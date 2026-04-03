@@ -1,0 +1,53 @@
+[project]
+name = "kempnerforge"
+version = "0.1.0"
+description = "A researcher-friendly, high-performance LLM training framework for large-scale distributed training"
+requires-python = ">=3.12"
+dependencies = [
+    "torch>=2.4",
+    "wandb",
+    "tensorboard",
+    "transformers",
+    "datasets",
+    "tokenizers",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-timeout",
+    "ruff",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+default-groups = ["dev"]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B", "SIM"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["kempnerforge"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "gpu: requires GPU",
+    "distributed: requires multiple GPUs",
+    "slow: long-running test",
+]

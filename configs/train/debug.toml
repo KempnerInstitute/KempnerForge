@@ -1,0 +1,48 @@
+# Debug configuration: small model for fast iteration and testing.
+# Usage: python scripts/train.py configs/train/debug.toml
+
+[model]
+dim = 256
+n_layers = 4
+n_heads = 4
+n_kv_heads = 4
+vocab_size = 32000
+max_seq_len = 512
+
+[train]
+batch_size = 4
+seq_len = 512
+max_steps = 100
+grad_accum_steps = 1
+grad_clip_norm = 1.0
+seed = 42
+compile_model = false
+activation_checkpointing = "none"
+
+[optimizer]
+name = "adamw"
+lr = 3e-4
+weight_decay = 0.1
+betas = [0.9, 0.95]
+
+[scheduler]
+name = "cosine"
+warmup_steps = 10
+min_lr_ratio = 0.1
+
+[data]
+num_workers = 2
+pin_memory = true
+
+[distributed]
+dp_shard = -1
+
+[checkpoint]
+dir = "checkpoints/debug"
+interval = 50
+keep_last_n = 2
+
+[metrics]
+log_interval = 5
+enable_wandb = false
+enable_tensorboard = false

@@ -1,0 +1,14 @@
+# Llama 7B model configuration.
+
+[model]
+dim = 4096
+n_layers = 32
+n_heads = 32
+n_kv_heads = 32
+vocab_size = 32000
+ffn_hidden_dim = 11008
+norm_type = "rmsnorm"
+activation = "silu"
+max_seq_len = 4096
+rope_theta = 10000.0
+tie_embeddings = false

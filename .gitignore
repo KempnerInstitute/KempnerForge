@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+
+# Tools
+.ruff_cache/
+.pytest_cache/
+
+# Wandb
+wandb/
+
+# OS
+.DS_Store
+
+# Training artifacts
+checkpoints/
+data/
+profiler_traces/
+tb_logs/
+
