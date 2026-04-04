@@ -21,9 +21,9 @@ import torch.nn.functional as F
 from torch.distributed._composable.fsdp import MixedPrecisionPolicy
 from torch.distributed.device_mesh import init_device_mesh
 
-from kempnerforge.config.schema import DistributedConfig, ModelConfig, OptimizerConfig
+from kempnerforge.config.schema import ModelConfig, OptimizerConfig
 from kempnerforge.distributed.parallel import apply_fsdp2
-from kempnerforge.distributed.setup import destroy_distributed, get_world_info, init_distributed
+from kempnerforge.distributed.setup import get_world_info
 from kempnerforge.distributed.utils import clip_grad_norm_
 from kempnerforge.model.transformer import Transformer
 from kempnerforge.training.grad import maybe_no_sync
@@ -38,14 +38,6 @@ pytestmark = pytest.mark.skipif(
 SMALL_CONFIG = ModelConfig(
     dim=128, n_layers=2, n_heads=2, vocab_size=256, max_seq_len=64
 )
-
-
-@pytest.fixture(autouse=True, scope="module")
-def _setup_distributed():
-    config = DistributedConfig(dp_shard=-1, dp_replicate=1, tp=1, pp=1)
-    init_distributed(config, seed=42)
-    yield
-    destroy_distributed()
 
 
 def _make_fsdp_model(config, device, world_size, mp_policy=None):

@@ -12,9 +12,8 @@ import torch
 import torch.distributed as dist
 
 from kempnerforge.checkpoint.manager import CheckpointManager
-from kempnerforge.config.schema import CheckpointConfig, DistributedConfig, ModelConfig
+from kempnerforge.config.schema import CheckpointConfig, ModelConfig
 from kempnerforge.distributed.parallel import apply_fsdp2
-from kempnerforge.distributed.setup import destroy_distributed, init_distributed
 from kempnerforge.model.transformer import Transformer
 from kempnerforge.training.optimizer import build_optimizer
 
@@ -26,14 +25,6 @@ pytestmark = pytest.mark.skipif(
 SMALL_CONFIG = ModelConfig(
     dim=128, n_layers=2, n_heads=2, vocab_size=512, max_seq_len=64
 )
-
-
-@pytest.fixture(autouse=True, scope="module")
-def distributed_env():
-    config = DistributedConfig()
-    mesh = init_distributed(config, seed=42)
-    yield mesh
-    destroy_distributed()
 
 
 class TestCheckpointRoundTrip:

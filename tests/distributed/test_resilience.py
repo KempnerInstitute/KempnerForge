@@ -10,9 +10,9 @@ import os
 import pytest
 import torch
 
-from kempnerforge.config.schema import DistributedConfig, ModelConfig
+from kempnerforge.config.schema import ModelConfig
 from kempnerforge.distributed.parallel import apply_fsdp2
-from kempnerforge.distributed.setup import destroy_distributed, get_world_info, init_distributed
+from kempnerforge.distributed.setup import get_world_info
 from kempnerforge.model.transformer import Transformer
 from kempnerforge.resilience.health import NaNDetector, check_gpu_health, check_nccl_health
 
@@ -25,15 +25,6 @@ pytestmark = pytest.mark.skipif(
 SMALL_CONFIG = ModelConfig(
     dim=128, n_layers=2, n_heads=2, vocab_size=256, max_seq_len=64
 )
-
-
-@pytest.fixture(autouse=True, scope="module")
-def _setup_distributed():
-    """Initialize distributed for the entire test module."""
-    config = DistributedConfig(dp_shard=-1, dp_replicate=1, tp=1, pp=1)
-    init_distributed(config, seed=42)
-    yield
-    destroy_distributed()
 
 
 class TestNCCLHealth:

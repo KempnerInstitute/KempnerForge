@@ -119,6 +119,9 @@ def init_distributed(config: DistributedConfig, seed: int = 42) -> DeviceMesh | 
         mesh_dim_names=tuple(mesh_dims),
     )
 
+    # Ensure all ranks have finished mesh creation before proceeding
+    dist.barrier()
+
     # Set seed (vary by PP rank for different dropout/stochastic depth per stage)
     pp_rank = 0
     if "pp" in device_mesh.mesh_dim_names:

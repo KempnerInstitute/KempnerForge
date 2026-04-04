@@ -14,7 +14,6 @@ import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 
 from kempnerforge.config.schema import ModelConfig
-from kempnerforge.distributed.setup import destroy_distributed
 from kempnerforge.distributed.tensor_parallel import apply_tensor_parallel
 from kempnerforge.model.transformer import Transformer
 
@@ -24,18 +23,11 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-@pytest.fixture(autouse=True, scope="module")
-def distributed_env():
-    """Initialize distributed with a TP-only mesh."""
-    if not dist.is_initialized():
-        dist.init_process_group(backend="nccl")
-    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    torch.cuda.set_device(local_rank)
-
+@pytest.fixture
+def tp_mesh():
+    """Create a TP mesh from the existing process group."""
     world_size = dist.get_world_size()
-    mesh = init_device_mesh("cuda", (world_size,), mesh_dim_names=("tp",))
-    yield mesh
-    destroy_distributed()
+    return init_device_mesh("cuda", (world_size,), mesh_dim_names=("tp",))
 
 
 # Config where n_heads and n_kv_heads are divisible by TP degree (2 or 4)
@@ -45,8 +37,8 @@ TP_CONFIG = ModelConfig(
 
 
 class TestTensorParallel:
-    def test_apply_tp(self, distributed_env):
-        mesh = distributed_env
+    def test_apply_tp(self, tp_mesh):
+        mesh = tp_mesh
         model = Transformer(TP_CONFIG).cuda()
         apply_tensor_parallel(model, mesh)
 
@@ -55,8 +47,8 @@ class TestTensorParallel:
             out = model(tokens)
         assert out.shape == (1, 32, 1000)
 
-    def test_tp_backward(self, distributed_env):
-        mesh = distributed_env
+    def test_tp_backward(self, tp_mesh):
+        mesh = tp_mesh
         model = Transformer(TP_CONFIG).cuda()
         apply_tensor_parallel(model, mesh)
 
@@ -68,9 +60,9 @@ class TestTensorParallel:
         for name, p in model.named_parameters():
             assert p.grad is not None, f"No gradient for {name}"
 
-    def test_tp_output_matches_across_ranks(self, distributed_env):
+    def test_tp_output_matches_across_ranks(self, tp_mesh):
         """With TP, all ranks should produce identical output (after all-reduce)."""
-        mesh = distributed_env
+        mesh = tp_mesh
 
         # Same model init seed across ranks
         torch.manual_seed(42)

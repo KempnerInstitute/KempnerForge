@@ -11,9 +11,9 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from kempnerforge.config.schema import ActivationCheckpointing, DistributedConfig, ModelConfig
+from kempnerforge.config.schema import ActivationCheckpointing, ModelConfig
 from kempnerforge.distributed.parallel import apply_ac, apply_fsdp2, get_dp_mesh
-from kempnerforge.distributed.setup import destroy_distributed, get_world_info, init_distributed
+from kempnerforge.distributed.setup import get_world_info
 from kempnerforge.model.transformer import Transformer
 
 # Skip entire module if not running under torchrun
@@ -25,15 +25,6 @@ pytestmark = pytest.mark.skipif(
 SMALL_CONFIG = ModelConfig(
     dim=256, n_layers=4, n_heads=4, n_kv_heads=4, vocab_size=1000, max_seq_len=128
 )
-
-
-@pytest.fixture(autouse=True, scope="module")
-def distributed_env():
-    """Initialize and tear down distributed for the entire test module."""
-    config = DistributedConfig()
-    mesh = init_distributed(config, seed=42)
-    yield mesh
-    destroy_distributed()
 
 
 class TestInitDistributed:
