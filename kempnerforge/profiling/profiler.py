@@ -68,33 +68,6 @@ def build_profiler(
     return prof
 
 
-class CUDATimer:
-    """CUDA event-based timer for accurate GPU timing.
 
-    Uses CUDA events to measure elapsed time without CPU synchronization
-    overhead (synchronizes only when reading the result).
-
-    Usage:
-        timer = CUDATimer()
-        timer.start()
-        # ... GPU work ...
-        timer.stop()
-        elapsed_ms = timer.elapsed_ms()
-    """
-
-    def __init__(self) -> None:
-        self._start = torch.cuda.Event(enable_timing=True)
-        self._end = torch.cuda.Event(enable_timing=True)
-
-    def start(self) -> None:
-        """Record the start event on the current CUDA stream."""
-        self._start.record()
-
-    def stop(self) -> None:
-        """Record the end event on the current CUDA stream."""
-        self._end.record()
-
-    def elapsed_ms(self) -> float:
-        """Get elapsed time in milliseconds (synchronizes CUDA)."""
-        self._end.synchronize()
-        return self._start.elapsed_time(self._end)
+# Re-export for backwards compatibility
+from kempnerforge.profiling.cuda_timer import CUDATimer  # noqa: E402, F401

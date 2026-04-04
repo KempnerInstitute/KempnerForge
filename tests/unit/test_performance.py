@@ -133,6 +133,35 @@ class TestProfiler:
         elapsed = timer.elapsed_ms()
         assert elapsed > 0
 
+    def test_cuda_timer_collection_disabled(self):
+        """Disabled timer collection should be zero-cost no-ops."""
+        from kempnerforge.profiling.cuda_timer import CUDATimerCollection
+
+        timers = CUDATimerCollection(regions=["forward", "backward"], enabled=False)
+        assert not timers.enabled
+        timers.start("forward")
+        timers.stop("forward")
+        assert timers.elapsed_ms("forward") == 0.0
+        report = timers.elapsed_all()
+        assert report == {"forward": 0.0, "backward": 0.0}
+
+    def test_cuda_timer_collection_enabled_no_gpu(self):
+        """Enabled collection should create timers for each region."""
+        if not torch.cuda.is_available():
+            return
+        from kempnerforge.profiling.cuda_timer import CUDATimerCollection
+
+        timers = CUDATimerCollection(regions=["forward", "backward", "comm"])
+        assert timers.enabled
+        timers.start("forward")
+        x = torch.randn(100, 100, device="cuda")
+        _ = x @ x
+        timers.stop("forward")
+        report = timers.elapsed_all()
+        assert report["forward"] > 0
+        assert "backward" in report
+        assert "comm" in report
+
 
 # ---------------------------------------------------------------------------
 # torch.compile correctness
