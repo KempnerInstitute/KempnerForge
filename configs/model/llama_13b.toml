@@ -1,0 +1,14 @@
+# Llama 13B model configuration.
+
+[model]
+dim = 5120
+n_layers = 40
+n_heads = 40
+n_kv_heads = 40
+vocab_size = 32000
+ffn_hidden_dim = 13824
+norm_type = "rmsnorm"
+activation = "silu"
+max_seq_len = 4096
+rope_theta = 10000.0
+tie_embeddings = false

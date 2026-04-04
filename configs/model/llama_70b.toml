@@ -1,0 +1,14 @@
+# Llama 70B model configuration.
+
+[model]
+dim = 8192
+n_layers = 80
+n_heads = 64
+n_kv_heads = 8
+vocab_size = 32000
+ffn_hidden_dim = 28672
+norm_type = "rmsnorm"
+activation = "silu"
+max_seq_len = 4096
+rope_theta = 500000.0
+tie_embeddings = false
