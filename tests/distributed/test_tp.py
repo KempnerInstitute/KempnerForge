@@ -23,17 +23,35 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-@pytest.fixture
-def tp_mesh():
-    """Create a TP mesh from the existing process group."""
-    world_size = dist.get_world_size()
-    return init_device_mesh("cuda", (world_size,), mesh_dim_names=("tp",))
-
-
 # Config where n_heads and n_kv_heads are divisible by TP degree (2 or 4)
 TP_CONFIG = ModelConfig(
     dim=256, n_layers=2, n_heads=8, n_kv_heads=4, vocab_size=1000, max_seq_len=64
 )
+
+# TP degree must divide n_heads and n_kv_heads. When world_size > n_kv_heads
+# (e.g. 12 GPUs but only 4 kv_heads), use a sub-mesh of valid size.
+_VALID_TP_SIZES = [
+    s for s in [2, 4, 8]
+    if TP_CONFIG.n_heads % s == 0 and TP_CONFIG.n_kv_heads % s == 0
+]
+
+
+@pytest.fixture
+def tp_mesh():
+    """Create a TP mesh that is compatible with TP_CONFIG head counts."""
+    world_size = dist.get_world_size()
+    # Use full world if it divides heads, otherwise pick largest valid sub-mesh
+    if TP_CONFIG.n_heads % world_size == 0 and TP_CONFIG.n_kv_heads % world_size == 0:
+        tp_size = world_size
+    else:
+        candidates = [s for s in _VALID_TP_SIZES if s <= world_size]
+        if not candidates:
+            pytest.skip(f"No valid TP degree for world_size={world_size}")
+        tp_size = max(candidates)
+    # Create a 2D mesh: (dp, tp) so only tp_size ranks participate in TP
+    dp_size = world_size // tp_size
+    mesh = init_device_mesh("cuda", (dp_size, tp_size), mesh_dim_names=("dp", "tp"))
+    return mesh["tp"]
 
 
 class TestTensorParallel:

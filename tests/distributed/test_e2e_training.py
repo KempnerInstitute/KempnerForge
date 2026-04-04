@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import os
 import shutil
-import tempfile
+from pathlib import Path
 
 import pytest
 import torch
@@ -38,6 +38,10 @@ pytestmark = pytest.mark.skipif(
 SMALL_CONFIG = ModelConfig(
     dim=128, n_layers=2, n_heads=2, vocab_size=256, max_seq_len=64
 )
+
+# Shared filesystem temp directory (visible to all nodes)
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_TEST_TMP = _PROJECT_ROOT / ".test_tmp"
 
 
 def _make_fsdp_model(config, device, world_size, mp_policy=None):
@@ -117,9 +121,13 @@ class TestE2ETraining:
             ).item()
 
         # Save via DCP — all ranks must use the same directory
+        import tempfile
+
         import torch.distributed.checkpoint as dcp
 
-        tmpdir = tempfile.mkdtemp() if rank == 0 else ""
+        if rank == 0:
+            _TEST_TMP.mkdir(exist_ok=True)
+        tmpdir = tempfile.mkdtemp(dir=str(_TEST_TMP)) if rank == 0 else ""
         tmpdir_list = [tmpdir]
         dist.broadcast_object_list(tmpdir_list, src=0)
         tmpdir = tmpdir_list[0]
