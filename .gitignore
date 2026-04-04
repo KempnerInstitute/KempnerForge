@@ -20,7 +20,7 @@ wandb/
 
 # Training artifacts
 checkpoints/
-data/
+/data/
 profiler_traces/
 tb_logs/
 

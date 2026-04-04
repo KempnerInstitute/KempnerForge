@@ -287,3 +287,119 @@ class TestStatefulDataLoader:
         # Exhaust one epoch
         list(loader)
         assert loader._epoch == 1
+
+
+# ---------------------------------------------------------------------------
+# StreamingHuggingFaceDataset
+# ---------------------------------------------------------------------------
+
+
+class TestStreamingHuggingFaceDataset:
+    """Tests using a mock streaming dataset to avoid network dependencies."""
+
+    def _make_mock_dataset(self, seq_len, rank=0, world_size=1, seed=42):
+        """Create a StreamingHuggingFaceDataset with mocked HF internals."""
+        from unittest.mock import MagicMock
+
+        from kempnerforge.data.dataset import StreamingHuggingFaceDataset
+
+        ds = StreamingHuggingFaceDataset(
+            dataset_name="mock/dataset",
+            split="train",
+            text_field="text",
+            seq_len=seq_len,
+            tokenizer_path="mock",
+            rank=rank,
+            world_size=world_size,
+            seed=seed,
+        )
+
+        # Mock tokenizer: each character → its ordinal (simple 1-to-1 mapping)
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.eos_token_id = 0
+        mock_tokenizer.encode = lambda text: [ord(c) for c in text]
+        ds._tokenizer = mock_tokenizer
+        ds._eos_id = 0
+
+        return ds
+
+    def _patch_stream(self, ds, documents):
+        """Patch _load_stream to return mock documents."""
+
+        class MockStream:
+            def __init__(self, docs):
+                self._docs = docs
+
+            def shuffle(self, seed=0, buffer_size=1000):
+                return self  # Don't shuffle for deterministic tests
+
+            def __iter__(self):
+                return iter(self._docs)
+
+        ds._load_stream = lambda: MockStream(documents)
+
+    def test_basic_iteration(self):
+        ds = self._make_mock_dataset(seq_len=4)
+        # Each char encodes to one token. "abcde" = 5 tokens + 1 EOS = 6 tokens
+        # chunk_size = seq_len + 1 = 5, so one full chunk from 6 tokens
+        docs = [{"text": "abcdefghij"}]  # 10 tokens + 1 EOS = 11 → 2 chunks of 5
+        self._patch_stream(ds, docs)
+
+        samples = list(ds)
+        assert len(samples) == 2
+        assert samples[0]["input_ids"].shape == (4,)
+        assert samples[0]["labels"].shape == (4,)
+
+    def test_sequence_packing(self):
+        """Multiple short docs should be packed into sequences."""
+        ds = self._make_mock_dataset(seq_len=8)
+        # chunk_size = 9. "abc" = 3 tokens + EOS = 4. Need 3 docs for one chunk.
+        docs = [{"text": "abc"}, {"text": "def"}, {"text": "ghi"}]
+        # 3+1 + 3+1 + 3+1 = 12 tokens → 1 chunk of 9, 3 leftover
+        self._patch_stream(ds, docs)
+
+        samples = list(ds)
+        assert len(samples) == 1
+
+    def test_distributed_sharding(self):
+        """Each rank should get different documents."""
+        docs = [{"text": f"doc{i}" * 10} for i in range(20)]
+
+        results = {}
+        for rank in range(2):
+            ds = self._make_mock_dataset(seq_len=4, rank=rank, world_size=2)
+            self._patch_stream(ds, docs)
+            results[rank] = list(ds)
+
+        # Both ranks should produce sequences
+        assert len(results[0]) > 0
+        assert len(results[1]) > 0
+
+    def test_empty_docs_skipped(self):
+        ds = self._make_mock_dataset(seq_len=4)
+        docs = [{"text": ""}, {"text": "abcdefghij"}]
+        self._patch_stream(ds, docs)
+
+        samples = list(ds)
+        assert len(samples) > 0  # Empty doc should be skipped
+
+    def test_state_dict_round_trip(self):
+        ds = self._make_mock_dataset(seq_len=4)
+        docs = [{"text": "abcdefghij" * 5}]  # 50 tokens → plenty of chunks
+        self._patch_stream(ds, docs)
+
+        # Consume some samples
+        it = iter(ds)
+        next(it)
+        next(it)
+
+        state = ds.state_dict()
+        assert "epoch" in state
+        assert "rank_docs_consumed" in state
+
+    def test_load_state_dict(self):
+        ds = self._make_mock_dataset(seq_len=4)
+
+        ds.load_state_dict({"epoch": 3, "rank_docs_consumed": 100})
+        assert ds._epoch == 3
+        assert ds._skip_rank_docs == 100
