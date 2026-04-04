@@ -34,9 +34,11 @@ NGPUS="${SLURM_GPUS_PER_NODE:-4}"
 # Prevent NCCL memory stacking
 export TORCH_NCCL_AVOID_RECORD_STREAMS=1
 
-# Use high-performance NCCL settings
+# Use InfiniBand for GPU-to-GPU communication
+export NCCL_SOCKET_IFNAME=ib0
 export NCCL_IB_DISABLE=0
 export NCCL_NET_GDR_LEVEL=2
+export NCCL_IB_GID_INDEX=3
 
 # Ensure log directory exists
 mkdir -p logs

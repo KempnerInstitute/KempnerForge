@@ -3,7 +3,7 @@
 #SBATCH --partition=kempner_h100
 #SBATCH --account=kempner_dev
 #SBATCH --nodes=2
-#SBATCH --ntasks-per-node=1
+#SBATCH --ntasks-per-node=4
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=256G
@@ -13,11 +13,15 @@
 #SBATCH --signal=B:SIGTERM@120
 #SBATCH --requeue
 #
-# Multi-node multi-GPU training via torchrun with SLURM.
+# Multi-node multi-GPU training via srun.
+#
+# IMPORTANT: --ntasks-per-node MUST equal --gpus-per-node. Each srun task
+# maps to one GPU process. SLURM sets RANK, LOCAL_RANK, WORLD_SIZE via
+# SLURM_PROCID, SLURM_LOCALID, SLURM_NTASKS automatically.
 #
 # Usage:
 #   sbatch --nodes=4 scripts/slurm/multinode.sh configs/train/default.toml
-#   sbatch --nodes=8 --partition=kempner_h100 scripts/slurm/multinode.sh \
+#   sbatch --nodes=8 scripts/slurm/multinode.sh \
 #       configs/train/default.toml --train.max_steps=50000
 #
 # Automatically detects master addr/port from SLURM environment and
@@ -34,15 +38,16 @@ NNODES="${SLURM_NNODES}"
 NGPUS_PER_NODE="${SLURM_GPUS_PER_NODE:-4}"
 
 # ---- Master address/port from SLURM ----
-# Get the first node in the allocation as master
-MASTER_ADDR=$(scontrol show hostnames "${SLURM_JOB_NODELIST}" | head -n 1)
-MASTER_PORT="${MASTER_PORT:-29500}"
+export MASTER_ADDR=$(scontrol show hostnames "${SLURM_JOB_NODELIST}" | head -n 1)
+# Pick a random free port to avoid collisions with other jobs
+export MASTER_PORT=$(shuf -i 20000-30000 -n 1)
 
 # ---- Environment ----
 # Prevent NCCL memory stacking
 export TORCH_NCCL_AVOID_RECORD_STREAMS=1
 
-# InfiniBand / RoCE settings (common on HPC clusters)
+# Use InfiniBand for inter-node communication
+export NCCL_SOCKET_IFNAME=ib0
 export NCCL_IB_DISABLE=0
 export NCCL_NET_GDR_LEVEL=2
 export NCCL_IB_GID_INDEX=3
@@ -65,12 +70,7 @@ echo "Restart cnt:  ${SLURM_RESTART_COUNT:-0}"
 echo "========================================="
 
 # ---- Launch with srun ----
-# srun launches one process per node; torchrun spawns per-GPU workers
+# srun launches one process per GPU. Each process gets:
+#   RANK=SLURM_PROCID, LOCAL_RANK=SLURM_LOCALID, WORLD_SIZE=SLURM_NTASKS
 srun --kill-on-bad-exit=1 \
-    uv run torchrun \
-    --nnodes="${NNODES}" \
-    --nproc_per_node="${NGPUS_PER_NODE}" \
-    --rdzv_id="${SLURM_JOB_ID}" \
-    --rdzv_backend=c10d \
-    --rdzv_endpoint="${MASTER_ADDR}:${MASTER_PORT}" \
-    scripts/train.py "${CONFIG}" ${OVERRIDES}
+    uv run python scripts/train.py "${CONFIG}" ${OVERRIDES}

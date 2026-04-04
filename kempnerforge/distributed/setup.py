@@ -22,11 +22,20 @@ logger = logging.getLogger(__name__)
 def get_world_info() -> tuple[int, int, int]:
     """Return (rank, local_rank, world_size) from environment variables.
 
-    Works with both torchrun and SLURM launchers.
+    Works with both torchrun (RANK/LOCAL_RANK/WORLD_SIZE) and direct srun
+    launch (SLURM_PROCID/SLURM_LOCALID/SLURM_NTASKS). When running under
+    srun, also sets RANK/LOCAL_RANK/WORLD_SIZE so that PyTorch's env://
+    rendezvous can find them.
     """
-    rank = int(os.environ.get("RANK", "0"))
-    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", os.environ.get("SLURM_PROCID", "0")))
+    local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("SLURM_LOCALID", "0")))
+    world_size = int(os.environ.get("WORLD_SIZE", os.environ.get("SLURM_NTASKS", "1")))
+
+    # Ensure standard env vars are set for PyTorch's env:// rendezvous
+    os.environ.setdefault("RANK", str(rank))
+    os.environ.setdefault("LOCAL_RANK", str(local_rank))
+    os.environ.setdefault("WORLD_SIZE", str(world_size))
+
     return rank, local_rank, world_size
 
 
@@ -39,6 +48,10 @@ def _set_nccl_env() -> None:
     """Set NCCL environment variables for optimal performance."""
     # Prevent NCCL memory stacking — avoids OOM from cached NCCL buffers
     os.environ.setdefault("TORCH_NCCL_AVOID_RECORD_STREAMS", "1")
+
+    # Use InfiniBand for inter-node communication when available
+    os.environ.setdefault("NCCL_IB_DISABLE", "0")
+    os.environ.setdefault("NCCL_NET_GDR_LEVEL", "2")
 
 
 def _set_seed(seed: int, rank: int, pp_rank: int = 0) -> None:
@@ -72,6 +85,37 @@ def init_distributed(config: DistributedConfig, seed: int = 42) -> DeviceMesh | 
         return None
 
     _set_nccl_env()
+
+    # Set MASTER_ADDR/MASTER_PORT from SLURM env vars if not already set.
+    # torchrun sets these automatically, but srun-direct launch does not.
+    if "MASTER_ADDR" not in os.environ and "SLURM_JOB_NODELIST" in os.environ:
+        import subprocess
+
+        result = subprocess.run(
+            ["scontrol", "show", "hostnames", os.environ["SLURM_JOB_NODELIST"]],
+            capture_output=True,
+            text=True,
+        )
+        os.environ["MASTER_ADDR"] = result.stdout.strip().split("\n")[0]
+    os.environ.setdefault("MASTER_ADDR", "localhost")
+    # Pick a port if not set. For multi-node SLURM jobs, the launch script
+    # (multinode.sh) sets MASTER_PORT before srun so all ranks get the same
+    # value. This fallback handles single-node and interactive use.
+    # Under SLURM, derive port deterministically from job ID so all ranks
+    # on the same job agree without communication, while different jobs on
+    # the same shared HPC node get different ports.
+    if "MASTER_PORT" not in os.environ:
+        job_id = os.environ.get("SLURM_JOB_ID")
+        if job_id is not None:
+            import random
+
+            os.environ["MASTER_PORT"] = str(random.Random(int(job_id)).randint(15000, 30000))
+        else:
+            import socket
+
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(("", 0))
+                os.environ["MASTER_PORT"] = str(s.getsockname()[1])
 
     # Initialize process group
     if not dist.is_initialized():

@@ -52,13 +52,24 @@ class MemoryMappedDataset(Dataset):
         if not self._files:
             raise FileNotFoundError(f"No files matching {file_pattern!r} in {data_dir}")
 
+        # Detect file format from extension
+        self._is_bin = self._files[0].suffix == ".bin"
+
         # Memory-map all files and compute cumulative offsets
         self._mmaps: list[np.ndarray] = []
         self._cumulative_samples: list[int] = [0]
         total_tokens = 0
 
         for f in self._files:
-            mmap = np.load(str(f), mmap_mode="r")
+            if self._is_bin:
+                # Raw binary: flat array of tokens. Infer dtype from file size
+                # or use uint32 (most common for modern tokenizers with vocab > 65535)
+                file_size = f.stat().st_size
+                dtype = np.uint32 if file_size % 4 == 0 else np.uint16
+                n_tokens = file_size // np.dtype(dtype).itemsize
+                mmap = np.memmap(str(f), dtype=dtype, mode="r", shape=(n_tokens,))
+            else:
+                mmap = np.load(str(f), mmap_mode="r")
             n_samples = len(mmap) // seq_len
             self._mmaps.append(mmap)
             total_tokens += len(mmap)

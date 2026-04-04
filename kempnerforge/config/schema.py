@@ -216,6 +216,7 @@ class DataConfig:
     """Data pipeline settings."""
 
     dataset_path: str = ""
+    file_pattern: str = "*.npy"  # Glob pattern for data files (e.g., "*.npy", "tokenized_*.bin")
     tokenizer_path: str = ""
     num_workers: int = 4
     pin_memory: bool = True
