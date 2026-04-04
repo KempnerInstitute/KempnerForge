@@ -39,6 +39,12 @@ class AsyncCheckpointMode(StrEnum):
     async_pinned = "async_with_pinned_mem"
 
 
+class PipelineSchedule(StrEnum):
+    schedule_1f1b = "1f1b"
+    gpipe = "gpipe"
+    interleaved_1f1b = "interleaved_1f1b"
+
+
 class SchedulerType(StrEnum):
     cosine = "cosine"
     linear = "linear"
@@ -239,6 +245,7 @@ class DistributedConfig:
     dp_replicate: int = 1
     tp: int = 1
     pp: int = 1
+    pp_schedule: PipelineSchedule = PipelineSchedule.schedule_1f1b
     cp: int = 1
     nccl_timeout_sec: int = 600
     backend: str = "nccl"
@@ -273,6 +280,7 @@ class DistributedConfig:
             dp_replicate=self.dp_replicate,
             tp=self.tp,
             pp=self.pp,
+            pp_schedule=self.pp_schedule,
             cp=self.cp,
             nccl_timeout_sec=self.nccl_timeout_sec,
             backend=self.backend,

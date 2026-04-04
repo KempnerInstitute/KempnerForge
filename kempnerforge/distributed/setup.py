@@ -92,6 +92,7 @@ def init_distributed(config: DistributedConfig, seed: int = 42) -> DeviceMesh | 
     mesh_sizes: list[int] = []
 
     dim_map = [
+        ("pp", resolved.pp),
         ("dp_replicate", resolved.dp_replicate),
         ("dp_shard", resolved.dp_shard),
         ("tp", resolved.tp),
@@ -118,8 +119,11 @@ def init_distributed(config: DistributedConfig, seed: int = 42) -> DeviceMesh | 
         mesh_dim_names=tuple(mesh_dims),
     )
 
-    # Set seed (vary by PP rank if pipeline parallelism is used)
-    _set_seed(seed, rank=rank)
+    # Set seed (vary by PP rank for different dropout/stochastic depth per stage)
+    pp_rank = 0
+    if "pp" in device_mesh.mesh_dim_names:
+        pp_rank = device_mesh["pp"].get_local_rank()
+    _set_seed(seed, rank=rank, pp_rank=pp_rank)
 
     return device_mesh
 
