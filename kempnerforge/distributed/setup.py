@@ -153,9 +153,7 @@ def init_distributed(config: DistributedConfig, seed: int = 42) -> DeviceMesh | 
         mesh_sizes = [world_size]
 
     if is_rank_zero():
-        logger.info(
-            f"DeviceMesh: dims={mesh_dims}, sizes={mesh_sizes}, world_size={world_size}"
-        )
+        logger.info(f"DeviceMesh: dims={mesh_dims}, sizes={mesh_sizes}, world_size={world_size}")
 
     device_mesh = init_device_mesh(
         device_type="cuda",

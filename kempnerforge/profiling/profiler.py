@@ -61,12 +61,10 @@ def build_profiler(
     )
 
     logger.info(
-        f"Profiler configured: steps {config.start_step}–{config.end_step}, "
-        f"traces → {trace_dir}"
+        f"Profiler configured: steps {config.start_step}–{config.end_step}, traces → {trace_dir}"
     )
 
     return prof
-
 
 
 # Re-export for backwards compatibility

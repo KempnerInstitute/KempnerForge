@@ -31,8 +31,7 @@ TP_CONFIG = ModelConfig(
 # TP degree must divide n_heads and n_kv_heads. When world_size > n_kv_heads
 # (e.g. 12 GPUs but only 4 kv_heads), use a sub-mesh of valid size.
 _VALID_TP_SIZES = [
-    s for s in [2, 4, 8]
-    if TP_CONFIG.n_heads % s == 0 and TP_CONFIG.n_kv_heads % s == 0
+    s for s in [2, 4, 8] if TP_CONFIG.n_heads % s == 0 and TP_CONFIG.n_kv_heads % s == 0
 ]
 
 
@@ -116,9 +115,7 @@ class TestTPWithFSDP:
         dp_size = world_size // tp_size
 
         # Create a 2D mesh with separate DP and TP dimensions
-        mesh_2d = init_device_mesh(
-            "cuda", (dp_size, tp_size), mesh_dim_names=("dp_shard", "tp")
-        )
+        mesh_2d = init_device_mesh("cuda", (dp_size, tp_size), mesh_dim_names=("dp_shard", "tp"))
 
         model = Transformer(TP_CONFIG).cuda()
 

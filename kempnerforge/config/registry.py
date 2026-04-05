@@ -46,9 +46,7 @@ class Registry:
         store = self._get_store(category)
         if name not in store:
             available = list(store.keys())
-            raise KeyError(
-                f"Unknown {category}: '{name}'. Available: {available}"
-            )
+            raise KeyError(f"Unknown {category}: '{name}'. Available: {available}")
         return store[name]
 
     def list(self, category: str) -> list[str]:
@@ -59,9 +57,11 @@ class Registry:
 
     def register_model(self, name: str) -> Callable:
         """Decorator to register a model builder."""
+
         def decorator(fn: Callable) -> Callable:
             self.register("model", name, fn)
             return fn
+
         return decorator
 
     def get_model(self, name: str) -> Callable:
@@ -69,9 +69,11 @@ class Registry:
 
     def register_optimizer(self, name: str) -> Callable:
         """Decorator to register an optimizer builder."""
+
         def decorator(fn: Callable) -> Callable:
             self.register("optimizer", name, fn)
             return fn
+
         return decorator
 
     def get_optimizer(self, name: str) -> Callable:
@@ -79,9 +81,11 @@ class Registry:
 
     def register_scheduler(self, name: str) -> Callable:
         """Decorator to register a scheduler builder."""
+
         def decorator(fn: Callable) -> Callable:
             self.register("scheduler", name, fn)
             return fn
+
         return decorator
 
     def get_scheduler(self, name: str) -> Callable:

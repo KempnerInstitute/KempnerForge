@@ -17,9 +17,7 @@ from kempnerforge.training.scheduler import build_scheduler
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-TINY_CONFIG = ModelConfig(
-    dim=64, n_layers=2, n_heads=2, vocab_size=256, max_seq_len=32
-)
+TINY_CONFIG = ModelConfig(dim=64, n_layers=2, n_heads=2, vocab_size=256, max_seq_len=32)
 
 
 # ---------------------------------------------------------------------------
@@ -115,9 +113,7 @@ class TestScheduler:
     def test_linear_decay(self):
         model = Transformer(TINY_CONFIG)
         opt = build_optimizer(model, OptimizerConfig(lr=1.0))
-        config = SchedulerConfig(
-            name=SchedulerType.linear, warmup_steps=0, min_lr_ratio=0.0
-        )
+        config = SchedulerConfig(name=SchedulerType.linear, warmup_steps=0, min_lr_ratio=0.0)
         sched = build_scheduler(opt, config, max_steps=100)
         for _ in range(50):
             sched.step()

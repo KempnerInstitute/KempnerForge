@@ -117,9 +117,7 @@ class DeviceMemoryMonitor:
         util = get_memory_utilization(self.device)
         stats["mem_utilization"] = util
 
-        logger.info(
-            f"[step {step}] {format_memory_stats(self.device)}"
-        )
+        logger.info(f"[step {step}] {format_memory_stats(self.device)}")
 
         # Check if we should capture a snapshot
         if (

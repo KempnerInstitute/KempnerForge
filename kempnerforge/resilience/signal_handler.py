@@ -116,9 +116,7 @@ class ShutdownHandler:
         """Force-exit the process if graceful shutdown takes too long."""
         import os
 
-        logger.error(
-            f"Graceful shutdown timed out after {self._timeout_sec}s — forcing exit"
-        )
+        logger.error(f"Graceful shutdown timed out after {self._timeout_sec}s — forcing exit")
         os._exit(1)
 
     def _cancel_timer(self) -> None:

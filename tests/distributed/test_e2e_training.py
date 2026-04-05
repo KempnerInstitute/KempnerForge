@@ -35,9 +35,7 @@ pytestmark = pytest.mark.skipif(
     reason="Requires torchrun launcher (RANK not set)",
 )
 
-SMALL_CONFIG = ModelConfig(
-    dim=128, n_layers=2, n_heads=2, vocab_size=256, max_seq_len=64
-)
+SMALL_CONFIG = ModelConfig(dim=128, n_layers=2, n_heads=2, vocab_size=256, max_seq_len=64)
 
 # Shared filesystem temp directory (visible to all nodes)
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -151,8 +149,7 @@ class TestE2ETraining:
                 loss2 = F.cross_entropy(logits2.view(-1, logits2.size(-1)), labels.view(-1))
 
             assert abs(loss_before_save - loss2.item()) < 1e-4, (
-                f"Loss mismatch: before_save={loss_before_save:.6f}, "
-                f"after_load={loss2.item():.6f}"
+                f"Loss mismatch: before_save={loss_before_save:.6f}, after_load={loss2.item():.6f}"
             )
         finally:
             dist.barrier()
@@ -196,9 +193,7 @@ class TestE2ETraining:
 
             with maybe_no_sync(model_accum, i, grad_accum_steps):
                 logits = model_accum(micro_tokens)
-                loss = F.cross_entropy(
-                    logits.view(-1, logits.size(-1)), micro_labels.view(-1)
-                )
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), micro_labels.view(-1))
                 scaled_loss = loss / grad_accum_steps
                 scaled_loss.backward()
 
@@ -206,14 +201,10 @@ class TestE2ETraining:
 
         # Gradient norms should be close (not exact due to floating point order)
         large_val = (
-            large_grad_norm.item()
-            if isinstance(large_grad_norm, torch.Tensor)
-            else large_grad_norm
+            large_grad_norm.item() if isinstance(large_grad_norm, torch.Tensor) else large_grad_norm
         )
         accum_val = (
-            accum_grad_norm.item()
-            if isinstance(accum_grad_norm, torch.Tensor)
-            else accum_grad_norm
+            accum_grad_norm.item() if isinstance(accum_grad_norm, torch.Tensor) else accum_grad_norm
         )
 
         # Allow 5% relative tolerance

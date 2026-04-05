@@ -235,7 +235,9 @@ def _load_hf_hub(model_id: str) -> dict[str, torch.Tensor]:
 
     logger.info(f"Downloading model from HuggingFace Hub: {model_id}")
     hf_model = AutoModelForCausalLM.from_pretrained(
-        model_id, torch_dtype=torch.bfloat16, trust_remote_code=True,
+        model_id,
+        torch_dtype=torch.bfloat16,
+        trust_remote_code=True,
     )
     return hf_model.state_dict()
 
@@ -276,7 +278,9 @@ def main() -> None:
     p_export.add_argument("--hf-dir", required=True, help="Output HuggingFace directory")
     p_export.add_argument("--config", required=True, help="TOML config file")
     p_export.add_argument(
-        "--dtype", default="bfloat16", choices=["float32", "bfloat16", "float16"],
+        "--dtype",
+        default="bfloat16",
+        choices=["float32", "bfloat16", "float16"],
     )
 
     # HF → DCP

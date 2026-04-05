@@ -49,7 +49,10 @@ class TransformerBlock(nn.Module):
         )
 
     def forward(
-        self, x: torch.Tensor, rope_cos: torch.Tensor, rope_sin: torch.Tensor,
+        self,
+        x: torch.Tensor,
+        rope_cos: torch.Tensor,
+        rope_sin: torch.Tensor,
     ) -> torch.Tensor:
         # Pre-norm attention with residual
         x = x + self.attention(self.attention_norm(x), rope_cos, rope_sin)

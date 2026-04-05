@@ -54,7 +54,9 @@ def clip_grad_norm_(
     if len(mesh_keys) <= 1:
         # Single mesh — standard path works
         return torch.nn.utils.clip_grad_norm_(
-            model.parameters(), max_norm=max_norm, foreach=foreach,
+            model.parameters(),
+            max_norm=max_norm,
+            foreach=foreach,
         )
 
     # Mixed meshes — group by mesh, compute per-group norms, combine.

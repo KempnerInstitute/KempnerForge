@@ -24,9 +24,7 @@ pytestmark = pytest.mark.skipif(
     reason="Requires torchrun launcher (RANK not set)",
 )
 
-SMALL_CONFIG = ModelConfig(
-    dim=128, n_layers=2, n_heads=2, vocab_size=512, max_seq_len=64
-)
+SMALL_CONFIG = ModelConfig(dim=128, n_layers=2, n_heads=2, vocab_size=512, max_seq_len=64)
 
 # Shared filesystem temp directory (visible to all nodes)
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -101,7 +99,7 @@ class TestCheckpointRoundTrip:
         with torch.no_grad():
             restored_out = model(tokens)
         assert torch.allclose(ref_out, restored_out, atol=1e-5), (
-            f"Restored output differs: max diff={( ref_out - restored_out).abs().max().item()}"
+            f"Restored output differs: max diff={(ref_out - restored_out).abs().max().item()}"
         )
 
     def test_latest_symlink(self, distributed_env, shared_tmp_dir):

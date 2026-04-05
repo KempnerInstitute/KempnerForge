@@ -136,8 +136,11 @@ class TestDistributedSampler:
         all_indices = []
         for rank in range(num_replicas):
             sampler = DistributedSampler(
-                simple_dataset, num_replicas=num_replicas, rank=rank,
-                shuffle=False, drop_last=True,
+                simple_dataset,
+                num_replicas=num_replicas,
+                rank=rank,
+                shuffle=False,
+                drop_last=True,
             )
             all_indices.append(list(sampler))
 
@@ -151,8 +154,11 @@ class TestDistributedSampler:
         all_indices = set()
         for rank in range(num_replicas):
             sampler = DistributedSampler(
-                simple_dataset, num_replicas=num_replicas, rank=rank,
-                shuffle=False, drop_last=False,
+                simple_dataset,
+                num_replicas=num_replicas,
+                rank=rank,
+                shuffle=False,
+                drop_last=False,
             )
             all_indices.update(list(sampler))
 
@@ -165,8 +171,11 @@ class TestDistributedSampler:
         sizes = set()
         for rank in range(num_replicas):
             sampler = DistributedSampler(
-                simple_dataset, num_replicas=num_replicas, rank=rank,
-                shuffle=False, drop_last=True,
+                simple_dataset,
+                num_replicas=num_replicas,
+                rank=rank,
+                shuffle=False,
+                drop_last=True,
             )
             sizes.add(len(list(sampler)))
 
@@ -175,10 +184,18 @@ class TestDistributedSampler:
     def test_deterministic_shuffle(self, simple_dataset):
         """Same seed + epoch → same permutation."""
         s1 = DistributedSampler(
-            simple_dataset, num_replicas=1, rank=0, shuffle=True, seed=42,
+            simple_dataset,
+            num_replicas=1,
+            rank=0,
+            shuffle=True,
+            seed=42,
         )
         s2 = DistributedSampler(
-            simple_dataset, num_replicas=1, rank=0, shuffle=True, seed=42,
+            simple_dataset,
+            num_replicas=1,
+            rank=0,
+            shuffle=True,
+            seed=42,
         )
         s1.set_epoch(3)
         s2.set_epoch(3)
@@ -187,7 +204,11 @@ class TestDistributedSampler:
     def test_different_epoch_different_order(self, simple_dataset):
         """Different epochs should produce different orderings."""
         s = DistributedSampler(
-            simple_dataset, num_replicas=1, rank=0, shuffle=True, seed=42,
+            simple_dataset,
+            num_replicas=1,
+            rank=0,
+            shuffle=True,
+            seed=42,
         )
         s.set_epoch(0)
         order_0 = list(s)
@@ -198,7 +219,11 @@ class TestDistributedSampler:
     def test_skip_ahead(self, simple_dataset):
         """Skip-ahead should produce the tail of the full iteration."""
         s = DistributedSampler(
-            simple_dataset, num_replicas=1, rank=0, shuffle=False, drop_last=True,
+            simple_dataset,
+            num_replicas=1,
+            rank=0,
+            shuffle=False,
+            drop_last=True,
         )
 
         # Full iteration
@@ -211,7 +236,11 @@ class TestDistributedSampler:
 
     def test_state_dict_round_trip(self, simple_dataset):
         s = DistributedSampler(
-            simple_dataset, num_replicas=2, rank=1, shuffle=True, seed=99,
+            simple_dataset,
+            num_replicas=2,
+            rank=1,
+            shuffle=True,
+            seed=99,
         )
         s.set_epoch(7)
         state = s.state_dict()
@@ -220,7 +249,11 @@ class TestDistributedSampler:
         assert state["rank"] == 1
 
         s2 = DistributedSampler(
-            simple_dataset, num_replicas=2, rank=1, shuffle=True, seed=99,
+            simple_dataset,
+            num_replicas=2,
+            rank=1,
+            shuffle=True,
+            seed=99,
         )
         s2.load_state_dict(state)
         assert s2._epoch == 7
@@ -229,10 +262,18 @@ class TestDistributedSampler:
         """drop_last=True discards, drop_last=False pads."""
         # 100 samples, 3 replicas → drop_last: 33 each (99 used), pad: 34 each
         s_drop = DistributedSampler(
-            simple_dataset, num_replicas=3, rank=0, shuffle=False, drop_last=True,
+            simple_dataset,
+            num_replicas=3,
+            rank=0,
+            shuffle=False,
+            drop_last=True,
         )
         s_pad = DistributedSampler(
-            simple_dataset, num_replicas=3, rank=0, shuffle=False, drop_last=False,
+            simple_dataset,
+            num_replicas=3,
+            rank=0,
+            shuffle=False,
+            drop_last=False,
         )
         assert len(list(s_drop)) == 33
         assert len(list(s_pad)) == 34

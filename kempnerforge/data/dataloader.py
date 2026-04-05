@@ -107,7 +107,4 @@ class StatefulDataLoader:
         if batches_yielded > 0:
             self.sampler.set_skip(batches_yielded * self.batch_size)
 
-        logger.info(
-            f"Resumed DataLoader: epoch={self._epoch}, "
-            f"skip_batches={batches_yielded}"
-        )
+        logger.info(f"Resumed DataLoader: epoch={self._epoch}, skip_batches={batches_yielded}")

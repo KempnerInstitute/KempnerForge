@@ -96,9 +96,7 @@ class Tokenizer:
         """
         return self._tokenizer.decode(token_ids, skip_special_tokens=skip_special_tokens)
 
-    def batch_encode(
-        self, texts: list[str], add_special_tokens: bool = False
-    ) -> list[list[int]]:
+    def batch_encode(self, texts: list[str], add_special_tokens: bool = False) -> list[list[int]]:
         """Encode a batch of texts to token IDs.
 
         Args:

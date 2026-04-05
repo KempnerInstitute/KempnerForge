@@ -137,6 +137,5 @@ def apply_fsdp2(
     )
 
     logger.info(
-        f"Applied FSDP2: dp_mesh={dp_mesh.mesh_dim_names}, "
-        f"blocks={len(model.layers)}, mp={policy}"
+        f"Applied FSDP2: dp_mesh={dp_mesh.mesh_dim_names}, blocks={len(model.layers)}, mp={policy}"
     )

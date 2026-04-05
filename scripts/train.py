@@ -138,7 +138,9 @@ def main() -> None:
 
         # Build pipeline stage and schedule
         pp_stage = build_pipeline_stage(
-            model, device_mesh, device,
+            model,
+            device_mesh,
+            device,
             batch_size=tc.batch_size,
             seq_len=tc.seq_len,
         )
@@ -220,10 +222,17 @@ def main() -> None:
             file_pattern=config.data.file_pattern,
         )
         sampler = DistributedSampler(
-            dataset, num_replicas=dp_size, rank=dp_rank, shuffle=True, seed=tc.seed,
+            dataset,
+            num_replicas=dp_size,
+            rank=dp_rank,
+            shuffle=True,
+            seed=tc.seed,
         )
         dataloader = StatefulDataLoader(
-            dataset, batch_size=tc.batch_size, sampler=sampler, config=config.data,
+            dataset,
+            batch_size=tc.batch_size,
+            sampler=sampler,
+            config=config.data,
         )
         logger.info(f"Dataset: {len(dataset):,} samples from {config.data.dataset_path}")
 

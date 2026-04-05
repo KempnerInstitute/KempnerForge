@@ -18,9 +18,7 @@ from kempnerforge.metrics.mfu import (
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-SMALL_CONFIG = ModelConfig(
-    dim=256, n_layers=4, n_heads=4, vocab_size=1000, max_seq_len=128
-)
+SMALL_CONFIG = ModelConfig(dim=256, n_layers=4, n_heads=4, vocab_size=1000, max_seq_len=128)
 
 
 # ---------------------------------------------------------------------------
@@ -59,8 +57,12 @@ class TestMFU:
 
     def test_llama_7b_flops_reasonable(self):
         config = ModelConfig(
-            dim=4096, n_layers=32, n_heads=32, vocab_size=32000,
-            ffn_hidden_dim=11008, max_seq_len=2048,
+            dim=4096,
+            n_layers=32,
+            n_heads=32,
+            vocab_size=32000,
+            ffn_hidden_dim=11008,
+            max_seq_len=2048,
         )
         flops = estimate_model_flops_per_token(config)
         # Llama 7B: ~41e9 FLOPS/token (6*7B + attention term)
@@ -176,9 +178,7 @@ class TestCompile:
 
         from kempnerforge.model.transformer import Transformer
 
-        config = ModelConfig(
-            dim=128, n_layers=2, n_heads=2, vocab_size=256, max_seq_len=32
-        )
+        config = ModelConfig(dim=128, n_layers=2, n_heads=2, vocab_size=256, max_seq_len=32)
         model = Transformer(config).to(DEVICE).eval()
 
         tokens = torch.randint(0, 256, (1, 16), device=DEVICE)
@@ -191,5 +191,5 @@ class TestCompile:
             compiled_out = compiled(tokens)
 
         assert torch.allclose(eager_out, compiled_out, atol=1e-4), (
-            f"Compiled output differs: max diff={( eager_out - compiled_out).abs().max().item()}"
+            f"Compiled output differs: max diff={(eager_out - compiled_out).abs().max().item()}"
         )

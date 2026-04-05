@@ -61,16 +61,11 @@ class TestKFtoHFKeyMapping:
 
     def test_mlp_projections(self):
         assert (
-            _kf_to_hf_key("layers.0.mlp.gate_proj.weight")
-            == "model.layers.0.mlp.gate_proj.weight"
+            _kf_to_hf_key("layers.0.mlp.gate_proj.weight") == "model.layers.0.mlp.gate_proj.weight"
         )
+        assert _kf_to_hf_key("layers.0.mlp.up_proj.weight") == "model.layers.0.mlp.up_proj.weight"
         assert (
-            _kf_to_hf_key("layers.0.mlp.up_proj.weight")
-            == "model.layers.0.mlp.up_proj.weight"
-        )
-        assert (
-            _kf_to_hf_key("layers.0.mlp.down_proj.weight")
-            == "model.layers.0.mlp.down_proj.weight"
+            _kf_to_hf_key("layers.0.mlp.down_proj.weight") == "model.layers.0.mlp.down_proj.weight"
         )
 
 

@@ -88,9 +88,7 @@ class TestPipelineStageModule:
         assert len(module.layers) == 4
 
     def test_single_stage_has_everything(self, small_config):
-        module = PipelineStageModule(
-            small_config, stage_id=0, num_stages=1, layer_range=(0, 8)
-        )
+        module = PipelineStageModule(small_config, stage_id=0, num_stages=1, layer_range=(0, 8))
         assert module.token_embedding is not None
         assert module.output_head is not None
         assert module.norm is not None
@@ -116,9 +114,7 @@ class TestPipelineStageModule:
         assert out.shape == (2, 16, 256)
 
     def test_single_stage_forward_shape(self, small_config):
-        module = PipelineStageModule(
-            small_config, stage_id=0, num_stages=1, layer_range=(0, 8)
-        )
+        module = PipelineStageModule(small_config, stage_id=0, num_stages=1, layer_range=(0, 8))
         tokens = torch.randint(0, 256, (2, 16))
         out = module(tokens)
         # Only stage → logits

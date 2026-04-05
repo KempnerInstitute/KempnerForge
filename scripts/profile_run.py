@@ -98,9 +98,7 @@ def main() -> None:
             for micro_step in range(tc.grad_accum_steps):
                 with maybe_no_sync(model, micro_step, tc.grad_accum_steps):
                     logits = model(input_ids)
-                    loss = F.cross_entropy(
-                        logits.view(-1, logits.size(-1)), labels.view(-1)
-                    )
+                    loss = F.cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1))
                     loss.backward()
 
             clip_grad_norm_(model, tc.grad_clip_norm)
@@ -123,11 +121,7 @@ def main() -> None:
         print("\n" + "=" * 100)
         print("TOP CUDA KERNELS (by FLOPS)")
         print("=" * 100)
-        print(
-            prof.key_averages().table(
-                sort_by="flops", row_limit=20, top_level_events_only=False
-            )
-        )
+        print(prof.key_averages().table(sort_by="flops", row_limit=20, top_level_events_only=False))
 
         # Compute aggregate stats
         total_cuda_time = 0
@@ -148,9 +142,19 @@ def main() -> None:
             total_cuda_time += cuda_us
             total_flops += evt.flops if evt.flops else 0
 
-            if any(k in name for k in [
-                "gemm", "mm", "matmul", "dot", "bmm", "cublas", "nvjet", "cutlass",
-            ]):
+            if any(
+                k in name
+                for k in [
+                    "gemm",
+                    "mm",
+                    "matmul",
+                    "dot",
+                    "bmm",
+                    "cublas",
+                    "nvjet",
+                    "cutlass",
+                ]
+            ):
                 matmul_time += cuda_us
             elif any(k in name for k in ["nccl", "allreduce", "allgather", "reduce_scatter"]):
                 comm_time += cuda_us
@@ -176,11 +180,12 @@ def main() -> None:
             achieved_tflops = total_flops / (total_cuda_time / 1e6) / 1e12
             print(f"  Achieved TFLOPS:    {achieved_tflops:.1f}")
             print("  H200 peak (bf16):   989 TFLOPS")
-            print(f"  Kernel efficiency:  {100*achieved_tflops/989:.1f}%")
+            print(f"  Kernel efficiency:  {100 * achieved_tflops / 989:.1f}%")
 
         # Export chrome trace for rank 0
         trace_path = "profiler_traces/trace_rank0.json"
         import os
+
         os.makedirs("profiler_traces", exist_ok=True)
         prof.export_chrome_trace(trace_path)
         print(f"\n  Chrome trace saved to: {trace_path}")

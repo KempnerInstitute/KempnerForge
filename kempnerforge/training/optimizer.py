@@ -60,8 +60,7 @@ def build_optimizer(
     n_decay = sum(p.numel() for p in decay_params)
     n_no_decay = sum(p.numel() for p in no_decay_params)
     logger.info(
-        f"Optimizer groups: {n_decay:,} params with decay, "
-        f"{n_no_decay:,} params without decay"
+        f"Optimizer groups: {n_decay:,} params with decay, {n_no_decay:,} params without decay"
     )
 
     if config.name == "adamw":

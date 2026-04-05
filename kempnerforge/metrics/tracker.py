@@ -171,9 +171,7 @@ class MetricsTracker:
             "grad_norm": f"{metrics.grad_norm:.3f}",
             "tok/s": f"{metrics.tokens_per_sec:,.0f}",
             "mfu": f"{metrics.mfu:.1%}",
-            "mem": (
-                f"{metrics.peak_gb:.1f}/{metrics.total_gb:.0f}GB"
-            ),
+            "mem": (f"{metrics.peak_gb:.1f}/{metrics.total_gb:.0f}GB"),
             "step_time": f"{metrics.step_time_sec:.2f}s",
         }
         logger.info(format_metrics(step, log_dict))

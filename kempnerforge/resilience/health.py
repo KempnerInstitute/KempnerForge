@@ -218,9 +218,13 @@ def log_health_status(device: int = 0) -> dict[str, bool | str]:
     """
     health = check_gpu_health(device)
 
-    status = "HEALTHY" if all(
-        health[k] for k in ("cuda_available", "device_accessible", "compute_ok", "memory_ok")
-    ) else "UNHEALTHY"
+    status = (
+        "HEALTHY"
+        if all(
+            health[k] for k in ("cuda_available", "device_accessible", "compute_ok", "memory_ok")
+        )
+        else "UNHEALTHY"
+    )
 
     logger.info(
         f"GPU {device} health: {status} | "

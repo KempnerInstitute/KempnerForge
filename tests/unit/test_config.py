@@ -252,13 +252,13 @@ class TestTomlLoading:
 
     def test_toml_with_typo_raises(self, tmp_path):
         bad_toml = tmp_path / "bad.toml"
-        bad_toml.write_text('[modell]\ndim = 512\n')
+        bad_toml.write_text("[modell]\ndim = 512\n")
         with pytest.raises(ValueError, match="Unknown config keys.*modell"):
             load_config(str(bad_toml), cli_args=[])
 
     def test_toml_field_typo_raises(self, tmp_path):
         bad_toml = tmp_path / "bad.toml"
-        bad_toml.write_text('[model]\ndimm = 512\n')
+        bad_toml.write_text("[model]\ndimm = 512\n")
         with pytest.raises(ValueError, match="Unknown config keys.*dimm"):
             load_config(str(bad_toml), cli_args=[])
 

@@ -60,9 +60,7 @@ class TestMetricsTracker:
     def test_mfu_computed(self):
         tracker = self._make_tracker()
         tracker.start_step()
-        result = tracker.end_step(
-            step=1, loss=2.0, grad_norm=1.0, lr=3e-4, tokens_in_step=100000
-        )
+        result = tracker.end_step(step=1, loss=2.0, grad_norm=1.0, lr=3e-4, tokens_in_step=100000)
         # MFU is computed (may be > 1 in tests due to near-zero step time)
         assert result.mfu > 0.0
 
@@ -123,9 +121,7 @@ class TestDeviceMemoryMonitor:
     def test_snapshot_triggered_at_step(self, tmp_path):
         if not torch.cuda.is_available():
             return
-        monitor = DeviceMemoryMonitor(
-            snapshot_step=3, snapshot_dir=str(tmp_path / "snapshots")
-        )
+        monitor = DeviceMemoryMonitor(snapshot_step=3, snapshot_dir=str(tmp_path / "snapshots"))
         monitor.report(step=1)
         assert not monitor._snapshot_taken
         monitor.report(step=3)
@@ -134,9 +130,7 @@ class TestDeviceMemoryMonitor:
     def test_snapshot_only_once(self, tmp_path):
         if not torch.cuda.is_available():
             return
-        monitor = DeviceMemoryMonitor(
-            snapshot_step=3, snapshot_dir=str(tmp_path / "snapshots")
-        )
+        monitor = DeviceMemoryMonitor(snapshot_step=3, snapshot_dir=str(tmp_path / "snapshots"))
         monitor.report(step=3)
         assert monitor._snapshot_taken
         # Second report at same step should not re-snapshot

@@ -88,9 +88,7 @@ class ModelConfig:
 
         # Divisibility checks
         if self.dim % self.n_heads != 0:
-            raise ValueError(
-                f"dim ({self.dim}) must be divisible by n_heads ({self.n_heads})"
-            )
+            raise ValueError(f"dim ({self.dim}) must be divisible by n_heads ({self.n_heads})")
         if self.n_heads % self.n_kv_heads != 0:
             raise ValueError(
                 f"n_heads ({self.n_heads}) must be divisible by n_kv_heads ({self.n_kv_heads})"
@@ -269,8 +267,7 @@ class DistributedConfig:
         other = self.dp_replicate * self.tp * self.pp * self.cp
         if world_size % other != 0:
             raise ValueError(
-                f"world_size ({world_size}) not divisible by "
-                f"dp_replicate*tp*pp*cp ({other})"
+                f"world_size ({world_size}) not divisible by dp_replicate*tp*pp*cp ({other})"
             )
         return world_size // other
 

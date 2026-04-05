@@ -95,9 +95,7 @@ def compute_layer_assignment(
         ValueError: If pp_size > n_layers.
     """
     if pp_size > n_layers:
-        raise ValueError(
-            f"pp_size ({pp_size}) cannot exceed n_layers ({n_layers})"
-        )
+        raise ValueError(f"pp_size ({pp_size}) cannot exceed n_layers ({n_layers})")
 
     base = n_layers // pp_size
     remainder = n_layers % pp_size
@@ -157,9 +155,7 @@ class PipelineStageModule(nn.Module):
 
         # Final norm + output head — only on last stage
         self.norm = (
-            build_norm(config.norm_type, config.dim, eps=config.norm_eps)
-            if self.is_last
-            else None
+            build_norm(config.norm_type, config.dim, eps=config.norm_eps) if self.is_last else None
         )
         self.output_head: OutputHead | None = (
             OutputHead(config.dim, config.vocab_size) if self.is_last else None
@@ -290,8 +286,11 @@ def build_pipeline_stage(
     else:
         input_args = (
             torch.zeros(
-                batch_size, seq_len, stage_module.config.dim,
-                dtype=torch.bfloat16, device=device,
+                batch_size,
+                seq_len,
+                stage_module.config.dim,
+                dtype=torch.bfloat16,
+                device=device,
             ),
         )
 

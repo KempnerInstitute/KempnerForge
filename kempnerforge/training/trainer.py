@@ -94,9 +94,7 @@ class Trainer:
 
         return model
 
-    def train_step(
-        self, batch: dict[str, torch.Tensor]
-    ) -> tuple[float, float]:
+    def train_step(self, batch: dict[str, torch.Tensor]) -> tuple[float, float]:
         """Execute a single training step with gradient accumulation.
 
         Args:

@@ -158,7 +158,8 @@ def apply_tensor_parallel(
     # Only when seq_parallel=True — matches the Shard(1) data flow from the final norm.
     if seq_parallel and not tie and getattr(model, "output_head", None) is not None:
         parallelize_module(
-            model.output_head, tp_mesh,
+            model.output_head,
+            tp_mesh,
             {"proj": ColwiseParallel(input_layouts=Shard(1), output_layouts=Replicate())},
         )
 

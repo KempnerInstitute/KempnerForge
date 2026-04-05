@@ -19,13 +19,9 @@ from kempnerforge.config.schema import (
 # Model configs
 # ---------------------------------------------------------------------------
 
-TINY_MODEL_CONFIG = ModelConfig(
-    dim=64, n_layers=2, n_heads=2, vocab_size=256, max_seq_len=64
-)
+TINY_MODEL_CONFIG = ModelConfig(dim=64, n_layers=2, n_heads=2, vocab_size=256, max_seq_len=64)
 
-SMALL_MODEL_CONFIG = ModelConfig(
-    dim=128, n_layers=4, n_heads=4, vocab_size=512, max_seq_len=128
-)
+SMALL_MODEL_CONFIG = ModelConfig(dim=128, n_layers=4, n_heads=4, vocab_size=512, max_seq_len=128)
 
 
 @pytest.fixture

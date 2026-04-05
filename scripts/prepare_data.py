@@ -22,8 +22,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Prepare tokenized .npy data")
     parser.add_argument("--output-dir", type=str, default="data/wikitext103")
     parser.add_argument("--tokenizer", type=str, default="gpt2")
-    parser.add_argument("--max-shard-tokens", type=int, default=50_000_000,
-                        help="Max tokens per .npy shard")
+    parser.add_argument(
+        "--max-shard-tokens", type=int, default=50_000_000, help="Max tokens per .npy shard"
+    )
     args = parser.parse_args()
 
     out_dir = Path(args.output_dir)

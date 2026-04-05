@@ -252,8 +252,12 @@ class TestTransformer:
     @pytest.mark.gpu
     def test_llama_7b_param_count(self):
         config = ModelConfig(
-            dim=4096, n_layers=32, n_heads=32, n_kv_heads=32,
-            vocab_size=32000, ffn_hidden_dim=11008,
+            dim=4096,
+            n_layers=32,
+            n_heads=32,
+            n_kv_heads=32,
+            vocab_size=32000,
+            ffn_hidden_dim=11008,
         )
         model = Transformer(config)
         total = sum(p.numel() for p in model.parameters())
@@ -271,8 +275,12 @@ class TestTransformer:
 
     def test_weight_tying(self):
         config = ModelConfig(
-            dim=256, n_layers=2, n_heads=4, vocab_size=1000,
-            max_seq_len=64, tie_embeddings=True,
+            dim=256,
+            n_layers=2,
+            n_heads=4,
+            vocab_size=1000,
+            max_seq_len=64,
+            tie_embeddings=True,
         )
         model = Transformer(config)
         assert model.output_head.proj.weight is model.token_embedding.embedding.weight
