@@ -62,42 +62,43 @@ class TestBuildNorm:
 
 class TestRoPE:
     def test_frequency_shape(self):
-        freqs = precompute_rope_frequencies(head_dim=128, max_seq_len=256, theta=10000.0)
-        assert freqs.shape == (256, 64)  # head_dim // 2
+        cos, sin = precompute_rope_frequencies(head_dim=128, max_seq_len=256, theta=10000.0)
+        assert cos.shape == (256, 64)  # head_dim // 2
+        assert sin.shape == (256, 64)
 
-    def test_complex_dtype(self):
-        freqs = precompute_rope_frequencies(head_dim=64, max_seq_len=16)
-        assert freqs.is_complex()
+    def test_real_dtype(self):
+        cos, sin = precompute_rope_frequencies(head_dim=64, max_seq_len=16)
+        assert cos.is_floating_point()
+        assert sin.is_floating_point()
 
     def test_unit_magnitude(self):
-        """All entries should have magnitude 1 (they're e^{i*theta})."""
-        freqs = precompute_rope_frequencies(head_dim=64, max_seq_len=128)
-        assert torch.allclose(freqs.abs(), torch.ones_like(freqs.abs()), atol=1e-5)
+        """cos² + sin² should equal 1 for all entries."""
+        cos, sin = precompute_rope_frequencies(head_dim=64, max_seq_len=128)
+        assert torch.allclose(cos.pow(2) + sin.pow(2), torch.ones_like(cos), atol=1e-5)
 
     def test_position_zero_is_identity(self):
-        """At position 0, rotation should be by angle 0 → e^{i*0} = 1+0j."""
-        freqs = precompute_rope_frequencies(head_dim=64, max_seq_len=16)
-        assert torch.allclose(freqs[0].real, torch.ones(32), atol=1e-5)
-        assert torch.allclose(freqs[0].imag, torch.zeros(32), atol=1e-5)
+        """At position 0, rotation should be by angle 0 → cos=1, sin=0."""
+        cos, sin = precompute_rope_frequencies(head_dim=64, max_seq_len=16)
+        assert torch.allclose(cos[0], torch.ones(32), atol=1e-5)
+        assert torch.allclose(sin[0], torch.zeros(32), atol=1e-5)
 
     def test_apply_rope_shape(self):
-        freqs = precompute_rope_frequencies(head_dim=64, max_seq_len=128)
+        cos, sin = precompute_rope_frequencies(head_dim=64, max_seq_len=128)
         x = torch.randn(2, 8, 128, 64)  # (batch, heads, seq, head_dim)
-        out = apply_rope(x, freqs)
+        out = apply_rope(x, cos, sin)
         assert out.shape == x.shape
 
     def test_apply_rope_preserves_dtype(self):
-        freqs = precompute_rope_frequencies(head_dim=64, max_seq_len=32)
+        cos, sin = precompute_rope_frequencies(head_dim=64, max_seq_len=32)
         x = torch.randn(1, 4, 32, 64, dtype=torch.bfloat16)
-        out = apply_rope(x, freqs)
+        out = apply_rope(x, cos, sin)
         assert out.dtype == torch.bfloat16
 
     def test_position_zero_is_identity_in_practice(self):
         """At position 0, apply_rope should not change the input."""
-        freqs = precompute_rope_frequencies(head_dim=64, max_seq_len=4)
+        cos, sin = precompute_rope_frequencies(head_dim=64, max_seq_len=4)
         x = torch.randn(1, 1, 1, 64)  # single position
-        freqs_0 = freqs[:1]
-        out = apply_rope(x, freqs_0)
+        out = apply_rope(x, cos[:1], sin[:1])
         assert torch.allclose(out, x, atol=1e-5)
 
 
@@ -109,23 +110,26 @@ class TestRoPE:
 class TestAttention:
     def test_mha_output_shape(self):
         attn = Attention(dim=256, n_heads=8, n_kv_heads=8).to(DEVICE)
-        freqs = precompute_rope_frequencies(32, 64).to(DEVICE)
+        cos, sin = precompute_rope_frequencies(32, 64)
+        cos, sin = cos.to(DEVICE), sin.to(DEVICE)
         x = torch.randn(2, 64, 256, device=DEVICE)
-        out = attn(x, freqs)
+        out = attn(x, cos, sin)
         assert out.shape == (2, 64, 256)
 
     def test_gqa_output_shape(self):
         attn = Attention(dim=256, n_heads=8, n_kv_heads=2).to(DEVICE)
-        freqs = precompute_rope_frequencies(32, 32).to(DEVICE)
+        cos, sin = precompute_rope_frequencies(32, 32)
+        cos, sin = cos.to(DEVICE), sin.to(DEVICE)
         x = torch.randn(1, 32, 256, device=DEVICE)
-        out = attn(x, freqs)
+        out = attn(x, cos, sin)
         assert out.shape == (1, 32, 256)
 
     def test_mqa_output_shape(self):
         attn = Attention(dim=256, n_heads=8, n_kv_heads=1).to(DEVICE)
-        freqs = precompute_rope_frequencies(32, 16).to(DEVICE)
+        cos, sin = precompute_rope_frequencies(32, 16)
+        cos, sin = cos.to(DEVICE), sin.to(DEVICE)
         x = torch.randn(1, 16, 256, device=DEVICE)
-        out = attn(x, freqs)
+        out = attn(x, cos, sin)
         assert out.shape == (1, 16, 256)
 
 
@@ -189,17 +193,19 @@ class TestTransformerBlock:
     def test_output_shape(self):
         config = ModelConfig(dim=256, n_layers=1, n_heads=4, vocab_size=1000, max_seq_len=64)
         block = TransformerBlock(config, layer_idx=0).to(DEVICE)
-        freqs = precompute_rope_frequencies(64, 32).to(DEVICE)
+        cos, sin = precompute_rope_frequencies(64, 32)
+        cos, sin = cos.to(DEVICE), sin.to(DEVICE)
         x = torch.randn(2, 32, 256, device=DEVICE)
-        assert block(x, freqs).shape == (2, 32, 256)
+        assert block(x, cos, sin).shape == (2, 32, 256)
 
     def test_residual_connection(self):
         """Output should differ from input (attention + MLP do something)."""
         config = ModelConfig(dim=256, n_layers=1, n_heads=4, vocab_size=1000, max_seq_len=64)
         block = TransformerBlock(config, layer_idx=0).to(DEVICE)
-        freqs = precompute_rope_frequencies(64, 16).to(DEVICE)
+        cos, sin = precompute_rope_frequencies(64, 16)
+        cos, sin = cos.to(DEVICE), sin.to(DEVICE)
         x = torch.randn(1, 16, 256, device=DEVICE)
-        out = block(x, freqs)
+        out = block(x, cos, sin)
         assert not torch.allclose(out, x)
 
 

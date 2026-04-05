@@ -107,15 +107,27 @@ def main() -> None:
         pp_rank = get_pp_rank(device_mesh)
         pp_size = get_pp_size(device_mesh)
 
-        # bf16 before GPU move — large stages in fp32 won't fit in GPU memory
-        stage_mod = build_stage_module(config.model, pp_rank, pp_size)
-        model = stage_mod.to(device=device, dtype=torch.bfloat16)
-        apply_ac(model, tc.activation_checkpointing)
+        tp_enabled_pp = device_mesh is not None and "tp" in device_mesh.mesh_dim_names
 
-        if device_mesh is not None and "tp" in device_mesh.mesh_dim_names:
+        if tp_enabled_pp:
+            # Meta-device init: same pattern as non-PP TP path.
+            # Avoids OOM for large PP stages that don't fit on one GPU before TP shards them.
+            with torch.device("meta"):
+                stage_mod = build_stage_module(config.model, pp_rank, pp_size)
+            model = stage_mod
             apply_tensor_parallel(model, device_mesh)
-        if device_mesh is not None:
-            apply_fsdp2(model, device_mesh)
+            apply_ac(model, tc.activation_checkpointing)
+            if device_mesh is not None:
+                apply_fsdp2(model, device_mesh)
+            model.to_empty(device=device)
+            model.init_weights_and_freqs()
+            model.to(dtype=torch.bfloat16)
+        else:
+            stage_mod = build_stage_module(config.model, pp_rank, pp_size)
+            model = stage_mod.to(device=device, dtype=torch.bfloat16)
+            apply_ac(model, tc.activation_checkpointing)
+            if device_mesh is not None:
+                apply_fsdp2(model, device_mesh)
 
         if tc.compile_model:
             logger.info("Compiling model with torch.compile...")
@@ -141,13 +153,30 @@ def main() -> None:
             schedule=config.distributed.pp_schedule.value,
         )
     else:
-        model = Transformer(config.model).to(device=device, dtype=torch.bfloat16)
-        apply_ac(model, tc.activation_checkpointing)
+        # Order matters: TP → AC → FSDP. AC wraps blocks in CheckpointWrapper,
+        # which changes submodule paths, so TP must see the raw blocks first.
+        tp_enabled = device_mesh is not None and "tp" in device_mesh.mesh_dim_names
 
-        if device_mesh is not None and "tp" in device_mesh.mesh_dim_names:
+        if tp_enabled:
+            # Meta-device init (torchtitan pattern): create model with zero memory,
+            # apply parallelisms, then materialize only the local shards on GPU.
+            # This avoids both CPU OOM (4 procs × 280 GB for 70B fp32) and GPU OOM
+            # (140 GB bf16 on 141 GB H200).
+            with torch.device("meta"):
+                model = Transformer(config.model)
             apply_tensor_parallel(model, device_mesh)
-        if device_mesh is not None:
-            apply_fsdp2(model, device_mesh)
+            apply_ac(model, tc.activation_checkpointing)
+            if device_mesh is not None:
+                apply_fsdp2(model, device_mesh)
+            # Materialize local shards and initialize weights
+            model.to_empty(device=device)
+            model.init_weights_and_freqs()
+            model.to(dtype=torch.bfloat16)
+        else:
+            model = Transformer(config.model).to(device=device, dtype=torch.bfloat16)
+            apply_ac(model, tc.activation_checkpointing)
+            if device_mesh is not None:
+                apply_fsdp2(model, device_mesh)
 
         if tc.compile_model:
             logger.info("Compiling model with torch.compile...")

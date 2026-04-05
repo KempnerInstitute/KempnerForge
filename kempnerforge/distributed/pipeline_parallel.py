@@ -10,8 +10,8 @@ Stage assignment:
 
 Application order when combining parallelisms:
   1. Build per-stage model via build_stage_module()
-  2. Activation checkpointing (per stage, via apply_ac)
-  3. Tensor parallelism (per stage, via apply_tensor_parallel)
+  2. Tensor parallelism (per stage, via apply_tensor_parallel) — must see raw blocks
+  3. Activation checkpointing (per stage, via apply_ac)
   4. FSDP2 (per stage, via apply_fsdp2 with reshard_after_forward=False)
 
 Note on FSDP reshard policy:
@@ -165,21 +165,33 @@ class PipelineStageModule(nn.Module):
             OutputHead(config.dim, config.vocab_size) if self.is_last else None
         )
 
-        # Precompute RoPE frequencies (all stages need this for their layers)
-        self._freqs_cis = precompute_rope_frequencies(
-            head_dim=config.head_dim,
-            max_seq_len=config.max_seq_len,
-            theta=config.rope_theta,
-        )
-
-        # Initialize weights
-        init_weights(self, config)
+        # Precompute RoPE cos/sin tables and initialize weights.
+        # Skip when on meta device (no data); call init_weights_and_freqs() later.
+        self._rope_cos = None
+        self._rope_sin = None
+        if not any(p.is_meta for p in self.parameters()):
+            self._rope_cos, self._rope_sin = precompute_rope_frequencies(
+                head_dim=config.head_dim,
+                max_seq_len=config.max_seq_len,
+                theta=config.rope_theta,
+            )
+            init_weights(self, config)
 
         logger.info(
             f"PP stage {stage_id}/{num_stages}: layers [{start}, {end}), "
             f"embedding={'yes' if self.is_first else 'no'}, "
             f"output={'yes' if self.is_last else 'no'}"
         )
+
+    def init_weights_and_freqs(self) -> None:
+        """Initialize weights and RoPE frequencies after meta-device materialization."""
+        if self._rope_cos is None:
+            self._rope_cos, self._rope_sin = precompute_rope_frequencies(
+                head_dim=self.config.head_dim,
+                max_seq_len=self.config.max_seq_len,
+                theta=self.config.rope_theta,
+            )
+        init_weights(self, self.config)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass for this pipeline stage.
@@ -196,13 +208,17 @@ class PipelineStageModule(nn.Module):
         if self.is_first and self.token_embedding is not None:
             x = self.token_embedding(x)
 
-        # Slice RoPE for current sequence length
+        # Slice RoPE for current sequence length (device transfer cached after first call)
         seq_len = x.shape[1]
-        freqs_cis = self._freqs_cis[:seq_len].to(x.device)
+        if self._rope_cos.device != x.device:
+            self._rope_cos = self._rope_cos.to(x.device)
+            self._rope_sin = self._rope_sin.to(x.device)
+        cos = self._rope_cos[:seq_len]
+        sin = self._rope_sin[:seq_len]
 
         # Run through assigned layers
         for layer in self.layers.values():
-            x = layer(x, freqs_cis)
+            x = layer(x, cos, sin)
 
         # Last stage: norm + output head
         if self.is_last:

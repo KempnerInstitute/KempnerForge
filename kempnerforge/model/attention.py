@@ -40,13 +40,15 @@ class Attention(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        freqs_cis: torch.Tensor,
+        rope_cos: torch.Tensor,
+        rope_sin: torch.Tensor,
     ) -> torch.Tensor:
         """Forward pass.
 
         Args:
             x: Input tensor of shape (batch, seq_len, dim).
-            freqs_cis: RoPE frequency tensor of shape (seq_len, head_dim // 2).
+            rope_cos: RoPE cosine frequencies, shape (seq_len, head_dim // 2).
+            rope_sin: RoPE sine frequencies, shape (seq_len, head_dim // 2).
 
         Returns:
             Output tensor of shape (batch, seq_len, dim).
@@ -66,8 +68,8 @@ class Attention(nn.Module):
         v = v.transpose(1, 2)
 
         # Apply RoPE to Q and K
-        q = apply_rope(q, freqs_cis)
-        k = apply_rope(k, freqs_cis)
+        q = apply_rope(q, rope_cos, rope_sin)
+        k = apply_rope(k, rope_cos, rope_sin)
 
         # Expand KV heads for GQA: (batch, n_kv_heads, seq, dim) → (batch, n_heads, seq, dim)
         if self.n_rep > 1:

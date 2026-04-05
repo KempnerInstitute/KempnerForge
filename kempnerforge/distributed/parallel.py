@@ -4,9 +4,9 @@ Applies fully_shard (FSDP2 composable API) and activation checkpointing
 to Transformer models. FSDP2 should always be applied LAST, after TP and AC.
 
 Recommended application order:
-  1. Activation checkpointing (apply_ac)
-  2. Tensor parallelism (apply_tensor_parallel)
-  3. FSDP2 (apply_fsdp2)
+  1. Tensor parallelism (apply_tensor_parallel) — must see raw blocks
+  2. Activation checkpointing (apply_ac) — wraps blocks in CheckpointWrapper
+  3. FSDP2 (apply_fsdp2) — shards everything
 """
 
 from __future__ import annotations

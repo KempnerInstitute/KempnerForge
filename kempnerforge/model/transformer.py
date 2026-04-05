@@ -48,9 +48,11 @@ class TransformerBlock(nn.Module):
             activation=config.activation,
         )
 
-    def forward(self, x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, rope_cos: torch.Tensor, rope_sin: torch.Tensor,
+    ) -> torch.Tensor:
         # Pre-norm attention with residual
-        x = x + self.attention(self.attention_norm(x), freqs_cis)
+        x = x + self.attention(self.attention_norm(x), rope_cos, rope_sin)
         # Pre-norm MLP with residual
         x = x + self.mlp(self.mlp_norm(x))
         return x
@@ -85,21 +87,33 @@ class Transformer(nn.Module):
         if config.tie_embeddings and can_tie:
             self.output_head.tie_weights(self.token_embedding)
 
-        # Precompute RoPE frequencies — stored as a plain attribute (not a buffer)
-        # to avoid dtype casts when calling model.to(bf16). Complex tensors cannot
-        # be cast to real dtypes. Device transfers are handled in forward().
-        self._freqs_cis = precompute_rope_frequencies(
-            head_dim=config.head_dim,
-            max_seq_len=config.max_seq_len,
-            theta=config.rope_theta,
-        )
+        # Precompute RoPE cos/sin tables — stored as plain attributes (not buffers)
+        # so model.to(bf16) doesn't cast them from float32.
+        # Skip when on meta device (no data); call init_weights_and_freqs() later.
+        self._rope_cos = None
+        self._rope_sin = None
+        if not any(p.is_meta for p in self.parameters()):
+            self._rope_cos, self._rope_sin = precompute_rope_frequencies(
+                head_dim=config.head_dim,
+                max_seq_len=config.max_seq_len,
+                theta=config.rope_theta,
+            )
+            init_weights(self, config)
 
-        # Initialize weights
-        init_weights(self, config)
+    def init_weights_and_freqs(self) -> None:
+        """Initialize weights and RoPE frequencies after meta-device materialization.
 
-    @property
-    def freqs_cis(self) -> torch.Tensor:
-        return self._freqs_cis
+        Called after ``model.to_empty(device=...)`` to fill in parameter values
+        and compute RoPE frequency table. Safe to call on already-initialized models
+        (skips if freqs are already computed).
+        """
+        if self._rope_cos is None:
+            self._rope_cos, self._rope_sin = precompute_rope_frequencies(
+                head_dim=self.config.head_dim,
+                max_seq_len=self.config.max_seq_len,
+                theta=self.config.rope_theta,
+            )
+        init_weights(self, self.config)
 
     def forward(
         self,
@@ -118,12 +132,16 @@ class Transformer(nn.Module):
         # Embed tokens (PP middle stages receive hidden states directly)
         h = self.token_embedding(tokens) if self.token_embedding is not None else tokens
 
-        # Slice RoPE frequencies for current sequence length, move to device
-        freqs_cis = self._freqs_cis[:seq_len].to(h.device)
+        # Slice RoPE frequencies for current sequence length (device transfer cached)
+        if self._rope_cos.device != h.device:
+            self._rope_cos = self._rope_cos.to(h.device)
+            self._rope_sin = self._rope_sin.to(h.device)
+        cos = self._rope_cos[:seq_len]
+        sin = self._rope_sin[:seq_len]
 
         # Transformer blocks
         for layer in self.layers.values():
-            h = layer(h, freqs_cis)
+            h = layer(h, cos, sin)
 
         # Final norm
         h = self.norm(h)

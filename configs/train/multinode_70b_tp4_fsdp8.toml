@@ -1,0 +1,75 @@
+# Multi-node training: 8 nodes × 4 GPUs = 32 GPUs
+# Parallelism: TP=4 (intra-node, NVLink) × FSDP=8 (inter-node, IB)
+# NO pipeline parallelism — eliminates bubble overhead
+# Model: Llama-3 70B architecture
+# Dataset: fineweb-edu tokenized with Llama-3 tokenizer (uint32 .bin files)
+#
+# Memory estimate per GPU:
+#   Sharded state (params+opt+grad): 70B × 16 bytes / 32 = 35 GB
+#   Remaining for activations: ~105 GB (with act. ckpt., <10 GB used)
+
+[model]
+dim = 8192
+n_layers = 80
+n_heads = 64
+n_kv_heads = 8
+vocab_size = 128256
+ffn_hidden_dim = 28672
+norm_type = "rmsnorm"
+activation = "silu"
+max_seq_len = 4096
+rope_theta = 500000.0
+tie_embeddings = false
+
+[train]
+batch_size = 2
+seq_len = 4096
+max_steps = 20
+grad_accum_steps = 4
+grad_clip_norm = 1.0
+seed = 42
+compile_model = true
+activation_checkpointing = "full"
+
+[optimizer]
+name = "adamw"
+lr = 1.5e-4
+weight_decay = 0.1
+betas = [0.9, 0.95]
+eps = 1e-8
+fused = true
+
+[scheduler]
+name = "cosine"
+warmup_steps = 50
+min_lr_ratio = 0.1
+
+[data]
+dataset_path = "/n/holylfs06/LABS/kempner_shared/Everyone/testbed/text/fineweb-edu/tokenized/meta-llama-3/default"
+file_pattern = "tokenized_*.bin"
+num_workers = 4
+pin_memory = true
+prefetch_factor = 2
+
+[distributed]
+dp_shard = 8
+dp_replicate = 1
+tp = 4
+pp = 1
+nccl_timeout_sec = 1200
+
+[checkpoint]
+dir = "checkpoints/multinode_70b_tp4_fsdp8"
+interval = 100
+async_mode = "async_with_pinned_mem"
+keep_last_n = 2
+
+[metrics]
+log_interval = 1
+enable_wandb = false
+enable_tensorboard = false
+
+[profiling]
+enable = false
+start_step = 5
+end_step = 8

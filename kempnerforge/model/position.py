@@ -1,4 +1,8 @@
-"""Rotary Position Embedding (RoPE) for KempnerForge models."""
+"""Rotary Position Embedding (RoPE) for KempnerForge models.
+
+Uses real-valued sin/cos rotation (not complex arithmetic) for
+compatibility with DTensor and SequenceParallel.
+"""
 
 from __future__ import annotations
 
@@ -10,11 +14,8 @@ def precompute_rope_frequencies(
     max_seq_len: int,
     theta: float = 10000.0,
     device: torch.device | None = None,
-) -> torch.Tensor:
-    """Precompute the complex-valued RoPE frequency table.
-
-    Returns a tensor of shape (max_seq_len, head_dim // 2) containing complex
-    exponentials e^{i * pos * freq} for each position and frequency pair.
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Precompute cos/sin RoPE frequency tables.
 
     Args:
         head_dim: Dimension per attention head (must be even).
@@ -23,7 +24,7 @@ def precompute_rope_frequencies(
         device: Device to place the tensor on.
 
     Returns:
-        Complex tensor of shape (max_seq_len, head_dim // 2).
+        Tuple of (cos, sin) tensors, each shape (max_seq_len, head_dim // 2).
     """
     assert head_dim % 2 == 0, f"head_dim must be even, got {head_dim}"
 
@@ -36,36 +37,35 @@ def precompute_rope_frequencies(
     # Outer product: (max_seq_len, head_dim // 2)
     freqs_table = torch.outer(positions, freqs)
 
-    # Complex exponentials: e^{i * theta}
-    return torch.polar(torch.ones_like(freqs_table), freqs_table)
+    return freqs_table.cos(), freqs_table.sin()
 
 
 def apply_rope(
     x: torch.Tensor,
-    freqs_cis: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
 ) -> torch.Tensor:
-    """Apply rotary position embeddings to a tensor.
+    """Apply rotary position embeddings using real-valued rotation.
 
     Args:
         x: Input tensor of shape (..., seq_len, head_dim).
-        freqs_cis: Complex frequency tensor of shape (seq_len, head_dim // 2)
-            or broadcastable prefix.
+        cos: Cosine frequencies, shape (seq_len, head_dim // 2).
+        sin: Sine frequencies, shape (seq_len, head_dim // 2).
 
     Returns:
         Tensor with RoPE applied, same shape and dtype as input.
     """
-    # Reshape x into pairs: (..., seq_len, head_dim//2, 2) and view as complex
-    dtype = x.dtype
-    x_pairs = x.float().reshape(*x.shape[:-1], -1, 2)
-    x_complex = torch.view_as_complex(x_pairs)
+    # Split head dim into two halves for paired rotation
+    d = x.shape[-1] // 2
+    x1, x2 = x[..., :d], x[..., d:]
 
-    # Broadcast freqs_cis to match x_complex shape
-    # x_complex: (batch, n_heads, seq_len, head_dim//2)
-    # freqs_cis: (seq_len, head_dim//2) → need to reshape for broadcasting
-    ndim = x_complex.ndim
-    shape = [1] * (ndim - 2) + list(freqs_cis.shape)
-    freqs_cis = freqs_cis.view(*shape)
+    # Broadcast cos/sin to match x shape: (seq_len, d) → (..., seq_len, d)
+    # Cast cos/sin to x's dtype (bf16) instead of casting x to float32,
+    # because .float() strips DTensor metadata needed for SequenceParallel.
+    ndim = x.ndim
+    shape = [1] * (ndim - 2) + list(cos.shape)
+    cos = cos.view(*shape).to(x.dtype)
+    sin = sin.view(*shape).to(x.dtype)
 
-    # Apply rotation in complex space and convert back to real pairs
-    x_rotated = torch.view_as_real(x_complex * freqs_cis).flatten(-2)
-    return x_rotated.to(dtype)
+    # Rotation: [x1, x2] → [x1*cos - x2*sin, x2*cos + x1*sin]
+    return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)

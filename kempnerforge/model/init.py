@@ -22,6 +22,8 @@ def init_weights(model: nn.Module, config: ModelConfig) -> None:
     residual_scale = 1.0 / math.sqrt(2.0 * config.n_layers)
 
     for name, param in model.named_parameters():
+        if param.is_meta:
+            continue
         if param.dim() < 2:
             # Bias and norm parameters: leave at default (zeros / ones)
             continue
