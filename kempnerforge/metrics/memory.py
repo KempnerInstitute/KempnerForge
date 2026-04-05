@@ -169,6 +169,6 @@ class DeviceMemoryMonitor:
             logger.info(f"Memory snapshot saved: {path}")
             return str(path)
 
-        except Exception as e:
+        except Exception as e:  # best-effort diagnostic; CUDA, disk, or pickle errors
             logger.warning(f"Memory snapshot failed: {e}")
             return None

@@ -262,6 +262,7 @@ def build_pipeline_stage(
     device: torch.device,
     batch_size: int,
     seq_len: int,
+    param_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.distributed.pipelining.PipelineStage:
     """Wrap a stage module in a PipelineStage for schedule execution.
 
@@ -271,6 +272,7 @@ def build_pipeline_stage(
         device: Device for this stage.
         batch_size: Micro-batch size (for shape inference).
         seq_len: Sequence length (for shape inference).
+        param_dtype: Dtype for intermediate activations (matches mixed precision).
 
     Returns:
         A PipelineStage ready for use with a pipeline schedule.
@@ -289,7 +291,7 @@ def build_pipeline_stage(
                 batch_size,
                 seq_len,
                 stage_module.config.dim,
-                dtype=torch.bfloat16,
+                dtype=param_dtype,
                 device=device,
             ),
         )

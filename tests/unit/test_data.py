@@ -358,7 +358,7 @@ class TestStreamingHuggingFaceDataset:
         # Mock tokenizer: each character → its ordinal (simple 1-to-1 mapping)
         mock_tokenizer = MagicMock()
         mock_tokenizer.eos_token_id = 0
-        mock_tokenizer.encode = lambda text: [ord(c) for c in text]
+        mock_tokenizer.encode = lambda text, **kwargs: [ord(c) for c in text]
         ds._tokenizer = mock_tokenizer
         ds._eos_id = 0
 

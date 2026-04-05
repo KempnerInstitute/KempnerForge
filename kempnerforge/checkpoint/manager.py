@@ -19,6 +19,7 @@ import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 
+from kempnerforge.checkpoint.async_save import AsyncCheckpointer
 from kempnerforge.checkpoint.state import build_train_state, restore_train_state
 from kempnerforge.config.schema import CheckpointConfig
 
@@ -54,6 +55,7 @@ class CheckpointManager:
         self.optimizer = optimizer
         self.base_dir = Path(config.dir)
         self._rank = dist.get_rank() if dist.is_initialized() else 0
+        self._async_ckpt = AsyncCheckpointer(mode=config.async_mode)
 
     def _checkpoint_dir(self, step: int) -> Path:
         return self.base_dir / f"step_{step}"
@@ -88,7 +90,7 @@ class CheckpointManager:
             "model": self.model.state_dict(),
             "optimizer": self.optimizer.state_dict(),
         }
-        dcp.save(dcp_state, checkpoint_id=str(ckpt_dir))
+        self._async_ckpt.save(dcp_state, checkpoint_id=str(ckpt_dir))
 
         # Save non-distributed state (rank 0 only)
         if self._rank == 0:
@@ -120,6 +122,10 @@ class CheckpointManager:
         # Barrier so all ranks wait for save to complete
         if dist.is_initialized():
             dist.barrier()
+
+    def wait(self) -> None:
+        """Block until any pending async checkpoint save completes."""
+        self._async_ckpt.wait()
 
     def load(
         self,

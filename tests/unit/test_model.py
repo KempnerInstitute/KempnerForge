@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import math
+
 import pytest
 import torch
 
 from kempnerforge.config.schema import ModelConfig
 from kempnerforge.model.attention import Attention
 from kempnerforge.model.embedding import OutputHead, TokenEmbedding
+from kempnerforge.model.init import init_weights
 from kempnerforge.model.mlp import StandardMLP, SwiGLUMLP, build_mlp
 from kempnerforge.model.norm import RMSNorm, build_norm
 from kempnerforge.model.position import apply_rope, precompute_rope_frequencies
@@ -288,3 +291,68 @@ class TestTransformer:
     def test_layer_keys_are_string_indices(self, small_config):
         model = Transformer(small_config)
         assert list(model.layers.keys()) == ["0", "1", "2", "3"]
+
+
+# ---------------------------------------------------------------------------
+# Weight initialization
+# ---------------------------------------------------------------------------
+
+_INIT_CONFIG = ModelConfig(dim=128, n_layers=4, n_heads=4, vocab_size=256, max_seq_len=32)
+
+
+class TestInitWeights:
+    def test_linear_weights_are_normal(self):
+        """init_weights should set linear weights to ~N(0, init_std)."""
+        model = Transformer(_INIT_CONFIG)
+        init_weights(model, _INIT_CONFIG)
+        for name, p in model.named_parameters():
+            if (
+                p.dim() >= 2
+                and "norm" not in name
+                and not name.endswith(("o_proj.weight", "down_proj.weight"))
+            ):
+                assert abs(p.std().item() - _INIT_CONFIG.init_std) < 0.015, (
+                    f"{name}: std={p.std().item():.4f}, expected ~{_INIT_CONFIG.init_std}"
+                )
+
+    def test_residual_projections_are_scaled(self):
+        """o_proj and down_proj should have std = init_std / sqrt(2 * n_layers)."""
+        model = Transformer(_INIT_CONFIG)
+        init_weights(model, _INIT_CONFIG)
+        expected_std = _INIT_CONFIG.init_std / math.sqrt(2.0 * _INIT_CONFIG.n_layers)
+        for name, p in model.named_parameters():
+            if name.endswith(("o_proj.weight", "down_proj.weight")):
+                assert abs(p.std().item() - expected_std) < 0.01, (
+                    f"{name}: std={p.std().item():.4f}, expected ~{expected_std:.4f}"
+                )
+
+    def test_norm_weights_unchanged(self):
+        """Norm weights should remain at 1.0 (default)."""
+        model = Transformer(_INIT_CONFIG)
+        init_weights(model, _INIT_CONFIG)
+        for name, p in model.named_parameters():
+            if "norm" in name and "weight" in name:
+                assert torch.allclose(p, torch.ones_like(p)), f"{name} should be all ones"
+
+    def test_custom_init_std(self):
+        """Custom init_std should be respected."""
+        config = ModelConfig(
+            dim=128, n_layers=4, n_heads=4, vocab_size=256, max_seq_len=32, init_std=0.01
+        )
+        model = Transformer(config)
+        init_weights(model, config)
+        stds = [
+            p.std().item()
+            for n, p in model.named_parameters()
+            if p.dim() >= 2
+            and "norm" not in n
+            and not n.endswith(("o_proj.weight", "down_proj.weight"))
+        ]
+        assert all(abs(s - 0.01) < 0.01 for s in stds)
+
+    def test_skips_meta_parameters(self):
+        """init_weights should skip parameters on meta device without error."""
+        with torch.device("meta"):
+            model = Transformer(_INIT_CONFIG)
+        # Should not raise even though all params are on meta device
+        init_weights(model, _INIT_CONFIG)

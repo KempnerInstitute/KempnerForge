@@ -9,7 +9,10 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    import torch
 
 # ---------------------------------------------------------------------------
 # Enums for constrained choices
@@ -73,6 +76,7 @@ class ModelConfig:
     max_seq_len: int = 2048
     rope_theta: float = 10000.0
     tie_embeddings: bool = False
+    init_std: float = 0.02  # Std for weight initialization (GPT-2/Llama default)
 
     def __post_init__(self) -> None:
         if self.n_kv_heads is None:
@@ -141,6 +145,7 @@ class TrainConfig:
     grad_clip_norm: float = 1.0
     seed: int = 42
     compile_model: bool = True
+    mixed_precision: Literal["bf16", "fp16", "fp32"] = "bf16"
     activation_checkpointing: ActivationCheckpointing = ActivationCheckpointing.none
 
     def __post_init__(self) -> None:
@@ -154,6 +159,15 @@ class TrainConfig:
             raise ValueError("grad_accum_steps must be positive")
         if self.grad_clip_norm <= 0:
             raise ValueError("grad_clip_norm must be positive")
+
+    @property
+    def param_dtype(self) -> torch.dtype:
+        """Resolve mixed_precision string to a torch dtype."""
+        import torch
+
+        return {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[
+            self.mixed_precision
+        ]
 
 
 # ---------------------------------------------------------------------------

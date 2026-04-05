@@ -65,7 +65,3 @@ def build_profiler(
     )
 
     return prof
-
-
-# Re-export for backwards compatibility
-from kempnerforge.profiling.cuda_timer import CUDATimer  # noqa: E402, F401

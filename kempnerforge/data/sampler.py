@@ -106,6 +106,7 @@ class DistributedSampler(Sampler[int]):
         return self.num_samples
 
     def state_dict(self) -> dict:
+        """Return checkpoint state. Keys: ``epoch``, ``seed``, ``num_replicas``, ``rank``."""
         return {
             "epoch": self._epoch,
             "seed": self.seed,
@@ -114,4 +115,5 @@ class DistributedSampler(Sampler[int]):
         }
 
     def load_state_dict(self, state: dict) -> None:
+        """Restore from checkpoint. Only ``epoch`` is restored; rank info is local."""
         self._epoch = state.get("epoch", 0)

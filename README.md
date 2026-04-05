@@ -5,8 +5,9 @@ A researcher-friendly, high-performance LLM training framework for large-scale d
 ## Features
 
 - **Decoder-only Transformer** with RoPE, GQA, SwiGLU MLP, RMSNorm
-- **FSDP2** with composable `fully_shard()`, mixed precision (bf16 compute, fp32 reduce)
-- **Tensor Parallelism** via `parallelize_module` + DTensor
+- **FSDP2** with composable `fully_shard()`, configurable mixed precision (bf16/fp16/fp32)
+- **Tensor Parallelism** with SequenceParallel, real-valued RoPE, meta-device initialization
+- **Pipeline Parallelism** via `torch.distributed.pipelining` with 1F1B/GPipe schedules
 - **Distributed Checkpointing** (DCP) with async save and auto-resume
 - **Stateful Data Pipeline** with memory-mapped datasets and exact mid-epoch resumption
 - **SLURM Integration** with preemption handling, requeue support, and multi-node launch scripts
@@ -58,7 +59,12 @@ uv run torchrun --nproc_per_node=4 scripts/train.py configs/train/default.toml \
   --model.dim=2048 --train.batch_size=8 --optimizer.lr=1e-4
 ```
 
-All config sections (`ModelConfig`, `TrainConfig`, `OptimizerConfig`, `SchedulerConfig`, `DistributedConfig`, `DataConfig`, `CheckpointConfig`) are defined as typed dataclasses in `kempnerforge/config/schema.py`.
+All config sections (`ModelConfig`, `TrainConfig`, `OptimizerConfig`, `SchedulerConfig`, `DistributedConfig`, `DataConfig`, `CheckpointConfig`, `MetricsConfig`, `ProfilingConfig`) are defined as typed dataclasses in `kempnerforge/config/schema.py`.
+
+Key config options:
+- `model.init_std` — weight initialization standard deviation (default 0.02)
+- `train.mixed_precision` — `"bf16"`, `"fp16"`, or `"fp32"` (default `"bf16"`)
+- `checkpoint.async_mode` — `"disabled"`, `"async"`, or `"async_with_pinned_mem"`
 
 ## Data Preparation
 
@@ -84,13 +90,13 @@ kempnerforge/
   distributed/ — DeviceMesh, FSDP2, tensor parallelism, distributed utils
   data/        — MemoryMappedDataset, StatefulDataLoader, DistributedSampler
   training/    — Optimizer (AdamW), LR schedulers (cosine/linear/WSD), gradient utils
-  checkpoint/  — DCP-based distributed checkpointing with async save
+  checkpoint/  — DCP-based distributed checkpointing with sync/async save
   resilience/  — Signal handling, NaN detection, GPU/NCCL health checks
   metrics/     — MetricsTracker, MFU computation, WandB/TensorBoard backends
   profiling/   — torch.profiler integration, CUDA timing
 configs/       — TOML configs for models, training, and cluster settings
 scripts/       — Training entry point, data prep, profiling, SLURM launch scripts
-tests/         — Unit (220+), integration (17), and distributed (25) tests
+tests/         — Unit (299), integration, distributed, and end-to-end tests
 ```
 
 ## Testing
@@ -105,9 +111,34 @@ uv run pytest tests/integration/
 # Distributed tests (4 GPUs)
 uv run torchrun --nproc_per_node=4 -m pytest tests/distributed/ -v
 
+# End-to-end tests (opt-in, 4 GPUs, ~2.5 min)
+uv run pytest tests/e2e/ --e2e -v
+
+# End-to-end including 7B model (~3 min)
+uv run pytest tests/e2e/ --e2e --slow -v
+
+# Everything (unit + e2e)
+uv run pytest tests/ --e2e --slow
+
 # Linting
 uv run ruff check kempnerforge/ tests/
 ```
+
+### End-to-End Tests
+
+E2E tests launch full training runs as subprocesses and verify they complete successfully. They are **opt-in** — skipped by default, activated with `--e2e`. All tests are self-contained (random data or synthetic `.npy` shards in temp directories).
+
+| Test | Parallelism | GPUs | What it verifies |
+|------|-------------|------|------------------|
+| Single GPU | — | 1 | Basic training loop, config loading |
+| FSDP | dp_shard=4 | 4 | `build_parallel_model` non-TP path |
+| TP only | tp=4 | 4 | Meta-device init, SequenceParallel |
+| TP + FSDP | tp=2, dp_shard=2 | 4 | Combined parallelism |
+| Pipeline Parallel | pp=2, dp_shard=2 | 4 | PP schedule, stage splitting |
+| fp16 | dp_shard=4, fp16 | 4 | `param_dtype` config path |
+| Data pipeline | dp_shard=4, synthetic .npy | 4 | MemoryMappedDataset, sampler, dataloader |
+| Checkpoint resume | dp_shard=4, save+load | 4 | DCP save, auto-resume from checkpoint |
+| 7B model (`--slow`) | tp=2, dp_shard=2, compile | 4 | Full production path with 7B Llama |
 
 ## Profiling
 
@@ -124,3 +155,4 @@ Outputs kernel-level GPU time breakdown, FLOPS analysis, MFU estimate, and a Chr
 - **Composition over inheritance**: components composed via config, not class hierarchies
 - **Minimal abstraction**: readable code over framework magic
 - **Stateful everything**: dataloader, sampler, and training state all support checkpoint/resume
+- **Configuration-driven**: all behavior controlled by typed dataclass configs, validated at startup

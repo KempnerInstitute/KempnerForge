@@ -179,7 +179,7 @@ def check_gpu_health(device: int = 0) -> dict[str, bool | str]:
         del buf
         result["memory_ok"] = True
 
-    except Exception as e:
+    except (RuntimeError, AssertionError) as e:
         result["error"] = str(e)
         logger.error(f"GPU health check failed on device {device}: {e}")
 
@@ -205,7 +205,7 @@ def check_nccl_health(timeout_sec: float = 10.0) -> bool:
         torch.cuda.synchronize()
         expected = dist.get_world_size()
         return tensor.item() == expected
-    except Exception as e:
+    except RuntimeError as e:
         logger.error(f"NCCL health check failed: {e}")
         return False
 

@@ -16,6 +16,30 @@ from kempnerforge.config.schema import (
 )
 
 # ---------------------------------------------------------------------------
+# CLI flags for opt-in test suites
+# ---------------------------------------------------------------------------
+
+
+def pytest_addoption(parser):
+    parser.addoption("--e2e", action="store_true", default=False, help="Run end-to-end tests")
+    parser.addoption("--slow", action="store_true", default=False, help="Include slow e2e tests")
+
+
+def pytest_collection_modifyitems(config, items):
+    run_e2e = config.getoption("--e2e")
+    run_slow = config.getoption("--slow")
+
+    skip_e2e = pytest.mark.skip(reason="E2E tests disabled (pass --e2e to run)")
+    skip_slow = pytest.mark.skip(reason="Slow tests disabled (pass --slow to run)")
+
+    for item in items:
+        if "e2e" in item.keywords and not run_e2e:
+            item.add_marker(skip_e2e)
+        elif "slow" in item.keywords and not run_slow:
+            item.add_marker(skip_slow)
+
+
+# ---------------------------------------------------------------------------
 # Model configs
 # ---------------------------------------------------------------------------
 

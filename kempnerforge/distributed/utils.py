@@ -16,6 +16,33 @@ from torch.distributed.device_mesh import DeviceMesh
 logger = logging.getLogger(__name__)
 
 
+def get_dp_info(device_mesh: DeviceMesh | None) -> tuple[int, int]:
+    """Get (dp_rank, dp_size) from the device mesh, accounting for PP/TP.
+
+    Handles all DeviceMesh configurations: HSDP (dp_replicate + dp_shard),
+    pure FSDP (dp_shard only), replicate-only, or no mesh (single GPU).
+
+    Args:
+        device_mesh: Full DeviceMesh, or None for single-GPU.
+
+    Returns:
+        Tuple of (dp_rank, dp_world_size).
+    """
+    if device_mesh is None:
+        return 0, 1
+    dim_names = device_mesh.mesh_dim_names
+    if "dp_shard" in dim_names and "dp_replicate" in dim_names:
+        dp_mesh = device_mesh["dp_replicate", "dp_shard"]
+        return dp_mesh.get_local_rank(), dp_mesh.size()
+    elif "dp_shard" in dim_names:
+        dp_mesh = device_mesh["dp_shard"]
+        return dp_mesh.get_local_rank(), dp_mesh.size()
+    elif "dp_replicate" in dim_names:
+        dp_mesh = device_mesh["dp_replicate"]
+        return dp_mesh.get_local_rank(), dp_mesh.size()
+    return 0, 1
+
+
 def clip_grad_norm_(
     model: torch.nn.Module,
     max_norm: float,

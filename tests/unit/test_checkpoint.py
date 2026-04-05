@@ -7,13 +7,14 @@ import random
 import numpy as np
 import torch
 
+from kempnerforge.checkpoint.async_save import AsyncCheckpointer
 from kempnerforge.checkpoint.state import (
     build_train_state,
     get_rng_state,
     restore_train_state,
     set_rng_state,
 )
-from kempnerforge.config.schema import CheckpointConfig
+from kempnerforge.config.schema import AsyncCheckpointMode, CheckpointConfig
 
 # ---------------------------------------------------------------------------
 # RNG state capture/restore
@@ -176,3 +177,70 @@ class TestCheckpointRetention:
 
         remaining = sorted(d.name for d in tmp_path.iterdir() if d.is_dir())
         assert remaining == ["step_10", "step_20"]
+
+
+# ---------------------------------------------------------------------------
+# AsyncCheckpointer
+# ---------------------------------------------------------------------------
+
+
+class TestAsyncCheckpointer:
+    def test_default_mode_is_disabled(self):
+        ckpt = AsyncCheckpointer()
+        assert ckpt.mode == AsyncCheckpointMode.disabled
+
+    def test_is_pending_initially_false(self):
+        ckpt = AsyncCheckpointer()
+        assert not ckpt.is_pending
+
+    def test_wait_with_no_pending_is_noop(self):
+        ckpt = AsyncCheckpointer()
+        ckpt.wait()  # Should not raise
+
+    def test_disabled_mode_calls_dcp_save(self, monkeypatch, tmp_path):
+        from unittest.mock import MagicMock
+
+        mock_save = MagicMock()
+        monkeypatch.setattr("kempnerforge.checkpoint.async_save.dcp.save", mock_save)
+        ckpt = AsyncCheckpointer(mode=AsyncCheckpointMode.disabled)
+        ckpt.save({"model": {}}, checkpoint_id=str(tmp_path / "step_1"))
+        mock_save.assert_called_once()
+        assert not ckpt.is_pending
+
+    def test_async_mode_calls_async_save(self, monkeypatch, tmp_path):
+        from unittest.mock import MagicMock
+
+        mock_future = MagicMock()
+        mock_async = MagicMock(return_value=mock_future)
+        monkeypatch.setattr("kempnerforge.checkpoint.async_save.dcp.async_save", mock_async)
+        ckpt = AsyncCheckpointer(mode=AsyncCheckpointMode.async_)
+        ckpt.save({"model": {}}, checkpoint_id=str(tmp_path / "step_1"))
+        mock_async.assert_called_once()
+        assert ckpt.is_pending
+
+    def test_wait_resolves_pending_future(self, monkeypatch, tmp_path):
+        from unittest.mock import MagicMock
+
+        mock_future = MagicMock()
+        monkeypatch.setattr(
+            "kempnerforge.checkpoint.async_save.dcp.async_save", MagicMock(return_value=mock_future)
+        )
+        ckpt = AsyncCheckpointer(mode=AsyncCheckpointMode.async_)
+        ckpt.save({"model": {}}, checkpoint_id=str(tmp_path / "step_1"))
+        assert ckpt.is_pending
+        ckpt.wait()
+        mock_future.result.assert_called_once()
+        assert not ckpt.is_pending
+
+    def test_save_waits_for_previous(self, monkeypatch, tmp_path):
+        from unittest.mock import MagicMock
+
+        mock_future1 = MagicMock()
+        mock_future2 = MagicMock()
+        mock_async = MagicMock(side_effect=[mock_future1, mock_future2])
+        monkeypatch.setattr("kempnerforge.checkpoint.async_save.dcp.async_save", mock_async)
+        ckpt = AsyncCheckpointer(mode=AsyncCheckpointMode.async_)
+        ckpt.save({"model": {}}, checkpoint_id=str(tmp_path / "step_1"))
+        ckpt.save({"model": {}}, checkpoint_id=str(tmp_path / "step_2"))
+        # First future should have been waited on before second save
+        mock_future1.result.assert_called_once()

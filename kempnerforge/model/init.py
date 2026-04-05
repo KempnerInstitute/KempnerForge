@@ -18,7 +18,7 @@ def init_weights(model: nn.Module, config: ModelConfig) -> None:
     - Residual output projections (o_proj, down_proj): scaled by 1/sqrt(2 * n_layers)
     - Norm layers: weight=1 (already default)
     """
-    std = 0.02
+    std = config.init_std
     residual_scale = 1.0 / math.sqrt(2.0 * config.n_layers)
 
     for name, param in model.named_parameters():

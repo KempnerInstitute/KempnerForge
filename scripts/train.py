@@ -30,13 +30,17 @@ from kempnerforge.config.loader import load_config
 from kempnerforge.data.dataloader import StatefulDataLoader
 from kempnerforge.data.dataset import MemoryMappedDataset
 from kempnerforge.data.sampler import DistributedSampler
-from kempnerforge.distributed.parallel import apply_ac, apply_fsdp2
+from kempnerforge.distributed.parallel import (
+    apply_ac,
+    apply_fsdp2,
+    build_parallel_model,
+    default_mp_policy,
+)
 from kempnerforge.distributed.setup import destroy_distributed, get_world_info, init_distributed
 from kempnerforge.distributed.tensor_parallel import apply_tensor_parallel
-from kempnerforge.distributed.utils import clip_grad_norm_
+from kempnerforge.distributed.utils import clip_grad_norm_, get_dp_info
 from kempnerforge.metrics.logger import get_logger
 from kempnerforge.metrics.tracker import MetricsTracker
-from kempnerforge.model.transformer import Transformer
 from kempnerforge.resilience.elastic import log_job_info, resolve_resume_path
 from kempnerforge.resilience.health import NaNDetector
 from kempnerforge.resilience.signal_handler import ShutdownHandler
@@ -45,23 +49,6 @@ from kempnerforge.training.optimizer import build_optimizer
 from kempnerforge.training.scheduler import build_scheduler
 
 logger = get_logger(__name__)
-
-
-def _get_dp_info(device_mesh) -> tuple[int, int]:
-    """Get (dp_rank, dp_size) from the device mesh, accounting for PP/TP."""
-    if device_mesh is None:
-        return 0, 1
-    dim_names = device_mesh.mesh_dim_names
-    if "dp_shard" in dim_names and "dp_replicate" in dim_names:
-        dp_mesh = device_mesh["dp_replicate", "dp_shard"]
-        return dp_mesh.get_local_rank(), dp_mesh.size()
-    elif "dp_shard" in dim_names:
-        dp_mesh = device_mesh["dp_shard"]
-        return dp_mesh.get_local_rank(), dp_mesh.size()
-    elif "dp_replicate" in dim_names:
-        dp_mesh = device_mesh["dp_replicate"]
-        return dp_mesh.get_local_rank(), dp_mesh.size()
-    return 0, 1
 
 
 def main() -> None:
@@ -93,6 +80,7 @@ def main() -> None:
     tc = config.train
     mc = config.model
     pp_enabled = config.distributed.pp > 1
+    mp_policy = default_mp_policy(tc.param_dtype)
 
     # --- Model ---
     if pp_enabled:
@@ -118,16 +106,16 @@ def main() -> None:
             apply_tensor_parallel(model, device_mesh)
             apply_ac(model, tc.activation_checkpointing)
             if device_mesh is not None:
-                apply_fsdp2(model, device_mesh)
+                apply_fsdp2(model, device_mesh, mp_policy=mp_policy)
             model.to_empty(device=device)
             model.init_weights_and_freqs()
-            model.to(dtype=torch.bfloat16)
+            model.to(dtype=tc.param_dtype)
         else:
             stage_mod = build_stage_module(config.model, pp_rank, pp_size)
-            model = stage_mod.to(device=device, dtype=torch.bfloat16)
+            model = stage_mod.to(device=device, dtype=tc.param_dtype)
             apply_ac(model, tc.activation_checkpointing)
             if device_mesh is not None:
-                apply_fsdp2(model, device_mesh)
+                apply_fsdp2(model, device_mesh, mp_policy=mp_policy)
 
         if tc.compile_model:
             logger.info("Compiling model with torch.compile...")
@@ -143,6 +131,7 @@ def main() -> None:
             device,
             batch_size=tc.batch_size,
             seq_len=tc.seq_len,
+            param_dtype=tc.param_dtype,
         )
 
         def pp_loss_fn(logits, labels):
@@ -155,37 +144,15 @@ def main() -> None:
             schedule=config.distributed.pp_schedule.value,
         )
     else:
-        # Order matters: TP → AC → FSDP. AC wraps blocks in CheckpointWrapper,
-        # which changes submodule paths, so TP must see the raw blocks first.
-        tp_enabled = device_mesh is not None and "tp" in device_mesh.mesh_dim_names
-
-        if tp_enabled:
-            # Meta-device init (torchtitan pattern): create model with zero memory,
-            # apply parallelisms, then materialize only the local shards on GPU.
-            # This avoids both CPU OOM (4 procs × 280 GB for 70B fp32) and GPU OOM
-            # (140 GB bf16 on 141 GB H200).
-            with torch.device("meta"):
-                model = Transformer(config.model)
-            apply_tensor_parallel(model, device_mesh)
-            apply_ac(model, tc.activation_checkpointing)
-            if device_mesh is not None:
-                apply_fsdp2(model, device_mesh)
-            # Materialize local shards and initialize weights
-            model.to_empty(device=device)
-            model.init_weights_and_freqs()
-            model.to(dtype=torch.bfloat16)
-        else:
-            model = Transformer(config.model).to(device=device, dtype=torch.bfloat16)
-            apply_ac(model, tc.activation_checkpointing)
-            if device_mesh is not None:
-                apply_fsdp2(model, device_mesh)
-
-        if tc.compile_model:
-            logger.info("Compiling model with torch.compile...")
-            model = torch.compile(model)
-
-        n_params = sum(p.numel() for p in model.parameters())
-        logger.info(f"Model: {n_params:,} parameters")
+        model = build_parallel_model(
+            config.model,
+            device,
+            device_mesh,
+            ac_mode=tc.activation_checkpointing,
+            mp_policy=mp_policy,
+            param_dtype=tc.param_dtype,
+            compile_model=tc.compile_model,
+        )
 
     # --- Optimizer + Scheduler ---
     optimizer = build_optimizer(model, config.optimizer)
@@ -210,7 +177,7 @@ def main() -> None:
     # --- Data ---
     # With PP, sampler should use DP rank/size (not total world size) since
     # all PP stages in the same DP group process the same batch.
-    dp_rank, dp_size = _get_dp_info(device_mesh)
+    dp_rank, dp_size = get_dp_info(device_mesh)
 
     dataset = None
     dataloader = None

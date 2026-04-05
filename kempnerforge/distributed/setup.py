@@ -131,7 +131,10 @@ def init_distributed(config: DistributedConfig, seed: int = 42) -> DeviceMesh | 
     resolved = config.resolve(world_size)
 
     # Build DeviceMesh — only include dimensions with size > 1
-    # to avoid unnecessary process groups for degenerate dimensions
+    # to avoid unnecessary process groups for degenerate dimensions.
+    # Exception: always include dp_shard when TP is active, even if dp_shard=1.
+    # FSDP2 wrapping converts all params to DTensors, which the optimizer needs
+    # when TP has already made some params DTensors.
     mesh_dims: list[str] = []
     mesh_sizes: list[int] = []
 
@@ -146,6 +149,14 @@ def init_distributed(config: DistributedConfig, seed: int = 42) -> DeviceMesh | 
         if size > 1:
             mesh_dims.append(name)
             mesh_sizes.append(size)
+
+    # When TP is active, ensure dp_shard is in the mesh so FSDP2 can wrap
+    # all parameters as DTensors (required for fused optimizer compatibility).
+    if resolved.tp > 1 and "dp_shard" not in mesh_dims:
+        # Insert dp_shard before tp (mesh order: pp, dp_replicate, dp_shard, tp)
+        tp_idx = mesh_dims.index("tp")
+        mesh_dims.insert(tp_idx, "dp_shard")
+        mesh_sizes.insert(tp_idx, 1)
 
     # If all dimensions are 1 (pure single-dim), create a flat DP mesh
     if not mesh_dims:

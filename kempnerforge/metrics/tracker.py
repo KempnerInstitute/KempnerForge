@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from kempnerforge.config.schema import JobConfig, MetricsConfig
 from kempnerforge.metrics.logger import format_metrics, get_logger
 from kempnerforge.metrics.memory import get_memory_stats, get_memory_utilization
-from kempnerforge.metrics.mfu import compute_mfu
+from kempnerforge.metrics.mfu import compute_mfu, get_gpu_peak_tflops
 
 logger = get_logger(__name__)
 
@@ -58,7 +58,7 @@ class MetricsTracker:
         self.model_config = config.model
         self.train_config = config.train
         self.num_gpus = num_gpus
-        self.gpu_peak_tflops = gpu_peak_tflops
+        self.gpu_peak_tflops = gpu_peak_tflops or get_gpu_peak_tflops()
 
         # Smoothed metrics (exponential moving average)
         self._ema_alpha = 0.1
@@ -247,7 +247,7 @@ class WandBBackend(_LoggingBackend):
         except ImportError:
             logger.warning("wandb not installed — disabling WandB backend")
             self._run = False  # Sentinel: tried and failed
-        except Exception as e:
+        except Exception as e:  # wandb.init() can raise many third-party errors (network, auth)
             logger.warning(f"WandB init failed: {e}")
             self._run = False
 

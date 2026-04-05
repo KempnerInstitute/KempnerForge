@@ -89,6 +89,7 @@ class StatefulDataLoader:
         return len(self._dataloader)
 
     def state_dict(self) -> dict:
+        """Return checkpoint state. Keys: ``epoch``, ``batches_yielded``, ``sampler``."""
         return {
             "epoch": self._epoch,
             "batches_yielded": self._batches_yielded,
@@ -96,6 +97,7 @@ class StatefulDataLoader:
         }
 
     def load_state_dict(self, state: dict) -> None:
+        """Restore from checkpoint. Restores sampler state and skips to saved batch position."""
         self._epoch = state.get("epoch", 0)
         batches_yielded = state.get("batches_yielded", 0)
 

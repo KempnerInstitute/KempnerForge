@@ -118,9 +118,11 @@ class MemoryMappedDataset(Dataset):
         return lo
 
     def state_dict(self) -> dict:
+        """Return checkpoint state. Keys: ``epoch``, ``total_samples``."""
         return {"epoch": self._epoch, "total_samples": self._total_samples}
 
     def load_state_dict(self, state: dict) -> None:
+        """Restore from checkpoint. Only ``epoch`` is restored; sample count is derived."""
         self._epoch = state.get("epoch", 0)
 
 
@@ -147,14 +149,13 @@ class HuggingFaceDataset(Dataset):
         tokenizer_path: str,
     ) -> None:
         from datasets import load_dataset
-
-        from kempnerforge.data.tokenizer import Tokenizer
+        from transformers import AutoTokenizer
 
         self.seq_len = seq_len
         self.text_field = text_field
 
         # Load tokenizer
-        self._tokenizer = Tokenizer.from_pretrained(tokenizer_path)
+        self._tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
         self._eos_id = self._tokenizer.eos_token_id or 0
 
         # Load dataset
@@ -186,7 +187,7 @@ class HuggingFaceDataset(Dataset):
 
         for example in raw_dataset:
             text = example[self.text_field]
-            tokens = self._tokenizer.encode(text)
+            tokens = self._tokenizer.encode(text, add_special_tokens=False)
             if not tokens:
                 continue
             buffer.extend(tokens)
@@ -211,6 +212,7 @@ class HuggingFaceDataset(Dataset):
         }
 
     def state_dict(self) -> dict:
+        """Return checkpoint state. Keys: ``epoch``, ``sample_idx``, ``total_sequences``."""
         return {
             "epoch": self._epoch,
             "sample_idx": self._sample_idx,
@@ -218,6 +220,7 @@ class HuggingFaceDataset(Dataset):
         }
 
     def load_state_dict(self, state: dict) -> None:
+        """Restore from checkpoint. Restores ``epoch`` and ``sample_idx``."""
         self._epoch = state.get("epoch", 0)
         self._sample_idx = state.get("sample_idx", 0)
 
@@ -286,9 +289,11 @@ class StreamingHuggingFaceDataset(torch.utils.data.IterableDataset):
     def _ensure_tokenizer(self):
         """Lazy-load tokenizer on first use."""
         if self._tokenizer is None:
-            from kempnerforge.data.tokenizer import Tokenizer
+            from transformers import AutoTokenizer
 
-            self._tokenizer = Tokenizer.from_pretrained(self.tokenizer_path)
+            self._tokenizer = AutoTokenizer.from_pretrained(
+                self.tokenizer_path, trust_remote_code=True
+            )
             self._eos_id = self._tokenizer.eos_token_id or 0
 
     def _load_stream(self):
@@ -328,7 +333,7 @@ class StreamingHuggingFaceDataset(torch.utils.data.IterableDataset):
                 continue
 
             text = example[self.text_field]
-            tokens = self._tokenizer.encode(text)
+            tokens = self._tokenizer.encode(text, add_special_tokens=False)
             if not tokens:
                 rank_docs += 1
                 doc_idx += 1
@@ -356,12 +361,14 @@ class StreamingHuggingFaceDataset(torch.utils.data.IterableDataset):
         self._rank_docs_consumed = 0
 
     def state_dict(self) -> dict:
+        """Return checkpoint state. Keys: ``epoch``, ``rank_docs_consumed``."""
         return {
             "epoch": self._epoch,
             "rank_docs_consumed": self._rank_docs_consumed,
         }
 
     def load_state_dict(self, state: dict) -> None:
+        """Restore from checkpoint. Sets skip count to fast-forward on next iteration."""
         self._epoch = state.get("epoch", 0)
         self._skip_rank_docs = state.get("rank_docs_consumed", 0)
         self._rank_docs_consumed = 0

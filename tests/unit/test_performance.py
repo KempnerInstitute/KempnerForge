@@ -124,7 +124,7 @@ class TestProfiler:
     def test_cuda_timer(self):
         if not torch.cuda.is_available():
             return
-        from kempnerforge.profiling.profiler import CUDATimer
+        from kempnerforge.profiling.cuda_timer import CUDATimer
 
         timer = CUDATimer()
         timer.start()
