@@ -43,15 +43,28 @@ export MASTER_ADDR=$(scontrol show hostnames "${SLURM_JOB_NODELIST}" | head -n 1
 export MASTER_PORT=$(comm -23 <(seq 15000 20000 | sort) \
     <(ss -Htan | awk '{print $4}' | cut -d':' -f2 | sort -u) | shuf | head -n 1)
 
-# ---- Environment ----
-# Prevent NCCL memory stacking
-export TORCH_NCCL_AVOID_RECORD_STREAMS=1
+# ---- Network interface detection ----
+# Detect the first UP InfiniBand interface with an IP address.
+# Verified across all Kempner node types (H200, H100, A100):
+#   - H200/H100: 4x CX-7 NDR (ib0-ib3), only ib0 has IP
+#   - A100: 1x CX-6 HDR (ib0), has IP
+# Without explicit IFNAME, gloo binds to em4 (management Ethernet) which
+# can cause timeouts for multi-node collectives (wrong subnet / firewall).
+IB_IFNAME=$(ip -br addr | awk '/^ib[0-9]+\s+UP\s+[0-9]/ {print $1; exit}')
+IB_IFNAME="${IB_IFNAME:-ib0}"
 
-# Use InfiniBand for inter-node communication
-export NCCL_SOCKET_IFNAME=ib0
+# ---- Environment ----
+# NCCL: use IB for RDMA data transport, IB interface for OOB bootstrap socket.
+# NCCL auto-discovers all active HCAs and selects the closest per GPU via
+# PCIe topology — no need for NCCL_IB_HCA on multi-HCA nodes.
+export NCCL_SOCKET_IFNAME="${IB_IFNAME}"
 export NCCL_IB_DISABLE=0
 export NCCL_NET_GDR_LEVEL=2
 export NCCL_IB_GID_INDEX=3
+
+# Gloo: used by DCP async checkpoint for CPU-side coordination.
+# Must bind to the same IB interface so peer connections route correctly.
+export GLOO_SOCKET_IFNAME="${IB_IFNAME}"
 
 # Timeout for NCCL operations (seconds) — increase for large clusters
 export NCCL_TIMEOUT=600
@@ -65,6 +78,7 @@ echo "Nodes:        ${NNODES} (${SLURM_JOB_NODELIST})"
 echo "GPUs/node:    ${NGPUS_PER_NODE}"
 echo "Total GPUs:   $((NNODES * NGPUS_PER_NODE))"
 echo "Master:       ${MASTER_ADDR}:${MASTER_PORT}"
+echo "IB interface: ${IB_IFNAME}"
 echo "Config:       ${CONFIG}"
 echo "Overrides:    ${OVERRIDES}"
 echo "Restart cnt:  ${SLURM_RESTART_COUNT:-0}"

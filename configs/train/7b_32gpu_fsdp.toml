@@ -1,7 +1,14 @@
-# Multi-node training: 3 nodes × 4 GPUs = 12 GPUs
-# Parallelism: TP=4 (intra-node, NVLink) × FSDP=3 (inter-node, IB)
-# Model: Llama-3 7B architecture with vocab_size=128256
-# Dataset: fineweb-edu tokenized with Llama-3 tokenizer (uint32 .bin files)
+# Llama-3 7B — 32 GPUs (8 nodes × 4), pure FSDP.
+# Simplest multi-node config, good baseline for 7B training.
+#
+# Usage: sbatch --nodes=8 scripts/slurm/multinode.sh configs/train/7b_32gpu_fsdp.toml
+#
+# Memory per GPU:
+#   Sharded state (params+opt+grad): 7B × 16 bytes / 32 = 3.5 GB
+#   Remaining for activations: ~137 GB (with act. ckpt., <10 GB used)
+#
+# Throughput:
+#   Global batch = 32 GPUs × 4 batch × 4 accum = 512 seqs = 2M tokens/step
 
 [model]
 dim = 4096
@@ -10,17 +17,17 @@ n_heads = 32
 n_kv_heads = 8
 vocab_size = 128256
 ffn_dim_multiplier = 1.3
-max_seq_len = 4096
 norm_type = "rmsnorm"
 activation = "silu"
+max_seq_len = 4096
 rope_theta = 500000.0
 tie_embeddings = false
 
 [train]
 batch_size = 4
 seq_len = 4096
-max_steps = 500
-grad_accum_steps = 8
+max_steps = 50
+grad_accum_steps = 4
 grad_clip_norm = 1.0
 seed = 42
 compile_model = true
@@ -36,7 +43,7 @@ fused = true
 
 [scheduler]
 name = "cosine"
-warmup_steps = 50
+warmup_steps = 10
 min_lr_ratio = 0.1
 
 [data]
@@ -47,23 +54,22 @@ pin_memory = true
 prefetch_factor = 2
 
 [distributed]
-dp_shard = 3
+dp_shard = -1
 dp_replicate = 1
-tp = 4
+tp = 1
 pp = 1
+nccl_timeout_sec = 600
 
 [checkpoint]
-dir = "checkpoints/multinode_tp4_fsdp3"
-interval = 100
+dir = "checkpoints/7b_32gpu_fsdp"
+interval = 25
 async_mode = "async_with_pinned_mem"
-keep_last_n = 3
+keep_last_n = 2
 
 [metrics]
 log_interval = 1
-enable_wandb = false
-enable_tensorboard = false
+enable_wandb = true
+wandb_project = "kempnerforge"
 
 [profiling]
 enable = false
-start_step = 5
-end_step = 8

@@ -421,6 +421,9 @@ def main() -> None:
         if rank == 0:
             print_profiler_summary(prof, trace_dir=config.profiling.trace_dir)
 
+    # Flush any pending async checkpoint before tearing down process group
+    ckpt_mgr.wait()
+
     logger.info(f"Training complete: {step} steps, {tokens_seen:,} tokens")
     tracker.close()
     destroy_distributed()

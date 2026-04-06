@@ -1,10 +1,9 @@
-# Multi-node training: 8 nodes × 4 GPUs = 32 GPUs
-# Parallelism: TP=4 (intra-node, NVLink) × FSDP=8 (inter-node, IB)
-# NO pipeline parallelism — eliminates bubble overhead
-# Model: Llama-3 70B architecture
-# Dataset: fineweb-edu tokenized with Llama-3 tokenizer (uint32 .bin files)
+# Llama-3 70B — 32 GPUs (8 nodes × 4), TP=4 + FSDP=8.
+# No pipeline parallelism — eliminates PP bubble overhead.
 #
-# Memory estimate per GPU:
+# Usage: sbatch --nodes=8 scripts/slurm/multinode.sh configs/train/70b_32gpu_tp4.toml
+#
+# Memory per GPU:
 #   Sharded state (params+opt+grad): 70B × 16 bytes / 32 = 35 GB
 #   Remaining for activations: ~105 GB (with act. ckpt., <10 GB used)
 
@@ -59,7 +58,7 @@ pp = 1
 nccl_timeout_sec = 1200
 
 [checkpoint]
-dir = "checkpoints/multinode_70b_tp4_fsdp8"
+dir = "checkpoints/70b_32gpu_tp4"
 interval = 100
 async_mode = "async_with_pinned_mem"
 keep_last_n = 2
@@ -67,9 +66,6 @@ keep_last_n = 2
 [metrics]
 log_interval = 1
 enable_wandb = false
-enable_tensorboard = false
 
 [profiling]
 enable = false
-start_step = 5
-end_step = 8

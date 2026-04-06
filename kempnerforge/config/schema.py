@@ -263,7 +263,7 @@ class DistributedConfig:
     pp_schedule: PipelineSchedule = PipelineSchedule.schedule_1f1b
     cp: int = 1
     nccl_timeout_sec: int = 600
-    backend: str = "nccl"
+    backend: str = "cpu:gloo,cuda:nccl"
 
     def validate_world_size(self, world_size: int) -> None:
         """Validate that parallelism dimensions match world size."""

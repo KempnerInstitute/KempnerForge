@@ -1,12 +1,13 @@
-# Multi-node training: 8 nodes × 4 GPUs = 32 GPUs
-# Parallelism: TP=4 (intra-node) × PP=2 (2 pipeline stages) × FSDP=4 (inter-node)
-# Model: Llama-3 13B architecture (40 layers → 20 per PP stage)
-# Dataset: fineweb-edu tokenized with Llama-3 tokenizer
+# Custom 29B — 32 GPUs (8 nodes × 4), TP=4 × PP=2 × FSDP=4.
+# dim=6144, 56 layers (28 per PP stage), 48 heads, GQA with 8 kv_heads.
+# Sized to saturate 32× H200 140GB (~120 GB/GPU target).
+#
+# Usage: sbatch --nodes=8 scripts/slurm/multinode.sh configs/train/29b_32gpu_tp4_pp2.toml
 
 [model]
-dim = 5120
-n_layers = 40
-n_heads = 40
+dim = 6144
+n_layers = 56
+n_heads = 48
 n_kv_heads = 8
 vocab_size = 128256
 ffn_dim_multiplier = 1.3
@@ -17,10 +18,10 @@ rope_theta = 500000.0
 tie_embeddings = false
 
 [train]
-batch_size = 4
+batch_size = 1
 seq_len = 4096
 max_steps = 20
-grad_accum_steps = 4
+grad_accum_steps = 8
 grad_clip_norm = 1.0
 seed = 42
 compile_model = false
@@ -28,7 +29,7 @@ activation_checkpointing = "full"
 
 [optimizer]
 name = "adamw"
-lr = 3e-4
+lr = 2e-4
 weight_decay = 0.1
 betas = [0.9, 0.95]
 eps = 1e-8
@@ -42,7 +43,7 @@ min_lr_ratio = 0.1
 [data]
 dataset_path = "/n/holylfs06/LABS/kempner_shared/Everyone/testbed/text/fineweb-edu/tokenized/meta-llama-3/default"
 file_pattern = "tokenized_*.bin"
-num_workers = 0
+num_workers = 4
 pin_memory = true
 prefetch_factor = 2
 
@@ -55,7 +56,7 @@ pp_schedule = "1f1b"
 nccl_timeout_sec = 1200
 
 [checkpoint]
-dir = "checkpoints/multinode_13b_tp4_pp2_fsdp4"
+dir = "checkpoints/29b_32gpu_tp4_pp2"
 interval = 100
 async_mode = "disabled"
 keep_last_n = 2
@@ -63,9 +64,6 @@ keep_last_n = 2
 [metrics]
 log_interval = 1
 enable_wandb = false
-enable_tensorboard = false
 
 [profiling]
 enable = false
-start_step = 5
-end_step = 8

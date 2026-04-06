@@ -44,10 +44,41 @@ def is_rank_zero() -> bool:
     return int(os.environ.get("RANK", "0")) == 0
 
 
+def _detect_ib_interface() -> str | None:
+    """Detect the first UP InfiniBand interface with an IP address.
+
+    Returns interface name (e.g., "ib0") or None if no IB interface found.
+    Used to set NCCL_SOCKET_IFNAME and GLOO_SOCKET_IFNAME so both backends
+    bind to the high-speed IB network rather than management Ethernet.
+    """
+    try:
+        import subprocess
+
+        result = subprocess.run(
+            ["ip", "-br", "addr"], capture_output=True, text=True, timeout=5
+        )
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 3 and parts[0].startswith("ib") and parts[1] == "UP":
+                return parts[0]
+    except Exception:
+        pass
+    return None
+
+
 def _set_nccl_env() -> None:
-    """Set NCCL environment variables for optimal performance."""
-    # Prevent NCCL memory stacking — avoids OOM from cached NCCL buffers
-    os.environ.setdefault("TORCH_NCCL_AVOID_RECORD_STREAMS", "1")
+    """Set NCCL and Gloo network environment variables.
+
+    Detects the IB interface and configures both NCCL (for RDMA data transport
+    bootstrap) and Gloo (for DCP async checkpoint coordination) to bind to it.
+    Without this, Gloo defaults to management Ethernet which can cause timeouts
+    for multi-node collectives.
+    """
+    # Detect IB interface if not already set by launch script
+    ib_iface = os.environ.get("NCCL_SOCKET_IFNAME") or _detect_ib_interface()
+    if ib_iface:
+        os.environ.setdefault("NCCL_SOCKET_IFNAME", ib_iface)
+        os.environ.setdefault("GLOO_SOCKET_IFNAME", ib_iface)
 
     # Use InfiniBand for inter-node communication when available
     os.environ.setdefault("NCCL_IB_DISABLE", "0")

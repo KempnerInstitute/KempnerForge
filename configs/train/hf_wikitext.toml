@@ -1,0 +1,60 @@
+# Small model on Wikitext-103 via HuggingFace streaming.
+# Demonstrates HF dataset integration without pre-tokenized data.
+# Works on any GPU count (dp_shard=-1).
+#
+# Usage: torchrun --nproc_per_node=4 scripts/train.py configs/train/hf_wikitext.toml
+#
+# Requires GPT-2 tokenizer cached locally (run once on login node):
+#   python -c "from transformers import AutoTokenizer; AutoTokenizer.from_pretrained('gpt2')"
+
+[model]
+dim = 512
+n_layers = 8
+n_heads = 8
+n_kv_heads = 4
+vocab_size = 50257
+max_seq_len = 1024
+
+[train]
+batch_size = 16
+seq_len = 1024
+max_steps = 500
+grad_accum_steps = 1
+grad_clip_norm = 1.0
+seed = 42
+compile_model = true
+activation_checkpointing = "full"
+
+[optimizer]
+name = "adamw"
+lr = 3e-4
+weight_decay = 0.1
+betas = [0.9, 0.95]
+fused = true
+
+[scheduler]
+name = "cosine"
+warmup_steps = 50
+min_lr_ratio = 0.1
+
+[data]
+hf_dataset_name = "wikitext"
+hf_dataset_config = "wikitext-103-raw-v1"
+hf_dataset_split = "train"
+hf_dataset_text_field = "text"
+hf_streaming = true
+tokenizer_path = "gpt2"
+num_workers = 4
+pin_memory = true
+
+[distributed]
+dp_shard = -1
+
+[checkpoint]
+dir = "checkpoints/hf_wikitext"
+interval = 100
+keep_last_n = 3
+
+[metrics]
+log_interval = 10
+enable_wandb = false

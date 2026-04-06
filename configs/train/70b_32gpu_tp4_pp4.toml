@@ -1,7 +1,8 @@
-# Multi-node training: 8 nodes × 4 GPUs = 32 GPUs
-# Parallelism: TP=4 (intra-node) × PP=4 (20 layers/stage) × FSDP=2 (inter-node)
-# Model: Llama-3 70B architecture (80 layers → 40 per PP stage)
-# Dataset: fineweb-edu tokenized with Llama-3 tokenizer (uint32 .bin files)
+# Llama-3 70B — 32 GPUs (8 nodes × 4), TP=4 × PP=4 × FSDP=2.
+# 80 layers → 20 per PP stage.
+# Alternative to 70b_32gpu_tp4.toml when memory is tight (less FSDP sharding).
+#
+# Usage: sbatch --nodes=8 scripts/slurm/multinode.sh configs/train/70b_32gpu_tp4_pp4.toml
 
 [model]
 dim = 8192
@@ -42,7 +43,7 @@ min_lr_ratio = 0.1
 [data]
 dataset_path = "/n/holylfs06/LABS/kempner_shared/Everyone/testbed/text/fineweb-edu/tokenized/meta-llama-3/default"
 file_pattern = "tokenized_*.bin"
-num_workers = 0
+num_workers = 4
 pin_memory = true
 prefetch_factor = 2
 
@@ -55,7 +56,7 @@ pp_schedule = "1f1b"
 nccl_timeout_sec = 1200
 
 [checkpoint]
-dir = "checkpoints/multinode_70b_tp4_pp2_fsdp4"
+dir = "checkpoints/70b_32gpu_tp4_pp4"
 interval = 100
 async_mode = "disabled"
 keep_last_n = 2
@@ -63,9 +64,6 @@ keep_last_n = 2
 [metrics]
 log_interval = 1
 enable_wandb = false
-enable_tensorboard = false
 
 [profiling]
 enable = false
-start_step = 5
-end_step = 8
