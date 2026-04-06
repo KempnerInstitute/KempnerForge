@@ -24,4 +24,5 @@ checkpoints/
 /data/
 profiler_traces/
 tb_logs/
+logs/
 

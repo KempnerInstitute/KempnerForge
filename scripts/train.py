@@ -6,15 +6,15 @@ Usage:
     uv run python scripts/train.py configs/train/debug.toml
 
     # Multi-GPU (single node, via torchrun)
-    uv run torchrun --nproc_per_node=4 scripts/train.py configs/train/default.toml
+    uv run torchrun --nproc_per_node=4 scripts/train.py configs/train/7b.toml
 
     # Multi-node (via SLURM srun — see scripts/slurm/multinode.sh)
     # srun launches one process per GPU; MASTER_ADDR/MASTER_PORT are resolved
     # automatically from SLURM env vars by init_distributed().
-    srun uv run python scripts/train.py configs/train/default.toml
+    srun uv run python scripts/train.py configs/train/7b.toml
 
     # With overrides
-    uv run python scripts/train.py configs/train/default.toml \
+    uv run python scripts/train.py configs/train/7b.toml \
         --train.max_steps=1000 --optimizer.lr=1e-4
 """
 

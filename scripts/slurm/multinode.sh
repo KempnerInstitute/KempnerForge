@@ -20,9 +20,9 @@
 # SLURM_PROCID, SLURM_LOCALID, SLURM_NTASKS automatically.
 #
 # Usage:
-#   sbatch --nodes=4 scripts/slurm/multinode.sh configs/train/default.toml
+#   sbatch --nodes=4 scripts/slurm/multinode.sh configs/train/7b.toml
 #   sbatch --nodes=8 scripts/slurm/multinode.sh \
-#       configs/train/default.toml --train.max_steps=50000
+#       configs/train/7b.toml --train.max_steps=50000
 #
 # Automatically detects master addr/port from SLURM environment and
 # supports auto-resume on requeue via latest checkpoint symlink.

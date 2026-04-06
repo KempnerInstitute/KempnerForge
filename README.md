@@ -31,17 +31,17 @@ uv sync
 uv run python scripts/train.py configs/train/debug.toml
 
 # Multi-GPU (single node, 4 GPUs)
-uv run torchrun --nproc_per_node=4 scripts/train.py configs/train/default.toml
+uv run torchrun --nproc_per_node=4 scripts/train.py configs/train/7b.toml
 
 # With CLI overrides
-uv run torchrun --nproc_per_node=4 scripts/train.py configs/train/default.toml \
+uv run torchrun --nproc_per_node=4 scripts/train.py configs/train/7b.toml \
   --train.max_steps=1000 --optimizer.lr=1e-4
 
 # SLURM (single node)
-sbatch scripts/slurm/singlenode.sh configs/train/default.toml
+sbatch scripts/slurm/singlenode.sh configs/train/7b.toml
 
 # SLURM (multi-node)
-sbatch scripts/slurm/multinode.sh configs/train/default.toml
+sbatch --nodes=4 scripts/slurm/multinode.sh configs/train/7b.toml
 ```
 
 ## Configuration
@@ -51,11 +51,11 @@ Configs are layered: **defaults → TOML file → CLI overrides**.
 ```bash
 # TOML presets
 configs/train/debug.toml       # small model, fast iteration
-configs/train/default.toml     # standard training config
-configs/train/llama7b_bench.toml  # 7B model benchmark
+configs/train/7b.toml          # Llama-3 7B (auto-scales FSDP)
+configs/train/hf_wikitext.toml # small model, HF streaming dataset
 
 # CLI overrides use --section.key=value
-uv run torchrun --nproc_per_node=4 scripts/train.py configs/train/default.toml \
+uv run torchrun --nproc_per_node=4 scripts/train.py configs/train/7b.toml \
   --model.dim=2048 --train.batch_size=8 --optimizer.lr=1e-4
 ```
 
@@ -94,9 +94,9 @@ kempnerforge/
   resilience/  — Signal handling, NaN detection, GPU/NCCL health checks
   metrics/     — MetricsTracker, MFU computation, WandB/TensorBoard backends
   profiling/   — torch.profiler integration, CUDA timing
-configs/       — TOML configs for models, training, and cluster settings
+configs/       — TOML configs for training runs and model architecture presets
 scripts/       — Training entry point, data prep, profiling, SLURM launch scripts
-tests/         — Unit (299), integration, distributed, and end-to-end tests
+tests/         — Unit (312), integration, distributed, and end-to-end tests
 ```
 
 ## Testing

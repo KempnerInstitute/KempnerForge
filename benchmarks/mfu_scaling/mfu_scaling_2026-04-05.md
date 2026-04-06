@@ -124,6 +124,6 @@ uv run torchrun --nproc_per_node=4 scripts/train.py configs/train/debug.toml \
 
 # Multi-node example (70B, TP=4+FSDP=8, 32 GPUs)
 srun --nodes=8 --ntasks=32 --gpus-per-node=4 --cpus-per-task=4 \
-  uv run python scripts/train.py configs/train/multinode_70b_tp4_fsdp8.toml \
+  uv run python scripts/train.py configs/train/70b_32gpu_tp4.toml \
   --train.max_steps=20
 ```

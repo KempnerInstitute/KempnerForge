@@ -15,8 +15,8 @@
 # Single-node multi-GPU training via torchrun.
 #
 # Usage:
-#   sbatch scripts/slurm/singlenode.sh configs/train/default.toml
-#   sbatch scripts/slurm/singlenode.sh configs/train/default.toml --train.max_steps=1000
+#   sbatch scripts/slurm/singlenode.sh configs/train/7b.toml
+#   sbatch scripts/slurm/singlenode.sh configs/train/7b.toml --train.max_steps=1000
 #
 # The first argument is the config TOML file. Any additional arguments are
 # passed through as CLI overrides (e.g., --optimizer.lr=1e-4).

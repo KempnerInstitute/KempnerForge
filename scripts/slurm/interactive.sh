@@ -2,11 +2,11 @@
 # Interactive srun launcher for multi-node training.
 #
 # Usage:
-#   ./scripts/scripts/slurm/interactive.sh <JOBID> <CONFIG> [overrides...]
+#   ./scripts/slurm/interactive.sh <JOBID> <CONFIG> [overrides...]
 #
 # Examples:
-#   ./scripts/scripts/slurm/interactive.sh 3565401 configs/train/multinode_70b_tp4_fsdp8.toml
-#   ./scripts/scripts/slurm/interactive.sh 3565401 configs/train/multinode_70b_tp4_fsdp8.toml --train.max_steps=50
+#   ./scripts/slurm/interactive.sh 3565401 configs/train/70b_32gpu_tp4.toml
+#   ./scripts/slurm/interactive.sh 3565401 configs/train/7b.toml --train.max_steps=50
 
 set -euo pipefail
 
@@ -22,11 +22,12 @@ export MASTER_PORT=$(comm -23 <(seq 15000 20000 | sort) \
     <(ss -Htan | awk '{print $4}' | cut -d':' -f2 | sort -u) | shuf | head -n 1)
 
 # ---- NCCL / InfiniBand ----
-export NCCL_SOCKET_IFNAME=ib0
+IB_IFNAME=$(ip -br addr | awk '/^ib[0-9]+\s+UP\s+[0-9]/ {print $1; exit}')
+export NCCL_SOCKET_IFNAME="${IB_IFNAME:-ib0}"
+export GLOO_SOCKET_IFNAME="${IB_IFNAME:-ib0}"
 export NCCL_IB_DISABLE=0
 export NCCL_NET_GDR_LEVEL=2
 export NCCL_IB_GID_INDEX=3
-export TORCH_NCCL_AVOID_RECORD_STREAMS=1
 
 # ---- CUDA ----
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
@@ -40,6 +41,7 @@ echo "Nodes:      ${NNODES} (${NODELIST})"
 echo "GPUs/node:  ${GPUS_PER_NODE}"
 echo "Total GPUs: $((NNODES * GPUS_PER_NODE))"
 echo "Master:     ${MASTER_ADDR}:${MASTER_PORT}"
+echo "IB iface:   ${IB_IFNAME:-ib0 (default)}"
 echo "Config:     ${CONFIG}"
 echo "Overrides:  ${OVERRIDES}"
 echo "================================"
