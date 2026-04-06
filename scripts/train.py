@@ -23,6 +23,7 @@ from __future__ import annotations
 import sys
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 
 from kempnerforge.checkpoint.manager import CheckpointManager
@@ -316,29 +317,36 @@ def main() -> None:
 
             # The schedule handles forward/backward for all microbatches.
             # First stage needs input; last stage needs target for loss.
+            # schedule.step() returns model output; losses are collected via the
+            # losses= output parameter (list populated by the schedule).
             is_first = pp_rank == 0
             is_last = pp_rank == pp_size - 1
+            pp_losses: list[torch.Tensor] = []
 
             if is_first:
-                losses = pp_schedule.step(full_input, target=full_labels)
+                pp_schedule.step(full_input, target=full_labels, losses=pp_losses)
             elif is_last:
-                losses = pp_schedule.step(target=full_labels)
+                pp_schedule.step(target=full_labels, losses=pp_losses)
             else:
-                losses = pp_schedule.step()
+                pp_schedule.step()
 
             # Loss is only meaningful on the last stage
-            if is_last and losses is not None:
-                if isinstance(losses, (list, tuple)):
-                    avg_loss = sum(loss.item() for loss in losses) / len(losses)
-                else:
-                    # schedule.step() may return a single tensor
-                    avg_loss = losses.item() if losses.dim() == 0 else losses.mean().item()
+            if is_last and pp_losses:
+                avg_loss = sum(loss.item() for loss in pp_losses) / len(pp_losses)
             else:
                 avg_loss = 0.0
 
-            # Gradient clipping + optimizer step
+            # Gradient clipping
             grad_norm = clip_grad_norm_(model, tc.grad_clip_norm)
             grad_norm_val = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
+
+            # Broadcast loss and grad_norm from last PP stage to all PP stages
+            pp_mesh = device_mesh["pp"]
+            pp_group = pp_mesh.get_group()
+            loss_tensor = torch.tensor([avg_loss, grad_norm_val], device=device)
+            dist.broadcast(loss_tensor, group_src=pp_size - 1, group=pp_group)
+            avg_loss = loss_tensor[0].item()
+            grad_norm_val = loss_tensor[1].item()
 
         else:
             # --- Standard training step (no PP) ---
