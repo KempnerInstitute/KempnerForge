@@ -1,7 +1,7 @@
 # KempnerForge Config Validation Report
 
 **Date**: 2026-04-06   
-**Git**: `5d3e723` (main)   
+**Git**: `601aba9` (main)   
 **Hardware**: 8 nodes, 4x NVIDIA H200 (141 GB) per node, NVLink intra-node, InfiniBand (NDR 400Gbps) inter-node   
 **Dataset**: FineWeb-Edu (Llama-3 tokenized, 499B tokens) for fineweb configs; Wikitext-103 (HF streaming) for hf_wikitext   
 **Architecture**: Llama-3 (decoder-only, GQA, SwiGLU, RMSNorm, RoPE)   
@@ -13,6 +13,7 @@ Validate all training configs in `configs/train/` after:
 1. Renaming configs to `{model}_{gpus}gpu_{strategy}.toml` convention
 2. Fixing multi-node distributed bugs (gloo backend, IB interface detection, async checkpoint flush)
 3. Fixing content issues (data paths, vocab_size, num_workers, PP comment errors)
+4. Fixing PP loss logging (schedule.step() API, broadcast from last stage)
 
 ## Configs Tested
 
@@ -39,12 +40,12 @@ Validate all training configs in `configs/train/` after:
 | `7b.toml` | **PASS** | 10 | 53.7 | 38,858 | 81.0 GB | 13.49s | 12.45 |
 | `7b_12gpu_tp4.toml` | **PASS** | 10 | 30.9 | 67,045 | 30.4 GB | 5.86s | 11.75 |
 | `7b_32gpu_fsdp.toml` | **PASS** | 10 | 51.3 | 297,384 | 51.3 GB | 7.05s | 13.56 |
-| `13b_32gpu_tp4_pp2.toml` | **PASS** | 20 | 16.5 | 52,739 | 24.0 GB | 4.97s | * |
-| `29b_32gpu_tp4_pp2.toml` | **PASS** | 20 | 13.5 | 22,631 | 32.8 GB | 5.79s | * |
+| `13b_32gpu_tp4_pp2.toml` | **PASS** | 20 | 16.5 | 52,554 | 24.0 GB | 4.99s | 11.75 |
+| `29b_32gpu_tp4_pp2.toml` | **PASS** | 20 | 13.6 | 22,688 | 32.8 GB | 5.78s | 11.75 |
 | `70b_32gpu_tp4.toml` | **PASS** | 20 | 25.6 | 17,769 | 93.2 GB | 14.76s | 11.75 |
-| `70b_32gpu_tp4_pp4.toml` | **PASS** | 20 | 11.8 | 8,212 | 51.0 GB | 3.99s | * |
+| `70b_32gpu_tp4_pp4.toml` | **PASS** | 20 | 11.0 | 7,641 | 51.0 GB | 4.29s | 11.75 |
 
-Steady-state values (last 5 steps). `*` = PP stage 0 reports loss=0 (see Known Issues).
+Steady-state values (last 5 steps).
 
 ### KempnerPulse GPU Metrics (7b_32gpu_fsdp, captured mid-training)
 
@@ -93,12 +94,6 @@ PP configs use `compile_model=false` because torch.compile has limited PP suppor
 
 ## Known Issues
 
-### PP loss logging (affects 13b, 29b, 70b_pp4 configs)
-
-Pipeline parallel configs report `loss=0.0000` and `grad_norm=0.000` on rank 0. This is because rank 0 is on PP stage 0 (embedding stage), while the loss is computed on the last PP stage. The training itself is correct — the issue is only in metric reporting.
-
-**Fix needed**: Communicate the loss from the last PP stage to rank 0 for logging. This is a training loop enhancement, not a config issue.
-
 ### MFU lower for PP configs
 
 PP configs show lower MFU (12-17%) compared to pure FSDP (51%) or TP+FSDP (26-31%). This is expected due to:
@@ -131,6 +126,12 @@ To improve PP MFU: increase `grad_accum_steps` to reduce bubble fraction, or use
 - **`70b_32gpu_tp4_pp4.toml`**: Fixed filename (was pp2, actual PP=4), fixed comment ("80 layers → 20 per stage")
 - **PP configs** (13b, 29b, 70b_pp4): Fixed `num_workers` 0→4 (removed data loading bottleneck)
 - **All configs**: Updated checkpoint dirs to match new filenames
+
+### PP Loss Logging Fix
+
+- **schedule.step() API**: `losses` must be collected via the `losses=` output parameter (list populated by the schedule), not from the return value (which is the model output)
+- **Loss broadcast**: Added `dist.broadcast()` with `group_src=pp_size-1` to send avg_loss and grad_norm from the last PP stage to all other stages, so rank 0 can log correct metrics
+- **Re-validated** all 3 PP configs (13b, 29b, 70b_pp4) — rank 0 now reports loss=11.75 (was 0.0)
 
 ### Distributed Fixes (validated in prior session)
 
