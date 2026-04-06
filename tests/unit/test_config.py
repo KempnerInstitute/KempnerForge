@@ -233,8 +233,8 @@ class TestTomlLoading:
         assert config.train.max_steps == 100
         assert config.train.compile_model is False
 
-    def test_load_default_toml(self):
-        config = load_config("configs/train/default.toml", cli_args=[])
+    def test_load_7b_toml(self):
+        config = load_config("configs/train/7b.toml", cli_args=[])
         assert config.model.dim == 4096
         assert config.model.n_kv_heads == 8
         assert config.train.compile_model is True
@@ -242,7 +242,7 @@ class TestTomlLoading:
         assert config.checkpoint.async_mode == AsyncCheckpointMode.async_pinned
 
     def test_enum_from_toml(self):
-        config = load_config("configs/train/default.toml", cli_args=[])
+        config = load_config("configs/train/7b.toml", cli_args=[])
         assert config.scheduler.name == SchedulerType.cosine
         assert isinstance(config.scheduler.name, SchedulerType)
 

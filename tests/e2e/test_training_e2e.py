@@ -31,7 +31,7 @@ from tests.e2e.conftest import requires_gpus
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 TRAIN_SCRIPT = str(PROJECT_ROOT / "scripts" / "train.py")
 DEBUG_CONFIG = str(PROJECT_ROOT / "configs" / "train" / "debug.toml")
-BENCH_CONFIG = str(PROJECT_ROOT / "configs" / "train" / "llama7b_bench.toml")
+BENCH_CONFIG = str(PROJECT_ROOT / "configs" / "train" / "7b.toml")
 
 
 def _run_training(
@@ -180,7 +180,7 @@ def test_pipeline_parallel():
         [
             DEBUG_CONFIG,
             "--train.max_steps=10",
-            "--metrics.log_interval=5",
+            "--metrics.log_interval=1",
             "--distributed.pp=2",
             "--distributed.dp_shard=2",
             "--train.grad_accum_steps=2",
@@ -188,6 +188,12 @@ def test_pipeline_parallel():
         nproc=4,
     )
     _assert_training_complete(result, expected_steps=10)
+
+    # Verify rank 0 reports actual loss (not 0.0 from PP stage 0)
+    output = result.stdout + result.stderr
+    loss = _parse_last_loss(output)
+    assert loss is not None, "Could not parse loss from PP training output"
+    assert loss > 0.0, f"PP training loss should be > 0 (got {loss})"
 
 
 # ============================================================================
