@@ -1,7 +1,7 @@
 # KempnerForge Config Validation Report
 
 **Date**: 2026-04-06   
-**Git**: `6a9a08a` (main) + uncommitted config renames and distributed fixes   
+**Git**: `5d3e723` (main)   
 **Hardware**: 8 nodes, 4x NVIDIA H200 (141 GB) per node, NVLink intra-node, InfiniBand (NDR 400Gbps) inter-node   
 **Dataset**: FineWeb-Edu (Llama-3 tokenized, 499B tokens) for fineweb configs; Wikitext-103 (HF streaming) for hf_wikitext   
 **Architecture**: Llama-3 (decoder-only, GQA, SwiGLU, RMSNorm, RoPE)   
