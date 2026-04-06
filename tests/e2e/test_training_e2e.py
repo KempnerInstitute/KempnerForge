@@ -235,6 +235,88 @@ def test_synthetic_data_pipeline(synthetic_data_dir):
     assert "Dataset:" in output, "Dataset was not loaded"
 
 
+# HuggingFace dataset overrides: clear dataset_path, set HF fields, use gpt2 tokenizer
+_HF_OVERRIDES = [
+    "--data.dataset_path=",
+    "--data.hf_dataset_name=wikitext",
+    "--data.hf_dataset_config=wikitext-2-raw-v1",
+    "--data.tokenizer_path=gpt2",
+    "--model.vocab_size=50257",
+]
+
+
+@pytest.mark.e2e
+def test_hf_dataset_single_gpu():
+    """Single GPU training with HuggingFace wikitext dataset."""
+    result = _run_training(
+        [
+            DEBUG_CONFIG,
+            "--train.max_steps=5",
+            "--metrics.log_interval=5",
+            *_HF_OVERRIDES,
+        ],
+        nproc=1,
+    )
+    _assert_training_complete(result, expected_steps=5)
+    output = result.stdout + result.stderr
+    assert "packed sequences" in output, "HF dataset was not loaded"
+
+
+@pytest.mark.e2e
+@requires_gpus(4)
+def test_hf_dataset_4gpu():
+    """4 GPU FSDP with HuggingFace wikitext dataset."""
+    result = _run_training(
+        [
+            DEBUG_CONFIG,
+            "--train.max_steps=5",
+            "--metrics.log_interval=5",
+            *_HF_OVERRIDES,
+        ],
+        nproc=4,
+    )
+    _assert_training_complete(result, expected_steps=5)
+    output = result.stdout + result.stderr
+    assert "packed sequences" in output, "HF dataset was not loaded"
+
+
+@pytest.mark.e2e
+def test_hf_streaming_single_gpu():
+    """Single GPU training with streaming HuggingFace dataset."""
+    result = _run_training(
+        [
+            DEBUG_CONFIG,
+            "--train.max_steps=5",
+            "--metrics.log_interval=5",
+            *_HF_OVERRIDES,
+            "--data.hf_streaming=true",
+        ],
+        nproc=1,
+    )
+    _assert_training_complete(result, expected_steps=5)
+    output = result.stdout + result.stderr
+    assert "streaming from" in output, "Streaming dataset was not loaded"
+
+
+@pytest.mark.e2e
+@requires_gpus(4)
+def test_hf_streaming_4gpu():
+    """4 GPU FSDP with streaming HuggingFace dataset."""
+    result = _run_training(
+        [
+            DEBUG_CONFIG,
+            "--train.max_steps=5",
+            "--metrics.log_interval=5",
+            *_HF_OVERRIDES,
+            "--data.hf_streaming=true",
+        ],
+        nproc=4,
+    )
+    _assert_training_complete(result, expected_steps=5)
+    output = result.stdout + result.stderr
+    assert "streaming from" in output, "Streaming dataset was not loaded"
+
+
 # ============================================================================
 # Checkpoint Save + Resume
 # ============================================================================

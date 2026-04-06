@@ -235,8 +235,10 @@ class DataConfig:
     prefetch_factor: int = 2
     # For HuggingFace datasets
     hf_dataset_name: str | None = None
+    hf_dataset_config: str | None = None  # Dataset config name (e.g., "wikitext-2-raw-v1")
     hf_dataset_split: str = "train"
     hf_dataset_text_field: str = "text"
+    hf_streaming: bool = False  # Use streaming (IterableDataset) for large HF datasets
 
     def __post_init__(self) -> None:
         if self.num_workers < 0:

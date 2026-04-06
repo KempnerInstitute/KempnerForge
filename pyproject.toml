@@ -17,6 +17,7 @@ dev = [
     "pytest",
     "pytest-timeout",
     "ruff",
+    "vulture>=2.16",
 ]
 
 [build-system]

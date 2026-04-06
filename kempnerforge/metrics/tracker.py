@@ -56,7 +56,6 @@ class MetricsTracker:
     ) -> None:
         self.metrics_config = config.metrics
         self.model_config = config.model
-        self.train_config = config.train
         self.num_gpus = num_gpus
         self.gpu_peak_tflops = gpu_peak_tflops or get_gpu_peak_tflops()
 
@@ -66,11 +65,6 @@ class MetricsTracker:
 
         # Per-step timing
         self._step_start: float = 0.0
-        self._step_times: list[float] = []
-
-        # Accumulation for gradient accumulation steps
-        self._accum_loss: float = 0.0
-        self._accum_count: int = 0
 
         # Logging backends (initialized lazily)
         self._backends: list[_LoggingBackend] = []

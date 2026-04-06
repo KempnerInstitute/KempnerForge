@@ -134,6 +134,7 @@ class HuggingFaceDataset(Dataset):
 
     Args:
         dataset_name: HuggingFace dataset name (e.g., "allenai/c4").
+        dataset_config: Optional config name (e.g., "wikitext-2-raw-v1").
         split: Dataset split ("train", "validation", etc.).
         text_field: Name of the text column.
         seq_len: Sequence length for packing.
@@ -147,6 +148,7 @@ class HuggingFaceDataset(Dataset):
         text_field: str,
         seq_len: int,
         tokenizer_path: str,
+        dataset_config: str | None = None,
     ) -> None:
         from datasets import load_dataset
         from transformers import AutoTokenizer
@@ -155,15 +157,12 @@ class HuggingFaceDataset(Dataset):
         self.text_field = text_field
 
         # Load tokenizer
-        self._tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
+        self._tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
         self._eos_id = self._tokenizer.eos_token_id or 0
 
-        # Load dataset
+        # Load dataset and pack into fixed-length sequences
         logger.info(f"Loading HuggingFace dataset: {dataset_name} ({split})")
-        raw_dataset = load_dataset(dataset_name, split=split, trust_remote_code=True)
-        self._raw_dataset = raw_dataset
-
-        # Pack all documents into fixed-length sequences
+        raw_dataset = load_dataset(dataset_name, dataset_config, split=split)
         self._packed_sequences = self._pack_sequences(raw_dataset)
         logger.info(
             f"HuggingFaceDataset: {len(self._packed_sequences)} packed sequences "
@@ -243,6 +242,7 @@ class StreamingHuggingFaceDataset(torch.utils.data.IterableDataset):
         text_field: Name of the text column.
         seq_len: Sequence length for packing.
         tokenizer_path: Path or name for HuggingFace tokenizer.
+        dataset_config: Optional config name (e.g., "wikitext-2-raw-v1").
         rank: Current distributed rank (for document sharding).
         world_size: Total number of ranks.
         seed: Random seed for shuffling.
@@ -256,6 +256,7 @@ class StreamingHuggingFaceDataset(torch.utils.data.IterableDataset):
         text_field: str,
         seq_len: int,
         tokenizer_path: str,
+        dataset_config: str | None = None,
         rank: int = 0,
         world_size: int = 1,
         seed: int = 42,
@@ -263,6 +264,7 @@ class StreamingHuggingFaceDataset(torch.utils.data.IterableDataset):
     ) -> None:
         super().__init__()
         self.dataset_name = dataset_name
+        self.dataset_config = dataset_config
         self.split = split
         self.text_field = text_field
         self.seq_len = seq_len
@@ -291,9 +293,7 @@ class StreamingHuggingFaceDataset(torch.utils.data.IterableDataset):
         if self._tokenizer is None:
             from transformers import AutoTokenizer
 
-            self._tokenizer = AutoTokenizer.from_pretrained(
-                self.tokenizer_path, trust_remote_code=True
-            )
+            self._tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_path)
             self._eos_id = self._tokenizer.eos_token_id or 0
 
     def _load_stream(self):
@@ -302,9 +302,9 @@ class StreamingHuggingFaceDataset(torch.utils.data.IterableDataset):
 
         ds = load_dataset(
             self.dataset_name,
+            self.dataset_config,
             split=self.split,
             streaming=True,
-            trust_remote_code=True,
         )
         # Shuffle with seed + epoch for different order each epoch
         ds = ds.shuffle(seed=self.seed + self._epoch, buffer_size=self.shuffle_buffer_size)

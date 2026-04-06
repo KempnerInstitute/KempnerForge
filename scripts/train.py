@@ -187,6 +187,7 @@ def main() -> None:
     dataloader = None
     data_iter = None
     if config.data.dataset_path:
+        # Pre-tokenized data on disk (fastest path)
         dataset = MemoryMappedDataset(
             data_dir=config.data.dataset_path,
             seq_len=tc.seq_len + 1,
@@ -206,6 +207,69 @@ def main() -> None:
             config=config.data,
         )
         logger.info(f"Dataset: {len(dataset):,} samples from {config.data.dataset_path}")
+    elif config.data.hf_dataset_name:
+        if not config.data.tokenizer_path:
+            raise ValueError("data.tokenizer_path is required for HuggingFace datasets")
+
+        if config.data.hf_streaming:
+            # Streaming: on-the-fly tokenization, no full download needed
+            from torch.utils.data import DataLoader as TorchDataLoader
+
+            from kempnerforge.data.dataset import StreamingHuggingFaceDataset
+
+            dataset = StreamingHuggingFaceDataset(
+                dataset_name=config.data.hf_dataset_name,
+                split=config.data.hf_dataset_split,
+                text_field=config.data.hf_dataset_text_field,
+                seq_len=tc.seq_len,
+                tokenizer_path=config.data.tokenizer_path,
+                dataset_config=config.data.hf_dataset_config,
+                rank=dp_rank,
+                world_size=dp_size,
+                seed=tc.seed,
+            )
+            dataloader = TorchDataLoader(
+                dataset,
+                batch_size=tc.batch_size,
+                num_workers=config.data.num_workers,
+                pin_memory=config.data.pin_memory,
+                prefetch_factor=(
+                    config.data.prefetch_factor if config.data.num_workers > 0 else None
+                ),
+            )
+            logger.info(
+                f"Dataset: streaming from {config.data.hf_dataset_name} "
+                f"({config.data.hf_dataset_split}), rank={dp_rank}/{dp_size}"
+            )
+        else:
+            # Eager: download, tokenize, and pack all sequences into memory
+            from kempnerforge.data.dataset import HuggingFaceDataset
+
+            dataset = HuggingFaceDataset(
+                dataset_name=config.data.hf_dataset_name,
+                split=config.data.hf_dataset_split,
+                text_field=config.data.hf_dataset_text_field,
+                seq_len=tc.seq_len,
+                tokenizer_path=config.data.tokenizer_path,
+                dataset_config=config.data.hf_dataset_config,
+            )
+            sampler = DistributedSampler(
+                dataset,
+                num_replicas=dp_size,
+                rank=dp_rank,
+                shuffle=True,
+                seed=tc.seed,
+            )
+            dataloader = StatefulDataLoader(
+                dataset,
+                batch_size=tc.batch_size,
+                sampler=sampler,
+                config=config.data,
+            )
+            logger.info(
+                f"Dataset: {len(dataset):,} packed sequences from "
+                f"{config.data.hf_dataset_name} ({config.data.hf_dataset_split})"
+            )
 
     logger.info(
         f"Starting training: step={step}, max_steps={tc.max_steps}, "
