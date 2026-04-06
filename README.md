@@ -38,7 +38,7 @@ uv run torchrun --nproc_per_node=4 scripts/train.py configs/train/default.toml \
   --train.max_steps=1000 --optimizer.lr=1e-4
 
 # SLURM (single node)
-sbatch scripts/slurm/launch.sh configs/train/default.toml
+sbatch scripts/slurm/singlenode.sh configs/train/default.toml
 
 # SLURM (multi-node)
 sbatch scripts/slurm/multinode.sh configs/train/default.toml
@@ -142,11 +142,15 @@ E2E tests launch full training runs as subprocesses and verify they complete suc
 
 ## Profiling
 
+Profiling is built into the training loop. Enable it via config or CLI override:
+
 ```bash
-uv run torchrun --nproc_per_node=4 scripts/profile_run.py configs/train/llama7b_bench.toml
+# Enable profiling for steps 5-8, traces saved to profiler_traces/
+uv run torchrun --nproc_per_node=4 scripts/train.py configs/train/debug.toml \
+    --profiling.enable=true --profiling.start_step=5 --profiling.end_step=8
 ```
 
-Outputs kernel-level GPU time breakdown, FLOPS analysis, MFU estimate, and a Chrome trace viewable at [Perfetto UI](https://ui.perfetto.dev/).
+Outputs kernel-level GPU time breakdown, FLOPS analysis, MFU estimate, and TensorBoard traces viewable at [Perfetto UI](https://ui.perfetto.dev/).
 
 ## Design Principles
 

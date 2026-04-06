@@ -41,6 +41,7 @@ from kempnerforge.distributed.tensor_parallel import apply_tensor_parallel
 from kempnerforge.distributed.utils import clip_grad_norm_, get_dp_info
 from kempnerforge.metrics.logger import get_logger
 from kempnerforge.metrics.tracker import MetricsTracker
+from kempnerforge.profiling.profiler import build_profiler, print_profiler_summary
 from kempnerforge.resilience.elastic import log_job_info, resolve_resume_path
 from kempnerforge.resilience.health import NaNDetector
 from kempnerforge.resilience.signal_handler import ShutdownHandler
@@ -174,6 +175,9 @@ def main() -> None:
     tracker = MetricsTracker(config, num_gpus=world_size)
     tracker.init_backends(config)
 
+    # --- Profiler ---
+    prof = build_profiler(config.profiling, rank=rank)
+
     # --- Data ---
     # With PP, sampler should use DP rank/size (not total world size) since
     # all PP stages in the same DP group process the same batch.
@@ -210,6 +214,9 @@ def main() -> None:
     )
 
     model.train()
+
+    if prof is not None:
+        prof.start()
 
     while step < tc.max_steps:
         # Refresh data iterator at start / epoch boundary
@@ -330,6 +337,10 @@ def main() -> None:
             tokens_in_step=tokens_in_step,
         )
 
+        # Advance profiler schedule
+        if prof is not None:
+            prof.step()
+
         # Checkpoint
         if step % config.checkpoint.interval == 0:
             ckpt_mgr.save(step=step, tokens_seen=tokens_seen, scheduler=scheduler)
@@ -340,6 +351,11 @@ def main() -> None:
             ckpt_mgr.save(step=step, tokens_seen=tokens_seen, scheduler=scheduler)
             shutdown_handler.finish()
             break
+
+    if prof is not None:
+        prof.stop()
+        if rank == 0:
+            print_profiler_summary(prof, trace_dir=config.profiling.trace_dir)
 
     logger.info(f"Training complete: {step} steps, {tokens_seen:,} tokens")
     tracker.close()

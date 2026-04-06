@@ -39,8 +39,9 @@ NGPUS_PER_NODE="${SLURM_GPUS_PER_NODE:-4}"
 
 # ---- Master address/port from SLURM ----
 export MASTER_ADDR=$(scontrol show hostnames "${SLURM_JOB_NODELIST}" | head -n 1)
-# Pick a random free port to avoid collisions with other jobs
-export MASTER_PORT=$(shuf -i 20000-30000 -n 1)
+# Pick a random free port (avoids collisions with other jobs on the same node)
+export MASTER_PORT=$(comm -23 <(seq 15000 20000 | sort) \
+    <(ss -Htan | awk '{print $4}' | cut -d':' -f2 | sort -u) | shuf | head -n 1)
 
 # ---- Environment ----
 # Prevent NCCL memory stacking
