@@ -252,7 +252,6 @@ class TestTransformer:
             model = Transformer(small_config)
         assert all(p.device.type == "meta" for p in model.parameters())
 
-    @pytest.mark.gpu
     def test_llama_7b_param_count(self):
         config = ModelConfig(
             dim=4096,
@@ -262,7 +261,8 @@ class TestTransformer:
             vocab_size=32000,
             ffn_hidden_dim=11008,
         )
-        model = Transformer(config)
+        with torch.device("meta"):
+            model = Transformer(config)
         total = sum(p.numel() for p in model.parameters())
         assert 6.5e9 < total < 7.0e9
 
