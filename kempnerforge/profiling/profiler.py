@@ -95,8 +95,7 @@ def _analyze_profiler(prof: torch.profiler.profile) -> dict:
         total_flops += evt.flops if evt.flops else 0
 
         if any(
-            k in name
-            for k in ["gemm", "mm", "matmul", "dot", "bmm", "cublas", "nvjet", "cutlass"]
+            k in name for k in ["gemm", "mm", "matmul", "dot", "bmm", "cublas", "nvjet", "cutlass"]
         ):
             matmul_time += cuda_us
         elif any(k in name for k in ["nccl", "allreduce", "allgather", "reduce_scatter"]):
@@ -108,9 +107,7 @@ def _analyze_profiler(prof: torch.profiler.profile) -> dict:
 
     denom = max(total_cuda_time, 1)
     peak_tflops = get_gpu_peak_tflops()
-    achieved_tflops = (
-        total_flops / (total_cuda_time / 1e6) / 1e12 if total_cuda_time > 0 else 0.0
-    )
+    achieved_tflops = total_flops / (total_cuda_time / 1e6) / 1e12 if total_cuda_time > 0 else 0.0
 
     return {
         "total_cuda_time_us": total_cuda_time,
@@ -180,9 +177,7 @@ def print_profiler_summary(prof: torch.profiler.profile, trace_dir: str | None =
         _save_profiler_summary(stats, prof, trace_dir)
 
 
-def _save_profiler_summary(
-    stats: dict, prof: torch.profiler.profile, trace_dir: str
-) -> None:
+def _save_profiler_summary(stats: dict, prof: torch.profiler.profile, trace_dir: str) -> None:
     """Save a markdown summary report alongside the trace files."""
     from datetime import datetime
 
@@ -206,9 +201,7 @@ def _save_profiler_summary(
         # Truncate long kernel names
         if len(name) > 60:
             name = name[:57] + "..."
-        kernel_rows.append(
-            f"| {name} | {cuda_us / 1e3:.1f} | {pct:.1f} | {calls} | {flops_str} |"
-        )
+        kernel_rows.append(f"| {name} | {cuda_us / 1e3:.1f} | {pct:.1f} | {calls} | {flops_str} |")
 
     gpu_name = "unknown"
     if torch.cuda.is_available():

@@ -469,12 +469,8 @@ def test_sigterm_triggers_emergency_checkpoint(tmp_path):
         pytest.fail("Process did not exit within 30s after SIGTERM")
 
     output = stdout + stderr
-    assert "Shutdown requested" in output, (
-        f"Signal handler did not trigger:\n{output[-2000:]}"
-    )
-    assert "Checkpoint saved" in output, (
-        f"Emergency checkpoint was not saved:\n{output[-2000:]}"
-    )
+    assert "Shutdown requested" in output, f"Signal handler did not trigger:\n{output[-2000:]}"
+    assert "Checkpoint saved" in output, f"Emergency checkpoint was not saved:\n{output[-2000:]}"
 
 
 # ============================================================================

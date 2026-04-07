@@ -167,10 +167,7 @@ class TestDetectIBInterface:
 
     def test_returns_none_when_ib_down(self):
         """Should return None when IB interface exists but is DOWN."""
-        output = (
-            "ib0              DOWN           \n"
-            "eth0             UP             10.0.0.1/24\n"
-        )
+        output = "ib0              DOWN           \neth0             UP             10.0.0.1/24\n"
         with patch("subprocess.run", return_value=self._mock_ip_output(output)):
             assert _detect_ib_interface() is None
 
@@ -189,8 +186,9 @@ class TestSetNcclEnv:
     def test_sets_ib_env_vars(self):
         """Should set NCCL and GLOO socket interface when IB is detected."""
         env = {}
-        with patch.dict(os.environ, env, clear=True), patch(
-            "kempnerforge.distributed.setup._detect_ib_interface", return_value="ib0"
+        with (
+            patch.dict(os.environ, env, clear=True),
+            patch("kempnerforge.distributed.setup._detect_ib_interface", return_value="ib0"),
         ):
             _set_nccl_env()
             assert os.environ["NCCL_SOCKET_IFNAME"] == "ib0"
@@ -210,8 +208,9 @@ class TestSetNcclEnv:
     def test_no_ib_detected(self):
         """Should not set socket ifname when no IB interface is found."""
         env = {}
-        with patch.dict(os.environ, env, clear=True), patch(
-            "kempnerforge.distributed.setup._detect_ib_interface", return_value=None
+        with (
+            patch.dict(os.environ, env, clear=True),
+            patch("kempnerforge.distributed.setup._detect_ib_interface", return_value=None),
         ):
             _set_nccl_env()
             assert "NCCL_SOCKET_IFNAME" not in os.environ

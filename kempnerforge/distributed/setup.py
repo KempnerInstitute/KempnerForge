@@ -54,9 +54,7 @@ def _detect_ib_interface() -> str | None:
     try:
         import subprocess
 
-        result = subprocess.run(
-            ["ip", "-br", "addr"], capture_output=True, text=True, timeout=5
-        )
+        result = subprocess.run(["ip", "-br", "addr"], capture_output=True, text=True, timeout=5)
         for line in result.stdout.splitlines():
             parts = line.split()
             if len(parts) >= 3 and parts[0].startswith("ib") and parts[1] == "UP":
