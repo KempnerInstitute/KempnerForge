@@ -369,16 +369,49 @@ def main() -> None:
                 f"Eval dataset: {len(eval_dataset):,} samples from {eval_config.dataset_path}"
             )
         elif eval_config.hf_dataset_name:
+            import numpy as np
+
             from kempnerforge.data.dataset import HuggingFaceDataset
 
-            eval_dataset = HuggingFaceDataset(
-                dataset_name=eval_config.hf_dataset_name,
-                split=eval_config.hf_dataset_split,
-                text_field=config.data.hf_dataset_text_field,
-                seq_len=tc.seq_len,
-                tokenizer_path=config.data.tokenizer_path,
-                dataset_config=eval_config.hf_dataset_config,
-            )
+            # Rank 0 loads/tokenizes the HF eval dataset, then broadcasts the
+            # packed token tensor to all ranks via torch.distributed.broadcast.
+            # This avoids file-lock failures (flock) on cluster filesystems
+            # (Lustre, VAST) where load_dataset() would crash on all ranks.
+            if rank == 0:
+                eval_ds = HuggingFaceDataset(
+                    dataset_name=eval_config.hf_dataset_name,
+                    split=eval_config.hf_dataset_split,
+                    text_field=config.data.hf_dataset_text_field,
+                    seq_len=tc.seq_len,
+                    tokenizer_path=config.data.tokenizer_path,
+                    dataset_config=eval_config.hf_dataset_config,
+                )
+                packed = torch.from_numpy(np.stack(eval_ds._packed_sequences))
+                n_seqs = torch.tensor([packed.shape[0]], device=device)
+            else:
+                n_seqs = torch.tensor([0], device=device)
+
+            dist.broadcast(n_seqs, src=0)
+            if rank != 0:
+                packed = torch.empty(n_seqs.item(), tc.seq_len + 1, dtype=torch.long)
+            packed_gpu = packed.to(device)
+            dist.broadcast(packed_gpu, src=0)
+            packed = packed_gpu.cpu()
+            del packed_gpu
+
+            # Wrap broadcast data as a simple map-style dataset
+            class _EvalTensorDataset(torch.utils.data.Dataset):
+                def __init__(self, data: torch.Tensor) -> None:
+                    self._data = data
+
+                def __len__(self) -> int:
+                    return self._data.shape[0]
+
+                def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+                    tokens = self._data[idx]
+                    return {"input_ids": tokens[:-1], "labels": tokens[1:]}
+
+            eval_dataset = _EvalTensorDataset(packed)
             eval_sampler = DistributedSampler(
                 eval_dataset, num_replicas=dp_size, rank=dp_rank, shuffle=False, seed=tc.seed
             )

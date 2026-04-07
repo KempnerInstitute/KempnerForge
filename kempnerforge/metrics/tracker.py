@@ -71,10 +71,15 @@ class MetricsTracker:
         self._backends_initialized = False
 
     def _init_backends(self, config: JobConfig) -> None:
-        """Lazily initialize logging backends."""
+        """Lazily initialize logging backends (rank 0 only)."""
         if self._backends_initialized:
             return
         self._backends_initialized = True
+
+        import torch.distributed as dist
+
+        if dist.is_initialized() and dist.get_rank() != 0:
+            return
 
         mc = config.metrics
         if mc.enable_wandb:
