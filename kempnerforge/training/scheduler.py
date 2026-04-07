@@ -14,6 +14,7 @@ import math
 
 import torch
 
+from kempnerforge.config.registry import registry
 from kempnerforge.config.schema import SchedulerConfig, SchedulerType
 
 
@@ -40,6 +41,63 @@ def _linear_decay(step: int, total_steps: int, min_ratio: float) -> float:
     return 1.0 - (1.0 - min_ratio) * progress
 
 
+@registry.register_scheduler("cosine")
+def _build_cosine(
+    optimizer: torch.optim.Optimizer,
+    config: SchedulerConfig,
+    max_steps: int,
+) -> torch.optim.lr_scheduler.LambdaLR:
+    warmup = config.warmup_steps
+    min_ratio = config.min_lr_ratio
+    decay_steps = config.decay_steps or (max_steps - warmup)
+
+    def lr_fn(step: int) -> float:
+        if step < warmup:
+            return _warmup_factor(step, warmup)
+        return _cosine_decay(step - warmup, decay_steps, min_ratio)
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_fn)
+
+
+@registry.register_scheduler("linear")
+def _build_linear(
+    optimizer: torch.optim.Optimizer,
+    config: SchedulerConfig,
+    max_steps: int,
+) -> torch.optim.lr_scheduler.LambdaLR:
+    warmup = config.warmup_steps
+    min_ratio = config.min_lr_ratio
+    decay_steps = config.decay_steps or (max_steps - warmup)
+
+    def lr_fn(step: int) -> float:
+        if step < warmup:
+            return _warmup_factor(step, warmup)
+        return _linear_decay(step - warmup, decay_steps, min_ratio)
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_fn)
+
+
+@registry.register_scheduler("wsd")
+def _build_wsd(
+    optimizer: torch.optim.Optimizer,
+    config: SchedulerConfig,
+    max_steps: int,
+) -> torch.optim.lr_scheduler.LambdaLR:
+    warmup = config.warmup_steps
+    min_ratio = config.min_lr_ratio
+    stable = config.stable_steps or 0
+    decay_steps = config.decay_steps or (max_steps - warmup - stable)
+
+    def lr_fn(step: int) -> float:
+        if step < warmup:
+            return _warmup_factor(step, warmup)
+        if step < warmup + stable:
+            return 1.0
+        return _cosine_decay(step - warmup - stable, decay_steps, min_ratio)
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_fn)
+
+
 def build_scheduler(
     optimizer: torch.optim.Optimizer,
     config: SchedulerConfig,
@@ -55,37 +113,6 @@ def build_scheduler(
     Returns:
         PyTorch LambdaLR scheduler.
     """
-    warmup = config.warmup_steps
-    min_ratio = config.min_lr_ratio
-
-    if config.name == SchedulerType.cosine:
-        decay_steps = config.decay_steps or (max_steps - warmup)
-
-        def lr_fn(step: int) -> float:
-            if step < warmup:
-                return _warmup_factor(step, warmup)
-            return _cosine_decay(step - warmup, decay_steps, min_ratio)
-
-    elif config.name == SchedulerType.linear:
-        decay_steps = config.decay_steps or (max_steps - warmup)
-
-        def lr_fn(step: int) -> float:
-            if step < warmup:
-                return _warmup_factor(step, warmup)
-            return _linear_decay(step - warmup, decay_steps, min_ratio)
-
-    elif config.name == SchedulerType.wsd:
-        stable = config.stable_steps or 0
-        decay_steps = config.decay_steps or (max_steps - warmup - stable)
-
-        def lr_fn(step: int) -> float:
-            if step < warmup:
-                return _warmup_factor(step, warmup)
-            if step < warmup + stable:
-                return 1.0
-            return _cosine_decay(step - warmup - stable, decay_steps, min_ratio)
-
-    else:
-        raise ValueError(f"Unknown scheduler: {config.name!r}")
-
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_fn)
+    name = config.name.value if isinstance(config.name, SchedulerType) else config.name
+    builder = registry.get_scheduler(name)
+    return builder(optimizer, config, max_steps)

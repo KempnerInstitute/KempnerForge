@@ -77,6 +77,7 @@ class ModelConfig:
     rope_theta: float = 10000.0
     tie_embeddings: bool = False
     init_std: float = 0.02  # Std for weight initialization (GPT-2/Llama default)
+    model_type: str = "transformer"  # Registry key for model builder
 
     def __post_init__(self) -> None:
         if self.n_kv_heads is None:
@@ -147,6 +148,7 @@ class TrainConfig:
     compile_model: bool = True
     mixed_precision: Literal["bf16", "fp16", "fp32"] = "bf16"
     activation_checkpointing: ActivationCheckpointing = ActivationCheckpointing.none
+    loss_fn: str = "cross_entropy"  # Registry key for loss function
 
     def __post_init__(self) -> None:
         if self.batch_size <= 0:
@@ -245,6 +247,33 @@ class DataConfig:
             raise ValueError("num_workers must be non-negative")
         if self.prefetch_factor < 1:
             raise ValueError("prefetch_factor must be >= 1")
+
+
+# ---------------------------------------------------------------------------
+# Eval configuration
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class EvalConfig:
+    """Evaluation pipeline settings (disabled by default)."""
+
+    enabled: bool = False
+    interval: int = 1000  # Eval every N training steps
+    steps: int = 50  # Number of eval batches per evaluation
+    # Pre-tokenized eval data (same format as training)
+    dataset_path: str = ""
+    file_pattern: str = "*.npy"
+    # HuggingFace eval data
+    hf_dataset_name: str | None = None
+    hf_dataset_config: str | None = None
+    hf_dataset_split: str = "validation"
+
+    def __post_init__(self) -> None:
+        if self.interval <= 0:
+            raise ValueError("eval interval must be positive")
+        if self.steps <= 0:
+            raise ValueError("eval steps must be positive")
 
 
 # ---------------------------------------------------------------------------
@@ -393,6 +422,7 @@ class JobConfig:
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
     data: DataConfig = field(default_factory=DataConfig)
+    eval: EvalConfig = field(default_factory=EvalConfig)
     distributed: DistributedConfig = field(default_factory=DistributedConfig)
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
     metrics: MetricsConfig = field(default_factory=MetricsConfig)
@@ -412,6 +442,12 @@ class JobConfig:
             raise ValueError(
                 "Tied embeddings are not supported with pipeline parallelism "
                 "(embedding and output head must be on different stages)"
+            )
+
+        if self.eval.enabled and not self.eval.dataset_path and not self.eval.hf_dataset_name:
+            raise ValueError(
+                "eval.enabled is True but no eval data source is configured. "
+                "Set eval.dataset_path or eval.hf_dataset_name."
             )
 
         if self.distributed.tp > 1:

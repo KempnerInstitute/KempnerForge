@@ -61,7 +61,7 @@ class TestBuildOptimizer:
 
     def test_unknown_optimizer_raises(self):
         model = Transformer(TINY_CONFIG)
-        with pytest.raises(ValueError, match="Unknown optimizer"):
+        with pytest.raises(KeyError, match="Unknown optimizer"):
             build_optimizer(model, OptimizerConfig(name="sgd"))
 
     def test_all_params_accounted(self):
@@ -158,7 +158,7 @@ class TestScheduler:
     def test_unknown_scheduler_raises(self):
         model = Transformer(TINY_CONFIG)
         opt = build_optimizer(model, OptimizerConfig())
-        with pytest.raises(ValueError, match="Unknown scheduler"):
+        with pytest.raises(KeyError, match="Unknown scheduler"):
             build_scheduler(opt, SchedulerConfig(name="invalid"), max_steps=100)
 
     def test_zero_warmup(self):

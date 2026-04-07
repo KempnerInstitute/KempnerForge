@@ -25,6 +25,7 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 )
 from torch.distributed.device_mesh import DeviceMesh
 
+from kempnerforge.config.registry import registry
 from kempnerforge.config.schema import ActivationCheckpointing
 from kempnerforge.model.transformer import Transformer, TransformerBlock
 
@@ -192,12 +193,13 @@ def build_parallel_model(
     from kempnerforge.distributed.tensor_parallel import apply_tensor_parallel
 
     tp_enabled = device_mesh is not None and "tp" in device_mesh.mesh_dim_names
+    model_builder = registry.get_model(model_config.model_type)
 
     if tp_enabled:
         # Meta-device init: create model with zero memory, apply parallelisms,
         # then materialize only the local shards on GPU.
         with torch.device("meta"):
-            model = Transformer(model_config)
+            model = model_builder(model_config)
         apply_tensor_parallel(model, device_mesh)
         apply_ac(model, ac_mode)
         if device_mesh is not None:
@@ -206,7 +208,7 @@ def build_parallel_model(
         model.init_weights_and_freqs()
         model.to(dtype=param_dtype)
     else:
-        model = Transformer(model_config).to(device=device, dtype=param_dtype)
+        model = model_builder(model_config).to(device=device, dtype=param_dtype)
         apply_ac(model, ac_mode)
         if device_mesh is not None:
             apply_fsdp2(model, device_mesh, mp_policy=mp_policy)

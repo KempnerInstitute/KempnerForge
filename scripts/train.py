@@ -20,14 +20,15 @@ Usage:
 
 from __future__ import annotations
 
+import math
 import sys
 
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
 
 from kempnerforge.checkpoint.manager import CheckpointManager
 from kempnerforge.config.loader import load_config
+from kempnerforge.config.registry import registry
 from kempnerforge.data.dataloader import StatefulDataLoader
 from kempnerforge.data.dataset import MemoryMappedDataset
 from kempnerforge.data.sampler import DistributedSampler
@@ -47,10 +48,84 @@ from kempnerforge.resilience.elastic import log_job_info, resolve_resume_path
 from kempnerforge.resilience.health import NaNDetector
 from kempnerforge.resilience.signal_handler import ShutdownHandler
 from kempnerforge.training.grad import maybe_no_sync
+from kempnerforge.training.loss import cross_entropy_loss as _  # noqa: F401 — triggers registration
 from kempnerforge.training.optimizer import build_optimizer
 from kempnerforge.training.scheduler import build_scheduler
 
 logger = get_logger(__name__)
+
+
+@torch.no_grad()
+def eval_step(
+    model: torch.nn.Module,
+    eval_dataloader: torch.utils.data.DataLoader,
+    loss_fn: callable,
+    device: torch.device,
+    eval_steps: int,
+    *,
+    pp_schedule=None,
+    pp_rank: int | None = None,
+    pp_size: int | None = None,
+    pp_group=None,
+) -> dict[str, float]:
+    """Run evaluation and return metrics."""
+    model.eval()
+
+    if pp_schedule is not None:
+        # --- PP eval path ---
+        input_ids_list, labels_list = [], []
+        eval_iter = iter(eval_dataloader)
+        for _ in range(eval_steps):
+            try:
+                batch = next(eval_iter)
+            except StopIteration:
+                eval_iter = iter(eval_dataloader)
+                batch = next(eval_iter)
+            input_ids_list.append(batch["input_ids"].to(device))
+            labels_list.append(batch["labels"].to(device))
+
+        full_input = torch.cat(input_ids_list, dim=0)
+        full_labels = torch.cat(labels_list, dim=0)
+
+        is_first = pp_rank == 0
+        is_last = pp_rank == pp_size - 1
+        pp_losses: list[torch.Tensor] = []
+
+        if is_first:
+            pp_schedule.step(full_input, target=full_labels, losses=pp_losses)
+        elif is_last:
+            pp_schedule.step(target=full_labels, losses=pp_losses)
+        else:
+            pp_schedule.step()
+
+        if is_last and pp_losses:
+            avg_loss = sum(loss.item() for loss in pp_losses) / len(pp_losses)
+        else:
+            avg_loss = 0.0
+
+        loss_tensor = torch.tensor([avg_loss], device=device)
+        dist.broadcast(loss_tensor, group_src=pp_size - 1, group=pp_group)
+        avg_loss = loss_tensor[0].item()
+    else:
+        # --- Standard eval path ---
+        total_loss = 0.0
+        eval_iter = iter(eval_dataloader)
+        for _ in range(eval_steps):
+            try:
+                batch = next(eval_iter)
+            except StopIteration:
+                eval_iter = iter(eval_dataloader)
+                batch = next(eval_iter)
+            input_ids = batch["input_ids"].to(device)
+            labels = batch["labels"].to(device)
+            logits = model(input_ids)
+            loss = loss_fn(logits, labels)
+            total_loss += loss.item()
+
+        avg_loss = total_loss / eval_steps
+
+    model.train()
+    return {"eval/loss": avg_loss, "eval/perplexity": math.exp(min(avg_loss, 20.0))}
 
 
 def main() -> None:
@@ -83,6 +158,9 @@ def main() -> None:
     mc = config.model
     pp_enabled = config.distributed.pp > 1
     mp_policy = default_mp_policy(tc.param_dtype)
+
+    # --- Loss function ---
+    loss_fn = registry.get_loss(tc.loss_fn)
 
     # --- Model ---
     if pp_enabled:
@@ -136,13 +214,10 @@ def main() -> None:
             param_dtype=tc.param_dtype,
         )
 
-        def pp_loss_fn(logits, labels):
-            return F.cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1))
-
         pp_schedule = build_pipeline_schedule(
             stage=pp_stage,
             n_microbatches=tc.grad_accum_steps,
-            loss_fn=pp_loss_fn,
+            loss_fn=loss_fn,
             schedule=config.distributed.pp_schedule.value,
         )
     else:
@@ -272,6 +347,49 @@ def main() -> None:
                 f"{config.data.hf_dataset_name} ({config.data.hf_dataset_split})"
             )
 
+    # --- Eval data ---
+    eval_config = config.eval
+    eval_dataloader = None
+    if eval_config.enabled:
+        from torch.utils.data import DataLoader as TorchDataLoader
+
+        if eval_config.dataset_path:
+            eval_dataset = MemoryMappedDataset(
+                data_dir=eval_config.dataset_path,
+                seq_len=tc.seq_len + 1,
+                file_pattern=eval_config.file_pattern,
+            )
+            eval_sampler = DistributedSampler(
+                eval_dataset, num_replicas=dp_size, rank=dp_rank, shuffle=False, seed=tc.seed
+            )
+            eval_dataloader = TorchDataLoader(
+                eval_dataset, batch_size=tc.batch_size, sampler=eval_sampler
+            )
+            logger.info(
+                f"Eval dataset: {len(eval_dataset):,} samples from {eval_config.dataset_path}"
+            )
+        elif eval_config.hf_dataset_name:
+            from kempnerforge.data.dataset import HuggingFaceDataset
+
+            eval_dataset = HuggingFaceDataset(
+                dataset_name=eval_config.hf_dataset_name,
+                split=eval_config.hf_dataset_split,
+                text_field=config.data.hf_dataset_text_field,
+                seq_len=tc.seq_len,
+                tokenizer_path=config.data.tokenizer_path,
+                dataset_config=eval_config.hf_dataset_config,
+            )
+            eval_sampler = DistributedSampler(
+                eval_dataset, num_replicas=dp_size, rank=dp_rank, shuffle=False, seed=tc.seed
+            )
+            eval_dataloader = TorchDataLoader(
+                eval_dataset, batch_size=tc.batch_size, sampler=eval_sampler
+            )
+            logger.info(
+                f"Eval dataset: {len(eval_dataset):,} packed sequences from "
+                f"{eval_config.hf_dataset_name} ({eval_config.hf_dataset_split})"
+            )
+
     logger.info(
         f"Starting training: step={step}, max_steps={tc.max_steps}, "
         f"batch_size={tc.batch_size}, grad_accum={tc.grad_accum_steps}, "
@@ -371,7 +489,7 @@ def main() -> None:
 
                 with maybe_no_sync(model, micro_step, tc.grad_accum_steps):
                     logits = model(input_ids)
-                    loss = F.cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1))
+                    loss = loss_fn(logits, labels)
                     scaled_loss = loss / tc.grad_accum_steps
                     scaled_loss.backward()
                     total_loss += loss.item()
@@ -408,6 +526,25 @@ def main() -> None:
             lr=scheduler.get_last_lr()[0],
             tokens_in_step=tokens_in_step,
         )
+
+        # Eval
+        if eval_config.enabled and eval_dataloader is not None and step % eval_config.interval == 0:
+            pp_group = None
+            if pp_enabled:
+                pp_mesh = device_mesh["pp"]
+                pp_group = pp_mesh.get_group()
+            eval_metrics = eval_step(
+                model,
+                eval_dataloader,
+                loss_fn,
+                device,
+                eval_config.steps,
+                pp_schedule=pp_schedule if pp_enabled else None,
+                pp_rank=pp_rank if pp_enabled else None,
+                pp_size=pp_size if pp_enabled else None,
+                pp_group=pp_group,
+            )
+            tracker.log_eval(eval_metrics, step)
 
         # Advance profiler schedule
         if prof is not None:

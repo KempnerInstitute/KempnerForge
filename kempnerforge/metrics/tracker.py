@@ -191,6 +191,12 @@ class MetricsTracker:
         for backend in self._backends:
             backend.log(backend_dict, step=step)
 
+    def log_eval(self, metrics: dict[str, float], step: int) -> None:
+        """Log eval metrics to all backends and stdout."""
+        logger.info(format_metrics(step, metrics))
+        for backend in self._backends:
+            backend.log(metrics, step=step)
+
     def init_backends(self, config: JobConfig) -> None:
         """Initialize logging backends (call after distributed setup)."""
         self._init_backends(config)

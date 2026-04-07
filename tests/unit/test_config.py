@@ -13,6 +13,7 @@ from kempnerforge.config.schema import (
     CheckpointConfig,
     DataConfig,
     DistributedConfig,
+    EvalConfig,
     MetricsConfig,
     OptimizerConfig,
     ProfilingConfig,
@@ -447,3 +448,84 @@ class TestRegistry:
         reg.register("optimizer", "x", "opt_x")
         assert reg.get("model", "x") == "model_x"
         assert reg.get("optimizer", "x") == "opt_x"
+
+    def test_builtin_optimizer_registered(self):
+        from kempnerforge.config.registry import registry
+        from kempnerforge.training import optimizer as _  # noqa: F401
+
+        assert callable(registry.get_optimizer("adamw"))
+
+    def test_builtin_schedulers_registered(self):
+        from kempnerforge.config.registry import registry
+        from kempnerforge.training import scheduler as _  # noqa: F401
+
+        for name in ["cosine", "linear", "wsd"]:
+            assert callable(registry.get_scheduler(name))
+
+    def test_builtin_model_registered(self):
+        from kempnerforge.config.registry import registry
+        from kempnerforge.model import transformer as _  # noqa: F401
+
+        assert callable(registry.get_model("transformer"))
+
+    def test_builtin_loss_registered(self):
+        from kempnerforge.config.registry import registry
+        from kempnerforge.training import loss as _  # noqa: F401
+
+        assert callable(registry.get_loss("cross_entropy"))
+
+    def test_builtin_mlp_registered(self):
+        from kempnerforge.config.registry import registry
+        from kempnerforge.model import mlp as _  # noqa: F401
+
+        for name in ["swiglu", "standard_gelu", "standard_relu"]:
+            assert callable(registry.get("mlp", name))
+
+    def test_builtin_norm_registered(self):
+        from kempnerforge.config.registry import registry
+        from kempnerforge.model import norm as _  # noqa: F401
+
+        for name in ["rmsnorm", "layernorm"]:
+            assert callable(registry.get("norm", name))
+
+
+# ---------------------------------------------------------------------------
+# EvalConfig
+# ---------------------------------------------------------------------------
+
+
+class TestEvalConfig:
+    def test_defaults(self):
+        ec = EvalConfig()
+        assert ec.enabled is False
+        assert ec.interval == 1000
+        assert ec.steps == 50
+
+    def test_rejects_zero_interval(self):
+        with pytest.raises(ValueError, match="eval interval must be positive"):
+            EvalConfig(interval=0)
+
+    def test_rejects_zero_steps(self):
+        with pytest.raises(ValueError, match="eval steps must be positive"):
+            EvalConfig(steps=0)
+
+    def test_validation_requires_data_source(self):
+        config = JobConfig()
+        config.eval = EvalConfig(enabled=True)
+        with pytest.raises(ValueError, match="no eval data source"):
+            config.validate()
+
+    def test_validation_passes_with_dataset_path(self):
+        config = JobConfig()
+        config.eval = EvalConfig(enabled=True, dataset_path="/data/eval")
+        config.validate()  # Should not raise
+
+    def test_validation_passes_with_hf_dataset(self):
+        config = JobConfig()
+        config.eval = EvalConfig(enabled=True, hf_dataset_name="wikitext")
+        config.validate()  # Should not raise
+
+    def test_disabled_skips_validation(self):
+        config = JobConfig()
+        config.eval = EvalConfig(enabled=False)
+        config.validate()  # Should not raise even without data source

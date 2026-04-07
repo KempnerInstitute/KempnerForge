@@ -91,6 +91,30 @@ class Registry:
     def get_scheduler(self, name: str) -> Callable:
         return self.get("scheduler", name)
 
+    def register_loss(self, name: str) -> Callable:
+        """Decorator to register a loss function."""
+
+        def decorator(fn: Callable) -> Callable:
+            self.register("loss", name, fn)
+            return fn
+
+        return decorator
+
+    def get_loss(self, name: str) -> Callable:
+        return self.get("loss", name)
+
+    def register_eval(self, name: str) -> Callable:
+        """Decorator to register an eval function."""
+
+        def decorator(fn: Callable) -> Callable:
+            self.register("eval", name, fn)
+            return fn
+
+        return decorator
+
+    def get_eval(self, name: str) -> Callable:
+        return self.get("eval", name)
+
 
 # Global registry instance
 registry = Registry()

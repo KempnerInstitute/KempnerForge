@@ -14,6 +14,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+from kempnerforge.config.registry import registry
 from kempnerforge.config.schema import ModelConfig
 from kempnerforge.model.attention import Attention
 from kempnerforge.model.embedding import OutputHead, TokenEmbedding
@@ -154,3 +155,8 @@ class Transformer(nn.Module):
             h = self.output_head(h)
 
         return h
+
+
+@registry.register_model("transformer")
+def _build_transformer(model_config: ModelConfig) -> Transformer:
+    return Transformer(model_config)

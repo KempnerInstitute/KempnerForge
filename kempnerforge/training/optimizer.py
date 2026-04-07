@@ -12,9 +12,24 @@ import logging
 
 import torch
 
+from kempnerforge.config.registry import registry
 from kempnerforge.config.schema import OptimizerConfig
 
 logger = logging.getLogger(__name__)
+
+
+@registry.register_optimizer("adamw")
+def _build_adamw(
+    param_groups: list[dict],
+    config: OptimizerConfig,
+) -> torch.optim.Optimizer:
+    return torch.optim.AdamW(
+        param_groups,
+        lr=config.lr,
+        betas=config.betas,
+        eps=config.eps,
+        fused=config.fused and torch.cuda.is_available(),
+    )
 
 
 def _should_decay(name: str, param: torch.nn.Parameter) -> bool:
@@ -63,15 +78,5 @@ def build_optimizer(
         f"Optimizer groups: {n_decay:,} params with decay, {n_no_decay:,} params without decay"
     )
 
-    if config.name == "adamw":
-        optimizer = torch.optim.AdamW(
-            param_groups,
-            lr=config.lr,
-            betas=config.betas,
-            eps=config.eps,
-            fused=config.fused and torch.cuda.is_available(),
-        )
-    else:
-        raise ValueError(f"Unknown optimizer: {config.name!r}")
-
-    return optimizer
+    builder = registry.get_optimizer(config.name)
+    return builder(param_groups, config)

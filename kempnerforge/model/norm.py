@@ -5,6 +5,8 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+from kempnerforge.config.registry import registry
+
 
 class RMSNorm(nn.Module):
     """Root Mean Square Layer Normalization (Llama-style).
@@ -25,10 +27,19 @@ class RMSNorm(nn.Module):
         return (norm * self.weight).to(dtype)
 
 
+def _build_rmsnorm(dim: int, eps: float = 1e-5) -> RMSNorm:
+    return RMSNorm(dim, eps=eps)
+
+
+def _build_layernorm(dim: int, eps: float = 1e-5) -> nn.LayerNorm:
+    return nn.LayerNorm(dim, eps=eps)
+
+
+registry.register("norm", "rmsnorm", _build_rmsnorm)
+registry.register("norm", "layernorm", _build_layernorm)
+
+
 def build_norm(norm_type: str, dim: int, eps: float = 1e-5) -> nn.Module:
     """Build a normalization layer by name."""
-    if norm_type == "rmsnorm":
-        return RMSNorm(dim, eps=eps)
-    if norm_type == "layernorm":
-        return nn.LayerNorm(dim, eps=eps)
-    raise ValueError(f"Unknown norm_type: {norm_type!r}. Expected 'rmsnorm' or 'layernorm'.")
+    builder = registry.get("norm", norm_type)
+    return builder(dim, eps=eps)

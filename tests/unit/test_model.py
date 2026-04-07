@@ -54,7 +54,7 @@ class TestBuildNorm:
         assert isinstance(build_norm("layernorm", 64), torch.nn.LayerNorm)
 
     def test_unknown(self):
-        with pytest.raises(ValueError, match="Unknown norm_type"):
+        with pytest.raises(KeyError, match="Unknown norm"):
             build_norm("batchnorm", 64)
 
 

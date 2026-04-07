@@ -6,6 +6,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from kempnerforge.config.registry import registry
+
 
 class SwiGLUMLP(nn.Module):
     """SwiGLU feed-forward network (Llama-style).
@@ -44,11 +46,32 @@ class StandardMLP(nn.Module):
         return self.down_proj(self._activation(self.up_proj(x)))
 
 
+def _build_swiglu(dim: int, hidden_dim: int) -> SwiGLUMLP:
+    return SwiGLUMLP(dim, hidden_dim)
+
+
+def _build_standard_gelu(dim: int, hidden_dim: int) -> StandardMLP:
+    return StandardMLP(dim, hidden_dim, activation="gelu")
+
+
+def _build_standard_relu(dim: int, hidden_dim: int) -> StandardMLP:
+    return StandardMLP(dim, hidden_dim, activation="relu")
+
+
+registry.register("mlp", "swiglu", _build_swiglu)
+registry.register("mlp", "standard_gelu", _build_standard_gelu)
+registry.register("mlp", "standard_relu", _build_standard_relu)
+
+
+# Map activation config names to registry keys
+_ACTIVATION_TO_MLP = {"silu": "swiglu", "gelu": "standard_gelu", "relu": "standard_relu"}
+
+
 def build_mlp(dim: int, hidden_dim: int, activation: str = "silu") -> nn.Module:
     """Build an MLP by activation name.
 
     SiLU activation uses SwiGLU (3 matrices); others use standard MLP (2 matrices).
     """
-    if activation == "silu":
-        return SwiGLUMLP(dim, hidden_dim)
-    return StandardMLP(dim, hidden_dim, activation=activation)
+    key = _ACTIVATION_TO_MLP.get(activation, activation)
+    builder = registry.get("mlp", key)
+    return builder(dim, hidden_dim)
