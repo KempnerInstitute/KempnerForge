@@ -13,7 +13,6 @@ from kempnerforge.resilience.health import (
     NaNState,
     check_gpu_health,
     check_nccl_health,
-    log_health_status,
 )
 from kempnerforge.resilience.signal_handler import ShutdownHandler
 
@@ -27,7 +26,6 @@ __all__ = [
     "get_slurm_info",
     "is_slurm_job",
     "is_slurm_requeue",
-    "log_health_status",
     "log_job_info",
     "resolve_resume_path",
 ]

@@ -11,9 +11,12 @@ from kempnerforge.config.schema import (
     ActivationCheckpointing,
     AsyncCheckpointMode,
     CheckpointConfig,
+    DataConfig,
     DistributedConfig,
+    MetricsConfig,
     OptimizerConfig,
     ProfilingConfig,
+    SchedulerConfig,
     SchedulerType,
     TrainConfig,
 )
@@ -172,6 +175,55 @@ class TestCheckpointConfig:
     def test_rejects_zero_interval(self):
         with pytest.raises(ValueError, match="interval must be positive"):
             CheckpointConfig(interval=0)
+
+
+# ---------------------------------------------------------------------------
+# ProfilingConfig
+# ---------------------------------------------------------------------------
+
+
+class TestSchedulerConfig:
+    def test_rejects_negative_warmup(self):
+        with pytest.raises(ValueError, match="warmup_steps must be non-negative"):
+            SchedulerConfig(warmup_steps=-1)
+
+    def test_rejects_min_lr_ratio_above_one(self):
+        with pytest.raises(ValueError, match="min_lr_ratio must be in"):
+            SchedulerConfig(min_lr_ratio=1.5)
+
+    def test_rejects_min_lr_ratio_below_zero(self):
+        with pytest.raises(ValueError, match="min_lr_ratio must be in"):
+            SchedulerConfig(min_lr_ratio=-0.1)
+
+
+# ---------------------------------------------------------------------------
+# DataConfig
+# ---------------------------------------------------------------------------
+
+
+class TestDataConfig:
+    def test_rejects_negative_workers(self):
+        with pytest.raises(ValueError, match="num_workers must be non-negative"):
+            DataConfig(num_workers=-1)
+
+    def test_rejects_zero_prefetch(self):
+        with pytest.raises(ValueError, match="prefetch_factor must be >= 1"):
+            DataConfig(prefetch_factor=0)
+
+
+# ---------------------------------------------------------------------------
+# MetricsConfig
+# ---------------------------------------------------------------------------
+
+
+class TestMetricsConfig:
+    def test_rejects_zero_log_interval(self):
+        with pytest.raises(ValueError, match="log_interval must be positive"):
+            MetricsConfig(log_interval=0)
+
+    def test_rejects_negative_log_interval(self):
+        with pytest.raises(ValueError, match="log_interval must be positive"):
+            MetricsConfig(log_interval=-1)
 
 
 # ---------------------------------------------------------------------------

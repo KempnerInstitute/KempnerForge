@@ -106,7 +106,7 @@ kempnerforge/
   profiling/   — torch.profiler integration, CUDA timing
 configs/       — TOML configs for training runs and model architecture presets
 scripts/       — Training entry point, data validation, checkpoint conversion, SLURM launch
-tests/         — Unit (312), integration, distributed, and end-to-end tests
+tests/         — Unit (336), integration, distributed, and end-to-end tests
 ```
 
 ## Testing

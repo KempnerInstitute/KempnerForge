@@ -5,9 +5,12 @@ from __future__ import annotations
 import os
 from unittest.mock import patch
 
+import torch
+
 from kempnerforge.config.schema import ModelConfig
 from kempnerforge.distributed.setup import _detect_ib_interface, _set_nccl_env, get_world_info
 from kempnerforge.distributed.tensor_parallel import _build_block_tp_plan
+from kempnerforge.distributed.utils import clip_grad_norm_
 from kempnerforge.model.transformer import TransformerBlock
 
 
@@ -15,6 +18,46 @@ def _make_block(activation: str = "silu") -> TransformerBlock:
     """Create a small TransformerBlock on CPU for plan builder testing."""
     config = ModelConfig(dim=64, n_layers=2, n_heads=4, vocab_size=128, activation=activation)
     return TransformerBlock(config, layer_idx=0)
+
+
+class TestClipGradNorm:
+    """Tests for clip_grad_norm_ on plain (non-FSDP) tensors."""
+
+    def _make_model_with_grad(self, grad_value: float) -> torch.nn.Module:
+        """Create a small model with uniform gradients for predictable norms."""
+        model = torch.nn.Linear(4, 4, bias=False)
+        model.weight.grad = torch.full_like(model.weight, grad_value)
+        return model
+
+    def test_returns_total_norm(self):
+        model = self._make_model_with_grad(1.0)
+        # 4x4 matrix of 1s → norm = sqrt(16) = 4.0
+        norm = clip_grad_norm_(model, max_norm=100.0)
+        assert abs(norm.item() - 4.0) < 1e-5
+
+    def test_clips_when_above_max(self):
+        model = self._make_model_with_grad(1.0)
+        # norm=4.0, clip to 2.0 → gradients scaled by 2.0/4.0 = 0.5
+        clip_grad_norm_(model, max_norm=2.0)
+        assert torch.allclose(model.weight.grad, torch.full((4, 4), 0.5), atol=1e-5)
+
+    def test_no_clip_when_below_max(self):
+        model = self._make_model_with_grad(1.0)
+        original_grad = model.weight.grad.clone()
+        # norm=4.0, max_norm=10.0 → no clipping
+        clip_grad_norm_(model, max_norm=10.0)
+        assert torch.allclose(model.weight.grad, original_grad)
+
+    def test_no_grads_returns_zero(self):
+        model = torch.nn.Linear(4, 4, bias=False)
+        # No .grad set
+        norm = clip_grad_norm_(model, max_norm=1.0)
+        assert norm.item() == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Tensor parallel plan builder
+# ---------------------------------------------------------------------------
 
 
 class TestBuildBlockTPPlan:

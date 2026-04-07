@@ -135,6 +135,83 @@ class TestProfiler:
         elapsed = timer.elapsed_ms()
         assert elapsed > 0
 
+    def test_analyze_profiler_extracts_stats(self):
+        """_analyze_profiler should return a dict with expected keys from mock profiler."""
+        from unittest.mock import MagicMock
+
+        from kempnerforge.profiling.profiler import _analyze_profiler
+
+        # Create mock profiler events
+        matmul_evt = MagicMock()
+        matmul_evt.key = "aten::mm"
+        matmul_evt.self_device_time_total = 5000  # 5000 us
+        matmul_evt.flops = int(1e12)  # 1 TFLOP
+
+        nccl_evt = MagicMock()
+        nccl_evt.key = "nccl:allreduce"
+        nccl_evt.self_device_time_total = 2000
+        nccl_evt.flops = 0
+
+        other_evt = MagicMock()
+        other_evt.key = "aten::relu"
+        other_evt.self_device_time_total = 1000
+        other_evt.flops = 0
+
+        mock_prof = MagicMock()
+        mock_prof.key_averages.return_value = [matmul_evt, nccl_evt, other_evt]
+
+        stats = _analyze_profiler(mock_prof)
+
+        assert stats["matmul_time_us"] == 5000
+        assert stats["comm_time_us"] == 2000
+        assert stats["other_time_us"] == 1000
+        assert stats["total_cuda_time_us"] == 8000
+        assert stats["total_flops"] == int(1e12)
+        assert "achieved_tflops" in stats
+        assert "peak_tflops" in stats
+        # Matmul should be 5000/8000 = 62.5%
+        assert abs(stats["matmul_pct"] - 62.5) < 0.1
+
+    def test_save_profiler_summary_creates_file(self, tmp_path):
+        """_save_profiler_summary should write a summary.md file."""
+        from unittest.mock import MagicMock
+
+        from kempnerforge.profiling.profiler import _save_profiler_summary
+
+        mock_evt = MagicMock()
+        mock_evt.key = "aten::mm"
+        mock_evt.self_device_time_total = 5000
+        mock_evt.flops = int(1e12)
+        mock_evt.count = 10
+
+        mock_prof = MagicMock()
+        mock_prof.key_averages.return_value = [mock_evt]
+
+        stats = {
+            "total_cuda_time_us": 8000,
+            "matmul_time_us": 5000,
+            "comm_time_us": 2000,
+            "memory_time_us": 500,
+            "other_time_us": 500,
+            "matmul_pct": 62.5,
+            "comm_pct": 25.0,
+            "memory_pct": 6.25,
+            "other_pct": 6.25,
+            "total_flops": int(1e12),
+            "achieved_tflops": 125.0,
+            "peak_tflops": 989.0,
+            "kernel_efficiency_pct": 12.6,
+        }
+
+        _save_profiler_summary(stats, mock_prof, str(tmp_path))
+
+        summary = tmp_path / "summary.md"
+        assert summary.exists()
+        content = summary.read_text()
+        assert "Profiling Summary" in content
+        assert "MatMul/GEMM" in content
+        assert "aten::mm" in content
+
     def test_cuda_timer_collection_disabled(self):
         """Disabled timer collection should be zero-cost no-ops."""
         from kempnerforge.profiling.cuda_timer import CUDATimerCollection

@@ -2,10 +2,20 @@
 
 from __future__ import annotations
 
+import logging
+import os
+from unittest.mock import patch
+
 import torch
 
 from kempnerforge.config.schema import JobConfig, MetricsConfig, ModelConfig
-from kempnerforge.metrics.logger import _format_number, format_metrics
+from kempnerforge.metrics.logger import (
+    _format_number,
+    _RankFilter,
+    _RankFormatter,
+    format_metrics,
+    get_logger,
+)
 from kempnerforge.metrics.memory import DeviceMemoryMonitor
 from kempnerforge.metrics.tracker import (
     MetricsTracker,
@@ -175,6 +185,53 @@ class TestTensorBoardBackend:
 
 # ---------------------------------------------------------------------------
 # Format helpers
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Rank-aware logging
+# ---------------------------------------------------------------------------
+
+
+class TestRankLogger:
+    def test_get_logger_returns_logger(self):
+        logger = get_logger("test_module")
+        assert isinstance(logger, logging.Logger)
+        assert logger.name == "kempnerforge.test_module"
+
+    def test_rank_filter_allows_rank_zero(self):
+        f = _RankFilter(rank=0)
+        record = logging.LogRecord("test", logging.INFO, "", 0, "msg", (), None)
+        with patch.dict(os.environ, {"RANK": "0"}):
+            assert f.filter(record) is True
+
+    def test_rank_filter_blocks_non_zero(self):
+        f = _RankFilter(rank=0)
+        record = logging.LogRecord("test", logging.INFO, "", 0, "msg", (), None)
+        with patch.dict(os.environ, {"RANK": "3"}):
+            assert f.filter(record) is False
+
+    def test_rank_filter_custom_rank(self):
+        """Filter allowing rank 2 should pass rank 2 and block others."""
+        f = _RankFilter(rank=2)
+        record = logging.LogRecord("test", logging.INFO, "", 0, "msg", (), None)
+        with patch.dict(os.environ, {"RANK": "2"}):
+            assert f.filter(record) is True
+        with patch.dict(os.environ, {"RANK": "0"}):
+            assert f.filter(record) is False
+
+    def test_rank_formatter_includes_rank(self):
+        fmt = _RankFormatter(use_color=False)
+        record = logging.LogRecord("test", logging.INFO, "", 0, "hello world", (), None)
+        with patch.dict(os.environ, {"RANK": "5"}):
+            output = fmt.format(record)
+        assert "[rank 5]" in output
+        assert "INFO" in output
+        assert "hello world" in output
+
+
+# ---------------------------------------------------------------------------
+# Format metrics
 # ---------------------------------------------------------------------------
 
 

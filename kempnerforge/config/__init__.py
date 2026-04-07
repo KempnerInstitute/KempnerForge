@@ -1,6 +1,6 @@
 """Configuration system for KempnerForge."""
 
-from kempnerforge.config.loader import load_config, load_config_from_args
+from kempnerforge.config.loader import load_config
 from kempnerforge.config.registry import registry
 from kempnerforge.config.schema import (
     CheckpointConfig,
@@ -27,6 +27,5 @@ __all__ = [
     "SchedulerConfig",
     "TrainConfig",
     "load_config",
-    "load_config_from_args",
     "registry",
 ]

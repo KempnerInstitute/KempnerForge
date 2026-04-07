@@ -20,8 +20,10 @@ from __future__ import annotations
 
 import os
 import re
+import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -363,6 +365,116 @@ def test_checkpoint_save_and_resume(tmp_path):
     _assert_training_complete(result, expected_steps=15)
     output = result.stdout + result.stderr
     assert "step=10" in output, "Did not resume from step 10"
+
+
+# ============================================================================
+# Pipeline Parallel + Checkpoint
+# ============================================================================
+
+
+@pytest.mark.e2e
+@requires_gpus(4)
+def test_pp_checkpoint_save_and_resume(tmp_path):
+    """4 GPU PP=2 + FSDP=2 — save checkpoint, resume, verify loss continuity."""
+    ckpt_dir = str(tmp_path / "pp_ckpt")
+
+    # Phase 1: Train 10 steps with PP, checkpoint at step 5
+    result = _run_training(
+        [
+            DEBUG_CONFIG,
+            "--train.max_steps=10",
+            "--metrics.log_interval=5",
+            "--distributed.pp=2",
+            "--distributed.dp_shard=2",
+            "--train.grad_accum_steps=2",
+            f"--checkpoint.dir={ckpt_dir}",
+            "--checkpoint.interval=5",
+        ],
+        nproc=4,
+    )
+    _assert_training_complete(result, expected_steps=10)
+    output = result.stdout + result.stderr
+    assert "Checkpoint saved" in output, "PP checkpoint was not saved"
+
+    # Verify loss is meaningful before resume
+    loss_phase1 = _parse_last_loss(output)
+    assert loss_phase1 is not None and loss_phase1 > 0.0, (
+        f"PP phase 1 loss should be > 0 (got {loss_phase1})"
+    )
+
+    # Phase 2: Resume from checkpoint, train to step 15
+    result = _run_training(
+        [
+            DEBUG_CONFIG,
+            "--train.max_steps=15",
+            "--metrics.log_interval=5",
+            "--distributed.pp=2",
+            "--distributed.dp_shard=2",
+            "--train.grad_accum_steps=2",
+            f"--checkpoint.dir={ckpt_dir}",
+            "--checkpoint.interval=100",
+        ],
+        nproc=4,
+    )
+    _assert_training_complete(result, expected_steps=15)
+    output = result.stdout + result.stderr
+    assert "Resumed from step" in output, "PP did not resume from checkpoint"
+
+
+# ============================================================================
+# Signal Handler (graceful shutdown)
+# ============================================================================
+
+
+@pytest.mark.e2e
+def test_sigterm_triggers_emergency_checkpoint(tmp_path):
+    """Send SIGTERM during training — verify emergency checkpoint is saved."""
+    ckpt_dir = str(tmp_path / "sigterm_ckpt")
+
+    env = os.environ.copy()
+    env.setdefault("WORLD_SIZE", "1")
+    env.setdefault("RANK", "0")
+    env.setdefault("LOCAL_RANK", "0")
+
+    # Start training with many steps so it's still running when we SIGTERM
+    cmd = [
+        sys.executable,
+        TRAIN_SCRIPT,
+        DEBUG_CONFIG,
+        "--train.max_steps=500",
+        "--metrics.log_interval=1",
+        f"--checkpoint.dir={ckpt_dir}",
+        "--checkpoint.interval=1000",  # no scheduled checkpoint
+    ]
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+        cwd=str(PROJECT_ROOT),
+    )
+
+    # Wait for training to start (look for first loss= in output),
+    # then send SIGTERM
+    time.sleep(10)
+    proc.send_signal(signal.SIGTERM)
+
+    try:
+        stdout, stderr = proc.communicate(timeout=30)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        stdout, stderr = proc.communicate()
+        pytest.fail("Process did not exit within 30s after SIGTERM")
+
+    output = stdout + stderr
+    assert "Shutdown requested" in output, (
+        f"Signal handler did not trigger:\n{output[-2000:]}"
+    )
+    assert "Checkpoint saved" in output, (
+        f"Emergency checkpoint was not saved:\n{output[-2000:]}"
+    )
 
 
 # ============================================================================

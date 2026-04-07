@@ -199,25 +199,3 @@ def load_config(
         config = _apply_dict_to_dataclass(config, overrides)
 
     return config
-
-
-def load_config_from_args() -> JobConfig:
-    """Load config from CLI arguments.
-
-    Usage: script.py [config.toml] [--overrides...]
-
-    The first positional argument (if it ends in .toml) is the config file.
-    All --key=value arguments are CLI overrides.
-    """
-    args = sys.argv[1:]
-
-    config_path = None
-    cli_args = []
-
-    for arg in args:
-        if not arg.startswith("--") and arg.endswith(".toml") and config_path is None:
-            config_path = arg
-        else:
-            cli_args.append(arg)
-
-    return load_config(config_path=config_path, cli_args=cli_args)

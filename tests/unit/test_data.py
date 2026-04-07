@@ -335,6 +335,94 @@ class TestStatefulDataLoader:
 # ---------------------------------------------------------------------------
 
 
+class TestHuggingFaceDataset:
+    """Tests for the non-streaming HuggingFace dataset using mocked HF internals."""
+
+    def _make_dataset(self, seq_len, documents):
+        """Create a HuggingFaceDataset with mocked load_dataset and tokenizer."""
+        from unittest.mock import MagicMock, patch
+
+        from kempnerforge.data.dataset import HuggingFaceDataset
+
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.eos_token_id = 0
+        mock_tokenizer.encode = lambda text, **kwargs: [ord(c) for c in text]
+
+        mock_raw_dataset = documents
+
+        with (
+            patch("datasets.load_dataset", return_value=mock_raw_dataset),
+            patch("transformers.AutoTokenizer.from_pretrained", return_value=mock_tokenizer),
+        ):
+            ds = HuggingFaceDataset(
+                dataset_name="mock/dataset",
+                split="train",
+                text_field="text",
+                seq_len=seq_len,
+                tokenizer_path="mock",
+            )
+        return ds
+
+    def test_len(self):
+        # "abcdefghij" = 10 tokens + EOS = 11, chunk_size = 5 (seq_len 4 + 1)
+        # 11 / 5 = 2 full chunks
+        ds = self._make_dataset(seq_len=4, documents=[{"text": "abcdefghij"}])
+        assert len(ds) == 2
+
+    def test_getitem_shape(self):
+        ds = self._make_dataset(seq_len=8, documents=[{"text": "a" * 30}])
+        sample = ds[0]
+        assert sample["input_ids"].shape == (8,)
+        assert sample["labels"].shape == (8,)
+
+    def test_input_label_offset(self):
+        """Labels should be inputs shifted by 1."""
+        ds = self._make_dataset(seq_len=4, documents=[{"text": "abcde"}])
+        sample = ds[0]
+        # tokens = [97,98,99,100,101] + eos=0. chunk = [97,98,99,100,101]
+        # input = [97,98,99,100], labels = [98,99,100,101]
+        assert sample["input_ids"][0].item() == ord("a")
+        assert sample["labels"][0].item() == ord("b")
+        assert (sample["labels"][:-1] == sample["input_ids"][1:]).all()
+
+    def test_sequence_packing(self):
+        """Short docs should be concatenated with EOS separators."""
+        # "ab" → [97,98,0], "cd" → [99,100,0], "ef" → [101,102,0] → 9 tokens
+        # seq_len=4 → chunk_size=5 → 1 full chunk from 9 tokens
+        docs = [{"text": "ab"}, {"text": "cd"}, {"text": "ef"}]
+        ds = self._make_dataset(seq_len=4, documents=docs)
+        assert len(ds) == 1
+
+    def test_empty_docs_skipped(self):
+        """Empty documents should not contribute tokens (except no EOS)."""
+        ds = self._make_dataset(
+            seq_len=4,
+            documents=[{"text": ""}, {"text": "abcdefghij"}],
+        )
+        # Empty doc is skipped in _pack_sequences (tokens empty → continue)
+        assert len(ds) == 2  # same as single 10-char doc
+
+    def test_state_dict_round_trip(self):
+        ds = self._make_dataset(seq_len=4, documents=[{"text": "abcdefghij"}])
+        ds._epoch = 3
+        ds._sample_idx = 5
+
+        state = ds.state_dict()
+        assert state["epoch"] == 3
+        assert state["sample_idx"] == 5
+        assert state["total_sequences"] == len(ds)
+
+        ds2 = self._make_dataset(seq_len=4, documents=[{"text": "abcdefghij"}])
+        ds2.load_state_dict(state)
+        assert ds2._epoch == 3
+        assert ds2._sample_idx == 5
+
+
+# ---------------------------------------------------------------------------
+# StreamingHuggingFaceDataset
+# ---------------------------------------------------------------------------
+
+
 class TestStreamingHuggingFaceDataset:
     """Tests using a mock streaming dataset to avoid network dependencies."""
 

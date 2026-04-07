@@ -6,7 +6,6 @@ from kempnerforge.metrics.memory import (
     format_memory_stats,
     get_memory_stats,
     get_memory_utilization,
-    log_memory_stats,
     reset_peak_memory,
 )
 from kempnerforge.metrics.mfu import (
@@ -28,6 +27,5 @@ __all__ = [
     "get_logger",
     "get_memory_stats",
     "get_memory_utilization",
-    "log_memory_stats",
     "reset_peak_memory",
 ]

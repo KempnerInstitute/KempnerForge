@@ -66,13 +66,6 @@ def reset_peak_memory(device: int = 0) -> None:
         torch.cuda.reset_peak_memory_stats(device)
 
 
-def log_memory_stats(device: int = 0) -> dict[str, float]:
-    """Log and return current memory statistics."""
-    stats = get_memory_stats(device)
-    logger.info(format_memory_stats(device))
-    return stats
-
-
 # ---------------------------------------------------------------------------
 # DeviceMemoryMonitor — per-step tracking with snapshot support
 # ---------------------------------------------------------------------------

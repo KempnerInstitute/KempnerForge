@@ -210,36 +210,6 @@ def check_nccl_health(timeout_sec: float = 10.0) -> bool:
         return False
 
 
-def log_health_status(device: int = 0) -> dict[str, bool | str]:
-    """Run and log GPU health checks.
-
-    Returns:
-        Health check results dict.
-    """
-    health = check_gpu_health(device)
-
-    status = (
-        "HEALTHY"
-        if all(
-            health[k] for k in ("cuda_available", "device_accessible", "compute_ok", "memory_ok")
-        )
-        else "UNHEALTHY"
-    )
-
-    logger.info(
-        f"GPU {device} health: {status} | "
-        f"cuda={health['cuda_available']}, "
-        f"device={health['device_accessible']}, "
-        f"compute={health['compute_ok']}, "
-        f"memory={health['memory_ok']}"
-    )
-
-    if health["error"]:
-        logger.warning(f"GPU {device} error: {health['error']}")
-
-    return health
-
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
