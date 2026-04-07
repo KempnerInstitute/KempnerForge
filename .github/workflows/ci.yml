@@ -11,8 +11,8 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
       - run: uv sync
       - run: uv run ruff check kempnerforge/ tests/ scripts/
       - run: uv run ruff format --check kempnerforge/ tests/ scripts/
@@ -21,8 +21,8 @@ jobs:
     runs-on: ubuntu-latest
     needs: lint
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
       - run: uv sync
       - run: uv run pytest tests/unit/ -v --timeout=60
 
@@ -30,7 +30,7 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'workflow_dispatch'
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
       - run: uv sync
       - run: uv run pytest tests/integration/ -v --timeout=120 -m "not slow"
