@@ -66,19 +66,29 @@ Key config options:
 - `train.mixed_precision` — `"bf16"`, `"fp16"`, or `"fp32"` (default `"bf16"`)
 - `checkpoint.async_mode` — `"disabled"`, `"async"`, or `"async_with_pinned_mem"`
 
-## Data Preparation
+## Data
 
-Tokenize a dataset into memory-mapped `.npy` shards:
+KempnerForge supports two data sources:
 
-```bash
-uv run python scripts/prepare_data.py
-```
-
-Then point your config to the output directory:
-
+**Pre-tokenized (fastest)** — memory-mapped `.npy` shards on disk:
 ```toml
 [data]
 dataset_path = "data/your_dataset"
+file_pattern = "tokenized_*.bin"
+```
+
+**HuggingFace datasets** — eager or streaming, tokenized on-the-fly:
+```toml
+[data]
+hf_dataset_name = "wikitext"
+hf_dataset_config = "wikitext-103-raw-v1"
+tokenizer_path = "openai-community/gpt2"
+hf_streaming = true
+```
+
+Validate a pre-tokenized dataset before training:
+```bash
+uv run python scripts/prepare_data.py /path/to/tokenized/data
 ```
 
 ## Project Structure
@@ -95,7 +105,7 @@ kempnerforge/
   metrics/     — MetricsTracker, MFU computation, WandB/TensorBoard backends
   profiling/   — torch.profiler integration, CUDA timing
 configs/       — TOML configs for training runs and model architecture presets
-scripts/       — Training entry point, data prep, profiling, SLURM launch scripts
+scripts/       — Training entry point, data validation, checkpoint conversion, SLURM launch
 tests/         — Unit (312), integration, distributed, and end-to-end tests
 ```
 
@@ -134,9 +144,11 @@ E2E tests launch full training runs as subprocesses and verify they complete suc
 | FSDP | dp_shard=4 | 4 | `build_parallel_model` non-TP path |
 | TP only | tp=4 | 4 | Meta-device init, SequenceParallel |
 | TP + FSDP | tp=2, dp_shard=2 | 4 | Combined parallelism |
-| Pipeline Parallel | pp=2, dp_shard=2 | 4 | PP schedule, stage splitting |
+| Pipeline Parallel | pp=2, dp_shard=2 | 4 | PP schedule, stage splitting, loss broadcast |
 | fp16 | dp_shard=4, fp16 | 4 | `param_dtype` config path |
 | Data pipeline | dp_shard=4, synthetic .npy | 4 | MemoryMappedDataset, sampler, dataloader |
+| HF dataset | — | 1, 4 | HuggingFace eager dataset, single + multi-GPU |
+| HF streaming | — | 1, 4 | HuggingFace streaming dataset, single + multi-GPU |
 | Checkpoint resume | dp_shard=4, save+load | 4 | DCP save, auto-resume from checkpoint |
 | 7B model (`--slow`) | tp=2, dp_shard=2, compile | 4 | Full production path with 7B Llama |
 
