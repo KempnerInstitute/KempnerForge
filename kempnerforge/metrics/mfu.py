@@ -87,7 +87,7 @@ def get_gpu_peak_tflops(device: int = 0) -> float:
     return tflops
 
 
-def estimate_model_flops_per_token(config: ModelConfig) -> int:
+def estimate_model_flops_per_token(config: ModelConfig, seq_len: int | None = None) -> int:
     """Estimate FLOPS per token for forward + backward pass.
 
     Uses the PaLM paper approximation:
@@ -104,12 +104,15 @@ def estimate_model_flops_per_token(config: ModelConfig) -> int:
 
     Args:
         config: Model configuration.
+        seq_len: Actual training sequence length. Falls back to
+            config.max_seq_len if not provided.
 
     Returns:
         Estimated FLOPS per token.
     """
+    s = seq_len if seq_len is not None else config.max_seq_len
     num_params = config.num_params_estimate
-    return 6 * num_params + 12 * config.n_layers * config.dim * config.max_seq_len
+    return 6 * num_params + 12 * config.n_layers * config.dim * s
 
 
 def compute_mfu(
@@ -117,6 +120,7 @@ def compute_mfu(
     tokens_per_sec: float,
     num_gpus: int = 1,
     gpu_peak_tflops: float | None = None,
+    seq_len: int | None = None,
 ) -> float:
     """Compute Model FLOPs Utilization.
 
@@ -125,6 +129,8 @@ def compute_mfu(
         tokens_per_sec: Global throughput (tokens/sec across all GPUs).
         num_gpus: Number of GPUs.
         gpu_peak_tflops: Peak bf16 TFLOPS per GPU. Auto-detected if None.
+        seq_len: Actual training sequence length for attention FLOPS.
+            Falls back to config.max_seq_len if not provided.
 
     Returns:
         MFU as a fraction (0.0 to 1.0).
@@ -132,7 +138,7 @@ def compute_mfu(
     if gpu_peak_tflops is None:
         gpu_peak_tflops = get_gpu_peak_tflops()
 
-    flops_per_token = estimate_model_flops_per_token(config)
+    flops_per_token = estimate_model_flops_per_token(config, seq_len=seq_len)
     achieved_tflops = flops_per_token * tokens_per_sec / 1e12
     peak_tflops = gpu_peak_tflops * num_gpus
 

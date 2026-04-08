@@ -56,6 +56,7 @@ class MetricsTracker:
     ) -> None:
         self.metrics_config = config.metrics
         self.model_config = config.model
+        self.seq_len = config.train.seq_len
         self.num_gpus = num_gpus
         self.gpu_peak_tflops = gpu_peak_tflops or get_gpu_peak_tflops()
 
@@ -120,6 +121,7 @@ class MetricsTracker:
             tokens_per_sec=tokens_per_sec,
             num_gpus=self.num_gpus,
             gpu_peak_tflops=self.gpu_peak_tflops,
+            seq_len=self.seq_len,
         )
 
         # Memory stats

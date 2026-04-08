@@ -204,7 +204,7 @@ def check_nccl_health(timeout_sec: float = 10.0) -> bool:
         dist.all_reduce(tensor)
         torch.cuda.synchronize()
         expected = dist.get_world_size()
-        return tensor.item() == expected
+        return abs(tensor.item() - expected) < 1e-5
     except RuntimeError as e:
         logger.error(f"NCCL health check failed: {e}")
         return False
