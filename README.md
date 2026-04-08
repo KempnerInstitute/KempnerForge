@@ -1,6 +1,6 @@
 # KempnerForge
 
-A researcher-friendly, high-performance LLM training framework for large-scale distributed training on HPC clusters.
+PyTorch-native framework for fault-tolerant distributed training of foundation models on AI clusters.
 
 ## Features
 

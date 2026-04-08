@@ -1,7 +1,7 @@
 [project]
 name = "kempnerforge"
 version = "0.1.0"
-description = "A researcher-friendly, high-performance LLM training framework for large-scale distributed training"
+description = "PyTorch-native framework for fault-tolerant distributed training of foundation models on AI clusters"
 requires-python = ">=3.12"
 dependencies = [
     "torch>=2.4",
