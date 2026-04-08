@@ -45,7 +45,7 @@ from kempnerforge.metrics.logger import get_logger
 from kempnerforge.metrics.tracker import MetricsTracker
 from kempnerforge.profiling.profiler import build_profiler, print_profiler_summary
 from kempnerforge.resilience.elastic import log_job_info, resolve_resume_path
-from kempnerforge.resilience.health import NaNDetector
+from kempnerforge.resilience.health import NaNDetector, check_nccl_health
 from kempnerforge.resilience.signal_handler import ShutdownHandler
 from kempnerforge.training.grad import maybe_no_sync
 from kempnerforge.training.loss import cross_entropy_loss as _  # noqa: F401 — triggers registration
@@ -149,7 +149,7 @@ def main() -> None:
     logger.info(f"Training config: {config}")
 
     # --- Resilience ---
-    shutdown_handler = ShutdownHandler(timeout_sec=120)
+    shutdown_handler = ShutdownHandler(timeout_sec=config.train.shutdown_timeout_sec)
     shutdown_handler.register()
 
     nan_detector = NaNDetector(action="warn", max_consecutive=10)
@@ -574,6 +574,15 @@ def main() -> None:
                 all_counts = torch.stack(list(expert_counts.values())).float()
                 moe_metrics["moe/expert_balance"] = (all_counts.min() / all_counts.max()).item()
             tracker.log_eval(moe_metrics, step)
+
+        # Periodic NCCL health check
+        if (
+            tc.nccl_health_check_interval > 0
+            and step % tc.nccl_health_check_interval == 0
+            and not check_nccl_health()
+        ):
+            logger.error(f"NCCL health check failed at step {step} — stopping")
+            break
 
         # Eval
         if eval_config.enabled and eval_dataloader is not None and step % eval_config.interval == 0:

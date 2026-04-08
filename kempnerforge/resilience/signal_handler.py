@@ -48,7 +48,7 @@ class ShutdownHandler:
             forced exit. Set to 0 to disable the timeout.
     """
 
-    def __init__(self, timeout_sec: float = 120.0) -> None:
+    def __init__(self, timeout_sec: float = 600.0) -> None:
         self._shutdown_requested = False
         self._signal_received: signal.Signals | None = None
         self._timeout_sec = timeout_sec

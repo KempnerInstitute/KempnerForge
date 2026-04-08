@@ -119,10 +119,6 @@ class CheckpointManager:
             # Cleanup old checkpoints
             self._cleanup()
 
-        # Barrier so all ranks wait for save to complete
-        if dist.is_initialized():
-            dist.barrier()
-
     def wait(self) -> None:
         """Block until any pending async checkpoint save completes."""
         self._async_ckpt.wait()

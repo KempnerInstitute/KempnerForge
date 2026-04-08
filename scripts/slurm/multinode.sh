@@ -67,7 +67,7 @@ export NCCL_IB_GID_INDEX=3
 export GLOO_SOCKET_IFNAME="${IB_IFNAME}"
 
 # Timeout for NCCL operations (seconds) — increase for large clusters
-export NCCL_TIMEOUT=600
+export NCCL_TIMEOUT=1800
 
 # Ensure log directory exists
 mkdir -p logs

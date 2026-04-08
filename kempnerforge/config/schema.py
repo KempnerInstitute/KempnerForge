@@ -187,6 +187,8 @@ class TrainConfig:
     mixed_precision: Literal["bf16", "fp16", "fp32"] = "bf16"
     activation_checkpointing: ActivationCheckpointing = ActivationCheckpointing.none
     loss_fn: str = "cross_entropy"  # Registry key for loss function
+    shutdown_timeout_sec: float = 600.0  # Graceful shutdown timeout before forced exit
+    nccl_health_check_interval: int = 0  # Check NCCL health every N steps (0=disabled)
 
     def __post_init__(self) -> None:
         if self.batch_size <= 0:
@@ -329,7 +331,7 @@ class DistributedConfig:
     pp: int = 1
     pp_schedule: PipelineSchedule = PipelineSchedule.schedule_1f1b
     cp: int = 1
-    nccl_timeout_sec: int = 600
+    nccl_timeout_sec: int = 1800
     backend: str = "cpu:gloo,cuda:nccl"
 
     def validate_world_size(self, world_size: int) -> None:

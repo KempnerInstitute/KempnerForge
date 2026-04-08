@@ -66,35 +66,57 @@ class NaNDetector:
     def check_loss(self, loss: float, step: int) -> bool:
         """Check a loss value for NaN/Inf.
 
+        When running distributed, all-reduces a NaN flag so ALL ranks agree
+        on whether to skip. Prevents rank desync where one rank sees NaN and
+        skips its optimizer step while others proceed normally.
+
         Args:
             loss: The scalar loss value to check.
             step: Current training step.
 
         Returns:
-            True if the loss is valid (finite), False if NaN/Inf.
+            True if the loss is valid (finite) on ALL ranks, False if any rank has NaN/Inf.
 
         Raises:
             RuntimeError: If action is "raise" and NaN is detected.
         """
-        if _is_finite(loss):
-            # Reset consecutive counter on good step
+        local_nan = not _is_finite(loss)
+
+        # Sync NaN flag across all ranks to prevent desync.
+        # One tiny all-reduce (4 bytes) — negligible vs gradient sync.
+        if dist.is_initialized():
+            nan_flag = torch.tensor([1.0 if local_nan else 0.0], device="cuda")
+            dist.all_reduce(nan_flag)
+            any_nan = nan_flag.item() > 0
+        else:
+            any_nan = local_nan
+
+        if not any_nan:
             self.state.consecutive_nans = 0
             self.state.last_good_loss = loss
             self.state.last_good_step = step
             return True
 
-        # NaN detected
+        # NaN detected (on this rank or another)
         self.state.consecutive_nans += 1
         self.state.total_nans += 1
         if len(self.state.nan_steps) < self.max_history:
             self.state.nan_steps.append(step)
 
-        msg = (
-            f"NaN/Inf loss at step {step} "
-            f"(consecutive={self.state.consecutive_nans}, "
-            f"total={self.state.total_nans}, "
-            f"last_good_loss={self.state.last_good_loss:.4f} at step {self.state.last_good_step})"
-        )
+        if local_nan:
+            msg = (
+                f"NaN/Inf loss at step {step} "
+                f"(consecutive={self.state.consecutive_nans}, "
+                f"total={self.state.total_nans}, "
+                f"last_good_loss={self.state.last_good_loss:.4f} "
+                f"at step {self.state.last_good_step})"
+            )
+        else:
+            msg = (
+                f"NaN/Inf detected on another rank at step {step} "
+                f"(consecutive={self.state.consecutive_nans}, "
+                f"total={self.state.total_nans})"
+            )
 
         if self.action == "raise":
             raise RuntimeError(msg)
