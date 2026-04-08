@@ -20,6 +20,7 @@ from kempnerforge.model.attention import Attention
 from kempnerforge.model.embedding import OutputHead, TokenEmbedding
 from kempnerforge.model.init import init_weights
 from kempnerforge.model.mlp import build_mlp
+from kempnerforge.model.moe import MoEMLP, build_moe
 from kempnerforge.model.norm import build_norm
 from kempnerforge.model.position import precompute_rope_frequencies
 
@@ -43,11 +44,26 @@ class TransformerBlock(nn.Module):
         )
 
         self.mlp_norm = build_norm(config.norm_type, config.dim, eps=config.norm_eps)
-        self.mlp = build_mlp(
-            dim=config.dim,
-            hidden_dim=config.computed_ffn_hidden_dim,
-            activation=config.activation,
-        )
+
+        # MoE placement: with moe_frequency=1, all layers are MoE.
+        # With moe_frequency=2, layers 1,3,5... are MoE (layer 0 stays dense).
+        use_moe = config.is_moe and ((layer_idx + 1) % config.moe_frequency == 0)
+        if use_moe:
+            self.mlp = build_moe(
+                dim=config.dim,
+                hidden_dim=config.computed_ffn_hidden_dim,
+                num_experts=config.num_experts,
+                top_k=config.moe_top_k,
+                activation=config.activation,
+                router_type=config.moe_router,
+                shared_experts=config.moe_shared_experts,
+            )
+        else:
+            self.mlp = build_mlp(
+                dim=config.dim,
+                hidden_dim=config.computed_ffn_hidden_dim,
+                activation=config.activation,
+            )
 
     def forward(
         self,
@@ -118,6 +134,22 @@ class Transformer(nn.Module):
                 theta=self.config.rope_theta,
             )
         init_weights(self, self.config)
+
+    def get_moe_aux_loss(self) -> torch.Tensor:
+        """Collect auxiliary losses from all MoE layers. Returns 0 if dense."""
+        total = torch.tensor(0.0, device=next(self.parameters()).device)
+        for layer in self.layers.values():
+            if isinstance(layer.mlp, MoEMLP):
+                total = total + layer.mlp.aux_loss
+        return total
+
+    def get_expert_counts(self) -> dict[int, torch.Tensor]:
+        """Collect per-layer expert utilization. Returns {} if dense."""
+        counts = {}
+        for name, layer in self.layers.items():
+            if isinstance(layer.mlp, MoEMLP):
+                counts[int(name)] = layer.mlp.expert_counts
+        return counts
 
     def forward(
         self,

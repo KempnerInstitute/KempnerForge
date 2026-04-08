@@ -21,6 +21,7 @@ from __future__ import annotations
 import os
 import re
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -33,7 +34,15 @@ from tests.e2e.conftest import requires_gpus
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 TRAIN_SCRIPT = str(PROJECT_ROOT / "scripts" / "train.py")
 DEBUG_CONFIG = str(PROJECT_ROOT / "configs" / "train" / "debug.toml")
+DEBUG_MOE_CONFIG = str(PROJECT_ROOT / "configs" / "train" / "debug_moe.toml")
 BENCH_CONFIG = str(PROJECT_ROOT / "configs" / "train" / "7b.toml")
+
+
+def _find_free_port() -> int:
+    """Find a free TCP port by binding to port 0 and letting the OS assign one."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("", 0))
+        return s.getsockname()[1]
 
 
 def _run_training(
@@ -56,11 +65,13 @@ def _run_training(
         env.update(env_extra)
 
     if nproc > 1:
+        port = _find_free_port()
         cmd = [
             sys.executable,
             "-m",
             "torch.distributed.run",
             f"--nproc_per_node={nproc}",
+            f"--master_port={port}",
             TRAIN_SCRIPT,
             *args,
         ]
@@ -471,6 +482,89 @@ def test_sigterm_triggers_emergency_checkpoint(tmp_path):
     output = stdout + stderr
     assert "Shutdown requested" in output, f"Signal handler did not trigger:\n{output[-2000:]}"
     assert "Checkpoint saved" in output, f"Emergency checkpoint was not saved:\n{output[-2000:]}"
+
+
+# ============================================================================
+# MoE Training
+# ============================================================================
+
+
+@pytest.mark.e2e
+def test_moe_single_gpu_random_data():
+    """Single GPU MoE training with random data."""
+    result = _run_training(
+        [DEBUG_MOE_CONFIG, "--train.max_steps=10", "--metrics.log_interval=5"],
+        nproc=1,
+    )
+    _assert_training_complete(result, expected_steps=10)
+    output = result.stdout + result.stderr
+    loss = _parse_last_loss(output)
+    assert loss is not None and loss > 0, f"MoE loss should be > 0 (got {loss})"
+
+
+@pytest.mark.e2e
+@requires_gpus(4)
+def test_moe_fsdp_4gpu():
+    """4 GPU FSDP with MoE model."""
+    result = _run_training(
+        [DEBUG_MOE_CONFIG, "--train.max_steps=10", "--metrics.log_interval=5"],
+        nproc=4,
+    )
+    _assert_training_complete(result, expected_steps=10)
+
+
+@pytest.mark.e2e
+@requires_gpus(4)
+def test_moe_tp_plus_fsdp():
+    """4 GPU TP=2 + FSDP=2 with MoE — experts replicated, attention TP-sharded."""
+    result = _run_training(
+        [
+            DEBUG_MOE_CONFIG,
+            "--train.max_steps=10",
+            "--metrics.log_interval=5",
+            "--distributed.tp=2",
+            "--distributed.dp_shard=2",
+        ],
+        nproc=4,
+    )
+    _assert_training_complete(result, expected_steps=10)
+
+
+@pytest.mark.e2e
+@requires_gpus(4)
+def test_moe_checkpoint_resume(tmp_path):
+    """MoE checkpoint save + resume on 4 GPUs."""
+    ckpt_dir = str(tmp_path / "moe_ckpt")
+
+    # Phase 1: Train 10 steps, checkpoint at step 5
+    result = _run_training(
+        [
+            DEBUG_MOE_CONFIG,
+            "--train.max_steps=10",
+            "--metrics.log_interval=5",
+            f"--checkpoint.dir={ckpt_dir}",
+            "--checkpoint.interval=5",
+        ],
+        nproc=4,
+    )
+    _assert_training_complete(result, expected_steps=10)
+    output = result.stdout + result.stderr
+    assert "Checkpoint saved" in output, "MoE checkpoint was not saved"
+
+    # Phase 2: Resume from checkpoint, train to step 15
+    result = _run_training(
+        [
+            DEBUG_MOE_CONFIG,
+            "--train.max_steps=15",
+            "--metrics.log_interval=5",
+            f"--checkpoint.dir={ckpt_dir}",
+            "--checkpoint.interval=100",
+        ],
+        nproc=4,
+    )
+    _assert_training_complete(result, expected_steps=15)
+    output = result.stdout + result.stderr
+    assert "step=10" in output, "MoE did not resume from step 10"
 
 
 # ============================================================================

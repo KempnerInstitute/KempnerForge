@@ -44,6 +44,7 @@ from torch.distributed.tensor.parallel import (
 )
 
 from kempnerforge.model.mlp import SwiGLUMLP
+from kempnerforge.model.moe import MoEMLP
 
 logger = logging.getLogger(__name__)
 
@@ -70,12 +71,17 @@ def _build_block_tp_plan(block, *, sequence_parallel: bool = True) -> dict:
     plan["attention.v_proj"] = ColwiseParallel(**col_kw)
     plan["attention.o_proj"] = RowwiseParallel(**row_kw)
 
-    if isinstance(block.mlp, SwiGLUMLP):
+    # MoE blocks: skip all mlp.* entries — experts and router stay replicated.
+    # Dense blocks: shard MLP projections as before.
+    if isinstance(block.mlp, MoEMLP):
+        pass  # No MLP entries — experts replicated, TP on attention only
+    elif isinstance(block.mlp, SwiGLUMLP):
         plan["mlp.gate_proj"] = ColwiseParallel(**col_kw)
         plan["mlp.up_proj"] = ColwiseParallel(**col_kw)
+        plan["mlp.down_proj"] = RowwiseParallel(**row_kw)
     else:
         plan["mlp.up_proj"] = ColwiseParallel(**col_kw)
-    plan["mlp.down_proj"] = RowwiseParallel(**row_kw)
+        plan["mlp.down_proj"] = RowwiseParallel(**row_kw)
 
     return plan
 
@@ -115,9 +121,12 @@ def apply_tensor_parallel(
 
     tie = getattr(getattr(model, "config", None), "tie_embeddings", False)
     is_pp_stage = hasattr(model, "stage_id")
+    is_moe = getattr(getattr(model, "config", None), "is_moe", False)
     # SequenceParallel requires TP on embedding/head (otherwise the unsharded
     # output head can't consume Shard(1) input from the final norm).
-    seq_parallel = not is_pp_stage and not tie
+    # Disabled for MoE: boolean indexing in expert dispatch breaks Shard(1) DTensors,
+    # and alternating SP-on/SP-off blocks create DTensor transition errors.
+    seq_parallel = not is_pp_stage and not tie and not is_moe
 
     # Token embedding: wrap output as DTensor Replicate so the first block's
     # SequenceParallel norm properly redistributes to Shard(1). Without this,

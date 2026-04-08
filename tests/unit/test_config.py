@@ -87,6 +87,49 @@ class TestModelConfig:
         with pytest.raises(ValueError, match="vocab_size must be positive"):
             ModelConfig(vocab_size=0)
 
+    # --- MoE config ---
+
+    def test_moe_defaults_are_dense(self):
+        m = ModelConfig()
+        assert m.num_experts == 0
+        assert m.is_moe is False
+
+    def test_moe_validation_passes(self):
+        m = ModelConfig(num_experts=8, moe_top_k=2)
+        assert m.is_moe is True
+        assert m.moe_top_k == 2
+
+    def test_moe_rejects_top_k_greater_than_experts(self):
+        with pytest.raises(ValueError, match="moe_top_k.*must be <= num_experts"):
+            ModelConfig(num_experts=8, moe_top_k=16)
+
+    def test_moe_disabled_ignores_top_k(self):
+        # num_experts=0 → MoE disabled, top_k not validated
+        m = ModelConfig(num_experts=0, moe_top_k=99)
+        assert m.is_moe is False
+
+    def test_moe_rejects_zero_top_k(self):
+        with pytest.raises(ValueError, match="moe_top_k must be positive"):
+            ModelConfig(num_experts=8, moe_top_k=0)
+
+    def test_moe_rejects_zero_frequency(self):
+        with pytest.raises(ValueError, match="moe_frequency must be positive"):
+            ModelConfig(num_experts=8, moe_frequency=0)
+
+    def test_moe_param_estimate(self):
+        dense = ModelConfig(dim=256, n_layers=2, n_heads=4, vocab_size=1000)
+        moe = ModelConfig(
+            dim=256, n_layers=2, n_heads=4, vocab_size=1000, num_experts=8, moe_top_k=2
+        )
+        # MoE should have more total params (8 experts vs 1 MLP per layer)
+        assert moe.num_params_estimate > dense.num_params_estimate
+        # Roughly: MoE layers have 8x MLP params + router, dense has 1x
+        dense_mlp = 3 * 256 * dense.computed_ffn_hidden_dim
+        ratio = (moe.num_params_estimate - dense.num_params_estimate) / (
+            2 * 7 * dense_mlp  # 2 layers, each gains 7 extra experts
+        )
+        assert 0.9 < ratio < 1.1  # close to 7x extra MLP params + small router overhead
+
 
 # ---------------------------------------------------------------------------
 # TrainConfig

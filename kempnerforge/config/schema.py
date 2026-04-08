@@ -79,6 +79,14 @@ class ModelConfig:
     init_std: float = 0.02  # Std for weight initialization (GPT-2/Llama default)
     model_type: str = "transformer"  # Registry key for model builder
 
+    # MoE (all defaults produce a dense model — zero behavior change)
+    num_experts: int = 0  # 0 = dense, >0 = MoE
+    moe_top_k: int = 2  # experts selected per token
+    moe_frequency: int = 1  # MoE every N layers (1=all, 2=alternating)
+    moe_router: str = "softmax_topk"  # registry key for router type
+    moe_shared_experts: int = 0  # shared experts that process all tokens
+    moe_aux_loss_weight: float = 0.01  # aux loss coefficient in training loss
+
     def __post_init__(self) -> None:
         if self.n_kv_heads is None:
             self.n_kv_heads = self.n_heads
@@ -99,6 +107,22 @@ class ModelConfig:
                 f"n_heads ({self.n_heads}) must be divisible by n_kv_heads ({self.n_kv_heads})"
             )
 
+        # MoE validation
+        if self.num_experts > 0:
+            if self.moe_top_k <= 0:
+                raise ValueError("moe_top_k must be positive when num_experts > 0")
+            if self.moe_top_k > self.num_experts:
+                raise ValueError(
+                    f"moe_top_k ({self.moe_top_k}) must be <= num_experts ({self.num_experts})"
+                )
+            if self.moe_frequency <= 0:
+                raise ValueError("moe_frequency must be positive")
+
+    @property
+    def is_moe(self) -> bool:
+        """Whether this config uses Mixture-of-Experts."""
+        return self.num_experts > 0
+
     @property
     def head_dim(self) -> int:
         return self.dim // self.n_heads
@@ -114,20 +138,34 @@ class ModelConfig:
 
     @property
     def num_params_estimate(self) -> int:
-        """Rough parameter count estimate (excluding embedding if tied)."""
+        """Rough total parameter count estimate (excluding embedding if tied).
+
+        For MoE models, counts all expert parameters (total, not active).
+        """
         d = self.dim
         h = self.computed_ffn_hidden_dim
         n_kv = self.n_kv_heads
         head_d = self.head_dim
-        # Per layer: attention (Q + K + V + O) + MLP (gate + up + down) + 2 norms
+        # Per layer: attention (Q + K + V + O) + 2 norms
         attn = d * (self.n_heads * head_d) + 2 * d * (n_kv * head_d) + (self.n_heads * head_d) * d
         mlp = d * h + d * h + h * d  # gate + up + down (SwiGLU has 3 matrices)
         norm = 2 * d  # 2 norms per layer
-        per_layer = attn + mlp + norm
+
+        if self.is_moe:
+            n_moe = sum(1 for i in range(self.n_layers) if (i + 1) % self.moe_frequency == 0)
+            n_dense = self.n_layers - n_moe
+            router = d * self.num_experts  # gate linear per MoE layer
+            shared_mlp = self.moe_shared_experts * mlp
+            moe_per_layer = attn + self.num_experts * mlp + router + shared_mlp + norm
+            dense_per_layer = attn + mlp + norm
+            layer_params = n_moe * moe_per_layer + n_dense * dense_per_layer
+        else:
+            layer_params = self.n_layers * (attn + mlp + norm)
+
         embedding = self.vocab_size * d
         output = 0 if self.tie_embeddings else self.vocab_size * d
         final_norm = d
-        return self.n_layers * per_layer + embedding + output + final_norm
+        return layer_params + embedding + output + final_norm
 
 
 # ---------------------------------------------------------------------------
@@ -448,6 +486,14 @@ class JobConfig:
             raise ValueError(
                 "eval.enabled is True but no eval data source is configured. "
                 "Set eval.dataset_path or eval.hf_dataset_name."
+            )
+
+        if self.model.is_moe and self.train.compile_model:
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "torch.compile is not yet optimized for MoE dispatch (data-dependent shapes "
+                "cause graph breaks). Set compile_model=false for MoE until Phase 9."
             )
 
         if self.distributed.tp > 1:

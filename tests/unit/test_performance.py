@@ -68,6 +68,49 @@ class TestMFU:
         # Llama 7B: ~41e9 FLOPS/token (6*7B + attention term)
         assert 30e9 < flops < 60e9
 
+    def test_moe_uses_active_params_not_total(self):
+        """MoE MFU counts only top_k experts per token, not all experts."""
+        base = dict(dim=256, n_layers=4, n_heads=4, vocab_size=1000, max_seq_len=128)
+        dense = ModelConfig(**base)
+        # 8 experts, top_k=2 → 2 active experts per token
+        moe = ModelConfig(**base, num_experts=8, moe_top_k=2)
+
+        dense_flops = estimate_model_flops_per_token(dense)
+        moe_flops = estimate_model_flops_per_token(moe)
+
+        # MoE with top_k=2 should have ~2x the MLP flops of dense (2 experts active),
+        # NOT 8x (all experts). So MoE flops should be more than dense but less than 4x.
+        assert moe_flops > dense_flops, "MoE should have more flops than dense (extra experts)"
+        assert moe_flops < 4 * dense_flops, "MoE flops too high — counting all experts, not active"
+
+    def test_moe_shared_experts_add_flops(self):
+        """Shared experts add to MoE active flops."""
+        base = dict(dim=256, n_layers=4, n_heads=4, vocab_size=1000, max_seq_len=128)
+        moe_no_shared = ModelConfig(**base, num_experts=8, moe_top_k=2, moe_shared_experts=0)
+        moe_shared = ModelConfig(**base, num_experts=8, moe_top_k=2, moe_shared_experts=1)
+
+        assert estimate_model_flops_per_token(moe_shared) > estimate_model_flops_per_token(
+            moe_no_shared
+        )
+
+    def test_moe_frequency_affects_flops(self):
+        """moe_frequency=2 → half the layers are MoE, less active flops than frequency=1."""
+        base = dict(dim=256, n_layers=4, n_heads=4, vocab_size=1000, max_seq_len=128)
+        all_moe = ModelConfig(**base, num_experts=8, moe_top_k=2, moe_frequency=1)
+        half_moe = ModelConfig(**base, num_experts=8, moe_top_k=2, moe_frequency=2)
+
+        assert estimate_model_flops_per_token(all_moe) > estimate_model_flops_per_token(half_moe)
+
+    def test_moe_seq_len_override(self):
+        """Explicit seq_len should override config.max_seq_len in flops calculation."""
+        config = ModelConfig(
+            dim=256, n_layers=4, n_heads=4, vocab_size=1000, max_seq_len=128,
+            num_experts=4, moe_top_k=2,
+        )
+        flops_short = estimate_model_flops_per_token(config, seq_len=64)
+        flops_long = estimate_model_flops_per_token(config, seq_len=256)
+        assert flops_long > flops_short
+
 
 # ---------------------------------------------------------------------------
 # Memory tracking

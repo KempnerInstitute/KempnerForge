@@ -523,6 +523,12 @@ def main() -> None:
                 with maybe_no_sync(model, micro_step, tc.grad_accum_steps):
                     logits = model(input_ids)
                     loss = loss_fn(logits, labels)
+
+                    # MoE auxiliary loss (no-op for dense: returns 0.0)
+                    if mc.is_moe:
+                        aux_loss = model.get_moe_aux_loss()
+                        loss = loss + mc.moe_aux_loss_weight * aux_loss
+
                     scaled_loss = loss / tc.grad_accum_steps
                     scaled_loss.backward()
                     total_loss += loss.item()
@@ -552,13 +558,22 @@ def main() -> None:
         tokens_seen += tokens_in_step
 
         # Metrics
-        tracker.end_step(
+        step_metrics = tracker.end_step(
             step=step,
             loss=avg_loss,
             grad_norm=grad_norm_val,
             lr=scheduler.get_last_lr()[0],
             tokens_in_step=tokens_in_step,
         )
+
+        # MoE metrics (logged at same interval as main metrics)
+        if mc.is_moe and step_metrics is not None:
+            moe_metrics = {"moe/aux_loss": model.get_moe_aux_loss().item()}
+            expert_counts = model.get_expert_counts()
+            if expert_counts:
+                all_counts = torch.stack(list(expert_counts.values())).float()
+                moe_metrics["moe/expert_balance"] = (all_counts.min() / all_counts.max()).item()
+            tracker.log_eval(moe_metrics, step)
 
         # Eval
         if eval_config.enabled and eval_dataloader is not None and step % eval_config.interval == 0:

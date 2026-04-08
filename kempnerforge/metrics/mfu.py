@@ -90,17 +90,13 @@ def get_gpu_peak_tflops(device: int = 0) -> float:
 def estimate_model_flops_per_token(config: ModelConfig, seq_len: int | None = None) -> int:
     """Estimate FLOPS per token for forward + backward pass.
 
-    Uses the PaLM paper approximation:
-      flops_per_token = 6*P + 12*L*D*S
+    Uses the PaLM paper approximation: ``6*P + 12*L*D*S``
 
-    Where:
-      P = number of parameters (non-embedding)
-      L = number of layers
-      D = model dimension
-      S = sequence length
-
-    The 6× accounts for forward (2×) + backward (4×) matmul FLOPS.
-    The 12×L×D×S term accounts for attention FLOPS.
+    For MoE: uses active params (top_k experts per layer, not all experts).
+    Excludes embedding (table lookup, not matmul). Includes output projection.
+    The 12*L*D*S attention term does not discount GQA — FlashAttention expands
+    GQA internally, so the hardware performs full attention compute.
+    Router FLOPS (dim × num_experts) are intentionally omitted — negligible.
 
     Args:
         config: Model configuration.
@@ -111,8 +107,46 @@ def estimate_model_flops_per_token(config: ModelConfig, seq_len: int | None = No
         Estimated FLOPS per token.
     """
     s = seq_len if seq_len is not None else config.max_seq_len
-    num_params = config.num_params_estimate
-    return 6 * num_params + 12 * config.n_layers * config.dim * s
+    if config.is_moe:
+        return _moe_flops_per_token(config, s)
+    return _dense_flops_per_token(config, s)
+
+
+def _dense_flops_per_token(config: ModelConfig, seq_len: int) -> int:
+    head_dim = config.head_dim
+    attn_params = (
+        config.dim * (config.n_heads * head_dim)  # Q
+        + 2 * config.dim * (config.n_kv_heads * head_dim)  # K + V
+        + (config.n_heads * head_dim) * config.dim  # O
+    )
+    mlp_params = 3 * config.dim * config.computed_ffn_hidden_dim  # SwiGLU
+    per_layer = attn_params + mlp_params
+    output_params = config.vocab_size * config.dim
+    active_params = config.n_layers * per_layer + output_params
+    return 6 * active_params + 12 * config.n_layers * config.dim * seq_len
+
+
+def _moe_flops_per_token(config: ModelConfig, seq_len: int) -> int:
+    head_dim = config.head_dim
+    attn_params = (
+        config.dim * (config.n_heads * head_dim)
+        + 2 * config.dim * (config.n_kv_heads * head_dim)
+        + (config.n_heads * head_dim) * config.dim
+    )
+    mlp_params = 3 * config.dim * config.computed_ffn_hidden_dim
+
+    n_moe_layers = sum(
+        1 for i in range(config.n_layers) if (i + 1) % config.moe_frequency == 0
+    )
+    n_dense_layers = config.n_layers - n_moe_layers
+
+    dense_active = n_dense_layers * (attn_params + mlp_params)
+    shared_mlp = config.moe_shared_experts * mlp_params
+    moe_active = n_moe_layers * (attn_params + config.moe_top_k * mlp_params + shared_mlp)
+
+    output_params = config.vocab_size * config.dim
+    active_params = dense_active + moe_active + output_params
+    return 6 * active_params + 12 * config.n_layers * config.dim * seq_len
 
 
 def compute_mfu(

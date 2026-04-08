@@ -1,0 +1,45 @@
+# Debug MoE configuration: tiny MoE model for fast testing.
+# Usage: python scripts/train.py configs/train/debug_moe.toml
+
+[model]
+dim = 256
+n_layers = 4
+n_heads = 4
+n_kv_heads = 2
+vocab_size = 32000
+max_seq_len = 512
+num_experts = 4
+moe_top_k = 2
+moe_frequency = 2
+moe_router = "softmax_topk"
+moe_aux_loss_weight = 0.01
+
+[train]
+batch_size = 4
+seq_len = 512
+max_steps = 50
+compile_model = false
+
+[optimizer]
+lr = 3e-4
+
+[scheduler]
+warmup_steps = 5
+min_lr_ratio = 0.1
+
+[data]
+num_workers = 2
+pin_memory = true
+
+[distributed]
+dp_shard = -1
+
+[checkpoint]
+dir = "checkpoints/debug_moe"
+interval = 25
+keep_last_n = 2
+
+[metrics]
+log_interval = 5
+enable_wandb = false
+enable_tensorboard = false
