@@ -57,6 +57,7 @@ class TransformerBlock(nn.Module):
                 activation=config.activation,
                 router_type=config.moe_router,
                 shared_experts=config.moe_shared_experts,
+                capacity_factor=config.moe_capacity_factor,
             )
         else:
             self.mlp = build_mlp(

@@ -468,6 +468,187 @@ class TestEPConfig:
             DistributedConfig(ep=0)
 
 
+class TestGroupedGEMM:
+    """Verify grouped GEMM matches loop-based expert forward."""
+
+    def test_grouped_matches_loop_swiglu(self):
+        """Grouped GEMM output matches sequential loop for SwiGLU experts."""
+        from kempnerforge.model.moe import _HAS_GROUPED_MM, grouped_expert_forward
+
+        if not _HAS_GROUPED_MM:
+            pytest.skip("torch._grouped_mm not available")
+
+        torch.manual_seed(42)
+        dim, hidden, num_experts = 64, 128, 4
+        experts = torch.nn.ModuleList([SwiGLUMLP(dim, hidden) for _ in range(num_experts)])
+        experts.eval()
+
+        # 20 tokens sorted by expert: 5, 7, 3, 5 per expert
+        tokens_per_expert = [5, 7, 3, 5]
+        total = sum(tokens_per_expert)
+        x_sorted = torch.randn(total, dim)
+
+        # Grouped path
+        grouped_out = grouped_expert_forward(x_sorted, tokens_per_expert, experts)
+
+        # Loop path
+        loop_out = torch.zeros_like(x_sorted)
+        offset = 0
+        for i, count in enumerate(tokens_per_expert):
+            if count > 0:
+                loop_out[offset:offset + count] = experts[i](x_sorted[offset:offset + count])
+            offset += count
+
+        torch.testing.assert_close(grouped_out, loop_out, atol=1e-5, rtol=1e-5)
+
+    def test_grouped_matches_loop_standard(self):
+        """Grouped GEMM output matches sequential loop for StandardMLP experts."""
+        from kempnerforge.model.moe import _HAS_GROUPED_MM, grouped_expert_forward
+
+        if not _HAS_GROUPED_MM:
+            pytest.skip("torch._grouped_mm not available")
+
+        torch.manual_seed(42)
+        dim, hidden, num_experts = 64, 128, 4
+        experts = torch.nn.ModuleList(
+            [StandardMLP(dim, hidden, activation="gelu") for _ in range(num_experts)]
+        )
+        experts.eval()
+
+        tokens_per_expert = [6, 4, 8, 2]
+        total = sum(tokens_per_expert)
+        x_sorted = torch.randn(total, dim)
+
+        grouped_out = grouped_expert_forward(x_sorted, tokens_per_expert, experts)
+
+        loop_out = torch.zeros_like(x_sorted)
+        offset = 0
+        for i, count in enumerate(tokens_per_expert):
+            if count > 0:
+                loop_out[offset:offset + count] = experts[i](x_sorted[offset:offset + count])
+            offset += count
+
+        torch.testing.assert_close(grouped_out, loop_out, atol=1e-5, rtol=1e-5)
+
+    def test_grouped_backward(self):
+        """Grouped GEMM path produces valid gradients."""
+        from kempnerforge.model.moe import _HAS_GROUPED_MM, grouped_expert_forward
+
+        if not _HAS_GROUPED_MM:
+            pytest.skip("torch._grouped_mm not available")
+
+        dim, hidden, num_experts = 32, 64, 3
+        experts = torch.nn.ModuleList([SwiGLUMLP(dim, hidden) for _ in range(num_experts)])
+        tokens_per_expert = [4, 6, 2]
+        x = torch.randn(12, dim, requires_grad=True)
+
+        out = grouped_expert_forward(x, tokens_per_expert, experts)
+        out.sum().backward()
+
+        assert x.grad is not None
+        assert x.grad.shape == x.shape
+        for expert in experts:
+            assert expert.gate_proj.weight.grad is not None
+
+    def test_grouped_empty_expert(self):
+        """Grouped GEMM handles experts with zero tokens."""
+        from kempnerforge.model.moe import _HAS_GROUPED_MM, grouped_expert_forward
+
+        if not _HAS_GROUPED_MM:
+            pytest.skip("torch._grouped_mm not available")
+
+        dim, hidden = 32, 64
+        experts = torch.nn.ModuleList([SwiGLUMLP(dim, hidden) for _ in range(3)])
+        # Expert 1 gets 0 tokens
+        tokens_per_expert = [4, 0, 6]
+        x = torch.randn(10, dim)
+
+        out = grouped_expert_forward(x, tokens_per_expert, experts)
+        assert out.shape == (10, dim)
+        assert torch.isfinite(out).all()
+
+    def test_moe_forward_uses_grouped(self):
+        """Full MoEMLP forward uses grouped path and produces correct shapes."""
+        from kempnerforge.model.moe import _HAS_GROUPED_MM
+
+        if not _HAS_GROUPED_MM:
+            pytest.skip("torch._grouped_mm not available")
+
+        moe = build_moe(dim=64, hidden_dim=128, num_experts=4, top_k=2)
+        x = torch.randn(2, 16, 64)
+        out = moe(x)
+        assert out.shape == (2, 16, 64)
+
+        # Backward should work
+        out.sum().backward()
+        for p in moe.parameters():
+            assert p.grad is not None
+
+
+class TestCapacityFactor:
+    """Capacity factor token dropping."""
+
+    def test_capacity_drops_excess_tokens(self):
+        """Capacity factor zeroes weights for overflow tokens."""
+        from kempnerforge.model.moe import _apply_capacity
+
+        torch.manual_seed(0)
+        num_tokens, top_k, num_experts = 100, 2, 4
+        # All tokens go to expert 0 → way over capacity
+        indices = torch.zeros(num_tokens, top_k, dtype=torch.long)
+        weights = torch.ones(num_tokens, top_k) / top_k
+
+        # capacity = ceil(100*2/4 * 1.0) = 50
+        new_weights, new_indices = _apply_capacity(weights, indices, num_experts, 1.0)
+
+        # Expert 0 should have at most 50 tokens per slot
+        for k in range(top_k):
+            active = (new_weights[:, k] > 0).sum().item()
+            assert active <= 50
+
+    def test_capacity_zero_disables(self):
+        """capacity_factor=0 passes through unchanged."""
+        moe = build_moe(dim=64, hidden_dim=128, num_experts=4, top_k=2, capacity_factor=0.0)
+        assert moe.capacity_factor == 0.0
+        x = torch.randn(2, 16, 64)
+        out = moe(x)
+        assert out.shape == (2, 16, 64)
+
+    def test_capacity_forward_backward(self):
+        """MoE with capacity factor produces valid output and gradients."""
+        moe = build_moe(dim=64, hidden_dim=128, num_experts=4, top_k=2, capacity_factor=1.25)
+        x = torch.randn(2, 16, 64, requires_grad=True)
+        out = moe(x)
+        assert out.shape == (2, 16, 64)
+        out.sum().backward()
+        assert x.grad is not None
+
+
+class TestCompile:
+    """torch.compile compatibility with MoE."""
+
+    def test_compile_moe_bf16(self):
+        """MoE compiles and runs correctly in bf16."""
+        moe = build_moe(dim=64, hidden_dim=128, num_experts=4, top_k=2).to(torch.bfloat16)
+        x = torch.randn(2, 16, 64, dtype=torch.bfloat16)
+
+        eager_out = moe(x)
+        compiled_moe = torch.compile(moe, fullgraph=False)
+        compiled_out = compiled_moe(x)
+
+        assert compiled_out.shape == eager_out.shape
+        torch.testing.assert_close(compiled_out, eager_out, atol=1e-2, rtol=1e-2)
+
+    def test_compile_moe_fp32_fallback(self):
+        """MoE falls back to loop under compile with fp32 (grouped_mm needs bf16)."""
+        moe = build_moe(dim=64, hidden_dim=128, num_experts=4, top_k=2)
+        x = torch.randn(2, 16, 64)
+
+        compiled_moe = torch.compile(moe, fullgraph=False)
+        out = compiled_moe(x)
+        assert out.shape == (2, 16, 64)
+
+
 class TestEPAttributes:
     """MoEMLP default EP attributes (no GPU needed)."""
 

@@ -86,6 +86,7 @@ class ModelConfig:
     moe_router: str = "softmax_topk"  # registry key for router type
     moe_shared_experts: int = 0  # shared experts that process all tokens
     moe_aux_loss_weight: float = 0.01  # aux loss coefficient in training loss
+    moe_capacity_factor: float = 0.0  # 0=no drop, >0=cap tokens/expert (e.g. 1.25)
 
     def __post_init__(self) -> None:
         if self.n_kv_heads is None:

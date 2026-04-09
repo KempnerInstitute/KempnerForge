@@ -166,24 +166,57 @@ def ep_dispatch_and_compute(
     received_expert_ids = received_expert_ids.squeeze(-1).long()
 
     # --- 5. Local expert computation ---
-    local_output = torch.zeros_like(received_tokens)
-    unused_expert_params: list[torch.nn.Parameter] = []
-    for i in range(num_local_experts):
-        global_expert_id = local_expert_start + i
-        mask = received_expert_ids == global_expert_id
-        if not mask.any():
-            unused_expert_params.extend(experts[i].parameters())
-            continue
-        local_output[mask] = experts[i](received_tokens[mask])
+    # Sort received tokens by expert for grouped GEMM.
+    from kempnerforge.model.moe import (
+        _GROUPED_MM_DTYPES,
+        _HAS_GROUPED_MM,
+        grouped_expert_forward,
+    )
 
-    # FSDP2 requires every parameter's AccumulateGrad hook to fire during
-    # backward for reduce-scatter to complete. When EP routing leaves some
-    # experts with zero tokens, their parameters are absent from the autograd
-    # graph, causing a hang on multi-node (dp_shard > 1). Add a zero-valued
-    # differentiable contribution so their AccumulateGrad nodes exist.
-    if unused_expert_params:
-        _zero = sum(p.sum() for p in unused_expert_params) * 0
-        local_output = local_output + _zero
+    use_grouped = _HAS_GROUPED_MM and received_tokens.dtype in _GROUPED_MM_DTYPES
+    if use_grouped:
+        sort_by_expert = torch.argsort(received_expert_ids, stable=True)
+        sorted_recv = received_tokens[sort_by_expert]
+        sorted_ids = received_expert_ids[sort_by_expert]
+
+        # Map global expert IDs to local indices for bincount.
+        local_ids = sorted_ids - local_expert_start
+        tokens_per_expert = torch.bincount(
+            local_ids, minlength=num_local_experts
+        ).tolist()
+
+        local_output_sorted = grouped_expert_forward(
+            sorted_recv, tokens_per_expert, experts,
+        )
+
+        # Unsort back to received order.
+        unsort_by_expert = torch.argsort(sort_by_expert)
+        local_output = local_output_sorted[unsort_by_expert]
+
+        # Ensure all expert params are in the autograd graph for FSDP2.
+        # grouped_expert_forward touches all expert weights via stacked matmul,
+        # but experts with zero tokens contribute only padding zeros. Add an
+        # explicit zero-valued contribution to guarantee AccumulateGrad fires.
+        for i in range(num_local_experts):
+            if tokens_per_expert[i] == 0:
+                for p in experts[i].parameters():
+                    local_output = local_output + p.sum() * 0
+    else:
+        local_output = torch.zeros_like(received_tokens)
+        unused_expert_params: list[torch.nn.Parameter] = []
+        for i in range(num_local_experts):
+            global_expert_id = local_expert_start + i
+            mask = received_expert_ids == global_expert_id
+            if not mask.any():
+                unused_expert_params.extend(experts[i].parameters())
+                continue
+            local_output[mask] = experts[i](received_tokens[mask])
+
+        # FSDP2 requires every parameter's AccumulateGrad hook to fire during
+        # backward for reduce-scatter to complete.
+        if unused_expert_params:
+            _zero = sum(p.sum() for p in unused_expert_params) * 0
+            local_output = local_output + _zero
 
     # Keep dispatch all-to-all in the autograd graph. When all local experts
     # are unused, local_output has no gradient path to received_tokens, so
