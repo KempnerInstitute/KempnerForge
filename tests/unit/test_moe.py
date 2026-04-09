@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import torch
 
+from kempnerforge.config.registry import registry
 from kempnerforge.config.schema import ModelConfig
 from kempnerforge.model.mlp import StandardMLP, SwiGLUMLP, build_mlp
 from kempnerforge.model.moe import MoEMLP, build_moe
-from kempnerforge.model.router import SoftmaxTopKRouter
+from kempnerforge.model.router import SigmoidTopKRouter, SoftmaxTopKRouter
 from kempnerforge.model.transformer import Transformer, TransformerBlock
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -66,7 +67,8 @@ class TestMoEMLP:
         # Each expert should have its own parameters (not shared references)
         for i in range(4):
             for j in range(i + 1, 4):
-                for pi, pj in zip(moe.experts[i].parameters(), moe.experts[j].parameters()):
+                params = zip(moe.experts[i].parameters(), moe.experts[j].parameters(), strict=True)
+                for pi, pj in params:
                     assert pi.data_ptr() != pj.data_ptr()
 
     def test_experts_are_registry_mlps(self):
@@ -178,7 +180,7 @@ class TestMoETransformer:
             model(tokens)
         counts = model.get_expert_counts()
         assert len(counts) == 4  # all 4 layers are MoE (frequency=1)
-        for layer_idx, c in counts.items():
+        for _layer_idx, c in counts.items():
             assert c.shape == (4,)
             assert c.sum().item() == 2 * 32 * 2  # batch * seq * top_k
 
@@ -207,3 +209,194 @@ class TestMoETransformer:
         model = Transformer(config)
         actual = sum(p.numel() for p in model.parameters())
         assert actual == config.num_params_estimate
+
+
+# ---------------------------------------------------------------------------
+# Phase 7: SigmoidTopKRouter (DeepSeek-V3 style)
+# ---------------------------------------------------------------------------
+
+
+class TestSigmoidTopKRouter:
+    def test_output_shapes(self):
+        router = SigmoidTopKRouter(dim=64, num_experts=8, top_k=2)
+        x = torch.randn(32, 64)
+        weights, indices = router(x)
+        assert weights.shape == (32, 2)
+        assert indices.shape == (32, 2)
+
+    def test_no_aux_loss(self):
+        """Sigmoid router uses bias-based balancing, not auxiliary loss."""
+        router = SigmoidTopKRouter(dim=64, num_experts=8, top_k=2)
+        x = torch.randn(32, 64)
+        router(x)
+        assert router.aux_loss.item() == 0.0
+
+    def test_weights_sum_to_one(self):
+        """Routing weights are normalized to sum to 1 per token."""
+        router = SigmoidTopKRouter(dim=64, num_experts=8, top_k=2)
+        x = torch.randn(32, 64)
+        weights, _ = router(x)
+        sums = weights.sum(dim=-1)
+        assert torch.allclose(sums, torch.ones_like(sums), atol=1e-5)
+
+    def test_expert_counts_tracked(self):
+        router = SigmoidTopKRouter(dim=64, num_experts=8, top_k=2)
+        x = torch.randn(32, 64)
+        router(x)
+        assert router.expert_counts.shape == (8,)
+        assert router.expert_counts.sum().item() == 32 * 2  # num_tokens * top_k
+
+    def test_ema_updates_in_training(self):
+        router = SigmoidTopKRouter(dim=64, num_experts=4, top_k=2)
+        router.train()
+        initial_ema = router.expert_ema.clone()
+        x = torch.randn(128, 64)
+        router(x)
+        # EMA should shift from uniform initialization
+        assert not torch.allclose(router.expert_ema, initial_ema)
+
+    def test_ema_frozen_in_eval(self):
+        router = SigmoidTopKRouter(dim=64, num_experts=4, top_k=2)
+        router.eval()
+        initial_ema = router.expert_ema.clone()
+        x = torch.randn(128, 64)
+        router(x)
+        assert torch.allclose(router.expert_ema, initial_ema)
+
+    def test_bias_adjusts_toward_balance(self):
+        """Expert bias should shift to balance utilization over many steps."""
+        router = SigmoidTopKRouter(dim=64, num_experts=4, top_k=2, bias_update_rate=0.01)
+        router.train()
+        initial_bias = router.expert_bias.data.clone()
+        # Run several forward passes to accumulate bias adjustments
+        for _ in range(50):
+            x = torch.randn(64, 64)
+            router(x)
+        # Bias should have changed from zero initialization
+        assert not torch.allclose(router.expert_bias.data, initial_bias)
+
+    def test_backward_through_gate(self):
+        router = SigmoidTopKRouter(dim=64, num_experts=4, top_k=2)
+        x = torch.randn(16, 64, requires_grad=True)
+        weights, _ = router(x)
+        weights.sum().backward()
+        assert router.gate.weight.grad is not None
+        assert router.gate.weight.grad.abs().sum() > 0
+
+    def test_registry_lookup(self):
+        builder = registry.get("router", "sigmoid_topk")
+        router = builder(64, 8, 2)
+        assert isinstance(router, SigmoidTopKRouter)
+
+
+class TestSigmoidMoEIntegration:
+    """Sigmoid router integrated into MoEMLP and Transformer."""
+
+    def test_build_moe_with_sigmoid(self):
+        moe = build_moe(dim=64, hidden_dim=128, num_experts=4, top_k=2, router_type="sigmoid_topk")
+        assert isinstance(moe.router, SigmoidTopKRouter)
+        x = torch.randn(2, 16, 64)
+        out = moe(x)
+        assert out.shape == (2, 16, 64)
+
+    def test_sigmoid_moe_backward(self):
+        moe = build_moe(dim=64, hidden_dim=128, num_experts=4, top_k=2, router_type="sigmoid_topk")
+        x = torch.randn(2, 16, 64)
+        out = moe(x)
+        loss = out.sum()
+        loss.backward()
+        assert moe.router.gate.weight.grad is not None
+
+    def test_sigmoid_transformer_forward(self):
+        config = ModelConfig(**_SMALL, num_experts=4, moe_top_k=2, moe_router="sigmoid_topk")
+        model = Transformer(config).to(DEVICE)
+        tokens = torch.randint(0, 1000, (2, 32), device=DEVICE)
+        with torch.no_grad():
+            out = model(tokens)
+        assert out.shape == (2, 32, 1000)
+
+    def test_sigmoid_aux_loss_zero_in_transformer(self):
+        config = ModelConfig(**_SMALL, num_experts=4, moe_top_k=2, moe_router="sigmoid_topk")
+        model = Transformer(config).to(DEVICE)
+        tokens = torch.randint(0, 1000, (2, 32), device=DEVICE)
+        with torch.no_grad():
+            model(tokens)
+        assert model.get_moe_aux_loss().item() == 0.0
+
+    def test_config_switch_router_type(self):
+        """Same architecture, different router — both produce valid forward."""
+        for router in ["softmax_topk", "sigmoid_topk"]:
+            config = ModelConfig(**_SMALL, num_experts=4, moe_top_k=2, moe_router=router)
+            model = Transformer(config).to(DEVICE)
+            tokens = torch.randint(0, 1000, (2, 32), device=DEVICE)
+            with torch.no_grad():
+                out = model(tokens)
+            assert out.shape == (2, 32, 1000), f"Failed for router={router}"
+
+
+# ---------------------------------------------------------------------------
+# Phase 7: Shared Experts
+# ---------------------------------------------------------------------------
+
+
+class TestSharedExperts:
+    def test_shared_expert_output_additive(self):
+        """Shared expert output is added to routed expert output."""
+        torch.manual_seed(42)
+        moe_no_shared = build_moe(dim=64, hidden_dim=128, num_experts=4, top_k=2)
+        moe_shared = build_moe(dim=64, hidden_dim=128, num_experts=4, top_k=2, shared_experts=1)
+        # Copy router and expert weights so only difference is shared expert
+        moe_shared.router.load_state_dict(moe_no_shared.router.state_dict())
+        for i in range(4):
+            moe_shared.experts[i].load_state_dict(moe_no_shared.experts[i].state_dict())
+        x = torch.randn(2, 16, 64)
+        with torch.no_grad():
+            out_no_shared = moe_no_shared(x)
+            out_shared = moe_shared(x)
+        # Shared expert adds something — outputs should differ
+        assert not torch.allclose(out_no_shared, out_shared, atol=1e-6)
+
+    def test_shared_expert_processes_all_tokens(self):
+        """Shared expert should receive all tokens, not just routed ones."""
+        moe = build_moe(dim=64, hidden_dim=128, num_experts=4, top_k=2, shared_experts=1)
+        assert moe.shared_expert is not None
+        assert isinstance(moe.shared_expert, SwiGLUMLP)
+
+    def test_shared_expert_backward(self):
+        moe = build_moe(dim=64, hidden_dim=128, num_experts=4, top_k=2, shared_experts=1)
+        x = torch.randn(2, 16, 64)
+        out = moe(x)
+        out.sum().backward()
+        # Shared expert should have gradients
+        for p in moe.shared_expert.parameters():
+            assert p.grad is not None
+            assert p.grad.abs().sum() > 0
+
+    def test_shared_expert_config(self):
+        config = ModelConfig(**_SMALL, num_experts=4, moe_top_k=2, moe_shared_experts=1)
+        model = Transformer(config).to(DEVICE)
+        # Check first MoE layer has a shared expert
+        layer = model.layers["0"]
+        assert isinstance(layer.mlp, MoEMLP)
+        assert layer.mlp.shared_expert is not None
+
+    def test_shared_expert_param_count(self):
+        """Shared expert adds one extra MLP worth of parameters per MoE layer."""
+        config_no_shared = ModelConfig(**_SMALL, num_experts=4, moe_top_k=2, moe_shared_experts=0)
+        config_shared = ModelConfig(**_SMALL, num_experts=4, moe_top_k=2, moe_shared_experts=1)
+        assert config_shared.num_params_estimate > config_no_shared.num_params_estimate
+
+    def test_deepseek_style_config_forward(self):
+        """DeepSeek-V3 style: sigmoid router + shared expert, many experts."""
+        config = ModelConfig(
+            dim=128, n_layers=4, n_heads=4, vocab_size=1000, max_seq_len=64,
+            num_experts=16, moe_top_k=2, moe_router="sigmoid_topk",
+            moe_shared_experts=1, moe_aux_loss_weight=0.0,
+        )
+        model = Transformer(config).to(DEVICE)
+        tokens = torch.randint(0, 1000, (2, 32), device=DEVICE)
+        with torch.no_grad():
+            out = model(tokens)
+        assert out.shape == (2, 32, 1000)
+        # Sigmoid router → aux_loss is 0
+        assert model.get_moe_aux_loss().item() == 0.0
