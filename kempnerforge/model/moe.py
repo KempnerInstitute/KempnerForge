@@ -31,6 +31,12 @@ class MoEMLP(nn.Module):
         self.shared_expert = shared_expert
         self.num_experts = len(experts)
 
+        # EP attributes — set by apply_expert_parallel(); defaults = no EP
+        self.ep_world_size: int = 1
+        self.ep_group = None
+        self.local_expert_start: int = 0
+        self.num_local_experts: int = len(experts)
+
     @property
     def aux_loss(self) -> torch.Tensor:
         return self.router.aux_loss
@@ -54,20 +60,30 @@ class MoEMLP(nn.Module):
         # Route tokens → stores aux_loss as side effect
         weights, indices = self.router(x_flat)
 
-        output = torch.zeros_like(x_flat)
+        if self.ep_world_size > 1:
+            from kempnerforge.distributed.expert_parallel import ep_dispatch_and_compute
 
-        for i in range(self.num_experts):
-            # Which tokens chose expert i (in any top_k slot)
-            mask = (indices == i).any(dim=-1)  # (num_tokens,)
-            if not mask.any():
-                continue
+            output = ep_dispatch_and_compute(
+                x_flat, weights, indices,
+                self.experts, self.ep_group,
+                self.local_expert_start, self.num_local_experts,
+                self.ep_world_size,
+            )
+        else:
+            output = torch.zeros_like(x_flat)
 
-            expert_input = x_flat[mask]  # (num_selected, D)
-            expert_output = self.experts[i](expert_input)  # (num_selected, D)
+            for i in range(self.num_experts):
+                # Which tokens chose expert i (in any top_k slot)
+                mask = (indices == i).any(dim=-1)  # (num_tokens,)
+                if not mask.any():
+                    continue
 
-            # Weight each token assigned to expert i
-            weight_for_i = (weights * (indices == i).float()).sum(dim=-1)  # (num_tokens,)
-            output[mask] += weight_for_i[mask].unsqueeze(-1) * expert_output
+                expert_input = x_flat[mask]  # (num_selected, D)
+                expert_output = self.experts[i](expert_input)  # (num_selected, D)
+
+                # Weight each token assigned to expert i
+                weight_for_i = (weights * (indices == i).float()).sum(dim=-1)  # (num_tokens,)
+                output[mask] += weight_for_i[mask].unsqueeze(-1) * expert_output
 
         if self.shared_expert is not None:
             output = output + self.shared_expert(x_flat)

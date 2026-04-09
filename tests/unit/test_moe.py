@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 from kempnerforge.config.registry import registry
-from kempnerforge.config.schema import ModelConfig
+from kempnerforge.config.schema import DistributedConfig, JobConfig, ModelConfig, TrainConfig
 from kempnerforge.model.mlp import StandardMLP, SwiGLUMLP, build_mlp
 from kempnerforge.model.moe import MoEMLP, build_moe
 from kempnerforge.model.router import SigmoidTopKRouter, SoftmaxTopKRouter
@@ -400,3 +401,81 @@ class TestSharedExperts:
         assert out.shape == (2, 32, 1000)
         # Sigmoid router → aux_loss is 0
         assert model.get_moe_aux_loss().item() == 0.0
+
+
+class TestEPConfig:
+    """Expert parallelism config validation (no GPU needed)."""
+
+    def test_ep_default_is_one(self):
+        config = DistributedConfig()
+        assert config.ep == 1
+
+    def test_ep_in_world_size_product(self):
+        config = DistributedConfig(ep=2, tp=2, dp_shard=2)
+        config.validate_world_size(8)  # 1 * 2 * 2 * 1 * 1 * 2 = 8
+
+    def test_ep_world_size_mismatch(self):
+        config = DistributedConfig(ep=2, tp=2)
+        with pytest.raises(ValueError):
+            config.validate_world_size(3)
+
+    def test_ep_resolve_includes_ep(self):
+        config = DistributedConfig(ep=2, tp=2)
+        resolved = config.resolve(world_size=4)
+        assert resolved.ep == 2
+        assert resolved.dp_shard == 1
+
+    def test_ep_auto_dp_shard_with_ep(self):
+        config = DistributedConfig(ep=2, tp=2)
+        resolved = config.resolve(world_size=8)
+        assert resolved.dp_shard == 2
+        assert resolved.ep == 2
+
+    def test_ep_requires_moe(self):
+        config = JobConfig(
+            model=ModelConfig(dim=64, n_layers=2, n_heads=2, vocab_size=100, max_seq_len=32),
+            train=TrainConfig(seq_len=32),
+            distributed=DistributedConfig(ep=2),
+        )
+        with pytest.raises(ValueError, match="ep > 1 requires an MoE model"):
+            config.validate(world_size=2)
+
+    def test_ep_must_divide_num_experts(self):
+        config = JobConfig(
+            model=ModelConfig(
+                dim=64, n_layers=2, n_heads=2, vocab_size=100, max_seq_len=32,
+                num_experts=5, moe_top_k=2,
+            ),
+            train=TrainConfig(seq_len=32),
+            distributed=DistributedConfig(ep=2),
+        )
+        with pytest.raises(ValueError, match="num_experts.*must be divisible by ep"):
+            config.validate(world_size=2)
+
+    def test_ep_valid_moe_config(self):
+        config = JobConfig(
+            model=ModelConfig(
+                dim=64, n_layers=2, n_heads=2, vocab_size=100, max_seq_len=32,
+                num_experts=4, moe_top_k=2,
+            ),
+            train=TrainConfig(seq_len=32),
+            distributed=DistributedConfig(ep=2),
+        )
+        config.validate(world_size=2)  # should not raise
+
+    def test_ep_invalid_value(self):
+        with pytest.raises(ValueError, match="ep must be >= 1"):
+            DistributedConfig(ep=0)
+
+
+class TestEPAttributes:
+    """MoEMLP default EP attributes (no GPU needed)."""
+
+    def test_default_ep_attributes(self):
+        router = SoftmaxTopKRouter(dim=64, num_experts=4, top_k=2)
+        experts = torch.nn.ModuleList([SwiGLUMLP(64, 128) for _ in range(4)])
+        moe = MoEMLP(router, experts)
+        assert moe.ep_world_size == 1
+        assert moe.ep_group is None
+        assert moe.local_expert_start == 0
+        assert moe.num_local_experts == 4

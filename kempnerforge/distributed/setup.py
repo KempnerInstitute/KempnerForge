@@ -171,6 +171,7 @@ def init_distributed(config: DistributedConfig, seed: int = 42) -> DeviceMesh | 
         ("pp", resolved.pp),
         ("dp_replicate", resolved.dp_replicate),
         ("dp_shard", resolved.dp_shard),
+        ("ep", resolved.ep),
         ("tp", resolved.tp),
     ]
 
@@ -179,13 +180,20 @@ def init_distributed(config: DistributedConfig, seed: int = 42) -> DeviceMesh | 
             mesh_dims.append(name)
             mesh_sizes.append(size)
 
-    # When TP is active, ensure dp_shard is in the mesh so FSDP2 can wrap
+    # When TP or EP is active, ensure dp_shard is in the mesh so FSDP2 can wrap
     # all parameters as DTensors (required for fused optimizer compatibility).
-    if resolved.tp > 1 and "dp_shard" not in mesh_dims:
-        # Insert dp_shard before tp (mesh order: pp, dp_replicate, dp_shard, tp)
-        tp_idx = mesh_dims.index("tp")
-        mesh_dims.insert(tp_idx, "dp_shard")
-        mesh_sizes.insert(tp_idx, 1)
+    if (resolved.tp > 1 or resolved.ep > 1) and "dp_shard" not in mesh_dims:
+        # Insert dp_shard before ep/tp (mesh order: pp, dp_replicate, dp_shard, ep, tp)
+        for insert_before in ("ep", "tp"):
+            if insert_before in mesh_dims:
+                idx = mesh_dims.index(insert_before)
+                mesh_dims.insert(idx, "dp_shard")
+                mesh_sizes.insert(idx, 1)
+                break
+        else:
+            # Neither ep nor tp in mesh — append
+            mesh_dims.append("dp_shard")
+            mesh_sizes.append(1)
 
     # If all dimensions are 1 (pure single-dim), create a flat DP mesh
     if not mesh_dims:

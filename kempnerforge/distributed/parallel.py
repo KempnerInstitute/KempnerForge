@@ -4,8 +4,9 @@ Applies parallelism to Transformer models in the correct order.
 
 Application order (critical — wrong order causes silent correctness bugs):
   1. Tensor parallelism (apply_tensor_parallel) — must see raw blocks
-  2. Activation checkpointing (apply_ac) — wraps blocks in CheckpointWrapper
-  3. FSDP2 (apply_fsdp2) — shards everything
+  2. Expert parallelism (apply_expert_parallel) — partitions MoE experts
+  3. Activation checkpointing (apply_ac) — wraps blocks in CheckpointWrapper
+  4. FSDP2 (apply_fsdp2) — shards everything
 
 For convenience, ``build_parallel_model`` combines all steps including
 model creation, meta-device initialization, and optional torch.compile.
@@ -108,6 +109,16 @@ def apply_ac(model: Transformer, mode: ActivationCheckpointing) -> None:
         logger.info("Applied selective activation checkpointing (Attention only)")
 
 
+def _has_ep_moe(module: torch.nn.Module) -> bool:
+    """Check if a module contains MoE with expert parallelism active."""
+    from kempnerforge.model.moe import MoEMLP
+
+    return any(
+        isinstance(m, MoEMLP) and m.ep_world_size > 1
+        for m in module.modules()
+    )
+
+
 def apply_fsdp2(
     model: Transformer,
     device_mesh: DeviceMesh,
@@ -120,6 +131,13 @@ def apply_fsdp2(
     model for remaining parameters (embeddings, final norm, output head).
 
     Must be called AFTER apply_ac and apply_tensor_parallel.
+
+    **EP interaction**: Blocks with expert parallelism are NOT individually
+    wrapped. Per-block fully_shard causes FSDP2's reduce-scatter to fire
+    between EP's two backward all-to-all calls, creating a cross-communicator
+    NCCL deadlock. Those blocks are instead handled by the top-level
+    fully_shard(model), which defers reduce-scatter until after all EP
+    backward communication completes.
 
     Args:
         model: Transformer model to shard.
@@ -137,8 +155,21 @@ def apply_fsdp2(
     dp_mesh = get_dp_mesh(device_mesh)
     policy = mp_policy or default_mp_policy()
 
-    # Shard each transformer block as an independent FSDP unit
+    # Shard each transformer block as an independent FSDP unit.
+    # For EP-MoE blocks: wrap attention sub-modules individually but leave MoE
+    # params to the top-level fully_shard. Per-block wrapping would cause FSDP2's
+    # reduce-scatter to fire between EP's two backward all-to-all calls, creating
+    # a cross-communicator NCCL deadlock. Wrapping attention separately restores
+    # per-block overlap and memory savings for the bulk of the computation.
+    ep_skipped = 0
     for layer in model.layers.values():
+        if _has_ep_moe(layer):
+            fully_shard(
+                layer.attention, mesh=dp_mesh, mp_policy=policy,
+                reshard_after_forward=reshard_after_forward,
+            )
+            ep_skipped += 1
+            continue
         fully_shard(
             layer,
             mesh=dp_mesh,
@@ -146,7 +177,8 @@ def apply_fsdp2(
             reshard_after_forward=reshard_after_forward,
         )
 
-    # Top-level shard covers remaining params (embeddings, final norm, output head)
+    # Top-level shard covers remaining params (embeddings, final norm, output head,
+    # and any EP-MoE blocks that were not individually wrapped above).
     fully_shard(
         model,
         mesh=dp_mesh,
@@ -155,7 +187,8 @@ def apply_fsdp2(
     )
 
     logger.info(
-        f"Applied FSDP2: dp_mesh={dp_mesh.mesh_dim_names}, blocks={len(model.layers)}, mp={policy}"
+        f"Applied FSDP2: dp_mesh={dp_mesh.mesh_dim_names}, blocks={len(model.layers)}, "
+        f"mp={policy}" + (f", ep_moe_blocks_deferred={ep_skipped}" if ep_skipped else "")
     )
 
 
@@ -195,12 +228,15 @@ def build_parallel_model(
     tp_enabled = device_mesh is not None and "tp" in device_mesh.mesh_dim_names
     model_builder = registry.get_model(model_config.model_type)
 
+    from kempnerforge.distributed.expert_parallel import apply_expert_parallel
+
     if tp_enabled:
         # Meta-device init: create model with zero memory, apply parallelisms,
         # then materialize only the local shards on GPU.
         with torch.device("meta"):
             model = model_builder(model_config)
         apply_tensor_parallel(model, device_mesh)
+        apply_expert_parallel(model, device_mesh)
         apply_ac(model, ac_mode)
         if device_mesh is not None:
             apply_fsdp2(model, device_mesh, mp_policy=mp_policy)
@@ -209,6 +245,7 @@ def build_parallel_model(
         model.to(dtype=param_dtype)
     else:
         model = model_builder(model_config).to(device=device, dtype=param_dtype)
+        apply_expert_parallel(model, device_mesh)
         apply_ac(model, ac_mode)
         if device_mesh is not None:
             apply_fsdp2(model, device_mesh, mp_policy=mp_policy)

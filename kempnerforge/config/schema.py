@@ -331,17 +331,18 @@ class DistributedConfig:
     pp: int = 1
     pp_schedule: PipelineSchedule = PipelineSchedule.schedule_1f1b
     cp: int = 1
+    ep: int = 1  # Expert parallelism degree (partitions MoE experts across ranks)
     nccl_timeout_sec: int = 1800
     backend: str = "cpu:gloo,cuda:nccl"
 
     def validate_world_size(self, world_size: int) -> None:
         """Validate that parallelism dimensions match world size."""
         dp_shard = self._resolve_dp_shard(world_size)
-        expected = self.dp_replicate * dp_shard * self.tp * self.pp * self.cp
+        expected = self.dp_replicate * dp_shard * self.tp * self.pp * self.cp * self.ep
         if expected != world_size:
             raise ValueError(
                 f"Parallelism dimensions ({self.dp_replicate} × {dp_shard} × "
-                f"{self.tp} × {self.pp} × {self.cp} = {expected}) "
+                f"{self.tp} × {self.pp} × {self.cp} × {self.ep} = {expected}) "
                 f"do not match world_size ({world_size})"
             )
 
@@ -349,10 +350,11 @@ class DistributedConfig:
         """Resolve dp_shard=-1 to actual value."""
         if self.dp_shard > 0:
             return self.dp_shard
-        other = self.dp_replicate * self.tp * self.pp * self.cp
+        other = self.dp_replicate * self.tp * self.pp * self.cp * self.ep
         if world_size % other != 0:
             raise ValueError(
-                f"world_size ({world_size}) not divisible by dp_replicate*tp*pp*cp ({other})"
+                f"world_size ({world_size}) not divisible by "
+                f"dp_replicate*tp*pp*cp*ep ({other})"
             )
         return world_size // other
 
@@ -365,6 +367,7 @@ class DistributedConfig:
             pp=self.pp,
             pp_schedule=self.pp_schedule,
             cp=self.cp,
+            ep=self.ep,
             nccl_timeout_sec=self.nccl_timeout_sec,
             backend=self.backend,
         )
@@ -379,6 +382,7 @@ class DistributedConfig:
             ("tp", self.tp),
             ("pp", self.pp),
             ("cp", self.cp),
+            ("ep", self.ep),
         ]:
             if val < 1:
                 raise ValueError(f"{name} must be >= 1")
@@ -508,4 +512,13 @@ class JobConfig:
                 raise ValueError(
                     f"n_kv_heads ({self.model.n_kv_heads}) must be divisible by "
                     f"tp ({self.distributed.tp})"
+                )
+
+        if self.distributed.ep > 1:
+            if not self.model.is_moe:
+                raise ValueError("ep > 1 requires an MoE model (num_experts > 0)")
+            if self.model.num_experts % self.distributed.ep != 0:
+                raise ValueError(
+                    f"num_experts ({self.model.num_experts}) must be divisible by "
+                    f"ep ({self.distributed.ep})"
                 )
