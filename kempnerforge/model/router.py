@@ -133,13 +133,14 @@ class SigmoidTopKRouter(nn.Module):
         # Update EMA and adjust bias (training only, no gradient)
         if self.training:
             utilization = tokens_per_expert / (num_tokens * self.top_k + 1e-8)
-            self.expert_ema.lerp_(utilization, 1.0 - self.ema_decay)
+            # Cast to match buffer dtype (FSDP2 mixed precision may cast buffers to bf16)
+            self.expert_ema.lerp_(utilization.to(self.expert_ema.dtype), 1.0 - self.ema_decay)
 
             # Bias adjustment: push under-utilized experts up, over-utilized down
             target = 1.0 / self.num_experts
             with torch.no_grad():
                 self.expert_bias.add_(
-                    self.bias_update_rate * (target - self.expert_ema)
+                    self.bias_update_rate * (target - self.expert_ema.float())
                 )
 
         # No auxiliary loss
