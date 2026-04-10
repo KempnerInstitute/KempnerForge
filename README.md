@@ -119,6 +119,7 @@ srun --nodes=4 --ntasks-per-node=4 --gpus-per-node=4 \
 | `debug.toml` | Dense | 20M | FSDP | 1-4 |
 | `debug_moe.toml` | MoE (4 experts) | 23M | FSDP | 1-4 |
 | `7b.toml` | Dense | 7B | FSDP | 4+ |
+| `7b_16gpu_fp8.toml` | Dense | 7B | FP8, FSDP | 16 |
 | `7b_32gpu_fsdp.toml` | Dense | 7B | FSDP | 32 |
 | `7b_12gpu_tp4.toml` | Dense | 7B | TP=4, FSDP=3 | 12 |
 | `13b_32gpu_tp4_pp2.toml` | Dense | 13B | TP=4, PP=2, FSDP=4 | 32 |
