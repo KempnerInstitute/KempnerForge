@@ -10,6 +10,7 @@ dependencies = [
     "transformers",
     "datasets",
     "tokenizers",
+    "torchao>=0.17.0",
 ]
 
 [dependency-groups]

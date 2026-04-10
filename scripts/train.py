@@ -34,6 +34,7 @@ from kempnerforge.data.dataset import MemoryMappedDataset
 from kempnerforge.data.sampler import DistributedSampler
 from kempnerforge.distributed.parallel import (
     apply_ac,
+    apply_float8,
     apply_fsdp2,
     build_parallel_model,
     default_mp_policy,
@@ -184,6 +185,8 @@ def main() -> None:
                 stage_mod = build_stage_module(config.model, pp_rank, pp_size)
             model = stage_mod
             apply_tensor_parallel(model, device_mesh)
+            if tc.is_fp8:
+                apply_float8(model)
             apply_ac(model, tc.activation_checkpointing)
             if device_mesh is not None:
                 apply_fsdp2(model, device_mesh, mp_policy=mp_policy)
@@ -193,6 +196,8 @@ def main() -> None:
         else:
             stage_mod = build_stage_module(config.model, pp_rank, pp_size)
             model = stage_mod.to(device=device, dtype=tc.param_dtype)
+            if tc.is_fp8:
+                apply_float8(model)
             apply_ac(model, tc.activation_checkpointing)
             if device_mesh is not None:
                 apply_fsdp2(model, device_mesh, mp_policy=mp_policy)
@@ -229,6 +234,7 @@ def main() -> None:
             mp_policy=mp_policy,
             param_dtype=tc.param_dtype,
             compile_model=tc.compile_model,
+            fp8=tc.is_fp8,
         )
 
     # --- Optimizer + Scheduler ---

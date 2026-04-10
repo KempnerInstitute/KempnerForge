@@ -568,6 +568,67 @@ def test_moe_checkpoint_resume(tmp_path):
 
 
 # ============================================================================
+# FP8 Mixed Precision
+# ============================================================================
+
+
+@pytest.mark.e2e
+@requires_gpus(1)
+def test_fp8_single_gpu():
+    """Single GPU FP8 training — verifies Float8 conversion + forward/backward."""
+    result = _run_training(
+        [
+            DEBUG_CONFIG,
+            "--train.max_steps=10",
+            "--metrics.log_interval=5",
+            "--train.mixed_precision=fp8",
+        ],
+        nproc=1,
+    )
+    _assert_training_complete(result, expected_steps=10)
+    output = result.stdout + result.stderr
+    assert "Float8" in output, "Float8 conversion was not applied"
+    loss = _parse_last_loss(output)
+    assert loss is not None and loss > 0, f"FP8 loss should be > 0 (got {loss})"
+
+
+@pytest.mark.e2e
+@requires_gpus(4)
+def test_fp8_fsdp_4gpu():
+    """4 GPU FSDP with FP8 — tests Float8 + FSDP2 float8 all-gather."""
+    result = _run_training(
+        [
+            DEBUG_CONFIG,
+            "--train.max_steps=10",
+            "--metrics.log_interval=5",
+            "--train.mixed_precision=fp8",
+        ],
+        nproc=4,
+    )
+    _assert_training_complete(result, expected_steps=10)
+    output = result.stdout + result.stderr
+    assert "Float8" in output, "Float8 conversion was not applied"
+
+
+@pytest.mark.e2e
+@requires_gpus(4)
+def test_fp8_moe_fsdp_4gpu():
+    """4 GPU FSDP with FP8 + MoE — verifies expert Linears excluded from Float8."""
+    result = _run_training(
+        [
+            DEBUG_MOE_CONFIG,
+            "--train.max_steps=10",
+            "--metrics.log_interval=5",
+            "--train.mixed_precision=fp8",
+        ],
+        nproc=4,
+    )
+    _assert_training_complete(result, expected_steps=10)
+    output = result.stdout + result.stderr
+    assert "Float8" in output, "Float8 conversion was not applied"
+
+
+# ============================================================================
 # Slow: Large Model
 # ============================================================================
 

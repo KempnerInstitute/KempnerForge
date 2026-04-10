@@ -185,7 +185,7 @@ class TrainConfig:
     grad_clip_norm: float = 1.0
     seed: int = 42
     compile_model: bool = True
-    mixed_precision: Literal["bf16", "fp16", "fp32"] = "bf16"
+    mixed_precision: Literal["bf16", "fp16", "fp32", "fp8"] = "bf16"
     activation_checkpointing: ActivationCheckpointing = ActivationCheckpointing.none
     loss_fn: str = "cross_entropy"  # Registry key for loss function
     shutdown_timeout_sec: float = 600.0  # Graceful shutdown timeout before forced exit
@@ -205,12 +205,24 @@ class TrainConfig:
 
     @property
     def param_dtype(self) -> torch.dtype:
-        """Resolve mixed_precision string to a torch dtype."""
+        """Resolve mixed_precision to the master weight dtype.
+
+        FP8 uses bf16 master weights — FP8 is a compute mode, not a storage dtype.
+        """
         import torch
 
-        return {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[
-            self.mixed_precision
-        ]
+        _DTYPE_MAP = {
+            "bf16": torch.bfloat16,
+            "fp16": torch.float16,
+            "fp32": torch.float32,
+            "fp8": torch.bfloat16,  # FP8 compute with bf16 master weights
+        }
+        return _DTYPE_MAP[self.mixed_precision]
+
+    @property
+    def is_fp8(self) -> bool:
+        """Whether FP8 mixed precision is enabled."""
+        return self.mixed_precision == "fp8"
 
 
 # ---------------------------------------------------------------------------
@@ -514,6 +526,13 @@ class JobConfig:
                     f"n_kv_heads ({self.model.n_kv_heads}) must be divisible by "
                     f"tp ({self.distributed.tp})"
                 )
+
+        if self.train.is_fp8 and self.distributed.tp > 1:
+            raise ValueError(
+                "FP8 + Tensor Parallelism is not yet supported (torchao Float8Linear "
+                "does not compose with DTensor sharding). Use FP8 with FSDP only, "
+                "or TP without FP8."
+            )
 
         if self.distributed.ep > 1:
             if not self.model.is_moe:

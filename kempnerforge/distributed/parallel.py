@@ -1,12 +1,13 @@
-"""Parallelism application: TP, AC, FSDP2, and model building.
+"""Parallelism application: TP, AC, Float8, FSDP2, and model building.
 
 Applies parallelism to Transformer models in the correct order.
 
 Application order (critical — wrong order causes silent correctness bugs):
   1. Tensor parallelism (apply_tensor_parallel) — must see raw blocks
   2. Expert parallelism (apply_expert_parallel) — partitions MoE experts
-  3. Activation checkpointing (apply_ac) — wraps blocks in CheckpointWrapper
-  4. FSDP2 (apply_fsdp2) — shards everything
+  3. Float8 training (apply_float8) — wraps Linear → Float8Linear
+  4. Activation checkpointing (apply_ac) — wraps blocks in CheckpointWrapper
+  5. FSDP2 (apply_fsdp2) — shards everything (uses float8 all-gather if enabled)
 
 For convenience, ``build_parallel_model`` combines all steps including
 model creation, meta-device initialization, and optional torch.compile.
@@ -107,6 +108,58 @@ def apply_ac(model: Transformer, mode: ActivationCheckpointing) -> None:
             check_fn=lambda m: isinstance(m, Attention),
         )
         logger.info("Applied selective activation checkpointing (Attention only)")
+
+
+def apply_float8(model: Transformer, enable_fsdp_float8_all_gather: bool = True) -> None:
+    """Apply Float8 training (torchao) to the model.
+
+    Converts nn.Linear modules to Float8Linear for E4M3 forward / E5M2 backward
+    with dynamic tensorwise scaling. Master weights remain in bf16.
+
+    Must be called AFTER apply_tensor_parallel / apply_expert_parallel
+    and BEFORE apply_ac / apply_fsdp2.
+
+    MoE expert modules (experts and shared_expert) are excluded because they use
+    grouped GEMM (torch._grouped_mm) which bypasses Float8Linear.forward().
+
+    Args:
+        model: Transformer model.
+        enable_fsdp_float8_all_gather: If True, FSDP2 all-gathers use float8
+            (halves communication volume). Requires FSDP2 to be applied after.
+            Must be False when TP is active — the float8 weight wrapper calls
+            aten.is_pinned on DTensors, which has no sharding strategy yet.
+    """
+    import dataclasses
+
+    from torchao.float8 import (
+        Float8LinearConfig,
+        Float8LinearRecipeName,
+        convert_to_float8_training,
+    )
+
+    config = dataclasses.replace(
+        Float8LinearConfig.from_recipe_name(Float8LinearRecipeName.TENSORWISE),
+        enable_fsdp_float8_all_gather=enable_fsdp_float8_all_gather,
+    )
+
+    def _filter_fn(module: torch.nn.Module, fqn: str) -> bool:
+        """Skip modules that shouldn't use Float8.
+
+        Excluded:
+        - Expert Linears: use grouped GEMM (torch._grouped_mm), not Linear.forward()
+        - Router gate: small output dim (num_experts) often not divisible by 16,
+          which torch._scaled_mm requires. Also not compute-bound.
+        """
+        if "experts" in fqn or "shared_expert" in fqn:
+            return False
+        return "router" not in fqn
+
+    convert_to_float8_training(model, config=config, module_filter_fn=_filter_fn)
+
+    logger.info(
+        f"Applied Float8 training: recipe=TENSORWISE, "
+        f"fsdp_float8_all_gather={enable_fsdp_float8_all_gather}"
+    )
 
 
 def _has_ep_moe(module: torch.nn.Module) -> bool:
@@ -213,12 +266,13 @@ def build_parallel_model(
     mp_policy: MixedPrecisionPolicy | None = None,
     param_dtype: torch.dtype = torch.bfloat16,
     compile_model: bool = False,
+    fp8: bool = False,
 ) -> torch.nn.Module:
     """Build a Transformer with parallelism applied in the correct order.
 
     Handles four configurations automatically:
-      - TP enabled:  meta-device init → TP → AC → FSDP → materialize → init weights
-      - TP disabled: create on device → AC → FSDP
+      - TP enabled:  meta-device init → TP → EP → [Float8] → AC → FSDP → materialize
+      - TP disabled: create on device → EP → [Float8] → AC → FSDP
 
     This is the non-PP model building path. For pipeline parallelism,
     use ``build_stage_module`` + apply parallelism directly.
@@ -231,6 +285,7 @@ def build_parallel_model(
         mp_policy: FSDP2 mixed-precision policy. Defaults to bf16 params + fp32 reduce.
         param_dtype: Dtype for model parameters.
         compile_model: Whether to torch.compile the model.
+        fp8: Whether to enable Float8 mixed precision (torchao).
 
     Returns:
         The parallelized model, ready for training.
@@ -249,6 +304,8 @@ def build_parallel_model(
             model = model_builder(model_config)
         apply_tensor_parallel(model, device_mesh)
         apply_expert_parallel(model, device_mesh)
+        if fp8:
+            apply_float8(model)
         apply_ac(model, ac_mode)
         if device_mesh is not None:
             apply_fsdp2(model, device_mesh, mp_policy=mp_policy)
@@ -258,6 +315,8 @@ def build_parallel_model(
     else:
         model = model_builder(model_config).to(device=device, dtype=param_dtype)
         apply_expert_parallel(model, device_mesh)
+        if fp8:
+            apply_float8(model)
         apply_ac(model, ac_mode)
         if device_mesh is not None:
             apply_fsdp2(model, device_mesh, mp_policy=mp_policy)
