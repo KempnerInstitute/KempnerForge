@@ -8,7 +8,14 @@
 #
 # Memory per GPU:
 #   Sharded state (params+opt+grad): 7B × 16 bytes / 16 = 7 GB
-#   Remaining for activations: ~133 GB (with full AC, <10 GB used)
+#   Activations (selective AC): ~30-40 GB per GPU
+#   Total peak: ~50-60 GB of 140 GB
+#
+# Tuning for FP8 tensor core utilization:
+#   - batch_size=8 (not 4): doubles GEMM M-dimension → better TC saturation
+#   - grad_accum_steps=2: keeps same effective batch (256 seq/step)
+#   - full AC required at batch_size=8 (selective AC OOMs — MLP intermediates
+#     across 32 layers exceed memory)
 
 [model]
 dim = 4096
@@ -21,10 +28,10 @@ max_seq_len = 4096
 rope_theta = 500000.0
 
 [train]
-batch_size = 4
+batch_size = 8
 seq_len = 4096
 max_steps = 50
-grad_accum_steps = 4
+grad_accum_steps = 2
 grad_clip_norm = 1.0
 seed = 42
 compile_model = true
