@@ -132,12 +132,12 @@ def apply_fsdp2(
 
     Must be called AFTER apply_ac and apply_tensor_parallel.
 
-    **EP interaction**: Blocks with expert parallelism are NOT individually
-    wrapped. Per-block fully_shard causes FSDP2's reduce-scatter to fire
-    between EP's two backward all-to-all calls, creating a cross-communicator
-    NCCL deadlock. Those blocks are instead handled by the top-level
-    fully_shard(model), which defers reduce-scatter until after all EP
-    backward communication completes.
+    **EP interaction**: Blocks with expert parallelism get per-sub-module
+    wrapping (attention and MoE individually) instead of per-block wrapping.
+    Per-block wrapping would cause FSDP2's reduce-scatter to fire between
+    EP's backward all-to-all calls (deadlock). Per-sub-module wrapping avoids
+    this: the MoE reduce-scatter fires after the entire MoE backward (both
+    EP all-to-alls complete), while attention reduce-scatter is EP-free.
 
     Args:
         model: Transformer model to shard.
@@ -156,19 +156,31 @@ def apply_fsdp2(
     policy = mp_policy or default_mp_policy()
 
     # Shard each transformer block as an independent FSDP unit.
-    # For EP-MoE blocks: wrap attention sub-modules individually but leave MoE
-    # params to the top-level fully_shard. Per-block wrapping would cause FSDP2's
-    # reduce-scatter to fire between EP's two backward all-to-all calls, creating
-    # a cross-communicator NCCL deadlock. Wrapping attention separately restores
-    # per-block overlap and memory savings for the bulk of the computation.
-    ep_skipped = 0
+    #
+    # EP-MoE blocks get per-sub-module wrapping: attention and MoE (layer.mlp)
+    # are each individually fully_shard()'d. This avoids the deadlock that
+    # per-block wrapping would cause (FSDP2 reduce-scatter firing between EP's
+    # two backward all-to-all calls), while still getting per-block param
+    # resharding and gradient reduction overlap — unlike the previous approach
+    # of deferring all MoE params to the top-level wrap.
+    #
+    # Safety: FSDP2 bucketizes all params in a fully_shard() unit and fires
+    # reduce-scatter only after the last param's grad is computed. For
+    # fully_shard(layer.mlp), reduce-scatter fires after the entire MoE
+    # backward (after both EP all-to-all calls complete). All dp_shard peers
+    # share the same EP rank, so they reach reduce-scatter in the same phase.
+    ep_sub_wrapped = 0
     for layer in model.layers.values():
         if _has_ep_moe(layer):
             fully_shard(
                 layer.attention, mesh=dp_mesh, mp_policy=policy,
                 reshard_after_forward=reshard_after_forward,
             )
-            ep_skipped += 1
+            fully_shard(
+                layer.mlp, mesh=dp_mesh, mp_policy=policy,
+                reshard_after_forward=reshard_after_forward,
+            )
+            ep_sub_wrapped += 1
             continue
         fully_shard(
             layer,
@@ -177,8 +189,8 @@ def apply_fsdp2(
             reshard_after_forward=reshard_after_forward,
         )
 
-    # Top-level shard covers remaining params (embeddings, final norm, output head,
-    # and any EP-MoE blocks that were not individually wrapped above).
+    # Top-level shard covers remaining params (embeddings, final norm, output
+    # head, and layer norms from EP-MoE blocks).
     fully_shard(
         model,
         mesh=dp_mesh,
@@ -188,7 +200,7 @@ def apply_fsdp2(
 
     logger.info(
         f"Applied FSDP2: dp_mesh={dp_mesh.mesh_dim_names}, blocks={len(model.layers)}, "
-        f"mp={policy}" + (f", ep_moe_blocks_deferred={ep_skipped}" if ep_skipped else "")
+        f"mp={policy}" + (f", ep_moe_blocks_sub_wrapped={ep_sub_wrapped}" if ep_sub_wrapped else "")
     )
 
 

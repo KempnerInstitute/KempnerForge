@@ -1,0 +1,72 @@
+# 32-GPU MoE + Expert Parallelism performance benchmark
+#
+# 8 nodes × 4 H200 141GB GPUs.
+# TP=4 (intra-node NVLink), EP=2 (cross-node IB), DP_shard=4 (FSDP).
+# 8 experts, top-2: ~4B total params, ~1.8B active per token.
+# All layers MoE (moe_frequency=1).
+#
+# Usage:
+#   srun --nodes=8 --ntasks-per-node=4 --gpus-per-node=4 \
+#     uv run python scripts/train.py configs/train/moe_ep_32gpu.toml
+
+[model]
+dim = 2048
+n_layers = 24
+n_heads = 16
+n_kv_heads = 4
+vocab_size = 128256
+ffn_dim_multiplier = 1.3
+max_seq_len = 4096
+rope_theta = 500000.0
+num_experts = 8
+moe_top_k = 2
+moe_frequency = 1
+moe_router = "softmax_topk"
+moe_aux_loss_weight = 0.01
+moe_capacity_factor = 0.0
+
+[train]
+batch_size = 12
+seq_len = 4096
+max_steps = 20
+grad_accum_steps = 1
+grad_clip_norm = 1.0
+compile_model = false
+mixed_precision = "bf16"
+activation_checkpointing = "full"
+
+[optimizer]
+name = "adamw"
+lr = 3e-4
+weight_decay = 0.1
+betas = [0.9, 0.95]
+eps = 1e-8
+fused = true
+
+[scheduler]
+name = "cosine"
+warmup_steps = 5
+min_lr_ratio = 0.1
+
+[data]
+dataset_path = "/n/holylfs06/LABS/kempner_shared/Everyone/testbed/text/fineweb-edu/tokenized/meta-llama-3/default"
+file_pattern = "tokenized_*.bin"
+num_workers = 4
+pin_memory = true
+prefetch_factor = 2
+
+[distributed]
+tp = 4
+ep = 2
+dp_shard = 4
+nccl_timeout_sec = 600
+
+[checkpoint]
+dir = "checkpoints/moe_ep_32gpu"
+interval = 50
+keep_last_n = 2
+
+[metrics]
+log_interval = 1
+enable_wandb = false
+enable_tensorboard = false
