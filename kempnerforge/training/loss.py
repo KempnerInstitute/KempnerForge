@@ -1,6 +1,14 @@
-"""Loss function registry for KempnerForge."""
+"""Loss function registry for KempnerForge.
+
+Registers loss functions and provides build_loss_fn() to compose them
+with config-driven options (chunk size, z-loss). Follows the same
+builder pattern as build_optimizer.
+"""
 
 from __future__ import annotations
+
+import functools
+from collections.abc import Callable
 
 import torch
 import torch.nn.functional as F
@@ -75,3 +83,28 @@ def z_loss(logits: torch.Tensor, weight: float) -> torch.Tensor:
     flat = logits.view(-1, logits.shape[-1]).float()
     lse = torch.logsumexp(flat, dim=-1)
     return weight * (lse**2).mean()
+
+
+def build_loss_fn(config) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
+    """Build a composed loss function from training config.
+
+    Follows the build_optimizer pattern: config in, callable out.
+    Binds chunk_size for chunked CE and composes z-loss, so the caller
+    gets a clean ``(logits, labels) -> Tensor`` interface.
+    """
+    base_fn = registry.get_loss(config.loss_fn)
+
+    if config.loss_fn == "chunked_cross_entropy":
+        chunk_size = config.ce_chunk_size if config.ce_chunk_size > 0 else 4096
+        base_fn = functools.partial(base_fn, chunk_size=chunk_size)
+
+    if config.z_loss_weight > 0:
+        z_weight = config.z_loss_weight
+        _inner = base_fn
+
+        def composed(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+            return _inner(logits, labels) + z_loss(logits, z_weight)
+
+        return composed
+
+    return base_fn

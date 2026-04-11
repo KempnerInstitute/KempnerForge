@@ -35,24 +35,28 @@ class AsyncCheckpointer:
         self.mode = mode
         self._pending_future: Any = None
 
-    def save(self, state_dict: dict, checkpoint_id: str) -> None:
+    def save(self, state_dict: dict, checkpoint_id: str, process_group=None) -> None:
         """Save distributed state, potentially asynchronously.
 
         Args:
             state_dict: DCP-compatible state dict (model + optimizer).
             checkpoint_id: Checkpoint directory path.
+            process_group: Process group for DCP. Required for PP where each
+                stage has a different state dict — pass a group scoped to ranks
+                within the same PP stage. None uses the default global group.
         """
         # Wait for any pending async save to complete first
         self.wait()
 
         if self.mode == AsyncCheckpointMode.disabled:
-            dcp.save(state_dict, checkpoint_id=checkpoint_id)
+            dcp.save(state_dict, checkpoint_id=checkpoint_id, process_group=process_group)
             logger.info(f"Sync checkpoint saved: {checkpoint_id}")
 
         elif self.mode in (AsyncCheckpointMode.async_, AsyncCheckpointMode.async_pinned):
             self._pending_future = dcp.async_save(
                 state_dict,
                 checkpoint_id=checkpoint_id,
+                process_group=process_group,
             )
             logger.info(f"Async checkpoint started: {checkpoint_id}")
 

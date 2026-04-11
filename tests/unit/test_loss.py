@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import torch
 
+from kempnerforge.config.schema import TrainConfig
 from kempnerforge.training.loss import (
+    build_loss_fn,
     chunked_cross_entropy_loss,
     cross_entropy_loss,
     z_loss,
@@ -130,3 +132,49 @@ class TestZLoss:
         logits = torch.randn(2, 8, 100)
         result = z_loss(logits, weight=1e-4)
         assert result.item() > 0
+
+
+class TestBuildLossFn:
+    def test_standard_ce(self):
+        config = TrainConfig(loss_fn="cross_entropy")
+        fn = build_loss_fn(config)
+        logits = torch.randn(2, 8, 100)
+        labels = torch.randint(0, 100, (2, 8))
+        loss = fn(logits, labels)
+        torch.testing.assert_close(loss, cross_entropy_loss(logits, labels))
+
+    def test_chunked_ce_binds_chunk_size(self):
+        config = TrainConfig(loss_fn="chunked_cross_entropy", ce_chunk_size=16)
+        fn = build_loss_fn(config)
+        logits = torch.randn(4, 32, 256)
+        labels = torch.randint(0, 256, (4, 32))
+        expected = chunked_cross_entropy_loss(logits, labels, chunk_size=16)
+        torch.testing.assert_close(fn(logits, labels), expected)
+
+    def test_chunked_ce_default_chunk_size(self):
+        """ce_chunk_size=0 should default to 4096."""
+        config = TrainConfig(loss_fn="chunked_cross_entropy", ce_chunk_size=0)
+        fn = build_loss_fn(config)
+        logits = torch.randn(2, 8, 50)
+        labels = torch.randint(0, 50, (2, 8))
+        expected = chunked_cross_entropy_loss(logits, labels, chunk_size=4096)
+        torch.testing.assert_close(fn(logits, labels), expected)
+
+    def test_composes_z_loss(self):
+        config = TrainConfig(loss_fn="cross_entropy", z_loss_weight=1e-4)
+        fn = build_loss_fn(config)
+        logits = torch.randn(2, 8, 100)
+        labels = torch.randint(0, 100, (2, 8))
+        result = fn(logits, labels)
+        base = cross_entropy_loss(logits, labels)
+        z = z_loss(logits, 1e-4)
+        torch.testing.assert_close(result, base + z)
+
+    def test_z_loss_not_added_when_zero(self):
+        config = TrainConfig(loss_fn="cross_entropy", z_loss_weight=0.0)
+        fn = build_loss_fn(config)
+        logits = torch.randn(2, 8, 100)
+        labels = torch.randint(0, 100, (2, 8))
+        result = fn(logits, labels)
+        base = cross_entropy_loss(logits, labels)
+        torch.testing.assert_close(result, base)

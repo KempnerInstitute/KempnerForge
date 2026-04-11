@@ -49,6 +49,8 @@ class CheckpointManager:
         config: CheckpointConfig,
         model: torch.nn.Module,
         optimizer: torch.optim.Optimizer,
+        process_group=None,
+        pp_rank: int | None = None,
     ) -> None:
         self.config = config
         self.model = model
@@ -56,6 +58,8 @@ class CheckpointManager:
         self.base_dir = Path(config.dir)
         self._rank = dist.get_rank() if dist.is_initialized() else 0
         self._async_ckpt = AsyncCheckpointer(mode=config.async_mode)
+        self._process_group = process_group
+        self._pp_rank = pp_rank
 
     def _checkpoint_dir(self, step: int) -> Path:
         return self.base_dir / f"step_{step}"
@@ -85,12 +89,19 @@ class CheckpointManager:
         # Create directory (all ranks)
         ckpt_dir.mkdir(parents=True, exist_ok=True)
 
+        # With PP, each stage has different parameters — save DCP shards to
+        # a per-stage subdirectory to avoid .metadata file collisions.
+        dcp_dir = ckpt_dir / f"pp{self._pp_rank}" if self._pp_rank is not None else ckpt_dir
+        dcp_dir.mkdir(parents=True, exist_ok=True)
+
         # Save distributed state (model + optimizer) via DCP
         dcp_state = {
             "model": self.model.state_dict(),
             "optimizer": self.optimizer.state_dict(),
         }
-        self._async_ckpt.save(dcp_state, checkpoint_id=str(ckpt_dir))
+        self._async_ckpt.save(
+            dcp_state, checkpoint_id=str(dcp_dir), process_group=self._process_group
+        )
 
         # Save non-distributed state (rank 0 only)
         if self._rank == 0:
@@ -150,6 +161,8 @@ class CheckpointManager:
         logger.info(f"Loading checkpoint: {ckpt_dir}")
 
         # Load distributed state via DCP
+        dcp_dir = ckpt_dir / f"pp{self._pp_rank}" if self._pp_rank is not None else ckpt_dir
+
         dcp_state: dict[str, Any] = {}
         if exclude_keys is None or "model" not in exclude_keys:
             dcp_state["model"] = self.model.state_dict()
@@ -157,7 +170,7 @@ class CheckpointManager:
             dcp_state["optimizer"] = self.optimizer.state_dict()
 
         if dcp_state:
-            dcp.load(dcp_state, checkpoint_id=str(ckpt_dir))
+            dcp.load(dcp_state, checkpoint_id=str(dcp_dir), process_group=self._process_group)
 
             if "model" in dcp_state:
                 self.model.load_state_dict(dcp_state["model"])

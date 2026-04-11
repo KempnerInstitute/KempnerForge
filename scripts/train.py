@@ -28,7 +28,6 @@ import torch.distributed as dist
 
 from kempnerforge.checkpoint.manager import CheckpointManager
 from kempnerforge.config.loader import load_config
-from kempnerforge.config.registry import registry
 from kempnerforge.data.dataloader import StatefulDataLoader
 from kempnerforge.data.dataset import MemoryMappedDataset
 from kempnerforge.data.sampler import DistributedSampler
@@ -48,12 +47,7 @@ from kempnerforge.profiling.profiler import build_profiler, print_profiler_summa
 from kempnerforge.resilience.elastic import log_job_info, resolve_resume_path
 from kempnerforge.resilience.health import NaNDetector, check_nccl_health
 from kempnerforge.resilience.signal_handler import ShutdownHandler
-from kempnerforge.training.grad import maybe_no_sync
-from kempnerforge.training.loss import chunked_cross_entropy_loss as _cce  # noqa: F401
-from kempnerforge.training.loss import cross_entropy_loss as _  # noqa: F401 — triggers registration
-from kempnerforge.training.loss import z_loss
-from kempnerforge.training.optimizer import build_optimizer
-from kempnerforge.training.scheduler import build_scheduler
+from kempnerforge.training import build_loss_fn, build_optimizer, build_scheduler, maybe_no_sync
 
 logger = get_logger(__name__)
 
@@ -163,14 +157,7 @@ def main() -> None:
     mp_policy = default_mp_policy(tc.param_dtype)
 
     # --- Loss function ---
-    _base_loss_fn = registry.get_loss(tc.loss_fn)
-    if tc.loss_fn == "chunked_cross_entropy":
-        chunk_size = tc.ce_chunk_size or 4096
-
-        def loss_fn(logits, labels):
-            return _base_loss_fn(logits, labels, chunk_size=chunk_size)
-    else:
-        loss_fn = _base_loss_fn
+    loss_fn = build_loss_fn(tc)
 
     # --- Model ---
     if pp_enabled:
@@ -251,7 +238,22 @@ def main() -> None:
     scheduler = build_scheduler(optimizer, config.scheduler, max_steps=tc.max_steps)
 
     # --- Checkpoint ---
-    ckpt_mgr = CheckpointManager(config.checkpoint, model, optimizer)
+    # With PP, each stage has different parameters — DCP needs a group scoped
+    # to ranks within the same PP stage (all non-PP mesh dimensions), and each
+    # stage saves DCP shards to its own subdirectory to avoid file collisions.
+    ckpt_pg = None
+    ckpt_pp_rank = None
+    if pp_enabled and device_mesh is not None:
+        ckpt_pp_rank = pp_rank
+        non_pp_dims = [d for d in device_mesh.mesh_dim_names if d != "pp"]
+        if len(non_pp_dims) == 1:
+            ckpt_pg = device_mesh[non_pp_dims[0]].get_group()
+        elif len(non_pp_dims) > 1:
+            ckpt_pg = device_mesh[tuple(non_pp_dims)].get_group()
+    ckpt_mgr = CheckpointManager(
+        config.checkpoint, model, optimizer,
+        process_group=ckpt_pg, pp_rank=ckpt_pp_rank,
+    )
 
     # Auto-resume
     resume_path = resolve_resume_path(config.checkpoint.dir)
@@ -538,10 +540,6 @@ def main() -> None:
                 with maybe_no_sync(model, micro_step, tc.grad_accum_steps):
                     logits = model(input_ids)
                     loss = loss_fn(logits, labels)
-
-                    # Z-loss: logit magnitude regularizer (PaLM/Gemini)
-                    if tc.z_loss_weight > 0:
-                        loss = loss + z_loss(logits, tc.z_loss_weight)
 
                     # MoE auxiliary loss (no-op for dense: returns 0.0)
                     if mc.is_moe:
