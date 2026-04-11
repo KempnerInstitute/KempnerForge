@@ -1,0 +1,64 @@
+# Llama-3 7B — 16 GPUs (4 nodes × 4), Muon + z-loss + chunked CE.
+# Tests all three new training components together at scale.
+#
+# Usage:
+#   srun --nodes=4 --ntasks-per-node=4 --gpus-per-node=4 \
+#     uv run python scripts/train.py configs/train/7b_16gpu_muon.toml
+
+[model]
+dim = 4096
+n_layers = 32
+n_heads = 32
+n_kv_heads = 8
+vocab_size = 128256
+ffn_dim_multiplier = 1.3
+max_seq_len = 4096
+rope_theta = 500000.0
+
+[train]
+batch_size = 4
+seq_len = 4096
+max_steps = 50
+grad_accum_steps = 4
+grad_clip_norm = 1.0
+seed = 42
+compile_model = true
+mixed_precision = "bf16"
+activation_checkpointing = "full"
+loss_fn = "chunked_cross_entropy"
+ce_chunk_size = 4096
+z_loss_weight = 1e-4
+
+[optimizer]
+name = "muon"
+lr = 0.003
+weight_decay = 0.1
+muon_momentum = 0.95
+muon_ns_steps = 5
+
+[scheduler]
+name = "cosine"
+warmup_steps = 10
+min_lr_ratio = 0.1
+
+[data]
+dataset_path = "/n/holylfs06/LABS/kempner_shared/Everyone/testbed/text/fineweb-edu/tokenized/meta-llama-3/default"
+file_pattern = "tokenized_*.bin"
+num_workers = 4
+pin_memory = true
+prefetch_factor = 2
+
+[distributed]
+dp_shard = -1
+nccl_timeout_sec = 600
+
+[checkpoint]
+dir = "checkpoints/7b_16gpu_muon"
+interval = 25
+async_mode = "async_with_pinned_mem"
+keep_last_n = 2
+
+[metrics]
+log_interval = 1
+enable_wandb = true
+wandb_project = "kempnerforge"
