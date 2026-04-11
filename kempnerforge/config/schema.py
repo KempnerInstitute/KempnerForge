@@ -188,6 +188,8 @@ class TrainConfig:
     mixed_precision: Literal["bf16", "fp16", "fp32", "fp8"] = "bf16"
     activation_checkpointing: ActivationCheckpointing = ActivationCheckpointing.none
     loss_fn: str = "cross_entropy"  # Registry key for loss function
+    z_loss_weight: float = 0.0  # Logit magnitude regularizer (PaLM uses 1e-4, 0=disabled)
+    ce_chunk_size: int = 0  # Token chunk size for chunked_cross_entropy (0=auto 4096)
     shutdown_timeout_sec: float = 600.0  # Graceful shutdown timeout before forced exit
     nccl_health_check_interval: int = 0  # Check NCCL health every N steps (0=disabled)
 
@@ -240,6 +242,10 @@ class OptimizerConfig:
     betas: tuple[float, float] = (0.9, 0.95)
     eps: float = 1e-8
     fused: bool = True  # Use fused AdamW when available
+    # Muon-specific
+    muon_momentum: float = 0.95  # Momentum coefficient for Muon
+    muon_ns_steps: int = 5  # Newton-Schulz iteration steps for Muon
+    muon_adam_lr: float | None = None  # LR for 1D params in Muon's AdamW fallback; None=same as lr
 
     def __post_init__(self) -> None:
         if self.lr <= 0:

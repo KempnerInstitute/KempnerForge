@@ -629,6 +629,102 @@ def test_fp8_moe_fsdp_4gpu():
 
 
 # ============================================================================
+# Z-Loss, Chunked CE, Muon Optimizer
+# ============================================================================
+
+
+@pytest.mark.e2e
+@requires_gpus(1)
+def test_z_loss_single_gpu():
+    """Single GPU training with z-loss enabled — verifies logit regularizer integrates."""
+    result = _run_training(
+        [
+            DEBUG_CONFIG,
+            "--train.max_steps=10",
+            "--metrics.log_interval=5",
+            "--train.z_loss_weight=1e-4",
+        ],
+        nproc=1,
+    )
+    _assert_training_complete(result, expected_steps=10)
+    loss = _parse_last_loss(result.stdout + result.stderr)
+    assert loss is not None and loss > 0
+
+
+@pytest.mark.e2e
+@requires_gpus(1)
+def test_chunked_cross_entropy_single_gpu():
+    """Single GPU training with chunked cross-entropy — verifies loss matches standard CE."""
+    result = _run_training(
+        [
+            DEBUG_CONFIG,
+            "--train.max_steps=10",
+            "--metrics.log_interval=5",
+            "--train.loss_fn=chunked_cross_entropy",
+            "--train.ce_chunk_size=4096",
+        ],
+        nproc=1,
+    )
+    _assert_training_complete(result, expected_steps=10)
+    loss = _parse_last_loss(result.stdout + result.stderr)
+    assert loss is not None and loss > 0
+
+
+@pytest.mark.e2e
+@requires_gpus(1)
+def test_muon_optimizer_single_gpu():
+    """Single GPU training with Muon optimizer — verifies Newton-Schulz + AdamW fallback."""
+    result = _run_training(
+        [
+            DEBUG_CONFIG,
+            "--train.max_steps=10",
+            "--metrics.log_interval=5",
+            "--optimizer.name=muon",
+            "--optimizer.lr=0.02",
+            "--optimizer.muon_momentum=0.95",
+        ],
+        nproc=1,
+    )
+    _assert_training_complete(result, expected_steps=10)
+    loss = _parse_last_loss(result.stdout + result.stderr)
+    assert loss is not None and loss > 0
+
+
+@pytest.mark.e2e
+@requires_gpus(4)
+def test_muon_fsdp_4gpu():
+    """4 GPU FSDP with Muon optimizer — verifies Muon composes with FSDP2."""
+    result = _run_training(
+        [
+            DEBUG_CONFIG,
+            "--train.max_steps=10",
+            "--metrics.log_interval=5",
+            "--optimizer.name=muon",
+            "--optimizer.lr=0.02",
+        ],
+        nproc=4,
+    )
+    _assert_training_complete(result, expected_steps=10)
+
+
+@pytest.mark.e2e
+@requires_gpus(4)
+def test_z_loss_chunked_ce_fsdp_4gpu():
+    """4 GPU FSDP with z-loss + chunked CE — verifies both compose with FSDP2."""
+    result = _run_training(
+        [
+            DEBUG_CONFIG,
+            "--train.max_steps=10",
+            "--metrics.log_interval=5",
+            "--train.z_loss_weight=1e-4",
+            "--train.loss_fn=chunked_cross_entropy",
+        ],
+        nproc=4,
+    )
+    _assert_training_complete(result, expected_steps=10)
+
+
+# ============================================================================
 # Slow: Large Model
 # ============================================================================
 

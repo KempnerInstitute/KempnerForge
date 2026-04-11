@@ -49,7 +49,9 @@ from kempnerforge.resilience.elastic import log_job_info, resolve_resume_path
 from kempnerforge.resilience.health import NaNDetector, check_nccl_health
 from kempnerforge.resilience.signal_handler import ShutdownHandler
 from kempnerforge.training.grad import maybe_no_sync
+from kempnerforge.training.loss import chunked_cross_entropy_loss as _cce  # noqa: F401
 from kempnerforge.training.loss import cross_entropy_loss as _  # noqa: F401 — triggers registration
+from kempnerforge.training.loss import z_loss
 from kempnerforge.training.optimizer import build_optimizer
 from kempnerforge.training.scheduler import build_scheduler
 
@@ -161,7 +163,14 @@ def main() -> None:
     mp_policy = default_mp_policy(tc.param_dtype)
 
     # --- Loss function ---
-    loss_fn = registry.get_loss(tc.loss_fn)
+    _base_loss_fn = registry.get_loss(tc.loss_fn)
+    if tc.loss_fn == "chunked_cross_entropy":
+        chunk_size = tc.ce_chunk_size or 4096
+
+        def loss_fn(logits, labels):
+            return _base_loss_fn(logits, labels, chunk_size=chunk_size)
+    else:
+        loss_fn = _base_loss_fn
 
     # --- Model ---
     if pp_enabled:
@@ -529,6 +538,10 @@ def main() -> None:
                 with maybe_no_sync(model, micro_step, tc.grad_accum_steps):
                     logits = model(input_ids)
                     loss = loss_fn(logits, labels)
+
+                    # Z-loss: logit magnitude regularizer (PaLM/Gemini)
+                    if tc.z_loss_weight > 0:
+                        loss = loss + z_loss(logits, tc.z_loss_weight)
 
                     # MoE auxiliary loss (no-op for dense: returns 0.0)
                     if mc.is_moe:
