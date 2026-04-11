@@ -12,6 +12,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from kempnerforge.model.norm import RMSNorm
 from kempnerforge.model.position import apply_rope
 
 
@@ -70,6 +71,7 @@ class Attention(nn.Module):
         n_heads: int,
         n_kv_heads: int,
         head_dim: int | None = None,
+        qk_norm: bool = False,
     ) -> None:
         super().__init__()
         self.n_heads = n_heads
@@ -82,6 +84,10 @@ class Attention(nn.Module):
         self.k_proj = nn.Linear(dim, n_kv_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(dim, n_kv_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(n_heads * self.head_dim, dim, bias=False)
+
+        # Per-head QK normalization (Gemma, DeepSeek-V3)
+        self.q_norm = RMSNorm(self.head_dim) if qk_norm else None
+        self.k_norm = RMSNorm(self.head_dim) if qk_norm else None
 
     def forward(
         self,
@@ -110,6 +116,11 @@ class Attention(nn.Module):
         q = self.q_proj(x).view(batch, seq_len, -1, self.head_dim)
         k = self.k_proj(x).view(batch, seq_len, -1, self.head_dim)
         v = self.v_proj(x).view(batch, seq_len, -1, self.head_dim)
+
+        # QK-Norm: normalize Q and K per-head before RoPE (stabilizes attention logits)
+        if self.q_norm is not None:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
 
         # Transpose to (batch, heads, seq_len, head_dim) for SDPA
         q = q.transpose(1, 2)

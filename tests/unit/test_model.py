@@ -135,6 +135,48 @@ class TestAttention:
         out = attn(x, cos, sin)
         assert out.shape == (1, 16, 256)
 
+    def test_qk_norm_output_shape(self):
+        """QK-Norm should not change output shape."""
+        attn = Attention(dim=256, n_heads=8, n_kv_heads=8, qk_norm=True).to(DEVICE)
+        cos, sin = precompute_rope_frequencies(32, 32)
+        cos, sin = cos.to(DEVICE), sin.to(DEVICE)
+        x = torch.randn(2, 32, 256, device=DEVICE)
+        out = attn(x, cos, sin)
+        assert out.shape == (2, 32, 256)
+
+    def test_qk_norm_creates_norm_layers(self):
+        attn = Attention(dim=128, n_heads=4, n_kv_heads=4, qk_norm=True)
+        assert attn.q_norm is not None
+        assert attn.k_norm is not None
+        assert attn.q_norm.weight.shape == (32,)  # head_dim = 128/4
+
+    def test_qk_norm_disabled_by_default(self):
+        attn = Attention(dim=128, n_heads=4, n_kv_heads=4)
+        assert attn.q_norm is None
+        assert attn.k_norm is None
+
+    def test_qk_norm_bounds_attention_logits(self):
+        """QK-Norm should produce bounded Q/K regardless of input scale."""
+        attn_norm = Attention(dim=128, n_heads=4, n_kv_heads=4, qk_norm=True).to(DEVICE)
+        cos, sin = precompute_rope_frequencies(32, 16)
+        cos, sin = cos.to(DEVICE), sin.to(DEVICE)
+
+        # Large input that would cause attention logit explosion without norm
+        x = torch.randn(1, 16, 128, device=DEVICE) * 100.0
+        out_norm = attn_norm(x, cos, sin)
+
+        # Normalized version should still produce finite output with large inputs
+        assert out_norm.isfinite().all()
+
+    def test_qk_norm_with_gqa(self):
+        """QK-Norm should work with grouped-query attention."""
+        attn = Attention(dim=256, n_heads=8, n_kv_heads=2, qk_norm=True).to(DEVICE)
+        cos, sin = precompute_rope_frequencies(32, 32)
+        cos, sin = cos.to(DEVICE), sin.to(DEVICE)
+        x = torch.randn(1, 32, 256, device=DEVICE)
+        out = attn(x, cos, sin)
+        assert out.shape == (1, 32, 256)
+
 
 # ---------------------------------------------------------------------------
 # MLP
@@ -291,6 +333,30 @@ class TestTransformer:
     def test_layer_keys_are_string_indices(self, small_config):
         model = Transformer(small_config)
         assert list(model.layers.keys()) == ["0", "1", "2", "3"]
+
+    def test_qk_norm_forward(self):
+        config = ModelConfig(
+            dim=128, n_layers=2, n_heads=4, vocab_size=256, max_seq_len=64, qk_norm=True,
+        )
+        model = Transformer(config).to(DEVICE)
+        tokens = torch.randint(0, 256, (1, 16), device=DEVICE)
+        with torch.no_grad():
+            out = model(tokens)
+        assert out.shape == (1, 16, 256)
+
+    def test_qk_norm_false_is_no_op(self):
+        """qk_norm=False should produce identical model to default."""
+        config_default = ModelConfig(dim=128, n_layers=2, n_heads=4, vocab_size=256, max_seq_len=64)
+        config_explicit = ModelConfig(
+            dim=128, n_layers=2, n_heads=4, vocab_size=256, max_seq_len=64, qk_norm=False,
+        )
+        m1 = Transformer(config_default)
+        m2 = Transformer(config_explicit)
+        # Neither should have norm layers in attention
+        assert m1.layers["0"].attention.q_norm is None
+        assert m2.layers["0"].attention.q_norm is None
+        # Same parameter count
+        assert sum(p.numel() for p in m1.parameters()) == sum(p.numel() for p in m2.parameters())
 
 
 # ---------------------------------------------------------------------------

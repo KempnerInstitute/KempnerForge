@@ -76,6 +76,7 @@ class ModelConfig:
     max_seq_len: int = 2048
     rope_theta: float = 10000.0
     tie_embeddings: bool = False
+    qk_norm: bool = False  # Apply RMSNorm to Q/K per-head before RoPE (Gemma, DeepSeek-V3)
     init_std: float = 0.02  # Std for weight initialization (GPT-2/Llama default)
     model_type: str = "transformer"  # Registry key for model builder
 
