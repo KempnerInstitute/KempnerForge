@@ -53,4 +53,5 @@ markers = [
     "distributed: requires multiple GPUs",
     "slow: long-running test",
     "e2e: end-to-end training tests (run with --e2e)",
+    "smoke: smoke tests across parallelism configs (run with --smoke)",
 ]

@@ -23,20 +23,25 @@ from kempnerforge.config.schema import (
 def pytest_addoption(parser):
     parser.addoption("--e2e", action="store_true", default=False, help="Run end-to-end tests")
     parser.addoption("--slow", action="store_true", default=False, help="Include slow e2e tests")
+    parser.addoption("--smoke", action="store_true", default=False, help="Run smoke tests")
 
 
 def pytest_collection_modifyitems(config, items):
     run_e2e = config.getoption("--e2e")
     run_slow = config.getoption("--slow")
+    run_smoke = config.getoption("--smoke")
 
     skip_e2e = pytest.mark.skip(reason="E2E tests disabled (pass --e2e to run)")
     skip_slow = pytest.mark.skip(reason="Slow tests disabled (pass --slow to run)")
+    skip_smoke = pytest.mark.skip(reason="Smoke tests disabled (pass --smoke to run)")
 
     for item in items:
         if "e2e" in item.keywords and not run_e2e:
             item.add_marker(skip_e2e)
         elif "slow" in item.keywords and not run_slow:
             item.add_marker(skip_slow)
+        elif "smoke" in item.keywords and not run_smoke:
+            item.add_marker(skip_smoke)
 
 
 # ---------------------------------------------------------------------------
