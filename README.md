@@ -18,6 +18,8 @@ PyTorch-native framework for fault-tolerant distributed training of foundation m
 - **FP8 Mixed Precision** — E4M3/E5M2 via torchao with FSDP2 float8 all-gather
 
 **Training**
+- Optimizers: AdamW and Muon (Newton-Schulz orthogonalized momentum for 2D weights)
+- Loss functions: cross-entropy, chunked cross-entropy (token-dimension chunking), z-loss regularizer
 - Distributed checkpointing (DCP) with async save and auto-resume
 - Stateful data pipeline with memory-mapped datasets and exact mid-epoch resumption
 - HuggingFace dataset integration (eager and streaming)
@@ -52,6 +54,9 @@ sbatch scripts/slurm/singlenode.sh configs/train/7b.toml
 
 # SLURM (multi-node)
 sbatch --nodes=4 scripts/slurm/multinode.sh configs/train/7b.toml
+
+# SLURM (kempner_requeue — preemption-resilient, auto-resume)
+sbatch scripts/slurm/7b_requeue.sh
 ```
 
 ## Training Configurations
@@ -119,6 +124,8 @@ srun --nodes=4 --ntasks-per-node=4 --gpus-per-node=4 \
 | `debug.toml` | Dense | 20M | FSDP | 1-4 |
 | `debug_moe.toml` | MoE (4 experts) | 23M | FSDP | 1-4 |
 | `7b.toml` | Dense | 7B | FSDP | 4+ |
+| `7b_16gpu_adamw.toml` | Dense | 7B | FSDP | 16 |
+| `7b_16gpu_muon.toml` | Dense | 7B | FSDP (Muon) | 16 |
 | `7b_16gpu_fp8.toml` | Dense | 7B | FP8, FSDP | 16 |
 | `7b_32gpu_fsdp.toml` | Dense | 7B | FSDP | 32 |
 | `7b_12gpu_tp4.toml` | Dense | 7B | TP=4, FSDP=3 | 12 |
@@ -150,6 +157,9 @@ Key config options:
 - `distributed.pp` — pipeline parallelism degree (default 1)
 - `model.num_experts` — number of MoE experts (0 = dense model)
 - `model.moe_router` — `"softmax_topk"` or `"sigmoid_topk"` (DeepSeek-V3 style)
+- `optimizer.name` — `"adamw"` or `"muon"` (default `"adamw"`)
+- `train.z_loss_weight` — z-loss regularization weight (0 = disabled, PaLM uses 1e-4)
+- `train.ce_chunk_size` — token chunk size for chunked cross-entropy (0 = auto 4096)
 - `checkpoint.async_mode` — `"disabled"`, `"async"`, or `"async_with_pinned_mem"`
 
 ## Data
@@ -180,14 +190,14 @@ kempnerforge/
   model/       — Transformer, attention, MLP, MoE, routers, norms, RoPE, embeddings
   distributed/ — DeviceMesh, FSDP2, tensor/expert/pipeline parallelism, FP8
   data/        — MemoryMappedDataset, StatefulDataLoader, DistributedSampler
-  training/    — Optimizer (AdamW), LR schedulers (cosine/linear/WSD), gradient utils
+  training/    — Optimizers (AdamW, Muon), loss functions, LR schedulers, gradient utils
   checkpoint/  — DCP-based distributed checkpointing with sync/async save
   resilience/  — Signal handling, NaN detection, GPU/NCCL health checks
   metrics/     — MetricsTracker, MFU computation, WandB/TensorBoard backends
   profiling/   — torch.profiler integration, CUDA timing
 configs/       — TOML configs for training runs and model architecture presets
 scripts/       — Training entry point, data validation, checkpoint conversion, SLURM launch
-tests/         — Unit (436), integration, distributed, and end-to-end tests
+tests/         — Unit (472), integration, distributed, and end-to-end tests
 ```
 
 ## Testing
@@ -236,6 +246,11 @@ E2E tests launch full training runs as subprocesses and verify they complete suc
 | HF streaming | — | 1, 4 | HuggingFace streaming dataset |
 | Checkpoint resume | dp_shard=4, save+load | 4 | DCP save, auto-resume from checkpoint |
 | PP checkpoint | pp=2, dp_shard=2 | 4 | Pipeline parallel checkpoint/resume |
+| Z-loss | — | 1 | Z-loss regularizer via build_loss_fn |
+| Chunked CE | — | 1 | Token-chunked cross-entropy |
+| Muon single GPU | — | 1 | Muon optimizer, Newton-Schulz updates |
+| Muon + FSDP | dp_shard=4 | 4 | Muon with DTensor momentum buffers |
+| Z-loss + chunked CE + FSDP | dp_shard=4 | 4 | Combined loss composition |
 | SIGTERM | — | 1 | Graceful shutdown, emergency checkpoint |
 | 7B model (`--slow`) | tp=2, dp_shard=2, compile | 4 | Full production path |
 
