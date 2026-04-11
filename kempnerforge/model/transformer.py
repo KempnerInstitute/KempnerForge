@@ -16,7 +16,7 @@ import torch.nn as nn
 
 from kempnerforge.config.registry import registry
 from kempnerforge.config.schema import ModelConfig
-from kempnerforge.model.attention import Attention
+from kempnerforge.model.attention import Attention, KVCache
 from kempnerforge.model.embedding import OutputHead, TokenEmbedding
 from kempnerforge.model.init import init_weights
 from kempnerforge.model.mlp import build_mlp
@@ -71,9 +71,11 @@ class TransformerBlock(nn.Module):
         x: torch.Tensor,
         rope_cos: torch.Tensor,
         rope_sin: torch.Tensor,
+        *,
+        kv_cache: KVCache | None = None,
     ) -> torch.Tensor:
         # Pre-norm attention with residual
-        x = x + self.attention(self.attention_norm(x), rope_cos, rope_sin)
+        x = x + self.attention(self.attention_norm(x), rope_cos, rope_sin, kv_cache=kv_cache)
         # Pre-norm MLP with residual
         x = x + self.mlp(self.mlp_norm(x))
         return x
@@ -155,11 +157,16 @@ class Transformer(nn.Module):
     def forward(
         self,
         tokens: torch.Tensor,
+        *,
+        kv_caches: list[KVCache] | None = None,
     ) -> torch.Tensor:
         """Forward pass.
 
         Args:
             tokens: Integer tensor of shape (batch, seq_len).
+            kv_caches: Optional list of KVCache (one per layer) for generation.
+                When provided, RoPE positions are offset by the current cache
+                fill level so incremental decode tokens get correct positions.
 
         Returns:
             Logits tensor of shape (batch, seq_len, vocab_size).
@@ -169,16 +176,20 @@ class Transformer(nn.Module):
         # Embed tokens (PP middle stages receive hidden states directly)
         h = self.token_embedding(tokens) if self.token_embedding is not None else tokens
 
-        # Slice RoPE frequencies for current sequence length (device transfer cached)
+        # Determine position offset from KV cache fill level
+        start_pos = kv_caches[0].seq_len if kv_caches is not None else 0
+
+        # Slice RoPE frequencies for current positions (device transfer cached)
         if self._rope_cos.device != h.device:
             self._rope_cos = self._rope_cos.to(h.device)
             self._rope_sin = self._rope_sin.to(h.device)
-        cos = self._rope_cos[:seq_len]
-        sin = self._rope_sin[:seq_len]
+        cos = self._rope_cos[start_pos : start_pos + seq_len]
+        sin = self._rope_sin[start_pos : start_pos + seq_len]
 
         # Transformer blocks
-        for layer in self.layers.values():
-            h = layer(h, cos, sin)
+        for i, layer in enumerate(self.layers.values()):
+            cache = kv_caches[i] if kv_caches is not None else None
+            h = layer(h, cos, sin, kv_cache=cache)
 
         # Final norm
         h = self.norm(h)

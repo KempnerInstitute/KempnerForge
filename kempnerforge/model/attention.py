@@ -15,6 +15,52 @@ import torch.nn.functional as F
 from kempnerforge.model.position import apply_rope
 
 
+class KVCache:
+    """Pre-allocated KV cache for autoregressive generation.
+
+    Stores key and value tensors for all previous positions, enabling
+    incremental decoding without recomputing attention over the full sequence.
+    Keys are stored after RoPE application but before GQA expansion.
+    """
+
+    def __init__(
+        self,
+        batch_size: int,
+        max_seq_len: int,
+        n_kv_heads: int,
+        head_dim: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> None:
+        self.k = torch.zeros(
+            batch_size, n_kv_heads, max_seq_len, head_dim, dtype=dtype, device=device
+        )
+        self.v = torch.zeros(
+            batch_size, n_kv_heads, max_seq_len, head_dim, dtype=dtype, device=device
+        )
+        self.seq_len = 0
+
+    def update(
+        self, k_new: torch.Tensor, v_new: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Append new key/value entries and return full cached tensors.
+
+        Args:
+            k_new: New keys, shape (batch, n_kv_heads, new_seq_len, head_dim).
+            v_new: New values, shape (batch, n_kv_heads, new_seq_len, head_dim).
+
+        Returns:
+            Tuple of (all_keys, all_values), each
+            (batch, n_kv_heads, total_seq_len, head_dim).
+        """
+        new_len = k_new.shape[2]
+        end = self.seq_len + new_len
+        self.k[:, :, self.seq_len : end] = k_new
+        self.v[:, :, self.seq_len : end] = v_new
+        self.seq_len = end
+        return self.k[:, :, :end], self.v[:, :, :end]
+
+
 class Attention(nn.Module):
     """Grouped-Query Attention with RoPE and SDPA."""
 
@@ -42,6 +88,8 @@ class Attention(nn.Module):
         x: torch.Tensor,
         rope_cos: torch.Tensor,
         rope_sin: torch.Tensor,
+        *,
+        kv_cache: KVCache | None = None,
     ) -> torch.Tensor:
         """Forward pass.
 
@@ -49,6 +97,7 @@ class Attention(nn.Module):
             x: Input tensor of shape (batch, seq_len, dim).
             rope_cos: RoPE cosine frequencies, shape (seq_len, head_dim // 2).
             rope_sin: RoPE sine frequencies, shape (seq_len, head_dim // 2).
+            kv_cache: Optional KV cache for incremental generation.
 
         Returns:
             Output tensor of shape (batch, seq_len, dim).
@@ -71,13 +120,23 @@ class Attention(nn.Module):
         q = apply_rope(q, rope_cos, rope_sin)
         k = apply_rope(k, rope_cos, rope_sin)
 
+        # Update KV cache (after RoPE, before GQA expansion)
+        if kv_cache is not None:
+            k, v = kv_cache.update(k, v)
+
         # Expand KV heads for GQA: (batch, n_kv_heads, seq, dim) → (batch, n_heads, seq, dim)
         if self.n_rep > 1:
             k = k.repeat_interleave(self.n_rep, dim=1)
             v = v.repeat_interleave(self.n_rep, dim=1)
 
+        # Causal masking: needed for training and prefill (Q seq == K seq).
+        # During single-token decode (seq_len=1), the query attends to all
+        # cached positions — no causal mask needed (and is_causal=True would
+        # incorrectly restrict attention to only the first key position).
+        is_causal = kv_cache is None or seq_len > 1
+
         # Scaled dot-product attention (auto-dispatches to FlashAttention/MemEfficient)
-        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
 
         # Reshape back: (batch, n_heads, seq_len, head_dim) → (batch, seq_len, dim)
         out = out.transpose(1, 2).contiguous().view(batch, seq_len, -1)
