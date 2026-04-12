@@ -29,13 +29,13 @@ def get_dp_info(device_mesh: DeviceMesh | None) -> tuple[int, int]:
     if device_mesh is None:
         return 0, 1
     dim_names = device_mesh.mesh_dim_names
-    if "dp_shard" in dim_names and "dp_replicate" in dim_names:
+    if "dp_shard" in dim_names and "dp_replicate" in dim_names:  # type: ignore[reportOperatorIssue]
         dp_mesh = device_mesh["dp_replicate", "dp_shard"]
         return dp_mesh.get_local_rank(), dp_mesh.size()
-    elif "dp_shard" in dim_names:
+    elif "dp_shard" in dim_names:  # type: ignore[reportOperatorIssue]
         dp_mesh = device_mesh["dp_shard"]
         return dp_mesh.get_local_rank(), dp_mesh.size()
-    elif "dp_replicate" in dim_names:
+    elif "dp_replicate" in dim_names:  # type: ignore[reportOperatorIssue]
         dp_mesh = device_mesh["dp_replicate"]
         return dp_mesh.get_local_rank(), dp_mesh.size()
     return 0, 1
@@ -97,7 +97,7 @@ def clip_grad_norm_(
         group_norm_sq = norms.pow(2).sum()
         # DTensor norm is a partial sum — full_tensor() does the all-reduce
         if hasattr(group_norm_sq, "full_tensor"):
-            group_norm_sq = group_norm_sq.full_tensor()
+            group_norm_sq = group_norm_sq.full_tensor()  # type: ignore[reportAttributeAccessIssue]
         total_norm_sq = total_norm_sq + group_norm_sq
 
     total_norm = total_norm_sq.sqrt()

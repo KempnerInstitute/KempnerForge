@@ -148,7 +148,7 @@ class MemoryMappedDataset(Dataset):
         tokens = self._mmaps[file_idx][start:end].astype(np.int64)
 
         if self._pack_sequences:
-            return _compute_packed_output(tokens, self._eos_token_id)
+            return _compute_packed_output(tokens, self._eos_token_id)  # type: ignore[reportArgumentType]
 
         token_tensor = torch.from_numpy(tokens.copy())
 
@@ -220,7 +220,7 @@ class HuggingFaceDataset(Dataset):
         self._packed_sequences = self._pack_sequences(raw_dataset)
         logger.info(
             f"HuggingFaceDataset: {len(self._packed_sequences)} packed sequences "
-            f"(seq_len={seq_len}) from {len(raw_dataset)} documents"
+            f"(seq_len={seq_len}) from {len(raw_dataset)} documents"  # type: ignore[reportArgumentType]
         )
 
         # State for resumption
@@ -368,7 +368,7 @@ class StreamingHuggingFaceDataset(torch.utils.data.IterableDataset):
             streaming=True,
         )
         # Shuffle with seed + epoch for different order each epoch
-        ds = ds.shuffle(seed=self.seed + self._epoch, buffer_size=self.shuffle_buffer_size)
+        ds = ds.shuffle(seed=self.seed + self._epoch, buffer_size=self.shuffle_buffer_size)  # type: ignore[reportCallIssue]
         return ds
 
     def __iter__(self):
@@ -394,14 +394,14 @@ class StreamingHuggingFaceDataset(torch.utils.data.IterableDataset):
                 continue
 
             text = example[self.text_field]
-            tokens = self._tokenizer.encode(text, add_special_tokens=False)
+            tokens = self._tokenizer.encode(text, add_special_tokens=False)  # type: ignore[reportOptionalMemberAccess]
             if not tokens:
                 rank_docs += 1
                 doc_idx += 1
                 continue
 
             buffer.extend(tokens)
-            buffer.append(self._eos_id)
+            buffer.append(self._eos_id)  # type: ignore[reportArgumentType]
             rank_docs += 1
             doc_idx += 1
             self._rank_docs_consumed = rank_docs
@@ -412,7 +412,7 @@ class StreamingHuggingFaceDataset(torch.utils.data.IterableDataset):
                 buffer = buffer[chunk_size:]
 
                 if self._packing_enabled:
-                    yield _compute_packed_output(np.array(chunk, dtype=np.int64), self._eos_id)
+                    yield _compute_packed_output(np.array(chunk, dtype=np.int64), self._eos_id)  # type: ignore[reportArgumentType]
                 else:
                     token_tensor = torch.tensor(chunk, dtype=torch.long)
                     yield {
@@ -461,12 +461,12 @@ class MixtureDataset(Dataset):
         self._names = names
         self._cumulative: list[int] = [0]
         for ds in datasets:
-            self._cumulative.append(self._cumulative[-1] + len(ds))
+            self._cumulative.append(self._cumulative[-1] + len(ds))  # type: ignore[reportArgumentType]
 
         total = self._cumulative[-1]
         logger.info(
             f"MixtureDataset: {len(datasets)} sources, {total:,} total samples "
-            f"({', '.join(f'{n}={len(d):,}' for n, d in zip(names, datasets, strict=True))})"
+            f"({', '.join(f'{n}={len(d):,}' for n, d in zip(names, datasets, strict=True))})"  # type: ignore[reportArgumentType]
         )
 
     @property
@@ -493,7 +493,7 @@ class MixtureDataset(Dataset):
     def state_dict(self) -> dict:
         """Return per-sub-dataset checkpoint state."""
         return {
-            f"dataset_{i}": ds.state_dict()
+            f"dataset_{i}": ds.state_dict()  # type: ignore[reportAttributeAccessIssue]
             for i, ds in enumerate(self._datasets)
             if hasattr(ds, "state_dict")
         }
@@ -503,4 +503,4 @@ class MixtureDataset(Dataset):
         for i, ds in enumerate(self._datasets):
             key = f"dataset_{i}"
             if key in state and hasattr(ds, "load_state_dict"):
-                ds.load_state_dict(state[key])
+                ds.load_state_dict(state[key])  # type: ignore[reportAttributeAccessIssue]

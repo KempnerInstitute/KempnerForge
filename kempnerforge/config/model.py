@@ -108,7 +108,7 @@ class ModelConfig:
         n_kv = self.n_kv_heads
         head_d = self.head_dim
         # Per layer: attention (Q + K + V + O) + 2 norms
-        attn = d * (self.n_heads * head_d) + 2 * d * (n_kv * head_d) + (self.n_heads * head_d) * d
+        attn = d * (self.n_heads * head_d) + 2 * d * (n_kv * head_d) + (self.n_heads * head_d) * d  # type: ignore[reportOptionalOperand]
         mlp = d * h + d * h + h * d  # gate + up + down (SwiGLU has 3 matrices)
         norm = 2 * d  # 2 norms per layer
 

@@ -62,7 +62,7 @@ def _coerce_value(field_type: Any, value: Any) -> Any:
                 # list[SomeDataclass] — convert each dict element to a dataclass instance
                 dc_type = args[0]
                 return [
-                    _apply_dict_to_dataclass(dc_type(), item) if isinstance(item, dict) else item
+                    _apply_dict_to_dataclass(dc_type(), item) if isinstance(item, dict) else item  # type: ignore[reportCallIssue]
                     for item in value
                 ]
             return value

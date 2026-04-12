@@ -48,7 +48,7 @@ def get_pp_mesh(device_mesh: DeviceMesh) -> DeviceMesh | None:
 
     Returns None if no 'pp' dimension exists.
     """
-    if "pp" not in device_mesh.mesh_dim_names:
+    if "pp" not in device_mesh.mesh_dim_names:  # type: ignore[reportOperatorIssue]
         return None
     return device_mesh["pp"]
 
@@ -206,11 +206,11 @@ class PipelineStageModule(nn.Module):
 
         # Slice RoPE for current sequence length (device transfer cached after first call)
         seq_len = x.shape[1]
-        if self._rope_cos.device != x.device:
-            self._rope_cos = self._rope_cos.to(x.device)
-            self._rope_sin = self._rope_sin.to(x.device)
-        cos = self._rope_cos[:seq_len]
-        sin = self._rope_sin[:seq_len]
+        if self._rope_cos.device != x.device:  # type: ignore[reportOptionalMemberAccess]
+            self._rope_cos = self._rope_cos.to(x.device)  # type: ignore[reportOptionalMemberAccess]
+            self._rope_sin = self._rope_sin.to(x.device)  # type: ignore[reportOptionalMemberAccess]
+        cos = self._rope_cos[:seq_len]  # type: ignore[reportOptionalSubscript]
+        sin = self._rope_sin[:seq_len]  # type: ignore[reportOptionalSubscript]
 
         # Run through assigned layers
         for layer in self.layers.values():
@@ -218,7 +218,7 @@ class PipelineStageModule(nn.Module):
 
         # Last stage: norm + output head
         if self.is_last:
-            x = self.norm(x)
+            x = self.norm(x)  # type: ignore[reportOptionalCall]
             if self.output_head is not None:
                 x = self.output_head(x)
 
@@ -263,7 +263,7 @@ def build_pipeline_stage(
     batch_size: int,
     seq_len: int,
     param_dtype: torch.dtype = torch.bfloat16,
-) -> torch.distributed.pipelining.PipelineStage:
+) -> torch.distributed.pipelining.PipelineStage:  # type: ignore[reportAttributeAccessIssue]
     """Wrap a stage module in a PipelineStage for schedule execution.
 
     Args:
@@ -307,9 +307,9 @@ def build_pipeline_stage(
 
 
 def build_pipeline_schedule(
-    stage: torch.distributed.pipelining.PipelineStage,
+    stage: torch.distributed.pipelining.PipelineStage,  # type: ignore[reportAttributeAccessIssue]
     n_microbatches: int,
-    loss_fn: callable,
+    loss_fn: callable,  # type: ignore[reportGeneralTypeIssues]
     schedule: str = "1f1b",
 ):
     """Create a pipeline execution schedule.

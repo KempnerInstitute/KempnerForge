@@ -200,7 +200,7 @@ class MetricsTracker:
 
     def log_eval(self, metrics: dict[str, float], step: int) -> None:
         """Log eval metrics to all backends and stdout."""
-        logger.info(format_metrics(step, metrics))
+        logger.info(format_metrics(step, metrics))  # type: ignore[reportArgumentType]
         for backend in self._backends:
             backend.log(metrics, step=step)
 
@@ -297,8 +297,8 @@ class TensorBoardBackend(_LoggingBackend):
         if self._writer is False:
             return
         for key, val in metrics.items():
-            self._writer.add_scalar(key, val, global_step=step)
+            self._writer.add_scalar(key, val, global_step=step)  # type: ignore[reportOptionalMemberAccess, reportAttributeAccessIssue]
 
     def close(self) -> None:
         if self._writer and self._writer is not False:
-            self._writer.close()
+            self._writer.close()  # type: ignore[reportAttributeAccessIssue]

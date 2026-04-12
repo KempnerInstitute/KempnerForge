@@ -1,0 +1,15 @@
+{
+  "typeCheckingMode": "basic",
+  "pythonVersion": "3.12",
+  "pythonPlatform": "Linux",
+  "include": ["kempnerforge/"],
+  "exclude": ["build/", ".venv/", "**/__pycache__"],
+  "venvPath": ".",
+  "venv": ".venv",
+  "reportMissingImports": true,
+  "reportMissingTypeStubs": false,
+  "reportUnusedImport": false,
+  "reportPrivateUsage": false,
+  "reportPrivateImportUsage": false,
+  "reportUnnecessaryTypeIgnoreComment": true
+}

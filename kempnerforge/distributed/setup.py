@@ -214,7 +214,7 @@ def init_distributed(config: DistributedConfig, seed: int = 42) -> DeviceMesh | 
 
     # Set seed (vary by PP rank for different dropout/stochastic depth per stage)
     pp_rank = 0
-    if "pp" in device_mesh.mesh_dim_names:
+    if "pp" in device_mesh.mesh_dim_names:  # type: ignore[reportOperatorIssue]
         pp_rank = device_mesh["pp"].get_local_rank()
     _set_seed(seed, rank=rank, pp_rank=pp_rank)
 

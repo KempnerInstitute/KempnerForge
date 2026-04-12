@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 def has_dp_mesh(device_mesh: DeviceMesh) -> bool:
     """Check whether the DeviceMesh contains any data-parallel dimensions."""
     dim_names = device_mesh.mesh_dim_names
-    return "dp_shard" in dim_names or "dp_replicate" in dim_names
+    return "dp_shard" in dim_names or "dp_replicate" in dim_names  # type: ignore[reportOperatorIssue]
 
 
 def get_dp_mesh(device_mesh: DeviceMesh) -> DeviceMesh:
@@ -50,8 +50,8 @@ def get_dp_mesh(device_mesh: DeviceMesh) -> DeviceMesh:
     Use ``has_dp_mesh`` to check first.
     """
     dim_names = device_mesh.mesh_dim_names
-    has_replicate = "dp_replicate" in dim_names
-    has_shard = "dp_shard" in dim_names
+    has_replicate = "dp_replicate" in dim_names  # type: ignore[reportOperatorIssue]
+    has_shard = "dp_shard" in dim_names  # type: ignore[reportOperatorIssue]
 
     if has_replicate and has_shard:
         # 2D HSDP: first dim = replicate, second dim = shard
@@ -222,14 +222,14 @@ def apply_fsdp2(
     ep_sub_wrapped = 0
     for layer in model.layers.values():
         if _has_ep_moe(layer):
-            fully_shard(
-                layer.attention,
+            fully_shard(  # type: ignore[reportCallIssue]
+                layer.attention,  # type: ignore[reportArgumentType]
                 mesh=dp_mesh,
                 mp_policy=policy,
                 reshard_after_forward=reshard_after_forward,
             )
-            fully_shard(
-                layer.mlp,
+            fully_shard(  # type: ignore[reportCallIssue]
+                layer.mlp,  # type: ignore[reportArgumentType]
                 mesh=dp_mesh,
                 mp_policy=policy,
                 reshard_after_forward=reshard_after_forward,
@@ -293,7 +293,7 @@ def build_parallel_model(
     """
     from kempnerforge.distributed.tensor_parallel import apply_tensor_parallel
 
-    tp_enabled = device_mesh is not None and "tp" in device_mesh.mesh_dim_names
+    tp_enabled = device_mesh is not None and "tp" in device_mesh.mesh_dim_names  # type: ignore[reportOperatorIssue]
     model_builder = registry.get_model(model_config.model_type)
 
     from kempnerforge.distributed.expert_parallel import apply_expert_parallel
@@ -303,7 +303,7 @@ def build_parallel_model(
         # then materialize only the local shards on GPU.
         with torch.device("meta"):
             model = model_builder(model_config)
-        apply_tensor_parallel(model, device_mesh)
+        apply_tensor_parallel(model, device_mesh)  # type: ignore[reportArgumentType]
         apply_expert_parallel(model, device_mesh)
         if fp8:
             apply_float8(model)
@@ -329,4 +329,4 @@ def build_parallel_model(
     n_params = sum(p.numel() for p in model.parameters())
     logger.info(f"Model: {n_params:,} parameters")
 
-    return model
+    return model  # type: ignore[reportReturnType]

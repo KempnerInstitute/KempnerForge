@@ -126,7 +126,7 @@ class Attention(nn.Module):
         # QK-Norm: normalize Q and K per-head before RoPE (stabilizes attention logits)
         if self.q_norm is not None:
             q = self.q_norm(q)
-            k = self.k_norm(k)
+            k = self.k_norm(k)  # type: ignore[reportOptionalCall]
 
         # Transpose to (batch, heads, seq_len, head_dim) for SDPA
         q = q.transpose(1, 2)

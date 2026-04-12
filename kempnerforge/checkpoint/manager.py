@@ -189,7 +189,7 @@ class CheckpointManager:
                 train_state = object_list[0]
 
             step, tokens_seen = restore_train_state(
-                train_state, scheduler=scheduler, dataloader=dataloader
+                train_state, scheduler=scheduler, dataloader=dataloader  # type: ignore[reportArgumentType]
             )
             logger.info(f"Resumed from step {step}, {tokens_seen:,} tokens seen")
             return step, tokens_seen

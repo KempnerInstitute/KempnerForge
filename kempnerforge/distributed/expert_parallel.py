@@ -269,7 +269,7 @@ def apply_expert_parallel(model: torch.nn.Module, device_mesh: DeviceMesh | None
     """
     if device_mesh is None:
         return
-    if "ep" not in device_mesh.mesh_dim_names:
+    if "ep" not in device_mesh.mesh_dim_names:  # type: ignore[reportOperatorIssue]
         return
 
     ep_mesh = device_mesh["ep"]
@@ -299,7 +299,7 @@ def apply_expert_parallel(model: torch.nn.Module, device_mesh: DeviceMesh | None
 
         # Store EP metadata
         module.ep_world_size = ep_size
-        module.ep_group = ep_group
+        module.ep_group = ep_group  # type: ignore[reportAttributeAccessIssue]
         module.local_expert_start = start
         module.num_local_experts = experts_per_rank
 
