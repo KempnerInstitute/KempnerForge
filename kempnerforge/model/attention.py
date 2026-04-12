@@ -89,6 +89,10 @@ class Attention(nn.Module):
         self.q_norm = RMSNorm(self.head_dim) if qk_norm else None
         self.k_norm = RMSNorm(self.head_dim) if qk_norm else None
 
+        # Attention weight capture (analysis only — not for training)
+        self.capture_attention_weights = False
+        self._last_attention_weights: torch.Tensor | None = None
+
     def forward(
         self,
         x: torch.Tensor,
@@ -151,7 +155,11 @@ class Attention(nn.Module):
         # 3. Single-token decode (seq_len=1 with KV cache): no mask needed — the
         #    query attends to all cached positions (is_causal=True would incorrectly
         #    restrict attention to only the first key position).
-        if doc_ids is not None:
+        if self.capture_attention_weights:
+            # Manual attention for weight extraction (analysis only, not for training)
+            out, attn_weights = self._attention_with_weights(q, k, v, seq_len, doc_ids, kv_cache)
+            self._last_attention_weights = attn_weights.detach().cpu()
+        elif doc_ids is not None:
             seq_len_kv = k.shape[2]
             # Block-diagonal mask: same-document AND causal
             doc_mask = doc_ids.unsqueeze(2) == doc_ids.unsqueeze(1)  # (B, S, S)
@@ -168,3 +176,44 @@ class Attention(nn.Module):
         out = out.transpose(1, 2).contiguous().view(batch, seq_len, -1)
 
         return self.o_proj(out)
+
+    def _attention_with_weights(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        seq_len: int,
+        doc_ids: torch.Tensor | None,
+        kv_cache: KVCache | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute attention output and weights manually (for analysis).
+
+        SDPA does not return attention weights, so this path computes
+        softmax(QK^T / sqrt(d)) explicitly. Only use for interpretability —
+        it is slower and uses more memory than the fused SDPA path.
+
+        Returns:
+            Tuple of (output, attention_weights).
+            output: (batch, n_heads, seq_len, head_dim)
+            attention_weights: (batch, n_heads, seq_q, seq_k)
+        """
+        scale = self.head_dim**-0.5
+        attn = torch.matmul(q, k.transpose(-2, -1)) * scale
+
+        seq_len_kv = k.shape[2]
+        if doc_ids is not None:
+            doc_mask = doc_ids.unsqueeze(2) == doc_ids.unsqueeze(1)
+            causal = torch.ones(
+                seq_len, seq_len_kv, dtype=torch.bool, device=q.device
+            ).tril()
+            mask = ~(doc_mask & causal).unsqueeze(1)
+            attn = attn.masked_fill(mask, float("-inf"))
+        elif kv_cache is None or seq_len > 1:
+            causal = torch.ones(
+                seq_len, seq_len_kv, dtype=torch.bool, device=q.device
+            ).triu(diagonal=1)
+            attn = attn.masked_fill(causal.unsqueeze(0).unsqueeze(0), float("-inf"))
+
+        attn_weights = F.softmax(attn, dim=-1)
+        out = torch.matmul(attn_weights, v)
+        return out, attn_weights
