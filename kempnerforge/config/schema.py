@@ -286,6 +286,25 @@ class SchedulerConfig:
 
 
 @dataclass
+class DatasetSource:
+    """A single data source in a multi-dataset mixture.
+
+    Either ``path`` (pre-tokenized) or ``hf_name`` (HuggingFace) must be set.
+    ``weight`` controls the relative sampling probability.
+    """
+
+    path: str = ""  # Pre-tokenized data directory
+    weight: float = 1.0  # Relative sampling weight
+    name: str = ""  # Name for per-dataset metrics (auto-derived if empty)
+    hf_name: str = ""  # HuggingFace dataset name
+    hf_config: str = ""  # HuggingFace dataset config
+
+    def __post_init__(self) -> None:
+        if self.weight <= 0:
+            raise ValueError(f"Dataset weight must be positive, got {self.weight}")
+
+
+@dataclass
 class DataConfig:
     """Data pipeline settings."""
 
@@ -302,12 +321,22 @@ class DataConfig:
     hf_dataset_text_field: str = "text"
     hf_streaming: bool = False  # Use streaming (IterableDataset) for large HF datasets
     pack_sequences: bool = False  # Document-aware packing with cross-doc isolation
+    # Multi-dataset mixing (overrides dataset_path/hf_dataset_name when non-empty)
+    datasets: list[DatasetSource] = field(default_factory=list)
+    mix_temperature: float = 1.0  # Temperature for weight scaling (1.0=as-is, >1=uniform)
 
     def __post_init__(self) -> None:
         if self.num_workers < 0:
             raise ValueError("num_workers must be non-negative")
         if self.prefetch_factor < 1:
             raise ValueError("prefetch_factor must be >= 1")
+        if self.mix_temperature <= 0:
+            raise ValueError("mix_temperature must be positive")
+        for src in self.datasets:
+            if not src.path and not src.hf_name:
+                raise ValueError(
+                    f"DatasetSource '{src.name}' must have either path or hf_name"
+                )
 
 
 # ---------------------------------------------------------------------------

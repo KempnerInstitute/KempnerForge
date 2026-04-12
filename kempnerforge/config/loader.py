@@ -57,6 +57,14 @@ def _coerce_value(field_type: Any, value: Any) -> Any:
     # Handle list
     if origin is list:
         if isinstance(value, list):
+            args = get_args(field_type)
+            if args and is_dataclass(args[0]):
+                # list[SomeDataclass] — convert each dict element to a dataclass instance
+                dc_type = args[0]
+                return [
+                    _apply_dict_to_dataclass(dc_type(), item) if isinstance(item, dict) else item
+                    for item in value
+                ]
             return value
         return [value]
 

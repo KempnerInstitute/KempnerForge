@@ -12,6 +12,7 @@ resumption after checkpoint loads.
 
 from __future__ import annotations
 
+import bisect
 import logging
 from pathlib import Path
 
@@ -438,3 +439,70 @@ class StreamingHuggingFaceDataset(torch.utils.data.IterableDataset):
         self._epoch = state.get("epoch", 0)
         self._skip_rank_docs = state.get("rank_docs_consumed", 0)
         self._rank_docs_consumed = 0
+
+
+class MixtureDataset(Dataset):
+    """Concatenates multiple datasets for weighted mixing.
+
+    Global index space maps to sub-datasets via cumulative offsets.
+    Each sample includes ``dataset_idx`` (integer) so the training loop
+    can compute per-dataset metrics.
+
+    Args:
+        datasets: List of map-style datasets to mix.
+        names: Human-readable name per dataset (for metrics logging).
+    """
+
+    def __init__(self, datasets: list[Dataset], names: list[str]) -> None:
+        if len(datasets) != len(names):
+            raise ValueError("datasets and names must have the same length")
+        if not datasets:
+            raise ValueError("At least one dataset is required")
+
+        self._datasets = datasets
+        self._names = names
+        self._cumulative: list[int] = [0]
+        for ds in datasets:
+            self._cumulative.append(self._cumulative[-1] + len(ds))
+
+        total = self._cumulative[-1]
+        logger.info(
+            f"MixtureDataset: {len(datasets)} sources, {total:,} total samples "
+            f"({', '.join(f'{n}={len(d):,}' for n, d in zip(names, datasets, strict=True))})"
+        )
+
+    @property
+    def cumulative_sizes(self) -> list[int]:
+        """Cumulative dataset sizes: ``[0, len(ds0), len(ds0)+len(ds1), ...]``."""
+        return list(self._cumulative)
+
+    @property
+    def dataset_names(self) -> list[str]:
+        return list(self._names)
+
+    def __len__(self) -> int:
+        return self._cumulative[-1]
+
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        if idx < 0 or idx >= len(self):
+            raise IndexError(f"Index {idx} out of range [0, {len(self)})")
+        ds_idx = bisect.bisect_right(self._cumulative, idx) - 1
+        local_idx = idx - self._cumulative[ds_idx]
+        sample = self._datasets[ds_idx][local_idx]
+        sample["dataset_idx"] = ds_idx
+        return sample
+
+    def state_dict(self) -> dict:
+        """Return per-sub-dataset checkpoint state."""
+        return {
+            f"dataset_{i}": ds.state_dict()
+            for i, ds in enumerate(self._datasets)
+            if hasattr(ds, "state_dict")
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        """Restore per-sub-dataset state."""
+        for i, ds in enumerate(self._datasets):
+            key = f"dataset_{i}"
+            if key in state and hasattr(ds, "load_state_dict"):
+                ds.load_state_dict(state[key])

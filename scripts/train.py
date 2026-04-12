@@ -211,17 +211,78 @@ def main() -> None:
     dataset = None
     dataloader = None
     data_iter = None
+    mixture_dataset = None  # Set when multi-dataset mixing is active
 
     # Resolve EOS token ID for sequence packing (needed by MemoryMappedDataset)
     eos_token_id = None
-    if config.data.pack_sequences and config.data.dataset_path:
-        if not config.data.tokenizer_path:
-            raise ValueError("data.tokenizer_path is required when pack_sequences=True")
-        from transformers import AutoTokenizer as _AT
+    if config.data.pack_sequences:
+        has_mmap = bool(config.data.dataset_path) or any(
+            s.path for s in config.data.datasets
+        )
+        if has_mmap:
+            if not config.data.tokenizer_path:
+                raise ValueError("data.tokenizer_path is required when pack_sequences=True")
+            from transformers import AutoTokenizer as _AT
 
-        eos_token_id = _AT.from_pretrained(config.data.tokenizer_path).eos_token_id
+            eos_token_id = _AT.from_pretrained(config.data.tokenizer_path).eos_token_id
 
-    if config.data.dataset_path:
+    if config.data.datasets:
+        # --- Multi-dataset mixing ---
+        from kempnerforge.data.dataset import HuggingFaceDataset, MixtureDataset
+        from kempnerforge.data.sampler import MixtureSampler
+
+        sub_datasets = []
+        names = []
+        weights = []
+        for src in config.data.datasets:
+            if src.path:
+                ds = MemoryMappedDataset(
+                    data_dir=src.path,
+                    seq_len=tc.seq_len + 1,
+                    file_pattern=config.data.file_pattern,
+                    pack_sequences=config.data.pack_sequences,
+                    eos_token_id=eos_token_id,
+                )
+            elif src.hf_name:
+                if not config.data.tokenizer_path:
+                    raise ValueError(
+                        f"data.tokenizer_path required for HF dataset '{src.hf_name}'"
+                    )
+                ds = HuggingFaceDataset(
+                    dataset_name=src.hf_name,
+                    split=config.data.hf_dataset_split,
+                    text_field=config.data.hf_dataset_text_field,
+                    seq_len=tc.seq_len,
+                    tokenizer_path=config.data.tokenizer_path,
+                    dataset_config=src.hf_config or None,
+                    pack_sequences=config.data.pack_sequences,
+                )
+            else:
+                continue
+            sub_datasets.append(ds)
+            names.append(src.name or src.path or src.hf_name)
+            weights.append(src.weight)
+
+        mixture_dataset = MixtureDataset(sub_datasets, names)
+        dataset = mixture_dataset
+        sampler = MixtureSampler(
+            cumulative_sizes=mixture_dataset.cumulative_sizes,
+            weights=weights,
+            num_replicas=dp_size,
+            rank=dp_rank,
+            shuffle=True,
+            seed=tc.seed,
+            temperature=config.data.mix_temperature,
+        )
+        dataloader = StatefulDataLoader(
+            dataset, batch_size=tc.batch_size, sampler=sampler, config=config.data,
+        )
+        logger.info(
+            f"Dataset: mixture of {len(sub_datasets)} sources, "
+            f"{len(mixture_dataset):,} total samples"
+        )
+
+    elif config.data.dataset_path:
         # Pre-tokenized data on disk (fastest path)
         dataset = MemoryMappedDataset(
             data_dir=config.data.dataset_path,
@@ -465,6 +526,9 @@ def main() -> None:
         else:
             # --- Standard training step (no PP) ---
             total_loss = 0.0
+            ds_token_counts: dict[str, int] = {}
+            ds_loss_sums: dict[str, float] = {}
+            ds_loss_counts: dict[str, int] = {}
 
             for micro_step in range(tc.grad_accum_steps):
                 if dataloader is not None:
@@ -488,6 +552,25 @@ def main() -> None:
                 with maybe_no_sync(model, micro_step, tc.grad_accum_steps):
                     logits = model(input_ids, doc_ids=doc_ids)
                     loss = loss_fn(logits, labels)
+
+                    # Per-dataset metrics (before backward, while logits are fresh)
+                    if mixture_dataset is not None and "dataset_idx" in batch:
+                        ds_idx = batch["dataset_idx"]
+                        with torch.no_grad():
+                            for i, name in enumerate(mixture_dataset.dataset_names):
+                                mask = ds_idx == i
+                                count = mask.sum().item()
+                                if count > 0:
+                                    ds_token_counts[name] = (
+                                        ds_token_counts.get(name, 0) + count * tc.seq_len
+                                    )
+                                    ds_l = torch.nn.functional.cross_entropy(
+                                        logits[mask].reshape(-1, logits.size(-1)),
+                                        labels[mask].reshape(-1),
+                                        ignore_index=-100,
+                                    ).item()
+                                    ds_loss_sums[name] = ds_loss_sums.get(name, 0) + ds_l
+                                    ds_loss_counts[name] = ds_loss_counts.get(name, 0) + 1
 
                     # MoE auxiliary loss (no-op for dense: returns 0.0)
                     if mc.is_moe:
@@ -539,6 +622,15 @@ def main() -> None:
                 all_counts = torch.stack(list(expert_counts.values())).float()
                 moe_metrics["moe/expert_balance"] = (all_counts.min() / all_counts.max()).item()
             tracker.log_eval(moe_metrics, step)
+
+        # Per-dataset metrics (logged at same interval as main metrics)
+        if mixture_dataset is not None and step_metrics is not None and ds_loss_sums:
+            ds_metrics: dict[str, float] = {}
+            for name in ds_loss_sums:
+                ds_metrics[f"loss/{name}"] = ds_loss_sums[name] / ds_loss_counts[name]
+            for name, count in ds_token_counts.items():
+                ds_metrics[f"data/{name}/tokens"] = float(count)
+            tracker.log_eval(ds_metrics, step)
 
         # Periodic NCCL health check
         if (

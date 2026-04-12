@@ -14,7 +14,7 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 from kempnerforge.config.schema import DataConfig
-from kempnerforge.data.sampler import DistributedSampler
+from kempnerforge.data.sampler import DistributedSampler, MixtureSampler
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +36,7 @@ class StatefulDataLoader:
         self,
         dataset: Dataset,
         batch_size: int,
-        sampler: DistributedSampler | None = None,
+        sampler: DistributedSampler | MixtureSampler | None = None,
         config: DataConfig | None = None,
     ) -> None:
         config = config or DataConfig()
