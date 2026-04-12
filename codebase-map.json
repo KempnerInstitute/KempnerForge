@@ -1,7 +1,7 @@
 {
   "meta": {
     "description": "KempnerForge codebase map — files, classes, functions, tests, and registry entries",
-    "updated": "2025-04-11",
+    "updated": "2026-04-12",
     "note": "Keep in sync as phases are implemented"
   },
   "source": {
@@ -46,8 +46,14 @@
         "SchedulerConfig": {
           "purpose": "LR schedule (type, warmup, min_lr_ratio, WSD params)"
         },
+        "DatasetSource": {
+          "purpose": "Single data source in a multi-dataset mixture (path or HF, weight, name)"
+        },
+        "TrainingPhase": {
+          "purpose": "Step-triggered phase with dataset weight overrides and LR scaling for data annealing"
+        },
         "DataConfig": {
-          "purpose": "Data pipeline (dataset_path, HF dataset, tokenizer, workers, packing)"
+          "purpose": "Data pipeline (dataset_path, HF dataset, tokenizer, packing, mixing, phases, annealing)"
         },
         "EvalConfig": {
           "purpose": "Evaluation pipeline (interval, steps, data source)"
@@ -81,7 +87,11 @@
         "tests/unit/test_config.py::TestMetricsConfig",
         "tests/unit/test_config.py::TestProfilingConfig",
         "tests/unit/test_config.py::TestJobConfig",
-        "tests/unit/test_config.py::TestEvalConfig"
+        "tests/unit/test_config.py::TestEvalConfig",
+        "tests/unit/test_mixing.py::TestDatasetSource",
+        "tests/unit/test_mixing.py::TestDataConfigMixing",
+        "tests/unit/test_annealing.py::TestTrainingPhase",
+        "tests/unit/test_annealing.py::TestDataConfigPhases"
       ]
     },
     "kempnerforge/config/loader.py": {
@@ -96,7 +106,9 @@
       "tested_by": [
         "tests/unit/test_config.py::TestTomlLoading",
         "tests/unit/test_config.py::TestCliOverrides",
-        "tests/unit/test_config.py::TestCliParsing"
+        "tests/unit/test_config.py::TestCliParsing",
+        "tests/unit/test_mixing.py::TestMixingTomlLoading",
+        "tests/unit/test_annealing.py::TestAnnealingTomlLoading"
       ]
     },
     "kempnerforge/model/transformer.py": {
@@ -128,14 +140,16 @@
           "methods": ["update(k_new, v_new)"]
         },
         "Attention": {
-          "purpose": "Grouped-Query Attention with RoPE, SDPA, optional QK-norm, doc_ids masking",
-          "methods": ["forward(x, rope_cos, rope_sin, *, kv_cache, doc_ids)"]
+          "purpose": "Grouped-Query Attention with RoPE, SDPA, optional QK-norm, doc_ids masking, attention weight capture",
+          "methods": ["forward(x, rope_cos, rope_sin, *, kv_cache, doc_ids)", "_attention_with_weights(q, k, v, seq_len, doc_ids, kv_cache)"],
+          "properties": ["capture_attention_weights", "_last_attention_weights"]
         }
       },
       "tested_by": [
         "tests/unit/test_model.py::TestAttention",
         "tests/unit/test_generate.py::TestKVCache",
-        "tests/unit/test_packing.py::TestPackedAttentionMask"
+        "tests/unit/test_packing.py::TestPackedAttentionMask",
+        "tests/unit/test_hooks.py::TestAttentionWeightCapture"
       ]
     },
     "kempnerforge/model/mlp.py": {
@@ -254,6 +268,26 @@
         "tests/unit/test_generate.py::TestGenerate"
       ]
     },
+    "kempnerforge/model/hooks.py": {
+      "classes": {
+        "ActivationStore": {
+          "purpose": "Forward hook manager for capturing intermediate activations to CPU",
+          "methods": ["enable()", "disable()", "clear()", "get(name)"],
+          "properties": ["enabled", "layer_names", "activations"]
+        }
+      },
+      "functions": [
+        "extract_representations(model, dataset, layers, device, batch_size, max_samples) -> dict[str, Tensor]",
+        "save_activations(activations, path)"
+      ],
+      "tested_by": [
+        "tests/unit/test_hooks.py::TestActivationStore",
+        "tests/unit/test_hooks.py::TestAttentionWeightCapture",
+        "tests/unit/test_hooks.py::TestExtractRepresentations",
+        "tests/unit/test_hooks.py::TestSaveActivations",
+        "tests/unit/test_hooks.py::TestActivationStoreIntegration"
+      ]
+    },
     "kempnerforge/training/loss.py": {
       "functions": [
         "cross_entropy_loss(logits, labels) -> Tensor",
@@ -334,6 +368,11 @@
         "StreamingHuggingFaceDataset": {
           "purpose": "Streaming HuggingFace IterableDataset for large corpora",
           "methods": ["__iter__()", "state_dict()", "load_state_dict(state)", "_ensure_tokenizer()", "_load_stream()"]
+        },
+        "MixtureDataset": {
+          "purpose": "Concatenates multiple datasets with global indexing and per-sample dataset_idx",
+          "methods": ["__getitem__(idx)", "__len__()", "state_dict()", "load_state_dict(state)"],
+          "properties": ["cumulative_sizes", "dataset_names"]
         }
       },
       "functions": ["_compute_packed_output(tokens, eos_token_id) -> dict"],
@@ -343,7 +382,8 @@
         "tests/unit/test_data.py::TestStreamingHuggingFaceDataset",
         "tests/unit/test_packing.py::TestComputePackedOutput",
         "tests/unit/test_packing.py::TestMemoryMappedDatasetPacking",
-        "tests/unit/test_packing.py::TestHuggingFaceDatasetPacking"
+        "tests/unit/test_packing.py::TestHuggingFaceDatasetPacking",
+        "tests/unit/test_mixing.py::TestMixtureDataset"
       ]
     },
     "kempnerforge/data/dataloader.py": {
@@ -360,9 +400,19 @@
         "DistributedSampler": {
           "purpose": "Deterministic distributed sampler with skip-ahead for resumption",
           "methods": ["set_epoch(epoch)", "set_skip(skip)", "__iter__()", "__len__()", "state_dict()", "load_state_dict(state)"]
+        },
+        "MixtureSampler": {
+          "purpose": "Weighted sampler over MixtureDataset with temperature scaling and oversampling",
+          "methods": ["set_epoch(epoch)", "set_skip(skip)", "update_weights(weights, temperature)", "__iter__()", "__len__()", "state_dict()", "load_state_dict(state)"]
         }
       },
-      "tested_by": ["tests/unit/test_data.py::TestDistributedSampler"]
+      "tested_by": [
+        "tests/unit/test_data.py::TestDistributedSampler",
+        "tests/unit/test_mixing.py::TestMixtureSampler",
+        "tests/unit/test_mixing.py::TestTemperatureScaling",
+        "tests/unit/test_mixing.py::TestMixtureSamplerWithDataset",
+        "tests/unit/test_annealing.py::TestUpdateWeights"
+      ]
     },
     "kempnerforge/distributed/setup.py": {
       "functions": [
@@ -712,6 +762,18 @@
       "tests/unit/test_packing.py": {
         "classes": ["TestComputePackedOutput(5)", "TestPackedAttentionMask(5)", "TestLossIgnoreIndex(5)", "TestModelWithPacking(5)", "TestMemoryMappedDatasetPacking(4)", "TestHuggingFaceDatasetPacking(3)", "TestPackingConfig(2)"],
         "count": 29
+      },
+      "tests/unit/test_mixing.py": {
+        "classes": ["TestDatasetSource(5)", "TestDataConfigMixing(4)", "TestMixingTomlLoading(3)", "TestMixtureDataset(10)", "TestMixtureSampler(9)", "TestTemperatureScaling(3)", "TestMixtureSamplerWithDataset(2)"],
+        "count": 36
+      },
+      "tests/unit/test_annealing.py": {
+        "classes": ["TestTrainingPhase(8)", "TestDataConfigPhases(7)", "TestAnnealingTomlLoading(4)", "TestUpdateWeights(4)", "TestPhaseTransitionLogic(5)", "TestAnnealingShortcut(4)"],
+        "count": 32
+      },
+      "tests/unit/test_hooks.py": {
+        "classes": ["TestActivationStore(11)", "TestAttentionWeightCapture(6)", "TestExtractRepresentations(5)", "TestSaveActivations(3)", "TestActivationStoreIntegration(3)"],
+        "count": 28
       }
     },
     "integration": {
