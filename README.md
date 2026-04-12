@@ -2,6 +2,20 @@
 
 PyTorch-native framework for fault-tolerant distributed training of foundation models on AI clusters.
 
+## AI / NeuroAI Use Cases
+
+**Scaling law experiments** — Train the same architecture from 125M to 70B parameters by swapping a TOML config file. FSDP, tensor, expert, and pipeline parallelism are handled automatically. One codebase for compute-optimal scaling studies across model sizes.
+
+**Mechanistic interpretability** — Built-in activation extraction hooks capture intermediate representations at any layer with automatic CPU offload. Attention weight capture exposes raw QK^T matrices. Feed extracted activations into your own CKA, SVCCA, RSA, or probing analysis pipelines without patching the training loop.
+
+**Sparse architecture research** — Switch between dense and Mixture-of-Experts models with a single config flag (`num_experts=0` for dense). Two routing strategies (softmax top-k, DeepSeek-V3 sigmoid), shared experts, and configurable MoE frequency let you study expert specialization, capacity allocation, and routing dynamics.
+
+**Optimizer and scheduler comparison** — Four optimizers (AdamW, Lion, Muon, Schedule-Free AdamW) and six LR schedulers (cosine, linear, WSD, constant, REX, none) are composable via config. Data annealing phases support curriculum learning with step-triggered weight shifts and LR scaling. Compare training dynamics without touching code.
+
+**Long-running jobs on shared clusters** — SLURM preemption handling (SIGTERM/SIGUSR1), async distributed checkpointing, and automatic resume from the latest checkpoint. NaN detection with configurable actions (warn, skip, raise) and GPU/NCCL health monitoring keep multi-day runs alive on preemptible partitions.
+
+**Representation analysis for NeuroAI** — Extract batch-level representations across entire datasets with CPU offload via `ActivationStore` and `extract_representations()`. Save to `.npz` for downstream comparison against neural recordings, cross-model similarity studies, or feature emergence analysis.
+
 ## Features
 
 **Architecture**
