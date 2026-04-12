@@ -52,6 +52,8 @@ class SchedulerType(StrEnum):
     cosine = "cosine"
     linear = "linear"
     wsd = "wsd"  # warmup-stable-decay
+    constant = "constant"  # warmup then flat LR
+    rex = "rex"  # polynomial decay: (1 - t/T)^alpha
     none = "none"  # constant LR (for schedule-free optimizers)
 
 
@@ -275,12 +277,21 @@ class SchedulerConfig:
     min_lr_ratio: float = 0.1  # min_lr = lr * min_lr_ratio
     # WSD-specific
     stable_steps: int | None = None  # For WSD: steps at constant LR
+    wsd_decay_type: str = "cosine"  # WSD cooldown shape: "cosine", "linear", "sqrt"
+    # REX-specific
+    rex_alpha: float = 1.0  # Exponent for REX: (1 - t/T)^alpha
 
     def __post_init__(self) -> None:
         if self.warmup_steps < 0:
             raise ValueError("warmup_steps must be non-negative")
         if not (0 <= self.min_lr_ratio <= 1):
             raise ValueError("min_lr_ratio must be in [0, 1]")
+        if self.wsd_decay_type not in ("cosine", "linear", "sqrt"):
+            raise ValueError(
+                f"wsd_decay_type must be 'cosine', 'linear', or 'sqrt', got '{self.wsd_decay_type}'"
+            )
+        if self.rex_alpha <= 0:
+            raise ValueError("rex_alpha must be positive")
 
 
 # ---------------------------------------------------------------------------
@@ -326,9 +337,7 @@ class TrainingPhase:
             raise ValueError("TrainingPhase.lr_scale must be positive")
         for name, w in self.dataset_weights.items():
             if w < 0:
-                raise ValueError(
-                    f"TrainingPhase.dataset_weights['{name}'] must be non-negative"
-                )
+                raise ValueError(f"TrainingPhase.dataset_weights['{name}'] must be non-negative")
 
 
 @dataclass
@@ -366,9 +375,7 @@ class DataConfig:
             raise ValueError("mix_temperature must be positive")
         for src in self.datasets:
             if not src.path and not src.hf_name:
-                raise ValueError(
-                    f"DatasetSource '{src.name}' must have either path or hf_name"
-                )
+                raise ValueError(f"DatasetSource '{src.name}' must have either path or hf_name")
         # Phase validation
         if self.phases:
             steps = [p.start_step for p in self.phases]
@@ -449,8 +456,7 @@ class DistributedConfig:
         other = self.dp_replicate * self.tp * self.pp * self.cp * self.ep
         if world_size % other != 0:
             raise ValueError(
-                f"world_size ({world_size}) not divisible by "
-                f"dp_replicate*tp*pp*cp*ep ({other})"
+                f"world_size ({world_size}) not divisible by dp_replicate*tp*pp*cp*ep ({other})"
             )
         return world_size // other
 

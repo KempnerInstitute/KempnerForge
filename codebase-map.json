@@ -348,17 +348,23 @@
         "build_scheduler(optimizer, config, max_steps) -> LambdaLR",
         "_warmup_factor(step, warmup_steps) -> float",
         "_cosine_decay(step, total_steps, min_ratio) -> float",
-        "_linear_decay(step, total_steps, min_ratio) -> float"
+        "_linear_decay(step, total_steps, min_ratio) -> float",
+        "_sqrt_decay(step, total_steps, min_ratio) -> float"
       ],
       "registry": [
         "@registry.register_scheduler('cosine')",
         "@registry.register_scheduler('linear')",
         "@registry.register_scheduler('wsd')",
+        "@registry.register_scheduler('constant')",
+        "@registry.register_scheduler('rex')",
         "@registry.register_scheduler('none')"
       ],
       "tested_by": [
         "tests/unit/test_training.py::TestScheduler",
-        "tests/unit/test_additional_optimizers.py::TestNoneScheduler"
+        "tests/unit/test_additional_optimizers.py::TestNoneScheduler",
+        "tests/unit/test_scheduler_extensions.py::TestConstantScheduler",
+        "tests/unit/test_scheduler_extensions.py::TestWSDDecayTypes",
+        "tests/unit/test_scheduler_extensions.py::TestREXScheduler"
       ]
     },
     "kempnerforge/training/eval.py": {
@@ -794,6 +800,10 @@
       "tests/unit/test_additional_optimizers.py": {
         "classes": ["TestLion(10)", "TestScheduleFreeAdamW(9)", "TestNoneScheduler(3)", "TestOptimizerConfig(3)"],
         "count": 25
+      },
+      "tests/unit/test_scheduler_extensions.py": {
+        "classes": ["TestConstantScheduler(7)", "TestWSDDecayTypes(11)", "TestREXScheduler(10)", "TestSchedulerTomlLoading(4)", "TestSchedulerConfigValidation(4)"],
+        "count": 36
       }
     },
     "integration": {
@@ -831,7 +841,7 @@
   "registry_entries": {
     "model": ["transformer"],
     "optimizer": ["adamw", "lion", "schedule_free_adamw", "muon"],
-    "scheduler": ["cosine", "linear", "wsd", "none"],
+    "scheduler": ["cosine", "linear", "wsd", "constant", "rex", "none"],
     "loss": ["cross_entropy", "chunked_cross_entropy"],
     "mlp": ["swiglu", "standard_gelu", "standard_relu"],
     "norm": ["rmsnorm", "layernorm"],
