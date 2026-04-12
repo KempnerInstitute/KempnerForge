@@ -350,8 +350,12 @@ class TestSLURM:
         old = os.environ.pop("SLURM_JOB_ID", None)
         # Clear all SLURM vars
         slurm_keys = [
-            "SLURM_JOB_NAME", "SLURM_JOB_NODELIST", "SLURM_NNODES",
-            "SLURM_NTASKS_PER_NODE", "SLURM_RESTART_COUNT", "SLURM_JOB_PARTITION",
+            "SLURM_JOB_NAME",
+            "SLURM_JOB_NODELIST",
+            "SLURM_NNODES",
+            "SLURM_NTASKS_PER_NODE",
+            "SLURM_RESTART_COUNT",
+            "SLURM_JOB_PARTITION",
             "SLURM_ARRAY_TASK_ID",
         ]
         saved = {k: os.environ.pop(k, None) for k in slurm_keys}
