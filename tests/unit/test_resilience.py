@@ -12,6 +12,7 @@ from kempnerforge.resilience.elastic import (
     get_slurm_info,
     is_slurm_job,
     is_slurm_requeue,
+    log_job_info,
     resolve_resume_path,
 )
 from kempnerforge.resilience.health import (
@@ -331,6 +332,162 @@ class TestSLURM:
         )
         assert info.is_requeued
 
+    def test_slurm_info_not_requeued_when_zero(self):
+        info = SLURMInfo(
+            job_id="1",
+            job_name="test",
+            node_list="node01",
+            num_nodes=1,
+            ntasks_per_node=4,
+            restart_count=0,
+            partition="gpu",
+            array_task_id=None,
+        )
+        assert not info.is_requeued
+
+    def test_get_slurm_info_minimal_env(self):
+        """Only SLURM_JOB_ID set — all other fields use defaults."""
+        old = os.environ.pop("SLURM_JOB_ID", None)
+        # Clear all SLURM vars
+        slurm_keys = [
+            "SLURM_JOB_NAME", "SLURM_JOB_NODELIST", "SLURM_NNODES",
+            "SLURM_NTASKS_PER_NODE", "SLURM_RESTART_COUNT", "SLURM_JOB_PARTITION",
+            "SLURM_ARRAY_TASK_ID",
+        ]
+        saved = {k: os.environ.pop(k, None) for k in slurm_keys}
+        os.environ["SLURM_JOB_ID"] = "55555"
+        try:
+            info = get_slurm_info()
+            assert info is not None
+            assert info.job_id == "55555"
+            assert info.job_name == ""
+            assert info.node_list == ""
+            assert info.num_nodes == 1
+            assert info.ntasks_per_node == 1
+            assert info.restart_count == 0
+            assert info.partition == ""
+            assert info.array_task_id is None
+            assert not info.is_requeued
+        finally:
+            os.environ.pop("SLURM_JOB_ID", None)
+            if old is not None:
+                os.environ["SLURM_JOB_ID"] = old
+            for k, v in saved.items():
+                if v is not None:
+                    os.environ[k] = v
+
+    def test_get_slurm_info_array_job(self):
+        """SLURM_ARRAY_TASK_ID is captured for array jobs."""
+        env = {
+            "SLURM_JOB_ID": "77777",
+            "SLURM_ARRAY_TASK_ID": "42",
+        }
+        saved = {k: os.environ.get(k) for k in env}
+        for k, v in env.items():
+            os.environ[k] = v
+        try:
+            info = get_slurm_info()
+            assert info is not None
+            assert info.array_task_id == "42"
+        finally:
+            for k in env:
+                if saved[k] is not None:
+                    os.environ[k] = saved[k]
+                else:
+                    os.environ.pop(k, None)
+
+    def test_is_slurm_requeue_explicit_zero(self):
+        """SLURM_RESTART_COUNT=0 is not a requeue."""
+        os.environ["SLURM_RESTART_COUNT"] = "0"
+        try:
+            assert not is_slurm_requeue()
+        finally:
+            del os.environ["SLURM_RESTART_COUNT"]
+
+    def test_log_job_info_outside_slurm(self):
+        """log_job_info() logs 'Not running under SLURM' when no SLURM env."""
+        import io
+        import logging
+
+        old = os.environ.pop("SLURM_JOB_ID", None)
+        buf = io.StringIO()
+        handler = logging.StreamHandler(buf)
+        handler.setLevel(logging.DEBUG)
+        logger = logging.getLogger("kempnerforge.resilience.elastic")
+        logger.addHandler(handler)
+        try:
+            log_job_info()
+            assert "Not running under SLURM" in buf.getvalue()
+        finally:
+            logger.removeHandler(handler)
+            if old is not None:
+                os.environ["SLURM_JOB_ID"] = old
+
+    def test_log_job_info_under_slurm(self):
+        """log_job_info() logs job details when SLURM env is set."""
+        import io
+        import logging
+
+        env = {
+            "SLURM_JOB_ID": "88888",
+            "SLURM_JOB_NAME": "test_run",
+            "SLURM_NNODES": "2",
+            "SLURM_NTASKS_PER_NODE": "4",
+            "SLURM_JOB_PARTITION": "gpu_test",
+            "SLURM_RESTART_COUNT": "0",
+        }
+        saved = {k: os.environ.get(k) for k in env}
+        for k, v in env.items():
+            os.environ[k] = v
+
+        buf = io.StringIO()
+        handler = logging.StreamHandler(buf)
+        handler.setLevel(logging.DEBUG)
+        logger = logging.getLogger("kempnerforge.resilience.elastic")
+        logger.addHandler(handler)
+        try:
+            log_job_info()
+            output = buf.getvalue()
+            assert "88888" in output
+            assert "test_run" in output
+            assert "gpu_test" in output
+        finally:
+            logger.removeHandler(handler)
+            for k in env:
+                if saved[k] is not None:
+                    os.environ[k] = saved[k]
+                else:
+                    os.environ.pop(k, None)
+
+    def test_log_job_info_requeued(self):
+        """log_job_info() notes when the job was requeued."""
+        import io
+        import logging
+
+        env = {
+            "SLURM_JOB_ID": "88888",
+            "SLURM_RESTART_COUNT": "2",
+        }
+        saved = {k: os.environ.get(k) for k in env}
+        for k, v in env.items():
+            os.environ[k] = v
+
+        buf = io.StringIO()
+        handler = logging.StreamHandler(buf)
+        handler.setLevel(logging.DEBUG)
+        logger = logging.getLogger("kempnerforge.resilience.elastic")
+        logger.addHandler(handler)
+        try:
+            log_job_info()
+            assert "requeued" in buf.getvalue().lower()
+        finally:
+            logger.removeHandler(handler)
+            for k in env:
+                if saved[k] is not None:
+                    os.environ[k] = saved[k]
+                else:
+                    os.environ.pop(k, None)
+
 
 class TestResumePathResolution:
     def test_no_checkpoint_dir(self, tmp_path):
@@ -393,3 +550,34 @@ class TestResumePathResolution:
         result = resolve_resume_path(str(tmp_path))
         assert result is not None
         assert result.name == "step_50"
+
+    def test_latest_symlink_takes_priority_over_higher_step(self, tmp_path):
+        """latest symlink should be used even if higher step dirs exist."""
+        for step in [10, 50, 100]:
+            (tmp_path / f"step_{step}").mkdir()
+
+        # Point latest at step_50 (not the highest)
+        latest = tmp_path / "latest"
+        latest.symlink_to("step_50")
+
+        result = resolve_resume_path(str(tmp_path))
+        assert result is not None
+        assert result.name == "step_50"
+
+    def test_single_step_dir(self, tmp_path):
+        """Works with exactly one step directory."""
+        (tmp_path / "step_1").mkdir()
+
+        result = resolve_resume_path(str(tmp_path))
+        assert result is not None
+        assert result.name == "step_1"
+
+    def test_step_dirs_with_large_numbers(self, tmp_path):
+        """Handles large step numbers correctly (sorts numerically, not lexically)."""
+        for step in [9, 100, 1000, 20]:
+            (tmp_path / f"step_{step}").mkdir()
+
+        result = resolve_resume_path(str(tmp_path))
+        assert result is not None
+        # Numerically highest is 1000, not lexically highest "step_9"
+        assert result.name == "step_1000"
