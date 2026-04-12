@@ -116,7 +116,7 @@ def _dense_flops_per_token(config: ModelConfig, seq_len: int) -> int:
     head_dim = config.head_dim
     attn_params = (
         config.dim * (config.n_heads * head_dim)  # Q
-        + 2 * config.dim * (config.n_kv_heads * head_dim)  # K + V
+        + 2 * config.dim * (config.n_kv_heads * head_dim)  # type: ignore[reportOptionalOperand]  # K+V
         + (config.n_heads * head_dim) * config.dim  # O
     )
     mlp_params = 3 * config.dim * config.computed_ffn_hidden_dim  # SwiGLU
@@ -130,7 +130,7 @@ def _moe_flops_per_token(config: ModelConfig, seq_len: int) -> int:
     head_dim = config.head_dim
     attn_params = (
         config.dim * (config.n_heads * head_dim)
-        + 2 * config.dim * (config.n_kv_heads * head_dim)
+        + 2 * config.dim * (config.n_kv_heads * head_dim)  # type: ignore[reportOptionalOperand]
         + (config.n_heads * head_dim) * config.dim
     )
     mlp_params = 3 * config.dim * config.computed_ffn_hidden_dim

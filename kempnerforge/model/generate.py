@@ -99,7 +99,7 @@ def generate(
 
     # Allocate one KV cache per layer
     kv_caches = [
-        KVCache(batch_size, total_len, config.n_kv_heads, config.head_dim, dtype, device)
+        KVCache(batch_size, total_len, config.n_kv_heads, config.head_dim, dtype, device)  # type: ignore[reportArgumentType]
         for _ in range(config.n_layers)
     ]
 

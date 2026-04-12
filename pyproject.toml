@@ -15,6 +15,7 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "pyright[nodejs]>=1.1.408",
     "pytest",
     "pytest-timeout",
     "ruff",

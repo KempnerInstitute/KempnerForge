@@ -91,7 +91,7 @@ def get_tp_mesh(device_mesh: DeviceMesh) -> DeviceMesh | None:
 
     Returns None if no 'tp' dimension exists.
     """
-    if "tp" not in device_mesh.mesh_dim_names:
+    if "tp" not in device_mesh.mesh_dim_names:  # type: ignore[reportOperatorIssue]
         return None
     return device_mesh["tp"]
 
@@ -138,12 +138,12 @@ def apply_tensor_parallel(
         def _wrap_replicate(module, input, output, mesh=tp_mesh):
             return DTensor.from_local(output, device_mesh=mesh, placements=[Replicate()])
 
-        model.token_embedding.register_forward_hook(_wrap_replicate)
+        model.token_embedding.register_forward_hook(_wrap_replicate)  # type: ignore[reportAttributeAccessIssue]
 
     # Transformer blocks
-    for block in model.layers.values():
+    for block in model.layers.values():  # type: ignore[reportCallIssue]
         plan = _build_block_tp_plan(block, sequence_parallel=seq_parallel)
-        parallelize_module(block, tp_mesh, plan)
+        parallelize_module(block, tp_mesh, plan)  # type: ignore[reportArgumentType]
 
         # Re-wrap attention/MLP outputs as DTensor Shard(1). Operations inside
         # attention (SDPA, view, contiguous) strip DTensor metadata, causing
@@ -156,8 +156,8 @@ def apply_tensor_parallel(
                     return DTensor.from_local(output, device_mesh=mesh, placements=[Shard(1)])
                 return output
 
-            block.attention.register_forward_hook(_rewrap_shard1)
-            block.mlp.register_forward_hook(_rewrap_shard1)
+            block.attention.register_forward_hook(_rewrap_shard1)  # type: ignore[reportAttributeAccessIssue]
+            block.mlp.register_forward_hook(_rewrap_shard1)  # type: ignore[reportAttributeAccessIssue]
 
     # Final norm: SequenceParallel (non-PP, non-tied only)
     if seq_parallel and getattr(model, "norm", None) is not None:
@@ -167,12 +167,12 @@ def apply_tensor_parallel(
     # Only when seq_parallel=True — matches the Shard(1) data flow from the final norm.
     if seq_parallel and not tie and getattr(model, "output_head", None) is not None:
         parallelize_module(
-            model.output_head,
+            model.output_head,  # type: ignore[reportArgumentType]
             tp_mesh,
             {"proj": ColwiseParallel(input_layouts=Shard(1), output_layouts=Replicate())},
         )
 
     logger.info(
         f"Applied tensor parallelism: tp_degree={tp_mesh.size()}, "
-        f"layers={len(model.layers)}, sequence_parallel={seq_parallel}"
+        f"layers={len(model.layers)}, sequence_parallel={seq_parallel}"  # type: ignore[reportArgumentType]
     )

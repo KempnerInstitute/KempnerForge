@@ -315,6 +315,27 @@ class TestJobConfig:
         config = JobConfig()
         config.validate(world_size=1)  # Should not raise
 
+    def test_validate_moe_with_pp_rejected(self):
+        config = JobConfig(
+            model=ModelConfig(num_experts=8, moe_top_k=2),
+            distributed=DistributedConfig(pp=2, dp_shard=1),
+        )
+        with pytest.raises(ValueError, match="MoE.*Pipeline Parallelism"):
+            config.validate(world_size=2)
+
+    def test_validate_moe_without_pp_passes(self):
+        config = JobConfig(
+            model=ModelConfig(num_experts=8, moe_top_k=2),
+        )
+        config.validate(world_size=1)  # Should not raise
+
+    def test_validate_dense_with_pp_passes(self):
+        config = JobConfig(
+            model=ModelConfig(tie_embeddings=False),
+            distributed=DistributedConfig(pp=2, dp_shard=1),
+        )
+        config.validate(world_size=2)  # Should not raise — dense + PP is fine
+
 
 # ---------------------------------------------------------------------------
 # TOML Loading

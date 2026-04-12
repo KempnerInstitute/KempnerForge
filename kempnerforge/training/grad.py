@@ -32,8 +32,8 @@ def maybe_no_sync(
         yield
     else:
         # FSDP2 uses set_requires_gradient_sync instead of no_sync() context
-        model.set_requires_gradient_sync(False)
+        model.set_requires_gradient_sync(False)  # type: ignore[reportCallIssue]
         try:
             yield
         finally:
-            model.set_requires_gradient_sync(True)
+            model.set_requires_gradient_sync(True)  # type: ignore[reportCallIssue]

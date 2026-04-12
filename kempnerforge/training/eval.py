@@ -17,7 +17,7 @@ import torch.distributed as dist
 def run_eval(
     model: torch.nn.Module,
     eval_dataloader: torch.utils.data.DataLoader,
-    loss_fn: callable,
+    loss_fn: callable,  # type: ignore[reportGeneralTypeIssues]
     device: torch.device,
     eval_steps: int,
     *,
@@ -61,7 +61,7 @@ def run_eval(
         full_labels = torch.cat(labels_list, dim=0)
 
         is_first = pp_rank == 0
-        is_last = pp_rank == pp_size - 1
+        is_last = pp_rank == pp_size - 1  # type: ignore[reportOptionalOperand]
         pp_losses: list[torch.Tensor] = []
 
         if is_first:
@@ -77,7 +77,7 @@ def run_eval(
             avg_loss = 0.0
 
         loss_tensor = torch.tensor([avg_loss], device=device)
-        dist.broadcast(loss_tensor, group_src=pp_size - 1, group=pp_group)
+        dist.broadcast(loss_tensor, group_src=pp_size - 1, group=pp_group)  # type: ignore[reportOptionalOperand]
         avg_loss = loss_tensor[0].item()
     else:
         # --- Standard eval path ---

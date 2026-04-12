@@ -39,7 +39,7 @@ class TransformerBlock(nn.Module):
         self.attention = Attention(
             dim=config.dim,
             n_heads=config.n_heads,
-            n_kv_heads=config.n_kv_heads,
+            n_kv_heads=config.n_kv_heads,  # type: ignore[reportArgumentType]
             head_dim=config.head_dim,
             qk_norm=config.qk_norm,
         )
@@ -188,11 +188,11 @@ class Transformer(nn.Module):
         start_pos = kv_caches[0].seq_len if kv_caches is not None else 0
 
         # Slice RoPE frequencies for current positions (device transfer cached)
-        if self._rope_cos.device != h.device:
-            self._rope_cos = self._rope_cos.to(h.device)
-            self._rope_sin = self._rope_sin.to(h.device)
-        cos = self._rope_cos[start_pos : start_pos + seq_len]
-        sin = self._rope_sin[start_pos : start_pos + seq_len]
+        if self._rope_cos.device != h.device:  # type: ignore[reportOptionalMemberAccess]
+            self._rope_cos = self._rope_cos.to(h.device)  # type: ignore[reportOptionalMemberAccess]
+            self._rope_sin = self._rope_sin.to(h.device)  # type: ignore[reportOptionalMemberAccess]
+        cos = self._rope_cos[start_pos : start_pos + seq_len]  # type: ignore[reportOptionalSubscript]
+        sin = self._rope_sin[start_pos : start_pos + seq_len]  # type: ignore[reportOptionalSubscript]
 
         # Transformer blocks
         for i, layer in enumerate(self.layers.values()):

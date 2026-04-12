@@ -39,7 +39,7 @@ class ActivationStore:
         self._model = model
         self._layers = list(layers or [])
         self._activations: dict[str, torch.Tensor] = {}
-        self._hooks: list[torch.utils.hooks.RemovableHook] = []
+        self._hooks: list[torch.utils.hooks.RemovableHook] = []  # type: ignore[reportAttributeAccessIssue]
         self._enabled = False
 
     @property
@@ -177,4 +177,4 @@ def save_activations(
     if path.suffix != ".npz":
         path = path.with_suffix(".npz")
     path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(str(path), **{k: v.numpy() for k, v in activations.items()})
+    np.savez(str(path), **{k: v.numpy() for k, v in activations.items()})  # type: ignore[reportArgumentType]

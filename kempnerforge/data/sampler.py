@@ -52,7 +52,7 @@ class DistributedSampler(Sampler[int]):
         self.drop_last = drop_last
 
         # Compute per-rank sample count
-        total = len(dataset)
+        total = len(dataset)  # type: ignore[reportArgumentType]
         if drop_last:
             # Drop remainder so all ranks get the same count
             self.num_samples = total // num_replicas
@@ -79,9 +79,9 @@ class DistributedSampler(Sampler[int]):
         if self.shuffle:
             g = torch.Generator()
             g.manual_seed(self.seed + self._epoch)
-            indices = torch.randperm(len(self.dataset), generator=g).tolist()
+            indices = torch.randperm(len(self.dataset), generator=g).tolist()  # type: ignore[reportArgumentType]
         else:
-            indices = list(range(len(self.dataset)))
+            indices = list(range(len(self.dataset)))  # type: ignore[reportArgumentType]
 
         # Handle uneven sizes
         if self.drop_last:

@@ -47,10 +47,10 @@ def grouped_expert_forward(
 
     # Stack expert weights into (E, in, out) for grouped matmul.
     # nn.Linear stores weight as (out, in), so transpose to (in, out).
-    up_w = torch.stack([e.up_proj.weight.t() for e in experts])  # (E, dim, H)
-    down_w = torch.stack([e.down_proj.weight.t() for e in experts])  # (E, H, dim)
+    up_w = torch.stack([e.up_proj.weight.t() for e in experts])  # type: ignore[reportCallIssue, reportAttributeAccessIssue]  # (E, dim, H)
+    down_w = torch.stack([e.down_proj.weight.t() for e in experts])  # type: ignore[reportCallIssue, reportAttributeAccessIssue]  # (E, H, dim)
     if is_swiglu:
-        gate_w = torch.stack([e.gate_proj.weight.t() for e in experts])  # (E, dim, H)
+        gate_w = torch.stack([e.gate_proj.weight.t() for e in experts])  # type: ignore[reportCallIssue, reportAttributeAccessIssue]  # (E, dim, H)
 
     # Pad token groups into (E, max_tokens, dim) for uniform batch size.
     x_padded = x_sorted.new_zeros(num_experts, max_tokens, dim)
@@ -68,7 +68,7 @@ def grouped_expert_forward(
     else:
         hidden = torch._grouped_mm(x_padded, up_w)  # (E, M, H)
         act_fn = experts[0]._activation
-        hidden = act_fn(hidden)
+        hidden = act_fn(hidden)  # type: ignore[reportCallIssue]
 
     out_padded = torch._grouped_mm(hidden, down_w)  # (E, M, dim)
 
@@ -213,11 +213,11 @@ class MoEMLP(nn.Module):
 
     @property
     def aux_loss(self) -> torch.Tensor:
-        return self.router.aux_loss
+        return self.router.aux_loss  # type: ignore[reportReturnType]
 
     @property
     def expert_counts(self) -> torch.Tensor:
-        return self.router.expert_counts
+        return self.router.expert_counts  # type: ignore[reportReturnType]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass dispatching tokens to experts.
@@ -253,7 +253,7 @@ class MoEMLP(nn.Module):
                 weights,
                 indices,
                 self.experts,
-                self.ep_group,
+                self.ep_group,  # type: ignore[reportArgumentType]
                 self.local_expert_start,
                 self.num_local_experts,
                 self.ep_world_size,

@@ -53,6 +53,7 @@ from kempnerforge.training import (
     maybe_no_sync,
     run_eval,
 )
+from kempnerforge.training.hooks import HookRunner, StepContext
 
 logger = get_logger(__name__)
 
@@ -496,6 +497,8 @@ def main() -> None:
         logger.info(f"Phase scheduling: {len(active_phases)} phase(s) configured")
 
     model.train()
+    hook_runner = HookRunner()
+    hook_runner.on_train_begin(config)
 
     if prof is not None:
         prof.start()
@@ -684,6 +687,18 @@ def main() -> None:
             tokens_in_step=tokens_in_step,
         )
 
+        hook_runner.on_step_end(
+            StepContext(
+                step=step,
+                loss=avg_loss,
+                grad_norm=grad_norm_val,
+                lr=current_lr,
+                tokens_seen=tokens_seen,
+                model=model,
+                optimizer=optimizer,
+            )
+        )
+
         # MoE metrics (logged at same interval as main metrics)
         if mc.is_moe and step_metrics is not None:
             moe_metrics = {"moe/aux_loss": model.get_moe_aux_loss().item()}
@@ -729,6 +744,7 @@ def main() -> None:
                 pp_group=pp_group,
             )
             tracker.log_eval(eval_metrics, step)
+            hook_runner.on_eval_end(eval_metrics, step)
 
         # Advance profiler schedule
         if prof is not None:
@@ -743,6 +759,7 @@ def main() -> None:
                 scheduler=scheduler,
                 extra=ckpt_extra,
             )
+            hook_runner.on_checkpoint_save(step, config.checkpoint.dir)
 
         # Graceful shutdown
         if shutdown_handler.should_shutdown():
@@ -765,6 +782,7 @@ def main() -> None:
     ckpt_mgr.wait()
 
     logger.info(f"Training complete: {step} steps, {tokens_seen:,} tokens")
+    hook_runner.on_train_end(step, tokens_seen)
     tracker.close()
     destroy_distributed()
 

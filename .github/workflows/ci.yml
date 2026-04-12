@@ -16,6 +16,7 @@ jobs:
       - run: uv sync
       - run: uv run ruff check kempnerforge/ tests/ scripts/
       - run: uv run ruff format --check kempnerforge/ tests/ scripts/
+      - run: uv run pyright kempnerforge/
 
   unit-tests:
     runs-on: ubuntu-latest
