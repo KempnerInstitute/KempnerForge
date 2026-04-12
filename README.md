@@ -18,14 +18,22 @@ PyTorch-native framework for fault-tolerant distributed training of foundation m
 - **FP8 Mixed Precision** — E4M3/E5M2 via torchao with FSDP2 float8 all-gather
 
 **Training**
-- Optimizers: AdamW and Muon (Newton-Schulz orthogonalized momentum for 2D weights)
+- Optimizers: AdamW, Muon (Newton-Schulz orthogonalized momentum), Lion (sign-based, half optimizer memory), Schedule-Free AdamW (no LR schedule needed)
+- LR schedulers: cosine, linear, WSD (cosine/linear/sqrt cooldown), constant, REX (polynomial decay), none
 - Loss functions: cross-entropy, chunked cross-entropy (token-dimension chunking), z-loss regularizer
 - Distributed checkpointing (DCP) with async save and auto-resume
 - Stateful data pipeline with memory-mapped datasets and exact mid-epoch resumption
+- Multi-dataset mixing with weighted sampling and temperature scaling
+- Data annealing with step-triggered phase transitions (weight shifts, LR scaling)
 - HuggingFace dataset integration (eager and streaming)
 - SLURM integration with preemption handling, requeue, and multi-node launch
 - Resilience: NaN detection, GPU health checks, NCCL liveness monitoring
 - Metrics: MFU tracking, WandB/TensorBoard backends, memory monitoring
+
+**Interpretability**
+- Activation extraction hooks for probing, CKA, SVCCA analysis
+- Attention weight capture (explicit QK^T path for mechanistic interpretability)
+- Batch extraction over datasets with CPU offload
 
 ## Requirements
 
@@ -157,7 +165,10 @@ Key config options:
 - `distributed.pp` — pipeline parallelism degree (default 1)
 - `model.num_experts` — number of MoE experts (0 = dense model)
 - `model.moe_router` — `"softmax_topk"` or `"sigmoid_topk"` (DeepSeek-V3 style)
-- `optimizer.name` — `"adamw"` or `"muon"` (default `"adamw"`)
+- `optimizer.name` — `"adamw"`, `"muon"`, `"lion"`, or `"schedule_free_adamw"` (default `"adamw"`)
+- `scheduler.name` — `"cosine"`, `"linear"`, `"wsd"`, `"constant"`, `"rex"`, or `"none"` (default `"cosine"`)
+- `scheduler.wsd_decay_type` — WSD cooldown shape: `"cosine"`, `"linear"`, or `"sqrt"` (default `"cosine"`)
+- `scheduler.rex_alpha` — REX polynomial exponent (default 1.0)
 - `train.z_loss_weight` — z-loss regularization weight (0 = disabled, PaLM uses 1e-4)
 - `train.ce_chunk_size` — token chunk size for chunked cross-entropy (0 = auto 4096)
 - `checkpoint.async_mode` — `"disabled"`, `"async"`, or `"async_with_pinned_mem"`
@@ -182,22 +193,51 @@ tokenizer_path = "openai-community/gpt2"
 hf_streaming = true
 ```
 
+**Multi-dataset mixing** — weighted sampling with temperature scaling:
+```toml
+[[data.datasets]]
+name = "code"
+path = "data/code_shards"
+weight = 0.3
+
+[[data.datasets]]
+name = "text"
+path = "data/text_shards"
+weight = 0.7
+
+[data]
+mix_temperature = 1.0  # >1 flattens weights, <1 sharpens
+```
+
+**Data annealing** — step-triggered phase transitions for curriculum learning:
+```toml
+[[data.phases]]
+start_step = 5000
+lr_scale = 0.5
+dataset_weights = {code = 0.1, text = 0.9}
+
+[[data.phases]]
+start_step = 8000
+lr_scale = 0.1
+dataset_weights = {code = 0.05, text = 0.95}
+```
+
 ## Project Structure
 
 ```
 kempnerforge/
   config/      — Typed dataclass configs, TOML loading, CLI overrides, registry
-  model/       — Transformer, attention, MLP, MoE, routers, norms, RoPE, embeddings
+  model/       — Transformer, attention, MLP, MoE, routers, norms, RoPE, embeddings, activation hooks
   distributed/ — DeviceMesh, FSDP2, tensor/expert/pipeline parallelism, FP8
-  data/        — MemoryMappedDataset, StatefulDataLoader, DistributedSampler
-  training/    — Optimizers (AdamW, Muon), loss functions, LR schedulers, gradient utils
+  data/        — MemoryMappedDataset, MixtureDataset, StatefulDataLoader, MixtureSampler
+  training/    — Optimizers (AdamW, Muon, Lion, Schedule-Free), loss functions, LR schedulers, gradient utils
   checkpoint/  — DCP-based distributed checkpointing with sync/async save
   resilience/  — Signal handling, NaN detection, GPU/NCCL health checks
   metrics/     — MetricsTracker, MFU computation, WandB/TensorBoard backends
   profiling/   — torch.profiler integration, CUDA timing
 configs/       — TOML configs for training runs and model architecture presets
 scripts/       — Training entry point, data validation, checkpoint conversion, SLURM launch
-tests/         — Unit (472), integration, distributed, and end-to-end tests
+tests/         — Unit (718), integration, distributed, and end-to-end tests
 ```
 
 ## Testing

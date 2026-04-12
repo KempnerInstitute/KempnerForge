@@ -41,10 +41,10 @@
           "properties": ["param_dtype", "is_fp8"]
         },
         "OptimizerConfig": {
-          "purpose": "Optimizer settings (name, lr, betas, weight_decay, muon params)"
+          "purpose": "Optimizer settings (name, lr, betas, weight_decay, muon params, schedule_free_warmup_steps)"
         },
         "SchedulerConfig": {
-          "purpose": "LR schedule (type, warmup, min_lr_ratio, WSD params)"
+          "purpose": "LR schedule (type, warmup, min_lr_ratio, WSD params, wsd_decay_type, rex_alpha)"
         },
         "DatasetSource": {
           "purpose": "Single data source in a multi-dataset mixture (path or HF, weight, name)"
