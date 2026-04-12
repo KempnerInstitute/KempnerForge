@@ -27,6 +27,7 @@ PyTorch-native framework for fault-tolerant distributed training of foundation m
 - Data annealing with step-triggered phase transitions (weight shifts, LR scaling)
 - HuggingFace dataset integration (eager and streaming)
 - SLURM integration with preemption handling, requeue, and multi-node launch
+- Training loop hooks (`TrainingHook`, `HookRunner`) for extensibility without forking `train.py`
 - Resilience: NaN detection, GPU health checks, NCCL liveness monitoring
 - Metrics: MFU tracking, WandB/TensorBoard backends, memory monitoring
 
@@ -155,7 +156,7 @@ uv run torchrun --nproc_per_node=4 scripts/train.py configs/train/7b.toml \
   --model.dim=2048 --train.batch_size=8 --optimizer.lr=1e-4
 ```
 
-All config sections (`ModelConfig`, `TrainConfig`, `OptimizerConfig`, `SchedulerConfig`, `DistributedConfig`, `DataConfig`, `CheckpointConfig`, `MetricsConfig`, `ProfilingConfig`) are defined as typed dataclasses in `kempnerforge/config/schema.py`.
+All config sections (`ModelConfig`, `TrainConfig`, `OptimizerConfig`, `SchedulerConfig`, `DistributedConfig`, `DataConfig`, `CheckpointConfig`, `MetricsConfig`, `ProfilingConfig`) are defined as typed dataclasses in `kempnerforge/config/` with one module per domain (e.g., `config/model.py`, `config/training.py`). Backward-compatible re-exports are available via `kempnerforge.config.schema`.
 
 Key config options:
 - `train.mixed_precision` — `"bf16"`, `"fp16"`, `"fp32"`, or `"fp8"` (default `"bf16"`)
@@ -172,6 +173,8 @@ Key config options:
 - `train.z_loss_weight` — z-loss regularization weight (0 = disabled, PaLM uses 1e-4)
 - `train.ce_chunk_size` — token chunk size for chunked cross-entropy (0 = auto 4096)
 - `checkpoint.async_mode` — `"disabled"`, `"async"`, or `"async_with_pinned_mem"`
+- `train.shutdown_timeout_sec` — graceful shutdown timeout before forced exit (default 600)
+- `train.nccl_health_check_interval` — check NCCL liveness every N steps (0 = disabled)
 
 ## Data
 
@@ -237,7 +240,8 @@ kempnerforge/
   profiling/   — torch.profiler integration, CUDA timing
 configs/       — TOML configs for training runs and model architecture presets
 scripts/       — Training entry point, data validation, checkpoint conversion, SLURM launch
-tests/         — Unit (718), integration, distributed, and end-to-end tests
+benchmarks/    — Performance benchmarks (forward pass, MoE, data pipeline, optimizer, MFU scaling)
+tests/         — Unit (740), integration, distributed, and end-to-end tests
 ```
 
 ## Testing
@@ -260,6 +264,9 @@ uv run pytest tests/e2e/ --e2e --slow -v
 
 # Linting
 uv run ruff check kempnerforge/ tests/
+
+# Static type checking (zero errors in CI)
+uv run pyright kempnerforge/
 ```
 
 ### End-to-End Tests
@@ -292,6 +299,9 @@ E2E tests launch full training runs as subprocesses and verify they complete suc
 | Muon + FSDP | dp_shard=4 | 4 | Muon with DTensor momentum buffers |
 | Z-loss + chunked CE + FSDP | dp_shard=4 | 4 | Combined loss composition |
 | SIGTERM | — | 1 | Graceful shutdown, emergency checkpoint |
+| Lion + FSDP | dp_shard=4 | 4 | Loss descent, gradients, checkpoint round-trip |
+| Schedule-Free + FSDP | dp_shard=4 | 4 | Loss descent, eval/train toggle, checkpoint |
+| Optimizer-scheduler matrix | dp_shard=4 | 4 | 7 (optimizer, scheduler) pairs, finite loss |
 | 7B model (`--slow`) | tp=2, dp_shard=2, compile | 4 | Full production path |
 
 ## Parallelism Application Order
@@ -313,6 +323,21 @@ uv run torchrun --nproc_per_node=4 scripts/train.py configs/train/debug.toml \
 
 Outputs kernel-level GPU time breakdown, FLOPS analysis, MFU estimate, and TensorBoard traces viewable at [Perfetto UI](https://ui.perfetto.dev/).
 
+## Benchmarks
+
+```bash
+# Run all benchmarks
+uv run python benchmarks/runner.py
+
+# Run a specific benchmark
+uv run python benchmarks/bench_forward.py
+
+# Save results to JSON
+uv run python benchmarks/runner.py --output results.json
+```
+
+Available benchmarks: forward pass throughput, MoE routing/dispatch, data pipeline I/O, optimizer step timing. Results from scaling experiments and profiling runs are stored in `benchmarks/` subdirectories.
+
 ## MoE Engineering Roadmap
 
 Phases 1-9 (core MoE, Expert Parallelism, DeepSeekMoE, grouped GEMM, FSDP2 fix) and Phase 11 (FP8) are complete and validated at multi-node scale. Remaining work toward DeepSeek-V3 production quality:
@@ -321,11 +346,13 @@ Phases 1-9 (core MoE, Expert Parallelism, DeepSeekMoE, grouped GEMM, FSDP2 fix) 
 |:-----:|---------|:------:|--------|
 | 10 | Router improvements (sequence aux loss, gradient scaling, adaptive bias) | Planned | Training quality |
 | 11 | FP8 mixed precision | **Done** | 2x compute throughput |
-| 12 | Pipeline parallelism for MoE (PP+EP+TP composition) | Planned | Required for 100B+ |
+| 12 | Pipeline parallelism for MoE (PP+EP+TP composition) | Blocked | Required for 100B+ |
 | 13 | Communication-computation overlap (async EP dispatch) | Planned | 15-30% throughput |
 | 14 | Node-limited expert routing (bounded cross-node traffic) | Planned | Scale to 64+ GPUs |
 | 15 | Multi-token prediction (MTP) | Planned | 10-15% sample efficiency |
 | 16 | Large-scale EP (hierarchical all-to-all, 256+ experts) | Planned | 1000+ GPU scale |
+
+> **Note:** Dense Pipeline Parallelism (PP) is fully supported. MoE + PP is explicitly rejected at config validation time because MoE data-dependent routing is incompatible with static pipeline stage splitting. Use FSDP, TP, or EP for MoE models.
 
 See `moe_eng_production_plan.md` for detailed implementation plans, steps, and test specifications.
 
