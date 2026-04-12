@@ -1,0 +1,758 @@
+{
+  "meta": {
+    "description": "KempnerForge codebase map — files, classes, functions, tests, and registry entries",
+    "updated": "2025-04-11",
+    "note": "Keep in sync as phases are implemented"
+  },
+  "source": {
+    "kempnerforge/config/registry.py": {
+      "classes": {
+        "Registry": {
+          "purpose": "Central registry for named components (models, optimizers, schedulers, losses, evaluators)",
+          "methods": [
+            "register(category, name, obj)",
+            "get(category, name)",
+            "list(category)",
+            "register_model(name)",
+            "get_model(name)",
+            "register_optimizer(name)",
+            "get_optimizer(name)",
+            "register_scheduler(name)",
+            "get_scheduler(name)",
+            "register_loss(name)",
+            "get_loss(name)",
+            "register_eval(name)",
+            "get_eval(name)"
+          ]
+        }
+      },
+      "globals": ["registry: Registry"],
+      "tested_by": ["tests/unit/test_config.py::TestRegistry"]
+    },
+    "kempnerforge/config/schema.py": {
+      "enums": ["NormType", "Activation", "ActivationCheckpointing", "AsyncCheckpointMode", "PipelineSchedule", "SchedulerType"],
+      "classes": {
+        "ModelConfig": {
+          "purpose": "Architecture hyperparameters (dim, layers, heads, vocab, MoE, QK-norm)",
+          "properties": ["is_moe", "head_dim", "computed_ffn_hidden_dim", "num_params_estimate"]
+        },
+        "TrainConfig": {
+          "purpose": "Training hyperparameters (steps, batch, seq_len, precision, loss, grad accum)",
+          "properties": ["param_dtype", "is_fp8"]
+        },
+        "OptimizerConfig": {
+          "purpose": "Optimizer settings (name, lr, betas, weight_decay, muon params)"
+        },
+        "SchedulerConfig": {
+          "purpose": "LR schedule (type, warmup, min_lr_ratio, WSD params)"
+        },
+        "DataConfig": {
+          "purpose": "Data pipeline (dataset_path, HF dataset, tokenizer, workers, packing)"
+        },
+        "EvalConfig": {
+          "purpose": "Evaluation pipeline (interval, steps, data source)"
+        },
+        "DistributedConfig": {
+          "purpose": "Parallelism dimensions (tp, pp, cp, ep, dp_replicate, dp_shard, fsdp)",
+          "methods": ["validate_world_size(world_size)", "resolve(world_size)"]
+        },
+        "CheckpointConfig": {
+          "purpose": "Checkpointing (dir, interval, keep, async mode)"
+        },
+        "MetricsConfig": {
+          "purpose": "Logging (interval, wandb, tensorboard)"
+        },
+        "ProfilingConfig": {
+          "purpose": "Performance profiling (torch.profiler settings)"
+        },
+        "JobConfig": {
+          "purpose": "Top-level config aggregating all sub-configs",
+          "methods": ["validate(world_size)"]
+        }
+      },
+      "tested_by": [
+        "tests/unit/test_config.py::TestModelConfig",
+        "tests/unit/test_config.py::TestTrainConfig",
+        "tests/unit/test_config.py::TestOptimizerConfig",
+        "tests/unit/test_config.py::TestDistributedConfig",
+        "tests/unit/test_config.py::TestCheckpointConfig",
+        "tests/unit/test_config.py::TestSchedulerConfig",
+        "tests/unit/test_config.py::TestDataConfig",
+        "tests/unit/test_config.py::TestMetricsConfig",
+        "tests/unit/test_config.py::TestProfilingConfig",
+        "tests/unit/test_config.py::TestJobConfig",
+        "tests/unit/test_config.py::TestEvalConfig"
+      ]
+    },
+    "kempnerforge/config/loader.py": {
+      "functions": [
+        "load_toml(path) -> dict",
+        "load_config(config_path, cli_args) -> JobConfig",
+        "_parse_cli_overrides(args) -> dict",
+        "_apply_dict_to_dataclass(dc, data)",
+        "_coerce_value(field_type, value)",
+        "_get_type_hints(dc_type) -> dict"
+      ],
+      "tested_by": [
+        "tests/unit/test_config.py::TestTomlLoading",
+        "tests/unit/test_config.py::TestCliOverrides",
+        "tests/unit/test_config.py::TestCliParsing"
+      ]
+    },
+    "kempnerforge/model/transformer.py": {
+      "classes": {
+        "TransformerBlock": {
+          "purpose": "Single pre-norm transformer block (attention + MLP with residuals)",
+          "methods": ["forward(x, rope_cos, rope_sin, *, kv_cache, doc_ids)"]
+        },
+        "Transformer": {
+          "purpose": "Full decoder-only transformer (embed -> blocks -> norm -> head)",
+          "methods": [
+            "forward(tokens, *, kv_caches, doc_ids)",
+            "init_weights_and_freqs()",
+            "get_moe_aux_loss()",
+            "get_expert_counts()"
+          ]
+        }
+      },
+      "registry": ["@registry.register_model('transformer') _build_transformer(model_config)"],
+      "tested_by": [
+        "tests/unit/test_model.py::TestTransformerBlock",
+        "tests/unit/test_model.py::TestTransformer"
+      ]
+    },
+    "kempnerforge/model/attention.py": {
+      "classes": {
+        "KVCache": {
+          "purpose": "Pre-allocated KV cache for autoregressive generation",
+          "methods": ["update(k_new, v_new)"]
+        },
+        "Attention": {
+          "purpose": "Grouped-Query Attention with RoPE, SDPA, optional QK-norm, doc_ids masking",
+          "methods": ["forward(x, rope_cos, rope_sin, *, kv_cache, doc_ids)"]
+        }
+      },
+      "tested_by": [
+        "tests/unit/test_model.py::TestAttention",
+        "tests/unit/test_generate.py::TestKVCache",
+        "tests/unit/test_packing.py::TestPackedAttentionMask"
+      ]
+    },
+    "kempnerforge/model/mlp.py": {
+      "classes": {
+        "SwiGLUMLP": {
+          "purpose": "SwiGLU feed-forward (Llama-style gated MLP)",
+          "methods": ["forward(x)"]
+        },
+        "StandardMLP": {
+          "purpose": "Standard two-layer MLP with configurable activation",
+          "methods": ["forward(x)"]
+        }
+      },
+      "functions": ["build_mlp(dim, hidden_dim, activation) -> nn.Module"],
+      "registry": [
+        "@registry.register('mlp', 'swiglu')",
+        "@registry.register('mlp', 'standard_gelu')",
+        "@registry.register('mlp', 'standard_relu')"
+      ],
+      "tested_by": ["tests/unit/test_model.py::TestMLP"]
+    },
+    "kempnerforge/model/norm.py": {
+      "classes": {
+        "RMSNorm": {
+          "purpose": "Root Mean Square Layer Normalization",
+          "methods": ["forward(x)"]
+        }
+      },
+      "functions": ["build_norm(norm_type, dim, eps) -> nn.Module"],
+      "registry": [
+        "@registry.register('norm', 'rmsnorm')",
+        "@registry.register('norm', 'layernorm')"
+      ],
+      "tested_by": [
+        "tests/unit/test_model.py::TestRMSNorm",
+        "tests/unit/test_model.py::TestBuildNorm"
+      ]
+    },
+    "kempnerforge/model/embedding.py": {
+      "classes": {
+        "TokenEmbedding": {
+          "purpose": "Token embedding layer",
+          "methods": ["forward(tokens)"]
+        },
+        "OutputHead": {
+          "purpose": "Linear output projection (hidden -> vocab logits)",
+          "methods": ["forward(x)", "tie_weights(embedding)"]
+        }
+      },
+      "tested_by": ["tests/unit/test_model.py::TestEmbedding"]
+    },
+    "kempnerforge/model/position.py": {
+      "functions": [
+        "precompute_rope_frequencies(head_dim, max_seq_len, theta, device) -> (cos, sin)",
+        "apply_rope(x, cos, sin) -> Tensor"
+      ],
+      "tested_by": ["tests/unit/test_model.py::TestRoPE"]
+    },
+    "kempnerforge/model/init.py": {
+      "functions": ["init_weights(model, config)"],
+      "tested_by": ["tests/unit/test_model.py::TestInitWeights"]
+    },
+    "kempnerforge/model/moe.py": {
+      "classes": {
+        "MoEMLP": {
+          "purpose": "Mixture-of-Experts feed-forward layer with router dispatch",
+          "properties": ["aux_loss", "expert_counts"],
+          "methods": ["forward(x)", "_local_forward(x_flat, weights, indices)"]
+        }
+      },
+      "functions": [
+        "build_moe(dim, hidden_dim, num_experts, top_k, activation, router_type, shared_experts, capacity_factor) -> MoEMLP",
+        "grouped_expert_forward(x_sorted, tokens_per_expert, experts) -> Tensor",
+        "_apply_capacity(weights, indices, num_experts, capacity_factor)"
+      ],
+      "tested_by": [
+        "tests/unit/test_moe.py::TestMoEMLP",
+        "tests/unit/test_moe.py::TestMoETransformer",
+        "tests/unit/test_moe.py::TestSharedExperts",
+        "tests/unit/test_moe.py::TestGroupedGEMM",
+        "tests/unit/test_moe.py::TestCapacityFactor",
+        "tests/unit/test_moe.py::TestCompile",
+        "tests/unit/test_moe.py::TestEPAttributes"
+      ]
+    },
+    "kempnerforge/model/router.py": {
+      "classes": {
+        "SoftmaxTopKRouter": {
+          "purpose": "Mixtral-style softmax top-k router with aux load-balancing loss",
+          "properties": ["aux_loss", "expert_counts"],
+          "methods": ["forward(x)"]
+        },
+        "SigmoidTopKRouter": {
+          "purpose": "DeepSeek-V3 style sigmoid router with learnable bias",
+          "properties": ["aux_loss", "expert_counts"],
+          "methods": ["forward(x)"]
+        }
+      },
+      "registry": [
+        "@registry.register('router', 'softmax_topk')",
+        "@registry.register('router', 'sigmoid_topk')"
+      ],
+      "tested_by": [
+        "tests/unit/test_router.py::TestSoftmaxTopKRouter",
+        "tests/unit/test_moe.py::TestSigmoidTopKRouter",
+        "tests/unit/test_moe.py::TestSigmoidMoEIntegration"
+      ]
+    },
+    "kempnerforge/model/generate.py": {
+      "functions": [
+        "sample(logits, temperature, top_k, top_p) -> Tensor",
+        "generate(model, prompt_tokens, max_new_tokens, *, temperature, top_k, top_p, eos_token_id) -> Tensor"
+      ],
+      "tested_by": [
+        "tests/unit/test_generate.py::TestSampling",
+        "tests/unit/test_generate.py::TestGenerate"
+      ]
+    },
+    "kempnerforge/training/loss.py": {
+      "functions": [
+        "cross_entropy_loss(logits, labels) -> Tensor",
+        "chunked_cross_entropy_loss(logits, labels, chunk_size) -> Tensor",
+        "z_loss(logits, weight) -> Tensor",
+        "build_loss_fn(config) -> Callable"
+      ],
+      "registry": [
+        "@registry.register_loss('cross_entropy')",
+        "@registry.register_loss('chunked_cross_entropy')"
+      ],
+      "tested_by": [
+        "tests/unit/test_loss.py::TestCrossEntropy",
+        "tests/unit/test_loss.py::TestChunkedCrossEntropy",
+        "tests/unit/test_loss.py::TestZLoss",
+        "tests/unit/test_loss.py::TestBuildLossFn",
+        "tests/unit/test_packing.py::TestLossIgnoreIndex"
+      ]
+    },
+    "kempnerforge/training/optimizer.py": {
+      "classes": {
+        "Muon": {
+          "purpose": "Momentum with Orthogonalized Updates optimizer (Newton-Schulz)",
+          "methods": ["step(closure)", "state_dict()", "load_state_dict(state_dict)"]
+        }
+      },
+      "functions": [
+        "build_optimizer(model, config) -> Optimizer",
+        "_newton_schulz(G, steps) -> Tensor",
+        "_is_muon_eligible(param) -> bool",
+        "_should_decay(name, param) -> bool"
+      ],
+      "registry": [
+        "@registry.register_optimizer('adamw')",
+        "@registry.register_optimizer('muon')"
+      ],
+      "tested_by": [
+        "tests/unit/test_training.py::TestBuildOptimizer",
+        "tests/unit/test_optimizer.py::TestNewtonSchulz",
+        "tests/unit/test_optimizer.py::TestMuon",
+        "tests/unit/test_optimizer.py::TestAdamW"
+      ]
+    },
+    "kempnerforge/training/scheduler.py": {
+      "functions": [
+        "build_scheduler(optimizer, config, max_steps) -> LambdaLR",
+        "_warmup_factor(step, warmup_steps) -> float",
+        "_cosine_decay(step, total_steps, min_ratio) -> float",
+        "_linear_decay(step, total_steps, min_ratio) -> float"
+      ],
+      "registry": [
+        "@registry.register_scheduler('cosine')",
+        "@registry.register_scheduler('linear')",
+        "@registry.register_scheduler('wsd')"
+      ],
+      "tested_by": ["tests/unit/test_training.py::TestScheduler"]
+    },
+    "kempnerforge/training/eval.py": {
+      "functions": [
+        "run_eval(model, eval_dataloader, loss_fn, device, eval_steps, *, pp_schedule, pp_rank, pp_size, pp_group) -> dict"
+      ],
+      "tested_by": ["tests/unit/test_eval.py::TestRunEval"]
+    },
+    "kempnerforge/training/grad.py": {
+      "functions": ["maybe_no_sync(model, micro_step, grad_accum_steps)"],
+      "tested_by": ["tests/unit/test_training.py::TestGradUtils"]
+    },
+    "kempnerforge/data/dataset.py": {
+      "classes": {
+        "MemoryMappedDataset": {
+          "purpose": "Pre-tokenized dataset via memory-mapped .npy/.bin files",
+          "methods": ["__getitem__(idx)", "__len__()", "state_dict()", "load_state_dict(state)", "_find_file(idx)"]
+        },
+        "HuggingFaceDataset": {
+          "purpose": "HuggingFace dataset with tokenization and sequence packing",
+          "methods": ["__getitem__(idx)", "__len__()", "state_dict()", "load_state_dict(state)", "_pack_sequences(raw_dataset)"]
+        },
+        "StreamingHuggingFaceDataset": {
+          "purpose": "Streaming HuggingFace IterableDataset for large corpora",
+          "methods": ["__iter__()", "state_dict()", "load_state_dict(state)", "_ensure_tokenizer()", "_load_stream()"]
+        }
+      },
+      "functions": ["_compute_packed_output(tokens, eos_token_id) -> dict"],
+      "tested_by": [
+        "tests/unit/test_data.py::TestMemoryMappedDataset",
+        "tests/unit/test_data.py::TestHuggingFaceDataset",
+        "tests/unit/test_data.py::TestStreamingHuggingFaceDataset",
+        "tests/unit/test_packing.py::TestComputePackedOutput",
+        "tests/unit/test_packing.py::TestMemoryMappedDatasetPacking",
+        "tests/unit/test_packing.py::TestHuggingFaceDatasetPacking"
+      ]
+    },
+    "kempnerforge/data/dataloader.py": {
+      "classes": {
+        "StatefulDataLoader": {
+          "purpose": "DataLoader wrapper with checkpoint/resume state tracking",
+          "methods": ["__iter__()", "__next__()", "__len__()", "state_dict()", "load_state_dict(state)"]
+        }
+      },
+      "tested_by": ["tests/unit/test_data.py::TestStatefulDataLoader"]
+    },
+    "kempnerforge/data/sampler.py": {
+      "classes": {
+        "DistributedSampler": {
+          "purpose": "Deterministic distributed sampler with skip-ahead for resumption",
+          "methods": ["set_epoch(epoch)", "set_skip(skip)", "__iter__()", "__len__()", "state_dict()", "load_state_dict(state)"]
+        }
+      },
+      "tested_by": ["tests/unit/test_data.py::TestDistributedSampler"]
+    },
+    "kempnerforge/distributed/setup.py": {
+      "functions": [
+        "get_world_info() -> (rank, local_rank, world_size)",
+        "is_rank_zero() -> bool",
+        "init_distributed(config, seed) -> DeviceMesh | None",
+        "destroy_distributed()",
+        "_detect_ib_interface() -> str | None",
+        "_set_nccl_env()",
+        "_set_seed(seed, rank, pp_rank)"
+      ],
+      "tested_by": [
+        "tests/unit/test_distributed.py::TestDetectIBInterface",
+        "tests/unit/test_distributed.py::TestSetNcclEnv",
+        "tests/unit/test_distributed.py::TestGetWorldInfo",
+        "tests/distributed/test_fsdp.py::TestInitDistributed"
+      ]
+    },
+    "kempnerforge/distributed/parallel.py": {
+      "functions": [
+        "build_parallel_model(model_config, device, device_mesh, *, ac_mode, mp_policy, param_dtype, compile_model, fp8) -> nn.Module",
+        "apply_ac(model, mode)",
+        "apply_float8(model, enable_fsdp_float8_all_gather)",
+        "apply_fsdp2(model, device_mesh, mp_policy, reshard_after_forward)",
+        "has_dp_mesh(device_mesh) -> bool",
+        "get_dp_mesh(device_mesh) -> DeviceMesh",
+        "default_mp_policy(param_dtype) -> MixedPrecisionPolicy"
+      ],
+      "tested_by": [
+        "tests/distributed/test_fsdp.py::TestFSDP2",
+        "tests/distributed/test_fsdp.py::TestActivationCheckpointing",
+        "tests/distributed/test_fsdp.py::TestGetDpMesh",
+        "tests/unit/test_fp8.py::TestApplyFloat8"
+      ]
+    },
+    "kempnerforge/distributed/tensor_parallel.py": {
+      "functions": [
+        "apply_tensor_parallel(model, device_mesh)",
+        "get_tp_mesh(device_mesh) -> DeviceMesh | None",
+        "_build_block_tp_plan(block, *, sequence_parallel) -> dict"
+      ],
+      "tested_by": [
+        "tests/unit/test_distributed.py::TestBuildBlockTPPlan",
+        "tests/distributed/test_tp.py"
+      ]
+    },
+    "kempnerforge/distributed/expert_parallel.py": {
+      "classes": {
+        "_AllToAll": {
+          "purpose": "Differentiable all-to-all autograd function for expert dispatch",
+          "methods": ["forward(ctx, x, output_split_sizes, input_split_sizes, group)", "backward(ctx, grad_output)"]
+        }
+      },
+      "functions": [
+        "ep_dispatch_and_compute(x, weights, indices, experts, ep_group, local_expert_start, num_local_experts, ep_world_size) -> Tensor",
+        "apply_expert_parallel(model, device_mesh)"
+      ],
+      "tested_by": ["tests/distributed/test_ep.py"]
+    },
+    "kempnerforge/distributed/pipeline_parallel.py": {
+      "classes": {
+        "PipelineStageModule": {
+          "purpose": "Model chunk for a single pipeline stage",
+          "methods": ["forward(x)", "init_weights_and_freqs()"]
+        }
+      },
+      "functions": [
+        "get_pp_mesh(device_mesh) -> DeviceMesh | None",
+        "get_pp_rank(device_mesh) -> int",
+        "get_pp_size(device_mesh) -> int",
+        "compute_layer_assignment(n_layers, pp_size) -> list[tuple]",
+        "build_stage_module(config, pp_rank, pp_size) -> PipelineStageModule",
+        "build_pipeline_stage(stage_module, device_mesh, device, batch_size, seq_len, param_dtype) -> PipelineStage",
+        "build_pipeline_schedule(stage, n_microbatches, loss_fn, schedule)"
+      ],
+      "tested_by": [
+        "tests/unit/test_pipeline_parallel.py::TestComputeLayerAssignment",
+        "tests/unit/test_pipeline_parallel.py::TestPipelineStageModule",
+        "tests/unit/test_pipeline_parallel.py::TestBuildStageModule",
+        "tests/unit/test_pipeline_parallel.py::TestPipelineScheduleConfig"
+      ]
+    },
+    "kempnerforge/distributed/utils.py": {
+      "functions": [
+        "get_dp_info(device_mesh) -> (dp_rank, dp_size)",
+        "clip_grad_norm_(model, max_norm, foreach) -> Tensor"
+      ],
+      "tested_by": ["tests/unit/test_distributed.py::TestClipGradNorm"]
+    },
+    "kempnerforge/checkpoint/state.py": {
+      "functions": [
+        "get_rng_state() -> dict",
+        "set_rng_state(state)",
+        "build_train_state(step, tokens_seen, scheduler, dataloader, extra) -> dict",
+        "restore_train_state(state, scheduler, dataloader) -> (step, tokens_seen)"
+      ],
+      "tested_by": [
+        "tests/unit/test_checkpoint.py::TestRNGState",
+        "tests/unit/test_checkpoint.py::TestBuildTrainState",
+        "tests/unit/test_checkpoint.py::TestRestoreTrainState"
+      ]
+    },
+    "kempnerforge/checkpoint/manager.py": {
+      "classes": {
+        "CheckpointManager": {
+          "purpose": "DCP-based distributed checkpoint save/load/cleanup manager",
+          "methods": ["save(step, tokens_seen, scheduler, dataloader, extra)", "wait()", "load(path, scheduler, dataloader, exclude_keys)", "_cleanup()"]
+        }
+      },
+      "tested_by": [
+        "tests/unit/test_checkpoint.py::TestCheckpointRetention",
+        "tests/integration/test_checkpoint_roundtrip.py::TestCheckpointRoundtrip",
+        "tests/distributed/test_checkpoint.py"
+      ]
+    },
+    "kempnerforge/checkpoint/async_save.py": {
+      "classes": {
+        "AsyncCheckpointer": {
+          "purpose": "Non-blocking checkpoint saver using dcp.async_save()",
+          "properties": ["is_pending"],
+          "methods": ["save(state_dict, checkpoint_id, process_group)", "wait()"]
+        }
+      },
+      "tested_by": ["tests/unit/test_checkpoint.py::TestAsyncCheckpointer"]
+    },
+    "kempnerforge/metrics/tracker.py": {
+      "classes": {
+        "StepMetrics": {
+          "purpose": "Dataclass for per-step training metrics"
+        },
+        "MetricsTracker": {
+          "purpose": "Collect, smooth (EMA), and dispatch metrics to backends",
+          "methods": ["start_step()", "end_step(step, loss, grad_norm, lr, ...)", "log_step(metrics, step)"]
+        }
+      },
+      "tested_by": [
+        "tests/unit/test_observability.py::TestMetricsTracker",
+        "tests/unit/test_observability.py::TestStepMetrics"
+      ]
+    },
+    "kempnerforge/metrics/logger.py": {
+      "functions": [
+        "get_logger(name) -> Logger",
+        "format_metrics(metrics) -> str"
+      ],
+      "tested_by": [
+        "tests/unit/test_observability.py::TestRankLogger",
+        "tests/unit/test_observability.py::TestFormatMetrics"
+      ]
+    },
+    "kempnerforge/metrics/memory.py": {
+      "classes": {
+        "DeviceMemoryMonitor": {
+          "purpose": "Track GPU memory across training steps with snapshot export",
+          "methods": ["reset_peak()", "snapshot(step)"]
+        }
+      },
+      "functions": [
+        "get_memory_stats(device) -> dict",
+        "get_memory_utilization(device) -> float",
+        "format_memory_stats(device) -> str",
+        "reset_peak_memory(device)"
+      ],
+      "tested_by": [
+        "tests/unit/test_observability.py::TestDeviceMemoryMonitor",
+        "tests/unit/test_performance.py::TestMemory"
+      ]
+    },
+    "kempnerforge/metrics/mfu.py": {
+      "functions": [
+        "get_gpu_peak_tflops(device) -> float",
+        "estimate_model_flops_per_token(config, seq_len) -> int",
+        "compute_mfu(tokens_per_sec, config, seq_len, gpu_peak_tflops) -> float"
+      ],
+      "tested_by": ["tests/unit/test_performance.py::TestMFU"]
+    },
+    "kempnerforge/profiling/profiler.py": {
+      "functions": [
+        "build_profiler(config, rank) -> profile | None",
+        "print_profiler_summary(prof)"
+      ],
+      "tested_by": ["tests/unit/test_performance.py::TestProfiler"]
+    },
+    "kempnerforge/profiling/cuda_timer.py": {
+      "classes": {
+        "CUDATimer": {
+          "purpose": "CUDA event-based timer for GPU timing",
+          "methods": ["start()", "stop()", "elapsed_ms()"]
+        },
+        "CUDATimerCollection": {
+          "purpose": "Collection of named CUDA timers",
+          "methods": ["start(name)", "stop(name)", "elapsed_all()"]
+        }
+      },
+      "tested_by": ["tests/unit/test_performance.py::TestProfiler"]
+    },
+    "kempnerforge/resilience/health.py": {
+      "classes": {
+        "NaNDetector": {
+          "purpose": "Detect and track NaN/Inf in loss and gradients with configurable actions",
+          "methods": ["check_loss(loss, step)", "check_grads(model, step)", "should_recommend_rollback()"]
+        }
+      },
+      "functions": [
+        "check_gpu_health(device) -> bool",
+        "check_nccl_health(group, timeout_sec) -> bool"
+      ],
+      "tested_by": [
+        "tests/unit/test_resilience.py::TestNaNDetector",
+        "tests/unit/test_resilience.py::TestGPUHealth",
+        "tests/distributed/test_resilience.py::TestNCCLHealth",
+        "tests/distributed/test_resilience.py::TestNaNDetectorDistributed"
+      ]
+    },
+    "kempnerforge/resilience/signal_handler.py": {
+      "classes": {
+        "ShutdownHandler": {
+          "purpose": "Cooperative shutdown for SIGTERM/SIGUSR1 (SLURM preemption)",
+          "properties": ["shutdown_requested", "signal_received"],
+          "methods": ["register()", "unregister()", "should_shutdown()", "finish()"]
+        }
+      },
+      "tested_by": ["tests/unit/test_resilience.py::TestShutdownHandler"]
+    },
+    "kempnerforge/resilience/elastic.py": {
+      "classes": {
+        "SLURMInfo": {
+          "purpose": "SLURM job metadata",
+          "properties": ["is_requeued"]
+        }
+      },
+      "functions": [
+        "get_slurm_info() -> SLURMInfo | None",
+        "is_slurm_job() -> bool",
+        "is_slurm_requeue() -> bool",
+        "resolve_resume_path(checkpoint_dir) -> Path | None",
+        "log_job_info()"
+      ],
+      "tested_by": [
+        "tests/unit/test_resilience.py::TestSLURM",
+        "tests/unit/test_resilience.py::TestResumePathResolution"
+      ]
+    }
+  },
+  "scripts": {
+    "scripts/train.py": {
+      "purpose": "Main training entry point — config, distributed setup, training loop, checkpointing",
+      "entry": "main()",
+      "tested_by": [
+        "tests/integration/test_train_step.py",
+        "tests/e2e/test_training_e2e.py",
+        "tests/smoke/test_smoke.py"
+      ]
+    },
+    "scripts/eval.py": {
+      "purpose": "Standalone evaluation — load model + checkpoint, compute loss/perplexity",
+      "entry": "main()"
+    },
+    "scripts/generate.py": {
+      "purpose": "Text generation — load model, sample from prompts, interactive REPL",
+      "entry": "main()"
+    },
+    "scripts/convert_checkpoint.py": {
+      "purpose": "KempnerForge <-> HuggingFace checkpoint conversion",
+      "functions": ["_kf_to_hf_key()", "_hf_to_kf_key()", "_build_hf_config()"],
+      "tested_by": ["tests/unit/test_convert_checkpoint.py"]
+    },
+    "scripts/prepare_data.py": {
+      "purpose": "Validate pre-tokenized datasets (.bin/.npy) for MemoryMappedDataset",
+      "entry": "validate(data_path)"
+    }
+  },
+  "tests": {
+    "unit": {
+      "tests/unit/test_model.py": {
+        "classes": ["TestRMSNorm(3)", "TestBuildNorm(3)", "TestRoPE(6)", "TestAttention(7)", "TestMLP(5)", "TestEmbedding(3)", "TestTransformerBlock(2)", "TestTransformer(8)", "TestInitWeights(4)"],
+        "count": 41
+      },
+      "tests/unit/test_config.py": {
+        "classes": ["TestModelConfig(12)", "TestTrainConfig(2)", "TestOptimizerConfig(2)", "TestDistributedConfig(6)", "TestCheckpointConfig(2)", "TestSchedulerConfig(3)", "TestDataConfig(2)", "TestMetricsConfig(2)", "TestProfilingConfig(1)", "TestJobConfig(4)", "TestTomlLoading(7)", "TestCliOverrides(7)", "TestCliParsing(6)", "TestRegistry(8)", "TestEvalConfig(5)"],
+        "count": 69
+      },
+      "tests/unit/test_training.py": {
+        "classes": ["TestBuildOptimizer(6)", "TestScheduler(7)", "TestGradUtils(2)", "TestTrainingIntegration(2)"],
+        "count": 17
+      },
+      "tests/unit/test_data.py": {
+        "classes": ["TestMemoryMappedDataset(9)", "TestDistributedSampler(8)", "TestStatefulDataLoader(3)", "TestHuggingFaceDataset(8)", "TestStreamingHuggingFaceDataset(5)"],
+        "count": 33
+      },
+      "tests/unit/test_distributed.py": {
+        "classes": ["TestClipGradNorm(4)", "TestBuildBlockTPPlan(6)", "TestDetectIBInterface(5)", "TestSetNcclEnv(3)", "TestGetWorldInfo(5)"],
+        "count": 23
+      },
+      "tests/unit/test_resilience.py": {
+        "classes": ["TestShutdownHandler(6)", "TestNaNDetector(14)", "TestGPUHealth(2)", "TestSLURM(5)", "TestResumePathResolution(4)"],
+        "count": 31
+      },
+      "tests/unit/test_checkpoint.py": {
+        "classes": ["TestRNGState(2)", "TestBuildTrainState(4)", "TestRestoreTrainState(4)", "TestCheckpointRetention(2)", "TestAsyncCheckpointer(6)"],
+        "count": 18
+      },
+      "tests/unit/test_observability.py": {
+        "classes": ["TestMetricsTracker(6)", "TestStepMetrics(1)", "TestDeviceMemoryMonitor(4)", "TestWandBBackend(2)", "TestTensorBoardBackend(2)", "TestRankLogger(4)", "TestFormatMetrics(3)"],
+        "count": 22
+      },
+      "tests/unit/test_performance.py": {
+        "classes": ["TestMFU(8)", "TestMemory(4)", "TestProfiler(8)", "TestCompile(1)"],
+        "count": 21
+      },
+      "tests/unit/test_pipeline_parallel.py": {
+        "classes": ["TestComputeLayerAssignment(6)", "TestPipelineStageModule(9)", "TestBuildStageModule(4)", "TestPipelineScheduleConfig(2)"],
+        "count": 21
+      },
+      "tests/unit/test_loss.py": {
+        "classes": ["TestCrossEntropy(2)", "TestChunkedCrossEntropy(6)", "TestZLoss(4)", "TestBuildLossFn(5)"],
+        "count": 17
+      },
+      "tests/unit/test_moe.py": {
+        "classes": ["TestMoEMLP(9)", "TestMoETransformer(8)", "TestSigmoidTopKRouter(6)", "TestSigmoidMoEIntegration(4)", "TestSharedExperts(4)", "TestEPConfig(5)", "TestGroupedGEMM(4)", "TestCapacityFactor(3)", "TestCompile(2)", "TestEPAttributes(1)"],
+        "count": 46
+      },
+      "tests/unit/test_router.py": {
+        "classes": ["TestSoftmaxTopKRouter(8)"],
+        "count": 8
+      },
+      "tests/unit/test_optimizer.py": {
+        "classes": ["TestNewtonSchulz(3)", "TestMuon(9)", "TestAdamW(2)"],
+        "count": 14
+      },
+      "tests/unit/test_eval.py": {
+        "classes": ["TestRunEval(6)"],
+        "count": 6
+      },
+      "tests/unit/test_generate.py": {
+        "classes": ["TestKVCache(3)", "TestSampling(6)", "TestGenerate(12)"],
+        "count": 21
+      },
+      "tests/unit/test_convert_checkpoint.py": {
+        "classes": ["TestKFtoHFKeyMapping(6)", "TestHFtoKFKeyMapping(6)", "TestRoundTrip(2)", "TestBuildHFConfig(3)"],
+        "count": 17
+      },
+      "tests/unit/test_fp8.py": {
+        "classes": ["TestFP8Config(5)", "TestApplyFloat8(3)"],
+        "count": 8
+      },
+      "tests/unit/test_packing.py": {
+        "classes": ["TestComputePackedOutput(5)", "TestPackedAttentionMask(5)", "TestLossIgnoreIndex(5)", "TestModelWithPacking(5)", "TestMemoryMappedDatasetPacking(4)", "TestHuggingFaceDatasetPacking(3)", "TestPackingConfig(2)"],
+        "count": 29
+      }
+    },
+    "integration": {
+      "tests/integration/test_train_step.py": { "classes": ["TestTrainStep(6)"], "count": 6 },
+      "tests/integration/test_checkpoint_roundtrip.py": { "classes": ["TestCheckpointRoundtrip(5)"], "count": 5 },
+      "tests/integration/test_data_resumption.py": { "classes": ["TestDataResumption(3)"], "count": 3 },
+      "tests/integration/test_compile.py": { "classes": ["TestCompileCorrectness(3)"], "count": 3 }
+    },
+    "distributed": {
+      "tests/distributed/test_fsdp.py": { "classes": ["TestInitDistributed(4)", "TestFSDP2(4)", "TestActivationCheckpointing(2)", "TestGetDpMesh(1)"] },
+      "tests/distributed/test_resilience.py": { "classes": ["TestNCCLHealth(2)", "TestNaNDetectorDistributed(3)"] },
+      "tests/distributed/test_tp.py": { "note": "Tensor parallelism end-to-end" },
+      "tests/distributed/test_checkpoint.py": { "note": "Distributed checkpoint save/load" },
+      "tests/distributed/test_e2e_training.py": { "note": "Multi-GPU training smoke" },
+      "tests/distributed/test_moe_distributed.py": { "note": "MoE with FSDP/TP" },
+      "tests/distributed/test_ep.py": { "note": "Expert parallelism" }
+    },
+    "e2e": {
+      "tests/e2e/test_training_e2e.py": {
+        "note": "Full training runs: single GPU, FSDP, TP, PP, MoE, FP8, checkpoint resume, signal handling"
+      }
+    },
+    "smoke": {
+      "tests/smoke/test_smoke.py": {
+        "note": "Hardware-adaptive smoke tests: CPU, single GPU, multi-GPU (torchrun or srun)"
+      }
+    }
+  },
+  "fixtures": {
+    "tests/conftest.py": ["tiny_model_config", "small_model_config", "tiny_job_config", "device", "random_batch", "mmap_data_dir"],
+    "tests/distributed/conftest.py": ["_distributed_init (session)", "distributed_env"],
+    "tests/e2e/conftest.py": ["synthetic_data_dir", "requires_gpus(n)"],
+    "tests/smoke/conftest.py": ["hw (session, GPU/SLURM info)", "tokenizer_name", "vocab_size"]
+  },
+  "registry_entries": {
+    "model": ["transformer"],
+    "optimizer": ["adamw", "muon"],
+    "scheduler": ["cosine", "linear", "wsd"],
+    "loss": ["cross_entropy", "chunked_cross_entropy"],
+    "mlp": ["swiglu", "standard_gelu", "standard_relu"],
+    "norm": ["rmsnorm", "layernorm"],
+    "router": ["softmax_topk", "sigmoid_topk"]
+  }
+}
