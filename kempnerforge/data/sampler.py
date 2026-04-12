@@ -275,6 +275,49 @@ class MixtureSampler(Sampler[int]):
             "rank": self.rank,
         }
 
+    def update_weights(self, weights: list[float], temperature: float = 1.0) -> None:
+        """Update sampling weights for phase transitions.
+
+        Recomputes internal probabilities and per-dataset target counts.
+        Takes effect on the next ``__iter__()`` call.
+        """
+        n = len(self._dataset_sizes)
+        if len(weights) != n:
+            raise ValueError(f"Expected {n} weights, got {len(weights)}")
+
+        # Apply temperature scaling and normalize (same logic as __init__)
+        if temperature != 1.0:
+            import math as _math
+
+            log_w = [_math.log(max(w, 1e-12)) / temperature for w in weights]
+            max_lw = max(log_w)
+            scaled = [_math.exp(lw - max_lw) for lw in log_w]
+            total = sum(scaled)
+            self._probs = [s / total for s in scaled]
+        else:
+            total_w = sum(weights)
+            self._probs = [w / total_w for w in weights]
+
+        # Recompute per-dataset per-rank available count
+        per_rank_avail = []
+        for size in self._dataset_sizes:
+            if self.drop_last:
+                per_rank_avail.append(size // self.num_replicas)
+            else:
+                per_rank_avail.append(math.ceil(size / self.num_replicas))
+
+        total_per_rank = sum(per_rank_avail)
+        self._target_counts = [round(p * total_per_rank) for p in self._probs]
+
+        # Fix rounding to match total exactly
+        diff = total_per_rank - sum(self._target_counts)
+        sorted_idx = sorted(range(n), key=lambda i: -self._probs[i])
+        for i in range(abs(diff)):
+            idx = sorted_idx[i % n]
+            self._target_counts[idx] += 1 if diff > 0 else -1
+
+        self.num_samples = sum(self._target_counts)
+
     def load_state_dict(self, state: dict) -> None:
         """Restore from checkpoint."""
         self._epoch = state.get("epoch", 0)

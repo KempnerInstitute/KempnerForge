@@ -305,6 +305,30 @@ class DatasetSource:
 
 
 @dataclass
+class TrainingPhase:
+    """A training phase with custom dataset weights and LR scaling.
+
+    Used for data annealing: at ``start_step``, the mixture sampler switches
+    to ``dataset_weights`` and the learning rate is multiplied by ``lr_scale``.
+    """
+
+    start_step: int = 0
+    dataset_weights: dict[str, float] = field(default_factory=dict)
+    lr_scale: float = 1.0
+
+    def __post_init__(self) -> None:
+        if self.start_step < 0:
+            raise ValueError("TrainingPhase.start_step must be non-negative")
+        if self.lr_scale <= 0:
+            raise ValueError("TrainingPhase.lr_scale must be positive")
+        for name, w in self.dataset_weights.items():
+            if w < 0:
+                raise ValueError(
+                    f"TrainingPhase.dataset_weights['{name}'] must be non-negative"
+                )
+
+
+@dataclass
 class DataConfig:
     """Data pipeline settings."""
 
@@ -324,6 +348,11 @@ class DataConfig:
     # Multi-dataset mixing (overrides dataset_path/hf_dataset_name when non-empty)
     datasets: list[DatasetSource] = field(default_factory=list)
     mix_temperature: float = 1.0  # Temperature for weight scaling (1.0=as-is, >1=uniform)
+    # Phase scheduling (step-triggered weight/LR transitions)
+    phases: list[TrainingPhase] = field(default_factory=list)
+    # Annealing shortcut (syntactic sugar for a common 2-phase pattern)
+    anneal_start_step: int = 0  # 0 = disabled
+    anneal_weights: dict[str, float] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.num_workers < 0:
@@ -337,6 +366,20 @@ class DataConfig:
                 raise ValueError(
                     f"DatasetSource '{src.name}' must have either path or hf_name"
                 )
+        # Phase validation
+        if self.phases:
+            steps = [p.start_step for p in self.phases]
+            if steps != sorted(steps) or len(steps) != len(set(steps)):
+                raise ValueError(
+                    "data.phases start_steps must be strictly monotonically increasing"
+                )
+        if self.anneal_start_step < 0:
+            raise ValueError("anneal_start_step must be non-negative")
+        if self.phases and self.anneal_start_step > 0:
+            raise ValueError(
+                "Cannot use both data.phases and data.anneal_start_step — "
+                "use phases for multi-phase scheduling"
+            )
 
 
 # ---------------------------------------------------------------------------

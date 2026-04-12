@@ -447,11 +447,56 @@ def main() -> None:
                 f"{eval_config.hf_dataset_name} ({eval_config.hf_dataset_split})"
             )
 
+    # --- Phase scheduling (data annealing) ---
+    active_phases: list = []
+    if config.data.phases:
+        active_phases = sorted(config.data.phases, key=lambda p: p.start_step)
+    elif config.data.anneal_start_step > 0 and config.data.anneal_weights:
+        from kempnerforge.config.schema import TrainingPhase
+
+        active_phases = [
+            TrainingPhase(
+                start_step=config.data.anneal_start_step,
+                dataset_weights=dict(config.data.anneal_weights),
+            )
+        ]
+
+    # Track original weights (by dataset name) for fallback when a phase
+    # doesn't override every dataset's weight.
+    original_weights_dict: dict[str, float] = {}
+    if mixture_dataset is not None:
+        for i, name in enumerate(mixture_dataset.dataset_names):
+            original_weights_dict[name] = weights[i]
+
+    current_phase_idx = 0  # Index of next phase to activate
+    phase_lr_scale = 1.0
+
+    # On resume, re-derive phase state from current step
+    if step > 0 and active_phases and mixture_dataset is not None:
+        for i, phase in enumerate(active_phases):
+            if step >= phase.start_step:
+                new_weights = [
+                    phase.dataset_weights.get(name, original_weights_dict[name])
+                    for name in mixture_dataset.dataset_names
+                ]
+                sampler.update_weights(
+                    new_weights, temperature=config.data.mix_temperature
+                )
+                phase_lr_scale = phase.lr_scale
+                current_phase_idx = i + 1
+        if current_phase_idx > 0:
+            logger.info(
+                f"Resumed into phase {current_phase_idx - 1}, "
+                f"lr_scale={phase_lr_scale}"
+            )
+
     logger.info(
         f"Starting training: step={step}, max_steps={tc.max_steps}, "
         f"batch_size={tc.batch_size}, grad_accum={tc.grad_accum_steps}, "
         f"world_size={world_size}"
     )
+    if active_phases:
+        logger.info(f"Phase scheduling: {len(active_phases)} phase(s) configured")
 
     model.train()
 
@@ -599,18 +644,48 @@ def main() -> None:
         # Optimizer step
         optimizer.step()
         scheduler.step()
+
+        # Phase LR scaling (applied after scheduler computes base LR)
+        if phase_lr_scale != 1.0:
+            for pg in optimizer.param_groups:
+                pg["lr"] *= phase_lr_scale
+
         optimizer.zero_grad()
 
         step += 1
         tokens_in_step = tc.batch_size * tc.seq_len * tc.grad_accum_steps * dp_size
         tokens_seen += tokens_in_step
 
-        # Metrics
+        # Phase transition check
+        if active_phases and mixture_dataset is not None:
+            while (
+                current_phase_idx < len(active_phases)
+                and step >= active_phases[current_phase_idx].start_step
+            ):
+                phase = active_phases[current_phase_idx]
+                new_weights = [
+                    phase.dataset_weights.get(name, original_weights_dict[name])
+                    for name in mixture_dataset.dataset_names
+                ]
+                sampler.update_weights(
+                    new_weights, temperature=config.data.mix_temperature
+                )
+                phase_lr_scale = phase.lr_scale
+                logger.info(
+                    f"Phase transition at step {step}: "
+                    f"phase={current_phase_idx}, lr_scale={phase_lr_scale}"
+                )
+                current_phase_idx += 1
+                # Force data iterator refresh so new weights take effect
+                data_iter = None
+
+        # Metrics (report LR after phase scaling)
+        current_lr = optimizer.param_groups[0]["lr"]
         step_metrics = tracker.end_step(
             step=step,
             loss=avg_loss,
             grad_norm=grad_norm_val,
-            lr=scheduler.get_last_lr()[0],
+            lr=current_lr,
             tokens_in_step=tokens_in_step,
         )
 
@@ -664,14 +739,21 @@ def main() -> None:
         if prof is not None:
             prof.step()
 
-        # Checkpoint
+        # Checkpoint (include phase index for exact resumption)
+        ckpt_extra = {"phase_idx": current_phase_idx} if active_phases else None
         if step % config.checkpoint.interval == 0:
-            ckpt_mgr.save(step=step, tokens_seen=tokens_seen, scheduler=scheduler)
+            ckpt_mgr.save(
+                step=step, tokens_seen=tokens_seen,
+                scheduler=scheduler, extra=ckpt_extra,
+            )
 
         # Graceful shutdown
         if shutdown_handler.should_shutdown():
             logger.warning(f"Shutdown requested at step {step} — saving emergency checkpoint")
-            ckpt_mgr.save(step=step, tokens_seen=tokens_seen, scheduler=scheduler)
+            ckpt_mgr.save(
+                step=step, tokens_seen=tokens_seen,
+                scheduler=scheduler, extra=ckpt_extra,
+            )
             shutdown_handler.finish()
             break
 
