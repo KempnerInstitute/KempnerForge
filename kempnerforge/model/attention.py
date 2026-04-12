@@ -96,6 +96,7 @@ class Attention(nn.Module):
         rope_sin: torch.Tensor,
         *,
         kv_cache: KVCache | None = None,
+        doc_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Forward pass.
 
@@ -104,6 +105,9 @@ class Attention(nn.Module):
             rope_cos: RoPE cosine frequencies, shape (seq_len, head_dim // 2).
             rope_sin: RoPE sine frequencies, shape (seq_len, head_dim // 2).
             kv_cache: Optional KV cache for incremental generation.
+            doc_ids: Optional per-token document IDs for packed sequences,
+                shape (batch, seq_len). When provided, constructs a block-diagonal
+                causal mask so tokens only attend within their document.
 
         Returns:
             Output tensor of shape (batch, seq_len, dim).
@@ -140,14 +144,25 @@ class Attention(nn.Module):
             k = k.repeat_interleave(self.n_rep, dim=1)
             v = v.repeat_interleave(self.n_rep, dim=1)
 
-        # Causal masking: needed for training and prefill (Q seq == K seq).
-        # During single-token decode (seq_len=1), the query attends to all
-        # cached positions — no causal mask needed (and is_causal=True would
-        # incorrectly restrict attention to only the first key position).
-        is_causal = kv_cache is None or seq_len > 1
-
-        # Scaled dot-product attention (auto-dispatches to FlashAttention/MemEfficient)
-        out = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
+        # Attention masking strategy:
+        # 1. Packed sequences (doc_ids provided): block-diagonal causal mask that
+        #    isolates documents from each other within a packed sequence.
+        # 2. Standard causal: needed for training and prefill (Q seq == K seq).
+        # 3. Single-token decode (seq_len=1 with KV cache): no mask needed — the
+        #    query attends to all cached positions (is_causal=True would incorrectly
+        #    restrict attention to only the first key position).
+        if doc_ids is not None:
+            seq_len_kv = k.shape[2]
+            # Block-diagonal mask: same-document AND causal
+            doc_mask = doc_ids.unsqueeze(2) == doc_ids.unsqueeze(1)  # (B, S, S)
+            causal = torch.ones(
+                seq_len, seq_len_kv, dtype=torch.bool, device=q.device
+            ).tril()
+            attn_mask = (doc_mask & causal).unsqueeze(1)  # (B, 1, S, S)
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        else:
+            is_causal = kv_cache is None or seq_len > 1
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
 
         # Reshape back: (batch, n_heads, seq_len, head_dim) → (batch, seq_len, dim)
         out = out.transpose(1, 2).contiguous().view(batch, seq_len, -1)

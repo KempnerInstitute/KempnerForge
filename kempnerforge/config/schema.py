@@ -301,6 +301,7 @@ class DataConfig:
     hf_dataset_split: str = "train"
     hf_dataset_text_field: str = "text"
     hf_streaming: bool = False  # Use streaming (IterableDataset) for large HF datasets
+    pack_sequences: bool = False  # Document-aware packing with cross-doc isolation
 
     def __post_init__(self) -> None:
         if self.num_workers < 0:

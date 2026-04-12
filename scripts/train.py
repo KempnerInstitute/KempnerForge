@@ -211,12 +211,24 @@ def main() -> None:
     dataset = None
     dataloader = None
     data_iter = None
+
+    # Resolve EOS token ID for sequence packing (needed by MemoryMappedDataset)
+    eos_token_id = None
+    if config.data.pack_sequences and config.data.dataset_path:
+        if not config.data.tokenizer_path:
+            raise ValueError("data.tokenizer_path is required when pack_sequences=True")
+        from transformers import AutoTokenizer as _AT
+
+        eos_token_id = _AT.from_pretrained(config.data.tokenizer_path).eos_token_id
+
     if config.data.dataset_path:
         # Pre-tokenized data on disk (fastest path)
         dataset = MemoryMappedDataset(
             data_dir=config.data.dataset_path,
             seq_len=tc.seq_len + 1,
             file_pattern=config.data.file_pattern,
+            pack_sequences=config.data.pack_sequences,
+            eos_token_id=eos_token_id,
         )
         sampler = DistributedSampler(
             dataset,
@@ -252,6 +264,7 @@ def main() -> None:
                 rank=dp_rank,
                 world_size=dp_size,
                 seed=tc.seed,
+                pack_sequences=config.data.pack_sequences,
             )
             dataloader = TorchDataLoader(
                 dataset,
@@ -277,6 +290,7 @@ def main() -> None:
                 seq_len=tc.seq_len,
                 tokenizer_path=config.data.tokenizer_path,
                 dataset_config=config.data.hf_dataset_config,
+                pack_sequences=config.data.pack_sequences,
             )
             sampler = DistributedSampler(
                 dataset,
@@ -461,6 +475,7 @@ def main() -> None:
                         batch = next(data_iter)
                     input_ids = batch["input_ids"].to(device)
                     labels = batch["labels"].to(device)
+                    doc_ids = batch["doc_ids"].to(device) if "doc_ids" in batch else None
                 else:
                     input_ids = torch.randint(
                         0, mc.vocab_size, (tc.batch_size, tc.seq_len), device=device
@@ -468,9 +483,10 @@ def main() -> None:
                     labels = torch.randint(
                         0, mc.vocab_size, (tc.batch_size, tc.seq_len), device=device
                     )
+                    doc_ids = None
 
                 with maybe_no_sync(model, micro_step, tc.grad_accum_steps):
-                    logits = model(input_ids)
+                    logits = model(input_ids, doc_ids=doc_ids)
                     loss = loss_fn(logits, labels)
 
                     # MoE auxiliary loss (no-op for dense: returns 0.0)

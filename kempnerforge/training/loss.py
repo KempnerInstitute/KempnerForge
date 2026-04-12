@@ -18,8 +18,16 @@ from kempnerforge.config.registry import registry
 
 @registry.register_loss("cross_entropy")
 def cross_entropy_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-    """Standard cross-entropy loss for language modeling."""
-    return F.cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1))
+    """Standard cross-entropy loss for language modeling.
+
+    Uses ``ignore_index=-100`` so packed-sequence boundary tokens (labeled -100
+    by the dataset) are excluded from the loss. When no -100 labels are present,
+    this has zero overhead.
+    """
+    flat_labels = labels.view(-1)
+    if (flat_labels == -100).all():
+        return torch.tensor(0.0, device=logits.device, dtype=torch.float32)
+    return F.cross_entropy(logits.view(-1, logits.size(-1)), flat_labels, ignore_index=-100)
 
 
 @registry.register_loss("chunked_cross_entropy")
@@ -36,6 +44,9 @@ def chunked_cross_entropy_loss(
     logsumexp path would create a ~8 GB float32 copy; this implementation
     avoids that entirely.
 
+    Uses ``ignore_index=-100`` so packed-sequence boundary tokens are excluded.
+    When no -100 labels are present, this has zero overhead.
+
     Note: the input logit tensor (B*S, V) is still fully materialized by the
     model's output head before reaching this function. For deeper savings
     (never materializing the full logit tensor), the output projection itself
@@ -51,7 +62,12 @@ def chunked_cross_entropy_loss(
     flat_labels = labels.view(-1)
 
     if num_tokens <= chunk_size:
-        return F.cross_entropy(flat_logits, flat_labels)
+        return F.cross_entropy(flat_logits, flat_labels, ignore_index=-100)
+
+    # Count valid (non-masked) tokens for correct averaging with ignore_index
+    valid_tokens = (flat_labels != -100).sum()
+    if valid_tokens == 0:
+        return torch.tensor(0.0, device=flat_logits.device, dtype=torch.float32)
 
     total_loss = torch.tensor(0.0, device=flat_logits.device, dtype=torch.float32)
     for i in range(0, num_tokens, chunk_size):
@@ -59,8 +75,9 @@ def chunked_cross_entropy_loss(
             flat_logits[i : i + chunk_size],
             flat_labels[i : i + chunk_size],
             reduction="sum",
+            ignore_index=-100,
         )
-    return total_loss / num_tokens
+    return total_loss / valid_tokens
 
 
 def z_loss(logits: torch.Tensor, weight: float) -> torch.Tensor:

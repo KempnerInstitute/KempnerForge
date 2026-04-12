@@ -22,6 +22,47 @@ from torch.utils.data import Dataset
 logger = logging.getLogger(__name__)
 
 
+def _compute_packed_output(tokens: np.ndarray, eos_token_id: int) -> dict[str, torch.Tensor]:
+    """Compute input_ids, labels, and doc_ids for a packed token sequence.
+
+    Detects document boundaries from EOS tokens. Each document includes its
+    trailing EOS. Cross-document label positions are masked with -100 so the
+    loss function can ignore them (predictions at the boundary between two
+    documents are meaningless).
+
+    Args:
+        tokens: Token array of shape ``(seq_len + 1,)`` (extra token for label offset).
+        eos_token_id: Token ID that marks document boundaries.
+
+    Returns:
+        Dict with ``input_ids`` (seq_len,), ``labels`` (seq_len, with -100 at
+        cross-document boundaries), and ``doc_ids`` (seq_len, integer document
+        assignment per input token for attention masking).
+    """
+    # Assign a document ID to each token: increment after every EOS
+    doc_ids = np.zeros(len(tokens), dtype=np.int64)
+    doc_id = 0
+    for i in range(len(tokens)):
+        doc_ids[i] = doc_id
+        if tokens[i] == eos_token_id:
+            doc_id += 1
+
+    token_tensor = torch.from_numpy(tokens.copy()).long()
+    doc_id_tensor = torch.from_numpy(doc_ids.copy())
+
+    input_ids = token_tensor[:-1]
+    labels = token_tensor[1:].clone()
+    input_doc_ids = doc_id_tensor[:-1]
+    label_doc_ids = doc_id_tensor[1:]
+
+    # Mask labels at cross-document boundaries (first token of a new document
+    # should not be predicted from the last token of the previous document)
+    cross_boundary = input_doc_ids != label_doc_ids
+    labels[cross_boundary] = -100
+
+    return {"input_ids": input_ids, "labels": labels, "doc_ids": input_doc_ids}
+
+
 class MemoryMappedDataset(Dataset):
     """Pre-tokenized dataset backed by memory-mapped numpy files.
 
@@ -43,8 +84,14 @@ class MemoryMappedDataset(Dataset):
         data_dir: str,
         seq_len: int,
         file_pattern: str = "*.npy",
+        pack_sequences: bool = False,
+        eos_token_id: int | None = None,
     ) -> None:
         self.seq_len = seq_len
+        self._pack_sequences = pack_sequences
+        self._eos_token_id = eos_token_id
+        if pack_sequences and eos_token_id is None:
+            raise ValueError("eos_token_id is required when pack_sequences=True")
 
         # Discover and sort data files for deterministic ordering
         data_path = Path(data_dir)
@@ -98,6 +145,10 @@ class MemoryMappedDataset(Dataset):
         end = start + self.seq_len
 
         tokens = self._mmaps[file_idx][start:end].astype(np.int64)
+
+        if self._pack_sequences:
+            return _compute_packed_output(tokens, self._eos_token_id)
+
         token_tensor = torch.from_numpy(tokens.copy())
 
         # Input: tokens[:-1], Target: tokens[1:] (standard causal LM)
@@ -149,12 +200,14 @@ class HuggingFaceDataset(Dataset):
         seq_len: int,
         tokenizer_path: str,
         dataset_config: str | None = None,
+        pack_sequences: bool = False,
     ) -> None:
         from datasets import load_dataset
         from transformers import AutoTokenizer
 
         self.seq_len = seq_len
         self.text_field = text_field
+        self._packing_enabled = pack_sequences
 
         # Load tokenizer
         self._tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
@@ -204,10 +257,15 @@ class HuggingFaceDataset(Dataset):
         return len(self._packed_sequences)
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
-        tokens = torch.from_numpy(self._packed_sequences[idx].copy())
+        tokens = self._packed_sequences[idx]
+
+        if self._packing_enabled:
+            return _compute_packed_output(tokens, self._eos_id)
+
+        token_tensor = torch.from_numpy(tokens.copy())
         return {
-            "input_ids": tokens[:-1],
-            "labels": tokens[1:],
+            "input_ids": token_tensor[:-1],
+            "labels": token_tensor[1:],
         }
 
     def state_dict(self) -> dict:
@@ -261,6 +319,7 @@ class StreamingHuggingFaceDataset(torch.utils.data.IterableDataset):
         world_size: int = 1,
         seed: int = 42,
         shuffle_buffer_size: int = 10000,
+        pack_sequences: bool = False,
     ) -> None:
         super().__init__()
         self.dataset_name = dataset_name
@@ -273,6 +332,7 @@ class StreamingHuggingFaceDataset(torch.utils.data.IterableDataset):
         self.world_size = world_size
         self.seed = seed
         self.shuffle_buffer_size = shuffle_buffer_size
+        self._packing_enabled = pack_sequences
 
         # Lazy-init tokenizer (avoid loading before fork in multiprocessing workers)
         self._tokenizer = None
@@ -349,11 +409,17 @@ class StreamingHuggingFaceDataset(torch.utils.data.IterableDataset):
             while len(buffer) >= chunk_size:
                 chunk = buffer[:chunk_size]
                 buffer = buffer[chunk_size:]
-                token_tensor = torch.tensor(chunk, dtype=torch.long)
-                yield {
-                    "input_ids": token_tensor[:-1],
-                    "labels": token_tensor[1:],
-                }
+
+                if self._packing_enabled:
+                    yield _compute_packed_output(
+                        np.array(chunk, dtype=np.int64), self._eos_id
+                    )
+                else:
+                    token_tensor = torch.tensor(chunk, dtype=torch.long)
+                    yield {
+                        "input_ids": token_tensor[:-1],
+                        "labels": token_tensor[1:],
+                    }
 
         # Epoch complete — reset for next iteration
         self._epoch += 1

@@ -74,9 +74,12 @@ class TransformerBlock(nn.Module):
         rope_sin: torch.Tensor,
         *,
         kv_cache: KVCache | None = None,
+        doc_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Pre-norm attention with residual
-        x = x + self.attention(self.attention_norm(x), rope_cos, rope_sin, kv_cache=kv_cache)
+        x = x + self.attention(
+            self.attention_norm(x), rope_cos, rope_sin, kv_cache=kv_cache, doc_ids=doc_ids
+        )
         # Pre-norm MLP with residual
         x = x + self.mlp(self.mlp_norm(x))
         return x
@@ -160,6 +163,7 @@ class Transformer(nn.Module):
         tokens: torch.Tensor,
         *,
         kv_caches: list[KVCache] | None = None,
+        doc_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Forward pass.
 
@@ -168,6 +172,9 @@ class Transformer(nn.Module):
             kv_caches: Optional list of KVCache (one per layer) for generation.
                 When provided, RoPE positions are offset by the current cache
                 fill level so incremental decode tokens get correct positions.
+            doc_ids: Optional per-token document IDs for packed sequences,
+                shape (batch, seq_len). Enables block-diagonal causal attention
+                that isolates documents within packed sequences.
 
         Returns:
             Logits tensor of shape (batch, seq_len, vocab_size).
@@ -190,7 +197,7 @@ class Transformer(nn.Module):
         # Transformer blocks
         for i, layer in enumerate(self.layers.values()):
             cache = kv_caches[i] if kv_caches is not None else None
-            h = layer(h, cos, sin, kv_cache=cache)
+            h = layer(h, cos, sin, kv_cache=cache, doc_ids=doc_ids)
 
         # Final norm
         h = self.norm(h)
