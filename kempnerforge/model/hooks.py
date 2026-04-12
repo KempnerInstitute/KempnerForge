@@ -91,6 +91,7 @@ class ActivationStore:
                 self._activations[name] = output.detach().cpu()
             elif isinstance(output, tuple) and len(output) > 0:
                 self._activations[name] = output[0].detach().cpu()
+
         return hook
 
     def _remove_hooks(self) -> None:

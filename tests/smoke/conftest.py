@@ -27,15 +27,21 @@ def pytest_addoption(parser):
     # --smoke is registered in tests/conftest.py (root) to work from any directory
     group.addoption("--slurm", action="store_true", default=False, help="Use srun launch mode")
     group.addoption(
-        "--jobid", type=str, default=None,
+        "--jobid",
+        type=str,
+        default=None,
         help="SLURM job ID (auto-detected if omitted)",
     )
     group.addoption(
-        "--tokenizer", type=str, default="gpt2",
+        "--tokenizer",
+        type=str,
+        default="gpt2",
         help="HF tokenizer for eval tests (default: gpt2, no auth)",
     )
     group.addoption(
-        "--vocab-size", type=int, default=50257,
+        "--vocab-size",
+        type=int,
+        default=50257,
         help="Vocab size matching the tokenizer (default: 50257 for gpt2)",
     )
 
@@ -48,7 +54,9 @@ def _detect_gpu_count() -> int:
     try:
         result = subprocess.run(
             [sys.executable, "-c", "import torch; print(torch.cuda.device_count())"],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True,
+            text=True,
+            timeout=30,
         )
         return int(result.stdout.strip()) if result.returncode == 0 else 0
     except Exception:
@@ -64,7 +72,9 @@ def _detect_slurm_env(jobid: str | None) -> dict[str, str | int] | None:
     try:
         result = subprocess.run(
             ["scontrol", "show", "job", str(jobid)],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
         if result.returncode != 0:
             return None
@@ -85,10 +95,16 @@ def _detect_slurm_env(jobid: str | None) -> dict[str, str | int] | None:
         gpus_per_node = total_tasks // nodes
 
         # Resolve master address
-        hostnames = subprocess.run(
-            ["scontrol", "show", "hostnames", nodelist_match.group(1)],
-            capture_output=True, text=True, timeout=10,
-        ).stdout.strip().split("\n")
+        hostnames = (
+            subprocess.run(
+                ["scontrol", "show", "hostnames", nodelist_match.group(1)],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            .stdout.strip()
+            .split("\n")
+        )
 
         return {
             "jobid": str(jobid),

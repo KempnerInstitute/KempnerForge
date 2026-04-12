@@ -233,9 +233,7 @@ class TestUpdateWeights:
 
     def test_update_wrong_count_raises(self):
         cumulative = [0, 100, 200]
-        sampler = MixtureSampler(
-            cumulative, weights=[0.5, 0.5], num_replicas=1, rank=0
-        )
+        sampler = MixtureSampler(cumulative, weights=[0.5, 0.5], num_replicas=1, rank=0)
         with pytest.raises(ValueError, match="Expected 2"):
             sampler.update_weights([1.0])
 
@@ -273,14 +271,9 @@ class TestPhaseTransitionLogic:
 
         phase_idx = 0
         for step in range(1, 11):
-            while (
-                phase_idx < len(phases)
-                and step >= phases[phase_idx].start_step
-            ):
+            while phase_idx < len(phases) and step >= phases[phase_idx].start_step:
                 phase = phases[phase_idx]
-                new_w = [
-                    phase.dataset_weights.get(n, original_weights[n]) for n in names
-                ]
+                new_w = [phase.dataset_weights.get(n, original_weights[n]) for n in names]
                 sampler.update_weights(new_w)
                 phase_idx += 1
 
@@ -307,9 +300,7 @@ class TestPhaseTransitionLogic:
 
         phase_idx = 0
         for step in range(1, 15):
-            while (
-                phase_idx < len(phases) and step >= phases[phase_idx].start_step
-            ):
+            while phase_idx < len(phases) and step >= phases[phase_idx].start_step:
                 phase = phases[phase_idx]
                 new_w = [phase.dataset_weights.get(n, original[n]) for n in names]
                 sampler.update_weights(new_w)
@@ -349,12 +340,8 @@ class TestPhaseTransitionLogic:
     def test_resume_derives_phase_from_step(self):
         """On resume, correct phase is derived from current step."""
         phases = [
-            TrainingPhase(
-                start_step=10, dataset_weights={"a": 0.8, "b": 0.2}, lr_scale=0.5
-            ),
-            TrainingPhase(
-                start_step=50, dataset_weights={"a": 0.2, "b": 0.8}, lr_scale=0.1
-            ),
+            TrainingPhase(start_step=10, dataset_weights={"a": 0.8, "b": 0.2}, lr_scale=0.5),
+            TrainingPhase(start_step=50, dataset_weights={"a": 0.2, "b": 0.8}, lr_scale=0.1),
         ]
 
         # Simulate resume at step 30 (should be in phase 0, before phase 1)
@@ -443,20 +430,26 @@ class TestAnnealingShortcut:
         names = ["code", "text"]
 
         # Via shortcut
-        shortcut_phase = TrainingPhase(
-            start_step=100, dataset_weights={"code": 0.3, "text": 0.7}
-        )
+        shortcut_phase = TrainingPhase(start_step=100, dataset_weights={"code": 0.3, "text": 0.7})
         s1 = MixtureSampler(
-            cumulative, weights=[0.5, 0.5], num_replicas=1, rank=0,
-            shuffle=False, seed=42,
+            cumulative,
+            weights=[0.5, 0.5],
+            num_replicas=1,
+            rank=0,
+            shuffle=False,
+            seed=42,
         )
         new_w = [shortcut_phase.dataset_weights.get(n, 0.5) for n in names]
         s1.update_weights(new_w)
 
         # Via explicit phase
         s2 = MixtureSampler(
-            cumulative, weights=[0.5, 0.5], num_replicas=1, rank=0,
-            shuffle=False, seed=42,
+            cumulative,
+            weights=[0.5, 0.5],
+            num_replicas=1,
+            rank=0,
+            shuffle=False,
+            seed=42,
         )
         s2.update_weights([0.3, 0.7])
 

@@ -183,8 +183,11 @@ def main() -> None:
         elif len(non_pp_dims) > 1:
             ckpt_pg = device_mesh[tuple(non_pp_dims)].get_group()
     ckpt_mgr = CheckpointManager(
-        config.checkpoint, model, optimizer,
-        process_group=ckpt_pg, pp_rank=ckpt_pp_rank,
+        config.checkpoint,
+        model,
+        optimizer,
+        process_group=ckpt_pg,
+        pp_rank=ckpt_pp_rank,
     )
 
     # Auto-resume
@@ -216,9 +219,7 @@ def main() -> None:
     # Resolve EOS token ID for sequence packing (needed by MemoryMappedDataset)
     eos_token_id = None
     if config.data.pack_sequences:
-        has_mmap = bool(config.data.dataset_path) or any(
-            s.path for s in config.data.datasets
-        )
+        has_mmap = bool(config.data.dataset_path) or any(s.path for s in config.data.datasets)
         if has_mmap:
             if not config.data.tokenizer_path:
                 raise ValueError("data.tokenizer_path is required when pack_sequences=True")
@@ -245,9 +246,7 @@ def main() -> None:
                 )
             elif src.hf_name:
                 if not config.data.tokenizer_path:
-                    raise ValueError(
-                        f"data.tokenizer_path required for HF dataset '{src.hf_name}'"
-                    )
+                    raise ValueError(f"data.tokenizer_path required for HF dataset '{src.hf_name}'")
                 ds = HuggingFaceDataset(
                     dataset_name=src.hf_name,
                     split=config.data.hf_dataset_split,
@@ -275,7 +274,10 @@ def main() -> None:
             temperature=config.data.mix_temperature,
         )
         dataloader = StatefulDataLoader(
-            dataset, batch_size=tc.batch_size, sampler=sampler, config=config.data,
+            dataset,
+            batch_size=tc.batch_size,
+            sampler=sampler,
+            config=config.data,
         )
         logger.info(
             f"Dataset: mixture of {len(sub_datasets)} sources, "
@@ -479,16 +481,11 @@ def main() -> None:
                     phase.dataset_weights.get(name, original_weights_dict[name])
                     for name in mixture_dataset.dataset_names
                 ]
-                sampler.update_weights(
-                    new_weights, temperature=config.data.mix_temperature
-                )
+                sampler.update_weights(new_weights, temperature=config.data.mix_temperature)
                 phase_lr_scale = phase.lr_scale
                 current_phase_idx = i + 1
         if current_phase_idx > 0:
-            logger.info(
-                f"Resumed into phase {current_phase_idx - 1}, "
-                f"lr_scale={phase_lr_scale}"
-            )
+            logger.info(f"Resumed into phase {current_phase_idx - 1}, lr_scale={phase_lr_scale}")
 
     logger.info(
         f"Starting training: step={step}, max_steps={tc.max_steps}, "
@@ -667,9 +664,7 @@ def main() -> None:
                     phase.dataset_weights.get(name, original_weights_dict[name])
                     for name in mixture_dataset.dataset_names
                 ]
-                sampler.update_weights(
-                    new_weights, temperature=config.data.mix_temperature
-                )
+                sampler.update_weights(new_weights, temperature=config.data.mix_temperature)
                 phase_lr_scale = phase.lr_scale
                 logger.info(
                     f"Phase transition at step {step}: "
@@ -743,16 +738,20 @@ def main() -> None:
         ckpt_extra = {"phase_idx": current_phase_idx} if active_phases else None
         if step % config.checkpoint.interval == 0:
             ckpt_mgr.save(
-                step=step, tokens_seen=tokens_seen,
-                scheduler=scheduler, extra=ckpt_extra,
+                step=step,
+                tokens_seen=tokens_seen,
+                scheduler=scheduler,
+                extra=ckpt_extra,
             )
 
         # Graceful shutdown
         if shutdown_handler.should_shutdown():
             logger.warning(f"Shutdown requested at step {step} — saving emergency checkpoint")
             ckpt_mgr.save(
-                step=step, tokens_seen=tokens_seen,
-                scheduler=scheduler, extra=ckpt_extra,
+                step=step,
+                tokens_seen=tokens_seen,
+                scheduler=scheduler,
+                extra=ckpt_extra,
             )
             shutdown_handler.finish()
             break

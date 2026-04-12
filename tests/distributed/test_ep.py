@@ -37,9 +37,7 @@ def ep_mesh():
         pytest.skip("EP tests require at least 2 GPUs")
     ep_size = 2
     dp_size = world_size // ep_size
-    mesh = init_device_mesh(
-        "cuda", (dp_size, ep_size), mesh_dim_names=("dp_shard", "ep")
-    )
+    mesh = init_device_mesh("cuda", (dp_size, ep_size), mesh_dim_names=("dp_shard", "ep"))
     return mesh
 
 
@@ -141,9 +139,7 @@ class TestEPPlusFSDP:
         world_size = dist.get_world_size()
         ep_size = 2
         dp_size = world_size // ep_size
-        mesh = init_device_mesh(
-            "cuda", (dp_size, ep_size), mesh_dim_names=("dp_shard", "ep")
-        )
+        mesh = init_device_mesh("cuda", (dp_size, ep_size), mesh_dim_names=("dp_shard", "ep"))
 
         model = Transformer(EP_CONFIG).cuda()
         apply_expert_parallel(model, mesh)
@@ -164,9 +160,7 @@ class TestEPPlusFSDP:
         world_size = dist.get_world_size()
         ep_size = 2
         dp_size = world_size // ep_size
-        mesh = init_device_mesh(
-            "cuda", (dp_size, ep_size), mesh_dim_names=("dp_shard", "ep")
-        )
+        mesh = init_device_mesh("cuda", (dp_size, ep_size), mesh_dim_names=("dp_shard", "ep"))
 
         model = Transformer(EP_CONFIG).cuda()
         apply_expert_parallel(model, mesh)

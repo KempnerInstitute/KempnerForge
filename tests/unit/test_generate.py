@@ -13,6 +13,7 @@ from kempnerforge.model.transformer import Transformer
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _tiny_config() -> ModelConfig:
     return ModelConfig(dim=64, n_layers=2, n_heads=2, vocab_size=128, max_seq_len=64)
 
@@ -32,8 +33,12 @@ def _tiny_model() -> Transformer:
 class TestKVCache:
     def test_update_shapes(self):
         cache = KVCache(
-            batch_size=2, max_seq_len=32, n_kv_heads=2, head_dim=16,
-            dtype=torch.float32, device=torch.device("cpu"),
+            batch_size=2,
+            max_seq_len=32,
+            n_kv_heads=2,
+            head_dim=16,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
         )
         k_new = torch.randn(2, 2, 5, 16)
         v_new = torch.randn(2, 2, 5, 16)
@@ -45,8 +50,12 @@ class TestKVCache:
 
     def test_incremental_update(self):
         cache = KVCache(
-            batch_size=1, max_seq_len=16, n_kv_heads=1, head_dim=8,
-            dtype=torch.float32, device=torch.device("cpu"),
+            batch_size=1,
+            max_seq_len=16,
+            n_kv_heads=1,
+            head_dim=8,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
         )
         # First update: 3 tokens (prefill)
         k1 = torch.randn(1, 1, 3, 8)
@@ -68,8 +77,12 @@ class TestKVCache:
 
     def test_initial_state(self):
         cache = KVCache(
-            batch_size=1, max_seq_len=8, n_kv_heads=2, head_dim=4,
-            dtype=torch.float32, device=torch.device("cpu"),
+            batch_size=1,
+            max_seq_len=8,
+            n_kv_heads=2,
+            head_dim=4,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
         )
         assert cache.seq_len == 0
         assert cache.k.shape == (1, 2, 8, 4)
@@ -185,7 +198,11 @@ class TestGenerate:
 
         # Now use that token as EOS — generation must stop after 1 token
         output = generate(
-            model, prompt, max_new_tokens=50, temperature=0, eos_token_id=first_token,
+            model,
+            prompt,
+            max_new_tokens=50,
+            temperature=0,
+            eos_token_id=first_token,
         )
         generated_len = output.shape[1] - prompt.shape[1]
         assert generated_len == 1
@@ -225,8 +242,12 @@ class TestGenerate:
     def test_kv_cache_with_gqa(self):
         """Generation should work with GQA (n_kv_heads < n_heads)."""
         config = ModelConfig(
-            dim=64, n_layers=2, n_heads=4, n_kv_heads=2,
-            vocab_size=128, max_seq_len=64,
+            dim=64,
+            n_layers=2,
+            n_heads=4,
+            n_kv_heads=2,
+            vocab_size=128,
+            max_seq_len=64,
         )
         model = Transformer(config)
         model.eval()

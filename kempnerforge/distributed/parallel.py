@@ -166,10 +166,7 @@ def _has_ep_moe(module: torch.nn.Module) -> bool:
     """Check if a module contains MoE with expert parallelism active."""
     from kempnerforge.model.moe import MoEMLP
 
-    return any(
-        isinstance(m, MoEMLP) and m.ep_world_size > 1
-        for m in module.modules()
-    )
+    return any(isinstance(m, MoEMLP) and m.ep_world_size > 1 for m in module.modules())
 
 
 def apply_fsdp2(
@@ -226,11 +223,15 @@ def apply_fsdp2(
     for layer in model.layers.values():
         if _has_ep_moe(layer):
             fully_shard(
-                layer.attention, mesh=dp_mesh, mp_policy=policy,
+                layer.attention,
+                mesh=dp_mesh,
+                mp_policy=policy,
                 reshard_after_forward=reshard_after_forward,
             )
             fully_shard(
-                layer.mlp, mesh=dp_mesh, mp_policy=policy,
+                layer.mlp,
+                mesh=dp_mesh,
+                mp_policy=policy,
                 reshard_after_forward=reshard_after_forward,
             )
             ep_sub_wrapped += 1

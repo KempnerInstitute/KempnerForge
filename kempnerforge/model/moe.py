@@ -47,7 +47,7 @@ def grouped_expert_forward(
 
     # Stack expert weights into (E, in, out) for grouped matmul.
     # nn.Linear stores weight as (out, in), so transpose to (in, out).
-    up_w = torch.stack([e.up_proj.weight.t() for e in experts])      # (E, dim, H)
+    up_w = torch.stack([e.up_proj.weight.t() for e in experts])  # (E, dim, H)
     down_w = torch.stack([e.down_proj.weight.t() for e in experts])  # (E, H, dim)
     if is_swiglu:
         gate_w = torch.stack([e.gate_proj.weight.t() for e in experts])  # (E, dim, H)
@@ -57,27 +57,27 @@ def grouped_expert_forward(
     offset = 0
     for i, count in enumerate(tokens_per_expert):
         if count > 0:
-            x_padded[i, :count] = x_sorted[offset:offset + count]
+            x_padded[i, :count] = x_sorted[offset : offset + count]
         offset += count
 
     # Grouped matmuls — 3 for SwiGLU, 2 for StandardMLP.
     if is_swiglu:
-        gate = torch._grouped_mm(x_padded, gate_w)   # (E, M, H)
-        up = torch._grouped_mm(x_padded, up_w)       # (E, M, H)
-        hidden = F.silu(gate) * up                     # (E, M, H)
+        gate = torch._grouped_mm(x_padded, gate_w)  # (E, M, H)
+        up = torch._grouped_mm(x_padded, up_w)  # (E, M, H)
+        hidden = F.silu(gate) * up  # (E, M, H)
     else:
-        hidden = torch._grouped_mm(x_padded, up_w)    # (E, M, H)
+        hidden = torch._grouped_mm(x_padded, up_w)  # (E, M, H)
         act_fn = experts[0]._activation
         hidden = act_fn(hidden)
 
-    out_padded = torch._grouped_mm(hidden, down_w)     # (E, M, dim)
+    out_padded = torch._grouped_mm(hidden, down_w)  # (E, M, dim)
 
     # Unpad back to flat sorted order.
     output = torch.zeros_like(x_sorted)
     offset = 0
     for i, count in enumerate(tokens_per_expert):
         if count > 0:
-            output[offset:offset + count] = out_padded[i, :count]
+            output[offset : offset + count] = out_padded[i, :count]
         offset += count
 
     return output
@@ -169,11 +169,13 @@ class MoEMLP(nn.Module):
         use_grouped = _HAS_GROUPED_MM and x_flat.dtype in _GROUPED_MM_DTYPES
         if use_grouped:
             # Expand (token, k) pairs → flat entries sorted by expert.
-            flat_indices = indices.reshape(-1)           # (T*K,)
-            flat_weights = weights.reshape(-1)           # (T*K,)
+            flat_indices = indices.reshape(-1)  # (T*K,)
+            flat_weights = weights.reshape(-1)  # (T*K,)
             token_ids = (
                 torch.arange(num_tokens, device=x_flat.device)
-                .unsqueeze(1).expand(-1, top_k).reshape(-1)
+                .unsqueeze(1)
+                .expand(-1, top_k)
+                .reshape(-1)
             )
 
             sort_order = torch.argsort(flat_indices, stable=True)
@@ -237,16 +239,23 @@ class MoEMLP(nn.Module):
         # carried through unchanged by the residual connection.
         if self.capacity_factor > 0:
             weights, indices = _apply_capacity(
-                weights, indices, self.num_experts, self.capacity_factor,
+                weights,
+                indices,
+                self.num_experts,
+                self.capacity_factor,
             )
 
         if self.ep_world_size > 1:
             from kempnerforge.distributed.expert_parallel import ep_dispatch_and_compute
 
             output = ep_dispatch_and_compute(
-                x_flat, weights, indices,
-                self.experts, self.ep_group,
-                self.local_expert_start, self.num_local_experts,
+                x_flat,
+                weights,
+                indices,
+                self.experts,
+                self.ep_group,
+                self.local_expert_start,
+                self.num_local_experts,
                 self.ep_world_size,
             )
         else:
@@ -283,9 +292,7 @@ def build_moe(
     router_builder = registry.get("router", router_type)
     router = router_builder(dim, num_experts, top_k)
 
-    experts = nn.ModuleList([
-        build_mlp(dim, hidden_dim, activation) for _ in range(num_experts)
-    ])
+    experts = nn.ModuleList([build_mlp(dim, hidden_dim, activation) for _ in range(num_experts)])
 
     shared_expert = None
     if shared_experts > 0:

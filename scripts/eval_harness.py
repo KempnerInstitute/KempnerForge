@@ -44,32 +44,42 @@ DEFAULT_TASKS = "hellaswag,arc_easy,arc_challenge,winogrande,piqa,boolq"
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Run lm-eval-harness on a KempnerForge checkpoint"
-    )
+    parser = argparse.ArgumentParser(description="Run lm-eval-harness on a KempnerForge checkpoint")
     parser.add_argument(
-        "--checkpoint", type=str, default=None,
+        "--checkpoint",
+        type=str,
+        default=None,
         help="DCP checkpoint directory (will be converted to HF format)",
     )
     parser.add_argument(
-        "--config", type=str, default=None,
+        "--config",
+        type=str,
+        default=None,
         help="TOML config file (required with --checkpoint for model architecture)",
     )
     parser.add_argument(
-        "--hf-model", type=str, default=None,
+        "--hf-model",
+        type=str,
+        default=None,
         help="Pre-converted HuggingFace model directory (skip DCP conversion)",
     )
     parser.add_argument(
-        "--tasks", type=str, default=DEFAULT_TASKS,
+        "--tasks",
+        type=str,
+        default=DEFAULT_TASKS,
         help=f"Comma-separated tasks (default: {DEFAULT_TASKS})",
     )
     parser.add_argument(
-        "--batch-size", type=int, default=8,
+        "--batch-size",
+        type=int,
+        default=8,
         help="Batch size for evaluation (default: 8)",
     )
     parser.add_argument("--output", type=str, default=None, help="Output JSON file path")
     parser.add_argument(
-        "--num-fewshot", type=int, default=None,
+        "--num-fewshot",
+        type=int,
+        default=None,
         help="Number of few-shot examples (default: task-specific)",
     )
     args = parser.parse_args()

@@ -287,6 +287,7 @@ def _build_schedule_free_adamw(
 # Muon optimizer
 # ---------------------------------------------------------------------------
 
+
 def _newton_schulz(G: torch.Tensor, steps: int = 5) -> torch.Tensor:
     """Approximate orthogonal projection via Newton-Schulz iteration.
 
@@ -326,6 +327,7 @@ def _get_local_tensor(t: torch.Tensor) -> torch.Tensor:
     """
     try:
         from torch.distributed._tensor import DTensor
+
         if isinstance(t, DTensor):
             return t._local_tensor
     except ImportError:
@@ -377,13 +379,17 @@ class Muon(torch.optim.Optimizer):
         self._initial_adam_lr = adam_lr
 
         # Create internal AdamW for 1D params
-        self._adam = torch.optim.AdamW(
-            adam_params,
-            lr=adam_lr,
-            betas=adam_betas,
-            eps=adam_eps,
-            fused=torch.cuda.is_available(),
-        ) if any(len(g["params"]) > 0 for g in adam_params) else None
+        self._adam = (
+            torch.optim.AdamW(
+                adam_params,
+                lr=adam_lr,
+                betas=adam_betas,
+                eps=adam_eps,
+                fused=torch.cuda.is_available(),
+            )
+            if any(len(g["params"]) > 0 for g in adam_params)
+            else None
+        )
 
         defaults = dict(lr=lr, momentum=momentum, weight_decay=weight_decay, ns_steps=ns_steps)
         super().__init__(muon_params, defaults)
@@ -531,6 +537,7 @@ def _build_muon(
 # ---------------------------------------------------------------------------
 # Optimizer construction
 # ---------------------------------------------------------------------------
+
 
 def _should_decay(name: str, param: torch.nn.Parameter) -> bool:
     """Decide whether a parameter should receive weight decay.

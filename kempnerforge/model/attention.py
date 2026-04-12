@@ -41,9 +41,7 @@ class KVCache:
         )
         self.seq_len = 0
 
-    def update(
-        self, k_new: torch.Tensor, v_new: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def update(self, k_new: torch.Tensor, v_new: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Append new key/value entries and return full cached tensors.
 
         Args:
@@ -163,9 +161,7 @@ class Attention(nn.Module):
             seq_len_kv = k.shape[2]
             # Block-diagonal mask: same-document AND causal
             doc_mask = doc_ids.unsqueeze(2) == doc_ids.unsqueeze(1)  # (B, S, S)
-            causal = torch.ones(
-                seq_len, seq_len_kv, dtype=torch.bool, device=q.device
-            ).tril()
+            causal = torch.ones(seq_len, seq_len_kv, dtype=torch.bool, device=q.device).tril()
             attn_mask = (doc_mask & causal).unsqueeze(1)  # (B, 1, S, S)
             out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         else:
@@ -203,15 +199,13 @@ class Attention(nn.Module):
         seq_len_kv = k.shape[2]
         if doc_ids is not None:
             doc_mask = doc_ids.unsqueeze(2) == doc_ids.unsqueeze(1)
-            causal = torch.ones(
-                seq_len, seq_len_kv, dtype=torch.bool, device=q.device
-            ).tril()
+            causal = torch.ones(seq_len, seq_len_kv, dtype=torch.bool, device=q.device).tril()
             mask = ~(doc_mask & causal).unsqueeze(1)
             attn = attn.masked_fill(mask, float("-inf"))
         elif kv_cache is None or seq_len > 1:
-            causal = torch.ones(
-                seq_len, seq_len_kv, dtype=torch.bool, device=q.device
-            ).triu(diagonal=1)
+            causal = torch.ones(seq_len, seq_len_kv, dtype=torch.bool, device=q.device).triu(
+                diagonal=1
+            )
             attn = attn.masked_fill(causal.unsqueeze(0).unsqueeze(0), float("-inf"))
 
         attn_weights = F.softmax(attn, dim=-1)

@@ -47,11 +47,10 @@ class _AllToAll(torch.autograd.Function):
         ctx.bwd_input_splits = output_split_sizes
         ctx.group = group
         x = x.contiguous()
-        out = torch.empty(
-            sum(output_split_sizes), *x.shape[1:], dtype=x.dtype, device=x.device
-        )
+        out = torch.empty(sum(output_split_sizes), *x.shape[1:], dtype=x.dtype, device=x.device)
         dist.all_to_all_single(
-            out, x,
+            out,
+            x,
             output_split_sizes=output_split_sizes,
             input_split_sizes=input_split_sizes,
             group=group,
@@ -68,7 +67,8 @@ class _AllToAll(torch.autograd.Function):
             device=grad_output.device,
         )
         dist.all_to_all_single(
-            grad_input, grad_output,
+            grad_input,
+            grad_output,
             output_split_sizes=ctx.bwd_output_splits,
             input_split_sizes=ctx.bwd_input_splits,
             group=ctx.group,
@@ -144,9 +144,7 @@ def ep_dispatch_and_compute(
 
     # --- 3. Exchange counts so each rank knows what it will receive ---
     recv_counts = torch.zeros_like(send_counts)
-    dist.all_to_all_single(
-        recv_counts, send_counts, group=ep_group
-    )
+    dist.all_to_all_single(recv_counts, send_counts, group=ep_group)
     recv_counts_list = recv_counts.tolist()
 
     # --- 4. All-to-all: send tokens to expert-owning ranks ---
@@ -158,7 +156,8 @@ def ep_dispatch_and_compute(
         sum(recv_counts_list), 1, dtype=torch.float32, device=x.device
     )
     dist.all_to_all_single(
-        received_expert_ids, sorted_expert_ids_float,
+        received_expert_ids,
+        sorted_expert_ids_float,
         output_split_sizes=recv_counts_list,
         input_split_sizes=send_counts_list,
         group=ep_group,
@@ -181,12 +180,12 @@ def ep_dispatch_and_compute(
 
         # Map global expert IDs to local indices for bincount.
         local_ids = sorted_ids - local_expert_start
-        tokens_per_expert = torch.bincount(
-            local_ids, minlength=num_local_experts
-        ).tolist()
+        tokens_per_expert = torch.bincount(local_ids, minlength=num_local_experts).tolist()
 
         local_output_sorted = grouped_expert_forward(
-            sorted_recv, tokens_per_expert, experts,
+            sorted_recv,
+            tokens_per_expert,
+            experts,
         )
 
         # Unsort back to received order.
@@ -243,9 +242,9 @@ def ep_dispatch_and_compute(
     output = torch.zeros(num_tokens, dim, dtype=x.dtype, device=x.device)
     output.scatter_add_(
         0,
-        token_ids[torch.arange(len(token_ids), device=x.device)].unsqueeze(-1).expand_as(
-            returned_unsorted
-        ),
+        token_ids[torch.arange(len(token_ids), device=x.device)]
+        .unsqueeze(-1)
+        .expand_as(returned_unsorted),
         returned_unsorted,
     )
 
@@ -295,9 +294,7 @@ def apply_expert_parallel(model: torch.nn.Module, device_mesh: DeviceMesh | None
         end = start + experts_per_rank
 
         # Prune to local experts only
-        local_experts = torch.nn.ModuleList(
-            [module.experts[i] for i in range(start, end)]
-        )
+        local_experts = torch.nn.ModuleList([module.experts[i] for i in range(start, end)])
         module.experts = local_experts
 
         # Store EP metadata
@@ -309,6 +306,5 @@ def apply_expert_parallel(model: torch.nn.Module, device_mesh: DeviceMesh | None
         applied += 1
 
     logger.info(
-        f"Applied expert parallelism: ep_size={ep_size}, ep_rank={ep_rank}, "
-        f"layers={applied}"
+        f"Applied expert parallelism: ep_size={ep_size}, ep_rank={ep_rank}, layers={applied}"
     )

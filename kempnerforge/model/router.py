@@ -139,9 +139,7 @@ class SigmoidTopKRouter(nn.Module):
             # Bias adjustment: push under-utilized experts up, over-utilized down
             target = 1.0 / self.num_experts
             with torch.no_grad():
-                self.expert_bias.add_(
-                    self.bias_update_rate * (target - self.expert_ema.float())
-                )
+                self.expert_bias.add_(self.bias_update_rate * (target - self.expert_ema.float()))
 
         # No auxiliary loss
         self.aux_loss = torch.tensor(0.0, device=x.device)

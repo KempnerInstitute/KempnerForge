@@ -290,20 +290,14 @@ class TestMixtureSampler:
     def test_deterministic(self):
         """Same seed and epoch produce identical sequences."""
         cumulative = [0, 50, 100]
-        s1 = MixtureSampler(
-            cumulative, weights=[0.5, 0.5], num_replicas=1, rank=0, seed=42
-        )
-        s2 = MixtureSampler(
-            cumulative, weights=[0.5, 0.5], num_replicas=1, rank=0, seed=42
-        )
+        s1 = MixtureSampler(cumulative, weights=[0.5, 0.5], num_replicas=1, rank=0, seed=42)
+        s2 = MixtureSampler(cumulative, weights=[0.5, 0.5], num_replicas=1, rank=0, seed=42)
         assert list(s1) == list(s2)
 
     def test_different_epoch_different_order(self):
         """Different epochs produce different orderings."""
         cumulative = [0, 100]
-        sampler = MixtureSampler(
-            cumulative, weights=[1.0], num_replicas=1, rank=0, seed=42
-        )
+        sampler = MixtureSampler(cumulative, weights=[1.0], num_replicas=1, rank=0, seed=42)
         order_0 = list(sampler)
         sampler.set_epoch(1)
         order_1 = list(sampler)
@@ -312,9 +306,7 @@ class TestMixtureSampler:
     def test_skip_ahead(self):
         """Skip-ahead produces tail of full iteration."""
         cumulative = [0, 100]
-        sampler = MixtureSampler(
-            cumulative, weights=[1.0], num_replicas=1, rank=0, shuffle=False
-        )
+        sampler = MixtureSampler(cumulative, weights=[1.0], num_replicas=1, rank=0, shuffle=False)
         full = list(sampler)
         sampler.set_skip(10)
         skipped = list(sampler)
@@ -322,18 +314,14 @@ class TestMixtureSampler:
 
     def test_state_dict_round_trip(self):
         cumulative = [0, 50, 100]
-        sampler = MixtureSampler(
-            cumulative, weights=[0.5, 0.5], num_replicas=2, rank=1, seed=99
-        )
+        sampler = MixtureSampler(cumulative, weights=[0.5, 0.5], num_replicas=2, rank=1, seed=99)
         sampler.set_epoch(5)
         state = sampler.state_dict()
         assert state["epoch"] == 5
         assert state["seed"] == 99
         assert state["rank"] == 1
 
-        sampler2 = MixtureSampler(
-            cumulative, weights=[0.5, 0.5], num_replicas=2, rank=1, seed=99
-        )
+        sampler2 = MixtureSampler(cumulative, weights=[0.5, 0.5], num_replicas=2, rank=1, seed=99)
         sampler2.load_state_dict(state)
         assert sampler2._epoch == 5
 
@@ -360,11 +348,19 @@ class TestTemperatureScaling:
         """Temperature=1.0 should produce same proportions as raw weights."""
         cumulative = [0, 500, 1000]
         s_t1 = MixtureSampler(
-            cumulative, weights=[0.7, 0.3], num_replicas=1, rank=0,
-            shuffle=False, temperature=1.0,
+            cumulative,
+            weights=[0.7, 0.3],
+            num_replicas=1,
+            rank=0,
+            shuffle=False,
+            temperature=1.0,
         )
         s_raw = MixtureSampler(
-            cumulative, weights=[0.7, 0.3], num_replicas=1, rank=0, shuffle=False,
+            cumulative,
+            weights=[0.7, 0.3],
+            num_replicas=1,
+            rank=0,
+            shuffle=False,
         )
         assert list(s_t1) == list(s_raw)
 
@@ -373,8 +369,12 @@ class TestTemperatureScaling:
         cumulative = [0, 500, 1000]
         # With T=1, 0.9/0.1 → ds0 gets 90%
         s_hot = MixtureSampler(
-            cumulative, weights=[0.9, 0.1], num_replicas=1, rank=0,
-            shuffle=False, temperature=5.0,
+            cumulative,
+            weights=[0.9, 0.1],
+            num_replicas=1,
+            rank=0,
+            shuffle=False,
+            temperature=5.0,
         )
         indices = list(s_hot)
         ds0_count = sum(1 for i in indices if i < 500)
@@ -386,8 +386,12 @@ class TestTemperatureScaling:
         """Low temperature should concentrate on the highest-weight dataset."""
         cumulative = [0, 500, 1000]
         s_cold = MixtureSampler(
-            cumulative, weights=[0.6, 0.4], num_replicas=1, rank=0,
-            shuffle=False, temperature=0.1,
+            cumulative,
+            weights=[0.6, 0.4],
+            num_replicas=1,
+            rank=0,
+            shuffle=False,
+            temperature=0.1,
         )
         indices = list(s_cold)
         ds0_count = sum(1 for i in indices if i < 500)
@@ -410,8 +414,12 @@ class TestMixtureSamplerWithDataset:
         mix = MixtureDataset([ds_a, ds_b], ["a", "b"])
 
         sampler = MixtureSampler(
-            mix.cumulative_sizes, weights=[0.5, 0.5],
-            num_replicas=1, rank=0, shuffle=True, seed=42,
+            mix.cumulative_sizes,
+            weights=[0.5, 0.5],
+            num_replicas=1,
+            rank=0,
+            shuffle=True,
+            seed=42,
         )
         for idx in sampler:
             assert 0 <= idx < len(mix)

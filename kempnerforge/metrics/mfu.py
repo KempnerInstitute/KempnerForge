@@ -135,9 +135,7 @@ def _moe_flops_per_token(config: ModelConfig, seq_len: int) -> int:
     )
     mlp_params = 3 * config.dim * config.computed_ffn_hidden_dim
 
-    n_moe_layers = sum(
-        1 for i in range(config.n_layers) if (i + 1) % config.moe_frequency == 0
-    )
+    n_moe_layers = sum(1 for i in range(config.n_layers) if (i + 1) % config.moe_frequency == 0)
     n_dense_layers = config.n_layers - n_moe_layers
 
     dense_active = n_dense_layers * (attn_params + mlp_params)

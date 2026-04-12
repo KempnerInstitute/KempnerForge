@@ -104,8 +104,13 @@ class TestMFU:
     def test_moe_seq_len_override(self):
         """Explicit seq_len should override config.max_seq_len in flops calculation."""
         config = ModelConfig(
-            dim=256, n_layers=4, n_heads=4, vocab_size=1000, max_seq_len=128,
-            num_experts=4, moe_top_k=2,
+            dim=256,
+            n_layers=4,
+            n_heads=4,
+            vocab_size=1000,
+            max_seq_len=128,
+            num_experts=4,
+            moe_top_k=2,
         )
         flops_short = estimate_model_flops_per_token(config, seq_len=64)
         flops_long = estimate_model_flops_per_token(config, seq_len=256)

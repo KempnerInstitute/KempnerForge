@@ -254,7 +254,8 @@ class TestScheduleFreeAdamW:
         # No warmup — full LR from step 1
         opt_no_warmup = ScheduleFreeAdamW(
             [{"params": list(model.parameters()), "weight_decay": 0.0}],
-            lr=base_lr, warmup_steps=0,
+            lr=base_lr,
+            warmup_steps=0,
         )
         weight_before = model.weight.data.clone()
         x = torch.randn(4, 16)
@@ -269,7 +270,8 @@ class TestScheduleFreeAdamW:
         # With warmup — step 1 uses lr * (1/100) = 0.01%
         opt_warmup = ScheduleFreeAdamW(
             [{"params": list(model.parameters()), "weight_decay": 0.0}],
-            lr=base_lr, warmup_steps=100,
+            lr=base_lr,
+            warmup_steps=100,
         )
         opt_warmup.zero_grad()
         model(x).sum().backward()
@@ -371,9 +373,7 @@ class TestScheduleFreeAdamW:
         ):
             if p1 in optimizer.state and "z" in optimizer.state[p1]:
                 for key in ("z", "v"):
-                    torch.testing.assert_close(
-                        optimizer.state[p1][key], optimizer2.state[p2][key]
-                    )
+                    torch.testing.assert_close(optimizer.state[p1][key], optimizer2.state[p2][key])
 
     def test_weight_decay(self):
         torch.manual_seed(42)

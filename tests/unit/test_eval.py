@@ -47,9 +47,7 @@ def _make_eval_dataloader(
 
 
 def _loss_fn(logits, labels):
-    return torch.nn.functional.cross_entropy(
-        logits.view(-1, logits.size(-1)), labels.view(-1)
-    )
+    return torch.nn.functional.cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1))
 
 
 class TestRunEval:

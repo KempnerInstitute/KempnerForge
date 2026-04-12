@@ -94,9 +94,7 @@ def main() -> None:
         logger.error("No checkpoint found. Specify --checkpoint.load_path or --checkpoint.dir")
         sys.exit(1)
 
-    step, tokens_seen = ckpt_mgr.load(
-        path=load_path, exclude_keys=["optimizer"]
-    )
+    step, tokens_seen = ckpt_mgr.load(path=load_path, exclude_keys=["optimizer"])
     logger.info(f"Loaded checkpoint: step={step}, tokens_seen={tokens_seen:,}")
 
     # --- Eval data ---
@@ -150,9 +148,7 @@ def main() -> None:
 
         eval_dataset = _EvalTensorDataset(packed)
     else:
-        logger.error(
-            "No eval data configured. Set --eval.dataset_path or --eval.hf_dataset_name"
-        )
+        logger.error("No eval data configured. Set --eval.dataset_path or --eval.hf_dataset_name")
         sys.exit(1)
 
     eval_sampler = DistributedSampler(

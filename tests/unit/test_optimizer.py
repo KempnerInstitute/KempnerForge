@@ -199,7 +199,6 @@ class TestMuon:
                 assert isinstance(buf, torch.Tensor)
                 assert buf.shape == p.grad.shape
 
-
     def test_state_dict_roundtrip(self):
         """state_dict/load_state_dict must preserve both Muon and internal AdamW state."""
         torch.manual_seed(42)

@@ -412,9 +412,7 @@ class StreamingHuggingFaceDataset(torch.utils.data.IterableDataset):
                 buffer = buffer[chunk_size:]
 
                 if self._packing_enabled:
-                    yield _compute_packed_output(
-                        np.array(chunk, dtype=np.int64), self._eos_id
-                    )
+                    yield _compute_packed_output(np.array(chunk, dtype=np.int64), self._eos_id)
                 else:
                     token_tensor = torch.tensor(chunk, dtype=torch.long)
                     yield {

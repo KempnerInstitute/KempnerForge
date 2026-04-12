@@ -143,16 +143,10 @@ class TestRoundTrip:
 
 class TestMoEKFtoHFKeyMapping:
     def test_router_gate(self):
-        assert (
-            _kf_to_hf_key("layers.0.mlp.router.gate.weight")
-            == "model.layers.0.mlp.gate.weight"
-        )
+        assert _kf_to_hf_key("layers.0.mlp.router.gate.weight") == "model.layers.0.mlp.gate.weight"
 
     def test_router_expert_bias(self):
-        assert (
-            _kf_to_hf_key("layers.0.mlp.router.expert_bias")
-            == "model.layers.0.mlp.expert_bias"
-        )
+        assert _kf_to_hf_key("layers.0.mlp.router.expert_bias") == "model.layers.0.mlp.expert_bias"
 
     def test_expert_projections(self):
         assert (
@@ -180,8 +174,7 @@ class TestMoEKFtoHFKeyMapping:
 
     def test_router_gate_different_layers(self):
         assert (
-            _kf_to_hf_key("layers.15.mlp.router.gate.weight")
-            == "model.layers.15.mlp.gate.weight"
+            _kf_to_hf_key("layers.15.mlp.router.gate.weight") == "model.layers.15.mlp.gate.weight"
         )
 
 
@@ -192,16 +185,10 @@ class TestMoEKFtoHFKeyMapping:
 
 class TestMoEHFtoKFKeyMapping:
     def test_router_gate(self):
-        assert (
-            _hf_to_kf_key("model.layers.0.mlp.gate.weight")
-            == "layers.0.mlp.router.gate.weight"
-        )
+        assert _hf_to_kf_key("model.layers.0.mlp.gate.weight") == "layers.0.mlp.router.gate.weight"
 
     def test_router_expert_bias(self):
-        assert (
-            _hf_to_kf_key("model.layers.0.mlp.expert_bias")
-            == "layers.0.mlp.router.expert_bias"
-        )
+        assert _hf_to_kf_key("model.layers.0.mlp.expert_bias") == "layers.0.mlp.router.expert_bias"
 
     def test_expert_projections(self):
         assert (
@@ -218,8 +205,7 @@ class TestMoEHFtoKFKeyMapping:
     def test_gate_proj_not_confused_with_router_gate(self):
         """mlp.gate_proj should NOT become mlp.router.gate_proj."""
         assert (
-            _hf_to_kf_key("model.layers.0.mlp.gate_proj.weight")
-            == "layers.0.mlp.gate_proj.weight"
+            _hf_to_kf_key("model.layers.0.mlp.gate_proj.weight") == "layers.0.mlp.gate_proj.weight"
         )
 
 

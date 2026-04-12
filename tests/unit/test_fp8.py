@@ -71,8 +71,12 @@ class TestApplyFloat8:
         from kempnerforge.model.transformer import Transformer  # triggers registration
 
         mc = ModelConfig(
-            dim=64, n_layers=2, n_heads=4, vocab_size=256,
-            num_experts=4, moe_top_k=2,
+            dim=64,
+            n_layers=2,
+            n_heads=4,
+            vocab_size=256,
+            num_experts=4,
+            moe_top_k=2,
         )
         return Transformer(mc)
 
@@ -91,12 +95,9 @@ class TestApplyFloat8:
         apply_float8(small_transformer, enable_fsdp_float8_all_gather=False)
 
         # All nn.Linear should now be Float8Linear
-        float8_count = sum(
-            1 for m in small_transformer.modules() if isinstance(m, Float8Linear)
-        )
+        float8_count = sum(1 for m in small_transformer.modules() if isinstance(m, Float8Linear))
         plain_linear_count = sum(
-            1 for m in small_transformer.modules()
-            if type(m) is torch.nn.Linear
+            1 for m in small_transformer.modules() if type(m) is torch.nn.Linear
         )
         assert float8_count > 0
         assert plain_linear_count == 0, f"Expected 0 plain nn.Linear, got {plain_linear_count}"
@@ -123,14 +124,10 @@ class TestApplyFloat8:
         for layer in moe_transformer.layers.values():
             if hasattr(layer.mlp, "router"):
                 gate = layer.mlp.router.gate
-                assert type(gate) is torch.nn.Linear, (
-                    "Router gate was converted to Float8Linear"
-                )
+                assert type(gate) is torch.nn.Linear, "Router gate was converted to Float8Linear"
 
         # Non-expert, non-router modules (attention, output) should be Float8Linear
-        float8_count = sum(
-            1 for m in moe_transformer.modules() if isinstance(m, Float8Linear)
-        )
+        float8_count = sum(1 for m in moe_transformer.modules() if isinstance(m, Float8Linear))
         assert float8_count > 0, "No Float8Linear modules found — conversion failed"
 
     def test_apply_float8_forward_backward(self, small_transformer):
@@ -146,9 +143,7 @@ class TestApplyFloat8:
 
         loss = out.sum()
         loss.backward()
-        grad_count = sum(
-            1 for p in small_transformer.parameters() if p.grad is not None
-        )
+        grad_count = sum(1 for p in small_transformer.parameters() if p.grad is not None)
         assert grad_count > 0
 
     def test_build_parallel_model_fp8_flag(self):
@@ -163,7 +158,5 @@ class TestApplyFloat8:
 
         model = build_parallel_model(mc, device, device_mesh=None, fp8=True)
 
-        float8_count = sum(
-            1 for m in model.modules() if isinstance(m, Float8Linear)
-        )
+        float8_count = sum(1 for m in model.modules() if isinstance(m, Float8Linear))
         assert float8_count > 0

@@ -71,10 +71,13 @@ def _run_torchrun(
     if nproc > 1:
         port = _find_free_port()
         cmd = [
-            sys.executable, "-m", "torch.distributed.run",
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
             f"--nproc_per_node={nproc}",
             f"--master_port={port}",
-            script, *args,
+            script,
+            *args,
         ]
     else:
         cmd = [sys.executable, script, *args]
@@ -83,8 +86,12 @@ def _run_torchrun(
         env.setdefault("LOCAL_RANK", "0")
 
     return subprocess.run(
-        cmd, capture_output=True, text=True,
-        timeout=timeout, env=env, cwd=str(PROJECT_ROOT),
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        env=env,
+        cwd=str(PROJECT_ROOT),
     )
 
 
@@ -110,7 +117,11 @@ def _run_srun(
         f"--ntasks={slurm['total_gpus']}",
         f"--gpus-per-node={slurm['gpus_per_node']}",
         "--kill-on-bad-exit=1",
-        "uv", "run", "python", script, *args,
+        "uv",
+        "run",
+        "python",
+        script,
+        *args,
     ]
 
     # Use file-based capture to avoid pipe deadlocks with srun
@@ -135,7 +146,8 @@ def _run_srun(
             )
 
     return subprocess.CompletedProcess(
-        cmd, returncode=returncode,
+        cmd,
+        returncode=returncode,
         stdout=stdout_f.read_text(),
         stderr=stderr_f.read_text(),
     )
@@ -238,6 +250,7 @@ def skip_unless_gpus(hw, n, reason=None):
 # Tests: CPU / No GPU
 # ============================================================================
 
+
 @pytest.mark.smoke
 class TestCPU:
     """Tests that run on any machine, including CPU-only."""
@@ -245,7 +258,8 @@ class TestCPU:
     def test_config_loads(self):
         """Verify debug configs parse without error."""
         cmd = [
-            sys.executable, "-c",
+            sys.executable,
+            "-c",
             "from kempnerforge.config.loader import load_config; "
             "c = load_config('configs/train/debug.toml', cli_args=[]); "
             "print(f'OK: {c.model.dim}d, {c.model.n_layers}L')",
@@ -257,7 +271,8 @@ class TestCPU:
     def test_moe_config_loads(self):
         """Verify MoE debug config parses without error."""
         cmd = [
-            sys.executable, "-c",
+            sys.executable,
+            "-c",
             "from kempnerforge.config.loader import load_config; "
             "c = load_config('configs/train/debug_moe.toml', cli_args=[]); "
             "print(f'OK: {c.model.num_experts} experts')",
@@ -270,6 +285,7 @@ class TestCPU:
 # ============================================================================
 # Tests: Single GPU
 # ============================================================================
+
 
 @pytest.mark.smoke
 class TestSingleGPU:
@@ -298,6 +314,7 @@ class TestSingleGPU:
 # Tests: Full pipeline — train → checkpoint → eval
 # ============================================================================
 
+
 @pytest.mark.smoke
 class TestFullPipeline:
     """Train → checkpoint → standalone eval. Core parallelism combos."""
@@ -314,44 +331,88 @@ class TestFullPipeline:
         skip_unless_gpus(hw, 4)
         name = "pipe_dense_tp2"
         extra = ["--distributed.tp=2"]
-        result = _run(hw, TRAIN_SCRIPT, _train_args(
-            DEBUG_CONFIG, name, extra, vocab_size,
-        ))
+        result = _run(
+            hw,
+            TRAIN_SCRIPT,
+            _train_args(
+                DEBUG_CONFIG,
+                name,
+                extra,
+                vocab_size,
+            ),
+        )
         _assert_train_ok(result)
-        result = _run(hw, EVAL_SCRIPT, _eval_args(
-            DEBUG_CONFIG, name, tokenizer_name, vocab_size, extra,
-        ))
+        result = _run(
+            hw,
+            EVAL_SCRIPT,
+            _eval_args(
+                DEBUG_CONFIG,
+                name,
+                tokenizer_name,
+                vocab_size,
+                extra,
+            ),
+        )
         _assert_eval_ok(result)
 
     def test_moe_fsdp(self, hw, tokenizer_name, vocab_size):
         skip_unless_gpus(hw, 2)
         name = "pipe_moe_fsdp"
-        result = _run(hw, TRAIN_SCRIPT, _train_args(
-            DEBUG_MOE_CONFIG, name, vocab_size=vocab_size,
-        ))
+        result = _run(
+            hw,
+            TRAIN_SCRIPT,
+            _train_args(
+                DEBUG_MOE_CONFIG,
+                name,
+                vocab_size=vocab_size,
+            ),
+        )
         _assert_train_ok(result)
-        result = _run(hw, EVAL_SCRIPT, _eval_args(
-            DEBUG_MOE_CONFIG, name, tokenizer_name, vocab_size,
-        ))
+        result = _run(
+            hw,
+            EVAL_SCRIPT,
+            _eval_args(
+                DEBUG_MOE_CONFIG,
+                name,
+                tokenizer_name,
+                vocab_size,
+            ),
+        )
         _assert_eval_ok(result)
 
     def test_moe_tp2_fsdp(self, hw, tokenizer_name, vocab_size):
         skip_unless_gpus(hw, 4)
         name = "pipe_moe_tp2"
         extra = ["--distributed.tp=2"]
-        result = _run(hw, TRAIN_SCRIPT, _train_args(
-            DEBUG_MOE_CONFIG, name, extra, vocab_size,
-        ))
+        result = _run(
+            hw,
+            TRAIN_SCRIPT,
+            _train_args(
+                DEBUG_MOE_CONFIG,
+                name,
+                extra,
+                vocab_size,
+            ),
+        )
         _assert_train_ok(result)
-        result = _run(hw, EVAL_SCRIPT, _eval_args(
-            DEBUG_MOE_CONFIG, name, tokenizer_name, vocab_size, extra,
-        ))
+        result = _run(
+            hw,
+            EVAL_SCRIPT,
+            _eval_args(
+                DEBUG_MOE_CONFIG,
+                name,
+                tokenizer_name,
+                vocab_size,
+                extra,
+            ),
+        )
         _assert_eval_ok(result)
 
 
 # ============================================================================
 # Tests: Train-only — verify specific features don't crash
 # ============================================================================
+
 
 @pytest.mark.smoke
 class TestTrainFeatures:
@@ -360,7 +421,8 @@ class TestTrainFeatures:
     def test_dense_compile(self, hw):
         skip_unless_gpus(hw, 2)
         result = _run(
-            hw, TRAIN_SCRIPT,
+            hw,
+            TRAIN_SCRIPT,
             _train_args(DEBUG_CONFIG, "feat_compile", ["--train.compile_model=true"]),
             timeout=300,  # compile is slow first time
         )
@@ -368,60 +430,95 @@ class TestTrainFeatures:
 
     def test_dense_fp8(self, hw):
         skip_unless_gpus(hw, 1)
-        result = _run(hw, TRAIN_SCRIPT, _train_args(
-            DEBUG_CONFIG, "feat_fp8", ["--train.mixed_precision=fp8"],
-        ))
+        result = _run(
+            hw,
+            TRAIN_SCRIPT,
+            _train_args(
+                DEBUG_CONFIG,
+                "feat_fp8",
+                ["--train.mixed_precision=fp8"],
+            ),
+        )
         _assert_train_ok(result)
 
     def test_dense_grad_accum(self, hw):
         skip_unless_gpus(hw, 2)
-        result = _run(hw, TRAIN_SCRIPT, _train_args(
-            DEBUG_CONFIG, "feat_grad_accum", ["--train.grad_accum_steps=4"],
-        ))
+        result = _run(
+            hw,
+            TRAIN_SCRIPT,
+            _train_args(
+                DEBUG_CONFIG,
+                "feat_grad_accum",
+                ["--train.grad_accum_steps=4"],
+            ),
+        )
         _assert_train_ok(result)
 
     def test_dense_ac_full(self, hw):
         skip_unless_gpus(hw, 2)
-        result = _run(hw, TRAIN_SCRIPT, _train_args(
-            DEBUG_CONFIG, "feat_ac", ["--train.activation_checkpointing=full"],
-        ))
+        result = _run(
+            hw,
+            TRAIN_SCRIPT,
+            _train_args(
+                DEBUG_CONFIG,
+                "feat_ac",
+                ["--train.activation_checkpointing=full"],
+            ),
+        )
         _assert_train_ok(result)
 
     def test_moe_fp8(self, hw):
         skip_unless_gpus(hw, 1)
-        result = _run(hw, TRAIN_SCRIPT, _train_args(
-            DEBUG_MOE_CONFIG, "feat_moe_fp8", ["--train.mixed_precision=fp8"],
-        ))
+        result = _run(
+            hw,
+            TRAIN_SCRIPT,
+            _train_args(
+                DEBUG_MOE_CONFIG,
+                "feat_moe_fp8",
+                ["--train.mixed_precision=fp8"],
+            ),
+        )
         _assert_train_ok(result)
 
     def test_dense_pp2(self, hw):
         skip_unless_gpus(hw, 4)
-        result = _run(hw, TRAIN_SCRIPT, _train_args(
-            DEBUG_CONFIG, "feat_pp2",
-            ["--distributed.pp=2", "--train.grad_accum_steps=2"],
-        ))
+        result = _run(
+            hw,
+            TRAIN_SCRIPT,
+            _train_args(
+                DEBUG_CONFIG,
+                "feat_pp2",
+                ["--distributed.pp=2", "--train.grad_accum_steps=2"],
+            ),
+        )
         _assert_train_ok(result)
 
     def test_dense_inline_eval(self, hw, tokenizer_name, vocab_size):
         skip_unless_gpus(hw, 2)
-        result = _run(hw, TRAIN_SCRIPT, _train_args(
-            DEBUG_CONFIG, "feat_inline_eval",
-            [
-                "--eval.enabled=true",
-                "--eval.interval=5",
-                "--eval.steps=3",
-                "--eval.hf_dataset_name=wikitext",
-                "--eval.hf_dataset_config=wikitext-103-raw-v1",
-                f"--data.tokenizer_path={tokenizer_name}",
-            ],
-            vocab_size=vocab_size,
-        ))
+        result = _run(
+            hw,
+            TRAIN_SCRIPT,
+            _train_args(
+                DEBUG_CONFIG,
+                "feat_inline_eval",
+                [
+                    "--eval.enabled=true",
+                    "--eval.interval=5",
+                    "--eval.steps=3",
+                    "--eval.hf_dataset_name=wikitext",
+                    "--eval.hf_dataset_config=wikitext-103-raw-v1",
+                    f"--data.tokenizer_path={tokenizer_name}",
+                ],
+                vocab_size=vocab_size,
+            ),
+        )
         _assert_train_ok(result)
 
 
 # ============================================================================
 # Session cleanup
 # ============================================================================
+
 
 @pytest.fixture(autouse=True, scope="session")
 def _cleanup_checkpoints(request):

@@ -99,9 +99,7 @@ class TestMoETP:
         """Create a TP-only mesh compatible with MOE_CONFIG head counts."""
         world_size = dist.get_world_size()
         valid_tp = [
-            s
-            for s in [2, 4, 8]
-            if MOE_CONFIG.n_heads % s == 0 and MOE_CONFIG.n_kv_heads % s == 0
+            s for s in [2, 4, 8] if MOE_CONFIG.n_heads % s == 0 and MOE_CONFIG.n_kv_heads % s == 0
         ]
         if world_size in valid_tp or (
             MOE_CONFIG.n_heads % world_size == 0 and MOE_CONFIG.n_kv_heads % world_size == 0
@@ -180,9 +178,7 @@ class TestMoETPPlusFSDP:
         world_size = dist.get_world_size()
         tp_size = 2
         dp_size = world_size // tp_size
-        mesh_2d = init_device_mesh(
-            "cuda", (dp_size, tp_size), mesh_dim_names=("dp_shard", "tp")
-        )
+        mesh_2d = init_device_mesh("cuda", (dp_size, tp_size), mesh_dim_names=("dp_shard", "tp"))
 
         model = Transformer(MOE_CONFIG).cuda()
         apply_tensor_parallel(model, mesh_2d)
@@ -208,9 +204,7 @@ class TestMoETPPlusFSDP:
         world_size = dist.get_world_size()
         tp_size = 2
         dp_size = world_size // tp_size
-        mesh_2d = init_device_mesh(
-            "cuda", (dp_size, tp_size), mesh_dim_names=("dp_shard", "tp")
-        )
+        mesh_2d = init_device_mesh("cuda", (dp_size, tp_size), mesh_dim_names=("dp_shard", "tp"))
 
         model = Transformer(MOE_FREQ_CONFIG).cuda()
         apply_tensor_parallel(model, mesh_2d)

@@ -171,9 +171,7 @@ class TestAttentionWeightCapture:
     def attention_setup(self):
         dim, n_heads, n_kv_heads = 64, 4, 4
         attn = Attention(dim, n_heads, n_kv_heads).to(DEVICE).eval()
-        rope_cos, rope_sin = precompute_rope_frequencies(
-            head_dim=dim // n_heads, max_seq_len=32
-        )
+        rope_cos, rope_sin = precompute_rope_frequencies(head_dim=dim // n_heads, max_seq_len=32)
         rope_cos = rope_cos[:16].to(DEVICE)
         rope_sin = rope_sin[:16].to(DEVICE)
         return attn, rope_cos, rope_sin
@@ -256,9 +254,7 @@ class TestAttentionWeightCapture:
 class TestExtractRepresentations:
     def test_basic_extraction(self, small_model, small_dataset):
         layers = ["layers.0.attention", "layers.1.mlp"]
-        reps = extract_representations(
-            small_model, small_dataset, layers, DEVICE, batch_size=8
-        )
+        reps = extract_representations(small_model, small_dataset, layers, DEVICE, batch_size=8)
         assert set(reps.keys()) == set(layers)
         for name in layers:
             assert reps[name].shape[0] == len(small_dataset)  # all samples
@@ -266,31 +262,29 @@ class TestExtractRepresentations:
 
     def test_max_samples(self, small_model, small_dataset):
         reps = extract_representations(
-            small_model, small_dataset, ["layers.0.attention"], DEVICE,
-            batch_size=4, max_samples=8,
+            small_model,
+            small_dataset,
+            ["layers.0.attention"],
+            DEVICE,
+            batch_size=4,
+            max_samples=8,
         )
         assert reps["layers.0.attention"].shape[0] == 8
 
     def test_model_restored_to_original_mode(self, small_model, small_dataset):
         small_model.train()
         assert small_model.training
-        extract_representations(
-            small_model, small_dataset, ["layers.0.attention"], DEVICE
-        )
+        extract_representations(small_model, small_dataset, ["layers.0.attention"], DEVICE)
         assert small_model.training  # Should be restored to train mode
 
     def test_results_on_cpu(self, small_model, small_dataset):
-        reps = extract_representations(
-            small_model, small_dataset, ["layers.0.attention"], DEVICE
-        )
+        reps = extract_representations(small_model, small_dataset, ["layers.0.attention"], DEVICE)
         for tensor in reps.values():
             assert tensor.device == torch.device("cpu")
 
     def test_non_trivial_activations(self, small_model, small_dataset):
         """Activations should not be all zeros."""
-        reps = extract_representations(
-            small_model, small_dataset, ["layers.0.attention"], DEVICE
-        )
+        reps = extract_representations(small_model, small_dataset, ["layers.0.attention"], DEVICE)
         act = reps["layers.0.attention"]
         assert act.abs().sum() > 0
 

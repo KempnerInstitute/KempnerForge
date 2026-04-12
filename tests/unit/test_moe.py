@@ -390,9 +390,16 @@ class TestSharedExperts:
     def test_deepseek_style_config_forward(self):
         """DeepSeek-V3 style: sigmoid router + shared expert, many experts."""
         config = ModelConfig(
-            dim=128, n_layers=4, n_heads=4, vocab_size=1000, max_seq_len=64,
-            num_experts=16, moe_top_k=2, moe_router="sigmoid_topk",
-            moe_shared_experts=1, moe_aux_loss_weight=0.0,
+            dim=128,
+            n_layers=4,
+            n_heads=4,
+            vocab_size=1000,
+            max_seq_len=64,
+            num_experts=16,
+            moe_top_k=2,
+            moe_router="sigmoid_topk",
+            moe_shared_experts=1,
+            moe_aux_loss_weight=0.0,
         )
         model = Transformer(config).to(DEVICE)
         tokens = torch.randint(0, 1000, (2, 32), device=DEVICE)
@@ -443,8 +450,13 @@ class TestEPConfig:
     def test_ep_must_divide_num_experts(self):
         config = JobConfig(
             model=ModelConfig(
-                dim=64, n_layers=2, n_heads=2, vocab_size=100, max_seq_len=32,
-                num_experts=5, moe_top_k=2,
+                dim=64,
+                n_layers=2,
+                n_heads=2,
+                vocab_size=100,
+                max_seq_len=32,
+                num_experts=5,
+                moe_top_k=2,
             ),
             train=TrainConfig(seq_len=32),
             distributed=DistributedConfig(ep=2),
@@ -455,8 +467,13 @@ class TestEPConfig:
     def test_ep_valid_moe_config(self):
         config = JobConfig(
             model=ModelConfig(
-                dim=64, n_layers=2, n_heads=2, vocab_size=100, max_seq_len=32,
-                num_experts=4, moe_top_k=2,
+                dim=64,
+                n_layers=2,
+                n_heads=2,
+                vocab_size=100,
+                max_seq_len=32,
+                num_experts=4,
+                moe_top_k=2,
             ),
             train=TrainConfig(seq_len=32),
             distributed=DistributedConfig(ep=2),
@@ -496,7 +513,7 @@ class TestGroupedGEMM:
         offset = 0
         for i, count in enumerate(tokens_per_expert):
             if count > 0:
-                loop_out[offset:offset + count] = experts[i](x_sorted[offset:offset + count])
+                loop_out[offset : offset + count] = experts[i](x_sorted[offset : offset + count])
             offset += count
 
         torch.testing.assert_close(grouped_out, loop_out, atol=1e-5, rtol=1e-5)
@@ -525,7 +542,7 @@ class TestGroupedGEMM:
         offset = 0
         for i, count in enumerate(tokens_per_expert):
             if count > 0:
-                loop_out[offset:offset + count] = experts[i](x_sorted[offset:offset + count])
+                loop_out[offset : offset + count] = experts[i](x_sorted[offset : offset + count])
             offset += count
 
         torch.testing.assert_close(grouped_out, loop_out, atol=1e-5, rtol=1e-5)

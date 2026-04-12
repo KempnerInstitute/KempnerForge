@@ -336,7 +336,12 @@ class TestTransformer:
 
     def test_qk_norm_forward(self):
         config = ModelConfig(
-            dim=128, n_layers=2, n_heads=4, vocab_size=256, max_seq_len=64, qk_norm=True,
+            dim=128,
+            n_layers=2,
+            n_heads=4,
+            vocab_size=256,
+            max_seq_len=64,
+            qk_norm=True,
         )
         model = Transformer(config).to(DEVICE)
         tokens = torch.randint(0, 256, (1, 16), device=DEVICE)
@@ -348,7 +353,12 @@ class TestTransformer:
         """qk_norm=False should produce identical model to default."""
         config_default = ModelConfig(dim=128, n_layers=2, n_heads=4, vocab_size=256, max_seq_len=64)
         config_explicit = ModelConfig(
-            dim=128, n_layers=2, n_heads=4, vocab_size=256, max_seq_len=64, qk_norm=False,
+            dim=128,
+            n_layers=2,
+            n_heads=4,
+            vocab_size=256,
+            max_seq_len=64,
+            qk_norm=False,
         )
         m1 = Transformer(config_default)
         m2 = Transformer(config_explicit)
