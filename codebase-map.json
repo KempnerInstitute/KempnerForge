@@ -309,6 +309,14 @@
     },
     "kempnerforge/training/optimizer.py": {
       "classes": {
+        "Lion": {
+          "purpose": "Sign-based momentum optimizer (Chen et al. 2023), half optimizer memory of AdamW",
+          "methods": ["step(closure)"]
+        },
+        "ScheduleFreeAdamW": {
+          "purpose": "Schedule-Free AdamW (Defazio & Mishchenko 2024), eliminates LR schedule via iterate averaging",
+          "methods": ["step(closure)", "state_dict()", "load_state_dict(state_dict)", "eval_params()", "train_params()"]
+        },
         "Muon": {
           "purpose": "Momentum with Orthogonalized Updates optimizer (Newton-Schulz)",
           "methods": ["step(closure)", "state_dict()", "load_state_dict(state_dict)"]
@@ -322,13 +330,17 @@
       ],
       "registry": [
         "@registry.register_optimizer('adamw')",
+        "@registry.register_optimizer('lion')",
+        "@registry.register_optimizer('schedule_free_adamw')",
         "@registry.register_optimizer('muon')"
       ],
       "tested_by": [
         "tests/unit/test_training.py::TestBuildOptimizer",
         "tests/unit/test_optimizer.py::TestNewtonSchulz",
         "tests/unit/test_optimizer.py::TestMuon",
-        "tests/unit/test_optimizer.py::TestAdamW"
+        "tests/unit/test_optimizer.py::TestAdamW",
+        "tests/unit/test_additional_optimizers.py::TestLion",
+        "tests/unit/test_additional_optimizers.py::TestScheduleFreeAdamW"
       ]
     },
     "kempnerforge/training/scheduler.py": {
@@ -341,9 +353,13 @@
       "registry": [
         "@registry.register_scheduler('cosine')",
         "@registry.register_scheduler('linear')",
-        "@registry.register_scheduler('wsd')"
+        "@registry.register_scheduler('wsd')",
+        "@registry.register_scheduler('none')"
       ],
-      "tested_by": ["tests/unit/test_training.py::TestScheduler"]
+      "tested_by": [
+        "tests/unit/test_training.py::TestScheduler",
+        "tests/unit/test_additional_optimizers.py::TestNoneScheduler"
+      ]
     },
     "kempnerforge/training/eval.py": {
       "functions": [
@@ -774,6 +790,10 @@
       "tests/unit/test_hooks.py": {
         "classes": ["TestActivationStore(11)", "TestAttentionWeightCapture(6)", "TestExtractRepresentations(5)", "TestSaveActivations(3)", "TestActivationStoreIntegration(3)"],
         "count": 28
+      },
+      "tests/unit/test_additional_optimizers.py": {
+        "classes": ["TestLion(10)", "TestScheduleFreeAdamW(9)", "TestNoneScheduler(3)", "TestOptimizerConfig(3)"],
+        "count": 25
       }
     },
     "integration": {
@@ -810,8 +830,8 @@
   },
   "registry_entries": {
     "model": ["transformer"],
-    "optimizer": ["adamw", "muon"],
-    "scheduler": ["cosine", "linear", "wsd"],
+    "optimizer": ["adamw", "lion", "schedule_free_adamw", "muon"],
+    "scheduler": ["cosine", "linear", "wsd", "none"],
     "loss": ["cross_entropy", "chunked_cross_entropy"],
     "mlp": ["swiglu", "standard_gelu", "standard_relu"],
     "norm": ["rmsnorm", "layernorm"],

@@ -52,6 +52,7 @@ class SchedulerType(StrEnum):
     cosine = "cosine"
     linear = "linear"
     wsd = "wsd"  # warmup-stable-decay
+    none = "none"  # constant LR (for schedule-free optimizers)
 
 
 # ---------------------------------------------------------------------------
@@ -247,6 +248,8 @@ class OptimizerConfig:
     muon_momentum: float = 0.95  # Momentum coefficient for Muon
     muon_ns_steps: int = 5  # Newton-Schulz iteration steps for Muon
     muon_adam_lr: float | None = None  # LR for 1D params in Muon's AdamW fallback; None=same as lr
+    # Schedule-Free specific
+    schedule_free_warmup_steps: int = 0  # Internal warmup for schedule-free optimizer
 
     def __post_init__(self) -> None:
         if self.lr <= 0:

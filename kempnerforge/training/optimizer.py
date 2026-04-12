@@ -4,11 +4,13 @@ Builds optimizers with per-parameter-group settings:
   - AdamW: standard Adam with decoupled weight decay
   - Muon: momentum with orthogonalized updates via Newton-Schulz iteration.
     Applies Muon to 2D+ weight matrices, AdamW to 1D params (biases, norms).
+  - Lion: sign-based momentum update (half the optimizer memory of AdamW)
+  - Schedule-Free AdamW: eliminates LR schedule by averaging iterates
 
-Both optimizers:
+All optimizers:
   - Weight decay applied to matrix weights only
   - Bias and norm parameters excluded from weight decay
-  - Fused kernel when available (PyTorch 2.x)
+  - Fused kernel when available (PyTorch 2.x, AdamW only)
 """
 
 from __future__ import annotations
@@ -34,6 +36,250 @@ def _build_adamw(
         betas=config.betas,
         eps=config.eps,
         fused=config.fused and torch.cuda.is_available(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Lion optimizer
+# ---------------------------------------------------------------------------
+
+
+class Lion(torch.optim.Optimizer):
+    """Lion optimizer (Chen et al., 2023): Evolved Sign Momentum.
+
+    Uses sign-based updates with momentum interpolation.  Only maintains
+    one momentum buffer (vs two for AdamW), halving optimizer memory.
+
+    Update rule::
+
+        update = sign(beta1 * m + (1 - beta1) * grad)
+        m = beta2 * m + (1 - beta2) * grad
+        p = p * (1 - lr * wd) - lr * update
+
+    Args:
+        params: Parameters or parameter groups.
+        lr: Learning rate (typically 3-10x smaller than AdamW).
+        betas: ``(beta1, beta2)`` for update interpolation and momentum.
+        weight_decay: Decoupled weight decay coefficient.
+    """
+
+    def __init__(
+        self,
+        params,
+        lr: float = 1e-4,
+        betas: tuple[float, float] = (0.9, 0.99),
+        weight_decay: float = 0.0,
+    ) -> None:
+        defaults = dict(lr=lr, betas=betas, weight_decay=weight_decay)
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            lr = group["lr"]
+            beta1, beta2 = group["betas"]
+            wd = group["weight_decay"]
+
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+
+                grad = p.grad
+                state = self.state[p]
+
+                if len(state) == 0:
+                    state["exp_avg"] = torch.zeros_like(p.data)
+
+                m = state["exp_avg"]
+
+                # Update direction: sign of interpolated momentum + gradient
+                # .mul() (not in-place) creates a temporary — m is unchanged
+                update = (m.mul(beta1) + grad.mul(1 - beta1)).sign_()
+
+                # Decoupled weight decay
+                if wd > 0:
+                    p.data.mul_(1 - lr * wd)
+
+                # Apply update
+                p.data.add_(update, alpha=-lr)
+
+                # Update momentum buffer
+                m.mul_(beta2).add_(grad, alpha=1 - beta2)
+
+        return loss
+
+
+@registry.register_optimizer("lion")
+def _build_lion(
+    param_groups: list[dict],
+    config: OptimizerConfig,
+) -> torch.optim.Optimizer:
+    return Lion(
+        param_groups,
+        lr=config.lr,
+        betas=config.betas,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Schedule-Free AdamW
+# ---------------------------------------------------------------------------
+
+
+class ScheduleFreeAdamW(torch.optim.Optimizer):
+    """Schedule-Free AdamW (Defazio & Mishchenko, 2024).
+
+    Eliminates the need for an LR schedule by maintaining an iterate ``z``
+    and a running average ``x``.  Parameters are set to the interpolated
+    point ``y = (1 - beta1) * z + beta1 * x`` for gradient computation.
+
+    Use with ``scheduler.name = "none"`` — no LR schedule is needed.
+
+    Args:
+        params: Parameters or parameter groups.
+        lr: Learning rate (constant — no schedule needed).
+        betas: ``(beta1, beta2)`` for interpolation and second moment.
+        eps: Denominator term for numerical stability.
+        weight_decay: Decoupled weight decay.
+        warmup_steps: Linear warmup steps (internal to the optimizer).
+    """
+
+    def __init__(
+        self,
+        params,
+        lr: float = 0.025,
+        betas: tuple[float, float] = (0.9, 0.999),
+        eps: float = 1e-8,
+        weight_decay: float = 0.0,
+        warmup_steps: int = 0,
+    ) -> None:
+        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+        super().__init__(params, defaults)
+        self.warmup_steps = warmup_steps
+        self._k = 0
+
+    def state_dict(self) -> dict:
+        sd = super().state_dict()
+        sd["_k"] = self._k
+        sd["_warmup_steps"] = self.warmup_steps
+        return sd
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        self._k = state_dict.pop("_k", 0)
+        self.warmup_steps = state_dict.pop("_warmup_steps", self.warmup_steps)
+        super().load_state_dict(state_dict)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        self._k += 1
+        k = self._k
+
+        warmup = min(1.0, k / max(self.warmup_steps, 1)) if self.warmup_steps > 0 else 1.0
+
+        for group in self.param_groups:
+            lr = group["lr"] * warmup
+            beta1, beta2 = group["betas"]
+            eps = group["eps"]
+            wd = group["weight_decay"]
+
+            # Weight for Polyak averaging (accounts for variable LR during warmup)
+            weight = lr * (1 - beta1)
+
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+
+                grad = p.grad
+                state = self.state[p]
+
+                if len(state) == 0:
+                    state["z"] = p.data.clone()
+                    state["v"] = torch.zeros_like(p.data)
+                    state["weight_sum"] = 0.0
+
+                z = state["z"]
+                v = state["v"]
+
+                # Second moment update
+                v.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+
+                # Bias-corrected denominator
+                bc2 = 1 - beta2**k
+                denom = (v / bc2).sqrt().add_(eps)
+
+                # Update z (the iterate)
+                z.addcdiv_(grad, denom, value=-lr)
+
+                # Decoupled weight decay on z
+                if wd > 0:
+                    z.mul_(1 - lr * wd)
+
+                # Polyak average coefficient
+                state["weight_sum"] += weight
+                ck = weight / state["weight_sum"]
+
+                # Update p.data via interpolation:
+                # x_new = (1 - ck) * x_old + ck * z
+                # y_new = (1 - beta1) * z + beta1 * x_new
+                # We don't store x explicitly — derive it from current y and z:
+                # x_old = (y_old - (1 - beta1) * z_old) / beta1
+                # But z changed, so we need a different approach.
+                # Store x explicitly for correctness:
+                if "x" not in state:
+                    state["x"] = z.clone()
+                else:
+                    state["x"].lerp_(z, ck)
+
+                # Set params to interpolated point for next gradient computation
+                p.data.copy_(z).lerp_(state["x"], beta1)
+
+        return loss
+
+    def eval_params(self) -> None:
+        """Set parameters to the evaluation point (running average).
+
+        Call before validation/inference for best results.
+        Call :meth:`train_params` afterward to resume training.
+        """
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p in self.state and "x" in self.state[p]:
+                    p.data.copy_(self.state[p]["x"])
+
+    def train_params(self) -> None:
+        """Restore parameters to the training point (interpolated y).
+
+        Call after :meth:`eval_params` to resume training.
+        """
+        for group in self.param_groups:
+            beta1 = group["betas"][0]
+            for p in group["params"]:
+                state = self.state[p]
+                if "z" in state and "x" in state:
+                    p.data.copy_(state["z"]).lerp_(state["x"], beta1)
+
+
+@registry.register_optimizer("schedule_free_adamw")
+def _build_schedule_free_adamw(
+    param_groups: list[dict],
+    config: OptimizerConfig,
+) -> torch.optim.Optimizer:
+    return ScheduleFreeAdamW(
+        param_groups,
+        lr=config.lr,
+        betas=config.betas,
+        eps=config.eps,
+        warmup_steps=config.schedule_free_warmup_steps,
     )
 
 

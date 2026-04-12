@@ -98,6 +98,15 @@ def _build_wsd(
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_fn)
 
 
+@registry.register_scheduler("none")
+def _build_none(
+    optimizer: torch.optim.Optimizer,
+    config: SchedulerConfig,
+    max_steps: int,
+) -> torch.optim.lr_scheduler.LambdaLR:
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: 1.0)
+
+
 def build_scheduler(
     optimizer: torch.optim.Optimizer,
     config: SchedulerConfig,
