@@ -205,7 +205,6 @@ class MoEMLP(nn.Module):
     ) -> None:
         super().__init__()
         self.router = router
-        self.experts = experts
         self.shared_expert = shared_expert
         self.num_experts = len(experts)
         self.capacity_factor = capacity_factor
@@ -218,11 +217,11 @@ class MoEMLP(nn.Module):
         self.local_expert_start: int = 0
         self.num_local_experts: int = len(experts)
 
-        # Packed expert weights: stack per-expert (out, in) Linear weights into
-        # (E, in, out) tensors at init so grouped GEMM can consume them zero-copy.
-        # Consumers (_local_forward, EP) still use self.experts; switch happens in
-        # subsequent steps. Activation function is captured here for the same reason.
         if packed_experts:
+            # Packed expert weights: stack per-expert (out, in) Linear weights into
+            # (E, in, out) tensors so grouped GEMM can consume them zero-copy.
+            # Drop the per-expert nn.ModuleList — the packed tensors are the
+            # sole source of truth. Tests / EP / FSDP2 read `self.up_w` etc.
             self._is_swiglu = hasattr(experts[0], "gate_proj")
             self.up_w = nn.Parameter(
                 torch.stack([e.up_proj.weight.t().contiguous() for e in experts])  # type: ignore[reportCallIssue, reportAttributeAccessIssue]
@@ -237,6 +236,8 @@ class MoEMLP(nn.Module):
                 self._packed_activation = F.silu
             else:
                 self._packed_activation = experts[0]._activation
+        else:
+            self.experts = experts
 
     def _apply_packed_expert(self, x: torch.Tensor, i: int) -> torch.Tensor:
         """Apply packed expert ``i`` to ``x`` without grouped GEMM.

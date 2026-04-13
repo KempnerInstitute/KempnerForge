@@ -351,19 +351,20 @@ def apply_expert_parallel(model: torch.nn.Module, device_mesh: DeviceMesh | None
         start = ep_rank * experts_per_rank
         end = start + experts_per_rank
 
-        # Prune to local experts only
-        local_experts = torch.nn.ModuleList([module.experts[i] for i in range(start, end)])
-        module.experts = local_experts
-
-        # Packed path: slice the stacked weight tensors along the expert dim.
-        # Replace the Parameter (can't resize in-place) with the sliced view.
         if module.packed_experts:
+            # Packed path: slice the stacked weight tensors along the expert dim.
+            # Replace the Parameter (can't resize in-place) with the sliced view.
+            # The unpacked ModuleList is already absent in packed mode.
             module.up_w = torch.nn.Parameter(module.up_w.data[start:end].clone().contiguous())
             module.down_w = torch.nn.Parameter(module.down_w.data[start:end].clone().contiguous())
             if module._is_swiglu:
                 module.gate_w = torch.nn.Parameter(
                     module.gate_w.data[start:end].clone().contiguous()
                 )
+        else:
+            # Unpacked path: prune the ModuleList to the local experts only.
+            local_experts = torch.nn.ModuleList([module.experts[i] for i in range(start, end)])
+            module.experts = local_experts
 
         # Store EP metadata
         module.ep_world_size = ep_size

@@ -216,7 +216,7 @@ class TestEPPacked:
                 assert p.grad is not None, f"No gradient for {name}"
 
     def test_ep_packed_grads_on_packed_params(self, ep_only_mesh):
-        """Backward fills grads on packed params, not on the local ModuleList experts."""
+        """Backward fills grads on packed params; packed MoE has no ModuleList."""
         model = Transformer(EP_CONFIG_PACKED).cuda()
         apply_expert_parallel(model, ep_only_mesh)
 
@@ -228,10 +228,7 @@ class TestEPPacked:
                 assert layer.mlp.up_w.grad is not None
                 assert layer.mlp.down_w.grad is not None
                 assert layer.mlp.gate_w.grad is not None
-                for expert in layer.mlp.experts:
-                    assert expert.up_proj.weight.grad is None
-                    assert expert.down_proj.weight.grad is None
-                    assert expert.gate_proj.weight.grad is None
+                assert not hasattr(layer.mlp, "experts")
 
     @pytest.mark.skipif(
         int(os.environ.get("WORLD_SIZE", "1")) < 4,
