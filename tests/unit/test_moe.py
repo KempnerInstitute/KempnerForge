@@ -992,3 +992,166 @@ class TestPackedExperts:
         assert id(moe.up_w) in param_ids
         assert id(moe.down_w) in param_ids
         assert id(moe.gate_w) in param_ids
+
+    # ----- Phase 17b: packed forward equivalence -----
+
+    def test_grouped_packed_matches_unpacked_swiglu(self):
+        """grouped_expert_forward_packed matches grouped_expert_forward for SwiGLU."""
+        from kempnerforge.model.moe import (
+            _HAS_GROUPED_MM,
+            grouped_expert_forward,
+            grouped_expert_forward_packed,
+        )
+
+        if not _HAS_GROUPED_MM:
+            pytest.skip("torch._grouped_mm not available")
+
+        torch.manual_seed(42)
+        dim, hidden, E = 64, 128, 4
+        experts = torch.nn.ModuleList([SwiGLUMLP(dim, hidden) for _ in range(E)])
+        experts.eval()
+
+        tokens_per_expert = [5, 7, 3, 5]
+        x_sorted = torch.randn(sum(tokens_per_expert), dim)
+
+        unpacked_out = grouped_expert_forward(x_sorted, tokens_per_expert, experts)
+
+        up_w = torch.stack([e.up_proj.weight.t().contiguous() for e in experts])
+        down_w = torch.stack([e.down_proj.weight.t().contiguous() for e in experts])
+        gate_w = torch.stack([e.gate_proj.weight.t().contiguous() for e in experts])
+        packed_out = grouped_expert_forward_packed(
+            x_sorted, tokens_per_expert, up_w, down_w, gate_w, torch.nn.functional.silu
+        )
+
+        torch.testing.assert_close(packed_out, unpacked_out, atol=1e-5, rtol=1e-5)
+
+    def test_grouped_packed_matches_unpacked_standard(self):
+        """grouped_expert_forward_packed matches grouped_expert_forward for StandardMLP."""
+        from kempnerforge.model.moe import (
+            _HAS_GROUPED_MM,
+            grouped_expert_forward,
+            grouped_expert_forward_packed,
+        )
+
+        if not _HAS_GROUPED_MM:
+            pytest.skip("torch._grouped_mm not available")
+
+        torch.manual_seed(42)
+        dim, hidden, E = 64, 128, 4
+        experts = torch.nn.ModuleList(
+            [StandardMLP(dim, hidden, activation="gelu") for _ in range(E)]
+        )
+        experts.eval()
+
+        tokens_per_expert = [6, 4, 8, 2]
+        x_sorted = torch.randn(sum(tokens_per_expert), dim)
+
+        unpacked_out = grouped_expert_forward(x_sorted, tokens_per_expert, experts)
+
+        up_w = torch.stack([e.up_proj.weight.t().contiguous() for e in experts])
+        down_w = torch.stack([e.down_proj.weight.t().contiguous() for e in experts])
+        packed_out = grouped_expert_forward_packed(
+            x_sorted, tokens_per_expert, up_w, down_w, None, experts[0]._activation
+        )
+
+        torch.testing.assert_close(packed_out, unpacked_out, atol=1e-5, rtol=1e-5)
+
+    def test_sequential_packed_matches_unpacked_swiglu(self):
+        """MoEMLP forward on fp32 CPU (sequential path) matches unpacked output."""
+        torch.manual_seed(42)
+        moe = build_moe(
+            dim=64,
+            hidden_dim=128,
+            num_experts=4,
+            top_k=2,
+            activation="silu",
+            packed_experts=True,
+        )
+        moe.eval()
+        x = torch.randn(2, 16, 64)
+
+        out_packed = moe(x)
+
+        # Flip flag → sequential path consults ModuleList experts.
+        # Packed and unpacked weights are mathematically equivalent (same init).
+        moe.packed_experts = False
+        out_unpacked = moe(x)
+
+        torch.testing.assert_close(out_packed, out_unpacked, atol=1e-5, rtol=1e-5)
+
+    def test_sequential_packed_matches_unpacked_standard(self):
+        """MoEMLP forward matches for StandardMLP (gelu) experts on sequential path."""
+        torch.manual_seed(42)
+        moe = build_moe(
+            dim=64,
+            hidden_dim=128,
+            num_experts=4,
+            top_k=2,
+            activation="gelu",
+            packed_experts=True,
+        )
+        moe.eval()
+        x = torch.randn(2, 16, 64)
+
+        out_packed = moe(x)
+        moe.packed_experts = False
+        out_unpacked = moe(x)
+
+        torch.testing.assert_close(out_packed, out_unpacked, atol=1e-5, rtol=1e-5)
+
+    def test_packed_backward_grads_flow_to_packed_weights(self):
+        """Backward through packed forward fills grads on up_w/down_w/gate_w."""
+        torch.manual_seed(42)
+        moe = build_moe(
+            dim=64,
+            hidden_dim=128,
+            num_experts=4,
+            top_k=2,
+            activation="silu",
+            packed_experts=True,
+        )
+        x = torch.randn(2, 16, 64)
+        moe(x).sum().backward()
+
+        assert moe.up_w.grad is not None and moe.up_w.grad.abs().sum() > 0
+        assert moe.down_w.grad is not None and moe.down_w.grad.abs().sum() > 0
+        assert moe.gate_w.grad is not None and moe.gate_w.grad.abs().sum() > 0
+
+    def test_packed_unpacked_experts_receive_no_gradient(self):
+        """When packed, forward only reads packed params; ModuleList experts get no grads."""
+        torch.manual_seed(42)
+        moe = build_moe(
+            dim=64,
+            hidden_dim=128,
+            num_experts=4,
+            top_k=2,
+            activation="silu",
+            packed_experts=True,
+        )
+        x = torch.randn(2, 16, 64)
+        moe(x).sum().backward()
+
+        for expert in moe.experts:
+            assert expert.up_proj.weight.grad is None
+            assert expert.down_proj.weight.grad is None
+            assert expert.gate_proj.weight.grad is None
+
+    def test_transformer_forward_backward_packed(self):
+        """End-to-end Transformer forward + backward uses packed params exclusively."""
+        config = ModelConfig(**_SMALL, num_experts=4, moe_top_k=2, moe_packed_experts=True)
+        model = Transformer(config)
+        tokens = torch.randint(0, _SMALL["vocab_size"], (2, 16))
+
+        out = model(tokens)
+        assert out.shape == (2, 16, _SMALL["vocab_size"])
+        assert torch.isfinite(out).all()
+
+        out.sum().backward()
+        moe_layers = [m for m in model.modules() if isinstance(m, MoEMLP)]
+        for moe in moe_layers:
+            assert moe.up_w.grad is not None and moe.up_w.grad.abs().sum() > 0
+            assert moe.down_w.grad is not None and moe.down_w.grad.abs().sum() > 0
+            assert moe.gate_w.grad is not None and moe.gate_w.grad.abs().sum() > 0
+            # ModuleList experts are not on the forward path → no grads.
+            for expert in moe.experts:
+                assert expert.up_proj.weight.grad is None
