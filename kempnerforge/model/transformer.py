@@ -59,6 +59,9 @@ class TransformerBlock(nn.Module):
                 router_type=config.moe_router,
                 shared_experts=config.moe_shared_experts,
                 capacity_factor=config.moe_capacity_factor,
+                gradient_scale=config.moe_gradient_scale,
+                sequence_aux_loss_weight=config.moe_sequence_aux_loss_weight,
+                bias_schedule=config.moe_bias_schedule,
             )
         else:
             self.mlp = build_mlp(
@@ -141,6 +144,14 @@ class Transformer(nn.Module):
                 theta=self.config.rope_theta,
             )
         init_weights(self, self.config)
+
+    def set_moe_step(self, step: int, max_steps: int) -> None:
+        """Set training step on all MoE routers for adaptive bias scheduling."""
+        from kempnerforge.model.router import SigmoidTopKRouter
+
+        for layer in self.layers.values():
+            if isinstance(layer.mlp, MoEMLP) and isinstance(layer.mlp.router, SigmoidTopKRouter):
+                layer.mlp.router.set_step(step, max_steps)
 
     def get_moe_aux_loss(self) -> torch.Tensor:
         """Collect auxiliary losses from all MoE layers. Returns 0 if dense."""

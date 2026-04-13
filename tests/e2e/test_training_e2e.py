@@ -568,6 +568,53 @@ def test_moe_checkpoint_resume(tmp_path):
 
 
 # ============================================================================
+# MoE: Sigmoid Router + Sequence Aux Loss + Gradient Scaling
+# ============================================================================
+
+_SIGMOID_MOE_OVERRIDES = [
+    "--model.moe_router=sigmoid_topk",
+    "--model.moe_sequence_aux_loss_weight=0.01",
+    "--model.moe_gradient_scale=true",
+    "--model.moe_bias_schedule=cosine_decay",
+    "--model.moe_aux_loss_weight=0.01",
+]
+
+
+@pytest.mark.e2e
+def test_moe_sigmoid_single_gpu():
+    """Single GPU MoE with sigmoid router, sequence aux loss, and gradient scaling."""
+    result = _run_training(
+        [
+            DEBUG_MOE_CONFIG,
+            "--train.max_steps=10",
+            "--metrics.log_interval=5",
+            *_SIGMOID_MOE_OVERRIDES,
+        ],
+        nproc=1,
+    )
+    _assert_training_complete(result, expected_steps=10)
+    output = result.stdout + result.stderr
+    loss = _parse_last_loss(output)
+    assert loss is not None and loss > 0, f"Sigmoid MoE loss should be > 0 (got {loss})"
+
+
+@pytest.mark.e2e
+@requires_gpus(4)
+def test_moe_sigmoid_fsdp_4gpu():
+    """4 GPU FSDP with sigmoid router, sequence aux loss, and gradient scaling."""
+    result = _run_training(
+        [
+            DEBUG_MOE_CONFIG,
+            "--train.max_steps=10",
+            "--metrics.log_interval=5",
+            *_SIGMOID_MOE_OVERRIDES,
+        ],
+        nproc=4,
+    )
+    _assert_training_complete(result, expected_steps=10)
+
+
+# ============================================================================
 # FP8 Mixed Precision
 # ============================================================================
 

@@ -354,17 +354,17 @@ Available benchmarks: forward pass throughput, MoE routing/dispatch, data pipeli
 
 ## MoE Engineering Roadmap
 
-Phases 1-9 (core MoE, Expert Parallelism, DeepSeekMoE, grouped GEMM, FSDP2 fix) and Phase 11 (FP8) are complete and validated at multi-node scale. Remaining work toward DeepSeek-V3 production quality:
+Core MoE, Expert Parallelism, DeepSeekMoE, grouped GEMM, FSDP2 compatibility, and FP8 are complete and validated at multi-node scale. Remaining work toward DeepSeek-V3 production quality:
 
-| Phase | Feature | Status | Impact |
-|:-----:|---------|:------:|--------|
-| 10 | Router improvements (sequence aux loss, gradient scaling, adaptive bias) | Planned | Training quality |
-| 11 | FP8 mixed precision | **Done** | 2x compute throughput |
-| 12 | Pipeline parallelism for MoE (PP+EP+TP composition) | Blocked | Required for 100B+ |
-| 13 | Communication-computation overlap (async EP dispatch) | Planned | 15-30% throughput |
-| 14 | Node-limited expert routing (bounded cross-node traffic) | Planned | Scale to 64+ GPUs |
-| 15 | Multi-token prediction (MTP) | Planned | 10-15% sample efficiency |
-| 16 | Large-scale EP (hierarchical all-to-all, 256+ experts) | Planned | 1000+ GPU scale |
+| Feature | Status | Impact |
+|---------|:------:|--------|
+| Router improvements (sequence aux loss, gradient scaling, adaptive bias) | In progress | Training quality |
+| FP8 mixed precision | **Done** | 2x compute throughput |
+| Pipeline parallelism for MoE (PP+EP+TP composition) | Blocked | Required for 100B+ |
+| Communication-computation overlap (async EP dispatch) | Planned | 15-30% throughput |
+| Node-limited expert routing (bounded cross-node traffic) | Planned | Scale to 64+ GPUs |
+| Multi-token prediction (MTP) | Planned | 10-15% sample efficiency |
+| Large-scale EP (hierarchical all-to-all, 256+ experts) | Planned | 1000+ GPU scale |
 
 > **Note:** Dense Pipeline Parallelism (PP) is fully supported. MoE + PP is explicitly rejected at config validation time because MoE data-dependent routing is incompatible with static pipeline stage splitting. Use FSDP, TP, or EP for MoE models.
 

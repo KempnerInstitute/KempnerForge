@@ -1,4 +1,4 @@
-"""Unit tests for multi-dataset mixing (Phase 6)."""
+"""Unit tests for multi-dataset mixing."""
 
 from __future__ import annotations
 

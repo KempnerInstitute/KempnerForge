@@ -1,4 +1,4 @@
-"""Unit tests for LR schedule extensions (Phase 10)."""
+"""Unit tests for LR schedule extensions."""
 
 from __future__ import annotations
 

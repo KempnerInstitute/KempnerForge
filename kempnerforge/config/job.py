@@ -58,7 +58,7 @@ class JobConfig:
 
             logging.getLogger(__name__).warning(
                 "torch.compile is not yet optimized for MoE dispatch (data-dependent shapes "
-                "cause graph breaks). Set compile_model=false for MoE until Phase 9."
+                "cause graph breaks). Set compile_model=false for MoE models."
             )
 
         if self.distributed.tp > 1:

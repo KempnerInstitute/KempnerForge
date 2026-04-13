@@ -1,4 +1,4 @@
-"""Unit tests for Lion and Schedule-Free AdamW optimizers (Phase 9)."""
+"""Unit tests for Lion and Schedule-Free AdamW optimizers."""
 
 from __future__ import annotations
 

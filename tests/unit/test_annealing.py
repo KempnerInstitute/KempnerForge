@@ -1,4 +1,4 @@
-"""Unit tests for data annealing & phase scheduling (Phase 7)."""
+"""Unit tests for data annealing & phase scheduling."""
 
 from __future__ import annotations
 
