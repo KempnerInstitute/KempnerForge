@@ -1,4 +1,4 @@
-"""Unit tests for sequence packing (Phase 5).
+"""Unit tests for sequence packing.
 
 Tests document-aware packing: doc_ids computation, cross-document attention
 masking, boundary label masking, and loss function ignore_index handling.

@@ -99,6 +99,7 @@ def ep_dispatch_and_compute(
     local_expert_start: int,
     num_local_experts: int,
     ep_world_size: int,
+    gradient_scale: bool = False,
 ) -> torch.Tensor:
     """All-to-all dispatch, local expert compute, all-to-all combine.
 
@@ -216,6 +217,22 @@ def ep_dispatch_and_compute(
         if unused_expert_params:
             _zero = sum(p.sum() for p in unused_expert_params) * 0
             local_output = local_output + _zero
+
+    # Per-expert gradient scaling: normalize by utilization ratio so
+    # high-traffic experts don't dominate learning (DeepSeek-V3 Sec 3.2).
+    if gradient_scale and received_tokens.requires_grad:
+        total_recv = sum(recv_counts_list)
+        if total_recv > 0:
+            local_ids = received_expert_ids - local_expert_start
+            tpe = torch.bincount(local_ids, minlength=num_local_experts)
+            avg_tokens = total_recv / max(num_local_experts, 1)
+            for i in range(num_local_experts):
+                global_id = local_expert_start + i
+                mask = received_expert_ids == global_id
+                count = tpe[i].item()
+                if count > 0:
+                    scale = avg_tokens / count
+                    local_output[mask] = local_output[mask] * scale
 
     # Keep dispatch all-to-all in the autograd graph. When all local experts
     # are unused, local_output has no gradient path to received_tokens, so

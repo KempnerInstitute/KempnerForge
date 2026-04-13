@@ -1,4 +1,4 @@
-"""Unit tests for activation extraction hooks (Phase 8)."""
+"""Unit tests for activation extraction hooks."""
 
 from __future__ import annotations
 

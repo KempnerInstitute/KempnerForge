@@ -595,6 +595,8 @@ def main() -> None:
                     doc_ids = None
 
                 with maybe_no_sync(model, micro_step, tc.grad_accum_steps):
+                    if mc.is_moe:
+                        model.set_moe_step(step, tc.max_steps)
                     logits = model(input_ids, doc_ids=doc_ids)
                     loss = loss_fn(logits, labels)
 

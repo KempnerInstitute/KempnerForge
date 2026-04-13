@@ -28,6 +28,16 @@ pytestmark = pytest.mark.skipif(
 _BASE = dict(dim=256, n_layers=4, n_heads=8, n_kv_heads=4, vocab_size=1000, max_seq_len=64)
 MOE_CONFIG = ModelConfig(**_BASE, num_experts=4, moe_top_k=2)
 MOE_FREQ_CONFIG = ModelConfig(**_BASE, num_experts=4, moe_top_k=2, moe_frequency=2)
+MOE_SIGMOID_CONFIG = ModelConfig(
+    **_BASE,
+    num_experts=4,
+    moe_top_k=2,
+    moe_router="sigmoid_topk",
+    moe_sequence_aux_loss_weight=0.01,
+    moe_gradient_scale=True,
+    moe_bias_schedule="cosine_decay",
+    moe_aux_loss_weight=0.01,
+)
 DENSE_CONFIG = ModelConfig(**_BASE)
 
 
@@ -220,3 +230,82 @@ class TestMoETPPlusFSDP:
         loss = out.sum()
         assert torch.isfinite(torch.tensor(loss.item()))
         loss.backward()
+
+
+# ---------------------------------------------------------------------------
+# Sigmoid router + gradient scaling + sequence aux loss under FSDP
+# ---------------------------------------------------------------------------
+
+
+class TestMoESigmoidFSDP:
+    """FSDP distributed tests with sigmoid router, gradient scaling, and aux loss."""
+
+    def test_sigmoid_fsdp_forward_backward(self, distributed_env):
+        """Sigmoid + gradient scaling + sequence aux loss under FSDP."""
+        mesh = distributed_env
+        model = Transformer(MOE_SIGMOID_CONFIG).cuda()
+        model.train()
+        apply_fsdp2(model, mesh)
+
+        model.set_moe_step(0, 100)
+        tokens = torch.randint(0, 1000, (2, 32), device="cuda")
+        out = model(tokens)
+        loss = out.sum()
+        assert torch.isfinite(loss), f"Loss not finite: {loss.item()}"
+        loss.backward()
+
+        for name, p in model.named_parameters():
+            assert p.grad is not None, f"No gradient for {name}"
+
+    def test_sigmoid_fsdp_aux_loss_positive(self, distributed_env):
+        """Sequence aux loss should be positive under FSDP with sigmoid router."""
+        mesh = distributed_env
+        model = Transformer(MOE_SIGMOID_CONFIG).cuda()
+        model.train()
+        apply_fsdp2(model, mesh)
+
+        model.set_moe_step(5, 100)
+        tokens = torch.randint(0, 1000, (2, 32), device="cuda")
+        with torch.no_grad():
+            model(tokens)
+
+        aux_loss = model.get_moe_aux_loss()
+        assert torch.isfinite(aux_loss), f"Aux loss not finite: {aux_loss.item()}"
+        assert aux_loss.item() > 0, "Sequence aux loss should be > 0"
+
+    def test_sigmoid_fsdp_gradient_sync(self, distributed_env):
+        """Loss should be identical across DP ranks with sigmoid MoE features."""
+        mesh = distributed_env
+        model = Transformer(MOE_SIGMOID_CONFIG).cuda()
+        model.train()
+        apply_fsdp2(model, mesh)
+
+        torch.manual_seed(0)
+        model.set_moe_step(0, 100)
+        tokens = torch.randint(0, 1000, (2, 32), device="cuda")
+        out = model(tokens)
+        loss = out.sum()
+
+        loss_val = loss.detach().clone()
+        all_losses = [torch.zeros_like(loss_val) for _ in range(dist.get_world_size())]
+        dist.all_gather(all_losses, loss_val)
+        for other in all_losses[1:]:
+            assert torch.allclose(all_losses[0], other, atol=1e-3), (
+                f"Sigmoid MoE losses differ: {[v.item() for v in all_losses]}"
+            )
+
+    def test_sigmoid_set_moe_step_under_fsdp(self, distributed_env):
+        """set_moe_step works correctly on FSDP-sharded model."""
+        from kempnerforge.model.router import SigmoidTopKRouter
+
+        mesh = distributed_env
+        model = Transformer(MOE_SIGMOID_CONFIG).cuda()
+        apply_fsdp2(model, mesh)
+
+        model.set_moe_step(42, 1000)
+        for layer in model.layers.values():
+            if isinstance(layer.mlp, MoEMLP):
+                router = layer.mlp.router
+                assert isinstance(router, SigmoidTopKRouter)
+                assert router._step == 42
+                assert router._max_steps == 1000

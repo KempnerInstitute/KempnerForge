@@ -480,6 +480,26 @@ class TestTrainFeatures:
         )
         _assert_train_ok(result)
 
+    def test_moe_sigmoid_router(self, hw):
+        """MoE with sigmoid router + sequence aux loss + gradient scaling + bias schedule."""
+        skip_unless_gpus(hw, 1)
+        result = _run(
+            hw,
+            TRAIN_SCRIPT,
+            _train_args(
+                DEBUG_MOE_CONFIG,
+                "feat_moe_sigmoid",
+                [
+                    "--model.moe_router=sigmoid_topk",
+                    "--model.moe_sequence_aux_loss_weight=0.01",
+                    "--model.moe_gradient_scale=true",
+                    "--model.moe_bias_schedule=cosine_decay",
+                    "--model.moe_aux_loss_weight=0.01",
+                ],
+            ),
+        )
+        _assert_train_ok(result)
+
     def test_dense_pp2(self, hw):
         skip_unless_gpus(hw, 4)
         result = _run(

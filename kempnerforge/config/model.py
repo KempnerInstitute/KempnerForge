@@ -47,6 +47,9 @@ class ModelConfig:
     moe_shared_experts: int = 0  # shared experts that process all tokens
     moe_aux_loss_weight: float = 0.01  # aux loss coefficient in training loss
     moe_capacity_factor: float = 0.0  # 0=no drop, >0=cap tokens/expert (e.g. 1.25)
+    moe_sequence_aux_loss_weight: float = 0.0  # Sequence-level balance loss (0=off)
+    moe_gradient_scale: bool = False  # Per-expert gradient normalization
+    moe_bias_schedule: str = "constant"  # "constant", "cosine_decay", "linear_warmup"
 
     def __post_init__(self) -> None:
         if self.n_kv_heads is None:
@@ -78,6 +81,13 @@ class ModelConfig:
                 )
             if self.moe_frequency <= 0:
                 raise ValueError("moe_frequency must be positive")
+            if self.moe_sequence_aux_loss_weight < 0:
+                raise ValueError("moe_sequence_aux_loss_weight must be non-negative")
+            if self.moe_bias_schedule not in ("constant", "cosine_decay", "linear_warmup"):
+                raise ValueError(
+                    f"Unknown moe_bias_schedule: '{self.moe_bias_schedule}'. "
+                    "Options: 'constant', 'cosine_decay', 'linear_warmup'"
+                )
 
     @property
     def is_moe(self) -> bool:

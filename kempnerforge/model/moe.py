@@ -138,6 +138,7 @@ class MoEMLP(nn.Module):
         experts: nn.ModuleList,
         shared_expert: nn.Module | None = None,
         capacity_factor: float = 0.0,
+        gradient_scale: bool = False,
     ) -> None:
         super().__init__()
         self.router = router
@@ -145,6 +146,7 @@ class MoEMLP(nn.Module):
         self.shared_expert = shared_expert
         self.num_experts = len(experts)
         self.capacity_factor = capacity_factor
+        self.gradient_scale = gradient_scale
 
         # EP attributes — set by apply_expert_parallel(); defaults = no EP
         self.ep_world_size: int = 1
@@ -190,6 +192,20 @@ class MoEMLP(nn.Module):
 
             expert_out = grouped_expert_forward(x_sorted, tokens_per_expert, self.experts)
 
+            # Per-expert gradient scaling: normalize by utilization ratio so
+            # high-traffic experts don't dominate learning (DeepSeek-V3 Sec 3.2).
+            if self.gradient_scale and self.training:
+                total_assignments = sum(tokens_per_expert)
+                avg_tokens = total_assignments / max(self.num_experts, 1)
+                offset = 0
+                for count in tokens_per_expert:
+                    if count > 0:
+                        scale = avg_tokens / count
+                        expert_out[offset : offset + count] = (
+                            expert_out[offset : offset + count] * scale
+                        )
+                    offset += count
+
             # Weighted scatter-add back to output.
             expert_out = expert_out * sorted_weights.unsqueeze(-1)
             output = torch.zeros(num_tokens, dim, dtype=x_flat.dtype, device=x_flat.device)
@@ -200,12 +216,20 @@ class MoEMLP(nn.Module):
             )
         else:
             output = torch.zeros_like(x_flat)
+            # Precompute average tokens for gradient scaling
+            if self.gradient_scale and self.training:
+                avg_tokens = num_tokens * top_k / max(self.num_experts, 1)
             for i in range(self.num_experts):
                 mask = (indices == i).any(dim=-1)
                 if not mask.any():
                     continue
                 expert_input = x_flat[mask]
                 expert_output = self.experts[i](expert_input)
+                # Per-expert gradient scaling (DeepSeek-V3 Sec 3.2)
+                if self.gradient_scale and self.training:
+                    tokens_i = (indices == i).sum().detach().float()
+                    scale = avg_tokens / tokens_i.clamp(min=1.0)
+                    expert_output = expert_output * scale
                 weight_for_i = (weights * (indices == i).float()).sum(dim=-1)
                 output[mask] += weight_for_i[mask].unsqueeze(-1) * expert_output
 
@@ -257,6 +281,7 @@ class MoEMLP(nn.Module):
                 self.local_expert_start,
                 self.num_local_experts,
                 self.ep_world_size,
+                gradient_scale=self.gradient_scale,
             )
         else:
             output = self._local_forward(x_flat, weights, indices)
@@ -276,6 +301,9 @@ def build_moe(
     router_type: str = "softmax_topk",
     shared_experts: int = 0,
     capacity_factor: float = 0.0,
+    gradient_scale: bool = False,
+    sequence_aux_loss_weight: float = 0.0,
+    bias_schedule: str = "constant",
 ) -> MoEMLP:
     """Build an MoE layer, composing router + experts from Registry.
 
@@ -288,9 +316,18 @@ def build_moe(
         router_type: Router registry key.
         shared_experts: Number of shared experts (always active).
         capacity_factor: Token capacity per expert (0=unlimited, >0=cap).
+        gradient_scale: Per-expert gradient normalization.
+        sequence_aux_loss_weight: Sequence-level balance loss weight (sigmoid router only).
+        bias_schedule: Bias update rate schedule (sigmoid router only).
     """
     router_builder = registry.get("router", router_type)
-    router = router_builder(dim, num_experts, top_k)
+    router_kwargs: dict[str, object] = {}
+    if router_type == "sigmoid_topk":
+        router_kwargs = {
+            "sequence_aux_loss_weight": sequence_aux_loss_weight,
+            "bias_schedule": bias_schedule,
+        }
+    router = router_builder(dim, num_experts, top_k, **router_kwargs)
 
     experts = nn.ModuleList([build_mlp(dim, hidden_dim, activation) for _ in range(num_experts)])
 
@@ -298,4 +335,10 @@ def build_moe(
     if shared_experts > 0:
         shared_expert = build_mlp(dim, hidden_dim, activation)
 
-    return MoEMLP(router, experts, shared_expert, capacity_factor=capacity_factor)
+    return MoEMLP(
+        router,
+        experts,
+        shared_expert,
+        capacity_factor=capacity_factor,
+        gradient_scale=gradient_scale,
+    )
