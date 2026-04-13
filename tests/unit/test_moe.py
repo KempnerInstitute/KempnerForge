@@ -1149,3 +1149,34 @@ class TestPackedExperts:
             assert moe.down_w.grad is not None and moe.down_w.grad.abs().sum() > 0
             assert moe.gate_w.grad is not None and moe.gate_w.grad.abs().sum() > 0
             assert not hasattr(moe, "experts")
+
+    @pytest.mark.parametrize("num_experts", [4, 8, 16])
+    def test_packed_collapses_weight_tensor_count(self, num_experts):
+        """Packed MoE has 3 weight tensors per layer; unpacked has 3×num_experts.
+
+        This is what makes FSDP2's flat-tensor bucketing + state tracking cheaper
+        in packed mode — the wrap still covers layer.mlp as one unit, but the
+        number of Parameters inside drops from 3×E to 3.
+        """
+        router_u = SoftmaxTopKRouter(dim=64, num_experts=num_experts, top_k=2)
+        experts_u = torch.nn.ModuleList([SwiGLUMLP(64, 128) for _ in range(num_experts)])
+        moe_unpacked = MoEMLP(router_u, experts_u, packed_experts=False)
+
+        moe_packed = build_moe(
+            dim=64,
+            hidden_dim=128,
+            num_experts=num_experts,
+            top_k=2,
+            activation="silu",
+            packed_experts=True,
+        )
+
+        unpacked_expert_weights = [
+            n for n, _ in moe_unpacked.named_parameters() if n.startswith("experts.")
+        ]
+        packed_expert_weights = [
+            n for n, _ in moe_packed.named_parameters() if n in ("up_w", "down_w", "gate_w")
+        ]
+
+        assert len(unpacked_expert_weights) == 3 * num_experts
+        assert len(packed_expert_weights) == 3
