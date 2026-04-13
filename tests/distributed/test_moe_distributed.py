@@ -27,6 +27,7 @@ pytestmark = pytest.mark.skipif(
 # n_heads=8, n_kv_heads=4 divisible by TP=2 and TP=4
 _BASE = dict(dim=256, n_layers=4, n_heads=8, n_kv_heads=4, vocab_size=1000, max_seq_len=64)
 MOE_CONFIG = ModelConfig(**_BASE, num_experts=4, moe_top_k=2)
+MOE_PACKED_CONFIG = ModelConfig(**_BASE, num_experts=4, moe_top_k=2, moe_packed_experts=True)
 MOE_FREQ_CONFIG = ModelConfig(**_BASE, num_experts=4, moe_top_k=2, moe_frequency=2)
 MOE_SIGMOID_CONFIG = ModelConfig(
     **_BASE,
@@ -101,6 +102,48 @@ class TestMoEFSDP:
         loss = out.sum()
         assert torch.isfinite(loss)
         loss.backward()
+
+
+class TestMoEFSDPPacked:
+    """FSDP2 over packed MoE expert weights (no EP)."""
+
+    def test_packed_fsdp_forward_backward(self, distributed_env):
+        """Packed MoE + FSDP2 produces finite loss; packed params get grads."""
+        mesh = distributed_env
+        model = Transformer(MOE_PACKED_CONFIG).cuda()
+        apply_fsdp2(model, mesh)
+
+        tokens = torch.randint(0, 1000, (2, 32), device="cuda")
+        out = model(tokens)
+        loss = out.sum()
+        assert torch.isfinite(loss), f"Loss not finite: {loss.item()}"
+        loss.backward()
+
+        for layer in model.layers.values():
+            if isinstance(layer.mlp, MoEMLP):
+                assert not hasattr(layer.mlp, "experts")
+                assert layer.mlp.up_w.grad is not None
+                assert layer.mlp.down_w.grad is not None
+                assert layer.mlp.gate_w.grad is not None
+
+    def test_packed_fsdp_gradient_sync(self, distributed_env):
+        """Losses should match across DP ranks with packed experts + FSDP2."""
+        mesh = distributed_env
+        model = Transformer(MOE_PACKED_CONFIG).cuda()
+        apply_fsdp2(model, mesh)
+
+        torch.manual_seed(0)
+        tokens = torch.randint(0, 1000, (2, 32), device="cuda")
+        out = model(tokens)
+        loss = out.sum()
+
+        loss_val = loss.detach().clone()
+        all_losses = [torch.zeros_like(loss_val) for _ in range(dist.get_world_size())]
+        dist.all_gather(all_losses, loss_val)
+        for other in all_losses[1:]:
+            assert torch.allclose(all_losses[0], other, atol=1e-3), (
+                f"Packed MoE losses differ across ranks: {[v.item() for v in all_losses]}"
+            )
 
 
 class TestMoETP:
