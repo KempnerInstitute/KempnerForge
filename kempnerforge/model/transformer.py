@@ -62,6 +62,7 @@ class TransformerBlock(nn.Module):
                 gradient_scale=config.moe_gradient_scale,
                 sequence_aux_loss_weight=config.moe_sequence_aux_loss_weight,
                 bias_schedule=config.moe_bias_schedule,
+                packed_experts=config.moe_packed_experts,
             )
         else:
             self.mlp = build_mlp(

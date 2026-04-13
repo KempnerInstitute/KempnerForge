@@ -139,6 +139,7 @@ class MoEMLP(nn.Module):
         shared_expert: nn.Module | None = None,
         capacity_factor: float = 0.0,
         gradient_scale: bool = False,
+        packed_experts: bool = False,
     ) -> None:
         super().__init__()
         self.router = router
@@ -147,12 +148,33 @@ class MoEMLP(nn.Module):
         self.num_experts = len(experts)
         self.capacity_factor = capacity_factor
         self.gradient_scale = gradient_scale
+        self.packed_experts = packed_experts
 
         # EP attributes — set by apply_expert_parallel(); defaults = no EP
         self.ep_world_size: int = 1
         self.ep_group = None
         self.local_expert_start: int = 0
         self.num_local_experts: int = len(experts)
+
+        # Packed expert weights: stack per-expert (out, in) Linear weights into
+        # (E, in, out) tensors at init so grouped GEMM can consume them zero-copy.
+        # Consumers (_local_forward, EP) still use self.experts; switch happens in
+        # subsequent steps. Activation function is captured here for the same reason.
+        if packed_experts:
+            self._is_swiglu = hasattr(experts[0], "gate_proj")
+            self.up_w = nn.Parameter(
+                torch.stack([e.up_proj.weight.t().contiguous() for e in experts])  # type: ignore[reportCallIssue, reportAttributeAccessIssue]
+            )
+            self.down_w = nn.Parameter(
+                torch.stack([e.down_proj.weight.t().contiguous() for e in experts])  # type: ignore[reportCallIssue, reportAttributeAccessIssue]
+            )
+            if self._is_swiglu:
+                self.gate_w = nn.Parameter(
+                    torch.stack([e.gate_proj.weight.t().contiguous() for e in experts])  # type: ignore[reportCallIssue, reportAttributeAccessIssue]
+                )
+                self._packed_activation = F.silu
+            else:
+                self._packed_activation = experts[0]._activation
 
     def _local_forward(
         self,
@@ -304,6 +326,7 @@ def build_moe(
     gradient_scale: bool = False,
     sequence_aux_loss_weight: float = 0.0,
     bias_schedule: str = "constant",
+    packed_experts: bool = False,
 ) -> MoEMLP:
     """Build an MoE layer, composing router + experts from Registry.
 
@@ -319,6 +342,7 @@ def build_moe(
         gradient_scale: Per-expert gradient normalization.
         sequence_aux_loss_weight: Sequence-level balance loss weight (sigmoid router only).
         bias_schedule: Bias update rate schedule (sigmoid router only).
+        packed_experts: Pack expert weights into one tensor per projection.
     """
     router_builder = registry.get("router", router_type)
     router_kwargs: dict[str, object] = {}
@@ -341,4 +365,5 @@ def build_moe(
         shared_expert,
         capacity_factor=capacity_factor,
         gradient_scale=gradient_scale,
+        packed_experts=packed_experts,
     )

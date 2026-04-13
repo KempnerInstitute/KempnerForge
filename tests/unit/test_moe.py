@@ -868,3 +868,127 @@ class TestMoESigmoidConfigValidation:
         logits.sum().backward()
         for name, p in model.named_parameters():
             assert p.grad is not None, f"{name} has no gradient"
+
+
+class TestPackedExperts:
+    """Phase 17a: packed expert weight storage in MoEMLP."""
+
+    def test_config_default_is_false(self):
+        config = ModelConfig(**_SMALL, num_experts=4, moe_top_k=2)
+        assert config.moe_packed_experts is False
+
+    def test_disabled_by_default_no_packed_attrs(self):
+        moe = build_moe(dim=64, hidden_dim=128, num_experts=4, top_k=2)
+        assert moe.packed_experts is False
+        assert not hasattr(moe, "up_w")
+        assert not hasattr(moe, "down_w")
+        assert not hasattr(moe, "gate_w")
+
+    def test_packed_swiglu_storage_shapes(self):
+        dim, hidden_dim, E = 64, 128, 4
+        moe = build_moe(
+            dim=dim,
+            hidden_dim=hidden_dim,
+            num_experts=E,
+            top_k=2,
+            activation="silu",
+            packed_experts=True,
+        )
+        assert moe.packed_experts is True
+        assert moe._is_swiglu is True
+        assert moe.up_w.shape == (E, dim, hidden_dim)
+        assert moe.down_w.shape == (E, hidden_dim, dim)
+        assert moe.gate_w.shape == (E, dim, hidden_dim)
+        assert isinstance(moe.up_w, torch.nn.Parameter)
+        assert isinstance(moe.down_w, torch.nn.Parameter)
+        assert isinstance(moe.gate_w, torch.nn.Parameter)
+
+    def test_packed_standard_storage_no_gate(self):
+        dim, hidden_dim, E = 64, 128, 4
+        moe = build_moe(
+            dim=dim,
+            hidden_dim=hidden_dim,
+            num_experts=E,
+            top_k=2,
+            activation="gelu",
+            packed_experts=True,
+        )
+        assert moe.packed_experts is True
+        assert moe._is_swiglu is False
+        assert moe.up_w.shape == (E, dim, hidden_dim)
+        assert moe.down_w.shape == (E, hidden_dim, dim)
+        assert not hasattr(moe, "gate_w")
+
+    def test_packed_weights_match_individual(self):
+        """Packed tensors equal stacked individual expert weights."""
+        moe = build_moe(
+            dim=64,
+            hidden_dim=128,
+            num_experts=4,
+            top_k=2,
+            activation="silu",
+            packed_experts=True,
+        )
+        expected_up = torch.stack([e.up_proj.weight.t().contiguous() for e in moe.experts])
+        expected_down = torch.stack([e.down_proj.weight.t().contiguous() for e in moe.experts])
+        expected_gate = torch.stack([e.gate_proj.weight.t().contiguous() for e in moe.experts])
+        torch.testing.assert_close(moe.up_w.data, expected_up)
+        torch.testing.assert_close(moe.down_w.data, expected_down)
+        torch.testing.assert_close(moe.gate_w.data, expected_gate)
+
+    def test_packed_activation_swiglu_is_silu(self):
+        moe = build_moe(
+            dim=64,
+            hidden_dim=128,
+            num_experts=4,
+            top_k=2,
+            activation="silu",
+            packed_experts=True,
+        )
+        # SwiGLU: outer activation handled by silu(gate) * up — the captured
+        # function is silu so the packed forward path can apply it directly.
+        x = torch.randn(8, 128)
+        torch.testing.assert_close(moe._packed_activation(x), torch.nn.functional.silu(x))
+
+    def test_packed_activation_standard_matches_expert(self):
+        moe = build_moe(
+            dim=64,
+            hidden_dim=128,
+            num_experts=4,
+            top_k=2,
+            activation="gelu",
+            packed_experts=True,
+        )
+        x = torch.randn(8, 128)
+        torch.testing.assert_close(moe._packed_activation(x), moe.experts[0]._activation(x))
+
+    def test_transformer_propagates_packed_flag(self):
+        config = ModelConfig(
+            **_SMALL,
+            num_experts=4,
+            moe_top_k=2,
+            moe_packed_experts=True,
+        )
+        model = Transformer(config)
+        moe_layers = [m for m in model.modules() if isinstance(m, MoEMLP)]
+        assert len(moe_layers) > 0
+        for moe in moe_layers:
+            assert moe.packed_experts is True
+            assert hasattr(moe, "up_w")
+            assert hasattr(moe, "down_w")
+            assert hasattr(moe, "gate_w")  # _SMALL uses silu → SwiGLU
+
+    def test_packed_params_registered_on_module(self):
+        """Packed tensors are nn.Parameters → discoverable via .parameters()."""
+        moe = build_moe(
+            dim=64,
+            hidden_dim=128,
+            num_experts=4,
+            top_k=2,
+            activation="silu",
+            packed_experts=True,
+        )
+        param_ids = {id(p) for p in moe.parameters()}
+        assert id(moe.up_w) in param_ids
+        assert id(moe.down_w) in param_ids
+        assert id(moe.gate_w) in param_ids
