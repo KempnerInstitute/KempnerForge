@@ -27,6 +27,7 @@ pytestmark = pytest.mark.skipif(
 
 _BASE = dict(dim=128, n_layers=2, n_heads=4, n_kv_heads=2, vocab_size=512, max_seq_len=32)
 EP_CONFIG = ModelConfig(**_BASE, num_experts=4, moe_top_k=2)
+EP_CONFIG_PACKED = ModelConfig(**_BASE, num_experts=4, moe_top_k=2, moe_packed_experts=True)
 
 
 @pytest.fixture
@@ -177,3 +178,78 @@ class TestEPPlusFSDP:
         # All losses should be finite
         for i, v in enumerate(all_losses):
             assert torch.isfinite(v), f"Rank {i} loss not finite: {v.item()}"
+
+
+class TestEPPacked:
+    """Phase 17c: EP sharding with packed expert weights."""
+
+    def test_apply_slices_packed_tensors(self, ep_only_mesh):
+        """apply_expert_parallel slices up_w/down_w/gate_w along the expert dim."""
+        model = Transformer(EP_CONFIG_PACKED).cuda()
+        apply_expert_parallel(model, ep_only_mesh)
+
+        ep_size = ep_only_mesh["ep"].size()
+        experts_per_rank = EP_CONFIG_PACKED.num_experts // ep_size
+
+        for layer in model.layers.values():
+            if isinstance(layer.mlp, MoEMLP):
+                assert layer.mlp.up_w.shape[0] == experts_per_rank
+                assert layer.mlp.down_w.shape[0] == experts_per_rank
+                assert layer.mlp.gate_w.shape[0] == experts_per_rank  # SwiGLU
+                assert isinstance(layer.mlp.up_w, torch.nn.Parameter)
+                assert isinstance(layer.mlp.down_w, torch.nn.Parameter)
+                assert isinstance(layer.mlp.gate_w, torch.nn.Parameter)
+
+    def test_ep_forward_backward_packed(self, ep_only_mesh):
+        """Packed EP model forward + backward produces finite output and grads."""
+        model = Transformer(EP_CONFIG_PACKED).cuda()
+        apply_expert_parallel(model, ep_only_mesh)
+
+        tokens = torch.randint(0, 512, (1, 16), device="cuda")
+        out = model(tokens)
+        loss = out.sum()
+        assert torch.isfinite(torch.tensor(loss.item())), f"Loss not finite: {loss.item()}"
+        loss.backward()
+
+        for name, p in model.named_parameters():
+            if p.requires_grad:
+                assert p.grad is not None, f"No gradient for {name}"
+
+    def test_ep_packed_grads_on_packed_params(self, ep_only_mesh):
+        """Backward fills grads on packed params, not on the local ModuleList experts."""
+        model = Transformer(EP_CONFIG_PACKED).cuda()
+        apply_expert_parallel(model, ep_only_mesh)
+
+        tokens = torch.randint(0, 512, (2, 32), device="cuda")
+        model(tokens).sum().backward()
+
+        for layer in model.layers.values():
+            if isinstance(layer.mlp, MoEMLP):
+                assert layer.mlp.up_w.grad is not None
+                assert layer.mlp.down_w.grad is not None
+                assert layer.mlp.gate_w.grad is not None
+                for expert in layer.mlp.experts:
+                    assert expert.up_proj.weight.grad is None
+                    assert expert.down_proj.weight.grad is None
+                    assert expert.gate_proj.weight.grad is None
+
+    @pytest.mark.skipif(
+        int(os.environ.get("WORLD_SIZE", "1")) < 4,
+        reason="EP+FSDP requires >= 4 GPUs (dp=2, ep=2)",
+    )
+    def test_ep_plus_fsdp2_packed(self):
+        """Packed EP composes with FSDP2 on a 2D mesh."""
+        world_size = dist.get_world_size()
+        ep_size = 2
+        dp_size = world_size // ep_size
+        mesh = init_device_mesh("cuda", (dp_size, ep_size), mesh_dim_names=("dp_shard", "ep"))
+
+        model = Transformer(EP_CONFIG_PACKED).cuda()
+        apply_expert_parallel(model, mesh)
+        apply_fsdp2(model, mesh)
+
+        tokens = torch.randint(0, 512, (1, 16), device="cuda")
+        out = model(tokens)
+        loss = out.sum()
+        assert torch.isfinite(torch.tensor(loss.item()))
+        loss.backward()

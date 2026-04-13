@@ -388,7 +388,7 @@ class MoEMLP(nn.Module):
                 x_flat,
                 weights,
                 indices,
-                self.experts,
+                self,
                 self.ep_group,  # type: ignore[reportArgumentType]
                 self.local_expert_start,
                 self.num_local_experts,
