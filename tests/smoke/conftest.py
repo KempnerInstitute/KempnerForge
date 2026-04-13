@@ -82,7 +82,7 @@ def _detect_slurm_env(jobid: str | None) -> dict[str, str | int] | None:
         info = result.stdout
         nodes_match = re.search(r"NumNodes=(\d+)", info)
         tasks_match = re.search(r"NumTasks=(\d+)", info)
-        nodelist_match = re.search(r"NodeList=(\S+)", info)
+        nodelist_match = re.search(r"(?<!\w)NodeList=(\S+)", info)
         state_match = re.search(r"JobState=(\w+)", info)
 
         if not all([nodes_match, nodelist_match, state_match]):
