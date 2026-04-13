@@ -721,10 +721,18 @@ class TestGradientScaling:
         """Gradient scaling modifies expert output magnitudes during training."""
         torch.manual_seed(42)
         moe_no_scale = build_moe(
-            dim=64, hidden_dim=128, num_experts=4, top_k=2, gradient_scale=False,
+            dim=64,
+            hidden_dim=128,
+            num_experts=4,
+            top_k=2,
+            gradient_scale=False,
         )
         moe_scaled = build_moe(
-            dim=64, hidden_dim=128, num_experts=4, top_k=2, gradient_scale=True,
+            dim=64,
+            hidden_dim=128,
+            num_experts=4,
+            top_k=2,
+            gradient_scale=True,
         )
         # Copy weights
         moe_scaled.load_state_dict(moe_no_scale.state_dict())
@@ -750,7 +758,11 @@ class TestGradientScaling:
         x = torch.randn(2, 16, 64)
 
         moe_no_scale = build_moe(
-            dim=64, hidden_dim=128, num_experts=4, top_k=2, gradient_scale=False,
+            dim=64,
+            hidden_dim=128,
+            num_experts=4,
+            top_k=2,
+            gradient_scale=False,
         )
         moe_no_scale.load_state_dict(moe.state_dict())
         moe_no_scale.eval()
@@ -769,9 +781,7 @@ class TestGradientScaling:
 class TestSetMoeStep:
     def test_set_moe_step_propagates(self):
         """set_moe_step propagates step to all sigmoid routers."""
-        config = ModelConfig(
-            **_SMALL, num_experts=4, moe_top_k=2, moe_router="sigmoid_topk"
-        )
+        config = ModelConfig(**_SMALL, num_experts=4, moe_top_k=2, moe_router="sigmoid_topk")
         model = Transformer(config)
         model.set_moe_step(42, 1000)
         for layer in model.layers.values():
@@ -780,9 +790,7 @@ class TestSetMoeStep:
 
     def test_set_moe_step_noop_for_softmax(self):
         """set_moe_step is a no-op for softmax routers (no set_step method needed)."""
-        config = ModelConfig(
-            **_SMALL, num_experts=4, moe_top_k=2, moe_router="softmax_topk"
-        )
+        config = ModelConfig(**_SMALL, num_experts=4, moe_top_k=2, moe_router="softmax_topk")
         model = Transformer(config)
         # Should not raise
         model.set_moe_step(42, 1000)

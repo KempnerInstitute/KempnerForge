@@ -336,7 +336,9 @@ def build_moe(
         shared_expert = build_mlp(dim, hidden_dim, activation)
 
     return MoEMLP(
-        router, experts, shared_expert,
+        router,
+        experts,
+        shared_expert,
         capacity_factor=capacity_factor,
         gradient_scale=gradient_scale,
     )

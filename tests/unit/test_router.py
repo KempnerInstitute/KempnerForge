@@ -141,9 +141,7 @@ class TestSigmoidBiasSchedule:
         assert router._effective_bias_rate() == router.bias_update_rate
 
     def test_cosine_decay_decreases(self):
-        router = SigmoidTopKRouter(
-            dim=64, num_experts=4, top_k=2, bias_schedule="cosine_decay"
-        )
+        router = SigmoidTopKRouter(dim=64, num_experts=4, top_k=2, bias_schedule="cosine_decay")
         router.set_step(0, 1000)
         rate_start = router._effective_bias_rate()
         router.set_step(500, 1000)
@@ -157,9 +155,7 @@ class TestSigmoidBiasSchedule:
         assert rate_end < 1e-7
 
     def test_cosine_decay_formula(self):
-        router = SigmoidTopKRouter(
-            dim=64, num_experts=4, top_k=2, bias_schedule="cosine_decay"
-        )
+        router = SigmoidTopKRouter(dim=64, num_experts=4, top_k=2, bias_schedule="cosine_decay")
         rate = router.bias_update_rate
         for step, total in [(0, 1000), (250, 1000), (750, 1000)]:
             router.set_step(step, total)
@@ -167,9 +163,7 @@ class TestSigmoidBiasSchedule:
             assert abs(router._effective_bias_rate() - expected) < 1e-7
 
     def test_linear_warmup_increases(self):
-        router = SigmoidTopKRouter(
-            dim=64, num_experts=4, top_k=2, bias_schedule="linear_warmup"
-        )
+        router = SigmoidTopKRouter(dim=64, num_experts=4, top_k=2, bias_schedule="linear_warmup")
         router.set_step(0, 1000)
         rate_start = router._effective_bias_rate()
         router.set_step(50, 1000)  # 5% → within warmup
@@ -191,8 +185,11 @@ class TestSigmoidBiasSchedule:
         """Cosine decay schedule produces smaller bias changes late in training."""
         torch.manual_seed(42)
         router = SigmoidTopKRouter(
-            dim=64, num_experts=4, top_k=2,
-            bias_update_rate=0.01, bias_schedule="cosine_decay",
+            dim=64,
+            num_experts=4,
+            top_k=2,
+            bias_update_rate=0.01,
+            bias_schedule="cosine_decay",
         )
         router.train()
 

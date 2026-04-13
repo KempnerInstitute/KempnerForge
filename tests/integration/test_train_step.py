@@ -230,9 +230,7 @@ class TestMoESigmoidTrainStep:
             model(tokens)
         for layer in model.layers.values():
             if isinstance(layer.mlp, MoEMLP):
-                delta_early = (
-                    layer.mlp.router.expert_bias.data - bias_before
-                ).abs().max().item()
+                delta_early = (layer.mlp.router.expert_bias.data - bias_before).abs().max().item()
                 bias_before = layer.mlp.router.expert_bias.data.clone()
 
         # Late step (cosine decay → near-zero update rate)
@@ -241,9 +239,7 @@ class TestMoESigmoidTrainStep:
             model(tokens)
         for layer in model.layers.values():
             if isinstance(layer.mlp, MoEMLP):
-                delta_late = (
-                    layer.mlp.router.expert_bias.data - bias_before
-                ).abs().max().item()
+                delta_late = (layer.mlp.router.expert_bias.data - bias_before).abs().max().item()
 
         assert delta_early > delta_late, (
             f"Bias delta should decrease: early={delta_early}, late={delta_late}"
@@ -264,9 +260,7 @@ class TestMoESigmoidTrainStep:
         for step in range(50):
             model.set_moe_step(step, 50)
             logits = model(tokens)
-            loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)), labels.view(-1)
-            )
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1))
             aux_loss = model.get_moe_aux_loss()
             total = loss + mc.moe_aux_loss_weight * aux_loss
             total.backward()
