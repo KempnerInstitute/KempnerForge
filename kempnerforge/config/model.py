@@ -50,6 +50,7 @@ class ModelConfig:
     moe_sequence_aux_loss_weight: float = 0.0  # Sequence-level balance loss (0=off)
     moe_gradient_scale: bool = False  # Per-expert gradient normalization
     moe_bias_schedule: str = "constant"  # "constant", "cosine_decay", "linear_warmup"
+    moe_packed_experts: bool = False  # Pack expert weights into one tensor per projection
 
     def __post_init__(self) -> None:
         if self.n_kv_heads is None:

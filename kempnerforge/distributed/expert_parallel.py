@@ -94,7 +94,7 @@ def ep_dispatch_and_compute(
     x: torch.Tensor,
     weights: torch.Tensor,
     indices: torch.Tensor,
-    experts: torch.nn.ModuleList,
+    moe: MoEMLP,
     ep_group: dist.ProcessGroup,
     local_expert_start: int,
     num_local_experts: int,
@@ -107,7 +107,8 @@ def ep_dispatch_and_compute(
         x: (num_tokens, dim) flattened token representations.
         weights: (num_tokens, top_k) routing weights.
         indices: (num_tokens, top_k) global expert indices.
-        experts: Local expert ModuleList (length = num_local_experts).
+        moe: The MoEMLP module. Holds either an nn.ModuleList of local experts
+            (unpacked) or packed expert tensors already sliced to the local range.
         ep_group: EP process group.
         local_expert_start: First global expert index on this rank.
         num_local_experts: Number of experts on this rank.
@@ -171,6 +172,7 @@ def ep_dispatch_and_compute(
         _GROUPED_MM_DTYPES,
         _HAS_GROUPED_MM,
         grouped_expert_forward,
+        grouped_expert_forward_packed,
     )
 
     use_grouped = _HAS_GROUPED_MM and received_tokens.dtype in _GROUPED_MM_DTYPES
@@ -183,40 +185,79 @@ def ep_dispatch_and_compute(
         local_ids = sorted_ids - local_expert_start
         tokens_per_expert = torch.bincount(local_ids, minlength=num_local_experts).tolist()
 
-        local_output_sorted = grouped_expert_forward(
-            sorted_recv,
-            tokens_per_expert,
-            experts,
-        )
+        if moe.packed_experts:
+            local_output_sorted = grouped_expert_forward_packed(
+                sorted_recv,
+                tokens_per_expert,
+                moe.up_w,
+                moe.down_w,
+                moe.gate_w if moe._is_swiglu else None,
+                moe._packed_activation,
+            )
+        else:
+            local_output_sorted = grouped_expert_forward(
+                sorted_recv,
+                tokens_per_expert,
+                moe.experts,
+            )
 
         # Unsort back to received order.
         unsort_by_expert = torch.argsort(sort_by_expert)
         local_output = local_output_sorted[unsort_by_expert]
 
-        # Ensure all expert params are in the autograd graph for FSDP2.
-        # grouped_expert_forward touches all expert weights via stacked matmul,
-        # but experts with zero tokens contribute only padding zeros. Add an
-        # explicit zero-valued contribution to guarantee AccumulateGrad fires.
-        for i in range(num_local_experts):
-            if tokens_per_expert[i] == 0:
-                for p in experts[i].parameters():
-                    local_output = local_output + p.sum() * 0
+        if moe.packed_experts:
+            # grouped_mm over the full packed tensor touches every expert row →
+            # AccumulateGrad on up_w/down_w/gate_w always fires when there is
+            # at least one token. If zero tokens arrived locally, grouped_mm
+            # short-circuits; add an explicit zero contribution to keep the
+            # packed params in the autograd graph for FSDP2.
+            if sum(tokens_per_expert) == 0:
+                _zero = moe.up_w.sum() * 0 + moe.down_w.sum() * 0
+                if moe._is_swiglu:
+                    _zero = _zero + moe.gate_w.sum() * 0
+                local_output = local_output + _zero
+        else:
+            # Unpacked: grouped_expert_forward stacks per-expert Linear weights
+            # into a temporary — experts with zero tokens never appear in the
+            # graph. Force AccumulateGrad to fire on each unused expert.
+            for i in range(num_local_experts):
+                if tokens_per_expert[i] == 0:
+                    for p in moe.experts[i].parameters():
+                        local_output = local_output + p.sum() * 0
     else:
         local_output = torch.zeros_like(received_tokens)
-        unused_expert_params: list[torch.nn.Parameter] = []
-        for i in range(num_local_experts):
-            global_expert_id = local_expert_start + i
-            mask = received_expert_ids == global_expert_id
-            if not mask.any():
-                unused_expert_params.extend(experts[i].parameters())
-                continue
-            local_output[mask] = experts[i](received_tokens[mask])
+        if moe.packed_experts:
+            any_computed = False
+            for i in range(num_local_experts):
+                global_expert_id = local_expert_start + i
+                mask = received_expert_ids == global_expert_id
+                if not mask.any():
+                    continue
+                local_output[mask] = moe._apply_packed_expert(received_tokens[mask], i)
+                any_computed = True
 
-        # FSDP2 requires every parameter's AccumulateGrad hook to fire during
-        # backward for reduce-scatter to complete.
-        if unused_expert_params:
-            _zero = sum(p.sum() for p in unused_expert_params) * 0
-            local_output = local_output + _zero
+            # If no local expert ran, packed params never entered the graph.
+            # Add zero contribution so FSDP2 reduce-scatter fires.
+            if not any_computed:
+                _zero = moe.up_w.sum() * 0 + moe.down_w.sum() * 0
+                if moe._is_swiglu:
+                    _zero = _zero + moe.gate_w.sum() * 0
+                local_output = local_output + _zero
+        else:
+            unused_expert_params: list[torch.nn.Parameter] = []
+            for i in range(num_local_experts):
+                global_expert_id = local_expert_start + i
+                mask = received_expert_ids == global_expert_id
+                if not mask.any():
+                    unused_expert_params.extend(moe.experts[i].parameters())
+                    continue
+                local_output[mask] = moe.experts[i](received_tokens[mask])
+
+            # FSDP2 requires every parameter's AccumulateGrad hook to fire during
+            # backward for reduce-scatter to complete.
+            if unused_expert_params:
+                _zero = sum(p.sum() for p in unused_expert_params) * 0
+                local_output = local_output + _zero
 
     # Per-expert gradient scaling: normalize by utilization ratio so
     # high-traffic experts don't dominate learning (DeepSeek-V3 Sec 3.2).
@@ -310,9 +351,20 @@ def apply_expert_parallel(model: torch.nn.Module, device_mesh: DeviceMesh | None
         start = ep_rank * experts_per_rank
         end = start + experts_per_rank
 
-        # Prune to local experts only
-        local_experts = torch.nn.ModuleList([module.experts[i] for i in range(start, end)])
-        module.experts = local_experts
+        if module.packed_experts:
+            # Packed path: slice the stacked weight tensors along the expert dim.
+            # Replace the Parameter (can't resize in-place) with the sliced view.
+            # The unpacked ModuleList is already absent in packed mode.
+            module.up_w = torch.nn.Parameter(module.up_w.data[start:end].clone().contiguous())
+            module.down_w = torch.nn.Parameter(module.down_w.data[start:end].clone().contiguous())
+            if module._is_swiglu:
+                module.gate_w = torch.nn.Parameter(
+                    module.gate_w.data[start:end].clone().contiguous()
+                )
+        else:
+            # Unpacked path: prune the ModuleList to the local experts only.
+            local_experts = torch.nn.ModuleList([module.experts[i] for i in range(start, end)])
+            module.experts = local_experts
 
         # Store EP metadata
         module.ep_world_size = ep_size

@@ -83,6 +83,68 @@ def grouped_expert_forward(
     return output
 
 
+def grouped_expert_forward_packed(
+    x_sorted: torch.Tensor,
+    tokens_per_expert: list[int],
+    up_w: torch.Tensor,
+    down_w: torch.Tensor,
+    gate_w: torch.Tensor | None,
+    activation,
+) -> torch.Tensor:
+    """Batched expert computation over pre-packed weights.
+
+    Same as ``grouped_expert_forward`` but consumes packed weight tensors
+    directly — no per-step ``torch.stack`` over an ``nn.ModuleList``.
+
+    Args:
+        x_sorted: (total_tokens, dim) token features sorted by expert index.
+        tokens_per_expert: Number of tokens assigned to each expert, in order.
+        up_w: (E, dim, hidden) packed up-projection weights.
+        down_w: (E, hidden, dim) packed down-projection weights.
+        gate_w: (E, dim, hidden) packed gate weights for SwiGLU, else None.
+        activation: Activation function applied to the up-projection output
+            when ``gate_w`` is None. SwiGLU hardcodes silu.
+
+    Returns:
+        (total_tokens, dim) expert outputs in the same sorted order as input.
+    """
+    num_experts = up_w.shape[0]
+    total_tokens, dim = x_sorted.shape
+    max_tokens = max(tokens_per_expert)
+
+    if max_tokens == 0 or total_tokens == 0:
+        return torch.zeros_like(x_sorted)
+
+    # Pad token groups into (E, max_tokens, dim) for uniform batch size.
+    x_padded = x_sorted.new_zeros(num_experts, max_tokens, dim)
+    offset = 0
+    for i, count in enumerate(tokens_per_expert):
+        if count > 0:
+            x_padded[i, :count] = x_sorted[offset : offset + count]
+        offset += count
+
+    # Grouped matmuls — 3 for SwiGLU, 2 for StandardMLP.
+    if gate_w is not None:
+        gate = torch._grouped_mm(x_padded, gate_w)  # (E, M, H)
+        up = torch._grouped_mm(x_padded, up_w)  # (E, M, H)
+        hidden = F.silu(gate) * up  # (E, M, H)
+    else:
+        hidden = torch._grouped_mm(x_padded, up_w)  # (E, M, H)
+        hidden = activation(hidden)
+
+    out_padded = torch._grouped_mm(hidden, down_w)  # (E, M, dim)
+
+    # Unpad back to flat sorted order.
+    output = torch.zeros_like(x_sorted)
+    offset = 0
+    for i, count in enumerate(tokens_per_expert):
+        if count > 0:
+            output[offset : offset + count] = out_padded[i, :count]
+        offset += count
+
+    return output
+
+
 def _apply_capacity(
     weights: torch.Tensor,
     indices: torch.Tensor,
@@ -139,20 +201,57 @@ class MoEMLP(nn.Module):
         shared_expert: nn.Module | None = None,
         capacity_factor: float = 0.0,
         gradient_scale: bool = False,
+        packed_experts: bool = False,
     ) -> None:
         super().__init__()
         self.router = router
-        self.experts = experts
         self.shared_expert = shared_expert
         self.num_experts = len(experts)
         self.capacity_factor = capacity_factor
         self.gradient_scale = gradient_scale
+        self.packed_experts = packed_experts
 
         # EP attributes — set by apply_expert_parallel(); defaults = no EP
         self.ep_world_size: int = 1
         self.ep_group = None
         self.local_expert_start: int = 0
         self.num_local_experts: int = len(experts)
+
+        if packed_experts:
+            # Packed expert weights: stack per-expert (out, in) Linear weights into
+            # (E, in, out) tensors so grouped GEMM can consume them zero-copy.
+            # Drop the per-expert nn.ModuleList — the packed tensors are the
+            # sole source of truth. Tests / EP / FSDP2 read `self.up_w` etc.
+            self._is_swiglu = hasattr(experts[0], "gate_proj")
+            self.up_w = nn.Parameter(
+                torch.stack([e.up_proj.weight.t().contiguous() for e in experts])  # type: ignore[reportCallIssue, reportAttributeAccessIssue]
+            )
+            self.down_w = nn.Parameter(
+                torch.stack([e.down_proj.weight.t().contiguous() for e in experts])  # type: ignore[reportCallIssue, reportAttributeAccessIssue]
+            )
+            if self._is_swiglu:
+                self.gate_w = nn.Parameter(
+                    torch.stack([e.gate_proj.weight.t().contiguous() for e in experts])  # type: ignore[reportCallIssue, reportAttributeAccessIssue]
+                )
+                self._packed_activation = F.silu
+            else:
+                self._packed_activation = experts[0]._activation
+        else:
+            self.experts = experts
+
+    def _apply_packed_expert(self, x: torch.Tensor, i: int) -> torch.Tensor:
+        """Apply packed expert ``i`` to ``x`` without grouped GEMM.
+
+        Used by the sequential fallback path. Matches the unpacked
+        SwiGLU/StandardMLP forward exactly (no bias, same matmul order).
+        """
+        up = x @ self.up_w[i]
+        if self._is_swiglu:
+            gate = x @ self.gate_w[i]
+            hidden = F.silu(gate) * up
+        else:
+            hidden = self._packed_activation(up)  # type: ignore[reportCallIssue]
+        return hidden @ self.down_w[i]
 
     def _local_forward(
         self,
@@ -190,7 +289,17 @@ class MoEMLP(nn.Module):
                 sorted_expert_ids, minlength=self.num_experts
             ).tolist()
 
-            expert_out = grouped_expert_forward(x_sorted, tokens_per_expert, self.experts)
+            if self.packed_experts:
+                expert_out = grouped_expert_forward_packed(
+                    x_sorted,
+                    tokens_per_expert,
+                    self.up_w,
+                    self.down_w,
+                    self.gate_w if self._is_swiglu else None,
+                    self._packed_activation,
+                )
+            else:
+                expert_out = grouped_expert_forward(x_sorted, tokens_per_expert, self.experts)
 
             # Per-expert gradient scaling: normalize by utilization ratio so
             # high-traffic experts don't dominate learning (DeepSeek-V3 Sec 3.2).
@@ -224,7 +333,11 @@ class MoEMLP(nn.Module):
                 if not mask.any():
                     continue
                 expert_input = x_flat[mask]
-                expert_output = self.experts[i](expert_input)
+                expert_output = (
+                    self._apply_packed_expert(expert_input, i)
+                    if self.packed_experts
+                    else self.experts[i](expert_input)
+                )
                 # Per-expert gradient scaling (DeepSeek-V3 Sec 3.2)
                 if self.gradient_scale and self.training:
                     tokens_i = (indices == i).sum().detach().float()
@@ -276,7 +389,7 @@ class MoEMLP(nn.Module):
                 x_flat,
                 weights,
                 indices,
-                self.experts,
+                self,
                 self.ep_group,  # type: ignore[reportArgumentType]
                 self.local_expert_start,
                 self.num_local_experts,
@@ -304,6 +417,7 @@ def build_moe(
     gradient_scale: bool = False,
     sequence_aux_loss_weight: float = 0.0,
     bias_schedule: str = "constant",
+    packed_experts: bool = False,
 ) -> MoEMLP:
     """Build an MoE layer, composing router + experts from Registry.
 
@@ -319,6 +433,7 @@ def build_moe(
         gradient_scale: Per-expert gradient normalization.
         sequence_aux_loss_weight: Sequence-level balance loss weight (sigmoid router only).
         bias_schedule: Bias update rate schedule (sigmoid router only).
+        packed_experts: Pack expert weights into one tensor per projection.
     """
     router_builder = registry.get("router", router_type)
     router_kwargs: dict[str, object] = {}
@@ -341,4 +456,5 @@ def build_moe(
         shared_expert,
         capacity_factor=capacity_factor,
         gradient_scale=gradient_scale,
+        packed_experts=packed_experts,
     )
