@@ -255,7 +255,7 @@ kempnerforge/
 configs/       — TOML configs for training runs and model architecture presets
 scripts/       — Training entry point, data validation, checkpoint conversion, SLURM launch
 benchmarks/    — Performance benchmarks (forward pass, MoE, data pipeline, optimizer, MFU scaling)
-tests/         — Unit (740), integration, distributed, and end-to-end tests
+tests/         — Unit (786), integration, distributed, and end-to-end tests
 ```
 
 ## Testing
@@ -358,7 +358,7 @@ Core MoE, Expert Parallelism, DeepSeekMoE, grouped GEMM, FSDP2 compatibility, an
 
 | Feature | Status | Impact |
 |---------|:------:|--------|
-| Router improvements (sequence aux loss, gradient scaling, adaptive bias) | In progress | Training quality |
+| Router improvements (sequence aux loss, gradient scaling, adaptive bias) | **Done** | Training quality |
 | FP8 mixed precision | **Done** | 2x compute throughput |
 | Pipeline parallelism for MoE (PP+EP+TP composition) | Blocked | Required for 100B+ |
 | Communication-computation overlap (async EP dispatch) | Planned | 15-30% throughput |
@@ -367,8 +367,6 @@ Core MoE, Expert Parallelism, DeepSeekMoE, grouped GEMM, FSDP2 compatibility, an
 | Large-scale EP (hierarchical all-to-all, 256+ experts) | Planned | 1000+ GPU scale |
 
 > **Note:** Dense Pipeline Parallelism (PP) is fully supported. MoE + PP is explicitly rejected at config validation time because MoE data-dependent routing is incompatible with static pipeline stage splitting. Use FSDP, TP, or EP for MoE models.
-
-See `moe_eng_production_plan.md` for detailed implementation plans, steps, and test specifications.
 
 ## Design Principles
 
