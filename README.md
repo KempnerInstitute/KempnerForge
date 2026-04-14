@@ -368,8 +368,6 @@ Core MoE, Expert Parallelism, DeepSeekMoE, grouped GEMM, FSDP2 compatibility, an
 
 > **Note:** Dense Pipeline Parallelism (PP) is fully supported. MoE + PP is explicitly rejected at config validation time because MoE data-dependent routing is incompatible with static pipeline stage splitting. Use FSDP, TP, or EP for MoE models.
 
-See `moe_eng_production_plan.md` for detailed implementation plans, steps, and test specifications.
-
 ## Design Principles
 
 - **PyTorch-native**: FSDP2, DTensor, DeviceMesh, DCP, SDPA, torch.compile

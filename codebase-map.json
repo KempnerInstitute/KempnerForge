@@ -8,7 +8,7 @@
     "kempnerforge/config/registry.py": {
       "classes": {
         "Registry": {
-          "purpose": "Central registry for named components (models, optimizers, schedulers, losses, evaluators)",
+          "purpose": "Central registry for named components (models, optimizers, schedulers, losses)",
           "methods": [
             "register(category, name, obj)",
             "get(category, name)",
@@ -20,9 +20,7 @@
             "register_scheduler(name)",
             "get_scheduler(name)",
             "register_loss(name)",
-            "get_loss(name)",
-            "register_eval(name)",
-            "get_eval(name)"
+            "get_loss(name)"
           ]
         }
       },
