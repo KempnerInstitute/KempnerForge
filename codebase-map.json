@@ -1,7 +1,7 @@
 {
   "meta": {
     "description": "KempnerForge codebase map — files, classes, functions, tests, and registry entries",
-    "updated": "2026-04-12",
+    "updated": "2026-04-14",
     "note": "Keep in sync as phases are implemented"
   },
   "source": {
@@ -28,22 +28,44 @@
       "tested_by": ["tests/unit/test_config.py::TestRegistry"]
     },
     "kempnerforge/config/schema.py": {
-      "enums": ["NormType", "Activation", "ActivationCheckpointing", "AsyncCheckpointMode", "PipelineSchedule", "SchedulerType"],
+      "purpose": "Backward-compatible re-exports — all config classes defined in submodules below",
+      "re_exports_from": ["config/model.py", "config/training.py", "config/optimizer.py", "config/scheduler.py", "config/data.py", "config/eval.py", "config/distributed.py", "config/checkpoint.py", "config/metrics.py", "config/profiling.py"]
+    },
+    "kempnerforge/config/model.py": {
+      "enums": ["NormType", "Activation"],
       "classes": {
         "ModelConfig": {
           "purpose": "Architecture hyperparameters (dim, layers, heads, vocab, MoE, QK-norm)",
           "properties": ["is_moe", "head_dim", "computed_ffn_hidden_dim", "num_params_estimate"]
-        },
+        }
+      }
+    },
+    "kempnerforge/config/training.py": {
+      "enums": ["ActivationCheckpointing"],
+      "classes": {
         "TrainConfig": {
           "purpose": "Training hyperparameters (steps, batch, seq_len, precision, loss, grad accum)",
           "properties": ["param_dtype", "is_fp8"]
-        },
+        }
+      }
+    },
+    "kempnerforge/config/optimizer.py": {
+      "classes": {
         "OptimizerConfig": {
           "purpose": "Optimizer settings (name, lr, betas, weight_decay, muon params, schedule_free_warmup_steps)"
-        },
+        }
+      }
+    },
+    "kempnerforge/config/scheduler.py": {
+      "enums": ["SchedulerType"],
+      "classes": {
         "SchedulerConfig": {
           "purpose": "LR schedule (type, warmup, min_lr_ratio, WSD params, wsd_decay_type, rex_alpha)"
-        },
+        }
+      }
+    },
+    "kempnerforge/config/data.py": {
+      "classes": {
         "DatasetSource": {
           "purpose": "Single data source in a multi-dataset mixture (path or HF, weight, name)"
         },
@@ -52,25 +74,51 @@
         },
         "DataConfig": {
           "purpose": "Data pipeline (dataset_path, HF dataset, tokenizer, packing, mixing, phases, annealing)"
-        },
+        }
+      }
+    },
+    "kempnerforge/config/eval.py": {
+      "classes": {
         "EvalConfig": {
           "purpose": "Evaluation pipeline (interval, steps, data source)"
-        },
+        }
+      }
+    },
+    "kempnerforge/config/distributed.py": {
+      "enums": ["PipelineSchedule"],
+      "classes": {
         "DistributedConfig": {
           "purpose": "Parallelism dimensions (tp, pp, cp, ep, dp_replicate, dp_shard, fsdp)",
           "methods": ["validate_world_size(world_size)", "resolve(world_size)"]
-        },
+        }
+      }
+    },
+    "kempnerforge/config/checkpoint.py": {
+      "enums": ["AsyncCheckpointMode"],
+      "classes": {
         "CheckpointConfig": {
           "purpose": "Checkpointing (dir, interval, keep, async mode)"
-        },
+        }
+      }
+    },
+    "kempnerforge/config/metrics.py": {
+      "classes": {
         "MetricsConfig": {
           "purpose": "Logging (interval, wandb, tensorboard)"
-        },
+        }
+      }
+    },
+    "kempnerforge/config/profiling.py": {
+      "classes": {
         "ProfilingConfig": {
           "purpose": "Performance profiling (torch.profiler settings)"
-        },
+        }
+      }
+    },
+    "kempnerforge/config/job.py": {
+      "classes": {
         "JobConfig": {
-          "purpose": "Top-level config aggregating all sub-configs",
+          "purpose": "Top-level config aggregating all sub-configs, cross-section validation",
           "methods": ["validate(world_size)"]
         }
       },
@@ -121,7 +169,8 @@
             "forward(tokens, *, kv_caches, doc_ids)",
             "init_weights_and_freqs()",
             "get_moe_aux_loss()",
-            "get_expert_counts()"
+            "get_expert_counts()",
+            "set_moe_step(step, max_steps)"
           ]
         }
       },
@@ -219,18 +268,26 @@
         }
       },
       "functions": [
-        "build_moe(dim, hidden_dim, num_experts, top_k, activation, router_type, shared_experts, capacity_factor) -> MoEMLP",
+        "build_moe(dim, hidden_dim, num_experts, top_k, activation, router_type, shared_experts, capacity_factor, gradient_scale, sequence_aux_loss_weight, bias_schedule, packed_experts) -> MoEMLP",
         "grouped_expert_forward(x_sorted, tokens_per_expert, experts) -> Tensor",
+        "grouped_expert_forward_packed(x_sorted, tokens_per_expert, up_w, down_w, gate_w, activation) -> Tensor",
         "_apply_capacity(weights, indices, num_experts, capacity_factor)"
       ],
       "tested_by": [
         "tests/unit/test_moe.py::TestMoEMLP",
         "tests/unit/test_moe.py::TestMoETransformer",
+        "tests/unit/test_moe.py::TestSigmoidTopKRouter",
+        "tests/unit/test_moe.py::TestSigmoidMoEIntegration",
         "tests/unit/test_moe.py::TestSharedExperts",
+        "tests/unit/test_moe.py::TestEPConfig",
         "tests/unit/test_moe.py::TestGroupedGEMM",
         "tests/unit/test_moe.py::TestCapacityFactor",
         "tests/unit/test_moe.py::TestCompile",
-        "tests/unit/test_moe.py::TestEPAttributes"
+        "tests/unit/test_moe.py::TestEPAttributes",
+        "tests/unit/test_moe.py::TestGradientScaling",
+        "tests/unit/test_moe.py::TestSetMoeStep",
+        "tests/unit/test_moe.py::TestMoeSigmoidConfigValidation",
+        "tests/unit/test_moe.py::TestPackedExperts"
       ]
     },
     "kempnerforge/model/router.py": {
@@ -241,9 +298,9 @@
           "methods": ["forward(x)"]
         },
         "SigmoidTopKRouter": {
-          "purpose": "DeepSeek-V3 style sigmoid router with learnable bias",
+          "purpose": "DeepSeek-V3 style sigmoid router with learnable bias, adaptive scheduling, sequence aux loss",
           "properties": ["aux_loss", "expert_counts"],
-          "methods": ["forward(x)"]
+          "methods": ["forward(x)", "set_step(step, max_steps)", "_effective_bias_rate()"]
         }
       },
       "registry": [
@@ -252,6 +309,8 @@
       ],
       "tested_by": [
         "tests/unit/test_router.py::TestSoftmaxTopKRouter",
+        "tests/unit/test_router.py::TestSigmoidSequenceAuxLoss",
+        "tests/unit/test_router.py::TestSigmoidBiasSchedule",
         "tests/unit/test_moe.py::TestSigmoidTopKRouter",
         "tests/unit/test_moe.py::TestSigmoidMoEIntegration"
       ]
@@ -375,6 +434,27 @@
       "functions": ["maybe_no_sync(model, micro_step, grad_accum_steps)"],
       "tested_by": ["tests/unit/test_training.py::TestGradUtils"]
     },
+    "kempnerforge/training/hooks.py": {
+      "classes": {
+        "StepContext": {
+          "purpose": "Per-step context dataclass passed to hooks (step, loss, grad_norm, lr, tokens_seen, model, optimizer)"
+        },
+        "TrainingHook": {
+          "purpose": "Base class for training loop hooks — override only the methods you need",
+          "methods": ["on_train_begin(config)", "on_step_end(ctx)", "on_eval_end(metrics, step)", "on_checkpoint_save(step, path)", "on_train_end(step, tokens_seen)"]
+        },
+        "HookRunner": {
+          "purpose": "Dispatches hook calls to registered hooks, zero cost when empty",
+          "methods": ["on_train_begin(config)", "on_step_end(ctx)", "on_eval_end(metrics, step)", "on_checkpoint_save(step, path)", "on_train_end(step, tokens_seen)"]
+        }
+      },
+      "tested_by": [
+        "tests/unit/test_training_hooks.py::TestHookRunner",
+        "tests/unit/test_training_hooks.py::TestStepContext",
+        "tests/unit/test_training_hooks.py::TestTrainingHook",
+        "tests/unit/test_training_hooks.py::TestAllEvents"
+      ]
+    },
     "kempnerforge/data/dataset.py": {
       "classes": {
         "MemoryMappedDataset": {
@@ -487,7 +567,7 @@
         }
       },
       "functions": [
-        "ep_dispatch_and_compute(x, weights, indices, experts, ep_group, local_expert_start, num_local_experts, ep_world_size) -> Tensor",
+        "ep_dispatch_and_compute(x, weights, indices, moe, ep_group, local_expert_start, num_local_experts, ep_world_size, gradient_scale) -> Tensor",
         "apply_expert_parallel(model, device_mesh)"
       ],
       "tested_by": ["tests/distributed/test_ep.py"]
@@ -703,6 +783,10 @@
     "scripts/prepare_data.py": {
       "purpose": "Validate pre-tokenized datasets (.bin/.npy) for MemoryMappedDataset",
       "entry": "validate(data_path)"
+    },
+    "scripts/eval_harness.py": {
+      "purpose": "Run lm-eval-harness benchmarks on KempnerForge checkpoints (converts DCP to HF format)",
+      "entry": "main()"
     }
   },
   "tests": {
@@ -752,12 +836,12 @@
         "count": 17
       },
       "tests/unit/test_moe.py": {
-        "classes": ["TestMoEMLP(9)", "TestMoETransformer(8)", "TestSigmoidTopKRouter(6)", "TestSigmoidMoEIntegration(4)", "TestSharedExperts(4)", "TestEPConfig(5)", "TestGroupedGEMM(4)", "TestCapacityFactor(3)", "TestCompile(2)", "TestEPAttributes(1)"],
-        "count": 46
+        "classes": ["TestMoEMLP(9)", "TestMoETransformer(10)", "TestSigmoidTopKRouter(9)", "TestSigmoidMoEIntegration(5)", "TestSharedExperts(6)", "TestEPConfig(9)", "TestGroupedGEMM(5)", "TestCapacityFactor(3)", "TestCompile(2)", "TestEPAttributes(1)", "TestGradientScaling(6)", "TestSetMoeStep(3)", "TestMoeSigmoidConfigValidation(6)", "TestPackedExperts(17)"],
+        "count": 91
       },
       "tests/unit/test_router.py": {
-        "classes": ["TestSoftmaxTopKRouter(8)"],
-        "count": 8
+        "classes": ["TestSoftmaxTopKRouter(8)", "TestSigmoidSequenceAuxLoss(5)", "TestSigmoidBiasSchedule(6)"],
+        "count": 19
       },
       "tests/unit/test_optimizer.py": {
         "classes": ["TestNewtonSchulz(3)", "TestMuon(9)", "TestAdamW(2)"],
@@ -802,6 +886,10 @@
       "tests/unit/test_scheduler_extensions.py": {
         "classes": ["TestConstantScheduler(7)", "TestWSDDecayTypes(11)", "TestREXScheduler(10)", "TestSchedulerTomlLoading(4)", "TestSchedulerConfigValidation(4)"],
         "count": 36
+      },
+      "tests/unit/test_training_hooks.py": {
+        "classes": ["TestHookRunner(4)", "TestStepContext(2)", "TestTrainingHook(2)", "TestAllEvents(1)"],
+        "count": 9
       }
     },
     "integration": {
@@ -817,7 +905,8 @@
       "tests/distributed/test_checkpoint.py": { "note": "Distributed checkpoint save/load" },
       "tests/distributed/test_e2e_training.py": { "note": "Multi-GPU training smoke" },
       "tests/distributed/test_moe_distributed.py": { "note": "MoE with FSDP/TP" },
-      "tests/distributed/test_ep.py": { "note": "Expert parallelism" }
+      "tests/distributed/test_ep.py": { "note": "Expert parallelism" },
+      "tests/distributed/test_optimizer_distributed.py": { "note": "Lion, Schedule-Free AdamW, optimizer-scheduler compat under FSDP2" }
     },
     "e2e": {
       "tests/e2e/test_training_e2e.py": {
