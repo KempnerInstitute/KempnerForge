@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+from typing import Any
 
 from kempnerforge.config.schema import JobConfig, MetricsConfig
 from kempnerforge.metrics.logger import format_metrics, get_logger
@@ -245,11 +246,15 @@ class WandBBackend(_LoggingBackend):
         try:
             import wandb
 
-            self._run = wandb.init(
-                project=self._config.wandb_project,
-                name=self._config.wandb_run_name,
-                resume="allow",
-            )
+            init_kwargs: dict[str, Any] = {
+                "project": self._config.wandb_project,
+                "name": self._config.wandb_run_name,
+                "resume": "allow",
+            }
+            if self._config.wandb_run_id:
+                init_kwargs["id"] = self._config.wandb_run_id
+            self._run = wandb.init(**init_kwargs)
+            self._config.wandb_run_id = self._run.id
             logger.info(f"WandB initialized: {self._run.url}")
         except ImportError:
             logger.warning("wandb not installed — disabling WandB backend")
