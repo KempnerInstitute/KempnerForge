@@ -91,9 +91,10 @@ class TestBuildTrainState:
 class TestRestoreTrainState:
     def test_restores_step_and_tokens(self):
         state = {"step": 42, "tokens_seen": 99999}
-        step, tokens = restore_train_state(state)
+        step, tokens, extra = restore_train_state(state)
         assert step == 42
         assert tokens == 99999
+        assert extra == {}
 
     def test_restores_scheduler(self):
         # Build a scheduler, step it, save its state
@@ -133,9 +134,18 @@ class TestRestoreTrainState:
         assert torch.equal(a, b)
 
     def test_defaults_for_missing_keys(self):
-        step, tokens = restore_train_state({})
+        step, tokens, extra = restore_train_state({})
         assert step == 0
         assert tokens == 0
+        assert extra == {}
+
+    def test_extra_keys_roundtrip(self):
+        state = build_train_state(step=5, tokens_seen=100, extra={"wandb_run_id": "abc123"})
+        assert state["wandb_run_id"] == "abc123"
+        step, tokens, extra = restore_train_state(state)
+        assert step == 5
+        assert tokens == 100
+        assert extra["wandb_run_id"] == "abc123"
 
 
 # ---------------------------------------------------------------------------

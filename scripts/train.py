@@ -195,10 +195,12 @@ def main() -> None:
     resume_path = resolve_resume_path(config.checkpoint.dir)
     step, tokens_seen = 0, 0
     if resume_path or config.checkpoint.load_path:
-        step, tokens_seen = ckpt_mgr.load(
+        step, tokens_seen, ckpt_extra_loaded = ckpt_mgr.load(
             path=str(resume_path) if resume_path else None,
             scheduler=scheduler,
         )
+        if ckpt_extra_loaded.get("wandb_run_id"):
+            config.metrics.wandb_run_id = ckpt_extra_loaded["wandb_run_id"]
 
     # --- Metrics ---
     tracker = MetricsTracker(config, num_gpus=world_size)
@@ -752,8 +754,10 @@ def main() -> None:
         if prof is not None:
             prof.step()
 
-        # Checkpoint (include phase index for exact resumption)
-        ckpt_extra = {"phase_idx": current_phase_idx} if active_phases else None
+        # Checkpoint (include phase index + wandb run ID for exact resumption)
+        ckpt_extra = {"phase_idx": current_phase_idx} if active_phases else {}
+        if config.metrics.wandb_run_id:
+            ckpt_extra["wandb_run_id"] = config.metrics.wandb_run_id
         if step % config.checkpoint.interval == 0:
             ckpt_mgr.save(
                 step=step,

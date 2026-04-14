@@ -14,6 +14,7 @@ class MetricsConfig:
     enable_tensorboard: bool = False
     wandb_project: str = "kempnerforge"
     wandb_run_name: str | None = None  # None -> auto-generated
+    wandb_run_id: str = ""  # Restored from checkpoint on resume; empty = new run
     tensorboard_dir: str = "tb_logs"
 
     def __post_init__(self) -> None:

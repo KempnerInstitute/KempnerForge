@@ -140,7 +140,7 @@ class CheckpointManager:
         scheduler: Any | None = None,
         dataloader: Any | None = None,
         exclude_keys: list[str] | None = None,
-    ) -> tuple[int, int]:
+    ) -> tuple[int, int, dict[str, Any]]:
         """Load a checkpoint and restore all state.
 
         Args:
@@ -151,12 +151,13 @@ class CheckpointManager:
             exclude_keys: DCP state keys to skip (e.g., ["optimizer"] for fine-tuning).
 
         Returns:
-            Tuple of (step, tokens_seen).
+            Tuple of (step, tokens_seen, extra) where extra contains any
+            additional keys saved via ``build_train_state(extra=...)``.
         """
         ckpt_dir = self._resolve_load_path(path)
         if ckpt_dir is None:
             logger.info("No checkpoint found — starting from scratch")
-            return 0, 0
+            return 0, 0, {}
 
         logger.info(f"Loading checkpoint: {ckpt_dir}")
 
@@ -189,15 +190,15 @@ class CheckpointManager:
                 train_state = object_list[0]
 
             assert train_state is not None, "train_state broadcast failed"
-            step, tokens_seen = restore_train_state(
+            step, tokens_seen, extra = restore_train_state(
                 train_state,
                 scheduler=scheduler,
                 dataloader=dataloader,
             )
             logger.info(f"Resumed from step {step}, {tokens_seen:,} tokens seen")
-            return step, tokens_seen
+            return step, tokens_seen, extra
 
-        return 0, 0
+        return 0, 0, {}
 
     def _resolve_load_path(self, path: str | None = None) -> Path | None:
         """Resolve the checkpoint path to load from."""

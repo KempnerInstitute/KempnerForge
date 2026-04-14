@@ -86,7 +86,7 @@ def restore_train_state(
     state: dict[str, Any],
     scheduler: Any | None = None,
     dataloader: Any | None = None,
-) -> tuple[int, int]:
+) -> tuple[int, int, dict[str, Any]]:
     """Restore the non-distributed portion of the training state.
 
     Args:
@@ -95,7 +95,8 @@ def restore_train_state(
         dataloader: Stateful dataloader to restore.
 
     Returns:
-        Tuple of (step, tokens_seen).
+        Tuple of (step, tokens_seen, extra) where extra contains any
+        additional keys saved via build_train_state(extra=...).
     """
     step = state.get("step", 0)
     tokens_seen = state.get("tokens_seen", 0)
@@ -112,4 +113,7 @@ def restore_train_state(
         dataloader.load_state_dict(state["dataloader"])
         logger.info("Restored dataloader state")
 
-    return step, tokens_seen
+    _standard_keys = {"step", "tokens_seen", "rng", "scheduler", "dataloader"}
+    extra = {k: v for k, v in state.items() if k not in _standard_keys}
+
+    return step, tokens_seen, extra
