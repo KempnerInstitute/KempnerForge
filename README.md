@@ -1,9 +1,13 @@
-# KempnerForge
+<p align="center">
+  <img src="docs/assets/logo.png" alt="KempnerForge" width="320"/>
+</p>
 
-[![CI](https://github.com/KempnerInstitute/KempnerForge/actions/workflows/ci.yml/badge.svg)](https://github.com/KempnerInstitute/KempnerForge/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
-[![PyTorch 2.4+](https://img.shields.io/badge/pytorch-2.4+-ee4c2c.svg)](https://pytorch.org/)
+<p align="center">
+  <a href="https://github.com/KempnerInstitute/KempnerForge/actions/workflows/ci.yml"><img src="https://github.com/KempnerInstitute/KempnerForge/actions/workflows/ci.yml/badge.svg" alt="CI"/></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"/></a>
+  <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.12+-blue.svg" alt="Python 3.12+"/></a>
+  <a href="https://pytorch.org/"><img src="https://img.shields.io/badge/pytorch-2.4+-ee4c2c.svg" alt="PyTorch 2.4+"/></a>
+</p>
 
 PyTorch-native framework for fault-tolerant distributed training of foundation models on AI clusters.
 
