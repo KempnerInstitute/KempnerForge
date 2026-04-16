@@ -2,6 +2,10 @@
 name = "kempnerforge"
 version = "0.1.0"
 description = "PyTorch-native framework for fault-tolerant distributed training of foundation models on AI clusters"
+license = "MIT"
+authors = [
+    { name = "Kempner Institute", email = "kempner_hpc_cluster@harvard.edu" },
+]
 requires-python = ">=3.12"
 dependencies = [
     "torch>=2.4",

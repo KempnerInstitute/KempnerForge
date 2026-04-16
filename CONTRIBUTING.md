@@ -17,7 +17,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 ### Clone and Install
 
 ```bash
-git clone git@github.com:mmshad/KempnerForge.git
+git clone git@github.com:KempnerInstitute/KempnerForge.git
 cd KempnerForge
 
 # Install all dependencies (creates .venv automatically)
