@@ -177,6 +177,14 @@ class TestAttention:
         out = attn(x, cos, sin)
         assert out.shape == (1, 32, 256)
 
+    def test_sdpa_backend_defaults_to_auto(self):
+        attn = Attention(dim=128, n_heads=4, n_kv_heads=4)
+        assert attn.sdpa_backend == "auto"
+
+    def test_sdpa_backend_stored_on_module(self):
+        attn = Attention(dim=128, n_heads=4, n_kv_heads=4, sdpa_backend="math")
+        assert attn.sdpa_backend == "math"
+
 
 # ---------------------------------------------------------------------------
 # MLP

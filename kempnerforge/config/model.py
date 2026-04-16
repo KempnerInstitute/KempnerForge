@@ -38,6 +38,9 @@ class ModelConfig:
     qk_norm: bool = False  # Apply RMSNorm to Q/K per-head before RoPE (Gemma, DeepSeek-V3)
     init_std: float = 0.02  # Std for weight initialization (GPT-2/Llama default)
     model_type: str = "transformer"  # Registry key for model builder
+    # SDPA backend: "auto" lets PyTorch select (recommended). Override to force
+    # a specific kernel for benchmarking or debugging.
+    sdpa_backend: str = "auto"  # "auto", "flash", "efficient", "cudnn", "math"
 
     # MoE (all defaults produce a dense model -- zero behavior change)
     num_experts: int = 0  # 0 = dense, >0 = MoE
@@ -70,6 +73,13 @@ class ModelConfig:
         if self.n_heads % self.n_kv_heads != 0:
             raise ValueError(
                 f"n_heads ({self.n_heads}) must be divisible by n_kv_heads ({self.n_kv_heads})"
+            )
+
+        # SDPA backend validation
+        if self.sdpa_backend not in ("auto", "flash", "efficient", "cudnn", "math"):
+            raise ValueError(
+                f"Unknown sdpa_backend: '{self.sdpa_backend}'. "
+                "Options: 'auto', 'flash', 'efficient', 'cudnn', 'math'"
             )
 
         # MoE validation

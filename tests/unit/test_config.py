@@ -130,6 +130,21 @@ class TestModelConfig:
         )
         assert 0.9 < ratio < 1.1  # close to 7x extra MLP params + small router overhead
 
+    # --- SDPA backend config ---
+
+    def test_sdpa_backend_default_is_auto(self):
+        m = ModelConfig()
+        assert m.sdpa_backend == "auto"
+
+    def test_sdpa_backend_accepts_valid_values(self):
+        for backend in ("auto", "flash", "efficient", "cudnn", "math"):
+            m = ModelConfig(sdpa_backend=backend)
+            assert m.sdpa_backend == backend
+
+    def test_sdpa_backend_rejects_unknown(self):
+        with pytest.raises(ValueError, match="Unknown sdpa_backend"):
+            ModelConfig(sdpa_backend="fa3")
+
 
 # ---------------------------------------------------------------------------
 # TrainConfig

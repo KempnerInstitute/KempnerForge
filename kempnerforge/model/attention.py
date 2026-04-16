@@ -8,12 +8,22 @@ GQA is the general case:
 
 from __future__ import annotations
 
+import contextlib
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from kempnerforge.model.norm import RMSNorm
 from kempnerforge.model.position import apply_rope
+
+_SDPA_BACKENDS = {
+    "flash": SDPBackend.FLASH_ATTENTION,
+    "efficient": SDPBackend.EFFICIENT_ATTENTION,
+    "cudnn": SDPBackend.CUDNN_ATTENTION,
+    "math": SDPBackend.MATH,
+}
 
 
 class KVCache:
@@ -70,12 +80,14 @@ class Attention(nn.Module):
         n_kv_heads: int,
         head_dim: int | None = None,
         qk_norm: bool = False,
+        sdpa_backend: str = "auto",
     ) -> None:
         super().__init__()
         self.n_heads = n_heads
         self.n_kv_heads = n_kv_heads
         self.head_dim = head_dim or (dim // n_heads)
         self.n_rep = n_heads // n_kv_heads  # GQA repetition factor
+        self.sdpa_backend = sdpa_backend
 
         # Projections
         self.q_proj = nn.Linear(dim, n_heads * self.head_dim, bias=False)
@@ -90,6 +102,16 @@ class Attention(nn.Module):
         # Attention weight capture (analysis only — not for training)
         self.capture_attention_weights = False
         self._last_attention_weights: torch.Tensor | None = None
+
+    def _sdpa_context(self):
+        """Return a context manager that forces a specific SDPA backend.
+
+        When sdpa_backend="auto", returns a no-op and lets PyTorch's
+        heuristics select the backend.
+        """
+        if self.sdpa_backend == "auto":
+            return contextlib.nullcontext()
+        return sdpa_kernel(_SDPA_BACKENDS[self.sdpa_backend])
 
     def forward(
         self,
@@ -163,10 +185,12 @@ class Attention(nn.Module):
             doc_mask = doc_ids.unsqueeze(2) == doc_ids.unsqueeze(1)  # (B, S, S)
             causal = torch.ones(seq_len, seq_len_kv, dtype=torch.bool, device=q.device).tril()
             attn_mask = (doc_mask & causal).unsqueeze(1)  # (B, 1, S, S)
-            out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+            with self._sdpa_context():
+                out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         else:
             is_causal = kv_cache is None or seq_len > 1
-            out = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
+            with self._sdpa_context():
+                out = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
 
         # Reshape back: (batch, n_heads, seq_len, head_dim) → (batch, seq_len, dim)
         out = out.transpose(1, 2).contiguous().view(batch, seq_len, -1)

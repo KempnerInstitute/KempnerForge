@@ -182,6 +182,7 @@ Key config options:
 - `distributed.pp` — pipeline parallelism degree (default 1)
 - `model.num_experts` — number of MoE experts (0 = dense model)
 - `model.moe_router` — `"softmax_topk"` or `"sigmoid_topk"` (DeepSeek-V3 style)
+- `model.sdpa_backend` — `"auto"` (default), `"flash"`, `"efficient"`, `"cudnn"`, `"math"` — force a specific SDPA kernel for benchmarking/debugging
 - `optimizer.name` — `"adamw"`, `"muon"`, `"lion"`, or `"schedule_free_adamw"` (default `"adamw"`)
 - `scheduler.name` — `"cosine"`, `"linear"`, `"wsd"`, `"constant"`, `"rex"`, or `"none"` (default `"cosine"`)
 - `scheduler.wsd_decay_type` — WSD cooldown shape: `"cosine"`, `"linear"`, or `"sqrt"` (default `"cosine"`)
