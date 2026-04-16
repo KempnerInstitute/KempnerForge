@@ -1,0 +1,22 @@
+cff-version: 1.2.0
+message: "If you use KempnerForge in your research, please cite it as below."
+title: "KempnerForge: PyTorch-native framework for fault-tolerant distributed training of foundation models"
+authors:
+  - name: "Kempner Institute for the Study of Natural and Artificial Intelligence at Harvard University"
+    affiliation: "Harvard University"
+    email: "kempner_hpc_cluster@harvard.edu"
+version: "0.1.0"
+date-released: "2026-04-16"
+url: "https://github.com/KempnerInstitute/KempnerForge"
+repository-code: "https://github.com/KempnerInstitute/KempnerForge"
+license: MIT
+type: software
+keywords:
+  - pytorch
+  - distributed-training
+  - foundation-models
+  - large-language-models
+  - mixture-of-experts
+  - fsdp
+  - tensor-parallelism
+  - expert-parallelism
