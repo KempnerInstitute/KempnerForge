@@ -42,6 +42,7 @@ class TransformerBlock(nn.Module):
             n_kv_heads=config.n_kv_heads,  # type: ignore[reportArgumentType]
             head_dim=config.head_dim,
             qk_norm=config.qk_norm,
+            sdpa_backend=config.sdpa_backend,
         )
 
         self.mlp_norm = build_norm(config.norm_type, config.dim, eps=config.norm_eps)
