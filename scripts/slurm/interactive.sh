@@ -34,7 +34,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # ---- Info ----
 NNODES=$(squeue -j "$JOBID" -h -o "%D")
-GPUS_PER_NODE=4
+GPUS_PER_NODE="${SLURM_GPUS_PER_NODE:-4}"
 echo "=== KempnerForge srun Launch ==="
 echo "Job ID:     ${JOBID}"
 echo "Nodes:      ${NNODES} (${NODELIST})"

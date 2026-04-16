@@ -12,12 +12,8 @@ Tokenization workflow:
     4. Train:     use the printed --data flags
 
 Usage:
-    # Validate testbed data
-    uv run python scripts/prepare_data.py \
-        /n/holylfs06/LABS/kempner_shared/Everyone/testbed/text/fineweb-edu/tokenized/meta-llama-3/default
-
-    # Validate custom tokenized data
-    uv run python scripts/prepare_data.py /n/netscratch/kempner_dev/mmsh/datasets/my-dataset
+    # Validate tokenized data
+    uv run python scripts/prepare_data.py /path/to/tokenized/dataset
 """
 
 from __future__ import annotations

@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH --job-name=13b-validation
-#SBATCH --partition=kempner_dev
-#SBATCH --account=kempner_dev
-#SBATCH --constraint=h200
+#SBATCH --partition=<partition-name>     # e.g. gpu, kempner_dev
+#SBATCH --account=<account-name>         # your SLURM account
+#SBATCH --constraint=<gpu-type>          # e.g. h200, h100, a100
 #SBATCH --nodes=6
 #SBATCH --ntasks-per-node=4
 #SBATCH --gpus-per-node=4

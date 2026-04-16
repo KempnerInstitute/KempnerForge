@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH --job-name=kf-7b-adamw
-#SBATCH --partition=kempner_requeue
-#SBATCH --account=kempner_dev
-#SBATCH --constraint=h200
+#SBATCH --partition=<partition-name>     # use a preemptible/requeue partition
+#SBATCH --account=<account-name>         # your SLURM account
+#SBATCH --constraint=<gpu-type>          # e.g. h200, h100, a100
 #SBATCH --nodes=4
 #SBATCH --ntasks-per-node=4
 #SBATCH --gpus-per-node=4
@@ -14,7 +14,7 @@
 #SBATCH --signal=B:SIGTERM@120
 #SBATCH --requeue
 #
-# Llama-3 7B training on 16 H200 GPUs via kempner_requeue.
+# Llama-3 7B training on 16 GPUs via a preemptible SLURM partition.
 #
 # Preemption-resilient:
 #   - SIGTERM@120: SLURM sends SIGTERM 120s before kill
@@ -57,7 +57,7 @@ export GLOO_SOCKET_IFNAME="${IB_IFNAME}"
 
 mkdir -p logs
 
-echo "=== KempnerForge 7B Training (kempner_requeue) ==="
+echo "=== KempnerForge 7B Training (preemptible) ==="
 echo "Job ID:       ${SLURM_JOB_ID}"
 echo "Nodes:        ${NNODES} (${SLURM_JOB_NODELIST})"
 echo "GPUs/node:    ${NGPUS_PER_NODE}"
