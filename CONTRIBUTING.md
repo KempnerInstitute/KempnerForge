@@ -30,7 +30,7 @@ Run all three checks that CI will run on your PR:
 
 ```bash
 # Lint + format + type check
-uv run ruff check kempnerforge/ tests/
+uv run ruff check kempnerforge/ tests/ scripts/
 uv run ruff format --check kempnerforge/ tests/ scripts/
 uv run pyright kempnerforge/
 
@@ -117,7 +117,7 @@ Write your code. Write tests. Then run the pre-push checklist:
 uv run ruff format kempnerforge/ tests/ scripts/
 
 # 2. Lint (auto-fix what it can)
-uv run ruff check --fix kempnerforge/ tests/
+uv run ruff check --fix kempnerforge/ tests/ scripts/
 
 # 3. Type check
 uv run pyright kempnerforge/
@@ -183,7 +183,7 @@ Include `Closes #N` to auto-close the issue on merge.
 
 ```bash
 # Auto-fix lint issues
-uv run ruff check --fix kempnerforge/ tests/
+uv run ruff check --fix kempnerforge/ tests/ scripts/
 
 # Auto-format
 uv run ruff format kempnerforge/ tests/ scripts/
@@ -422,7 +422,7 @@ uv sync
 
 # Pre-push checklist (run all before every push)
 uv run ruff format kempnerforge/ tests/ scripts/
-uv run ruff check kempnerforge/ tests/
+uv run ruff check kempnerforge/ tests/ scripts/
 uv run pyright kempnerforge/
 uv run pytest tests/unit/ -v --timeout=60
 
