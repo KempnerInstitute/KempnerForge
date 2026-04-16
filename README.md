@@ -1,5 +1,10 @@
 # KempnerForge
 
+[![CI](https://github.com/KempnerInstitute/KempnerForge/actions/workflows/ci.yml/badge.svg)](https://github.com/KempnerInstitute/KempnerForge/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
+[![PyTorch 2.4+](https://img.shields.io/badge/pytorch-2.4+-ee4c2c.svg)](https://pytorch.org/)
+
 PyTorch-native framework for fault-tolerant distributed training of foundation models on AI clusters.
 
 ## AI / NeuroAI Use Cases
@@ -49,6 +54,60 @@ PyTorch-native framework for fault-tolerant distributed training of foundation m
 - Activation extraction hooks for probing, CKA, SVCCA analysis
 - Attention weight capture (explicit QK^T path for mechanistic interpretability)
 - Batch extraction over datasets with CPU offload
+
+## Architecture
+
+```mermaid
+%%{init: {'flowchart': {'nodeSpacing': 10, 'rankSpacing': 20, 'padding': 2, 'subGraphTitleMargin': {'top': 0, 'bottom': 2}}}}%%
+flowchart TB
+    %% Layer 1 — configuration inputs
+    TOML[TOML preset] --> JC[JobConfig<br/>typed dataclasses]
+    CLI[CLI overrides] --> JC
+
+    %% Layer 2 — training loop
+    JC --> TL[scripts/train.py<br/>training loop]
+
+    %% Layer 3 — subsystems (each a compact vertical stack)
+    TL --> Model
+    TL --> Parallelism
+    TL --> Data
+    TL --> Resilience
+    TL --> Outputs
+
+    subgraph Model
+        direction TB
+        M1[Token Embedding]
+        M2[Transformer Blocks<br/>RoPE · GQA · SwiGLU/MoE]
+        M3[Output Head]
+        M1 --> M2 --> M3
+    end
+
+    subgraph Parallelism ["Parallelism (strict order)"]
+        direction TB
+        P1[1 · TP] --> P2[2 · EP] --> P3[3 · FP8] --> P4[4 · AC] --> P5[5 · FSDP2]
+    end
+
+    subgraph Data ["Data"]
+        direction TB
+        D1[MemoryMapped<br/>or HuggingFace] --> D2[MixtureSampler] --> D3[StatefulDataLoader]
+    end
+
+    subgraph Resilience
+        direction TB
+        R1[SIGTERM handler]
+        R2[NaN detector]
+        R3[NCCL health]
+    end
+
+    subgraph Outputs
+        direction TB
+        O1[DCP checkpoints]
+        O2[MetricsTracker<br/>WandB · TB]
+        O3[torch.profiler]
+    end
+```
+
+The parallelism order is enforced by `kempnerforge/distributed/parallel.py` - wrong order causes silent correctness bugs (e.g., FSDP wrapping before TP breaks `nn.Linear` detection).
 
 ## Requirements
 
@@ -354,6 +413,21 @@ uv run python benchmarks/runner.py --output results.json
 ```
 
 Available benchmarks: forward pass throughput, MoE routing/dispatch, data pipeline I/O, optimizer step timing. Results from scaling experiments and profiling runs are stored in `benchmarks/` subdirectories.
+
+### Measured Performance
+
+Llama-3 architecture on NVIDIA H200 (141 GB), bf16 + full activation checkpointing, fused AdamW, cosine LR. Peak MFU per GPU count:
+
+| GPUs | Nodes | Model | Best Config | MFU | tok/s |
+|-----:|------:|-------|-------------|----:|------:|
+| 1 | 1 | 7B | single GPU | **57.8%** | 10,471 |
+| 4 | 1 | 7B | FSDP=4 | **53.8%** | 38,983 |
+| 8 | 2 | 13B | FSDP=8 | **44.4%** | 35,405 |
+| 16 | 4 | 13B | TP=4 + FSDP=4 | 33.7% | 53,814 |
+| 32 | 8 | 13B | TP=4 + FSDP=8 | 32.7% | 104,309 |
+| 32 | 8 | 70B | TP=4 + FSDP=8 | 25.4% | 17,657 |
+
+Full sweep (14 configurations) and analysis in [`benchmarks/mfu_scaling/mfu_scaling.md`](benchmarks/mfu_scaling/mfu_scaling.md). MoE expert parallelism results in [`benchmarks/moe_expert_parallel/`](benchmarks/moe_expert_parallel/).
 
 ## MoE Engineering Roadmap
 
