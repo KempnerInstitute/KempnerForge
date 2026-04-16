@@ -44,7 +44,7 @@ warmup_steps = 5
 min_lr_ratio = 0.1
 
 [data]
-dataset_path = "/n/holylfs06/LABS/kempner_shared/Everyone/testbed/text/fineweb-edu/tokenized/meta-llama-3/default"
+dataset_path = "/path/to/tokenized/dataset"
 file_pattern = "tokenized_*.bin"
 num_workers = 4
 pin_memory = true
