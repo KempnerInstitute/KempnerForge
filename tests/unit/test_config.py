@@ -170,6 +170,18 @@ class TestOptimizerConfig:
         with pytest.raises(ValueError, match="betas"):
             OptimizerConfig(betas=(1.0, 0.95))
 
+    def test_rejects_bad_muon_momentum(self):
+        with pytest.raises(ValueError, match="muon_momentum"):
+            OptimizerConfig(muon_momentum=0.0)
+
+    def test_rejects_bad_muon_ns_steps(self):
+        with pytest.raises(ValueError, match="muon_ns_steps"):
+            OptimizerConfig(muon_ns_steps=0)
+
+    def test_rejects_negative_schedule_free_warmup(self):
+        with pytest.raises(ValueError, match="schedule_free_warmup_steps"):
+            OptimizerConfig(schedule_free_warmup_steps=-1)
+
 
 # ---------------------------------------------------------------------------
 # DistributedConfig

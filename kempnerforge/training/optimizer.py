@@ -307,7 +307,7 @@ def _newton_schulz(G: torch.Tensor, steps: int = 5) -> torch.Tensor:
     assert G.ndim == 2
     a, b, c = 3.4445, -4.7750, 2.0315
 
-    # Spectral normalization to ensure convergence
+    # Frobenius normalization (matches reference Muon; sufficient for NS convergence)
     X = G / (G.norm() + 1e-7)
 
     for _ in range(steps):
@@ -329,7 +329,7 @@ def _get_local_tensor(t: torch.Tensor) -> torch.Tensor:
         from torch.distributed._tensor import DTensor
 
         if isinstance(t, DTensor):
-            return t._local_tensor
+            return t.to_local()
     except ImportError:
         pass
     return t
