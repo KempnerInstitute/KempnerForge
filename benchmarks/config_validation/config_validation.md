@@ -145,7 +145,7 @@ To improve PP MFU: increase `grad_accum_steps` to reduce bubble fraction, or use
 
 ```bash
 # 1. Get an interactive allocation (8 nodes, 4 H200 GPUs each)
-salloc -p kempner_dev --account=kempner_dev \
+salloc -p <partition> --account=<account> \
     --nodes=8 --ntasks-per-node=4 --gpus-per-node=4 \
     --cpus-per-task=16 --mem=1490G -t 00-10:00:00
 

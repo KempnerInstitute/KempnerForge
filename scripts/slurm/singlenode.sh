@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=kempnerforge
-#SBATCH --partition=kempner_h100
-#SBATCH --account=kempner_dev
+#SBATCH --partition=<partition-name>     # e.g. gpu, kempner_h100
+#SBATCH --account=<account-name>         # your SLURM account
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=4

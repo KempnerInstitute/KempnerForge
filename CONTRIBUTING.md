@@ -46,7 +46,7 @@ Unit tests run on CPU. Integration, distributed, and e2e tests require GPUs via 
 
 ```bash
 # Interactive allocation — 1 node, 4 GPUs (for integration + distributed tests)
-salloc --partition=kempner_h100 --account=kempner_dev \
+salloc --partition=<partition-name> --account=<account-name> \
   --nodes=1 --gpus-per-node=4 --cpus-per-task=16 --mem=256G --time=2:00:00
 
 # Once allocated, run GPU tests inside the allocation:

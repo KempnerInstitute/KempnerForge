@@ -78,7 +78,7 @@ sbatch scripts/slurm/singlenode.sh configs/train/7b.toml
 # SLURM (multi-node)
 sbatch --nodes=4 scripts/slurm/multinode.sh configs/train/7b.toml
 
-# SLURM (kempner_requeue — preemption-resilient, auto-resume)
+# SLURM (preemptible partition — preemption-resilient, auto-resume)
 sbatch scripts/slurm/7b_requeue.sh
 ```
 
@@ -156,7 +156,9 @@ srun --nodes=4 --ntasks-per-node=4 --gpus-per-node=4 \
 | `29b_32gpu_tp4_pp2.toml` | Dense | 29B | TP=4, PP=2, FSDP=4 | 32 |
 | `70b_32gpu_tp4.toml` | Dense | 70B | TP=4, FSDP=8 | 32 |
 | `70b_32gpu_tp4_pp4.toml` | Dense | 70B | TP=4, PP=4, FSDP=2 | 32 |
+| `13b_24gpu_validation.toml` | Dense | 13B | TP=4, FSDP=6 | 24 |
 | `moe_24gpu.toml` | MoE (8 experts) | ~7B total | TP=4, FSDP=6 | 24 |
+| `moe_8gpu_stress.toml` | MoE (8 experts) | ~4B total | TP=4, FSDP=2 | 8 |
 | `moe_ep_32gpu.toml` | MoE (8 experts) | ~4B total | TP=4, EP=2, FSDP=4 | 32 |
 | `hf_wikitext.toml` | Dense | 20M | FSDP | 1-4 |
 
