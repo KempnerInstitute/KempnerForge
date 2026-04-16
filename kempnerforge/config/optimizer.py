@@ -29,3 +29,9 @@ class OptimizerConfig:
             raise ValueError("weight_decay must be non-negative")
         if not (0 <= self.betas[0] < 1 and 0 <= self.betas[1] < 1):
             raise ValueError("betas must be in [0, 1)")
+        if not (0 < self.muon_momentum < 1):
+            raise ValueError("muon_momentum must be in (0, 1)")
+        if self.muon_ns_steps <= 0:
+            raise ValueError("muon_ns_steps must be positive")
+        if self.schedule_free_warmup_steps < 0:
+            raise ValueError("schedule_free_warmup_steps must be non-negative")
