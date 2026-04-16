@@ -7,7 +7,7 @@ export MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -1)
 RESULTS_DIR="mfu_results"
 mkdir -p "$RESULTS_DIR"
 
-DATA="/n/holylfs06/LABS/kempner_shared/Everyone/testbed/text/fineweb-edu/tokenized/meta-llama-3/default"
+DATA="${DATA:?Set DATA to your tokenized dataset path (e.g. /path/to/tokenized/llama3)}"
 DATA_ARGS="--data.dataset_path=$DATA --data.file_pattern=tokenized_*.bin"
 COMMON="--metrics.log_interval=1 --metrics.enable_wandb=false --metrics.enable_tensorboard=false --checkpoint.interval=99999"
 
