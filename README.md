@@ -145,6 +145,10 @@ sbatch --nodes=4 scripts/slurm/multinode.sh configs/train/7b.toml
 sbatch scripts/slurm/7b_requeue.sh
 ```
 
+> **Next steps for hands-on exploration:**
+> - [`examples/quickstart.md`](examples/quickstart.md) — 5-minute walkthrough (install → debug run → multi-GPU → custom data → optimizer swap → MoE → hooks)
+> - [`examples/notebooks/`](examples/notebooks/) — 6 Jupyter notebooks: model inspection, attention visualization, activation extraction, checkpoint analysis, optimizer comparison, MoE routing
+
 ## Training Configurations
 
 ### Dense models

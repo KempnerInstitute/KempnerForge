@@ -180,17 +180,17 @@ class TestAttentionWeightCapture:
         attn, rope_cos, rope_sin = attention_setup
         x = torch.randn(2, 16, 64, device=DEVICE)
         attn(x, rope_cos, rope_sin)
-        assert attn._last_attention_weights is None
+        assert attn.last_attention_weights is None
 
     def test_capture_attention_weights(self, attention_setup):
         attn, rope_cos, rope_sin = attention_setup
         attn.capture_attention_weights = True
         x = torch.randn(2, 16, 64, device=DEVICE)
         out = attn(x, rope_cos, rope_sin)
-        assert attn._last_attention_weights is not None
+        assert attn.last_attention_weights is not None
         # Shape: (batch, n_heads, seq_q, seq_k)
-        assert attn._last_attention_weights.shape == (2, 4, 16, 16)
-        assert attn._last_attention_weights.device == torch.device("cpu")
+        assert attn.last_attention_weights.shape == (2, 4, 16, 16)
+        assert attn.last_attention_weights.device == torch.device("cpu")
         # Output shape should be unchanged
         assert out.shape == (2, 16, 64)
 
@@ -200,7 +200,7 @@ class TestAttentionWeightCapture:
         attn.capture_attention_weights = True
         x = torch.randn(2, 16, 64, device=DEVICE)
         attn(x, rope_cos, rope_sin)
-        weights = attn._last_attention_weights.float()
+        weights = attn.last_attention_weights.float()
         # Each row sums to 1.0 (softmax over keys)
         row_sums = weights.sum(dim=-1)
         assert torch.allclose(row_sums, torch.ones_like(row_sums), atol=1e-5)
@@ -211,7 +211,7 @@ class TestAttentionWeightCapture:
         attn.capture_attention_weights = True
         x = torch.randn(1, 16, 64, device=DEVICE)
         attn(x, rope_cos, rope_sin)
-        weights = attn._last_attention_weights.float()
+        weights = attn.last_attention_weights.float()
         # Check upper triangle is zero (strictly above diagonal)
         seq_len = weights.shape[-1]
         upper_mask = torch.triu(torch.ones(seq_len, seq_len), diagonal=1).bool()
@@ -238,12 +238,12 @@ class TestAttentionWeightCapture:
         attn.capture_attention_weights = True
         x = torch.randn(2, 16, 64, device=DEVICE)
         attn(x, rope_cos, rope_sin)
-        assert attn._last_attention_weights is not None
+        assert attn.last_attention_weights is not None
 
         attn.capture_attention_weights = False
-        attn._last_attention_weights = None
+        attn.last_attention_weights = None
         attn(x, rope_cos, rope_sin)
-        assert attn._last_attention_weights is None
+        assert attn.last_attention_weights is None
 
 
 # ---------------------------------------------------------------------------

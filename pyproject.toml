@@ -24,6 +24,11 @@ dev = [
     "pytest-timeout",
     "ruff",
     "vulture>=2.16",
+    # Notebooks (examples/notebooks/)
+    "ipykernel",
+    "matplotlib",
+    "nbstripout",
+    "nbconvert>=7.17.1",
 ]
 
 [build-system]
