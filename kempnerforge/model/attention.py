@@ -101,7 +101,7 @@ class Attention(nn.Module):
 
         # Attention weight capture (analysis only — not for training)
         self.capture_attention_weights = False
-        self._last_attention_weights: torch.Tensor | None = None
+        self.last_attention_weights: torch.Tensor | None = None
 
     def _sdpa_context(self):
         """Return a context manager that forces a specific SDPA backend.
@@ -178,7 +178,7 @@ class Attention(nn.Module):
         if self.capture_attention_weights:
             # Manual attention for weight extraction (analysis only, not for training)
             out, attn_weights = self._attention_with_weights(q, k, v, seq_len, doc_ids, kv_cache)
-            self._last_attention_weights = attn_weights.detach().cpu()
+            self.last_attention_weights = attn_weights.detach().cpu()
         elif doc_ids is not None:
             seq_len_kv = k.shape[2]
             # Block-diagonal mask: same-document AND causal
