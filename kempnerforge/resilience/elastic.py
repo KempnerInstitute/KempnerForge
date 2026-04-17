@@ -2,9 +2,10 @@
 
 Provides utilities for training jobs that may be preempted, requeued,
 or restarted with a different number of nodes:
-  - SLURM job info detection
-  - Requeue detection
-  - Auto-resume path resolution
+
+- SLURM job info detection
+- Requeue detection
+- Auto-resume path resolution
 """
 
 from __future__ import annotations

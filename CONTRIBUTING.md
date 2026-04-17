@@ -389,6 +389,71 @@ Config rules:
 - Validate in `__post_init__` — fail fast with a clear `ValueError`.
 - Cross-section validation (e.g., "EP requires MoE") goes in `JobConfig.__post_init__`.
 
+## Writing Docs
+
+Documentation lives in `docs/` and is built with Sphinx. It deploys to GitHub Pages
+automatically on every push to `main` — PRs only build the site (no deploy) to catch
+warnings before merge.
+
+### Build locally
+
+```bash
+# One-time: install docs deps into .venv
+uv sync --group docs
+
+# One-shot HTML build (same command CI runs)
+uv run make -C docs html
+
+# Strict build (fail on any warning — matches CI)
+uv run make -C docs strict
+
+# Live-reload server while writing pages (browser at http://127.0.0.1:8000)
+uv run make -C docs live
+
+# Clean build artifacts (also removes auto-generated API stubs)
+uv run make -C docs clean
+```
+
+Output lands in `docs/_build/html/index.html`. Both `_build/` and the
+`docs/api/generated/` stub tree are gitignored.
+
+### Where pages live
+
+| Path | What goes here |
+|------|----------------|
+| `docs/index.md` | Landing page and top-level toctree |
+| `docs/api/index.md` | API reference root — `autosummary` auto-generates per-module pages |
+| `docs/<topic>/` | Narrative guides (architecture, training, distributed, MoE, checkpointing, ...) |
+| `docs/_static/` | CSS/images referenced by the site |
+| `docs/conf.py` | Sphinx configuration (theme, extensions, intersphinx mapping) |
+
+To add a new narrative page, drop a `.md` file under `docs/` and reference it from the
+`toctree` in `docs/index.md` (or from a section-specific index page).
+
+### Style conventions
+
+- **Markdown by default.** Use MyST flavored markdown (`.md`). Only fall back to `.rst`
+  when you need a docutils feature MyST doesn't cover.
+- **Use fenced directives** for admonitions and toctrees:
+  ````markdown
+  ```{note}
+  Body of the note.
+  ```
+  ````
+- **Cross-reference code** with `` {py:class}`kempnerforge.model.transformer.Transformer` ``
+  (or `func`, `meth`, `mod`). Let intersphinx handle PyTorch links — e.g.
+  `` {py:class}`torch.Tensor` ``.
+- **Docstrings use Google style** (`Args:` / `Returns:` / `Raises:`). Napoleon converts
+  them to RST at build time.
+- **Strict build matters.** CI runs `sphinx-build -W`, so unresolved references and
+  malformed docstrings fail the build. Fix them at the source rather than silencing.
+
+### Adding a new top-level module to the API reference
+
+`autosummary` picks up everything listed in `docs/api/index.md`. When you add a new
+top-level subpackage under `kempnerforge/`, add its dotted name to that list and run a
+local strict build to confirm it renders.
+
 ## Logging
 
 Use the rank-aware logger in all library code:

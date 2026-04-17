@@ -30,6 +30,15 @@ dev = [
     "nbstripout",
     "nbconvert>=7.17.1",
 ]
+docs = [
+    "sphinx>=7.0",
+    "furo>=2024.1",
+    "myst-parser>=3.0",
+    "linkify-it-py>=2.0",
+    "sphinx-copybutton>=0.5",
+    "sphinx-autodoc-typehints>=2.0",
+    "sphinx-autobuild>=2024.4",
+]
 
 [build-system]
 requires = ["hatchling"]

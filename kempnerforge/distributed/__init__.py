@@ -1,11 +1,13 @@
 """Distributed training infrastructure.
 
 Public API:
-  - init_distributed / destroy_distributed: Process group lifecycle
-  - apply_fsdp2 / apply_ac: FSDP2 sharding and activation checkpointing
-  - apply_tensor_parallel: DTensor-based tensor parallelism
-  - Pipeline parallelism: build_stage_module, build_pipeline_stage, build_pipeline_schedule
-  - clip_grad_norm_: DTensor-aware gradient clipping
+
+- ``init_distributed`` / ``destroy_distributed``: process group lifecycle
+- ``apply_fsdp2`` / ``apply_ac``: FSDP2 sharding and activation checkpointing
+- ``apply_tensor_parallel``: DTensor-based tensor parallelism
+- Pipeline parallelism: ``build_stage_module``, ``build_pipeline_stage``,
+  ``build_pipeline_schedule``
+- ``clip_grad_norm_``: DTensor-aware gradient clipping
 """
 
 from kempnerforge.distributed.parallel import apply_ac, apply_fsdp2, default_mp_policy, get_dp_mesh
