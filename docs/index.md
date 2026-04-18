@@ -44,6 +44,8 @@ once you want a real run:
   expert / pipeline parallelism, FP8.
 - **{doc}`moe/index`** — routers, capacity and dispatch, auxiliary
   losses and balancing, FP8 interaction.
+- **{doc}`data/index`** — memory-mapped datasets, HuggingFace
+  streaming, sampler, stateful dataloader, mixing and annealing.
 
 ## Indices
 
