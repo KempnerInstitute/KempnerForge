@@ -53,8 +53,72 @@ once you want a real run:
 - **{doc}`resilience/index`** — SLURM preemption, NaN detection,
   NCCL liveness, GPU health, elastic training.
 
-## Indices
+### Reference Tables and API Documentation
 
-- {ref}`genindex`
-- {ref}`modindex`
-- {ref}`search`
+- **{doc}`reference/index`** — available configs, parallelism
+  recipes, benchmarks, environment variables.
+- **{doc}`api/index`** — API reference, auto-generated from
+  docstrings.
+
+## Contributing
+
+Documentation PRs follow the same flow as code PRs. The editor loop, build
+commands, and style conventions live in
+[Contributing § Writing Docs](contributing.md#writing-docs).
+
+```{toctree}
+:hidden:
+:maxdepth: 2
+:caption: Getting Started
+
+getting-started/index
+```
+
+```{toctree}
+:hidden:
+:maxdepth: 2
+:caption: Architecture and How-to
+
+architecture/index
+how-to/index
+```
+
+```{toctree}
+:hidden:
+:maxdepth: 2
+:caption: Subsystems
+
+training/index
+distributed/index
+moe/index
+data/index
+checkpointing/index
+metrics-and-profiling/index
+resilience/index
+```
+
+```{toctree}
+:hidden:
+:maxdepth: 2
+:caption: Configuration and Reference
+
+configuration/index
+reference/index
+```
+
+```{toctree}
+:hidden:
+:maxdepth: 2
+:caption: API
+
+api/index
+```
+
+```{toctree}
+:hidden:
+:maxdepth: 1
+:caption: Project
+
+contributing
+```
+

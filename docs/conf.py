@@ -5,8 +5,8 @@ from __future__ import annotations
 import importlib.metadata
 
 project = "KempnerForge"
-author = "Kempner Institute"
-copyright = "2026, Kempner Institute"
+author = "Kempner Institute for the Study of Natural and Artificial Intelligence at Harvard University"
+copyright = "2026, Kempner Institute for the Study of Natural and Artificial Intelligence at Harvard University"
 
 try:
     release = importlib.metadata.version("kempnerforge")
@@ -20,7 +20,6 @@ extensions = [
     "sphinx.ext.napoleon",
     "sphinx.ext.intersphinx",
     "sphinx.ext.viewcode",
-    "sphinx_autodoc_typehints",
     "sphinx_copybutton",
     "myst_parser",
 ]
@@ -33,6 +32,18 @@ source_suffix = {
 exclude_patterns = ["_build", "Thumbs.db", ".DS_Store"]
 
 autosummary_generate = True
+autodoc_mock_imports = [
+    "torch",
+    "torchao",
+    "torchdata",
+    "datasets",
+    "transformers",
+    "wandb",
+    "tensorboard",
+    "sympy",
+    "numpy",
+    "triton",
+]
 autodoc_default_options = {
     "members": True,
     "undoc-members": False,
@@ -80,7 +91,7 @@ html_theme_options = {
 
 nitpicky = False
 
-# PyTorch's DeviceMesh has an unresolved ``ArrayLike`` forward reference in
-# its signature — that is upstream, not ours, so suppress those warnings so
-# ``-W`` in CI still catches real issues in our own code.
-suppress_warnings = ["sphinx_autodoc_typehints.forward_reference"]
+# Autosummary generates stubs for both package re-exports (e.g. kempnerforge.config.JobConfig)
+# and their defining submodules (kempnerforge.config.job.JobConfig). Docstring refs to the
+# short name then resolve to two targets; silence those ambiguities.
+suppress_warnings = ["ref.python"]
