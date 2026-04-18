@@ -25,6 +25,15 @@ once you want a real run:
   model inspection, attention visualization, activation extraction,
   checkpoint analysis, optimizer comparison, MoE routing.
 
+## Looking for something specific?
+
+- **{doc}`how-to/index`** — end-to-end researcher workflows: prepare
+  data, scale 1→32 GPUs, compare optimizers, set up MoE experiments,
+  extract activations, debug regressions.
+- **{doc}`architecture/index`** — model forward pass, parallelism
+  application order, data flow through the training loop.
+- **{doc}`configuration/index`** — the typed dataclass system, CLI
+  overrides, registry for swappable components.
 
 ## Indices
 
