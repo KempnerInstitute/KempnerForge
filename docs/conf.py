@@ -72,8 +72,9 @@ intersphinx_mapping = {
 }
 
 html_theme = "furo"
-html_title = f"KempnerForge {version}"
+html_title = f"v{release}"
 html_static_path = ["_static"]
+html_css_files = ["custom.css"]
 html_logo = "assets/logo.png"
 html_favicon = None
 html_theme_options = {
