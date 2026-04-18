@@ -1,25 +1,30 @@
 # KempnerForge
 
-PyTorch-native framework for fault-tolerant distributed training of foundation models on AI clusters.
+PyTorch-native framework for fault-tolerant distributed training of
+foundation models on AI clusters.
 
-This site is the canonical documentation for KempnerForge. It builds automatically from the `docs/`
-folder and the package source, and is published on every push to `main`.
+This site is the canonical documentation for KempnerForge. It builds from
+the `docs/` folder and the package source, and deploys to GitHub Pages on
+every push to `main`.
 
-:::{note}
-Content is in progress. This page and the API reference are scaffolding — the second-phase docs PR
-will fill in architecture, training, distributed, MoE, and checkpoint guides. Until then, see the
-[README](https://github.com/KempnerInstitute/KempnerForge#readme),
-[`examples/quickstart.md`](https://github.com/KempnerInstitute/KempnerForge/blob/main/examples/quickstart.md),
-and [`examples/notebooks/`](https://github.com/KempnerInstitute/KempnerForge/tree/main/examples/notebooks).
-:::
+## New here?
 
-## Contents
+Start with the getting-started pages, then move to the flagship how-to
+once you want a real run:
 
-```{toctree}
-:maxdepth: 2
+- **{doc}`getting-started/install`** — prerequisites, `uv sync`,
+  environment verification, SLURM-specific notes.
+- **{doc}`getting-started/quickstart`** — five-minute walkthrough: debug
+  run → multi-GPU → custom data → optimizer swap → MoE → hooks.
+- **{doc}`getting-started/first-training-run`** — what the debug run
+  actually did, log line by log line.
+- **{doc}`how-to/end-to-end-training-run`** — flagship walkthrough:
+  tokenize → write a config → launch 1 GPU → launch 4 GPUs → resume →
+  generate. The integration test of the docs.
+- **{doc}`getting-started/notebooks`** — six interactive notebooks for
+  model inspection, attention visualization, activation extraction,
+  checkpoint analysis, optimizer comparison, MoE routing.
 
-api/index
-```
 
 ## Indices
 
