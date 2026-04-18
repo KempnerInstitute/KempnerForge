@@ -40,6 +40,8 @@ once you want a real run:
 
 - **{doc}`training/index`** — training loop, optimizers, schedulers,
   loss functions, gradient utilities, hooks, evaluation, generation.
+- **{doc}`distributed/index`** — DeviceMesh, FSDP2, tensor /
+  expert / pipeline parallelism, FP8.
 
 ## Indices
 
