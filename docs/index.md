@@ -35,6 +35,12 @@ once you want a real run:
 - **{doc}`configuration/index`** — the typed dataclass system, CLI
   overrides, registry for swappable components.
 
+
+### Subsystem reference
+
+- **{doc}`training/index`** — training loop, optimizers, schedulers,
+  loss functions, gradient utilities, hooks, evaluation, generation.
+
 ## Indices
 
 - {ref}`genindex`
