@@ -42,6 +42,8 @@ once you want a real run:
   loss functions, gradient utilities, hooks, evaluation, generation.
 - **{doc}`distributed/index`** — DeviceMesh, FSDP2, tensor /
   expert / pipeline parallelism, FP8.
+- **{doc}`moe/index`** — routers, capacity and dispatch, auxiliary
+  losses and balancing, FP8 interaction.
 
 ## Indices
 
