@@ -50,6 +50,8 @@ once you want a real run:
   auto-resume, resharding, HuggingFace conversion.
 - **{doc}`metrics-and-profiling/index`** — metrics tracker, MFU,
   memory monitor, profiler, WandB / TensorBoard backends.
+- **{doc}`resilience/index`** — SLURM preemption, NaN detection,
+  NCCL liveness, GPU health, elastic training.
 
 ## Indices
 
