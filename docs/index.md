@@ -46,6 +46,10 @@ once you want a real run:
   losses and balancing, FP8 interaction.
 - **{doc}`data/index`** — memory-mapped datasets, HuggingFace
   streaming, sampler, stateful dataloader, mixing and annealing.
+- **{doc}`checkpointing/index`** — DCP model and train-state,
+  auto-resume, resharding, HuggingFace conversion.
+- **{doc}`metrics-and-profiling/index`** — metrics tracker, MFU,
+  memory monitor, profiler, WandB / TensorBoard backends.
 
 ## Indices
 
