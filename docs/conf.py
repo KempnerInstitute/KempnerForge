@@ -6,13 +6,14 @@ import importlib.metadata
 
 project = "KempnerForge"
 author = "Kempner Institute for the Study of Natural and Artificial Intelligence at Harvard University"
-copyright = "2026, Kempner Institute for the Study of Natural and Artificial Intelligence at Harvard University"
 
 try:
     release = importlib.metadata.version("kempnerforge")
 except importlib.metadata.PackageNotFoundError:
     release = "0.0.0"
 version = ".".join(release.split(".")[:2])
+
+copyright = f"2026, Kempner Institute for the Study of Natural and Artificial Intelligence at Harvard University · v{release}"
 
 extensions = [
     "sphinx.ext.autodoc",
@@ -72,12 +73,13 @@ intersphinx_mapping = {
 }
 
 html_theme = "furo"
-html_title = f"v{release}"
+html_title = "KempnerForge"
 html_static_path = ["_static"]
 html_css_files = ["custom.css"]
 html_logo = "assets/logo.png"
 html_favicon = None
 html_theme_options = {
+    "sidebar_hide_name": True,
     "source_repository": "https://github.com/KempnerInstitute/KempnerForge",
     "source_branch": "main",
     "source_directory": "docs/",
