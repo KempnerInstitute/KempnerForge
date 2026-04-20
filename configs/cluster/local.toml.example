@@ -1,0 +1,43 @@
+# Per-user cluster configuration for KempnerForge.
+#
+# This file is the committed schema reference. Do not edit it directly with
+# your cluster values. Either:
+#   1. Run /kempnerforge:cluster-config (preferred) to interactively write
+#      configs/cluster/local.toml, which is gitignored.
+#   2. Copy this file: `cp configs/cluster/local.toml.example configs/cluster/local.toml`
+#      and hand-edit.
+#
+# Precedence in check_env (highest first):
+#   explicit --cluster-config override > env var > local.toml > prompt user.
+
+[cluster]
+name = "kempner_h100"
+scheduler = "slurm"               # slurm | none
+
+[slurm]
+account = "<your_slurm_account>"     # leave empty and set require_account=false if your cluster does not use --account
+partition = "<your_partition>"
+qos = "<your_qos_or_blank>"          # leave empty unless your cluster requires --qos
+default_time = "01:00:00"
+default_nodes = 1
+default_gpus_per_node = 4
+require_account = true               # some clusters do not need --account; set false to opt out
+require_qos = false                  # set true if your cluster requires --qos
+
+[network]
+ib_interface = "auto"             # "auto" or a specific interface like "ib0".
+                                  # Exported as NCCL_SOCKET_IFNAME for multi-node.
+shared_fs_root = "/n/holylfs06/LABS/kempner_dev"
+# Required only for multi-node runs. Must be a distributed filesystem
+# (NFS / Lustre / GPFS) that all ranks can read and write.
+# check_env --requires multi-node verifies that:
+#   1. the repo checkout is under shared_fs_root,
+#   2. shared_fs_root is a distributed FS type,
+#   3. checkpoints_root (below) is also under it.
+
+[paths]
+checkpoints_root = "/n/holylfs06/LABS/kempner_dev/checkpoints"
+
+[credentials]
+wandb_entity = "<your_wandb_entity>"   # entity name only, never the API key
+hf_user = "<your_hf_username>"

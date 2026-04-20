@@ -88,7 +88,7 @@ class TestCheckpointRoundtrip:
             sched_config,
             max_steps=100,
         )
-        step, tokens = restore_train_state(state, scheduler=sched2)
+        step, tokens, _ = restore_train_state(state, scheduler=sched2)
         assert step == 10
         assert tokens == 5000
         assert sched2.last_epoch == sched.last_epoch
