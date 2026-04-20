@@ -117,6 +117,14 @@ api/index
 ```{toctree}
 :hidden:
 :maxdepth: 1
+:caption: Agent Integration
+
+claude-ready
+```
+
+```{toctree}
+:hidden:
+:maxdepth: 1
 :caption: Project
 
 contributing

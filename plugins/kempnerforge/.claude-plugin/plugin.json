@@ -1,0 +1,11 @@
+{
+  "name": "kempnerforge",
+  "version": "0.1.0",
+  "description": "Skills for running, extending, and contributing to KempnerForge, a PyTorch-native framework for fault-tolerant distributed training of foundation models.",
+  "author": {
+    "name": "Kempner Institute",
+    "email": "kempner_hpc_cluster@harvard.edu"
+  },
+  "homepage": "https://github.com/KempnerInstitute/KempnerForge",
+  "license": "MIT"
+}
