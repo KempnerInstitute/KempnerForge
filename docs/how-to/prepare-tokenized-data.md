@@ -121,8 +121,9 @@ local directory.
 
 ### Cache the tokenizer first
 
-HuggingFace won't reach out to the hub from a compute node that
-doesn't have internet. Cache on the login node once:
+Hugging Face cannot access the hub from compute nodes with no or limited internet connectivity. 
+Since compute nodes also have much slower bandwidth (~1 Gbps vs. ~100 Gbps on login nodes), 
+cache the tokenizer once on the login node:
 
 ```bash
 python -c "from transformers import AutoTokenizer; AutoTokenizer.from_pretrained('gpt2')"
