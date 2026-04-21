@@ -440,3 +440,100 @@ class TestMixtureSamplerWithDataset:
         # All indices in ds_b range → dataset_idx=1
         for i in range(len(ds_a), len(mix)):
             assert mix[i]["dataset_idx"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Zero-weight validation
+# ---------------------------------------------------------------------------
+
+
+class TestMixtureSamplerZeroWeights:
+    """Both normalization branches must reject all-zero weights up-front.
+
+    Previously, ``temperature == 1.0`` crashed with ZeroDivisionError at the
+    ``/`` inside __init__/update_weights, and ``temperature != 1.0`` silently
+    degraded to uniform sampling via the ``max(w, 1e-12)`` clamp. Both are
+    config errors and should raise the same ValueError with a clear message.
+    """
+
+    def test_init_rejects_all_zero_weights(self):
+        with pytest.raises(ValueError, match="sum to > 0"):
+            MixtureSampler(
+                cumulative_sizes=[0, 10, 20],
+                weights=[0.0, 0.0],
+                num_replicas=1,
+                rank=0,
+            )
+
+    def test_init_rejects_empty_weights(self):
+        with pytest.raises(ValueError, match="empty"):
+            MixtureSampler(
+                cumulative_sizes=[0],
+                weights=[],
+                num_replicas=1,
+                rank=0,
+            )
+
+    def test_init_rejects_negative_weights(self):
+        with pytest.raises(ValueError, match="non-negative"):
+            MixtureSampler(
+                cumulative_sizes=[0, 10, 20],
+                weights=[1.0, -0.5],
+                num_replicas=1,
+                rank=0,
+            )
+
+    def test_init_rejects_all_zero_with_temperature(self):
+        """Regression guard: temperature branch previously silently produced uniform."""
+        with pytest.raises(ValueError, match="sum to > 0"):
+            MixtureSampler(
+                cumulative_sizes=[0, 10, 20],
+                weights=[0.0, 0.0],
+                num_replicas=1,
+                rank=0,
+                temperature=2.0,
+            )
+
+    def test_update_weights_rejects_all_zero(self):
+        sampler = MixtureSampler(
+            cumulative_sizes=[0, 10, 20],
+            weights=[0.5, 0.5],
+            num_replicas=1,
+            rank=0,
+        )
+        with pytest.raises(ValueError, match="sum to > 0"):
+            sampler.update_weights([0.0, 0.0])
+
+    def test_update_weights_rejects_all_zero_with_temperature(self):
+        """Regression guard: the temperature != 1.0 branch must also reject
+        all-zero weights."""
+        sampler = MixtureSampler(
+            cumulative_sizes=[0, 10, 20],
+            weights=[0.5, 0.5],
+            num_replicas=1,
+            rank=0,
+            temperature=2.0,
+        )
+        with pytest.raises(ValueError, match="sum to > 0"):
+            sampler.update_weights([0.0, 0.0], temperature=2.0)
+
+    def test_update_weights_accepts_single_zero_with_nonzero_companion(self):
+        """A single dataset can be zeroed out as long as at least one stays positive."""
+        sampler = MixtureSampler(
+            cumulative_sizes=[0, 10, 20],
+            weights=[0.5, 0.5],
+            num_replicas=1,
+            rank=0,
+        )
+        sampler.update_weights([0.0, 1.0])  # must not raise
+        assert sampler._probs == [0.0, 1.0]
+
+    def test_update_weights_rejects_negative(self):
+        sampler = MixtureSampler(
+            cumulative_sizes=[0, 10, 20],
+            weights=[0.5, 0.5],
+            num_replicas=1,
+            rank=0,
+        )
+        with pytest.raises(ValueError, match="non-negative"):
+            sampler.update_weights([1.0, -0.2])
