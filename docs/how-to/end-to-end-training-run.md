@@ -33,9 +33,8 @@ uv sync           # creates .venv and installs all deps
 
 ## 2. Cache the tokenizer
 
-The reference config uses the GPT-2 tokenizer. Compute nodes
-typically don't have internet access, so pre-cache it on the login
-node:
+The reference config uses the GPT-2 tokenizer. Compute nodes typically have restricted or much slower 
+internet access (~1 Gbps vs. ~100 Gbps on login nodes), so it’s best to pre-cache it on the login node:
 
 ```bash
 python -c "from transformers import AutoTokenizer; AutoTokenizer.from_pretrained('gpt2')"
