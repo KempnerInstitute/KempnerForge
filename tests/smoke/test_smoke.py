@@ -38,6 +38,7 @@ TRAIN_SCRIPT = str(PROJECT_ROOT / "scripts" / "train.py")
 EVAL_SCRIPT = str(PROJECT_ROOT / "scripts" / "eval.py")
 DEBUG_CONFIG = str(PROJECT_ROOT / "configs" / "train" / "debug.toml")
 DEBUG_MOE_CONFIG = str(PROJECT_ROOT / "configs" / "train" / "debug_moe.toml")
+FP8_7B_CONFIG = str(PROJECT_ROOT / "configs" / "train" / "7b_16gpu_fp8.toml")
 CKPT_ROOT = PROJECT_ROOT / "checkpoints" / "_smoke_test"
 
 # Port counter to avoid collisions between tests in the same session
@@ -533,6 +534,148 @@ class TestTrainFeatures:
             ),
         )
         _assert_train_ok(result)
+
+
+# ============================================================================
+# Tests: Checkpoint auto-resume (post-release fix regression coverage)
+# ============================================================================
+
+
+def _assert_resume_markers(output: str, expected_resume_step: int) -> None:
+    """Assert the warm-resume log markers fire and carry the right step count."""
+    assert "Auto-resume: found latest checkpoint" in output, (
+        f"missing auto-resume marker:\n{output[-3000:]}"
+    )
+    assert "Restored RNG states" in output, f"missing RNG restore marker:\n{output[-3000:]}"
+    assert f"Resumed from step {expected_resume_step}" in output, (
+        f"did not resume at step {expected_resume_step}:\n{output[-3000:]}"
+    )
+    assert f"skip_batches={expected_resume_step}" in output, (
+        f"dataloader skip_batches not restored to {expected_resume_step}:\n{output[-3000:]}"
+    )
+    assert "Applied stashed dataloader state" in output, (
+        f"stashed dataloader state not applied:\n{output[-3000:]}"
+    )
+
+
+@pytest.mark.smoke
+class TestAutoResume:
+    """Train → save → relaunch → verify full state restoration.
+
+    Exercises the checkpoint save / auto-resume path end-to-end: init-path
+    barrier timeout, RNG restoration, StatefulDataLoader replay with monotonic
+    batches_yielded, train_state.pt ownership gate, and scheduler continuity.
+
+    Requires a pre-tokenized dataset (``--data-path``) because ``scripts/train.py``
+    falls back to synthetic ``torch.randint`` batches when no data source is
+    configured, which bypasses StatefulDataLoader entirely.
+    """
+
+    def _common_args(self, config, ckpt_name, data_path, file_pattern, data_vocab_size):
+        ckpt_dir = CKPT_ROOT / ckpt_name
+        return [
+            config,
+            f"--model.vocab_size={data_vocab_size}",
+            f"--data.dataset_path={data_path}",
+            f"--data.file_pattern={file_pattern}",
+            "--data.pack_sequences=false",
+            f"--checkpoint.dir={ckpt_dir}",
+            "--checkpoint.interval=10",
+            "--checkpoint.keep_last_n=2",
+            "--checkpoint.async_mode=disabled",
+            "--metrics.log_interval=5",
+            "--metrics.enable_wandb=false",
+            "--metrics.enable_tensorboard=false",
+        ]
+
+    def test_dense_fsdp_auto_resume(self, hw, data_path, file_pattern, data_vocab_size):
+        if data_path is None:
+            pytest.skip("Requires --data-path to exercise StatefulDataLoader")
+        skip_unless_gpus(hw, 2)
+
+        args = self._common_args(
+            DEBUG_CONFIG, "resume_dense_fsdp", data_path, file_pattern, data_vocab_size
+        )
+        r1 = _run(hw, TRAIN_SCRIPT, args + ["--train.max_steps=20"])
+        _assert_train_ok(r1, expected_steps=20)
+
+        r2 = _run(hw, TRAIN_SCRIPT, args + ["--train.max_steps=30"])
+        output2 = r2.stdout + r2.stderr
+        assert r2.returncode == 0, f"Resume failed:\n{output2[-3000:]}"
+        _assert_resume_markers(output2, expected_resume_step=20)
+        match = re.search(r"Training complete: (\d+) steps", output2)
+        assert match and int(match.group(1)) == 30, (
+            f"Expected 30 steps, got output:\n{output2[-1000:]}"
+        )
+
+    def test_moe_fsdp_auto_resume(self, hw, data_path, file_pattern, data_vocab_size):
+        if data_path is None:
+            pytest.skip("Requires --data-path to exercise StatefulDataLoader")
+        skip_unless_gpus(hw, 2)
+
+        args = self._common_args(
+            DEBUG_MOE_CONFIG, "resume_moe_fsdp", data_path, file_pattern, data_vocab_size
+        )
+        r1 = _run(hw, TRAIN_SCRIPT, args + ["--train.max_steps=20"])
+        _assert_train_ok(r1, expected_steps=20)
+
+        r2 = _run(hw, TRAIN_SCRIPT, args + ["--train.max_steps=30"])
+        output2 = r2.stdout + r2.stderr
+        assert r2.returncode == 0, f"MoE resume failed:\n{output2[-3000:]}"
+        _assert_resume_markers(output2, expected_resume_step=20)
+        assert "moe/aux_loss" in output2, (
+            f"MoE aux_loss metric missing post-resume:\n{output2[-1000:]}"
+        )
+
+
+# ============================================================================
+# Tests: Real-config sanity (post-release fix regression coverage)
+# ============================================================================
+
+
+@pytest.mark.smoke
+class TestRealConfigs:
+    """Run the published production configs at reduced scope to catch drift.
+
+    Complements TestTrainFeatures which exercises individual features via
+    ``debug.toml`` overrides. These tests execute the actual config file so
+    any silent rot (renamed field, stale comment, broken default) surfaces.
+    """
+
+    def test_fp8_7b_config(self, hw, data_path, file_pattern):
+        """7B FP8 training starts cleanly and applies Float8 + FSDP2 float8 all-gather."""
+        if data_path is None:
+            pytest.skip("Requires --data-path; 7B config uses dataset_path not synthetic")
+        skip_unless_gpus(hw, 4)
+        ckpt_dir = CKPT_ROOT / "fp8_7b"
+        result = _run(
+            hw,
+            TRAIN_SCRIPT,
+            [
+                FP8_7B_CONFIG,
+                f"--data.dataset_path={data_path}",
+                f"--data.file_pattern={file_pattern}",
+                "--data.pack_sequences=false",
+                "--train.max_steps=3",
+                "--train.batch_size=4",
+                "--train.grad_accum_steps=1",
+                "--train.compile_model=false",
+                f"--checkpoint.dir={ckpt_dir}",
+                "--checkpoint.interval=100",
+                "--checkpoint.async_mode=disabled",
+                "--metrics.enable_wandb=false",
+                "--metrics.enable_tensorboard=false",
+                "--metrics.log_interval=1",
+            ],
+            timeout=600,
+        )
+        output = result.stdout + result.stderr
+        assert result.returncode == 0, f"FP8 7B failed:\n{output[-3000:]}"
+        assert "Applied Float8 training" in output, f"Float8 was not applied:\n{output[-2000:]}"
+        assert "fsdp_float8_all_gather=True" in output, (
+            f"FSDP2 float8 all-gather was not enabled:\n{output[-2000:]}"
+        )
+        _assert_train_ok(result, expected_steps=3)
 
 
 # ============================================================================

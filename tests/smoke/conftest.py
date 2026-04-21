@@ -44,6 +44,27 @@ def pytest_addoption(parser):
         default=50257,
         help="Vocab size matching the tokenizer (default: 50257 for gpt2)",
     )
+    group.addoption(
+        "--data-path",
+        type=str,
+        default=None,
+        help=(
+            "Pre-tokenized dataset directory. Required by tests that exercise "
+            "StatefulDataLoader (auto-resume, 7B FP8). Skipped when omitted."
+        ),
+    )
+    group.addoption(
+        "--file-pattern",
+        type=str,
+        default="tokenized_*.bin",
+        help="Glob pattern for tokenized shards (default: tokenized_*.bin)",
+    )
+    group.addoption(
+        "--data-vocab-size",
+        type=int,
+        default=128256,
+        help="Vocab size of the tokenizer used for --data-path (default: 128256 for Llama-3)",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -84,6 +105,9 @@ def _detect_slurm_env(jobid: str | None) -> dict[str, str | int] | None:
         tasks_match = re.search(r"NumTasks=(\d+)", info)
         nodelist_match = re.search(r"(?<!\w)NodeList=(\S+)", info)
         state_match = re.search(r"JobState=(\w+)", info)
+        # AllocTRES reports the GPUs physically reserved for the job even on
+        # interactive salloc sessions where NumTasks defaults to 1.
+        gres_match = re.search(r"AllocTRES=[^\n]*gres/gpu=(\d+)", info)
 
         if not all([nodes_match, nodelist_match, state_match]):
             return None
@@ -92,7 +116,11 @@ def _detect_slurm_env(jobid: str | None) -> dict[str, str | int] | None:
 
         nodes = int(nodes_match.group(1))
         total_tasks = int(tasks_match.group(1)) if tasks_match else nodes
-        gpus_per_node = total_tasks // nodes
+        tasks_per_node = total_tasks // nodes
+        gres_per_node = int(gres_match.group(1)) // nodes if gres_match else 0
+        # Prefer the GPU count from GRES: salloc without --ntasks reports
+        # NumTasks=1 but still reserves the requested GPUs.
+        gpus_per_node = max(tasks_per_node, gres_per_node)
 
         # Resolve master address
         hostnames = (
@@ -175,3 +203,18 @@ def tokenizer_name(request) -> str:
 @pytest.fixture(scope="session")
 def vocab_size(request) -> int:
     return request.config.getoption("--vocab-size")
+
+
+@pytest.fixture(scope="session")
+def data_path(request) -> str | None:
+    return request.config.getoption("--data-path")
+
+
+@pytest.fixture(scope="session")
+def file_pattern(request) -> str:
+    return request.config.getoption("--file-pattern")
+
+
+@pytest.fixture(scope="session")
+def data_vocab_size(request) -> int:
+    return request.config.getoption("--data-vocab-size")
