@@ -242,54 +242,8 @@ class TestNcclAsyncErrorHandlingEnvGuard:
         )
 
 
-class TestCheckpointBroadcastTimeout:
-    def test_broadcast_object_list_honors_timeout(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """CheckpointManager.load raises with a clear message if the object
-        broadcast does not complete within _TRAIN_STATE_BROADCAST_TIMEOUT_SEC."""
-        from unittest.mock import MagicMock
-
-        import kempnerforge.checkpoint.manager as mgr_mod
-        from kempnerforge.checkpoint.manager import CheckpointManager
-        from kempnerforge.config.schema import CheckpointConfig
-
-        # Build a step_1 dir with a benign train_state.pt so the load reaches
-        # the broadcast path.
-        tmp = pytest.importorskip("pathlib").Path
-        import tempfile
-
-        with tempfile.TemporaryDirectory() as td:
-            root = tmp(td)
-            ckpt_dir = root / "step_1"
-            ckpt_dir.mkdir()
-            torch.save({"step": 1, "tokens_seen": 0, "rng": {}}, ckpt_dir / "train_state.pt")
-            (root / "latest").symlink_to("step_1")
-
-            config = CheckpointConfig(dir=str(root))
-            model = MagicMock()
-            model.state_dict.return_value = {}
-            optimizer = MagicMock()
-            optimizer.state_dict.return_value = {}
-            manager = CheckpointManager(config=config, model=model, optimizer=optimizer)
-
-            # Force the "distributed" branches.
-            monkeypatch.setattr(mgr_mod.dist, "is_initialized", lambda: True)
-            monkeypatch.setattr(manager, "_rank", 0, raising=False)
-
-            # First call: the existence-flag broadcast — let it succeed.
-            # Second call: the object-list broadcast — simulate a hang by raising.
-            call_count = {"n": 0}
-
-            def fake_broadcast_object_list(obj_list, src=0, *, async_op: bool = False, **kwargs):  # noqa: ANN001, ARG001
-                call_count["n"] += 1
-                if call_count["n"] == 1:
-                    # existence probe — not async
-                    return None
-                assert async_op is True, (
-                    "object_list broadcast on load must be async to enforce the timeout"
-                )
-                return _FakeWork(raises=RuntimeError("Wait timeout"))
-
-            monkeypatch.setattr(mgr_mod.dist, "broadcast_object_list", fake_broadcast_object_list)
-
-            with pytest.raises(RuntimeError, match="train_state broadcast timed out"):
-                manager.load(exclude_keys=["model", "optimizer"])
+# NOTE: There is no TestCheckpointBroadcastTimeout class here. PyTorch 2.11's
+# ``dist.broadcast_object_list`` does not accept ``async_op``, so the load-path
+# train_state broadcast in CheckpointManager cannot enforce a per-op timeout
+# and inherits the 1800s process-group default. The other fast-fail paths in
+# this module (init barrier, NCCL health, eval loss broadcast) still apply.

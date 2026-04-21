@@ -12,7 +12,6 @@ from __future__ import annotations
 import json
 import logging
 import shutil
-from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -29,11 +28,6 @@ logger = logging.getLogger(__name__)
 # Filename for non-distributed training state within a checkpoint directory
 _TRAIN_STATE_FILE = "train_state.pt"
 _METADATA_FILE = "metadata.json"
-
-# Per-operation timeout for the train_state broadcast. Generous enough to
-# cover a cold-NFS torch.load on rank 0, but short enough that a wedged
-# rank surfaces well before the 1800s process-group default.
-_TRAIN_STATE_BROADCAST_TIMEOUT_SEC = 600.0
 
 
 class CheckpointManager:
@@ -189,26 +183,14 @@ class CheckpointManager:
         if train_state_path.exists():
             train_state = torch.load(train_state_path, map_location="cpu", weights_only=False)
 
-            # Broadcast from rank 0 to all ranks with a per-op timeout so
-            # a wedged rank surfaces well before the 1800s PG default.
+            # Broadcast from rank 0 to all ranks. PyTorch 2.11's
+            # broadcast_object_list does not accept async_op, so a per-op
+            # timeout cannot be wired here — this call inherits the 1800s
+            # process-group default. A wedged rank will still surface, just
+            # later than the other fast-fail paths in this patch.
             if dist.is_initialized():
                 object_list = [train_state if self._rank == 0 else None]
-                work = dist.broadcast_object_list(object_list, src=0, async_op=True)
-                try:
-                    done = work.wait(timeout=timedelta(seconds=_TRAIN_STATE_BROADCAST_TIMEOUT_SEC))
-                except RuntimeError as e:
-                    raise RuntimeError(
-                        f"train_state broadcast timed out after "
-                        f"{_TRAIN_STATE_BROADCAST_TIMEOUT_SEC}s. If rank 0's "
-                        f"torch.load is slow (cold NFS, large pickle), raise "
-                        f"_TRAIN_STATE_BROADCAST_TIMEOUT_SEC in manager.py; "
-                        f"otherwise a rank is wedged. Underlying: {e}"
-                    ) from e
-                if done is False:
-                    raise RuntimeError(
-                        f"train_state broadcast timed out after "
-                        f"{_TRAIN_STATE_BROADCAST_TIMEOUT_SEC}s."
-                    )
+                dist.broadcast_object_list(object_list, src=0)
                 train_state = object_list[0]
 
             assert train_state is not None, "train_state broadcast failed"
