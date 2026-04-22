@@ -13,6 +13,7 @@ resumption after checkpoint loads.
 from __future__ import annotations
 
 import bisect
+import contextlib
 import logging
 from pathlib import Path
 
@@ -108,20 +109,27 @@ class MemoryMappedDataset(Dataset):
         self._cumulative_samples: list[int] = [0]
         total_tokens = 0
 
-        for f in self._files:
-            if self._is_bin:
-                # Raw binary: flat array of tokens. Infer dtype from file size
-                # or use uint32 (most common for modern tokenizers with vocab > 65535)
-                file_size = f.stat().st_size
-                dtype = np.uint32 if file_size % 4 == 0 else np.uint16
-                n_tokens = file_size // np.dtype(dtype).itemsize
-                mmap = np.memmap(str(f), dtype=dtype, mode="r", shape=(n_tokens,))
-            else:
-                mmap = np.load(str(f), mmap_mode="r")
-            n_samples = len(mmap) // seq_len
-            self._mmaps.append(mmap)
-            total_tokens += len(mmap)
-            self._cumulative_samples.append(self._cumulative_samples[-1] + n_samples)
+        # If any open fails partway, close the ones we already opened so they
+        # don't leak via the exception traceback (pytest, logger.exception,
+        # post-mortem debuggers all pin the partial `self` and its mmaps).
+        try:
+            for f in self._files:
+                if self._is_bin:
+                    # Raw binary: flat array of tokens. Infer dtype from file size
+                    # or use uint32 (most common for modern tokenizers with vocab > 65535)
+                    file_size = f.stat().st_size
+                    dtype = np.uint32 if file_size % 4 == 0 else np.uint16
+                    n_tokens = file_size // np.dtype(dtype).itemsize
+                    mmap = np.memmap(str(f), dtype=dtype, mode="r", shape=(n_tokens,))
+                else:
+                    mmap = np.load(str(f), mmap_mode="r")
+                n_samples = len(mmap) // seq_len
+                self._mmaps.append(mmap)
+                total_tokens += len(mmap)
+                self._cumulative_samples.append(self._cumulative_samples[-1] + n_samples)
+        except Exception:
+            self._close_mmaps()
+            raise
 
         self._total_samples = self._cumulative_samples[-1]
         logger.info(
@@ -176,6 +184,27 @@ class MemoryMappedDataset(Dataset):
     def load_state_dict(self, state: dict) -> None:
         """Restore from checkpoint. Only ``epoch`` is restored; sample count is derived."""
         self._epoch = state.get("epoch", 0)
+
+    def _close_mmaps(self) -> None:
+        """Release the underlying mmap objects. Idempotent."""
+        for mm in self._mmaps:
+            inner = getattr(mm, "_mmap", None)
+            if inner is not None and not inner.closed:
+                # BufferError: live views into the mapping still exist — can't
+                # force-close safely; drop the ref and let GC finish it.
+                # ValueError: already closed by another code path.
+                with contextlib.suppress(BufferError, ValueError):
+                    inner.close()
+        self._mmaps.clear()
+
+    def close(self) -> None:
+        """Release the underlying mmaps. Preferred path; do not rely on ``__del__``."""
+        self._close_mmaps()
+
+    def __del__(self) -> None:
+        """GC safety net only. Prefer explicit :meth:`close`."""
+        with contextlib.suppress(Exception):
+            self._close_mmaps()
 
 
 class HuggingFaceDataset(Dataset):
