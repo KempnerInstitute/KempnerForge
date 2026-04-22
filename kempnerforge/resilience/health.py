@@ -235,7 +235,7 @@ def check_nccl_health(timeout_sec: float = 10.0) -> bool:
         # timeout; older/alternate backends may return False instead. Handle
         # both so the timeout is honored regardless of version.
         try:
-            done = work.wait(timeout=timedelta(seconds=timeout_sec))
+            done = work.wait(timeout=timedelta(seconds=timeout_sec))  # type: ignore[reportOptionalMemberAccess]
         except RuntimeError as e:
             logger.warning(f"NCCL health check timed out after {timeout_sec}s: {e}")
             return False

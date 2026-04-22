@@ -107,7 +107,7 @@ def _barrier_with_timeout(seconds: float, reason: str) -> None:
     """
     work = dist.barrier(async_op=True)
     try:
-        done = work.wait(timeout=timedelta(seconds=seconds))
+        done = work.wait(timeout=timedelta(seconds=seconds))  # type: ignore[reportOptionalMemberAccess]
     except RuntimeError as e:
         raise RuntimeError(
             f"Barrier timed out after {seconds}s during {reason}. "

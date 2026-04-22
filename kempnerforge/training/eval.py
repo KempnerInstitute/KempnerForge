@@ -93,7 +93,7 @@ def run_eval(
             async_op=True,
         )
         try:
-            done = work.wait(timeout=timedelta(seconds=_EVAL_BROADCAST_TIMEOUT_SEC))
+            done = work.wait(timeout=timedelta(seconds=_EVAL_BROADCAST_TIMEOUT_SEC))  # type: ignore[reportOptionalMemberAccess]
         except RuntimeError as e:
             logger.error(
                 f"Eval loss broadcast timed out after {_EVAL_BROADCAST_TIMEOUT_SEC}s; "
