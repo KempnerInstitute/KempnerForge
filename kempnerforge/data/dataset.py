@@ -198,10 +198,11 @@ class MemoryMappedDataset(Dataset):
         self._mmaps.clear()
 
     def close(self) -> None:
-        """Explicit cleanup for callers that want to release mmaps before GC."""
+        """Release the underlying mmaps. Preferred path; do not rely on ``__del__``."""
         self._close_mmaps()
 
     def __del__(self) -> None:
+        """GC safety net only. Prefer explicit :meth:`close`."""
         with contextlib.suppress(Exception):
             self._close_mmaps()
 
