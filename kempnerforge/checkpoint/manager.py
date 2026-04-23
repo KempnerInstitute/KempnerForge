@@ -130,6 +130,13 @@ class CheckpointManager:
             # Cleanup old checkpoints
             self._cleanup()
 
+        # save() is a collective: non-rank-0 ranks must not return until
+        # rank-0 has committed train_state.pt, metadata.json, and the
+        # latest symlink. Without this barrier, post-save hooks or readers
+        # on other ranks race rank-0's writes (especially on NFS/Lustre).
+        if dist.is_initialized():
+            dist.barrier()
+
     def wait(self) -> None:
         """Block until any pending async checkpoint save completes."""
         self._async_ckpt.wait()
@@ -178,10 +185,25 @@ class CheckpointManager:
             if "optimizer" in dcp_state:
                 self.optimizer.load_state_dict(dcp_state["optimizer"])
 
-        # Load non-distributed state
+        # Load non-distributed state. On NFS/Lustre, independent stat()
+        # calls can disagree briefly across ranks; if some ranks enter
+        # this branch and others don't, the broadcast_object_list below
+        # hangs. Use a rank-0-authoritative existence check broadcast to
+        # all ranks so every rank takes the same branch.
         train_state_path = ckpt_dir / _TRAIN_STATE_FILE
-        if train_state_path.exists():
-            train_state = torch.load(train_state_path, map_location="cpu", weights_only=False)
+        if dist.is_initialized():
+            exists_flag = [train_state_path.exists() if self._rank == 0 else False]
+            dist.broadcast_object_list(exists_flag, src=0)
+            train_state_exists = bool(exists_flag[0])
+        else:
+            train_state_exists = train_state_path.exists()
+
+        if train_state_exists:
+            train_state = (
+                torch.load(train_state_path, map_location="cpu", weights_only=False)
+                if self._rank == 0 or not dist.is_initialized()
+                else None
+            )
 
             # Broadcast from rank 0 to all ranks
             if dist.is_initialized():
