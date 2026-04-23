@@ -376,6 +376,13 @@ def main() -> None:
                 f"{config.data.hf_dataset_name} ({config.data.hf_dataset_split})"
             )
 
+    # Apply any dataloader state stashed during load(). Runs after dataloader
+    # construction because the loader's identity depends on phase scheduling
+    # that load() restores. No-op when resuming without a prior dataloader
+    # state or when the loader is not stateful (plain TorchDataLoader).
+    if dataloader is not None:
+        ckpt_mgr.apply_dataloader_state(dataloader)
+
     # --- Eval data ---
     eval_config = config.eval
     eval_dataloader = None
@@ -763,6 +770,7 @@ def main() -> None:
                 step=step,
                 tokens_seen=tokens_seen,
                 scheduler=scheduler,
+                dataloader=dataloader,
                 extra=ckpt_extra,
             )
             hook_runner.on_checkpoint_save(step, config.checkpoint.dir)
@@ -774,6 +782,7 @@ def main() -> None:
                 step=step,
                 tokens_seen=tokens_seen,
                 scheduler=scheduler,
+                dataloader=dataloader,
                 extra=ckpt_extra,
             )
             shutdown_handler.finish()

@@ -254,3 +254,174 @@ class TestAsyncCheckpointer:
         ckpt.save({"model": {}}, checkpoint_id=str(tmp_path / "step_2"))
         # First future should have been waited on before second save
         mock_future1.result.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Dataloader state persistence (two-phase apply)
+# ---------------------------------------------------------------------------
+
+
+def _make_mock_mgr(tmp_path, monkeypatch):
+    """Build a CheckpointManager with DCP calls mocked out (no distributed)."""
+    from unittest.mock import MagicMock
+
+    from kempnerforge.checkpoint.manager import CheckpointManager
+
+    model = torch.nn.Linear(4, 4)
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    config = CheckpointConfig(dir=str(tmp_path), keep_last_n=5)
+    mgr = CheckpointManager(config, model, opt)
+    monkeypatch.setattr(mgr._async_ckpt, "save", MagicMock())
+    monkeypatch.setattr("kempnerforge.checkpoint.manager.dcp.load", MagicMock())
+    return mgr
+
+
+class TestDataloaderStatePersistence:
+    """Round-trip coverage for dataloader state across save -> load -> apply.
+
+    Training loops call load() before constructing the dataloader (the loader
+    depends on phase/annealing state that load() restores). Load stashes the
+    dataloader state; apply_dataloader_state() restores it into the freshly
+    built loader.
+    """
+
+    def test_apply_no_op_when_nothing_pending(self, tmp_path, monkeypatch):
+        from unittest.mock import MagicMock
+
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        loader = MagicMock(spec=["load_state_dict"])
+        mgr.apply_dataloader_state(loader)
+        loader.load_state_dict.assert_not_called()
+
+    def test_apply_restores_state_to_stateful_loader(self, tmp_path, monkeypatch):
+        from unittest.mock import MagicMock
+
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        stashed = {"epoch": 3, "batches_yielded": 100, "sampler": {"epoch": 3, "skip_samples": 0}}
+        mgr._pending_dataloader_state = stashed
+
+        loader = MagicMock(spec=["load_state_dict"])
+        mgr.apply_dataloader_state(loader)
+
+        loader.load_state_dict.assert_called_once_with(stashed)
+        assert mgr._pending_dataloader_state is None
+
+    def test_apply_clears_state_for_non_stateful_loader(self, tmp_path, monkeypatch):
+        """Prevent the stashed state from leaking into a later (stateful) loader."""
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        mgr._pending_dataloader_state = {"epoch": 1}
+
+        class PlainLoader:  # no load_state_dict method
+            pass
+
+        mgr.apply_dataloader_state(PlainLoader())
+        assert mgr._pending_dataloader_state is None
+
+    def test_apply_clears_state_for_none_loader(self, tmp_path, monkeypatch):
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        mgr._pending_dataloader_state = {"epoch": 1}
+        mgr.apply_dataloader_state(None)
+        assert mgr._pending_dataloader_state is None
+
+    def test_save_persists_dataloader_state(self, tmp_path, monkeypatch):
+        """save() must include dataloader state when a stateful loader is passed."""
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+
+        class Loader:
+            def state_dict(self):
+                return {"epoch": 4, "batches_yielded": 200}
+
+        mgr.save(step=1, tokens_seen=64, dataloader=Loader())
+        saved = torch.load(tmp_path / "step_1" / "train_state.pt", weights_only=False)
+        assert saved["dataloader"] == {"epoch": 4, "batches_yielded": 200}
+
+    def test_load_stashes_dataloader_state_when_no_loader_provided(self, tmp_path, monkeypatch):
+        """load(dataloader=None) must stash the dataloader state for later apply."""
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        ckpt_dir = tmp_path / "step_1"
+        ckpt_dir.mkdir()
+        saved_state = {"epoch": 2, "batches_yielded": 50}
+        torch.save(
+            {
+                "step": 1,
+                "tokens_seen": 64,
+                "rng": get_rng_state(),
+                "dataloader": saved_state,
+            },
+            ckpt_dir / "train_state.pt",
+        )
+
+        step, tokens, _ = mgr.load(path=str(ckpt_dir))
+
+        assert step == 1
+        assert tokens == 64
+        assert mgr._pending_dataloader_state == saved_state
+
+    def test_load_restores_directly_when_loader_provided(self, tmp_path, monkeypatch):
+        """load(dataloader=X) must restore directly and leave pending state empty."""
+        from unittest.mock import MagicMock
+
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        ckpt_dir = tmp_path / "step_1"
+        ckpt_dir.mkdir()
+        saved_state = {"epoch": 2, "batches_yielded": 50}
+        torch.save(
+            {
+                "step": 1,
+                "tokens_seen": 64,
+                "rng": get_rng_state(),
+                "dataloader": saved_state,
+            },
+            ckpt_dir / "train_state.pt",
+        )
+
+        loader = MagicMock(spec=["load_state_dict"])
+        mgr.load(path=str(ckpt_dir), dataloader=loader)
+
+        loader.load_state_dict.assert_called_once_with(saved_state)
+        assert mgr._pending_dataloader_state is None
+
+    def test_load_no_stash_when_no_dataloader_key(self, tmp_path, monkeypatch):
+        """Missing dataloader key in train_state leaves pending state empty."""
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        ckpt_dir = tmp_path / "step_1"
+        ckpt_dir.mkdir()
+        torch.save(
+            {"step": 1, "tokens_seen": 64, "rng": get_rng_state()},
+            ckpt_dir / "train_state.pt",
+        )
+
+        mgr.load(path=str(ckpt_dir))
+        assert mgr._pending_dataloader_state is None
+
+    def test_round_trip_save_load_apply(self, tmp_path, monkeypatch):
+        """Save with loader, load without loader, apply to new loader — state flows through."""
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+
+        captured: dict[str, dict] = {}
+
+        class RecorderLoader:
+            def __init__(self, initial: dict) -> None:
+                self._state = initial
+
+            def state_dict(self) -> dict:
+                return self._state
+
+            def load_state_dict(self, state: dict) -> None:
+                captured["restored"] = state
+
+        saver = RecorderLoader({"epoch": 7, "batches_yielded": 333})
+        mgr.save(step=5, tokens_seen=128, dataloader=saver)
+
+        # Simulate a fresh process: build a new manager and load without loader.
+        mgr2 = _make_mock_mgr(tmp_path, monkeypatch)
+        step, tokens, _ = mgr2.load(path=str(tmp_path / "step_5"))
+        assert step == 5
+        assert tokens == 128
+        assert mgr2._pending_dataloader_state == {"epoch": 7, "batches_yielded": 333}
+
+        # Build loader after load() and apply the stashed state.
+        restorer = RecorderLoader({"epoch": 0, "batches_yielded": 0})
+        mgr2.apply_dataloader_state(restorer)
+        assert captured["restored"] == {"epoch": 7, "batches_yielded": 333}
+        assert mgr2._pending_dataloader_state is None
