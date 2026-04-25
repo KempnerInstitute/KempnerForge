@@ -67,8 +67,12 @@ class StatefulDataLoader:
 
     def __iter__(self):
         self.sampler.set_epoch(self._epoch)
+        # Re-apply skip on every iter() so double-resume within the same epoch
+        # stays aligned. The sampler consumes _skip once per iter(), and
+        # _batches_yielded persists across save/load so the skip is re-computable.
+        if self._batches_yielded > 0:
+            self.sampler.set_skip(self._batches_yielded * self.batch_size)
         self._iterator = iter(self._dataloader)
-        self._batches_yielded = 0
         return self
 
     def __next__(self) -> dict[str, torch.Tensor]:
@@ -97,16 +101,16 @@ class StatefulDataLoader:
         }
 
     def load_state_dict(self, state: dict) -> None:
-        """Restore from checkpoint. Restores sampler state and skips to saved batch position."""
+        """Restore from checkpoint. ``__iter__`` re-applies the sampler skip from
+        ``_batches_yielded``, so double-resume within the same epoch stays aligned.
+        """
         self._epoch = state.get("epoch", 0)
-        batches_yielded = state.get("batches_yielded", 0)
+        self._batches_yielded = state.get("batches_yielded", 0)
 
         # Set sampler state for resumption
         if "sampler" in state:
             self.sampler.load_state_dict(state["sampler"])
 
-        # Skip ahead to the correct position in the current epoch
-        if batches_yielded > 0:
-            self.sampler.set_skip(batches_yielded * self.batch_size)
-
-        logger.info(f"Resumed DataLoader: epoch={self._epoch}, skip_batches={batches_yielded}")
+        logger.info(
+            f"Resumed DataLoader: epoch={self._epoch}, skip_batches={self._batches_yielded}"
+        )
