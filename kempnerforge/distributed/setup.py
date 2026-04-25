@@ -82,6 +82,42 @@ def _set_nccl_env() -> None:
     os.environ.setdefault("NCCL_IB_DISABLE", "0")
     os.environ.setdefault("NCCL_NET_GDR_LEVEL", "2")
 
+    # Ensure NCCL actually enforces the process-group timeout. The default in
+    # PyTorch 2.2+ is "1", but a user shell/SLURM prolog may override it to
+    # "0", at which point the PG timeout becomes advisory and stuck collectives
+    # can hang indefinitely. Set a safe default and warn loudly if the user
+    # has explicitly disabled it.
+    existing = os.environ.get("TORCH_NCCL_ASYNC_ERROR_HANDLING")
+    if existing == "0":
+        logger.warning(
+            "TORCH_NCCL_ASYNC_ERROR_HANDLING=0 detected — NCCL timeouts "
+            "are advisory; stuck collectives can hang indefinitely."
+        )
+    else:
+        os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
+
+
+def _barrier_with_timeout(seconds: float, reason: str) -> None:
+    """dist.barrier with an explicit per-op timeout and a diagnostic log.
+
+    The process-group default timeout (``config.nccl_timeout_sec``) is sized
+    for training collectives (minutes of reduce on large tensors). Init-path
+    barriers should fail fast so mesh or env misconfiguration does not block
+    a job for 30 minutes before surfacing a useful error.
+    """
+    work = dist.barrier(async_op=True)
+    try:
+        done = work.wait(timeout=timedelta(seconds=seconds))  # type: ignore[reportOptionalMemberAccess]
+    except RuntimeError as e:
+        raise RuntimeError(
+            f"Barrier timed out after {seconds}s during {reason}. "
+            f"Common causes: MASTER_ADDR/MASTER_PORT disagreement across ranks, "
+            f"a rank missing from the job, or the IB interface unreachable. "
+            f"Underlying: {e}"
+        ) from e
+    if done is False:
+        raise RuntimeError(f"Barrier timed out after {seconds}s during {reason}.")
+
 
 def _set_seed(seed: int, rank: int, pp_rank: int = 0) -> None:
     """Set deterministic seeds for reproducibility.
@@ -209,8 +245,10 @@ def init_distributed(config: DistributedConfig, seed: int = 42) -> DeviceMesh | 
         mesh_dim_names=tuple(mesh_dims),
     )
 
-    # Ensure all ranks have finished mesh creation before proceeding
-    dist.barrier()
+    # Ensure all ranks have finished mesh creation before proceeding.
+    # A 60s bound fails fast on mesh misconfiguration rather than inheriting
+    # the 1800s PG timeout.
+    _barrier_with_timeout(60.0, reason="DeviceMesh construction")
 
     # Set seed (vary by PP rank for different dropout/stochastic depth per stage)
     pp_rank = 0
