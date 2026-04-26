@@ -7,10 +7,19 @@ no unwrapping needed.
 
 from __future__ import annotations
 
+import logging
 import math
+from datetime import timedelta
 
 import torch
 import torch.distributed as dist
+
+logger = logging.getLogger(__name__)
+
+# Per-operation timeout for the PP eval loss broadcast. Shorter than the
+# 1800s process-group default so a diverged PP stage surfaces fast rather
+# than freezing eval for half an hour.
+_EVAL_BROADCAST_TIMEOUT_SEC = 300.0
 
 
 @torch.no_grad()
@@ -77,8 +86,29 @@ def run_eval(
             avg_loss = 0.0
 
         loss_tensor = torch.tensor([avg_loss], device=device)
-        dist.broadcast(loss_tensor, group_src=pp_size - 1, group=pp_group)  # type: ignore[reportOptionalOperand]
-        avg_loss = loss_tensor[0].item()
+        work = dist.broadcast(
+            loss_tensor,
+            group_src=pp_size - 1,  # type: ignore[reportOptionalOperand]
+            group=pp_group,
+            async_op=True,
+        )
+        try:
+            done = work.wait(timeout=timedelta(seconds=_EVAL_BROADCAST_TIMEOUT_SEC))  # type: ignore[reportOptionalMemberAccess]
+        except RuntimeError as e:
+            logger.error(
+                f"Eval loss broadcast timed out after {_EVAL_BROADCAST_TIMEOUT_SEC}s; "
+                f"a PP stage is likely wedged. Reporting nan loss. Underlying: {e}"
+            )
+            avg_loss = float("nan")
+        else:
+            if done is False:
+                logger.error(
+                    f"Eval loss broadcast timed out after {_EVAL_BROADCAST_TIMEOUT_SEC}s; "
+                    "reporting nan loss."
+                )
+                avg_loss = float("nan")
+            else:
+                avg_loss = loss_tensor[0].item()
     else:
         # --- Standard eval path ---
         total_loss = 0.0

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from datetime import timedelta
 
 import torch
 import torch.distributed as dist
@@ -211,19 +212,36 @@ def check_gpu_health(device: int = 0) -> dict[str, bool | str]:
 def check_nccl_health(timeout_sec: float = 10.0) -> bool:
     """Check NCCL communication health via a lightweight all-reduce.
 
+    The all-reduce runs with ``async_op=True`` so ``work.wait(timeout=...)``
+    enforces the caller's bound rather than falling back to the
+    process-group default timeout (``nccl_timeout_sec``, 1800s). Without
+    that, this function would sit for 30 minutes on a single stuck peer
+    regardless of the ``timeout_sec`` argument.
+
     Args:
-        timeout_sec: Timeout for the collective operation.
+        timeout_sec: Per-operation timeout for the collective. Returns
+            False if the all-reduce does not complete within this budget.
 
     Returns:
-        True if the all-reduce succeeded, False on timeout or error.
+        True on success, False on timeout, error, or world-size mismatch.
     """
     if not dist.is_initialized():
         return True  # No distributed, nothing to check
 
     try:
         tensor = torch.ones(1, device="cuda")
-        # Use a work handle with timeout
-        dist.all_reduce(tensor)
+        work = dist.all_reduce(tensor, async_op=True)
+        # In current PyTorch Work.wait(timeout=...) raises RuntimeError on
+        # timeout; older/alternate backends may return False instead. Handle
+        # both so the timeout is honored regardless of version.
+        try:
+            done = work.wait(timeout=timedelta(seconds=timeout_sec))  # type: ignore[reportOptionalMemberAccess]
+        except RuntimeError as e:
+            logger.warning(f"NCCL health check timed out after {timeout_sec}s: {e}")
+            return False
+        if done is False:
+            logger.warning(f"NCCL health check timed out after {timeout_sec}s")
+            return False
         torch.cuda.synchronize()
         expected = dist.get_world_size()
         return abs(tensor.item() - expected) < 1e-5

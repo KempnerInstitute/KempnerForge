@@ -209,7 +209,11 @@ class CheckpointManager:
                 else None
             )
 
-            # Broadcast from rank 0 to all ranks
+            # Broadcast from rank 0 to all ranks. PyTorch 2.11's
+            # broadcast_object_list does not accept async_op, so a per-op
+            # timeout cannot be wired here — this call inherits the 1800s
+            # process-group default. A wedged rank will still surface, just
+            # later than the other fast-fail paths in this patch.
             if dist.is_initialized():
                 object_list = [train_state if self._rank == 0 else None]
                 dist.broadcast_object_list(object_list, src=0)
