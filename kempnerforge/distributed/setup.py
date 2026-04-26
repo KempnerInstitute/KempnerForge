@@ -8,10 +8,16 @@ from __future__ import annotations
 
 import logging
 import os
+
+# ``random`` is aliased to ``_random`` because ``init_distributed`` has a
+# function-local ``import random`` for SLURM-port derivation (a fresh
+# ``random.Random(int(job_id))`` factory isolated from the global RNG that
+# ``_set_seed`` mutates). The underscore keeps the two ``random`` bindings
+# unambiguous when grepping the file.
 import random as _random
 from datetime import timedelta
 
-import numpy as _np
+import numpy as np
 import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
@@ -100,7 +106,7 @@ def _set_seed(seed: int, rank: int, pp_rank: int = 0) -> None:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(effective_seed)
     _random.seed(effective_seed)
-    _np.random.seed(effective_seed)
+    np.random.seed(effective_seed)
 
 
 def init_distributed(config: DistributedConfig, seed: int = 42) -> DeviceMesh | None:
