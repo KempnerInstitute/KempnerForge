@@ -100,6 +100,10 @@ class CheckpointManager:
         self._async_ckpt = AsyncCheckpointer(mode=config.async_mode)
         self._process_group = process_group
         self._pp_rank = pp_rank
+        # Dataloader state stashed during load() when the caller cannot yet
+        # provide a dataloader object. Applied later via
+        # apply_dataloader_state() once the loader is constructed.
+        self._pending_dataloader_state: dict[str, Any] | None = None
 
     def _checkpoint_dir(self, step: int) -> Path:
         return self.base_dir / f"step_{step}"
@@ -170,6 +174,13 @@ class CheckpointManager:
             # Cleanup old checkpoints
             self._cleanup()
 
+        # save() is a collective: non-rank-0 ranks must not return until
+        # rank-0 has committed train_state.pt, metadata.json, and the
+        # latest symlink. Without this barrier, post-save hooks or readers
+        # on other ranks race rank-0's writes (especially on NFS/Lustre).
+        if dist.is_initialized():
+            dist.barrier()
+
     def wait(self) -> None:
         """Block until any pending async checkpoint save completes."""
         self._async_ckpt.wait()
@@ -218,18 +229,46 @@ class CheckpointManager:
             if "optimizer" in dcp_state:
                 self.optimizer.load_state_dict(dcp_state["optimizer"])
 
-        # Load non-distributed state
+        # Load non-distributed state. On NFS/Lustre, independent stat()
+        # calls can disagree briefly across ranks; if some ranks enter
+        # this branch and others don't, the broadcast_object_list below
+        # hangs. Use a rank-0-authoritative existence check broadcast to
+        # all ranks so every rank takes the same branch.
         train_state_path = ckpt_dir / _TRAIN_STATE_FILE
-        if train_state_path.exists():
-            train_state = _load_train_state(train_state_path)
+        if dist.is_initialized():
+            exists_flag = [train_state_path.exists() if self._rank == 0 else False]
+            dist.broadcast_object_list(exists_flag, src=0)
+            train_state_exists = bool(exists_flag[0])
+        else:
+            train_state_exists = train_state_path.exists()
 
-            # Broadcast from rank 0 to all ranks
+        if train_state_exists:
+            # Rank-0-authoritative: only rank 0 reads the file. The
+            # ownership check inside ``_load_train_state`` runs there and
+            # the resulting state is broadcast to all ranks below. Other
+            # ranks pass ``None`` into the broadcast.
+            train_state = (
+                _load_train_state(train_state_path)
+                if self._rank == 0 or not dist.is_initialized()
+                else None
+            )
+
+            # Broadcast from rank 0 to all ranks. PyTorch 2.11's
+            # broadcast_object_list does not accept async_op, so a per-op
+            # timeout cannot be wired here — this call inherits the 1800s
+            # process-group default. A wedged rank will still surface, just
+            # later than the other fast-fail paths in this patch.
             if dist.is_initialized():
                 object_list = [train_state if self._rank == 0 else None]
                 dist.broadcast_object_list(object_list, src=0)
                 train_state = object_list[0]
 
             assert train_state is not None, "train_state broadcast failed"
+            # Stash dataloader state if the caller can't yet provide the loader
+            # object. Training loops construct the dataloader after load() so
+            # apply_dataloader_state() can restore it once it exists.
+            if dataloader is None and "dataloader" in train_state:
+                self._pending_dataloader_state = train_state["dataloader"]
             step, tokens_seen, extra = restore_train_state(
                 train_state,
                 scheduler=scheduler,
@@ -239,6 +278,25 @@ class CheckpointManager:
             return step, tokens_seen, extra
 
         return 0, 0, {}
+
+    def apply_dataloader_state(self, dataloader: Any) -> None:
+        """Apply any dataloader state stashed during load().
+
+        Training loops call load() before constructing the dataloader (since
+        the dataloader depends on phase/annealing state that load() restores).
+        This method applies the stashed state once the loader exists.
+
+        No-op if no state is pending, or if the loader does not support
+        ``load_state_dict`` (e.g., plain torch DataLoader for HF streaming).
+        """
+        if self._pending_dataloader_state is None:
+            return
+        if dataloader is None or not hasattr(dataloader, "load_state_dict"):
+            self._pending_dataloader_state = None
+            return
+        dataloader.load_state_dict(self._pending_dataloader_state)
+        self._pending_dataloader_state = None
+        logger.info("Applied stashed dataloader state")
 
     def _resolve_load_path(self, path: str | None = None) -> Path | None:
         """Resolve the checkpoint path to load from."""

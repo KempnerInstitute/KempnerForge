@@ -82,9 +82,14 @@ class TestRunEval:
 
         dl = DataLoader(dataset, batch_size=4, collate_fn=collate_fn)
 
-        # Bias the output head to strongly predict class 0
+        # Bias the output head to strongly predict class 0.
+        # Also zero the embedding and set row 0 to ones so logits[0] is deterministically
+        # positive regardless of inherited global RNG state (otherwise loss depends on
+        # whether sum(embed(0)) lands above or below ~0.4, which is coin-flip-random).
         model = _TinyLM()
         with torch.no_grad():
+            model.embed.weight.zero_()
+            model.embed.weight[0, :] = 1.0
             model.head.weight.zero_()
             model.head.weight[0, :] = 10.0
 

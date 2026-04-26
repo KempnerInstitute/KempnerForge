@@ -15,6 +15,27 @@ import torch.distributed as dist
 from torch.utils.data import Dataset, Sampler
 
 
+def _validate_weights(weights: list[float], context: str) -> None:
+    """Fail fast on empty, negative, or all-zero weight lists.
+
+    The two normalization branches in ``MixtureSampler`` disagree on all-zero
+    input: the ``temperature == 1.0`` branch divides by ``sum(weights)`` and
+    raises ``ZeroDivisionError``; the ``temperature != 1.0`` branch clamps via
+    ``max(w, 1e-12)`` and silently produces uniform sampling. Reject both
+    cases up-front with a clear error so misconfigured phase transitions
+    surface immediately instead of crashing mid-run or drifting silently.
+    """
+    if not weights:
+        raise ValueError(f"{context}: weights list is empty")
+    if any(w < 0 for w in weights):
+        raise ValueError(f"{context}: weights must be non-negative, got {weights}")
+    if sum(weights) <= 0:
+        raise ValueError(
+            f"{context}: weights must sum to > 0 (at least one dataset must have "
+            f"weight > 0), got {weights}"
+        )
+
+
 class DistributedSampler(Sampler[int]):
     """Deterministic distributed sampler with skip-ahead support.
 
@@ -159,6 +180,8 @@ class MixtureSampler(Sampler[int]):
         self._dataset_sizes = [cumulative_sizes[i + 1] - cumulative_sizes[i] for i in range(n)]
         self._offsets = list(cumulative_sizes[:n])
 
+        _validate_weights(weights, "MixtureSampler(weights=...)")
+
         # Apply temperature scaling and normalize
         if temperature != 1.0:
             import math as _math
@@ -284,6 +307,8 @@ class MixtureSampler(Sampler[int]):
         n = len(self._dataset_sizes)
         if len(weights) != n:
             raise ValueError(f"Expected {n} weights, got {len(weights)}")
+
+        _validate_weights(weights, "MixtureSampler.update_weights")
 
         # Apply temperature scaling and normalize (same logic as __init__)
         if temperature != 1.0:
