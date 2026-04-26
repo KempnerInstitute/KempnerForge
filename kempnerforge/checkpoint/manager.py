@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
+import stat
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +30,44 @@ logger = logging.getLogger(__name__)
 # Filename for non-distributed training state within a checkpoint directory
 _TRAIN_STATE_FILE = "train_state.pt"
 _METADATA_FILE = "metadata.json"
+
+
+def _load_train_state(path: Path) -> dict[str, Any]:
+    """Load ``train_state.pt`` under an explicit trust boundary.
+
+    ``train_state.pt`` carries scheduler state, dataloader state, and a
+    caller-supplied ``extra`` dict, so it is loaded with ``weights_only=False``
+    (i.e. full pickle). Any object in the file whose class defines
+    ``__reduce__`` runs arbitrary Python during ``torch.load``. On shared
+    filesystems this is a real attack surface: anyone who can write into
+    another user's checkpoint directory gets code execution in that user's
+    training process on next resume.
+
+    Refuses to load files not owned by the current UID and warns when the
+    file is group- or world-writable. This does not defend against a
+    same-UID compromise — if the attacker can write as you, they already
+    win — but it closes the common "group-writable shared checkpoint dir"
+    foot-gun and makes the trust boundary visible.
+
+    Checkpoints imported from outside the lab (HuggingFace Hub, colleague
+    transfers, etc.) will fail this check and must be either chown'd to the
+    current user after inspection or converted to a weights-only-safe form.
+    """
+    st = path.stat()
+    uid = os.getuid()
+    if st.st_uid != uid:
+        raise PermissionError(
+            f"Refusing to load {path}: owned by uid={st.st_uid}, current uid={uid}. "
+            f"train_state.pt is a pickle and loading it executes arbitrary Python. "
+            f"If you trust this checkpoint, chown it to the current user after inspection."
+        )
+    if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        logger.warning(
+            f"{path} is group/world-writable (mode={oct(st.st_mode & 0o777)}); "
+            f"train_state.pt is a pickle and any writer can inject arbitrary code "
+            f"at load time. Consider chmod g-w,o-w on the checkpoint directory."
+        )
+    return torch.load(path, map_location="cpu", weights_only=False)
 
 
 class CheckpointManager:
@@ -203,8 +243,12 @@ class CheckpointManager:
             train_state_exists = train_state_path.exists()
 
         if train_state_exists:
+            # Rank-0-authoritative: only rank 0 reads the file. The
+            # ownership check inside ``_load_train_state`` runs there and
+            # the resulting state is broadcast to all ranks below. Other
+            # ranks pass ``None`` into the broadcast.
             train_state = (
-                torch.load(train_state_path, map_location="cpu", weights_only=False)
+                _load_train_state(train_state_path)
                 if self._rank == 0 or not dist.is_initialized()
                 else None
             )
