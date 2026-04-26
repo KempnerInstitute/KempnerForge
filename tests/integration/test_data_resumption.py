@@ -102,3 +102,58 @@ class TestDataResumption:
         # Should be able to iterate
         batches_epoch2 = list(loader2)
         assert len(batches_epoch2) > 0
+
+    def test_double_resume_within_same_epoch(self, tmp_path):
+        """Two save/load cycles within a single epoch must preserve alignment.
+
+        Reproduces the pre-fix bug where batches_yielded was reset to 0 on
+        every iter() call and not restored from state_dict. The second resume
+        would re-skip only the delta of the middle run rather than the total
+        epoch position.
+        """
+        ds = _make_dataset(tmp_path, n_tokens=30000, seq_len=32)
+        bs = 4
+
+        # Ground truth: one continuous run, capture batches 40..49.
+        s_gt = DistributedSampler(ds, num_replicas=1, rank=0, shuffle=True, seed=42)
+        L_gt = StatefulDataLoader(ds, batch_size=bs, sampler=s_gt, config=_TEST_CONFIG)
+        it_gt = iter(L_gt)
+        for _ in range(40):
+            next(it_gt)
+        ground_truth = [next(it_gt) for _ in range(10)]
+
+        # Run 1: consume 30 batches, save.
+        s1 = DistributedSampler(ds, num_replicas=1, rank=0, shuffle=True, seed=42)
+        L1 = StatefulDataLoader(ds, batch_size=bs, sampler=s1, config=_TEST_CONFIG)
+        it1 = iter(L1)
+        for _ in range(30):
+            next(it1)
+        state1 = L1.state_dict()
+        assert state1["batches_yielded"] == 30
+
+        # Run 2: resume from state1, consume 10 more, save again.
+        s2 = DistributedSampler(ds, num_replicas=1, rank=0, shuffle=True, seed=42)
+        L2 = StatefulDataLoader(ds, batch_size=bs, sampler=s2, config=_TEST_CONFIG)
+        L2.load_state_dict(state1)
+        it2 = iter(L2)
+        for _ in range(10):
+            next(it2)
+        state2 = L2.state_dict()
+
+        # Pre-fix: state2["batches_yielded"] == 10. Post-fix: 40.
+        assert state2["batches_yielded"] == 40, (
+            f"Expected total epoch position 40, got {state2['batches_yielded']} "
+            "— save/load/iter lost prior resume offset"
+        )
+
+        # Run 3: resume from state2, consume 10 more — must match ground_truth.
+        s3 = DistributedSampler(ds, num_replicas=1, rank=0, shuffle=True, seed=42)
+        L3 = StatefulDataLoader(ds, batch_size=bs, sampler=s3, config=_TEST_CONFIG)
+        L3.load_state_dict(state2)
+        it3 = iter(L3)
+        resumed = [next(it3) for _ in range(10)]
+
+        for i, (gt, r) in enumerate(zip(ground_truth, resumed, strict=True)):
+            assert (gt["input_ids"] == r["input_ids"]).all(), (
+                f"Batch {i} misaligned after double-resume"
+            )
