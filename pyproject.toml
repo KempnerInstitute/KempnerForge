@@ -21,6 +21,7 @@ dependencies = [
 dev = [
     "pyright[nodejs]>=1.1.408",
     "pytest",
+    "pytest-cov",
     "pytest-timeout",
     "ruff",
     "vulture>=2.16",
@@ -73,4 +74,16 @@ markers = [
     "slow: long-running test",
     "e2e: end-to-end training tests (run with --e2e)",
     "smoke: smoke tests across parallelism configs (run with --smoke)",
+]
+
+[tool.coverage.run]
+source = ["kempnerforge"]
+branch = true
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "\\.\\.\\.",
 ]
