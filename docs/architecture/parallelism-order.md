@@ -40,9 +40,9 @@ to be allocated on any one GPU. `build_parallel_model` creates the model
 under `with torch.device("meta"):`, applies TP, then materializes just
 the local shards via `model.to_empty(device=...)`.
 
-**Violation:** apply FSDP before TP and you get a correct-looking run
-with wrong gradients — TP's plan matches zero modules, the model stays
-data-parallel only, and the loss curve *looks* fine.
+:::{danger}
+Applying FSDP before TP yields a correct-looking run with **wrong gradients** — TP's plan matches zero modules, the model stays data-parallel only, and the loss curve looks fine.
+:::
 
 ### 2 · Expert Parallelism second
 
