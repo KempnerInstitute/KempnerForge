@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `docs/getting-started/install.md` Prerequisites: documents `.python-version` and uv's auto-fetch behavior.
 - `README.md` and `kempnerforge/README.md` Prerequisites: clarify that uv auto-fetches Python 3.12 via `.python-version`.
 - `docs/claude-ready.md` first-run flow: `/kempnerforge:install-and-verify` runs before `/kempnerforge:cluster-config`.
-- `README.md` and `kempnerforge/README.md`: skill count updated from six to seven.
+- `README.md` and `kempnerforge/README.md`: list `install-and-verify` in the skill catalog and drop the hardcoded skill count.
 
 ## [0.1.0] — 2026-04-16
 

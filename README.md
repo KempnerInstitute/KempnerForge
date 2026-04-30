@@ -155,7 +155,7 @@ First-run flow, from a fresh clone (use the absolute path to your checkout; rela
 
 The `marketplace list` step is a sanity check: `kempnerforge` should appear under "Configured marketplaces". If it doesn't, the add silently failed; re-check the absolute path.
 
-v0.1 ships seven skills: `install-and-verify`, `cluster-config`, `smoke-test`, `slurm-launch`, `explain-architecture`, `add-optimizer`, `component-gaps`. Full catalog, install details, and how skills stay in sync with the code: [`docs/claude-ready.md`](docs/claude-ready.md).
+v0.1 ships these skills: `install-and-verify`, `cluster-config`, `smoke-test`, `slurm-launch`, `explain-architecture`, `add-optimizer`, `component-gaps`. Full catalog, install details, and how skills stay in sync with the code: [`docs/claude-ready.md`](docs/claude-ready.md).
 
 ## Documentation
 

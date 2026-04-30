@@ -42,7 +42,7 @@ Subsequent sessions on the same checkout skip both prompts. Reconfiguration is a
 
 ## v0.1 skill catalog
 
-Seven skills cover the end-to-end path from clone to real runs.
+These skills cover the end-to-end path from clone to real runs.
 
 | Skill | Category | Preflight tags | What it does |
 |-------|----------|----------------|--------------|
