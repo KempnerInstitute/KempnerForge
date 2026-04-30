@@ -5,8 +5,10 @@ description: Run `uv sync` and the four CI gate checks (ruff check, ruff format,
 
 ## When to use
 - Right after `git clone`, before any other skill.
-- After `git pull` brings new dependency changes (`pyproject.toml` or `uv.lock`).
+- Optionally after `git pull` if the user asks for it.
 - When CI fails and you want to reproduce the four PR-gate checks locally.
+
+Run every step in the background so the user isn't blocked — in Claude Code, set `run_in_background=true` on each Bash call and report status as each completes.
 
 ## Preflight
 
@@ -16,7 +18,7 @@ description: Run `uv sync` and the four CI gate checks (ruff check, ruff format,
 
    On `NO_CUDA`, **print this warning to the user verbatim** before proceeding, and append `--no-sources` to every `uv run` and `uv sync` invocation in this skill (the flag is per-command, not sticky):
 
-   > ⚠️ No CUDA GPU detected. Using `--no-sources` to fetch torch from PyPI instead of the CUDA wheel index. Sufficient for the dev loop (lint, type-check, CPU unit tests); training and GPU tests still need a Linux GPU box. Note: `--no-sources` also bypasses any other `[tool.uv.sources]` entries the project may add later.
+   > No CUDA GPU detected. Using `--no-sources` to fetch torch from PyPI instead of the CUDA wheel index. Sufficient for the dev loop (lint, type-check, CPU unit tests); training and GPU tests still need a Linux GPU box. Note: `--no-sources` also bypasses any other `[tool.uv.sources]` entries the project may add later.
 
 2. Baseline check (use the form matching your host):
 
