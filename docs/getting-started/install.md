@@ -5,7 +5,10 @@ There is no `pip install kempnerforge` — you work from a clone.
 
 ## Prerequisites
 
-- **Python 3.12+** — `pyproject.toml` pins the target interpreter.
+- **Python 3.12+** — pinned via `.python-version` (`>=3.12`) and
+  `pyproject.toml`'s `requires-python`. uv reads `.python-version` and will
+  use any Python ≥ 3.12 already on your machine, or fetch a managed CPython
+  for you. No manual Python install needed.
 - **CUDA 12.8 toolkit** — PyTorch wheels are pulled from the CUDA 12.8 index.
 - **NVIDIA GPU** for any training or distributed test (H100, H200, or A100).
   Unit tests and the inspection notebooks run on CPU.

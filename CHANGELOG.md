@@ -5,6 +5,15 @@ All notable changes to KempnerForge are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- `.python-version` pinned to `>=3.12` so uv resolves the interpreter explicitly. Teammates on 3.13 use 3.13 (no download); 3.11-only users get 3.12 auto-fetched.
+
+### Changed
+- `docs/getting-started/install.md` Prerequisites: documents `.python-version` and uv's auto-fetch behavior.
+- `README.md` and `kempnerforge/README.md` Prerequisites: clarify that uv auto-fetches Python 3.12 via `.python-version`.
+
 ## [0.1.0] — 2026-04-16
 
 Initial public release.
@@ -66,4 +75,5 @@ Initial public release.
 - End-to-end tests (opt-in full training runs)
 - Smoke tests across parallelism configurations
 
+[Unreleased]: https://github.com/KempnerInstitute/KempnerForge/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/KempnerInstitute/KempnerForge/releases/tag/v0.1.0
