@@ -118,7 +118,7 @@ Full 14-configuration sweep: [`benchmarks/mfu_scaling/mfu_scaling.md`](benchmark
 
 ## Quick start
 
-Prerequisites: Python ≥ 3.12, PyTorch ≥ 2.4 (CUDA), [uv](https://docs.astral.sh/uv/).
+Prerequisites: Python ≥ 3.12 (auto-fetched by uv via `.python-version` if not present), PyTorch ≥ 2.4 (CUDA), [uv](https://docs.astral.sh/uv/).
 
 ```bash
 # Install
