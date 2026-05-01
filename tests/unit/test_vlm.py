@@ -192,6 +192,37 @@ class TestInnerTransformer:
         # should be reachable via the unwrap helper without raising.
         inner.set_moe_step(0, 100)  # type: ignore[attr-defined]
 
+    def test_unwraps_torch_compile_around_vlm_wrapper(self):
+        """torch.compile wraps modules in OptimizedModule with ``_orig_mod``;
+        ``inner_transformer`` peels both layers to reach the real Transformer."""
+
+        class _FakeCompiled:
+            def __init__(self, mod):
+                self._orig_mod = mod
+
+        wrapper = _build_tiny_wrapper()
+        compiled = _FakeCompiled(wrapper)
+        inner = inner_transformer(compiled)  # type: ignore[arg-type]
+        assert inner is wrapper.transformer
+
+    def test_unwraps_torch_compile_around_plain_transformer(self):
+        model = Transformer(ModelConfig(dim=64, n_layers=2, n_heads=4, vocab_size=256))
+
+        class _FakeCompiled:
+            def __init__(self, mod):
+                self._orig_mod = mod
+
+        compiled = _FakeCompiled(model)
+        assert inner_transformer(compiled) is model  # type: ignore[arg-type]
+
+
+class TestBuildVLMWrapperErrors:
+    def test_missing_vlm_raises(self):
+        cfg = ModelConfig(dim=64, n_layers=2, n_heads=4, vocab_size=256)
+        assert cfg.vlm is None
+        with pytest.raises(ValueError, match="model_config.vlm"):
+            build_vlm_wrapper(cfg)
+
 
 # ---------------------------------------------------------------------------
 # _is_encoder_frozen

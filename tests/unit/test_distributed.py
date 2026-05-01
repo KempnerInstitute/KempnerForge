@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from unittest.mock import patch
 
+import pytest
 import torch
 
 from kempnerforge.config.schema import ModelConfig
@@ -268,3 +269,207 @@ class TestGetWorldInfo:
             assert os.environ["RANK"] == "5"
             assert os.environ["LOCAL_RANK"] == "2"
             assert os.environ["WORLD_SIZE"] == "32"
+
+
+# ---------------------------------------------------------------------------
+# default_mp_policy / VLM build path on a single CPU process.
+# Real DeviceMesh wrap paths require multi-GPU and live in
+# tests/distributed/test_vlm_fsdp.py; the cases here exercise the
+# non-distributed dispatch + assertions that still run on plain CPU.
+# ---------------------------------------------------------------------------
+
+
+class TestDefaultMpPolicy:
+    def test_cast_forward_inputs_is_set(self):
+        """The VLM path relies on ``cast_forward_inputs=True`` so adapter
+        outputs reach the sharded transformer in matching dtype. Pin the
+        contract here so a downgrade in policy defaults can't slip in."""
+        from kempnerforge.distributed.parallel import default_mp_policy
+
+        policy = default_mp_policy(torch.bfloat16)
+        assert policy.param_dtype == torch.bfloat16
+        assert policy.reduce_dtype == torch.float32
+        assert policy.cast_forward_inputs is True
+
+    def test_param_dtype_passes_through(self):
+        from kempnerforge.distributed.parallel import default_mp_policy
+
+        assert default_mp_policy(torch.float32).param_dtype == torch.float32
+
+
+class TestApplyFsdpVLMGuards:
+    def test_no_dp_mesh_is_noop(self):
+        """``has_dp_mesh`` returns False -> early return, no fully_shard call."""
+        from unittest.mock import MagicMock
+
+        from kempnerforge.distributed.parallel import _apply_fsdp_vlm
+
+        fake_mesh = MagicMock()
+        fake_mesh.mesh_dim_names = ("tp",)  # no dp_shard / dp_replicate
+        wrapper = MagicMock()
+        # Should not raise even though wrapper is not a real VLMWrapper:
+        # the early-return runs before the isinstance assert.
+        _apply_fsdp_vlm(wrapper, fake_mesh, mp_policy=None, encoder_frozen=False)
+
+    def test_assert_on_non_vlm_wrapper(self):
+        """Past the dp-mesh guard, the function asserts the input type."""
+        from unittest.mock import MagicMock
+
+        from kempnerforge.distributed.parallel import _apply_fsdp_vlm
+
+        fake_mesh = MagicMock()
+        fake_mesh.mesh_dim_names = ("dp_shard",)
+        with pytest.raises(AssertionError, match="VLMWrapper"):
+            _apply_fsdp_vlm(MagicMock(), fake_mesh, mp_policy=None, encoder_frozen=False)
+
+
+class TestBuildParallelModelVLM:
+    def _vlm_model_config(self, max_seq_len: int = 64, max_text_len: int = 32, num_tokens: int = 8):
+        from kempnerforge.config.vlm import VLMConfig
+
+        return ModelConfig(
+            dim=64,
+            n_layers=2,
+            n_heads=4,
+            n_kv_heads=4,
+            vocab_size=256,
+            max_seq_len=max_seq_len,
+            vlm=VLMConfig(
+                vision_encoder="random",
+                feature_dim=96,
+                num_tokens=num_tokens,
+                max_text_len=max_text_len,
+            ),
+        )
+
+    def test_dispatches_to_vlm_branch(self):
+        """``is_vlm=True`` routes through ``_build_vlm`` and returns a
+        ``VLMWrapper`` (not a bare Transformer)."""
+        from kempnerforge.distributed.parallel import build_parallel_model
+        from kempnerforge.model.vlm import VLMWrapper
+
+        cfg = self._vlm_model_config()
+        model = build_parallel_model(cfg, torch.device("cpu"), device_mesh=None)
+        assert isinstance(model, VLMWrapper)
+
+    def test_param_dtype_applied_to_transformer_and_adapter(self):
+        from kempnerforge.distributed.parallel import build_parallel_model
+
+        cfg = self._vlm_model_config()
+        model = build_parallel_model(
+            cfg, torch.device("cpu"), device_mesh=None, param_dtype=torch.bfloat16
+        )
+        # Transformer + adapter cast to bf16; encoder stays in HF dtype (fp32 here).
+        assert model.transformer.token_embedding.embedding.weight.dtype == torch.bfloat16
+        assert model.adapter.proj1.weight.dtype == torch.bfloat16
+
+    def test_max_seq_len_too_short_raises(self):
+        """Cross-check: ``num_image_tokens + max_text_len > max_seq_len`` raises."""
+        from kempnerforge.config.vlm import VLMConfig
+        from kempnerforge.distributed.parallel import build_parallel_model
+
+        # Bypass the ModelConfig __post_init__ check by setting num_tokens=0
+        # (deferred), then forcing the encoder to produce a real number of
+        # tokens that overflows max_seq_len at build time.
+        cfg = ModelConfig(
+            dim=64,
+            n_layers=2,
+            n_heads=4,
+            n_kv_heads=4,
+            vocab_size=256,
+            max_seq_len=32,
+            vlm=VLMConfig(
+                vision_encoder="random",
+                feature_dim=96,
+                num_tokens=0,  # defer; RandomVisionEncoder default = 16
+                max_text_len=24,  # 16 + 24 = 40 > 32
+            ),
+        )
+        with pytest.raises(ValueError, match="max_seq_len.*insufficient"):
+            build_parallel_model(cfg, torch.device("cpu"), device_mesh=None)
+
+    def test_frozen_encoder_set_to_eval(self):
+        """When all freeze specs target the vision encoder with frozen=True,
+        the encoder is switched to eval() and its params have requires_grad=False."""
+        from kempnerforge.distributed.parallel import build_parallel_model
+
+        cfg = self._vlm_model_config()
+        model = build_parallel_model(cfg, torch.device("cpu"), device_mesh=None)
+        assert model.vision_encoder.training is False
+        assert all(not p.requires_grad for p in model.vision_encoder.parameters())
+
+    def test_partially_unfrozen_encoder_stays_in_train_mode(self):
+        from kempnerforge.config.vlm import FreezeSpec, VLMConfig
+        from kempnerforge.distributed.parallel import build_parallel_model
+
+        cfg = ModelConfig(
+            dim=64,
+            n_layers=2,
+            n_heads=4,
+            n_kv_heads=4,
+            vocab_size=256,
+            max_seq_len=64,
+            vlm=VLMConfig(
+                vision_encoder="random",
+                feature_dim=96,
+                num_tokens=8,
+                max_text_len=32,
+                # Mixed specs: alias+True plus a sub-pattern with frozen=False
+                # means _is_encoder_frozen returns False -> stays in train().
+                freeze=[
+                    FreezeSpec("vision_encoder", True),
+                    FreezeSpec("vision_encoder._anchor", False),
+                ],
+            ),
+        )
+        model = build_parallel_model(cfg, torch.device("cpu"), device_mesh=None)
+        assert model.vision_encoder.training is True
+
+    def test_dispatch_falls_through_for_non_vlm(self):
+        """Sanity: non-VLM ModelConfig does not enter the VLM branch."""
+        from kempnerforge.distributed.parallel import build_parallel_model
+
+        cfg = ModelConfig(dim=64, n_layers=2, n_heads=4, n_kv_heads=4, vocab_size=256)
+        model = build_parallel_model(cfg, torch.device("cpu"), device_mesh=None)
+        # Plain Transformer, not VLMWrapper.
+        from kempnerforge.model.transformer import Transformer
+
+        assert isinstance(model, Transformer)
+
+
+class TestFsdpWrapTransformerBlocksHelper:
+    """Exercise the EP-MoE detection branch without touching FSDP2.
+
+    The helper inspects ``layer`` types with ``_has_ep_moe`` to decide between
+    block-level and per-sub-module wrap. We can verify the branching by
+    monkey-patching ``fully_shard`` to record what it was called with.
+    """
+
+    def test_dense_blocks_get_block_level_wrap(self, monkeypatch):
+        from unittest.mock import MagicMock
+
+        import kempnerforge.distributed.parallel as parallel_mod
+        from kempnerforge.distributed.parallel import (
+            _fsdp_wrap_transformer_blocks,
+            default_mp_policy,
+        )
+        from kempnerforge.model.transformer import Transformer
+
+        captured: list[object] = []
+
+        def fake_fully_shard(mod, **kwargs):  # noqa: ARG001
+            captured.append(mod)
+
+        monkeypatch.setattr(parallel_mod, "fully_shard", fake_fully_shard)
+
+        cfg = ModelConfig(dim=64, n_layers=2, n_heads=4, n_kv_heads=4, vocab_size=256)
+        transformer = Transformer(cfg)
+        ep_sub = _fsdp_wrap_transformer_blocks(
+            transformer, MagicMock(), default_mp_policy(), reshard_after_forward=True
+        )
+        # Dense path: one wrap per block, none of them ep-sub-wrapped.
+        assert ep_sub == 0
+        assert len(captured) == 2  # two transformer blocks
+        # Each captured object should be a TransformerBlock, not a sub-module.
+        for layer in captured:
+            assert isinstance(layer, TransformerBlock)
