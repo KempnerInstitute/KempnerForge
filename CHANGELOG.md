@@ -34,7 +34,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `.python-version` pinned to `>=3.12` so uv resolves the interpreter explicitly. Teammates on 3.13 use 3.13 (no download); 3.11-only users get 3.12 auto-fetched.
 
 ### Changed
-- Dropped `pytest-cov` from dev dependencies and the `[tool.coverage]` configuration; CI no longer uploads to Codecov.
 - `docs/getting-started/install.md` Prerequisites: documents `.python-version` and uv's auto-fetch behavior.
 - `README.md` and `kempnerforge/README.md` Prerequisites: clarify that uv auto-fetches Python 3.12 via `.python-version`.
 - `docs/claude-ready.md` first-run flow: `/kempnerforge:install-and-verify` runs before `/kempnerforge:cluster-config`.
