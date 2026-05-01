@@ -117,7 +117,7 @@ Full 14-configuration sweep: [`benchmarks/mfu_scaling/mfu_scaling.md`](benchmark
 
 ## Quick start
 
-Prerequisites: Python ≥ 3.12, PyTorch ≥ 2.4 (CUDA), [uv](https://docs.astral.sh/uv/).
+Prerequisites: Python ≥ 3.12 (auto-fetched by uv via `.python-version` if not present), PyTorch ≥ 2.4 (CUDA), [uv](https://docs.astral.sh/uv/).
 
 ```bash
 # Install
@@ -154,7 +154,7 @@ First-run flow, from a fresh clone (use the absolute path to your checkout; rela
 
 The `marketplace list` step is a sanity check: `kempnerforge` should appear under "Configured marketplaces". If it doesn't, the add silently failed; re-check the absolute path.
 
-v0.1 ships six skills: `cluster-config`, `smoke-test`, `slurm-launch`, `explain-architecture`, `add-optimizer`, `component-gaps`. Full catalog, install details, and how skills stay in sync with the code: [`docs/claude-ready.md`](docs/claude-ready.md).
+v0.1 ships these skills: `install-and-verify`, `cluster-config`, `smoke-test`, `slurm-launch`, `explain-architecture`, `add-optimizer`, `component-gaps`. Full catalog, install details, and how skills stay in sync with the code: [`docs/claude-ready.md`](docs/claude-ready.md).
 
 ## Documentation
 

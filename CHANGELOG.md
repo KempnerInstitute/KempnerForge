@@ -30,9 +30,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `scripts/prep_vlm_coco_smoke.py`: helper to materialize a small COCO Karpathy slice for smoke runs.
   - Tests: `tests/unit/test_vlm.py`, `test_vlm_config.py`, `test_modality_context.py`, `test_vision.py`, `test_vlm_dataset.py`, `test_freeze.py`; `tests/integration/test_vlm_train_step.py`, `test_vlm_checkpoint.py`; `tests/distributed/test_vlm_fsdp.py` (gated on multi-GPU).
   - Configs: `configs/train/vlm_debug.toml` (1-GPU smoke), `vlm_7b.toml` / `vlm_7b_ac.toml` / `vlm_7b_siglip2.toml`, `vlm_7b_freeze_schedule.toml`.
+- `install-and-verify` plugin skill: runs `uv sync`, asserts Python ≥ 3.12, then runs the four CI gate checks (`ruff check`, `ruff format --check`, `pyright`, `pytest tests/unit/`). Canonical first command after cloning.
+- `.python-version` pinned to `>=3.12` so uv resolves the interpreter explicitly. Teammates on 3.13 use 3.13 (no download); 3.11-only users get 3.12 auto-fetched.
 
 ### Changed
 - Dropped `pytest-cov` from dev dependencies and the `[tool.coverage]` configuration; CI no longer uploads to Codecov.
+- `docs/getting-started/install.md` Prerequisites: documents `.python-version` and uv's auto-fetch behavior.
+- `README.md` and `kempnerforge/README.md` Prerequisites: clarify that uv auto-fetches Python 3.12 via `.python-version`.
+- `docs/claude-ready.md` first-run flow: `/kempnerforge:install-and-verify` runs before `/kempnerforge:cluster-config`.
+- `README.md` and `kempnerforge/README.md`: list `install-and-verify` in the skill catalog and drop the hardcoded skill count.
 
 ## [0.1.0] — 2026-04-16
 
@@ -95,4 +101,5 @@ Initial public release.
 - End-to-end tests (opt-in full training runs)
 - Smoke tests across parallelism configurations
 
+[Unreleased]: https://github.com/KempnerInstitute/KempnerForge/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/KempnerInstitute/KempnerForge/releases/tag/v0.1.0

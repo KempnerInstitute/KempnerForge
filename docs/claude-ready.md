@@ -27,22 +27,26 @@ Optional schema validation:
 
 ## First-run flow
 
-Once installed, the canonical first invocation is:
+Once installed, run these in order:
 
 ```
+/kempnerforge:install-and-verify
 /kempnerforge:cluster-config
 ```
 
-This calls `scripts/check_env.py --init`, which reads `SLURM_*` env vars as defaults, prompts for each field, and writes `configs/cluster/local.toml` atomically. The file is gitignored. Every other skill reads from it.
+`install-and-verify` runs `uv sync`, confirms the venv is on Python ≥ 3.12 (per `.python-version`), then runs the same four checks CI runs on every PR (`ruff check`, `ruff format --check`, `pyright`, `pytest tests/unit/`). A green pass means your environment matches what CI gates against. Skip it only if you have already run those four locally on this checkout.
 
-Subsequent sessions on the same checkout skip the prompt. Reconfiguration is a re-run of the same command.
+`cluster-config` calls `scripts/check_env.py --init`, which reads `SLURM_*` env vars as defaults, prompts for each field, and writes `configs/cluster/local.toml` atomically. The file is gitignored. Every other skill reads from it. Run this whenever you onboard onto a new SLURM cluster (skip it on CPU-only or non-SLURM dev boxes).
+
+Subsequent sessions on the same checkout skip both prompts. Reconfiguration is a re-run of the same command.
 
 ## v0.1 skill catalog
 
-Six skills cover the end-to-end path from clone to real runs.
+These skills cover the end-to-end path from clone to real runs.
 
 | Skill | Category | Preflight tags | What it does |
 |-------|----------|----------------|--------------|
+| `install-and-verify` | onboarding | baseline | Run `uv sync`, confirm Python ≥ 3.12, then run the four CI checks (ruff check / format, pyright, pytest unit). First step after cloning. |
 | `cluster-config` | onboarding | baseline | Write `configs/cluster/local.toml`. First step on any new cluster. |
 | `smoke-test` | run-training | `gpu` | Short one-GPU training loop. Confirms torch, CUDA, NCCL, uv, dataloader. |
 | `slurm-launch` | run-training | `slurm` (+ `multi-node`) | Submit `sbatch` for single- or multi-node jobs. Inject account, partition, QoS, time from `local.toml`. |
@@ -90,7 +94,7 @@ To add a new skill:
 3. If your skill runs a code path not yet covered by `check_env`, add a new tag to `scripts/check_env.py` and a unit test in `tests/unit/test_check_env.py`.
 4. Bump `plugins[0].version` in `.claude-plugin/marketplace.json` and the README badge.
 
-See the existing six skills under `plugins/kempnerforge/skills/` for the reference layout.
+See the existing skills under `plugins/kempnerforge/skills/` for the reference layout.
 
 ## Design choices worth knowing
 
