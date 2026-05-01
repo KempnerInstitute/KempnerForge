@@ -269,6 +269,136 @@ class TestHuggingFaceVLMDataset:
         assert item["labels"].shape == (16,)
         assert item["input_ids"].dtype == torch.long
 
+    def test_init_load_from_disk_single_split(self, tiny_hf_dataset):
+        """Real ``__init__`` on a dataset saved by ``save_to_disk`` (single
+        split). Exercises the ``is_local`` branch."""
+        ds = HuggingFaceVLMDataset(
+            dataset_name=tiny_hf_dataset,
+            split="ignored_when_single_split",
+            image_field="image",
+            text_field="caption",
+            tokenizer_path="gpt2",
+            max_text_len=8,
+        )
+        assert len(ds) == 3
+        item = ds[0]
+        assert item["pixel_values"].shape == (3, 224, 224)
+        assert item["input_ids"].shape == (8,)
+        assert item["labels"].shape == (8,)
+
+    def test_init_load_from_disk_dataset_dict(self, tmp_path):
+        """``load_from_disk`` returns a DatasetDict when multiple splits are
+        saved together; ``__init__`` selects by split name."""
+        from datasets import Dataset, DatasetDict
+
+        train = Dataset.from_dict({"image": [_make_image(32, 100)], "caption": ["a tree."]})
+        val = Dataset.from_dict({"image": [_make_image(32, 200)], "caption": ["a river."]})
+        dd = DatasetDict({"train": train, "validation": val})
+        out = tmp_path / "split_ds"
+        dd.save_to_disk(str(out))
+
+        ds = HuggingFaceVLMDataset(
+            dataset_name=str(out),
+            split="validation",
+            image_field="image",
+            text_field="caption",
+            tokenizer_path="gpt2",
+            max_text_len=4,
+        )
+        assert len(ds) == 1
+        # Confirm we got the validation split, not train.
+        assert "river" in ds._ds[0]["caption"]  # type: ignore[attr-defined]
+
+    def test_init_via_load_dataset_branch(self, monkeypatch, tiny_hf_dataset):
+        """When ``dataset_name`` is not a local directory, ``__init__`` falls
+        through to ``load_dataset``. We mock ``load_dataset`` to hand back a
+        prebuilt Dataset and assert the call routed through the correct
+        branch."""
+        from datasets import load_from_disk
+
+        from kempnerforge.data import vlm_dataset as mod
+
+        prebuilt = load_from_disk(tiny_hf_dataset)
+        called: dict[str, object] = {}
+
+        def fake_load_dataset(name, config=None, split=None):
+            called["name"] = name
+            called["config"] = config
+            called["split"] = split
+            return prebuilt
+
+        monkeypatch.setattr(mod, "load_dataset", fake_load_dataset, raising=False)
+        # Patch the import target that __init__ pulls in lazily.
+        import datasets
+
+        monkeypatch.setattr(datasets, "load_dataset", fake_load_dataset)
+
+        ds = HuggingFaceVLMDataset(
+            dataset_name="some/hub-id",  # not a directory -> load_dataset path
+            split="train",
+            image_field="image",
+            text_field="caption",
+            tokenizer_path="gpt2",
+            max_text_len=8,
+            dataset_config="cfg",
+        )
+        assert called == {"name": "some/hub-id", "config": "cfg", "split": "train"}
+        assert len(ds) == 3
+
+    def test_init_rejects_streaming_dataset(self, monkeypatch):
+        """Non-map-style outputs (e.g. IterableDataset) should raise."""
+        import datasets
+        from datasets import IterableDataset
+
+        # Build a tiny IterableDataset and have load_dataset hand it back.
+        def gen():
+            yield {"image": _make_image(32, 50), "caption": "hi."}
+
+        iterable = IterableDataset.from_generator(gen)
+        monkeypatch.setattr(datasets, "load_dataset", lambda *a, **k: iterable)
+
+        with pytest.raises(TypeError, match="map-style"):
+            HuggingFaceVLMDataset(
+                dataset_name="not/a/real/path",
+                split="train",
+                image_field="image",
+                text_field="caption",
+                tokenizer_path="gpt2",
+                max_text_len=4,
+            )
+
+    def test_getitem_rejects_non_string_text(self, tiny_hf_dataset):
+        """Schema guard: text field must be a string at __getitem__ time."""
+        # tiny_hf_dataset fixture is parameter-bound (forces creation) but we
+        # do not need to load it here; the schema-guard check uses a fresh
+        # in-memory dataset with a non-string column.
+        del tiny_hf_dataset
+        from datasets import Dataset
+
+        class _Wrapper(HuggingFaceVLMDataset):
+            def __init__(self, ds, tokenizer_path, max_text_len):
+                from transformers import AutoTokenizer
+
+                self._ds = ds
+                self._image_field = "image"
+                self._text_field = "caption"
+                self._prompt_field = None
+                self._image_size = 32
+                self._image_mean = DEFAULT_IMAGE_MEAN
+                self._image_std = DEFAULT_IMAGE_STD
+                self._max_text_len = max_text_len
+                self._tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+
+        mixed = Dataset.from_dict(
+            {
+                "image": [_make_image(32, 100)],
+                "caption": [{"not": "a string"}],  # type: ignore[list-item]
+            }
+        )
+        wrapper = _Wrapper(mixed, tokenizer_path="gpt2", max_text_len=4)
+        with pytest.raises(TypeError, match="must be str"):
+            _ = wrapper[0]
+
     def test_collator_wired_through_stateful_dataloader(self, tiny_hf_dataset):
         """VLMCollator reaches the batch when passed via collate_fn.
 

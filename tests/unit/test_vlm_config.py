@@ -47,6 +47,20 @@ class TestVLMConfigValidation:
                 ],
             )
 
+    def test_freeze_schedule_valid_monotonic(self):
+        cfg = VLMConfig(
+            vision_encoder="random",
+            freeze_schedule=[
+                FreezeStage(start_step=50, specs=(FreezeSpec("transformer"),)),
+                FreezeStage(start_step=100, specs=(FreezeSpec("vision_encoder"),)),
+            ],
+        )
+        assert [s.start_step for s in cfg.freeze_schedule] == [50, 100]
+
+    def test_negative_adapter_hidden_dim(self):
+        with pytest.raises(ValueError, match="adapter_hidden_dim must be non-negative"):
+            VLMConfig(vision_encoder="random", adapter_hidden_dim=-1)
+
     def test_default_is_valid(self):
         cfg = VLMConfig(vision_encoder="random")
         assert cfg.arch == "joint_decoder"

@@ -479,6 +479,90 @@ class TestTomlLoading:
         # 196 image + 2048 text = 2244 <= max_seq_len=2304
         config.validate(world_size=4)
 
+    def test_vlm_freeze_schedule_loads_variadic_tuple(self, tmp_path):
+        """``FreezeStage.specs`` is ``tuple[FreezeSpec, ...]``; the loader's
+        variadic-tuple path must instantiate each spec dict via
+        ``_instantiate_from_dict`` so ``FreezeSpec.__post_init__`` runs."""
+        toml = tmp_path / "vlm.toml"
+        toml.write_text(
+            """
+[model]
+dim = 64
+n_layers = 2
+n_heads = 4
+n_kv_heads = 4
+vocab_size = 256
+max_seq_len = 96
+
+[model.vlm]
+arch = "joint_decoder"
+vision_encoder = "random"
+num_tokens = 16
+max_text_len = 64
+freeze = [{module = "vision_encoder", frozen = true}]
+freeze_schedule = [
+    {start_step = 5, specs = [{module = "adapter", frozen = true}]},
+    {start_step = 10, specs = [{module = "adapter", frozen = false}]},
+]
+"""
+        )
+        config = load_config(str(toml), cli_args=[])
+        assert config.model.vlm is not None
+        sched = config.model.vlm.freeze_schedule
+        assert len(sched) == 2
+        assert sched[0].start_step == 5
+        assert sched[0].specs[0].module == "adapter"
+        assert sched[0].specs[0].frozen is True
+        assert sched[1].specs[0].frozen is False
+
+    def test_vlm_reserved_arch_in_toml_raises(self, tmp_path):
+        """A TOML aiming at a reserved arch (cross_attention, mot) should
+        surface ``NotImplementedError`` from the loader's arch resolver,
+        not the generic ``Unknown vlm.arch`` message."""
+        toml = tmp_path / "vlm_reserved.toml"
+        toml.write_text(
+            """
+[model.vlm]
+arch = "cross_attention"
+vision_encoder = "random"
+num_tokens = 16
+max_text_len = 32
+"""
+        )
+        with pytest.raises(NotImplementedError, match="reserved"):
+            load_config(str(toml), cli_args=[])
+
+    def test_vlm_unknown_arch_in_toml_raises_value_error(self, tmp_path):
+        toml = tmp_path / "vlm_unknown.toml"
+        toml.write_text(
+            """
+[model.vlm]
+arch = "bogus_arch"
+vision_encoder = "random"
+num_tokens = 16
+max_text_len = 32
+"""
+        )
+        with pytest.raises(ValueError, match="Unknown vlm.arch"):
+            load_config(str(toml), cli_args=[])
+
+    def test_vlm_unknown_field_raises_with_valid_keys(self, tmp_path):
+        """``_instantiate_from_dict`` rejects unknown keys with the list of
+        valid fields so the user can fix typos."""
+        toml = tmp_path / "vlm_typo.toml"
+        toml.write_text(
+            """
+[model.vlm]
+arch = "joint_decoder"
+vision_encoder = "random"
+num_tokens = 16
+max_text_len = 32
+not_a_real_field = 99
+"""
+        )
+        with pytest.raises(ValueError, match="not_a_real_field"):
+            load_config(str(toml), cli_args=[])
+
 
 # ---------------------------------------------------------------------------
 # CLI Overrides
