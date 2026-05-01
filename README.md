@@ -144,6 +144,7 @@ Further reading:
 KempnerForge supports VLM training via a thin wrapper around the existing `Transformer`. Image tokens come from a frozen HF vision encoder (SigLIP2, CLIP, or a tiny `random` test stub), pass through a 2-layer adapter, and feed the backbone via an arch-specific path:
 
 - **Joint-Decoder** (`arch = "joint_decoder"`): image embeds are prepended to the text sequence; the transformer runs over the concatenated `(image, text)` sequence and the LM head is applied to text positions only.
+- **Cross-Attention** (`arch = "cross_attention"`, Llama-3-V style): the residual stream carries text only. Separate `CrossAttentionBlock`s inserted at a configurable cadence let text queries attend to image K/V. CA blocks are zero-initialized so adding the arch on top of a text-only checkpoint is identity at step 0 and learns from there.
 
 ```bash
 # 1-GPU smoke (random encoder, Joint-Decoder)
@@ -152,15 +153,18 @@ uv run python scripts/train.py configs/train/vlm_debug.toml \
 
 # 4-GPU SigLIP2 + 7B Joint-Decoder
 uv run torchrun --nproc_per_node=4 scripts/train.py configs/train/vlm_7b_siglip2.toml
+
+# 4-GPU 7B Cross-Attention (8 CA blocks at cadence 4)
+uv run torchrun --nproc_per_node=4 scripts/train.py configs/train/vlm_7b_cross_attn.toml
 ```
 
-Configs set `[model.vlm]` with `arch`, the encoder registry key, the number of image tokens, and a freeze list (`FreezeSpec`). The vision encoder stays in its HF-loaded dtype; the transformer and adapter are cast to `param_dtype`. Pipeline Parallel + VLM is not supported on this branch (raises at startup); multi-image and video are reserved slots for follow-up work. Cross-Attention and Mixture-of-Transformers arches are reserved discriminators (`_RESERVED_ARCHS`) — TOMLs targeting them get a clear `NotImplementedError` until those land in follow-up PRs.
+Configs set `[model.vlm]` with `arch`, the encoder registry key, the number of image tokens, and a freeze list (`FreezeSpec`). For Cross-Attention, set `cross_attention_every_n_layers` and optionally `cross_attention_n_kv_heads` (0 → MHA; positive → GQA on the cross path). The vision encoder stays in its HF-loaded dtype; the transformer, adapter, and CA blocks are cast to `param_dtype`. Pipeline Parallel + VLM is not supported on this branch (raises at startup); multi-image and video are reserved slots for follow-up work. Mixture-of-Transformers (`arch = "mot"`) is a reserved discriminator (`_RESERVED_ARCHS`) — TOMLs targeting it get a clear `NotImplementedError` until that arch lands in a follow-up PR.
 
 **Adding a new VLM arch.** The discriminated-union dispatch is registry-driven, so a new arch is four small additions, no edits to existing call sites:
 
 1. Add a `VLMConfig` subclass in `kempnerforge/config/vlm.py` decorated with `@registry.register_vlm_config("<arch_name>")`. Override `residual_stream_image_tokens()` if the arch's residual stream is not text-only-plus-prefix.
 2. Add a `ModalityStrategy` class (in `kempnerforge/model/vlm.py` for in-tree arches, or any module imported at startup) decorated with `@registry.register_modality_strategy("<arch_name>")`. Implement `prepare(wrapper, pixel_values, input_ids) -> ModalityContext` and `num_image_tokens(wrapper) -> int`.
-3. If the arch needs new modules, add them under `kempnerforge/model/` and wire them into `Transformer.__init__` behind an `isinstance(config.vlm, MyConfig)` guard so non-arch builds stay zero-cost.
+3. If the arch needs new modules (e.g. `CrossAttentionBlock` for Cross-Attention), add them under `kempnerforge/model/` and wire them into `Transformer.__init__` behind an `isinstance(config.vlm, MyConfig)` guard so non-arch builds stay zero-cost.
 4. Drop the arch name from `_RESERVED_ARCHS` in `kempnerforge/config/vlm.py` if it was reserved.
 
 The TOML loader picks up the new arch automatically — `[model.vlm]` with `arch = "<arch_name>"` instantiates the right subclass. `VLMWrapper.forward` is unchanged.
