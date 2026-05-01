@@ -7,6 +7,7 @@ import torch
 
 from kempnerforge.config.model import ModelConfig
 from kempnerforge.config.vlm import (
+    CrossAttentionConfig,
     FreezeSpec,
     JointDecoderConfig,
     VLMConfig,
@@ -15,6 +16,7 @@ from kempnerforge.model.modality import ModalityContext
 from kempnerforge.model.transformer import Transformer
 from kempnerforge.model.vlm import (
     Adapter,
+    CrossAttentionStrategy,
     JointDecoderStrategy,
     VLMWrapper,
     _is_encoder_frozen,
@@ -227,6 +229,25 @@ class TestIsEncoderFrozen:
 # ---------------------------------------------------------------------------
 
 
+def _ca_vlm_config(
+    num_image_tokens: int = 8, feature_dim: int = 96, cadence: int = 2
+) -> ModelConfig:
+    return ModelConfig(
+        dim=64,
+        n_layers=4,
+        n_heads=4,
+        vocab_size=256,
+        max_seq_len=64,
+        vlm=CrossAttentionConfig(
+            vision_encoder="random",
+            feature_dim=feature_dim,
+            num_tokens=num_image_tokens,
+            max_text_len=32,
+            cross_attention_every_n_layers=cadence,
+        ),
+    )
+
+
 class TestModalityStrategies:
     def test_joint_decoder_strategy_fills_prefix_and_slice(self):
         wrapper = _build_tiny_wrapper(num_image_tokens=8)
@@ -237,12 +258,32 @@ class TestModalityStrategies:
         assert ctx.prefix_embeds is not None
         assert ctx.prefix_embeds.shape == (1, 8, 64)  # (B, N, dim)
         assert ctx.output_slice == slice(8, None)
+        # CA-specific fields not set
+        assert ctx.image_features is None
+        assert ctx.image_mask is None
         assert ctx.inputs_embeds is None
 
-    def test_strategy_num_image_tokens(self):
+    def test_cross_attention_strategy_fills_image_features(self):
+        wrapper = build_vlm_wrapper(_ca_vlm_config(num_image_tokens=8))
+        strategy = CrossAttentionStrategy()
+        pixel_values = torch.randn(1, 3, 64, 64)
+        input_ids = torch.randint(0, 256, (1, 16))
+        ctx = strategy.prepare(wrapper, pixel_values, input_ids)
+        assert ctx.image_features is not None
+        assert ctx.image_features.shape == (1, 8, 64)
+        assert ctx.image_mask is None
+        # JD-specific fields not set
+        assert ctx.prefix_embeds is None
+        assert ctx.output_slice is None
+        assert ctx.inputs_embeds is None
+
+    def test_strategy_num_image_tokens_arch_specific(self):
         jd_wrapper = _build_tiny_wrapper(num_image_tokens=12)
+        ca_wrapper = build_vlm_wrapper(_ca_vlm_config(num_image_tokens=12))
         # JD: extends the residual stream by num_image_tokens.
         assert jd_wrapper.num_image_tokens == 12
+        # CA: residual stream is text-only, so no extension.
+        assert ca_wrapper.num_image_tokens == 0
 
 
 class TestVLMWrapperDispatch:
@@ -250,6 +291,11 @@ class TestVLMWrapperDispatch:
         cfg = JointDecoderConfig(vision_encoder="random")
         strategy = build_modality_strategy(cfg)
         assert isinstance(strategy, JointDecoderStrategy)
+
+    def test_build_modality_strategy_cross_attention(self):
+        cfg = CrossAttentionConfig(vision_encoder="random")
+        strategy = build_modality_strategy(cfg)
+        assert isinstance(strategy, CrossAttentionStrategy)
 
     def test_dispatch_no_isinstance_ladder(self):
         """Sanity check: build_modality_strategy is a pure registry
@@ -276,6 +322,10 @@ class TestVLMWrapperDispatch:
         wrapper = _build_tiny_wrapper()
         assert isinstance(wrapper.strategy, JointDecoderStrategy)
 
+    def test_ca_wrapper_uses_ca_strategy(self):
+        wrapper = build_vlm_wrapper(_ca_vlm_config())
+        assert isinstance(wrapper.strategy, CrossAttentionStrategy)
+
     def test_strategy_not_in_module_tree(self):
         """Strategy is a plain Python object, not an nn.Module. Verify
         it is not registered in _modules and does not appear in
@@ -294,6 +344,16 @@ class TestVLMWrapperDispatch:
     def test_jd_forward_logits_text_only_shape(self):
         """JD forward returns logits with shape (B, T, V) — no image positions."""
         wrapper = _build_tiny_wrapper(num_image_tokens=8).to(DEVICE).eval()
+        pixel_values = torch.randn(1, 3, 64, 64, device=DEVICE)
+        input_ids = torch.randint(0, 256, (1, 16), device=DEVICE)
+        with torch.no_grad():
+            logits, _ = wrapper(pixel_values, input_ids)
+        assert logits.shape == (1, 16, 256)
+
+    def test_ca_forward_logits_text_only_shape(self):
+        """CA forward also returns logits with shape (B, T, V): the
+        residual stream is text-only, so no extra image positions."""
+        wrapper = build_vlm_wrapper(_ca_vlm_config(num_image_tokens=8)).to(DEVICE).eval()
         pixel_values = torch.randn(1, 3, 64, 64, device=DEVICE)
         input_ids = torch.randint(0, 256, (1, 16), device=DEVICE)
         with torch.no_grad():
