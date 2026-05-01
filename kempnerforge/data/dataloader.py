@@ -9,6 +9,7 @@ Wraps PyTorch DataLoader with:
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 
 import torch
 from torch.utils.data import DataLoader, Dataset
@@ -30,6 +31,10 @@ class StatefulDataLoader:
         batch_size: Per-device micro-batch size.
         sampler: Distributed sampler (created automatically if None).
         config: Data pipeline configuration.
+        collate_fn: Optional custom batch collator. When None, uses
+            PyTorch's default collation. VLM training passes
+            ``VLMCollator`` so that the fixed-length padding and
+            ``image_positions`` slot reach the batch.
     """
 
     def __init__(
@@ -38,22 +43,25 @@ class StatefulDataLoader:
         batch_size: int,
         sampler: DistributedSampler | MixtureSampler | None = None,
         config: DataConfig | None = None,
+        collate_fn: Callable | None = None,
     ) -> None:
         config = config or DataConfig()
         self.dataset = dataset
         self.batch_size = batch_size
         self.sampler = sampler or DistributedSampler(dataset)
 
-        self._dataloader = DataLoader(
-            dataset,
-            batch_size=batch_size,
-            sampler=self.sampler,
-            num_workers=config.num_workers,
-            pin_memory=config.pin_memory,
-            prefetch_factor=config.prefetch_factor if config.num_workers > 0 else None,
-            persistent_workers=config.num_workers > 0,
-            drop_last=True,
-        )
+        loader_kwargs: dict = {
+            "batch_size": batch_size,
+            "sampler": self.sampler,
+            "num_workers": config.num_workers,
+            "pin_memory": config.pin_memory,
+            "prefetch_factor": config.prefetch_factor if config.num_workers > 0 else None,
+            "persistent_workers": config.num_workers > 0,
+            "drop_last": True,
+        }
+        if collate_fn is not None:
+            loader_kwargs["collate_fn"] = collate_fn
+        self._dataloader = DataLoader(dataset, **loader_kwargs)
 
         # State tracking
         self._epoch = 0

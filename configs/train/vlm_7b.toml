@@ -1,0 +1,93 @@
+# 7B VLM Joint-Decoder on 4x H200 (141 GB/GPU).
+#
+# Primary 7B VLM config. Activation checkpointing is OFF to trade
+# recompute for throughput, and batch_size=16 per GPU uses ~72% of
+# H200 VRAM. For memory-tighter setups (fewer GPUs, smaller GPUs,
+# larger seq) use vlm_7b_ac.toml instead.
+#
+# Measured on 4x H200 (200-step smoke on 2k COCO Karpathy captions):
+#   memory: ~101 / 140 GB per GPU (72%)
+#   throughput: ~41k tok/s, ~46% MFU
+#
+# Usage:
+#   uv run torchrun --nproc_per_node=4 scripts/train.py configs/train/vlm_7b.toml
+#
+# Defaults point at the public COCO Karpathy split on HF Hub. Override
+# the dataset and tokenizer via CLI for other corpora:
+#   --data.hf_dataset_name=<dataset> --data.tokenizer_path=<tokenizer>
+#
+# Swap the vision encoder via [model.vlm].vision_encoder: "random"
+# (stub, no download), "siglip2", or "clip". When pointing at a real
+# encoder also set vision_encoder_path.
+
+[model]
+dim = 4096
+n_layers = 32
+n_heads = 32
+n_kv_heads = 8
+vocab_size = 50257
+ffn_dim_multiplier = 1.3
+norm_type = "rmsnorm"
+activation = "silu"
+max_seq_len = 1024
+rope_theta = 500000.0
+tie_embeddings = false
+
+[model.vlm]
+arch = "joint_decoder"
+vision_encoder = "random"
+feature_dim = 1024
+num_tokens = 256
+adapter_hidden_dim = 0
+adapter_activation = "gelu"
+max_text_len = 512
+freeze = [{module = "vision_encoder", frozen = true}]
+
+[train]
+batch_size = 16
+seq_len = 768
+max_steps = 15
+grad_accum_steps = 1
+grad_clip_norm = 1.0
+seed = 42
+compile_model = false
+activation_checkpointing = "none"   # intentionally off to stress VRAM
+loss_fn = "cross_entropy"
+
+[optimizer]
+name = "adamw"
+lr = 1e-4
+weight_decay = 0.1
+betas = [0.9, 0.95]
+eps = 1e-8
+fused = true
+
+[scheduler]
+name = "cosine"
+warmup_steps = 3
+min_lr_ratio = 0.1
+
+[data]
+hf_dataset_name = "nlphuji/coco_karpathy"
+hf_dataset_split = "train"
+hf_dataset_image_field = "image"
+hf_dataset_text_field = "caption"
+hf_image_size = 224
+tokenizer_path = "gpt2"
+num_workers = 2
+pin_memory = true
+prefetch_factor = 2
+
+[distributed]
+dp_shard = -1
+nccl_timeout_sec = 600
+
+[checkpoint]
+dir = "checkpoints/vlm_7b"
+interval = 1000
+keep_last_n = 1
+
+[metrics]
+log_interval = 1
+enable_wandb = false
+enable_tensorboard = false

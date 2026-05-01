@@ -103,6 +103,65 @@ class Registry:
     def get_loss(self, name: str) -> Callable:
         return self.get("loss", name)
 
+    def register_vision_encoder(self, name: str) -> Callable:
+        """Decorator to register a vision encoder builder.
+
+        Builders take ``(path: str, **kwargs)`` and return a ``VisionEncoder``
+        that produces ``(B, num_tokens, feature_dim)`` patch tokens from
+        ``(B, 3, H, W)`` pixel values.
+        """
+
+        def decorator(fn: Callable) -> Callable:
+            self.register("vision_encoder", name, fn)
+            return fn
+
+        return decorator
+
+    def get_vision_encoder(self, name: str) -> Callable:
+        return self.get("vision_encoder", name)
+
+    def register_vlm_config(self, name: str) -> Callable:
+        """Decorator to register a ``VLMConfig`` subclass.
+
+        Registers an arch discriminator (e.g. ``"joint_decoder"``,
+        ``"cross_attention"``) so the loader can dispatch a TOML
+        ``[model.vlm]`` table with ``arch = "..."`` to the right
+        subclass and ``VLMConfig.for_arch`` can resolve programmatically.
+        """
+
+        def decorator(cls: Any) -> Any:
+            self.register("vlm_config", name, cls)
+            return cls
+
+        return decorator
+
+    def get_vlm_config(self, name: str) -> Any:
+        return self.get("vlm_config", name)
+
+    def list_vlm_configs(self) -> list[str]:
+        return self.list("vlm_config")
+
+    def register_modality_strategy(self, name: str) -> Callable:
+        """Decorator to register a ``ModalityStrategy`` for a VLM arch.
+
+        The strategy prepares a ``ModalityContext`` from raw
+        ``(pixel_values, input_ids)`` for one arch (Joint-Decoder,
+        Cross-Attention, MoT, ...). ``VLMWrapper`` looks up its
+        strategy by arch name.
+        """
+
+        def decorator(cls: Any) -> Any:
+            self.register("modality_strategy", name, cls)
+            return cls
+
+        return decorator
+
+    def get_modality_strategy(self, name: str) -> Any:
+        return self.get("modality_strategy", name)
+
+    def list_modality_strategies(self) -> list[str]:
+        return self.list("modality_strategy")
+
 
 # Global registry instance
 registry = Registry()

@@ -5,7 +5,6 @@
 <p align="center">
   <a href="https://github.com/KempnerInstitute/KempnerForge/actions/workflows/ci.yml"><img src="https://github.com/KempnerInstitute/KempnerForge/actions/workflows/ci.yml/badge.svg" alt="CI"/></a>
   <a href="https://github.com/KempnerInstitute/KempnerForge/actions/workflows/docs.yml"><img src="https://github.com/KempnerInstitute/KempnerForge/actions/workflows/docs.yml/badge.svg" alt="Docs"/></a>
-  <a href="https://codecov.io/gh/KempnerInstitute/KempnerForge"><img src="https://codecov.io/gh/KempnerInstitute/KempnerForge/graph/badge.svg?token=JvU079LEsl" alt="codecov"/></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"/></a>
   <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.12+-blue.svg" alt="Python 3.12+"/></a>
   <a href="https://pytorch.org/"><img src="https://img.shields.io/badge/pytorch-2.4+-ee4c2c.svg" alt="PyTorch 2.4+"/></a>
@@ -138,6 +137,32 @@ Further reading:
 - [`docs/getting-started/quickstart.md`](docs/getting-started/quickstart.md): 5-minute walkthrough (install → debug → multi-GPU → custom data → optimizer swap → MoE → hooks)
 - [`docs/how-to/end-to-end-training-run.md`](docs/how-to/end-to-end-training-run.md): tokenize → config → 1 GPU → 4 GPUs → resume → generate
 - [`examples/notebooks/`](examples/notebooks/): 6 Jupyter notebooks (model inspection, attention visualization, activation extraction, checkpoint analysis, optimizer comparison, MoE routing)
+
+### Vision-language models
+
+KempnerForge supports VLM training via a thin wrapper around the existing `Transformer`. Image tokens come from a frozen HF vision encoder (SigLIP2, CLIP, or a tiny `random` test stub), pass through a 2-layer adapter, and feed the backbone via an arch-specific path:
+
+- **Joint-Decoder** (`arch = "joint_decoder"`): image embeds are prepended to the text sequence; the transformer runs over the concatenated `(image, text)` sequence and the LM head is applied to text positions only.
+
+```bash
+# 1-GPU smoke (random encoder, Joint-Decoder)
+uv run python scripts/train.py configs/train/vlm_debug.toml \
+    --data.hf_dataset_name=<vlm-dataset> --data.tokenizer_path=gpt2
+
+# 4-GPU SigLIP2 + 7B Joint-Decoder
+uv run torchrun --nproc_per_node=4 scripts/train.py configs/train/vlm_7b_siglip2.toml
+```
+
+Configs set `[model.vlm]` with `arch`, the encoder registry key, the number of image tokens, and a freeze list (`FreezeSpec`). The vision encoder stays in its HF-loaded dtype; the transformer and adapter are cast to `param_dtype`. Pipeline Parallel + VLM is not supported on this branch (raises at startup); multi-image and video are reserved slots for follow-up work. Cross-Attention and Mixture-of-Transformers arches are reserved discriminators (`_RESERVED_ARCHS`) — TOMLs targeting them get a clear `NotImplementedError` until those land in follow-up PRs.
+
+**Adding a new VLM arch.** The discriminated-union dispatch is registry-driven, so a new arch is four small additions, no edits to existing call sites:
+
+1. Add a `VLMConfig` subclass in `kempnerforge/config/vlm.py` decorated with `@registry.register_vlm_config("<arch_name>")`. Override `residual_stream_image_tokens()` if the arch's residual stream is not text-only-plus-prefix.
+2. Add a `ModalityStrategy` class (in `kempnerforge/model/vlm.py` for in-tree arches, or any module imported at startup) decorated with `@registry.register_modality_strategy("<arch_name>")`. Implement `prepare(wrapper, pixel_values, input_ids) -> ModalityContext` and `num_image_tokens(wrapper) -> int`.
+3. If the arch needs new modules, add them under `kempnerforge/model/` and wire them into `Transformer.__init__` behind an `isinstance(config.vlm, MyConfig)` guard so non-arch builds stay zero-cost.
+4. Drop the arch name from `_RESERVED_ARCHS` in `kempnerforge/config/vlm.py` if it was reserved.
+
+The TOML loader picks up the new arch automatically — `[model.vlm]` with `arch = "<arch_name>"` instantiates the right subclass. `VLMWrapper.forward` is unchanged.
 
 ## Agent-ready
 

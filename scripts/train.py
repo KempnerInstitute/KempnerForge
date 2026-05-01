@@ -42,6 +42,7 @@ from kempnerforge.distributed.tensor_parallel import apply_tensor_parallel
 from kempnerforge.distributed.utils import clip_grad_norm_, get_dp_info
 from kempnerforge.metrics.logger import get_logger
 from kempnerforge.metrics.tracker import MetricsTracker
+from kempnerforge.model.vlm import inner_transformer
 from kempnerforge.profiling.profiler import build_profiler, print_profiler_summary
 from kempnerforge.resilience.elastic import log_job_info, resolve_resume_path
 from kempnerforge.resilience.health import NaNDetector, check_nccl_health
@@ -52,6 +53,11 @@ from kempnerforge.training import (
     build_scheduler,
     maybe_no_sync,
     run_eval,
+)
+from kempnerforge.training.freeze import (
+    apply_freeze_specs,
+    canonical_freeze_meta,
+    effective_freeze,
 )
 from kempnerforge.training.hooks import HookRunner, StepContext
 
@@ -195,12 +201,39 @@ def main() -> None:
     resume_path = resolve_resume_path(config.checkpoint.dir)
     step, tokens_seen = 0, 0
     if resume_path or config.checkpoint.load_path:
+        # On resume the expected freeze metadata reflects the
+        # post-transition state at the saved step (effective_freeze
+        # handles step-boundary transitions). Peek at the saved step
+        # via metadata.json before invoking load() so the comparison
+        # uses the same step the checkpoint was written at.
+        vlm_freeze_expected = None
+        if mc.is_vlm:
+            assert mc.vlm is not None
+            probe_step = ckpt_mgr.peek_saved_step(str(resume_path) if resume_path else None) or 0
+            # valid_modules: the set of aliases the current config knows
+            # about. effective_freeze raises ValueError if any FreezeSpec
+            # references an alias not in this set, catching TOML typos at
+            # config-load time rather than silently no-op'ing the freeze.
+            valid_modules = set(mc.vlm.module_patterns.keys())
+            vlm_freeze_expected = canonical_freeze_meta(
+                effective_freeze(probe_step, mc.vlm.freeze, mc.vlm.freeze_schedule, valid_modules)
+            )
         step, tokens_seen, ckpt_extra_loaded = ckpt_mgr.load(
             path=str(resume_path) if resume_path else None,
             scheduler=scheduler,
+            vlm_freeze_expected=vlm_freeze_expected,
         )
         if ckpt_extra_loaded.get("wandb_run_id"):
             config.metrics.wandb_run_id = ckpt_extra_loaded["wandb_run_id"]
+        # Apply effective freeze at the resumed step so requires_grad
+        # reflects the post-transition state of any stages with
+        # start_step <= loaded_step. Build-time apply only handles
+        # the base freeze list.
+        if mc.vlm is not None and mc.vlm.freeze_schedule:
+            valid_modules = set(mc.vlm.module_patterns.keys())
+            specs = effective_freeze(step, mc.vlm.freeze, mc.vlm.freeze_schedule, valid_modules)
+            apply_freeze_specs(model, specs, mc.vlm.module_patterns)
+            logger.info(f"Resumed at step={step}; applied effective freeze ({len(specs)} specs)")
 
     # --- Metrics ---
     tracker = MetricsTracker(config, num_gpus=world_size)
@@ -230,7 +263,51 @@ def main() -> None:
 
             eos_token_id = _AT.from_pretrained(config.data.tokenizer_path).eos_token_id
 
-    if config.data.datasets:
+    if mc.is_vlm:
+        # --- VLM (Joint-Decoder) data path ---
+        # Mixing VLM + text-only datasets in one run is out of scope on this
+        # branch. DatasetSource doesn't describe image sources yet; follow-up.
+        if not config.data.hf_dataset_name or not config.data.tokenizer_path:
+            raise ValueError("VLM training requires data.hf_dataset_name and data.tokenizer_path")
+        from transformers import AutoTokenizer
+
+        from kempnerforge.data.vlm_dataset import HuggingFaceVLMDataset, VLMCollator
+
+        assert mc.vlm is not None  # narrowed by is_vlm
+        dataset = HuggingFaceVLMDataset(
+            dataset_name=config.data.hf_dataset_name,
+            split=config.data.hf_dataset_split,
+            image_field=config.data.hf_dataset_image_field,
+            text_field=config.data.hf_dataset_text_field,
+            tokenizer_path=config.data.tokenizer_path,
+            max_text_len=mc.vlm.max_text_len,
+            prompt_field=config.data.hf_dataset_prompt_field or None,
+            image_size=config.data.hf_image_size,
+            dataset_config=config.data.hf_dataset_config,
+        )
+        # Resolve pad_id from the tokenizer for VLMCollator. Fall back to
+        # EOS when pad_token_id is unset (gpt2, some Llama families), then
+        # to 0 as a last resort. Collator also enforces fixed-length
+        # padding so all DP ranks see identical tensor shapes and emits
+        # the image_positions slot (D18) for downstream multi-image work.
+        _tok = AutoTokenizer.from_pretrained(config.data.tokenizer_path)
+        _pad_id = _tok.pad_token_id
+        if _pad_id is None:
+            _pad_id = _tok.eos_token_id if _tok.eos_token_id is not None else 0
+        collator = VLMCollator(pad_id=int(_pad_id), max_text_len=mc.vlm.max_text_len)
+        sampler = DistributedSampler(
+            dataset, num_replicas=dp_size, rank=dp_rank, shuffle=True, seed=tc.seed
+        )
+        dataloader = StatefulDataLoader(
+            dataset,
+            batch_size=tc.batch_size,
+            sampler=sampler,
+            config=config.data,
+            collate_fn=collator,
+        )
+        logger.info(f"VLM dataset: {len(dataset):,} samples from {config.data.hf_dataset_name}")
+
+    elif config.data.datasets:
         # --- Multi-dataset mixing ---
         from kempnerforge.data.dataset import HuggingFaceDataset, MixtureDataset
         from kempnerforge.data.sampler import MixtureSampler
@@ -384,9 +461,23 @@ def main() -> None:
         ckpt_mgr.apply_dataloader_state(dataloader)
 
     # --- Eval data ---
+    # VLM + eval is out of scope on this branch: run_eval calls
+    # `model(input_ids)`, which does not match VLMWrapper's
+    # `forward(pixel_values, input_ids, labels)`. The helper decides
+    # whether to build the eval dataloader and whether to log a clear
+    # warning that eval was skipped for VLM configs.
+    from kempnerforge.training.eval import should_build_eval_dataloader
+
     eval_config = config.eval
     eval_dataloader = None
-    if eval_config.enabled:
+    _build_eval, _warn_vlm_eval = should_build_eval_dataloader(eval_config.enabled, mc.is_vlm)
+    if _warn_vlm_eval:
+        logger.warning(
+            "eval.enabled=true is ignored for VLM configs on this branch. "
+            "run_eval does not support VLMWrapper.forward yet; disabling "
+            "eval for the duration of this run."
+        )
+    if _build_eval:
         from torch.utils.data import DataLoader as TorchDataLoader
 
         if eval_config.dataset_path:
@@ -577,8 +668,49 @@ def main() -> None:
             avg_loss = loss_tensor[0].item()
             grad_norm_val = loss_tensor[1].item()
 
+        elif mc.is_vlm:
+            # --- VLM training step (no PP, VLM Joint-Decoder) ---
+            total_loss = 0.0
+            total_text_tokens = 0
+
+            for micro_step in range(tc.grad_accum_steps):
+                if dataloader is None:
+                    raise RuntimeError(
+                        "VLM training requires a real dataloader; synthetic fallback "
+                        "(randint) does not produce pixel_values"
+                    )
+                try:
+                    batch = next(data_iter)
+                except StopIteration:
+                    data_iter = iter(dataloader)
+                    batch = next(data_iter)
+                pixel_values = batch["pixel_values"].to(device)
+                input_ids = batch["input_ids"].to(device)
+                labels = batch["labels"].to(device)
+
+                with maybe_no_sync(model, micro_step, tc.grad_accum_steps):
+                    if mc.is_moe:
+                        inner_transformer(model).set_moe_step(step, tc.max_steps)  # type: ignore[attr-defined]
+                    logits, labels_out = model(pixel_values, input_ids, labels)
+                    loss = loss_fn(logits, labels_out)
+
+                    total_text_tokens += int((labels_out != -100).sum().item())
+
+                    # MoE auxiliary loss (no-op for dense: returns 0.0)
+                    if mc.is_moe:
+                        aux_loss = inner_transformer(model).get_moe_aux_loss()  # type: ignore[attr-defined]
+                        loss = loss + mc.moe_aux_loss_weight * aux_loss
+
+                    scaled_loss = loss / tc.grad_accum_steps
+                    scaled_loss.backward()
+                    total_loss += loss.item()
+
+            avg_loss = total_loss / tc.grad_accum_steps
+            grad_norm = clip_grad_norm_(model, tc.grad_clip_norm)
+            grad_norm_val = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
+
         else:
-            # --- Standard training step (no PP) ---
+            # --- Standard training step (no PP, text-only) ---
             total_loss = 0.0
             ds_token_counts: dict[str, int] = {}
             ds_loss_sums: dict[str, float] = {}
@@ -605,7 +737,7 @@ def main() -> None:
 
                 with maybe_no_sync(model, micro_step, tc.grad_accum_steps):
                     if mc.is_moe:
-                        model.set_moe_step(step, tc.max_steps)
+                        inner_transformer(model).set_moe_step(step, tc.max_steps)  # type: ignore[attr-defined]
                     logits = model(input_ids, doc_ids=doc_ids)
                     loss = loss_fn(logits, labels)
 
@@ -630,7 +762,7 @@ def main() -> None:
 
                     # MoE auxiliary loss (no-op for dense: returns 0.0)
                     if mc.is_moe:
-                        aux_loss = model.get_moe_aux_loss()
+                        aux_loss = inner_transformer(model).get_moe_aux_loss()  # type: ignore[attr-defined]
                         loss = loss + mc.moe_aux_loss_weight * aux_loss
 
                     scaled_loss = loss / tc.grad_accum_steps
@@ -666,6 +798,26 @@ def main() -> None:
         step += 1
         tokens_in_step = tc.batch_size * tc.seq_len * tc.grad_accum_steps * dp_size
         tokens_seen += tokens_in_step
+
+        # FreezeStage hook: apply any stage whose start_step matches the
+        # current step boundary. AdamW + set_to_none=True default skips
+        # frozen params entirely (no SGD step, no weight decay), so
+        # mutating requires_grad mid-training is a clean no-op for
+        # newly-frozen params and re-enables gradient flow for
+        # newly-unfrozen ones.
+        #
+        # Async-save fence: drain any in-flight save FIRST so that its
+        # metadata.json — which records the pre-transition spec — lands
+        # before we flip requires_grad. Otherwise a save started at
+        # step S-1 could write metadata after the transition, attaching
+        # the post-transition spec to pre-transition shards.
+        if mc.is_vlm and mc.vlm is not None and mc.vlm.freeze_schedule:
+            pending_stages = [s for s in mc.vlm.freeze_schedule if s.start_step == step]
+            if pending_stages:
+                ckpt_mgr.flush_pending_save()
+                for stage in pending_stages:
+                    flipped = apply_freeze_specs(model, stage.specs, mc.vlm.module_patterns)
+                    logger.info(f"FreezeStage at step={step}: applied {flipped}")
 
         # Phase transition check
         if active_phases and mixture_dataset is not None:
@@ -712,12 +864,26 @@ def main() -> None:
 
         # MoE metrics (logged at same interval as main metrics)
         if mc.is_moe and step_metrics is not None:
-            moe_metrics = {"moe/aux_loss": model.get_moe_aux_loss().item()}
-            expert_counts = model.get_expert_counts()
+            _inner = inner_transformer(model)
+            moe_metrics = {"moe/aux_loss": _inner.get_moe_aux_loss().item()}  # type: ignore[attr-defined]
+            expert_counts = _inner.get_expert_counts()  # type: ignore[attr-defined]
             if expert_counts:
                 all_counts = torch.stack(list(expert_counts.values())).float()
                 moe_metrics["moe/expert_balance"] = (all_counts.min() / all_counts.max()).item()
             tracker.log_eval(moe_metrics, step)
+
+        # VLM per-step text-token count (excludes image prefix, -100 pad, and
+        # masked prompt tokens). Logged separately from tokens_in_step which
+        # still reports sequence positions processed. The counter is DP-local
+        # on each rank, so all-reduce it to the global text-token count
+        # before logging.
+        if mc.is_vlm and step_metrics is not None:
+            global_text_tokens = total_text_tokens
+            if dist.is_initialized():
+                _t = torch.tensor([total_text_tokens], device=device, dtype=torch.long)
+                dist.all_reduce(_t, op=dist.ReduceOp.SUM)
+                global_text_tokens = int(_t.item())
+            tracker.log_eval({"data/text_tokens_trained": float(global_text_tokens)}, step)
 
         # Per-dataset metrics (logged at same interval as main metrics)
         if mixture_dataset is not None and step_metrics is not None and ds_loss_sums:
@@ -762,9 +928,18 @@ def main() -> None:
             prof.step()
 
         # Checkpoint (include phase index + wandb run ID for exact resumption)
-        ckpt_extra = {"phase_idx": current_phase_idx} if active_phases else {}
+        ckpt_extra: dict = {"phase_idx": current_phase_idx} if active_phases else {}
         if config.metrics.wandb_run_id:
             ckpt_extra["wandb_run_id"] = config.metrics.wandb_run_id
+        if mc.is_vlm:
+            assert mc.vlm is not None
+            # Use effective_freeze so the saved metadata reflects the
+            # post-transition state when a FreezeStage has fired.
+            # valid_modules pins typo-catching at save time too.
+            valid_modules = set(mc.vlm.module_patterns.keys())
+            ckpt_extra["vlm_freeze"] = canonical_freeze_meta(
+                effective_freeze(step, mc.vlm.freeze, mc.vlm.freeze_schedule, valid_modules)
+            )
         if step % config.checkpoint.interval == 0:
             ckpt_mgr.save(
                 step=step,

@@ -18,7 +18,9 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Literal, Union, get_args, get_origin, get_type_hints
 
+from kempnerforge.config.registry import registry
 from kempnerforge.config.schema import JobConfig
+from kempnerforge.config.vlm import VLMConfig
 
 
 def _coerce_value(field_type: Any, value: Any) -> Any:
@@ -48,9 +50,32 @@ def _coerce_value(field_type: Any, value: Any) -> Any:
             return value
         return field_type(value)
 
-    # Handle tuple (e.g., betas: tuple[float, float])
+    # Handle tuple (e.g., betas: tuple[float, float], or
+    # tuple[FreezeSpec, ...] for variadic dataclass tuples).
     if origin is tuple:
         if isinstance(value, (list, tuple)):
+            args = get_args(field_type)
+            # Variadic tuple[X, ...]: args == (X, Ellipsis). Recursively
+            # convert dict elements to X when X is a dataclass.
+            if (
+                len(args) == 2
+                and args[1] is Ellipsis
+                and isinstance(args[0], type)
+                and is_dataclass(args[0])
+            ):
+                dc_type = args[0]
+                return tuple(
+                    _instantiate_from_dict(dc_type, item) if isinstance(item, dict) else item
+                    for item in value
+                )
+            # Fixed-length tuple[A, B, C]: per-position conversion.
+            if all(isinstance(a, type) and is_dataclass(a) for a in args) and len(args) == len(
+                value
+            ):
+                return tuple(
+                    _instantiate_from_dict(dc_type, item) if isinstance(item, dict) else item
+                    for dc_type, item in zip(args, value, strict=True)
+                )
             return tuple(value)
         return value
 
@@ -58,11 +83,13 @@ def _coerce_value(field_type: Any, value: Any) -> Any:
     if origin is list:
         if isinstance(value, list):
             args = get_args(field_type)
-            if args and is_dataclass(args[0]):
-                # list[SomeDataclass] — convert each dict element to a dataclass instance
+            if args and isinstance(args[0], type) and is_dataclass(args[0]):
+                # list[SomeDataclass] — convert each dict element to a dataclass
+                # instance. Use _instantiate_from_dict so __post_init__ sees
+                # all required fields rather than the empty-default instance.
                 dc_type = args[0]
                 return [
-                    _apply_dict_to_dataclass(dc_type(), item) if isinstance(item, dict) else item  # type: ignore[reportCallIssue]
+                    _instantiate_from_dict(dc_type, item) if isinstance(item, dict) else item
                     for item in value
                 ]
             return value
@@ -93,6 +120,88 @@ def _get_type_hints(dc_type: type) -> dict[str, Any]:
     return _type_hints_cache[dc_type]
 
 
+def _dataclass_type_from_hint(hint: Any) -> type | None:
+    """Return the dataclass type inside ``hint`` if the hint is a dataclass
+    or ``dataclass | None`` (Optional[dataclass]). Returns ``None`` otherwise.
+    """
+    origin = get_origin(hint)
+    if origin is types.UnionType or origin is Union:
+        for arg in get_args(hint):
+            if arg is type(None):
+                continue
+            if isinstance(arg, type) and is_dataclass(arg):
+                return arg
+        return None
+    if isinstance(hint, type) and is_dataclass(hint):
+        return hint
+    return None
+
+
+def _instantiate_from_dict(dc_type: type, data: dict[str, Any]) -> Any:
+    """Construct a dataclass directly from a dict, without first building a
+    default instance.
+
+    Used for nested Optional[dataclass] fields (e.g. ``ModelConfig.vlm``)
+    where the parent's default is ``None`` and the nested dataclass's
+    ``__post_init__`` may reject an empty-default instance.
+
+    When ``dc_type`` is ``VLMConfig`` (the discriminated-union base),
+    dispatch on the ``arch`` field to the registered subclass before
+    populating fields, so subclass-specific fields (e.g.
+    ``cross_attention_every_n_layers``) are recognized.
+    """
+    if dc_type is VLMConfig:
+        dc_type = _resolve_vlm_subclass(data)
+    type_hints = _get_type_hints(dc_type)
+    field_names = {f.name for f in fields(dc_type)}
+    unknown = set(data.keys()) - field_names
+    if unknown:
+        raise ValueError(
+            f"Unknown config keys in {dc_type.__name__}: {sorted(unknown)}. "
+            f"Valid keys: {sorted(field_names)}"
+        )
+    kwargs: dict[str, Any] = {}
+    for f in fields(dc_type):
+        if f.name not in data:
+            continue
+        raw = data[f.name]
+        hint = type_hints[f.name]
+        inner = _dataclass_type_from_hint(hint)
+        if inner is not None and isinstance(raw, dict):
+            kwargs[f.name] = _instantiate_from_dict(inner, raw)
+        else:
+            kwargs[f.name] = _coerce_value(hint, raw)
+    return dc_type(**kwargs)
+
+
+def _resolve_vlm_subclass(data: dict[str, Any]) -> type:
+    """Resolve a TOML ``[model.vlm]`` table to the right ``VLMConfig``
+    subclass via the registered-arch lookup.
+
+    Mirrors ``VLMConfig.for_arch`` error semantics so error type is
+    independent of construction site (loader vs programmatic).
+    """
+    # Late import: registry/_RESERVED_ARCHS live with VLMConfig; pulling
+    # them in at module scope would create a redundant pin on the
+    # config layout for callers that never touch VLM.
+    from kempnerforge.config.vlm import _RESERVED_ARCHS  # noqa: PLC0415
+
+    arch = data.get("arch", "joint_decoder")
+    if arch in _RESERVED_ARCHS:
+        raise NotImplementedError(
+            f"vlm.arch={arch!r} is reserved; not yet implemented. "
+            f"Reserved: {sorted(_RESERVED_ARCHS)}."
+        )
+    try:
+        return registry.get_vlm_config(arch)
+    except KeyError as e:
+        raise ValueError(
+            f"Unknown vlm.arch: {arch!r}. "
+            f"Registered: {sorted(registry.list_vlm_configs())}. "
+            f"Reserved (not yet implemented): {sorted(_RESERVED_ARCHS)}."
+        ) from e
+
+
 def _apply_dict_to_dataclass(dc: Any, data: dict[str, Any]) -> Any:
     """Recursively apply a dict to a dataclass, creating a new instance.
 
@@ -120,6 +229,16 @@ def _apply_dict_to_dataclass(dc: Any, data: dict[str, Any]) -> Any:
             raw = data[f.name]
             if is_dataclass(current_val) and isinstance(raw, dict):
                 kwargs[f.name] = _apply_dict_to_dataclass(current_val, raw)
+            elif current_val is None and isinstance(raw, dict):
+                # Optional nested dataclass (e.g. `vlm: VLMConfig | None`).
+                # Default is None; a TOML table overrides it. Instantiate
+                # directly from the dict so nested __post_init__ validators
+                # see all required fields at construction time.
+                inner = _dataclass_type_from_hint(type_hints[f.name])
+                if inner is not None:
+                    kwargs[f.name] = _instantiate_from_dict(inner, raw)
+                else:
+                    kwargs[f.name] = _coerce_value(type_hints[f.name], raw)
             else:
                 kwargs[f.name] = _coerce_value(type_hints[f.name], raw)
         else:

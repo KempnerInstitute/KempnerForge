@@ -11,10 +11,12 @@ Application order (critical — wrong order causes silent correctness bugs):
 
 For convenience, ``build_parallel_model`` combines all steps including
 model creation, meta-device initialization, and optional torch.compile.
+It also dispatches to a VLM branch when ``model_config.is_vlm`` is True.
 """
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from functools import partial
 
@@ -68,10 +70,20 @@ def get_dp_mesh(device_mesh: DeviceMesh) -> DeviceMesh:
 
 
 def default_mp_policy(param_dtype: torch.dtype = torch.bfloat16) -> MixedPrecisionPolicy:
-    """Mixed-precision policy: param_dtype compute, fp32 gradient reduction."""
+    """Mixed-precision policy: param_dtype compute, fp32 gradient reduction.
+
+    ``cast_forward_inputs=True`` ensures FSDP2 casts input tensors to the
+    declared ``param_dtype`` at each wrapped module's forward boundary.
+    The VLM path relies on this so image embeddings produced by the
+    adapter (bf16) reach the sharded transformer with matching dtype
+    without needing the caller to do manual casts. The default on
+    ``MixedPrecisionPolicy`` is False, so we set it explicitly here to
+    pin the contract.
+    """
     return MixedPrecisionPolicy(
         param_dtype=param_dtype,
         reduce_dtype=torch.float32,
+        cast_forward_inputs=True,
     )
 
 
@@ -169,6 +181,57 @@ def _has_ep_moe(module: torch.nn.Module) -> bool:
     return any(isinstance(m, MoEMLP) and m.ep_world_size > 1 for m in module.modules())
 
 
+def _fsdp_wrap_transformer_blocks(
+    transformer: Transformer,
+    dp_mesh: DeviceMesh,
+    policy: MixedPrecisionPolicy,
+    reshard_after_forward: bool | int,
+) -> int:
+    """Per-block FSDP2 wrap over ``transformer.layers``, EP-MoE aware.
+
+    Dense blocks are wrapped once per ``TransformerBlock``. EP-MoE blocks
+    get per-sub-module wrapping (``layer.attention`` and ``layer.mlp``
+    separately) because wrapping the whole block would cause FSDP2's
+    reduce-scatter to fire between EP's backward all-to-all calls and
+    deadlock. Per-sub-module wrapping keeps the two EP all-to-alls
+    inside a single FSDP unit (``layer.mlp``), so reduce-scatter only
+    fires after both complete.
+
+    Shared by ``apply_fsdp2`` (for text Transformers) and
+    ``_apply_fsdp_vlm`` (for the inner Transformer of a VLMWrapper) so
+    the VLM path inherits the EP-MoE safety automatically if a future
+    config combines MoE with VLM.
+
+    Returns the number of EP-MoE blocks that got the per-sub-module
+    wrap; 0 for dense models.
+    """
+    ep_sub_wrapped = 0
+    for layer in transformer.layers.values():
+        if _has_ep_moe(layer):
+            fully_shard(  # type: ignore[reportCallIssue]
+                layer.attention,  # type: ignore[reportArgumentType]
+                mesh=dp_mesh,
+                mp_policy=policy,
+                reshard_after_forward=reshard_after_forward,
+            )
+            fully_shard(  # type: ignore[reportCallIssue]
+                layer.mlp,  # type: ignore[reportArgumentType]
+                mesh=dp_mesh,
+                mp_policy=policy,
+                reshard_after_forward=reshard_after_forward,
+            )
+            ep_sub_wrapped += 1
+            continue
+        fully_shard(
+            layer,
+            mesh=dp_mesh,
+            mp_policy=policy,
+            reshard_after_forward=reshard_after_forward,
+        )
+
+    return ep_sub_wrapped
+
+
 def apply_fsdp2(
     model: Transformer,
     device_mesh: DeviceMesh,
@@ -177,8 +240,10 @@ def apply_fsdp2(
 ) -> None:
     """Apply FSDP2 (fully_shard) to a Transformer model.
 
-    Shards each TransformerBlock independently, then wraps the top-level
-    model for remaining parameters (embeddings, final norm, output head).
+    Shards each TransformerBlock independently (via
+    ``_fsdp_wrap_transformer_blocks`` so the EP-MoE per-sub-module wrap
+    is shared with the VLM path), then wraps the top-level model for
+    remaining parameters (embeddings, final norm, output head).
 
     Must be called AFTER apply_ac and apply_tensor_parallel.
 
@@ -205,43 +270,7 @@ def apply_fsdp2(
     dp_mesh = get_dp_mesh(device_mesh)
     policy = mp_policy or default_mp_policy()
 
-    # Shard each transformer block as an independent FSDP unit.
-    #
-    # EP-MoE blocks get per-sub-module wrapping: attention and MoE (layer.mlp)
-    # are each individually fully_shard()'d. This avoids the deadlock that
-    # per-block wrapping would cause (FSDP2 reduce-scatter firing between EP's
-    # two backward all-to-all calls), while still getting per-block param
-    # resharding and gradient reduction overlap — unlike the previous approach
-    # of deferring all MoE params to the top-level wrap.
-    #
-    # Safety: FSDP2 bucketizes all params in a fully_shard() unit and fires
-    # reduce-scatter only after the last param's grad is computed. For
-    # fully_shard(layer.mlp), reduce-scatter fires after the entire MoE
-    # backward (after both EP all-to-all calls complete). All dp_shard peers
-    # share the same EP rank, so they reach reduce-scatter in the same phase.
-    ep_sub_wrapped = 0
-    for layer in model.layers.values():
-        if _has_ep_moe(layer):
-            fully_shard(  # type: ignore[reportCallIssue]
-                layer.attention,  # type: ignore[reportArgumentType]
-                mesh=dp_mesh,
-                mp_policy=policy,
-                reshard_after_forward=reshard_after_forward,
-            )
-            fully_shard(  # type: ignore[reportCallIssue]
-                layer.mlp,  # type: ignore[reportArgumentType]
-                mesh=dp_mesh,
-                mp_policy=policy,
-                reshard_after_forward=reshard_after_forward,
-            )
-            ep_sub_wrapped += 1
-            continue
-        fully_shard(
-            layer,
-            mesh=dp_mesh,
-            mp_policy=policy,
-            reshard_after_forward=reshard_after_forward,
-        )
+    ep_sub_wrapped = _fsdp_wrap_transformer_blocks(model, dp_mesh, policy, reshard_after_forward)
 
     # Top-level shard covers remaining params (embeddings, final norm, output
     # head, and layer norms from EP-MoE blocks).
@@ -258,6 +287,188 @@ def apply_fsdp2(
     )
 
 
+def _apply_fsdp_vlm(
+    wrapper: torch.nn.Module,
+    device_mesh: DeviceMesh,
+    mp_policy: MixedPrecisionPolicy | None,
+    *,
+    encoder_frozen: bool,
+    reshard_after_forward: bool | int = True,
+) -> None:
+    """FSDP2 wrap policy for a ``VLMWrapper``.
+
+    Shards per-component:
+      - Each ``TransformerBlock`` (via ``_fsdp_wrap_transformer_blocks``
+        so the EP-MoE per-sub-module wrap is shared with the text path
+        and VLM+MoE cannot deadlock).
+      - Transformer root (embedding + final norm + output head): own unit.
+      - Adapter: own unit (small, but keeps grad-sync scheduling symmetric).
+      - Vision encoder: wrapped only when not fully frozen. A frozen encoder
+        stays as a full replica in eval mode; replication is fine because
+        requires_grad=False means no grad-reduce participation.
+      - The ``VLMWrapper`` itself is not wrapped (no direct parameters).
+    """
+    if not has_dp_mesh(device_mesh):
+        return
+
+    # Local import to avoid a hard dependency at module load time.
+    from kempnerforge.model.vlm import VLMWrapper
+
+    assert isinstance(wrapper, VLMWrapper), "_apply_fsdp_vlm expects a VLMWrapper"
+
+    dp_mesh = get_dp_mesh(device_mesh)
+    policy = mp_policy or default_mp_policy()
+
+    _fsdp_wrap_transformer_blocks(wrapper.transformer, dp_mesh, policy, reshard_after_forward)
+    fully_shard(
+        wrapper.transformer,
+        mesh=dp_mesh,
+        mp_policy=policy,
+        reshard_after_forward=reshard_after_forward,
+    )
+    fully_shard(
+        wrapper.adapter,
+        mesh=dp_mesh,
+        mp_policy=policy,
+        reshard_after_forward=reshard_after_forward,
+    )
+    if not encoder_frozen:
+        fully_shard(
+            wrapper.vision_encoder,
+            mesh=dp_mesh,
+            mp_policy=policy,
+            reshard_after_forward=reshard_after_forward,
+        )
+    logger.info(
+        f"Applied VLM FSDP2: dp_mesh={dp_mesh.mesh_dim_names}, "
+        f"blocks={len(wrapper.transformer.layers)}, encoder_frozen={encoder_frozen}"
+    )
+
+
+def _build_vlm(
+    model_config,
+    device: torch.device,
+    device_mesh: DeviceMesh | None,
+    *,
+    ac_mode: ActivationCheckpointing,
+    mp_policy: MixedPrecisionPolicy | None,
+    param_dtype: torch.dtype,
+    compile_model: bool,
+    fp8: bool,
+) -> torch.nn.Module:
+    """Build a VLM wrapper with parallelism applied in the correct order.
+
+    The VLM pipeline sequences component-by-component:
+
+      1. Vision encoder is built on CPU via HF (real weights). Never on meta.
+      2. Transformer + Adapter are built under ``torch.device("meta")`` when
+         TP is active (to avoid OOM before sharding), or directly on CPU
+         otherwise.
+      3. They are composed into a ``VLMWrapper`` and the image-prefix length
+         is cross-checked against ``model_config.max_seq_len`` now that
+         ``num_tokens`` is known from the encoder.
+      4. TP / EP / Float8 / AC are applied to the transformer only.
+      5. FSDP2 is applied component-by-component (transformer blocks,
+         transformer root, adapter, and vision encoder iff not frozen).
+      6. Meta subtrees are materialized (transformer / adapter), the
+         vision encoder is moved to ``device``, and the transformer and
+         adapter are cast to ``param_dtype``. The vision encoder stays in
+         its HF dtype (D16) to avoid ViT LayerNorm numerical drift.
+      7. Freeze specs are applied via ``apply_freeze_specs`` and a fully
+         frozen encoder is switched to ``eval()``.
+    """
+    from kempnerforge.distributed.expert_parallel import apply_expert_parallel
+    from kempnerforge.distributed.tensor_parallel import apply_tensor_parallel
+    from kempnerforge.model.vlm import (
+        Adapter,
+        VLMWrapper,
+        _is_encoder_frozen,
+        build_modality_strategy,
+    )
+    from kempnerforge.training.freeze import apply_freeze_specs
+
+    vlm = model_config.vlm
+    assert vlm is not None, "_build_vlm requires model_config.vlm to be set"
+    tp_enabled = device_mesh is not None and "tp" in device_mesh.mesh_dim_names  # type: ignore[reportOperatorIssue]
+
+    # 1. Vision encoder on CPU (real HF weights).
+    encoder_builder = registry.get_vision_encoder(vlm.vision_encoder)
+    encoder = encoder_builder(
+        vlm.vision_encoder_path,
+        num_tokens=vlm.num_tokens if vlm.num_tokens > 0 else None,
+        feature_dim=vlm.feature_dim if vlm.feature_dim > 0 else None,
+    )
+    in_dim = vlm.feature_dim or encoder.feature_dim
+
+    # 2. Transformer + Adapter on meta (when TP is active) or CPU.
+    model_builder = registry.get_model(model_config.model_type)
+    ctx = torch.device("meta") if tp_enabled else contextlib.nullcontext()
+    with ctx:
+        transformer = model_builder(model_config)
+        adapter = Adapter(
+            in_dim=in_dim,
+            out_dim=model_config.dim,
+            hidden_dim=vlm.adapter_hidden_dim or None,
+            activation=vlm.adapter_activation,
+        )
+
+    strategy = build_modality_strategy(vlm)
+    wrapper = VLMWrapper(encoder, adapter, transformer, strategy)
+
+    # 3. Length cross-check now that num_tokens is resolved.
+    required = wrapper.num_image_tokens + vlm.max_text_len
+    if model_config.max_seq_len < required:
+        raise ValueError(
+            f"max_seq_len ({model_config.max_seq_len}) insufficient for VLM: "
+            f"num_image_tokens ({wrapper.num_image_tokens}) + vlm.max_text_len "
+            f"({vlm.max_text_len}) = {required}"
+        )
+
+    # 4. TP / EP / Float8 / AC on the transformer only.
+    if tp_enabled:
+        apply_tensor_parallel(transformer, device_mesh)  # type: ignore[reportArgumentType]
+    apply_expert_parallel(transformer, device_mesh)
+    if fp8:
+        apply_float8(transformer)
+    apply_ac(transformer, ac_mode)
+
+    # 5. FSDP2 (before materialization when meta-device path is used).
+    encoder_frozen = _is_encoder_frozen(vlm.freeze)
+    if device_mesh is not None:
+        _apply_fsdp_vlm(wrapper, device_mesh, mp_policy, encoder_frozen=encoder_frozen)
+
+    # 6. Materialize and move to device.
+    if tp_enabled:
+        transformer.to_empty(device=device)
+        transformer.init_weights_and_freqs()
+        adapter.to_empty(device=device)
+        adapter.reset_parameters()
+    else:
+        transformer.to(device=device)
+        adapter.to(device=device)
+    encoder.to(device)  # Keep HF dtype per D16.
+    transformer.to(dtype=param_dtype)
+    adapter.to(dtype=param_dtype)
+
+    # 7. Freeze specs + eval() for fully frozen encoder.
+    apply_freeze_specs(wrapper, vlm.freeze, vlm.module_patterns)
+    if encoder_frozen:
+        encoder.eval()
+
+    compiled: torch.nn.Module = wrapper
+    if compile_model:
+        logger.info("Compiling VLM wrapper with torch.compile...")
+        compiled = torch.compile(wrapper)  # type: ignore[assignment]
+
+    n_params = sum(p.numel() for p in wrapper.parameters())
+    n_trainable = sum(p.numel() for p in wrapper.parameters() if p.requires_grad)
+    logger.info(
+        f"VLM model: {n_params:,} total, {n_trainable:,} trainable, "
+        f"num_image_tokens={wrapper.num_image_tokens}, encoder_frozen={encoder_frozen}"
+    )
+    return compiled
+
+
 def build_parallel_model(
     model_config,
     device: torch.device,
@@ -269,11 +480,15 @@ def build_parallel_model(
     compile_model: bool = False,
     fp8: bool = False,
 ) -> torch.nn.Module:
-    """Build a Transformer with parallelism applied in the correct order.
+    """Build a Transformer (or a VLMWrapper) with parallelism applied.
 
-    Handles four configurations automatically:
+    Dispatches on ``model_config.is_vlm``. Non-VLM configurations follow
+    the original order:
+
       - TP enabled:  meta-device init → TP → EP → [Float8] → AC → FSDP → materialize
       - TP disabled: create on device → EP → [Float8] → AC → FSDP
+
+    VLM configurations follow the order documented on ``_build_vlm``.
 
     This is the non-PP model building path. For pipeline parallelism,
     use ``build_stage_module`` + apply parallelism directly.
@@ -291,6 +506,18 @@ def build_parallel_model(
     Returns:
         The parallelized model, ready for training.
     """
+    if getattr(model_config, "is_vlm", False):
+        return _build_vlm(
+            model_config,
+            device,
+            device_mesh,
+            ac_mode=ac_mode,
+            mp_policy=mp_policy,
+            param_dtype=param_dtype,
+            compile_model=compile_model,
+            fp8=fp8,
+        )
+
     from kempnerforge.distributed.tensor_parallel import apply_tensor_parallel
 
     tp_enabled = device_mesh is not None and "tp" in device_mesh.mesh_dim_names  # type: ignore[reportOperatorIssue]

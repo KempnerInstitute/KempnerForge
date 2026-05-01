@@ -20,6 +20,7 @@ from kempnerforge.config.schema import (
     SchedulerConfig,
     SchedulerType,
     TrainConfig,
+    VLMConfig,
 )
 
 # ---------------------------------------------------------------------------
@@ -363,6 +364,55 @@ class TestJobConfig:
         )
         config.validate(world_size=2)  # Should not raise — dense + PP is fine
 
+    def test_validate_vlm_seq_len_too_short(self):
+        config = JobConfig(
+            model=ModelConfig(
+                max_seq_len=1024,
+                vlm=VLMConfig(vision_encoder="random", num_tokens=64, max_text_len=512),
+            ),
+            train=TrainConfig(seq_len=100),
+        )
+        with pytest.raises(ValueError, match="train.seq_len.*insufficient for VLM"):
+            config.validate(world_size=1)
+
+    def test_validate_vlm_pp_rejected(self):
+        config = JobConfig(
+            model=ModelConfig(
+                max_seq_len=1024,
+                vlm=VLMConfig(vision_encoder="random", num_tokens=64, max_text_len=512),
+            ),
+            train=TrainConfig(seq_len=600),
+            distributed=DistributedConfig(pp=2, dp_shard=1),
+        )
+        with pytest.raises(ValueError, match="VLM.*Pipeline Parallelism"):
+            config.validate(world_size=2)
+
+    def test_validate_vlm_num_tokens_zero_defers(self):
+        config = JobConfig(
+            model=ModelConfig(
+                max_seq_len=1024,
+                vlm=VLMConfig(vision_encoder="random", num_tokens=0, max_text_len=512),
+            ),
+            train=TrainConfig(seq_len=64),
+        )
+        config.validate(world_size=1)  # Should not raise — check deferred
+
+    def test_validate_vlm_plus_moe_supported(self):
+        """VLM + MoE is supported: cross-check passes. Live-tested on
+        CA + MoE under 2-GPU FSDP2 (CE 10.4 -> 4.5 over 8 steps). MoE
+        lives in TransformerBlocks; CrossAttentionBlocks remain dense.
+        """
+        config = JobConfig(
+            model=ModelConfig(
+                max_seq_len=1024,
+                vlm=VLMConfig(vision_encoder="random", num_tokens=64, max_text_len=512),
+                num_experts=4,
+                moe_top_k=2,
+            ),
+            train=TrainConfig(seq_len=600),
+        )
+        config.validate(world_size=1)  # Should not raise.
+
 
 # ---------------------------------------------------------------------------
 # TOML Loading
@@ -405,6 +455,29 @@ class TestTomlLoading:
         bad_toml.write_text("[model]\ndimm = 512\n")
         with pytest.raises(ValueError, match="Unknown config keys.*dimm"):
             load_config(str(bad_toml), cli_args=[])
+
+    def test_load_vlm_debug_toml(self):
+        """Regression: nested Optional[VLMConfig] in ModelConfig loads
+        correctly from [model.vlm] table, and list[FreezeSpec] inside
+        VLMConfig instantiates each freeze entry via __post_init__."""
+        config = load_config("configs/train/vlm_debug.toml", cli_args=[])
+        assert config.model.is_vlm is True
+        assert config.model.vlm is not None
+        assert config.model.vlm.vision_encoder == "random"
+        assert config.model.vlm.num_tokens == 64
+        assert len(config.model.vlm.freeze) == 1
+        assert config.model.vlm.freeze[0].module == "vision_encoder"
+        assert config.model.vlm.freeze[0].frozen is True
+        config.validate(world_size=1)
+
+    def test_load_vlm_7b_siglip2_toml(self):
+        config = load_config("configs/train/vlm_7b_siglip2.toml", cli_args=[])
+        assert config.model.is_vlm is True
+        assert config.model.vlm is not None
+        assert config.model.vlm.vision_encoder == "siglip2"
+        assert config.model.vlm.num_tokens == 196
+        # 196 image + 2048 text = 2244 <= max_seq_len=2304
+        config.validate(world_size=4)
 
 
 # ---------------------------------------------------------------------------

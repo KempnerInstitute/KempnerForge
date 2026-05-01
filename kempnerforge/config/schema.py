@@ -11,3 +11,9 @@ from kempnerforge.config.optimizer import OptimizerConfig  # noqa: F401
 from kempnerforge.config.profiling import ProfilingConfig  # noqa: F401
 from kempnerforge.config.scheduler import SchedulerConfig, SchedulerType  # noqa: F401
 from kempnerforge.config.training import ActivationCheckpointing, TrainConfig  # noqa: F401
+from kempnerforge.config.vlm import (  # noqa: F401
+    DEFAULT_MODULE_PATTERNS,
+    FreezeSpec,
+    FreezeStage,
+    VLMConfig,
+)
