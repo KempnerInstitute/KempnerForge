@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from kempnerforge.training.eval import run_eval
+from kempnerforge.training.eval import run_eval, should_build_eval_dataloader
 
 VOCAB_SIZE = 64
 DIM = 32
@@ -120,3 +120,26 @@ class TestRunEval:
         run_eval(model, dl, _loss_fn, torch.device("cpu"), eval_steps=2)
         for param in model.parameters():
             assert param.grad is None
+
+
+class TestShouldBuildEvalDataloader:
+    """Gating logic for `eval.enabled` across text-only vs VLM configs.
+
+    VLM configs must not build an eval dataloader on this branch because
+    ``run_eval`` calls ``model(input_ids)`` which does not match
+    ``VLMWrapper.forward(pixel_values, input_ids, labels)``.
+    """
+
+    def test_text_only_enabled_builds(self):
+        assert should_build_eval_dataloader(True, False) == (True, False)
+
+    def test_text_only_disabled_skips(self):
+        assert should_build_eval_dataloader(False, False) == (False, False)
+
+    def test_vlm_enabled_warns_and_skips(self):
+        """is_vlm=True + eval.enabled=True → skip eval, flag the warning."""
+        assert should_build_eval_dataloader(True, True) == (False, True)
+
+    def test_vlm_disabled_silent(self):
+        """is_vlm=True + eval.enabled=False → silent no-op."""
+        assert should_build_eval_dataloader(False, True) == (False, False)

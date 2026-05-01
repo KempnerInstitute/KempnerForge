@@ -32,6 +32,37 @@ _TRAIN_STATE_FILE = "train_state.pt"
 _METADATA_FILE = "metadata.json"
 
 
+def _intersect_freeze_meta_by_module(
+    saved: list[dict[str, Any]],
+    expected: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Filter both freeze-metadata lists to the intersection of module keys.
+
+    Used at checkpoint load time to make cross-arch resumes work cleanly:
+    a Joint-Decoder checkpoint's ``vlm_freeze`` has only
+    ``vision_encoder``; a Cross-Attention config's expected metadata has
+    ``vision_encoder`` + ``cross_attention`` (auto-default in
+    ``CrossAttentionConfig.module_patterns``). Loading JD into CA: the
+    ``cross_attention`` entry is in ``expected`` but not in ``saved``,
+    so it gets dropped from ``expected``; the remaining
+    ``vision_encoder`` entries compare cleanly.
+
+    Real semantic mismatches on shared keys are preserved. If both
+    sides have ``vision_encoder`` but with different ``frozen`` values,
+    the filtered lists differ and the caller raises.
+
+    The lists are already canonicalized (sorted, deduped) by
+    ``canonical_freeze_meta``, so the filter preserves canonical order.
+    """
+    saved_keys = {e["module"] for e in saved}
+    expected_keys = {e["module"] for e in expected}
+    shared = saved_keys & expected_keys
+    return (
+        [e for e in saved if e["module"] in shared],
+        [e for e in expected if e["module"] in shared],
+    )
+
+
 def _load_train_state(path: Path) -> dict[str, Any]:
     """Load ``train_state.pt`` under an explicit trust boundary.
 
@@ -159,7 +190,12 @@ class CheckpointManager:
             torch.save(train_state, ckpt_dir / _TRAIN_STATE_FILE)
 
             # Write human-readable metadata
-            meta = {"step": step, "tokens_seen": tokens_seen}
+            meta: dict[str, Any] = {"step": step, "tokens_seen": tokens_seen}
+            if extra is not None and "vlm_freeze" in extra:
+                # Already canonicalized by canonical_freeze_meta(...); stored as
+                # a sorted, deduplicated list of {"module", "frozen"} dicts so
+                # the comparison on load is reorder-invariant.
+                meta["vlm_freeze"] = extra["vlm_freeze"]
             (ckpt_dir / _METADATA_FILE).write_text(json.dumps(meta, indent=2))
 
             # Update "latest" symlink
@@ -185,12 +221,46 @@ class CheckpointManager:
         """Block until any pending async checkpoint save completes."""
         self._async_ckpt.wait()
 
+    def flush_pending_save(self) -> None:
+        """Drain any in-flight async save before mutating model state.
+
+        Called from the FreezeStage transition hook in the training
+        loop: when a transition fires at step S, any save started at
+        step S-1 must have written ``metadata.json`` with the
+        pre-transition spec before the transition flips
+        ``requires_grad``. Otherwise ``metadata.json`` lands with the
+        post-transition spec attached to the pre-transition shards.
+        """
+        self._async_ckpt.wait()
+
+    def peek_saved_step(self, path: str | None = None) -> int | None:
+        """Read ``step`` from a candidate checkpoint's metadata.json.
+
+        Returns ``None`` if no checkpoint resolves or the metadata is
+        missing/unreadable. Used by the training loop on resume to
+        compute the expected freeze list (which depends on
+        ``saved_step``) before calling ``load``.
+        """
+        ckpt_dir = self._resolve_load_path(path)
+        if ckpt_dir is None:
+            return None
+        metadata_path = ckpt_dir / _METADATA_FILE
+        if not metadata_path.exists():
+            return None
+        try:
+            saved_meta = json.loads(metadata_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return None
+        step = saved_meta.get("step")
+        return int(step) if step is not None else None
+
     def load(
         self,
         path: str | None = None,
         scheduler: Any | None = None,
         dataloader: Any | None = None,
         exclude_keys: list[str] | None = None,
+        vlm_freeze_expected: list[dict[str, Any]] | None = None,
     ) -> tuple[int, int, dict[str, Any]]:
         """Load a checkpoint and restore all state.
 
@@ -200,6 +270,12 @@ class CheckpointManager:
             scheduler: LR scheduler to restore.
             dataloader: Stateful dataloader to restore.
             exclude_keys: DCP state keys to skip (e.g., ["optimizer"] for fine-tuning).
+            vlm_freeze_expected: Canonical freeze metadata (output of
+                ``canonical_freeze_meta``) for the current run's VLMConfig.
+                When both the saved metadata and this argument are set,
+                a mismatch raises ``ValueError`` unless the checkpoint
+                config has ``ignore_freeze_mismatch=True``, in which case
+                the load proceeds with a warning.
 
         Returns:
             Tuple of (step, tokens_seen, extra) where extra contains any
@@ -211,6 +287,61 @@ class CheckpointManager:
             return 0, 0, {}
 
         logger.info(f"Loading checkpoint: {ckpt_dir}")
+
+        # Check VLM freeze metadata BEFORE loading DCP shards so a mismatch
+        # surfaces without leaving partial state in the live model.
+        #
+        # Cross-arch load rule: filter both saved and expected to the
+        # intersection of module keys. A JD checkpoint's vlm_freeze has
+        # only ``vision_encoder``; a Cross-Attention config's expected
+        # has ``vision_encoder`` + ``cross_attention`` (auto-default).
+        # Loading JD into CA: ``cross_attention`` is in expected but not
+        # saved -> drop from expected; remaining ``vision_encoder``
+        # entries compare cleanly. Real semantic mismatches on shared
+        # keys (e.g., saved ``vision_encoder=True`` vs expected
+        # ``vision_encoder=False``) still raise.
+        if vlm_freeze_expected is not None:
+            metadata_path = ckpt_dir / _METADATA_FILE
+            if metadata_path.exists():
+                try:
+                    saved_meta = json.loads(metadata_path.read_text())
+                except (OSError, json.JSONDecodeError) as e:
+                    logger.warning(f"Could not read {metadata_path}: {e}")
+                    saved_meta = {}
+                saved_vlm_freeze = saved_meta.get("vlm_freeze")
+                if saved_vlm_freeze is not None:
+                    saved_filt, expected_filt = _intersect_freeze_meta_by_module(
+                        saved_vlm_freeze, vlm_freeze_expected
+                    )
+                    if saved_filt != expected_filt:
+                        dropped_from_saved = sorted(
+                            {e["module"] for e in saved_vlm_freeze}
+                            - {e["module"] for e in saved_filt}
+                        )
+                        dropped_from_expected = sorted(
+                            {e["module"] for e in vlm_freeze_expected}
+                            - {e["module"] for e in expected_filt}
+                        )
+                        cross_arch_note = ""
+                        if dropped_from_saved or dropped_from_expected:
+                            cross_arch_note = (
+                                f" (cross-arch keys ignored: "
+                                f"saved-only={dropped_from_saved}, "
+                                f"current-only={dropped_from_expected})"
+                            )
+                        msg = (
+                            f"VLM freeze mismatch at {ckpt_dir}: "
+                            f"saved={saved_filt}, current={expected_filt}"
+                            f"{cross_arch_note}"
+                        )
+                        if getattr(self.config, "ignore_freeze_mismatch", False):
+                            logger.warning(
+                                msg + " — proceeding because checkpoint.ignore_freeze_mismatch=True"
+                            )
+                        else:
+                            raise ValueError(
+                                msg + " (set checkpoint.ignore_freeze_mismatch=true to override)"
+                            )
 
         # Load distributed state via DCP
         dcp_dir = ckpt_dir / f"pp{self._pp_rank}" if self._pp_rank is not None else ckpt_dir
@@ -243,10 +374,6 @@ class CheckpointManager:
             train_state_exists = train_state_path.exists()
 
         if train_state_exists:
-            # Rank-0-authoritative: only rank 0 reads the file. The
-            # ownership check inside ``_load_train_state`` runs there and
-            # the resulting state is broadcast to all ranks below. Other
-            # ranks pass ``None`` into the broadcast.
             train_state = (
                 _load_train_state(train_state_path)
                 if self._rank == 0 or not dist.is_initialized()

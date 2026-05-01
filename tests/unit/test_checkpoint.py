@@ -261,7 +261,7 @@ class TestAsyncCheckpointer:
 # ---------------------------------------------------------------------------
 
 
-def _make_mock_mgr(tmp_path, monkeypatch):
+def _make_mock_mgr(tmp_path, monkeypatch, *, ignore_freeze_mismatch=False):
     """Build a CheckpointManager with DCP calls mocked out (no distributed)."""
     from unittest.mock import MagicMock
 
@@ -269,7 +269,9 @@ def _make_mock_mgr(tmp_path, monkeypatch):
 
     model = torch.nn.Linear(4, 4)
     opt = torch.optim.SGD(model.parameters(), lr=0.1)
-    config = CheckpointConfig(dir=str(tmp_path), keep_last_n=5)
+    config = CheckpointConfig(
+        dir=str(tmp_path), keep_last_n=5, ignore_freeze_mismatch=ignore_freeze_mismatch
+    )
     mgr = CheckpointManager(config, model, opt)
     monkeypatch.setattr(mgr._async_ckpt, "save", MagicMock())
     monkeypatch.setattr("kempnerforge.checkpoint.manager.dcp.load", MagicMock())
@@ -425,3 +427,291 @@ class TestDataloaderStatePersistence:
         mgr2.apply_dataloader_state(restorer)
         assert captured["restored"] == {"epoch": 7, "batches_yielded": 333}
         assert mgr2._pending_dataloader_state is None
+
+
+# ---------------------------------------------------------------------------
+# VLM freeze metadata: save side, load side, and the cross-arch intersection.
+# Mirrors tests/integration/test_vlm_checkpoint.py but runs without CUDA so
+# the unit-tests-only CI coverage job exercises this code path.
+# ---------------------------------------------------------------------------
+
+
+def _freeze_meta(*pairs):
+    from kempnerforge.config.vlm import FreezeSpec
+    from kempnerforge.training.freeze import canonical_freeze_meta
+
+    return canonical_freeze_meta([FreezeSpec(m, f) for (m, f) in pairs])
+
+
+class TestIntersectFreezeMetaByModule:
+    def test_disjoint_keys_filter_to_empty(self):
+        from kempnerforge.checkpoint.manager import _intersect_freeze_meta_by_module
+
+        saved = [{"module": "a", "frozen": True}]
+        expected = [{"module": "b", "frozen": False}]
+        s, e = _intersect_freeze_meta_by_module(saved, expected)
+        assert s == [] and e == []
+
+    def test_shared_key_passes_through(self):
+        from kempnerforge.checkpoint.manager import _intersect_freeze_meta_by_module
+
+        saved = [{"module": "vision_encoder", "frozen": True}]
+        expected = [{"module": "vision_encoder", "frozen": True}]
+        s, e = _intersect_freeze_meta_by_module(saved, expected)
+        assert s == saved and e == expected
+
+    def test_drops_one_sided_keys(self):
+        from kempnerforge.checkpoint.manager import _intersect_freeze_meta_by_module
+
+        saved = [
+            {"module": "vision_encoder", "frozen": True},
+            {"module": "future_arch", "frozen": False},
+        ]
+        expected = [
+            {"module": "vision_encoder", "frozen": True},
+            {"module": "another_arch", "frozen": True},
+        ]
+        s, e = _intersect_freeze_meta_by_module(saved, expected)
+        assert s == [{"module": "vision_encoder", "frozen": True}]
+        assert e == [{"module": "vision_encoder", "frozen": True}]
+
+    def test_preserves_canonical_order(self):
+        from kempnerforge.checkpoint.manager import _intersect_freeze_meta_by_module
+
+        saved = [
+            {"module": "a", "frozen": True},
+            {"module": "c", "frozen": False},
+        ]
+        expected = [
+            {"module": "a", "frozen": True},
+            {"module": "c", "frozen": False},
+        ]
+        s, e = _intersect_freeze_meta_by_module(saved, expected)
+        # Order from input is preserved (it was canonical going in).
+        assert [m["module"] for m in s] == ["a", "c"]
+        assert [m["module"] for m in e] == ["a", "c"]
+
+
+class TestPeekSavedStep:
+    def test_returns_none_when_no_checkpoint(self, tmp_path, monkeypatch):
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        assert mgr.peek_saved_step() is None
+
+    def test_returns_step_from_metadata(self, tmp_path, monkeypatch):
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        mgr.save(step=42, tokens_seen=128)
+        assert mgr.peek_saved_step(path=str(tmp_path / "step_42")) == 42
+
+    def test_returns_none_when_metadata_missing(self, tmp_path, monkeypatch):
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        ckpt_dir = tmp_path / "step_3"
+        ckpt_dir.mkdir()
+        # No metadata.json in this dir.
+        assert mgr.peek_saved_step(path=str(ckpt_dir)) is None
+
+    def test_returns_none_when_metadata_unreadable(self, tmp_path, monkeypatch):
+        import json
+
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        ckpt_dir = tmp_path / "step_3"
+        ckpt_dir.mkdir()
+        # Write malformed JSON; peek should swallow the decode error.
+        (ckpt_dir / "metadata.json").write_text("{ not valid json")
+        assert mgr.peek_saved_step(path=str(ckpt_dir)) is None
+
+        # Sanity: a valid metadata works.
+        (ckpt_dir / "metadata.json").write_text(json.dumps({"step": 7}))
+        assert mgr.peek_saved_step(path=str(ckpt_dir)) == 7
+
+    def test_returns_none_when_step_field_absent(self, tmp_path, monkeypatch):
+        import json
+
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        ckpt_dir = tmp_path / "step_3"
+        ckpt_dir.mkdir()
+        (ckpt_dir / "metadata.json").write_text(json.dumps({"tokens_seen": 1024}))
+        assert mgr.peek_saved_step(path=str(ckpt_dir)) is None
+
+
+class TestFlushPendingSave:
+    def test_delegates_to_async_wait(self, tmp_path, monkeypatch):
+        from unittest.mock import MagicMock
+
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        wait_mock = MagicMock()
+        monkeypatch.setattr(mgr._async_ckpt, "wait", wait_mock)
+        mgr.flush_pending_save()
+        wait_mock.assert_called_once()
+
+
+class TestSaveVLMFreezeMetadata:
+    def test_save_writes_vlm_freeze_to_metadata(self, tmp_path, monkeypatch):
+        import json
+
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        freeze = _freeze_meta(("vision_encoder", True), ("adapter", False))
+        mgr.save(step=1, extra={"vlm_freeze": freeze})
+        meta = json.loads((tmp_path / "step_1" / "metadata.json").read_text())
+        assert meta["vlm_freeze"] == freeze
+        assert meta["step"] == 1
+
+    def test_save_omits_vlm_freeze_when_extra_absent(self, tmp_path, monkeypatch):
+        import json
+
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        mgr.save(step=1)  # no extra
+        meta = json.loads((tmp_path / "step_1" / "metadata.json").read_text())
+        assert "vlm_freeze" not in meta
+
+    def test_save_omits_vlm_freeze_when_extra_lacks_key(self, tmp_path, monkeypatch):
+        import json
+
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        mgr.save(step=1, extra={"other": "thing"})
+        meta = json.loads((tmp_path / "step_1" / "metadata.json").read_text())
+        assert "vlm_freeze" not in meta
+
+
+class TestLoadVLMFreezeCompare:
+    def test_match_passes(self, tmp_path, monkeypatch):
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        freeze = _freeze_meta(("vision_encoder", True))
+        mgr.save(step=1, extra={"vlm_freeze": freeze})
+
+        mgr2 = _make_mock_mgr(tmp_path, monkeypatch)
+        step, _, _ = mgr2.load(path=str(tmp_path / "step_1"), vlm_freeze_expected=freeze)
+        assert step == 1
+
+    def test_semantic_mismatch_raises(self, tmp_path, monkeypatch):
+        import pytest
+
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        mgr.save(step=1, extra={"vlm_freeze": _freeze_meta(("vision_encoder", True))})
+
+        mgr2 = _make_mock_mgr(tmp_path, monkeypatch)
+        with pytest.raises(ValueError, match="VLM freeze mismatch"):
+            mgr2.load(
+                path=str(tmp_path / "step_1"),
+                vlm_freeze_expected=_freeze_meta(("vision_encoder", False)),
+            )
+
+    def test_ignore_flag_demotes_to_warning(self, tmp_path, monkeypatch):
+        """``ignore_freeze_mismatch=True`` swaps the raise for a warning log.
+        The logger lives under ``kempnerforge.*`` whose root has
+        ``propagate=False``, so we attach a capturing handler directly
+        instead of relying on caplog's propagation path."""
+        import logging
+
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        mgr.save(step=1, extra={"vlm_freeze": _freeze_meta(("vision_encoder", True))})
+
+        records: list[logging.LogRecord] = []
+
+        class _CaptureHandler(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                records.append(record)
+
+        target = logging.getLogger("kempnerforge.checkpoint.manager")
+        capture = _CaptureHandler(level=logging.WARNING)
+        target.addHandler(capture)
+        try:
+            mgr2 = _make_mock_mgr(tmp_path, monkeypatch, ignore_freeze_mismatch=True)
+            step, _, _ = mgr2.load(
+                path=str(tmp_path / "step_1"),
+                vlm_freeze_expected=_freeze_meta(("vision_encoder", False)),
+            )
+        finally:
+            target.removeHandler(capture)
+        assert step == 1
+        assert any("VLM freeze mismatch" in rec.getMessage() for rec in records)
+
+    def test_no_expected_skips_compare(self, tmp_path, monkeypatch):
+        """Text-only runs pass ``vlm_freeze_expected=None``; saved metadata
+        stays on disk but no compare runs."""
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        mgr.save(step=1, extra={"vlm_freeze": _freeze_meta(("vision_encoder", True))})
+        mgr2 = _make_mock_mgr(tmp_path, monkeypatch)
+        step, _, _ = mgr2.load(path=str(tmp_path / "step_1"))
+        assert step == 1
+
+    def test_no_saved_skips_compare(self, tmp_path, monkeypatch):
+        """Older / non-VLM checkpoints have no ``vlm_freeze`` in metadata; a
+        VLM run loads them without raising."""
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        mgr.save(step=1)  # no extra
+        mgr2 = _make_mock_mgr(tmp_path, monkeypatch)
+        step, _, _ = mgr2.load(
+            path=str(tmp_path / "step_1"),
+            vlm_freeze_expected=_freeze_meta(("vision_encoder", True)),
+        )
+        assert step == 1
+
+    def test_corrupt_metadata_logs_warning(self, tmp_path, monkeypatch):
+        """Bad metadata.json is logged and treated as no-vlm-freeze; the
+        load proceeds rather than crashing. Uses a direct handler attach
+        because the kempnerforge logger sets ``propagate=False`` once any
+        other test imports its log helpers."""
+        import logging
+
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        ckpt_dir = tmp_path / "step_1"
+        ckpt_dir.mkdir()
+        (ckpt_dir / "metadata.json").write_text("not-json")
+        torch.save(
+            {"step": 1, "tokens_seen": 0, "rng": get_rng_state()},
+            ckpt_dir / "train_state.pt",
+        )
+
+        records: list[logging.LogRecord] = []
+
+        class _CaptureHandler(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                records.append(record)
+
+        target = logging.getLogger("kempnerforge.checkpoint.manager")
+        capture = _CaptureHandler(level=logging.WARNING)
+        target.addHandler(capture)
+        try:
+            step, _, _ = mgr.load(
+                path=str(ckpt_dir),
+                vlm_freeze_expected=_freeze_meta(("vision_encoder", True)),
+            )
+        finally:
+            target.removeHandler(capture)
+        assert step == 1
+        assert any("Could not read" in rec.getMessage() for rec in records)
+
+    def test_cross_arch_extra_expected_key_drops_out(self, tmp_path, monkeypatch):
+        """Saved {vision_encoder=True}; expected adds a future-arch key.
+        The intersection rule drops the unmatched expected entry."""
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        mgr.save(step=1, extra={"vlm_freeze": _freeze_meta(("vision_encoder", True))})
+
+        mgr2 = _make_mock_mgr(tmp_path, monkeypatch)
+        expected = _freeze_meta(("future_arch", False), ("vision_encoder", True))
+        step, _, _ = mgr2.load(path=str(tmp_path / "step_1"), vlm_freeze_expected=expected)
+        assert step == 1
+
+    def test_cross_arch_extra_saved_key_drops_out(self, tmp_path, monkeypatch):
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        saved = _freeze_meta(("future_arch", False), ("vision_encoder", True))
+        mgr.save(step=1, extra={"vlm_freeze": saved})
+
+        mgr2 = _make_mock_mgr(tmp_path, monkeypatch)
+        expected = _freeze_meta(("vision_encoder", True))
+        step, _, _ = mgr2.load(path=str(tmp_path / "step_1"), vlm_freeze_expected=expected)
+        assert step == 1
+
+    def test_cross_arch_error_message_lists_dropped(self, tmp_path, monkeypatch):
+        import pytest
+
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        saved = _freeze_meta(("future_arch", False), ("vision_encoder", True))
+        mgr.save(step=1, extra={"vlm_freeze": saved})
+
+        mgr2 = _make_mock_mgr(tmp_path, monkeypatch)
+        mismatched = _freeze_meta(("vision_encoder", False))
+        with pytest.raises(ValueError) as exc_info:
+            mgr2.load(path=str(tmp_path / "step_1"), vlm_freeze_expected=mismatched)
+        assert "cross-arch" in str(exc_info.value)
+        assert "future_arch" in str(exc_info.value)

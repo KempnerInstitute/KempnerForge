@@ -1,0 +1,102 @@
+# 7B VLM Cross-Attention with a multi-stage freeze schedule + async
+# DCP checkpointing.
+#
+# Exercises the FreezeStage hook in scripts/train.py:
+#   - step 0..9: vision encoder frozen, everything else trainable.
+#   - step 10: freeze adapter (typical "pretrain CA blocks first" recipe).
+#   - step 20: unfreeze adapter (typical "now align embeddings" recipe).
+#
+# checkpoint.interval matches one transition step (10) to exercise
+# the async-save fence: the FreezeStage hook in scripts/train.py
+# calls flush_pending_save() before applying the transition, so the
+# in-flight save's metadata.json lands with the pre-transition spec
+# (adapter trainable) and only the next save records the post-
+# transition spec (adapter frozen).
+#
+# Usage:
+#   uv run torchrun --nproc_per_node=4 scripts/train.py \
+#       configs/train/vlm_7b_freeze_schedule.toml
+#
+# Defaults point at the public COCO Karpathy split on HF Hub. Override
+# the dataset and tokenizer via CLI for other corpora:
+#   --data.hf_dataset_name=<dataset> --data.tokenizer_path=<tokenizer>
+
+[model]
+dim = 4096
+n_layers = 32
+n_heads = 32
+n_kv_heads = 8
+vocab_size = 50257
+ffn_dim_multiplier = 1.3
+norm_type = "rmsnorm"
+activation = "silu"
+max_seq_len = 1024
+rope_theta = 500000.0
+tie_embeddings = false
+
+[model.vlm]
+arch = "cross_attention"
+vision_encoder = "random"
+feature_dim = 1024
+num_tokens = 256
+adapter_hidden_dim = 0
+adapter_activation = "gelu"
+max_text_len = 512
+cross_attention_every_n_layers = 4
+cross_attention_n_heads = 0
+cross_attention_n_kv_heads = 0
+freeze = [{module = "vision_encoder", frozen = true}]
+freeze_schedule = [
+    {start_step = 10, specs = [{module = "adapter", frozen = true}]},
+    {start_step = 20, specs = [{module = "adapter", frozen = false}]},
+]
+
+[train]
+batch_size = 16
+seq_len = 512
+max_steps = 30
+grad_accum_steps = 1
+grad_clip_norm = 1.0
+seed = 42
+compile_model = false
+activation_checkpointing = "none"
+loss_fn = "cross_entropy"
+
+[optimizer]
+name = "adamw"
+lr = 1e-4
+weight_decay = 0.1
+betas = [0.9, 0.95]
+eps = 1e-8
+fused = true
+
+[scheduler]
+name = "cosine"
+warmup_steps = 3
+min_lr_ratio = 0.1
+
+[data]
+hf_dataset_name = "nlphuji/coco_karpathy"
+hf_dataset_split = "train"
+hf_dataset_image_field = "image"
+hf_dataset_text_field = "caption"
+hf_image_size = 224
+tokenizer_path = "gpt2"
+num_workers = 2
+pin_memory = true
+prefetch_factor = 2
+
+[distributed]
+dp_shard = -1
+nccl_timeout_sec = 600
+
+[checkpoint]
+dir = "checkpoints/vlm_7b_freeze_schedule"
+interval = 10                              # save at step 10 == FreezeStage start_step
+async_mode = "async_with_pinned_mem"        # exercise the freeze-transition fence
+keep_last_n = 3
+
+[metrics]
+log_interval = 1
+enable_wandb = false
+enable_tensorboard = false

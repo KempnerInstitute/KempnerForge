@@ -61,6 +61,9 @@ class DataConfig:
     hf_dataset_config: str | None = None  # Dataset config name (e.g., "wikitext-2-raw-v1")
     hf_dataset_split: str = "train"
     hf_dataset_text_field: str = "text"
+    hf_dataset_image_field: str = "image"  # VLM only: image column name
+    hf_dataset_prompt_field: str = ""  # VLM only: prompt column name (empty = no prompt mask)
+    hf_image_size: int = 224  # VLM only: target square image size
     hf_streaming: bool = False  # Use streaming (IterableDataset) for large HF datasets
     pack_sequences: bool = False  # Document-aware packing with cross-doc isolation
     # Multi-dataset mixing (overrides dataset_path/hf_dataset_name when non-empty)

@@ -6,6 +6,8 @@ import math
 from dataclasses import dataclass
 from enum import StrEnum
 
+from kempnerforge.config.vlm import VLMConfig
+
 
 class NormType(StrEnum):
     rmsnorm = "rmsnorm"
@@ -55,6 +57,9 @@ class ModelConfig:
     moe_bias_schedule: str = "constant"  # "constant", "cosine_decay", "linear_warmup"
     moe_packed_experts: bool = False  # Pack expert weights into one tensor per projection
 
+    # VLM (Joint-Decoder, etc.). Default None = pure text LLM, zero behavior change.
+    vlm: VLMConfig | None = None
+
     def __post_init__(self) -> None:
         if self.n_kv_heads is None:
             self.n_kv_heads = self.n_heads
@@ -100,10 +105,31 @@ class ModelConfig:
                     "Options: 'constant', 'cosine_decay', 'linear_warmup'"
                 )
 
+        # VLM max_seq_len cross-check (only when num_tokens is known at config time;
+        # with num_tokens=0 the encoder resolves it at build time, and the check is
+        # re-run in build_vlm_wrapper). Effective residual-stream length is
+        # residual_stream_image_tokens() + max_text_len; for Cross-Attention this is
+        # max_text_len (residual stream is text-only), for Joint-Decoder it is
+        # num_tokens + max_text_len.
+        if self.vlm is not None and self.vlm.num_tokens > 0:
+            residual_image_tokens = self.vlm.residual_stream_image_tokens()
+            required = residual_image_tokens + self.vlm.max_text_len
+            if self.max_seq_len < required:
+                raise ValueError(
+                    f"max_seq_len ({self.max_seq_len}) insufficient for VLM: "
+                    f"residual_image_tokens ({residual_image_tokens}) + "
+                    f"vlm.max_text_len ({self.vlm.max_text_len}) = {required}"
+                )
+
     @property
     def is_moe(self) -> bool:
         """Whether this config uses Mixture-of-Experts."""
         return self.num_experts > 0
+
+    @property
+    def is_vlm(self) -> bool:
+        """Whether this config enables a VLM wrapper around the Transformer."""
+        return self.vlm is not None
 
     @property
     def head_dim(self) -> int:

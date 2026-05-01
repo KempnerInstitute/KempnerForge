@@ -20,6 +20,7 @@ from kempnerforge.model.attention import Attention, KVCache
 from kempnerforge.model.embedding import OutputHead, TokenEmbedding
 from kempnerforge.model.init import init_weights
 from kempnerforge.model.mlp import build_mlp
+from kempnerforge.model.modality import ModalityContext
 from kempnerforge.model.moe import MoEMLP, build_moe
 from kempnerforge.model.norm import build_norm
 from kempnerforge.model.position import precompute_rope_frequencies
@@ -173,29 +174,75 @@ class Transformer(nn.Module):
 
     def forward(
         self,
-        tokens: torch.Tensor,
+        tokens: torch.Tensor | None = None,
         *,
+        modality: ModalityContext | None = None,
         kv_caches: list[KVCache] | None = None,
         doc_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Forward pass.
 
+        Exactly one of ``tokens`` or ``modality.inputs_embeds`` must be
+        provided. Modality-injection routes (``prefix_embeds``,
+        ``output_slice``) are grouped on the optional ``ModalityContext``
+        arg; see ``kempnerforge/model/modality.py`` for the full
+        intra-context invariant table.
+
         Args:
-            tokens: Integer tensor of shape (batch, seq_len).
-            kv_caches: Optional list of KVCache (one per layer) for generation.
-                When provided, RoPE positions are offset by the current cache
-                fill level so incremental decode tokens get correct positions.
+            tokens: Integer token ids, shape ``(batch, seq_len)``.
+            modality: Optional ``ModalityContext`` bundling pre-embedded
+                inputs, prefix embeds, and output slicing for VLM arches.
+                ``None`` is the pure text-only forward.
+            kv_caches: Optional list of KVCache (one per layer) for
+                generation. When provided, RoPE positions are offset by
+                the current cache fill level. Cross-arg invariant:
+                ``kv_caches`` forbids ``modality.prefix_embeds`` and
+                ``modality.output_slice`` (both training-only).
             doc_ids: Optional per-token document IDs for packed sequences,
-                shape (batch, seq_len). Enables block-diagonal causal attention
-                that isolates documents within packed sequences.
+                shape ``(batch, seq_len)``. Enables block-diagonal causal
+                attention that isolates documents within packed sequences.
 
         Returns:
-            Logits tensor of shape (batch, seq_len, vocab_size).
+            Logits tensor of shape ``(batch, out_seq_len, vocab_size)``
+            where ``out_seq_len == seq_len`` normally or the sliced
+            length when ``modality.output_slice`` is set.
         """
-        seq_len = tokens.shape[1]
+        inputs_embeds = modality.inputs_embeds if modality is not None else None
+        prefix_embeds = modality.prefix_embeds if modality is not None else None
+        output_slice = modality.output_slice if modality is not None else None
 
-        # Embed tokens (PP middle stages receive hidden states directly)
-        h = self.token_embedding(tokens) if self.token_embedding is not None else tokens
+        if (tokens is None) == (inputs_embeds is None):
+            raise ValueError(
+                "Transformer.forward requires exactly one of tokens or modality.inputs_embeds"
+            )
+        if kv_caches is not None:
+            if output_slice is not None:
+                raise ValueError(
+                    "modality.output_slice is training-only; cannot be combined with kv_caches"
+                )
+            if prefix_embeds is not None:
+                # If we ever allowed both, the RoPE slice below would start at
+                # start_pos (the cache's text fill level) but seq_len would
+                # include the prefix — positions would double-count the prefix
+                # at every decode step. Training-only.
+                raise ValueError(
+                    "modality.prefix_embeds is training-only; cannot be combined with kv_caches"
+                )
+
+        h = (
+            self.token_embedding(tokens)  # type: ignore[reportOptionalCall]
+            if tokens is not None
+            else inputs_embeds
+        )
+        assert h is not None  # narrowed by the XOR check above
+
+        if prefix_embeds is not None:
+            # Cast to the text-embedding dtype so the concat does not promote.
+            if prefix_embeds.dtype != h.dtype:
+                prefix_embeds = prefix_embeds.to(h.dtype)
+            h = torch.cat([prefix_embeds, h], dim=1)
+
+        seq_len = h.shape[1]
 
         # Determine position offset from KV cache fill level
         start_pos = kv_caches[0].seq_len if kv_caches is not None else 0
@@ -214,6 +261,10 @@ class Transformer(nn.Module):
 
         # Final norm
         h = self.norm(h)
+
+        # Optional slice before the output head (training-only kwarg)
+        if output_slice is not None:
+            h = h[:, output_slice, :]
 
         # Output projection
         if self.output_head is not None:

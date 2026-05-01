@@ -95,3 +95,39 @@ class JobConfig:
                     f"num_experts ({self.model.num_experts}) must be divisible by "
                     f"ep ({self.distributed.ep})"
                 )
+
+        if self.model.is_vlm:
+            vlm = self.model.vlm
+            assert vlm is not None  # narrowed by is_vlm
+            # train.seq_len drives the attention sequence length. The
+            # effective residual-stream length is
+            # vlm.residual_stream_image_tokens() + max_text_len:
+            #   - Joint-Decoder: residual_stream_image_tokens == num_tokens
+            #     (image tokens prepended to text).
+            #   - Cross-Attention: residual_stream_image_tokens == 0 (image
+            #     features flow side-channel into CA blocks; residual is
+            #     text-only).
+            # num_tokens=0 is deferred to build_vlm_wrapper.
+            if vlm.num_tokens > 0:
+                residual_image_tokens = vlm.residual_stream_image_tokens()
+                required = residual_image_tokens + vlm.max_text_len
+                if self.train.seq_len < required:
+                    raise ValueError(
+                        f"train.seq_len ({self.train.seq_len}) insufficient for VLM: "
+                        f"residual_image_tokens ({residual_image_tokens}) + "
+                        f"vlm.max_text_len ({vlm.max_text_len}) = {required}"
+                    )
+            if self.distributed.pp > 1:
+                raise ValueError(
+                    "VLM + Pipeline Parallelism is not supported on this branch. "
+                    "The vlm-cross-attention branch will address PP integration."
+                )
+            # VLM + MoE is supported. The FSDP2 wrap helper is EP-MoE aware
+            # for both paths (Fix 5), and scripts/train.py routes set_moe_step
+            # / get_moe_aux_loss through inner_transformer(model) so the VLM
+            # wrapper does not hide the MoE methods. Live-tested on a tiny
+            # CA + MoE config: CE 10.4 -> 4.5 over 8 steps under 2-GPU FSDP2;
+            # aux_loss bounded; tests/integration + tests/distributed cover
+            # the build + forward + backward path. CrossAttentionBlocks
+            # themselves remain dense MLP; MoE lives in the text
+            # TransformerBlocks (where moe_frequency selects).
