@@ -82,31 +82,32 @@ class VLMConfig:
     programmatically; the TOML loader dispatches on ``arch``
     automatically.
 
-    Fields:
-        arch: VLM architecture discriminator. Subclasses set this via
-            field default; direct construction with an arch name not
-            backed by a registered subclass raises.
-        vision_encoder: Registry key (see
-            ``registry.register_vision_encoder``). Required.
-        vision_encoder_path: HF Hub id or local path passed to the
-            encoder builder.
-        feature_dim: Output feature dim of the vision encoder. 0 means
-            infer from the encoder at build time.
-        num_tokens: Number of image tokens produced per image. 0 means
-            infer from the encoder at build time. When > 0 it is
-            cross-checked against ``max_seq_len``.
-        adapter_hidden_dim: Hidden dim of the 2-layer MLP adapter.
-            0 means use the backbone ``dim``.
-        adapter_activation: Activation inside the adapter.
-            One of ``"gelu"``, ``"silu"``, ``"relu"``.
-        max_text_len: Fixed text padding length used by ``VLMCollator``.
-            Enforces rank-consistent batches under FSDP2.
-        freeze: Static freeze specs applied once at build time.
-        freeze_schedule: Step-boundary freeze transitions (reserved;
-            wiring into the training loop lands in a follow-up).
-        module_patterns: Map of module alias (``"transformer"``,
-            ``"vision_encoder"``, ``"adapter"``, plus arch-specific
-            additions) to fnmatch pattern list.
+    Field summary (full per-field docs are picked up from autodoc):
+
+    - ``arch`` — VLM architecture discriminator. Subclasses set this via
+      field default; direct construction with an arch name not backed by
+      a registered subclass raises.
+    - ``vision_encoder`` — registry key
+      (see ``registry.register_vision_encoder``). Required.
+    - ``vision_encoder_path`` — HF Hub id or local path passed to the
+      encoder builder.
+    - ``feature_dim`` — output feature dim of the vision encoder. 0 means
+      infer from the encoder at build time.
+    - ``num_tokens`` — number of image tokens produced per image. 0 means
+      infer from the encoder at build time. When > 0 it is cross-checked
+      against ``max_seq_len``.
+    - ``adapter_hidden_dim`` — hidden dim of the 2-layer MLP adapter.
+      0 means use the backbone ``dim``.
+    - ``adapter_activation`` — activation inside the adapter. One of
+      ``"gelu"``, ``"silu"``, ``"relu"``.
+    - ``max_text_len`` — fixed text padding length used by ``VLMCollator``.
+      Enforces rank-consistent batches under FSDP2.
+    - ``freeze`` — static freeze specs applied once at build time.
+    - ``freeze_schedule`` — step-boundary freeze transitions (reserved;
+      wiring into the training loop lands in a follow-up).
+    - ``module_patterns`` — map of module alias (``"transformer"``,
+      ``"vision_encoder"``, ``"adapter"``, plus arch-specific additions)
+      to fnmatch pattern list.
     """
 
     arch: str = "joint_decoder"
