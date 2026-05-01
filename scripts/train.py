@@ -27,6 +27,7 @@ import torch.distributed as dist
 
 from kempnerforge.checkpoint.manager import CheckpointManager
 from kempnerforge.config.loader import load_config
+from kempnerforge.config.vlm import MoTConfig
 from kempnerforge.data.dataloader import StatefulDataLoader
 from kempnerforge.data.dataset import MemoryMappedDataset
 from kempnerforge.data.sampler import DistributedSampler
@@ -42,6 +43,7 @@ from kempnerforge.distributed.tensor_parallel import apply_tensor_parallel
 from kempnerforge.distributed.utils import clip_grad_norm_, get_dp_info
 from kempnerforge.metrics.logger import get_logger
 from kempnerforge.metrics.tracker import MetricsTracker
+from kempnerforge.model.mot import mot_warm_start_from_text_stack
 from kempnerforge.model.vlm import inner_transformer
 from kempnerforge.profiling.profiler import build_profiler, print_profiler_summary
 from kempnerforge.resilience.elastic import log_job_info, resolve_resume_path
@@ -225,6 +227,20 @@ def main() -> None:
         )
         if ckpt_extra_loaded.get("wandb_run_id"):
             config.metrics.wandb_run_id = ckpt_extra_loaded["wandb_run_id"]
+        # MoT warm-start: translate dense TransformerBlock weights from a
+        # JD/text-only checkpoint into per-modality copies inside every
+        # MoTBlock. Runs once at the start of training (resume_path is
+        # None or step == 0); a real resume of an in-flight MoT run
+        # already has the MoT-shaped state in the checkpoint and skips
+        # this hook.
+        if isinstance(mc.vlm, MoTConfig) and mc.vlm.mot_warm_start_from_text and step == 0:
+            source = torch.load(mc.vlm.mot_warm_start_path, map_location="cpu", weights_only=True)
+            if isinstance(source, dict) and "model" in source:
+                source = source["model"]
+            mot_warm_start_from_text_stack(inner_transformer(model), source)  # type: ignore[arg-type]
+            logger.info(
+                f"MoT warm-start: copied dense block weights from {mc.vlm.mot_warm_start_path}"
+            )
         # Apply effective freeze at the resumed step so requires_grad
         # reflects the post-transition state of any stages with
         # start_step <= loaded_step. Build-time apply only handles
