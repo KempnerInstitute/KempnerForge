@@ -302,7 +302,6 @@ def _build_mot_tiny_wrapper(num_image_tokens: int = 8, feature_dim: int = 96) ->
     return build_vlm_wrapper(_mot_vlm_config(num_image_tokens, feature_dim))
 
 
-
 class TestModalityStrategies:
     def test_joint_decoder_strategy_fills_prefix_and_slice(self):
         wrapper = _build_tiny_wrapper(num_image_tokens=8)
