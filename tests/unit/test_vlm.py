@@ -7,15 +7,19 @@ import torch
 
 from kempnerforge.config.model import ModelConfig
 from kempnerforge.config.vlm import (
+    CrossAttentionConfig,
     FreezeSpec,
     JointDecoderConfig,
+    MoTConfig,
     VLMConfig,
 )
 from kempnerforge.model.modality import ModalityContext
 from kempnerforge.model.transformer import Transformer
 from kempnerforge.model.vlm import (
     Adapter,
+    CrossAttentionStrategy,
     JointDecoderStrategy,
+    MoTStrategy,
     VLMWrapper,
     _is_encoder_frozen,
     build_modality_strategy,
@@ -258,6 +262,46 @@ class TestIsEncoderFrozen:
 # ---------------------------------------------------------------------------
 
 
+def _ca_vlm_config(
+    num_image_tokens: int = 8, feature_dim: int = 96, cadence: int = 2
+) -> ModelConfig:
+    return ModelConfig(
+        dim=64,
+        n_layers=4,
+        n_heads=4,
+        vocab_size=256,
+        max_seq_len=64,
+        vlm=CrossAttentionConfig(
+            vision_encoder="random",
+            feature_dim=feature_dim,
+            num_tokens=num_image_tokens,
+            max_text_len=32,
+            cross_attention_every_n_layers=cadence,
+        ),
+    )
+
+
+def _mot_vlm_config(num_image_tokens: int = 8, feature_dim: int = 96) -> ModelConfig:
+    return ModelConfig(
+        dim=64,
+        n_layers=2,
+        n_heads=4,
+        vocab_size=256,
+        max_seq_len=64,
+        ffn_hidden_dim=128,
+        vlm=MoTConfig(
+            vision_encoder="random",
+            feature_dim=feature_dim,
+            num_tokens=num_image_tokens,
+            max_text_len=32,
+        ),
+    )
+
+
+def _build_mot_tiny_wrapper(num_image_tokens: int = 8, feature_dim: int = 96) -> VLMWrapper:
+    return build_vlm_wrapper(_mot_vlm_config(num_image_tokens, feature_dim))
+
+
 class TestModalityStrategies:
     def test_joint_decoder_strategy_fills_prefix_and_slice(self):
         wrapper = _build_tiny_wrapper(num_image_tokens=8)
@@ -268,12 +312,64 @@ class TestModalityStrategies:
         assert ctx.prefix_embeds is not None
         assert ctx.prefix_embeds.shape == (1, 8, 64)  # (B, N, dim)
         assert ctx.output_slice == slice(8, None)
+        # CA-specific fields not set
+        assert ctx.image_features is None
+        assert ctx.image_mask is None
+        assert ctx.inputs_embeds is None
+        # MoT-specific field not set
+        assert ctx.modality_ids is None
+
+    def test_mot_strategy_fills_prefix_slice_and_modality_ids(self):
+        """MoT strategy mirrors JD's prefix+slice setup AND adds modality_ids."""
+        wrapper = _build_mot_tiny_wrapper(num_image_tokens=8)
+        strategy = MoTStrategy()
+        pixel_values = torch.randn(1, 3, 64, 64)
+        input_ids = torch.randint(0, 256, (1, 16))
+        ctx = strategy.prepare(wrapper, pixel_values, input_ids)
+        assert ctx.prefix_embeds is not None
+        assert ctx.prefix_embeds.shape == (1, 8, 64)
+        assert ctx.output_slice == slice(8, None)
+        assert ctx.modality_ids is not None
+        assert ctx.modality_ids.shape == (1, 8 + 16)
+        assert ctx.modality_ids.dtype == torch.long
+        # Position-based: 0 for image positions, 1 for text positions.
+        assert (ctx.modality_ids[:, :8] == 0).all()
+        assert (ctx.modality_ids[:, 8:] == 1).all()
         assert ctx.inputs_embeds is None
 
-    def test_strategy_num_image_tokens(self):
+    @pytest.mark.parametrize("t_text", [4, 16, 128])
+    def test_mot_modality_ids_shape_dtype_device(self, t_text: int):
+        wrapper = _build_mot_tiny_wrapper(num_image_tokens=8).to(DEVICE)
+        strategy = MoTStrategy()
+        pixel_values = torch.randn(2, 3, 64, 64, device=DEVICE)
+        input_ids = torch.randint(0, 256, (2, t_text), device=DEVICE)
+        ctx = strategy.prepare(wrapper, pixel_values, input_ids)
+        assert ctx.modality_ids is not None
+        assert ctx.modality_ids.shape == (2, 8 + t_text)
+        assert ctx.modality_ids.dtype == torch.long
+        assert ctx.modality_ids.device == input_ids.device
+
+    def test_cross_attention_strategy_fills_image_features(self):
+        wrapper = build_vlm_wrapper(_ca_vlm_config(num_image_tokens=8))
+        strategy = CrossAttentionStrategy()
+        pixel_values = torch.randn(1, 3, 64, 64)
+        input_ids = torch.randint(0, 256, (1, 16))
+        ctx = strategy.prepare(wrapper, pixel_values, input_ids)
+        assert ctx.image_features is not None
+        assert ctx.image_features.shape == (1, 8, 64)
+        assert ctx.image_mask is None
+        # JD-specific fields not set
+        assert ctx.prefix_embeds is None
+        assert ctx.output_slice is None
+        assert ctx.inputs_embeds is None
+
+    def test_strategy_num_image_tokens_arch_specific(self):
         jd_wrapper = _build_tiny_wrapper(num_image_tokens=12)
+        ca_wrapper = build_vlm_wrapper(_ca_vlm_config(num_image_tokens=12))
         # JD: extends the residual stream by num_image_tokens.
         assert jd_wrapper.num_image_tokens == 12
+        # CA: residual stream is text-only, so no extension.
+        assert ca_wrapper.num_image_tokens == 0
 
 
 class TestVLMWrapperDispatch:
@@ -281,6 +377,16 @@ class TestVLMWrapperDispatch:
         cfg = JointDecoderConfig(vision_encoder="random")
         strategy = build_modality_strategy(cfg)
         assert isinstance(strategy, JointDecoderStrategy)
+
+    def test_build_modality_strategy_cross_attention(self):
+        cfg = CrossAttentionConfig(vision_encoder="random")
+        strategy = build_modality_strategy(cfg)
+        assert isinstance(strategy, CrossAttentionStrategy)
+
+    def test_build_modality_strategy_mot(self):
+        cfg = MoTConfig(vision_encoder="random")
+        strategy = build_modality_strategy(cfg)
+        assert isinstance(strategy, MoTStrategy)
 
     def test_dispatch_no_isinstance_ladder(self):
         """Sanity check: build_modality_strategy is a pure registry
@@ -307,6 +413,25 @@ class TestVLMWrapperDispatch:
         wrapper = _build_tiny_wrapper()
         assert isinstance(wrapper.strategy, JointDecoderStrategy)
 
+    def test_ca_wrapper_uses_ca_strategy(self):
+        wrapper = build_vlm_wrapper(_ca_vlm_config())
+        assert isinstance(wrapper.strategy, CrossAttentionStrategy)
+
+    def test_mot_wrapper_uses_mot_strategy(self):
+        wrapper = _build_mot_tiny_wrapper()
+        assert isinstance(wrapper.strategy, MoTStrategy)
+
+    def test_mot_forward_logits_text_only_shape(self):
+        """MoT VLMWrapper forward returns text-only logits (output_slice
+        trims the image prefix off the head)."""
+        wrapper = _build_mot_tiny_wrapper(num_image_tokens=8).to(DEVICE)
+        pixels = torch.randn(2, 3, 16, 16, device=DEVICE)
+        input_ids = torch.randint(0, 256, (2, 20), device=DEVICE)
+        labels = torch.full((2, 20), -100, dtype=torch.long, device=DEVICE)
+        logits, labels_out = wrapper(pixels, input_ids, labels)
+        assert logits.shape == (2, 20, 256)
+        assert labels_out is labels
+
     def test_strategy_not_in_module_tree(self):
         """Strategy is a plain Python object, not an nn.Module. Verify
         it is not registered in _modules and does not appear in
@@ -325,6 +450,16 @@ class TestVLMWrapperDispatch:
     def test_jd_forward_logits_text_only_shape(self):
         """JD forward returns logits with shape (B, T, V) — no image positions."""
         wrapper = _build_tiny_wrapper(num_image_tokens=8).to(DEVICE).eval()
+        pixel_values = torch.randn(1, 3, 64, 64, device=DEVICE)
+        input_ids = torch.randint(0, 256, (1, 16), device=DEVICE)
+        with torch.no_grad():
+            logits, _ = wrapper(pixel_values, input_ids)
+        assert logits.shape == (1, 16, 256)
+
+    def test_ca_forward_logits_text_only_shape(self):
+        """CA forward also returns logits with shape (B, T, V): the
+        residual stream is text-only, so no extra image positions."""
+        wrapper = build_vlm_wrapper(_ca_vlm_config(num_image_tokens=8)).to(DEVICE).eval()
         pixel_values = torch.randn(1, 3, 64, 64, device=DEVICE)
         input_ids = torch.randint(0, 256, (1, 16), device=DEVICE)
         with torch.no_grad():

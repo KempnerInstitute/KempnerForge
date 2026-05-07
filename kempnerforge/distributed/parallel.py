@@ -187,7 +187,8 @@ def _fsdp_wrap_transformer_blocks(
     policy: MixedPrecisionPolicy,
     reshard_after_forward: bool | int,
 ) -> int:
-    """Per-block FSDP2 wrap over ``transformer.layers``, EP-MoE aware.
+    """Per-block FSDP2 wrap over ``transformer.layers`` and
+    ``transformer.cross_attention_layers``, EP-MoE aware.
 
     Dense blocks are wrapped once per ``TransformerBlock``. EP-MoE blocks
     get per-sub-module wrapping (``layer.attention`` and ``layer.mlp``
@@ -196,6 +197,10 @@ def _fsdp_wrap_transformer_blocks(
     deadlock. Per-sub-module wrapping keeps the two EP all-to-alls
     inside a single FSDP unit (``layer.mlp``), so reduce-scatter only
     fires after both complete.
+
+    Cross-Attention blocks (when present) are wrapped once each, like
+    dense ``TransformerBlock``s. The dict is empty for non-CA configs,
+    so iteration is a no-op on the JD / text-only paths.
 
     Shared by ``apply_fsdp2`` (for text Transformers) and
     ``_apply_fsdp_vlm`` (for the inner Transformer of a VLMWrapper) so
@@ -224,6 +229,16 @@ def _fsdp_wrap_transformer_blocks(
             continue
         fully_shard(
             layer,
+            mesh=dp_mesh,
+            mp_policy=policy,
+            reshard_after_forward=reshard_after_forward,
+        )
+
+    # Cross-Attention blocks (Cross-Attention arch only). Empty dict
+    # for non-CA configs.
+    for ca_block in transformer.cross_attention_layers.values():
+        fully_shard(
+            ca_block,
             mesh=dp_mesh,
             mp_policy=policy,
             reshard_after_forward=reshard_after_forward,

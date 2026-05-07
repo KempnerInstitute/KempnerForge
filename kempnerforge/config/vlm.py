@@ -69,7 +69,7 @@ class FreezeStage:
 # Reserved arches: known names not yet implemented. Loader/for_arch raise
 # ``NotImplementedError`` rather than ``ValueError`` so TOMLs that aim at
 # a future arch get a clear message about it.
-_RESERVED_ARCHS: tuple[str, ...] = ("cross_attention", "mot")
+_RESERVED_ARCHS: tuple[str, ...] = ()
 
 
 @dataclass
@@ -220,3 +220,158 @@ class JointDecoderConfig(VLMConfig):
     """
 
     arch: str = "joint_decoder"
+
+
+@registry.register_vlm_config("cross_attention")
+@dataclass
+class CrossAttentionConfig(VLMConfig):
+    """Cross-Attention: image K/V flows into separate cross-attention
+    blocks inserted at a configurable cadence.
+
+    The CA-specific module alias ``"cross_attention"`` is added to
+    ``module_patterns`` so freeze targeting works out of the box.
+    """
+
+    arch: str = "cross_attention"
+    cross_attention_every_n_layers: int = 4
+    cross_attention_n_heads: int = 0
+    cross_attention_n_kv_heads: int = 0
+    module_patterns: dict[str, list[str]] = field(
+        default_factory=lambda: {
+            **{k: list(v) for k, v in DEFAULT_MODULE_PATTERNS.items()},
+            "cross_attention": [
+                "transformer.cross_attention_layers",
+                "transformer.cross_attention_layers.*",
+            ],
+        }
+    )
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if self.cross_attention_every_n_layers <= 0:
+            raise ValueError(
+                "vlm.cross_attention_every_n_layers must be positive "
+                f"(got {self.cross_attention_every_n_layers})"
+            )
+        if self.cross_attention_n_heads < 0 or self.cross_attention_n_kv_heads < 0:
+            raise ValueError(
+                "vlm.cross_attention_n_heads and cross_attention_n_kv_heads must be non-negative"
+            )
+
+    def residual_stream_image_tokens(self) -> int:
+        """Cross-Attention does not extend the residual stream.
+
+        Image features flow as K/V into separate CrossAttentionBlocks;
+        the residual itself carries text only. So the seq_len cross-check
+        skips ``num_tokens`` and just enforces ``seq_len >= max_text_len``.
+        """
+        return 0
+
+    def resolved_heads(self, model_n_heads: int) -> tuple[int, int]:
+        """Resolve zero-defaults against the text backbone's head count.
+
+        Returns ``(n_heads, n_kv_heads)`` such that the
+        ``CrossAttentionBlock`` constructor never observes 0.
+
+        Resolution rule:
+
+        - ``n_heads = self.cross_attention_n_heads or model_n_heads``
+        - ``n_kv_heads = self.cross_attention_n_kv_heads or n_heads``
+        """
+        if model_n_heads <= 0:
+            raise ValueError(f"model_n_heads must be positive (got {model_n_heads})")
+        n_heads = self.cross_attention_n_heads or model_n_heads
+        n_kv_heads = self.cross_attention_n_kv_heads or n_heads
+        return n_heads, n_kv_heads
+
+
+@registry.register_vlm_config("mot")
+@dataclass
+class MoTConfig(VLMConfig):
+    """Mixture-of-Transformers: per-modality Q/K/V/O projections + per-
+    modality FFN at every layer; single global self-attention mixes all
+    modality streams (Liang et al. 2024, Algorithm 1).
+
+    Image tokens are prepended to the text sequence in the residual
+    stream (image-then-text concat order). ``modality_ids`` tags every
+    position with its source modality; the operator routes per-token
+    through the per-modality projection / FFN copy for that position.
+
+    The MoT-specific module alias ``"mot"`` is added to
+    ``module_patterns`` so freeze targeting works out of the box:
+    ``FreezeSpec("mot", True)`` freezes the per-modality main stack
+    (``transformer.layers.*``) without touching the embedding /
+    output head / final norms.
+    """
+
+    arch: str = "mot"
+    mot_modalities: tuple[str, ...] = ("image", "text")
+    mot_image_n_heads: int = 0
+    mot_image_n_kv_heads: int = 0
+    mot_warm_start_from_text: bool = False
+    mot_warm_start_path: str = ""
+    module_patterns: dict[str, list[str]] = field(
+        default_factory=lambda: {
+            **{k: list(v) for k, v in DEFAULT_MODULE_PATTERNS.items()},
+            "mot": [
+                "transformer.layers",
+                "transformer.layers.*",
+            ],
+        }
+    )
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if len(self.mot_modalities) < 2:
+            raise ValueError(
+                f"vlm.mot_modalities must have at least 2 entries (got {self.mot_modalities!r})"
+            )
+        if "text" not in self.mot_modalities:
+            raise ValueError(
+                f"vlm.mot_modalities must include 'text' (got {self.mot_modalities!r})"
+            )
+        if "image" not in self.mot_modalities:
+            raise ValueError(
+                f"vlm.mot_modalities must include 'image' (got {self.mot_modalities!r})"
+            )
+        if len(set(self.mot_modalities)) != len(self.mot_modalities):
+            raise ValueError(
+                f"vlm.mot_modalities must not contain duplicates (got {self.mot_modalities!r})"
+            )
+        if self.mot_image_n_heads < 0 or self.mot_image_n_kv_heads < 0:
+            raise ValueError("vlm.mot_image_n_heads and mot_image_n_kv_heads must be non-negative")
+        if self.mot_warm_start_from_text and not self.mot_warm_start_path:
+            raise ValueError(
+                "vlm.mot_warm_start_from_text=True requires vlm.mot_warm_start_path to be a "
+                "non-empty filesystem path to a torch-saved JD or text-only state dict"
+            )
+
+    def residual_stream_image_tokens(self) -> int:
+        """MoT prepends ``num_tokens`` image tokens to the text sequence
+        (same residual-stream layout as Joint-Decoder)."""
+        return self.num_tokens
+
+    def resolved_image_heads(
+        self, model_n_heads: int, model_n_kv_heads: int = 0
+    ) -> tuple[int, int]:
+        """Resolve zero-defaults against the text backbone's head counts.
+
+        Returns ``(n_heads, n_kv_heads)`` such that the operator's
+        per-modality projection sizes are never built from 0.
+
+        Resolution rule:
+
+        - ``n_heads = self.mot_image_n_heads or model_n_heads``
+        - ``n_kv_heads = self.mot_image_n_kv_heads or model_n_kv_heads or n_heads``
+
+        v1 note: the global-SDPA design requires equal head counts
+        across modalities; ``Transformer.__init__`` asserts the
+        resolved tuple matches the text backbone (raise on per-modality
+        override). Field is present so a future per-modality relaxation
+        can land without a config-shape change.
+        """
+        if model_n_heads <= 0:
+            raise ValueError(f"model_n_heads must be positive (got {model_n_heads})")
+        n_heads = self.mot_image_n_heads or model_n_heads
+        n_kv_heads = self.mot_image_n_kv_heads or model_n_kv_heads or n_heads
+        return n_heads, n_kv_heads

@@ -10,10 +10,17 @@ holds, so adding a new arch is one new strategy decorator on
 subclass — no edits to ``VLMWrapper.forward``, no ``isinstance``
 ladder.
 
-Strategy registered today:
+Strategies registered today:
 
 - ``"joint_decoder"`` — image embeds prepended to the text sequence
   via ``ModalityContext.prefix_embeds`` + ``output_slice``.
+- ``"cross_attention"`` — image embeds passed via
+  ``ModalityContext.image_features`` to the ``CrossAttentionBlock``s
+  inside ``Transformer``.
+- ``"mot"`` — Mixture-of-Transformers. Same residual-stream layout as
+  Joint-Decoder (image-then-text concat, ``output_slice`` trims image
+  positions before the head), plus a per-position ``modality_ids``
+  tag that the ``MoTBlock`` stack consumes for routing.
 
 ``inner_transformer(model)`` is the explicit unwrap helper used by the
 training loop when it needs to reach Transformer-internal state
@@ -138,6 +145,73 @@ class JointDecoderStrategy:
         img_embeds = _project_image_features(wrapper, pixel_values)
         n = wrapper.vision_encoder.num_tokens
         return ModalityContext(prefix_embeds=img_embeds, output_slice=slice(n, None))
+
+    def num_image_tokens(self, wrapper: VLMWrapper) -> int:
+        return wrapper.vision_encoder.num_tokens
+
+
+@registry.register_modality_strategy("cross_attention")
+class CrossAttentionStrategy:
+    """Cross-Attention: image embeds flow as K/V into separate
+    cross-attention blocks inside the transformer; the residual stream
+    itself carries text only.
+
+    Forward path: ``feats = vision_encoder(pixel_values)``;
+    ``img_embeds = adapter(feats)``; ``ModalityContext(image_features,
+    image_mask=None)``. ``image_mask=None`` means "all image tokens
+    valid"; multi-image variants will fill it in later.
+    """
+
+    def prepare(
+        self,
+        wrapper: VLMWrapper,
+        pixel_values: torch.Tensor,
+        input_ids: torch.Tensor,  # noqa: ARG002
+    ) -> ModalityContext:
+        img_embeds = _project_image_features(wrapper, pixel_values)
+        return ModalityContext(image_features=img_embeds, image_mask=None)
+
+    def num_image_tokens(self, wrapper: VLMWrapper) -> int:  # noqa: ARG002
+        # Cross-Attention does not extend the residual stream.
+        return 0
+
+
+@registry.register_modality_strategy("mot")
+class MoTStrategy:
+    """Mixture-of-Transformers: image-then-text residual layout (same as
+    Joint-Decoder) plus a per-position ``modality_ids`` tag.
+
+    Forward path: ``feats = vision_encoder(pixel_values)``;
+    ``img_embeds = adapter(feats)``;
+    ``ModalityContext(prefix_embeds, output_slice, modality_ids)``.
+
+    ``modality_ids`` is built position-based: ``0`` for the first
+    ``num_image_tokens`` positions and ``1`` for the rest. The MoT
+    forward path uses position-based slicing for v1 routing (the tags
+    are validated for shape but not value-matched against positions),
+    so a future per-token scatter/gather can land without changing the
+    public interface.
+
+    ``output_slice`` trims the image prefix off the residual before
+    the LM head, matching ``JointDecoderStrategy``.
+    """
+
+    def prepare(
+        self,
+        wrapper: VLMWrapper,
+        pixel_values: torch.Tensor,
+        input_ids: torch.Tensor,
+    ) -> ModalityContext:
+        img_embeds = _project_image_features(wrapper, pixel_values)
+        n = wrapper.vision_encoder.num_tokens
+        b, t_text = input_ids.shape
+        modality_ids = torch.zeros(b, n + t_text, dtype=torch.long, device=input_ids.device)
+        modality_ids[:, n:] = 1
+        return ModalityContext(
+            prefix_embeds=img_embeds,
+            output_slice=slice(n, None),
+            modality_ids=modality_ids,
+        )
 
     def num_image_tokens(self, wrapper: VLMWrapper) -> int:
         return wrapper.vision_encoder.num_tokens
