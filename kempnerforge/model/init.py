@@ -7,6 +7,8 @@ import math
 import torch.nn as nn
 
 from kempnerforge.config.schema import ModelConfig
+from kempnerforge.model.moe import MoEMLP
+from kempnerforge.model.mot import MoTAttention, MoTBlock
 
 
 def init_weights(model: nn.Module, config: ModelConfig) -> None:
@@ -18,6 +20,7 @@ def init_weights(model: nn.Module, config: ModelConfig) -> None:
     - Embedding layers: normal(0, 0.02)
     - Residual output projections (o_proj, down_proj): scaled by 1/sqrt(2 * n_layers)
     - Cross-attention block residuals: zero-initialized (identity-at-init warm-start)
+    - MoT per-modality residual projections: zero-initialized (identity-at-construction)
     - Norm layers: weight=1 (already default)
     """
     std = config.init_std
@@ -42,3 +45,19 @@ def init_weights(model: nn.Module, config: ModelConfig) -> None:
             nn.init.normal_(param, mean=0.0, std=std * residual_scale)
         else:
             nn.init.normal_(param, mean=0.0, std=std)
+
+    # MoT-specific zero-init for identity-at-construction residual.
+    # These FQNs do not match endswith("o_proj.weight") (per-modality
+    # ModuleDict nesting puts {modality} after o_proj), so they are
+    # handled by a second pass over modules.
+    for module in model.modules():
+        if isinstance(module, MoTAttention):
+            for m in module.modalities:
+                nn.init.zeros_(module.o_proj[m].weight)  # type: ignore[reportArgumentType]
+        elif isinstance(module, MoTBlock):
+            for m in module.modalities:
+                mlp_m = module.mlp[m]
+                if isinstance(mlp_m, MoEMLP):
+                    continue
+                if hasattr(mlp_m, "down_proj"):
+                    nn.init.zeros_(mlp_m.down_proj.weight)  # type: ignore[union-attr]

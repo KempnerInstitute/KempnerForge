@@ -81,3 +81,45 @@ class TestModalityContextInvariants:
                 prefix_embeds=torch.zeros(1, 4, 8),
                 image_features=torch.zeros(1, 4, 8),
             )
+
+
+class TestModalityIdsInvariants:
+    """modality_ids field for MoT routing.
+
+    Intra-context invariants:
+
+    - modality_ids requires prefix_embeds OR inputs_embeds (routing
+      without a residual extension is meaningless).
+
+    Cross-arg invariants (kv_caches incompatibility, dtype, shape) are
+    enforced in Transformer.forward and tested in test_model.py.
+    """
+
+    def test_modality_ids_with_prefix_embeds_is_valid(self):
+        ctx = ModalityContext(
+            prefix_embeds=torch.zeros(1, 4, 8),
+            modality_ids=torch.zeros(1, 12, dtype=torch.long),
+        )
+        assert ctx.modality_ids is not None
+        assert ctx.modality_ids.dtype == torch.long
+
+    def test_modality_ids_with_inputs_embeds_is_valid(self):
+        ctx = ModalityContext(
+            inputs_embeds=torch.zeros(1, 4, 8),
+            modality_ids=torch.zeros(1, 4, dtype=torch.long),
+        )
+        assert ctx.modality_ids is not None
+
+    def test_modality_ids_alone_raises(self):
+        """Bare modality_ids (no prefix/inputs_embeds) is meaningless."""
+        with pytest.raises(ValueError, match="modality_ids requires"):
+            ModalityContext(modality_ids=torch.zeros(1, 4, dtype=torch.long))
+
+    def test_modality_ids_only_with_output_slice_raises(self):
+        """output_slice is not a residual-extension route, so modality_ids
+        with only output_slice still raises."""
+        with pytest.raises(ValueError, match="modality_ids requires"):
+            ModalityContext(
+                output_slice=slice(4, None),
+                modality_ids=torch.zeros(1, 8, dtype=torch.long),
+            )

@@ -553,6 +553,239 @@ class TestPrefixEmbeds:
             model(tokens, modality=ModalityContext(prefix_embeds=prefix), kv_caches=kv)
 
 
+class TestModalityIdsCrossArgs:
+    """modality_ids cross-arg invariants on Transformer.forward.
+
+    Intra-context invariants live in test_modality_context.py; here we
+    test the forward-arg interactions: dtype check, kv_caches forbids
+    modality_ids (training-only).
+    """
+
+    def test_modality_ids_wrong_dtype_raises(self):
+        model = Transformer(_KWARG_CONFIG).to(DEVICE)
+        tokens = torch.randint(0, 256, (1, 8), device=DEVICE)
+        prefix = torch.randn(1, 4, 128, device=DEVICE)
+        # int32 instead of long — should raise.
+        bad_ids = torch.zeros(1, 12, dtype=torch.int32, device=DEVICE)
+        with pytest.raises(ValueError, match="modality_ids.dtype must be torch.long"):
+            model(
+                tokens,
+                modality=ModalityContext(prefix_embeds=prefix, modality_ids=bad_ids),
+            )
+
+    def test_modality_ids_with_kv_caches_raises(self):
+        from kempnerforge.model.attention import KVCache
+
+        model = Transformer(_KWARG_CONFIG).to(DEVICE)
+        kv = [
+            KVCache(
+                batch_size=1,
+                max_seq_len=32,
+                n_kv_heads=4,
+                head_dim=32,
+                dtype=torch.float32,
+                device=DEVICE,
+            )
+            for _ in range(_KWARG_CONFIG.n_layers)
+        ]
+        # Use inputs_embeds (allowed with kv_caches; pipeline-PP path) so the
+        # modality_ids check is what fires, not prefix_embeds.
+        embeds = torch.randn(1, 4, 128, device=DEVICE)
+        ids = torch.zeros(1, 4, dtype=torch.long, device=DEVICE)
+        with pytest.raises(ValueError, match="modality_ids is training-only"):
+            model(
+                None,
+                modality=ModalityContext(inputs_embeds=embeds, modality_ids=ids),
+                kv_caches=kv,
+            )
+
+    def test_modality_ids_correct_dtype_no_raise_yet(self):
+        """Long-dtype modality_ids passes the dtype check at the top of
+        forward. Non-MoT Transformer with modality_ids set in the context
+        just no-ops it for the residual stream — pin that behavior."""
+        model = Transformer(_KWARG_CONFIG).to(DEVICE)
+        tokens = torch.randint(0, 256, (1, 8), device=DEVICE)
+        prefix = torch.randn(1, 4, 128, device=DEVICE)
+        ids = torch.zeros(1, 12, dtype=torch.long, device=DEVICE)
+        with torch.no_grad():
+            out = model(
+                tokens,
+                modality=ModalityContext(prefix_embeds=prefix, modality_ids=ids),
+            )
+        assert out.shape == (1, 12, 256)
+
+
+# ---------------------------------------------------------------------------
+# MoT (Mixture-of-Transformers) integration on Transformer
+# ---------------------------------------------------------------------------
+
+
+def _mot_config(
+    dim: int = 128,
+    n_layers: int = 2,
+    n_heads: int = 4,
+    n_kv_heads: int | None = None,
+    num_tokens: int = 8,
+    max_text_len: int = 16,
+    mot_image_n_heads: int = 0,
+    mot_image_n_kv_heads: int = 0,
+) -> ModelConfig:
+    """Tiny MoT-backed ModelConfig for integration tests."""
+    from kempnerforge.config.vlm import MoTConfig
+
+    return ModelConfig(
+        dim=dim,
+        n_layers=n_layers,
+        n_heads=n_heads,
+        n_kv_heads=n_kv_heads or n_heads,
+        vocab_size=256,
+        max_seq_len=num_tokens + max_text_len,
+        ffn_hidden_dim=128,
+        vlm=MoTConfig(
+            vision_encoder="random",
+            num_tokens=num_tokens,
+            max_text_len=max_text_len,
+            mot_image_n_heads=mot_image_n_heads,
+            mot_image_n_kv_heads=mot_image_n_kv_heads,
+        ),
+    )
+
+
+class TestMoT:
+    """MoTConfig-backed Transformer: per-modality blocks + global SDPA."""
+
+    def test_layers_are_mot_blocks_when_mot(self):
+        from kempnerforge.model.mot import MoTBlock
+
+        cfg = _mot_config()
+        model = Transformer(cfg).to(DEVICE)
+        assert all(isinstance(layer, MoTBlock) for layer in model.layers.values())
+        assert model._mot_modalities == ("image", "text")
+        assert model._mot_n_image == 8
+        assert set(model.mot_norms.keys()) == {"image", "text"}
+
+    def test_layers_are_transformer_blocks_when_not_mot(self):
+        """Regression: text-only path keeps TransformerBlock structure."""
+        cfg = ModelConfig(dim=128, n_layers=2, n_heads=4, vocab_size=256, max_seq_len=32)
+        model = Transformer(cfg).to(DEVICE)
+        assert all(isinstance(layer, TransformerBlock) for layer in model.layers.values())
+        assert model._mot_modalities == ()
+        assert model._mot_n_image == 0
+        assert len(model.mot_norms) == 0
+
+    def test_unequal_image_n_heads_raises(self):
+        """v1 enforces equal head counts across modalities."""
+        with pytest.raises(ValueError, match="equal head counts"):
+            cfg = _mot_config(mot_image_n_heads=2)
+            Transformer(cfg)
+
+    def test_unequal_image_n_kv_heads_raises(self):
+        with pytest.raises(ValueError, match="equal head counts"):
+            cfg = _mot_config(mot_image_n_kv_heads=2)
+            Transformer(cfg)
+
+    def test_modality_ids_required_when_mot_active(self):
+        cfg = _mot_config()
+        model = Transformer(cfg).to(DEVICE).eval()
+        tokens = torch.randint(0, 256, (1, cfg.vlm.max_text_len), device=DEVICE)  # type: ignore[union-attr]
+        prefix = torch.randn(1, cfg.vlm.num_tokens, cfg.dim, device=DEVICE)  # type: ignore[union-attr]
+        with pytest.raises(ValueError, match="MoT model requires modality.modality_ids"):
+            model(tokens, modality=ModalityContext(prefix_embeds=prefix))
+
+    def test_modality_ids_shape_mismatch_raises(self):
+        cfg = _mot_config()
+        model = Transformer(cfg).to(DEVICE).eval()
+        tokens = torch.randint(0, 256, (1, cfg.vlm.max_text_len), device=DEVICE)  # type: ignore[union-attr]
+        prefix = torch.randn(1, cfg.vlm.num_tokens, cfg.dim, device=DEVICE)  # type: ignore[union-attr]
+        bad_ids = torch.zeros(1, 5, dtype=torch.long, device=DEVICE)
+        with pytest.raises(ValueError, match="modality.modality_ids shape"):
+            model(
+                tokens,
+                modality=ModalityContext(prefix_embeds=prefix, modality_ids=bad_ids),
+            )
+
+    def test_forward_output_shape(self):
+        cfg = _mot_config()
+        model = Transformer(cfg).to(DEVICE).eval()
+        n_image = cfg.vlm.num_tokens  # type: ignore[union-attr]
+        n_text = cfg.vlm.max_text_len  # type: ignore[union-attr]
+        total = n_image + n_text
+        tokens = torch.randint(0, 256, (1, n_text), device=DEVICE)
+        prefix = torch.randn(1, n_image, cfg.dim, device=DEVICE)
+        ids = torch.zeros(1, total, dtype=torch.long, device=DEVICE)
+        ids[:, n_image:] = 1
+        with torch.no_grad():
+            out = model(
+                tokens,
+                modality=ModalityContext(prefix_embeds=prefix, modality_ids=ids),
+            )
+        assert out.shape == (1, total, cfg.vocab_size)
+        assert torch.isfinite(out).all()
+
+    def test_forward_output_slice_works(self):
+        """output_slice composes with the MoT path: trim image tokens off the head input."""
+        cfg = _mot_config()
+        model = Transformer(cfg).to(DEVICE).eval()
+        n_image = cfg.vlm.num_tokens  # type: ignore[union-attr]
+        n_text = cfg.vlm.max_text_len  # type: ignore[union-attr]
+        tokens = torch.randint(0, 256, (1, n_text), device=DEVICE)
+        prefix = torch.randn(1, n_image, cfg.dim, device=DEVICE)
+        ids = torch.zeros(1, n_image + n_text, dtype=torch.long, device=DEVICE)
+        ids[:, n_image:] = 1
+        with torch.no_grad():
+            out = model(
+                tokens,
+                modality=ModalityContext(
+                    prefix_embeds=prefix,
+                    modality_ids=ids,
+                    output_slice=slice(n_image, None),
+                ),
+            )
+        assert out.shape == (1, n_text, cfg.vocab_size)
+
+    def test_state_dict_contains_per_modality_keys(self):
+        cfg = _mot_config()
+        model = Transformer(cfg).to(DEVICE)
+        keys = set(model.state_dict().keys())
+        assert "layers.0.attn.q_proj.image.weight" in keys
+        assert "layers.0.attn.q_proj.text.weight" in keys
+        assert "layers.0.attn.o_proj.image.weight" in keys
+        assert "layers.0.attn.o_proj.text.weight" in keys
+        assert "layers.0.attn_norm.image.weight" in keys
+        assert "layers.0.mlp_norm.text.weight" in keys
+        assert "layers.0.mlp.image.gate_proj.weight" in keys
+        assert "layers.0.mlp.text.down_proj.weight" in keys
+        assert "mot_norms.image.weight" in keys
+        assert "mot_norms.text.weight" in keys
+        assert not any(".attention.q_proj.weight" in k for k in keys)
+
+    def test_backward_through_mot_path(self):
+        """Backward flows through per-modality projections after a non-zero
+        o_proj re-init (zero-init residual blocks gradient to upstream
+        Q/K/V via the residual chain rule)."""
+        cfg = _mot_config()
+        model = Transformer(cfg).to(DEVICE)
+        with torch.no_grad():
+            for layer in model.layers.values():
+                for m in layer.modalities:
+                    torch.nn.init.normal_(layer.attn.o_proj[m].weight, std=0.01)
+                    torch.nn.init.normal_(layer.mlp[m].down_proj.weight, std=0.01)
+        n_image = cfg.vlm.num_tokens  # type: ignore[union-attr]
+        n_text = cfg.vlm.max_text_len  # type: ignore[union-attr]
+        tokens = torch.randint(0, 256, (1, n_text), device=DEVICE)
+        prefix = torch.randn(1, n_image, cfg.dim, device=DEVICE)
+        ids = torch.zeros(1, n_image + n_text, dtype=torch.long, device=DEVICE)
+        ids[:, n_image:] = 1
+        out = model(
+            tokens,
+            modality=ModalityContext(prefix_embeds=prefix, modality_ids=ids),
+        )
+        out.sum().backward()
+        for m in ("image", "text"):
+            assert model.layers["0"].attn.q_proj[m].weight.grad is not None  # type: ignore[union-attr]
+            assert model.layers["0"].attn.q_proj[m].weight.grad.abs().sum() > 0  # type: ignore[union-attr]
+
+
 # ---------------------------------------------------------------------------
 # Cross-Attention interleaving on Transformer
 # ---------------------------------------------------------------------------

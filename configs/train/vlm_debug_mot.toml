@@ -1,0 +1,78 @@
+# VLM smoke config — Mixture-of-Transformers (MoT) arch, tiny LLM + random vision encoder.
+#
+# Runs end-to-end in <1 minute on 1 GPU. Uses RandomVisionEncoder so no
+# HF download is needed. Per-modality Q/K/V/O + per-modality FFN at every
+# layer, single global self-attention (Liang et al. 2024 Algorithm 1).
+#
+# Usage:
+#   uv run python scripts/train.py configs/train/vlm_debug_mot.toml \
+#       --data.hf_dataset_name=... --data.tokenizer_path=gpt2
+
+[model]
+dim = 256
+n_layers = 4
+n_heads = 4
+n_kv_heads = 4
+vocab_size = 50257     # gpt2 vocab
+max_seq_len = 576      # 64 image + 512 text
+norm_type = "rmsnorm"
+activation = "silu"
+
+[model.vlm]
+arch = "mot"
+vision_encoder = "random"
+feature_dim = 384
+num_tokens = 64
+adapter_hidden_dim = 0  # 0 = use model.dim
+adapter_activation = "gelu"
+max_text_len = 512
+mot_modalities = ["image", "text"]
+mot_image_n_heads = 0      # 0 = inherit model.n_heads
+mot_image_n_kv_heads = 0   # 0 = inherit
+mot_warm_start_from_text = false
+freeze = [{module = "vision_encoder", frozen = true}]
+
+[train]
+batch_size = 2
+seq_len = 576
+max_steps = 50
+grad_accum_steps = 1
+grad_clip_norm = 1.0
+seed = 42
+compile_model = false
+activation_checkpointing = "none"
+
+[optimizer]
+name = "adamw"
+lr = 3e-4
+weight_decay = 0.1
+betas = [0.9, 0.95]
+fused = false
+
+[scheduler]
+name = "cosine"
+warmup_steps = 5
+min_lr_ratio = 0.1
+
+[data]
+hf_dataset_name = "nlphuji/coco_karpathy"
+hf_dataset_split = "train"
+hf_dataset_image_field = "image"
+hf_dataset_text_field = "caption"
+hf_image_size = 224
+tokenizer_path = "gpt2"
+num_workers = 2
+pin_memory = true
+
+[distributed]
+dp_shard = -1
+
+[checkpoint]
+dir = "checkpoints/vlm_debug_mot"
+interval = 25
+keep_last_n = 2
+
+[metrics]
+log_interval = 5
+enable_wandb = false
+enable_tensorboard = false

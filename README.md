@@ -145,6 +145,7 @@ KempnerForge supports VLM training via a thin wrapper around the existing `Trans
 
 - **Joint-Decoder** (`arch = "joint_decoder"`): image embeds are prepended to the text sequence; the transformer runs over the concatenated `(image, text)` sequence and the LM head is applied to text positions only.
 - **Cross-Attention** (`arch = "cross_attention"`, Llama-3-V style): the residual stream carries text only. Separate `CrossAttentionBlock`s inserted at a configurable cadence let text queries attend to image K/V. CA blocks are zero-initialized so adding the arch on top of a text-only checkpoint is identity at step 0 and learns from there.
+- **Mixture-of-Transformers** (`arch = "mot"`, Liang et al. 2024 Algorithm 1): every layer carries per-modality Q/K/V/O projections plus a per-modality FFN; a single global self-attention mixes all modality streams. Image tokens prepend the text sequence (same residual layout as Joint-Decoder); per-modality residual projections are zero-initialized so a fresh MoT block is identity at construction. A warm-start helper (`mot_warm_start_from_text_stack`) translates a JD or text-only checkpoint into per-modality copies — toggle via `[model.vlm].mot_warm_start_from_text` + `mot_warm_start_path`.
 
 ```bash
 # 1-GPU smoke (random encoder, Joint-Decoder)
@@ -156,9 +157,12 @@ uv run torchrun --nproc_per_node=4 scripts/train.py configs/train/vlm_7b_siglip2
 
 # 4-GPU 7B Cross-Attention (8 CA blocks at cadence 4)
 uv run torchrun --nproc_per_node=4 scripts/train.py configs/train/vlm_7b_cross_attn.toml
+
+# 4-GPU 7B Mixture-of-Transformers
+uv run torchrun --nproc_per_node=4 scripts/train.py configs/train/vlm_7b_mot.toml
 ```
 
-Configs set `[model.vlm]` with `arch`, the encoder registry key, the number of image tokens, and a freeze list (`FreezeSpec`). For Cross-Attention, set `cross_attention_every_n_layers` and optionally `cross_attention_n_kv_heads` (0 → MHA; positive → GQA on the cross path). The vision encoder stays in its HF-loaded dtype; the transformer, adapter, and CA blocks are cast to `param_dtype`. Pipeline Parallel + VLM is not supported on this branch (raises at startup); multi-image and video are reserved slots for follow-up work. Mixture-of-Transformers (`arch = "mot"`) is a reserved discriminator (`_RESERVED_ARCHS`) — TOMLs targeting it get a clear `NotImplementedError` until that arch lands in a follow-up PR.
+Configs set `[model.vlm]` with `arch`, the encoder registry key, the number of image tokens, and a freeze list (`FreezeSpec`). For Cross-Attention, set `cross_attention_every_n_layers` and optionally `cross_attention_n_kv_heads` (0 → MHA; positive → GQA on the cross path). For MoT, set `mot_modalities` (must include both `"image"` and `"text"`); `mot_image_n_heads` / `mot_image_n_kv_heads` are forward-looking per-modality head fields (v1 enforces equality with the text-side counts since the operator runs a single global SDPA). The vision encoder stays in its HF-loaded dtype; the transformer, adapter, and CA / MoT blocks are cast to `param_dtype`. Pipeline Parallel + VLM is not supported on this branch (raises at startup); multi-image and video are reserved slots for follow-up work.
 
 **Adding a new VLM arch.** The discriminated-union dispatch is registry-driven, so a new arch is four small additions, no edits to existing call sites:
 
