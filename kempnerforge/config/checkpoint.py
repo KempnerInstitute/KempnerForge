@@ -24,6 +24,11 @@ class CheckpointConfig:
     load_path: str | None = None  # Path to load from (for resumption)
     export_dtype: Literal["float32", "bfloat16"] = "bfloat16"
     exclude_from_loading: list[str] = field(default_factory=list)
+    # If the saved checkpoint's VLM freeze metadata differs from the current
+    # config's freeze specs, the load path raises by default. Setting this
+    # to True downgrades the mismatch to a warning. Useful when intentionally
+    # switching from frozen to trainable mid-training.
+    ignore_freeze_mismatch: bool = False
 
     def __post_init__(self) -> None:
         if self.interval <= 0:

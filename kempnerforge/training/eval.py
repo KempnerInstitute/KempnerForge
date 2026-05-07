@@ -22,6 +22,24 @@ logger = logging.getLogger(__name__)
 _EVAL_BROADCAST_TIMEOUT_SEC = 300.0
 
 
+def should_build_eval_dataloader(eval_enabled: bool, is_vlm: bool) -> tuple[bool, bool]:
+    """Decide whether to build an eval dataloader and whether to warn.
+
+    The training loop calls ``run_eval(model, eval_dataloader, ...)`` which
+    invokes ``model(input_ids)`` — this does not match
+    ``VLMWrapper.forward(pixel_values, input_ids, labels)``. VLM configs
+    with ``eval.enabled=true`` would crash on the first eval interval.
+    This helper gates the eval setup: for VLM configs it suppresses eval
+    and flags that a warning should be logged so users see their eval
+    setting was ignored. VLM eval support is a tracked follow-up.
+
+    Returns ``(should_build, should_warn_vlm_skip)``.
+    """
+    if eval_enabled and is_vlm:
+        return False, True
+    return eval_enabled, False
+
+
 @torch.no_grad()
 def run_eval(
     model: torch.nn.Module,

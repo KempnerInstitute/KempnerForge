@@ -12,6 +12,7 @@ from kempnerforge.model.attention import Attention
 from kempnerforge.model.embedding import OutputHead, TokenEmbedding
 from kempnerforge.model.init import init_weights
 from kempnerforge.model.mlp import StandardMLP, SwiGLUMLP, build_mlp
+from kempnerforge.model.modality import ModalityContext
 from kempnerforge.model.norm import RMSNorm, build_norm
 from kempnerforge.model.position import apply_rope, precompute_rope_frequencies
 from kempnerforge.model.transformer import Transformer, TransformerBlock
@@ -375,6 +376,181 @@ class TestTransformer:
         assert m2.layers["0"].attention.q_norm is None
         # Same parameter count
         assert sum(p.numel() for p in m1.parameters()) == sum(p.numel() for p in m2.parameters())
+
+
+# ---------------------------------------------------------------------------
+# Modality-injection routes on Transformer.forward (ModalityContext)
+# ---------------------------------------------------------------------------
+
+
+_KWARG_CONFIG = ModelConfig(dim=128, n_layers=2, n_heads=4, vocab_size=256, max_seq_len=64)
+
+
+class TestInputsEmbeds:
+    def test_both_none_raises(self):
+        model = Transformer(_KWARG_CONFIG).to(DEVICE)
+        with pytest.raises(ValueError, match="exactly one of tokens or modality.inputs_embeds"):
+            model()
+
+    def test_both_set_raises(self):
+        model = Transformer(_KWARG_CONFIG).to(DEVICE)
+        tokens = torch.randint(0, 256, (1, 8), device=DEVICE)
+        embeds = torch.randn(1, 8, 128, device=DEVICE)
+        with pytest.raises(ValueError, match="exactly one of tokens or modality.inputs_embeds"):
+            model(tokens, modality=ModalityContext(inputs_embeds=embeds))
+
+    def test_inputs_embeds_matches_tokens(self):
+        """inputs_embeds path is bit-equal to the tokens path when embeds
+        come from the model's own token_embedding."""
+        model = Transformer(_KWARG_CONFIG).to(DEVICE).eval()
+        tokens = torch.randint(0, 256, (2, 16), device=DEVICE)
+        with torch.no_grad():
+            out_tokens = model(tokens)
+            embeds = model.token_embedding(tokens)
+            out_embeds = model(modality=ModalityContext(inputs_embeds=embeds))
+        assert torch.equal(out_tokens, out_embeds)
+
+    def test_inputs_embeds_backward(self):
+        """Gradients should flow through an externally-provided inputs_embeds."""
+        model = Transformer(_KWARG_CONFIG).to(DEVICE)
+        embeds = torch.randn(1, 8, 128, device=DEVICE, requires_grad=True)
+        out = model(modality=ModalityContext(inputs_embeds=embeds))
+        out.sum().backward()
+        assert embeds.grad is not None
+        assert torch.isfinite(embeds.grad).all()
+
+    def test_inputs_embeds_shape(self):
+        model = Transformer(_KWARG_CONFIG).to(DEVICE)
+        embeds = torch.randn(3, 12, 128, device=DEVICE)
+        with torch.no_grad():
+            out = model(modality=ModalityContext(inputs_embeds=embeds))
+        assert out.shape == (3, 12, 256)
+
+
+class TestOutputSlice:
+    def test_output_slice_trims_logits(self):
+        model = Transformer(_KWARG_CONFIG).to(DEVICE).eval()
+        tokens = torch.randint(0, 256, (2, 20), device=DEVICE)
+        with torch.no_grad():
+            full = model(tokens)
+            sliced = model(tokens, modality=ModalityContext(output_slice=slice(5, None)))
+        assert full.shape == (2, 20, 256)
+        assert sliced.shape == (2, 15, 256)
+        # Sliced positions equal the tail of the full output
+        assert torch.equal(sliced, full[:, 5:, :])
+
+    def test_output_slice_none_matches_full(self):
+        model = Transformer(_KWARG_CONFIG).to(DEVICE).eval()
+        tokens = torch.randint(0, 256, (1, 10), device=DEVICE)
+        with torch.no_grad():
+            a = model(tokens)
+            b = model(tokens, modality=ModalityContext(output_slice=None))
+        assert torch.equal(a, b)
+
+    def test_output_slice_full_range_matches_full(self):
+        model = Transformer(_KWARG_CONFIG).to(DEVICE).eval()
+        tokens = torch.randint(0, 256, (1, 10), device=DEVICE)
+        with torch.no_grad():
+            a = model(tokens)
+            b = model(tokens, modality=ModalityContext(output_slice=slice(None, None)))
+        assert torch.equal(a, b)
+
+    def test_output_slice_with_kv_caches_raises(self):
+        from kempnerforge.model.attention import KVCache
+
+        model = Transformer(_KWARG_CONFIG).to(DEVICE)
+        kv = [
+            KVCache(
+                batch_size=1,
+                max_seq_len=32,
+                n_kv_heads=4,
+                head_dim=32,
+                dtype=torch.float32,
+                device=DEVICE,
+            )
+            for _ in range(_KWARG_CONFIG.n_layers)
+        ]
+        tokens = torch.randint(0, 256, (1, 4), device=DEVICE)
+        with pytest.raises(ValueError, match="modality.output_slice is training-only"):
+            model(
+                tokens,
+                modality=ModalityContext(output_slice=slice(1, None)),
+                kv_caches=kv,
+            )
+
+
+class TestPrefixEmbeds:
+    """prefix_embeds field: image/soft-prompt prefix concatenated to the
+    left of the token embeddings. Entry point is VLMWrapper but the
+    behavior is unit-tested here directly so a Transformer regression
+    surfaces without needing a VLM build."""
+
+    def test_basic_shape(self):
+        """prefix_embeds=(B, N, D) + tokens=(B, T) -> logits (B, N+T, V)."""
+        model = Transformer(_KWARG_CONFIG).to(DEVICE).eval()
+        tokens = torch.randint(0, 256, (2, 10), device=DEVICE)
+        prefix = torch.randn(2, 6, 128, device=DEVICE)
+        with torch.no_grad():
+            out = model(tokens, modality=ModalityContext(prefix_embeds=prefix))
+        assert out.shape == (2, 16, 256)
+
+    def test_matches_manual_concat(self):
+        """The prefix_embeds path is bit-equal to the manual
+        inputs_embeds=cat([prefix, embed(tokens)], 1) path (sanity check
+        that prefix is placed on the left, not the right)."""
+        model = Transformer(_KWARG_CONFIG).to(DEVICE).eval()
+        tokens = torch.randint(0, 256, (1, 8), device=DEVICE)
+        prefix = torch.randn(1, 4, 128, device=DEVICE)
+        with torch.no_grad():
+            txt_embeds = model.token_embedding(tokens)
+            manual = model(
+                modality=ModalityContext(inputs_embeds=torch.cat([prefix, txt_embeds], dim=1))
+            )
+            prefixed = model(tokens, modality=ModalityContext(prefix_embeds=prefix))
+        assert torch.equal(manual, prefixed)
+
+    def test_inputs_embeds_and_prefix_embeds_mutually_exclusive(self):
+        """ModalityContext.__post_init__ rejects setting both inputs_embeds
+        and prefix_embeds (mutually exclusive residual-stream routes)."""
+        embeds = torch.randn(1, 8, 128, device=DEVICE)
+        prefix = torch.randn(1, 4, 128, device=DEVICE)
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            ModalityContext(inputs_embeds=embeds, prefix_embeds=prefix)
+
+    def test_dtype_promotion_cast(self):
+        """prefix in fp32 while the transformer is bf16: the cast happens
+        inside Transformer.forward before the concat, output dtype matches
+        the transformer."""
+        model = Transformer(_KWARG_CONFIG).to(DEVICE).to(torch.bfloat16)
+        tokens = torch.randint(0, 256, (1, 4), device=DEVICE)
+        prefix = torch.randn(1, 3, 128, device=DEVICE, dtype=torch.float32)
+        with torch.no_grad():
+            out = model(tokens, modality=ModalityContext(prefix_embeds=prefix))
+        assert out.dtype == torch.bfloat16
+        assert out.shape == (1, 7, 256)
+
+    def test_with_kv_caches_raises(self):
+        """prefix_embeds is training-only; combining with kv_caches would
+        cause the RoPE offset to double-count the prefix at every decode
+        step. Guard rejects it."""
+        from kempnerforge.model.attention import KVCache
+
+        model = Transformer(_KWARG_CONFIG).to(DEVICE)
+        kv = [
+            KVCache(
+                batch_size=1,
+                max_seq_len=32,
+                n_kv_heads=4,
+                head_dim=32,
+                dtype=torch.float32,
+                device=DEVICE,
+            )
+            for _ in range(_KWARG_CONFIG.n_layers)
+        ]
+        tokens = torch.randint(0, 256, (1, 4), device=DEVICE)
+        prefix = torch.randn(1, 2, 128, device=DEVICE)
+        with pytest.raises(ValueError, match="modality.prefix_embeds is training-only"):
+            model(tokens, modality=ModalityContext(prefix_embeds=prefix), kv_caches=kv)
 
 
 # ---------------------------------------------------------------------------
