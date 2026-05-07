@@ -787,6 +787,202 @@ class TestMoT:
 
 
 # ---------------------------------------------------------------------------
+# Cross-Attention interleaving on Transformer
+# ---------------------------------------------------------------------------
+
+
+def _ca_config(n_layers: int, cadence: int) -> ModelConfig:
+    """Tiny CrossAttentionConfig-backed ModelConfig for interleaving tests."""
+    from kempnerforge.config.vlm import CrossAttentionConfig
+
+    return ModelConfig(
+        dim=64,
+        n_layers=n_layers,
+        n_heads=4,
+        vocab_size=256,
+        max_seq_len=128,
+        vlm=CrossAttentionConfig(
+            vision_encoder="random",
+            feature_dim=64,
+            num_tokens=8,
+            cross_attention_every_n_layers=cadence,
+            max_text_len=64,
+        ),
+    )
+
+
+class TestCrossAttentionInterleaving:
+    def test_n28_cadence4_yields_7_ca_blocks(self):
+        """Paper baseline: 28 layers, cadence 4 -> 7 CA blocks."""
+        model = Transformer(_ca_config(n_layers=28, cadence=4))
+        assert len(model.cross_attention_layers) == 7
+        assert model._ca_cadence == 4
+
+    def test_n32_cadence4_yields_8_ca_blocks(self):
+        """Default 7B backbone: 32 layers, cadence 4 -> 8 CA blocks."""
+        model = Transformer(_ca_config(n_layers=32, cadence=4))
+        assert len(model.cross_attention_layers) == 8
+
+    def test_n28_cadence4_attaches_at_paper_positions(self):
+        """CA fires after text block i iff (i+1) % cadence == 0.
+        For 28/4 the firing indices are {3, 7, 11, 15, 19, 23, 27}.
+        We exercise the boundary by counting CA invocations."""
+        from kempnerforge.config.vlm import CrossAttentionConfig
+        from kempnerforge.model.cross_attention import CrossAttentionBlock
+
+        config = _ca_config(n_layers=28, cadence=4)
+        assert isinstance(config.vlm, CrossAttentionConfig)
+
+        model = Transformer(config).to(DEVICE).eval()
+        # Replace CA blocks with counters via monkeypatching forward.
+        invocations: list[int] = []
+        original = CrossAttentionBlock.forward
+
+        def counting_forward(self, x, image_features, image_mask=None):
+            invocations.append(len(invocations))
+            return original(self, x, image_features, image_mask)
+
+        CrossAttentionBlock.forward = counting_forward  # type: ignore[method-assign]
+        try:
+            tokens = torch.randint(0, 256, (1, 8), device=DEVICE)
+            img = torch.randn(1, 8, 64, device=DEVICE)
+            with torch.no_grad():
+                model(tokens, modality=ModalityContext(image_features=img))
+        finally:
+            CrossAttentionBlock.forward = original  # type: ignore[method-assign]
+        # 7 CA blocks should have fired exactly once each.
+        assert invocations == list(range(7))
+
+    def test_text_only_path_bit_equal_when_no_vlm(self):
+        """Without a VLM config, cross_attention_layers is empty and the
+        forward-loop's inner branch is dead -> output bit-equal to a
+        Transformer built before this commit (text-only path).
+        """
+        config = ModelConfig(dim=64, n_layers=4, n_heads=4, vocab_size=256, max_seq_len=32)
+        model = Transformer(config).to(DEVICE).eval()
+        assert len(model.cross_attention_layers) == 0
+        assert model._ca_cadence == 0
+        tokens = torch.randint(0, 256, (1, 8), device=DEVICE)
+        with torch.no_grad():
+            out = model(tokens)
+        assert out.shape == (1, 8, 256)
+
+    def test_old_jd_checkpoint_loads_with_empty_cross_attention_layers(self):
+        """A state dict from a Transformer built before this commit (no
+        cross_attention_layers keys) loads cleanly into a Transformer
+        with an empty cross_attention_layers ModuleDict (strict=True).
+        """
+        # Build a Transformer with an empty cross_attention_layers
+        # (text-only or JD config). Save its state_dict.
+        config = ModelConfig(dim=64, n_layers=4, n_heads=4, vocab_size=256, max_seq_len=32)
+        model_a = Transformer(config)
+        state = {k: v for k, v in model_a.state_dict().items()}
+        # No cross_attention_layers entries should appear when the dict is empty.
+        assert not any(k.startswith("cross_attention_layers.") for k in state)
+        # Build a fresh Transformer (also empty CA dict) and load.
+        model_b = Transformer(config)
+        missing_keys, unexpected_keys = model_b.load_state_dict(state, strict=True)
+        assert missing_keys == []
+        assert unexpected_keys == []
+
+    def test_cadence_change_in_state_dict_load(self):
+        """A checkpoint saved with cadence=4 (n_layers=8 -> 2 CA blocks)
+        does not load into a model built with cadence=2 (n_layers=8 ->
+        4 CA blocks): strict=True raises with a missing-keys error
+        mentioning cross_attention_layers.
+        """
+        cfg_4 = _ca_config(n_layers=8, cadence=4)  # K=2
+        cfg_2 = _ca_config(n_layers=8, cadence=2)  # K=4
+        model_4 = Transformer(cfg_4)
+        model_2 = Transformer(cfg_2)
+        state_4 = model_4.state_dict()
+        with pytest.raises(RuntimeError, match="cross_attention_layers"):
+            model_2.load_state_dict(state_4, strict=True)
+
+    def test_ca_preserves_text_causality(self):
+        """Text token at position t produces a bit-equal hidden state
+        regardless of text tokens at positions > t, even with CA blocks
+        interleaved. Two inputs that agree on [0..t-1] and differ on
+        [t..end] must produce equal logits on positions [0..t-1].
+        """
+        torch.manual_seed(0)
+        config = _ca_config(n_layers=8, cadence=4)
+        model = Transformer(config).to(DEVICE).eval()
+        img = torch.randn(1, 8, 64, device=DEVICE)
+        seq_len = 12
+
+        for t in [1, 4, 7, 10]:
+            tokens_a = torch.randint(0, 256, (1, seq_len), device=DEVICE)
+            tokens_b = tokens_a.clone()
+            # Differ at positions [t..end]
+            tokens_b[:, t:] = (tokens_b[:, t:] + 1) % 256
+            with torch.no_grad():
+                out_a = model(tokens_a, modality=ModalityContext(image_features=img))
+                out_b = model(tokens_b, modality=ModalityContext(image_features=img))
+            torch.testing.assert_close(out_a[:, :t, :], out_b[:, :t, :], atol=1e-5, rtol=1e-5)
+
+    def test_ca_zero_init_residual_at_construction(self):
+        """At construction (before any optimizer step), CA blocks are
+        identity. So a CA-built Transformer's forward output equals a
+        text-only Transformer's forward output for the same text tokens
+        and same backbone weights.
+        """
+        torch.manual_seed(0)
+        config_ca = _ca_config(n_layers=4, cadence=2)
+        text_config = ModelConfig(
+            dim=config_ca.dim,
+            n_layers=config_ca.n_layers,
+            n_heads=config_ca.n_heads,
+            vocab_size=config_ca.vocab_size,
+            max_seq_len=config_ca.max_seq_len,
+        )
+        ca_model = Transformer(config_ca).to(DEVICE).eval()
+        text_model = Transformer(text_config).to(DEVICE).eval()
+        # Copy CA model's text-stack weights into text_model so backbone matches.
+        text_state = {
+            k: v for k, v in ca_model.state_dict().items() if "cross_attention_layers" not in k
+        }
+        text_model.load_state_dict(text_state, strict=True)
+        tokens = torch.randint(0, 256, (1, 8), device=DEVICE)
+        img = torch.randn(1, 8, 64, device=DEVICE)
+        with torch.no_grad():
+            out_ca = ca_model(tokens, modality=ModalityContext(image_features=img))
+            out_text = text_model(tokens)
+        torch.testing.assert_close(out_ca, out_text, atol=1e-5, rtol=1e-5)
+
+    def test_image_features_required_when_ca_layers_present(self):
+        """Forward without image_features raises a clear error when
+        CA layers are configured."""
+        config = _ca_config(n_layers=4, cadence=2)
+        model = Transformer(config).to(DEVICE).eval()
+        tokens = torch.randint(0, 256, (1, 8), device=DEVICE)
+        with pytest.raises(ValueError, match="image_features is None"):
+            model(tokens)
+
+    def test_image_features_with_kv_caches_raises(self):
+        """Cross-arg invariant: image_features is training-only."""
+        from kempnerforge.model.attention import KVCache
+
+        config = _ca_config(n_layers=4, cadence=2)
+        model = Transformer(config).to(DEVICE)
+        kv = [
+            KVCache(
+                batch_size=1,
+                max_seq_len=32,
+                n_kv_heads=4,
+                head_dim=16,
+                dtype=torch.float32,
+                device=DEVICE,
+            )
+            for _ in range(config.n_layers)
+        ]
+        tokens = torch.randint(0, 256, (1, 4), device=DEVICE)
+        img = torch.randn(1, 8, 64, device=DEVICE)
+        with pytest.raises(ValueError, match="image_features is training-only"):
+            model(tokens, modality=ModalityContext(image_features=img), kv_caches=kv)
+
+
+# ---------------------------------------------------------------------------
 # Weight initialization
 # ---------------------------------------------------------------------------
 

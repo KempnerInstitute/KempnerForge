@@ -19,6 +19,7 @@ def init_weights(model: nn.Module, config: ModelConfig) -> None:
     - Linear layers: normal(0, 0.02)
     - Embedding layers: normal(0, 0.02)
     - Residual output projections (o_proj, down_proj): scaled by 1/sqrt(2 * n_layers)
+    - Cross-attention block residuals: zero-initialized (identity-at-init warm-start)
     - MoT per-modality residual projections: zero-initialized (identity-at-construction)
     - Norm layers: weight=1 (already default)
     """
@@ -32,8 +33,15 @@ def init_weights(model: nn.Module, config: ModelConfig) -> None:
             # Bias and norm parameters: leave at default (zeros / ones)
             continue
 
-        # Residual projections get scaled init to prevent signal growth
-        if name.endswith(("o_proj.weight", "down_proj.weight")):
+        # Cross-attention block residuals get zero-init so the block is
+        # identity at construction; downstream training learns a
+        # non-zero contribution from there.
+        if name.startswith("cross_attention_layers.") and name.endswith(
+            ("o_proj.weight", "down_proj.weight")
+        ):
+            nn.init.zeros_(param)
+        # Residual projections elsewhere get scaled init to prevent signal growth
+        elif name.endswith(("o_proj.weight", "down_proj.weight")):
             nn.init.normal_(param, mean=0.0, std=std * residual_scale)
         else:
             nn.init.normal_(param, mean=0.0, std=std)
