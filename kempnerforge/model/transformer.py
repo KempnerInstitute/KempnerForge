@@ -16,7 +16,9 @@ import torch.nn as nn
 
 from kempnerforge.config.registry import registry
 from kempnerforge.config.schema import ModelConfig
+from kempnerforge.config.vlm import CrossAttentionConfig
 from kempnerforge.model.attention import Attention, KVCache
+from kempnerforge.model.cross_attention import CrossAttentionBlock
 from kempnerforge.model.embedding import OutputHead, TokenEmbedding
 from kempnerforge.model.init import init_weights
 from kempnerforge.model.mlp import build_mlp
@@ -109,6 +111,26 @@ class Transformer(nn.Module):
             {str(i): TransformerBlock(config, layer_idx=i) for i in range(config.n_layers)}
         )
 
+        # Cross-Attention layers (only populated when vlm is a
+        # CrossAttentionConfig). Empty ModuleDict registers no
+        # state_dict keys, so JD checkpoints load unchanged on builds
+        # where this dict ends up empty.
+        self.cross_attention_layers: nn.ModuleDict = nn.ModuleDict()
+        self._ca_cadence: int = 0
+        if isinstance(config.vlm, CrossAttentionConfig):
+            self._ca_cadence = config.vlm.cross_attention_every_n_layers
+            n_h, n_kv = config.vlm.resolved_heads(config.n_heads)
+            num_ca_blocks = config.n_layers // self._ca_cadence
+            for k in range(num_ca_blocks):
+                self.cross_attention_layers[str(k)] = CrossAttentionBlock(
+                    dim=config.dim,
+                    n_heads=n_h,
+                    n_kv_heads=n_kv,
+                    ffn_hidden_dim=config.computed_ffn_hidden_dim,
+                    norm_type=config.norm_type,
+                    activation=config.activation,
+                )
+
         # Final normalization
         self.norm = build_norm(config.norm_type, config.dim, eps=config.norm_eps)
 
@@ -184,20 +206,22 @@ class Transformer(nn.Module):
 
         Exactly one of ``tokens`` or ``modality.inputs_embeds`` must be
         provided. Modality-injection routes (``prefix_embeds``,
-        ``output_slice``) are grouped on the optional ``ModalityContext``
-        arg; see ``kempnerforge/model/modality.py`` for the full
-        intra-context invariant table.
+        ``output_slice``, ``image_features``, ``image_mask``) are
+        grouped on the optional ``ModalityContext`` arg; see
+        ``kempnerforge/model/modality.py`` for the full intra-context
+        invariant table.
 
         Args:
             tokens: Integer token ids, shape ``(batch, seq_len)``.
             modality: Optional ``ModalityContext`` bundling pre-embedded
-                inputs, prefix embeds, and output slicing for VLM arches.
-                ``None`` is the pure text-only forward.
+                inputs, prefix embeds, output slicing, and image features
+                for VLM arches. ``None`` is the pure text-only forward.
             kv_caches: Optional list of KVCache (one per layer) for
                 generation. When provided, RoPE positions are offset by
                 the current cache fill level. Cross-arg invariant:
-                ``kv_caches`` forbids ``modality.prefix_embeds`` and
-                ``modality.output_slice`` (both training-only).
+                ``kv_caches`` forbids ``modality.prefix_embeds``,
+                ``modality.output_slice``, and ``modality.image_features``
+                (all training-only).
             doc_ids: Optional per-token document IDs for packed sequences,
                 shape ``(batch, seq_len)``. Enables block-diagonal causal
                 attention that isolates documents within packed sequences.
@@ -210,6 +234,8 @@ class Transformer(nn.Module):
         inputs_embeds = modality.inputs_embeds if modality is not None else None
         prefix_embeds = modality.prefix_embeds if modality is not None else None
         output_slice = modality.output_slice if modality is not None else None
+        image_features = modality.image_features if modality is not None else None
+        image_mask = modality.image_mask if modality is not None else None
 
         if (tokens is None) == (inputs_embeds is None):
             raise ValueError(
@@ -227,6 +253,10 @@ class Transformer(nn.Module):
                 # at every decode step. Training-only.
                 raise ValueError(
                     "modality.prefix_embeds is training-only; cannot be combined with kv_caches"
+                )
+            if image_features is not None:
+                raise ValueError(
+                    "modality.image_features is training-only; cannot be combined with kv_caches"
                 )
 
         h = (
@@ -254,11 +284,27 @@ class Transformer(nn.Module):
         cos = self._rope_cos[start_pos : start_pos + seq_len]  # type: ignore[reportOptionalSubscript]
         sin = self._rope_sin[start_pos : start_pos + seq_len]  # type: ignore[reportOptionalSubscript]
 
-        # Transformer blocks
+        # Transformer blocks. When the model has cross-attention layers
+        # (CrossAttentionConfig + nonzero cadence), a CrossAttentionBlock
+        # fires after text block index i iff (i+1) % _ca_cadence == 0.
+        # _ca_cadence == 0 (text-only / Joint-Decoder) makes the inner
+        # branch dead, so the JD path stays bit-equal to today's.
+        ca_iter = iter(self.cross_attention_layers.values()) if self._ca_cadence else None
         for i, layer in enumerate(self.layers.values()):
             cache = kv_caches[i] if kv_caches is not None else None
             h = layer(h, cos, sin, kv_cache=cache, doc_ids=doc_ids)
-
+            if ca_iter is not None and (i + 1) % self._ca_cadence == 0:
+                ca = next(ca_iter, None)
+                if ca is not None:
+                    if image_features is None:
+                        raise ValueError(
+                            "Cross-Attention block fired but modality.image_features is None. "
+                            "Cross-Attention models require image_features in the "
+                            "ModalityContext."
+                        )
+                    if image_features.dtype != h.dtype:
+                        image_features = image_features.to(h.dtype)
+                    h = ca(h, image_features, image_mask)
         # Final norm
         h = self.norm(h)
 

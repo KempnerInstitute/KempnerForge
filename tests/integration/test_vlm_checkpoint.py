@@ -131,32 +131,33 @@ class TestCrossArchLoad:
     """Cross-arch resume: filter both saved and expected freeze metadata
     to the intersection of module keys before comparing.
 
-    A JD checkpoint may have only ``vision_encoder`` in its freeze list,
-    while a future arch's config could add an extra alias by default.
-    The intersection rule lets keys present on only one side drop out
-    so the remaining shared keys compare cleanly. Real semantic
-    mismatches on shared keys still raise.
+    A JD checkpoint has only ``vision_encoder`` in its freeze list. A
+    Cross-Attention config's expected metadata adds ``cross_attention``
+    by default. Loading JD into CA: ``cross_attention`` is in expected
+    but not in saved, so it gets dropped from expected; the remaining
+    ``vision_encoder`` entries compare cleanly. Real semantic mismatches
+    on shared keys still raise.
     """
 
     def test_extra_expected_key_drops_out(self, tmp_path):
         """Saved {vision_encoder=True}; expected
-        {vision_encoder=True, future_arch=False}. Load succeeds:
-        future_arch is dropped from expected (not in saved)."""
+        {vision_encoder=True, cross_attention=False}. Load succeeds:
+        cross_attention is dropped from expected (not in saved)."""
         mgr = _make_manager(tmp_path)
         mgr.save(step=1, extra={"vlm_freeze": _freeze(("vision_encoder", True))})
 
         mgr2 = _make_manager(tmp_path)
         # Simulate a future-arch config's expected: extra alias not in saved.
-        expected = _freeze(("future_arch", False), ("vision_encoder", True))
+        expected = _freeze(("cross_attention", False), ("vision_encoder", True))
         step, _, _ = mgr2.load(vlm_freeze_expected=expected)
         assert step == 1
 
     def test_extra_saved_key_drops_out(self, tmp_path):
-        """Saved {vision_encoder=True, future_arch=False}; expected
-        {vision_encoder=True}. Load succeeds: future_arch is dropped
+        """Saved {vision_encoder=True, cross_attention=False}; expected
+        {vision_encoder=True}. Load succeeds: cross_attention is dropped
         from saved (not in expected)."""
         mgr = _make_manager(tmp_path)
-        saved = _freeze(("future_arch", False), ("vision_encoder", True))
+        saved = _freeze(("cross_attention", False), ("vision_encoder", True))
         mgr.save(step=1, extra={"vlm_freeze": saved})
 
         mgr2 = _make_manager(tmp_path)
@@ -168,7 +169,7 @@ class TestCrossArchLoad:
         """Even with cross-arch keys dropped, mismatch on a shared key
         (vision_encoder=True saved vs False expected) still raises."""
         mgr = _make_manager(tmp_path)
-        saved = _freeze(("future_arch", False), ("vision_encoder", True))
+        saved = _freeze(("cross_attention", False), ("vision_encoder", True))
         mgr.save(step=1, extra={"vlm_freeze": saved})
 
         mgr2 = _make_manager(tmp_path)
@@ -182,7 +183,7 @@ class TestCrossArchLoad:
         the error message should call out which keys were dropped from
         each side so the user can diagnose."""
         mgr = _make_manager(tmp_path)
-        saved = _freeze(("future_arch", False), ("vision_encoder", True))
+        saved = _freeze(("cross_attention", False), ("vision_encoder", True))
         mgr.save(step=1, extra={"vlm_freeze": saved})
 
         mgr2 = _make_manager(tmp_path)
@@ -191,7 +192,7 @@ class TestCrossArchLoad:
             mgr2.load(vlm_freeze_expected=mismatched)
         # Error mentions cross-arch drops to help the user.
         assert "cross-arch" in str(exc_info.value)
-        assert "future_arch" in str(exc_info.value)
+        assert "cross_attention" in str(exc_info.value)
 
     def test_disjoint_only_passes_quietly(self, tmp_path):
         """If saved and expected have NO shared keys, both filter to
@@ -201,6 +202,6 @@ class TestCrossArchLoad:
 
         mgr2 = _make_manager(tmp_path)
         # Wholly disjoint expected.
-        weird_expected = _freeze(("future_arch", False))
+        weird_expected = _freeze(("cross_attention", False))
         step, _, _ = mgr2.load(vlm_freeze_expected=weird_expected)
         assert step == 1

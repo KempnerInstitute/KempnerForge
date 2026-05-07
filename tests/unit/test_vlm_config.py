@@ -8,6 +8,7 @@ from kempnerforge.config.model import ModelConfig
 from kempnerforge.config.registry import registry
 from kempnerforge.config.vlm import (
     DEFAULT_MODULE_PATTERNS,
+    CrossAttentionConfig,
     FreezeSpec,
     FreezeStage,
     JointDecoderConfig,
@@ -77,10 +78,43 @@ class TestVLMConfigSubclasses:
         assert cfg.arch == "joint_decoder"
         assert isinstance(cfg, VLMConfig)
 
+    def test_cross_attention_config_construction(self):
+        cfg = CrossAttentionConfig(vision_encoder="random")
+        assert cfg.arch == "cross_attention"
+        assert cfg.cross_attention_every_n_layers == 4
+        assert cfg.cross_attention_n_heads == 0
+        assert cfg.cross_attention_n_kv_heads == 0
+        # CA-specific module alias added to module_patterns
+        assert "cross_attention" in cfg.module_patterns
+        assert cfg.module_patterns["cross_attention"] == [
+            "transformer.cross_attention_layers",
+            "transformer.cross_attention_layers.*",
+        ]
+        # Base aliases still present
+        assert "transformer" in cfg.module_patterns
+        assert "vision_encoder" in cfg.module_patterns
+
+    def test_cross_attention_invalid_cadence(self):
+        with pytest.raises(ValueError, match="cross_attention_every_n_layers"):
+            CrossAttentionConfig(vision_encoder="random", cross_attention_every_n_layers=0)
+
+    def test_cross_attention_negative_heads(self):
+        with pytest.raises(ValueError, match="non-negative"):
+            CrossAttentionConfig(vision_encoder="random", cross_attention_n_heads=-1)
+
     def test_for_arch_joint_decoder(self):
         cfg = VLMConfig.for_arch("joint_decoder", vision_encoder="random")
         assert isinstance(cfg, JointDecoderConfig)
         assert cfg.arch == "joint_decoder"
+
+    def test_for_arch_cross_attention(self):
+        cfg = VLMConfig.for_arch(
+            "cross_attention",
+            vision_encoder="random",
+            cross_attention_every_n_layers=2,
+        )
+        assert isinstance(cfg, CrossAttentionConfig)
+        assert cfg.cross_attention_every_n_layers == 2
 
     def test_for_arch_unknown_raises_value_error(self):
         with pytest.raises(ValueError, match="Unknown vlm.arch"):
@@ -92,18 +126,57 @@ class TestVLMConfigSubclasses:
         except ValueError as e:
             msg = str(e)
             assert "joint_decoder" in msg
+            assert "cross_attention" in msg
 
-    def test_for_arch_reserved_arch_raises_not_implemented(self):
-        """Cross-Attention and MoT are reserved on the JD-only branch;
-        TOMLs aiming at them should get a clear NotImplementedError."""
-        with pytest.raises(NotImplementedError, match="reserved"):
-            VLMConfig.for_arch("cross_attention", vision_encoder="random")
+    def test_for_arch_mot_still_reserved(self):
+        """MoT is the remaining reserved arch on this branch; TOMLs aiming
+        at it should get a clear NotImplementedError."""
         with pytest.raises(NotImplementedError, match="reserved"):
             VLMConfig.for_arch("mot", vision_encoder="random")
 
-    def test_registry_has_joint_decoder(self):
+    def test_registry_has_jd_and_ca(self):
         archs = set(registry.list_vlm_configs())
-        assert "joint_decoder" in archs
+        assert {"joint_decoder", "cross_attention"} <= archs
+
+
+class TestCrossAttentionResolvedHeads:
+    """`cross_attention_n_heads=0` and `cross_attention_n_kv_heads=0` both
+    resolve against ModelConfig.n_heads at build time. The block
+    constructor never observes 0.
+    """
+
+    def test_both_zero_resolve_to_model_n_heads_mha(self):
+        cfg = CrossAttentionConfig(vision_encoder="random")
+        n, kv = cfg.resolved_heads(model_n_heads=32)
+        assert n == 32
+        assert kv == 32
+
+    def test_n_heads_zero_n_kv_heads_explicit_gqa(self):
+        cfg = CrossAttentionConfig(vision_encoder="random", cross_attention_n_kv_heads=4)
+        n, kv = cfg.resolved_heads(model_n_heads=32)
+        assert n == 32
+        assert kv == 4
+
+    def test_n_heads_explicit_n_kv_heads_zero_mha(self):
+        cfg = CrossAttentionConfig(vision_encoder="random", cross_attention_n_heads=8)
+        n, kv = cfg.resolved_heads(model_n_heads=32)
+        assert n == 8
+        assert kv == 8
+
+    def test_both_explicit(self):
+        cfg = CrossAttentionConfig(
+            vision_encoder="random",
+            cross_attention_n_heads=16,
+            cross_attention_n_kv_heads=4,
+        )
+        n, kv = cfg.resolved_heads(model_n_heads=32)
+        assert n == 16
+        assert kv == 4
+
+    def test_zero_model_n_heads_raises(self):
+        cfg = CrossAttentionConfig(vision_encoder="random")
+        with pytest.raises(ValueError, match="model_n_heads must be positive"):
+            cfg.resolved_heads(model_n_heads=0)
 
 
 class TestModalityStrategyRegistry:

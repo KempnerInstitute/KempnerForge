@@ -516,14 +516,22 @@ freeze_schedule = [
         assert sched[1].specs[0].frozen is False
 
     def test_vlm_reserved_arch_in_toml_raises(self, tmp_path):
-        """A TOML aiming at a reserved arch (cross_attention, mot) should
-        surface ``NotImplementedError`` from the loader's arch resolver,
-        not the generic ``Unknown vlm.arch`` message."""
+        """A TOML aiming at a reserved arch should surface
+        ``NotImplementedError`` from the loader's arch resolver, not the
+        generic ``Unknown vlm.arch`` message. Reads ``_RESERVED_ARCHS``
+        dynamically so the test stays portable across branches where
+        the reserved set differs."""
+        from kempnerforge.config.vlm import _RESERVED_ARCHS
+
+        if not _RESERVED_ARCHS:
+            pytest.skip("No reserved arches on this branch")
+
+        reserved_arch = _RESERVED_ARCHS[0]
         toml = tmp_path / "vlm_reserved.toml"
         toml.write_text(
-            """
+            f"""
 [model.vlm]
-arch = "cross_attention"
+arch = "{reserved_arch}"
 vision_encoder = "random"
 num_tokens = 16
 max_text_len = 32
