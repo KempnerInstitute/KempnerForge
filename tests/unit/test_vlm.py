@@ -227,6 +227,68 @@ class TestBuildVLMWrapperErrors:
         with pytest.raises(ValueError, match="model_config.vlm"):
             build_vlm_wrapper(cfg)
 
+    def test_max_seq_len_insufficient_for_inferred_encoder_num_tokens(self):
+        """When ``vlm.num_tokens=0`` (the "infer from encoder at build time"
+        sentinel), the config-time cross-check in ``ModelConfig.__post_init__``
+        is skipped. The build-time check in ``build_vlm_wrapper`` must catch
+        the case where the encoder's resolved ``num_tokens`` + ``max_text_len``
+        exceeds ``max_seq_len``. Regression guard for the §1.1 validation gap.
+        """
+        # RandomVisionEncoder's default num_tokens is 16 (see vision.py:53),
+        # so vlm.num_tokens=0 -> encoder resolves to 16 at build time.
+        # max_text_len=32 -> JD residual = 16 + 32 = 48. max_seq_len=32 < 48.
+        cfg = ModelConfig(
+            dim=64,
+            n_layers=2,
+            n_heads=4,
+            vocab_size=256,
+            max_seq_len=32,
+            vlm=VLMConfig(
+                vision_encoder="random",
+                num_tokens=0,  # sentinel — skips config-time check
+                max_text_len=32,
+            ),
+        )
+        # ModelConfig construction succeeded (no num_tokens-based check fired).
+        assert cfg.vlm is not None and cfg.vlm.num_tokens == 0
+        with pytest.raises(ValueError) as exc_info:
+            build_vlm_wrapper(cfg)
+        # Error message must name max_seq_len, encoder.num_tokens, and
+        # vlm.max_text_len so the user can find the offending knobs.
+        msg = str(exc_info.value)
+        assert "max_seq_len" in msg
+        assert "encoder.num_tokens" in msg
+        assert "max_text_len" in msg
+        assert "32" in msg  # max_seq_len value
+        assert "16" in msg  # encoder.num_tokens value
+
+    def test_build_time_check_skipped_for_cross_attention(self):
+        """CA does not extend the residual stream — the build-time check
+        must allow max_seq_len < encoder.num_tokens + max_text_len so long
+        as max_seq_len >= max_text_len. Without this carve-out, CA configs
+        with num_tokens=0 (sentinel) would incorrectly raise.
+        """
+        # max_seq_len=32, max_text_len=32 -> JD would fail (residual would
+        # be 16+32=48), but CA's residual is text-only (0+32=32).
+        cfg = ModelConfig(
+            dim=64,
+            n_layers=2,
+            n_heads=4,
+            vocab_size=256,
+            max_seq_len=32,
+            vlm=CrossAttentionConfig(
+                vision_encoder="random",
+                num_tokens=0,
+                max_text_len=32,
+            ),
+        )
+        # Should not raise — CA's residual_stream_image_tokens() returns 0
+        # regardless of the encoder's num_tokens.
+        wrapper = build_vlm_wrapper(cfg)
+        assert isinstance(wrapper, VLMWrapper)
+        # CA's residual is text-only, so wrapper.num_image_tokens is 0.
+        assert wrapper.num_image_tokens == 0
+
 
 # ---------------------------------------------------------------------------
 # _is_encoder_frozen

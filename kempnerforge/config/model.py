@@ -105,12 +105,16 @@ class ModelConfig:
                     "Options: 'constant', 'cosine_decay', 'linear_warmup'"
                 )
 
-        # VLM max_seq_len cross-check (only when num_tokens is known at config time;
-        # with num_tokens=0 the encoder resolves it at build time, and the check is
-        # re-run in build_vlm_wrapper). Effective residual-stream length is
+        # VLM max_seq_len cross-check. Effective residual-stream length is
         # residual_stream_image_tokens() + max_text_len; for Cross-Attention this is
-        # max_text_len (residual stream is text-only), for Joint-Decoder it is
+        # max_text_len (residual stream is text-only), for Joint-Decoder / MoT it is
         # num_tokens + max_text_len.
+        #
+        # This config-time check only fires when num_tokens > 0. When num_tokens = 0
+        # (the "infer from encoder at build time" sentinel), the check is skipped
+        # here and re-run in build_vlm_wrapper using the encoder's resolved
+        # num_tokens. That second check is the one that catches misconfigured
+        # max_seq_len when configs use the inference sentinel.
         if self.vlm is not None and self.vlm.num_tokens > 0:
             residual_image_tokens = self.vlm.residual_stream_image_tokens()
             required = residual_image_tokens + self.vlm.max_text_len

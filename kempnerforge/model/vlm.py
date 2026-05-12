@@ -329,6 +329,21 @@ def build_vlm_wrapper(model_config: ModelConfig) -> VLMWrapper:
         num_tokens=vlm.num_tokens if vlm.num_tokens > 0 else None,
         feature_dim=vlm.feature_dim if vlm.feature_dim > 0 else None,
     )
+    # Build-time max_seq_len cross-check using the encoder's resolved
+    # num_tokens. ModelConfig.__post_init__ runs the same check at config
+    # time only when vlm.num_tokens > 0; when the user leaves num_tokens=0
+    # (the "infer from encoder at build time" sentinel) the config-time
+    # check is skipped and the residual-stream allocation goes unchecked
+    # until the model actually runs. This guard fills that gap.
+    residual_image_tokens = vlm.residual_stream_image_tokens(encoder.num_tokens)
+    required = residual_image_tokens + vlm.max_text_len
+    if model_config.max_seq_len < required:
+        raise ValueError(
+            f"max_seq_len ({model_config.max_seq_len}) insufficient for VLM at build time: "
+            f"encoder.num_tokens ({encoder.num_tokens}) -> "
+            f"residual_image_tokens ({residual_image_tokens}) + "
+            f"vlm.max_text_len ({vlm.max_text_len}) = {required}"
+        )
     in_dim = vlm.feature_dim or encoder.feature_dim
     adapter = Adapter(
         in_dim=in_dim,
