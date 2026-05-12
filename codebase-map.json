@@ -1,14 +1,14 @@
 {
   "meta": {
     "description": "KempnerForge codebase map — files, classes, functions, tests, and registry entries",
-    "updated": "2026-04-14",
-    "note": "Keep in sync as phases are implemented"
+    "updated": "2026-05-11",
+    "note": "Keep in sync as phases are implemented. Latest landings: VLM (Joint-Decoder, Cross-Attention, Mixture-of-Transformers) + freeze schedule + vision encoder registry + checkpoint helpers (peek_saved_step, flush_pending_save, cross-arch freeze-meta intersection) + FSDP2 helpers (_fsdp_wrap_transformer_blocks, _apply_fsdp_vlm, _build_vlm)."
   },
   "source": {
     "kempnerforge/config/registry.py": {
       "classes": {
         "Registry": {
-          "purpose": "Central registry for named components (models, optimizers, schedulers, losses)",
+          "purpose": "Central registry for named components (models, optimizers, schedulers, losses, vision encoders, VLM configs, modality strategies)",
           "methods": [
             "register(category, name, obj)",
             "get(category, name)",
@@ -20,32 +20,68 @@
             "register_scheduler(name)",
             "get_scheduler(name)",
             "register_loss(name)",
-            "get_loss(name)"
+            "get_loss(name)",
+            "register_vision_encoder(name)",
+            "get_vision_encoder(name)",
+            "register_vlm_config(name)",
+            "get_vlm_config(name)",
+            "list_vlm_configs()",
+            "register_modality_strategy(name)",
+            "get_modality_strategy(name)",
+            "list_modality_strategies()"
           ]
         }
       },
-      "globals": ["registry: Registry"],
-      "tested_by": ["tests/unit/test_config.py::TestRegistry"]
+      "globals": [
+        "registry: Registry"
+      ],
+      "tested_by": [
+        "tests/unit/test_config.py::TestRegistry"
+      ]
     },
     "kempnerforge/config/schema.py": {
       "purpose": "Backward-compatible re-exports — all config classes defined in submodules below",
-      "re_exports_from": ["config/model.py", "config/training.py", "config/optimizer.py", "config/scheduler.py", "config/data.py", "config/eval.py", "config/distributed.py", "config/checkpoint.py", "config/metrics.py", "config/profiling.py"]
+      "re_exports_from": [
+        "config/model.py",
+        "config/training.py",
+        "config/optimizer.py",
+        "config/scheduler.py",
+        "config/data.py",
+        "config/eval.py",
+        "config/distributed.py",
+        "config/checkpoint.py",
+        "config/metrics.py",
+        "config/profiling.py"
+      ]
     },
     "kempnerforge/config/model.py": {
-      "enums": ["NormType", "Activation"],
+      "enums": [
+        "NormType",
+        "Activation"
+      ],
       "classes": {
         "ModelConfig": {
           "purpose": "Architecture hyperparameters (dim, layers, heads, vocab, MoE, QK-norm)",
-          "properties": ["is_moe", "head_dim", "computed_ffn_hidden_dim", "num_params_estimate"]
+          "properties": [
+            "is_moe",
+            "head_dim",
+            "computed_ffn_hidden_dim",
+            "num_params_estimate"
+          ]
         }
       }
     },
     "kempnerforge/config/training.py": {
-      "enums": ["ActivationCheckpointing"],
+      "enums": [
+        "ActivationCheckpointing"
+      ],
       "classes": {
         "TrainConfig": {
           "purpose": "Training hyperparameters (steps, batch, seq_len, precision, loss, grad accum)",
-          "properties": ["param_dtype", "is_fp8"]
+          "properties": [
+            "param_dtype",
+            "is_fp8"
+          ]
         }
       }
     },
@@ -57,7 +93,9 @@
       }
     },
     "kempnerforge/config/scheduler.py": {
-      "enums": ["SchedulerType"],
+      "enums": [
+        "SchedulerType"
+      ],
       "classes": {
         "SchedulerConfig": {
           "purpose": "LR schedule (type, warmup, min_lr_ratio, WSD params, wsd_decay_type, rex_alpha)"
@@ -85,16 +123,23 @@
       }
     },
     "kempnerforge/config/distributed.py": {
-      "enums": ["PipelineSchedule"],
+      "enums": [
+        "PipelineSchedule"
+      ],
       "classes": {
         "DistributedConfig": {
           "purpose": "Parallelism dimensions (tp, pp, cp, ep, dp_replicate, dp_shard, fsdp)",
-          "methods": ["validate_world_size(world_size)", "resolve(world_size)"]
+          "methods": [
+            "validate_world_size(world_size)",
+            "resolve(world_size)"
+          ]
         }
       }
     },
     "kempnerforge/config/checkpoint.py": {
-      "enums": ["AsyncCheckpointMode"],
+      "enums": [
+        "AsyncCheckpointMode"
+      ],
       "classes": {
         "CheckpointConfig": {
           "purpose": "Checkpointing (dir, interval, keep, async mode)"
@@ -119,7 +164,9 @@
       "classes": {
         "JobConfig": {
           "purpose": "Top-level config aggregating all sub-configs, cross-section validation",
-          "methods": ["validate(world_size)"]
+          "methods": [
+            "validate(world_size)"
+          ]
         }
       },
       "tested_by": [
@@ -138,6 +185,61 @@
         "tests/unit/test_mixing.py::TestDataConfigMixing",
         "tests/unit/test_annealing.py::TestTrainingPhase",
         "tests/unit/test_annealing.py::TestDataConfigPhases"
+      ]
+    },
+    "kempnerforge/config/vlm.py": {
+      "purpose": "VLM (vision-language model) configuration. Discriminated union over `arch`: joint_decoder | cross_attention | mot. Each subclass registered via @registry.register_vlm_config",
+      "classes": {
+        "FreezeSpec": {
+          "purpose": "Single freeze directive (module alias or fnmatch pattern, frozen flag). Consumed by training/freeze.py"
+        },
+        "FreezeStage": {
+          "purpose": "Step-boundary freeze transition (start_step + tuple of FreezeSpecs). Strictly monotonic in start_step"
+        },
+        "VLMConfig": {
+          "purpose": "Base VLM configuration. Subclasses register via @registry.register_vlm_config and override the `arch` field's default",
+          "methods": [
+            "__post_init__()",
+            "residual_stream_image_tokens() -> int",
+            "for_arch(arch, **kwargs) -> VLMConfig"
+          ]
+        },
+        "JointDecoderConfig(VLMConfig)": {
+          "purpose": "Joint-Decoder: image embeds prepended to text via prefix_embeds + output_slice. arch='joint_decoder'"
+        },
+        "CrossAttentionConfig(VLMConfig)": {
+          "purpose": "Cross-Attention (Llama-3-V style): image K/V flows into separate CrossAttentionBlocks at a configurable cadence. arch='cross_attention'",
+          "methods": [
+            "__post_init__()",
+            "residual_stream_image_tokens() -> 0",
+            "resolved_heads(model_n_heads) -> (n_heads, n_kv_heads)"
+          ]
+        },
+        "MoTConfig(VLMConfig)": {
+          "purpose": "Mixture-of-Transformers (Liang et al. 2024 Algorithm 1): per-modality Q/K/V/O + per-modality FFN at every layer with single global SDPA. arch='mot'",
+          "methods": [
+            "__post_init__()",
+            "residual_stream_image_tokens() -> num_tokens",
+            "resolved_image_heads(model_n_heads, model_n_kv_heads) -> (n_heads, n_kv_heads)"
+          ]
+        }
+      },
+      "globals": [
+        "DEFAULT_MODULE_PATTERNS",
+        "_RESERVED_ARCHS"
+      ],
+      "registry": [
+        "@registry.register_vlm_config('joint_decoder')",
+        "@registry.register_vlm_config('cross_attention')",
+        "@registry.register_vlm_config('mot')"
+      ],
+      "tested_by": [
+        "tests/unit/test_vlm_config.py::TestVLMConfigValidation",
+        "tests/unit/test_vlm_config.py::TestVLMConfigSubclasses",
+        "tests/unit/test_vlm_config.py::TestCrossAttentionResolvedHeads",
+        "tests/unit/test_vlm_config.py::TestMoTConfig",
+        "tests/unit/test_vlm_config.py::TestModalityStrategyRegistry",
+        "tests/unit/test_vlm_config.py::TestModelConfigWithVLM"
       ]
     },
     "kempnerforge/config/loader.py": {
@@ -160,13 +262,15 @@
     "kempnerforge/model/transformer.py": {
       "classes": {
         "TransformerBlock": {
-          "purpose": "Single pre-norm transformer block (attention + MLP with residuals)",
-          "methods": ["forward(x, rope_cos, rope_sin, *, kv_cache, doc_ids)"]
+          "purpose": "Single pre-norm transformer block (attention + MLP with residuals). Used on text-only / Joint-Decoder / Cross-Attention paths",
+          "methods": [
+            "forward(x, rope_cos, rope_sin, *, kv_cache, doc_ids)"
+          ]
         },
         "Transformer": {
-          "purpose": "Full decoder-only transformer (embed -> blocks -> norm -> head)",
+          "purpose": "Full decoder-only transformer (embed -> blocks -> norm -> head). Branches on isinstance(config.vlm, MoTConfig) to build MoTBlocks + per-modality mot_norms + per-modality forward path; on isinstance(config.vlm, CrossAttentionConfig) to interleave CrossAttentionBlocks at cadence; otherwise the JD / text-only path. Forward accepts a `modality: ModalityContext` kwarg with cross-arg invariants vs kv_caches",
           "methods": [
-            "forward(tokens, *, kv_caches, doc_ids)",
+            "forward(tokens, *, modality, kv_caches, doc_ids)",
             "init_weights_and_freqs()",
             "get_moe_aux_loss()",
             "get_expert_counts()",
@@ -174,22 +278,190 @@
           ]
         }
       },
-      "registry": ["@registry.register_model('transformer') _build_transformer(model_config)"],
+      "registry": [
+        "@registry.register_model('transformer') _build_transformer(model_config)"
+      ],
       "tested_by": [
         "tests/unit/test_model.py::TestTransformerBlock",
-        "tests/unit/test_model.py::TestTransformer"
+        "tests/unit/test_model.py::TestTransformer",
+        "tests/unit/test_model.py::TestInputsEmbeds",
+        "tests/unit/test_model.py::TestOutputSlice",
+        "tests/unit/test_model.py::TestPrefixEmbeds",
+        "tests/unit/test_model.py::TestModalityIdsCrossArgs",
+        "tests/unit/test_model.py::TestCrossAttentionInterleaving",
+        "tests/unit/test_model.py::TestMoT"
+      ]
+    },
+    "kempnerforge/model/modality.py": {
+      "classes": {
+        "ModalityContext": {
+          "purpose": "Frozen dataclass bundling all modality-injection inputs flowing into Transformer.forward (inputs_embeds, prefix_embeds, output_slice, image_features, image_mask, modality_ids). Intra-context invariants enforced in __post_init__; cross-arg invariants vs kv_caches enforced at the top of Transformer.forward",
+          "methods": [
+            "__post_init__()"
+          ]
+        }
+      },
+      "tested_by": [
+        "tests/unit/test_modality_context.py::TestModalityContextInvariants",
+        "tests/unit/test_modality_context.py::TestModalityIdsInvariants",
+        "tests/unit/test_model.py::TestModalityIdsCrossArgs"
+      ]
+    },
+    "kempnerforge/model/cross_attention.py": {
+      "classes": {
+        "CrossAttention": {
+          "purpose": "Cross-attention operator: text Q attends to image K/V. GQA + RoPE-free (image positions are not autoregressive)",
+          "methods": [
+            "forward(text_h, image_features, image_mask)"
+          ]
+        },
+        "CrossAttentionBlock": {
+          "purpose": "Pre-norm CA block: norm -> CrossAttention -> residual, norm -> MLP -> residual. Zero-init residual projections (o_proj + down_proj) so the block is identity at construction (warm-start property)",
+          "methods": [
+            "forward(text_h, image_features, image_mask)"
+          ]
+        }
+      },
+      "tested_by": [
+        "tests/unit/test_cross_attention.py::TestCrossAttention",
+        "tests/unit/test_cross_attention.py::TestCrossAttentionBlock",
+        "tests/unit/test_cross_attention.py::TestCrossAttentionNumerical",
+        "tests/unit/test_model.py::TestCrossAttentionInterleaving"
+      ]
+    },
+    "kempnerforge/model/mot.py": {
+      "classes": {
+        "MoTAttention": {
+          "purpose": "Per-modality Q/K/V/O projections (nn.ModuleDict keyed by modality) with one global SDPA over the modality-concatenated sequence. Algorithm 1 of Liang et al. (2024). Per-modality QK-norm + per-modality RoPE; image-then-text concat layout matches Chameleon-style causal masking. o_proj.{m}.weight zero-init at construction.",
+          "methods": [
+            "forward(streams, rope, is_causal)"
+          ]
+        },
+        "MoTBlock": {
+          "purpose": "Pre-norm block: per-modality attn_norm + MoTAttention + per-modality mlp_norm + per-modality FFN. Dense FFN branches' down_proj zero-init for warm-start identity. MoE FFN branches (when (i+1) % moe_frequency == 0) skip zero-init",
+          "methods": [
+            "forward(streams, rope)"
+          ]
+        }
+      },
+      "functions": [
+        "_copy_weight(target_module, src_tensor, src_key, modality)",
+        "mot_warm_start_from_text_stack(transformer, source_state_dict)"
+      ],
+      "tested_by": [
+        "tests/unit/test_mot.py::TestMoTAttentionStructural",
+        "tests/unit/test_mot.py::TestMoTAttentionForward",
+        "tests/unit/test_mot.py::TestMoTAttentionNumerical",
+        "tests/unit/test_mot.py::TestMoTBlock",
+        "tests/unit/test_mot.py::TestWarmStartHelper",
+        "tests/unit/test_model.py::TestMoT",
+        "tests/integration/test_vlm_mot.py",
+        "tests/distributed/test_vlm_mot_fsdp.py"
+      ]
+    },
+    "kempnerforge/model/vision.py": {
+      "classes": {
+        "VisionEncoder": {
+          "purpose": "Base class for vision encoders. Subclasses provide `forward(pixel_values) -> features` of shape (B, num_tokens, feature_dim)"
+        },
+        "RandomVisionEncoder(VisionEncoder)": {
+          "purpose": "Test-stub vision encoder: deterministic random features by image_id hash. No download; used for VLM smokes"
+        },
+        "_HFVisionEncoder(VisionEncoder)": {
+          "purpose": "Wraps a HuggingFace vision model (SigLIP2 or CLIP). Optionally strips the [CLS] token. Stays in HF's loaded dtype; the adapter casts at the boundary"
+        }
+      },
+      "registry": [
+        "@registry.register_vision_encoder('random')",
+        "@registry.register_vision_encoder('siglip2')",
+        "@registry.register_vision_encoder('clip')"
+      ],
+      "tested_by": [
+        "tests/unit/test_vision.py::TestRandomVisionEncoder",
+        "tests/unit/test_vision.py::TestHFEncoders",
+        "tests/unit/test_vision.py::TestVisionEncoderRegistry"
+      ]
+    },
+    "kempnerforge/model/vlm.py": {
+      "classes": {
+        "Adapter": {
+          "purpose": "2-layer MLP from vision-feature dim to LLM embedding dim. reset_parameters() supports meta-device materialization",
+          "methods": [
+            "forward(x)",
+            "reset_parameters()"
+          ]
+        },
+        "ModalityStrategy (Protocol)": {
+          "purpose": "Composes raw VLM inputs into a ModalityContext. Stateless (holds no parameters); read submodules off the VLMWrapper. NOT registered as a submodule, so FSDP2 does not wrap them and DCP does not serialize them",
+          "methods": [
+            "prepare(wrapper, pixel_values, input_ids) -> ModalityContext",
+            "num_image_tokens(wrapper) -> int"
+          ]
+        },
+        "JointDecoderStrategy": {
+          "purpose": "Joint-Decoder: image embeds prepended to text. Fills prefix_embeds + output_slice"
+        },
+        "CrossAttentionStrategy": {
+          "purpose": "Cross-Attention: image embeds flow as K/V into separate CA blocks. Fills image_features + image_mask"
+        },
+        "MoTStrategy": {
+          "purpose": "Mixture-of-Transformers: prefix_embeds + output_slice + per-position modality_ids (0=image, 1=text). Same residual-stream layout as JD, plus the routing tag the MoTBlock stack consumes"
+        },
+        "VLMWrapper(nn.Module)": {
+          "purpose": "VLM wrapper composing vision_encoder + adapter + transformer + strategy. Strategy is a plain Python object, not an nn.Module submodule",
+          "methods": [
+            "forward(pixel_values, input_ids, labels) -> (logits, labels)"
+          ],
+          "properties": [
+            "num_image_tokens"
+          ]
+        }
+      },
+      "functions": [
+        "_project_image_features(wrapper, pixel_values) -> Tensor",
+        "build_modality_strategy(vlm) -> ModalityStrategy",
+        "_is_encoder_frozen(specs) -> bool",
+        "build_vlm_wrapper(model_config) -> VLMWrapper",
+        "inner_transformer(model) -> nn.Module"
+      ],
+      "registry": [
+        "@registry.register_modality_strategy('joint_decoder')",
+        "@registry.register_modality_strategy('cross_attention')",
+        "@registry.register_modality_strategy('mot')"
+      ],
+      "tested_by": [
+        "tests/unit/test_vlm.py::TestAdapter",
+        "tests/unit/test_vlm.py::TestVLMWrapper",
+        "tests/unit/test_vlm.py::TestInnerTransformer",
+        "tests/unit/test_vlm.py::TestIsEncoderFrozen",
+        "tests/unit/test_vlm.py::TestModalityStrategies",
+        "tests/unit/test_vlm.py::TestVLMWrapperDispatch",
+        "tests/integration/test_vlm_train_step.py",
+        "tests/integration/test_vlm_cross_attn.py",
+        "tests/integration/test_vlm_mot.py",
+        "tests/distributed/test_vlm_fsdp.py",
+        "tests/distributed/test_vlm_cross_attn_fsdp.py",
+        "tests/distributed/test_vlm_mot_fsdp.py"
       ]
     },
     "kempnerforge/model/attention.py": {
       "classes": {
         "KVCache": {
           "purpose": "Pre-allocated KV cache for autoregressive generation",
-          "methods": ["update(k_new, v_new)"]
+          "methods": [
+            "update(k_new, v_new)"
+          ]
         },
         "Attention": {
           "purpose": "Grouped-Query Attention with RoPE, SDPA, optional QK-norm, doc_ids masking, attention weight capture",
-          "methods": ["forward(x, rope_cos, rope_sin, *, kv_cache, doc_ids)", "_attention_with_weights(q, k, v, seq_len, doc_ids, kv_cache)"],
-          "properties": ["capture_attention_weights", "_last_attention_weights"]
+          "methods": [
+            "forward(x, rope_cos, rope_sin, *, kv_cache, doc_ids)",
+            "_attention_with_weights(q, k, v, seq_len, doc_ids, kv_cache)"
+          ],
+          "properties": [
+            "capture_attention_weights",
+            "_last_attention_weights"
+          ]
         }
       },
       "tested_by": [
@@ -203,29 +475,41 @@
       "classes": {
         "SwiGLUMLP": {
           "purpose": "SwiGLU feed-forward (Llama-style gated MLP)",
-          "methods": ["forward(x)"]
+          "methods": [
+            "forward(x)"
+          ]
         },
         "StandardMLP": {
           "purpose": "Standard two-layer MLP with configurable activation",
-          "methods": ["forward(x)"]
+          "methods": [
+            "forward(x)"
+          ]
         }
       },
-      "functions": ["build_mlp(dim, hidden_dim, activation) -> nn.Module"],
+      "functions": [
+        "build_mlp(dim, hidden_dim, activation) -> nn.Module"
+      ],
       "registry": [
         "@registry.register('mlp', 'swiglu')",
         "@registry.register('mlp', 'standard_gelu')",
         "@registry.register('mlp', 'standard_relu')"
       ],
-      "tested_by": ["tests/unit/test_model.py::TestMLP"]
+      "tested_by": [
+        "tests/unit/test_model.py::TestMLP"
+      ]
     },
     "kempnerforge/model/norm.py": {
       "classes": {
         "RMSNorm": {
           "purpose": "Root Mean Square Layer Normalization",
-          "methods": ["forward(x)"]
+          "methods": [
+            "forward(x)"
+          ]
         }
       },
-      "functions": ["build_norm(norm_type, dim, eps) -> nn.Module"],
+      "functions": [
+        "build_norm(norm_type, dim, eps) -> nn.Module"
+      ],
       "registry": [
         "@registry.register('norm', 'rmsnorm')",
         "@registry.register('norm', 'layernorm')"
@@ -239,32 +523,52 @@
       "classes": {
         "TokenEmbedding": {
           "purpose": "Token embedding layer",
-          "methods": ["forward(tokens)"]
+          "methods": [
+            "forward(tokens)"
+          ]
         },
         "OutputHead": {
           "purpose": "Linear output projection (hidden -> vocab logits)",
-          "methods": ["forward(x)", "tie_weights(embedding)"]
+          "methods": [
+            "forward(x)",
+            "tie_weights(embedding)"
+          ]
         }
       },
-      "tested_by": ["tests/unit/test_model.py::TestEmbedding"]
+      "tested_by": [
+        "tests/unit/test_model.py::TestEmbedding"
+      ]
     },
     "kempnerforge/model/position.py": {
       "functions": [
         "precompute_rope_frequencies(head_dim, max_seq_len, theta, device) -> (cos, sin)",
         "apply_rope(x, cos, sin) -> Tensor"
       ],
-      "tested_by": ["tests/unit/test_model.py::TestRoPE"]
+      "tested_by": [
+        "tests/unit/test_model.py::TestRoPE"
+      ]
     },
     "kempnerforge/model/init.py": {
-      "functions": ["init_weights(model, config)"],
-      "tested_by": ["tests/unit/test_model.py::TestInitWeights"]
+      "purpose": "Standard initialization: Linear+Embedding ~ N(0, init_std); residual o_proj/down_proj scaled by 1/sqrt(2*n_layers); cross-attention block o_proj/down_proj zero-init; MoT per-modality o_proj.{m}.weight + mlp.{m}.down_proj.weight zero-init via a second isinstance pass (MoTAttention / MoTBlock)",
+      "functions": [
+        "init_weights(model, config)"
+      ],
+      "tested_by": [
+        "tests/unit/test_model.py::TestInitWeights"
+      ]
     },
     "kempnerforge/model/moe.py": {
       "classes": {
         "MoEMLP": {
           "purpose": "Mixture-of-Experts feed-forward layer with router dispatch",
-          "properties": ["aux_loss", "expert_counts"],
-          "methods": ["forward(x)", "_local_forward(x_flat, weights, indices)"]
+          "properties": [
+            "aux_loss",
+            "expert_counts"
+          ],
+          "methods": [
+            "forward(x)",
+            "_local_forward(x_flat, weights, indices)"
+          ]
         }
       },
       "functions": [
@@ -294,13 +598,25 @@
       "classes": {
         "SoftmaxTopKRouter": {
           "purpose": "Mixtral-style softmax top-k router with aux load-balancing loss",
-          "properties": ["aux_loss", "expert_counts"],
-          "methods": ["forward(x)"]
+          "properties": [
+            "aux_loss",
+            "expert_counts"
+          ],
+          "methods": [
+            "forward(x)"
+          ]
         },
         "SigmoidTopKRouter": {
           "purpose": "DeepSeek-V3 style sigmoid router with learnable bias, adaptive scheduling, sequence aux loss",
-          "properties": ["aux_loss", "expert_counts"],
-          "methods": ["forward(x)", "set_step(step, max_steps)", "_effective_bias_rate()"]
+          "properties": [
+            "aux_loss",
+            "expert_counts"
+          ],
+          "methods": [
+            "forward(x)",
+            "set_step(step, max_steps)",
+            "_effective_bias_rate()"
+          ]
         }
       },
       "registry": [
@@ -329,8 +645,17 @@
       "classes": {
         "ActivationStore": {
           "purpose": "Forward hook manager for capturing intermediate activations to CPU",
-          "methods": ["enable()", "disable()", "clear()", "get(name)"],
-          "properties": ["enabled", "layer_names", "activations"]
+          "methods": [
+            "enable()",
+            "disable()",
+            "clear()",
+            "get(name)"
+          ],
+          "properties": [
+            "enabled",
+            "layer_names",
+            "activations"
+          ]
         }
       },
       "functions": [
@@ -368,15 +693,27 @@
       "classes": {
         "Lion": {
           "purpose": "Sign-based momentum optimizer (Chen et al. 2023), half optimizer memory of AdamW",
-          "methods": ["step(closure)"]
+          "methods": [
+            "step(closure)"
+          ]
         },
         "ScheduleFreeAdamW": {
           "purpose": "Schedule-Free AdamW (Defazio & Mishchenko 2024), eliminates LR schedule via iterate averaging",
-          "methods": ["step(closure)", "state_dict()", "load_state_dict(state_dict)", "eval_params()", "train_params()"]
+          "methods": [
+            "step(closure)",
+            "state_dict()",
+            "load_state_dict(state_dict)",
+            "eval_params()",
+            "train_params()"
+          ]
         },
         "Muon": {
           "purpose": "Momentum with Orthogonalized Updates optimizer (Newton-Schulz)",
-          "methods": ["step(closure)", "state_dict()", "load_state_dict(state_dict)"]
+          "methods": [
+            "step(closure)",
+            "state_dict()",
+            "load_state_dict(state_dict)"
+          ]
         }
       },
       "functions": [
@@ -428,11 +765,36 @@
       "functions": [
         "run_eval(model, eval_dataloader, loss_fn, device, eval_steps, *, pp_schedule, pp_rank, pp_size, pp_group) -> dict"
       ],
-      "tested_by": ["tests/unit/test_eval.py::TestRunEval"]
+      "tested_by": [
+        "tests/unit/test_eval.py::TestRunEval"
+      ]
+    },
+    "kempnerforge/training/freeze.py": {
+      "purpose": "Freeze utilities: resolve module aliases / fnmatch patterns to parameter names, flip requires_grad, build canonical metadata for checkpoint validation, compute effective freeze at a given step from base specs + a freeze_schedule with start_step boundaries",
+      "functions": [
+        "freeze_params(model, specs, module_patterns) -> dict",
+        "apply_freeze_specs(model, specs, module_patterns) -> dict",
+        "canonical_freeze_meta(specs) -> list[dict]",
+        "effective_freeze(step, base_specs, schedule, valid_modules) -> list[FreezeSpec]"
+      ],
+      "tested_by": [
+        "tests/unit/test_freeze.py::TestFreezeParams",
+        "tests/unit/test_freeze.py::TestApplyFreezeSpecs",
+        "tests/unit/test_freeze.py::TestCanonicalFreezeMeta",
+        "tests/unit/test_freeze.py::TestEffectiveFreeze",
+        "tests/integration/test_vlm_cross_attn.py::TestFreezeStageHook",
+        "tests/integration/test_vlm_mot.py::TestFreezeStageHook",
+        "tests/distributed/test_vlm_cross_attn_fsdp.py::TestFreezeStageUnderFsdp",
+        "tests/distributed/test_vlm_mot_fsdp.py::TestFreezeStageUnderFsdp"
+      ]
     },
     "kempnerforge/training/grad.py": {
-      "functions": ["maybe_no_sync(model, micro_step, grad_accum_steps)"],
-      "tested_by": ["tests/unit/test_training.py::TestGradUtils"]
+      "functions": [
+        "maybe_no_sync(model, micro_step, grad_accum_steps)"
+      ],
+      "tested_by": [
+        "tests/unit/test_training.py::TestGradUtils"
+      ]
     },
     "kempnerforge/training/hooks.py": {
       "classes": {
@@ -441,11 +803,23 @@
         },
         "TrainingHook": {
           "purpose": "Base class for training loop hooks — override only the methods you need",
-          "methods": ["on_train_begin(config)", "on_step_end(ctx)", "on_eval_end(metrics, step)", "on_checkpoint_save(step, path)", "on_train_end(step, tokens_seen)"]
+          "methods": [
+            "on_train_begin(config)",
+            "on_step_end(ctx)",
+            "on_eval_end(metrics, step)",
+            "on_checkpoint_save(step, path)",
+            "on_train_end(step, tokens_seen)"
+          ]
         },
         "HookRunner": {
           "purpose": "Dispatches hook calls to registered hooks, zero cost when empty",
-          "methods": ["on_train_begin(config)", "on_step_end(ctx)", "on_eval_end(metrics, step)", "on_checkpoint_save(step, path)", "on_train_end(step, tokens_seen)"]
+          "methods": [
+            "on_train_begin(config)",
+            "on_step_end(ctx)",
+            "on_eval_end(metrics, step)",
+            "on_checkpoint_save(step, path)",
+            "on_train_end(step, tokens_seen)"
+          ]
         }
       },
       "tested_by": [
@@ -459,23 +833,51 @@
       "classes": {
         "MemoryMappedDataset": {
           "purpose": "Pre-tokenized dataset via memory-mapped .npy/.bin files",
-          "methods": ["__getitem__(idx)", "__len__()", "state_dict()", "load_state_dict(state)", "_find_file(idx)"]
+          "methods": [
+            "__getitem__(idx)",
+            "__len__()",
+            "state_dict()",
+            "load_state_dict(state)",
+            "_find_file(idx)"
+          ]
         },
         "HuggingFaceDataset": {
           "purpose": "HuggingFace dataset with tokenization and sequence packing",
-          "methods": ["__getitem__(idx)", "__len__()", "state_dict()", "load_state_dict(state)", "_pack_sequences(raw_dataset)"]
+          "methods": [
+            "__getitem__(idx)",
+            "__len__()",
+            "state_dict()",
+            "load_state_dict(state)",
+            "_pack_sequences(raw_dataset)"
+          ]
         },
         "StreamingHuggingFaceDataset": {
           "purpose": "Streaming HuggingFace IterableDataset for large corpora",
-          "methods": ["__iter__()", "state_dict()", "load_state_dict(state)", "_ensure_tokenizer()", "_load_stream()"]
+          "methods": [
+            "__iter__()",
+            "state_dict()",
+            "load_state_dict(state)",
+            "_ensure_tokenizer()",
+            "_load_stream()"
+          ]
         },
         "MixtureDataset": {
           "purpose": "Concatenates multiple datasets with global indexing and per-sample dataset_idx",
-          "methods": ["__getitem__(idx)", "__len__()", "state_dict()", "load_state_dict(state)"],
-          "properties": ["cumulative_sizes", "dataset_names"]
+          "methods": [
+            "__getitem__(idx)",
+            "__len__()",
+            "state_dict()",
+            "load_state_dict(state)"
+          ],
+          "properties": [
+            "cumulative_sizes",
+            "dataset_names"
+          ]
         }
       },
-      "functions": ["_compute_packed_output(tokens, eos_token_id) -> dict"],
+      "functions": [
+        "_compute_packed_output(tokens, eos_token_id) -> dict"
+      ],
       "tested_by": [
         "tests/unit/test_data.py::TestMemoryMappedDataset",
         "tests/unit/test_data.py::TestHuggingFaceDataset",
@@ -490,20 +892,43 @@
       "classes": {
         "StatefulDataLoader": {
           "purpose": "DataLoader wrapper with checkpoint/resume state tracking",
-          "methods": ["__iter__()", "__next__()", "__len__()", "state_dict()", "load_state_dict(state)"]
+          "methods": [
+            "__iter__()",
+            "__next__()",
+            "__len__()",
+            "state_dict()",
+            "load_state_dict(state)"
+          ]
         }
       },
-      "tested_by": ["tests/unit/test_data.py::TestStatefulDataLoader"]
+      "tested_by": [
+        "tests/unit/test_data.py::TestStatefulDataLoader"
+      ]
     },
     "kempnerforge/data/sampler.py": {
       "classes": {
         "DistributedSampler": {
           "purpose": "Deterministic distributed sampler with skip-ahead for resumption",
-          "methods": ["set_epoch(epoch)", "set_skip(skip)", "__iter__()", "__len__()", "state_dict()", "load_state_dict(state)"]
+          "methods": [
+            "set_epoch(epoch)",
+            "set_skip(skip)",
+            "__iter__()",
+            "__len__()",
+            "state_dict()",
+            "load_state_dict(state)"
+          ]
         },
         "MixtureSampler": {
           "purpose": "Weighted sampler over MixtureDataset with temperature scaling and oversampling",
-          "methods": ["set_epoch(epoch)", "set_skip(skip)", "update_weights(weights, temperature)", "__iter__()", "__len__()", "state_dict()", "load_state_dict(state)"]
+          "methods": [
+            "set_epoch(epoch)",
+            "set_skip(skip)",
+            "update_weights(weights, temperature)",
+            "__iter__()",
+            "__len__()",
+            "state_dict()",
+            "load_state_dict(state)"
+          ]
         }
       },
       "tested_by": [
@@ -512,6 +937,33 @@
         "tests/unit/test_mixing.py::TestTemperatureScaling",
         "tests/unit/test_mixing.py::TestMixtureSamplerWithDataset",
         "tests/unit/test_annealing.py::TestUpdateWeights"
+      ]
+    },
+    "kempnerforge/data/vlm_dataset.py": {
+      "classes": {
+        "HuggingFaceVLMDataset": {
+          "purpose": "Map-style VLM dataset over a HuggingFace Dataset (Hub id or local save_to_disk path). Tokenizes captions, normalizes images, returns (pixel_values, input_ids, labels) per sample",
+          "methods": [
+            "__len__()",
+            "__getitem__(idx)"
+          ]
+        },
+        "VLMCollator": {
+          "purpose": "Fixed-length pad collator for VLM batches. Pads input_ids and labels to max_text_len so NCCL collectives stay rank-consistent under FSDP2",
+          "methods": [
+            "__call__(samples)"
+          ]
+        }
+      },
+      "functions": [
+        "_pil_to_tensor(image, image_size, image_mean, image_std) -> Tensor",
+        "_tokenize_and_mask(tokenizer, text, max_text_len, prompt) -> (input_ids, labels)"
+      ],
+      "tested_by": [
+        "tests/unit/test_vlm_dataset.py::TestPILToTensor",
+        "tests/unit/test_vlm_dataset.py::TestTokenizeAndMask",
+        "tests/unit/test_vlm_dataset.py::TestVLMCollator",
+        "tests/unit/test_vlm_dataset.py::TestHuggingFaceVLMDataset"
       ]
     },
     "kempnerforge/distributed/setup.py": {
@@ -533,10 +985,14 @@
     },
     "kempnerforge/distributed/parallel.py": {
       "functions": [
-        "build_parallel_model(model_config, device, device_mesh, *, ac_mode, mp_policy, param_dtype, compile_model, fp8) -> nn.Module",
+        "build_parallel_model(model_config, device, device_mesh, *, ac_mode, mp_policy, param_dtype, compile_model, fp8) -> nn.Module (dispatches to _build_vlm when model_config.vlm is set)",
+        "_build_vlm(model_config, device, device_mesh, *, ac_mode, mp_policy, param_dtype, compile_model, fp8) -> VLMWrapper",
         "apply_ac(model, mode)",
         "apply_float8(model, enable_fsdp_float8_all_gather)",
-        "apply_fsdp2(model, device_mesh, mp_policy, reshard_after_forward)",
+        "apply_fsdp2(model, device_mesh, mp_policy, reshard_after_forward) (text-only path; shares _fsdp_wrap_transformer_blocks with VLM)",
+        "_apply_fsdp_vlm(wrapper, device_mesh, mp_policy, reshard_after_forward) (VLM-aware FSDP: inner Transformer per-block + adapter + optional encoder wrap based on freeze)",
+        "_fsdp_wrap_transformer_blocks(transformer, dp_mesh, policy, reshard_after_forward) (EP-MoE-aware per-block FSDP wrap; iterates transformer.layers and transformer.cross_attention_layers)",
+        "_has_ep_moe(module) -> bool",
         "has_dp_mesh(device_mesh) -> bool",
         "get_dp_mesh(device_mesh) -> DeviceMesh",
         "default_mp_policy(param_dtype) -> MixedPrecisionPolicy"
@@ -545,7 +1001,11 @@
         "tests/distributed/test_fsdp.py::TestFSDP2",
         "tests/distributed/test_fsdp.py::TestActivationCheckpointing",
         "tests/distributed/test_fsdp.py::TestGetDpMesh",
-        "tests/unit/test_fp8.py::TestApplyFloat8"
+        "tests/unit/test_fp8.py::TestApplyFloat8",
+        "tests/unit/test_distributed.py::TestDefaultMpPolicy",
+        "tests/unit/test_distributed.py::TestApplyFsdpVLMGuards",
+        "tests/unit/test_distributed.py::TestBuildParallelModelVLM",
+        "tests/unit/test_distributed.py::TestFsdpWrapTransformerBlocksHelper"
       ]
     },
     "kempnerforge/distributed/tensor_parallel.py": {
@@ -563,20 +1023,28 @@
       "classes": {
         "_AllToAll": {
           "purpose": "Differentiable all-to-all autograd function for expert dispatch",
-          "methods": ["forward(ctx, x, output_split_sizes, input_split_sizes, group)", "backward(ctx, grad_output)"]
+          "methods": [
+            "forward(ctx, x, output_split_sizes, input_split_sizes, group)",
+            "backward(ctx, grad_output)"
+          ]
         }
       },
       "functions": [
         "ep_dispatch_and_compute(x, weights, indices, moe, ep_group, local_expert_start, num_local_experts, ep_world_size, gradient_scale) -> Tensor",
         "apply_expert_parallel(model, device_mesh)"
       ],
-      "tested_by": ["tests/distributed/test_ep.py"]
+      "tested_by": [
+        "tests/distributed/test_ep.py"
+      ]
     },
     "kempnerforge/distributed/pipeline_parallel.py": {
       "classes": {
         "PipelineStageModule": {
           "purpose": "Model chunk for a single pipeline stage",
-          "methods": ["forward(x)", "init_weights_and_freqs()"]
+          "methods": [
+            "forward(x)",
+            "init_weights_and_freqs()"
+          ]
         }
       },
       "functions": [
@@ -600,7 +1068,9 @@
         "get_dp_info(device_mesh) -> (dp_rank, dp_size)",
         "clip_grad_norm_(model, max_norm, foreach) -> Tensor"
       ],
-      "tested_by": ["tests/unit/test_distributed.py::TestClipGradNorm"]
+      "tested_by": [
+        "tests/unit/test_distributed.py::TestClipGradNorm"
+      ]
     },
     "kempnerforge/checkpoint/state.py": {
       "functions": [
@@ -618,12 +1088,32 @@
     "kempnerforge/checkpoint/manager.py": {
       "classes": {
         "CheckpointManager": {
-          "purpose": "DCP-based distributed checkpoint save/load/cleanup manager",
-          "methods": ["save(step, tokens_seen, scheduler, dataloader, extra)", "wait()", "load(path, scheduler, dataloader, exclude_keys)", "_cleanup()"]
+          "purpose": "DCP-based distributed checkpoint save/load/cleanup manager. Cross-arch VLM freeze-metadata validation, rank-0-authoritative train_state existence broadcast (NFS/Lustre stat() race), ownership-gated train_state.pt load",
+          "methods": [
+            "save(step, tokens_seen, scheduler, dataloader, extra)",
+            "wait()",
+            "flush_pending_save()",
+            "peek_saved_step(path)",
+            "load(path, scheduler, dataloader, exclude_keys, vlm_freeze_expected)",
+            "apply_dataloader_state(dataloader)",
+            "_resolve_load_path(path)",
+            "_cleanup()"
+          ]
         }
       },
+      "functions": [
+        "_load_train_state(path) -> dict (ownership-gated torch.load with weights_only=False)",
+        "_intersect_freeze_meta_by_module(saved, expected) -> (saved_filt, expected_filt) (cross-arch drop-zero-match rule)"
+      ],
       "tested_by": [
         "tests/unit/test_checkpoint.py::TestCheckpointRetention",
+        "tests/unit/test_checkpoint.py::TestFlushPendingSave",
+        "tests/unit/test_checkpoint.py::TestPeekSavedStep",
+        "tests/unit/test_checkpoint.py::TestSaveVLMFreezeMetadata",
+        "tests/unit/test_checkpoint.py::TestLoadVLMFreezeCompare",
+        "tests/unit/test_checkpoint.py::TestIntersectFreezeMetaByModule",
+        "tests/unit/test_checkpoint_security.py::TestLoadTrainStateOwnershipGate",
+        "tests/unit/test_checkpoint_security.py::TestManagerLoadRejectsForeignCheckpoint",
         "tests/integration/test_checkpoint_roundtrip.py::TestCheckpointRoundtrip",
         "tests/distributed/test_checkpoint.py"
       ]
@@ -632,11 +1122,18 @@
       "classes": {
         "AsyncCheckpointer": {
           "purpose": "Non-blocking checkpoint saver using dcp.async_save()",
-          "properties": ["is_pending"],
-          "methods": ["save(state_dict, checkpoint_id, process_group)", "wait()"]
+          "properties": [
+            "is_pending"
+          ],
+          "methods": [
+            "save(state_dict, checkpoint_id, process_group)",
+            "wait()"
+          ]
         }
       },
-      "tested_by": ["tests/unit/test_checkpoint.py::TestAsyncCheckpointer"]
+      "tested_by": [
+        "tests/unit/test_checkpoint.py::TestAsyncCheckpointer"
+      ]
     },
     "kempnerforge/metrics/tracker.py": {
       "classes": {
@@ -645,7 +1142,11 @@
         },
         "MetricsTracker": {
           "purpose": "Collect, smooth (EMA), and dispatch metrics to backends",
-          "methods": ["start_step()", "end_step(step, loss, grad_norm, lr, ...)", "log_step(metrics, step)"]
+          "methods": [
+            "start_step()",
+            "end_step(step, loss, grad_norm, lr, ...)",
+            "log_step(metrics, step)"
+          ]
         }
       },
       "tested_by": [
@@ -667,7 +1168,10 @@
       "classes": {
         "DeviceMemoryMonitor": {
           "purpose": "Track GPU memory across training steps with snapshot export",
-          "methods": ["reset_peak()", "snapshot(step)"]
+          "methods": [
+            "reset_peak()",
+            "snapshot(step)"
+          ]
         }
       },
       "functions": [
@@ -687,33 +1191,51 @@
         "estimate_model_flops_per_token(config, seq_len) -> int",
         "compute_mfu(tokens_per_sec, config, seq_len, gpu_peak_tflops) -> float"
       ],
-      "tested_by": ["tests/unit/test_performance.py::TestMFU"]
+      "tested_by": [
+        "tests/unit/test_performance.py::TestMFU"
+      ]
     },
     "kempnerforge/profiling/profiler.py": {
       "functions": [
         "build_profiler(config, rank) -> profile | None",
         "print_profiler_summary(prof)"
       ],
-      "tested_by": ["tests/unit/test_performance.py::TestProfiler"]
+      "tested_by": [
+        "tests/unit/test_performance.py::TestProfiler"
+      ]
     },
     "kempnerforge/profiling/cuda_timer.py": {
       "classes": {
         "CUDATimer": {
           "purpose": "CUDA event-based timer for GPU timing",
-          "methods": ["start()", "stop()", "elapsed_ms()"]
+          "methods": [
+            "start()",
+            "stop()",
+            "elapsed_ms()"
+          ]
         },
         "CUDATimerCollection": {
           "purpose": "Collection of named CUDA timers",
-          "methods": ["start(name)", "stop(name)", "elapsed_all()"]
+          "methods": [
+            "start(name)",
+            "stop(name)",
+            "elapsed_all()"
+          ]
         }
       },
-      "tested_by": ["tests/unit/test_performance.py::TestProfiler"]
+      "tested_by": [
+        "tests/unit/test_performance.py::TestProfiler"
+      ]
     },
     "kempnerforge/resilience/health.py": {
       "classes": {
         "NaNDetector": {
           "purpose": "Detect and track NaN/Inf in loss and gradients with configurable actions",
-          "methods": ["check_loss(loss, step)", "check_grads(model, step)", "should_recommend_rollback()"]
+          "methods": [
+            "check_loss(loss, step)",
+            "check_grads(model, step)",
+            "should_recommend_rollback()"
+          ]
         }
       },
       "functions": [
@@ -731,17 +1253,29 @@
       "classes": {
         "ShutdownHandler": {
           "purpose": "Cooperative shutdown for SIGTERM/SIGUSR1 (SLURM preemption)",
-          "properties": ["shutdown_requested", "signal_received"],
-          "methods": ["register()", "unregister()", "should_shutdown()", "finish()"]
+          "properties": [
+            "shutdown_requested",
+            "signal_received"
+          ],
+          "methods": [
+            "register()",
+            "unregister()",
+            "should_shutdown()",
+            "finish()"
+          ]
         }
       },
-      "tested_by": ["tests/unit/test_resilience.py::TestShutdownHandler"]
+      "tested_by": [
+        "tests/unit/test_resilience.py::TestShutdownHandler"
+      ]
     },
     "kempnerforge/resilience/elastic.py": {
       "classes": {
         "SLURMInfo": {
           "purpose": "SLURM job metadata",
-          "properties": ["is_requeued"]
+          "properties": [
+            "is_requeued"
+          ]
         }
       },
       "functions": [
@@ -777,8 +1311,14 @@
     },
     "scripts/convert_checkpoint.py": {
       "purpose": "KempnerForge <-> HuggingFace checkpoint conversion",
-      "functions": ["_kf_to_hf_key()", "_hf_to_kf_key()", "_build_hf_config()"],
-      "tested_by": ["tests/unit/test_convert_checkpoint.py"]
+      "functions": [
+        "_kf_to_hf_key()",
+        "_hf_to_kf_key()",
+        "_build_hf_config()"
+      ],
+      "tested_by": [
+        "tests/unit/test_convert_checkpoint.py"
+      ]
     },
     "scripts/prepare_data.py": {
       "purpose": "Validate pre-tokenized datasets (.bin/.npy) for MemoryMappedDataset",
@@ -787,126 +1327,551 @@
     "scripts/eval_harness.py": {
       "purpose": "Run lm-eval-harness benchmarks on KempnerForge checkpoints (converts DCP to HF format)",
       "entry": "main()"
+    },
+    "scripts/check_env.py": {
+      "purpose": "Centralized preflight: tag-driven environment checks (uv, repo layout, gpu, slurm, multi-node, wandb, hf, gh) and the cluster-config writer (`--init`)",
+      "entry": "main()",
+      "tested_by": [
+        "tests/unit/test_check_env.py"
+      ]
+    },
+    "scripts/prep_vlm_coco_smoke.py": {
+      "purpose": "Build a small COCO Karpathy HuggingFace Dataset on disk for VLM smoke runs by joining the testbed Karpathy JSON with the testbed COCO image tree",
+      "entry": "main()"
     }
   },
   "tests": {
     "unit": {
       "tests/unit/test_model.py": {
-        "classes": ["TestRMSNorm(3)", "TestBuildNorm(3)", "TestRoPE(6)", "TestAttention(7)", "TestMLP(5)", "TestEmbedding(3)", "TestTransformerBlock(2)", "TestTransformer(8)", "TestInitWeights(4)"],
-        "count": 41
+        "classes": [
+          "TestRMSNorm(3)",
+          "TestBuildNorm(3)",
+          "TestRoPE(7)",
+          "TestAttention(10)",
+          "TestMLP(5)",
+          "TestEmbedding(3)",
+          "TestTransformerBlock(2)",
+          "TestTransformer(2)",
+          "TestInputsEmbeds(5)",
+          "TestOutputSlice(4)",
+          "TestPrefixEmbeds(5)",
+          "TestModalityIdsCrossArgs(3)",
+          "TestCrossAttentionInterleaving(10)",
+          "TestMoT(10)",
+          "TestInitWeights(5)"
+        ],
+        "count": 77
       },
       "tests/unit/test_config.py": {
-        "classes": ["TestModelConfig(12)", "TestTrainConfig(2)", "TestOptimizerConfig(2)", "TestDistributedConfig(6)", "TestCheckpointConfig(2)", "TestSchedulerConfig(3)", "TestDataConfig(2)", "TestMetricsConfig(2)", "TestProfilingConfig(1)", "TestJobConfig(4)", "TestTomlLoading(7)", "TestCliOverrides(7)", "TestCliParsing(6)", "TestRegistry(8)", "TestEvalConfig(5)"],
-        "count": 69
+        "classes": [
+          "TestModelConfig(23)",
+          "TestTrainConfig(3)",
+          "TestOptimizerConfig(6)",
+          "TestDistributedConfig(6)",
+          "TestCheckpointConfig(2)",
+          "TestSchedulerConfig(3)",
+          "TestDataConfig(2)",
+          "TestMetricsConfig(2)",
+          "TestProfilingConfig(1)",
+          "TestJobConfig(11)",
+          "TestTomlLoading(12)",
+          "TestCliOverrides(11)",
+          "TestCliParsing(6)",
+          "TestRegistry(12)",
+          "TestEvalConfig(7)"
+        ],
+        "count": 107
       },
       "tests/unit/test_training.py": {
-        "classes": ["TestBuildOptimizer(6)", "TestScheduler(7)", "TestGradUtils(2)", "TestTrainingIntegration(2)"],
-        "count": 17
+        "classes": [
+          "TestBuildOptimizer(7)",
+          "TestScheduler(8)",
+          "TestGradUtils(2)",
+          "TestTrainingIntegration(2)"
+        ],
+        "count": 19
       },
       "tests/unit/test_data.py": {
-        "classes": ["TestMemoryMappedDataset(9)", "TestDistributedSampler(8)", "TestStatefulDataLoader(3)", "TestHuggingFaceDataset(8)", "TestStreamingHuggingFaceDataset(5)"],
-        "count": 33
+        "classes": [
+          "TestMemoryMappedDataset(9)",
+          "TestDistributedSampler(8)",
+          "TestStatefulDataLoader(3)",
+          "TestHuggingFaceDataset(6)",
+          "TestStreamingHuggingFaceDataset(6)"
+        ],
+        "count": 32
       },
       "tests/unit/test_distributed.py": {
-        "classes": ["TestClipGradNorm(4)", "TestBuildBlockTPPlan(6)", "TestDetectIBInterface(5)", "TestSetNcclEnv(3)", "TestGetWorldInfo(5)"],
-        "count": 23
+        "classes": [
+          "TestClipGradNorm(4)",
+          "TestBuildBlockTPPlan(7)",
+          "TestDetectIBInterface(5)",
+          "TestSetNcclEnv(3)",
+          "TestGetWorldInfo(5)",
+          "TestDefaultMpPolicy(2)",
+          "TestApplyFsdpVLMGuards(2)",
+          "TestBuildParallelModelVLM(6)",
+          "TestFsdpWrapTransformerBlocksHelper(1)"
+        ],
+        "count": 35
       },
       "tests/unit/test_resilience.py": {
-        "classes": ["TestShutdownHandler(6)", "TestNaNDetector(14)", "TestGPUHealth(2)", "TestSLURM(5)", "TestResumePathResolution(4)"],
-        "count": 31
+        "classes": [
+          "TestShutdownHandler(8)",
+          "TestNaNDetector(17)",
+          "TestGPUHealth(2)",
+          "TestSLURM(13)",
+          "TestResumePathResolution(9)"
+        ],
+        "count": 49
       },
       "tests/unit/test_checkpoint.py": {
-        "classes": ["TestRNGState(2)", "TestBuildTrainState(4)", "TestRestoreTrainState(4)", "TestCheckpointRetention(2)", "TestAsyncCheckpointer(6)"],
-        "count": 18
+        "classes": [
+          "TestRNGState(2)",
+          "TestBuildTrainState(4)",
+          "TestRestoreTrainState(5)",
+          "TestCheckpointRetention(2)",
+          "TestAsyncCheckpointer(7)",
+          "TestDataloaderStatePersistence(9)",
+          "TestIntersectFreezeMetaByModule(4)",
+          "TestPeekSavedStep(5)",
+          "TestFlushPendingSave(1)",
+          "TestSaveVLMFreezeMetadata(3)",
+          "TestLoadVLMFreezeCompare(9)"
+        ],
+        "count": 51
       },
       "tests/unit/test_observability.py": {
-        "classes": ["TestMetricsTracker(6)", "TestStepMetrics(1)", "TestDeviceMemoryMonitor(4)", "TestWandBBackend(2)", "TestTensorBoardBackend(2)", "TestRankLogger(4)", "TestFormatMetrics(3)"],
-        "count": 22
+        "classes": [
+          "TestMetricsTracker(7)",
+          "TestStepMetrics(1)",
+          "TestDeviceMemoryMonitor(5)",
+          "TestWandBBackend(2)",
+          "TestTensorBoardBackend(2)",
+          "TestRankLogger(5)",
+          "TestFormatMetrics(4)"
+        ],
+        "count": 26
       },
       "tests/unit/test_performance.py": {
-        "classes": ["TestMFU(8)", "TestMemory(4)", "TestProfiler(8)", "TestCompile(1)"],
-        "count": 21
+        "classes": [
+          "TestMFU(11)",
+          "TestMemory(4)",
+          "TestProfiler(7)",
+          "TestCompile(1)"
+        ],
+        "count": 23
       },
       "tests/unit/test_pipeline_parallel.py": {
-        "classes": ["TestComputeLayerAssignment(6)", "TestPipelineStageModule(9)", "TestBuildStageModule(4)", "TestPipelineScheduleConfig(2)"],
-        "count": 21
+        "classes": [
+          "TestComputeLayerAssignment(7)",
+          "TestPipelineStageModule(10)",
+          "TestBuildStageModule(4)",
+          "TestPipelineScheduleConfig(2)"
+        ],
+        "count": 23
       },
       "tests/unit/test_loss.py": {
-        "classes": ["TestCrossEntropy(2)", "TestChunkedCrossEntropy(6)", "TestZLoss(4)", "TestBuildLossFn(5)"],
-        "count": 17
+        "classes": [
+          "TestCrossEntropy(2)",
+          "TestChunkedCrossEntropy(6)",
+          "TestZLoss(5)",
+          "TestBuildLossFn(5)"
+        ],
+        "count": 18
       },
       "tests/unit/test_moe.py": {
-        "classes": ["TestMoEMLP(9)", "TestMoETransformer(10)", "TestSigmoidTopKRouter(9)", "TestSigmoidMoEIntegration(5)", "TestSharedExperts(6)", "TestEPConfig(9)", "TestGroupedGEMM(5)", "TestCapacityFactor(3)", "TestCompile(2)", "TestEPAttributes(1)", "TestGradientScaling(6)", "TestSetMoeStep(3)", "TestMoeSigmoidConfigValidation(6)", "TestPackedExperts(17)"],
+        "classes": [
+          "TestMoEMLP(9)",
+          "TestMoETransformer(10)",
+          "TestSigmoidTopKRouter(9)",
+          "TestSigmoidMoEIntegration(5)",
+          "TestSharedExperts(6)",
+          "TestEPConfig(9)",
+          "TestGroupedGEMM(5)",
+          "TestCapacityFactor(3)",
+          "TestCompile(2)",
+          "TestEPAttributes(1)",
+          "TestGradientScaling(6)",
+          "TestSetMoeStep(3)",
+          "TestMoESigmoidConfigValidation(6)",
+          "TestPackedExperts(17)"
+        ],
         "count": 91
       },
       "tests/unit/test_router.py": {
-        "classes": ["TestSoftmaxTopKRouter(8)", "TestSigmoidSequenceAuxLoss(5)", "TestSigmoidBiasSchedule(6)"],
+        "classes": [
+          "TestSoftmaxTopKRouter(8)",
+          "TestSigmoidSequenceAuxLoss(5)",
+          "TestSigmoidBiasSchedule(6)"
+        ],
         "count": 19
       },
       "tests/unit/test_optimizer.py": {
-        "classes": ["TestNewtonSchulz(3)", "TestMuon(9)", "TestAdamW(2)"],
-        "count": 14
+        "classes": [
+          "TestNewtonSchulz(3)",
+          "TestMuon(11)",
+          "TestAdamW(2)"
+        ],
+        "count": 16
       },
       "tests/unit/test_eval.py": {
-        "classes": ["TestRunEval(6)"],
-        "count": 6
+        "classes": [
+          "TestRunEval(6)",
+          "TestShouldBuildEvalDataloader(4)"
+        ],
+        "count": 10
       },
       "tests/unit/test_generate.py": {
-        "classes": ["TestKVCache(3)", "TestSampling(6)", "TestGenerate(12)"],
+        "classes": [
+          "TestKVCache(3)",
+          "TestSampling(6)",
+          "TestGenerate(12)"
+        ],
         "count": 21
       },
       "tests/unit/test_convert_checkpoint.py": {
-        "classes": ["TestKFtoHFKeyMapping(6)", "TestHFtoKFKeyMapping(6)", "TestRoundTrip(2)", "TestBuildHFConfig(3)"],
-        "count": 17
-      },
-      "tests/unit/test_fp8.py": {
-        "classes": ["TestFP8Config(5)", "TestApplyFloat8(3)"],
-        "count": 8
-      },
-      "tests/unit/test_packing.py": {
-        "classes": ["TestComputePackedOutput(5)", "TestPackedAttentionMask(5)", "TestLossIgnoreIndex(5)", "TestModelWithPacking(5)", "TestMemoryMappedDatasetPacking(4)", "TestHuggingFaceDatasetPacking(3)", "TestPackingConfig(2)"],
+        "classes": [
+          "TestKFtoHFKeyMapping(7)",
+          "TestHFtoKFKeyMapping(6)",
+          "TestRoundTrip(1)",
+          "TestBuildHFConfig(4)",
+          "TestMoEKFtoHFKeyMapping(5)",
+          "TestMoEHFtoKFKeyMapping(5)",
+          "TestMoERoundTrip(1)"
+        ],
         "count": 29
       },
+      "tests/unit/test_fp8.py": {
+        "classes": [
+          "TestFP8Config(7)",
+          "TestApplyFloat8(4)"
+        ],
+        "count": 11
+      },
+      "tests/unit/test_packing.py": {
+        "classes": [
+          "TestComputePackedOutput(6)",
+          "TestPackedAttentionMask(5)",
+          "TestLossIgnoreIndex(6)",
+          "TestModelWithPacking(6)",
+          "TestMemoryMappedDatasetPacking(4)",
+          "TestHuggingFaceDatasetPacking(3)",
+          "TestPackingConfig(2)"
+        ],
+        "count": 32
+      },
       "tests/unit/test_mixing.py": {
-        "classes": ["TestDatasetSource(5)", "TestDataConfigMixing(4)", "TestMixingTomlLoading(3)", "TestMixtureDataset(10)", "TestMixtureSampler(9)", "TestTemperatureScaling(3)", "TestMixtureSamplerWithDataset(2)"],
-        "count": 36
+        "classes": [
+          "TestDatasetSource(5)",
+          "TestDataConfigMixing(4)",
+          "TestMixingTomlLoading(3)",
+          "TestMixtureDataset(10)",
+          "TestMixtureSampler(9)",
+          "TestTemperatureScaling(3)",
+          "TestMixtureSamplerWithDataset(2)",
+          "TestMixtureSamplerZeroWeights(8)"
+        ],
+        "count": 44
       },
       "tests/unit/test_annealing.py": {
-        "classes": ["TestTrainingPhase(8)", "TestDataConfigPhases(7)", "TestAnnealingTomlLoading(4)", "TestUpdateWeights(4)", "TestPhaseTransitionLogic(5)", "TestAnnealingShortcut(4)"],
+        "classes": [
+          "TestTrainingPhase(8)",
+          "TestDataConfigPhases(7)",
+          "TestAnnealingTomlLoading(4)",
+          "TestUpdateWeights(4)",
+          "TestPhaseTransitionLogic(5)",
+          "TestAnnealingShortcut(4)"
+        ],
         "count": 32
       },
       "tests/unit/test_hooks.py": {
-        "classes": ["TestActivationStore(11)", "TestAttentionWeightCapture(6)", "TestExtractRepresentations(5)", "TestSaveActivations(3)", "TestActivationStoreIntegration(3)"],
+        "classes": [
+          "TestActivationStore(11)",
+          "TestAttentionWeightCapture(6)",
+          "TestExtractRepresentations(5)",
+          "TestSaveActivations(3)",
+          "TestActivationStoreIntegration(3)"
+        ],
         "count": 28
       },
       "tests/unit/test_additional_optimizers.py": {
-        "classes": ["TestLion(10)", "TestScheduleFreeAdamW(9)", "TestNoneScheduler(3)", "TestOptimizerConfig(3)"],
+        "classes": [
+          "TestLion(10)",
+          "TestScheduleFreeAdamW(9)",
+          "TestNoneScheduler(3)",
+          "TestOptimizerConfig(3)"
+        ],
         "count": 25
       },
       "tests/unit/test_scheduler_extensions.py": {
-        "classes": ["TestConstantScheduler(7)", "TestWSDDecayTypes(11)", "TestREXScheduler(10)", "TestSchedulerTomlLoading(4)", "TestSchedulerConfigValidation(4)"],
+        "classes": [
+          "TestConstantScheduler(7)",
+          "TestWSDDecayTypes(11)",
+          "TestREXScheduler(10)",
+          "TestSchedulerTomlLoading(4)",
+          "TestSchedulerConfigValidation(4)"
+        ],
         "count": 36
       },
       "tests/unit/test_training_hooks.py": {
-        "classes": ["TestHookRunner(4)", "TestStepContext(2)", "TestTrainingHook(2)", "TestAllEvents(1)"],
+        "classes": [
+          "TestHookRunner(4)",
+          "TestStepContext(2)",
+          "TestTrainingHook(2)",
+          "TestAllEvents(1)"
+        ],
         "count": 9
+      },
+      "tests/unit/test_modality_context.py": {
+        "classes": [
+          "TestModalityContextInvariants(11)",
+          "TestModalityIdsInvariants(4)"
+        ],
+        "count": 15
+      },
+      "tests/unit/test_mot.py": {
+        "classes": [
+          "TestMoTAttentionStructural(7)",
+          "TestMoTAttentionForward(6)",
+          "TestMoTAttentionNumerical(4)",
+          "TestMoTBlock(6)",
+          "TestWarmStartHelper(8)"
+        ],
+        "count": 31
+      },
+      "tests/unit/test_vlm.py": {
+        "classes": [
+          "TestAdapter(8)",
+          "TestVLMWrapper(7)",
+          "TestInnerTransformer(5)",
+          "TestIsEncoderFrozen(5)",
+          "TestModalityStrategies(5)",
+          "TestVLMWrapperDispatch(11)",
+          "TestBuildVLMWrapperErrors(1)"
+        ],
+        "count": 42
+      },
+      "tests/unit/test_vlm_config.py": {
+        "classes": [
+          "TestVLMConfigValidation(9)",
+          "TestVLMConfigSubclasses(9)",
+          "TestCrossAttentionResolvedHeads(5)",
+          "TestMoTConfig(21)",
+          "TestModalityStrategyRegistry(4)",
+          "TestModelConfigWithVLM(5)"
+        ],
+        "count": 53
+      },
+      "tests/unit/test_vlm_dataset.py": {
+        "classes": [
+          "TestPILToTensor(5)",
+          "TestTokenizeAndMask(5)",
+          "TestVLMCollator(6)",
+          "TestHuggingFaceVLMDataset(7)"
+        ],
+        "count": 23
+      },
+      "tests/unit/test_vision.py": {
+        "classes": [
+          "TestRandomVisionEncoder(6)",
+          "TestHFEncoders(1)",
+          "TestVisionEncoderRegistry(3)",
+          "TestHFVisionEncoderMocked(5)"
+        ],
+        "count": 15
+      },
+      "tests/unit/test_cross_attention.py": {
+        "classes": [
+          "TestCrossAttention(4)",
+          "TestCrossAttentionBlock(4)",
+          "TestCrossAttentionNumerical(7)"
+        ],
+        "count": 15
+      },
+      "tests/unit/test_freeze.py": {
+        "classes": [
+          "TestFreezeParams(6)",
+          "TestApplyFreezeSpecs(3)",
+          "TestCanonicalFreezeMeta(4)",
+          "TestEffectiveFreeze(7)"
+        ],
+        "count": 20
+      },
+      "tests/unit/test_check_env.py": {
+        "classes": [
+          "TestExitCode(3)",
+          "TestFormatText(2)",
+          "TestParseRequires(1)",
+          "TestRunChecks(3)",
+          "TestCheckUv(3)",
+          "TestCheckRepoLayout(2)",
+          "TestCheckGpu(3)",
+          "TestCheckSlurm(9)",
+          "TestCheckMultiNode(6)",
+          "TestCheckWandb(2)",
+          "TestCheckHf(3)",
+          "TestCheckGh(3)",
+          "TestDoInitNonInteractive(9)",
+          "TestMain(3)"
+        ],
+        "count": 52
+      },
+      "tests/unit/test_checkpoint_security.py": {
+        "classes": [
+          "TestLoadTrainStateOwnershipGate(4)",
+          "TestManagerLoadRejectsForeignCheckpoint(1)"
+        ],
+        "count": 5
+      },
+      "tests/unit/test_collective_timeouts.py": {
+        "classes": [
+          "TestNcclAsyncErrorHandlingEnvGuard(3)",
+          "TestCheckNcclHealthTimeout(4)",
+          "TestBarrierWithTimeout(3)"
+        ],
+        "count": 10
+      },
+      "tests/unit/test_dataset_mmap_cleanup.py": {
+        "note": "Module-level pytest functions (no Test* classes): mmap close on partial-open failure, idempotent close, mmap retention on success, .bin variant",
+        "count": 4
+      },
+      "tests/unit/test_distributed_seed.py": {
+        "note": "Module-level pytest functions: _set_seed seeds python/numpy/torch.cpu/torch.cuda; varies with pp_rank; consistent across dp ranks; covers checkpoint surface",
+        "count": 4
       }
     },
     "integration": {
-      "tests/integration/test_train_step.py": { "classes": ["TestTrainStep(6)"], "count": 6 },
-      "tests/integration/test_checkpoint_roundtrip.py": { "classes": ["TestCheckpointRoundtrip(5)"], "count": 5 },
-      "tests/integration/test_data_resumption.py": { "classes": ["TestDataResumption(3)"], "count": 3 },
-      "tests/integration/test_compile.py": { "classes": ["TestCompileCorrectness(3)"], "count": 3 }
+      "tests/integration/test_train_step.py": {
+        "classes": [
+          "TestTrainStep(6)",
+          "TestMoESigmoidTrainStep(4)"
+        ],
+        "count": 10
+      },
+      "tests/integration/test_checkpoint_roundtrip.py": {
+        "classes": [
+          "TestCheckpointRoundtrip(5)"
+        ],
+        "count": 5
+      },
+      "tests/integration/test_data_resumption.py": {
+        "classes": [
+          "TestDataResumption(4)"
+        ],
+        "count": 4
+      },
+      "tests/integration/test_compile.py": {
+        "classes": [
+          "TestCompileCorrectness(3)"
+        ],
+        "count": 3
+      },
+      "tests/integration/test_vlm_train_step.py": {
+        "classes": [
+          "TestBuild(3)",
+          "TestForward(3)",
+          "TestValidation(1)",
+          "TestTokenAccounting(1)",
+          "TestOverfit(1)",
+          "TestDtypePolicy(1)",
+          "TestInnerTransformer(1)"
+        ],
+        "count": 11
+      },
+      "tests/integration/test_vlm_checkpoint.py": {
+        "classes": [
+          "TestSaveFreezeMetadata(2)",
+          "TestLoadFreezeMismatch(6)",
+          "TestCrossArchLoad(5)"
+        ],
+        "count": 13
+      },
+      "tests/integration/test_vlm_cross_attn.py": {
+        "classes": [
+          "TestBuildAndForward(4)",
+          "TestFreezeStageHook(8)"
+        ],
+        "count": 12
+      },
+      "tests/integration/test_vlm_mot.py": {
+        "classes": [
+          "TestBuildAndForward(5)",
+          "TestMoTPlusMoESmoke(2)",
+          "TestWarmStartFromJD(2)",
+          "TestFreezeStageHook(1)"
+        ],
+        "count": 10
+      }
     },
     "distributed": {
-      "tests/distributed/test_fsdp.py": { "classes": ["TestInitDistributed(4)", "TestFSDP2(4)", "TestActivationCheckpointing(2)", "TestGetDpMesh(1)"] },
-      "tests/distributed/test_resilience.py": { "classes": ["TestNCCLHealth(2)", "TestNaNDetectorDistributed(3)"] },
-      "tests/distributed/test_tp.py": { "note": "Tensor parallelism end-to-end" },
-      "tests/distributed/test_checkpoint.py": { "note": "Distributed checkpoint save/load" },
-      "tests/distributed/test_e2e_training.py": { "note": "Multi-GPU training smoke" },
-      "tests/distributed/test_moe_distributed.py": { "note": "MoE with FSDP/TP" },
-      "tests/distributed/test_ep.py": { "note": "Expert parallelism" },
-      "tests/distributed/test_optimizer_distributed.py": { "note": "Lion, Schedule-Free AdamW, optimizer-scheduler compat under FSDP2" }
+      "tests/distributed/test_fsdp.py": {
+        "classes": [
+          "TestInitDistributed(4)",
+          "TestFSDP2(4)",
+          "TestActivationCheckpointing(2)",
+          "TestGetDpMesh(1)"
+        ]
+      },
+      "tests/distributed/test_resilience.py": {
+        "classes": [
+          "TestNCCLHealth(2)",
+          "TestNaNDetectorDistributed(3)"
+        ]
+      },
+      "tests/distributed/test_tp.py": {
+        "note": "Tensor parallelism end-to-end"
+      },
+      "tests/distributed/test_checkpoint.py": {
+        "note": "Distributed checkpoint save/load"
+      },
+      "tests/distributed/test_e2e_training.py": {
+        "note": "Multi-GPU training smoke"
+      },
+      "tests/distributed/test_moe_distributed.py": {
+        "note": "MoE with FSDP/TP"
+      },
+      "tests/distributed/test_ep.py": {
+        "note": "Expert parallelism"
+      },
+      "tests/distributed/test_optimizer_distributed.py": {
+        "note": "Lion, Schedule-Free AdamW, optimizer-scheduler compat under FSDP2"
+      },
+      "tests/distributed/test_vlm_fsdp.py": {
+        "classes": [
+          "TestBuildAndForward(2)",
+          "TestVariableLengthRankConsistency(1)",
+          "TestDtypeCombinatorics(1)",
+          "TestInnerTransformerUnderCompileAndFsdp(1)",
+          "TestCheckpointRoundtrip(1)"
+        ],
+        "note": "VLM Joint-Decoder FSDP2"
+      },
+      "tests/distributed/test_vlm_cross_attn_fsdp.py": {
+        "classes": [
+          "TestBuildAndForward(2)",
+          "TestVariableLengthRankConsistency(1)",
+          "TestInnerTransformerUnderCompileAndFsdp(1)",
+          "TestFreezeStageUnderFsdp(1)",
+          "TestDeterminism(1)",
+          "TestMoEWithVLM(1)",
+          "TestCheckpointRoundtrip(1)"
+        ],
+        "note": "VLM Cross-Attention FSDP2 (mandatory merge gate for CA)"
+      },
+      "tests/distributed/test_vlm_mot_fsdp.py": {
+        "classes": [
+          "TestBuildAndForward(2)",
+          "TestVariableLengthRankConsistency(1)",
+          "TestInnerTransformerUnderCompileAndFsdp(1)",
+          "TestFreezeStageUnderFsdp(1)",
+          "TestDeterminism(1)",
+          "TestWarmStartUnderFsdp(1)",
+          "TestMoEWithMoT(1)",
+          "TestCheckpointRoundtrip(1)"
+        ],
+        "note": "VLM Mixture-of-Transformers FSDP2 (mandatory merge gate for MoT)"
+      }
     },
     "e2e": {
       "tests/e2e/test_training_e2e.py": {
@@ -920,18 +1885,77 @@
     }
   },
   "fixtures": {
-    "tests/conftest.py": ["tiny_model_config", "small_model_config", "tiny_job_config", "device", "random_batch", "mmap_data_dir"],
-    "tests/distributed/conftest.py": ["_distributed_init (session)", "distributed_env"],
-    "tests/e2e/conftest.py": ["synthetic_data_dir", "requires_gpus(n)"],
-    "tests/smoke/conftest.py": ["hw (session, GPU/SLURM info)", "tokenizer_name", "vocab_size"]
+    "tests/conftest.py": [
+      "tiny_model_config",
+      "small_model_config",
+      "tiny_job_config",
+      "device",
+      "random_batch",
+      "mmap_data_dir"
+    ],
+    "tests/distributed/conftest.py": [
+      "_distributed_init (session)",
+      "distributed_env"
+    ],
+    "tests/e2e/conftest.py": [
+      "synthetic_data_dir",
+      "requires_gpus(n)"
+    ],
+    "tests/smoke/conftest.py": [
+      "hw (session, GPU/SLURM info)",
+      "tokenizer_name",
+      "vocab_size"
+    ]
   },
   "registry_entries": {
-    "model": ["transformer"],
-    "optimizer": ["adamw", "lion", "schedule_free_adamw", "muon"],
-    "scheduler": ["cosine", "linear", "wsd", "constant", "rex", "none"],
-    "loss": ["cross_entropy", "chunked_cross_entropy"],
-    "mlp": ["swiglu", "standard_gelu", "standard_relu"],
-    "norm": ["rmsnorm", "layernorm"],
-    "router": ["softmax_topk", "sigmoid_topk"]
+    "model": [
+      "transformer"
+    ],
+    "optimizer": [
+      "adamw",
+      "lion",
+      "schedule_free_adamw",
+      "muon"
+    ],
+    "scheduler": [
+      "cosine",
+      "linear",
+      "wsd",
+      "constant",
+      "rex",
+      "none"
+    ],
+    "loss": [
+      "cross_entropy",
+      "chunked_cross_entropy"
+    ],
+    "mlp": [
+      "swiglu",
+      "standard_gelu",
+      "standard_relu"
+    ],
+    "norm": [
+      "rmsnorm",
+      "layernorm"
+    ],
+    "router": [
+      "softmax_topk",
+      "sigmoid_topk"
+    ],
+    "vision_encoder": [
+      "random",
+      "siglip2",
+      "clip"
+    ],
+    "vlm_config": [
+      "joint_decoder",
+      "cross_attention",
+      "mot"
+    ],
+    "modality_strategy": [
+      "joint_decoder",
+      "cross_attention",
+      "mot"
+    ]
   }
 }
