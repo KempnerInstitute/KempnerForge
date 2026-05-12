@@ -48,18 +48,9 @@ tie_embeddings = false
 [model.vlm]
 arch = "cross_attention"
 vision_encoder = "random"
-feature_dim = 1024           # typical ViT-L/14 hidden size
-num_tokens = 256             # 16x16 patches at 224 input (CLS stripped)
-adapter_hidden_dim = 0       # 0 = use model.dim (4096)
-adapter_activation = "gelu"
-max_text_len = 512
-# Cross-attention placement. Cadence 4 with n_layers=32 yields 8 CA
-# blocks; n_kv_heads=0 resolves to n_heads on the cross path (MHA);
-# set a smaller positive value for GQA on the cross path.
-cross_attention_every_n_layers = 4
-cross_attention_n_heads = 0
-cross_attention_n_kv_heads = 0
-freeze = [{module = "vision_encoder", frozen = true}]
+# ViT-L/14-shaped dims (constructor inputs to RandomVisionEncoder, swap-in compatible)
+feature_dim = 1024
+num_tokens = 256
 
 [train]
 batch_size = 16

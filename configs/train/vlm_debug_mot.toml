@@ -23,14 +23,6 @@ arch = "mot"
 vision_encoder = "random"
 feature_dim = 384
 num_tokens = 64
-adapter_hidden_dim = 0  # 0 = use model.dim
-adapter_activation = "gelu"
-max_text_len = 512
-mot_modalities = ["image", "text"]
-mot_image_n_heads = 0      # 0 = inherit model.n_heads
-mot_image_n_kv_heads = 0   # 0 = inherit
-mot_warm_start_from_text = false
-freeze = [{module = "vision_encoder", frozen = true}]
 
 [train]
 batch_size = 2

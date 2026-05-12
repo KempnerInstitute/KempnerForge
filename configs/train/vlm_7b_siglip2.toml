@@ -35,10 +35,7 @@ vision_encoder = "siglip2"
 vision_encoder_path = "google/siglip2-base-patch16-224"
 feature_dim = 768       # SigLIP2 base hidden size
 num_tokens = 196        # 14x14 patches for 224-input
-adapter_hidden_dim = 0  # 0 = use model.dim (4096)
-adapter_activation = "gelu"
 max_text_len = 2048
-freeze = [{module = "vision_encoder", frozen = true}]
 
 [train]
 batch_size = 4

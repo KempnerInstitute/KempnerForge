@@ -38,10 +38,6 @@ arch = "joint_decoder"
 vision_encoder = "random"
 feature_dim = 1024
 num_tokens = 256
-adapter_hidden_dim = 0
-adapter_activation = "gelu"
-max_text_len = 512
-freeze = [{module = "vision_encoder", frozen = true}]
 
 [train]
 batch_size = 16
