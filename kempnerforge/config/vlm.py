@@ -157,7 +157,7 @@ class VLMConfig:
             if steps != sorted(steps) or len(steps) != len(set(steps)):
                 raise ValueError("vlm.freeze_schedule start_steps must be strictly monotonic")
 
-    def residual_stream_image_tokens(self) -> int:
+    def residual_stream_image_tokens(self, num_tokens: int | None = None) -> int:
         """Number of image tokens this arch puts in the residual stream.
 
         Used by ``ModelConfig`` and ``JobConfig`` to validate that
@@ -169,10 +169,17 @@ class VLMConfig:
         - Cross-Attention: ``0`` (residual stream is text-only; image
           features flow side-channel into CA blocks).
 
+        Args:
+            num_tokens: Override for ``self.num_tokens``. Pass the vision
+                encoder's resolved ``num_tokens`` at build time when the
+                config-level value is ``0`` (the "infer at build time"
+                sentinel). When ``None``, ``self.num_tokens`` is used —
+                matches the config-time call site in ``ModelConfig``.
+
         Subclasses override as needed. Base default matches the
         Joint-Decoder semantics.
         """
-        return self.num_tokens
+        return self.num_tokens if num_tokens is None else num_tokens
 
     @classmethod
     def for_arch(cls, arch: str, **kwargs: Any) -> VLMConfig:
@@ -258,12 +265,14 @@ class CrossAttentionConfig(VLMConfig):
                 "vlm.cross_attention_n_heads and cross_attention_n_kv_heads must be non-negative"
             )
 
-    def residual_stream_image_tokens(self) -> int:
+    def residual_stream_image_tokens(self, num_tokens: int | None = None) -> int:  # noqa: ARG002
         """Cross-Attention does not extend the residual stream.
 
         Image features flow as K/V into separate CrossAttentionBlocks;
         the residual itself carries text only. So the seq_len cross-check
         skips ``num_tokens`` and just enforces ``seq_len >= max_text_len``.
+        The ``num_tokens`` argument is accepted for signature parity with
+        the base method but ignored.
         """
         return 0
 
@@ -346,10 +355,15 @@ class MoTConfig(VLMConfig):
                 "non-empty filesystem path to a torch-saved JD or text-only state dict"
             )
 
-    def residual_stream_image_tokens(self) -> int:
+    def residual_stream_image_tokens(self, num_tokens: int | None = None) -> int:
         """MoT prepends ``num_tokens`` image tokens to the text sequence
-        (same residual-stream layout as Joint-Decoder)."""
-        return self.num_tokens
+        (same residual-stream layout as Joint-Decoder).
+
+        Accepts the same ``num_tokens`` override as the base method so
+        build-time call sites can pass the encoder's resolved value when
+        the config-level ``num_tokens`` is ``0``.
+        """
+        return self.num_tokens if num_tokens is None else num_tokens
 
     def resolved_image_heads(
         self, model_n_heads: int, model_n_kv_heads: int = 0

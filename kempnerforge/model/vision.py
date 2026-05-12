@@ -105,13 +105,25 @@ def _build_random(
 class _HFVisionEncoder(VisionEncoder):
     """Shared wrapper for HuggingFace vision encoders (SigLIP2, CLIP, ...).
 
-    The HF model's vision tower produces patch tokens; we drop the CLS
-    token if present and expose a flat ``(B, num_tokens, feature_dim)``
-    output. The text tower and projection head (if any) are discarded.
+    The HF model's vision tower produces patch tokens. CLIP-family towers
+    prepend a CLS token at position 0; SigLIP/SigLIP2 towers do not. The
+    ``has_cls_token`` flag tells the encoder which architecture it wraps so
+    ``num_tokens`` reflects the actual forward output shape, and the
+    ``strip_cls`` flag controls whether to drop position 0 before returning.
     """
 
-    def __init__(self, path: str, strip_cls: bool = False) -> None:
+    def __init__(
+        self,
+        path: str,
+        strip_cls: bool = False,
+        has_cls_token: bool = True,
+    ) -> None:
         super().__init__()
+        if strip_cls and not has_cls_token:
+            raise ValueError(
+                "_HFVisionEncoder: strip_cls=True is meaningless when has_cls_token=False "
+                "(nothing to strip). Pass strip_cls=False for SigLIP-style encoders."
+            )
         try:
             from transformers import AutoModel
         except ImportError as e:  # pragma: no cover
@@ -127,16 +139,23 @@ class _HFVisionEncoder(VisionEncoder):
         vision_tower = getattr(model, "vision_model", model)
         self.vision_tower = vision_tower
         self._strip_cls = strip_cls
+        self._has_cls_token = has_cls_token
 
-        # Probe output shape with a tiny dummy input to resolve attributes
-        # without relying on HF config fields that differ between models.
+        # Resolve output shape from the HF config without an actual dry-run pass.
         cfg = getattr(vision_tower, "config", None)
         image_size = getattr(cfg, "image_size", 224) if cfg is not None else 224
         patch_size = getattr(cfg, "patch_size", 16) if cfg is not None else 16
         hidden = getattr(cfg, "hidden_size", None) if cfg is not None else None
         n_patches = (image_size // patch_size) ** 2
         self.feature_dim = int(hidden) if hidden else -1  # -1 => resolve via dry run
-        self.num_tokens = n_patches if strip_cls else n_patches + (1 if hidden else 0)
+        # Three cases for num_tokens:
+        #   - has_cls_token + strip_cls:     n_patches      (CLIP, dropping CLS)
+        #   - has_cls_token + not strip_cls: n_patches + 1  (CLIP, keeping CLS)
+        #   - not has_cls_token:             n_patches      (SigLIP/SigLIP2)
+        if has_cls_token and not strip_cls:
+            self.num_tokens = n_patches + 1
+        else:
+            self.num_tokens = n_patches
 
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
         out = self.vision_tower(pixel_values=pixel_values)
@@ -154,7 +173,7 @@ def _build_siglip2(
     **_: Any,
 ) -> VisionEncoder:
     """Builder for a SigLIP2 vision tower. SigLIP2 has no CLS token."""
-    enc = _HFVisionEncoder(path, strip_cls=False)
+    enc = _HFVisionEncoder(path, strip_cls=False, has_cls_token=False)
     if num_tokens is not None:
         enc.num_tokens = num_tokens
     if feature_dim is not None:
@@ -173,7 +192,7 @@ def _build_clip(
     token; we strip it so ``num_tokens`` matches the number of image
     patches.
     """
-    enc = _HFVisionEncoder(path, strip_cls=True)
+    enc = _HFVisionEncoder(path, strip_cls=True, has_cls_token=True)
     if num_tokens is not None:
         enc.num_tokens = num_tokens
     if feature_dim is not None:
