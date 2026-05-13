@@ -1,5 +1,11 @@
 # 7B VLM Joint-Decoder with activation checkpointing (memory-tight).
 #
+# Mode: smoke.
+#
+# max_seq_len allocation (JD/MoT): residual_image_tokens + max_text_len.
+# Image tokens prepend the text sequence in the residual stream, so the
+# budget must cover both modalities.
+#
 # Sibling of vlm_7b.toml with activation_checkpointing="full" and a
 # smaller batch. Use when memory is tight (fewer GPUs, longer seq_len,
 # larger image token count) or when recompute is cheap relative to
@@ -27,7 +33,7 @@ vocab_size = 50257          # gpt2 tokenizer vocab
 ffn_dim_multiplier = 1.3
 norm_type = "rmsnorm"
 activation = "silu"
-max_seq_len = 1024
+max_seq_len = 1024          # 256 image + 512 text (max_text_len default) + headroom
 rope_theta = 500000.0
 tie_embeddings = false
 

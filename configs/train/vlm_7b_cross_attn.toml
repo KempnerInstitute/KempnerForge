@@ -1,5 +1,10 @@
 # 7B VLM Cross-Attention on 4x H200 (141 GB/GPU).
 #
+# Mode: smoke.
+#
+# max_seq_len allocation (CA): max_text_len only. The residual stream is
+# text-only; image features flow as K/V into separate CrossAttentionBlocks.
+#
 # Llama-3-V style: text flows through the main self-attention stack
 # unchanged; CrossAttentionBlocks are inserted between regular
 # transformer blocks at a configurable cadence (default 4 ->
@@ -42,7 +47,7 @@ vocab_size = 50257
 ffn_dim_multiplier = 1.3
 norm_type = "rmsnorm"
 activation = "silu"
-max_seq_len = 1024
+max_seq_len = 1024     # text-only (CA): max_text_len default 512 + headroom
 rope_theta = 500000.0
 tie_embeddings = false
 

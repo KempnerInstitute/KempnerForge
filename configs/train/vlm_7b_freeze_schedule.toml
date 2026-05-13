@@ -1,6 +1,11 @@
 # 7B VLM Cross-Attention with a multi-stage freeze schedule + async
 # DCP checkpointing.
 #
+# Mode: smoke.
+#
+# max_seq_len allocation (CA): max_text_len only. The residual stream is
+# text-only; image features flow as K/V into separate CrossAttentionBlocks.
+#
 # Exercises the FreezeStage hook in scripts/train.py:
 #   - step 0..9: vision encoder frozen, everything else trainable.
 #   - step 10: freeze adapter (typical "pretrain CA blocks first" recipe).
@@ -31,7 +36,7 @@ vocab_size = 50257
 ffn_dim_multiplier = 1.3
 norm_type = "rmsnorm"
 activation = "silu"
-max_seq_len = 1024
+max_seq_len = 1024     # text-only (CA): max_text_len default 512 + headroom
 rope_theta = 500000.0
 tie_embeddings = false
 
