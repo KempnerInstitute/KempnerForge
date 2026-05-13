@@ -119,7 +119,8 @@ class HuggingFaceVLMDataset(Dataset):
     """Map-style HF image-text dataset for Joint-Decoder training.
 
     Args:
-        dataset_name: HF dataset name (e.g. ``"nlphuji/coco_karpathy"``).
+        dataset_name: HF dataset name (e.g. ``"sayakpaul/coco-30-val-2014"``)
+            or a local directory written by ``datasets.save_to_disk``.
         split: Dataset split.
         image_field: Column name for the PIL image.
         text_field: Column name for the caption / target text.

@@ -60,8 +60,9 @@ warmup_steps = 5
 min_lr_ratio = 0.1
 
 [data]
-# Placeholder; override at the CLI with a real dataset.
-hf_dataset_name = "nlphuji/coco_karpathy"
+# 30-sample COCO val substitute (sayakpaul/coco-30-val-2014). For a real
+# training run, override via CLI: --data.hf_dataset_name=<your-dataset>
+hf_dataset_name = "sayakpaul/coco-30-val-2014"
 hf_dataset_split = "train"
 hf_dataset_image_field = "image"
 hf_dataset_text_field = "caption"
