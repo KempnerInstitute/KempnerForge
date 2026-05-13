@@ -1,5 +1,15 @@
 # 7B Llama-style backbone + SigLIP2 vision encoder, Cross-Attention VLM.
 #
+# Mode: smoke.
+#
+# Tokenizer: meta-llama/Meta-Llama-3-8B (vocab_size = 128256). The SigLIP2
+# family uses the Llama-3 vocab to match a real Llama-3 + SigLIP2
+# production target. Other configs in this folder use gpt2 (vocab_size =
+# 50257) for fast smoke iteration.
+#
+# max_seq_len allocation (CA): max_text_len only. The residual stream is
+# text-only; image features flow as K/V into separate CrossAttentionBlocks.
+#
 # Sibling of vlm_7b_siglip2.toml (Joint-Decoder) for the Cross-Attention
 # arch. Image features flow as K/V into separate CrossAttentionBlocks
 # at cadence 4 (n_layers=32 -> 8 CA blocks); the residual stream

@@ -1,5 +1,18 @@
 # 7B Llama-style backbone + SigLIP2 vision encoder, Joint-Decoder VLM.
 #
+# Mode: real-run starting point (max_steps = 5000).
+#
+# Tokenizer: meta-llama/Meta-Llama-3-8B (vocab_size = 128256). The SigLIP2
+# family uses the Llama-3 vocab to match a real Llama-3 + SigLIP2
+# production target. Other configs in this folder use gpt2 (vocab_size =
+# 50257) for fast smoke iteration.
+#
+# max_seq_len allocation (JD/MoT): residual_image_tokens + max_text_len.
+# Image tokens prepend the text sequence in the residual stream, so the
+# budget must cover both modalities. SigLIP2-base-patch16-224 probes
+# num_tokens = 196 (14x14 patches, no CLS); with max_text_len = 2048 the
+# minimum is 2244 and 2304 leaves a small headroom margin.
+#
 # Target: 4-8 GPU single node via FSDP2. Pipeline parallelism with VLM is
 # not supported on this branch (JobConfig.validate raises).
 #
@@ -30,7 +43,7 @@ vocab_size = 128256
 ffn_dim_multiplier = 1.3
 norm_type = "rmsnorm"
 activation = "silu"
-max_seq_len = 2304     # 256 image + 2048 text
+max_seq_len = 2304     # 196 image (SigLIP2-base probes 14x14 patches) + 2048 text + headroom
 rope_theta = 500000.0
 tie_embeddings = false
 

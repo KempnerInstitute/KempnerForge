@@ -1,8 +1,14 @@
 # VLM smoke config — Mixture-of-Transformers (MoT) arch, tiny LLM + random vision encoder.
 #
+# Mode: smoke.
+#
 # Runs end-to-end in <1 minute on 1 GPU. Uses RandomVisionEncoder so no
 # HF download is needed. Per-modality Q/K/V/O + per-modality FFN at every
 # layer, single global self-attention (Liang et al. 2024 Algorithm 1).
+#
+# max_seq_len allocation (JD/MoT): residual_image_tokens + max_text_len.
+# Image tokens prepend the text sequence in the residual stream, so the
+# budget must cover both modalities.
 #
 # Usage:
 #   uv run python scripts/train.py configs/train/vlm_debug_mot.toml \

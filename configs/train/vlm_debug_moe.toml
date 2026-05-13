@@ -1,6 +1,11 @@
 # VLM + MoE smoke config — tiny LLM with MoE TransformerBlocks +
 # random vision encoder + Cross-Attention.
 #
+# Mode: smoke.
+#
+# max_seq_len allocation (CA): max_text_len only. The residual stream is
+# text-only; image features flow as K/V into separate CrossAttentionBlocks.
+#
 # MoE lives in the text TransformerBlocks (every other layer at
 # moe_frequency=2). CrossAttentionBlocks remain dense MLPs. The two
 # arches compose: image features flow as K/V into CA blocks, while
