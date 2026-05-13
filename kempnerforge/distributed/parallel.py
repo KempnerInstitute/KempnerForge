@@ -11,7 +11,7 @@ Application order (critical — wrong order causes silent correctness bugs):
 
 For convenience, ``build_parallel_model`` combines all steps including
 model creation, meta-device initialization, and optional torch.compile.
-It also dispatches to a VLM branch when ``model_config.is_vlm`` is True.
+It also dispatches to a VLM branch when ``vlm_config`` is provided.
 """
 
 from __future__ import annotations
@@ -362,6 +362,9 @@ def _apply_fsdp_vlm(
 
 def _build_vlm(
     model_config,
+    vision_config,
+    adapter_config,
+    vlm_config,
     device: torch.device,
     device_mesh: DeviceMesh | None,
     *,
@@ -392,10 +395,10 @@ def _build_vlm(
       7. Freeze specs are applied via ``apply_freeze_specs`` and a fully
          frozen encoder is switched to ``eval()``.
     """
-    from kempnerforge.config.adapter import AdapterConfig
     from kempnerforge.distributed.expert_parallel import apply_expert_parallel
     from kempnerforge.distributed.tensor_parallel import apply_tensor_parallel
     from kempnerforge.model.adapter import build_adapter
+    from kempnerforge.model.transformer import Transformer
     from kempnerforge.model.vlm import (
         VLMWrapper,
         _is_encoder_frozen,
@@ -403,41 +406,41 @@ def _build_vlm(
     )
     from kempnerforge.training.freeze import apply_freeze_specs
 
-    vlm = model_config.vlm
-    assert vlm is not None, "_build_vlm requires model_config.vlm to be set"
+    assert vlm_config is not None, "_build_vlm requires vlm_config to be set"
+    assert vision_config is not None, "_build_vlm requires vision_config to be set"
+    assert adapter_config is not None, "_build_vlm requires adapter_config to be set"
     tp_enabled = device_mesh is not None and "tp" in device_mesh.mesh_dim_names  # type: ignore[reportOperatorIssue]
 
     # 1. Vision encoder on CPU (real HF weights).
-    encoder_builder = registry.get_vision_encoder(vlm.vision_encoder)
+    encoder_builder = registry.get_vision_encoder(vision_config.type)
     encoder = encoder_builder(
-        vlm.vision_encoder_path,
-        num_tokens=vlm.num_tokens if vlm.num_tokens > 0 else None,
-        feature_dim=vlm.feature_dim if vlm.feature_dim > 0 else None,
+        vision_config.path,
+        num_tokens=vision_config.num_tokens if vision_config.num_tokens > 0 else None,
+        feature_dim=vision_config.feature_dim if vision_config.feature_dim > 0 else None,
     )
-    in_dim = vlm.feature_dim or encoder.feature_dim
+    in_dim = vision_config.feature_dim or encoder.feature_dim
 
     # 2. Transformer + Adapter on meta (when TP is active) or CPU.
-    model_builder = registry.get_model(model_config.model_type)
-    adapter_config = AdapterConfig(
-        type="mlp_2layer",
-        hidden_dim=vlm.adapter_hidden_dim,
-        activation=vlm.adapter_activation,
-    )
+    # VLM path always constructs Transformer directly (the registry's
+    # text-only builder takes a single ModelConfig and cannot accept the
+    # extra vlm_config / num_image_tokens kwargs the VLM path needs).
     ctx = torch.device("meta") if tp_enabled else contextlib.nullcontext()
     with ctx:
-        transformer = model_builder(model_config)
+        transformer = Transformer(
+            model_config, vlm_config=vlm_config, num_image_tokens=encoder.num_tokens
+        )
         adapter = build_adapter(adapter_config, in_dim=in_dim, out_dim=model_config.dim)
 
-    strategy = build_modality_strategy(vlm)
+    strategy = build_modality_strategy(vlm_config)
     wrapper = VLMWrapper(encoder, adapter, transformer, strategy)
 
     # 3. Length cross-check now that num_tokens is resolved.
-    required = wrapper.num_image_tokens + vlm.max_text_len
+    required = wrapper.num_image_tokens + vlm_config.max_text_len
     if model_config.max_seq_len < required:
         raise ValueError(
             f"max_seq_len ({model_config.max_seq_len}) insufficient for VLM: "
             f"num_image_tokens ({wrapper.num_image_tokens}) + vlm.max_text_len "
-            f"({vlm.max_text_len}) = {required}"
+            f"({vlm_config.max_text_len}) = {required}"
         )
 
     # 4. TP / EP / Float8 / AC on the transformer only.
@@ -449,7 +452,7 @@ def _build_vlm(
     apply_ac(transformer, ac_mode)
 
     # 5. FSDP2 (before materialization when meta-device path is used).
-    encoder_frozen = _is_encoder_frozen(vlm.freeze)
+    encoder_frozen = _is_encoder_frozen(vlm_config.freeze)
     if device_mesh is not None:
         _apply_fsdp_vlm(wrapper, device_mesh, mp_policy, encoder_frozen=encoder_frozen)
 
@@ -471,7 +474,7 @@ def _build_vlm(
     adapter.to(dtype=param_dtype)
 
     # 7. Freeze specs + eval() for fully frozen encoder.
-    apply_freeze_specs(wrapper, vlm.freeze, vlm.module_patterns)
+    apply_freeze_specs(wrapper, vlm_config.freeze, vlm_config.module_patterns)
     if encoder_frozen:
         encoder.eval()
 
@@ -494,6 +497,9 @@ def build_parallel_model(
     device: torch.device,
     device_mesh: DeviceMesh | None,
     *,
+    vision_config=None,
+    adapter_config=None,
+    vlm_config=None,
     ac_mode: ActivationCheckpointing = ActivationCheckpointing.none,
     mp_policy: MixedPrecisionPolicy | None = None,
     param_dtype: torch.dtype = torch.bfloat16,
@@ -502,11 +508,11 @@ def build_parallel_model(
 ) -> torch.nn.Module:
     """Build a Transformer (or a VLMWrapper) with parallelism applied.
 
-    Dispatches on ``model_config.is_vlm``. Non-VLM configurations follow
-    the original order:
+    Dispatches on ``vlm_config`` (``None`` -> text-only path). Non-VLM
+    configurations follow the original order:
 
-      - TP enabled:  meta-device init → TP → EP → [Float8] → AC → FSDP → materialize
-      - TP disabled: create on device → EP → [Float8] → AC → FSDP
+      - TP enabled:  meta-device init -> TP -> EP -> [Float8] -> AC -> FSDP -> materialize
+      - TP disabled: create on device -> EP -> [Float8] -> AC -> FSDP
 
     VLM configurations follow the order documented on ``_build_vlm``.
 
@@ -517,6 +523,9 @@ def build_parallel_model(
         model_config: ModelConfig for the Transformer.
         device: Target device for the model.
         device_mesh: Full DeviceMesh (may contain tp, dp_shard, dp_replicate dims).
+        vision_config: VisionEncoderConfig (required iff vlm_config is set).
+        adapter_config: AdapterConfig (required iff vlm_config is set).
+        vlm_config: VLMConfig. None for a pure text-only run.
         ac_mode: Activation checkpointing mode.
         mp_policy: FSDP2 mixed-precision policy. Defaults to bf16 params + fp32 reduce.
         param_dtype: Dtype for model parameters.
@@ -526,9 +535,12 @@ def build_parallel_model(
     Returns:
         The parallelized model, ready for training.
     """
-    if getattr(model_config, "is_vlm", False):
+    if vlm_config is not None:
         return _build_vlm(
             model_config,
+            vision_config,
+            adapter_config,
+            vlm_config,
             device,
             device_mesh,
             ac_mode=ac_mode,

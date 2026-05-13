@@ -9,7 +9,9 @@ from __future__ import annotations
 import pytest
 import torch
 
+from kempnerforge.config.adapter import AdapterConfig
 from kempnerforge.config.model import ModelConfig
+from kempnerforge.config.vision import VisionEncoderConfig
 from kempnerforge.config.vlm import (
     CrossAttentionConfig,
     FreezeSpec,
@@ -38,24 +40,20 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # ---------------------------------------------------------------------------
 
 
-def _tiny_vlm_config(num_image_tokens: int = 8, feature_dim: int = 96) -> ModelConfig:
-    return ModelConfig(
-        dim=64,
-        n_layers=2,
-        n_heads=4,
-        vocab_size=256,
-        max_seq_len=64,
-        vlm=VLMConfig(
-            vision_encoder="random",
-            feature_dim=feature_dim,
-            num_tokens=num_image_tokens,
-            max_text_len=32,
-        ),
+def _tiny_configs(
+    num_image_tokens: int = 8, feature_dim: int = 96
+) -> tuple[ModelConfig, VisionEncoderConfig, AdapterConfig, VLMConfig]:
+    return (
+        ModelConfig(dim=64, n_layers=2, n_heads=4, vocab_size=256, max_seq_len=64),
+        VisionEncoderConfig(type="random", feature_dim=feature_dim, num_tokens=num_image_tokens),
+        AdapterConfig(),
+        VLMConfig(max_text_len=32),
     )
 
 
 def _build_tiny_wrapper(num_image_tokens: int = 8, feature_dim: int = 96) -> VLMWrapper:
-    return build_vlm_wrapper(_tiny_vlm_config(num_image_tokens, feature_dim))
+    mc, vc, ac, lc = _tiny_configs(num_image_tokens, feature_dim)
+    return build_vlm_wrapper(mc, vc, ac, lc)
 
 
 class TestVLMWrapper:
@@ -105,15 +103,15 @@ class TestVLMWrapper:
         trainable = [p for p in wrapper.transformer.parameters() if p.requires_grad]
         assert any(p.grad is not None for p in trainable)
 
-    def test_dispatch_on_is_vlm_only(self):
+    def test_dispatch_on_vlm_only(self):
         """build_vlm_wrapper should not require model_type changes; the
         inner transformer is registered under the standard 'transformer'
-        model_type, and VLM dispatch happens through model_config.is_vlm.
+        model_type, and VLM dispatch happens through the presence of a
+        VLMConfig.
         """
-        cfg = _tiny_vlm_config()
-        assert cfg.is_vlm is True
-        assert cfg.model_type == "transformer"
-        wrapper = build_vlm_wrapper(cfg)
+        mc, vc, ac, lc = _tiny_configs()
+        assert mc.model_type == "transformer"
+        wrapper = build_vlm_wrapper(mc, vc, ac, lc)
         assert isinstance(wrapper.transformer, Transformer)
 
     def test_transformer_reachable(self):
@@ -171,40 +169,25 @@ class TestInnerTransformer:
 
 
 class TestBuildVLMWrapperErrors:
-    def test_missing_vlm_raises(self):
-        cfg = ModelConfig(dim=64, n_layers=2, n_heads=4, vocab_size=256)
-        assert cfg.vlm is None
-        with pytest.raises(ValueError, match="model_config.vlm"):
-            build_vlm_wrapper(cfg)
-
     def test_max_seq_len_insufficient_for_inferred_encoder_num_tokens(self):
-        """When ``vlm.num_tokens=0`` (the "infer from encoder at build time"
-        sentinel), the config-time cross-check in ``ModelConfig.__post_init__``
-        is skipped. The build-time check in ``build_vlm_wrapper`` must catch
-        the case where the encoder's resolved ``num_tokens`` + ``max_text_len``
-        exceeds ``max_seq_len``. Regression guard for the §1.1 validation gap.
+        """When ``vision_encoder.num_tokens=0`` (the "infer from encoder at
+        build time" sentinel), the config-time cross-check in
+        ``JobConfig.__post_init__`` is skipped. The build-time check in
+        ``build_vlm_wrapper`` must catch the case where the encoder's
+        resolved ``num_tokens`` + ``max_text_len`` exceeds ``max_seq_len``.
+        Regression guard for the validation gap.
         """
-        # RandomVisionEncoder's default num_tokens is 16 (see vision.py:53),
-        # so vlm.num_tokens=0 -> encoder resolves to 16 at build time.
+        # RandomVisionEncoder's default num_tokens is 16 (see vision.py),
+        # so num_tokens=0 -> encoder resolves to 16 at build time.
         # max_text_len=32 -> JD residual = 16 + 32 = 48. max_seq_len=32 < 48.
-        cfg = ModelConfig(
-            dim=64,
-            n_layers=2,
-            n_heads=4,
-            vocab_size=256,
-            max_seq_len=32,
-            vlm=VLMConfig(
-                vision_encoder="random",
-                num_tokens=0,  # sentinel — skips config-time check
-                max_text_len=32,
-            ),
-        )
-        # ModelConfig construction succeeded (no num_tokens-based check fired).
-        assert cfg.vlm is not None and cfg.vlm.num_tokens == 0
+        mc = ModelConfig(dim=64, n_layers=2, n_heads=4, vocab_size=256, max_seq_len=32)
+        vc = VisionEncoderConfig(type="random", num_tokens=0)  # sentinel
+        ac = AdapterConfig()
+        lc = VLMConfig(max_text_len=32)
         with pytest.raises(ValueError) as exc_info:
-            build_vlm_wrapper(cfg)
+            build_vlm_wrapper(mc, vc, ac, lc)
         # Error message must name max_seq_len, encoder.num_tokens, and
-        # vlm.max_text_len so the user can find the offending knobs.
+        # max_text_len so the user can find the offending knobs.
         msg = str(exc_info.value)
         assert "max_seq_len" in msg
         assert "encoder.num_tokens" in msg
@@ -220,21 +203,11 @@ class TestBuildVLMWrapperErrors:
         """
         # max_seq_len=32, max_text_len=32 -> JD would fail (residual would
         # be 16+32=48), but CA's residual is text-only (0+32=32).
-        cfg = ModelConfig(
-            dim=64,
-            n_layers=2,
-            n_heads=4,
-            vocab_size=256,
-            max_seq_len=32,
-            vlm=CrossAttentionConfig(
-                vision_encoder="random",
-                num_tokens=0,
-                max_text_len=32,
-            ),
-        )
-        # Should not raise — CA's residual_stream_image_tokens() returns 0
-        # regardless of the encoder's num_tokens.
-        wrapper = build_vlm_wrapper(cfg)
+        mc = ModelConfig(dim=64, n_layers=2, n_heads=4, vocab_size=256, max_seq_len=32)
+        vc = VisionEncoderConfig(type="random", num_tokens=0)
+        ac = AdapterConfig()
+        lc = CrossAttentionConfig(max_text_len=32)
+        wrapper = build_vlm_wrapper(mc, vc, ac, lc)
         assert isinstance(wrapper, VLMWrapper)
         # CA's residual is text-only, so wrapper.num_image_tokens is 0.
         assert wrapper.num_image_tokens == 0
@@ -274,44 +247,43 @@ class TestIsEncoderFrozen:
 # ---------------------------------------------------------------------------
 
 
-def _ca_vlm_config(
+def _ca_configs(
     num_image_tokens: int = 8, feature_dim: int = 96, cadence: int = 2
-) -> ModelConfig:
-    return ModelConfig(
-        dim=64,
-        n_layers=4,
-        n_heads=4,
-        vocab_size=256,
-        max_seq_len=64,
-        vlm=CrossAttentionConfig(
-            vision_encoder="random",
-            feature_dim=feature_dim,
-            num_tokens=num_image_tokens,
-            max_text_len=32,
-            cross_attention_every_n_layers=cadence,
-        ),
+) -> tuple[ModelConfig, VisionEncoderConfig, AdapterConfig, CrossAttentionConfig]:
+    return (
+        ModelConfig(dim=64, n_layers=4, n_heads=4, vocab_size=256, max_seq_len=64),
+        VisionEncoderConfig(type="random", feature_dim=feature_dim, num_tokens=num_image_tokens),
+        AdapterConfig(),
+        CrossAttentionConfig(max_text_len=32, cross_attention_every_n_layers=cadence),
     )
 
 
-def _mot_vlm_config(num_image_tokens: int = 8, feature_dim: int = 96) -> ModelConfig:
-    return ModelConfig(
-        dim=64,
-        n_layers=2,
-        n_heads=4,
-        vocab_size=256,
-        max_seq_len=64,
-        ffn_hidden_dim=128,
-        vlm=MoTConfig(
-            vision_encoder="random",
-            feature_dim=feature_dim,
-            num_tokens=num_image_tokens,
-            max_text_len=32,
+def _build_ca_tiny_wrapper(*args, **kwargs) -> VLMWrapper:
+    mc, vc, ac, lc = _ca_configs(*args, **kwargs)
+    return build_vlm_wrapper(mc, vc, ac, lc)
+
+
+def _mot_configs(
+    num_image_tokens: int = 8, feature_dim: int = 96
+) -> tuple[ModelConfig, VisionEncoderConfig, AdapterConfig, MoTConfig]:
+    return (
+        ModelConfig(
+            dim=64,
+            n_layers=2,
+            n_heads=4,
+            vocab_size=256,
+            max_seq_len=64,
+            ffn_hidden_dim=128,
         ),
+        VisionEncoderConfig(type="random", feature_dim=feature_dim, num_tokens=num_image_tokens),
+        AdapterConfig(),
+        MoTConfig(max_text_len=32),
     )
 
 
 def _build_mot_tiny_wrapper(num_image_tokens: int = 8, feature_dim: int = 96) -> VLMWrapper:
-    return build_vlm_wrapper(_mot_vlm_config(num_image_tokens, feature_dim))
+    mc, vc, ac, lc = _mot_configs(num_image_tokens, feature_dim)
+    return build_vlm_wrapper(mc, vc, ac, lc)
 
 
 class TestModalityStrategies:
@@ -362,7 +334,7 @@ class TestModalityStrategies:
         assert ctx.modality_ids.device == input_ids.device
 
     def test_cross_attention_strategy_fills_image_features(self):
-        wrapper = build_vlm_wrapper(_ca_vlm_config(num_image_tokens=8))
+        wrapper = _build_ca_tiny_wrapper(num_image_tokens=8)
         strategy = CrossAttentionStrategy()
         pixel_values = torch.randn(1, 3, 64, 64)
         input_ids = torch.randint(0, 256, (1, 16))
@@ -377,7 +349,7 @@ class TestModalityStrategies:
 
     def test_strategy_num_image_tokens_arch_specific(self):
         jd_wrapper = _build_tiny_wrapper(num_image_tokens=12)
-        ca_wrapper = build_vlm_wrapper(_ca_vlm_config(num_image_tokens=12))
+        ca_wrapper = _build_ca_tiny_wrapper(num_image_tokens=12)
         # JD: extends the residual stream by num_image_tokens.
         assert jd_wrapper.num_image_tokens == 12
         # CA: residual stream is text-only, so no extension.
@@ -386,17 +358,17 @@ class TestModalityStrategies:
 
 class TestVLMWrapperDispatch:
     def test_build_modality_strategy_joint_decoder(self):
-        cfg = JointDecoderConfig(vision_encoder="random")
+        cfg = JointDecoderConfig()
         strategy = build_modality_strategy(cfg)
         assert isinstance(strategy, JointDecoderStrategy)
 
     def test_build_modality_strategy_cross_attention(self):
-        cfg = CrossAttentionConfig(vision_encoder="random")
+        cfg = CrossAttentionConfig()
         strategy = build_modality_strategy(cfg)
         assert isinstance(strategy, CrossAttentionStrategy)
 
     def test_build_modality_strategy_mot(self):
-        cfg = MoTConfig(vision_encoder="random")
+        cfg = MoTConfig()
         strategy = build_modality_strategy(cfg)
         assert isinstance(strategy, MoTStrategy)
 
@@ -426,7 +398,7 @@ class TestVLMWrapperDispatch:
         assert isinstance(wrapper.strategy, JointDecoderStrategy)
 
     def test_ca_wrapper_uses_ca_strategy(self):
-        wrapper = build_vlm_wrapper(_ca_vlm_config())
+        wrapper = _build_ca_tiny_wrapper()
         assert isinstance(wrapper.strategy, CrossAttentionStrategy)
 
     def test_mot_wrapper_uses_mot_strategy(self):
@@ -471,7 +443,7 @@ class TestVLMWrapperDispatch:
     def test_ca_forward_logits_text_only_shape(self):
         """CA forward also returns logits with shape (B, T, V): the
         residual stream is text-only, so no extra image positions."""
-        wrapper = build_vlm_wrapper(_ca_vlm_config(num_image_tokens=8)).to(DEVICE).eval()
+        wrapper = _build_ca_tiny_wrapper(num_image_tokens=8).to(DEVICE).eval()
         pixel_values = torch.randn(1, 3, 64, 64, device=DEVICE)
         input_ids = torch.randint(0, 256, (1, 16), device=DEVICE)
         with torch.no_grad():

@@ -30,8 +30,10 @@ import torch
 import torch.distributed as dist
 
 from kempnerforge.checkpoint.manager import CheckpointManager
+from kempnerforge.config.adapter import AdapterConfig
 from kempnerforge.config.model import ModelConfig
 from kempnerforge.config.schema import CheckpointConfig, OptimizerConfig
+from kempnerforge.config.vision import VisionEncoderConfig
 from kempnerforge.config.vlm import FreezeSpec, JointDecoderConfig, MoTConfig
 from kempnerforge.distributed.parallel import build_parallel_model
 from kempnerforge.model.mot import mot_warm_start_from_text_stack
@@ -57,21 +59,22 @@ def _tiny_mot_cfg(
     n_layers: int = 2,
     freeze: list[FreezeSpec] | None = None,
     moe: bool = False,
-) -> ModelConfig:
-    return ModelConfig(
-        dim=64,
-        n_layers=n_layers,
-        n_heads=4,
-        vocab_size=256,
-        max_seq_len=128,
-        ffn_hidden_dim=128,
-        num_experts=4 if moe else 0,
-        moe_top_k=2 if moe else 2,
-        moe_frequency=2 if moe else 1,
-        vlm=MoTConfig(
-            vision_encoder="random",
-            feature_dim=feature_dim,
-            num_tokens=num_image_tokens,
+) -> tuple[ModelConfig, VisionEncoderConfig, AdapterConfig, MoTConfig]:
+    return (
+        ModelConfig(
+            dim=64,
+            n_layers=n_layers,
+            n_heads=4,
+            vocab_size=256,
+            max_seq_len=128,
+            ffn_hidden_dim=128,
+            num_experts=4 if moe else 0,
+            moe_top_k=2 if moe else 2,
+            moe_frequency=2 if moe else 1,
+        ),
+        VisionEncoderConfig(type="random", feature_dim=feature_dim, num_tokens=num_image_tokens),
+        AdapterConfig(),
+        MoTConfig(
             max_text_len=32,
             freeze=freeze if freeze is not None else [FreezeSpec("vision_encoder", True)],
         ),
@@ -79,16 +82,20 @@ def _tiny_mot_cfg(
 
 
 def _build(
-    cfg: ModelConfig,
+    cfg: tuple[ModelConfig, VisionEncoderConfig, AdapterConfig, MoTConfig],
     mesh,
     *,
     param_dtype: torch.dtype = torch.bfloat16,
     compile_model: bool = False,
 ) -> VLMWrapper:
+    mc, vc, ac, lc = cfg
     model = build_parallel_model(
-        cfg,
+        mc,
         device=torch.device("cuda"),
         device_mesh=mesh,
+        vision_config=vc,
+        adapter_config=ac,
+        vlm_config=lc,
         param_dtype=param_dtype,
         compile_model=compile_model,
     )
@@ -213,7 +220,7 @@ class TestFreezeStageUnderFsdp:
         apply_freeze_specs(
             wrapper,
             [FreezeSpec("mot", False)],
-            cfg.vlm.module_patterns,  # type: ignore[union-attr]
+            cfg[3].module_patterns,  # type: ignore[union-attr]
         )
         for p in wrapper.parameters():
             p.grad = None
@@ -269,16 +276,18 @@ class TestWarmStartUnderFsdp:
 
         # Build a JD model with the same backbone shape, unwrap the FSDP
         # state on rank 0 via state_dict, broadcast a CPU dict to all ranks.
-        jd_cfg = ModelConfig(
-            dim=64,
-            n_layers=2,
-            n_heads=4,
-            vocab_size=256,
-            max_seq_len=128,
-            ffn_hidden_dim=128,
-            vlm=JointDecoderConfig(
-                vision_encoder="random", feature_dim=96, num_tokens=8, max_text_len=32
+        jd_cfg = (
+            ModelConfig(
+                dim=64,
+                n_layers=2,
+                n_heads=4,
+                vocab_size=256,
+                max_seq_len=128,
+                ffn_hidden_dim=128,
             ),
+            VisionEncoderConfig(type="random", feature_dim=96, num_tokens=8),
+            AdapterConfig(),
+            JointDecoderConfig(max_text_len=32),
         )
         jd_wrapper = _build(jd_cfg, mesh, param_dtype=torch.float32)
         jd_state_full = inner_transformer(jd_wrapper).state_dict()
@@ -308,7 +317,7 @@ class TestWarmStartUnderFsdp:
 
         # Per-modality copies equal source dense weights (gather first).
         mot_t = inner_transformer(mot_wrapper)
-        for i in range(mot_cfg.n_layers):
+        for i in range(mot_cfg[0].n_layers):
             for m in mot_t.layers[str(i)].modalities:  # type: ignore[union-attr]
                 w = mot_t.layers[str(i)].attn.q_proj[m].weight  # type: ignore[union-attr]
                 w_full = w.full_tensor() if hasattr(w, "full_tensor") else w
@@ -390,7 +399,7 @@ class TestCheckpointRoundtrip:
         ckpt_cfg = CheckpointConfig(dir=str(path_str), interval=1)
         mgr = CheckpointManager(ckpt_cfg, wrapper, opt)
         freeze = canonical_freeze_meta(
-            effective_freeze(0, cfg.vlm.freeze, cfg.vlm.freeze_schedule)  # type: ignore[union-attr]
+            effective_freeze(0, cfg[3].freeze, cfg[3].freeze_schedule)  # type: ignore[union-attr]
         )
         mgr.save(step=1, extra={"vlm_freeze": freeze})
         dist.barrier()

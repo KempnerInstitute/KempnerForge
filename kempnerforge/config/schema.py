@@ -1,5 +1,6 @@
 """Backward-compatible re-exports. Import from here or from submodules directly."""
 
+from kempnerforge.config.adapter import AdapterConfig  # noqa: F401
 from kempnerforge.config.checkpoint import AsyncCheckpointMode, CheckpointConfig  # noqa: F401
 from kempnerforge.config.data import DataConfig, DatasetSource, TrainingPhase  # noqa: F401
 from kempnerforge.config.distributed import DistributedConfig, PipelineSchedule  # noqa: F401
@@ -11,6 +12,7 @@ from kempnerforge.config.optimizer import OptimizerConfig  # noqa: F401
 from kempnerforge.config.profiling import ProfilingConfig  # noqa: F401
 from kempnerforge.config.scheduler import SchedulerConfig, SchedulerType  # noqa: F401
 from kempnerforge.config.training import ActivationCheckpointing, TrainConfig  # noqa: F401
+from kempnerforge.config.vision import VisionEncoderConfig  # noqa: F401
 from kempnerforge.config.vlm import (  # noqa: F401
     DEFAULT_MODULE_PATTERNS,
     FreezeSpec,

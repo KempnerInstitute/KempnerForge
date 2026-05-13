@@ -17,7 +17,9 @@ from __future__ import annotations
 import pytest
 import torch
 
+from kempnerforge.config.adapter import AdapterConfig
 from kempnerforge.config.model import ModelConfig
+from kempnerforge.config.vision import VisionEncoderConfig
 from kempnerforge.config.vlm import (
     CrossAttentionConfig,
     FreezeSpec,
@@ -36,23 +38,18 @@ pytestmark = pytest.mark.skipif(
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def _tiny_ca_config(
+def _tiny_ca_configs(
     *,
     num_image_tokens: int = 8,
     feature_dim: int = 96,
     cadence: int = 2,
     freeze: list[FreezeSpec] | None = None,
-) -> ModelConfig:
-    return ModelConfig(
-        dim=64,
-        n_layers=4,
-        n_heads=4,
-        vocab_size=256,
-        max_seq_len=128,
-        vlm=CrossAttentionConfig(
-            vision_encoder="random",
-            feature_dim=feature_dim,
-            num_tokens=num_image_tokens,
+) -> tuple[ModelConfig, VisionEncoderConfig, AdapterConfig, CrossAttentionConfig]:
+    return (
+        ModelConfig(dim=64, n_layers=4, n_heads=4, vocab_size=256, max_seq_len=128),
+        VisionEncoderConfig(type="random", feature_dim=feature_dim, num_tokens=num_image_tokens),
+        AdapterConfig(),
+        CrossAttentionConfig(
             max_text_len=32,
             cross_attention_every_n_layers=cadence,
             freeze=freeze if freeze is not None else [FreezeSpec("vision_encoder", True)],
@@ -60,8 +57,21 @@ def _tiny_ca_config(
     )
 
 
-def _build(cfg: ModelConfig, *, param_dtype: torch.dtype = torch.bfloat16) -> VLMWrapper:
-    model = build_parallel_model(cfg, device=DEVICE, device_mesh=None, param_dtype=param_dtype)
+def _build(
+    configs: tuple[ModelConfig, VisionEncoderConfig, AdapterConfig, CrossAttentionConfig],
+    *,
+    param_dtype: torch.dtype = torch.bfloat16,
+) -> VLMWrapper:
+    mc, vc, ac, lc = configs
+    model = build_parallel_model(
+        mc,
+        device=DEVICE,
+        device_mesh=None,
+        vision_config=vc,
+        adapter_config=ac,
+        vlm_config=lc,
+        param_dtype=param_dtype,
+    )
     assert isinstance(model, VLMWrapper)
     return model
 
@@ -80,7 +90,7 @@ def _dummy_batch(
 class TestBuildAndForward:
     def test_build_and_forward_1gpu(self):
         """Tiny CA config builds on a single GPU; forward + backward run."""
-        cfg = _tiny_ca_config()
+        cfg = _tiny_ca_configs()
         wrapper = _build(cfg)
         assert isinstance(wrapper, VLMWrapper)
         # CA arch: residual stream is text-only.
@@ -90,7 +100,7 @@ class TestBuildAndForward:
 
         pixels, input_ids, labels = _dummy_batch(wrapper)
         logits, _ = wrapper(pixels, input_ids, labels)
-        assert logits.shape == (2, 16, cfg.vocab_size)
+        assert logits.shape == (2, 16, cfg[0].vocab_size)
         loss = logits.float().sum()
         loss.backward()
         # Adapter and CA layers receive gradients (encoder is frozen).
@@ -111,7 +121,7 @@ class TestBuildAndForward:
         """`FreezeSpec("cross_attention")` freezes only CA params and
         leaves the rest of the transformer trainable.
         """
-        cfg = _tiny_ca_config(freeze=[FreezeSpec("cross_attention", True)])
+        cfg = _tiny_ca_configs(freeze=[FreezeSpec("cross_attention", True)])
         wrapper = _build(cfg)
         trainable = {name for name, p in wrapper.named_parameters() if p.requires_grad}
         frozen = {name for name, p in wrapper.named_parameters() if not p.requires_grad}
@@ -132,7 +142,7 @@ class TestBuildAndForward:
         sees it. The test asserts (a) build with bf16 param_dtype works,
         (b) forward output is bf16, (c) no dtype-mismatch errors.
         """
-        cfg = _tiny_ca_config()
+        cfg = _tiny_ca_configs()
         wrapper = _build(cfg, param_dtype=torch.bfloat16)
         # Adapter params are bf16; encoder is in HF default (fp32).
         assert wrapper.adapter.proj1.weight.dtype == torch.bfloat16
@@ -145,7 +155,7 @@ class TestBuildAndForward:
         """torch.compile(wrapper) output matches eager output within
         a small tolerance. Catches compile-graph divergence in the
         CA-interleaved forward path."""
-        cfg = _tiny_ca_config()
+        cfg = _tiny_ca_configs()
         wrapper = _build(cfg, param_dtype=torch.float32)  # fp32 for tighter comparison
         wrapper.eval()
         pixels, input_ids, _ = _dummy_batch(wrapper, batch=1, text_len=8)
@@ -167,14 +177,14 @@ class TestFreezeStageHook:
         idempotent: running effective_freeze + apply_freeze_specs at the
         boundary matches the on-the-fly hook in scripts/train.py.
         """
-        cfg = _tiny_ca_config(
+        cfg = _tiny_ca_configs(
             freeze=[
                 FreezeSpec("vision_encoder", True),
                 FreezeSpec("adapter", False),
             ],
         )
         # Schedule: at step 3, freeze adapter. At step 7, unfreeze adapter.
-        cfg.vlm.freeze_schedule = [
+        cfg[3].freeze_schedule = [
             FreezeStage(start_step=3, specs=(FreezeSpec("adapter", True),)),
             FreezeStage(start_step=7, specs=(FreezeSpec("adapter", False),)),
         ]
@@ -187,14 +197,14 @@ class TestFreezeStageHook:
             assert p.requires_grad
 
         # At step 3: apply effective_freeze and confirm adapter is frozen.
-        specs = effective_freeze(3, cfg.vlm.freeze, cfg.vlm.freeze_schedule)
-        apply_freeze_specs(wrapper, specs, cfg.vlm.module_patterns)
+        specs = effective_freeze(3, cfg[3].freeze, cfg[3].freeze_schedule)
+        apply_freeze_specs(wrapper, specs, cfg[3].module_patterns)
         for p in adapter_params:
             assert not p.requires_grad
 
         # At step 7: unfreeze.
-        specs = effective_freeze(7, cfg.vlm.freeze, cfg.vlm.freeze_schedule)
-        apply_freeze_specs(wrapper, specs, cfg.vlm.module_patterns)
+        specs = effective_freeze(7, cfg[3].freeze, cfg[3].freeze_schedule)
+        apply_freeze_specs(wrapper, specs, cfg[3].module_patterns)
         for p in adapter_params:
             assert p.requires_grad
 
@@ -204,7 +214,7 @@ class TestFreezeStageHook:
         Frozen-adapter weights are bit-identical across optimizer steps
         even when weight_decay is non-zero.
         """
-        cfg = _tiny_ca_config(freeze=[FreezeSpec("adapter", True)])
+        cfg = _tiny_ca_configs(freeze=[FreezeSpec("adapter", True)])
         wrapper = _build(cfg, param_dtype=torch.float32)
 
         # Snapshot adapter weights before the optimizer step.
@@ -240,7 +250,7 @@ class TestFreezeStageHook:
         """A model's state_dict round-trips with bit-equal forward
         output. Catches missing buffer registration, persistent vs
         non-persistent buffer mistakes, etc."""
-        cfg = _tiny_ca_config()
+        cfg = _tiny_ca_configs()
         wrapper_a = _build(cfg, param_dtype=torch.float32)
         wrapper_a.eval()
         pixels, input_ids, _ = _dummy_batch(wrapper_a, batch=1, text_len=8)
@@ -263,18 +273,11 @@ class TestFreezeStageHook:
         """Sanity: a JD state_dict round-trips into a JD-built wrapper
         without missing/unexpected keys.
         """
-        cfg = ModelConfig(
-            dim=64,
-            n_layers=2,
-            n_heads=4,
-            vocab_size=256,
-            max_seq_len=128,
-            vlm=JointDecoderConfig(
-                vision_encoder="random",
-                feature_dim=96,
-                num_tokens=8,
-                max_text_len=32,
-            ),
+        cfg = (
+            ModelConfig(dim=64, n_layers=2, n_heads=4, vocab_size=256, max_seq_len=128),
+            VisionEncoderConfig(type="random", feature_dim=96, num_tokens=8),
+            AdapterConfig(),
+            JointDecoderConfig(max_text_len=32),
         )
         wrapper_a = _build(cfg)
         state = wrapper_a.state_dict()
@@ -289,20 +292,13 @@ class TestFreezeStageHook:
         (CA layers stay at their construction defaults, which for Wo
         is zero -> identity at init), and the resulting model is
         functional for forward."""
-        jd_cfg = ModelConfig(
-            dim=64,
-            n_layers=4,
-            n_heads=4,
-            vocab_size=256,
-            max_seq_len=128,
-            vlm=JointDecoderConfig(
-                vision_encoder="random",
-                feature_dim=96,
-                num_tokens=8,
-                max_text_len=32,
-            ),
+        jd_cfg = (
+            ModelConfig(dim=64, n_layers=4, n_heads=4, vocab_size=256, max_seq_len=128),
+            VisionEncoderConfig(type="random", feature_dim=96, num_tokens=8),
+            AdapterConfig(),
+            JointDecoderConfig(max_text_len=32),
         )
-        ca_cfg = _tiny_ca_config(num_image_tokens=8, feature_dim=96, cadence=2)
+        ca_cfg = _tiny_ca_configs(num_image_tokens=8, feature_dim=96, cadence=2)
 
         jd_wrapper = _build(jd_cfg)
         ca_wrapper = _build(ca_cfg)
@@ -329,25 +325,25 @@ class TestFreezeStageHook:
         (typo in TOML, e.g., "adaptor" instead of "adapter") must raise
         at training-loop start so the user can fix the typo before
         wasting compute. effective_freeze validates against
-        mc.vlm.module_patterns keys when the training loop calls it
+        vlm_cfg.module_patterns keys when the training loop calls it
         with valid_modules set.
         """
-        cfg = _tiny_ca_config()
+        cfg = _tiny_ca_configs()
         # FreezeStage with a typo'd module alias: "adaptor" not in
         # module_patterns ({transformer, vision_encoder, adapter,
         # cross_attention} for CrossAttentionConfig).
-        cfg.vlm.freeze_schedule = [
+        cfg[3].freeze_schedule = [
             FreezeStage(start_step=5, specs=(FreezeSpec("adaptor", True),)),
         ]
         # The validation fires when effective_freeze is called with
         # valid_modules=set(module_patterns.keys()), which scripts/train.py
         # does at every save and at resume.
-        valid_modules = set(cfg.vlm.module_patterns.keys())
+        valid_modules = set(cfg[3].module_patterns.keys())
         with pytest.raises(ValueError, match="adaptor"):
             effective_freeze(
                 step=10,
-                base=cfg.vlm.freeze,
-                schedule=cfg.vlm.freeze_schedule,
+                base=cfg[3].freeze,
+                schedule=cfg[3].freeze_schedule,
                 valid_modules=valid_modules,
             )
 
@@ -362,20 +358,21 @@ class TestFreezeStageHook:
         """
         from kempnerforge.model.vlm import inner_transformer
 
-        cfg = ModelConfig(
-            dim=64,
-            n_layers=4,
-            n_heads=4,
-            n_kv_heads=2,
-            vocab_size=256,
-            max_seq_len=128,
-            num_experts=4,
-            moe_top_k=2,
-            moe_frequency=2,
-            vlm=CrossAttentionConfig(
-                vision_encoder="random",
-                feature_dim=96,
-                num_tokens=8,
+        cfg = (
+            ModelConfig(
+                dim=64,
+                n_layers=4,
+                n_heads=4,
+                n_kv_heads=2,
+                vocab_size=256,
+                max_seq_len=128,
+                num_experts=4,
+                moe_top_k=2,
+                moe_frequency=2,
+            ),
+            VisionEncoderConfig(type="random", feature_dim=96, num_tokens=8),
+            AdapterConfig(),
+            CrossAttentionConfig(
                 max_text_len=32,
                 cross_attention_every_n_layers=2,
                 freeze=[FreezeSpec("vision_encoder", True)],
@@ -396,14 +393,14 @@ class TestFreezeStageHook:
         loss_fn = torch.nn.CrossEntropyLoss()
         torch.manual_seed(0)
         pixels = torch.randn(2, 3, 32, 32, device=DEVICE)
-        input_ids = torch.randint(0, cfg.vocab_size, (2, 16), device=DEVICE)
+        input_ids = torch.randint(0, cfg[0].vocab_size, (2, 16), device=DEVICE)
 
         inner = inner_transformer(wrapper)
         losses = []
         for step in range(5):
             inner.set_moe_step(step, max_steps=100)  # type: ignore[attr-defined]
             logits, _ = wrapper(pixels, input_ids, input_ids)
-            ce = loss_fn(logits.reshape(-1, cfg.vocab_size), input_ids.reshape(-1))
+            ce = loss_fn(logits.reshape(-1, cfg[0].vocab_size), input_ids.reshape(-1))
             aux = inner.get_moe_aux_loss()  # type: ignore[attr-defined]
             loss = ce + 0.01 * aux
             loss.backward()
@@ -430,7 +427,7 @@ class TestFreezeStageHook:
         functionally ignored" failure mode.
         """
         torch.manual_seed(0)
-        cfg = _tiny_ca_config(num_image_tokens=8, feature_dim=96, cadence=2)
+        cfg = _tiny_ca_configs(num_image_tokens=8, feature_dim=96, cadence=2)
         wrapper = _build(cfg, param_dtype=torch.float32)
         wrapper.train()
 
@@ -444,17 +441,17 @@ class TestFreezeStageHook:
         # could match if labels were random.
         input_ids_dataset = torch.zeros(n_pairs, text_len, dtype=torch.long, device=DEVICE)
         for i in range(n_pairs):
-            seed_val = int(pixels_dataset[i].sum().item() * 1000) % cfg.vocab_size
-            input_ids_dataset[i] = (
-                torch.arange(text_len, device=DEVICE) + seed_val
-            ) % cfg.vocab_size
+            seed_val = int(pixels_dataset[i].sum().item() * 1000) % cfg[0].vocab_size
+            input_ids_dataset[i] = (torch.arange(text_len, device=DEVICE) + seed_val) % cfg[
+                0
+            ].vocab_size
 
         optimizer = torch.optim.AdamW(wrapper.parameters(), lr=3e-3)
         loss_fn = torch.nn.CrossEntropyLoss(ignore_index=-100)
 
         def _train_step(pixels, input_ids, labels):
             logits, _ = wrapper(pixels, input_ids, labels)
-            loss = loss_fn(logits.reshape(-1, cfg.vocab_size), labels.reshape(-1))
+            loss = loss_fn(logits.reshape(-1, cfg[0].vocab_size), labels.reshape(-1))
             return loss
 
         # Initial loss: forward over the full mini-dataset.

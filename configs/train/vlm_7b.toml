@@ -17,9 +17,9 @@
 # the dataset (and tokenizer) via CLI:
 #   --data.hf_dataset_name=<dataset> --data.tokenizer_path=<tokenizer>
 #
-# Swap the vision encoder via [model.vlm].vision_encoder: "random"
-# (stub, no download), "siglip2", or "clip". When pointing at a real
-# encoder also set vision_encoder_path.
+# Swap the vision encoder via [vision_encoder].type: "random" (stub, no
+# download), "siglip2", or "clip". When pointing at a real encoder also
+# set [vision_encoder].path.
 
 [model]
 dim = 4096
@@ -34,11 +34,13 @@ max_seq_len = 1024
 rope_theta = 500000.0
 tie_embeddings = false
 
-[model.vlm]
-arch = "joint_decoder"
-vision_encoder = "random"
+[vision_encoder]
+type = "random"
 feature_dim = 1024
 num_tokens = 256
+
+[vlm]
+arch = "joint_decoder"
 
 [train]
 batch_size = 16

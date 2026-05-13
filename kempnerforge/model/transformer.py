@@ -16,7 +16,7 @@ import torch.nn as nn
 
 from kempnerforge.config.registry import registry
 from kempnerforge.config.schema import ModelConfig
-from kempnerforge.config.vlm import CrossAttentionConfig, MoTConfig
+from kempnerforge.config.vlm import CrossAttentionConfig, MoTConfig, VLMConfig
 from kempnerforge.model.attention import Attention, KVCache
 from kempnerforge.model.cross_attention import CrossAttentionBlock
 from kempnerforge.model.embedding import OutputHead, TokenEmbedding
@@ -100,7 +100,13 @@ class Transformer(nn.Module):
     Embedding → TransformerBlocks → Norm → Output Head
     """
 
-    def __init__(self, config: ModelConfig) -> None:
+    def __init__(
+        self,
+        config: ModelConfig,
+        *,
+        vlm_config: VLMConfig | None = None,
+        num_image_tokens: int = 0,
+    ) -> None:
         super().__init__()
         self.config = config
 
@@ -110,11 +116,14 @@ class Transformer(nn.Module):
         # MoT branch: build MoTBlocks instead of TransformerBlocks. v1
         # enforces equal head counts across modalities (single global
         # SDPA over the concatenated multi-modality sequence).
+        # num_image_tokens flows in from the vision encoder via the VLM
+        # build path; it is unused for non-MoT arches but kept as a single
+        # constructor arg so the signature is uniform across arches.
         self._mot_modalities: tuple[str, ...] = ()
         self._mot_n_image: int = 0
-        if isinstance(config.vlm, MoTConfig):
+        if isinstance(vlm_config, MoTConfig):
             text_n_kv_heads = config.n_kv_heads if config.n_kv_heads is not None else config.n_heads
-            img_n_heads, img_n_kv_heads = config.vlm.resolved_image_heads(
+            img_n_heads, img_n_kv_heads = vlm_config.resolved_image_heads(
                 config.n_heads, text_n_kv_heads
             )
             if img_n_heads != config.n_heads or img_n_kv_heads != text_n_kv_heads:
@@ -123,8 +132,8 @@ class Transformer(nn.Module):
                     f"image=({img_n_heads}, {img_n_kv_heads}) vs "
                     f"text=({config.n_heads}, {text_n_kv_heads})"
                 )
-            self._mot_modalities = config.vlm.mot_modalities
-            self._mot_n_image = config.vlm.num_tokens
+            self._mot_modalities = vlm_config.mot_modalities
+            self._mot_n_image = num_image_tokens
             self.layers = nn.ModuleDict(
                 {
                     str(i): MoTBlock(config, modalities=self._mot_modalities, layer_idx=i)
@@ -137,15 +146,15 @@ class Transformer(nn.Module):
                 {str(i): TransformerBlock(config, layer_idx=i) for i in range(config.n_layers)}
             )
 
-        # Cross-Attention layers (only populated when vlm is a
+        # Cross-Attention layers (only populated when vlm_config is a
         # CrossAttentionConfig). Empty ModuleDict registers no
         # state_dict keys, so JD checkpoints load unchanged on builds
         # where this dict ends up empty.
         self.cross_attention_layers: nn.ModuleDict = nn.ModuleDict()
         self._ca_cadence: int = 0
-        if isinstance(config.vlm, CrossAttentionConfig):
-            self._ca_cadence = config.vlm.cross_attention_every_n_layers
-            n_h, n_kv = config.vlm.resolved_heads(config.n_heads)
+        if isinstance(vlm_config, CrossAttentionConfig):
+            self._ca_cadence = vlm_config.cross_attention_every_n_layers
+            n_h, n_kv = vlm_config.resolved_heads(config.n_heads)
             num_ca_blocks = config.n_layers // self._ca_cadence
             for k in range(num_ca_blocks):
                 self.cross_attention_layers[str(k)] = CrossAttentionBlock(

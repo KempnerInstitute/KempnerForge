@@ -1,15 +1,21 @@
 """VLM (vision-language model) configuration.
 
-``VLMConfig`` describes the vision stack attached to a backbone
-``Transformer``. It lives as ``ModelConfig.vlm``; when unset, models
-behave exactly as before.
+``VLMConfig`` carries the arch-level knobs of the vision-language
+model: which architecture to wire (``arch``), the fixed text padding
+length, and the freeze policy. The vision encoder and adapter are
+described by sibling top-level sections (``VisionEncoderConfig`` in
+``config/vision.py``, ``AdapterConfig`` in ``config/adapter.py``).
+
+In TOML, ``[vlm]`` is a top-level section, parallel to ``[model]``,
+``[vision_encoder]``, and ``[adapter]``. When ``[vlm]`` is absent the
+job is a pure text run.
 
 Architecture is a discriminated union on the ``arch`` field:
 
-- ``"joint_decoder"`` — image tokens prepended to the text sequence.
-- ``"cross_attention"`` — image K/V flows in via separate
+- ``"joint_decoder"`` image tokens prepended to the text sequence.
+- ``"cross_attention"`` image K/V flows in via separate
   cross-attention blocks at a configurable cadence.
-- ``"mot"`` — Mixture-of-Transformers: per-modality Q/K/V/O + per-
+- ``"mot"`` Mixture-of-Transformers: per-modality Q/K/V/O + per-
   modality FFN at every layer, single global self-attention.
 
 Each arch gets its own ``VLMConfig`` subclass, registered via
@@ -84,39 +90,19 @@ class VLMConfig:
 
     Field summary (full per-field docs are picked up from autodoc):
 
-    - ``arch`` — VLM architecture discriminator. Subclasses set this via
+    - ``arch`` VLM architecture discriminator. Subclasses set this via
       field default; direct construction with an arch name not backed by
       a registered subclass raises.
-    - ``vision_encoder`` — registry key
-      (see ``registry.register_vision_encoder``). Required.
-    - ``vision_encoder_path`` — HF Hub id or local path passed to the
-      encoder builder.
-    - ``feature_dim`` — output feature dim of the vision encoder. 0 means
-      infer from the encoder at build time.
-    - ``num_tokens`` — number of image tokens produced per image. 0 means
-      infer from the encoder at build time. When > 0 it is cross-checked
-      against ``max_seq_len``.
-    - ``adapter_hidden_dim`` — hidden dim of the 2-layer MLP adapter.
-      0 means use the backbone ``dim``.
-    - ``adapter_activation`` — activation inside the adapter. One of
-      ``"gelu"``, ``"silu"``, ``"relu"``.
-    - ``max_text_len`` — fixed text padding length used by ``VLMCollator``.
+    - ``max_text_len`` fixed text padding length used by ``VLMCollator``.
       Enforces rank-consistent batches under FSDP2.
-    - ``freeze`` — static freeze specs applied once at build time.
-    - ``freeze_schedule`` — step-boundary freeze transitions (reserved;
-      wiring into the training loop lands in a follow-up).
-    - ``module_patterns`` — map of module alias (``"transformer"``,
+    - ``freeze`` static freeze specs applied once at build time.
+    - ``freeze_schedule`` step-boundary freeze transitions.
+    - ``module_patterns`` map of module alias (``"transformer"``,
       ``"vision_encoder"``, ``"adapter"``, plus arch-specific additions)
       to fnmatch pattern list.
     """
 
     arch: str = "joint_decoder"
-    vision_encoder: str = ""
-    vision_encoder_path: str = ""
-    feature_dim: int = 0
-    num_tokens: int = 0
-    adapter_hidden_dim: int = 0
-    adapter_activation: str = "gelu"
     max_text_len: int = 512
     freeze: list[FreezeSpec] = field(default_factory=lambda: [FreezeSpec("vision_encoder", True)])
     freeze_schedule: list[FreezeStage] = field(default_factory=list)
@@ -137,19 +123,6 @@ class VLMConfig:
                 f"Registered: {sorted(registered)}. "
                 f"Reserved (not yet implemented): {sorted(_RESERVED_ARCHS)}."
             )
-        if not self.vision_encoder:
-            raise ValueError(
-                "vlm.vision_encoder must be set (registry key, e.g. 'random', 'siglip2', 'clip')"
-            )
-        if self.adapter_activation not in ("gelu", "silu", "relu"):
-            raise ValueError(
-                f"Unknown vlm.adapter_activation: {self.adapter_activation!r}. "
-                "Options: 'gelu', 'silu', 'relu'."
-            )
-        if self.feature_dim < 0 or self.num_tokens < 0:
-            raise ValueError("vlm.feature_dim and vlm.num_tokens must be non-negative")
-        if self.adapter_hidden_dim < 0:
-            raise ValueError("vlm.adapter_hidden_dim must be non-negative")
         if self.max_text_len <= 0:
             raise ValueError("vlm.max_text_len must be positive")
         if self.freeze_schedule:
@@ -157,29 +130,26 @@ class VLMConfig:
             if steps != sorted(steps) or len(steps) != len(set(steps)):
                 raise ValueError("vlm.freeze_schedule start_steps must be strictly monotonic")
 
-    def residual_stream_image_tokens(self, num_tokens: int | None = None) -> int:
-        """Number of image tokens this arch puts in the residual stream.
+    def residual_stream_image_tokens(self, num_tokens: int) -> int:
+        """Number of image tokens this arch places in the residual stream.
 
-        Used by ``ModelConfig`` and ``JobConfig`` to validate that
-        ``max_seq_len`` and ``train.seq_len`` are large enough to fit
+        Used by ``JobConfig`` to validate that ``model.max_seq_len`` and
+        ``train.seq_len`` are large enough to fit
         ``residual_stream_image_tokens + max_text_len`` along the
         attention sequence dimension.
 
-        - Joint-Decoder: ``num_tokens`` (image tokens prepended to text).
+        - Joint-Decoder / MoT: ``num_tokens`` (image tokens prepended to
+          text).
         - Cross-Attention: ``0`` (residual stream is text-only; image
           features flow side-channel into CA blocks).
 
         Args:
-            num_tokens: Override for ``self.num_tokens``. Pass the vision
-                encoder's resolved ``num_tokens`` at build time when the
-                config-level value is ``0`` (the "infer at build time"
-                sentinel). When ``None``, ``self.num_tokens`` is used —
-                matches the config-time call site in ``ModelConfig``.
-
-        Subclasses override as needed. Base default matches the
-        Joint-Decoder semantics.
+            num_tokens: The vision encoder's resolved ``num_tokens``.
+                Pass ``0`` when it is not known yet (the "infer at build
+                time" sentinel); cross-checks that depend on a concrete
+                value will skip and re-run at build time.
         """
-        return self.num_tokens if num_tokens is None else num_tokens
+        return num_tokens
 
     @classmethod
     def for_arch(cls, arch: str, **kwargs: Any) -> VLMConfig:
@@ -188,15 +158,13 @@ class VLMConfig:
         Raises:
             ValueError: ``arch`` is not registered.
             NotImplementedError: ``arch`` is reserved (in
-                ``_RESERVED_ARCHS``) — matches loader semantics so the
+                ``_RESERVED_ARCHS``) matches loader semantics so the
                 error type is independent of construction site.
 
         Example:
             >>> cfg = VLMConfig.for_arch(
             ...     "cross_attention",
-            ...     vision_encoder="random",
-            ...     feature_dim=1024,
-            ...     num_tokens=256,
+            ...     max_text_len=2048,
             ...     cross_attention_every_n_layers=4,
             ... )
         """
@@ -265,7 +233,7 @@ class CrossAttentionConfig(VLMConfig):
                 "vlm.cross_attention_n_heads and cross_attention_n_kv_heads must be non-negative"
             )
 
-    def residual_stream_image_tokens(self, num_tokens: int | None = None) -> int:  # noqa: ARG002
+    def residual_stream_image_tokens(self, num_tokens: int) -> int:  # noqa: ARG002
         """Cross-Attention does not extend the residual stream.
 
         Image features flow as K/V into separate CrossAttentionBlocks;
@@ -355,15 +323,11 @@ class MoTConfig(VLMConfig):
                 "non-empty filesystem path to a torch-saved JD or text-only state dict"
             )
 
-    def residual_stream_image_tokens(self, num_tokens: int | None = None) -> int:
+    def residual_stream_image_tokens(self, num_tokens: int) -> int:
         """MoT prepends ``num_tokens`` image tokens to the text sequence
         (same residual-stream layout as Joint-Decoder).
-
-        Accepts the same ``num_tokens`` override as the base method so
-        build-time call sites can pass the encoder's resolved value when
-        the config-level ``num_tokens`` is ``0``.
         """
-        return self.num_tokens if num_tokens is None else num_tokens
+        return num_tokens
 
     def resolved_image_heads(
         self, model_n_heads: int, model_n_kv_heads: int = 0

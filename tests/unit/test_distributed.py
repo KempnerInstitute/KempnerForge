@@ -324,40 +324,54 @@ class TestApplyFsdpVLMGuards:
 
 
 class TestBuildParallelModelVLM:
-    def _vlm_model_config(self, max_seq_len: int = 64, max_text_len: int = 32, num_tokens: int = 8):
+    def _vlm_configs(self, max_seq_len: int = 64, max_text_len: int = 32, num_tokens: int = 8):
+        from kempnerforge.config.adapter import AdapterConfig
+        from kempnerforge.config.vision import VisionEncoderConfig
         from kempnerforge.config.vlm import VLMConfig
 
-        return ModelConfig(
-            dim=64,
-            n_layers=2,
-            n_heads=4,
-            n_kv_heads=4,
-            vocab_size=256,
-            max_seq_len=max_seq_len,
-            vlm=VLMConfig(
-                vision_encoder="random",
-                feature_dim=96,
-                num_tokens=num_tokens,
-                max_text_len=max_text_len,
+        return (
+            ModelConfig(
+                dim=64,
+                n_layers=2,
+                n_heads=4,
+                n_kv_heads=4,
+                vocab_size=256,
+                max_seq_len=max_seq_len,
             ),
+            VisionEncoderConfig(type="random", feature_dim=96, num_tokens=num_tokens),
+            AdapterConfig(),
+            VLMConfig(max_text_len=max_text_len),
         )
 
     def test_dispatches_to_vlm_branch(self):
-        """``is_vlm=True`` routes through ``_build_vlm`` and returns a
-        ``VLMWrapper`` (not a bare Transformer)."""
+        """Passing a non-None ``vlm_config`` routes through ``_build_vlm`` and
+        returns a ``VLMWrapper`` (not a bare Transformer)."""
         from kempnerforge.distributed.parallel import build_parallel_model
         from kempnerforge.model.vlm import VLMWrapper
 
-        cfg = self._vlm_model_config()
-        model = build_parallel_model(cfg, torch.device("cpu"), device_mesh=None)
+        mc, vc, ac, lc = self._vlm_configs()
+        model = build_parallel_model(
+            mc,
+            torch.device("cpu"),
+            device_mesh=None,
+            vision_config=vc,
+            adapter_config=ac,
+            vlm_config=lc,
+        )
         assert isinstance(model, VLMWrapper)
 
     def test_param_dtype_applied_to_transformer_and_adapter(self):
         from kempnerforge.distributed.parallel import build_parallel_model
 
-        cfg = self._vlm_model_config()
+        mc, vc, ac, lc = self._vlm_configs()
         model = build_parallel_model(
-            cfg, torch.device("cpu"), device_mesh=None, param_dtype=torch.bfloat16
+            mc,
+            torch.device("cpu"),
+            device_mesh=None,
+            vision_config=vc,
+            adapter_config=ac,
+            vlm_config=lc,
+            param_dtype=torch.bfloat16,
         )
         # Transformer + adapter cast to bf16; encoder stays in HF dtype (fp32 here).
         assert model.transformer.token_embedding.embedding.weight.dtype == torch.bfloat16
@@ -365,68 +379,89 @@ class TestBuildParallelModelVLM:
 
     def test_max_seq_len_too_short_raises(self):
         """Cross-check: ``num_image_tokens + max_text_len > max_seq_len`` raises."""
+        from kempnerforge.config.adapter import AdapterConfig
+        from kempnerforge.config.vision import VisionEncoderConfig
         from kempnerforge.config.vlm import VLMConfig
         from kempnerforge.distributed.parallel import build_parallel_model
 
-        # Bypass the ModelConfig __post_init__ check by setting num_tokens=0
+        # Bypass the JobConfig __post_init__ check by setting num_tokens=0
         # (deferred), then forcing the encoder to produce a real number of
         # tokens that overflows max_seq_len at build time.
-        cfg = ModelConfig(
+        mc = ModelConfig(
             dim=64,
             n_layers=2,
             n_heads=4,
             n_kv_heads=4,
             vocab_size=256,
             max_seq_len=32,
-            vlm=VLMConfig(
-                vision_encoder="random",
-                feature_dim=96,
-                num_tokens=0,  # defer; RandomVisionEncoder default = 16
-                max_text_len=24,  # 16 + 24 = 40 > 32
-            ),
         )
+        vc = VisionEncoderConfig(type="random", feature_dim=96, num_tokens=0)
+        ac = AdapterConfig()
+        lc = VLMConfig(max_text_len=24)  # 16 + 24 = 40 > 32
         with pytest.raises(ValueError, match="max_seq_len.*insufficient"):
-            build_parallel_model(cfg, torch.device("cpu"), device_mesh=None)
+            build_parallel_model(
+                mc,
+                torch.device("cpu"),
+                device_mesh=None,
+                vision_config=vc,
+                adapter_config=ac,
+                vlm_config=lc,
+            )
 
     def test_frozen_encoder_set_to_eval(self):
         """When all freeze specs target the vision encoder with frozen=True,
         the encoder is switched to eval() and its params have requires_grad=False."""
         from kempnerforge.distributed.parallel import build_parallel_model
 
-        cfg = self._vlm_model_config()
-        model = build_parallel_model(cfg, torch.device("cpu"), device_mesh=None)
+        mc, vc, ac, lc = self._vlm_configs()
+        model = build_parallel_model(
+            mc,
+            torch.device("cpu"),
+            device_mesh=None,
+            vision_config=vc,
+            adapter_config=ac,
+            vlm_config=lc,
+        )
         assert model.vision_encoder.training is False
         assert all(not p.requires_grad for p in model.vision_encoder.parameters())
 
     def test_partially_unfrozen_encoder_stays_in_train_mode(self):
+        from kempnerforge.config.adapter import AdapterConfig
+        from kempnerforge.config.vision import VisionEncoderConfig
         from kempnerforge.config.vlm import FreezeSpec, VLMConfig
         from kempnerforge.distributed.parallel import build_parallel_model
 
-        cfg = ModelConfig(
+        mc = ModelConfig(
             dim=64,
             n_layers=2,
             n_heads=4,
             n_kv_heads=4,
             vocab_size=256,
             max_seq_len=64,
-            vlm=VLMConfig(
-                vision_encoder="random",
-                feature_dim=96,
-                num_tokens=8,
-                max_text_len=32,
-                # Mixed specs: alias+True plus a sub-pattern with frozen=False
-                # means _is_encoder_frozen returns False -> stays in train().
-                freeze=[
-                    FreezeSpec("vision_encoder", True),
-                    FreezeSpec("vision_encoder._anchor", False),
-                ],
-            ),
         )
-        model = build_parallel_model(cfg, torch.device("cpu"), device_mesh=None)
+        vc = VisionEncoderConfig(type="random", feature_dim=96, num_tokens=8)
+        ac = AdapterConfig()
+        # Mixed specs: alias+True plus a sub-pattern with frozen=False
+        # means _is_encoder_frozen returns False -> stays in train().
+        lc = VLMConfig(
+            max_text_len=32,
+            freeze=[
+                FreezeSpec("vision_encoder", True),
+                FreezeSpec("vision_encoder._anchor", False),
+            ],
+        )
+        model = build_parallel_model(
+            mc,
+            torch.device("cpu"),
+            device_mesh=None,
+            vision_config=vc,
+            adapter_config=ac,
+            vlm_config=lc,
+        )
         assert model.vision_encoder.training is True
 
     def test_dispatch_falls_through_for_non_vlm(self):
-        """Sanity: non-VLM ModelConfig does not enter the VLM branch."""
+        """Sanity: omitting vlm_config builds a plain Transformer."""
         from kempnerforge.distributed.parallel import build_parallel_model
 
         cfg = ModelConfig(dim=64, n_layers=2, n_heads=4, n_kv_heads=4, vocab_size=256)

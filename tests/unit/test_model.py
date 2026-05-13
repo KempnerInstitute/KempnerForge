@@ -620,7 +620,7 @@ class TestModalityIdsCrossArgs:
 # ---------------------------------------------------------------------------
 
 
-def _mot_config(
+def _mot_setup(
     dim: int = 128,
     n_layers: int = 2,
     n_heads: int = 4,
@@ -629,11 +629,11 @@ def _mot_config(
     max_text_len: int = 16,
     mot_image_n_heads: int = 0,
     mot_image_n_kv_heads: int = 0,
-) -> ModelConfig:
-    """Tiny MoT-backed ModelConfig for integration tests."""
+):
+    """Tiny MoT-backed (model_config, vlm_config, num_image_tokens, max_text_len)."""
     from kempnerforge.config.vlm import MoTConfig
 
-    return ModelConfig(
+    mc = ModelConfig(
         dim=dim,
         n_layers=n_layers,
         n_heads=n_heads,
@@ -641,14 +641,18 @@ def _mot_config(
         vocab_size=256,
         max_seq_len=num_tokens + max_text_len,
         ffn_hidden_dim=128,
-        vlm=MoTConfig(
-            vision_encoder="random",
-            num_tokens=num_tokens,
-            max_text_len=max_text_len,
-            mot_image_n_heads=mot_image_n_heads,
-            mot_image_n_kv_heads=mot_image_n_kv_heads,
-        ),
     )
+    lc = MoTConfig(
+        max_text_len=max_text_len,
+        mot_image_n_heads=mot_image_n_heads,
+        mot_image_n_kv_heads=mot_image_n_kv_heads,
+    )
+    return mc, lc, num_tokens, max_text_len
+
+
+def _mot_transformer(**kwargs) -> Transformer:
+    mc, lc, n_image, _ = _mot_setup(**kwargs)
+    return Transformer(mc, vlm_config=lc, num_image_tokens=n_image)
 
 
 class TestMoT:
@@ -657,8 +661,7 @@ class TestMoT:
     def test_layers_are_mot_blocks_when_mot(self):
         from kempnerforge.model.mot import MoTBlock
 
-        cfg = _mot_config()
-        model = Transformer(cfg).to(DEVICE)
+        model = _mot_transformer().to(DEVICE)
         assert all(isinstance(layer, MoTBlock) for layer in model.layers.values())
         assert model._mot_modalities == ("image", "text")
         assert model._mot_n_image == 8
@@ -676,27 +679,25 @@ class TestMoT:
     def test_unequal_image_n_heads_raises(self):
         """v1 enforces equal head counts across modalities."""
         with pytest.raises(ValueError, match="equal head counts"):
-            cfg = _mot_config(mot_image_n_heads=2)
-            Transformer(cfg)
+            _mot_transformer(mot_image_n_heads=2)
 
     def test_unequal_image_n_kv_heads_raises(self):
         with pytest.raises(ValueError, match="equal head counts"):
-            cfg = _mot_config(mot_image_n_kv_heads=2)
-            Transformer(cfg)
+            _mot_transformer(mot_image_n_kv_heads=2)
 
     def test_modality_ids_required_when_mot_active(self):
-        cfg = _mot_config()
-        model = Transformer(cfg).to(DEVICE).eval()
-        tokens = torch.randint(0, 256, (1, cfg.vlm.max_text_len), device=DEVICE)  # type: ignore[union-attr]
-        prefix = torch.randn(1, cfg.vlm.num_tokens, cfg.dim, device=DEVICE)  # type: ignore[union-attr]
+        mc, lc, n_image, max_text_len = _mot_setup()
+        model = Transformer(mc, vlm_config=lc, num_image_tokens=n_image).to(DEVICE).eval()
+        tokens = torch.randint(0, 256, (1, max_text_len), device=DEVICE)
+        prefix = torch.randn(1, n_image, mc.dim, device=DEVICE)
         with pytest.raises(ValueError, match="MoT model requires modality.modality_ids"):
             model(tokens, modality=ModalityContext(prefix_embeds=prefix))
 
     def test_modality_ids_shape_mismatch_raises(self):
-        cfg = _mot_config()
-        model = Transformer(cfg).to(DEVICE).eval()
-        tokens = torch.randint(0, 256, (1, cfg.vlm.max_text_len), device=DEVICE)  # type: ignore[union-attr]
-        prefix = torch.randn(1, cfg.vlm.num_tokens, cfg.dim, device=DEVICE)  # type: ignore[union-attr]
+        mc, lc, n_image, max_text_len = _mot_setup()
+        model = Transformer(mc, vlm_config=lc, num_image_tokens=n_image).to(DEVICE).eval()
+        tokens = torch.randint(0, 256, (1, max_text_len), device=DEVICE)
+        prefix = torch.randn(1, n_image, mc.dim, device=DEVICE)
         bad_ids = torch.zeros(1, 5, dtype=torch.long, device=DEVICE)
         with pytest.raises(ValueError, match="modality.modality_ids shape"):
             model(
@@ -705,13 +706,11 @@ class TestMoT:
             )
 
     def test_forward_output_shape(self):
-        cfg = _mot_config()
-        model = Transformer(cfg).to(DEVICE).eval()
-        n_image = cfg.vlm.num_tokens  # type: ignore[union-attr]
-        n_text = cfg.vlm.max_text_len  # type: ignore[union-attr]
+        mc, lc, n_image, n_text = _mot_setup()
+        model = Transformer(mc, vlm_config=lc, num_image_tokens=n_image).to(DEVICE).eval()
         total = n_image + n_text
         tokens = torch.randint(0, 256, (1, n_text), device=DEVICE)
-        prefix = torch.randn(1, n_image, cfg.dim, device=DEVICE)
+        prefix = torch.randn(1, n_image, mc.dim, device=DEVICE)
         ids = torch.zeros(1, total, dtype=torch.long, device=DEVICE)
         ids[:, n_image:] = 1
         with torch.no_grad():
@@ -719,17 +718,15 @@ class TestMoT:
                 tokens,
                 modality=ModalityContext(prefix_embeds=prefix, modality_ids=ids),
             )
-        assert out.shape == (1, total, cfg.vocab_size)
+        assert out.shape == (1, total, mc.vocab_size)
         assert torch.isfinite(out).all()
 
     def test_forward_output_slice_works(self):
         """output_slice composes with the MoT path: trim image tokens off the head input."""
-        cfg = _mot_config()
-        model = Transformer(cfg).to(DEVICE).eval()
-        n_image = cfg.vlm.num_tokens  # type: ignore[union-attr]
-        n_text = cfg.vlm.max_text_len  # type: ignore[union-attr]
+        mc, lc, n_image, n_text = _mot_setup()
+        model = Transformer(mc, vlm_config=lc, num_image_tokens=n_image).to(DEVICE).eval()
         tokens = torch.randint(0, 256, (1, n_text), device=DEVICE)
-        prefix = torch.randn(1, n_image, cfg.dim, device=DEVICE)
+        prefix = torch.randn(1, n_image, mc.dim, device=DEVICE)
         ids = torch.zeros(1, n_image + n_text, dtype=torch.long, device=DEVICE)
         ids[:, n_image:] = 1
         with torch.no_grad():
@@ -741,11 +738,10 @@ class TestMoT:
                     output_slice=slice(n_image, None),
                 ),
             )
-        assert out.shape == (1, n_text, cfg.vocab_size)
+        assert out.shape == (1, n_text, mc.vocab_size)
 
     def test_state_dict_contains_per_modality_keys(self):
-        cfg = _mot_config()
-        model = Transformer(cfg).to(DEVICE)
+        model = _mot_transformer().to(DEVICE)
         keys = set(model.state_dict().keys())
         assert "layers.0.attn.q_proj.image.weight" in keys
         assert "layers.0.attn.q_proj.text.weight" in keys
@@ -763,17 +759,15 @@ class TestMoT:
         """Backward flows through per-modality projections after a non-zero
         o_proj re-init (zero-init residual blocks gradient to upstream
         Q/K/V via the residual chain rule)."""
-        cfg = _mot_config()
-        model = Transformer(cfg).to(DEVICE)
+        mc, lc, n_image, n_text = _mot_setup()
+        model = Transformer(mc, vlm_config=lc, num_image_tokens=n_image).to(DEVICE)
         with torch.no_grad():
             for layer in model.layers.values():
                 for m in layer.modalities:
                     torch.nn.init.normal_(layer.attn.o_proj[m].weight, std=0.01)
                     torch.nn.init.normal_(layer.mlp[m].down_proj.weight, std=0.01)
-        n_image = cfg.vlm.num_tokens  # type: ignore[union-attr]
-        n_text = cfg.vlm.max_text_len  # type: ignore[union-attr]
         tokens = torch.randint(0, 256, (1, n_text), device=DEVICE)
-        prefix = torch.randn(1, n_image, cfg.dim, device=DEVICE)
+        prefix = torch.randn(1, n_image, mc.dim, device=DEVICE)
         ids = torch.zeros(1, n_image + n_text, dtype=torch.long, device=DEVICE)
         ids[:, n_image:] = 1
         out = model(
@@ -791,36 +785,36 @@ class TestMoT:
 # ---------------------------------------------------------------------------
 
 
-def _ca_config(n_layers: int, cadence: int) -> ModelConfig:
-    """Tiny CrossAttentionConfig-backed ModelConfig for interleaving tests."""
+def _ca_setup(n_layers: int, cadence: int):
+    """Tiny CrossAttentionConfig setup -> (model_config, vlm_config, num_image_tokens)."""
     from kempnerforge.config.vlm import CrossAttentionConfig
 
-    return ModelConfig(
+    mc = ModelConfig(
         dim=64,
         n_layers=n_layers,
         n_heads=4,
         vocab_size=256,
         max_seq_len=128,
-        vlm=CrossAttentionConfig(
-            vision_encoder="random",
-            feature_dim=64,
-            num_tokens=8,
-            cross_attention_every_n_layers=cadence,
-            max_text_len=64,
-        ),
     )
+    lc = CrossAttentionConfig(cross_attention_every_n_layers=cadence, max_text_len=64)
+    return mc, lc, 8
+
+
+def _ca_transformer(n_layers: int, cadence: int) -> Transformer:
+    mc, lc, n_image = _ca_setup(n_layers, cadence)
+    return Transformer(mc, vlm_config=lc, num_image_tokens=n_image)
 
 
 class TestCrossAttentionInterleaving:
     def test_n28_cadence4_yields_7_ca_blocks(self):
         """Paper baseline: 28 layers, cadence 4 -> 7 CA blocks."""
-        model = Transformer(_ca_config(n_layers=28, cadence=4))
+        model = _ca_transformer(n_layers=28, cadence=4)
         assert len(model.cross_attention_layers) == 7
         assert model._ca_cadence == 4
 
     def test_n32_cadence4_yields_8_ca_blocks(self):
         """Default 7B backbone: 32 layers, cadence 4 -> 8 CA blocks."""
-        model = Transformer(_ca_config(n_layers=32, cadence=4))
+        model = _ca_transformer(n_layers=32, cadence=4)
         assert len(model.cross_attention_layers) == 8
 
     def test_n28_cadence4_attaches_at_paper_positions(self):
@@ -830,10 +824,10 @@ class TestCrossAttentionInterleaving:
         from kempnerforge.config.vlm import CrossAttentionConfig
         from kempnerforge.model.cross_attention import CrossAttentionBlock
 
-        config = _ca_config(n_layers=28, cadence=4)
-        assert isinstance(config.vlm, CrossAttentionConfig)
+        mc, lc, n_image = _ca_setup(n_layers=28, cadence=4)
+        assert isinstance(lc, CrossAttentionConfig)
 
-        model = Transformer(config).to(DEVICE).eval()
+        model = Transformer(mc, vlm_config=lc, num_image_tokens=n_image).to(DEVICE).eval()
         # Replace CA blocks with counters via monkeypatching forward.
         invocations: list[int] = []
         original = CrossAttentionBlock.forward
@@ -891,10 +885,8 @@ class TestCrossAttentionInterleaving:
         4 CA blocks): strict=True raises with a missing-keys error
         mentioning cross_attention_layers.
         """
-        cfg_4 = _ca_config(n_layers=8, cadence=4)  # K=2
-        cfg_2 = _ca_config(n_layers=8, cadence=2)  # K=4
-        model_4 = Transformer(cfg_4)
-        model_2 = Transformer(cfg_2)
+        model_4 = _ca_transformer(n_layers=8, cadence=4)  # K=2
+        model_2 = _ca_transformer(n_layers=8, cadence=2)  # K=4
         state_4 = model_4.state_dict()
         with pytest.raises(RuntimeError, match="cross_attention_layers"):
             model_2.load_state_dict(state_4, strict=True)
@@ -906,8 +898,7 @@ class TestCrossAttentionInterleaving:
         [t..end] must produce equal logits on positions [0..t-1].
         """
         torch.manual_seed(0)
-        config = _ca_config(n_layers=8, cadence=4)
-        model = Transformer(config).to(DEVICE).eval()
+        model = _ca_transformer(n_layers=8, cadence=4).to(DEVICE).eval()
         img = torch.randn(1, 8, 64, device=DEVICE)
         seq_len = 12
 
@@ -928,15 +919,15 @@ class TestCrossAttentionInterleaving:
         and same backbone weights.
         """
         torch.manual_seed(0)
-        config_ca = _ca_config(n_layers=4, cadence=2)
+        mc_ca, lc_ca, n_image = _ca_setup(n_layers=4, cadence=2)
         text_config = ModelConfig(
-            dim=config_ca.dim,
-            n_layers=config_ca.n_layers,
-            n_heads=config_ca.n_heads,
-            vocab_size=config_ca.vocab_size,
-            max_seq_len=config_ca.max_seq_len,
+            dim=mc_ca.dim,
+            n_layers=mc_ca.n_layers,
+            n_heads=mc_ca.n_heads,
+            vocab_size=mc_ca.vocab_size,
+            max_seq_len=mc_ca.max_seq_len,
         )
-        ca_model = Transformer(config_ca).to(DEVICE).eval()
+        ca_model = Transformer(mc_ca, vlm_config=lc_ca, num_image_tokens=n_image).to(DEVICE).eval()
         text_model = Transformer(text_config).to(DEVICE).eval()
         # Copy CA model's text-stack weights into text_model so backbone matches.
         text_state = {
@@ -953,8 +944,7 @@ class TestCrossAttentionInterleaving:
     def test_image_features_required_when_ca_layers_present(self):
         """Forward without image_features raises a clear error when
         CA layers are configured."""
-        config = _ca_config(n_layers=4, cadence=2)
-        model = Transformer(config).to(DEVICE).eval()
+        model = _ca_transformer(n_layers=4, cadence=2).to(DEVICE).eval()
         tokens = torch.randint(0, 256, (1, 8), device=DEVICE)
         with pytest.raises(ValueError, match="image_features is None"):
             model(tokens)
@@ -963,8 +953,9 @@ class TestCrossAttentionInterleaving:
         """Cross-arg invariant: image_features is training-only."""
         from kempnerforge.model.attention import KVCache
 
-        config = _ca_config(n_layers=4, cadence=2)
-        model = Transformer(config).to(DEVICE)
+        mc, lc, n_image = _ca_setup(n_layers=4, cadence=2)
+        config = mc
+        model = Transformer(mc, vlm_config=lc, num_image_tokens=n_image).to(DEVICE)
         kv = [
             KVCache(
                 batch_size=1,

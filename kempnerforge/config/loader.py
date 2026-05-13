@@ -141,7 +141,7 @@ def _instantiate_from_dict(dc_type: type, data: dict[str, Any]) -> Any:
     """Construct a dataclass directly from a dict, without first building a
     default instance.
 
-    Used for nested Optional[dataclass] fields (e.g. ``ModelConfig.vlm``)
+    Used for nested Optional[dataclass] fields (e.g. ``JobConfig.vlm``)
     where the parent's default is ``None`` and the nested dataclass's
     ``__post_init__`` may reject an empty-default instance.
 
@@ -175,8 +175,8 @@ def _instantiate_from_dict(dc_type: type, data: dict[str, Any]) -> Any:
 
 
 def _resolve_vlm_subclass(data: dict[str, Any]) -> type:
-    """Resolve a TOML ``[model.vlm]`` table to the right ``VLMConfig``
-    subclass via the registered-arch lookup.
+    """Resolve a TOML ``[vlm]`` table to the right ``VLMConfig`` subclass
+    via the registered-arch lookup.
 
     Mirrors ``VLMConfig.for_arch`` error semantics so error type is
     independent of construction site (loader vs programmatic).

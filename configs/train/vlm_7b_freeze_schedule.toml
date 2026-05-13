@@ -35,11 +35,13 @@ max_seq_len = 1024
 rope_theta = 500000.0
 tie_embeddings = false
 
-[model.vlm]
-arch = "cross_attention"
-vision_encoder = "random"
+[vision_encoder]
+type = "random"
 feature_dim = 1024
 num_tokens = 256
+
+[vlm]
+arch = "cross_attention"
 freeze_schedule = [
     {start_step = 10, specs = [{module = "adapter", frozen = true}]},
     {start_step = 20, specs = [{module = "adapter", frozen = false}]},

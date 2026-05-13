@@ -25,8 +25,10 @@ import torch
 import torch.distributed as dist
 
 from kempnerforge.checkpoint.manager import CheckpointManager
+from kempnerforge.config.adapter import AdapterConfig
 from kempnerforge.config.model import ModelConfig
 from kempnerforge.config.schema import CheckpointConfig, OptimizerConfig
+from kempnerforge.config.vision import VisionEncoderConfig
 from kempnerforge.config.vlm import CrossAttentionConfig, FreezeSpec
 from kempnerforge.distributed.parallel import build_parallel_model
 from kempnerforge.model.vlm import VLMWrapper, inner_transformer
@@ -50,17 +52,12 @@ def _tiny_ca_cfg(
     feature_dim: int = 96,
     cadence: int = 2,
     freeze: list[FreezeSpec] | None = None,
-) -> ModelConfig:
-    return ModelConfig(
-        dim=64,
-        n_layers=4,
-        n_heads=4,
-        vocab_size=256,
-        max_seq_len=128,
-        vlm=CrossAttentionConfig(
-            vision_encoder="random",
-            feature_dim=feature_dim,
-            num_tokens=num_image_tokens,
+) -> tuple[ModelConfig, VisionEncoderConfig, AdapterConfig, CrossAttentionConfig]:
+    return (
+        ModelConfig(dim=64, n_layers=4, n_heads=4, vocab_size=256, max_seq_len=128),
+        VisionEncoderConfig(type="random", feature_dim=feature_dim, num_tokens=num_image_tokens),
+        AdapterConfig(),
+        CrossAttentionConfig(
             max_text_len=32,
             cross_attention_every_n_layers=cadence,
             freeze=freeze if freeze is not None else [FreezeSpec("vision_encoder", True)],
@@ -69,16 +66,20 @@ def _tiny_ca_cfg(
 
 
 def _build(
-    cfg: ModelConfig,
+    cfg: tuple[ModelConfig, VisionEncoderConfig, AdapterConfig, CrossAttentionConfig],
     mesh,
     *,
     param_dtype: torch.dtype = torch.bfloat16,
     compile_model: bool = False,
 ) -> VLMWrapper:
+    mc, vc, ac, lc = cfg
     model = build_parallel_model(
-        cfg,
+        mc,
         device=torch.device("cuda"),
         device_mesh=mesh,
+        vision_config=vc,
+        adapter_config=ac,
+        vlm_config=lc,
         param_dtype=param_dtype,
         compile_model=compile_model,
     )
@@ -194,7 +195,7 @@ class TestFreezeStageUnderFsdp:
         apply_freeze_specs(
             wrapper,
             [FreezeSpec("adapter", False)],
-            cfg.vlm.module_patterns,  # type: ignore[union-attr]
+            cfg[3].module_patterns,  # type: ignore[union-attr]
         )
         # Run another backward (must zero grads first since prior backward
         # left frozen-param grads as None and trainable-param grads populated).
@@ -249,30 +250,31 @@ class TestMoEWithVLM:
         TransformerBlocks selected by moe_frequency. Exercises the
         EP-aware FSDP block wrap (Fix 5) on the VLM path.
         """
-        from kempnerforge.config.model import ModelConfig as _MC
         from kempnerforge.model.moe import MoEMLP
 
         torch.manual_seed(42 + dist.get_rank())
-        mc = _MC(
-            dim=256,
-            n_layers=4,
-            n_heads=4,
-            n_kv_heads=2,
-            vocab_size=32000,
-            max_seq_len=128,
-            num_experts=4,
-            moe_top_k=2,
-            moe_frequency=2,
-            vlm=CrossAttentionConfig(
-                vision_encoder="random",
-                feature_dim=96,
-                num_tokens=8,
+        cfg = (
+            ModelConfig(
+                dim=256,
+                n_layers=4,
+                n_heads=4,
+                n_kv_heads=2,
+                vocab_size=32000,
+                max_seq_len=128,
+                num_experts=4,
+                moe_top_k=2,
+                moe_frequency=2,
+            ),
+            VisionEncoderConfig(type="random", feature_dim=96, num_tokens=8),
+            AdapterConfig(),
+            CrossAttentionConfig(
                 max_text_len=64,
                 cross_attention_every_n_layers=2,
                 freeze=[FreezeSpec("vision_encoder", True)],
             ),
         )
-        wrapper = _build(mc, distributed_env, param_dtype=torch.float32)
+        mc = cfg[0]
+        wrapper = _build(cfg, distributed_env, param_dtype=torch.float32)
         # 4 layers, frequency=2 -> 2 MoE blocks; cadence=2 -> 2 CA blocks.
         moe_blocks = sum(
             1 for layer in wrapper.transformer.layers.values() if isinstance(layer.mlp, MoEMLP)
@@ -333,7 +335,7 @@ class TestCheckpointRoundtrip:
         ckpt_cfg = CheckpointConfig(dir=str(path_str), interval=1)
         mgr = CheckpointManager(ckpt_cfg, wrapper, opt)
         freeze = canonical_freeze_meta(
-            effective_freeze(0, cfg.vlm.freeze, cfg.vlm.freeze_schedule)  # type: ignore[union-attr]
+            effective_freeze(0, cfg[3].freeze, cfg[3].freeze_schedule)  # type: ignore[union-attr]
         )
         mgr.save(step=1, extra={"vlm_freeze": freeze})
         dist.barrier()
