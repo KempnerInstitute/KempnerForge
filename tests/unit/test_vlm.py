@@ -1,4 +1,8 @@
-"""Unit tests for Adapter, VLMWrapper, inner_transformer, _is_encoder_frozen."""
+"""Unit tests for VLMWrapper, inner_transformer, _is_encoder_frozen.
+
+Adapter unit tests moved to ``tests/unit/test_adapter.py`` when ``Adapter``
+was renamed to ``MLP2LayerAdapter`` and promoted to a registered component.
+"""
 
 from __future__ import annotations
 
@@ -16,7 +20,6 @@ from kempnerforge.config.vlm import (
 from kempnerforge.model.modality import ModalityContext
 from kempnerforge.model.transformer import Transformer
 from kempnerforge.model.vlm import (
-    Adapter,
     CrossAttentionStrategy,
     JointDecoderStrategy,
     MoTStrategy,
@@ -28,59 +31,6 @@ from kempnerforge.model.vlm import (
 )
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
-# ---------------------------------------------------------------------------
-# Adapter
-# ---------------------------------------------------------------------------
-
-
-class TestAdapter:
-    def test_forward_shape(self):
-        adapter = Adapter(in_dim=384, out_dim=256).to(DEVICE)
-        x = torch.randn(2, 16, 384, device=DEVICE)
-        out = adapter(x)
-        assert out.shape == (2, 16, 256)
-
-    def test_hidden_dim_defaults_to_out_dim(self):
-        adapter = Adapter(in_dim=128, out_dim=64)
-        assert adapter.proj1.out_features == 64
-
-    def test_hidden_dim_override(self):
-        adapter = Adapter(in_dim=128, out_dim=64, hidden_dim=256)
-        assert adapter.proj1.out_features == 256
-        assert adapter.proj2.in_features == 256
-
-    def test_activations(self):
-        for act in ("gelu", "silu", "relu"):
-            adapter = Adapter(in_dim=8, out_dim=8, activation=act)
-            out = adapter(torch.randn(1, 4, 8))
-            assert out.shape == (1, 4, 8)
-
-    def test_unknown_activation_raises(self):
-        with pytest.raises(ValueError, match="Unknown adapter activation"):
-            Adapter(in_dim=8, out_dim=8, activation="tanh")
-
-    def test_rejects_zero_dim(self):
-        with pytest.raises(ValueError, match="must be positive"):
-            Adapter(in_dim=0, out_dim=8)
-
-    def test_backward_grads_flow(self):
-        adapter = Adapter(in_dim=32, out_dim=16).to(DEVICE)
-        x = torch.randn(1, 4, 32, device=DEVICE, requires_grad=True)
-        adapter(x).sum().backward()
-        for p in adapter.parameters():
-            assert p.grad is not None
-            assert torch.isfinite(p.grad).all()
-
-    def test_reset_parameters_reinitializes(self):
-        adapter = Adapter(in_dim=8, out_dim=4)
-        w1 = adapter.proj1.weight.clone()
-        adapter.reset_parameters()
-        # Not guaranteed bit-different (unlikely but possible), so just
-        # check it actually ran without error and weights are finite.
-        assert torch.isfinite(adapter.proj1.weight).all()
-        assert adapter.proj1.weight.shape == w1.shape
 
 
 # ---------------------------------------------------------------------------

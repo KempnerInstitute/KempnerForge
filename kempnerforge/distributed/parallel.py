@@ -392,10 +392,11 @@ def _build_vlm(
       7. Freeze specs are applied via ``apply_freeze_specs`` and a fully
          frozen encoder is switched to ``eval()``.
     """
+    from kempnerforge.config.adapter import AdapterConfig
     from kempnerforge.distributed.expert_parallel import apply_expert_parallel
     from kempnerforge.distributed.tensor_parallel import apply_tensor_parallel
+    from kempnerforge.model.adapter import build_adapter
     from kempnerforge.model.vlm import (
-        Adapter,
         VLMWrapper,
         _is_encoder_frozen,
         build_modality_strategy,
@@ -417,15 +418,15 @@ def _build_vlm(
 
     # 2. Transformer + Adapter on meta (when TP is active) or CPU.
     model_builder = registry.get_model(model_config.model_type)
+    adapter_config = AdapterConfig(
+        type="mlp_2layer",
+        hidden_dim=vlm.adapter_hidden_dim,
+        activation=vlm.adapter_activation,
+    )
     ctx = torch.device("meta") if tp_enabled else contextlib.nullcontext()
     with ctx:
         transformer = model_builder(model_config)
-        adapter = Adapter(
-            in_dim=in_dim,
-            out_dim=model_config.dim,
-            hidden_dim=vlm.adapter_hidden_dim or None,
-            activation=vlm.adapter_activation,
-        )
+        adapter = build_adapter(adapter_config, in_dim=in_dim, out_dim=model_config.dim)
 
     strategy = build_modality_strategy(vlm)
     wrapper = VLMWrapper(encoder, adapter, transformer, strategy)
@@ -457,7 +458,11 @@ def _build_vlm(
         transformer.to_empty(device=device)
         transformer.init_weights_and_freqs()
         adapter.to_empty(device=device)
-        adapter.reset_parameters()
+        # Adapter contract (model/adapter.py): every registered adapter
+        # exposes reset_parameters() so meta-device builds can re-init the
+        # weights after to_empty. nn.Module itself does not declare the
+        # method, so pyright sees an unknown attr; suppress the report.
+        adapter.reset_parameters()  # type: ignore[reportCallIssue,reportAttributeAccessIssue]
     else:
         transformer.to(device=device)
         adapter.to(device=device)

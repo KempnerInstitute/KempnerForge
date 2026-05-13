@@ -162,6 +162,27 @@ class Registry:
     def list_modality_strategies(self) -> list[str]:
         return self.list("modality_strategy")
 
+    def register_adapter(self, name: str) -> Callable:
+        """Decorator to register an adapter builder.
+
+        Adapters project image features (``(B, N, feature_dim)``) into the
+        LLM embedding space (``(B, N, model.dim)``). Builders take
+        ``(in_dim, out_dim, **kwargs)`` and return an ``nn.Module`` with the
+        expected forward shape.
+        """
+
+        def decorator(fn: Callable) -> Callable:
+            self.register("adapter", name, fn)
+            return fn
+
+        return decorator
+
+    def get_adapter(self, name: str) -> Callable:
+        return self.get("adapter", name)
+
+    def list_adapters(self) -> list[str]:
+        return self.list("adapter")
+
 
 # Global registry instance
 registry = Registry()
