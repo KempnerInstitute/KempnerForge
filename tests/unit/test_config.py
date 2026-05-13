@@ -414,6 +414,76 @@ class TestJobConfig:
         config.validate(world_size=1)  # Should not raise.
 
 
+class TestHfEncoderOverrideWarning:
+    """HF-backed encoders probe feature_dim / num_tokens from the loaded
+    model. Non-zero TOML values override the probe at build time and
+    silently desync from the actual model, so ``JobConfig.__post_init__``
+    logs a warning.
+
+    ``kempnerforge.metrics.logger._configure_root`` sets
+    ``propagate = False`` on the ``kempnerforge`` logger, which blocks
+    pytest's caplog (attached at the python root). We temporarily
+    re-enable propagation in setup/teardown so caplog can observe the
+    records from ``kempnerforge.config.job``.
+    """
+
+    def setup_method(self):
+        import logging
+
+        self._kf_logger = logging.getLogger("kempnerforge")
+        self._old_propagate = self._kf_logger.propagate
+        self._kf_logger.propagate = True
+
+    def teardown_method(self):
+        self._kf_logger.propagate = self._old_propagate
+
+    def _vlm_config_with(self, *, type: str, feature_dim: int = 0, num_tokens: int = 0):
+        return JobConfig(
+            model=ModelConfig(max_seq_len=2304),
+            vision_encoder=VisionEncoderConfig(
+                type=type, feature_dim=feature_dim, num_tokens=num_tokens
+            ),
+            adapter=AdapterConfig(),
+            vlm=VLMConfig(max_text_len=2048),
+        )
+
+    def test_warns_when_siglip2_paired_with_num_tokens(self, caplog):
+        with caplog.at_level("WARNING", logger="kempnerforge.config.job"):
+            self._vlm_config_with(type="siglip2", num_tokens=196)
+        assert any(
+            "siglip2" in r.getMessage() and "num_tokens=196" in r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_warns_when_clip_paired_with_feature_dim(self, caplog):
+        with caplog.at_level("WARNING", logger="kempnerforge.config.job"):
+            self._vlm_config_with(type="clip", feature_dim=768)
+        assert any(
+            "clip" in r.getMessage() and "feature_dim=768" in r.getMessage() for r in caplog.records
+        )
+
+    def test_warns_with_both_overrides(self, caplog):
+        with caplog.at_level("WARNING", logger="kempnerforge.config.job"):
+            self._vlm_config_with(type="siglip2", feature_dim=768, num_tokens=196)
+        matches = [r.getMessage() for r in caplog.records if "siglip2" in r.getMessage()]
+        assert len(matches) == 1
+        assert "feature_dim=768" in matches[0]
+        assert "num_tokens=196" in matches[0]
+
+    def test_no_warning_for_hf_with_zero_overrides(self, caplog):
+        """The documented path: HF type + both knobs at 0. No warning."""
+        with caplog.at_level("WARNING", logger="kempnerforge.config.job"):
+            self._vlm_config_with(type="siglip2")
+        assert not any("siglip2" in r.getMessage() for r in caplog.records)
+
+    def test_no_warning_for_random_with_overrides(self, caplog):
+        """The 'random' stub has no model to probe; user-supplied values
+        ARE the actual values. No warning regardless of non-zero values."""
+        with caplog.at_level("WARNING", logger="kempnerforge.config.job"):
+            self._vlm_config_with(type="random", feature_dim=384, num_tokens=64)
+        assert not any("random" in r.getMessage() for r in caplog.records)
+
+
 # ---------------------------------------------------------------------------
 # TOML Loading
 # ---------------------------------------------------------------------------

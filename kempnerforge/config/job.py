@@ -18,6 +18,13 @@ from kempnerforge.config.training import TrainConfig
 from kempnerforge.config.vision import VisionEncoderConfig
 from kempnerforge.config.vlm import VLMConfig
 
+# Vision-encoder types whose builders load a HuggingFace model and probe
+# feature_dim / num_tokens from the model's config. Setting these knobs
+# explicitly in the TOML overrides the probe and is almost always a
+# user mistake. The "random" stub is excluded because it has no model
+# to probe and the user-supplied values are the actual values.
+_HF_VISION_ENCODER_TYPES = frozenset({"siglip2", "clip"})
+
 
 @dataclass
 class JobConfig:
@@ -63,6 +70,30 @@ class JobConfig:
                 # Materialize the default adapter so downstream callers always
                 # see a non-None AdapterConfig once [vlm] is present.
                 self.adapter = AdapterConfig()
+            # HF-backed encoder override warning. SigLIP2 / CLIP encoders
+            # probe their own feature_dim and num_tokens from the loaded
+            # HF model. Setting these to non-zero values in the TOML
+            # overrides the probe at build time and silently desyncs from
+            # the actual model, so warn the user. The override is still
+            # legal (the builder applies it post-probe) so this is a
+            # warning, not an error.
+            if self.vision_encoder.type in _HF_VISION_ENCODER_TYPES and (
+                self.vision_encoder.feature_dim > 0 or self.vision_encoder.num_tokens > 0
+            ):
+                import logging
+
+                overrides = []
+                if self.vision_encoder.feature_dim > 0:
+                    overrides.append(f"feature_dim={self.vision_encoder.feature_dim}")
+                if self.vision_encoder.num_tokens > 0:
+                    overrides.append(f"num_tokens={self.vision_encoder.num_tokens}")
+                logging.getLogger(__name__).warning(
+                    "vision_encoder.type=%r is HF-backed and probes its own dims; "
+                    "setting %s overrides the probe and may desync from the loaded "
+                    "model. Leave both at 0 to use the probed values.",
+                    self.vision_encoder.type,
+                    " and ".join(overrides),
+                )
             # max_seq_len cross-check. Effective residual-stream length is
             # residual_stream_image_tokens(num_tokens) + max_text_len.
             #   - Joint-Decoder / MoT: residual is num_tokens + max_text_len.
