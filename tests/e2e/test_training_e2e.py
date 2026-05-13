@@ -116,10 +116,15 @@ def _parse_last_loss(output: str) -> float | None:
 
 
 @pytest.mark.e2e
-def test_single_gpu_random_data():
+def test_single_gpu_random_data(tmp_path):
     """Single GPU training with random data — basic smoke test."""
     result = _run_training(
-        [DEBUG_CONFIG, "--train.max_steps=10", "--metrics.log_interval=5"],
+        [
+            DEBUG_CONFIG,
+            "--train.max_steps=10",
+            "--metrics.log_interval=5",
+            f"--checkpoint.dir={tmp_path}/ckpt",
+        ],
         nproc=1,
     )
     _assert_training_complete(result, expected_steps=10)
@@ -132,10 +137,15 @@ def test_single_gpu_random_data():
 
 @pytest.mark.e2e
 @requires_gpus(4)
-def test_fsdp_4gpu():
+def test_fsdp_4gpu(tmp_path):
     """4 GPU FSDP — tests build_parallel_model non-TP path."""
     result = _run_training(
-        [DEBUG_CONFIG, "--train.max_steps=10", "--metrics.log_interval=5"],
+        [
+            DEBUG_CONFIG,
+            "--train.max_steps=10",
+            "--metrics.log_interval=5",
+            f"--checkpoint.dir={tmp_path}/ckpt",
+        ],
         nproc=4,
     )
     _assert_training_complete(result, expected_steps=10)
@@ -148,7 +158,7 @@ def test_fsdp_4gpu():
 
 @pytest.mark.e2e
 @requires_gpus(4)
-def test_tp_only_4gpu():
+def test_tp_only_4gpu(tmp_path):
     """4 GPU TP — tests meta-device init + SequenceParallel path."""
     result = _run_training(
         [
@@ -157,6 +167,7 @@ def test_tp_only_4gpu():
             "--metrics.log_interval=5",
             "--distributed.tp=4",
             "--distributed.dp_shard=1",
+            f"--checkpoint.dir={tmp_path}/ckpt",
         ],
         nproc=4,
     )
@@ -165,7 +176,7 @@ def test_tp_only_4gpu():
 
 @pytest.mark.e2e
 @requires_gpus(4)
-def test_tp_plus_fsdp():
+def test_tp_plus_fsdp(tmp_path):
     """4 GPU TP=2 + FSDP=2 — combined parallelism."""
     result = _run_training(
         [
@@ -174,6 +185,7 @@ def test_tp_plus_fsdp():
             "--metrics.log_interval=5",
             "--distributed.tp=2",
             "--distributed.dp_shard=2",
+            f"--checkpoint.dir={tmp_path}/ckpt",
         ],
         nproc=4,
     )
@@ -187,7 +199,7 @@ def test_tp_plus_fsdp():
 
 @pytest.mark.e2e
 @requires_gpus(4)
-def test_pipeline_parallel():
+def test_pipeline_parallel(tmp_path):
     """4 GPU PP=2 + FSDP=2 — pipeline parallelism with 1F1B schedule."""
     result = _run_training(
         [
@@ -197,6 +209,7 @@ def test_pipeline_parallel():
             "--distributed.pp=2",
             "--distributed.dp_shard=2",
             "--train.grad_accum_steps=2",
+            f"--checkpoint.dir={tmp_path}/ckpt",
         ],
         nproc=4,
     )
@@ -216,7 +229,7 @@ def test_pipeline_parallel():
 
 @pytest.mark.e2e
 @requires_gpus(4)
-def test_fp16_mixed_precision():
+def test_fp16_mixed_precision(tmp_path):
     """4 GPU FSDP with fp16 — verifies param_dtype config path."""
     result = _run_training(
         [
@@ -224,6 +237,7 @@ def test_fp16_mixed_precision():
             "--train.max_steps=10",
             "--metrics.log_interval=5",
             "--train.mixed_precision=fp16",
+            f"--checkpoint.dir={tmp_path}/ckpt",
         ],
         nproc=4,
     )
@@ -237,7 +251,7 @@ def test_fp16_mixed_precision():
 
 @pytest.mark.e2e
 @requires_gpus(4)
-def test_synthetic_data_pipeline(synthetic_data_dir):
+def test_synthetic_data_pipeline(synthetic_data_dir, tmp_path):
     """4 GPU FSDP with synthetic .npy data — tests full data pipeline."""
     result = _run_training(
         [
@@ -246,6 +260,7 @@ def test_synthetic_data_pipeline(synthetic_data_dir):
             "--metrics.log_interval=5",
             f"--data.dataset_path={synthetic_data_dir}",
             "--data.file_pattern=*.npy",
+            f"--checkpoint.dir={tmp_path}/ckpt",
         ],
         nproc=4,
     )
@@ -265,7 +280,7 @@ _HF_OVERRIDES = [
 
 
 @pytest.mark.e2e
-def test_hf_dataset_single_gpu():
+def test_hf_dataset_single_gpu(tmp_path):
     """Single GPU training with HuggingFace wikitext dataset."""
     result = _run_training(
         [
@@ -273,6 +288,7 @@ def test_hf_dataset_single_gpu():
             "--train.max_steps=5",
             "--metrics.log_interval=5",
             *_HF_OVERRIDES,
+            f"--checkpoint.dir={tmp_path}/ckpt",
         ],
         nproc=1,
     )
@@ -283,7 +299,7 @@ def test_hf_dataset_single_gpu():
 
 @pytest.mark.e2e
 @requires_gpus(4)
-def test_hf_dataset_4gpu():
+def test_hf_dataset_4gpu(tmp_path):
     """4 GPU FSDP with HuggingFace wikitext dataset."""
     result = _run_training(
         [
@@ -291,6 +307,7 @@ def test_hf_dataset_4gpu():
             "--train.max_steps=5",
             "--metrics.log_interval=5",
             *_HF_OVERRIDES,
+            f"--checkpoint.dir={tmp_path}/ckpt",
         ],
         nproc=4,
     )
@@ -300,7 +317,7 @@ def test_hf_dataset_4gpu():
 
 
 @pytest.mark.e2e
-def test_hf_streaming_single_gpu():
+def test_hf_streaming_single_gpu(tmp_path):
     """Single GPU training with streaming HuggingFace dataset."""
     result = _run_training(
         [
@@ -309,6 +326,7 @@ def test_hf_streaming_single_gpu():
             "--metrics.log_interval=5",
             *_HF_OVERRIDES,
             "--data.hf_streaming=true",
+            f"--checkpoint.dir={tmp_path}/ckpt",
         ],
         nproc=1,
     )
@@ -319,7 +337,7 @@ def test_hf_streaming_single_gpu():
 
 @pytest.mark.e2e
 @requires_gpus(4)
-def test_hf_streaming_4gpu():
+def test_hf_streaming_4gpu(tmp_path):
     """4 GPU FSDP with streaming HuggingFace dataset."""
     result = _run_training(
         [
@@ -328,6 +346,7 @@ def test_hf_streaming_4gpu():
             "--metrics.log_interval=5",
             *_HF_OVERRIDES,
             "--data.hf_streaming=true",
+            f"--checkpoint.dir={tmp_path}/ckpt",
         ],
         nproc=4,
     )
@@ -490,10 +509,15 @@ def test_sigterm_triggers_emergency_checkpoint(tmp_path):
 
 
 @pytest.mark.e2e
-def test_moe_single_gpu_random_data():
+def test_moe_single_gpu_random_data(tmp_path):
     """Single GPU MoE training with random data."""
     result = _run_training(
-        [DEBUG_MOE_CONFIG, "--train.max_steps=10", "--metrics.log_interval=5"],
+        [
+            DEBUG_MOE_CONFIG,
+            "--train.max_steps=10",
+            "--metrics.log_interval=5",
+            f"--checkpoint.dir={tmp_path}/ckpt",
+        ],
         nproc=1,
     )
     _assert_training_complete(result, expected_steps=10)
@@ -504,10 +528,15 @@ def test_moe_single_gpu_random_data():
 
 @pytest.mark.e2e
 @requires_gpus(4)
-def test_moe_fsdp_4gpu():
+def test_moe_fsdp_4gpu(tmp_path):
     """4 GPU FSDP with MoE model."""
     result = _run_training(
-        [DEBUG_MOE_CONFIG, "--train.max_steps=10", "--metrics.log_interval=5"],
+        [
+            DEBUG_MOE_CONFIG,
+            "--train.max_steps=10",
+            "--metrics.log_interval=5",
+            f"--checkpoint.dir={tmp_path}/ckpt",
+        ],
         nproc=4,
     )
     _assert_training_complete(result, expected_steps=10)
@@ -515,7 +544,7 @@ def test_moe_fsdp_4gpu():
 
 @pytest.mark.e2e
 @requires_gpus(4)
-def test_moe_tp_plus_fsdp():
+def test_moe_tp_plus_fsdp(tmp_path):
     """4 GPU TP=2 + FSDP=2 with MoE — experts replicated, attention TP-sharded."""
     result = _run_training(
         [
@@ -524,6 +553,7 @@ def test_moe_tp_plus_fsdp():
             "--metrics.log_interval=5",
             "--distributed.tp=2",
             "--distributed.dp_shard=2",
+            f"--checkpoint.dir={tmp_path}/ckpt",
         ],
         nproc=4,
     )
@@ -581,7 +611,7 @@ _SIGMOID_MOE_OVERRIDES = [
 
 
 @pytest.mark.e2e
-def test_moe_sigmoid_single_gpu():
+def test_moe_sigmoid_single_gpu(tmp_path):
     """Single GPU MoE with sigmoid router, sequence aux loss, and gradient scaling."""
     result = _run_training(
         [
@@ -589,6 +619,7 @@ def test_moe_sigmoid_single_gpu():
             "--train.max_steps=10",
             "--metrics.log_interval=5",
             *_SIGMOID_MOE_OVERRIDES,
+            f"--checkpoint.dir={tmp_path}/ckpt",
         ],
         nproc=1,
     )
@@ -600,7 +631,7 @@ def test_moe_sigmoid_single_gpu():
 
 @pytest.mark.e2e
 @requires_gpus(4)
-def test_moe_sigmoid_fsdp_4gpu():
+def test_moe_sigmoid_fsdp_4gpu(tmp_path):
     """4 GPU FSDP with sigmoid router, sequence aux loss, and gradient scaling."""
     result = _run_training(
         [
@@ -608,6 +639,7 @@ def test_moe_sigmoid_fsdp_4gpu():
             "--train.max_steps=10",
             "--metrics.log_interval=5",
             *_SIGMOID_MOE_OVERRIDES,
+            f"--checkpoint.dir={tmp_path}/ckpt",
         ],
         nproc=4,
     )
@@ -621,7 +653,7 @@ def test_moe_sigmoid_fsdp_4gpu():
 
 @pytest.mark.e2e
 @requires_gpus(1)
-def test_fp8_single_gpu():
+def test_fp8_single_gpu(tmp_path):
     """Single GPU FP8 training — verifies Float8 conversion + forward/backward."""
     result = _run_training(
         [
@@ -629,6 +661,7 @@ def test_fp8_single_gpu():
             "--train.max_steps=10",
             "--metrics.log_interval=5",
             "--train.mixed_precision=fp8",
+            f"--checkpoint.dir={tmp_path}/ckpt",
         ],
         nproc=1,
     )
@@ -641,7 +674,7 @@ def test_fp8_single_gpu():
 
 @pytest.mark.e2e
 @requires_gpus(4)
-def test_fp8_fsdp_4gpu():
+def test_fp8_fsdp_4gpu(tmp_path):
     """4 GPU FSDP with FP8 — tests Float8 + FSDP2 float8 all-gather."""
     result = _run_training(
         [
@@ -649,6 +682,7 @@ def test_fp8_fsdp_4gpu():
             "--train.max_steps=10",
             "--metrics.log_interval=5",
             "--train.mixed_precision=fp8",
+            f"--checkpoint.dir={tmp_path}/ckpt",
         ],
         nproc=4,
     )
@@ -659,7 +693,7 @@ def test_fp8_fsdp_4gpu():
 
 @pytest.mark.e2e
 @requires_gpus(4)
-def test_fp8_moe_fsdp_4gpu():
+def test_fp8_moe_fsdp_4gpu(tmp_path):
     """4 GPU FSDP with FP8 + MoE — verifies expert Linears excluded from Float8."""
     result = _run_training(
         [
@@ -667,6 +701,7 @@ def test_fp8_moe_fsdp_4gpu():
             "--train.max_steps=10",
             "--metrics.log_interval=5",
             "--train.mixed_precision=fp8",
+            f"--checkpoint.dir={tmp_path}/ckpt",
         ],
         nproc=4,
     )
@@ -682,7 +717,7 @@ def test_fp8_moe_fsdp_4gpu():
 
 @pytest.mark.e2e
 @requires_gpus(1)
-def test_z_loss_single_gpu():
+def test_z_loss_single_gpu(tmp_path):
     """Single GPU training with z-loss enabled — verifies logit regularizer integrates."""
     result = _run_training(
         [
@@ -690,6 +725,7 @@ def test_z_loss_single_gpu():
             "--train.max_steps=10",
             "--metrics.log_interval=5",
             "--train.z_loss_weight=1e-4",
+            f"--checkpoint.dir={tmp_path}/ckpt",
         ],
         nproc=1,
     )
@@ -700,7 +736,7 @@ def test_z_loss_single_gpu():
 
 @pytest.mark.e2e
 @requires_gpus(1)
-def test_chunked_cross_entropy_single_gpu():
+def test_chunked_cross_entropy_single_gpu(tmp_path):
     """Single GPU training with chunked cross-entropy — verifies loss matches standard CE."""
     result = _run_training(
         [
@@ -709,6 +745,7 @@ def test_chunked_cross_entropy_single_gpu():
             "--metrics.log_interval=5",
             "--train.loss_fn=chunked_cross_entropy",
             "--train.ce_chunk_size=4096",
+            f"--checkpoint.dir={tmp_path}/ckpt",
         ],
         nproc=1,
     )
@@ -719,7 +756,7 @@ def test_chunked_cross_entropy_single_gpu():
 
 @pytest.mark.e2e
 @requires_gpus(1)
-def test_muon_optimizer_single_gpu():
+def test_muon_optimizer_single_gpu(tmp_path):
     """Single GPU training with Muon optimizer — verifies Newton-Schulz + AdamW fallback."""
     result = _run_training(
         [
@@ -729,6 +766,7 @@ def test_muon_optimizer_single_gpu():
             "--optimizer.name=muon",
             "--optimizer.lr=0.02",
             "--optimizer.muon_momentum=0.95",
+            f"--checkpoint.dir={tmp_path}/ckpt",
         ],
         nproc=1,
     )
@@ -739,7 +777,7 @@ def test_muon_optimizer_single_gpu():
 
 @pytest.mark.e2e
 @requires_gpus(4)
-def test_muon_fsdp_4gpu():
+def test_muon_fsdp_4gpu(tmp_path):
     """4 GPU FSDP with Muon optimizer — verifies Muon composes with FSDP2."""
     result = _run_training(
         [
@@ -748,6 +786,7 @@ def test_muon_fsdp_4gpu():
             "--metrics.log_interval=5",
             "--optimizer.name=muon",
             "--optimizer.lr=0.02",
+            f"--checkpoint.dir={tmp_path}/ckpt",
         ],
         nproc=4,
     )
@@ -756,7 +795,7 @@ def test_muon_fsdp_4gpu():
 
 @pytest.mark.e2e
 @requires_gpus(4)
-def test_z_loss_chunked_ce_fsdp_4gpu():
+def test_z_loss_chunked_ce_fsdp_4gpu(tmp_path):
     """4 GPU FSDP with z-loss + chunked CE — verifies both compose with FSDP2."""
     result = _run_training(
         [
@@ -765,6 +804,7 @@ def test_z_loss_chunked_ce_fsdp_4gpu():
             "--metrics.log_interval=5",
             "--train.z_loss_weight=1e-4",
             "--train.loss_fn=chunked_cross_entropy",
+            f"--checkpoint.dir={tmp_path}/ckpt",
         ],
         nproc=4,
     )
@@ -779,7 +819,7 @@ def test_z_loss_chunked_ce_fsdp_4gpu():
 @pytest.mark.e2e
 @pytest.mark.slow
 @requires_gpus(4)
-def test_7b_tp_fsdp_compile():
+def test_7b_tp_fsdp_compile(tmp_path):
     """7B model with TP=2 + FSDP=2 + torch.compile — full production path.
 
     Uses random data, 5 steps. Verifies the heavy-weight path works:
@@ -792,6 +832,7 @@ def test_7b_tp_fsdp_compile():
             "--metrics.log_interval=5",
             "--distributed.tp=2",
             "--distributed.dp_shard=2",
+            f"--checkpoint.dir={tmp_path}/ckpt",
         ],
         nproc=4,
         timeout=300,

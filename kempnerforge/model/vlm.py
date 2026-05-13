@@ -1,14 +1,16 @@
 """Vision-language model wrapper.
 
-The wrapper composes a ``VisionEncoder`` (HF or test stub), a 2-layer
-MLP ``Adapter`` projecting image features into the LLM embedding
-space, and the existing ``Transformer``. The arch-specific work
-(composing ``pixel_values`` + ``input_ids`` into a
+The wrapper composes a ``VisionEncoder`` (HF or test stub), a registered
+adapter (``MLP2LayerAdapter`` by default; ``LinearAdapter`` available
+via the ``adapter`` registry) projecting image features into the LLM
+embedding space, and the existing ``Transformer``. The arch-specific
+work (composing ``pixel_values`` + ``input_ids`` into a
 ``ModalityContext``) lives on a ``ModalityStrategy`` that the wrapper
 holds, so adding a new arch is one new strategy decorator on
 ``@registry.register_modality_strategy`` plus one new ``VLMConfig``
-subclass — no edits to ``VLMWrapper.forward``, no ``isinstance``
-ladder.
+subclass, and adding a new adapter is one new builder under
+``@registry.register_adapter``. No edits to ``VLMWrapper.forward``,
+no ``isinstance`` ladder.
 
 Strategies registered today:
 
@@ -37,59 +39,14 @@ from typing import Protocol
 import torch
 import torch.nn as nn
 
+from kempnerforge.config.adapter import AdapterConfig
 from kempnerforge.config.registry import registry
 from kempnerforge.config.schema import ModelConfig
 from kempnerforge.config.vlm import FreezeSpec, VLMConfig
+from kempnerforge.model.adapter import build_adapter
 from kempnerforge.model.modality import ModalityContext
 from kempnerforge.model.transformer import Transformer
 from kempnerforge.model.vision import VisionEncoder
-
-_ADAPTER_ACTIVATIONS: dict[str, type[nn.Module]] = {
-    "gelu": nn.GELU,
-    "silu": nn.SiLU,
-    "relu": nn.ReLU,
-}
-
-
-class Adapter(nn.Module):
-    """2-layer MLP from image-feature dim to LLM embedding dim.
-
-    Architecture: ``Linear(in_dim, hidden) -> activation -> Linear(hidden, out_dim)``.
-    ``hidden_dim=None`` defaults to ``out_dim``.
-
-    ``reset_parameters`` is provided so callers that materialize adapters
-    from meta can re-initialize weights with the standard Linear defaults.
-    """
-
-    def __init__(
-        self,
-        in_dim: int,
-        out_dim: int,
-        hidden_dim: int | None = None,
-        activation: str = "gelu",
-    ) -> None:
-        super().__init__()
-        if in_dim <= 0 or out_dim <= 0:
-            raise ValueError("Adapter in_dim and out_dim must be positive")
-        if activation not in _ADAPTER_ACTIVATIONS:
-            raise ValueError(
-                f"Unknown adapter activation: {activation!r}. Options: {list(_ADAPTER_ACTIVATIONS)}"
-            )
-        hidden = hidden_dim if hidden_dim and hidden_dim > 0 else out_dim
-        self.proj1 = nn.Linear(in_dim, hidden, bias=True)
-        self.act = _ADAPTER_ACTIVATIONS[activation]()
-        self.proj2 = nn.Linear(hidden, out_dim, bias=True)
-
-    def reset_parameters(self) -> None:
-        """Re-run ``nn.Linear`` default init on both projections.
-
-        Used after ``to_empty(device=...)`` on a meta-device build.
-        """
-        self.proj1.reset_parameters()
-        self.proj2.reset_parameters()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.proj2(self.act(self.proj1(x)))
 
 
 class ModalityStrategy(Protocol):
@@ -119,7 +76,10 @@ def _project_image_features(wrapper: VLMWrapper, pixel_values: torch.Tensor) -> 
     clash.
     """
     feats = wrapper.vision_encoder(pixel_values)
-    adapter_dtype = wrapper.adapter.proj1.weight.dtype
+    # Adapter-agnostic dtype lookup: use the first adapter parameter's
+    # dtype so any registered adapter (mlp_2layer, linear, ...) works
+    # without coupling to a specific submodule attribute.
+    adapter_dtype = next(wrapper.adapter.parameters()).dtype
     if feats.dtype != adapter_dtype:
         feats = feats.to(adapter_dtype)
     return wrapper.adapter(feats)
@@ -240,7 +200,7 @@ class VLMWrapper(nn.Module):
     def __init__(
         self,
         vision_encoder: VisionEncoder,
-        adapter: Adapter,
+        adapter: nn.Module,
         transformer: Transformer,
         strategy: ModalityStrategy,
     ) -> None:
@@ -315,10 +275,16 @@ def build_vlm_wrapper(model_config: ModelConfig) -> VLMWrapper:
 
     Used by tests and by ``build_parallel_model``. Constructs the
     vision encoder via the registry (HF weights loaded on CPU), builds
-    a fresh ``Adapter`` at the LLM ``dim``, looks up the right
-    ``ModalityStrategy`` by arch, and composes them with a raw
-    ``Transformer``. Callers that need meta-device / FSDP / freeze
-    handling go through ``build_parallel_model`` instead.
+    an adapter via the ``adapter`` registry at the LLM ``dim``, looks
+    up the right ``ModalityStrategy`` by arch, and composes them with
+    a raw ``Transformer``. Callers that need meta-device / FSDP /
+    freeze handling go through ``build_parallel_model`` instead.
+
+    The adapter type defaults to ``"mlp_2layer"`` (matches the pre-
+    registry behavior). A follow-up PR will expose ``[adapter]`` as a
+    top-level TOML section; in the meantime this builder synthesizes
+    an ``AdapterConfig`` from the existing ``VLMConfig`` fields
+    (``adapter_hidden_dim`` and ``adapter_activation``).
     """
     vlm: VLMConfig | None = model_config.vlm
     if vlm is None:
@@ -345,12 +311,12 @@ def build_vlm_wrapper(model_config: ModelConfig) -> VLMWrapper:
             f"vlm.max_text_len ({vlm.max_text_len}) = {required}"
         )
     in_dim = vlm.feature_dim or encoder.feature_dim
-    adapter = Adapter(
-        in_dim=in_dim,
-        out_dim=model_config.dim,
-        hidden_dim=vlm.adapter_hidden_dim or None,
+    adapter_config = AdapterConfig(
+        type="mlp_2layer",
+        hidden_dim=vlm.adapter_hidden_dim,
         activation=vlm.adapter_activation,
     )
+    adapter = build_adapter(adapter_config, in_dim=in_dim, out_dim=model_config.dim)
     transformer = Transformer(model_config)
     strategy = build_modality_strategy(vlm)
     return VLMWrapper(encoder, adapter, transformer, strategy)
