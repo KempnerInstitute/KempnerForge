@@ -38,8 +38,9 @@ tie_embeddings = false
 arch = "joint_decoder"
 vision_encoder = "siglip2"
 vision_encoder_path = "google/siglip2-base-patch16-224"
-feature_dim = 768       # SigLIP2 base hidden size
-num_tokens = 196        # 14x14 patches for 224-input
+# feature_dim and num_tokens default to 0 = infer from the encoder at
+# build time. For siglip2-base-patch16-224 the encoder probes
+# feature_dim=768 and num_tokens=196 (14x14 patches, no CLS).
 max_text_len = 2048
 
 [train]

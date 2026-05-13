@@ -475,8 +475,11 @@ class TestTomlLoading:
         assert config.model.is_vlm is True
         assert config.model.vlm is not None
         assert config.model.vlm.vision_encoder == "siglip2"
-        assert config.model.vlm.num_tokens == 196
-        # 196 image + 2048 text = 2244 <= max_seq_len=2304
+        # num_tokens defaults to 0 = "infer from encoder at build time".
+        # The encoder probes 196 (14x14 patches, no CLS) for this path; the
+        # build-time max_seq_len cross-check in build_vlm_wrapper enforces
+        # 196 + 2048 = 2244 <= max_seq_len=2304.
+        assert config.model.vlm.num_tokens == 0
         config.validate(world_size=4)
 
     def test_vlm_freeze_schedule_loads_variadic_tuple(self, tmp_path):
