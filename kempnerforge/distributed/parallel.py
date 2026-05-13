@@ -458,7 +458,11 @@ def _build_vlm(
         transformer.to_empty(device=device)
         transformer.init_weights_and_freqs()
         adapter.to_empty(device=device)
-        adapter.reset_parameters()
+        # Adapter contract (model/adapter.py): every registered adapter
+        # exposes reset_parameters() so meta-device builds can re-init the
+        # weights after to_empty. nn.Module itself does not declare the
+        # method, so pyright sees an unknown attr; suppress the report.
+        adapter.reset_parameters()  # type: ignore[reportCallIssue,reportAttributeAccessIssue]
     else:
         transformer.to(device=device)
         adapter.to(device=device)
