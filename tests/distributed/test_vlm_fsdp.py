@@ -21,8 +21,10 @@ import torch
 import torch.distributed as dist
 
 from kempnerforge.checkpoint.manager import CheckpointManager
+from kempnerforge.config.adapter import AdapterConfig
 from kempnerforge.config.model import ModelConfig
 from kempnerforge.config.schema import CheckpointConfig, OptimizerConfig
+from kempnerforge.config.vision import VisionEncoderConfig
 from kempnerforge.config.vlm import FreezeSpec, VLMConfig
 from kempnerforge.distributed.parallel import build_parallel_model
 from kempnerforge.model.vlm import VLMWrapper, inner_transformer
@@ -40,17 +42,12 @@ def _tiny_cfg(
     num_image_tokens: int = 8,
     feature_dim: int = 96,
     freeze: list[FreezeSpec] | None = None,
-) -> ModelConfig:
-    return ModelConfig(
-        dim=64,
-        n_layers=2,
-        n_heads=4,
-        vocab_size=256,
-        max_seq_len=128,
-        vlm=VLMConfig(
-            vision_encoder="random",
-            feature_dim=feature_dim,
-            num_tokens=num_image_tokens,
+) -> tuple[ModelConfig, VisionEncoderConfig, AdapterConfig, VLMConfig]:
+    return (
+        ModelConfig(dim=64, n_layers=2, n_heads=4, vocab_size=256, max_seq_len=128),
+        VisionEncoderConfig(type="random", feature_dim=feature_dim, num_tokens=num_image_tokens),
+        AdapterConfig(),
+        VLMConfig(
             max_text_len=32,
             freeze=freeze if freeze is not None else [FreezeSpec("vision_encoder", True)],
         ),
@@ -58,16 +55,20 @@ def _tiny_cfg(
 
 
 def _build(
-    cfg: ModelConfig,
+    cfg: tuple[ModelConfig, VisionEncoderConfig, AdapterConfig, VLMConfig],
     mesh,
     *,
     param_dtype: torch.dtype = torch.bfloat16,
     compile_model: bool = False,
 ) -> VLMWrapper:
+    mc, vc, ac, lc = cfg
     model = build_parallel_model(
-        cfg,
+        mc,
         device=torch.device("cuda"),
         device_mesh=mesh,
+        vision_config=vc,
+        adapter_config=ac,
+        vlm_config=lc,
         param_dtype=param_dtype,
         compile_model=compile_model,
     )

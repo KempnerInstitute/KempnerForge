@@ -14,7 +14,9 @@ from __future__ import annotations
 import pytest
 import torch
 
+from kempnerforge.config.adapter import AdapterConfig
 from kempnerforge.config.model import ModelConfig
+from kempnerforge.config.vision import VisionEncoderConfig
 from kempnerforge.config.vlm import (
     FreezeSpec,
     FreezeStage,
@@ -32,36 +34,50 @@ pytestmark = pytest.mark.skipif(
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def _tiny_mot_config(
+def _tiny_mot_configs(
     *,
     num_image_tokens: int = 8,
     feature_dim: int = 96,
     n_layers: int = 2,
     freeze: list[FreezeSpec] | None = None,
     moe: bool = False,
-) -> ModelConfig:
-    return ModelConfig(
-        dim=64,
-        n_layers=n_layers,
-        n_heads=4,
-        vocab_size=256,
-        max_seq_len=128,
-        ffn_hidden_dim=128,
-        num_experts=4 if moe else 0,
-        moe_top_k=2 if moe else 2,
-        moe_frequency=2 if moe else 1,
-        vlm=MoTConfig(
-            vision_encoder="random",
-            feature_dim=feature_dim,
-            num_tokens=num_image_tokens,
+) -> tuple[ModelConfig, VisionEncoderConfig, AdapterConfig, MoTConfig]:
+    return (
+        ModelConfig(
+            dim=64,
+            n_layers=n_layers,
+            n_heads=4,
+            vocab_size=256,
+            max_seq_len=128,
+            ffn_hidden_dim=128,
+            num_experts=4 if moe else 0,
+            moe_top_k=2 if moe else 2,
+            moe_frequency=2 if moe else 1,
+        ),
+        VisionEncoderConfig(type="random", feature_dim=feature_dim, num_tokens=num_image_tokens),
+        AdapterConfig(),
+        MoTConfig(
             max_text_len=32,
             freeze=freeze if freeze is not None else [FreezeSpec("vision_encoder", True)],
         ),
     )
 
 
-def _build(cfg: ModelConfig, *, param_dtype: torch.dtype = torch.bfloat16) -> VLMWrapper:
-    model = build_parallel_model(cfg, device=DEVICE, device_mesh=None, param_dtype=param_dtype)
+def _build(
+    configs: tuple[ModelConfig, VisionEncoderConfig, AdapterConfig, MoTConfig],
+    *,
+    param_dtype: torch.dtype = torch.bfloat16,
+) -> VLMWrapper:
+    mc, vc, ac, lc = configs
+    model = build_parallel_model(
+        mc,
+        device=DEVICE,
+        device_mesh=None,
+        vision_config=vc,
+        adapter_config=ac,
+        vlm_config=lc,
+        param_dtype=param_dtype,
+    )
     assert isinstance(model, VLMWrapper)
     return model
 
@@ -82,7 +98,7 @@ class TestBuildAndForward:
         """Tiny MoT config builds on a single GPU; forward + backward run."""
         from kempnerforge.model.mot import MoTBlock
 
-        cfg = _tiny_mot_config()
+        cfg = _tiny_mot_configs()
         wrapper = _build(cfg)
         assert isinstance(wrapper, VLMWrapper)
         # MoT extends the residual stream with num_image_tokens.
@@ -93,7 +109,7 @@ class TestBuildAndForward:
         pixels, input_ids, labels = _dummy_batch(wrapper)
         logits, _ = wrapper(pixels, input_ids, labels)
         # output_slice trims the 8 image positions; logits cover text_len positions.
-        assert logits.shape == (2, 16, cfg.vocab_size)
+        assert logits.shape == (2, 16, cfg[0].vocab_size)
         # Re-init per-modality o_proj / down_proj so backward exercises Q/K/V grads.
         with torch.no_grad():
             for layer in wrapper.transformer.layers.values():
@@ -121,7 +137,7 @@ class TestBuildAndForward:
         (transformer.layers.*) and leaves the adapter and final norms
         trainable.
         """
-        cfg = _tiny_mot_config(freeze=[FreezeSpec("mot", True)])
+        cfg = _tiny_mot_configs(freeze=[FreezeSpec("mot", True)])
         wrapper = _build(cfg)
         trainable = {name for name, p in wrapper.named_parameters() if p.requires_grad}
         frozen = {name for name, p in wrapper.named_parameters() if not p.requires_grad}
@@ -143,7 +159,7 @@ class TestBuildAndForward:
         block sees it. Asserts (a) build with bf16 param_dtype works,
         (b) forward output is bf16, (c) no dtype-mismatch errors.
         """
-        cfg = _tiny_mot_config()
+        cfg = _tiny_mot_configs()
         wrapper = _build(cfg, param_dtype=torch.bfloat16)
         assert wrapper.adapter.proj1.weight.dtype == torch.bfloat16
         pixels, input_ids, _ = _dummy_batch(wrapper)
@@ -154,7 +170,7 @@ class TestBuildAndForward:
         """torch.compile(wrapper) output matches eager output within a
         small tolerance. Catches compile-graph divergence on the MoT
         per-modality forward path."""
-        cfg = _tiny_mot_config()
+        cfg = _tiny_mot_configs()
         wrapper = _build(cfg, param_dtype=torch.float32)
         wrapper.eval()
         pixels, input_ids, _ = _dummy_batch(wrapper, batch=1, text_len=8)
@@ -170,7 +186,7 @@ class TestBuildAndForward:
 
     def test_save_load_forward_parity(self):
         """state_dict round-trips with bit-equal forward output."""
-        cfg = _tiny_mot_config()
+        cfg = _tiny_mot_configs()
         wrapper_a = _build(cfg, param_dtype=torch.float32)
         wrapper_a.eval()
         pixels, input_ids, _ = _dummy_batch(wrapper_a, batch=1, text_len=8)
@@ -196,7 +212,7 @@ class TestMoTPlusMoESmoke:
         from kempnerforge.model.moe import MoEMLP
         from kempnerforge.model.mot import MoTBlock
 
-        cfg = _tiny_mot_config(moe=True, n_layers=2)
+        cfg = _tiny_mot_configs(moe=True, n_layers=2)
         wrapper = _build(cfg)
         # Layer 1 (i=1, (i+1) % moe_frequency == 0) has MoE FFNs per modality.
         layer1 = wrapper.transformer.layers["1"]
@@ -210,11 +226,11 @@ class TestMoTPlusMoESmoke:
 
         pixels, input_ids, labels = _dummy_batch(wrapper)
         logits, _ = wrapper(pixels, input_ids, labels)
-        assert logits.shape == (2, 16, cfg.vocab_size)
+        assert logits.shape == (2, 16, cfg[0].vocab_size)
         assert torch.isfinite(logits).all()
 
     def test_mot_plus_moe_backward_1gpu(self):
-        cfg = _tiny_mot_config(moe=True, n_layers=2)
+        cfg = _tiny_mot_configs(moe=True, n_layers=2)
         wrapper = _build(cfg, param_dtype=torch.float32)
         with torch.no_grad():
             for layer in wrapper.transformer.layers.values():
@@ -251,19 +267,18 @@ class TestWarmStartFromJD:
         from kempnerforge.model.vlm import inner_transformer
 
         # Build a JD model with the same backbone shape and dump its state.
-        jd_cfg = ModelConfig(
-            dim=64,
-            n_layers=2,
-            n_heads=4,
-            vocab_size=256,
-            max_seq_len=128,
-            ffn_hidden_dim=128,
-            vlm=JointDecoderConfig(
-                vision_encoder="random",
-                feature_dim=96,
-                num_tokens=8,
-                max_text_len=32,
+        jd_cfg = (
+            ModelConfig(
+                dim=64,
+                n_layers=2,
+                n_heads=4,
+                vocab_size=256,
+                max_seq_len=128,
+                ffn_hidden_dim=128,
             ),
+            VisionEncoderConfig(type="random", feature_dim=96, num_tokens=8),
+            AdapterConfig(),
+            JointDecoderConfig(max_text_len=32),
         )
         jd_wrapper = _build(jd_cfg, param_dtype=torch.float32)
         jd_state = inner_transformer(jd_wrapper).state_dict()
@@ -271,7 +286,7 @@ class TestWarmStartFromJD:
         torch.save(jd_state, ckpt_path)
 
         # Build a MoT model and run the warm-start helper.
-        mot_cfg = _tiny_mot_config(num_image_tokens=8, n_layers=2)
+        mot_cfg = _tiny_mot_configs(num_image_tokens=8, n_layers=2)
         mot_wrapper = _build(mot_cfg, param_dtype=torch.float32)
         source = torch.load(ckpt_path, map_location="cpu", weights_only=True)
         mot_warm_start_from_text_stack(inner_transformer(mot_wrapper), source)
@@ -279,7 +294,7 @@ class TestWarmStartFromJD:
         # Per-modality copies equal the source dense weights. (Compare via
         # the on-disk CPU state to avoid cross-device tensor compares.)
         mot_t = inner_transformer(mot_wrapper)
-        for i in range(mot_cfg.n_layers):
+        for i in range(mot_cfg[0].n_layers):
             for m in mot_t.layers[str(i)].modalities:  # type: ignore[union-attr]
                 assert torch.equal(
                     mot_t.layers[str(i)].attn.q_proj[m].weight.cpu(),  # type: ignore[union-attr]
@@ -296,23 +311,25 @@ class TestWarmStartFromJD:
         from kempnerforge.model.mot import mot_warm_start_from_text_stack
         from kempnerforge.model.vlm import inner_transformer
 
-        jd_cfg = ModelConfig(
-            dim=64,
-            n_layers=2,
-            n_heads=4,
-            vocab_size=256,
-            max_seq_len=128,
-            ffn_hidden_dim=128,
-            vlm=JointDecoderConfig(
-                vision_encoder="random", feature_dim=96, num_tokens=8, max_text_len=32
+        jd_cfg = (
+            ModelConfig(
+                dim=64,
+                n_layers=2,
+                n_heads=4,
+                vocab_size=256,
+                max_seq_len=128,
+                ffn_hidden_dim=128,
             ),
+            VisionEncoderConfig(type="random", feature_dim=96, num_tokens=8),
+            AdapterConfig(),
+            JointDecoderConfig(max_text_len=32),
         )
         jd_wrapper = _build(jd_cfg, param_dtype=torch.float32)
         jd_state = inner_transformer(jd_wrapper).state_dict()
         ckpt_path = tmp_path / "jd_ckpt.pt"
         torch.save(jd_state, ckpt_path)
 
-        mot_cfg = _tiny_mot_config(num_image_tokens=8, n_layers=2)
+        mot_cfg = _tiny_mot_configs(num_image_tokens=8, n_layers=2)
         mot_wrapper = _build(mot_cfg, param_dtype=torch.float32)
         source = torch.load(ckpt_path, map_location="cpu", weights_only=True)
         mot_warm_start_from_text_stack(inner_transformer(mot_wrapper), source)
@@ -325,13 +342,13 @@ class TestWarmStartFromJD:
 class TestFreezeStageHook:
     def test_freeze_schedule_transitions(self):
         """Schedule that freezes 'mot' at step 3 and unfreezes at step 7."""
-        cfg = _tiny_mot_config(
+        cfg = _tiny_mot_configs(
             freeze=[
                 FreezeSpec("vision_encoder", True),
                 FreezeSpec("mot", False),
             ],
         )
-        cfg.vlm.freeze_schedule = [  # type: ignore[union-attr]
+        cfg[3].freeze_schedule = [  # type: ignore[union-attr]
             FreezeStage(start_step=3, specs=(FreezeSpec("mot", True),)),
             FreezeStage(start_step=7, specs=(FreezeSpec("mot", False),)),
         ]
@@ -346,13 +363,13 @@ class TestFreezeStageHook:
             assert p.requires_grad
 
         # Step 3: layers frozen.
-        specs = effective_freeze(3, cfg.vlm.freeze, cfg.vlm.freeze_schedule)  # type: ignore[union-attr]
-        apply_freeze_specs(wrapper, specs, cfg.vlm.module_patterns)  # type: ignore[union-attr]
+        specs = effective_freeze(3, cfg[3].freeze, cfg[3].freeze_schedule)  # type: ignore[union-attr]
+        apply_freeze_specs(wrapper, specs, cfg[3].module_patterns)  # type: ignore[union-attr]
         for p in layer_params:
             assert not p.requires_grad
 
         # Step 7: layers trainable again.
-        specs = effective_freeze(7, cfg.vlm.freeze, cfg.vlm.freeze_schedule)  # type: ignore[union-attr]
-        apply_freeze_specs(wrapper, specs, cfg.vlm.module_patterns)  # type: ignore[union-attr]
+        specs = effective_freeze(7, cfg[3].freeze, cfg[3].freeze_schedule)  # type: ignore[union-attr]
+        apply_freeze_specs(wrapper, specs, cfg[3].module_patterns)  # type: ignore[union-attr]
         for p in layer_params:
             assert p.requires_grad

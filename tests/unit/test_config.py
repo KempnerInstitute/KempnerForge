@@ -9,6 +9,7 @@ from kempnerforge.config.loader import _parse_cli_overrides
 from kempnerforge.config.registry import Registry
 from kempnerforge.config.schema import (
     ActivationCheckpointing,
+    AdapterConfig,
     AsyncCheckpointMode,
     CheckpointConfig,
     DataConfig,
@@ -20,6 +21,7 @@ from kempnerforge.config.schema import (
     SchedulerConfig,
     SchedulerType,
     TrainConfig,
+    VisionEncoderConfig,
     VLMConfig,
 )
 
@@ -366,10 +368,10 @@ class TestJobConfig:
 
     def test_validate_vlm_seq_len_too_short(self):
         config = JobConfig(
-            model=ModelConfig(
-                max_seq_len=1024,
-                vlm=VLMConfig(vision_encoder="random", num_tokens=64, max_text_len=512),
-            ),
+            model=ModelConfig(max_seq_len=1024),
+            vision_encoder=VisionEncoderConfig(type="random", num_tokens=64),
+            adapter=AdapterConfig(),
+            vlm=VLMConfig(max_text_len=512),
             train=TrainConfig(seq_len=100),
         )
         with pytest.raises(ValueError, match="train.seq_len.*insufficient for VLM"):
@@ -377,10 +379,10 @@ class TestJobConfig:
 
     def test_validate_vlm_pp_rejected(self):
         config = JobConfig(
-            model=ModelConfig(
-                max_seq_len=1024,
-                vlm=VLMConfig(vision_encoder="random", num_tokens=64, max_text_len=512),
-            ),
+            model=ModelConfig(max_seq_len=1024),
+            vision_encoder=VisionEncoderConfig(type="random", num_tokens=64),
+            adapter=AdapterConfig(),
+            vlm=VLMConfig(max_text_len=512),
             train=TrainConfig(seq_len=600),
             distributed=DistributedConfig(pp=2, dp_shard=1),
         )
@@ -389,10 +391,10 @@ class TestJobConfig:
 
     def test_validate_vlm_num_tokens_zero_defers(self):
         config = JobConfig(
-            model=ModelConfig(
-                max_seq_len=1024,
-                vlm=VLMConfig(vision_encoder="random", num_tokens=0, max_text_len=512),
-            ),
+            model=ModelConfig(max_seq_len=1024),
+            vision_encoder=VisionEncoderConfig(type="random", num_tokens=0),
+            adapter=AdapterConfig(),
+            vlm=VLMConfig(max_text_len=512),
             train=TrainConfig(seq_len=64),
         )
         config.validate(world_size=1)  # Should not raise — check deferred
@@ -403,12 +405,10 @@ class TestJobConfig:
         lives in TransformerBlocks; CrossAttentionBlocks remain dense.
         """
         config = JobConfig(
-            model=ModelConfig(
-                max_seq_len=1024,
-                vlm=VLMConfig(vision_encoder="random", num_tokens=64, max_text_len=512),
-                num_experts=4,
-                moe_top_k=2,
-            ),
+            model=ModelConfig(max_seq_len=1024, num_experts=4, moe_top_k=2),
+            vision_encoder=VisionEncoderConfig(type="random", num_tokens=64),
+            adapter=AdapterConfig(),
+            vlm=VLMConfig(max_text_len=512),
             train=TrainConfig(seq_len=600),
         )
         config.validate(world_size=1)  # Should not raise.
@@ -457,29 +457,31 @@ class TestTomlLoading:
             load_config(str(bad_toml), cli_args=[])
 
     def test_load_vlm_debug_toml(self):
-        """Regression: nested Optional[VLMConfig] in ModelConfig loads
-        correctly from [model.vlm] table, and list[FreezeSpec] inside
-        VLMConfig instantiates each freeze entry via __post_init__."""
+        """Regression: parallel [vision_encoder] / [adapter] / [vlm] tables
+        load correctly, and list[FreezeSpec] inside VLMConfig instantiates
+        each freeze entry via __post_init__."""
         config = load_config("configs/train/vlm_debug.toml", cli_args=[])
-        assert config.model.is_vlm is True
-        assert config.model.vlm is not None
-        assert config.model.vlm.vision_encoder == "random"
-        assert config.model.vlm.num_tokens == 64
-        assert len(config.model.vlm.freeze) == 1
-        assert config.model.vlm.freeze[0].module == "vision_encoder"
-        assert config.model.vlm.freeze[0].frozen is True
+        assert config.is_vlm is True
+        assert config.vision_encoder is not None
+        assert config.vlm is not None
+        assert config.vision_encoder.type == "random"
+        assert config.vision_encoder.num_tokens == 64
+        assert len(config.vlm.freeze) == 1
+        assert config.vlm.freeze[0].module == "vision_encoder"
+        assert config.vlm.freeze[0].frozen is True
         config.validate(world_size=1)
 
     def test_load_vlm_7b_siglip2_toml(self):
         config = load_config("configs/train/vlm_7b_siglip2.toml", cli_args=[])
-        assert config.model.is_vlm is True
-        assert config.model.vlm is not None
-        assert config.model.vlm.vision_encoder == "siglip2"
+        assert config.is_vlm is True
+        assert config.vision_encoder is not None
+        assert config.vlm is not None
+        assert config.vision_encoder.type == "siglip2"
         # num_tokens defaults to 0 = "infer from encoder at build time".
         # The encoder probes 196 (14x14 patches, no CLS) for this path; the
         # build-time max_seq_len cross-check in build_vlm_wrapper enforces
         # 196 + 2048 = 2244 <= max_seq_len=2304.
-        assert config.model.vlm.num_tokens == 0
+        assert config.vision_encoder.num_tokens == 0
         config.validate(world_size=4)
 
     def test_vlm_freeze_schedule_loads_variadic_tuple(self, tmp_path):
@@ -497,10 +499,12 @@ n_kv_heads = 4
 vocab_size = 256
 max_seq_len = 96
 
-[model.vlm]
-arch = "joint_decoder"
-vision_encoder = "random"
+[vision_encoder]
+type = "random"
 num_tokens = 16
+
+[vlm]
+arch = "joint_decoder"
 max_text_len = 64
 freeze = [{module = "vision_encoder", frozen = true}]
 freeze_schedule = [
@@ -510,8 +514,8 @@ freeze_schedule = [
 """
         )
         config = load_config(str(toml), cli_args=[])
-        assert config.model.vlm is not None
-        sched = config.model.vlm.freeze_schedule
+        assert config.vlm is not None
+        sched = config.vlm.freeze_schedule
         assert len(sched) == 2
         assert sched[0].start_step == 5
         assert sched[0].specs[0].module == "adapter"
@@ -533,10 +537,12 @@ freeze_schedule = [
         toml = tmp_path / "vlm_reserved.toml"
         toml.write_text(
             f"""
-[model.vlm]
-arch = "{reserved_arch}"
-vision_encoder = "random"
+[vision_encoder]
+type = "random"
 num_tokens = 16
+
+[vlm]
+arch = "{reserved_arch}"
 max_text_len = 32
 """
         )
@@ -547,10 +553,12 @@ max_text_len = 32
         toml = tmp_path / "vlm_unknown.toml"
         toml.write_text(
             """
-[model.vlm]
-arch = "bogus_arch"
-vision_encoder = "random"
+[vision_encoder]
+type = "random"
 num_tokens = 16
+
+[vlm]
+arch = "bogus_arch"
 max_text_len = 32
 """
         )
@@ -563,10 +571,12 @@ max_text_len = 32
         toml = tmp_path / "vlm_typo.toml"
         toml.write_text(
             """
-[model.vlm]
-arch = "joint_decoder"
-vision_encoder = "random"
+[vision_encoder]
+type = "random"
 num_tokens = 16
+
+[vlm]
+arch = "joint_decoder"
 max_text_len = 32
 not_a_real_field = 99
 """

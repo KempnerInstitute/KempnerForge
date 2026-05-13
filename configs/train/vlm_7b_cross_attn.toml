@@ -29,9 +29,9 @@
 # the dataset (and tokenizer) via CLI:
 #   --data.hf_dataset_name=<dataset> --data.tokenizer_path=<tokenizer>
 #
-# Swap the vision encoder via [model.vlm].vision_encoder: "random"
-# (stub, no download), "siglip2", or "clip". When pointing at a real
-# encoder also set vision_encoder_path.
+# Swap the vision encoder via [vision_encoder].type: "random" (stub, no
+# download), "siglip2", or "clip". When pointing at a real encoder also
+# set [vision_encoder].path.
 
 [model]
 dim = 4096
@@ -46,12 +46,14 @@ max_seq_len = 1024
 rope_theta = 500000.0
 tie_embeddings = false
 
-[model.vlm]
-arch = "cross_attention"
-vision_encoder = "random"
+[vision_encoder]
+type = "random"
 # ViT-L/14-shaped dims (constructor inputs to RandomVisionEncoder, swap-in compatible)
 feature_dim = 1024
 num_tokens = 256
+
+[vlm]
+arch = "cross_attention"
 
 [train]
 batch_size = 16

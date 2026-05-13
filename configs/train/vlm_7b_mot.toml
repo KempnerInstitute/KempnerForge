@@ -31,7 +31,7 @@
 # datasets.save_to_disk:
 #   --data.hf_dataset_name=/path/to/local/hf_dataset \
 #   --data.hf_dataset_text_field=caption
-# Swap the encoder via [model.vlm].vision_encoder = "siglip2" / "clip".
+# Swap the encoder via [vision_encoder].type = "siglip2" / "clip".
 
 [model]
 dim = 4096
@@ -46,11 +46,13 @@ max_seq_len = 1024
 rope_theta = 500000.0
 tie_embeddings = false
 
-[model.vlm]
-arch = "mot"
-vision_encoder = "random"
+[vision_encoder]
+type = "random"
 feature_dim = 1024
 num_tokens = 256
+
+[vlm]
+arch = "mot"
 
 [train]
 batch_size = 8

@@ -16,7 +16,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-import kempnerforge.model.adapter  # noqa: F401 - triggers adapter registration
 from kempnerforge.config.registry import registry
 
 
@@ -39,6 +38,13 @@ class AdapterConfig:
     activation: str = "gelu"
 
     def __post_init__(self) -> None:
+        # Late import: importing the adapter module triggers the
+        # ``@registry.register_adapter`` decorators that populate the registry.
+        # Doing this at module scope creates a circular import via
+        # ``kempnerforge.model.__init__`` -> ``transformer.py`` ->
+        # ``kempnerforge.config.schema`` -> ``adapter.py``.
+        import kempnerforge.model.adapter  # noqa: F401, PLC0415
+
         registered = tuple(registry.list_adapters())
         if self.type not in registered:
             raise ValueError(

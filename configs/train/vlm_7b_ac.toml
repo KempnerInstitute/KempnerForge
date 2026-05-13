@@ -31,12 +31,14 @@ max_seq_len = 1024
 rope_theta = 500000.0
 tie_embeddings = false
 
-[model.vlm]
-arch = "joint_decoder"
-vision_encoder = "random"
+[vision_encoder]
+type = "random"
 # ViT-L/14-shaped dims (constructor inputs to RandomVisionEncoder, swap-in compatible)
 feature_dim = 1024
 num_tokens = 256
+
+[vlm]
+arch = "joint_decoder"
 
 [train]
 batch_size = 8

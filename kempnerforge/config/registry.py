@@ -120,13 +120,16 @@ class Registry:
     def get_vision_encoder(self, name: str) -> Callable:
         return self.get("vision_encoder", name)
 
+    def list_vision_encoders(self) -> list[str]:
+        return self.list("vision_encoder")
+
     def register_vlm_config(self, name: str) -> Callable:
         """Decorator to register a ``VLMConfig`` subclass.
 
         Registers an arch discriminator (e.g. ``"joint_decoder"``,
         ``"cross_attention"``) so the loader can dispatch a TOML
-        ``[model.vlm]`` table with ``arch = "..."`` to the right
-        subclass and ``VLMConfig.for_arch`` can resolve programmatically.
+        ``[vlm]`` table with ``arch = "..."`` to the right subclass
+        and ``VLMConfig.for_arch`` can resolve programmatically.
         """
 
         def decorator(cls: Any) -> Any:

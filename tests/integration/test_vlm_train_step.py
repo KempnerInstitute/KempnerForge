@@ -15,8 +15,10 @@ from __future__ import annotations
 import pytest
 import torch
 
+from kempnerforge.config.adapter import AdapterConfig
 from kempnerforge.config.model import ModelConfig
 from kempnerforge.config.schema import OptimizerConfig
+from kempnerforge.config.vision import VisionEncoderConfig
 from kempnerforge.config.vlm import FreezeSpec, VLMConfig
 from kempnerforge.distributed.parallel import build_parallel_model
 from kempnerforge.model.vlm import VLMWrapper, inner_transformer
@@ -30,33 +32,36 @@ pytestmark = pytest.mark.skipif(
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def _tiny_vlm_config(
+def _tiny_vlm_configs(
     *,
     num_image_tokens: int = 8,
     feature_dim: int = 96,
     freeze: list[FreezeSpec] | None = None,
-) -> ModelConfig:
-    return ModelConfig(
-        dim=64,
-        n_layers=2,
-        n_heads=4,
-        vocab_size=256,
-        max_seq_len=128,
-        vlm=VLMConfig(
-            vision_encoder="random",
-            feature_dim=feature_dim,
-            num_tokens=num_image_tokens,
+) -> tuple[ModelConfig, VisionEncoderConfig, AdapterConfig, VLMConfig]:
+    return (
+        ModelConfig(dim=64, n_layers=2, n_heads=4, vocab_size=256, max_seq_len=128),
+        VisionEncoderConfig(type="random", feature_dim=feature_dim, num_tokens=num_image_tokens),
+        AdapterConfig(),
+        VLMConfig(
             max_text_len=32,
             freeze=freeze if freeze is not None else [FreezeSpec("vision_encoder", True)],
         ),
     )
 
 
-def _build(cfg: ModelConfig, *, param_dtype: torch.dtype = torch.bfloat16) -> VLMWrapper:
+def _build(
+    configs: tuple[ModelConfig, VisionEncoderConfig, AdapterConfig, VLMConfig],
+    *,
+    param_dtype: torch.dtype = torch.bfloat16,
+) -> VLMWrapper:
+    mc, vc, ac, lc = configs
     model = build_parallel_model(
-        cfg,
+        mc,
         device=DEVICE,
         device_mesh=None,
+        vision_config=vc,
+        adapter_config=ac,
+        vlm_config=lc,
         param_dtype=param_dtype,
     )
     assert isinstance(model, VLMWrapper)
@@ -84,13 +89,13 @@ def _dummy_batch(
 class TestBuild:
     def test_meta_device_build_no_oom(self):
         """Tiny VLM config builds on a single GPU."""
-        cfg = _tiny_vlm_config()
+        cfg = _tiny_vlm_configs()
         wrapper = _build(cfg)
         assert isinstance(wrapper, VLMWrapper)
         assert wrapper.num_image_tokens == 8
 
     def test_build_respects_freeze(self):
-        cfg = _tiny_vlm_config(freeze=[FreezeSpec("vision_encoder", True)])
+        cfg = _tiny_vlm_configs(freeze=[FreezeSpec("vision_encoder", True)])
         wrapper = _build(cfg)
         trainable = {name for name, p in wrapper.named_parameters() if p.requires_grad}
         frozen = {name for name, p in wrapper.named_parameters() if not p.requires_grad}
@@ -101,7 +106,7 @@ class TestBuild:
         assert any(n.startswith("transformer") for n in trainable)
 
     def test_encoder_in_eval_when_frozen(self):
-        wrapper = _build(_tiny_vlm_config())
+        wrapper = _build(_tiny_vlm_configs())
         assert wrapper.vision_encoder.training is False
         # Transformer and adapter remain in train mode (default for nn.Module).
         assert wrapper.transformer.training is True
@@ -112,7 +117,7 @@ class TestDtypePolicy:
     def test_frozen_encoder_not_cast_to_bf16(self):
         """Transformer and adapter are bf16, vision encoder stays in its
         HF dtype (fp32 for RandomVisionEncoder). D16."""
-        cfg = _tiny_vlm_config()
+        cfg = _tiny_vlm_configs()
         wrapper = _build(cfg, param_dtype=torch.bfloat16)
         # Transformer / adapter are bf16.
         for p in wrapper.transformer.parameters():
@@ -126,7 +131,7 @@ class TestDtypePolicy:
 
 class TestForward:
     def test_one_step_loss_finite(self):
-        cfg = _tiny_vlm_config()
+        cfg = _tiny_vlm_configs()
         wrapper = _build(cfg)
         optimizer = build_optimizer(wrapper, OptimizerConfig(lr=1e-3, fused=False))
 
@@ -139,18 +144,18 @@ class TestForward:
         assert torch.isfinite(loss).item()
 
     def test_logits_shape_matches_text_only(self):
-        cfg = _tiny_vlm_config(num_image_tokens=8)
+        cfg = _tiny_vlm_configs(num_image_tokens=8)
         wrapper = _build(cfg)
         pixels, input_ids, _ = _dummy_batch(wrapper, text_len=20)
         logits, _ = wrapper(pixels, input_ids, None)
         # output_slice drops image positions; (B, T, V) not (B, N+T, V).
-        assert logits.shape == (2, 20, cfg.vocab_size)
+        assert logits.shape == (2, 20, cfg[0].vocab_size)
 
     def test_vlm_all_pad_batch_no_nan(self):
         """Every label is -100: kempnerforge.training.loss.cross_entropy_loss
         short-circuits to 0.0 (no NaN), backward is skipped (no grad graph),
         and a subsequent real step still updates params."""
-        cfg = _tiny_vlm_config()
+        cfg = _tiny_vlm_configs()
         wrapper = _build(cfg)
         optimizer = build_optimizer(wrapper, OptimizerConfig(lr=1e-3, fused=False))
 
@@ -184,7 +189,7 @@ class TestOverfit:
     def test_adapter_changes_frozen_encoder_stays(self):
         """After 10 steps on a fixed batch, adapter + transformer params
         drift and the frozen encoder parameters are bit-equal."""
-        cfg = _tiny_vlm_config()
+        cfg = _tiny_vlm_configs()
         wrapper = _build(cfg)
         optimizer = build_optimizer(wrapper, OptimizerConfig(lr=1e-2, fused=False))
 
@@ -209,7 +214,7 @@ class TestOverfit:
 class TestInnerTransformer:
     def test_unwrap_reaches_moe_methods(self):
         """inner_transformer is usable under the real build path."""
-        wrapper = _build(_tiny_vlm_config())
+        wrapper = _build(_tiny_vlm_configs())
         inner = inner_transformer(wrapper)
         assert inner is wrapper.transformer
         # set_moe_step is a no-op on a dense model but must resolve.
@@ -221,7 +226,7 @@ class TestTokenAccounting:
         """scripts/train.py measures 'text_tokens_trained' as
         (labels != -100).sum(). Verify the math matches what the
         train-loop VLM branch would compute."""
-        cfg = _tiny_vlm_config(num_image_tokens=8)
+        cfg = _tiny_vlm_configs(num_image_tokens=8)
         wrapper = _build(cfg)
         pixels, input_ids, labels = _dummy_batch(wrapper, batch=3, text_len=16)
         # Manually mask half of labels as -100 (mimics prompt + pad masking).
@@ -233,7 +238,7 @@ class TestTokenAccounting:
         # 3 rows * 8 non-masked positions = 24
         assert n_tokens == 24
         # Logits cover text positions, not image positions.
-        assert logits.shape == (3, 16, cfg.vocab_size)
+        assert logits.shape == (3, 16, cfg[0].vocab_size)
 
 
 class TestValidation:
@@ -241,20 +246,18 @@ class TestValidation:
         """If max_seq_len < num_image_tokens + max_text_len, build_parallel_model
         raises even when num_tokens is resolved at build time (e.g.
         encoder exposes a different value than the config asserts)."""
-        # Trick: pass num_tokens=0 so the ModelConfig-time check is skipped,
+        # Trick: pass num_tokens=0 so the JobConfig-time check is skipped,
         # but the encoder default (num_tokens=16) will exceed max_seq_len.
-        cfg = ModelConfig(
-            dim=64,
-            n_layers=2,
-            n_heads=4,
-            vocab_size=256,
-            max_seq_len=20,  # 16 image + 32 text = 48 > 20
-            vlm=VLMConfig(
-                vision_encoder="random",
-                feature_dim=0,
-                num_tokens=0,
-                max_text_len=32,
-            ),
-        )
+        mc = ModelConfig(dim=64, n_layers=2, n_heads=4, vocab_size=256, max_seq_len=20)
+        vc = VisionEncoderConfig(type="random", feature_dim=0, num_tokens=0)
+        ac = AdapterConfig()
+        lc = VLMConfig(max_text_len=32)  # 16 image + 32 text = 48 > 20
         with pytest.raises(ValueError, match="insufficient"):
-            build_parallel_model(cfg, device=DEVICE, device_mesh=None)
+            build_parallel_model(
+                mc,
+                device=DEVICE,
+                device_mesh=None,
+                vision_config=vc,
+                adapter_config=ac,
+                vlm_config=lc,
+            )

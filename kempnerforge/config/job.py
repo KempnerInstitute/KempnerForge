@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from kempnerforge.config.adapter import AdapterConfig
 from kempnerforge.config.checkpoint import CheckpointConfig
 from kempnerforge.config.data import DataConfig
 from kempnerforge.config.distributed import DistributedConfig
@@ -14,11 +15,21 @@ from kempnerforge.config.optimizer import OptimizerConfig
 from kempnerforge.config.profiling import ProfilingConfig
 from kempnerforge.config.scheduler import SchedulerConfig
 from kempnerforge.config.training import TrainConfig
+from kempnerforge.config.vision import VisionEncoderConfig
+from kempnerforge.config.vlm import VLMConfig
 
 
 @dataclass
 class JobConfig:
-    """Top-level configuration aggregating all sub-configs."""
+    """Top-level configuration aggregating all sub-configs.
+
+    The VLM stack lives as three sibling top-level sections,
+    ``[vision_encoder]`` / ``[adapter]`` / ``[vlm]``. A pure text run
+    leaves all three at ``None`` and writes only ``[model]`` (plus the
+    other operational sections). A VLM run sets ``[vlm]`` and is
+    required to provide ``[vision_encoder]``; ``[adapter]`` defaults to
+    the registered 2-layer MLP and may be omitted.
+    """
 
     model: ModelConfig = field(default_factory=ModelConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
@@ -30,9 +41,55 @@ class JobConfig:
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
     metrics: MetricsConfig = field(default_factory=MetricsConfig)
     profiling: ProfilingConfig = field(default_factory=ProfilingConfig)
+    vision_encoder: VisionEncoderConfig | None = None
+    adapter: AdapterConfig | None = None
+    vlm: VLMConfig | None = None
+
+    def __post_init__(self) -> None:
+        """Cross-section invariants that fire at construction time.
+
+        ``validate(world_size)`` covers checks that depend on the
+        distributed world size; everything that is decidable from the
+        config alone runs here so loader-time mistakes surface before
+        any distributed init.
+        """
+        if self.vlm is not None:
+            if self.vision_encoder is None:
+                raise ValueError(
+                    "[vlm] is set but [vision_encoder] is missing; a VLM run requires a "
+                    "vision encoder section."
+                )
+            if self.adapter is None:
+                # Materialize the default adapter so downstream callers always
+                # see a non-None AdapterConfig once [vlm] is present.
+                self.adapter = AdapterConfig()
+            # max_seq_len cross-check. Effective residual-stream length is
+            # residual_stream_image_tokens(num_tokens) + max_text_len.
+            #   - Joint-Decoder / MoT: residual is num_tokens + max_text_len.
+            #   - Cross-Attention: residual is text-only (max_text_len), the
+            #     encoder's num_tokens flows side-channel into CA blocks.
+            # Only fires when num_tokens > 0; num_tokens == 0 (the "infer at
+            # build time" sentinel) defers the check to ``build_vlm_wrapper``
+            # / ``_build_vlm`` using the encoder's resolved value.
+            if self.vision_encoder.num_tokens > 0:
+                residual_image_tokens = self.vlm.residual_stream_image_tokens(
+                    self.vision_encoder.num_tokens
+                )
+                required = residual_image_tokens + self.vlm.max_text_len
+                if self.model.max_seq_len < required:
+                    raise ValueError(
+                        f"model.max_seq_len ({self.model.max_seq_len}) insufficient for VLM: "
+                        f"residual_image_tokens ({residual_image_tokens}) + "
+                        f"vlm.max_text_len ({self.vlm.max_text_len}) = {required}"
+                    )
+
+    @property
+    def is_vlm(self) -> bool:
+        """Whether this job builds a ``VLMWrapper`` around the text backbone."""
+        return self.vlm is not None
 
     def validate(self, world_size: int = 1) -> None:
-        """Run cross-config validations."""
+        """Run cross-config validations that depend on the world size."""
         self.distributed.validate_world_size(world_size)
 
         if self.train.seq_len > self.model.max_seq_len:
@@ -96,26 +153,28 @@ class JobConfig:
                     f"ep ({self.distributed.ep})"
                 )
 
-        if self.model.is_vlm:
-            vlm = self.model.vlm
-            assert vlm is not None  # narrowed by is_vlm
+        if self.is_vlm:
+            assert self.vlm is not None  # narrowed by is_vlm
+            assert self.vision_encoder is not None  # __post_init__ enforces this
             # train.seq_len drives the attention sequence length. The
             # effective residual-stream length is
-            # vlm.residual_stream_image_tokens() + max_text_len:
-            #   - Joint-Decoder: residual_stream_image_tokens == num_tokens
+            # vlm.residual_stream_image_tokens(num_tokens) + max_text_len:
+            #   - Joint-Decoder / MoT: residual_stream_image_tokens == num_tokens
             #     (image tokens prepended to text).
             #   - Cross-Attention: residual_stream_image_tokens == 0 (image
             #     features flow side-channel into CA blocks; residual is
             #     text-only).
             # num_tokens=0 is deferred to build_vlm_wrapper.
-            if vlm.num_tokens > 0:
-                residual_image_tokens = vlm.residual_stream_image_tokens()
-                required = residual_image_tokens + vlm.max_text_len
+            if self.vision_encoder.num_tokens > 0:
+                residual_image_tokens = self.vlm.residual_stream_image_tokens(
+                    self.vision_encoder.num_tokens
+                )
+                required = residual_image_tokens + self.vlm.max_text_len
                 if self.train.seq_len < required:
                     raise ValueError(
                         f"train.seq_len ({self.train.seq_len}) insufficient for VLM: "
                         f"residual_image_tokens ({residual_image_tokens}) + "
-                        f"vlm.max_text_len ({vlm.max_text_len}) = {required}"
+                        f"vlm.max_text_len ({self.vlm.max_text_len}) = {required}"
                     )
             if self.distributed.pp > 1:
                 raise ValueError(

@@ -35,14 +35,16 @@ max_seq_len = 2048      # CA residual stream is text-only (no image prefix)
 rope_theta = 500000.0
 tie_embeddings = false
 
-[model.vlm]
-arch = "cross_attention"
-vision_encoder = "siglip2"
-vision_encoder_path = "google/siglip2-base-patch16-224"
+[vision_encoder]
+type = "siglip2"
+path = "google/siglip2-base-patch16-224"
 # feature_dim and num_tokens default to 0 = infer from the encoder at
 # build time. For siglip2-base-patch16-224 the encoder probes
 # feature_dim=768 and num_tokens=196. CA ignores num_tokens at runtime
 # (residual is text-only); kept here only as documentation.
+
+[vlm]
+arch = "cross_attention"
 max_text_len = 2048
 
 [train]

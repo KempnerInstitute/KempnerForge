@@ -19,11 +19,13 @@ max_seq_len = 576      # 64 image + 512 text
 norm_type = "rmsnorm"
 activation = "silu"
 
-[model.vlm]
-arch = "joint_decoder"
-vision_encoder = "random"
+[vision_encoder]
+type = "random"
 feature_dim = 384
 num_tokens = 64
+
+[vlm]
+arch = "joint_decoder"
 
 [train]
 batch_size = 2

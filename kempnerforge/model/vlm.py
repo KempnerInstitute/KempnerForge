@@ -42,6 +42,7 @@ import torch.nn as nn
 from kempnerforge.config.adapter import AdapterConfig
 from kempnerforge.config.registry import registry
 from kempnerforge.config.schema import ModelConfig
+from kempnerforge.config.vision import VisionEncoderConfig
 from kempnerforge.config.vlm import FreezeSpec, VLMConfig
 from kempnerforge.model.adapter import build_adapter
 from kempnerforge.model.modality import ModalityContext
@@ -270,8 +271,13 @@ def _is_encoder_frozen(specs: Iterable[FreezeSpec]) -> bool:
     return all(s.frozen for s in relevant)
 
 
-def build_vlm_wrapper(model_config: ModelConfig) -> VLMWrapper:
-    """Build a ``VLMWrapper`` from a ``ModelConfig`` with ``vlm`` set.
+def build_vlm_wrapper(
+    model_config: ModelConfig,
+    vision_config: VisionEncoderConfig,
+    adapter_config: AdapterConfig,
+    vlm_config: VLMConfig,
+) -> VLMWrapper:
+    """Build a ``VLMWrapper`` from the four top-level configs.
 
     Used by tests and by ``build_parallel_model``. Constructs the
     vision encoder via the registry (HF weights loaded on CPU), builds
@@ -280,43 +286,35 @@ def build_vlm_wrapper(model_config: ModelConfig) -> VLMWrapper:
     a raw ``Transformer``. Callers that need meta-device / FSDP /
     freeze handling go through ``build_parallel_model`` instead.
 
-    The adapter type defaults to ``"mlp_2layer"`` (matches the pre-
-    registry behavior). A follow-up PR will expose ``[adapter]`` as a
-    top-level TOML section; in the meantime this builder synthesizes
-    an ``AdapterConfig`` from the existing ``VLMConfig`` fields
-    (``adapter_hidden_dim`` and ``adapter_activation``).
+    All four configs are required: the schema flip lifted the vision /
+    adapter / VLM sections out of ``ModelConfig`` and made them parallel
+    siblings.
     """
-    vlm: VLMConfig | None = model_config.vlm
-    if vlm is None:
-        raise ValueError("build_vlm_wrapper requires model_config.vlm to be set")
-    encoder_builder = registry.get_vision_encoder(vlm.vision_encoder)
+    encoder_builder = registry.get_vision_encoder(vision_config.type)
     encoder = encoder_builder(
-        vlm.vision_encoder_path,
-        num_tokens=vlm.num_tokens if vlm.num_tokens > 0 else None,
-        feature_dim=vlm.feature_dim if vlm.feature_dim > 0 else None,
+        vision_config.path,
+        num_tokens=vision_config.num_tokens if vision_config.num_tokens > 0 else None,
+        feature_dim=vision_config.feature_dim if vision_config.feature_dim > 0 else None,
     )
     # Build-time max_seq_len cross-check using the encoder's resolved
-    # num_tokens. ModelConfig.__post_init__ runs the same check at config
-    # time only when vlm.num_tokens > 0; when the user leaves num_tokens=0
-    # (the "infer from encoder at build time" sentinel) the config-time
-    # check is skipped and the residual-stream allocation goes unchecked
-    # until the model actually runs. This guard fills that gap.
-    residual_image_tokens = vlm.residual_stream_image_tokens(encoder.num_tokens)
-    required = residual_image_tokens + vlm.max_text_len
+    # num_tokens. ``JobConfig.__post_init__`` runs the same check at config
+    # time only when ``vision_encoder.num_tokens > 0``; when the user leaves
+    # num_tokens=0 (the "infer from encoder at build time" sentinel) the
+    # config-time check is skipped and the residual-stream allocation goes
+    # unchecked until the model actually runs. This guard fills that gap.
+    residual_image_tokens = vlm_config.residual_stream_image_tokens(encoder.num_tokens)
+    required = residual_image_tokens + vlm_config.max_text_len
     if model_config.max_seq_len < required:
         raise ValueError(
             f"max_seq_len ({model_config.max_seq_len}) insufficient for VLM at build time: "
             f"encoder.num_tokens ({encoder.num_tokens}) -> "
             f"residual_image_tokens ({residual_image_tokens}) + "
-            f"vlm.max_text_len ({vlm.max_text_len}) = {required}"
+            f"vlm.max_text_len ({vlm_config.max_text_len}) = {required}"
         )
-    in_dim = vlm.feature_dim or encoder.feature_dim
-    adapter_config = AdapterConfig(
-        type="mlp_2layer",
-        hidden_dim=vlm.adapter_hidden_dim,
-        activation=vlm.adapter_activation,
-    )
+    in_dim = vision_config.feature_dim or encoder.feature_dim
     adapter = build_adapter(adapter_config, in_dim=in_dim, out_dim=model_config.dim)
-    transformer = Transformer(model_config)
-    strategy = build_modality_strategy(vlm)
+    transformer = Transformer(
+        model_config, vlm_config=vlm_config, num_image_tokens=encoder.num_tokens
+    )
+    strategy = build_modality_strategy(vlm_config)
     return VLMWrapper(encoder, adapter, transformer, strategy)

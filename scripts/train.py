@@ -94,6 +94,10 @@ def main() -> None:
 
     tc = config.train
     mc = config.model
+    vlm_cfg = config.vlm
+    vision_cfg = config.vision_encoder
+    adapter_cfg = config.adapter
+    is_vlm = config.is_vlm
     pp_enabled = config.distributed.pp > 1
     mp_policy = default_mp_policy(tc.param_dtype)
 
@@ -167,6 +171,9 @@ def main() -> None:
             config.model,
             device,
             device_mesh,
+            vision_config=vision_cfg,
+            adapter_config=adapter_cfg,
+            vlm_config=vlm_cfg,
             ac_mode=tc.activation_checkpointing,
             mp_policy=mp_policy,
             param_dtype=tc.param_dtype,
@@ -209,16 +216,16 @@ def main() -> None:
         # via metadata.json before invoking load() so the comparison
         # uses the same step the checkpoint was written at.
         vlm_freeze_expected = None
-        if mc.is_vlm:
-            assert mc.vlm is not None
+        if is_vlm:
+            assert vlm_cfg is not None
             probe_step = ckpt_mgr.peek_saved_step(str(resume_path) if resume_path else None) or 0
             # valid_modules: the set of aliases the current config knows
             # about. effective_freeze raises ValueError if any FreezeSpec
             # references an alias not in this set, catching TOML typos at
             # config-load time rather than silently no-op'ing the freeze.
-            valid_modules = set(mc.vlm.module_patterns.keys())
+            valid_modules = set(vlm_cfg.module_patterns.keys())
             vlm_freeze_expected = canonical_freeze_meta(
-                effective_freeze(probe_step, mc.vlm.freeze, mc.vlm.freeze_schedule, valid_modules)
+                effective_freeze(probe_step, vlm_cfg.freeze, vlm_cfg.freeze_schedule, valid_modules)
             )
         step, tokens_seen, ckpt_extra_loaded = ckpt_mgr.load(
             path=str(resume_path) if resume_path else None,
@@ -233,22 +240,22 @@ def main() -> None:
         # None or step == 0); a real resume of an in-flight MoT run
         # already has the MoT-shaped state in the checkpoint and skips
         # this hook.
-        if isinstance(mc.vlm, MoTConfig) and mc.vlm.mot_warm_start_from_text and step == 0:
-            source = torch.load(mc.vlm.mot_warm_start_path, map_location="cpu", weights_only=True)
+        if isinstance(vlm_cfg, MoTConfig) and vlm_cfg.mot_warm_start_from_text and step == 0:
+            source = torch.load(vlm_cfg.mot_warm_start_path, map_location="cpu", weights_only=True)
             if isinstance(source, dict) and "model" in source:
                 source = source["model"]
             mot_warm_start_from_text_stack(inner_transformer(model), source)  # type: ignore[arg-type]
             logger.info(
-                f"MoT warm-start: copied dense block weights from {mc.vlm.mot_warm_start_path}"
+                f"MoT warm-start: copied dense block weights from {vlm_cfg.mot_warm_start_path}"
             )
         # Apply effective freeze at the resumed step so requires_grad
         # reflects the post-transition state of any stages with
         # start_step <= loaded_step. Build-time apply only handles
         # the base freeze list.
-        if mc.vlm is not None and mc.vlm.freeze_schedule:
-            valid_modules = set(mc.vlm.module_patterns.keys())
-            specs = effective_freeze(step, mc.vlm.freeze, mc.vlm.freeze_schedule, valid_modules)
-            apply_freeze_specs(model, specs, mc.vlm.module_patterns)
+        if vlm_cfg is not None and vlm_cfg.freeze_schedule:
+            valid_modules = set(vlm_cfg.module_patterns.keys())
+            specs = effective_freeze(step, vlm_cfg.freeze, vlm_cfg.freeze_schedule, valid_modules)
+            apply_freeze_specs(model, specs, vlm_cfg.module_patterns)
             logger.info(f"Resumed at step={step}; applied effective freeze ({len(specs)} specs)")
 
     # --- Metrics ---
@@ -279,7 +286,7 @@ def main() -> None:
 
             eos_token_id = _AT.from_pretrained(config.data.tokenizer_path).eos_token_id
 
-    if mc.is_vlm:
+    if is_vlm:
         # --- VLM (Joint-Decoder) data path ---
         # Mixing VLM + text-only datasets in one run is out of scope on this
         # branch. DatasetSource doesn't describe image sources yet; follow-up.
@@ -289,14 +296,14 @@ def main() -> None:
 
         from kempnerforge.data.vlm_dataset import HuggingFaceVLMDataset, VLMCollator
 
-        assert mc.vlm is not None  # narrowed by is_vlm
+        assert vlm_cfg is not None  # narrowed by is_vlm
         dataset = HuggingFaceVLMDataset(
             dataset_name=config.data.hf_dataset_name,
             split=config.data.hf_dataset_split,
             image_field=config.data.hf_dataset_image_field,
             text_field=config.data.hf_dataset_text_field,
             tokenizer_path=config.data.tokenizer_path,
-            max_text_len=mc.vlm.max_text_len,
+            max_text_len=vlm_cfg.max_text_len,
             prompt_field=config.data.hf_dataset_prompt_field or None,
             image_size=config.data.hf_image_size,
             dataset_config=config.data.hf_dataset_config,
@@ -310,7 +317,7 @@ def main() -> None:
         _pad_id = _tok.pad_token_id
         if _pad_id is None:
             _pad_id = _tok.eos_token_id if _tok.eos_token_id is not None else 0
-        collator = VLMCollator(pad_id=int(_pad_id), max_text_len=mc.vlm.max_text_len)
+        collator = VLMCollator(pad_id=int(_pad_id), max_text_len=vlm_cfg.max_text_len)
         sampler = DistributedSampler(
             dataset, num_replicas=dp_size, rank=dp_rank, shuffle=True, seed=tc.seed
         )
@@ -486,7 +493,7 @@ def main() -> None:
 
     eval_config = config.eval
     eval_dataloader = None
-    _build_eval, _warn_vlm_eval = should_build_eval_dataloader(eval_config.enabled, mc.is_vlm)
+    _build_eval, _warn_vlm_eval = should_build_eval_dataloader(eval_config.enabled, is_vlm)
     if _warn_vlm_eval:
         logger.warning(
             "eval.enabled=true is ignored for VLM configs on this branch. "
@@ -684,7 +691,7 @@ def main() -> None:
             avg_loss = loss_tensor[0].item()
             grad_norm_val = loss_tensor[1].item()
 
-        elif mc.is_vlm:
+        elif is_vlm:
             # --- VLM training step (no PP, VLM Joint-Decoder) ---
             total_loss = 0.0
             total_text_tokens = 0
@@ -827,12 +834,12 @@ def main() -> None:
         # before we flip requires_grad. Otherwise a save started at
         # step S-1 could write metadata after the transition, attaching
         # the post-transition spec to pre-transition shards.
-        if mc.is_vlm and mc.vlm is not None and mc.vlm.freeze_schedule:
-            pending_stages = [s for s in mc.vlm.freeze_schedule if s.start_step == step]
+        if is_vlm and vlm_cfg is not None and vlm_cfg.freeze_schedule:
+            pending_stages = [s for s in vlm_cfg.freeze_schedule if s.start_step == step]
             if pending_stages:
                 ckpt_mgr.flush_pending_save()
                 for stage in pending_stages:
-                    flipped = apply_freeze_specs(model, stage.specs, mc.vlm.module_patterns)
+                    flipped = apply_freeze_specs(model, stage.specs, vlm_cfg.module_patterns)
                     logger.info(f"FreezeStage at step={step}: applied {flipped}")
 
         # Phase transition check
@@ -893,7 +900,7 @@ def main() -> None:
         # still reports sequence positions processed. The counter is DP-local
         # on each rank, so all-reduce it to the global text-token count
         # before logging.
-        if mc.is_vlm and step_metrics is not None:
+        if is_vlm and step_metrics is not None:
             global_text_tokens = total_text_tokens
             if dist.is_initialized():
                 _t = torch.tensor([total_text_tokens], device=device, dtype=torch.long)
@@ -947,14 +954,14 @@ def main() -> None:
         ckpt_extra: dict = {"phase_idx": current_phase_idx} if active_phases else {}
         if config.metrics.wandb_run_id:
             ckpt_extra["wandb_run_id"] = config.metrics.wandb_run_id
-        if mc.is_vlm:
-            assert mc.vlm is not None
+        if is_vlm:
+            assert vlm_cfg is not None
             # Use effective_freeze so the saved metadata reflects the
             # post-transition state when a FreezeStage has fired.
             # valid_modules pins typo-catching at save time too.
-            valid_modules = set(mc.vlm.module_patterns.keys())
+            valid_modules = set(vlm_cfg.module_patterns.keys())
             ckpt_extra["vlm_freeze"] = canonical_freeze_meta(
-                effective_freeze(step, mc.vlm.freeze, mc.vlm.freeze_schedule, valid_modules)
+                effective_freeze(step, vlm_cfg.freeze, vlm_cfg.freeze_schedule, valid_modules)
             )
         if step % config.checkpoint.interval == 0:
             ckpt_mgr.save(

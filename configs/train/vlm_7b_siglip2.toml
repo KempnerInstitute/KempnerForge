@@ -34,13 +34,15 @@ max_seq_len = 2304     # 256 image + 2048 text
 rope_theta = 500000.0
 tie_embeddings = false
 
-[model.vlm]
-arch = "joint_decoder"
-vision_encoder = "siglip2"
-vision_encoder_path = "google/siglip2-base-patch16-224"
+[vision_encoder]
+type = "siglip2"
+path = "google/siglip2-base-patch16-224"
 # feature_dim and num_tokens default to 0 = infer from the encoder at
 # build time. For siglip2-base-patch16-224 the encoder probes
 # feature_dim=768 and num_tokens=196 (14x14 patches, no CLS).
+
+[vlm]
+arch = "joint_decoder"
 max_text_len = 2048
 
 [train]
