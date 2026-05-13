@@ -25,9 +25,10 @@
 # Usage:
 #   uv run torchrun --nproc_per_node=4 scripts/train.py configs/train/vlm_7b_mot.toml
 #
-# The default hf_dataset_name below points at the public Karpathy COCO
-# split for parity with vlm_7b.toml; if that name is unreachable, point
-# at any local HF Dataset directory (saved via datasets.save_to_disk):
+# Default points at a 30-sample COCO val substitute (sayakpaul/coco-30-val-2014)
+# so a fresh clone runs without external setup. For real training, override
+# either via the Hub or a local HF Dataset directory saved with
+# datasets.save_to_disk:
 #   --data.hf_dataset_name=/path/to/local/hf_dataset \
 #   --data.hf_dataset_text_field=caption
 # Swap the encoder via [model.vlm].vision_encoder = "siglip2" / "clip".
@@ -76,7 +77,7 @@ warmup_steps = 5
 min_lr_ratio = 0.1
 
 [data]
-hf_dataset_name = "nlphuji/coco_karpathy"
+hf_dataset_name = "sayakpaul/coco-30-val-2014"
 hf_dataset_split = "train"
 hf_dataset_image_field = "image"
 hf_dataset_text_field = "caption"

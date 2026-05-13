@@ -12,8 +12,9 @@
 # Usage:
 #   uv run torchrun --nproc_per_node=4 scripts/train.py configs/train/vlm_7b.toml
 #
-# Defaults point at the public COCO Karpathy split on HF Hub. Override
-# the dataset and tokenizer via CLI for other corpora:
+# Default points at a 30-sample COCO val substitute (sayakpaul/coco-30-val-2014)
+# so a fresh clone runs without external setup. For real training, override
+# the dataset (and tokenizer) via CLI:
 #   --data.hf_dataset_name=<dataset> --data.tokenizer_path=<tokenizer>
 #
 # Swap the vision encoder via [model.vlm].vision_encoder: "random"
@@ -64,7 +65,7 @@ warmup_steps = 3
 min_lr_ratio = 0.1
 
 [data]
-hf_dataset_name = "nlphuji/coco_karpathy"
+hf_dataset_name = "sayakpaul/coco-30-val-2014"
 hf_dataset_split = "train"
 hf_dataset_image_field = "image"
 hf_dataset_text_field = "caption"
