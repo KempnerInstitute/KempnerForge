@@ -10,12 +10,14 @@ from unittest.mock import MagicMock, patch
 import torch
 import torch.distributed as dist
 
+import kempnerforge.metrics.logger as log_mod
 import kempnerforge.metrics.tracker as tracker_mod
 from kempnerforge.config.schema import JobConfig, MetricsConfig, ModelConfig
 from kempnerforge.metrics.logger import (
     _format_number,
     _RankFilter,
     _RankFormatter,
+    _supports_color,
     format_metrics,
     get_logger,
 )
@@ -394,6 +396,37 @@ class TestRankLogger:
         assert "[rank 5]" in output
         assert "INFO" in output
         assert "hello world" in output
+
+    def test_supports_color_no_color_env(self, monkeypatch):
+        """NO_COLOR=1 disables color output regardless of TTY status."""
+        monkeypatch.setenv("NO_COLOR", "1")
+        assert _supports_color() is False
+
+    def test_supports_color_no_isatty(self, monkeypatch):
+        """A stdout object without isatty disables color output.
+
+        io.StringIO HAS isatty (returns False) so cannot be used here;
+        use a custom stub that simply lacks the attribute.
+        """
+
+        class _NoIsattyStdout:
+            def write(self, s):
+                pass
+
+            def flush(self):
+                pass
+
+        monkeypatch.setattr(sys, "stdout", _NoIsattyStdout())
+        assert _supports_color() is False
+
+    def test_rank_formatter_with_color(self, monkeypatch):
+        """When use_color=True and _supports_color()=True, output includes ANSI."""
+        monkeypatch.setattr(log_mod, "_supports_color", lambda: True)
+        monkeypatch.setenv("RANK", "0")
+        fmt = _RankFormatter(use_color=True)
+        record = logging.LogRecord("test", logging.INFO, "", 0, "hello", (), None)
+        output = fmt.format(record)
+        assert "\x1b[" in output
 
 
 # ---------------------------------------------------------------------------
