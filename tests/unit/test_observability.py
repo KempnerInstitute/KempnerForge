@@ -428,6 +428,26 @@ class TestRankLogger:
         output = fmt.format(record)
         assert "\x1b[" in output
 
+    def test_configure_root_no_rank_filter(self, monkeypatch):
+        """When rank_zero_only=False, _configure_root attaches no _RankFilter.
+
+        _configure_root has a module-level _configured idempotency guard; any
+        earlier get_logger() call will have set it to True. We reset it via
+        monkeypatch so the function body actually runs.
+        """
+        monkeypatch.setattr(log_mod, "_configured", False)
+        root = logging.getLogger("kempnerforge")
+        orig_handlers = list(root.handlers)
+        try:
+            root.handlers.clear()
+            log_mod._configure_root(rank_zero_only=False)
+            for h in root.handlers:
+                rank_filters = [f for f in h.filters if isinstance(f, log_mod._RankFilter)]
+                assert rank_filters == []
+        finally:
+            root.handlers.clear()
+            root.handlers.extend(orig_handlers)
+
 
 # ---------------------------------------------------------------------------
 # Format metrics
