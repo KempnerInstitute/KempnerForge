@@ -243,6 +243,12 @@ class TestDeviceMemoryMonitor:
         monitor.report(step=3)
         assert monitor._snapshot_taken
 
+    def test_capture_snapshot_cpu_only(self, monkeypatch):
+        """Without CUDA, capture_snapshot returns None immediately."""
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+        monitor = DeviceMemoryMonitor()
+        assert monitor.capture_snapshot(step=10) is None
+
 
 class TestMemoryHelpers:
     def test_get_memory_stats_cpu_only(self, monkeypatch):
