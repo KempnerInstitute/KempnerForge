@@ -149,6 +149,14 @@ class TestMetricsTracker:
         assert step == 1
         assert "train/loss" in metrics_dict
 
+    def test_log_eval_dispatches_to_backends(self):
+        """log_eval must forward the metrics dict verbatim to every backend."""
+        tracker = self._make_tracker()
+        fake = _FakeBackend()
+        tracker._backends.append(fake)
+        tracker.log_eval({"eval/loss": 2.3}, step=10)
+        assert fake.log_calls == [({"eval/loss": 2.3}, 10)]
+
 
 class _FakeBackend:
     """Recording backend used by tracker dispatch tests."""
