@@ -7,6 +7,7 @@ import os
 from unittest.mock import MagicMock, patch
 
 import torch
+import torch.distributed as dist
 
 import kempnerforge.metrics.tracker as tracker_mod
 from kempnerforge.config.schema import JobConfig, MetricsConfig, ModelConfig
@@ -110,6 +111,18 @@ class TestMetricsTracker:
         tracker = MetricsTracker(config, num_gpus=1)
         tracker.init_backends(config)
         assert len(tracker._backends) == 1
+
+    def test_init_backends_skips_non_rank_zero(self, monkeypatch):
+        """Non-rank-0 ranks must not initialize backends even if enabled."""
+        monkeypatch.setattr(dist, "is_initialized", lambda: True)
+        monkeypatch.setattr(dist, "get_rank", lambda: 1)
+        config = JobConfig(
+            model=ModelConfig(dim=128, n_layers=2, n_heads=2, vocab_size=256),
+            metrics=MetricsConfig(enable_wandb=True),
+        )
+        tracker = MetricsTracker(config, num_gpus=1)
+        tracker.init_backends(config)
+        assert tracker._backends == []
 
 
 # ---------------------------------------------------------------------------
