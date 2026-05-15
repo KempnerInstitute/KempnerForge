@@ -19,7 +19,7 @@ from kempnerforge.metrics.logger import (
     format_metrics,
     get_logger,
 )
-from kempnerforge.metrics.memory import DeviceMemoryMonitor, get_memory_stats
+from kempnerforge.metrics.memory import DeviceMemoryMonitor, get_memory_stats, get_memory_utilization
 from kempnerforge.metrics.tracker import (
     MetricsTracker,
     StepMetrics,
@@ -250,6 +250,14 @@ class TestMemoryHelpers:
             "reserved_gb": 0,
             "total_gb": 0,
         }
+
+    def test_get_memory_utilization_zero_total(self, monkeypatch):
+        """When total_gb == 0 (no GPU), utilization is 0.0 to avoid div-by-zero."""
+        monkeypatch.setattr(
+            "kempnerforge.metrics.memory.get_memory_stats",
+            lambda d=0: {"allocated_gb": 0, "peak_gb": 5, "reserved_gb": 0, "total_gb": 0},
+        )
+        assert get_memory_utilization() == 0.0
 
 
 # ---------------------------------------------------------------------------
