@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -257,6 +258,13 @@ class TestWandBBackend:
         backend.log({"test": 1.0}, step=1)
         # Either initialized or set to False sentinel
         assert backend._run is not None
+
+    def test_wandb_handles_import_error(self, monkeypatch):
+        """ImportError inside _ensure_init flips _run to the False sentinel."""
+        monkeypatch.setitem(sys.modules, "wandb", None)
+        backend = WandBBackend(MetricsConfig(enable_wandb=True))
+        backend.log({"loss": 1.0}, step=1)
+        assert backend._run is False
 
 
 class TestTensorBoardBackend:
