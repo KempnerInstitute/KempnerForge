@@ -116,6 +116,11 @@ class TestMFU:
         flops_long = estimate_model_flops_per_token(config, seq_len=256)
         assert flops_long > flops_short
 
+    def test_gpu_peak_tflops_cpu_only(self, monkeypatch):
+        """Without CUDA, get_gpu_peak_tflops returns the 1.0 dummy."""
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+        assert get_gpu_peak_tflops() == 1.0
+
 
 # ---------------------------------------------------------------------------
 # Memory tracking
