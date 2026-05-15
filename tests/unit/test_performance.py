@@ -121,6 +121,27 @@ class TestMFU:
         monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
         assert get_gpu_peak_tflops() == 1.0
 
+    def test_gpu_peak_tflops_unknown_hopper(self, monkeypatch):
+        """Unknown GPU with compute capability >= 9 falls back to 989 TFLOPS."""
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(torch.cuda, "get_device_name", lambda d=0: "Fake-Unknown-GPU-9000")
+        monkeypatch.setattr(torch.cuda, "get_device_capability", lambda d=0: (9, 0))
+        assert get_gpu_peak_tflops() == 989.0
+
+    def test_gpu_peak_tflops_unknown_ampere(self, monkeypatch):
+        """Unknown GPU with compute capability 8.x falls back to 312 TFLOPS."""
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(torch.cuda, "get_device_name", lambda d=0: "Fake-Unknown-GPU-9000")
+        monkeypatch.setattr(torch.cuda, "get_device_capability", lambda d=0: (8, 0))
+        assert get_gpu_peak_tflops() == 312.0
+
+    def test_gpu_peak_tflops_unknown_older(self, monkeypatch):
+        """Unknown GPU with compute capability < 8 falls back to 100 TFLOPS."""
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(torch.cuda, "get_device_name", lambda d=0: "Fake-Unknown-GPU-9000")
+        monkeypatch.setattr(torch.cuda, "get_device_capability", lambda d=0: (7, 5))
+        assert get_gpu_peak_tflops() == 100.0
+
 
 # ---------------------------------------------------------------------------
 # Memory tracking
