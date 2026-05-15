@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import logging
 import os
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 
+import kempnerforge.metrics.tracker as tracker_mod
 from kempnerforge.config.schema import JobConfig, MetricsConfig, ModelConfig
 from kempnerforge.metrics.logger import (
     _format_number,
@@ -87,6 +88,17 @@ class TestMetricsTracker:
     def test_close_without_backends(self):
         tracker = self._make_tracker()
         tracker.close()  # Should not raise
+
+    def test_init_backends_rank_zero_appends_wandb(self, monkeypatch):
+        """When rank-0 and enable_wandb=True, init_backends appends a WandBBackend."""
+        monkeypatch.setattr(tracker_mod, "WandBBackend", MagicMock(name="FakeWandB"))
+        config = JobConfig(
+            model=ModelConfig(dim=128, n_layers=2, n_heads=2, vocab_size=256),
+            metrics=MetricsConfig(enable_wandb=True),
+        )
+        tracker = MetricsTracker(config, num_gpus=1)
+        tracker.init_backends(config)
+        assert len(tracker._backends) == 1
 
 
 # ---------------------------------------------------------------------------
