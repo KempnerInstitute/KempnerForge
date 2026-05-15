@@ -124,6 +124,19 @@ class TestMetricsTracker:
         tracker.init_backends(config)
         assert tracker._backends == []
 
+    def test_init_backends_idempotent(self, monkeypatch):
+        """Calling init_backends twice must not double-append backends."""
+        fake = MagicMock(name="FakeWandB")
+        monkeypatch.setattr(tracker_mod, "WandBBackend", fake)
+        config = JobConfig(
+            model=ModelConfig(dim=128, n_layers=2, n_heads=2, vocab_size=256),
+            metrics=MetricsConfig(enable_wandb=True),
+        )
+        tracker = MetricsTracker(config, num_gpus=1)
+        tracker.init_backends(config)
+        tracker.init_backends(config)  # second call is a no-op
+        assert fake.call_count == 1
+
 
 # ---------------------------------------------------------------------------
 # StepMetrics
