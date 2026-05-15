@@ -266,6 +266,18 @@ class TestWandBBackend:
         backend.log({"loss": 1.0}, step=1)
         assert backend._run is False
 
+    def test_wandb_handles_init_exception(self, monkeypatch):
+        """Non-ImportError exception from wandb.init() also flips _run = False."""
+        import wandb
+
+        def _boom(**kwargs):
+            raise RuntimeError("simulated auth failure")
+
+        monkeypatch.setattr(wandb, "init", _boom)
+        backend = WandBBackend(MetricsConfig(enable_wandb=True))
+        backend.log({"loss": 1.0}, step=1)
+        assert backend._run is False
+
 
 class TestTensorBoardBackend:
     def test_init_no_crash(self):
