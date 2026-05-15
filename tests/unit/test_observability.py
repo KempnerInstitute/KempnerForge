@@ -100,6 +100,17 @@ class TestMetricsTracker:
         tracker.init_backends(config)
         assert len(tracker._backends) == 1
 
+    def test_init_backends_rank_zero_appends_tensorboard(self, monkeypatch):
+        """When rank-0 and enable_tensorboard=True, init_backends appends a TBBackend."""
+        monkeypatch.setattr(tracker_mod, "TensorBoardBackend", MagicMock(name="FakeTB"))
+        config = JobConfig(
+            model=ModelConfig(dim=128, n_layers=2, n_heads=2, vocab_size=256),
+            metrics=MetricsConfig(enable_tensorboard=True),
+        )
+        tracker = MetricsTracker(config, num_gpus=1)
+        tracker.init_backends(config)
+        assert len(tracker._backends) == 1
+
 
 # ---------------------------------------------------------------------------
 # StepMetrics
