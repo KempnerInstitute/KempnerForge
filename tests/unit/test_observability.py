@@ -23,6 +23,7 @@ from kempnerforge.metrics.memory import (
     DeviceMemoryMonitor,
     get_memory_stats,
     get_memory_utilization,
+    reset_peak_memory,
 )
 from kempnerforge.metrics.tracker import (
     MetricsTracker,
@@ -280,6 +281,11 @@ class TestMemoryHelpers:
             lambda d=0: {"allocated_gb": 0, "peak_gb": 5, "reserved_gb": 0, "total_gb": 0},
         )
         assert get_memory_utilization() == 0.0
+
+    def test_reset_peak_memory_cpu_only(self, monkeypatch):
+        """Without CUDA, reset_peak_memory is a no-op (must not raise)."""
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+        reset_peak_memory(device=0)  # Should not raise
 
 
 # ---------------------------------------------------------------------------
