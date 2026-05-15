@@ -157,6 +157,14 @@ class TestMetricsTracker:
         tracker.log_eval({"eval/loss": 2.3}, step=10)
         assert fake.log_calls == [({"eval/loss": 2.3}, 10)]
 
+    def test_close_with_backends(self):
+        """tracker.close() must call close() on every registered backend."""
+        tracker = self._make_tracker()
+        fake = _FakeBackend()
+        tracker._backends.append(fake)
+        tracker.close()
+        assert fake.close_calls == 1
+
 
 class _FakeBackend:
     """Recording backend used by tracker dispatch tests."""
