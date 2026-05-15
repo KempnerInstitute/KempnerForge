@@ -452,3 +452,11 @@ class TestFormatMetrics:
     def test_format_number_regular_float(self):
         result = _format_number(2.34)
         assert "2.34" in result
+
+    def test_format_number_small_int(self):
+        """Integers below 1000 return as plain str without unit suffix."""
+        assert _format_number(42) == "42"
+
+    def test_format_number_non_numeric_fallback(self):
+        """Defensive final return: non-numeric input passes through as str(val)."""
+        assert _format_number("foo") == "foo"
