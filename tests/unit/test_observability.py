@@ -293,6 +293,13 @@ class TestTensorBoardBackend:
         assert backend._writer is not None
         backend.close()
 
+    def test_tb_handles_import_error(self, monkeypatch):
+        """ImportError inside _ensure_init flips _writer to the False sentinel."""
+        monkeypatch.setitem(sys.modules, "torch.utils.tensorboard", None)
+        backend = TensorBoardBackend(MetricsConfig(enable_tensorboard=True))
+        backend.log({"loss": 1.0}, step=1)
+        assert backend._writer is False
+
 
 # ---------------------------------------------------------------------------
 # Format helpers
