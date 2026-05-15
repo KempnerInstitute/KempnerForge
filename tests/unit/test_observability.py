@@ -19,13 +19,7 @@ from kempnerforge.metrics.logger import (
     format_metrics,
     get_logger,
 )
-import kempnerforge.metrics.memory as mem_mod
-from kempnerforge.metrics.memory import (
-    DeviceMemoryMonitor,
-    get_memory_stats,
-    get_memory_utilization,
-    reset_peak_memory,
-)
+from kempnerforge.metrics.memory import DeviceMemoryMonitor, get_memory_stats
 from kempnerforge.metrics.tracker import (
     MetricsTracker,
     StepMetrics,
