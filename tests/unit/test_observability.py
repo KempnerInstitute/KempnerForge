@@ -249,6 +249,18 @@ class TestDeviceMemoryMonitor:
         monitor = DeviceMemoryMonitor()
         assert monitor.capture_snapshot(step=10) is None
 
+    def test_capture_snapshot_handles_exception(self, monkeypatch, tmp_path):
+        """Any exception inside capture_snapshot is swallowed; returns None."""
+        # Bypass the CPU-only early return so the try-block runs.
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("simulated _record_memory_history failure")
+
+        monkeypatch.setattr(torch.cuda.memory, "_record_memory_history", _boom)
+        monitor = DeviceMemoryMonitor(snapshot_dir=str(tmp_path))
+        assert monitor.capture_snapshot(step=1) is None
+
 
 class TestMemoryHelpers:
     def test_get_memory_stats_cpu_only(self, monkeypatch):
