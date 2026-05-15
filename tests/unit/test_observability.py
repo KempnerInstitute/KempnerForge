@@ -19,7 +19,13 @@ from kempnerforge.metrics.logger import (
     format_metrics,
     get_logger,
 )
-from kempnerforge.metrics.memory import DeviceMemoryMonitor
+import kempnerforge.metrics.memory as mem_mod
+from kempnerforge.metrics.memory import (
+    DeviceMemoryMonitor,
+    get_memory_stats,
+    get_memory_utilization,
+    reset_peak_memory,
+)
 from kempnerforge.metrics.tracker import (
     MetricsTracker,
     StepMetrics,
@@ -238,6 +244,18 @@ class TestDeviceMemoryMonitor:
         # Second report at same step should not re-snapshot
         monitor.report(step=3)
         assert monitor._snapshot_taken
+
+
+class TestMemoryHelpers:
+    def test_get_memory_stats_cpu_only(self, monkeypatch):
+        """Without CUDA, get_memory_stats returns all-zero values."""
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+        assert get_memory_stats() == {
+            "allocated_gb": 0,
+            "peak_gb": 0,
+            "reserved_gb": 0,
+            "total_gb": 0,
+        }
 
 
 # ---------------------------------------------------------------------------
