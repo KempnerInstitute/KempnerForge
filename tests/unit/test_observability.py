@@ -137,6 +137,32 @@ class TestMetricsTracker:
         tracker.init_backends(config)  # second call is a no-op
         assert fake.call_count == 1
 
+    def test_end_step_dispatches_to_backend(self):
+        """end_step must forward the metrics dict to every registered backend."""
+        tracker = self._make_tracker(log_interval=1)
+        fake = _FakeBackend()
+        tracker._backends.append(fake)
+        tracker.start_step()
+        tracker.end_step(step=1, loss=2.5, grad_norm=1.0, lr=3e-4, tokens_in_step=1024)
+        assert len(fake.log_calls) == 1
+        metrics_dict, step = fake.log_calls[0]
+        assert step == 1
+        assert "train/loss" in metrics_dict
+
+
+class _FakeBackend:
+    """Recording backend used by tracker dispatch tests."""
+
+    def __init__(self) -> None:
+        self.log_calls: list[tuple[dict, int]] = []
+        self.close_calls = 0
+
+    def log(self, metrics: dict, step: int) -> None:
+        self.log_calls.append((metrics, step))
+
+    def close(self) -> None:
+        self.close_calls += 1
+
 
 # ---------------------------------------------------------------------------
 # StepMetrics
