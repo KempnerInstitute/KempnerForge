@@ -188,7 +188,8 @@ class TestCheckpointRoundtrip:
         """Save a VLM checkpoint, load it in a fresh manager, and verify
         the canonical vlm_freeze metadata is present in metadata.json."""
         mesh = distributed_env
-        wrapper = _build(_tiny_cfg(), mesh)
+        cfg_tuple = _tiny_cfg()
+        wrapper = _build(cfg_tuple, mesh)
         opt = build_optimizer(wrapper, OptimizerConfig(lr=1e-3, fused=False))
 
         # Per-rank tmp path picked from rank 0 and broadcast so all ranks
@@ -205,7 +206,8 @@ class TestCheckpointRoundtrip:
 
         cfg = CheckpointConfig(dir=str(path_str), interval=1)
         mgr = CheckpointManager(cfg, wrapper, opt)
-        freeze = canonical_freeze_meta(_tiny_cfg().vlm.freeze)  # type: ignore[union-attr]
+        # _tiny_cfg returns (ModelConfig, VisionEncoderConfig, AdapterConfig, VLMConfig)
+        freeze = canonical_freeze_meta(cfg_tuple[3].freeze)
         mgr.save(step=1, extra={"vlm_freeze": freeze})
 
         # Let rank 0 finish writing metadata.json before rank 1 reads it.
