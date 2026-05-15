@@ -334,13 +334,15 @@ class TestMoEWithMoT:
         from kempnerforge.model.moe import MoEMLP
 
         torch.manual_seed(42 + dist.get_rank())
-        mc = _tiny_mot_cfg(moe=True, n_layers=4, num_image_tokens=4)
+        # _tiny_mot_cfg returns (ModelConfig, VisionEncoderConfig, AdapterConfig, MoTConfig);
+        # destructure to mutate the ModelConfig in place before passing the tuple to _build.
+        mc, vc, ac, lc = _tiny_mot_cfg(moe=True, n_layers=4, num_image_tokens=4)
         # Bump the dim/ffn so MoE is meaningful.
         mc.dim = 128
         mc.n_heads = 4
         mc.n_kv_heads = 4
         mc.ffn_hidden_dim = 256
-        wrapper = _build(mc, distributed_env, param_dtype=torch.float32)
+        wrapper = _build((mc, vc, ac, lc), distributed_env, param_dtype=torch.float32)
         # 4 layers, frequency=2 -> layers 1, 3 have MoE per modality.
         moe_blocks = sum(
             1
