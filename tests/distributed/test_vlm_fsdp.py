@@ -184,28 +184,24 @@ class TestInnerTransformerUnderCompileAndFsdp:
 
 
 class TestCheckpointRoundtrip:
-    def test_save_load_freeze_metadata(self, distributed_env, tmp_path_factory):
+    def test_save_load_freeze_metadata(self, distributed_env, shared_tmp_dir):
         """Save a VLM checkpoint, load it in a fresh manager, and verify
         the canonical vlm_freeze metadata is present in metadata.json."""
         mesh = distributed_env
-        wrapper = _build(_tiny_cfg(), mesh)
+        cfg_tuple = _tiny_cfg()
+        wrapper = _build(cfg_tuple, mesh)
         opt = build_optimizer(wrapper, OptimizerConfig(lr=1e-3, fused=False))
 
-        # Per-rank tmp path picked from rank 0 and broadcast so all ranks
-        # agree on the same base directory.
+        # shared_tmp_dir is on the shared filesystem and identical on every
+        # rank, so DCP shards from rank 0 are visible to rank 1 even under
+        # multi-node srun.
+        path_str = shared_tmp_dir
         rank = dist.get_rank()
-        if rank == 0:
-            base = tmp_path_factory.mktemp("vlm_ckpt")
-            path_str = str(base)
-        else:
-            path_str = ""
-        objs: list[object] = [path_str]
-        dist.broadcast_object_list(objs, src=0)
-        path_str = objs[0]  # type: ignore[assignment]
 
         cfg = CheckpointConfig(dir=str(path_str), interval=1)
         mgr = CheckpointManager(cfg, wrapper, opt)
-        freeze = canonical_freeze_meta(_tiny_cfg().vlm.freeze)  # type: ignore[union-attr]
+        # _tiny_cfg returns (ModelConfig, VisionEncoderConfig, AdapterConfig, VLMConfig)
+        freeze = canonical_freeze_meta(cfg_tuple[3].freeze)
         mgr.save(step=1, extra={"vlm_freeze": freeze})
 
         # Let rank 0 finish writing metadata.json before rank 1 reads it.

@@ -24,6 +24,7 @@ Mirrors ``tests/distributed/test_vlm_cross_attn_fsdp.py`` for the MoT arch:
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import pytest
 import torch
@@ -266,7 +267,7 @@ class TestDeterminism:
 
 
 class TestWarmStartUnderFsdp:
-    def test_warm_start_from_jd_under_fsdp(self, distributed_env, tmp_path_factory):
+    def test_warm_start_from_jd_under_fsdp(self, distributed_env, shared_tmp_dir):
         """JD checkpoint -> torch.save -> mot_warm_start_from_text_stack
         on an FSDP2-wrapped MoT model. Per-modality copies become bit-equal
         to the source dense block weights after the helper runs.
@@ -298,16 +299,10 @@ class TestWarmStartUnderFsdp:
             t = v.full_tensor() if hasattr(v, "full_tensor") else v
             jd_state_cpu[k] = t.detach().cpu()
 
+        ckpt_path = str(Path(shared_tmp_dir) / "jd.pt")
         if rank == 0:
-            base = tmp_path_factory.mktemp("jd_warm_start_src")
-            ckpt_path = str(base / "jd.pt")
             torch.save(jd_state_cpu, ckpt_path)
-        else:
-            ckpt_path = ""
-        objs: list[object] = [ckpt_path]
-        dist.broadcast_object_list(objs, src=0)
-        ckpt_path = objs[0]  # type: ignore[assignment]
-        dist.barrier()
+        dist.barrier()  # rank 1 must wait for rank 0's torch.save to complete
 
         # Build a MoT model under FSDP and run the warm-start helper.
         mot_cfg = _tiny_mot_cfg(num_image_tokens=8, n_layers=2)
@@ -334,13 +329,15 @@ class TestMoEWithMoT:
         from kempnerforge.model.moe import MoEMLP
 
         torch.manual_seed(42 + dist.get_rank())
-        mc = _tiny_mot_cfg(moe=True, n_layers=4, num_image_tokens=4)
+        # _tiny_mot_cfg returns (ModelConfig, VisionEncoderConfig, AdapterConfig, MoTConfig);
+        # destructure to mutate the ModelConfig in place before passing the tuple to _build.
+        mc, vc, ac, lc = _tiny_mot_cfg(moe=True, n_layers=4, num_image_tokens=4)
         # Bump the dim/ffn so MoE is meaningful.
         mc.dim = 128
         mc.n_heads = 4
         mc.n_kv_heads = 4
         mc.ffn_hidden_dim = 256
-        wrapper = _build(mc, distributed_env, param_dtype=torch.float32)
+        wrapper = _build((mc, vc, ac, lc), distributed_env, param_dtype=torch.float32)
         # 4 layers, frequency=2 -> layers 1, 3 have MoE per modality.
         moe_blocks = sum(
             1
@@ -376,7 +373,7 @@ class TestMoEWithMoT:
 
 
 class TestCheckpointRoundtrip:
-    def test_save_load_freeze_metadata_mot(self, distributed_env, tmp_path_factory):
+    def test_save_load_freeze_metadata_mot(self, distributed_env, shared_tmp_dir):
         """Save a MoT VLM checkpoint, load it in a fresh manager, and
         verify metadata.json carries the canonical vlm_freeze and DCP
         shards round-trip the per-modality block params.
@@ -386,15 +383,10 @@ class TestCheckpointRoundtrip:
         wrapper = _build(cfg, mesh)
         opt = build_optimizer(wrapper, OptimizerConfig(lr=1e-3, fused=False))
 
+        # shared_tmp_dir lives on the shared filesystem so DCP shards
+        # written by rank 0 are visible to rank 1 under multi-node srun.
+        path_str = shared_tmp_dir
         rank = dist.get_rank()
-        if rank == 0:
-            base = tmp_path_factory.mktemp("vlm_mot_ckpt")
-            path_str = str(base)
-        else:
-            path_str = ""
-        objs: list[object] = [path_str]
-        dist.broadcast_object_list(objs, src=0)
-        path_str = objs[0]  # type: ignore[assignment]
 
         ckpt_cfg = CheckpointConfig(dir=str(path_str), interval=1)
         mgr = CheckpointManager(ckpt_cfg, wrapper, opt)
