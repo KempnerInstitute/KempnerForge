@@ -959,3 +959,67 @@ class TestAsyncLatestSymlinkSafety:
         # No complete checkpoint anywhere -> fallback is None -> resolved
         # is returned unchanged (caller then surfaces the real load error).
         assert mgr._resolve_dcp_load_dir(incomplete, None) == incomplete
+
+
+# ---------------------------------------------------------------------------
+# Dedicated sync-barrier group (async-save / barrier deadlock fix)
+# ---------------------------------------------------------------------------
+
+
+class TestSyncBarrierGroup:
+    """save()'s end barrier must run on a dedicated gloo group, not the
+    default process group that DCP's async-save background thread uses.
+
+    Sharing that group across the main thread (barrier) and DCP's executor
+    thread (all_gather / reduce_scatter) interleaves two collectives on one
+    communicator and deadlocks under tight async saves.
+    """
+
+    def _mgr(self, tmp_path):
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        model = torch.nn.Linear(4, 4)
+        opt = torch.optim.SGD(model.parameters(), lr=0.1)
+        return CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model, opt)
+
+    def test_sync_group_none_when_not_distributed(self, tmp_path):
+        mgr = self._mgr(tmp_path)
+        assert mgr._sync_group is None
+
+    def test_sync_barrier_noop_when_not_distributed(self, tmp_path):
+        # Must not raise when distributed is not initialized.
+        self._mgr(tmp_path)._sync_barrier()
+
+    def test_init_creates_dedicated_gloo_group(self, tmp_path, monkeypatch):
+        import kempnerforge.checkpoint.manager as mgr_mod
+
+        calls = {}
+
+        def fake_new_group(backend=None):
+            calls["backend"] = backend
+            return "SENTINEL_GLOO_GROUP"
+
+        monkeypatch.setattr(mgr_mod.dist, "is_initialized", lambda: True)
+        monkeypatch.setattr(mgr_mod.dist, "new_group", fake_new_group)
+        monkeypatch.setattr(mgr_mod.dist, "get_rank", lambda: 0)
+
+        mgr = self._mgr(tmp_path)
+        assert calls["backend"] == "gloo"
+        assert mgr._sync_group == "SENTINEL_GLOO_GROUP"
+
+    def test_sync_barrier_uses_dedicated_group_not_default(self, tmp_path, monkeypatch):
+        import kempnerforge.checkpoint.manager as mgr_mod
+
+        barrier_calls = []
+
+        monkeypatch.setattr(mgr_mod.dist, "is_initialized", lambda: True)
+        monkeypatch.setattr(mgr_mod.dist, "new_group", lambda backend=None: "GLOO_PG")
+        monkeypatch.setattr(mgr_mod.dist, "get_rank", lambda: 0)
+        monkeypatch.setattr(mgr_mod.dist, "barrier", lambda group=None: barrier_calls.append(group))
+
+        mgr = self._mgr(tmp_path)
+        mgr._sync_barrier()
+
+        # The barrier must target the dedicated gloo group, never the
+        # default group (group=None) that DCP's async thread uses.
+        assert barrier_calls == ["GLOO_PG"]

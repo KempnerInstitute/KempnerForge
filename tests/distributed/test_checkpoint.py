@@ -242,18 +242,15 @@ class TestAsyncCheckpointLatestSafety:
     """
 
     @pytest.mark.skip(
-        reason="Blocked by a SEPARATE pre-existing bug, not the latest-symlink "
-        "fix: DCP's async-executor background thread runs collectives "
-        "(all_gather/reduce_scatter) on the default PG while save()'s end "
-        "dist.barrier() runs on the same PG from the main thread, "
-        "deadlocking under tight back-to-back async saves. Verified present "
-        "on `main` (identical _async_ckpt.save() -> dist.barrier() structure "
-        "in save()); real training spaces saves with step collectives so it "
-        "has not bitten in practice. The latest-symlink fix's async "
-        "behavior is covered by the deterministic unit tests in "
-        "tests/unit/test_checkpoint.py::TestAsyncLatestSymlinkSafety and was "
-        "validated end-to-end by a live 2-node 7B run + external probe. "
-        "Unskip once the async-collective/barrier hazard is resolved."
+        reason="Test contains internal dist.barrier() calls between async saves "
+        "that race DCP's async-executor background collective on the "
+        "default PG. The save()-end barrier deadlock is fixed by this PR "
+        "(via _sync_barrier on a dedicated gloo group), but unskipping "
+        "additionally requires rewriting this test's intra-loop barriers "
+        "to drain the async future first or use a private gloo group. "
+        "Out of scope here; the async-save behavior is covered by "
+        "TestAsyncSaveBarrierNoDeadlock and by the deterministic unit "
+        "tests in TestAsyncLatestSymlinkSafety."
     )
     def test_latest_only_resolves_to_durable_checkpoints(self, distributed_env, shared_tmp_dir):
         mesh = distributed_env
@@ -347,3 +344,45 @@ class TestAsyncCheckpointLatestSafety:
         step, tokens_seen, _ = mgr.load()
         assert step == 1, f"rank {rank}: expected fallback to step 1, got {step}"
         assert tokens_seen == 64
+
+
+class TestAsyncSaveBarrierNoDeadlock:
+    """save()'s end barrier must not deadlock against DCP's async-save
+    background collective.
+
+    ``dcp.async_save()`` runs its collective planning (all_gather /
+    reduce_scatter) on a background thread using the default process
+    group. Pre-fix, save()'s end barrier ran on that same group from the
+    main thread; two collectives interleaving on one communicator with
+    nondeterministic per-rank ordering deadlock under tightly spaced
+    async saves (no training collectives in between to separate them).
+    The fix moves the barrier onto a dedicated gloo group.
+    """
+
+    def test_back_to_back_async_saves_do_not_deadlock(self, distributed_env, shared_tmp_dir):
+        mesh = distributed_env
+        ckpt_dir = shared_tmp_dir
+        from kempnerforge.config.schema import OptimizerConfig
+
+        model = Transformer(SMALL_CONFIG).cuda()
+        apply_fsdp2(model, mesh)
+        opt = build_optimizer(model, OptimizerConfig(lr=1e-3, fused=False))
+        cfg = CheckpointConfig(
+            dir=ckpt_dir,
+            keep_last_n=3,
+            async_mode=AsyncCheckpointMode.async_pinned,
+        )
+        mgr = CheckpointManager(cfg, model, opt)
+
+        # Tight loop, no training collectives between saves: the exact
+        # pattern that deadlocks pre-fix. Reaching the asserts at all means
+        # the gloo barrier did not race the in-flight DCP collective.
+        for s in (10, 20, 30, 40):
+            mgr.save(step=s)
+        mgr.wait()
+
+        if dist.get_rank() == 0:
+            latest = Path(ckpt_dir) / "latest"
+            assert latest.exists()
+            assert latest.resolve().name == "step_40"
+        dist.barrier()
