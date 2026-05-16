@@ -23,13 +23,16 @@ import torch.distributed.checkpoint as dcp
 
 from kempnerforge.checkpoint.async_save import AsyncCheckpointer
 from kempnerforge.checkpoint.state import build_train_state, restore_train_state
-from kempnerforge.config.schema import CheckpointConfig
+from kempnerforge.config.schema import AsyncCheckpointMode, CheckpointConfig
 
 logger = logging.getLogger(__name__)
 
 # Filename for non-distributed training state within a checkpoint directory
 _TRAIN_STATE_FILE = "train_state.pt"
 _METADATA_FILE = "metadata.json"
+# DCP writes this file LAST, once all shards are durable. Its presence is the
+# authoritative signal that a checkpoint's distributed state is loadable.
+_DCP_METADATA_FILE = ".metadata"
 
 
 def _intersect_freeze_meta_by_module(
@@ -135,12 +138,53 @@ class CheckpointManager:
         # provide a dataloader object. Applied later via
         # apply_dataloader_state() once the loader is constructed.
         self._pending_dataloader_state: dict[str, Any] | None = None
+        # Async-only: a checkpoint whose DCP flush was dispatched but is not
+        # yet durable. Its `latest` symlink swap + cleanup are deferred until
+        # the flush completes (drained at the next save() or wait()), so
+        # `latest` never points at a half-written checkpoint. (step, ckpt_dir).
+        self._pending_finalize: tuple[int, Path] | None = None
 
     def _checkpoint_dir(self, step: int) -> Path:
         return self.base_dir / f"step_{step}"
 
     def _latest_link(self) -> Path:
         return self.base_dir / "latest"
+
+    def _dcp_dir(self, ckpt_dir: Path) -> Path:
+        """DCP shard directory for a checkpoint (per-stage subdir under PP)."""
+        return ckpt_dir / f"pp{self._pp_rank}" if self._pp_rank is not None else ckpt_dir
+
+    def _dcp_complete(self, ckpt_dir: Path) -> bool:
+        """True once DCP has written its `.metadata` (all shards durable)."""
+        return (self._dcp_dir(ckpt_dir) / _DCP_METADATA_FILE).exists()
+
+    def _commit_latest(self, step: int, ckpt_dir: Path) -> None:
+        """Atomically point `latest` at a now-durable checkpoint, then prune.
+
+        Rank 0 only. Called either inline (sync mode, DCP already durable) or
+        deferred (async mode, after the flush future has resolved).
+        """
+        latest = self._latest_link()
+        tmp_link = latest.with_suffix(".tmp")
+        tmp_link.unlink(missing_ok=True)
+        tmp_link.symlink_to(ckpt_dir.name)
+        tmp_link.rename(latest)
+        logger.info(f"Checkpoint committed: {ckpt_dir} (step={step})")
+        self._cleanup()
+
+    def _drain_pending_finalize(self) -> None:
+        """Commit a deferred async checkpoint once its flush is durable.
+
+        Invoked after the pending DCP future has been awaited (next save()
+        or an explicit wait()/flush). Rank 0 performs the symlink + cleanup;
+        other ranks no-op (they never touch the symlink), mirroring save().
+        """
+        if self._pending_finalize is None:
+            return
+        step, ckpt_dir = self._pending_finalize
+        self._pending_finalize = None
+        if self._rank == 0:
+            self._commit_latest(step, ckpt_dir)
 
     def save(
         self,
@@ -174,11 +218,24 @@ class CheckpointManager:
             "model": self.model.state_dict(),
             "optimizer": self.optimizer.state_dict(),
         }
+        # Dispatch the DCP save. For async modes this returns immediately but
+        # FIRST awaits the previous in-flight flush, so any deferred
+        # `_pending_finalize` from the prior save is now durable. For sync
+        # mode (disabled) dcp.save() blocks until THIS checkpoint is durable.
         self._async_ckpt.save(
             dcp_state, checkpoint_id=str(dcp_dir), process_group=self._process_group
         )
 
-        # Save non-distributed state (rank 0 only)
+        sync_mode = self.config.async_mode == AsyncCheckpointMode.disabled
+
+        # The prior async checkpoint's flush is now guaranteed durable (the
+        # dispatch above awaited it). Commit its `latest` symlink + cleanup
+        # before doing anything else.
+        self._drain_pending_finalize()
+
+        # Save non-distributed state (rank 0 only). These are small synchronous
+        # writes; they finish well before `latest` is ever pointed here, so
+        # the checkpoint dir is fully populated by commit time.
         if self._rank == 0:
             train_state = build_train_state(
                 step=step,
@@ -198,28 +255,35 @@ class CheckpointManager:
                 meta["vlm_freeze"] = extra["vlm_freeze"]
             (ckpt_dir / _METADATA_FILE).write_text(json.dumps(meta, indent=2))
 
-            # Update "latest" symlink
-            latest = self._latest_link()
-            tmp_link = latest.with_suffix(".tmp")
-            tmp_link.unlink(missing_ok=True)
-            tmp_link.symlink_to(ckpt_dir.name)
-            tmp_link.rename(latest)
-
-            logger.info(f"Checkpoint saved: {ckpt_dir} (step={step})")
-
-            # Cleanup old checkpoints
-            self._cleanup()
+        if sync_mode:
+            # DCP shards are already durable — commit immediately.
+            if self._rank == 0:
+                self._commit_latest(step, ckpt_dir)
+        else:
+            # Async flush still in flight. Defer the `latest` swap + cleanup
+            # until it is durable (drained at the next save() or wait()), so
+            # a crash mid-flush leaves `latest` on the last GOOD step rather
+            # than a half-written one whose DCP `.metadata` is absent.
+            self._pending_finalize = (step, ckpt_dir)
 
         # save() is a collective: non-rank-0 ranks must not return until
-        # rank-0 has committed train_state.pt, metadata.json, and the
-        # latest symlink. Without this barrier, post-save hooks or readers
-        # on other ranks race rank-0's writes (especially on NFS/Lustre).
+        # rank-0 has written train_state.pt + metadata.json (and, in sync
+        # mode, advanced `latest`). Without this barrier, post-save hooks or
+        # readers on other ranks race rank-0's writes (especially NFS/Lustre).
         if dist.is_initialized():
             dist.barrier()
 
     def wait(self) -> None:
-        """Block until any pending async checkpoint save completes."""
+        """Block until any pending async checkpoint save completes.
+
+        Once the flush is durable, commit its deferred `latest` symlink +
+        cleanup. The training loop calls this after the loop exits, so the
+        final checkpoint's `latest` is committed before process teardown.
+        """
         self._async_ckpt.wait()
+        self._drain_pending_finalize()
+        if dist.is_initialized():
+            dist.barrier()
 
     def flush_pending_save(self) -> None:
         """Drain any in-flight async save before mutating model state.
@@ -230,8 +294,15 @@ class CheckpointManager:
         pre-transition spec before the transition flips
         ``requires_grad``. Otherwise ``metadata.json`` lands with the
         post-transition spec attached to the pre-transition shards.
+
+        Also commits the deferred `latest` symlink for that save, so a
+        transition (or any caller draining the queue) leaves `latest`
+        pointed at the now-durable checkpoint.
         """
         self._async_ckpt.wait()
+        self._drain_pending_finalize()
+        if dist.is_initialized():
+            dist.barrier()
 
     def peek_saved_step(self, path: str | None = None) -> int | None:
         """Read ``step`` from a candidate checkpoint's metadata.json.
@@ -285,6 +356,17 @@ class CheckpointManager:
         if ckpt_dir is None:
             logger.info("No checkpoint found — starting from scratch")
             return 0, 0, {}
+
+        # When a DCP load will occur, fall back off an interrupted async
+        # flush to the newest complete checkpoint so the whole load (DCP
+        # shards, train_state.pt, metadata.json) stays consistent on one
+        # step. Skipped when DCP is fully excluded (e.g. fine-tuning that
+        # loads only train_state), where DCP durability is irrelevant.
+        will_load_dcp = (
+            exclude_keys is None or "model" not in exclude_keys or "optimizer" not in exclude_keys
+        )
+        if will_load_dcp:
+            ckpt_dir = self._resolve_dcp_load_dir(ckpt_dir, path)
 
         logger.info(f"Loading checkpoint: {ckpt_dir}")
 
@@ -425,8 +507,37 @@ class CheckpointManager:
         self._pending_dataloader_state = None
         logger.info("Applied stashed dataloader state")
 
+    def _newest_complete_checkpoint(self) -> Path | None:
+        """Newest ``step_N`` dir whose DCP shards are durable, or None.
+
+        Defense in depth: even though the Layer-1 deferral keeps `latest`
+        off half-written checkpoints, a crash mid-flush (or a checkpoint
+        dir left incomplete by older buggy code / external interference)
+        can still leave the newest dir without DCP `.metadata`. Falling
+        back to the newest COMPLETE dir keeps resume working instead of
+        hard-failing in dcp.load with "metadata is None".
+        """
+        if not self.base_dir.exists():
+            return None
+        step_dirs = sorted(
+            (d for d in self.base_dir.iterdir() if d.is_dir() and d.name.startswith("step_")),
+            key=lambda d: int(d.name.split("_")[1]),
+            reverse=True,
+        )
+        for d in step_dirs:
+            if self._dcp_complete(d):
+                return d
+        return None
+
     def _resolve_load_path(self, path: str | None = None) -> Path | None:
-        """Resolve the checkpoint path to load from."""
+        """Resolve the checkpoint path to load from.
+
+        Returns the raw resolution (explicit path, ``load_path``, or the
+        ``latest`` symlink target). The DCP-durability fallback for an
+        interrupted async flush is applied separately in ``load()``,
+        scoped to the case where DCP state is actually being loaded — so
+        it never interferes with DCP-excluded loads (e.g. fine-tuning).
+        """
         if path is not None:
             p = Path(path)
             return p if p.exists() else None
@@ -441,8 +552,39 @@ class CheckpointManager:
 
         return None
 
+    def _resolve_dcp_load_dir(self, resolved: Path, path: str | None) -> Path:
+        """Pick the dir to DCP-load from, falling back if interrupted.
+
+        ``resolved`` is the ``_resolve_load_path`` result. When it was
+        reached via auto-resume (no explicit path/``load_path``) and its
+        DCP shards are not durable — the signature of a crash during an
+        async flush — fall back to the newest complete checkpoint so
+        resume degrades to "last good step" instead of hard-failing in
+        ``dcp.load`` with "metadata is None". An explicitly requested
+        path is honored as-is (caller intent; fail loudly if broken).
+        """
+        explicit = path is not None or bool(self.config.load_path)
+        if explicit or self._dcp_complete(resolved):
+            return resolved
+        fallback = self._newest_complete_checkpoint()
+        if fallback is not None and fallback != resolved:
+            logger.warning(
+                f"`latest` -> {resolved} has no durable DCP metadata "
+                f"(likely an interrupted async flush); resuming from "
+                f"newest complete checkpoint {fallback} instead."
+            )
+            return fallback
+        return resolved
+
     def _cleanup(self) -> None:
-        """Remove old checkpoints beyond the retention limit."""
+        """Remove old checkpoints beyond the retention limit.
+
+        Two directories are never removed regardless of retention: the
+        current ``latest`` target and the in-flight async checkpoint
+        (``_pending_finalize``). Pruning either would let a crash strand
+        resume with no loadable checkpoint — the exact failure this fix
+        exists to prevent.
+        """
         keep = self.config.keep_last_n
         if keep <= 0:
             return
@@ -453,8 +595,17 @@ class CheckpointManager:
             key=lambda d: int(d.name.split("_")[1]),
         )
 
-        # Remove oldest beyond retention
+        protected: set[Path] = set()
+        latest = self._latest_link()
+        if latest.exists():
+            protected.add(latest.resolve())
+        if self._pending_finalize is not None:
+            protected.add(self._pending_finalize[1].resolve())
+
+        # Remove oldest beyond retention, but never a protected dir.
         to_remove = ckpt_dirs[:-keep] if len(ckpt_dirs) > keep else []
         for d in to_remove:
+            if d.resolve() in protected:
+                continue
             shutil.rmtree(d)
             logger.info(f"Removed old checkpoint: {d}")

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import random
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -715,3 +717,180 @@ class TestLoadVLMFreezeCompare:
             mgr2.load(path=str(tmp_path / "step_1"), vlm_freeze_expected=mismatched)
         assert "cross-arch" in str(exc_info.value)
         assert "future_arch" in str(exc_info.value)
+
+
+# ---------------------------------------------------------------------------
+# Async-checkpoint `latest` safety (regression for the symlink-before-flush bug)
+# ---------------------------------------------------------------------------
+
+
+class TestAsyncLatestSymlinkSafety:
+    """`latest` must never resolve to a checkpoint whose DCP shards are not
+    durable, and auto-resume must fall back off an interrupted async flush.
+
+    Bug: ``save()`` advanced ``latest`` (and ran ``_cleanup``) right after
+    *dispatching* the async DCP save, so a crash during the ~minute-long
+    background flush left ``latest`` pointing at a checkpoint with no DCP
+    ``.metadata`` (resume then hard-failed with "metadata is None") while
+    ``_cleanup`` may already have pruned the last good checkpoint.
+    """
+
+    @staticmethod
+    def _mgr(tmp_path, mode):
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        model = torch.nn.Linear(4, 4)
+        opt = torch.optim.SGD(model.parameters(), lr=0.1)
+        cfg = CheckpointConfig(dir=str(tmp_path), keep_last_n=2, async_mode=mode)
+        return CheckpointManager(cfg, model, opt)
+
+    @staticmethod
+    def _install_async_mock(mgr, monkeypatch):
+        """Faithfully model ``AsyncCheckpointer`` for async modes.
+
+        Real contract: ``save(new)`` first awaits the previous flush (so the
+        previous checkpoint's DCP ``.metadata`` becomes durable) then
+        dispatches the new one (no ``.metadata`` yet). ``wait()`` drains the
+        last dispatched flush to durability.
+        """
+        from unittest.mock import MagicMock
+
+        from kempnerforge.checkpoint.manager import _DCP_METADATA_FILE
+
+        st = {"prev": None}
+
+        def _save(state_dict, checkpoint_id, process_group=None):
+            if st["prev"] is not None:
+                (Path(st["prev"]) / _DCP_METADATA_FILE).write_text("ok")
+            st["prev"] = checkpoint_id
+
+        def _wait():
+            if st["prev"] is not None:
+                (Path(st["prev"]) / _DCP_METADATA_FILE).write_text("ok")
+
+        monkeypatch.setattr(mgr._async_ckpt, "save", _save)
+        monkeypatch.setattr(mgr._async_ckpt, "wait", _wait)
+        monkeypatch.setattr("kempnerforge.checkpoint.manager.dcp.load", MagicMock())
+        return st
+
+    def _latest_target(self, tmp_path):
+        latest = Path(tmp_path) / "latest"
+        return latest.resolve() if latest.exists() else None
+
+    def test_async_save_defers_latest_until_flush_durable(self, tmp_path, monkeypatch):
+        mgr = self._mgr(tmp_path, AsyncCheckpointMode.async_pinned)
+        self._install_async_mock(mgr, monkeypatch)
+
+        # First async save: flush in flight, latest must NOT point at step_10.
+        mgr.save(step=10)
+        assert self._latest_target(tmp_path) is None, (
+            "latest advanced before the async flush was durable"
+        )
+
+        # Second save awaits step_10's flush -> step_10 now durable + committed.
+        mgr.save(step=20)
+        tgt = self._latest_target(tmp_path)
+        assert tgt == (tmp_path / "step_10").resolve()
+        assert (tgt / ".metadata").exists()
+
+        # Final drain (training loop calls wait() after the loop) commits step_20.
+        mgr.wait()
+        tgt = self._latest_target(tmp_path)
+        assert tgt == (tmp_path / "step_20").resolve()
+        assert (tgt / ".metadata").exists()
+
+    def test_latest_invariant_holds_every_cycle(self, tmp_path, monkeypatch):
+        mgr = self._mgr(tmp_path, AsyncCheckpointMode.async_pinned)
+        self._install_async_mock(mgr, monkeypatch)
+        for s in (5, 10, 15, 20, 25):
+            mgr.save(step=s)
+            tgt = self._latest_target(tmp_path)
+            # Invariant: if latest exists it MUST be a durable checkpoint.
+            if tgt is not None:
+                assert (tgt / ".metadata").exists(), (
+                    f"latest -> {tgt} but DCP .metadata missing (cycle step {s})"
+                )
+        mgr.wait()
+        tgt = self._latest_target(tmp_path)
+        assert tgt == (tmp_path / "step_25").resolve()
+        assert (tgt / ".metadata").exists()
+
+    def test_sync_mode_commits_latest_immediately(self, tmp_path, monkeypatch):
+        from unittest.mock import MagicMock
+
+        mgr = self._mgr(tmp_path, AsyncCheckpointMode.disabled)
+        # Sync dcp.save is blocking; emulate it writing .metadata before return.
+        from kempnerforge.checkpoint.manager import _DCP_METADATA_FILE
+
+        def _save(state_dict, checkpoint_id, process_group=None):
+            (Path(checkpoint_id) / _DCP_METADATA_FILE).write_text("ok")
+
+        monkeypatch.setattr(mgr._async_ckpt, "save", _save)
+        monkeypatch.setattr("kempnerforge.checkpoint.manager.dcp.load", MagicMock())
+
+        mgr.save(step=7)
+        tgt = self._latest_target(tmp_path)
+        assert tgt == (tmp_path / "step_7").resolve()
+        assert (tgt / ".metadata").exists()
+
+    def _build_ckpt(self, tmp_path, step, *, complete):
+        d = Path(tmp_path) / f"step_{step}"
+        d.mkdir(parents=True, exist_ok=True)
+        torch.save({"step": step, "tokens_seen": step * 100, "rng": {}}, d / "train_state.pt")
+        (d / "metadata.json").write_text(json.dumps({"step": step, "tokens_seen": step * 100}))
+        if complete:
+            (d / ".metadata").write_text("ok")
+        return d
+
+    def test_resume_falls_back_to_newest_complete(self, tmp_path, monkeypatch, caplog):
+        import logging
+        from unittest.mock import MagicMock
+
+        self._build_ckpt(tmp_path, 10, complete=True)
+        incomplete = self._build_ckpt(tmp_path, 20, complete=False)
+        latest = Path(tmp_path) / "latest"
+        latest.symlink_to(incomplete.name)
+
+        mgr = self._mgr(tmp_path, AsyncCheckpointMode.async_pinned)
+        monkeypatch.setattr("kempnerforge.checkpoint.manager.dcp.load", MagicMock())
+
+        with caplog.at_level(logging.WARNING, logger="kempnerforge.checkpoint.manager"):
+            step, tokens, _ = mgr.load()
+
+        assert step == 10, "did not fall back to the newest COMPLETE checkpoint"
+        assert tokens == 1000
+        assert any("interrupted async flush" in r.getMessage() for r in caplog.records)
+
+    def test_resume_no_fallback_when_dcp_excluded(self, tmp_path, monkeypatch):
+        from unittest.mock import MagicMock
+
+        self._build_ckpt(tmp_path, 10, complete=True)
+        incomplete = self._build_ckpt(tmp_path, 20, complete=False)
+        latest = Path(tmp_path) / "latest"
+        latest.symlink_to(incomplete.name)
+
+        mgr = self._mgr(tmp_path, AsyncCheckpointMode.async_pinned)
+        monkeypatch.setattr("kempnerforge.checkpoint.manager.dcp.load", MagicMock())
+
+        # DCP fully excluded (fine-tune style): durability is irrelevant, the
+        # incomplete `latest` target itself must still be honored.
+        step, tokens, _ = mgr.load(exclude_keys=["model", "optimizer"])
+        assert step == 20
+        assert tokens == 2000
+
+    def test_cleanup_never_deletes_latest_or_in_flight(self, tmp_path, monkeypatch):
+        mgr = self._mgr(tmp_path, AsyncCheckpointMode.async_pinned)
+        mgr.config.keep_last_n = 1
+        dirs = {s: self._build_ckpt(tmp_path, s, complete=True) for s in (1, 2, 3, 4, 5)}
+
+        latest = Path(tmp_path) / "latest"
+        latest.symlink_to(dirs[3].name)  # latest -> step_3
+        mgr._pending_finalize = (5, dirs[5])  # step_5 async flush in flight
+
+        mgr._cleanup()
+
+        assert dirs[3].exists(), "cleanup deleted the live `latest` target"
+        assert dirs[5].exists(), "cleanup deleted the in-flight pending checkpoint"
+        # keep_last_n=1 still prunes the genuinely-stale ones.
+        assert not dirs[1].exists()
+        assert not dirs[2].exists()
