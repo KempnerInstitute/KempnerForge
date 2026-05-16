@@ -913,3 +913,49 @@ class TestAsyncLatestSymlinkSafety:
         # keep_last_n=1 still prunes the genuinely-stale ones.
         assert not dirs[1].exists()
         assert not dirs[2].exists()
+
+    # --- coverage for the distributed barrier + resolution edge paths ---
+
+    def test_save_runs_barrier_when_distributed(self, tmp_path, monkeypatch):
+        from unittest.mock import MagicMock
+
+        mgr = self._mgr(tmp_path, AsyncCheckpointMode.disabled)
+        monkeypatch.setattr(mgr._async_ckpt, "save", MagicMock())
+        barriers = []
+        monkeypatch.setattr("kempnerforge.checkpoint.manager.dist.is_initialized", lambda: True)
+        monkeypatch.setattr(
+            "kempnerforge.checkpoint.manager.dist.barrier",
+            lambda *a, **k: barriers.append(True),
+        )
+        mgr.save(step=1)
+        assert barriers, "save() did not barrier when distributed is initialized"
+
+    def test_wait_and_flush_drain_and_barrier_when_distributed(self, tmp_path, monkeypatch):
+        mgr = self._mgr(tmp_path, AsyncCheckpointMode.async_pinned)
+        barriers = []
+        monkeypatch.setattr("kempnerforge.checkpoint.manager.dist.is_initialized", lambda: True)
+        monkeypatch.setattr(
+            "kempnerforge.checkpoint.manager.dist.barrier",
+            lambda *a, **k: barriers.append(True),
+        )
+        # No pending finalize: drain is a no-op, barrier still runs.
+        mgr.wait()
+        mgr.flush_pending_save()
+        assert len(barriers) == 2
+
+    def test_newest_complete_none_when_base_dir_missing(self, tmp_path):
+        mgr = self._mgr(tmp_path / "does_not_exist", AsyncCheckpointMode.async_pinned)
+        assert mgr._newest_complete_checkpoint() is None
+
+    def test_newest_complete_none_when_no_durable_checkpoint(self, tmp_path):
+        mgr = self._mgr(tmp_path, AsyncCheckpointMode.async_pinned)
+        self._build_ckpt(tmp_path, 1, complete=False)
+        self._build_ckpt(tmp_path, 2, complete=False)
+        assert mgr._newest_complete_checkpoint() is None
+
+    def test_resolve_dcp_load_dir_returns_resolved_when_no_fallback(self, tmp_path):
+        mgr = self._mgr(tmp_path, AsyncCheckpointMode.async_pinned)
+        incomplete = self._build_ckpt(tmp_path, 5, complete=False)
+        # No complete checkpoint anywhere -> fallback is None -> resolved
+        # is returned unchanged (caller then surfaces the real load error).
+        assert mgr._resolve_dcp_load_dir(incomplete, None) == incomplete
