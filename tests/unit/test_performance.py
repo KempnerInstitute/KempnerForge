@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 
 from kempnerforge.config.schema import ModelConfig, ProfilingConfig
@@ -115,6 +117,44 @@ class TestMFU:
         flops_short = estimate_model_flops_per_token(config, seq_len=64)
         flops_long = estimate_model_flops_per_token(config, seq_len=256)
         assert flops_long > flops_short
+
+    def test_gpu_peak_tflops_cpu_only(self, monkeypatch):
+        """Without CUDA, get_gpu_peak_tflops returns the 1.0 dummy."""
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+        assert get_gpu_peak_tflops() == 1.0
+
+    def test_gpu_peak_tflops_unknown_hopper(self, monkeypatch):
+        """Unknown GPU with compute capability >= 9 falls back to 989 TFLOPS."""
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(torch.cuda, "get_device_name", lambda d=0: "Fake-Unknown-GPU-9000")
+        monkeypatch.setattr(torch.cuda, "get_device_capability", lambda d=0: (9, 0))
+        assert get_gpu_peak_tflops() == 989.0
+
+    def test_gpu_peak_tflops_unknown_ampere(self, monkeypatch):
+        """Unknown GPU with compute capability 8.x falls back to 312 TFLOPS."""
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(torch.cuda, "get_device_name", lambda d=0: "Fake-Unknown-GPU-9000")
+        monkeypatch.setattr(torch.cuda, "get_device_capability", lambda d=0: (8, 0))
+        assert get_gpu_peak_tflops() == 312.0
+
+    def test_gpu_peak_tflops_unknown_older(self, monkeypatch):
+        """Unknown GPU with compute capability < 8 falls back to 100 TFLOPS."""
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(torch.cuda, "get_device_name", lambda d=0: "Fake-Unknown-GPU-9000")
+        monkeypatch.setattr(torch.cuda, "get_device_capability", lambda d=0: (7, 5))
+        assert get_gpu_peak_tflops() == 100.0
+
+    def test_compute_mfu_zero_peak(self):
+        """compute_mfu returns 0.0 when peak * num_gpus == 0 to avoid div-by-zero."""
+        result = compute_mfu(SMALL_CONFIG, tokens_per_sec=1e6, num_gpus=1, gpu_peak_tflops=0.0)
+        assert result == 0.0
+
+    def test_compute_mfu_auto_detects_gpu_peak(self, monkeypatch):
+        """compute_mfu(..., gpu_peak_tflops=None) auto-detects via get_gpu_peak_tflops."""
+        monkeypatch.setattr("kempnerforge.metrics.mfu.get_gpu_peak_tflops", lambda device=0: 100.0)
+        result = compute_mfu(SMALL_CONFIG, tokens_per_sec=1e6, num_gpus=1)
+        assert math.isfinite(result)
+        assert result > 0
 
 
 # ---------------------------------------------------------------------------

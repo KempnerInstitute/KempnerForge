@@ -26,3 +26,6 @@ profiler_traces/
 tb_logs/
 logs/
 
+# Coverage artifacts
+.coverage
+.coverage.*

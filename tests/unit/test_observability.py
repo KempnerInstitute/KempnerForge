@@ -4,19 +4,29 @@ from __future__ import annotations
 
 import logging
 import os
-from unittest.mock import patch
+import sys
+from unittest.mock import MagicMock, patch
 
 import torch
+import torch.distributed as dist
 
+import kempnerforge.metrics.logger as log_mod
+import kempnerforge.metrics.tracker as tracker_mod
 from kempnerforge.config.schema import JobConfig, MetricsConfig, ModelConfig
 from kempnerforge.metrics.logger import (
     _format_number,
     _RankFilter,
     _RankFormatter,
+    _supports_color,
     format_metrics,
     get_logger,
 )
-from kempnerforge.metrics.memory import DeviceMemoryMonitor
+from kempnerforge.metrics.memory import (
+    DeviceMemoryMonitor,
+    get_memory_stats,
+    get_memory_utilization,
+    reset_peak_memory,
+)
 from kempnerforge.metrics.tracker import (
     MetricsTracker,
     StepMetrics,
@@ -88,6 +98,95 @@ class TestMetricsTracker:
         tracker = self._make_tracker()
         tracker.close()  # Should not raise
 
+    def test_init_backends_rank_zero_appends_wandb(self, monkeypatch):
+        """When rank-0 and enable_wandb=True, init_backends appends a WandBBackend."""
+        monkeypatch.setattr(tracker_mod, "WandBBackend", MagicMock(name="FakeWandB"))
+        config = JobConfig(
+            model=ModelConfig(dim=128, n_layers=2, n_heads=2, vocab_size=256),
+            metrics=MetricsConfig(enable_wandb=True),
+        )
+        tracker = MetricsTracker(config, num_gpus=1)
+        tracker.init_backends(config)
+        assert len(tracker._backends) == 1
+
+    def test_init_backends_rank_zero_appends_tensorboard(self, monkeypatch):
+        """When rank-0 and enable_tensorboard=True, init_backends appends a TBBackend."""
+        monkeypatch.setattr(tracker_mod, "TensorBoardBackend", MagicMock(name="FakeTB"))
+        config = JobConfig(
+            model=ModelConfig(dim=128, n_layers=2, n_heads=2, vocab_size=256),
+            metrics=MetricsConfig(enable_tensorboard=True),
+        )
+        tracker = MetricsTracker(config, num_gpus=1)
+        tracker.init_backends(config)
+        assert len(tracker._backends) == 1
+
+    def test_init_backends_skips_non_rank_zero(self, monkeypatch):
+        """Non-rank-0 ranks must not initialize backends even if enabled."""
+        monkeypatch.setattr(dist, "is_initialized", lambda: True)
+        monkeypatch.setattr(dist, "get_rank", lambda: 1)
+        config = JobConfig(
+            model=ModelConfig(dim=128, n_layers=2, n_heads=2, vocab_size=256),
+            metrics=MetricsConfig(enable_wandb=True),
+        )
+        tracker = MetricsTracker(config, num_gpus=1)
+        tracker.init_backends(config)
+        assert tracker._backends == []
+
+    def test_init_backends_idempotent(self, monkeypatch):
+        """Calling init_backends twice must not double-append backends."""
+        fake = MagicMock(name="FakeWandB")
+        monkeypatch.setattr(tracker_mod, "WandBBackend", fake)
+        config = JobConfig(
+            model=ModelConfig(dim=128, n_layers=2, n_heads=2, vocab_size=256),
+            metrics=MetricsConfig(enable_wandb=True),
+        )
+        tracker = MetricsTracker(config, num_gpus=1)
+        tracker.init_backends(config)
+        tracker.init_backends(config)  # second call is a no-op
+        assert fake.call_count == 1
+
+    def test_end_step_dispatches_to_backend(self):
+        """end_step must forward the metrics dict to every registered backend."""
+        tracker = self._make_tracker(log_interval=1)
+        fake = _FakeBackend()
+        tracker._backends.append(fake)
+        tracker.start_step()
+        tracker.end_step(step=1, loss=2.5, grad_norm=1.0, lr=3e-4, tokens_in_step=1024)
+        assert len(fake.log_calls) == 1
+        metrics_dict, step = fake.log_calls[0]
+        assert step == 1
+        assert "train/loss" in metrics_dict
+
+    def test_log_eval_dispatches_to_backends(self):
+        """log_eval must forward the metrics dict verbatim to every backend."""
+        tracker = self._make_tracker()
+        fake = _FakeBackend()
+        tracker._backends.append(fake)
+        tracker.log_eval({"eval/loss": 2.3}, step=10)
+        assert fake.log_calls == [({"eval/loss": 2.3}, 10)]
+
+    def test_close_with_backends(self):
+        """tracker.close() must call close() on every registered backend."""
+        tracker = self._make_tracker()
+        fake = _FakeBackend()
+        tracker._backends.append(fake)
+        tracker.close()
+        assert fake.close_calls == 1
+
+
+class _FakeBackend:
+    """Recording backend used by tracker dispatch tests."""
+
+    def __init__(self) -> None:
+        self.log_calls: list[tuple[dict, int]] = []
+        self.close_calls = 0
+
+    def log(self, metrics: dict, step: int) -> None:
+        self.log_calls.append((metrics, step))
+
+    def close(self) -> None:
+        self.close_calls += 1
+
 
 # ---------------------------------------------------------------------------
 # StepMetrics
@@ -147,6 +246,49 @@ class TestDeviceMemoryMonitor:
         monitor.report(step=3)
         assert monitor._snapshot_taken
 
+    def test_capture_snapshot_cpu_only(self, monkeypatch):
+        """Without CUDA, capture_snapshot returns None immediately."""
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+        monitor = DeviceMemoryMonitor()
+        assert monitor.capture_snapshot(step=10) is None
+
+    def test_capture_snapshot_handles_exception(self, monkeypatch, tmp_path):
+        """Any exception inside capture_snapshot is swallowed; returns None."""
+        # Bypass the CPU-only early return so the try-block runs.
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("simulated _record_memory_history failure")
+
+        monkeypatch.setattr(torch.cuda.memory, "_record_memory_history", _boom)
+        monitor = DeviceMemoryMonitor(snapshot_dir=str(tmp_path))
+        assert monitor.capture_snapshot(step=1) is None
+
+
+class TestMemoryHelpers:
+    def test_get_memory_stats_cpu_only(self, monkeypatch):
+        """Without CUDA, get_memory_stats returns all-zero values."""
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+        assert get_memory_stats() == {
+            "allocated_gb": 0,
+            "peak_gb": 0,
+            "reserved_gb": 0,
+            "total_gb": 0,
+        }
+
+    def test_get_memory_utilization_zero_total(self, monkeypatch):
+        """When total_gb == 0 (no GPU), utilization is 0.0 to avoid div-by-zero."""
+        monkeypatch.setattr(
+            "kempnerforge.metrics.memory.get_memory_stats",
+            lambda d=0: {"allocated_gb": 0, "peak_gb": 5, "reserved_gb": 0, "total_gb": 0},
+        )
+        assert get_memory_utilization() == 0.0
+
+    def test_reset_peak_memory_cpu_only(self, monkeypatch):
+        """Without CUDA, reset_peak_memory is a no-op (must not raise)."""
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+        reset_peak_memory(device=0)  # Should not raise
+
 
 # ---------------------------------------------------------------------------
 # Logging backends
@@ -167,6 +309,25 @@ class TestWandBBackend:
         # Either initialized or set to False sentinel
         assert backend._run is not None
 
+    def test_wandb_handles_import_error(self, monkeypatch):
+        """ImportError inside _ensure_init flips _run to the False sentinel."""
+        monkeypatch.setitem(sys.modules, "wandb", None)
+        backend = WandBBackend(MetricsConfig(enable_wandb=True))
+        backend.log({"loss": 1.0}, step=1)
+        assert backend._run is False
+
+    def test_wandb_handles_init_exception(self, monkeypatch):
+        """Non-ImportError exception from wandb.init() also flips _run = False."""
+        import wandb
+
+        def _boom(**kwargs):
+            raise RuntimeError("simulated auth failure")
+
+        monkeypatch.setattr(wandb, "init", _boom)
+        backend = WandBBackend(MetricsConfig(enable_wandb=True))
+        backend.log({"loss": 1.0}, step=1)
+        assert backend._run is False
+
 
 class TestTensorBoardBackend:
     def test_init_no_crash(self):
@@ -181,6 +342,13 @@ class TestTensorBoardBackend:
         # Writer should be initialized (or False if tensorboard not installed)
         assert backend._writer is not None
         backend.close()
+
+    def test_tb_handles_import_error(self, monkeypatch):
+        """ImportError inside _ensure_init flips _writer to the False sentinel."""
+        monkeypatch.setitem(sys.modules, "torch.utils.tensorboard", None)
+        backend = TensorBoardBackend(MetricsConfig(enable_tensorboard=True))
+        backend.log({"loss": 1.0}, step=1)
+        assert backend._writer is False
 
 
 # ---------------------------------------------------------------------------
@@ -229,6 +397,57 @@ class TestRankLogger:
         assert "INFO" in output
         assert "hello world" in output
 
+    def test_supports_color_no_color_env(self, monkeypatch):
+        """NO_COLOR=1 disables color output regardless of TTY status."""
+        monkeypatch.setenv("NO_COLOR", "1")
+        assert _supports_color() is False
+
+    def test_supports_color_no_isatty(self, monkeypatch):
+        """A stdout object without isatty disables color output.
+
+        io.StringIO HAS isatty (returns False) so cannot be used here;
+        use a custom stub that simply lacks the attribute.
+        """
+
+        class _NoIsattyStdout:
+            def write(self, s):
+                pass
+
+            def flush(self):
+                pass
+
+        monkeypatch.setattr(sys, "stdout", _NoIsattyStdout())
+        assert _supports_color() is False
+
+    def test_rank_formatter_with_color(self, monkeypatch):
+        """When use_color=True and _supports_color()=True, output includes ANSI."""
+        monkeypatch.setattr(log_mod, "_supports_color", lambda: True)
+        monkeypatch.setenv("RANK", "0")
+        fmt = _RankFormatter(use_color=True)
+        record = logging.LogRecord("test", logging.INFO, "", 0, "hello", (), None)
+        output = fmt.format(record)
+        assert "\x1b[" in output
+
+    def test_configure_root_no_rank_filter(self, monkeypatch):
+        """When rank_zero_only=False, _configure_root attaches no _RankFilter.
+
+        _configure_root has a module-level _configured idempotency guard; any
+        earlier get_logger() call will have set it to True. We reset it via
+        monkeypatch so the function body actually runs.
+        """
+        monkeypatch.setattr(log_mod, "_configured", False)
+        root = logging.getLogger("kempnerforge")
+        orig_handlers = list(root.handlers)
+        try:
+            root.handlers.clear()
+            log_mod._configure_root(rank_zero_only=False)
+            for h in root.handlers:
+                rank_filters = [f for f in h.filters if isinstance(f, log_mod._RankFilter)]
+                assert rank_filters == []
+        finally:
+            root.handlers.clear()
+            root.handlers.extend(orig_handlers)
+
 
 # ---------------------------------------------------------------------------
 # Format metrics
@@ -253,3 +472,11 @@ class TestFormatMetrics:
     def test_format_number_regular_float(self):
         result = _format_number(2.34)
         assert "2.34" in result
+
+    def test_format_number_small_int(self):
+        """Integers below 1000 return as plain str without unit suffix."""
+        assert _format_number(42) == "42"
+
+    def test_format_number_non_numeric_fallback(self):
+        """Defensive final return: non-numeric input passes through as str(val)."""
+        assert _format_number("foo") == "foo"

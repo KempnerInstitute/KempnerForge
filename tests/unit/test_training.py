@@ -192,6 +192,23 @@ class TestGradUtils:
         with maybe_no_sync(model, micro_step=0, grad_accum_steps=3):
             pass  # Should not raise (no set_requires_gradient_sync on vanilla model)
 
+    def test_maybe_no_sync_fsdp2_branch(self):
+        """When the model has set_requires_gradient_sync (FSDP2), the wrapper
+        toggles sync off on entry and back on after exit."""
+        from kempnerforge.training.grad import maybe_no_sync
+
+        class _FakeFSDPModel:
+            def __init__(self):
+                self.calls = []
+
+            def set_requires_gradient_sync(self, val):
+                self.calls.append(val)
+
+        model = _FakeFSDPModel()
+        with maybe_no_sync(model, micro_step=0, grad_accum_steps=3):
+            assert model.calls == [False]
+        assert model.calls == [False, True]
+
 
 # ---------------------------------------------------------------------------
 # Integration: loss decreases
