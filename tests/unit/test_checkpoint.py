@@ -842,7 +842,7 @@ class TestAsyncLatestSymlinkSafety:
             (d / ".metadata").write_text("ok")
         return d
 
-    def test_resume_falls_back_to_newest_complete(self, tmp_path, monkeypatch, caplog):
+    def test_resume_falls_back_to_newest_complete(self, tmp_path, monkeypatch):
         import logging
         from unittest.mock import MagicMock
 
@@ -854,12 +854,31 @@ class TestAsyncLatestSymlinkSafety:
         mgr = self._mgr(tmp_path, AsyncCheckpointMode.async_pinned)
         monkeypatch.setattr("kempnerforge.checkpoint.manager.dcp.load", MagicMock())
 
-        with caplog.at_level(logging.WARNING, logger="kempnerforge.checkpoint.manager"):
+        # Attach a handler directly to the manager logger. caplog captures
+        # through a root handler and relies on propagation, which the full
+        # suite's global logging setup can disable (flaky in CI, passes in
+        # isolation). A direct handler is isolation-proof (same pattern as
+        # test_checkpoint_security.py).
+        records: list[logging.LogRecord] = []
+
+        class _Capture(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                records.append(record)
+
+        mgr_logger = logging.getLogger("kempnerforge.checkpoint.manager")
+        handler = _Capture(level=logging.WARNING)
+        prior_level = mgr_logger.level
+        mgr_logger.setLevel(logging.WARNING)
+        mgr_logger.addHandler(handler)
+        try:
             step, tokens, _ = mgr.load()
+        finally:
+            mgr_logger.removeHandler(handler)
+            mgr_logger.setLevel(prior_level)
 
         assert step == 10, "did not fall back to the newest COMPLETE checkpoint"
         assert tokens == 1000
-        assert any("interrupted async flush" in r.getMessage() for r in caplog.records)
+        assert any("interrupted async flush" in r.getMessage() for r in records)
 
     def test_resume_no_fallback_when_dcp_excluded(self, tmp_path, monkeypatch):
         from unittest.mock import MagicMock
