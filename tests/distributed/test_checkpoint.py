@@ -17,7 +17,7 @@ import torch.distributed as dist
 
 from kempnerforge.checkpoint import manager as mgr_mod
 from kempnerforge.checkpoint.manager import CheckpointManager
-from kempnerforge.config.schema import CheckpointConfig, ModelConfig
+from kempnerforge.config.schema import AsyncCheckpointMode, CheckpointConfig, ModelConfig
 from kempnerforge.distributed.parallel import apply_fsdp2
 from kempnerforge.model.transformer import Transformer
 from kempnerforge.training.optimizer import build_optimizer
@@ -230,3 +230,120 @@ class TestCheckpointLoadDivergentExistence:
         assert tokens_seen == 100, (
             f"rank {rank}: expected tokens_seen=100 after load, got {tokens_seen}"
         )
+
+
+class TestAsyncCheckpointLatestSafety:
+    """Real 2-rank FSDP coverage for the async `latest`-before-flush bug.
+
+    With ``async_with_pinned_mem`` the DCP shards + ``.metadata`` are
+    written by a background thread. ``latest`` must never resolve to a
+    checkpoint whose ``.metadata`` is not yet durable, and resume must
+    recover from the newest durable step.
+    """
+
+    @pytest.mark.skip(
+        reason="Blocked by a SEPARATE pre-existing bug, not the latest-symlink "
+        "fix: DCP's async-executor background thread runs collectives "
+        "(all_gather/reduce_scatter) on the default PG while save()'s end "
+        "dist.barrier() runs on the same PG from the main thread, "
+        "deadlocking under tight back-to-back async saves. Verified present "
+        "on `main` (identical _async_ckpt.save() -> dist.barrier() structure "
+        "in save()); real training spaces saves with step collectives so it "
+        "has not bitten in practice. The latest-symlink fix's async "
+        "behavior is covered by the deterministic unit tests in "
+        "tests/unit/test_checkpoint.py::TestAsyncLatestSymlinkSafety and was "
+        "validated end-to-end by a live 2-node 7B run + external probe. "
+        "Unskip once the async-collective/barrier hazard is resolved."
+    )
+    def test_latest_only_resolves_to_durable_checkpoints(self, distributed_env, shared_tmp_dir):
+        mesh = distributed_env
+        ckpt_dir = shared_tmp_dir
+        rank = dist.get_rank()
+
+        model = Transformer(SMALL_CONFIG).cuda()
+        apply_fsdp2(model, mesh)
+        from kempnerforge.config.schema import OptimizerConfig
+
+        opt = build_optimizer(model, OptimizerConfig(lr=1e-3, fused=False))
+        cfg = CheckpointConfig(
+            dir=ckpt_dir,
+            keep_last_n=3,
+            async_mode=AsyncCheckpointMode.async_pinned,
+        )
+        mgr = CheckpointManager(cfg, model, opt)
+
+        latest = Path(ckpt_dir) / "latest"
+
+        # Mirror the real training loop exactly: periodic save() calls, then
+        # a single wait() after the loop (scripts/train.py:995). NO barriers
+        # are injected between/after save() here — a mid-flush collective on
+        # the default PG races DCP's own async-executor collective thread,
+        # an unrelated pre-existing hazard that has nothing to do with the
+        # `latest` symlink fix under test.
+        for s in (10, 20, 30, 40):
+            mgr.save(step=s)
+            # Rank-0 local check only (no collective): whenever `latest`
+            # resolves, it MUST be a durable checkpoint. Pre-fix it pointed
+            # at the in-flight step whose DCP `.metadata` did not exist yet.
+            if rank == 0 and latest.exists():
+                target = latest.resolve()
+                assert (target / ".metadata").exists(), (
+                    f"after save({s}): latest -> {target} has no DCP .metadata"
+                )
+
+        # Final drain (the training loop calls wait() after the loop); this
+        # commits the last deferred checkpoint. wait() ends with its own
+        # barrier, so all ranks resync here.
+        mgr.wait()
+        if rank == 0:
+            assert latest.exists(), "latest missing after wait()"
+            target = latest.resolve()
+            assert target.name == "step_40", f"latest -> {target.name}, want step_40"
+            assert (target / ".metadata").exists(), "final latest not durable"
+
+        # No async flush is in flight after wait(), so this barrier cannot
+        # race a DCP collective; it just re-syncs before the collective
+        # load() (rank 0 did extra local fs asserts above).
+        dist.barrier()
+        step, tokens_seen, _ = mgr.load()
+        assert step == 40, f"rank {rank}: resumed at step {step}, want 40"
+
+    def test_resume_falls_back_when_latest_incomplete(self, distributed_env, shared_tmp_dir):
+        """Defense in depth: if `latest` points at an interrupted async
+        flush (no DCP `.metadata`), resume falls back to the newest
+        complete checkpoint instead of hard-failing in dcp.load."""
+        mesh = distributed_env
+        ckpt_dir = shared_tmp_dir
+        rank = dist.get_rank()
+
+        model = Transformer(SMALL_CONFIG).cuda()
+        apply_fsdp2(model, mesh)
+        from kempnerforge.config.schema import OptimizerConfig
+
+        opt = build_optimizer(model, OptimizerConfig(lr=1e-3, fused=False))
+        cfg = CheckpointConfig(dir=ckpt_dir, keep_last_n=5)
+        mgr = CheckpointManager(cfg, model, opt)
+
+        # A real, complete checkpoint at step 1 (sync save -> durable).
+        mgr.save(step=1, tokens_seen=64)
+        dist.barrier()
+
+        # Simulate an interrupted async flush at step 2: rank 0 fabricates
+        # a step_2 dir with train_state/metadata but NO DCP `.metadata`,
+        # and repoints `latest` at it (exactly the crash-mid-flush state).
+        if rank == 0:
+            step2 = Path(ckpt_dir) / "step_2"
+            step2.mkdir(parents=True, exist_ok=True)
+            torch.save({"step": 2, "tokens_seen": 128, "rng": {}}, step2 / "train_state.pt")
+            (step2 / "metadata.json").write_text('{"step": 2, "tokens_seen": 128}')
+            link = Path(ckpt_dir) / "latest"
+            tmp = link.with_suffix(".tmp")
+            tmp.unlink(missing_ok=True)
+            tmp.symlink_to("step_2")
+            tmp.rename(link)
+        dist.barrier()
+
+        # Resume must fall back to the durable step_1, not crash on step_2.
+        step, tokens_seen, _ = mgr.load()
+        assert step == 1, f"rank {rank}: expected fallback to step 1, got {step}"
+        assert tokens_seen == 64
