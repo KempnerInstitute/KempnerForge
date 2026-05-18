@@ -117,10 +117,7 @@ def _build_split(caption_json: str, image_root: str, num_samples: int, split_lab
         }
     )
     ds = Dataset.from_generator(gen, features=features)
-    print(
-        f"split={split_label}: {len(ds):,} samples "
-        f"(skipped {skipped['missing']} missing)"
-    )
+    print(f"split={split_label}: {len(ds):,} samples (skipped {skipped['missing']} missing)")
     return ds
 
 
