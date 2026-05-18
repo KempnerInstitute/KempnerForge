@@ -1335,8 +1335,8 @@
         "tests/unit/test_check_env.py"
       ]
     },
-    "scripts/prep_vlm_coco_smoke.py": {
-      "purpose": "Build a small COCO Karpathy HuggingFace Dataset on disk for VLM smoke runs by joining the testbed Karpathy JSON with the testbed COCO image tree",
+    "scripts/prep_vlm_coco.py": {
+      "purpose": "Build a COCO Karpathy HuggingFace dataset on disk for VLM training/eval/smoke — bare Dataset by default or 3-split DatasetDict via --all-splits; streams images through the HF Image() feature so peak RAM stays flat",
       "entry": "main()"
     }
   },

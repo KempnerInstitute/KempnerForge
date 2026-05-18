@@ -31,7 +31,7 @@
 #   setup. This config runs 5000 steps; the 30-sample default will
 #   memorize in <1 epoch. Override via CLI for real training, e.g.:
 #     --data.hf_dataset_name=<larger-dataset-or-local-path>
-#   For a local Karpathy-split COCO dataset, see scripts/prep_vlm_coco_smoke.py
+#   For a local Karpathy-split COCO dataset, see scripts/prep_vlm_coco.py
 #   which writes a save_to_disk directory you can point this field at.
 
 [model]
