@@ -15,7 +15,7 @@ import os
 import shutil
 import stat
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import torch
 import torch.distributed as dist
@@ -143,6 +143,23 @@ class CheckpointManager:
         # the flush completes (drained at the next save() or wait()), so
         # `latest` never points at a half-written checkpoint. (step, ckpt_dir).
         self._pending_finalize: tuple[int, Path] | None = None
+        # Dedicated gloo group for the manager's own synchronization
+        # (the end-of-save barrier). dcp.async_save() runs its collective
+        # planning (all_gather/reduce_scatter) on a background thread using
+        # the default process group; issuing the save() barrier on that
+        # SAME group from the main thread interleaves two collectives on
+        # one communicator with nondeterministic per-rank ordering, which
+        # deadlocks under tightly spaced async saves. A separate gloo
+        # group is independent, so the CPU-only barrier cannot race the
+        # in-flight DCP collective. Created on all ranks (every rank
+        # constructs CheckpointManager identically). Typed + cast because
+        # the torch stubs declare new_group as ProcessGroup | int | None
+        # but barrier(group=...) wants ProcessGroup | None.
+        self._sync_group: dist.ProcessGroup | None = (
+            cast("dist.ProcessGroup", dist.new_group(backend="gloo"))
+            if dist.is_initialized()
+            else None
+        )
 
     def _checkpoint_dir(self, step: int) -> Path:
         return self.base_dir / f"step_{step}"
@@ -185,6 +202,16 @@ class CheckpointManager:
         self._pending_finalize = None
         if self._rank == 0:
             self._commit_latest(step, ckpt_dir)
+
+    def _sync_barrier(self) -> None:
+        """Barrier on the manager's dedicated gloo group.
+
+        Used to fence non-rank-0 ranks behind rank-0's metadata writes
+        without sharing the default process group that DCP's async-save
+        background thread is concurrently issuing collectives on.
+        """
+        if dist.is_initialized():
+            dist.barrier(group=self._sync_group)
 
     def save(
         self,
@@ -270,8 +297,10 @@ class CheckpointManager:
         # rank-0 has written train_state.pt + metadata.json (and, in sync
         # mode, advanced `latest`). Without this barrier, post-save hooks or
         # readers on other ranks race rank-0's writes (especially NFS/Lustre).
-        if dist.is_initialized():
-            dist.barrier()
+        # Uses the dedicated gloo group: the async DCP flush dispatched just
+        # above runs collectives on the default process group from a
+        # background thread, and sharing that group here deadlocks.
+        self._sync_barrier()
 
     def wait(self) -> None:
         """Block until any pending async checkpoint save completes.
