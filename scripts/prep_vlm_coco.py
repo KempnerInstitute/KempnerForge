@@ -7,9 +7,18 @@ The output directory is consumed by ``HuggingFaceVLMDataset`` through its
 ``load_from_disk`` path — point ``data.hf_dataset_name`` at it in your
 training TOML.
 
-Output columns: ``image`` (HF ``Image()`` feature → ``PIL.Image`` at
-read), ``caption`` (str), ``image_id`` (str — useful for eval metrics
-like CIDEr that key on image id).
+Output columns:
+- ``image`` — HF ``Image()`` feature, returns ``PIL.Image`` at read.
+- ``caption`` — single ``str``. Karpathy train rows store one caption
+  per row already; val/test rows store a 5-reference list, in which
+  case the first reference is used here so the column is always a str
+  (matches what ``HuggingFaceVLMDataset`` expects).
+- ``references`` — list of ``str`` with *all* captions for the image
+  (1 element for train rows, 5 for val/test). Lets eval loops do
+  multi-reference scoring without re-reading the JSON.
+- ``image_id`` — ``str``. Present in the train JSON; for val/test the
+  source JSON omits it, so it's derived from the image filename stem
+  (e.g. ``COCO_val2014_000000391895``).
 
 Modes:
 - Default — single split. Reads one JSON (``--caption-json``) and writes
@@ -62,7 +71,7 @@ def _build_split(caption_json: str, image_root: str, num_samples: int, split_lab
     each image as Arrow shards are built. Decoded pixels are never held
     in a Python list.
     """
-    from datasets import Dataset, Features, Image, Value
+    from datasets import Dataset, Features, Image, Sequence, Value
     from tqdm.auto import tqdm
 
     with open(caption_json) as fh:
@@ -79,16 +88,31 @@ def _build_split(caption_json: str, image_root: str, num_samples: int, split_lab
             if not img_path.exists():
                 skipped["missing"] += 1
                 continue
+            # Karpathy train rows: caption is str. Val/test rows: caption is
+            # a 5-element list. Normalize so the column is always str and
+            # surface all references separately for multi-ref eval.
+            raw_caption = row["caption"]
+            if isinstance(raw_caption, list):
+                references = [str(c) for c in raw_caption]
+            else:
+                references = [str(raw_caption)]
+            # Val/test JSONs omit image_id; fall back to the image filename
+            # stem (e.g. COCO_val2014_000000391895), which is unique per image.
+            image_id = row.get("image_id")
+            if image_id is None:
+                image_id = Path(img_rel).stem
             yield {
                 "image": str(img_path),
-                "caption": row["caption"],
-                "image_id": str(row.get("image_id", "")),
+                "caption": references[0],
+                "references": references,
+                "image_id": str(image_id),
             }
 
     features = Features(
         {
             "image": Image(),
             "caption": Value("string"),
+            "references": Sequence(Value("string")),
             "image_id": Value("string"),
         }
     )
