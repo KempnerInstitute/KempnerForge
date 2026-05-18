@@ -241,17 +241,6 @@ class TestAsyncCheckpointLatestSafety:
     recover from the newest durable step.
     """
 
-    @pytest.mark.skip(
-        reason="Test contains internal dist.barrier() calls between async saves "
-        "that race DCP's async-executor background collective on the "
-        "default PG. The save()-end barrier deadlock is fixed by this PR "
-        "(via _sync_barrier on a dedicated gloo group), but unskipping "
-        "additionally requires rewriting this test's intra-loop barriers "
-        "to drain the async future first or use a private gloo group. "
-        "Out of scope here; the async-save behavior is covered by "
-        "TestAsyncSaveBarrierNoDeadlock and by the deterministic unit "
-        "tests in TestAsyncLatestSymlinkSafety."
-    )
     def test_latest_only_resolves_to_durable_checkpoints(self, distributed_env, shared_tmp_dir):
         mesh = distributed_env
         ckpt_dir = shared_tmp_dir
