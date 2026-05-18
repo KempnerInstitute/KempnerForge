@@ -18,6 +18,7 @@ from kempnerforge.config.vlm import (
     FreezeSpec,
     FreezeStage,
     JointDecoderConfig,
+    MoMaConfig,
     MoTConfig,
     VLMConfig,
 )
@@ -115,7 +116,7 @@ class TestVLMConfigSubclasses:
 
     def test_registry_has_all_archs(self):
         archs = set(registry.list_vlm_configs())
-        assert {"joint_decoder", "cross_attention", "mot"} <= archs
+        assert {"joint_decoder", "cross_attention", "mot", "moma"} <= archs
 
 
 class TestCrossAttentionResolvedHeads:
@@ -309,3 +310,97 @@ class TestMoTConfig:
         )
         assert cfg.mot_warm_start_from_text is False
         assert cfg.mot_warm_start_path == "/tmp/jd_ckpt.pt"
+
+
+class TestMoMaConfig:
+    """``MoMaConfig`` (registered subclass for arch='moma').
+
+    Mirrors ``TestMoTConfig``: construction defaults, module_patterns alias,
+    ``for_arch`` dispatch via the registry, residual-stream layout, and
+    field validation. Detailed expert-count / capacity-factor / Gumbel-noise
+    semantics live in ``tests/unit/test_moma.py``.
+    """
+
+    def test_construction_defaults(self):
+        cfg = MoMaConfig()
+        assert cfg.arch == "moma"
+        assert isinstance(cfg, VLMConfig)
+        assert cfg.moma_modalities == ("image", "text")
+        assert cfg.moma_experts_per_modality == {"image": 4, "text": 4}
+        assert cfg.moma_capacity_factor == 0.0
+        assert cfg.moma_gumbel_noise is True
+
+    def test_module_patterns_has_moma_alias(self):
+        cfg = MoMaConfig()
+        assert "moma" in cfg.module_patterns
+        assert cfg.module_patterns["moma"] == [
+            "transformer.layers",
+            "transformer.layers.*",
+        ]
+        # Base aliases still present.
+        assert "transformer" in cfg.module_patterns
+        assert "vision_encoder" in cfg.module_patterns
+
+    def test_for_arch_moma_returns_subclass(self):
+        cfg = VLMConfig.for_arch("moma")
+        assert isinstance(cfg, MoMaConfig)
+        assert cfg.arch == "moma"
+
+    def test_for_arch_moma_with_overrides(self):
+        cfg = VLMConfig.for_arch(
+            "moma",
+            moma_experts_per_modality={"image": 1, "text": 7},
+            moma_capacity_factor=0.5,
+            moma_gumbel_noise=False,
+        )
+        assert isinstance(cfg, MoMaConfig)
+        assert cfg.moma_experts_per_modality == {"image": 1, "text": 7}
+        assert cfg.moma_capacity_factor == 0.5
+        assert cfg.moma_gumbel_noise is False
+
+    def test_residual_stream_image_tokens_passes_through(self):
+        cfg = MoMaConfig()
+        assert cfg.residual_stream_image_tokens(128) == 128
+
+    def test_effective_capacity_factor_paper_default(self):
+        cfg = MoMaConfig(moma_experts_per_modality={"image": 4, "text": 4})
+        assert cfg.effective_capacity_factor("image") == pytest.approx(0.25)
+        assert cfg.effective_capacity_factor("text") == pytest.approx(0.25)
+
+    def test_effective_capacity_factor_explicit_override(self):
+        cfg = MoMaConfig(
+            moma_experts_per_modality={"image": 4, "text": 4},
+            moma_capacity_factor=0.6,
+        )
+        assert cfg.effective_capacity_factor("image") == 0.6
+        assert cfg.effective_capacity_factor("text") == 0.6
+
+    def test_moma_modalities_must_include_text(self):
+        with pytest.raises(ValueError, match="must include 'text'"):
+            MoMaConfig(
+                moma_modalities=("image", "audio"),
+                moma_experts_per_modality={"image": 2, "audio": 2},
+            )
+
+    def test_moma_modalities_must_include_image(self):
+        with pytest.raises(ValueError, match="must include 'image'"):
+            MoMaConfig(
+                moma_modalities=("text", "audio"),
+                moma_experts_per_modality={"text": 2, "audio": 2},
+            )
+
+    def test_negative_capacity_factor_raises(self):
+        with pytest.raises(ValueError, match="capacity_factor must be >= 0"):
+            MoMaConfig(moma_capacity_factor=-0.1)
+
+    def test_missing_expert_count_entry_raises(self):
+        with pytest.raises(ValueError, match="missing entries"):
+            MoMaConfig(moma_experts_per_modality={"image": 2})
+
+    def test_extra_expert_count_entry_raises(self):
+        with pytest.raises(ValueError, match="unknown modality keys"):
+            MoMaConfig(moma_experts_per_modality={"image": 2, "text": 2, "audio": 4})
+
+    def test_nonpositive_expert_count_raises(self):
+        with pytest.raises(ValueError, match="must be positive"):
+            MoMaConfig(moma_experts_per_modality={"image": 0, "text": 2})

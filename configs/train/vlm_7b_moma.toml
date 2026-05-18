@@ -1,0 +1,125 @@
+# 7B VLM Mixture of Modality-Aware Experts (MoMa) on 4x H200 (141 GB/GPU).
+#
+# Mode: smoke / starter.
+#
+# Shared Q/K/V/O attention (one set across modalities) + per-modality MoE
+# FFN groups with expert-choice + Sigmoid routing (Lin et al. 2024,
+# arXiv:2407.21770). Default 4 text + 4 image experts per layer
+# (paper's optimal moe_4t4i). Tokens route deterministically by modality
+# (level 1) then through a learned EC + Sigmoid router within their
+# modality group (level 2). Image tokens prepend the text sequence
+# (same residual layout as Joint-Decoder / MoT); output_slice trims
+# them off the LM head input.
+#
+# Inference note: MoMa v1 supports training only. Expert-choice routing
+# is non-causal (each expert's top-k depends on all tokens in the batch);
+# autoregressive generation requires auxiliary routers (paper §2.4),
+# deferred to a follow-up.
+#
+# Parameter / memory note: with the default 7B-dense-shaped backbone
+# (dim=4096, n_layers=32, ffn ~14336) and 8 SwiGLU experts per layer
+# (4 image + 4 text), total params is much larger than dense 7B. Use
+# FSDP=4 + activation_checkpointing="full" to fit on 4x H200. For a
+# roomier setup, reduce moma_experts_per_modality (e.g. 2t2i) or fall
+# back to the MoT debug config. Pipeline Parallel + VLM is not supported.
+#
+# max_seq_len allocation: residual_image_tokens + max_text_len. Image
+# tokens prepend the text sequence in the residual stream, so the budget
+# must cover both modalities.
+#
+# Usage:
+#   uv run torchrun --nproc_per_node=4 scripts/train.py configs/train/vlm_7b_moma.toml
+#
+# Default points at a 30-sample COCO val substitute (sayakpaul/coco-30-val-2014)
+# so a fresh clone runs without external setup. For real training override:
+#   --data.hf_dataset_name=/path/to/local/hf_dataset \
+#   --data.hf_dataset_text_field=caption
+# Swap the encoder via [vision_encoder].type = "siglip2" / "clip".
+
+[model]
+dim = 4096
+n_layers = 32
+n_heads = 32
+n_kv_heads = 8
+vocab_size = 50257
+ffn_dim_multiplier = 1.3
+norm_type = "rmsnorm"
+activation = "silu"
+max_seq_len = 1024     # 256 image + 512 text (max_text_len default) + headroom
+rope_theta = 500000.0
+tie_embeddings = false
+
+[vision_encoder]
+type = "random"
+feature_dim = 1024
+num_tokens = 256
+
+[vlm]
+arch = "moma"
+# Paper Eq. 5: Gumbel-Sigmoid noise on router scores during training.
+# Set false for a deterministic forward (useful for warm-start parity
+# checks and reproducibility-sensitive smoke runs).
+moma_gumbel_noise = true
+# moma_capacity_factor = 0.0 → use paper default 1/|E^M| per modality
+# (each expert sees the average token load; perfect EC balance).
+
+[vlm.moma_experts_per_modality]
+# Paper's optimal balanced allocation (moe_4t4i at 1.4B-compute-matched
+# in Table 1). Unbalanced allocations like {image = 1, text = 7} are
+# supported and match the paper's moe_7t1i / 1t7i ablations.
+image = 4
+text = 4
+
+[train]
+batch_size = 4
+seq_len = 768
+max_steps = 200
+grad_accum_steps = 1
+grad_clip_norm = 1.0
+seed = 42
+# Modality-aware scatter/gather + EC top-k are not yet validated under
+# torch.compile (graph breaks on data-dependent dispatch); JobConfig.validate
+# emits a warning if you flip this on.
+compile_model = false
+# Required given the per-layer expert duplication on 4x H200; drop to
+# "selective" or "none" if you scale down experts_per_modality or n_layers.
+activation_checkpointing = "full"
+loss_fn = "cross_entropy"
+
+[optimizer]
+name = "adamw"
+lr = 1e-4
+weight_decay = 0.1
+betas = [0.9, 0.95]
+eps = 1e-8
+fused = true
+
+[scheduler]
+name = "cosine"
+warmup_steps = 5
+min_lr_ratio = 0.1
+
+[data]
+hf_dataset_name = "sayakpaul/coco-30-val-2014"
+hf_dataset_split = "train"
+hf_dataset_image_field = "image"
+hf_dataset_text_field = "caption"
+hf_image_size = 224
+tokenizer_path = "gpt2"
+num_workers = 2
+pin_memory = true
+prefetch_factor = 2
+
+[distributed]
+dp_shard = -1
+nccl_timeout_sec = 600
+
+[checkpoint]
+dir = "checkpoints/vlm_7b_moma"
+interval = 1000
+keep_last_n = 1
+
+[metrics]
+log_interval = 1
+enable_wandb = false
+enable_tensorboard = false

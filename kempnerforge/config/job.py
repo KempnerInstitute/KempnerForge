@@ -16,7 +16,7 @@ from kempnerforge.config.profiling import ProfilingConfig
 from kempnerforge.config.scheduler import SchedulerConfig
 from kempnerforge.config.training import TrainConfig
 from kempnerforge.config.vision import VisionEncoderConfig
-from kempnerforge.config.vlm import VLMConfig
+from kempnerforge.config.vlm import MoMaConfig, VLMConfig
 
 # Vision-encoder types whose builders load a HuggingFace model and probe
 # feature_dim / num_tokens from the model's config. Setting these knobs
@@ -221,3 +221,28 @@ class JobConfig:
             # the build + forward + backward path. CrossAttentionBlocks
             # themselves remain dense MLP; MoE lives in the text
             # TransformerBlocks (where moe_frequency selects).
+
+            if isinstance(self.vlm, MoMaConfig):
+                # MoMa carries its own per-modality expert counts on
+                # ``moma_experts_per_modality``; ``model.num_experts``
+                # would be a redundant second source of truth, so we
+                # reject it explicitly rather than silently ignoring.
+                if self.model.num_experts > 0:
+                    raise ValueError(
+                        "MoMa + model.num_experts > 0 is rejected. MoMa derives expert "
+                        "counts per modality from vlm.moma_experts_per_modality; set "
+                        "model.num_experts=0 (the dense-LLM default) when using arch='moma'."
+                    )
+                if self.distributed.ep > 1:
+                    raise ValueError(
+                        "MoMa + Expert Parallelism is not supported in v1. Per-modality "
+                        "expert groups need EP-aware dispatch that is not yet wired."
+                    )
+                if self.train.compile_model:
+                    import logging
+
+                    logging.getLogger(__name__).warning(
+                        "torch.compile is not yet validated for MoMa dispatch "
+                        "(modality_ids-based scatter/gather + expert-choice top-k cause "
+                        "graph breaks). Set compile_model=false for MoMa models."
+                    )
