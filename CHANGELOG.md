@@ -27,7 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `kempnerforge/config/data.py`: `hf_dataset_image_field`, `hf_dataset_prompt_field`, `hf_image_size`.
   - `kempnerforge/config/job.py`: VLM seq_len validation + explicit "VLM + PP not supported" guard.
   - `scripts/train.py`: VLM training step (no PP), freeze-schedule transition hook with async-save fence, VLM checkpoint metadata, per-step text-token counter (DP-reduced).
-  - `scripts/prep_vlm_coco_smoke.py`: helper to materialize a small COCO Karpathy slice for smoke runs.
+  - `scripts/prep_vlm_coco.py`: prep helper for COCO-Karpathy — writes a bare HF `Dataset` (default, small slice for smoke runs) or a 3-split `DatasetDict` via `--all-splits` for training + eval.
   - Tests: `tests/unit/test_vlm.py`, `test_vlm_config.py`, `test_modality_context.py`, `test_vision.py`, `test_vlm_dataset.py`, `test_freeze.py`; `tests/integration/test_vlm_train_step.py`, `test_vlm_checkpoint.py`; `tests/distributed/test_vlm_fsdp.py` (gated on multi-GPU).
   - Configs: `configs/train/vlm_debug.toml` (1-GPU smoke), `vlm_7b.toml` / `vlm_7b_ac.toml` / `vlm_7b_siglip2.toml`, `vlm_7b_freeze_schedule.toml`.
 - **Cross-Attention (CA) VLM arch** (`arch = "cross_attention"`, Llama-3-V style). The residual stream stays text-only; image features flow as K/V into separate `CrossAttentionBlock`s inserted at a configurable cadence. CA blocks are zero-initialized so adding the arch on top of a text-only checkpoint is identity at step 0 and learns from there. Composes with MoE in the text `TransformerBlock`s.
