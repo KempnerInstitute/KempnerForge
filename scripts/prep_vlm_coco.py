@@ -218,10 +218,9 @@ def main() -> None:
     else:
         ds = _build_split(args.caption_json, args.image_root, args.num_samples, args.split)
         ds.save_to_disk(args.out)
-        # save_to_disk writes the Dataset (not a DatasetDict). HuggingFaceVLMDataset
-        # handles both shapes via its is_local path; for this prep we store a
-        # single split so load_from_disk returns a bare Dataset that matches
-        # split="train" by convention.
+        # save_to_disk writes a bare Dataset (not a DatasetDict). HuggingFaceVLMDataset
+        # accepts both via its load_from_disk path; for a bare Dataset it uses the
+        # loaded object directly, and the data.hf_dataset_split TOML field is ignored.
         print(f"Saved {len(ds):,} samples to {args.out}")
 
 
