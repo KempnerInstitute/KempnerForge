@@ -81,6 +81,11 @@ seed = 42
 # torch.compile (graph breaks on data-dependent dispatch); JobConfig.validate
 # emits a warning if you flip this on.
 compile_model = false
+# NOTE: AC=full is currently a no-op for MoMa — kempnerforge.distributed.parallel.apply_ac
+# matches `isinstance(m, TransformerBlock)` only, and MoMaBlock is a sibling nn.Module
+# (same gap exists for MoTBlock and CrossAttentionBlock). The follow-up PR will refactor
+# apply_ac to iterate ``transformer.layers`` directly so AC works across all VLM arches.
+# Until then this line has no effect; OOM risk on tighter GPUs is real and unmitigated.
 # Required given the per-layer expert duplication on 4x H200; drop to
 # "selective" or "none" if you scale down experts_per_modality or n_layers.
 activation_checkpointing = "full"

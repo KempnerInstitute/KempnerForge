@@ -331,18 +331,38 @@ class MoMaFFN(nn.Module):
         mod_flat = modality_ids.reshape(b * s)
         out = torch.zeros_like(x_flat)
 
+        # Tracks how many positions actually got routed to *some* modality
+        # group. With well-formed modality_ids (values in [0, len(modalities)))
+        # this equals b*s at the end. We accumulate Python ints from
+        # ``idx.numel()`` (tensor metadata, no host sync) and compare after
+        # the loop — much cheaper than an upfront ``.all()`` reduction which
+        # would force a device->host sync every step. The error fires
+        # post-FFN, but the in-range work is the same either way and the
+        # failure mode without this check is silent zero-output on the
+        # affected positions (residual still carries them through, so the
+        # bug would only surface as quietly wrong training).
+        total_routed = 0
         for i, m in enumerate(self.modalities):
             # nonzero() avoids the boolean-mask copy and gives us a 1-D index
             # tensor we can feed to index_select + scatter.
             idx = (mod_flat == i).nonzero(as_tuple=False).squeeze(-1)  # (N_m,)
             if idx.numel() == 0:
                 continue
+            total_routed += idx.numel()
             x_m = x_flat.index_select(0, idx)  # (N_m, D)
             y_m = self.experts[m](x_m)  # (N_m, D)
             # The modality groups partition the position space, so indices
             # are guaranteed unique across iterations. index_copy on
             # disjoint indices is safe and autograd-friendly.
             out = out.index_copy(0, idx, y_m)
+
+        if total_routed != b * s:
+            raise ValueError(
+                f"MoMaFFN.forward: modality_ids contains out-of-range values; "
+                f"{b * s - total_routed} of {b * s} positions did not match any "
+                f"modality (allowed values: 0..{len(self.modalities) - 1} for "
+                f"modalities {self.modalities!r})"
+            )
         return out.view(b, s, d)
 
 

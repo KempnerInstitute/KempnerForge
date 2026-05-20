@@ -24,7 +24,7 @@ from kempnerforge.model.init import init_weights
 from kempnerforge.model.mlp import build_mlp
 from kempnerforge.model.modality import ModalityContext
 from kempnerforge.model.moe import MoEMLP, build_moe
-from kempnerforge.model.moma import MoMaBlock
+from kempnerforge.model.moma import MoMaBlock, MoMaFFN
 from kempnerforge.model.mot import MoTBlock
 from kempnerforge.model.norm import build_norm
 from kempnerforge.model.position import precompute_rope_frequencies
@@ -262,11 +262,36 @@ class Transformer(nn.Module):
         return total
 
     def get_expert_counts(self) -> dict[int, torch.Tensor]:
-        """Collect per-layer expert utilization. Returns {} if dense."""
+        """Collect per-layer expert utilization for flat MoE layers.
+
+        Returns ``{layer_idx: (num_experts,) tensor}`` for layers whose MLP
+        is a ``MoEMLP`` (the standard, single-pool MoE). Returns ``{}`` for
+        dense models and for MoMa: MoMa's per-modality groups have a
+        different shape (per modality, per expert) and surface through
+        ``get_moma_expert_counts`` instead.
+        """
         counts = {}
         for name, layer in self.layers.items():
             if isinstance(layer.mlp, MoEMLP):
                 counts[int(name)] = layer.mlp.expert_counts
+        return counts
+
+    def get_moma_expert_counts(self) -> dict[int, dict[str, torch.Tensor]]:
+        """Collect per-layer, per-modality expert utilization for MoMa layers.
+
+        Returns ``{layer_idx: {modality: (num_experts_for_modality,) tensor}}``
+        for every layer whose MLP is a ``MoMaFFN``; returns ``{}`` otherwise.
+        Each modality's expert count tensor reflects the most recent forward
+        through that layer's expert-choice router (paper Figure 5-style
+        utilization). Counts on a fresh model (no forward yet) are the
+        router's init zeros.
+        """
+        counts: dict[int, dict[str, torch.Tensor]] = {}
+        for name, layer in self.layers.items():
+            if isinstance(layer.mlp, MoMaFFN):
+                counts[int(name)] = {
+                    m: layer.mlp.experts[m].expert_counts for m in layer.mlp.modalities
+                }
         return counts
 
     def forward(

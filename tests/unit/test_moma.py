@@ -461,6 +461,29 @@ class TestMoMaFFN:
         with pytest.raises(ValueError, match="dtype must be torch.long"):
             ffn(x, torch.zeros(2, 8, dtype=torch.float32))
 
+    def test_forward_rejects_out_of_range_modality_id(self):
+        """A modality id >= len(modalities) is silently equivalent to "no group
+        picked this token" without the check — caller would see zero output
+        at those positions, which is hard to debug. We require an explicit
+        ValueError instead.
+        """
+        ffn = self._make_ffn()
+        ffn.eval()
+        x = torch.randn(2, 4, 32)
+        modality_ids = torch.zeros(2, 4, dtype=torch.long)
+        modality_ids[0, 0] = 2  # only 0 ("image") and 1 ("text") are valid
+        with pytest.raises(ValueError, match="out-of-range"):
+            ffn(x, modality_ids)
+
+    def test_forward_rejects_negative_modality_id(self):
+        ffn = self._make_ffn()
+        ffn.eval()
+        x = torch.randn(2, 4, 32)
+        modality_ids = torch.zeros(2, 4, dtype=torch.long)
+        modality_ids[1, 2] = -1
+        with pytest.raises(ValueError, match="out-of-range"):
+            ffn(x, modality_ids)
+
     def test_all_text_batch_image_positions_zero(self):
         """When no tokens are tagged image, image-position outputs are 0."""
         ffn = self._make_ffn(dim=32)
@@ -715,6 +738,65 @@ class TestTransformerWithMoMaConfig:
         # have gradients.
         assert prefix_embeds.grad is not None
         assert prefix_embeds.grad.abs().sum().item() > 0
+
+    def test_get_expert_counts_returns_empty_for_moma(self):
+        """The flat-MoE helper returns {} for MoMa — MoMa layers expose
+        per-modality counts through get_moma_expert_counts instead.
+        """
+        config = _config(dim=32, n_heads=4, n_kv_heads=4, n_layers=2, max_seq_len=32)
+        vlm = MoMaConfig(
+            moma_experts_per_modality={"image": 2, "text": 2},
+            moma_gumbel_noise=False,
+        )
+        transformer = Transformer(config, vlm_config=vlm, num_image_tokens=4)
+        assert transformer.get_expert_counts() == {}
+
+    def test_get_moma_expert_counts_returns_empty_when_no_moma_layers(self):
+        """Dense Transformer (no MoMa, no MoT, no MoE) has no MoMa layers,
+        so the helper returns {}.
+        """
+        config = _config(dim=32, n_heads=4, n_kv_heads=4, n_layers=2, max_seq_len=32)
+        transformer = Transformer(config)
+        assert transformer.get_moma_expert_counts() == {}
+
+    def test_get_moma_expert_counts_after_forward(self):
+        """After a forward, get_moma_expert_counts surfaces per-layer
+        per-modality utilization tensors (paper Figure 5 shape).
+        """
+        config = _config(dim=32, n_heads=4, n_kv_heads=4, n_layers=2, max_seq_len=32)
+        # Unequal experts per modality so the shape check is meaningful.
+        vlm = MoMaConfig(
+            moma_experts_per_modality={"image": 2, "text": 3},
+            moma_gumbel_noise=False,
+        )
+        transformer = Transformer(config, vlm_config=vlm, num_image_tokens=4)
+        transformer.eval()
+
+        b, n_img, t_text = 1, 4, 4
+        tokens = torch.randint(0, config.vocab_size, (b, t_text))
+        prefix_embeds = torch.randn(b, n_img, config.dim)
+        modality_ids = torch.zeros(b, n_img + t_text, dtype=torch.long)
+        modality_ids[:, n_img:] = 1
+        ctx = ModalityContext(
+            prefix_embeds=prefix_embeds,
+            output_slice=slice(n_img, None),
+            modality_ids=modality_ids,
+        )
+        _ = transformer(tokens=tokens, modality=ctx)
+
+        counts = transformer.get_moma_expert_counts()
+        # Both layers reported.
+        assert set(counts.keys()) == {0, 1}
+        for layer_counts in counts.values():
+            # Both modality groups present.
+            assert set(layer_counts.keys()) == {"image", "text"}
+            # Per-modality shape == (num_experts_for_that_modality,).
+            assert layer_counts["image"].shape == (2,)
+            assert layer_counts["text"].shape == (3,)
+            # Counts are non-negative; expert-choice puts >=1 token per expert
+            # when N_m > 0 (k_e = max(1, ceil(c*N_m)) and N_m == 4 here).
+            assert (layer_counts["image"] >= 1).all()
+            assert (layer_counts["text"] >= 1).all()
 
 
 # ---------------------------------------------------------------------------
