@@ -11,6 +11,8 @@ Design choices:
 
 from __future__ import annotations
 
+from typing import cast
+
 import torch
 import torch.nn as nn
 
@@ -24,7 +26,7 @@ from kempnerforge.model.init import init_weights
 from kempnerforge.model.mlp import build_mlp
 from kempnerforge.model.modality import ModalityContext
 from kempnerforge.model.moe import MoEMLP, build_moe
-from kempnerforge.model.moma import MoMaBlock, MoMaFFN
+from kempnerforge.model.moma import ExpertChoiceMoE, MoMaBlock, MoMaFFN
 from kempnerforge.model.mot import MoTBlock
 from kempnerforge.model.norm import build_norm
 from kempnerforge.model.position import precompute_rope_frequencies
@@ -289,8 +291,14 @@ class Transformer(nn.Module):
         counts: dict[int, dict[str, torch.Tensor]] = {}
         for name, layer in self.layers.items():
             if isinstance(layer.mlp, MoMaFFN):
+                # nn.ModuleDict.__getitem__ returns Module; cast back to the
+                # concrete expert-group type so pyright sees the
+                # ``expert_counts`` Tensor rather than ``Tensor | Module``.
+                # The cast is safe because ``MoMaFFN.__init__`` only ever
+                # writes ``ExpertChoiceMoE`` values into ``experts``.
                 counts[int(name)] = {
-                    m: layer.mlp.experts[m].expert_counts for m in layer.mlp.modalities
+                    m: cast(ExpertChoiceMoE, layer.mlp.experts[m]).expert_counts
+                    for m in layer.mlp.modalities
                 }
         return counts
 
