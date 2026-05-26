@@ -246,3 +246,21 @@ class JobConfig:
                         "(modality_ids-based scatter/gather + expert-choice top-k cause "
                         "graph breaks). Set compile_model=false for MoMa models."
                     )
+
+                # AC=full silently no-ops on MoMa because apply_ac matches
+                # isinstance(m, TransformerBlock) only and MoMaBlock is a
+                # sibling nn.Module. The selective branch wraps
+                # isinstance(m, Attention), and MoMaBlock.attention is a
+                # vanilla Attention, so 'selective' DOES work on MoMa today
+                # — only 'full' is broken. The cross-arch apply_ac refactor
+                # will make 'full' work; until then surface the silent
+                # no-op explicitly so fresh MoMa configs don't trust it.
+                if self.train.activation_checkpointing == "full":
+                    import logging
+
+                    logging.getLogger(__name__).warning(
+                        "AC=full is currently a no-op for MoMa (apply_ac matches "
+                        "TransformerBlock only; MoMaBlock is a sibling nn.Module). "
+                        "Use ac='selective' (wraps the Attention submodule, still works) "
+                        "or reduce moma_experts_per_modality until the apply_ac refactor lands."
+                    )

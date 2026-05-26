@@ -18,10 +18,12 @@
 #
 # Parameter / memory note: with the default 7B-dense-shaped backbone
 # (dim=4096, n_layers=32, ffn ~14336) and 8 SwiGLU experts per layer
-# (4 image + 4 text), total params is much larger than dense 7B. Use
-# FSDP=4 + activation_checkpointing="full" to fit on 4x H200. For a
-# roomier setup, reduce moma_experts_per_modality (e.g. 2t2i) or fall
-# back to the MoT debug config. Pipeline Parallel + VLM is not supported.
+# (4 image + 4 text), total params is much larger than dense 7B. Fitting
+# on 4x H200 today needs FSDP=4 plus reducing moma_experts_per_modality
+# (e.g. 2t2i), or falling back to the MoT debug config —
+# activation_checkpointing="full" is set below but is currently a no-op
+# for MoMa (see the comment near the field). Pipeline Parallel + VLM is
+# not supported.
 #
 # max_seq_len allocation: residual_image_tokens + max_text_len. Image
 # tokens prepend the text sequence in the residual stream, so the budget
@@ -86,8 +88,9 @@ compile_model = false
 # (same gap exists for MoTBlock and CrossAttentionBlock). The follow-up PR will refactor
 # apply_ac to iterate ``transformer.layers`` directly so AC works across all VLM arches.
 # Until then this line has no effect; OOM risk on tighter GPUs is real and unmitigated.
-# Required given the per-layer expert duplication on 4x H200; drop to
-# "selective" or "none" if you scale down experts_per_modality or n_layers.
+# Intended once apply_ac is refactored — at that point this will checkpoint every
+# MoMaBlock per layer and recover the memory budget needed for the per-layer expert
+# duplication on 4x H200. Currently inert (see NOTE above).
 activation_checkpointing = "full"
 loss_fn = "cross_entropy"
 
