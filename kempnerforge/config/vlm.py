@@ -17,6 +17,11 @@ Architecture is a discriminated union on the ``arch`` field:
   cross-attention blocks at a configurable cadence.
 - ``"mot"`` Mixture-of-Transformers: per-modality Q/K/V/O + per-
   modality FFN at every layer, single global self-attention.
+- ``"moma"`` Mixture of Modality-Aware Experts: shared Q/K/V/O +
+  per-modality MoE FFN groups at every layer. Tokens are routed
+  deterministically by modality (level 1) then by a learned
+  expert-choice + Sigmoid router within their modality group
+  (level 2). Lin et al. 2024 (arXiv:2407.21770).
 
 Each arch gets its own ``VLMConfig`` subclass, registered via
 ``registry.register_vlm_config``. The TOML loader dispatches on
@@ -353,3 +358,122 @@ class MoTConfig(VLMConfig):
         n_heads = self.mot_image_n_heads or model_n_heads
         n_kv_heads = self.mot_image_n_kv_heads or model_n_kv_heads or n_heads
         return n_heads, n_kv_heads
+
+
+@registry.register_vlm_config("moma")
+@dataclass
+class MoMaConfig(VLMConfig):
+    """Mixture of Modality-Aware Experts (MoMa): shared self-attention +
+    per-modality MoE FFN groups (Lin et al. 2024, arXiv:2407.21770).
+
+    Each transformer layer is a pre-norm block with:
+
+    - Standard ``Attention`` (one set of Q/K/V/O across modalities) running a
+      single global SDPA over the concatenated image+text sequence.
+    - A ``MoMaFFN`` that routes tokens in two stages:
+
+      1. Deterministic by modality (level 1): token's ``modality_ids`` value
+         selects which modality expert group processes it.
+      2. Learned expert-choice + Sigmoid (level 2): within the modality
+         group, each expert independently picks its top-k tokens by sigmoid
+         score (with optional Gumbel-Sigmoid noise during training; paper
+         Eq. 5). Token output is the sum of selected experts' outputs
+         weighted by their sigmoid scores.
+
+    Image tokens are prepended to the text sequence (same residual layout as
+    Joint-Decoder and MoT). ``modality_ids`` tags every position; the FFN
+    uses these tags for scatter/gather dispatch (works for arbitrary
+    interleaved layouts, not just image-prefix).
+
+    Differs from ``"mot"``: MoT has per-modality Q/K/V/O *and* per-modality
+    FFN. MoMa has shared Q/K/V/O and per-modality MoE FFN groups (multiple
+    experts per modality, learned routing within each group).
+
+    Inference note: expert-choice routing is non-causal (each expert's
+    top-k depends on all tokens in the batch). v1 supports training only;
+    autoregressive generation requires auxiliary routers (paper §2.4),
+    deferred to a follow-up.
+
+    The MoMa-specific module alias ``"moma"`` is added to
+    ``module_patterns`` so freeze targeting works out of the box:
+    ``FreezeSpec("moma", True)`` freezes the per-modality MoE stack
+    (``transformer.layers.*``) without touching the embedding, output head,
+    or final norm.
+    """
+
+    arch: str = "moma"
+    moma_modalities: tuple[str, ...] = ("image", "text")
+    moma_experts_per_modality: dict[str, int] = field(
+        default_factory=lambda: {"image": 4, "text": 4}
+    )
+    moma_capacity_factor: float = 0.0
+    moma_gumbel_noise: bool = True
+    module_patterns: dict[str, list[str]] = field(
+        default_factory=lambda: {
+            **{k: list(v) for k, v in DEFAULT_MODULE_PATTERNS.items()},
+            "moma": [
+                "transformer.layers",
+                "transformer.layers.*",
+            ],
+        }
+    )
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if len(self.moma_modalities) < 2:
+            raise ValueError(
+                f"vlm.moma_modalities must have at least 2 entries (got {self.moma_modalities!r})"
+            )
+        if "text" not in self.moma_modalities:
+            raise ValueError(
+                f"vlm.moma_modalities must include 'text' (got {self.moma_modalities!r})"
+            )
+        if "image" not in self.moma_modalities:
+            raise ValueError(
+                f"vlm.moma_modalities must include 'image' (got {self.moma_modalities!r})"
+            )
+        if len(set(self.moma_modalities)) != len(self.moma_modalities):
+            raise ValueError(
+                f"vlm.moma_modalities must not contain duplicates (got {self.moma_modalities!r})"
+            )
+        missing = set(self.moma_modalities) - set(self.moma_experts_per_modality.keys())
+        if missing:
+            raise ValueError(
+                f"vlm.moma_experts_per_modality missing entries for {sorted(missing)} "
+                f"(got {self.moma_experts_per_modality!r}, need keys for all "
+                f"moma_modalities {self.moma_modalities!r})"
+            )
+        extra = set(self.moma_experts_per_modality.keys()) - set(self.moma_modalities)
+        if extra:
+            raise ValueError(
+                f"vlm.moma_experts_per_modality has unknown modality keys {sorted(extra)} "
+                f"(allowed: {sorted(self.moma_modalities)})"
+            )
+        for m, n in self.moma_experts_per_modality.items():
+            if n <= 0:
+                raise ValueError(
+                    f"vlm.moma_experts_per_modality[{m!r}] must be positive "
+                    f"(got {n}). For dense per-modality FFN use arch='mot' instead."
+                )
+        if self.moma_capacity_factor < 0:
+            raise ValueError(
+                f"vlm.moma_capacity_factor must be >= 0 (got {self.moma_capacity_factor})"
+            )
+
+    def residual_stream_image_tokens(self, num_tokens: int) -> int:
+        """MoMa prepends ``num_tokens`` image tokens to the text sequence
+        (same residual-stream layout as Joint-Decoder).
+        """
+        return num_tokens
+
+    def effective_capacity_factor(self, modality: str) -> float:
+        """Resolve the per-expert capacity factor for ``modality``.
+
+        Paper default (``moma_capacity_factor == 0``): return
+        ``1 / |E^M|`` so each expert sees the average load per modality
+        (perfect balance under expert-choice routing). Explicit positive
+        values pass through unchanged.
+        """
+        if self.moma_capacity_factor > 0:
+            return self.moma_capacity_factor
+        return 1.0 / self.moma_experts_per_modality[modality]

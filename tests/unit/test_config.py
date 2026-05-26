@@ -24,6 +24,7 @@ from kempnerforge.config.schema import (
     VisionEncoderConfig,
     VLMConfig,
 )
+from kempnerforge.config.vlm import MoMaConfig
 
 # ---------------------------------------------------------------------------
 # ModelConfig
@@ -482,6 +483,97 @@ class TestHfEncoderOverrideWarning:
         with caplog.at_level("WARNING", logger="kempnerforge.config.job"):
             self._vlm_config_with(type="random", feature_dim=384, num_tokens=64)
         assert not any("random" in r.getMessage() for r in caplog.records)
+
+
+class TestMoMaAcFullWarning:
+    """``JobConfig.validate`` warns when MoMa is paired with
+    ``activation_checkpointing="full"`` because ``apply_ac`` matches
+    ``isinstance(m, TransformerBlock)`` only — and ``MoMaBlock`` is a
+    sibling ``nn.Module``, so AC=full silently no-ops on MoMa. The
+    ``selective`` branch wraps ``isinstance(m, Attention)`` and
+    ``MoMaBlock.attention`` is a standard ``Attention``, so
+    ``selective`` and ``none`` are correct and MUST NOT warn. Non-MoMa
+    arches are unaffected and must not warn either.
+
+    Mirrors ``TestHfEncoderOverrideWarning``'s caplog plumbing: the
+    ``kempnerforge`` logger has propagation disabled by
+    ``metrics.logger._configure_root``, so we re-enable it for the
+    duration of each test so pytest's root-attached caplog can observe
+    records from ``kempnerforge.config.job``.
+    """
+
+    def setup_method(self):
+        import logging
+
+        self._kf_logger = logging.getLogger("kempnerforge")
+        self._old_propagate = self._kf_logger.propagate
+        self._kf_logger.propagate = True
+
+    def teardown_method(self):
+        self._kf_logger.propagate = self._old_propagate
+
+    def _moma_job(self, ac: ActivationCheckpointing) -> JobConfig:
+        return JobConfig(
+            model=ModelConfig(max_seq_len=1024),
+            train=TrainConfig(
+                seq_len=576,
+                activation_checkpointing=ac,
+                # Silence the sibling MoMa-compile warning so it can't
+                # accidentally satisfy our "no AC warning" assertions.
+                compile_model=False,
+            ),
+            vision_encoder=VisionEncoderConfig(type="random", feature_dim=256, num_tokens=64),
+            adapter=AdapterConfig(),
+            vlm=MoMaConfig(max_text_len=512),
+        )
+
+    def test_warns_on_full(self, caplog):
+        cfg = self._moma_job(ActivationCheckpointing.full)
+        with caplog.at_level("WARNING", logger="kempnerforge.config.job"):
+            cfg.validate(world_size=1)
+        assert any(
+            "AC=full is currently a no-op for MoMa" in r.getMessage()
+            and "selective" in r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_no_warning_on_selective(self, caplog):
+        cfg = self._moma_job(ActivationCheckpointing.selective)
+        with caplog.at_level("WARNING", logger="kempnerforge.config.job"):
+            cfg.validate(world_size=1)
+        assert not any(
+            "AC=full is currently a no-op for MoMa" in r.getMessage() for r in caplog.records
+        )
+
+    def test_no_warning_on_none(self, caplog):
+        cfg = self._moma_job(ActivationCheckpointing.none)
+        with caplog.at_level("WARNING", logger="kempnerforge.config.job"):
+            cfg.validate(world_size=1)
+        assert not any(
+            "AC=full is currently a no-op for MoMa" in r.getMessage() for r in caplog.records
+        )
+
+    def test_no_warning_for_non_moma_arch_with_full(self, caplog):
+        """A non-MoMa arch (default joint_decoder) with AC=full uses
+        TransformerBlock-shaped layers, which apply_ac handles correctly.
+        The MoMa-only warning must not fire.
+        """
+        cfg = JobConfig(
+            model=ModelConfig(max_seq_len=1024),
+            train=TrainConfig(
+                seq_len=576,
+                activation_checkpointing=ActivationCheckpointing.full,
+                compile_model=False,
+            ),
+            vision_encoder=VisionEncoderConfig(type="random", feature_dim=256, num_tokens=64),
+            adapter=AdapterConfig(),
+            vlm=VLMConfig(max_text_len=512),  # default arch = joint_decoder
+        )
+        with caplog.at_level("WARNING", logger="kempnerforge.config.job"):
+            cfg.validate(world_size=1)
+        assert not any(
+            "AC=full is currently a no-op for MoMa" in r.getMessage() for r in caplog.records
+        )
 
 
 # ---------------------------------------------------------------------------

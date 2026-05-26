@@ -11,12 +11,14 @@ Design choices:
 
 from __future__ import annotations
 
+from typing import cast
+
 import torch
 import torch.nn as nn
 
 from kempnerforge.config.registry import registry
 from kempnerforge.config.schema import ModelConfig
-from kempnerforge.config.vlm import CrossAttentionConfig, MoTConfig, VLMConfig
+from kempnerforge.config.vlm import CrossAttentionConfig, MoMaConfig, MoTConfig, VLMConfig
 from kempnerforge.model.attention import Attention, KVCache
 from kempnerforge.model.cross_attention import CrossAttentionBlock
 from kempnerforge.model.embedding import OutputHead, TokenEmbedding
@@ -24,6 +26,7 @@ from kempnerforge.model.init import init_weights
 from kempnerforge.model.mlp import build_mlp
 from kempnerforge.model.modality import ModalityContext
 from kempnerforge.model.moe import MoEMLP, build_moe
+from kempnerforge.model.moma import ExpertChoiceMoE, MoMaBlock, MoMaFFN
 from kempnerforge.model.mot import MoTBlock
 from kempnerforge.model.norm import build_norm
 from kempnerforge.model.position import precompute_rope_frequencies
@@ -116,11 +119,16 @@ class Transformer(nn.Module):
         # MoT branch: build MoTBlocks instead of TransformerBlocks. v1
         # enforces equal head counts across modalities (single global
         # SDPA over the concatenated multi-modality sequence).
+        # MoMa branch: build MoMaBlocks (shared Q/K/V/O attention +
+        # per-modality MoE FFN groups). The branches are mutually
+        # exclusive on layer construction; CA layers are still attached
+        # separately below for ``CrossAttentionConfig``.
         # num_image_tokens flows in from the vision encoder via the VLM
         # build path; it is unused for non-MoT arches but kept as a single
         # constructor arg so the signature is uniform across arches.
         self._mot_modalities: tuple[str, ...] = ()
         self._mot_n_image: int = 0
+        self._moma_modalities: tuple[str, ...] = ()
         if isinstance(vlm_config, MoTConfig):
             text_n_kv_heads = config.n_kv_heads if config.n_kv_heads is not None else config.n_heads
             img_n_heads, img_n_kv_heads = vlm_config.resolved_image_heads(
@@ -137,6 +145,25 @@ class Transformer(nn.Module):
             self.layers = nn.ModuleDict(
                 {
                     str(i): MoTBlock(config, modalities=self._mot_modalities, layer_idx=i)
+                    for i in range(config.n_layers)
+                }
+            )
+        elif isinstance(vlm_config, MoMaConfig):
+            self._moma_modalities = vlm_config.moma_modalities
+            experts_per_modality = dict(vlm_config.moma_experts_per_modality)
+            capacity_factor_per_modality = {
+                m: vlm_config.effective_capacity_factor(m) for m in self._moma_modalities
+            }
+            self.layers = nn.ModuleDict(
+                {
+                    str(i): MoMaBlock(
+                        config,
+                        modalities=self._moma_modalities,
+                        experts_per_modality=experts_per_modality,
+                        capacity_factor_per_modality=capacity_factor_per_modality,
+                        gumbel_noise=vlm_config.moma_gumbel_noise,
+                        layer_idx=i,
+                    )
                     for i in range(config.n_layers)
                 }
             )
@@ -237,11 +264,42 @@ class Transformer(nn.Module):
         return total
 
     def get_expert_counts(self) -> dict[int, torch.Tensor]:
-        """Collect per-layer expert utilization. Returns {} if dense."""
+        """Collect per-layer expert utilization for flat MoE layers.
+
+        Returns ``{layer_idx: (num_experts,) tensor}`` for layers whose MLP
+        is a ``MoEMLP`` (the standard, single-pool MoE). Returns ``{}`` for
+        dense models and for MoMa: MoMa's per-modality groups have a
+        different shape (per modality, per expert) and surface through
+        ``get_moma_expert_counts`` instead.
+        """
         counts = {}
         for name, layer in self.layers.items():
             if isinstance(layer.mlp, MoEMLP):
                 counts[int(name)] = layer.mlp.expert_counts
+        return counts
+
+    def get_moma_expert_counts(self) -> dict[int, dict[str, torch.Tensor]]:
+        """Collect per-layer, per-modality expert utilization for MoMa layers.
+
+        Returns ``{layer_idx: {modality: (num_experts_for_modality,) tensor}}``
+        for every layer whose MLP is a ``MoMaFFN``; returns ``{}`` otherwise.
+        Each modality's expert count tensor reflects the most recent forward
+        through that layer's expert-choice router (paper Figure 5-style
+        utilization). Counts on a fresh model (no forward yet) are the
+        router's init zeros.
+        """
+        counts: dict[int, dict[str, torch.Tensor]] = {}
+        for name, layer in self.layers.items():
+            if isinstance(layer.mlp, MoMaFFN):
+                # nn.ModuleDict.__getitem__ returns Module; cast back to the
+                # concrete expert-group type so pyright sees the
+                # ``expert_counts`` Tensor rather than ``Tensor | Module``.
+                # The cast is safe because ``MoMaFFN.__init__`` only ever
+                # writes ``ExpertChoiceMoE`` values into ``experts``.
+                counts[int(name)] = {
+                    m: cast(ExpertChoiceMoE, layer.mlp.experts[m]).expert_counts
+                    for m in layer.mlp.modalities
+                }
         return counts
 
     def forward(
@@ -351,6 +409,27 @@ class Transformer(nn.Module):
         cos = self._rope_cos[start_pos : start_pos + seq_len]  # type: ignore[reportOptionalSubscript]
         sin = self._rope_sin[start_pos : start_pos + seq_len]  # type: ignore[reportOptionalSubscript]
 
+        # MoMa path: single residual stream + shared SDPA + per-modality
+        # MoE FFN groups. modality_ids tags every position and the
+        # ``MoMaFFN`` uses these tags to dispatch tokens to per-modality
+        # expert groups (level-1 deterministic routing); within each
+        # group, expert-choice + Sigmoid routing picks experts
+        # (level-2 learned routing). EC routing is non-causal, so
+        # ``kv_caches`` is rejected upstream (training-only in v1).
+        if self._moma_modalities:
+            if modality_ids is None:
+                raise ValueError(
+                    "MoMa model requires modality.modality_ids (got None). Build the "
+                    "ModalityContext via MoMaStrategy or set modality_ids explicitly."
+                )
+            if modality_ids.shape != h.shape[:2]:
+                raise ValueError(
+                    f"modality.modality_ids shape {tuple(modality_ids.shape)} does not "
+                    f"match residual shape {tuple(h.shape[:2])}"
+                )
+            for layer in self.layers.values():
+                h = layer(h, cos, sin, modality_ids, doc_ids=doc_ids)
+            h = self.norm(h)
         # MoT path: position-based image-then-text split, per-modality
         # streams through the MoTBlock stack, single global SDPA per
         # layer. modality_ids is required (presence + shape checked
@@ -358,7 +437,7 @@ class Transformer(nn.Module):
         # tags are validated for shape but not value-matched against
         # positions, so a future per-token scatter/gather can land
         # without changing the public interface.
-        if self._mot_modalities:
+        elif self._mot_modalities:
             if modality_ids is None:
                 raise ValueError(
                     "MoT model requires modality.modality_ids (got None). Build the "

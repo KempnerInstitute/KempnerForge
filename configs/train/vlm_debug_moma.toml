@@ -1,0 +1,90 @@
+# VLM smoke config — Mixture of Modality-Aware Experts (MoMa) arch,
+# tiny LLM + random vision encoder.
+#
+# Mode: smoke.
+#
+# Runs end-to-end in <2 minutes on 1 GPU. Uses RandomVisionEncoder so no
+# HF download is needed. Shared Q/K/V/O self-attention + per-modality
+# MoE FFN groups with expert-choice + Sigmoid routing (Lin et al. 2024,
+# arXiv:2407.21770). 2 text experts + 2 image experts at every layer.
+#
+# max_seq_len allocation: residual_image_tokens + max_text_len. Image
+# tokens prepend the text sequence in the residual stream (same layout
+# as Joint-Decoder / MoT).
+#
+# Note: MoMa v1 supports training only. Expert-choice routing is
+# non-causal; autoregressive generation requires auxiliary routers
+# (paper §2.4), deferred to a follow-up.
+#
+# Usage:
+#   uv run python scripts/train.py configs/train/vlm_debug_moma.toml \
+#       --data.hf_dataset_name=... --data.tokenizer_path=gpt2
+
+[model]
+dim = 256
+n_layers = 4
+n_heads = 4
+n_kv_heads = 4
+vocab_size = 50257     # gpt2 vocab
+max_seq_len = 576      # 64 image + 512 text
+norm_type = "rmsnorm"
+activation = "silu"
+
+[vision_encoder]
+type = "random"
+feature_dim = 384
+num_tokens = 64
+
+[vlm]
+arch = "moma"
+
+[vlm.moma_experts_per_modality]
+image = 2
+text = 2
+
+[train]
+batch_size = 2
+seq_len = 576
+max_steps = 50
+grad_accum_steps = 1
+grad_clip_norm = 1.0
+seed = 42
+compile_model = false
+activation_checkpointing = "none"
+
+[optimizer]
+name = "adamw"
+lr = 3e-4
+weight_decay = 0.1
+betas = [0.9, 0.95]
+fused = false
+
+[scheduler]
+name = "cosine"
+warmup_steps = 5
+min_lr_ratio = 0.1
+
+[data]
+# 30-sample COCO val substitute (sayakpaul/coco-30-val-2014). For a real
+# training run, override via CLI: --data.hf_dataset_name=<your-dataset>
+hf_dataset_name = "sayakpaul/coco-30-val-2014"
+hf_dataset_split = "train"
+hf_dataset_image_field = "image"
+hf_dataset_text_field = "caption"
+hf_image_size = 224
+tokenizer_path = "gpt2"
+num_workers = 2
+pin_memory = true
+
+[distributed]
+dp_shard = -1
+
+[checkpoint]
+dir = "checkpoints/vlm_debug_moma"
+interval = 25
+keep_last_n = 2
+
+[metrics]
+log_interval = 5
+enable_wandb = false
+enable_tensorboard = false

@@ -23,6 +23,9 @@ Strategies registered today:
   Joint-Decoder (image-then-text concat, ``output_slice`` trims image
   positions before the head), plus a per-position ``modality_ids``
   tag that the ``MoTBlock`` stack consumes for routing.
+- ``"moma"`` — Mixture of Modality-Aware Experts. Same residual layout
+  and ``modality_ids`` tagging as MoT; per-layer block has shared
+  Q/K/V/O attention but per-modality MoE FFN groups.
 
 ``inner_transformer(model)`` is the explicit unwrap helper used by the
 training loop when it needs to reach Transformer-internal state
@@ -155,6 +158,48 @@ class MoTStrategy:
 
     ``output_slice`` trims the image prefix off the residual before
     the LM head, matching ``JointDecoderStrategy``.
+    """
+
+    def prepare(
+        self,
+        wrapper: VLMWrapper,
+        pixel_values: torch.Tensor,
+        input_ids: torch.Tensor,
+    ) -> ModalityContext:
+        img_embeds = _project_image_features(wrapper, pixel_values)
+        n = wrapper.vision_encoder.num_tokens
+        b, t_text = input_ids.shape
+        modality_ids = torch.zeros(b, n + t_text, dtype=torch.long, device=input_ids.device)
+        modality_ids[:, n:] = 1
+        return ModalityContext(
+            prefix_embeds=img_embeds,
+            output_slice=slice(n, None),
+            modality_ids=modality_ids,
+        )
+
+    def num_image_tokens(self, wrapper: VLMWrapper) -> int:
+        return wrapper.vision_encoder.num_tokens
+
+
+@registry.register_modality_strategy("moma")
+class MoMaStrategy:
+    """Mixture of Modality-Aware Experts: same residual-stream layout as
+    Joint-Decoder/MoT (image embeds prepended, ``output_slice`` trims them
+    before the LM head), plus a per-position ``modality_ids`` tag the
+    MoMa FFN stack consumes for true scatter/gather dispatch (level-1
+    deterministic routing by modality).
+
+    Forward path: ``feats = vision_encoder(pixel_values)``;
+    ``img_embeds = adapter(feats)``;
+    ``ModalityContext(prefix_embeds, output_slice, modality_ids)``.
+
+    Convention: ``modality_ids == 0`` for image positions and
+    ``modality_ids == 1`` for text positions, matching the index order
+    of ``MoMaConfig.moma_modalities = ("image", "text")``. The MoMa
+    FFN uses these tags to dispatch tokens to per-modality expert
+    groups; positions are *not* assumed to be in any particular order,
+    so interleaved layouts work too (image-prefix is just one
+    instantiation).
     """
 
     def prepare(
