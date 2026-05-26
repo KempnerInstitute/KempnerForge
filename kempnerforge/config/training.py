@@ -25,7 +25,8 @@ class TrainConfig:
     max_steps: int = 100000
     grad_accum_steps: int = 1
     grad_clip_norm: float = 1.0
-    seed: int = 42
+    seed: int = 42  # Seeds parameter init, dropout, and (by default) data order
+    data_seed: int | None = None  # Overrides data/batch order only; None falls back to seed
     compile_model: bool = True
     mixed_precision: Literal["bf16", "fp16", "fp32", "fp8"] = "bf16"
     activation_checkpointing: ActivationCheckpointing = ActivationCheckpointing.none
@@ -67,3 +68,15 @@ class TrainConfig:
     def is_fp8(self) -> bool:
         """Whether FP8 mixed precision is enabled."""
         return self.mixed_precision == "fp8"
+
+    @property
+    def effective_data_seed(self) -> int:
+        """Seed for data shuffling / batch composition.
+
+        Falls back to ``seed`` when ``data_seed`` is unset, so existing configs
+        reproduce their current trajectory. Kept independent from ``seed``
+        (parameter init) so stability studies can vary batch order while holding
+        initialization fixed. Must stay identical across data-parallel ranks so
+        the global shuffle is consistent before rank partitioning.
+        """
+        return self.data_seed if self.data_seed is not None else self.seed
