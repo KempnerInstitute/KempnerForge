@@ -164,3 +164,54 @@ class TestCheckpointRoundtrip:
         assert abs(ref_loss - resumed_loss) < 1e-4, (
             f"Resumed loss differs: ref={ref_loss:.6f}, resumed={resumed_loss:.6f}"
         )
+
+    def test_manager_restores_optimizer_moments_single_gpu(self, tmp_path):
+        """Single-GPU: CheckpointManager must restore optimizer moments into a
+        FRESH optimizer (the resume scenario).
+
+        Plain torch.save/load round-trips an optimizer fine, so the tests above
+        don't exercise the bug. The manager's DCP path filled the load template
+        from a freshly-built optimizer's *empty* state_dict, silently dropping the
+        moments. This guards that single-GPU manager path (the distributed
+        equivalent is in tests/distributed/test_checkpoint.py).
+        """
+        from kempnerforge.checkpoint.manager import CheckpointManager
+        from kempnerforge.config.schema import CheckpointConfig
+
+        def moments(optimizer):
+            out = []
+            for group in optimizer.param_groups:
+                for p in group["params"]:
+                    st = optimizer.state.get(p, {})
+                    if "exp_avg" in st:
+                        out.append((st["exp_avg"].clone(), st["exp_avg_sq"].clone()))
+            return out
+
+        torch.manual_seed(0)
+        model = Transformer(CONFIG).to(DEVICE)
+        opt = build_optimizer(model, OptimizerConfig(lr=1e-3, fused=False))
+        for _ in range(3):
+            tokens = torch.randint(0, 256, (2, 32), device=DEVICE)
+            model(tokens).sum().backward()
+            opt.step()
+            opt.zero_grad()
+
+        ref = moments(opt)
+        assert ref and any(ea.abs().sum().item() > 0 for ea, _ in ref), (
+            "no non-zero moments to test"
+        )
+
+        ckpt_dir = str(tmp_path / "ckpt")
+        CheckpointManager(CheckpointConfig(dir=ckpt_dir), model, opt).save(step=3)
+
+        # Fresh model + fresh optimizer (empty state) -> the resume scenario.
+        model2 = Transformer(CONFIG).to(DEVICE)
+        opt2 = build_optimizer(model2, OptimizerConfig(lr=1e-3, fused=False))
+        assert not moments(opt2), "fresh optimizer should have empty state before load"
+        CheckpointManager(CheckpointConfig(dir=ckpt_dir), model2, opt2).load()
+
+        loaded = moments(opt2)
+        assert loaded, "optimizer moments not restored via manager (momentum reset on resume)"
+        for (rea, rev), (lea, lev) in zip(ref, loaded, strict=True):
+            assert torch.equal(rea, lea), "exp_avg not restored bit-exactly"
+            assert torch.equal(rev, lev), "exp_avg_sq not restored bit-exactly"

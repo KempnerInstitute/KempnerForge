@@ -20,6 +20,12 @@ from typing import Any, cast
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
+from torch.distributed.checkpoint.state_dict import (
+    get_model_state_dict,
+    get_optimizer_state_dict,
+    set_model_state_dict,
+    set_optimizer_state_dict,
+)
 
 from kempnerforge.checkpoint.async_save import AsyncCheckpointer
 from kempnerforge.checkpoint.state import build_train_state, restore_train_state
@@ -240,10 +246,15 @@ class CheckpointManager:
         dcp_dir = ckpt_dir / f"pp{self._pp_rank}" if self._pp_rank is not None else ckpt_dir
         dcp_dir.mkdir(parents=True, exist_ok=True)
 
-        # Save distributed state (model + optimizer) via DCP
+        # Save distributed state (model + optimizer) via DCP. Use the DCP-aware
+        # state-dict helpers, NOT raw optimizer.state_dict(): on load they build a
+        # template with the optimizer moment tensors allocated so dcp.load can
+        # repopulate them. A freshly-constructed optimizer's raw state_dict() is
+        # empty, so the moments would be silently dropped on resume (Adam momentum
+        # resets to zero -> non-bit-exact resume; see manager load()).
         dcp_state = {
-            "model": self.model.state_dict(),
-            "optimizer": self.optimizer.state_dict(),
+            "model": get_model_state_dict(self.model),
+            "optimizer": get_optimizer_state_dict(self.model, self.optimizer),
         }
         # Dispatch the DCP save. For async modes this returns immediately but
         # FIRST awaits the previous in-flight flush, so any deferred
@@ -457,19 +468,29 @@ class CheckpointManager:
         # Load distributed state via DCP
         dcp_dir = ckpt_dir / f"pp{self._pp_rank}" if self._pp_rank is not None else ckpt_dir
 
+        load_model = exclude_keys is None or "model" not in exclude_keys
+        load_optim = exclude_keys is None or "optimizer" not in exclude_keys
+
+        # Build properly-structured (FSDP-sharded, moment-allocated) templates via
+        # the DCP-aware getters so dcp.load can repopulate them, then write them
+        # back with the setters. Raw optimizer.state_dict() would be empty on a
+        # fresh optimizer, so dcp.load would find no moment tensors to fill and the
+        # AdamW momentum would silently reset to zero on resume.
         dcp_state: dict[str, Any] = {}
-        if exclude_keys is None or "model" not in exclude_keys:
-            dcp_state["model"] = self.model.state_dict()
-        if exclude_keys is None or "optimizer" not in exclude_keys:
-            dcp_state["optimizer"] = self.optimizer.state_dict()
+        if load_model:
+            dcp_state["model"] = get_model_state_dict(self.model)
+        if load_optim:
+            dcp_state["optimizer"] = get_optimizer_state_dict(self.model, self.optimizer)
 
         if dcp_state:
             dcp.load(dcp_state, checkpoint_id=str(dcp_dir), process_group=self._process_group)
 
-            if "model" in dcp_state:
-                self.model.load_state_dict(dcp_state["model"])
-            if "optimizer" in dcp_state:
-                self.optimizer.load_state_dict(dcp_state["optimizer"])
+            if load_model:
+                set_model_state_dict(self.model, dcp_state["model"])
+            if load_optim:
+                set_optimizer_state_dict(
+                    self.model, self.optimizer, optim_state_dict=dcp_state["optimizer"]
+                )
 
         # Load non-distributed state. On NFS/Lustre, independent stat()
         # calls can disagree briefly across ranks; if some ranks enter
