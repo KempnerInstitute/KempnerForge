@@ -169,6 +169,18 @@ class TestTrainConfig:
         with pytest.raises(ValueError, match="grad_accum_steps must be positive"):
             TrainConfig(grad_accum_steps=0)
 
+    def test_data_seed_defaults_to_none(self):
+        assert TrainConfig().data_seed is None
+
+    def test_effective_data_seed_falls_back_to_seed(self):
+        t = TrainConfig(seed=123)
+        assert t.effective_data_seed == 123
+
+    def test_effective_data_seed_overrides_when_set(self):
+        t = TrainConfig(seed=123, data_seed=456)
+        assert t.effective_data_seed == 456
+        assert t.seed == 123  # init seed stays independent
+
 
 # ---------------------------------------------------------------------------
 # OptimizerConfig

@@ -319,7 +319,7 @@ def main() -> None:
             _pad_id = _tok.eos_token_id if _tok.eos_token_id is not None else 0
         collator = VLMCollator(pad_id=int(_pad_id), max_text_len=vlm_cfg.max_text_len)
         sampler = DistributedSampler(
-            dataset, num_replicas=dp_size, rank=dp_rank, shuffle=True, seed=tc.seed
+            dataset, num_replicas=dp_size, rank=dp_rank, shuffle=True, seed=tc.effective_data_seed
         )
         dataloader = StatefulDataLoader(
             dataset,
@@ -373,7 +373,7 @@ def main() -> None:
             num_replicas=dp_size,
             rank=dp_rank,
             shuffle=True,
-            seed=tc.seed,
+            seed=tc.effective_data_seed,
             temperature=config.data.mix_temperature,
         )
         dataloader = StatefulDataLoader(
@@ -401,7 +401,7 @@ def main() -> None:
             num_replicas=dp_size,
             rank=dp_rank,
             shuffle=True,
-            seed=tc.seed,
+            seed=tc.effective_data_seed,
         )
         dataloader = StatefulDataLoader(
             dataset,
@@ -429,7 +429,7 @@ def main() -> None:
                 dataset_config=config.data.hf_dataset_config,
                 rank=dp_rank,
                 world_size=dp_size,
-                seed=tc.seed,
+                seed=tc.effective_data_seed,
                 pack_sequences=config.data.pack_sequences,
             )
             dataloader = TorchDataLoader(
@@ -463,7 +463,7 @@ def main() -> None:
                 num_replicas=dp_size,
                 rank=dp_rank,
                 shuffle=True,
-                seed=tc.seed,
+                seed=tc.effective_data_seed,
             )
             dataloader = StatefulDataLoader(
                 dataset,
