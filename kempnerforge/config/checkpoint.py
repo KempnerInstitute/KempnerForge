@@ -18,9 +18,11 @@ class CheckpointConfig:
     """Checkpointing settings."""
 
     dir: str = "checkpoints"
-    interval: int = 1000  # Save every N steps
+    interval: int = 1000  # Save every N steps (after log_until in "log" mode)
+    schedule: Literal["interval", "log"] = "interval"  # "log": dense early saves for dynamics
+    log_until: int = 512  # In "log" mode: save at step 0 and powers of two up to this step
     async_mode: AsyncCheckpointMode = AsyncCheckpointMode.disabled
-    keep_last_n: int = 3  # Number of checkpoints to retain
+    keep_last_n: int = 3  # Checkpoints to retain; <= 0 keeps all (e.g. for dynamics studies)
     load_path: str | None = None  # Path to load from (for resumption)
     export_dtype: Literal["float32", "bfloat16"] = "bfloat16"
     exclude_from_loading: list[str] = field(default_factory=list)
@@ -33,5 +35,18 @@ class CheckpointConfig:
     def __post_init__(self) -> None:
         if self.interval <= 0:
             raise ValueError("interval must be positive")
-        if self.keep_last_n < 1:
-            raise ValueError("keep_last_n must be >= 1")
+        if self.schedule == "log" and self.log_until < 1:
+            raise ValueError("log_until must be positive when schedule='log'")
+
+    def should_save(self, step: int) -> bool:
+        """Whether to write a checkpoint at ``step``.
+
+        ``interval`` mode saves every ``interval`` steps. ``log`` mode saves at
+        step 0 and each power of two up to ``log_until`` -- dense coverage of the
+        early-training dynamics -- then falls back to every ``interval`` steps.
+        Pair ``log`` mode with ``keep_last_n <= 0`` so the early checkpoints
+        survive retention.
+        """
+        if self.schedule == "log" and step <= self.log_until:
+            return step == 0 or (step & (step - 1)) == 0
+        return step % self.interval == 0

@@ -963,7 +963,7 @@ def main() -> None:
             ckpt_extra["vlm_freeze"] = canonical_freeze_meta(
                 effective_freeze(step, vlm_cfg.freeze, vlm_cfg.freeze_schedule, valid_modules)
             )
-        if step % config.checkpoint.interval == 0:
+        if config.checkpoint.should_save(step):
             ckpt_mgr.save(
                 step=step,
                 tokens_seen=tokens_seen,

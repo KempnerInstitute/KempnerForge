@@ -251,6 +251,37 @@ class TestCheckpointConfig:
         with pytest.raises(ValueError, match="interval must be positive"):
             CheckpointConfig(interval=0)
 
+    def test_schedule_defaults_to_interval(self):
+        assert CheckpointConfig().schedule == "interval"
+
+    def test_interval_schedule_saves_on_multiples(self):
+        c = CheckpointConfig(interval=100)
+        assert c.should_save(0)
+        assert c.should_save(100)
+        assert not c.should_save(150)
+
+    def test_log_schedule_saves_powers_of_two_early(self):
+        c = CheckpointConfig(schedule="log", log_until=512, interval=1000)
+        for step in (0, 1, 2, 4, 8, 256, 512):
+            assert c.should_save(step), f"expected save at {step}"
+        for step in (3, 5, 100, 300):
+            assert not c.should_save(step), f"unexpected save at {step}"
+
+    def test_log_schedule_uses_interval_after_log_until(self):
+        c = CheckpointConfig(schedule="log", log_until=512, interval=1000)
+        assert c.should_save(1000)
+        assert c.should_save(2000)
+        assert not c.should_save(1500)
+
+    def test_keep_last_n_allows_keep_all(self):
+        # <= 0 means retain all checkpoints (CheckpointManager._cleanup early-returns)
+        assert CheckpointConfig(keep_last_n=0).keep_last_n == 0
+        assert CheckpointConfig(keep_last_n=-1).keep_last_n == -1
+
+    def test_rejects_nonpositive_log_until_in_log_mode(self):
+        with pytest.raises(ValueError, match="log_until must be positive"):
+            CheckpointConfig(schedule="log", log_until=0)
+
 
 # ---------------------------------------------------------------------------
 # ProfilingConfig
