@@ -186,6 +186,31 @@ class Registry:
     def list_adapters(self) -> list[str]:
         return self.list("adapter")
 
+    def register_dyn_ckpt_strategy(self, name: str) -> Callable:
+        """Decorator to register a dynamic-checkpointing-window strategy.
+
+        Strategies take ``(window: DynamicCheckpointWindow, step: int)`` and
+        return ``True`` iff ``step`` should be saved by the dynamic window.
+        ``DynamicCheckpointWindow.is_milestone`` looks the strategy up here by
+        name; ``CheckpointManager._cleanup`` exempts every step the strategy
+        fires on from ``keep_last_n`` retention.
+
+        Ships with ``"power2"`` registered by default in
+        ``kempnerforge/config/checkpoint.py``.
+        """
+
+        def decorator(fn: Callable) -> Callable:
+            self.register("dyn_ckpt_strategy", name, fn)
+            return fn
+
+        return decorator
+
+    def get_dyn_ckpt_strategy(self, name: str) -> Callable:
+        return self.get("dyn_ckpt_strategy", name)
+
+    def list_dyn_ckpt_strategies(self) -> list[str]:
+        return self.list("dyn_ckpt_strategy")
+
 
 # Global registry instance
 registry = Registry()

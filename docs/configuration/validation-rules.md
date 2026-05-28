@@ -120,7 +120,12 @@ File:
 [`kempnerforge/config/checkpoint.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/config/checkpoint.py).
 
 - `interval > 0`.
-- `keep_last_n ≥ 1`.
+- If `dyn_ckpt_window` is set:
+  - `dyn_ckpt_window.start >= 0`.
+  - `dyn_ckpt_window.stop >= dyn_ckpt_window.start`.
+  - `dyn_ckpt_window.strategy` must name a registered dyn_ckpt strategy
+    (`"power2"` ships by default; see
+    [`kempnerforge/config/registry.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/config/registry.py)).
 
 ### `MetricsConfig`
 
