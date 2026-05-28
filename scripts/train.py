@@ -626,6 +626,29 @@ def main() -> None:
     if prof is not None:
         prof.start()
 
+    # Capture the initial weights (step 0) on fresh start when the
+    # dyn_ckpt_window covers step 0 -- the per-step save gate only runs
+    # after a training step completes, so without this the random init
+    # is never persisted. Skipped on resume (step > 0).
+    if step == 0 and config.checkpoint.is_dynamic_milestone(0):
+        init_extra: dict = {"phase_idx": current_phase_idx} if active_phases else {}
+        if config.metrics.wandb_run_id:
+            init_extra["wandb_run_id"] = config.metrics.wandb_run_id
+        if is_vlm:
+            assert vlm_cfg is not None
+            valid_modules = set(vlm_cfg.module_patterns.keys())
+            init_extra["vlm_freeze"] = canonical_freeze_meta(
+                effective_freeze(0, vlm_cfg.freeze, vlm_cfg.freeze_schedule, valid_modules)
+            )
+        ckpt_mgr.save(
+            step=0,
+            tokens_seen=0,
+            scheduler=scheduler,
+            dataloader=dataloader,
+            extra=init_extra,
+        )
+        hook_runner.on_checkpoint_save(0, config.checkpoint.dir)
+
     while step < tc.max_steps:
         # Refresh data iterator at start / epoch boundary
         if dataloader is not None and data_iter is None:
