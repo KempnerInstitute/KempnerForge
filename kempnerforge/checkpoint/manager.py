@@ -629,11 +629,12 @@ class CheckpointManager:
     def _cleanup(self) -> None:
         """Remove old checkpoints beyond the retention limit.
 
-        Two directories are never removed regardless of retention: the
-        current ``latest`` target and the in-flight async checkpoint
-        (``_pending_finalize``). Pruning either would let a crash strand
-        resume with no loadable checkpoint — the exact failure this fix
-        exists to prevent.
+        Never removed regardless of retention: the current ``latest`` target
+        and the in-flight async checkpoint (``_pending_finalize``) — pruning
+        either would let a crash strand resume with no loadable checkpoint —
+        and any dynamic-window milestone (``CheckpointConfig.is_dynamic_milestone``),
+        so the dense early-dynamics checkpoints survive even with a finite
+        ``keep_last_n``.
         """
         keep = self.config.keep_last_n
         if keep <= 0:
@@ -651,6 +652,15 @@ class CheckpointManager:
             protected.add(latest.resolve())
         if self._pending_finalize is not None:
             protected.add(self._pending_finalize[1].resolve())
+
+        # Dynamic-window milestones (whatever steps the configured
+        # dyn_ckpt_window strategy fires on) are the dense early-dynamics
+        # checkpoints the window exists to capture, so never prune them;
+        # retention then applies only to the later interval checkpoints.
+        # No-op when no dyn_ckpt_window is configured.
+        for d in ckpt_dirs:
+            if self.config.is_dynamic_milestone(int(d.name.split("_")[1])):
+                protected.add(d.resolve())
 
         # Remove oldest beyond retention, but never a protected dir.
         to_remove = ckpt_dirs[:-keep] if len(ckpt_dirs) > keep else []

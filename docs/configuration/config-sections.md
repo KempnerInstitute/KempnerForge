@@ -236,12 +236,61 @@ DCP-based checkpointing.
 | Field | Type | Default | Purpose |
 |-------|------|---------|---------|
 | `dir` | `str` | `"checkpoints"` | root directory for `step_N/` + `latest` symlink |
-| `interval` | `int` | `1000` | save every N steps |
+| `interval` | `int` | `1000` | save every N steps (outside any `dyn_ckpt_window`) |
+| `dyn_ckpt_window` | `DynamicCheckpointWindow \| None` | `None` | optional dense save phase — see [`[checkpoint.dyn_ckpt_window]`](#checkpointdyn_ckpt_window--dynamiccheckpointwindow) |
 | `async_mode` | `"disabled" \| "async" \| "async_with_pinned_mem"` | `"disabled"` | DCP async-save mode |
-| `keep_last_n` | `int` | `3` | retain the most recent N checkpoints |
+| `keep_last_n` | `int` | `3` | retain the most recent N checkpoints (`<= 0` keeps all); steps saved by `dyn_ckpt_window` are always kept |
 | `load_path` | `str \| None` | `None` | explicit resume path (overrides `latest` symlink) |
 | `export_dtype` | `"float32" \| "bfloat16"` | `"bfloat16"` | dtype for HF exports via `scripts/convert_checkpoint.py` |
 | `exclude_from_loading` | `list[str]` | `[]` | FQN prefixes to skip on load (e.g. to reinit a head) |
+
+### `[checkpoint.dyn_ckpt_window]` — `DynamicCheckpointWindow`
+
+Opt-in dense save phase. Inside `[start, stop]` a registered strategy decides
+which steps to save; outside the window the regular `interval` cadence applies.
+Steps saved by the strategy are exempt from `keep_last_n` retention, so a
+finite `keep_last_n` rotates only the later interval checkpoints — the dense
+window checkpoints are never pruned. Useful for inspecting early-training
+dynamics at fine granularity.
+
+| Field | Type | Default | Purpose |
+|-------|------|---------|---------|
+| `start` | `int` | `0` | first step of the dense window; `0` captures the initial weights before any training step |
+| `stop` | `int` | `512` | last step of the dense window |
+| `strategy` | `str` | `"power2"` | name of a registered strategy (see below) |
+
+Example TOML:
+
+```toml
+# Off by default — interval cadence only:
+[checkpoint]
+interval = 1000
+keep_last_n = 3
+
+# Opt in with defaults (start=0, stop=512, strategy="power2"):
+[checkpoint.dyn_ckpt_window]
+
+# Customize:
+[checkpoint.dyn_ckpt_window]
+start = 0
+stop  = 1024
+strategy = "power2"
+```
+
+#### Dyn_ckpt strategies
+
+A strategy is a `Callable[[DynamicCheckpointWindow, int], bool]` registered via
+`@registry.register_dyn_ckpt_strategy("name")` (see
+[`kempnerforge/config/registry.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/config/registry.py)).
+The strategy receives the window and the current training step and returns
+`True` iff the step should be saved. The registry must be populated before
+config load — either by `kempnerforge` itself (the default `"power2"` is
+registered in `kempnerforge/config/checkpoint.py`) or by an explicit `import`
+of the user's module.
+
+| Name | Behavior |
+|------|----------|
+| `"power2"` (default) | save at `start` and at every `start + 2^k` while `<= stop` (offset-based powers of two; tight near `start`, doubling thereafter) |
 
 ## `[metrics]` — `MetricsConfig`
 

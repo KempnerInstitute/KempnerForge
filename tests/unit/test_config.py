@@ -14,6 +14,7 @@ from kempnerforge.config.schema import (
     CheckpointConfig,
     DataConfig,
     DistributedConfig,
+    DynamicCheckpointWindow,
     EvalConfig,
     MetricsConfig,
     OptimizerConfig,
@@ -169,6 +170,18 @@ class TestTrainConfig:
         with pytest.raises(ValueError, match="grad_accum_steps must be positive"):
             TrainConfig(grad_accum_steps=0)
 
+    def test_data_seed_defaults_to_none(self):
+        assert TrainConfig().data_seed is None
+
+    def test_effective_data_seed_falls_back_to_seed(self):
+        t = TrainConfig(seed=123)
+        assert t.effective_data_seed == 123
+
+    def test_effective_data_seed_overrides_when_set(self):
+        t = TrainConfig(seed=123, data_seed=456)
+        assert t.effective_data_seed == 456
+        assert t.seed == 123  # init seed stays independent
+
 
 # ---------------------------------------------------------------------------
 # OptimizerConfig
@@ -250,6 +263,73 @@ class TestCheckpointConfig:
     def test_rejects_zero_interval(self):
         with pytest.raises(ValueError, match="interval must be positive"):
             CheckpointConfig(interval=0)
+
+    def test_dyn_ckpt_window_defaults_to_none(self):
+        # Opt-in: no dyn_ckpt_window means pure interval cadence.
+        assert CheckpointConfig().dyn_ckpt_window is None
+
+    def test_interval_only_saves_on_multiples(self):
+        c = CheckpointConfig(interval=100)
+        assert c.should_save(0)
+        assert c.should_save(100)
+        assert not c.should_save(150)
+
+    def test_dyn_ckpt_window_power2_saves_powers_of_two(self):
+        c = CheckpointConfig(
+            interval=1000,
+            dyn_ckpt_window=DynamicCheckpointWindow(start=0, stop=512),
+        )
+        for step in (0, 1, 2, 4, 8, 256, 512):
+            assert c.should_save(step), f"expected save at {step}"
+        for step in (3, 5, 100, 300):
+            assert not c.should_save(step), f"unexpected save at {step}"
+
+    def test_dyn_ckpt_window_uses_interval_outside_window(self):
+        c = CheckpointConfig(
+            interval=1000,
+            dyn_ckpt_window=DynamicCheckpointWindow(start=0, stop=512),
+        )
+        # Beyond stop, interval applies again.
+        assert c.should_save(1000)
+        assert c.should_save(2000)
+        assert not c.should_save(1500)
+
+    def test_dyn_ckpt_window_with_start_offset(self):
+        # Offset-based power2: save at start and at start + 2^k while <= stop.
+        c = CheckpointConfig(
+            interval=10_000,  # large so the interval rule doesn't shadow the test
+            dyn_ckpt_window=DynamicCheckpointWindow(start=1000, stop=1300),
+        )
+        for step in (1000, 1001, 1002, 1004, 1008, 1016, 1128, 1256):
+            assert c.should_save(step), f"expected save at {step}"
+        for step in (999, 1003, 1005, 1100, 1300):  # 1300-1000=300, not a power of two
+            assert not c.should_save(step), f"unexpected save at {step}"
+
+    def test_is_dynamic_milestone(self):
+        c = CheckpointConfig(dyn_ckpt_window=DynamicCheckpointWindow(start=0, stop=512))
+        assert c.is_dynamic_milestone(0)
+        assert c.is_dynamic_milestone(256)
+        assert not c.is_dynamic_milestone(300)
+        assert not c.is_dynamic_milestone(1000)
+        # No window configured -> never a milestone, even at power-of-two steps.
+        assert not CheckpointConfig().is_dynamic_milestone(4)
+
+    def test_keep_last_n_allows_keep_all(self):
+        # <= 0 means retain all checkpoints (CheckpointManager._cleanup early-returns)
+        assert CheckpointConfig(keep_last_n=0).keep_last_n == 0
+        assert CheckpointConfig(keep_last_n=-1).keep_last_n == -1
+
+    def test_dyn_ckpt_window_rejects_negative_start(self):
+        with pytest.raises(ValueError, match="dyn_ckpt_window.start must be >= 0"):
+            DynamicCheckpointWindow(start=-1)
+
+    def test_dyn_ckpt_window_rejects_stop_below_start(self):
+        with pytest.raises(ValueError, match="dyn_ckpt_window.stop must be >= start"):
+            DynamicCheckpointWindow(start=100, stop=50)
+
+    def test_dyn_ckpt_window_rejects_unknown_strategy(self):
+        with pytest.raises(ValueError, match="unknown dyn_ckpt_window.strategy"):
+            DynamicCheckpointWindow(strategy="not_registered")
 
 
 # ---------------------------------------------------------------------------

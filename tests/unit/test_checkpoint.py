@@ -19,6 +19,7 @@ from kempnerforge.checkpoint.state import (
 from kempnerforge.config.schema import (
     AsyncCheckpointMode,
     CheckpointConfig,
+    DynamicCheckpointWindow,
     ModelConfig,
     OptimizerConfig,
 )
@@ -196,6 +197,33 @@ class TestCheckpointRetention:
 
         remaining = sorted(d.name for d in tmp_path.iterdir() if d.is_dir())
         assert remaining == ["step_10", "step_20"]
+
+    def test_cleanup_protects_dynamic_milestones(self, tmp_path):
+        """With a dyn_ckpt_window configured, the strategy's milestone steps
+        survive keep_last_n; retention applies only to the later interval
+        checkpoints."""
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        config = CheckpointConfig(
+            dir=str(tmp_path),
+            interval=1000,
+            keep_last_n=2,
+            dyn_ckpt_window=DynamicCheckpointWindow(start=0, stop=512),
+        )
+        model = torch.nn.Linear(4, 4)
+        opt = torch.optim.SGD(model.parameters(), lr=0.1)
+        mgr = CheckpointManager(config, model, opt)
+
+        milestones = [0, 1, 2, 4, 256, 512]
+        intervals = [1000, 2000, 3000]
+        for i in milestones + intervals:
+            (tmp_path / f"step_{i}").mkdir()
+
+        mgr._cleanup()
+
+        remaining = sorted(int(d.name.split("_")[1]) for d in tmp_path.iterdir() if d.is_dir())
+        # All dynamic milestones kept; only the last keep_last_n=2 interval ckpts kept.
+        assert remaining == [0, 1, 2, 4, 256, 512, 2000, 3000]
 
 
 # ---------------------------------------------------------------------------

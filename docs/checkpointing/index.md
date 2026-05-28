@@ -51,4 +51,4 @@ contains two kinds of state:
   [HF conversion](hf-conversion.md).
 - **Config knobs**:
   [Configuration § CheckpointConfig](../configuration/config-sections.md)
-  (search for `interval`, `async_mode`, `keep_last_n`, `load_path`).
+  (search for `interval`, `dyn_ckpt_window`, `async_mode`, `keep_last_n`, `load_path`).

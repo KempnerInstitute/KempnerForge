@@ -319,7 +319,7 @@ def main() -> None:
             _pad_id = _tok.eos_token_id if _tok.eos_token_id is not None else 0
         collator = VLMCollator(pad_id=int(_pad_id), max_text_len=vlm_cfg.max_text_len)
         sampler = DistributedSampler(
-            dataset, num_replicas=dp_size, rank=dp_rank, shuffle=True, seed=tc.seed
+            dataset, num_replicas=dp_size, rank=dp_rank, shuffle=True, seed=tc.effective_data_seed
         )
         dataloader = StatefulDataLoader(
             dataset,
@@ -373,7 +373,7 @@ def main() -> None:
             num_replicas=dp_size,
             rank=dp_rank,
             shuffle=True,
-            seed=tc.seed,
+            seed=tc.effective_data_seed,
             temperature=config.data.mix_temperature,
         )
         dataloader = StatefulDataLoader(
@@ -401,7 +401,7 @@ def main() -> None:
             num_replicas=dp_size,
             rank=dp_rank,
             shuffle=True,
-            seed=tc.seed,
+            seed=tc.effective_data_seed,
         )
         dataloader = StatefulDataLoader(
             dataset,
@@ -429,7 +429,7 @@ def main() -> None:
                 dataset_config=config.data.hf_dataset_config,
                 rank=dp_rank,
                 world_size=dp_size,
-                seed=tc.seed,
+                seed=tc.effective_data_seed,
                 pack_sequences=config.data.pack_sequences,
             )
             dataloader = TorchDataLoader(
@@ -463,7 +463,7 @@ def main() -> None:
                 num_replicas=dp_size,
                 rank=dp_rank,
                 shuffle=True,
-                seed=tc.seed,
+                seed=tc.effective_data_seed,
             )
             dataloader = StatefulDataLoader(
                 dataset,
@@ -625,6 +625,29 @@ def main() -> None:
 
     if prof is not None:
         prof.start()
+
+    # Capture the initial weights (step 0) on fresh start when the
+    # dyn_ckpt_window covers step 0 -- the per-step save gate only runs
+    # after a training step completes, so without this the random init
+    # is never persisted. Skipped on resume (step > 0).
+    if step == 0 and config.checkpoint.is_dynamic_milestone(0):
+        init_extra: dict = {"phase_idx": current_phase_idx} if active_phases else {}
+        if config.metrics.wandb_run_id:
+            init_extra["wandb_run_id"] = config.metrics.wandb_run_id
+        if is_vlm:
+            assert vlm_cfg is not None
+            valid_modules = set(vlm_cfg.module_patterns.keys())
+            init_extra["vlm_freeze"] = canonical_freeze_meta(
+                effective_freeze(0, vlm_cfg.freeze, vlm_cfg.freeze_schedule, valid_modules)
+            )
+        ckpt_mgr.save(
+            step=0,
+            tokens_seen=0,
+            scheduler=scheduler,
+            dataloader=dataloader,
+            extra=init_extra,
+        )
+        hook_runner.on_checkpoint_save(0, config.checkpoint.dir)
 
     while step < tc.max_steps:
         # Refresh data iterator at start / epoch boundary
@@ -963,7 +986,7 @@ def main() -> None:
             ckpt_extra["vlm_freeze"] = canonical_freeze_meta(
                 effective_freeze(step, vlm_cfg.freeze, vlm_cfg.freeze_schedule, valid_modules)
             )
-        if step % config.checkpoint.interval == 0:
+        if config.checkpoint.should_save(step):
             ckpt_mgr.save(
                 step=step,
                 tokens_seen=tokens_seen,

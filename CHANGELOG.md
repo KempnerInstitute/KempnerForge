@@ -52,6 +52,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Configs: `configs/train/vlm_debug_mot.toml` (1-GPU smoke) and `configs/train/vlm_7b_mot.toml` (4-GPU 7B).
 - `install-and-verify` plugin skill: runs `uv sync`, asserts Python ≥ 3.12, then runs the four CI gate checks (`ruff check`, `ruff format --check`, `pyright`, `pytest tests/unit/`). Canonical first command after cloning.
 - `.python-version` pinned to `>=3.12` so uv resolves the interpreter explicitly. Teammates on 3.13 use 3.13 (no download); 3.11-only users get 3.12 auto-fetched.
+- **Dynamic-checkpointing window** (`[checkpoint.dyn_ckpt_window]`). Opt-in dense save phase: inside `[start, stop]` a registered strategy decides which steps to save; outside the window the regular `interval` cadence applies. The default strategy, `"power2"`, saves at `start` and at every `start + 2^k` while `<= stop` — tight near the start of the window, doubling thereafter. Useful for analyzing early-training dynamics, where the loss moves fastest. The default `CheckpointConfig` is unchanged (no `dyn_ckpt_window`, interval-only saves).
+  - `kempnerforge/config/checkpoint.py`: new `DynamicCheckpointWindow` dataclass (`start: int = 0`, `stop: int = 512`, `strategy: str = "power2"`), new `CheckpointConfig.dyn_ckpt_window: DynamicCheckpointWindow | None = None`, `should_save(step)`, and `is_dynamic_milestone(step)`. Ships with `"power2"` registered by default; new strategies plug in via the registry without touching `CheckpointConfig`.
+  - `kempnerforge/config/registry.py`: `register_dyn_ckpt_strategy(name)` / `get_dyn_ckpt_strategy(name)` / `list_dyn_ckpt_strategies()` — a strategy is any `Callable[[DynamicCheckpointWindow, int], bool]` and registers via `@registry.register_dyn_ckpt_strategy("name")`.
+  - Milestone-aware retention: `CheckpointManager._cleanup` never prunes a step where the configured dynamic strategy fired, so `keep_last_n` rotates only the later interval checkpoints. `keep_last_n <= 0` keeps everything (the previous `keep_last_n >= 1` requirement is relaxed).
+  - `scripts/train.py`: the save gate now calls `config.checkpoint.should_save(step)`.
+  - Tests: `tests/unit/test_config.py` (defaults, power2 firing, offset-based `start > 0`, validation, unknown-strategy rejection, `is_dynamic_milestone`), `tests/unit/test_checkpoint.py::TestCheckpointRetention::test_cleanup_protects_dynamic_milestones`.
 
 ### Changed
 - `docs/getting-started/install.md` Prerequisites: documents `.python-version` and uv's auto-fetch behavior.
