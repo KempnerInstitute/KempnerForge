@@ -215,3 +215,94 @@ class TestCheckpointRoundtrip:
         for (rea, rev), (lea, lev) in zip(ref, loaded, strict=True):
             assert torch.equal(rea, lea), "exp_avg not restored bit-exactly"
             assert torch.equal(rev, lev), "exp_avg_sq not restored bit-exactly"
+
+    def test_manager_load_excludes_optimizer(self, tmp_path):
+        """exclude_keys=['optimizer'] (the scripts/eval.py / fine-tune flow):
+        load model state but leave the fresh optimizer untouched. Covers the
+        load_optim=False branch in CheckpointManager.load."""
+        from kempnerforge.checkpoint.manager import CheckpointManager
+        from kempnerforge.config.schema import CheckpointConfig
+
+        def moments(optimizer):
+            out = []
+            for group in optimizer.param_groups:
+                for p in group["params"]:
+                    st = optimizer.state.get(p, {})
+                    if "exp_avg" in st:
+                        out.append((st["exp_avg"].clone(), st["exp_avg_sq"].clone()))
+            return out
+
+        torch.manual_seed(0)
+        model = Transformer(CONFIG).to(DEVICE)
+        opt = build_optimizer(model, OptimizerConfig(lr=1e-3, fused=False))
+        for _ in range(3):
+            tokens = torch.randint(0, 256, (2, 32), device=DEVICE)
+            model(tokens).sum().backward()
+            opt.step()
+            opt.zero_grad()
+        ref_weights = {n: p.clone() for n, p in model.named_parameters()}
+
+        ckpt_dir = str(tmp_path / "ckpt")
+        CheckpointManager(CheckpointConfig(dir=ckpt_dir), model, opt).save(step=3)
+
+        # Fresh model (different init) + fresh optimizer.
+        torch.manual_seed(99)
+        model2 = Transformer(CONFIG).to(DEVICE)
+        opt2 = build_optimizer(model2, OptimizerConfig(lr=1e-3, fused=False))
+        pre_load = {n: p.clone() for n, p in model2.named_parameters()}
+        CheckpointManager(CheckpointConfig(dir=ckpt_dir), model2, opt2).load(
+            exclude_keys=["optimizer"]
+        )
+
+        # Model state restored (weights now match the saved model).
+        for n, p in model2.named_parameters():
+            assert not torch.equal(pre_load[n], p), f"{n} was not loaded"
+            assert torch.equal(ref_weights[n], p), f"{n} mismatch vs saved"
+        # Optimizer was excluded -> still empty.
+        assert not moments(opt2), "optimizer should remain empty on exclude_keys=['optimizer']"
+
+    def test_manager_load_excludes_model(self, tmp_path):
+        """exclude_keys=['model'] (symmetric case): load optimizer moments but
+        leave the existing model weights untouched. Covers the load_model=False
+        branch in CheckpointManager.load."""
+        from kempnerforge.checkpoint.manager import CheckpointManager
+        from kempnerforge.config.schema import CheckpointConfig
+
+        def moments(optimizer):
+            out = []
+            for group in optimizer.param_groups:
+                for p in group["params"]:
+                    st = optimizer.state.get(p, {})
+                    if "exp_avg" in st:
+                        out.append((st["exp_avg"].clone(), st["exp_avg_sq"].clone()))
+            return out
+
+        torch.manual_seed(0)
+        model = Transformer(CONFIG).to(DEVICE)
+        opt = build_optimizer(model, OptimizerConfig(lr=1e-3, fused=False))
+        for _ in range(3):
+            tokens = torch.randint(0, 256, (2, 32), device=DEVICE)
+            model(tokens).sum().backward()
+            opt.step()
+            opt.zero_grad()
+        ref_moments = moments(opt)
+        assert ref_moments, "fixture: expected non-empty optimizer state"
+
+        ckpt_dir = str(tmp_path / "ckpt")
+        CheckpointManager(CheckpointConfig(dir=ckpt_dir), model, opt).save(step=3)
+
+        torch.manual_seed(99)
+        model2 = Transformer(CONFIG).to(DEVICE)
+        opt2 = build_optimizer(model2, OptimizerConfig(lr=1e-3, fused=False))
+        pre_load = {n: p.clone() for n, p in model2.named_parameters()}
+        CheckpointManager(CheckpointConfig(dir=ckpt_dir), model2, opt2).load(exclude_keys=["model"])
+
+        # Model state was excluded -> weights unchanged from fresh init.
+        for n, p in model2.named_parameters():
+            assert torch.equal(pre_load[n], p), f"{n} should not have changed"
+        # Optimizer moments restored from the saved checkpoint.
+        loaded = moments(opt2)
+        assert loaded, "optimizer moments should load with exclude_keys=['model']"
+        for (rea, rev), (lea, lev) in zip(ref_moments, loaded, strict=True):
+            assert torch.equal(rea, lea), "exp_avg not restored"
+            assert torch.equal(rev, lev), "exp_avg_sq not restored"
