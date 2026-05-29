@@ -20,7 +20,11 @@ from kempnerforge.config.schema import (
     AsyncCheckpointMode,
     CheckpointConfig,
     DynamicCheckpointWindow,
+    ModelConfig,
+    OptimizerConfig,
 )
+from kempnerforge.model.transformer import Transformer
+from kempnerforge.training.optimizer import build_optimizer
 
 # ---------------------------------------------------------------------------
 # RNG state capture/restore
@@ -1054,3 +1058,128 @@ class TestSyncBarrierGroup:
         # The barrier must target the dedicated gloo group, never the
         # default group (group=None) that DCP's async thread uses.
         assert barrier_calls == ["GLOO_PG"]
+
+
+# ---------------------------------------------------------------------------
+# CheckpointManager.load -- moment restore + exclude_keys branches
+# ---------------------------------------------------------------------------
+
+
+class TestCheckpointManagerLoad:
+    """End-to-end ``load()`` tests on the real DCP save/load path
+    (single-process mode). Lives in tests/unit/ so it counts toward CI
+    coverage of ``manager.py`` -- the same single-GPU regression coverage
+    that previously lived in tests/integration/.
+    """
+
+    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    MODEL_CONFIG = ModelConfig(dim=64, n_layers=2, n_heads=2, vocab_size=256, max_seq_len=64)
+
+    @staticmethod
+    def _moments(optimizer):
+        out = []
+        for group in optimizer.param_groups:
+            for p in group["params"]:
+                st = optimizer.state.get(p, {})
+                if "exp_avg" in st:
+                    out.append((st["exp_avg"].clone(), st["exp_avg_sq"].clone()))
+        return out
+
+    def _train_few_steps(self, model, opt):
+        for _ in range(3):
+            tokens = torch.randint(0, 256, (2, 32), device=self.DEVICE)
+            model(tokens).sum().backward()
+            opt.step()
+            opt.zero_grad()
+
+    def test_restores_optimizer_moments_into_fresh_optimizer(self, tmp_path):
+        """Regression: the manager's DCP path used to fill the load template
+        from a freshly-built optimizer's *empty* state_dict, silently dropping
+        the moments. After the fix, moments must restore bit-exactly into a
+        fresh optimizer."""
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        torch.manual_seed(0)
+        model = Transformer(self.MODEL_CONFIG).to(self.DEVICE)
+        opt = build_optimizer(model, OptimizerConfig(lr=1e-3, fused=False))
+        self._train_few_steps(model, opt)
+
+        ref = self._moments(opt)
+        assert ref and any(ea.abs().sum().item() > 0 for ea, _ in ref), (
+            "no non-zero moments to test"
+        )
+
+        ckpt_dir = str(tmp_path / "ckpt")
+        CheckpointManager(CheckpointConfig(dir=ckpt_dir), model, opt).save(step=3)
+
+        model2 = Transformer(self.MODEL_CONFIG).to(self.DEVICE)
+        opt2 = build_optimizer(model2, OptimizerConfig(lr=1e-3, fused=False))
+        assert not self._moments(opt2), "fresh optimizer should have empty state before load"
+        CheckpointManager(CheckpointConfig(dir=ckpt_dir), model2, opt2).load()
+
+        loaded = self._moments(opt2)
+        assert loaded, "optimizer moments not restored (momentum reset on resume)"
+        for (rea, rev), (lea, lev) in zip(ref, loaded, strict=True):
+            assert torch.equal(rea, lea), "exp_avg not restored bit-exactly"
+            assert torch.equal(rev, lev), "exp_avg_sq not restored bit-exactly"
+
+    def test_load_excludes_optimizer(self, tmp_path):
+        """``exclude_keys=['optimizer']`` (the scripts/eval.py / fine-tune
+        flow): load model state but leave the fresh optimizer untouched.
+        Covers the inner ``if load_optim:`` False branch in
+        ``CheckpointManager.load``."""
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        torch.manual_seed(0)
+        model = Transformer(self.MODEL_CONFIG).to(self.DEVICE)
+        opt = build_optimizer(model, OptimizerConfig(lr=1e-3, fused=False))
+        self._train_few_steps(model, opt)
+        ref_weights = {n: p.clone() for n, p in model.named_parameters()}
+
+        ckpt_dir = str(tmp_path / "ckpt")
+        CheckpointManager(CheckpointConfig(dir=ckpt_dir), model, opt).save(step=3)
+
+        torch.manual_seed(99)
+        model2 = Transformer(self.MODEL_CONFIG).to(self.DEVICE)
+        opt2 = build_optimizer(model2, OptimizerConfig(lr=1e-3, fused=False))
+        pre_load = {n: p.clone() for n, p in model2.named_parameters()}
+        CheckpointManager(CheckpointConfig(dir=ckpt_dir), model2, opt2).load(
+            exclude_keys=["optimizer"]
+        )
+
+        for n, p in model2.named_parameters():
+            assert not torch.equal(pre_load[n], p), f"{n} was not loaded"
+            assert torch.equal(ref_weights[n], p), f"{n} mismatch vs saved"
+        assert not self._moments(opt2), (
+            "optimizer should remain empty on exclude_keys=['optimizer']"
+        )
+
+    def test_load_excludes_model(self, tmp_path):
+        """``exclude_keys=['model']`` (symmetric case): load optimizer moments
+        but leave the existing model weights untouched. Covers the inner
+        ``if load_model:`` False branch in ``CheckpointManager.load``."""
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        torch.manual_seed(0)
+        model = Transformer(self.MODEL_CONFIG).to(self.DEVICE)
+        opt = build_optimizer(model, OptimizerConfig(lr=1e-3, fused=False))
+        self._train_few_steps(model, opt)
+        ref_moments = self._moments(opt)
+        assert ref_moments, "fixture: expected non-empty optimizer state"
+
+        ckpt_dir = str(tmp_path / "ckpt")
+        CheckpointManager(CheckpointConfig(dir=ckpt_dir), model, opt).save(step=3)
+
+        torch.manual_seed(99)
+        model2 = Transformer(self.MODEL_CONFIG).to(self.DEVICE)
+        opt2 = build_optimizer(model2, OptimizerConfig(lr=1e-3, fused=False))
+        pre_load = {n: p.clone() for n, p in model2.named_parameters()}
+        CheckpointManager(CheckpointConfig(dir=ckpt_dir), model2, opt2).load(exclude_keys=["model"])
+
+        for n, p in model2.named_parameters():
+            assert torch.equal(pre_load[n], p), f"{n} should not have changed"
+        loaded = self._moments(opt2)
+        assert loaded, "optimizer moments should load with exclude_keys=['model']"
+        for (rea, rev), (lea, lev) in zip(ref_moments, loaded, strict=True):
+            assert torch.equal(rea, lea), "exp_avg not restored"
+            assert torch.equal(rev, lev), "exp_avg_sq not restored"

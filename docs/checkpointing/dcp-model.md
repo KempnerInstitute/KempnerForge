@@ -15,13 +15,21 @@ in `kempnerforge/checkpoint/manager.py`.
 
 ```python
 dcp_state = {
-    "model":     self.model.state_dict(),
-    "optimizer": self.optimizer.state_dict(),
+    "model":     get_model_state_dict(self.model),
+    "optimizer": get_optimizer_state_dict(self.model, self.optimizer),
 }
 self._async_ckpt.save(
     dcp_state, checkpoint_id=str(dcp_dir), process_group=self._process_group
 )
 ```
+
+`get_model_state_dict` / `get_optimizer_state_dict` are the DCP-aware
+helpers from `torch.distributed.checkpoint.state_dict` — **not** raw
+`model.state_dict()` / `optimizer.state_dict()`. They key the
+optimizer state by parameter fully-qualified name (not positional
+index) and keep the FSDP/DTensor sharding intact, which is what makes
+load (and resharding) line up by name. See [Loading](#loading) for why
+the raw calls break resume.
 
 Two top-level keys — `"model"` and `"optimizer"`. DCP introspects the
 state dicts, finds `DTensor` / `ShardedTensor` parameters, and
@@ -29,11 +37,11 @@ writes each shard to disk with enough metadata to reassemble.
 
 What's in each:
 
-- **`model.state_dict()`** — every parameter and buffer: weights,
+- **model state** — every parameter and buffer: weights,
   RMSNorm scales, learned RoPE frequencies (if present), and any
   registered buffer. Under FSDP2 these are `DTensor`s; under TP
   they're `DTensor`s on a 2D mesh. DCP handles both.
-- **`optimizer.state_dict()`** — AdamW's `exp_avg`, `exp_avg_sq`,
+- **optimizer state** — AdamW's `exp_avg`, `exp_avg_sq`,
   `step` counters; Lion's `exp_avg`; Muon's internal state. All
   per-parameter tensors live on the same device and parallelism
   shape as the parameter, so DCP saves them symmetrically.
@@ -148,16 +156,33 @@ it through on every save/load.
 Load is the mirror image of save:
 
 ```python
-dcp_state = {"model": self.model.state_dict(), "optimizer": self.optimizer.state_dict()}
+dcp_state = {
+    "model":     get_model_state_dict(self.model),
+    "optimizer": get_optimizer_state_dict(self.model, self.optimizer),
+}
 dcp.load(dcp_state, checkpoint_id=str(dcp_dir), process_group=self._process_group)
-self.model.load_state_dict(dcp_state["model"])
-self.optimizer.load_state_dict(dcp_state["optimizer"])
+set_model_state_dict(self.model, dcp_state["model"])
+set_optimizer_state_dict(self.model, self.optimizer, optim_state_dict=dcp_state["optimizer"])
 ```
 
-The first `state_dict()` call gives DCP the **shape** to fill — it
-doesn't contain the saved data, just the tensor metadata DCP needs
-to know what to load where. `dcp.load` mutates the tensors in place
-with the loaded values. Then `load_state_dict` consumes them.
+The getter call gives DCP the **shape** to fill — it doesn't contain
+the saved data, just the tensor metadata (and, crucially, the
+*allocated* optimizer moment tensors) DCP needs to know what to load
+where. `dcp.load` mutates those tensors in place with the loaded
+values; the setters then write them back into the live model and
+optimizer.
+
+> **Why the DCP-aware helpers, not `optimizer.state_dict()`?** On
+> resume the optimizer is freshly built, so `optimizer.state_dict()`
+> has *no* `exp_avg` / `exp_avg_sq` tensors yet — AdamW creates the
+> per-parameter state lazily on the first `.step()`. Passing that
+> empty dict as the load template gives `dcp.load` nothing to fill, so
+> the saved moments are silently dropped and Adam momentum resets to
+> zero at every resume (a non-bit-exact resume). `get_optimizer_state_dict`
+> allocates the moment tensors up front in the right sharded layout, so
+> `dcp.load` repopulates them. The model side would work with either
+> call — its parameters are always allocated — but we use the matching
+> getter/setter for symmetry.
 
 Loading with a different GPU count triggers DCP's automatic
 resharding — see [Resharding](resharding.md).

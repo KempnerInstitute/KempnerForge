@@ -65,6 +65,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `docs/claude-ready.md` first-run flow: `/kempnerforge:install-and-verify` runs before `/kempnerforge:cluster-config`.
 - `README.md` and `kempnerforge/README.md`: list `install-and-verify` in the skill catalog and drop the hardcoded skill count.
 
+### Fixed
+- **Resume silently reset AdamW optimizer momentum.** `CheckpointManager` round-tripped optimizer state through raw `optimizer.state_dict()` / `optimizer.load_state_dict()`. On resume the optimizer is freshly built, so its `state_dict()` is empty — `dcp.load` then had no `exp_avg` / `exp_avg_sq` tensors to fill, and the moments were silently dropped, resetting Adam momentum to zero at every resume point. Model weights, scheduler, dataloader position, and RNG all restored correctly; only the optimizer moments were lost, so resumed runs were not bit-exact.
+  - `kempnerforge/checkpoint/manager.py`: save and load now go through DCP's `get_model_state_dict` / `get_optimizer_state_dict` / `set_model_state_dict` / `set_optimizer_state_dict`. The getters build a load template with the optimizer moments allocated in the correct FSDP/DTensor layout, so `dcp.load` repopulates them; the setters write the loaded values back into the live optimizer.
+  - `docs/checkpointing/dcp-model.md`: updated the save/load snippets and the "shape to fill" explanation to the DCP-aware helpers.
+  - Tests (fail on the pre-fix code, pass after): `tests/integration/test_checkpoint_roundtrip.py::test_manager_restores_optimizer_moments_single_gpu` and `tests/distributed/test_checkpoint.py::test_resume_restores_optimizer_moments` assert `exp_avg` / `exp_avg_sq` are restored bit-exactly into a *fresh* optimizer (single-GPU + distributed); `tests/e2e/test_training_e2e.py::test_resume_determinism_single_gpu` / `test_resume_determinism_2gpu_fsdp` assert end-to-end bit-exact loss across an interrupt-and-resume on a learnable dataset.
+  - **On-disk format note:** optimizer state is now keyed by parameter fully-qualified name rather than positional index. Checkpoints written before this fix will not restore optimizer state on resume (training continues with a fresh optimizer); model state is unaffected.
+
 ## [0.1.0] — 2026-04-16
 
 Initial public release.

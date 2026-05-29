@@ -110,6 +110,11 @@ def _parse_last_loss(output: str) -> float | None:
     return float(matches[-1]) if matches else None
 
 
+def _parse_losses_by_step(output: str) -> dict[int, str]:
+    """Map step -> logged loss string (exact text, for bit-identical comparison)."""
+    return {int(s): loss for s, loss in re.findall(r"\[step (\d+)\] loss=([\d.]+)", output)}
+
+
 # ============================================================================
 # Single GPU
 # ============================================================================
@@ -395,6 +400,104 @@ def test_checkpoint_save_and_resume(tmp_path):
     _assert_training_complete(result, expected_steps=15)
     output = result.stdout + result.stderr
     assert "step=10" in output, "Did not resume from step 10"
+
+
+# ============================================================================
+# Resume Determinism (regression: optimizer state must be restored bit-exactly)
+# ============================================================================
+
+
+def _make_learnable_shard(tmp_path) -> str:
+    """Write a small on-disk dataset with a LEARNABLE repeating pattern.
+
+    The resume bug perturbs the weights slightly; random tokens give a
+    near-constant loss (a model can't fit noise) that masks it, so we need data
+    the model can actually learn for the loss to be sensitive to the exact
+    weights. A simple token cycle (next token is always predictable) does that.
+    """
+    import numpy as np
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    tokens = (np.arange(8_000_000) % 256).astype(np.uint16)
+    np.save(str(data_dir / "shard.npy"), tokens)
+    return str(data_dir)
+
+
+def _check_resume_determinism(tmp_path, nproc: int) -> None:
+    """An interrupted+resumed run must reproduce an uninterrupted reference
+    bit-for-bit on the post-resume steps.
+
+    If the optimizer moments (or RNG / dataloader position) are not restored
+    exactly, the loss trajectories diverge. Regression test for the bug where the
+    manager used raw ``optimizer.state_dict()`` with DCP: a freshly-built
+    optimizer's state is empty, so ``dcp.load`` had no moment tensors to fill and
+    AdamW momentum silently reset to zero on every resume.
+    """
+    data_dir = _make_learnable_shard(tmp_path)
+    common = [
+        DEBUG_CONFIG,
+        "--metrics.log_interval=1",
+        "--train.seed=1234",
+        "--train.compile_model=false",
+        "--model.vocab_size=256",
+        f"--data.dataset_path={data_dir}",
+        "--data.file_pattern=*.npy",
+    ]
+    reference = _run_training(
+        common
+        + [
+            "--train.max_steps=20",
+            f"--checkpoint.dir={tmp_path}/ref",
+            "--checkpoint.interval=1000",
+        ],
+        nproc=nproc,
+        timeout=300,
+    )
+    _assert_training_complete(reference, expected_steps=20)
+
+    phase1 = _run_training(
+        common
+        + ["--train.max_steps=10", f"--checkpoint.dir={tmp_path}/test", "--checkpoint.interval=10"],
+        nproc=nproc,
+        timeout=300,
+    )
+    _assert_training_complete(phase1, expected_steps=10)
+
+    resumed = _run_training(
+        common
+        + [
+            "--train.max_steps=20",
+            f"--checkpoint.dir={tmp_path}/test",
+            "--checkpoint.interval=1000",
+        ],
+        nproc=nproc,
+        timeout=300,
+    )
+    _assert_training_complete(resumed, expected_steps=20)
+    assert "step=10" in (resumed.stdout + resumed.stderr), "did not resume from step 10"
+
+    ref_losses = _parse_losses_by_step(reference.stdout + reference.stderr)
+    res_losses = _parse_losses_by_step(resumed.stdout + resumed.stderr)
+    for step in range(11, 21):
+        assert step in res_losses, f"resumed run missing step {step}"
+        assert res_losses[step] == ref_losses.get(step), (
+            f"step {step}: resumed loss {res_losses[step]} != reference {ref_losses.get(step)} "
+            "-- post-resume state (optimizer moments / RNG / dataloader) not restored bit-exactly"
+        )
+
+
+@pytest.mark.e2e
+def test_resume_determinism_single_gpu(tmp_path):
+    """Single GPU: resumed run must match the uninterrupted reference bit-for-bit."""
+    _check_resume_determinism(tmp_path, nproc=1)
+
+
+@pytest.mark.e2e
+@requires_gpus(2)
+def test_resume_determinism_2gpu_fsdp(tmp_path):
+    """2 GPU FSDP: resumed run must match the uninterrupted reference bit-for-bit."""
+    _check_resume_determinism(tmp_path, nproc=2)
 
 
 # ============================================================================

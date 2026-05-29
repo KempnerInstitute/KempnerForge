@@ -105,6 +105,74 @@ class TestCheckpointRoundTrip:
             f"Restored output differs: max diff={(ref_out - restored_out).abs().max().item()}"
         )
 
+    def test_resume_restores_optimizer_moments(self, distributed_env, shared_tmp_dir):
+        """Optimizer moments must be restored into a FRESH optimizer on resume.
+
+        Regression for the bug where the manager used raw ``optimizer.state_dict()``
+        with DCP: a freshly-constructed optimizer has empty state, so the load
+        template had no moment tensors and ``dcp.load`` silently dropped them ->
+        AdamW ``exp_avg``/``exp_avg_sq`` reset to zero on every resume. Loading
+        into the *same* already-stepped optimizer (as test_save_load_fsdp does)
+        hides this, so here we load into a fresh optimizer like a real resume.
+        """
+        from kempnerforge.config.schema import OptimizerConfig
+
+        mesh = distributed_env
+        ckpt_dir = shared_tmp_dir
+
+        def snapshot_moments(optimizer):
+            """Per-rank (sharded) (exp_avg, exp_avg_sq) clones, in param order."""
+            out = []
+            for group in optimizer.param_groups:
+                for p in group["params"]:
+                    st = optimizer.state.get(p, {})
+                    if "exp_avg" in st:
+                        out.append(
+                            (st["exp_avg"].detach().clone(), st["exp_avg_sq"].detach().clone())
+                        )
+            return out
+
+        # Build, step a few times so the moments are non-trivial, then save.
+        torch.manual_seed(42)
+        model = Transformer(SMALL_CONFIG).cuda()
+        apply_fsdp2(model, mesh)
+        opt = build_optimizer(model, OptimizerConfig(lr=1e-3, fused=False))
+        for _ in range(3):
+            tokens = torch.randint(0, 512, (2, 32), device="cuda")
+            model(tokens).sum().backward()
+            opt.step()
+            opt.zero_grad()
+
+        ref_moments = snapshot_moments(opt)
+        assert ref_moments, "optimizer had no moment state to test"
+        assert any(ea.abs().sum().item() > 0 for ea, _ in ref_moments), (
+            "reference moments are all zero"
+        )
+
+        CheckpointManager(CheckpointConfig(dir=ckpt_dir, keep_last_n=2), model, opt).save(
+            step=3, tokens_seen=192
+        )
+
+        # FRESH model + FRESH optimizer (never stepped -> empty optimizer state),
+        # exactly the resume scenario. Then load.
+        torch.manual_seed(42)
+        model2 = Transformer(SMALL_CONFIG).cuda()
+        apply_fsdp2(model2, mesh)
+        opt2 = build_optimizer(model2, OptimizerConfig(lr=1e-3, fused=False))
+        assert not snapshot_moments(opt2), "fresh optimizer should have empty state before load"
+
+        CheckpointManager(CheckpointConfig(dir=ckpt_dir, keep_last_n=2), model2, opt2).load()
+
+        loaded_moments = snapshot_moments(opt2)
+        assert loaded_moments, (
+            "optimizer moments were not restored (state still empty after load) "
+            "-- AdamW momentum reset on resume"
+        )
+        assert len(loaded_moments) == len(ref_moments)
+        for i, ((rea, rev), (lea, lev)) in enumerate(zip(ref_moments, loaded_moments, strict=True)):
+            assert torch.equal(rea, lea), f"param {i}: exp_avg not restored bit-exactly"
+            assert torch.equal(rev, lev), f"param {i}: exp_avg_sq not restored bit-exactly"
+
     def test_latest_symlink(self, distributed_env, shared_tmp_dir):
         """The 'latest' symlink should point to the most recent checkpoint."""
         mesh = distributed_env
