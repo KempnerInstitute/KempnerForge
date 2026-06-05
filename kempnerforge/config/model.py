@@ -54,6 +54,7 @@ class ModelConfig:
     moe_gradient_scale: bool = False  # Per-expert gradient normalization
     moe_bias_schedule: str = "constant"  # "constant", "cosine_decay", "linear_warmup"
     moe_packed_experts: bool = False  # Pack expert weights into one tensor per projection
+    moe_expert_ffn_multiplier: float = 1.0  # expert FFN hidden vs dense (0.5 = fine-grained)
 
     def __post_init__(self) -> None:
         if self.n_kv_heads is None:
@@ -99,6 +100,8 @@ class ModelConfig:
                     f"Unknown moe_bias_schedule: '{self.moe_bias_schedule}'. "
                     "Options: 'constant', 'cosine_decay', 'linear_warmup'"
                 )
+            if self.moe_expert_ffn_multiplier <= 0:
+                raise ValueError("moe_expert_ffn_multiplier must be positive")
 
     @property
     def is_moe(self) -> bool:
@@ -119,6 +122,19 @@ class ModelConfig:
         return 256 * math.ceil(raw / 256)
 
     @property
+    def computed_expert_ffn_hidden_dim(self) -> int:
+        """Per-expert FFN hidden dim = ``computed_ffn_hidden_dim`` * ``moe_expert_ffn_multiplier``.
+
+        Rounded to a multiple of 16 for tensor-core alignment. With the default
+        multiplier 1.0 this equals ``computed_ffn_hidden_dim`` (zero behavior
+        change); set 0.5 for fine-grained experts so top-2 routing matches the
+        dense FFN's activated FLOPs (2 * F/2 = F). Applies to routed and shared
+        experts wherever they are built (build_moe and MoMa's ExpertChoiceMoE).
+        """
+        raw = int(self.computed_ffn_hidden_dim * self.moe_expert_ffn_multiplier)
+        return max(16, 16 * round(raw / 16))
+
+    @property
     def num_params_estimate(self) -> int:
         """Rough total parameter count estimate (excluding embedding if tied).
 
@@ -134,11 +150,13 @@ class ModelConfig:
         norm = 2 * d  # 2 norms per layer
 
         if self.is_moe:
+            he = self.computed_expert_ffn_hidden_dim  # may be fine-grained (< h)
+            expert_mlp = d * he + d * he + he * d
             n_moe = sum(1 for i in range(self.n_layers) if (i + 1) % self.moe_frequency == 0)
             n_dense = self.n_layers - n_moe
             router = d * self.num_experts  # gate linear per MoE layer
-            shared_mlp = self.moe_shared_experts * mlp
-            moe_per_layer = attn + self.num_experts * mlp + router + shared_mlp + norm
+            shared_mlp = self.moe_shared_experts * expert_mlp
+            moe_per_layer = attn + self.num_experts * expert_mlp + router + shared_mlp + norm
             dense_per_layer = attn + mlp + norm
             layer_params = n_moe * moe_per_layer + n_dense * dense_per_layer
         else:

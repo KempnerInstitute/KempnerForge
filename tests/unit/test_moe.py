@@ -211,6 +211,26 @@ class TestMoETransformer:
         actual = sum(p.numel() for p in model.parameters())
         assert actual == config.num_params_estimate
 
+    def test_finegrained_experts_built_smaller(self):
+        """moe_expert_ffn_multiplier=0.5 -> experts have F/2 hidden; dense layers unchanged."""
+        config = ModelConfig(
+            **_SMALL, num_experts=4, moe_top_k=2, moe_frequency=2, moe_expert_ffn_multiplier=0.5
+        )
+        f = config.computed_ffn_hidden_dim
+        model = Transformer(config)
+        for _name, layer in model.layers.items():
+            if isinstance(layer.mlp, MoEMLP):  # layers 1, 3
+                assert layer.mlp.experts[0].gate_proj.weight.shape[0] == f // 2
+            else:  # dense layers 0, 2
+                assert layer.mlp.gate_proj.weight.shape[0] == f
+
+    def test_finegrained_param_count_matches(self):
+        """num_params_estimate matches actual params for a fine-grained MoE model."""
+        config = ModelConfig(**_SMALL, num_experts=4, moe_top_k=2, moe_expert_ffn_multiplier=0.5)
+        model = Transformer(config)
+        actual = sum(p.numel() for p in model.parameters())
+        assert actual == config.num_params_estimate
+
 
 # ---------------------------------------------------------------------------
 # SigmoidTopKRouter (DeepSeek-V3 style)

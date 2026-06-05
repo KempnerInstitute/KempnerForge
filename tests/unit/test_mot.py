@@ -54,6 +54,27 @@ def _config(
     )
 
 
+def test_mot_finegrained_experts():
+    """MoT MoE experts honor moe_expert_ffn_multiplier (fine-grained)."""
+    from kempnerforge.model.moe import MoEMLP
+
+    cfg = ModelConfig(
+        dim=64,
+        n_layers=2,
+        n_heads=4,
+        vocab_size=128,
+        max_seq_len=64,
+        num_experts=4,
+        moe_top_k=2,
+        moe_frequency=1,
+        moe_expert_ffn_multiplier=0.5,
+    )
+    block = MoTBlock(cfg, modalities=("image", "text"), layer_idx=0)
+    moe = block.mlp["text"]
+    assert isinstance(moe, MoEMLP)
+    assert moe.experts[0].gate_proj.weight.shape[0] == cfg.computed_ffn_hidden_dim // 2
+
+
 # ---------------------------------------------------------------------------
 # MoTAttention — structural
 # ---------------------------------------------------------------------------
