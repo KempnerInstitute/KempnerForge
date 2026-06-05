@@ -104,6 +104,14 @@ class TestModelConfig:
         assert m.is_moe is True
         assert m.moe_top_k == 2
 
+    def test_router_z_loss_weight_default(self):
+        m = ModelConfig(num_experts=4, moe_top_k=2)
+        assert m.moe_router_z_loss_weight == 0.0
+
+    def test_router_z_loss_weight_rejects_negative(self):
+        with pytest.raises(ValueError, match="moe_router_z_loss_weight must be non-negative"):
+            ModelConfig(num_experts=4, moe_top_k=2, moe_router_z_loss_weight=-1.0)
+
     def test_moe_rejects_top_k_greater_than_experts(self):
         with pytest.raises(ValueError, match="moe_top_k.*must be <= num_experts"):
             ModelConfig(num_experts=8, moe_top_k=16)

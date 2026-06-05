@@ -54,6 +54,7 @@ class ModelConfig:
     moe_gradient_scale: bool = False  # Per-expert gradient normalization
     moe_bias_schedule: str = "constant"  # "constant", "cosine_decay", "linear_warmup"
     moe_packed_experts: bool = False  # Pack expert weights into one tensor per projection
+    moe_router_z_loss_weight: float = 0.0  # router logit z-loss coeff (ST-MoE; 0=off)
 
     def __post_init__(self) -> None:
         if self.n_kv_heads is None:
@@ -99,6 +100,8 @@ class ModelConfig:
                     f"Unknown moe_bias_schedule: '{self.moe_bias_schedule}'. "
                     "Options: 'constant', 'cosine_decay', 'linear_warmup'"
                 )
+            if self.moe_router_z_loss_weight < 0:
+                raise ValueError("moe_router_z_loss_weight must be non-negative")
 
     @property
     def is_moe(self) -> bool:

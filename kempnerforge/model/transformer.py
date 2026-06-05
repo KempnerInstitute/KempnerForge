@@ -263,6 +263,14 @@ class Transformer(nn.Module):
                 total = total + layer.mlp.aux_loss
         return total
 
+    def get_moe_router_z_loss(self) -> torch.Tensor:
+        """Collect router z-losses (ST-MoE) from all MoE layers. Returns 0 if dense."""
+        total = torch.tensor(0.0, device=next(self.parameters()).device)
+        for layer in self.layers.values():
+            if isinstance(layer.mlp, MoEMLP):
+                total = total + layer.mlp.z_loss
+        return total
+
     def get_expert_counts(self) -> dict[int, torch.Tensor]:
         """Collect per-layer expert utilization for flat MoE layers.
 
