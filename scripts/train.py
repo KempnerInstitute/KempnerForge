@@ -746,6 +746,9 @@ def main() -> None:
                     if mc.is_moe:
                         aux_loss = inner_transformer(model).get_moe_aux_loss()  # type: ignore[attr-defined]
                         loss = loss + mc.moe_aux_loss_weight * aux_loss
+                        if mc.moe_router_z_loss_weight > 0:
+                            z = inner_transformer(model).get_moe_router_z_loss()  # type: ignore[attr-defined]
+                            loss = loss + mc.moe_router_z_loss_weight * z
 
                     scaled_loss = loss / tc.grad_accum_steps
                     scaled_loss.backward()
@@ -810,6 +813,9 @@ def main() -> None:
                     if mc.is_moe:
                         aux_loss = inner_transformer(model).get_moe_aux_loss()  # type: ignore[attr-defined]
                         loss = loss + mc.moe_aux_loss_weight * aux_loss
+                        if mc.moe_router_z_loss_weight > 0:
+                            z = inner_transformer(model).get_moe_router_z_loss()  # type: ignore[attr-defined]
+                            loss = loss + mc.moe_router_z_loss_weight * z
 
                     scaled_loss = loss / tc.grad_accum_steps
                     scaled_loss.backward()
@@ -912,6 +918,7 @@ def main() -> None:
         if mc.is_moe and step_metrics is not None:
             _inner = inner_transformer(model)
             moe_metrics = {"moe/aux_loss": _inner.get_moe_aux_loss().item()}  # type: ignore[attr-defined]
+            moe_metrics["moe/router_z_loss"] = _inner.get_moe_router_z_loss().item()  # type: ignore[attr-defined]
             expert_counts = _inner.get_expert_counts()  # type: ignore[attr-defined]
             if expert_counts:
                 all_counts = torch.stack(list(expert_counts.values())).float()

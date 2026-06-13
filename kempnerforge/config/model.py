@@ -55,6 +55,7 @@ class ModelConfig:
     moe_bias_schedule: str = "constant"  # "constant", "cosine_decay", "linear_warmup"
     moe_packed_experts: bool = False  # Pack expert weights into one tensor per projection
     moe_expert_ffn_multiplier: float = 1.0  # expert FFN hidden vs dense (0.5 = fine-grained)
+    moe_router_z_loss_weight: float = 0.0  # router logit z-loss coeff (ST-MoE; 0=off)
 
     def __post_init__(self) -> None:
         if self.n_kv_heads is None:
@@ -102,6 +103,8 @@ class ModelConfig:
                 )
             if self.moe_expert_ffn_multiplier <= 0:
                 raise ValueError("moe_expert_ffn_multiplier must be positive")
+            if self.moe_router_z_loss_weight < 0:
+                raise ValueError("moe_router_z_loss_weight must be non-negative")
 
     @property
     def is_moe(self) -> bool:

@@ -51,6 +51,23 @@ class TestMoEMLP:
         assert torch.isfinite(moe.aux_loss)
         assert moe.aux_loss.item() > 0
 
+    def test_z_loss_accessible(self):
+        router = SoftmaxTopKRouter(dim=64, num_experts=8, top_k=2)
+        experts = torch.nn.ModuleList([SwiGLUMLP(64, 128) for _ in range(8)])
+        moe = MoEMLP(router, experts)
+        x = torch.randn(2, 16, 64)
+        moe(x)
+        assert torch.isfinite(moe.z_loss)
+        assert moe.z_loss.item() > 0
+
+    def test_z_loss_matches_logsumexp_formula(self):
+        torch.manual_seed(0)
+        router = SoftmaxTopKRouter(dim=64, num_experts=8, top_k=2)
+        x = torch.randn(32, 64)
+        router(x)
+        expected = (torch.logsumexp(router.gate(x), dim=-1) ** 2).mean()
+        assert torch.allclose(router.z_loss, expected, atol=1e-5)
+
     def test_expert_counts_accessible(self):
         router = SoftmaxTopKRouter(dim=64, num_experts=8, top_k=2)
         experts = torch.nn.ModuleList([SwiGLUMLP(64, 128) for _ in range(8)])
@@ -173,6 +190,30 @@ class TestMoETransformer:
             model(tokens)
         assert model.get_moe_aux_loss().item() == 0.0
 
+    def test_get_moe_router_z_loss(self):
+        config = ModelConfig(**_SMALL, num_experts=4, moe_top_k=2)
+        model = Transformer(config).to(DEVICE)
+        tokens = torch.randint(0, 1000, (2, 32), device=DEVICE)
+        with torch.no_grad():
+            model(tokens)
+        z = model.get_moe_router_z_loss()
+        assert torch.isfinite(z)
+        assert z.item() > 0
+
+    def test_get_moe_router_z_loss_dense_returns_zero(self):
+        config = ModelConfig(**_SMALL)
+        model = Transformer(config).to(DEVICE)
+        tokens = torch.randint(0, 1000, (2, 32), device=DEVICE)
+        with torch.no_grad():
+            model(tokens)
+        assert model.get_moe_router_z_loss().item() == 0.0
+
+    def test_z_loss_not_in_state_dict(self):
+        """z_loss is a transient attribute (like aux_loss), not a checkpointed buffer."""
+        config = ModelConfig(**_SMALL, num_experts=4, moe_top_k=2)
+        model = Transformer(config)
+        assert not any("z_loss" in k for k in model.state_dict())
+
     def test_get_expert_counts(self):
         config = ModelConfig(**_SMALL, num_experts=4, moe_top_k=2)
         model = Transformer(config).to(DEVICE)
@@ -251,6 +292,14 @@ class TestSigmoidTopKRouter:
         x = torch.randn(32, 64)
         router(x)
         assert router.aux_loss.item() == 0.0
+
+    def test_z_loss_computed(self):
+        """Sigmoid router computes router z-loss from gate logits."""
+        router = SigmoidTopKRouter(dim=64, num_experts=8, top_k=2)
+        x = torch.randn(32, 64)
+        router(x)
+        assert torch.isfinite(router.z_loss)
+        assert router.z_loss.item() > 0
 
     def test_weights_sum_to_one(self):
         """Routing weights are normalized to sum to 1 per token."""

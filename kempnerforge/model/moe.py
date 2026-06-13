@@ -353,6 +353,10 @@ class MoEMLP(nn.Module):
         return self.router.aux_loss  # type: ignore[reportReturnType]
 
     @property
+    def z_loss(self) -> torch.Tensor:
+        return self.router.z_loss  # type: ignore[reportReturnType]
+
+    @property
     def expert_counts(self) -> torch.Tensor:
         return self.router.expert_counts  # type: ignore[reportReturnType]
 

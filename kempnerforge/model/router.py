@@ -28,6 +28,7 @@ class SoftmaxTopKRouter(nn.Module):
         self.num_experts = num_experts
         self.top_k = top_k
         self.aux_loss = torch.tensor(0.0)
+        self.z_loss = torch.tensor(0.0)
         self.expert_counts: torch.Tensor = torch.zeros(num_experts)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -65,6 +66,9 @@ class SoftmaxTopKRouter(nn.Module):
         p = probs.mean(dim=0)  # (E,)
 
         self.aux_loss = self.num_experts * (f * p).sum()
+        # Router z-loss (ST-MoE): penalizes large router logits. Always computed
+        # (like aux_loss); only added to the training loss when the weight > 0.
+        self.z_loss = (torch.logsumexp(logits, dim=-1) ** 2).mean()
         self.expert_counts = tokens_per_expert.detach()
 
         return weights, indices
@@ -120,6 +124,7 @@ class SigmoidTopKRouter(nn.Module):
         self.register_buffer("expert_ema", torch.ones(num_experts) / num_experts)
 
         self.aux_loss = torch.tensor(0.0)
+        self.z_loss = torch.tensor(0.0)
         self.expert_counts: torch.Tensor = torch.zeros(num_experts)
 
     def set_step(self, step: int, max_steps: int) -> None:
@@ -189,6 +194,10 @@ class SigmoidTopKRouter(nn.Module):
             self.aux_loss = self.sequence_aux_loss_weight * balance_loss
         else:
             self.aux_loss = torch.tensor(0.0, device=x.device)
+
+        # Router z-loss (ST-MoE): penalizes large router logits. Always computed
+        # (like aux_loss); only added to the training loss when the weight > 0.
+        self.z_loss = (torch.logsumexp(logits, dim=-1) ** 2).mean()
 
         return weights, indices
 
