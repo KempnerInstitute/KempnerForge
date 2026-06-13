@@ -18,7 +18,7 @@ PyTorch-native framework for fault-tolerant distributed training of foundation m
 
 - **Scaling law experiments**: train the same architecture from 125M to 70B by swapping a TOML config. FSDP, tensor, expert, and pipeline parallelism are automatic.
 - **Mechanistic interpretability**: activation extraction hooks at any layer with CPU offload; attention weight capture exposes raw QK^T matrices.
-- **Sparse architecture research**: switch between dense and MoE by setting `num_experts` (0 for dense, >0 for MoE). Softmax top-k or DeepSeek-V3 sigmoid routing, shared experts, configurable MoE frequency.
+- **Sparse architecture research**: switch between dense and MoE by setting `num_experts` (0 for dense, >0 for MoE). Softmax top-k or DeepSeek-V3 sigmoid routing, shared experts, fine-grained experts, configurable MoE frequency.
 - **Optimizer and scheduler comparison**: 4 optimizers (AdamW, Muon, Lion, Schedule-Free AdamW) × 6 LR schedulers, composable via config. Data annealing phases for curriculum learning.
 - **Long-running jobs on shared clusters**: SLURM preemption handling, async DCP checkpointing, auto-resume, NaN detection, GPU/NCCL health monitoring.
 - **Representation analysis for NeuroAI**: batch activation extraction via `ActivationStore` and `extract_representations()`, saved to `.npz` for downstream comparison against neural recordings.
@@ -27,7 +27,7 @@ PyTorch-native framework for fault-tolerant distributed training of foundation m
 
 **Architecture**
 - Decoder-only Transformer: RoPE, GQA, SwiGLU, RMSNorm, `torch.compile`
-- Mixture-of-Experts: softmax top-k and DeepSeek-V3 sigmoid routers, shared experts, configurable frequency
+- Mixture-of-Experts: softmax top-k and DeepSeek-V3 sigmoid routers, shared experts, fine-grained experts, configurable frequency
 
 **Parallelism**
 - FSDP2, Tensor, Expert, and Pipeline Parallelism
