@@ -37,6 +37,7 @@ the distributed mechanics (all-to-all, expert parallelism) live under
 | `moe_gradient_scale` | `false` | Per-expert output scaling by utilization |
 | `moe_sequence_aux_loss_weight` | `0.0` | Sigmoid-only: sequence-level balance penalty |
 | `moe_bias_schedule` | `"constant"` | Sigmoid-only: bias update rate schedule |
+| `moe_expert_ffn_multiplier` | `1.0` | Per-expert FFN hidden = `multiplier × dense FFN`; `0.5` = fine-grained, so top-2 matches the dense FFN's activated FLOPs |
 
 All fields live in
 [`kempnerforge/config/model.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/config/model.py)

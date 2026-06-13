@@ -60,7 +60,7 @@ class TransformerBlock(nn.Module):
         if use_moe:
             self.mlp = build_moe(
                 dim=config.dim,
-                hidden_dim=config.computed_ffn_hidden_dim,
+                hidden_dim=config.computed_expert_ffn_hidden_dim,
                 num_experts=config.num_experts,
                 top_k=config.moe_top_k,
                 activation=config.activation,

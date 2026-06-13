@@ -104,6 +104,35 @@ class TestModelConfig:
         assert m.is_moe is True
         assert m.moe_top_k == 2
 
+    def test_expert_ffn_multiplier_default_matches_dense(self):
+        m = ModelConfig(dim=1024, n_heads=16, num_experts=4, moe_top_k=2)
+        assert m.moe_expert_ffn_multiplier == 1.0
+        assert m.computed_expert_ffn_hidden_dim == m.computed_ffn_hidden_dim
+
+    def test_expert_ffn_multiplier_half(self):
+        m = ModelConfig(
+            dim=1024, n_heads=16, num_experts=4, moe_top_k=2, moe_expert_ffn_multiplier=0.5
+        )
+        assert m.computed_expert_ffn_hidden_dim == m.computed_ffn_hidden_dim // 2
+
+    def test_expert_ffn_isoflop_top2(self):
+        # top-2 with half-size experts matches the dense FFN's activated FLOPs (2 * F/2 = F)
+        m = ModelConfig(
+            dim=1024, n_heads=16, num_experts=4, moe_top_k=2, moe_expert_ffn_multiplier=0.5
+        )
+        assert m.moe_top_k * m.computed_expert_ffn_hidden_dim == m.computed_ffn_hidden_dim
+
+    def test_expert_ffn_multiplier_rejects_nonpositive(self):
+        with pytest.raises(ValueError, match="moe_expert_ffn_multiplier must be positive"):
+            ModelConfig(num_experts=4, moe_top_k=2, moe_expert_ffn_multiplier=0.0)
+
+    def test_finegrained_reduces_param_estimate(self):
+        common = dict(dim=512, n_layers=2, n_heads=8, vocab_size=1000, num_experts=4, moe_top_k=2)
+        assert (
+            ModelConfig(**common, moe_expert_ffn_multiplier=0.5).num_params_estimate
+            < ModelConfig(**common).num_params_estimate
+        )
+
     def test_router_z_loss_weight_default(self):
         m = ModelConfig(num_experts=4, moe_top_k=2)
         assert m.moe_router_z_loss_weight == 0.0

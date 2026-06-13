@@ -66,6 +66,21 @@ def _config(
     )
 
 
+def test_moma_finegrained_experts():
+    """MoMa expert-choice MoE experts honor moe_expert_ffn_multiplier (fine-grained)."""
+    cfg = ModelConfig(
+        dim=64, n_layers=2, n_heads=4, vocab_size=128, max_seq_len=64, moe_expert_ffn_multiplier=0.5
+    )
+    ffn = MoMaFFN(
+        cfg,
+        modalities=("image", "text"),
+        experts_per_modality={"image": 4, "text": 4},
+        capacity_factor_per_modality={"image": 1.0, "text": 1.0},
+    )
+    expert = ffn.experts["text"].experts[0]
+    assert expert.gate_proj.weight.shape[0] == cfg.computed_ffn_hidden_dim // 2
+
+
 # ---------------------------------------------------------------------------
 # MoMaConfig
 # ---------------------------------------------------------------------------

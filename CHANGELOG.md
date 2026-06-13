@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Fine-grained MoE experts** (`moe_expert_ffn_multiplier`). Decouples each expert's FFN hidden width from the dense FFN: the per-expert hidden dim is `computed_ffn_hidden_dim × moe_expert_ffn_multiplier`, rounded to a multiple of 16. The default `1.0` is a no-op (each expert is a full dense FFN, zero behavior change); set `0.5` for fine-grained experts so top-2 routing matches the dense FFN's activated FLOPs (`2 × F/2 = F`) while adding total capacity — the DeepSeekMoE recipe. Applies to routed and shared experts wherever they are built (`build_moe` and MoMa's `ExpertChoiceMoE`).
+  - `kempnerforge/config/model.py`: `moe_expert_ffn_multiplier: float = 1.0` (with a positivity check) and a `computed_expert_ffn_hidden_dim` property; `num_params_estimate` accounts for the smaller experts.
+  - `kempnerforge/model/{moe,moma,mot,transformer}.py`: experts are built at `computed_expert_ffn_hidden_dim` instead of the dense FFN width.
+  - Tests: `tests/unit/test_config.py` (default-equals-dense, half-size, iso-FLOP top-2, rejects non-positive, param-estimate drop) plus cases in `test_moe.py`, `test_moma.py`, `test_mot.py`.
 - **VLM (Vision-Language Model) foundation + Joint-Decoder arch.** A registry-driven, discriminated-union design so future arches (Cross-Attention, Mixture-of-Transformers) can be added as small additive PRs without changes to existing call sites.
   - `kempnerforge/config/vlm.py`: `VLMConfig` base + `JointDecoderConfig(arch="joint_decoder")` registered via `@registry.register_vlm_config`. `FreezeSpec`, `FreezeStage`, and `DEFAULT_MODULE_PATTERNS` for the freeze plumbing. `_RESERVED_ARCHS = ("cross_attention", "mot")` so TOMLs aimed at future arches get a clear `NotImplementedError`.
   - `kempnerforge/config/registry.py`: `register_vision_encoder` / `register_vlm_config` / `register_modality_strategy` registries.

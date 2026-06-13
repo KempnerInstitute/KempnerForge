@@ -289,7 +289,7 @@ class MoMaFFN(nn.Module):
             {
                 m: ExpertChoiceMoE(
                     dim=config.dim,
-                    hidden_dim=config.computed_ffn_hidden_dim,
+                    hidden_dim=config.computed_expert_ffn_hidden_dim,
                     num_experts=experts_per_modality[m],
                     capacity_factor=capacity_factor_per_modality[m],
                     activation=config.activation,
