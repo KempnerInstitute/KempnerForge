@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **MoE router z-loss** (`moe_router_z_loss_weight`, ST-MoE style). An optional penalty on the router's pre-softmax logits — per MoE layer `mean_token(logsumexp(router_logits))²` — summed across layers and added to the training loss as `moe_router_z_loss_weight × z_loss`. It keeps router logits from growing without bound, targeting *logit-growth stability* (not load balance — that's the aux loss). Default `0.0` is off: the term is never added, so training, outputs, and gradients are unchanged. `z_loss` is a plain attribute like `aux_loss` (not a buffer/parameter), so it never enters `state_dict` — checkpoint-safe.
+  - `kempnerforge/config/model.py`: `moe_router_z_loss_weight: float = 0.0` (with a non-negativity check).
+  - `kempnerforge/model/router.py`: both `SoftmaxTopKRouter` and `SigmoidTopKRouter` set `self.z_loss = (logsumexp(logits, dim=-1) ** 2).mean()`.
+  - `kempnerforge/model/moe.py` / `transformer.py`: `MoEMLP.z_loss` exposes the per-layer value; `Transformer.get_moe_router_z_loss()` sums it across MoE layers (mirrors `get_moe_aux_loss()`).
+  - `scripts/train.py`: adds `moe_router_z_loss_weight × z_loss` to the loss on both forward paths (gated on `weight > 0`) and logs `moe/router_z_loss`.
+  - Tests: `tests/unit/test_config.py` (default, rejects negative) and `tests/unit/test_moe.py` (z-loss computed; scales with the coefficient).
 - **Fine-grained MoE experts** (`moe_expert_ffn_multiplier`). Decouples each expert's FFN hidden width from the dense FFN: the per-expert hidden dim is `computed_ffn_hidden_dim × moe_expert_ffn_multiplier`, rounded to a multiple of 16. The default `1.0` is a no-op (each expert is a full dense FFN, zero behavior change); set `0.5` for fine-grained experts so top-2 routing matches the dense FFN's activated FLOPs (`2 × F/2 = F`) while adding total capacity — the DeepSeekMoE recipe. Applies to routed and shared experts wherever they are built (`build_moe` and MoMa's `ExpertChoiceMoE`).
   - `kempnerforge/config/model.py`: `moe_expert_ffn_multiplier: float = 1.0` (with a positivity check) and a `computed_expert_ffn_hidden_dim` property; `num_params_estimate` accounts for the smaller experts.
   - `kempnerforge/model/{moe,moma,mot,transformer}.py`: experts are built at `computed_expert_ffn_hidden_dim` instead of the dense FFN width.
