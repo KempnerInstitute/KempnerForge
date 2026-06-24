@@ -66,9 +66,12 @@ def test_dcp_roundtrip_generate_until(tmp_path, tiny_vlm_configs, monkeypatch):
         "kempnerforge.eval.vlm.adapter.build_tokenizer", lambda _path: _MockTokenizer()
     )
 
-    vlm = KempnerForgeVLM(config="ignored", checkpoint=str(ckpt_dir), device="cpu", dtype="float32")
+    vlm = KempnerForgeVLM(
+        config="ignored", checkpoint=str(ckpt_dir), device="cpu", dtype="float32", batch_size=2
+    )
 
-    # Synthetic single-image, single-turn request mirroring the chat 6-tuple.
+    # Two synthetic single-image requests with different prompt lengths, decoded
+    # as one right-padded batch (batch_size=2), mirroring the chat 6-tuple.
     img = Image.new("RGB", (8, 8), color=(120, 120, 120))
 
     def doc_to_messages(doc):
@@ -79,18 +82,28 @@ def test_dcp_roundtrip_generate_until(tmp_path, tiny_vlm_configs, monkeypatch):
             }
         ]
 
-    vlm.task_dict = {"t": {"test": {"d0": {"q": "What color is this?"}}}}
-    inst = Instance(
-        request_type="generate_until",
-        arguments=("ctx", doc_to_messages, {"max_new_tokens": 3}, "d0", "t", "test"),
-        idx=0,
-        metadata={"task": "t", "doc_id": "d0", "repeats": 1},
-    )
+    vlm.task_dict = {
+        "t": {
+            "test": {
+                "d0": {"q": "What color is this?"},
+                "d1": {"q": "Describe this picture in a few words please."},
+            }
+        }
+    }
+    instances = [
+        Instance(
+            request_type="generate_until",
+            arguments=("ctx", doc_to_messages, {"max_new_tokens": 3}, doc_id, "t", "test"),
+            idx=i,
+            metadata={"task": "t", "doc_id": doc_id, "repeats": 1},
+        )
+        for i, doc_id in enumerate(["d0", "d1"])
+    ]
 
-    outputs = vlm.generate_until([inst])
-    assert isinstance(outputs, list) and len(outputs) == 1
-    assert isinstance(outputs[0], str)
-    assert len(outputs[0].split()) == 3  # greedy emits exactly max_new_tokens
+    outputs = vlm.generate_until(instances)
+    assert isinstance(outputs, list) and len(outputs) == 2
+    assert all(isinstance(o, str) for o in outputs)
+    assert all(len(o.split()) == 3 for o in outputs)  # greedy emits exactly max_new_tokens
 
 
 @pytest.mark.skipif(

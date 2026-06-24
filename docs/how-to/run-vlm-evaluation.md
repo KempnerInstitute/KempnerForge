@@ -77,7 +77,7 @@ default benchmark set is still being decided.
 | `--output` | `None` | save full JSON results |
 | `--device` | `cuda` | inference device |
 | `--dtype` | `bfloat16` | model dtype |
-| `--batch-size` | `1` | v1 decodes one request at a time |
+| `--batch-size` | `1` | requests decoded together (grouped by `gen_kwargs`) |
 | `--max-new-tokens` | `128` | fallback only; task `gen_kwargs` override it |
 
 
@@ -107,7 +107,9 @@ Several are tracked follow-ups.
   over the growing sequence each step (KempnerForge has no image-conditioned
   KV-cache decode path), and the vision tower is re-encoded each step (there is
   no arch-agnostic public seam to pass cached image features). Both are correct
-  but cost extra compute; encode-once and a KV-cache decode are future work.
+  but cost extra compute. Raising `--batch-size` decodes multiple requests
+  together (right-padded, grouped by `gen_kwargs`) to amortize per-step overhead;
+  encode-once and a KV-cache decode are future work.
 
 ## Cluster environment notes
 

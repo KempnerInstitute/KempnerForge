@@ -14,11 +14,15 @@ standard multimodal benchmarks lmms-eval implements as ``generate_until`` tasks
 and is arch-agnostic across the generative VLM arches.
 v1 scope and deliberate choices (see docs/how-to/run-vlm-evaluation.md):
 
-- **Generation: cache-less, single-GPU, batch 1.** The decode loop re-runs the
+- **Generation: cache-less, single-GPU, batched.** The decode loop re-runs the
   full ``VLMWrapper.forward`` over the growing sequence each step. There is no
   transformer KV cache (``Transformer.forward`` forbids combining ``kv_caches``
   with any image-conditioning route), and KempnerForge has no
-  image-conditioned KV-cache decode path. Single-GPU is the validated
+  image-conditioned KV-cache decode path. Requests are decoded in batches
+  (``batch_size`` model-arg) by **right-padding** the text to the batch-max
+  length — the same layout training uses (image prefix at ``0..n-1``, text
+  contiguous from ``n``, trailing pads causally masked) — and reading each
+  row's logits at its own last real position. Single-GPU is the validated
   invocation, not a baked-in assumption: rank/world_size come from the lmms
   base (defaults 0/1) and model construction sits behind ``_build_model`` so a
   data-parallel path is a localized future change.
@@ -62,6 +66,7 @@ import torch.distributed.checkpoint as dcp
 from lmms_eval.api.instance import Instance
 from lmms_eval.api.model import lmms
 from lmms_eval.protocol import ChatMessages
+from lmms_eval.utils import Collator
 from tqdm import tqdm
 
 from kempnerforge.config.job import JobConfig
@@ -71,6 +76,7 @@ from kempnerforge.data.vlm_dataset import (
     DEFAULT_IMAGE_STD,
     build_tokenizer,
     pil_to_tensor,
+    resolve_pad_id,
 )
 from kempnerforge.metrics.logger import get_logger
 from kempnerforge.model.generate import sample
@@ -286,21 +292,28 @@ def _first_stop(text: str, until: list[str]) -> int | None:
 
 
 @torch.inference_mode()
-def _generate_one(
+def _generate_batch(
     model: VLMWrapper,
     tokenizer: Any,
     pixel_values: torch.Tensor,
-    prompt_ids: torch.Tensor,
+    prompt_ids: list[torch.Tensor],
     resolved: dict[str, Any],
     max_seq_len: int,
-) -> str:
-    """Cache-less decode for one request (batch 1); returns the continuation.
+) -> list[str]:
+    """Cache-less batched decode; returns one continuation per request.
 
-    Re-runs ``model(pixel_values, seq)`` over the growing sequence each step
-    (no transformer KV cache; vision re-encoded per step — see module
-    docstring), selects the next token with KempnerForge's ``sample`` using the
-    resolved ``gen_kwargs``, and stops on EOS, ``max_new_tokens``, or the first
-    ``until`` match (trimming the continuation at that match).
+    Decodes ``B`` requests together (``pixel_values`` is ``(B, 3, H, W)``,
+    ``prompt_ids`` a list of ``B`` 1-D token tensors). Re-runs
+    ``model(pixel_values, input_ids)`` over the growing **right-padded** batch
+    each step (no transformer KV cache; vision re-encoded per step — see module
+    docstring). Right-padding matches the training layout: the image prefix
+    stays at positions ``0..n-1`` and text is contiguous from ``n`` for every
+    row (so image/text RoPE distances are consistent across rows), and the
+    trailing pads are causally masked, so a batched forward gives each row the
+    same real-position logits as decoding it alone. Each row's next token is
+    read at its own last real position; EOS / ``max_new_tokens`` / first
+    ``until`` match are tracked per row. ``B == 1`` reproduces the
+    single-request path exactly.
     """
     until: list[str] = resolved["until"]
     max_new_tokens: int = resolved["max_new_tokens"]
@@ -308,7 +321,13 @@ def _generate_one(
     top_k: int = resolved["top_k"]
     top_p: float = resolved["top_p"]
     eos_id = tokenizer.eos_token_id
+    pad_id = resolve_pad_id(tokenizer)
+    device = pixel_values.device
+    batch_size = len(prompt_ids)
 
+    # Length bound: image tokens (in-residual for JD/MoT; 0 for CA) + prompt +
+    # generated must fit the context. Reserve room for generation and left-
+    # truncate any over-budget prompt (per row).
     num_image_tokens = model.num_image_tokens
     prompt_budget = max_seq_len - num_image_tokens - max_new_tokens
     if prompt_budget <= 0:
@@ -316,31 +335,63 @@ def _generate_one(
             f"max_new_tokens ({max_new_tokens}) + image tokens ({num_image_tokens}) leave no "
             f"room for the prompt within max_seq_len ({max_seq_len}); lower --max-new-tokens."
         )
-    if prompt_ids.shape[1] > prompt_budget:
-        logger.warning(
-            f"Prompt ({prompt_ids.shape[1]}) + image tokens ({num_image_tokens}) + "
-            f"max_new_tokens ({max_new_tokens}) exceeds max_seq_len ({max_seq_len}); "
-            f"left-truncating prompt to {prompt_budget} tokens. Severe truncation may "
-            f"distort results — report the task to the project owner if so."
-        )
-        prompt_ids = prompt_ids[:, -prompt_budget:]
+    prompts: list[torch.Tensor] = []
+    for ids in prompt_ids:
+        if ids.shape[0] > prompt_budget:
+            logger.warning(
+                f"Prompt ({ids.shape[0]}) + image tokens ({num_image_tokens}) + max_new_tokens "
+                f"({max_new_tokens}) exceeds max_seq_len ({max_seq_len}); left-truncating prompt "
+                f"to {prompt_budget} tokens. Severe truncation may distort results."
+            )
+            ids = ids[-prompt_budget:]
+        prompts.append(ids)
 
-    seq = prompt_ids
-    generated: list[int] = []
+    generated: list[list[int]] = [[] for _ in range(batch_size)]
+    done = [False] * batch_size
+    row_index = torch.arange(batch_size, device=device)
+
     for _ in range(max_new_tokens):
-        logits, _ = model(pixel_values, seq)
-        next_token = sample(logits[:, -1, :], temperature, top_k, top_p)
-        token_id = int(next_token.item())
-        if eos_id is not None and token_id == eos_id:
+        # Rebuild the right-padded batch from prompt + tokens generated so far.
+        seqs = [
+            torch.cat([prompts[i], torch.tensor(generated[i], dtype=torch.long, device=device)])
+            for i in range(batch_size)
+        ]
+        real_len = torch.tensor([s.shape[0] for s in seqs], device=device)
+        cur_max = int(real_len.max().item())
+        input_ids = torch.full((batch_size, cur_max), pad_id, dtype=torch.long, device=device)
+        for i, s in enumerate(seqs):
+            input_ids[i, : s.shape[0]] = s
+
+        logits, _ = model(pixel_values, input_ids)
+        # Each row's next-token logits sit at its own last real position (the
+        # output is already trimmed to text positions for JD/MoT; CA has no
+        # image prefix), not at [-1] (a pad for shorter rows).
+        next_logits = logits[row_index, real_len - 1]
+        next_tokens = sample(next_logits, temperature, top_k, top_p)
+
+        for i in range(batch_size):
+            if done[i]:
+                continue
+            token_id = int(next_tokens[i].item())
+            if eos_id is not None and token_id == eos_id:
+                done[i] = True
+                continue
+            generated[i].append(token_id)
+            if len(generated[i]) >= max_new_tokens:
+                done[i] = True
+            elif until:
+                text = tokenizer.decode(generated[i], skip_special_tokens=True)
+                if _first_stop(text, until) is not None:
+                    done[i] = True
+        if all(done):
             break
-        generated.append(token_id)
-        seq = torch.cat([seq, next_token.view(1, 1)], dim=1)
-        if until:
-            text = tokenizer.decode(generated, skip_special_tokens=True)
-            cut = _first_stop(text, until)
-            if cut is not None:
-                return text[:cut]
-    return tokenizer.decode(generated, skip_special_tokens=True)
+
+    outputs: list[str] = []
+    for tokens in generated:
+        text = tokenizer.decode(tokens, skip_special_tokens=True)
+        cut = _first_stop(text, until)
+        outputs.append(text[:cut] if cut is not None else text)
+    return outputs
 
 
 # --------------------------------------------------------------------------- #
@@ -359,8 +410,8 @@ class KempnerForgeVLM(lmms):
     - ``checkpoint`` (required): DCP checkpoint directory (a run dir or a
       specific ``step_N`` dir).
     - ``device`` (default ``"cuda"``), ``dtype`` (default ``"bfloat16"``).
-    - ``batch_size`` (default ``1``): recorded for parity; v1 decodes one
-      request at a time.
+    - ``batch_size`` (default ``1``): number of requests decoded together
+      (right-padded), grouped by gen_kwargs.
     - ``max_new_tokens`` (default ``128``): fallback only; task ``gen_kwargs``
       override it.
     """
@@ -401,37 +452,54 @@ class KempnerForgeVLM(lmms):
         )
 
     def generate_until(self, requests: list[Instance]) -> list[str]:
+        # Group requests by gen_kwargs (a batch must share decode params) and,
+        # within a group, sort by context length so similar-length prompts batch
+        # together (less padding). Collator.get_original restores request order.
+        def _collate(args: tuple[Any, ...]) -> int:
+            return -len(args[0]) if isinstance(args[0], str) else 0
+
+        re_ords = Collator(
+            [request.args for request in requests],
+            _collate,
+            group_fn=lambda args: args[2],  # args[2] == gen_kwargs
+            grouping=True,
+        )
         results: list[str] = []
         pbar = tqdm(total=len(requests), disable=(self.rank != 0), desc="KempnerForge VLM")
-        for request in requests:
-            # Instance.args is an untyped tuple; for chat generate_until it is the
-            # 6-tuple (context, doc_to_messages, gen_kwargs, doc_id, task, split).
-            args: tuple[Any, ...] = request.args
-            context, doc_to_messages, gen_kwargs, doc_id, task, split = args
-            doc = self.task_dict[task][split][doc_id]
-            messages = ChatMessages(messages=doc_to_messages(doc))
-
-            frames, prompt = _render_request(messages)
-            pixel_values = _frames_to_pixel_values(
-                frames, self._config.data.hf_image_size, self._device, self._dtype
-            )
-            # Mirror training tokenization: no chat template, no <image> placeholder,
-            # add_special_tokens=False (images are conditioned via pixel_values).
-            prompt_ids = torch.tensor(
-                [self._tokenizer(prompt, add_special_tokens=False)["input_ids"]],
-                dtype=torch.long,
-                device=self._device,
-            )
-            resolved = _resolve_gen_kwargs(gen_kwargs, self._default_max_new_tokens)
-            output = _generate_one(
+        for chunk in re_ords.get_batched(n=self._batch_size, batch_fn=None):
+            # Every request in the chunk shares gen_kwargs (index 2); resolve once.
+            resolved = _resolve_gen_kwargs(chunk[0][2], self._default_max_new_tokens)
+            frames_batch: list[torch.Tensor] = []
+            prompt_ids: list[torch.Tensor] = []
+            for args in chunk:
+                # Chat 6-tuple: (context, doc_to_messages, gen_kwargs, doc_id, task, split).
+                doc = self.task_dict[args[4]][args[5]][args[3]]
+                messages = ChatMessages(messages=args[1](doc))
+                frames, prompt = _render_request(messages)
+                frames_batch.append(
+                    _frames_to_pixel_values(
+                        frames, self._config.data.hf_image_size, self._device, self._dtype
+                    )
+                )
+                # Mirror training tokenization: no chat template, no <image>
+                # placeholder, add_special_tokens=False (images go via pixel_values).
+                prompt_ids.append(
+                    torch.tensor(
+                        self._tokenizer(prompt, add_special_tokens=False)["input_ids"],
+                        dtype=torch.long,
+                        device=self._device,
+                    )
+                )
+            pixel_values = torch.cat(frames_batch, dim=0)
+            outputs = _generate_batch(
                 self._model, self._tokenizer, pixel_values, prompt_ids, resolved, self._max_seq_len
             )
-
-            results.append(output)
-            self.cache_hook.add_partial("generate_until", (context, gen_kwargs), output)
-            pbar.update(1)
+            for args, output in zip(chunk, outputs, strict=True):
+                results.append(output)
+                self.cache_hook.add_partial("generate_until", (args[0], args[2]), output)
+            pbar.update(len(chunk))
         pbar.close()
-        return results
+        return re_ords.get_original(results)
 
     def loglikelihood(self, requests: list[Instance]) -> list[tuple[float, bool]]:
         raise NotImplementedError(

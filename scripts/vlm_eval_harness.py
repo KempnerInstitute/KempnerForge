@@ -79,7 +79,10 @@ def main() -> None:
         "--dtype", type=str, default="bfloat16", help="Model dtype (default: bfloat16)"
     )
     parser.add_argument(
-        "--batch-size", type=int, default=1, help="Batch size (v1 decodes one request at a time)"
+        "--batch-size",
+        type=int,
+        default=1,
+        help="Requests decoded together (grouped by gen_kwargs)",
     )
     parser.add_argument(
         "--max-new-tokens",

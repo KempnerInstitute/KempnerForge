@@ -25,7 +25,7 @@ from kempnerforge.eval.vlm.adapter import (  # noqa: E402
     KempnerForgeVLM,
     _check_generative_arch,
     _frames_to_pixel_values,
-    _generate_one,
+    _generate_batch,
     _render_request,
     _resolve_gen_kwargs,
 )
@@ -173,79 +173,136 @@ class TestResolveGenKwargs:
 
 
 # ---------------------------------------------------------------------------
-# _generate_one (cache-less decode loop) on a tiny random VLM
+# _generate_batch (cache-less batched decode loop) on a tiny random VLM
 # ---------------------------------------------------------------------------
 
 
-class TestGenerateOne:
-    def _pixels(self) -> torch.Tensor:
-        torch.manual_seed(0)
-        return torch.randn(1, 3, 16, 16)
+def _pixels(batch: int = 1) -> torch.Tensor:
+    torch.manual_seed(0)
+    return torch.randn(batch, 3, 16, 16)
 
-    def _prompt(self) -> torch.Tensor:
-        return torch.tensor([[5, 9, 12, 3]], dtype=torch.long)
+
+class TestGenerateBatchSingle:
+    """B == 1 must reproduce the v1 single-request behavior."""
+
+    def _prompt(self) -> list[torch.Tensor]:
+        return [torch.tensor([5, 9, 12, 3], dtype=torch.long)]
 
     def test_greedy_is_deterministic(self, tiny_vlm_wrapper):
-        pv, pid = self._pixels(), self._prompt()
+        pv, pid = _pixels(), self._prompt()
         r = _resolve_gen_kwargs({"max_new_tokens": 6}, 128)
-        out1 = _generate_one(tiny_vlm_wrapper, _MockTokenizer(), pv, pid, r, 64)
-        out2 = _generate_one(tiny_vlm_wrapper, _MockTokenizer(), pv, pid, r, 64)
-        assert isinstance(out1, str) and out1 == out2
+        out1 = _generate_batch(tiny_vlm_wrapper, _MockTokenizer(), pv, pid, r, 64)
+        out2 = _generate_batch(tiny_vlm_wrapper, _MockTokenizer(), pv, pid, r, 64)
+        assert out1 == out2 and len(out1) == 1 and isinstance(out1[0], str)
 
     def test_respects_max_new_tokens(self, tiny_vlm_wrapper):
         r = _resolve_gen_kwargs({"max_new_tokens": 6}, 128)
-        out = _generate_one(
-            tiny_vlm_wrapper, _MockTokenizer(), self._pixels(), self._prompt(), r, 64
-        )
-        assert len(out.split()) == 6
+        out = _generate_batch(tiny_vlm_wrapper, _MockTokenizer(), _pixels(), self._prompt(), r, 64)
+        assert len(out[0].split()) == 6
 
     def test_until_trims_continuation(self, tiny_vlm_wrapper):
-        pv, pid = self._pixels(), self._prompt()
-        one = _generate_one(
+        pv, pid = _pixels(), self._prompt()
+        one = _generate_batch(
             tiny_vlm_wrapper,
             _MockTokenizer(),
             pv,
             pid,
             _resolve_gen_kwargs({"max_new_tokens": 1}, 128),
             64,
-        )
-        # With decode = space-joined ids, the first space follows the first token,
-        # so until=[" "] trims to exactly the first generated token.
-        trimmed = _generate_one(
+        )[0]
+        # decode = space-joined ids, so the first space follows the first token:
+        # until=[" "] trims to exactly the first generated token.
+        trimmed = _generate_batch(
             tiny_vlm_wrapper,
             _MockTokenizer(),
             pv,
             pid,
             _resolve_gen_kwargs({"max_new_tokens": 6, "until": [" "]}, 128),
             64,
-        )
+        )[0]
         assert trimmed == one and " " not in trimmed
 
     def test_eos_stops_generation(self, tiny_vlm_wrapper):
-        pv, pid = self._pixels(), self._prompt()
-        first = _generate_one(
+        pv, pid = _pixels(), self._prompt()
+        first = _generate_batch(
             tiny_vlm_wrapper,
             _MockTokenizer(),
             pv,
             pid,
             _resolve_gen_kwargs({"max_new_tokens": 1}, 128),
             64,
-        )
-        eos_id = int(first)
-        out = _generate_one(
+        )[0]
+        out = _generate_batch(
             tiny_vlm_wrapper,
-            _MockTokenizer(eos_token_id=eos_id),
+            _MockTokenizer(eos_token_id=int(first)),
             pv,
             pid,
             _resolve_gen_kwargs({"max_new_tokens": 6}, 128),
             64,
         )
-        assert out == ""
+        assert out == [""]
 
     def test_length_bound_raises_when_no_room(self, tiny_vlm_wrapper):
         r = _resolve_gen_kwargs({"max_new_tokens": 100}, 128)
         with pytest.raises(ValueError, match="max_new_tokens"):
-            _generate_one(tiny_vlm_wrapper, _MockTokenizer(), self._pixels(), self._prompt(), r, 64)
+            _generate_batch(tiny_vlm_wrapper, _MockTokenizer(), _pixels(), self._prompt(), r, 64)
+
+
+class TestGenerateBatchMulti:
+    """B > 1: right-padding must not change any row's result, and stop
+    conditions must be tracked per row."""
+
+    def _prompts(self) -> list[torch.Tensor]:
+        # Deliberately different lengths so right-padding is exercised.
+        return [
+            torch.tensor([5, 9, 12, 3], dtype=torch.long),
+            torch.tensor([7, 2], dtype=torch.long),
+            torch.tensor([1, 4, 8, 11, 20, 6], dtype=torch.long),
+        ]
+
+    def test_batch_equals_sequential(self, tiny_vlm_wrapper):
+        """Key correctness gate: a right-padded batch yields the same per-row
+        continuation as decoding each request alone (greedy, float32)."""
+        prompts = self._prompts()
+        pv = _pixels(len(prompts))  # (3, 3, 16, 16) — one image per request
+        r = _resolve_gen_kwargs({"max_new_tokens": 5}, 128)
+        sequential = [
+            _generate_batch(tiny_vlm_wrapper, _MockTokenizer(), pv[i : i + 1], [prompts[i]], r, 64)[
+                0
+            ]
+            for i in range(len(prompts))
+        ]
+        batched = _generate_batch(tiny_vlm_wrapper, _MockTokenizer(), pv, prompts, r, 64)
+        assert batched == sequential
+
+    def test_per_row_max_new_tokens(self, tiny_vlm_wrapper):
+        prompts = self._prompts()
+        pv = _pixels(len(prompts))
+        r = _resolve_gen_kwargs({"max_new_tokens": 4}, 128)
+        outs = _generate_batch(tiny_vlm_wrapper, _MockTokenizer(), pv, prompts, r, 64)
+        assert len(outs) == 3 and all(len(o.split()) == 4 for o in outs)
+
+    def test_per_row_eos_independent(self, tiny_vlm_wrapper):
+        """EOS on one row stops only that row; the batch still returns all rows."""
+        prompts = self._prompts()
+        pv = _pixels(len(prompts))
+        first0 = _generate_batch(
+            tiny_vlm_wrapper,
+            _MockTokenizer(),
+            pv[:1],
+            [prompts[0]],
+            _resolve_gen_kwargs({"max_new_tokens": 1}, 128),
+            64,
+        )[0]
+        outs = _generate_batch(
+            tiny_vlm_wrapper,
+            _MockTokenizer(eos_token_id=int(first0)),
+            pv,
+            prompts,
+            _resolve_gen_kwargs({"max_new_tokens": 5}, 128),
+            64,
+        )
+        assert len(outs) == 3 and outs[0] == ""  # row 0 stops immediately on EOS
 
 
 # ---------------------------------------------------------------------------
