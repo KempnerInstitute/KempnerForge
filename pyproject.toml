@@ -4,41 +4,44 @@ version = "0.1.0"
 description = "PyTorch-native framework for fault-tolerant distributed training of foundation models on AI clusters"
 license = "MIT"
 authors = [
-    { name = "Kempner Institute", email = "kempner_hpc_cluster@harvard.edu" },
+  { name = "Kempner Institute", email = "kempner_hpc_cluster@harvard.edu" },
 ]
 requires-python = ">=3.12"
 dependencies = [
-    "torch>=2.4",
-    "wandb",
-    "tensorboard",
-    "transformers",
-    "datasets",
-    "tokenizers",
-    "torchao>=0.17.0",
+  "torch>=2.4",
+  "wandb",
+  "tensorboard",
+  "transformers",
+  "datasets",
+  "tokenizers",
+  "torchao>=0.17.0",
 ]
+
+[project.entry-points."lmms_eval.models"]
+kempnerforge_vlm = "kempnerforge.eval.vlm.registry:MANIFEST"
 
 [dependency-groups]
 dev = [
-    "pyright[nodejs]>=1.1.408",
-    "pytest",
-    "pytest-cov",
-    "pytest-timeout",
-    "ruff",
-    "vulture>=2.16",
-    # Notebooks (examples/notebooks/)
-    "ipykernel",
-    "matplotlib",
-    "nbstripout",
-    "nbconvert>=7.17.1",
+  "pyright[nodejs]>=1.1.408",
+  "pytest",
+  "pytest-cov",
+  "pytest-timeout",
+  "ruff",
+  "vulture>=2.16",
+  # Notebooks (examples/notebooks/)
+  "ipykernel",
+  "matplotlib",
+  "nbstripout",
+  "nbconvert>=7.17.1",
 ]
 docs = [
-    "sphinx>=7.0",
-    "furo>=2024.1",
-    "myst-parser>=3.0",
-    "linkify-it-py>=2.0",
-    "sphinx-copybutton>=0.5",
-    "sphinx-autodoc-typehints>=2.0",
-    "sphinx-autobuild>=2024.4",
+  "sphinx>=7.0",
+  "furo>=2024.1",
+  "myst-parser>=3.0",
+  "linkify-it-py>=2.0",
+  "sphinx-copybutton>=0.5",
+  "sphinx-autodoc-typehints>=2.0",
+  "sphinx-autobuild>=2024.4",
 ]
 
 [build-system]
@@ -69,11 +72,11 @@ known-first-party = ["kempnerforge"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [
-    "gpu: requires GPU",
-    "distributed: requires multiple GPUs",
-    "slow: long-running test",
-    "e2e: end-to-end training tests (run with --e2e)",
-    "smoke: smoke tests across parallelism configs (run with --smoke)",
+  "gpu: requires GPU",
+  "distributed: requires multiple GPUs",
+  "slow: long-running test",
+  "e2e: end-to-end training tests (run with --e2e)",
+  "smoke: smoke tests across parallelism configs (run with --smoke)",
 ]
 
 [tool.coverage.run]
@@ -82,8 +85,8 @@ branch = true
 
 [tool.coverage.report]
 exclude_lines = [
-    "pragma: no cover",
-    "if TYPE_CHECKING:",
-    "raise NotImplementedError",
-    "\\.\\.\\.",
+  "pragma: no cover",
+  "if TYPE_CHECKING:",
+  "raise NotImplementedError",
+  "\\.\\.\\.",
 ]

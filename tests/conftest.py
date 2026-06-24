@@ -7,12 +7,15 @@ import pytest
 import torch
 
 from kempnerforge.config.schema import (
+    AdapterConfig,
     CheckpointConfig,
     JobConfig,
     ModelConfig,
     OptimizerConfig,
     SchedulerConfig,
     TrainConfig,
+    VisionEncoderConfig,
+    VLMConfig,
 )
 
 # ---------------------------------------------------------------------------
@@ -84,6 +87,30 @@ def tiny_job_config(tmp_path) -> JobConfig:
         scheduler=SchedulerConfig(warmup_steps=2),
         checkpoint=CheckpointConfig(dir=str(tmp_path / "checkpoints"), interval=5),
     )
+
+
+# ---------------------------------------------------------------------------
+# VLM configs / model
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def tiny_vlm_configs() -> tuple[ModelConfig, VisionEncoderConfig, AdapterConfig, VLMConfig]:
+    """Tiny Joint-Decoder VLM configs for CPU tests (random vision encoder)."""
+    return (
+        ModelConfig(dim=64, n_layers=2, n_heads=4, vocab_size=256, max_seq_len=64),
+        VisionEncoderConfig(type="random", feature_dim=96, num_tokens=8),
+        AdapterConfig(),
+        VLMConfig(max_text_len=32),
+    )
+
+
+@pytest.fixture
+def tiny_vlm_wrapper(tiny_vlm_configs):
+    """A tiny CPU ``VLMWrapper`` built from ``tiny_vlm_configs`` (no checkpoint)."""
+    from kempnerforge.model.vlm import build_vlm_wrapper
+
+    return build_vlm_wrapper(*tiny_vlm_configs).eval()
 
 
 # ---------------------------------------------------------------------------

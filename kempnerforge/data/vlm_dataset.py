@@ -38,7 +38,7 @@ DEFAULT_IMAGE_MEAN = (0.5, 0.5, 0.5)
 DEFAULT_IMAGE_STD = (0.5, 0.5, 0.5)
 
 
-def _pil_to_tensor(
+def pil_to_tensor(
     img: Any,
     image_size: int,
     mean: tuple[float, float, float],
@@ -49,6 +49,10 @@ def _pil_to_tensor(
     Accepts a PIL ``Image``. Converts to RGB if needed so grayscale /
     RGBA inputs do not drop into the encoder with the wrong channel
     count.
+
+    Public so that out-of-tree callers (e.g. the VLM evaluation adapter)
+    reuse the exact training-time preprocessing as the single source of
+    truth, rather than re-implementing resize/normalize.
     """
     from PIL import Image
 
@@ -65,6 +69,25 @@ def _pil_to_tensor(
     mean_t = torch.tensor(mean, dtype=t.dtype).view(3, 1, 1)
     std_t = torch.tensor(std, dtype=t.dtype).view(3, 1, 1)
     return (t - mean_t) / std_t
+
+
+def build_tokenizer(tokenizer_path: str) -> Any:
+    from transformers import AutoTokenizer
+
+    return AutoTokenizer.from_pretrained(tokenizer_path)
+
+
+def resolve_pad_id(tokenizer: Any) -> int:
+    """Resolve a pad id, falling back to EOS then 0.
+
+    Mirrors what the dataset uses to right-pad ``input_ids``; tokenizers
+    without a dedicated pad token fall back to
+    the EOS id, and finally to ``0`` if neither is set.
+    """
+    pad_id = tokenizer.pad_token_id
+    if pad_id is None:
+        pad_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
+    return pad_id
 
 
 def _tokenize_and_mask(
@@ -99,9 +122,7 @@ def _tokenize_and_mask(
         prompt_len = 0
 
     full_ids = full_ids[:max_text_len]
-    pad_id = tokenizer.pad_token_id
-    if pad_id is None:
-        pad_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
+    pad_id = resolve_pad_id(tokenizer)
 
     n = len(full_ids)
     input_ids = torch.full((max_text_len,), pad_id, dtype=torch.long)
@@ -153,7 +174,6 @@ class HuggingFaceVLMDataset(Dataset):
 
         from datasets import Dataset as HFDataset
         from datasets import load_dataset, load_from_disk
-        from transformers import AutoTokenizer
 
         # When dataset_name points at an existing directory on disk (absolute
         # or relative path), prefer load_from_disk. Otherwise treat it as an
@@ -183,7 +203,7 @@ class HuggingFaceVLMDataset(Dataset):
         self._image_mean = image_mean
         self._image_std = image_std
         self._max_text_len = max_text_len
-        self._tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+        self._tokenizer = build_tokenizer(tokenizer_path)
         logger.info(
             f"HuggingFaceVLMDataset: {dataset_name} [{split}], {len(self._ds):,} samples, "
             f"image_size={image_size}, max_text_len={max_text_len}"
@@ -194,7 +214,7 @@ class HuggingFaceVLMDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         row = self._ds[idx]
-        pixels = _pil_to_tensor(
+        pixels = pil_to_tensor(
             row[self._image_field], self._image_size, self._image_mean, self._image_std
         )
         prompt_val = row[self._prompt_field] if self._prompt_field is not None else None

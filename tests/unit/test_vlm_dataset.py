@@ -11,8 +11,8 @@ from kempnerforge.data.vlm_dataset import (
     DEFAULT_IMAGE_STD,
     HuggingFaceVLMDataset,
     VLMCollator,
-    _pil_to_tensor,
     _tokenize_and_mask,
+    pil_to_tensor,
 )
 
 
@@ -21,38 +21,38 @@ def _make_image(size: int = 64, color: int = 128) -> Image.Image:
 
 
 # ---------------------------------------------------------------------------
-# _pil_to_tensor
+# pil_to_tensor
 # ---------------------------------------------------------------------------
 
 
 class TestPILToTensor:
     def test_shape_and_dtype(self):
         img = _make_image(48)
-        t = _pil_to_tensor(img, 224, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD)
+        t = pil_to_tensor(img, 224, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD)
         assert t.shape == (3, 224, 224)
         assert t.dtype == torch.float32
 
     def test_non_square_resize(self):
         img = Image.new("RGB", (100, 50), color=(0, 128, 255))
-        t = _pil_to_tensor(img, 64, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD)
+        t = pil_to_tensor(img, 64, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD)
         assert t.shape == (3, 64, 64)
 
     def test_grayscale_promoted_to_rgb(self):
         img = Image.new("L", (32, 32), color=128)
-        t = _pil_to_tensor(img, 32, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD)
+        t = pil_to_tensor(img, 32, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD)
         assert t.shape == (3, 32, 32)
 
     def test_normalization(self):
         """Input with pixels at 127.5 (0.5 after /255) should normalize
         to ~0 under mean=0.5, std=0.5."""
         img = Image.new("RGB", (16, 16), color=(128, 128, 128))  # ~0.502
-        t = _pil_to_tensor(img, 16, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD)
+        t = pil_to_tensor(img, 16, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD)
         # (0.502 - 0.5) / 0.5 ~= 0.004
         assert abs(float(t.mean())) < 0.02
 
     def test_non_pil_raises(self):
         with pytest.raises(TypeError, match="Expected a PIL.Image"):
-            _pil_to_tensor(torch.randn(3, 16, 16), 16, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD)
+            pil_to_tensor(torch.randn(3, 16, 16), 16, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD)
 
 
 # ---------------------------------------------------------------------------
