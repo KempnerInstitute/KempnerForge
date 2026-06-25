@@ -115,7 +115,7 @@ def main() -> None:
 
     model_args = (
         f"config={args.config},checkpoint={args.checkpoint},"
-        f"dtype={args.dtype},max_new_tokens={args.max_new_tokens}"
+        f"dtype={args.dtype},max_new_tokens={args.max_new_tokens},batch_size={args.batch_size}"
     )
     results = simple_evaluate(
         model="kempnerforge_vlm",
