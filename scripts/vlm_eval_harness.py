@@ -46,7 +46,13 @@ logger = logging.getLogger(__name__)
 def _limit_type(value: str) -> int | float:
     """Per-task example cap: an integer count, or a fraction < 1.0."""
     parsed = float(value)
-    return int(parsed) if parsed >= 1 and parsed.is_integer() else parsed
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("--limit must be > 0")
+    if parsed < 1.0:
+        return parsed
+    if parsed.is_integer():
+        return int(parsed)
+    raise argparse.ArgumentTypeError("--limit must be an integer count, or a fraction < 1.0")
 
 
 def main() -> None:
@@ -109,7 +115,7 @@ def main() -> None:
 
     model_args = (
         f"config={args.config},checkpoint={args.checkpoint},"
-        f"dtype={args.dtype},max_new_tokens={args.max_new_tokens}"
+        f"dtype={args.dtype},max_new_tokens={args.max_new_tokens},batch_size={args.batch_size}"
     )
     results = simple_evaluate(
         model="kempnerforge_vlm",
