@@ -120,7 +120,7 @@ def main() -> None:
     results = simple_evaluate(
         model="kempnerforge_vlm",
         model_args=model_args,
-        tasks=args.tasks.split(","),
+        tasks=[t.strip() for t in args.tasks.split(",") if t.strip()],
         device=args.device,
         batch_size=args.batch_size,
         limit=args.limit,
