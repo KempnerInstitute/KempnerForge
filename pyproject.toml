@@ -15,6 +15,7 @@ dependencies = [
     "datasets",
     "tokenizers",
     "torchao>=0.17.0",
+    "av>=17.1.0",
 ]
 
 [dependency-groups]

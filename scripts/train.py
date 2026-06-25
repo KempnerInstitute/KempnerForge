@@ -174,6 +174,7 @@ def main() -> None:
             vision_config=vision_cfg,
             adapter_config=adapter_cfg,
             vlm_config=vlm_cfg,
+            frames_per_clip=(config.video.max_frames if config.video is not None else 1),
             ac_mode=tc.activation_checkpointing,
             mp_policy=mp_policy,
             param_dtype=tc.param_dtype,
@@ -287,37 +288,69 @@ def main() -> None:
             eos_token_id = _AT.from_pretrained(config.data.tokenizer_path).eos_token_id
 
     if is_vlm:
-        # --- VLM (Joint-Decoder) data path ---
-        # Mixing VLM + text-only datasets in one run is out of scope on this
-        # branch. DatasetSource doesn't describe image sources yet; follow-up.
-        if not config.data.hf_dataset_name or not config.data.tokenizer_path:
-            raise ValueError("VLM training requires data.hf_dataset_name and data.tokenizer_path")
-        from transformers import AutoTokenizer
-
-        from kempnerforge.data.vlm_dataset import HuggingFaceVLMDataset, VLMCollator
-
         assert vlm_cfg is not None  # narrowed by is_vlm
-        dataset = HuggingFaceVLMDataset(
-            dataset_name=config.data.hf_dataset_name,
-            split=config.data.hf_dataset_split,
-            image_field=config.data.hf_dataset_image_field,
-            text_field=config.data.hf_dataset_text_field,
-            tokenizer_path=config.data.tokenizer_path,
-            max_text_len=vlm_cfg.max_text_len,
-            prompt_field=config.data.hf_dataset_prompt_field or None,
-            image_size=config.data.hf_image_size,
-            dataset_config=config.data.hf_dataset_config,
-        )
-        # Resolve pad_id from the tokenizer for VLMCollator. Fall back to
-        # EOS when pad_token_id is unset (gpt2, some Llama families), then
-        # to 0 as a last resort. Collator also enforces fixed-length
-        # padding so all DP ranks see identical tensor shapes and emits
-        # the image_positions slot (D18) for downstream multi-image work.
-        _tok = AutoTokenizer.from_pretrained(config.data.tokenizer_path)
-        _pad_id = _tok.pad_token_id
-        if _pad_id is None:
-            _pad_id = _tok.eos_token_id if _tok.eos_token_id is not None else 0
-        collator = VLMCollator(pad_id=int(_pad_id), max_text_len=vlm_cfg.max_text_len)
+        if config.is_video:
+            # --- Video data path (a clip = ordered frames; same VLM wrapper) ---
+            assert config.video is not None  # narrowed by is_video
+            if not config.data.tokenizer_path:
+                raise ValueError("Video training requires data.tokenizer_path")
+            from transformers import AutoTokenizer
+
+            from kempnerforge.data.video_dataset import VideoCollator, WebVidVideoDataset
+
+            vcfg = config.video
+            dataset = WebVidVideoDataset(
+                data_root=vcfg.data_root,
+                split=vcfg.split,
+                tokenizer_path=config.data.tokenizer_path,
+                max_text_len=vlm_cfg.max_text_len,
+                max_frames=vcfg.max_frames,
+                min_frames=vcfg.min_frames,
+                fps=vcfg.fps,
+                frame_size=vcfg.frame_size,
+                max_samples=vcfg.max_samples,
+                prompt=vcfg.prompt,
+            )
+            _tok = AutoTokenizer.from_pretrained(config.data.tokenizer_path)
+            _pad_id = _tok.pad_token_id
+            if _pad_id is None:
+                _pad_id = _tok.eos_token_id if _tok.eos_token_id is not None else 0
+            collator = VideoCollator(pad_id=int(_pad_id), max_text_len=vlm_cfg.max_text_len)
+            logger.info(f"Video dataset: {len(dataset):,} clips from {vcfg.data_root}")
+        else:
+            # --- Image VLM (Joint-Decoder) data path ---
+            # Mixing VLM + text-only datasets in one run is out of scope on this
+            # branch. DatasetSource doesn't describe image sources yet; follow-up.
+            if not config.data.hf_dataset_name or not config.data.tokenizer_path:
+                raise ValueError(
+                    "VLM training requires data.hf_dataset_name and data.tokenizer_path"
+                )
+            from transformers import AutoTokenizer
+
+            from kempnerforge.data.vlm_dataset import HuggingFaceVLMDataset, VLMCollator
+
+            dataset = HuggingFaceVLMDataset(
+                dataset_name=config.data.hf_dataset_name,
+                split=config.data.hf_dataset_split,
+                image_field=config.data.hf_dataset_image_field,
+                text_field=config.data.hf_dataset_text_field,
+                tokenizer_path=config.data.tokenizer_path,
+                max_text_len=vlm_cfg.max_text_len,
+                prompt_field=config.data.hf_dataset_prompt_field or None,
+                image_size=config.data.hf_image_size,
+                dataset_config=config.data.hf_dataset_config,
+            )
+            # Resolve pad_id from the tokenizer for VLMCollator. Fall back to
+            # EOS when pad_token_id is unset (gpt2, some Llama families), then
+            # to 0 as a last resort. Collator also enforces fixed-length
+            # padding so all DP ranks see identical tensor shapes and emits
+            # the image_positions slot (D18) for downstream multi-image work.
+            _tok = AutoTokenizer.from_pretrained(config.data.tokenizer_path)
+            _pad_id = _tok.pad_token_id
+            if _pad_id is None:
+                _pad_id = _tok.eos_token_id if _tok.eos_token_id is not None else 0
+            collator = VLMCollator(pad_id=int(_pad_id), max_text_len=vlm_cfg.max_text_len)
+            logger.info(f"VLM dataset: {len(dataset):,} samples from {config.data.hf_dataset_name}")
         sampler = DistributedSampler(
             dataset, num_replicas=dp_size, rank=dp_rank, shuffle=True, seed=tc.effective_data_seed
         )
@@ -328,7 +361,6 @@ def main() -> None:
             config=config.data,
             collate_fn=collator,
         )
-        logger.info(f"VLM dataset: {len(dataset):,} samples from {config.data.hf_dataset_name}")
 
     elif config.data.datasets:
         # --- Multi-dataset mixing ---

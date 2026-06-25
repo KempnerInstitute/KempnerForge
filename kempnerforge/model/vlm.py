@@ -47,7 +47,7 @@ from kempnerforge.config.registry import registry
 from kempnerforge.config.schema import ModelConfig
 from kempnerforge.config.vision import VisionEncoderConfig
 from kempnerforge.config.vlm import FreezeSpec, VLMConfig
-from kempnerforge.model.adapter import build_adapter
+from kempnerforge.model.adapter import VisionAdapter, build_adapter
 from kempnerforge.model.modality import ModalityContext
 from kempnerforge.model.transformer import Transformer
 from kempnerforge.model.vision import VisionEncoder
@@ -73,20 +73,37 @@ class ModalityStrategy(Protocol):
     def num_image_tokens(self, wrapper: VLMWrapper) -> int: ...
 
 
-def _project_image_features(wrapper: VLMWrapper, pixel_values: torch.Tensor) -> torch.Tensor:
-    """Encode + adapt image features. Cast at the encoder/adapter
-    boundary so the encoder can stay in its HF dtype (often fp32) while
-    the adapter and transformer run in bf16 without an inner dtype
-    clash.
+def _project_visual_features(wrapper: VLMWrapper, pixel_values: torch.Tensor) -> torch.Tensor:
+    """Encode + adapt visual features into LLM-dim tokens.
+
+    Accepts a single-image batch ``(B, 3, H, W)`` or a video-clip batch
+    ``(B, F, 3, H, W)``. For video the frame axis is folded into the batch so
+    the per-frame vision encoder + adapter run once over ``B*F`` frames, then
+    the per-frame tokens are concatenated back per clip in frame order to
+    ``(B, F * tokens_per_frame, dim)``. A single image is just the ``F == 1``
+    case with the frame axis absent.
+
+    Casts at the encoder/adapter boundary so the encoder can stay in its HF
+    dtype (often fp32) while the adapter and transformer run in bf16.
     """
-    feats = wrapper.vision_encoder(pixel_values)
-    # Adapter-agnostic dtype lookup: use the first adapter parameter's
-    # dtype so any registered adapter (mlp_2layer, linear, ...) works
+    is_video = pixel_values.dim() == 5
+    if is_video:
+        b, f = pixel_values.shape[0], pixel_values.shape[1]
+        encoder_input = pixel_values.reshape(b * f, *pixel_values.shape[2:])
+    else:
+        encoder_input = pixel_values
+    feats = wrapper.vision_encoder(encoder_input)
+    # Adapter-agnostic dtype lookup: use the first adapter parameter's dtype
+    # so any registered adapter (mlp_2layer, linear, avgpool, ...) works
     # without coupling to a specific submodule attribute.
     adapter_dtype = next(wrapper.adapter.parameters()).dtype
     if feats.dtype != adapter_dtype:
         feats = feats.to(adapter_dtype)
-    return wrapper.adapter(feats)
+    embeds = wrapper.adapter(feats)
+    if is_video:
+        # (B*F, P', dim) -> (B, F*P', dim): frame-contiguous, temporal order kept.
+        embeds = embeds.reshape(b, f * embeds.shape[1], embeds.shape[2])
+    return embeds
 
 
 @registry.register_modality_strategy("joint_decoder")
@@ -106,12 +123,14 @@ class JointDecoderStrategy:
         pixel_values: torch.Tensor,
         input_ids: torch.Tensor,  # noqa: ARG002
     ) -> ModalityContext:
-        img_embeds = _project_image_features(wrapper, pixel_values)
-        n = wrapper.vision_encoder.num_tokens
+        img_embeds = _project_visual_features(wrapper, pixel_values)
+        n = img_embeds.shape[1]  # pooling-aware: the adapter's actual visual-token count
         return ModalityContext(prefix_embeds=img_embeds, output_slice=slice(n, None))
 
     def num_image_tokens(self, wrapper: VLMWrapper) -> int:
-        return wrapper.vision_encoder.num_tokens
+        return wrapper.frames_per_clip * wrapper.adapter.output_num_tokens(
+            wrapper.vision_encoder.num_tokens
+        )
 
 
 @registry.register_modality_strategy("cross_attention")
@@ -132,7 +151,7 @@ class CrossAttentionStrategy:
         pixel_values: torch.Tensor,
         input_ids: torch.Tensor,  # noqa: ARG002
     ) -> ModalityContext:
-        img_embeds = _project_image_features(wrapper, pixel_values)
+        img_embeds = _project_visual_features(wrapper, pixel_values)
         return ModalityContext(image_features=img_embeds, image_mask=None)
 
     def num_image_tokens(self, wrapper: VLMWrapper) -> int:  # noqa: ARG002
@@ -166,8 +185,8 @@ class MoTStrategy:
         pixel_values: torch.Tensor,
         input_ids: torch.Tensor,
     ) -> ModalityContext:
-        img_embeds = _project_image_features(wrapper, pixel_values)
-        n = wrapper.vision_encoder.num_tokens
+        img_embeds = _project_visual_features(wrapper, pixel_values)
+        n = img_embeds.shape[1]  # pooling-aware: the adapter's actual visual-token count
         b, t_text = input_ids.shape
         modality_ids = torch.zeros(b, n + t_text, dtype=torch.long, device=input_ids.device)
         modality_ids[:, n:] = 1
@@ -178,7 +197,9 @@ class MoTStrategy:
         )
 
     def num_image_tokens(self, wrapper: VLMWrapper) -> int:
-        return wrapper.vision_encoder.num_tokens
+        return wrapper.frames_per_clip * wrapper.adapter.output_num_tokens(
+            wrapper.vision_encoder.num_tokens
+        )
 
 
 @registry.register_modality_strategy("moma")
@@ -208,8 +229,8 @@ class MoMaStrategy:
         pixel_values: torch.Tensor,
         input_ids: torch.Tensor,
     ) -> ModalityContext:
-        img_embeds = _project_image_features(wrapper, pixel_values)
-        n = wrapper.vision_encoder.num_tokens
+        img_embeds = _project_visual_features(wrapper, pixel_values)
+        n = img_embeds.shape[1]  # pooling-aware: the adapter's actual visual-token count
         b, t_text = input_ids.shape
         modality_ids = torch.zeros(b, n + t_text, dtype=torch.long, device=input_ids.device)
         modality_ids[:, n:] = 1
@@ -220,7 +241,9 @@ class MoMaStrategy:
         )
 
     def num_image_tokens(self, wrapper: VLMWrapper) -> int:
-        return wrapper.vision_encoder.num_tokens
+        return wrapper.frames_per_clip * wrapper.adapter.output_num_tokens(
+            wrapper.vision_encoder.num_tokens
+        )
 
 
 def build_modality_strategy(vlm: VLMConfig) -> ModalityStrategy:
@@ -246,14 +269,19 @@ class VLMWrapper(nn.Module):
     def __init__(
         self,
         vision_encoder: VisionEncoder,
-        adapter: nn.Module,
+        adapter: VisionAdapter,
         transformer: Transformer,
         strategy: ModalityStrategy,
+        frames_per_clip: int = 1,
     ) -> None:
         super().__init__()
         self.vision_encoder = vision_encoder
         self.adapter = adapter
         self.transformer = transformer
+        # Frames per video clip (1 for a single image). The static visual-token
+        # count is ``frames_per_clip * adapter.output_num_tokens(...)``; the
+        # strategies use it for ``num_image_tokens`` (residual budget, MoT split).
+        self.frames_per_clip = frames_per_clip
         # Strategy is a plain Python object (not nn.Module). nn.Module's
         # __setattr__ only routes Module/Parameter/Tensor attributes into
         # _modules/_parameters/_buffers, so plain objects are stored as
@@ -321,6 +349,7 @@ def build_vlm_wrapper(
     vision_config: VisionEncoderConfig,
     adapter_config: AdapterConfig,
     vlm_config: VLMConfig,
+    frames_per_clip: int = 1,
 ) -> VLMWrapper:
     """Build a ``VLMWrapper`` from the four top-level configs.
 
@@ -347,19 +376,21 @@ def build_vlm_wrapper(
     # num_tokens=0 (the "infer from encoder at build time" sentinel) the
     # config-time check is skipped and the residual-stream allocation goes
     # unchecked until the model actually runs. This guard fills that gap.
-    residual_image_tokens = vlm_config.residual_stream_image_tokens(encoder.num_tokens)
+    in_dim = vision_config.feature_dim or encoder.feature_dim
+    adapter = build_adapter(adapter_config, in_dim=in_dim, out_dim=model_config.dim)
+    # Visual tokens entering the LLM = the adapter's output count (pooling
+    # adapters reduce it; projection adapters are the identity), not the raw
+    # encoder patch count. This drives the residual budget and MoT's split.
+    visual_tokens = frames_per_clip * adapter.output_num_tokens(encoder.num_tokens)
+    residual_image_tokens = vlm_config.residual_stream_image_tokens(visual_tokens)
     required = residual_image_tokens + vlm_config.max_text_len
     if model_config.max_seq_len < required:
         raise ValueError(
             f"max_seq_len ({model_config.max_seq_len}) insufficient for VLM at build time: "
-            f"encoder.num_tokens ({encoder.num_tokens}) -> "
-            f"residual_image_tokens ({residual_image_tokens}) + "
+            f"encoder.num_tokens ({encoder.num_tokens}) -> adapter visual_tokens "
+            f"({visual_tokens}) -> residual_image_tokens ({residual_image_tokens}) + "
             f"vlm.max_text_len ({vlm_config.max_text_len}) = {required}"
         )
-    in_dim = vision_config.feature_dim or encoder.feature_dim
-    adapter = build_adapter(adapter_config, in_dim=in_dim, out_dim=model_config.dim)
-    transformer = Transformer(
-        model_config, vlm_config=vlm_config, num_image_tokens=encoder.num_tokens
-    )
+    transformer = Transformer(model_config, vlm_config=vlm_config, num_image_tokens=visual_tokens)
     strategy = build_modality_strategy(vlm_config)
-    return VLMWrapper(encoder, adapter, transformer, strategy)
+    return VLMWrapper(encoder, adapter, transformer, strategy, frames_per_clip=frames_per_clip)

@@ -16,6 +16,7 @@ from kempnerforge.config.vlm import (
     CrossAttentionConfig,
     FreezeSpec,
     JointDecoderConfig,
+    MoMaConfig,
     MoTConfig,
     VLMConfig,
 )
@@ -449,3 +450,175 @@ class TestVLMWrapperDispatch:
         with torch.no_grad():
             logits, _ = wrapper(pixel_values, input_ids)
         assert logits.shape == (1, 16, 256)
+
+
+# ---------------------------------------------------------------------------
+# Pooling connector (Phase 1): a pooling adapter reduces the visual-token
+# count between the encoder and the LLM. The whole VLM path must use the
+# adapter's output count (not encoder.num_tokens) for the prefix length,
+# output_slice, modality_ids, and MoT's positional split.
+# ---------------------------------------------------------------------------
+
+
+def _build_pooled_jd_wrapper(adapter_type: str = "avgpool", pool_window: int = 2) -> VLMWrapper:
+    # Encoder emits a 4x4 grid (16 tokens); a 2x2 pool -> 4 visual tokens.
+    mc = ModelConfig(dim=64, n_layers=2, n_heads=4, vocab_size=256, max_seq_len=64)
+    vc = VisionEncoderConfig(type="random", feature_dim=96, num_tokens=16)
+    ac = AdapterConfig(type=adapter_type, pool_window=pool_window)
+    lc = JointDecoderConfig(max_text_len=32)
+    return build_vlm_wrapper(mc, vc, ac, lc)
+
+
+def _build_pooled_mot_wrapper(pool_window: int = 2) -> VLMWrapper:
+    mc = ModelConfig(
+        dim=64, n_layers=2, n_heads=4, vocab_size=256, max_seq_len=64, ffn_hidden_dim=128
+    )
+    vc = VisionEncoderConfig(type="random", feature_dim=96, num_tokens=16)
+    ac = AdapterConfig(type="avgpool", pool_window=pool_window)
+    lc = MoTConfig(max_text_len=32)
+    return build_vlm_wrapper(mc, vc, ac, lc)
+
+
+class TestPoolingConnector:
+    @pytest.mark.parametrize("adapter_type", ["avgpool", "attentional_pool"])
+    def test_num_image_tokens_is_pooled_count(self, adapter_type):
+        # 16 patch tokens, 2x2 pool -> 4 visual tokens.
+        wrapper = _build_pooled_jd_wrapper(adapter_type, pool_window=2)
+        assert wrapper.num_image_tokens == 4
+
+    @pytest.mark.parametrize("adapter_type", ["avgpool", "attentional_pool"])
+    def test_jd_prefix_length_is_pooled(self, adapter_type):
+        wrapper = _build_pooled_jd_wrapper(adapter_type, pool_window=2)
+        strategy = JointDecoderStrategy()
+        pixels = torch.randn(2, 3, 16, 16)
+        input_ids = torch.randint(0, 256, (2, 12))
+        ctx = strategy.prepare(wrapper, pixels, input_ids)
+        assert ctx.prefix_embeds is not None
+        assert ctx.prefix_embeds.shape == (2, 4, 64)  # pooled prefix, model dim
+        assert ctx.output_slice == slice(4, None)
+
+    @pytest.mark.parametrize("adapter_type", ["avgpool", "attentional_pool"])
+    def test_jd_forward_trims_pooled_prefix(self, adapter_type):
+        wrapper = _build_pooled_jd_wrapper(adapter_type, pool_window=2).to(DEVICE).eval()
+        pixels = torch.randn(2, 3, 16, 16, device=DEVICE)
+        input_ids = torch.randint(0, 256, (2, 20), device=DEVICE)
+        with torch.no_grad():
+            logits, _ = wrapper(pixels, input_ids)
+        # output_slice trims the 4 pooled positions -> logits cover text only.
+        assert logits.shape == (2, 20, 256)
+
+    def test_mot_split_uses_pooled_count(self):
+        """MoT modality_ids length and the Transformer's positional split
+        both key off the pooled count; a mismatch would crash the forward.
+        """
+        wrapper = _build_pooled_mot_wrapper(pool_window=2).to(DEVICE)
+        strategy = MoTStrategy()
+        pixels = torch.randn(2, 3, 16, 16, device=DEVICE)
+        input_ids = torch.randint(0, 256, (2, 16), device=DEVICE)
+        ctx = strategy.prepare(wrapper, pixels, input_ids)
+        assert ctx.modality_ids is not None
+        assert ctx.modality_ids.shape == (2, 4 + 16)  # pooled prefix + text
+        assert (ctx.modality_ids[:, :4] == 0).all()
+        assert (ctx.modality_ids[:, 4:] == 1).all()
+        # End-to-end forward exercises the build-time _mot_n_image split,
+        # which must equal the runtime pooled prefix length (4).
+        labels = torch.full((2, 16), -100, dtype=torch.long, device=DEVICE)
+        logits, _ = wrapper(pixels, input_ids, labels)
+        assert logits.shape == (2, 16, 256)
+
+    def test_projection_adapter_keeps_token_count(self):
+        """Regression: a non-pooling adapter must leave num_image_tokens ==
+        encoder.num_tokens (the image path stays bit-for-bit unchanged)."""
+        wrapper = _build_pooled_jd_wrapper("mlp_2layer", pool_window=2)
+        assert wrapper.num_image_tokens == 16  # no pooling -> unchanged
+
+
+# ---------------------------------------------------------------------------
+# Video forward (Phase 3): the wrapper consumes a (B, F, 3, H, W) clip batch.
+# _project_visual_features folds the frame axis through the encoder+pooler to
+# (B, F*P', dim); the static visual-token count (frames_per_clip * per-frame)
+# drives the residual budget + MoT's split and must equal the runtime prefix.
+# ---------------------------------------------------------------------------
+
+
+def _video_wrapper(vlm_cfg, frames: int = 4, *, ffn_hidden_dim: int | None = None) -> VLMWrapper:
+    # Encoder: 4x4 patch grid (16 tokens); avgpool 2x2 -> 4 tokens/frame.
+    # frames=4 -> 4*4 = 16 visual tokens in the residual prefix.
+    mc_kwargs: dict[str, int] = {
+        "dim": 64,
+        "n_layers": 2,
+        "n_heads": 4,
+        "vocab_size": 256,
+        "max_seq_len": 64,
+    }
+    if ffn_hidden_dim is not None:
+        mc_kwargs["ffn_hidden_dim"] = ffn_hidden_dim
+    mc = ModelConfig(**mc_kwargs)
+    vc = VisionEncoderConfig(type="random", feature_dim=96, num_tokens=16)
+    ac = AdapterConfig(type="avgpool", pool_window=2)
+    return build_vlm_wrapper(mc, vc, ac, vlm_cfg, frames_per_clip=frames)
+
+
+class TestVideoForward:
+    def test_num_image_tokens_is_frames_times_per_frame(self):
+        # 4 frames * (16 patches -> 2x2 pool -> 4) = 16 visual tokens.
+        wrapper = _video_wrapper(JointDecoderConfig(max_text_len=8), frames=4)
+        assert wrapper.num_image_tokens == 16
+
+    def test_projector_folds_frame_axis(self):
+        wrapper = _video_wrapper(JointDecoderConfig(max_text_len=8), frames=4)
+        ctx = JointDecoderStrategy().prepare(
+            wrapper, torch.randn(2, 4, 3, 16, 16), torch.randint(0, 256, (2, 6))
+        )
+        assert ctx.prefix_embeds is not None
+        assert ctx.prefix_embeds.shape == (2, 16, 64)  # (B, F*P', dim)
+        assert ctx.output_slice == slice(16, None)
+
+    def test_static_count_matches_runtime_prefix(self):
+        """MoT's positional split uses the build-time count; it must equal the
+        runtime prefix length (frames * per-frame)."""
+        wrapper = _video_wrapper(JointDecoderConfig(max_text_len=8), frames=4)
+        ctx = JointDecoderStrategy().prepare(
+            wrapper, torch.randn(1, 4, 3, 16, 16), torch.randint(0, 256, (1, 6))
+        )
+        assert ctx.prefix_embeds is not None
+        assert ctx.prefix_embeds.shape[1] == wrapper.num_image_tokens == 16
+
+    @pytest.mark.parametrize("arch", ["joint_decoder", "cross_attention", "mot", "moma"])
+    def test_video_forward_all_archs(self, arch):
+        ffn = 128 if arch in ("mot", "moma") else None
+        if arch == "joint_decoder":
+            vlm_cfg: VLMConfig = JointDecoderConfig(max_text_len=8)
+        elif arch == "cross_attention":
+            vlm_cfg = CrossAttentionConfig(max_text_len=8, cross_attention_every_n_layers=2)
+        elif arch == "mot":
+            vlm_cfg = MoTConfig(max_text_len=8)
+        else:
+            vlm_cfg = MoMaConfig(max_text_len=8)
+        wrapper = _video_wrapper(vlm_cfg, frames=4, ffn_hidden_dim=ffn).to(DEVICE)
+        pixels = torch.randn(2, 4, 3, 16, 16, device=DEVICE)
+        input_ids = torch.randint(0, 256, (2, 6), device=DEVICE)
+        labels = torch.full((2, 6), -100, dtype=torch.long, device=DEVICE)
+        logits, _ = wrapper(pixels, input_ids, labels)
+        # output_slice trims the F*P' visual prefix -> logits cover text only.
+        assert logits.shape == (2, 6, 256)
+
+    def test_video_forward_backward_grads(self):
+        wrapper = _video_wrapper(JointDecoderConfig(max_text_len=8), frames=4).to(DEVICE)
+        pixels = torch.randn(1, 4, 3, 16, 16, device=DEVICE)
+        input_ids = torch.randint(0, 256, (1, 6), device=DEVICE)
+        logits, _ = wrapper(pixels, input_ids)
+        logits.sum().backward()
+        for p in wrapper.adapter.parameters():
+            assert p.grad is not None
+            assert torch.isfinite(p.grad).all()
+
+    def test_image_path_unchanged_with_4d(self):
+        """frames_per_clip=1 + a 4D image batch still works (image path intact)."""
+        wrapper = _video_wrapper(JointDecoderConfig(max_text_len=8), frames=1).to(DEVICE).eval()
+        pixels = torch.randn(2, 3, 16, 16, device=DEVICE)  # 4D single-image batch
+        input_ids = torch.randint(0, 256, (2, 6), device=DEVICE)
+        with torch.no_grad():
+            logits, _ = wrapper(pixels, input_ids)
+        assert logits.shape == (2, 6, 256)
+        assert wrapper.num_image_tokens == 4  # per-frame pooled count, frames=1
