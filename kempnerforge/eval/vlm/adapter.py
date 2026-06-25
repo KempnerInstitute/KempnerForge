@@ -172,7 +172,8 @@ def _load_weights(
     ckpt_path = resolve_resume_path(checkpoint) or Path(checkpoint)
     if not ckpt_path.exists():
         raise FileNotFoundError(f"Checkpoint path does not exist: {ckpt_path}")
-
+    if not ckpt_path.is_dir():
+        raise NotADirectoryError(f"Checkpoint path is not a directory: {ckpt_path}")
     model = _build_model(config, device, dtype)
     model.eval()
 
