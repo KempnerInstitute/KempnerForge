@@ -1,32 +1,40 @@
 """CPU unit tests for the KempnerForge VLM lmms-eval adapter.
 
-The whole module is skipped when lmms-eval is not installed (it is an optional,
-undeclared dependency), so these tests run locally where lmms-eval is present
-and skip cleanly in CI. They exercise the adapter's private helpers directly on
-a tiny random VLM — no GPU, no real checkpoint, no network.
+A faithful fake ``lmms_eval`` is injected by ``conftest.py`` (lmms-eval is an optional,
+undeclared dependency), so these tests always run — in CI without lmms-eval and locally —
+exercising the adapter's helpers, guards, and decode loop on a tiny random VLM: no GPU, no
+real checkpoint, no network. Real-package fidelity is pinned by the gated contract test in
+``tests/integration/``.
 """
 
 from __future__ import annotations
 
+import json
+
 import pytest
 import torch
+from lmms_eval.api.instance import Instance
+from lmms_eval.protocol import ChatMessages
 from PIL import Image
 
-pytest.importorskip("lmms_eval")
-
-from lmms_eval.protocol import ChatMessages  # noqa: E402
-
-from kempnerforge.data.vlm_dataset import (  # noqa: E402
+from kempnerforge.config.data import DataConfig
+from kempnerforge.config.schema import JobConfig
+from kempnerforge.data.vlm_dataset import (
     DEFAULT_IMAGE_MEAN,
     DEFAULT_IMAGE_STD,
     pil_to_tensor,
 )
-from kempnerforge.eval.vlm.adapter import (  # noqa: E402
+from kempnerforge.eval.vlm.adapter import (
     KempnerForgeVLM,
     _check_generative_arch,
+    _first_stop,
     _frames_to_pixel_values,
     _generate_batch,
+    _load_config,
+    _load_weights,
+    _log_checkpoint_metadata,
     _render_request,
+    _resolve_dtype,
     _resolve_gen_kwargs,
 )
 
@@ -52,6 +60,20 @@ class _MockTokenizer:
     def decode(self, ids: list[int], skip_special_tokens: bool = True) -> str:
         del skip_special_tokens
         return " ".join(str(int(i)) for i in ids)
+
+
+class _RecordingLogger:
+    """Captures log calls so metadata/warning behavior is asserted without caplog."""
+
+    def __init__(self) -> None:
+        self.infos: list[str] = []
+        self.warnings: list[str] = []
+
+    def info(self, msg: str) -> None:
+        self.infos.append(msg)
+
+    def warning(self, msg: str) -> None:
+        self.warnings.append(msg)
 
 
 def _text(s: str) -> dict:
@@ -136,6 +158,18 @@ class TestFramesToPixelValues:
         pv = _frames_to_pixel_values([img], image_size=24, device=DEVICE, dtype=torch.float32)
         expected = pil_to_tensor(img, 24, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD)
         assert torch.allclose(pv[0], expected)
+
+    def test_accepts_path_string(self, tmp_path):
+        """A frame given as a path string is opened and preprocessed identically."""
+        img = _img(16)
+        path = tmp_path / "frame.png"
+        img.save(path)
+        from_path = _frames_to_pixel_values(
+            [str(path)], image_size=16, device=DEVICE, dtype=torch.float32
+        )
+        from_pil = _frames_to_pixel_values([img], image_size=16, device=DEVICE, dtype=torch.float32)
+        assert from_path.shape == (1, 3, 16, 16)
+        assert torch.allclose(from_path, from_pil)
 
 
 # ---------------------------------------------------------------------------
@@ -247,6 +281,17 @@ class TestGenerateBatchSingle:
         with pytest.raises(ValueError, match="max_new_tokens"):
             _generate_batch(tiny_vlm_wrapper, _MockTokenizer(), _pixels(), self._prompt(), r, 64)
 
+    def test_overlong_prompt_is_left_truncated(self, tiny_vlm_wrapper, monkeypatch):
+        """A prompt that exceeds the budget (but leaves room) is left-truncated with a warning."""
+        rec = _RecordingLogger()
+        monkeypatch.setattr("kempnerforge.eval.vlm.adapter.logger", rec)
+        # budget = max_seq_len(64) - image_tokens(8) - max_new_tokens(2) = 54; 60 > 54.
+        long_prompt = [torch.arange(1, 61, dtype=torch.long)]
+        r = _resolve_gen_kwargs({"max_new_tokens": 2}, 128)
+        out = _generate_batch(tiny_vlm_wrapper, _MockTokenizer(), _pixels(), long_prompt, r, 64)
+        assert len(out) == 1 and len(out[0].split()) == 2
+        assert any("left-truncating" in m for m in rec.warnings)
+
 
 class TestGenerateBatchMulti:
     """B > 1: right-padding must not change any row's result, and stop
@@ -328,3 +373,208 @@ class TestGuards:
         inst = KempnerForgeVLM.__new__(KempnerForgeVLM)
         with pytest.raises(NotImplementedError, match="multi-round"):
             inst.generate_until_multi_round([])
+
+
+# ---------------------------------------------------------------------------
+# Loader / __init__ helpers (build a VLM JobConfig + patch the heavy loaders so
+# the adapter can be constructed on CPU with no checkpoint).
+# ---------------------------------------------------------------------------
+
+
+def _vlm_job_config(tiny_vlm_configs, arch: str | None = None) -> JobConfig:
+    mc, vc, ac, lc = tiny_vlm_configs
+    job = JobConfig(
+        model=mc, vision_encoder=vc, adapter=ac, vlm=lc, data=DataConfig(tokenizer_path="mock")
+    )
+    if arch is not None:
+        job.vlm.arch = arch
+    return job
+
+
+def _patch_loaders(monkeypatch, job: JobConfig, model) -> None:
+    monkeypatch.setattr("kempnerforge.eval.vlm.adapter._load_config", lambda _p: job)
+    monkeypatch.setattr("kempnerforge.eval.vlm.adapter._load_weights", lambda *a, **k: model)
+    monkeypatch.setattr(
+        "kempnerforge.eval.vlm.adapter.build_tokenizer", lambda _p: _MockTokenizer()
+    )
+
+
+# ---------------------------------------------------------------------------
+# _resolve_dtype
+# ---------------------------------------------------------------------------
+
+
+class TestResolveDtype:
+    @pytest.mark.parametrize(
+        "name,expected",
+        [("bfloat16", torch.bfloat16), ("float16", torch.float16), ("float32", torch.float32)],
+    )
+    def test_string_dtypes(self, name, expected):
+        assert _resolve_dtype(name) == expected
+
+    def test_passthrough_torch_dtype(self):
+        assert _resolve_dtype(torch.float64) == torch.float64
+
+    def test_unsupported_dtype_raises(self):
+        with pytest.raises(ValueError, match="Unsupported dtype"):
+            _resolve_dtype("float64")
+
+
+# ---------------------------------------------------------------------------
+# _first_stop
+# ---------------------------------------------------------------------------
+
+
+class TestFirstStop:
+    def test_no_match_returns_none(self):
+        assert _first_stop("hello world", ["xyz"]) is None
+
+    def test_empty_until_returns_none(self):
+        assert _first_stop("abc", []) is None
+
+    def test_earliest_of_multiple(self):
+        # "cd" at index 2 precedes "ef" at index 4.
+        assert _first_stop("abcdef", ["ef", "cd"]) == 2
+
+    def test_single_match_index(self):
+        assert _first_stop("a.b", ["."]) == 1
+
+
+# ---------------------------------------------------------------------------
+# _log_checkpoint_metadata
+# ---------------------------------------------------------------------------
+
+
+class TestLogCheckpointMetadata:
+    def test_missing_metadata_is_noop(self, tmp_path, monkeypatch):
+        rec = _RecordingLogger()
+        monkeypatch.setattr("kempnerforge.eval.vlm.adapter.logger", rec)
+        _log_checkpoint_metadata(tmp_path)
+        assert rec.infos == [] and rec.warnings == []
+
+    def test_valid_metadata_logged(self, tmp_path, monkeypatch):
+        rec = _RecordingLogger()
+        monkeypatch.setattr("kempnerforge.eval.vlm.adapter.logger", rec)
+        (tmp_path / "metadata.json").write_text(json.dumps({"step": 7, "tokens_seen": 1234}))
+        _log_checkpoint_metadata(tmp_path)
+        assert any("step=7" in m and "tokens_seen=1234" in m for m in rec.infos)
+
+    def test_malformed_metadata_warns_not_raises(self, tmp_path, monkeypatch):
+        rec = _RecordingLogger()
+        monkeypatch.setattr("kempnerforge.eval.vlm.adapter.logger", rec)
+        (tmp_path / "metadata.json").write_text("{not valid json")
+        _log_checkpoint_metadata(tmp_path)  # must not raise
+        assert any("Could not read" in m for m in rec.warnings)
+
+
+# ---------------------------------------------------------------------------
+# _load_config (VLM-only guard)
+# ---------------------------------------------------------------------------
+
+
+class TestLoadConfig:
+    def test_non_vlm_config_rejected(self, monkeypatch, tiny_job_config):
+        monkeypatch.setattr(
+            "kempnerforge.eval.vlm.adapter.load_config",
+            lambda _p, cli_args=None: tiny_job_config,
+        )
+        with pytest.raises(ValueError, match="not a VLM config"):
+            _load_config("ignored.toml")
+
+    def test_vlm_config_accepted(self, monkeypatch, tiny_vlm_configs):
+        job = _vlm_job_config(tiny_vlm_configs)
+        monkeypatch.setattr(
+            "kempnerforge.eval.vlm.adapter.load_config", lambda _p, cli_args=None: job
+        )
+        assert _load_config("ignored.toml") is job
+
+
+# ---------------------------------------------------------------------------
+# _load_weights (path resolution / missing checkpoint)
+# ---------------------------------------------------------------------------
+
+
+class TestLoadWeights:
+    def test_missing_checkpoint_raises(self, tmp_path, tiny_vlm_configs):
+        job = _vlm_job_config(tiny_vlm_configs)
+        missing = tmp_path / "no_such_checkpoint"
+        with pytest.raises(FileNotFoundError, match="does not exist"):
+            _load_weights(job, str(missing), torch.device("cpu"), torch.float32)
+
+
+# ---------------------------------------------------------------------------
+# KempnerForgeVLM.__init__ guards
+# ---------------------------------------------------------------------------
+
+
+class TestInitGuards:
+    def test_moma_fails_fast_before_load(self, monkeypatch, tiny_vlm_configs):
+        job = _vlm_job_config(tiny_vlm_configs, arch="moma")
+        monkeypatch.setattr("kempnerforge.eval.vlm.adapter._load_config", lambda _p: job)
+
+        def _must_not_load(*args, **kwargs):
+            raise AssertionError("model load must not run for an unsupported arch")
+
+        monkeypatch.setattr("kempnerforge.eval.vlm.adapter._load_weights", _must_not_load)
+        with pytest.raises(ValueError, match="non-causal"):
+            KempnerForgeVLM(config="x", checkpoint="y", device="cpu", dtype="float32")
+
+    def test_ignored_kwargs_warn(self, monkeypatch, tiny_vlm_configs, tiny_vlm_wrapper):
+        rec = _RecordingLogger()
+        monkeypatch.setattr("kempnerforge.eval.vlm.adapter.logger", rec)
+        _patch_loaders(monkeypatch, _vlm_job_config(tiny_vlm_configs), tiny_vlm_wrapper)
+        KempnerForgeVLM(config="x", checkpoint="y", device="cpu", dtype="float32", bogus=1)
+        assert any("bogus" in m for m in rec.warnings)
+
+    def test_init_populates_attrs(self, monkeypatch, tiny_vlm_configs, tiny_vlm_wrapper):
+        job = _vlm_job_config(tiny_vlm_configs)
+        _patch_loaders(monkeypatch, job, tiny_vlm_wrapper)
+        vlm = KempnerForgeVLM(
+            config="x", checkpoint="y", device="cpu", dtype="float32", batch_size=2
+        )
+        assert vlm._arch == "joint_decoder"
+        assert vlm._max_seq_len == job.model.max_seq_len
+        assert vlm._batch_size == 2
+        assert vlm._dtype == torch.float32
+
+
+# ---------------------------------------------------------------------------
+# generate_until (end-to-end on a tiny VLM via the fake lmms-eval objects)
+# ---------------------------------------------------------------------------
+
+
+class TestGenerateUntil:
+    def test_batches_and_restores_order(self, monkeypatch, tiny_vlm_configs, tiny_vlm_wrapper):
+        _patch_loaders(monkeypatch, _vlm_job_config(tiny_vlm_configs), tiny_vlm_wrapper)
+        vlm = KempnerForgeVLM(
+            config="x", checkpoint="y", device="cpu", dtype="float32", batch_size=2
+        )
+
+        img = _img()
+
+        def doc_to_messages(doc):
+            return [{"role": "user", "content": [_text(doc["q"]), _image(img)]}]
+
+        vlm.task_dict = {
+            "t": {"test": {"d0": {"q": "hi?"}, "d1": {"q": "describe the picture please"}}}
+        }
+        # Different context strings (args[0]) so the Collator reorders the batch by length;
+        # get_original must then restore the original request order.
+        specs = [("d0", "c"), ("d1", "cc")]
+        instances = [
+            Instance(
+                request_type="generate_until",
+                arguments=(ctx, doc_to_messages, {"max_new_tokens": 3}, doc_id, "t", "test"),
+                idx=i,
+                metadata={"task": "t", "doc_id": doc_id, "repeats": 1},
+            )
+            for i, (doc_id, ctx) in enumerate(specs)
+        ]
+
+        # Each request decoded alone (greedy → deterministic), in original order.
+        singles = [vlm.generate_until([inst])[0] for inst in instances]
+        batched = vlm.generate_until(instances)
+
+        assert batched == singles  # batching + reorder + get_original preserve per-request results
+        assert all(isinstance(o, str) for o in batched)
+        assert all(len(o.split()) == 3 for o in batched)  # greedy emits exactly max_new_tokens
