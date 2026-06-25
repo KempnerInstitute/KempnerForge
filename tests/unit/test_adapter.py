@@ -275,6 +275,14 @@ class TestPooledTokenCount:
         with pytest.raises(ValueError, match="must be positive"):
             pooled_token_count(0, 2)
 
+    def test_require_divisible_raises_on_ragged(self):
+        # attentional_pool path: a ragged grid is rejected up front, not at forward.
+        with pytest.raises(ValueError, match="ragged grid"):
+            pooled_token_count(196, 3, require_divisible=True)  # 14x14 not divisible by 3
+
+    def test_require_divisible_ok_when_divisible(self):
+        assert pooled_token_count(196, 2, require_divisible=True) == 49  # 14x14 -> 7x7
+
 
 # ---------------------------------------------------------------------------
 # AvgPoolAdapter
@@ -386,6 +394,13 @@ class TestAttentionalPoolAdapter:
         with pytest.raises(ValueError, match="divisible"):
             adapter(torch.randn(1, 16, 96))  # 4x4 grid, not divisible by 3
 
+    def test_output_num_tokens_rejects_ragged(self):
+        # The static count must mirror forward()'s ragged rejection so an invalid
+        # config fails at build / seq-len-check time, not at the first step.
+        adapter = AttentionalPoolAdapter(in_dim=96, out_dim=64, pool_window=3, pool_heads=16)
+        with pytest.raises(ValueError, match="ragged grid"):
+            adapter.output_num_tokens(16)  # 4x4 grid, not divisible by 3
+
     def test_heads_must_divide_dim(self):
         with pytest.raises(ValueError, match="divisible by"):
             AttentionalPoolAdapter(in_dim=96, out_dim=64, pool_heads=7)
@@ -462,6 +477,16 @@ class TestAdapterConfigPooling:
 
     def test_output_num_tokens_pools_for_attentional(self):
         assert AdapterConfig(type="attentional_pool", pool_window=3).output_num_tokens(729) == 81
+
+    def test_attentional_output_num_tokens_rejects_ragged(self):
+        # Config-time check rejects a ragged attentional_pool grid (mirrors forward),
+        # so the misconfig fails at config load, not at the first training step.
+        with pytest.raises(ValueError, match="ragged grid"):
+            AdapterConfig(type="attentional_pool", pool_window=3).output_num_tokens(196)
+
+    def test_avgpool_output_num_tokens_allows_ragged(self):
+        # avgpool pools ragged edges, so the same ragged grid is fine (ceil math).
+        assert AdapterConfig(type="avgpool", pool_window=3).output_num_tokens(196) == 25
 
     def test_output_num_tokens_passthrough_on_sentinel(self):
         # num_tokens=0 ("infer at build time") must not trigger the square check.

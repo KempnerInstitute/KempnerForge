@@ -45,8 +45,15 @@ _ADAPTER_ACTIVATIONS: dict[str, type[nn.Module]] = {
 # the registered pooling builders below.
 POOLING_ADAPTER_TYPES: tuple[str, ...] = ("avgpool", "attentional_pool")
 
+# Pooling adapters whose ``forward`` requires the patch grid be divisible by the
+# window (no ragged edge windows). Their token count must enforce the same so a
+# ragged config is rejected at config/build time, not at the first training step.
+DIVISIBLE_ONLY_POOL_TYPES: tuple[str, ...] = ("attentional_pool",)
 
-def pooled_token_count(num_input_tokens: int, window: int) -> int:
+
+def pooled_token_count(
+    num_input_tokens: int, window: int, *, require_divisible: bool = False
+) -> int:
     """Token count out of a ``window×window`` pool over a square patch grid.
 
     A vision encoder emits ``num_input_tokens`` patch tokens laid out on a
@@ -55,6 +62,11 @@ def pooled_token_count(num_input_tokens: int, window: int) -> int:
     tokens; edge windows that do not fill the kernel pool only the patches they
     cover (Molmo2 §A: "the bottom and far-right image patches are pooled with a
     reduced number of patches").
+
+    Connectors that cannot pool ragged edges (``require_divisible=True``, e.g.
+    ``attentional_pool``) raise when ``grid`` is not divisible by ``window``, so a
+    ragged config is rejected at config/build time rather than deterministically
+    failing in ``forward`` at the first step.
 
     This is the single source of truth for the post-pool count: it must equal
     the pooling adapters' actual ``forward`` output length, because the build
@@ -65,6 +77,13 @@ def pooled_token_count(num_input_tokens: int, window: int) -> int:
     if num_input_tokens <= 0:
         raise ValueError(f"num_input_tokens must be positive (got {num_input_tokens})")
     grid = _grid_side(num_input_tokens)
+    if require_divisible and grid % window != 0:
+        raise ValueError(
+            f"this pooling connector requires the patch grid ({grid}x{grid}) be "
+            f"divisible by the pool window ({window}); got a ragged grid "
+            f"(num_tokens={num_input_tokens}). Use avgpool for ragged grids, or pick "
+            "a divisible window."
+        )
     per_side = math.ceil(grid / window)
     return per_side * per_side
 
@@ -266,7 +285,9 @@ class AttentionalPoolAdapter(VisionAdapter):
             layer.reset_parameters()
 
     def output_num_tokens(self, num_input_tokens: int) -> int:
-        return pooled_token_count(num_input_tokens, self.pool_window)
+        # require_divisible mirrors forward()'s ragged-grid rejection so a bad
+        # config fails at build / seq-len-check time, not at the first step.
+        return pooled_token_count(num_input_tokens, self.pool_window, require_divisible=True)
 
     def forward(self, x: torch.Tensor, pool_window: int | None = None) -> torch.Tensor:
         w = pool_window if pool_window is not None else self.pool_window

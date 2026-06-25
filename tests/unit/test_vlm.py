@@ -635,3 +635,16 @@ class TestVideoForward:
         logits, _ = wrapper(pixels, input_ids)
         assert logits.dtype == torch.bfloat16
         assert logits.shape == (2, 6, 256)
+
+    def test_frame_count_mismatch_raises(self):
+        """A clip whose frame count != frames_per_clip is rejected at the
+        projection boundary: the static MoT split and seq-len budget assume
+        frames_per_clip, so a mismatch is a clear error, not a confusing one."""
+        wrapper = _video_wrapper(JointDecoderConfig(max_text_len=8), frames=4).to(DEVICE)
+        input_ids = torch.randint(0, 256, (2, 6), device=DEVICE)
+        # 2-frame clip into a 4-frame wrapper.
+        with pytest.raises(ValueError, match="frames-per-clip mismatch"):
+            wrapper(torch.randn(2, 2, 3, 16, 16, device=DEVICE), input_ids)
+        # 4D single-image batch into a video (frames_per_clip>1) wrapper.
+        with pytest.raises(ValueError, match="frames-per-clip mismatch"):
+            wrapper(torch.randn(2, 3, 16, 16, device=DEVICE), input_ids)

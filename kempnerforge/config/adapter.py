@@ -90,9 +90,16 @@ class AdapterConfig:
         """
         if num_input_tokens <= 0 or self.type not in self._pooling_types():
             return num_input_tokens
-        from kempnerforge.model.adapter import pooled_token_count  # noqa: PLC0415
+        from kempnerforge.model.adapter import (  # noqa: PLC0415
+            DIVISIBLE_ONLY_POOL_TYPES,
+            pooled_token_count,
+        )
 
-        return pooled_token_count(num_input_tokens, self.pool_window)
+        return pooled_token_count(
+            num_input_tokens,
+            self.pool_window,
+            require_divisible=self.type in DIVISIBLE_ONLY_POOL_TYPES,
+        )
 
     @staticmethod
     def _pooling_types() -> tuple[str, ...]:
