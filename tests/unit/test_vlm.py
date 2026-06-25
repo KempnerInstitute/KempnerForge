@@ -622,3 +622,16 @@ class TestVideoForward:
             logits, _ = wrapper(pixels, input_ids)
         assert logits.shape == (2, 6, 256)
         assert wrapper.num_image_tokens == 4  # per-frame pooled count, frames=1
+
+    def test_video_forward_dtype_mismatch_cast(self):
+        """Encoder fp32 + bf16 adapter/transformer: the cast inside the visual
+        projector lets the 5D video path run (covers the dtype-cast branch)."""
+        wrapper = _video_wrapper(JointDecoderConfig(max_text_len=8), frames=4).to(DEVICE)
+        wrapper.adapter.to(torch.bfloat16)
+        wrapper.transformer.to(torch.bfloat16)
+        # vision_encoder (RandomVisionEncoder) stays fp32
+        pixels = torch.randn(2, 4, 3, 16, 16, device=DEVICE)
+        input_ids = torch.randint(0, 256, (2, 6), device=DEVICE)
+        logits, _ = wrapper(pixels, input_ids)
+        assert logits.dtype == torch.bfloat16
+        assert logits.shape == (2, 6, 256)

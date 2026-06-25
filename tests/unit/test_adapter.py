@@ -352,6 +352,11 @@ class TestAvgPoolAdapter:
         # tokens 0,1,4,5 -> mean 2.5.
         assert torch.allclose(out[0, 0], torch.full((4,), 2.5))
 
+    def test_forward_rejects_nonpositive_window_override(self):
+        adapter = AvgPoolAdapter(in_dim=8, out_dim=4, pool_window=2)
+        with pytest.raises(ValueError, match="pool_window must be positive"):
+            adapter(torch.randn(1, 16, 8), pool_window=0)
+
 
 # ---------------------------------------------------------------------------
 # AttentionalPoolAdapter
@@ -403,6 +408,11 @@ class TestAttentionalPoolAdapter:
         adapter = AttentionalPoolAdapter(in_dim=16, out_dim=8, pool_heads=4)
         adapter.reset_parameters()
         assert torch.isfinite(adapter.out_proj.weight).all()
+
+    def test_forward_rejects_nonpositive_window_override(self):
+        adapter = AttentionalPoolAdapter(in_dim=16, out_dim=8, pool_window=2, pool_heads=4)
+        with pytest.raises(ValueError, match="pool_window must be positive"):
+            adapter(torch.randn(1, 16, 16), pool_window=0)
 
 
 # ---------------------------------------------------------------------------

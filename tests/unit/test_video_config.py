@@ -45,6 +45,10 @@ class TestVideoConfig:
         with pytest.raises(ValueError, match="video.min_frames must be >= 1"):
             VideoConfig(min_frames=0)
 
+    def test_max_frames_below_one_rejected(self):
+        with pytest.raises(ValueError, match="video.max_frames must be >= 1"):
+            VideoConfig(max_frames=0)
+
 
 class TestJobConfigVideoWiring:
     def _vlm_kwargs(self) -> dict:

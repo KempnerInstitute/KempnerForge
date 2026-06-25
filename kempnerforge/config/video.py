@@ -28,14 +28,11 @@ class VideoConfig:
         data_root: Root directory of the on-disk video dataset.
         split: Which split to read (``"train"`` or ``"validation"``).
         max_samples: Cap the manifest to this many examples (``0`` = all).
-            Useful for quick smoke runs over a 10M-scale corpus.
         max_frames: Maximum frames sampled per clip (the per-clip budget).
-        min_frames: Minimum frames sampled per clip (short clips are padded
-            with masked frames up to this many real samples where possible).
+        min_frames: Minimum frames sampled per clip; short clips pad up to this.
         fps: Target sampling rate in frames per second (Molmo2 uses 2).
         frame_size: Square pixel size each frame is resized to.
-        prompt: Optional fixed instruction prepended to the target text and
-            masked from the loss (empty = no prompt).
+        prompt: Optional instruction prepended to the target text, masked from loss.
     """
 
     data_root: str = ""

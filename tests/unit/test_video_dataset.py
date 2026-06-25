@@ -7,6 +7,8 @@ and a char-level mock tokenizer (no HF download), mirroring the approach in
 
 from __future__ import annotations
 
+import importlib.util
+
 import pytest
 import torch
 from PIL import Image
@@ -197,3 +199,94 @@ class TestVideoCollator:
     def test_max_text_len_must_be_positive(self):
         with pytest.raises(ValueError, match="max_text_len must be positive"):
             VideoCollator(pad_id=0, max_text_len=0)
+
+
+# ---------------------------------------------------------------------------
+# Real dataset integration: build a synthetic WebVid layout (CSV manifest +
+# a tiny encoded .mp4 at the prefix path) and exercise the real __init__,
+# manifest load, path mapping, __getitem__ decode, and the decode-failure
+# path. Uses av (a hard dependency) so it runs in CI; gpt2 tokenizer matches
+# the existing VLM dataset tests.
+# ---------------------------------------------------------------------------
+
+_AV_AVAILABLE = importlib.util.find_spec("av") is not None
+
+
+def _write_mp4(path, n_frames: int, size: int = 32, fps: int = 8) -> None:
+    import av
+    import numpy as np
+
+    with av.open(str(path), mode="w") as container:
+        stream = container.add_stream("mpeg4", rate=fps)
+        stream.width = size
+        stream.height = size
+        stream.pix_fmt = "yuv420p"
+        for i in range(n_frames):
+            arr = np.full((size, size, 3), (i * 17) % 256, dtype=np.uint8)
+            frame = av.VideoFrame.from_ndarray(arr, format="rgb24")
+            for packet in stream.encode(frame):
+                container.mux(packet)
+        for packet in stream.encode():
+            container.mux(packet)
+
+
+@pytest.mark.skipif(not _AV_AVAILABLE, reason="requires the 'av' package")
+class TestRealDatasetIntegration:
+    def _manifest_dir(self, root):
+        d = root / "raw" / "webvid-10M" / "data" / "train" / "partitions"
+        d.mkdir(parents=True)
+        return d
+
+    def test_init_getitem_and_decode(self, tmp_path):
+        vid, cap = "123456", "a test clip"
+        (self._manifest_dir(tmp_path) / "0000.csv").write_text(f"videoid,name\n{vid},{cap}\n")
+        vdir = tmp_path / "raw" / "videos" / "train" / vid[:2] / vid[:4] / vid[:6]
+        vdir.mkdir(parents=True)
+        _write_mp4(vdir / f"{vid}.mp4", n_frames=16, size=32, fps=8)
+
+        ds = WebVidVideoDataset(
+            data_root=str(tmp_path),
+            split="train",
+            tokenizer_path="gpt2",
+            max_text_len=16,
+            max_frames=8,
+            min_frames=4,
+            fps=2.0,
+            frame_size=32,
+        )
+        assert len(ds) == 1
+        item = ds[0]
+        assert item["pixel_values"].shape == (8, 3, 32, 32)
+        assert item["frame_mask"].any()  # real frames decoded
+        assert (item["labels"] != -100).any()  # caption supervised
+
+    def test_decode_failure_is_masked(self, tmp_path):
+        # Manifest points at a videoid with no .mp4 on disk -> decode raises,
+        # __getitem__ catches it and yields a zero clip with no loss.
+        (self._manifest_dir(tmp_path) / "0000.csv").write_text("videoid,name\n999999,missing\n")
+        ds = WebVidVideoDataset(
+            data_root=str(tmp_path),
+            split="train",
+            tokenizer_path="gpt2",
+            max_text_len=8,
+            max_frames=4,
+            min_frames=2,
+            fps=2.0,
+            frame_size=16,
+        )
+        item = ds[0]
+        assert not item["frame_mask"].any()
+        assert (item["labels"] == -100).all()
+
+    def test_empty_manifest_raises(self, tmp_path):
+        self._manifest_dir(tmp_path)  # dir exists but no CSVs
+        with pytest.raises(FileNotFoundError, match="No partition CSVs"):
+            WebVidVideoDataset(
+                data_root=str(tmp_path),
+                split="train",
+                tokenizer_path="gpt2",
+                max_text_len=8,
+                max_frames=4,
+                min_frames=2,
+                fps=2.0,
+            )
