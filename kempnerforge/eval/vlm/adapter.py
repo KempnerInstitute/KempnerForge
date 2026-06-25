@@ -249,7 +249,11 @@ def _frames_to_pixel_values(
 
     tensors = []
     for frame in frames:
-        img = Image.open(frame) if isinstance(frame, str) else frame
+        if isinstance(frame, str):
+            with Image.open(frame) as im:
+                img = im.copy()
+        else:
+            img = frame
         tensors.append(pil_to_tensor(img, image_size, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD))
     return torch.stack(tensors, dim=0).to(device=device, dtype=dtype)
 
