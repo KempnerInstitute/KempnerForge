@@ -440,7 +440,10 @@ class KempnerForgeVLM(lmms):
         self._dtype = _resolve_dtype(dtype)
         self._batch_size = int(batch_size)
         self._default_max_new_tokens = int(max_new_tokens)
-
+        if self._batch_size < 1:
+            raise ValueError(f"batch_size must be >= 1, got {self._batch_size}")
+        if self._default_max_new_tokens < 1:
+            raise ValueError(f"max_new_tokens must be >= 1, got {self._default_max_new_tokens}")
         self._config = _load_config(config)
         assert self._config.vlm is not None  # guaranteed by is_vlm; narrows for the type checker
         self._arch = self._config.vlm.arch
