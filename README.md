@@ -27,7 +27,7 @@ PyTorch-native framework for fault-tolerant distributed training of foundation m
 
 **Architecture**
 - Decoder-only Transformer: RoPE, GQA, SwiGLU, RMSNorm, `torch.compile`
-- Mixture-of-Experts: softmax top-k and DeepSeek-V3 sigmoid routers, shared experts, fine-grained experts, configurable frequency
+- Mixture-of-Experts: softmax top-k and DeepSeek-V3 sigmoid routers, shared experts, fine-grained experts, router z-loss, configurable frequency
 
 **Parallelism**
 - FSDP2, Tensor, Expert, and Pipeline Parallelism
@@ -212,7 +212,7 @@ Core MoE, Expert Parallelism, DeepSeekMoE, grouped GEMM, FSDP2 compatibility, an
 
 | Feature | Status | Impact |
 |---------|:------:|--------|
-| Router improvements (sequence aux loss, gradient scaling, adaptive bias) | **Done** | Training quality |
+| Router improvements (sequence aux loss, gradient scaling, adaptive bias, z-loss) | **Done** | Training quality |
 | FP8 mixed precision | **Done** | 2x compute throughput |
 | Pipeline parallelism for MoE (PP+EP+TP composition) | Blocked | Required for 100B+ |
 | Communication-computation overlap (async EP dispatch) | Planned | 15-30% throughput |
