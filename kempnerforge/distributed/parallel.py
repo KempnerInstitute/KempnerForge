@@ -381,6 +381,7 @@ def _build_vlm(
     compile_model: bool,
     fp8: bool,
     frames_per_clip: int = 1,
+    time_embedding_config=None,
 ) -> torch.nn.Module:
     """Build a VLM wrapper with parallelism applied in the correct order.
 
@@ -406,7 +407,7 @@ def _build_vlm(
     from kempnerforge.distributed.expert_parallel import apply_expert_parallel
     from kempnerforge.distributed.tensor_parallel import apply_tensor_parallel
     from kempnerforge.model.adapter import build_adapter
-    from kempnerforge.model.frame_time import FrameTimeEmbedding
+    from kempnerforge.model.frame_time import build_time_embedding
     from kempnerforge.model.transformer import Transformer
     from kempnerforge.model.vlm import (
         VLMWrapper,
@@ -442,9 +443,14 @@ def _build_vlm(
         transformer = Transformer(
             model_config, vlm_config=vlm_config, num_image_tokens=visual_tokens
         )
-        # Video gets a per-frame timestamp embedding; built alongside the adapter
-        # so it shares the meta/CPU build + materialize path below.
-        frame_time_embed = FrameTimeEmbedding(model_config.dim) if frames_per_clip > 1 else None
+        # Video gets a per-frame timestamp embedding (registry-selected via
+        # [time_embedding]); built alongside the adapter so it shares the
+        # meta/CPU build + materialize path below.
+        frame_time_embed = (
+            build_time_embedding(time_embedding_config, model_config.dim)
+            if frames_per_clip > 1
+            else None
+        )
 
     strategy = build_modality_strategy(vlm_config)
     wrapper = VLMWrapper(
@@ -535,6 +541,7 @@ def build_parallel_model(
     compile_model: bool = False,
     fp8: bool = False,
     frames_per_clip: int = 1,
+    time_embedding_config=None,
 ) -> torch.nn.Module:
     """Build a Transformer (or a VLMWrapper) with parallelism applied.
 
@@ -579,6 +586,7 @@ def build_parallel_model(
             compile_model=compile_model,
             fp8=fp8,
             frames_per_clip=frames_per_clip,
+            time_embedding_config=time_embedding_config,
         )
 
     from kempnerforge.distributed.tensor_parallel import apply_tensor_parallel

@@ -701,3 +701,20 @@ class TestVideoFrameTimes:
         bad = torch.zeros(2, 3, device=DEVICE)  # F=3 != frames_per_clip=4
         with pytest.raises(ValueError, match="frame_times shape"):
             wrapper(pixels, input_ids, frame_times=bad)
+
+    def test_time_embedding_none_disables_for_video(self):
+        # Registry "none" => no temporal module even for video (frames_per_clip>1).
+        from kempnerforge.config.time_embedding import TimeEmbeddingConfig
+
+        mc = ModelConfig(dim=64, n_layers=2, n_heads=4, vocab_size=256, max_seq_len=64)
+        vc = VisionEncoderConfig(type="random", feature_dim=96, num_tokens=16)
+        ac = AdapterConfig(type="avgpool", pool_window=2)
+        wrapper = build_vlm_wrapper(
+            mc,
+            vc,
+            ac,
+            JointDecoderConfig(max_text_len=8),
+            frames_per_clip=4,
+            time_embedding_config=TimeEmbeddingConfig(type="none"),
+        )
+        assert wrapper.frame_time_embed is None

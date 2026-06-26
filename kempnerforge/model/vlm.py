@@ -45,10 +45,11 @@ import torch.nn as nn
 from kempnerforge.config.adapter import AdapterConfig
 from kempnerforge.config.registry import registry
 from kempnerforge.config.schema import ModelConfig
+from kempnerforge.config.time_embedding import TimeEmbeddingConfig
 from kempnerforge.config.vision import VisionEncoderConfig
 from kempnerforge.config.vlm import FreezeSpec, VLMConfig
 from kempnerforge.model.adapter import VisionAdapter, build_adapter
-from kempnerforge.model.frame_time import FrameTimeEmbedding
+from kempnerforge.model.frame_time import TimeEmbedding, build_time_embedding
 from kempnerforge.model.modality import ModalityContext
 from kempnerforge.model.transformer import Transformer
 from kempnerforge.model.vision import VisionEncoder
@@ -309,7 +310,7 @@ class VLMWrapper(nn.Module):
         transformer: Transformer,
         strategy: ModalityStrategy,
         frames_per_clip: int = 1,
-        frame_time_embed: FrameTimeEmbedding | None = None,
+        frame_time_embed: TimeEmbedding | None = None,
     ) -> None:
         super().__init__()
         self.vision_encoder = vision_encoder
@@ -391,6 +392,7 @@ def build_vlm_wrapper(
     adapter_config: AdapterConfig,
     vlm_config: VLMConfig,
     frames_per_clip: int = 1,
+    time_embedding_config: TimeEmbeddingConfig | None = None,
 ) -> VLMWrapper:
     """Build a ``VLMWrapper`` from the four top-level configs.
 
@@ -434,8 +436,13 @@ def build_vlm_wrapper(
         )
     transformer = Transformer(model_config, vlm_config=vlm_config, num_image_tokens=visual_tokens)
     strategy = build_modality_strategy(vlm_config)
-    # Video clips get a per-frame timestamp embedding; the image path (F=1) does not.
-    frame_time_embed = FrameTimeEmbedding(model_config.dim) if frames_per_clip > 1 else None
+    # Video clips get a per-frame timestamp embedding (registry-selected via
+    # [time_embedding]); the image path (F=1) does not. type="none" disables it.
+    frame_time_embed = (
+        build_time_embedding(time_embedding_config, model_config.dim)
+        if frames_per_clip > 1
+        else None
+    )
     return VLMWrapper(
         encoder,
         adapter,

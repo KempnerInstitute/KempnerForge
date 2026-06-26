@@ -23,12 +23,42 @@ parameters are the projection, which materializes like any other ``nn.Linear``.
 from __future__ import annotations
 
 import math
+from typing import Any
 
 import torch
 import torch.nn as nn
 
+from kempnerforge.config.registry import registry
 
-class FrameTimeEmbedding(nn.Module):
+
+class TimeEmbedding(nn.Module):
+    """Base for per-frame timestamp embeddings (the *additive* family).
+
+    Contract: ``forward(times: (B, F) seconds) -> (B, F, dim)`` — an additive
+    embedding added to each frame's visual tokens, with **no change to sequence
+    length** — plus ``reset_parameters()`` so meta-device builds can re-init
+    after ``to_empty``. Register a new technique with
+    ``@registry.register_time_embedding`` and select it via
+    ``[time_embedding].type``; ``build_time_embedding`` dispatches through the
+    registry.
+
+    Out of scope (a separate, future integration point): sequence-*modifying*
+    time encodings — e.g. Molmo2-style textual time-tokens interleaved between
+    frame groups — change the token sequence (count / ``output_slice`` /
+    ``modality_ids`` / MoT split) and need tokenizer + interleaved-sequence
+    support KF does not have yet. Those would hook the sequence-assembly layer
+    (``ModalityStrategy.prepare``), not this additive registry; set
+    ``[time_embedding].type = "none"`` to run them instead of an additive one.
+    """
+
+    def forward(self, times: torch.Tensor) -> torch.Tensor:  # pragma: no cover - interface
+        raise NotImplementedError
+
+    def reset_parameters(self) -> None:  # pragma: no cover - interface
+        raise NotImplementedError
+
+
+class FrameTimeEmbedding(TimeEmbedding):
     """Sinusoidal embedding of a per-frame timestamp (seconds) -> model dim.
 
     Args:
@@ -93,3 +123,37 @@ class FrameTimeEmbedding(nn.Module):
         ang = times.to(torch.float32).unsqueeze(-1) * (2.0 * math.pi / periods)  # (B, F, bands)
         feats = torch.cat([torch.sin(ang), torch.cos(ang)], dim=-1)  # (B, F, 2*bands)
         return self.proj(feats.to(self.proj.weight.dtype))
+
+
+@registry.register_time_embedding("sinusoidal")
+def _build_sinusoidal(
+    dim: int,
+    *,
+    num_bands: int = 16,
+    min_period: float = 0.5,
+    max_period: float = 256.0,
+    **_: Any,
+) -> FrameTimeEmbedding:
+    """Registry builder for the sinusoidal time embedding."""
+    return FrameTimeEmbedding(
+        dim, num_bands=num_bands, min_period=min_period, max_period=max_period
+    )
+
+
+def build_time_embedding(time_embedding_config: Any, dim: int) -> TimeEmbedding | None:
+    """Build the per-frame time embedding from a ``TimeEmbeddingConfig``.
+
+    Returns ``None`` when disabled (``type == "none"``). A ``None`` config falls
+    back to the default (sinusoidal) so video callers that pass nothing keep the
+    default behavior. The config is duck-typed (``.enabled`` / ``.type`` /
+    ``.extra_kwargs()``) to avoid a model->config import cycle, matching
+    ``build_adapter``.
+    """
+    if time_embedding_config is None:
+        from kempnerforge.config.time_embedding import TimeEmbeddingConfig  # noqa: PLC0415
+
+        time_embedding_config = TimeEmbeddingConfig()
+    if not time_embedding_config.enabled:
+        return None
+    builder = registry.get_time_embedding(time_embedding_config.type)
+    return builder(dim, **time_embedding_config.extra_kwargs())

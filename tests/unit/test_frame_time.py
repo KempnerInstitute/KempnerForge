@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from kempnerforge.model.frame_time import FrameTimeEmbedding
+from kempnerforge.model.frame_time import FrameTimeEmbedding, build_time_embedding
 
 
 class TestFrameTimeEmbedding:
@@ -66,3 +66,31 @@ class TestFrameTimeEmbedding:
     def test_invalid_args_rejected(self, kwargs, match):
         with pytest.raises(ValueError, match=match):
             FrameTimeEmbedding(**kwargs)
+
+
+class TestTimeEmbeddingRegistry:
+    """The registry + builder make the time embedding config-switchable."""
+
+    def test_sinusoidal_registered(self):
+        from kempnerforge.config.registry import registry
+
+        assert "sinusoidal" in registry.list_time_embeddings()
+
+    def test_build_none_config_defaults_to_sinusoidal(self):
+        # A None config preserves the default (sinusoidal) so video callers that
+        # pass nothing keep the current behavior.
+        m = build_time_embedding(None, dim=64)
+        assert isinstance(m, FrameTimeEmbedding)
+        assert m.proj.out_features == 64
+
+    def test_build_from_config(self):
+        from kempnerforge.config.time_embedding import TimeEmbeddingConfig
+
+        m = build_time_embedding(TimeEmbeddingConfig(type="sinusoidal", num_bands=8), dim=32)
+        assert isinstance(m, FrameTimeEmbedding)
+        assert m.num_bands == 8
+
+    def test_build_none_type_returns_none(self):
+        from kempnerforge.config.time_embedding import TimeEmbeddingConfig
+
+        assert build_time_embedding(TimeEmbeddingConfig(type="none"), dim=32) is None

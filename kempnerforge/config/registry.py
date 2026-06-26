@@ -227,6 +227,27 @@ class Registry:
     def list_sampling_policies(self) -> list[str]:
         return self.list("sampling_policy")
 
+    def register_time_embedding(self, name: str) -> Callable:
+        """Decorator to register a time-embedding builder.
+
+        Builders take ``(dim, **kwargs)`` and return an ``nn.Module`` mapping
+        per-frame timestamps ``(B, F)`` in seconds to an additive embedding
+        ``(B, F, dim)`` (and exposing ``reset_parameters()`` for meta-device
+        builds). Selected by ``[time_embedding].type`` on the VLM video path.
+        """
+
+        def decorator(fn: Callable) -> Callable:
+            self.register("time_embedding", name, fn)
+            return fn
+
+        return decorator
+
+    def get_time_embedding(self, name: str) -> Callable:
+        return self.get("time_embedding", name)
+
+    def list_time_embeddings(self) -> list[str]:
+        return self.list("time_embedding")
+
     def register_dyn_ckpt_strategy(self, name: str) -> Callable:
         """Decorator to register a dynamic-checkpointing-window strategy.
 

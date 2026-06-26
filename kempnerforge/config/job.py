@@ -14,6 +14,7 @@ from kempnerforge.config.model import ModelConfig
 from kempnerforge.config.optimizer import OptimizerConfig
 from kempnerforge.config.profiling import ProfilingConfig
 from kempnerforge.config.scheduler import SchedulerConfig
+from kempnerforge.config.time_embedding import TimeEmbeddingConfig
 from kempnerforge.config.training import TrainConfig
 from kempnerforge.config.video import VideoConfig
 from kempnerforge.config.vision import VisionEncoderConfig
@@ -53,6 +54,7 @@ class JobConfig:
     adapter: AdapterConfig | None = None
     vlm: VLMConfig | None = None
     video: VideoConfig | None = None
+    time_embedding: TimeEmbeddingConfig | None = None
 
     def __post_init__(self) -> None:
         """Cross-section invariants that fire at construction time.

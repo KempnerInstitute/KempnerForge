@@ -26,10 +26,13 @@ A clip of `F` frames becomes `F × P′` visual tokens:
      `max_seq_len`).
 
 Temporal order is carried by frame order (sequential positions). On top of that,
-each frame's **timestamp in seconds** is embedded (sinusoidal features → a
-zero-initialized projection) and added to that frame's visual tokens, so the
-model sees *when* each frame occurs, not just its order. Grounding outputs are a
-separate follow-up (see below).
+each frame's **timestamp in seconds** is embedded and added to that frame's
+visual tokens, so the model sees *when* each frame occurs, not just its order.
+The embedding is registry-driven: `[time_embedding].type` selects it
+(`sinusoidal` by default — sinusoidal features at log-spaced periods through a
+zero-initialized projection; `none` disables it), so new techniques (learned,
+Fourier, …) register as small additions and switch via config. Grounding
+outputs are a separate follow-up (see below).
 
 ## Token budget
 
@@ -105,6 +108,11 @@ time, so it is set in the TOML, not via a `--vlm.arch=` CLI override.)
 - **Grounding outputs are a follow-up** — per-frame timestamps are encoded (see
   above), but structured grounding (`<points>`/`<tracks>` outputs with point-F1
   / track-J&F eval) is not yet implemented.
+- **Sequence-modifying time encodings are a separate hook** — the
+  `[time_embedding]` registry is for *additive* per-frame embeddings (no change
+  to sequence length). Molmo2-style interleaved text time-tokens change the
+  token sequence and need interleaved/variable-length sequence support KF does
+  not have yet; they would hook the sequence-assembly layer, not this registry.
 - **Padded frames are not yet masked from attention** — short clips pad to
   `max_frames` with blank frames; a `frame_mask` is produced but not yet
   consumed by the attention mask.
