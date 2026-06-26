@@ -649,6 +649,8 @@ def main() -> None:
         )
         hook_runner.on_checkpoint_save(0, config.checkpoint.dir)
 
+    completed_normally = False
+
     while step < tc.max_steps:
         # Refresh data iterator at start / epoch boundary
         if dataloader is not None and data_iter is None:
@@ -1016,10 +1018,28 @@ def main() -> None:
             shutdown_handler.finish()
             break
 
+        # Clean-completion marker for the unconditional final save after the
+        # loop. Reached only on the iteration that hits max_steps with no
+        # break, so it is never set after a NaN/NCCL/shutdown break and never
+        # on a zero-iteration resume — guaranteeing ckpt_extra is bound when
+        # the final save runs.
+        if step >= tc.max_steps:
+            completed_normally = True
+
     if prof is not None:
         prof.stop()
         if rank == 0:
             print_profiler_summary(prof, trace_dir=config.profiling.trace_dir)
+
+    if completed_normally and not config.checkpoint.should_save(step):
+        ckpt_mgr.save(
+            step=step,
+            tokens_seen=tokens_seen,
+            scheduler=scheduler,
+            dataloader=dataloader,
+            extra=ckpt_extra,
+        )
+        hook_runner.on_checkpoint_save(step, config.checkpoint.dir)
 
     # Flush any pending async checkpoint before tearing down process group
     ckpt_mgr.wait()
