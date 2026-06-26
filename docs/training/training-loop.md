@@ -187,7 +187,7 @@ After the loop:
 prof.stop()
 # Clean off-schedule finish: persist the fully-trained final step
 if completed_normally and not config.checkpoint.should_save(step):
-    ckpt_mgr.save(step, ...)           # final checkpoint; updates `latest`
+    ckpt_mgr.save(step, ...)           # final checkpoint; `latest` committed after wait
 ckpt_mgr.wait()                        # drain last async save
 hook_runner.on_train_end(step, tokens_seen)
 tracker.close()
