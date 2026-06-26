@@ -78,7 +78,7 @@ class WebVidVideoDataset(VideoDataset):
     """Map-style WebVid-style video-caption dataset for VLM training.
 
     Args:
-        data_root: Dataset root (contains ``raw/webvid-10M/data`` and
+        data_root: Dataset root (contains ``raw/<dataset_name>/data`` and
             ``raw/videos``).
         split: ``"train"`` or ``"validation"``.
         tokenizer_path: HF tokenizer id or local path.
@@ -148,9 +148,9 @@ class WebVidVideoDataset(VideoDataset):
         """Read partition CSVs into (videoid, caption) lists.
 
         Reads partitions in sorted order, stopping early once ``max_samples``
-        rows are collected so a quick run does not scan the entire 10M-row
-        corpus. ``videoid`` is kept as a string to preserve the digits used by
-        the on-disk path mapping.
+        rows are collected so a quick run does not scan the entire corpus.
+        ``videoid`` is kept as a string to preserve the digits used by the
+        on-disk path mapping.
         """
         import glob
 
