@@ -1,0 +1,93 @@
+# Video VLM training on WebVid-10M (Joint-Decoder).
+#
+# A clip is decoded into `max_frames` frames (sampled by timestamp at `fps`,
+# Molmo2-style: uniform, first + last frame kept), each encoded by the vision
+# tower, pooled by the connector, and prepended to the caption tokens. The LLM
+# is trained from scratch here; warm-starting from a pretrained backbone is a
+# later phase.
+#
+# Visual-token budget (Joint-Decoder): max_frames * tokens_per_frame + max_text_len
+#   must be <= model.max_seq_len. With SigLIP2 @224/patch16 (14x14 = 196 patches)
+#   and the avgpool connector at pool_window=2 -> ceil(14/2)^2 = 49 tokens/frame.
+#   8 frames -> 8*49 = 392 visual + 64 text = 456 <= 576.
+#
+# Launch (single node, 4 GPUs):
+#   uv run torchrun --nproc_per_node=4 scripts/train.py configs/train/vlm_video_webvid.toml
+#
+# Quick smoke (no SigLIP download, a few clips; pair with a small step count):
+#   ... --vision_encoder.type=random --vision_encoder.num_tokens=196 \
+#       --vision_encoder.feature_dim=768 --video.max_samples=256 --train.max_steps=20
+
+[model]
+dim = 1024
+n_layers = 12
+n_heads = 16
+n_kv_heads = 16
+vocab_size = 50257        # gpt2 tokenizer
+max_seq_len = 576         # 8 frames * 49 pooled tokens + 64 text + headroom
+norm_type = "rmsnorm"
+activation = "silu"
+rope_theta = 10000.0
+
+[vision_encoder]
+type = "siglip2"
+path = "google/siglip2-base-patch16-224"
+# feature_dim / num_tokens left at 0 -> probed from the HF model at build time.
+
+[adapter]
+type = "avgpool"          # token-reducing connector; "attentional_pool" is the faithful upgrade
+pool_window = 2           # 14x14 patch grid -> 7x7 = 49 tokens/frame
+
+[vlm]
+arch = "joint_decoder"    # also: cross_attention / mot / moma
+max_text_len = 64
+freeze = [{module = "vision_encoder", frozen = true}]
+
+[video]
+data_root = "/n/holylfs06/LABS/kempner_shared/Everyone/testbed/video/webvid-10m"
+split = "train"
+fps = 2.0
+max_frames = 8
+min_frames = 4
+frame_size = 224
+max_samples = 0           # 0 = full manifest; set small (e.g. 256) for a smoke
+
+[data]
+tokenizer_path = "gpt2"
+num_workers = 4
+pin_memory = true
+
+[train]
+batch_size = 4
+seq_len = 576
+max_steps = 5000
+grad_accum_steps = 4
+grad_clip_norm = 1.0
+seed = 42
+compile_model = false
+activation_checkpointing = "none"
+
+[optimizer]
+name = "adamw"
+lr = 2e-4
+weight_decay = 0.1
+betas = [0.9, 0.95]
+fused = false
+
+[scheduler]
+name = "cosine"
+warmup_steps = 200
+min_lr_ratio = 0.1
+
+[distributed]
+dp_shard = -1
+
+[checkpoint]
+dir = "checkpoints/vlm_video_webvid"
+interval = 1000
+keep_last_n = 2
+
+[metrics]
+log_interval = 10
+enable_wandb = false
+enable_tensorboard = false
