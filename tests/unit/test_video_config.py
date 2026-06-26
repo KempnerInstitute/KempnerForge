@@ -49,6 +49,20 @@ class TestVideoConfig:
         with pytest.raises(ValueError, match="video.max_frames must be >= 1"):
             VideoConfig(max_frames=0)
 
+    def test_pluggable_defaults(self):
+        cfg = VideoConfig()
+        assert cfg.dataset_type == "webvid"
+        assert cfg.dataset_name == "webvid-10M"
+        assert cfg.sampling_policy == "uniform"
+
+    def test_unknown_dataset_type_rejected(self):
+        with pytest.raises(ValueError, match="video.dataset_type must be one of"):
+            VideoConfig(dataset_type="bogus")
+
+    def test_unknown_sampling_policy_rejected(self):
+        with pytest.raises(ValueError, match="video.sampling_policy must be one of"):
+            VideoConfig(sampling_policy="bogus")
+
 
 class TestJobConfigVideoWiring:
     def _vlm_kwargs(self) -> dict:

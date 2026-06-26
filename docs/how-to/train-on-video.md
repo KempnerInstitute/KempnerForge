@@ -56,19 +56,30 @@ arch = "joint_decoder"    # also: cross_attention | mot | moma
 
 [video]
 data_root = "/path/to/webvid-10m"
-split = "train"           # "train" | "validation"
-fps = 2.0                 # target sampling rate
-max_frames = 8            # per-clip frame budget
+dataset_type = "webvid"      # registry key; add styles via @registry.register_video_dataset
+dataset_name = "webvid-10M"  # corpus dir under raw/<dataset_name>/data (WebVid style)
+sampling_policy = "uniform"  # registry key; the frame-sampling policy
+split = "train"              # "train" | "validation"
+fps = 2.0                    # target sampling rate
+max_frames = 8               # per-clip frame budget
 min_frames = 4
 frame_size = 224
-max_samples = 0           # 0 = full manifest; set small for a smoke
+max_samples = 0              # 0 = full manifest; set small for a smoke
 ```
 
-The `[video]` section is decoded by `WebVidVideoDataset` (a WebVid-style layout:
-CSV manifests under `raw/webvid-10M/data/<split>/partitions/` and `.mp4` files
-under `raw/videos/<split>/`). Decoding uses PyAV (its wheel bundles FFmpeg, so no
-system FFmpeg is required); it is imported lazily, so the package imports without
-`av` and only actual decoding needs it.
+The dataset side is **pluggable**: `dataset_type` selects a builder from the
+`video_dataset` registry (`"webvid"` ships; other styles — HuggingFace video
+sets, flat folders, alternate manifests — register as small follow-ups and are
+selected here), and `sampling_policy` selects a registered frame-sampling policy
+(`"uniform"` = the Molmo2 default). The WebVid corpus directory is parameterized
+by `dataset_name`, so any WebVid-style dataset works, not just `webvid-10M`:
+CSV manifests under `raw/<dataset_name>/data/<split>/partitions/` and `.mp4`
+files under `raw/videos/<split>/`.
+
+Decoding uses **PyAV**, an **optional** dependency (its wheel bundles FFmpeg, so
+no system FFmpeg is required): install it with `uv sync --group video`. It is
+imported lazily, so the package imports without `av` and only actual decoding
+requires it.
 
 ## Launch
 

@@ -24,6 +24,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from kempnerforge.config.registry import registry
+
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from PIL.Image import Image as PILImage
 
@@ -31,6 +33,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 _AV_TIME_BASE = 1_000_000.0
 
 
+@registry.register_sampling_policy("uniform")
 def sample_timestamps(
     duration_s: float, fps: float, min_frames: int, max_frames: int
 ) -> list[float]:
@@ -72,22 +75,30 @@ def _video_duration_seconds(stream: Any, container: Any) -> float:
 
 
 def decode_video_frames(
-    path: str, *, fps: float, min_frames: int, max_frames: int
+    path: str, *, fps: float, min_frames: int, max_frames: int, sampling_policy: str = "uniform"
 ) -> list[PILImage]:
     """Decode a clip into a list of sampled ``PIL.Image`` frames (RGB).
 
-    Frames are chosen by ``sample_timestamps`` and read in a single decode
-    pass: each target timestamp is mapped to the first decoded frame at or
-    after it (timestamps past the last frame map to the last frame, so the
-    final frame is always returned). The returned list has length equal to the
-    number of sampled timestamps (``<= max_frames``), or is empty when the file
-    has no decodable video stream.
+    Frames are chosen by the registered ``sampling_policy`` (default
+    ``"uniform"`` = ``sample_timestamps``) and read in a single decode pass: each
+    target timestamp is mapped to the first decoded frame at or after it
+    (timestamps past the last frame map to the last frame, so the final frame is
+    always returned). The returned list has length equal to the number of sampled
+    timestamps (``<= max_frames``), or is empty when the file has no decodable
+    video stream.
 
     Raises whatever ``av`` raises on a missing/corrupt file; callers that train
     over noisy data should catch and substitute an empty clip.
     """
-    import av  # lazy: bundled-FFmpeg decoder, optional at import time
+    try:
+        import av  # lazy: bundled-FFmpeg decoder, optional (the "video" dep group)
+    except ImportError as e:  # pragma: no cover - only triggered without PyAV installed
+        raise ImportError(
+            "Video decoding requires PyAV, an optional dependency. "
+            "Install the video extra: `uv sync --group video`."
+        ) from e
 
+    sample = registry.get_sampling_policy(sampling_policy)
     images: list[PILImage] = []
     with av.open(path) as container:
         if not container.streams.video:
@@ -95,7 +106,7 @@ def decode_video_frames(
         stream = container.streams.video[0]
         stream.thread_type = "AUTO"
         duration_s = _video_duration_seconds(stream, container)
-        targets = sample_timestamps(duration_s, fps, min_frames, max_frames)
+        targets = sample(duration_s, fps, min_frames, max_frames)
 
         j = 0
         eps = 1e-3

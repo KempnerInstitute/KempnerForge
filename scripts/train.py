@@ -296,21 +296,12 @@ def main() -> None:
                 raise ValueError("Video training requires data.tokenizer_path")
             from transformers import AutoTokenizer
 
-            from kempnerforge.data.video_dataset import VideoCollator, WebVidVideoDataset
+            from kempnerforge.data.video_dataset import VideoCollator, build_video_dataset
 
             vcfg = config.video
-            dataset = WebVidVideoDataset(
-                data_root=vcfg.data_root,
-                split=vcfg.split,
-                tokenizer_path=config.data.tokenizer_path,
-                max_text_len=vlm_cfg.max_text_len,
-                max_frames=vcfg.max_frames,
-                min_frames=vcfg.min_frames,
-                fps=vcfg.fps,
-                frame_size=vcfg.frame_size,
-                max_samples=vcfg.max_samples,
-                prompt=vcfg.prompt,
-            )
+            # Dataset style is registry-selected via [video].dataset_type; the
+            # builder reads the rest of the knobs off vcfg.
+            dataset = build_video_dataset(vcfg, config.data.tokenizer_path, vlm_cfg.max_text_len)
             _tok = AutoTokenizer.from_pretrained(config.data.tokenizer_path)
             _pad_id = _tok.pad_token_id
             if _pad_id is None:

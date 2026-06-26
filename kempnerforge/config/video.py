@@ -26,6 +26,9 @@ class VideoConfig:
 
     Fields:
         data_root: Root directory of the on-disk video dataset.
+        dataset_type: Registry key for the dataset builder (``"webvid"`` default).
+        dataset_name: On-disk corpus name within a style (e.g. ``"webvid-10M"``).
+        sampling_policy: Registry key for the frame-sampling policy (``"uniform"``).
         split: Which split to read (``"train"`` or ``"validation"``).
         max_samples: Cap the manifest to this many examples (``0`` = all).
         max_frames: Maximum frames sampled per clip (the per-clip budget).
@@ -36,6 +39,9 @@ class VideoConfig:
     """
 
     data_root: str = ""
+    dataset_type: str = "webvid"
+    dataset_name: str = "webvid-10M"
+    sampling_policy: str = "uniform"
     split: str = "train"
     max_samples: int = 0
     max_frames: int = 16
@@ -45,6 +51,23 @@ class VideoConfig:
     prompt: str = ""
 
     def __post_init__(self) -> None:
+        # Late imports populate the dataset/sampling registries (their decorators
+        # run on import) and avoid a config->data import cycle; only hit for a
+        # video job. ``av`` is not required here (it is lazy inside the decoder).
+        import kempnerforge.data.video_dataset  # noqa: F401, PLC0415
+        import kempnerforge.data.video_io  # noqa: F401, PLC0415
+        from kempnerforge.config.registry import registry  # noqa: PLC0415
+
+        if self.dataset_type not in registry.list_video_datasets():
+            raise ValueError(
+                f"video.dataset_type must be one of {sorted(registry.list_video_datasets())} "
+                f"(got {self.dataset_type!r})"
+            )
+        if self.sampling_policy not in registry.list_sampling_policies():
+            raise ValueError(
+                "video.sampling_policy must be one of "
+                f"{sorted(registry.list_sampling_policies())} (got {self.sampling_policy!r})"
+            )
         if self.split not in _VIDEO_SPLITS:
             raise ValueError(f"video.split must be one of {_VIDEO_SPLITS} (got {self.split!r})")
         if self.max_samples < 0:

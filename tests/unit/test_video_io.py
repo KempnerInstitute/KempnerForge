@@ -155,3 +155,19 @@ class TestDecodeSynthetic:
         _write_mp4(path, n_frames=3, fps=10)  # shorter than min_frames request
         frames = decode_video_frames(str(path), fps=2.0, min_frames=4, max_frames=8)
         assert len(frames) >= 1
+
+
+class TestSamplingPolicyRegistry:
+    """The sampling-policy registry makes frame selection config-switchable."""
+
+    def test_uniform_registered(self):
+        from kempnerforge.config.registry import registry
+
+        assert "uniform" in registry.list_sampling_policies()
+        assert registry.get_sampling_policy("uniform") is sample_timestamps
+
+    def test_unknown_policy_raises(self):
+        from kempnerforge.config.registry import registry
+
+        with pytest.raises(KeyError, match="sampling_policy"):
+            registry.get_sampling_policy("bogus")

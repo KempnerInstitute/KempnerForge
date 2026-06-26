@@ -1274,7 +1274,6 @@ name = "kempnerforge"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
-    { name = "av" },
     { name = "datasets" },
     { name = "tensorboard" },
     { name = "tokenizers" },
@@ -1306,10 +1305,12 @@ docs = [
     { name = "sphinx-autodoc-typehints" },
     { name = "sphinx-copybutton" },
 ]
+video = [
+    { name = "av" },
+]
 
 [package.metadata]
 requires-dist = [
-    { name = "av", specifier = ">=17.1.0" },
     { name = "datasets" },
     { name = "tensorboard" },
     { name = "tokenizers" },
@@ -1341,6 +1342,7 @@ docs = [
     { name = "sphinx-autodoc-typehints", specifier = ">=2.0" },
     { name = "sphinx-copybutton", specifier = ">=0.5" },
 ]
+video = [{ name = "av", specifier = ">=17.1.0" }]
 
 [[package]]
 name = "kiwisolver"

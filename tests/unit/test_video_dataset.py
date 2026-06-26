@@ -67,6 +67,7 @@ class _StubVideoDataset(WebVidVideoDataset):
         self._fps = fps
         self._frame_size = frame_size
         self._prompt = prompt
+        self._sampling_policy = "uniform"
         self._image_mean = DEFAULT_IMAGE_MEAN
         self._image_std = DEFAULT_IMAGE_STD
 
@@ -290,3 +291,52 @@ class TestRealDatasetIntegration:
                 min_frames=2,
                 fps=2.0,
             )
+
+    def test_build_video_dataset_with_custom_dataset_name(self, tmp_path):
+        # De-hardcoded: a custom dataset_name reads raw/<name>/data, and
+        # build_video_dataset dispatches via the registry (no hardcoded class).
+        from kempnerforge.config.video import VideoConfig
+        from kempnerforge.data.video_dataset import VideoDataset, build_video_dataset
+
+        name = "my-webvid"
+        mdir = tmp_path / "raw" / name / "data" / "train" / "partitions"
+        mdir.mkdir(parents=True)
+        vid, cap = "654321", "a clip"
+        (mdir / "0000.csv").write_text(f"videoid,name\n{vid},{cap}\n")
+        vdir = tmp_path / "raw" / "videos" / "train" / vid[:2] / vid[:4] / vid[:6]
+        vdir.mkdir(parents=True)
+        _write_mp4(vdir / f"{vid}.mp4", n_frames=16, size=32, fps=8)
+
+        cfg = VideoConfig(
+            data_root=str(tmp_path),
+            dataset_name=name,
+            split="train",
+            max_frames=8,
+            min_frames=4,
+            fps=2.0,
+            frame_size=32,
+        )
+        ds = build_video_dataset(cfg, "gpt2", max_text_len=16)
+        assert isinstance(ds, VideoDataset)
+        assert len(ds) == 1
+        assert ds[0]["frame_mask"].any()
+
+
+class TestVideoDatasetRegistry:
+    """Registry + build_video_dataset make the dataset style config-switchable."""
+
+    def test_webvid_registered(self):
+        from kempnerforge.config.registry import registry
+
+        assert "webvid" in registry.list_video_datasets()
+
+    def test_is_video_dataset_subclass(self):
+        from kempnerforge.data.video_dataset import VideoDataset
+
+        assert issubclass(WebVidVideoDataset, VideoDataset)
+
+    def test_unknown_dataset_type_raises(self):
+        from kempnerforge.config.registry import registry
+
+        with pytest.raises(KeyError, match="video_dataset"):
+            registry.get_video_dataset("bogus")

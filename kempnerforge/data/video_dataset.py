@@ -31,6 +31,7 @@ from typing import Any
 import torch
 from torch.utils.data import Dataset
 
+from kempnerforge.config.registry import registry
 from kempnerforge.data.video_io import decode_video_frames
 from kempnerforge.data.vlm_dataset import (
     DEFAULT_IMAGE_MEAN,
@@ -54,7 +55,26 @@ def _resolve_pad_id(tokenizer: Any) -> int:
     return int(pad_id)
 
 
-class WebVidVideoDataset(Dataset):
+class VideoDataset(Dataset):
+    """Base for video-caption datasets feeding the VLM video path.
+
+    A subclass is a map-style ``Dataset`` whose ``__getitem__`` returns the
+    sample dict ``VideoCollator`` batches:
+
+    - ``pixel_values``: ``(F, 3, H, W)`` float32 (``F = max_frames``, zero-padded).
+    - ``frame_mask``: ``(F,)`` bool (``True`` for real frames).
+    - ``input_ids`` / ``labels``: ``(T,)`` int64, padded to ``max_text_len`` with
+      ``-100`` on pad/prompt positions.
+
+    Register a new dataset style with ``@registry.register_video_dataset`` and
+    select it via ``[video].dataset_type``; ``build_video_dataset`` dispatches
+    through the registry. ``WebVidVideoDataset`` is the WebVid-style layout
+    (per-partition CSV manifests + prefix-nested ``.mp4`` files); other styles
+    (HuggingFace video sets, flat folders, alternate manifests) are follow-ups.
+    """
+
+
+class WebVidVideoDataset(VideoDataset):
     """Map-style WebVid-style video-caption dataset for VLM training.
 
     Args:
@@ -83,6 +103,8 @@ class WebVidVideoDataset(Dataset):
         frame_size: int = 224,
         max_samples: int = 0,
         prompt: str = "",
+        dataset_name: str = "webvid-10M",
+        sampling_policy: str = "uniform",
         image_mean: tuple[float, float, float] = DEFAULT_IMAGE_MEAN,
         image_std: tuple[float, float, float] = DEFAULT_IMAGE_STD,
     ) -> None:
@@ -92,8 +114,11 @@ class WebVidVideoDataset(Dataset):
             raise ValueError(f"split must be one of {tuple(_VIDEO_SUBDIR)} (got {split!r})")
         self._split = split
         self._video_dir = os.path.join(data_root, "raw", "videos", _VIDEO_SUBDIR[split])
+        # ``dataset_name`` names the on-disk corpus (e.g. "webvid-10M"); the WebVid
+        # *style* (CSV manifests + prefix-nested mp4s) is shared, so other
+        # WebVid-style datasets differ only by this directory.
         csv_dir = os.path.join(
-            data_root, "raw", "webvid-10M", "data", _CSV_SUBDIR[split], "partitions"
+            data_root, "raw", dataset_name, "data", _CSV_SUBDIR[split], "partitions"
         )
         self._ids, self._caps = self._load_manifest(csv_dir, max_samples)
         self._tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
@@ -104,11 +129,13 @@ class WebVidVideoDataset(Dataset):
         self._fps = fps
         self._frame_size = frame_size
         self._prompt = prompt
+        self._sampling_policy = sampling_policy
         self._image_mean = image_mean
         self._image_std = image_std
         logger.info(
-            "WebVidVideoDataset: %s [%s], %d clips, max_frames=%d, fps=%s, frame_size=%d",
+            "WebVidVideoDataset: %s/%s [%s], %d clips, max_frames=%d, fps=%s, frame_size=%d",
             data_root,
+            dataset_name,
             split,
             len(self._ids),
             max_frames,
@@ -165,7 +192,11 @@ class WebVidVideoDataset(Dataset):
         path = self._video_path(videoid)
         try:
             frames = decode_video_frames(
-                path, fps=self._fps, min_frames=self._min_frames, max_frames=self._max_frames
+                path,
+                fps=self._fps,
+                min_frames=self._min_frames,
+                max_frames=self._max_frames,
+                sampling_policy=self._sampling_policy,
             )
         except Exception as e:  # noqa: BLE001 - any decode failure -> skip-with-mask
             logger.debug("video decode failed for %s: %s", path, e)
@@ -232,3 +263,33 @@ class VideoCollator:
             "input_ids": input_ids,
             "labels": labels,
         }
+
+
+@registry.register_video_dataset("webvid")
+def _build_webvid(video_config: Any, tokenizer_path: str, max_text_len: int) -> WebVidVideoDataset:
+    """Registry builder for the WebVid-style dataset (see ``WebVidVideoDataset``)."""
+    return WebVidVideoDataset(
+        data_root=video_config.data_root,
+        split=video_config.split,
+        tokenizer_path=tokenizer_path,
+        max_text_len=max_text_len,
+        max_frames=video_config.max_frames,
+        min_frames=video_config.min_frames,
+        fps=video_config.fps,
+        frame_size=video_config.frame_size,
+        max_samples=video_config.max_samples,
+        prompt=video_config.prompt,
+        dataset_name=video_config.dataset_name,
+        sampling_policy=video_config.sampling_policy,
+    )
+
+
+def build_video_dataset(video_config: Any, tokenizer_path: str, max_text_len: int) -> VideoDataset:
+    """Build the video dataset selected by ``video_config.dataset_type``.
+
+    Dispatches through the ``video_dataset`` registry, so a new dataset style is
+    one ``@registry.register_video_dataset`` builder + a config string. The
+    config is duck-typed to avoid a data->config import cycle.
+    """
+    builder = registry.get_video_dataset(video_config.dataset_type)
+    return builder(video_config, tokenizer_path, max_text_len)
