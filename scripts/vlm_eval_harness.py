@@ -115,12 +115,12 @@ def main() -> None:
 
     model_args = (
         f"config={args.config},checkpoint={args.checkpoint},"
-        f"dtype={args.dtype},max_new_tokens={args.max_new_tokens},batch_size={args.batch_size}"
+        f"dtype={args.dtype},max_new_tokens={args.max_new_tokens}"
     )
     results = simple_evaluate(
         model="kempnerforge_vlm",
         model_args=model_args,
-        tasks=[t.strip() for t in args.tasks.split(",") if t.strip()],
+        tasks=args.tasks.split(","),
         device=args.device,
         batch_size=args.batch_size,
         limit=args.limit,
