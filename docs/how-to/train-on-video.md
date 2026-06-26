@@ -25,8 +25,11 @@ A clip of `F` frames becomes `F × P′` visual tokens:
      blocks; the residual stays text-only (so it fits more frames per
      `max_seq_len`).
 
-Temporal order is carried by frame order (sequential positions). Per-frame
-timestamp tokens and grounding outputs are a separate follow-up (see below).
+Temporal order is carried by frame order (sequential positions). On top of that,
+each frame's **timestamp in seconds** is embedded (sinusoidal features → a
+zero-initialized projection) and added to that frame's visual tokens, so the
+model sees *when* each frame occurs, not just its order. Grounding outputs are a
+separate follow-up (see below).
 
 ## Token budget
 
@@ -99,9 +102,9 @@ time, so it is set in the TOML, not via a `--vlm.arch=` CLI override.)
 
 ## Constraints and follow-ups
 
-- **Causal attention; no per-frame timestamps yet** — temporal order is frame
-  order. Per-frame timestamp tokens + grounding (`<points>`/`<tracks>` outputs
-  with point-F1 / track-J&F eval) are a follow-up.
+- **Grounding outputs are a follow-up** — per-frame timestamps are encoded (see
+  above), but structured grounding (`<points>`/`<tracks>` outputs with point-F1
+  / track-J&F eval) is not yet implemented.
 - **Padded frames are not yet masked from attention** — short clips pad to
   `max_frames` with blank frames; a `frame_mask` is produced but not yet
   consumed by the attention mask.

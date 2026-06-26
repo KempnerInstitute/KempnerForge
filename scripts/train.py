@@ -756,11 +756,14 @@ def main() -> None:
                 pixel_values = batch["pixel_values"].to(device)
                 input_ids = batch["input_ids"].to(device)
                 labels = batch["labels"].to(device)
+                frame_times = batch["frame_times"].to(device) if "frame_times" in batch else None
 
                 with maybe_no_sync(model, micro_step, tc.grad_accum_steps):
                     if mc.is_moe:
                         inner_transformer(model).set_moe_step(step, tc.max_steps)  # type: ignore[attr-defined]
-                    logits, labels_out = model(pixel_values, input_ids, labels)
+                    logits, labels_out = model(
+                        pixel_values, input_ids, labels, frame_times=frame_times
+                    )
                     loss = loss_fn(logits, labels_out)
 
                     total_text_tokens += int((labels_out != -100).sum().item())

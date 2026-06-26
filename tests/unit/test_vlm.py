@@ -648,3 +648,56 @@ class TestVideoForward:
         # 4D single-image batch into a video (frames_per_clip>1) wrapper.
         with pytest.raises(ValueError, match="frames-per-clip mismatch"):
             wrapper(torch.randn(2, 3, 16, 16, device=DEVICE), input_ids)
+
+
+class TestVideoFrameTimes:
+    """Per-frame timestamp embedding (frame-aware visual prefix)."""
+
+    def test_frame_time_embed_built_for_video(self):
+        wrapper = _video_wrapper(JointDecoderConfig(max_text_len=8), frames=4)
+        assert wrapper.frame_time_embed is not None
+
+    def test_image_wrapper_has_no_frame_time_embed(self):
+        wrapper = _video_wrapper(JointDecoderConfig(max_text_len=8), frames=1)
+        assert wrapper.frame_time_embed is None
+
+    def test_forward_with_frame_times_keeps_shape(self):
+        wrapper = _video_wrapper(JointDecoderConfig(max_text_len=8), frames=4).to(DEVICE)
+        pixels = torch.randn(2, 4, 3, 16, 16, device=DEVICE)
+        input_ids = torch.randint(0, 256, (2, 6), device=DEVICE)
+        ft = torch.tensor([[0.0, 1.0, 2.0, 3.0], [0.0, 5.0, 10.0, 15.0]], device=DEVICE)
+        logits, _ = wrapper(pixels, input_ids, frame_times=ft)
+        assert logits.shape == (2, 6, 256)
+
+    def test_zero_init_temporal_is_identity(self):
+        # Zero-init => passing frame_times adds nothing at step 0 (warm-start).
+        wrapper = _video_wrapper(JointDecoderConfig(max_text_len=8), frames=4).to(DEVICE).eval()
+        pixels = torch.randn(1, 4, 3, 16, 16, device=DEVICE)
+        input_ids = torch.randint(0, 256, (1, 6), device=DEVICE)
+        ft = torch.tensor([[0.0, 1.0, 2.0, 3.0]], device=DEVICE)
+        with torch.no_grad():
+            l_none, _ = wrapper(pixels, input_ids)
+            l_zero, _ = wrapper(pixels, input_ids, frame_times=ft)
+        assert torch.allclose(l_none, l_zero)
+
+    def test_frame_times_change_logits_once_learned(self):
+        # After the temporal proj is nonzero, different timestamps change output.
+        wrapper = _video_wrapper(JointDecoderConfig(max_text_len=8), frames=4).to(DEVICE).eval()
+        with torch.no_grad():
+            wrapper.frame_time_embed.proj.weight.normal_(std=0.1)
+        pixels = torch.randn(1, 4, 3, 16, 16, device=DEVICE)
+        input_ids = torch.randint(0, 256, (1, 6), device=DEVICE)
+        t1 = torch.tensor([[0.0, 1.0, 2.0, 3.0]], device=DEVICE)
+        t2 = torch.tensor([[0.0, 20.0, 40.0, 60.0]], device=DEVICE)
+        with torch.no_grad():
+            l1, _ = wrapper(pixels, input_ids, frame_times=t1)
+            l2, _ = wrapper(pixels, input_ids, frame_times=t2)
+        assert not torch.allclose(l1, l2)
+
+    def test_frame_times_shape_mismatch_raises(self):
+        wrapper = _video_wrapper(JointDecoderConfig(max_text_len=8), frames=4).to(DEVICE)
+        pixels = torch.randn(2, 4, 3, 16, 16, device=DEVICE)
+        input_ids = torch.randint(0, 256, (2, 6), device=DEVICE)
+        bad = torch.zeros(2, 3, device=DEVICE)  # F=3 != frames_per_clip=4
+        with pytest.raises(ValueError, match="frame_times shape"):
+            wrapper(pixels, input_ids, frame_times=bad)
