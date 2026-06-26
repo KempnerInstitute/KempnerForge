@@ -15,6 +15,7 @@ from kempnerforge.config.optimizer import OptimizerConfig
 from kempnerforge.config.profiling import ProfilingConfig
 from kempnerforge.config.scheduler import SchedulerConfig
 from kempnerforge.config.training import TrainConfig
+from kempnerforge.config.video import VideoConfig
 from kempnerforge.config.vision import VisionEncoderConfig
 from kempnerforge.config.vlm import MoMaConfig, VLMConfig
 
@@ -51,6 +52,7 @@ class JobConfig:
     vision_encoder: VisionEncoderConfig | None = None
     adapter: AdapterConfig | None = None
     vlm: VLMConfig | None = None
+    video: VideoConfig | None = None
 
     def __post_init__(self) -> None:
         """Cross-section invariants that fire at construction time.
@@ -103,9 +105,11 @@ class JobConfig:
             # build time" sentinel) defers the check to ``build_vlm_wrapper``
             # / ``_build_vlm`` using the encoder's resolved value.
             if self.vision_encoder.num_tokens > 0:
-                residual_image_tokens = self.vlm.residual_stream_image_tokens(
-                    self.vision_encoder.num_tokens
-                )
+                assert self.adapter is not None  # materialized in __post_init__ when [vlm] set
+                per_frame = self.adapter.output_num_tokens(self.vision_encoder.num_tokens)
+                frames = self.video.max_frames if self.video is not None else 1
+                visual_tokens = frames * per_frame
+                residual_image_tokens = self.vlm.residual_stream_image_tokens(visual_tokens)
                 required = residual_image_tokens + self.vlm.max_text_len
                 if self.model.max_seq_len < required:
                     raise ValueError(
@@ -114,10 +118,21 @@ class JobConfig:
                         f"vlm.max_text_len ({self.vlm.max_text_len}) = {required}"
                     )
 
+        if self.video is not None and self.vlm is None:
+            raise ValueError(
+                "[video] is set but [vlm] is missing; video training runs through "
+                "the VLM wrapper, so a [vlm] section (and [vision_encoder]) is required."
+            )
+
     @property
     def is_vlm(self) -> bool:
         """Whether this job builds a ``VLMWrapper`` around the text backbone."""
         return self.vlm is not None
+
+    @property
+    def is_video(self) -> bool:
+        """Whether this job trains on a video dataset (a VLM sub-mode)."""
+        return self.video is not None
 
     def validate(self, world_size: int = 1) -> None:
         """Run cross-config validations that depend on the world size."""
@@ -197,9 +212,11 @@ class JobConfig:
             #     text-only).
             # num_tokens=0 is deferred to build_vlm_wrapper.
             if self.vision_encoder.num_tokens > 0:
-                residual_image_tokens = self.vlm.residual_stream_image_tokens(
-                    self.vision_encoder.num_tokens
-                )
+                assert self.adapter is not None  # materialized in __post_init__ when [vlm] set
+                per_frame = self.adapter.output_num_tokens(self.vision_encoder.num_tokens)
+                frames = self.video.max_frames if self.video is not None else 1
+                visual_tokens = frames * per_frame
+                residual_image_tokens = self.vlm.residual_stream_image_tokens(visual_tokens)
                 required = residual_image_tokens + self.vlm.max_text_len
                 if self.train.seq_len < required:
                     raise ValueError(
