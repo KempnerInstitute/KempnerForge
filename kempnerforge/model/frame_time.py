@@ -11,8 +11,10 @@ Transformer positional encodings, but over continuous seconds rather than
 integer positions), then projected to the model dimension and added to that
 frame's visual tokens. The output projection is zero-initialized so the
 temporal signal starts at zero and is learned from there — matching the
-``CrossAttention`` warm-start convention, so adding this module to an existing
-checkpoint contributes no gradient at step 0.
+``CrossAttention`` warm-start convention: at step 0 the module is a no-op on
+the model's outputs (the added embedding is zero, so logits are unchanged),
+while gradients still flow into the projection, so it begins learning from the
+first step.
 
 The frequencies are recomputed in ``forward`` on the input's device rather than
 stored in a buffer, so the module is safe to construct under
