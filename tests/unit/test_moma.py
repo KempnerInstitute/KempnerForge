@@ -192,6 +192,9 @@ class _StubAdapter(nn.Module):
         super().__init__()
         self.proj = nn.Linear(in_dim, out_dim)
 
+    def output_num_tokens(self, num_input_tokens: int) -> int:
+        return num_input_tokens  # projection stub: token count unchanged
+
     def forward(self, feats: torch.Tensor) -> torch.Tensor:
         return self.proj(feats)
 
@@ -201,6 +204,7 @@ class _StubWrapper(nn.Module):
         super().__init__()
         self.vision_encoder = _StubVisionEncoder(num_tokens, feature_dim)
         self.adapter = _StubAdapter(feature_dim, dim)
+        self.frames_per_clip = 1
 
 
 class TestMoMaStrategy:

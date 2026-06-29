@@ -153,6 +153,41 @@ Leave `moe_aux_loss_weight` at its default 0.01 — it's the
 multiplier on `aux_loss` downstream, so the effective weight on the
 balance loss is `moe_aux_loss_weight × sequence_aux_loss_weight`.
 
+## Router z-loss (logit-growth stability)
+
+Opt-in via `moe_router_z_loss_weight > 0` (default `0.0` = off). The
+ST-MoE *z-loss* penalizes the router's pre-softmax logits so they don't
+grow without bound. It is orthogonal to the balancing losses above — it
+targets *logit-growth stability*, not load balance:
+
+```python
+# kempnerforge/model/router.py — both routers, after computing logits
+self.z_loss = (torch.logsumexp(logits, dim=-1) ** 2).mean()
+```
+
+Both `SoftmaxTopKRouter` and `SigmoidTopKRouter` set it. `MoEMLP.z_loss`
+surfaces the per-layer value, and `Transformer.get_moe_router_z_loss()`
+sums it across MoE layers — mirroring `aux_loss` / `get_moe_aux_loss()`.
+The training loop adds it only when the weight is positive:
+
+```python
+# scripts/train.py
+if mc.moe_router_z_loss_weight > 0:
+    z = inner_transformer(model).get_moe_router_z_loss()
+    loss = loss + mc.moe_router_z_loss_weight * z
+```
+
+Logged as `moe/router_z_loss`. `z_loss` is a plain attribute (like
+`aux_loss`), not a buffer or parameter, so it never enters `state_dict`
+(checkpoint-safe); with the default `0.0` the term is never added, so
+training, outputs, and gradients are unchanged.
+
+**When to use**: long runs where router logits drift upward. A small
+weight such as `1e-3` keeps the summed router z-loss bounded (~2&ndash;3, vs.
+~14&rarr;24 when off) at identical LM loss — stabilizing the router at
+negligible cost. Distinct from the output-logit `z_loss_weight`
+(a cross-entropy regularizer); this one acts on the *router* logits.
+
 ## Per-expert gradient scaling
 
 Opt-in via `moe_gradient_scale = true`. Normalizes each expert's

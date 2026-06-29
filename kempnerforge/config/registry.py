@@ -186,6 +186,47 @@ class Registry:
     def list_adapters(self) -> list[str]:
         return self.list("adapter")
 
+    def register_video_dataset(self, name: str) -> Callable:
+        """Decorator to register a video-dataset builder.
+
+        Builders take ``(video_config, tokenizer_path, max_text_len)`` and return
+        a map-style ``Dataset`` whose samples ``VideoCollator`` batches (see
+        ``kempnerforge.data.video_dataset.VideoDataset``). Selected by
+        ``[video].dataset_type``.
+        """
+
+        def decorator(fn: Callable) -> Callable:
+            self.register("video_dataset", name, fn)
+            return fn
+
+        return decorator
+
+    def get_video_dataset(self, name: str) -> Callable:
+        return self.get("video_dataset", name)
+
+    def list_video_datasets(self) -> list[str]:
+        return self.list("video_dataset")
+
+    def register_sampling_policy(self, name: str) -> Callable:
+        """Decorator to register a frame-sampling policy.
+
+        Policies take ``(duration_s, fps, min_frames, max_frames)`` and return a
+        sorted list of timestamps (seconds) to sample from a clip. Selected by
+        ``[video].sampling_policy``.
+        """
+
+        def decorator(fn: Callable) -> Callable:
+            self.register("sampling_policy", name, fn)
+            return fn
+
+        return decorator
+
+    def get_sampling_policy(self, name: str) -> Callable:
+        return self.get("sampling_policy", name)
+
+    def list_sampling_policies(self) -> list[str]:
+        return self.list("sampling_policy")
+
     def register_dyn_ckpt_strategy(self, name: str) -> Callable:
         """Decorator to register a dynamic-checkpointing-window strategy.
 

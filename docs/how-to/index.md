@@ -54,6 +54,12 @@ with runnable code (or a link to a notebook, config, or script that runs it)
   — `ActivationStore`, `extract_representations()`, save to `.npz`,
   feed to probing / CKA / SVCCA.
 
+## Multimodal
+
+- [Train on video](train-on-video.md) — ingest a clip as frames through the
+  VLM path: timestamp frame sampling, the pooling connector, the `[video]`
+  config + token budget, and how all four archs consume a clip.
+
 ```{toctree}
 :maxdepth: 1
 :hidden:
@@ -72,4 +78,5 @@ data-mixing-annealing
 fp8-training
 moe-experiments
 mechanistic-interpretability
+train-on-video
 ```

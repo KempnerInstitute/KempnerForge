@@ -373,6 +373,7 @@ def _build_vlm(
     param_dtype: torch.dtype,
     compile_model: bool,
     fp8: bool,
+    frames_per_clip: int = 1,
 ) -> torch.nn.Module:
     """Build a VLM wrapper with parallelism applied in the correct order.
 
@@ -426,13 +427,16 @@ def _build_vlm(
     # extra vlm_config / num_image_tokens kwargs the VLM path needs).
     ctx = torch.device("meta") if tp_enabled else contextlib.nullcontext()
     with ctx:
-        transformer = Transformer(
-            model_config, vlm_config=vlm_config, num_image_tokens=encoder.num_tokens
-        )
         adapter = build_adapter(adapter_config, in_dim=in_dim, out_dim=model_config.dim)
+        # Pooling adapters reduce the token count; size the transformer's
+        # image-prefix split on the adapter's output, not the raw patch count.
+        visual_tokens = frames_per_clip * adapter.output_num_tokens(encoder.num_tokens)
+        transformer = Transformer(
+            model_config, vlm_config=vlm_config, num_image_tokens=visual_tokens
+        )
 
     strategy = build_modality_strategy(vlm_config)
-    wrapper = VLMWrapper(encoder, adapter, transformer, strategy)
+    wrapper = VLMWrapper(encoder, adapter, transformer, strategy, frames_per_clip=frames_per_clip)
 
     # 3. Length cross-check now that num_tokens is resolved.
     required = wrapper.num_image_tokens + vlm_config.max_text_len
@@ -505,6 +509,7 @@ def build_parallel_model(
     param_dtype: torch.dtype = torch.bfloat16,
     compile_model: bool = False,
     fp8: bool = False,
+    frames_per_clip: int = 1,
 ) -> torch.nn.Module:
     """Build a Transformer (or a VLMWrapper) with parallelism applied.
 
@@ -548,6 +553,7 @@ def build_parallel_model(
             param_dtype=param_dtype,
             compile_model=compile_model,
             fp8=fp8,
+            frames_per_clip=frames_per_clip,
         )
 
     from kempnerforge.distributed.tensor_parallel import apply_tensor_parallel
