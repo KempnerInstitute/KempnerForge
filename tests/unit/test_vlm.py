@@ -747,3 +747,23 @@ class TestVideoFrameTimes:
         with torch.no_grad():
             logits_after, _ = restored(pixels, input_ids, frame_times=ft)
         assert torch.equal(logits_before, logits_after)
+
+    def test_frame_time_embed_is_freeze_addressable(self):
+        # frame_time_embed is an injected sibling submodule (like the adapter),
+        # so a freeze spec must be able to target it — warm-start staging recipes
+        # freeze it while the LLM warms up. The base module_patterns alias makes
+        # it clear the effective_freeze typo-guard and lets apply_freeze_specs
+        # match its params.
+        from kempnerforge.config.vlm import FreezeSpec
+        from kempnerforge.training.freeze import apply_freeze_specs, effective_freeze
+
+        vlm_cfg = JointDecoderConfig(max_text_len=8)
+        wrapper = _video_wrapper(vlm_cfg, frames=4)
+        assert wrapper.frame_time_embed is not None
+        # (a) the alias clears the train.py typo-guard (pre-fix this raised).
+        valid = set(vlm_cfg.module_patterns.keys())
+        specs = effective_freeze(0, [FreezeSpec("frame_time_embed", True)], [], valid)
+        # (b) applying it actually freezes the projection params.
+        apply_freeze_specs(wrapper, specs, vlm_cfg.module_patterns)
+        assert not wrapper.frame_time_embed.proj.weight.requires_grad
+        assert not wrapper.frame_time_embed.proj.bias.requires_grad
