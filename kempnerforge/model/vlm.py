@@ -343,6 +343,15 @@ class VLMWrapper(nn.Module):
         labels: torch.Tensor | None = None,
         frame_times: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Run the VLM forward.
+
+        ``frame_times`` is ``(B, F)`` per-frame timestamps in seconds.
+        **Inference contract:** a video model (one built with a time embedding)
+        silently drops the learned temporal signal when ``frame_times`` is
+        ``None`` — no error is raised — so eval/generate paths must thread it for
+        video. ``None`` is correct only for image/text models or an untrained
+        (zero-init) time embedding.
+        """
         # Route the text embedding through Transformer.forward so FSDP2's
         # per-module hook intercepts the token_embedding call and
         # materializes the DTensor weight before F.embedding runs. Doing

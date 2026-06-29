@@ -126,6 +126,22 @@ class JobConfig:
                 "the VLM wrapper, so a [vlm] section (and [vision_encoder]) is required."
             )
 
+        # Set-but-ineffective [time_embedding] warning. The per-frame time
+        # embedding is built only for video (frames_per_clip > 1); an explicit,
+        # enabled [time_embedding] on a non-video config is silently ignored, so
+        # warn (mirrors the HF-encoder-override warning above). type="none" is
+        # an intentional disable and stays quiet.
+        if self.time_embedding is not None and self.time_embedding.enabled and self.video is None:
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "[time_embedding] is set (type=%r) but no [video] section is present; "
+                "the time embedding is built only for video (frames_per_clip > 1), so it "
+                'will be ignored. Set [time_embedding].type = "none" or remove the section '
+                "to silence this.",
+                self.time_embedding.type,
+            )
+
     @property
     def is_vlm(self) -> bool:
         """Whether this job builds a ``VLMWrapper`` around the text backbone."""

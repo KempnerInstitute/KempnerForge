@@ -206,8 +206,10 @@ class WebVidVideoDataset(VideoDataset):
         size = self._frame_size
         pixel_values = torch.zeros(f, 3, size, size, dtype=torch.float32)
         frame_mask = torch.zeros(f, dtype=torch.bool)
-        # Per-frame timestamp in seconds (0.0 for pad frames; the model reads
-        # these only where frame_mask is True, so the pad value is inert).
+        # Per-frame timestamp in seconds; 0.0 for pad frames. The time projection
+        # runs over every frame and does not consult frame_mask, so pad frames
+        # still receive a (time-0) embedding — harmless only while padded frames
+        # are themselves unmasked from attention, and inert once they are masked.
         frame_times = torch.zeros(f, dtype=torch.float32)
         n_real = min(len(frames), f)
         for i in range(n_real):

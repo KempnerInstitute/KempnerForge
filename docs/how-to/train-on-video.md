@@ -113,6 +113,14 @@ time, so it is set in the TOML, not via a `--vlm.arch=` CLI override.)
   to sequence length). Molmo2-style interleaved text time-tokens change the
   token sequence and need interleaved/variable-length sequence support KF does
   not have yet; they would hook the sequence-assembly layer, not this registry.
+- **Inference must pass `frame_times`** — a video model silently drops the
+  learned temporal signal if `frame_times` is `None` (no error is raised).
+  Training threads it automatically; eval/generate paths must pass it for video
+  models.
+- **Resuming a pre-timestamp video checkpoint** — a checkpoint trained before
+  per-frame timestamps lacks the `frame_time_embed` keys, so loading it into the
+  current (default-on) video model needs `[time_embedding].type = "none"` or a
+  warm-start key-fill.
 - **Padded frames are not yet masked from attention** — short clips pad to
   `max_frames` with blank frames; a `frame_mask` is produced but not yet
   consumed by the attention mask.
