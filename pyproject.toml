@@ -44,9 +44,9 @@ docs = [
   "sphinx-autobuild>=2024.4",
 ]
 video = [
-    # PyAV bundles FFmpeg; optional so non-video installs stay lean. Required
-    # only to decode clips (lazy-imported in kempnerforge/data/video_io.py).
-    "av>=17.1.0",
+  # PyAV bundles FFmpeg; optional so non-video installs stay lean. Required
+  # only to decode clips (lazy-imported in kempnerforge/data/video_io.py).
+  "av>=17.1.0",
 ]
 
 [build-system]
