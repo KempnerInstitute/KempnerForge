@@ -75,6 +75,7 @@ from tqdm import tqdm
 from kempnerforge.config.job import JobConfig
 from kempnerforge.config.loader import load_config
 from kempnerforge.config.video import VideoConfig
+from kempnerforge.config.vlm import VLMConfig
 from kempnerforge.data.video_io import decode_video_frames
 from kempnerforge.data.vlm_dataset import (
     DEFAULT_IMAGE_MEAN,
@@ -90,9 +91,6 @@ from kempnerforge.model.vlm import VLMWrapper, build_vlm_wrapper
 from kempnerforge.resilience.elastic import resolve_resume_path
 
 logger = get_logger(__name__)
-
-# Arches whose routing cannot autoregressively generate.
-UNSUPPORTED_GEN_ARCHS = frozenset({"moma"})
 
 DEFAULT_MAX_NEW_TOKENS = 128
 
@@ -165,14 +163,14 @@ def _load_config(config_path: str) -> JobConfig:
     return config
 
 
-def _check_generative_arch(arch: str) -> None:
+def _check_generative(vlm_config: VLMConfig) -> None:
     """Fail fast (before building) on arches that cannot autoregressively generate."""
-    if arch in UNSUPPORTED_GEN_ARCHS:
+    if not vlm_config.is_generative:
         raise ValueError(
-            f"VLM arch {arch!r} cannot be evaluated: its routing is non-causal and cannot "
-            f"autoregressively generate, but chat tasks are generation-only. Supported arches: "
-            f"joint_decoder, cross_attention, mot. Generation support for {arch!r} is a tracked "
-            f"model-side follow-up — contact the project owner."
+            f"VLM arch {vlm_config.arch!r} cannot be evaluated: its routing is non-causal "
+            f"and cannot autoregressively generate, but chat tasks are generation-only. "
+            f"Generation support for {vlm_config.arch!r} is a tracked model-side follow-up "
+            f"— contact the project owner."
         )
 
 
@@ -525,7 +523,7 @@ class KempnerForgeVLM(lmms):
         assert self._config.vlm is not None  # guaranteed by is_vlm; narrows for the type checker
         self._arch = self._config.vlm.arch
         # Fail fast on non-generative arches before building/loading the model.
-        _check_generative_arch(self._arch)
+        _check_generative(self._config.vlm)
 
         # Video vs image mode is a property of the checkpoint's config. A video
         # checkpoint ([video] config) fixes frames_per_clip and resizes frames to

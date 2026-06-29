@@ -18,8 +18,10 @@ from lmms_eval.protocol import ChatMessages
 from PIL import Image
 
 from kempnerforge.config.data import DataConfig
-from kempnerforge.config.schema import JobConfig
+from kempnerforge.config.registry import registry
+from kempnerforge.config.schema import AdapterConfig, JobConfig, ModelConfig, VisionEncoderConfig
 from kempnerforge.config.video import VideoConfig
+from kempnerforge.config.vlm import VLMConfig
 from kempnerforge.data.vlm_dataset import (
     DEFAULT_IMAGE_MEAN,
     DEFAULT_IMAGE_STD,
@@ -28,7 +30,7 @@ from kempnerforge.data.vlm_dataset import (
 from kempnerforge.eval.vlm.adapter import (
     KempnerForgeVLM,
     _build_model,
-    _check_generative_arch,
+    _check_generative,
     _first_stop,
     _frames_to_pixel_values,
     _generate_batch,
@@ -39,8 +41,44 @@ from kempnerforge.eval.vlm.adapter import (
     _resolve_dtype,
     _resolve_gen_kwargs,
 )
+from kempnerforge.model.vlm import VLMWrapper, build_vlm_wrapper
 
 DEVICE = torch.device("cpu")
+
+
+# Arch coverage is DERIVED from the registry + the is_generative property (not a
+# hardcoded list) so new arches are swept automatically: generative arches get the
+# decode/generate sweeps, non-generative ones get the rejection guard. The single
+# explicit per-arch truth lives in tests/unit/test_vlm_config.py::TestIsGenerative.
+_ALL_VLM_ARCHS = tuple(sorted(registry.list_vlm_configs()))
+GENERATIVE_ARCHES = tuple(a for a in _ALL_VLM_ARCHS if VLMConfig.for_arch(a).is_generative)
+NON_GENERATIVE_ARCHES = tuple(a for a in _ALL_VLM_ARCHS if not VLMConfig.for_arch(a).is_generative)
+
+# Per-arch BUILD sizing for a tiny CPU wrapper (sizing only, NOT generativity policy):
+# CA needs a cross-attention cadence that fits the tiny layer count. Arches without an
+# entry build from defaults; a future arch needing knobs fails the build loudly here.
+_ARCH_BUILD_KWARGS = {"cross_attention": {"cross_attention_every_n_layers": 2}}
+
+
+def _vlm_wrapper(arch: str) -> VLMWrapper:
+    """Build a tiny CPU ``VLMWrapper`` for a generative arch (no checkpoint).
+
+    Uniform ``n_layers=4`` (so CA has at least one cross-attention block) and
+    ``ffn_hidden_dim=128`` (so MoT's per-modality FFN stays tiny) are valid for every
+    arch; ``num_image_tokens`` (8) + ``max_text_len`` (32) fits ``max_seq_len`` (64).
+    """
+    mc = ModelConfig(
+        dim=64, n_layers=4, n_heads=4, vocab_size=256, max_seq_len=64, ffn_hidden_dim=128
+    )
+    vc = VisionEncoderConfig(type="random", feature_dim=96, num_tokens=8)
+    lc = VLMConfig.for_arch(arch, max_text_len=32, **_ARCH_BUILD_KWARGS.get(arch, {}))
+    return build_vlm_wrapper(mc, vc, AdapterConfig(), lc).eval()
+
+
+@pytest.fixture
+def arch_wrapper(arch):
+    """A tiny per-arch ``VLMWrapper``; ``arch`` is provided by ``@pytest.mark.parametrize``."""
+    return _vlm_wrapper(arch)
 
 
 class _MockTokenizer:
@@ -303,28 +341,29 @@ def _pixels(batch: int = 1) -> torch.Tensor:
     return torch.randn(batch, 3, 16, 16)
 
 
+@pytest.mark.parametrize("arch", GENERATIVE_ARCHES)
 class TestGenerateBatchSingle:
-    """B == 1 must reproduce the v1 single-request behavior."""
+    """B == 1 must reproduce the v1 single-request behavior (every generative arch)."""
 
     def _prompt(self) -> list[torch.Tensor]:
         return [torch.tensor([5, 9, 12, 3], dtype=torch.long)]
 
-    def test_greedy_is_deterministic(self, tiny_vlm_wrapper):
+    def test_greedy_is_deterministic(self, arch_wrapper):
         pv, pid = _pixels(), self._prompt()
         r = _resolve_gen_kwargs({"max_new_tokens": 6}, 128)
-        out1 = _generate_batch(tiny_vlm_wrapper, _MockTokenizer(), pv, pid, r, 64)
-        out2 = _generate_batch(tiny_vlm_wrapper, _MockTokenizer(), pv, pid, r, 64)
+        out1 = _generate_batch(arch_wrapper, _MockTokenizer(), pv, pid, r, 64)
+        out2 = _generate_batch(arch_wrapper, _MockTokenizer(), pv, pid, r, 64)
         assert out1 == out2 and len(out1) == 1 and isinstance(out1[0], str)
 
-    def test_respects_max_new_tokens(self, tiny_vlm_wrapper):
+    def test_respects_max_new_tokens(self, arch_wrapper):
         r = _resolve_gen_kwargs({"max_new_tokens": 6}, 128)
-        out = _generate_batch(tiny_vlm_wrapper, _MockTokenizer(), _pixels(), self._prompt(), r, 64)
+        out = _generate_batch(arch_wrapper, _MockTokenizer(), _pixels(), self._prompt(), r, 64)
         assert len(out[0].split()) == 6
 
-    def test_until_trims_continuation(self, tiny_vlm_wrapper):
+    def test_until_trims_continuation(self, arch_wrapper):
         pv, pid = _pixels(), self._prompt()
         one = _generate_batch(
-            tiny_vlm_wrapper,
+            arch_wrapper,
             _MockTokenizer(),
             pv,
             pid,
@@ -334,7 +373,7 @@ class TestGenerateBatchSingle:
         # decode = space-joined ids, so the first space follows the first token:
         # until=[" "] trims to exactly the first generated token.
         trimmed = _generate_batch(
-            tiny_vlm_wrapper,
+            arch_wrapper,
             _MockTokenizer(),
             pv,
             pid,
@@ -343,10 +382,10 @@ class TestGenerateBatchSingle:
         )[0]
         assert trimmed == one and " " not in trimmed
 
-    def test_eos_stops_generation(self, tiny_vlm_wrapper):
+    def test_eos_stops_generation(self, arch_wrapper):
         pv, pid = _pixels(), self._prompt()
         first = _generate_batch(
-            tiny_vlm_wrapper,
+            arch_wrapper,
             _MockTokenizer(),
             pv,
             pid,
@@ -354,7 +393,7 @@ class TestGenerateBatchSingle:
             64,
         )[0]
         out = _generate_batch(
-            tiny_vlm_wrapper,
+            arch_wrapper,
             _MockTokenizer(eos_token_id=int(first)),
             pv,
             pid,
@@ -363,26 +402,31 @@ class TestGenerateBatchSingle:
         )
         assert out == [""]
 
-    def test_length_bound_raises_when_no_room(self, tiny_vlm_wrapper):
+    def test_length_bound_raises_when_no_room(self, arch_wrapper):
         r = _resolve_gen_kwargs({"max_new_tokens": 100}, 128)
         with pytest.raises(ValueError, match="max_new_tokens"):
-            _generate_batch(tiny_vlm_wrapper, _MockTokenizer(), _pixels(), self._prompt(), r, 64)
+            _generate_batch(arch_wrapper, _MockTokenizer(), _pixels(), self._prompt(), r, 64)
 
-    def test_overlong_prompt_is_left_truncated(self, tiny_vlm_wrapper, monkeypatch):
+    def test_overlong_prompt_is_left_truncated(self, arch_wrapper, monkeypatch):
         """A prompt that exceeds the budget (but leaves room) is left-truncated with a warning."""
         rec = _RecordingLogger()
         monkeypatch.setattr("kempnerforge.eval.vlm.adapter.logger", rec)
-        # budget = max_seq_len(64) - image_tokens(8) - max_new_tokens(2) = 54; 60 > 54.
-        long_prompt = [torch.arange(1, 61, dtype=torch.long)]
-        r = _resolve_gen_kwargs({"max_new_tokens": 2}, 128)
-        out = _generate_batch(tiny_vlm_wrapper, _MockTokenizer(), _pixels(), long_prompt, r, 64)
+        # Size the prompt from the wrapper's own num_image_tokens (0 for CA, 8 for JD/MoT)
+        # so it overflows the budget by 6 on every arch — no hardcoded image-token count.
+        # budget = max_seq_len(64) - num_image_tokens - max_new_tokens(2).
+        max_new = 2
+        budget = 64 - arch_wrapper.num_image_tokens - max_new
+        long_prompt = [torch.arange(1, budget + 7, dtype=torch.long)]
+        r = _resolve_gen_kwargs({"max_new_tokens": max_new}, 128)
+        out = _generate_batch(arch_wrapper, _MockTokenizer(), _pixels(), long_prompt, r, 64)
         assert len(out) == 1 and len(out[0].split()) == 2
         assert any("left-truncating" in m for m in rec.warnings)
 
 
+@pytest.mark.parametrize("arch", GENERATIVE_ARCHES)
 class TestGenerateBatchMulti:
     """B > 1: right-padding must not change any row's result, and stop
-    conditions must be tracked per row."""
+    conditions must be tracked per row (every generative arch)."""
 
     def _prompts(self) -> list[torch.Tensor]:
         # Deliberately different lengths so right-padding is exercised.
@@ -392,34 +436,32 @@ class TestGenerateBatchMulti:
             torch.tensor([1, 4, 8, 11, 20, 6], dtype=torch.long),
         ]
 
-    def test_batch_equals_sequential(self, tiny_vlm_wrapper):
+    def test_batch_equals_sequential(self, arch_wrapper):
         """Key correctness gate: a right-padded batch yields the same per-row
         continuation as decoding each request alone (greedy, float32)."""
         prompts = self._prompts()
         pv = _pixels(len(prompts))  # (3, 3, 16, 16) — one image per request
         r = _resolve_gen_kwargs({"max_new_tokens": 5}, 128)
         sequential = [
-            _generate_batch(tiny_vlm_wrapper, _MockTokenizer(), pv[i : i + 1], [prompts[i]], r, 64)[
-                0
-            ]
+            _generate_batch(arch_wrapper, _MockTokenizer(), pv[i : i + 1], [prompts[i]], r, 64)[0]
             for i in range(len(prompts))
         ]
-        batched = _generate_batch(tiny_vlm_wrapper, _MockTokenizer(), pv, prompts, r, 64)
+        batched = _generate_batch(arch_wrapper, _MockTokenizer(), pv, prompts, r, 64)
         assert batched == sequential
 
-    def test_per_row_max_new_tokens(self, tiny_vlm_wrapper):
+    def test_per_row_max_new_tokens(self, arch_wrapper):
         prompts = self._prompts()
         pv = _pixels(len(prompts))
         r = _resolve_gen_kwargs({"max_new_tokens": 4}, 128)
-        outs = _generate_batch(tiny_vlm_wrapper, _MockTokenizer(), pv, prompts, r, 64)
+        outs = _generate_batch(arch_wrapper, _MockTokenizer(), pv, prompts, r, 64)
         assert len(outs) == 3 and all(len(o.split()) == 4 for o in outs)
 
-    def test_per_row_eos_independent(self, tiny_vlm_wrapper):
+    def test_per_row_eos_independent(self, arch_wrapper):
         """EOS on one row stops only that row; the batch still returns all rows."""
         prompts = self._prompts()
         pv = _pixels(len(prompts))
         first0 = _generate_batch(
-            tiny_vlm_wrapper,
+            arch_wrapper,
             _MockTokenizer(),
             pv[:1],
             [prompts[0]],
@@ -427,7 +469,7 @@ class TestGenerateBatchMulti:
             64,
         )[0]
         outs = _generate_batch(
-            tiny_vlm_wrapper,
+            arch_wrapper,
             _MockTokenizer(eos_token_id=int(first0)),
             pv,
             prompts,
@@ -443,13 +485,14 @@ class TestGenerateBatchMulti:
 
 
 class TestGuards:
-    def test_moma_arch_rejected(self):
+    @pytest.mark.parametrize("arch", NON_GENERATIVE_ARCHES)
+    def test_non_generative_arches_rejected(self, arch):
         with pytest.raises(ValueError, match="non-causal"):
-            _check_generative_arch("moma")
+            _check_generative(VLMConfig.for_arch(arch))
 
-    @pytest.mark.parametrize("arch", ["joint_decoder", "cross_attention", "mot"])
+    @pytest.mark.parametrize("arch", GENERATIVE_ARCHES)
     def test_generative_arches_allowed(self, arch):
-        _check_generative_arch(arch)  # must not raise
+        _check_generative(VLMConfig.for_arch(arch))  # must not raise
 
     def test_loglikelihood_not_implemented(self):
         inst = KempnerForgeVLM.__new__(KempnerForgeVLM)  # bypass __init__ (no checkpoint needed)
@@ -470,12 +513,13 @@ class TestGuards:
 
 def _vlm_job_config(tiny_vlm_configs, arch: str | None = None) -> JobConfig:
     mc, vc, ac, lc = tiny_vlm_configs
-    job = JobConfig(
+    if arch is not None:
+        # Build the real arch subclass (not a base VLMConfig with a mutated
+        # .arch) so per-arch config policy like is_generative is exercised.
+        lc = VLMConfig.for_arch(arch, max_text_len=lc.max_text_len)
+    return JobConfig(
         model=mc, vision_encoder=vc, adapter=ac, vlm=lc, data=DataConfig(tokenizer_path="mock")
     )
-    if arch is not None:
-        job.vlm.arch = arch
-    return job
 
 
 def _video_job_config(tiny_video_configs) -> JobConfig:
@@ -607,8 +651,9 @@ class TestLoadWeights:
 
 
 class TestInitGuards:
-    def test_moma_fails_fast_before_load(self, monkeypatch, tiny_vlm_configs):
-        job = _vlm_job_config(tiny_vlm_configs, arch="moma")
+    @pytest.mark.parametrize("arch", NON_GENERATIVE_ARCHES)
+    def test_non_generative_fails_fast_before_load(self, monkeypatch, tiny_vlm_configs, arch):
+        job = _vlm_job_config(tiny_vlm_configs, arch=arch)
         monkeypatch.setattr("kempnerforge.eval.vlm.adapter._load_config", lambda _p: job)
 
         def _must_not_load(*args, **kwargs):
@@ -625,13 +670,14 @@ class TestInitGuards:
         KempnerForgeVLM(config="x", checkpoint="y", device="cpu", dtype="float32", bogus=1)
         assert any("bogus" in m for m in rec.warnings)
 
-    def test_init_populates_attrs(self, monkeypatch, tiny_vlm_configs, tiny_vlm_wrapper):
-        job = _vlm_job_config(tiny_vlm_configs)
-        _patch_loaders(monkeypatch, job, tiny_vlm_wrapper)
+    @pytest.mark.parametrize("arch", GENERATIVE_ARCHES)
+    def test_init_populates_attrs(self, monkeypatch, tiny_vlm_configs, arch):
+        job = _vlm_job_config(tiny_vlm_configs, arch=arch)
+        _patch_loaders(monkeypatch, job, _vlm_wrapper(arch))
         vlm = KempnerForgeVLM(
             config="x", checkpoint="y", device="cpu", dtype="float32", batch_size=2
         )
-        assert vlm._arch == "joint_decoder"
+        assert vlm._arch == arch
         assert vlm._max_seq_len == job.model.max_seq_len
         assert vlm._batch_size == 2
         assert vlm._dtype == torch.float32
@@ -664,8 +710,11 @@ class TestBuildModel:
 
 
 class TestGenerateUntil:
-    def test_batches_and_restores_order(self, monkeypatch, tiny_vlm_configs, tiny_vlm_wrapper):
-        _patch_loaders(monkeypatch, _vlm_job_config(tiny_vlm_configs), tiny_vlm_wrapper)
+    @pytest.mark.parametrize("arch", GENERATIVE_ARCHES)
+    def test_batches_and_restores_order(self, monkeypatch, tiny_vlm_configs, arch):
+        _patch_loaders(
+            monkeypatch, _vlm_job_config(tiny_vlm_configs, arch=arch), _vlm_wrapper(arch)
+        )
         vlm = KempnerForgeVLM(
             config="x", checkpoint="y", device="cpu", dtype="float32", batch_size=2
         )

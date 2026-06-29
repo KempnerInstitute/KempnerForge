@@ -156,6 +156,18 @@ class VLMConfig:
         """
         return num_tokens
 
+    @property
+    def is_generative(self) -> bool:
+        """Whether this arch can autoregressively generate token-by-token.
+
+        Generation-only consumers (e.g. the lmms-eval chat adapter in
+        ``kempnerforge/eval/vlm``) query this to fail fast on arches that
+        cannot decode autoregressively. Defaults to ``True`` (the common
+        case); a non-causal arch overrides it to ``False`` (see
+        ``MoMaConfig``).
+        """
+        return True
+
     @classmethod
     def for_arch(cls, arch: str, **kwargs: Any) -> VLMConfig:
         """Resolve ``arch`` to a registered subclass and instantiate.
@@ -465,6 +477,12 @@ class MoMaConfig(VLMConfig):
         (same residual-stream layout as Joint-Decoder).
         """
         return num_tokens
+
+    @property
+    def is_generative(self) -> bool:
+        # Expert-choice routing is non-causal (see the class docstring), so MoMa
+        # cannot autoregressively generate; generation-only consumers reject it.
+        return False
 
     def effective_capacity_factor(self, modality: str) -> float:
         """Resolve the per-expert capacity factor for ``modality``.
