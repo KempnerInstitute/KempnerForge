@@ -718,3 +718,32 @@ class TestVideoFrameTimes:
             time_embedding_config=TimeEmbeddingConfig(type="none"),
         )
         assert wrapper.frame_time_embed is None
+
+    def test_frame_time_embed_state_dict_round_trips(self):
+        # The default-on time embedding adds frame_time_embed.proj.* keys to
+        # every video checkpoint; pin that they serialize and reload with a
+        # bit-equal forward (the per-arch state_dict round-trip invariant,
+        # extended to the video model). Move the projection off zero-init first
+        # so the round-trip is not trivially comparing zeros.
+        wrapper = _video_wrapper(JointDecoderConfig(max_text_len=8), frames=4).to(DEVICE).eval()
+        with torch.no_grad():
+            wrapper.frame_time_embed.proj.weight.normal_(std=0.1)
+            wrapper.frame_time_embed.proj.bias.normal_(std=0.1)
+        pixels = torch.randn(1, 4, 3, 16, 16, device=DEVICE)
+        input_ids = torch.randint(0, 256, (1, 6), device=DEVICE)
+        ft = torch.tensor([[0.0, 1.0, 2.0, 3.0]], device=DEVICE)
+        with torch.no_grad():
+            logits_before, _ = wrapper(pixels, input_ids, frame_times=ft)
+
+        state = wrapper.state_dict()
+        assert "frame_time_embed.proj.weight" in state
+        assert "frame_time_embed.proj.bias" in state
+
+        restored = _video_wrapper(JointDecoderConfig(max_text_len=8), frames=4).to(DEVICE).eval()
+        restored.load_state_dict(state)
+        assert torch.equal(
+            restored.frame_time_embed.proj.weight, wrapper.frame_time_embed.proj.weight
+        )
+        with torch.no_grad():
+            logits_after, _ = restored(pixels, input_ids, frame_times=ft)
+        assert torch.equal(logits_before, logits_after)
