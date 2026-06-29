@@ -13,7 +13,7 @@ benchmark (MMMU, MMBench, ScienceQA, SEED, AI2D, …) by integrating the
 A custom lmms-eval *chat model* loads `VLMWrapper` directly from the DCP checkpoint. The pieces are:
 [`kempnerforge/eval/vlm/adapter.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/eval/vlm/adapter.py)
 (the `KempnerForgeVLM` adapter),
-[`kempnerforge/eval/vlm/registry.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/eval/vlm/registry.py)
+[`kempnerforge/eval/vlm/manifest.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/eval/vlm/manifest.py)
 (the lmms-eval registration manifest), and
 [`scripts/vlm_eval_harness.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/scripts/vlm_eval_harness.py)
 (the CLI).

@@ -1,7 +1,7 @@
 """Hermetic fake ``lmms_eval`` for the VLM-eval unit tests.
 
 ``lmms-eval`` is an optional, undeclared dependency, so
-``adapter.py``/``registry.py`` cannot be imported without it and these tests would skip in
+``adapter.py``/``manifest.py`` cannot be imported without it and these tests would skip in
 CI (no coverage). This conftest installs a faithful in-repo fake (``_fake_lmms_eval``) into
 ``sys.modules`` at import time so the tests always run and exercise our code. The fake is
 installed unconditionally (hermetic): unit-test behavior is identical with or without real
@@ -22,12 +22,12 @@ import pytest
 
 from . import _fake_lmms_eval
 
-_ADAPTER_MODULES = ("kempnerforge.eval.vlm.adapter", "kempnerforge.eval.vlm.registry")
+_ADAPTER_MODULES = ("kempnerforge.eval.vlm.adapter", "kempnerforge.eval.vlm.manifest")
 _FAKE_MODULES = _fake_lmms_eval.build_modules()
 _MANAGED = (*_FAKE_MODULES.keys(), *_ADAPTER_MODULES)
 _SAVED = {name: sys.modules.get(name) for name in _MANAGED}
 
-# Install the fakes and evict any real-bound adapter/registry so they re-import against the
+# Install the fakes and evict any real-bound adapter/manifest so they re-import against the
 # fakes when the test modules import them.
 sys.modules.update(_FAKE_MODULES)
 for _name in _ADAPTER_MODULES:

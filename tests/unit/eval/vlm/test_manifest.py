@@ -1,7 +1,7 @@
 """CPU unit test for the lmms-eval registration manifest.
 
 Runs against the fake ``lmms_eval`` injected by ``conftest.py`` (lmms-eval is an optional,
-undeclared dependency), so it executes in CI and covers ``registry.py``. Real entry-point
+undeclared dependency), so it executes in CI and covers ``manifest.py``. Real entry-point
 resolution against the installed package is verified by the gated integration test.
 """
 
@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from lmms_eval.models.registry_v2 import ModelManifest
 
-from kempnerforge.eval.vlm.registry import MANIFEST
+from kempnerforge.eval.vlm.manifest import MANIFEST
 
 
 def test_manifest_is_well_formed():

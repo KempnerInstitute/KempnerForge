@@ -1,7 +1,7 @@
 """Dependency-free fakes for the ``lmms_eval`` API surface the VLM adapter uses.
 
 ``lmms-eval`` is an optional, *undeclared* dependency, so
-``kempnerforge.eval.vlm.adapter`` / ``registry`` import it at module top and cannot be
+``kempnerforge.eval.vlm.adapter`` / ``manifest`` import it at module top and cannot be
 imported without it. ``conftest.py`` injects these fakes into ``sys.modules`` so the unit
 tests run (and contribute coverage) in CI, where ``lmms-eval`` is absent. The fakes
 reproduce ONLY the behavior the adapter relies on; their fidelity to the real package is
