@@ -81,6 +81,35 @@ def test_moma_finegrained_experts():
     assert expert.gate_proj.weight.shape[0] == cfg.computed_ffn_hidden_dim // 2
 
 
+def test_moma_ffn_excludes_padded_from_routing():
+    """key_padding_mask drops padded positions from expert-choice routing: they
+    get zero FFN output, and real tokens' outputs don't depend on padded tokens'
+    content (no capacity competition)."""
+    torch.manual_seed(0)
+    cfg = ModelConfig(dim=32, n_layers=2, n_heads=4, vocab_size=128, max_seq_len=64)
+    ffn = MoMaFFN(
+        cfg,
+        modalities=("image", "text"),
+        experts_per_modality={"image": 2, "text": 2},
+        capacity_factor_per_modality={"image": 1.0, "text": 1.0},
+        gumbel_noise=False,  # deterministic routing for the comparison
+    )
+    # positions 0..3 image, 4..7 text; mark image positions 2,3 as padded.
+    modality_ids = torch.tensor([[0, 0, 0, 0, 1, 1, 1, 1]])
+    kpm = torch.tensor([[True, True, False, False, True, True, True, True]])
+    x = torch.randn(1, 8, cfg.dim)
+    out = ffn(x, modality_ids, key_padding_mask=kpm)
+    # Padded image positions are excluded from routing -> zero FFN output.
+    assert torch.count_nonzero(out[0, 2]) == 0
+    assert torch.count_nonzero(out[0, 3]) == 0
+    # Real tokens' outputs are invariant to the padded tokens' content.
+    x2 = x.clone()
+    x2[0, 2:4] = torch.randn(2, cfg.dim)
+    out2 = ffn(x2, modality_ids, key_padding_mask=kpm)
+    real = [0, 1, 4, 5, 6, 7]
+    assert torch.equal(out[0, real], out2[0, real])
+
+
 # ---------------------------------------------------------------------------
 # MoMaConfig
 # ---------------------------------------------------------------------------

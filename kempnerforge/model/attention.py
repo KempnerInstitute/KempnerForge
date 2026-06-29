@@ -121,6 +121,7 @@ class Attention(nn.Module):
         *,
         kv_cache: KVCache | None = None,
         doc_ids: torch.Tensor | None = None,
+        key_padding_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Forward pass.
 
@@ -132,6 +133,11 @@ class Attention(nn.Module):
             doc_ids: Optional per-token document IDs for packed sequences,
                 shape (batch, seq_len). When provided, constructs a block-diagonal
                 causal mask so tokens only attend within their document.
+            key_padding_mask: Optional per-key validity mask, shape
+                (batch, seq_len); ``True`` = attend, ``False`` = drop (e.g. the
+                visual tokens of padded video frames). Combined with the causal
+                (and doc) mask; fully-masked query rows are unmasked to keep
+                softmax finite.
 
         Returns:
             Output tensor of shape (batch, seq_len, dim).
@@ -177,14 +183,26 @@ class Attention(nn.Module):
         #    restrict attention to only the first key position).
         if self.capture_attention_weights:
             # Manual attention for weight extraction (analysis only, not for training)
-            out, attn_weights = self._attention_with_weights(q, k, v, seq_len, doc_ids, kv_cache)
+            out, attn_weights = self._attention_with_weights(
+                q, k, v, seq_len, doc_ids, kv_cache, key_padding_mask
+            )
             self.last_attention_weights = attn_weights.detach().cpu()
-        elif doc_ids is not None:
+        elif doc_ids is not None or key_padding_mask is not None:
             seq_len_kv = k.shape[2]
-            # Block-diagonal mask: same-document AND causal
-            doc_mask = doc_ids.unsqueeze(2) == doc_ids.unsqueeze(1)  # (B, S, S)
+            # Explicit bool mask: causal, AND same-document (doc_ids), AND valid
+            # keys (key_padding_mask, e.g. dropping padded video frames' tokens).
             causal = torch.ones(seq_len, seq_len_kv, dtype=torch.bool, device=q.device).tril()
-            attn_mask = (doc_mask & causal).unsqueeze(1)  # (B, 1, S, S)
+            attn_mask = causal.unsqueeze(0).unsqueeze(0)  # (1, 1, S, S_kv)
+            if doc_ids is not None:
+                doc_mask = (doc_ids.unsqueeze(2) == doc_ids.unsqueeze(1)).unsqueeze(1)  # (B,1,S,S)
+                attn_mask = attn_mask & doc_mask
+            if key_padding_mask is not None:
+                attn_mask = attn_mask & key_padding_mask.view(batch, 1, 1, seq_len_kv)
+            # NaN guard: a query row with no reachable valid key (e.g. the leading
+            # positions of an all-padded / undecodable clip) would softmax over all
+            # -inf -> NaN. Unmask such rows; their outputs are discarded (trimmed by
+            # output_slice, or the clip's labels are all -100).
+            attn_mask = attn_mask | ~attn_mask.any(dim=-1, keepdim=True)
             with self._sdpa_context():
                 out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         else:
@@ -205,6 +223,7 @@ class Attention(nn.Module):
         seq_len: int,
         doc_ids: torch.Tensor | None,
         kv_cache: KVCache | None,
+        key_padding_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute attention output and weights manually (for analysis).
 
@@ -221,11 +240,15 @@ class Attention(nn.Module):
         attn = torch.matmul(q, k.transpose(-2, -1)) * scale
 
         seq_len_kv = k.shape[2]
-        if doc_ids is not None:
-            doc_mask = doc_ids.unsqueeze(2) == doc_ids.unsqueeze(1)
+        if doc_ids is not None or key_padding_mask is not None:
             causal = torch.ones(seq_len, seq_len_kv, dtype=torch.bool, device=q.device).tril()
-            mask = ~(doc_mask & causal).unsqueeze(1)
-            attn = attn.masked_fill(mask, float("-inf"))
+            valid = causal.unsqueeze(0).unsqueeze(0)  # (1, 1, S, S_kv)
+            if doc_ids is not None:
+                valid = valid & (doc_ids.unsqueeze(2) == doc_ids.unsqueeze(1)).unsqueeze(1)
+            if key_padding_mask is not None:
+                valid = valid & key_padding_mask.view(q.shape[0], 1, 1, seq_len_kv)
+            valid = valid | ~valid.any(dim=-1, keepdim=True)  # NaN guard (see forward)
+            attn = attn.masked_fill(~valid, float("-inf"))
         elif kv_cache is None or seq_len > 1:
             causal = torch.ones(seq_len, seq_len_kv, dtype=torch.bool, device=q.device).triu(
                 diagonal=1
