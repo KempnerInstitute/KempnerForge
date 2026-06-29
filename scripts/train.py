@@ -1042,10 +1042,10 @@ def main() -> None:
             break
 
         # Clean-completion marker for the unconditional final save after the
-        # loop. Reached only on the iteration that hits max_steps with no
-        # break, so it is never set after a NaN/NCCL/shutdown break and never
-        # on a zero-iteration resume — guaranteeing ckpt_extra is bound when
-        # the final save runs.
+        # loop. Only reached when training completes without any errors, e.g.,
+        # no NaN/NCCl/shutdown breaks. If a run encounters a NaN, the last step
+        # is intentionally *not* saved because the actual model state would be
+        # `max_steps` - 1, not `max_steps`.
         if step >= tc.max_steps:
             completed_normally = True
 
