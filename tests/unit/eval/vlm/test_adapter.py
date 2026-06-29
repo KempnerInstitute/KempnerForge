@@ -19,6 +19,7 @@ from PIL import Image
 
 from kempnerforge.config.data import DataConfig
 from kempnerforge.config.schema import JobConfig
+from kempnerforge.config.video import VideoConfig
 from kempnerforge.data.vlm_dataset import (
     DEFAULT_IMAGE_MEAN,
     DEFAULT_IMAGE_STD,
@@ -26,6 +27,7 @@ from kempnerforge.data.vlm_dataset import (
 )
 from kempnerforge.eval.vlm.adapter import (
     KempnerForgeVLM,
+    _build_model,
     _check_generative_arch,
     _first_stop,
     _frames_to_pixel_values,
@@ -84,6 +86,10 @@ def _image(img: object) -> dict:
     return {"type": "image", "url": img}
 
 
+def _video(url: object) -> dict:
+    return {"type": "video", "url": url}
+
+
 def _chat(content: list[dict], role: str = "user") -> ChatMessages:
     return ChatMessages(messages=[{"role": role, "content": content}])
 
@@ -100,29 +106,29 @@ def _img(size: int = 8) -> Image.Image:
 class TestRenderRequest:
     def test_flattens_text_blocks_in_order(self):
         messages = _chat([_text("Question:"), _image(_img()), _text("What color?")])
-        images, prompt = _render_request(messages)
+        images, prompt = _render_request(messages, None)
         assert len(images) == 1
         assert prompt == "Question:\nWhat color?"
 
     def test_video_content_raises(self):
         messages = _chat([_text("describe"), {"type": "video", "url": "clip.mp4"}])
         with pytest.raises(NotImplementedError, match="[Vv]ideo"):
-            _render_request(messages)
+            _render_request(messages, None)
 
     def test_audio_content_raises(self):
         messages = _chat([_text("listen"), {"type": "audio", "url": "a.wav"}])
         with pytest.raises(NotImplementedError, match="[Aa]udio"):
-            _render_request(messages)
+            _render_request(messages, None)
 
     def test_multi_image_raises(self):
         messages = _chat([_text("compare"), _image(_img()), _image(_img())])
         with pytest.raises(NotImplementedError, match="one image"):
-            _render_request(messages)
+            _render_request(messages, None)
 
     def test_no_image_raises(self):
         messages = _chat([_text("text only question")])
         with pytest.raises(NotImplementedError, match="one image"):
-            _render_request(messages)
+            _render_request(messages, None)
 
     def test_multi_turn_assistant_raises(self):
         messages = ChatMessages(
@@ -133,7 +139,88 @@ class TestRenderRequest:
             ]
         )
         with pytest.raises(NotImplementedError, match="[Mm]ulti-turn"):
-            _render_request(messages)
+            _render_request(messages, None)
+
+
+class TestRenderRequestVideo:
+    """Video-checkpoint rendering (``video_config`` is not None). Decode is stubbed."""
+
+    @pytest.fixture
+    def vcfg(self) -> VideoConfig:
+        return VideoConfig(max_frames=4, min_frames=1, frame_size=16)
+
+    def test_video_decoded_to_frames(self, monkeypatch, vcfg):
+        frames = [_img(), _img(), _img()]
+        monkeypatch.setattr(
+            "kempnerforge.eval.vlm.adapter.decode_video_frames", lambda path, **kw: frames
+        )
+        out_frames, prompt = _render_request(_chat([_text("describe"), _video("clip.mp4")]), vcfg)
+        assert out_frames is frames
+        assert prompt == "describe"
+
+    def test_decode_uses_config_policy(self, monkeypatch, vcfg):
+        captured: dict = {}
+
+        def _fake(path, **kw):
+            captured["path"] = path
+            captured.update(kw)
+            return [_img()]
+
+        monkeypatch.setattr("kempnerforge.eval.vlm.adapter.decode_video_frames", _fake)
+        _render_request(_chat([_video("c.mp4")]), vcfg)
+        assert captured["path"] == "c.mp4"
+        assert captured["fps"] == vcfg.fps
+        assert captured["min_frames"] == vcfg.min_frames
+        assert captured["max_frames"] == vcfg.max_frames
+        assert captured["sampling_policy"] == vcfg.sampling_policy
+
+    def test_multiple_videos_raise(self, vcfg):
+        with pytest.raises(NotImplementedError, match="[Mm]ultiple videos"):
+            _render_request(_chat([_video("a.mp4"), _video("b.mp4")]), vcfg)
+
+    def test_non_path_video_raises(self, vcfg):
+        msg = _chat([_video({"video": "x", "start": 0.0})])
+        with pytest.raises(NotImplementedError, match="path string"):
+            _render_request(msg, vcfg)
+
+    def test_mixed_image_and_video_raise(self, vcfg):
+        with pytest.raises(NotImplementedError, match="[Mm]ixed"):
+            _render_request(_chat([_image(_img()), _video("c.mp4")]), vcfg)
+
+    def test_single_image_is_one_frame_clip(self, vcfg):
+        frames, prompt = _render_request(_chat([_text("q"), _image(_img())]), vcfg)
+        assert len(frames) == 1
+        assert prompt == "q"
+
+    def test_audio_still_raises(self, vcfg):
+        msg = _chat([_text("x"), {"type": "audio", "url": "a.wav"}])
+        with pytest.raises(NotImplementedError, match="[Aa]udio"):
+            _render_request(msg, vcfg)
+
+    def test_multi_image_raises(self, vcfg):
+        with pytest.raises(NotImplementedError, match="exactly one"):
+            _render_request(_chat([_image(_img()), _image(_img())]), vcfg)
+
+    def test_multi_turn_raises(self, vcfg):
+        msg = ChatMessages(
+            messages=[
+                {"role": "user", "content": [_text("q"), _video("c.mp4")]},
+                {"role": "assistant", "content": [_text("a")]},
+                {"role": "user", "content": [_text("again")]},
+            ]
+        )
+        with pytest.raises(NotImplementedError, match="[Mm]ulti-turn"):
+            _render_request(msg, vcfg)
+
+    def test_no_frames_decoded_warns(self, monkeypatch, vcfg):
+        rec = _RecordingLogger()
+        monkeypatch.setattr("kempnerforge.eval.vlm.adapter.logger", rec)
+        monkeypatch.setattr(
+            "kempnerforge.eval.vlm.adapter.decode_video_frames", lambda path, **kw: []
+        )
+        frames, _ = _render_request(_chat([_video("c.mp4")]), vcfg)
+        assert frames == []
+        assert any("zero clip" in m for m in rec.warnings)
 
 
 # ---------------------------------------------------------------------------
@@ -391,6 +478,18 @@ def _vlm_job_config(tiny_vlm_configs, arch: str | None = None) -> JobConfig:
     return job
 
 
+def _video_job_config(tiny_video_configs) -> JobConfig:
+    mc, vc, ac, lc, video = tiny_video_configs
+    return JobConfig(
+        model=mc,
+        vision_encoder=vc,
+        adapter=ac,
+        vlm=lc,
+        video=video,
+        data=DataConfig(tokenizer_path="mock"),
+    )
+
+
 def _patch_loaders(monkeypatch, job: JobConfig, model) -> None:
     monkeypatch.setattr("kempnerforge.eval.vlm.adapter._load_config", lambda _p: job)
     monkeypatch.setattr("kempnerforge.eval.vlm.adapter._load_weights", lambda *a, **k: model)
@@ -536,6 +635,27 @@ class TestInitGuards:
         assert vlm._max_seq_len == job.model.max_seq_len
         assert vlm._batch_size == 2
         assert vlm._dtype == torch.float32
+        assert vlm._is_video is False
+        assert vlm._frames_per_clip == 1
+        assert vlm._frame_size == job.data.hf_image_size
+
+
+# ---------------------------------------------------------------------------
+# _build_model (frames_per_clip wiring for image vs video checkpoints)
+# ---------------------------------------------------------------------------
+
+
+class TestBuildModel:
+    def test_video_config_sets_frames_per_clip(self, tiny_video_configs):
+        job = _video_job_config(tiny_video_configs)
+        model = _build_model(job, torch.device("cpu"), torch.float32)
+        assert job.video is not None
+        assert model.frames_per_clip == job.video.max_frames == 2
+
+    def test_image_config_frames_per_clip_is_one(self, tiny_vlm_configs):
+        job = _vlm_job_config(tiny_vlm_configs)
+        model = _build_model(job, torch.device("cpu"), torch.float32)
+        assert model.frames_per_clip == 1
 
 
 # ---------------------------------------------------------------------------
@@ -578,3 +698,61 @@ class TestGenerateUntil:
         assert batched == singles  # batching + reorder + get_original preserve per-request results
         assert all(isinstance(o, str) for o in batched)
         assert all(len(o.split()) == 3 for o in batched)  # greedy emits exactly max_new_tokens
+
+
+class TestGenerateUntilVideo:
+    """End-to-end video decode: stack -> (B, F, 3, H, W) -> forward -> strings."""
+
+    def test_video_batches_and_restores_order(
+        self, monkeypatch, tiny_video_configs, tiny_video_vlm_wrapper
+    ):
+        job = _video_job_config(tiny_video_configs)
+        _patch_loaders(monkeypatch, job, tiny_video_vlm_wrapper)
+        # Two real frames per clip; zero-padded to frames_per_clip (== 2) downstream.
+        monkeypatch.setattr(
+            "kempnerforge.eval.vlm.adapter.decode_video_frames",
+            lambda path, **kw: [_img(), _img()],
+        )
+        vlm = KempnerForgeVLM(
+            config="x", checkpoint="y", device="cpu", dtype="float32", batch_size=2
+        )
+        assert vlm._is_video is True
+        assert vlm._frames_per_clip == 2
+
+        def doc_to_messages(doc):
+            return [{"role": "user", "content": [_text(doc["q"]), _video(doc["v"])]}]
+
+        vlm.task_dict = {
+            "t": {
+                "test": {
+                    "d0": {"q": "what?", "v": "a.mp4"},
+                    "d1": {"q": "describe it", "v": "b.mp4"},
+                }
+            }
+        }
+        specs = [("d0", "c"), ("d1", "cc")]
+        instances = [
+            Instance(
+                request_type="generate_until",
+                arguments=(ctx, doc_to_messages, {"max_new_tokens": 3}, doc_id, "t", "test"),
+                idx=i,
+                metadata={"task": "t", "doc_id": doc_id, "repeats": 1},
+            )
+            for i, (doc_id, ctx) in enumerate(specs)
+        ]
+        # Decoding each request alone must match the batched (stacked, 5-D) result; if the
+        # adapter folded frames with cat, the forward would trip the frames-per-clip check.
+        singles = [vlm.generate_until([inst])[0] for inst in instances]
+        batched = vlm.generate_until(instances)
+        assert batched == singles
+        assert all(isinstance(o, str) and len(o.split()) == 3 for o in batched)
+
+    def test_video_pixel_values_assembled_5d(self):
+        """The video batch is (B, F, 3, H, W) via stack, not (B*F, 3, H, W)."""
+        from kempnerforge.data.vlm_dataset import frames_to_clip_tensor
+
+        clip0, _ = frames_to_clip_tensor([_img(), _img()], max_frames=2, frame_size=16)
+        clip1, _ = frames_to_clip_tensor([_img()], max_frames=2, frame_size=16)
+        pixel_values = torch.stack([clip0, clip1], dim=0)
+        assert pixel_values.shape == (2, 2, 3, 16, 16)
+        assert pixel_values.ndim == 5

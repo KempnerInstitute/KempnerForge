@@ -17,7 +17,7 @@ treats like a sequence of images. Two concerns live here:
    decoding requires the package.
 
 Returned frames are ``PIL.Image`` objects so the caller can reuse the exact
-image preprocessing (``_pil_to_tensor``) used on the single-image path.
+image preprocessing (``pil_to_tensor``) used on the single-image path.
 """
 
 from __future__ import annotations

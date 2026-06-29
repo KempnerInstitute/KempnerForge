@@ -47,12 +47,15 @@ v1 scope and deliberate choices (see docs/how-to/run-vlm-evaluation.md):
   autoregressively generate, and chat tasks are generation-only. A MoMa
   checkpoint fails fast in ``__init__``.
 
-- **Images only.** A request must carry exactly one image. Video/audio content,
-  multi-image, and multi-turn/few-shot requests raise ``NotImplementedError``;
-  ``loglikelihood`` and ``generate_until_multi_round`` are not implemented
-  (chat tasks are generation-only). Visual input is modeled as an ordered list
-  of frames (a single image is the length-1 case) so video is a localized
-  future addition.
+- **Image and video.** An image checkpoint evaluates exactly one image per
+  request; a video checkpoint (a ``[video]`` config) evaluates one video per
+  request — decoded to a fixed ``frames_per_clip`` clip via the training
+  frame-sampling policy — and also accepts a single image (a 1-frame clip).
+  Audio, multi-image, multiple videos, mixed image+video, and multi-turn/few-shot
+  requests raise ``NotImplementedError``; ``loglikelihood`` and
+  ``generate_until_multi_round`` are not implemented (chat tasks are
+  generation-only). Visual input is modeled as an ordered list of frames (a
+  single image is the length-1 case).
 """
 
 from __future__ import annotations
@@ -71,10 +74,13 @@ from tqdm import tqdm
 
 from kempnerforge.config.job import JobConfig
 from kempnerforge.config.loader import load_config
+from kempnerforge.config.video import VideoConfig
+from kempnerforge.data.video_io import decode_video_frames
 from kempnerforge.data.vlm_dataset import (
     DEFAULT_IMAGE_MEAN,
     DEFAULT_IMAGE_STD,
     build_tokenizer,
+    frames_to_clip_tensor,
     pil_to_tensor,
     resolve_pad_id,
 )
@@ -115,7 +121,18 @@ def _build_model(config: JobConfig, device: torch.device, dtype: torch.dtype) ->
     assert config.vlm is not None, "internal: _build_model requires a VLM config"
     assert config.vision_encoder is not None, "internal: VLM config requires a vision encoder"
     assert config.adapter is not None, "internal: VLM config materializes a default adapter"
-    model = build_vlm_wrapper(config.model, config.vision_encoder, config.adapter, config.vlm)
+    # A video checkpoint bakes num_image_tokens = frames_per_clip * tokens_per_frame
+    # into the transformer's residual/positional structure, so the eval must rebuild
+    # with the same frames_per_clip the training run used (mirrors scripts/train.py).
+    # Image configs default to 1.
+    frames_per_clip = config.video.max_frames if config.video is not None else 1
+    model = build_vlm_wrapper(
+        config.model,
+        config.vision_encoder,
+        config.adapter,
+        config.vlm,
+        frames_per_clip=frames_per_clip,
+    )
     return model.to(device=device, dtype=dtype)
 
 
@@ -193,47 +210,106 @@ def _load_weights(
 # --------------------------------------------------------------------------- #
 
 
-def _render_request(messages: ChatMessages) -> tuple[list[Any], str]:
-    """Flatten one chat request into ``(image_frames, prompt_text)``.
+def _render_request(
+    messages: ChatMessages, video_config: VideoConfig | None
+) -> tuple[list[Any], str]:
+    """Flatten one chat request into ``(frames, prompt_text)``.
 
-    v1 is single-turn, zero-shot, image-only. Raises ``NotImplementedError``
-    for content that violates those assumptions (video/audio, multi-turn or
-    few-shot, or anything other than exactly one image) so the offending task
-    is surfaced rather than silently mishandled. Text content blocks are
+    ``frames`` is an ordered list of visual frames; a single image is the
+    length-1 case and a decoded video is the multi-frame case. ``video_config``
+    is the checkpoint's ``[video]`` config (``None`` for an image checkpoint)
+    and selects the mode:
+
+    - **Image checkpoint** (``video_config is None``): exactly one image per
+      request; video content raises (an image model cannot evaluate video).
+    - **Video checkpoint**: exactly one video — decoded to frames via
+      ``video_io.decode_video_frames`` using the checkpoint's frame-sampling
+      policy — or, when no video is present, a single image treated as a
+      1-frame clip (zero-padded to ``frames_per_clip`` downstream).
+
+    Out-of-scope content (audio, multi-turn/few-shot, multi-image, multiple
+    videos, mixed image+video) raises ``NotImplementedError`` so the offending
+    task is surfaced rather than silently mishandled. Text content blocks are
     concatenated in message order (newline-joined); role/turn structure is
     intentionally discarded (see the module docstring on flattening).
     """
     images, videos, audios = messages.extract_media()
-    if videos:
-        raise NotImplementedError(
-            "Video evaluation is not implemented in v1 (image-only). A video request "
-            "reached the KempnerForge VLM adapter; report the task to the project owner."
-        )
     if audios:
         raise NotImplementedError(
-            "Audio evaluation is not implemented in v1 (image-only). An audio request "
+            "Audio evaluation is not implemented (image/video only). An audio request "
             "reached the KempnerForge VLM adapter; report the task to the project owner."
         )
 
     roles = [message.role for message in messages.messages]
     if any(role == "assistant" for role in roles) or roles.count("user") > 1:
         raise NotImplementedError(
-            "Multi-turn / few-shot requests are not supported in v1 (single-turn, "
-            "zero-shot only). Report the task to the project owner."
-        )
-    if len(images) != 1:
-        raise NotImplementedError(
-            f"v1 supports exactly one image per request, got {len(images)}. Multi-image "
-            "and text-only requests are out of scope; report the task to the project owner."
+            "Multi-turn / few-shot requests are not supported (single-turn, zero-shot "
+            "only). Report the task to the project owner."
         )
 
-    parts = [
+    prompt = "\n".join(
         content.text
         for message in messages.messages
         for content in message.content
         if content.type == "text"
-    ]
-    return images, "\n".join(parts)
+    )
+
+    if video_config is None:
+        # Image checkpoint: image-only, exactly one image per request.
+        if videos:
+            raise NotImplementedError(
+                "This is an image checkpoint (no [video] config) and cannot evaluate video. "
+                "Use a video checkpoint, or report the task to the project owner."
+            )
+        if len(images) != 1:
+            raise NotImplementedError(
+                f"This adapter supports exactly one image per request, got {len(images)}. "
+                "Multi-image and text-only requests are out of scope; report the task to "
+                "the project owner."
+            )
+        return images, prompt
+
+    # Video checkpoint: exactly one visual — a video (decoded to frames) or a
+    # single image (treated as a 1-frame clip, zero-padded downstream).
+    if len(videos) > 1:
+        raise NotImplementedError(
+            f"Multiple videos per request are not supported, got {len(videos)}. "
+            "Report the task to the project owner."
+        )
+    if videos:
+        if images:
+            raise NotImplementedError(
+                "Mixed image + video content in one request is not supported. "
+                "Report the task to the project owner."
+            )
+        path = videos[0]
+        if not isinstance(path, str):
+            raise NotImplementedError(
+                f"Video content must be a local path string for decoding, got "
+                f"{type(path).__name__}. The task may pass clip boundaries or a URL; "
+                "report the task to the project owner."
+            )
+        frames = decode_video_frames(
+            path,
+            fps=video_config.fps,
+            min_frames=video_config.min_frames,
+            max_frames=video_config.max_frames,
+            sampling_policy=video_config.sampling_policy,
+        )
+        if not frames:
+            logger.warning(
+                f"No frames decoded from {path}; evaluating a zero clip (result unreliable)."
+            )
+        return frames, prompt
+    if len(images) == 1:
+        # A single image on a video checkpoint: a 1-frame clip (zero-padded to
+        # frames_per_clip downstream), consistent with how training pads short clips.
+        return images, prompt
+    raise NotImplementedError(
+        f"A video-checkpoint request must carry exactly one video or one image, got "
+        f"{len(images)} images and no video. Multi-image and text-only requests are out "
+        "of scope; report the task to the project owner."
+    )
 
 
 def _frames_to_pixel_values(
@@ -451,11 +527,24 @@ class KempnerForgeVLM(lmms):
         # Fail fast on non-generative arches before building/loading the model.
         _check_generative_arch(self._arch)
 
+        # Video vs image mode is a property of the checkpoint's config. A video
+        # checkpoint ([video] config) fixes frames_per_clip and resizes frames to
+        # config.video.frame_size; an image checkpoint is a 1-frame clip at
+        # config.data.hf_image_size.
+        self._is_video = self._config.is_video
+        if self._config.video is not None:
+            self._frames_per_clip = self._config.video.max_frames
+            self._frame_size = self._config.video.frame_size
+        else:
+            self._frames_per_clip = 1
+            self._frame_size = self._config.data.hf_image_size
+
         self._model = _load_weights(self._config, checkpoint, self._device, self._dtype)
         self._tokenizer = build_tokenizer(self._config.data.tokenizer_path)
         self._max_seq_len = self._config.model.max_seq_len
         logger.info(
-            f"KempnerForgeVLM ready: arch={self._arch}, device={self._device}, "
+            f"KempnerForgeVLM ready: arch={self._arch}, video={self._is_video}, "
+            f"frames_per_clip={self._frames_per_clip}, device={self._device}, "
             f"dtype={self._dtype}, max_seq_len={self._max_seq_len}"
         )
 
@@ -483,12 +572,18 @@ class KempnerForgeVLM(lmms):
                 # Chat 6-tuple: (context, doc_to_messages, gen_kwargs, doc_id, task, split).
                 doc = self.task_dict[args[4]][args[5]][args[3]]
                 messages = ChatMessages(messages=args[1](doc))
-                frames, prompt = _render_request(messages)
-                frames_batch.append(
-                    _frames_to_pixel_values(
-                        frames, self._config.data.hf_image_size, self._device, self._dtype
+                frames, prompt = _render_request(messages, self._config.video)
+                if self._is_video:
+                    # Fixed (frames_per_clip, 3, H, W) clip, zero-padded — identical to
+                    # training (frames_to_clip_tensor is the shared helper).
+                    clip, _ = frames_to_clip_tensor(
+                        frames, max_frames=self._frames_per_clip, frame_size=self._frame_size
                     )
-                )
+                    frames_batch.append(clip.to(device=self._device, dtype=self._dtype))
+                else:
+                    frames_batch.append(
+                        _frames_to_pixel_values(frames, self._frame_size, self._device, self._dtype)
+                    )
                 # Mirror training tokenization: no chat template, no <image>
                 # placeholder, add_special_tokens=False (images go via pixel_values).
                 prompt_ids.append(
@@ -498,7 +593,13 @@ class KempnerForgeVLM(lmms):
                         device=self._device,
                     )
                 )
-            pixel_values = torch.cat(frames_batch, dim=0)
+            # Video: (B, F, 3, H, W) via stack (each request is one F-frame clip).
+            # Image: (B, 3, H, W) via cat (each request is one frame). cat on video
+            # would fold frames into the batch and trip the frames-per-clip check.
+            if self._is_video:
+                pixel_values = torch.stack(frames_batch, dim=0)
+            else:
+                pixel_values = torch.cat(frames_batch, dim=0)
             outputs = _generate_batch(
                 self._model, self._tokenizer, pixel_values, prompt_ids, resolved, self._max_seq_len
             )

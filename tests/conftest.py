@@ -17,6 +17,7 @@ from kempnerforge.config.schema import (
     VisionEncoderConfig,
     VLMConfig,
 )
+from kempnerforge.config.video import VideoConfig
 
 # ---------------------------------------------------------------------------
 # CLI flags for opt-in test suites
@@ -111,6 +112,30 @@ def tiny_vlm_wrapper(tiny_vlm_configs):
     from kempnerforge.model.vlm import build_vlm_wrapper
 
     return build_vlm_wrapper(*tiny_vlm_configs).eval()
+
+
+@pytest.fixture
+def tiny_video_configs(
+    tiny_vlm_configs,
+) -> tuple[ModelConfig, VisionEncoderConfig, AdapterConfig, VLMConfig, VideoConfig]:
+    """Tiny configs for a video VLM checkpoint (``frames_per_clip == 2``).
+
+    Reuses the image VLM configs and adds a ``[video]`` section sized so the
+    visual budget (2 frames x 8 tokens = 16) plus ``max_text_len`` (32) fits the
+    tiny ``max_seq_len`` (64).
+    """
+    mc, vc, ac, lc = tiny_vlm_configs
+    video = VideoConfig(max_frames=2, min_frames=1, frame_size=16)
+    return (mc, vc, ac, lc, video)
+
+
+@pytest.fixture
+def tiny_video_vlm_wrapper(tiny_video_configs):
+    """A tiny CPU video ``VLMWrapper`` (``frames_per_clip == 2``; no checkpoint)."""
+    from kempnerforge.model.vlm import build_vlm_wrapper
+
+    mc, vc, ac, lc, video = tiny_video_configs
+    return build_vlm_wrapper(mc, vc, ac, lc, frames_per_clip=video.max_frames).eval()
 
 
 # ---------------------------------------------------------------------------

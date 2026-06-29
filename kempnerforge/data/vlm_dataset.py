@@ -71,6 +71,42 @@ def pil_to_tensor(
     return (t - mean_t) / std_t
 
 
+def frames_to_clip_tensor(
+    frames: list[Any],
+    *,
+    max_frames: int,
+    frame_size: int,
+    image_mean: tuple[float, float, float] = DEFAULT_IMAGE_MEAN,
+    image_std: tuple[float, float, float] = DEFAULT_IMAGE_STD,
+    dtype: torch.dtype = torch.float32,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pack frames into a fixed ``(max_frames, 3, H, W)`` zero-padded clip + mask.
+
+    Fills the first ``min(len(frames), max_frames)`` slots with per-frame
+    ``pil_to_tensor`` output (temporal order preserved) and leaves the remaining
+    slots zero; also returns a ``(max_frames,)`` bool ``frame_mask`` (``True`` for
+    real frames). A single image is the length-1 case (a 1-frame clip).
+
+    Args:
+        frames: Ordered list of PIL ``Image`` objects (e.g. decoded clip frames).
+        max_frames: Fixed per-clip frame budget (the output's frame dimension).
+        frame_size: Square pixel size each frame is resized to.
+        image_mean / image_std: Per-channel normalization (SigLIP defaults).
+        dtype: Output ``pixel_values`` dtype.
+
+    Returns:
+        ``(pixel_values, frame_mask)`` of shapes ``(max_frames, 3, frame_size,
+        frame_size)`` and ``(max_frames,)``.
+    """
+    pixel_values = torch.zeros(max_frames, 3, frame_size, frame_size, dtype=dtype)
+    frame_mask = torch.zeros(max_frames, dtype=torch.bool)
+    n_real = min(len(frames), max_frames)
+    for i in range(n_real):
+        pixel_values[i] = pil_to_tensor(frames[i], frame_size, image_mean, image_std)
+        frame_mask[i] = True
+    return pixel_values, frame_mask
+
+
 def build_tokenizer(tokenizer_path: str) -> Any:
     from transformers import AutoTokenizer
 
