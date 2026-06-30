@@ -87,10 +87,16 @@ class TransformerBlock(nn.Module):
         *,
         kv_cache: KVCache | None = None,
         doc_ids: torch.Tensor | None = None,
+        key_padding_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Pre-norm attention with residual
         x = x + self.attention(
-            self.attention_norm(x), rope_cos, rope_sin, kv_cache=kv_cache, doc_ids=doc_ids
+            self.attention_norm(x),
+            rope_cos,
+            rope_sin,
+            kv_cache=kv_cache,
+            doc_ids=doc_ids,
+            key_padding_mask=key_padding_mask,
         )
         # Pre-norm MLP with residual
         x = x + self.mlp(self.mlp_norm(x))
@@ -355,6 +361,7 @@ class Transformer(nn.Module):
         image_features = modality.image_features if modality is not None else None
         image_mask = modality.image_mask if modality is not None else None
         modality_ids = modality.modality_ids if modality is not None else None
+        key_padding_mask = modality.key_padding_mask if modality is not None else None
 
         if (tokens is None) == (inputs_embeds is None):
             raise ValueError(
@@ -436,7 +443,9 @@ class Transformer(nn.Module):
                     f"match residual shape {tuple(h.shape[:2])}"
                 )
             for layer in self.layers.values():
-                h = layer(h, cos, sin, modality_ids, doc_ids=doc_ids)
+                h = layer(
+                    h, cos, sin, modality_ids, doc_ids=doc_ids, key_padding_mask=key_padding_mask
+                )
             h = self.norm(h)
         # MoT path: position-based image-then-text split, per-modality
         # streams through the MoTBlock stack, single global SDPA per
@@ -471,7 +480,7 @@ class Transformer(nn.Module):
                 "text": (cos[:t_text], sin[:t_text]),
             }
             for layer in self.layers.values():
-                streams = layer(streams, rope)
+                streams = layer(streams, rope, key_padding_mask=key_padding_mask)
             streams = {m: self.mot_norms[m](streams[m]) for m in self._mot_modalities}
             # Re-concat in image-then-text order to match the residual
             # layout the rest of forward expects (output_slice + head).
@@ -485,7 +494,9 @@ class Transformer(nn.Module):
             ca_iter = iter(self.cross_attention_layers.values()) if self._ca_cadence else None
             for i, layer in enumerate(self.layers.values()):
                 cache = kv_caches[i] if kv_caches is not None else None
-                h = layer(h, cos, sin, kv_cache=cache, doc_ids=doc_ids)
+                h = layer(
+                    h, cos, sin, kv_cache=cache, doc_ids=doc_ids, key_padding_mask=key_padding_mask
+                )
                 if ca_iter is not None and (i + 1) % self._ca_cadence == 0:
                     ca = next(ca_iter, None)
                     if ca is not None:

@@ -74,6 +74,7 @@ class ModalityStrategy(Protocol):
         pixel_values: torch.Tensor,
         input_ids: torch.Tensor,
         precomputed_embeds: torch.Tensor | None = None,
+        frame_mask: torch.Tensor | None = None,
     ) -> ModalityContext: ...
 
     def num_image_tokens(self, wrapper: VLMWrapper) -> int: ...
@@ -123,6 +124,53 @@ def _project_visual_features(wrapper: VLMWrapper, pixel_values: torch.Tensor) ->
     return embeds
 
 
+def _visual_token_mask(
+    frame_mask: torch.Tensor | None, num_visual_tokens: int
+) -> torch.Tensor | None:
+    """Expand a per-frame validity mask to per-visual-token.
+
+    ``frame_mask`` is ``(B, F)`` bool (``True`` = real frame). Each frame maps to
+    ``num_visual_tokens // F`` visual tokens (frame-contiguous, see
+    ``_project_visual_features``), so each frame's bit is repeated over its
+    tokens -> ``(B, num_visual_tokens)``. Returns ``None`` when no mask is given
+    (the image path, or a caller that passes nothing), read downstream as "all
+    tokens valid".
+    """
+    if frame_mask is None:
+        return None
+    num_frames = frame_mask.shape[1]
+    if num_visual_tokens % num_frames != 0:
+        # Visual tokens are frame-contiguous (F * tokens_per_frame), so the count
+        # must be divisible by the frame count. A future adapter that adds a
+        # non-per-frame token (e.g. a global/CLS token) would break this and
+        # silently misalign the mask -- fail loudly here instead.
+        raise ValueError(
+            f"_visual_token_mask: num_visual_tokens ({num_visual_tokens}) is not a "
+            f"multiple of num_frames ({num_frames}); the per-frame expansion assumes "
+            "frame-contiguous visual tokens."
+        )
+    tokens_per_frame = num_visual_tokens // num_frames
+    return frame_mask.repeat_interleave(tokens_per_frame, dim=1)
+
+
+def _prefix_key_padding_mask(
+    frame_mask: torch.Tensor | None, num_visual_tokens: int, input_ids: torch.Tensor
+) -> torch.Tensor | None:
+    """Residual key-validity mask ``(B, S)`` for the image-prefix arches.
+
+    ``S = num_visual_tokens + T_text``. Visual positions follow the expanded
+    per-frame mask; text positions are always valid (trailing text padding is
+    causal-safe and is not masked here). Returns ``None`` when no frame_mask is
+    given.
+    """
+    vmask = _visual_token_mask(frame_mask, num_visual_tokens)
+    if vmask is None:
+        return None
+    b, t_text = input_ids.shape
+    text_valid = torch.ones(b, t_text, dtype=torch.bool, device=vmask.device)
+    return torch.cat([vmask, text_valid], dim=1)
+
+
 @registry.register_modality_strategy("joint_decoder")
 class JointDecoderStrategy:
     """Joint-Decoder: image embeds prepended to the text sequence.
@@ -140,6 +188,7 @@ class JointDecoderStrategy:
         pixel_values: torch.Tensor,
         input_ids: torch.Tensor,  # noqa: ARG002
         precomputed_embeds: torch.Tensor | None = None,
+        frame_mask: torch.Tensor | None = None,
     ) -> ModalityContext:
         img_embeds = (
             precomputed_embeds
@@ -147,7 +196,11 @@ class JointDecoderStrategy:
             else _project_visual_features(wrapper, pixel_values)
         )
         n = img_embeds.shape[1]  # pooling-aware: the adapter's actual visual-token count
-        return ModalityContext(prefix_embeds=img_embeds, output_slice=slice(n, None))
+        return ModalityContext(
+            prefix_embeds=img_embeds,
+            output_slice=slice(n, None),
+            key_padding_mask=_prefix_key_padding_mask(frame_mask, n, input_ids),
+        )
 
     def num_image_tokens(self, wrapper: VLMWrapper) -> int:
         return wrapper.frames_per_clip * wrapper.adapter.output_num_tokens(
@@ -163,8 +216,9 @@ class CrossAttentionStrategy:
 
     Forward path: ``feats = vision_encoder(pixel_values)``;
     ``img_embeds = adapter(feats)``; ``ModalityContext(image_features,
-    image_mask=None)``. ``image_mask=None`` means "all image tokens
-    valid"; multi-image variants will fill it in later.
+    image_mask)``. ``image_mask`` carries per-visual-token validity (padded
+    video frames are masked out of the image K/V); ``None`` means all image
+    tokens are valid (e.g. a single image or a full clip).
     """
 
     def prepare(
@@ -173,13 +227,16 @@ class CrossAttentionStrategy:
         pixel_values: torch.Tensor,
         input_ids: torch.Tensor,  # noqa: ARG002
         precomputed_embeds: torch.Tensor | None = None,
+        frame_mask: torch.Tensor | None = None,
     ) -> ModalityContext:
         img_embeds = (
             precomputed_embeds
             if precomputed_embeds is not None
             else _project_visual_features(wrapper, pixel_values)
+        return ModalityContext(
+            image_features=img_embeds,
+            image_mask=_visual_token_mask(frame_mask, img_embeds.shape[1]),
         )
-        return ModalityContext(image_features=img_embeds, image_mask=None)
 
     def num_image_tokens(self, wrapper: VLMWrapper) -> int:  # noqa: ARG002
         # Cross-Attention does not extend the residual stream.
@@ -212,6 +269,7 @@ class MoTStrategy:
         pixel_values: torch.Tensor,
         input_ids: torch.Tensor,
         precomputed_embeds: torch.Tensor | None = None,
+        frame_mask: torch.Tensor | None = None,
     ) -> ModalityContext:
         img_embeds = (
             precomputed_embeds
@@ -226,6 +284,7 @@ class MoTStrategy:
             prefix_embeds=img_embeds,
             output_slice=slice(n, None),
             modality_ids=modality_ids,
+            key_padding_mask=_prefix_key_padding_mask(frame_mask, n, input_ids),
         )
 
     def num_image_tokens(self, wrapper: VLMWrapper) -> int:
@@ -261,6 +320,7 @@ class MoMaStrategy:
         pixel_values: torch.Tensor,
         input_ids: torch.Tensor,
         precomputed_embeds: torch.Tensor | None = None,
+        frame_mask: torch.Tensor | None = None,
     ) -> ModalityContext:
         img_embeds = (
             precomputed_embeds
@@ -275,6 +335,7 @@ class MoMaStrategy:
             prefix_embeds=img_embeds,
             output_slice=slice(n, None),
             modality_ids=modality_ids,
+            key_padding_mask=_prefix_key_padding_mask(frame_mask, n, input_ids),
         )
 
     def num_image_tokens(self, wrapper: VLMWrapper) -> int:
@@ -338,6 +399,7 @@ class VLMWrapper(nn.Module):
         input_ids: torch.Tensor,
         labels: torch.Tensor | None = None,
         precomputed_embeds: torch.Tensor | None = None,
+        frame_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         # Route the text embedding through Transformer.forward so FSDP2's
         # per-module hook intercepts the token_embedding call and
@@ -347,7 +409,12 @@ class VLMWrapper(nn.Module):
         # ``precomputed_embeds`` (when set) is forwarded to the strategy as the
         # projected visual embeds, skipping the per-call vision encode (the
         # cached-decode path); ``None`` keeps the default encode-from-pixels path.
-        modality = self.strategy.prepare(self, pixel_values, input_ids, precomputed_embeds)
+        modality = self.strategy.prepare(self, 
+                                         pixel_values, 
+                                         input_ids, 
+                                         precomputed_embeds, 
+                                         frame_mask=frame_mask
+                                        )
         logits = self.transformer(tokens=input_ids, modality=modality)
         return logits, labels
 

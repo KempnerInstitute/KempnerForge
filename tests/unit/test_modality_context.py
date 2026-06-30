@@ -73,6 +73,17 @@ class TestModalityContextInvariants:
         with pytest.raises(ValueError, match="image_mask requires image_features"):
             ModalityContext(image_mask=torch.ones(1, 4, dtype=torch.bool))
 
+    def test_key_padding_mask_with_prefix_embeds_is_valid(self):
+        ctx = ModalityContext(
+            prefix_embeds=torch.zeros(1, 4, 8),
+            key_padding_mask=torch.ones(1, 10, dtype=torch.bool),
+        )
+        assert ctx.key_padding_mask is not None
+
+    def test_key_padding_mask_without_residual_raises(self):
+        with pytest.raises(ValueError, match="key_padding_mask requires"):
+            ModalityContext(key_padding_mask=torch.ones(1, 10, dtype=torch.bool))
+
     def test_three_residual_routes_raises(self):
         """Setting all three residual-route fields surfaces the same error."""
         with pytest.raises(ValueError, match="mutually exclusive"):
