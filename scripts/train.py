@@ -1043,9 +1043,9 @@ def main() -> None:
 
         # Clean-completion marker for the unconditional final save after the
         # loop. Only reached when training completes without any errors, e.g.,
-        # no NaN/NCCl/shutdown breaks. If a run encounters a NaN, the last step
+        # no NaN/NCCL/shutdown breaks. If a run encounters a NaN, the last step
         # is intentionally *not* saved because the actual model state would be
-        # `max_steps` - 1, not `max_steps`.
+        # `max_steps - 1`, not `max_steps`.
         if step >= tc.max_steps:
             completed_normally = True
 
