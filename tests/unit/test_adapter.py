@@ -383,23 +383,41 @@ class TestAttentionalPoolAdapter:
     def test_is_vision_adapter(self):
         assert isinstance(AttentionalPoolAdapter(in_dim=16, out_dim=8, pool_heads=4), VisionAdapter)
 
-    @pytest.mark.parametrize(("n_in", "window"), [(16, 2), (256, 2), (729, 3)])
+    # (196, 3) is ragged: 14x14 grid, 14 % 3 != 0 -> ceil(14/3)=5 -> 25.
+    @pytest.mark.parametrize(("n_in", "window"), [(16, 2), (256, 2), (729, 3), (196, 3)])
     def test_output_num_tokens_matches_forward(self, n_in, window):
         adapter = AttentionalPoolAdapter(in_dim=32, out_dim=16, pool_window=window, pool_heads=4)
         x = torch.randn(1, n_in, 32)
         assert adapter(x).shape[1] == adapter.output_num_tokens(n_in)
 
-    def test_ragged_grid_raises(self):
+    def test_ragged_grid_supported(self):
+        # 4x4 grid, window 3 -> ceil(4/3)=2 -> 2x2=4 tokens; edge windows pool only
+        # their real patches (padded patches masked out). No longer raises.
         adapter = AttentionalPoolAdapter(in_dim=96, out_dim=64, pool_window=3, pool_heads=16)
-        with pytest.raises(ValueError, match="divisible"):
-            adapter(torch.randn(1, 16, 96))  # 4x4 grid, not divisible by 3
+        out = adapter(torch.randn(2, 16, 96))  # 4x4 grid, ragged for window 3
+        assert out.shape == (2, 4, 64)
+        assert torch.isfinite(out).all()
 
-    def test_output_num_tokens_rejects_ragged(self):
-        # The static count must mirror forward()'s ragged rejection so an invalid
-        # config fails at build / seq-len-check time, not at the first step.
+    def test_output_num_tokens_ragged(self):
+        # Ragged grids are supported: the count is ceil(grid/window)**2, matching
+        # avgpool and the masked forward.
         adapter = AttentionalPoolAdapter(in_dim=96, out_dim=64, pool_window=3, pool_heads=16)
-        with pytest.raises(ValueError, match="ragged grid"):
-            adapter.output_num_tokens(16)  # 4x4 grid, not divisible by 3
+        assert adapter.output_num_tokens(16) == 4  # 4x4 -> ceil(4/3)=2 -> 2x2
+        assert adapter.output_num_tokens(196) == 25  # 14x14 -> ceil(14/3)=5 -> 5x5
+
+    def test_ragged_edge_window_pools_only_real_patches(self):
+        # 4x4 grid, window 3 -> 2x2 windows; the bottom-right window (output token
+        # 3) has exactly one real patch (index 15). With the padded patches masked,
+        # attention over a single key is the identity on its value, so that
+        # window's output must equal out_proj(o_proj(v_proj(patch_15))).
+        torch.manual_seed(0)
+        adapter = AttentionalPoolAdapter(in_dim=32, out_dim=16, pool_window=3, pool_heads=4).eval()
+        x = torch.randn(1, 16, 32)  # 4x4 grid
+        with torch.no_grad():
+            out = adapter(x)  # (1, 4, 16)
+            real = x[:, 15:16]  # (1, 1, 32) — the window's only real patch
+            ref = adapter.out_proj(adapter.o_proj(adapter.v_proj(real)))  # (1, 1, 16)
+        assert torch.allclose(out[:, 3:4], ref, atol=1e-5)
 
     def test_heads_must_divide_dim(self):
         with pytest.raises(ValueError, match="divisible by"):
@@ -478,11 +496,10 @@ class TestAdapterConfigPooling:
     def test_output_num_tokens_pools_for_attentional(self):
         assert AdapterConfig(type="attentional_pool", pool_window=3).output_num_tokens(729) == 81
 
-    def test_attentional_output_num_tokens_rejects_ragged(self):
-        # Config-time check rejects a ragged attentional_pool grid (mirrors forward),
-        # so the misconfig fails at config load, not at the first training step.
-        with pytest.raises(ValueError, match="ragged grid"):
-            AdapterConfig(type="attentional_pool", pool_window=3).output_num_tokens(196)
+    def test_attentional_output_num_tokens_allows_ragged(self):
+        # attentional_pool now pools ragged edges (masked partial windows), so the
+        # config-time count uses the same ceil math as avgpool — no rejection.
+        assert AdapterConfig(type="attentional_pool", pool_window=3).output_num_tokens(196) == 25
 
     def test_avgpool_output_num_tokens_allows_ragged(self):
         # avgpool pools ragged edges, so the same ragged grid is fine (ceil math).

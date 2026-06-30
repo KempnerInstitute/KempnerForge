@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Ragged grids in `attentional_pool`.** The `attentional_pool` connector now pools ragged patch grids (grid not divisible by the window) instead of rejecting them: each partial edge window pools only its real patches via a masked attention (matching `avgpool` and Molmo2 §A). This enables faithful **Molmo2 3×3 video pooling** on a 14×14 SigLIP grid (`14 % 3 != 0`), which previously had to fall back to `avgpool` or a divisible window. `output_num_tokens` is `ceil(grid/window)²`; divisible grids are bit-exact with before (no mask is built).
+  - `kempnerforge/model/adapter.py`: `AttentionalPoolAdapter.forward` pads the bottom/right edges and masks padded patches out of each edge window's K/V (with a masked-mean query); `DIVISIBLE_ONLY_POOL_TYPES` is now empty.
+  - Tests: `tests/unit/test_adapter.py` — ragged token count, masked edge-window correctness (a 1-real-patch window equals attention over that patch), config accepts ragged.
 - **MoE router z-loss** (`moe_router_z_loss_weight`, ST-MoE style). An optional penalty on the router's pre-softmax logits — per MoE layer `mean_token(logsumexp(router_logits))²` — summed across layers and added to the training loss as `moe_router_z_loss_weight × z_loss`. It keeps router logits from growing without bound, targeting *logit-growth stability* (not load balance — that's the aux loss). Default `0.0` is off: the term is never added, so training, outputs, and gradients are unchanged. `z_loss` is a plain attribute like `aux_loss` (not a buffer/parameter), so it never enters `state_dict` — checkpoint-safe.
   - `kempnerforge/config/model.py`: `moe_router_z_loss_weight: float = 0.0` (with a non-negativity check).
   - `kempnerforge/model/router.py`: both `SoftmaxTopKRouter` and `SigmoidTopKRouter` set `self.z_loss = (logsumexp(logits, dim=-1) ** 2).mean()`.
