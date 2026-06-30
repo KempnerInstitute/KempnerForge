@@ -45,10 +45,11 @@ _ADAPTER_ACTIVATIONS: dict[str, type[nn.Module]] = {
 # the registered pooling builders below.
 POOLING_ADAPTER_TYPES: tuple[str, ...] = ("avgpool", "attentional_pool")
 
-# Pooling adapters whose ``forward`` requires the patch grid be divisible by the
-# window (no ragged edge windows). Their token count must enforce the same so a
-# ragged config is rejected at config/build time, not at the first training step.
-DIVISIBLE_ONLY_POOL_TYPES: tuple[str, ...] = ("attentional_pool",)
+# Pooling adapters whose ``forward`` cannot pool ragged edge windows (so their
+# token count must reject a non-divisible grid at config/build time). Both
+# ``avgpool`` and ``attentional_pool`` now mask partial edge windows, so this is
+# empty -- kept as a seam for a future connector that genuinely needs divisibility.
+DIVISIBLE_ONLY_POOL_TYPES: tuple[str, ...] = ()
 
 
 def pooled_token_count(
@@ -63,10 +64,11 @@ def pooled_token_count(
     cover (Molmo2 §A: "the bottom and far-right image patches are pooled with a
     reduced number of patches").
 
-    Connectors that cannot pool ragged edges (``require_divisible=True``, e.g.
-    ``attentional_pool``) raise when ``grid`` is not divisible by ``window``, so a
-    ragged config is rejected at config/build time rather than deterministically
-    failing in ``forward`` at the first step.
+    Connectors that genuinely cannot pool ragged edges may pass
+    ``require_divisible=True`` to raise when ``grid`` is not divisible by
+    ``window``, rejecting a ragged config at config/build time rather than
+    deterministically failing in ``forward`` at the first step. (Today both
+    pooling connectors handle ragged edges, so none set it.)
 
     This is the single source of truth for the post-pool count: it must equal
     the pooling adapters' actual ``forward`` output length, because the build
@@ -245,9 +247,9 @@ class AttentionalPoolAdapter(VisionAdapter):
     is projected ``in_dim -> out_dim``. Output length is ``ceil(grid/window)**2``.
 
     ``window`` is overridable per ``forward`` call (shared params across image
-    2×2 and video 3×3 pooling, per the paper). v1 requires the grid be divisible
-    by the window (no ragged edge windows); ragged attentional pooling is a
-    follow-up.
+    2×2 and video 3×3 pooling, per the paper). Ragged grids are supported: a
+    partial edge window pools only its real patches (the padded patches are
+    masked out of the window's K/V), matching ``avgpool`` and Molmo2 §A.
     """
 
     def __init__(
@@ -285,9 +287,7 @@ class AttentionalPoolAdapter(VisionAdapter):
             layer.reset_parameters()
 
     def output_num_tokens(self, num_input_tokens: int) -> int:
-        # require_divisible mirrors forward()'s ragged-grid rejection so a bad
-        # config fails at build / seq-len-check time, not at the first step.
-        return pooled_token_count(num_input_tokens, self.pool_window, require_divisible=True)
+        return pooled_token_count(num_input_tokens, self.pool_window)
 
     def forward(self, x: torch.Tensor, pool_window: int | None = None) -> torch.Tensor:
         w = pool_window if pool_window is not None else self.pool_window
@@ -295,24 +295,48 @@ class AttentionalPoolAdapter(VisionAdapter):
             raise ValueError(f"pool_window must be positive (got {w})")
         b, n, c = x.shape
         grid = _grid_side(n)
-        if grid % w != 0:
-            raise ValueError(
-                f"attentional_pool v1 requires the patch grid ({grid}x{grid}) be divisible "
-                f"by the pool window ({w}); ragged edge windows are not yet supported. "
-                "Use avgpool for ragged grids, or pick a divisible window."
-            )
-        per = grid // w
+        per = math.ceil(grid / w)
+        padded = per * w
         k_win = w * w
-        # (B, grid, grid, C) -> windows (B*per*per, w*w, C): each window's patches contiguous.
+        x = x.view(b, grid, grid, c)
+        # Ragged grid (grid not divisible by w): pad the bottom/right edges to
+        # per*w and mask the padded patches out of each edge window's attention,
+        # so a window pools only its real patches (Molmo2 §A). Divisible grids
+        # skip this and stay bit-identical to the unmasked pooling.
+        win_mask: torch.Tensor | None = None
+        if padded != grid:
+            pad = padded - grid
+            valid = torch.ones(b, grid, grid, 1, dtype=torch.bool, device=x.device)
+            # F.pad pads the last dim backward: (C:0,0)(W:0,pad)(H:0,pad).
+            x = F.pad(x, (0, 0, 0, pad, 0, pad))
+            valid = F.pad(valid, (0, 0, 0, pad, 0, pad))  # (B, padded, padded, 1) bool
+            # Window order must match `windows` below.
+            win_mask = (
+                valid.view(b, per, w, per, w, 1)
+                .permute(0, 1, 3, 2, 4, 5)
+                .reshape(b * per * per, k_win)
+            )
+        # (B, padded, padded, C) -> windows (B*per*per, w*w, C): each window's patches contiguous.
         windows = (
             x.view(b, per, w, per, w, c).permute(0, 1, 3, 2, 4, 5).reshape(b * per * per, k_win, c)
         )
         m = windows.shape[0]
-        query = windows.mean(dim=1, keepdim=True)  # (M, 1, C) — window mean as query
+        if win_mask is None:
+            query = windows.mean(dim=1, keepdim=True)  # (M, 1, C) — window mean as query
+        else:
+            # Query = mean over real patches only (every window has >=1 real patch,
+            # so the count is never zero).
+            wf = win_mask.unsqueeze(-1).to(windows.dtype)  # (M, k_win, 1)
+            query = (windows * wf).sum(dim=1, keepdim=True) / wf.sum(dim=1, keepdim=True).clamp_(
+                min=1
+            )
         q = self.q_proj(query).view(m, 1, self.pool_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(windows).view(m, k_win, self.pool_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(windows).view(m, k_win, self.pool_heads, self.head_dim).transpose(1, 2)
-        attn = F.scaled_dot_product_attention(q, k, v)  # (M, H, 1, head_dim)
+        # Mask padded patches out of the K/V for edge windows; None -> plain SDPA
+        # (the divisible path, bit-identical to before).
+        attn_mask = None if win_mask is None else win_mask.view(m, 1, 1, k_win)
+        attn = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)  # (M, H, 1, head_dim)
         attn = attn.transpose(1, 2).reshape(m, c)  # (M, C)
         pooled = self.o_proj(attn).view(b, per * per, c)
         return self.out_proj(pooled)
