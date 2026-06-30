@@ -299,7 +299,12 @@ class MoMaFFN(nn.Module):
             }
         )
 
-    def forward(self, x: torch.Tensor, modality_ids: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        modality_ids: torch.Tensor,
+        key_padding_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Dispatch tokens by modality and run per-modality EC-MoE.
 
         Args:
@@ -307,6 +312,10 @@ class MoMaFFN(nn.Module):
             modality_ids: ``(B, S)`` long tensor. ``modality_ids == i``
                 routes that token to ``self.modalities[i]``'s expert
                 group.
+            key_padding_mask: Optional ``(B, S)`` bool mask; ``False`` positions
+                (e.g. padded video frames) are excluded from the expert-choice
+                routing so they neither consume expert capacity nor perturb which
+                real tokens the experts select. ``None`` = all positions routed.
 
         Returns:
             ``(B, S, D)`` tensor with each modality's positions filled
@@ -329,31 +338,36 @@ class MoMaFFN(nn.Module):
         b, s, d = x.shape
         x_flat = x.reshape(b * s, d)
         mod_flat = modality_ids.reshape(b * s)
+        valid_flat = key_padding_mask.reshape(b * s) if key_padding_mask is not None else None
         out = torch.zeros_like(x_flat)
 
-        # Tracks how many positions actually got routed to *some* modality
-        # group. With well-formed modality_ids (values in [0, len(modalities)))
-        # this equals b*s at the end. We accumulate Python ints from
-        # ``idx.numel()`` (tensor metadata, no host sync) and compare after
-        # the loop — much cheaper than an upfront ``.all()`` reduction which
-        # would force a device->host sync every step. The error fires
-        # post-FFN, but the in-range work is the same either way and the
-        # failure mode without this check is silent zero-output on the
-        # affected positions (residual still carries them through, so the
-        # bug would only surface as quietly wrong training).
+        # ``total_routed`` counts positions matching *some* modality group (the
+        # modality_ids range check below); with well-formed modality_ids it
+        # equals b*s. We accumulate Python ints from ``idx.numel()`` (tensor
+        # metadata, no host sync) rather than a ``.all()`` reduction that would
+        # force a device->host sync every step. The per-modality routing set
+        # additionally drops padded positions so they never compete for capacity.
         total_routed = 0
         for i, m in enumerate(self.modalities):
-            # nonzero() avoids the boolean-mask copy and gives us a 1-D index
+            # nonzero() avoids the boolean-mask copy and gives a 1-D index
             # tensor we can feed to index_select + scatter.
-            idx = (mod_flat == i).nonzero(as_tuple=False).squeeze(-1)  # (N_m,)
+            mod_idx = (mod_flat == i).nonzero(as_tuple=False).squeeze(-1)  # (N_m,)
+            total_routed += mod_idx.numel()
+            idx = mod_idx
+            if valid_flat is not None:
+                # Drop padded (e.g. blank-frame) positions from the expert-choice
+                # competition: padded tokens must not consume expert capacity or
+                # change which real tokens the experts pick. They get zero FFN
+                # output; the outer residual skip carries them through unchanged.
+                keep = valid_flat.index_select(0, mod_idx).nonzero(as_tuple=False).squeeze(-1)
+                idx = mod_idx.index_select(0, keep)
             if idx.numel() == 0:
                 continue
-            total_routed += idx.numel()
-            x_m = x_flat.index_select(0, idx)  # (N_m, D)
-            y_m = self.experts[m](x_m)  # (N_m, D)
-            # The modality groups partition the position space, so indices
-            # are guaranteed unique across iterations. index_copy on
-            # disjoint indices is safe and autograd-friendly.
+            x_m = x_flat.index_select(0, idx)  # (N_routed, D)
+            y_m = self.experts[m](x_m)  # (N_routed, D)
+            # The modality groups partition the position space, so indices are
+            # unique across iterations; index_copy on disjoint indices is safe
+            # and autograd-friendly.
             out = out.index_copy(0, idx, y_m)
 
         if total_routed != b * s:
@@ -435,10 +449,20 @@ class MoMaBlock(nn.Module):
         modality_ids: torch.Tensor,
         *,
         doc_ids: torch.Tensor | None = None,
+        key_padding_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Pre-norm attention with residual (shared QKVO, single SDPA).
         # kv_cache is intentionally omitted: EC routing is non-causal in v1.
-        x = x + self.attention(self.attention_norm(x), rope_cos, rope_sin, doc_ids=doc_ids)
-        # Pre-norm MoMa FFN with residual (per-modality EC-MoE groups).
-        x = x + self.mlp(self.mlp_norm(x), modality_ids=modality_ids)
+        x = x + self.attention(
+            self.attention_norm(x),
+            rope_cos,
+            rope_sin,
+            doc_ids=doc_ids,
+            key_padding_mask=key_padding_mask,
+        )
+        # Pre-norm MoMa FFN with residual (per-modality EC-MoE groups). The
+        # key_padding_mask drops padded positions from expert-choice routing.
+        x = x + self.mlp(
+            self.mlp_norm(x), modality_ids=modality_ids, key_padding_mask=key_padding_mask
+        )
         return x

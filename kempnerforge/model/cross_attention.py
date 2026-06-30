@@ -101,7 +101,12 @@ class CrossAttention(nn.Module):
         # the right thing across heads and text Q positions.
         attn_mask = None
         if image_mask is not None:
-            attn_mask = image_mask.view(batch, 1, 1, num_image_tokens)
+            # NaN guard: a sample with no valid image tokens (e.g. an undecodable
+            # clip — all frames padded) would softmax over all -inf -> NaN. Unmask
+            # such rows so softmax stays finite; their text outputs are discarded
+            # (the clip's labels are all -100).
+            safe = image_mask | ~image_mask.any(dim=1, keepdim=True)  # (B, N)
+            attn_mask = safe.view(batch, 1, 1, num_image_tokens)
 
         # Cross-attention: no causal mask on the image axis.
         out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=False)
