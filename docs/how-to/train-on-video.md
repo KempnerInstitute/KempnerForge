@@ -16,7 +16,9 @@ A clip of `F` frames becomes `F × P′` visual tokens:
 3. **Pool + project** each frame with the connector — an `avgpool` or
    `attentional_pool` adapter reduces a `grid×grid` patch map to
    `P′ = ceil(grid/window)²` tokens per frame (e.g. SigLIP2 @224/patch16 →
-   14×14 → 49 tokens at `pool_window=2`).
+   14×14 → 49 tokens at `pool_window=2`). Ragged windows work too — both
+   connectors pool partial edge windows over their real patches — so Molmo2-style
+   3×3 on the 14×14 grid gives 5×5 = 25 tokens.
 4. **Fuse** the resulting `(B, F·P′, dim)` visual tokens into the backbone the
    same way images are fused — so **all four archs work unchanged**:
    - `joint_decoder` / `mot` / `moma`: the `F·P′` tokens prepend the text in the
