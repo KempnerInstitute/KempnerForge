@@ -111,6 +111,7 @@ class MoTAttention(nn.Module):
         streams: dict[str, torch.Tensor],
         rope: dict[str, tuple[torch.Tensor, torch.Tensor]],
         is_causal: bool = True,
+        key_padding_mask: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Run per-modality projections, global SDPA, per-modality output.
 
@@ -123,7 +124,12 @@ class MoTAttention(nn.Module):
                 ``(seq_m, head_dim // 2)`` — counts from position 0
                 within that modality's axis.
             is_causal: passed through to
-                ``F.scaled_dot_product_attention``.
+                ``F.scaled_dot_product_attention`` (used only when
+                ``key_padding_mask`` is None).
+            key_padding_mask: Optional ``(B, S)`` bool over the concatenated
+                ``[image | text]`` sequence; ``True`` = attend. When given,
+                builds an explicit causal-AND-valid mask (dropping padded video
+                frames' visual tokens) instead of the ``is_causal`` fast path.
 
         Returns:
             per-modality output of shape ``(batch, seq_m, dim)``.
@@ -175,7 +181,19 @@ class MoTAttention(nn.Module):
             k = k.repeat_interleave(self.n_rep, dim=1)
             v = v.repeat_interleave(self.n_rep, dim=1)
 
-        out = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
+        if key_padding_mask is not None:
+            # Explicit mask: causal AND valid keys (drop padded video frames'
+            # visual tokens). Replaces the is_causal fast path.
+            total_seq = q.shape[2]
+            causal = torch.ones(total_seq, total_seq, dtype=torch.bool, device=q.device).tril()
+            kv = key_padding_mask.view(batch, 1, 1, total_seq)
+            attn_mask = causal.unsqueeze(0).unsqueeze(0) & kv
+            # NaN guard: unmask fully-masked query rows (e.g. an all-padded clip)
+            # so softmax stays finite; those outputs are discarded downstream.
+            attn_mask = attn_mask | ~attn_mask.any(dim=-1, keepdim=True)
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        else:
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
         # (B, n_heads, total_seq, head_dim) -> (B, total_seq, n_heads, head_dim)
         out = out.transpose(1, 2).contiguous()
 
@@ -293,6 +311,7 @@ class MoTBlock(nn.Module):
         self,
         streams: dict[str, torch.Tensor],
         rope: dict[str, tuple[torch.Tensor, torch.Tensor]],
+        key_padding_mask: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         if set(streams.keys()) != set(self.modalities):
             raise ValueError(
@@ -300,7 +319,7 @@ class MoTBlock(nn.Module):
                 f"do not match construction-time modalities {sorted(self.modalities)}"
             )
         normed_attn = {m: self.attn_norm[m](streams[m]) for m in self.modalities}
-        attn_out = self.attn(normed_attn, rope, is_causal=True)
+        attn_out = self.attn(normed_attn, rope, is_causal=True, key_padding_mask=key_padding_mask)
         post_attn = {m: streams[m] + attn_out[m] for m in self.modalities}
         normed_mlp = {m: self.mlp_norm[m](post_attn[m]) for m in self.modalities}
         mlp_out = {m: self.mlp[m](normed_mlp[m]) for m in self.modalities}

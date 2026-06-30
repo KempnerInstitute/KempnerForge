@@ -648,3 +648,81 @@ class TestVideoForward:
         # 4D single-image batch into a video (frames_per_clip>1) wrapper.
         with pytest.raises(ValueError, match="frames-per-clip mismatch"):
             wrapper(torch.randn(2, 3, 16, 16, device=DEVICE), input_ids)
+
+
+class TestFramePaddingMask:
+    """frame_mask hides padded video frames from attention (and, for MoMa, from
+    expert-choice routing), so real-token outputs are invariant to padded-frame
+    content. The image (F=1) path is a no-op, and an all-padded (undecodable)
+    clip stays finite via the NaN guard."""
+
+    @staticmethod
+    def _arch_wrapper(arch):
+        ffn = 128 if arch in ("mot", "moma") else None
+        cfgs = {
+            "joint_decoder": JointDecoderConfig(max_text_len=8),
+            "cross_attention": CrossAttentionConfig(
+                max_text_len=8, cross_attention_every_n_layers=2
+            ),
+            "mot": MoTConfig(max_text_len=8),
+            "moma": MoMaConfig(max_text_len=8),
+        }
+        w = _video_wrapper(cfgs[arch], frames=4, ffn_hidden_dim=ffn).to(DEVICE).eval()
+        # Move off zero-init warm-start gating (e.g. MoT/CA zero-init o_proj) so
+        # the image path actually contributes — otherwise the no-mask control is
+        # vacuous (image gated off at init).
+        with torch.no_grad():
+            for p in w.parameters():
+                p.add_(0.02 * torch.randn_like(p))
+        return w
+
+    def test_visual_token_mask_expands_per_frame(self):
+        from kempnerforge.model.vlm import _visual_token_mask
+
+        fm = torch.tensor([[True, False, True]])  # 3 frames
+        out = _visual_token_mask(fm, num_visual_tokens=6)  # 2 tokens/frame
+        assert out.tolist() == [[True, True, False, False, True, True]]
+        assert _visual_token_mask(None, 6) is None
+        # Non-divisible count (e.g. a future non-per-frame token) must fail loudly.
+        with pytest.raises(ValueError, match="multiple of num_frames"):
+            _visual_token_mask(fm, num_visual_tokens=7)
+
+    @pytest.mark.parametrize("arch", ["joint_decoder", "cross_attention", "mot", "moma"])
+    def test_masked_frames_do_not_affect_real_tokens(self, arch):
+        torch.manual_seed(0)
+        w = self._arch_wrapper(arch)
+        ids = torch.randint(0, 256, (1, 6), device=DEVICE)
+        pix = torch.randn(1, 4, 3, 16, 16, device=DEVICE)
+        fm = torch.tensor([[True, True, False, False]], device=DEVICE)  # frames 2,3 padded
+        pix2 = pix.clone()
+        pix2[:, 2:] = torch.randn(1, 2, 3, 16, 16, device=DEVICE)  # corrupt the padded frames
+        with torch.no_grad():
+            masked_a, _ = w(pix, ids, frame_mask=fm)
+            masked_b, _ = w(pix2, ids, frame_mask=fm)
+            nomask_a, _ = w(pix, ids)
+            nomask_b, _ = w(pix2, ids)
+        assert torch.equal(masked_a, masked_b), f"{arch}: masked output depends on padded frames"
+        assert not torch.equal(nomask_a, nomask_b), f"{arch}: control — pads should leak unmasked"
+
+    def test_image_f1_mask_is_noop(self):
+        torch.manual_seed(0)
+        w = _video_wrapper(JointDecoderConfig(max_text_len=8), frames=1).to(DEVICE).eval()
+        img = torch.randn(1, 3, 16, 16, device=DEVICE)
+        ids = torch.randint(0, 256, (1, 6), device=DEVICE)
+        with torch.no_grad():
+            no_mask, _ = w(img, ids)
+            all_true, _ = w(img, ids, frame_mask=torch.tensor([[True]], device=DEVICE))
+        assert torch.equal(no_mask, all_true)
+
+    @pytest.mark.parametrize("arch", ["joint_decoder", "cross_attention", "mot", "moma"])
+    def test_undecodable_clip_stays_finite(self, arch):
+        # An undecodable clip has frame_mask all-False; the NaN guard must keep
+        # softmax finite (no NaN poisoning the batch loss).
+        torch.manual_seed(0)
+        w = self._arch_wrapper(arch)
+        ids = torch.randint(0, 256, (2, 6), device=DEVICE)
+        pix = torch.randn(2, 4, 3, 16, 16, device=DEVICE)
+        fm = torch.tensor([[False, False, False, False], [True, True, True, True]], device=DEVICE)
+        with torch.no_grad():
+            logits, _ = w(pix, ids, frame_mask=fm)
+        assert torch.isfinite(logits).all(), f"{arch}: NaN/inf with an all-padded clip"

@@ -46,6 +46,9 @@ class ModalityContext:
       error).
     - ``modality_ids`` requires ``prefix_embeds`` or ``inputs_embeds``
       to be set (routing without a residual extension is meaningless).
+    - ``key_padding_mask`` requires ``prefix_embeds`` or ``inputs_embeds``
+      to be set (it is a key-validity mask over the residual sequence; the
+      Cross-Attention arch masks image K/V via ``image_mask`` instead).
 
     ``output_slice`` composes with the ``tokens`` path AND with the
     ``inputs_embeds`` path; it is not constrained intra-context. The
@@ -59,6 +62,7 @@ class ModalityContext:
     image_features: torch.Tensor | None = None
     image_mask: torch.Tensor | None = None
     modality_ids: torch.Tensor | None = None
+    key_padding_mask: torch.Tensor | None = None
 
     def __post_init__(self) -> None:
         residual_routes = sum(
@@ -79,4 +83,13 @@ class ModalityContext:
             raise ValueError(
                 "ModalityContext: modality_ids requires prefix_embeds OR "
                 "inputs_embeds to be set (routing without a residual extension is meaningless)"
+            )
+        if (
+            self.key_padding_mask is not None
+            and self.prefix_embeds is None
+            and self.inputs_embeds is None
+        ):
+            raise ValueError(
+                "ModalityContext: key_padding_mask requires prefix_embeds OR inputs_embeds "
+                "to be set (it masks the residual sequence; Cross-Attention uses image_mask)"
             )
