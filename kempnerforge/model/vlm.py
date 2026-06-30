@@ -233,6 +233,7 @@ class CrossAttentionStrategy:
             precomputed_embeds
             if precomputed_embeds is not None
             else _project_visual_features(wrapper, pixel_values)
+        )
         return ModalityContext(
             image_features=img_embeds,
             image_mask=_visual_token_mask(frame_mask, img_embeds.shape[1]),
@@ -409,12 +410,9 @@ class VLMWrapper(nn.Module):
         # ``precomputed_embeds`` (when set) is forwarded to the strategy as the
         # projected visual embeds, skipping the per-call vision encode (the
         # cached-decode path); ``None`` keeps the default encode-from-pixels path.
-        modality = self.strategy.prepare(self, 
-                                         pixel_values, 
-                                         input_ids, 
-                                         precomputed_embeds, 
-                                         frame_mask=frame_mask
-                                        )
+        modality = self.strategy.prepare(
+            self, pixel_values, input_ids, precomputed_embeds, frame_mask=frame_mask
+        )
         logits = self.transformer(tokens=input_ids, modality=modality)
         return logits, labels
 
