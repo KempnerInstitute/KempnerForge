@@ -83,8 +83,8 @@ def pooled_token_count(
         raise ValueError(
             f"this pooling connector requires the patch grid ({grid}x{grid}) be "
             f"divisible by the pool window ({window}); got a ragged grid "
-            f"(num_tokens={num_input_tokens}). Use avgpool for ragged grids, or pick "
-            "a divisible window."
+            f"(num_tokens={num_input_tokens}). Use a ragged-capable connector "
+            "(avgpool or attentional_pool), or pick a divisible window."
         )
     per_side = math.ceil(grid / window)
     return per_side * per_side
