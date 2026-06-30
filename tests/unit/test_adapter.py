@@ -276,7 +276,8 @@ class TestPooledTokenCount:
             pooled_token_count(0, 2)
 
     def test_require_divisible_raises_on_ragged(self):
-        # attentional_pool path: a ragged grid is rejected up front, not at forward.
+        # The generic require_divisible flag still rejects a ragged grid up front
+        # (the seam for a future divisible-only connector); no current connector sets it.
         with pytest.raises(ValueError, match="ragged grid"):
             pooled_token_count(196, 3, require_divisible=True)  # 14x14 not divisible by 3
 
