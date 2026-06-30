@@ -106,10 +106,13 @@ time, so it is set in the TOML, not via a `--vlm.arch=` CLI override.)
   `max_frames` with blank frames, and the `frame_mask` is consumed so real
   tokens never attend to padded-frame visual tokens (MoMa also drops them from
   expert-choice routing); a NaN guard keeps an all-padded clip finite. It is a
-  pure mask (no new checkpoint keys); image/text keep the FlashAttention-2 path,
-  but video always takes the explicit-mask SDPA path (FA2 disabled, a `(B,1,S,S)`
-  mask built) even for fully-decoded clips — a deliberate compile/DP-friendly
-  trade-off; recovering FA2 / FlexAttention is a follow-up. *Remaining:* MoT
+  pure mask (no new checkpoint keys); image/text keep the FlashAttention-2 path.
+  For the image-prefix arches (Joint-Decoder/MoT/MoMa), video self-attention
+  always takes the explicit-mask SDPA path (FA2 disabled, a `(B,1,S,S)` mask
+  built) even for fully-decoded clips — a deliberate compile/DP-friendly
+  trade-off; recovering FA2 / FlexAttention is a follow-up. (Cross-Attention
+  keeps FA2 on its text self-attention; it masks padded image K/V in the
+  cross-attention blocks instead.) *Remaining:* MoT
   configured with an MoE FFN still routes padded tokens through the shared MoE
   (a "generic token-validity in MoE" follow-up).
 - **Fixed `F` per batch** keeps tensor shapes static (for `torch.compile` and

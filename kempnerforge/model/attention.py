@@ -189,12 +189,16 @@ class Attention(nn.Module):
             self.last_attention_weights = attn_weights.detach().cpu()
         elif doc_ids is not None or key_padding_mask is not None:
             # An explicit attn_mask is not a FlashAttention-2 shape, so SDPA falls
-            # back to the mem-efficient/math kernel here. Video always passes a
-            # key_padding_mask (all-True when unpadded), so video training always
-            # takes this branch -- losing FA2 and materializing a (B, 1, S, S) mask
-            # even for fully-decoded clips. Deliberate: always-masking is
-            # torch.compile / DP-friendly (one graph, no host sync). Recovering FA2
-            # for unpadded batches (or moving to FlexAttention) is a follow-up.
+            # back to the mem-efficient/math kernel here. The image-prefix video
+            # arches (Joint-Decoder/MoMa here, MoT in mot.py) always pass a
+            # key_padding_mask (all-True when unpadded), so their self-attention
+            # always takes this branch -- losing FA2 and materializing a (B, 1, S, S)
+            # mask even for fully-decoded clips. (Cross-Attention sets no
+            # key_padding_mask on this text self-attention -- it masks padded image
+            # K/V in the cross-attention blocks instead -- so it keeps FA2 here.)
+            # Deliberate: always-masking is torch.compile / DP-friendly (one graph,
+            # no host sync). Recovering FA2 for unpadded batches (or moving to
+            # FlexAttention) is a follow-up.
             #
             # Asserts no kv_cache: neither doc_ids (packed training) nor
             # key_padding_mask (VLM video) co-occurs with decode today, and this
