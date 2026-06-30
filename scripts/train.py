@@ -757,13 +757,19 @@ def main() -> None:
                 pixel_values = batch["pixel_values"].to(device)
                 input_ids = batch["input_ids"].to(device)
                 labels = batch["labels"].to(device)
+                # Video batches carry per-frame timestamps + a validity mask; images do not.
                 frame_times = batch["frame_times"].to(device) if "frame_times" in batch else None
+                frame_mask = batch["frame_mask"].to(device) if "frame_mask" in batch else None
 
                 with maybe_no_sync(model, micro_step, tc.grad_accum_steps):
                     if mc.is_moe:
                         inner_transformer(model).set_moe_step(step, tc.max_steps)  # type: ignore[attr-defined]
                     logits, labels_out = model(
-                        pixel_values, input_ids, labels, frame_times=frame_times
+                        pixel_values,
+                        input_ids,
+                        labels,
+                        frame_times=frame_times,
+                        frame_mask=frame_mask,
                     )
                     loss = loss_fn(logits, labels_out)
 

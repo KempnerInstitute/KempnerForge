@@ -121,9 +121,19 @@ time, so it is set in the TOML, not via a `--vlm.arch=` CLI override.)
   per-frame timestamps lacks the `frame_time_embed` keys, so loading it into the
   current (default-on) video model needs `[time_embedding].type = "none"` or a
   warm-start key-fill.
-- **Padded frames are not yet masked from attention** — short clips pad to
-  `max_frames` with blank frames; a `frame_mask` is produced but not yet
-  consumed by the attention mask.
+- **Padded frames are masked from attention** — short/undecodable clips pad to
+  `max_frames` with blank frames, and the `frame_mask` is consumed so real
+  tokens never attend to padded-frame visual tokens (MoMa also drops them from
+  expert-choice routing); a NaN guard keeps an all-padded clip finite. It is a
+  pure mask (no new checkpoint keys); image/text keep the FlashAttention-2 path.
+  For the image-prefix arches (Joint-Decoder/MoT/MoMa), video self-attention
+  always takes the explicit-mask SDPA path (FA2 disabled, a `(B,1,S,S)` mask
+  built) even for fully-decoded clips — a deliberate compile/DP-friendly
+  trade-off; recovering FA2 / FlexAttention is a follow-up. (Cross-Attention
+  keeps FA2 on its text self-attention; it masks padded image K/V in the
+  cross-attention blocks instead.) *Remaining:* MoT
+  configured with an MoE FFN still routes padded tokens through the shared MoE
+  (a "generic token-validity in MoE" follow-up).
 - **Fixed `F` per batch** keeps tensor shapes static (for `torch.compile` and
   DP-rank consistency); variable-length clips arrive with VLM sequence packing.
 - **Long-context** (many frames) is blocked on context-parallel being wired.
