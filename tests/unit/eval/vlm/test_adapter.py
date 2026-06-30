@@ -341,6 +341,26 @@ def _pixels(batch: int = 1) -> torch.Tensor:
     return torch.randn(batch, 3, 16, 16)
 
 
+def _count_projection_calls(monkeypatch) -> list[int]:
+    """Patch the vision projection with a counting delegate; return a 1-element count.
+
+    ``_project_visual_features`` is the module global that every strategy's ``prepare``
+    and ``VLMWrapper.encode_visual`` resolve, so one patch sees both the encode-once
+    call and any per-step re-encode.
+    """
+    import kempnerforge.model.vlm as kf_vlm
+
+    original = kf_vlm._project_visual_features
+    count = [0]
+
+    def counting(wrapper, pixel_values):
+        count[0] += 1
+        return original(wrapper, pixel_values)
+
+    monkeypatch.setattr("kempnerforge.model.vlm._project_visual_features", counting)
+    return count
+
+
 @pytest.mark.parametrize("arch", GENERATIVE_ARCHES)
 class TestGenerateBatchSingle:
     """B == 1 must reproduce the v1 single-request behavior (every generative arch)."""
@@ -421,6 +441,32 @@ class TestGenerateBatchSingle:
         out = _generate_batch(arch_wrapper, _MockTokenizer(), _pixels(), long_prompt, r, 64)
         assert len(out) == 1 and len(out[0].split()) == 2
         assert any("left-truncating" in m for m in rec.warnings)
+
+
+@pytest.mark.parametrize("arch", GENERATIVE_ARCHES)
+def test_image_projection_encoded_once(arch_wrapper, monkeypatch):
+    """Across a multi-step decode the vision projection runs exactly once (encode-once),
+    not once per step, for every generative arch."""
+    count = _count_projection_calls(monkeypatch)
+    # eos None + max_new_tokens=6 => multiple decode steps run (asserted below); without
+    # caching the projection would run once per step.
+    r = _resolve_gen_kwargs({"max_new_tokens": 6}, 128)
+    prompt = [torch.tensor([5, 9, 12, 3], dtype=torch.long)]
+    out = _generate_batch(arch_wrapper, _MockTokenizer(), _pixels(), prompt, r, 64)
+    assert len(out[0].split()) == 6  # confirms the loop actually ran 6 steps
+    assert count[0] == 1
+
+
+def test_video_projection_encoded_once(tiny_video_vlm_wrapper, monkeypatch):
+    """A 5-D video clip (frames_per_clip=2) is encoded once across the decode — one folded
+    B*F encode up front, not one per step."""
+    count = _count_projection_calls(monkeypatch)
+    pixels = torch.randn(1, 2, 3, 16, 16)  # (B, frames_per_clip, 3, H, W)
+    prompt = [torch.tensor([5, 9, 12, 3], dtype=torch.long)]
+    r = _resolve_gen_kwargs({"max_new_tokens": 4}, 128)
+    out = _generate_batch(tiny_video_vlm_wrapper, _MockTokenizer(), pixels, prompt, r, 64)
+    assert len(out[0].split()) == 4
+    assert count[0] == 1
 
 
 @pytest.mark.parametrize("arch", GENERATIVE_ARCHES)

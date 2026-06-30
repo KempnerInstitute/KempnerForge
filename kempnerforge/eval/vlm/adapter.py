@@ -14,11 +14,13 @@ standard multimodal benchmarks lmms-eval implements as ``generate_until`` tasks
 and is arch-agnostic across the generative VLM arches.
 v1 scope and deliberate choices (see docs/how-to/run-vlm-evaluation.md):
 
-- **Generation: cache-less, single-GPU, batched.** The decode loop re-runs the
-  full ``VLMWrapper.forward`` over the growing sequence each step. There is no
+- **Generation: no transformer KV cache, single-GPU, batched.** The decode loop
+  re-runs the transformer over the growing sequence each step. There is no
   transformer KV cache (``Transformer.forward`` forbids combining ``kv_caches``
   with any image-conditioning route), and KempnerForge has no
-  image-conditioned KV-cache decode path. Requests are decoded in batches
+  image-conditioned KV-cache decode path. The projected vision embeds, by
+  contrast, are encoded once per request and reused across steps (see the next
+  bullet), so the encoder + adapter do not re-run each step. Requests are decoded in batches
   (``batch_size`` model-arg) by **right-padding** the text to the batch-max
   length — the same layout training uses (image prefix at ``0..n-1``, text
   contiguous from ``n``, trailing pads causally masked) — and reading each
@@ -27,11 +29,12 @@ v1 scope and deliberate choices (see docs/how-to/run-vlm-evaluation.md):
   base (defaults 0/1) and model construction sits behind ``_build_model`` so a
   data-parallel path is a localized future change.
 
-- **Vision re-encoded per step.** ``ModalityStrategy.prepare`` re-runs the
-  vision encoder + adapter internally on every forward, and there is no
-  arch-agnostic public seam on ``VLMWrapper`` to pass precomputed image
-  features. Encoding the image exactly once per request would require a
-  model-side change (a strategy method accepting cached embeds).
+- **Vision encoded once per request.** The decode loop calls
+  ``VLMWrapper.encode_visual`` once before generating and reuses the projected
+  embeds across all decode steps via ``forward(..., precomputed_embeds=…)`` /
+  ``ModalityStrategy.prepare(..., precomputed_embeds=…)``, so the vision encoder +
+  adapter run once per request rather than once per step. The seam is
+  arch-agnostic: every registered strategy honors ``precomputed_embeds``.
 
 - **Prompt rendering: flatten, no chat template.** KempnerForge pre-training
   uses no chat template / processor and no ``<image>`` placeholder (images are
@@ -379,20 +382,21 @@ def _generate_batch(
     resolved: dict[str, Any],
     max_seq_len: int,
 ) -> list[str]:
-    """Cache-less batched decode; returns one continuation per request.
+    """Batched decode (no transformer KV cache); returns one continuation per request.
 
     Decodes ``B`` requests together (``pixel_values`` is ``(B, 3, H, W)``,
-    ``prompt_ids`` a list of ``B`` 1-D token tensors). Re-runs
-    ``model(pixel_values, input_ids)`` over the growing **right-padded** batch
-    each step (no transformer KV cache; vision re-encoded per step — see module
-    docstring). Right-padding matches the training layout: the image prefix
-    stays at positions ``0..n-1`` and text is contiguous from ``n`` for every
-    row (so image/text RoPE distances are consistent across rows), and the
-    trailing pads are causally masked, so a batched forward gives each row the
-    same real-position logits as decoding it alone. Each row's next token is
-    read at its own last real position; EOS / ``max_new_tokens`` / first
-    ``until`` match are tracked per row. ``B == 1`` reproduces the
-    single-request path exactly.
+    ``prompt_ids`` a list of ``B`` 1-D token tensors). The projected visual embeds
+    are computed once up front via ``model.encode_visual`` and reused every step
+    through ``precomputed_embeds``, so the vision encoder + adapter do not re-run
+    per step. There is still no transformer KV cache: ``model(...)`` is re-run over
+    the growing **right-padded** batch each step. Right-padding matches the training
+    layout: the image prefix stays at positions ``0..n-1`` and text is contiguous
+    from ``n`` for every row (so image/text RoPE distances are consistent across
+    rows), and the trailing pads are causally masked, so a batched forward gives
+    each row the same real-position logits as decoding it alone. Each row's next
+    token is read at its own last real position; EOS / ``max_new_tokens`` / first
+    ``until`` match are tracked per row. ``B == 1`` reproduces the single-request
+    path exactly.
     """
     until: list[str] = resolved["until"]
     max_new_tokens: int = resolved["max_new_tokens"]
@@ -429,6 +433,12 @@ def _generate_batch(
     done = [False] * batch_size
     row_index = torch.arange(batch_size, device=device)
 
+    # Vision embeds depend only on pixel_values (invariant across decode steps), so
+    # encode the clip once and reuse it every step instead of re-running the encoder +
+    # adapter inside each forward. (Not a KV cache: the transformer is still re-run over
+    # the full sequence each step.)
+    visual_embeds = model.encode_visual(pixel_values)
+
     for _ in range(max_new_tokens):
         # Rebuild the right-padded batch from prompt + tokens generated so far.
         seqs = [
@@ -441,7 +451,7 @@ def _generate_batch(
         for i, s in enumerate(seqs):
             input_ids[i, : s.shape[0]] = s
 
-        logits, _ = model(pixel_values, input_ids)
+        logits, _ = model(pixel_values, input_ids, precomputed_embeds=visual_embeds)
         # Each row's next-token logits sit at its own last real position (the
         # output is already trimmed to text positions for JD/MoT; CA has no
         # image prefix), not at [-1] (a pad for shorter rows).

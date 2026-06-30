@@ -148,13 +148,14 @@ Several are tracked follow-ups.
   and any model-specific chat template. KempnerForge pre-training uses no chat
   template; once a post-training format exists, repo-wide chat-template support
   should be added and the rendering step made configurable.
-- **No KV cache; vision re-encoded per step.** Decoding re-runs the full forward
-  over the growing sequence each step (KempnerForge has no image-conditioned
-  KV-cache decode path), and the vision tower is re-encoded each step (there is
-  no arch-agnostic public seam to pass cached image features). Both are correct
-  but cost extra compute. Raising `--batch-size` decodes multiple requests
-  together (right-padded, grouped by `gen_kwargs`) to amortize per-step overhead;
-  encode-once and a KV-cache decode are future work.
+- **No KV cache.** Decoding re-runs the full transformer over the growing sequence
+  each step (KempnerForge has no image-conditioned KV-cache decode path); this is
+  correct but costs extra compute, and a KV-cache decode is future work. The vision
+  tower + adapter, by contrast, are cached: they are encoded
+  once per request and the projected embeds are reused across all decode steps via
+  the `VLMWrapper.encode_visual` / `precomputed_embeds` seam (arch-agnostic across
+  the modality strategies). Raising `--batch-size` decodes multiple requests together
+  (right-padded, grouped by `gen_kwargs`) to amortize the per-step transformer cost.
 
 ## Cluster environment notes
 
