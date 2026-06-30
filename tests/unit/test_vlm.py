@@ -683,6 +683,9 @@ class TestFramePaddingMask:
         out = _visual_token_mask(fm, num_visual_tokens=6)  # 2 tokens/frame
         assert out.tolist() == [[True, True, False, False, True, True]]
         assert _visual_token_mask(None, 6) is None
+        # Non-divisible count (e.g. a future non-per-frame token) must fail loudly.
+        with pytest.raises(ValueError, match="multiple of num_frames"):
+            _visual_token_mask(fm, num_visual_tokens=7)
 
     @pytest.mark.parametrize("arch", ["joint_decoder", "cross_attention", "mot", "moma"])
     def test_masked_frames_do_not_affect_real_tokens(self, arch):

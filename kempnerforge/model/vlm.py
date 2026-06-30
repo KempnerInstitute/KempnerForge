@@ -133,6 +133,16 @@ def _visual_token_mask(
     if frame_mask is None:
         return None
     num_frames = frame_mask.shape[1]
+    if num_visual_tokens % num_frames != 0:
+        # Visual tokens are frame-contiguous (F * tokens_per_frame), so the count
+        # must be divisible by the frame count. A future adapter that adds a
+        # non-per-frame token (e.g. a global/CLS token) would break this and
+        # silently misalign the mask -- fail loudly here instead.
+        raise ValueError(
+            f"_visual_token_mask: num_visual_tokens ({num_visual_tokens}) is not a "
+            f"multiple of num_frames ({num_frames}); the per-frame expansion assumes "
+            "frame-contiguous visual tokens."
+        )
     tokens_per_frame = num_visual_tokens // num_frames
     return frame_mask.repeat_interleave(tokens_per_frame, dim=1)
 

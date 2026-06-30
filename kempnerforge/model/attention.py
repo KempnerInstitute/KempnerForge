@@ -188,6 +188,22 @@ class Attention(nn.Module):
             )
             self.last_attention_weights = attn_weights.detach().cpu()
         elif doc_ids is not None or key_padding_mask is not None:
+            # An explicit attn_mask is not a FlashAttention-2 shape, so SDPA falls
+            # back to the mem-efficient/math kernel here. Video always passes a
+            # key_padding_mask (all-True when unpadded), so video training always
+            # takes this branch -- losing FA2 and materializing a (B, 1, S, S) mask
+            # even for fully-decoded clips. Deliberate: always-masking is
+            # torch.compile / DP-friendly (one graph, no host sync). Recovering FA2
+            # for unpadded batches (or moving to FlexAttention) is a follow-up.
+            #
+            # Asserts no kv_cache: neither doc_ids (packed training) nor
+            # key_padding_mask (VLM video) co-occurs with decode today, and this
+            # branch's full-sequence causal mask would mis-handle a cached
+            # (seq_len=1) decode rather than attend to all cached positions.
+            assert kv_cache is None, (
+                "doc_ids / key_padding_mask are not supported with kv_cache decode "
+                "(would build an incorrect causal mask)."
+            )
             seq_len_kv = k.shape[2]
             # Explicit bool mask: causal, AND same-document (doc_ids), AND valid
             # keys (key_padding_mask, e.g. dropping padded video frames' tokens).
