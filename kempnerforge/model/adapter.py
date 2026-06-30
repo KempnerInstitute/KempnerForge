@@ -102,6 +102,34 @@ def _grid_side(num_tokens: int) -> int:
     return grid
 
 
+def _pad_grid_to_windows(
+    x: torch.Tensor, window: int
+) -> tuple[torch.Tensor, int, torch.Tensor | None]:
+    """Reshape patch tokens to a square grid, padded to tile into windows.
+
+    ``x`` is ``(B, grid**2, C)``. Returns ``(x, per, valid)``: ``x`` reshaped to
+    ``(B, padded, padded, C)`` with ``padded = ceil(grid/window) * window``
+    (bottom/right zero-padded so it tiles into ``per × per`` windows of
+    ``window × window``), and ``valid`` a ``(B, padded, padded, 1)`` bool mask of
+    the real (non-padded) patches -- or ``None`` when the grid is already
+    divisible (no padding, so callers skip masking). Shared by the pooling
+    adapters so their ragged edge handling stays in lock-step.
+    """
+    b, n, c = x.shape
+    grid = _grid_side(n)
+    per = math.ceil(grid / window)
+    padded = per * window
+    x = x.view(b, grid, grid, c)
+    if padded == grid:
+        return x, per, None
+    pad = padded - grid
+    valid = torch.ones(b, grid, grid, 1, dtype=torch.bool, device=x.device)
+    # F.pad pads the last dim backward: (C:0,0)(W:0,pad)(H:0,pad).
+    x = F.pad(x, (0, 0, 0, pad, 0, pad))
+    valid = F.pad(valid, (0, 0, 0, pad, 0, pad))  # (B, padded, padded, 1) bool
+    return x, per, valid
+
+
 class VisionAdapter(nn.Module):
     """Base class for vision→LLM adapters (the connector).
 
@@ -218,23 +246,15 @@ class AvgPoolAdapter(VisionAdapter):
         w = pool_window if pool_window is not None else self.pool_window
         if w <= 0:
             raise ValueError(f"pool_window must be positive (got {w})")
-        b, n, c = x.shape
-        grid = _grid_side(n)
-        per = math.ceil(grid / w)
-        padded = per * w
-        x = x.view(b, grid, grid, c)
-        if padded != grid:
-            pad = padded - grid
-            # F.pad pads from the last dim backward: (C:0,0)(W:0,pad)(H:0,pad).
-            x = F.pad(x, (0, 0, 0, pad, 0, pad))
-            mask = torch.ones(b, grid, grid, 1, dtype=x.dtype, device=x.device)
-            mask = F.pad(mask, (0, 0, 0, pad, 0, pad))
-        else:
-            mask = torch.ones(b, padded, padded, 1, dtype=x.dtype, device=x.device)
+        x, per, valid = _pad_grid_to_windows(x, w)
+        b, _, _, c = x.shape
         # Group into windows and average over real (unpadded) cells only.
         sums = x.view(b, per, w, per, w, c).sum(dim=(2, 4))  # (B, per, per, C)
-        counts = mask.view(b, per, w, per, w, 1).sum(dim=(2, 4)).clamp_(min=1)  # (B, per, per, 1)
-        pooled = (sums / counts).reshape(b, per * per, c)
+        if valid is None:
+            pooled = (sums / (w * w)).reshape(b, per * per, c)
+        else:
+            counts = valid.view(b, per, w, per, w, 1).to(sums.dtype).sum(dim=(2, 4)).clamp_(min=1)
+            pooled = (sums / counts).reshape(b, per * per, c)
         return self.proj(pooled)
 
 
@@ -293,23 +313,17 @@ class AttentionalPoolAdapter(VisionAdapter):
         w = pool_window if pool_window is not None else self.pool_window
         if w <= 0:
             raise ValueError(f"pool_window must be positive (got {w})")
-        b, n, c = x.shape
-        grid = _grid_side(n)
-        per = math.ceil(grid / w)
-        padded = per * w
+        x, per, valid = _pad_grid_to_windows(x, w)
+        b, _, _, c = x.shape
         k_win = w * w
-        x = x.view(b, grid, grid, c)
-        # Ragged grid (grid not divisible by w): pad the bottom/right edges to
-        # per*w and mask the padded patches out of each edge window's attention,
-        # so a window pools only its real patches (Molmo2 §A). Divisible grids
-        # skip this and stay bit-identical to the unmasked pooling.
-        win_mask: torch.Tensor | None = None
-        if padded != grid:
-            pad = padded - grid
-            valid = torch.ones(b, grid, grid, 1, dtype=torch.bool, device=x.device)
-            # F.pad pads the last dim backward: (C:0,0)(W:0,pad)(H:0,pad).
-            x = F.pad(x, (0, 0, 0, pad, 0, pad))
-            valid = F.pad(valid, (0, 0, 0, pad, 0, pad))  # (B, padded, padded, 1) bool
+        # Ragged grid: each padded edge window pools only its real patches via a
+        # masked attention -- `valid` masks the padded patches out of the window's
+        # K/V (and the masked-mean query). Divisible grids return valid=None and
+        # stay bit-identical to the unmasked pooling.
+        win_mask: torch.Tensor | None
+        if valid is None:
+            win_mask = None
+        else:
             # Window order must match `windows` below.
             win_mask = (
                 valid.view(b, per, w, per, w, 1)
