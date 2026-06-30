@@ -175,6 +175,7 @@ def main() -> None:
             adapter_config=adapter_cfg,
             vlm_config=vlm_cfg,
             frames_per_clip=(config.video.max_frames if config.video is not None else 1),
+            time_embedding_config=config.time_embedding,
             ac_mode=tc.activation_checkpointing,
             mp_policy=mp_policy,
             param_dtype=tc.param_dtype,
@@ -758,14 +759,19 @@ def main() -> None:
                 pixel_values = batch["pixel_values"].to(device)
                 input_ids = batch["input_ids"].to(device)
                 labels = batch["labels"].to(device)
-                # Video batches carry a per-frame validity mask; image batches do not.
+                # Video batches carry per-frame timestamps + a validity mask; images do not.
+                frame_times = batch["frame_times"].to(device) if "frame_times" in batch else None
                 frame_mask = batch["frame_mask"].to(device) if "frame_mask" in batch else None
 
                 with maybe_no_sync(model, micro_step, tc.grad_accum_steps):
                     if mc.is_moe:
                         inner_transformer(model).set_moe_step(step, tc.max_steps)  # type: ignore[attr-defined]
                     logits, labels_out = model(
-                        pixel_values, input_ids, labels, frame_mask=frame_mask
+                        pixel_values,
+                        input_ids,
+                        labels,
+                        frame_times=frame_times,
+                        frame_mask=frame_mask,
                     )
                     loss = loss_fn(logits, labels_out)
 

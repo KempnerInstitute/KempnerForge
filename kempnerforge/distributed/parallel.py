@@ -347,6 +347,13 @@ def _apply_fsdp_vlm(
         mp_policy=policy,
         reshard_after_forward=reshard_after_forward,
     )
+    if wrapper.frame_time_embed is not None:
+        fully_shard(
+            wrapper.frame_time_embed,
+            mesh=dp_mesh,
+            mp_policy=policy,
+            reshard_after_forward=reshard_after_forward,
+        )
     if not encoder_frozen:
         fully_shard(
             wrapper.vision_encoder,
@@ -374,6 +381,7 @@ def _build_vlm(
     compile_model: bool,
     fp8: bool,
     frames_per_clip: int = 1,
+    time_embedding_config=None,
 ) -> torch.nn.Module:
     """Build a VLM wrapper with parallelism applied in the correct order.
 
@@ -399,6 +407,7 @@ def _build_vlm(
     from kempnerforge.distributed.expert_parallel import apply_expert_parallel
     from kempnerforge.distributed.tensor_parallel import apply_tensor_parallel
     from kempnerforge.model.adapter import build_adapter
+    from kempnerforge.model.frame_time import build_time_embedding
     from kempnerforge.model.transformer import Transformer
     from kempnerforge.model.vlm import (
         VLMWrapper,
@@ -434,9 +443,24 @@ def _build_vlm(
         transformer = Transformer(
             model_config, vlm_config=vlm_config, num_image_tokens=visual_tokens
         )
+        # Video gets a per-frame timestamp embedding (registry-selected via
+        # [time_embedding]); built alongside the adapter so it shares the
+        # meta/CPU build + materialize path below.
+        frame_time_embed = (
+            build_time_embedding(time_embedding_config, model_config.dim)
+            if frames_per_clip > 1
+            else None
+        )
 
     strategy = build_modality_strategy(vlm_config)
-    wrapper = VLMWrapper(encoder, adapter, transformer, strategy, frames_per_clip=frames_per_clip)
+    wrapper = VLMWrapper(
+        encoder,
+        adapter,
+        transformer,
+        strategy,
+        frames_per_clip=frames_per_clip,
+        frame_time_embed=frame_time_embed,
+    )
 
     # 3. Length cross-check now that num_tokens is resolved.
     required = wrapper.num_image_tokens + vlm_config.max_text_len
@@ -470,12 +494,19 @@ def _build_vlm(
         # weights after to_empty. nn.Module itself does not declare the
         # method, so pyright sees an unknown attr; suppress the report.
         adapter.reset_parameters()  # type: ignore[reportCallIssue,reportAttributeAccessIssue]
+        if frame_time_embed is not None:
+            frame_time_embed.to_empty(device=device)
+            frame_time_embed.reset_parameters()
     else:
         transformer.to(device=device)
         adapter.to(device=device)
+        if frame_time_embed is not None:
+            frame_time_embed.to(device=device)
     encoder.to(device)  # Keep HF dtype per D16.
     transformer.to(dtype=param_dtype)
     adapter.to(dtype=param_dtype)
+    if frame_time_embed is not None:
+        frame_time_embed.to(dtype=param_dtype)
 
     # 7. Freeze specs + eval() for fully frozen encoder.
     apply_freeze_specs(wrapper, vlm_config.freeze, vlm_config.module_patterns)
@@ -510,6 +541,7 @@ def build_parallel_model(
     compile_model: bool = False,
     fp8: bool = False,
     frames_per_clip: int = 1,
+    time_embedding_config=None,
 ) -> torch.nn.Module:
     """Build a Transformer (or a VLMWrapper) with parallelism applied.
 
@@ -554,6 +586,7 @@ def build_parallel_model(
             compile_model=compile_model,
             fp8=fp8,
             frames_per_clip=frames_per_clip,
+            time_embedding_config=time_embedding_config,
         )
 
     from kempnerforge.distributed.tensor_parallel import apply_tensor_parallel

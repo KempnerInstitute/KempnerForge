@@ -76,16 +76,18 @@ def _video_duration_seconds(stream: Any, container: Any) -> float:
 
 def decode_video_frames(
     path: str, *, fps: float, min_frames: int, max_frames: int, sampling_policy: str = "uniform"
-) -> list[PILImage]:
-    """Decode a clip into a list of sampled ``PIL.Image`` frames (RGB).
+) -> tuple[list[PILImage], list[float]]:
+    """Decode a clip into sampled ``PIL.Image`` frames (RGB) + their times.
 
     Frames are chosen by the registered ``sampling_policy`` (default
     ``"uniform"`` = ``sample_timestamps``) and read in a single decode pass: each
     target timestamp is mapped to the first decoded frame at or after it
     (timestamps past the last frame map to the last frame, so the final frame is
-    always returned). The returned list has length equal to the number of sampled
-    timestamps (``<= max_frames``), or is empty when the file has no decodable
-    video stream.
+    always returned). Returns ``(frames, times)`` where ``times`` are the matched
+    frames' actual presentation times in seconds (parallel to ``frames``, so the
+    caller can encode *when* each frame occurs). Both lists have length equal to
+    the number of sampled timestamps (``<= max_frames``), or are empty when the
+    file has no decodable video stream.
 
     Raises whatever ``av`` raises on a missing/corrupt file; callers that train
     over noisy data should catch and substitute an empty clip.
@@ -100,9 +102,10 @@ def decode_video_frames(
 
     sample = registry.get_sampling_policy(sampling_policy)
     images: list[PILImage] = []
+    times: list[float] = []
     with av.open(path) as container:
         if not container.streams.video:
-            return images
+            return images, times
         stream = container.streams.video[0]
         stream.thread_type = "AUTO"
         duration_s = _video_duration_seconds(stream, container)
@@ -111,17 +114,22 @@ def decode_video_frames(
         j = 0
         eps = 1e-3
         last_frame = None
+        last_t = 0.0
         for frame in container.decode(stream):
             t = float(frame.time) if frame.time is not None else 0.0
             while j < len(targets) and t + eps >= targets[j]:
                 images.append(frame.to_image())
+                times.append(t)
                 j += 1
             last_frame = frame
+            last_t = t
             if j >= len(targets):
                 break
         # Trailing targets (e.g. the final ``duration_s`` timestamp, which sits
         # just past the last frame's PTS) map to the last decoded frame.
         if j < len(targets) and last_frame is not None:
             tail = last_frame.to_image()
-            images.extend(tail for _ in range(len(targets) - j))
-    return images
+            for _ in range(len(targets) - j):
+                images.append(tail)
+                times.append(last_t)
+    return images, times

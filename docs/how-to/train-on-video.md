@@ -25,8 +25,14 @@ A clip of `F` frames becomes `F × P′` visual tokens:
      blocks; the residual stays text-only (so it fits more frames per
      `max_seq_len`).
 
-Temporal order is carried by frame order (sequential positions). Per-frame
-timestamp tokens and grounding outputs are a separate follow-up (see below).
+Temporal order is carried by frame order (sequential positions). On top of that,
+each frame's **timestamp in seconds** is embedded and added to that frame's
+visual tokens, so the model sees *when* each frame occurs, not just its order.
+The embedding is registry-driven: `[time_embedding].type` selects it
+(`sinusoidal` by default — sinusoidal features at log-spaced periods through a
+zero-initialized projection; `none` disables it), so new techniques (learned,
+Fourier, …) register as small additions and switch via config. Grounding
+outputs are a separate follow-up (see below).
 
 ## Token budget
 
@@ -99,9 +105,22 @@ time, so it is set in the TOML, not via a `--vlm.arch=` CLI override.)
 
 ## Constraints and follow-ups
 
-- **Causal attention; no per-frame timestamps yet** — temporal order is frame
-  order. Per-frame timestamp tokens + grounding (`<points>`/`<tracks>` outputs
-  with point-F1 / track-J&F eval) are a follow-up.
+- **Grounding outputs are a follow-up** — per-frame timestamps are encoded (see
+  above), but structured grounding (`<points>`/`<tracks>` outputs with point-F1
+  / track-J&F eval) is not yet implemented.
+- **Sequence-modifying time encodings are a separate hook** — the
+  `[time_embedding]` registry is for *additive* per-frame embeddings (no change
+  to sequence length). Molmo2-style interleaved text time-tokens change the
+  token sequence and need interleaved/variable-length sequence support KF does
+  not have yet; they would hook the sequence-assembly layer, not this registry.
+- **Inference must pass `frame_times`** — a video model silently drops the
+  learned temporal signal if `frame_times` is `None` (no error is raised).
+  Training threads it automatically; eval/generate paths must pass it for video
+  models.
+- **Resuming a pre-timestamp video checkpoint** — a checkpoint trained before
+  per-frame timestamps lacks the `frame_time_embed` keys, so loading it into the
+  current (default-on) video model needs `[time_embedding].type = "none"` or a
+  warm-start key-fill.
 - **Padded frames are masked from attention** — short/undecodable clips pad to
   `max_frames` with blank frames, and the `frame_mask` is consumed so real
   tokens never attend to padded-frame visual tokens (MoMa also drops them from

@@ -25,6 +25,7 @@ from kempnerforge.config.schema import (
     VisionEncoderConfig,
     VLMConfig,
 )
+from kempnerforge.config.time_embedding import TimeEmbeddingConfig
 from kempnerforge.config.vlm import MoMaConfig
 
 # ---------------------------------------------------------------------------
@@ -600,6 +601,43 @@ class TestHfEncoderOverrideWarning:
         with caplog.at_level("WARNING", logger="kempnerforge.config.job"):
             self._vlm_config_with(type="random", feature_dim=384, num_tokens=64)
         assert not any("random" in r.getMessage() for r in caplog.records)
+
+
+class TestTimeEmbeddingIneffectiveWarning:
+    """``JobConfig.__post_init__`` warns when an explicit, enabled
+    ``[time_embedding]`` is paired with a non-video config: the per-frame time
+    embedding is built only for video (``frames_per_clip > 1``), so it is
+    silently ignored otherwise (mirrors the HF-encoder-override warning)."""
+
+    def setup_method(self):
+        import logging
+
+        self._kf_logger = logging.getLogger("kempnerforge")
+        self._old_propagate = self._kf_logger.propagate
+        self._kf_logger.propagate = True
+
+    def teardown_method(self):
+        self._kf_logger.propagate = self._old_propagate
+
+    def _image_vlm(self, time_embedding):
+        return JobConfig(
+            model=ModelConfig(max_seq_len=2304),
+            vision_encoder=VisionEncoderConfig(type="random", feature_dim=384, num_tokens=64),
+            adapter=AdapterConfig(),
+            vlm=VLMConfig(max_text_len=2048),
+            time_embedding=time_embedding,
+        )
+
+    def test_warns_when_time_embedding_set_without_video(self, caplog):
+        with caplog.at_level("WARNING", logger="kempnerforge.config.job"):
+            self._image_vlm(TimeEmbeddingConfig())
+        assert any("[time_embedding] is set" in r.getMessage() for r in caplog.records)
+
+    def test_no_warning_when_disabled(self, caplog):
+        # type="none" is an intentional disable and stays quiet.
+        with caplog.at_level("WARNING", logger="kempnerforge.config.job"):
+            self._image_vlm(TimeEmbeddingConfig(type="none"))
+        assert not any("[time_embedding] is set" in r.getMessage() for r in caplog.records)
 
 
 class TestMoMaAcFullWarning:
