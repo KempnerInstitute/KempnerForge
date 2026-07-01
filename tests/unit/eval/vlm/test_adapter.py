@@ -377,6 +377,15 @@ class TestResolveGenKwargs:
     def test_until_list_preserved(self):
         assert _resolve_gen_kwargs({"until": ["a", "b"]}, 64)["until"] == ["a", "b"]
 
+    def test_explicit_zero_max_new_tokens_honored(self):
+        # 0 is a valid explicit value, not a "missing" fallback.
+        assert _resolve_gen_kwargs({"max_new_tokens": 0}, 64)["max_new_tokens"] == 0
+
+    def test_explicit_zero_top_p_honored_when_sampling(self):
+        # top_p only applies when sampling; an explicit 0.0 must not fall back to 1.0.
+        r = _resolve_gen_kwargs({"temperature": 0.5, "top_p": 0.0}, 64)
+        assert r["top_p"] == 0.0
+
 
 # ---------------------------------------------------------------------------
 # _generate_batch (cache-less batched decode loop) on a tiny random VLM

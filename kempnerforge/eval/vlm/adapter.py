@@ -345,24 +345,35 @@ def _frames_to_pixel_values(
 
 
 def _resolve_gen_kwargs(gen_kwargs: dict[str, Any], default_max_new_tokens: int) -> dict[str, Any]:
-    """Merge task ``gen_kwargs`` over the adapter's fallback defaults."""
-    until = gen_kwargs.get("until") or []
-    if isinstance(until, str):
+    """Merge task ``gen_kwargs`` over the adapter's fallback defaults.
+
+    Uses explicit ``is None`` checks (not ``x or default``) so an explicit falsy
+    task value — ``max_new_tokens=0`` or ``top_p=0.0`` — is honored rather than
+    silently replaced by the default.
+    """
+    until = gen_kwargs.get("until")
+    if until is None:
+        until = []
+    elif isinstance(until, str):
         until = [until]
 
-    max_new_tokens = gen_kwargs.get("max_new_tokens") or default_max_new_tokens
-    temperature = gen_kwargs.get("temperature") or 0.0
+    mnt = gen_kwargs.get("max_new_tokens")
+    max_new_tokens = default_max_new_tokens if mnt is None else int(mnt)
+    temp = gen_kwargs.get("temperature")
+    temperature = 0.0 if temp is None else float(temp)
     # An explicit do_sample=False forces greedy even if a temperature is given.
     if not gen_kwargs.get("do_sample", temperature > 0):
         temperature = 0.0
 
     sampling = temperature > 0
+    top_k = gen_kwargs.get("top_k")
+    top_p = gen_kwargs.get("top_p")
     return {
         "until": [u for u in until if u],
-        "max_new_tokens": int(max_new_tokens),
-        "temperature": float(temperature),
-        "top_k": int(gen_kwargs.get("top_k") or 0) if sampling else 0,
-        "top_p": float(gen_kwargs.get("top_p") or 1.0) if sampling else 1.0,
+        "max_new_tokens": max_new_tokens,
+        "temperature": temperature,
+        "top_k": (0 if top_k is None else int(top_k)) if sampling else 0,
+        "top_p": (1.0 if top_p is None else float(top_p)) if sampling else 1.0,
     }
 
 
