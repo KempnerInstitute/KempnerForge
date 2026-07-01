@@ -28,7 +28,12 @@ import torch
 import torch.distributed.checkpoint as dcp
 from PIL import Image
 
-pytest.importorskip("lmms_eval")
+lmms_eval = pytest.importorskip("lmms_eval")
+if getattr(lmms_eval, "__file__", None) is None:
+    # The unit conftest injects a fake lmms_eval (a bare module with no __file__);
+    # these DCP-roundtrip tests need the real package, so skip rather than bind the
+    # fake (mirrors tests/integration/test_lmms_eval_contract.py).
+    pytest.skip("fake lmms_eval is active; skipping real-package tests", allow_module_level=True)
 
 from lmms_eval.api.instance import Instance  # noqa: E402
 
