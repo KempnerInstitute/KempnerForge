@@ -373,11 +373,14 @@ def _generate_batch(
     prompt_ids: list[torch.Tensor],
     resolved: dict[str, Any],
     max_seq_len: int,
+    frame_mask: torch.Tensor | None = None,
 ) -> list[str]:
     """Batched decode (no transformer KV cache); returns one continuation per request.
 
-    Decodes ``B`` requests together (``pixel_values`` is ``(B, 3, H, W)``,
-    ``prompt_ids`` a list of ``B`` 1-D token tensors). There is no transformer KV
+    Decodes ``B`` requests together (``pixel_values`` is ``(B, 3, H, W)`` or a
+    ``(B, F, 3, H, W)`` video clip, ``prompt_ids`` a list of ``B`` 1-D token
+    tensors; ``frame_mask`` is ``(B, F)`` bool for video, masking padded-frame
+    visual tokens from attention as in training). There is no transformer KV
     cache and no vision cache: ``model(...)`` re-runs over the growing
     **right-padded** batch each step, re-encoding the vision tower each time.
     Right-padding matches the training
@@ -436,7 +439,7 @@ def _generate_batch(
         for i, s in enumerate(seqs):
             input_ids[i, : s.shape[0]] = s
 
-        logits, _ = model(pixel_values, input_ids)
+        logits, _ = model(pixel_values, input_ids, frame_mask=frame_mask)
         # Each row's next-token logits sit at its own last real position (the
         # output is already trimmed to text positions for JD/MoT; CA has no
         # image prefix), not at [-1] (a pad for shorter rows).
@@ -560,6 +563,7 @@ class KempnerForgeVLM(lmms):
             # Every request in the chunk shares gen_kwargs (index 2); resolve once.
             resolved = _resolve_gen_kwargs(chunk[0][2], self._default_max_new_tokens)
             frames_batch: list[torch.Tensor] = []
+            masks_batch: list[torch.Tensor] = []
             prompt_ids: list[torch.Tensor] = []
             for args in chunk:
                 # Chat 6-tuple: (context, doc_to_messages, gen_kwargs, doc_id, task, split).
@@ -567,12 +571,15 @@ class KempnerForgeVLM(lmms):
                 messages = ChatMessages(messages=args[1](doc))
                 frames, prompt = _render_request(messages, self._config.video)
                 if self._is_video:
-                    # Fixed (frames_per_clip, 3, H, W) clip, zero-padded — identical to
-                    # training (frames_to_clip_tensor is the shared helper).
-                    clip, _ = frames_to_clip_tensor(
+                    # Fixed (frames_per_clip, 3, H, W) clip + per-frame validity mask,
+                    # zero-padded — identical to training (frames_to_clip_tensor is the
+                    # shared helper). The mask hides padded-frame visual tokens from
+                    # attention, matching the training-time masking.
+                    clip, fmask = frames_to_clip_tensor(
                         frames, max_frames=self._frames_per_clip, frame_size=self._frame_size
                     )
                     frames_batch.append(clip.to(device=self._device, dtype=self._dtype))
+                    masks_batch.append(fmask.to(device=self._device))
                 else:
                     frames_batch.append(
                         _frames_to_pixel_values(frames, self._frame_size, self._device, self._dtype)
@@ -586,15 +593,24 @@ class KempnerForgeVLM(lmms):
                         device=self._device,
                     )
                 )
-            # Video: (B, F, 3, H, W) via stack (each request is one F-frame clip).
-            # Image: (B, 3, H, W) via cat (each request is one frame). cat on video
-            # would fold frames into the batch and trip the frames-per-clip check.
+            # Video: (B, F, 3, H, W) via stack (each request is one F-frame clip),
+            # with a (B, F) frame mask. Image: (B, 3, H, W) via cat (each request is
+            # one frame), no mask. cat on video would fold frames into the batch and
+            # trip the frames-per-clip check.
             if self._is_video:
                 pixel_values = torch.stack(frames_batch, dim=0)
+                frame_mask = torch.stack(masks_batch, dim=0)
             else:
                 pixel_values = torch.cat(frames_batch, dim=0)
+                frame_mask = None
             outputs = _generate_batch(
-                self._model, self._tokenizer, pixel_values, prompt_ids, resolved, self._max_seq_len
+                self._model,
+                self._tokenizer,
+                pixel_values,
+                prompt_ids,
+                resolved,
+                self._max_seq_len,
+                frame_mask=frame_mask,
             )
             for args, output in zip(chunk, outputs, strict=True):
                 results.append(output)

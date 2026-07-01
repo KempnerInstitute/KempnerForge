@@ -480,6 +480,51 @@ class TestGenerateBatchMulti:
 
 
 # ---------------------------------------------------------------------------
+# _generate_batch frame_mask threading (video padded-frame masking)
+# ---------------------------------------------------------------------------
+
+
+class _CaptureModel:
+    """Minimal ``VLMWrapper`` stand-in: records the ``frame_mask`` each forward
+    receives and returns deterministic zero logits (greedy -> token 0), so the
+    decode-loop plumbing can be asserted without a real transformer."""
+
+    def __init__(self, num_image_tokens: int, vocab_size: int = 256) -> None:
+        self.num_image_tokens = num_image_tokens
+        self._vocab = vocab_size
+        self.seen_frame_masks: list[torch.Tensor | None] = []
+
+    def __call__(self, pixel_values, input_ids, frame_mask=None):
+        del pixel_values
+        self.seen_frame_masks.append(frame_mask)
+        b, t = input_ids.shape
+        return torch.zeros(b, t, self._vocab), None
+
+
+def test_generate_batch_threads_frame_mask_for_video():
+    """A video batch passes the same (B, F) frame_mask into every model forward, so
+    padded-frame visual tokens are masked from attention exactly as in training."""
+    model = _CaptureModel(num_image_tokens=16)
+    pixel_values = torch.randn(2, 2, 3, 16, 16)  # (B, F=2, 3, H, W)
+    frame_mask = torch.tensor([[True, True], [True, False]])  # row 1: frame 2 padded
+    prompt_ids = [torch.tensor([5, 9], dtype=torch.long), torch.tensor([7], dtype=torch.long)]
+    r = _resolve_gen_kwargs({"max_new_tokens": 3}, 128)
+    _generate_batch(model, _MockTokenizer(), pixel_values, prompt_ids, r, 64, frame_mask=frame_mask)
+    assert model.seen_frame_masks  # decode actually ran
+    assert all(fm is frame_mask for fm in model.seen_frame_masks)
+
+
+def test_generate_batch_no_frame_mask_for_image():
+    """An image batch forwards frame_mask=None so the model keeps its unmasked path."""
+    model = _CaptureModel(num_image_tokens=8)
+    pixel_values = torch.randn(1, 3, 16, 16)
+    prompt_ids = [torch.tensor([5, 9, 12], dtype=torch.long)]
+    r = _resolve_gen_kwargs({"max_new_tokens": 2}, 128)
+    _generate_batch(model, _MockTokenizer(), pixel_values, prompt_ids, r, 64)
+    assert model.seen_frame_masks and all(fm is None for fm in model.seen_frame_masks)
+
+
+# ---------------------------------------------------------------------------
 # Guards: arch + not-implemented methods
 # ---------------------------------------------------------------------------
 
