@@ -562,56 +562,83 @@ class KempnerForgeVLM(lmms):
         for chunk in re_ords.get_batched(n=self._batch_size, batch_fn=None):
             # Every request in the chunk shares gen_kwargs (index 2); resolve once.
             resolved = _resolve_gen_kwargs(chunk[0][2], self._default_max_new_tokens)
+            # Per-request slots aligned to ``chunk``: ``None`` = filled by generation
+            # below; ``""`` = a request that failed to render/preprocess, isolated
+            # with a warning so one bad doc does not abort the whole run.
+            chunk_outputs: list[str | None] = [None] * len(chunk)
             frames_batch: list[torch.Tensor] = []
             masks_batch: list[torch.Tensor] = []
             prompt_ids: list[torch.Tensor] = []
-            for args in chunk:
-                # Chat 6-tuple: (context, doc_to_messages, gen_kwargs, doc_id, task, split).
-                doc = self.task_dict[args[4]][args[5]][args[3]]
-                messages = ChatMessages(messages=args[1](doc))
-                frames, prompt = _render_request(messages, self._config.video)
+            for slot, args in enumerate(chunk):
+                try:
+                    # Chat 6-tuple: (context, doc_to_messages, gen_kwargs, doc_id, task, split).
+                    doc = self.task_dict[args[4]][args[5]][args[3]]
+                    messages = ChatMessages(messages=args[1](doc))
+                    frames, prompt = _render_request(messages, self._config.video)
+                    # Mirror training tokenization: no chat template, no <image>
+                    # placeholder, add_special_tokens=False (images go via pixel_values).
+                    token_ids = self._tokenizer(prompt, add_special_tokens=False)["input_ids"]
+                    if not token_ids:
+                        # No text to condition on. Image-prefix positions are trained
+                        # with -100 labels (and trimmed by output_slice), so there is
+                        # no valid position to predict an image-only first token.
+                        raise ValueError("empty prompt after flattening (no text content)")
+                    if self._is_video:
+                        # Fixed (frames_per_clip, 3, H, W) clip + per-frame validity
+                        # mask, zero-padded — identical to training. The mask hides
+                        # padded-frame visual tokens from attention.
+                        clip, fmask = frames_to_clip_tensor(
+                            frames, max_frames=self._frames_per_clip, frame_size=self._frame_size
+                        )
+                        pixels = clip.to(device=self._device, dtype=self._dtype)
+                        mask = fmask.to(device=self._device)
+                    else:
+                        pixels = _frames_to_pixel_values(
+                            frames, self._frame_size, self._device, self._dtype
+                        )
+                        mask = None
+                    prompt_tensor = torch.tensor(token_ids, dtype=torch.long, device=self._device)
+                except Exception as exc:
+                    # Isolate a bad request (unsupported content, decode failure, empty
+                    # prompt, ...) so the remaining requests still score.
+                    logger.warning(
+                        f"Skipping request (task={args[4]}, doc_id={args[3]}): "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    chunk_outputs[slot] = ""
+                    continue
+                # Commit atomically: only reached when every step above succeeded, so a
+                # mid-request failure never leaves a partial entry in these lists.
+                frames_batch.append(pixels)
+                if mask is not None:
+                    masks_batch.append(mask)
+                prompt_ids.append(prompt_tensor)
+
+            if prompt_ids:
+                # Video: (B, F, 3, H, W) via stack (each request is one F-frame clip),
+                # with a (B, F) frame mask. Image: (B, 3, H, W) via cat. cat on video
+                # would fold frames into the batch and trip the frames-per-clip check.
                 if self._is_video:
-                    # Fixed (frames_per_clip, 3, H, W) clip + per-frame validity mask,
-                    # zero-padded — identical to training (frames_to_clip_tensor is the
-                    # shared helper). The mask hides padded-frame visual tokens from
-                    # attention, matching the training-time masking.
-                    clip, fmask = frames_to_clip_tensor(
-                        frames, max_frames=self._frames_per_clip, frame_size=self._frame_size
-                    )
-                    frames_batch.append(clip.to(device=self._device, dtype=self._dtype))
-                    masks_batch.append(fmask.to(device=self._device))
+                    pixel_values = torch.stack(frames_batch, dim=0)
+                    frame_mask = torch.stack(masks_batch, dim=0)
                 else:
-                    frames_batch.append(
-                        _frames_to_pixel_values(frames, self._frame_size, self._device, self._dtype)
-                    )
-                # Mirror training tokenization: no chat template, no <image>
-                # placeholder, add_special_tokens=False (images go via pixel_values).
-                prompt_ids.append(
-                    torch.tensor(
-                        self._tokenizer(prompt, add_special_tokens=False)["input_ids"],
-                        dtype=torch.long,
-                        device=self._device,
-                    )
+                    pixel_values = torch.cat(frames_batch, dim=0)
+                    frame_mask = None
+                gen_outputs = _generate_batch(
+                    self._model,
+                    self._tokenizer,
+                    pixel_values,
+                    prompt_ids,
+                    resolved,
+                    self._max_seq_len,
+                    frame_mask=frame_mask,
                 )
-            # Video: (B, F, 3, H, W) via stack (each request is one F-frame clip),
-            # with a (B, F) frame mask. Image: (B, 3, H, W) via cat (each request is
-            # one frame), no mask. cat on video would fold frames into the batch and
-            # trip the frames-per-clip check.
-            if self._is_video:
-                pixel_values = torch.stack(frames_batch, dim=0)
-                frame_mask = torch.stack(masks_batch, dim=0)
             else:
-                pixel_values = torch.cat(frames_batch, dim=0)
-                frame_mask = None
-            outputs = _generate_batch(
-                self._model,
-                self._tokenizer,
-                pixel_values,
-                prompt_ids,
-                resolved,
-                self._max_seq_len,
-                frame_mask=frame_mask,
-            )
+                gen_outputs = []
+            # Scatter generated continuations back into the surviving (None) slots,
+            # preserving alignment with ``chunk`` (skipped slots keep their "").
+            gen_iter = iter(gen_outputs)
+            outputs = [o if o is not None else next(gen_iter) for o in chunk_outputs]
             for args, output in zip(chunk, outputs, strict=True):
                 results.append(output)
                 self.cache_hook.add_partial("generate_until", (args[0], args[2]), output)

@@ -850,3 +850,98 @@ class TestGenerateUntilVideo:
         pixel_values = torch.stack([clip0, clip1], dim=0)
         assert pixel_values.shape == (2, 2, 3, 16, 16)
         assert pixel_values.ndim == 5
+
+
+# ---------------------------------------------------------------------------
+# generate_until fault tolerance + empty-prompt guard
+# ---------------------------------------------------------------------------
+
+
+class TestGenerateUntilFaultTolerance:
+    """A request that fails to render/preprocess is isolated (empty output + a
+    warning) so the rest of the batch still scores; an empty flattened prompt is
+    guarded rather than crashing the decode."""
+
+    def _vlm(self, monkeypatch, tiny_vlm_configs, batch_size=2):
+        _patch_loaders(
+            monkeypatch, _vlm_job_config(tiny_vlm_configs), _vlm_wrapper("joint_decoder")
+        )
+        return KempnerForgeVLM(
+            config="x", checkpoint="y", device="cpu", dtype="float32", batch_size=batch_size
+        )
+
+    def test_bad_request_skipped_others_complete(self, monkeypatch, tiny_vlm_configs):
+        rec = _RecordingLogger()
+        monkeypatch.setattr("kempnerforge.eval.vlm.adapter.logger", rec)
+        vlm = self._vlm(monkeypatch, tiny_vlm_configs)
+        img = _img()
+
+        def doc_to_messages(doc):
+            # The "bad" doc carries two images (multi-image -> NotImplementedError in
+            # _render_request); the "good" doc carries exactly one.
+            content = [_text(doc["q"])] + [_image(img)] * doc["n_images"]
+            return [{"role": "user", "content": content}]
+
+        vlm.task_dict = {
+            "t": {
+                "test": {
+                    "bad": {"q": "compare", "n_images": 2},
+                    "good": {"q": "describe", "n_images": 1},
+                }
+            }
+        }
+        instances = [
+            Instance(
+                request_type="generate_until",
+                arguments=(ctx, doc_to_messages, {"max_new_tokens": 3}, doc_id, "t", "test"),
+                idx=i,
+                metadata={"task": "t", "doc_id": doc_id, "repeats": 1},
+            )
+            for i, (doc_id, ctx) in enumerate([("bad", "c"), ("good", "cc")])
+        ]
+        outs = vlm.generate_until(instances)
+        assert outs[0] == ""  # bad request isolated (order restored by get_original)
+        assert len(outs[1].split()) == 3  # good request completes normally
+        assert any("Skipping request" in m and "doc_id=bad" in m for m in rec.warnings)
+
+    def test_empty_prompt_is_guarded(self, monkeypatch, tiny_vlm_configs):
+        rec = _RecordingLogger()
+        monkeypatch.setattr("kempnerforge.eval.vlm.adapter.logger", rec)
+        vlm = self._vlm(monkeypatch, tiny_vlm_configs, batch_size=1)
+
+        def doc_to_messages(doc):
+            del doc
+            # One image, no text block -> empty flattened prompt.
+            return [{"role": "user", "content": [_image(_img())]}]
+
+        vlm.task_dict = {"t": {"test": {"d0": {}}}}
+        inst = Instance(
+            request_type="generate_until",
+            arguments=("ctx", doc_to_messages, {"max_new_tokens": 3}, "d0", "t", "test"),
+            idx=0,
+            metadata={"task": "t", "doc_id": "d0", "repeats": 1},
+        )
+        assert vlm.generate_until([inst]) == [""]
+        assert any("empty prompt" in m for m in rec.warnings)
+
+    def test_all_requests_bad_returns_empties(self, monkeypatch, tiny_vlm_configs):
+        # Every request in the chunk fails -> generation is short-circuited (no empty
+        # stack/cat) and each slot returns "", order preserved.
+        monkeypatch.setattr("kempnerforge.eval.vlm.adapter.logger", _RecordingLogger())
+        vlm = self._vlm(monkeypatch, tiny_vlm_configs)
+
+        def doc_to_messages(doc):
+            del doc
+            return [{"role": "user", "content": [_text("x"), _image(_img()), _image(_img())]}]
+
+        vlm.task_dict = {"t": {"test": {"d0": {}, "d1": {}}}}
+        instances = [
+            Instance(
+                request_type="generate_until",
+                arguments=(ctx, doc_to_messages, {"max_new_tokens": 3}, doc_id, "t", "test"),
+                idx=i,
+                metadata={"task": "t", "doc_id": doc_id, "repeats": 1},
+            )
+            for i, (doc_id, ctx) in enumerate([("d0", "c"), ("d1", "cc")])
+        ]
+        assert vlm.generate_until(instances) == ["", ""]
