@@ -31,6 +31,7 @@ from kempnerforge.eval.vlm.adapter import (
     KempnerForgeVLM,
     _build_model,
     _check_generative,
+    _ContextBudgetError,
     _first_stop,
     _frames_to_pixel_values,
     _generate_batch,
@@ -458,9 +459,11 @@ class TestGenerateBatchSingle:
         )
         assert out == [""]
 
-    def test_length_bound_raises_when_no_room(self, arch_wrapper):
+    def test_no_room_raises_context_budget_error(self, arch_wrapper):
+        # _generate_batch still guards standalone; generate_until converts this into a
+        # per-task skip (see TestGenerateUntilFaultTolerance).
         r = _resolve_gen_kwargs({"max_new_tokens": 100}, 128)
-        with pytest.raises(ValueError, match="max_new_tokens"):
+        with pytest.raises(_ContextBudgetError, match="max_new_tokens"):
             _generate_batch(arch_wrapper, _MockTokenizer(), _pixels(), self._prompt(), r, 64)
 
     def test_overlong_prompt_is_left_truncated(self, arch_wrapper, monkeypatch):
@@ -1024,3 +1027,73 @@ class TestGenerateUntilFaultTolerance:
             for i, (doc_id, ctx) in enumerate([("d0", "c"), ("d1", "cc")])
         ]
         assert vlm.generate_until(instances) == ["", ""]
+
+    def test_infra_error_propagates(self, monkeypatch, tiny_vlm_configs):
+        # A non-per-document error (version drift, CUDA OOM, ...) must surface rather
+        # than being silently scored as "".
+        vlm = self._vlm(monkeypatch, tiny_vlm_configs, batch_size=1)
+
+        def boom(*_a, **_k):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr("kempnerforge.eval.vlm.adapter._render_request", boom)
+
+        def doc_to_messages(doc):
+            del doc
+            return [{"role": "user", "content": [_text("hi"), _image(_img())]}]
+
+        vlm.task_dict = {"t": {"test": {"d0": {}}}}
+        inst = Instance(
+            request_type="generate_until",
+            arguments=("ctx", doc_to_messages, {"max_new_tokens": 3}, "d0", "t", "test"),
+            idx=0,
+            metadata={"task": "t", "doc_id": "d0", "repeats": 1},
+        )
+        with pytest.raises(RuntimeError, match="boom"):
+            vlm.generate_until([inst])
+
+    def test_missing_image_path_skipped(self, monkeypatch, tiny_vlm_configs):
+        # A bad image path raises FileNotFoundError (subclass of OSError) inside _to_pil;
+        # it is isolated as "" like other per-document failures.
+        rec = _RecordingLogger()
+        monkeypatch.setattr("kempnerforge.eval.vlm.adapter.logger", rec)
+        vlm = self._vlm(monkeypatch, tiny_vlm_configs, batch_size=1)
+
+        def doc_to_messages(doc):
+            del doc
+            return [{"role": "user", "content": [_text("describe"), _image("/no/such/frame.png")]}]
+
+        vlm.task_dict = {"t": {"test": {"d0": {}}}}
+        inst = Instance(
+            request_type="generate_until",
+            arguments=("ctx", doc_to_messages, {"max_new_tokens": 3}, "d0", "t", "test"),
+            idx=0,
+            metadata={"task": "t", "doc_id": "d0", "repeats": 1},
+        )
+        assert vlm.generate_until([inst]) == [""]
+        assert any("Skipping request" in m and "doc_id=d0" in m for m in rec.warnings)
+
+    def test_over_budget_chunk_skipped_not_aborted(self, monkeypatch, tiny_vlm_configs):
+        # A task whose max_new_tokens over-budgets the context skips its own requests
+        # (via _ContextBudgetError) instead of aborting the whole run.
+        rec = _RecordingLogger()
+        monkeypatch.setattr("kempnerforge.eval.vlm.adapter.logger", rec)
+        vlm = self._vlm(monkeypatch, tiny_vlm_configs)  # tiny max_seq_len == 64
+        img = _img()
+
+        def doc_to_messages(doc):
+            del doc
+            return [{"role": "user", "content": [_text("hi"), _image(img)]}]
+
+        vlm.task_dict = {"t": {"test": {"d0": {}, "d1": {}}}}
+        instances = [
+            Instance(
+                request_type="generate_until",
+                arguments=(ctx, doc_to_messages, {"max_new_tokens": 1000}, doc_id, "t", "test"),
+                idx=i,
+                metadata={"task": "t", "doc_id": doc_id, "repeats": 1},
+            )
+            for i, (doc_id, ctx) in enumerate([("d0", "c"), ("d1", "cc")])
+        ]
+        assert vlm.generate_until(instances) == ["", ""]
+        assert any("Skipping" in m and "max_new_tokens" in m for m in rec.warnings)

@@ -344,6 +344,10 @@ def _frames_to_pixel_values(
 # --------------------------------------------------------------------------- #
 
 
+class _ContextBudgetError(ValueError):
+    """No room for the prompt: max_new_tokens + image tokens exceed max_seq_len."""
+
+
 def _resolve_gen_kwargs(gen_kwargs: dict[str, Any], default_max_new_tokens: int) -> dict[str, Any]:
     """Merge task ``gen_kwargs`` over the adapter's fallback defaults.
 
@@ -430,7 +434,7 @@ def _generate_batch(
     num_image_tokens = model.num_image_tokens
     prompt_budget = max_seq_len - num_image_tokens - max_new_tokens
     if prompt_budget <= 0:
-        raise ValueError(
+        raise _ContextBudgetError(
             f"max_new_tokens ({max_new_tokens}) + image tokens ({num_image_tokens}) leave no "
             f"room for the prompt within max_seq_len ({max_seq_len}); lower --max-new-tokens."
         )
@@ -627,7 +631,7 @@ class KempnerForgeVLM(lmms):
                         )
                         mask = None
                     prompt_tensor = torch.tensor(token_ids, dtype=torch.long, device=self._device)
-                except Exception as exc:
+                except (NotImplementedError, OSError, ValueError) as exc:
                     # Isolate a bad request (unsupported content, decode failure, empty
                     # prompt, ...) so the remaining requests still score.
                     logger.warning(
@@ -653,15 +657,23 @@ class KempnerForgeVLM(lmms):
                 else:
                     pixel_values = torch.cat(frames_batch, dim=0)
                     frame_mask = None
-                gen_outputs = _generate_batch(
-                    self._model,
-                    self._tokenizer,
-                    pixel_values,
-                    prompt_ids,
-                    resolved,
-                    self._max_seq_len,
-                    frame_mask=frame_mask,
-                )
+                try:
+                    gen_outputs = _generate_batch(
+                        self._model,
+                        self._tokenizer,
+                        pixel_values,
+                        prompt_ids,
+                        resolved,
+                        self._max_seq_len,
+                        frame_mask=frame_mask,
+                    )
+                except _ContextBudgetError as exc:
+                    # One task's gen_kwargs over-budgets the context; skip its requests
+                    # (they all share gen_kwargs) rather than aborting the whole run.
+                    logger.warning(
+                        f"Skipping {len(prompt_ids)} request(s) for task {chunk[0][4]}: {exc}"
+                    )
+                    gen_outputs = [""] * len(prompt_ids)
             else:
                 gen_outputs = []
             # Scatter generated continuations back into the surviving (None) slots,
