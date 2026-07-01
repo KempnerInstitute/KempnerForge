@@ -17,6 +17,9 @@ dependencies = [
     "torchao>=0.17.0",
 ]
 
+[project.entry-points."lmms_eval.models"]
+kempnerforge_vlm = "kempnerforge.eval.vlm.manifest:MANIFEST"
+
 [dependency-groups]
 dev = [
     "pyright[nodejs]>=1.1.408",

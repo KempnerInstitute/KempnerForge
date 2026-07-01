@@ -11,8 +11,9 @@ from kempnerforge.data.vlm_dataset import (
     DEFAULT_IMAGE_STD,
     HuggingFaceVLMDataset,
     VLMCollator,
-    _pil_to_tensor,
     _tokenize_and_mask,
+    frames_to_clip_tensor,
+    pil_to_tensor,
 )
 
 
@@ -21,38 +22,38 @@ def _make_image(size: int = 64, color: int = 128) -> Image.Image:
 
 
 # ---------------------------------------------------------------------------
-# _pil_to_tensor
+# pil_to_tensor
 # ---------------------------------------------------------------------------
 
 
 class TestPILToTensor:
     def test_shape_and_dtype(self):
         img = _make_image(48)
-        t = _pil_to_tensor(img, 224, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD)
+        t = pil_to_tensor(img, 224, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD)
         assert t.shape == (3, 224, 224)
         assert t.dtype == torch.float32
 
     def test_non_square_resize(self):
         img = Image.new("RGB", (100, 50), color=(0, 128, 255))
-        t = _pil_to_tensor(img, 64, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD)
+        t = pil_to_tensor(img, 64, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD)
         assert t.shape == (3, 64, 64)
 
     def test_grayscale_promoted_to_rgb(self):
         img = Image.new("L", (32, 32), color=128)
-        t = _pil_to_tensor(img, 32, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD)
+        t = pil_to_tensor(img, 32, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD)
         assert t.shape == (3, 32, 32)
 
     def test_normalization(self):
         """Input with pixels at 127.5 (0.5 after /255) should normalize
         to ~0 under mean=0.5, std=0.5."""
         img = Image.new("RGB", (16, 16), color=(128, 128, 128))  # ~0.502
-        t = _pil_to_tensor(img, 16, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD)
+        t = pil_to_tensor(img, 16, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD)
         # (0.502 - 0.5) / 0.5 ~= 0.004
         assert abs(float(t.mean())) < 0.02
 
     def test_non_pil_raises(self):
         with pytest.raises(TypeError, match="Expected a PIL.Image"):
-            _pil_to_tensor(torch.randn(3, 16, 16), 16, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD)
+            pil_to_tensor(torch.randn(3, 16, 16), 16, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD)
 
 
 # ---------------------------------------------------------------------------
@@ -443,3 +444,43 @@ class TestHuggingFaceVLMDataset:
         assert batch["input_ids"].shape == (2, 12)
         assert batch["labels"].shape == (2, 12)
         assert batch["pixel_values"].shape == (2, 3, 16, 16)
+
+
+class TestFramesToClipTensor:
+    """The shared frame-packing helper used by both training (``WebVidVideoDataset``)
+    and the VLM evaluation adapter."""
+
+    def test_full_clip_shape_and_dtype(self):
+        frames = [_make_image(32) for _ in range(4)]
+        pv, mask = frames_to_clip_tensor(frames, max_frames=4, frame_size=16)
+        assert pv.shape == (4, 3, 16, 16)
+        assert pv.dtype == torch.float32
+        assert mask.tolist() == [True, True, True, True]
+
+    def test_short_clip_is_zero_padded(self):
+        frames = [_make_image(32) for _ in range(2)]
+        pv, mask = frames_to_clip_tensor(frames, max_frames=5, frame_size=16)
+        assert pv.shape == (5, 3, 16, 16)
+        assert mask.tolist() == [True, True, False, False, False]
+        assert torch.count_nonzero(pv[2:]) == 0  # padded frames are zero
+
+    def test_single_image_is_one_frame_clip(self):
+        pv, mask = frames_to_clip_tensor([_make_image(20)], max_frames=3, frame_size=16)
+        assert pv.shape == (3, 3, 16, 16)
+        assert mask.tolist() == [True, False, False]
+
+    def test_per_frame_matches_pil_to_tensor(self):
+        img = _make_image(40)
+        pv, _ = frames_to_clip_tensor([img], max_frames=1, frame_size=16)
+        expected = pil_to_tensor(img, 16, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD)
+        assert torch.allclose(pv[0], expected)
+
+    def test_uses_frame_size(self):
+        pv, _ = frames_to_clip_tensor([_make_image(32)], max_frames=2, frame_size=24)
+        assert pv.shape == (2, 3, 24, 24)
+
+    def test_excess_frames_truncated_to_budget(self):
+        frames = [_make_image(16) for _ in range(5)]
+        pv, mask = frames_to_clip_tensor(frames, max_frames=3, frame_size=16)
+        assert pv.shape == (3, 3, 16, 16)
+        assert mask.all()

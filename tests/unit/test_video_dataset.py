@@ -161,6 +161,26 @@ class TestGetItem:
         ds = _StubVideoDataset(["1", "2", "3"], ["a", "b", "c"])
         assert len(ds) == 3
 
+    def test_pixel_values_match_shared_helper(self, monkeypatch):
+        """The dataset's clip is exactly ``frames_to_clip_tensor``'s output (the
+        shared helper), guaranteeing training/eval frame-packing parity by
+        construction."""
+        from kempnerforge.data.vlm_dataset import frames_to_clip_tensor
+
+        frames = _frames(3)
+        monkeypatch.setattr(vd, "decode_video_frames", lambda *a, **k: frames)
+        ds = _StubVideoDataset(["1"], ["a cat."], max_frames=8, frame_size=16)
+        item = ds[0]
+        expected_pv, expected_mask = frames_to_clip_tensor(
+            frames,
+            max_frames=8,
+            frame_size=16,
+            image_mean=DEFAULT_IMAGE_MEAN,
+            image_std=DEFAULT_IMAGE_STD,
+        )
+        assert torch.equal(item["pixel_values"], expected_pv)
+        assert torch.equal(item["frame_mask"], expected_mask)
+
 
 # ---------------------------------------------------------------------------
 # VideoCollator

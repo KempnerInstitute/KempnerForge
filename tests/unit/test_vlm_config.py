@@ -119,6 +119,22 @@ class TestVLMConfigSubclasses:
         assert {"joint_decoder", "cross_attention", "mot", "moma"} <= archs
 
 
+class TestIsGenerative:
+    """Per-arch ``is_generative`` capability, queried by generation-only
+    consumers (the lmms-eval chat adapter). Generative arches inherit the base
+    ``True``; MoMa overrides to ``False`` (non-causal expert-choice routing)."""
+
+    @pytest.mark.parametrize(
+        "config",
+        [VLMConfig(), JointDecoderConfig(), CrossAttentionConfig(), MoTConfig()],
+    )
+    def test_generative_arches_are_generative(self, config):
+        assert config.is_generative is True
+
+    def test_moma_is_not_generative(self):
+        assert MoMaConfig().is_generative is False
+
+
 class TestCrossAttentionResolvedHeads:
     """`cross_attention_n_heads=0` and `cross_attention_n_kv_heads=0` both
     resolve against ModelConfig.n_heads at build time. The block

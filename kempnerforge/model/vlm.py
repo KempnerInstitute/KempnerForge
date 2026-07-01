@@ -180,7 +180,7 @@ class JointDecoderStrategy:
         self,
         wrapper: VLMWrapper,
         pixel_values: torch.Tensor,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor,  # noqa: ARG002
         frame_mask: torch.Tensor | None = None,
     ) -> ModalityContext:
         img_embeds = _project_visual_features(wrapper, pixel_values)
