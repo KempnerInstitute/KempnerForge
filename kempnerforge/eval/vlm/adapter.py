@@ -508,7 +508,8 @@ class KempnerForgeVLM(lmms):
       trained with.
     - ``checkpoint`` (required): DCP checkpoint directory (a run dir or a
       specific ``step_N`` dir).
-    - ``device`` (default ``"cuda"``), ``dtype`` (default ``"bfloat16"``).
+    - ``device`` (default ``"cuda"``), ``dtype`` (default: the checkpoint config's
+      ``train.param_dtype``; pass e.g. ``"float32"`` to override).
     - ``batch_size`` (default ``1``): number of requests decoded together
       (right-padded), grouped by gen_kwargs.
     - ``max_new_tokens`` (default ``128``): fallback only; task ``gen_kwargs``
@@ -522,7 +523,7 @@ class KempnerForgeVLM(lmms):
         config: str,
         checkpoint: str,
         device: str = "cuda",
-        dtype: str = "bfloat16",
+        dtype: str | None = None,
         batch_size: int | str = 1,
         max_new_tokens: int | str = DEFAULT_MAX_NEW_TOKENS,
         **kwargs: Any,
@@ -532,7 +533,6 @@ class KempnerForgeVLM(lmms):
             logger.warning(f"Ignoring unsupported model_args: {sorted(kwargs)}")
 
         self._device = torch.device(device)
-        self._dtype = _resolve_dtype(dtype)
         self._batch_size = int(batch_size)
         self._default_max_new_tokens = int(max_new_tokens)
         if self._batch_size < 1:
@@ -541,6 +541,9 @@ class KempnerForgeVLM(lmms):
             raise ValueError(f"max_new_tokens must be >= 1, got {self._default_max_new_tokens}")
         self._config = _load_config(config)
         assert self._config.vlm is not None  # guaranteed by is_vlm; narrows for the type checker
+        # Default the compute dtype to what the checkpoint was trained at
+        # (config.train.param_dtype) unless an explicit dtype was passed.
+        self._dtype = self._config.train.param_dtype if dtype is None else _resolve_dtype(dtype)
         self._arch = self._config.vlm.arch
         # Fail fast on non-generative arches before building/loading the model.
         _check_generative(self._config.vlm)

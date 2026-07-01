@@ -82,7 +82,10 @@ def main() -> None:
     )
     parser.add_argument("--device", type=str, default="cuda", help="Device (default: cuda)")
     parser.add_argument(
-        "--dtype", type=str, default="bfloat16", help="Model dtype (default: bfloat16)"
+        "--dtype",
+        type=str,
+        default=None,
+        help="Model dtype; default: the checkpoint config's train.param_dtype",
     )
     parser.add_argument(
         "--batch-size",
@@ -114,9 +117,12 @@ def main() -> None:
     logger.info(f"Running lmms-eval: tasks={args.tasks}, checkpoint={args.checkpoint}")
 
     model_args = (
-        f"config={args.config},checkpoint={args.checkpoint},"
-        f"dtype={args.dtype},max_new_tokens={args.max_new_tokens}"
+        f"config={args.config},checkpoint={args.checkpoint},max_new_tokens={args.max_new_tokens}"
     )
+    # Only pass dtype when explicitly set; otherwise the adapter defaults it from
+    # the checkpoint config (train.param_dtype).
+    if args.dtype is not None:
+        model_args += f",dtype={args.dtype}"
     results = simple_evaluate(
         model="kempnerforge_vlm",
         model_args=model_args,

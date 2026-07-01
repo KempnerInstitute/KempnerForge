@@ -786,6 +786,29 @@ class TestInitGuards:
         assert vlm._frames_per_clip == 1
         assert vlm._frame_size == job.data.hf_image_size
 
+    def test_dtype_defaults_from_config(self, monkeypatch, tiny_vlm_configs, tiny_vlm_wrapper):
+        # No explicit dtype -> use the checkpoint config's train.param_dtype.
+        from kempnerforge.config.training import TrainConfig
+
+        mc, vc, ac, lc = tiny_vlm_configs
+        job = JobConfig(
+            model=mc,
+            vision_encoder=vc,
+            adapter=ac,
+            vlm=lc,
+            data=DataConfig(tokenizer_path="mock"),
+            train=TrainConfig(mixed_precision="fp32"),
+        )
+        _patch_loaders(monkeypatch, job, tiny_vlm_wrapper)
+        vlm = KempnerForgeVLM(config="x", checkpoint="y", device="cpu")
+        assert vlm._dtype == job.train.param_dtype == torch.float32
+
+    def test_explicit_dtype_overrides_config(self, monkeypatch, tiny_vlm_configs, tiny_vlm_wrapper):
+        # An explicit dtype wins over the config default.
+        _patch_loaders(monkeypatch, _vlm_job_config(tiny_vlm_configs), tiny_vlm_wrapper)
+        vlm = KempnerForgeVLM(config="x", checkpoint="y", device="cpu", dtype="float16")
+        assert vlm._dtype == torch.float16
+
 
 # ---------------------------------------------------------------------------
 # _build_model (frames_per_clip wiring for image vs video checkpoints)
