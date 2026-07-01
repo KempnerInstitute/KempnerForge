@@ -40,6 +40,7 @@ from kempnerforge.eval.vlm.adapter import (
     _render_request,
     _resolve_dtype,
     _resolve_gen_kwargs,
+    _to_pil,
 )
 from kempnerforge.model.vlm import VLMWrapper, build_vlm_wrapper
 
@@ -295,6 +296,52 @@ class TestFramesToPixelValues:
         from_pil = _frames_to_pixel_values([img], image_size=16, device=DEVICE, dtype=torch.float32)
         assert from_path.shape == (1, 3, 16, 16)
         assert torch.allclose(from_path, from_pil)
+
+
+# ---------------------------------------------------------------------------
+# _to_pil (str/path -> PIL normalization) + video str-image handling
+# ---------------------------------------------------------------------------
+
+
+class TestToPil:
+    def test_passthrough_pil(self):
+        img = _img()
+        assert _to_pil(img) is img
+
+    def test_opens_str_path(self, tmp_path):
+        from PIL import Image
+
+        path = tmp_path / "frame.png"
+        _img(16).save(path)
+        out = _to_pil(str(path))
+        assert isinstance(out, Image.Image)
+        assert out.size == (16, 16)
+
+
+def test_video_checkpoint_accepts_str_image_path(
+    tmp_path, monkeypatch, tiny_video_configs, tiny_video_vlm_wrapper
+):
+    """A single image supplied as a path string runs on a video checkpoint: it is
+    opened to PIL before frames_to_clip_tensor (strict PIL-only), so it is processed
+    rather than silently skipped by the per-request fault handler."""
+    _patch_loaders(monkeypatch, _video_job_config(tiny_video_configs), tiny_video_vlm_wrapper)
+    vlm = KempnerForgeVLM(config="x", checkpoint="y", device="cpu", dtype="float32")
+    path = tmp_path / "frame.png"
+    _img(16).save(path)
+
+    def doc_to_messages(doc):
+        del doc
+        return [{"role": "user", "content": [_text("describe"), _image(str(path))]}]
+
+    vlm.task_dict = {"t": {"test": {"d0": {}}}}
+    inst = Instance(
+        request_type="generate_until",
+        arguments=("ctx", doc_to_messages, {"max_new_tokens": 3}, "d0", "t", "test"),
+        idx=0,
+        metadata={"task": "t", "doc_id": "d0", "repeats": 1},
+    )
+    out = vlm.generate_until([inst])
+    assert len(out) == 1 and len(out[0].split()) == 3  # processed, not skipped
 
 
 # ---------------------------------------------------------------------------

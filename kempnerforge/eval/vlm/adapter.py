@@ -305,6 +305,23 @@ def _render_request(
     )
 
 
+def _to_pil(frame: Any) -> Any:
+    """Normalize one visual frame to a PIL ``Image``.
+
+    lmms-eval delivers image content as either a ``PIL.Image`` or a path/URL
+    string. The training preprocessing (``pil_to_tensor``) is strict PIL-only, so
+    a string is opened here (copied so the file handle can close). This lets both
+    the image packer (``_frames_to_pixel_values``) and the video packer
+    (``frames_to_clip_tensor`` -> ``pil_to_tensor``) accept either form.
+    """
+    if isinstance(frame, str):
+        from PIL import Image
+
+        with Image.open(frame) as im:
+            return im.copy()
+    return frame
+
+
 def _frames_to_pixel_values(
     frames: list[Any], image_size: int, device: torch.device, dtype: torch.dtype
 ) -> torch.Tensor:
@@ -313,18 +330,12 @@ def _frames_to_pixel_values(
     Reuses the training-time ``pil_to_tensor`` (resize + SigLIP-style
     normalize) as the single source of truth. v1 passes a single image (a
     length-1 list); the list shape is the seam for future video (ordered
-    frames). Each frame may be a ``PIL.Image`` or a path string.
+    frames). Each frame may be a ``PIL.Image`` or a path string (see ``_to_pil``).
     """
-    from PIL import Image
-
-    tensors = []
-    for frame in frames:
-        if isinstance(frame, str):
-            with Image.open(frame) as im:
-                img = im.copy()
-        else:
-            img = frame
-        tensors.append(pil_to_tensor(img, image_size, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD))
+    tensors = [
+        pil_to_tensor(_to_pil(frame), image_size, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD)
+        for frame in frames
+    ]
     return torch.stack(tensors, dim=0).to(device=device, dtype=dtype)
 
 
@@ -575,6 +586,10 @@ class KempnerForgeVLM(lmms):
                     doc = self.task_dict[args[4]][args[5]][args[3]]
                     messages = ChatMessages(messages=args[1](doc))
                     frames, prompt = _render_request(messages, self._config.video)
+                    # lmms-eval may deliver image content as a path/URL string;
+                    # normalize to PIL so both the image and video packers (strict
+                    # pil_to_tensor) accept it.
+                    frames = [_to_pil(f) for f in frames]
                     # Mirror training tokenization: no chat template, no <image>
                     # placeholder, add_special_tokens=False (images go via pixel_values).
                     token_ids = self._tokenizer(prompt, add_special_tokens=False)["input_ids"]
