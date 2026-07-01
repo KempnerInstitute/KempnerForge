@@ -61,11 +61,6 @@ class ModalityStrategy(Protocol):
     off the ``VLMWrapper`` they receive. They are NOT registered as
     submodules of the wrapper, so FSDP2 does not wrap them and DCP
     does not serialize them.
-
-    ``prepare`` takes an optional ``precomputed_embeds``: when provided (the
-    cached-decode path) it is used as the projected visual embeds in place of
-    re-running the vision encoder + adapter; when ``None`` (the default) the
-    strategy encodes from ``pixel_values`` as usual.
     """
 
     def prepare(
@@ -73,7 +68,6 @@ class ModalityStrategy(Protocol):
         wrapper: VLMWrapper,
         pixel_values: torch.Tensor,
         input_ids: torch.Tensor,
-        precomputed_embeds: torch.Tensor | None = None,
         frame_mask: torch.Tensor | None = None,
     ) -> ModalityContext: ...
 
@@ -187,14 +181,9 @@ class JointDecoderStrategy:
         wrapper: VLMWrapper,
         pixel_values: torch.Tensor,
         input_ids: torch.Tensor,  # noqa: ARG002
-        precomputed_embeds: torch.Tensor | None = None,
         frame_mask: torch.Tensor | None = None,
     ) -> ModalityContext:
-        img_embeds = (
-            precomputed_embeds
-            if precomputed_embeds is not None
-            else _project_visual_features(wrapper, pixel_values)
-        )
+        img_embeds = _project_visual_features(wrapper, pixel_values)
         n = img_embeds.shape[1]  # pooling-aware: the adapter's actual visual-token count
         return ModalityContext(
             prefix_embeds=img_embeds,
@@ -226,14 +215,9 @@ class CrossAttentionStrategy:
         wrapper: VLMWrapper,
         pixel_values: torch.Tensor,
         input_ids: torch.Tensor,  # noqa: ARG002
-        precomputed_embeds: torch.Tensor | None = None,
         frame_mask: torch.Tensor | None = None,
     ) -> ModalityContext:
-        img_embeds = (
-            precomputed_embeds
-            if precomputed_embeds is not None
-            else _project_visual_features(wrapper, pixel_values)
-        )
+        img_embeds = _project_visual_features(wrapper, pixel_values)
         return ModalityContext(
             image_features=img_embeds,
             image_mask=_visual_token_mask(frame_mask, img_embeds.shape[1]),
@@ -269,14 +253,9 @@ class MoTStrategy:
         wrapper: VLMWrapper,
         pixel_values: torch.Tensor,
         input_ids: torch.Tensor,
-        precomputed_embeds: torch.Tensor | None = None,
         frame_mask: torch.Tensor | None = None,
     ) -> ModalityContext:
-        img_embeds = (
-            precomputed_embeds
-            if precomputed_embeds is not None
-            else _project_visual_features(wrapper, pixel_values)
-        )
+        img_embeds = _project_visual_features(wrapper, pixel_values)
         n = img_embeds.shape[1]  # pooling-aware: the adapter's actual visual-token count
         b, t_text = input_ids.shape
         modality_ids = torch.zeros(b, n + t_text, dtype=torch.long, device=input_ids.device)
@@ -320,14 +299,9 @@ class MoMaStrategy:
         wrapper: VLMWrapper,
         pixel_values: torch.Tensor,
         input_ids: torch.Tensor,
-        precomputed_embeds: torch.Tensor | None = None,
         frame_mask: torch.Tensor | None = None,
     ) -> ModalityContext:
-        img_embeds = (
-            precomputed_embeds
-            if precomputed_embeds is not None
-            else _project_visual_features(wrapper, pixel_values)
-        )
+        img_embeds = _project_visual_features(wrapper, pixel_values)
         n = img_embeds.shape[1]  # pooling-aware: the adapter's actual visual-token count
         b, t_text = input_ids.shape
         modality_ids = torch.zeros(b, n + t_text, dtype=torch.long, device=input_ids.device)
@@ -399,7 +373,6 @@ class VLMWrapper(nn.Module):
         pixel_values: torch.Tensor,
         input_ids: torch.Tensor,
         labels: torch.Tensor | None = None,
-        precomputed_embeds: torch.Tensor | None = None,
         frame_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         # Route the text embedding through Transformer.forward so FSDP2's
@@ -407,35 +380,9 @@ class VLMWrapper(nn.Module):
         # materializes the DTensor weight before F.embedding runs. Doing
         # the embedding externally (transformer.token_embedding(input_ids))
         # bypasses FSDP and fails with "mixed torch.Tensor and DTensor".
-        # ``precomputed_embeds`` (when set) is forwarded to the strategy as the
-        # projected visual embeds, skipping the per-call vision encode (the
-        # cached-decode path); ``None`` keeps the default encode-from-pixels path.
-        modality = self.strategy.prepare(
-            self, pixel_values, input_ids, precomputed_embeds, frame_mask=frame_mask
-        )
+        modality = self.strategy.prepare(self, pixel_values, input_ids, frame_mask=frame_mask)
         logits = self.transformer(tokens=input_ids, modality=modality)
         return logits, labels
-
-    def encode_visual(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        """Project visual input to LLM-dim embeds once, for cached decode.
-
-        Returns the post-adapter visual embeds that ``ModalityStrategy.prepare``
-        computes internally. Callers (e.g. the eval decode loop) encode once and
-        pass the result back via the ``precomputed_embeds`` argument of
-        ``forward`` so the vision encoder + adapter do not re-run each decode
-        step. This is not a KV cache: the transformer still re-runs over the full
-        sequence each step.
-
-        Args:
-            pixel_values: A single-image batch ``(B, 3, H, W)`` or a video-clip
-                batch ``(B, F, 3, H, W)``; frames-per-clip validation is delegated
-                to the projection helper.
-
-        Returns:
-            The post-adapter visual embeds of shape
-            ``(B, num_visual_tokens, dim)``.
-        """
-        return _project_visual_features(self, pixel_values)
 
 
 def inner_transformer(model: nn.Module) -> nn.Module:

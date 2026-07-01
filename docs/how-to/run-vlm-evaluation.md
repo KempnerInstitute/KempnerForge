@@ -150,11 +150,8 @@ Several are tracked follow-ups.
   should be added and the rendering step made configurable.
 - **No KV cache.** Decoding re-runs the full transformer over the growing sequence
   each step (KempnerForge has no image-conditioned KV-cache decode path); this is
-  correct but costs extra compute, and a KV-cache decode is future work. The vision
-  tower + adapter, by contrast, are cached: they are encoded
-  once per request and the projected embeds are reused across all decode steps via
-  the `VLMWrapper.encode_visual` / `precomputed_embeds` seam (arch-agnostic across
-  the modality strategies). Raising `--batch-size` decodes multiple requests together
+  correct but costs extra compute, and a KV-cache decode is future work. Raising
+  `--batch-size` decodes multiple requests together
   (right-padded, grouped by `gen_kwargs`) to amortize the per-step transformer cost.
 
 ## Cluster environment notes

@@ -119,37 +119,6 @@ class TestVLMWrapper:
         wrapper = _build_tiny_wrapper()
         assert isinstance(wrapper.transformer, Transformer)
 
-    def test_encode_visual_shape(self):
-        # encode_visual returns the post-adapter visual tokens the strategy would
-        # compute internally: (B, num_image_tokens, dim) for the JD tiny wrapper.
-        wrapper = _build_tiny_wrapper(num_image_tokens=8).to(DEVICE)
-        pixels = torch.randn(2, 3, 16, 16, device=DEVICE)
-        embeds = wrapper.encode_visual(pixels)
-        assert embeds.shape == (2, wrapper.num_image_tokens, 64)
-
-    def test_precomputed_embeds_parity(self):
-        # The cached path (encode once, pass precomputed_embeds) is bit-identical
-        # to the default encode-from-pixels path. eval() pins determinism across the
-        # two forwards so the comparison is meaningful.
-        wrapper = _build_tiny_wrapper().to(DEVICE).eval()
-        pixels = torch.randn(2, 3, 16, 16, device=DEVICE)
-        input_ids = torch.randint(0, 256, (2, 12), device=DEVICE)
-        logits_encode, _ = wrapper(pixels, input_ids)
-        logits_cached, _ = wrapper(
-            pixels, input_ids, precomputed_embeds=wrapper.encode_visual(pixels)
-        )
-        assert torch.equal(logits_encode, logits_cached)
-
-    def test_precomputed_embeds_default_preserves_behavior(self):
-        # precomputed_embeds=None (the default) keeps the encode path: forward is
-        # unchanged (finite logits over the text positions).
-        wrapper = _build_tiny_wrapper(num_image_tokens=8).to(DEVICE)
-        pixels = torch.randn(1, 3, 16, 16, device=DEVICE)
-        input_ids = torch.randint(0, 256, (1, 10), device=DEVICE)
-        logits, _ = wrapper(pixels, input_ids)
-        assert logits.shape == (1, 10, 256)
-        assert torch.isfinite(logits).all()
-
 
 # ---------------------------------------------------------------------------
 # inner_transformer helper
