@@ -352,8 +352,11 @@ def _resolve_gen_kwargs(gen_kwargs: dict[str, Any], default_max_new_tokens: int)
     """Merge task ``gen_kwargs`` over the adapter's fallback defaults.
 
     Uses explicit ``is None`` checks (not ``x or default``) so an explicit falsy
-    task value — ``max_new_tokens=0`` or ``top_p=0.0`` — is honored rather than
-    silently replaced by the default.
+    task value — e.g. ``max_new_tokens=0`` or ``temperature=0.0`` (greedy) — is
+    honored rather than silently replaced by the default. ``top_p`` is the one
+    exception: a non-positive value is an ill-defined nucleus (an empty token
+    set), so ``top_p <= 0`` is treated as disabled (1.0) instead of passed
+    through to ``sample`` (where it would mask every token and raise).
     """
     until = gen_kwargs.get("until")
     if until is None:
@@ -372,12 +375,17 @@ def _resolve_gen_kwargs(gen_kwargs: dict[str, Any], default_max_new_tokens: int)
     sampling = temperature > 0
     top_k = gen_kwargs.get("top_k")
     top_p = gen_kwargs.get("top_p")
+    top_p = 1.0 if top_p is None else float(top_p)
+
+    # Treat undefined `top_p` as diasbled
+    if top_p <= 0:
+        top_p = 1.0
     return {
         "until": [u for u in until if u],
         "max_new_tokens": max_new_tokens,
         "temperature": temperature,
         "top_k": (0 if top_k is None else int(top_k)) if sampling else 0,
-        "top_p": (1.0 if top_p is None else float(top_p)) if sampling else 1.0,
+        "top_p": top_p if sampling else 1.0,
     }
 
 
@@ -631,7 +639,7 @@ class KempnerForgeVLM(lmms):
                         )
                         mask = None
                     prompt_tensor = torch.tensor(token_ids, dtype=torch.long, device=self._device)
-                except (NotImplementedError, OSError, ValueError) as exc:
+                except Exception as exc:
                     # Isolate a bad request (unsupported content, decode failure, empty
                     # prompt, ...) so the remaining requests still score.
                     logger.warning(

@@ -382,10 +382,12 @@ class TestResolveGenKwargs:
         # 0 is a valid explicit value, not a "missing" fallback.
         assert _resolve_gen_kwargs({"max_new_tokens": 0}, 64)["max_new_tokens"] == 0
 
-    def test_explicit_zero_top_p_honored_when_sampling(self):
-        # top_p only applies when sampling; an explicit 0.0 must not fall back to 1.0.
-        r = _resolve_gen_kwargs({"temperature": 0.5, "top_p": 0.0}, 64)
-        assert r["top_p"] == 0.0
+    def test_nonpositive_top_p_treated_as_disabled(self):
+        assert _resolve_gen_kwargs({"temperature": 0.5, "top_p": 0.0}, 64)["top_p"] == 1.0
+        assert _resolve_gen_kwargs({"temperature": 0.5, "top_p": -0.3}, 64)["top_p"] == 1.0
+
+    def test_positive_top_p_honored_when_sampling(self):
+        assert _resolve_gen_kwargs({"temperature": 0.5, "top_p": 0.1}, 64)["top_p"] == 0.1
 
 
 # ---------------------------------------------------------------------------

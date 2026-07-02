@@ -87,10 +87,9 @@ default benchmark set is still being decided.
 | `--limit` | `None` | cap examples per task (int count, or `<1.0` fraction) |
 | `--output` | `None` | save full JSON results |
 | `--device` | `cuda` | inference device |
-| `--dtype` | `bfloat16` | model dtype |
+| `--dtype` | `None`(maps to model config setting) | model dtype |
 | `--batch-size` | `1` | requests decoded together (grouped by `gen_kwargs`) |
 | `--max-new-tokens` | `128` | fallback only; task `gen_kwargs` override it |
-
 
 ## Video evaluation
 
@@ -122,7 +121,6 @@ uv run python scripts/vlm_eval_harness.py \
   and multi-turn / few-shot raise a clear error; MoMa still fails fast. An
   **image** checkpoint cannot evaluate video and raises a clear error if handed a
   video task.
-
 
 ## Limitations
 
