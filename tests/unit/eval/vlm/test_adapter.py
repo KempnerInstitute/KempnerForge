@@ -944,7 +944,10 @@ class TestGenerateUntilVideo:
 class TestGenerateUntilFaultTolerance:
     """A request that fails to render/preprocess is isolated (empty output + a
     warning) so the rest of the batch still scores; an empty flattened prompt is
-    guarded rather than crashing the decode."""
+    guarded rather than crashing the decode. The per-request handler catches any
+    ``Exception``, so an unexpected error skips just that doc; a fatal
+    ``BaseException`` (Ctrl-C / ``SystemExit``) still propagates so the run stays
+    interruptible rather than being silently scored ""."""
 
     def _vlm(self, monkeypatch, tiny_vlm_configs, batch_size=2):
         _patch_loaders(
@@ -1030,9 +1033,13 @@ class TestGenerateUntilFaultTolerance:
         ]
         assert vlm.generate_until(instances) == ["", ""]
 
-    def test_infra_error_propagates(self, monkeypatch, tiny_vlm_configs):
-        # A non-per-document error (version drift, CUDA OOM, ...) must surface rather
-        # than being silently scored as "".
+    def test_unexpected_error_isolated(self, monkeypatch, tiny_vlm_configs):
+        # The per-request handler catches Exception (broadened from the original
+        # NotImplementedError/OSError/ValueError), so an unexpected error on one
+        # document — here a RuntimeError from _render_request — is isolated as ""
+        # with a warning rather than aborting the whole run.
+        rec = _RecordingLogger()
+        monkeypatch.setattr("kempnerforge.eval.vlm.adapter.logger", rec)
         vlm = self._vlm(monkeypatch, tiny_vlm_configs, batch_size=1)
 
         def boom(*_a, **_k):
@@ -1051,7 +1058,32 @@ class TestGenerateUntilFaultTolerance:
             idx=0,
             metadata={"task": "t", "doc_id": "d0", "repeats": 1},
         )
-        with pytest.raises(RuntimeError, match="boom"):
+        assert vlm.generate_until([inst]) == [""]
+        assert any("Skipping request" in m and "doc_id=d0" in m for m in rec.warnings)
+
+    def test_fatal_baseexception_propagates(self, monkeypatch, tiny_vlm_configs):
+        # The broadened catch is `except Exception`, so a BaseException (a Ctrl-C
+        # KeyboardInterrupt or a SystemExit) is NOT swallowed: it surfaces rather
+        # than being silently scored "", keeping a long eval run interruptible.
+        vlm = self._vlm(monkeypatch, tiny_vlm_configs, batch_size=1)
+
+        def interrupt(*_a, **_k):
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr("kempnerforge.eval.vlm.adapter._render_request", interrupt)
+
+        def doc_to_messages(doc):
+            del doc
+            return [{"role": "user", "content": [_text("hi"), _image(_img())]}]
+
+        vlm.task_dict = {"t": {"test": {"d0": {}}}}
+        inst = Instance(
+            request_type="generate_until",
+            arguments=("ctx", doc_to_messages, {"max_new_tokens": 3}, "d0", "t", "test"),
+            idx=0,
+            metadata={"task": "t", "doc_id": "d0", "repeats": 1},
+        )
+        with pytest.raises(KeyboardInterrupt):
             vlm.generate_until([inst])
 
     def test_missing_image_path_skipped(self, monkeypatch, tiny_vlm_configs):
