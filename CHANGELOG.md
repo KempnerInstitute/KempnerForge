@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Decoupled attention head dim, an optional adapter pre-norm, and weights-only warm-start.** Small, model-agnostic additions to core, reusable by any config:
+  - `kempnerforge/config/model.py`: `ModelConfig.head_dim` is now an overridable field (`int`, `0` → `dim // n_heads`; was a computed property), decoupling the attention width so `n_heads * head_dim` need not equal `dim`. The default preserves the `dim // n_heads` coupling; `dim % n_heads == 0` is required only when the head dim is inferred.
+  - `kempnerforge/model/adapter.py`: the `mlp_2layer` connector gains an optional `pre_norm` — a pre-projection normalization over the vision features (exposed as `ln_q`), chosen by norm-registry key (`rmsnorm` / `layernorm`). Off by default, so existing `mlp_2layer` configs are unchanged.
+  - `kempnerforge/model/cross_attention.py`, `transformer.py`: `CrossAttentionBlock` threads `head_dim` to `CrossAttention`, so cross-attention honors a decoupled head dim.
+  - `scripts/train.py`: a `load_path` warm-start now honors `checkpoint.exclude_from_loading`, so a weights-only checkpoint (no optimizer/train-state) fine-tunes cleanly; a real resume still restores full state.
+  - Tests fold into the components' existing suites (`tests/unit/test_config.py`, `test_model.py`, `test_adapter.py`, `test_cross_attention.py`).
 - **MoE router z-loss** (`moe_router_z_loss_weight`, ST-MoE style). An optional penalty on the router's pre-softmax logits — per MoE layer `mean_token(logsumexp(router_logits))²` — summed across layers and added to the training loss as `moe_router_z_loss_weight × z_loss`. It keeps router logits from growing without bound, targeting *logit-growth stability* (not load balance — that's the aux loss). Default `0.0` is off: the term is never added, so training, outputs, and gradients are unchanged. `z_loss` is a plain attribute like `aux_loss` (not a buffer/parameter), so it never enters `state_dict` — checkpoint-safe.
   - `kempnerforge/config/model.py`: `moe_router_z_loss_weight: float = 0.0` (with a non-negativity check).
   - `kempnerforge/model/router.py`: both `SoftmaxTopKRouter` and `SigmoidTopKRouter` set `self.z_loss = (logsumexp(logits, dim=-1) ** 2).mean()`.
