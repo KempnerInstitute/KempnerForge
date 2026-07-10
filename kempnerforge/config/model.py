@@ -26,6 +26,7 @@ class ModelConfig:
     n_layers: int = 32
     n_heads: int = 32
     n_kv_heads: int | None = None  # None -> same as n_heads (MHA)
+    head_dim: int = 0  # 0 -> dim // n_heads; set explicitly for decoupled head_dim (Qwen3)
     vocab_size: int = 32000
     ffn_dim_multiplier: float = 1.0
     ffn_hidden_dim: int | None = None  # Override computed hidden dim
@@ -69,9 +70,22 @@ class ModelConfig:
         if self.n_kv_heads <= 0:
             raise ValueError("n_kv_heads must be positive")
 
-        # Divisibility checks
-        if self.dim % self.n_heads != 0:
-            raise ValueError(f"dim ({self.dim}) must be divisible by n_heads ({self.n_heads})")
+        # Head dim: the default couples it to dim // n_heads (Llama-style). An
+        # explicit value decouples the attention width from the model dim
+        # (n_heads * head_dim need not equal dim) as in Qwen3 (dim=1024,
+        # n_heads=16, head_dim=128 -> a 2048-wide attention over a 1024-wide
+        # residual). The dim-divisible-by-n_heads requirement only applies to
+        # the inferred case.
+        if self.head_dim == 0:
+            if self.dim % self.n_heads != 0:
+                raise ValueError(
+                    f"dim ({self.dim}) must be divisible by n_heads ({self.n_heads}) "
+                    "when head_dim is not set explicitly"
+                )
+            self.head_dim = self.dim // self.n_heads
+        elif self.head_dim < 0:
+            raise ValueError(f"head_dim must be positive (got {self.head_dim})")
+
         if self.n_heads % self.n_kv_heads != 0:
             raise ValueError(
                 f"n_heads ({self.n_heads}) must be divisible by n_kv_heads ({self.n_kv_heads})"
@@ -110,10 +124,6 @@ class ModelConfig:
     def is_moe(self) -> bool:
         """Whether this config uses Mixture-of-Experts."""
         return self.num_experts > 0
-
-    @property
-    def head_dim(self) -> int:
-        return self.dim // self.n_heads
 
     @property
     def computed_ffn_hidden_dim(self) -> int:

@@ -229,9 +229,17 @@ def main() -> None:
             vlm_freeze_expected = canonical_freeze_meta(
                 effective_freeze(probe_step, vlm_cfg.freeze, vlm_cfg.freeze_schedule, valid_modules)
             )
+        # Warm-start (fine-tune from checkpoint.load_path, no in-place resume)
+        # honors checkpoint.exclude_from_loading so a weights-only checkpoint
+        # (e.g. a converted external model with no optimizer/train_state) loads
+        # cleanly. A real resume (resume_path present) always restores full state.
+        warm_start_exclude = (
+            (config.checkpoint.exclude_from_loading or None) if resume_path is None else None
+        )
         step, tokens_seen, ckpt_extra_loaded = ckpt_mgr.load(
             path=str(resume_path) if resume_path else None,
             scheduler=scheduler,
+            exclude_keys=warm_start_exclude,
             vlm_freeze_expected=vlm_freeze_expected,
         )
         if ckpt_extra_loaded.get("wandb_run_id"):
@@ -673,6 +681,8 @@ def main() -> None:
         )
         hook_runner.on_checkpoint_save(0, config.checkpoint.dir)
 
+    completed_normally = False
+
     while step < tc.max_steps:
         # Refresh data iterator at start / epoch boundary
         if dataloader is not None and data_iter is None:
@@ -1049,10 +1059,28 @@ def main() -> None:
             shutdown_handler.finish()
             break
 
+        # Clean-completion marker for the unconditional final save after the
+        # loop. Only reached when training completes without any errors, e.g.,
+        # no NaN/NCCL/shutdown breaks. If a run encounters a NaN, the last step
+        # is intentionally *not* saved because the actual model state would be
+        # `max_steps - 1`, not `max_steps`.
+        if step >= tc.max_steps:
+            completed_normally = True
+
     if prof is not None:
         prof.stop()
         if rank == 0:
             print_profiler_summary(prof, trace_dir=config.profiling.trace_dir)
+
+    if completed_normally and not config.checkpoint.should_save(step):
+        ckpt_mgr.save(
+            step=step,
+            tokens_seen=tokens_seen,
+            scheduler=scheduler,
+            dataloader=dataloader,
+            extra=ckpt_extra,
+        )
+        hook_runner.on_checkpoint_save(step, config.checkpoint.dir)
 
     # Flush any pending async checkpoint before tearing down process group
     ckpt_mgr.wait()

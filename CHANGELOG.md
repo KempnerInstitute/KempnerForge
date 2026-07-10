@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+
+- **Decoupled attention head dim, an optional adapter pre-norm, and weights-only warm-start.** Small, model-agnostic additions to core, reusable by any config:
+  - `kempnerforge/config/model.py`: `ModelConfig.head_dim` is now an overridable field (`int`, `0` → `dim // n_heads`; was a computed property), decoupling the attention width so `n_heads * head_dim` need not equal `dim`. The default preserves the `dim // n_heads` coupling; `dim % n_heads == 0` is required only when the head dim is inferred.
+  - `kempnerforge/model/adapter.py`: the `mlp_2layer` connector gains an optional `pre_norm` — a pre-projection normalization over the vision features (exposed as `ln_q`), chosen by norm-registry key (`rmsnorm` / `layernorm`). Off by default, so existing `mlp_2layer` configs are unchanged.
+  - `kempnerforge/model/cross_attention.py`, `transformer.py`: `CrossAttentionBlock` threads `head_dim` to `CrossAttention`, so cross-attention honors a decoupled head dim.
+  - `scripts/train.py`: a `load_path` warm-start now honors `checkpoint.exclude_from_loading`, so a weights-only checkpoint (no optimizer/train-state) fine-tunes cleanly; a real resume still restores full state.
+  - Tests fold into the components' existing suites (`tests/unit/test_config.py`, `test_model.py`, `test_adapter.py`, `test_cross_attention.py`).
 - **MoE router z-loss** (`moe_router_z_loss_weight`, ST-MoE style). An optional penalty on the router's pre-softmax logits — per MoE layer `mean_token(logsumexp(router_logits))²` — summed across layers and added to the training loss as `moe_router_z_loss_weight × z_loss`. It keeps router logits from growing without bound, targeting *logit-growth stability* (not load balance — that's the aux loss). Default `0.0` is off: the term is never added, so training, outputs, and gradients are unchanged. `z_loss` is a plain attribute like `aux_loss` (not a buffer/parameter), so it never enters `state_dict` — checkpoint-safe.
   - `kempnerforge/config/model.py`: `moe_router_z_loss_weight: float = 0.0` (with a non-negativity check).
   - `kempnerforge/model/router.py`: both `SoftmaxTopKRouter` and `SigmoidTopKRouter` set `self.z_loss = (logsumexp(logits, dim=-1) ** 2).mean()`.
@@ -85,25 +92,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Milestone-aware retention: `CheckpointManager._cleanup` never prunes a step where the configured dynamic strategy fired, so `keep_last_n` rotates only the later interval checkpoints. `keep_last_n <= 0` keeps everything (the previous `keep_last_n >= 1` requirement is relaxed).
   - `scripts/train.py`: the save gate now calls `config.checkpoint.should_save(step)`.
   - Tests: `tests/unit/test_config.py` (defaults, power2 firing, offset-based `start > 0`, validation, unknown-strategy rejection, `is_dynamic_milestone`), `tests/unit/test_checkpoint.py::TestCheckpointRetention::test_cleanup_protects_dynamic_milestones`.
+- **VLM evaluation pipeline** (`scripts/vlm_eval_harness.py` + `kempnerforge/eval/vlm/`). Evaluates any KempnerForge VLM checkpoint on any standard multimodal benchmarks (MMMU, MMBench, ScienceQA, SEED, AI2D, …) by integrating the [lmms-eval](https://github.com/EvolvingLMMs-Lab/lmms-eval) harness through a custom model adapter that wraps `VLMWrapper` and loads directly from a DCP checkpoint. Arch-agnostic across Joint-Decoder / Cross-Attention / MoT; MoMa fails fast (its non-causal expert-choice routing cannot autoregressively generate, and eval requires generation). v1 is single-GPU, image-only, and generation-only (`generate_until`), decoding requests in batches (the `--batch-size` model-arg). All changes are additive and backward compatible; the only edit to existing code is a behavior-preserving refactor.
+  - `kempnerforge/eval/__init__.py`, `kempnerforge/eval/vlm/__init__.py`: new eval-subsystem namespace. Import-isolated — neither is imported on the default `import kempnerforge` path, so the main package keeps working with lmms-eval absent (pinned by `test_import_isolation.py`).
+  - `kempnerforge/eval/vlm/adapter.py`: `KempnerForgeVLM(lmms)` chat adapter (`is_simple = False`). Loader (`build_vlm_wrapper` behind a `_build_model` seam → single-process `dcp.load` of model shards only; `resolve_resume_path` with a specific-`step_N` fallback; reads plain-JSON `metadata.json`, never `train_state.pt`); prompt rendering by flattening `ChatMessages` text blocks (no chat template, no `<image>` placeholder — images are conditioned via `pixel_values`); a cache-less, **batched** greedy/sampled decode loop (`_generate_batch`, reusing `kempnerforge.model.generate.sample`): `generate_until` groups requests by `gen_kwargs` and chunks/reorders them via `lmms_eval.utils.Collator` (mirrors `lmms_eval/models/chat/qwen2_5_vl.py`), **right-padding** the text to the batch-max length (image prefix at `0..n-1`, text contiguous from `n`, trailing pads causally masked — the training layout; reuses the now-public `resolve_pad_id` for pad ids) so a batched forward gives each row the same real-position logits as decoding it alone (pinned by a batch-equivalence test), reading each row's next token at its own last real position and tracking EOS / `until` / `max_new_tokens` per row. `generate_until` only — `loglikelihood` and `generate_until_multi_round` raise `NotImplementedError`. Guards (clear `NotImplementedError`/`ValueError`): MoMa arch, video/audio, multi-image, multi-turn/few-shot. A file-level `# pyright: reportMissingImports=false` keeps `pyright kempnerforge/` green in CI (where the undeclared lmms-eval is absent) without an inline ignore.
+  - `kempnerforge/eval/vlm/manifest.py`: `MANIFEST = ModelManifest(model_id="kempnerforge_vlm", chat_class_path="kempnerforge.eval.vlm.adapter.KempnerForgeVLM")` for lmms-eval entry-point discovery.
+  - `scripts/vlm_eval_harness.py`: CLI mirroring `scripts/eval_harness.py` (no conversion). `--config`/`--checkpoint`/`--tasks` required (default suite TBD), plus `--limit`/`--output`/`--device`/`--dtype`/`--batch-size`/`--max-new-tokens`; lazy `lmms_eval.evaluator.simple_evaluate` import with a helpful error.
+  - `pyproject.toml`: `[project.entry-points."lmms_eval.models"]` for the adapter — metadata only; lmms-eval is NOT added as a dependency (install separately with `uv pip install lmms-eval`, mirroring how lm-eval is handled).
+  - `kempnerforge/data/vlm_dataset.py`: behavior-preserving refactor — `_pil_to_tensor` → public `pil_to_tensor`; tokenizer construction and pad-id resolution extracted to public `build_tokenizer` / `resolve_pad_id`, so the eval adapter reuses the exact training-time preprocessing as the single source of truth. (`tests/unit/test_vlm_dataset.py` updated to the renamed helper; all behavior identical.)
+  - Tests: `tests/unit/eval/vlm/` (CPU) runs against a faithful in-repo fake `lmms_eval` injected via `conftest.py` (`_fake_lmms_eval.py`) — so the adapter/registry tests **always run in CI and contribute coverage** without the undeclared lmms-eval dependency, instead of skipping. `test_adapter.py` covers rendering / preprocessing / `gen_kwargs` / the batched decode loop (`TestGenerateBatchSingle` B=1 regressions + `TestGenerateBatchMulti` batch-equivalence, per-row `max_new_tokens`, per-row EOS) / guards, plus the loader helpers (`_resolve_dtype`, `_load_config`, `_load_weights`, `_log_checkpoint_metadata`, `_first_stop`), the `__init__` guards, and `generate_until` end-to-end; `test_manigest.py` covers the manifest. `test_import_isolation.py` still asserts `import kempnerforge` needs no lmms-eval. `tests/integration/test_lmms_eval_contract.py` pins the *real* lmms-eval API and entry-point resolution to the fakes' assumptions (gated on real lmms-eval), and `tests/integration/test_vlm_eval.py` keeps the self-contained DCP round-trip (at `batch_size=2`) + env-gated real-task path. `tests/conftest.py`: `tiny_vlm_configs` / `tiny_vlm_wrapper` fixtures (random vision encoder, CPU, no checkpoint).
+  - Docs: `docs/how-to/run-vlm-evaluation.md`, wired into the how-to `toctree`.
+  - Deferred: data-parallel and sharded multi-GPU inference, a representative default benchmark suite, whether to formalize the lmms-eval dependency, and confirming frozen vision-encoder weights load from a real checkpoint.
 
 ### Changed
+
 - `docs/getting-started/install.md` Prerequisites: documents `.python-version` and uv's auto-fetch behavior.
 - `README.md` and `kempnerforge/README.md` Prerequisites: clarify that uv auto-fetches Python 3.12 via `.python-version`.
 - `docs/claude-ready.md` first-run flow: `/kempnerforge:install-and-verify` runs before `/kempnerforge:cluster-config`.
 - `README.md` and `kempnerforge/README.md`: list `install-and-verify` in the skill catalog and drop the hardcoded skill count.
 
 ### Fixed
+
 - **Resume silently reset AdamW optimizer momentum.** `CheckpointManager` round-tripped optimizer state through raw `optimizer.state_dict()` / `optimizer.load_state_dict()`. On resume the optimizer is freshly built, so its `state_dict()` is empty — `dcp.load` then had no `exp_avg` / `exp_avg_sq` tensors to fill, and the moments were silently dropped, resetting Adam momentum to zero at every resume point. Model weights, scheduler, dataloader position, and RNG all restored correctly; only the optimizer moments were lost, so resumed runs were not bit-exact.
   - `kempnerforge/checkpoint/manager.py`: save and load now go through DCP's `get_model_state_dict` / `get_optimizer_state_dict` / `set_model_state_dict` / `set_optimizer_state_dict`. The getters build a load template with the optimizer moments allocated in the correct FSDP/DTensor layout, so `dcp.load` repopulates them; the setters write the loaded values back into the live optimizer.
   - `docs/checkpointing/dcp-model.md`: updated the save/load snippets and the "shape to fill" explanation to the DCP-aware helpers.
   - Tests (fail on the pre-fix code, pass after): `tests/integration/test_checkpoint_roundtrip.py::test_manager_restores_optimizer_moments_single_gpu` and `tests/distributed/test_checkpoint.py::test_resume_restores_optimizer_moments` assert `exp_avg` / `exp_avg_sq` are restored bit-exactly into a *fresh* optimizer (single-GPU + distributed); `tests/e2e/test_training_e2e.py::test_resume_determinism_single_gpu` / `test_resume_determinism_2gpu_fsdp` assert end-to-end bit-exact loss across an interrupt-and-resume on a learnable dataset.
   - **On-disk format note:** optimizer state is now keyed by parameter fully-qualified name rather than positional index. Checkpoints written before this fix will not restore optimizer state on resume (training continues with a fresh optimizer); model state is unaffected.
+- **Always save a final checkpoint on clean completion.** A run that finished cleanly previously wrote a final checkpoint only when `max_steps` happened to land on the save schedule; otherwise the fully-trained model (including the entire WSD decay tail) was never persisted and `latest` resolved to the last scheduled step. The training-loop teardown now writes one unconditional checkpoint at `max_steps` on normal completion when that step is off-schedule, matching the emergency-checkpoint guarantee on the preemption path. Purely additive: the schedule/retention knobs (`interval`, `keep_last_n`, `dyn_ckpt_window`) are untouched.
+  - `scripts/train.py`: a `completed_normally` marker set on the final iteration, plus an off-schedule final `ckpt_mgr.save(...)` (and `on_checkpoint_save` hook) before `ckpt_mgr.wait()`.
+  - Tests: `tests/e2e/test_training_e2e.py` — a clean off-schedule completion writes `step_{max_steps}` and points `latest` at it.
 
 ## [0.1.0] — 2026-04-16
 
 Initial public release.
 
 ### Architecture
+
 - Decoder-only Transformer with RoPE, GQA, SwiGLU MLP, RMSNorm
 - Optional QK-Norm (Gemma/DeepSeek-V3 style)
 - Mixture-of-Experts (MoE) with softmax top-k and DeepSeek-V3 sigmoid routers
@@ -112,6 +135,7 @@ Initial public release.
 - Sequence-level aux loss, gradient scaling, adaptive bias schedule for sigmoid router
 
 ### Parallelism
+
 - **FSDP2** — composable `fully_shard()`, per-block sharding, mixed precision (bf16/fp16/fp32)
 - **Tensor Parallelism** — column/row parallel with SequenceParallel and meta-device init
 - **Expert Parallelism** — all-to-all dispatch, multi-node EP+TP+FSDP2 composition
@@ -120,6 +144,7 @@ Initial public release.
 - **SDPA backend override** — `model.sdpa_backend` config (`auto`/`flash`/`efficient`/`cudnn`/`math`) for kernel benchmarking and debugging
 
 ### Training
+
 - Optimizers: AdamW, Muon (Newton-Schulz orthogonalized momentum), Lion (half optimizer memory), Schedule-Free AdamW
 - LR schedulers: cosine, linear, WSD (cosine/linear/sqrt cooldown), constant, REX, none
 - Loss functions: cross-entropy, chunked cross-entropy, z-loss regularizer
@@ -131,29 +156,34 @@ Initial public release.
 - Training loop hooks (`TrainingHook`, `HookRunner`) for extensibility
 
 ### Resilience
+
 - SLURM preemption handling (SIGTERM/SIGUSR1) with cooperative shutdown
 - NaN detection with configurable actions (warn, skip, raise)
 - GPU compute/memory health checks
 - NCCL liveness monitoring via all-reduce
 
 ### Interpretability
+
 - Activation extraction hooks (`ActivationStore`) with CPU offload
 - Attention weight capture (explicit QK^T path for mechanistic interpretability)
 - Batch extraction over datasets for CKA/SVCCA/probing pipelines
 
 ### Metrics & Observability
+
 - Per-step MetricsTracker with EMA smoothing
 - MFU computation from architecture params and GPU peak FLOPs
 - WandB and TensorBoard backends
 - Peak memory monitoring with optional snapshot export
 
 ### Configuration
+
 - Typed dataclass configs per domain (`ModelConfig`, `TrainConfig`, etc.)
 - Layered loading: defaults → TOML file → CLI overrides
 - Fail-fast validation at object construction
 - Registry for swappable components (optimizers, schedulers, losses, routers, norms)
 
 ### Testing
+
 - 794 unit tests (CPU-only)
 - Integration tests (1 GPU)
 - Distributed tests (4 GPUs via torchrun)

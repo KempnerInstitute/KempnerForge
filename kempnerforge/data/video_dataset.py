@@ -36,8 +36,9 @@ from kempnerforge.data.video_io import decode_video_frames
 from kempnerforge.data.vlm_dataset import (
     DEFAULT_IMAGE_MEAN,
     DEFAULT_IMAGE_STD,
-    _pil_to_tensor,
     _tokenize_and_mask,
+    frames_to_clip_tensor,
+    resolve_pad_id,
 )
 
 logger = logging.getLogger(__name__)
@@ -46,13 +47,6 @@ logger = logging.getLogger(__name__)
 # directory name ("validation"); "train" matches both.
 _CSV_SUBDIR = {"train": "train", "validation": "val"}
 _VIDEO_SUBDIR = {"train": "train", "validation": "validation"}
-
-
-def _resolve_pad_id(tokenizer: Any) -> int:
-    pad_id = tokenizer.pad_token_id
-    if pad_id is None:
-        pad_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
-    return int(pad_id)
 
 
 class VideoDataset(Dataset):
@@ -122,7 +116,7 @@ class WebVidVideoDataset(VideoDataset):
         )
         self._ids, self._caps = self._load_manifest(csv_dir, max_samples)
         self._tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-        self._pad_id = _resolve_pad_id(self._tokenizer)
+        self._pad_id = resolve_pad_id(self._tokenizer)
         self._max_text_len = max_text_len
         self._max_frames = max_frames
         self._min_frames = min_frames
@@ -202,24 +196,25 @@ class WebVidVideoDataset(VideoDataset):
             logger.debug("video decode failed for %s: %s", path, e)
             frames, frame_times_s = [], []
 
-        f = self._max_frames
-        size = self._frame_size
-        pixel_values = torch.zeros(f, 3, size, size, dtype=torch.float32)
-        frame_mask = torch.zeros(f, dtype=torch.bool)
+        pixel_values, frame_mask = frames_to_clip_tensor(
+            frames,
+            max_frames=self._max_frames,
+            frame_size=self._frame_size,
+            image_mean=self._image_mean,
+            image_std=self._image_std,
+        )
         # Per-frame timestamp in seconds; 0.0 for pad frames. The time projection
         # runs over every frame and does not consult frame_mask, so pad frames
         # still receive a (time-0) embedding — harmless only while padded frames
         # are themselves unmasked from attention, and inert once they are masked.
-        frame_times = torch.zeros(f, dtype=torch.float32)
-        n_real = min(len(frames), f)
+        frame_times = torch.zeros(self._max_frames, dtype=torch.float32)
+        n_real = min(len(frames), self._max_frames)
         for i in range(n_real):
-            pixel_values[i] = _pil_to_tensor(frames[i], size, self._image_mean, self._image_std)
-            frame_mask[i] = True
             frame_times[i] = frame_times_s[i]
 
         prompt = self._prompt or None
         input_ids, labels = _tokenize_and_mask(self._tokenizer, caption, self._max_text_len, prompt)
-        if n_real == 0:
+        if not frames:
             # Undecodable clip: keep static shapes but contribute no loss.
             labels = torch.full_like(labels, -100)
         return {

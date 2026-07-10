@@ -1036,3 +1036,33 @@ class TestInitWeights:
             model = Transformer(_INIT_CONFIG)
         # Should not raise even though all params are on meta device
         init_weights(model, _INIT_CONFIG)
+
+
+class TestDecoupledHeadDim:
+    """A ``ModelConfig.head_dim`` override flows into the built attention/RoPE."""
+
+    def test_attention_uses_decoupled_head_dim(self):
+        cfg = ModelConfig(
+            dim=1024, n_heads=16, n_kv_heads=8, head_dim=128, vocab_size=1000, n_layers=1
+        )
+        block = TransformerBlock(cfg, layer_idx=0)
+        assert block.attention.q_proj.out_features == 16 * 128  # 2048, decoupled
+        assert block.attention.k_proj.out_features == 8 * 128  # 1024 (GQA)
+        assert block.attention.o_proj.in_features == 16 * 128  # 2048
+        assert block.attention.o_proj.out_features == 1024  # back to residual dim
+
+    def test_rope_table_width_follows_head_dim(self):
+        # RoPE cos/sin last dim is head_dim // 2; a decoupled head_dim must flow
+        # into the precomputed table, not dim // n_heads.
+        cfg = ModelConfig(
+            dim=1024,
+            n_heads=16,
+            n_kv_heads=8,
+            head_dim=128,
+            vocab_size=64,
+            n_layers=1,
+            max_seq_len=8,
+        )
+        model = Transformer(cfg)
+        assert model._rope_cos is not None
+        assert model._rope_cos.shape[-1] == 128 // 2
