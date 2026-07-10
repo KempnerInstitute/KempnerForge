@@ -1,10 +1,10 @@
 # pyright: reportMissingImports=false
 # ^ lmms-eval is an optional, UNDECLARED dependency (it is installed separately,
-#   not listed in pyproject.toml). CI type-checks `kempnerforge/` without it
-#   installed, so the `lmms_eval` imports below would otherwise raise
-#   reportMissingImports. A file-level directive (not a `# type: ignore`, which
-#   reportUnnecessaryTypeIgnoreComment would flag as unnecessary in dev where
-#   lmms-eval *is* installed) scopes the relaxation to this one module.
+#   not listed in pyproject.toml), so in an environment without it the
+#   `lmms_eval` imports below would raise reportMissingImports. A file-level
+#   directive (not a `# type: ignore`, which reportUnnecessaryTypeIgnoreComment
+#   would flag as unnecessary where lmms-eval *is* installed) scopes the
+#   relaxation to this one module.
 """lmms-eval chat-model adapter wrapping a KempnerForge ``VLMWrapper``.
 
 This module implements ``KempnerForgeVLM``, an lmms-eval ``chat`` model
@@ -12,7 +12,7 @@ This module implements ``KempnerForgeVLM``, an lmms-eval ``chat`` model
 standard multimodal benchmarks lmms-eval implements as ``generate_until`` tasks
 (MMMU, MMBench, ScienceQA, SEED, AI2D, ...). It is loaded directly from a DCP checkpoint,
 and is arch-agnostic across the generative VLM arches.
-v1 scope and deliberate choices (see docs/how-to/run-vlm-evaluation.md):
+v1 scope and deliberate choices (see README.md in this directory):
 
 - **Generation: no transformer KV cache, single-GPU, batched.** The decode loop
   re-runs the transformer (including the vision encoder + adapter) over the
@@ -513,8 +513,8 @@ def _generate_batch(
 class KempnerForgeVLM(lmms):
     """lmms-eval chat model over a KempnerForge ``VLMWrapper`` (see module docstring).
 
-    Model args (parsed by the base ``create_from_arg_string`` from a
-    ``key=value,...`` string):
+    Constructor args (the harness in this directory constructs the adapter
+    directly and passes the instance to ``simple_evaluate``):
 
     - ``config`` (required): path to the KempnerForge TOML the checkpoint was
       trained with.

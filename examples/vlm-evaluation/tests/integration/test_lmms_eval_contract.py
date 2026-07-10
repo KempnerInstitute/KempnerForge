@@ -1,13 +1,11 @@
 """Contract tests pinning the real ``lmms_eval`` API to what the unit-test fakes assume.
 
 The VLM-eval unit tests run against an in-repo fake ``lmms_eval``
-(``tests/unit/eval/vlm/_fake_lmms_eval.py``) so they execute in CI without the optional,
-undeclared ``lmms-eval`` dependency. These tests are the fidelity net: they exercise the
-*real* package and fail loudly if its API drifts from the fakes (in which case update the
-fakes — and likely the adapter). They run wherever real lmms-eval is installed (locally, the
-manual ``gpu-tests`` CI job) and skip otherwise.
-
-Also verifies the ``pyproject.toml`` ``lmms_eval.models`` entry point resolves to the adapter.
+(``../unit/_fake_lmms_eval.py``) so they execute without the optional, undeclared
+``lmms-eval`` dependency. These tests are the fidelity net: they exercise the *real*
+package and fail loudly if its API drifts from the fakes (in which case update the
+fakes — and likely the adapter). They run wherever real lmms-eval is installed and skip
+otherwise.
 """
 
 from __future__ import annotations
@@ -23,17 +21,8 @@ if getattr(lmms_eval, "__file__", None) is None:
 
 from lmms_eval.api.instance import Instance  # noqa: E402
 from lmms_eval.api.model import lmms  # noqa: E402
-from lmms_eval.models import get_model  # noqa: E402
-from lmms_eval.models.registry_v2 import ModelManifest  # noqa: E402
 from lmms_eval.protocol import ChatMessages  # noqa: E402
 from lmms_eval.utils import Collator  # noqa: E402
-
-from kempnerforge.eval.vlm.adapter import KempnerForgeVLM  # noqa: E402
-
-
-def test_entrypoint_resolves_to_adapter():
-    """The pyproject ``lmms_eval.models`` entry point resolves ``kempnerforge_vlm``."""
-    assert get_model("kempnerforge_vlm") is KempnerForgeVLM
 
 
 class TestChatMessagesContract:
@@ -70,16 +59,6 @@ class TestCollatorContract:
         flat = [item for batch in col.get_batched(n=2, batch_fn=None) for item in batch]
         assert sorted(map(id, flat)) == sorted(map(id, arr))  # all items present
         assert col.get_original(flat) == arr  # original request order restored
-
-
-class TestModelManifestContract:
-    def test_fields_and_validation(self):
-        manifest = ModelManifest(model_id="x", chat_class_path="a.b.C")
-        assert manifest.model_id == "x"
-        assert manifest.chat_class_path == "a.b.C"
-        assert manifest.simple_class_path is None
-        with pytest.raises(ValueError):
-            ModelManifest(model_id="y")  # neither class path -> rejected
 
 
 class TestLmmsBaseContract:

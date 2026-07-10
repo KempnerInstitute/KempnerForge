@@ -1,30 +1,31 @@
 #!/usr/bin/env python3
 """Run lmms-eval benchmarks on a KempnerForge VLM checkpoint.
 
-Evaluates a VLM checkpoint directly via the
-``kempnerforge_vlm`` lmms-eval chat-model adapter, on the standard image
-benchmarks lmms-eval implements as ``generate_until`` tasks (MMMU, MMBench,
-ScienceQA, SEED, AI2D, ...).
+Evaluates a VLM checkpoint via the ``KempnerForgeVLM`` lmms-eval chat-model
+adapter (the sibling ``adapter.py``), on the standard benchmarks lmms-eval
+implements as ``generate_until`` tasks (MMMU, MMBench, ScienceQA, SEED, AI2D,
+...). The harness constructs the adapter directly and passes the instance to
+``simple_evaluate`` — there is no lmms-eval entry-point registration.
 
 Requirements (lmms-eval is an OPTIONAL, separately-installed dependency, exactly
 like lm-eval for text evaluation):
 
     uv pip install lmms-eval
 
-v1 is single-GPU and image-only; MoMa checkpoints are not supported (see
-docs/how-to/run-vlm-evaluation.md). On clusters where importing lmms-eval's
-evaluator fails with ``GLIBCXX_... not found``, put a newer libstdc++ on the
-library path (e.g. ``LD_LIBRARY_PATH=<conda>/lib``).
+v1 is single-GPU; MoMa checkpoints are not supported (see README.md in this
+directory). On clusters where importing lmms-eval's evaluator fails with
+``GLIBCXX_... not found``, put a newer libstdc++ on the library path
+(e.g. ``LD_LIBRARY_PATH=<conda>/lib``).
 
 Usage:
-    uv run python scripts/vlm_eval_harness.py \
+    uv run python examples/vlm-evaluation/vlm_eval_harness.py \
         --config configs/train/vlm_jd.toml \
         --checkpoint checkpoints/vlm/step_10000 \
         --tasks mmmu_val \
         --output results/vlm_step_10000.json
 
     # Quick partial run (4 examples per task)
-    uv run python scripts/vlm_eval_harness.py \
+    uv run python examples/vlm-evaluation/vlm_eval_harness.py \
         --config configs/train/vlm_jd.toml \
         --checkpoint checkpoints/vlm/step_10000 \
         --tasks mmmu_val,mmbench_en_dev \
@@ -109,26 +110,32 @@ def main() -> None:
             "Could not import lmms-eval's simple_evaluate (%s).\n"
             "lmms-eval is an optional dependency; install it with: uv pip install lmms-eval\n"
             "If this is a 'GLIBCXX_... not found' error, put a newer libstdc++ on the library "
-            "path (e.g. LD_LIBRARY_PATH=<conda>/lib); see docs/how-to/run-vlm-evaluation.md.",
+            "path (e.g. LD_LIBRARY_PATH=<conda>/lib); see README.md in examples/vlm-evaluation/.",
             exc,
         )
         sys.exit(1)
 
+    # The adapter imports lmms-eval at module top; the guard above already proved
+    # it importable. The script's own directory is sys.path[0], so the sibling
+    # adapter.py resolves as a top-level module.
+    from adapter import KempnerForgeVLM
+
     logger.info(f"Running lmms-eval: tasks={args.tasks}, checkpoint={args.checkpoint}")
 
-    model_args = (
-        f"config={args.config},checkpoint={args.checkpoint},max_new_tokens={args.max_new_tokens}"
-    )
     # Only pass dtype when explicitly set; otherwise the adapter defaults it from
     # the checkpoint config (train.param_dtype).
-    if args.dtype is not None:
-        model_args += f",dtype={args.dtype}"
-    results = simple_evaluate(
-        model="kempnerforge_vlm",
-        model_args=model_args,
-        tasks=args.tasks.split(","),
+    dtype_kwargs = {"dtype": args.dtype} if args.dtype is not None else {}
+    model = KempnerForgeVLM(
+        config=args.config,
+        checkpoint=args.checkpoint,
         device=args.device,
         batch_size=args.batch_size,
+        max_new_tokens=args.max_new_tokens,
+        **dtype_kwargs,
+    )
+    results = simple_evaluate(
+        model=model,
+        tasks=args.tasks.split(","),
         limit=args.limit,
     )
 
