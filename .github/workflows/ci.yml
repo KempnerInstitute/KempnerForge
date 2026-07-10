@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, multimodal-video]
   pull_request:
-    branches: [main]
+    branches: [main, multimodal-video]
   workflow_dispatch:
 
 jobs:
