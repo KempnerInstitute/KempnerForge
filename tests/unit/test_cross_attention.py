@@ -317,3 +317,19 @@ def test_cross_attention_shape_parametrize(batch, seq_len, num_image_tokens):
     out.sum().backward()
     assert x.grad is not None
     assert img.grad is not None
+
+
+class TestCrossAttentionHeadDim:
+    """``CrossAttentionBlock`` honors a decoupled ``head_dim``."""
+
+    def test_block_uses_decoupled_head_dim(self):
+        block = CrossAttentionBlock(
+            dim=1024, n_heads=16, n_kv_heads=8, ffn_hidden_dim=3072, head_dim=128
+        )
+        assert block.attn.q_proj.out_features == 16 * 128  # 2048, not 1024
+        assert block.attn.o_proj.in_features == 16 * 128
+
+    def test_block_defaults_to_coupled_head_dim(self):
+        # Without an explicit head_dim the block keeps dim // n_heads.
+        block = CrossAttentionBlock(dim=1024, n_heads=16, n_kv_heads=8, ffn_hidden_dim=3072)
+        assert block.attn.q_proj.out_features == 1024  # 16 * (1024 // 16)

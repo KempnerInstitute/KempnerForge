@@ -131,10 +131,13 @@ class CrossAttentionBlock(nn.Module):
         ffn_hidden_dim: int,
         norm_type: str = "rmsnorm",
         activation: str = "silu",
+        head_dim: int | None = None,
     ) -> None:
         super().__init__()
         self.attn_norm = build_norm(norm_type, dim)
-        self.attn = CrossAttention(dim=dim, n_heads=n_heads, n_kv_heads=n_kv_heads)
+        self.attn = CrossAttention(
+            dim=dim, n_heads=n_heads, n_kv_heads=n_kv_heads, head_dim=head_dim
+        )
         self.mlp_norm = build_norm(norm_type, dim)
         self.mlp = build_mlp(dim=dim, hidden_dim=ffn_hidden_dim, activation=activation)
 
