@@ -606,6 +606,37 @@ def test_sigterm_triggers_emergency_checkpoint(tmp_path):
     assert "Checkpoint saved" in output, f"Emergency checkpoint was not saved:\n{output[-2000:]}"
 
 
+@pytest.mark.e2e
+def test_final_checkpoint_on_clean_completion(tmp_path):
+    """A clean finish at an off-schedule step must still persist a final
+    checkpoint, with `latest` pointing at it."""
+    ckpt_dir = tmp_path / "final_ckpt"
+
+    # max_steps=10 with interval=1000 => no scheduled save lands (debug.toml
+    # configures no dyn_ckpt_window), so the only checkpoint must be the
+    # unconditional final save at step 10.
+    result = _run_training(
+        [
+            DEBUG_CONFIG,
+            "--train.max_steps=10",
+            "--metrics.log_interval=5",
+            f"--checkpoint.dir={ckpt_dir}",
+            "--checkpoint.interval=1000",  # no scheduled checkpoint
+        ],
+        nproc=1,
+    )
+    _assert_training_complete(result, expected_steps=10)
+
+    output = result.stdout + result.stderr
+    final = ckpt_dir / "step_10"
+    latest = ckpt_dir / "latest"
+    assert final.is_dir(), f"final checkpoint step_10 was not written:\n{output[-2000:]}"
+    assert latest.exists(), f"`latest` pointer is missing:\n{output[-2000:]}"
+    assert latest.resolve().name == "step_10", (
+        f"`latest` should resolve to step_10, got {latest.resolve().name!r}"
+    )
+
+
 # ============================================================================
 # MoE Training
 # ============================================================================
