@@ -127,20 +127,29 @@ class JobConfig:
             )
 
         # Set-but-ineffective [time_embedding] warning. The per-frame time
-        # embedding is built only for video (frames_per_clip > 1); an explicit,
-        # enabled [time_embedding] on a non-video config is silently ignored, so
-        # warn (mirrors the HF-encoder-override warning above). type="none" is
-        # an intentional disable and stays quiet.
-        if self.time_embedding is not None and self.time_embedding.enabled and self.video is None:
-            import logging
+        # embedding is built only for multi-frame video (frames_per_clip > 1,
+        # matching the build sites in parallel.py / vlm.py). An explicit, enabled
+        # [time_embedding] is silently ignored otherwise — either no [video]
+        # section, or a [video] with max_frames == 1 (a single-frame clip has no
+        # time axis to encode) — so warn (mirrors the HF-encoder-override warning
+        # above). type="none" is an intentional disable and stays quiet.
+        if self.time_embedding is not None and self.time_embedding.enabled:
+            frames_per_clip = self.video.max_frames if self.video is not None else 1
+            if frames_per_clip <= 1:
+                import logging
 
-            logging.getLogger(__name__).warning(
-                "[time_embedding] is set (type=%r) but no [video] section is present; "
-                "the time embedding is built only for video (frames_per_clip > 1), so it "
-                'will be ignored. Set [time_embedding].type = "none" or remove the section '
-                "to silence this.",
-                self.time_embedding.type,
-            )
+                reason = (
+                    "no [video] section is present"
+                    if self.video is None
+                    else f"[video].max_frames == {self.video.max_frames} (frames_per_clip == 1)"
+                )
+                logging.getLogger(__name__).warning(
+                    "[time_embedding] is set (type=%r) but %s; the time embedding is built "
+                    "only for multi-frame video (frames_per_clip > 1), so it will be ignored. "
+                    'Set [time_embedding].type = "none" or remove the section to silence this.',
+                    self.time_embedding.type,
+                    reason,
+                )
 
     @property
     def is_vlm(self) -> bool:

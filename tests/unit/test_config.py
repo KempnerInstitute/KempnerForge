@@ -26,6 +26,7 @@ from kempnerforge.config.schema import (
     VLMConfig,
 )
 from kempnerforge.config.time_embedding import TimeEmbeddingConfig
+from kempnerforge.config.video import VideoConfig
 from kempnerforge.config.vlm import MoMaConfig
 
 # ---------------------------------------------------------------------------
@@ -636,9 +637,12 @@ class TestHfEncoderOverrideWarning:
 
 class TestTimeEmbeddingIneffectiveWarning:
     """``JobConfig.__post_init__`` warns when an explicit, enabled
-    ``[time_embedding]`` is paired with a non-video config: the per-frame time
-    embedding is built only for video (``frames_per_clip > 1``), so it is
-    silently ignored otherwise (mirrors the HF-encoder-override warning)."""
+    ``[time_embedding]`` cannot take effect: the per-frame time embedding is
+    built only for multi-frame video (``frames_per_clip > 1``), so it is
+    silently ignored both when there is no ``[video]`` section AND when
+    ``[video].max_frames == 1`` (a single-frame clip has no time axis). It must
+    NOT warn for real multi-frame video (mirrors the HF-encoder-override
+    warning)."""
 
     def setup_method(self):
         import logging
@@ -659,10 +663,43 @@ class TestTimeEmbeddingIneffectiveWarning:
             time_embedding=time_embedding,
         )
 
+    def _video_vlm(self, time_embedding, max_frames):
+        # Same VLM sizing as _image_vlm, plus a [video] section. frames_per_clip
+        # == max_frames; max_frames=1 => single-frame (embedding not built),
+        # max_frames>1 => real video (embedding built). data_root="" is fine:
+        # construction validates knobs, not the filesystem.
+        return JobConfig(
+            model=ModelConfig(max_seq_len=2304),
+            vision_encoder=VisionEncoderConfig(type="random", feature_dim=384, num_tokens=64),
+            adapter=AdapterConfig(),
+            vlm=VLMConfig(max_text_len=2048),
+            video=VideoConfig(max_frames=max_frames, min_frames=1),
+            time_embedding=time_embedding,
+        )
+
     def test_warns_when_time_embedding_set_without_video(self, caplog):
         with caplog.at_level("WARNING", logger="kempnerforge.config.job"):
             self._image_vlm(TimeEmbeddingConfig())
         assert any("[time_embedding] is set" in r.getMessage() for r in caplog.records)
+
+    def test_warns_when_time_embedding_set_with_single_frame_video(self, caplog):
+        # [video] present but max_frames == 1 -> frames_per_clip == 1 -> the
+        # embedding is not built, so this must warn too (the case the old
+        # `video is None`-only guard missed).
+        with caplog.at_level("WARNING", logger="kempnerforge.config.job"):
+            self._video_vlm(TimeEmbeddingConfig(), max_frames=1)
+        msgs = [
+            r.getMessage() for r in caplog.records if "[time_embedding] is set" in r.getMessage()
+        ]
+        assert msgs, "expected an ineffective-[time_embedding] warning"
+        assert any("max_frames == 1" in m for m in msgs)
+
+    def test_no_warning_for_multiframe_video(self, caplog):
+        # Real multi-frame video (frames_per_clip > 1): the embedding IS built,
+        # so the warning must stay silent (guards against over-firing).
+        with caplog.at_level("WARNING", logger="kempnerforge.config.job"):
+            self._video_vlm(TimeEmbeddingConfig(), max_frames=2)
+        assert not any("[time_embedding] is set" in r.getMessage() for r in caplog.records)
 
     def test_no_warning_when_disabled(self, caplog):
         # type="none" is an intentional disable and stays quiet.
