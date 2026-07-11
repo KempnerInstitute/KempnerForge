@@ -37,6 +37,17 @@ class TimeEmbeddingConfig:
     max_period: float = 256.0
 
     def __post_init__(self) -> None:
+        # Validate the numeric fields unconditionally (fail-loud at construction),
+        # even when disabled, so a bad value can't lie dormant under type="none"
+        # and only surface later when the type is flipped to an enabled builder
+        # (e.g. a `--time_embedding.type=sinusoidal` override over such a config).
+        if self.num_bands <= 0:
+            raise ValueError(f"time_embedding.num_bands must be positive (got {self.num_bands})")
+        if not 0.0 < self.min_period < self.max_period:
+            raise ValueError(
+                f"time_embedding requires 0 < min_period < max_period "
+                f"(got min_period={self.min_period}, max_period={self.max_period})"
+            )
         if self.type == "none":
             return
         # Late import: importing the module triggers the
@@ -49,13 +60,6 @@ class TimeEmbeddingConfig:
             raise ValueError(
                 f"Unknown time_embedding.type: {self.type!r}. "
                 f"Registered: {sorted(registered)} (or 'none' to disable)."
-            )
-        if self.num_bands <= 0:
-            raise ValueError(f"time_embedding.num_bands must be positive (got {self.num_bands})")
-        if not 0.0 < self.min_period < self.max_period:
-            raise ValueError(
-                f"time_embedding requires 0 < min_period < max_period "
-                f"(got min_period={self.min_period}, max_period={self.max_period})"
             )
 
     @property

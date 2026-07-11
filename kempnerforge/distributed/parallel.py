@@ -318,6 +318,8 @@ def _apply_fsdp_vlm(
         and VLM+MoE cannot deadlock).
       - Transformer root (embedding + final norm + output head): own unit.
       - Adapter: own unit (small, but keeps grad-sync scheduling symmetric).
+      - Frame-time embedding: own unit, wrapped only when built (video path,
+        ``frames_per_clip > 1``; ``None`` otherwise).
       - Vision encoder: wrapped only when not fully frozen. A frozen encoder
         stays as a full replica in eval mode; replication is fine because
         requires_grad=False means no grad-reduce participation.
@@ -396,11 +398,13 @@ def _build_vlm(
          ``num_tokens`` is known from the encoder.
       4. TP / EP / Float8 / AC are applied to the transformer only.
       5. FSDP2 is applied component-by-component (transformer blocks,
-         transformer root, adapter, and vision encoder iff not frozen).
-      6. Meta subtrees are materialized (transformer / adapter), the
-         vision encoder is moved to ``device``, and the transformer and
-         adapter are cast to ``param_dtype``. The vision encoder stays in
-         its HF dtype (D16) to avoid ViT LayerNorm numerical drift.
+         transformer root, adapter, the frame-time embedding when built
+         (video path), and vision encoder iff not frozen).
+      6. Meta subtrees are materialized (transformer / adapter / frame-time
+         embedding), the vision encoder is moved to ``device``, and the
+         transformer, adapter, and frame-time embedding are cast to
+         ``param_dtype``. The vision encoder stays in its HF dtype (D16) to
+         avoid ViT LayerNorm numerical drift.
       7. Freeze specs are applied via ``apply_freeze_specs`` and a fully
          frozen encoder is switched to ``eval()``.
     """

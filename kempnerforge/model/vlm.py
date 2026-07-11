@@ -131,8 +131,12 @@ def _project_visual_features(
                     f"(batch, frames) = ({b}, {f})"
                 )
             t_emb = wrapper.frame_time_embed(frame_times)  # (B, F, dim)
-            t_emb = t_emb.unsqueeze(2).expand(b, f, pprime, dim).reshape(b, f * pprime, dim)
-            embeds = embeds + t_emb.to(embeds.dtype)
+            # Broadcast the per-frame embedding across each frame's P' tokens by
+            # adding in a (B, F, P', dim) view — avoids materializing the expanded
+            # (B, F*P', dim) copy that `expand().reshape()` would force.
+            embeds = (
+                embeds.reshape(b, f, pprime, dim) + t_emb.unsqueeze(2).to(embeds.dtype)
+            ).reshape(b, f * pprime, dim)
     return embeds
 
 
