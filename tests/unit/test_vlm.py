@@ -25,6 +25,7 @@ from kempnerforge.model.transformer import Transformer
 from kempnerforge.model.vlm import (
     CrossAttentionStrategy,
     JointDecoderStrategy,
+    MoMaStrategy,
     MoTStrategy,
     VLMWrapper,
     _is_encoder_frozen,
@@ -79,6 +80,35 @@ class TestVLMWrapper:
         logits, labels_out = wrapper(pixels, input_ids, None)
         assert logits.shape == (1, 10, 256)
         assert labels_out is None
+
+    def test_text_only_forward_jd(self):
+        """pixel_values=None routes JD to a pure-text forward (no image prefix)."""
+        wrapper = _build_tiny_wrapper(num_image_tokens=8).to(DEVICE)
+        input_ids = torch.randint(0, 256, (2, 12), device=DEVICE)
+        logits, labels_out = wrapper(None, input_ids)
+        assert logits.shape == (2, 12, 256)
+        assert labels_out is None
+        assert torch.isfinite(logits).all()
+
+    def test_text_only_forward_ca(self):
+        wrapper = _build_ca_tiny_wrapper(num_image_tokens=8).to(DEVICE)
+        input_ids = torch.randint(0, 256, (2, 12), device=DEVICE)
+        logits, _ = wrapper(None, input_ids)
+        assert logits.shape == (2, 12, 256)
+        assert torch.isfinite(logits).all()
+
+    def test_text_only_forward_mot(self):
+        wrapper = _build_mot_tiny_wrapper(num_image_tokens=8).to(DEVICE)
+        input_ids = torch.randint(0, 256, (2, 12), device=DEVICE)
+        logits, _ = wrapper(None, input_ids)
+        assert logits.shape == (2, 12, 256)
+        assert torch.isfinite(logits).all()
+
+    def test_text_only_forward_moma_raises(self):
+        wrapper = _build_moma_tiny_wrapper(num_image_tokens=8).to(DEVICE)
+        input_ids = torch.randint(0, 256, (1, 12), device=DEVICE)
+        with pytest.raises(NotImplementedError, match="moma"):
+            wrapper(None, input_ids)
 
     def test_dtype_mismatch_cast(self):
         """Vision encoder output in fp32, transformer in bf16 -> forward
@@ -287,6 +317,15 @@ def _build_mot_tiny_wrapper(num_image_tokens: int = 8, feature_dim: int = 96) ->
     return build_vlm_wrapper(mc, vc, ac, lc)
 
 
+def _build_moma_tiny_wrapper(num_image_tokens: int = 8, feature_dim: int = 96) -> VLMWrapper:
+    mc = ModelConfig(
+        dim=64, n_layers=2, n_heads=4, vocab_size=256, max_seq_len=64, ffn_hidden_dim=128
+    )
+    vc = VisionEncoderConfig(type="random", feature_dim=feature_dim, num_tokens=num_image_tokens)
+    lc = MoMaConfig(max_text_len=32, moma_experts_per_modality={"image": 2, "text": 2})
+    return build_vlm_wrapper(mc, vc, AdapterConfig(), lc)
+
+
 class TestModalityStrategies:
     def test_joint_decoder_strategy_fills_prefix_and_slice(self):
         wrapper = _build_tiny_wrapper(num_image_tokens=8)
@@ -355,6 +394,37 @@ class TestModalityStrategies:
         assert jd_wrapper.num_image_tokens == 12
         # CA: residual stream is text-only, so no extension.
         assert ca_wrapper.num_image_tokens == 0
+
+    def test_joint_decoder_strategy_text_only_returns_empty_context(self):
+        """pixel_values=None (text-only): empty context -> pure-text forward."""
+        wrapper = _build_tiny_wrapper(num_image_tokens=8)
+        input_ids = torch.randint(0, 256, (1, 16))
+        ctx = JointDecoderStrategy().prepare(wrapper, None, input_ids)
+        assert ctx.prefix_embeds is None
+        assert ctx.output_slice is None
+        assert ctx.key_padding_mask is None
+
+    def test_cross_attention_strategy_text_only_returns_empty_context(self):
+        wrapper = _build_ca_tiny_wrapper(num_image_tokens=8)
+        input_ids = torch.randint(0, 256, (1, 16))
+        ctx = CrossAttentionStrategy().prepare(wrapper, None, input_ids)
+        assert ctx.image_features is None
+        assert ctx.image_mask is None
+
+    def test_mot_strategy_text_only_returns_empty_context(self):
+        """Text-only MoT carries no modality_ids: the forward runs n_image=0."""
+        wrapper = _build_mot_tiny_wrapper(num_image_tokens=8)
+        input_ids = torch.randint(0, 256, (1, 16))
+        ctx = MoTStrategy().prepare(wrapper, None, input_ids)
+        assert ctx.prefix_embeds is None
+        assert ctx.modality_ids is None
+
+    def test_moma_strategy_text_only_raises(self):
+        """MoMa is non-generative and excluded from text-only evaluation."""
+        wrapper = _build_moma_tiny_wrapper(num_image_tokens=8)
+        input_ids = torch.randint(0, 256, (1, 16))
+        with pytest.raises(NotImplementedError, match="moma"):
+            MoMaStrategy().prepare(wrapper, None, input_ids)
 
 
 class TestVLMWrapperDispatch:

@@ -450,23 +450,31 @@ class Transformer(nn.Module):
             h = self.norm(h)
         # MoT path: position-based image-then-text split, per-modality
         # streams through the MoTBlock stack, single global SDPA per
-        # layer. modality_ids is required (presence + shape checked
-        # against the residual). v1 uses position-based routing; the
-        # tags are validated for shape but not value-matched against
-        # positions, so a future per-token scatter/gather can land
-        # without changing the public interface.
+        # layer. modality_ids is required when an image prefix is present
+        # (presence + shape checked against the residual); a text-only
+        # forward (no prefix, no ids) runs with n_image=0 (empty image
+        # stream). v1 uses position-based routing; the tags are validated
+        # for shape but not value-matched against positions, so a future
+        # per-token scatter/gather can land without changing the public
+        # interface.
         elif self._mot_modalities:
             if modality_ids is None:
-                raise ValueError(
-                    "MoT model requires modality.modality_ids (got None). Build the "
-                    "ModalityContext via MoTStrategy or set modality_ids explicitly."
-                )
-            if modality_ids.shape != h.shape[:2]:
-                raise ValueError(
-                    f"modality.modality_ids shape {tuple(modality_ids.shape)} does not "
-                    f"match residual shape {tuple(h.shape[:2])}"
-                )
-            n_image = self._mot_n_image
+                if prefix_embeds is not None:
+                    # Image present (prefix) but routing tags missing: a real misuse.
+                    raise ValueError(
+                        "MoT model requires modality.modality_ids (got None). Build the "
+                        "ModalityContext via MoTStrategy or set modality_ids explicitly."
+                    )
+                # Text-only forward (no image prefix): route every position through the
+                # text modality with an empty image stream (n_image=0).
+                n_image = 0
+            else:
+                if modality_ids.shape != h.shape[:2]:
+                    raise ValueError(
+                        f"modality.modality_ids shape {tuple(modality_ids.shape)} does not "
+                        f"match residual shape {tuple(h.shape[:2])}"
+                    )
+                n_image = self._mot_n_image
             t_image = n_image
             t_text = h.shape[1] - n_image
             streams: dict[str, torch.Tensor] = {
@@ -500,13 +508,10 @@ class Transformer(nn.Module):
                 )
                 if ca_iter is not None and (i + 1) % self._ca_cadence == 0:
                     ca = next(ca_iter, None)
-                    if ca is not None:
-                        if image_features is None:
-                            raise ValueError(
-                                "Cross-Attention block fired but modality.image_features is None. "
-                                "Cross-Attention models require image_features in the "
-                                "ModalityContext."
-                            )
+                    # image_features is None on a text-only request: skip the
+                    # cross-attention block, leaving the pure text backbone. Existing
+                    # image forwards always pass image_features, so they are unchanged.
+                    if ca is not None and image_features is not None:
                         if image_features.dtype != h.dtype:
                             image_features = image_features.to(h.dtype)
                         h = ca(h, image_features, image_mask)

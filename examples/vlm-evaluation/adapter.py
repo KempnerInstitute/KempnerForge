@@ -42,17 +42,20 @@ v1 scope and deliberate choices (see README.md in this directory):
   autoregressively generate, and chat tasks are generation-only. A MoMa
   checkpoint fails fast in ``__init__``.
 
-- **Image and video.** An image checkpoint evaluates exactly one image per
-  request; a video checkpoint (a ``[video]`` config) evaluates one video per
-  request — decoded to a fixed ``frames_per_clip`` clip via the training
-  frame-sampling policy — or one or more images packed as an ordered clip (a
-  single image is the 1-frame case; multiple images fill successive frame slots,
-  zero-padded and truncated to ``frames_per_clip``). Audio, multiple videos,
-  mixed image+video, multi-image on an image checkpoint, and multi-turn/few-shot
-  requests raise ``NotImplementedError``; ``loglikelihood`` and
-  ``generate_until_multi_round`` are not implemented (chat tasks are
-  generation-only). Visual input is modeled as an ordered list of frames (a
-  single image is the length-1 case).
+- **Text, image, and video.** An image checkpoint evaluates a text-only request
+  (no visual) or exactly one image per request; a video checkpoint (a
+  ``[video]`` config) evaluates a text-only request, one video per request —
+  decoded to a fixed ``frames_per_clip`` clip via the training frame-sampling
+  policy — or one or more images packed as an ordered clip (a single image is
+  the 1-frame case; multiple images fill successive frame slots, zero-padded and
+  truncated to ``frames_per_clip``). A text-only request runs the generative
+  arch's pure-text forward (no visual encoder), measuring text-backbone
+  behavior. Audio, multiple videos, mixed image+video, multi-image on an image
+  checkpoint, and multi-turn/few-shot requests raise ``NotImplementedError``;
+  ``loglikelihood`` and ``generate_until_multi_round`` are not implemented (chat
+  tasks are generation-only). Visual input is modeled as an ordered list of
+  frames (a single image is the length-1 case; a text-only request is the empty
+  list).
 """
 
 from __future__ import annotations
@@ -210,16 +213,18 @@ def _render_request(
 ) -> tuple[list[Any], str]:
     """Flatten one chat request into ``(frames, prompt_text)``.
 
-    ``frames`` is an ordered list of visual frames; a single image is the
-    length-1 case and a decoded video is the multi-frame case. ``video_config``
-    is the checkpoint's ``[video]`` config (``None`` for an image checkpoint)
-    and selects the mode:
+    ``frames`` is an ordered list of visual frames; an empty list is a text-only
+    request, a single image is the length-1 case, and a decoded video is the
+    multi-frame case. ``video_config`` is the checkpoint's ``[video]`` config
+    (``None`` for an image checkpoint) and selects the mode:
 
-    - **Image checkpoint** (``video_config is None``): exactly one image per
-      request; video content raises (an image model cannot evaluate video).
-    - **Video checkpoint**: one video — decoded to frames via
-      ``video_io.decode_video_frames`` using the checkpoint's frame-sampling
-      policy — or, when no video is present, one or more images treated as an
+    - **Image checkpoint** (``video_config is None``): a text-only request (no
+      image, empty frames) or exactly one image; multiple images and video raise
+      (an image model cannot evaluate video, and multi-image needs a video
+      checkpoint).
+    - **Video checkpoint**: a text-only request (empty frames), one video —
+      decoded to frames via ``video_io.decode_video_frames`` using the
+      checkpoint's frame-sampling policy — or one or more images treated as an
       ordered clip of frames (zero-padded to ``frames_per_clip`` downstream;
       frames beyond ``frames_per_clip`` are truncated with a warning). A single
       image is the length-1 clip.
@@ -253,18 +258,19 @@ def _render_request(
     )
 
     if video_config is None:
-        # Image checkpoint: image-only, exactly one image per request.
+        # Image checkpoint: a text-only request (no image) or exactly one image.
         if videos:
             raise NotImplementedError(
                 "This is an image checkpoint (no [video] config) and cannot evaluate video. "
                 "Use a video checkpoint, or report the task to the project owner."
             )
-        if len(images) != 1:
+        if len(images) > 1:
             raise NotImplementedError(
-                f"This adapter supports exactly one image per request, got {len(images)}. "
-                "Multi-image and text-only requests are out of scope; report the task to "
-                "the project owner."
+                f"This image checkpoint supports at most one image per request, got "
+                f"{len(images)}. Multi-image is only supported on a video checkpoint; report "
+                "the task to the project owner."
             )
+        # len(images) == 0 is a text-only request (empty frames); 1 is a single image.
         return images, prompt
 
     # Video checkpoint: a video (decoded to frames), or one or more images packed
@@ -300,11 +306,8 @@ def _render_request(
             )
         return frames, prompt
     if not images:
-        raise NotImplementedError(
-            "A video-checkpoint request must carry a video or at least one image, got no "
-            "visual content. Text-only requests are out of scope; report the task to the "
-            "project owner."
-        )
+        # Text-only request on a video checkpoint (no video, no image): empty frames.
+        return [], prompt
     # One or more images on a video checkpoint: treat them as an ordered clip of frames
     # (zero-padded to frames_per_clip downstream, extra frames truncated), mirroring how
     # training packs short clips. A single image is the length-1 case. lmms-eval delivers
@@ -417,7 +420,7 @@ def _first_stop(text: str, until: list[str]) -> int | None:
 def _generate_batch(
     model: VLMWrapper,
     tokenizer: Any,
-    pixel_values: torch.Tensor,
+    pixel_values: torch.Tensor | None,
     prompt_ids: list[torch.Tensor],
     resolved: dict[str, Any],
     max_seq_len: int,
@@ -428,7 +431,9 @@ def _generate_batch(
     Decodes ``B`` requests together (``pixel_values`` is ``(B, 3, H, W)`` or a
     ``(B, F, 3, H, W)`` video clip, ``prompt_ids`` a list of ``B`` 1-D token
     tensors; ``frame_mask`` is ``(B, F)`` bool for video, masking padded-frame
-    visual tokens from attention as in training). There is no transformer KV
+    visual tokens from attention as in training). ``pixel_values is None`` is a
+    text-only batch: the vision tower is skipped, ``num_image_tokens`` is 0, and
+    ``model(None, ...)`` runs the pure-text forward. There is no transformer KV
     cache and no vision cache: ``model(...)`` re-runs over the growing
     **right-padded** batch each step, re-encoding the vision tower each time.
     Right-padding matches the training
@@ -447,13 +452,15 @@ def _generate_batch(
     top_p: float = resolved["top_p"]
     eos_id = tokenizer.eos_token_id
     pad_id = resolve_pad_id(tokenizer)
-    device = pixel_values.device
+    # Derive device from the prompts (present for every request), not pixel_values,
+    # which is None on a text-only batch.
+    device = prompt_ids[0].device
     batch_size = len(prompt_ids)
 
-    # Length bound: image tokens (in-residual for JD/MoT; 0 for CA) + prompt +
-    # generated must fit the context. Reserve room for generation and left-
-    # truncate any over-budget prompt (per row).
-    num_image_tokens = model.num_image_tokens
+    # Length bound: image tokens (in-residual for JD/MoT; 0 for CA, and 0 for a
+    # text-only batch with no visual) + prompt + generated must fit the context.
+    # Reserve room for generation and left-truncate any over-budget prompt (per row).
+    num_image_tokens = 0 if pixel_values is None else model.num_image_tokens
     prompt_budget = max_seq_len - num_image_tokens - max_new_tokens
     if prompt_budget <= 0:
         raise _ContextBudgetError(
@@ -595,6 +602,35 @@ class KempnerForgeVLM(lmms):
             f"dtype={self._dtype}, max_seq_len={self._max_seq_len}"
         )
 
+    def _decode_subbatch(
+        self,
+        pixel_values: torch.Tensor | None,
+        prompts: list[torch.Tensor],
+        resolved: dict[str, Any],
+        frame_mask: torch.Tensor | None,
+        task_name: str,
+    ) -> list[str]:
+        """Decode one homogeneous sub-batch (all-visual, or all-text-only with
+        ``pixel_values=None``), returning one continuation per prompt.
+
+        A ``_ContextBudgetError`` (the task's gen_kwargs over-budget the context;
+        every request here shares gen_kwargs) is isolated to this sub-batch as empty
+        strings rather than aborting the whole run.
+        """
+        try:
+            return _generate_batch(
+                self._model,
+                self._tokenizer,
+                pixel_values,
+                prompts,
+                resolved,
+                self._max_seq_len,
+                frame_mask=frame_mask,
+            )
+        except _ContextBudgetError as exc:
+            logger.warning(f"Skipping {len(prompts)} request(s) for task {task_name}: {exc}")
+            return [""] * len(prompts)
+
     def generate_until(self, requests: list[Instance]) -> list[str]:
         # Group requests by gen_kwargs (a batch must share decode params) and,
         # within a group, sort by context length so similar-length prompts batch
@@ -617,9 +653,15 @@ class KempnerForgeVLM(lmms):
             # below; ``""`` = a request that failed to render/preprocess, isolated
             # with a warning so one bad doc does not abort the whole run.
             chunk_outputs: list[str | None] = [None] * len(chunk)
-            frames_batch: list[torch.Tensor] = []
-            masks_batch: list[torch.Tensor] = []
-            prompt_ids: list[torch.Tensor] = []
+            # A chunk shares gen_kwargs but may now mix visual and text-only requests,
+            # which cannot share one pixel_values tensor — decode them as two
+            # sub-batches, each tagged by its original slot for order-preserving scatter.
+            vis_frames: list[torch.Tensor] = []
+            vis_masks: list[torch.Tensor] = []
+            vis_prompts: list[torch.Tensor] = []
+            vis_slots: list[int] = []
+            txt_prompts: list[torch.Tensor] = []
+            txt_slots: list[int] = []
             for slot, args in enumerate(chunk):
                 try:
                     # Chat 6-tuple: (context, doc_to_messages, gen_kwargs, doc_id, task, split).
@@ -628,7 +670,7 @@ class KempnerForgeVLM(lmms):
                     frames, prompt = _render_request(messages, self._config.video)
                     # lmms-eval may deliver image content as a path/URL string;
                     # normalize to PIL so both the image and video packers (strict
-                    # pil_to_tensor) accept it.
+                    # pil_to_tensor) accept it. Empty frames => text-only request.
                     frames = [_to_pil(f) for f in frames]
                     # Mirror training tokenization: no chat template, no <image>
                     # placeholder, add_special_tokens=False (images go via pixel_values).
@@ -638,7 +680,12 @@ class KempnerForgeVLM(lmms):
                         # with -100 labels (and trimmed by output_slice), so there is
                         # no valid position to predict an image-only first token.
                         raise ValueError("empty prompt after flattening (no text content)")
-                    if self._is_video:
+                    pixels: torch.Tensor | None
+                    if not frames:
+                        # Text-only request: no visual to pack.
+                        pixels = None
+                        mask = None
+                    elif self._is_video:
                         # Fixed (frames_per_clip, 3, H, W) clip + per-frame validity
                         # mask, zero-padded — identical to training. The mask hides
                         # padded-frame visual tokens from attention.
@@ -662,49 +709,44 @@ class KempnerForgeVLM(lmms):
                     )
                     chunk_outputs[slot] = ""
                     continue
-                # Commit atomically: only reached when every step above succeeded, so a
-                # mid-request failure never leaves a partial entry in these lists.
-                frames_batch.append(pixels)
-                if mask is not None:
-                    masks_batch.append(mask)
-                prompt_ids.append(prompt_tensor)
-
-            if prompt_ids:
-                # Video: (B, F, 3, H, W) via stack (each request is one F-frame clip),
-                # with a (B, F) frame mask. Image: (B, 3, H, W) via cat. cat on video
-                # would fold frames into the batch and trip the frames-per-clip check.
-                if self._is_video:
-                    pixel_values = torch.stack(frames_batch, dim=0)
-                    frame_mask = torch.stack(masks_batch, dim=0)
+                # Commit atomically (only reached on full success), routed by modality:
+                # a text-only request (pixels is None) goes to the text-only sub-batch.
+                if pixels is None:
+                    txt_prompts.append(prompt_tensor)
+                    txt_slots.append(slot)
                 else:
-                    pixel_values = torch.cat(frames_batch, dim=0)
+                    vis_frames.append(pixels)
+                    if mask is not None:
+                        vis_masks.append(mask)
+                    vis_prompts.append(prompt_tensor)
+                    vis_slots.append(slot)
+
+            # Visual sub-batch: Video stacks (B, F, 3, H, W) clips with a (B, F) frame
+            # mask; Image cats to (B, 3, H, W). cat on video would fold frames into the
+            # batch and trip the frames-per-clip check. Text-only sub-batch: no pixels.
+            if vis_prompts:
+                if self._is_video:
+                    pixel_values = torch.stack(vis_frames, dim=0)
+                    frame_mask = torch.stack(vis_masks, dim=0)
+                else:
+                    pixel_values = torch.cat(vis_frames, dim=0)
                     frame_mask = None
-                try:
-                    gen_outputs = _generate_batch(
-                        self._model,
-                        self._tokenizer,
-                        pixel_values,
-                        prompt_ids,
-                        resolved,
-                        self._max_seq_len,
-                        frame_mask=frame_mask,
-                    )
-                except _ContextBudgetError as exc:
-                    # One task's gen_kwargs over-budgets the context; skip its requests
-                    # (they all share gen_kwargs) rather than aborting the whole run.
-                    logger.warning(
-                        f"Skipping {len(prompt_ids)} request(s) for task {chunk[0][4]}: {exc}"
-                    )
-                    gen_outputs = [""] * len(prompt_ids)
-            else:
-                gen_outputs = []
-            # Scatter generated continuations back into the surviving (None) slots,
-            # preserving alignment with ``chunk`` (skipped slots keep their "").
-            gen_iter = iter(gen_outputs)
-            outputs = [o if o is not None else next(gen_iter) for o in chunk_outputs]
-            for args, output in zip(chunk, outputs, strict=True):
-                results.append(output)
-                self.cache_hook.add_partial("generate_until", (args[0], args[2]), output)
+                vis_outputs = self._decode_subbatch(
+                    pixel_values, vis_prompts, resolved, frame_mask, chunk[0][4]
+                )
+                for s, o in zip(vis_slots, vis_outputs, strict=True):
+                    chunk_outputs[s] = o
+            if txt_prompts:
+                txt_outputs = self._decode_subbatch(None, txt_prompts, resolved, None, chunk[0][4])
+                for s, o in zip(txt_slots, txt_outputs, strict=True):
+                    chunk_outputs[s] = o
+
+            # Every surviving slot is now filled (a continuation, or "" for a skipped
+            # or over-budget request), preserving alignment with ``chunk``.
+            for args, output in zip(chunk, chunk_outputs, strict=True):
+                out = output if output is not None else ""
+                results.append(out)
+                self.cache_hook.add_partial("generate_until", (args[0], args[2]), out)
             pbar.update(len(chunk))
         pbar.close()
         return re_ords.get_original(results)

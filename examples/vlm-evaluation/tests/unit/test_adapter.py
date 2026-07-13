@@ -165,10 +165,11 @@ class TestRenderRequest:
         with pytest.raises(NotImplementedError, match="one image"):
             _render_request(messages, None)
 
-    def test_no_image_raises(self):
-        messages = _chat([_text("text only question")])
-        with pytest.raises(NotImplementedError, match="one image"):
-            _render_request(messages, None)
+    def test_no_image_is_text_only(self):
+        """A text-only request on an image checkpoint renders as empty frames."""
+        images, prompt = _render_request(_chat([_text("text only question")]), None)
+        assert images == []
+        assert prompt == "text only question"
 
     def test_multi_turn_assistant_raises(self):
         messages = ChatMessages(
@@ -229,6 +230,12 @@ class TestRenderRequestVideo:
         frames, prompt = _render_request(_chat([_text("q"), _image(_img())]), vcfg)
         assert len(frames) == 1
         assert prompt == "q"
+
+    def test_no_visual_is_text_only(self, vcfg):
+        """A text-only request on a video checkpoint renders as empty frames."""
+        frames, prompt = _render_request(_chat([_text("text only")]), vcfg)
+        assert frames == []
+        assert prompt == "text only"
 
     def test_audio_still_raises(self, vcfg):
         msg = _chat([_text("x"), {"type": "audio", "url": "a.wav"}])
@@ -493,6 +500,14 @@ class TestGenerateBatchSingle:
         assert len(out) == 1 and len(out[0].split()) == 2
         assert any("left-truncating" in m for m in rec.warnings)
 
+    def test_text_only_decode_no_pixels(self, arch_wrapper):
+        """pixel_values=None runs the pure-text forward for every generative arch
+        (JD/CA/MoT) end to end and returns a continuation of max_new_tokens."""
+        r = _resolve_gen_kwargs({"max_new_tokens": 6}, 128)
+        out = _generate_batch(arch_wrapper, _MockTokenizer(), None, self._prompt(), r, 64)
+        assert len(out) == 1 and isinstance(out[0], str)
+        assert len(out[0].split()) == 6
+
 
 @pytest.mark.parametrize("arch", GENERATIVE_ARCHES)
 class TestGenerateBatchMulti:
@@ -593,6 +608,30 @@ def test_generate_batch_no_frame_mask_for_image():
     r = _resolve_gen_kwargs({"max_new_tokens": 2}, 128)
     _generate_batch(model, _MockTokenizer(), pixel_values, prompt_ids, r, 64)
     assert model.seen_frame_masks and all(fm is None for fm in model.seen_frame_masks)
+
+
+def test_generate_batch_text_only_runs_with_none():
+    """pixel_values=None decodes a text-only batch (device from prompts, no vision,
+    frame_mask=None each step)."""
+    model = _CaptureModel(num_image_tokens=8)
+    prompt_ids = [torch.tensor([5, 9, 12], dtype=torch.long)]
+    r = _resolve_gen_kwargs({"max_new_tokens": 3}, 128)
+    out = _generate_batch(model, _MockTokenizer(), None, prompt_ids, r, 64)
+    assert len(out) == 1
+    assert model.seen_frame_masks and all(fm is None for fm in model.seen_frame_masks)
+
+
+def test_generate_batch_text_only_budget_excludes_image_tokens():
+    """A text-only batch reserves no image-token budget: a max_new_tokens that would
+    over-budget a visual batch (num_image_tokens=16) still fits when pixel_values is None."""
+    model = _CaptureModel(num_image_tokens=16)
+    prompt_ids = [torch.tensor([5, 9], dtype=torch.long)]
+    r = _resolve_gen_kwargs({"max_new_tokens": 50}, 128)
+    # Visual budget: 64 - 16 - 50 <= 0 -> raises. Text-only: 64 - 0 - 50 = 14 -> fits.
+    with pytest.raises(_ContextBudgetError):
+        _generate_batch(model, _MockTokenizer(), torch.randn(1, 3, 16, 16), prompt_ids, r, 64)
+    out = _generate_batch(model, _MockTokenizer(), None, prompt_ids, r, 64)
+    assert len(out) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -882,6 +921,45 @@ class TestGenerateUntil:
         assert batched == singles  # batching + reorder + get_original preserve per-request results
         assert all(isinstance(o, str) for o in batched)
         assert all(len(o.split()) == 3 for o in batched)  # greedy emits exactly max_new_tokens
+
+    @pytest.mark.parametrize("arch", GENERATIVE_ARCHES)
+    def test_mixed_text_only_and_image_batch(self, monkeypatch, tiny_vlm_configs, arch):
+        """A chunk mixing a text-only and an image request (same gen_kwargs) decodes
+        them as separate sub-batches and scatters results back in original order."""
+        _patch_loaders(
+            monkeypatch, _vlm_job_config(tiny_vlm_configs, arch=arch), _vlm_wrapper(arch)
+        )
+        vlm = KempnerForgeVLM(
+            config="x", checkpoint="y", device="cpu", dtype="float32", batch_size=2
+        )
+        img = _img()
+
+        def doc_to_messages(doc):
+            content = [_text(doc["q"])]
+            if doc.get("img"):
+                content.append(_image(img))
+            return [{"role": "user", "content": content}]
+
+        vlm.task_dict = {
+            "t": {"test": {"d0": {"q": "text only?"}, "d1": {"q": "and this", "img": True}}}
+        }
+        specs = [("d0", "c"), ("d1", "cc")]
+        instances = [
+            Instance(
+                request_type="generate_until",
+                arguments=(ctx, doc_to_messages, {"max_new_tokens": 3}, doc_id, "t", "test"),
+                idx=i,
+                metadata={"task": "t", "doc_id": doc_id, "repeats": 1},
+            )
+            for i, (doc_id, ctx) in enumerate(specs)
+        ]
+
+        # d0 (text-only) and d1 (image) land in one chunk (shared gen_kwargs); each is
+        # decoded in its own sub-batch, so the mixed batch matches per-request singles.
+        singles = [vlm.generate_until([inst])[0] for inst in instances]
+        batched = vlm.generate_until(instances)
+        assert batched == singles
+        assert all(isinstance(o, str) and len(o.split()) == 3 for o in batched)
 
 
 class TestGenerateUntilVideo:

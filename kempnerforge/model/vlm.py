@@ -66,10 +66,18 @@ class ModalityStrategy(Protocol):
     def prepare(
         self,
         wrapper: VLMWrapper,
-        pixel_values: torch.Tensor,
+        pixel_values: torch.Tensor | None,
         input_ids: torch.Tensor,
         frame_mask: torch.Tensor | None = None,
-    ) -> ModalityContext: ...
+    ) -> ModalityContext:
+        """Compose a ``ModalityContext`` from raw VLM inputs.
+
+        ``pixel_values is None`` is a text-only request (no visual content):
+        the generative arches return a context that drives the pure-text
+        forward — an empty ``ModalityContext()`` for the image-prefix and
+        cross-attention arches — while a non-generative arch may reject it.
+        """
+        ...
 
     def num_image_tokens(self, wrapper: VLMWrapper) -> int: ...
 
@@ -179,10 +187,15 @@ class JointDecoderStrategy:
     def prepare(
         self,
         wrapper: VLMWrapper,
-        pixel_values: torch.Tensor,
+        pixel_values: torch.Tensor | None,
         input_ids: torch.Tensor,  # noqa: ARG002
         frame_mask: torch.Tensor | None = None,
     ) -> ModalityContext:
+        if pixel_values is None:
+            # Text-only request: no image prefix, so the residual carries text
+            # alone and the LM head runs over every position (empty context ->
+            # Transformer.forward's pure-text path).
+            return ModalityContext()
         img_embeds = _project_visual_features(wrapper, pixel_values)
         n = img_embeds.shape[1]  # pooling-aware: the adapter's actual visual-token count
         return ModalityContext(
@@ -213,10 +226,15 @@ class CrossAttentionStrategy:
     def prepare(
         self,
         wrapper: VLMWrapper,
-        pixel_values: torch.Tensor,
+        pixel_values: torch.Tensor | None,
         input_ids: torch.Tensor,  # noqa: ARG002
         frame_mask: torch.Tensor | None = None,
     ) -> ModalityContext:
+        if pixel_values is None:
+            # Text-only request: no image K/V. The cross-attention blocks are
+            # skipped in Transformer.forward when image_features is None, leaving
+            # the pure text backbone.
+            return ModalityContext()
         img_embeds = _project_visual_features(wrapper, pixel_values)
         return ModalityContext(
             image_features=img_embeds,
@@ -251,10 +269,16 @@ class MoTStrategy:
     def prepare(
         self,
         wrapper: VLMWrapper,
-        pixel_values: torch.Tensor,
+        pixel_values: torch.Tensor | None,
         input_ids: torch.Tensor,
         frame_mask: torch.Tensor | None = None,
     ) -> ModalityContext:
+        if pixel_values is None:
+            # Text-only request: no image prefix. The MoT forward runs with
+            # n_image=0 (an empty image stream), routing every position through
+            # the text-modality projections/FFN; no modality_ids are needed (see
+            # Transformer.forward's MoT branch).
+            return ModalityContext()
         img_embeds = _project_visual_features(wrapper, pixel_values)
         n = img_embeds.shape[1]  # pooling-aware: the adapter's actual visual-token count
         b, t_text = input_ids.shape
@@ -297,10 +321,18 @@ class MoMaStrategy:
     def prepare(
         self,
         wrapper: VLMWrapper,
-        pixel_values: torch.Tensor,
+        pixel_values: torch.Tensor | None,
         input_ids: torch.Tensor,
         frame_mask: torch.Tensor | None = None,
     ) -> ModalityContext:
+        if pixel_values is None:
+            # MoMa's expert-choice routing is non-causal (is_generative=False), so it
+            # is excluded from generative/text-only evaluation; fail fast rather than
+            # emit an unusable context.
+            raise NotImplementedError(
+                "Text-only forward is not supported for the 'moma' arch "
+                "(non-causal expert-choice routing; excluded from generative evaluation)."
+            )
         img_embeds = _project_visual_features(wrapper, pixel_values)
         n = img_embeds.shape[1]  # pooling-aware: the adapter's actual visual-token count
         b, t_text = input_ids.shape
@@ -335,8 +367,9 @@ class VLMWrapper(nn.Module):
     Forward: ``(pixel_values, input_ids, labels) -> (logits, labels)``.
     The strategy composes a ``ModalityContext`` from the raw inputs
     and the wrapper's submodules; ``Transformer.forward`` consumes the
-    context. ``num_image_tokens`` is arch-aware and delegates to the
-    strategy.
+    context. ``pixel_values`` may be ``None`` for a text-only (no visual)
+    request — the generative arches route it to the pure-text forward.
+    ``num_image_tokens`` is arch-aware and delegates to the strategy.
     """
 
     def __init__(
@@ -370,7 +403,7 @@ class VLMWrapper(nn.Module):
 
     def forward(
         self,
-        pixel_values: torch.Tensor,
+        pixel_values: torch.Tensor | None,
         input_ids: torch.Tensor,
         labels: torch.Tensor | None = None,
         frame_mask: torch.Tensor | None = None,

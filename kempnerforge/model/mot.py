@@ -151,9 +151,12 @@ class MoTAttention(nn.Module):
             t_m = x_m.shape[1]
             lengths[m] = t_m
 
-            q_m = self.q_proj[m](x_m).view(batch, t_m, -1, self.head_dim)
-            k_m = self.k_proj[m](x_m).view(batch, t_m, -1, self.head_dim)
-            v_m = self.v_proj[m](x_m).view(batch, t_m, -1, self.head_dim)
+            # Explicit head counts (not -1) so a zero-length modality stream
+            # (t_m == 0, e.g. a text-only forward's empty image stream) reshapes
+            # unambiguously; identical to -1 inference whenever t_m > 0.
+            q_m = self.q_proj[m](x_m).view(batch, t_m, self.n_heads, self.head_dim)
+            k_m = self.k_proj[m](x_m).view(batch, t_m, self.n_kv_heads, self.head_dim)
+            v_m = self.v_proj[m](x_m).view(batch, t_m, self.n_kv_heads, self.head_dim)
 
             if self.q_norm is not None:
                 q_m = self.q_norm[m](q_m)
@@ -201,7 +204,9 @@ class MoTAttention(nn.Module):
         offset = 0
         for m in self.modalities:
             t_m = lengths[m]
-            o_m = out[:, offset : offset + t_m, :, :].reshape(batch, t_m, -1)
+            o_m = out[:, offset : offset + t_m, :, :].reshape(
+                batch, t_m, self.n_heads * self.head_dim
+            )
             out_streams[m] = self.o_proj[m](o_m)
             offset += t_m
         return out_streams

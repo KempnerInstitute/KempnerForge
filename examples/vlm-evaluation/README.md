@@ -126,6 +126,31 @@ uv run python examples/vlm-evaluation/vlm_eval_harness.py \
   few-shot raise a clear error; MoMa still fails fast. An **image** checkpoint
   cannot evaluate video and raises a clear error if handed a video task.
 
+## Text-only evaluation
+
+Text-only `generate_until` benchmarks (e.g. GSM8K, IFEval) run on **both image and
+video checkpoints**, for the generative arches (`joint_decoder` / `cross_attention` /
+`mot`). A request with no image or video renders as an empty-frame prompt and runs
+the arch's **pure-text forward** — no vision encoder, no image prefix (JD/MoT), and
+cross-attention blocks skipped (CA) — so the number reflects the text backbone. This
+is how you measure how much VLM training drifted the base LM, in the same harness as
+the multimodal tasks.
+
+```bash
+uv run python examples/vlm-evaluation/vlm_eval_harness.py \
+    --config     configs/train/vlm_jd.toml \
+    --checkpoint checkpoints/vlm/step_10000 \
+    --tasks      gsm8k \
+    --limit      8
+```
+
+- **Scope.** `generate_until` tasks only (generation / answer-extraction).
+  `loglikelihood`-scored multiple-choice suites (ARC, HellaSwag, MMLU-style) are not
+  supported — the adapter is generation-only. MoMa is excluded (non-generative).
+  Text-only, image, and video requests may be freely mixed across a task suite; each
+  request is decoded by its own modality path (text-only and visual requests within a
+  batch are decoded as separate sub-batches).
+
 ## Limitations
 
 Several are tracked follow-ups.
