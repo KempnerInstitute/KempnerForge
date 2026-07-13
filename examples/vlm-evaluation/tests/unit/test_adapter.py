@@ -235,9 +235,23 @@ class TestRenderRequestVideo:
         with pytest.raises(NotImplementedError, match="[Aa]udio"):
             _render_request(msg, vcfg)
 
-    def test_multi_image_raises(self, vcfg):
-        with pytest.raises(NotImplementedError, match="exactly one"):
-            _render_request(_chat([_image(_img()), _image(_img())]), vcfg)
+    def test_multi_image_returns_frames(self, vcfg):
+        # A multi-image request on a video checkpoint is packed as an ordered clip:
+        # the N images become N frames (a single image is the length-1 case).
+        frames, prompt = _render_request(
+            _chat([_text("compare"), _image(_img()), _image(_img())]), vcfg
+        )
+        assert len(frames) == 2
+        assert prompt == "compare"
+
+    def test_multi_image_over_max_frames_warns(self, monkeypatch, vcfg):
+        # More images than the clip length (max_frames=4): all are returned here and
+        # truncated downstream by frames_to_clip_tensor, so render warns the drop is visible.
+        rec = _RecordingLogger()
+        monkeypatch.setattr("adapter.logger", rec)
+        frames, _ = _render_request(_chat([_image(_img()) for _ in range(5)]), vcfg)
+        assert len(frames) == 5
+        assert any("truncated" in m for m in rec.warnings)
 
     def test_multi_turn_raises(self, vcfg):
         msg = ChatMessages(

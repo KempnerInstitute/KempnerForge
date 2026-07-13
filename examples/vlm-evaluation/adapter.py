@@ -45,8 +45,10 @@ v1 scope and deliberate choices (see README.md in this directory):
 - **Image and video.** An image checkpoint evaluates exactly one image per
   request; a video checkpoint (a ``[video]`` config) evaluates one video per
   request — decoded to a fixed ``frames_per_clip`` clip via the training
-  frame-sampling policy — and also accepts a single image (a 1-frame clip).
-  Audio, multi-image, multiple videos, mixed image+video, and multi-turn/few-shot
+  frame-sampling policy — or one or more images packed as an ordered clip (a
+  single image is the 1-frame case; multiple images fill successive frame slots,
+  zero-padded and truncated to ``frames_per_clip``). Audio, multiple videos,
+  mixed image+video, multi-image on an image checkpoint, and multi-turn/few-shot
   requests raise ``NotImplementedError``; ``loglikelihood`` and
   ``generate_until_multi_round`` are not implemented (chat tasks are
   generation-only). Visual input is modeled as an ordered list of frames (a
@@ -215,16 +217,19 @@ def _render_request(
 
     - **Image checkpoint** (``video_config is None``): exactly one image per
       request; video content raises (an image model cannot evaluate video).
-    - **Video checkpoint**: exactly one video — decoded to frames via
+    - **Video checkpoint**: one video — decoded to frames via
       ``video_io.decode_video_frames`` using the checkpoint's frame-sampling
-      policy — or, when no video is present, a single image treated as a
-      1-frame clip (zero-padded to ``frames_per_clip`` downstream).
+      policy — or, when no video is present, one or more images treated as an
+      ordered clip of frames (zero-padded to ``frames_per_clip`` downstream;
+      frames beyond ``frames_per_clip`` are truncated with a warning). A single
+      image is the length-1 clip.
 
-    Out-of-scope content (audio, multi-turn/few-shot, multi-image, multiple
-    videos, mixed image+video) raises ``NotImplementedError`` so the offending
-    task is surfaced rather than silently mishandled. Text content blocks are
-    concatenated in message order (newline-joined); role/turn structure is
-    intentionally discarded (see the module docstring on flattening).
+    Out-of-scope content (audio, multi-turn/few-shot, multiple videos, mixed
+    image+video, and — on an image checkpoint — multiple images) raises
+    ``NotImplementedError`` so the offending task is surfaced rather than
+    silently mishandled. Text content blocks are concatenated in message order
+    (newline-joined); role/turn structure is intentionally discarded (see the
+    module docstring on flattening).
     """
     images, videos, audios = messages.extract_media()
     if audios:
@@ -262,8 +267,8 @@ def _render_request(
             )
         return images, prompt
 
-    # Video checkpoint: exactly one visual — a video (decoded to frames) or a
-    # single image (treated as a 1-frame clip, zero-padded downstream).
+    # Video checkpoint: a video (decoded to frames), or one or more images packed
+    # as an ordered clip (a single image is the 1-frame case).
     if len(videos) > 1:
         raise NotImplementedError(
             f"Multiple videos per request are not supported, got {len(videos)}. "
@@ -294,15 +299,24 @@ def _render_request(
                 f"No frames decoded from {path}; evaluating a zero clip (result unreliable)."
             )
         return frames, prompt
-    if len(images) == 1:
-        # A single image on a video checkpoint: a 1-frame clip (zero-padded to
-        # frames_per_clip downstream), consistent with how training pads short clips.
-        return images, prompt
-    raise NotImplementedError(
-        f"A video-checkpoint request must carry exactly one video or one image, got "
-        f"{len(images)} images and no video. Multi-image and text-only requests are out "
-        "of scope; report the task to the project owner."
-    )
+    if not images:
+        raise NotImplementedError(
+            "A video-checkpoint request must carry a video or at least one image, got no "
+            "visual content. Text-only requests are out of scope; report the task to the "
+            "project owner."
+        )
+    # One or more images on a video checkpoint: treat them as an ordered clip of frames
+    # (zero-padded to frames_per_clip downstream, extra frames truncated), mirroring how
+    # training packs short clips. A single image is the length-1 case. lmms-eval delivers
+    # a multi-image request as several image content blocks (e.g. MMMU); extract_media
+    # gives them to us in document order, which we keep as frame order.
+    if len(images) > video_config.max_frames:
+        logger.warning(
+            f"Request carries {len(images)} images but the checkpoint's clip length is "
+            f"frames_per_clip={video_config.max_frames}; the extra frames will be truncated "
+            "(result may be unreliable)."
+        )
+    return images, prompt
 
 
 def _to_pil(frame: Any) -> Any:
