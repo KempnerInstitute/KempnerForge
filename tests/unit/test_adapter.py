@@ -19,6 +19,7 @@ from kempnerforge.model.adapter import (
     build_adapter,
     pooled_token_count,
 )
+from kempnerforge.model.norm import RMSNorm
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -533,3 +534,82 @@ class TestBuildAdapterPooling:
         adapter = build_adapter(cfg, in_dim=32, out_dim=16)
         assert isinstance(adapter, AttentionalPoolAdapter)
         assert adapter.pool_heads == 8
+
+
+# ---------------------------------------------------------------------------
+# MLP2LayerAdapter optional pre-norm (the folded-in Qwen2.5-VL merger head)
+# ---------------------------------------------------------------------------
+
+
+class TestMLP2LayerPreNorm:
+    """``mlp_2layer`` with an optional pre-projection norm (``ln_q``).
+
+    A pre-norm over the vision features before the 2-layer MLP, selected by
+    norm-registry key. ``pre_norm=None`` keeps the plain MLP (default).
+    """
+
+    def test_no_pre_norm_has_no_ln_q(self):
+        adapter = MLP2LayerAdapter(in_dim=1152, out_dim=1024)
+        assert adapter.ln_q is None
+        assert adapter(torch.randn(2, 8, 1152)).shape == (2, 8, 1024)
+
+    def test_pre_norm_adds_rmsnorm_ln_q(self):
+        adapter = MLP2LayerAdapter(in_dim=1152, out_dim=1024, pre_norm="rmsnorm")
+        assert isinstance(adapter.ln_q, RMSNorm)
+        assert adapter.ln_q.weight.shape == (1152,)
+
+    def test_pre_norm_layernorm(self):
+        adapter = MLP2LayerAdapter(in_dim=32, out_dim=16, pre_norm="layernorm")
+        assert isinstance(adapter.ln_q, torch.nn.LayerNorm)
+        assert adapter(torch.randn(1, 4, 32)).shape == (1, 4, 16)
+
+    def test_forward_shape_preserves_tokens(self):
+        adapter = MLP2LayerAdapter(in_dim=1152, out_dim=1024, hidden_dim=1152, pre_norm="rmsnorm")
+        assert adapter(torch.randn(2, 256, 1152)).shape == (2, 256, 1024)
+
+    def test_backward_grads_flow(self):
+        adapter = MLP2LayerAdapter(in_dim=32, out_dim=16, pre_norm="rmsnorm")
+        x = torch.randn(1, 4, 32, requires_grad=True)
+        adapter(x).sum().backward()
+        for p in adapter.parameters():
+            assert p.grad is not None
+            assert torch.isfinite(p.grad).all()
+
+    def test_reset_parameters_reinitializes(self):
+        adapter = MLP2LayerAdapter(in_dim=8, out_dim=4, pre_norm="rmsnorm")
+        adapter.reset_parameters()
+        assert torch.isfinite(adapter.proj1.weight).all()
+        assert torch.allclose(adapter.ln_q.weight, torch.ones_like(adapter.ln_q.weight))
+
+    def test_built_via_config(self):
+        cfg = AdapterConfig(type="mlp_2layer", pre_norm="rmsnorm", hidden_dim=1152)
+        adapter = build_adapter(cfg, in_dim=1152, out_dim=1024)
+        assert isinstance(adapter, MLP2LayerAdapter)
+        assert isinstance(adapter.ln_q, RMSNorm)
+        assert adapter.proj1.out_features == 1152
+
+    def test_config_default_has_no_pre_norm(self):
+        adapter = build_adapter(AdapterConfig(type="mlp_2layer"), in_dim=8, out_dim=4)
+        assert adapter.ln_q is None
+
+    def test_unknown_pre_norm_raises(self):
+        with pytest.raises(ValueError, match="Unknown adapter.pre_norm"):
+            AdapterConfig(type="mlp_2layer", pre_norm="banana")
+
+    def test_matches_converted_checkpoint_keys(self):
+        # Warm-start guarantee: the converted checkpoints store the adapter as
+        # {ln_q.weight, proj1.weight, proj1.bias, proj2.weight, proj2.bias}.
+        # Building the connector the configs name must reproduce exactly those
+        # keys and shapes, or the checkpoints would stop loading.
+        cfg = AdapterConfig(type="mlp_2layer", pre_norm="rmsnorm", hidden_dim=1152)
+        sd = build_adapter(cfg, in_dim=1152, out_dim=1024).state_dict()
+        assert set(sd) == {
+            "ln_q.weight",
+            "proj1.weight",
+            "proj1.bias",
+            "proj2.weight",
+            "proj2.bias",
+        }
+        assert tuple(sd["ln_q.weight"].shape) == (1152,)
+        assert tuple(sd["proj1.weight"].shape) == (1152, 1152)
+        assert tuple(sd["proj2.weight"].shape) == (1024, 1152)

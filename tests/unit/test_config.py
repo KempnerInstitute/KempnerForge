@@ -188,6 +188,37 @@ class TestModelConfig:
             ModelConfig(sdpa_backend="fa3")
 
 
+class TestHeadDimOverride:
+    """``ModelConfig.head_dim`` decouples the attention width from ``dim``."""
+
+    def test_defaults_to_dim_over_n_heads(self):
+        assert ModelConfig(dim=256, n_heads=8).head_dim == 32
+
+    def test_explicit_decouples_from_dim(self):
+        cfg = ModelConfig(dim=1024, n_heads=16, n_kv_heads=8, head_dim=128)
+        assert cfg.head_dim == 128  # not 1024 // 16 == 64
+
+    def test_explicit_allows_dim_not_divisible_by_n_heads(self):
+        # With an explicit head_dim the attention width is decoupled, so dim
+        # need not be divisible by n_heads.
+        cfg = ModelConfig(
+            dim=100, n_heads=8, head_dim=16, vocab_size=100, n_layers=1, max_seq_len=16
+        )
+        assert cfg.head_dim == 16
+
+    def test_inferred_still_requires_divisible(self):
+        with pytest.raises(ValueError, match="divisible by n_heads"):
+            ModelConfig(dim=100, n_heads=8)
+
+    def test_zero_head_dim_infers(self):
+        # 0 is the "infer" sentinel -> dim // n_heads (same as an unset head_dim).
+        assert ModelConfig(dim=256, n_heads=8, head_dim=0).head_dim == 32
+
+    def test_rejects_negative_head_dim(self):
+        with pytest.raises(ValueError, match="head_dim must be positive"):
+            ModelConfig(dim=256, n_heads=8, head_dim=-4)
+
+
 # ---------------------------------------------------------------------------
 # TrainConfig
 # ---------------------------------------------------------------------------

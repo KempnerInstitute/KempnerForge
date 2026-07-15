@@ -7,8 +7,9 @@ between the vision encoder and the transformer in ``VLMWrapper``.
 Two families:
 
 - **Projection adapters** keep the token count (``out_tokens == num_tokens``):
-  ``mlp_2layer`` (default, the canonical LLaVA-family 2-layer MLP) and
-  ``linear`` (single ``nn.Linear``, an ablation baseline).
+  ``mlp_2layer`` (default, the canonical LLaVA-family 2-layer MLP, with an
+  optional pre-projection norm) and ``linear`` (single ``nn.Linear``, an
+  ablation baseline).
 - **Pooling adapters** reduce the token count by pooling the square patch grid
   before projecting: ``avgpool`` (window-average, the cheapest reducer) and
   ``attentional_pool`` (Molmo2-style per-window multi-head attention with the
@@ -32,6 +33,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from kempnerforge.config.registry import registry
+from kempnerforge.model.norm import build_norm
 
 _ADAPTER_ACTIVATIONS: dict[str, type[nn.Module]] = {
     "gelu": nn.GELU,
@@ -154,11 +156,17 @@ class VisionAdapter(nn.Module):
 class MLP2LayerAdapter(VisionAdapter):
     """2-layer MLP from image-feature dim to LLM embedding dim.
 
-    Architecture: ``Linear(in_dim, hidden) -> activation -> Linear(hidden, out_dim)``.
-    ``hidden_dim=None`` defaults to ``out_dim``. Keeps the token count.
+    Architecture: ``[pre_norm] -> Linear(in_dim, hidden) -> activation ->
+    Linear(hidden, out_dim)``. ``hidden_dim=None`` defaults to ``out_dim``.
+    Keeps the token count.
+
+    ``pre_norm`` optionally inserts a pre-projection normalization over the
+    vision features (exposed as ``ln_q``), selected by norm-registry key
+    (e.g. ``"rmsnorm"`` / ``"layernorm"``); ``None``/empty disables it. This is
+    the LLaVA-family MLP, optionally with a Qwen2.5-VL-style pre-norm head.
 
     ``reset_parameters`` is provided so callers that materialize adapters
-    from meta can re-initialize weights with the standard Linear defaults.
+    from meta can re-initialize weights with the standard defaults.
     """
 
     def __init__(
@@ -167,6 +175,7 @@ class MLP2LayerAdapter(VisionAdapter):
         out_dim: int,
         hidden_dim: int | None = None,
         activation: str = "gelu",
+        pre_norm: str | None = None,
     ) -> None:
         super().__init__()
         if in_dim <= 0 or out_dim <= 0:
@@ -176,19 +185,28 @@ class MLP2LayerAdapter(VisionAdapter):
                 f"Unknown adapter activation: {activation!r}. Options: {list(_ADAPTER_ACTIVATIONS)}"
             )
         hidden = hidden_dim if hidden_dim and hidden_dim > 0 else out_dim
+        # Optional pre-projection norm over the vision features (Qwen2.5-VL's
+        # merger ``ln_q``); registry-selected so any registered norm works.
+        self.ln_q = build_norm(pre_norm, in_dim) if pre_norm else None
         self.proj1 = nn.Linear(in_dim, hidden, bias=True)
         self.act = _ADAPTER_ACTIVATIONS[activation]()
         self.proj2 = nn.Linear(hidden, out_dim, bias=True)
 
     def reset_parameters(self) -> None:
-        """Re-run ``nn.Linear`` default init on both projections.
+        """Re-init the projections (and the pre-norm, if any).
 
         Used after ``to_empty(device=...)`` on a meta-device build.
         """
+        if self.ln_q is not None:
+            # Standard norm init (weight -> 1, bias -> 0); covers RMSNorm/LayerNorm.
+            for name, param in self.ln_q.named_parameters():
+                nn.init.zeros_(param) if name.endswith("bias") else nn.init.ones_(param)
         self.proj1.reset_parameters()
         self.proj2.reset_parameters()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.ln_q is not None:
+            x = self.ln_q(x)
         return self.proj2(self.act(self.proj1(x)))
 
 
@@ -362,6 +380,7 @@ def _build_mlp_2layer(
     out_dim: int,
     hidden_dim: int | None = None,
     activation: str = "gelu",
+    pre_norm: str | None = None,
     **_: Any,
 ) -> VisionAdapter:
     return MLP2LayerAdapter(
@@ -369,6 +388,7 @@ def _build_mlp_2layer(
         out_dim=out_dim,
         hidden_dim=hidden_dim,
         activation=activation,
+        pre_norm=pre_norm,
     )
 
 
