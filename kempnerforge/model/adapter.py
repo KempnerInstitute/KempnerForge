@@ -12,7 +12,7 @@ Two families:
   ablation baseline).
 - **Pooling adapters** reduce the token count by pooling the square patch grid
   before projecting: ``avgpool`` (window-average, the cheapest reducer) and
-  ``attentional_pool`` (Molmo2-style per-window multi-head attention with the
+  ``attentional_pool`` (per-window multi-head attention with the
   window mean as query). Pooling is what makes many-frame video fit the
   sequence budget: a 27×27 SigLIP grid (729 tokens) pools to 81 tokens at a
   3×3 window.
@@ -63,8 +63,8 @@ def pooled_token_count(
     square ``grid × grid`` map (``grid = sqrt(num_input_tokens)``). Pooling with
     a ``window × window`` kernel and ceil edges yields ``ceil(grid/window) ** 2``
     tokens; edge windows that do not fill the kernel pool only the patches they
-    cover (Molmo2 §A: "the bottom and far-right image patches are pooled with a
-    reduced number of patches").
+    cover (so the bottom and far-right edge windows pool fewer patches than a
+    full window).
 
     Connectors that genuinely cannot pool ragged edges may pass
     ``require_divisible=True`` to raise when ``grid`` is not divisible by
@@ -277,7 +277,7 @@ class AvgPoolAdapter(VisionAdapter):
 
 
 class AttentionalPoolAdapter(VisionAdapter):
-    """Attentional pooling connector (Molmo2 §3.1).
+    """Attentional pooling connector (per-window multi-head attention).
 
     For each ``window × window`` patch window, a multi-head attention layer
     pools the window's patches into one vector, using the **mean of the window's
@@ -285,9 +285,9 @@ class AttentionalPoolAdapter(VisionAdapter):
     is projected ``in_dim -> out_dim``. Output length is ``ceil(grid/window)**2``.
 
     ``window`` is overridable per ``forward`` call (shared params across image
-    2×2 and video 3×3 pooling, per the paper). Ragged grids are supported: a
+    2×2 and video 3×3 pooling). Ragged grids are supported: a
     partial edge window pools only its real patches (the padded patches are
-    masked out of the window's K/V), matching ``avgpool`` and Molmo2 §A.
+    masked out of the window's K/V), matching ``avgpool``.
     """
 
     def __init__(

@@ -253,7 +253,7 @@ class TestPooledTokenCount:
         [
             (196, 2, 49),  # 14x14 grid, divisible -> 7x7
             (256, 2, 64),  # 16x16 -> 8x8
-            (729, 3, 81),  # 27x27 (Molmo2 SigLIP 378/14) -> 9x9
+            (729, 3, 81),  # 27x27 (SigLIP 378/14) -> 9x9
             (16, 2, 4),  # 4x4 -> 2x2
             (16, 3, 4),  # 4x4 ragged: ceil(4/3)=2 -> 2x2
             (100, 3, 16),  # 10x10 ragged: ceil(10/3)=4 -> 4x4
