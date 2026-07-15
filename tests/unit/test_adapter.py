@@ -16,6 +16,7 @@ from kempnerforge.model.adapter import (
     LinearAdapter,
     MLP2LayerAdapter,
     VisionAdapter,
+    _pad_grid_to_windows,
     build_adapter,
     pooled_token_count,
 )
@@ -276,14 +277,32 @@ class TestPooledTokenCount:
         with pytest.raises(ValueError, match="must be positive"):
             pooled_token_count(0, 2)
 
-    def test_require_divisible_raises_on_ragged(self):
-        # The generic require_divisible flag still rejects a ragged grid up front
-        # (the seam for a future divisible-only connector); no current connector sets it.
-        with pytest.raises(ValueError, match="ragged grid"):
-            pooled_token_count(196, 3, require_divisible=True)  # 14x14 not divisible by 3
 
-    def test_require_divisible_ok_when_divisible(self):
-        assert pooled_token_count(196, 2, require_divisible=True) == 49  # 14x14 -> 7x7
+class TestPadGridToWindows:
+    """The shared ``_pad_grid_to_windows`` helper decides the divisible-vs-ragged
+    branch for BOTH pooling adapters. A divisible grid MUST return ``valid=None``
+    so the connectors take the unmasked, bit-exact, no-mask-built fast path; a
+    ragged grid returns a validity mask over the real patches. Regressing this
+    (e.g. an all-True mask for a divisible grid) would silently route divisible
+    grids through the masked SDPA path instead of the unmasked one."""
+
+    def test_divisible_grid_builds_no_mask(self):
+        x = torch.randn(2, 16, 8)  # 4x4 grid; window 2 divides it
+        padded, per, valid = _pad_grid_to_windows(x, 2)
+        assert per == 2
+        assert valid is None  # no mask built -> unmasked / bit-exact fast path
+        assert padded.shape == (2, 4, 4, 8)  # no padding for a divisible grid
+
+    def test_ragged_grid_builds_mask_over_real_patches(self):
+        x = torch.randn(2, 16, 8)  # 4x4 grid; window 3 -> pad to 6x6
+        padded, per, valid = _pad_grid_to_windows(x, 3)
+        assert per == 2  # ceil(4/3)
+        assert padded.shape == (2, 6, 6, 8)
+        assert valid is not None and valid.shape == (2, 6, 6, 1)
+        assert valid.sum().item() == 2 * 16  # exactly the 16 real patches per sample
+        # Real patches are the top-left 4x4 block; the padded rows/cols are False.
+        assert bool(valid[:, :4, :4].all())
+        assert not bool(valid[:, 4:, :].any()) and not bool(valid[:, :, 4:].any())
 
 
 # ---------------------------------------------------------------------------
@@ -362,6 +381,19 @@ class TestAvgPoolAdapter:
         # tokens 0,1,4,5 -> mean 2.5.
         assert torch.allclose(out[0, 0], torch.full((4,), 2.5))
 
+    def test_ragged_edge_window_averages_only_real_patches(self):
+        """A ragged edge window averages over its real patches only (divide by the
+        real-patch count, NOT by w*w)."""
+        adapter = AvgPoolAdapter(in_dim=4, out_dim=4, pool_window=3)
+        with torch.no_grad():
+            adapter.proj.weight.copy_(torch.eye(4))
+            adapter.proj.bias.zero_()
+        x = torch.arange(16.0).view(1, 16, 1).expand(1, 16, 4).contiguous()  # 4x4 grid
+        out = adapter(x)  # (1, 4, 4): 2x2 windows, window 3 ragged
+        # Bottom-right window (token 3) has grid cell (3,3) = token 15 as its only
+        # real patch; mean over that 1 patch = 15.0 (a /(w*w)=/9 bug gives ~1.67).
+        assert torch.allclose(out[0, 3], torch.full((4,), 15.0))
+
     def test_forward_rejects_nonpositive_window_override(self):
         adapter = AvgPoolAdapter(in_dim=8, out_dim=4, pool_window=2)
         with pytest.raises(ValueError, match="pool_window must be positive"):
@@ -438,6 +470,20 @@ class TestAttentionalPoolAdapter:
         for p in adapter.parameters():
             assert p.grad is not None
             assert torch.isfinite(p.grad).all()
+
+    def test_backward_grads_flow_ragged(self):
+        # window 3 on a 4x4 grid is ragged -> exercises the masked SDPA + masked-mean
+        # query + clamp(min=1) backward, which the divisible window=2 case above never
+        # hits. Guards against NaN grads on the edge-window path.
+        adapter = AttentionalPoolAdapter(in_dim=32, out_dim=16, pool_window=3, pool_heads=4).to(
+            DEVICE
+        )
+        x = torch.randn(1, 16, 32, device=DEVICE, requires_grad=True)  # 4x4 grid, ragged
+        adapter(x).sum().backward()
+        for p in adapter.parameters():
+            assert p.grad is not None
+            assert torch.isfinite(p.grad).all()
+        assert x.grad is not None and torch.isfinite(x.grad).all()
 
     def test_reset_parameters_reinitializes(self):
         adapter = AttentionalPoolAdapter(in_dim=16, out_dim=8, pool_heads=4)

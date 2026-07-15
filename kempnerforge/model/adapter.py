@@ -47,16 +47,8 @@ _ADAPTER_ACTIVATIONS: dict[str, type[nn.Module]] = {
 # the registered pooling builders below.
 POOLING_ADAPTER_TYPES: tuple[str, ...] = ("avgpool", "attentional_pool")
 
-# Pooling adapters whose ``forward`` cannot pool ragged edge windows (so their
-# token count must reject a non-divisible grid at config/build time). Both
-# ``avgpool`` and ``attentional_pool`` now mask partial edge windows, so this is
-# empty -- kept as a seam for a future connector that genuinely needs divisibility.
-DIVISIBLE_ONLY_POOL_TYPES: tuple[str, ...] = ()
 
-
-def pooled_token_count(
-    num_input_tokens: int, window: int, *, require_divisible: bool = False
-) -> int:
+def pooled_token_count(num_input_tokens: int, window: int) -> int:
     """Token count out of a ``window×window`` pool over a square patch grid.
 
     A vision encoder emits ``num_input_tokens`` patch tokens laid out on a
@@ -65,12 +57,6 @@ def pooled_token_count(
     tokens; edge windows that do not fill the kernel pool only the patches they
     cover (so the bottom and far-right edge windows pool fewer patches than a
     full window).
-
-    Connectors that genuinely cannot pool ragged edges may pass
-    ``require_divisible=True`` to raise when ``grid`` is not divisible by
-    ``window``, rejecting a ragged config at config/build time rather than
-    deterministically failing in ``forward`` at the first step. (Today both
-    pooling connectors handle ragged edges, so none set it.)
 
     This is the single source of truth for the post-pool count: it must equal
     the pooling adapters' actual ``forward`` output length, because the build
@@ -81,13 +67,6 @@ def pooled_token_count(
     if num_input_tokens <= 0:
         raise ValueError(f"num_input_tokens must be positive (got {num_input_tokens})")
     grid = _grid_side(num_input_tokens)
-    if require_divisible and grid % window != 0:
-        raise ValueError(
-            f"this pooling connector requires the patch grid ({grid}x{grid}) be "
-            f"divisible by the pool window ({window}); got a ragged grid "
-            f"(num_tokens={num_input_tokens}). Use a ragged-capable connector "
-            "(avgpool or attentional_pool), or pick a divisible window."
-        )
     per_side = math.ceil(grid / window)
     return per_side * per_side
 
