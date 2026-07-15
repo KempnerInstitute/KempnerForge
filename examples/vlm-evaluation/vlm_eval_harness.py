@@ -38,6 +38,7 @@ import argparse
 import json
 import logging
 import sys
+import tempfile
 from pathlib import Path
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -69,8 +70,6 @@ def main() -> None:
     parser.add_argument(
         "--checkpoint", type=str, required=True, help="DCP checkpoint dir (run dir or step_N dir)"
     )
-    # No default task suite: the representative default benchmark set is an open
-    # decision; --tasks is required until one is provided.
     parser.add_argument(
         "--tasks", type=str, required=True, help="Comma-separated lmms-eval task names"
     )
@@ -133,10 +132,22 @@ def main() -> None:
         max_new_tokens=args.max_new_tokens,
         **dtype_kwargs,
     )
+    # lmms-eval's evaluate() reads a few attributes off a `cli_args` namespace,
+    # and some tasks dereference them directly rather than via getattr: judge-
+    # scored tasks cache their GPT responses under `cli_args.output_path`, and
+    # hallusion_bench's aggregation crashes on `args.output_path` when
+    # `task.args` is None (which is what a missing cli_args leaves it as).
+    judge_output_dir = Path(args.output).parent if args.output else Path(tempfile.mkdtemp())
+    judge_output_dir.mkdir(parents=True, exist_ok=True)
+    cli_args = argparse.Namespace(
+        output_path=str(judge_output_dir),
+        process_with_media=True,
+    )
     results = simple_evaluate(
         model=model,
         tasks=args.tasks.split(","),
         limit=args.limit,
+        cli_args=cli_args,
     )
 
     # --- Print results ---
