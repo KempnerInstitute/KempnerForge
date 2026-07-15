@@ -131,12 +131,17 @@ class FrameTimeEmbedding(TimeEmbedding):
 def _build_sinusoidal(
     dim: int,
     *,
-    num_bands: int = 16,
-    min_period: float = 0.5,
-    max_period: float = 256.0,
+    num_bands: int,
+    min_period: float,
+    max_period: float,
     **_: Any,
 ) -> FrameTimeEmbedding:
-    """Registry builder for the sinusoidal time embedding."""
+    """Registry builder for the sinusoidal time embedding.
+
+    ``num_bands`` / ``min_period`` / ``max_period`` are required: the config path
+    always supplies them via ``TimeEmbeddingConfig.extra_kwargs()``, so this
+    builder holds no defaults of its own (they would be dead, always overridden).
+    """
     return FrameTimeEmbedding(
         dim, num_bands=num_bands, min_period=min_period, max_period=max_period
     )
@@ -145,17 +150,30 @@ def _build_sinusoidal(
 def build_time_embedding(time_embedding_config: Any, dim: int) -> TimeEmbedding | None:
     """Build the per-frame time embedding from a ``TimeEmbeddingConfig``.
 
-    Returns ``None`` when disabled (``type == "none"``). A ``None`` config falls
-    back to the default (sinusoidal) so video callers that pass nothing keep the
-    default behavior. The config is duck-typed (``.enabled`` / ``.type`` /
-    ``.extra_kwargs()``) to avoid a model->config import cycle, matching
-    ``build_adapter``.
+    Opt-in: returns ``None`` when there is no config (``None`` -- i.e. no
+    ``[time_embedding]`` section) or it is disabled (``type == "none"``). A video
+    model therefore gets a time embedding ONLY when a ``[time_embedding]`` section
+    is present and enabled, so a default config builds a model identical to one
+    with no time embedding at all (no ``frame_time_embed.*`` parameters). The
+    config is duck-typed (``.enabled`` / ``.type`` / ``.extra_kwargs()``) to avoid
+    a model->config import cycle, matching ``build_adapter``.
     """
-    if time_embedding_config is None:
-        from kempnerforge.config.time_embedding import TimeEmbeddingConfig  # noqa: PLC0415
-
-        time_embedding_config = TimeEmbeddingConfig()
-    if not time_embedding_config.enabled:
+    if time_embedding_config is None or not time_embedding_config.enabled:
         return None
     builder = registry.get_time_embedding(time_embedding_config.type)
     return builder(dim, **time_embedding_config.extra_kwargs())
+
+
+def build_time_embedding_for_clip(
+    time_embedding_config: Any, dim: int, frames_per_clip: int
+) -> TimeEmbedding | None:
+    """Per-frame time embedding for a clip.
+
+    Video (``frames_per_clip > 1``) gets one (registry-selected via
+    ``[time_embedding]``); the image path (``frames_per_clip == 1``) never does.
+    Shared by both VLM build paths (``build_vlm_wrapper`` and the parallel
+    ``_build_vlm``) so the ``frames_per_clip`` gate can't drift between them.
+    """
+    if frames_per_clip <= 1:
+        return None
+    return build_time_embedding(time_embedding_config, dim)

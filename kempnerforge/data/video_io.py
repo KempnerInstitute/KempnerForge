@@ -74,6 +74,23 @@ def _video_duration_seconds(stream: Any, container: Any) -> float:
     return 0.0
 
 
+def _frame_time(pts: float | None, index: int, avg_rate: float) -> float:
+    """Per-frame timestamp in seconds.
+
+    Uses the frame's presentation time (``pts``) when the container provides it;
+    otherwise falls back to a monotonic estimate from the decode ``index`` and the
+    stream's ``avg_rate`` (or the raw index when the rate is unknown). Without this
+    fallback a container that reports no PTS would give ``pts=None -> 0.0`` for
+    every frame, collapsing frame times to all-zero -- which makes the per-frame
+    time embedding a silent no-op and breaks timestamp-based target matching.
+    """
+    if pts is not None:
+        return float(pts)
+    if avg_rate > 0:
+        return index / avg_rate
+    return float(index)
+
+
 def decode_video_frames(
     path: str, *, fps: float, min_frames: int, max_frames: int, sampling_policy: str = "uniform"
 ) -> tuple[list[PILImage], list[float]]:
@@ -115,8 +132,11 @@ def decode_video_frames(
         eps = 1e-3
         last_frame = None
         last_t = 0.0
-        for frame in container.decode(stream):
-            t = float(frame.time) if frame.time is not None else 0.0
+        # Fallback clock for containers that report no per-frame PTS -- see
+        # _frame_time (keeps frame times monotonic instead of silently all-zero).
+        avg_rate = float(stream.average_rate) if stream.average_rate else 0.0
+        for idx, frame in enumerate(container.decode(stream)):
+            t = _frame_time(frame.time, idx, avg_rate)
             while j < len(targets) and t + eps >= targets[j]:
                 images.append(frame.to_image())
                 times.append(t)

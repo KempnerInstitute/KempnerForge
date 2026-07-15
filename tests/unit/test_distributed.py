@@ -378,9 +378,10 @@ class TestBuildParallelModelVLM:
         assert model.adapter.proj1.weight.dtype == torch.bfloat16
 
     def test_video_build_attaches_frame_time_embed(self):
-        """frames_per_clip>1 routes through _build_vlm and attaches a
-        FrameTimeEmbedding, built + materialized + cast on the device_mesh=None
-        (no-FSDP) path."""
+        """frames_per_clip>1 with an explicit [time_embedding] routes through
+        _build_vlm and attaches a FrameTimeEmbedding, built + materialized + cast
+        on the device_mesh=None (no-FSDP) path."""
+        from kempnerforge.config.time_embedding import TimeEmbeddingConfig
         from kempnerforge.distributed.parallel import build_parallel_model
 
         mc, vc, ac, lc = self._vlm_configs(max_seq_len=64, max_text_len=16, num_tokens=8)
@@ -393,6 +394,7 @@ class TestBuildParallelModelVLM:
             vlm_config=lc,
             param_dtype=torch.bfloat16,
             frames_per_clip=4,
+            time_embedding_config=TimeEmbeddingConfig(),
         )
         assert model.frame_time_embed is not None
         assert model.frame_time_embed.proj.weight.dtype == torch.bfloat16  # cast applied

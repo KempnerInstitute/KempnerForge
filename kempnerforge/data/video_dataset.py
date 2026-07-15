@@ -57,6 +57,8 @@ class VideoDataset(Dataset):
 
     - ``pixel_values``: ``(F, 3, H, W)`` float32 (``F = max_frames``, zero-padded).
     - ``frame_mask``: ``(F,)`` bool (``True`` for real frames).
+    - ``frame_times``: ``(F,)`` float32 — per-frame time in seconds (``0.0`` on pad
+      frames); required by ``VideoCollator``.
     - ``input_ids`` / ``labels``: ``(T,)`` int64, padded to ``max_text_len`` with
       ``-100`` on pad/prompt positions.
 
@@ -209,8 +211,7 @@ class WebVidVideoDataset(VideoDataset):
         # are themselves unmasked from attention, and inert once they are masked.
         frame_times = torch.zeros(self._max_frames, dtype=torch.float32)
         n_real = min(len(frames), self._max_frames)
-        for i in range(n_real):
-            frame_times[i] = frame_times_s[i]
+        frame_times[:n_real] = torch.tensor(frame_times_s[:n_real], dtype=torch.float32)
 
         prompt = self._prompt or None
         input_ids, labels = _tokenize_and_mask(self._tokenizer, caption, self._max_text_len, prompt)

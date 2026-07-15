@@ -75,6 +75,32 @@ class TestSampleTimestamps:
 
 
 # ---------------------------------------------------------------------------
+# _frame_time (per-frame timestamp with no-PTS fallback; pure, no decoder)
+# ---------------------------------------------------------------------------
+
+
+class TestFrameTime:
+    def test_uses_pts_when_present(self):
+        from kempnerforge.data.video_io import _frame_time
+
+        assert _frame_time(3.5, 0, 2.0) == 3.5
+
+    def test_falls_back_to_index_over_rate_when_no_pts(self):
+        # No PTS => monotonic index/rate estimate, not the all-zero a raw
+        # `pts or 0.0` would give (which collapses frame_times to a no-op).
+        from kempnerforge.data.video_io import _frame_time
+
+        assert _frame_time(None, 0, 2.0) == 0.0
+        assert _frame_time(None, 4, 2.0) == 2.0
+        assert _frame_time(None, 3, 2.0) == 1.5
+
+    def test_falls_back_to_raw_index_without_rate(self):
+        from kempnerforge.data.video_io import _frame_time
+
+        assert _frame_time(None, 3, 0.0) == 3.0
+
+
+# ---------------------------------------------------------------------------
 # decode_video_frames (integration; needs av + the testbed data)
 # ---------------------------------------------------------------------------
 

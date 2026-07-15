@@ -40,6 +40,24 @@ class TestFrameTimeEmbedding:
         long = emb(torch.tensor([[0.0, 20.0, 40.0, 60.0]]))  # 60s clip
         assert not torch.allclose(short, long)
 
+    def test_large_timestamps_need_fp32(self):
+        # bf16 (8 mantissa bits) cannot resolve sub-second differences at large
+        # t, which is why the FSDP wrap must NOT cast the fp32 timestamps to bf16
+        # before the sinusoidal features (parallel.py: cast_forward_inputs=False).
+        emb = FrameTimeEmbedding(dim=16, num_bands=8, min_period=0.5, max_period=256.0)
+        with torch.no_grad():
+            emb.proj.weight.normal_(std=0.1)
+        t = torch.tensor([[256.0, 256.3]])  # large, sub-second apart
+        # These two times collapse to a single value in bf16 ...
+        t_bf16 = t.to(torch.bfloat16).to(torch.float32)
+        assert t_bf16[0, 0] == t_bf16[0, 1]
+        # ... so a bf16-cast input makes the two frames' embeddings identical,
+        out_bf16 = emb(t_bf16)
+        assert torch.allclose(out_bf16[:, 0], out_bf16[:, 1])
+        # ... whereas the fp32 input keeps them distinct.
+        out_fp32 = emb(t)
+        assert not torch.allclose(out_fp32[:, 0], out_fp32[:, 1])
+
     def test_dtype_follows_proj(self):
         emb = FrameTimeEmbedding(dim=16, num_bands=4).to(torch.bfloat16)
         out = emb(torch.zeros(1, 3))  # float32 input, bf16 module
@@ -76,12 +94,10 @@ class TestTimeEmbeddingRegistry:
 
         assert "sinusoidal" in registry.list_time_embeddings()
 
-    def test_build_none_config_defaults_to_sinusoidal(self):
-        # A None config preserves the default (sinusoidal) so video callers that
-        # pass nothing keep the current behavior.
-        m = build_time_embedding(None, dim=64)
-        assert isinstance(m, FrameTimeEmbedding)
-        assert m.proj.out_features == 64
+    def test_build_none_config_returns_none(self):
+        # Opt-in: no config (no [time_embedding] section) builds NO embedding, so
+        # a default video model is identical to one built with no time embedding.
+        assert build_time_embedding(None, dim=64) is None
 
     def test_build_from_config(self):
         from kempnerforge.config.time_embedding import TimeEmbeddingConfig

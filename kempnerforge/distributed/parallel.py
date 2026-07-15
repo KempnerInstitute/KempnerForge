@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+from dataclasses import replace
 from functools import partial
 
 import torch
@@ -350,10 +351,18 @@ def _apply_fsdp_vlm(
         reshard_after_forward=reshard_after_forward,
     )
     if wrapper.frame_time_embed is not None:
+        # The time embedding consumes float32 per-frame timestamps (seconds) and
+        # must compute its sinusoidal features in fp32: bf16 (8 mantissa bits)
+        # cannot resolve sub-second differences past ~1 min, so the default
+        # cast_forward_inputs=True would silently collapse nearby frame times for
+        # long videos. Disable the input cast for this unit only; its forward
+        # already casts the bounded sin/cos features to the param dtype before the
+        # proj matmul, so params stay bf16 with fp32 gradient reduction as usual.
+        ft_policy = replace(policy, cast_forward_inputs=False)
         fully_shard(
             wrapper.frame_time_embed,
             mesh=dp_mesh,
-            mp_policy=policy,
+            mp_policy=ft_policy,
             reshard_after_forward=reshard_after_forward,
         )
     if not encoder_frozen:
@@ -411,7 +420,7 @@ def _build_vlm(
     from kempnerforge.distributed.expert_parallel import apply_expert_parallel
     from kempnerforge.distributed.tensor_parallel import apply_tensor_parallel
     from kempnerforge.model.adapter import build_adapter
-    from kempnerforge.model.frame_time import build_time_embedding
+    from kempnerforge.model.frame_time import build_time_embedding_for_clip
     from kempnerforge.model.transformer import Transformer
     from kempnerforge.model.vlm import (
         VLMWrapper,
@@ -450,10 +459,8 @@ def _build_vlm(
         # Video gets a per-frame timestamp embedding (registry-selected via
         # [time_embedding]); built alongside the adapter so it shares the
         # meta/CPU build + materialize path below.
-        frame_time_embed = (
-            build_time_embedding(time_embedding_config, model_config.dim)
-            if frames_per_clip > 1
-            else None
+        frame_time_embed = build_time_embedding_for_clip(
+            time_embedding_config, model_config.dim, frames_per_clip
         )
 
     strategy = build_modality_strategy(vlm_config)

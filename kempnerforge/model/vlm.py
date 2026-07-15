@@ -37,6 +37,7 @@ relying on attribute fallthrough on ``VLMWrapper``.
 from __future__ import annotations
 
 from collections.abc import Iterable
+from dataclasses import replace
 from typing import Protocol
 
 import torch
@@ -49,7 +50,7 @@ from kempnerforge.config.time_embedding import TimeEmbeddingConfig
 from kempnerforge.config.vision import VisionEncoderConfig
 from kempnerforge.config.vlm import FreezeSpec, VLMConfig
 from kempnerforge.model.adapter import VisionAdapter, build_adapter
-from kempnerforge.model.frame_time import TimeEmbedding, build_time_embedding
+from kempnerforge.model.frame_time import TimeEmbedding, build_time_embedding_for_clip
 from kempnerforge.model.modality import ModalityContext
 from kempnerforge.model.transformer import Transformer
 from kempnerforge.model.vision import VisionEncoder
@@ -71,16 +72,13 @@ class ModalityStrategy(Protocol):
         pixel_values: torch.Tensor,
         input_ids: torch.Tensor,
         *,
-        frame_times: torch.Tensor | None = None,
         frame_mask: torch.Tensor | None = None,
     ) -> ModalityContext: ...
 
     def num_image_tokens(self, wrapper: VLMWrapper) -> int: ...
 
 
-def _project_visual_features(
-    wrapper: VLMWrapper, pixel_values: torch.Tensor, frame_times: torch.Tensor | None = None
-) -> torch.Tensor:
+def _project_visual_features(wrapper: VLMWrapper, pixel_values: torch.Tensor) -> torch.Tensor:
     """Encode + adapt visual features into LLM-dim tokens.
 
     Accepts a single-image batch ``(B, 3, H, W)`` or a video-clip batch
@@ -122,22 +120,54 @@ def _project_visual_features(
         # (B*F, P', dim) -> (B, F*P', dim): frame-contiguous, temporal order kept.
         pprime, dim = embeds.shape[1], embeds.shape[2]
         embeds = embeds.reshape(b, f * pprime, dim)
-        # Per-frame timestamp embedding, broadcast across each frame's P' tokens,
-        # so the model can reason about *when* each frame occurs (not just order).
-        if wrapper.frame_time_embed is not None and frame_times is not None:
-            if frame_times.shape != (b, f):
-                raise ValueError(
-                    f"frame_times shape {tuple(frame_times.shape)} does not match "
-                    f"(batch, frames) = ({b}, {f})"
-                )
-            t_emb = wrapper.frame_time_embed(frame_times)  # (B, F, dim)
-            # Broadcast the per-frame embedding across each frame's P' tokens by
-            # adding in a (B, F, P', dim) view — avoids materializing the expanded
-            # (B, F*P', dim) copy that `expand().reshape()` would force.
-            embeds = (
-                embeds.reshape(b, f, pprime, dim) + t_emb.unsqueeze(2).to(embeds.dtype)
-            ).reshape(b, f * pprime, dim)
     return embeds
+
+
+def _apply_frame_time_embedding(
+    modality: ModalityContext,
+    frame_time_embed: TimeEmbedding,
+    frame_times: torch.Tensor,
+    frames_per_clip: int,
+) -> ModalityContext:
+    """Add a per-frame timestamp embedding onto a context's visual tokens.
+
+    Self-contained post-step, called only from ``VLMWrapper.forward`` and only
+    when a time embedding is configured. The strategies build a time-agnostic
+    ``ModalityContext``; this adds ``frame_time_embed(frame_times)`` broadcast
+    across each frame's ``P'`` tokens onto whichever visual field the context set
+    -- ``prefix_embeds`` for the image-prefix archs, ``image_features`` for
+    Cross-Attention -- and returns a new context. When no time embedding is
+    configured this is never called, so the rest of the model is unchanged.
+    """
+    viz = modality.prefix_embeds if modality.prefix_embeds is not None else modality.image_features
+    if viz is None:
+        # No visual field to augment (e.g. a pipeline-parallel middle stage whose
+        # inputs_embeds already carry the embedding added at stage 0).
+        return modality
+    b, n, dim = viz.shape
+    f = frames_per_clip
+    if frame_times.shape != (b, f):
+        raise ValueError(
+            f"frame_times shape {tuple(frame_times.shape)} does not match "
+            f"(batch, frames) = ({b}, {f})"
+        )
+    if n % f != 0:
+        # Visual tokens are frame-contiguous (F * tokens_per_frame); a future
+        # adapter adding a non-per-frame token (e.g. a global/CLS token) would
+        # break the reshape below. Fail loudly (mirrors _visual_token_mask)
+        # instead of a cryptic reshape error.
+        raise ValueError(
+            f"_apply_frame_time_embedding: visual token count ({n}) is not a "
+            f"multiple of frames ({f}); the per-frame embedding assumes "
+            "frame-contiguous visual tokens."
+        )
+    pprime = n // f
+    t_emb = frame_time_embed(frame_times)  # (B, F, dim)
+    # Broadcast across each frame's P' tokens via a (B, F, P', dim) view; the
+    # frame-contiguous layout matches _project_visual_features.
+    viz = (viz.reshape(b, f, pprime, dim) + t_emb.unsqueeze(2).to(viz.dtype)).reshape(b, n, dim)
+    field = "prefix_embeds" if modality.prefix_embeds is not None else "image_features"
+    return replace(modality, **{field: viz})
 
 
 def _visual_token_mask(
@@ -204,10 +234,9 @@ class JointDecoderStrategy:
         pixel_values: torch.Tensor,
         input_ids: torch.Tensor,
         *,
-        frame_times: torch.Tensor | None = None,
         frame_mask: torch.Tensor | None = None,
     ) -> ModalityContext:
-        img_embeds = _project_visual_features(wrapper, pixel_values, frame_times)
+        img_embeds = _project_visual_features(wrapper, pixel_values)
         n = img_embeds.shape[1]  # pooling-aware: the adapter's actual visual-token count
         return ModalityContext(
             prefix_embeds=img_embeds,
@@ -240,10 +269,9 @@ class CrossAttentionStrategy:
         pixel_values: torch.Tensor,
         input_ids: torch.Tensor,  # noqa: ARG002
         *,
-        frame_times: torch.Tensor | None = None,
         frame_mask: torch.Tensor | None = None,
     ) -> ModalityContext:
-        img_embeds = _project_visual_features(wrapper, pixel_values, frame_times)
+        img_embeds = _project_visual_features(wrapper, pixel_values)
         return ModalityContext(
             image_features=img_embeds,
             image_mask=_visual_token_mask(frame_mask, img_embeds.shape[1]),
@@ -280,10 +308,9 @@ class MoTStrategy:
         pixel_values: torch.Tensor,
         input_ids: torch.Tensor,
         *,
-        frame_times: torch.Tensor | None = None,
         frame_mask: torch.Tensor | None = None,
     ) -> ModalityContext:
-        img_embeds = _project_visual_features(wrapper, pixel_values, frame_times)
+        img_embeds = _project_visual_features(wrapper, pixel_values)
         n = img_embeds.shape[1]  # pooling-aware: the adapter's actual visual-token count
         b, t_text = input_ids.shape
         modality_ids = torch.zeros(b, n + t_text, dtype=torch.long, device=input_ids.device)
@@ -328,10 +355,9 @@ class MoMaStrategy:
         pixel_values: torch.Tensor,
         input_ids: torch.Tensor,
         *,
-        frame_times: torch.Tensor | None = None,
         frame_mask: torch.Tensor | None = None,
     ) -> ModalityContext:
-        img_embeds = _project_visual_features(wrapper, pixel_values, frame_times)
+        img_embeds = _project_visual_features(wrapper, pixel_values)
         n = img_embeds.shape[1]  # pooling-aware: the adapter's actual visual-token count
         b, t_text = input_ids.shape
         modality_ids = torch.zeros(b, n + t_text, dtype=torch.long, device=input_ids.device)
@@ -424,9 +450,15 @@ class VLMWrapper(nn.Module):
         # materializes the DTensor weight before F.embedding runs. Doing
         # the embedding externally (transformer.token_embedding(input_ids))
         # bypasses FSDP and fails with "mixed torch.Tensor and DTensor".
-        modality = self.strategy.prepare(
-            self, pixel_values, input_ids, frame_times=frame_times, frame_mask=frame_mask
-        )
+        modality = self.strategy.prepare(self, pixel_values, input_ids, frame_mask=frame_mask)
+        # Opt-in, fully decoupled: the strategies build a time-agnostic context;
+        # add the per-frame timestamp embedding here as a self-contained step, and
+        # only when one was configured. Disabled (the default) => this is skipped
+        # and the model is identical to one built with no time embedding.
+        if self.frame_time_embed is not None and frame_times is not None:
+            modality = _apply_frame_time_embedding(
+                modality, self.frame_time_embed, frame_times, self.frames_per_clip
+            )
         logits = self.transformer(tokens=input_ids, modality=modality)
         return logits, labels
 
@@ -516,10 +548,8 @@ def build_vlm_wrapper(
     strategy = build_modality_strategy(vlm_config)
     # Video clips get a per-frame timestamp embedding (registry-selected via
     # [time_embedding]); the image path (F=1) does not. type="none" disables it.
-    frame_time_embed = (
-        build_time_embedding(time_embedding_config, model_config.dim)
-        if frames_per_clip > 1
-        else None
+    frame_time_embed = build_time_embedding_for_clip(
+        time_embedding_config, model_config.dim, frames_per_clip
     )
     return VLMWrapper(
         encoder,

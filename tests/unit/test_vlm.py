@@ -11,6 +11,7 @@ import torch
 
 from kempnerforge.config.adapter import AdapterConfig
 from kempnerforge.config.model import ModelConfig
+from kempnerforge.config.time_embedding import TimeEmbeddingConfig
 from kempnerforge.config.vision import VisionEncoderConfig
 from kempnerforge.config.vlm import (
     CrossAttentionConfig,
@@ -541,7 +542,13 @@ class TestPoolingConnector:
 # ---------------------------------------------------------------------------
 
 
-def _video_wrapper(vlm_cfg, frames: int = 4, *, ffn_hidden_dim: int | None = None) -> VLMWrapper:
+def _video_wrapper(
+    vlm_cfg,
+    frames: int = 4,
+    *,
+    ffn_hidden_dim: int | None = None,
+    time_embedding_config: TimeEmbeddingConfig | None = None,
+) -> VLMWrapper:
     # Encoder: 4x4 patch grid (16 tokens); avgpool 2x2 -> 4 tokens/frame.
     # frames=4 -> 4*4 = 16 visual tokens in the residual prefix.
     mc_kwargs: dict[str, int] = {
@@ -556,7 +563,14 @@ def _video_wrapper(vlm_cfg, frames: int = 4, *, ffn_hidden_dim: int | None = Non
     mc = ModelConfig(**mc_kwargs)
     vc = VisionEncoderConfig(type="random", feature_dim=96, num_tokens=16)
     ac = AdapterConfig(type="avgpool", pool_window=2)
-    return build_vlm_wrapper(mc, vc, ac, vlm_cfg, frames_per_clip=frames)
+    return build_vlm_wrapper(
+        mc, vc, ac, vlm_cfg, frames_per_clip=frames, time_embedding_config=time_embedding_config
+    )
+
+
+def _video_wrapper_te(vlm_cfg, frames: int = 4) -> VLMWrapper:
+    """Video wrapper WITH the default (sinusoidal) time embedding enabled."""
+    return _video_wrapper(vlm_cfg, frames=frames, time_embedding_config=TimeEmbeddingConfig())
 
 
 class TestVideoForward:
@@ -653,16 +667,37 @@ class TestVideoForward:
 class TestVideoFrameTimes:
     """Per-frame timestamp embedding (frame-aware visual prefix)."""
 
-    def test_frame_time_embed_built_for_video(self):
-        wrapper = _video_wrapper(JointDecoderConfig(max_text_len=8), frames=4)
+    def test_time_embed_built_when_configured(self):
+        # Opt-in: an explicit, enabled [time_embedding] section builds the module.
+        wrapper = _video_wrapper_te(JointDecoderConfig(max_text_len=8), frames=4)
         assert wrapper.frame_time_embed is not None
 
-    def test_image_wrapper_has_no_frame_time_embed(self):
-        wrapper = _video_wrapper(JointDecoderConfig(max_text_len=8), frames=1)
+    def test_no_time_embed_by_default(self):
+        # Opt-in default: no [time_embedding] section => no module, so a default
+        # video model is identical to one built before the feature existed.
+        wrapper = _video_wrapper(JointDecoderConfig(max_text_len=8), frames=4)
         assert wrapper.frame_time_embed is None
 
+    def test_image_wrapper_has_no_frame_time_embed(self):
+        # Even with a [time_embedding] section, an image (F=1) builds no module.
+        wrapper = _video_wrapper_te(JointDecoderConfig(max_text_len=8), frames=1)
+        assert wrapper.frame_time_embed is None
+
+    def test_disabled_ignores_frame_times(self):
+        # Fully decoupled: with no embedding, passing frame_times has ZERO effect
+        # on the output — the feature is inert when disabled.
+        wrapper = _video_wrapper(JointDecoderConfig(max_text_len=8), frames=4).to(DEVICE).eval()
+        assert wrapper.frame_time_embed is None
+        pixels = torch.randn(1, 4, 3, 16, 16, device=DEVICE)
+        input_ids = torch.randint(0, 256, (1, 6), device=DEVICE)
+        ft = torch.tensor([[0.0, 1.0, 2.0, 3.0]], device=DEVICE)
+        with torch.no_grad():
+            l_none, _ = wrapper(pixels, input_ids)
+            l_ft, _ = wrapper(pixels, input_ids, frame_times=ft)
+        assert torch.equal(l_none, l_ft)
+
     def test_forward_with_frame_times_keeps_shape(self):
-        wrapper = _video_wrapper(JointDecoderConfig(max_text_len=8), frames=4).to(DEVICE)
+        wrapper = _video_wrapper_te(JointDecoderConfig(max_text_len=8), frames=4).to(DEVICE)
         pixels = torch.randn(2, 4, 3, 16, 16, device=DEVICE)
         input_ids = torch.randint(0, 256, (2, 6), device=DEVICE)
         ft = torch.tensor([[0.0, 1.0, 2.0, 3.0], [0.0, 5.0, 10.0, 15.0]], device=DEVICE)
@@ -671,7 +706,7 @@ class TestVideoFrameTimes:
 
     def test_zero_init_temporal_is_identity(self):
         # Zero-init => passing frame_times adds nothing at step 0 (warm-start).
-        wrapper = _video_wrapper(JointDecoderConfig(max_text_len=8), frames=4).to(DEVICE).eval()
+        wrapper = _video_wrapper_te(JointDecoderConfig(max_text_len=8), frames=4).to(DEVICE).eval()
         pixels = torch.randn(1, 4, 3, 16, 16, device=DEVICE)
         input_ids = torch.randint(0, 256, (1, 6), device=DEVICE)
         ft = torch.tensor([[0.0, 1.0, 2.0, 3.0]], device=DEVICE)
@@ -682,7 +717,7 @@ class TestVideoFrameTimes:
 
     def test_frame_times_change_logits_once_learned(self):
         # After the temporal proj is nonzero, different timestamps change output.
-        wrapper = _video_wrapper(JointDecoderConfig(max_text_len=8), frames=4).to(DEVICE).eval()
+        wrapper = _video_wrapper_te(JointDecoderConfig(max_text_len=8), frames=4).to(DEVICE).eval()
         with torch.no_grad():
             wrapper.frame_time_embed.proj.weight.normal_(std=0.1)
         pixels = torch.randn(1, 4, 3, 16, 16, device=DEVICE)
@@ -694,8 +729,42 @@ class TestVideoFrameTimes:
             l2, _ = wrapper(pixels, input_ids, frame_times=t2)
         assert not torch.allclose(l1, l2)
 
+    def test_post_step_adds_time_to_prefix_and_image_fields(self):
+        # The decoupled post-step adds time onto whichever visual field the
+        # context set: prefix_embeds (image-prefix archs) OR image_features
+        # (Cross-Attention). Exercise both branches directly, arch-agnostic.
+        from kempnerforge.model.frame_time import FrameTimeEmbedding
+        from kempnerforge.model.vlm import _apply_frame_time_embedding
+
+        embed = FrameTimeEmbedding(dim=8)
+        with torch.no_grad():
+            embed.proj.weight.normal_(std=0.1)  # off zero-init so it has an effect
+        f, pprime, dim = 2, 3, 8
+        viz = torch.randn(1, f * pprime, dim)
+        ft = torch.tensor([[0.0, 10.0]])
+        for field in ("prefix_embeds", "image_features"):
+            ctx = ModalityContext(**{field: viz})
+            out = _apply_frame_time_embedding(ctx, embed, ft, frames_per_clip=f)
+            got = getattr(out, field)
+            assert got.shape == viz.shape
+            assert not torch.allclose(got, viz)
+
+    def test_post_step_rejects_indivisible_token_count(self):
+        # A visual token count not divisible by frames_per_clip (a future
+        # non-per-frame token) fails loudly, not with a cryptic reshape error.
+        from kempnerforge.model.frame_time import FrameTimeEmbedding
+        from kempnerforge.model.vlm import _apply_frame_time_embedding
+
+        embed = FrameTimeEmbedding(dim=8)
+        viz = torch.randn(1, 7, 8)  # 7 tokens with frames_per_clip=2 -> not divisible
+        ft = torch.tensor([[0.0, 1.0]])
+        with pytest.raises(ValueError, match="multiple of frames"):
+            _apply_frame_time_embedding(
+                ModalityContext(prefix_embeds=viz), embed, ft, frames_per_clip=2
+            )
+
     def test_frame_times_shape_mismatch_raises(self):
-        wrapper = _video_wrapper(JointDecoderConfig(max_text_len=8), frames=4).to(DEVICE)
+        wrapper = _video_wrapper_te(JointDecoderConfig(max_text_len=8), frames=4).to(DEVICE)
         pixels = torch.randn(2, 4, 3, 16, 16, device=DEVICE)
         input_ids = torch.randint(0, 256, (2, 6), device=DEVICE)
         bad = torch.zeros(2, 3, device=DEVICE)  # F=3 != frames_per_clip=4
@@ -704,28 +773,18 @@ class TestVideoFrameTimes:
 
     def test_time_embedding_none_disables_for_video(self):
         # Registry "none" => no temporal module even for video (frames_per_clip>1).
-        from kempnerforge.config.time_embedding import TimeEmbeddingConfig
-
-        mc = ModelConfig(dim=64, n_layers=2, n_heads=4, vocab_size=256, max_seq_len=64)
-        vc = VisionEncoderConfig(type="random", feature_dim=96, num_tokens=16)
-        ac = AdapterConfig(type="avgpool", pool_window=2)
-        wrapper = build_vlm_wrapper(
-            mc,
-            vc,
-            ac,
+        wrapper = _video_wrapper(
             JointDecoderConfig(max_text_len=8),
-            frames_per_clip=4,
+            frames=4,
             time_embedding_config=TimeEmbeddingConfig(type="none"),
         )
         assert wrapper.frame_time_embed is None
 
     def test_frame_time_embed_state_dict_round_trips(self):
-        # The default-on time embedding adds frame_time_embed.proj.* keys to
-        # every video checkpoint; pin that they serialize and reload with a
-        # bit-equal forward (the per-arch state_dict round-trip invariant,
-        # extended to the video model). Move the projection off zero-init first
-        # so the round-trip is not trivially comparing zeros.
-        wrapper = _video_wrapper(JointDecoderConfig(max_text_len=8), frames=4).to(DEVICE).eval()
+        # When configured, the embedding adds frame_time_embed.proj.* keys; pin
+        # that they serialize and reload with a bit-equal forward. Move the
+        # projection off zero-init first so it is not comparing zeros.
+        wrapper = _video_wrapper_te(JointDecoderConfig(max_text_len=8), frames=4).to(DEVICE).eval()
         with torch.no_grad():
             wrapper.frame_time_embed.proj.weight.normal_(std=0.1)
             wrapper.frame_time_embed.proj.bias.normal_(std=0.1)
@@ -739,7 +798,7 @@ class TestVideoFrameTimes:
         assert "frame_time_embed.proj.weight" in state
         assert "frame_time_embed.proj.bias" in state
 
-        restored = _video_wrapper(JointDecoderConfig(max_text_len=8), frames=4).to(DEVICE).eval()
+        restored = _video_wrapper_te(JointDecoderConfig(max_text_len=8), frames=4).to(DEVICE).eval()
         restored.load_state_dict(state)
         assert torch.equal(
             restored.frame_time_embed.proj.weight, wrapper.frame_time_embed.proj.weight
@@ -751,19 +810,14 @@ class TestVideoFrameTimes:
     def test_frame_time_embed_is_freeze_addressable(self):
         # frame_time_embed is an injected sibling submodule (like the adapter),
         # so a freeze spec must be able to target it — warm-start staging recipes
-        # freeze it while the LLM warms up. The base module_patterns alias makes
-        # it clear the effective_freeze typo-guard and lets apply_freeze_specs
-        # match its params.
-        from kempnerforge.config.vlm import FreezeSpec
+        # freeze it while the LLM warms up.
         from kempnerforge.training.freeze import apply_freeze_specs, effective_freeze
 
         vlm_cfg = JointDecoderConfig(max_text_len=8)
-        wrapper = _video_wrapper(vlm_cfg, frames=4)
+        wrapper = _video_wrapper_te(vlm_cfg, frames=4)
         assert wrapper.frame_time_embed is not None
-        # (a) the alias clears the train.py typo-guard (pre-fix this raised).
         valid = set(vlm_cfg.module_patterns.keys())
         specs = effective_freeze(0, [FreezeSpec("frame_time_embed", True)], [], valid)
-        # (b) applying it actually freezes the projection params.
         apply_freeze_specs(wrapper, specs, vlm_cfg.module_patterns)
         assert not wrapper.frame_time_embed.proj.weight.requires_grad
         assert not wrapper.frame_time_embed.proj.bias.requires_grad

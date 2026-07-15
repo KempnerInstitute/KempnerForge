@@ -25,14 +25,19 @@ A clip of `F` frames becomes `F × P′` visual tokens:
      blocks; the residual stays text-only (so it fits more frames per
      `max_seq_len`).
 
-Temporal order is carried by frame order (sequential positions). On top of that,
-each frame's **timestamp in seconds** is embedded and added to that frame's
+Temporal order is carried by frame order (sequential positions). **Optionally**,
+each frame's **timestamp in seconds** can be embedded and added to that frame's
 visual tokens, so the model sees *when* each frame occurs, not just its order.
-The embedding is registry-driven: `[time_embedding].type` selects it
-(`sinusoidal` by default — sinusoidal features at log-spaced periods through a
-zero-initialized projection; `none` disables it), so new techniques (learned,
-Fourier, …) register as small additions and switch via config. Grounding
-outputs are a separate follow-up (see below).
+This is **opt-in**: add a `[time_embedding]` section to enable it (within the
+section `type` defaults to `sinusoidal` — sinusoidal features at log-spaced
+periods through a zero-initialized projection; `type = "none"` disables it).
+With **no `[time_embedding]` section (the default) no embedding is built**, and
+the model is identical to one with no timestamps at all. It is fully decoupled —
+added as a self-contained post-step in `VLMWrapper.forward`, so the fusion
+strategies and the transformer backbone never see `frame_times` — and
+registry-driven, so new techniques (learned, Fourier, …) register as small
+additions and switch via config. Grounding outputs are a separate follow-up
+(see below).
 
 ## Token budget
 
@@ -117,10 +122,12 @@ time, so it is set in the TOML, not via a `--vlm.arch=` CLI override.)
   learned temporal signal if `frame_times` is `None` (no error is raised).
   Training threads it automatically; eval/generate paths must pass it for video
   models.
-- **Resuming a pre-timestamp video checkpoint** — a checkpoint trained before
-  per-frame timestamps lacks the `frame_time_embed` keys, so loading it into the
-  current (default-on) video model needs `[time_embedding].type = "none"` or a
-  warm-start key-fill.
+- **Checkpoint compatibility** — because the time embedding is opt-in (off by
+  default), a default video model has no `frame_time_embed` parameters and loads
+  pre-timestamp checkpoints unchanged. As for any component, config must match
+  the checkpoint: a checkpoint trained *with* a `[time_embedding]` section must
+  be resumed/evaluated with the same section, and one trained without must not
+  add one (a mismatch fails the strict load, exactly like changing the adapter).
 - **Padded frames are masked from attention** — short/undecodable clips pad to
   `max_frames` with blank frames, and the `frame_mask` is consumed so real
   tokens never attend to padded-frame visual tokens (MoMa also drops them from
