@@ -8,7 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-
+- **Ragged grids in `attentional_pool`.** The `attentional_pool` connector now pools ragged patch grids (grid not divisible by the window) instead of rejecting them: each partial edge window pools only its real patches via a masked attention (matching `avgpool`). This lets any window size pool a grid it does not evenly divide (e.g. a 3×3 window on a 14×14 patch grid, since `14 % 3 != 0`), which previously had to fall back to `avgpool` or a divisible window. `output_num_tokens` is `ceil(grid/window)²`; divisible grids are bit-exact with before (no mask is built).
+  - `kempnerforge/model/adapter.py`: `AttentionalPoolAdapter.forward` pads the bottom/right edges and masks padded patches out of each edge window's K/V (with a masked-mean query). Every pooling connector now handles ragged grids — there is no divisible-only rejection path.
+  - Tests: `tests/unit/test_adapter.py` — ragged token count, masked edge-window correctness (a 1-real-patch window equals attention over that patch), config accepts ragged.
 - **Decoupled attention head dim, an optional adapter pre-norm, and weights-only warm-start.** Small, model-agnostic additions to core, reusable by any config:
   - `kempnerforge/config/model.py`: `ModelConfig.head_dim` is now an overridable field (`int`, `0` → `dim // n_heads`; was a computed property), decoupling the attention width so `n_heads * head_dim` need not equal `dim`. The default preserves the `dim // n_heads` coupling; `dim % n_heads == 0` is required only when the head dim is inferred.
   - `kempnerforge/model/adapter.py`: the `mlp_2layer` connector gains an optional `pre_norm` — a pre-projection normalization over the vision features (exposed as `ln_q`), chosen by norm-registry key (`rmsnorm` / `layernorm`). Off by default, so existing `mlp_2layer` configs are unchanged.
