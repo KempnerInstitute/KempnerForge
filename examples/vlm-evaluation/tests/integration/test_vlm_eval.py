@@ -36,7 +36,7 @@ if getattr(lmms_eval, "__file__", None) is None:
     pytest.skip("fake lmms_eval is active; skipping real-package tests", allow_module_level=True)
 
 from adapter import KempnerForgeVLM  # noqa: E402
-from lmms_eval.api.instance import Instance  # noqa: E402
+from lmms_eval.api.instance import GenerationResult, Instance  # noqa: E402
 
 from kempnerforge.config.data import DataConfig  # noqa: E402
 from kempnerforge.config.schema import JobConfig  # noqa: E402
@@ -110,8 +110,9 @@ def test_dcp_roundtrip_generate_until(tmp_path, tiny_vlm_configs, monkeypatch):
 
     outputs = vlm.generate_until(instances)
     assert isinstance(outputs, list) and len(outputs) == 2
-    assert all(isinstance(o, str) for o in outputs)
-    assert all(len(o.split()) == 3 for o in outputs)  # greedy emits exactly max_new_tokens
+    assert all(isinstance(o, GenerationResult) for o in outputs)
+    assert all(len(o.text.split()) == 3 for o in outputs)  # greedy emits exactly max_new_tokens
+    assert all(o.token_counts.output_tokens == 3 for o in outputs)  # per-sample output count
 
 
 def test_dcp_roundtrip_video_generate_until(tmp_path, tiny_video_configs, monkeypatch):
@@ -177,8 +178,9 @@ def test_dcp_roundtrip_video_generate_until(tmp_path, tiny_video_configs, monkey
 
     outputs = vlm.generate_until(instances)
     assert isinstance(outputs, list) and len(outputs) == 2
-    assert all(isinstance(o, str) for o in outputs)
-    assert all(len(o.split()) == 3 for o in outputs)  # greedy emits exactly max_new_tokens
+    assert all(isinstance(o, GenerationResult) for o in outputs)
+    assert all(len(o.text.split()) == 3 for o in outputs)  # greedy emits exactly max_new_tokens
+    assert all(o.token_counts.output_tokens == 3 for o in outputs)  # per-sample output count
 
 
 @pytest.mark.skipif(

@@ -19,8 +19,18 @@ if getattr(lmms_eval, "__file__", None) is None:
         "fake lmms_eval is active; skipping real-package contract tests", allow_module_level=True
     )
 
-from lmms_eval.api.instance import Instance  # noqa: E402
+from lmms_eval.api.instance import (  # noqa: E402
+    GenerationResult,
+    Instance,
+    TokenCounts,
+    unwrap_generation_output,
+)
 from lmms_eval.api.model import lmms  # noqa: E402
+from lmms_eval.models.model_utils.gen_metrics import (  # noqa: E402
+    log_metrics,
+    reset_logged_metrics,
+    summarize_logged_metrics,
+)
 from lmms_eval.protocol import ChatMessages  # noqa: E402
 from lmms_eval.utils import Collator  # noqa: E402
 
@@ -90,3 +100,34 @@ class TestInstanceContract:
             metadata={"task": "t", "doc_id": "d0", "repeats": 1},
         )
         assert inst.args == ("ctx", None, {}, "d0", "t", "test")
+
+
+class TestGenerationResultContract:
+    """Pins the typed generate_until return + per-sample token counters the adapter now emits."""
+
+    def test_generation_result_and_token_counts_fields(self):
+        gr = GenerationResult(text="a b c", token_counts=TokenCounts(output_tokens=3))
+        assert gr.text == "a b c"
+        assert gr.token_counts.output_tokens == 3
+        # to_dict drops None fields — the shape build_efficiency_summary consumes.
+        assert gr.token_counts.to_dict() == {"output_tokens": 3}
+
+    def test_unwrap_generation_output_handles_str_and_wrapper(self):
+        text, tc = unwrap_generation_output(
+            GenerationResult(text="x", token_counts=TokenCounts(output_tokens=1))
+        )
+        assert text == "x" and tc.output_tokens == 1
+        # A bare string (the pre-instrumentation return) unwraps to (text, None).
+        assert unwrap_generation_output("plain") == ("plain", None)
+
+
+class TestGenMetricsContract:
+    """Pins the throughput sink the adapter calls; the evaluator resets/summarizes this."""
+
+    def test_log_metrics_feeds_summary(self):
+        reset_logged_metrics()
+        log_metrics(total_elapsed_time=2.0, total_gen_tokens=10, avg_speed=5.0)
+        summary = summarize_logged_metrics()
+        assert summary["total_gen_tokens"] == 10
+        assert summary["total_elapsed_time"] == 2.0
+        reset_logged_metrics()

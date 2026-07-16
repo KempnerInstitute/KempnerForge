@@ -61,13 +61,15 @@ v1 scope and deliberate choices (see README.md in this directory):
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import Any
 
 import torch
 import torch.distributed.checkpoint as dcp
-from lmms_eval.api.instance import Instance
+from lmms_eval.api.instance import GenerationResult, Instance, TokenCounts
 from lmms_eval.api.model import lmms
+from lmms_eval.models.model_utils.gen_metrics import log_metrics
 from lmms_eval.protocol import ChatMessages
 from lmms_eval.utils import Collator
 from tqdm import tqdm
@@ -425,8 +427,9 @@ def _generate_batch(
     resolved: dict[str, Any],
     max_seq_len: int,
     frame_mask: torch.Tensor | None = None,
-) -> list[str]:
-    """Batched decode (no transformer KV cache); returns one continuation per request.
+) -> tuple[list[str], list[int]]:
+    """Batched decode (no transformer KV cache); returns one continuation per request
+    plus its generated token count.
 
     Decodes ``B`` requests together (``pixel_values`` is ``(B, 3, H, W)`` or a
     ``(B, F, 3, H, W)`` video clip, ``prompt_ids`` a list of ``B`` 1-D token
@@ -523,7 +526,8 @@ def _generate_batch(
         text = tokenizer.decode(tokens, skip_special_tokens=True)
         cut = _first_stop(text, until)
         outputs.append(text[:cut] if cut is not None else text)
-    return outputs
+    gen_counts = [len(g) for g in generated]
+    return outputs, gen_counts
 
 
 # --------------------------------------------------------------------------- #
@@ -609,9 +613,10 @@ class KempnerForgeVLM(lmms):
         resolved: dict[str, Any],
         frame_mask: torch.Tensor | None,
         task_name: str,
-    ) -> list[str]:
+    ) -> tuple[list[str], list[int]]:
         """Decode one homogeneous sub-batch (all-visual, or all-text-only with
-        ``pixel_values=None``), returning one continuation per prompt.
+        ``pixel_values=None``), returning one continuation per prompt and its
+        generated token count.
 
         A ``_ContextBudgetError`` (the task's gen_kwargs over-budget the context;
         every request here shares gen_kwargs) is isolated to this sub-batch as empty
@@ -629,9 +634,9 @@ class KempnerForgeVLM(lmms):
             )
         except _ContextBudgetError as exc:
             logger.warning(f"Skipping {len(prompts)} request(s) for task {task_name}: {exc}")
-            return [""] * len(prompts)
+            return [""] * len(prompts), [0] * len(prompts)
 
-    def generate_until(self, requests: list[Instance]) -> list[str]:
+    def generate_until(self, requests: list[Instance]) -> list[GenerationResult]:
         # Group requests by gen_kwargs (a batch must share decode params) and,
         # within a group, sort by context length so similar-length prompts batch
         # together (less padding). Collator.get_original restores request order.
@@ -644,7 +649,9 @@ class KempnerForgeVLM(lmms):
             group_fn=lambda args: args[2],  # args[2] == gen_kwargs
             grouping=True,
         )
-        results: list[str] = []
+        results: list[GenerationResult] = []
+        total_gen_tokens = 0
+        decode_elapsed = 0.0
         pbar = tqdm(total=len(requests), disable=(self.rank != 0), desc="KempnerForge VLM")
         for chunk in re_ords.get_batched(n=self._batch_size, batch_fn=None):
             # Every request in the chunk shares gen_kwargs (index 2); resolve once.
@@ -653,6 +660,8 @@ class KempnerForgeVLM(lmms):
             # below; ``""`` = a request that failed to render/preprocess, isolated
             # with a warning so one bad doc does not abort the whole run.
             chunk_outputs: list[str | None] = [None] * len(chunk)
+            # Parallel per-slot generated token counts (``None`` until filled).
+            chunk_counts: list[int | None] = [None] * len(chunk)
             # A chunk shares gen_kwargs but may now mix visual and text-only requests,
             # which cannot share one pixel_values tensor — decode them as two
             # sub-batches, each tagged by its original slot for order-preserving scatter.
@@ -708,6 +717,7 @@ class KempnerForgeVLM(lmms):
                         f"{type(exc).__name__}: {exc}"
                     )
                     chunk_outputs[slot] = ""
+                    chunk_counts[slot] = 0
                     continue
                 # Commit atomically (only reached on full success), routed by modality:
                 # a text-only request (pixels is None) goes to the text-only sub-batch.
@@ -731,24 +741,42 @@ class KempnerForgeVLM(lmms):
                 else:
                     pixel_values = torch.cat(vis_frames, dim=0)
                     frame_mask = None
-                vis_outputs = self._decode_subbatch(
+                _t = time.perf_counter()
+                vis_outputs, vis_counts = self._decode_subbatch(
                     pixel_values, vis_prompts, resolved, frame_mask, chunk[0][4]
                 )
-                for s, o in zip(vis_slots, vis_outputs, strict=True):
+                decode_elapsed += time.perf_counter() - _t
+                for s, o, c in zip(vis_slots, vis_outputs, vis_counts, strict=True):
                     chunk_outputs[s] = o
+                    chunk_counts[s] = c
             if txt_prompts:
-                txt_outputs = self._decode_subbatch(None, txt_prompts, resolved, None, chunk[0][4])
-                for s, o in zip(txt_slots, txt_outputs, strict=True):
+                _t = time.perf_counter()
+                txt_outputs, txt_counts = self._decode_subbatch(
+                    None, txt_prompts, resolved, None, chunk[0][4]
+                )
+                decode_elapsed += time.perf_counter() - _t
+                for s, o, c in zip(txt_slots, txt_outputs, txt_counts, strict=True):
                     chunk_outputs[s] = o
+                    chunk_counts[s] = c
 
             # Every surviving slot is now filled (a continuation, or "" for a skipped
             # or over-budget request), preserving alignment with ``chunk``.
-            for args, output in zip(chunk, chunk_outputs, strict=True):
-                out = output if output is not None else ""
-                results.append(out)
-                self.cache_hook.add_partial("generate_until", (args[0], args[2]), out)
+            for args, output, count in zip(chunk, chunk_outputs, chunk_counts, strict=True):
+                text = output if output is not None else ""
+                n_tok = count if count is not None else 0
+                total_gen_tokens += n_tok
+                results.append(
+                    GenerationResult(text=text, token_counts=TokenCounts(output_tokens=n_tok))
+                )
+                self.cache_hook.add_partial("generate_until", (args[0], args[2]), text)
             pbar.update(len(chunk))
         pbar.close()
+        avg_speed = total_gen_tokens / decode_elapsed if decode_elapsed > 0 else 0.0
+        log_metrics(
+            total_elapsed_time=decode_elapsed,
+            total_gen_tokens=total_gen_tokens,
+            avg_speed=avg_speed,
+        )
         return re_ords.get_original(results)
 
     def loglikelihood(self, requests: list[Instance]) -> list[tuple[float, bool]]:
