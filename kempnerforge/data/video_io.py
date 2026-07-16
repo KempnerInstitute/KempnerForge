@@ -3,8 +3,8 @@
 A clip is reduced to an ordered set of still frames that the VLM pipeline
 treats like a sequence of images. Two concerns live here:
 
-1. ``sample_timestamps`` — *which* timestamps to sample. This is the policy
-   from the Molmo2 paper (§3.1, §A): sample at a target frame-rate ``fps``,
+1. ``sample_timestamps`` — *which* timestamps to sample. The policy is to
+   sample at a target frame-rate ``fps``,
    cap the total at ``max_frames`` (uniformly subsampling longer clips), and
    always include the first and last frame. Sampling is expressed in
    *seconds* rather than frame indices so it is robust to variable-fps video.
@@ -39,7 +39,7 @@ def sample_timestamps(
 ) -> list[float]:
     """Timestamps (seconds) to sample from a clip of length ``duration_s``.
 
-    Policy (Molmo2 §3.1/§A): aim for ``fps`` frames per second, clamp the
+    Policy: aim for ``fps`` frames per second, clamp the
     count to ``[min_frames, max_frames]``, and lay the samples out uniformly
     over ``[0, duration_s]`` so the first frame (``0.0``) and last frame
     (``duration_s``) are always included. A non-positive duration (unknown or

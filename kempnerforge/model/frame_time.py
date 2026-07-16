@@ -4,7 +4,7 @@ A video clip enters the model as ``F`` frames in temporal order, but frame
 *order* alone does not tell the model *when* each frame occurs: an 8-frame clip
 spanning 2 seconds and one spanning 2 minutes both map to frame indices 0..7.
 ``FrameTimeEmbedding`` injects the actual per-frame timestamp (seconds) so the
-model can reason about elapsed time (Molmo2-style temporal grounding).
+model can reason about *when* each frame occurs, not just its order.
 
 The timestamp is expanded into sinusoidal features at log-spaced periods (à la
 Transformer positional encodings, but over continuous seconds rather than
@@ -45,7 +45,7 @@ class TimeEmbedding(nn.Module):
     registry.
 
     Out of scope (a separate, future integration point): sequence-*modifying*
-    time encodings — e.g. Molmo2-style textual time-tokens interleaved between
+    time encodings — e.g. textual time-tokens interleaved between
     frame groups — change the token sequence (count / ``output_slice`` /
     ``modality_ids`` / MoT split) and need tokenizer + interleaved-sequence
     support KF does not have yet. Those would hook the sequence-assembly layer

@@ -1,7 +1,7 @@
 # Video VLM training on WebVid-10M (Joint-Decoder).
 #
 # A clip is decoded into `max_frames` frames (sampled by timestamp at `fps`,
-# Molmo2-style: uniform, first + last frame kept), each encoded by the vision
+# uniform, first + last frame kept), each encoded by the vision
 # tower, pooled by the connector, and prepended to the caption tokens. The LLM
 # is trained from scratch here; warm-starting from a pretrained backbone is a
 # later phase.

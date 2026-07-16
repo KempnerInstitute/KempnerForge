@@ -84,7 +84,7 @@ The dataset side is **pluggable**: `dataset_type` selects a builder from the
 `video_dataset` registry (`"webvid"` ships; other styles — HuggingFace video
 sets, flat folders, alternate manifests — register as small follow-ups and are
 selected here), and `sampling_policy` selects a registered frame-sampling policy
-(`"uniform"` = the Molmo2 default). The WebVid corpus directory is parameterized
+(`"uniform"` is the default). The WebVid corpus directory is parameterized
 by `dataset_name`, so any WebVid-style dataset works, not just `webvid-10M`:
 CSV manifests under `raw/<dataset_name>/data/<split>/partitions/` and `.mp4`
 files under `raw/videos/<split>/`.
@@ -117,7 +117,7 @@ time, so it is set in the TOML, not via a `--vlm.arch=` CLI override.)
   / track-J&F eval) is not yet implemented.
 - **Sequence-modifying time encodings are a separate hook** — the
   `[time_embedding]` registry is for *additive* per-frame embeddings (no change
-  to sequence length). Molmo2-style interleaved text time-tokens change the
+  to sequence length). Interleaved text time-tokens change the
   token sequence and need interleaved/variable-length sequence support KF does
   not have yet; they would hook the sequence-assembly layer, not this registry.
 - **Inference must pass `frame_times`** — a video model silently drops the
