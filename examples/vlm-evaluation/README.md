@@ -81,6 +81,38 @@ automatically) or a specific `step_N` directory.
 There is **no default task suite** — `--tasks` is required. A representative
 default benchmark set is still being decided.
 
+## Multi-GPU (data parallel)
+
+A single benchmark can be **data-parallelized across GPUs**: launch the harness with
+`accelerate launch --num_processes N` and lmms-eval shards the benchmark's documents
+`[rank::world_size]` across the N processes, gathering results onto rank 0. Each rank loads a
+**full replica** of the model on its own GPU, so throughput scales ~N× with identical scores.
+`accelerate` ships with lmms-eval, so there is nothing extra to install.
+
+```bash
+accelerate launch --num_processes 4 examples/vlm-evaluation/vlm_eval_harness.py \
+    --config     configs/train/vlm_jd.toml \
+    --checkpoint checkpoints/vlm/step_10000 \
+    --tasks      mmmu_val \
+    --output     results/vlm_step_10000.json
+```
+
+- **No new flags.** DP is entirely launcher-driven — the adapter auto-detects the run from the
+  `WORLD_SIZE` / `LOCAL_RANK` environment variables the launcher sets and binds each rank to
+  `cuda:LOCAL_RANK`. Plain `uv run python vlm_eval_harness.py …` (no launcher) is unchanged
+  single-GPU.
+- **Pass `--device cuda` without an index.** Per-rank GPU binding triggers only on the bare
+  `cuda`; an explicit `--device cuda:0` would pin *every* rank to GPU 0.
+- **Replication, not model-parallel.** Every rank holds a full copy, so aggregate GPU memory is
+  N× — the model must fit on one GPU. Sharded inference for larger models is separate future
+  work (see [Limitations](#limitations)).
+- **`--limit N` stays a global cap** (the per-rank shards union to `N` docs total); `--batch-size`
+  is per rank.
+- **Only rank 0 writes** the `--output` JSON; the other ranks score their shard and exit.
+- On the Kempner cluster, request the GPUs in your allocation (`--gres=gpu:N` on one node) and keep
+  the same `LD_LIBRARY_PATH` / `HF_HOME` environment as a single-GPU run (see
+  [Cluster environment notes](#cluster-environment-notes)).
+
 ## Flags
 
 | Flag | Default | Purpose |
@@ -155,10 +187,11 @@ uv run python examples/vlm-evaluation/vlm_eval_harness.py \
 
 Several are tracked follow-ups.
 
-- **Single GPU.** v1 runs on one GPU. Data-parallel
-  multi-GPU is a localized
-  future addition; sharded/model-parallel inference for models too large for one
-  GPU is a larger, separate effort.
+- **Data parallel, replicated.** Multi-GPU runs shard the benchmark's documents across GPUs
+  via `accelerate launch --num_processes N` (see
+  [Multi-GPU (data parallel)](#multi-gpu-data-parallel)); each rank holds a **full replica** of
+  the model. Sharded / model-parallel inference for models too large for a single GPU is a
+  larger, separate effort.
 - **MoMa is not supported.** The `moma` arch uses non-causal expert-choice
   routing and cannot autoregressively generate, but eval tasks are
   generation-only. A MoMa checkpoint fails fast with a clear error. Joint-Decoder

@@ -10,6 +10,8 @@ real checkpoint, no network. Real-package fidelity is pinned by the gated contra
 from __future__ import annotations
 
 import json
+import sys
+import types
 
 import pytest
 import torch
@@ -875,6 +877,105 @@ class TestInitGuards:
         _patch_loaders(monkeypatch, _vlm_job_config(tiny_vlm_configs), tiny_vlm_wrapper)
         vlm = KempnerForgeVLM(config="x", checkpoint="y", device="cpu", dtype="float16")
         assert vlm._dtype == torch.float16
+
+
+# ---------------------------------------------------------------------------
+# Data-parallel (multi-GPU) wiring
+# ---------------------------------------------------------------------------
+
+
+def _install_fake_accelerate(monkeypatch, process_index=0, num_processes=2) -> dict:
+    """Inject a stub ``accelerate`` so the adapter's lazy
+    ``from accelerate import Accelerator, InitProcessGroupKwargs`` resolves to a fake that
+    never initializes a real process group (the real ``Accelerator`` would try to reach NCCL
+    and hang). Returns a dict capturing the ``Accelerator`` constructor kwargs.
+    """
+    captured: dict = {}
+
+    class _FakeAccelerator:
+        def __init__(self, kwargs_handlers=None):
+            captured["kwargs_handlers"] = kwargs_handlers
+            self.process_index = process_index
+            self.num_processes = num_processes
+            self.local_process_index = process_index
+
+    class _FakeInitProcessGroupKwargs:
+        def __init__(self, timeout=None):
+            self.timeout = timeout
+
+    fake = types.ModuleType("accelerate")
+    fake.Accelerator = _FakeAccelerator  # type: ignore[attr-defined]
+    fake.InitProcessGroupKwargs = _FakeInitProcessGroupKwargs  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "accelerate", fake)
+    return captured
+
+
+class TestDataParallelWiring:
+    """DP multi-GPU wiring, exercised hermetically on CPU: the launcher env is faked with
+    ``monkeypatch`` and a stub ``accelerate.Accelerator`` replaces the real one (which would
+    initialize a live process group and hang). Mirrors ``TestInitGuards``.
+    """
+
+    def test_multi_process_env_sets_rank_world_and_accelerator(
+        self, monkeypatch, tiny_vlm_configs, tiny_vlm_wrapper
+    ):
+        _patch_loaders(monkeypatch, _vlm_job_config(tiny_vlm_configs), tiny_vlm_wrapper)
+        captured = _install_fake_accelerate(monkeypatch, process_index=1, num_processes=2)
+        monkeypatch.setenv("WORLD_SIZE", "2")
+        monkeypatch.setenv("LOCAL_RANK", "1")
+        # device="cpu" keeps the test off CUDA; the Accelerator block is gated on WORLD_SIZE,
+        # not device, so rank/world_size/accelerator still populate from the fake.
+        vlm = KempnerForgeVLM(config="x", checkpoint="y", device="cpu", dtype="float32")
+        # rank must be the GLOBAL process_index: the evaluator indexes gathered_item[lm.rank].
+        assert vlm._rank == 1 and vlm.rank == 1
+        assert vlm._world_size == 2 and vlm.world_size == 2
+        assert isinstance(vlm.accelerator, sys.modules["accelerate"].Accelerator)
+        # The long-timeout InitProcessGroupKwargs handler is passed through to the Accelerator.
+        assert captured["kwargs_handlers"] is not None and len(captured["kwargs_handlers"]) == 1
+
+    def test_multi_process_cuda_binds_local_rank_device(
+        self, monkeypatch, tiny_vlm_configs, tiny_vlm_wrapper
+    ):
+        # device="cuda" + WORLD_SIZE>1 pins this replica to cuda:LOCAL_RANK. No CUDA is
+        # touched: torch.device is a descriptor and _load_weights is patched to a no-op.
+        _patch_loaders(monkeypatch, _vlm_job_config(tiny_vlm_configs), tiny_vlm_wrapper)
+        _install_fake_accelerate(monkeypatch, process_index=1, num_processes=2)
+        monkeypatch.setenv("WORLD_SIZE", "2")
+        monkeypatch.setenv("LOCAL_RANK", "1")
+        vlm = KempnerForgeVLM(config="x", checkpoint="y", device="cuda", dtype="float32")
+        assert vlm._device == torch.device("cuda:1")
+        assert vlm.device == torch.device("cuda:1")  # the new property
+
+    def test_device_property_returns_underlying_device(
+        self, monkeypatch, tiny_vlm_configs, tiny_vlm_wrapper
+    ):
+        _patch_loaders(monkeypatch, _vlm_job_config(tiny_vlm_configs), tiny_vlm_wrapper)
+        vlm = KempnerForgeVLM(config="x", checkpoint="y", device="cpu", dtype="float32")
+        assert vlm.device is vlm._device
+        assert vlm.device == torch.device("cpu")
+
+    def test_single_process_unchanged_no_accelerate(
+        self, monkeypatch, tiny_vlm_configs, tiny_vlm_wrapper
+    ):
+        # No launcher env -> the adapter must NOT import/construct an Accelerator, and
+        # rank/world_size/device keep the single-GPU defaults. A booby-trapped stub proves the
+        # accelerate path is never taken.
+        monkeypatch.delenv("WORLD_SIZE", raising=False)
+        monkeypatch.delenv("LOCAL_RANK", raising=False)
+        boom = types.ModuleType("accelerate")
+
+        def _explode(*args, **kwargs):
+            raise AssertionError("Accelerator must not be constructed in single-process mode")
+
+        boom.Accelerator = _explode  # type: ignore[attr-defined]
+        boom.InitProcessGroupKwargs = _explode  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "accelerate", boom)
+        _patch_loaders(monkeypatch, _vlm_job_config(tiny_vlm_configs), tiny_vlm_wrapper)
+        vlm = KempnerForgeVLM(config="x", checkpoint="y", device="cpu", dtype="float32")
+        assert vlm._rank == 0 and vlm.rank == 0
+        assert vlm._world_size == 1 and vlm.world_size == 1
+        assert vlm._device == torch.device("cpu")
+        assert not hasattr(vlm, "accelerator")
 
 
 # ---------------------------------------------------------------------------

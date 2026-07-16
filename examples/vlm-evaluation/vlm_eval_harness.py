@@ -115,8 +115,11 @@ def main() -> None:
         sys.exit(1)
 
     # The adapter imports lmms-eval at module top; the guard above already proved
-    # it importable. The script's own directory is sys.path[0], so the sibling
-    # adapter.py resolves as a top-level module.
+    # it importable. The script's own directory is normally sys.path[0], so the sibling
+    # adapter.py resolves as a top-level module — but under `accelerate launch` the launcher
+    # may run this file such that sys.path[0] is not its directory, so insert it explicitly
+    # so `from adapter import ...` resolves on every rank.
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
     from adapter import KempnerForgeVLM
 
     logger.info(f"Running lmms-eval: tasks={args.tasks}, checkpoint={args.checkpoint}")
@@ -150,27 +153,31 @@ def main() -> None:
         cli_args=cli_args,
     )
 
-    # --- Print results ---
-    print(f"\n{'=' * 60}")
-    print("lmms-eval Results")
-    print(f"{'=' * 60}")
-    if results is not None and "results" in results:
-        for task_name, task_results in sorted(results["results"].items()):
-            print(f"\n  {task_name}:")
-            for metric, value in sorted(task_results.items()):
-                if isinstance(value, float):
-                    print(f"    {metric}: {value:.4f}")
-                elif metric != "alias":
-                    print(f"    {metric}: {value}")
-    print(f"{'=' * 60}\n")
+    # Only rank 0 holds the aggregated results (simple_evaluate returns None on non-zero
+    # ranks); every other DP rank must skip reporting so it does not print an empty banner,
+    # dump `None` to --output, or race on the same file. Single-process: rank 0.
+    if model.rank == 0:
+        # --- Print results ---
+        print(f"\n{'=' * 60}")
+        print("lmms-eval Results")
+        print(f"{'=' * 60}")
+        if results is not None and "results" in results:
+            for task_name, task_results in sorted(results["results"].items()):
+                print(f"\n  {task_name}:")
+                for metric, value in sorted(task_results.items()):
+                    if isinstance(value, float):
+                        print(f"    {metric}: {value:.4f}")
+                    elif metric != "alias":
+                        print(f"    {metric}: {value}")
+        print(f"{'=' * 60}\n")
 
-    # --- Save results ---
-    if args.output:
-        output_path = Path(args.output)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(output_path, "w") as f:
-            json.dump(results, f, indent=2, default=str)
-        logger.info(f"Results saved to {output_path}")
+        # --- Save results ---
+        if args.output:
+            output_path = Path(args.output)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(output_path, "w") as f:
+                json.dump(results, f, indent=2, default=str)
+            logger.info(f"Results saved to {output_path}")
 
 
 if __name__ == "__main__":
