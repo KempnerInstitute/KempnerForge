@@ -292,13 +292,24 @@ def _mlflow_databricks_ready() -> bool:
 
 def _resolve_mlflow_experiment(config: MetricsConfig, uri: str) -> str | None:
     """Experiment name: mlflow_experiment -> $MLFLOW_EXPERIMENT -> auto
-    (/Users/<user>/<project> via the SDK on Databricks; bare name locally)."""
+    (/Users/<user>/<project> via the SDK on Databricks; bare name locally).
+
+    On Databricks a non-absolute $MLFLOW_EXPERIMENT raises, mirroring the
+    MetricsConfig.__post_init__ guard on the config field.
+    """
+    on_databricks = uri.startswith("databricks")
     if config.mlflow_experiment:
-        return config.mlflow_experiment
-    if os.environ.get("MLFLOW_EXPERIMENT"):
-        return os.environ["MLFLOW_EXPERIMENT"]
+        return config.mlflow_experiment  # validated in MetricsConfig.__post_init__
+    env_experiment = os.environ.get("MLFLOW_EXPERIMENT")
+    if env_experiment:
+        if on_databricks and not env_experiment.startswith("/"):
+            raise ValueError(
+                "$MLFLOW_EXPERIMENT must be an absolute workspace path on Databricks "
+                f"(e.g. '/Users/you@example.com/proj'); got {env_experiment!r}"
+            )
+        return env_experiment
     project = config.wandb_project or "kempnerforge"
-    if not uri.startswith("databricks"):
+    if not on_databricks:
         return project
     try:
         from databricks.sdk import WorkspaceClient
@@ -421,13 +432,23 @@ class MLflowBackend(_LoggingBackend):
             return
         import mlflow
 
-        mlflow.log_metrics({k: float(v) for k, v in metrics.items()}, step=step)
+        try:
+            mlflow.log_metrics({k: float(v) for k, v in metrics.items()}, step=step)
+        except Exception as e:  # a mid-run network/token failure must not crash training
+            logger.warning(f"MLflow log failed ({e}); disabling MLflow backend")
+            self._active = False
 
     def close(self) -> None:
-        if self._active is True:
+        if self._active is not True:
+            return
+        try:
             import mlflow
 
             mlflow.end_run()
+        except Exception as e:  # teardown must not fail the job
+            logger.warning(f"MLflow end_run failed ({e})")
+        finally:
+            self._active = False
 
 
 class TensorBoardBackend(_LoggingBackend):

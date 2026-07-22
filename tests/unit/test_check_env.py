@@ -323,6 +323,31 @@ class TestCheckWandb:
         assert "not validated" in r.message
 
 
+class TestCheckMlflow:
+    def test_missing_both(self, monkeypatch):
+        for v in ("DATABRICKS_HOST", "DATABRICKS_TOKEN", "DATABRICKS_API_TOKEN"):
+            monkeypatch.delenv(v, raising=False)
+        assert check_env.check_mlflow().status == check_env.MISS
+
+    def test_host_without_token_is_miss(self, monkeypatch):
+        monkeypatch.setenv("DATABRICKS_HOST", "https://x.cloud.databricks.com")
+        monkeypatch.delenv("DATABRICKS_TOKEN", raising=False)
+        monkeypatch.delenv("DATABRICKS_API_TOKEN", raising=False)
+        assert check_env.check_mlflow().status == check_env.MISS
+
+    def test_token_without_host_is_miss(self, monkeypatch):
+        monkeypatch.delenv("DATABRICKS_HOST", raising=False)
+        monkeypatch.setenv("DATABRICKS_API_TOKEN", "dapi-xxx")
+        assert check_env.check_mlflow().status == check_env.MISS
+
+    def test_both_set_ok(self, monkeypatch):
+        monkeypatch.setenv("DATABRICKS_HOST", "https://x.cloud.databricks.com")
+        monkeypatch.setenv("DATABRICKS_API_TOKEN", "dapi-xxx")
+        r = check_env.check_mlflow()
+        assert r.status == check_env.OK
+        assert "not validated" in r.message
+
+
 class TestCheckHf:
     def test_missing(self, monkeypatch):
         monkeypatch.delenv("HF_TOKEN", raising=False)

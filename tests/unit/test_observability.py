@@ -35,6 +35,7 @@ from kempnerforge.metrics.tracker import (
     TensorBoardBackend,
     WandBBackend,
     _flatten_config_params,
+    _resolve_mlflow_experiment,
 )
 
 # ---------------------------------------------------------------------------
@@ -415,6 +416,81 @@ class TestMLflowBackend:
         assert backend._active is True
         assert cfg.mlflow_run_id == "new-run-123"  # wrote back the new id
         assert tried == ["stale-id", None]  # tried resume, then started fresh
+
+    def test_log_failure_disables_backend(self, monkeypatch):
+        """A mid-run log_metrics failure warns and disables the backend, never raises."""
+        import types
+
+        def _boom_log(*a, **k):
+            raise RuntimeError("network down")
+
+        fake_run = types.SimpleNamespace(info=types.SimpleNamespace(run_id="r1"))
+        fake_mlflow = types.SimpleNamespace(
+            set_tracking_uri=lambda *a, **k: None,
+            set_experiment=lambda *a, **k: None,
+            set_system_metrics_sampling_interval=lambda *a, **k: None,
+            start_run=lambda *a, **k: fake_run,
+            log_params=lambda *a, **k: None,
+            set_tags=lambda *a, **k: None,
+            log_metrics=_boom_log,
+            end_run=lambda *a, **k: None,
+        )
+        monkeypatch.setitem(sys.modules, "mlflow", fake_mlflow)
+        backend = MLflowBackend(
+            MetricsConfig(
+                enable_mlflow=True,
+                mlflow_tracking_uri="http://localhost:5000",
+                mlflow_experiment="e2e",
+                mlflow_log_system_metrics=False,
+            )
+        )
+        backend.log({"train/loss": 1.0}, step=1)  # must not raise
+        assert backend._active is False
+
+    def test_close_survives_end_run_error(self, monkeypatch):
+        """A failing end_run at teardown warns but does not raise; backend marked inactive."""
+        import types
+
+        def _boom_end(*a, **k):
+            raise RuntimeError("server gone")
+
+        fake_run = types.SimpleNamespace(info=types.SimpleNamespace(run_id="r1"))
+        fake_mlflow = types.SimpleNamespace(
+            set_tracking_uri=lambda *a, **k: None,
+            set_experiment=lambda *a, **k: None,
+            set_system_metrics_sampling_interval=lambda *a, **k: None,
+            start_run=lambda *a, **k: fake_run,
+            log_params=lambda *a, **k: None,
+            set_tags=lambda *a, **k: None,
+            log_metrics=lambda *a, **k: None,
+            end_run=_boom_end,
+        )
+        monkeypatch.setitem(sys.modules, "mlflow", fake_mlflow)
+        backend = MLflowBackend(
+            MetricsConfig(
+                enable_mlflow=True,
+                mlflow_tracking_uri="http://localhost:5000",
+                mlflow_experiment="e2e",
+                mlflow_log_system_metrics=False,
+            )
+        )
+        backend.log({"train/loss": 1.0}, step=1)
+        assert backend._active is True
+        backend.close()  # must not raise
+        assert backend._active is False
+
+
+class TestResolveMlflowExperiment:
+    def test_env_experiment_must_be_absolute_on_databricks(self, monkeypatch):
+        """Non-absolute $MLFLOW_EXPERIMENT is rejected on Databricks (config-guard parity)."""
+        monkeypatch.setenv("MLFLOW_EXPERIMENT", "bare-name")
+        with pytest.raises(ValueError, match="absolute workspace path"):
+            _resolve_mlflow_experiment(MetricsConfig(enable_mlflow=True), "databricks")
+
+    def test_env_experiment_bare_ok_for_non_databricks(self, monkeypatch):
+        monkeypatch.setenv("MLFLOW_EXPERIMENT", "bare-name")
+        cfg = MetricsConfig(enable_mlflow=True, mlflow_tracking_uri="http://localhost:5000")
+        assert _resolve_mlflow_experiment(cfg, "http://localhost:5000") == "bare-name"
 
 
 class TestTensorBoardBackend:

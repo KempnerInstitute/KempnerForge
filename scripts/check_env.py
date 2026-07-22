@@ -348,10 +348,15 @@ def check_mlflow(check_credentials: bool = False) -> CheckResult:
             "(needed for metrics.enable_mlflow with tracking_uri=databricks)",
         )
     if not host:
-        return CheckResult("mlflow", WARN, "token set but DATABRICKS_HOST missing")
+        return CheckResult(
+            "mlflow", MISS, "token set but DATABRICKS_HOST missing", "export DATABRICKS_HOST=..."
+        )
     if not token:
         return CheckResult(
-            "mlflow", WARN, "DATABRICKS_HOST set but token missing (DATABRICKS_TOKEN/_API_TOKEN)"
+            "mlflow",
+            MISS,
+            "DATABRICKS_HOST set but token missing",
+            "export DATABRICKS_API_TOKEN=... (or DATABRICKS_TOKEN)",
         )
     if check_credentials:
         try:

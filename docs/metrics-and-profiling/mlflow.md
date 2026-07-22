@@ -34,9 +34,9 @@ log to a local SQLite store instead, install full `mlflow` and set
 
 The experiment name resolves in order: `mlflow_experiment` → `$MLFLOW_EXPERIMENT`
 → auto. On Databricks the name **must be an absolute workspace path**
-(`/Users/you@example.com/proj` or `/Experiments/proj`); a bare name fails, so
-`MetricsConfig.__post_init__` rejects a non-absolute `mlflow_experiment` at
-config-load time. When none is set, auto derives
+(`/Users/you@example.com/proj` or `/Experiments/proj`); a bare name fails, so a
+non-absolute experiment is rejected — `MetricsConfig.__post_init__` for the config
+field at load time, and at runtime for `$MLFLOW_EXPERIMENT`. When none is set, auto derives
 `/Users/<databricks-username>/<wandb_project>` via the Databricks SDK.
 
 ## Init is lazy
@@ -113,9 +113,9 @@ except Exception as e:     # network, auth, experiment-path, etc.
     self._active = False
 ```
 
-Subsequent `log()` calls no-op — a flaky network or expired token loses logs but
-never crashes training. Param/tag logging is separately guarded so a metadata
-error doesn't disable metric logging.
+`log()` and `close()` are guarded too: a network/token failure there is caught,
+warns, disables the backend, and never propagates — a mid-run outage loses logs
+but never crashes training. Param/tag logging is separately guarded as well.
 
 MLflow is an optional dependency: install with `uv sync --group mlflow` (pulls
 `mlflow-skinny` + `databricks-sdk`). Without it, `enable_mlflow = true` logs a
