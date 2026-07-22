@@ -28,7 +28,11 @@ from torch.distributed.checkpoint.state_dict import (
 )
 
 from kempnerforge.checkpoint.async_save import AsyncCheckpointer
-from kempnerforge.checkpoint.state import build_train_state, restore_train_state
+from kempnerforge.checkpoint.state import (
+    TRAIN_STATE_STANDARD_KEYS,
+    build_train_state,
+    restore_train_state,
+)
 from kempnerforge.config.schema import AsyncCheckpointMode, CheckpointConfig
 
 logger = logging.getLogger(__name__)
@@ -108,6 +112,34 @@ def _load_train_state(path: Path) -> dict[str, Any]:
             f"at load time. Consider chmod g-w,o-w on the checkpoint directory."
         )
     return torch.load(path, map_location="cpu", weights_only=False)
+
+
+def load_train_state_extras(checkpoint_dir: str | Path) -> dict[str, Any]:
+    """Read the caller-supplied ``extra`` metadata from a checkpoint's train_state.pt.
+
+    Public, read-only accessor for the non-standard keys training saves via
+    ``build_train_state(extra=...)`` — e.g. ``wandb_run_id`` — so tooling outside
+    the training loop (the VLM eval harness) can attach results to the
+    checkpoint's experiment-tracking run. Unlike ``restore_train_state`` this
+    never applies the saved RNG state.
+
+    Args:
+        checkpoint_dir: A concrete ``step_N`` checkpoint directory (resolve run
+            dirs first, e.g. via ``resolve_resume_path``).
+
+    Returns:
+        The extras dict; ``{}`` when the checkpoint has no ``train_state.pt``
+        or saved no extras.
+
+    Raises:
+        PermissionError: The file is owned by another uid (``train_state.pt``
+            is a full pickle; see ``_load_train_state``).
+    """
+    path = Path(checkpoint_dir) / _TRAIN_STATE_FILE
+    if not path.exists():
+        return {}
+    state = _load_train_state(path)
+    return {k: v for k, v in state.items() if k not in TRAIN_STATE_STANDARD_KEYS}
 
 
 class CheckpointManager:
