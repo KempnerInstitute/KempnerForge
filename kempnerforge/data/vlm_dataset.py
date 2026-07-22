@@ -142,9 +142,8 @@ def _tokenize_and_mask(
     ``tokenize(prompt + text)`` at the boundary (tokens can merge or
     split). To guarantee the mask lines up with the prompt boundary we
     tokenize prompt and text independently, then concatenate the id
-    lists. The mask length is ``len(prompt_ids)``, so masking
-    ``labels[:prompt_len]`` cannot leak a prompt token into supervision
-    or erase the first target token.
+    lists, so the prompt/target boundary is exact and only positions
+    predicting prompt tokens are masked.
     """
     if prompt is not None:
         prompt_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
