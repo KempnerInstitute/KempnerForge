@@ -29,7 +29,7 @@ from adapter import (
     _resolve_gen_kwargs,
     _to_pil,
 )
-from lmms_eval.api.instance import Instance
+from lmms_eval.api.instance import GenerationResult, Instance, TokenCounts
 from lmms_eval.protocol import ChatMessages
 from PIL import Image
 
@@ -55,6 +55,23 @@ DEVICE = torch.device("cpu")
 _ALL_VLM_ARCHS = tuple(sorted(registry.list_vlm_configs()))
 GENERATIVE_ARCHES = tuple(a for a in _ALL_VLM_ARCHS if VLMConfig.for_arch(a).is_generative)
 NON_GENERATIVE_ARCHES = tuple(a for a in _ALL_VLM_ARCHS if not VLMConfig.for_arch(a).is_generative)
+
+
+# ``_generate_batch`` now returns ``(texts, token_counts)`` and ``generate_until`` returns
+# ``list[GenerationResult]`` (the native lmms-eval efficiency/throughput surface). These thin
+# wrappers recover just the continuation strings so the behavioral tests below keep asserting
+# on text; the new (text, count) contract is covered by ``TestGenerationTokenCounts``.
+_gb = _generate_batch
+
+
+def _gen_texts(*args, **kwargs) -> list[str]:
+    texts, _counts = _gb(*args, **kwargs)
+    return texts
+
+
+def _gu_texts(model, requests) -> list[str]:
+    return [r.text for r in model.generate_until(requests)]
+
 
 # Per-arch BUILD sizing for a tiny CPU wrapper (sizing only, NOT generativity policy):
 # CA needs a cross-attention cadence that fits the tiny layer count. Arches without an
@@ -165,10 +182,11 @@ class TestRenderRequest:
         with pytest.raises(NotImplementedError, match="one image"):
             _render_request(messages, None)
 
-    def test_no_image_raises(self):
-        messages = _chat([_text("text only question")])
-        with pytest.raises(NotImplementedError, match="one image"):
-            _render_request(messages, None)
+    def test_no_image_is_text_only(self):
+        """A text-only request on an image checkpoint renders as empty frames."""
+        images, prompt = _render_request(_chat([_text("text only question")]), None)
+        assert images == []
+        assert prompt == "text only question"
 
     def test_multi_turn_assistant_raises(self):
         messages = ChatMessages(
@@ -230,14 +248,34 @@ class TestRenderRequestVideo:
         assert len(frames) == 1
         assert prompt == "q"
 
+    def test_no_visual_is_text_only(self, vcfg):
+        """A text-only request on a video checkpoint renders as empty frames."""
+        frames, prompt = _render_request(_chat([_text("text only")]), vcfg)
+        assert frames == []
+        assert prompt == "text only"
+
     def test_audio_still_raises(self, vcfg):
         msg = _chat([_text("x"), {"type": "audio", "url": "a.wav"}])
         with pytest.raises(NotImplementedError, match="[Aa]udio"):
             _render_request(msg, vcfg)
 
-    def test_multi_image_raises(self, vcfg):
-        with pytest.raises(NotImplementedError, match="exactly one"):
-            _render_request(_chat([_image(_img()), _image(_img())]), vcfg)
+    def test_multi_image_returns_frames(self, vcfg):
+        # A multi-image request on a video checkpoint is packed as an ordered clip:
+        # the N images become N frames (a single image is the length-1 case).
+        frames, prompt = _render_request(
+            _chat([_text("compare"), _image(_img()), _image(_img())]), vcfg
+        )
+        assert len(frames) == 2
+        assert prompt == "compare"
+
+    def test_multi_image_over_max_frames_warns(self, monkeypatch, vcfg):
+        # More images than the clip length (max_frames=4): all are returned here and
+        # truncated downstream by frames_to_clip_tensor, so render warns the drop is visible.
+        rec = _RecordingLogger()
+        monkeypatch.setattr("adapter.logger", rec)
+        frames, _ = _render_request(_chat([_image(_img()) for _ in range(5)]), vcfg)
+        assert len(frames) == 5
+        assert any("truncated" in m for m in rec.warnings)
 
     def test_multi_turn_raises(self, vcfg):
         msg = ChatMessages(
@@ -337,7 +375,7 @@ def test_video_checkpoint_accepts_str_image_path(
         idx=0,
         metadata={"task": "t", "doc_id": "d0", "repeats": 1},
     )
-    out = vlm.generate_until([inst])
+    out = _gu_texts(vlm, [inst])
     assert len(out) == 1 and len(out[0].split()) == 3  # processed, not skipped
 
 
@@ -406,18 +444,18 @@ class TestGenerateBatchSingle:
     def test_greedy_is_deterministic(self, arch_wrapper):
         pv, pid = _pixels(), self._prompt()
         r = _resolve_gen_kwargs({"max_new_tokens": 6}, 128)
-        out1 = _generate_batch(arch_wrapper, _MockTokenizer(), pv, pid, r, 64)
-        out2 = _generate_batch(arch_wrapper, _MockTokenizer(), pv, pid, r, 64)
+        out1 = _gen_texts(arch_wrapper, _MockTokenizer(), pv, pid, r, 64)
+        out2 = _gen_texts(arch_wrapper, _MockTokenizer(), pv, pid, r, 64)
         assert out1 == out2 and len(out1) == 1 and isinstance(out1[0], str)
 
     def test_respects_max_new_tokens(self, arch_wrapper):
         r = _resolve_gen_kwargs({"max_new_tokens": 6}, 128)
-        out = _generate_batch(arch_wrapper, _MockTokenizer(), _pixels(), self._prompt(), r, 64)
+        out = _gen_texts(arch_wrapper, _MockTokenizer(), _pixels(), self._prompt(), r, 64)
         assert len(out[0].split()) == 6
 
     def test_until_trims_continuation(self, arch_wrapper):
         pv, pid = _pixels(), self._prompt()
-        one = _generate_batch(
+        one = _gen_texts(
             arch_wrapper,
             _MockTokenizer(),
             pv,
@@ -427,7 +465,7 @@ class TestGenerateBatchSingle:
         )[0]
         # decode = space-joined ids, so the first space follows the first token:
         # until=[" "] trims to exactly the first generated token.
-        trimmed = _generate_batch(
+        trimmed = _gen_texts(
             arch_wrapper,
             _MockTokenizer(),
             pv,
@@ -439,7 +477,7 @@ class TestGenerateBatchSingle:
 
     def test_eos_stops_generation(self, arch_wrapper):
         pv, pid = _pixels(), self._prompt()
-        first = _generate_batch(
+        first = _gen_texts(
             arch_wrapper,
             _MockTokenizer(),
             pv,
@@ -447,7 +485,7 @@ class TestGenerateBatchSingle:
             _resolve_gen_kwargs({"max_new_tokens": 1}, 128),
             64,
         )[0]
-        out = _generate_batch(
+        out = _gen_texts(
             arch_wrapper,
             _MockTokenizer(eos_token_id=int(first)),
             pv,
@@ -462,7 +500,7 @@ class TestGenerateBatchSingle:
         # per-task skip (see TestGenerateUntilFaultTolerance).
         r = _resolve_gen_kwargs({"max_new_tokens": 100}, 128)
         with pytest.raises(_ContextBudgetError, match="max_new_tokens"):
-            _generate_batch(arch_wrapper, _MockTokenizer(), _pixels(), self._prompt(), r, 64)
+            _gen_texts(arch_wrapper, _MockTokenizer(), _pixels(), self._prompt(), r, 64)
 
     def test_overlong_prompt_is_left_truncated(self, arch_wrapper, monkeypatch):
         """A prompt that exceeds the budget (but leaves room) is left-truncated with a warning."""
@@ -475,9 +513,17 @@ class TestGenerateBatchSingle:
         budget = 64 - arch_wrapper.num_image_tokens - max_new
         long_prompt = [torch.arange(1, budget + 7, dtype=torch.long)]
         r = _resolve_gen_kwargs({"max_new_tokens": max_new}, 128)
-        out = _generate_batch(arch_wrapper, _MockTokenizer(), _pixels(), long_prompt, r, 64)
+        out = _gen_texts(arch_wrapper, _MockTokenizer(), _pixels(), long_prompt, r, 64)
         assert len(out) == 1 and len(out[0].split()) == 2
         assert any("left-truncating" in m for m in rec.warnings)
+
+    def test_text_only_decode_no_pixels(self, arch_wrapper):
+        """pixel_values=None runs the pure-text forward for every generative arch
+        (JD/CA/MoT) end to end and returns a continuation of max_new_tokens."""
+        r = _resolve_gen_kwargs({"max_new_tokens": 6}, 128)
+        out = _gen_texts(arch_wrapper, _MockTokenizer(), None, self._prompt(), r, 64)
+        assert len(out) == 1 and isinstance(out[0], str)
+        assert len(out[0].split()) == 6
 
 
 @pytest.mark.parametrize("arch", GENERATIVE_ARCHES)
@@ -500,24 +546,24 @@ class TestGenerateBatchMulti:
         pv = _pixels(len(prompts))  # (3, 3, 16, 16) — one image per request
         r = _resolve_gen_kwargs({"max_new_tokens": 5}, 128)
         sequential = [
-            _generate_batch(arch_wrapper, _MockTokenizer(), pv[i : i + 1], [prompts[i]], r, 64)[0]
+            _gen_texts(arch_wrapper, _MockTokenizer(), pv[i : i + 1], [prompts[i]], r, 64)[0]
             for i in range(len(prompts))
         ]
-        batched = _generate_batch(arch_wrapper, _MockTokenizer(), pv, prompts, r, 64)
+        batched = _gen_texts(arch_wrapper, _MockTokenizer(), pv, prompts, r, 64)
         assert batched == sequential
 
     def test_per_row_max_new_tokens(self, arch_wrapper):
         prompts = self._prompts()
         pv = _pixels(len(prompts))
         r = _resolve_gen_kwargs({"max_new_tokens": 4}, 128)
-        outs = _generate_batch(arch_wrapper, _MockTokenizer(), pv, prompts, r, 64)
+        outs = _gen_texts(arch_wrapper, _MockTokenizer(), pv, prompts, r, 64)
         assert len(outs) == 3 and all(len(o.split()) == 4 for o in outs)
 
     def test_per_row_eos_independent(self, arch_wrapper):
         """EOS on one row stops only that row; the batch still returns all rows."""
         prompts = self._prompts()
         pv = _pixels(len(prompts))
-        first0 = _generate_batch(
+        first0 = _gen_texts(
             arch_wrapper,
             _MockTokenizer(),
             pv[:1],
@@ -525,7 +571,7 @@ class TestGenerateBatchMulti:
             _resolve_gen_kwargs({"max_new_tokens": 1}, 128),
             64,
         )[0]
-        outs = _generate_batch(
+        outs = _gen_texts(
             arch_wrapper,
             _MockTokenizer(eos_token_id=int(first0)),
             pv,
@@ -566,7 +612,7 @@ def test_generate_batch_threads_frame_mask_for_video():
     frame_mask = torch.tensor([[True, True], [True, False]])  # row 1: frame 2 padded
     prompt_ids = [torch.tensor([5, 9], dtype=torch.long), torch.tensor([7], dtype=torch.long)]
     r = _resolve_gen_kwargs({"max_new_tokens": 3}, 128)
-    _generate_batch(model, _MockTokenizer(), pixel_values, prompt_ids, r, 64, frame_mask=frame_mask)
+    _gen_texts(model, _MockTokenizer(), pixel_values, prompt_ids, r, 64, frame_mask=frame_mask)
     assert model.seen_frame_masks  # decode actually ran
     assert all(fm is frame_mask for fm in model.seen_frame_masks)
 
@@ -577,8 +623,32 @@ def test_generate_batch_no_frame_mask_for_image():
     pixel_values = torch.randn(1, 3, 16, 16)
     prompt_ids = [torch.tensor([5, 9, 12], dtype=torch.long)]
     r = _resolve_gen_kwargs({"max_new_tokens": 2}, 128)
-    _generate_batch(model, _MockTokenizer(), pixel_values, prompt_ids, r, 64)
+    _gen_texts(model, _MockTokenizer(), pixel_values, prompt_ids, r, 64)
     assert model.seen_frame_masks and all(fm is None for fm in model.seen_frame_masks)
+
+
+def test_generate_batch_text_only_runs_with_none():
+    """pixel_values=None decodes a text-only batch (device from prompts, no vision,
+    frame_mask=None each step)."""
+    model = _CaptureModel(num_image_tokens=8)
+    prompt_ids = [torch.tensor([5, 9, 12], dtype=torch.long)]
+    r = _resolve_gen_kwargs({"max_new_tokens": 3}, 128)
+    out = _gen_texts(model, _MockTokenizer(), None, prompt_ids, r, 64)
+    assert len(out) == 1
+    assert model.seen_frame_masks and all(fm is None for fm in model.seen_frame_masks)
+
+
+def test_generate_batch_text_only_budget_excludes_image_tokens():
+    """A text-only batch reserves no image-token budget: a max_new_tokens that would
+    over-budget a visual batch (num_image_tokens=16) still fits when pixel_values is None."""
+    model = _CaptureModel(num_image_tokens=16)
+    prompt_ids = [torch.tensor([5, 9], dtype=torch.long)]
+    r = _resolve_gen_kwargs({"max_new_tokens": 50}, 128)
+    # Visual budget: 64 - 16 - 50 <= 0 -> raises. Text-only: 64 - 0 - 50 = 14 -> fits.
+    with pytest.raises(_ContextBudgetError):
+        _gen_texts(model, _MockTokenizer(), torch.randn(1, 3, 16, 16), prompt_ids, r, 64)
+    out = _gen_texts(model, _MockTokenizer(), None, prompt_ids, r, 64)
+    assert len(out) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -862,12 +932,51 @@ class TestGenerateUntil:
         ]
 
         # Each request decoded alone (greedy → deterministic), in original order.
-        singles = [vlm.generate_until([inst])[0] for inst in instances]
-        batched = vlm.generate_until(instances)
+        singles = [_gu_texts(vlm, [inst])[0] for inst in instances]
+        batched = _gu_texts(vlm, instances)
 
         assert batched == singles  # batching + reorder + get_original preserve per-request results
         assert all(isinstance(o, str) for o in batched)
         assert all(len(o.split()) == 3 for o in batched)  # greedy emits exactly max_new_tokens
+
+    @pytest.mark.parametrize("arch", GENERATIVE_ARCHES)
+    def test_mixed_text_only_and_image_batch(self, monkeypatch, tiny_vlm_configs, arch):
+        """A chunk mixing a text-only and an image request (same gen_kwargs) decodes
+        them as separate sub-batches and scatters results back in original order."""
+        _patch_loaders(
+            monkeypatch, _vlm_job_config(tiny_vlm_configs, arch=arch), _vlm_wrapper(arch)
+        )
+        vlm = KempnerForgeVLM(
+            config="x", checkpoint="y", device="cpu", dtype="float32", batch_size=2
+        )
+        img = _img()
+
+        def doc_to_messages(doc):
+            content = [_text(doc["q"])]
+            if doc.get("img"):
+                content.append(_image(img))
+            return [{"role": "user", "content": content}]
+
+        vlm.task_dict = {
+            "t": {"test": {"d0": {"q": "text only?"}, "d1": {"q": "and this", "img": True}}}
+        }
+        specs = [("d0", "c"), ("d1", "cc")]
+        instances = [
+            Instance(
+                request_type="generate_until",
+                arguments=(ctx, doc_to_messages, {"max_new_tokens": 3}, doc_id, "t", "test"),
+                idx=i,
+                metadata={"task": "t", "doc_id": doc_id, "repeats": 1},
+            )
+            for i, (doc_id, ctx) in enumerate(specs)
+        ]
+
+        # d0 (text-only) and d1 (image) land in one chunk (shared gen_kwargs); each is
+        # decoded in its own sub-batch, so the mixed batch matches per-request singles.
+        singles = [_gu_texts(vlm, [inst])[0] for inst in instances]
+        batched = _gu_texts(vlm, instances)
+        assert batched == singles
+        assert all(isinstance(o, str) and len(o.split()) == 3 for o in batched)
 
 
 class TestGenerateUntilVideo:
@@ -912,8 +1021,8 @@ class TestGenerateUntilVideo:
         ]
         # Decoding each request alone must match the batched (stacked, 5-D) result; if the
         # adapter folded frames with cat, the forward would trip the frames-per-clip check.
-        singles = [vlm.generate_until([inst])[0] for inst in instances]
-        batched = vlm.generate_until(instances)
+        singles = [_gu_texts(vlm, [inst])[0] for inst in instances]
+        batched = _gu_texts(vlm, instances)
         assert batched == singles
         assert all(isinstance(o, str) and len(o.split()) == 3 for o in batched)
 
@@ -978,7 +1087,7 @@ class TestGenerateUntilFaultTolerance:
             )
             for i, (doc_id, ctx) in enumerate([("bad", "c"), ("good", "cc")])
         ]
-        outs = vlm.generate_until(instances)
+        outs = _gu_texts(vlm, instances)
         assert outs[0] == ""  # bad request isolated (order restored by get_original)
         assert len(outs[1].split()) == 3  # good request completes normally
         assert any("Skipping request" in m and "doc_id=bad" in m for m in rec.warnings)
@@ -1000,7 +1109,7 @@ class TestGenerateUntilFaultTolerance:
             idx=0,
             metadata={"task": "t", "doc_id": "d0", "repeats": 1},
         )
-        assert vlm.generate_until([inst]) == [""]
+        assert _gu_texts(vlm, [inst]) == [""]
         assert any("empty prompt" in m for m in rec.warnings)
 
     def test_all_requests_bad_returns_empties(self, monkeypatch, tiny_vlm_configs):
@@ -1023,7 +1132,7 @@ class TestGenerateUntilFaultTolerance:
             )
             for i, (doc_id, ctx) in enumerate([("d0", "c"), ("d1", "cc")])
         ]
-        assert vlm.generate_until(instances) == ["", ""]
+        assert _gu_texts(vlm, instances) == ["", ""]
 
     def test_unexpected_error_isolated(self, monkeypatch, tiny_vlm_configs):
         # The per-request handler catches Exception (broadened from the original
@@ -1050,7 +1159,7 @@ class TestGenerateUntilFaultTolerance:
             idx=0,
             metadata={"task": "t", "doc_id": "d0", "repeats": 1},
         )
-        assert vlm.generate_until([inst]) == [""]
+        assert _gu_texts(vlm, [inst]) == [""]
         assert any("Skipping request" in m and "doc_id=d0" in m for m in rec.warnings)
 
     def test_fatal_baseexception_propagates(self, monkeypatch, tiny_vlm_configs):
@@ -1076,7 +1185,7 @@ class TestGenerateUntilFaultTolerance:
             metadata={"task": "t", "doc_id": "d0", "repeats": 1},
         )
         with pytest.raises(KeyboardInterrupt):
-            vlm.generate_until([inst])
+            _gu_texts(vlm, [inst])
 
     def test_missing_image_path_skipped(self, monkeypatch, tiny_vlm_configs):
         # A bad image path raises FileNotFoundError (subclass of OSError) inside _to_pil;
@@ -1096,7 +1205,7 @@ class TestGenerateUntilFaultTolerance:
             idx=0,
             metadata={"task": "t", "doc_id": "d0", "repeats": 1},
         )
-        assert vlm.generate_until([inst]) == [""]
+        assert _gu_texts(vlm, [inst]) == [""]
         assert any("Skipping request" in m and "doc_id=d0" in m for m in rec.warnings)
 
     def test_over_budget_chunk_skipped_not_aborted(self, monkeypatch, tiny_vlm_configs):
@@ -1121,5 +1230,62 @@ class TestGenerateUntilFaultTolerance:
             )
             for i, (doc_id, ctx) in enumerate([("d0", "c"), ("d1", "cc")])
         ]
-        assert vlm.generate_until(instances) == ["", ""]
+        assert _gu_texts(vlm, instances) == ["", ""]
         assert any("Skipping" in m and "max_new_tokens" in m for m in rec.warnings)
+
+
+# ---------------------------------------------------------------------------
+# Native lmms-eval throughput/efficiency wiring: the (texts, counts) tuple from
+# _generate_batch and the GenerationResult(text, token_counts) from generate_until,
+# plus the generation-throughput metrics fed to gen_metrics.log_metrics.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("arch", GENERATIVE_ARCHES)
+class TestGenerationTokenCounts:
+    def test_generate_batch_returns_per_row_token_counts(self, arch_wrapper):
+        r = _resolve_gen_kwargs({"max_new_tokens": 6}, 128)
+        texts, counts = _generate_batch(
+            arch_wrapper,
+            _MockTokenizer(),
+            _pixels(),
+            [torch.tensor([5, 9, 12, 3], dtype=torch.long)],
+            r,
+            64,
+        )
+        # _MockTokenizer decodes ids space-joined, so word count == generated token count.
+        assert len(counts) == len(texts) == 1
+        assert counts[0] == len(texts[0].split()) == 6
+
+    def test_generate_until_reports_token_counts_and_throughput(
+        self, monkeypatch, tiny_vlm_configs, arch
+    ):
+        from lmms_eval.models.model_utils.gen_metrics import (
+            reset_logged_metrics,
+            summarize_logged_metrics,
+        )
+
+        _patch_loaders(
+            monkeypatch, _vlm_job_config(tiny_vlm_configs, arch=arch), _vlm_wrapper(arch)
+        )
+        vlm = KempnerForgeVLM(config="x", checkpoint="y", device="cpu", dtype="float32")
+
+        def doc_to_messages(doc):
+            del doc
+            return [{"role": "user", "content": [_text("hi?"), _image(_img())]}]
+
+        vlm.task_dict = {"t": {"test": {"d0": {}}}}
+        inst = Instance(
+            request_type="generate_until",
+            arguments=("ctx", doc_to_messages, {"max_new_tokens": 3}, "d0", "t", "test"),
+            idx=0,
+            metadata={"task": "t", "doc_id": "d0", "repeats": 1},
+        )
+        reset_logged_metrics()
+        out = vlm.generate_until([inst])
+        # Efficiency surface: a typed result carrying the per-sample output-token count.
+        assert len(out) == 1 and isinstance(out[0], GenerationResult)
+        assert isinstance(out[0].token_counts, TokenCounts)
+        assert out[0].token_counts.output_tokens == len(out[0].text.split()) == 3
+        # Throughput surface: log_metrics was fed, so the evaluator's summary is non-empty.
+        assert summarize_logged_metrics()["total_gen_tokens"] == 3

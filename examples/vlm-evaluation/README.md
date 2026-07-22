@@ -119,12 +119,37 @@ uv run python examples/vlm-evaluation/vlm_eval_harness.py \
   on the checkpoint's frame budget matching the reference's, which is a training
   choice rather than a knob here.
 - **Scope.** One video per request, single-turn, zero-shot, generative arches
-  (`joint_decoder` / `cross_attention` / `mot`). A single **image** task also runs
-  on a video checkpoint — the image is treated as a 1-frame clip, zero-padded to
-  `frames_per_clip`. Multiple videos, mixed image+video, multiple images, audio,
-  and multi-turn / few-shot raise a clear error; MoMa still fails fast. An
-  **image** checkpoint cannot evaluate video and raises a clear error if handed a
-  video task.
+  (`joint_decoder` / `cross_attention` / `mot`). **Image** tasks also run on a
+  video checkpoint — one image is a 1-frame clip, and multiple images are packed
+  as an ordered clip (zero-padded, and truncated with a warning past
+  `frames_per_clip`). Multiple videos, mixed image+video, audio, and multi-turn /
+  few-shot raise a clear error; MoMa still fails fast. An **image** checkpoint
+  cannot evaluate video and raises a clear error if handed a video task.
+
+## Text-only evaluation
+
+Text-only `generate_until` benchmarks (e.g. GSM8K, IFEval) run on **both image and
+video checkpoints**, for the generative arches (`joint_decoder` / `cross_attention` /
+`mot`). A request with no image or video renders as an empty-frame prompt and runs
+the arch's **pure-text forward** — no vision encoder, no image prefix (JD/MoT), and
+cross-attention blocks skipped (CA) — so the number reflects the text backbone. This
+is how you measure how much VLM training drifted the base LM, in the same harness as
+the multimodal tasks.
+
+```bash
+uv run python examples/vlm-evaluation/vlm_eval_harness.py \
+    --config     configs/train/vlm_jd.toml \
+    --checkpoint checkpoints/vlm/step_10000 \
+    --tasks      gsm8k \
+    --limit      8
+```
+
+- **Scope.** `generate_until` tasks only (generation / answer-extraction).
+  `loglikelihood`-scored multiple-choice suites (ARC, HellaSwag, MMLU-style) are not
+  supported — the adapter is generation-only. MoMa is excluded (non-generative).
+  Text-only, image, and video requests may be freely mixed across a task suite; each
+  request is decoded by its own modality path (text-only and visual requests within a
+  batch are decoded as separate sub-batches).
 
 ## Limitations
 
@@ -139,13 +164,13 @@ Several are tracked follow-ups.
   generation-only. A MoMa checkpoint fails fast with a clear error. Joint-Decoder
   (`joint_decoder`), Cross-Attention (`cross_attention`), and MoT (`mot`) are
   supported.
-- **One visual per request; no multi-turn / few-shot / multi-image.** A request
-  carries exactly one image (image checkpoint) or one video (video checkpoint —
-  see [Video evaluation](#video-evaluation)). Audio, multiple images, multiple
-  videos, mixed image+video, and multi-turn / few-shot requests raise a clear
-  error. Multi-image and multi-turn/few-shot are tracked follow-ups (for chat
-  tasks lmms-eval delivers few-shot as extra content blocks/turns, so it reduces
-  to multi-image + multi-turn support).
+- **One visual per request on image checkpoints; no multi-turn / few-shot.** An
+  image checkpoint carries exactly one image per request (multiple images raise); a
+  video checkpoint carries one video, or one or more images packed as an ordered
+  clip (see [Video evaluation](#video-evaluation)). Audio, multiple videos, mixed
+  image+video, and multi-turn / few-shot requests raise a clear error. Multi-turn /
+  few-shot is a tracked follow-up (for chat tasks lmms-eval delivers few-shot as
+  extra content blocks/turns, so it reduces to multi-turn support).
 - **Prompt flattening discards structure.** Flattening drops role/turn structure
   and any model-specific chat template. KempnerForge pre-training uses no chat
   template; once a post-training format exists, repo-wide chat-template support

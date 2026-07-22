@@ -18,6 +18,10 @@ Verified against the installed ``lmms_eval`` source:
 - ``api.model.lmms``: base sets ``_rank=0/_world_size=1/cache_hook/task_dict`` and exposes
   ``rank``/``world_size`` properties.
 - ``api.instance.Instance``: dataclass exposing ``.args`` (the arguments tuple).
+- ``api.instance.GenerationResult`` / ``TokenCounts``: the typed ``generate_until``
+  return and per-request token counters (``.text`` / ``.token_counts.output_tokens``).
+- ``models.model_utils.gen_metrics.log_metrics`` (+ ``reset_logged_metrics`` /
+  ``summarize_logged_metrics``): the throughput history the evaluator resets/summarizes.
 """
 
 from __future__ import annotations
@@ -173,6 +177,74 @@ class Instance:
 
 
 # --------------------------------------------------------------------------- #
+# lmms_eval.api.instance.TokenCounts / GenerationResult
+# --------------------------------------------------------------------------- #
+
+
+@dataclasses.dataclass
+class TokenCounts:
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    reasoning_tokens: int | None = None
+
+    def to_dict(self) -> dict[str, int | None]:
+        d: dict[str, int | None] = {}
+        if self.input_tokens is not None:
+            d["input_tokens"] = self.input_tokens
+        if self.output_tokens is not None:
+            d["output_tokens"] = self.output_tokens
+        if self.reasoning_tokens is not None:
+            d["reasoning_tokens"] = self.reasoning_tokens
+        return d
+
+
+@dataclasses.dataclass
+class GenerationResult:
+    text: str
+    token_counts: TokenCounts | None = None
+
+
+# --------------------------------------------------------------------------- #
+# lmms_eval.models.model_utils.gen_metrics (throughput history)
+# --------------------------------------------------------------------------- #
+
+_THROUGHPUT_METRICS_HISTORY: list[dict[str, Any]] = []
+
+
+def reset_logged_metrics() -> None:
+    _THROUGHPUT_METRICS_HISTORY.clear()
+
+
+def log_metrics(
+    total_elapsed_time: float,
+    total_gen_tokens: int,
+    avg_speed: float,
+    additional_metrics: dict[str, Any] | None = None,
+) -> None:
+    payload: dict[str, Any] = {
+        "total_elapsed_time": total_elapsed_time,
+        "total_gen_tokens": total_gen_tokens,
+        "avg_speed": avg_speed,
+    }
+    if additional_metrics:
+        payload.update(additional_metrics)
+    _THROUGHPUT_METRICS_HISTORY.append(payload)
+
+
+def summarize_logged_metrics() -> dict[str, Any]:
+    if not _THROUGHPUT_METRICS_HISTORY:
+        return {}
+    total_gen_tokens = sum(m.get("total_gen_tokens", 0) for m in _THROUGHPUT_METRICS_HISTORY)
+    total_elapsed_time = sum(m.get("total_elapsed_time", 0.0) for m in _THROUGHPUT_METRICS_HISTORY)
+    avg_speed = (total_gen_tokens / total_elapsed_time) if total_elapsed_time > 0 else 0.0
+    return {
+        "total_gen_tokens": total_gen_tokens,
+        "total_elapsed_time": total_elapsed_time,
+        "avg_speed": avg_speed,
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Module tree assembly
 # --------------------------------------------------------------------------- #
 
@@ -193,15 +265,31 @@ def build_modules() -> dict[str, types.ModuleType]:
     root = _mod("lmms_eval")
     api = _mod("lmms_eval.api")
     api_model = _mod("lmms_eval.api.model", lmms=lmms, CacheHook=_CacheHook)
-    api_instance = _mod("lmms_eval.api.instance", Instance=Instance)
+    api_instance = _mod(
+        "lmms_eval.api.instance",
+        Instance=Instance,
+        GenerationResult=GenerationResult,
+        TokenCounts=TokenCounts,
+    )
     protocol = _mod("lmms_eval.protocol", ChatMessages=ChatMessages)
     utils = _mod("lmms_eval.utils", Collator=Collator)
+    models = _mod("lmms_eval.models")
+    model_utils = _mod("lmms_eval.models.model_utils")
+    gen_metrics = _mod(
+        "lmms_eval.models.model_utils.gen_metrics",
+        log_metrics=log_metrics,
+        reset_logged_metrics=reset_logged_metrics,
+        summarize_logged_metrics=summarize_logged_metrics,
+    )
 
     root.api = api
     root.protocol = protocol
     root.utils = utils
+    root.models = models
     api.model = api_model
     api.instance = api_instance
+    models.model_utils = model_utils
+    model_utils.gen_metrics = gen_metrics
 
     return {
         "lmms_eval": root,
@@ -210,4 +298,7 @@ def build_modules() -> dict[str, types.ModuleType]:
         "lmms_eval.api.instance": api_instance,
         "lmms_eval.protocol": protocol,
         "lmms_eval.utils": utils,
+        "lmms_eval.models": models,
+        "lmms_eval.models.model_utils": model_utils,
+        "lmms_eval.models.model_utils.gen_metrics": gen_metrics,
     }

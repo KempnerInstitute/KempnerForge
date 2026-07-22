@@ -693,6 +693,44 @@ class TestMoT:
         with pytest.raises(ValueError, match="MoT model requires modality.modality_ids"):
             model(tokens, modality=ModalityContext(prefix_embeds=prefix))
 
+    def test_text_only_forward_no_image(self):
+        """A text-only MoT forward (no prefix, no modality_ids) runs with
+        n_image=0: every position routes through the text modality over an empty
+        image stream. modality=None and an empty ModalityContext agree."""
+        mc, lc, n_image, n_text = _mot_setup()
+        model = Transformer(mc, vlm_config=lc, num_image_tokens=n_image).to(DEVICE).eval()
+        tokens = torch.randint(0, 256, (1, n_text), device=DEVICE)
+        with torch.no_grad():
+            out_ctx = model(tokens, modality=ModalityContext())
+            out_none = model(tokens)
+        assert out_ctx.shape == (1, n_text, mc.vocab_size)
+        assert torch.isfinite(out_ctx).all()
+        torch.testing.assert_close(out_ctx, out_none)
+
+    def test_text_only_forward_with_moe(self):
+        """MoT + MoE text-only: the per-modality image FFN (an MoE router) runs
+        over the empty image stream (0 tokens) without error; output is finite."""
+        from kempnerforge.config.vlm import MoTConfig
+
+        mc = ModelConfig(
+            dim=64,
+            n_layers=2,
+            n_heads=4,
+            vocab_size=256,
+            max_seq_len=64,
+            ffn_hidden_dim=128,
+            num_experts=4,
+            moe_top_k=2,
+            moe_frequency=1,
+        )
+        model = Transformer(mc, vlm_config=MoTConfig(max_text_len=32), num_image_tokens=8)
+        model = model.to(DEVICE).eval()
+        tokens = torch.randint(0, 256, (1, 16), device=DEVICE)
+        with torch.no_grad():
+            out = model(tokens, modality=ModalityContext())
+        assert out.shape == (1, 16, 256)
+        assert torch.isfinite(out).all()
+
     def test_modality_ids_shape_mismatch_raises(self):
         mc, lc, n_image, max_text_len = _mot_setup()
         model = Transformer(mc, vlm_config=lc, num_image_tokens=n_image).to(DEVICE).eval()
@@ -941,13 +979,45 @@ class TestCrossAttentionInterleaving:
             out_text = text_model(tokens)
         torch.testing.assert_close(out_ca, out_text, atol=1e-5, rtol=1e-5)
 
-    def test_image_features_required_when_ca_layers_present(self):
-        """Forward without image_features raises a clear error when
-        CA layers are configured."""
+    def test_text_only_skips_cross_attention(self):
+        """A text-only forward (no image_features) skips the CA blocks and
+        returns text-backbone logits instead of raising."""
         model = _ca_transformer(n_layers=4, cadence=2).to(DEVICE).eval()
         tokens = torch.randint(0, 256, (1, 8), device=DEVICE)
-        with pytest.raises(ValueError, match="image_features is None"):
-            model(tokens)
+        with torch.no_grad():
+            out = model(tokens)
+        assert out.shape == (1, 8, 256)
+        assert torch.isfinite(out).all()
+
+    def test_text_only_equals_text_backbone_with_perturbed_ca(self):
+        """A CA model's text-only forward equals a plain text Transformer with
+        the same backbone weights even when the CA blocks are non-identity: the
+        CA blocks are skipped, not applied."""
+        torch.manual_seed(0)
+        mc_ca, lc_ca, n_image = _ca_setup(n_layers=4, cadence=2)
+        text_config = ModelConfig(
+            dim=mc_ca.dim,
+            n_layers=mc_ca.n_layers,
+            n_heads=mc_ca.n_heads,
+            vocab_size=mc_ca.vocab_size,
+            max_seq_len=mc_ca.max_seq_len,
+        )
+        ca_model = Transformer(mc_ca, vlm_config=lc_ca, num_image_tokens=n_image).to(DEVICE).eval()
+        text_model = Transformer(text_config).to(DEVICE).eval()
+        text_state = {
+            k: v for k, v in ca_model.state_dict().items() if "cross_attention_layers" not in k
+        }
+        text_model.load_state_dict(text_state, strict=True)
+        # Perturb CA weights so they are NOT the zero-init identity; a text-only
+        # forward must still skip them (equal the text backbone), not apply them.
+        with torch.no_grad():
+            for p in ca_model.cross_attention_layers.parameters():
+                p.copy_(torch.randn_like(p))
+        tokens = torch.randint(0, 256, (1, 8), device=DEVICE)
+        with torch.no_grad():
+            out_ca = ca_model(tokens)  # text-only: CA skipped
+            out_text = text_model(tokens)
+        torch.testing.assert_close(out_ca, out_text, atol=1e-5, rtol=1e-5)
 
     def test_image_features_with_kv_caches_raises(self):
         """Cross-arg invariant: image_features is training-only."""

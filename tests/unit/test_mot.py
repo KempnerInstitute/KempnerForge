@@ -150,6 +150,21 @@ class TestMoTAttentionForward:
         assert out["image"].shape == (batch, t_image, 64)
         assert out["text"].shape == (batch, t_text, 64)
 
+    def test_empty_image_stream_runs(self):
+        """A zero-length image stream (a text-only forward's n_image=0) flows
+        through MoTAttention: the per-modality projections, the concat for the
+        global SDPA, and the split-back all handle the 0-length modality."""
+        attn = MoTAttention(dim=64, n_heads=4, n_kv_heads=2, modalities=("image", "text"))
+        for m in ("image", "text"):
+            nn.init.normal_(attn.o_proj[m].weight)
+        cos_t, sin_t = _rope_for(10, 16)
+        streams = {"image": torch.randn(2, 0, 64), "text": torch.randn(2, 10, 64)}
+        rope = {"image": (cos_t[:0], sin_t[:0]), "text": (cos_t, sin_t)}
+        out = attn(streams, rope)
+        assert out["image"].shape == (2, 0, 64)
+        assert out["text"].shape == (2, 10, 64)
+        assert torch.isfinite(out["text"]).all()
+
     def test_output_dtype_matches_input(self):
         attn = MoTAttention(dim=64, n_heads=4, n_kv_heads=4, modalities=("image", "text")).to(
             dtype=torch.float32
@@ -354,6 +369,22 @@ class TestMoTBlock:
         out = block(streams, rope)
         assert out["image"].shape == (2, 6, 64)
         assert out["text"].shape == (2, 10, 64)
+
+    def test_block_empty_image_stream_runs(self):
+        """MoTBlock with a zero-length image stream (text-only n_image=0) runs
+        end to end (per-modality norms + attention + per-modality FFN)."""
+        cfg = _config(dim=64, n_heads=4)
+        block = MoTBlock(cfg, modalities=("image", "text"), layer_idx=0)
+        for m in ("image", "text"):
+            nn.init.normal_(block.attn.o_proj[m].weight)
+            nn.init.normal_(block.mlp[m].down_proj.weight)  # type: ignore[union-attr]
+        cos_t, sin_t = _rope_for(10, 16)
+        streams = {"image": torch.randn(1, 0, 64), "text": torch.randn(1, 10, 64)}
+        rope = {"image": (cos_t[:0], sin_t[:0]), "text": (cos_t, sin_t)}
+        out = block(streams, rope)
+        assert out["image"].shape == (1, 0, 64)
+        assert out["text"].shape == (1, 10, 64)
+        assert torch.isfinite(out["text"]).all()
 
     def test_block_zero_init_residual_identity(self):
         """At construction, MoTBlock(streams) bit-equal to streams."""
