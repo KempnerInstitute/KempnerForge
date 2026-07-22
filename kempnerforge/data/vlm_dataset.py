@@ -6,9 +6,9 @@ produces the ``VLMSample`` contract:
 - ``pixel_values``: ``(3, H, W)`` float tensor, resized to ``image_size``
   and normalized with the provided mean/std.
 - ``input_ids``: ``(T,)`` int64 tensor, right-padded to ``max_text_len``.
-- ``labels``: ``(T,)`` int64 tensor matching ``input_ids`` with ``-100``
-  on padding positions and (optionally) on prompt positions when
-  ``prompt_field`` is set.
+- ``labels``: ``(T,)`` int64 next-token targets (``labels[i]`` = input
+  token ``i+1``), right-padded to ``max_text_len``; pad, trailing, and
+  prompt-predicting positions are ``-100``.
 
 ``VLMCollator`` stacks a list of samples into a batch. All batches are
 padded to the same fixed ``max_text_len`` regardless of batch content so
@@ -184,8 +184,9 @@ class HuggingFaceVLMDataset(Dataset):
         tokenizer_path: HF tokenizer id or local path.
         max_text_len: Fixed-length pad target; passed to the collator.
         prompt_field: Optional column name for a prompt that should NOT
-            receive loss (e.g. the instruction in an instruction-tuned
-            dataset). Prompt tokens get ``labels=-100``.
+            be supervised (e.g. the instruction in an instruction-tuned
+            dataset). Positions predicting prompt tokens are ``-100``; the
+            last prompt token still predicts the first caption token.
         image_size: Target square image size. Default 224.
         image_mean / image_std: Normalization stats. Defaults match
             SigLIP's ``(0.5, 0.5, 0.5)``.
