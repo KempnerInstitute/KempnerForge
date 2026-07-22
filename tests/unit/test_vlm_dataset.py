@@ -122,8 +122,8 @@ class TestTokenizeAndMask:
         from ``tokenize(prompt + text)`` at the boundary (tokens can
         merge or split). The implementation must tokenize the prompt and
         text independently and concatenate the id lists, so the
-        ``labels[:len(prompt_ids)]`` mask lines up exactly with the
-        prompt boundary. Verified end-to-end on the gpt2 tokenizer.
+        prompt/target boundary is exact and only prompt-predicting
+        positions are masked. Verified end-to-end on the gpt2 tokenizer.
         """
         from transformers import AutoTokenizer
 
