@@ -132,12 +132,10 @@ def _tokenize_and_mask(
     max_text_len: int,
     prompt: str | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Tokenize and build right-padded input_ids + labels.
+    """Tokenize into right-padded input_ids + next-token labels.
 
-    When ``prompt`` is provided, the prompt portion of ``labels`` is
-    masked with ``-100`` (loss does not backpropagate through prompt
-    tokens). Padding positions in both ``input_ids`` and ``labels`` are
-    handled via ``ignore_index=-100`` on the loss.
+    ``labels[i]`` is token ``i+1`` (matching text pretraining and the no-shift
+    loss); pad, trailing, and prompt-predicting positions are ``-100``.
 
     BPE and SentencePiece tokenizers are NOT prefix-preserving: in
     general ``tokenize(prompt) + tokenize(text)`` differs from
@@ -166,9 +164,12 @@ def _tokenize_and_mask(
     if n > 0:
         ids_tensor = torch.tensor(full_ids, dtype=torch.long)
         input_ids[:n] = ids_tensor
-        labels[:n] = ids_tensor
-        if prompt_len > 0:
-            labels[:prompt_len] = -100
+        # Next-token targets: position i predicts token i+1; the last real token
+        # has no successor, and positions that would predict a prompt token stay
+        # masked so only response tokens are supervised.
+        labels[: n - 1] = ids_tensor[1:]
+        if prompt_len > 1:
+            labels[: prompt_len - 1] = -100
     return input_ids, labels
 
 
