@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import types
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -13,7 +14,13 @@ import torch.distributed as dist
 
 import kempnerforge.metrics.logger as log_mod
 import kempnerforge.metrics.tracker as tracker_mod
-from kempnerforge.config.schema import JobConfig, MetricsConfig, ModelConfig
+from kempnerforge.config.schema import (
+    DataConfig,
+    DatasetSource,
+    JobConfig,
+    MetricsConfig,
+    ModelConfig,
+)
 from kempnerforge.metrics.logger import (
     _format_number,
     _RankFilter,
@@ -344,6 +351,59 @@ class TestWandBBackend:
         assert backend._run is False
 
 
+class _FakeMlflow:
+    """Stand-in `mlflow` module for MLflowBackend tests (no real tracking server)."""
+
+    def __init__(self):
+        self._run = types.SimpleNamespace(info=types.SimpleNamespace(run_id="run-xyz"))
+        self.log_steps: list = []
+        self.start_run_ids: list = []
+        self.end_run_calls = 0
+        self.logged_params: list = []
+        self.logged_tags: list = []
+        self.history_steps: list = []  # steps returned by MlflowClient().get_metric_history
+
+    def set_tracking_uri(self, *a, **k):
+        pass
+
+    def set_experiment(self, *a, **k):
+        pass
+
+    def set_system_metrics_sampling_interval(self, *a, **k):
+        pass
+
+    def start_run(self, run_id=None, run_name=None, log_system_metrics=False):
+        self.start_run_ids.append(run_id)
+        return self._run
+
+    def log_metrics(self, metrics, step=None):
+        self.log_steps.append(step)
+
+    def log_params(self, params):
+        self.logged_params.append(params)
+
+    def set_tags(self, tags):
+        self.logged_tags.append(tags)
+
+    def end_run(self):
+        self.end_run_calls += 1
+
+    def MlflowClient(self, *a, **k):
+        steps = [types.SimpleNamespace(step=s) for s in self.history_steps]
+        return types.SimpleNamespace(get_metric_history=lambda run_id, key: steps)
+
+
+def _mlflow_cfg(**kw):
+    base = dict(
+        enable_mlflow=True,
+        mlflow_tracking_uri="http://localhost:5000",  # non-databricks: skip readiness gate
+        mlflow_experiment="exp",
+        mlflow_log_system_metrics=False,
+    )
+    base.update(kw)
+    return MetricsConfig(**base)
+
+
 class TestMLflowBackend:
     def test_init_no_crash(self):
         backend = MLflowBackend(MetricsConfig(enable_mlflow=True))
@@ -417,67 +477,113 @@ class TestMLflowBackend:
         assert cfg.mlflow_run_id == "new-run-123"  # wrote back the new id
         assert tried == ["stale-id", None]  # tried resume, then started fresh
 
-    def test_log_failure_disables_backend(self, monkeypatch):
-        """A mid-run log_metrics failure warns and disables the backend, never raises."""
-        import types
+    def test_log_retries_after_transient_failure(self, monkeypatch):
+        """A transient log error is swallowed (warned) but does NOT disable the backend;
+        the next step retries and succeeds. (Finding #1)"""
+        fm = _FakeMlflow()
+        state = {"n": 0}
 
-        def _boom_log(*a, **k):
-            raise RuntimeError("network down")
+        def flaky_log(metrics, step=None):
+            state["n"] += 1
+            if state["n"] == 1:
+                raise RuntimeError("transient network blip")
+            fm.log_steps.append(step)
 
-        fake_run = types.SimpleNamespace(info=types.SimpleNamespace(run_id="r1"))
-        fake_mlflow = types.SimpleNamespace(
-            set_tracking_uri=lambda *a, **k: None,
-            set_experiment=lambda *a, **k: None,
-            set_system_metrics_sampling_interval=lambda *a, **k: None,
-            start_run=lambda *a, **k: fake_run,
-            log_params=lambda *a, **k: None,
-            set_tags=lambda *a, **k: None,
-            log_metrics=_boom_log,
-            end_run=lambda *a, **k: None,
+        fm.log_metrics = flaky_log
+        monkeypatch.setitem(sys.modules, "mlflow", fm)
+        backend = MLflowBackend(_mlflow_cfg())
+        backend.log({"train/loss": 2.0}, step=1)  # fails internally, swallowed
+        backend.log({"train/loss": 1.5}, step=2)  # must retry, not stay disabled
+        assert backend._active is True
+        assert state["n"] == 2  # second call actually attempted (no permanent disable)
+        assert fm.log_steps == [2]
+
+    def test_resume_skips_already_logged_steps(self, monkeypatch):
+        """On resume, steps already recorded in the run are not re-logged. (Finding #2)"""
+        fm = _FakeMlflow()
+        fm.history_steps = [1, 2, 3, 4]  # run already has metrics up to step 4
+        monkeypatch.setitem(sys.modules, "mlflow", fm)
+        backend = MLflowBackend(_mlflow_cfg(mlflow_run_id="existing-run"))
+        backend.log({"train/loss": 1.2}, step=3)  # already logged -> skip
+        backend.log({"train/loss": 1.0}, step=4)  # already logged -> skip
+        backend.log({"train/loss": 0.8}, step=5)  # new -> log
+        assert fm.log_steps == [5]
+
+    def test_bad_env_experiment_disables_with_clear_message(self, monkeypatch):
+        """Non-absolute $MLFLOW_EXPERIMENT on Databricks disables with a specific message,
+        not the generic 'MLflow init failed'. (Finding #3)"""
+        monkeypatch.setenv("DATABRICKS_HOST", "https://x.cloud.databricks.com")
+        monkeypatch.setenv("DATABRICKS_TOKEN", "dapi-x")
+        monkeypatch.setenv("MLFLOW_EXPERIMENT", "bare-name")  # not absolute
+        warnings_seen: list = []
+        monkeypatch.setattr(
+            tracker_mod.logger, "warning", lambda msg, *a, **k: warnings_seen.append(str(msg))
         )
-        monkeypatch.setitem(sys.modules, "mlflow", fake_mlflow)
-        backend = MLflowBackend(
-            MetricsConfig(
-                enable_mlflow=True,
-                mlflow_tracking_uri="http://localhost:5000",
-                mlflow_experiment="e2e",
-                mlflow_log_system_metrics=False,
-            )
-        )
-        backend.log({"train/loss": 1.0}, step=1)  # must not raise
+        fm = _FakeMlflow()
+        monkeypatch.setitem(sys.modules, "mlflow", fm)
+        backend = MLflowBackend(MetricsConfig(enable_mlflow=True))  # default uri = databricks
+        backend.log({"train/loss": 1.0}, step=1)
         assert backend._active is False
+        assert fm.start_run_ids == []  # never started a run
+        text = " ".join(warnings_seen).lower()
+        assert "absolute" in text and "disabled" in text
+        assert "init failed" not in text  # a deliberate config error, not an unexpected failure
+
+    def test_null_experiment_disables_on_databricks(self, monkeypatch):
+        """On Databricks, an unresolvable experiment (None) disables the backend instead of
+        logging into the default experiment. (Finding #7)"""
+        monkeypatch.setenv("DATABRICKS_HOST", "https://x.cloud.databricks.com")
+        monkeypatch.setenv("DATABRICKS_TOKEN", "dapi-x")
+        monkeypatch.delenv("MLFLOW_EXPERIMENT", raising=False)
+        monkeypatch.setattr(tracker_mod, "_resolve_mlflow_experiment", lambda cfg, uri: None)
+        fm = _FakeMlflow()
+        monkeypatch.setitem(sys.modules, "mlflow", fm)
+        backend = MLflowBackend(MetricsConfig(enable_mlflow=True))  # uri = databricks
+        backend.log({"train/loss": 1.0}, step=1)
+        assert backend._active is False
+        assert fm.start_run_ids == []  # never started a run in the default experiment
+
+    def test_resume_transient_error_does_not_fork(self, monkeypatch):
+        """A transient error resuming a still-valid run must NOT fork a new run; it disables
+        instead so history isn't split. (Finding #8)"""
+        fm = _FakeMlflow()
+
+        def start_run(run_id=None, run_name=None, log_system_metrics=False):
+            fm.start_run_ids.append(run_id)
+            if run_id is not None:
+                raise RuntimeError("503 Service Unavailable")  # transient; run still exists
+            return fm._run
+
+        fm.start_run = start_run
+        monkeypatch.setitem(sys.modules, "mlflow", fm)
+        backend = MLflowBackend(_mlflow_cfg(mlflow_run_id="live-run"))
+        backend.log({"train/loss": 1.0}, step=1)
+        assert backend._active is False  # disabled, not forked
+        assert fm.start_run_ids == ["live-run"]  # only the resume attempt, no fresh start_run()
+
+    def test_close_ends_run_even_when_inactive(self, monkeypatch):
+        """Once a run is started, close() ends it even if the backend was later marked
+        inactive, so the run isn't left RUNNING. (Finding #11)"""
+        fm = _FakeMlflow()
+        monkeypatch.setitem(sys.modules, "mlflow", fm)
+        backend = MLflowBackend(_mlflow_cfg())
+        backend.log({"train/loss": 1.0}, step=1)  # starts the run
+        backend._active = False  # simulate a later disable
+        backend.close()
+        assert fm.end_run_calls == 1
 
     def test_close_survives_end_run_error(self, monkeypatch):
-        """A failing end_run at teardown warns but does not raise; backend marked inactive."""
-        import types
+        """A failing end_run at teardown warns but does not raise."""
+        fm = _FakeMlflow()
 
-        def _boom_end(*a, **k):
+        def boom_end():
             raise RuntimeError("server gone")
 
-        fake_run = types.SimpleNamespace(info=types.SimpleNamespace(run_id="r1"))
-        fake_mlflow = types.SimpleNamespace(
-            set_tracking_uri=lambda *a, **k: None,
-            set_experiment=lambda *a, **k: None,
-            set_system_metrics_sampling_interval=lambda *a, **k: None,
-            start_run=lambda *a, **k: fake_run,
-            log_params=lambda *a, **k: None,
-            set_tags=lambda *a, **k: None,
-            log_metrics=lambda *a, **k: None,
-            end_run=_boom_end,
-        )
-        monkeypatch.setitem(sys.modules, "mlflow", fake_mlflow)
-        backend = MLflowBackend(
-            MetricsConfig(
-                enable_mlflow=True,
-                mlflow_tracking_uri="http://localhost:5000",
-                mlflow_experiment="e2e",
-                mlflow_log_system_metrics=False,
-            )
-        )
+        fm.end_run = boom_end
+        monkeypatch.setitem(sys.modules, "mlflow", fm)
+        backend = MLflowBackend(_mlflow_cfg())
         backend.log({"train/loss": 1.0}, step=1)
-        assert backend._active is True
         backend.close()  # must not raise
-        assert backend._active is False
 
 
 class TestResolveMlflowExperiment:
@@ -533,6 +639,24 @@ class TestFlattenConfigParams:
         config = JobConfig(model=ModelConfig(dim=128, n_layers=2, n_heads=2, vocab_size=256))
         params = _flatten_config_params(config, max_len=4)
         assert all(len(v) <= 4 for v in params.values())
+
+    def test_flatten_recurses_into_lists(self):
+        """list-of-dataclass config (data.datasets) expands into indexed dotted keys,
+        not one truncated str(). (Finding #5)"""
+        config = JobConfig(
+            model=ModelConfig(dim=128, n_layers=2, n_heads=2, vocab_size=256),
+            data=DataConfig(
+                datasets=[
+                    DatasetSource(path="/d/a", name="ds_a", weight=0.7),
+                    DatasetSource(path="/d/b", name="ds_b", weight=0.3),
+                ]
+            ),
+        )
+        params = _flatten_config_params(config)
+        assert params["data.datasets.0.name"] == "ds_a"
+        assert params["data.datasets.1.name"] == "ds_b"
+        assert params["data.datasets.0.path"] == "/d/a"
+        assert "data.datasets" not in params  # not collapsed into one opaque key
 
 
 class TestMetricsConfigMLflow:

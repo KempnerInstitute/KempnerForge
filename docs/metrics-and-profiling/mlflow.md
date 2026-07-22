@@ -35,8 +35,9 @@ log to a local SQLite store instead, install full `mlflow` and set
 The experiment name resolves in order: `mlflow_experiment` → `$MLFLOW_EXPERIMENT`
 → auto. On Databricks the name **must be an absolute workspace path**
 (`/Users/you@example.com/proj` or `/Experiments/proj`); a bare name fails, so a
-non-absolute experiment is rejected — `MetricsConfig.__post_init__` for the config
-field at load time, and at runtime for `$MLFLOW_EXPERIMENT`. When none is set, auto derives
+non-absolute experiment is rejected — `MetricsConfig.__post_init__` aborts at config-load
+time for the config field, and the backend disables with a clear message if
+`$MLFLOW_EXPERIMENT` is not absolute at runtime. When none is set, auto derives
 `/Users/<databricks-username>/<wandb_project>` via the Databricks SDK.
 
 ## Init is lazy
@@ -81,7 +82,9 @@ if ckpt_extra_loaded.get("mlflow_run_id"):
 `start_run(run_id=...)` then reattaches to the same run, so metrics continue on
 one curve across Slurm restarts. If that run id no longer exists (e.g. it was
 deleted), the backend falls back to a fresh run instead of erroring — matching
-wandb's `resume="allow"`.
+wandb's `resume="allow"`. On resume it also skips re-logging any step the run already
+recorded, so re-executing the steps between the last checkpoint and the crash does not
+duplicate metric points.
 
 ## What gets logged
 
@@ -113,9 +116,10 @@ except Exception as e:     # network, auth, experiment-path, etc.
     self._active = False
 ```
 
-`log()` and `close()` are guarded too: a network/token failure there is caught,
-warns, disables the backend, and never propagates — a mid-run outage loses logs
-but never crashes training. Param/tag logging is separately guarded as well.
+`log()` never propagates and does not disable the backend on a transient error: it
+warns once and keeps retrying, so logging recovers after a blip. `close()` always ends
+the run (even if logging was disabled) and swallows teardown errors. Param/tag logging
+is separately guarded as well.
 
 MLflow is an optional dependency: install with `uv sync --group mlflow` (pulls
 `mlflow-skinny` + `databricks-sdk`). Without it, `enable_mlflow = true` logs a

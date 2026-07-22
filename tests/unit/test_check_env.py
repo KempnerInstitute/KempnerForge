@@ -347,6 +347,34 @@ class TestCheckMlflow:
         assert r.status == check_env.OK
         assert "not validated" in r.message
 
+    def test_check_credentials_applies_api_token_alias(self, monkeypatch):
+        """--check-credentials mirrors DATABRICKS_API_TOKEN->DATABRICKS_TOKEN before the SDK
+        probe (the same alias the backend applies), so it doesn't falsely WARN. (Finding #6)"""
+        import types as _types
+
+        monkeypatch.setenv("DATABRICKS_HOST", "https://x.cloud.databricks.com")
+        monkeypatch.setenv("DATABRICKS_API_TOKEN", "dapi-x")
+        monkeypatch.delenv("DATABRICKS_TOKEN", raising=False)
+
+        class _WC:  # authenticates only when the SDK-native DATABRICKS_TOKEN is present
+            def __init__(self):
+                import os as _os
+
+                if not _os.environ.get("DATABRICKS_TOKEN"):
+                    raise RuntimeError("no DATABRICKS_TOKEN")
+                self.current_user = _types.SimpleNamespace(
+                    me=lambda: _types.SimpleNamespace(user_name="abbas")
+                )
+
+        fake_sdk = _types.ModuleType("databricks.sdk")
+        fake_sdk.WorkspaceClient = _WC
+        monkeypatch.setitem(sys.modules, "databricks", _types.ModuleType("databricks"))
+        monkeypatch.setitem(sys.modules, "databricks.sdk", fake_sdk)
+
+        r = check_env.check_mlflow(check_credentials=True)
+        assert r.status == check_env.OK
+        assert "abbas" in r.message
+
 
 class TestCheckHf:
     def test_missing(self, monkeypatch):

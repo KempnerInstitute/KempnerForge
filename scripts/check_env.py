@@ -359,6 +359,10 @@ def check_mlflow(check_credentials: bool = False) -> CheckResult:
             "export DATABRICKS_API_TOKEN=... (or DATABRICKS_TOKEN)",
         )
     if check_credentials:
+        # The SDK authenticates from DATABRICKS_TOKEN; mirror the DATABRICKS_API_TOKEN
+        # alias the MLflow backend applies so the probe matches runtime behavior.
+        if not os.environ.get("DATABRICKS_TOKEN") and os.environ.get("DATABRICKS_API_TOKEN"):
+            os.environ["DATABRICKS_TOKEN"] = os.environ["DATABRICKS_API_TOKEN"]
         try:
             from databricks.sdk import WorkspaceClient  # type: ignore
 

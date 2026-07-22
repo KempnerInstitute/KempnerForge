@@ -93,7 +93,7 @@ class MetricsTracker:
         if mc.enable_tensorboard:
             self._backends.append(TensorBoardBackend(mc))
         if mc.enable_mlflow:
-            self._backends.append(MLflowBackend(mc, hyperparams=_flatten_config_params(config)))
+            self._backends.append(MLflowBackend(mc, job_config=config))
 
     def start_step(self) -> None:
         """Mark the beginning of a training step."""
@@ -294,8 +294,9 @@ def _resolve_mlflow_experiment(config: MetricsConfig, uri: str) -> str | None:
     """Experiment name: mlflow_experiment -> $MLFLOW_EXPERIMENT -> auto
     (/Users/<user>/<project> via the SDK on Databricks; bare name locally).
 
-    On Databricks a non-absolute $MLFLOW_EXPERIMENT raises, mirroring the
-    MetricsConfig.__post_init__ guard on the config field.
+    On Databricks a non-absolute $MLFLOW_EXPERIMENT raises ValueError; the backend
+    catches it and disables MLflow with a clear message (the config-field equivalent
+    is rejected at load time by MetricsConfig.__post_init__).
     """
     on_databricks = uri.startswith("databricks")
     if config.mlflow_experiment:
@@ -336,11 +337,36 @@ def _flatten_config_params(config: JobConfig, max_len: int = 250) -> dict[str, s
         if isinstance(value, dict):
             for k, v in value.items():
                 _walk(f"{prefix}.{k}" if prefix else str(k), v)
+        elif isinstance(value, (list, tuple)):
+            for i, v in enumerate(value):
+                _walk(f"{prefix}.{i}" if prefix else str(i), v)
         else:
             flat[prefix] = str(value)[:max_len]
 
     _walk("", asdict(config))
     return flat
+
+
+def _mlflow_run_gone(exc: Exception) -> bool:
+    """True if the error means the run can't be resumed (deleted / does not exist), vs a
+    transient network/server error that should NOT trigger a fresh-run fallback."""
+    code = str(getattr(exc, "error_code", "") or "")
+    if "RESOURCE_DOES_NOT_EXIST" in code or "NOT_FOUND" in code:
+        return True
+    msg = str(exc).lower()
+    return any(
+        s in msg for s in ("does not exist", "resource_does_not_exist", "not found", "deleted")
+    )
+
+
+def _mlflow_last_step(mlflow: Any, run_id: str) -> int | None:
+    """Highest step already recorded for the watermark metric, so a resumed run can skip
+    re-logging steps it already has (mlflow metric history is append-only)."""
+    try:
+        hist = mlflow.MlflowClient().get_metric_history(run_id, "train/loss")
+        return max((m.step for m in hist), default=None)
+    except Exception:
+        return None
 
 
 class MLflowBackend(_LoggingBackend):
@@ -349,10 +375,13 @@ class MLflowBackend(_LoggingBackend):
     Lazy init on first log; run ID written back to config for checkpoint resume.
     """
 
-    def __init__(self, config: MetricsConfig, hyperparams: dict[str, str] | None = None) -> None:
+    def __init__(self, config: MetricsConfig, job_config: JobConfig | None = None) -> None:
         self._config = config
-        self._hyperparams = hyperparams or {}
+        self._job_config = job_config  # flattened to params lazily, only for a fresh run
         self._active: bool | None = None  # None = not tried, True = live, False = failed
+        self._run_started = False  # a run exists that close() must end
+        self._resume_skip_below: int | None = None  # skip re-logging steps already in the run
+        self._log_failures = 0  # consecutive log failures (warn once, keep retrying)
 
     def _ensure_init(self) -> None:
         if self._active is not None:
@@ -374,7 +403,19 @@ class MLflowBackend(_LoggingBackend):
             import mlflow
 
             mlflow.set_tracking_uri(uri)
-            experiment = _resolve_mlflow_experiment(self._config, uri)
+            try:
+                experiment = _resolve_mlflow_experiment(self._config, uri)
+            except ValueError as e:  # bad $MLFLOW_EXPERIMENT: a deliberate config error
+                logger.warning(f"MLflow disabled: {e}")
+                self._active = False
+                return
+            if uri.startswith("databricks") and not experiment:
+                logger.warning(
+                    "MLflow disabled: could not resolve a Databricks experiment path "
+                    "(set mlflow_experiment or $MLFLOW_EXPERIMENT to an absolute path)"
+                )
+                self._active = False
+                return
             if experiment:
                 mlflow.set_experiment(experiment)
             if self._config.mlflow_log_system_metrics:
@@ -382,10 +423,13 @@ class MLflowBackend(_LoggingBackend):
                     self._config.mlflow_system_metrics_interval
                 )
             run, resumed = self._start_run(mlflow)
+            self._run_started = True
             self._config.mlflow_run_id = run.info.run_id
             self._active = True
             logger.info(f"MLflow initialized: experiment={experiment} run_id={run.info.run_id}")
-            if not resumed:
+            if resumed:
+                self._resume_skip_below = _mlflow_last_step(mlflow, run.info.run_id)
+            else:
                 self._log_run_metadata(mlflow)
         except ImportError:
             logger.warning(
@@ -407,8 +451,10 @@ class MLflowBackend(_LoggingBackend):
         if run_id:
             try:
                 return mlflow.start_run(run_id=run_id, **kwargs), True
-            except Exception as e:  # saved run deleted/inaccessible — start fresh, like wandb
-                logger.warning(f"MLflow could not resume run_id={run_id} ({e}); starting a new run")
+            except Exception as e:
+                if not _mlflow_run_gone(e):
+                    raise  # transient/other error — don't fork a new run; let init disable
+                logger.warning(f"MLflow run_id={run_id} is gone ({e}); starting a new run")
         return mlflow.start_run(**kwargs), False
 
     def _log_run_metadata(self, mlflow: Any) -> None:
@@ -416,7 +462,8 @@ class MLflowBackend(_LoggingBackend):
         try:
             import socket
 
-            items = list(self._hyperparams.items())
+            hyperparams = _flatten_config_params(self._job_config) if self._job_config else {}
+            items = list(hyperparams.items())
             # MLflow caps a single log_params batch at 100 entries.
             for i in range(0, len(items), 100):
                 mlflow.log_params(dict(items[i : i + 100]))
@@ -430,16 +477,20 @@ class MLflowBackend(_LoggingBackend):
         self._ensure_init()
         if self._active is not True:
             return
+        if self._resume_skip_below is not None and step <= self._resume_skip_below:
+            return  # already logged before this resume — avoid duplicate history points
         import mlflow
 
         try:
             mlflow.log_metrics({k: float(v) for k, v in metrics.items()}, step=step)
-        except Exception as e:  # a mid-run network/token failure must not crash training
-            logger.warning(f"MLflow log failed ({e}); disabling MLflow backend")
-            self._active = False
+            self._log_failures = 0
+        except Exception as e:  # transient network/token failure: warn once, keep retrying
+            self._log_failures += 1
+            if self._log_failures == 1:
+                logger.warning(f"MLflow log failed ({e}); will keep retrying, points may be lost")
 
     def close(self) -> None:
-        if self._active is not True:
+        if not self._run_started:
             return
         try:
             import mlflow
@@ -449,6 +500,7 @@ class MLflowBackend(_LoggingBackend):
             logger.warning(f"MLflow end_run failed ({e})")
         finally:
             self._active = False
+            self._run_started = False
 
 
 class TensorBoardBackend(_LoggingBackend):
