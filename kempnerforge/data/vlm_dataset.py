@@ -135,7 +135,11 @@ def _tokenize_and_mask(
     """Tokenize into right-padded input_ids + next-token labels.
 
     ``labels[i]`` is token ``i+1`` (matching text pretraining and the no-shift
-    loss); pad, trailing, and prompt-predicting positions are ``-100``.
+    loss); pad, trailing, and prompt-predicting positions are ``-100``. An EOS
+    token is appended (when the tokenizer defines one) so the last caption token
+    is trained to stop. The first caption token is supervised only when a
+    ``prompt`` precedes it (the last prompt token predicts it); a plain,
+    unprompted caption leaves the first token unsupervised.
 
     BPE and SentencePiece tokenizers are NOT prefix-preserving: in
     general ``tokenize(prompt) + tokenize(text)`` differs from
@@ -154,7 +158,14 @@ def _tokenize_and_mask(
         full_ids = list(tokenizer(text, add_special_tokens=False)["input_ids"])
         prompt_len = 0
 
-    full_ids = full_ids[:max_text_len]
+    # Append EOS so the last caption token is trained to predict a stop token
+    # (captions use add_special_tokens=False, so none is added otherwise);
+    # reserve its slot within max_text_len. Skip when the tokenizer has no EOS.
+    eos_id = tokenizer.eos_token_id
+    if eos_id is not None:
+        full_ids = full_ids[: max_text_len - 1] + [eos_id]
+    else:
+        full_ids = full_ids[:max_text_len]
     pad_id = resolve_pad_id(tokenizer)
 
     n = len(full_ids)
