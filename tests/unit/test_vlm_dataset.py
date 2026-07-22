@@ -95,6 +95,7 @@ class TestTokenizeAndMask:
         assert labels.shape == (8,)
         assert ids[:3].tolist() == [1, 2, 3]
         assert ids[3].item() == 0  # pad
+        assert labels[:3].tolist() == [2, 3, -100]  # next-token; last has no target
         assert labels[3].item() == -100  # pad masked
 
     def test_prompt_masks_labels(self):
@@ -102,15 +103,18 @@ class TestTokenizeAndMask:
         ids, labels = _tokenize_and_mask(tok, text="xyz", max_text_len=8, prompt="ab")
         # Prompt "ab" = 2 tokens; target "xyz" = 3 tokens; total 5 tokens.
         assert ids[:5].tolist() == [1, 2, 24, 25, 26]
-        assert labels[:2].tolist() == [-100, -100]  # prompt masked
-        assert labels[2:5].tolist() == [24, 25, 26]  # targets not masked
+        # Next-token: last prompt token predicts the first target (24); earlier
+        # prompt-predicting positions are masked; last real token has no target.
+        assert labels[0].item() == -100
+        assert labels[1:4].tolist() == [24, 25, 26]
+        assert labels[4].item() == -100
         assert labels[5].item() == -100  # pad masked
 
     def test_truncation(self):
         tok = _MockTokenizer()
         ids, labels = _tokenize_and_mask(tok, text="abcdefghij", max_text_len=4, prompt=None)
         assert ids.tolist() == [1, 2, 3, 4]
-        assert labels.tolist() == [1, 2, 3, 4]
+        assert labels.tolist() == [2, 3, 4, -100]  # next-token labels; final position has none
 
     def test_prompt_mask_with_bpe_tokenizer(self):
         """Regression: BPE (gpt2) and SentencePiece tokenizers are not
@@ -136,10 +140,11 @@ class TestTokenizeAndMask:
 
         # input_ids exactly matches the independent-concat form.
         assert ids[:n].tolist() == expected_ids
-        # Prompt portion of labels is -100.
-        assert (labels[: len(prompt_ids)] == -100).all()
-        # Target portion is the independently-tokenized text ids, byte-for-byte.
-        assert labels[len(prompt_ids) : n].tolist() == text_ids
+        # Positions predicting a prompt token are -100 (the last prompt token
+        # predicts the first target, so it stays supervised).
+        assert (labels[: len(prompt_ids) - 1] == -100).all()
+        # Target labels are the independently-tokenized text ids, byte-for-byte.
+        assert labels[len(prompt_ids) - 1 : n - 1].tolist() == text_ids
 
     def test_prompt_mask_under_bpe_merge_keeps_target_intact(self):
         """Concrete BPE case: ``tokenize("foo") + tokenize("bar")`` can
@@ -163,7 +168,9 @@ class TestTokenizeAndMask:
         assert ids[:split_total].tolist() == prompt_ids + text_ids
         # Target is exactly tokenize(text) — a regression would show up
         # here as a drift in the label ids (not just their length).
-        assert labels[len(prompt_ids) : len(prompt_ids) + len(text_ids)].tolist() == text_ids
+        assert (
+            labels[len(prompt_ids) - 1 : len(prompt_ids) - 1 + len(text_ids)].tolist() == text_ids
+        )
 
 
 # ---------------------------------------------------------------------------
