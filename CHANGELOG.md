@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **MLflow logging backend** (`metrics.enable_mlflow`, Databricks-hosted or local). A third `_LoggingBackend` alongside WandB and TensorBoard: logs the same per-step metric dict, plus the flattened config as params, `host`/`slurm_job_id` tags, and optional system metrics. Credentials come from the environment (`DATABRICKS_HOST` + `DATABRICKS_TOKEN`/`DATABRICKS_API_TOKEN`); with `tracking_uri="databricks"` and no creds it disables with a warning. Opt-in at both layers — `uv sync --group mlflow` and `enable_mlflow=true`; absent or misconfigured it warns and no-ops without touching training. Default off, so existing runs are unchanged.
+  - `kempnerforge/config/metrics.py`: `enable_mlflow`, `mlflow_tracking_uri`, `mlflow_experiment`, `mlflow_run_name`, `mlflow_run_id`, `mlflow_log_system_metrics`, `mlflow_system_metrics_interval`; `__post_init__` requires an absolute experiment path on Databricks.
+  - `kempnerforge/metrics/tracker.py`: `MLflowBackend` (lazy init, run-id write-back, system metrics) + `_flatten_config_params`; selected in `_init_backends`.
+  - `scripts/train.py`: `mlflow_run_id` saved in `ckpt_extra`/`init_extra` and restored on resume, mirroring `wandb_run_id`, so a requeue reattaches to the same run (or a fresh one if the saved id was deleted, like wandb `resume="allow"`).
+  - `scripts/check_env.py`: `mlflow` preflight tag checking `DATABRICKS_HOST` + token.
+  - `pyproject.toml`: optional `mlflow` dependency group (`mlflow-skinny`, `databricks-sdk`, `psutil`, `nvidia-ml-py`).
+  - Tests: `tests/unit/test_observability.py` (backend sentinels, backend selection, config flatten, absolute-path guard).
+  - Docs: `docs/metrics-and-profiling/mlflow.md` + metrics index/tracker pages + `[metrics]` config reference.
 - **MoE router z-loss** (`moe_router_z_loss_weight`, ST-MoE style). An optional penalty on the router's pre-softmax logits — per MoE layer `mean_token(logsumexp(router_logits))²` — summed across layers and added to the training loss as `moe_router_z_loss_weight × z_loss`. It keeps router logits from growing without bound, targeting *logit-growth stability* (not load balance — that's the aux loss). Default `0.0` is off: the term is never added, so training, outputs, and gradients are unchanged. `z_loss` is a plain attribute like `aux_loss` (not a buffer/parameter), so it never enters `state_dict` — checkpoint-safe.
   - `kempnerforge/config/model.py`: `moe_router_z_loss_weight: float = 0.0` (with a non-negativity check).
   - `kempnerforge/model/router.py`: both `SoftmaxTopKRouter` and `SigmoidTopKRouter` set `self.z_loss = (logsumexp(logits, dim=-1) ** 2).mean()`.

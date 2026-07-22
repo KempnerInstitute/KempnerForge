@@ -40,7 +40,7 @@ PyTorch-native framework for fault-tolerant distributed training of foundation m
 - DCP async checkpointing with auto-resume
 - Stateful data pipeline, multi-dataset mixing, data annealing, HuggingFace integration (eager + streaming)
 - SLURM preemption, multi-node launch, `TrainingHook` extensibility
-- NaN / GPU / NCCL health monitoring, MFU tracking, WandB / TensorBoard backends
+- NaN / GPU / NCCL health monitoring, MFU tracking, WandB / TensorBoard / MLflow backends
 
 **Interpretability**
 - Activation hooks with CPU offload for probing, CKA, SVCCA
@@ -94,7 +94,7 @@ flowchart TB
     subgraph Outputs
         direction TB
         O1[DCP checkpoints]
-        O2[MetricsTracker<br/>WandB · TB]
+        O2[MetricsTracker<br/>WandB · TB · MLflow]
         O3[torch.profiler]
     end
 ```
@@ -238,7 +238,7 @@ kempnerforge/
   training/    # optimizers, loss functions, LR schedulers, gradient utils, hooks
   checkpoint/  # DCP-based distributed checkpointing with sync/async save
   resilience/  # signal handling, NaN detection, GPU/NCCL health checks
-  metrics/     # MetricsTracker, MFU computation, WandB/TensorBoard backends
+  metrics/     # MetricsTracker, MFU computation, WandB/TensorBoard/MLflow backends
   profiling/   # torch.profiler integration, CUDA timing
 configs/       # TOML configs for training runs and model architecture presets
 scripts/       # training entry point, data validation, checkpoint conversion, SLURM launch

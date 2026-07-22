@@ -7,6 +7,7 @@ import os
 import sys
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 import torch.distributed as dist
 
@@ -29,9 +30,11 @@ from kempnerforge.metrics.memory import (
 )
 from kempnerforge.metrics.tracker import (
     MetricsTracker,
+    MLflowBackend,
     StepMetrics,
     TensorBoardBackend,
     WandBBackend,
+    _flatten_config_params,
 )
 
 # ---------------------------------------------------------------------------
@@ -115,6 +118,17 @@ class TestMetricsTracker:
         config = JobConfig(
             model=ModelConfig(dim=128, n_layers=2, n_heads=2, vocab_size=256),
             metrics=MetricsConfig(enable_tensorboard=True),
+        )
+        tracker = MetricsTracker(config, num_gpus=1)
+        tracker.init_backends(config)
+        assert len(tracker._backends) == 1
+
+    def test_init_backends_rank_zero_appends_mlflow(self, monkeypatch):
+        """When rank-0 and enable_mlflow=True, init_backends appends an MLflowBackend."""
+        monkeypatch.setattr(tracker_mod, "MLflowBackend", MagicMock(name="FakeMLflow"))
+        config = JobConfig(
+            model=ModelConfig(dim=128, n_layers=2, n_heads=2, vocab_size=256),
+            metrics=MetricsConfig(enable_mlflow=True),
         )
         tracker = MetricsTracker(config, num_gpus=1)
         tracker.init_backends(config)
@@ -329,6 +343,80 @@ class TestWandBBackend:
         assert backend._run is False
 
 
+class TestMLflowBackend:
+    def test_init_no_crash(self):
+        backend = MLflowBackend(MetricsConfig(enable_mlflow=True))
+        assert backend._active is None
+
+    def test_disabled_without_databricks_creds(self, monkeypatch):
+        """tracking_uri=databricks with no creds disables the backend before importing mlflow."""
+        for var in ("DATABRICKS_HOST", "DATABRICKS_TOKEN", "DATABRICKS_API_TOKEN"):
+            monkeypatch.delenv(var, raising=False)
+        backend = MLflowBackend(MetricsConfig(enable_mlflow=True))  # default uri = databricks
+        backend.log({"train/loss": 1.0}, step=1)
+        assert backend._active is False
+
+    def test_mlflow_handles_import_error(self, monkeypatch):
+        """ImportError inside _ensure_init flips _active to the False sentinel."""
+        monkeypatch.setitem(sys.modules, "mlflow", None)
+        # Non-databricks URI so the readiness gate is skipped and the import is attempted.
+        backend = MLflowBackend(
+            MetricsConfig(enable_mlflow=True, mlflow_tracking_uri="http://localhost:5000")
+        )
+        backend.log({"train/loss": 1.0}, step=1)
+        assert backend._active is False
+
+    def test_mlflow_handles_init_exception(self, monkeypatch):
+        """A non-ImportError from mlflow (e.g. tracking/auth) flips _active = False."""
+        mlflow = pytest.importorskip("mlflow")
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("simulated tracking failure")
+
+        monkeypatch.setattr(mlflow, "set_tracking_uri", _boom)
+        backend = MLflowBackend(
+            MetricsConfig(enable_mlflow=True, mlflow_tracking_uri="sqlite:///x.db")
+        )
+        backend.log({"train/loss": 1.0}, step=1)
+        assert backend._active is False
+
+    def test_resume_falls_back_to_new_run_when_id_missing(self, monkeypatch):
+        """A stale saved run_id (run deleted) starts a fresh run, like wandb resume='allow'."""
+        import types
+
+        tried: list = []
+        fake_run = types.SimpleNamespace(info=types.SimpleNamespace(run_id="new-run-123"))
+
+        def fake_start_run(run_id=None, run_name=None, log_system_metrics=False):
+            tried.append(run_id)
+            if run_id is not None:
+                raise RuntimeError("RESOURCE_DOES_NOT_EXIST")
+            return fake_run
+
+        fake_mlflow = types.SimpleNamespace(
+            set_tracking_uri=lambda *a, **k: None,
+            set_experiment=lambda *a, **k: None,
+            set_system_metrics_sampling_interval=lambda *a, **k: None,
+            start_run=fake_start_run,
+            log_params=lambda *a, **k: None,
+            set_tags=lambda *a, **k: None,
+            log_metrics=lambda *a, **k: None,
+            end_run=lambda *a, **k: None,
+        )
+        monkeypatch.setitem(sys.modules, "mlflow", fake_mlflow)
+        cfg = MetricsConfig(
+            enable_mlflow=True,
+            mlflow_tracking_uri="http://localhost:5000",  # skip the databricks readiness gate
+            mlflow_run_id="stale-id",
+            mlflow_log_system_metrics=False,
+        )
+        backend = MLflowBackend(cfg)
+        backend.log({"train/loss": 1.0}, step=1)
+        assert backend._active is True
+        assert cfg.mlflow_run_id == "new-run-123"  # wrote back the new id
+        assert tried == ["stale-id", None]  # tried resume, then started fresh
+
+
 class TestTensorBoardBackend:
     def test_init_no_crash(self):
         config = MetricsConfig(enable_tensorboard=True)
@@ -349,6 +437,44 @@ class TestTensorBoardBackend:
         backend = TensorBoardBackend(MetricsConfig(enable_tensorboard=True))
         backend.log({"loss": 1.0}, step=1)
         assert backend._writer is False
+
+
+class TestFlattenConfigParams:
+    def test_flatten_produces_dotted_scalar_string_keys(self):
+        config = JobConfig(
+            model=ModelConfig(dim=128, n_layers=2, n_heads=2, vocab_size=256),
+            metrics=MetricsConfig(log_interval=7),
+        )
+        params = _flatten_config_params(config)
+        assert params["model.dim"] == "128"
+        assert params["metrics.log_interval"] == "7"
+        # mlflow.log_params requires string values.
+        assert all(isinstance(v, str) for v in params.values())
+        # Optional None sub-configs (vlm, adapter, vision_encoder) are skipped.
+        assert not any(k.startswith("vlm") for k in params)
+
+    def test_flatten_truncates_long_values(self):
+        config = JobConfig(model=ModelConfig(dim=128, n_layers=2, n_heads=2, vocab_size=256))
+        params = _flatten_config_params(config, max_len=4)
+        assert all(len(v) <= 4 for v in params.values())
+
+
+class TestMetricsConfigMLflow:
+    def test_databricks_requires_absolute_experiment_path(self):
+        with pytest.raises(ValueError, match="absolute workspace path"):
+            MetricsConfig(enable_mlflow=True, mlflow_experiment="bare-name")
+
+    def test_absolute_experiment_path_ok(self):
+        cfg = MetricsConfig(enable_mlflow=True, mlflow_experiment="/Users/me/proj")
+        assert cfg.mlflow_experiment == "/Users/me/proj"
+
+    def test_bare_name_ok_for_local_uri(self):
+        cfg = MetricsConfig(
+            enable_mlflow=True,
+            mlflow_tracking_uri="sqlite:///mlflow.db",
+            mlflow_experiment="bare-name",
+        )
+        assert cfg.mlflow_experiment == "bare-name"
 
 
 # ---------------------------------------------------------------------------

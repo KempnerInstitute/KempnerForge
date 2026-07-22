@@ -1,12 +1,16 @@
+# pyright: reportMissingImports=false
+# ^ mlflow + databricks-sdk are an optional group; CI type-checks without them,
+#   so the lazy imports below would otherwise raise reportMissingImports.
 """Metrics collection, accumulation, and reporting.
 
 MetricsTracker aggregates per-step metrics (loss, grad norm, throughput,
 MFU, memory) and dispatches them to configured logging backends (stdout,
-WandB, TensorBoard) at a configurable interval.
+WandB, TensorBoard, MLflow) at a configurable interval.
 """
 
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -88,6 +92,8 @@ class MetricsTracker:
             self._backends.append(WandBBackend(mc))
         if mc.enable_tensorboard:
             self._backends.append(TensorBoardBackend(mc))
+        if mc.enable_mlflow:
+            self._backends.append(MLflowBackend(mc, hyperparams=_flatten_config_params(config)))
 
     def start_step(self) -> None:
         """Mark the beginning of a training step."""
@@ -276,6 +282,152 @@ class WandBBackend(_LoggingBackend):
             import wandb
 
             wandb.finish()
+
+
+def _mlflow_databricks_ready() -> bool:
+    """True when Databricks credentials are present in the environment."""
+    has_token = bool(os.environ.get("DATABRICKS_TOKEN") or os.environ.get("DATABRICKS_API_TOKEN"))
+    return bool(os.environ.get("DATABRICKS_HOST")) and has_token
+
+
+def _resolve_mlflow_experiment(config: MetricsConfig, uri: str) -> str | None:
+    """Experiment name: mlflow_experiment -> $MLFLOW_EXPERIMENT -> auto
+    (/Users/<user>/<project> via the SDK on Databricks; bare name locally)."""
+    if config.mlflow_experiment:
+        return config.mlflow_experiment
+    if os.environ.get("MLFLOW_EXPERIMENT"):
+        return os.environ["MLFLOW_EXPERIMENT"]
+    project = config.wandb_project or "kempnerforge"
+    if not uri.startswith("databricks"):
+        return project
+    try:
+        from databricks.sdk import WorkspaceClient
+
+        user = WorkspaceClient().current_user.me().user_name
+        return f"/Users/{user}/{project}"
+    except Exception as e:  # SDK missing, no creds, or API error
+        logger.warning(f"Could not auto-resolve Databricks experiment path: {e}")
+        return None
+
+
+def _flatten_config_params(config: JobConfig, max_len: int = 250) -> dict[str, str]:
+    """Flatten a JobConfig to dotted string keys (model.dim, ...) for mlflow.log_params.
+
+    None is skipped; non-scalars are stringified; values truncated to max_len.
+    """
+    from dataclasses import asdict
+
+    flat: dict[str, str] = {}
+
+    def _walk(prefix: str, value: Any) -> None:
+        if value is None:
+            return
+        if isinstance(value, dict):
+            for k, v in value.items():
+                _walk(f"{prefix}.{k}" if prefix else str(k), v)
+        else:
+            flat[prefix] = str(value)[:max_len]
+
+    _walk("", asdict(config))
+    return flat
+
+
+class MLflowBackend(_LoggingBackend):
+    """MLflow logging backend (Databricks-hosted or any MLflow tracking server).
+
+    Lazy init on first log; run ID written back to config for checkpoint resume.
+    """
+
+    def __init__(self, config: MetricsConfig, hyperparams: dict[str, str] | None = None) -> None:
+        self._config = config
+        self._hyperparams = hyperparams or {}
+        self._active: bool | None = None  # None = not tried, True = live, False = failed
+
+    def _ensure_init(self) -> None:
+        if self._active is not None:
+            return
+        uri = self._config.mlflow_tracking_uri
+        if uri.startswith("databricks"):
+            if not _mlflow_databricks_ready():
+                logger.warning(
+                    "enable_mlflow with tracking_uri='databricks' but DATABRICKS_HOST/token "
+                    "not set — disabling MLflow backend"
+                )
+                self._active = False
+                return
+            # The Databricks SDK reads DATABRICKS_TOKEN; mirror the DATABRICKS_API_TOKEN
+            # name many keep in ~/.bashrc so either works.
+            if not os.environ.get("DATABRICKS_TOKEN") and os.environ.get("DATABRICKS_API_TOKEN"):
+                os.environ["DATABRICKS_TOKEN"] = os.environ["DATABRICKS_API_TOKEN"]
+        try:
+            import mlflow
+
+            mlflow.set_tracking_uri(uri)
+            experiment = _resolve_mlflow_experiment(self._config, uri)
+            if experiment:
+                mlflow.set_experiment(experiment)
+            if self._config.mlflow_log_system_metrics:
+                mlflow.set_system_metrics_sampling_interval(
+                    self._config.mlflow_system_metrics_interval
+                )
+            run, resumed = self._start_run(mlflow)
+            self._config.mlflow_run_id = run.info.run_id
+            self._active = True
+            logger.info(f"MLflow initialized: experiment={experiment} run_id={run.info.run_id}")
+            if not resumed:
+                self._log_run_metadata(mlflow)
+        except ImportError:
+            logger.warning(
+                "mlflow not installed — disabling MLflow backend (uv sync --group mlflow)"
+            )
+            self._active = False
+        except Exception as e:  # mlflow talks to a remote server: network / auth / config errors
+            logger.warning(f"MLflow init failed: {e}")
+            self._active = False
+
+    def _start_run(self, mlflow: Any) -> tuple[Any, bool]:
+        """Start a run, or resume the saved run_id. If that run_id no longer exists, fall
+        back to a fresh run (matching wandb's resume='allow'). Returns (run, resumed)."""
+        kwargs: dict[str, Any] = {
+            "run_name": self._config.mlflow_run_name,
+            "log_system_metrics": self._config.mlflow_log_system_metrics,
+        }
+        run_id = self._config.mlflow_run_id or None
+        if run_id:
+            try:
+                return mlflow.start_run(run_id=run_id, **kwargs), True
+            except Exception as e:  # saved run deleted/inaccessible — start fresh, like wandb
+                logger.warning(f"MLflow could not resume run_id={run_id} ({e}); starting a new run")
+        return mlflow.start_run(**kwargs), False
+
+    def _log_run_metadata(self, mlflow: Any) -> None:
+        """Log flattened config as params + host/slurm tags; non-fatal on error."""
+        try:
+            import socket
+
+            items = list(self._hyperparams.items())
+            # MLflow caps a single log_params batch at 100 entries.
+            for i in range(0, len(items), 100):
+                mlflow.log_params(dict(items[i : i + 100]))
+            mlflow.set_tags(
+                {"host": socket.gethostname(), "slurm_job_id": os.environ.get("SLURM_JOB_ID", "")}
+            )
+        except Exception as e:
+            logger.warning(f"MLflow metadata logging failed (continuing): {e}")
+
+    def log(self, metrics: dict[str, float], step: int) -> None:
+        self._ensure_init()
+        if self._active is not True:
+            return
+        import mlflow
+
+        mlflow.log_metrics({k: float(v) for k, v in metrics.items()}, step=step)
+
+    def close(self) -> None:
+        if self._active is True:
+            import mlflow
+
+            mlflow.end_run()
 
 
 class TensorBoardBackend(_LoggingBackend):

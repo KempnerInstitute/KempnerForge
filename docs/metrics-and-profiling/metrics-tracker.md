@@ -134,6 +134,8 @@ if mc.enable_wandb:
     self._backends.append(WandBBackend(mc))
 if mc.enable_tensorboard:
     self._backends.append(TensorBoardBackend(mc))
+if mc.enable_mlflow:
+    self._backends.append(MLflowBackend(mc, hyperparams=_flatten_config_params(config)))
 ```
 
 Non-rank-0 workers keep `_backends` empty; their `_log_step` call iterates
@@ -172,8 +174,8 @@ def close(self) -> None:
         backend.close()
 ```
 
-Called at the end of `scripts/train.py`. WandB closes the run; TensorBoard
-flushes the event file.
+Called at the end of `scripts/train.py`. WandB and MLflow close the run;
+TensorBoard flushes the event file.
 
 ## Logger: `get_logger`, `format_metrics`
 
@@ -198,6 +200,8 @@ only takes effect on the very first call.
 ## See also
 
 - [WandB](wandb.md) — how `WandBBackend` initializes and what it logs.
+- [MLflow](mlflow.md) — Databricks-hosted tracking with the same metric
+  dict and run-id-resume pattern.
 - [TensorBoard](tensorboard.md) — `TensorBoardBackend` specifics and
   where event files land.
 - [MFU](mfu.md) — what the `mfu` field is computed from.
