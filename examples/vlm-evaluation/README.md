@@ -127,6 +127,46 @@ accelerate launch --num_processes 4 examples/vlm-evaluation/vlm_eval_harness.py 
 | `--batch-size` | `1` | requests decoded together (grouped by `gen_kwargs`) |
 | `--max-new-tokens` | `128` | fallback only; task `gen_kwargs` override it |
 
+## Experiment tracking
+
+Eval results can be logged through the framework's metrics backends — the same
+`MetricsTracker` training uses (`kempnerforge/metrics/tracker.py`), so eval
+inherits every backend the framework has (WandB, TensorBoard; MLflow once PR
+#159 lands). Tracking is off by default and enabled with the same config flags
+as training, forwarded as dotted overrides:
+
+```bash
+uv run python examples/vlm-evaluation/vlm_eval_harness.py \
+    --config     configs/train/vlm_jd.toml \
+    --checkpoint checkpoints/vlm/step_10000 \
+    --tasks      mmmu_val \
+    --metrics.enable_wandb=true --metrics.wandb_project=vlm-eval
+```
+
+Any unrecognized `--section.key=value` argument is layered over `--config` by
+the KempnerForge config loader (unknown keys fail fast). TensorBoard works the
+same way: `--metrics.enable_tensorboard=true --metrics.tensorboard_dir=...`.
+
+- **Results land in the checkpoint's training run.** The harness reads the
+  `wandb_run_id` training saved into the checkpoint's `train_state.pt` and
+  resumes that run, so eval metrics sit next to the training curves and the run
+  id can never be wrong. When the checkpoint has none (training ran with
+  tracking off), a fresh run named `<run>-<step_N>` starts with a warning;
+  attach to a specific run with `--metrics.wandb_run_id=<id>`.
+- **Logged at the checkpoint's training step**, as one flat dict:
+  `eval/benchmarks/agg/<benchmark>` (the aggregate, normalized into [0, 1] via
+  the manifest), `eval/benchmarks/raw/<task>/<metric>` (every numeric metric of
+  every task and subtask, unnormalized — nothing thrown away), and
+  `eval/benchmarks/throughput/<task>/...`.
+- **Per-benchmark knowledge lives in
+  [`benchmark_manifest.py`](benchmark_manifest.py).** Each benchmark registers
+  its authoritative aggregate metric and score range. An unregistered benchmark
+  falls back to result metadata with a loud warning that includes the exact
+  registry line to paste — add it when you add a benchmark. `egoschema` is
+  submission-only and logs no aggregate by design.
+- A tracking failure (missing wandb, no network, bad credentials) never fails a
+  completed eval — it warns and moves on.
+
 ## Video evaluation
 
 When `--config` is a **video checkpoint** (its TOML has a `[video]` section), the
