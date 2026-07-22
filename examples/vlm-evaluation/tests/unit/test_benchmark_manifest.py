@@ -1,10 +1,6 @@
-"""CPU unit tests for the benchmark manifest (aggregate resolution + metric flattening).
-
-Pure dict-in/dict-out — ``benchmark_manifest`` imports nothing beyond stdlib,
-so these run hermetically with no GPU, checkpoint, or lmms-eval. Results-dict
-fixtures mirror the shapes ``simple_evaluate`` actually produces (leaf tasks,
-grouped tasks with empty main entries, nested groups, dict-valued aggregates).
-"""
+"""Unit tests for the benchmark manifest. Fixtures mirror the result shapes
+``simple_evaluate`` produces (leaf tasks, grouped tasks with empty main
+entries, nested groups, dict-valued aggregates)."""
 
 from __future__ import annotations
 

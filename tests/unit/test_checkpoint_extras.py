@@ -1,10 +1,5 @@
-"""Tests for ``load_train_state_extras`` — the read-only checkpoint extras accessor.
-
-The accessor shares ``_load_train_state``'s UID trust boundary (train_state.pt
-is a full pickle) but, unlike ``restore_train_state``, must never apply the
-saved RNG state: it exists so eval tooling can read ``wandb_run_id`` and
-friends without perturbing the calling process.
-"""
+"""Tests for ``load_train_state_extras``: extras round-trip, the UID trust
+boundary, and that reading never applies the saved RNG state."""
 
 from __future__ import annotations
 

@@ -31,8 +31,7 @@ Usage:
         --tasks mmmu_val,mmbench_en_dev \
         --limit 4
 
-    # Track results through the framework metrics backends (see README.md,
-    # "Experiment tracking"): any --section.key=value arg is a config override.
+    # Log results to the checkpoint's training run (see README: Experiment tracking)
     uv run python examples/vlm-evaluation/vlm_eval_harness.py \
         --config configs/train/vlm_jd.toml \
         --checkpoint checkpoints/vlm/step_10000 \
@@ -96,11 +95,9 @@ def _checkpoint_step(ckpt_dir: Path) -> int:
 
 
 def _resolve_run_id(config: JobConfig, ckpt_dir: Path) -> None:
-    """Point ``config.metrics`` at the run these eval results belong to.
-
-    Precedence: an explicit ``--metrics.wandb_run_id=`` override (already layered
-    into ``config``) > the ``wandb_run_id`` training saved into the checkpoint >
-    a fresh run named after the checkpoint (with a warning).
+    """Point ``config.metrics`` at the run these results belong to: an explicit
+    ``--metrics.wandb_run_id`` override wins, else the id training saved into
+    the checkpoint, else a fresh run named after the checkpoint.
     """
     mc = config.metrics
     if mc.wandb_run_id:
@@ -127,11 +124,9 @@ def _resolve_run_id(config: JobConfig, ckpt_dir: Path) -> None:
 def _track_eval(config: JobConfig, results: dict, tasks: list[str], ckpt_dir: Path) -> None:
     """Log eval metrics through the framework's MetricsTracker backends.
 
-    The same interface train.py uses — construct, ``init_backends``, one
-    ``log_eval`` at the checkpoint's training step, ``close`` — with eval-scoped
-    choices: the tracker lives for exactly this one call, and ``gpu_peak_tflops``
-    is a nonzero sentinel because eval never computes MFU (``None``/``0.0`` would
-    trigger the GPU probe). A tracking failure never fails a completed eval.
+    ``gpu_peak_tflops`` is a nonzero sentinel: eval never computes MFU, and
+    ``None``/``0.0`` would trigger the GPU probe. A tracking failure never
+    fails a completed eval.
     """
     try:
         from benchmark_manifest import build_eval_metrics
@@ -197,9 +192,8 @@ def main() -> None:
     )
     args, extra_overrides = parser.parse_known_args()
 
-    # Layer forwarded --section.key=value overrides over the checkpoint TOML; an
-    # unknown key raises here, before the expensive model build. The adapter does
-    # its own model-only load of the TOML — this config exists for tracking.
+    # Forwarded --section.key=value overrides layer over the checkpoint TOML;
+    # unknown keys raise here, before the expensive model build.
     from kempnerforge.config.loader import load_config
 
     config = load_config(args.config, cli_args=extra_overrides)
@@ -283,9 +277,9 @@ def main() -> None:
                 json.dump(results, f, indent=2, default=str)
             logger.info(f"Results saved to {output_path}")
 
-        # --- Experiment tracking (opt-in via --metrics.* overrides) ---
+        # --- Experiment tracking (opt-in) ---
         mc = config.metrics
-        track = mc.enable_wandb or mc.enable_tensorboard  # + mc.enable_mlflow once #159 lands
+        track = mc.enable_wandb or mc.enable_tensorboard
         if track and results is not None and "results" in results:
             _track_eval(config, results, args.tasks.split(","), ckpt_dir)
 

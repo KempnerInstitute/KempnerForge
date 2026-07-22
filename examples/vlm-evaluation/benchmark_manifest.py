@@ -1,21 +1,15 @@
-"""Benchmark manifest: the single place per-benchmark knowledge lives for VLM eval.
+"""Benchmark manifest: per-benchmark metric knowledge for VLM eval.
 
-For each benchmark the registry records which metric in an lmms-eval results
-dict is the authoritative aggregate, and how to map it into [0, 1] so scores
-are comparable across benchmarks. Unregistered benchmarks fall back to a
-metadata-driven guess with a loud warning telling you to register them.
+Each entry records which metric in an lmms-eval results dict is a benchmark's
+authoritative aggregate and how to map it into [0, 1]. Unregistered benchmarks
+fall back to a metadata-driven guess with a loud warning.
 
-``build_eval_metrics`` turns a ``simple_evaluate`` results dict into one flat
-``{key: float}`` dict for logging through the framework's metrics backends:
+``build_eval_metrics`` flattens a ``simple_evaluate`` results dict for logging:
 
     eval/benchmarks/agg/<benchmark>            normalized [0, 1] aggregate
     eval/benchmarks/raw/<task>/<metric>[/...]  every numeric metric, raw
     eval/benchmarks/throughput/<task>/<key>    native lmms-eval throughput
     eval/benchmarks/efficiency/<task>/<key>    only when the run logged samples
-
-Deliberately not in the spec until a consumer lands: random-guess baselines
-(today in ``local/scripts/plot_eval_results.py``; wanted for above-chance
-normalization), display names, modality tags.
 """
 
 from __future__ import annotations
@@ -30,17 +24,12 @@ _KEY_PREFIX = "eval/benchmarks"
 
 @dataclass(frozen=True)
 class MetricSpec:
-    """How to read one benchmark's authoritative aggregate out of an lmms-eval result.
+    """How to read one benchmark's authoritative aggregate from an lmms-eval result.
 
-    ``metric`` is the name *before* lmms-eval's ``,<filter>`` suffix (``"aAcc"``
-    matches ``"aAcc,none"``); ``None`` marks a registered benchmark with no
-    local score (a submission-only leaderboard task) — skipped without warning.
-    ``scale`` is the divisor mapping the raw value into [0, 1] (``100.0`` for a
-    0-100 percentage); ``None`` means "infer by magnitude" (raw > 1.0 -> /100,
-    else /1) — used by the unregistered fallback, or when a scale is genuinely
-    unknown. ``filter`` disambiguates a metric reported under several filters
-    (gsm8k's strict vs flexible). ``subkey`` selects from a dict-valued metric
-    (videoevalpro reports a dict keyed by task type plus ``"overall"``).
+    ``metric`` is the name before the ``,<filter>`` suffix; ``None`` = no local
+    score (submission-only task). ``scale`` divides the raw value into [0, 1];
+    ``None`` = infer by magnitude (raw > 1.0 -> /100, else /1). ``filter``
+    disambiguates multi-filter metrics; ``subkey`` indexes a dict-valued one.
     """
 
     metric: str | None
@@ -49,13 +38,9 @@ class MetricSpec:
     subkey: str | None = None
 
 
-# The authoritative aggregate for each benchmark we run, keyed by the lmms-eval
-# top-level task name (the ``results`` key). Derived by crawling real lmms-eval
-# outputs and task sources: the "overall" metric cannot be inferred from name
-# substrings (a task reports several accuracies and only one is the aggregate),
-# and scale cannot be inferred from the metric name (``accuracy`` is 0-100 for
-# mmvu_val but 0-1 for perceptiontest_val_mc). Registering a benchmark = adding
-# one line here.
+# Authoritative aggregate per benchmark, keyed by the lmms-eval top-level task
+# name. Neither the metric nor its scale can be inferred (``accuracy`` is 0-100
+# for mmvu_val but 0-1 for perceptiontest_val_mc), so entries are explicit.
 BENCHMARK_METRICS: dict[str, MetricSpec] = {
     # --- image ---
     "hallusion_bench_image": MetricSpec("aAcc", scale=100.0),
@@ -75,14 +60,14 @@ BENCHMARK_METRICS: dict[str, MetricSpec] = {
     "videoevalpro": MetricSpec("videoevalpro_score", subkey="overall"),  # dict-valued aggregate
     "lvbench": MetricSpec("lvbench_score"),
     "videomme_v2": MetricSpec("videomme_v2_overall_acc", scale=100.0),
-    "egoschema": MetricSpec(None),  # submission-only leaderboard task; no local score
-    # --- vdc caption splits (upstream metric name carries the double-l typo) ---
+    "egoschema": MetricSpec(None),  # submission-only; no local score
+    # --- vdc caption splits (upstream double-l typo) ---
     "camera_test": MetricSpec("llmms_eval_acc"),
     "background_test": MetricSpec("llmms_eval_acc"),
     "detailed_test": MetricSpec("llmms_eval_acc"),
     "main_object_test": MetricSpec("llmms_eval_acc"),
     "short_test": MetricSpec("llmms_eval_acc"),
-    # --- text (flexible-extract disambiguates the two exact_match filter columns) ---
+    # --- text ---
     "gsm8k_cot_zeroshot": MetricSpec("exact_match", filter="flexible-extract"),
     "mmlu_flan_cot_zeroshot": MetricSpec("exact_match", filter="flexible-extract"),
     "gpqa_main_cot_zeroshot": MetricSpec("exact_match", filter="flexible-extract"),
@@ -94,10 +79,8 @@ def _lookup_metric(
 ) -> float | None:
     """Value of ``metric`` in one result entry, matched on the name before the comma.
 
-    Among keys whose base name (before ``,``) equals ``metric`` — skipping the
-    ``alias`` and stderr columns — prefer the requested ``filter``, then
-    ``"none"``, then the first match. When ``subkey`` is set and the chosen
-    value is a dict, index into it. Returns ``None`` when absent or non-numeric.
+    Prefers the requested ``filter``, then ``"none"``, then the first match;
+    skips ``alias``/stderr columns. Returns ``None`` when absent or non-numeric.
     """
     matches: list[tuple[str, object]] = []
     for key, value in entry.items():
@@ -123,12 +106,8 @@ def _lookup_metric(
 
 
 def _resolve_spec(task: str, higher_is_better: dict) -> MetricSpec | None:
-    """Registry entry for ``task``, else a metadata-driven fallback (loud), else ``None``.
-
-    The fallback uses the result's own ``higher_is_better`` metadata: exactly
-    one named metric -> use it with a magnitude-inferred scale; zero or several
-    -> no way to choose an aggregate, skip. Both paths warn with a paste-ready
-    registry line so the benchmark gets registered.
+    """Registry entry for ``task``, else a loud ``higher_is_better``-driven
+    fallback, else ``None`` (skip).
     """
     spec = BENCHMARK_METRICS.get(task)
     if spec is not None:
@@ -160,13 +139,11 @@ def _resolve_spec(task: str, higher_is_better: dict) -> MetricSpec | None:
 
 
 def benchmark_aggregates(results: dict, tasks: list[str]) -> dict[str, float]:
-    """Map each requested benchmark -> its authoritative aggregate as a [0, 1] fraction.
+    """Map each requested benchmark to its aggregate as a [0, 1] fraction.
 
-    Iterates the *requested* top-level tasks — never ``group_subtasks`` keys,
-    which also list nested intermediate groups (mmlu's ``stem``/``humanities``)
-    that would resolve as phantom benchmarks. A grouped task whose main entry
-    carries no value for the metric (tempcompass, tvbench) is the mean of that
-    metric over its subtasks.
+    Only the requested tasks are resolved (``group_subtasks`` also lists nested
+    intermediate groups). A grouped task whose main entry carries no value is
+    the mean of the metric over its subtasks.
     """
     task_results: dict[str, dict] = results.get("results", {})
     group_subtasks: dict[str, list] = results.get("group_subtasks", {})
@@ -175,7 +152,7 @@ def benchmark_aggregates(results: dict, tasks: list[str]) -> dict[str, float]:
     for task in tasks:
         spec = _resolve_spec(task, higher_is_better)
         if spec is None or spec.metric is None:
-            continue  # unresolved (already warned) or submission-only (silent)
+            continue  # unresolved (already warned) or submission-only
         raw = _lookup_metric(task_results.get(task) or {}, spec.metric, spec.filter, spec.subkey)
         if raw is None:
             subtask_values = [
@@ -206,10 +183,8 @@ def benchmark_aggregates(results: dict, tasks: list[str]) -> dict[str, float]:
 def _raw_metrics(results: dict) -> dict[str, float]:
     """Flatten every numeric metric of every task and subtask, unnormalized.
 
-    Key shape: ``eval/benchmarks/raw/<task>/<metric>``, with the filter
-    appended when it is not ``"none"`` and the dict key appended for
-    dict-valued metrics. ``alias`` and stderr columns are skipped (they remain
-    in the results JSON).
+    Keys are ``eval/benchmarks/raw/<task>/<metric>``, with non-``none`` filters
+    and dict keys appended; ``alias``/stderr columns are skipped.
     """
     metrics: dict[str, float] = {}
     for task, entry in (results.get("results") or {}).items():
@@ -244,10 +219,9 @@ _EFFICIENCY_KEYS = (
 def _perf_metrics(results: dict, tasks: list[str]) -> dict[str, float]:
     """Native lmms-eval throughput/efficiency summaries as per-task scalars.
 
-    ``results["throughput"]`` is per-invocation (one benchmark per job in the
-    launch scripts), so it is attributed to each requested task;
-    ``results["efficiency"]["by_task"]`` is already per-task and exists only
-    when the run logged samples. Non-numeric entries are skipped.
+    ``results["throughput"]`` is per-invocation, so it is attributed to each
+    requested task; ``efficiency["by_task"]`` exists only when samples were
+    logged.
     """
     metrics: dict[str, float] = {}
     throughput = results.get("throughput") or {}
@@ -268,12 +242,8 @@ def _perf_metrics(results: dict, tasks: list[str]) -> dict[str, float]:
 
 
 def build_eval_metrics(results: dict, tasks: list[str]) -> dict[str, float]:
-    """One flat ``{key: float}`` dict for logging.
-
-    Normalized aggregates under ``eval/benchmarks/agg/<benchmark>``, the full
-    raw flatten under ``eval/benchmarks/raw/...``, and native throughput /
-    efficiency — the aggregate selection only adds to, never filters, what gets
-    logged.
+    """One flat ``{key: float}`` dict for logging: normalized aggregates, the
+    full raw flatten, and native throughput/efficiency.
     """
     metrics = {
         f"{_KEY_PREFIX}/agg/{bench}": score

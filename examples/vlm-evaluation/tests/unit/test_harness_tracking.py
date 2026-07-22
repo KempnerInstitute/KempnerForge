@@ -1,10 +1,6 @@
-"""CPU unit tests for the harness's experiment-tracking helpers.
-
-``vlm_eval_harness``'s module-level imports are stdlib-only (kempnerforge and
-lmms-eval are imported lazily inside functions), so it imports cleanly under the
-hermetic unit conftest. ``load_train_state_extras`` is monkeypatched at its
-source module — the harness re-imports it per call.
-"""
+"""Unit tests for the harness's experiment-tracking helpers.
+``load_train_state_extras`` is monkeypatched at its source module — the
+harness re-imports it per call."""
 
 from __future__ import annotations
 
