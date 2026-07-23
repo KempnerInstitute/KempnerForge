@@ -2,18 +2,16 @@
 """Run lmms-eval benchmarks on a KempnerForge VLM checkpoint.
 
 Evaluates a VLM checkpoint via the ``KempnerForgeVLM`` lmms-eval chat-model
-adapter (the sibling ``adapter.py``), on the standard benchmarks lmms-eval
-implements as ``generate_until`` tasks (MMMU, MMBench, ScienceQA, SEED, AI2D,
-...). The harness constructs the adapter directly and passes the instance to
-``simple_evaluate`` — there is no lmms-eval entry-point registration.
+adapter, on the standard benchmarks lmms-eval implements as ``generate_until``
+tasks.
 
 Requirements (lmms-eval is an OPTIONAL, separately-installed dependency, exactly
 like lm-eval for text evaluation):
 
     uv pip install lmms-eval
 
-v1 is single-GPU; MoMa checkpoints are not supported (see README.md in this
-directory). On clusters where importing lmms-eval's evaluator fails with
+MoMa checkpoints are not supported (see README.md in this directory).
+On clusters where importing lmms-eval's evaluator fails with
 ``GLIBCXX_... not found``, put a newer libstdc++ on the library path
 (e.g. ``LD_LIBRARY_PATH=<conda>/lib``).
 
