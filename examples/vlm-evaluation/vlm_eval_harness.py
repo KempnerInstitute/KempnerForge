@@ -147,7 +147,8 @@ def main() -> None:
         description="Run lmms-eval on a KempnerForge VLM checkpoint",
         epilog=(
             "Unrecognized --section.key=value arguments are forwarded to the KempnerForge "
-            "config loader as dotted overrides on --config. Experiment tracking is enabled "
+            "config loader as dotted overrides on --config and apply to both the evaluated "
+            "model (e.g. --video.max_frames=8) and experiment tracking, which is enabled "
             "that way, e.g. --metrics.enable_wandb=true --metrics.wandb_project=vlm-eval "
             "(see 'Experiment tracking' in README.md)."
         ),
@@ -193,7 +194,9 @@ def main() -> None:
     args, extra_overrides = parser.parse_known_args()
 
     # Forwarded --section.key=value overrides layer over the checkpoint TOML;
-    # unknown keys raise here, before the expensive model build.
+    # unknown keys raise here, before the expensive model build. The merged
+    # config object is passed to the adapter below, so overrides reach the
+    # evaluated model, not just experiment tracking.
     from kempnerforge.config.loader import load_config
 
     config = load_config(args.config, cli_args=extra_overrides)
@@ -226,7 +229,7 @@ def main() -> None:
     # the checkpoint config (train.param_dtype).
     dtype_kwargs = {"dtype": args.dtype} if args.dtype is not None else {}
     model = KempnerForgeVLM(
-        config=args.config,
+        config=config,
         checkpoint=args.checkpoint,
         device=args.device,
         batch_size=args.batch_size,

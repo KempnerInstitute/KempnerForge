@@ -132,7 +132,8 @@ accelerate launch --num_processes 4 examples/vlm-evaluation/vlm_eval_harness.py 
 Results can be logged through the framework's metrics backends
 (`kempnerforge/metrics/tracker.py`) using the same config flags as training,
 forwarded as dotted overrides — any unrecognized `--section.key=value` argument
-is layered over `--config` (unknown keys fail fast):
+is layered over `--config` (unknown keys fail fast) and applies to both the
+evaluated model (e.g. `--video.max_frames=8`) and experiment tracking:
 
 ```bash
 uv run python examples/vlm-evaluation/vlm_eval_harness.py \
@@ -149,7 +150,8 @@ uv run python examples/vlm-evaluation/vlm_eval_harness.py \
 - Metrics are logged at the checkpoint's training step:
   `eval/benchmarks/agg/<benchmark>` (aggregate, normalized into [0, 1]),
   `eval/benchmarks/raw/<task>/<metric>` (every metric, unnormalized), and
-  `eval/benchmarks/throughput/<task>/...`.
+  `eval/benchmarks/throughput/overall/...` (per-invocation, so comparable
+  across runs only for the same task set).
 - Per-benchmark metric names and scales live in
   [`benchmark_manifest.py`](benchmark_manifest.py); an unregistered benchmark
   warns with the exact registry line to add.
