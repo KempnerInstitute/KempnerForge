@@ -28,7 +28,11 @@ from torch.distributed.checkpoint.state_dict import (
 )
 
 from kempnerforge.checkpoint.async_save import AsyncCheckpointer
-from kempnerforge.checkpoint.state import build_train_state, restore_train_state
+from kempnerforge.checkpoint.state import (
+    TRAIN_STATE_STANDARD_KEYS,
+    build_train_state,
+    restore_train_state,
+)
 from kempnerforge.config.schema import AsyncCheckpointMode, CheckpointConfig
 
 logger = logging.getLogger(__name__)
@@ -108,6 +112,23 @@ def _load_train_state(path: Path) -> dict[str, Any]:
             f"at load time. Consider chmod g-w,o-w on the checkpoint directory."
         )
     return torch.load(path, map_location="cpu", weights_only=False)
+
+
+def load_train_state_extras(checkpoint_dir: str | Path) -> dict[str, Any]:
+    """Read the caller-supplied ``extra`` keys from a checkpoint's train_state.pt.
+
+    Read-only accessor for the metadata training saves via
+    ``build_train_state(extra=...)``, e.g. ``wandb_run_id``; unlike
+    ``restore_train_state`` it never applies the saved RNG state. Expects a
+    concrete ``step_N`` directory and returns ``{}`` when there is no
+    ``train_state.pt``. Raises ``PermissionError`` for a foreign-owned file
+    (see ``_load_train_state``).
+    """
+    path = Path(checkpoint_dir) / _TRAIN_STATE_FILE
+    if not path.exists():
+        return {}
+    state = _load_train_state(path)
+    return {k: v for k, v in state.items() if k not in TRAIN_STATE_STANDARD_KEYS}
 
 
 class CheckpointManager:

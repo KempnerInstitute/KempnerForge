@@ -159,14 +159,19 @@ def _log_checkpoint_metadata(ckpt_path: Path) -> None:
     )
 
 
-def _load_config(config_path: str) -> JobConfig:
-    config = load_config(config_path, cli_args=[])
-    if not config.is_vlm:
+def _load_config(config: str | JobConfig) -> JobConfig:
+    """A TOML path, or an already-loaded ``JobConfig`` (the harness passes its
+    CLI-merged config so ``--section.key=value`` overrides reach the model);
+    the VLM-only guard applies either way.
+    """
+    loaded = config if isinstance(config, JobConfig) else load_config(config, cli_args=[])
+    if not loaded.is_vlm:
+        source = repr(config) if isinstance(config, str) else "the provided JobConfig"
         raise ValueError(
-            f"{config_path!r} is not a VLM config (config.vlm is None); this evaluation "
+            f"{source} is not a VLM config (config.vlm is None); this evaluation "
             f"path is VLM-only. Use scripts/eval.py for text-model loss/perplexity."
         )
-    return config
+    return loaded
 
 
 def _check_generative(vlm_config: VLMConfig) -> None:
@@ -553,7 +558,8 @@ class KempnerForgeVLM(lmms):
     directly and passes the instance to ``simple_evaluate``):
 
     - ``config`` (required): path to the KempnerForge TOML the checkpoint was
-      trained with.
+      trained with, or an already-loaded ``JobConfig`` (the harness passes its
+      CLI-merged config so ``--section.key=value`` overrides reach the model).
     - ``checkpoint`` (required): DCP checkpoint directory (a run dir or a
       specific ``step_N`` dir).
     - ``device`` (default ``"cuda"``), ``dtype`` (default: the checkpoint config's
@@ -568,7 +574,7 @@ class KempnerForgeVLM(lmms):
 
     def __init__(
         self,
-        config: str,
+        config: str | JobConfig,
         checkpoint: str,
         device: str = "cuda",
         dtype: str | None = None,

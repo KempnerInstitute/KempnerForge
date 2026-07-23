@@ -17,6 +17,9 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+# Keys build_train_state always owns; anything else in the dict is caller ``extra``.
+TRAIN_STATE_STANDARD_KEYS = frozenset({"step", "tokens_seen", "rng", "scheduler", "dataloader"})
+
 
 def get_rng_state() -> dict[str, Any]:
     """Capture all RNG states for reproducibility on resume."""
@@ -113,7 +116,6 @@ def restore_train_state(
         dataloader.load_state_dict(state["dataloader"])
         logger.info("Restored dataloader state")
 
-    _standard_keys = {"step", "tokens_seen", "rng", "scheduler", "dataloader"}
-    extra = {k: v for k, v in state.items() if k not in _standard_keys}
+    extra = {k: v for k, v in state.items() if k not in TRAIN_STATE_STANDARD_KEYS}
 
     return step, tokens_seen, extra

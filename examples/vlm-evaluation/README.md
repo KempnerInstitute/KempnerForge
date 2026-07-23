@@ -127,6 +127,36 @@ accelerate launch --num_processes 4 examples/vlm-evaluation/vlm_eval_harness.py 
 | `--batch-size` | `1` | requests decoded together (grouped by `gen_kwargs`) |
 | `--max-new-tokens` | `128` | fallback only; task `gen_kwargs` override it |
 
+## Experiment tracking
+
+Results can be logged through the framework's metrics backends
+(`kempnerforge/metrics/tracker.py`) using the same config flags as training,
+forwarded as dotted overrides — any unrecognized `--section.key=value` argument
+is layered over `--config` (unknown keys fail fast) and applies to both the
+evaluated model (e.g. `--video.max_frames=8`) and experiment tracking:
+
+```bash
+uv run python examples/vlm-evaluation/vlm_eval_harness.py \
+    --config     configs/train/vlm_jd.toml \
+    --checkpoint checkpoints/vlm/step_10000 \
+    --tasks      mmmu_val \
+    --metrics.enable_wandb=true --metrics.wandb_project=vlm-eval
+```
+
+- Results land in the checkpoint's training run: the harness reads the
+  `wandb_run_id` saved in `train_state.pt` and resumes that run. Without one, a
+  fresh run named `<run>-<step_N>` starts with a warning; target a specific run
+  with `--metrics.wandb_run_id=<id>`.
+- Metrics are logged at the checkpoint's training step:
+  `eval/benchmarks/agg/<benchmark>` (aggregate, normalized into [0, 1]),
+  `eval/benchmarks/raw/<task>/<metric>` (every metric, unnormalized), and
+  `eval/benchmarks/throughput/overall/...` (per-invocation, so comparable
+  across runs only for the same task set).
+- Per-benchmark metric names and scales live in
+  [`benchmark_manifest.py`](benchmark_manifest.py); an unregistered benchmark
+  warns with the exact registry line to add.
+- A tracking failure never fails a completed eval — it warns and moves on.
+
 ## Video evaluation
 
 When `--config` is a **video checkpoint** (its TOML has a `[video]` section), the

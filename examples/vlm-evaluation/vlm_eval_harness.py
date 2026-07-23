@@ -28,6 +28,13 @@ Usage:
         --checkpoint checkpoints/vlm/step_10000 \
         --tasks mmmu_val,mmbench_en_dev \
         --limit 4
+
+    # Log results to the checkpoint's training run (see README: Experiment tracking)
+    uv run python examples/vlm-evaluation/vlm_eval_harness.py \
+        --config configs/train/vlm_jd.toml \
+        --checkpoint checkpoints/vlm/step_10000 \
+        --tasks mmmu_val \
+        --metrics.enable_wandb=true --metrics.wandb_project=vlm-eval
 """
 
 from __future__ import annotations
@@ -38,6 +45,10 @@ import logging
 import sys
 import tempfile
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from kempnerforge.config.schema import JobConfig
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -55,9 +66,90 @@ def _limit_type(value: str) -> int | float:
     raise argparse.ArgumentTypeError("--limit must be an integer count, or a fraction < 1.0")
 
 
+def _resolve_checkpoint(checkpoint: str) -> Path:
+    """Resolve a checkpoint arg (run dir or step_N dir) to a concrete step directory.
+
+    Mirrors how the adapter loads weights: a run directory resolves to its
+    latest ``step_N`` via ``resolve_resume_path``.
+    """
+    from kempnerforge.resilience.elastic import resolve_resume_path
+
+    return (resolve_resume_path(checkpoint) or Path(checkpoint)).resolve()
+
+
+def _checkpoint_step(ckpt_dir: Path) -> int:
+    """The checkpoint's training step: metadata.json, else the step_N dir name, else 0."""
+    meta_file = ckpt_dir / "metadata.json"
+    if meta_file.exists():
+        try:
+            return int(json.loads(meta_file.read_text())["step"])
+        except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+            logger.warning(f"Could not read step from {meta_file}; falling back to the dir name")
+    step_suffix = ckpt_dir.name.removeprefix("step_")
+    if ckpt_dir.name.startswith("step_") and step_suffix.isdigit():
+        return int(step_suffix)
+    logger.warning(f"Could not determine {ckpt_dir}'s training step; logging eval at step 0")
+    return 0
+
+
+def _resolve_run_id(config: JobConfig, ckpt_dir: Path) -> None:
+    """Point ``config.metrics`` at the run these results belong to: an explicit
+    ``--metrics.wandb_run_id`` override wins, else the id training saved into
+    the checkpoint, else a fresh run named after the checkpoint.
+    """
+    mc = config.metrics
+    if mc.wandb_run_id:
+        return  # explicit override (or TOML) wins
+    from kempnerforge.checkpoint import load_train_state_extras
+
+    run_id = None
+    try:
+        run_id = load_train_state_extras(ckpt_dir).get("wandb_run_id")
+    except Exception as exc:  # foreign-owned or corrupt train_state.pt — never fatal here
+        logger.warning(f"Could not read {ckpt_dir / 'train_state.pt'} ({exc})")
+    if run_id:
+        mc.wandb_run_id = run_id
+        logger.info(f"Attaching eval metrics to the checkpoint's training run ({run_id})")
+        return
+    logger.warning(
+        f"{ckpt_dir} has no saved wandb_run_id — starting a fresh run "
+        f"(attach to an existing one with --metrics.wandb_run_id=<id>)"
+    )
+    if mc.wandb_run_name is None:
+        mc.wandb_run_name = f"{ckpt_dir.parent.name}-{ckpt_dir.name}"
+
+
+def _track_eval(config: JobConfig, results: dict, tasks: list[str], ckpt_dir: Path) -> None:
+    """Log eval metrics through the framework's MetricsTracker backends.
+
+    ``gpu_peak_tflops`` is a nonzero sentinel: eval never computes MFU, and
+    ``None``/``0.0`` would trigger the GPU probe. A tracking failure never
+    fails a completed eval.
+    """
+    try:
+        from benchmark_manifest import build_eval_metrics
+
+        from kempnerforge.metrics.tracker import MetricsTracker
+
+        _resolve_run_id(config, ckpt_dir)
+        tracker = MetricsTracker(config, num_gpus=1, gpu_peak_tflops=1.0)
+        tracker.init_backends(config)
+        tracker.log_eval(build_eval_metrics(results, tasks), step=_checkpoint_step(ckpt_dir))
+        tracker.close()
+    except Exception as exc:  # tracking must never fail a completed eval
+        logger.warning(f"Experiment tracking failed (eval results are unaffected): {exc}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Run lmms-eval on a KempnerForge VLM checkpoint",
+        epilog=(
+            "Unrecognized --section.key=value arguments are forwarded to the KempnerForge "
+            "config loader as dotted overrides on --config and apply to both the evaluated "
+            "model (e.g. --video.max_frames=8) and experiment tracking, which is enabled "
+            "that way, e.g. --metrics.enable_wandb=true --metrics.wandb_project=vlm-eval "
+            "(see 'Experiment tracking' in README.md)."
+        ),
     )
     parser.add_argument(
         "--config",
@@ -97,7 +189,16 @@ def main() -> None:
         default=128,
         help="Fallback max new tokens; task gen_kwargs override it (default: 128)",
     )
-    args = parser.parse_args()
+    args, extra_overrides = parser.parse_known_args()
+
+    # Forwarded --section.key=value overrides layer over the checkpoint TOML;
+    # unknown keys raise here, before the expensive model build. The merged
+    # config object is passed to the adapter below, so overrides reach the
+    # evaluated model, not just experiment tracking.
+    from kempnerforge.config.loader import load_config
+
+    config = load_config(args.config, cli_args=extra_overrides)
+    ckpt_dir = _resolve_checkpoint(args.checkpoint)
 
     # lmms-eval is optional and undeclared; import lazily with a helpful error.
     try:
@@ -126,7 +227,7 @@ def main() -> None:
     # the checkpoint config (train.param_dtype).
     dtype_kwargs = {"dtype": args.dtype} if args.dtype is not None else {}
     model = KempnerForgeVLM(
-        config=args.config,
+        config=config,
         checkpoint=args.checkpoint,
         device=args.device,
         batch_size=args.batch_size,
@@ -176,6 +277,12 @@ def main() -> None:
             with open(output_path, "w") as f:
                 json.dump(results, f, indent=2, default=str)
             logger.info(f"Results saved to {output_path}")
+
+        # --- Experiment tracking (opt-in) ---
+        mc = config.metrics
+        track = mc.enable_wandb or mc.enable_tensorboard
+        if track and results is not None and "results" in results:
+            _track_eval(config, results, args.tasks.split(","), ckpt_dir)
 
 
 if __name__ == "__main__":
