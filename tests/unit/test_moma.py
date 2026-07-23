@@ -42,7 +42,7 @@ from kempnerforge.model.moma import (
     MoMaFFN,
 )
 from kempnerforge.model.transformer import Transformer
-from kempnerforge.model.vlm import MoMaStrategy
+from kempnerforge.model.vlm import MoMaStrategy, _project_visual_features
 
 DEVICE = torch.device("cpu")
 
@@ -240,10 +240,14 @@ class TestMoMaStrategy:
     def test_prepare_builds_modality_context(self):
         wrapper = _StubWrapper(num_tokens=4, feature_dim=8, dim=16)
         strategy = MoMaStrategy()
-        pixel_values = torch.zeros(2, 3, 8, 8)
+        # prepare() takes already-projected embeds. Route pixels through the real
+        # projection helper so the encoder -> adapter chain stays under test: the
+        # (2, 4, 16) assertions below then pin that the visual-token count and the
+        # model dim survive projection, rather than restating a hand-built shape.
+        visual_embeds = _project_visual_features(wrapper, torch.zeros(2, 3, 16, 16))
         input_ids = torch.zeros(2, 6, dtype=torch.long)
 
-        ctx = strategy.prepare(wrapper, pixel_values, input_ids)
+        ctx = strategy.prepare(wrapper, visual_embeds, input_ids)
         assert isinstance(ctx, ModalityContext)
         assert ctx.prefix_embeds is not None
         assert ctx.prefix_embeds.shape == (2, 4, 16)
@@ -255,10 +259,11 @@ class TestMoMaStrategy:
     def test_modality_ids_image_then_text(self):
         wrapper = _StubWrapper(num_tokens=3, feature_dim=8, dim=16)
         strategy = MoMaStrategy()
-        pixel_values = torch.zeros(1, 3, 8, 8)
+        # Projected from pixels: 3 visual tokens (stub adapter is token-count identity).
+        visual_embeds = _project_visual_features(wrapper, torch.zeros(1, 3, 16, 16))
         input_ids = torch.zeros(1, 5, dtype=torch.long)
 
-        ctx = strategy.prepare(wrapper, pixel_values, input_ids)
+        ctx = strategy.prepare(wrapper, visual_embeds, input_ids)
         # First 3 positions (image) get 0; rest (text) get 1.
         assert ctx.modality_ids is not None
         ids = ctx.modality_ids[0]

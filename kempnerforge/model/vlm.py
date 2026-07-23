@@ -4,7 +4,7 @@ The wrapper composes a ``VisionEncoder`` (HF or test stub), a registered
 adapter (``MLP2LayerAdapter`` by default; ``LinearAdapter`` available
 via the ``adapter`` registry) projecting image features into the LLM
 embedding space, and the existing ``Transformer``. The arch-specific
-work (composing ``pixel_values`` + ``input_ids`` into a
+work (composing already-projected visual embeds + ``input_ids`` into a
 ``ModalityContext``) lives on a ``ModalityStrategy`` that the wrapper
 holds, so adding a new arch is one new strategy decorator on
 ``@registry.register_modality_strategy`` plus one new ``VLMConfig``
@@ -66,16 +66,14 @@ class ModalityStrategy(Protocol):
     def prepare(
         self,
         wrapper: VLMWrapper,
-        pixel_values: torch.Tensor | None,
+        visual_embeds: torch.Tensor | None,
         input_ids: torch.Tensor,
         frame_mask: torch.Tensor | None = None,
     ) -> ModalityContext:
-        """Compose a ``ModalityContext`` from raw VLM inputs.
+        """Compose a ``ModalityContext`` from already-projected visual embeds.
 
-        ``pixel_values is None`` is a text-only request (no visual content):
-        the generative arches return a context that drives the pure-text
-        forward — an empty ``ModalityContext()`` for the image-prefix and
-        cross-attention arches — while a non-generative arch may reject it.
+        Projection is hoisted into ``VLMWrapper.forward``, so strategies get
+        ``visual_embeds`` (``None`` for text-only) and never touch pixels.
         """
         ...
 
@@ -173,72 +171,137 @@ def _prefix_key_padding_mask(
     return torch.cat([vmask, text_valid], dim=1)
 
 
-@registry.register_modality_strategy("joint_decoder")
-class JointDecoderStrategy:
-    """Joint-Decoder: image embeds prepended to the text sequence.
+def _expected_visual_tokens(wrapper: VLMWrapper) -> int:
+    """Static visual-token count: ``frames_per_clip`` * per-frame adapter output.
 
-    Forward path: ``feats = vision_encoder(pixel_values)``;
-    ``img_embeds = adapter(feats)``; ``ModalityContext(prefix_embeds,
-    output_slice)``. The transformer runs over the concatenated
-    ``(image, text)`` sequence and ``output_slice`` trims the image
-    positions before the LM head.
+    This is what ``_project_visual_features`` always produces (the frames check
+    there pins the frame count), so it is both the residual budget and the
+    expected ``n`` for a caller-supplied cache.
+    """
+    return wrapper.frames_per_clip * wrapper.adapter.output_num_tokens(
+        wrapper.vision_encoder.num_tokens
+    )
+
+
+def _validate_cached_visual_embeds(
+    wrapper: VLMWrapper, visual_embeds: torch.Tensor, input_ids: torch.Tensor
+) -> None:
+    """Re-establish, for caller-supplied embeds, the invariants the uncached path
+    gets for free from ``_project_visual_features``.
+
+    ``n = visual_embeds.shape[1]`` drives ``output_slice``, MoT's positional split
+    and the residual budget, so a malformed cache would otherwise surface as an
+    opaque shape error inside ``Transformer.forward`` (or, for a 2-D tensor, as a
+    plausible-looking ``n`` taken from the feature dim).
+    """
+    if visual_embeds.dim() != 3:
+        raise ValueError(
+            f"visual_embeds must be (B, N, dim); received a {visual_embeds.dim()}-D tensor "
+            f"of shape {tuple(visual_embeds.shape)}"
+        )
+    b, n, dim = visual_embeds.shape
+    if b != input_ids.shape[0]:
+        raise ValueError(
+            f"visual_embeds batch ({b}) does not match input_ids batch "
+            f"({input_ids.shape[0]}); a cache built for one batch cannot be reused "
+            "against a differently-sized decode batch"
+        )
+    expected_n = _expected_visual_tokens(wrapper)
+    if n != expected_n:
+        raise ValueError(
+            f"visual_embeds has {n} visual token(s) but this wrapper projects to "
+            f"{expected_n} (frames_per_clip={wrapper.frames_per_clip}); the token count "
+            "sets output_slice and the residual budget, so it must match"
+        )
+    expected_dim = wrapper.transformer.config.dim
+    if dim != expected_dim:
+        raise ValueError(
+            f"visual_embeds has feature dim {dim} but the transformer expects "
+            f"{expected_dim}; embeds must already be projected to the LLM dim"
+        )
+
+
+class BaseModalityStrategy:
+    """Shared ``ModalityStrategy`` base: ``prepare`` handles the text-only case
+    and the visual-token count ``n``, then defers to ``_build_context``. Concrete
+    strategies override ``_build_context`` (Cross-Attention also ``num_image_tokens``;
+    MoMa also ``_text_only_context``).
     """
 
     def prepare(
         self,
-        wrapper: VLMWrapper,
-        pixel_values: torch.Tensor | None,
-        input_ids: torch.Tensor,  # noqa: ARG002
+        wrapper: VLMWrapper,  # noqa: ARG002
+        visual_embeds: torch.Tensor | None,
+        input_ids: torch.Tensor,
         frame_mask: torch.Tensor | None = None,
     ) -> ModalityContext:
-        if pixel_values is None:
-            # Text-only request: no image prefix, so the residual carries text
-            # alone and the LM head runs over every position (empty context ->
-            # Transformer.forward's pure-text path).
-            return ModalityContext()
-        img_embeds = _project_visual_features(wrapper, pixel_values)
-        n = img_embeds.shape[1]  # pooling-aware: the adapter's actual visual-token count
+        if visual_embeds is None:
+            return self._text_only_context()
+        n = visual_embeds.shape[1]  # actual visual-token count
+        return self._build_context(visual_embeds, n, input_ids, frame_mask)
+
+    def _text_only_context(self) -> ModalityContext:
+        # empty context -> pure-text forward
+        return ModalityContext()
+
+    def _build_context(
+        self,
+        visual_embeds: torch.Tensor,
+        n: int,
+        input_ids: torch.Tensor,
+        frame_mask: torch.Tensor | None,
+    ) -> ModalityContext:
+        raise NotImplementedError
+
+    def num_image_tokens(self, wrapper: VLMWrapper) -> int:
+        return _expected_visual_tokens(wrapper)
+
+
+@registry.register_modality_strategy("joint_decoder")
+class JointDecoderStrategy(BaseModalityStrategy):
+    """Joint-Decoder: image embeds prepended to the text sequence.
+
+    ``_build_context`` returns ``ModalityContext(prefix_embeds, output_slice)``:
+    the transformer runs over the concatenated ``(image, text)`` sequence and
+    ``output_slice`` trims the image positions before the LM head.
+    """
+
+    def _build_context(
+        self,
+        visual_embeds: torch.Tensor,
+        n: int,
+        input_ids: torch.Tensor,
+        frame_mask: torch.Tensor | None,
+    ) -> ModalityContext:
         return ModalityContext(
-            prefix_embeds=img_embeds,
+            prefix_embeds=visual_embeds,
             output_slice=slice(n, None),
             key_padding_mask=_prefix_key_padding_mask(frame_mask, n, input_ids),
         )
 
-    def num_image_tokens(self, wrapper: VLMWrapper) -> int:
-        return wrapper.frames_per_clip * wrapper.adapter.output_num_tokens(
-            wrapper.vision_encoder.num_tokens
-        )
-
 
 @registry.register_modality_strategy("cross_attention")
-class CrossAttentionStrategy:
+class CrossAttentionStrategy(BaseModalityStrategy):
     """Cross-Attention: image embeds flow as K/V into separate
     cross-attention blocks inside the transformer; the residual stream
     itself carries text only.
 
-    Forward path: ``feats = vision_encoder(pixel_values)``;
-    ``img_embeds = adapter(feats)``; ``ModalityContext(image_features,
-    image_mask)``. ``image_mask`` carries per-visual-token validity (padded
-    video frames are masked out of the image K/V); ``None`` means all image
-    tokens are valid (e.g. a single image or a full clip).
+    ``_build_context`` returns ``ModalityContext(image_features, image_mask)``.
+    ``image_mask`` carries per-visual-token validity (padded video frames are
+    masked out of the image K/V); ``None`` means all image tokens are valid
+    (e.g. a single image or a full clip).
     """
 
-    def prepare(
+    def _build_context(
         self,
-        wrapper: VLMWrapper,
-        pixel_values: torch.Tensor | None,
+        visual_embeds: torch.Tensor,
+        n: int,
         input_ids: torch.Tensor,  # noqa: ARG002
-        frame_mask: torch.Tensor | None = None,
+        frame_mask: torch.Tensor | None,
     ) -> ModalityContext:
-        if pixel_values is None:
-            # Text-only request: no image K/V. The cross-attention blocks are
-            # skipped in Transformer.forward when image_features is None, leaving
-            # the pure text backbone.
-            return ModalityContext()
-        img_embeds = _project_visual_features(wrapper, pixel_values)
         return ModalityContext(
-            image_features=img_embeds,
-            image_mask=_visual_token_mask(frame_mask, img_embeds.shape[1]),
+            image_features=visual_embeds,
+            image_mask=_visual_token_mask(frame_mask, n),
         )
 
     def num_image_tokens(self, wrapper: VLMWrapper) -> int:  # noqa: ARG002
@@ -247,12 +310,11 @@ class CrossAttentionStrategy:
 
 
 @registry.register_modality_strategy("mot")
-class MoTStrategy:
+class MoTStrategy(BaseModalityStrategy):
     """Mixture-of-Transformers: image-then-text residual layout (same as
     Joint-Decoder) plus a per-position ``modality_ids`` tag.
 
-    Forward path: ``feats = vision_encoder(pixel_values)``;
-    ``img_embeds = adapter(feats)``;
+    ``_build_context`` returns
     ``ModalityContext(prefix_embeds, output_slice, modality_ids)``.
 
     ``modality_ids`` is built position-based: ``0`` for the first
@@ -266,88 +328,36 @@ class MoTStrategy:
     the LM head, matching ``JointDecoderStrategy``.
     """
 
-    def prepare(
+    def _build_context(
         self,
-        wrapper: VLMWrapper,
-        pixel_values: torch.Tensor | None,
+        visual_embeds: torch.Tensor,
+        n: int,
         input_ids: torch.Tensor,
-        frame_mask: torch.Tensor | None = None,
+        frame_mask: torch.Tensor | None,
     ) -> ModalityContext:
-        if pixel_values is None:
-            # Text-only request: no image prefix. The MoT forward runs with
-            # n_image=0 (an empty image stream), routing every position through
-            # the text-modality projections/FFN; no modality_ids are needed (see
-            # Transformer.forward's MoT branch).
-            return ModalityContext()
-        img_embeds = _project_visual_features(wrapper, pixel_values)
-        n = img_embeds.shape[1]  # pooling-aware: the adapter's actual visual-token count
         b, t_text = input_ids.shape
         modality_ids = torch.zeros(b, n + t_text, dtype=torch.long, device=input_ids.device)
         modality_ids[:, n:] = 1
         return ModalityContext(
-            prefix_embeds=img_embeds,
+            prefix_embeds=visual_embeds,
             output_slice=slice(n, None),
             modality_ids=modality_ids,
             key_padding_mask=_prefix_key_padding_mask(frame_mask, n, input_ids),
-        )
-
-    def num_image_tokens(self, wrapper: VLMWrapper) -> int:
-        return wrapper.frames_per_clip * wrapper.adapter.output_num_tokens(
-            wrapper.vision_encoder.num_tokens
         )
 
 
 @registry.register_modality_strategy("moma")
-class MoMaStrategy:
-    """Mixture of Modality-Aware Experts: same residual-stream layout as
-    Joint-Decoder/MoT (image embeds prepended, ``output_slice`` trims them
-    before the LM head), plus a per-position ``modality_ids`` tag the
-    MoMa FFN stack consumes for true scatter/gather dispatch (level-1
-    deterministic routing by modality).
-
-    Forward path: ``feats = vision_encoder(pixel_values)``;
-    ``img_embeds = adapter(feats)``;
-    ``ModalityContext(prefix_embeds, output_slice, modality_ids)``.
-
-    Convention: ``modality_ids == 0`` for image positions and
-    ``modality_ids == 1`` for text positions, matching the index order
-    of ``MoMaConfig.moma_modalities = ("image", "text")``. The MoMa
-    FFN uses these tags to dispatch tokens to per-modality expert
-    groups; positions are *not* assumed to be in any particular order,
-    so interleaved layouts work too (image-prefix is just one
-    instantiation).
+class MoMaStrategy(MoTStrategy):
+    """Mixture of Modality-Aware Experts: same residual layout and ``modality_ids``
+    tagging as MoT. Non-generative (expert-choice routing is non-causal), so the
+    text-only path is rejected.
     """
 
-    def prepare(
-        self,
-        wrapper: VLMWrapper,
-        pixel_values: torch.Tensor | None,
-        input_ids: torch.Tensor,
-        frame_mask: torch.Tensor | None = None,
-    ) -> ModalityContext:
-        if pixel_values is None:
-            # MoMa's expert-choice routing is non-causal (is_generative=False), so it
-            # is excluded from generative/text-only evaluation; fail fast rather than
-            # emit an unusable context.
-            raise NotImplementedError(
-                "Text-only forward is not supported for the 'moma' arch "
-                "(non-causal expert-choice routing; excluded from generative evaluation)."
-            )
-        img_embeds = _project_visual_features(wrapper, pixel_values)
-        n = img_embeds.shape[1]  # pooling-aware: the adapter's actual visual-token count
-        b, t_text = input_ids.shape
-        modality_ids = torch.zeros(b, n + t_text, dtype=torch.long, device=input_ids.device)
-        modality_ids[:, n:] = 1
-        return ModalityContext(
-            prefix_embeds=img_embeds,
-            output_slice=slice(n, None),
-            modality_ids=modality_ids,
-            key_padding_mask=_prefix_key_padding_mask(frame_mask, n, input_ids),
-        )
-
-    def num_image_tokens(self, wrapper: VLMWrapper) -> int:
-        return wrapper.frames_per_clip * wrapper.adapter.output_num_tokens(
-            wrapper.vision_encoder.num_tokens
+    def _text_only_context(self) -> ModalityContext:
+        # Non-causal expert-choice routing (is_generative=False): no text-only path.
+        raise NotImplementedError(
+            "Text-only forward is not supported for the 'moma' arch "
+            "(non-causal expert-choice routing; excluded from generative evaluation)."
         )
 
 
@@ -401,19 +411,50 @@ class VLMWrapper(nn.Module):
     def num_image_tokens(self) -> int:
         return self.strategy.num_image_tokens(self)
 
+    def encode_visual(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        """Project pixels to LLM-dim visual embeds once, for cached decode.
+
+        The decode loop passes the result to ``forward(..., visual_embeds=...)``
+        so the vision tower runs once per request, not once per token.
+        """
+        return _project_visual_features(self, pixel_values)
+
     def forward(
         self,
         pixel_values: torch.Tensor | None,
         input_ids: torch.Tensor,
         labels: torch.Tensor | None = None,
         frame_mask: torch.Tensor | None = None,
+        visual_embeds: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        # Project once here, or reuse precomputed ``visual_embeds`` (cached decode,
+        # inference-only). ``pixel_values is None`` with no cache is text-only.
+        # The cache bypasses ``_project_visual_features``, so its invariants are
+        # re-checked here rather than inherited.
+        if visual_embeds is not None:
+            if self.training:
+                raise ValueError(
+                    "visual_embeds (cached decode) is inference-only: it bypasses the "
+                    "vision encoder + adapter, which would silently receive no gradient"
+                )
+            if pixel_values is not None:
+                raise ValueError(
+                    "pass pixel_values or visual_embeds, not both; cached embeds supersede "
+                    "pixels, so the pixels would be silently ignored (and may not even "
+                    "correspond to the cached embeds)"
+                )
+            _validate_cached_visual_embeds(self, visual_embeds, input_ids)
+            embeds = visual_embeds
+        elif pixel_values is not None:
+            embeds = _project_visual_features(self, pixel_values)
+        else:
+            embeds = None  # text-only request
         # Route the text embedding through Transformer.forward so FSDP2's
         # per-module hook intercepts the token_embedding call and
         # materializes the DTensor weight before F.embedding runs. Doing
         # the embedding externally (transformer.token_embedding(input_ids))
         # bypasses FSDP and fails with "mixed torch.Tensor and DTensor".
-        modality = self.strategy.prepare(self, pixel_values, input_ids, frame_mask=frame_mask)
+        modality = self.strategy.prepare(self, embeds, input_ids, frame_mask=frame_mask)
         logits = self.transformer(tokens=input_ids, modality=modality)
         return logits, labels
 
