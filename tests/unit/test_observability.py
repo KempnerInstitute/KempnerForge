@@ -585,6 +585,23 @@ class TestMLflowBackend:
         backend.log({"train/loss": 1.0}, step=1)
         backend.close()  # must not raise
 
+    def test_databricks_token_mirror_and_metadata(self, monkeypatch):
+        """DATABRICKS_API_TOKEN is mirrored to DATABRICKS_TOKEN, the system-metrics interval
+        is set when enabled, and a fresh run logs flattened params + tags."""
+        monkeypatch.setenv("DATABRICKS_HOST", "https://x.cloud.databricks.com")
+        monkeypatch.setenv("DATABRICKS_API_TOKEN", "dapi-x")
+        monkeypatch.delenv("DATABRICKS_TOKEN", raising=False)
+        monkeypatch.setattr(tracker_mod, "_resolve_mlflow_experiment", lambda c, u: "/Users/me/p")
+        fm = _FakeMlflow()
+        monkeypatch.setitem(sys.modules, "mlflow", fm)
+        cfg = MetricsConfig(enable_mlflow=True, mlflow_log_system_metrics=True)  # uri = databricks
+        job = JobConfig(model=ModelConfig(dim=128, n_layers=2, n_heads=2, vocab_size=256))
+        backend = MLflowBackend(cfg, job_config=job)
+        backend.log({"train/loss": 1.0}, step=1)
+        assert backend._active is True
+        assert os.environ["DATABRICKS_TOKEN"] == "dapi-x"  # mirrored from API_TOKEN
+        assert fm.logged_params and fm.logged_tags  # fresh-run metadata (params + tags) logged
+
 
 class TestResolveMlflowExperiment:
     def test_env_experiment_must_be_absolute_on_databricks(self, monkeypatch):
@@ -597,6 +614,65 @@ class TestResolveMlflowExperiment:
         monkeypatch.setenv("MLFLOW_EXPERIMENT", "bare-name")
         cfg = MetricsConfig(enable_mlflow=True, mlflow_tracking_uri="http://localhost:5000")
         assert _resolve_mlflow_experiment(cfg, "http://localhost:5000") == "bare-name"
+
+    def test_auto_resolves_databricks_user_path(self, monkeypatch):
+        """With no experiment set on Databricks, derive /Users/<sdk-user>/<project>."""
+        monkeypatch.delenv("MLFLOW_EXPERIMENT", raising=False)
+
+        class _WC:
+            def __init__(self):
+                self.current_user = types.SimpleNamespace(
+                    me=lambda: types.SimpleNamespace(user_name="abbas")
+                )
+
+        fake_sdk = types.ModuleType("databricks.sdk")
+        fake_sdk.WorkspaceClient = _WC
+        monkeypatch.setitem(sys.modules, "databricks", types.ModuleType("databricks"))
+        monkeypatch.setitem(sys.modules, "databricks.sdk", fake_sdk)
+        cfg = MetricsConfig(enable_mlflow=True, wandb_project="proj")
+        assert _resolve_mlflow_experiment(cfg, "databricks") == "/Users/abbas/proj"
+
+    def test_auto_resolve_failure_returns_none(self, monkeypatch):
+        """If the SDK lookup fails, auto-resolution returns None (backend then disables)."""
+        monkeypatch.delenv("MLFLOW_EXPERIMENT", raising=False)
+
+        class _WC:
+            def __init__(self):
+                raise RuntimeError("no sdk creds")
+
+        fake_sdk = types.ModuleType("databricks.sdk")
+        fake_sdk.WorkspaceClient = _WC
+        monkeypatch.setitem(sys.modules, "databricks", types.ModuleType("databricks"))
+        monkeypatch.setitem(sys.modules, "databricks.sdk", fake_sdk)
+        assert _resolve_mlflow_experiment(MetricsConfig(enable_mlflow=True), "databricks") is None
+
+
+class TestMlflowHelpers:
+    def test_run_gone_by_error_code(self):
+        e = RuntimeError("boom")
+        e.error_code = "RESOURCE_DOES_NOT_EXIST"
+        assert tracker_mod._mlflow_run_gone(e) is True
+
+    def test_run_gone_by_message(self):
+        assert tracker_mod._mlflow_run_gone(RuntimeError("run is in the deleted state")) is True
+
+    def test_transient_error_is_not_gone(self):
+        assert tracker_mod._mlflow_run_gone(RuntimeError("503 Service Unavailable")) is False
+
+    def test_last_step_from_history(self):
+        fm = _FakeMlflow()
+        fm.history_steps = [2, 7, 5]
+        assert tracker_mod._mlflow_last_step(fm, "rid") == 7
+
+    def test_last_step_empty_history(self):
+        assert tracker_mod._mlflow_last_step(_FakeMlflow(), "rid") is None
+
+    def test_last_step_handles_error(self):
+        class _M:
+            def MlflowClient(self):
+                raise RuntimeError("no client")
+
+        assert tracker_mod._mlflow_last_step(_M(), "rid") is None
 
 
 class TestTensorBoardBackend:
