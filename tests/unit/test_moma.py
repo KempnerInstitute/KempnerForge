@@ -240,8 +240,7 @@ class TestMoMaStrategy:
     def test_prepare_builds_modality_context(self):
         wrapper = _StubWrapper(num_tokens=4, feature_dim=8, dim=16)
         strategy = MoMaStrategy()
-        # prepare() now receives already-projected visual embeds (projection is
-        # hoisted into VLMWrapper.forward); pass (B, N, dim) directly.
+        # prepare() takes already-projected embeds; pass (B, N, dim) directly.
         visual_embeds = torch.zeros(2, 4, 16)
         input_ids = torch.zeros(2, 6, dtype=torch.long)
 

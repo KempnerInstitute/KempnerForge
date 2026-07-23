@@ -636,8 +636,7 @@ class TestVideoForward:
         assert wrapper.num_image_tokens == 16
 
     def test_projector_folds_frame_axis(self):
-        # Frame-axis folding now lives in encode_visual (VLMWrapper.forward hoists
-        # projection out of the strategies); assert on its output directly.
+        # Frame-axis folding now lives in encode_visual.
         wrapper = _video_wrapper(JointDecoderConfig(max_text_len=8), frames=4)
         embeds = wrapper.encode_visual(torch.randn(2, 4, 3, 16, 16))
         assert embeds.shape == (2, 16, 64)  # (B, F*P', dim)
@@ -794,14 +793,11 @@ class TestFramePaddingMask:
 
 
 class TestVisualEmbedCache:
-    """The eval decode loop projects visual features once via ``encode_visual``
-    and feeds them back through ``forward(..., visual_embeds=...)``. Projection is
-    deterministic, so the cached path reproduces the uncached forward
-    bit-for-bit; the cache is inference-only (rejected in training mode)."""
+    """encode_visual projects once; feeding the result back via ``visual_embeds``
+    reproduces the uncached forward bit-for-bit (projection is deterministic)."""
 
     def test_encode_visual_is_deterministic(self):
-        # Premise of the equivalence tests: RandomVisionEncoder seeds from the
-        # input and the adapter has fixed weights, so encode_visual is reproducible.
+        # RandomVisionEncoder seeds from the input -> encode_visual is reproducible.
         wrapper = _build_tiny_wrapper().to(DEVICE).eval()
         pixels = torch.randn(2, 3, 16, 16, device=DEVICE)
         with torch.no_grad():
@@ -826,8 +822,7 @@ class TestVisualEmbedCache:
 
     @pytest.mark.parametrize("arch", ["joint_decoder", "cross_attention", "mot", "moma"])
     def test_cached_visual_embeds_equal_uncached_video(self, arch):
-        # Video + frame_mask: masks are built from n == visual_embeds.shape[1],
-        # which caching does not change, so masking matches the uncached path.
+        # Video + frame_mask: caching doesn't change n, so masking is identical.
         ffn = 128 if arch in ("mot", "moma") else None
         cfgs = {
             "joint_decoder": JointDecoderConfig(max_text_len=8),
@@ -848,9 +843,7 @@ class TestVisualEmbedCache:
         assert torch.equal(cached, uncached), f"{arch}: cached video decode diverges"
 
     def test_visual_embeds_in_training_mode_asserts(self):
-        # The cache path skips the vision tower, so it must never run in training
-        # (it would silently detach the encoder from the graph). Guarded by an
-        # assert, which python -O strips.
+        # Cache path is inference-only; guard is an assert (stripped under -O).
         if not __debug__:
             pytest.skip("assert guard is a no-op under -O")
         wrapper = _build_tiny_wrapper().to(DEVICE).train()

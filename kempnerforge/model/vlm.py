@@ -72,14 +72,8 @@ class ModalityStrategy(Protocol):
     ) -> ModalityContext:
         """Compose a ``ModalityContext`` from already-projected visual embeds.
 
-        Vision projection (encoder + adapter) is arch-independent and runs once
-        in ``VLMWrapper.forward`` (or ``VLMWrapper.encode_visual`` for cached
-        decode), so strategies receive ``visual_embeds`` and never touch pixels
-        or the vision tower. ``visual_embeds is None`` is a text-only request
-        (no visual content): the generative arches return a context that drives
-        the pure-text forward — an empty ``ModalityContext()`` for the
-        image-prefix and cross-attention arches — while a non-generative arch
-        may reject it.
+        Projection is hoisted into ``VLMWrapper.forward``, so strategies get
+        ``visual_embeds`` (``None`` for text-only) and never touch pixels.
         """
         ...
 
@@ -178,17 +172,10 @@ def _prefix_key_padding_mask(
 
 
 class BaseModalityStrategy:
-    """Shared ``ModalityStrategy`` implementation (not registered, not the Protocol).
-
-    ``prepare`` is a template method: it handles the text-only request and the
-    visual-token count ``n``, then delegates arch-specific ``ModalityContext``
-    construction to ``_build_context``. Concrete strategies override
-    ``_build_context`` (and, for the residual-free Cross-Attention arch,
-    ``num_image_tokens``; for the non-generative MoMa arch, ``_text_only_context``).
-
-    Vision projection is arch-independent and runs once in ``VLMWrapper.forward``,
-    so strategies receive already-projected ``visual_embeds`` and never touch
-    pixels or the vision tower.
+    """Shared ``ModalityStrategy`` base: ``prepare`` handles the text-only case
+    and the visual-token count ``n``, then defers to ``_build_context``. Concrete
+    strategies override ``_build_context`` (Cross-Attention also ``num_image_tokens``;
+    MoMa also ``_text_only_context``).
     """
 
     def prepare(
@@ -200,11 +187,11 @@ class BaseModalityStrategy:
     ) -> ModalityContext:
         if visual_embeds is None:
             return self._text_only_context()
-        n = visual_embeds.shape[1]  # pooling-/video-aware: the actual visual-token count
+        n = visual_embeds.shape[1]  # actual visual-token count
         return self._build_context(visual_embeds, n, input_ids, frame_mask)
 
     def _text_only_context(self) -> ModalityContext:
-        # Generative arches drive the pure-text forward from an empty context.
+        # empty context -> pure-text forward
         return ModalityContext()
 
     def _build_context(
@@ -313,24 +300,13 @@ class MoTStrategy(BaseModalityStrategy):
 
 @registry.register_modality_strategy("moma")
 class MoMaStrategy(MoTStrategy):
-    """Mixture of Modality-Aware Experts: same residual-stream layout and
-    ``modality_ids`` tagging as MoT (image embeds prepended, ``output_slice``
-    trims them before the LM head), so it reuses ``MoTStrategy._build_context``.
-    The MoMa FFN stack consumes the per-position tag for true scatter/gather
-    dispatch (level-1 deterministic routing by modality).
-
-    Convention: ``modality_ids == 0`` for image positions and
-    ``modality_ids == 1`` for text positions, matching the index order
-    of ``MoMaConfig.moma_modalities = ("image", "text")``.
-
-    Non-generative: expert-choice routing is non-causal, so the text-only path
-    is rejected (``_text_only_context`` raises) rather than driven.
+    """Mixture of Modality-Aware Experts: same residual layout and ``modality_ids``
+    tagging as MoT. Non-generative (expert-choice routing is non-causal), so the
+    text-only path is rejected.
     """
 
     def _text_only_context(self) -> ModalityContext:
-        # MoMa's expert-choice routing is non-causal (is_generative=False), so it
-        # is excluded from generative/text-only evaluation; fail fast rather than
-        # emit an unusable context.
+        # Non-causal expert-choice routing (is_generative=False): no text-only path.
         raise NotImplementedError(
             "Text-only forward is not supported for the 'moma' arch "
             "(non-causal expert-choice routing; excluded from generative evaluation)."
@@ -388,13 +364,10 @@ class VLMWrapper(nn.Module):
         return self.strategy.num_image_tokens(self)
 
     def encode_visual(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        """Project raw pixels to LLM-dim visual embeds (vision encoder + adapter).
+        """Project pixels to LLM-dim visual embeds once, for cached decode.
 
-        The eval decode loop calls this once per request and feeds the result
-        back into ``forward(..., visual_embeds=...)`` at every decode step, so
-        the vision encoder + adapter run once instead of once per generated
-        token. This is not a KV cache: the transformer still re-runs over the
-        full sequence each step.
+        The decode loop passes the result to ``forward(..., visual_embeds=...)``
+        so the vision tower runs once per request, not once per token.
         """
         return _project_visual_features(self, pixel_values)
 
@@ -406,11 +379,8 @@ class VLMWrapper(nn.Module):
         frame_mask: torch.Tensor | None = None,
         visual_embeds: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        # Vision projection happens once here, or is reused from a precomputed
-        # ``visual_embeds`` (the inference-only cached-decode path) so the vision
-        # tower + adapter do not re-run each decode step. ``pixel_values is None``
-        # with no cache is a text-only request. Strategies receive the projected
-        # embeds and never touch pixels.
+        # Project once here, or reuse precomputed ``visual_embeds`` (cached decode,
+        # inference-only). ``pixel_values is None`` with no cache is text-only.
         if visual_embeds is not None:
             assert not self.training, "visual_embeds (cached decode) is inference-only"
             embeds = visual_embeds
