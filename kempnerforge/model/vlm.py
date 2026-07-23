@@ -72,14 +72,8 @@ class ModalityStrategy(Protocol):
     ) -> ModalityContext:
         """Compose a ``ModalityContext`` from already-projected visual embeds.
 
-        Vision projection (encoder + adapter) is arch-independent and runs once
-        in ``VLMWrapper.forward`` (or ``VLMWrapper.encode_visual`` for cached
-        decode), so strategies receive ``visual_embeds`` and never touch pixels
-        or the vision tower. ``visual_embeds is None`` is a text-only request
-        (no visual content): the generative arches return a context that drives
-        the pure-text forward — an empty ``ModalityContext()`` for the
-        image-prefix and cross-attention arches — while a non-generative arch
-        may reject it.
+        Projection is hoisted into ``VLMWrapper.forward``, so strategies get
+        ``visual_embeds`` (``None`` for text-only) and never touch pixels.
         """
         ...
 
@@ -177,18 +171,61 @@ def _prefix_key_padding_mask(
     return torch.cat([vmask, text_valid], dim=1)
 
 
+def _expected_visual_tokens(wrapper: VLMWrapper) -> int:
+    """Static visual-token count: ``frames_per_clip`` * per-frame adapter output.
+
+    This is what ``_project_visual_features`` always produces (the frames check
+    there pins the frame count), so it is both the residual budget and the
+    expected ``n`` for a caller-supplied cache.
+    """
+    return wrapper.frames_per_clip * wrapper.adapter.output_num_tokens(
+        wrapper.vision_encoder.num_tokens
+    )
+
+
+def _validate_cached_visual_embeds(
+    wrapper: VLMWrapper, visual_embeds: torch.Tensor, input_ids: torch.Tensor
+) -> None:
+    """Re-establish, for caller-supplied embeds, the invariants the uncached path
+    gets for free from ``_project_visual_features``.
+
+    ``n = visual_embeds.shape[1]`` drives ``output_slice``, MoT's positional split
+    and the residual budget, so a malformed cache would otherwise surface as an
+    opaque shape error inside ``Transformer.forward`` (or, for a 2-D tensor, as a
+    plausible-looking ``n`` taken from the feature dim).
+    """
+    if visual_embeds.dim() != 3:
+        raise ValueError(
+            f"visual_embeds must be (B, N, dim); received a {visual_embeds.dim()}-D tensor "
+            f"of shape {tuple(visual_embeds.shape)}"
+        )
+    b, n, dim = visual_embeds.shape
+    if b != input_ids.shape[0]:
+        raise ValueError(
+            f"visual_embeds batch ({b}) does not match input_ids batch "
+            f"({input_ids.shape[0]}); a cache built for one batch cannot be reused "
+            "against a differently-sized decode batch"
+        )
+    expected_n = _expected_visual_tokens(wrapper)
+    if n != expected_n:
+        raise ValueError(
+            f"visual_embeds has {n} visual token(s) but this wrapper projects to "
+            f"{expected_n} (frames_per_clip={wrapper.frames_per_clip}); the token count "
+            "sets output_slice and the residual budget, so it must match"
+        )
+    expected_dim = wrapper.transformer.config.dim
+    if dim != expected_dim:
+        raise ValueError(
+            f"visual_embeds has feature dim {dim} but the transformer expects "
+            f"{expected_dim}; embeds must already be projected to the LLM dim"
+        )
+
+
 class BaseModalityStrategy:
-    """Shared ``ModalityStrategy`` implementation (not registered, not the Protocol).
-
-    ``prepare`` is a template method: it handles the text-only request and the
-    visual-token count ``n``, then delegates arch-specific ``ModalityContext``
-    construction to ``_build_context``. Concrete strategies override
-    ``_build_context`` (and, for the residual-free Cross-Attention arch,
-    ``num_image_tokens``; for the non-generative MoMa arch, ``_text_only_context``).
-
-    Vision projection is arch-independent and runs once in ``VLMWrapper.forward``,
-    so strategies receive already-projected ``visual_embeds`` and never touch
-    pixels or the vision tower.
+    """Shared ``ModalityStrategy`` base: ``prepare`` handles the text-only case
+    and the visual-token count ``n``, then defers to ``_build_context``. Concrete
+    strategies override ``_build_context`` (Cross-Attention also ``num_image_tokens``;
+    MoMa also ``_text_only_context``).
     """
 
     def prepare(
@@ -200,11 +237,11 @@ class BaseModalityStrategy:
     ) -> ModalityContext:
         if visual_embeds is None:
             return self._text_only_context()
-        n = visual_embeds.shape[1]  # pooling-/video-aware: the actual visual-token count
+        n = visual_embeds.shape[1]  # actual visual-token count
         return self._build_context(visual_embeds, n, input_ids, frame_mask)
 
     def _text_only_context(self) -> ModalityContext:
-        # Generative arches drive the pure-text forward from an empty context.
+        # empty context -> pure-text forward
         return ModalityContext()
 
     def _build_context(
@@ -217,9 +254,7 @@ class BaseModalityStrategy:
         raise NotImplementedError
 
     def num_image_tokens(self, wrapper: VLMWrapper) -> int:
-        return wrapper.frames_per_clip * wrapper.adapter.output_num_tokens(
-            wrapper.vision_encoder.num_tokens
-        )
+        return _expected_visual_tokens(wrapper)
 
 
 @registry.register_modality_strategy("joint_decoder")
@@ -313,24 +348,13 @@ class MoTStrategy(BaseModalityStrategy):
 
 @registry.register_modality_strategy("moma")
 class MoMaStrategy(MoTStrategy):
-    """Mixture of Modality-Aware Experts: same residual-stream layout and
-    ``modality_ids`` tagging as MoT (image embeds prepended, ``output_slice``
-    trims them before the LM head), so it reuses ``MoTStrategy._build_context``.
-    The MoMa FFN stack consumes the per-position tag for true scatter/gather
-    dispatch (level-1 deterministic routing by modality).
-
-    Convention: ``modality_ids == 0`` for image positions and
-    ``modality_ids == 1`` for text positions, matching the index order
-    of ``MoMaConfig.moma_modalities = ("image", "text")``.
-
-    Non-generative: expert-choice routing is non-causal, so the text-only path
-    is rejected (``_text_only_context`` raises) rather than driven.
+    """Mixture of Modality-Aware Experts: same residual layout and ``modality_ids``
+    tagging as MoT. Non-generative (expert-choice routing is non-causal), so the
+    text-only path is rejected.
     """
 
     def _text_only_context(self) -> ModalityContext:
-        # MoMa's expert-choice routing is non-causal (is_generative=False), so it
-        # is excluded from generative/text-only evaluation; fail fast rather than
-        # emit an unusable context.
+        # Non-causal expert-choice routing (is_generative=False): no text-only path.
         raise NotImplementedError(
             "Text-only forward is not supported for the 'moma' arch "
             "(non-causal expert-choice routing; excluded from generative evaluation)."
@@ -388,13 +412,10 @@ class VLMWrapper(nn.Module):
         return self.strategy.num_image_tokens(self)
 
     def encode_visual(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        """Project raw pixels to LLM-dim visual embeds (vision encoder + adapter).
+        """Project pixels to LLM-dim visual embeds once, for cached decode.
 
-        The eval decode loop calls this once per request and feeds the result
-        back into ``forward(..., visual_embeds=...)`` at every decode step, so
-        the vision encoder + adapter run once instead of once per generated
-        token. This is not a KV cache: the transformer still re-runs over the
-        full sequence each step.
+        The decode loop passes the result to ``forward(..., visual_embeds=...)``
+        so the vision tower runs once per request, not once per token.
         """
         return _project_visual_features(self, pixel_values)
 
@@ -406,13 +427,23 @@ class VLMWrapper(nn.Module):
         frame_mask: torch.Tensor | None = None,
         visual_embeds: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        # Vision projection happens once here, or is reused from a precomputed
-        # ``visual_embeds`` (the inference-only cached-decode path) so the vision
-        # tower + adapter do not re-run each decode step. ``pixel_values is None``
-        # with no cache is a text-only request. Strategies receive the projected
-        # embeds and never touch pixels.
+        # Project once here, or reuse precomputed ``visual_embeds`` (cached decode,
+        # inference-only). ``pixel_values is None`` with no cache is text-only.
+        # The cache bypasses ``_project_visual_features``, so its invariants are
+        # re-checked here rather than inherited.
         if visual_embeds is not None:
-            assert not self.training, "visual_embeds (cached decode) is inference-only"
+            if self.training:
+                raise ValueError(
+                    "visual_embeds (cached decode) is inference-only: it bypasses the "
+                    "vision encoder + adapter, which would silently receive no gradient"
+                )
+            if pixel_values is not None:
+                raise ValueError(
+                    "pass pixel_values or visual_embeds, not both; cached embeds supersede "
+                    "pixels, so the pixels would be silently ignored (and may not even "
+                    "correspond to the cached embeds)"
+                )
+            _validate_cached_visual_embeds(self, visual_embeds, input_ids)
             embeds = visual_embeds
         elif pixel_values is not None:
             embeds = _project_visual_features(self, pixel_values)
