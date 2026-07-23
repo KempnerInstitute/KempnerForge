@@ -14,7 +14,7 @@ standard multimodal benchmarks lmms-eval implements as ``generate_until`` tasks
 and is arch-agnostic across the generative VLM arches.
 v1 scope and deliberate choices (see README.md in this directory):
 
-- **Generation: no transformer KV cache, single-GPU, batched.** The decode loop
+- **Generation: no transformer KV cache, batched, data-parallel.** The decode loop
   re-runs the transformer (including the vision encoder + adapter) over the
   growing sequence each step. There is no transformer KV cache
   (``Transformer.forward`` forbids combining ``kv_caches`` with any
@@ -23,10 +23,12 @@ v1 scope and deliberate choices (see README.md in this directory):
   (``batch_size`` model-arg) by **right-padding** the text to the batch-max
   length — the same layout training uses (image prefix at ``0..n-1``, text
   contiguous from ``n``, trailing pads causally masked) — and reading each
-  row's logits at its own last real position. Single-GPU is the validated
-  invocation, not a baked-in assumption: rank/world_size come from the lmms
-  base (defaults 0/1) and model construction sits behind ``_build_model`` so a
-  data-parallel path is a localized future change.
+  row's logits at its own last real position. **Data parallelism** is supported:
+  under ``accelerate launch --num_processes N`` each rank loads a full model
+  replica (rank/world_size come from an ``accelerate.Accelerator`` built after the
+  checkpoint load; single-process defaults to 0/1) and lmms-eval shards the
+  benchmark's documents across ranks, gathering results on rank 0. Sharded /
+  model-parallel inference for models too large for one GPU is a separate effort.
 
 - **Prompt rendering: flatten, no chat template.** KempnerForge pre-training
   uses no chat template / processor and no ``<image>`` placeholder (images are
@@ -61,7 +63,9 @@ v1 scope and deliberate choices (see README.md in this directory):
 from __future__ import annotations
 
 import json
+import os
 import time
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -179,12 +183,14 @@ def _check_generative(vlm_config: VLMConfig) -> None:
 def _load_weights(
     config: JobConfig, checkpoint: str, device: torch.device, dtype: torch.dtype
 ) -> VLMWrapper:
-    """Build a ``VLMWrapper`` and load DCP weights for single-process eval.
+    """Build a ``VLMWrapper`` and load DCP weights as a full per-rank replica.
 
     Accepts either a run directory (resolved to its ``latest``/highest
     ``step_N`` via ``resolve_resume_path``) or a specific checkpoint directory
     (used as-is when ``resolve_resume_path`` finds nothing). DCP reshards on
-    load, so checkpoints saved under FSDP/PP load into the full model.
+    load, so checkpoints saved under FSDP/PP load into the full model. Under a
+    data-parallel launch every rank calls this independently and loads the same
+    full weights (see the ``no_dist=True`` note below).
     """
     ckpt_path = resolve_resume_path(checkpoint) or Path(checkpoint)
     if not ckpt_path.exists():
@@ -194,10 +200,15 @@ def _load_weights(
     model = _build_model(config, device, dtype)
     model.eval()
 
-    # Single-process DCP load: build the full (unsharded) model, then load the
-    # model shards into its state-dict.
+    # Per-rank full-replica DCP load: build the full (unsharded) model, then load the
+    # model shards into its state-dict. no_dist=True forces dcp.load's independent
+    # single-process path (never a collective reshard across the DP process group), so every
+    # data-parallel rank ends up with a full, identical copy of the weights. In the
+    # single-GPU path this is a no-op — dcp.load already selects no_dist when
+    # torch.distributed is not initialized — but stating it makes the load correct regardless
+    # of whether a process group happens to be live when this runs.
     state_dict = {"model": model.state_dict()}
-    dcp.load(state_dict, checkpoint_id=str(ckpt_path))
+    dcp.load(state_dict, checkpoint_id=str(ckpt_path), no_dist=True)
     model.load_state_dict(state_dict["model"])
 
     _log_checkpoint_metadata(ckpt_path)
@@ -569,7 +580,20 @@ class KempnerForgeVLM(lmms):
         if kwargs:
             logger.warning(f"Ignoring unsupported model_args: {sorted(kwargs)}")
 
-        self._device = torch.device(device)
+        # Data-parallel (DP) launch detection. Under `accelerate launch --num_processes N`
+        # the launcher sets WORLD_SIZE / LOCAL_RANK / RANK in the environment for every
+        # process before any Accelerator or process group exists. Read them here so this
+        # replica can (a) bind to its own GPU below and (b) create the process group only
+        # AFTER the checkpoint load (see _load_weights call). With no launcher these default
+        # to 1 / 0 -> the single-GPU path, byte-identical to before.
+        env_world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        if env_world_size > 1 and device == "cuda":
+            # One full model replica per GPU: pin this process to its local device. Pass
+            # --device cuda (no index) under DP; an explicit cuda:i would collide every rank.
+            self._device = torch.device(f"cuda:{local_rank}")
+        else:
+            self._device = torch.device(device)
         self._batch_size = int(batch_size)
         self._default_max_new_tokens = int(max_new_tokens)
         if self._batch_size < 1:
@@ -598,6 +622,26 @@ class KempnerForgeVLM(lmms):
             self._frame_size = self._config.data.hf_image_size
 
         self._model = _load_weights(self._config, checkpoint, self._device, self._dtype)
+        if env_world_size > 1:
+            # Initialize accelerate ONLY under a real multi-process launch, and only AFTER the
+            # DCP load above so that load runs its independent no_dist path on every rank ->
+            # one full identical replica per GPU (pure data parallelism). Constructing the
+            # Accelerator here initializes the torch.distributed process group that
+            # lmms-eval's evaluator uses to gather per-rank results onto rank 0.
+            from accelerate import Accelerator, InitProcessGroupKwargs
+
+            # A long NCCL timeout mirrors lmms-eval's own models: with no KV cache, ranks can
+            # drift far apart in wall-clock (uneven shards, judge/aggregation gaps) and the
+            # ~30-min default would abort the collective mid-run.
+            accelerator = Accelerator(
+                kwargs_handlers=[InitProcessGroupKwargs(timeout=timedelta(weeks=52))]
+            )
+            self.accelerator = accelerator
+            # Global rank (process_index), not local_process_index: the evaluator shards docs
+            # by env RANK and indexes an accelerate-gathered, global-rank-ordered tensor as
+            # gathered_item[lm.rank]. The per-node device already uses LOCAL_RANK above.
+            self._rank = accelerator.process_index
+            self._world_size = accelerator.num_processes
         self._tokenizer = build_tokenizer(self._config.data.tokenizer_path)
         self._max_seq_len = self._config.model.max_seq_len
         logger.info(
@@ -605,6 +649,13 @@ class KempnerForgeVLM(lmms):
             f"frames_per_clip={self._frames_per_clip}, device={self._device}, "
             f"dtype={self._dtype}, max_seq_len={self._max_seq_len}"
         )
+
+    @property
+    def device(self) -> torch.device:
+        # lmms-eval's evaluator reads ``lm.device`` when world_size > 1 (to place the
+        # per-rank instance-count tensor it gathers). The lmms base exposes rank/world_size
+        # but no device, so the adapter provides it. Single-process: the cuda/cpu passed in.
+        return self._device
 
     def _decode_subbatch(
         self,
