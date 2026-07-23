@@ -65,6 +65,39 @@ def test_filter_disambiguates_multi_filter_metric():
     assert scores == pytest.approx({"gsm8k_cot_zeroshot": 0.42})
 
 
+def test_registered_filter_absent_warns_and_skips(caplog):
+    """The registered filter must match exactly: another variant (strict-match)
+    must never silently stand in for the registered one (flexible-extract)."""
+    results = {
+        "results": {
+            "gsm8k_cot_zeroshot": {
+                "alias": "gsm8k_cot_zeroshot",
+                "exact_match,strict-match": 0.10,
+            }
+        },
+        "group_subtasks": {"gsm8k_cot_zeroshot": []},
+    }
+    with caplog.at_level(logging.WARNING, logger="benchmark_manifest"):
+        scores = benchmark_aggregates(results, ["gsm8k_cot_zeroshot"])
+    assert scores == {}
+    warnings = [r.getMessage() for r in caplog.records]
+    assert any(
+        "'flexible-extract'" in w and "strict-match" in w and "skipping its aggregate" in w
+        for w in warnings
+    )
+
+
+def test_no_registered_filter_still_falls_back():
+    """Specs without a filter keep the lenient chain: 'none' first, else the
+    first available filter variant."""
+    results = {
+        "results": {"blink": {"alias": "blink", "blink_acc,custom-filter": 0.6}},
+        "group_subtasks": {"blink": []},
+    }
+    scores = benchmark_aggregates(results, ["blink"])
+    assert scores == pytest.approx({"blink": 0.6})
+
+
 def test_subkey_selects_from_dict_valued_metric():
     """videoevalpro's aggregate is a dict keyed by task type plus 'overall'."""
     results = {
@@ -187,9 +220,27 @@ def test_build_eval_metrics_key_scheme():
     metrics = build_eval_metrics(results, ["realworldqa"])
     assert metrics["eval/benchmarks/agg/realworldqa"] == pytest.approx(0.44)
     assert metrics["eval/benchmarks/raw/realworldqa/exact_match"] == pytest.approx(0.44)
-    assert metrics["eval/benchmarks/throughput/realworldqa/avg_speed"] == pytest.approx(12.5)
-    assert metrics["eval/benchmarks/throughput/realworldqa/total_gen_tokens"] == pytest.approx(300)
+    assert metrics["eval/benchmarks/throughput/overall/avg_speed"] == pytest.approx(12.5)
+    assert metrics["eval/benchmarks/throughput/overall/total_gen_tokens"] == pytest.approx(300)
     assert not any("stderr" in k for k in metrics)
+
+
+def test_throughput_is_run_level_never_per_task():
+    """The invocation-wide throughput summary is logged once under ``overall``,
+    never duplicated under each requested task (a two-task run would otherwise
+    attribute the combined run's totals to both tasks)."""
+    results = {
+        "results": {
+            "realworldqa": {"alias": "realworldqa", "exact_match,none": 0.44},
+            "mmstar": {"alias": "mmstar", "average,none": 0.5},
+        },
+        "group_subtasks": {"realworldqa": [], "mmstar": []},
+        "throughput": {"avg_speed": 12.5, "total_elapsed_time": 24.0},
+    }
+    metrics = build_eval_metrics(results, ["realworldqa", "mmstar"])
+    assert metrics["eval/benchmarks/throughput/overall/total_elapsed_time"] == pytest.approx(24.0)
+    per_task = [k for k in metrics if "/throughput/" in k and "/throughput/overall/" not in k]
+    assert per_task == []
 
 
 def test_build_eval_metrics_raw_includes_subtasks_and_filters():

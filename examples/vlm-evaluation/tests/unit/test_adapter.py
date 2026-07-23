@@ -801,6 +801,15 @@ class TestLoadConfig:
         monkeypatch.setattr("adapter.load_config", lambda _p, cli_args=None: job)
         assert _load_config("ignored.toml") is job
 
+    def test_jobconfig_instance_passes_through(self, tiny_vlm_configs):
+        """The harness passes its CLI-merged JobConfig directly; no re-parse."""
+        job = _vlm_job_config(tiny_vlm_configs)
+        assert _load_config(job) is job
+
+    def test_non_vlm_jobconfig_instance_rejected(self, tiny_job_config):
+        with pytest.raises(ValueError, match="not a VLM config"):
+            _load_config(tiny_job_config)
+
 
 # ---------------------------------------------------------------------------
 # _load_weights (path resolution / missing checkpoint)
