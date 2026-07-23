@@ -332,7 +332,7 @@ class TestModalityStrategies:
         strategy = JointDecoderStrategy()
         pixel_values = torch.randn(1, 3, 64, 64)
         input_ids = torch.randint(0, 256, (1, 16))
-        ctx = strategy.prepare(wrapper, pixel_values, input_ids)
+        ctx = strategy.prepare(wrapper, wrapper.encode_visual(pixel_values), input_ids)
         assert ctx.prefix_embeds is not None
         assert ctx.prefix_embeds.shape == (1, 8, 64)  # (B, N, dim)
         assert ctx.output_slice == slice(8, None)
@@ -349,7 +349,7 @@ class TestModalityStrategies:
         strategy = MoTStrategy()
         pixel_values = torch.randn(1, 3, 64, 64)
         input_ids = torch.randint(0, 256, (1, 16))
-        ctx = strategy.prepare(wrapper, pixel_values, input_ids)
+        ctx = strategy.prepare(wrapper, wrapper.encode_visual(pixel_values), input_ids)
         assert ctx.prefix_embeds is not None
         assert ctx.prefix_embeds.shape == (1, 8, 64)
         assert ctx.output_slice == slice(8, None)
@@ -367,7 +367,7 @@ class TestModalityStrategies:
         strategy = MoTStrategy()
         pixel_values = torch.randn(2, 3, 64, 64, device=DEVICE)
         input_ids = torch.randint(0, 256, (2, t_text), device=DEVICE)
-        ctx = strategy.prepare(wrapper, pixel_values, input_ids)
+        ctx = strategy.prepare(wrapper, wrapper.encode_visual(pixel_values), input_ids)
         assert ctx.modality_ids is not None
         assert ctx.modality_ids.shape == (2, 8 + t_text)
         assert ctx.modality_ids.dtype == torch.long
@@ -378,7 +378,7 @@ class TestModalityStrategies:
         strategy = CrossAttentionStrategy()
         pixel_values = torch.randn(1, 3, 64, 64)
         input_ids = torch.randint(0, 256, (1, 16))
-        ctx = strategy.prepare(wrapper, pixel_values, input_ids)
+        ctx = strategy.prepare(wrapper, wrapper.encode_visual(pixel_values), input_ids)
         assert ctx.image_features is not None
         assert ctx.image_features.shape == (1, 8, 64)
         assert ctx.image_mask is None
@@ -451,7 +451,7 @@ class TestVLMWrapperDispatch:
 
         @registry.register_modality_strategy("dispatch_smoke_test_arch")
         class _Smoke:
-            def prepare(self, wrapper, pixel_values, input_ids):  # noqa: ARG002
+            def prepare(self, wrapper, visual_embeds, input_ids, frame_mask=None):  # noqa: ARG002
                 return ModalityContext()
 
             def num_image_tokens(self, wrapper):  # noqa: ARG002
@@ -562,7 +562,7 @@ class TestPoolingConnector:
         strategy = JointDecoderStrategy()
         pixels = torch.randn(2, 3, 16, 16)
         input_ids = torch.randint(0, 256, (2, 12))
-        ctx = strategy.prepare(wrapper, pixels, input_ids)
+        ctx = strategy.prepare(wrapper, wrapper.encode_visual(pixels), input_ids)
         assert ctx.prefix_embeds is not None
         assert ctx.prefix_embeds.shape == (2, 4, 64)  # pooled prefix, model dim
         assert ctx.output_slice == slice(4, None)
@@ -585,7 +585,7 @@ class TestPoolingConnector:
         strategy = MoTStrategy()
         pixels = torch.randn(2, 3, 16, 16, device=DEVICE)
         input_ids = torch.randint(0, 256, (2, 16), device=DEVICE)
-        ctx = strategy.prepare(wrapper, pixels, input_ids)
+        ctx = strategy.prepare(wrapper, wrapper.encode_visual(pixels), input_ids)
         assert ctx.modality_ids is not None
         assert ctx.modality_ids.shape == (2, 4 + 16)  # pooled prefix + text
         assert (ctx.modality_ids[:, :4] == 0).all()
@@ -636,23 +636,18 @@ class TestVideoForward:
         assert wrapper.num_image_tokens == 16
 
     def test_projector_folds_frame_axis(self):
+        # Frame-axis folding now lives in encode_visual (VLMWrapper.forward hoists
+        # projection out of the strategies); assert on its output directly.
         wrapper = _video_wrapper(JointDecoderConfig(max_text_len=8), frames=4)
-        ctx = JointDecoderStrategy().prepare(
-            wrapper, torch.randn(2, 4, 3, 16, 16), torch.randint(0, 256, (2, 6))
-        )
-        assert ctx.prefix_embeds is not None
-        assert ctx.prefix_embeds.shape == (2, 16, 64)  # (B, F*P', dim)
-        assert ctx.output_slice == slice(16, None)
+        embeds = wrapper.encode_visual(torch.randn(2, 4, 3, 16, 16))
+        assert embeds.shape == (2, 16, 64)  # (B, F*P', dim)
 
     def test_static_count_matches_runtime_prefix(self):
         """MoT's positional split uses the build-time count; it must equal the
-        runtime prefix length (frames * per-frame)."""
+        runtime visual-token count (frames * per-frame) from encode_visual."""
         wrapper = _video_wrapper(JointDecoderConfig(max_text_len=8), frames=4)
-        ctx = JointDecoderStrategy().prepare(
-            wrapper, torch.randn(1, 4, 3, 16, 16), torch.randint(0, 256, (1, 6))
-        )
-        assert ctx.prefix_embeds is not None
-        assert ctx.prefix_embeds.shape[1] == wrapper.num_image_tokens == 16
+        embeds = wrapper.encode_visual(torch.randn(1, 4, 3, 16, 16))
+        assert embeds.shape[1] == wrapper.num_image_tokens == 16
 
     @pytest.mark.parametrize("arch", ["joint_decoder", "cross_attention", "mot", "moma"])
     def test_video_forward_all_archs(self, arch):
@@ -796,3 +791,71 @@ class TestFramePaddingMask:
         with torch.no_grad():
             logits, _ = w(pix, ids, frame_mask=fm)
         assert torch.isfinite(logits).all(), f"{arch}: NaN/inf with an all-padded clip"
+
+
+class TestVisualEmbedCache:
+    """The eval decode loop projects visual features once via ``encode_visual``
+    and feeds them back through ``forward(..., visual_embeds=...)``. Projection is
+    deterministic, so the cached path reproduces the uncached forward
+    bit-for-bit; the cache is inference-only (rejected in training mode)."""
+
+    def test_encode_visual_is_deterministic(self):
+        # Premise of the equivalence tests: RandomVisionEncoder seeds from the
+        # input and the adapter has fixed weights, so encode_visual is reproducible.
+        wrapper = _build_tiny_wrapper().to(DEVICE).eval()
+        pixels = torch.randn(2, 3, 16, 16, device=DEVICE)
+        with torch.no_grad():
+            assert torch.equal(wrapper.encode_visual(pixels), wrapper.encode_visual(pixels))
+
+    @pytest.mark.parametrize("arch", ["joint_decoder", "cross_attention", "mot", "moma"])
+    def test_cached_visual_embeds_equal_uncached_image(self, arch):
+        builders = {
+            "joint_decoder": _build_tiny_wrapper,
+            "cross_attention": _build_ca_tiny_wrapper,
+            "mot": _build_mot_tiny_wrapper,
+            "moma": _build_moma_tiny_wrapper,
+        }
+        wrapper = builders[arch](num_image_tokens=8).to(DEVICE).eval()
+        pixels = torch.randn(2, 3, 16, 16, device=DEVICE)
+        input_ids = torch.randint(0, 256, (2, 12), device=DEVICE)
+        with torch.no_grad():
+            ve = wrapper.encode_visual(pixels)
+            cached, _ = wrapper(pixels, input_ids, visual_embeds=ve)
+            uncached, _ = wrapper(pixels, input_ids)
+        assert torch.equal(cached, uncached), f"{arch}: cached decode diverges from projection"
+
+    @pytest.mark.parametrize("arch", ["joint_decoder", "cross_attention", "mot", "moma"])
+    def test_cached_visual_embeds_equal_uncached_video(self, arch):
+        # Video + frame_mask: masks are built from n == visual_embeds.shape[1],
+        # which caching does not change, so masking matches the uncached path.
+        ffn = 128 if arch in ("mot", "moma") else None
+        cfgs = {
+            "joint_decoder": JointDecoderConfig(max_text_len=8),
+            "cross_attention": CrossAttentionConfig(
+                max_text_len=8, cross_attention_every_n_layers=2
+            ),
+            "mot": MoTConfig(max_text_len=8),
+            "moma": MoMaConfig(max_text_len=8),
+        }
+        wrapper = _video_wrapper(cfgs[arch], frames=4, ffn_hidden_dim=ffn).to(DEVICE).eval()
+        pixels = torch.randn(2, 4, 3, 16, 16, device=DEVICE)
+        input_ids = torch.randint(0, 256, (2, 6), device=DEVICE)
+        fm = torch.tensor([[True, True, False, False], [True, True, True, True]], device=DEVICE)
+        with torch.no_grad():
+            ve = wrapper.encode_visual(pixels)
+            cached, _ = wrapper(pixels, input_ids, frame_mask=fm, visual_embeds=ve)
+            uncached, _ = wrapper(pixels, input_ids, frame_mask=fm)
+        assert torch.equal(cached, uncached), f"{arch}: cached video decode diverges"
+
+    def test_visual_embeds_in_training_mode_asserts(self):
+        # The cache path skips the vision tower, so it must never run in training
+        # (it would silently detach the encoder from the graph). Guarded by an
+        # assert, which python -O strips.
+        if not __debug__:
+            pytest.skip("assert guard is a no-op under -O")
+        wrapper = _build_tiny_wrapper().to(DEVICE).train()
+        pixels = torch.randn(1, 3, 16, 16, device=DEVICE)
+        input_ids = torch.randint(0, 256, (1, 8), device=DEVICE)
+        ve = wrapper.encode_visual(pixels)
+        with pytest.raises(AssertionError):
+            wrapper(pixels, input_ids, visual_embeds=ve)

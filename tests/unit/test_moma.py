@@ -240,10 +240,12 @@ class TestMoMaStrategy:
     def test_prepare_builds_modality_context(self):
         wrapper = _StubWrapper(num_tokens=4, feature_dim=8, dim=16)
         strategy = MoMaStrategy()
-        pixel_values = torch.zeros(2, 3, 8, 8)
+        # prepare() now receives already-projected visual embeds (projection is
+        # hoisted into VLMWrapper.forward); pass (B, N, dim) directly.
+        visual_embeds = torch.zeros(2, 4, 16)
         input_ids = torch.zeros(2, 6, dtype=torch.long)
 
-        ctx = strategy.prepare(wrapper, pixel_values, input_ids)
+        ctx = strategy.prepare(wrapper, visual_embeds, input_ids)
         assert isinstance(ctx, ModalityContext)
         assert ctx.prefix_embeds is not None
         assert ctx.prefix_embeds.shape == (2, 4, 16)
@@ -255,10 +257,11 @@ class TestMoMaStrategy:
     def test_modality_ids_image_then_text(self):
         wrapper = _StubWrapper(num_tokens=3, feature_dim=8, dim=16)
         strategy = MoMaStrategy()
-        pixel_values = torch.zeros(1, 3, 8, 8)
+        # Already-projected embeds: 3 visual tokens.
+        visual_embeds = torch.zeros(1, 3, 16)
         input_ids = torch.zeros(1, 5, dtype=torch.long)
 
-        ctx = strategy.prepare(wrapper, pixel_values, input_ids)
+        ctx = strategy.prepare(wrapper, visual_embeds, input_ids)
         # First 3 positions (image) get 0; rest (text) get 1.
         assert ctx.modality_ids is not None
         ids = ctx.modality_ids[0]
