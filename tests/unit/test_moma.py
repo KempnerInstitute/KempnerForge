@@ -42,7 +42,7 @@ from kempnerforge.model.moma import (
     MoMaFFN,
 )
 from kempnerforge.model.transformer import Transformer
-from kempnerforge.model.vlm import MoMaStrategy
+from kempnerforge.model.vlm import MoMaStrategy, _project_visual_features
 
 DEVICE = torch.device("cpu")
 
@@ -240,8 +240,11 @@ class TestMoMaStrategy:
     def test_prepare_builds_modality_context(self):
         wrapper = _StubWrapper(num_tokens=4, feature_dim=8, dim=16)
         strategy = MoMaStrategy()
-        # prepare() takes already-projected embeds; pass (B, N, dim) directly.
-        visual_embeds = torch.zeros(2, 4, 16)
+        # prepare() takes already-projected embeds. Route pixels through the real
+        # projection helper so the encoder -> adapter chain stays under test: the
+        # (2, 4, 16) assertions below then pin that the visual-token count and the
+        # model dim survive projection, rather than restating a hand-built shape.
+        visual_embeds = _project_visual_features(wrapper, torch.zeros(2, 3, 16, 16))
         input_ids = torch.zeros(2, 6, dtype=torch.long)
 
         ctx = strategy.prepare(wrapper, visual_embeds, input_ids)
@@ -256,8 +259,8 @@ class TestMoMaStrategy:
     def test_modality_ids_image_then_text(self):
         wrapper = _StubWrapper(num_tokens=3, feature_dim=8, dim=16)
         strategy = MoMaStrategy()
-        # Already-projected embeds: 3 visual tokens.
-        visual_embeds = torch.zeros(1, 3, 16)
+        # Projected from pixels: 3 visual tokens (stub adapter is token-count identity).
+        visual_embeds = _project_visual_features(wrapper, torch.zeros(1, 3, 16, 16))
         input_ids = torch.zeros(1, 5, dtype=torch.long)
 
         ctx = strategy.prepare(wrapper, visual_embeds, input_ids)

@@ -171,6 +171,56 @@ def _prefix_key_padding_mask(
     return torch.cat([vmask, text_valid], dim=1)
 
 
+def _expected_visual_tokens(wrapper: VLMWrapper) -> int:
+    """Static visual-token count: ``frames_per_clip`` * per-frame adapter output.
+
+    This is what ``_project_visual_features`` always produces (the frames check
+    there pins the frame count), so it is both the residual budget and the
+    expected ``n`` for a caller-supplied cache.
+    """
+    return wrapper.frames_per_clip * wrapper.adapter.output_num_tokens(
+        wrapper.vision_encoder.num_tokens
+    )
+
+
+def _validate_cached_visual_embeds(
+    wrapper: VLMWrapper, visual_embeds: torch.Tensor, input_ids: torch.Tensor
+) -> None:
+    """Re-establish, for caller-supplied embeds, the invariants the uncached path
+    gets for free from ``_project_visual_features``.
+
+    ``n = visual_embeds.shape[1]`` drives ``output_slice``, MoT's positional split
+    and the residual budget, so a malformed cache would otherwise surface as an
+    opaque shape error inside ``Transformer.forward`` (or, for a 2-D tensor, as a
+    plausible-looking ``n`` taken from the feature dim).
+    """
+    if visual_embeds.dim() != 3:
+        raise ValueError(
+            f"visual_embeds must be (B, N, dim); received a {visual_embeds.dim()}-D tensor "
+            f"of shape {tuple(visual_embeds.shape)}"
+        )
+    b, n, dim = visual_embeds.shape
+    if b != input_ids.shape[0]:
+        raise ValueError(
+            f"visual_embeds batch ({b}) does not match input_ids batch "
+            f"({input_ids.shape[0]}); a cache built for one batch cannot be reused "
+            "against a differently-sized decode batch"
+        )
+    expected_n = _expected_visual_tokens(wrapper)
+    if n != expected_n:
+        raise ValueError(
+            f"visual_embeds has {n} visual token(s) but this wrapper projects to "
+            f"{expected_n} (frames_per_clip={wrapper.frames_per_clip}); the token count "
+            "sets output_slice and the residual budget, so it must match"
+        )
+    expected_dim = wrapper.transformer.config.dim
+    if dim != expected_dim:
+        raise ValueError(
+            f"visual_embeds has feature dim {dim} but the transformer expects "
+            f"{expected_dim}; embeds must already be projected to the LLM dim"
+        )
+
+
 class BaseModalityStrategy:
     """Shared ``ModalityStrategy`` base: ``prepare`` handles the text-only case
     and the visual-token count ``n``, then defers to ``_build_context``. Concrete
@@ -204,9 +254,7 @@ class BaseModalityStrategy:
         raise NotImplementedError
 
     def num_image_tokens(self, wrapper: VLMWrapper) -> int:
-        return wrapper.frames_per_clip * wrapper.adapter.output_num_tokens(
-            wrapper.vision_encoder.num_tokens
-        )
+        return _expected_visual_tokens(wrapper)
 
 
 @registry.register_modality_strategy("joint_decoder")
@@ -381,8 +429,21 @@ class VLMWrapper(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         # Project once here, or reuse precomputed ``visual_embeds`` (cached decode,
         # inference-only). ``pixel_values is None`` with no cache is text-only.
+        # The cache bypasses ``_project_visual_features``, so its invariants are
+        # re-checked here rather than inherited.
         if visual_embeds is not None:
-            assert not self.training, "visual_embeds (cached decode) is inference-only"
+            if self.training:
+                raise ValueError(
+                    "visual_embeds (cached decode) is inference-only: it bypasses the "
+                    "vision encoder + adapter, which would silently receive no gradient"
+                )
+            if pixel_values is not None:
+                raise ValueError(
+                    "pass pixel_values or visual_embeds, not both; cached embeds supersede "
+                    "pixels, so the pixels would be silently ignored (and may not even "
+                    "correspond to the cached embeds)"
+                )
+            _validate_cached_visual_embeds(self, visual_embeds, input_ids)
             embeds = visual_embeds
         elif pixel_values is not None:
             embeds = _project_visual_features(self, pixel_values)
