@@ -591,16 +591,26 @@ class TestGenerateBatchMulti:
 
 class _CaptureModel:
     """Minimal ``VLMWrapper`` stand-in: records the ``frame_mask`` each forward
-    receives and returns deterministic zero logits (greedy -> token 0), so the
-    decode-loop plumbing can be asserted without a real transformer."""
+    receives, counts ``encode_visual`` / forward calls, and returns deterministic
+    zero logits (greedy -> token 0), so the decode-loop plumbing can be asserted
+    without a real transformer."""
 
     def __init__(self, num_image_tokens: int, vocab_size: int = 256) -> None:
         self.num_image_tokens = num_image_tokens
         self._vocab = vocab_size
         self.seen_frame_masks: list[torch.Tensor | None] = []
+        self.encode_calls = 0
+        self.forward_calls = 0
 
-    def __call__(self, pixel_values, input_ids, frame_mask=None):
-        del pixel_values
+    def encode_visual(self, pixel_values):
+        # The decode loop calls this once per request; return dummy embeds
+        # (__call__ ignores them and shapes logits from input_ids).
+        self.encode_calls += 1
+        return torch.zeros(pixel_values.shape[0], self.num_image_tokens, 1)
+
+    def __call__(self, pixel_values, input_ids, visual_embeds=None, frame_mask=None):
+        del pixel_values, visual_embeds
+        self.forward_calls += 1
         self.seen_frame_masks.append(frame_mask)
         b, t = input_ids.shape
         return torch.zeros(b, t, self._vocab), None
@@ -651,6 +661,29 @@ def test_generate_batch_text_only_budget_excludes_image_tokens():
         _gen_texts(model, _MockTokenizer(), torch.randn(1, 3, 16, 16), prompt_ids, r, 64)
     out = _gen_texts(model, _MockTokenizer(), None, prompt_ids, r, 64)
     assert len(out) == 1
+
+
+def test_encode_visual_called_once_per_generate_batch():
+    """The optimization: the vision tower + adapter are encoded ONCE per request,
+    not once per decode step (the transformer still re-runs each step)."""
+    model = _CaptureModel(num_image_tokens=8)
+    pixel_values = torch.randn(2, 3, 16, 16)
+    prompt_ids = [torch.tensor([5, 9], dtype=torch.long), torch.tensor([7, 3], dtype=torch.long)]
+    max_new = 5
+    r = _resolve_gen_kwargs({"max_new_tokens": max_new}, 128)
+    _gen_texts(model, _MockTokenizer(), pixel_values, prompt_ids, r, 64)
+    assert model.encode_calls == 1  # vision encoded once for the whole request
+    assert model.forward_calls == max_new  # transformer still re-runs each step
+
+
+def test_encode_visual_not_called_for_text_only():
+    """A text-only batch (pixel_values=None) never touches the vision tower."""
+    model = _CaptureModel(num_image_tokens=8)
+    prompt_ids = [torch.tensor([5, 9, 12], dtype=torch.long)]
+    r = _resolve_gen_kwargs({"max_new_tokens": 3}, 128)
+    _gen_texts(model, _MockTokenizer(), None, prompt_ids, r, 64)
+    assert model.encode_calls == 0
+    assert model.forward_calls == 3
 
 
 # ---------------------------------------------------------------------------

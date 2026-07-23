@@ -15,8 +15,9 @@ and is arch-agnostic across the generative VLM arches.
 v1 scope and deliberate choices (see README.md in this directory):
 
 - **Generation: no transformer KV cache, batched, data-parallel.** The decode loop
-  re-runs the transformer (including the vision encoder + adapter) over the
-  growing sequence each step. There is no transformer KV cache
+  re-runs the transformer over the growing sequence each step; the vision encoder +
+  adapter run **once** per request (``VLMWrapper.encode_visual``), and the projected
+  embeds are reused every step via ``visual_embeds``. There is no transformer KV cache
   (``Transformer.forward`` forbids combining ``kv_caches`` with any
   image-conditioning route), and KempnerForge has no image-conditioned KV-cache
   decode path. Requests are decoded in batches
@@ -453,9 +454,10 @@ def _generate_batch(
     visual tokens from attention as in training). ``pixel_values is None`` is a
     text-only batch: the vision tower is skipped, ``num_image_tokens`` is 0, and
     ``model(None, ...)`` runs the pure-text forward. There is no transformer KV
-    cache and no vision cache: ``model(...)`` re-runs over the growing
-    **right-padded** batch each step, re-encoding the vision tower each time.
-    Right-padding matches the training
+    cache, but the vision tower + adapter are encoded **once** per request
+    (``model.encode_visual``) and reused across steps via ``visual_embeds``;
+    ``model(...)`` still re-runs the transformer over the growing **right-padded**
+    batch each step. Right-padding matches the training
     layout: the image prefix stays at positions ``0..n-1`` and text is contiguous
     from ``n`` for every row (so image/text RoPE distances are consistent across
     rows), and the trailing pads are causally masked, so a batched forward gives
@@ -501,6 +503,12 @@ def _generate_batch(
     done = [False] * batch_size
     row_index = torch.arange(batch_size, device=device)
 
+    # Vision embeds depend only on pixel_values (invariant across decode steps), so
+    # encode the clip once and reuse it every step instead of re-running the encoder +
+    # adapter inside each forward. Text-only batches (pixel_values is None) skip it.
+    # (Not a KV cache: the transformer still re-runs the full sequence each step.)
+    visual_embeds = None if pixel_values is None else model.encode_visual(pixel_values)
+
     for _ in range(max_new_tokens):
         # Rebuild the right-padded batch from prompt + tokens generated so far.
         seqs = [
@@ -513,7 +521,9 @@ def _generate_batch(
         for i, s in enumerate(seqs):
             input_ids[i, : s.shape[0]] = s
 
-        logits, _ = model(pixel_values, input_ids, frame_mask=frame_mask)
+        logits, _ = model(
+            pixel_values, input_ids, visual_embeds=visual_embeds, frame_mask=frame_mask
+        )
         # Each row's next-token logits sit at its own last real position (the
         # output is already trimmed to text positions for JD/MoT; CA has no
         # image prefix), not at [-1] (a pad for shorter rows).
