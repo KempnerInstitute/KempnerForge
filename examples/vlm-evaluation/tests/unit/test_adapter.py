@@ -603,8 +603,7 @@ class _CaptureModel:
         self.forward_calls = 0
 
     def encode_visual(self, pixel_values):
-        # The decode loop calls this once per request; return dummy embeds
-        # (__call__ ignores them and shapes logits from input_ids).
+        # dummy embeds; __call__ ignores them
         self.encode_calls += 1
         return torch.zeros(pixel_values.shape[0], self.num_image_tokens, 1)
 
@@ -664,16 +663,15 @@ def test_generate_batch_text_only_budget_excludes_image_tokens():
 
 
 def test_encode_visual_called_once_per_generate_batch():
-    """The optimization: the vision tower + adapter are encoded ONCE per request,
-    not once per decode step (the transformer still re-runs each step)."""
+    """Vision encoded once per request, not once per decode step."""
     model = _CaptureModel(num_image_tokens=8)
     pixel_values = torch.randn(2, 3, 16, 16)
     prompt_ids = [torch.tensor([5, 9], dtype=torch.long), torch.tensor([7, 3], dtype=torch.long)]
     max_new = 5
     r = _resolve_gen_kwargs({"max_new_tokens": max_new}, 128)
     _gen_texts(model, _MockTokenizer(), pixel_values, prompt_ids, r, 64)
-    assert model.encode_calls == 1  # vision encoded once for the whole request
-    assert model.forward_calls == max_new  # transformer still re-runs each step
+    assert model.encode_calls == 1
+    assert model.forward_calls == max_new
 
 
 def test_encode_visual_not_called_for_text_only():
