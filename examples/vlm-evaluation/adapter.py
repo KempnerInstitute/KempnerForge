@@ -461,8 +461,8 @@ def _generate_batch(
     rows), and the trailing pads are causally masked, so a batched forward gives
     each row the same real-position logits as decoding it alone. Each row's next
     token is read at its own last real position; EOS / ``max_new_tokens`` / first
-    ``until`` match are tracked per row. ``B == 1`` reproduces the single-request
-    path exactly.
+    ``until`` match are tracked per row, and a row that finishes is dropped from
+    every later forward. ``B == 1`` reproduces the single-request path exactly.
     """
     until: list[str] = resolved["until"]
     max_new_tokens: int = resolved["max_new_tokens"]
@@ -498,48 +498,76 @@ def _generate_batch(
         prompts.append(ids)
 
     generated: list[list[int]] = [[] for _ in range(batch_size)]
-    done = [False] * batch_size
-    row_index = torch.arange(batch_size, device=device)
+    # No decode steps to run: return before touching the vision tower, whose output
+    # would be discarded by the zero-iteration loop below.
+    if max_new_tokens == 0:
+        return [""] * batch_size, [0] * batch_size
 
     # Encode the clip once and reuse it every step; text-only batches skip this.
     visual_embeds = None if pixel_values is None else model.encode_visual(pixel_values)
 
-    for _ in range(max_new_tokens):
-        # Rebuild the right-padded batch from prompt + tokens generated so far.
-        seqs = [
-            torch.cat([prompts[i], torch.tensor(generated[i], dtype=torch.long, device=device)])
-            for i in range(batch_size)
-        ]
-        real_len = torch.tensor([s.shape[0] for s in seqs], device=device)
-        cur_max = int(real_len.max().item())
-        input_ids = torch.full((batch_size, cur_max), pad_id, dtype=torch.long, device=device)
-        for i, s in enumerate(seqs):
-            input_ids[i, : s.shape[0]] = s
+    # Token buffer, allocated once: prompt + room for the whole generation, pad-filled.
+    # A step writes its sampled token in place, so no per-row tensor is rebuilt or
+    # copied to the device each iteration. ``lengths`` stays a Python list: it indexes
+    # the buffer and bounds the slice, and reading it off a device tensor would force
+    # a sync every step.
+    max_prompt_len = max(p.shape[0] for p in prompts)
+    token_buf = torch.full(
+        (batch_size, max_prompt_len + max_new_tokens), pad_id, dtype=torch.long, device=device
+    )
+    lengths = [p.shape[0] for p in prompts]
+    for i, p in enumerate(prompts):
+        token_buf[i, : lengths[i]] = p
 
-        logits, _ = model(
-            pixel_values, input_ids, visual_embeds=visual_embeds, frame_mask=frame_mask
-        )
+    # Rows still generating. Finished rows are dropped from the forward batch: their
+    # logits were discarded anyway, and with right-padding + causal attention a row's
+    # logits at its own real positions depend on neither the other rows nor the batch
+    # width, so survivors decode bit-identically to the uncompacted loop.
+    active = list(range(batch_size))
+
+    for _ in range(max_new_tokens):
+        cur_max = max(lengths[i] for i in active)
+        if len(active) == batch_size:
+            # Full batch: slice the buffer in place and pass the visual tensors
+            # through untouched (no index_select, no copy).
+            input_ids = token_buf[:, :cur_max]
+            step_embeds, step_frame_mask = visual_embeds, frame_mask
+        else:
+            # Compacted: the visual tensors are row-aligned with input_ids, and
+            # VLMWrapper.forward rejects a cache whose batch differs from input_ids.
+            active_index = torch.tensor(active, device=device)
+            input_ids = token_buf[active_index, :cur_max]
+            step_embeds = None if visual_embeds is None else visual_embeds[active_index]
+            step_frame_mask = None if frame_mask is None else frame_mask[active_index]
+        real_len = torch.tensor([lengths[i] for i in active], device=device)
+
+        # pixel_values is never passed: the clip is already encoded into
+        # visual_embeds, and forward rejects both together (they could disagree).
+        # Text-only batches have no cache and pass None for both.
+        logits, _ = model(None, input_ids, frame_mask=step_frame_mask, visual_embeds=step_embeds)
         # Each row's next-token logits sit at its own last real position (the
         # output is already trimmed to text positions for JD/MoT; CA has no
         # image prefix), not at [-1] (a pad for shorter rows).
-        next_logits = logits[row_index, real_len - 1]
+        next_logits = logits[torch.arange(len(active), device=device), real_len - 1]
         next_tokens = sample(next_logits, temperature, top_k, top_p)
 
-        for i in range(batch_size):
-            if done[i]:
-                continue
-            token_id = int(next_tokens[i].item())
+        still_active: list[int] = []
+        for j, i in enumerate(active):
+            token_id = int(next_tokens[j].item())
             if eos_id is not None and token_id == eos_id:
-                done[i] = True
                 continue
             generated[i].append(token_id)
+            token_buf[i, lengths[i]] = token_id
+            lengths[i] += 1
             if len(generated[i]) >= max_new_tokens:
-                done[i] = True
-            elif until:
+                continue
+            if until:
                 text = tokenizer.decode(generated[i], skip_special_tokens=True)
                 if _first_stop(text, until) is not None:
-                    done[i] = True
-        if all(done):
+                    continue
+            still_active.append(i)
+        active = still_active
+        if not active:
             break
 
     outputs: list[str] = []

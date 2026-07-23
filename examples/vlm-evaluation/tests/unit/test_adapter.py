@@ -9,6 +9,7 @@ real checkpoint, no network. Real-package fidelity is pinned by the gated contra
 
 from __future__ import annotations
 
+import inspect
 import json
 import sys
 import types
@@ -590,27 +591,50 @@ class TestGenerateBatchMulti:
 
 
 class _CaptureModel:
-    """Minimal ``VLMWrapper`` stand-in: records the ``frame_mask`` each forward
-    receives, counts ``encode_visual`` / forward calls, and returns deterministic
-    zero logits (greedy -> token 0), so the decode-loop plumbing can be asserted
-    without a real transformer."""
+    """Minimal ``VLMWrapper`` stand-in: records what each forward receives
+    (``pixel_values``, ``visual_embeds``, ``frame_mask``, batch width), counts
+    ``encode_visual`` / forward calls, and returns deterministic zero logits
+    (greedy -> token 0), so the decode-loop plumbing can be asserted without a
+    real transformer.
+
+    ``__call__`` mirrors ``VLMWrapper.forward``'s signature exactly, including
+    ``labels`` and parameter order; ``test_capture_model_matches_forward_signature``
+    pins that so a positional call site cannot bind arguments differently here
+    than in production.
+    """
 
     def __init__(self, num_image_tokens: int, vocab_size: int = 256) -> None:
         self.num_image_tokens = num_image_tokens
         self._vocab = vocab_size
         self.seen_frame_masks: list[torch.Tensor | None] = []
+        self.seen_pixel_values: list[torch.Tensor | None] = []
+        self.seen_visual_embeds: list[torch.Tensor | None] = []
+        self.seen_batch_sizes: list[int] = []
         self.encode_calls = 0
         self.forward_calls = 0
+        self.returned_embeds: torch.Tensor | None = None
 
     def encode_visual(self, pixel_values):
-        # dummy embeds; __call__ ignores them
         self.encode_calls += 1
-        return torch.zeros(pixel_values.shape[0], self.num_image_tokens, 1)
+        # Identifiable object whose rows are distinguishable (row i is filled with i),
+        # so a forward can be asserted to have received *this* cache, and a compacted
+        # forward to have received the surviving rows of it.
+        batch = pixel_values.shape[0]
+        self.returned_embeds = (
+            torch.arange(batch, dtype=torch.float32)
+            .view(batch, 1, 1)
+            .expand(-1, self.num_image_tokens, 1)
+            .clone()
+        )
+        return self.returned_embeds
 
-    def __call__(self, pixel_values, input_ids, visual_embeds=None, frame_mask=None):
-        del pixel_values, visual_embeds
+    def __call__(self, pixel_values, input_ids, labels=None, frame_mask=None, visual_embeds=None):
+        del labels
         self.forward_calls += 1
         self.seen_frame_masks.append(frame_mask)
+        self.seen_pixel_values.append(pixel_values)
+        self.seen_visual_embeds.append(visual_embeds)
+        self.seen_batch_sizes.append(input_ids.shape[0])
         b, t = input_ids.shape
         return torch.zeros(b, t, self._vocab), None
 
@@ -663,7 +687,13 @@ def test_generate_batch_text_only_budget_excludes_image_tokens():
 
 
 def test_encode_visual_called_once_per_generate_batch():
-    """Vision encoded once per request, not once per decode step."""
+    """Vision encoded once per request, not once per decode step -- and the cache that
+    encode_visual returned is what every forward actually conditions on.
+
+    Counting encode calls alone is not enough: dropping ``visual_embeds=`` from the
+    model call would leave the count at 1 while the real wrapper re-projected the clip
+    on every step. The identity assertion is what makes that revert fail.
+    """
     model = _CaptureModel(num_image_tokens=8)
     pixel_values = torch.randn(2, 3, 16, 16)
     prompt_ids = [torch.tensor([5, 9], dtype=torch.long), torch.tensor([7, 3], dtype=torch.long)]
@@ -672,6 +702,35 @@ def test_encode_visual_called_once_per_generate_batch():
     _gen_texts(model, _MockTokenizer(), pixel_values, prompt_ids, r, 64)
     assert model.encode_calls == 1
     assert model.forward_calls == max_new
+    # No row finishes early here, so every step takes the uncompacted fast path and
+    # forwards the cache object itself.
+    assert model.returned_embeds is not None
+    assert all(ve is model.returned_embeds for ve in model.seen_visual_embeds)
+
+
+def test_generate_batch_never_passes_pixels_with_cache():
+    """VLMWrapper.forward rejects pixel_values and visual_embeds together, so the decode
+    loop must pass only the cache once the clip is encoded."""
+    model = _CaptureModel(num_image_tokens=8)
+    prompt_ids = [torch.tensor([5, 9], dtype=torch.long)]
+    r = _resolve_gen_kwargs({"max_new_tokens": 3}, 128)
+    _gen_texts(model, _MockTokenizer(), torch.randn(1, 3, 16, 16), prompt_ids, r, 64)
+    assert model.forward_calls == 3
+    assert all(pv is None for pv in model.seen_pixel_values)
+    assert all(ve is not None for ve in model.seen_visual_embeds)
+
+
+def test_capture_model_matches_forward_signature():
+    """_CaptureModel must accept arguments exactly as VLMWrapper.forward does.
+
+    A drifting mock (missing ``labels``, or ``visual_embeds`` ahead of ``frame_mask``)
+    would keep every decode-loop test green while a positional call site in production
+    bound the cache to ``labels`` and dropped image conditioning.
+    """
+    real = list(inspect.signature(VLMWrapper.forward).parameters)
+    mock = list(inspect.signature(_CaptureModel.__call__).parameters)
+    assert real[0] == "self" and mock[0] == "self"
+    assert real[1:] == mock[1:]
 
 
 def test_encode_visual_not_called_for_text_only():
@@ -682,6 +741,96 @@ def test_encode_visual_not_called_for_text_only():
     _gen_texts(model, _MockTokenizer(), None, prompt_ids, r, 64)
     assert model.encode_calls == 0
     assert model.forward_calls == 3
+    assert all(ve is None for ve in model.seen_visual_embeds)
+
+
+def test_zero_max_new_tokens_skips_vision_and_decode():
+    """max_new_tokens=0 is a supported task value; with no decode steps to run, the
+    vision tower must not be run only for its output to be discarded."""
+    model = _CaptureModel(num_image_tokens=8)
+    prompt_ids = [torch.tensor([5, 9], dtype=torch.long), torch.tensor([7], dtype=torch.long)]
+    r = _resolve_gen_kwargs({"max_new_tokens": 0}, 128)
+    texts, counts = _gb(model, _MockTokenizer(), torch.randn(2, 3, 16, 16), prompt_ids, r, 64)
+    assert texts == ["", ""] and counts == [0, 0]
+    assert model.encode_calls == 0 and model.forward_calls == 0
+
+
+class _RowTokenModel(_CaptureModel):
+    """_CaptureModel that makes greedy decoding row-dependent: row j's argmax is its
+    own first prompt token, which is stable across steps and survives compaction (the
+    row is identified by its content, not its position). Lets one row hit EOS while
+    another keeps generating."""
+
+    def __call__(self, pixel_values, input_ids, labels=None, frame_mask=None, visual_embeds=None):
+        logits, _ = super().__call__(pixel_values, input_ids, labels, frame_mask, visual_embeds)
+        logits = logits.clone()
+        for j in range(input_ids.shape[0]):
+            logits[j, :, int(input_ids[j, 0])] = 1.0
+        return logits, None
+
+
+def test_finished_rows_dropped_from_forward_batch():
+    """A row that hits EOS stops being forwarded: its logits were discarded anyway, so
+    keeping it in the batch is pure waste (and skews the reported tok/s)."""
+    model = _RowTokenModel(num_image_tokens=8)
+    # Row 0 generates token 5 forever; row 1 generates token 7 == eos and finishes
+    # on the first step.
+    prompt_ids = [torch.tensor([5, 9], dtype=torch.long), torch.tensor([7, 3], dtype=torch.long)]
+    max_new = 4
+    r = _resolve_gen_kwargs({"max_new_tokens": max_new}, 128)
+    texts, counts = _gb(
+        model, _MockTokenizer(eos_token_id=7), torch.randn(2, 3, 16, 16), prompt_ids, r, 64
+    )
+    assert texts == ["5 5 5 5", ""] and counts == [4, 0]
+    # Step 1 sees both rows; every later step sees only the survivor.
+    assert model.seen_batch_sizes == [2, 1, 1, 1]
+    # The compacted cache is row 0 of the original (encode_visual fills row i with i),
+    # so the survivor stays conditioned on its own image.
+    assert model.seen_visual_embeds[-1].shape[0] == 1
+    assert torch.equal(model.seen_visual_embeds[-1][0], model.returned_embeds[0])
+
+
+def test_compaction_preserves_survivor_output():
+    """Dropping finished rows must not change what the remaining rows generate."""
+    prompt_ids = [torch.tensor([5, 9], dtype=torch.long), torch.tensor([7, 3], dtype=torch.long)]
+    r = _resolve_gen_kwargs({"max_new_tokens": 4}, 128)
+    batched = _gen_texts(
+        _RowTokenModel(num_image_tokens=8),
+        _MockTokenizer(eos_token_id=7),
+        torch.randn(2, 3, 16, 16),
+        prompt_ids,
+        r,
+        64,
+    )
+    alone = _gen_texts(
+        _RowTokenModel(num_image_tokens=8),
+        _MockTokenizer(eos_token_id=7),
+        torch.randn(1, 3, 16, 16),
+        [prompt_ids[0]],
+        r,
+        64,
+    )
+    assert batched[0] == alone[0]
+
+
+def test_frame_mask_compacted_with_finished_rows():
+    """frame_mask is row-aligned with the forward batch, so it must be compacted too --
+    otherwise the survivor would be masked with another row's padded-frame pattern."""
+    model = _RowTokenModel(num_image_tokens=8)
+    frame_mask = torch.tensor([[True, True], [True, False]])
+    prompt_ids = [torch.tensor([5, 9], dtype=torch.long), torch.tensor([7, 3], dtype=torch.long)]
+    r = _resolve_gen_kwargs({"max_new_tokens": 3}, 128)
+    _gen_texts(
+        model,
+        _MockTokenizer(eos_token_id=7),
+        torch.randn(2, 2, 3, 16, 16),
+        prompt_ids,
+        r,
+        64,
+        frame_mask=frame_mask,
+    )
+    assert model.seen_frame_masks[0] is frame_mask  # full batch: passed through as-is
+    assert torch.equal(model.seen_frame_masks[-1], frame_mask[:1])
 
 
 # ---------------------------------------------------------------------------
