@@ -8,7 +8,7 @@ fall back to a metadata-driven guess with a loud warning.
 
     eval/benchmarks/agg/<benchmark>            normalized [0, 1] aggregate
     eval/benchmarks/raw/<task>/<metric>[/...]  every numeric metric, raw
-    eval/benchmarks/throughput/<task>/<key>    native lmms-eval throughput
+    eval/benchmarks/throughput/overall/<key>   native lmms-eval throughput (per-invocation)
     eval/benchmarks/efficiency/<task>/<key>    only when the run logged samples
 """
 
@@ -79,8 +79,11 @@ def _lookup_metric(
 ) -> float | None:
     """Value of ``metric`` in one result entry, matched on the name before the comma.
 
-    Prefers the requested ``filter``, then ``"none"``, then the first match;
-    skips ``alias``/stderr columns. Returns ``None`` when absent or non-numeric.
+    A requested ``filter`` must match exactly (filter variants like strict-match
+    vs flexible-extract are materially different numbers, so no other variant may
+    stand in for a registered one); without a ``filter``, prefers ``"none"``, then
+    the first match. Skips ``alias``/stderr columns. Returns ``None`` when absent
+    or non-numeric.
     """
     matches: list[tuple[str, object]] = []
     for key, value in entry.items():
@@ -91,18 +94,27 @@ def _lookup_metric(
             matches.append((filt, value))
     if not matches:
         return None
-    chosen: object | None = None
     if filter is not None:
         chosen = next((v for f, v in matches if f == filter), None)
-    if chosen is None:
-        chosen = next((v for f, v in matches if f == "none"), None)
-    if chosen is None:
-        chosen = matches[0][1]
+    else:
+        chosen = next((v for f, v in matches if f == "none"), matches[0][1])
     if subkey is not None and isinstance(chosen, dict):
         chosen = chosen.get(subkey)
     if isinstance(chosen, bool) or not isinstance(chosen, (int, float)):
         return None
     return float(chosen)
+
+
+def _available_filters(entry: dict, metric: str) -> list[str]:
+    """Filter variants under which ``metric`` appears in one result entry."""
+    filters: list[str] = []
+    for key in entry:
+        if key == "alias" or "stderr" in key:
+            continue
+        base, _, filt = key.partition(",")
+        if base == metric:
+            filters.append(filt)
+    return filters
 
 
 def _resolve_spec(task: str, higher_is_better: dict) -> MetricSpec | None:
@@ -168,12 +180,35 @@ def benchmark_aggregates(results: dict, tasks: list[str]) -> dict[str, float]:
             if subtask_values:
                 raw = sum(subtask_values) / len(subtask_values)
         if raw is None:
-            logger.warning(
-                "Benchmark %r: registered metric %r is absent from the results and no subtask "
-                "supplied it; skipping its aggregate (raw metrics are still logged).",
-                task,
-                spec.metric,
+            available = sorted(
+                {
+                    filt
+                    for name in (task, *(group_subtasks.get(task) or []))
+                    for filt in _available_filters(task_results.get(name) or {}, spec.metric)
+                }
             )
+            if spec.filter is not None and available:
+                logger.warning(
+                    "Benchmark %r: registered metric %r is present only under filter(s) %s, not "
+                    "the registered filter %r; skipping its aggregate rather than silently "
+                    "logging a different variant (raw metrics are still logged). If lmms-eval "
+                    "renamed the filter, update benchmark_manifest.py:\n"
+                    "    %r: MetricSpec(%r, filter=<one of %s>),",
+                    task,
+                    spec.metric,
+                    available,
+                    spec.filter,
+                    task,
+                    spec.metric,
+                    available,
+                )
+            else:
+                logger.warning(
+                    "Benchmark %r: registered metric %r is absent from the results and no "
+                    "subtask supplied it; skipping its aggregate (raw metrics are still logged).",
+                    task,
+                    spec.metric,
+                )
             continue
         divisor = spec.scale if spec.scale is not None else (100.0 if raw > 1.0 else 1.0)
         scores[task] = raw / divisor
@@ -216,20 +251,20 @@ _EFFICIENCY_KEYS = (
 )
 
 
-def _perf_metrics(results: dict, tasks: list[str]) -> dict[str, float]:
-    """Native lmms-eval throughput/efficiency summaries as per-task scalars.
+def _perf_metrics(results: dict) -> dict[str, float]:
+    """Native lmms-eval throughput/efficiency summaries as scalars.
 
-    ``results["throughput"]`` is per-invocation, so it is attributed to each
-    requested task; ``efficiency["by_task"]`` exists only when samples were
-    logged.
+    ``results["throughput"]`` is per-invocation (one ``generate_until`` call
+    spans every task), so it is logged once under ``overall`` — comparable
+    across runs only for the same task set. ``efficiency["by_task"]`` is
+    genuinely per-task and exists only when samples were logged.
     """
     metrics: dict[str, float] = {}
     throughput = results.get("throughput") or {}
-    for task in tasks:
-        for key in _THROUGHPUT_KEYS:
-            value = throughput.get(key)
-            if isinstance(value, (int, float)) and not isinstance(value, bool):
-                metrics[f"{_KEY_PREFIX}/throughput/{task}/{key}"] = float(value)
+    for key in _THROUGHPUT_KEYS:
+        value = throughput.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            metrics[f"{_KEY_PREFIX}/throughput/overall/{key}"] = float(value)
     by_task = (results.get("efficiency") or {}).get("by_task") or {}
     for task, summary in by_task.items():
         if not isinstance(summary, dict):
@@ -250,5 +285,5 @@ def build_eval_metrics(results: dict, tasks: list[str]) -> dict[str, float]:
         for bench, score in benchmark_aggregates(results, tasks).items()
     }
     metrics.update(_raw_metrics(results))
-    metrics.update(_perf_metrics(results, tasks))
+    metrics.update(_perf_metrics(results))
     return metrics
