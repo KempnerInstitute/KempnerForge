@@ -130,6 +130,15 @@ class TestTokenizeAndMask:
         _, labels = _tokenize_and_mask(tok, "", max_text_len=8, prompt=None)
         assert (labels == -100).all()
 
+    def test_no_eos_tokenizer_appends_nothing(self):
+        """A tokenizer with no EOS id appends nothing and keeps up to
+        max_text_len caption tokens (the no-EOS branch of the append)."""
+        tok = _MockTokenizer()
+        tok.eos_token_id = None
+        ids, labels = _tokenize_and_mask(tok, "abcde", max_text_len=4, prompt=None)
+        assert ids.tolist() == [1, 2, 3, 4]  # no EOS slot reserved; kept full 4 tokens
+        assert labels.tolist() == [2, 3, 4, -100]  # next-token; last real token unsupervised
+
     def test_prompt_mask_with_bpe_tokenizer(self):
         """Regression: BPE (gpt2) and SentencePiece tokenizers are not
         prefix-preserving. ``tokenize(prompt) + tokenize(text)`` differs
