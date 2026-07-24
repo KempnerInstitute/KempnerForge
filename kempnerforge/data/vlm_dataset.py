@@ -6,9 +6,9 @@ produces the ``VLMSample`` contract:
 - ``pixel_values``: ``(3, H, W)`` float tensor, resized to ``image_size``
   and normalized with the provided mean/std.
 - ``input_ids``: ``(T,)`` int64 tensor, right-padded to ``max_text_len``.
-- ``labels``: ``(T,)`` int64 tensor matching ``input_ids`` with ``-100``
-  on padding positions and (optionally) on prompt positions when
-  ``prompt_field`` is set.
+- ``labels``: ``(T,)`` int64 next-token targets (``labels[i]`` = input
+  token ``i+1``), right-padded to ``max_text_len``; pad, trailing, and
+  prompt-predicting positions are ``-100``.
 
 ``VLMCollator`` stacks a list of samples into a batch. All batches are
 padded to the same fixed ``max_text_len`` regardless of batch content so
@@ -132,21 +132,18 @@ def _tokenize_and_mask(
     max_text_len: int,
     prompt: str | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Tokenize and build right-padded input_ids + labels.
+    """Tokenize into right-padded input_ids + next-token labels.
 
-    When ``prompt`` is provided, the prompt portion of ``labels`` is
-    masked with ``-100`` (loss does not backpropagate through prompt
-    tokens). Padding positions in both ``input_ids`` and ``labels`` are
-    handled via ``ignore_index=-100`` on the loss.
+    ``labels[i]`` is token ``i+1`` (matching text pretraining and the no-shift
+    loss); pad, trailing, and prompt-predicting positions are ``-100``.
 
     BPE and SentencePiece tokenizers are NOT prefix-preserving: in
     general ``tokenize(prompt) + tokenize(text)`` differs from
     ``tokenize(prompt + text)`` at the boundary (tokens can merge or
     split). To guarantee the mask lines up with the prompt boundary we
     tokenize prompt and text independently, then concatenate the id
-    lists. The mask length is ``len(prompt_ids)``, so masking
-    ``labels[:prompt_len]`` cannot leak a prompt token into supervision
-    or erase the first target token.
+    lists, so the prompt/target boundary is exact and only positions
+    predicting prompt tokens are masked.
     """
     if prompt is not None:
         prompt_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
@@ -166,9 +163,12 @@ def _tokenize_and_mask(
     if n > 0:
         ids_tensor = torch.tensor(full_ids, dtype=torch.long)
         input_ids[:n] = ids_tensor
-        labels[:n] = ids_tensor
-        if prompt_len > 0:
-            labels[:prompt_len] = -100
+        # Next-token targets: position i predicts token i+1; the last real token
+        # has no successor, and positions that would predict a prompt token stay
+        # masked so only response tokens are supervised.
+        labels[: n - 1] = ids_tensor[1:]
+        if prompt_len > 1:
+            labels[: prompt_len - 1] = -100
     return input_ids, labels
 
 
@@ -184,8 +184,9 @@ class HuggingFaceVLMDataset(Dataset):
         tokenizer_path: HF tokenizer id or local path.
         max_text_len: Fixed-length pad target; passed to the collator.
         prompt_field: Optional column name for a prompt that should NOT
-            receive loss (e.g. the instruction in an instruction-tuned
-            dataset). Prompt tokens get ``labels=-100``.
+            be supervised (e.g. the instruction in an instruction-tuned
+            dataset). Positions predicting prompt tokens are ``-100``; the
+            last prompt token still predicts the first caption token.
         image_size: Target square image size. Default 224.
         image_mean / image_std: Normalization stats. Defaults match
             SigLIP's ``(0.5, 0.5, 0.5)``.
