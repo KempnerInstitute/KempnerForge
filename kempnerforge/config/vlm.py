@@ -128,8 +128,8 @@ class VLMConfig:
                 f"Registered: {sorted(registered)}. "
                 f"Reserved (not yet implemented): {sorted(_RESERVED_ARCHS)}."
             )
-        if self.max_text_len <= 0:
-            raise ValueError("vlm.max_text_len must be positive")
+        if self.max_text_len < 2:
+            raise ValueError("vlm.max_text_len must be >= 2 (a caption token plus its target)")
         if self.freeze_schedule:
             steps = [s.start_step for s in self.freeze_schedule]
             if steps != sorted(steps) or len(steps) != len(set(steps)):

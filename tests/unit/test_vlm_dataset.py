@@ -93,28 +93,51 @@ class TestTokenizeAndMask:
         ids, labels = _tokenize_and_mask(tok, "abc", max_text_len=8, prompt=None)
         assert ids.shape == (8,)
         assert labels.shape == (8,)
-        assert ids[:3].tolist() == [1, 2, 3]
-        assert ids[3].item() == 0  # pad
-        assert labels[:3].tolist() == [2, 3, -100]  # next-token; last has no target
-        assert labels[3].item() == -100  # pad masked
+        assert ids[:4].tolist() == [1, 2, 3, 28]  # caption + appended EOS
+        assert ids[4].item() == 0  # pad
+        assert labels[:4].tolist() == [2, 3, 28, -100]  # next-token; "c" predicts EOS
+        assert labels[4].item() == -100  # pad masked
 
     def test_prompt_masks_labels(self):
         tok = _MockTokenizer()
         ids, labels = _tokenize_and_mask(tok, text="xyz", max_text_len=8, prompt="ab")
-        # Prompt "ab" = 2 tokens; target "xyz" = 3 tokens; total 5 tokens.
-        assert ids[:5].tolist() == [1, 2, 24, 25, 26]
-        # Next-token: last prompt token predicts the first target (24); earlier
-        # prompt-predicting positions are masked; last real token has no target.
+        # Prompt "ab" (2 tokens) + target "xyz" (3) + appended EOS (28).
+        assert ids[:6].tolist() == [1, 2, 24, 25, 26, 28]
+        # Next-token: the last prompt token predicts the first target (24), the
+        # last caption token predicts EOS; earlier prompt-predicting positions masked.
         assert labels[0].item() == -100
-        assert labels[1:4].tolist() == [24, 25, 26]
-        assert labels[4].item() == -100
-        assert labels[5].item() == -100  # pad masked
+        assert labels[1:5].tolist() == [24, 25, 26, 28]
+        assert labels[5].item() == -100  # EOS has no successor
 
     def test_truncation(self):
         tok = _MockTokenizer()
         ids, labels = _tokenize_and_mask(tok, text="abcdefghij", max_text_len=4, prompt=None)
-        assert ids.tolist() == [1, 2, 3, 4]
-        assert labels.tolist() == [2, 3, 4, -100]  # next-token labels; final position has none
+        assert ids.tolist() == [1, 2, 3, 28]  # caption truncated to fit the appended EOS
+        assert labels.tolist() == [2, 3, 28, -100]
+
+    def test_single_token_caption_supervises_eos(self):
+        """A one-token caption still yields a supervised target (the appended
+        EOS), so it is never an all--100 row."""
+        tok = _MockTokenizer()
+        ids, labels = _tokenize_and_mask(tok, "a", max_text_len=8, prompt=None)
+        assert ids[:2].tolist() == [1, 28]  # "a" + EOS
+        assert labels[0].item() == 28  # predict EOS (learn to stop)
+        assert (labels[1:] == -100).all()
+
+    def test_empty_caption_all_masked(self):
+        """An empty caption has no target (a lone EOS has no successor)."""
+        tok = _MockTokenizer()
+        _, labels = _tokenize_and_mask(tok, "", max_text_len=8, prompt=None)
+        assert (labels == -100).all()
+
+    def test_no_eos_tokenizer_appends_nothing(self):
+        """A tokenizer with no EOS id appends nothing and keeps up to
+        max_text_len caption tokens (the no-EOS branch of the append)."""
+        tok = _MockTokenizer()
+        tok.eos_token_id = None
+        ids, labels = _tokenize_and_mask(tok, "abcde", max_text_len=4, prompt=None)
+        assert ids.tolist() == [1, 2, 3, 4]  # no EOS slot reserved; kept full 4 tokens
+        assert labels.tolist() == [2, 3, 4, -100]  # next-token; last real token unsupervised
 
     def test_prompt_mask_with_bpe_tokenizer(self):
         """Regression: BPE (gpt2) and SentencePiece tokenizers are not
