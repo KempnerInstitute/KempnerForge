@@ -55,6 +55,7 @@ v1 scope and deliberate choices (see README.md in this directory):
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from pathlib import Path
 from typing import Any
@@ -129,23 +130,28 @@ def _build_model(config: JobConfig, device: torch.device, dtype: torch.dtype) ->
     return model.to(device=device, dtype=dtype)
 
 
-def _log_checkpoint_metadata(ckpt_path: Path) -> None:
-    """Log ``step``/``tokens_seen`` from the plain-JSON ``metadata.json`` if
-    present. Never reads ``train_state.pt`` (a pickle behind a UID-ownership
-    security gate); only the model weights from the ``.distcp`` shards are
-    needed for inference.
+def _read_checkpoint_metadata(ckpt_path: Path) -> dict[str, Any]:
+    """Read ``step``/``tokens_seen`` from the plain-JSON ``metadata.json`` and
+    return them with the resolved checkpoint path (the run-identity record);
+    both are ``None`` when the file is missing or unreadable. Never reads
+    ``train_state.pt`` (a pickle behind a UID-ownership security gate); only
+    the model weights from the ``.distcp`` shards are needed for inference.
     """
+    metadata: dict[str, Any] = {"path": str(ckpt_path), "step": None, "tokens_seen": None}
     meta_file = ckpt_path / "metadata.json"
     if not meta_file.exists():
-        return
+        return metadata
     try:
         meta = json.loads(meta_file.read_text())
     except (json.JSONDecodeError, OSError) as exc:
         logger.warning(f"Could not read {meta_file}: {exc}")
-        return
+        return metadata
+    metadata["step"] = meta.get("step")
+    metadata["tokens_seen"] = meta.get("tokens_seen")
     logger.info(
-        f"VLM checkpoint metadata: step={meta.get('step')}, tokens_seen={meta.get('tokens_seen')}"
+        f"VLM checkpoint metadata: step={metadata['step']}, tokens_seen={metadata['tokens_seen']}"
     )
+    return metadata
 
 
 def _load_config(config_path: str) -> JobConfig:
@@ -171,13 +177,15 @@ def _check_generative(vlm_config: VLMConfig) -> None:
 
 def _load_weights(
     config: JobConfig, checkpoint: str, device: torch.device, dtype: torch.dtype
-) -> VLMWrapper:
+) -> tuple[VLMWrapper, dict[str, Any]]:
     """Build a ``VLMWrapper`` and load DCP weights for single-process eval.
 
     Accepts either a run directory (resolved to its ``latest``/highest
     ``step_N`` via ``resolve_resume_path``) or a specific checkpoint directory
     (used as-is when ``resolve_resume_path`` finds nothing). DCP reshards on
     load, so checkpoints saved under FSDP/PP load into the full model.
+    Returns the model together with the checkpoint metadata record from
+    ``_read_checkpoint_metadata`` (resolved path, step, tokens_seen).
     """
     ckpt_path = resolve_resume_path(checkpoint) or Path(checkpoint)
     if not ckpt_path.exists():
@@ -193,9 +201,9 @@ def _load_weights(
     dcp.load(state_dict, checkpoint_id=str(ckpt_path))
     model.load_state_dict(state_dict["model"])
 
-    _log_checkpoint_metadata(ckpt_path)
+    checkpoint_meta = _read_checkpoint_metadata(ckpt_path)
     logger.info(f"Loaded VLM checkpoint from {ckpt_path}")
-    return model
+    return model, checkpoint_meta
 
 
 # --------------------------------------------------------------------------- #
@@ -547,6 +555,7 @@ class KempnerForgeVLM(lmms):
             raise ValueError(f"batch_size must be >= 1, got {self._batch_size}")
         if self._default_max_new_tokens < 1:
             raise ValueError(f"max_new_tokens must be >= 1, got {self._default_max_new_tokens}")
+        self._config_path = config
         self._config = _load_config(config)
         assert self._config.vlm is not None  # guaranteed by is_vlm; narrows for the type checker
         # Default the compute dtype to what the checkpoint was trained at
@@ -568,7 +577,9 @@ class KempnerForgeVLM(lmms):
             self._frames_per_clip = 1
             self._frame_size = self._config.data.hf_image_size
 
-        self._model = _load_weights(self._config, checkpoint, self._device, self._dtype)
+        self._model, self._checkpoint_meta = _load_weights(
+            self._config, checkpoint, self._device, self._dtype
+        )
         self._tokenizer = build_tokenizer(self._config.data.tokenizer_path)
         self._max_seq_len = self._config.model.max_seq_len
         logger.info(
@@ -576,6 +587,30 @@ class KempnerForgeVLM(lmms):
             f"frames_per_clip={self._frames_per_clip}, device={self._device}, "
             f"dtype={self._dtype}, max_seq_len={self._max_seq_len}"
         )
+
+    def run_metadata(self) -> dict[str, Any]:
+        """Resolved run-identity record (JSON-serializable) for results stamping.
+
+        ``model_args`` mirrors lmms-eval's field of the same name — the
+        constructor recipe — but with values as *resolved by the adapter*
+        (dtype defaulted from the checkpoint config, checkpoint resolved to its
+        ``step_N`` dir), so it is a valid re-invocation recipe rather than an
+        echo of the CLI. ``checkpoint`` carries the resolved path plus
+        ``step``/``tokens_seen`` from the checkpoint's ``metadata.json``;
+        ``job_config`` is the full resolved KempnerForge config.
+        """
+        return {
+            "model_args": {
+                "config": self._config_path,
+                "checkpoint": self._checkpoint_meta["path"],
+                "device": str(self._device),
+                "dtype": str(self._dtype).removeprefix("torch."),  # constructor-valid form
+                "batch_size": self._batch_size,
+                "max_new_tokens": self._default_max_new_tokens,
+            },
+            "checkpoint": dict(self._checkpoint_meta),
+            "job_config": dataclasses.asdict(self._config),
+        }
 
     def generate_until(self, requests: list[Instance]) -> list[str]:
         # Group requests by gen_kwargs (a batch must share decode params) and,

@@ -130,11 +130,24 @@ def main() -> None:
         max_new_tokens=args.max_new_tokens,
         dtype=args.dtype,  # None -> adapter defaults to the checkpoint's train.param_dtype
     )
+
+    metadata = model.run_metadata()
     results = simple_evaluate(
         model=model,
+        # Record-only on the instance path: simple_evaluate never constructs or
+        # configures a prebuilt model with these; it stores them in results["config"].
+        model_args=metadata["model_args"],
+        batch_size=args.batch_size,
+        device=args.device,
         tasks=args.tasks.split(","),
         limit=args.limit,
     )
+
+    if results is not None:
+        # The two identity records simple_evaluate has no parameter for.
+        config_block = results.setdefault("config", {})
+        config_block["checkpoint"] = metadata["checkpoint"]
+        config_block["job_config"] = metadata["job_config"]
 
     # --- Print results ---
     print(f"\n{'=' * 60}")

@@ -21,6 +21,7 @@ Three tests, all skipped when lmms-eval is absent (optional, undeclared dep):
 
 from __future__ import annotations
 
+import json
 import os
 
 import pytest
@@ -77,6 +78,12 @@ def test_dcp_roundtrip_generate_until(tmp_path, tiny_vlm_configs, monkeypatch):
     vlm = KempnerForgeVLM(
         config="ignored", checkpoint=str(ckpt_dir), device="cpu", dtype="float32", batch_size=2
     )
+
+    # The run-identity record reflects the real (DCP-resolved) checkpoint path
+    # and survives the harness's JSON dump.
+    md = vlm.run_metadata()
+    assert md["checkpoint"]["path"] == str(ckpt_dir)
+    json.dumps(md, default=str)
 
     # Two synthetic single-image requests with different prompt lengths, decoded
     # as one right-padded batch (batch_size=2), mirroring the chat 6-tuple.
@@ -193,6 +200,10 @@ def test_real_task_via_simple_evaluate():
     task = os.environ.get("KF_VLM_EVAL_TASK", "mmmu_val")
 
     model = KempnerForgeVLM(config=config, checkpoint=checkpoint)
-    results = simple_evaluate(model=model, tasks=[task], limit=2)
+    # Mirror the harness call: the identity record rides in via model_args.
+    results = simple_evaluate(
+        model=model, model_args=model.run_metadata()["model_args"], tasks=[task], limit=2
+    )
     assert results is not None
     assert "results" in results and task in results["results"]
+    assert results["config"]["model_args"]["checkpoint"]

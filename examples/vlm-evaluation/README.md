@@ -81,6 +81,9 @@ automatically) or a specific `step_N` directory.
 There is **no default task suite** — `--tasks` is required. A representative
 default benchmark set is still being decided.
 
+`--output` saves the task results at the specified path, including KempnerForge
+model metadata and job config to make runs identifiable and reproducible.
+
 ## Flags
 
 | Flag | Default | Purpose |

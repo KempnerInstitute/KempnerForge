@@ -14,6 +14,7 @@ import json
 import pytest
 import torch
 from adapter import (
+    DEFAULT_MAX_NEW_TOKENS,
     KempnerForgeVLM,
     _build_model,
     _check_generative,
@@ -23,7 +24,7 @@ from adapter import (
     _generate_batch,
     _load_config,
     _load_weights,
-    _log_checkpoint_metadata,
+    _read_checkpoint_metadata,
     _render_request,
     _resolve_dtype,
     _resolve_gen_kwargs,
@@ -638,7 +639,10 @@ def _video_job_config(tiny_video_configs) -> JobConfig:
 
 def _patch_loaders(monkeypatch, job: JobConfig, model) -> None:
     monkeypatch.setattr("adapter._load_config", lambda _p: job)
-    monkeypatch.setattr("adapter._load_weights", lambda *a, **k: model)
+    monkeypatch.setattr(
+        "adapter._load_weights",
+        lambda *a, **k: (model, {"path": "y", "step": None, "tokens_seen": None}),
+    )
     monkeypatch.setattr("adapter.build_tokenizer", lambda _p: _MockTokenizer())
 
 
@@ -684,29 +688,32 @@ class TestFirstStop:
 
 
 # ---------------------------------------------------------------------------
-# _log_checkpoint_metadata
+# _read_checkpoint_metadata
 # ---------------------------------------------------------------------------
 
 
-class TestLogCheckpointMetadata:
-    def test_missing_metadata_is_noop(self, tmp_path, monkeypatch):
+class TestReadCheckpointMetadata:
+    def test_missing_metadata_returns_nones(self, tmp_path, monkeypatch):
         rec = _RecordingLogger()
         monkeypatch.setattr("adapter.logger", rec)
-        _log_checkpoint_metadata(tmp_path)
+        meta = _read_checkpoint_metadata(tmp_path)
+        assert meta == {"path": str(tmp_path), "step": None, "tokens_seen": None}
         assert rec.infos == [] and rec.warnings == []
 
-    def test_valid_metadata_logged(self, tmp_path, monkeypatch):
+    def test_valid_metadata_returned_and_logged(self, tmp_path, monkeypatch):
         rec = _RecordingLogger()
         monkeypatch.setattr("adapter.logger", rec)
         (tmp_path / "metadata.json").write_text(json.dumps({"step": 7, "tokens_seen": 1234}))
-        _log_checkpoint_metadata(tmp_path)
+        meta = _read_checkpoint_metadata(tmp_path)
+        assert meta == {"path": str(tmp_path), "step": 7, "tokens_seen": 1234}
         assert any("step=7" in m and "tokens_seen=1234" in m for m in rec.infos)
 
     def test_malformed_metadata_warns_not_raises(self, tmp_path, monkeypatch):
         rec = _RecordingLogger()
         monkeypatch.setattr("adapter.logger", rec)
         (tmp_path / "metadata.json").write_text("{not valid json")
-        _log_checkpoint_metadata(tmp_path)  # must not raise
+        meta = _read_checkpoint_metadata(tmp_path)  # must not raise
+        assert meta == {"path": str(tmp_path), "step": None, "tokens_seen": None}
         assert any("Could not read" in m for m in rec.warnings)
 
 
@@ -782,6 +789,26 @@ class TestInitGuards:
         assert vlm._is_video is False
         assert vlm._frames_per_clip == 1
         assert vlm._frame_size == job.data.hf_image_size
+
+    def test_run_metadata_reflects_resolved_state(
+        self, monkeypatch, tiny_vlm_configs, tiny_vlm_wrapper
+    ):
+        _patch_loaders(monkeypatch, _vlm_job_config(tiny_vlm_configs), tiny_vlm_wrapper)
+        vlm = KempnerForgeVLM(
+            config="x", checkpoint="y", device="cpu", dtype="float32", batch_size=2
+        )
+        md = vlm.run_metadata()
+        assert md["model_args"] == {
+            "config": "x",
+            "checkpoint": "y",  # the loader-resolved path, not the raw argument
+            "device": "cpu",
+            "dtype": "float32",
+            "batch_size": 2,
+            "max_new_tokens": DEFAULT_MAX_NEW_TOKENS,
+        }
+        assert md["checkpoint"] == {"path": "y", "step": None, "tokens_seen": None}
+        assert md["job_config"]["model"]["max_seq_len"] == vlm._max_seq_len
+        json.dumps(md, default=str)  # must survive the harness's results dump
 
     def test_dtype_defaults_from_config(self, monkeypatch, tiny_vlm_configs, tiny_vlm_wrapper):
         # No explicit dtype -> use the checkpoint config's train.param_dtype.
