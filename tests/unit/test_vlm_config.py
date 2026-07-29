@@ -121,8 +121,8 @@ class TestVLMConfigSubclasses:
 
 class TestIsGenerative:
     """Per-arch ``is_generative`` capability, queried by generation-only
-    consumers (the lmms-eval chat adapter). Generative arches inherit the base
-    ``True``; MoMa overrides to ``False`` (non-causal expert-choice routing)."""
+    consumers. Generative arches inherit the base ``True``; MoMa overrides
+    to ``False`` (non-causal expert-choice routing)."""
 
     @pytest.mark.parametrize(
         "config",

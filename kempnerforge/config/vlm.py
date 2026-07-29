@@ -160,10 +160,9 @@ class VLMConfig:
     def is_generative(self) -> bool:
         """Whether this arch can autoregressively generate token-by-token.
 
-        Generation-only consumers (e.g. the lmms-eval chat adapter in
-        ``examples/vlm-evaluation``) query this to fail fast on arches that
-        cannot decode autoregressively. Defaults to ``True`` (the common
-        case); a non-causal arch overrides it to ``False`` (see
+        Generation-only consumers outside core query this to fail fast on
+        arches that cannot decode autoregressively. Defaults to ``True``
+        (the common case); a non-causal arch overrides it to ``False`` (see
         ``MoMaConfig``).
         """
         return True
