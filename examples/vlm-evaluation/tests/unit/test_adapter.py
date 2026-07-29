@@ -761,12 +761,12 @@ class TestInitGuards:
         with pytest.raises(ValueError, match="non-causal"):
             KempnerForgeVLM(config="x", checkpoint="y", device="cpu", dtype="float32")
 
-    def test_ignored_kwargs_warn(self, monkeypatch, tiny_vlm_configs, tiny_vlm_wrapper):
-        rec = _RecordingLogger()
-        monkeypatch.setattr("adapter.logger", rec)
-        _patch_loaders(monkeypatch, _vlm_job_config(tiny_vlm_configs), tiny_vlm_wrapper)
-        KempnerForgeVLM(config="x", checkpoint="y", device="cpu", dtype="float32", bogus=1)
-        assert any("bogus" in m for m in rec.warnings)
+    def test_unknown_kwarg_raises(self):
+        # No **kwargs escape hatch: a typo'd constructor arg fails loudly instead
+        # of being silently swallowed (the lmms-eval model_args path that needed
+        # one was deleted with the entry-point registration).
+        with pytest.raises(TypeError):
+            KempnerForgeVLM(config="x", checkpoint="y", device="cpu", dtype="float32", bogus=1)
 
     @pytest.mark.parametrize("arch", GENERATIVE_ARCHES)
     def test_init_populates_attrs(self, monkeypatch, tiny_vlm_configs, arch):

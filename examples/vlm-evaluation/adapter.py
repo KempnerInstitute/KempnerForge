@@ -20,7 +20,7 @@ v1 scope and deliberate choices (see README.md in this directory):
   (``Transformer.forward`` forbids combining ``kv_caches`` with any
   image-conditioning route), and KempnerForge has no image-conditioned KV-cache
   decode path. Requests are decoded in batches
-  (``batch_size`` model-arg) by **right-padding** the text to the batch-max
+  (``batch_size`` constructor arg) by **right-padding** the text to the batch-max
   length — the same layout training uses (image prefix at ``0..n-1``, text
   contiguous from ``n``, trailing pads causally masked) — and reading each
   row's logits at its own last real position. Single-GPU is the validated
@@ -538,12 +538,8 @@ class KempnerForgeVLM(lmms):
         dtype: str | None = None,
         batch_size: int | str = 1,
         max_new_tokens: int | str = DEFAULT_MAX_NEW_TOKENS,
-        **kwargs: Any,
     ) -> None:
         super().__init__()
-        if kwargs:
-            logger.warning(f"Ignoring unsupported model_args: {sorted(kwargs)}")
-
         self._device = torch.device(device)
         self._batch_size = int(batch_size)
         self._default_max_new_tokens = int(max_new_tokens)
