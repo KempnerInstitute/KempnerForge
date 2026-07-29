@@ -178,6 +178,8 @@ PyTorch. Two gotchas seen on the Kempner cluster:
   `simple_evaluate` pulls in a library that needs a newer `libstdc++` than the
   system one. Put a newer `libstdc++` first on the library path, e.g.
   `LD_LIBRARY_PATH=<conda-env>/lib uv run python examples/vlm-evaluation/vlm_eval_harness.py …`.
+  The integration test suite imports the evaluator too and needs the same
+  workaround (see [Run the tests](#run-the-tests)).
 
 ## Run the tests
 
@@ -190,6 +192,20 @@ uv run pytest examples/vlm-evaluation/tests/unit
 # Integration tests — need real lmms-eval installed; skip otherwise
 uv run pytest examples/vlm-evaluation/tests/integration
 ```
+
+> [!WARNING] **Kempner cluster: the integration suite needs `LD_LIBRARY_PATH`.**
+> The `simple_evaluate` contract test imports `lmms_eval.evaluator`, which pulls
+> in `sqlite3` and fails with
+> `ImportError: /lib64/libstdc++.so.6: version 'GLIBCXX_3.4.30' not found`
+> when the old system `libstdc++` wins the library load order — the same gotcha
+> the harness hits (see
+> [Cluster environment notes](#cluster-environment-notes)). This is an
+> environment problem, not a test regression; run the integration suite with a
+> newer `libstdc++` on the library path:
+>
+> ```bash
+> LD_LIBRARY_PATH=<conda-env>/lib uv run pytest examples/vlm-evaluation/tests/integration
+> ```
 
 Keep the two directories in separate pytest sessions: in a combined run the unit
 conftest's injected fake replaces the `adapter` module in `sys.modules` after the
