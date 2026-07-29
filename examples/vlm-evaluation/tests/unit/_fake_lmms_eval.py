@@ -1,3 +1,6 @@
+# pyright: reportAttributeAccessIssue=false
+# ^ the fake package is assembled by assigning submodules onto plain ModuleType
+#   objects (``root.api = ...``), attribute writes pyright cannot statically model.
 """Dependency-free fakes for the ``lmms_eval`` API surface the VLM adapter uses.
 
 ``lmms-eval`` is an optional, *undeclared* dependency, so ``adapter.py`` imports it at

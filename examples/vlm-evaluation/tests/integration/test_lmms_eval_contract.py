@@ -1,3 +1,5 @@
+# pyright: reportMissingImports=false
+# ^ lmms-eval is an optional, undeclared dependency; see adapter.py's directive.
 """Contract tests pinning the real ``lmms_eval`` API to what the unit-test fakes assume.
 
 The VLM-eval unit tests run against an in-repo fake ``lmms_eval``
@@ -66,21 +68,21 @@ class TestSimpleEvaluateContract:
         import inspect
 
         # Unlike the api/protocol/utils imports above, importing the evaluator
-        # pulls in sqlite3, which fails on a cluster whose old system libstdc++
-        # wins the library load order (`GLIBCXX_... not found`). That is an
-        # environment problem, not API drift — fix it with the LD_LIBRARY_PATH
-        # workaround in README.md ("Run the tests"), as for the harness itself.
+        # can fail on the cluster with `GLIBCXX_... not found` — an environment
+        # problem, not API drift; the README's libstdc++ warning has the fix.
         from lmms_eval.evaluator import simple_evaluate
 
         sig = inspect.signature(simple_evaluate)
         # Exactly the harness call: prebuilt instance + identity record + tasks/limit.
         sig.bind(
-            model=object(), model_args={}, batch_size=1, device="cuda",
-            tasks=["mmmu_val"], limit=8,
+            model=object(),
+            model_args={},
+            batch_size=1,
+            device="cuda",
+            tasks=["mmmu_val"],
+            limit=8,
         )  # raises TypeError on drift
-        required = [
-            n for n, p in sig.parameters.items() if p.default is inspect.Parameter.empty
-        ]
+        required = [n for n, p in sig.parameters.items() if p.default is inspect.Parameter.empty]
         assert required == ["model"]  # an lmms instance is accepted; everything else optional
         assert sig.parameters["model_args"].default is None
         assert sig.parameters["tasks"].default is None

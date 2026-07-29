@@ -1,3 +1,5 @@
+# pyright: reportMissingImports=false
+# ^ lmms-eval is an optional, undeclared dependency; see adapter.py's directive.
 """CPU unit tests for the KempnerForge VLM lmms-eval adapter.
 
 A faithful fake ``lmms_eval`` is injected by ``conftest.py`` (lmms-eval is an optional,
@@ -567,7 +569,15 @@ def test_generate_batch_threads_frame_mask_for_video():
     frame_mask = torch.tensor([[True, True], [True, False]])  # row 1: frame 2 padded
     prompt_ids = [torch.tensor([5, 9], dtype=torch.long), torch.tensor([7], dtype=torch.long)]
     r = _resolve_gen_kwargs({"max_new_tokens": 3}, 128)
-    _generate_batch(model, _MockTokenizer(), pixel_values, prompt_ids, r, 64, frame_mask=frame_mask)
+    _generate_batch(
+        model,  # pyright: ignore[reportArgumentType]
+        _MockTokenizer(),
+        pixel_values,
+        prompt_ids,
+        r,
+        64,
+        frame_mask=frame_mask,
+    )
     assert model.seen_frame_masks  # decode actually ran
     assert all(fm is frame_mask for fm in model.seen_frame_masks)
 
@@ -578,7 +588,14 @@ def test_generate_batch_no_frame_mask_for_image():
     pixel_values = torch.randn(1, 3, 16, 16)
     prompt_ids = [torch.tensor([5, 9, 12], dtype=torch.long)]
     r = _resolve_gen_kwargs({"max_new_tokens": 2}, 128)
-    _generate_batch(model, _MockTokenizer(), pixel_values, prompt_ids, r, 64)
+    _generate_batch(
+        model,  # pyright: ignore[reportArgumentType]
+        _MockTokenizer(),
+        pixel_values,
+        prompt_ids,
+        r,
+        64,
+    )
     assert model.seen_frame_masks and all(fm is None for fm in model.seen_frame_masks)
 
 
@@ -770,10 +787,15 @@ class TestInitGuards:
 
     def test_unknown_kwarg_raises(self):
         # No **kwargs escape hatch: a typo'd constructor arg fails loudly instead
-        # of being silently swallowed (the lmms-eval model_args path that needed
-        # one was deleted with the entry-point registration).
+        # of being silently swallowed
         with pytest.raises(TypeError):
-            KempnerForgeVLM(config="x", checkpoint="y", device="cpu", dtype="float32", bogus=1)
+            KempnerForgeVLM(
+                config="x",
+                checkpoint="y",
+                device="cpu",
+                dtype="float32",
+                bogus=1,  # pyright: ignore[reportCallIssue]
+            )
 
     @pytest.mark.parametrize("arch", GENERATIVE_ARCHES)
     def test_init_populates_attrs(self, monkeypatch, tiny_vlm_configs, arch):
@@ -800,7 +822,7 @@ class TestInitGuards:
         md = vlm.run_metadata()
         assert md["model_args"] == {
             "config": "x",
-            "checkpoint": "y",  # the loader-resolved path, not the raw argument
+            "checkpoint": "y",
             "device": "cpu",
             "dtype": "float32",
             "batch_size": 2,

@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# pyright: reportMissingImports=false
+# ^ lmms-eval is an optional, undeclared dependency; see adapter.py's directive.
 """Run lmms-eval benchmarks on a KempnerForge VLM checkpoint.
 
 Evaluates a VLM checkpoint via the ``KempnerForgeVLM`` lmms-eval chat-model

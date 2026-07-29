@@ -1,3 +1,5 @@
+# pyright: reportMissingImports=false
+# ^ lmms-eval is an optional, undeclared dependency; see adapter.py's directive.
 """Integration tests for the KempnerForge VLM lmms-eval adapter.
 
 Three tests, all skipped when lmms-eval is absent (optional, undeclared dep):
@@ -79,8 +81,6 @@ def test_dcp_roundtrip_generate_until(tmp_path, tiny_vlm_configs, monkeypatch):
         config="ignored", checkpoint=str(ckpt_dir), device="cpu", dtype="float32", batch_size=2
     )
 
-    # The run-identity record reflects the real (DCP-resolved) checkpoint path
-    # and survives the harness's JSON dump.
     md = vlm.run_metadata()
     assert md["checkpoint"]["path"] == str(ckpt_dir)
     json.dumps(md, default=str)

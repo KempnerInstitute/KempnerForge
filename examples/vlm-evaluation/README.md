@@ -55,6 +55,18 @@ uv sync --group video
 PyAV's manylinux wheel bundles FFmpeg, so no system FFmpeg or CUDA libraries are
 required. (Image-only evaluation does not need this group.)
 
+> [!WARNING]
+> **Kempner cluster: `libstdc++` Version:**
+> `lmms-eval` imports packages that require version `GLIBCXX_3.4.30` or newer.
+> If you experience `ImportError: /lib64/libstdc++.so.6: version 'GLIBCXX_3.4.30' not found`,
+> please point the system towards a newer version with e.g.,
+>
+> ```bash
+> export LD_LIBRARY_PATH=/n/sw/Miniforge3-25.3.1-0/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}  
+> ```
+>
+> See [Cluster environment notes](#cluster-environment-notes) for more details.
+
 ## Usage
 
 ```bash
@@ -94,7 +106,7 @@ model metadata and job config to make runs identifiable and reproducible.
 | `--limit` | `None` | cap examples per task (int count, or `<1.0` fraction) |
 | `--output` | `None` | save full JSON results |
 | `--device` | `cuda` | inference device |
-| `--dtype` | `None`(maps to model config setting) | model dtype |
+| `--dtype` | `None`(defaults to `train.param_dtype`) | model dtype |
 | `--batch-size` | `1` | requests decoded together (grouped by `gen_kwargs`) |
 | `--max-new-tokens` | `128` | fallback only; task `gen_kwargs` override it |
 
@@ -179,7 +191,7 @@ PyTorch. Two gotchas seen on the Kempner cluster:
   system one. Put a newer `libstdc++` first on the library path, e.g.
   `LD_LIBRARY_PATH=<conda-env>/lib uv run python examples/vlm-evaluation/vlm_eval_harness.py …`.
   The integration test suite imports the evaluator too and needs the same
-  workaround (see [Run the tests](#run-the-tests)).
+  workaround.
 
 ## Run the tests
 
@@ -192,20 +204,6 @@ uv run pytest examples/vlm-evaluation/tests/unit
 # Integration tests — need real lmms-eval installed; skip otherwise
 uv run pytest examples/vlm-evaluation/tests/integration
 ```
-
-> [!WARNING] **Kempner cluster: the integration suite needs `LD_LIBRARY_PATH`.**
-> The `simple_evaluate` contract test imports `lmms_eval.evaluator`, which pulls
-> in `sqlite3` and fails with
-> `ImportError: /lib64/libstdc++.so.6: version 'GLIBCXX_3.4.30' not found`
-> when the old system `libstdc++` wins the library load order — the same gotcha
-> the harness hits (see
-> [Cluster environment notes](#cluster-environment-notes)). This is an
-> environment problem, not a test regression; run the integration suite with a
-> newer `libstdc++` on the library path:
->
-> ```bash
-> LD_LIBRARY_PATH=<conda-env>/lib uv run pytest examples/vlm-evaluation/tests/integration
-> ```
 
 Keep the two directories in separate pytest sessions: in a combined run the unit
 conftest's injected fake replaces the `adapter` module in `sys.modules` after the
