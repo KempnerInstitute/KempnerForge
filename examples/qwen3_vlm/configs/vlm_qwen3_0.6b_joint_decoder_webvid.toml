@@ -1,0 +1,90 @@
+# Qwen3-0.6B Joint-Decoder video captioning on WebVid-10M, from a checkpoint
+# built by convert_hf_backbone.py (HF LLM + pretrained SigLIP2).
+#
+# Alignment stage: LLM frozen, vision encoder + adapter train. avgpool
+# (pool_window=2) gives 64 tokens/frame, so 18 * 64 = 1152 visual + 96 text
+# = 1248 <= max_seq_len. max_text_len 96 covers ~all WebVid captions (max 84).
+#
+# Target: 16 H200, global batch 256, one epoch = 41905 steps.
+[model]
+dim = 1024
+n_layers = 28
+n_heads = 16
+n_kv_heads = 8
+head_dim = 128
+vocab_size = 151936
+ffn_hidden_dim = 3072
+norm_type = "rmsnorm"
+norm_eps = 1e-6
+activation = "silu"
+qk_norm = true
+rope_theta = 1000000.0
+tie_embeddings = true
+max_seq_len = 1280
+
+[vision_encoder]
+type = "siglip2"
+path = "google/siglip2-so400m-patch14-224"
+
+[adapter]
+type = "avgpool"
+pool_window = 2
+
+[vlm]
+arch = "joint_decoder"
+max_text_len = 96
+freeze = [{ module = "transformer", frozen = true }]
+
+[video]
+data_root = "path-to-webvid-10m"
+dataset_type = "webvid"
+split = "train"
+max_frames = 18
+min_frames = 2
+fps = 2.0
+frame_size = 224
+max_samples = 0
+prompt = "Describe the video:"
+
+[data]
+tokenizer_path = "Qwen/Qwen3-0.6B"
+num_workers = 12
+pin_memory = true
+
+[train]
+batch_size = 16
+seq_len = 1280
+max_steps = 41905
+grad_accum_steps = 1
+grad_clip_norm = 1.0
+seed = 42
+compile_model = false
+activation_checkpointing = "none"
+
+[optimizer]
+name = "adamw"
+lr = 8e-5
+weight_decay = 0.1
+betas = [0.9, 0.95]
+eps = 1e-8
+fused = true
+
+[scheduler]
+name = "cosine"
+warmup_steps = 2000
+min_lr_ratio = 0.1
+
+[checkpoint]
+dir = "path-to-output-dir"
+load_path = "path-to-init-checkpoint"
+exclude_from_loading = ["optimizer", "dataloader"]
+interval = 20000
+keep_last_n = 0
+async_mode = "async"
+
+[metrics]
+log_interval = 20
+enable_wandb = true
+wandb_project = "kf-vlm-qwen3-video"
+wandb_run_name = "qwen3-0.6b-jd-webvid-phase1-avgpool18f-t96"
+enable_tensorboard = true
