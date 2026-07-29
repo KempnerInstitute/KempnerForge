@@ -122,16 +122,13 @@ def main() -> None:
 
     logger.info(f"Running lmms-eval: tasks={args.tasks}, checkpoint={args.checkpoint}")
 
-    # Only pass dtype when explicitly set; otherwise the adapter defaults it from
-    # the checkpoint config (train.param_dtype).
-    dtype_kwargs = {"dtype": args.dtype} if args.dtype is not None else {}
     model = KempnerForgeVLM(
         config=args.config,
         checkpoint=args.checkpoint,
         device=args.device,
         batch_size=args.batch_size,
         max_new_tokens=args.max_new_tokens,
-        **dtype_kwargs,
+        dtype=args.dtype,  # None -> adapter defaults to the checkpoint's train.param_dtype
     )
     results = simple_evaluate(
         model=model,
