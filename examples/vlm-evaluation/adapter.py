@@ -143,11 +143,11 @@ def _read_checkpoint_metadata(ckpt_path: Path) -> dict[str, Any]:
         return metadata
     try:
         meta = json.loads(meta_file.read_text())
-    except (json.JSONDecodeError, OSError) as exc:
+        metadata["step"] = meta.get("step")
+        metadata["tokens_seen"] = meta.get("tokens_seen")
+    except (ValueError, OSError, AttributeError) as exc:
         logger.warning(f"Could not read {meta_file}: {exc}")
         return metadata
-    metadata["step"] = meta.get("step")
-    metadata["tokens_seen"] = meta.get("tokens_seen")
     logger.info(
         f"VLM checkpoint metadata: step={metadata['step']}, tokens_seen={metadata['tokens_seen']}"
     )
