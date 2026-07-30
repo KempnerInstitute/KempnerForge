@@ -46,3 +46,5 @@ keep_last_n = 2
 log_interval = 5
 enable_wandb = false
 enable_tensorboard = false
+# enable_mlflow = true                                    # uv sync --group mlflow; creds via env
+# mlflow_experiment = "/Users/you@example.com/kf-debug"   # absolute workspace path on Databricks

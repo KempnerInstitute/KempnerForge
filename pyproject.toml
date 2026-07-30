@@ -48,6 +48,14 @@ video = [
     # only to decode clips (lazy-imported in kempnerforge/data/video_io.py).
     "av>=17.1.0",
 ]
+mlflow = [
+    # Optional Databricks-hosted experiment tracking; lazy-imported in metrics/tracker.py.
+    # mlflow-skinny = tracking-only client (no pandas/server); psutil+nvidia-ml-py = system metrics.
+    "mlflow-skinny>=3.1",
+    "databricks-sdk>=0.20",
+    "psutil",
+    "nvidia-ml-py",
+]
 
 [build-system]
 requires = ["hatchling"]
