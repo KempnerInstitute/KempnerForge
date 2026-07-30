@@ -360,8 +360,8 @@ def _mlflow_run_gone(exc: Exception) -> bool:
 
 
 def _mlflow_last_step(mlflow: Any, run_id: str) -> int | None:
-    """Highest step already recorded for the watermark metric, so a resumed run can skip
-    re-logging steps it already has (mlflow metric history is append-only)."""
+    """Highest step already logged for "train/loss" (the metric _log_step always emits), so a
+    resume skips steps it already has. Returns None if absent (dedup then skipped)."""
     try:
         hist = mlflow.MlflowClient().get_metric_history(run_id, "train/loss")
         return max((m.step for m in hist), default=None)
@@ -459,19 +459,22 @@ class MLflowBackend(_LoggingBackend):
 
     def _log_run_metadata(self, mlflow: Any) -> None:
         """Log flattened config as params + host/slurm tags; non-fatal on error."""
-        try:
-            import socket
+        import socket
 
-            hyperparams = _flatten_config_params(self._job_config) if self._job_config else {}
-            items = list(hyperparams.items())
-            # MLflow caps a single log_params batch at 100 entries.
-            for i in range(0, len(items), 100):
+        hyperparams = _flatten_config_params(self._job_config) if self._job_config else {}
+        items = list(hyperparams.items())
+        # log_params caps at 100 per batch; guard each so one bad batch keeps the rest.
+        for i in range(0, len(items), 100):
+            try:
                 mlflow.log_params(dict(items[i : i + 100]))
+            except Exception as e:
+                logger.warning(f"MLflow log_params batch failed (skipping): {e}")
+        try:
             mlflow.set_tags(
                 {"host": socket.gethostname(), "slurm_job_id": os.environ.get("SLURM_JOB_ID", "")}
             )
         except Exception as e:
-            logger.warning(f"MLflow metadata logging failed (continuing): {e}")
+            logger.warning(f"MLflow set_tags failed (continuing): {e}")
 
     def log(self, metrics: dict[str, float], step: int) -> None:
         self._ensure_init()
