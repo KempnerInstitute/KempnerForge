@@ -16,6 +16,10 @@ build/
 # Wandb
 wandb/
 
+# MLflow (local SQLite fallback store)
+mlflow.db
+mlruns/
+
 # OS
 .DS_Store
 

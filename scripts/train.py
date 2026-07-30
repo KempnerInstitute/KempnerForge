@@ -243,6 +243,8 @@ def main() -> None:
         )
         if ckpt_extra_loaded.get("wandb_run_id"):
             config.metrics.wandb_run_id = ckpt_extra_loaded["wandb_run_id"]
+        if ckpt_extra_loaded.get("mlflow_run_id"):
+            config.metrics.mlflow_run_id = ckpt_extra_loaded["mlflow_run_id"]
         # MoT warm-start: translate dense TransformerBlock weights from a
         # JD/text-only checkpoint into per-modality copies inside every
         # MoTBlock. Runs once at the start of training (resume_path is
@@ -665,6 +667,8 @@ def main() -> None:
         init_extra: dict = {"phase_idx": current_phase_idx} if active_phases else {}
         if config.metrics.wandb_run_id:
             init_extra["wandb_run_id"] = config.metrics.wandb_run_id
+        if config.metrics.mlflow_run_id:
+            init_extra["mlflow_run_id"] = config.metrics.mlflow_run_id
         if is_vlm:
             assert vlm_cfg is not None
             valid_modules = set(vlm_cfg.module_patterns.keys())
@@ -1017,10 +1021,12 @@ def main() -> None:
         if prof is not None:
             prof.step()
 
-        # Checkpoint (include phase index + wandb run ID for exact resumption)
+        # Checkpoint (include phase index + wandb/mlflow run IDs for exact resumption)
         ckpt_extra: dict = {"phase_idx": current_phase_idx} if active_phases else {}
         if config.metrics.wandb_run_id:
             ckpt_extra["wandb_run_id"] = config.metrics.wandb_run_id
+        if config.metrics.mlflow_run_id:
+            ckpt_extra["mlflow_run_id"] = config.metrics.mlflow_run_id
         if is_vlm:
             assert vlm_cfg is not None
             # Use effective_freeze so the saved metadata reflects the
