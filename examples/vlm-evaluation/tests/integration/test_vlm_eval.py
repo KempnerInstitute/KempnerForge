@@ -1,3 +1,5 @@
+# pyright: reportMissingImports=false
+# ^ lmms-eval is an optional, undeclared dependency; see adapter.py's directive.
 """Integration tests for the KempnerForge VLM lmms-eval adapter.
 
 Three tests, all skipped when lmms-eval is absent (optional, undeclared dep):
@@ -21,6 +23,7 @@ Three tests, all skipped when lmms-eval is absent (optional, undeclared dep):
 
 from __future__ import annotations
 
+import json
 import os
 
 import pytest
@@ -32,14 +35,14 @@ lmms_eval = pytest.importorskip("lmms_eval")
 if getattr(lmms_eval, "__file__", None) is None:
     # The unit conftest injects a fake lmms_eval (a bare module with no __file__);
     # these DCP-roundtrip tests need the real package, so skip rather than bind the
-    # fake (mirrors tests/integration/test_lmms_eval_contract.py).
+    # fake (mirrors test_lmms_eval_contract.py).
     pytest.skip("fake lmms_eval is active; skipping real-package tests", allow_module_level=True)
 
+from adapter import KempnerForgeVLM  # noqa: E402
 from lmms_eval.api.instance import Instance  # noqa: E402
 
 from kempnerforge.config.data import DataConfig  # noqa: E402
 from kempnerforge.config.schema import JobConfig  # noqa: E402
-from kempnerforge.eval.vlm.adapter import KempnerForgeVLM  # noqa: E402
 from kempnerforge.model.vlm import build_vlm_wrapper  # noqa: E402
 
 
@@ -71,14 +74,16 @@ def test_dcp_roundtrip_generate_until(tmp_path, tiny_vlm_configs, monkeypatch):
     job_config = JobConfig(
         model=mc, vision_encoder=vc, adapter=ac, vlm=lc, data=DataConfig(tokenizer_path="mock")
     )
-    monkeypatch.setattr("kempnerforge.eval.vlm.adapter._load_config", lambda _path: job_config)
-    monkeypatch.setattr(
-        "kempnerforge.eval.vlm.adapter.build_tokenizer", lambda _path: _MockTokenizer()
-    )
+    monkeypatch.setattr("adapter._load_config", lambda _path: job_config)
+    monkeypatch.setattr("adapter.build_tokenizer", lambda _path: _MockTokenizer())
 
     vlm = KempnerForgeVLM(
         config="ignored", checkpoint=str(ckpt_dir), device="cpu", dtype="float32", batch_size=2
     )
+
+    md = vlm.run_metadata()
+    assert md["checkpoint"]["path"] == str(ckpt_dir)
+    json.dumps(md, default=str)
 
     # Two synthetic single-image requests with different prompt lengths, decoded
     # as one right-padded batch (batch_size=2), mirroring the chat 6-tuple.
@@ -137,15 +142,11 @@ def test_dcp_roundtrip_video_generate_until(tmp_path, tiny_video_configs, monkey
         video=video,
         data=DataConfig(tokenizer_path="mock"),
     )
-    monkeypatch.setattr("kempnerforge.eval.vlm.adapter._load_config", lambda _path: job_config)
-    monkeypatch.setattr(
-        "kempnerforge.eval.vlm.adapter.build_tokenizer", lambda _path: _MockTokenizer()
-    )
+    monkeypatch.setattr("adapter._load_config", lambda _path: job_config)
+    monkeypatch.setattr("adapter.build_tokenizer", lambda _path: _MockTokenizer())
     # Stub video decode so the test needs no av / no real video file.
     frames = [Image.new("RGB", (8, 8), color=(120, 120, 120)) for _ in range(2)]
-    monkeypatch.setattr(
-        "kempnerforge.eval.vlm.adapter.decode_video_frames", lambda path, **kw: frames
-    )
+    monkeypatch.setattr("adapter.decode_video_frames", lambda path, **kw: frames)
 
     vlm = KempnerForgeVLM(
         config="ignored", checkpoint=str(ckpt_dir), device="cpu", dtype="float32", batch_size=2
@@ -198,11 +199,11 @@ def test_real_task_via_simple_evaluate():
     checkpoint = os.environ["KF_VLM_EVAL_CHECKPOINT"]
     task = os.environ.get("KF_VLM_EVAL_TASK", "mmmu_val")
 
+    model = KempnerForgeVLM(config=config, checkpoint=checkpoint)
+    # Mirror the harness call: the identity record rides in via model_args.
     results = simple_evaluate(
-        model="kempnerforge_vlm",
-        model_args=f"config={config},checkpoint={checkpoint}",
-        tasks=[task],
-        limit=2,
+        model=model, model_args=model.run_metadata()["model_args"], tasks=[task], limit=2
     )
     assert results is not None
     assert "results" in results and task in results["results"]
+    assert results["config"]["model_args"]["checkpoint"]

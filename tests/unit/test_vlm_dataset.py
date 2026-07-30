@@ -477,8 +477,8 @@ class TestHuggingFaceVLMDataset:
 
 
 class TestFramesToClipTensor:
-    """The shared frame-packing helper used by both training (``WebVidVideoDataset``)
-    and the VLM evaluation adapter."""
+    """The shared frame-packing helper used by training (``WebVidVideoDataset``)
+    and by out-of-tree consumers."""
 
     def test_full_clip_shape_and_dtype(self):
         frames = [_make_image(32) for _ in range(4)]

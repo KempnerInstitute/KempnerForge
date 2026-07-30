@@ -50,9 +50,9 @@ def pil_to_tensor(
     RGBA inputs do not drop into the encoder with the wrong channel
     count.
 
-    Public so that out-of-tree callers (e.g. the VLM evaluation adapter)
-    reuse the exact training-time preprocessing as the single source of
-    truth, rather than re-implementing resize/normalize.
+    Public so that out-of-tree callers reuse the exact training-time
+    preprocessing as the single source of truth, rather than
+    re-implementing resize/normalize.
     """
     from PIL import Image
 

@@ -1,13 +1,13 @@
+# pyright: reportMissingImports=false
+# ^ lmms-eval is an optional, undeclared dependency; see adapter.py's directive.
 """Contract tests pinning the real ``lmms_eval`` API to what the unit-test fakes assume.
 
 The VLM-eval unit tests run against an in-repo fake ``lmms_eval``
-(``tests/unit/eval/vlm/_fake_lmms_eval.py``) so they execute in CI without the optional,
-undeclared ``lmms-eval`` dependency. These tests are the fidelity net: they exercise the
-*real* package and fail loudly if its API drifts from the fakes (in which case update the
-fakes — and likely the adapter). They run wherever real lmms-eval is installed (locally, the
-manual ``gpu-tests`` CI job) and skip otherwise.
-
-Also verifies the ``pyproject.toml`` ``lmms_eval.models`` entry point resolves to the adapter.
+(``../unit/_fake_lmms_eval.py``) so they execute without the optional, undeclared
+``lmms-eval`` dependency. These tests are the fidelity net: they exercise the *real*
+package and fail loudly if its API drifts from the fakes (in which case update the
+fakes — and likely the adapter). They run wherever real lmms-eval is installed and skip
+otherwise.
 """
 
 from __future__ import annotations
@@ -23,17 +23,8 @@ if getattr(lmms_eval, "__file__", None) is None:
 
 from lmms_eval.api.instance import Instance  # noqa: E402
 from lmms_eval.api.model import lmms  # noqa: E402
-from lmms_eval.models import get_model  # noqa: E402
-from lmms_eval.models.registry_v2 import ModelManifest  # noqa: E402
 from lmms_eval.protocol import ChatMessages  # noqa: E402
 from lmms_eval.utils import Collator  # noqa: E402
-
-from kempnerforge.eval.vlm.adapter import KempnerForgeVLM  # noqa: E402
-
-
-def test_entrypoint_resolves_to_adapter():
-    """The pyproject ``lmms_eval.models`` entry point resolves ``kempnerforge_vlm``."""
-    assert get_model("kempnerforge_vlm") is KempnerForgeVLM
 
 
 class TestChatMessagesContract:
@@ -72,14 +63,30 @@ class TestCollatorContract:
         assert col.get_original(flat) == arr  # original request order restored
 
 
-class TestModelManifestContract:
-    def test_fields_and_validation(self):
-        manifest = ModelManifest(model_id="x", chat_class_path="a.b.C")
-        assert manifest.model_id == "x"
-        assert manifest.chat_class_path == "a.b.C"
-        assert manifest.simple_class_path is None
-        with pytest.raises(ValueError):
-            ModelManifest(model_id="y")  # neither class path -> rejected
+class TestSimpleEvaluateContract:
+    def test_harness_call_shape(self):
+        import inspect
+
+        # Unlike the api/protocol/utils imports above, importing the evaluator
+        # can fail on the cluster with `GLIBCXX_... not found` — an environment
+        # problem, not API drift; the README's libstdc++ warning has the fix.
+        from lmms_eval.evaluator import simple_evaluate
+
+        sig = inspect.signature(simple_evaluate)
+        # Exactly the harness call: prebuilt instance + identity record + tasks/limit.
+        sig.bind(
+            model=object(),
+            model_args={},
+            batch_size=1,
+            device="cuda",
+            tasks=["mmmu_val"],
+            limit=8,
+        )  # raises TypeError on drift
+        required = [n for n, p in sig.parameters.items() if p.default is inspect.Parameter.empty]
+        assert required == ["model"]  # an lmms instance is accepted; everything else optional
+        assert sig.parameters["model_args"].default is None
+        assert sig.parameters["tasks"].default is None
+        assert sig.parameters["limit"].default is None
 
 
 class TestLmmsBaseContract:
