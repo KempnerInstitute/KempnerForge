@@ -290,7 +290,7 @@ def _render_request(
                 f"{type(path).__name__}. The task may pass clip boundaries or a URL; "
                 "report the task to the project owner."
             )
-        frames = decode_video_frames(
+        frames, _frame_times = decode_video_frames(
             path,
             fps=video_config.fps,
             min_frames=video_config.min_frames,

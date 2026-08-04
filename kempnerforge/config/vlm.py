@@ -47,6 +47,7 @@ DEFAULT_MODULE_PATTERNS: dict[str, list[str]] = {
     "transformer": ["transformer", "transformer.*"],
     "vision_encoder": ["vision_encoder", "vision_encoder.*"],
     "adapter": ["adapter", "adapter.*"],
+    "frame_time_embed": ["frame_time_embed", "frame_time_embed.*"],
 }
 
 

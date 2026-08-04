@@ -57,6 +57,8 @@ class VideoDataset(Dataset):
 
     - ``pixel_values``: ``(F, 3, H, W)`` float32 (``F = max_frames``, zero-padded).
     - ``frame_mask``: ``(F,)`` bool (``True`` for real frames).
+    - ``frame_times``: ``(F,)`` float32 — per-frame time in seconds (``0.0`` on pad
+      frames); required by ``VideoCollator``.
     - ``input_ids`` / ``labels``: ``(T,)`` int64, padded to ``max_text_len`` with
       ``-100`` on pad/prompt positions.
 
@@ -185,7 +187,7 @@ class WebVidVideoDataset(VideoDataset):
         caption = self._caps[idx]
         path = self._video_path(videoid)
         try:
-            frames = decode_video_frames(
+            frames, frame_times_s = decode_video_frames(
                 path,
                 fps=self._fps,
                 min_frames=self._min_frames,
@@ -194,7 +196,7 @@ class WebVidVideoDataset(VideoDataset):
             )
         except Exception as e:  # noqa: BLE001 - any decode failure -> skip-with-mask
             logger.debug("video decode failed for %s: %s", path, e)
-            frames = []
+            frames, frame_times_s = [], []
 
         pixel_values, frame_mask = frames_to_clip_tensor(
             frames,
@@ -203,6 +205,13 @@ class WebVidVideoDataset(VideoDataset):
             image_mean=self._image_mean,
             image_std=self._image_std,
         )
+        # Per-frame timestamp in seconds; 0.0 for pad frames. The time projection
+        # runs over every frame and does not consult frame_mask, so pad frames
+        # still receive a (time-0) embedding — harmless only while padded frames
+        # are themselves unmasked from attention, and inert once they are masked.
+        frame_times = torch.zeros(self._max_frames, dtype=torch.float32)
+        n_real = min(len(frames), self._max_frames)
+        frame_times[:n_real] = torch.tensor(frame_times_s[:n_real], dtype=torch.float32)
 
         prompt = self._prompt or None
         input_ids, labels = _tokenize_and_mask(self._tokenizer, caption, self._max_text_len, prompt)
@@ -212,6 +221,7 @@ class WebVidVideoDataset(VideoDataset):
         return {
             "pixel_values": pixel_values,
             "frame_mask": frame_mask,
+            "frame_times": frame_times,
             "input_ids": input_ids,
             "labels": labels,
         }
@@ -223,6 +233,7 @@ class VideoCollator:
     Output keys:
       - ``pixel_values``: ``(B, F, 3, H, W)`` float32.
       - ``frame_mask``: ``(B, F)`` bool (``True`` = real frame).
+      - ``frame_times``: ``(B, F)`` float32 (per-frame time in seconds).
       - ``input_ids``: ``(B, max_text_len)`` int64.
       - ``labels``: ``(B, max_text_len)`` int64 with ``-100`` on pad/prompt.
 
@@ -242,6 +253,7 @@ class VideoCollator:
         b = len(samples)
         pixel_values = torch.stack([s["pixel_values"] for s in samples], dim=0)
         frame_mask = torch.stack([s["frame_mask"] for s in samples], dim=0)
+        frame_times = torch.stack([s["frame_times"] for s in samples], dim=0)
         input_ids = torch.full((b, self.max_text_len), self.pad_id, dtype=torch.long)
         labels = torch.full((b, self.max_text_len), -100, dtype=torch.long)
         for i, s in enumerate(samples):
@@ -253,6 +265,7 @@ class VideoCollator:
         return {
             "pixel_values": pixel_values,
             "frame_mask": frame_mask,
+            "frame_times": frame_times,
             "input_ids": input_ids,
             "labels": labels,
         }

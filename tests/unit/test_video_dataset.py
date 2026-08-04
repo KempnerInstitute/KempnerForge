@@ -76,6 +76,11 @@ def _frames(n: int, size: int = 16) -> list[Image.Image]:
     return [Image.new("RGB", (size, size), color=(i * 10 % 255, 0, 0)) for i in range(n)]
 
 
+def _decoded(n: int, size: int = 16) -> tuple[list[Image.Image], list[float]]:
+    """Mimic decode_video_frames: (frames, per-frame presentation seconds)."""
+    return _frames(n, size), [float(i) for i in range(n)]
+
+
 # ---------------------------------------------------------------------------
 # Video path mapping (verified against the on-disk WebVid layout)
 # ---------------------------------------------------------------------------
@@ -103,7 +108,7 @@ class TestVideoPath:
 
 class TestGetItem:
     def test_shapes_and_mask_full_clip(self, monkeypatch):
-        monkeypatch.setattr(vd, "decode_video_frames", lambda *a, **k: _frames(8))
+        monkeypatch.setattr(vd, "decode_video_frames", lambda *a, **k: _decoded(8))
         ds = _StubVideoDataset(["1"], ["a cat."], max_frames=8, frame_size=16)
         item = ds[0]
         assert item["pixel_values"].shape == (8, 3, 16, 16)
@@ -111,19 +116,25 @@ class TestGetItem:
         assert item["frame_mask"].shape == (8,)
         assert item["frame_mask"].dtype == torch.bool
         assert item["frame_mask"].all()
+        assert item["frame_times"].shape == (8,)
+        assert item["frame_times"].dtype == torch.float32
+        assert item["frame_times"].tolist() == [float(i) for i in range(8)]
         assert item["input_ids"].shape == (8,)
         assert item["labels"].shape == (8,)
 
     def test_pads_and_masks_short_clip(self, monkeypatch):
-        monkeypatch.setattr(vd, "decode_video_frames", lambda *a, **k: _frames(3))
+        monkeypatch.setattr(vd, "decode_video_frames", lambda *a, **k: _decoded(3))
         ds = _StubVideoDataset(["1"], ["a dog."], max_frames=8)
         item = ds[0]
         assert item["frame_mask"].tolist() == [True, True, True, False, False, False, False, False]
         # Padded frames are zeros.
         assert torch.count_nonzero(item["pixel_values"][3:]) == 0
+        # Real frames carry their times; pad frames are 0.0.
+        assert item["frame_times"][:3].tolist() == [0.0, 1.0, 2.0]
+        assert item["frame_times"][3:].tolist() == [0.0, 0.0, 0.0, 0.0, 0.0]
 
     def test_caption_is_supervised_when_frames_present(self, monkeypatch):
-        monkeypatch.setattr(vd, "decode_video_frames", lambda *a, **k: _frames(4))
+        monkeypatch.setattr(vd, "decode_video_frames", lambda *a, **k: _decoded(4))
         ds = _StubVideoDataset(["1"], ["abc"], max_frames=8, max_text_len=8)
         item = ds[0]
         # "abc" -> [1,2,3] + EOS(28); next-token labels [2,3,28,-100], rest -100.
@@ -139,17 +150,18 @@ class TestGetItem:
         item = ds[0]
         assert torch.count_nonzero(item["pixel_values"]) == 0
         assert not item["frame_mask"].any()
+        assert torch.count_nonzero(item["frame_times"]) == 0
         assert (item["labels"] == -100).all()  # no supervision for an unloadable clip
 
     def test_empty_decode_yields_zero_clip_no_loss(self, monkeypatch):
-        monkeypatch.setattr(vd, "decode_video_frames", lambda *a, **k: [])
+        monkeypatch.setattr(vd, "decode_video_frames", lambda *a, **k: ([], []))
         ds = _StubVideoDataset(["1"], ["a cat."], max_frames=4)
         item = ds[0]
         assert not item["frame_mask"].any()
         assert (item["labels"] == -100).all()
 
     def test_prompt_is_masked(self, monkeypatch):
-        monkeypatch.setattr(vd, "decode_video_frames", lambda *a, **k: _frames(2))
+        monkeypatch.setattr(vd, "decode_video_frames", lambda *a, **k: _decoded(2))
         ds = _StubVideoDataset(["1"], ["xyz"], max_frames=4, max_text_len=8, prompt="ab")
         item = ds[0]
         # prompt "ab": last prompt token predicts first target (24); caption + EOS(28).
@@ -169,7 +181,9 @@ class TestGetItem:
         from kempnerforge.data.vlm_dataset import frames_to_clip_tensor
 
         frames = _frames(3)
-        monkeypatch.setattr(vd, "decode_video_frames", lambda *a, **k: frames)
+        monkeypatch.setattr(
+            vd, "decode_video_frames", lambda *a, **k: (frames, [0.0] * len(frames))
+        )
         ds = _StubVideoDataset(["1"], ["a cat."], max_frames=8, frame_size=16)
         item = ds[0]
         expected_pv, expected_mask = frames_to_clip_tensor(
@@ -198,7 +212,15 @@ class TestVideoCollator:
         ids[:3] = torch.tensor([1, 2, 3])
         labels = torch.full((max_text_len,), -100, dtype=torch.long)
         labels[:3] = torch.tensor([1, 2, 3])
-        return {"pixel_values": pv, "frame_mask": mask, "input_ids": ids, "labels": labels}
+        times = torch.zeros(max_frames, dtype=torch.float32)
+        times[:n_frames_valid] = torch.arange(n_frames_valid, dtype=torch.float32)
+        return {
+            "pixel_values": pv,
+            "frame_mask": mask,
+            "frame_times": times,
+            "input_ids": ids,
+            "labels": labels,
+        }
 
     def test_batch_shapes(self):
         collator = VideoCollator(pad_id=0, max_text_len=8)
@@ -206,6 +228,8 @@ class TestVideoCollator:
         assert batch["pixel_values"].shape == (3, 4, 3, 16, 16)
         assert batch["frame_mask"].shape == (3, 4)
         assert batch["frame_mask"].dtype == torch.bool
+        assert batch["frame_times"].shape == (3, 4)
+        assert batch["frame_times"].dtype == torch.float32
         assert batch["input_ids"].shape == (3, 8)
         assert batch["labels"].shape == (3, 8)
 
@@ -280,6 +304,8 @@ class TestRealDatasetIntegration:
         item = ds[0]
         assert item["pixel_values"].shape == (8, 3, 32, 32)
         assert item["frame_mask"].any()  # real frames decoded
+        assert item["frame_times"].shape == (8,)
+        assert (item["frame_times"][item["frame_mask"]] >= 0).all()  # real-frame times set
         assert (item["labels"] != -100).any()  # caption supervised
 
     def test_decode_failure_is_masked(self, tmp_path):

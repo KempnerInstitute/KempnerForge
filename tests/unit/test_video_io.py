@@ -75,6 +75,32 @@ class TestSampleTimestamps:
 
 
 # ---------------------------------------------------------------------------
+# _frame_time (per-frame timestamp with no-PTS fallback; pure, no decoder)
+# ---------------------------------------------------------------------------
+
+
+class TestFrameTime:
+    def test_uses_pts_when_present(self):
+        from kempnerforge.data.video_io import _frame_time
+
+        assert _frame_time(3.5, 0, 2.0) == 3.5
+
+    def test_falls_back_to_index_over_rate_when_no_pts(self):
+        # No PTS => monotonic index/rate estimate, not the all-zero a raw
+        # `pts or 0.0` would give (which collapses frame_times to a no-op).
+        from kempnerforge.data.video_io import _frame_time
+
+        assert _frame_time(None, 0, 2.0) == 0.0
+        assert _frame_time(None, 4, 2.0) == 2.0
+        assert _frame_time(None, 3, 2.0) == 1.5
+
+    def test_falls_back_to_raw_index_without_rate(self):
+        from kempnerforge.data.video_io import _frame_time
+
+        assert _frame_time(None, 3, 0.0) == 3.0
+
+
+# ---------------------------------------------------------------------------
 # decode_video_frames (integration; needs av + the testbed data)
 # ---------------------------------------------------------------------------
 
@@ -89,15 +115,17 @@ class TestDecodeVideoFramesIntegration:
 
         from kempnerforge.data.video_io import decode_video_frames
 
-        frames = decode_video_frames(_WEBVID_CLIP, fps=2.0, min_frames=4, max_frames=8)
+        frames, times = decode_video_frames(_WEBVID_CLIP, fps=2.0, min_frames=4, max_frames=8)
         assert 1 <= len(frames) <= 8
+        assert len(times) == len(frames)
         assert all(isinstance(f, Image.Image) and f.mode == "RGB" for f in frames)
 
     def test_respects_max_frames(self):
         from kempnerforge.data.video_io import decode_video_frames
 
-        frames = decode_video_frames(_WEBVID_CLIP, fps=8.0, min_frames=4, max_frames=4)
+        frames, times = decode_video_frames(_WEBVID_CLIP, fps=8.0, min_frames=4, max_frames=4)
         assert len(frames) == 4
+        assert len(times) == 4
 
     def test_missing_file_raises(self):
         from kempnerforge.data.video_io import decode_video_frames
@@ -136,8 +164,10 @@ class TestDecodeSynthetic:
 
         path = tmp_path / "clip.mp4"
         _write_mp4(path, n_frames=20, fps=10)  # ~2s
-        frames = decode_video_frames(str(path), fps=2.0, min_frames=4, max_frames=8)
+        frames, times = decode_video_frames(str(path), fps=2.0, min_frames=4, max_frames=8)
         assert 1 <= len(frames) <= 8
+        assert len(times) == len(frames)
+        assert times == sorted(times)  # presentation times are non-decreasing
         assert all(isinstance(f, Image.Image) and f.mode == "RGB" for f in frames)
 
     def test_respects_max_frames(self, tmp_path):
@@ -145,16 +175,18 @@ class TestDecodeSynthetic:
 
         path = tmp_path / "clip.mp4"
         _write_mp4(path, n_frames=40, fps=10)  # ~4s
-        frames = decode_video_frames(str(path), fps=8.0, min_frames=4, max_frames=4)
+        frames, times = decode_video_frames(str(path), fps=8.0, min_frames=4, max_frames=4)
         assert len(frames) == 4
+        assert len(times) == 4
 
     def test_short_clip_returns_frames(self, tmp_path):
         from kempnerforge.data.video_io import decode_video_frames
 
         path = tmp_path / "short.mp4"
         _write_mp4(path, n_frames=3, fps=10)  # shorter than min_frames request
-        frames = decode_video_frames(str(path), fps=2.0, min_frames=4, max_frames=8)
+        frames, times = decode_video_frames(str(path), fps=2.0, min_frames=4, max_frames=8)
         assert len(frames) >= 1
+        assert len(times) == len(frames)
 
 
 class TestSamplingPolicyRegistry:
