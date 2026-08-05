@@ -23,7 +23,11 @@ class TestVideoConfig:
 
     def test_bad_split_rejected(self):
         with pytest.raises(ValueError, match="video.split"):
-            VideoConfig(split="test")
+            VideoConfig(split="valid")
+
+    def test_test_split_accepted(self):
+        # QA corpora ship a test split; WebVid rejects it at dataset build time.
+        assert VideoConfig(split="test").split == "test"
 
     def test_min_greater_than_max_rejected(self):
         with pytest.raises(ValueError, match="must be <="):

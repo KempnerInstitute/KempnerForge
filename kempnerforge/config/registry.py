@@ -190,13 +190,14 @@ class Registry:
         """Decorator to register a video-dataset builder.
 
         Builders take ``(video_config, tokenizer_path, max_text_len,
-        frame_selector_config=None)`` and return a map-style ``Dataset`` whose
+        frame_selector=None)`` and return a map-style ``Dataset`` whose
         samples ``VideoCollator`` batches (see
         ``kempnerforge.data.video_dataset.VideoDataset``). Selected by
-        ``[video].dataset_type``. ``frame_selector_config`` is the optional
-        ``[frame_selector]`` section; builders thread it to
+        ``[video].dataset_type``. ``frame_selector`` is an optional *prebuilt*
+        ``FrameSelector`` (constructed once at the ``build_video_data`` seam from
+        the ``[frame_selector]`` section); builders thread it to
         ``VideoDataset._init_frame_selector`` so query-aware frame selection
-        works for every dataset style, not just one.
+        works for every dataset style while a mixture shares one scorer.
         """
 
         def decorator(fn: Callable) -> Callable:
@@ -271,11 +272,31 @@ class Registry:
 
         return decorator
 
+    def register_qa_format(self, name: str) -> Callable:
+        """Decorator to register a question-answering prompt/target format.
+
+        Formats take ``(question, options, answer_index, instruction)`` and
+        return a ``QAText(prompt, target)``; the prompt is masked out of the
+        loss. Selected by ``[video].qa_format``.
+        """
+
+        def decorator(fn: Callable) -> Callable:
+            self.register("qa_format", name, fn)
+            return fn
+
+        return decorator
+
     def get_frame_selector(self, name: str) -> Callable:
         return self.get("frame_selector", name)
 
     def list_frame_selectors(self) -> list[str]:
         return self.list("frame_selector")
+
+    def get_qa_format(self, name: str) -> Callable:
+        return self.get("qa_format", name)
+
+    def list_qa_formats(self) -> list[str]:
+        return self.list("qa_format")
 
     def register_dyn_ckpt_strategy(self, name: str) -> Callable:
         """Decorator to register a dynamic-checkpointing-window strategy.
