@@ -19,7 +19,7 @@ model = registry.get("mlp", "my_mlp")(dim=4096, hidden_dim=11008)
 raises `KeyError` with an "Available: […]" hint when a name is missing;
 `list(category)` returns registered names.
 
-## The seven categories
+## The core categories
 
 | Category | Registered keys | Selected by config field |
 |----------|-----------------|--------------------------|
@@ -30,6 +30,19 @@ raises `KeyError` with an "Available: […]" hint when a name is missing;
 | `norm` | `rmsnorm`, `layernorm` | `model.norm_type` |
 | `router` | `softmax_topk`, `sigmoid_topk` | `model.moe_router` |
 | `mlp` | `swiglu`, `standard_gelu`, `standard_relu` | `model.activation` (mapped) |
+
+The VLM / video path adds more categories, each `register_*` / `get_*` /
+`list_*`-shaped and selected by its own config section:
+
+| Category | Registered keys | Selected by config field |
+|----------|-----------------|--------------------------|
+| `vision_encoder` | `random`, `siglip2`, `clip` | `vision_encoder.type` |
+| `adapter` | `mlp_2layer`, `linear`, `avgpool`, `attentional_pool` | `adapter.type` |
+| `vlm_config` / `modality_strategy` | `joint_decoder`, `cross_attention`, `mot`, `moma` | `vlm.arch` |
+| `video_dataset` | `webvid` | `video.dataset_type` |
+| `sampling_policy` | `uniform` | `video.sampling_policy` |
+| `time_embedding` | `sinusoidal` | `time_embedding.type` |
+| `frame_selector` | `topk`, `qframe`, `mdp3` | `frame_selector.type` |
 
 The `mlp` case is the only one that isn't a direct string match:
 `build_mlp` in

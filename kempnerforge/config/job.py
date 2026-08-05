@@ -9,6 +9,7 @@ from kempnerforge.config.checkpoint import CheckpointConfig
 from kempnerforge.config.data import DataConfig
 from kempnerforge.config.distributed import DistributedConfig
 from kempnerforge.config.eval import EvalConfig
+from kempnerforge.config.frame_selector import FrameSelectorConfig
 from kempnerforge.config.metrics import MetricsConfig
 from kempnerforge.config.model import ModelConfig
 from kempnerforge.config.optimizer import OptimizerConfig
@@ -55,6 +56,7 @@ class JobConfig:
     vlm: VLMConfig | None = None
     video: VideoConfig | None = None
     time_embedding: TimeEmbeddingConfig | None = None
+    frame_selector: FrameSelectorConfig | None = None
 
     def __post_init__(self) -> None:
         """Cross-section invariants that fire at construction time.
@@ -149,6 +151,27 @@ class JobConfig:
                     'Set [time_embedding].type = "none" or remove the section to silence this.',
                     self.time_embedding.type,
                     reason,
+                )
+
+        # [frame_selector] applies only to the video path (it selects among
+        # decoded video frames). Set-but-no-[video] is silently ineffective, so
+        # warn (mirrors the [time_embedding] warning). When [video] is present,
+        # the candidate pool must be at least as large as the frames we keep.
+        if self.frame_selector is not None:
+            if self.video is None:
+                import logging
+
+                logging.getLogger(__name__).warning(
+                    "[frame_selector] is set (type=%r) but no [video] section is present; "
+                    "frame selection applies only to the video path, so it will be ignored. "
+                    "Remove the section to silence this.",
+                    self.frame_selector.type,
+                )
+            elif self.frame_selector.candidate_frames < self.video.max_frames:
+                raise ValueError(
+                    f"frame_selector.candidate_frames ({self.frame_selector.candidate_frames}) "
+                    f"must be >= video.max_frames ({self.video.max_frames}): the selector keeps "
+                    "max_frames frames out of the candidate pool."
                 )
 
     @property

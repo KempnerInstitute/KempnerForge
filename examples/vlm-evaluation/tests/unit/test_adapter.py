@@ -149,7 +149,7 @@ def _img(size: int = 8) -> Image.Image:
 class TestRenderRequest:
     def test_flattens_text_blocks_in_order(self):
         messages = _chat([_text("Question:"), _image(_img()), _text("What color?")])
-        images, prompt = _render_request(messages, None)
+        images, _times, prompt = _render_request(messages, None)
         assert len(images) == 1
         assert prompt == "Question:\nWhat color?"
 
@@ -198,8 +198,11 @@ class TestRenderRequestVideo:
             "adapter.decode_video_frames",
             lambda path, **kw: (frames, [0.0] * len(frames)),
         )
-        out_frames, prompt = _render_request(_chat([_text("describe"), _video("clip.mp4")]), vcfg)
+        out_frames, out_times, prompt = _render_request(
+            _chat([_text("describe"), _video("clip.mp4")]), vcfg
+        )
         assert out_frames is frames
+        assert out_times == [0.0, 0.0, 0.0]  # decode times are now threaded through
         assert prompt == "describe"
 
     def test_decode_uses_config_policy(self, monkeypatch, vcfg):
@@ -232,7 +235,7 @@ class TestRenderRequestVideo:
             _render_request(_chat([_image(_img()), _video("c.mp4")]), vcfg)
 
     def test_single_image_is_one_frame_clip(self, vcfg):
-        frames, prompt = _render_request(_chat([_text("q"), _image(_img())]), vcfg)
+        frames, _times, prompt = _render_request(_chat([_text("q"), _image(_img())]), vcfg)
         assert len(frames) == 1
         assert prompt == "q"
 
@@ -262,9 +265,33 @@ class TestRenderRequestVideo:
         monkeypatch.setattr(
             "adapter.decode_video_frames", lambda path, **kw: ([], [])
         )
-        frames, _ = _render_request(_chat([_video("c.mp4")]), vcfg)
+        frames, _times, _prompt = _render_request(_chat([_video("c.mp4")]), vcfg)
         assert frames == []
         assert any("zero clip" in m for m in rec.warnings)
+
+    def test_selector_reduces_candidate_frames(self, monkeypatch, vcfg):
+        # With a frame selector, _render_request routes through select_video_frames
+        # (candidate decode + query-aware subset), passing the prompt as query and
+        # the path as seed_key.
+        captured: dict = {}
+
+        def _select(path, query, selector, k, *, sampling_policy="uniform", seed_key=None):
+            captured.update(
+                path=path, query=query, k=k, seed_key=seed_key, policy=sampling_policy
+            )
+            return [_img(), _img()], [0.0, 3.0]  # 2 selected of a larger pool
+
+        monkeypatch.setattr("adapter.select_video_frames", _select)
+        sel = object()  # a stand-in FrameSelector; identity is all _render_request needs
+        frames, times, prompt = _render_request(
+            _chat([_text("what is happening?"), _video("clip.mp4")]), vcfg, sel
+        )
+        assert len(frames) == 2
+        assert times == [0.0, 3.0]
+        assert captured["query"] == "what is happening?"
+        assert captured["k"] == vcfg.max_frames
+        assert captured["seed_key"] == "clip.mp4"
+        assert captured["policy"] == vcfg.sampling_policy
 
 
 # ---------------------------------------------------------------------------
@@ -558,10 +585,12 @@ class _CaptureModel:
         self.num_image_tokens = num_image_tokens
         self._vocab = vocab_size
         self.seen_frame_masks: list[torch.Tensor | None] = []
+        self.seen_frame_times: list[torch.Tensor | None] = []
 
-    def __call__(self, pixel_values, input_ids, frame_mask=None):
+    def __call__(self, pixel_values, input_ids, frame_mask=None, frame_times=None):
         del pixel_values
         self.seen_frame_masks.append(frame_mask)
+        self.seen_frame_times.append(frame_times)
         b, t = input_ids.shape
         return torch.zeros(b, t, self._vocab), None
 
@@ -602,6 +631,39 @@ def test_generate_batch_no_frame_mask_for_image():
         64,
     )
     assert model.seen_frame_masks and all(fm is None for fm in model.seen_frame_masks)
+
+
+def test_generate_batch_threads_frame_times_for_video():
+    """A video batch passes the (B, F) frame_times into every model forward, so a
+    time-aware checkpoint gets its temporal signal at eval (previously dropped)."""
+    model = _CaptureModel(num_image_tokens=16)
+    pixel_values = torch.randn(2, 2, 3, 16, 16)
+    frame_mask = torch.tensor([[True, True], [True, False]])
+    frame_times = torch.tensor([[0.0, 1.5], [0.0, 0.0]])
+    prompt_ids = [torch.tensor([5, 9], dtype=torch.long), torch.tensor([7], dtype=torch.long)]
+    r = _resolve_gen_kwargs({"max_new_tokens": 2}, 128)
+    _generate_batch(
+        model,  # pyright: ignore[reportArgumentType]
+        _MockTokenizer(),
+        pixel_values,
+        prompt_ids,
+        r,
+        64,
+        frame_mask=frame_mask,
+        frame_times=frame_times,
+    )
+    assert model.seen_frame_times
+    assert all(ft is frame_times for ft in model.seen_frame_times)
+
+
+def test_generate_batch_no_frame_times_for_image():
+    """An image batch forwards frame_times=None (no temporal axis)."""
+    model = _CaptureModel(num_image_tokens=8)
+    pixel_values = torch.randn(1, 3, 16, 16)
+    prompt_ids = [torch.tensor([5, 9, 12], dtype=torch.long)]
+    r = _resolve_gen_kwargs({"max_new_tokens": 2}, 128)
+    _generate_batch(model, _MockTokenizer(), pixel_values, prompt_ids, r, 64)  # pyright: ignore[reportArgumentType]
+    assert model.seen_frame_times and all(ft is None for ft in model.seen_frame_times)
 
 
 # ---------------------------------------------------------------------------
@@ -660,7 +722,7 @@ def _video_job_config(tiny_video_configs) -> JobConfig:
 
 
 def _patch_loaders(monkeypatch, job: JobConfig, model) -> None:
-    monkeypatch.setattr("adapter._load_config", lambda _p: job)
+    monkeypatch.setattr("adapter._load_config", lambda _p, *a, **k: job)
     monkeypatch.setattr(
         "adapter._load_weights",
         lambda *a, **k: (model, {"path": "y", "step": None, "tokens_seen": None}),
@@ -781,7 +843,7 @@ class TestInitGuards:
     @pytest.mark.parametrize("arch", NON_GENERATIVE_ARCHES)
     def test_non_generative_fails_fast_before_load(self, monkeypatch, tiny_vlm_configs, arch):
         job = _vlm_job_config(tiny_vlm_configs, arch=arch)
-        monkeypatch.setattr("adapter._load_config", lambda _p: job)
+        monkeypatch.setattr("adapter._load_config", lambda _p, *a, **k: job)
 
         def _must_not_load(*args, **kwargs):
             raise AssertionError("model load must not run for an unsupported arch")
@@ -817,6 +879,62 @@ class TestInitGuards:
         assert vlm._frames_per_clip == 1
         assert vlm._frame_size == job.data.hf_image_size
 
+    def test_constructor_forwards_config_overrides(self, monkeypatch, tiny_vlm_configs):
+        captured: dict = {}
+
+        def _capturing_load_config(path, overrides=None):
+            captured["overrides"] = overrides
+            return _vlm_job_config(tiny_vlm_configs)
+
+        monkeypatch.setattr("adapter._load_config", _capturing_load_config)
+        monkeypatch.setattr(
+            "adapter._load_weights",
+            lambda *a, **k: (
+                _vlm_wrapper("joint_decoder"),
+                {"path": "y", "step": None, "tokens_seen": None},
+            ),
+        )
+        monkeypatch.setattr("adapter.build_tokenizer", lambda _p: _MockTokenizer())
+        vlm = KempnerForgeVLM(
+            config="x",
+            checkpoint="y",
+            device="cpu",
+            dtype="float32",
+            config_overrides=["frame_selector.type=qframe"],
+        )
+        assert captured["overrides"] == ["frame_selector.type=qframe"]
+        assert vlm.run_metadata()["model_args"]["config_overrides"] == [
+            "frame_selector.type=qframe"
+        ]
+
+    def test_selector_built_only_in_video_mode(
+        self, monkeypatch, tiny_vlm_configs, tiny_video_configs, tiny_vlm_wrapper,
+        tiny_video_vlm_wrapper,
+    ):
+        from kempnerforge.config.frame_selector import FrameSelectorConfig
+
+        built: list[bool] = []
+        monkeypatch.setattr(
+            "adapter.build_frame_selector",
+            lambda cfg, device=None, dtype=None: built.append(True) or object(),
+        )
+
+        # Image job with a [frame_selector]: is_video False -> selector NOT built.
+        image_job = _vlm_job_config(tiny_vlm_configs)
+        image_job.frame_selector = FrameSelectorConfig()
+        _patch_loaders(monkeypatch, image_job, tiny_vlm_wrapper)
+        img_vlm = KempnerForgeVLM(config="x", checkpoint="y", device="cpu", dtype="float32")
+        assert img_vlm._frame_selector is None
+        assert built == []
+
+        # Video job with a [frame_selector]: selector IS built.
+        video_job = _video_job_config(tiny_video_configs)
+        video_job.frame_selector = FrameSelectorConfig(candidate_frames=8)
+        _patch_loaders(monkeypatch, video_job, tiny_video_vlm_wrapper)
+        vid_vlm = KempnerForgeVLM(config="x", checkpoint="y", device="cpu", dtype="float32")
+        assert vid_vlm._frame_selector is not None
+        assert built == [True]
+
     def test_run_metadata_reflects_resolved_state(
         self, monkeypatch, tiny_vlm_configs, tiny_vlm_wrapper
     ):
@@ -832,6 +950,7 @@ class TestInitGuards:
             "dtype": "float32",
             "batch_size": 2,
             "max_new_tokens": DEFAULT_MAX_NEW_TOKENS,
+            "config_overrides": [],
         }
         assert md["checkpoint"] == {"path": "y", "step": None, "tokens_seen": None}
         assert md["job_config"]["model"]["max_seq_len"] == vlm._max_seq_len

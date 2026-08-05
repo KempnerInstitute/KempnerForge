@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from kempnerforge.config import JobConfig, ModelConfig, load_config
+from kempnerforge.config.frame_selector import FrameSelectorConfig
 from kempnerforge.config.loader import _parse_cli_overrides
 from kempnerforge.config.registry import Registry
 from kempnerforge.config.schema import (
@@ -706,6 +707,109 @@ class TestTimeEmbeddingIneffectiveWarning:
         with caplog.at_level("WARNING", logger="kempnerforge.config.job"):
             self._image_vlm(TimeEmbeddingConfig(type="none"))
         assert not any("[time_embedding] is set" in r.getMessage() for r in caplog.records)
+
+
+class TestFrameSelectorIneffectiveWarning:
+    """``JobConfig.__post_init__`` warns when ``[frame_selector]`` is set without a
+    ``[video]`` section (frame selection applies only to the video path), and is
+    silent when there is real video. Mirrors the ``[time_embedding]`` warning."""
+
+    def setup_method(self):
+        import logging
+
+        self._kf_logger = logging.getLogger("kempnerforge")
+        self._old_propagate = self._kf_logger.propagate
+        self._kf_logger.propagate = True
+
+    def teardown_method(self):
+        self._kf_logger.propagate = self._old_propagate
+
+    def _image_vlm(self, frame_selector):
+        return JobConfig(
+            model=ModelConfig(max_seq_len=1024),
+            vision_encoder=VisionEncoderConfig(type="random", feature_dim=384, num_tokens=64),
+            adapter=AdapterConfig(),
+            vlm=VLMConfig(max_text_len=512),
+            frame_selector=frame_selector,
+        )
+
+    def _video_vlm(self, frame_selector, max_frames):
+        return JobConfig(
+            model=ModelConfig(max_seq_len=1024),
+            vision_encoder=VisionEncoderConfig(type="random", feature_dim=384, num_tokens=64),
+            adapter=AdapterConfig(),
+            vlm=VLMConfig(max_text_len=512),
+            video=VideoConfig(max_frames=max_frames, min_frames=1),
+            frame_selector=frame_selector,
+        )
+
+    def test_warns_when_set_without_video(self, caplog):
+        with caplog.at_level("WARNING", logger="kempnerforge.config.job"):
+            self._image_vlm(FrameSelectorConfig())
+        assert any("[frame_selector] is set" in r.getMessage() for r in caplog.records)
+
+    def test_no_warning_with_video(self, caplog):
+        with caplog.at_level("WARNING", logger="kempnerforge.config.job"):
+            self._video_vlm(FrameSelectorConfig(candidate_frames=16), max_frames=8)
+        assert not any("[frame_selector] is set" in r.getMessage() for r in caplog.records)
+
+    def test_no_warning_when_absent(self, caplog):
+        with caplog.at_level("WARNING", logger="kempnerforge.config.job"):
+            self._image_vlm(None)
+        assert not any("[frame_selector] is set" in r.getMessage() for r in caplog.records)
+
+
+class TestFrameSelectorCandidateBudget:
+    """The candidate pool must be at least as large as the frames kept."""
+
+    def _video_vlm(self, candidate_frames, max_frames):
+        return JobConfig(
+            model=ModelConfig(max_seq_len=1024),
+            vision_encoder=VisionEncoderConfig(type="random", feature_dim=384, num_tokens=64),
+            adapter=AdapterConfig(),
+            vlm=VLMConfig(max_text_len=512),
+            video=VideoConfig(max_frames=max_frames, min_frames=1),
+            frame_selector=FrameSelectorConfig(candidate_frames=candidate_frames),
+        )
+
+    def test_rejects_pool_smaller_than_max_frames(self):
+        with pytest.raises(ValueError, match="candidate_frames.*must be >= video.max_frames"):
+            self._video_vlm(candidate_frames=4, max_frames=8)
+
+    def test_allows_equal(self):
+        cfg = self._video_vlm(candidate_frames=8, max_frames=8)
+        assert cfg.frame_selector.candidate_frames == 8
+
+    def test_loader_roundtrip_with_cli_override(self, tmp_path):
+        # A [frame_selector] TOML table plus a CLI override instantiates the
+        # section and merges the override (the eval --override path).
+        toml = tmp_path / "cfg.toml"
+        toml.write_text(
+            "[model]\nmax_seq_len = 1024\n\n"
+            "[vision_encoder]\ntype = 'random'\nfeature_dim = 384\nnum_tokens = 64\n\n"
+            "[adapter]\n\n"
+            "[vlm]\nmax_text_len = 512\n\n"
+            "[video]\nmax_frames = 8\nmin_frames = 1\n\n"
+            "[frame_selector]\ncandidate_frames = 32\n"
+        )
+        cfg = load_config(str(toml), cli_args=["--frame_selector.type=qframe"])
+        assert cfg.frame_selector is not None
+        assert cfg.frame_selector.type == "qframe"
+        assert cfg.frame_selector.candidate_frames == 32
+
+    def test_cli_override_instantiates_missing_section(self, tmp_path):
+        # No [frame_selector] table in the TOML; a CLI override alone creates it.
+        toml = tmp_path / "cfg.toml"
+        toml.write_text(
+            "[model]\nmax_seq_len = 1024\n\n"
+            "[vision_encoder]\ntype = 'random'\nfeature_dim = 384\nnum_tokens = 64\n\n"
+            "[adapter]\n\n"
+            "[vlm]\nmax_text_len = 512\n\n"
+            "[video]\nmax_frames = 8\nmin_frames = 1\n"
+        )
+        cfg = load_config(str(toml), cli_args=["--frame_selector.type=topk"])
+        assert cfg.frame_selector is not None
+        assert cfg.frame_selector.type == "topk"
 
 
 class TestMoMaAcFullWarning:

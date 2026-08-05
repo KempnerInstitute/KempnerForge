@@ -26,12 +26,17 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from torch.utils.data import Dataset
 
 from kempnerforge.config.registry import registry
+from kempnerforge.data.frame_selection import (
+    ScorerUnavailableError,
+    build_frame_selector,
+    select_video_frames,
+)
 from kempnerforge.data.video_io import decode_video_frames
 from kempnerforge.data.vlm_dataset import (
     DEFAULT_IMAGE_MEAN,
@@ -40,6 +45,9 @@ from kempnerforge.data.vlm_dataset import (
     frames_to_clip_tensor,
     resolve_pad_id,
 )
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from PIL.Image import Image as PILImage
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +75,69 @@ class VideoDataset(Dataset):
     through the registry. ``WebVidVideoDataset`` is the WebVid-style layout
     (per-partition CSV manifests + prefix-nested ``.mp4`` files); other styles
     (HuggingFace video sets, flat folders, alternate manifests) are follow-ups.
+
+    Query-aware frame selection is a base-class capability, so every dataset
+    style gets it for free. A subclass adopts selection in three steps:
+
+    1. Take ``frame_selector_config`` in its builder and pass it to
+       ``self._init_frame_selector(...)`` in ``__init__``.
+    2. Decode via ``self._decode_clip(path, query, ...)`` instead of calling
+       ``decode_video_frames`` directly, passing the sample's query text (the
+       caption for captioning sets, the question for QA sets).
+    3. Nothing else — the returned frames/times flow through the existing
+       ``frames_to_clip_tensor`` packing unchanged.
+
+    A dataset without a decodable file path (pre-extracted frames / byte
+    streams) can call ``self._frame_selector.select(frames, times, query, k,
+    seed_key=...)`` directly; ``_decode_clip`` is a convenience, not the only door.
     """
+
+    # Class-level defaults so subclasses (and tests that bypass ``__init__``)
+    # have them without calling ``_init_frame_selector``.
+    _frame_selector: Any = None
+    _query_source: str = "sample"
+
+    def _init_frame_selector(self, frame_selector_config: Any | None) -> None:
+        """Build the frame selector from a ``[frame_selector]`` config (or leave
+        selection off when ``None``). The scorer runs on CPU in fp32 at train time
+        (weights load lazily on first sample).
+        """
+        if frame_selector_config is None:
+            return
+        self._frame_selector = build_frame_selector(frame_selector_config)
+        self._query_source = frame_selector_config.query_source
+
+    def _decode_clip(
+        self,
+        path: str,
+        query: str | None,
+        *,
+        fps: float,
+        min_frames: int,
+        max_frames: int,
+        sampling_policy: str,
+        seed_key: str,
+    ) -> tuple[list[PILImage], list[float]]:
+        """Decode a clip to frames + times, applying query-aware selection when a
+        selector is configured (else the plain uniform decode). Shared by every
+        dataset style so the decode-vs-select branch lives in one place.
+        """
+        if self._frame_selector is not None:
+            return select_video_frames(
+                path,
+                query,
+                self._frame_selector,
+                max_frames,
+                sampling_policy=sampling_policy,
+                seed_key=seed_key,
+            )
+        return decode_video_frames(
+            path,
+            fps=fps,
+            min_frames=min_frames,
+            max_frames=max_frames,
+            sampling_policy=sampling_policy,
+        )
 
 
 class WebVidVideoDataset(VideoDataset):
@@ -103,6 +173,7 @@ class WebVidVideoDataset(VideoDataset):
         sampling_policy: str = "uniform",
         image_mean: tuple[float, float, float] = DEFAULT_IMAGE_MEAN,
         image_std: tuple[float, float, float] = DEFAULT_IMAGE_STD,
+        frame_selector_config: Any | None = None,
     ) -> None:
         from transformers import AutoTokenizer
 
@@ -128,6 +199,7 @@ class WebVidVideoDataset(VideoDataset):
         self._sampling_policy = sampling_policy
         self._image_mean = image_mean
         self._image_std = image_std
+        self._init_frame_selector(frame_selector_config)
         logger.info(
             "WebVidVideoDataset: %s/%s [%s], %d clips, max_frames=%d, fps=%s, frame_size=%d",
             data_root,
@@ -186,16 +258,25 @@ class WebVidVideoDataset(VideoDataset):
         videoid = self._ids[idx]
         caption = self._caps[idx]
         path = self._video_path(videoid)
+        # Query source for selection: the per-sample caption, or the static
+        # [video].prompt. No-op when no selector is configured.
+        query = caption if self._query_source == "sample" else self._prompt
         try:
-            frames, frame_times_s = decode_video_frames(
+            frames, frame_times_s = self._decode_clip(
                 path,
+                query,
                 fps=self._fps,
                 min_frames=self._min_frames,
                 max_frames=self._max_frames,
                 sampling_policy=self._sampling_policy,
+                seed_key=str(videoid),
             )
-        except Exception as e:  # noqa: BLE001 - any decode failure -> skip-with-mask
-            logger.debug("video decode failed for %s: %s", path, e)
+        except ScorerUnavailableError:
+            # Systemic misconfiguration (e.g. un-prefetched scorer on an offline
+            # node): fail the run loudly rather than silently masking every clip.
+            raise
+        except Exception as e:  # noqa: BLE001 - any decode/scoring failure -> skip-with-mask
+            logger.debug("video decode/selection failed for %s: %s", path, e)
             frames, frame_times_s = [], []
 
         pixel_values, frame_mask = frames_to_clip_tensor(
@@ -272,7 +353,12 @@ class VideoCollator:
 
 
 @registry.register_video_dataset("webvid")
-def _build_webvid(video_config: Any, tokenizer_path: str, max_text_len: int) -> WebVidVideoDataset:
+def _build_webvid(
+    video_config: Any,
+    tokenizer_path: str,
+    max_text_len: int,
+    frame_selector_config: Any | None = None,
+) -> WebVidVideoDataset:
     """Registry builder for the WebVid-style dataset (see ``WebVidVideoDataset``)."""
     return WebVidVideoDataset(
         data_root=video_config.data_root,
@@ -287,15 +373,24 @@ def _build_webvid(video_config: Any, tokenizer_path: str, max_text_len: int) -> 
         prompt=video_config.prompt,
         dataset_name=video_config.dataset_name,
         sampling_policy=video_config.sampling_policy,
+        frame_selector_config=frame_selector_config,
     )
 
 
-def build_video_dataset(video_config: Any, tokenizer_path: str, max_text_len: int) -> VideoDataset:
+def build_video_dataset(
+    video_config: Any,
+    tokenizer_path: str,
+    max_text_len: int,
+    frame_selector_config: Any | None = None,
+) -> VideoDataset:
     """Build the video dataset selected by ``video_config.dataset_type``.
 
     Dispatches through the ``video_dataset`` registry, so a new dataset style is
     one ``@registry.register_video_dataset`` builder + a config string. The
-    config is duck-typed to avoid a data->config import cycle.
+    configs are duck-typed to avoid a data->config import cycle.
+    ``frame_selector_config`` is the optional ``[frame_selector]`` section; builders
+    thread it to ``VideoDataset._init_frame_selector`` so query-aware selection
+    works for every dataset style.
     """
     builder = registry.get_video_dataset(video_config.dataset_type)
-    return builder(video_config, tokenizer_path, max_text_len)
+    return builder(video_config, tokenizer_path, max_text_len, frame_selector_config)

@@ -94,6 +94,54 @@ no system FFmpeg is required): install it with `uv sync --group video`. It is
 imported lazily, so the package imports without `av` and only actual decoding
 requires it.
 
+## Query-aware frame selection (optional)
+
+By default a clip is decoded to `max_frames` frames uniformly. Add a
+`[frame_selector]` section to instead decode a larger **candidate pool** and keep
+the `max_frames` frames most relevant to each sample's query — a training-free,
+plug-in selection stage that runs on the data path (no model changes). With no
+`[frame_selector]` section the path is bit-identical to uniform sampling.
+
+```toml
+[frame_selector]
+type = "mdp3"            # "topk" (cosine) | "qframe" (Gumbel-Max top-k) | "mdp3"
+scorer = "siglip2"       # frozen dual encoder for frame/query embeddings ("clip" too)
+scorer_path = "google/siglip2-base-patch16-224"
+candidate_frames = 32    # decoded pool; must be >= [video].max_frames
+query_source = "sample"  # the dataset's per-sample text (caption/question); or "prompt"
+mdp3_lambda = 0.2        # relevance/diversity trade-off (mdp3)
+mdp3_segment_size = 32   # temporal segment length for sequentiality; 0 = plain conditional DPP
+```
+
+- **Selectors.** `topk` = cosine top-k of frame/query similarity; `qframe` =
+  Q-Frame QFS, a Gumbel-Max top-k over `softmax(sim/τ)` (stochastic, seeded per
+  sample); `mdp3` = Markov-DPP list-wise selection balancing query relevance,
+  list-wise diversity, and temporal sequentiality.
+- **Query source.** `query_source = "sample"` uses the dataset's per-sample text
+  (the caption for captioning sets, the question for QA sets — the dataset
+  decides). `"prompt"` uses the static `[video].prompt`; if that is empty the
+  selector logs a one-time warning and falls back to uniform sampling.
+- **Dataset-agnostic.** Selection is a `VideoDataset` base-class capability, so a
+  new dataset style adopts it in three lines: take `frame_selector_config` in its
+  builder, call `self._init_frame_selector(...)`, and decode via
+  `self._decode_clip(path, query, ...)`. A dataset without a decodable file path
+  can call `self._frame_selector.select(frames, times, query, k, seed_key=...)`
+  directly.
+- **Scorer prefetch + cost.** The scorer weights load lazily on first use, once
+  per worker; prefetch them on a networked node (set `HF_HOME` to the shared
+  cache) so offline compute nodes don't fail mid-run. The default scorer
+  (`so400m` at 128 candidates) is **eval-grade** — dataloader workers run at one
+  intra-op thread, so for CPU-worker *training* use a base-scale scorer and a
+  modest `candidate_frames` (as above); real-scale training belongs in an offline
+  precompute step (future work).
+- **Default deviation.** The default `scorer_path` is SigLIP2-so400m @ 224 (stack
+  consistency, cheaper scoring); the mDP3 paper used SigLIP(v1)-so400m @ 384 — one
+  `scorer_path` away.
+
+At eval, the same selection turns on per-checkpoint via the harness
+`--override frame_selector.type=...` flag (see the vlm-evaluation README), so an
+existing checkpoint can be A/B'd across selectors without editing its config.
+
 ## Launch
 
 ```bash
@@ -122,8 +170,9 @@ time, so it is set in the TOML, not via a `--vlm.arch=` CLI override.)
   not have yet; they would hook the sequence-assembly layer, not this registry.
 - **Inference must pass `frame_times`** — a video model silently drops the
   learned temporal signal if `frame_times` is `None` (no error is raised).
-  Training threads it automatically; eval/generate paths must pass it for video
-  models.
+  Training threads it automatically, and the vlm-evaluation adapter now threads it
+  too (per-frame times of the decoded/selected clip); any other custom
+  generate path must pass it for video models.
 - **Checkpoint compatibility** — because the time embedding is opt-in (off by
   default), a default video model has no `frame_time_embed` parameters and loads
   pre-timestamp checkpoints unchanged. As for any component, config must match

@@ -109,6 +109,7 @@ model metadata and job config to make runs identifiable and reproducible.
 | `--dtype` | `None`(defaults to `train.param_dtype`) | model dtype |
 | `--batch-size` | `1` | requests decoded together (grouped by `gen_kwargs`) |
 | `--max-new-tokens` | `128` | fallback only; task `gen_kwargs` override it |
+| `--override` | `None` | KempnerForge `SECTION.KEY=VALUE` config override merged over the TOML (repeatable), e.g. `--override frame_selector.type=qframe` |
 
 ## Video evaluation
 
@@ -133,6 +134,13 @@ uv run python examples/vlm-evaluation/vlm_eval_harness.py \
   Comparability to externally published video-benchmark numbers therefore depends
   on the checkpoint's frame budget matching the reference's, which is a training
   choice rather than a knob here.
+- **Query-aware frame selection.** If the config has a `[frame_selector]` section
+  (or you add one with `--override frame_selector.type=qframe`), the harness
+  decodes a larger candidate pool and keeps the `max_frames` frames most relevant
+  to the request's prompt — the *which* frames change, the budget does not. This
+  is how a uniform-trained checkpoint is A/B'd across `topk` / `qframe` / `mdp3`
+  without editing its TOML. Per-frame times of the selected clip are threaded to
+  the model, so a time-aware checkpoint gets its temporal signal at eval.
 - **Scope.** One video per request, single-turn, zero-shot, generative arches
   (`joint_decoder` / `cross_attention` / `mot`). A single **image** task also runs
   on a video checkpoint — the image is treated as a 1-frame clip, zero-padded to

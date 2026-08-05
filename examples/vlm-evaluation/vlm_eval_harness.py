@@ -102,6 +102,15 @@ def main() -> None:
         default=128,
         help="Fallback max new tokens; task gen_kwargs override it (default: 128)",
     )
+    parser.add_argument(
+        "--override",
+        action="append",
+        default=None,
+        metavar="SECTION.KEY=VALUE",
+        help="KempnerForge config override merged over the TOML (repeatable), "
+        "e.g. --override frame_selector.type=qframe. Turns query-aware frame "
+        "selection on for an existing checkpoint without editing its config.",
+    )
     args = parser.parse_args()
 
     # lmms-eval is optional and undeclared; import lazily with a helpful error.
@@ -131,6 +140,7 @@ def main() -> None:
         batch_size=args.batch_size,
         max_new_tokens=args.max_new_tokens,
         dtype=args.dtype,  # None -> adapter defaults to the checkpoint's train.param_dtype
+        config_overrides=args.override,
     )
 
     metadata = model.run_metadata()

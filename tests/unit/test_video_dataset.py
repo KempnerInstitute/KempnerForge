@@ -387,3 +387,175 @@ class TestVideoDatasetRegistry:
 
         with pytest.raises(KeyError, match="video_dataset"):
             registry.get_video_dataset("bogus")
+
+
+# ---------------------------------------------------------------------------
+# Query-aware frame selection (base-class hook, dataset-agnostic)
+# ---------------------------------------------------------------------------
+
+
+class _FakeSelector:
+    """Records the query/k/seed_key and returns a fixed subset of indices."""
+
+    def __init__(self, indices):
+        self._indices = indices
+        self.calls = []
+
+    def select(self, frames, times, query, k, *, seed_key=None):
+        self.calls.append({"n": len(frames), "query": query, "k": k, "seed_key": seed_key})
+        return self._indices
+
+
+class TestGetItemWithSelector:
+    def _select_stub(self, indices):
+        # Mirror select_video_frames: decode a pool, subset to the given indices.
+        def _fn(path, query, selector, k, *, sampling_policy="uniform", seed_key=None):
+            selector.select(_dummy(len(indices) + 2), [], query, k, seed_key=seed_key)
+            frames = _frames(len(indices))
+            return frames, [float(i) for i in range(len(indices))]
+
+        return _fn
+
+    def test_uses_decode_clip_and_records_query_seed(self, monkeypatch):
+        sel = _FakeSelector([0, 1, 2])
+        captured = {}
+
+        def _select(path, query, selector, k, *, sampling_policy="uniform", seed_key=None):
+            captured.update(query=query, k=k, seed_key=seed_key, policy=sampling_policy)
+            return _frames(3), [0.0, 1.0, 2.0]
+
+        monkeypatch.setattr(vd, "select_video_frames", _select)
+        ds = _StubVideoDataset(["7788"], ["a caption"], max_frames=8)
+        ds._frame_selector = sel
+        ds._query_source = "sample"
+        item = ds[0]
+        assert captured["query"] == "a caption"  # sample source -> caption
+        assert captured["k"] == 8  # max_frames
+        assert captured["seed_key"] == "7788"  # videoid
+        assert item["frame_mask"][:3].all() and not item["frame_mask"][3:].any()
+        assert item["frame_times"][:3].tolist() == [0.0, 1.0, 2.0]
+
+    def test_prompt_query_source(self, monkeypatch):
+        captured = {}
+
+        def _select(path, query, selector, k, *, sampling_policy="uniform", seed_key=None):
+            captured["query"] = query
+            return _frames(2), [0.0, 1.0]
+
+        monkeypatch.setattr(vd, "select_video_frames", _select)
+        ds = _StubVideoDataset(["1"], ["the caption"], max_frames=4, prompt="describe:")
+        ds._frame_selector = _FakeSelector([0, 1])
+        ds._query_source = "prompt"
+        ds[0]
+        assert captured["query"] == "describe:"  # static prompt, not the caption
+
+    def test_selection_error_degrades_to_empty_clip(self, monkeypatch):
+        def _boom(*a, **k):
+            raise RuntimeError("scoring blew up")
+
+        monkeypatch.setattr(vd, "select_video_frames", _boom)
+        ds = _StubVideoDataset(["1"], ["a cat."], max_frames=4)
+        ds._frame_selector = _FakeSelector([0])
+        item = ds[0]
+        assert not item["frame_mask"].any()
+        assert (item["labels"] == -100).all()
+
+    def test_scorer_unavailable_propagates(self, monkeypatch):
+        from kempnerforge.data.frame_selection import ScorerUnavailableError
+
+        def _unavail(*a, **k):
+            raise ScorerUnavailableError("prefetch the model")
+
+        monkeypatch.setattr(vd, "select_video_frames", _unavail)
+        ds = _StubVideoDataset(["1"], ["a cat."], max_frames=4)
+        ds._frame_selector = _FakeSelector([0])
+        with pytest.raises(ScorerUnavailableError):
+            ds[0]  # systemic misconfig must not be silently masked
+
+
+class TestBuilderThreadsSelector:
+    def test_backward_compatible_without_kwarg(self, monkeypatch):
+        # Existing call sites pass no frame_selector_config; the builder still
+        # dispatches and receives None (no selector).
+        captured = {}
+
+        def _fake_builder(video_config, tokenizer_path, max_text_len, frame_selector_config=None):
+            captured["fsc"] = frame_selector_config
+            return object()
+
+        from kempnerforge.config.registry import registry
+        from kempnerforge.config.video import VideoConfig
+        from kempnerforge.data.video_dataset import build_video_dataset
+
+        monkeypatch.setattr(registry, "get_video_dataset", lambda name: _fake_builder)
+        build_video_dataset(VideoConfig(), "gpt2", 16)  # no frame_selector_config arg
+        assert captured["fsc"] is None
+
+    def test_build_video_dataset_threads_config(self, monkeypatch):
+        # build_video_dataset forwards frame_selector_config to the builder.
+        captured = {}
+
+        def _fake_builder(video_config, tokenizer_path, max_text_len, frame_selector_config=None):
+            captured["fsc"] = frame_selector_config
+            return object()
+
+        from kempnerforge.config.registry import registry
+
+        monkeypatch.setattr(registry, "get_video_dataset", lambda name: _fake_builder)
+        from kempnerforge.config.video import VideoConfig
+        from kempnerforge.data.video_dataset import build_video_dataset
+
+        sentinel = object()
+        build_video_dataset(VideoConfig(), "gpt2", 16, frame_selector_config=sentinel)
+        assert captured["fsc"] is sentinel
+
+
+class _StubQADataset(vd.VideoDataset):
+    """A non-WebVid dataset that adopts selection via the base hook alone.
+
+    Proves the base-class ``_init_frame_selector`` / ``_decode_clip`` path is
+    dataset-agnostic: this class has no frame-selection code of its own, uses a
+    question (not a caption) as its query, and a different seed key.
+    """
+
+    def __init__(self, question, frame_selector_config=None):
+        self._question = question
+        self._init_frame_selector(frame_selector_config)
+
+    def probe(self, path, seed_key):
+        # Question is the query regardless of query_source="sample".
+        return self._decode_clip(
+            path,
+            self._question,
+            fps=1.0,
+            min_frames=2,
+            max_frames=4,
+            sampling_policy="uniform",
+            seed_key=seed_key,
+        )
+
+
+class TestBaseHookGenerality:
+    def test_second_dataset_style_gets_selection(self, monkeypatch):
+        captured = {}
+
+        def _select(path, query, selector, k, *, sampling_policy="uniform", seed_key=None):
+            captured.update(query=query, k=k, seed_key=seed_key)
+            return _frames(3), [0.0, 1.0, 2.0]
+
+        monkeypatch.setattr(vd, "select_video_frames", _select)
+        ds = _StubQADataset("what color is the car?")
+        ds._frame_selector = _FakeSelector([0, 1, 2])  # simulate a built selector
+        frames, times = ds.probe("clip.mp4", seed_key="qa-42")
+        assert captured == {"query": "what color is the car?", "k": 4, "seed_key": "qa-42"}
+        assert len(frames) == 3
+
+    def test_no_selector_falls_back_to_plain_decode(self, monkeypatch):
+        monkeypatch.setattr(vd, "decode_video_frames", lambda *a, **k: _decoded(4))
+        ds = _StubQADataset("q")  # no selector configured
+        frames, times = ds.probe("clip.mp4", seed_key="x")
+        assert len(frames) == 4  # plain uniform decode path
+
+
+def _dummy(n: int) -> list[int]:
+    return list(range(n))

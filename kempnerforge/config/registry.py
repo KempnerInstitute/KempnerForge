@@ -189,10 +189,14 @@ class Registry:
     def register_video_dataset(self, name: str) -> Callable:
         """Decorator to register a video-dataset builder.
 
-        Builders take ``(video_config, tokenizer_path, max_text_len)`` and return
-        a map-style ``Dataset`` whose samples ``VideoCollator`` batches (see
+        Builders take ``(video_config, tokenizer_path, max_text_len,
+        frame_selector_config=None)`` and return a map-style ``Dataset`` whose
+        samples ``VideoCollator`` batches (see
         ``kempnerforge.data.video_dataset.VideoDataset``). Selected by
-        ``[video].dataset_type``.
+        ``[video].dataset_type``. ``frame_selector_config`` is the optional
+        ``[frame_selector]`` section; builders thread it to
+        ``VideoDataset._init_frame_selector`` so query-aware frame selection
+        works for every dataset style, not just one.
         """
 
         def decorator(fn: Callable) -> Callable:
@@ -247,6 +251,31 @@ class Registry:
 
     def list_time_embeddings(self) -> list[str]:
         return self.list("time_embedding")
+
+    def register_frame_selector(self, name: str) -> Callable:
+        """Decorator to register a query-aware frame-selector builder.
+
+        Builders take ``(scorer, **kwargs)`` — a ``FrameQueryScorer``-like
+        object plus ``FrameSelectorConfig.extra_kwargs()`` (foreign keys
+        swallowed via ``**_``) — and return a ``FrameSelector`` whose
+        ``select(frames, times, query, k, *, seed_key=None)`` picks ``k`` of the
+        ``n`` decoded candidate frames and returns their indices sorted
+        ascending (temporal order preserved). Runs post-decode on the data
+        path (train dataset ``__getitem__`` / eval request rendering), never
+        inside the model. Selected by ``[frame_selector].type``.
+        """
+
+        def decorator(fn: Callable) -> Callable:
+            self.register("frame_selector", name, fn)
+            return fn
+
+        return decorator
+
+    def get_frame_selector(self, name: str) -> Callable:
+        return self.get("frame_selector", name)
+
+    def list_frame_selectors(self) -> list[str]:
+        return self.list("frame_selector")
 
     def register_dyn_ckpt_strategy(self, name: str) -> Callable:
         """Decorator to register a dynamic-checkpointing-window strategy.

@@ -9,6 +9,7 @@ from kempnerforge.config.checkpoint import (  # noqa: F401
 from kempnerforge.config.data import DataConfig, DatasetSource, TrainingPhase  # noqa: F401
 from kempnerforge.config.distributed import DistributedConfig, PipelineSchedule  # noqa: F401
 from kempnerforge.config.eval import EvalConfig  # noqa: F401
+from kempnerforge.config.frame_selector import FrameSelectorConfig  # noqa: F401
 from kempnerforge.config.job import JobConfig  # noqa: F401
 from kempnerforge.config.metrics import MetricsConfig  # noqa: F401
 from kempnerforge.config.model import Activation, ModelConfig, NormType  # noqa: F401

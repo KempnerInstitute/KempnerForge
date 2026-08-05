@@ -311,14 +311,24 @@ def main() -> None:
 
             vcfg = config.video
             # Dataset style is registry-selected via [video].dataset_type; the
-            # builder reads the rest of the knobs off vcfg.
-            dataset = build_video_dataset(vcfg, config.data.tokenizer_path, vlm_cfg.max_text_len)
+            # builder reads the rest of the knobs off vcfg. An optional
+            # [frame_selector] enables query-aware frame selection in the dataset.
+            dataset = build_video_dataset(
+                vcfg,
+                config.data.tokenizer_path,
+                vlm_cfg.max_text_len,
+                frame_selector_config=config.frame_selector,
+            )
             _tok = AutoTokenizer.from_pretrained(config.data.tokenizer_path)
             _pad_id = _tok.pad_token_id
             if _pad_id is None:
                 _pad_id = _tok.eos_token_id if _tok.eos_token_id is not None else 0
             collator = VideoCollator(pad_id=int(_pad_id), max_text_len=vlm_cfg.max_text_len)
-            logger.info(f"Video dataset: {len(dataset):,} clips from {vcfg.data_root}")
+            _fs = "off" if config.frame_selector is None else config.frame_selector.type
+            logger.info(
+                f"Video dataset: {len(dataset):,} clips from {vcfg.data_root} "
+                f"(frame_selector={_fs})"
+            )
         else:
             # --- Image VLM (Joint-Decoder) data path ---
             # Mixing VLM + text-only datasets in one run is out of scope on this

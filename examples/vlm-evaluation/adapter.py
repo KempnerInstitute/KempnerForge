@@ -72,6 +72,11 @@ from kempnerforge.config.job import JobConfig
 from kempnerforge.config.loader import load_config
 from kempnerforge.config.video import VideoConfig
 from kempnerforge.config.vlm import VLMConfig
+from kempnerforge.data.frame_selection import (
+    FrameSelector,
+    build_frame_selector,
+    select_video_frames,
+)
 from kempnerforge.data.video_io import decode_video_frames
 from kempnerforge.data.vlm_dataset import (
     DEFAULT_IMAGE_MEAN,
@@ -154,8 +159,12 @@ def _read_checkpoint_metadata(ckpt_path: Path) -> dict[str, Any]:
     return metadata
 
 
-def _load_config(config_path: str) -> JobConfig:
-    config = load_config(config_path, cli_args=[])
+def _load_config(config_path: str, overrides: list[str] | None = None) -> JobConfig:
+    # Overrides are KempnerForge CLI-style --section.key=value merges over the
+    # TOML (e.g. "frame_selector.type=qframe"), so selection can be turned on for
+    # an existing checkpoint without editing its config. Normalize the "--" prefix.
+    cli_args = [o if o.startswith("--") else f"--{o}" for o in (overrides or [])]
+    config = load_config(config_path, cli_args=cli_args)
     if not config.is_vlm:
         raise ValueError(
             f"{config_path!r} is not a VLM config (config.vlm is None); this evaluation "
@@ -212,21 +221,26 @@ def _load_weights(
 
 
 def _render_request(
-    messages: ChatMessages, video_config: VideoConfig | None
-) -> tuple[list[Any], str]:
-    """Flatten one chat request into ``(frames, prompt_text)``.
+    messages: ChatMessages,
+    video_config: VideoConfig | None,
+    frame_selector: FrameSelector | None = None,
+) -> tuple[list[Any], list[float], str]:
+    """Flatten one chat request into ``(frames, frame_times_s, prompt_text)``.
 
     ``frames`` is an ordered list of visual frames; a single image is the
-    length-1 case and a decoded video is the multi-frame case. ``video_config``
-    is the checkpoint's ``[video]`` config (``None`` for an image checkpoint)
-    and selects the mode:
+    length-1 case and a decoded video is the multi-frame case. ``frame_times_s``
+    are the matched per-frame times in seconds (empty for images), threaded to
+    the model so time-aware checkpoints get their temporal signal at eval.
+    ``video_config`` is the checkpoint's ``[video]`` config (``None`` for an image
+    checkpoint) and selects the mode:
 
     - **Image checkpoint** (``video_config is None``): exactly one image per
       request; video content raises (an image model cannot evaluate video).
-    - **Video checkpoint**: exactly one video — decoded to frames via
-      ``video_io.decode_video_frames`` using the checkpoint's frame-sampling
-      policy — or, when no video is present, a single image treated as a
-      1-frame clip (zero-padded to ``frames_per_clip`` downstream).
+    - **Video checkpoint**: exactly one video. With a ``frame_selector`` it is
+      decoded to a candidate pool and query-aware-selected to ``max_frames``;
+      otherwise decoded uniformly via ``video_io.decode_video_frames``. When no
+      video is present, a single image is treated as a 1-frame clip (zero-padded
+      to ``frames_per_clip`` downstream).
 
     Out-of-scope content (audio, multi-turn/few-shot, multi-image, multiple
     videos, mixed image+video) raises ``NotImplementedError`` so the offending
@@ -268,7 +282,7 @@ def _render_request(
                 "Multi-image and text-only requests are out of scope; report the task to "
                 "the project owner."
             )
-        return images, prompt
+        return images, [0.0], prompt
 
     # Video checkpoint: exactly one visual — a video (decoded to frames) or a
     # single image (treated as a 1-frame clip, zero-padded downstream).
@@ -290,22 +304,33 @@ def _render_request(
                 f"{type(path).__name__}. The task may pass clip boundaries or a URL; "
                 "report the task to the project owner."
             )
-        frames, _frame_times = decode_video_frames(
-            path,
-            fps=video_config.fps,
-            min_frames=video_config.min_frames,
-            max_frames=video_config.max_frames,
-            sampling_policy=video_config.sampling_policy,
-        )
+        if frame_selector is not None:
+            # Query-aware: decode a candidate pool and keep max_frames for the prompt.
+            frames, frame_times = select_video_frames(
+                path,
+                prompt,
+                frame_selector,
+                video_config.max_frames,
+                sampling_policy=video_config.sampling_policy,
+                seed_key=path,
+            )
+        else:
+            frames, frame_times = decode_video_frames(
+                path,
+                fps=video_config.fps,
+                min_frames=video_config.min_frames,
+                max_frames=video_config.max_frames,
+                sampling_policy=video_config.sampling_policy,
+            )
         if not frames:
             logger.warning(
                 f"No frames decoded from {path}; evaluating a zero clip (result unreliable)."
             )
-        return frames, prompt
+        return frames, frame_times, prompt
     if len(images) == 1:
         # A single image on a video checkpoint: a 1-frame clip (zero-padded to
         # frames_per_clip downstream), consistent with how training pads short clips.
-        return images, prompt
+        return images, [0.0], prompt
     raise NotImplementedError(
         f"A video-checkpoint request must carry exactly one video or one image, got "
         f"{len(images)} images and no video. Multi-image and text-only requests are out "
@@ -416,6 +441,7 @@ def _generate_batch(
     resolved: dict[str, Any],
     max_seq_len: int,
     frame_mask: torch.Tensor | None = None,
+    frame_times: torch.Tensor | None = None,
 ) -> list[str]:
     """Batched decode (no transformer KV cache); returns one continuation per request.
 
@@ -481,7 +507,7 @@ def _generate_batch(
         for i, s in enumerate(seqs):
             input_ids[i, : s.shape[0]] = s
 
-        logits, _ = model(pixel_values, input_ids, frame_mask=frame_mask)
+        logits, _ = model(pixel_values, input_ids, frame_mask=frame_mask, frame_times=frame_times)
         # Each row's next-token logits sit at its own last real position (the
         # output is already trimmed to text positions for JD/MoT; CA has no
         # image prefix), not at [-1] (a pad for shorter rows).
@@ -546,6 +572,7 @@ class KempnerForgeVLM(lmms):
         dtype: str | None = None,
         batch_size: int | str = 1,
         max_new_tokens: int | str = DEFAULT_MAX_NEW_TOKENS,
+        config_overrides: list[str] | None = None,
     ) -> None:
         super().__init__()
         self._device = torch.device(device)
@@ -556,7 +583,10 @@ class KempnerForgeVLM(lmms):
         if self._default_max_new_tokens < 1:
             raise ValueError(f"max_new_tokens must be >= 1, got {self._default_max_new_tokens}")
         self._config_path = config
-        self._config = _load_config(config)
+        # KempnerForge --section.key=value overrides merged over the TOML; this is
+        # how frame selection is turned on for an existing checkpoint at eval.
+        self._config_overrides = list(config_overrides or [])
+        self._config = _load_config(config, self._config_overrides)
         assert self._config.vlm is not None  # guaranteed by is_vlm; narrows for the type checker
         # Default the compute dtype to what the checkpoint was trained at
         # (config.train.param_dtype) unless an explicit dtype was passed.
@@ -577,15 +607,26 @@ class KempnerForgeVLM(lmms):
             self._frames_per_clip = 1
             self._frame_size = self._config.data.hf_image_size
 
+        # Query-aware frame selection (video only). The scorer runs on the eval
+        # device at the model dtype on CUDA (fp32 on CPU, where bf16 matmuls are
+        # slow/unsupported). JobConfig warns on selector-without-video.
+        self._frame_selector: FrameSelector | None = None
+        if self._config.frame_selector is not None and self._is_video:
+            scorer_dtype = self._dtype if self._device.type == "cuda" else torch.float32
+            self._frame_selector = build_frame_selector(
+                self._config.frame_selector, device=self._device, dtype=scorer_dtype
+            )
+
         self._model, self._checkpoint_meta = _load_weights(
             self._config, checkpoint, self._device, self._dtype
         )
         self._tokenizer = build_tokenizer(self._config.data.tokenizer_path)
         self._max_seq_len = self._config.model.max_seq_len
+        _fs = "off" if self._frame_selector is None else self._config.frame_selector.type
         logger.info(
             f"KempnerForgeVLM ready: arch={self._arch}, video={self._is_video}, "
-            f"frames_per_clip={self._frames_per_clip}, device={self._device}, "
-            f"dtype={self._dtype}, max_seq_len={self._max_seq_len}"
+            f"frames_per_clip={self._frames_per_clip}, frame_selector={_fs}, "
+            f"device={self._device}, dtype={self._dtype}, max_seq_len={self._max_seq_len}"
         )
 
     def run_metadata(self) -> dict[str, Any]:
@@ -607,6 +648,7 @@ class KempnerForgeVLM(lmms):
                 "dtype": str(self._dtype).removeprefix("torch."),  # constructor-valid form
                 "batch_size": self._batch_size,
                 "max_new_tokens": self._default_max_new_tokens,
+                "config_overrides": self._config_overrides,
             },
             "checkpoint": dict(self._checkpoint_meta),
             "job_config": dataclasses.asdict(self._config),
@@ -636,13 +678,16 @@ class KempnerForgeVLM(lmms):
             chunk_outputs: list[str | None] = [None] * len(chunk)
             frames_batch: list[torch.Tensor] = []
             masks_batch: list[torch.Tensor] = []
+            times_batch: list[torch.Tensor] = []
             prompt_ids: list[torch.Tensor] = []
             for slot, args in enumerate(chunk):
                 try:
                     # Chat 6-tuple: (context, doc_to_messages, gen_kwargs, doc_id, task, split).
                     doc = self.task_dict[args[4]][args[5]][args[3]]
                     messages = ChatMessages(messages=args[1](doc))
-                    frames, prompt = _render_request(messages, self._config.video)
+                    frames, frame_times_s, prompt = _render_request(
+                        messages, self._config.video, self._frame_selector
+                    )
                     # lmms-eval may deliver image content as a path/URL string;
                     # normalize to PIL so both the image and video packers (strict
                     # pil_to_tensor) accept it.
@@ -664,11 +709,22 @@ class KempnerForgeVLM(lmms):
                         )
                         pixels = clip.to(device=self._device, dtype=self._dtype)
                         mask = fmask.to(device=self._device)
+                        # Per-frame times zero-padded to frames_per_clip, exactly like
+                        # the training dataset — so time-aware checkpoints get their
+                        # temporal signal at eval instead of it being silently dropped.
+                        ftimes = torch.zeros(self._frames_per_clip, dtype=torch.float32)
+                        n_real = min(len(frame_times_s), self._frames_per_clip)
+                        if n_real:
+                            ftimes[:n_real] = torch.tensor(
+                                frame_times_s[:n_real], dtype=torch.float32
+                            )
+                        times = ftimes.to(device=self._device)
                     else:
                         pixels = _frames_to_pixel_values(
                             frames, self._frame_size, self._device, self._dtype
                         )
                         mask = None
+                        times = None
                     prompt_tensor = torch.tensor(token_ids, dtype=torch.long, device=self._device)
                 except Exception as exc:
                     # Isolate a bad request (unsupported content, decode failure, empty
@@ -684,18 +740,23 @@ class KempnerForgeVLM(lmms):
                 frames_batch.append(pixels)
                 if mask is not None:
                     masks_batch.append(mask)
+                if times is not None:
+                    times_batch.append(times)
                 prompt_ids.append(prompt_tensor)
 
             if prompt_ids:
                 # Video: (B, F, 3, H, W) via stack (each request is one F-frame clip),
-                # with a (B, F) frame mask. Image: (B, 3, H, W) via cat. cat on video
-                # would fold frames into the batch and trip the frames-per-clip check.
+                # with a (B, F) frame mask and (B, F) frame times. Image: (B, 3, H, W)
+                # via cat. cat on video would fold frames into the batch and trip the
+                # frames-per-clip check.
                 if self._is_video:
                     pixel_values = torch.stack(frames_batch, dim=0)
                     frame_mask = torch.stack(masks_batch, dim=0)
+                    frame_times = torch.stack(times_batch, dim=0)
                 else:
                     pixel_values = torch.cat(frames_batch, dim=0)
                     frame_mask = None
+                    frame_times = None
                 try:
                     gen_outputs = _generate_batch(
                         self._model,
@@ -705,6 +766,7 @@ class KempnerForgeVLM(lmms):
                         resolved,
                         self._max_seq_len,
                         frame_mask=frame_mask,
+                        frame_times=frame_times,
                     )
                 except _ContextBudgetError as exc:
                     # One task's gen_kwargs over-budgets the context; skip its requests
