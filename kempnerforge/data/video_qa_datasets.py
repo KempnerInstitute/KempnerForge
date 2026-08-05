@@ -31,6 +31,7 @@ import logging
 import os
 import random
 import zlib
+from collections.abc import Sequence
 from typing import Any
 
 from kempnerforge.config.registry import registry
@@ -43,14 +44,21 @@ logger = logging.getLogger(__name__)
 _VIDEO_EXTS = (".mp4", ".mkv", ".webm")
 
 
-def _geometry(video_config: Any) -> dict[str, Any]:
-    """Frame-geometry kwargs shared by every corpus (global on ``[video]``)."""
+def _geometry(video_config: Any, frame_selector: Any | None = None) -> dict[str, Any]:
+    """Frame-geometry kwargs shared by every corpus (global on ``[video]``).
+
+    The optional prebuilt ``frame_selector`` (from the ``[frame_selector]``
+    section, constructed once at the ``build_video_data`` seam) rides along here
+    so it reaches ``VideoQADataset.__init__`` via each dataset's ``**geometry``
+    forwarding, enabling query-aware selection for every corpus.
+    """
     return {
         "max_frames": video_config.max_frames,
         "min_frames": video_config.min_frames,
         "fps": video_config.fps,
         "frame_size": video_config.frame_size,
         "sampling_policy": video_config.sampling_policy,
+        "frame_selector": frame_selector,
     }
 
 
@@ -58,7 +66,7 @@ def _cap[T](items: list[T], max_samples: int) -> list[T]:
     return items[:max_samples] if max_samples else items
 
 
-def _log_built(name: str, root: str, split: str, records: list[VideoRecord]) -> None:
+def _log_built(name: str, root: str, split: str, records: Sequence[Any]) -> None:
     logger.info("%s: %s [%s], %d samples", name, root, split, len(records))
 
 
@@ -697,8 +705,11 @@ def _read_table(pattern: str) -> list[dict[str, Any]]:
     """
     import pandas as pd
 
-    files = sorted(glob.glob(pattern)) if any(c in pattern for c in "*?[") else [pattern]
-    files = [f for f in files if os.path.exists(f)]
+    # Stat the literal path first: a real single-file manifest whose path happens
+    # to contain a glob metacharacter (``data_root`` like ``/data/set[v2]/...``)
+    # must not be reinterpreted as a pattern. Only fall back to globbing when the
+    # literal does not exist, which is exactly the shard-pattern case.
+    files = [pattern] if os.path.exists(pattern) else sorted(glob.glob(pattern))
     if not files:
         raise FileNotFoundError(f"No annotation files matching {pattern!r}")
     frames = [
@@ -724,9 +735,30 @@ def _shuffled_options(answer: str, negatives: list[str], seed_text: str) -> tupl
 
 
 def _youtube_id(url: str) -> str:
-    """YouTube id from a watch URL (``...?v=<id>``); ``""`` if not present."""
-    _, sep, tail = url.partition("v=")
-    return tail.split("&", 1)[0] if sep else ""
+    """YouTube video id from any common URL shape; ``""`` if not present.
+
+    Handles watch URLs (``...watch?v=<id>``, parsed so an earlier query param
+    like ``pv=1`` cannot be mistaken for the id), short links (``youtu.be/<id>``),
+    and ``/embed/<id>`` / ``/shorts/<id>`` / ``/v/<id>`` path forms. Scheme-less
+    inputs (``youtu.be/<id>``) are handled too. CinePile v1 rows carry only
+    ``yt_clip_link``, so a wrong parse silently points at the wrong ``videos/<id>.mp4``.
+    """
+    from urllib.parse import parse_qs, urlparse
+
+    raw = url.strip()
+    if not raw:
+        return ""
+    # Give a scheme-less URL a netloc so urlparse populates host/path correctly.
+    if "://" not in raw and not raw.startswith("//"):
+        raw = "//" + raw
+    parsed = urlparse(raw)
+    if parsed.netloc.lower().endswith("youtu.be"):
+        return parsed.path.lstrip("/").split("/", 1)[0]
+    parts = [p for p in parsed.path.split("/") if p]
+    if len(parts) >= 2 and parts[0] in ("embed", "shorts", "v"):
+        return parts[1]
+    values = parse_qs(parsed.query).get("v")
+    return values[0] if values else ""
 
 
 def _warn_missing(name: str, missing: int) -> None:
@@ -747,7 +779,10 @@ def _require_video_file(video_config: Any, default: bool) -> bool:
 
 @registry.register_video_dataset("molmo2_videocapqa")
 def _build_molmo2_videocapqa(
-    video_config: Any, tokenizer_path: str, max_text_len: int
+    video_config: Any,
+    tokenizer_path: str,
+    max_text_len: int,
+    frame_selector: Any | None = None,
 ) -> Molmo2VideoCapQADataset:
     """Registry builder for Molmo2-VideoCapQA (see ``Molmo2VideoCapQADataset``)."""
     return Molmo2VideoCapQADataset(
@@ -758,13 +793,16 @@ def _build_molmo2_videocapqa(
         max_samples=video_config.max_samples,
         prompt=video_config.prompt,
         text_source=video_config.text_source or "title",
-        **_geometry(video_config),
+        **_geometry(video_config, frame_selector),
     )
 
 
 @registry.register_video_dataset("spatialvid")
 def _build_spatialvid(
-    video_config: Any, tokenizer_path: str, max_text_len: int
+    video_config: Any,
+    tokenizer_path: str,
+    max_text_len: int,
+    frame_selector: Any | None = None,
 ) -> SpatialVIDDataset:
     """Registry builder for SpatialVID (see ``SpatialVIDDataset``)."""
     # dataset_name selects the manifest CSV; the [video] default names the
@@ -779,13 +817,16 @@ def _build_spatialvid(
         max_samples=video_config.max_samples,
         prompt=video_config.prompt,
         require_video_file=_require_video_file(video_config, default=False),
-        **_geometry(video_config),
+        **_geometry(video_config, frame_selector),
     )
 
 
 @registry.register_video_dataset("molmo2_capqa")
 def _build_molmo2_capqa(
-    video_config: Any, tokenizer_path: str, max_text_len: int
+    video_config: Any,
+    tokenizer_path: str,
+    max_text_len: int,
+    frame_selector: Any | None = None,
 ) -> Molmo2CapQADataset:
     """Registry builder for the released Molmo2 QA (see ``Molmo2CapQADataset``)."""
     return Molmo2CapQADataset(
@@ -797,13 +838,16 @@ def _build_molmo2_capqa(
         prompt=video_config.prompt,
         qa_format=video_config.qa_format,
         require_video_file=_require_video_file(video_config, default=True),
-        **_geometry(video_config),
+        **_geometry(video_config, frame_selector),
     )
 
 
 @registry.register_video_dataset("perception_test")
 def _build_perception_test(
-    video_config: Any, tokenizer_path: str, max_text_len: int
+    video_config: Any,
+    tokenizer_path: str,
+    max_text_len: int,
+    frame_selector: Any | None = None,
 ) -> PerceptionTestDataset:
     """Registry builder for PerceptionTest (see ``PerceptionTestDataset``)."""
     return PerceptionTestDataset(
@@ -815,12 +859,17 @@ def _build_perception_test(
         prompt=video_config.prompt,
         qa_format=video_config.qa_format,
         require_video_file=_require_video_file(video_config, default=True),
-        **_geometry(video_config),
+        **_geometry(video_config, frame_selector),
     )
 
 
 @registry.register_video_dataset("nextqa")
-def _build_nextqa(video_config: Any, tokenizer_path: str, max_text_len: int) -> NExTQADataset:
+def _build_nextqa(
+    video_config: Any,
+    tokenizer_path: str,
+    max_text_len: int,
+    frame_selector: Any | None = None,
+) -> NExTQADataset:
     """Registry builder for NExT-QA (see ``NExTQADataset``)."""
     return NExTQADataset(
         data_root=video_config.data_root,
@@ -832,12 +881,17 @@ def _build_nextqa(video_config: Any, tokenizer_path: str, max_text_len: int) -> 
         prompt=video_config.prompt,
         qa_format=video_config.qa_format,
         require_video_file=_require_video_file(video_config, default=True),
-        **_geometry(video_config),
+        **_geometry(video_config, frame_selector),
     )
 
 
 @registry.register_video_dataset("cinepile")
-def _build_cinepile(video_config: Any, tokenizer_path: str, max_text_len: int) -> CinePileDataset:
+def _build_cinepile(
+    video_config: Any,
+    tokenizer_path: str,
+    max_text_len: int,
+    frame_selector: Any | None = None,
+) -> CinePileDataset:
     """Registry builder for CinePile (see ``CinePileDataset``)."""
     # dataset_name selects the annotation revision; the [video] default names
     # the WebVid corpus, so fall back to the newest CinePile release.
@@ -852,5 +906,5 @@ def _build_cinepile(video_config: Any, tokenizer_path: str, max_text_len: int) -
         prompt=video_config.prompt,
         qa_format=video_config.qa_format,
         require_video_file=_require_video_file(video_config, default=True),
-        **_geometry(video_config),
+        **_geometry(video_config, frame_selector),
     )

@@ -11,6 +11,12 @@ the sample's query; when absent, the video path decodes ``max_frames`` uniformly
 as before (bit-identical). It requires ``[video]`` — a selector with no video has
 nothing to select from.
 
+The candidate pool is sized solely by ``candidate_frames`` / ``candidate_fps``.
+``[video].fps`` and ``[video].min_frames`` describe the plain (non-selector)
+decode and are inert on the selector path — only ``[video].max_frames`` (the
+count kept) still applies. ``JobConfig`` warns if ``fps``/``min_frames`` are set
+to non-defaults alongside a selector, so a tuned-but-ignored knob is never silent.
+
 The default scorer is SigLIP2-so400m-patch14-224. The mDP3 paper used
 SigLIP(v1)-so400m @ 384; SigLIP2 @ 224 is chosen for stack consistency with the
 VLM vision towers and cheaper scoring. The paper-exact tower is one
@@ -25,7 +31,6 @@ from typing import Any
 from kempnerforge.config.registry import registry
 
 _SCORERS = ("siglip2", "clip")
-_QUERY_SOURCES = ("sample", "prompt")
 _KERNELS = ("rkhs", "cosine")
 
 
@@ -47,10 +52,6 @@ class FrameSelectorConfig:
         candidate_fps: Candidate sampling rate. ``0.0`` (default) samples exactly
             ``candidate_frames`` uniformly over the clip; ``> 0`` samples at that
             rate, capped at ``candidate_frames``.
-        query_source: Which text conditions selection at *train* time. ``"sample"``
-            (default) = the dataset's per-sample text (caption/question, chosen by
-            the dataset); ``"prompt"`` = the static ``[video].prompt``. (Eval always
-            uses the rendered request prompt.)
         gumbel_tau: Softmax temperature for ``"qframe"`` Gumbel sampling.
         seed: Base seed for ``"qframe"`` (mixed per-sample with the sample key).
         mdp3_lambda: Relevance/diversity trade-off for ``"mdp3"`` (paper ``lambda``).
@@ -65,7 +66,6 @@ class FrameSelectorConfig:
     scorer_path: str = "google/siglip2-so400m-patch14-224"
     candidate_frames: int = 128
     candidate_fps: float = 0.0
-    query_source: str = "sample"
     gumbel_tau: float = 0.8
     seed: int = 0
     mdp3_lambda: float = 0.2
@@ -88,11 +88,6 @@ class FrameSelectorConfig:
         if self.candidate_fps < 0.0:
             raise ValueError(
                 f"frame_selector.candidate_fps must be non-negative (got {self.candidate_fps})"
-            )
-        if self.query_source not in _QUERY_SOURCES:
-            raise ValueError(
-                f"frame_selector.query_source must be one of {_QUERY_SOURCES} "
-                f"(got {self.query_source!r})"
             )
         if self.gumbel_tau <= 0.0:
             raise ValueError(f"frame_selector.gumbel_tau must be positive (got {self.gumbel_tau})")
@@ -124,8 +119,7 @@ class FrameSelectorConfig:
         """Builder kwargs beyond ``scorer``. ``candidate_frames`` / ``candidate_fps``
         configure the base selector; per-algorithm knobs are consumed by their own
         selector; foreign keys are swallowed via ``**_`` (mirrors ``AdapterConfig``).
-        ``scorer`` / ``scorer_path`` build the scorer and ``query_source`` is
-        consumed by the dataset, so none appear here.
+        ``scorer`` / ``scorer_path`` build the scorer, so neither appears here.
         """
         return {
             "candidate_frames": self.candidate_frames,

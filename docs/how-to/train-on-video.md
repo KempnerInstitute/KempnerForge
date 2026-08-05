@@ -189,7 +189,6 @@ type = "mdp3"            # "topk" (cosine) | "qframe" (Gumbel-Max top-k) | "mdp3
 scorer = "siglip2"       # frozen dual encoder for frame/query embeddings ("clip" too)
 scorer_path = "google/siglip2-base-patch16-224"
 candidate_frames = 32    # decoded pool; must be >= [video].max_frames
-query_source = "sample"  # the dataset's per-sample text (caption/question); or "prompt"
 mdp3_lambda = 0.2        # relevance/diversity trade-off (mdp3)
 mdp3_segment_size = 32   # temporal segment length for sequentiality; 0 = plain conditional DPP
 ```
@@ -198,10 +197,13 @@ mdp3_segment_size = 32   # temporal segment length for sequentiality; 0 = plain 
   Q-Frame QFS, a Gumbel-Max top-k over `softmax(sim/τ)` (stochastic, seeded per
   sample); `mdp3` = Markov-DPP list-wise selection balancing query relevance,
   list-wise diversity, and temporal sequentiality.
-- **Query source.** `query_source = "sample"` uses the dataset's per-sample text
-  (the caption for captioning sets, the question for QA sets — the dataset
-  decides). `"prompt"` uses the static `[video].prompt`; if that is empty the
-  selector logs a one-time warning and falls back to uniform sampling.
+- **Query.** Selection always conditions on the sample's question/instruction
+  prompt — the text the model is given at inference — never on its target
+  (caption/answer), which is not available at test time. A captioning corpus,
+  whose prompt is a static instruction or empty, therefore has no meaningful
+  per-sample query: with an empty prompt the selector logs a one-time warning and
+  falls back to uniform sampling. This is deliberate — the expectation is that
+  query-aware selection helps VQA but not captioning, which the eval can falsify.
 - **Dataset-agnostic.** Selection is a `VideoDataset` base-class capability, so a
   new dataset style adopts it in three lines: take `frame_selector_config` in its
   builder, call `self._init_frame_selector(...)`, and decode via

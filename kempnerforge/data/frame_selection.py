@@ -157,27 +157,37 @@ class FrameQueryScorer:
                 "Frame selection requires `transformers` for the scorer. Install it "
                 "or omit the [frame_selector] section."
             ) from e
+        # Any load/config failure is systemic misconfiguration, not a per-sample
+        # data error: a gated/incompatible repo raises ValueError, an offline node
+        # raises OSError, a broken checkpoint raises assorted errors. Wrap them all
+        # (except ImportError, handled above) as ScorerUnavailableError so the run
+        # fails loudly instead of __getitem__'s broad except degrading every clip.
+        # Derive everything into locals and publish _model/_processor/_text_max_len
+        # only once all of it succeeds, so a mid-load failure can't leave a
+        # half-initialized object that the `self._model is not None` guard freezes.
         try:
             model = AutoModel.from_pretrained(self._path)
             processor = AutoProcessor.from_pretrained(self._path)
-        except OSError as e:
+            model.eval().requires_grad_(False)
+            model.to(device=self._device, dtype=self._dtype)
+            text_cfg = getattr(model.config, "text_config", None)
+            max_len = getattr(text_cfg, "max_position_embeddings", None)
+            if not max_len:
+                max_len = getattr(getattr(processor, "tokenizer", None), "model_max_length", 64)
+            # SentencePiece/BPE model_max_length can be a huge sentinel; cap defensively.
+            text_max_len = int(max_len) if max_len and max_len < 100_000 else 64
+        except Exception as e:  # noqa: BLE001 - any load/config failure is systemic
             raise ScorerUnavailableError(
                 f"Could not load frame-selection scorer {self._path!r}: {e}. "
                 "Prefetch it once on a networked node (set HF_HOME to the shared cache and run "
                 f'`python -c "from transformers import AutoModel, AutoProcessor; '
                 f"AutoModel.from_pretrained('{self._path}'); "
-                f"AutoProcessor.from_pretrained('{self._path}')\"`), or unset HF_HUB_OFFLINE."
+                f"AutoProcessor.from_pretrained('{self._path}')\"`), unset HF_HUB_OFFLINE, or "
+                "check the repo id / weights are compatible."
             ) from e
-        model.eval().requires_grad_(False)
-        model.to(device=self._device, dtype=self._dtype)
-        self._model = model
+        self._text_max_len = text_max_len
         self._processor = processor
-        text_cfg = getattr(model.config, "text_config", None)
-        max_len = getattr(text_cfg, "max_position_embeddings", None)
-        if not max_len:
-            max_len = getattr(getattr(processor, "tokenizer", None), "model_max_length", 64)
-        # SentencePiece/BPE model_max_length can be a huge sentinel; cap defensively.
-        self._text_max_len = int(max_len) if max_len and max_len < 100_000 else 64
+        self._model = model  # published last: the `_model is not None` load guard
 
     @torch.inference_mode()
     def embed_frames(self, frames: Sequence[PILImage]) -> torch.Tensor:
@@ -281,8 +291,9 @@ class FrameSelector:
             if not self._warned_no_query:
                 logger.warning(
                     "Frame selector received an empty query; falling back to uniform stride. "
-                    "For training set [frame_selector].query_source to a field the dataset "
-                    'populates (or set [video].prompt for query_source="prompt").'
+                    "Selection conditions on the sample's question/instruction prompt, so a "
+                    "corpus with no prompt (e.g. captioning with an empty [video].prompt) has "
+                    "nothing to select on."
                 )
                 self._warned_no_query = True
             return [i * n // k for i in range(k)]
@@ -638,11 +649,15 @@ def select_video_frames(
 ) -> tuple[list[PILImage], list[float]]:
     """Decode a candidate pool, select ``k`` frames for the query, return them + times.
 
-    The candidate decode uses the selector's ``candidate_frames`` / ``candidate_fps``:
-    ``candidate_fps == 0`` samples exactly ``candidate_frames`` uniformly over the clip
-    (via the ``min==max`` clamp in ``sample_timestamps``); ``candidate_fps > 0`` samples
-    at that rate capped at ``candidate_frames``. Decode exceptions propagate (the caller
-    isolates them: per-sample at train, per-request at eval).
+    The candidate decode is sized *only* by the selector's ``candidate_frames`` /
+    ``candidate_fps`` — deliberately independent of ``[video].fps`` /
+    ``[video].min_frames`` (which govern the non-selector decode; ``JobConfig``
+    warns if they are set alongside a selector). ``candidate_fps == 0`` samples
+    exactly ``candidate_frames`` uniformly over the clip (via the ``min==max``
+    clamp in ``sample_timestamps``); ``candidate_fps > 0`` samples at that rate
+    capped at ``candidate_frames``. ``k`` is ``[video].max_frames``. Decode
+    exceptions propagate (the caller isolates them: per-sample at train,
+    per-request at eval).
     """
     cf = selector.candidate_frames
     cfps = selector.candidate_fps

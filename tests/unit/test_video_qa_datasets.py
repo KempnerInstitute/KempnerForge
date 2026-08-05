@@ -896,3 +896,63 @@ class TestRegistry:
             ]
         )
         assert "dataset_idx" not in batch
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+
+
+class TestYoutubeId:
+    @pytest.mark.parametrize(
+        "url,expected",
+        [
+            ("https://www.youtube.com/watch?v=REALID&t=3s", "REALID"),
+            # An earlier query param containing "v=" must not be mistaken for the id.
+            ("https://youtube.com/watch?pv=1&v=REALID", "REALID"),
+            ("https://youtu.be/SHORTID", "SHORTID"),  # short link (was dropped before)
+            ("https://youtu.be/SHORTID?t=5", "SHORTID"),
+            ("https://www.youtube.com/embed/EMBEDID", "EMBEDID"),  # embed form
+            ("https://www.youtube.com/shorts/SHORTS1", "SHORTS1"),
+            ("youtu.be/NOSCHEME", "NOSCHEME"),  # scheme-less
+            ("", ""),
+            ("https://example.com/no-video-here", ""),
+        ],
+    )
+    def test_parses_common_shapes(self, url, expected):
+        from kempnerforge.data.video_qa_datasets import _youtube_id
+
+        assert _youtube_id(url) == expected
+
+
+class TestReadTable:
+    def test_single_file_path_with_glob_metachar(self, tmp_path):
+        # A real single-file manifest whose directory contains a glob
+        # metacharacter ('[') must be read as a literal, not reinterpreted as a
+        # pattern (glob would treat "[v2]" as a character class and match nothing).
+        import pandas as pd
+
+        from kempnerforge.data.video_qa_datasets import _read_table
+
+        d = tmp_path / "set[v2]"
+        d.mkdir()
+        f = d / "train.csv"
+        pd.DataFrame({"video": ["abc"], "answer": [1]}).to_csv(f, index=False)
+        rows = _read_table(str(f))
+        assert [r["video"] for r in rows] == ["abc"]
+
+    def test_globs_multiple_shards_in_order(self, tmp_path):
+        import pandas as pd
+
+        from kempnerforge.data.video_qa_datasets import _read_table
+
+        for i in range(3):
+            pd.DataFrame({"video": [f"v{i}"]}).to_parquet(tmp_path / f"train-{i}.parquet")
+        rows = _read_table(str(tmp_path / "train-*.parquet"))
+        assert [r["video"] for r in rows] == ["v0", "v1", "v2"]  # sorted shard order
+
+    def test_missing_raises(self, tmp_path):
+        from kempnerforge.data.video_qa_datasets import _read_table
+
+        with pytest.raises(FileNotFoundError, match="No annotation files"):
+            _read_table(str(tmp_path / "does-not-exist-*.parquet"))

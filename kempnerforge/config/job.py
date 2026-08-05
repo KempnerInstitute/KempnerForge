@@ -173,6 +173,31 @@ class JobConfig:
                     f"must be >= video.max_frames ({self.video.max_frames}): the selector keeps "
                     "max_frames frames out of the candidate pool."
                 )
+            else:
+                # On the selector path the candidate pool is sized by
+                # frame_selector.candidate_frames / candidate_fps; [video].fps and
+                # [video].min_frames govern only the plain (non-selector) decode.
+                # Only [video].max_frames still applies (the number of frames kept).
+                # Warn rather than let a tuned-but-ignored knob look effective.
+                from dataclasses import fields as _dataclass_fields  # noqa: PLC0415
+
+                defaults = {f.name: f.default for f in _dataclass_fields(self.video)}
+                ignored = [
+                    name
+                    for name in ("fps", "min_frames")
+                    if getattr(self.video, name) != defaults[name]
+                ]
+                if ignored:
+                    import logging  # noqa: PLC0415
+
+                    logging.getLogger(__name__).warning(
+                        "[video].%s set alongside [frame_selector], but the candidate pool is "
+                        "sized by frame_selector.candidate_frames / candidate_fps; [video].fps and "
+                        "[video].min_frames do not affect selection (only [video].max_frames, the "
+                        "number of frames kept, applies). Use candidate_fps / candidate_frames to "
+                        "control the pool.",
+                        ", [video].".join(ignored),
+                    )
 
     @property
     def is_vlm(self) -> bool:

@@ -11,6 +11,7 @@ exact) and behaviorally for more segments.
 
 from __future__ import annotations
 
+import math
 import pickle
 import sys
 import types
@@ -186,8 +187,12 @@ class TestDeriveSeed:
         assert _derive_seed(5, None) == 5
 
     def test_pythonhashseed_independent_and_deterministic(self):
-        # Pinned constant: SHA-256 based, so stable across processes/runs.
-        assert _derive_seed(0, "abc") == _derive_seed(0, "abc")
+        # Pin the literal SHA-256-derived value. In-process equality alone would
+        # stay green if the impl regressed to the PYTHONHASHSEED-salted builtin
+        # hash() the code deliberately avoids — which would silently diverge
+        # QFrame/mDP3 draws across DP ranks and resumes. The literal is what makes
+        # "stable across processes" actually testable here.
+        assert _derive_seed(0, "abc") == 965315470085333761
 
     def test_distinct_keys_distinct_seeds(self):
         assert _derive_seed(0, "a") != _derive_seed(0, "b")
@@ -272,6 +277,29 @@ class TestDppGreedy:
         assert len(picks) == 3
         assert len(set(picks)) == 3
 
+    def test_rank1_kernel_exhausts_gain_and_fills(self):
+        # A genuinely rank-1 pool (e.g. a static clip: every frame embedding
+        # identical). Greedy earns exactly one real marginal gain, then the fill
+        # branch must complete to k with log(_MIN_GAIN) markers rather than
+        # returning < k. This is the path the duplicate-rows test does NOT reach
+        # (its kernel stays full-rank), so it pins _dpp_greedy's fill loop.
+        kernel = torch.ones(4, 4, dtype=torch.float64)  # rank 1, PSD
+        picks, gains = _dpp_greedy(kernel, 3)
+        assert len(picks) == 3
+        assert len(set(picks)) == 3
+        # One real gain, then two fill markers.
+        fill = [g for g in gains if g == pytest.approx(math.log(fsmod._MIN_GAIN))]
+        assert len(fill) == 2
+
+    def test_rank1_fill_orders_by_descending_diagonal(self):
+        # The fill picks in descending diagonal (relevance) order after the first
+        # real pick (argmax diagonal). Diagonal = [1,4,2,3]: first pick is index 1
+        # (largest), fill then takes 3 then 2.
+        d = torch.tensor([1.0, 4.0, 2.0, 3.0], dtype=torch.float64)
+        kernel = torch.outer(d.sqrt(), d.sqrt())  # rank 1, diagonal == d
+        picks, _ = _dpp_greedy(kernel, 3)
+        assert picks == [1, 3, 2]
+
 
 # --------------------------------------------------------------------------- #
 # mDP3 segment DP
@@ -315,6 +343,16 @@ class TestMdp3SegmentDp:
         m = 3
         kernel = _well_conditioned(2 * m, seed=5)
         for k in (2, 3, 4):
+            assert sorted(_mdp3_segment_dp(kernel, k, m)) == _exhaustive_two_segment(kernel, k, m)
+
+    def test_matches_exhaustive_ragged_final_segment(self):
+        # n=5, segment_size=3 -> segments [0,1,2] and [3,4]: the trailing block is
+        # PARTIAL (n % segment_size != 0), the common real case since
+        # candidate_frames rarely divides evenly. The min-clamp on seg_bounds must
+        # handle it, and the two-segment DP is still exactly checkable.
+        m = 3
+        kernel = _well_conditioned(5, seed=7)
+        for k in (2, 3):
             assert sorted(_mdp3_segment_dp(kernel, k, m)) == _exhaustive_two_segment(kernel, k, m)
 
     def test_exact_k_distinct_sorted_in_range(self):
@@ -379,12 +417,41 @@ class TestMdp3Selector:
         )
         assert seg0 == big  # segment_size >= n also degenerates to one segment
 
+    def test_lambda_trades_relevance_for_diversity(self):
+        # frames 0,1 near-duplicate AND highly relevant; frame 2 diverse but less
+        # relevant. D = diag(r ** (1/lam)): small lambda amplifies the relevance
+        # ratio so the two relevant near-dups win; large lambda flattens D so
+        # diversity dominates and the diverse frame is chosen. This pins the sign
+        # of the exponent (1/lam) — inverting it flips the two regimes.
+        emb = torch.tensor([[1.0, 0.0, 0.0], [0.985, 0.174, 0.0], [0.3, 0.0, 0.954]])
+        q = torch.tensor([1.0, 0.0, 0.0])
+
+        def pick(lam: float) -> list[int]:
+            sel = MDP3Selector(FakeScorer(emb, q), segment_size=0, candidate_frames=3, lam=lam)
+            return sel.select(_dummy_frames(3), [0, 1, 2], "q", 2, seed_key="v")
+
+        assert 2 not in pick(0.05)  # relevance dominates -> the two near-dups {0,1}
+        assert 2 in pick(3.0)  # diversity dominates -> relevant + diverse {0,2}
+
     def test_cosine_kernel_runs(self):
         emb = torch.randn(6, 8, generator=torch.Generator().manual_seed(11))
         q = torch.randn(8, generator=torch.Generator().manual_seed(12))
         sel = MDP3Selector(FakeScorer(emb, q), segment_size=0, kernel="cosine")
         idx = sel.select(_dummy_frames(6), list(range(6)), "q", 3, seed_key="v")
         assert len(idx) == 3
+        assert idx == sorted(idx)
+
+    def test_cosine_kernel_handles_negative_similarity(self):
+        # An anti-aligned query gives negative raw cosine; the (1 + s) / 2 shift
+        # (and clamp_min on relevance) must keep L PSD and r > 0 so the selection
+        # stays finite. Breaking the shift would yield NaN relevance -> a crash or
+        # garbage picks; this pins it.
+        emb = torch.eye(4)
+        q = torch.tensor([-1.0, -1.0, 0.0, 0.0])
+        sel = MDP3Selector(FakeScorer(emb, q), segment_size=0, candidate_frames=4, kernel="cosine")
+        idx = sel.select(_dummy_frames(4), [0, 1, 2, 3], "q", 2, seed_key="v")
+        assert len(idx) == 2
+        assert len(set(idx)) == 2
         assert idx == sorted(idx)
 
     def test_rejects_bad_kernel(self):
@@ -549,6 +616,20 @@ class TestScorerLifecycle:
 
 
 class TestFrameSelectorRegistry:
+    @pytest.fixture(autouse=True)
+    def _restore_frame_selector_registry(self):
+        # These tests register throwaway selectors into the process-global
+        # registry. Without teardown a second run in the same interpreter
+        # (pytest-repeat, a --lf retry, a double import) makes the first
+        # register_frame_selector(...) raise "already registered" before the
+        # test's own pytest.raises, flipping it to an unexpected error. Snapshot
+        # and restore the frame_selector store around each test.
+        store = registry._get_store("frame_selector")
+        before = dict(store)
+        yield
+        store.clear()
+        store.update(before)
+
     def test_builtins_registered(self):
         for name in ("topk", "qframe", "mdp3"):
             assert name in registry.list_frame_selectors()

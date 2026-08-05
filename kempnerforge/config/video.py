@@ -178,9 +178,19 @@ class VideoConfig:
             replace(
                 src,
                 dataset_name=src.dataset_name or self.dataset_name,
+                subset=src.subset or self.subset,
                 split=src.split or self.split,
                 prompt=src.prompt or self.prompt,
+                text_source=src.text_source or self.text_source,
                 qa_format=src.qa_format or self.qa_format,
+                max_samples=src.max_samples or self.max_samples,
+                # Tri-state: a source's explicit True/False wins; None inherits
+                # [video]'s value (itself possibly None -> builder default).
+                require_video_file=(
+                    src.require_video_file
+                    if src.require_video_file is not None
+                    else self.require_video_file
+                ),
             )
             for src in self.datasets
         ]

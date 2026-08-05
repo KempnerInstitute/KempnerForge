@@ -63,7 +63,6 @@ max_samples = 0           # 0 = full manifest; set small (e.g. 256) for a smoke
 # scorer = "siglip2"
 # scorer_path = "google/siglip2-base-patch16-224"
 # candidate_frames = 32
-# query_source = "sample"   # the dataset's per-sample text (caption); or "prompt"
 # mdp3_lambda = 0.2
 # mdp3_segment_size = 32
 

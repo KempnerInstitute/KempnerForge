@@ -15,7 +15,6 @@ class TestFrameSelectorConfig:
         assert c.scorer_path == "google/siglip2-so400m-patch14-224"
         assert c.candidate_frames == 128
         assert c.candidate_fps == 0.0
-        assert c.query_source == "sample"
         assert c.mdp3_segment_size == 32
 
     def test_registers_selectors_on_construction(self):
@@ -33,7 +32,6 @@ class TestFrameSelectorConfig:
             ({"scorer_path": ""}, "scorer_path must be non-empty"),
             ({"candidate_frames": 0}, "candidate_frames must be >= 1"),
             ({"candidate_fps": -1.0}, "candidate_fps must be non-negative"),
-            ({"query_source": "bogus"}, "query_source must be one of"),
             ({"gumbel_tau": 0.0}, "gumbel_tau must be positive"),
             ({"mdp3_lambda": 0.0}, "mdp3_lambda must be positive"),
             ({"mdp3_segment_size": -1}, "mdp3_segment_size must be non-negative"),

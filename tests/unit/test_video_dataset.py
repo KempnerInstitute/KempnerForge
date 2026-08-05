@@ -153,6 +153,26 @@ class TestGetItem:
         assert torch.count_nonzero(item["frame_times"]) == 0
         assert (item["labels"] == -100).all()  # no supervision for an unloadable clip
 
+
+class TestProbeChecksClipPresence:
+    def test_missing_clip_not_counted_as_supervised(self, tmp_path):
+        # A record with text but an absent clip decodes to zero frames at
+        # __getitem__ -> all labels masked. probe_supervision must therefore not
+        # count it, so a partially-downloaded corpus (require_video_file off) is
+        # reported honestly instead of at false-high supervision.
+        from kempnerforge.data.video_dataset import VideoRecord
+
+        present = tmp_path / "present.mp4"
+        present.write_bytes(b"x")
+
+        class _DS(_StubVideoDataset):
+            def _record(self, idx):
+                path = str(present) if idx == 0 else str(tmp_path / "missing.mp4")
+                return VideoRecord(path, "", "a caption.")
+
+        ds = _DS(["a", "b"], ["a caption.", "a caption."], max_text_len=16)
+        assert ds.probe_supervision() == 0.5  # present supervised, missing skipped
+
     def test_empty_decode_yields_zero_clip_no_loss(self, monkeypatch):
         monkeypatch.setattr(vd, "decode_video_frames", lambda *a, **k: ([], []))
         ds = _StubVideoDataset(["1"], ["a cat."], max_frames=4)
@@ -425,17 +445,47 @@ class TestGetItemWithSelector:
             return _frames(3), [0.0, 1.0, 2.0]
 
         monkeypatch.setattr(vd, "select_video_frames", _select)
-        ds = _StubVideoDataset(["7788"], ["a caption"], max_frames=8)
+        # The query is the sample's prompt (the input-time question/instruction),
+        # never the caption/target; the seed is (clip path, query) so multiple
+        # questions per clip draw independently (see the per-question test below).
+        ds = _StubVideoDataset(["7788"], ["a caption"], max_frames=8, prompt="describe:")
         ds._frame_selector = sel
-        ds._query_source = "sample"
         item = ds[0]
-        assert captured["query"] == "a caption"  # sample source -> caption
+        assert captured["query"] == "describe:"  # the prompt, not the caption
         assert captured["k"] == 8  # max_frames
-        assert captured["seed_key"] == "7788"  # videoid
+        assert captured["seed_key"] == f"{ds._video_path('7788')}|describe:"
         assert item["frame_mask"][:3].all() and not item["frame_mask"][3:].any()
         assert item["frame_times"][:3].tolist() == [0.0, 1.0, 2.0]
 
-    def test_prompt_query_source(self, monkeypatch):
+    def test_seed_key_folds_in_query_for_per_question_independence(self, monkeypatch):
+        # A QA corpus emits many questions per clip. Seeding on the path alone
+        # would draw identical Gumbel noise for every question; the seed must fold
+        # in the query so same-clip questions are independent yet reproducible.
+        seeds: list[str] = []
+
+        def _select(path, query, selector, k, *, sampling_policy="uniform", seed_key=None):
+            seeds.append(seed_key)
+            return _frames(2), [0.0, 1.0]
+
+        monkeypatch.setattr(vd, "select_video_frames", _select)
+
+        class _TwoQuestionsOneClip(_StubVideoDataset):
+            # Same clip path, different prompt per index (mimics a QA corpus).
+            def _record(self, idx):
+                from kempnerforge.data.video_dataset import VideoRecord
+
+                return VideoRecord("/same/clip.mp4", ["q one?", "q two?"][idx], "answer")
+
+        ds = _TwoQuestionsOneClip(["a", "b"], ["x", "y"], max_frames=4)
+        ds._frame_selector = _FakeSelector([0, 1])
+        ds[0]
+        ds[1]
+        assert seeds == ["/same/clip.mp4|q one?", "/same/clip.mp4|q two?"]
+        assert seeds[0] != seeds[1]  # independent draws for the two questions
+
+    def test_empty_prompt_gives_no_query(self, monkeypatch):
+        # A captioning sample with no prompt has no query to condition on (the
+        # deliberate expectation that query-aware selection cannot help it).
         captured = {}
 
         def _select(path, query, selector, k, *, sampling_policy="uniform", seed_key=None):
@@ -443,11 +493,10 @@ class TestGetItemWithSelector:
             return _frames(2), [0.0, 1.0]
 
         monkeypatch.setattr(vd, "select_video_frames", _select)
-        ds = _StubVideoDataset(["1"], ["the caption"], max_frames=4, prompt="describe:")
+        ds = _StubVideoDataset(["1"], ["the caption"], max_frames=4)  # prompt=""
         ds._frame_selector = _FakeSelector([0, 1])
-        ds._query_source = "prompt"
         ds[0]
-        assert captured["query"] == "describe:"  # static prompt, not the caption
+        assert captured["query"] is None  # empty prompt -> no query, not the caption
 
     def test_selection_error_degrades_to_empty_clip(self, monkeypatch):
         def _boom(*a, **k):
@@ -475,12 +524,12 @@ class TestGetItemWithSelector:
 
 class TestBuilderThreadsSelector:
     def test_backward_compatible_without_kwarg(self, monkeypatch):
-        # Existing call sites pass no frame_selector_config; the builder still
+        # Existing call sites pass no frame_selector; the builder still
         # dispatches and receives None (no selector).
         captured = {}
 
-        def _fake_builder(video_config, tokenizer_path, max_text_len, frame_selector_config=None):
-            captured["fsc"] = frame_selector_config
+        def _fake_builder(video_config, tokenizer_path, max_text_len, frame_selector=None):
+            captured["sel"] = frame_selector
             return object()
 
         from kempnerforge.config.registry import registry
@@ -488,15 +537,16 @@ class TestBuilderThreadsSelector:
         from kempnerforge.data.video_dataset import build_video_dataset
 
         monkeypatch.setattr(registry, "get_video_dataset", lambda name: _fake_builder)
-        build_video_dataset(VideoConfig(), "gpt2", 16)  # no frame_selector_config arg
-        assert captured["fsc"] is None
+        build_video_dataset(VideoConfig(), "gpt2", 16)  # no frame_selector arg
+        assert captured["sel"] is None
 
-    def test_build_video_dataset_threads_config(self, monkeypatch):
-        # build_video_dataset forwards frame_selector_config to the builder.
+    def test_build_video_dataset_threads_prebuilt_selector(self, monkeypatch):
+        # build_video_dataset forwards the prebuilt frame_selector object to the
+        # builder (the object is now constructed once at the build_video_data seam).
         captured = {}
 
-        def _fake_builder(video_config, tokenizer_path, max_text_len, frame_selector_config=None):
-            captured["fsc"] = frame_selector_config
+        def _fake_builder(video_config, tokenizer_path, max_text_len, frame_selector=None):
+            captured["sel"] = frame_selector
             return object()
 
         from kempnerforge.config.registry import registry
@@ -506,8 +556,8 @@ class TestBuilderThreadsSelector:
         from kempnerforge.data.video_dataset import build_video_dataset
 
         sentinel = object()
-        build_video_dataset(VideoConfig(), "gpt2", 16, frame_selector_config=sentinel)
-        assert captured["fsc"] is sentinel
+        build_video_dataset(VideoConfig(), "gpt2", 16, frame_selector=sentinel)
+        assert captured["sel"] is sentinel
 
 
 class _StubQADataset(vd.VideoDataset):
@@ -518,12 +568,12 @@ class _StubQADataset(vd.VideoDataset):
     question (not a caption) as its query, and a different seed key.
     """
 
-    def __init__(self, question, frame_selector_config=None):
+    def __init__(self, question, frame_selector=None):
         self._question = question
-        self._init_frame_selector(frame_selector_config)
+        self._init_frame_selector(frame_selector)
 
     def probe(self, path, seed_key):
-        # Question is the query regardless of query_source="sample".
+        # The question is the query (the input-time prompt), never a target.
         return self._decode_clip(
             path,
             self._question,

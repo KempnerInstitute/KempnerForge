@@ -607,15 +607,18 @@ class KempnerForgeVLM(lmms):
             self._frames_per_clip = 1
             self._frame_size = self._config.data.hf_image_size
 
-        # Query-aware frame selection (video only). The scorer runs on the eval
-        # device at the model dtype on CUDA (fp32 on CPU, where bf16 matmuls are
-        # slow/unsupported). JobConfig warns on selector-without-video.
+        # Query-aware frame selection (video only). The scorer runs on CPU in
+        # fp32 — byte-for-byte the same device+dtype as the training data path
+        # (dataloader workers), so the frozen encoder yields identical embeddings
+        # and therefore identical frame selections at train and eval. Running it
+        # at the model dtype (bf16) on CUDA would flip near-tie top-k/DPP picks and
+        # evaluate the model on frames it was never trained on, muddying the very
+        # "does query-aware selection help" measurement. (CPU also matches the
+        # eval-decode dataloader planned next, whose workers are CPU.) JobConfig
+        # warns on selector-without-video.
         self._frame_selector: FrameSelector | None = None
         if self._config.frame_selector is not None and self._is_video:
-            scorer_dtype = self._dtype if self._device.type == "cuda" else torch.float32
-            self._frame_selector = build_frame_selector(
-                self._config.frame_selector, device=self._device, dtype=scorer_dtype
-            )
+            self._frame_selector = build_frame_selector(self._config.frame_selector)
 
         self._model, self._checkpoint_meta = _load_weights(
             self._config, checkpoint, self._device, self._dtype

@@ -812,6 +812,58 @@ class TestFrameSelectorCandidateBudget:
         assert cfg.frame_selector.type == "topk"
 
 
+class TestFrameSelectorIgnoredGeometryWarning:
+    """On the selector path the candidate pool is sized by
+    ``candidate_frames`` / ``candidate_fps``; ``[video].fps`` / ``[video].min_frames``
+    are inert. ``JobConfig`` warns when they are set to non-defaults alongside a
+    selector so a tuned-but-ignored knob is never silent. ``[video].max_frames``
+    still applies (it is ``k``) and must not warn."""
+
+    def setup_method(self):
+        import logging
+
+        self._kf_logger = logging.getLogger("kempnerforge")
+        self._old_propagate = self._kf_logger.propagate
+        self._kf_logger.propagate = True
+
+    def teardown_method(self):
+        self._kf_logger.propagate = self._old_propagate
+
+    def _job(self, video):
+        # max_seq_len generous so default/large max_frames fit the visual-token
+        # budget — these tests are about the geometry warning, not the seq check.
+        return JobConfig(
+            model=ModelConfig(max_seq_len=8192),
+            vision_encoder=VisionEncoderConfig(type="random", feature_dim=384, num_tokens=64),
+            adapter=AdapterConfig(),
+            vlm=VLMConfig(max_text_len=512),
+            video=video,
+            frame_selector=FrameSelectorConfig(),
+        )
+
+    def test_warns_on_nondefault_fps(self, caplog):
+        with caplog.at_level("WARNING", logger="kempnerforge.config.job"):
+            self._job(VideoConfig(fps=3.0))
+        assert any("do not affect selection" in r.getMessage() for r in caplog.records)
+
+    def test_warns_on_nondefault_min_frames(self, caplog):
+        with caplog.at_level("WARNING", logger="kempnerforge.config.job"):
+            self._job(VideoConfig(min_frames=8))
+        assert any("[video].min_frames" in r.getMessage() for r in caplog.records)
+
+    def test_silent_on_default_geometry(self, caplog):
+        # Default fps/min_frames alongside a selector -> nothing ignored, no warn.
+        with caplog.at_level("WARNING", logger="kempnerforge.config.job"):
+            self._job(VideoConfig())
+        assert not any("do not affect selection" in r.getMessage() for r in caplog.records)
+
+    def test_silent_on_nondefault_max_frames(self, caplog):
+        # max_frames IS honored (it is k), so changing it must not warn.
+        with caplog.at_level("WARNING", logger="kempnerforge.config.job"):
+            self._job(VideoConfig(max_frames=32))
+        assert not any("do not affect selection" in r.getMessage() for r in caplog.records)
+
+
 class TestMoMaAcFullWarning:
     """``JobConfig.validate`` warns when MoMa is paired with
     ``activation_checkpointing="full"`` because ``apply_ac`` matches

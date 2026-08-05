@@ -86,6 +86,52 @@ class TestSources:
         assert (a.split, a.prompt, a.qa_format) == ("validation", "Describe the video:", "mcq_text")
         assert (b.split, b.prompt) == ("train", "Answer.")  # explicit values win
 
+    def test_mixture_inherits_all_inheritable_fields(self):
+        # max_samples / require_video_file / subset / text_source must inherit from
+        # [video] too, exactly like the single-corpus path passes them through.
+        # Otherwise a [video].max_samples smoke cap (or an asr text_source) is
+        # silently dropped for every source and the two config forms disagree.
+        cfg = VideoConfig(
+            max_samples=100,
+            require_video_file=True,
+            subset="OE",
+            text_source="asr",
+            datasets=[
+                _source(dataset_type="webvid"),  # inherits all four
+                _source(
+                    dataset_type="nextqa",
+                    data_root="/n",
+                    max_samples=5,
+                    require_video_file=False,
+                    subset="MC",
+                    text_source="title",
+                ),  # explicit values win
+            ],
+            **GEOMETRY,
+        )
+        a, b = cfg.sources()
+        assert (a.max_samples, a.require_video_file, a.subset, a.text_source) == (
+            100,
+            True,
+            "OE",
+            "asr",
+        )
+        assert (b.max_samples, b.require_video_file, b.subset, b.text_source) == (
+            5,
+            False,
+            "MC",
+            "title",
+        )
+
+    def test_mixture_require_video_file_none_inherits_video_none(self):
+        # Tri-state: source None + [video] None stays None (builder default), not
+        # coerced to a bool.
+        cfg = VideoConfig(
+            datasets=[_source(dataset_type="nextqa", data_root="/n")], **GEOMETRY
+        )
+        (src,) = cfg.sources()
+        assert src.require_video_file is None
+
     def test_for_source_shares_geometry_and_swaps_corpus_fields(self):
         cfg = VideoConfig(
             max_frames=8,
