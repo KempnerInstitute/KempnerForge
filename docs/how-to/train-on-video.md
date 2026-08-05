@@ -81,13 +81,94 @@ max_samples = 0              # 0 = full manifest; set small for a smoke
 ```
 
 The dataset side is **pluggable**: `dataset_type` selects a builder from the
-`video_dataset` registry (`"webvid"` ships; other styles — HuggingFace video
-sets, flat folders, alternate manifests — register as small follow-ups and are
-selected here), and `sampling_policy` selects a registered frame-sampling policy
-(`"uniform"` is the default). The WebVid corpus directory is parameterized
-by `dataset_name`, so any WebVid-style dataset works, not just `webvid-10M`:
-CSV manifests under `raw/<dataset_name>/data/<split>/partitions/` and `.mp4`
-files under `raw/videos/<split>/`.
+`video_dataset` registry, and `sampling_policy` selects a registered
+frame-sampling policy (`"uniform"` is the default). The WebVid corpus directory
+is parameterized by `dataset_name`, so any WebVid-style dataset works, not just
+`webvid-10M`: CSV manifests under `raw/<dataset_name>/data/<split>/partitions/`
+and `.mp4` files under `raw/videos/<split>/`.
+
+## Corpora that ship
+
+| `dataset_type` | Text | Layout under `data_root` |
+|---|---|---|
+| `webvid` | caption | `raw/<dataset_name>/data/<split>/partitions/*.csv` + prefix-nested `raw/videos/<split>/` |
+| `molmo2_videocapqa` | caption from a yt-dlp sidecar | `videos/<subset>/<id>/<id>.{mp4,mkv,webm}` (+ `<id>.json` / `<id>.grover.json`) |
+| `perception_test` | 3-way MCQ | `mc_question_<split>.json` + flat `videos/<video_id>.mp4` |
+| `nextqa` | 5-way MCQ (`subset="MC"`) or free text (`"OE"`) | `annotations/{MC,OE}/<split>.{csv,parquet}` + flat `videos/<video>.mp4` |
+| `cinepile` | 5-way MCQ | `<dataset_name>/<split>-*.parquet` (`v1`/`v2`) + flat `videos/<ytid>.mp4` |
+
+Add another corpus by subclassing `VideoQADataset` — it only needs a
+`VideoRecord(video_path, prompt, target)` per index; decode, frame padding,
+timestamps, prompt masking and the skip-with-mask path are inherited.
+
+**Question rendering** is a registry knob, not a per-corpus decision.
+`qa_format` picks how an MCQ becomes supervised text:
+
+| `qa_format` | Target | Notes |
+|---|---|---|
+| `mcq_letter` (default) | `" C"` | ~2 supervised tokens; matches the usual MC eval protocol |
+| `mcq_letter_text` | `" C. lay on floor"` | still letter-parseable, supervises the wording |
+| `mcq_text` | `" lay on floor"` | generative setup |
+
+The question and its options go in the prompt, which `-100` masks out of the
+loss. Give MCQ corpora enough `vlm.max_text_len` for the whole option list —
+CinePile's five long options need ~192 — or the answer is truncated away and the
+sample silently trains on nothing. Every corpus logs the fraction of its first
+128 samples that supervise at least one token at startup, and warns below 50%;
+watch that line.
+
+## Mix several corpora
+
+List `[[video.datasets]]` entries instead of the flat corpus fields. Frame
+geometry (`fps`, `max_frames`, `min_frames`, `frame_size`, `sampling_policy`)
+stays global on `[video]` — it sizes the visual-token budget checked against
+`model.max_seq_len`, so every source must share it, and setting it on a source
+is rejected as an unknown key.
+
+```toml
+[video]                      # geometry: global, shared by every source
+fps = 2.0
+max_frames = 8
+min_frames = 2
+frame_size = 224
+
+[[video.datasets]]
+dataset_type = "webvid"
+data_root = "/path/to/webvid-10m"
+prompt = "Describe the video:"
+weight = 1.0
+
+[[video.datasets]]
+dataset_type = "nextqa"
+data_root = "/path/to/NExTQA"
+subset = "MC"
+weight = 2.0
+```
+
+Per-source fields: `dataset_type`, `data_root`, `dataset_name`, `subset`,
+`split`, `prompt`, `text_source`, `qa_format`, `max_samples`,
+`require_video_file`, `weight`, `name`. Anything left empty inherits the
+`[video]` value, so shared settings are written once.
+
+This reuses the text path's `MixtureDataset` + `MixtureSampler`, so
+`data.mix_temperature` and `[[data.phases]]` apply, and each corpus gets its own
+`loss/<name>` and `data/<name>/tokens` metric. Sources are concatenated into one
+index space and drawn by weight; `name` disambiguates two sources of the same
+type. See `configs/train/vlm_video_stage1_mix.toml` for a complete example.
+
+**Weights control rows, not gradient share.** There is one loss: a batch mixes
+rows from every corpus and cross-entropy averages over all supervised *tokens*
+in it, so a corpus's real contribution is `rows × supervised-tokens-per-row`.
+A caption supervises ~20 tokens and an `mcq_letter` answer ~2, so at equal
+weights caption corpora take roughly 87% of the gradient in a caption+MCQ mix.
+Raise the MCQ `weight`, or switch those sources to `mcq_letter_text`, to
+rebalance. The per-corpus `loss/<name>` values are diagnostics computed under
+`no_grad` — they are never combined or backwarded.
+
+**Partially-downloaded corpora**: `require_video_file` drops manifest rows whose
+video is missing, so they cost no decode and no wasted step. It defaults on for
+the QA corpora and off where an existence scan would be prohibitive (WebVid's
+10M-row manifest).
 
 Decoding uses **PyAV**, an **optional** dependency (its wheel bundles FFmpeg, so
 no system FFmpeg is required): install it with `uv sync --group video`. It is

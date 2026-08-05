@@ -1,0 +1,120 @@
+# Stage-1 video alignment on a WebVid-10M + Molmo2-VideoCapQA mixture.
+#
+# Two corpora are listed as [[video.datasets]] sources and sampled by weight;
+# frame geometry stays global on [video] so every source produces identically
+# shaped clips (a hard requirement for FSDP2 and the visual-token budget).
+#
+# Alignment stage: LLM frozen, vision encoder + adapter train. avgpool
+# (pool_window=2) on SigLIP2-so400m@224/patch14 gives 64 tokens/frame, so
+# 8 * 64 = 512 visual + 96 text = 608 <= max_seq_len.
+#
+# Molmo2-VideoCapQA ships no caption annotations — text_source selects which
+# yt-dlp sidecar field stands in ("title" | "description" | "asr"). Sidecar
+# coverage is uneven per subset, so the loader logs the fraction of samples
+# that actually supervise a token at startup; watch for that line.
+#
+# Launch (16 H200):
+#   uv run torchrun --nproc_per_node=8 --nnodes=2 scripts/train.py \
+#       configs/train/vlm_video_stage1_mix.toml
+#
+# Smoke (2 GPUs, no SigLIP download, a few clips, few steps):
+#   uv run torchrun --nproc_per_node=2 scripts/train.py \
+#       configs/train/vlm_video_stage1_mix.toml \
+#       --vision_encoder.type=random --vision_encoder.num_tokens=256 \
+#       --vision_encoder.feature_dim=1152 --train.max_steps=10 \
+#       --model.n_layers=2 --data.num_workers=4
+
+[model]
+dim = 1024
+n_layers = 28
+n_heads = 16
+n_kv_heads = 8
+head_dim = 128
+vocab_size = 151936
+ffn_hidden_dim = 3072
+norm_type = "rmsnorm"
+norm_eps = 1e-6
+activation = "silu"
+qk_norm = true
+rope_theta = 1000000.0
+tie_embeddings = true
+max_seq_len = 640
+
+[vision_encoder]
+type = "siglip2"
+path = "google/siglip2-so400m-patch14-224"
+
+[adapter]
+type = "avgpool"
+pool_window = 2           # 16x16 patch grid -> 8x8 = 64 tokens/frame
+
+[vlm]
+arch = "joint_decoder"    # also: cross_attention / mot / moma
+max_text_len = 96
+freeze = [{ module = "transformer", frozen = true }]
+
+# --- Frame geometry: global, shared by every source below ---
+[video]
+fps = 2.0
+max_frames = 8
+min_frames = 2
+frame_size = 224
+sampling_policy = "uniform"
+
+[[video.datasets]]
+dataset_type = "webvid"
+data_root = "/n/holylfs06/LABS/kempner_shared/Everyone/testbed/video/webvid-10m"
+dataset_name = "webvid-10M"
+split = "train"
+prompt = "Describe the video:"
+weight = 1.0
+
+[[video.datasets]]
+dataset_type = "molmo2_videocapqa"
+data_root = "/n/holylfs06/LABS/kempner_shared/Everyone/testbed/multimodal/Molmo2-VideoCapQA"
+subset = "youtube-cc-kw"  # "" reads every subset; youtube-cc-exist has no sidecars
+text_source = "title"     # "title" | "description" | "asr" (asr: youtube-cc-temporal)
+prompt = "Describe the video:"
+weight = 1.0
+
+[data]
+tokenizer_path = "Qwen/Qwen3-0.6B"
+num_workers = 12
+pin_memory = true
+mix_temperature = 1.0     # also rescales the video mixture weights
+
+[train]
+batch_size = 16
+seq_len = 640
+max_steps = 20000
+grad_accum_steps = 1
+grad_clip_norm = 1.0
+seed = 42
+compile_model = false
+activation_checkpointing = "none"
+
+[optimizer]
+name = "adamw"
+lr = 8e-5
+weight_decay = 0.1
+betas = [0.9, 0.95]
+eps = 1e-8
+fused = true
+
+[scheduler]
+name = "cosine"
+warmup_steps = 1000
+min_lr_ratio = 0.1
+
+[distributed]
+dp_shard = -1
+
+[checkpoint]
+dir = "checkpoints/vlm_video_stage1_mix"
+interval = 5000
+keep_last_n = 2
+
+[metrics]
+log_interval = 20
+enable_wandb = false
+enable_tensorboard = false

@@ -248,6 +248,26 @@ class Registry:
     def list_time_embeddings(self) -> list[str]:
         return self.list("time_embedding")
 
+    def register_qa_format(self, name: str) -> Callable:
+        """Decorator to register a question-answering prompt/target format.
+
+        Formats take ``(question, options, answer_index, instruction)`` and
+        return a ``QAText(prompt, target)``; the prompt is masked out of the
+        loss. Selected by ``[video].qa_format``.
+        """
+
+        def decorator(fn: Callable) -> Callable:
+            self.register("qa_format", name, fn)
+            return fn
+
+        return decorator
+
+    def get_qa_format(self, name: str) -> Callable:
+        return self.get("qa_format", name)
+
+    def list_qa_formats(self) -> list[str]:
+        return self.list("qa_format")
+
     def register_dyn_ckpt_strategy(self, name: str) -> Callable:
         """Decorator to register a dynamic-checkpointing-window strategy.
 

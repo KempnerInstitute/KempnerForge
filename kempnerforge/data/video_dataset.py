@@ -1,8 +1,11 @@
-"""Video dataset and collator for the VLM video path (WebVid-style layout).
+"""Video datasets and collator for the VLM video path.
 
-``WebVidVideoDataset`` reads a WebVid-style on-disk corpus — per-partition CSV
-manifests (``videoid``, ``name`` = caption) plus ``.mp4`` files laid out under
-``raw/videos/<split>/`` — and produces the video analogue of the single-image
+``VideoQADataset`` is the shared base: given a per-index ``VideoRecord``
+(``video_path``, ``prompt``, ``target``) it decodes, pads, timestamps, and
+tokenizes one clip. Corpus-specific layouts live in subclasses —
+``WebVidVideoDataset`` here (per-partition CSV manifests plus prefix-nested
+``.mp4`` files under ``raw/videos/<split>/``), the rest in
+``video_qa_datasets``. Each produces the video analogue of the single-image
 ``VLMSample``:
 
 - ``pixel_values``: ``(F, 3, H, W)`` float tensor — ``F = max_frames`` frames,
@@ -15,7 +18,8 @@ manifests (``videoid``, ``name`` = caption) plus ``.mp4`` files laid out under
 
 ``VideoCollator`` stacks samples into a fixed-shape batch
 (``pixel_values: (B, F, 3, H, W)``, ``frame_mask: (B, F)``) so every DP rank
-sees identical shapes under FSDP2.
+sees identical shapes under FSDP2. ``build_video_data`` resolves the configured
+corpora, returning a weighted ``MixtureDataset`` when more than one is listed.
 
 Frame decoding lives in ``video_io.decode_video_frames`` and is imported at
 module scope so tests can substitute a stub; ``av`` itself is imported lazily
@@ -26,7 +30,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any
+from typing import Any, NamedTuple
 
 import torch
 from torch.utils.data import Dataset
@@ -64,13 +68,160 @@ class VideoDataset(Dataset):
 
     Register a new dataset style with ``@registry.register_video_dataset`` and
     select it via ``[video].dataset_type``; ``build_video_dataset`` dispatches
-    through the registry. ``WebVidVideoDataset`` is the WebVid-style layout
-    (per-partition CSV manifests + prefix-nested ``.mp4`` files); other styles
-    (HuggingFace video sets, flat folders, alternate manifests) are follow-ups.
+    through the registry. Most styles subclass ``VideoQADataset``, which
+    implements this contract once and asks only for per-index records.
     """
 
 
-class WebVidVideoDataset(VideoDataset):
+class VideoRecord(NamedTuple):
+    """One training example before decoding: a clip plus its text.
+
+    ``prompt`` is prepended to ``target`` and masked out of the loss, so a
+    caption corpus leaves it empty and a QA corpus puts the question (and any
+    answer options) there.
+    """
+
+    video_path: str
+    prompt: str
+    target: str
+
+
+class VideoQADataset(VideoDataset):
+    """Base implementing the sample contract for any video-text corpus.
+
+    Subclasses supply records — either eagerly (pass ``records``) or lazily
+    (override ``_record``/``__len__``) — and inherit decode, frame padding,
+    per-frame timestamps, prompt masking, and the skip-with-mask behavior that
+    keeps a corrupt clip from crashing training.
+
+    Args:
+        records: Per-index records; omit when overriding ``_record``.
+        tokenizer_path: HF tokenizer id or local path.
+        max_text_len: Fixed-length text pad target.
+        max_frames / min_frames / fps: Frame-sampling knobs (see ``video_io``).
+        frame_size: Square pixel size per frame.
+        sampling_policy: Registry key for the frame-sampling policy.
+        image_mean / image_std: Per-channel normalization (SigLIP defaults).
+    """
+
+    def __init__(
+        self,
+        records: list[VideoRecord] | None = None,
+        *,
+        tokenizer_path: str,
+        max_text_len: int,
+        max_frames: int,
+        min_frames: int,
+        fps: float,
+        frame_size: int = 224,
+        sampling_policy: str = "uniform",
+        image_mean: tuple[float, float, float] = DEFAULT_IMAGE_MEAN,
+        image_std: tuple[float, float, float] = DEFAULT_IMAGE_STD,
+    ) -> None:
+        from transformers import AutoTokenizer
+
+        self._records: list[VideoRecord] = records or []
+        self._tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+        self._pad_id = resolve_pad_id(self._tokenizer)
+        self._max_text_len = max_text_len
+        self._max_frames = max_frames
+        self._min_frames = min_frames
+        self._fps = fps
+        self._frame_size = frame_size
+        self._sampling_policy = sampling_policy
+        self._image_mean = image_mean
+        self._image_std = image_std
+        # Subclasses populate their records before calling super().__init__(),
+        # so the probe can read them here and surface a silently-unsupervised
+        # corpus at startup rather than after a flat-loss run.
+        self.probe_supervision()
+
+    def _record(self, idx: int) -> VideoRecord:
+        """Record at ``idx``. Override to build records lazily."""
+        return self._records[idx]
+
+    def __len__(self) -> int:
+        return len(self._records)
+
+    def probe_supervision(self, n: int = 128) -> float:
+        """Fraction of the first ``n`` samples that supervise at least one token.
+
+        Two silent failure modes end with an all-``-100`` label row: a record
+        whose text is missing on disk, and a QA prompt so long that the answer
+        is truncated past ``max_text_len``. Both train on nothing while looking
+        healthy, so subclasses call this at construction and warn when the rate
+        is low. Text-only — it never decodes video.
+        """
+        probe = min(n, len(self))
+        if probe == 0:
+            return 0.0
+        supervised = 0
+        for idx in range(probe):
+            record = self._record(idx)
+            if not record.target.strip():
+                continue
+            _, labels = _tokenize_and_mask(
+                self._tokenizer, record.target, self._max_text_len, record.prompt or None
+            )
+            supervised += int(bool((labels != -100).any()))
+        rate = supervised / probe
+        log = logger.warning if rate < 0.5 else logger.info
+        log(
+            "%s: %.0f%% of the first %d samples supervise at least one token "
+            "(max_text_len=%d); the rest contribute no loss.",
+            type(self).__name__,
+            100.0 * rate,
+            probe,
+            self._max_text_len,
+        )
+        return rate
+
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        record = self._record(idx)
+        try:
+            frames, frame_times_s = decode_video_frames(
+                record.video_path,
+                fps=self._fps,
+                min_frames=self._min_frames,
+                max_frames=self._max_frames,
+                sampling_policy=self._sampling_policy,
+            )
+        except Exception as e:  # noqa: BLE001 - any decode failure -> skip-with-mask
+            logger.debug("video decode failed for %s: %s", record.video_path, e)
+            frames, frame_times_s = [], []
+
+        pixel_values, frame_mask = frames_to_clip_tensor(
+            frames,
+            max_frames=self._max_frames,
+            frame_size=self._frame_size,
+            image_mean=self._image_mean,
+            image_std=self._image_std,
+        )
+        # Per-frame timestamp in seconds; 0.0 for pad frames. The time projection
+        # runs over every frame and does not consult frame_mask, so pad frames
+        # still receive a (time-0) embedding — harmless only while padded frames
+        # are themselves unmasked from attention, and inert once they are masked.
+        frame_times = torch.zeros(self._max_frames, dtype=torch.float32)
+        n_real = min(len(frames), self._max_frames)
+        frame_times[:n_real] = torch.tensor(frame_times_s[:n_real], dtype=torch.float32)
+
+        input_ids, labels = _tokenize_and_mask(
+            self._tokenizer, record.target, self._max_text_len, record.prompt or None
+        )
+        if not frames or not record.target.strip():
+            # Undecodable clip, or a record whose text is missing on disk: keep
+            # static shapes but contribute no loss.
+            labels = torch.full_like(labels, -100)
+        return {
+            "pixel_values": pixel_values,
+            "frame_mask": frame_mask,
+            "frame_times": frame_times,
+            "input_ids": input_ids,
+            "labels": labels,
+        }
+
+
+class WebVidVideoDataset(VideoQADataset):
     """Map-style WebVid-style video-caption dataset for VLM training.
 
     Args:
@@ -104,8 +255,6 @@ class WebVidVideoDataset(VideoDataset):
         image_mean: tuple[float, float, float] = DEFAULT_IMAGE_MEAN,
         image_std: tuple[float, float, float] = DEFAULT_IMAGE_STD,
     ) -> None:
-        from transformers import AutoTokenizer
-
         if split not in _VIDEO_SUBDIR:
             raise ValueError(f"split must be one of {tuple(_VIDEO_SUBDIR)} (got {split!r})")
         self._split = split
@@ -116,18 +265,21 @@ class WebVidVideoDataset(VideoDataset):
         csv_dir = os.path.join(
             data_root, "raw", dataset_name, "data", _CSV_SUBDIR[split], "partitions"
         )
+        # Records stay lazy: the manifest reaches 10M rows, so ids/captions are
+        # kept as parallel lists and a VideoRecord is built per __getitem__.
         self._ids, self._caps = self._load_manifest(csv_dir, max_samples)
-        self._tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-        self._pad_id = resolve_pad_id(self._tokenizer)
-        self._max_text_len = max_text_len
-        self._max_frames = max_frames
-        self._min_frames = min_frames
-        self._fps = fps
-        self._frame_size = frame_size
         self._prompt = prompt
-        self._sampling_policy = sampling_policy
-        self._image_mean = image_mean
-        self._image_std = image_std
+        super().__init__(
+            tokenizer_path=tokenizer_path,
+            max_text_len=max_text_len,
+            max_frames=max_frames,
+            min_frames=min_frames,
+            fps=fps,
+            frame_size=frame_size,
+            sampling_policy=sampling_policy,
+            image_mean=image_mean,
+            image_std=image_std,
+        )
         logger.info(
             "WebVidVideoDataset: %s/%s [%s], %d clips, max_frames=%d, fps=%s, frame_size=%d",
             data_root,
@@ -182,49 +334,8 @@ class WebVidVideoDataset(VideoDataset):
     def __len__(self) -> int:
         return len(self._ids)
 
-    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
-        videoid = self._ids[idx]
-        caption = self._caps[idx]
-        path = self._video_path(videoid)
-        try:
-            frames, frame_times_s = decode_video_frames(
-                path,
-                fps=self._fps,
-                min_frames=self._min_frames,
-                max_frames=self._max_frames,
-                sampling_policy=self._sampling_policy,
-            )
-        except Exception as e:  # noqa: BLE001 - any decode failure -> skip-with-mask
-            logger.debug("video decode failed for %s: %s", path, e)
-            frames, frame_times_s = [], []
-
-        pixel_values, frame_mask = frames_to_clip_tensor(
-            frames,
-            max_frames=self._max_frames,
-            frame_size=self._frame_size,
-            image_mean=self._image_mean,
-            image_std=self._image_std,
-        )
-        # Per-frame timestamp in seconds; 0.0 for pad frames. The time projection
-        # runs over every frame and does not consult frame_mask, so pad frames
-        # still receive a (time-0) embedding — harmless only while padded frames
-        # are themselves unmasked from attention, and inert once they are masked.
-        frame_times = torch.zeros(self._max_frames, dtype=torch.float32)
-        n_real = min(len(frames), self._max_frames)
-        frame_times[:n_real] = torch.tensor(frame_times_s[:n_real], dtype=torch.float32)
-
-        prompt = self._prompt or None
-        input_ids, labels = _tokenize_and_mask(self._tokenizer, caption, self._max_text_len, prompt)
-        if not frames:
-            # Undecodable clip: keep static shapes but contribute no loss.
-            labels = torch.full_like(labels, -100)
-        return {
-            "pixel_values": pixel_values,
-            "frame_mask": frame_mask,
-            "frame_times": frame_times,
-            "input_ids": input_ids,
-            "labels": labels,
-        }
+    def _record(self, idx: int) -> VideoRecord:
+        return VideoRecord(self._video_path(self._ids[idx]), self._prompt, self._caps[idx])
 
 
 class VideoCollator:
@@ -236,6 +347,8 @@ class VideoCollator:
       - ``frame_times``: ``(B, F)`` float32 (per-frame time in seconds).
       - ``input_ids``: ``(B, max_text_len)`` int64.
       - ``labels``: ``(B, max_text_len)`` int64 with ``-100`` on pad/prompt.
+      - ``dataset_idx``: ``(B,)`` int64 — only when mixing, so the loop can
+        attribute loss to the source corpus.
 
     Text is always padded to ``max_text_len`` (never batch-max) so DP ranks
     see identical shapes under FSDP2, matching ``VLMCollator``.
@@ -262,13 +375,20 @@ class VideoCollator:
             n = min(ids.shape[0], self.max_text_len)
             input_ids[i, :n] = ids[:n]
             labels[i, :n] = lbl[:n]
-        return {
+        batch = {
             "pixel_values": pixel_values,
             "frame_mask": frame_mask,
             "frame_times": frame_times,
             "input_ids": input_ids,
             "labels": labels,
         }
+        # MixtureDataset tags each sample with its source index; forward it so
+        # per-dataset loss can be logged (absent for a single-corpus run).
+        if "dataset_idx" in samples[0]:
+            batch["dataset_idx"] = torch.tensor(
+                [int(s["dataset_idx"]) for s in samples], dtype=torch.long
+            )
+        return batch
 
 
 @registry.register_video_dataset("webvid")
@@ -299,3 +419,31 @@ def build_video_dataset(video_config: Any, tokenizer_path: str, max_text_len: in
     """
     builder = registry.get_video_dataset(video_config.dataset_type)
     return builder(video_config, tokenizer_path, max_text_len)
+
+
+def build_video_data(
+    video_config: Any, tokenizer_path: str, max_text_len: int
+) -> tuple[Dataset, Any, list[float]]:
+    """Build the video dataset, or a weighted mixture of several corpora.
+
+    Returns ``(dataset, mixture, weights)``. ``mixture`` is the
+    ``MixtureDataset`` when ``[[video.datasets]]`` lists more than one corpus —
+    its ``cumulative_sizes`` / ``dataset_names`` drive ``MixtureSampler`` and
+    per-dataset metrics — and ``None`` for a single corpus, which keeps the
+    plain ``DistributedSampler`` path unchanged.
+
+    Every corpus is built from ``video_config.for_source(src)``, so frame
+    geometry is shared and only the per-source fields differ.
+    """
+    sources = video_config.sources()
+    datasets = [
+        build_video_dataset(video_config.for_source(src), tokenizer_path, max_text_len)
+        for src in sources
+    ]
+    if len(datasets) == 1:
+        return datasets[0], None, [sources[0].weight]
+
+    from kempnerforge.data.dataset import MixtureDataset
+
+    mixture = MixtureDataset(datasets, [src.metrics_name for src in sources])
+    return mixture, mixture, [src.weight for src in sources]

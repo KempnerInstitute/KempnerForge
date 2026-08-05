@@ -1,0 +1,194 @@
+# Stage 2: video-QA fine-tuning on top of the WebVid caption-alignment run.
+#
+# Warm-starts from jd_webvid_phase1_avgpool_t96/step_41905 (1 epoch of WebVid,
+# transformer frozen). Here EVERYTHING trains: transformer, vision encoder and
+# adapter.
+#
+# Frame geometry is identical to stage 1 and must stay that way — the
+# checkpoint was trained with 18 frames at 64 pooled tokens each. Only
+# max_text_len moves, 96 -> 128, which the QA prompts need:
+#   18 * 64 = 1152 visual + 128 text = 1280 = max_seq_len exactly.
+#
+# Measured prompt+answer token lengths (Qwen3 tokenizer, 800-1500 samples each):
+#   corpus            median  p95  max   fits in 128
+#   perception_test       45   88  120     100.0%
+#   nextqa_mc             56   67   78     100.0%
+#   nextqa_oe             20   29   35     100.0%
+#   cinepile              61   96  428      98.9%   <- the tail that truncates
+#   molmo2_capqa          59   78  122     100.0%
+# A truncated sample loses its answer and contributes no loss, so ~1% of
+# CinePile is silently dropped; each loader logs its supervised-sample rate at
+# startup, so watch those lines.
+#
+# Mixture weights are sqrt(dataset size), following Molmo2 §4 ("within each
+# category, we sample datasets proportionally to the square root of each
+# dataset size"). Resulting epoch composition and gradient share:
+#   corpus            size      weight  rows    gradient
+#   perception_test     7,392     0.48   4.8%      4.4%
+#   nextqa_mc          34,132     1.03  10.3%      9.4%
+#   nextqa_oe          37,523     1.08  10.8%     18.0%   <- free text, 3.6 sup. tokens
+#   cinepile          130,484     2.01  20.1%     18.3%
+#   molmo2_capqa      950,579     5.41  54.1%     49.8%
+# One epoch = 1,160,110 samples; at global batch 256 that is 4,532 steps.
+
+[model]
+dim = 1024
+n_layers = 28
+n_heads = 16
+n_kv_heads = 8
+head_dim = 128
+vocab_size = 151936
+ffn_hidden_dim = 3072
+norm_type = "rmsnorm"
+norm_eps = 1e-6
+activation = "silu"
+qk_norm = true
+rope_theta = 1000000.0
+tie_embeddings = true
+max_seq_len = 1280
+
+[vision_encoder]
+type = "siglip2"
+path = "google/siglip2-so400m-patch14-224"
+
+[adapter]
+type = "avgpool"
+pool_window = 2            # 16x16 patch grid -> 8x8 = 64 tokens/frame
+
+[vlm]
+arch = "joint_decoder"
+max_text_len = 128
+# Everything trains. This must be written explicitly: the field defaults to
+# [{module = "vision_encoder", frozen = true}], so omitting it would silently
+# keep the encoder frozen.
+freeze = []
+
+# --- Frame geometry: global, shared by every source, unchanged from stage 1 ---
+[video]
+fps = 2.0
+max_frames = 18
+min_frames = 2
+frame_size = 224
+sampling_policy = "uniform"
+qa_format = "mcq_letter"   # single-token answer; matches Molmo2's MCQ target
+
+[[video.datasets]]
+dataset_type = "molmo2_capqa"
+# Overlay: the released annotations live here, with videos/ and youtube/
+# symlinked to the shared corpus (which has the clips but not the parquet).
+data_root = "/n/netscratch/kempner_dev/amazloumi/video-arch/data/Molmo2-VideoCapQA"
+subset = "CapQA"
+weight = 5.41
+
+[[video.datasets]]
+dataset_type = "cinepile"
+data_root = "/n/netscratch/kempner_undergrads/Everyone/cbrownpinilla/CinePile"
+dataset_name = "v2"
+split = "train"
+weight = 2.01
+
+[[video.datasets]]
+dataset_type = "nextqa"
+name = "nextqa_oe"
+data_root = "/n/netscratch/kempner_undergrads/Everyone/cbrownpinilla/NExTQA"
+subset = "OE"
+split = "train"
+weight = 1.08
+
+[[video.datasets]]
+dataset_type = "nextqa"
+name = "nextqa_mc"
+data_root = "/n/netscratch/kempner_undergrads/Everyone/cbrownpinilla/NExTQA"
+subset = "MC"
+split = "train"
+weight = 1.03
+
+[[video.datasets]]
+dataset_type = "perception_test"
+data_root = "/n/netscratch/kempner_undergrads/Everyone/cbrownpinilla/PerceptionTest"
+split = "train"
+weight = 0.48
+
+[data]
+tokenizer_path = "Qwen/Qwen3-0.6B"
+num_workers = 12
+pin_memory = true
+# Mixture sampling temperature: probabilities go as weight^(1/T). Only has an
+# effect once [[video.datasets]] lists more than one corpus, which is why stage 1
+# had no reason to set it. Left at 1.0 (= the field default, i.e. use the weights
+# as written) because the flattening is already baked into the weights: sqrt(size)
+# is itself a temperature-2 transform, and sqrt-weights@T=1 samples identically to
+# raw-size-weights@T=2. Raising T here would compound on top of the sqrt — T=3
+# would give size^(1/6) and drop molmo2_capqa from 54% to 30%.
+mix_temperature = 1.0
+
+[train]
+batch_size = 16
+seq_len = 1280
+max_steps = 4532           # 1 epoch over the 1,160,110-sample mixture at gbs 256
+grad_accum_steps = 1
+grad_clip_norm = 1.0
+seed = 42
+compile_model = false
+# Matches stage 1. Activation checkpointing is applied to the inner transformer
+# only (parallel.py:491) and never reaches the vision encoder — which at
+# batch 16 x 18 frames pushes 288 images through an unfrozen SigLIP2-so400m and
+# dominates activation memory. Stage 1 already ran the encoder unfrozen at this
+# batch size and frame count, so the only new cost here is the 0.6B LLM's
+# activations. If it OOMs, prefer halving batch_size with grad_accum_steps = 2
+# (keeps global batch 256) over enabling AC, which would only checkpoint the
+# smaller half while paying recompute for it.
+activation_checkpointing = "none"
+
+[optimizer]
+name = "adamw"
+lr = 2e-5                  # full SFT: the LLM is no longer frozen (stage 1 ran 8e-5)
+weight_decay = 0.1
+betas = [0.9, 0.95]
+eps = 1e-8
+fused = true
+
+[scheduler]
+name = "cosine"
+warmup_steps = 200
+min_lr_ratio = 0.1
+
+[distributed]
+dp_shard = -1
+
+[checkpoint]
+dir = "/n/netscratch/kempner_dev/amazloumi/video-arch/checkpoints/runs/jd_videoqa_stage2"
+
+# Points at a WEIGHTS-ONLY VIEW of stage 1's step_41905, not the step dir itself.
+# The view is 16 symlinks to the .distcp shards plus .metadata, and deliberately
+# omits train_state.pt.
+#
+#   mkdir -p <parent>/step_41905_weights_only
+#   ln -s <parent>/step_41905/{__*.distcp,.metadata} <parent>/step_41905_weights_only/
+#
+# Why: `exclude_from_loading` gates only the DCP model/optimizer tensors —
+# train_state.pt is read unconditionally (manager.py:508). Loading the step dir
+# directly would restore step=41905 (so a 4,532-step run would exit before its
+# first step), stage 1's cosine scheduler at its terminal LR, its RNG, its
+# WebVid dataloader position, and its wandb_run_id. Dropping train_state.pt
+# makes load() return (0, 0, {}) and everything starts fresh.
+# Omitting metadata.json also skips the freeze-metadata comparison, so no
+# ignore_freeze_mismatch is needed — and in fact it would not be needed anyway:
+# with `freeze = []` the expected list is empty, and the loader intersects
+# saved/expected by module key, leaving nothing to compare.
+load_path = "/n/netscratch/kempner_dev/amazloumi/video-arch/checkpoints/runs/jd_webvid_phase1_avgpool_t96/step_41905_weights_only"
+
+# Stage 1's AdamW state covers only its 450 trainable tensors (448 encoder +
+# 2 adapter); this run trains 761 including the transformer, at a different LR.
+exclude_from_loading = ["optimizer", "dataloader"]
+
+interval = 1000
+keep_last_n = 0            # keep every checkpoint (~5 over the run)
+async_mode = "async"
+
+[metrics]
+log_interval = 20
+enable_wandb = true
+wandb_project = "kf-vlm-qwen3-video"
+wandb_run_name = "qwen3-0.6b-jd-videoqa-stage2"
+enable_tensorboard = true

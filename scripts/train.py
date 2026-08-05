@@ -286,6 +286,7 @@ def main() -> None:
     dataloader = None
     data_iter = None
     mixture_dataset = None  # Set when multi-dataset mixing is active
+    weights: list[float] = []  # Per-source sampling weights when mixing
 
     # Resolve EOS token ID for sequence packing (needed by MemoryMappedDataset)
     eos_token_id = None
@@ -307,18 +308,24 @@ def main() -> None:
                 raise ValueError("Video training requires data.tokenizer_path")
             from transformers import AutoTokenizer
 
-            from kempnerforge.data.video_dataset import VideoCollator, build_video_dataset
+            from kempnerforge.data.video_dataset import VideoCollator, build_video_data
 
             vcfg = config.video
-            # Dataset style is registry-selected via [video].dataset_type; the
-            # builder reads the rest of the knobs off vcfg.
-            dataset = build_video_dataset(vcfg, config.data.tokenizer_path, vlm_cfg.max_text_len)
+            # Corpora are registry-selected via [video].dataset_type (one) or
+            # [[video.datasets]] (a weighted mixture); the builders read the rest
+            # of the knobs off vcfg, and frame geometry is shared by all of them.
+            dataset, mixture_dataset, weights = build_video_data(
+                vcfg, config.data.tokenizer_path, vlm_cfg.max_text_len
+            )
             _tok = AutoTokenizer.from_pretrained(config.data.tokenizer_path)
             _pad_id = _tok.pad_token_id
             if _pad_id is None:
                 _pad_id = _tok.eos_token_id if _tok.eos_token_id is not None else 0
             collator = VideoCollator(pad_id=int(_pad_id), max_text_len=vlm_cfg.max_text_len)
-            logger.info(f"Video dataset: {len(dataset):,} clips from {vcfg.data_root}")
+            logger.info(
+                f"Video dataset: {len(dataset):,} clips from "
+                f"{', '.join(s.metrics_name for s in vcfg.sources())}"
+            )
         else:
             # --- Image VLM (Joint-Decoder) data path ---
             # Mixing VLM + text-only datasets in one run is out of scope on this
@@ -353,9 +360,29 @@ def main() -> None:
                 _pad_id = _tok.eos_token_id if _tok.eos_token_id is not None else 0
             collator = VLMCollator(pad_id=int(_pad_id), max_text_len=vlm_cfg.max_text_len)
             logger.info(f"VLM dataset: {len(dataset):,} samples from {config.data.hf_dataset_name}")
-        sampler = DistributedSampler(
-            dataset, num_replicas=dp_size, rank=dp_rank, shuffle=True, seed=tc.effective_data_seed
-        )
+        if mixture_dataset is not None:
+            # Video mixture: weighted sampling over the concatenated corpora,
+            # reusing the text path's sampler so weights, temperature and
+            # per-dataset metrics behave identically.
+            from kempnerforge.data.sampler import MixtureSampler
+
+            sampler = MixtureSampler(
+                cumulative_sizes=mixture_dataset.cumulative_sizes,
+                weights=weights,
+                num_replicas=dp_size,
+                rank=dp_rank,
+                shuffle=True,
+                seed=tc.effective_data_seed,
+                temperature=config.data.mix_temperature,
+            )
+        else:
+            sampler = DistributedSampler(
+                dataset,
+                num_replicas=dp_size,
+                rank=dp_rank,
+                shuffle=True,
+                seed=tc.effective_data_seed,
+            )
         dataloader = StatefulDataLoader(
             dataset,
             batch_size=tc.batch_size,
@@ -756,6 +783,9 @@ def main() -> None:
             # --- VLM training step (no PP, VLM Joint-Decoder) ---
             total_loss = 0.0
             total_text_tokens = 0
+            ds_token_counts: dict[str, int] = {}
+            ds_loss_sums: dict[str, float] = {}
+            ds_loss_counts: dict[str, int] = {}
 
             for micro_step in range(tc.grad_accum_steps):
                 if dataloader is None:
@@ -788,6 +818,27 @@ def main() -> None:
                     loss = loss_fn(logits, labels_out)
 
                     total_text_tokens += int((labels_out != -100).sum().item())
+
+                    # Per-corpus metrics for a video mixture (before backward,
+                    # while logits are fresh). Counts supervised tokens rather
+                    # than seq_len: a video sample's text is mostly masked.
+                    if mixture_dataset is not None and "dataset_idx" in batch:
+                        ds_idx = batch["dataset_idx"].to(device)
+                        with torch.no_grad():
+                            for i, name in enumerate(mixture_dataset.dataset_names):
+                                mask = ds_idx == i
+                                sel_labels = labels_out[mask]
+                                n_supervised = int((sel_labels != -100).sum().item())
+                                if n_supervised == 0:
+                                    continue
+                                ds_token_counts[name] = ds_token_counts.get(name, 0) + n_supervised
+                                ds_l = torch.nn.functional.cross_entropy(
+                                    logits[mask].reshape(-1, logits.size(-1)),
+                                    sel_labels.reshape(-1),
+                                    ignore_index=-100,
+                                ).item()
+                                ds_loss_sums[name] = ds_loss_sums.get(name, 0) + ds_l
+                                ds_loss_counts[name] = ds_loss_counts.get(name, 0) + 1
 
                     # MoE auxiliary loss (no-op for dense: returns 0.0)
                     if mc.is_moe:
