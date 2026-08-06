@@ -102,13 +102,10 @@ def decode_video_frames(
 
     Reading seeks to the keyframe at or before each target and decodes forward
     (``_decode_seek``), so cost scales with frames kept rather than clip
-    length. Whenever a seek cannot guarantee the same selection — a stream
-    without ``time_base``, frames without PTS, a seek landing past its target,
-    or any FFmpeg error during the attempt — the clip is reopened and decoded
-    in a single serial pass (``_decode_serial``); selection is identical on
-    either path, so seeking only ever changes speed. A clip that is corrupt
-    mid-file consequently raises from the serial retry rather than the first
-    attempt (the same error class surfaces).
+    length. If a seek cannot guarantee the same selection (see
+    ``_decode_seek``), the clip is reopened and decoded in a single serial
+    pass (``_decode_serial``) with identical selection, so seeking only ever
+    changes speed.
 
     Raises whatever ``av`` raises on a missing/corrupt file; callers that train
     over noisy data should catch and substitute an empty clip.
@@ -148,10 +145,9 @@ def _decode_seek(container: Any, stream: Any, targets: list[float]) -> list[PILI
     several targets), and targets past the last frame tail-fill with that
     frame. Raises ``_SeekUnreliableError`` whenever identical selection cannot
     be guaranteed: no ``time_base``, a frame without PTS, a seek landing past
-    its target (fuzzy-seeking container — frames may have been skipped;
-    targets near 0.0 are exempt because the landing is then the stream's first
-    frame, which is exactly what the serial pass matches), or EOF with nothing
-    decoded after a seek (the serial path defines degenerate-file behavior).
+    its target (frames may have been skipped; exempt for targets near 0.0,
+    where the landing is the stream's first frame — what serial selects too),
+    or EOF with nothing decoded after a seek.
     """
     tb = stream.time_base
     if tb is None:

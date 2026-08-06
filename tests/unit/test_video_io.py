@@ -153,11 +153,10 @@ def _write_h264_mp4(
 ) -> None:
     """Encode an H.264 clip with B-frames (and optionally open GOPs).
 
-    The real datasets (WebVid/MLVU/Molmo2) are H.264, whose presentation
-    reordering (pts != dts) and — with ``open_gop`` — cross-GOP leading
-    B-frames the mpeg4 fixture cannot produce, so this is the codec shape the
-    seek/serial parity claim must hold on. ``b-adapt=0`` forces a fixed
-    B-frame pattern and a moving stripe gives the encoder real motion.
+    Produces the codec features the mpeg4 fixture cannot: presentation
+    reordering (pts != dts) and, with ``open_gop``, leading B-frames that
+    reference across GOP boundaries. ``b-adapt=0`` forces a fixed B-frame
+    pattern and a moving stripe gives the encoder real motion.
     """
     import av
     import numpy as np
@@ -316,19 +315,16 @@ class TestSeekMatchesSerial:
     not _H264_AVAILABLE, reason="requires a PyAV build with the libx264 encoder"
 )
 class TestSeekMatchesSerialH264:
-    """Parity on the real datasets' codec shape: H.264 with B-frames.
+    """Parity on the codec shape of real data: H.264 with B-frames.
 
-    The mpeg4 fixtures above are closed-GOP with no B-frames, so they never
-    exercise presentation reordering — but WebVid/MLVU/Molmo2 clips are H.264,
-    where it always occurs. ``open_gop`` additionally produces leading
-    B-frames that reference across the GOP boundary and are dropped when a
-    mid-stream seek decodes from the boundary keyframe.
+    The mpeg4 fixtures above never exercise presentation reordering; real
+    clips (e.g. WebVid) are H.264, where it always occurs. ``open_gop`` adds
+    leading B-frames that are dropped after a mid-stream seek.
     """
 
     def _assert_parity_seek_ran(self, path, *, fps, min_frames, max_frames, monkeypatch):
-        # Same parity assertion as TestSeekMatchesSerial, plus a spy proving
-        # the seek path actually ran: a silent serial fallback would make
-        # parity trivially true and hide a seek path broken on H.264.
+        # Parity as in TestSeekMatchesSerial, plus a spy proving the seek path
+        # actually ran: a silent serial fallback would make parity trivially true.
         import kempnerforge.data.video_io as video_io
 
         expected = _serial_reference(path, fps, min_frames, max_frames)
@@ -424,7 +420,7 @@ class TestSeekFrameIdentity:
         expected = [0, 7 * 17, 14 * 17, (19 * 17) % 256]
         means = [float(np.asarray(f.convert("L")).mean()) for f in frames]
         for got, want in zip(means, expected, strict=True):
-            assert abs(got - want) <= 4.0  # mpeg4 roundtrip error, measured 2.0
+            assert abs(got - want) <= 4.0  # mpeg4 encode/decode roundtrip tolerance
 
 
 @pytest.mark.skipif(not _AV_AVAILABLE, reason="requires the 'av' package")
