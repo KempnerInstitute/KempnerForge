@@ -18,6 +18,18 @@ _WEBVID_CLIP = (
 _AV_AVAILABLE = importlib.util.find_spec("av") is not None
 
 
+def _libx264_available() -> bool:
+    """Whether this PyAV build bundles the libx264 encoder (H.264 fixtures)."""
+    if not _AV_AVAILABLE:
+        return False
+    import av
+
+    return "libx264" in av.codecs_available
+
+
+_H264_AVAILABLE = _libx264_available()
+
+
 # ---------------------------------------------------------------------------
 # sample_timestamps (pure policy, no decoder)
 # ---------------------------------------------------------------------------
@@ -129,6 +141,39 @@ def _write_mp4(
             stream.codec_context.options = {"sc_threshold": "1000000000"}
         for i in range(n_frames):
             arr = np.full((size, size, 3), (i * 17) % 256, dtype=np.uint8)
+            frame = av.VideoFrame.from_ndarray(arr, format="rgb24")
+            for packet in stream.encode(frame):
+                container.mux(packet)
+        for packet in stream.encode():  # flush
+            container.mux(packet)
+
+
+def _write_h264_mp4(
+    path, n_frames: int, size: int = 64, fps: int = 10, gop_size: int = 12, open_gop: bool = False
+) -> None:
+    """Encode an H.264 clip with B-frames (and optionally open GOPs).
+
+    The real datasets (WebVid/MLVU/Molmo2) are H.264, whose presentation
+    reordering (pts != dts) and — with ``open_gop`` — cross-GOP leading
+    B-frames the mpeg4 fixture cannot produce, so this is the codec shape the
+    seek/serial parity claim must hold on. ``b-adapt=0`` forces a fixed
+    B-frame pattern and a moving stripe gives the encoder real motion.
+    """
+    import av
+    import numpy as np
+
+    params = f"keyint={gop_size}:min-keyint={gop_size}:scenecut=0:bframes=2:b-adapt=0"
+    if open_gop:
+        params += ":open-gop=1"
+    with av.open(str(path), mode="w") as container:
+        stream = container.add_stream("libx264", rate=fps)
+        stream.width = size
+        stream.height = size
+        stream.pix_fmt = "yuv420p"
+        stream.codec_context.options = {"x264-params": params}
+        for i in range(n_frames):
+            arr = np.full((size, size, 3), (i * 7) % 200, dtype=np.uint8)
+            arr[:, (i * 5) % size] = 255  # moving stripe: motion for B-frames
             frame = av.VideoFrame.from_ndarray(arr, format="rgb24")
             for packet in stream.encode(frame):
                 container.mux(packet)
@@ -265,6 +310,100 @@ class TestSeekMatchesSerial:
         _write_mp4(src, n_frames=20, gop_size=5)
         _write_shifted_mp4(src, dst, offset_s=5.0)
         self._assert_parity(dst, fps=2.0, min_frames=4, max_frames=8)
+
+
+@pytest.mark.skipif(
+    not _H264_AVAILABLE, reason="requires a PyAV build with the libx264 encoder"
+)
+class TestSeekMatchesSerialH264:
+    """Parity on the real datasets' codec shape: H.264 with B-frames.
+
+    The mpeg4 fixtures above are closed-GOP with no B-frames, so they never
+    exercise presentation reordering — but WebVid/MLVU/Molmo2 clips are H.264,
+    where it always occurs. ``open_gop`` additionally produces leading
+    B-frames that reference across the GOP boundary and are dropped when a
+    mid-stream seek decodes from the boundary keyframe.
+    """
+
+    def _assert_parity_seek_ran(self, path, *, fps, min_frames, max_frames, monkeypatch):
+        # Same parity assertion as TestSeekMatchesSerial, plus a spy proving
+        # the seek path actually ran: a silent serial fallback would make
+        # parity trivially true and hide a seek path broken on H.264.
+        import kempnerforge.data.video_io as video_io
+
+        expected = _serial_reference(path, fps, min_frames, max_frames)
+        fell_back = []
+        original = video_io._decode_serial
+
+        def _spy(*args, **kwargs):
+            fell_back.append(True)
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(video_io, "_decode_serial", _spy)
+        got = video_io.decode_video_frames(
+            str(path), fps=fps, min_frames=min_frames, max_frames=max_frames
+        )
+        assert not fell_back, "seek path unexpectedly fell back to serial decode"
+        assert len(got) == len(expected)
+        assert [f.tobytes() for f in got] == [f.tobytes() for f in expected]
+
+    def test_fixture_has_b_frames_and_reordering(self, tmp_path):
+        import av
+        from av.video.frame import PictureType
+
+        path = tmp_path / "h264.mp4"
+        _write_h264_mp4(path, n_frames=60, open_gop=True)
+        with av.open(str(path)) as container:
+            stream = container.streams.video[0]
+            packets = [p for p in container.demux(stream) if p.pts is not None]
+        # B-frames are stored out of presentation order: dts != pts somewhere.
+        assert any(p.dts is not None and p.dts != p.pts for p in packets)
+        with av.open(str(path)) as container:
+            types = {
+                PictureType(int(f.pict_type)).name
+                for f in container.decode(container.streams.video[0])
+            }
+        assert "B" in types
+
+    @pytest.mark.parametrize("open_gop", [False, True])
+    def test_sparse_targets_long_clip(self, tmp_path, monkeypatch, open_gop):
+        path = tmp_path / "clip.mp4"
+        _write_h264_mp4(path, n_frames=200, open_gop=open_gop)  # 20s, 1.2s GOPs
+        self._assert_parity_seek_ran(
+            path, fps=2.0, min_frames=1, max_frames=4, monkeypatch=monkeypatch
+        )
+
+    @pytest.mark.parametrize("open_gop", [False, True])
+    def test_dense_targets_min_eq_max(self, tmp_path, monkeypatch, open_gop):
+        path = tmp_path / "clip.mp4"
+        _write_h264_mp4(path, n_frames=60, open_gop=open_gop)  # 6s
+        self._assert_parity_seek_ran(
+            path, fps=8.0, min_frames=16, max_frames=16, monkeypatch=monkeypatch
+        )
+
+    @pytest.mark.parametrize("open_gop", [False, True])
+    def test_explicit_targets_straddle_gop_boundaries(self, tmp_path, open_gop):
+        # Targets just after each keyframe time (keyint=12 @ 10fps -> 1.2s
+        # GOPs), where open-GOP leading B-frames sit; drives _decode_seek
+        # directly so a serial fallback cannot mask a divergence.
+        import av
+
+        from kempnerforge.data.video_io import _decode_seek, _decode_serial
+
+        path = tmp_path / "clip.mp4"
+        _write_h264_mp4(path, n_frames=120, open_gop=open_gop)
+        targets = [0.05, 2.45, 4.85, 7.25, 9.65, 11.9]
+
+        def _run(fn):
+            with av.open(str(path)) as container:
+                stream = container.streams.video[0]
+                stream.thread_type = "AUTO"
+                return fn(container, stream, list(targets))
+
+        got = _run(_decode_seek)
+        expected = _run(_decode_serial)
+        assert len(got) == len(expected)
+        assert [f.tobytes() for f in got] == [f.tobytes() for f in expected]
 
 
 @pytest.mark.skipif(not _AV_AVAILABLE, reason="requires the 'av' package")
