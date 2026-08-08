@@ -197,26 +197,48 @@ mdp3_segment_size = 32   # temporal segment length for sequentiality; 0 = plain 
   Q-Frame QFS, a Gumbel-Max top-k over `softmax(sim/τ)` (stochastic, seeded per
   sample); `mdp3` = Markov-DPP list-wise selection balancing query relevance,
   list-wise diversity, and temporal sequentiality.
-- **Query.** Selection always conditions on the sample's question/instruction
-  prompt — the text the model is given at inference — never on its target
-  (caption/answer), which is not available at test time. A captioning corpus,
-  whose prompt is a static instruction or empty, therefore has no meaningful
-  per-sample query: with an empty prompt the selector logs a one-time warning and
-  falls back to uniform sampling. This is deliberate — the expectation is that
-  query-aware selection helps VQA but not captioning, which the eval can falsify.
-- **Dataset-agnostic.** Selection is a `VideoDataset` base-class capability, so a
-  new dataset style adopts it in three lines: take `frame_selector_config` in its
-  builder, call `self._init_frame_selector(...)`, and decode via
-  `self._decode_clip(path, query, ...)`. A dataset without a decodable file path
-  can call `self._frame_selector.select(frames, times, query, k, seed_key=...)`
-  directly.
-- **Scorer prefetch + cost.** The scorer weights load lazily on first use, once
-  per worker; prefetch them on a networked node (set `HF_HOME` to the shared
-  cache) so offline compute nodes don't fail mid-run. The default scorer
-  (`so400m` at 128 candidates) is **eval-grade** — dataloader workers run at one
-  intra-op thread, so for CPU-worker *training* use a base-scale scorer and a
-  modest `candidate_frames` (as above); real-scale training belongs in an offline
-  precompute step (future work).
+- **Query.** Selection conditions on the *bare question* when the corpus
+  provides one (QA datasets thread it via `VideoRecord.query`) — that is where
+  the frame-relevance signal lives, and it fits the scorer's ~64-token text
+  context in one forward instead of being chunk+mean-pooled with options and
+  boilerplate. Corpora without a bare question fall back to the rendered
+  prompt; never the target (caption/answer), which is not available at test
+  time. A captioning corpus, whose prompt is a static instruction or empty,
+  therefore has no meaningful per-sample query: with an empty (or
+  whitespace-only) prompt the selector logs a one-time warning and falls back
+  to uniform sampling. This is deliberate — the expectation is that
+  query-aware selection helps VQA but not captioning, which the eval can
+  falsify. (At eval, lmms-eval hands the adapter pre-rendered text, so the
+  scoring query there is the benchmark's own question rendering.)
+- **GPU scoring, worker decode.** Dataloader workers only decode the candidate
+  pool and ship it raw (uint8) with the query text; the scorer runs on the
+  training GPU in the main process, which scores and selects each micro-batch
+  (`frame_selection.apply_frame_selection`) before the forward. This is the same
+  scoring mechanism the eval harness uses (device-placed scorer, bf16): both
+  call sites share the same selector construction, the same scorer-derived
+  preprocessing (normalization and resize follow the scorer's own processor
+  config, not the model-path `image_mean`/`image_std`), and the same pixel
+  path (the eval adapter scores frames resized/quantized exactly like the
+  dataloader workers, via `select_video_frames(..., frame_size=...)`), so for
+  the same clip, query, and seed the selection is bit-identical. Note that
+  bf16 scoring can flip near-tie top-k/DPP picks relative to fp32 — a
+  deliberate speed trade. Samples with an *empty query* (e.g. captioning with
+  no prompt) take a worker-side fast path: the worker pre-applies the
+  selector's uniform-stride fallback and ships only `max_frames` frames, so
+  unscoreable pools never cross worker IPC or touch the GPU. A per-sample
+  scoring failure degrades that sample to skip-with-mask (warning logged)
+  rather than aborting the run; only a scorer that never loaded
+  (`ScorerUnavailableError`) fails loudly. The stage's wall time is logged per
+  step as `video/frame_selection_s` — it sits on the step critical path, so
+  watch it against step time; `candidate_frames` scales its cost linearly.
+- **Dataset-agnostic.** Pool mode is a `VideoDataset` base-class capability, so
+  a new dataset style adopts it by taking `candidate_spec` in its builder and
+  calling `self._init_candidate_spec(...)`; `VideoQADataset.__getitem__` is the
+  reference implementation of the pool-mode sample contract.
+- **Scorer prefetch.** The training loop loads the scorer eagerly at startup
+  (one copy per rank, on device); prefetch the weights on a networked node (set
+  `HF_HOME` to the shared cache) so offline compute nodes fail fast rather than
+  mid-run.
 - **Default deviation.** The default `scorer_path` is SigLIP2-so400m @ 224 (stack
   consistency, cheaper scoring); the mDP3 paper used SigLIP(v1)-so400m @ 384 — one
   `scorer_path` away.

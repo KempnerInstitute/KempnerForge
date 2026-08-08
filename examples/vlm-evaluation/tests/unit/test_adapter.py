@@ -272,12 +272,16 @@ class TestRenderRequestVideo:
     def test_selector_reduces_candidate_frames(self, monkeypatch, vcfg):
         # With a frame selector, _render_request routes through select_video_frames
         # (candidate decode + query-aware subset), passing the prompt as query and
-        # the path as seed_key.
+        # "path|query" as seed_key, matching training's seed derivation.
         captured: dict = {}
 
-        def _select(path, query, selector, k, *, sampling_policy="uniform", seed_key=None):
+        def _select(
+            path, query, selector, k, *, sampling_policy="uniform", seed_key=None,
+            frame_size=None,
+        ):
             captured.update(
-                path=path, query=query, k=k, seed_key=seed_key, policy=sampling_policy
+                path=path, query=query, k=k, seed_key=seed_key, policy=sampling_policy,
+                frame_size=frame_size,
             )
             return [_img(), _img()], [0.0, 3.0]  # 2 selected of a larger pool
 
@@ -290,8 +294,11 @@ class TestRenderRequestVideo:
         assert times == [0.0, 3.0]
         assert captured["query"] == "what is happening?"
         assert captured["k"] == vcfg.max_frames
-        assert captured["seed_key"] == "clip.mp4"
+        assert captured["seed_key"] == "clip.mp4|what is happening?"
         assert captured["policy"] == vcfg.sampling_policy
+        # Training-parity scoring: frames are scored at the training frame_size
+        # (uint8 + scorer-derived preprocessing), not native resolution.
+        assert captured["frame_size"] == vcfg.frame_size
 
 
 # ---------------------------------------------------------------------------
@@ -914,9 +921,14 @@ class TestInitGuards:
         from kempnerforge.config.frame_selector import FrameSelectorConfig
 
         built: list[bool] = []
+
+        class _StubSelector:
+            def ensure_loaded(self):
+                pass
+
         monkeypatch.setattr(
             "adapter.build_frame_selector",
-            lambda cfg, device=None, dtype=None: built.append(True) or object(),
+            lambda cfg, device=None, dtype=None: built.append(True) or _StubSelector(),
         )
 
         # Image job with a [frame_selector]: is_video False -> selector NOT built.

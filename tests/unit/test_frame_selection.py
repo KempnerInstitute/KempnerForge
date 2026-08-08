@@ -12,7 +12,6 @@ exact) and behaviorally for more segments.
 from __future__ import annotations
 
 import math
-import pickle
 import sys
 import types
 
@@ -23,10 +22,12 @@ import torch.nn.functional as F
 from kempnerforge.config.registry import registry
 from kempnerforge.data import frame_selection as fsmod
 from kempnerforge.data.frame_selection import (
+    CandidatePoolSpec,
     FrameQueryScorer,
     FrameSelector,
     MDP3Selector,
     QFrameSelector,
+    ScorerPreprocess,
     ScorerUnavailableError,
     TopKSelector,
     _dedupe_by_time,
@@ -34,8 +35,12 @@ from kempnerforge.data.frame_selection import (
     _dpp_greedy,
     _mdp3_segment_dp,
     _pooled_features,
+    apply_frame_selection,
     build_frame_selector,
+    decode_candidate_pool,
+    make_seed_key,
     select_video_frames,
+    uniform_stride_indices,
 )
 from kempnerforge.data.video_io import sample_timestamps
 
@@ -47,11 +52,27 @@ class FakeScorer:
         self._frame_emb = frame_emb.float()
         self._query_emb = query_emb.float()
         self.embed_frames_calls = 0
+        self.embed_frame_tensors_calls = 0
+        self.embed_uint8_frames_calls = 0
         self.embed_query_calls = 0
+
+    def ensure_loaded(self):
+        pass
 
     def embed_frames(self, frames):  # noqa: ANN001
         self.embed_frames_calls += 1
         return F.normalize(self._frame_emb[: len(frames)], dim=-1)
+
+    def embed_frame_tensors(self, pixel_values):  # noqa: ANN001
+        self.embed_frame_tensors_calls += 1
+        return F.normalize(self._frame_emb[: pixel_values.shape[0]], dim=-1)
+
+    def preprocess_frame_tensors(self, frames_u8):  # noqa: ANN001
+        return frames_u8.to(torch.float32)  # identity-ish: no resize, no stats
+
+    def embed_uint8_frames(self, frames_u8):  # noqa: ANN001
+        self.embed_uint8_frames_calls += 1
+        return F.normalize(self._frame_emb[: frames_u8.shape[0]], dim=-1)
 
     def embed_query(self, query):  # noqa: ANN001
         self.embed_query_calls += 1
@@ -119,6 +140,27 @@ class TestFrameSelectorFallbacks:
         scorer = FakeScorer(torch.eye(6), torch.tensor([6.0, 5, 4, 3, 2, 1]))
         idx = TopKSelector(scorer).select(_dummy_frames(6), list(range(6)), "q", 3)
         assert idx == sorted(idx)
+
+
+class TestUniformStrideIndices:
+    def test_values(self):
+        assert uniform_stride_indices(6, 4) == [0, 1, 3, 4]
+        assert uniform_stride_indices(8, 4) == [0, 2, 4, 6]
+
+    def test_fallback_consistency(self):
+        # The empty-query fallback must produce exactly the shared stride, so
+        # worker-side pre-striding and the main-process fallback agree.
+        sel = TopKSelector(FakeScorer(torch.eye(8), torch.ones(8)))
+        assert sel._fallback_indices(8, None, 4) == uniform_stride_indices(8, 4)
+        assert sel._fallback_indices(6, "", 4) == uniform_stride_indices(6, 4)
+
+    def test_take_all_checked_before_stride(self):
+        # Workers pre-apply the stride and ship <= k frames with an EMPTY query;
+        # the downstream fallback must take-all (n <= k) before considering the
+        # empty-query stride, or pre-strided pools would be re-strided.
+        sel = TopKSelector(FakeScorer(torch.eye(8), torch.ones(8)))
+        assert sel._fallback_indices(4, None, 4) == [0, 1, 2, 3]
+        assert sel._fallback_indices(3, "", 4) == [0, 1, 2]
 
 
 # --------------------------------------------------------------------------- #
@@ -569,6 +611,158 @@ class TestPooledFeatures:
             _pooled_features(object())
 
 
+def _stub_scorer(
+    image_size: int,
+    mean: tuple[float, ...],
+    std: tuple[float, ...],
+    model: object | None = None,
+    processor: object | None = None,
+) -> FrameQueryScorer:
+    """A FrameQueryScorer 'loaded' with stubs: no HF, no network."""
+    scorer = FrameQueryScorer("siglip2", "fake/path")
+    scorer._model = model if model is not None else object()
+    scorer._processor = processor if processor is not None else object()
+    scorer._text_max_len = 64
+    scorer.preprocess = ScorerPreprocess(image_size=image_size, image_mean=mean, image_std=std)
+    return scorer
+
+
+class TestPreprocessFrameTensors:
+    def setup_method(self):
+        import logging
+
+        self._kf_logger = logging.getLogger("kempnerforge")
+        self._old_propagate = self._kf_logger.propagate
+        self._kf_logger.propagate = True
+
+    def teardown_method(self):
+        self._kf_logger.propagate = self._old_propagate
+
+    def test_default_config_matches_normalize_frames_exactly(self):
+        from kempnerforge.data.vlm_dataset import (
+            DEFAULT_IMAGE_MEAN,
+            DEFAULT_IMAGE_STD,
+            normalize_frames,
+        )
+
+        # Matching geometry + default stats: bit-identical to the dataset
+        # normalization (the verified default SigLIP2@224 / frame_size=224 path).
+        scorer = _stub_scorer(8, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD)
+        g = torch.Generator().manual_seed(0)
+        u8 = torch.randint(0, 256, (5, 3, 8, 8), generator=g, dtype=torch.uint8)
+        out = scorer.preprocess_frame_tensors(u8)
+        assert torch.equal(out, normalize_frames(u8, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD))
+        assert not scorer._warned_resize  # no resize on the matched path
+
+    def test_mismatched_size_interpolates_and_applies_stats(self, caplog):
+        # CLIP-like stats + a scorer resolution different from the input.
+        mean = (0.48145466, 0.4578275, 0.40821073)
+        std = (0.26862954, 0.26130258, 0.27577711)
+        scorer = _stub_scorer(16, mean, std)
+        g = torch.Generator().manual_seed(1)
+        u8 = torch.randint(0, 256, (4, 3, 8, 8), generator=g, dtype=torch.uint8)
+        with caplog.at_level("WARNING"):
+            out = scorer.preprocess_frame_tensors(u8)
+            scorer.preprocess_frame_tensors(u8)  # warn-once
+        assert out.shape == (4, 3, 16, 16)
+        x = F.interpolate(u8.float() / 255.0, size=(16, 16), mode="bicubic", antialias=True)
+        mean_t = torch.tensor(mean).view(3, 1, 1)
+        std_t = torch.tensor(std).view(3, 1, 1)
+        assert torch.equal(out, (x - mean_t) / std_t)
+        assert sum("resize" in r.message.lower() for r in caplog.records) == 1
+
+    def test_missing_record_raises(self):
+        scorer = FrameQueryScorer("siglip2", "fake/path")
+        scorer._model = object()  # "loaded" but without a preprocess record
+        with pytest.raises(RuntimeError, match="preprocessing record"):
+            scorer.preprocess_frame_tensors(torch.zeros(1, 3, 8, 8, dtype=torch.uint8))
+
+
+class TestValidateFrameGeometry:
+    def setup_method(self):
+        import logging
+
+        self._kf_logger = logging.getLogger("kempnerforge")
+        self._old_propagate = self._kf_logger.propagate
+        self._kf_logger.propagate = True
+
+    def teardown_method(self):
+        self._kf_logger.propagate = self._old_propagate
+
+    def test_match_logs_info(self, caplog):
+        sel = TopKSelector(_stub_scorer(224, (0.5,) * 3, (0.5,) * 3))
+        with caplog.at_level("INFO"):
+            sel.validate_frame_geometry(224)
+        assert any(r.levelname == "INFO" and "matches" in r.message for r in caplog.records)
+        assert not any(r.levelname == "WARNING" for r in caplog.records)
+
+    def test_mismatch_warns_never_raises(self, caplog):
+        sel = TopKSelector(_stub_scorer(224, (0.5,) * 3, (0.5,) * 3))
+        with caplog.at_level("WARNING"):
+            sel.validate_frame_geometry(336)  # must not raise
+        assert any(r.levelname == "WARNING" and "resize" in r.message for r in caplog.records)
+
+    def test_requires_ensure_loaded(self):
+        sel = TopKSelector(FrameQueryScorer("siglip2", "fake/path"))
+        with pytest.raises(RuntimeError, match="ensure_loaded"):
+            sel.validate_frame_geometry(224)
+
+
+class _FakeImageModel:
+    """get_image_features as a deterministic per-frame function of the pixels."""
+
+    def get_image_features(self, pixel_values=None):  # noqa: ANN001
+        return pixel_values.float().mean(dim=(2, 3))  # (b, 3)
+
+
+class _FakeImageProcessor:
+    """Stacks tensor 'images' into a pixel_values batch (no resize/normalize)."""
+
+    def __call__(self, images=None, return_tensors=None):  # noqa: ANN001
+        return {"pixel_values": torch.stack(list(images))}
+
+
+class TestEmbedChunkParity:
+    """embed_frames / embed_frame_tensors / embed_uint8_frames all route through
+    the one chunk helper and agree on identical inputs (guards the refactor)."""
+
+    def _scorer(self) -> FrameQueryScorer:
+        return _stub_scorer(
+            4,
+            (0.5, 0.5, 0.5),
+            (0.5, 0.5, 0.5),
+            model=_FakeImageModel(),
+            processor=_FakeImageProcessor(),
+        )
+
+    def test_frames_vs_frame_tensors(self):
+        # > 2x _EMBED_BATCH frames so the chunk loop runs multiple times.
+        n = 2 * fsmod._EMBED_BATCH + 5
+        g = torch.Generator().manual_seed(2)
+        frames = [torch.rand(3, 4, 4, generator=g) for _ in range(n)]
+        scorer = self._scorer()
+        via_pil_path = scorer.embed_frames(frames)
+        via_tensor_path = scorer.embed_frame_tensors(torch.stack(frames))
+        assert via_pil_path.shape == (n, 3)
+        assert torch.equal(via_pil_path, via_tensor_path)
+
+    def test_uint8_path_equals_preprocess_then_tensor_path(self):
+        g = torch.Generator().manual_seed(3)
+        u8 = torch.randint(0, 256, (10, 3, 4, 4), generator=g, dtype=torch.uint8)
+        scorer = self._scorer()
+        assert torch.equal(
+            scorer.embed_uint8_frames(u8),
+            scorer.embed_frame_tensors(scorer.preprocess_frame_tensors(u8)),
+        )
+
+    def test_output_is_normalized_float32_cpu(self):
+        scorer = self._scorer()
+        out = scorer.embed_frame_tensors(torch.rand(3, 3, 4, 4))
+        assert out.dtype == torch.float32
+        assert out.device.type == "cpu"
+        assert torch.allclose(out.norm(dim=-1), torch.ones(3), atol=1e-6)
+
+
 class TestScorerLifecycle:
     def test_load_failure_raises_scorer_unavailable(self, monkeypatch):
         fake_transformers = types.ModuleType("transformers")
@@ -588,7 +782,22 @@ class TestScorerLifecycle:
         monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
         scorer = FrameQueryScorer("siglip2", "fake/path")
         with pytest.raises(ScorerUnavailableError, match="HF_HOME"):
-            scorer._load()
+            scorer.ensure_loaded()
+
+    def test_ensure_loaded_is_idempotent(self):
+        scorer = FrameQueryScorer("clip", "fake/path")
+        scorer._model = object()  # simulate a loaded model
+        scorer.ensure_loaded()  # must not attempt a reload (no transformers import)
+
+    def test_selector_ensure_loaded_delegates_to_scorer(self):
+        calls = []
+
+        class _Scorer(FakeScorer):
+            def ensure_loaded(self):
+                calls.append(True)
+
+        TopKSelector(_Scorer(torch.eye(2), torch.ones(2))).ensure_loaded()
+        assert calls == [True]
 
     def test_rejects_bad_scorer_type(self):
         with pytest.raises(ValueError, match="Unknown scorer"):
@@ -597,17 +806,6 @@ class TestScorerLifecycle:
     def test_rejects_empty_path(self):
         with pytest.raises(ValueError, match="non-empty"):
             FrameQueryScorer("siglip2", "")
-
-    def test_pickle_drops_loaded_weights(self):
-        scorer = FrameQueryScorer("clip", "fake/path")
-        scorer._model = object()  # simulate a loaded model
-        scorer._processor = object()
-        scorer._text_max_len = 77
-        restored = pickle.loads(pickle.dumps(scorer))
-        assert restored._model is None
-        assert restored._processor is None
-        assert restored._scorer == "clip"
-        assert restored._path == "fake/path"
 
 
 # --------------------------------------------------------------------------- #
@@ -782,3 +980,370 @@ class TestCandidateCountMath:
 
     def test_nonpositive_duration_single_timestamp(self):
         assert sample_timestamps(0.0, 1.0, 16, 16) == [0.0]
+
+
+# --------------------------------------------------------------------------- #
+# Tensor-path selection (select_tensor_frames) + the main-process batch stage
+# --------------------------------------------------------------------------- #
+
+
+class TestSelectTensorFrames:
+    """The tensor entry point must select exactly like the PIL entry point."""
+
+    def _planted(self):
+        # Distinct rows; query favors high indices so topk has a unique answer.
+        return torch.eye(6), torch.tensor([1.0, 2, 3, 4, 5, 6])
+
+    def test_parity_with_pil_select(self):
+        frame_emb, query_emb = self._planted()
+        times = [float(i) for i in range(6)]
+        pil_idx = TopKSelector(FakeScorer(frame_emb, query_emb)).select(
+            list(range(6)), times, "q", 3, seed_key="k"
+        )
+        tensor_idx = TopKSelector(FakeScorer(frame_emb, query_emb)).select_tensor_frames(
+            torch.zeros(6, 3, 4, 4), times, "q", 3, seed_key="k"
+        )
+        assert tensor_idx == pil_idx == [3, 4, 5]
+
+    def test_qframe_seed_parity_across_paths(self):
+        frame_emb, query_emb = self._planted()
+        times = [float(i) for i in range(6)]
+        a = QFrameSelector(FakeScorer(frame_emb, query_emb), seed=7).select(
+            list(range(6)), times, "q", 3, seed_key="vid|q"
+        )
+        b = QFrameSelector(FakeScorer(frame_emb, query_emb), seed=7).select_tensor_frames(
+            torch.zeros(6, 3, 4, 4), times, "q", 3, seed_key="vid|q"
+        )
+        assert a == b
+
+    def test_fallbacks_never_consult_scorer(self):
+        scorer = FakeScorer(*self._planted())
+        sel = TopKSelector(scorer)
+        assert sel.select_tensor_frames(torch.zeros(0, 3, 4, 4), [], "q", 4) == []
+        assert sel.select_tensor_frames(torch.zeros(3, 3, 4, 4), [0, 1, 2], "q", 4) == [0, 1, 2]
+        assert sel.select_tensor_frames(torch.zeros(6, 3, 4, 4), list(range(6)), "", 3) == [0, 2, 4]
+        assert scorer.embed_frame_tensors_calls == 0
+        assert scorer.embed_query_calls == 0
+
+
+def _pool_images(n: int, size: int = 8):
+    from PIL import Image
+
+    return [
+        Image.new("RGB", (size, size), color=(i * 20 % 255, 7, 250 - i * 9 % 255)) for i in range(n)
+    ]
+
+
+class TestApplyFrameSelection:
+    """The batch stage: normalize once, per-sample select, gather the clip."""
+
+    C = 6  # candidate_frames
+    K = 4  # max_frames
+    SIZE = 8
+
+    def _batch(self, queries: list[str], counts: list[int]):
+        from kempnerforge.data.vlm_dataset import pil_to_uint8_tensor
+
+        b = len(counts)
+        pool = torch.zeros(b, self.C, 3, self.SIZE, self.SIZE, dtype=torch.uint8)
+        times = torch.zeros(b, self.C, dtype=torch.float32)
+        for i, n in enumerate(counts):
+            for j, img in enumerate(_pool_images(n, self.SIZE)):
+                pool[i, j] = pil_to_uint8_tensor(img, self.SIZE)
+            times[i, :n] = torch.arange(n, dtype=torch.float32)
+        return {
+            "candidate_pixels": pool,
+            "candidate_count": torch.tensor(counts, dtype=torch.long),
+            "candidate_times": times,
+            "query": queries,
+            "seed_key": [f"clip{i}|{q}" for i, q in enumerate(queries)],
+            "input_ids": torch.arange(b * 5, dtype=torch.long).view(b, 5),
+            "labels": torch.full((b, 5), -100, dtype=torch.long),
+        }
+
+    def _selector(self) -> TopKSelector:
+        # Query favors high indices: topk(k=4) over 6 candidates -> [2, 3, 4, 5].
+        return TopKSelector(FakeScorer(torch.eye(self.C), torch.tensor([1.0, 2, 3, 4, 5, 6])))
+
+    def test_contract_and_gather(self):
+        from kempnerforge.data.vlm_dataset import (
+            DEFAULT_IMAGE_MEAN,
+            DEFAULT_IMAGE_STD,
+            pil_to_tensor,
+        )
+
+        batch = self._batch(queries=["q", "q", "q"], counts=[6, 2, 0])
+        input_ids_before = batch["input_ids"]
+        out = apply_frame_selection(batch, self._selector(), self.K, torch.device("cpu"))
+
+        # Pool keys consumed; model contract produced.
+        for key in ("candidate_pixels", "candidate_count", "candidate_times", "query", "seed_key"):
+            assert key not in out
+        assert out["pixel_values"].shape == (3, self.K, 3, self.SIZE, self.SIZE)
+        assert out["pixel_values"].dtype == torch.float32
+        assert not out["pixel_values"].is_inference()  # must be usable by autograd
+        assert out["frame_mask"].shape == (3, self.K)
+        assert out["frame_times"].shape == (3, self.K)
+        assert out["input_ids"] is input_ids_before  # text passes through untouched
+
+        # Sample 0 (n=6 > k): scored selection [2,3,4,5]; gathered pixels are
+        # bit-identical to the worker-side pil_to_tensor of those frames.
+        assert out["frame_mask"][0].all()
+        assert out["frame_times"][0].tolist() == [2.0, 3.0, 4.0, 5.0]
+        imgs = _pool_images(6, self.SIZE)
+        for slot, j in enumerate([2, 3, 4, 5]):
+            expected = pil_to_tensor(imgs[j], self.SIZE, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD)
+            assert torch.equal(out["pixel_values"][0, slot], expected)
+
+        # Sample 1 (n=2 <= k): take-all fallback, padded+masked past 2.
+        assert out["frame_mask"][1].tolist() == [True, True, False, False]
+        assert out["frame_times"][1].tolist() == [0.0, 1.0, 0.0, 0.0]
+        assert (out["pixel_values"][1, 2:] == 0).all()
+
+        # Sample 2 (n=0, decode failure): all-masked, all-zero.
+        assert not out["frame_mask"][2].any()
+        assert (out["pixel_values"][2] == 0).all()
+        assert (out["frame_times"][2] == 0).all()
+
+    def test_empty_query_uniform_stride(self):
+        batch = self._batch(queries=[""], counts=[6])
+        out = apply_frame_selection(batch, self._selector(), self.K, torch.device("cpu"))
+        # i * n // k for n=6, k=4 -> frames at times [0, 1, 3, 4].
+        assert out["frame_times"][0].tolist() == [0.0, 1.0, 3.0, 4.0]
+        assert out["frame_mask"][0].all()
+
+    def test_qframe_selection_is_batchmate_independent(self):
+        # The same (pixels, query, seed_key) selects identically whether the
+        # sample arrives alone or beside other samples.
+        def _sel():
+            return QFrameSelector(
+                FakeScorer(
+                    torch.randn(self.C, 16, generator=torch.Generator().manual_seed(3)),
+                    torch.randn(16, generator=torch.Generator().manual_seed(4)),
+                ),
+                seed=11,
+            )
+
+        alone = apply_frame_selection(
+            self._batch(queries=["q"], counts=[6]), _sel(), self.K, torch.device("cpu")
+        )
+        paired = apply_frame_selection(
+            self._batch(queries=["q", "other"], counts=[6, 6]), _sel(), self.K, torch.device("cpu")
+        )
+        assert torch.equal(alone["frame_times"][0], paired["frame_times"][0])
+        assert torch.equal(alone["pixel_values"][0], paired["pixel_values"][0])
+
+    def test_query_embedding_cached_per_distinct_query(self):
+        # Same query across the batch -> one text forward; distinct -> one each.
+        sel = self._selector()
+        apply_frame_selection(
+            self._batch(queries=["q", "q", "q"], counts=[6, 6, 6]),
+            sel,
+            self.K,
+            torch.device("cpu"),
+        )
+        assert sel._scorer.embed_query_calls == 1
+        assert sel._scorer.embed_uint8_frames_calls == 3  # frames still per-sample
+
+        sel2 = self._selector()
+        apply_frame_selection(
+            self._batch(queries=["a", "b", "c"], counts=[6, 6, 6]),
+            sel2,
+            self.K,
+            torch.device("cpu"),
+        )
+        assert sel2._scorer.embed_query_calls == 3
+
+    def test_fallback_samples_never_consult_scorer(self):
+        # take-all (n <= k) and empty-query stride skip both towers entirely.
+        sel = self._selector()
+        apply_frame_selection(
+            self._batch(queries=["q", ""], counts=[2, 6]), sel, self.K, torch.device("cpu")
+        )
+        assert sel._scorer.embed_uint8_frames_calls == 0
+        assert sel._scorer.embed_query_calls == 0
+
+    def test_accepts_any_pool_capacity(self):
+        # C3: candidate_pixels capacity C is the batch max, not candidate_frames —
+        # it may be as small as 1. Behavior must match the padded-capacity batch.
+        from kempnerforge.data.vlm_dataset import pil_to_uint8_tensor
+
+        imgs = _pool_images(1, self.SIZE)
+        pool = torch.zeros(1, 1, 3, self.SIZE, self.SIZE, dtype=torch.uint8)
+        pool[0, 0] = pil_to_uint8_tensor(imgs[0], self.SIZE)
+        batch = {
+            "candidate_pixels": pool,  # C = 1 << candidate_frames
+            "candidate_count": torch.tensor([1], dtype=torch.long),
+            "candidate_times": torch.zeros(1, 1, dtype=torch.float32),
+            "query": ["q"],
+            "seed_key": ["clip0|q"],
+        }
+        out = apply_frame_selection(batch, self._selector(), self.K, torch.device("cpu"))
+        assert out["pixel_values"].shape == (1, self.K, 3, self.SIZE, self.SIZE)
+        assert out["frame_mask"][0].tolist() == [True, False, False, False]
+
+        # Scored path with counts < C < candidate-frames-sized pools also works.
+        wide = self._batch(queries=["q"], counts=[5])  # C=6, n=5 > k=4 -> scored
+        out2 = apply_frame_selection(wide, self._selector(), self.K, torch.device("cpu"))
+        assert out2["frame_mask"][0].all()
+        # Query favors high indices: topk over 5 candidates -> [1, 2, 3, 4].
+        assert out2["frame_times"][0].tolist() == [1.0, 2.0, 3.0, 4.0]
+
+
+class TestApplyFrameSelectionIsolation:
+    """Per-sample failure isolation: one bad sample must not kill the batch."""
+
+    C = 6
+    K = 4
+    SIZE = 8
+
+    def _batch(self, queries, counts):  # noqa: ANN001
+        maker = TestApplyFrameSelection()
+        batch = maker._batch(queries, counts)
+        batch["labels"] = torch.full((len(counts), 5), 7, dtype=torch.long)
+        return batch
+
+    def _failing_selector(self, fail_on_call: int) -> TopKSelector:
+        scorer = FakeScorer(torch.eye(self.C), torch.tensor([1.0, 2, 3, 4, 5, 6]))
+        original = scorer.embed_uint8_frames
+
+        def _flaky(frames_u8):  # noqa: ANN001
+            if scorer.embed_uint8_frames_calls + 1 == fail_on_call:
+                scorer.embed_uint8_frames_calls += 1
+                raise RuntimeError("transient scorer failure")
+            return original(frames_u8)
+
+        scorer.embed_uint8_frames = _flaky
+        return TopKSelector(scorer)
+
+    def test_scoring_failure_masks_sample_and_labels(self):
+        batch = self._batch(queries=["q", "q"], counts=[6, 6])
+        out = apply_frame_selection(
+            batch, self._failing_selector(fail_on_call=1), self.K, torch.device("cpu")
+        )
+        # Failed sample 0: all-masked frames, labels forced to -100.
+        assert not out["frame_mask"][0].any()
+        assert (out["pixel_values"][0] == 0).all()
+        assert (out["labels"][0] == -100).all()
+        # Batchmate 1 trains normally on the scored selection.
+        assert out["frame_mask"][1].all()
+        assert out["frame_times"][1].tolist() == [2.0, 3.0, 4.0, 5.0]
+        assert (out["labels"][1] == 7).all()
+
+    def test_selection_failure_masks_sample_and_labels(self):
+        class _ExplodingSelector(TopKSelector):
+            def _select_scored(self, frame_emb, query_emb, times, k, seed_key):  # noqa: ANN001
+                raise RuntimeError("selection math failure")
+
+        sel = _ExplodingSelector(FakeScorer(torch.eye(self.C), torch.arange(6.0)))
+        batch = self._batch(queries=["q", ""], counts=[6, 6])
+        out = apply_frame_selection(batch, sel, self.K, torch.device("cpu"))
+        assert not out["frame_mask"][0].any()
+        assert (out["labels"][0] == -100).all()
+        # Sample 1 (empty query) never reaches _select_scored: uniform stride.
+        assert out["frame_mask"][1].all()
+        assert (out["labels"][1] == 7).all()
+
+    def test_scorer_unavailable_still_propagates(self):
+        # A scorer that never loaded is systemic misconfiguration, not a
+        # per-sample data error: it must fail the run loudly.
+        class _UnavailableScorer(FakeScorer):
+            def embed_uint8_frames(self, frames_u8):  # noqa: ANN001
+                raise ScorerUnavailableError("weights not cached")
+
+        sel = TopKSelector(_UnavailableScorer(torch.eye(self.C), torch.arange(6.0)))
+        with pytest.raises(ScorerUnavailableError):
+            apply_frame_selection(
+                self._batch(queries=["q"], counts=[6]), sel, self.K, torch.device("cpu")
+            )
+
+
+class TestMakeSeedKey:
+    def test_format_and_none_query(self):
+        assert make_seed_key("/v/clip.mp4", "what happens?") == "/v/clip.mp4|what happens?"
+        assert make_seed_key("/v/clip.mp4", None) == "/v/clip.mp4|"
+        assert make_seed_key("/v/clip.mp4", "") == "/v/clip.mp4|"
+
+
+class TestSelectUint8Frames:
+    """The training-parity entry point mirrors select/select_tensor_frames."""
+
+    def test_scored_path_uses_uint8_tower_and_matches_planted_topk(self):
+        scorer = FakeScorer(torch.eye(6), torch.tensor([1.0, 2, 3, 4, 5, 6]))
+        sel = TopKSelector(scorer)
+        pool = torch.zeros(6, 3, 8, 8, dtype=torch.uint8)
+        idx = sel.select_uint8_frames(pool, [float(i) for i in range(6)], "q", 4)
+        assert idx == [2, 3, 4, 5]
+        assert scorer.embed_uint8_frames_calls == 1
+        assert scorer.embed_frames_calls == 0
+
+    def test_fallbacks_shared_with_select(self):
+        scorer = FakeScorer(torch.eye(6), torch.arange(6.0))
+        sel = TopKSelector(scorer)
+        pool = torch.zeros(6, 3, 8, 8, dtype=torch.uint8)
+        assert sel.select_uint8_frames(pool[:2], [0.0, 1.0], "q", 4) == [0, 1]  # take-all
+        assert sel.select_uint8_frames(pool, list(range(6)), "  ", 4) == [0, 1, 3, 4]  # stride
+        assert scorer.embed_uint8_frames_calls == 0
+
+    def test_select_video_frames_frame_size_routes_through_uint8_path(self, monkeypatch):
+        imgs = _pool_images(6, 8)
+        monkeypatch.setattr(
+            fsmod,
+            "decode_candidate_pool",
+            lambda path, **kw: (imgs, [float(i) for i in range(6)]),
+        )
+        scorer = FakeScorer(torch.eye(6), torch.tensor([1.0, 2, 3, 4, 5, 6]))
+        sel = TopKSelector(scorer)
+        frames, times = select_video_frames("clip.mp4", "q", sel, 4, frame_size=8)
+        assert times == [2.0, 3.0, 4.0, 5.0]
+        assert frames == [imgs[j] for j in (2, 3, 4, 5)]  # original PILs returned
+        assert scorer.embed_uint8_frames_calls == 1  # training pixel path
+        assert scorer.embed_frames_calls == 0
+
+        # Without frame_size, the PIL/HF-processor path is used as before.
+        scorer2 = FakeScorer(torch.eye(6), torch.tensor([1.0, 2, 3, 4, 5, 6]))
+        sel2 = TopKSelector(scorer2)
+        select_video_frames("clip.mp4", "q", sel2, 4)
+        assert scorer2.embed_frames_calls == 1
+        assert scorer2.embed_uint8_frames_calls == 0
+
+
+class TestDecodeCandidatePool:
+    def test_matches_select_video_frames_sizing(self, monkeypatch):
+        seen = {}
+
+        def _decode(path, *, fps, min_frames, max_frames, sampling_policy):  # noqa: ANN001
+            seen.update(fps=fps, min_frames=min_frames, max_frames=max_frames)
+            return list(range(max_frames)), [float(i) for i in range(max_frames)]
+
+        monkeypatch.setattr(fsmod, "decode_video_frames", _decode)
+        decode_candidate_pool("p.mp4", candidate_frames=16, candidate_fps=0.0)
+        assert seen == {"fps": 1.0, "min_frames": 16, "max_frames": 16}
+        decode_candidate_pool("p.mp4", candidate_frames=32, candidate_fps=2.0)
+        assert seen == {"fps": 2.0, "min_frames": 1, "max_frames": 32}
+
+    def test_dedupes_by_time(self, monkeypatch):
+        monkeypatch.setattr(
+            fsmod, "decode_video_frames", lambda path, **k: ([10, 11, 12], [0.0, 1.0, 1.0])
+        )
+        frames, times = decode_candidate_pool("p.mp4", candidate_frames=8)
+        assert frames == [10, 11]
+        assert times == [0.0, 1.0]
+
+    def test_spec_defaults_mirror_config(self):
+        from kempnerforge.config.frame_selector import FrameSelectorConfig
+
+        cfg = FrameSelectorConfig()
+        spec = CandidatePoolSpec.from_config(cfg)
+        assert spec.candidate_frames == cfg.candidate_frames
+        assert spec.candidate_fps == cfg.candidate_fps
+        # The bare-constructor defaults mirror the config defaults too.
+        assert spec == CandidatePoolSpec()
+
+    def test_from_config_duck_typed(self):
+        class _Cfg:
+            candidate_frames = 32
+            candidate_fps = 2.0
+
+        spec = CandidatePoolSpec.from_config(_Cfg())
+        assert spec == CandidatePoolSpec(candidate_frames=32, candidate_fps=2.0)

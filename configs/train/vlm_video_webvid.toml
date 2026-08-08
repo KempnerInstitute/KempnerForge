@@ -53,11 +53,12 @@ frame_size = 224
 max_samples = 0           # 0 = full manifest; set small (e.g. 256) for a smoke
 
 # Optional: query-aware frame selection. Uncomment to decode a larger candidate
-# pool and keep `max_frames` frames for each sample's query (a frozen SigLIP/CLIP
-# scorer runs in the dataloader workers). Off by default -> the video path decodes
-# `max_frames` uniformly (unchanged). candidate_frames must be >= [video].max_frames.
-# NOTE: the so400m default scorer at 128 candidates is eval-grade; for CPU-worker
-# training use a base-scale scorer + a modest pool (shown here).
+# pool per sample and keep the `max_frames` frames most relevant to its query.
+# Workers only decode the pool; the frozen SigLIP/CLIP scorer runs on the
+# training GPU in the main process (the same mechanism eval uses), costing GPU
+# time on every step — logged as video/frame_selection_s. Off by default -> the
+# video path decodes `max_frames` uniformly (unchanged). candidate_frames must
+# be >= [video].max_frames and scales the scoring cost linearly.
 # [frame_selector]
 # type = "mdp3"             # also: "topk" | "qframe"
 # scorer = "siglip2"

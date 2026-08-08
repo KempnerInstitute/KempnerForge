@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -75,6 +76,7 @@ from kempnerforge.config.vlm import VLMConfig
 from kempnerforge.data.frame_selection import (
     FrameSelector,
     build_frame_selector,
+    make_seed_key,
     select_video_frames,
 )
 from kempnerforge.data.video_io import decode_video_frames
@@ -220,10 +222,34 @@ def _load_weights(
 # --------------------------------------------------------------------------- #
 
 
+def _load_prompt_template() -> str | None:
+    """Read the optional ``KFVLM_PROMPT_TEMPLATE`` env var, validated once.
+
+    The template wraps each request's flattened question to match the
+    checkpoint's training format (e.g. ``"Question: {prompt}\\nAnswer with the
+    option's letter.\\nAnswer:"``). Off by default; without it caption-format-
+    tuned checkpoints emit EOS as the first token on bare lmms-eval prompts
+    (see local/debug_harness). A template missing the ``{prompt}`` placeholder
+    would silently replace every question with constant boilerplate, so that
+    is rejected loudly here — at adapter construction, not per request.
+    """
+    template = os.environ.get("KFVLM_PROMPT_TEMPLATE")
+    if not template:
+        return None
+    if "{prompt}" not in template:
+        raise ValueError(
+            "KFVLM_PROMPT_TEMPLATE must contain the literal placeholder '{prompt}' "
+            f"(it is replaced with each request's question); got: {template!r}"
+        )
+    logger.info(f"KFVLM_PROMPT_TEMPLATE active: {template!r}")
+    return template
+
+
 def _render_request(
     messages: ChatMessages,
     video_config: VideoConfig | None,
     frame_selector: FrameSelector | None = None,
+    prompt_template: str | None = None,
 ) -> tuple[list[Any], list[float], str]:
     """Flatten one chat request into ``(frames, frame_times_s, prompt_text)``.
 
@@ -262,12 +288,20 @@ def _render_request(
             "only). Report the task to the project owner."
         )
 
-    prompt = "\n".join(
+    raw_prompt = "\n".join(
         content.text
         for message in messages.messages
         for content in message.content
         if content.type == "text"
     )
+
+    # Optional prompt-template wrap (validated in _load_prompt_template) to
+    # match the checkpoint's training format. Applied only at the exit seam so
+    # frame selection scores against the raw question, never template
+    # boilerplate — and an empty-rendering doc stays "" so the empty-token_ids
+    # guard in generate_until fires as designed.
+    def _wrap(p: str) -> str:
+        return prompt_template.replace("{prompt}", p) if (prompt_template and p.strip()) else p
 
     if video_config is None:
         # Image checkpoint: image-only, exactly one image per request.
@@ -282,7 +316,7 @@ def _render_request(
                 "Multi-image and text-only requests are out of scope; report the task to "
                 "the project owner."
             )
-        return images, [0.0], prompt
+        return images, [0.0], _wrap(raw_prompt)
 
     # Video checkpoint: exactly one visual — a video (decoded to frames) or a
     # single image (treated as a 1-frame clip, zero-padded downstream).
@@ -306,13 +340,20 @@ def _render_request(
             )
         if frame_selector is not None:
             # Query-aware: decode a candidate pool and keep max_frames for the prompt.
+            # The scorer query is the raw lmms-eval text (never the wrapped
+            # template); training scores QA corpora on the bare question, which
+            # lmms-eval's pre-rendered docs don't expose, so the rendered text
+            # is the closest available match. frame_size routes scoring through
+            # the training pixel path (uint8 at frame_size + scorer-derived
+            # preprocessing) for bit-identical train/eval selection.
             frames, frame_times = select_video_frames(
                 path,
-                prompt,
+                raw_prompt,
                 frame_selector,
                 video_config.max_frames,
                 sampling_policy=video_config.sampling_policy,
-                seed_key=path,
+                seed_key=make_seed_key(path, raw_prompt),
+                frame_size=video_config.frame_size,
             )
         else:
             frames, frame_times = decode_video_frames(
@@ -326,11 +367,11 @@ def _render_request(
             logger.warning(
                 f"No frames decoded from {path}; evaluating a zero clip (result unreliable)."
             )
-        return frames, frame_times, prompt
+        return frames, frame_times, _wrap(raw_prompt)
     if len(images) == 1:
         # A single image on a video checkpoint: a 1-frame clip (zero-padded to
         # frames_per_clip downstream), consistent with how training pads short clips.
-        return images, [0.0], prompt
+        return images, [0.0], _wrap(raw_prompt)
     raise NotImplementedError(
         f"A video-checkpoint request must carry exactly one video or one image, got "
         f"{len(images)} images and no video. Multi-image and text-only requests are out "
@@ -607,18 +648,31 @@ class KempnerForgeVLM(lmms):
             self._frames_per_clip = 1
             self._frame_size = self._config.data.hf_image_size
 
-        # Query-aware frame selection (video only). The scorer runs on CPU in
-        # fp32 — byte-for-byte the same device+dtype as the training data path
-        # (dataloader workers), so the frozen encoder yields identical embeddings
-        # and therefore identical frame selections at train and eval. Running it
-        # at the model dtype (bf16) on CUDA would flip near-tie top-k/DPP picks and
-        # evaluate the model on frames it was never trained on, muddying the very
-        # "does query-aware selection help" measurement. (CPU also matches the
-        # eval-decode dataloader planned next, whose workers are CPU.) JobConfig
-        # warns on selector-without-video.
+        # Query-aware frame selection (video only). The scorer runs on the model
+        # device in bf16 — the project-wide scoring configuration, mirrored by
+        # the training loop (scripts/train.py builds the selector identically)
+        # so train and eval score with the same mechanism and numerics. bf16
+        # can flip near-tie top-k/DPP picks vs fp32; that trade was made
+        # deliberately for the ~4-10x scoring speedup. Embeddings return as
+        # fp32 CPU tensors either way, so the selection math itself is
+        # device/dtype-independent. On CPU the so400m scorer was the eval
+        # bottleneck: ~4 min per 128-candidate pool single-threaded vs ~0.1 s
+        # on an H200, leaving the GPU idle. JobConfig warns on
+        # selector-without-video.
         self._frame_selector: FrameSelector | None = None
         if self._config.frame_selector is not None and self._is_video:
-            self._frame_selector = build_frame_selector(self._config.frame_selector)
+            self._frame_selector = build_frame_selector(
+                self._config.frame_selector, device=self._device, dtype=torch.bfloat16
+            )
+            # Load scorer weights now, mirroring scripts/train.py: a
+            # missing/un-prefetched scorer (ScorerUnavailableError) must abort
+            # construction rather than be swallowed into per-request "" results
+            # by the broad except in generate_until.
+            self._frame_selector.ensure_loaded()
+
+        # Optional prompt-template wrap (KFVLM_PROMPT_TEMPLATE); validated here
+        # so a malformed template fails at construction, not silently per request.
+        self._prompt_template = _load_prompt_template()
 
         self._model, self._checkpoint_meta = _load_weights(
             self._config, checkpoint, self._device, self._dtype
@@ -689,7 +743,10 @@ class KempnerForgeVLM(lmms):
                     doc = self.task_dict[args[4]][args[5]][args[3]]
                     messages = ChatMessages(messages=args[1](doc))
                     frames, frame_times_s, prompt = _render_request(
-                        messages, self._config.video, self._frame_selector
+                        messages,
+                        self._config.video,
+                        self._frame_selector,
+                        prompt_template=self._prompt_template,
                     )
                     # lmms-eval may deliver image content as a path/URL string;
                     # normalize to PIL so both the image and video packers (strict

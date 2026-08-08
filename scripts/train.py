@@ -20,7 +20,9 @@ Usage:
 
 from __future__ import annotations
 
+import dataclasses
 import sys
+import time
 
 import torch
 import torch.distributed as dist
@@ -64,6 +66,52 @@ from kempnerforge.training.freeze import (
 from kempnerforge.training.hooks import HookRunner, StepContext
 
 logger = get_logger(__name__)
+
+
+def _probe_pool_mode(dataset, mixture_dataset, *, fetch_samples: bool = True) -> None:
+    """Fail fast when [frame_selector] is on but a dataset style ignores it.
+
+    Pool mode is opt-in per dataset style (the builder must thread
+    ``candidate_spec`` / call ``_init_candidate_spec``); a style that drops the
+    kwarg silently trains WITHOUT selection (workers emit final clips and
+    ``apply_frame_selection`` never runs). Fetch one probe sample per
+    sub-corpus and require the pool contract. Worker-side decode failures
+    still emit the contract (``candidate_count == 0``), so the probe is robust
+    to a missing/corrupt probe file.
+
+    The check is deterministic and rank-invariant, and a probe fetch decodes a
+    full candidate pool from shared storage — so only rank 0 fetches samples
+    (``fetch_samples``); every rank still runs the free ``_candidate_spec``
+    attribute check. A rank-0 raise aborts the whole launch.
+    """
+    if mixture_dataset is not None:
+        sub_datasets = list(mixture_dataset._datasets)  # noqa: SLF001 - startup probe
+        names = mixture_dataset.dataset_names
+        # cumulative_sizes is [0, len0, len0+len1, ..., total]; the starts of
+        # the sub-corpora in the concatenated index space are all but the last.
+        probe_indices = mixture_dataset.cumulative_sizes[:-1]
+    else:
+        sub_datasets = [dataset]
+        names = [type(dataset).__name__]
+        probe_indices = [0]
+    for ds, name, idx in zip(sub_datasets, names, probe_indices, strict=True):
+        if len(ds) == 0:
+            continue
+        if getattr(ds, "_candidate_spec", None) is None:
+            raise ValueError(
+                f"[frame_selector] is configured but dataset {name} has no candidate "
+                "spec (its builder dropped the candidate_spec kwarg); its style must "
+                "thread candidate_spec / _init_candidate_spec"
+            )
+        if not fetch_samples:
+            continue
+        sample = dataset[idx]
+        if "candidate_pixels" not in sample:
+            raise ValueError(
+                f"[frame_selector] is configured but dataset {name} emitted a non-pool "
+                "sample (missing 'candidate_pixels'); its style must thread "
+                "candidate_spec / _init_candidate_spec"
+            )
 
 
 def main() -> None:
@@ -287,6 +335,8 @@ def main() -> None:
     data_iter = None
     mixture_dataset = None  # Set when multi-dataset mixing is active
     weights: list[float] = []  # Per-source sampling weights when mixing
+    frame_selector = None  # Main-process frame selector (video + [frame_selector] only)
+    fs_max_frames = 0  # Selection budget k (= [video].max_frames) when selecting
 
     # Resolve EOS token ID for sequence packing (needed by MemoryMappedDataset)
     eos_token_id = None
@@ -322,6 +372,12 @@ def main() -> None:
                 vlm_cfg.max_text_len,
                 frame_selector_config=config.frame_selector,
             )
+            if config.frame_selector is not None:
+                # Startup contract probe: every sub-corpus must emit pool-mode
+                # samples, or selection would be silently skipped for it. The
+                # sample fetch decodes a full candidate pool, so only rank 0
+                # does it (identical result on every rank).
+                _probe_pool_mode(dataset, mixture_dataset, fetch_samples=rank == 0)
             _tok = AutoTokenizer.from_pretrained(config.data.tokenizer_path)
             _pad_id = _tok.pad_token_id
             if _pad_id is None:
@@ -333,6 +389,28 @@ def main() -> None:
                 f"{', '.join(s.metrics_name for s in vcfg.sources())} "
                 f"(frame_selector={_fs})"
             )
+            if config.frame_selector is not None:
+                from kempnerforge.data.frame_selection import (
+                    apply_frame_selection,
+                    build_frame_selector,
+                )
+
+                # Datasets emit raw candidate pools; scoring + selection run
+                # here in the main process, per micro-batch, on the training
+                # device (apply_frame_selection). Same construction as the eval
+                # adapter — device-placed scorer, bf16 — so train and eval score
+                # with the same mechanism and numerics. Held as a local, never
+                # attached to the model, so it stays out of DCP checkpoint state.
+                frame_selector = build_frame_selector(
+                    config.frame_selector, device=device, dtype=torch.bfloat16
+                )
+                # Load weights now: a missing/un-prefetched scorer should fail
+                # the run at startup, not at the first batch.
+                frame_selector.ensure_loaded()
+                # Warn (never raise) when the worker-decoded frame size and the
+                # scorer's native input geometry disagree.
+                frame_selector.validate_frame_geometry(vcfg.frame_size)
+                fs_max_frames = vcfg.max_frames
         else:
             # --- Image VLM (Joint-Decoder) data path ---
             # Mixing VLM + text-only datasets in one run is out of scope on this
@@ -390,11 +468,21 @@ def main() -> None:
                 shuffle=True,
                 seed=tc.effective_data_seed,
             )
+        loader_data_config = config.data
+        if frame_selector is not None and config.data.prefetch_factor != 1:
+            # Pool-mode batches are large (candidate_frames uint8 frames per
+            # sample before selection); prefetching several per worker can
+            # exhaust host RAM for no throughput gain, so cap prefetch at 1.
+            loader_data_config = dataclasses.replace(config.data, prefetch_factor=1)
+            logger.info(
+                "[frame_selector] pool mode: overriding data.prefetch_factor="
+                f"{config.data.prefetch_factor} -> 1 to bound worker memory"
+            )
         dataloader = StatefulDataLoader(
             dataset,
             batch_size=tc.batch_size,
             sampler=sampler,
-            config=config.data,
+            config=loader_data_config,
             collate_fn=collator,
         )
 
@@ -790,6 +878,7 @@ def main() -> None:
             # --- VLM training step (no PP, VLM Joint-Decoder) ---
             total_loss = 0.0
             total_text_tokens = 0
+            frame_selection_s = 0.0
             ds_token_counts: dict[str, int] = {}
             ds_loss_sums: dict[str, float] = {}
             ds_loss_counts: dict[str, int] = {}
@@ -805,6 +894,15 @@ def main() -> None:
                 except StopIteration:
                     data_iter = iter(dataloader)
                     batch = next(data_iter)
+                if frame_selector is not None and "candidate_pixels" in batch:
+                    # Pool-mode batch: score the candidate pools on the training
+                    # device and gather the selected clips, producing the
+                    # standard pixel_values/frame_mask/frame_times (on device;
+                    # the .to(device) below is then a no-op). The embed's final
+                    # .cpu() syncs, so perf_counter bounds the real stage cost.
+                    _t0 = time.perf_counter()
+                    batch = apply_frame_selection(batch, frame_selector, fs_max_frames, device)
+                    frame_selection_s += time.perf_counter() - _t0
                 pixel_values = batch["pixel_values"].to(device)
                 input_ids = batch["input_ids"].to(device)
                 labels = batch["labels"].to(device)
@@ -1042,6 +1140,11 @@ def main() -> None:
                 dist.all_reduce(_t, op=dist.ReduceOp.SUM)
                 global_text_tokens = int(_t.item())
             tracker.log_eval({"data/text_tokens_trained": float(global_text_tokens)}, step)
+            # Wall time of the main-process frame-selection stage this step
+            # (rank-local, summed over micro-batches). This is the serial cost
+            # sitting on the step critical path; watch it against step time.
+            if frame_selector is not None:
+                tracker.log_eval({"video/frame_selection_s": frame_selection_s}, step)
 
         # Per-dataset metrics (logged at same interval as main metrics)
         if mixture_dataset is not None and step_metrics is not None and ds_loss_sums:

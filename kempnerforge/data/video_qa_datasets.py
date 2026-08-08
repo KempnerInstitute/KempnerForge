@@ -35,6 +35,7 @@ from collections.abc import Sequence
 from typing import Any
 
 from kempnerforge.config.registry import registry
+from kempnerforge.data.frame_selection import CandidatePoolSpec
 from kempnerforge.data.qa_format import format_multiple_choice, format_open_ended
 from kempnerforge.data.video_dataset import VideoQADataset, VideoRecord
 
@@ -44,13 +45,15 @@ logger = logging.getLogger(__name__)
 _VIDEO_EXTS = (".mp4", ".mkv", ".webm")
 
 
-def _geometry(video_config: Any, frame_selector: Any | None = None) -> dict[str, Any]:
+def _geometry(
+    video_config: Any, candidate_spec: CandidatePoolSpec | None = None
+) -> dict[str, Any]:
     """Frame-geometry kwargs shared by every corpus (global on ``[video]``).
 
-    The optional prebuilt ``frame_selector`` (from the ``[frame_selector]``
-    section, constructed once at the ``build_video_data`` seam) rides along here
-    so it reaches ``VideoQADataset.__init__`` via each dataset's ``**geometry``
-    forwarding, enabling query-aware selection for every corpus.
+    The optional ``candidate_spec`` (derived from the ``[frame_selector]``
+    section at the ``build_video_data`` seam) rides along here so it reaches
+    ``VideoQADataset.__init__`` via each dataset's ``**geometry`` forwarding,
+    enabling pool-mode query-aware selection for every corpus.
     """
     return {
         "max_frames": video_config.max_frames,
@@ -58,7 +61,7 @@ def _geometry(video_config: Any, frame_selector: Any | None = None) -> dict[str,
         "fps": video_config.fps,
         "frame_size": video_config.frame_size,
         "sampling_policy": video_config.sampling_policy,
-        "frame_selector": frame_selector,
+        "candidate_spec": candidate_spec,
     }
 
 
@@ -475,7 +478,7 @@ class Molmo2CapQADataset(VideoQADataset):
             answer_index=answer_index,
             instruction=self._prompt,
         )
-        return VideoRecord(path, text.prompt, text.target)
+        return VideoRecord(path, text.prompt, text.target, query=question)
 
 
 class PerceptionTestDataset(VideoQADataset):
@@ -521,7 +524,9 @@ class PerceptionTestDataset(VideoQADataset):
                     answer_index=int(question["answer_id"]),
                     instruction=prompt,
                 )
-                records.append(VideoRecord(path, text.prompt, text.target))
+                records.append(
+                    VideoRecord(path, text.prompt, text.target, query=str(question["question"]))
+                )
                 if max_samples and len(records) >= max_samples:
                     break
             if max_samples and len(records) >= max_samples:
@@ -597,7 +602,7 @@ class NExTQADataset(VideoQADataset):
                 text = format_open_ended(
                     question=question, answer=str(row["answer"]), instruction=prompt
                 )
-            records.append(VideoRecord(path, text.prompt, text.target))
+            records.append(VideoRecord(path, text.prompt, text.target, query=question))
             if max_samples and len(records) >= max_samples:
                 break
 
@@ -663,7 +668,9 @@ class CinePileDataset(VideoQADataset):
                 answer_index=int(row["answer_key_position"]),
                 instruction=prompt,
             )
-            records.append(VideoRecord(path, text.prompt, text.target))
+            records.append(
+                VideoRecord(path, text.prompt, text.target, query=str(row["question"]))
+            )
             if max_samples and len(records) >= max_samples:
                 break
 
@@ -782,7 +789,7 @@ def _build_molmo2_videocapqa(
     video_config: Any,
     tokenizer_path: str,
     max_text_len: int,
-    frame_selector: Any | None = None,
+    candidate_spec: CandidatePoolSpec | None = None,
 ) -> Molmo2VideoCapQADataset:
     """Registry builder for Molmo2-VideoCapQA (see ``Molmo2VideoCapQADataset``)."""
     return Molmo2VideoCapQADataset(
@@ -793,7 +800,7 @@ def _build_molmo2_videocapqa(
         max_samples=video_config.max_samples,
         prompt=video_config.prompt,
         text_source=video_config.text_source or "title",
-        **_geometry(video_config, frame_selector),
+        **_geometry(video_config, candidate_spec),
     )
 
 
@@ -802,7 +809,7 @@ def _build_spatialvid(
     video_config: Any,
     tokenizer_path: str,
     max_text_len: int,
-    frame_selector: Any | None = None,
+    candidate_spec: CandidatePoolSpec | None = None,
 ) -> SpatialVIDDataset:
     """Registry builder for SpatialVID (see ``SpatialVIDDataset``)."""
     # dataset_name selects the manifest CSV; the [video] default names the
@@ -817,7 +824,7 @@ def _build_spatialvid(
         max_samples=video_config.max_samples,
         prompt=video_config.prompt,
         require_video_file=_require_video_file(video_config, default=False),
-        **_geometry(video_config, frame_selector),
+        **_geometry(video_config, candidate_spec),
     )
 
 
@@ -826,7 +833,7 @@ def _build_molmo2_capqa(
     video_config: Any,
     tokenizer_path: str,
     max_text_len: int,
-    frame_selector: Any | None = None,
+    candidate_spec: CandidatePoolSpec | None = None,
 ) -> Molmo2CapQADataset:
     """Registry builder for the released Molmo2 QA (see ``Molmo2CapQADataset``)."""
     return Molmo2CapQADataset(
@@ -838,7 +845,7 @@ def _build_molmo2_capqa(
         prompt=video_config.prompt,
         qa_format=video_config.qa_format,
         require_video_file=_require_video_file(video_config, default=True),
-        **_geometry(video_config, frame_selector),
+        **_geometry(video_config, candidate_spec),
     )
 
 
@@ -847,7 +854,7 @@ def _build_perception_test(
     video_config: Any,
     tokenizer_path: str,
     max_text_len: int,
-    frame_selector: Any | None = None,
+    candidate_spec: CandidatePoolSpec | None = None,
 ) -> PerceptionTestDataset:
     """Registry builder for PerceptionTest (see ``PerceptionTestDataset``)."""
     return PerceptionTestDataset(
@@ -859,7 +866,7 @@ def _build_perception_test(
         prompt=video_config.prompt,
         qa_format=video_config.qa_format,
         require_video_file=_require_video_file(video_config, default=True),
-        **_geometry(video_config, frame_selector),
+        **_geometry(video_config, candidate_spec),
     )
 
 
@@ -868,7 +875,7 @@ def _build_nextqa(
     video_config: Any,
     tokenizer_path: str,
     max_text_len: int,
-    frame_selector: Any | None = None,
+    candidate_spec: CandidatePoolSpec | None = None,
 ) -> NExTQADataset:
     """Registry builder for NExT-QA (see ``NExTQADataset``)."""
     return NExTQADataset(
@@ -881,7 +888,7 @@ def _build_nextqa(
         prompt=video_config.prompt,
         qa_format=video_config.qa_format,
         require_video_file=_require_video_file(video_config, default=True),
-        **_geometry(video_config, frame_selector),
+        **_geometry(video_config, candidate_spec),
     )
 
 
@@ -890,7 +897,7 @@ def _build_cinepile(
     video_config: Any,
     tokenizer_path: str,
     max_text_len: int,
-    frame_selector: Any | None = None,
+    candidate_spec: CandidatePoolSpec | None = None,
 ) -> CinePileDataset:
     """Registry builder for CinePile (see ``CinePileDataset``)."""
     # dataset_name selects the annotation revision; the [video] default names
@@ -906,5 +913,5 @@ def _build_cinepile(
         prompt=video_config.prompt,
         qa_format=video_config.qa_format,
         require_video_file=_require_video_file(video_config, default=True),
-        **_geometry(video_config, frame_selector),
+        **_geometry(video_config, candidate_spec),
     )

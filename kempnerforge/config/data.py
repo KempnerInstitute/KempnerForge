@@ -55,6 +55,9 @@ class DataConfig:
     tokenizer_path: str = ""
     num_workers: int = 4
     pin_memory: bool = True
+    # Batches prefetched per worker. Note: with a [frame_selector] configured,
+    # train.py overrides this to 1 at loader construction (pool-mode batches
+    # ship candidate_frames uint8 frames per sample, so prefetch is RAM-bound).
     prefetch_factor: int = 2
     # For HuggingFace datasets
     hf_dataset_name: str | None = None

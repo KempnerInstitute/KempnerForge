@@ -21,6 +21,11 @@ tokenizes one clip. Corpus-specific layouts live in subclasses —
 sees identical shapes under FSDP2. ``build_video_data`` resolves the configured
 corpora, returning a weighted ``MixtureDataset`` when more than one is listed.
 
+With a ``[frame_selector]`` configured, datasets instead emit *candidate-pool*
+samples (raw uint8 frames + query text; see ``VideoDataset``); the main
+training process scores them on the accelerator and produces the contract
+above via ``frame_selection.apply_frame_selection``.
+
 Frame decoding lives in ``video_io.decode_video_frames`` and is imported at
 module scope so tests can substitute a stub; ``av`` itself is imported lazily
 inside the decoder.
@@ -30,16 +35,17 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import Any, NamedTuple
 
 import torch
 from torch.utils.data import Dataset
 
 from kempnerforge.config.registry import registry
 from kempnerforge.data.frame_selection import (
-    ScorerUnavailableError,
-    build_frame_selector,
-    select_video_frames,
+    CandidatePoolSpec,
+    decode_candidate_pool,
+    make_seed_key,
+    uniform_stride_indices,
 )
 from kempnerforge.data.video_io import decode_video_frames
 from kempnerforge.data.vlm_dataset import (
@@ -47,11 +53,9 @@ from kempnerforge.data.vlm_dataset import (
     DEFAULT_IMAGE_STD,
     _tokenize_and_mask,
     frames_to_clip_tensor,
+    pil_to_uint8_tensor,
     resolve_pad_id,
 )
-
-if TYPE_CHECKING:  # pragma: no cover - typing only
-    from PIL.Image import Image as PILImage
 
 logger = logging.getLogger(__name__)
 
@@ -80,76 +84,35 @@ class VideoDataset(Dataset):
     implements the sample contract once and asks only for per-index records.
 
     Query-aware frame selection is a base-class capability, so every dataset
-    style gets it for free — ``VideoQADataset`` already routes its decode
-    through ``_decode_clip``, so subclasses on that base need only thread the
-    ``frame_selector`` object to ``super().__init__``. A dataset that bypasses
-    ``VideoQADataset`` adopts selection in three steps:
-
-    1. Take ``frame_selector`` in its builder and pass it to
-       ``self._init_frame_selector(...)`` in ``__init__``.
-    2. Decode via ``self._decode_clip(path, query, ...)`` instead of calling
-       ``decode_video_frames`` directly, passing the sample's query text — the
-       question/instruction prompt the model is conditioned on at inference.
-    3. Nothing else — the returned frames/times flow through the existing
-       ``frames_to_clip_tensor`` packing unchanged.
-
-    A dataset without a decodable file path (pre-extracted frames / byte
-    streams) can call ``self._frame_selector.select(frames, times, query, k,
-    seed_key=...)`` directly; ``_decode_clip`` is a convenience, not the only door.
-
-    The selector is built once at the ``build_video_data`` seam and injected, so a
-    mixture shares a single scorer rather than loading one identical copy per
-    corpus per worker.
+    style gets it for free: when a ``[frame_selector]`` section is configured,
+    ``build_video_data`` threads a ``CandidatePoolSpec`` to every corpus and
+    ``VideoQADataset.__getitem__`` switches to *pool mode* — it decodes the
+    candidate pool and emits it raw (``candidate_pixels`` uint8 +
+    ``candidate_count``/``candidate_times``/``query``/``seed_key``) instead of
+    a final clip. Scoring and selection run on the accelerator in the main
+    training process (``frame_selection.apply_frame_selection``), which
+    replaces the pool keys with the standard
+    ``pixel_values``/``frame_mask``/``frame_times`` contract. Workers never
+    hold a scorer. A dataset style that bypasses ``VideoQADataset`` adopts
+    selection by threading ``candidate_spec`` to ``_init_candidate_spec`` and
+    emitting the same pool-mode sample dict (see
+    ``VideoQADataset.__getitem__`` for the reference implementation).
     """
 
     # Class-level default so subclasses (and tests that bypass ``__init__``)
-    # have it without calling ``_init_frame_selector``.
-    _frame_selector: Any = None
+    # have it without calling ``_init_candidate_spec``.
+    _candidate_spec: CandidatePoolSpec | None = None
 
-    def _init_frame_selector(self, frame_selector: Any | None) -> None:
-        """Store the prebuilt frame selector (or leave selection off when ``None``).
+    def _init_candidate_spec(self, candidate_spec: CandidatePoolSpec | None) -> None:
+        """Store the candidate-pool geometry (or leave selection off when ``None``).
 
-        The selector is constructed once at the ``build_video_data`` seam and
-        injected here, so a mixture of N corpora shares a single ``FrameQueryScorer``
-        instead of instantiating N identical copies (each of which would lazily load
-        a full scorer in every dataloader worker). The scorer runs on CPU in fp32
-        (weights load lazily on first sample).
+        Derived from the ``[frame_selector]`` section at the ``build_video_data``
+        seam. A non-``None`` spec switches ``__getitem__`` to pool mode; the
+        dataset never holds a selector or scorer object.
         """
-        if frame_selector is None:
+        if candidate_spec is None:
             return
-        self._frame_selector = frame_selector
-
-    def _decode_clip(
-        self,
-        path: str,
-        query: str | None,
-        *,
-        fps: float,
-        min_frames: int,
-        max_frames: int,
-        sampling_policy: str,
-        seed_key: str,
-    ) -> tuple[list[PILImage], list[float]]:
-        """Decode a clip to frames + times, applying query-aware selection when a
-        selector is configured (else the plain uniform decode). Shared by every
-        dataset style so the decode-vs-select branch lives in one place.
-        """
-        if self._frame_selector is not None:
-            return select_video_frames(
-                path,
-                query,
-                self._frame_selector,
-                max_frames,
-                sampling_policy=sampling_policy,
-                seed_key=seed_key,
-            )
-        return decode_video_frames(
-            path,
-            fps=fps,
-            min_frames=min_frames,
-            max_frames=max_frames,
-            sampling_policy=sampling_policy,
-        )
+        self._candidate_spec = candidate_spec
 
 
 class VideoRecord(NamedTuple):
@@ -157,12 +120,18 @@ class VideoRecord(NamedTuple):
 
     ``prompt`` is prepended to ``target`` and masked out of the loss, so a
     caption corpus leaves it empty and a QA corpus puts the question (and any
-    answer options) there.
+    answer options) there. ``query`` is the *bare* question text for
+    query-aware frame selection: the rendered ``prompt`` buries the question
+    in options and boilerplate (and typically overflows the scorer's ~64-token
+    text context, forcing chunk+mean-pool), so QA builders thread the raw
+    question here. Empty means "no bare question available" and selection
+    falls back to ``prompt``.
     """
 
     video_path: str
     prompt: str
     target: str
+    query: str = ""
 
 
 class VideoQADataset(VideoDataset):
@@ -181,10 +150,10 @@ class VideoQADataset(VideoDataset):
         frame_size: Square pixel size per frame.
         sampling_policy: Registry key for the frame-sampling policy.
         image_mean / image_std: Per-channel normalization (SigLIP defaults).
-        frame_selector: Optional prebuilt ``FrameSelector`` (from the
-            ``[frame_selector]`` section, constructed once at the
-            ``build_video_data`` seam) enabling query-aware frame selection
-            (``None`` = uniform decode, unchanged).
+        candidate_spec: Optional ``CandidatePoolSpec`` (derived from the
+            ``[frame_selector]`` section at the ``build_video_data`` seam)
+            switching ``__getitem__`` to candidate-pool mode for main-process
+            query-aware selection (``None`` = uniform decode, unchanged).
     """
 
     def __init__(
@@ -200,7 +169,7 @@ class VideoQADataset(VideoDataset):
         sampling_policy: str = "uniform",
         image_mean: tuple[float, float, float] = DEFAULT_IMAGE_MEAN,
         image_std: tuple[float, float, float] = DEFAULT_IMAGE_STD,
-        frame_selector: Any | None = None,
+        candidate_spec: CandidatePoolSpec | None = None,
     ) -> None:
         from transformers import AutoTokenizer
 
@@ -216,8 +185,21 @@ class VideoQADataset(VideoDataset):
         self._image_mean = image_mean
         self._image_std = image_std
         # Optional query-aware frame selection (no-op when None); inherited from
-        # VideoDataset so every corpus gets it by threading one kwarg.
-        self._init_frame_selector(frame_selector)
+        # VideoDataset so every corpus gets it by threading one kwarg. Pool-mode
+        # frames ship un-normalized; the MODEL-path normalization of the selected
+        # frames happens downstream with the SigLIP defaults, which these
+        # defaults pin — so a custom mean/std cannot be honored there. (The
+        # scorer's own preprocessing is independent of these values: it is
+        # derived from the scorer's processor config in frame_selection.)
+        if candidate_spec is not None and (
+            image_mean != DEFAULT_IMAGE_MEAN or image_std != DEFAULT_IMAGE_STD
+        ):
+            raise ValueError(
+                "[frame_selector] pool mode normalizes frames in the main process "
+                "with the default SigLIP image_mean/image_std; custom values are "
+                "not supported alongside a frame selector."
+            )
+        self._init_candidate_spec(candidate_spec)
         # Subclasses populate their records before calling super().__init__(),
         # so the probe can read them here and surface a silently-unsupervised
         # corpus at startup rather than after a flat-loss run.
@@ -273,40 +255,114 @@ class VideoQADataset(VideoDataset):
     def _selection_query(self, record: VideoRecord) -> str | None:
         """Query text handed to a configured frame selector for this sample.
 
-        Always the sample's question/instruction (the ``prompt`` the model is
-        conditioned on at inference), never its ``target``: the caption/answer is
-        not available at test time, so selecting frames on it would skew training
-        against eval. A captioning corpus, whose prompt is a static instruction or
-        empty, therefore has no meaningful per-sample query — the deliberate,
-        falsifiable expectation that query-aware selection helps VQA but not
-        captioning. A no-op when no selector is configured.
+        The bare question (``record.query``) when the corpus provides one —
+        that is where the information about which frames matter lives, and it
+        fits the scorer's text context in one forward instead of being
+        chunk+mean-pooled with options and boilerplate. Falls back to the
+        rendered ``prompt`` (a QA corpus without a threaded question, or a
+        captioning corpus's static instruction). Never the ``target``: the
+        caption/answer is not available at test time, so selecting frames on
+        it would skew training against eval. A captioning corpus, whose prompt
+        is a static instruction or empty, has no meaningful per-sample query —
+        the deliberate, falsifiable expectation that query-aware selection
+        helps VQA but not captioning. A no-op when no selector is configured.
         """
-        return record.prompt or None
+        return record.query or record.prompt or None
 
-    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+    def _candidate_pool_sample(self, record: VideoRecord, query: str | None) -> dict[str, Any]:
+        """Pool-mode sample: raw resized candidates, selection deferred downstream.
+
+        Emitted when a ``CandidatePoolSpec`` is configured. The pool ships
+        *ragged* — ``candidate_pixels`` is ``(n_shipped, 3, S, S)`` uint8 (4x
+        smaller over worker IPC than float32; no padding to
+        ``candidate_frames``, which the collator applies batch-wide) — with
+        ``candidate_count = n_shipped`` (0 = undecodable clip, which also
+        masks the labels so the sample trains on nothing). Pools also come
+        back smaller than ``candidate_frames`` when ``decode_candidate_pool``
+        drops time-duplicate frames.
+
+        A sample with no query (empty/None prompt) can never be scored: the
+        selector's ``FrameSelector._fallback_indices`` uniform-strides it. That
+        stride is applied *here in the worker* instead, so the full pool never
+        crosses IPC nor reaches the GPU (see the fast path below).
+
+        ``query``/``seed_key`` ride along for the downstream scoring stage;
+        ``seed_key`` mirrors the non-pool seed: (clip path, query), stable
+        across ranks/resumes and independent per question of the same clip.
+        """
+        spec = self._candidate_spec
+        assert spec is not None
+        try:
+            frames, times = decode_candidate_pool(
+                record.video_path,
+                candidate_frames=spec.candidate_frames,
+                candidate_fps=spec.candidate_fps,
+                sampling_policy=self._sampling_policy,
+            )
+        except Exception as e:  # noqa: BLE001 - any decode failure -> skip-with-mask
+            logger.debug("candidate pool decode failed for %s: %s", record.video_path, e)
+            frames, times = [], []
+
+        n = min(len(frames), spec.candidate_frames)
+        frames = list(frames[:n])
+        times = [float(t) for t in times[:n]]
+        if (query is None or not query.strip()) and n > self._max_frames:
+            # Empty-query fast path (same strip semantics as
+            # FrameSelector._fallback_indices, so a whitespace-only prompt
+            # takes it too): pre-apply the exact uniform stride
+            # _fallback_indices would take ([i*n//k]), so the
+            # shipped k-frame pool round-trips through selection unchanged
+            # (downstream, n_shipped <= k hits the take-all branch, which
+            # _fallback_indices checks BEFORE its own empty-query stride).
+            # This must stride the *candidate pool* rather than fall back to a
+            # standard [video].fps decode: the pool's timestamps are
+            # i*duration/(candidate_frames-1) from the candidate decode, so a
+            # standard uniform decode would land on different frames/times and
+            # silently change what empty-query samples train on.
+            sel = uniform_stride_indices(n, self._max_frames)
+            frames = [frames[i] for i in sel]
+            times = [times[i] for i in sel]
+
+        n_shipped = len(frames)
+        candidate_pixels = torch.zeros(
+            n_shipped, 3, self._frame_size, self._frame_size, dtype=torch.uint8
+        )
+        for i, frame in enumerate(frames):
+            candidate_pixels[i] = pil_to_uint8_tensor(frame, self._frame_size)
+        candidate_times = torch.tensor(times, dtype=torch.float32)
+
+        input_ids, labels = _tokenize_and_mask(
+            self._tokenizer, record.target, self._max_text_len, record.prompt or None
+        )
+        # Label masking keys off the pre-stride pool size: the stride only runs
+        # when n > 0, so this is exactly the "undecodable clip" condition.
+        if n == 0 or not record.target.strip():
+            labels = torch.full_like(labels, -100)
+        return {
+            "candidate_pixels": candidate_pixels,
+            "candidate_count": torch.tensor(n_shipped, dtype=torch.long),
+            "candidate_times": candidate_times,
+            "query": query or "",
+            "seed_key": make_seed_key(record.video_path, query),
+            "input_ids": input_ids,
+            "labels": labels,
+        }
+
+    def __getitem__(self, idx: int) -> dict[str, Any]:
         record = self._record(idx)
         query = self._selection_query(record)
+        if self._candidate_spec is not None:
+            return self._candidate_pool_sample(record, query)
         try:
-            frames, frame_times_s = self._decode_clip(
+            frames, frame_times_s = decode_video_frames(
                 record.video_path,
-                query,
                 fps=self._fps,
                 min_frames=self._min_frames,
                 max_frames=self._max_frames,
                 sampling_policy=self._sampling_policy,
-                # Seed on (clip path, query): a QA corpus emits many questions per
-                # clip, so path alone would draw identical Gumbel noise for every
-                # question. Both parts are stable across ranks/resumes, keeping the
-                # draw reproducible while independent per question. Mirrors the
-                # answer-shuffle seed (`f"{path}|{question}"`).
-                seed_key=f"{record.video_path}|{query or ''}",
             )
-        except ScorerUnavailableError:
-            # Systemic misconfiguration (e.g. an un-prefetched scorer on an
-            # offline node): fail loudly rather than silently masking every clip.
-            raise
-        except Exception as e:  # noqa: BLE001 - any decode/selection failure -> skip-with-mask
-            logger.debug("video decode/selection failed for %s: %s", record.video_path, e)
+        except Exception as e:  # noqa: BLE001 - any decode failure -> skip-with-mask
+            logger.debug("video decode failed for %s: %s", record.video_path, e)
             frames, frame_times_s = [], []
 
         pixel_values, frame_mask = frames_to_clip_tensor(
@@ -354,8 +410,9 @@ class WebVidVideoDataset(VideoQADataset):
         max_samples: Cap the manifest (``0`` = all).
         prompt: Optional instruction prepended and masked from the loss.
         image_mean / image_std: Per-channel normalization (SigLIP defaults).
-        frame_selector: Optional prebuilt ``FrameSelector`` enabling query-aware
-            frame selection (``None`` = uniform decode, unchanged).
+        candidate_spec: Optional ``CandidatePoolSpec`` switching to
+            candidate-pool mode for query-aware selection (``None`` = uniform
+            decode, unchanged).
     """
 
     def __init__(
@@ -375,7 +432,7 @@ class WebVidVideoDataset(VideoQADataset):
         sampling_policy: str = "uniform",
         image_mean: tuple[float, float, float] = DEFAULT_IMAGE_MEAN,
         image_std: tuple[float, float, float] = DEFAULT_IMAGE_STD,
-        frame_selector: Any | None = None,
+        candidate_spec: CandidatePoolSpec | None = None,
     ) -> None:
         if split not in _VIDEO_SUBDIR:
             raise ValueError(f"split must be one of {tuple(_VIDEO_SUBDIR)} (got {split!r})")
@@ -401,7 +458,7 @@ class WebVidVideoDataset(VideoQADataset):
             sampling_policy=sampling_policy,
             image_mean=image_mean,
             image_std=image_std,
-            frame_selector=frame_selector,
+            candidate_spec=candidate_spec,
         )
         logger.info(
             "WebVidVideoDataset: %s/%s [%s], %d clips, max_frames=%d, fps=%s, frame_size=%d",
@@ -473,6 +530,18 @@ class VideoCollator:
       - ``dataset_idx``: ``(B,)`` int64 — only when mixing, so the loop can
         attribute loss to the source corpus.
 
+    Pool-mode samples (a configured ``[frame_selector]``) swap the first three
+    keys for the candidate-pool contract consumed by
+    ``frame_selection.apply_frame_selection``. Samples arrive *ragged*
+    (``(n_i, 3, H, W)``) and are zero-padded here to the batch maximum:
+      - ``candidate_pixels``: ``(B, C, 3, H, W)`` uint8
+        (``C = batch-max candidate count``, floored at 1 so an all-failed
+        batch still has a valid shape).
+      - ``candidate_count``: ``(B,)`` int64 (real-prefix length per sample).
+      - ``candidate_times``: ``(B, C)`` float32.
+      - ``query`` / ``seed_key``: ``list[str]`` of length ``B`` (strings pass
+        through pin_memory untouched).
+
     Text is always padded to ``max_text_len`` (never batch-max) so DP ranks
     see identical shapes under FSDP2, matching ``VLMCollator``.
     """
@@ -483,13 +552,38 @@ class VideoCollator:
         self.pad_id = pad_id
         self.max_text_len = max_text_len
 
-    def __call__(self, samples: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
+    def __call__(self, samples: list[dict[str, Any]]) -> dict[str, Any]:
         if not samples:
             raise ValueError("VideoCollator received an empty batch")
         b = len(samples)
-        pixel_values = torch.stack([s["pixel_values"] for s in samples], dim=0)
-        frame_mask = torch.stack([s["frame_mask"] for s in samples], dim=0)
-        frame_times = torch.stack([s["frame_times"] for s in samples], dim=0)
+        batch: dict[str, Any]
+        if "candidate_pixels" in samples[0]:
+            # Ragged pools -> one zero-padded (b, cmax, ...) batch. cmax is the
+            # batch-max candidate count, floored at 1 so a batch of all-failed
+            # decodes (every count 0) still collates to a valid shape.
+            counts = torch.stack([s["candidate_count"] for s in samples], dim=0)
+            cmax = max(1, int(counts.max().item()))
+            size = samples[0]["candidate_pixels"].shape[-1]
+            pixels = torch.zeros(b, cmax, 3, size, size, dtype=torch.uint8)
+            times = torch.zeros(b, cmax, dtype=torch.float32)
+            for i, s in enumerate(samples):
+                n = min(int(s["candidate_count"]), cmax)
+                if n > 0:
+                    pixels[i, :n] = s["candidate_pixels"][:n]
+                    times[i, :n] = s["candidate_times"][:n]
+            batch = {
+                "candidate_pixels": pixels,
+                "candidate_count": counts,
+                "candidate_times": times,
+                "query": [s["query"] for s in samples],
+                "seed_key": [s["seed_key"] for s in samples],
+            }
+        else:
+            batch = {
+                "pixel_values": torch.stack([s["pixel_values"] for s in samples], dim=0),
+                "frame_mask": torch.stack([s["frame_mask"] for s in samples], dim=0),
+                "frame_times": torch.stack([s["frame_times"] for s in samples], dim=0),
+            }
         input_ids = torch.full((b, self.max_text_len), self.pad_id, dtype=torch.long)
         labels = torch.full((b, self.max_text_len), -100, dtype=torch.long)
         for i, s in enumerate(samples):
@@ -498,13 +592,8 @@ class VideoCollator:
             n = min(ids.shape[0], self.max_text_len)
             input_ids[i, :n] = ids[:n]
             labels[i, :n] = lbl[:n]
-        batch = {
-            "pixel_values": pixel_values,
-            "frame_mask": frame_mask,
-            "frame_times": frame_times,
-            "input_ids": input_ids,
-            "labels": labels,
-        }
+        batch["input_ids"] = input_ids
+        batch["labels"] = labels
         # MixtureDataset tags each sample with its source index; forward it so
         # per-dataset loss can be logged (absent for a single-corpus run).
         if "dataset_idx" in samples[0]:
@@ -519,7 +608,7 @@ def _build_webvid(
     video_config: Any,
     tokenizer_path: str,
     max_text_len: int,
-    frame_selector: Any | None = None,
+    candidate_spec: CandidatePoolSpec | None = None,
 ) -> WebVidVideoDataset:
     """Registry builder for the WebVid-style dataset (see ``WebVidVideoDataset``)."""
     return WebVidVideoDataset(
@@ -535,7 +624,7 @@ def _build_webvid(
         prompt=video_config.prompt,
         dataset_name=video_config.dataset_name,
         sampling_policy=video_config.sampling_policy,
-        frame_selector=frame_selector,
+        candidate_spec=candidate_spec,
     )
 
 
@@ -543,20 +632,20 @@ def build_video_dataset(
     video_config: Any,
     tokenizer_path: str,
     max_text_len: int,
-    frame_selector: Any | None = None,
+    candidate_spec: CandidatePoolSpec | None = None,
 ) -> VideoDataset:
     """Build the video dataset selected by ``video_config.dataset_type``.
 
     Dispatches through the ``video_dataset`` registry, so a new dataset style is
     one ``@registry.register_video_dataset`` builder + a config string. The
-    configs are duck-typed to avoid a data->config import cycle. ``frame_selector``
-    is an optional *prebuilt* ``FrameSelector`` (constructed once at the
-    ``build_video_data`` seam); builders thread it to
-    ``VideoDataset._init_frame_selector`` so query-aware selection works for every
-    dataset style while a mixture shares one scorer.
+    configs are duck-typed to avoid a data->config import cycle.
+    ``candidate_spec`` (derived from ``[frame_selector]`` at the
+    ``build_video_data`` seam) is threaded to
+    ``VideoDataset._init_candidate_spec`` so pool-mode query-aware selection
+    works for every dataset style.
     """
     builder = registry.get_video_dataset(video_config.dataset_type)
-    return builder(video_config, tokenizer_path, max_text_len, frame_selector)
+    return builder(video_config, tokenizer_path, max_text_len, candidate_spec)
 
 
 def build_video_data(
@@ -575,13 +664,16 @@ def build_video_data(
 
     Every corpus is built from ``video_config.for_source(src)``, so frame
     geometry is shared and only the per-source fields differ. The optional
-    ``frame_selector_config`` (``[frame_selector]``) is realized into a single
-    ``FrameSelector`` here and injected into every corpus, so a mixture shares one
-    scorer instead of loading N identical copies (per corpus, per worker), while
-    query-aware selection still applies across the whole mixture.
+    ``frame_selector_config`` (``[frame_selector]``) is reduced to a
+    ``CandidatePoolSpec`` injected into every corpus — datasets only decode
+    candidate pools; the selector itself (and its scorer) lives in the main
+    training process, which applies scoring/selection per batch via
+    ``frame_selection.apply_frame_selection``.
     """
-    selector = (
-        build_frame_selector(frame_selector_config) if frame_selector_config is not None else None
+    spec = (
+        CandidatePoolSpec.from_config(frame_selector_config)
+        if frame_selector_config is not None
+        else None
     )
     sources = video_config.sources()
     datasets: list[Dataset] = [
@@ -589,7 +681,7 @@ def build_video_data(
             video_config.for_source(src),
             tokenizer_path,
             max_text_len,
-            selector,
+            spec,
         )
         for src in sources
     ]

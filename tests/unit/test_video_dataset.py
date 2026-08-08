@@ -14,8 +14,13 @@ import torch
 from PIL import Image
 
 from kempnerforge.data import video_dataset as vd
+from kempnerforge.data.frame_selection import CandidatePoolSpec
 from kempnerforge.data.video_dataset import VideoCollator, WebVidVideoDataset
-from kempnerforge.data.vlm_dataset import DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD
+from kempnerforge.data.vlm_dataset import (
+    DEFAULT_IMAGE_MEAN,
+    DEFAULT_IMAGE_STD,
+    pil_to_uint8_tensor,
+)
 
 
 class _MockTokenizer:
@@ -266,6 +271,68 @@ class TestVideoCollator:
         with pytest.raises(ValueError, match="max_text_len must be positive"):
             VideoCollator(pad_id=0, max_text_len=0)
 
+    def _pool_sample(self, count: int, max_text_len: int = 8, tag: str = "a"):
+        # Ragged emission: exactly ``count`` frames, no worker-side padding.
+        pixels = torch.randint(1, 255, (count, 3, 16, 16), dtype=torch.uint8)
+        times = torch.arange(count, dtype=torch.float32)
+        ids = torch.zeros(max_text_len, dtype=torch.long)
+        labels = torch.full((max_text_len,), -100, dtype=torch.long)
+        return {
+            "candidate_pixels": pixels,
+            "candidate_count": torch.tensor(count, dtype=torch.long),
+            "candidate_times": times,
+            "query": f"question {tag}?",
+            "seed_key": f"/clip/{tag}.mp4|question {tag}?",
+            "input_ids": ids,
+            "labels": labels,
+        }
+
+    def test_pool_mode_batch(self):
+        collator = VideoCollator(pad_id=0, max_text_len=8)
+        batch = collator([self._pool_sample(6, tag="a"), self._pool_sample(2, tag="b")])
+        # C = batch-max candidate count (6 here), not a fixed candidate_frames.
+        assert batch["candidate_pixels"].shape == (2, 6, 3, 16, 16)
+        assert batch["candidate_pixels"].dtype == torch.uint8
+        assert batch["candidate_count"].tolist() == [6, 2]
+        assert batch["candidate_times"].shape == (2, 6)
+        assert batch["query"] == ["question a?", "question b?"]
+        assert batch["seed_key"] == ["/clip/a.mp4|question a?", "/clip/b.mp4|question b?"]
+        assert batch["input_ids"].shape == (2, 8)
+        assert batch["labels"].shape == (2, 8)
+        assert "pixel_values" not in batch  # produced downstream by apply_frame_selection
+
+    def test_pool_mode_pads_ragged_samples_to_batch_max(self):
+        collator = VideoCollator(pad_id=0, max_text_len=8)
+        s_full, s_short = self._pool_sample(5, tag="a"), self._pool_sample(2, tag="b")
+        batch = collator([s_full, s_short])
+        assert batch["candidate_pixels"].shape == (2, 5, 3, 16, 16)
+        # Real prefixes are copied verbatim...
+        assert torch.equal(batch["candidate_pixels"][0], s_full["candidate_pixels"])
+        assert torch.equal(batch["candidate_pixels"][1, :2], s_short["candidate_pixels"])
+        assert batch["candidate_times"][0].tolist() == [0.0, 1.0, 2.0, 3.0, 4.0]
+        assert batch["candidate_times"][1, :2].tolist() == [0.0, 1.0]
+        # ...and the padded tail past each count is zeros.
+        assert (batch["candidate_pixels"][1, 2:] == 0).all()
+        assert (batch["candidate_times"][1, 2:] == 0).all()
+
+    def test_pool_mode_all_failed_decodes_pads_to_one(self):
+        # Every sample in the batch failed to decode (count 0, empty pixel
+        # tensors): cmax floors at 1 so the batch still has a valid shape.
+        collator = VideoCollator(pad_id=0, max_text_len=8)
+        batch = collator([self._pool_sample(0, tag="a"), self._pool_sample(0, tag="b")])
+        assert batch["candidate_pixels"].shape == (2, 1, 3, 16, 16)
+        assert (batch["candidate_pixels"] == 0).all()
+        assert batch["candidate_times"].shape == (2, 1)
+        assert batch["candidate_count"].tolist() == [0, 0]
+
+    def test_pool_mode_forwards_dataset_idx(self):
+        collator = VideoCollator(pad_id=0, max_text_len=8)
+        s0, s1 = self._pool_sample(3, tag="a"), self._pool_sample(3, tag="b")
+        s0["dataset_idx"] = 0
+        s1["dataset_idx"] = 1
+        batch = collator([s0, s1])
+        assert batch["dataset_idx"].tolist() == [0, 1]
+
 
 # ---------------------------------------------------------------------------
 # Real dataset integration: build a synthetic WebVid layout (CSV manifest +
@@ -410,64 +477,194 @@ class TestVideoDatasetRegistry:
 
 
 # ---------------------------------------------------------------------------
-# Query-aware frame selection (base-class hook, dataset-agnostic)
+# Candidate-pool mode (base-class capability, dataset-agnostic)
 # ---------------------------------------------------------------------------
 
 
-class _FakeSelector:
-    """Records the query/k/seed_key and returns a fixed subset of indices."""
-
-    def __init__(self, indices):
-        self._indices = indices
-        self.calls = []
-
-    def select(self, frames, times, query, k, *, seed_key=None):
-        self.calls.append({"n": len(frames), "query": query, "k": k, "seed_key": seed_key})
-        return self._indices
-
-
-class TestGetItemWithSelector:
-    def _select_stub(self, indices):
-        # Mirror select_video_frames: decode a pool, subset to the given indices.
-        def _fn(path, query, selector, k, *, sampling_policy="uniform", seed_key=None):
-            selector.select(_dummy(len(indices) + 2), [], query, k, seed_key=seed_key)
-            frames = _frames(len(indices))
-            return frames, [float(i) for i in range(len(indices))]
-
-        return _fn
-
-    def test_uses_decode_clip_and_records_query_seed(self, monkeypatch):
-        sel = _FakeSelector([0, 1, 2])
-        captured = {}
-
-        def _select(path, query, selector, k, *, sampling_policy="uniform", seed_key=None):
-            captured.update(query=query, k=k, seed_key=seed_key, policy=sampling_policy)
-            return _frames(3), [0.0, 1.0, 2.0]
-
-        monkeypatch.setattr(vd, "select_video_frames", _select)
+class TestGetItemPoolMode:
+    def test_pool_contract_ragged_and_pixels(self, monkeypatch):
+        frames = _frames(4)
+        monkeypatch.setattr(
+            vd, "decode_candidate_pool", lambda path, **k: (frames, [0.0, 1.0, 2.0, 3.0])
+        )
         # The query is the sample's prompt (the input-time question/instruction),
         # never the caption/target; the seed is (clip path, query) so multiple
         # questions per clip draw independently (see the per-question test below).
-        ds = _StubVideoDataset(["7788"], ["a caption"], max_frames=8, prompt="describe:")
-        ds._frame_selector = sel
+        # max_text_len leaves room for prompt + target so labels stay supervised.
+        ds = _StubVideoDataset(
+            ["7788"], ["a caption"], max_frames=8, prompt="describe:", max_text_len=24
+        )
+        ds._candidate_spec = CandidatePoolSpec(candidate_frames=6)
         item = ds[0]
-        assert captured["query"] == "describe:"  # the prompt, not the caption
-        assert captured["k"] == 8  # max_frames
-        assert captured["seed_key"] == f"{ds._video_path('7788')}|describe:"
-        assert item["frame_mask"][:3].all() and not item["frame_mask"][3:].any()
-        assert item["frame_times"][:3].tolist() == [0.0, 1.0, 2.0]
+        # Ragged emission: exactly the decoded frames, no padding to
+        # candidate_frames (batch padding moved to VideoCollator).
+        assert item["candidate_pixels"].shape == (4, 3, 16, 16)
+        assert item["candidate_pixels"].dtype == torch.uint8
+        assert item["candidate_count"].item() == 4
+        for j in range(4):  # shipped pixels are the worker-side resize, exactly
+            assert torch.equal(item["candidate_pixels"][j], pil_to_uint8_tensor(frames[j], 16))
+        assert item["candidate_times"].tolist() == [0.0, 1.0, 2.0, 3.0]
+        assert item["query"] == "describe:"  # the prompt, not the caption
+        assert item["seed_key"] == f"{ds._video_path('7788')}|describe:"
+        assert "pixel_values" not in item  # selection happens downstream
+        assert not (item["labels"] == -100).all()  # supervised: real target + frames
+
+    def test_empty_query_fast_path_pre_strides_pool(self, monkeypatch):
+        # An empty query can never be scored: the worker pre-applies the exact
+        # uniform stride FrameSelector._fallback_indices would take, shipping
+        # only max_frames frames instead of the full pool.
+        from kempnerforge.data.frame_selection import uniform_stride_indices
+
+        frames = _frames(6)
+        times = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]
+        monkeypatch.setattr(vd, "decode_candidate_pool", lambda path, **k: (frames, times))
+        ds = _StubVideoDataset(["1"], ["a caption"], max_frames=4)  # prompt="" -> no query
+        ds._candidate_spec = CandidatePoolSpec(candidate_frames=8)
+        item = ds[0]
+        sel = uniform_stride_indices(6, 4)
+        assert sel == [0, 1, 3, 4]  # [i * n // k], pinned to _fallback_indices
+        assert item["candidate_count"].item() == 4
+        assert item["candidate_pixels"].shape == (4, 3, 16, 16)
+        for out_j, src_j in enumerate(sel):
+            assert torch.equal(
+                item["candidate_pixels"][out_j], pil_to_uint8_tensor(frames[src_j], 16)
+            )
+        assert item["candidate_times"].tolist() == [times[j] for j in sel]
+        assert not (item["labels"] == -100).all()  # still supervised (n > 0)
+
+    def test_empty_query_small_pool_ships_all(self, monkeypatch):
+        # n <= max_frames: nothing to stride, ship the whole pool (mirrors the
+        # selector's take-all branch, checked BEFORE its empty-query stride).
+        frames = _frames(3)
+        monkeypatch.setattr(
+            vd, "decode_candidate_pool", lambda path, **k: (frames, [0.0, 1.0, 2.0])
+        )
+        ds = _StubVideoDataset(["1"], ["a caption"], max_frames=4)  # prompt="" -> no query
+        ds._candidate_spec = CandidatePoolSpec(candidate_frames=8)
+        item = ds[0]
+        assert item["candidate_count"].item() == 3
+        assert item["candidate_pixels"].shape == (3, 3, 16, 16)
+        assert item["candidate_times"].tolist() == [0.0, 1.0, 2.0]
+
+    def test_whitespace_only_prompt_takes_fast_path(self, monkeypatch):
+        # " " strips to nothing: _fallback_indices would uniform-stride it, so
+        # the worker must pre-stride too (same strip semantics) instead of
+        # shipping the full pool across IPC for a deterministic no-op.
+        frames = _frames(6)
+        times = [float(i) for i in range(6)]
+        monkeypatch.setattr(vd, "decode_candidate_pool", lambda path, **k: (frames, times))
+        ds = _StubVideoDataset(
+            ["1"], ["a caption"], max_frames=4, prompt=" ", max_text_len=24
+        )
+        ds._candidate_spec = CandidatePoolSpec(candidate_frames=8)
+        item = ds[0]
+        assert item["candidate_count"].item() == 4  # pre-strided, not 6
+        assert item["candidate_times"].tolist() == [0.0, 1.0, 3.0, 4.0]
+
+    def test_selection_query_prefers_bare_question(self, monkeypatch):
+        # A QA record threads the bare question via VideoRecord.query; scoring
+        # conditions on it (not the rendered options/boilerplate prompt), and
+        # the seed key folds it in via make_seed_key.
+        from kempnerforge.data.frame_selection import make_seed_key
+        from kempnerforge.data.video_dataset import VideoRecord
+
+        monkeypatch.setattr(
+            vd, "decode_candidate_pool", lambda path, **k: (_frames(2), [0.0, 1.0])
+        )
+
+        class _BareQuestionDataset(_StubVideoDataset):
+            def _record(self, idx):
+                return VideoRecord(
+                    "/clip.mp4",
+                    "Question: what happens?\nA. x\nB. y\nAnswer with the option's letter.\nAnswer:",
+                    " A",
+                    query="what happens?",
+                )
+
+        ds = _BareQuestionDataset(["1"], ["x"], max_frames=4, max_text_len=48)
+        ds._candidate_spec = CandidatePoolSpec(candidate_frames=4)
+        item = ds[0]
+        assert item["query"] == "what happens?"
+        assert item["seed_key"] == make_seed_key("/clip.mp4", "what happens?")
+
+        # Without a bare question, selection falls back to the rendered prompt.
+        class _PromptOnlyDataset(_StubVideoDataset):
+            def _record(self, idx):
+                return VideoRecord("/clip.mp4", "describe the video", "a caption")
+
+        ds2 = _PromptOnlyDataset(["1"], ["x"], max_frames=4, max_text_len=48)
+        ds2._candidate_spec = CandidatePoolSpec(candidate_frames=4)
+        assert ds2[0]["query"] == "describe the video"
+
+    def test_non_empty_query_ships_full_pool(self, monkeypatch):
+        # A real query must NOT be pre-strided: the scorer needs the full pool.
+        frames = _frames(6)
+        monkeypatch.setattr(
+            vd, "decode_candidate_pool", lambda path, **k: (frames, [float(i) for i in range(6)])
+        )
+        ds = _StubVideoDataset(
+            ["1"], ["an answer"], max_frames=4, prompt="what happens?", max_text_len=24
+        )
+        ds._candidate_spec = CandidatePoolSpec(candidate_frames=8)
+        item = ds[0]
+        assert item["candidate_count"].item() == 6
+        assert item["candidate_pixels"].shape == (6, 3, 16, 16)
+
+    def test_fast_path_identity_with_full_pool_selection(self, monkeypatch):
+        # The #10 identity proof: a worker pre-strided (empty-query) sample fed
+        # through VideoCollator + apply_frame_selection yields exactly the
+        # pixel_values / frame_times the full-pool path yields for the same
+        # inputs — the fast path only moves the stride, never changes frames.
+        from kempnerforge.data.frame_selection import TopKSelector, apply_frame_selection
+
+        frames = _frames(6)
+        times = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]
+        monkeypatch.setattr(vd, "decode_candidate_pool", lambda path, **k: (frames, times))
+        ds = _StubVideoDataset(["1"], ["a caption"], max_frames=4)  # prompt="" -> no query
+        ds._candidate_spec = CandidatePoolSpec(candidate_frames=8)
+        strided_sample = ds[0]  # worker fast path: ships 4 pre-strided frames
+
+        # Full-pool sample for the same clip (what a worker without the fast
+        # path would ship): all 6 frames + count 6.
+        full_sample = dict(strided_sample)
+        full_sample["candidate_pixels"] = torch.stack(
+            [pil_to_uint8_tensor(f, 16) for f in frames]
+        )
+        full_sample["candidate_count"] = torch.tensor(6, dtype=torch.long)
+        full_sample["candidate_times"] = torch.tensor(times, dtype=torch.float32)
+
+        collator = VideoCollator(pad_id=0, max_text_len=8)
+        # Empty query -> selection never touches the scorer (fallback paths).
+        selector = TopKSelector(scorer=None)
+        out_strided = apply_frame_selection(
+            collator([strided_sample]), selector, max_frames=4, device="cpu"
+        )
+        out_full = apply_frame_selection(
+            collator([full_sample]), selector, max_frames=4, device="cpu"
+        )
+        assert torch.equal(out_strided["pixel_values"], out_full["pixel_values"])
+        assert torch.equal(out_strided["frame_times"], out_full["frame_times"])
+        assert torch.equal(out_strided["frame_mask"], out_full["frame_mask"])
+        assert out_full["frame_mask"].all()  # all 4 slots filled in both paths
+
+    def test_decode_kwargs_come_from_spec(self, monkeypatch):
+        captured = {}
+
+        def _decode(path, *, candidate_frames, candidate_fps, sampling_policy):
+            captured.update(cf=candidate_frames, cfps=candidate_fps, policy=sampling_policy)
+            return _frames(2), [0.0, 1.0]
+
+        monkeypatch.setattr(vd, "decode_candidate_pool", _decode)
+        ds = _StubVideoDataset(["1"], ["a cat."], max_frames=4)
+        ds._candidate_spec = CandidatePoolSpec(candidate_frames=12, candidate_fps=1.5)
+        ds[0]
+        assert captured == {"cf": 12, "cfps": 1.5, "policy": "uniform"}
 
     def test_seed_key_folds_in_query_for_per_question_independence(self, monkeypatch):
         # A QA corpus emits many questions per clip. Seeding on the path alone
         # would draw identical Gumbel noise for every question; the seed must fold
         # in the query so same-clip questions are independent yet reproducible.
-        seeds: list[str] = []
-
-        def _select(path, query, selector, k, *, sampling_policy="uniform", seed_key=None):
-            seeds.append(seed_key)
-            return _frames(2), [0.0, 1.0]
-
-        monkeypatch.setattr(vd, "select_video_frames", _select)
+        monkeypatch.setattr(vd, "decode_candidate_pool", lambda path, **k: (_frames(2), [0.0, 1.0]))
 
         class _TwoQuestionsOneClip(_StubVideoDataset):
             # Same clip path, different prompt per index (mimics a QA corpus).
@@ -477,135 +674,184 @@ class TestGetItemWithSelector:
                 return VideoRecord("/same/clip.mp4", ["q one?", "q two?"][idx], "answer")
 
         ds = _TwoQuestionsOneClip(["a", "b"], ["x", "y"], max_frames=4)
-        ds._frame_selector = _FakeSelector([0, 1])
-        ds[0]
-        ds[1]
+        ds._candidate_spec = CandidatePoolSpec(candidate_frames=4)
+        seeds = [ds[0]["seed_key"], ds[1]["seed_key"]]
         assert seeds == ["/same/clip.mp4|q one?", "/same/clip.mp4|q two?"]
         assert seeds[0] != seeds[1]  # independent draws for the two questions
 
-    def test_empty_prompt_gives_no_query(self, monkeypatch):
+    def test_empty_prompt_ships_empty_query(self, monkeypatch):
         # A captioning sample with no prompt has no query to condition on (the
         # deliberate expectation that query-aware selection cannot help it).
-        captured = {}
-
-        def _select(path, query, selector, k, *, sampling_policy="uniform", seed_key=None):
-            captured["query"] = query
-            return _frames(2), [0.0, 1.0]
-
-        monkeypatch.setattr(vd, "select_video_frames", _select)
+        monkeypatch.setattr(vd, "decode_candidate_pool", lambda path, **k: (_frames(2), [0.0, 1.0]))
         ds = _StubVideoDataset(["1"], ["the caption"], max_frames=4)  # prompt=""
-        ds._frame_selector = _FakeSelector([0, 1])
-        ds[0]
-        assert captured["query"] is None  # empty prompt -> no query, not the caption
+        ds._candidate_spec = CandidatePoolSpec(candidate_frames=4)
+        assert ds[0]["query"] == ""  # empty prompt -> no query, not the caption
 
-    def test_selection_error_degrades_to_empty_clip(self, monkeypatch):
+    def test_decode_error_degrades_to_empty_pool(self, monkeypatch):
         def _boom(*a, **k):
-            raise RuntimeError("scoring blew up")
+            raise RuntimeError("decode blew up")
 
-        monkeypatch.setattr(vd, "select_video_frames", _boom)
+        monkeypatch.setattr(vd, "decode_candidate_pool", _boom)
         ds = _StubVideoDataset(["1"], ["a cat."], max_frames=4)
-        ds._frame_selector = _FakeSelector([0])
+        ds._candidate_spec = CandidatePoolSpec(candidate_frames=4)
         item = ds[0]
-        assert not item["frame_mask"].any()
-        assert (item["labels"] == -100).all()
+        assert item["candidate_count"].item() == 0
+        assert (item["candidate_pixels"] == 0).all()
+        assert (item["labels"] == -100).all()  # trains on nothing
 
-    def test_scorer_unavailable_propagates(self, monkeypatch):
-        from kempnerforge.data.frame_selection import ScorerUnavailableError
+    def test_custom_mean_std_rejected_with_spec(self, monkeypatch):
+        import transformers
 
-        def _unavail(*a, **k):
-            raise ScorerUnavailableError("prefetch the model")
-
-        monkeypatch.setattr(vd, "select_video_frames", _unavail)
-        ds = _StubVideoDataset(["1"], ["a cat."], max_frames=4)
-        ds._frame_selector = _FakeSelector([0])
-        with pytest.raises(ScorerUnavailableError):
-            ds[0]  # systemic misconfig must not be silently masked
-
-
-class TestBuilderThreadsSelector:
-    def test_backward_compatible_without_kwarg(self, monkeypatch):
-        # Existing call sites pass no frame_selector; the builder still
-        # dispatches and receives None (no selector).
-        captured = {}
-
-        def _fake_builder(video_config, tokenizer_path, max_text_len, frame_selector=None):
-            captured["sel"] = frame_selector
-            return object()
-
-        from kempnerforge.config.registry import registry
-        from kempnerforge.config.video import VideoConfig
-        from kempnerforge.data.video_dataset import build_video_dataset
-
-        monkeypatch.setattr(registry, "get_video_dataset", lambda name: _fake_builder)
-        build_video_dataset(VideoConfig(), "gpt2", 16)  # no frame_selector arg
-        assert captured["sel"] is None
-
-    def test_build_video_dataset_threads_prebuilt_selector(self, monkeypatch):
-        # build_video_dataset forwards the prebuilt frame_selector object to the
-        # builder (the object is now constructed once at the build_video_data seam).
-        captured = {}
-
-        def _fake_builder(video_config, tokenizer_path, max_text_len, frame_selector=None):
-            captured["sel"] = frame_selector
-            return object()
-
-        from kempnerforge.config.registry import registry
-
-        monkeypatch.setattr(registry, "get_video_dataset", lambda name: _fake_builder)
-        from kempnerforge.config.video import VideoConfig
-        from kempnerforge.data.video_dataset import build_video_dataset
-
-        sentinel = object()
-        build_video_dataset(VideoConfig(), "gpt2", 16, frame_selector=sentinel)
-        assert captured["sel"] is sentinel
-
-
-class _StubQADataset(vd.VideoDataset):
-    """A non-WebVid dataset that adopts selection via the base hook alone.
-
-    Proves the base-class ``_init_frame_selector`` / ``_decode_clip`` path is
-    dataset-agnostic: this class has no frame-selection code of its own, uses a
-    question (not a caption) as its query, and a different seed key.
-    """
-
-    def __init__(self, question, frame_selector=None):
-        self._question = question
-        self._init_frame_selector(frame_selector)
-
-    def probe(self, path, seed_key):
-        # The question is the query (the input-time prompt), never a target.
-        return self._decode_clip(
-            path,
-            self._question,
-            fps=1.0,
-            min_frames=2,
-            max_frames=4,
-            sampling_policy="uniform",
-            seed_key=seed_key,
+        monkeypatch.setattr(
+            transformers.AutoTokenizer, "from_pretrained", staticmethod(lambda p: _MockTokenizer())
         )
+        kwargs = dict(
+            records=[],
+            tokenizer_path="mock",
+            max_text_len=8,
+            max_frames=4,
+            min_frames=2,
+            fps=1.0,
+            candidate_spec=CandidatePoolSpec(candidate_frames=8),
+        )
+        # Pool-mode frames are normalized downstream with the SigLIP defaults;
+        # a custom mean/std would silently diverge, so it must be rejected.
+        with pytest.raises(ValueError, match="image_mean"):
+            vd.VideoQADataset(image_mean=(0.4, 0.4, 0.4), **kwargs)
+        vd.VideoQADataset(**kwargs)  # defaults are fine
+
+
+class TestBuilderThreadsSpec:
+    def test_backward_compatible_without_kwarg(self, monkeypatch):
+        # Existing call sites pass no candidate_spec; the builder still
+        # dispatches and receives None (no pool mode).
+        captured = {}
+
+        def _fake_builder(video_config, tokenizer_path, max_text_len, candidate_spec=None):
+            captured["spec"] = candidate_spec
+            return object()
+
+        from kempnerforge.config.registry import registry
+        from kempnerforge.config.video import VideoConfig
+        from kempnerforge.data.video_dataset import build_video_dataset
+
+        monkeypatch.setattr(registry, "get_video_dataset", lambda name: _fake_builder)
+        build_video_dataset(VideoConfig(), "gpt2", 16)  # no candidate_spec arg
+        assert captured["spec"] is None
+
+    def test_build_video_dataset_threads_spec(self, monkeypatch):
+        captured = {}
+
+        def _fake_builder(video_config, tokenizer_path, max_text_len, candidate_spec=None):
+            captured["spec"] = candidate_spec
+            return object()
+
+        from kempnerforge.config.registry import registry
+
+        monkeypatch.setattr(registry, "get_video_dataset", lambda name: _fake_builder)
+        from kempnerforge.config.video import VideoConfig
+        from kempnerforge.data.video_dataset import build_video_dataset
+
+        spec = CandidatePoolSpec(candidate_frames=32)
+        build_video_dataset(VideoConfig(), "gpt2", 16, spec)
+        assert captured["spec"] is spec
+
+    def test_build_video_data_derives_spec_from_config(self, monkeypatch):
+        # build_video_data reduces the [frame_selector] config to a
+        # CandidatePoolSpec — the dataset side never sees a selector object.
+        captured = {}
+
+        def _fake_builder(video_config, tokenizer_path, max_text_len, candidate_spec=None):
+            captured["spec"] = candidate_spec
+            return object()
+
+        from kempnerforge.config.frame_selector import FrameSelectorConfig
+        from kempnerforge.config.registry import registry
+        from kempnerforge.config.video import VideoConfig
+
+        monkeypatch.setattr(registry, "get_video_dataset", lambda name: _fake_builder)
+        vd.build_video_data(
+            VideoConfig(data_root="/fake/root"),
+            "gpt2",
+            16,
+            frame_selector_config=FrameSelectorConfig(candidate_frames=64, candidate_fps=2.0),
+        )
+        assert captured["spec"] == CandidatePoolSpec(candidate_frames=64, candidate_fps=2.0)
 
 
 class TestBaseHookGenerality:
-    def test_second_dataset_style_gets_selection(self, monkeypatch):
-        captured = {}
+    def test_second_dataset_style_gets_pool_mode(self, monkeypatch):
+        # A genuine non-WebVid style (own record scheme: flat qa_<idx>.mp4
+        # paths + a per-sample question) adopts pool mode with ZERO
+        # frame-selection code of its own — it only threads candidate_spec
+        # through super().__init__ and inherits the full pool contract.
+        import transformers
 
-        def _select(path, query, selector, k, *, sampling_policy="uniform", seed_key=None):
-            captured.update(query=query, k=k, seed_key=seed_key)
-            return _frames(3), [0.0, 1.0, 2.0]
+        monkeypatch.setattr(
+            transformers.AutoTokenizer, "from_pretrained", staticmethod(lambda p: _MockTokenizer())
+        )
+        frames = _frames(3)
+        monkeypatch.setattr(
+            vd, "decode_candidate_pool", lambda path, **k: (frames, [0.0, 0.5, 1.0])
+        )
 
-        monkeypatch.setattr(vd, "select_video_frames", _select)
-        ds = _StubQADataset("what color is the car?")
-        ds._frame_selector = _FakeSelector([0, 1, 2])  # simulate a built selector
-        frames, times = ds.probe("clip.mp4", seed_key="qa-42")
-        assert captured == {"query": "what color is the car?", "k": 4, "seed_key": "qa-42"}
-        assert len(frames) == 3
+        class _JsonlQADataset(vd.VideoQADataset):
+            """Second style: parallel question/answer lists, flat path layout."""
 
-    def test_no_selector_falls_back_to_plain_decode(self, monkeypatch):
-        monkeypatch.setattr(vd, "decode_video_frames", lambda *a, **k: _decoded(4))
-        ds = _StubQADataset("q")  # no selector configured
-        frames, times = ds.probe("clip.mp4", seed_key="x")
-        assert len(frames) == 4  # plain uniform decode path
+            def __init__(self, questions, answers, video_dir, **kwargs):
+                self._questions = questions
+                self._answers = answers
+                self._qa_video_dir = video_dir
+                super().__init__(**kwargs)
 
+            def __len__(self):
+                return len(self._questions)
 
-def _dummy(n: int) -> list[int]:
-    return list(range(n))
+            def _record(self, idx):
+                return vd.VideoRecord(
+                    f"{self._qa_video_dir}/qa_{idx}.mp4",
+                    self._questions[idx],
+                    self._answers[idx],
+                )
+
+        ds = _JsonlQADataset(
+            ["what happens?"],
+            ["a dog runs."],
+            "/qa/videos",
+            tokenizer_path="mock",
+            max_text_len=32,
+            max_frames=8,
+            min_frames=2,
+            fps=1.0,
+            frame_size=16,
+            candidate_spec=CandidatePoolSpec(candidate_frames=6),
+        )
+        item = ds[0]
+        # Full pool contract under the ragged shape (n, 3, S, S) uint8.
+        assert item["candidate_pixels"].shape == (3, 3, 16, 16)
+        assert item["candidate_pixels"].dtype == torch.uint8
+        for j in range(3):  # per-frame uint8 conversion, exactly
+            assert torch.equal(item["candidate_pixels"][j], pil_to_uint8_tensor(frames[j], 16))
+        assert item["candidate_count"].item() == 3
+        assert item["candidate_times"].tolist() == [0.0, 0.5, 1.0]
+        assert item["query"] == "what happens?"  # the per-sample prompt
+        assert item["seed_key"] == "/qa/videos/qa_0.mp4|what happens?"
+        assert "pixel_values" not in item  # selection happens downstream
+
+        # Without a spec the same style stays in the plain decode path.
+        monkeypatch.setattr(
+            vd, "decode_video_frames", lambda *a, **k: (frames, [0.0, 0.5, 1.0])
+        )
+        ds_off = _JsonlQADataset(
+            ["what happens?"],
+            ["a dog runs."],
+            "/qa/videos",
+            tokenizer_path="mock",
+            max_text_len=32,
+            max_frames=8,
+            min_frames=2,
+            fps=1.0,
+            frame_size=16,
+        )
+        assert ds_off._candidate_spec is None  # off by default
+        assert "candidate_pixels" not in ds_off[0]

@@ -38,6 +38,48 @@ DEFAULT_IMAGE_MEAN = (0.5, 0.5, 0.5)
 DEFAULT_IMAGE_STD = (0.5, 0.5, 0.5)
 
 
+def pil_to_uint8_tensor(img: Any, image_size: int) -> torch.Tensor:
+    """Resize and convert a PIL ``Image`` to a ``(3, H, W)`` uint8 tensor.
+
+    The resize half of ``pil_to_tensor`` (RGB-convert + bilinear resize, no
+    normalization). Dataloader workers use it to ship raw frames cheaply (4x
+    smaller than float32) with normalization applied once downstream via
+    ``normalize_frames``; ``pil_to_tensor`` composes the two, so the resize
+    stays single-sourced.
+    """
+    from PIL import Image
+
+    if not isinstance(img, Image.Image):
+        raise TypeError(
+            f"Expected a PIL.Image, got {type(img).__name__}. "
+            "If the dataset returns raw bytes, decode with PIL first."
+        )
+    img = img.convert("RGB").resize((image_size, image_size), Image.Resampling.BILINEAR)
+    import numpy as np
+
+    # np.array (not asarray): PIL exposes a read-only buffer, and a copy keeps
+    # torch.from_numpy off the non-writable-tensor warning path.
+    arr = np.array(img, dtype=np.uint8)  # (H, W, 3)
+    return torch.from_numpy(arr).permute(2, 0, 1).contiguous()  # (3, H, W)
+
+
+def normalize_frames(
+    frames: torch.Tensor,
+    mean: tuple[float, float, float],
+    std: tuple[float, float, float],
+) -> torch.Tensor:
+    """Normalize uint8 frames -> float32: ``(x / 255 - mean) / std``.
+
+    Accepts any ``(..., 3, H, W)`` layout and runs on the input's device, so a
+    batch of worker-shipped uint8 frames can be normalized once on GPU with
+    output bit-identical to CPU ``pil_to_tensor`` (elementwise IEEE fp32 ops).
+    """
+    t = frames.to(torch.float32) / 255.0
+    mean_t = torch.tensor(mean, dtype=t.dtype, device=t.device).view(3, 1, 1)
+    std_t = torch.tensor(std, dtype=t.dtype, device=t.device).view(3, 1, 1)
+    return (t - mean_t) / std_t
+
+
 def pil_to_tensor(
     img: Any,
     image_size: int,
@@ -54,21 +96,7 @@ def pil_to_tensor(
     preprocessing as the single source of truth, rather than
     re-implementing resize/normalize.
     """
-    from PIL import Image
-
-    if not isinstance(img, Image.Image):
-        raise TypeError(
-            f"Expected a PIL.Image, got {type(img).__name__}. "
-            "If the dataset returns raw bytes, decode with PIL first."
-        )
-    img = img.convert("RGB").resize((image_size, image_size), Image.Resampling.BILINEAR)
-    import numpy as np
-
-    arr = np.asarray(img, dtype=np.float32) / 255.0  # (H, W, 3)
-    t = torch.from_numpy(arr).permute(2, 0, 1).contiguous()  # (3, H, W)
-    mean_t = torch.tensor(mean, dtype=t.dtype).view(3, 1, 1)
-    std_t = torch.tensor(std, dtype=t.dtype).view(3, 1, 1)
-    return (t - mean_t) / std_t
+    return normalize_frames(pil_to_uint8_tensor(img, image_size), mean, std)
 
 
 def frames_to_clip_tensor(

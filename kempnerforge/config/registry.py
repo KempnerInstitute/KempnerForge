@@ -190,14 +190,14 @@ class Registry:
         """Decorator to register a video-dataset builder.
 
         Builders take ``(video_config, tokenizer_path, max_text_len,
-        frame_selector=None)`` and return a map-style ``Dataset`` whose
+        candidate_spec=None)`` and return a map-style ``Dataset`` whose
         samples ``VideoCollator`` batches (see
         ``kempnerforge.data.video_dataset.VideoDataset``). Selected by
-        ``[video].dataset_type``. ``frame_selector`` is an optional *prebuilt*
-        ``FrameSelector`` (constructed once at the ``build_video_data`` seam from
+        ``[video].dataset_type``. ``candidate_spec`` is an optional
+        ``CandidatePoolSpec`` (derived at the ``build_video_data`` seam from
         the ``[frame_selector]`` section); builders thread it to
-        ``VideoDataset._init_frame_selector`` so query-aware frame selection
-        works for every dataset style while a mixture shares one scorer.
+        ``VideoDataset._init_candidate_spec`` so pool-mode query-aware frame
+        selection works for every dataset style.
         """
 
         def decorator(fn: Callable) -> Callable:
