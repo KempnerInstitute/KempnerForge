@@ -25,6 +25,7 @@ image preprocessing (``pil_to_tensor``) used on the single-image path.
 
 from __future__ import annotations
 
+import functools
 import logging
 from typing import TYPE_CHECKING, Any
 
@@ -44,6 +45,22 @@ _MATCH_EPS_S = 1e-3
 
 class _SeekUnreliableError(Exception):
     """Raised when seek-based decoding cannot guarantee serial-identical output."""
+
+
+@functools.cache
+def _log_fallback_once(reason: str) -> None:
+    """Log a seek-to-serial fallback once per distinct cause for this process.
+
+    On a corpus where seeking systematically fails, a per-clip log line would
+    bury the training log, so fallbacks are deduplicated by ``reason`` (the
+    exception type name): ``functools.cache`` runs the body — and thus the
+    log call — only on each cause's first occurrence.
+    """
+    logger.debug(
+        "seek decode failed (%s); falling back to serial decode "
+        "(further fallbacks with this cause are not logged)",
+        reason,
+    )
 
 
 @registry.register_sampling_policy("uniform")
@@ -129,9 +146,11 @@ def decode_video_frames(
         try:
             return _decode_seek(container, stream, targets)
         except (av.FFmpegError, _SeekUnreliableError) as e:
-            reason = f"{type(e).__name__}: {e}"
-    logger.debug("seek decode failed for %s (%s); falling back to serial decode", path, reason)
+            reason = type(e).__name__
+    _log_fallback_once(reason)
     with av.open(path) as container:
+        if not container.streams.video:
+            return []
         stream = container.streams.video[0]
         stream.thread_type = "AUTO"
         return _decode_serial(container, stream, targets)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import logging
 import os
 
 import pytest
@@ -311,9 +312,7 @@ class TestSeekMatchesSerial:
         self._assert_parity(dst, fps=2.0, min_frames=4, max_frames=8)
 
 
-@pytest.mark.skipif(
-    not _H264_AVAILABLE, reason="requires a PyAV build with the libx264 encoder"
-)
+@pytest.mark.skipif(not _H264_AVAILABLE, reason="requires a PyAV build with the libx264 encoder")
 class TestSeekMatchesSerialH264:
     """Parity on the codec shape of real data: H.264 with B-frames.
 
@@ -440,6 +439,61 @@ class TestSeekFallback:
         monkeypatch.setattr(video_io, "_decode_seek", _raise)
         got = video_io.decode_video_frames(str(path), fps=2.0, min_frames=4, max_frames=8)
         assert [f.tobytes() for f in got] == [f.tobytes() for f in expected]
+
+    def test_fallback_logged_once_per_cause(self, tmp_path, monkeypatch, caplog):
+        import kempnerforge.data.video_io as video_io
+
+        path = tmp_path / "clip.mp4"
+        _write_mp4(path, n_frames=40, gop_size=12)
+
+        def _raise(container, stream, targets):
+            raise video_io._SeekUnreliableError("test")
+
+        monkeypatch.setattr(video_io, "_decode_seek", _raise)
+        video_io._log_fallback_once.cache_clear()
+        with caplog.at_level(logging.DEBUG, logger="kempnerforge.data.video_io"):
+            for _ in range(3):
+                video_io.decode_video_frames(str(path), fps=2.0, min_frames=4, max_frames=8)
+        fallback_lines = [r for r in caplog.records if "falling back" in r.message]
+        assert len(fallback_lines) == 1
+
+    def test_fallback_reopen_without_video_stream_returns_empty(self, tmp_path, monkeypatch):
+        import av
+
+        import kempnerforge.data.video_io as video_io
+
+        path = tmp_path / "clip.mp4"
+        _write_mp4(path, n_frames=40, gop_size=12)
+
+        def _raise(container, stream, targets):
+            raise video_io._SeekUnreliableError("test")
+
+        # The second open (the fallback reopen) yields a container whose video
+        # stream has vanished — the guard must return [] rather than crash.
+        real_open = av.open
+        opens = {"n": 0}
+
+        class _NoVideoStreams:
+            video = ()
+
+        class _NoVideoContainer:
+            streams = _NoVideoStreams()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def _flaky_open(p, *args, **kwargs):
+            opens["n"] += 1
+            if opens["n"] == 2:
+                return _NoVideoContainer()
+            return real_open(p, *args, **kwargs)
+
+        monkeypatch.setattr(video_io, "_decode_seek", _raise)
+        monkeypatch.setattr(av, "open", _flaky_open)
+        assert video_io.decode_video_frames(str(path), fps=2.0, min_frames=4, max_frames=8) == []
 
     def test_landing_check_raises_on_shifted_stream(self, tmp_path):
         import av
