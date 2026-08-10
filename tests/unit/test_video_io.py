@@ -450,6 +450,7 @@ class TestSeekFallback:
             raise video_io._SeekUnreliableError("test")
 
         monkeypatch.setattr(video_io, "_decode_seek", _raise)
+        monkeypatch.setattr(logging.getLogger("kempnerforge"), "propagate", True)
         video_io._log_fallback_once.cache_clear()
         with caplog.at_level(logging.DEBUG, logger="kempnerforge.data.video_io"):
             for _ in range(3):
