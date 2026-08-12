@@ -25,6 +25,7 @@ image preprocessing (``pil_to_tensor``) used on the single-image path.
 
 from __future__ import annotations
 
+import io
 import logging
 from typing import TYPE_CHECKING, Any
 
@@ -105,9 +106,20 @@ def _frame_time(pts: float | None, index: int, avg_rate: float) -> float:
 
 
 def decode_video_frames(
-    path: str, *, fps: float, min_frames: int, max_frames: int, sampling_policy: str = "uniform"
+    source: str | bytes,
+    *,
+    fps: float,
+    min_frames: int,
+    max_frames: int,
+    sampling_policy: str = "uniform",
 ) -> tuple[list[PILImage], list[float]]:
     """Decode a clip into sampled ``PIL.Image`` frames (RGB) + their times.
+
+    ``source`` is a filesystem path, or the clip's bytes for a corpus that stores
+    clips inside archives. Bytes are wrapped in a fresh ``BytesIO`` per open
+    rather than once: the serial fallback below reopens the container, and a
+    single shared handle would already be positioned (and possibly closed) by the
+    seek attempt.
 
     Frames are chosen by the registered ``sampling_policy`` (default
     ``"uniform"`` = ``sample_timestamps``): each target timestamp is mapped to
@@ -137,8 +149,12 @@ def decode_video_frames(
             "Install the video extra: `uv sync --group video`."
         ) from e
 
+    def _open() -> Any:
+        return av.open(source if isinstance(source, str) else io.BytesIO(source))
+
+    label = source if isinstance(source, str) else f"<{len(source)} bytes>"
     sample = registry.get_sampling_policy(sampling_policy)
-    with av.open(path) as container:
+    with _open() as container:
         if not container.streams.video:
             return [], []
         stream = container.streams.video[0]
@@ -149,8 +165,8 @@ def decode_video_frames(
             return _decode_seek(container, stream, targets)
         except (av.FFmpegError, _SeekUnreliableError) as e:
             reason = f"{type(e).__name__}: {e}"
-    logger.debug("seek decode failed for %s (%s); falling back to serial decode", path, reason)
-    with av.open(path) as container:
+    logger.debug("seek decode failed for %s (%s); falling back to serial decode", label, reason)
+    with _open() as container:
         stream = container.streams.video[0]
         stream.thread_type = "AUTO"
         images, times = _decode_serial(container, stream, targets)
@@ -172,6 +188,14 @@ def _decode_seek(
     its target (frames may have been skipped; exempt for targets near 0.0,
     where the landing is the stream's first frame — what serial selects too),
     or EOF with nothing decoded after a seek.
+
+    One seek does not serve one target: after a match the same generator keeps
+    running, and a fresh seek is issued only on reaching a keyframe whose
+    pending target is more than the measured keyframe interval away, i.e. only
+    when a whole GOP can be skipped. Selection is unaffected, since a backward
+    seek rewinds only to a keyframe at or before the pending target. Seeking per
+    target instead re-decodes each GOP once per target inside it, and with
+    keyframes seconds apart many targets share a GOP.
     """
     tb = stream.time_base
     if tb is None:
@@ -184,8 +208,10 @@ def _decode_seek(
         container.seek(int(tgt / tb), stream=stream, backward=True, any_frame=False)
         last = None
         last_t = 0.0
-        matched = False
+        n_matched = 0
         first = True
+        hit_next_gop = False
+        prev_key_t: float | None = None
         for frame in container.decode(stream):  # fresh generator after every seek
             if frame.time is None:
                 raise _SeekUnreliableError("frame without pts")
@@ -200,18 +226,35 @@ def _decode_seek(
                     images.append(img)
                     times.append(t)
                     j += 1
-                matched = True
-                break
+                n_matched += 1
+                if j >= len(targets):
+                    return images, times
+                tgt = targets[j]
+            elif n_matched and frame.key_frame:
+                # A new GOP, pending target still ahead. Seek only if the target
+                # is further off than the keyframe interval just measured, i.e.
+                # a whole GOP can be skipped; otherwise it is in this GOP and a
+                # seek would land right back here. Checked only *after* the match
+                # above, so a keyframe that already satisfies the target is used
+                # rather than re-reached by rewinding to the previous keyframe.
+                gop_s = None if prev_key_t is None else t - prev_key_t
+                if gop_s is None or tgt - t > gop_s:
+                    hit_next_gop = True
+                    break
+            if frame.key_frame:
+                prev_key_t = t
             last = frame
             last_t = t
-        if not matched:  # EOF: the remaining targets sit past the last frame
-            if last is None:
-                raise _SeekUnreliableError(f"no frames decodable at or after {tgt:.3f}s")
-            tail = last.to_image()
-            for _ in range(len(targets) - j):
-                images.append(tail)
-                times.append(last_t)
-            j = len(targets)
+        if hit_next_gop:
+            continue
+        # EOF: the remaining targets sit past the last frame.
+        if last is None:
+            raise _SeekUnreliableError(f"no frames decodable at or after {tgt:.3f}s")
+        tail = last.to_image()
+        for _ in range(len(targets) - j):
+            images.append(tail)
+            times.append(last_t)
+        j = len(targets)
     return images, times
 
 

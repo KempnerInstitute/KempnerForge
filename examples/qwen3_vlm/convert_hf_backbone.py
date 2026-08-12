@@ -138,6 +138,12 @@ def convert(hf_dir: str, config_path: str, out: str) -> None:
         config.adapter,
         config.vlm,
         frames_per_clip=frames,
+        # Honor [time_embedding] so the emitted DCP carries frame_time_embed.*
+        # keys. Without this the checkpoint lacks them and a run whose config
+        # enables the embedding cannot warm-start from it: DCP's load planner is
+        # strict and raises "Missing key in checkpoint state_dict". None (no
+        # section) builds no module, so non-time-embedding output is unchanged.
+        time_embedding_config=config.time_embedding,
     )
 
     converted, unmapped = map_state_dict(_load_hf_state_dict(hf_dir))
@@ -174,14 +180,19 @@ def convert(hf_dir: str, config_path: str, out: str) -> None:
     n_tf = sum(1 for k in full if k.startswith("transformer."))
     n_vis = sum(1 for k in full if k.startswith("vision_encoder."))
     n_ad = sum(1 for k in full if k.startswith("adapter."))
+    n_te = sum(1 for k in full if k.startswith("frame_time_embed."))
     logger.info(
-        "Wrote complete VLM DCP (%d tensors: %d transformer, %d vision, %d adapter) -> %s\n"
+        "Wrote complete VLM DCP (%d tensors: %d transformer, %d vision, %d adapter, "
+        "%d frame_time_embed) -> %s\n"
         "Load it via [checkpoint].load_path + "
-        "exclude_from_loading=['optimizer','dataloader'] (weights-only warm start).",
+        "exclude_from_loading=['optimizer','dataloader'] (weights-only warm start).\n"
+        "Pair this checkpoint with the config it was built from: the presence or "
+        "absence of frame_time_embed.* must match [time_embedding].",
         len(full),
         n_tf,
         n_vis,
         n_ad,
+        n_te,
         out_path,
     )
 

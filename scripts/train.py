@@ -232,7 +232,13 @@ def main() -> None:
         )
 
     # --- Optimizer + Scheduler ---
-    optimizer = build_optimizer(model, config.optimizer)
+    # VLM module patterns let [optimizer].lr_multipliers name modules the same
+    # way [vlm].freeze does; None for text-only runs, where there are no modules.
+    optimizer = build_optimizer(
+        model,
+        config.optimizer,
+        module_patterns=getattr(config.vlm, "module_patterns", None),
+    )
     scheduler = build_scheduler(optimizer, config.scheduler, max_steps=tc.max_steps)
 
     # --- Checkpoint ---

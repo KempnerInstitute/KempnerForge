@@ -7,6 +7,7 @@ and a char-level mock tokenizer (no HF download), mirroring the approach in
 
 from __future__ import annotations
 
+import collections
 import importlib.util
 
 import pytest
@@ -855,3 +856,49 @@ class TestBaseHookGenerality:
         )
         assert ds_off._candidate_spec is None  # off by default
         assert "candidate_pixels" not in ds_off[0]
+
+
+class TestPromptPool:
+    """``[video].prompt_pool``: one paraphrase per example, varying by epoch.
+
+    A single fixed instruction teaches the model to tie that exact wording to
+    "produce a caption"; a pool keeps the behaviour general. The draw must be a
+    pure function of (index, epoch) so every rank and every resume agrees.
+    """
+
+    POOL = [f"prompt {i}" for i in range(8)]
+
+    def _ds(self, pool):
+        ds = vd.VideoQADataset.__new__(vd.VideoQADataset)
+        ds._prompt = "fixed"
+        ds._prompt_pool = list(pool)
+        return ds
+
+    def test_empty_pool_falls_back_to_scalar_prompt(self):
+        assert self._ds([])._prompt_for(0) == "fixed"
+
+    def test_pool_overrides_scalar_prompt(self):
+        assert self._ds(self.POOL)._prompt_for(0) in self.POOL
+
+    def test_varies_across_examples(self):
+        ds = self._ds(self.POOL)
+        assert len({ds._prompt_for(i) for i in range(200)}) == len(self.POOL)
+
+    def test_same_index_same_epoch_is_stable(self):
+        a, b = self._ds(self.POOL), self._ds(self.POOL)
+        assert [a._prompt_for(i) for i in range(50)] == [b._prompt_for(i) for i in range(50)]
+
+    def test_varies_across_epochs(self):
+        ds = self._ds(self.POOL)
+        e0 = [ds._prompt_for(i) for i in range(50)]
+        ds.set_epoch(1)
+        e1 = [ds._prompt_for(i) for i in range(50)]
+        assert e0 != e1
+        ds.set_epoch(0)
+        assert [ds._prompt_for(i) for i in range(50)] == e0  # returning is stable
+
+    def test_draw_is_roughly_uniform(self):
+        ds = self._ds(self.POOL)
+        counts = collections.Counter(ds._prompt_for(i) for i in range(4000))
+        expected = 4000 / len(self.POOL)
+        assert all(0.7 * expected < c < 1.3 * expected for c in counts.values())

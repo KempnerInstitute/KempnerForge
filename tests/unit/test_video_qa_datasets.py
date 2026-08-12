@@ -190,9 +190,32 @@ class TestNExTQA:
         )
         assert len(ds) == 3
         assert [ds._record(i).target for i in range(3)] == [" A", " B", " C"]
-        prompt = ds._record(0).prompt
-        for letter, j in zip("ABCDE", range(5), strict=True):
-            assert f"{letter}. choice {j}" in prompt
+        # Whole string, not `in`: a containment check passes on a prompt that has
+        # picked up an extra prefix, hint or answer cue, which is exactly the
+        # difference between the training rendering and the published one.
+        assert ds._record(0).prompt == (
+            "Question: what happens in clip 0\n"
+            "A. choice 0\nB. choice 1\nC. choice 2\nD. choice 3\nE. choice 4\n"
+            "Answer with the option's letter.\n"
+            "Answer:"
+        )
+
+    def test_mcq_plain_renders_the_published_prompt(self, tmp_path, stub_decoder):
+        """`mcq_plain` is what the published harness sends: question and lettered
+        options, with no "Question: " prefix, no hint and no "Answer:" cue.
+
+        Scoring against a published number requires this rendering; the default
+        `mcq_letter` is a training choice and differs on all three counts.
+        """
+        ds = NExTQADataset(
+            str(_nextqa_root(tmp_path, "MC", "train", n=3)),
+            "train", TOKENIZER, 96, subset="MC", qa_format="mcq_plain", **GEOMETRY,
+        )
+        assert ds._record(0).prompt == (
+            "what happens in clip 0\n"
+            "A. choice 0\nB. choice 1\nC. choice 2\nD. choice 3\nE. choice 4"
+        )
+        assert ds._record(0).target == " A"
 
     def test_oe_reads_text_answer_and_has_no_options(self, tmp_path, stub_decoder):
         ds = NExTQADataset(
@@ -848,6 +871,11 @@ class TestRegistry:
             "perception_test",
             "nextqa",
             "cinepile",
+            "tempcompass",
+            "mlvu",
+            "perception_test_val",
+            "llava_video",
+            "onevision2",
         }
 
     def test_builders_go_through_build_video_dataset(self, tmp_path, stub_decoder):

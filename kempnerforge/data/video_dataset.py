@@ -43,6 +43,7 @@ from torch.utils.data import Dataset
 from kempnerforge.config.registry import registry
 from kempnerforge.data.frame_selection import (
     CandidatePoolSpec,
+    _derive_seed,
     decode_candidate_pool,
     make_seed_key,
     uniform_stride_indices,
@@ -132,6 +133,10 @@ class VideoRecord(NamedTuple):
     prompt: str
     target: str
     query: str = ""
+    # Archive-backed corpora only: the container holding this clip and its
+    # ``(offset, size)`` inside it. Unset means ``video_path`` is the file.
+    archive: str = ""
+    byte_range: tuple[int, int] | None = None
 
 
 class VideoQADataset(VideoDataset):
@@ -209,6 +214,26 @@ class VideoQADataset(VideoDataset):
         """Record at ``idx``. Override to build records lazily."""
         return self._records[idx]
 
+    def set_epoch(self, epoch: int) -> None:
+        """Note the epoch, so prompt-pool draws vary across passes.
+
+        The dataloader forwards it from its checkpointed state, so a resume
+        redraws the same prompts.
+        """
+        self._epoch = int(epoch)
+
+    def _prompt_for(self, idx: int) -> str:
+        """The instruction for ``idx``: one pool draw, or the fixed ``prompt``.
+
+        Seeded from ``(idx, epoch)``, not a shared generator: forked workers
+        would desynchronize, and every rank must draw the same prompt.
+        """
+        pool = getattr(self, "_prompt_pool", None)
+        if not pool:
+            return self._prompt
+        seed = _derive_seed(getattr(self, "_epoch", 0), f"prompt|{idx}")
+        return pool[seed % len(pool)]
+
     def __len__(self) -> int:
         return len(self._records)
 
@@ -234,7 +259,9 @@ class VideoQADataset(VideoDataset):
                 continue
             # Mirror __getitem__: a missing clip decodes to zero frames -> all
             # labels masked, so an unsupervised sample regardless of its text.
-            if not record.video_path or not os.path.exists(record.video_path):
+            # Archive-backed: video_path is a locator, so stat the archive.
+            clip = record.archive or record.video_path
+            if not clip or not os.path.exists(clip):
                 continue
             _, labels = _tokenize_and_mask(
                 self._tokenizer, record.target, self._max_text_len, record.prompt or None
@@ -294,7 +321,7 @@ class VideoQADataset(VideoDataset):
         assert spec is not None
         try:
             frames, times = decode_candidate_pool(
-                record.video_path,
+                self._decode_source(record),
                 candidate_frames=spec.candidate_frames,
                 candidate_fps=spec.candidate_fps,
                 sampling_policy=self._sampling_policy,
@@ -348,6 +375,23 @@ class VideoQADataset(VideoDataset):
             "labels": labels,
         }
 
+    @staticmethod
+    def _decode_source(record: VideoRecord) -> str | bytes:
+        """What ``decode_video_frames`` should read for ``record``.
+
+        A path for an on-disk corpus; the clip's bytes when the record points
+        into an archive, read by one seek rather than by unpacking the container.
+        """
+        if not record.archive or record.byte_range is None:
+            return record.video_path
+        offset, size = record.byte_range
+        with open(record.archive, "rb") as fh:
+            fh.seek(offset)
+            buf = fh.read(size)
+        if len(buf) != size:
+            raise OSError(f"{record.archive}: read {len(buf)} of {size} bytes at {offset}")
+        return buf
+
     def __getitem__(self, idx: int) -> dict[str, Any]:
         record = self._record(idx)
         query = self._selection_query(record)
@@ -355,7 +399,7 @@ class VideoQADataset(VideoDataset):
             return self._candidate_pool_sample(record, query)
         try:
             frames, frame_times_s = decode_video_frames(
-                record.video_path,
+                self._decode_source(record),
                 fps=self._fps,
                 min_frames=self._min_frames,
                 max_frames=self._max_frames,
@@ -428,6 +472,7 @@ class WebVidVideoDataset(VideoQADataset):
         frame_size: int = 224,
         max_samples: int = 0,
         prompt: str = "",
+        prompt_pool: list[str] | None = None,
         dataset_name: str = "webvid-10M",
         sampling_policy: str = "uniform",
         image_mean: tuple[float, float, float] = DEFAULT_IMAGE_MEAN,
@@ -448,6 +493,7 @@ class WebVidVideoDataset(VideoQADataset):
         # kept as parallel lists and a VideoRecord is built per __getitem__.
         self._ids, self._caps = self._load_manifest(csv_dir, max_samples)
         self._prompt = prompt
+        self._prompt_pool = list(prompt_pool or ())
         super().__init__(
             tokenizer_path=tokenizer_path,
             max_text_len=max_text_len,
@@ -515,7 +561,9 @@ class WebVidVideoDataset(VideoQADataset):
         return len(self._ids)
 
     def _record(self, idx: int) -> VideoRecord:
-        return VideoRecord(self._video_path(self._ids[idx]), self._prompt, self._caps[idx])
+        return VideoRecord(
+            self._video_path(self._ids[idx]), self._prompt_for(idx), self._caps[idx]
+        )
 
 
 class VideoCollator:
@@ -622,6 +670,7 @@ def _build_webvid(
         frame_size=video_config.frame_size,
         max_samples=video_config.max_samples,
         prompt=video_config.prompt,
+        prompt_pool=video_config.prompt_pool,
         dataset_name=video_config.dataset_name,
         sampling_policy=video_config.sampling_policy,
         candidate_spec=candidate_spec,

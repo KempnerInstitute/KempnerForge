@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -264,3 +265,110 @@ class TestAdamW:
             assert p.ndim >= 2
         for p in no_decay_group["params"]:
             assert p.ndim <= 1
+
+
+class TestPerModuleLR:
+    """``optimizer.lr_multipliers``: one rate per module, resolved like freezing.
+
+    A VLM alignment stage trains a large pretrained encoder next to a small
+    randomly-initialised adapter; the rate the adapter needs can damage
+    pretrained features, and that damage does not show up in the training loss.
+    """
+
+    PATTERNS = {
+        m: [m, f"{m}.*"] for m in ("transformer", "vision_encoder", "adapter", "frame_time_embed")
+    }
+
+    def _model(self):
+        class M(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.transformer = torch.nn.Linear(8, 8)
+                self.vision_encoder = torch.nn.Linear(8, 8)
+                self.adapter = torch.nn.Linear(8, 8)
+                self.frame_time_embed = torch.nn.Linear(8, 8)
+
+        return M()
+
+    def _cfg(self, **kw):
+        return OptimizerConfig(name="adamw", lr=1e-4, fused=False, **kw)
+
+    def _lrs(self, opt, model):
+        owner = {id(p): n.split(".")[0] for n, p in model.named_parameters()}
+        out = {}
+        for g in opt.param_groups:
+            for p in g["params"]:
+                out.setdefault(owner[id(p)], set()).add(g["lr"])
+        return {k: sorted(v) for k, v in out.items()}
+
+    def test_no_multipliers_keeps_a_single_rate(self):
+        m = self._model()
+        opt = build_optimizer(m, self._cfg(), module_patterns=self.PATTERNS)
+        assert all(v == [1e-4] for v in self._lrs(opt, m).values())
+
+    def test_multiplier_scales_only_the_named_module(self):
+        m = self._model()
+        opt = build_optimizer(
+            m, self._cfg(lr_multipliers={"vision_encoder": 0.1}), module_patterns=self.PATTERNS
+        )
+        lrs = self._lrs(opt, m)
+        assert lrs["vision_encoder"] == [1e-5]
+        assert lrs["adapter"] == [1e-4]
+        assert lrs["frame_time_embed"] == [1e-4]
+
+    def test_multipliers_above_one_are_allowed(self):
+        m = self._model()
+        opt = build_optimizer(
+            m,
+            self._cfg(lr_multipliers={"adapter": 4.0, "frame_time_embed": 4.0}),
+            module_patterns=self.PATTERNS,
+        )
+        lrs = self._lrs(opt, m)
+        assert lrs["adapter"] == [4e-4]
+        assert lrs["frame_time_embed"] == [4e-4]
+        assert lrs["vision_encoder"] == [1e-4]
+
+    def test_frozen_params_are_excluded(self):
+        m = self._model()
+        for p in m.transformer.parameters():
+            p.requires_grad_(False)
+        opt = build_optimizer(
+            m, self._cfg(lr_multipliers={"adapter": 2.0}), module_patterns=self.PATTERNS
+        )
+        assert "transformer" not in self._lrs(opt, m)
+
+    def test_decay_split_survives_inside_a_module(self):
+        m = self._model()
+        opt = build_optimizer(
+            m, self._cfg(lr_multipliers={"adapter": 2.0}), module_patterns=self.PATTERNS
+        )
+        adapter_groups = [
+            g
+            for g in opt.param_groups
+            if any(id(p) in {id(q) for q in m.adapter.parameters()} for p in g["params"])
+        ]
+        assert sorted(g["weight_decay"] for g in adapter_groups) == [0.0, 0.1]
+
+    def test_default_groups_stay_first_for_checkpoint_compatibility(self):
+        m = self._model()
+        opt = build_optimizer(
+            m, self._cfg(lr_multipliers={"vision_encoder": 0.5}), module_patterns=self.PATTERNS
+        )
+        assert opt.param_groups[0]["weight_decay"] == 0.1
+        assert opt.param_groups[1]["weight_decay"] == 0.0
+
+    def test_unknown_module_name_is_rejected(self):
+        m = self._model()
+        with pytest.raises(ValueError, match="unknown modules"):
+            build_optimizer(
+                m, self._cfg(lr_multipliers={"nope": 2.0}), module_patterns=self.PATTERNS
+            )
+
+    def test_multipliers_without_patterns_is_rejected(self):
+        m = self._model()
+        with pytest.raises(ValueError, match="module_patterns"):
+            build_optimizer(m, self._cfg(lr_multipliers={"adapter": 2.0}))
+
+    def test_non_positive_multiplier_is_rejected(self):
+        with pytest.raises(ValueError, match="must be positive"):
+            OptimizerConfig(lr_multipliers={"adapter": 0.0})

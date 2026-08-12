@@ -938,7 +938,7 @@ class CandidatePoolSpec:
 
 
 def decode_candidate_pool(
-    path: str,
+    source: str | bytes,
     *,
     candidate_frames: int,
     candidate_fps: float = 0.0,
@@ -959,7 +959,7 @@ def decode_candidate_pool(
     """
     if candidate_fps > 0:
         frames, times = decode_video_frames(
-            path,
+            source,
             fps=candidate_fps,
             min_frames=1,
             max_frames=candidate_frames,
@@ -967,7 +967,7 @@ def decode_candidate_pool(
         )
     else:
         frames, times = decode_video_frames(
-            path,
+            source,
             fps=1.0,
             min_frames=candidate_frames,
             max_frames=candidate_frames,

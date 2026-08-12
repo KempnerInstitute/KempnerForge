@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -22,9 +22,21 @@ class OptimizerConfig:
     # Schedule-Free specific
     schedule_free_warmup_steps: int = 0  # Internal warmup for schedule-free optimizer
 
+    # Per-module LR, keyed by ``VLMConfig.module_patterns`` names; a module's
+    # rate is ``lr * multiplier`` and anything unlisted stays at ``lr``.
+    # Multipliers rather than absolute rates so the scheduler keeps scaling
+    # every group by one factor. Lets a pretrained encoder train slower than a
+    # freshly initialised adapter.
+    lr_multipliers: dict[str, float] = field(default_factory=dict)
+
     def __post_init__(self) -> None:
         if self.lr <= 0:
             raise ValueError("lr must be positive")
+        for module, mult in self.lr_multipliers.items():
+            if mult <= 0:
+                raise ValueError(
+                    f"optimizer.lr_multipliers[{module!r}] must be positive (got {mult})"
+                )
         if self.weight_decay < 0:
             raise ValueError("weight_decay must be non-negative")
         if not (0 <= self.betas[0] < 1 and 0 <= self.betas[1] < 1):

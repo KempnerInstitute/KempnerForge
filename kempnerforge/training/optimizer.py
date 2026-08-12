@@ -15,7 +15,9 @@ All optimizers:
 
 from __future__ import annotations
 
+import fnmatch
 import logging
+from collections.abc import Mapping
 
 import torch
 
@@ -552,38 +554,75 @@ def _should_decay(name: str, param: torch.nn.Parameter) -> bool:
 def build_optimizer(
     model: torch.nn.Module,
     config: OptimizerConfig,
+    module_patterns: Mapping[str, list[str]] | None = None,
 ) -> torch.optim.Optimizer:
-    """Construct an optimizer with per-parameter-group weight decay settings.
+    """Construct an optimizer with per-group weight decay and per-module LR.
+
+    Groups are decay-eligibility crossed with the parameter's module when
+    ``config.lr_multipliers`` is set; unlisted parameters keep ``config.lr``.
+    Modules resolve through the same ``module_patterns`` ``apply_freeze_specs``
+    uses, so a module means one thing to both freezing and the LR.
 
     Args:
         model: Model whose parameters to optimize.
         config: Optimizer configuration.
+        module_patterns: ``{module: [fnmatch patterns]}`` naming each module's
+            parameters; required to honour ``lr_multipliers``.
 
     Returns:
         Configured optimizer instance.
     """
-    decay_params = []
-    no_decay_params = []
+    multipliers = dict(config.lr_multipliers)
+    if multipliers and not module_patterns:
+        raise ValueError(
+            "optimizer.lr_multipliers needs module_patterns to resolve module names; "
+            "none were passed to build_optimizer"
+        )
+    unknown = set(multipliers) - set(module_patterns or {})
+    if unknown:
+        raise ValueError(
+            f"optimizer.lr_multipliers names unknown modules {sorted(unknown)}; "
+            f"known modules are {sorted(module_patterns or {})}"
+        )
 
+    def _module_of(name: str) -> str:
+        for module in multipliers:
+            if any(fnmatch.fnmatch(name, pat) for pat in module_patterns[module]):
+                return module
+        return ""
+
+    # {(module, decay): [params]} -- "" is the module-less default at config.lr.
+    buckets: dict[tuple[str, bool], list[torch.nn.Parameter]] = {}
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        if _should_decay(name, param):
-            decay_params.append(param)
-        else:
-            no_decay_params.append(param)
+        buckets.setdefault((_module_of(name), _should_decay(name, param)), []).append(param)
 
-    param_groups = [
-        {"params": decay_params, "weight_decay": config.weight_decay},
-        {"params": no_decay_params, "weight_decay": 0.0},
-    ]
+    # Saved optimizer state indexes param_groups positionally, so this order
+    # must not change: module-less groups first, decay before no-decay.
+    def _order(item: tuple[tuple[str, bool], list]) -> tuple[str, bool]:
+        (module, decay) = item[0]
+        return (module, not decay)
 
-    # Log parameter counts
-    n_decay = sum(p.numel() for p in decay_params)
-    n_no_decay = sum(p.numel() for p in no_decay_params)
-    logger.info(
-        f"Optimizer groups: {n_decay:,} params with decay, {n_no_decay:,} params without decay"
-    )
+    param_groups = []
+    for (module, decay), params in sorted(buckets.items(), key=_order):
+        group: dict = {
+            "params": params,
+            "weight_decay": config.weight_decay if decay else 0.0,
+        }
+        if module:
+            group["lr"] = config.lr * multipliers[module]
+        param_groups.append(group)
+
+    for (module, decay), params in sorted(buckets.items(), key=_order):
+        lr = config.lr * multipliers[module] if module else config.lr
+        logger.info(
+            "Optimizer group: module=%s decay=%s params=%s lr=%.3g",
+            module or "(default)",
+            decay,
+            f"{sum(p.numel() for p in params):,}",
+            lr,
+        )
 
     builder = registry.get_optimizer(config.name)
     return builder(param_groups, config)

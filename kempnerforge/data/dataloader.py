@@ -75,6 +75,10 @@ class StatefulDataLoader:
 
     def __iter__(self):
         self.sampler.set_epoch(self._epoch)
+        # Prompt-pool datasets redraw per epoch, so they need it too.
+        setter = getattr(self._dataloader.dataset, "set_epoch", None)
+        if callable(setter):
+            setter(self._epoch)
         # Re-apply skip on every iter() so double-resume within the same epoch
         # stays aligned. The sampler consumes _skip once per iter(), and
         # _batches_yielded persists across save/load so the skip is re-computable.

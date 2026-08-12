@@ -32,6 +32,7 @@ _SOURCE_OVERRIDES = (
     "subset",
     "split",
     "prompt",
+    "prompt_pool",
     "text_source",
     "qa_format",
     "max_samples",
@@ -75,6 +76,7 @@ class VideoDatasetSource:
     subset: str = ""
     split: str = ""
     prompt: str = ""
+    prompt_pool: list[str] = field(default_factory=list)
     text_source: str = ""
     qa_format: str = ""
     max_samples: int = 0
@@ -148,6 +150,10 @@ class VideoConfig:
     fps: float = 2.0
     frame_size: int = 224
     prompt: str = ""
+    # Caption prompts sampled one per example, seeded by (index, epoch);
+    # non-empty wins over ``prompt``. A pool of paraphrases keeps the model from
+    # tying one exact wording to "produce a caption".
+    prompt_pool: list[str] = field(default_factory=list)
     text_source: str = ""
     qa_format: str = "mcq_letter"
     require_video_file: bool | None = None
@@ -181,6 +187,7 @@ class VideoConfig:
                 subset=src.subset or self.subset,
                 split=src.split or self.split,
                 prompt=src.prompt or self.prompt,
+                prompt_pool=src.prompt_pool or self.prompt_pool,
                 text_source=src.text_source or self.text_source,
                 qa_format=src.qa_format or self.qa_format,
                 max_samples=src.max_samples or self.max_samples,
@@ -257,6 +264,11 @@ class VideoConfig:
             raise ValueError(f"video.split must be one of {_VIDEO_SPLITS} (got {self.split!r})")
         if self.max_samples < 0:
             raise ValueError(f"video.max_samples must be non-negative (got {self.max_samples})")
+        for pool, where in [(self.prompt_pool, "video")] + [
+            (s.prompt_pool, f"video.datasets[{s.dataset_type!r}]") for s in self.datasets
+        ]:
+            if any(not p.strip() for p in pool):
+                raise ValueError(f"{where}.prompt_pool entries must be non-empty strings")
         if self.min_frames < 1:
             raise ValueError(f"video.min_frames must be >= 1 (got {self.min_frames})")
         if self.max_frames < 1:
