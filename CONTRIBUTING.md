@@ -105,6 +105,7 @@ Branch naming convention:
 | `refactor/` | Code cleanup, no behavior change |
 | `test/` | Adding or fixing tests |
 | `docs/` | Documentation only |
+| `bench` | Benchmarking code |
 
 Examples: `feat/context-parallelism`, `fix/checkpoint-resume-rank0`, `refactor/cleanup-eval-registry`.
 
