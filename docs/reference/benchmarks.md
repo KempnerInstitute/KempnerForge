@@ -8,7 +8,7 @@ reproduction commands, and the shell script that produced them.
 ## MFU scaling (dense)
 
 Report:
-[`benchmarks/mfu_scaling/mfu_scaling.md`](https://github.com/KempnerInstitute/KempnerForge/blob/main/benchmarks/mfu_scaling/mfu_scaling.md).
+[`benchmarks/mfu_scaling/`](https://github.com/KempnerInstitute/KempnerForge/tree/main/benchmarks/mfu_scaling).
 Driver:
 [`benchmarks/mfu_scaling/mfu_bench.sh`](https://github.com/KempnerInstitute/KempnerForge/blob/main/benchmarks/mfu_scaling/mfu_bench.sh).
 
@@ -63,7 +63,7 @@ its tail.
 ## MoE Expert Parallelism
 
 Report:
-[`benchmarks/moe_expert_parallel/moe_ep_benchmark.md`](https://github.com/KempnerInstitute/KempnerForge/blob/main/benchmarks/moe_expert_parallel/moe_ep_benchmark.md).
+[`benchmarks/moe_expert_parallel/`](https://github.com/KempnerInstitute/KempnerForge/tree/main/benchmarks/moe_expert_parallel).
 Driver:
 [`benchmarks/moe_expert_parallel/moe_ep_bench.sh`](https://github.com/KempnerInstitute/KempnerForge/blob/main/benchmarks/moe_expert_parallel/moe_ep_bench.sh).
 

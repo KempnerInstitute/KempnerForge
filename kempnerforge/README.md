@@ -113,7 +113,7 @@ Llama-3 architecture on NVIDIA H200 (141 GB), bf16 + full activation checkpointi
 | 32 | 8 | 13B | TP=4 + FSDP=8 | 32.7% | 104,309 |
 | 32 | 8 | 70B | TP=4 + FSDP=8 | 25.4% | 17,657 |
 
-Full 14-configuration sweep: [`benchmarks/mfu_scaling/mfu_scaling.md`](benchmarks/mfu_scaling/mfu_scaling.md). MoE expert parallelism results: [`benchmarks/moe_expert_parallel/`](benchmarks/moe_expert_parallel/).
+Full 14-configuration sweep: [`benchmarks/mfu_scaling/`](benchmarks/mfu_scaling/). MoE expert parallelism results: [`benchmarks/moe_expert_parallel/`](benchmarks/moe_expert_parallel/).
 
 ## Quick start
 

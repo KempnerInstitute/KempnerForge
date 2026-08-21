@@ -163,7 +163,7 @@ Grouped GEMM consumes these directly via
 `ModuleList`, and FSDP2 wraps three tensors instead of `3 × E`.
 
 Measured impact (see
-[Benchmark § MoE Expert Packing](https://github.com/KempnerInstitute/KempnerForge/blob/main/benchmarks/moe_packed/moe_packed_benchmark.md)):
+[Benchmark § MoE Expert Packing](https://github.com/KempnerInstitute/KempnerForge/tree/main/benchmarks/moe_packed)):
 
 | Experts | Unpacked tok/s | Packed tok/s | Delta |
 |:-------:|---------------:|-------------:|:-----:|

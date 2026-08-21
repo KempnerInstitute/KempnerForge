@@ -190,7 +190,7 @@ moe_packed_experts = true
 
 Replaces the `ModuleList` of experts with three packed
 `(num_experts, dim, hidden)` tensors. Measured speedups from
-[`benchmarks/moe_packed`](https://github.com/KempnerInstitute/KempnerForge/blob/main/benchmarks/moe_packed/moe_packed_benchmark.md):
+[`benchmarks/moe_packed`](https://github.com/KempnerInstitute/KempnerForge/tree/main/benchmarks/moe_packed):
 
 | `num_experts` | Unpacked | Packed | Speedup |
 |:---:|---:|---:|:---:|

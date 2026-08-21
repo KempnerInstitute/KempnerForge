@@ -115,7 +115,7 @@ Register them in your own script by subclassing `TrainingHook`.
   [README § Quick Start](https://github.com/KempnerInstitute/KempnerForge#quick-start)
   for single- and multi-node launch scripts.
 - **Measured performance**: see
-  [`benchmarks/mfu_scaling/mfu_scaling.md`](https://github.com/KempnerInstitute/KempnerForge/blob/main/benchmarks/mfu_scaling/mfu_scaling.md)
+  [`benchmarks/mfu_scaling/`](https://github.com/KempnerInstitute/KempnerForge/tree/main/benchmarks/mfu_scaling)
   for MFU / throughput numbers across 1–32 GPUs.
 - **Contribute**:
   [CONTRIBUTING.md](https://github.com/KempnerInstitute/KempnerForge/blob/main/CONTRIBUTING.md)
