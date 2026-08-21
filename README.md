@@ -103,7 +103,7 @@ Parallelism application order is enforced. Wrong order causes silent correctness
 
 ## Benchmarks
 
-Benchmarking and performance studies live in [`benchmarks/`](benchmarks/README.md): MFU and dense scaling sweeps, MoE expert parallelism and expert packing, multi-node profiling, and config validation.
+Benchmarking and performance studies live in [`benchmarks/`](benchmarks): MFU and dense scaling sweeps, MoE expert parallelism and expert packing, multi-node profiling, and config validation.
 
 ## Quick start
 

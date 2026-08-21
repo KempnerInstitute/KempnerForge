@@ -82,7 +82,7 @@ Not applicable — this skill is informational. When the user is about to act on
 ## Gotchas
 - This document lags the code between commits. Re-run the Context auto-gen (Phase 2) or spot-check before acting on a gap claim.
 - "Tested" means there is a unit or distributed test. Heavy behaviors (MoE expert balancing over long runs, FSDP2 with >64 GPUs, FP8 stability) are validated by e2e / benchmark runs, not unit tests. Absence of a unit test is not the same as absence of validation.
-- "Implemented" does not mean "production-validated at all scales". The `benchmarks/` package holds the actual bench scripts (`bench_forward.py`, `bench_moe.py`, `bench_optimizer.py`, `mfu_scaling/`, `moe_expert_parallel/`, `moe_packed/`) — run them directly for scale validation. The MFU benchmarks cover dense up through 70B and MoE up through 32 GPUs with EP.
+- "Implemented" does not mean "production-validated at all scales". The `benchmarks/` package holds the actual bench scripts (`micro/` for single-GPU component timing; `mfu_scaling/`, `moe_expert_parallel/`, `moe_packed/` for the at-scale campaigns) — run them directly for scale validation. The MFU benchmarks cover dense up through 70B and MoE up through 32 GPUs with EP.
 - If you are about to tell the user a feature is missing, grep for it first. Claims decay fast.
 
 ## Related skills

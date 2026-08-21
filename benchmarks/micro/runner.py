@@ -5,13 +5,13 @@ table. Uses CUDA events for accurate GPU timing.
 
 Usage:
     # Run all benchmarks
-    uv run python benchmarks/runner.py
+    uv run python benchmarks/micro/runner.py
 
     # Run a specific benchmark file
-    uv run python benchmarks/bench_forward.py
+    uv run python benchmarks/micro/bench_forward.py
 
     # Save results to JSON
-    uv run python benchmarks/runner.py --output results.json
+    uv run python benchmarks/micro/runner.py --output results.json
 """
 
 from __future__ import annotations
@@ -147,10 +147,10 @@ def main() -> None:
     all_results: list[BenchmarkResult] = []
 
     # Import and run each benchmark suite
-    from benchmarks.bench_data import run_data_benchmarks
-    from benchmarks.bench_forward import run_forward_benchmarks
-    from benchmarks.bench_moe import run_moe_benchmarks
-    from benchmarks.bench_optimizer import run_optimizer_benchmarks
+    from benchmarks.micro.bench_data import run_data_benchmarks
+    from benchmarks.micro.bench_forward import run_forward_benchmarks
+    from benchmarks.micro.bench_moe import run_moe_benchmarks
+    from benchmarks.micro.bench_optimizer import run_optimizer_benchmarks
 
     all_results.extend(run_forward_benchmarks())
     all_results.extend(run_moe_benchmarks())

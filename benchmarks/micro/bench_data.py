@@ -8,7 +8,7 @@ from pathlib import Path
 
 import numpy as np
 
-from benchmarks.runner import BenchmarkResult, print_results
+from benchmarks.micro.runner import BenchmarkResult, print_results
 
 
 def run_data_benchmarks() -> list[BenchmarkResult]:

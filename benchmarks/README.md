@@ -1,14 +1,12 @@
 # Benchmarking and Performance Reports
 
-This folder holds measurements of two different kinds.
+The campaign directories hold finished results. Each one records a specific run, pinned to the
+commit, hardware and date behind it, and these are the figures the top-level README and the
+documentation quote.
 
-**Campaign reports** are at-scale results: one directory per campaign, each with a standalone
-report carrying its numbers alongside the hardware, commit and driver script that produced
-them. These are the figures quoted in the top-level README and throughout the documentation.
-
-The **micro-benchmark harness** (`runner.py` and the `bench_*.py` modules) times individual
-components on a single GPU. It exists to catch a regression in a forward pass or an optimizer
-step, not to characterize the framework at scale.
+[`micro/`](micro/) is instruments rather than results. `runner.py` and the `bench_*.py` files
+are a harness you execute to time individual components against whatever commit you have
+checked out, on a single GPU. Nothing in it is a stored measurement.
 
 ## Measured performance
 
@@ -55,22 +53,22 @@ Component-level timing via CUDA events. Requires a GPU; no cluster allocation ne
 
 ```bash
 # Everything, with a results table
-uv run python benchmarks/runner.py
+uv run python benchmarks/micro/runner.py
 
 # One module
-uv run python benchmarks/bench_forward.py
+uv run python benchmarks/micro/bench_forward.py
 
 # Machine-readable output
-uv run python benchmarks/runner.py --output results.json
+uv run python benchmarks/micro/runner.py --output results.json
 ```
 
 | Module | Covers |
 |--------|--------|
-| [`bench_forward.py`](bench_forward.py) | Forward pass, forward+backward, attention, MLP (125M model) |
-| [`bench_moe.py`](bench_moe.py) | MoE forward+backward, router comparison, grouped GEMM vs Python loop |
-| [`bench_optimizer.py`](bench_optimizer.py) | Step time and memory for every registered optimizer |
-| [`bench_data.py`](bench_data.py) | Memory-mapped iteration, sequence packing, mixture sampling (CPU only) |
-| [`runner.py`](runner.py) | Timing utilities and the CLI the others share |
+| [`micro/bench_forward.py`](micro/bench_forward.py) | Forward pass, forward+backward, attention, MLP (125M model) |
+| [`micro/bench_moe.py`](micro/bench_moe.py) | MoE forward+backward, router comparison, grouped GEMM vs Python loop |
+| [`micro/bench_optimizer.py`](micro/bench_optimizer.py) | Step time and memory for every registered optimizer |
+| [`micro/bench_data.py`](micro/bench_data.py) | Memory-mapped iteration, sequence packing, mixture sampling (CPU only) |
+| [`micro/runner.py`](micro/runner.py) | Timing utilities and the CLI the others share |
 
 ## Adding a campaign
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from benchmarks.runner import BenchmarkResult, print_results, run_benchmark
+from benchmarks.micro.runner import BenchmarkResult, print_results, run_benchmark
 from kempnerforge.config.model import ModelConfig
 from kempnerforge.config.optimizer import OptimizerConfig
 from kempnerforge.model.transformer import Transformer
