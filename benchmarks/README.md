@@ -11,20 +11,31 @@ checked out, on a single GPU.
 ## Measured performance
 
 Llama-3 architecture on NVIDIA H200 (141 GB), bf16 with full activation checkpointing, fused
-AdamW, cosine LR, `seq_len=4096`. Best MFU per GPU count:
+AdamW, cosine LR, `seq_len=4096`. Best measured MFU at each scale:
 
-| GPUs | Nodes | Model | Best config | MFU | tok/s |
-|-----:|------:|-------|-------------|----:|------:|
-| 1 | 1 | 7B | single GPU | **57.8%** | 10,471 |
-| 2 | 1 | 7B | FSDP=2 | 51.7% | 18,728 |
-| 4 | 1 | 7B | FSDP=4 | **53.8%** | 38,983 |
-| 8 | 2 | 13B | FSDP=8 | **44.4%** | 35,405 |
-| 16 | 4 | 13B | TP=4 + FSDP=4 | 33.7% | 53,814 |
-| 32 | 8 | 13B | TP=4 + FSDP=8 | 32.7% | 104,309 |
-| 32 | 8 | 70B | TP=4 + FSDP=8 | 25.4% | 17,657 |
+| GPUs | Nodes | Model | Best config | MFU | tok/s | Source |
+|-----:|------:|-------|-------------|----:|------:|--------|
+| 1 | 1 | 7B | single GPU | **57.8%** | 10,471 | [`mfu_scaling/`](mfu_scaling/) |
+| 2 | 1 | 7B | FSDP=2 | 51.7% | 18,728 | [`mfu_scaling/`](mfu_scaling/) |
+| 4 | 1 | 7B | FSDP=4 | **53.8%** | 38,983 | [`mfu_scaling/`](mfu_scaling/) |
+| 8 | 2 | 13B | FSDP=8 | **44.4%** | 35,405 | [`mfu_scaling/`](mfu_scaling/) |
+| 16 | 4 | 13B | TP=4 + FSDP=4 | 33.7% | 53,814 | [`mfu_scaling/`](mfu_scaling/) |
+| 32 | 8 | 13B | TP=4 + FSDP=8 | 33.2% | 110,373 | [`weak_scaling_160gpu/`](weak_scaling_160gpu/) |
+| 32 | 8 | 70B | TP=4 + FSDP=8 | 26.5% | 18,688 | [`weak_scaling_160gpu/`](weak_scaling_160gpu/) |
+| 160 | 40 | 13B | TP=4 + FSDP=40 | 32.2% | 534,644 | [`weak_scaling_160gpu/`](weak_scaling_160gpu/) |
+| 160 | 40 | 70B | TP=4 + FSDP=40 | 24.3% | 85,571 | [`weak_scaling_160gpu/`](weak_scaling_160gpu/) |
+| 360 | 90 | 175B | TP=4 + FSDP=90 | **47.7%** | 154,523 | [`175b_360gpu/`](175b_360gpu/) |
 
-From [`mfu_scaling/`](mfu_scaling/), the 14-configuration sweep. MFU is against the H200 bf16
-peak of 989 TFLOP/s per GPU.
+MFU is against the H200 dense bf16 peak of 989 TFLOP/s per GPU.
+
+Two things in that table are worth reading twice. **Efficiency improves at 175B**, to 47.7%,
+rather than degrading with scale, because larger matmuls amortize communication and
+kernel-launch overhead better. And **MFU is nearly flat from 32 to 160 GPUs**, so scaling out is
+not what limits these runs.
+
+The 32-GPU rows come from the later campaign, which measured 32 through 160 GPUs in one sweep, so
+the curve is internally consistent. [`mfu_scaling/`](mfu_scaling/) measured the same two configs
+in April and reported 32.7% and 25.4%; see the caveats below.
 
 ## Campaign reports
 
@@ -35,6 +46,8 @@ peak of 989 TFLOP/s per GPU.
 | [`profiling/`](profiling/) | 2026-04-07 | 13B on 24 GPUs | Where GPU time actually goes on a multi-node run: 39.3% GEMM, 47.5% NCCL, 13.1% other kernels, at 216.9 achieved TFLOP/s. |
 | [`moe_expert_parallel/`](moe_expert_parallel/) | 2026-04-10 | 32 GPUs, MoE | Wrapping `layer.attention` and `layer.mlp` as separate FSDP2 units instead of the whole block: +67% throughput, -13.2 GB. Also argues why single-digit MFU is the correct number for an MoE this size, not a bug. |
 | [`moe_packed/`](moe_packed/) | 2026-04-13 | 8 GPUs, MoE E=8/16/64 | Packed expert storage beats unpacked at every expert count tested: +5.1% at E=8, +36.5% at E=16, +22.7% at E=64 with EP=4. Memory is at parity; the win grows with E. |
+| [`weak_scaling_160gpu/`](weak_scaling_160gpu/) | 2026-06-30 | 8-160 GPUs, 13B/70B | Weak-scaling efficiency holds at 92-97% out to 160 GPUs and MFU is nearly flat, so scaling out is not the bottleneck. Per-GPU memory falls monotonically as FSDP shards further. 13B beats 70B on MFU at every scale, bounding the "bigger is more efficient" trend. |
+| [`175b_360gpu/`](175b_360gpu/) | 2026-07-03 | 360 GPUs, 175B dense | The largest run to date: 47.7% MFU sustained for ~11 h, compute-bound by telemetry (78% SM / 62% tensor / 24% DRAM), async checkpointing at 0.9% of wall-clock. Also documents why `grad_accum > 1` OOMs at this size and why batch, not accumulation, is the knob. |
 
 Each report states its own commit, hardware, dataset, step count, and steady-state window.
 Those windows are not uniform across campaigns (some average the last 5 steps, others take a
