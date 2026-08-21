@@ -1,14 +1,19 @@
 # Benchmarks
 
-Two benchmark reports live under
+Benchmark campaigns live under
 [`benchmarks/`](https://github.com/KempnerInstitute/KempnerForge/tree/main/benchmarks)
-in the repo. Each is a standalone markdown report with numbers,
-reproduction commands, and the shell script that produced them.
+in the repo, one directory each. Every campaign is a standalone report with
+its numbers, the commit and hardware behind them, reproduction commands,
+and the driver script that produced them.
+
+The four dense and MoE campaigns are summarized below. `benchmarks/README.md`
+indexes all of them, including config validation and multi-node profiling,
+and carries the combined MFU table.
 
 ## MFU scaling (dense)
 
 Report:
-[`benchmarks/mfu_scaling/mfu_scaling.md`](https://github.com/KempnerInstitute/KempnerForge/blob/main/benchmarks/mfu_scaling/mfu_scaling.md).
+[`benchmarks/mfu_scaling/`](https://github.com/KempnerInstitute/KempnerForge/tree/main/benchmarks/mfu_scaling).
 Driver:
 [`benchmarks/mfu_scaling/mfu_bench.sh`](https://github.com/KempnerInstitute/KempnerForge/blob/main/benchmarks/mfu_scaling/mfu_bench.sh).
 
@@ -60,10 +65,131 @@ interactive allocation. Results go to `mfu_results/*.log` (one per
 experiment). The full report prints the per-experiment log layout at
 its tail.
 
+## Weak scaling to 160 GPUs (dense)
+
+Report:
+[`benchmarks/weak_scaling_160gpu/`](https://github.com/KempnerInstitute/KempnerForge/tree/main/benchmarks/weak_scaling_160gpu).
+Driver:
+[`benchmarks/weak_scaling_160gpu/weak_scaling_160gpu_bench.sh`](https://github.com/KempnerInstitute/KempnerForge/blob/main/benchmarks/weak_scaling_160gpu/weak_scaling_160gpu_bench.sh).
+
+13B and 70B Llama-3 from 8 to 160 H200s (up to 40 nodes × 4). Parallelism
+is held fixed at TP=4 intra-node × FSDP across nodes, and per-GPU batch is
+held constant, so the total problem size grows with the machine — weak
+scaling, not strong. Steady state is the median over the back half of each
+run; the two 160-GPU points are repeated twice and reported mean ± std.
+
+### Weak-scaling efficiency
+
+Anchored at 32 GPUs, since the 8-GPU 70B point is memory-bound at 128.5 GB
+of 141 and makes a misleadingly low baseline.
+
+| GPUs | 13B MFU | 13B eff | 70B MFU | 70B eff |
+|-----:|--------:|--------:|--------:|--------:|
+| 32 | 33.2% | 100% | 26.5% | 100% |
+| 64 | 32.6% | 98% | 25.4% | 96% |
+| 96 | — | — | 24.7% | 93% |
+| 128 | 31.8% | 96% | 24.8% | 94% |
+| 160 | 32.2% | 97% | 24.3% | 92% |
+
+### Headline observations
+
+- **Scaling out is not the bottleneck.** Efficiency holds at 92–97% over a
+  5× growth in machine size, with no cliff and no accumulating straggler
+  penalty.
+- **MFU is nearly flat.** 13B loses one point between 32 and 160 GPUs, 70B
+  loses 2.2. Whatever limits efficiency is already present at 32 GPUs.
+- **FSDP sharding works as intended.** Per-GPU memory falls monotonically:
+  13B from 45.0 GB at 8 GPUs to 33.9 GB at 160, 70B from 128.5 to 82.9 GB.
+- **13B beats 70B at every scale**, by 6.7 points at 32 GPUs. This bounds
+  the "larger models use the hardware better" trend rather than inverting
+  it; note 70B runs at `batch_size=2` against 13B's 4.
+
+### Reproduction
+
+Each config is its own SLURM job, so the allocation and the config are the
+same node set. 13 jobs, roughly 3.5 hours.
+
+```bash
+export DATA=/path/to/tokenized/fineweb-edu
+export PARTITION=<gpu-partition> ACCOUNT=<slurm-account>
+bash benchmarks/weak_scaling_160gpu/weak_scaling_160gpu_bench.sh preflight
+bash benchmarks/weak_scaling_160gpu/weak_scaling_160gpu_bench.sh scaling
+bash benchmarks/weak_scaling_160gpu/weak_scaling_160gpu_bench.sh headline
+uv run python benchmarks/weak_scaling_160gpu/parse_results.py \
+    benchmarks/weak_scaling_160gpu/results
+```
+
+`parse_results.py` regenerates every table in the report from the committed
+logs, so the numbers can be re-derived rather than trusted.
+
+## 175B dense on 360 GPUs
+
+Report:
+[`benchmarks/175b_360gpu/`](https://github.com/KempnerInstitute/KempnerForge/tree/main/benchmarks/175b_360gpu).
+Driver:
+[`benchmarks/175b_360gpu/175b_360gpu_bench.sh`](https://github.com/KempnerInstitute/KempnerForge/blob/main/benchmarks/175b_360gpu/175b_360gpu_bench.sh).
+
+A 175B-parameter dense decoder-only Transformer on 360 H200s (90 nodes ×
+4), TP=4 intra-node × FSDP2 `dp_shard=90` across nodes, for 2,000 steps
+and about 11 hours. The largest run performed with KempnerForge to date.
+A systems benchmark, not a pre-training run: 5.9B tokens leave the loss
+healthy but unconverged.
+
+| Metric | Value |
+|--------|-------|
+| Sustained MFU | **47.7%** |
+| Throughput | 154,523 tokens/s |
+| Step time | 19.09 s (global batch 2.95M tokens) |
+| Aggregate model FLOPs | ~170 PFLOP/s |
+| Peak memory | 53.8 / 140 GB per GPU |
+| Loss | 11.75 → 5.47 over 5.90B tokens |
+| Async checkpoint cost | +60 s mean, 0.9% of wall-clock |
+| Compute activity | 78% SM / 62% tensor / 24% DRAM |
+
+### Headline observations
+
+- **Efficiency improves at this size.** 47.7% exceeds the same framework's
+  24.3% at 70B and 32.2% at 13B on 160 GPUs. Larger matmuls amortize
+  communication and kernel-launch overhead better.
+- **The run is compute-bound, not communication- or memory-bound.** High SM
+  and tensor activity against low DRAM activity is the signature, so the
+  86 GB of unused memory is not the constraint — recomputation FLOPs from
+  full activation checkpointing are.
+- **`grad_accum > 1` OOMs at 175B.** With gradient accumulation FSDP2 keeps
+  the unsharded fp32 gradient across microbatches, roughly the model size
+  in fp32 divided by TP, about 87 GB. The failure is sequence-independent.
+  Scale the batch instead: `batch_size=1` reaches only 8.1% MFU because one
+  microbatch cannot amortize the FSDP collectives, while `batch_size=8`
+  reaches the same global batch in one forward/backward at 47.7%.
+- **Async checkpointing is not free but is affordable.** Staging a 175B
+  state stalls the step by about a minute; at a 300-step interval that is
+  0.9% of wall-clock, and it is the input a Young–Daly interval calculation
+  needs.
+
+### Reproduction
+
+One config, one job: 90 nodes for about 11 hours. The driver is a dry run
+unless passed `GO`.
+
+```bash
+export DATA=/path/to/tokenized/fineweb-edu
+export PARTITION=<gpu-partition> ACCOUNT=<slurm-account>
+export CKPT_DIR=/path/to/scratch          # room for one 175B checkpoint
+bash benchmarks/175b_360gpu/175b_360gpu_bench.sh        # dry run
+bash benchmarks/175b_360gpu/175b_360gpu_bench.sh GO     # submit
+
+uv run python benchmarks/175b_360gpu/parse_results.py \
+    benchmarks/175b_360gpu/results/175b-360gpu.log
+```
+
+Both `parse_results.py` and `make_figures.py` read only the committed
+training log, so every number and both figures in the report can be
+regenerated.
+
 ## MoE Expert Parallelism
 
 Report:
-[`benchmarks/moe_expert_parallel/moe_ep_benchmark.md`](https://github.com/KempnerInstitute/KempnerForge/blob/main/benchmarks/moe_expert_parallel/moe_ep_benchmark.md).
+[`benchmarks/moe_expert_parallel/`](https://github.com/KempnerInstitute/KempnerForge/tree/main/benchmarks/moe_expert_parallel).
 Driver:
 [`benchmarks/moe_expert_parallel/moe_ep_bench.sh`](https://github.com/KempnerInstitute/KempnerForge/blob/main/benchmarks/moe_expert_parallel/moe_ep_bench.sh).
 
@@ -128,5 +254,6 @@ memory above the limit.
   the 7B/13B/70B and MoE EP numbers.
 - [Architecture § Parallelism order](../architecture/parallelism-order.md)
   — why the mesh dimensions compose in a specific order.
-- [README § Benchmarks](https://github.com/KempnerInstitute/KempnerForge#benchmarks)
-  — summary of both reports at the repo root.
+- [`benchmarks/README.md`](https://github.com/KempnerInstitute/KempnerForge/tree/main/benchmarks)
+  — the index of every campaign, with the combined MFU table across all
+  measured scales and the conventions for adding a new one.

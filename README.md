@@ -101,20 +101,9 @@ flowchart TB
 
 Parallelism application order is enforced. Wrong order causes silent correctness bugs. See [`docs/architecture/parallelism-order.md`](docs/architecture/parallelism-order.md) for the rationale.
 
-## Measured performance
+## Benchmarks
 
-Llama-3 architecture on NVIDIA H200 (141 GB), bf16 + full activation checkpointing, fused AdamW, cosine LR. Peak MFU per GPU count:
-
-| GPUs | Nodes | Model | Best Config | MFU | tok/s |
-|-----:|------:|-------|-------------|----:|------:|
-| 1 | 1 | 7B | single GPU | **57.8%** | 10,471 |
-| 4 | 1 | 7B | FSDP=4 | **53.8%** | 38,983 |
-| 8 | 2 | 13B | FSDP=8 | **44.4%** | 35,405 |
-| 16 | 4 | 13B | TP=4 + FSDP=4 | 33.7% | 53,814 |
-| 32 | 8 | 13B | TP=4 + FSDP=8 | 32.7% | 104,309 |
-| 32 | 8 | 70B | TP=4 + FSDP=8 | 25.4% | 17,657 |
-
-Full 14-configuration sweep: [`benchmarks/mfu_scaling/mfu_scaling.md`](benchmarks/mfu_scaling/mfu_scaling.md). MoE expert parallelism results: [`benchmarks/moe_expert_parallel/`](benchmarks/moe_expert_parallel/).
+Benchmarking and performance studies live in [`benchmarks/`](benchmarks): MFU and dense scaling sweeps, MoE expert parallelism and expert packing, multi-node profiling, and config validation.
 
 ## Quick start
 
