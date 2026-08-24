@@ -137,9 +137,9 @@ class TestGetItem:
         monkeypatch.setattr(vd, "decode_video_frames", lambda *a, **k: _decoded(4))
         ds = _StubVideoDataset(["1"], ["abc"], max_frames=8, max_text_len=8)
         item = ds[0]
-        # "abc" -> ids 1,2,3 supervised; rest -100.
-        assert item["labels"][:3].tolist() == [1, 2, 3]
-        assert (item["labels"][3:] == -100).all()
+        # "abc" -> [1,2,3] + EOS(28); next-token labels [2,3,28,-100], rest -100.
+        assert item["labels"][:4].tolist() == [2, 3, 28, -100]
+        assert (item["labels"][4:] == -100).all()
 
     def test_decode_failure_yields_zero_clip_no_loss(self, monkeypatch):
         def _boom(*a, **k):
@@ -164,10 +164,11 @@ class TestGetItem:
         monkeypatch.setattr(vd, "decode_video_frames", lambda *a, **k: _decoded(2))
         ds = _StubVideoDataset(["1"], ["xyz"], max_frames=4, max_text_len=8, prompt="ab")
         item = ds[0]
-        # prompt "ab" (2 toks) masked; "xyz" (24,25,26) supervised.
-        assert item["input_ids"][:5].tolist() == [1, 2, 24, 25, 26]
-        assert item["labels"][:2].tolist() == [-100, -100]
-        assert item["labels"][2:5].tolist() == [24, 25, 26]
+        # prompt "ab": last prompt token predicts first target (24); caption + EOS(28).
+        assert item["input_ids"][:6].tolist() == [1, 2, 24, 25, 26, 28]
+        assert item["labels"][0].item() == -100
+        assert item["labels"][1:5].tolist() == [24, 25, 26, 28]
+        assert item["labels"][5].item() == -100
 
     def test_len(self):
         ds = _StubVideoDataset(["1", "2", "3"], ["a", "b", "c"])

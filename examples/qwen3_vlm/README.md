@@ -1,118 +1,104 @@
-# Vision-Language Model with a Qwen3 backbone
+# Video training on WebVid-10M with a Qwen3 backbone
 
-A worked example: build KempnerForge VLMs (Joint-Decoder, Cross-Attention, MoT,
-MoMa) on a **Qwen3-0.6B** backbone, optionally **warm-start** them from an
-externally-trained (`KempnerInstitute/multimodal`) checkpoint, and **fine-tune
-on video** (WebVid-10M).
+A worked, self-contained example: build a Joint-Decoder VLM on a **Qwen3-0.6B**
+backbone from pretrained components (a HuggingFace LLM + SigLIP2), then train it
+to caption video on **WebVid-10M**.
 
 The Qwen3 backbone is expressed **entirely through config** — there is no
-Qwen-specific model class. It relies on a few small, *general* additions to
-KempnerForge core (reusable by any model, not just this example):
+Qwen-specific model class. It relies on two *general* KempnerForge features
+(reusable by any model, already in core and unit-tested there):
 
 - `ModelConfig.head_dim` — an overridable field, so the attention width can
   decouple from the model dim (Qwen3-0.6B: `dim=1024`, `head_dim=128` →
   2048-wide attention). Default preserves Llama-style `dim // n_heads`.
-- `mlp_2layer` gains an optional `pre_norm` — a pre-projection norm (`ln_q`)
-  over the vision features, selected by norm-registry key (`rmsnorm` /
-  `layernorm`); off by default, so existing `mlp_2layer` configs are unchanged.
-- Cross-attention `head_dim` threading — CA blocks honor the decoupled head_dim.
-- `checkpoint.exclude_from_loading` is wired into the warm-start path in
+- `checkpoint.exclude_from_loading` — wired into the warm-start path in
   `scripts/train.py`, so a weights-only checkpoint loads without an optimizer.
 
-Those live in `kempnerforge/`, tested alongside the components they extend
-(`tests/unit/test_config.py`, `test_model.py`, `test_adapter.py`,
-`test_cross_attention.py`). Everything specific to *this* use case lives here.
+Nothing in `kempnerforge/` is modified by this example.
 
 ## Contents
 
 ```
 examples/qwen3_vlm/
 ├── README.md
-├── convert_multimodal_checkpoint.py   # multimodal .pt -> KempnerForge DCP
+├── convert_hf_backbone.py   # HF LLM + configured vision encoder -> one DCP
 ├── configs/
-│   ├── vlm_qwen3_0.6b_joint_decoder.toml   # warm-start from converted JD ckpt
-│   ├── vlm_qwen3_0.6b_mot.toml             # warm-start from converted MoT ckpt
-│   ├── vlm_qwen3_0.6b_cross_attn.toml      # from scratch (see note)
-│   └── vlm_qwen3_0.6b_moma.toml            # from scratch (no source ckpt)
+│   └── vlm_qwen3_0.6b_joint_decoder_webvid.toml
 └── tests/
-    ├── test_configs.py       # configs load + build the right Qwen3-0.6B shapes
-    └── test_converter.py     # the key mapping (pure, no GPU/network)
+    ├── test_configs.py       # the config loads + builds the right Qwen3 shapes
+    └── test_hf_backbone.py    # HF key mapping + tied head (pure)
 ```
 
-## The four arches
+## How it fits together
 
-| arch | source checkpoint | this example |
-|------|-------------------|--------------|
-| `joint_decoder` | converts 1:1 | warm-start from a converted JD DCP |
-| `mot` | converts 1:1, or init from a dense JD (duplicate per modality) | warm-start from a converted MoT DCP |
-| `moma` | none (no multimodal-repo counterpart) | **from scratch** |
-| `cross_attention` | exists, but doesn't convert faithfully yet | **from scratch** (see below) |
+| piece | choice |
+|-------|--------|
+| backbone | Qwen3-0.6B, warm-started from HuggingFace (frozen) |
+| vision | SigLIP2 so400m patch14 @ 224 px, pretrained (trains) |
+| connector | `avgpool`, `pool_window = 2` (fresh; trains) |
+| arch | `joint_decoder` — visual tokens are prepended to the text sequence |
 
-**Cross-attention note.** The `multimodal` repo's cross-attention is an extra
-sub-module at every 4th layer that projects fused K/V straight from the **vision
-dim (1152)** and reuses that layer's FFN, with a vision-side norm and QK-norm.
-KF's `CrossAttentionBlock` is a separate block that projects K/V from the
-**text/adapter dim (1024)** with its own FFN and no vision-side norm. So the
-trained cross-attn tensors don't map 1:1. A faithful CA checkpoint needs a small
-KF cross-attn alignment (identity adapter + K/V from the vision dim + QK/vision
-norms) — tracked as its own PR. Until then, cross-attention trains from scratch.
+**Phase-1 alignment.** The pretrained LLM is frozen (`freeze = transformer`); only
+the vision encoder and the fresh adapter learn, so the visual pathway adapts to a
+fixed language model.
 
-## 1. Convert a checkpoint (optional; JD / MoT only)
+**Frame budget.** SigLIP2 emits a 16×16 = 256-patch grid per frame. `avgpool` with
+`pool_window = 2` averages each 2×2 neighbourhood into one token → 8×8 = **64
+tokens/frame**, so 18 frames × 64 = 1152 visual + 96 text = 1248 ≤ `max_seq_len`
+(1280). Trading per-frame detail for 4.5× the temporal coverage is what makes
+many-frame video fit. Frames are sampled uniformly in time at 2 fps, capped at 18.
 
-Network-free: builds the KF transformer + adapter on `meta` to validate
-keys/shapes and carries the SigLIP tower straight from the source (no download).
-Reads only the model `*.pt` (optimizer state is ignored) and refuses to write
-inside the source tree.
+**Captions** are trained next-token with an appended EOS (so generation learns to
+stop). `[video].prompt` is masked from the loss, and its last token predicts the
+first caption token — first-token supervision plus a generation seed.
+
+## 1. Build a starting checkpoint
+
+Qwen3 LLM weights from HuggingFace, the pretrained SigLIP2 tower, and a fresh
+adapter, saved as one **complete** DCP the warm-start load accepts (any key the
+source does not supply keeps its init). Dense / joint-decoder targets only.
 
 ```bash
-# Joint-Decoder (1:1)
-uv run python examples/qwen3_vlm/convert_multimodal_checkpoint.py \
-    --src   /path/to/stage-1/vlm/<run>/<ts>/model_epoch_0_100000.pt \
-    --config examples/qwen3_vlm/configs/vlm_qwen3_0.6b_joint_decoder.toml \
-    --out   /your/scratch/converted/jd
-
-# Init a MoT checkpoint from a dense Joint-Decoder checkpoint (duplicate)
-uv run python examples/qwen3_vlm/convert_multimodal_checkpoint.py \
-    --src /path/to/jd_model.pt --from joint_decoder \
-    --config examples/qwen3_vlm/configs/vlm_qwen3_0.6b_mot.toml \
-    --out /your/scratch/converted/mot_from_jd
-
-# Native MoT source (1:1) — state which source modality index is the image stream
-uv run python examples/qwen3_vlm/convert_multimodal_checkpoint.py \
-    --src /path/to/mot_model.pt \
-    --config examples/qwen3_vlm/configs/vlm_qwen3_0.6b_mot.toml \
-    --out /your/scratch/converted/mot --mot-image-index 0
+uv run python examples/qwen3_vlm/convert_hf_backbone.py \
+    --hf-dir Qwen/Qwen3-0.6B \
+    --config examples/qwen3_vlm/configs/vlm_qwen3_0.6b_joint_decoder_webvid.toml \
+    --out   path-to-init-checkpoint
 ```
 
-Then point the config at the output:
+The config already points `[checkpoint].load_path` at that output and loads it
+weights-only:
 
 ```toml
 [checkpoint]
-load_path = "/your/scratch/converted/jd"
-exclude_from_loading = ["optimizer", "dataloader"]   # weights-only warm start
+load_path = "path-to-init-checkpoint"
+exclude_from_loading = ["optimizer", "dataloader"]
 ```
 
-## 2. Fine-tune on video (WebVid-10M)
+`tie_embeddings = true` matches HF Qwen3-0.6B, which ties its output head to the
+token embedding.
 
-Each config wires the `[video]` pipeline (SigLIP2 so400m + a pre-norm
-`mlp_2layer`, **4 frames × 256 tokens/frame** = 1024 visual tokens, vision
-tower frozen). Video decoding needs the `video` extra (PyAV) — run
-`uv sync --group video` before the first finetune.
+## 2. Train on WebVid-10M
+
+Video decoding needs the `video` extra (PyAV) — run `uv sync --group video` once.
 
 ```bash
 uv run torchrun --nproc_per_node=4 scripts/train.py \
-    examples/qwen3_vlm/configs/vlm_qwen3_0.6b_joint_decoder.toml
+    examples/qwen3_vlm/configs/vlm_qwen3_0.6b_joint_decoder_webvid.toml
 ```
 
-Before a real run, edit the placeholders in the config: `[checkpoint].load_path`
-(your converted DCP), `[video].data_root` (your WebVid corpus), `[checkpoint].dir`,
-and the `[metrics]` wandb fields. SigLIP2 (`google/siglip2-so400m-patch14-224`) and
-the `Qwen/Qwen3-0.6B` tokenizer must be reachable (local path or `HF_HOME`).
+Fill in the placeholders first: `[video].data_root` (your WebVid corpus),
+`[checkpoint].load_path` and `.dir`, and the `[metrics]` wandb fields. SigLIP2
+(`google/siglip2-so400m-patch14-224`) and the `Qwen/Qwen3-0.6B` tokenizer must be
+reachable (local path or `HF_HOME`).
 
-**Frame budget.** The `mlp_2layer` connector keeps 256 tokens/frame (no pooling),
-which is why these configs use 4 frames. For longer clips, switch `[adapter].type`
-to a pooling connector (`avgpool` / `attentional_pool`) — that reduces tokens/frame
-but re-initializes the adapter (the backbone + vision still warm-start).
+For a quick shakedown instead of the full epoch, override on the command line:
+
+```bash
+--train.max_steps=20 --video.max_samples=512 --metrics.enable_wandb=false
+```
+
+The config as written targets 16 H200s (4 nodes × 4): global batch 256, lr 8e-5,
+41,905 steps ≈ one epoch over the ~10.7M-clip manifest.
 
 ## 3. Run the tests
 

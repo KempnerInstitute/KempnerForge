@@ -42,7 +42,7 @@ WARN = "WARN"
 MISS = "MISS"
 
 # Tags accepted via --requires. Baseline (uv, repo-layout) runs always.
-KNOWN_TAGS = ("gpu", "slurm", "multi-node", "wandb", "hf", "gh")
+KNOWN_TAGS = ("gpu", "slurm", "multi-node", "wandb", "mlflow", "hf", "gh")
 # Accepted for documentation symmetry but ignored (baseline always runs).
 BASELINE_ALIASES = ("uv", "repo-layout")
 
@@ -335,6 +335,44 @@ def check_wandb(check_credentials: bool = False) -> CheckResult:
     return CheckResult("wandb", OK, "WANDB_API_KEY set (not validated)")
 
 
+def check_mlflow(check_credentials: bool = False) -> CheckResult:
+    """Check Databricks credentials for MLflow; optionally validate via the SDK."""
+    host = os.environ.get("DATABRICKS_HOST")
+    token = os.environ.get("DATABRICKS_TOKEN") or os.environ.get("DATABRICKS_API_TOKEN")
+    if not host and not token:
+        return CheckResult(
+            "mlflow",
+            MISS,
+            "DATABRICKS_HOST and token not set",
+            "export DATABRICKS_HOST=... and DATABRICKS_API_TOKEN=... "
+            "(needed for metrics.enable_mlflow with tracking_uri=databricks)",
+        )
+    if not host:
+        return CheckResult(
+            "mlflow", MISS, "token set but DATABRICKS_HOST missing", "export DATABRICKS_HOST=..."
+        )
+    if not token:
+        return CheckResult(
+            "mlflow",
+            MISS,
+            "DATABRICKS_HOST set but token missing",
+            "export DATABRICKS_API_TOKEN=... (or DATABRICKS_TOKEN)",
+        )
+    if check_credentials:
+        # The SDK authenticates from DATABRICKS_TOKEN; mirror the DATABRICKS_API_TOKEN
+        # alias the MLflow backend applies so the probe matches runtime behavior.
+        if not os.environ.get("DATABRICKS_TOKEN") and os.environ.get("DATABRICKS_API_TOKEN"):
+            os.environ["DATABRICKS_TOKEN"] = os.environ["DATABRICKS_API_TOKEN"]
+        try:
+            from databricks.sdk import WorkspaceClient  # type: ignore
+
+            user = WorkspaceClient().current_user.me().user_name
+        except Exception as e:
+            return CheckResult("mlflow", WARN, f"credentials set but SDK probe failed: {e}")
+        return CheckResult("mlflow", OK, f"Databricks reachable, user={user}")
+    return CheckResult("mlflow", OK, "DATABRICKS_HOST + token set (not validated)")
+
+
 def check_hf(check_credentials: bool = False) -> CheckResult:
     """Check HF_TOKEN env var; optionally validate via API."""
     key = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
@@ -578,6 +616,8 @@ def run_checks(
             results.append(check_multi_node(config, repo_root))
         elif tag == "wandb":
             results.append(check_wandb(check_credentials))
+        elif tag == "mlflow":
+            results.append(check_mlflow(check_credentials))
         elif tag == "hf":
             results.append(check_hf(check_credentials))
         elif tag == "gh":
@@ -622,7 +662,7 @@ def build_argparser() -> argparse.ArgumentParser:
         "--requires",
         type=str,
         default="",
-        help="Comma-separated tags (gpu,slurm,multi-node,wandb,hf,gh). "
+        help="Comma-separated tags (gpu,slurm,multi-node,wandb,mlflow,hf,gh). "
         "Empty or omitted runs baseline only.",
     )
     ap.add_argument("--json", action="store_true", help="Emit JSON report.")
@@ -668,7 +708,7 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument(
         "--check-credentials",
         action="store_true",
-        help="Validate WandB/HF tokens via API (slow; opt-in).",
+        help="Validate WandB/HF/Databricks tokens via API (slow; opt-in).",
     )
     return ap
 

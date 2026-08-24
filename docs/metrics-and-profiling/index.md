@@ -4,7 +4,7 @@ Everything the training loop reports about itself — throughput, MFU,
 loss smoothing, GPU memory, kernel traces. Two modules:
 
 - **`kempnerforge/metrics/`** — always-on per-step metrics with WandB /
-  TensorBoard dispatch, MFU computation, memory stats.
+  TensorBoard / MLflow dispatch, MFU computation, memory stats.
 - **`kempnerforge/profiling/`** — opt-in `torch.profiler` wrapper for
   kernel-level traces and ad-hoc CUDA event timing.
 
@@ -15,6 +15,7 @@ loss smoothing, GPU memory, kernel traces. Two modules:
 | `MetricsTracker` | always-on per-step metrics | created unconditionally in `scripts/train.py` |
 | `WandBBackend` | cloud logging | `metrics.enable_wandb = true` |
 | `TensorBoardBackend` | local event files | `metrics.enable_tensorboard = true` |
+| `MLflowBackend` | Databricks / MLflow server | `metrics.enable_mlflow = true` |
 | `compute_mfu` | per-step MFU | always-on (part of `MetricsTracker`) |
 | `get_memory_stats` | per-step GPU memory | always-on |
 | `DeviceMemoryMonitor` | interval-scoped peak tracking + snapshots | opt-in, instantiate manually |
@@ -53,6 +54,9 @@ wandb_project      = "kempnerforge"
 wandb_run_name     = ""          # auto-generated if empty
 wandb_run_id       = ""          # restored from checkpoint on resume
 tensorboard_dir    = "tb_logs"
+enable_mlflow      = false
+mlflow_experiment  = "/Experiments/my-project"   # absolute workspace path on Databricks
+mlflow_run_name    = ""                          # auto-generated if empty
 
 [profiling]
 enable     = false
@@ -72,6 +76,7 @@ for field-level notes.
 metrics-tracker
 wandb
 tensorboard
+mlflow
 mfu
 memory-monitor
 profiler

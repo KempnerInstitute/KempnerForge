@@ -33,6 +33,11 @@ class TestVLMConfigValidation:
         with pytest.raises(ValueError, match="max_text_len"):
             VLMConfig(max_text_len=0)
 
+    def test_max_text_len_one_rejected(self):
+        # Needs >= 2: one caption token plus its next-token target.
+        with pytest.raises(ValueError, match="max_text_len"):
+            VLMConfig(max_text_len=1)
+
     def test_freeze_schedule_monotonic(self):
         with pytest.raises(ValueError, match="strictly monotonic"):
             VLMConfig(
@@ -121,8 +126,8 @@ class TestVLMConfigSubclasses:
 
 class TestIsGenerative:
     """Per-arch ``is_generative`` capability, queried by generation-only
-    consumers (the lmms-eval chat adapter). Generative arches inherit the base
-    ``True``; MoMa overrides to ``False`` (non-causal expert-choice routing)."""
+    consumers. Generative arches inherit the base ``True``; MoMa overrides
+    to ``False`` (non-causal expert-choice routing)."""
 
     @pytest.mark.parametrize(
         "config",
