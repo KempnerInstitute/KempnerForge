@@ -3,8 +3,8 @@
 A clip is reduced to an ordered set of still frames that the VLM pipeline
 treats like a sequence of images. Two concerns live here:
 
-1. ``sample_timestamps`` — *which* timestamps to sample. This is the policy
-   from the Molmo2 paper (§3.1, §A): sample at a target frame-rate ``fps``,
+1. ``sample_timestamps`` — *which* timestamps to sample. The policy is to
+   sample at a target frame-rate ``fps``,
    cap the total at ``max_frames`` (uniformly subsampling longer clips), and
    always include the first and last frame. Sampling is expressed in
    *seconds* rather than frame indices so it is robust to variable-fps video.
@@ -69,7 +69,7 @@ def sample_timestamps(
 ) -> list[float]:
     """Timestamps (seconds) to sample from a clip of length ``duration_s``.
 
-    Policy (Molmo2 §3.1/§A): aim for ``fps`` frames per second, clamp the
+    Policy: aim for ``fps`` frames per second, clamp the
     count to ``[min_frames, max_frames]``, and lay the samples out uniformly
     over ``[0, duration_s]`` so the first frame (``0.0``) and last frame
     (``duration_s``) are always included. A non-positive duration (unknown or
@@ -104,18 +104,37 @@ def _video_duration_seconds(stream: Any, container: Any) -> float:
     return 0.0
 
 
+def _frame_time(pts: float | None, index: int, avg_rate: float) -> float:
+    """Per-frame timestamp in seconds.
+
+    Uses the frame's presentation time (``pts``) when the container provides it;
+    otherwise falls back to a monotonic estimate from the decode ``index`` and the
+    stream's ``avg_rate`` (or the raw index when the rate is unknown). Without this
+    fallback a container that reports no PTS would give ``pts=None -> 0.0`` for
+    every frame, collapsing frame times to all-zero -- which makes the per-frame
+    time embedding a silent no-op and breaks timestamp-based target matching.
+    """
+    if pts is not None:
+        return float(pts)
+    if avg_rate > 0:
+        return index / avg_rate
+    return float(index)
+
+
 def decode_video_frames(
     path: str, *, fps: float, min_frames: int, max_frames: int, sampling_policy: str = "uniform"
-) -> list[PILImage]:
-    """Decode a clip into a list of sampled ``PIL.Image`` frames (RGB).
+) -> tuple[list[PILImage], list[float]]:
+    """Decode a clip into sampled ``PIL.Image`` frames (RGB) + their times.
 
     Frames are chosen by the registered ``sampling_policy`` (default
     ``"uniform"`` = ``sample_timestamps``): each target timestamp is mapped to
     the first decoded frame at or after it (timestamps past the last frame map
-    to the last frame, so the final frame is always returned). The returned
-    list has length equal to the number of sampled timestamps
-    (``<= max_frames``), or is empty when the file has no decodable video
-    stream.
+    to the last frame, so the final frame is always returned). Returns
+    ``(frames, times)`` where ``times`` are the matched frames' actual
+    presentation times in seconds (parallel to ``frames``, so the caller can
+    encode *when* each frame occurs). Both lists have length equal to the
+    number of sampled timestamps (``<= max_frames``), or are empty when the
+    file has no decodable video stream.
 
     Reading seeks to the keyframe at or before each target and decodes forward
     (``_decode_seek``), so cost scales with frames kept rather than clip
@@ -138,7 +157,7 @@ def decode_video_frames(
     sample = registry.get_sampling_policy(sampling_policy)
     with av.open(path) as container:
         if not container.streams.video:
-            return []
+            return [], []
         stream = container.streams.video[0]
         stream.thread_type = "AUTO"
         duration_s = _video_duration_seconds(stream, container)
@@ -150,33 +169,38 @@ def decode_video_frames(
     _log_fallback_once(reason)
     with av.open(path) as container:
         if not container.streams.video:
-            return []
+            return [], []
         stream = container.streams.video[0]
         stream.thread_type = "AUTO"
         return _decode_serial(container, stream, targets)
 
 
-def _decode_seek(container: Any, stream: Any, targets: list[float]) -> list[PILImage]:
+def _decode_seek(
+    container: Any, stream: Any, targets: list[float]
+) -> tuple[list[PILImage], list[float]]:
     """Seek to the keyframe at or before each target, then decode forward to it.
 
     Selection matches ``_decode_serial`` byte-for-byte: each target takes the
     first frame with ``time + _MATCH_EPS_S >= target`` (one frame may satisfy
     several targets), and targets past the last frame tail-fill with that
-    frame. Raises ``_SeekUnreliableError`` whenever identical selection cannot
-    be guaranteed: no ``time_base``, a frame without PTS, a seek landing past
-    its target (frames may have been skipped; exempt for targets near 0.0,
-    where the landing is the stream's first frame — what serial selects too),
-    or EOF with nothing decoded after a seek.
+    frame. Returns ``(images, times)``, the matched frames' presentation times
+    parallel to ``images``. Raises ``_SeekUnreliableError`` whenever identical
+    selection cannot be guaranteed: no ``time_base``, a frame without PTS, a
+    seek landing past its target (frames may have been skipped; exempt for
+    targets near 0.0, where the landing is the stream's first frame — what
+    serial selects too), or EOF with nothing decoded after a seek.
     """
     tb = stream.time_base
     if tb is None:
         raise _SeekUnreliableError("stream has no time_base")
     images: list[PILImage] = []
+    times: list[float] = []
     j = 0
     while j < len(targets):
         tgt = targets[j]
         container.seek(int(tgt / tb), stream=stream, backward=True, any_frame=False)
         last = None
+        last_t = 0.0
         matched = False
         first = True
         for frame in container.decode(stream):  # fresh generator after every seek
@@ -191,39 +215,55 @@ def _decode_seek(container: Any, stream: Any, targets: list[float]) -> list[PILI
                 img = frame.to_image()
                 while j < len(targets) and t + _MATCH_EPS_S >= targets[j]:
                     images.append(img)
+                    times.append(t)
                     j += 1
                 matched = True
                 break
             last = frame
+            last_t = t
         if not matched:  # EOF: the remaining targets sit past the last frame
             if last is None:
                 raise _SeekUnreliableError(f"no frames decodable at or after {tgt:.3f}s")
             tail = last.to_image()
-            images.extend(tail for _ in range(len(targets) - j))
+            for _ in range(len(targets) - j):
+                images.append(tail)
+                times.append(last_t)
             j = len(targets)
-    return images
+    return images, times
 
 
-def _decode_serial(container: Any, stream: Any, targets: list[float]) -> list[PILImage]:
+def _decode_serial(
+    container: Any, stream: Any, targets: list[float]
+) -> tuple[list[PILImage], list[float]]:
     """Single decode pass over the whole file; the frame-selection reference.
 
     Kept as the fallback for containers where seeking is unavailable or
     unreliable; ``_decode_seek`` must match its selection byte-for-byte.
+    Returns ``(images, times)`` like ``_decode_seek``. Times come from
+    ``_frame_time``, whose index/avg_rate fallback keeps them monotonic on
+    containers that report no per-frame PTS instead of collapsing to all-zero.
     """
     images: list[PILImage] = []
+    times: list[float] = []
     j = 0
     last_frame = None
-    for frame in container.decode(stream):
-        t = float(frame.time) if frame.time is not None else 0.0
+    last_t = 0.0
+    avg_rate = float(stream.average_rate) if stream.average_rate else 0.0
+    for idx, frame in enumerate(container.decode(stream)):
+        t = _frame_time(frame.time, idx, avg_rate)
         while j < len(targets) and t + _MATCH_EPS_S >= targets[j]:
             images.append(frame.to_image())
+            times.append(t)
             j += 1
         last_frame = frame
+        last_t = t
         if j >= len(targets):
             break
     # Trailing targets (e.g. the final ``duration_s`` timestamp, which sits
     # just past the last frame's PTS) map to the last decoded frame.
     if j < len(targets) and last_frame is not None:
         tail = last_frame.to_image()
-        images.extend(tail for _ in range(len(targets) - j))
-    return images
+        for _ in range(len(targets) - j):
+            images.append(tail)
+            times.append(last_t)
+    return images, times

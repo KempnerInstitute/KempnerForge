@@ -146,7 +146,9 @@ def test_dcp_roundtrip_video_generate_until(tmp_path, tiny_video_configs, monkey
     monkeypatch.setattr("adapter.build_tokenizer", lambda _path: _MockTokenizer())
     # Stub video decode so the test needs no av / no real video file.
     frames = [Image.new("RGB", (8, 8), color=(120, 120, 120)) for _ in range(2)]
-    monkeypatch.setattr("adapter.decode_video_frames", lambda path, **kw: frames)
+    monkeypatch.setattr(
+        "adapter.decode_video_frames", lambda path, **kw: (frames, [0.0] * len(frames))
+    )
 
     vlm = KempnerForgeVLM(
         config="ignored", checkpoint=str(ckpt_dir), device="cpu", dtype="float32", batch_size=2

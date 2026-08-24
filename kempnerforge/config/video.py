@@ -6,8 +6,8 @@ ordered set of frames, each preprocessed like an image and fed to the vision
 encoder. The section is a sibling of ``[vision_encoder]`` / ``[adapter]`` /
 ``[vlm]`` and requires ``[vlm]`` to be set.
 
-Frame-sampling defaults follow the Molmo2 paper (sample at ``fps`` per second,
-include the first and last frame, cap at ``max_frames``). ``max_frames`` is the
+Frame-sampling defaults: sample at ``fps`` per second, include the first and
+last frame, and cap at ``max_frames``. ``max_frames`` is the
 per-clip frame budget; the number of visual tokens it implies
 (``max_frames * tokens_per_frame``) feeds the residual-stream / sequence-length
 math once the model consumes video.
@@ -33,7 +33,7 @@ class VideoConfig:
         max_samples: Cap the manifest to this many examples (``0`` = all).
         max_frames: Maximum frames sampled per clip (the per-clip budget).
         min_frames: Minimum frames sampled per clip; short clips pad up to this.
-        fps: Target sampling rate in frames per second (Molmo2 uses 2).
+        fps: Target sampling rate in frames per second.
         frame_size: Square pixel size each frame is resized to.
         prompt: Optional instruction prepended to the target text, masked from loss.
     """

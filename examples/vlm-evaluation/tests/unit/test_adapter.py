@@ -194,7 +194,9 @@ class TestRenderRequestVideo:
 
     def test_video_decoded_to_frames(self, monkeypatch, vcfg):
         frames = [_img(), _img(), _img()]
-        monkeypatch.setattr("adapter.decode_video_frames", lambda path, **kw: frames)
+        monkeypatch.setattr(
+            "adapter.decode_video_frames", lambda path, **kw: (frames, [0.0] * len(frames))
+        )
         out_frames, prompt = _render_request(_chat([_text("describe"), _video("clip.mp4")]), vcfg)
         assert out_frames is frames
         assert prompt == "describe"
@@ -205,7 +207,7 @@ class TestRenderRequestVideo:
         def _fake(path, **kw):
             captured["path"] = path
             captured.update(kw)
-            return [_img()]
+            return [_img()], [0.0]
 
         monkeypatch.setattr("adapter.decode_video_frames", _fake)
         _render_request(_chat([_video("c.mp4")]), vcfg)
@@ -256,7 +258,7 @@ class TestRenderRequestVideo:
     def test_no_frames_decoded_warns(self, monkeypatch, vcfg):
         rec = _RecordingLogger()
         monkeypatch.setattr("adapter.logger", rec)
-        monkeypatch.setattr("adapter.decode_video_frames", lambda path, **kw: [])
+        monkeypatch.setattr("adapter.decode_video_frames", lambda path, **kw: ([], []))
         frames, _ = _render_request(_chat([_video("c.mp4")]), vcfg)
         assert frames == []
         assert any("zero clip" in m for m in rec.warnings)
@@ -930,7 +932,7 @@ class TestGenerateUntilVideo:
         # Two real frames per clip; zero-padded to frames_per_clip (== 2) downstream.
         monkeypatch.setattr(
             "adapter.decode_video_frames",
-            lambda path, **kw: [_img(), _img()],
+            lambda path, **kw: ([_img(), _img()], [0.0, 0.5]),
         )
         vlm = KempnerForgeVLM(
             config="x", checkpoint="y", device="cpu", dtype="float32", batch_size=2

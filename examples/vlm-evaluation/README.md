@@ -127,7 +127,7 @@ uv run python examples/vlm-evaluation/vlm_eval_harness.py \
 
 - **The frame budget is a property of the checkpoint, not a flag.** Frames are
   sampled by the model's own `[video]` policy (`fps` / `min_frames` /
-  `max_frames`, the Molmo2 uniform `sample_timestamps`) and fixed to exactly
+  `max_frames`, the uniform `sample_timestamps`) and fixed to exactly
   `max_frames` (zero-padded when a clip yields fewer). You cannot change it at
   eval time — the transformer was built around `frames_per_clip = max_frames`.
   Comparability to externally published video-benchmark numbers therefore depends

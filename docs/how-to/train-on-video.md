@@ -27,8 +27,19 @@ A clip of `F` frames becomes `F × P′` visual tokens:
      blocks; the residual stays text-only (so it fits more frames per
      `max_seq_len`).
 
-Temporal order is carried by frame order (sequential positions). Per-frame
-timestamp tokens and grounding outputs are a separate follow-up (see below).
+Temporal order is carried by frame order (sequential positions). **Optionally**,
+each frame's **timestamp in seconds** can be embedded and added to that frame's
+visual tokens, so the model sees *when* each frame occurs, not just its order.
+This is **opt-in**: add a `[time_embedding]` section to enable it (within the
+section `type` defaults to `sinusoidal` — sinusoidal features at log-spaced
+periods through a zero-initialized projection; `type = "none"` disables it).
+With **no `[time_embedding]` section (the default) no embedding is built**, and
+the model is identical to one with no timestamps at all. It is fully decoupled —
+added as a self-contained post-step in `VLMWrapper.forward`, so the fusion
+strategies and the transformer backbone never see `frame_times` — and
+registry-driven, so new techniques (learned, Fourier, …) register as small
+additions and switch via config. Grounding outputs are a separate follow-up
+(see below).
 
 ## Token budget
 
@@ -73,7 +84,7 @@ The dataset side is **pluggable**: `dataset_type` selects a builder from the
 `video_dataset` registry (`"webvid"` ships; other styles — HuggingFace video
 sets, flat folders, alternate manifests — register as small follow-ups and are
 selected here), and `sampling_policy` selects a registered frame-sampling policy
-(`"uniform"` = the Molmo2 default). The WebVid corpus directory is parameterized
+(`"uniform"` is the default). The WebVid corpus directory is parameterized
 by `dataset_name`, so any WebVid-style dataset works, not just `webvid-10M`:
 CSV manifests under `raw/<dataset_name>/data/<split>/partitions/` and `.mp4`
 files under `raw/videos/<split>/`.
@@ -101,9 +112,24 @@ time, so it is set in the TOML, not via a `--vlm.arch=` CLI override.)
 
 ## Constraints and follow-ups
 
-- **Causal attention; no per-frame timestamps yet** — temporal order is frame
-  order. Per-frame timestamp tokens + grounding (`<points>`/`<tracks>` outputs
-  with point-F1 / track-J&F eval) are a follow-up.
+- **Grounding outputs are a follow-up** — per-frame timestamps are encoded (see
+  above), but structured grounding (`<points>`/`<tracks>` outputs with point-F1
+  / track-J&F eval) is not yet implemented.
+- **Sequence-modifying time encodings are a separate hook** — the
+  `[time_embedding]` registry is for *additive* per-frame embeddings (no change
+  to sequence length). Interleaved text time-tokens change the
+  token sequence and need interleaved/variable-length sequence support KF does
+  not have yet; they would hook the sequence-assembly layer, not this registry.
+- **Inference must pass `frame_times`** — a video model silently drops the
+  learned temporal signal if `frame_times` is `None` (no error is raised).
+  Training threads it automatically; eval/generate paths must pass it for video
+  models.
+- **Checkpoint compatibility** — because the time embedding is opt-in (off by
+  default), a default video model has no `frame_time_embed` parameters and loads
+  pre-timestamp checkpoints unchanged. As for any component, config must match
+  the checkpoint: a checkpoint trained *with* a `[time_embedding]` section must
+  be resumed/evaluated with the same section, and one trained without must not
+  add one (a mismatch fails the strict load, exactly like changing the adapter).
 - **Padded frames are masked from attention** — short/undecodable clips pad to
   `max_frames` with blank frames, and the `frame_mask` is consumed so real
   tokens never attend to padded-frame visual tokens (MoMa also drops them from

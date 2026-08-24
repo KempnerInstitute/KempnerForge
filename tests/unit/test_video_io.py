@@ -88,6 +88,32 @@ class TestSampleTimestamps:
 
 
 # ---------------------------------------------------------------------------
+# _frame_time (per-frame timestamp with no-PTS fallback; pure, no decoder)
+# ---------------------------------------------------------------------------
+
+
+class TestFrameTime:
+    def test_uses_pts_when_present(self):
+        from kempnerforge.data.video_io import _frame_time
+
+        assert _frame_time(3.5, 0, 2.0) == 3.5
+
+    def test_falls_back_to_index_over_rate_when_no_pts(self):
+        # No PTS => monotonic index/rate estimate, not the all-zero a raw
+        # `pts or 0.0` would give (which collapses frame_times to a no-op).
+        from kempnerforge.data.video_io import _frame_time
+
+        assert _frame_time(None, 0, 2.0) == 0.0
+        assert _frame_time(None, 4, 2.0) == 2.0
+        assert _frame_time(None, 3, 2.0) == 1.5
+
+    def test_falls_back_to_raw_index_without_rate(self):
+        from kempnerforge.data.video_io import _frame_time
+
+        assert _frame_time(None, 3, 0.0) == 3.0
+
+
+# ---------------------------------------------------------------------------
 # decode_video_frames (integration; needs av + the testbed data)
 # ---------------------------------------------------------------------------
 
@@ -102,15 +128,17 @@ class TestDecodeVideoFramesIntegration:
 
         from kempnerforge.data.video_io import decode_video_frames
 
-        frames = decode_video_frames(_WEBVID_CLIP, fps=2.0, min_frames=4, max_frames=8)
+        frames, times = decode_video_frames(_WEBVID_CLIP, fps=2.0, min_frames=4, max_frames=8)
         assert 1 <= len(frames) <= 8
+        assert len(times) == len(frames)
         assert all(isinstance(f, Image.Image) and f.mode == "RGB" for f in frames)
 
     def test_respects_max_frames(self):
         from kempnerforge.data.video_io import decode_video_frames
 
-        frames = decode_video_frames(_WEBVID_CLIP, fps=8.0, min_frames=4, max_frames=4)
+        frames, times = decode_video_frames(_WEBVID_CLIP, fps=8.0, min_frames=4, max_frames=4)
         assert len(frames) == 4
+        assert len(times) == 4
 
     def test_missing_file_raises(self):
         from kempnerforge.data.video_io import decode_video_frames
@@ -199,8 +227,8 @@ def _write_shifted_mp4(src, dst, offset_s: float = 5.0) -> None:
             oc.mux(packet)
 
 
-def _serial_reference(path, fps: float, min_frames: int, max_frames: int) -> list:
-    """Ground-truth frames via the serial reference pass (bypasses seeking)."""
+def _serial_reference(path, fps: float, min_frames: int, max_frames: int) -> tuple[list, list]:
+    """Ground-truth ``(frames, times)`` via the serial pass (bypasses seeking)."""
     import av
 
     from kempnerforge.data.video_io import _decode_serial, _video_duration_seconds
@@ -224,8 +252,10 @@ class TestDecodeSynthetic:
 
         path = tmp_path / "clip.mp4"
         _write_mp4(path, n_frames=20, fps=10)  # ~2s
-        frames = decode_video_frames(str(path), fps=2.0, min_frames=4, max_frames=8)
+        frames, times = decode_video_frames(str(path), fps=2.0, min_frames=4, max_frames=8)
         assert 1 <= len(frames) <= 8
+        assert len(times) == len(frames)
+        assert times == sorted(times)  # presentation times are non-decreasing
         assert all(isinstance(f, Image.Image) and f.mode == "RGB" for f in frames)
 
     def test_respects_max_frames(self, tmp_path):
@@ -233,16 +263,18 @@ class TestDecodeSynthetic:
 
         path = tmp_path / "clip.mp4"
         _write_mp4(path, n_frames=40, fps=10)  # ~4s
-        frames = decode_video_frames(str(path), fps=8.0, min_frames=4, max_frames=4)
+        frames, times = decode_video_frames(str(path), fps=8.0, min_frames=4, max_frames=4)
         assert len(frames) == 4
+        assert len(times) == 4
 
     def test_short_clip_returns_frames(self, tmp_path):
         from kempnerforge.data.video_io import decode_video_frames
 
         path = tmp_path / "short.mp4"
         _write_mp4(path, n_frames=3, fps=10)  # shorter than min_frames request
-        frames = decode_video_frames(str(path), fps=2.0, min_frames=4, max_frames=8)
+        frames, times = decode_video_frames(str(path), fps=2.0, min_frames=4, max_frames=8)
         assert len(frames) >= 1
+        assert len(times) == len(frames)
 
 
 # ---------------------------------------------------------------------------
@@ -272,12 +304,15 @@ class TestSeekMatchesSerial:
     def _assert_parity(self, path, *, fps, min_frames, max_frames):
         from kempnerforge.data.video_io import decode_video_frames
 
-        expected = _serial_reference(path, fps, min_frames, max_frames)
-        got = decode_video_frames(str(path), fps=fps, min_frames=min_frames, max_frames=max_frames)
-        assert len(got) == len(expected)
+        exp_frames, exp_times = _serial_reference(path, fps, min_frames, max_frames)
+        frames, times = decode_video_frames(
+            str(path), fps=fps, min_frames=min_frames, max_frames=max_frames
+        )
+        assert len(frames) == len(exp_frames)
         # Compare bytes, not identity: the seek path reuses one PIL object for
         # an eps-group of duplicate targets where serial makes distinct copies.
-        assert [f.tobytes() for f in got] == [f.tobytes() for f in expected]
+        assert [f.tobytes() for f in frames] == [f.tobytes() for f in exp_frames]
+        assert times == exp_times
 
     def test_sparse_targets_long_clip(self, tmp_path):
         path = tmp_path / "clip.mp4"
@@ -326,7 +361,7 @@ class TestSeekMatchesSerialH264:
         # actually ran: a silent serial fallback would make parity trivially true.
         import kempnerforge.data.video_io as video_io
 
-        expected = _serial_reference(path, fps, min_frames, max_frames)
+        exp_frames, exp_times = _serial_reference(path, fps, min_frames, max_frames)
         fell_back = []
         original = video_io._decode_serial
 
@@ -335,12 +370,13 @@ class TestSeekMatchesSerialH264:
             return original(*args, **kwargs)
 
         monkeypatch.setattr(video_io, "_decode_serial", _spy)
-        got = video_io.decode_video_frames(
+        frames, times = video_io.decode_video_frames(
             str(path), fps=fps, min_frames=min_frames, max_frames=max_frames
         )
         assert not fell_back, "seek path unexpectedly fell back to serial decode"
-        assert len(got) == len(expected)
-        assert [f.tobytes() for f in got] == [f.tobytes() for f in expected]
+        assert len(frames) == len(exp_frames)
+        assert [f.tobytes() for f in frames] == [f.tobytes() for f in exp_frames]
+        assert times == exp_times
 
     def test_fixture_has_b_frames_and_reordering(self, tmp_path):
         import av
@@ -395,10 +431,11 @@ class TestSeekMatchesSerialH264:
                 stream.thread_type = "AUTO"
                 return fn(container, stream, list(targets))
 
-        got = _run(_decode_seek)
-        expected = _run(_decode_serial)
-        assert len(got) == len(expected)
-        assert [f.tobytes() for f in got] == [f.tobytes() for f in expected]
+        frames, times = _run(_decode_seek)
+        exp_frames, exp_times = _run(_decode_serial)
+        assert len(frames) == len(exp_frames)
+        assert [f.tobytes() for f in frames] == [f.tobytes() for f in exp_frames]
+        assert times == exp_times
 
 
 @pytest.mark.skipif(not _AV_AVAILABLE, reason="requires the 'av' package")
@@ -412,11 +449,13 @@ class TestSeekFrameIdentity:
 
         path = tmp_path / "clip.mp4"
         _write_mp4(path, n_frames=20, fps=10)  # 2s; frame i is solid (i*17)%256 gray
-        frames = decode_video_frames(str(path), fps=2.0, min_frames=4, max_frames=4)
+        frames, times = decode_video_frames(str(path), fps=2.0, min_frames=4, max_frames=4)
         assert len(frames) == 4
         # Targets [0, 2/3, 4/3, 2.0] -> first frame at/after each: 0, 7, 14;
         # the final target sits past the last PTS -> tail-fills with frame 19.
         expected = [0, 7 * 17, 14 * 17, (19 * 17) % 256]
+        # Times are the selected frames' own PTS (10fps), tail included.
+        assert times == pytest.approx([0.0, 0.7, 1.4, 1.9])
         means = [float(np.asarray(f.convert("L")).mean()) for f in frames]
         for got, want in zip(means, expected, strict=True):
             assert abs(got - want) <= 4.0  # mpeg4 encode/decode roundtrip tolerance
@@ -431,14 +470,15 @@ class TestSeekFallback:
 
         path = tmp_path / "clip.mp4"
         _write_mp4(path, n_frames=40, gop_size=12)
-        expected = _serial_reference(path, 2.0, 4, 8)
+        exp_frames, exp_times = _serial_reference(path, 2.0, 4, 8)
 
         def _raise(container, stream, targets):
             raise video_io._SeekUnreliableError("test")
 
         monkeypatch.setattr(video_io, "_decode_seek", _raise)
-        got = video_io.decode_video_frames(str(path), fps=2.0, min_frames=4, max_frames=8)
-        assert [f.tobytes() for f in got] == [f.tobytes() for f in expected]
+        frames, times = video_io.decode_video_frames(str(path), fps=2.0, min_frames=4, max_frames=8)
+        assert [f.tobytes() for f in frames] == [f.tobytes() for f in exp_frames]
+        assert times == exp_times
 
     def test_fallback_logged_once_per_cause(self, tmp_path, monkeypatch, caplog):
         import kempnerforge.data.video_io as video_io
@@ -470,7 +510,7 @@ class TestSeekFallback:
             raise video_io._SeekUnreliableError("test")
 
         # The second open (the fallback reopen) yields a container whose video
-        # stream has vanished — the guard must return [] rather than crash.
+        # stream has vanished — the guard must return empties rather than crash.
         real_open = av.open
         opens = {"n": 0}
 
@@ -494,7 +534,10 @@ class TestSeekFallback:
 
         monkeypatch.setattr(video_io, "_decode_seek", _raise)
         monkeypatch.setattr(av, "open", _flaky_open)
-        assert video_io.decode_video_frames(str(path), fps=2.0, min_frames=4, max_frames=8) == []
+        assert video_io.decode_video_frames(str(path), fps=2.0, min_frames=4, max_frames=8) == (
+            [],
+            [],
+        )
 
     def test_landing_check_raises_on_shifted_stream(self, tmp_path):
         import av
