@@ -1183,3 +1183,31 @@ class TestCheckpointManagerLoad:
         for (rea, rev), (lea, lev) in zip(ref_moments, loaded, strict=True):
             assert torch.equal(rea, lea), "exp_avg not restored"
             assert torch.equal(rev, lev), "exp_avg_sq not restored"
+
+
+# ---------------------------------------------------------------------------
+# Resume with a different component build (config `plugins` changed)
+# ---------------------------------------------------------------------------
+
+
+class TestComponentSwapOnResume:
+    def test_resume_into_a_different_component_is_rejected(self, tmp_path):
+        """The `plugins` list is not recorded in the checkpoint, so a resume
+        that builds a different component must fail the load rather than train
+        on a silently mismatched model."""
+        import pytest
+        from torch.distributed.checkpoint.api import CheckpointException
+
+        from kempnerforge.checkpoint.manager import CheckpointManager
+        from kempnerforge.config.schema import AdapterConfig
+        from kempnerforge.model.adapter import build_adapter
+
+        ckpt_dir = str(tmp_path / "ckpt")
+        saved = build_adapter(AdapterConfig(type="linear"), in_dim=8, out_dim=4)
+        opt = build_optimizer(saved, OptimizerConfig(lr=1e-3, fused=False))
+        CheckpointManager(CheckpointConfig(dir=ckpt_dir), saved, opt).save(step=1)
+
+        resumed = build_adapter(AdapterConfig(type="mlp_2layer"), in_dim=8, out_dim=4)
+        opt2 = build_optimizer(resumed, OptimizerConfig(lr=1e-3, fused=False))
+        with pytest.raises(CheckpointException, match="Missing key in checkpoint"):
+            CheckpointManager(CheckpointConfig(dir=ckpt_dir), resumed, opt2).load()

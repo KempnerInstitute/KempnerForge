@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
-import pytest
+import random
 
-from kempnerforge.config import JobConfig, ModelConfig, load_config
+import numpy as np
+import pytest
+import torch
+
+from kempnerforge.config import JobConfig, ModelConfig, load_config, loader
 from kempnerforge.config.loader import _parse_cli_overrides
-from kempnerforge.config.registry import Registry
+from kempnerforge.config.registry import Registry, registry
 from kempnerforge.config.schema import (
     ActivationCheckpointing,
     AdapterConfig,
@@ -951,6 +955,176 @@ class TestCliParsing:
     def test_multiple_overrides(self):
         result = _parse_cli_overrides(["--model.dim=512", "--model.n_layers=8"])
         assert result == {"model": {"dim": 512, "n_layers": 8}}
+
+
+# ---------------------------------------------------------------------------
+# Plugin modules
+# ---------------------------------------------------------------------------
+
+# Registers a video dataset (VideoConfig validates dataset_type against the
+# registry in __post_init__, so it also pins the import-before-overlay order)
+# and records each execution of the module body.
+_PLUGIN_SRC = """\
+from kempnerforge.config.registry import registry
+
+with open({log!r}, "a") as f:
+    f.write("imported\\n")
+
+
+@registry.register_video_dataset({dataset!r})
+def _build(video_config, tokenizer_path, max_text_len):
+    raise NotImplementedError
+"""
+
+
+def _write_plugin(tmp_path, monkeypatch, module: str, dataset: str, body: str | None = None):
+    """Write an importable plugin module; return the path it logs imports to."""
+    log = tmp_path / f"{module}.log"
+    src = body if body is not None else _PLUGIN_SRC.format(log=str(log), dataset=dataset)
+    (tmp_path / f"{module}.py").write_text(src)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    return log
+
+
+def _video_toml(dataset: str, module: str | None = None) -> str:
+    """A minimal video job whose dataset_type is validated against the registry."""
+    header = f'plugins = ["{module}"]\n\n' if module else ""
+    return (
+        header
+        + f"""\
+[model]
+dim = 64
+n_layers = 2
+n_heads = 4
+n_kv_heads = 4
+vocab_size = 256
+max_seq_len = 128
+
+[vision_encoder]
+type = "random"
+
+[vlm]
+arch = "joint_decoder"
+max_text_len = 64
+
+[video]
+dataset_type = "{dataset}"
+"""
+    )
+
+
+class TestConfigPlugins:
+    def test_default_is_empty(self):
+        assert JobConfig().plugins == []
+
+    def test_no_plugins_key_runs_no_import_machinery(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(loader, "_import_plugins", calls.append)
+        config = load_config("configs/train/debug.toml", cli_args=[])
+        assert config.plugins == []
+        assert calls == []
+
+    def test_toml_plugin_registers_before_validation(self, tmp_path, monkeypatch):
+        log = _write_plugin(tmp_path, monkeypatch, "kf_plugin_toml", "kf_plugin_ds_toml")
+        toml = tmp_path / "job.toml"
+        toml.write_text(_video_toml("kf_plugin_ds_toml", module="kf_plugin_toml"))
+
+        config = load_config(str(toml), cli_args=[])
+
+        assert config.plugins == ["kf_plugin_toml"]
+        assert config.video is not None
+        assert config.video.dataset_type == "kf_plugin_ds_toml"
+        assert "kf_plugin_ds_toml" in registry.list_video_datasets()
+        assert log.read_text() == "imported\n"
+
+    def test_unregistered_dataset_type_still_rejected(self, tmp_path):
+        """Control for the ordering test: no plugin, same TOML shape, rejected.
+
+        Uses a name no plugin fixture registers, so it stays a control
+        whatever order the tests run in.
+        """
+        toml = tmp_path / "job.toml"
+        toml.write_text(_video_toml("kf_never_registered_ds"))
+        with pytest.raises(ValueError, match="video.dataset_type must be one of"):
+            load_config(str(toml), cli_args=[])
+
+    def test_cli_plugin_registers_before_validation(self, tmp_path, monkeypatch):
+        _write_plugin(tmp_path, monkeypatch, "kf_plugin_cli", "kf_plugin_ds_cli")
+        toml = tmp_path / "job.toml"
+        toml.write_text(_video_toml("kf_plugin_ds_cli"))
+
+        config = load_config(str(toml), cli_args=['--plugins=["kf_plugin_cli"]'])
+
+        assert config.plugins == ["kf_plugin_cli"]
+        assert config.video is not None
+        assert config.video.dataset_type == "kf_plugin_ds_cli"
+
+    def test_cli_accepts_bare_module_path(self, tmp_path, monkeypatch):
+        log = _write_plugin(tmp_path, monkeypatch, "kf_plugin_bare", "kf_plugin_ds_bare")
+        config = load_config(cli_args=["--plugins=kf_plugin_bare"])
+        assert config.plugins == ["kf_plugin_bare"]
+        assert log.read_text() == "imported\n"
+
+    def test_cli_replaces_toml_list(self, tmp_path, monkeypatch):
+        _write_plugin(tmp_path, monkeypatch, "kf_plugin_winner", "kf_plugin_ds_winner")
+        toml_log = _write_plugin(tmp_path, monkeypatch, "kf_plugin_loser", "kf_plugin_ds_loser")
+        toml = tmp_path / "job.toml"
+        toml.write_text('plugins = ["kf_plugin_loser"]\n')
+
+        config = load_config(str(toml), cli_args=['--plugins=["kf_plugin_winner"]'])
+
+        assert config.plugins == ["kf_plugin_winner"]
+        assert not toml_log.exists()
+
+    def test_repeated_load_imports_once(self, tmp_path, monkeypatch):
+        log = _write_plugin(tmp_path, monkeypatch, "kf_plugin_once", "kf_plugin_ds_once")
+        for _ in range(2):
+            load_config(cli_args=['--plugins=["kf_plugin_once"]'])
+        assert log.read_text() == "imported\n"
+
+    def test_import_leaves_global_rng_untouched(self, tmp_path, monkeypatch):
+        """The seam must not consume global RNG: seeded init (hence bit-exact
+        resume) depends on the generator state at seed time."""
+        _write_plugin(tmp_path, monkeypatch, "kf_plugin_rng", "kf_plugin_ds_rng")
+        torch.manual_seed(1234)
+        random.seed(1234)
+        np.random.seed(1234)
+        torch_before, py_before, np_before = (
+            torch.random.get_rng_state(),
+            random.getstate(),
+            np.random.get_state(),
+        )
+
+        load_config(cli_args=['--plugins=["kf_plugin_rng"]'])
+
+        assert torch.equal(torch_before, torch.random.get_rng_state())
+        assert py_before == random.getstate()
+        np_after = np.random.get_state()
+        assert np_before[0] == np_after[0]
+        assert np.array_equal(np_before[1], np_after[1])
+        assert np_before[2:] == np_after[2:]
+
+    def test_missing_module_raises_actionable_error(self):
+        with pytest.raises(ValueError, match="kf_plugin_absent.*'plugins'.*ModuleNotFoundError"):
+            load_config(cli_args=['--plugins=["kf_plugin_absent"]'])
+
+    def test_module_raising_on_import_reports_cause(self, tmp_path, monkeypatch):
+        _write_plugin(
+            tmp_path, monkeypatch, "kf_plugin_broken", "", body="raise RuntimeError('kaboom')\n"
+        )
+        with pytest.raises(ValueError, match="kf_plugin_broken.*RuntimeError: kaboom"):
+            load_config(cli_args=['--plugins=["kf_plugin_broken"]'])
+
+    def test_non_string_entry_rejected(self, tmp_path):
+        toml = tmp_path / "job.toml"
+        toml.write_text("plugins = [1]\n")
+        with pytest.raises(ValueError, match="'plugins' must be a list of module paths"):
+            load_config(str(toml), cli_args=[])
+
+    def test_field_rejects_bare_string(self):
+        """A bare string would iterate as characters downstream."""
+        with pytest.raises(ValueError, match="plugins must be a list of module paths"):
+            JobConfig(plugins="my_experiment.components")
 
 
 # ---------------------------------------------------------------------------
