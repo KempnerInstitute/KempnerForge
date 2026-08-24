@@ -116,7 +116,7 @@ def _build_model(config: JobConfig, device: torch.device, dtype: torch.dtype) ->
     assert config.adapter is not None, "internal: VLM config materializes a default adapter"
     # A video checkpoint bakes num_image_tokens = frames_per_clip * tokens_per_frame
     # into the transformer's residual/positional structure, so the eval must rebuild
-    # with the same frames_per_clip the training run used (mirrors scripts/train.py).
+    # with the same frames_per_clip the training run used (mirrors build_model).
     # Image configs default to 1.
     frames_per_clip = config.video.max_frames if config.video is not None else 1
     model = build_vlm_wrapper(

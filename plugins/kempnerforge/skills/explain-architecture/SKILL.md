@@ -61,8 +61,8 @@ Walk the user through the path a single forward+backward pass takes. Use the out
 - `training/grad.py` owns gradient utilities: clipping, accumulation (`maybe_no_sync` context manager for FSDP), NaN detection hooks.
 
 ### 6. Training loop
-- `scripts/train.py` runs the loop directly (no framework wrapper). Each step: forward, loss (`training/loss.py`), backward, optional gradient accumulation, optimizer step, scheduler step, metrics log, checkpoint if interval hit.
-- MoE runs apply an aux loss term inside the model (see `model/transformer.py::get_moe_aux_loss`), which `train.py` adds to the main loss before `backward()`.
+- `training/loop.py::run_training_loop` runs the loop (no framework wrapper); `training/entry.py::run_training` builds its collaborators and `scripts/train.py` is a thin CLI wrapper. Each step: forward, loss (`training/loss.py`), backward, optional gradient accumulation, optimizer step, scheduler step, metrics log, checkpoint if interval hit.
+- MoE runs apply an aux loss term inside the model (see `model/transformer.py::get_moe_aux_loss`), which the step body adds to the main loss before `backward()`.
 
 ### 7. Checkpointing
 - `kempnerforge/checkpoint/manager.py::CheckpointManager` orchestrates save and load. Uses `torch.distributed.checkpoint` (DCP), which automatically handles FSDP sharded state and reshards on load.
