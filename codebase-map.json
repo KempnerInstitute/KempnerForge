@@ -775,7 +775,8 @@
         "freeze_params(model, specs, module_patterns) -> dict",
         "apply_freeze_specs(model, specs, module_patterns) -> dict",
         "canonical_freeze_meta(specs) -> list[dict]",
-        "effective_freeze(step, base_specs, schedule, valid_modules) -> list[FreezeSpec]"
+        "effective_freeze(step, base_specs, schedule, valid_modules) -> list[FreezeSpec]",
+        "freeze_meta_at_step(step, config) -> list[dict]"
       ],
       "tested_by": [
         "tests/unit/test_freeze.py::TestFreezeParams",
@@ -835,11 +836,12 @@
           "purpose": "Ranks, device, DeviceMesh, and the DP view of it"
         },
         "PipelineBundle": {
-          "purpose": "PP rank/size/schedule/process-group (pp > 1 only)"
+          "purpose": "PP rank/size/schedule (pp > 1 only); the process group is derived on demand"
         }
       },
       "functions": [
-        "setup_distributed(config) -> RuntimeContext"
+        "setup_distributed(config) -> RuntimeContext",
+        "pp_group(runtime) -> ProcessGroup"
       ],
       "tested_by": [
         "tests/unit/test_train_entry.py"
@@ -858,7 +860,7 @@
         "build_data_pipeline(config, runtime) -> DataPipeline",
         "build_eval_dataloader(config, runtime) -> DataLoader | None",
         "build_phase_state(config, data, step) -> PhaseState",
-        "advance_phases(state, data, step, temperature) -> bool"
+        "advance_phases(state, data, step) -> bool"
       ],
       "tested_by": [
         "tests/unit/test_train_entry.py::TestBuildDataPipeline",
@@ -897,12 +899,14 @@
     "kempnerforge/training/entry.py": {
       "purpose": "Training job orchestration — build phases, run the loop, tear down",
       "functions": [
-        "run_training(config)",
+        "run_training(config, step_fn=None, hooks=None)",
         "build_model(config, runtime, loss_fn) -> tuple[Module, PipelineBundle | None]",
         "build_checkpoint_manager(config, runtime, model, optimizer, pipeline) -> CheckpointManager",
         "restore_checkpoint(config, model, scheduler, ckpt_mgr) -> tuple[int, int]"
       ],
       "tested_by": [
+        "tests/unit/test_train_entry.py::TestRunTraining",
+        "tests/unit/test_train_entry.py::TestBuildPhaseHelpers",
         "tests/e2e/test_training_e2e.py",
         "tests/smoke/test_smoke.py"
       ]

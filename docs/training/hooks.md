@@ -89,16 +89,15 @@ then `on_checkpoint_save`.
 Hooks are created in-process, not from TOML:
 
 ```python
-# In a custom launcher built on kempnerforge.training.entry:
-
+from kempnerforge.training.entry import run_training
 from kempnerforge.training.hooks import HookRunner
-hook_runner = HookRunner([MyHook1(), MyHook2()])
+
+run_training(config, hooks=HookRunner([MyHook1(), MyHook2()]))
 ```
 
-`run_training` instantiates `HookRunner()` with no hooks. To register
-hooks today, build the `TrainingSession` yourself with a populated
-`hooks=` and call `run_training_loop`. A config-driven hook registry is
-not yet wired up.
+`scripts/train.py` calls `run_training(config)` with no hooks, so a
+default run has none. Pass `hooks=` from your own launcher to register
+them. A config-driven hook registry is not yet wired up.
 
 ## When to write a hook vs fork `train.py`
 
