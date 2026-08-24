@@ -38,8 +38,9 @@ nccl_health_check_interval = 0       # NCCL ping every N steps (0 = disabled)
 ```
 
 Two knobs. There is deliberately no `nan_detection` section — the
-action and max-consecutive count are hardcoded in `scripts/train.py`
-(`action="warn"`, `max_consecutive=10`). Edit the script if you need
+action and max-consecutive count are hardcoded in
+`kempnerforge/training/entry.py` (`action="warn"`, `max_consecutive=10`).
+Edit the source if you need
 different behavior; see [NaN detection](nan-detection.md).
 
 ## SLURM launch

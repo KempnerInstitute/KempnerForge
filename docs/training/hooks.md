@@ -3,7 +3,7 @@
 The `TrainingHook` interface in
 [`kempnerforge/training/hooks.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/training/hooks.py)
 is the supported way to run custom logic during training without
-forking [`scripts/train.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/scripts/train.py).
+forking the [training loop](training-loop.md).
 
 ## Interface
 
@@ -89,17 +89,16 @@ then `on_checkpoint_save`.
 Hooks are created in-process, not from TOML:
 
 ```python
-# In a custom launcher that imports scripts/train.py as a library,
-# or in a fork that monkey-patches the hook_runner after construction:
+# In a custom launcher built on kempnerforge.training.entry:
 
 from kempnerforge.training.hooks import HookRunner
 hook_runner = HookRunner([MyHook1(), MyHook2()])
 ```
 
-`scripts/train.py` instantiates `HookRunner()` with no hooks at line
-502. To register hooks today, you either fork `train.py` to pass a
-populated list, or import-and-patch from a custom entry point.
-A config-driven hook registry is not yet wired up.
+`run_training` instantiates `HookRunner()` with no hooks. To register
+hooks today, build the `TrainingSession` yourself with a populated
+`hooks=` and call `run_training_loop`. A config-driven hook registry is
+not yet wired up.
 
 ## When to write a hook vs fork `train.py`
 
@@ -143,7 +142,7 @@ class GradHistogramHook(TrainingHook):
 ```
 
 The pragmatic version: for a one-off gradient-norm histogram, just
-edit `scripts/train.py` to log it directly after the microbatch loop —
+edit the step body to log it directly after the microbatch loop —
 the hook machinery adds complexity when you only ever need one
 logger.
 

@@ -100,6 +100,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Training entry point is now a library.** `scripts/train.py:main()` (~1000 lines) is decomposed into `kempnerforge/training/` modules: `runtime.py` (`RuntimeContext`, `PipelineBundle`, `setup_distributed`), `data_pipeline.py` (`DataPipeline`, `PhaseState`, data/eval/phase builders), `loop.py` (`BatchStream`, `StepResult`, `TrainingSession`, `run_training_loop`, and the `text_step` / `vlm_step` / `pipeline_step` bodies picked by `select_step_fn`), and `entry.py` (`run_training` plus the model/checkpoint/resume builders). `scripts/train.py` is now a thin CLI wrapper — same CLI, same log lines, same metric keys, same checkpoint format. Behavior-preserving; the loop is unit-testable with a fake `CheckpointManager` (`tests/unit/test_train_entry.py`).
 - `docs/getting-started/install.md` Prerequisites: documents `.python-version` and uv's auto-fetch behavior.
 - `README.md` and `kempnerforge/README.md` Prerequisites: clarify that uv auto-fetches Python 3.12 via `.python-version`.
 - `docs/claude-ready.md` first-run flow: `/kempnerforge:install-and-verify` runs before `/kempnerforge:cluster-config`.

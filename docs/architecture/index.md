@@ -13,7 +13,7 @@ The README renders this as a mermaid diagram:
 
 ```
 TOML preset ─┐
-             ├──► JobConfig ──► scripts/train.py ──┬──► Model
+             ├──► JobConfig ──► run_training()  ──┬──► Model
 CLI override ┘    (dataclasses)   (training loop)  │     Token Embedding → Blocks (RoPE · GQA · SwiGLU or MoE) → Output Head
                                                    │
                                                    ├──► Parallelism (strict order)
