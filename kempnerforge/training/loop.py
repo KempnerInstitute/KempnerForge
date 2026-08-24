@@ -462,7 +462,8 @@ def run_training_loop(
 
     Returns the final ``(step, tokens_seen)``. Drains any pending async
     checkpoint before returning so the caller can tear down the process
-    group safely.
+    group safely. ``session.data`` is read once and must stay fixed for the
+    duration; only its ``dataloader`` may be swapped mid-run.
     """
     config = session.config
     tc = config.train

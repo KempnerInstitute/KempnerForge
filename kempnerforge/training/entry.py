@@ -331,9 +331,9 @@ def run_training(
             tracker.close()
         # destroy_process_group() is the cooperative teardown -- it blocks in
         # _wait_for_pending_works() and shuts backends down in a deliberate
-        # order because ncclCommAbort has been collective in some NCCL versions
-        # (torch/distributed/distributed_c10d.py:2304-2319). Peers are still
-        # mid-collective while we unwind, so on the failure path leave the
-        # group to the launcher, as main did.
+        # order because ncclCommAbort has been collective in some NCCL
+        # versions; torch ships _abort_process_group() as the separate
+        # error-path API. Peers are still mid-collective while we unwind, so
+        # on the failure path leave the group to the launcher, as main did.
         if finished:
             destroy_distributed()
