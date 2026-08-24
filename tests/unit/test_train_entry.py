@@ -8,6 +8,7 @@ dispatch, and the data-pipeline builder.
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Any
 
 import pytest
@@ -560,6 +561,49 @@ class TestRunTrainingLoop:
         assert hook.begins == 1
         assert hook.steps == [1, 2, 3, 4]
         assert hook.saves == [2, 4]
+
+    def test_exception_path_runs_no_collectives(self):
+        # ckpt_mgr.wait() ends in dist.barrier(). Running it while an
+        # exception unwinds rendezvouses against ranks still in the loop and
+        # hangs the whole job instead of failing one rank fast.
+        config = make_config(max_steps=4)
+
+        def boom(_session, step):
+            raise RuntimeError("step blew up")
+
+        session = make_session(config, step_fn=boom)
+        with pytest.raises(RuntimeError, match="step blew up"):
+            run_training_loop(session)
+        ckpt: FakeCheckpointManager = session.checkpointer  # type: ignore[assignment]
+        assert ckpt.waits == 0
+        assert ckpt.saves == []
+
+    def test_profiler_is_stopped_even_when_a_step_raises(self):
+        class FakeProfiler:
+            def __init__(self) -> None:
+                self.started = self.stopped = 0
+
+            def start(self) -> None:
+                self.started += 1
+
+            def stop(self) -> None:
+                self.stopped += 1
+
+            def step(self) -> None:
+                pass
+
+        prof = FakeProfiler()
+        session = make_session(
+            make_config(max_steps=4),
+            step_fn=lambda _s, _i: (_ for _ in ()).throw(RuntimeError("boom")),
+            profiler=prof,
+            # Non-zero rank so the assertion is about stop(), not the rank-0
+            # summary print (which needs a real torch profiler).
+            runtime=dataclasses.replace(_runtime(), rank=1),
+        )
+        with pytest.raises(RuntimeError, match="boom"):
+            run_training_loop(session)
+        assert (prof.started, prof.stopped) == (1, 1)
 
     def test_phase_lr_scale_multiplies_the_scheduled_lr(self):
         config = make_config(max_steps=1)

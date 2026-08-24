@@ -476,7 +476,6 @@ def run_training_loop(
     hooks = session.hooks
     data = session.data
     phases = session.phases
-    batches = session.batches
     prof = session.profiler
 
     logger.info(
@@ -515,7 +514,7 @@ def run_training_loop(
     try:
         while step < tc.max_steps:
             # Refresh data iterator at start / epoch boundary
-            batches.ensure_started()
+            session.batches.ensure_started()
 
             tracker.start_step()
             result = session.step_fn(session, step)
@@ -549,7 +548,7 @@ def run_training_loop(
             # Phase transition check — a fired phase forces a data iterator
             # refresh so the new sampler weights take effect.
             if advance_phases(phases, data, step):
-                batches.reset()
+                session.batches.reset()
 
             # Metrics (report LR after phase scaling)
             current_lr = optimizer.param_groups[0]["lr"]
@@ -644,24 +643,29 @@ def run_training_loop(
                 completed_normally = True
 
     finally:
+        # Only rank-local work belongs here. A collective on the exception path
+        # would rendezvous against ranks still in the loop, turning a
+        # rank-local crash into an all-rank hang until the NCCL watchdog fires.
         if prof is not None:
             prof.stop()
             if runtime.rank == 0:
                 print_profiler_summary(prof, trace_dir=config.profiling.trace_dir)
 
-        if completed_normally and not config.checkpoint.should_save(step):
-            ckpt_mgr.save(
-                step=step,
-                tokens_seen=tokens_seen,
-                scheduler=scheduler,
-                dataloader=data.dataloader,
-                extra=ckpt_extra,
-            )
-            hooks.on_checkpoint_save(step, config.checkpoint.dir)
+    if completed_normally and not config.checkpoint.should_save(step):
+        ckpt_mgr.save(
+            step=step,
+            tokens_seen=tokens_seen,
+            scheduler=scheduler,
+            dataloader=data.dataloader,
+            extra=ckpt_extra,
+        )
+        hooks.on_checkpoint_save(step, config.checkpoint.dir)
 
-        # Flush any pending async checkpoint before tearing down process group.
-        # In `finally` so a raise mid-loop cannot leave a half-written save.
-        ckpt_mgr.wait()
+    # Flush any pending async checkpoint before tearing down process group.
+    # `wait()` ends in a barrier, so it stays on the normal path; an
+    # interrupted save is already guarded by the DCP completion marker and
+    # the deferred `latest` commit.
+    ckpt_mgr.wait()
 
     logger.info(f"Training complete: {step} steps, {tokens_seen:,} tokens")
     hooks.on_train_end(step, tokens_seen)
