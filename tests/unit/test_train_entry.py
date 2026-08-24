@@ -671,6 +671,56 @@ class TestRunTraining:
         # The default body never ran: no backward, so the weights are untouched.
         assert torch.equal(before, model.out.weight)
 
+    def test_teardown_is_cooperative_only_on_the_clean_path(self, monkeypatch):
+        # destroy_process_group() blocks in _wait_for_pending_works() and
+        # shuts NCCL backends down in a deliberate order because
+        # ncclCommAbort has been collective. Running it while an exception
+        # unwinds meets peers that are still mid-collective.
+        import kempnerforge.training.entry as entry
+        from kempnerforge.training.entry import run_training
+        from kempnerforge.training.loop import StepResult
+
+        destroys: list[int] = []
+        closes: list[int] = []
+
+        class CountingTracker:
+            def __init__(self, *_a, **_k) -> None:
+                pass
+
+            def init_backends(self, _config) -> None:
+                pass
+
+            def start_step(self) -> None:
+                pass
+
+            def end_step(self, **_kw):
+                return None
+
+            def log_eval(self, *_a) -> None:
+                pass
+
+            def close(self) -> None:
+                closes.append(1)
+
+        _stub_entry(monkeypatch, TinyTextModel())
+        monkeypatch.setattr(entry, "MetricsTracker", CountingTracker)
+        monkeypatch.setattr(entry, "destroy_distributed", lambda: destroys.append(1))
+
+        def boom(_session, _step):
+            raise RuntimeError("step blew up")
+
+        with pytest.raises(RuntimeError, match="step blew up"):
+            run_training(make_config(max_steps=2), step_fn=boom)
+        assert destroys == []  # left to the launcher on the failure path
+        assert closes == [1]  # rank-local, always runs
+
+        run_training(
+            make_config(max_steps=2),
+            step_fn=lambda _s, _i: StepResult(loss=1.0, grad_norm=0.5),
+        )
+        assert destroys == [1]
+        assert closes == [1, 1]
+
     def test_injected_hooks_get_the_whole_lifecycle(self, monkeypatch):
         from kempnerforge.training.entry import run_training
         from kempnerforge.training.loop import StepResult
