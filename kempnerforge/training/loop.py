@@ -28,10 +28,10 @@ from kempnerforge.resilience.health import NaNDetector, check_nccl_health
 from kempnerforge.resilience.signal_handler import ShutdownHandler
 from kempnerforge.training.data_pipeline import DataPipeline, PhaseState, advance_phases
 from kempnerforge.training.eval import run_eval
-from kempnerforge.training.freeze import apply_freeze_specs, canonical_freeze_meta, effective_freeze
+from kempnerforge.training.freeze import apply_freeze_specs, freeze_meta_at_step
 from kempnerforge.training.grad import maybe_no_sync
 from kempnerforge.training.hooks import HookRunner, StepContext
-from kempnerforge.training.runtime import PipelineBundle, RuntimeContext
+from kempnerforge.training.runtime import PipelineBundle, RuntimeContext, pp_group
 
 logger = get_logger(__name__)
 
@@ -42,45 +42,81 @@ class BatchStream:
     """The training dataloader plus its live iterator.
 
     Wraps the epoch-boundary restart and the "no dataloader configured"
-    case so the step bodies don't each re-implement them.
+    case so the step bodies don't each re-implement them. The loader is read
+    off the pipeline on every access, so swapping ``pipeline.dataloader``
+    takes effect on the next step instead of leaving a stale snapshot.
     """
 
-    def __init__(self, dataloader: Any | None) -> None:
-        self.dataloader: Any = dataloader
+    def __init__(self, pipeline: DataPipeline) -> None:
+        self.pipeline = pipeline
         self._iter: Any = None
+        self._source: Any = None
+
+    @property
+    def dataloader(self) -> Any:
+        return self.pipeline.dataloader
 
     @property
     def has_data(self) -> bool:
         return self.dataloader is not None
 
     def ensure_started(self) -> None:
-        """Materialize the iterator at the start of a step (no-op if live)."""
-        if self.dataloader is not None and self._iter is None:
-            self._iter = iter(self.dataloader)
+        """Materialize the iterator, if it isn't already, for the loader in use.
+
+        ``next_batch`` does this itself; the loop calls it up front so building
+        an iterator (which spawns dataloader workers) stays outside the region
+        ``MetricsTracker`` times.
+        """
+        loader = self.dataloader
+        if loader is not None and (self._iter is None or self._source is not loader):
+            self._iter = iter(loader)
+            self._source = loader
 
     def reset(self) -> None:
-        """Drop the iterator so the next step rebuilds it (e.g. after a phase change)."""
+        """Drop the iterator so the next step takes a fresh one from the loader.
+
+        A ``StatefulDataLoader`` re-applies its recorded skip, so this picks up
+        inside the current epoch rather than restarting it.
+        """
         self._iter = None
 
     def next_batch(self) -> dict[str, torch.Tensor]:
+        if self.dataloader is None:
+            raise RuntimeError("BatchStream has no dataloader; check has_data first")
+        self.ensure_started()
         try:
             return next(self._iter)
         except StopIteration:
-            self._iter = iter(self.dataloader)
+            pass
+        # Epoch boundary: take a fresh iterator. A second StopIteration means
+        # this rank's shard is empty, which would otherwise escape as a bare
+        # StopIteration and leave the other ranks blocked in the next
+        # collective until the process-group timeout.
+        self._iter = iter(self.dataloader)
+        self._source = self.dataloader
+        try:
             return next(self._iter)
+        except StopIteration:
+            raise RuntimeError(
+                "dataloader yielded no batches for this rank: the dataset is "
+                "smaller than batch_size x dp_size, a streaming shard is "
+                "exhausted, or a mixture phase weighted this rank's only "
+                "source to zero"
+            ) from None
 
 
 @dataclass
 class StepResult:
     """What one training step reports back to the loop.
 
-    The per-dataset and text-token fields stay empty for step bodies that
-    don't produce them.
+    The per-dataset fields stay empty for step bodies that don't produce
+    them; ``text_tokens`` stays None, which a VLM run treats as an error
+    rather than logging a zero.
     """
 
     loss: float
     grad_norm: float
-    text_tokens: int = 0
+    text_tokens: int | None = None
     dataset_token_counts: dict[str, int] = field(default_factory=dict)
     dataset_loss_sums: dict[str, float] = field(default_factory=dict)
     dataset_loss_counts: dict[str, int] = field(default_factory=dict)
@@ -110,10 +146,14 @@ class TrainingSession:
     pipeline: PipelineBundle | None = None
     eval_dataloader: Any | None = None
     profiler: Any | None = None
-    batches: BatchStream = field(init=False)
+    _batch_stream: BatchStream | None = field(default=None, init=False, repr=False)
 
-    def __post_init__(self) -> None:
-        self.batches = BatchStream(self.data.dataloader)
+    @property
+    def batches(self) -> BatchStream:
+        """The live batch iterator. Rebuilt if ``data`` is replaced wholesale."""
+        if self._batch_stream is None or self._batch_stream.pipeline is not self.data:
+            self._batch_stream = BatchStream(self.data)
+        return self._batch_stream
 
 
 # ---------------------------------------------------------------------------
@@ -148,7 +188,8 @@ def pipeline_step(session: TrainingSession, step: int) -> StepResult:
     model = session.model
     batches = session.batches
     pipeline = session.pipeline
-    assert pipeline is not None  # selected only when distributed.pp > 1
+    if pipeline is None:  # select_step_fn only picks this body when pp > 1
+        raise RuntimeError("pipeline_step requires TrainingSession.pipeline")
 
     # Collect microbatches into a full batch for the schedule.
     # schedule.step() splits along dim 0 into n_microbatches.
@@ -194,7 +235,7 @@ def pipeline_step(session: TrainingSession, step: int) -> StepResult:
 
     # Broadcast loss and grad_norm from last PP stage to all PP stages
     loss_tensor = torch.tensor([avg_loss, grad_norm_val], device=device)
-    dist.broadcast(loss_tensor, group_src=pipeline.size - 1, group=pipeline.group)
+    dist.broadcast(loss_tensor, group_src=pipeline.size - 1, group=pp_group(session.runtime))
     return StepResult(loss=loss_tensor[0].item(), grad_norm=loss_tensor[1].item())
 
 
@@ -328,9 +369,8 @@ def select_step_fn(config: JobConfig) -> StepFn:
 def checkpoint_extra(config: JobConfig, step: int, phases: PhaseState) -> dict:
     """Metadata saved alongside every checkpoint so a resume is exact.
 
-    ``vlm_freeze`` uses ``effective_freeze`` so it reflects the
-    post-transition state when a FreezeStage has fired; ``valid_modules``
-    pins typo-catching at save time too.
+    ``vlm_freeze`` reflects the post-transition state when a FreezeStage
+    has fired (see ``freeze_meta_at_step``).
     """
     extra: dict = {"phase_idx": phases.next_idx} if phases.phases else {}
     if config.metrics.wandb_run_id:
@@ -339,10 +379,7 @@ def checkpoint_extra(config: JobConfig, step: int, phases: PhaseState) -> dict:
         extra["mlflow_run_id"] = config.metrics.mlflow_run_id
     if config.is_vlm:
         assert config.vlm is not None  # narrowed by is_vlm
-        valid_modules = set(config.vlm.module_patterns.keys())
-        extra["vlm_freeze"] = canonical_freeze_meta(
-            effective_freeze(step, config.vlm.freeze, config.vlm.freeze_schedule, valid_modules)
-        )
+        extra["vlm_freeze"] = freeze_meta_at_step(step, config.vlm)
     return extra
 
 
@@ -369,6 +406,11 @@ def _log_periodic_metrics(session: TrainingSession, result: StepResult, step: in
     # on each rank, so all-reduce it to the global text-token count
     # before logging.
     if config.is_vlm:
+        if result.text_tokens is None:
+            raise RuntimeError(
+                "VLM run: the step body reported no text-token count, so "
+                "data/text_tokens_trained would be logged as zero"
+            )
         global_text_tokens = result.text_tokens
         if dist.is_initialized():
             t = torch.tensor([result.text_tokens], device=session.runtime.device, dtype=torch.long)
@@ -470,106 +512,144 @@ def run_training_loop(
     # iteration has assigned it.
     ckpt_extra: dict = {}
 
-    while step < tc.max_steps:
-        # Refresh data iterator at start / epoch boundary
-        batches.ensure_started()
+    try:
+        while step < tc.max_steps:
+            # Refresh data iterator at start / epoch boundary
+            batches.ensure_started()
 
-        tracker.start_step()
-        result = session.step_fn(session, step)
+            tracker.start_step()
+            result = session.step_fn(session, step)
 
-        # NaN check
-        if not session.nan_detector.check_loss(result.loss, step):
+            # NaN check
+            if not session.nan_detector.check_loss(result.loss, step):
+                optimizer.zero_grad()
+                if session.nan_detector.should_rollback:
+                    logger.error("Too many consecutive NaNs — stopping")
+                    break
+                step += 1
+                continue
+
+            # Optimizer step
+            optimizer.step()
+            scheduler.step()
+
+            # Phase LR scaling (applied after scheduler computes base LR)
+            if phases.lr_scale != 1.0:
+                for pg in optimizer.param_groups:
+                    pg["lr"] *= phases.lr_scale
+
             optimizer.zero_grad()
-            if session.nan_detector.should_rollback:
-                logger.error("Too many consecutive NaNs — stopping")
-                break
+
             step += 1
-            continue
+            tokens_in_step = tc.batch_size * tc.seq_len * tc.grad_accum_steps * data.dp_size
+            tokens_seen += tokens_in_step
 
-        # Optimizer step
-        optimizer.step()
-        scheduler.step()
+            _apply_freeze_stages(session, step)
 
-        # Phase LR scaling (applied after scheduler computes base LR)
-        if phases.lr_scale != 1.0:
-            for pg in optimizer.param_groups:
-                pg["lr"] *= phases.lr_scale
+            # Phase transition check — a fired phase forces a data iterator
+            # refresh so the new sampler weights take effect.
+            if advance_phases(phases, data, step):
+                batches.reset()
 
-        optimizer.zero_grad()
-
-        step += 1
-        tokens_in_step = tc.batch_size * tc.seq_len * tc.grad_accum_steps * runtime.dp_size
-        tokens_seen += tokens_in_step
-
-        _apply_freeze_stages(session, step)
-
-        # Phase transition check — a fired phase forces a data iterator
-        # refresh so the new sampler weights take effect.
-        if advance_phases(phases, data, step, config.data.mix_temperature):
-            batches.reset()
-
-        # Metrics (report LR after phase scaling)
-        current_lr = optimizer.param_groups[0]["lr"]
-        step_metrics = tracker.end_step(
-            step=step,
-            loss=result.loss,
-            grad_norm=result.grad_norm,
-            lr=current_lr,
-            tokens_in_step=tokens_in_step,
-        )
-
-        hooks.on_step_end(
-            StepContext(
+            # Metrics (report LR after phase scaling)
+            current_lr = optimizer.param_groups[0]["lr"]
+            step_metrics = tracker.end_step(
                 step=step,
                 loss=result.loss,
                 grad_norm=result.grad_norm,
                 lr=current_lr,
-                tokens_seen=tokens_seen,
-                model=model,
-                optimizer=optimizer,
+                tokens_in_step=tokens_in_step,
             )
-        )
 
-        if step_metrics is not None:
-            _log_periodic_metrics(session, result, step)
-
-        # Periodic NCCL health check
-        if (
-            tc.nccl_health_check_interval > 0
-            and step % tc.nccl_health_check_interval == 0
-            and not check_nccl_health()
-        ):
-            logger.error(f"NCCL health check failed at step {step} — stopping")
-            break
-
-        # Eval
-        if (
-            eval_config.enabled
-            and session.eval_dataloader is not None
-            and step % eval_config.interval == 0
-        ):
-            pipeline = session.pipeline
-            eval_metrics = run_eval(
-                model,
-                session.eval_dataloader,
-                session.loss_fn,
-                runtime.device,
-                eval_config.steps,
-                pp_schedule=pipeline.schedule if pipeline is not None else None,
-                pp_rank=pipeline.rank if pipeline is not None else None,
-                pp_size=pipeline.size if pipeline is not None else None,
-                pp_group=pipeline.group if pipeline is not None else None,
+            hooks.on_step_end(
+                StepContext(
+                    step=step,
+                    loss=result.loss,
+                    grad_norm=result.grad_norm,
+                    lr=current_lr,
+                    tokens_seen=tokens_seen,
+                    model=model,
+                    optimizer=optimizer,
+                )
             )
-            tracker.log_eval(eval_metrics, step)
-            hooks.on_eval_end(eval_metrics, step)
 
-        # Advance profiler schedule
+            if step_metrics is not None:
+                _log_periodic_metrics(session, result, step)
+
+            # Periodic NCCL health check
+            if (
+                tc.nccl_health_check_interval > 0
+                and step % tc.nccl_health_check_interval == 0
+                and not check_nccl_health()
+            ):
+                logger.error(f"NCCL health check failed at step {step} — stopping")
+                break
+
+            # Eval
+            if (
+                eval_config.enabled
+                and session.eval_dataloader is not None
+                and step % eval_config.interval == 0
+            ):
+                pipeline = session.pipeline
+                eval_metrics = run_eval(
+                    model,
+                    session.eval_dataloader,
+                    session.loss_fn,
+                    runtime.device,
+                    eval_config.steps,
+                    pp_schedule=pipeline.schedule if pipeline is not None else None,
+                    pp_rank=pipeline.rank if pipeline is not None else None,
+                    pp_size=pipeline.size if pipeline is not None else None,
+                    pp_group=pp_group(runtime) if pipeline is not None else None,
+                )
+                tracker.log_eval(eval_metrics, step)
+                hooks.on_eval_end(eval_metrics, step)
+
+            # Advance profiler schedule
+            if prof is not None:
+                prof.step()
+
+            # Checkpoint
+            ckpt_extra = checkpoint_extra(config, step, phases)
+            if config.checkpoint.should_save(step):
+                ckpt_mgr.save(
+                    step=step,
+                    tokens_seen=tokens_seen,
+                    scheduler=scheduler,
+                    dataloader=data.dataloader,
+                    extra=ckpt_extra,
+                )
+                hooks.on_checkpoint_save(step, config.checkpoint.dir)
+
+            # Graceful shutdown
+            if session.shutdown_handler.should_shutdown():
+                logger.warning(f"Shutdown requested at step {step} — saving emergency checkpoint")
+                ckpt_mgr.save(
+                    step=step,
+                    tokens_seen=tokens_seen,
+                    scheduler=scheduler,
+                    dataloader=data.dataloader,
+                    extra=ckpt_extra,
+                )
+                session.shutdown_handler.finish()
+                break
+
+            # Clean-completion marker for the unconditional final save after the
+            # loop. Only reached when training completes without any errors, e.g.,
+            # no NaN/NCCL/shutdown breaks. If a run encounters a NaN, the last step
+            # is intentionally *not* saved because the actual model state would be
+            # `max_steps - 1`, not `max_steps`.
+            if step >= tc.max_steps:
+                completed_normally = True
+
+    finally:
         if prof is not None:
-            prof.step()
+            prof.stop()
+            if runtime.rank == 0:
+                print_profiler_summary(prof, trace_dir=config.profiling.trace_dir)
 
-        # Checkpoint
-        ckpt_extra = checkpoint_extra(config, step, phases)
-        if config.checkpoint.should_save(step):
+        if completed_normally and not config.checkpoint.should_save(step):
             ckpt_mgr.save(
                 step=step,
                 tokens_seen=tokens_seen,
@@ -579,43 +659,10 @@ def run_training_loop(
             )
             hooks.on_checkpoint_save(step, config.checkpoint.dir)
 
-        # Graceful shutdown
-        if session.shutdown_handler.should_shutdown():
-            logger.warning(f"Shutdown requested at step {step} — saving emergency checkpoint")
-            ckpt_mgr.save(
-                step=step,
-                tokens_seen=tokens_seen,
-                scheduler=scheduler,
-                dataloader=data.dataloader,
-                extra=ckpt_extra,
-            )
-            session.shutdown_handler.finish()
-            break
+        # Flush any pending async checkpoint before tearing down process group.
+        # In `finally` so a raise mid-loop cannot leave a half-written save.
+        ckpt_mgr.wait()
 
-        # Clean-completion marker for the unconditional final save after the
-        # loop. Only reached when training completes without any errors, e.g.,
-        # no NaN/NCCL/shutdown breaks. If a run encounters a NaN, the last step
-        # is intentionally *not* saved because the actual model state would be
-        # `max_steps - 1`, not `max_steps`.
-        if step >= tc.max_steps:
-            completed_normally = True
-
-    if prof is not None:
-        prof.stop()
-        if runtime.rank == 0:
-            print_profiler_summary(prof, trace_dir=config.profiling.trace_dir)
-
-    if completed_normally and not config.checkpoint.should_save(step):
-        ckpt_mgr.save(
-            step=step,
-            tokens_seen=tokens_seen,
-            scheduler=scheduler,
-            dataloader=data.dataloader,
-            extra=ckpt_extra,
-        )
-        hooks.on_checkpoint_save(step, config.checkpoint.dir)
-
-    # Flush any pending async checkpoint before tearing down process group
-    ckpt_mgr.wait()
-
+    logger.info(f"Training complete: {step} steps, {tokens_seen:,} tokens")
+    hooks.on_train_end(step, tokens_seen)
     return step, tokens_seen

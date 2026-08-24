@@ -44,6 +44,10 @@ VOCAB = 16
 DIM = 8
 
 
+def _fake_batches(n: int) -> list[dict[str, torch.Tensor]]:
+    return [{"input_ids": torch.tensor([i])} for i in range(n)]
+
+
 # ---------------------------------------------------------------------------
 # Fakes
 # ---------------------------------------------------------------------------
@@ -87,7 +91,11 @@ class FakeShutdownHandler:
     def __init__(self, after_steps: int | None = None) -> None:
         self.after_steps = after_steps
         self.checks = 0
+        self.registered = False
         self.finished = False
+
+    def register(self) -> None:
+        self.registered = True
 
     def should_shutdown(self) -> bool:
         self.checks += 1
@@ -100,6 +108,7 @@ class FakeShutdownHandler:
 class RecordingHook(TrainingHook):
     def __init__(self) -> None:
         self.begins = 0
+        self.ends: list[tuple[int, int]] = []
         self.steps: list[int] = []
         self.saves: list[int] = []
 
@@ -111,6 +120,9 @@ class RecordingHook(TrainingHook):
 
     def on_checkpoint_save(self, step: int, path: str) -> None:
         self.saves.append(step)
+
+    def on_train_end(self, step: int, tokens_seen: int) -> None:
+        self.ends.append((step, tokens_seen))
 
 
 class FakeMixtureDataset:
@@ -153,15 +165,7 @@ def make_session(config: JobConfig, **overrides: Any) -> TrainingSession:
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _s: 1.0)
     kwargs: dict[str, Any] = {
         "config": config,
-        "runtime": RuntimeContext(
-            rank=0,
-            local_rank=0,
-            world_size=1,
-            device=torch.device("cpu"),
-            device_mesh=None,
-            dp_rank=0,
-            dp_size=1,
-        ),
+        "runtime": _runtime(),
         "model": model,
         "optimizer": optimizer,
         "scheduler": scheduler,
@@ -181,6 +185,16 @@ def make_session(config: JobConfig, **overrides: Any) -> TrainingSession:
     return TrainingSession(**kwargs)
 
 
+def _runtime() -> RuntimeContext:
+    return RuntimeContext(
+        rank=0,
+        local_rank=0,
+        world_size=1,
+        device=torch.device("cpu"),
+        device_mesh=None,
+    )
+
+
 def _make_tracker(config: JobConfig):
     from kempnerforge.metrics.tracker import MetricsTracker
 
@@ -194,38 +208,78 @@ def _make_tracker(config: JobConfig):
 
 class TestBatchStream:
     def test_no_dataloader_reports_no_data(self):
-        stream = BatchStream(None)
+        stream = BatchStream(DataPipeline())
         stream.ensure_started()
         assert stream.has_data is False
 
     def test_restarts_iterator_at_epoch_boundary(self):
-        batches = [{"input_ids": torch.tensor([i])} for i in range(2)]
-        stream = BatchStream(batches)
-        stream.ensure_started()
+        stream = BatchStream(DataPipeline(dataloader=_fake_batches(2)))
         seen = [int(stream.next_batch()["input_ids"]) for _ in range(5)]
         assert seen == [0, 1, 0, 1, 0]
 
+    def test_next_batch_starts_the_iterator_itself(self):
+        # A step body called directly (an example owning its own step_fn)
+        # must not have to remember ensure_started().
+        stream = BatchStream(DataPipeline(dataloader=_fake_batches(3)))
+        assert int(stream.next_batch()["input_ids"]) == 0
+
     def test_reset_forces_a_fresh_iterator(self):
-        batches = [{"input_ids": torch.tensor([i])} for i in range(3)]
-        stream = BatchStream(batches)
-        stream.ensure_started()
+        stream = BatchStream(DataPipeline(dataloader=_fake_batches(3)))
         assert int(stream.next_batch()["input_ids"]) == 0
         stream.reset()
-        stream.ensure_started()
         assert int(stream.next_batch()["input_ids"]) == 0
 
     def test_ensure_started_is_idempotent(self):
-        batches = [{"input_ids": torch.tensor([i])} for i in range(3)]
-        stream = BatchStream(batches)
+        stream = BatchStream(DataPipeline(dataloader=_fake_batches(3)))
         stream.ensure_started()
         assert int(stream.next_batch()["input_ids"]) == 0
         stream.ensure_started()
         assert int(stream.next_batch()["input_ids"]) == 1
 
+    def test_empty_shard_raises_a_named_error(self):
+        # A bare StopIteration here would kill one rank and leave the others
+        # blocked in the next collective until the PG timeout.
+        stream = BatchStream(DataPipeline(dataloader=[]))
+        with pytest.raises(RuntimeError, match="no batches for this rank"):
+            stream.next_batch()
+
+    def test_follows_a_swapped_dataloader(self):
+        pipeline = DataPipeline(dataloader=_fake_batches(3))
+        stream = BatchStream(pipeline)
+        assert int(stream.next_batch()["input_ids"]) == 0
+        pipeline.dataloader = [{"input_ids": torch.tensor([99])}]
+        stream.ensure_started()
+        assert int(stream.next_batch()["input_ids"]) == 99
+
 
 # ---------------------------------------------------------------------------
 # Step-body dispatch
 # ---------------------------------------------------------------------------
+
+
+class TestSessionBatches:
+    def test_follows_a_replaced_data_pipeline(self):
+        # Replacing session.data must not leave the loop on the synthetic
+        # random-token path while a real dataloader sits unused.
+        session = make_session(make_config())
+        assert session.batches.has_data is False
+        session.data = DataPipeline(dataloader=_fake_batches(2))
+        assert session.batches.has_data is True
+        assert int(session.batches.next_batch()["input_ids"]) == 0
+
+
+class TestDataPipelineInvariants:
+    def test_rejects_a_mixture_without_a_sampler(self):
+        with pytest.raises(ValueError, match="must be set together"):
+            DataPipeline(mixture_dataset=FakeMixtureDataset(["a"]))  # type: ignore[arg-type]
+
+    def test_rejects_weights_that_miss_a_dataset(self):
+        with pytest.raises(ValueError, match="must cover every"):
+            DataPipeline(
+                mixture_dataset=FakeMixtureDataset(["a", "b"]),  # type: ignore[arg-type]
+                mixture_sampler=FakeMixtureSampler(),  # type: ignore[arg-type]
+                mixture_weights={"a": 1.0},
+            )
 
 
 class TestSelectStepFn:
@@ -268,9 +322,26 @@ class TestTextStep:
             }
         ]
         session = make_session(config, data=DataPipeline(dataloader=batches))
-        session.batches.ensure_started()
         result = session.step_fn(session, 0)
         assert result.loss > 0
+
+
+class TestVlmTextTokenGuard:
+    def test_missing_count_is_loud(self, tiny_vlm_configs):
+        from kempnerforge.training.loop import StepResult, _log_periodic_metrics
+
+        mc, vision, adapter, vlm = tiny_vlm_configs
+        config = JobConfig(
+            model=mc,
+            train=TrainConfig(batch_size=1, seq_len=64, max_steps=1),
+            vision_encoder=vision,
+            adapter=adapter,
+            vlm=vlm,
+        )
+        session = make_session(make_config())
+        session.config = config
+        with pytest.raises(RuntimeError, match="no text-token count"):
+            _log_periodic_metrics(session, StepResult(loss=1.0, grad_norm=0.1), 1)
 
 
 # ---------------------------------------------------------------------------
@@ -314,7 +385,7 @@ def _mixture_pipeline() -> DataPipeline:
     return DataPipeline(
         mixture_dataset=FakeMixtureDataset(["a", "b"]),  # type: ignore[arg-type]
         mixture_sampler=FakeMixtureSampler(),  # type: ignore[arg-type]
-        mixture_weights=[1.0, 3.0],
+        mixture_weights={"a": 1.0, "b": 3.0},
     )
 
 
@@ -364,18 +435,18 @@ class TestPhaseState:
 class TestAdvancePhases:
     def test_noop_without_a_mixture(self):
         state = PhaseState(phases=[TrainingPhase(start_step=1)])
-        assert advance_phases(state, DataPipeline(), 5, 1.0) is False
+        assert advance_phases(state, DataPipeline(), 5) is False
 
     def test_fires_once_then_stays_put(self):
         data = _mixture_pipeline()
         state = build_phase_state(
             _config_with_phases([TrainingPhase(start_step=2, lr_scale=0.25)]), data, step=0
         )
-        assert advance_phases(state, data, 1, 1.0) is False
-        assert advance_phases(state, data, 2, 1.0) is True
+        assert advance_phases(state, data, 1) is False
+        assert advance_phases(state, data, 2) is True
         assert state.lr_scale == 0.25
         assert state.next_idx == 1
-        assert advance_phases(state, data, 3, 1.0) is False
+        assert advance_phases(state, data, 3) is False
 
     def test_catches_up_across_skipped_phases(self):
         data = _mixture_pipeline()
@@ -389,7 +460,7 @@ class TestAdvancePhases:
             data,
             step=0,
         )
-        assert advance_phases(state, data, 4, 1.0) is True
+        assert advance_phases(state, data, 4) is True
         assert state.next_idx == 2
         assert state.lr_scale == 0.1
 
@@ -498,20 +569,111 @@ class TestRunTrainingLoop:
 
 
 # ---------------------------------------------------------------------------
-# Data pipeline
+# run_training wiring
 # ---------------------------------------------------------------------------
 
 
-def _runtime() -> RuntimeContext:
-    return RuntimeContext(
-        rank=0,
-        local_rank=0,
-        world_size=1,
-        device=torch.device("cpu"),
-        device_mesh=None,
-        dp_rank=0,
-        dp_size=1,
+def _stub_entry(monkeypatch, model: nn.Module) -> FakeCheckpointManager:
+    """Replace every phase run_training builds so the orchestration runs on CPU."""
+    import kempnerforge.training.entry as entry
+
+    ckpt = FakeCheckpointManager()
+    monkeypatch.setattr(entry, "setup_distributed", lambda _config: _runtime())
+    monkeypatch.setattr(entry, "ShutdownHandler", lambda **_kw: FakeShutdownHandler())
+    monkeypatch.setattr(entry, "build_model", lambda *_a, **_k: (model, None))
+    monkeypatch.setattr(
+        entry, "build_optimizer", lambda m, _c: torch.optim.SGD(m.parameters(), lr=0.05)
     )
+    monkeypatch.setattr(
+        entry,
+        "build_scheduler",
+        lambda o, _c, max_steps: torch.optim.lr_scheduler.LambdaLR(o, lambda _s: 1.0),
+    )
+    monkeypatch.setattr(entry, "build_checkpoint_manager", lambda *_a, **_k: ckpt)
+    monkeypatch.setattr(entry, "restore_checkpoint", lambda *_a, **_k: (0, 0))
+    monkeypatch.setattr(entry, "build_profiler", lambda *_a, **_k: None)
+    monkeypatch.setattr(entry, "build_data_pipeline", lambda *_a, **_k: DataPipeline())
+    monkeypatch.setattr(entry, "build_eval_dataloader", lambda *_a, **_k: None)
+    monkeypatch.setattr(entry, "destroy_distributed", lambda: None)
+    return ckpt
+
+
+class TestRunTraining:
+    def test_defaults_to_the_registry_selected_step_body(self, monkeypatch):
+        from kempnerforge.training.entry import run_training
+
+        model = TinyTextModel()
+        before = model.out.weight.detach().clone()
+        _stub_entry(monkeypatch, model)
+        run_training(make_config(max_steps=2))
+        # text_step ran on the synthetic-batch path and the optimizer stepped.
+        assert not torch.equal(before, model.out.weight)
+
+    def test_injected_step_fn_replaces_the_default(self, monkeypatch):
+        from kempnerforge.training.entry import run_training
+        from kempnerforge.training.loop import StepResult
+
+        model = TinyTextModel()
+        before = model.out.weight.detach().clone()
+        _stub_entry(monkeypatch, model)
+        seen: list[int] = []
+
+        def custom_step(_session, step):
+            seen.append(step)
+            return StepResult(loss=1.0, grad_norm=0.5)
+
+        run_training(make_config(max_steps=3), step_fn=custom_step)
+        assert seen == [0, 1, 2]
+        # The default body never ran: no backward, so the weights are untouched.
+        assert torch.equal(before, model.out.weight)
+
+    def test_injected_hooks_get_the_whole_lifecycle(self, monkeypatch):
+        from kempnerforge.training.entry import run_training
+        from kempnerforge.training.loop import StepResult
+
+        model = TinyTextModel()
+        _stub_entry(monkeypatch, model)
+        hook = RecordingHook()
+        config = make_config(max_steps=2)
+
+        run_training(
+            config,
+            step_fn=lambda _s, _i: StepResult(loss=1.0, grad_norm=0.5),
+            hooks=HookRunner([hook]),
+        )
+        assert hook.begins == 1
+        assert hook.steps == [1, 2]
+        tokens = 2 * config.train.batch_size * config.train.seq_len
+        assert hook.ends == [(2, tokens)]
+
+
+class TestBuildPhaseHelpers:
+    def test_checkpoint_manager_has_no_pp_scoping_without_pipeline(self, tmp_path):
+        from kempnerforge.training.entry import build_checkpoint_manager
+
+        config = make_config()
+        config.checkpoint.dir = str(tmp_path / "ckpt")
+        model = TinyTextModel()
+        mgr = build_checkpoint_manager(
+            config, _runtime(), model, torch.optim.SGD(model.parameters(), lr=0.1), None
+        )
+        assert mgr._process_group is None
+        assert mgr._pp_rank is None
+
+    def test_restore_checkpoint_starts_from_scratch(self, tmp_path):
+        from kempnerforge.training.entry import build_checkpoint_manager, restore_checkpoint
+
+        config = make_config()
+        config.checkpoint.dir = str(tmp_path / "empty")
+        model = TinyTextModel()
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+        mgr = build_checkpoint_manager(config, _runtime(), model, optimizer, None)
+        assert restore_checkpoint(config, model, None, mgr) == (0, 0)
+
+
+# ---------------------------------------------------------------------------
+# Data pipeline
+# ---------------------------------------------------------------------------
 
 
 class TestBuildDataPipeline:
@@ -541,7 +703,7 @@ class TestBuildDataPipeline:
         data = build_data_pipeline(config, _runtime())
         assert data.mixture_dataset is not None
         assert data.mixture_sampler is not None
-        assert data.mixture_weights == [1.0, 3.0]
+        assert data.mixture_weights == {"a": 1.0, "b": 3.0}
 
 
 class TestBuildEvalDataloader:

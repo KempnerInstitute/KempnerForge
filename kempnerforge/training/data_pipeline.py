@@ -25,6 +25,7 @@ from kempnerforge.data.dataset import (
     StreamingHuggingFaceDataset,
 )
 from kempnerforge.data.sampler import DistributedSampler, MixtureSampler
+from kempnerforge.distributed.utils import get_dp_info
 from kempnerforge.metrics.logger import get_logger
 from kempnerforge.training.eval import should_build_eval_dataloader
 from kempnerforge.training.runtime import RuntimeContext
@@ -37,14 +38,30 @@ class DataPipeline:
     """The training dataset/loader plus the mixture state phases need.
 
     ``dataloader is None`` means no data source was configured; the text and
-    PP step bodies then fall back to random tokens.
+    PP step bodies then fall back to random tokens. ``dp_rank`` / ``dp_size``
+    record the data-parallel partition the samplers were built for.
     """
 
-    dataset: Any | None = None
     dataloader: Any | None = None
+    dp_rank: int = 0
+    dp_size: int = 1
     mixture_dataset: MixtureDataset | None = None
     mixture_sampler: MixtureSampler | None = None
-    mixture_weights: list[float] = field(default_factory=list)
+    mixture_weights: dict[str, float] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        # Phase scheduling needs both mixture handles and a weight for every
+        # dataset name; either gap would surface only at the first transition,
+        # as an AttributeError or a KeyError.
+        if (self.mixture_dataset is None) != (self.mixture_sampler is None):
+            raise ValueError("mixture_dataset and mixture_sampler must be set together")
+        if self.mixture_dataset is not None and set(self.mixture_weights) != set(
+            self.mixture_dataset.dataset_names
+        ):
+            raise ValueError(
+                f"mixture_weights keys {sorted(self.mixture_weights)} must cover every "
+                f"mixture dataset name {sorted(set(self.mixture_dataset.dataset_names))}"
+            )
 
 
 @dataclass
@@ -53,6 +70,7 @@ class PhaseState:
 
     phases: list[TrainingPhase] = field(default_factory=list)
     original_weights: dict[str, float] = field(default_factory=dict)
+    temperature: float = 1.0
     next_idx: int = 0
     lr_scale: float = 1.0
 
@@ -72,20 +90,13 @@ def _resolve_eos_token_id(config: JobConfig) -> int | None:
 
 
 def _resolve_pad_id(tokenizer_path: str) -> int:
-    """Pad id for the VLM collators, falling back to EOS then 0.
+    """Pad id for the VLM collators — the same resolution the datasets use."""
+    from kempnerforge.data.vlm_dataset import build_tokenizer, resolve_pad_id
 
-    ``pad_token_id`` is unset for some tokenizers (gpt2, some Llama families).
-    """
-    from transformers import AutoTokenizer
-
-    tok = AutoTokenizer.from_pretrained(tokenizer_path)
-    pad_id = tok.pad_token_id
-    if pad_id is None:
-        pad_id = tok.eos_token_id if tok.eos_token_id is not None else 0
-    return int(pad_id)
+    return int(resolve_pad_id(build_tokenizer(tokenizer_path)))
 
 
-def _build_vlm_pipeline(config: JobConfig, runtime: RuntimeContext) -> DataPipeline:
+def _build_vlm_pipeline(config: JobConfig, dp_rank: int, dp_size: int) -> DataPipeline:
     """Image (Joint-Decoder) or video VLM loader, selected by ``config.is_video``."""
     tc = config.train
     vlm_cfg = config.vlm
@@ -137,8 +148,8 @@ def _build_vlm_pipeline(config: JobConfig, runtime: RuntimeContext) -> DataPipel
 
     sampler = DistributedSampler(
         dataset,
-        num_replicas=runtime.dp_size,
-        rank=runtime.dp_rank,
+        num_replicas=dp_size,
+        rank=dp_rank,
         shuffle=True,
         seed=tc.effective_data_seed,
     )
@@ -149,11 +160,11 @@ def _build_vlm_pipeline(config: JobConfig, runtime: RuntimeContext) -> DataPipel
         config=config.data,
         collate_fn=collator,
     )
-    return DataPipeline(dataset=dataset, dataloader=dataloader)
+    return DataPipeline(dataloader=dataloader, dp_rank=dp_rank, dp_size=dp_size)
 
 
 def _build_mixture_pipeline(
-    config: JobConfig, runtime: RuntimeContext, eos_token_id: int | None
+    config: JobConfig, dp_rank: int, dp_size: int, eos_token_id: int | None
 ) -> DataPipeline:
     """Weighted mixture over ``[[data.datasets]]`` sources."""
     tc = config.train
@@ -192,8 +203,8 @@ def _build_mixture_pipeline(
     sampler = MixtureSampler(
         cumulative_sizes=mixture_dataset.cumulative_sizes,
         weights=weights,
-        num_replicas=runtime.dp_size,
-        rank=runtime.dp_rank,
+        num_replicas=dp_size,
+        rank=dp_rank,
         shuffle=True,
         seed=tc.effective_data_seed,
         temperature=config.data.mix_temperature,
@@ -208,16 +219,17 @@ def _build_mixture_pipeline(
         f"Dataset: mixture of {len(sub_datasets)} sources, {len(mixture_dataset):,} total samples"
     )
     return DataPipeline(
-        dataset=mixture_dataset,
         dataloader=dataloader,
+        dp_rank=dp_rank,
+        dp_size=dp_size,
         mixture_dataset=mixture_dataset,
         mixture_sampler=sampler,
-        mixture_weights=weights,
+        mixture_weights=dict(zip(names, weights, strict=True)),
     )
 
 
 def _build_mmap_pipeline(
-    config: JobConfig, runtime: RuntimeContext, eos_token_id: int | None
+    config: JobConfig, dp_rank: int, dp_size: int, eos_token_id: int | None
 ) -> DataPipeline:
     """Pre-tokenized data on disk (fastest path)."""
     tc = config.train
@@ -230,8 +242,8 @@ def _build_mmap_pipeline(
     )
     sampler = DistributedSampler(
         dataset,
-        num_replicas=runtime.dp_size,
-        rank=runtime.dp_rank,
+        num_replicas=dp_size,
+        rank=dp_rank,
         shuffle=True,
         seed=tc.effective_data_seed,
     )
@@ -242,16 +254,17 @@ def _build_mmap_pipeline(
         config=config.data,
     )
     logger.info(f"Dataset: {len(dataset):,} samples from {config.data.dataset_path}")
-    return DataPipeline(dataset=dataset, dataloader=dataloader)
+    return DataPipeline(dataloader=dataloader, dp_rank=dp_rank, dp_size=dp_size)
 
 
-def _build_hf_pipeline(config: JobConfig, runtime: RuntimeContext) -> DataPipeline:
+def _build_hf_pipeline(config: JobConfig, dp_rank: int, dp_size: int) -> DataPipeline:
     """HuggingFace text dataset, streamed or tokenized eagerly into memory."""
     tc = config.train
     if not config.data.tokenizer_path:
         raise ValueError("data.tokenizer_path is required for HuggingFace datasets")
     hf_dataset_name = config.data.hf_dataset_name
-    assert hf_dataset_name  # dispatched on by build_data_pipeline
+    if not hf_dataset_name:  # build_data_pipeline dispatches on this
+        raise ValueError("data.hf_dataset_name is required for HuggingFace datasets")
 
     if config.data.hf_streaming:
         # Streaming: on-the-fly tokenization, no full download needed
@@ -262,8 +275,8 @@ def _build_hf_pipeline(config: JobConfig, runtime: RuntimeContext) -> DataPipeli
             seq_len=tc.seq_len,
             tokenizer_path=config.data.tokenizer_path,
             dataset_config=config.data.hf_dataset_config,
-            rank=runtime.dp_rank,
-            world_size=runtime.dp_size,
+            rank=dp_rank,
+            world_size=dp_size,
             seed=tc.effective_data_seed,
             pack_sequences=config.data.pack_sequences,
         )
@@ -276,7 +289,7 @@ def _build_hf_pipeline(config: JobConfig, runtime: RuntimeContext) -> DataPipeli
         )
         logger.info(
             f"Dataset: streaming from {config.data.hf_dataset_name} "
-            f"({config.data.hf_dataset_split}), rank={runtime.dp_rank}/{runtime.dp_size}"
+            f"({config.data.hf_dataset_split}), rank={dp_rank}/{dp_size}"
         )
     else:
         # Eager: download, tokenize, and pack all sequences into memory
@@ -291,8 +304,8 @@ def _build_hf_pipeline(config: JobConfig, runtime: RuntimeContext) -> DataPipeli
         )
         sampler = DistributedSampler(
             dataset,
-            num_replicas=runtime.dp_size,
-            rank=runtime.dp_rank,
+            num_replicas=dp_size,
+            rank=dp_rank,
             shuffle=True,
             seed=tc.effective_data_seed,
         )
@@ -306,7 +319,7 @@ def _build_hf_pipeline(config: JobConfig, runtime: RuntimeContext) -> DataPipeli
             f"Dataset: {len(dataset):,} packed sequences from "
             f"{config.data.hf_dataset_name} ({config.data.hf_dataset_split})"
         )
-    return DataPipeline(dataset=dataset, dataloader=dataloader)
+    return DataPipeline(dataloader=dataloader, dp_rank=dp_rank, dp_size=dp_size)
 
 
 def build_data_pipeline(config: JobConfig, runtime: RuntimeContext) -> DataPipeline:
@@ -316,16 +329,19 @@ def build_data_pipeline(config: JobConfig, runtime: RuntimeContext) -> DataPipel
     step bodies then run on random tokens.
     """
     eos_token_id = _resolve_eos_token_id(config)
+    # With PP, samplers use DP rank/size (not total world size) since all PP
+    # stages in the same DP group process the same batch.
+    dp_rank, dp_size = get_dp_info(runtime.device_mesh)
 
     if config.is_vlm:
-        return _build_vlm_pipeline(config, runtime)
+        return _build_vlm_pipeline(config, dp_rank, dp_size)
     if config.data.datasets:
-        return _build_mixture_pipeline(config, runtime, eos_token_id)
+        return _build_mixture_pipeline(config, dp_rank, dp_size, eos_token_id)
     if config.data.dataset_path:
-        return _build_mmap_pipeline(config, runtime, eos_token_id)
+        return _build_mmap_pipeline(config, dp_rank, dp_size, eos_token_id)
     if config.data.hf_dataset_name:
-        return _build_hf_pipeline(config, runtime)
-    return DataPipeline()
+        return _build_hf_pipeline(config, dp_rank, dp_size)
+    return DataPipeline(dp_rank=dp_rank, dp_size=dp_size)
 
 
 def build_eval_dataloader(config: JobConfig, runtime: RuntimeContext) -> Any | None:
@@ -337,6 +353,7 @@ def build_eval_dataloader(config: JobConfig, runtime: RuntimeContext) -> Any | N
     tc = config.train
     eval_config = config.eval
     device = runtime.device
+    dp_rank, dp_size = get_dp_info(runtime.device_mesh)
 
     build_eval, warn_vlm_eval = should_build_eval_dataloader(eval_config.enabled, config.is_vlm)
     if warn_vlm_eval:
@@ -375,13 +392,15 @@ def build_eval_dataloader(config: JobConfig, runtime: RuntimeContext) -> Any | N
             packed = torch.empty(0, dtype=torch.long)
             n_seqs = torch.tensor([0], device=device)
 
-        dist.broadcast(n_seqs, src=0)
-        if runtime.rank != 0:
-            packed = torch.empty(int(n_seqs.item()), tc.seq_len + 1, dtype=torch.long)
-        packed_gpu = packed.to(device)
-        dist.broadcast(packed_gpu, src=0)
-        packed = packed_gpu.cpu()
-        del packed_gpu
+        # Single-process callers (and unit tests) have no group to broadcast on.
+        if dist.is_initialized():
+            dist.broadcast(n_seqs, src=0)
+            if runtime.rank != 0:
+                packed = torch.empty(int(n_seqs.item()), tc.seq_len + 1, dtype=torch.long)
+            packed_gpu = packed.to(device)
+            dist.broadcast(packed_gpu, src=0)
+            packed = packed_gpu.cpu()
+            del packed_gpu
 
         eval_dataset = _EvalTensorDataset(packed)
         logger.info(
@@ -393,8 +412,8 @@ def build_eval_dataloader(config: JobConfig, runtime: RuntimeContext) -> Any | N
 
     eval_sampler = DistributedSampler(
         eval_dataset,
-        num_replicas=runtime.dp_size,
-        rank=runtime.dp_rank,
+        num_replicas=dp_size,
+        rank=dp_rank,
         shuffle=False,
         seed=tc.seed,
     )
@@ -428,19 +447,17 @@ def build_phase_state(config: JobConfig, data: DataPipeline, step: int) -> Phase
             )
         ]
 
-    # Original weights (by dataset name) are the fallback when a phase
-    # doesn't override every dataset's weight.
-    original_weights: dict[str, float] = {}
-    if data.mixture_dataset is not None:
-        for i, name in enumerate(data.mixture_dataset.dataset_names):
-            original_weights[name] = data.mixture_weights[i]
+    state = PhaseState(
+        phases=phases,
+        original_weights=dict(data.mixture_weights),
+        temperature=config.data.mix_temperature,
+    )
 
-    state = PhaseState(phases=phases, original_weights=original_weights)
-
-    if step > 0 and phases and data.mixture_dataset is not None:
+    mixture, sampler = data.mixture_dataset, data.mixture_sampler
+    if step > 0 and phases and mixture is not None and sampler is not None:
         for i, phase in enumerate(phases):
             if step >= phase.start_step:
-                _apply_phase(phase, state, data, config.data.mix_temperature)
+                _apply_phase(phase, state, mixture, sampler)
                 state.next_idx = i + 1
         if state.next_idx > 0:
             logger.info(f"Resumed into phase {state.next_idx - 1}, lr_scale={state.lr_scale}")
@@ -449,30 +466,34 @@ def build_phase_state(config: JobConfig, data: DataPipeline, step: int) -> Phase
 
 
 def _apply_phase(
-    phase: TrainingPhase, state: PhaseState, data: DataPipeline, temperature: float
+    phase: TrainingPhase,
+    state: PhaseState,
+    mixture: MixtureDataset,
+    sampler: MixtureSampler,
 ) -> None:
-    assert data.mixture_dataset is not None and data.mixture_sampler is not None
+    # A phase need not name every dataset; the rest keep their original weight.
     new_weights = [
         phase.dataset_weights.get(name, state.original_weights[name])
-        for name in data.mixture_dataset.dataset_names
+        for name in mixture.dataset_names
     ]
-    data.mixture_sampler.update_weights(new_weights, temperature=temperature)
+    sampler.update_weights(new_weights, temperature=state.temperature)
     state.lr_scale = phase.lr_scale
 
 
-def advance_phases(state: PhaseState, data: DataPipeline, step: int, temperature: float) -> bool:
+def advance_phases(state: PhaseState, data: DataPipeline, step: int) -> bool:
     """Activate every phase whose ``start_step`` has been reached.
 
     Returns True when at least one phase fired, so the caller can drop the
     materialized data iterator and pick up the new sampler weights.
     """
-    if not state.phases or data.mixture_dataset is None:
+    mixture, sampler = data.mixture_dataset, data.mixture_sampler
+    if not state.phases or mixture is None or sampler is None:
         return False
 
     fired = False
     while state.next_idx < len(state.phases) and step >= state.phases[state.next_idx].start_step:
         phase = state.phases[state.next_idx]
-        _apply_phase(phase, state, data, temperature)
+        _apply_phase(phase, state, mixture, sampler)
         logger.info(
             f"Phase transition at step {step}: phase={state.next_idx}, lr_scale={state.lr_scale}"
         )

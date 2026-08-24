@@ -40,11 +40,17 @@ from kempnerforge.training.data_pipeline import (
 )
 from kempnerforge.training.freeze import (
     apply_freeze_specs,
-    canonical_freeze_meta,
     effective_freeze,
+    freeze_meta_at_step,
 )
 from kempnerforge.training.hooks import HookRunner
-from kempnerforge.training.loop import LossFn, TrainingSession, run_training_loop, select_step_fn
+from kempnerforge.training.loop import (
+    LossFn,
+    StepFn,
+    TrainingSession,
+    run_training_loop,
+    select_step_fn,
+)
 from kempnerforge.training.loss import build_loss_fn
 from kempnerforge.training.optimizer import build_optimizer
 from kempnerforge.training.runtime import PipelineBundle, RuntimeContext, setup_distributed
@@ -92,9 +98,10 @@ def build_model(
         get_pp_size,
     )
 
-    # pp > 1 implies world_size > 1, so init_distributed always built a mesh
-    # (JobConfig.validate rejects pp > world_size before we get here).
-    assert device_mesh is not None
+    if device_mesh is None:
+        # Unreachable: JobConfig.validate rejects pp > 1 at world_size 1, the
+        # only case init_distributed returns no mesh. Explicit so it survives -O.
+        raise RuntimeError("pipeline parallelism requires a device mesh")
     pp_rank = get_pp_rank(device_mesh)
     pp_size = get_pp_size(device_mesh)
 
@@ -149,13 +156,7 @@ def build_model(
         loss_fn=loss_fn,
         schedule=config.distributed.pp_schedule.value,
     )
-    pipeline = PipelineBundle(
-        rank=pp_rank,
-        size=pp_size,
-        schedule=pp_schedule,
-        group=device_mesh["pp"].get_group(),
-    )
-    return model, pipeline
+    return model, PipelineBundle(rank=pp_rank, size=pp_size, schedule=pp_schedule)
 
 
 def build_checkpoint_manager(
@@ -176,7 +177,7 @@ def build_checkpoint_manager(
     device_mesh = runtime.device_mesh
     if pipeline is not None and device_mesh is not None:
         ckpt_pp_rank = pipeline.rank
-        non_pp_dims = [d for d in device_mesh.mesh_dim_names or () if d != "pp"]
+        non_pp_dims = [d for d in device_mesh.mesh_dim_names if d != "pp"]  # type: ignore[reportOptionalIterable]
         if len(non_pp_dims) == 1:
             ckpt_pg = device_mesh[non_pp_dims[0]].get_group()
         elif len(non_pp_dims) > 1:
@@ -215,14 +216,7 @@ def restore_checkpoint(
     if config.is_vlm:
         assert vlm_cfg is not None  # narrowed by is_vlm
         probe_step = ckpt_mgr.peek_saved_step(str(resume_path) if resume_path else None) or 0
-        # valid_modules: the set of aliases the current config knows about.
-        # effective_freeze raises ValueError if any FreezeSpec references an
-        # alias not in this set, catching TOML typos at config-load time
-        # rather than silently no-op'ing the freeze.
-        valid_modules = set(vlm_cfg.module_patterns.keys())
-        vlm_freeze_expected = canonical_freeze_meta(
-            effective_freeze(probe_step, vlm_cfg.freeze, vlm_cfg.freeze_schedule, valid_modules)
-        )
+        vlm_freeze_expected = freeze_meta_at_step(probe_step, vlm_cfg)
 
     step, tokens_seen, ckpt_extra_loaded = ckpt_mgr.load(
         path=str(resume_path) if resume_path else None,
@@ -261,63 +255,76 @@ def restore_checkpoint(
     return step, tokens_seen
 
 
-def run_training(config: JobConfig) -> None:
-    """Run a full training job: build every phase, run the loop, tear down."""
+def run_training(
+    config: JobConfig,
+    *,
+    step_fn: StepFn | None = None,
+    hooks: HookRunner | None = None,
+) -> None:
+    """Run a full training job: build every phase, run the loop, tear down.
+
+    ``step_fn`` and ``hooks`` let an experiment own the step body or register
+    hooks without copying the build phases. Both default to what
+    ``scripts/train.py`` uses.
+    """
     runtime = setup_distributed(config)
+    # Bound before the try so the teardown can tell "never built" from "built".
+    tracker: MetricsTracker | None = None
+    try:
+        shutdown_handler = ShutdownHandler(timeout_sec=config.train.shutdown_timeout_sec)
+        shutdown_handler.register()
+        nan_detector = NaNDetector(action="warn", max_consecutive=10)
 
-    shutdown_handler = ShutdownHandler(timeout_sec=config.train.shutdown_timeout_sec)
-    shutdown_handler.register()
-    nan_detector = NaNDetector(action="warn", max_consecutive=10)
+        loss_fn = build_loss_fn(config.train)
+        model, pipeline = build_model(config, runtime, loss_fn)
 
-    loss_fn = build_loss_fn(config.train)
-    model, pipeline = build_model(config, runtime, loss_fn)
+        optimizer = build_optimizer(model, config.optimizer)
+        scheduler = build_scheduler(optimizer, config.scheduler, max_steps=config.train.max_steps)
 
-    optimizer = build_optimizer(model, config.optimizer)
-    scheduler = build_scheduler(optimizer, config.scheduler, max_steps=config.train.max_steps)
+        ckpt_mgr = build_checkpoint_manager(config, runtime, model, optimizer, pipeline)
+        step, tokens_seen = restore_checkpoint(config, model, scheduler, ckpt_mgr)
 
-    ckpt_mgr = build_checkpoint_manager(config, runtime, model, optimizer, pipeline)
-    step, tokens_seen = restore_checkpoint(config, model, scheduler, ckpt_mgr)
+        tracker = MetricsTracker(config, num_gpus=runtime.world_size)
+        tracker.init_backends(config)
 
-    tracker = MetricsTracker(config, num_gpus=runtime.world_size)
-    tracker.init_backends(config)
+        prof = build_profiler(config.profiling, rank=runtime.rank)
 
-    prof = build_profiler(config.profiling, rank=runtime.rank)
+        data = build_data_pipeline(config, runtime)
+        # Apply any dataloader state stashed during load(). Runs after dataloader
+        # construction because the loader's identity depends on phase scheduling
+        # that load() restores. No-op when resuming without a prior dataloader
+        # state or when the loader is not stateful (plain TorchDataLoader).
+        if data.dataloader is not None:
+            ckpt_mgr.apply_dataloader_state(data.dataloader)
 
-    data = build_data_pipeline(config, runtime)
-    # Apply any dataloader state stashed during load(). Runs after dataloader
-    # construction because the loader's identity depends on phase scheduling
-    # that load() restores. No-op when resuming without a prior dataloader
-    # state or when the loader is not stateful (plain TorchDataLoader).
-    if data.dataloader is not None:
-        ckpt_mgr.apply_dataloader_state(data.dataloader)
+        eval_dataloader = build_eval_dataloader(config, runtime)
+        phases = build_phase_state(config, data, step)
 
-    eval_dataloader = build_eval_dataloader(config, runtime)
-    phases = build_phase_state(config, data, step)
-    hooks = HookRunner()
+        session = TrainingSession(
+            config=config,
+            runtime=runtime,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            loss_fn=loss_fn,
+            step_fn=step_fn or select_step_fn(config),
+            data=data,
+            phases=phases,
+            checkpointer=ckpt_mgr,
+            tracker=tracker,
+            hooks=hooks or HookRunner(),
+            nan_detector=nan_detector,
+            shutdown_handler=shutdown_handler,
+            pipeline=pipeline,
+            eval_dataloader=eval_dataloader,
+            profiler=prof,
+        )
 
-    session = TrainingSession(
-        config=config,
-        runtime=runtime,
-        model=model,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        loss_fn=loss_fn,
-        step_fn=select_step_fn(config),
-        data=data,
-        phases=phases,
-        checkpointer=ckpt_mgr,
-        tracker=tracker,
-        hooks=hooks,
-        nan_detector=nan_detector,
-        shutdown_handler=shutdown_handler,
-        pipeline=pipeline,
-        eval_dataloader=eval_dataloader,
-        profiler=prof,
-    )
-
-    step, tokens_seen = run_training_loop(session, step=step, tokens_seen=tokens_seen)
-
-    logger.info(f"Training complete: {step} steps, {tokens_seen:,} tokens")
-    hooks.on_train_end(step, tokens_seen)
-    tracker.close()
-    destroy_distributed()
+        run_training_loop(session, step=step, tokens_seen=tokens_seen)
+    finally:
+        # As a library call this can raise and the caller can keep going, so
+        # the process group and the metrics run must not outlive it.
+        # run_training_loop drains the checkpointer in its own finally.
+        if tracker is not None:
+            tracker.close()
+        destroy_distributed()
