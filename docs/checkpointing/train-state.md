@@ -83,31 +83,27 @@ See [Training § Schedulers](../training/schedulers.md).
 
 ## Dataloader state
 
-The infrastructure supports dataloader state (via
-`dataloader.state_dict()` / `load_state_dict()` on KempnerForge's
-`StatefulDataLoader`), but the shipped training loop in
-The training loop **does not currently pass the dataloader** to
-`ckpt_mgr.save()`:
+`StatefulDataLoader` exposes `state_dict()` / `load_state_dict()`, and the
+training loop passes `dataloader=` at every save site, so `build_train_state`
+records the loader position under the `dataloader` key:
 
 ```python
+# training/loop.py::run_training_loop
 ckpt_mgr.save(
     step=step,
     tokens_seen=tokens_seen,
     scheduler=scheduler,
-    extra=ckpt_extra,          # note: no dataloader=...
+    dataloader=data.dataloader,
+    extra=ckpt_extra,
 )
 ```
 
-On resume, the dataloader restarts at the beginning of its epoch.
-Combined with sampler resume logic (see
-[Data § Stateful dataloader](../data/index.md)) and
-deterministic RNG, this is usually fine for most pretraining
-workflows — you may replay a few batches on resume but loss is not
-affected long-term.
-
-If exact-batch-level reproducibility matters, pass `dataloader=` into
-`ckpt_mgr.save()` yourself; `build_train_state` will pick it up
-automatically.
+A checkpoint taken mid-epoch carries e.g.
+`{'epoch': 7, 'batches_yielded': 14, 'sampler': {...}}`. On resume
+`StatefulDataLoader.__iter__` re-applies the skip, so training continues at the
+same sample boundary rather than restarting the epoch. Plain
+`torch.utils.data.DataLoader` (the streaming and eval paths) has no
+`state_dict`, so it is skipped and those loaders do restart.
 
 ## The `extra` dict
 
@@ -116,12 +112,15 @@ can be threaded through `extra`:
 
 ```python
 # training/loop.py::checkpoint_extra
-ckpt_extra = {"phase_idx": current_phase_idx} if active_phases else {}
+extra = {"phase_idx": phases.next_idx} if phases.phases else {}
 if config.metrics.wandb_run_id:
-    ckpt_extra["wandb_run_id"] = config.metrics.wandb_run_id
+    extra["wandb_run_id"] = config.metrics.wandb_run_id
+return extra
 
+# training/loop.py::run_training_loop
+ckpt_extra = checkpoint_extra(config, step, phases)
 ckpt_mgr.save(step=step, tokens_seen=tokens_seen, scheduler=scheduler,
-              extra=ckpt_extra)
+              dataloader=data.dataloader, extra=ckpt_extra)
 ```
 
 On load, `restore_train_state` strips out the "standard" keys
