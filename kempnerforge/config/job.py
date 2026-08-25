@@ -53,6 +53,10 @@ class JobConfig:
     adapter: AdapterConfig | None = None
     vlm: VLMConfig | None = None
     video: VideoConfig | None = None
+    # Module paths the loader imports before building this config, so
+    # out-of-tree components (an experiment's dataset, adapter, ...) are in
+    # the registry by the time a config field validates against it.
+    plugins: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         """Cross-section invariants that fire at construction time.
@@ -62,6 +66,9 @@ class JobConfig:
         config alone runs here so loader-time mistakes surface before
         any distributed init.
         """
+        if not isinstance(self.plugins, list) or not all(isinstance(p, str) for p in self.plugins):
+            raise ValueError(f"plugins must be a list of module paths (got {self.plugins!r})")
+
         if self.vlm is not None:
             if self.vision_encoder is None:
                 raise ValueError(

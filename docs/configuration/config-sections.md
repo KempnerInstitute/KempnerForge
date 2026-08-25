@@ -36,6 +36,9 @@ Owns the ten sub-configs and the cross-section `validate` method.
 | `checkpoint` | `CheckpointConfig` | DCP save cadence, retention, resume path |
 | `metrics` | `MetricsConfig` | logging cadence and backends |
 | `profiling` | `ProfilingConfig` | torch.profiler window and trace dir |
+| `plugins` | `list[str]` | module paths imported before the config is built, for their registry side effects — see [Registry](registry.md) |
+
+`plugins` is a top-level key, not a section: `plugins = ["pkg.module"]`.
 
 ## `[model]` — `ModelConfig`
 
