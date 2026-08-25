@@ -17,7 +17,7 @@ on the router:
 Regardless of which router is active, the aux loss flows the same way:
 
 ```python
-# scripts/train.py
+# training/loop.py step body
 main_loss = cross_entropy(logits, labels)
 aux_loss  = model.get_moe_aux_loss()
 total     = main_loss + mc.moe_aux_loss_weight * aux_loss
@@ -115,7 +115,7 @@ if self.bias_schedule == "linear_warmup":
 
 The schedule needs the current training step, which is pushed in each
 step via `model.set_moe_step(step, max_steps)` in
-`scripts/train.py`. `Transformer.set_moe_step` walks only sigmoid
+the step body. `Transformer.set_moe_step` walks only sigmoid
 routers:
 
 ```python
@@ -171,7 +171,7 @@ sums it across MoE layers — mirroring `aux_loss` / `get_moe_aux_loss()`.
 The training loop adds it only when the weight is positive:
 
 ```python
-# scripts/train.py
+# training/loop.py::_add_moe_losses
 if mc.moe_router_z_loss_weight > 0:
     z = inner_transformer(model).get_moe_router_z_loss()
     loss = loss + mc.moe_router_z_loss_weight * z

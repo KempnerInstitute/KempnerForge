@@ -17,7 +17,7 @@ Two pieces:
 Wired into the training loop at two points:
 
 ```python
-# scripts/train.py
+# training/entry.py::run_training
 shutdown_handler = ShutdownHandler(timeout_sec=config.train.shutdown_timeout_sec)
 shutdown_handler.register()
 ...

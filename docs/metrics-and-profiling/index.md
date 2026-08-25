@@ -12,7 +12,7 @@ loss smoothing, GPU memory, kernel traces. Two modules:
 
 | Component | Type | Enabled by |
 |-----------|------|-----------|
-| `MetricsTracker` | always-on per-step metrics | created unconditionally in `scripts/train.py` |
+| `MetricsTracker` | always-on per-step metrics | created unconditionally in `training/entry.py` |
 | `WandBBackend` | cloud logging | `metrics.enable_wandb = true` |
 | `TensorBoardBackend` | local event files | `metrics.enable_tensorboard = true` |
 | `MLflowBackend` | Databricks / MLflow server | `metrics.enable_mlflow = true` |

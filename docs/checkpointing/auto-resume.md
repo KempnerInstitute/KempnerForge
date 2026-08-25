@@ -50,7 +50,7 @@ training starts from step 0.
 
 ## Where it's called
 
-`scripts/train.py` calls this **once**, right after creating the
+`training/entry.py::restore_checkpoint` calls this **once**, right after creating the
 `CheckpointManager`:
 
 ```python

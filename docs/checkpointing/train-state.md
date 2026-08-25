@@ -86,7 +86,7 @@ See [Training § Schedulers](../training/schedulers.md).
 The infrastructure supports dataloader state (via
 `dataloader.state_dict()` / `load_state_dict()` on KempnerForge's
 `StatefulDataLoader`), but the shipped training loop in
-`scripts/train.py` **does not currently pass the dataloader** to
+The training loop **does not currently pass the dataloader** to
 `ckpt_mgr.save()`:
 
 ```python
@@ -115,7 +115,7 @@ Anything that isn't step / tokens / RNG / scheduler / dataloader
 can be threaded through `extra`:
 
 ```python
-# scripts/train.py — around the checkpoint call
+# training/loop.py::checkpoint_extra
 ckpt_extra = {"phase_idx": current_phase_idx} if active_phases else {}
 if config.metrics.wandb_run_id:
     ckpt_extra["wandb_run_id"] = config.metrics.wandb_run_id

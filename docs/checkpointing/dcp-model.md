@@ -97,7 +97,7 @@ Each stage also gets a process group scoped to that stage's DP + TP
 ranks:
 
 ```python
-# scripts/train.py
+# training/entry.py::build_checkpoint_manager
 non_pp_dims = [d for d in device_mesh.mesh_dim_names if d != "pp"]
 if len(non_pp_dims) == 1:
     ckpt_pg = device_mesh[non_pp_dims[0]].get_group()

@@ -26,7 +26,7 @@ Debug config: configs/train/debug.toml (4-layer, 256-dim, no dataset_path)
 HF streaming demo: configs/train/hf_wikitext.toml (works out of the box with gpt2 tokenizer)
 Train entry point: scripts/train.py
 Default duration: debug.toml max_steps=100, batch_size=4, seq_len=512
-Dataset options (scripts/train.py): config.data.datasets (mixture), config.data.dataset_path (pre-tokenized .npy), config.data.hf_dataset_name (HuggingFace)
+Dataset options (training/data_pipeline.py): config.data.datasets (mixture), config.data.dataset_path (pre-tokenized .npy), config.data.hf_dataset_name (HuggingFace)
 Smoke-test artifact: checkpoints/debug/ (from debug.toml)
 <!-- context-end -->
 
@@ -34,7 +34,7 @@ Smoke-test artifact: checkpoints/debug/ (from debug.toml)
 Assume preflight has passed.
 
 1. Pick a config:
-    - **No local data, no internet**: use `configs/train/debug.toml`. `scripts/train.py` falls back to random-token batches when no dataset is configured, which is enough to exercise the training loop end-to-end.
+    - **No local data, no internet**: use `configs/train/debug.toml`. training falls back to random-token batches when no dataset is configured, which is enough to exercise the training loop end-to-end.
     - **Fast iteration with HF streaming (recommended when internet is available)**: use `configs/train/hf_wikitext.toml`. Tokenizer is `gpt2` (small, cached on first use). Streams wikitext-103. Real data means the loss curve is interpretable.
     - **User has pre-tokenized data**: use `configs/train/debug.toml` with `--data.dataset_path=<path>`.
 

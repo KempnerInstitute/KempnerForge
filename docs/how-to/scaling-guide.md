@@ -19,7 +19,7 @@ exact sequence:
 TP → EP → [FP8] → AC → FSDP (dp_shard)
 ```
 
-Pipeline parallelism is applied separately in `scripts/train.py`
+Pipeline parallelism is applied separately in `training/entry.py::build_model`
 (split into stages *before* `build_parallel_model` runs on each
 stage), and DP replicate / CP are mesh dimensions without a dedicated
 apply step — they fall out of how the `DeviceMesh` is constructed.

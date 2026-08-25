@@ -197,7 +197,7 @@ different mechanisms:
   picks up at sample `3500 × batch_size × world_size` without replay.
 - **HF streaming (Path B)**: wrapped in a plain `DataLoader`;
   `StreamingHuggingFaceDataset` tracks its own position and exposes
-  `load_state_dict` / `state_dict`, which `scripts/train.py` drives
+  `load_state_dict` / `state_dict`, which the training loop drives
   directly. Same guarantee — no replay, no skip — via a different
   code path.
 

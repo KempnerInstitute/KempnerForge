@@ -34,7 +34,7 @@ collective hadn't actually started yet.
 ## Periodic check in the loop
 
 ```python
-# scripts/train.py
+# training/loop.py::run_training_loop
 if (
     tc.nccl_health_check_interval > 0
     and step % tc.nccl_health_check_interval == 0

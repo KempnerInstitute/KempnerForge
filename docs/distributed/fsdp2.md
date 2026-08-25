@@ -54,7 +54,7 @@ apply_fsdp2(model, device_mesh, reshard_after_forward=True)
 | `False` | All-gather once, keep gathered across the step | Pipeline parallel: `1F1B` schedule sends many microbatches through each stage; resharding between them would be wasted work |
 | `int` | Rate-limit concurrency: keep at most `N` blocks gathered at once | Rarely used; middle-ground for memory tuning |
 
-[`scripts/train.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/scripts/train.py)
+[`training/entry.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/training/entry.py)
 calls `apply_fsdp2(model, device_mesh, mp_policy=mp_policy)` on all
 paths without overriding `reshard_after_forward`, so both dense and
 PP runs default to `True`. The docstring on `pipeline_parallel.py`

@@ -5,7 +5,7 @@ partitions work across data-parallel ranks, the stateful dataloader
 that makes checkpoint resume possible, and the mixing / annealing
 hooks used for curriculum training.
 
-Entry point: `scripts/train.py` picks one of four paths based on
+Entry point: `training/data_pipeline.py::build_data_pipeline` picks one of four paths based on
 config — pre-tokenized mmap, HuggingFace eager, HuggingFace streaming,
 or multi-source mixture.
 

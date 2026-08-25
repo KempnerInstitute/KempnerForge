@@ -51,7 +51,7 @@ On a fresh run:
 3. The training loop writes it into `ckpt_extra`:
 
    ```python
-   # scripts/train.py
+   # training/loop.py::checkpoint_extra
    if config.metrics.wandb_run_id:
        ckpt_extra["wandb_run_id"] = config.metrics.wandb_run_id
    ```
@@ -61,7 +61,7 @@ On a fresh run:
 On resume:
 
 ```python
-# scripts/train.py — right after ckpt_mgr.load(...)
+# training/entry.py::restore_checkpoint — right after ckpt_mgr.load(...)
 if ckpt_extra_loaded.get("wandb_run_id"):
     config.metrics.wandb_run_id = ckpt_extra_loaded["wandb_run_id"]
 ```

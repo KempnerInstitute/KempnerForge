@@ -12,7 +12,7 @@ wraps `torch.utils.data.DataLoader` with three additions:
 ## Construction
 
 ```python
-# scripts/train.py
+# training/data_pipeline.py
 dataloader = StatefulDataLoader(
     dataset,
     batch_size=tc.batch_size,
@@ -92,11 +92,11 @@ picks up at the exact same sample boundary.
 
 ## The wiring gap
 
-The infrastructure works, but `scripts/train.py` **does not currently
+The infrastructure works, but the training loop **does not currently
 pass the dataloader to `ckpt_mgr.save()`**:
 
 ```python
-# scripts/train.py
+# training/loop.py::run_training_loop
 ckpt_mgr.save(
     step=step,
     tokens_seen=tokens_seen,

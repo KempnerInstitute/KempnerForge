@@ -7,7 +7,7 @@ Validation runs in two passes:
    Checks fields that can be validated in isolation.
 2. **`JobConfig.validate(world_size)`** — called explicitly by the
    launchers
-   ([`scripts/train.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/scripts/train.py),
+   ([`training/runtime.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/training/runtime.py),
    [`scripts/eval.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/scripts/eval.py))
    once `world_size` is known. Checks rules that cross section
    boundaries.

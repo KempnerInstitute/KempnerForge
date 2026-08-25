@@ -91,7 +91,7 @@ handle.
 
 ## Gradient accumulation in practice
 
-The full microbatching pattern in `scripts/train.py` is:
+The full microbatching pattern in `training/loop.py` is:
 
 ```python
 for micro_step in range(tc.grad_accum_steps):
