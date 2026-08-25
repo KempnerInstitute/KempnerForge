@@ -105,6 +105,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING — VLM evaluation moved out of the core package into `examples/vlm/eval/`.** `kempnerforge/eval/` no longer exists. The lmms-eval chat adapter, the CLI, and their tests now live in the example, so core carries no lmms-eval-facing code and no undeclared dependency. Invoke the harness by its new path — the flags are unchanged:
+
+  ```bash
+  uv run python examples/vlm/eval/vlm_eval_harness.py \
+      --config configs/train/vlm_jd.toml --checkpoint checkpoints/vlm/step_10000 --tasks mmmu_val
+  ```
+
+  - Moved: `kempnerforge/eval/vlm/adapter.py` → `examples/vlm/eval/adapter.py`, `scripts/vlm_eval_harness.py` → `examples/vlm/eval/vlm_eval_harness.py`, `tests/unit/eval/vlm/` → `examples/vlm/eval/tests/unit/`, `tests/integration/test_vlm_eval.py` + `test_lmms_eval_contract.py` → `examples/vlm/eval/tests/integration/`, `docs/how-to/run-vlm-evaluation.md` → `examples/vlm/eval/README.md` (the how-to index links to the example).
+  - Removed: the `[project.entry-points."lmms_eval.models"]` declaration in `pyproject.toml` and `kempnerforge/eval/vlm/manifest.py` (plus its test). The harness now constructs `KempnerForgeVLM` itself and passes the instance to `simple_evaluate`, reaching the adapter as a `sys.path[0]` sibling module; lmms-eval's own CLI (`--model kempnerforge_vlm`) no longer resolves KempnerForge, and there is no compatibility shim. The contract test pins the `simple_evaluate` call shape in place of entry-point resolution.
+  - The example's tests are standalone (outside the suite's `testpaths`) and run as two separate pytest sessions — `uv run pytest examples/vlm/eval/tests/unit` and `.../tests/integration` — because the unit conftest's hermetic fake `lmms_eval` would otherwise reach the integration tests. The tiny-VLM fixtures they need are duplicated into `examples/vlm/eval/tests/conftest.py` and stay in `tests/conftest.py` for the core VLM tests.
+
 - `docs/getting-started/install.md` Prerequisites: documents `.python-version` and uv's auto-fetch behavior.
 - `README.md` and `kempnerforge/README.md` Prerequisites: clarify that uv auto-fetches Python 3.12 via `.python-version`.
 - `docs/claude-ready.md` first-run flow: `/kempnerforge:install-and-verify` runs before `/kempnerforge:cluster-config`.

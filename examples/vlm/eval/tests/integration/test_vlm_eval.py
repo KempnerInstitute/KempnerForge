@@ -15,8 +15,9 @@ Three tests, all skipped when lmms-eval is absent (optional, undeclared dep):
 3. ``test_real_task_via_simple_evaluate`` — opt-in (set ``KF_VLM_EVAL_CONFIG``
    and ``KF_VLM_EVAL_CHECKPOINT``): runs a small ``--limit`` slice of a real
    lmms-eval ``generate_until`` task through ``simple_evaluate`` against a real
-   checkpoint. Point it at a video config + video task to cover real video.
-   Intended for a GPU node; skipped by default.
+   checkpoint, on the prebuilt-instance path the harness uses. Point it at a
+   video config + video task to cover real video. Intended for a GPU node;
+   skipped by default.
 """
 
 from __future__ import annotations
@@ -35,11 +36,11 @@ if getattr(lmms_eval, "__file__", None) is None:
     # fake (mirrors tests/integration/test_lmms_eval_contract.py).
     pytest.skip("fake lmms_eval is active; skipping real-package tests", allow_module_level=True)
 
+from adapter import KempnerForgeVLM  # noqa: E402
 from lmms_eval.api.instance import Instance  # noqa: E402
 
 from kempnerforge.config.data import DataConfig  # noqa: E402
 from kempnerforge.config.schema import JobConfig  # noqa: E402
-from kempnerforge.eval.vlm.adapter import KempnerForgeVLM  # noqa: E402
 from kempnerforge.model.vlm import build_vlm_wrapper  # noqa: E402
 
 
@@ -71,10 +72,8 @@ def test_dcp_roundtrip_generate_until(tmp_path, tiny_vlm_configs, monkeypatch):
     job_config = JobConfig(
         model=mc, vision_encoder=vc, adapter=ac, vlm=lc, data=DataConfig(tokenizer_path="mock")
     )
-    monkeypatch.setattr("kempnerforge.eval.vlm.adapter._load_config", lambda _path: job_config)
-    monkeypatch.setattr(
-        "kempnerforge.eval.vlm.adapter.build_tokenizer", lambda _path: _MockTokenizer()
-    )
+    monkeypatch.setattr("adapter._load_config", lambda _path: job_config)
+    monkeypatch.setattr("adapter.build_tokenizer", lambda _path: _MockTokenizer())
 
     vlm = KempnerForgeVLM(
         config="ignored", checkpoint=str(ckpt_dir), device="cpu", dtype="float32", batch_size=2
@@ -137,15 +136,11 @@ def test_dcp_roundtrip_video_generate_until(tmp_path, tiny_video_configs, monkey
         video=video,
         data=DataConfig(tokenizer_path="mock"),
     )
-    monkeypatch.setattr("kempnerforge.eval.vlm.adapter._load_config", lambda _path: job_config)
-    monkeypatch.setattr(
-        "kempnerforge.eval.vlm.adapter.build_tokenizer", lambda _path: _MockTokenizer()
-    )
+    monkeypatch.setattr("adapter._load_config", lambda _path: job_config)
+    monkeypatch.setattr("adapter.build_tokenizer", lambda _path: _MockTokenizer())
     # Stub video decode so the test needs no av / no real video file.
     frames = [Image.new("RGB", (8, 8), color=(120, 120, 120)) for _ in range(2)]
-    monkeypatch.setattr(
-        "kempnerforge.eval.vlm.adapter.decode_video_frames", lambda path, **kw: frames
-    )
+    monkeypatch.setattr("adapter.decode_video_frames", lambda path, **kw: frames)
 
     vlm = KempnerForgeVLM(
         config="ignored", checkpoint=str(ckpt_dir), device="cpu", dtype="float32", batch_size=2
@@ -199,8 +194,8 @@ def test_real_task_via_simple_evaluate():
     task = os.environ.get("KF_VLM_EVAL_TASK", "mmmu_val")
 
     results = simple_evaluate(
-        model="kempnerforge_vlm",
-        model_args=f"config={config},checkpoint={checkpoint}",
+        model=KempnerForgeVLM(config=config, checkpoint=checkpoint),
+        model_args=f"config={config},checkpoint={checkpoint}",  # record-only
         tasks=[task],
         limit=2,
     )
