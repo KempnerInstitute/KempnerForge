@@ -72,7 +72,7 @@ Assume preflight has passed.
 - `nvidia-smi` returns to idle after the process exits (no zombie CUDA contexts).
 
 ## Gotchas
-- `debug.toml` has no dataset configured by default. `scripts/train.py` detects this and feeds random-token batches (see the `dataloader is None` branch around line 508); the smoke test still exercises forward/backward/optimizer. Loss will not be meaningful, so for a true "is this converging" signal use `hf_wikitext.toml` or supply `--data.dataset_path`.
+- `debug.toml` has no dataset configured by default. Training detects this and feeds random-token batches (see the `batches.has_data` fallback in `training/loop.py::text_step`); the smoke test still exercises forward/backward/optimizer. Loss will not be meaningful, so for a true "is this converging" signal use `hf_wikitext.toml` or supply `--data.dataset_path`.
 - HF streaming writes to `~/.cache/huggingface/` on first use. On read-only home directories, set `HF_HOME=/tmp/hf_cache` before the run.
 - Do not use `torchrun` for a one-GPU smoke test. `python scripts/train.py ...` is correct because FSDP2 with world_size=1 initializes a single-rank process group internally.
 - If the user is on an A100, `compile_model=true` may add 2 to 3 minutes to the first step. Pass `--train.compile_model=false` for a faster first iteration during smoke testing.

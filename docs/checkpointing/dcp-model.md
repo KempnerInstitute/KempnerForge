@@ -135,7 +135,7 @@ directory.
 The returned future is an `AsyncCheckpointerFuture`; `wait()` calls
 `.result()` which blocks until the background writer has flushed to
 disk. Training calls `ckpt_mgr.wait()` once before shutdown
-(`scripts/train.py` line ~788) to flush any pending save.
+(`training/loop.py::run_training_loop`) to flush any pending save.
 
 ## Process groups
 

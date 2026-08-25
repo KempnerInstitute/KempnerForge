@@ -330,8 +330,7 @@ class TestAsyncCheckpointLatestSafety:
 
         # Mirror the real training loop exactly: periodic save() calls, then
         # a single wait() after the loop (training/loop.py::run_training_loop).
-        # NO barriers
-        # are injected between/after save() here — a mid-flush collective on
+        # NO barriers are injected between/after save() here — a mid-flush collective on
         # the default PG races DCP's own async-executor collective thread,
         # an unrelated pre-existing hazard that has nothing to do with the
         # `latest` symlink fix under test.
