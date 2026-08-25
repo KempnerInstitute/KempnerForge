@@ -240,6 +240,103 @@ class TestMuon:
         adam_states = [s for s in optimizer2._adam.state.values() if s]
         assert len(adam_states) > 0, "Internal AdamW state was not restored"
 
+    def test_zero_grad_clears_delegated_params(self):
+        """Params routed to the inner AdamW must be zeroed too.
+
+        Only Muon's half is registered with the base class, so the inherited
+        zero_grad leaves everything delegated to _adam accumulating. The shape
+        matters: at an aspect ratio under 10 the embedding stays on Muon's side
+        and this passes even when the delegation is missing.
+        """
+        torch.manual_seed(0)
+        model = nn.Sequential(
+            nn.Embedding(32000, 64),  # aspect ratio 500:1 -> inner AdamW
+            nn.Linear(64, 64),
+        )
+        # lr tiny and no decay, so parameters barely move and the per-step
+        # gradient is constant unless it is accumulating.
+        config = OptimizerConfig(name="muon", lr=1e-12, weight_decay=0.0)
+        optimizer = build_optimizer(model, config)
+        embedding = model[0].weight
+        assert any(p is embedding for g in optimizer._adam.param_groups for p in g["params"]), (
+            "test needs the embedding on the AdamW side"
+        )
+
+        x = torch.randint(0, 32000, (8, 16))
+        grad_sums = []
+        for _ in range(3):
+            optimizer.zero_grad()
+            model(x).square().sum().backward()
+            grad_sums.append(embedding.grad.abs().sum().item())
+            optimizer.step()
+
+        torch.testing.assert_close(grad_sums[1], grad_sums[0], rtol=1e-5, atol=0.0)
+        torch.testing.assert_close(grad_sums[2], grad_sums[0], rtol=1e-5, atol=0.0)
+
+    def test_zero_grad_still_clears_muon_params(self):
+        """Regression guard: the Muon half must keep being zeroed."""
+        torch.manual_seed(0)
+        model = self._make_model()
+        optimizer = build_optimizer(model, OptimizerConfig(name="muon", lr=0.01))
+
+        x = torch.randn(8, 32)
+        nn.functional.cross_entropy(model(x), torch.randint(0, 10, (8,))).backward()
+        muon_params = [p for g in optimizer.param_groups for p in g["params"]]
+        assert all(p.grad is not None for p in muon_params)
+
+        optimizer.zero_grad()
+        assert all(p.grad is None for p in muon_params)
+
+    def test_zero_grad_forwards_set_to_none_false(self):
+        """set_to_none=False has to reach the inner AdamW, not just Muon."""
+        torch.manual_seed(0)
+        model = nn.Sequential(
+            nn.Embedding(32000, 64),
+            nn.Linear(64, 64),
+        )
+        optimizer = build_optimizer(model, OptimizerConfig(name="muon", lr=0.01))
+        embedding = model[0].weight
+
+        x = torch.randint(0, 32000, (8, 16))
+        model(x).square().sum().backward()
+        assert embedding.grad is not None
+
+        optimizer.zero_grad(set_to_none=False)
+        assert embedding.grad is not None, "set_to_none=False must keep the tensor"
+        assert embedding.grad.abs().sum().item() == 0.0
+
+    def test_zero_grad_without_delegated_params(self):
+        """A model whose parameters are all Muon-eligible leaves _adam as None."""
+        torch.manual_seed(0)
+        model = nn.Linear(32, 32, bias=False)  # single 2D param, aspect ratio 1.0
+        optimizer = build_optimizer(model, OptimizerConfig(name="muon", lr=0.01))
+        assert optimizer._adam is None
+
+        model(torch.randn(4, 32)).sum().backward()
+        assert model.weight.grad is not None
+
+        optimizer.zero_grad()
+        assert model.weight.grad is None
+
+    def test_no_delegated_params_step_and_roundtrip(self):
+        """step/state_dict/load_state_dict must tolerate _adam being None."""
+        torch.manual_seed(0)
+        model = nn.Linear(32, 32, bias=False)
+        optimizer = build_optimizer(model, OptimizerConfig(name="muon", lr=0.01))
+        assert optimizer._adam is None
+
+        optimizer.zero_grad()
+        model(torch.randn(4, 32)).sum().backward()
+        optimizer.step()
+
+        sd = optimizer.state_dict()
+        assert "_adam_state" not in sd
+
+        model2 = nn.Linear(32, 32, bias=False)
+        optimizer2 = build_optimizer(model2, OptimizerConfig(name="muon", lr=0.01))
+        optimizer2.load_state_dict(sd)
+        assert optimizer2._adam is None
+
 
 class TestAdamW:
     def test_build_adamw(self):
