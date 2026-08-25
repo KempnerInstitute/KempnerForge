@@ -270,6 +270,7 @@ def run_training(
     runtime = setup_distributed(config)
     # Bound before the try so the teardown can tell "never built" from "built".
     tracker: MetricsTracker | None = None
+    finished = False
     try:
         shutdown_handler = ShutdownHandler(timeout_sec=config.train.shutdown_timeout_sec)
         shutdown_handler.register()
@@ -321,10 +322,18 @@ def run_training(
         )
 
         run_training_loop(session, step=step, tokens_seen=tokens_seen)
+        finished = True
     finally:
         # As a library call this can raise and the caller can keep going, so
-        # the process group and the metrics run must not outlive it.
-        # run_training_loop drains the checkpointer in its own finally.
+        # the metrics run must not outlive it. close() is rank-local: backends
+        # are built on rank 0 only, so it is a no-op elsewhere.
         if tracker is not None:
             tracker.close()
-        destroy_distributed()
+        # destroy_process_group() is the cooperative teardown -- it blocks in
+        # _wait_for_pending_works() and shuts backends down in a deliberate
+        # order because ncclCommAbort has been collective in some NCCL
+        # versions; torch ships _abort_process_group() as the separate
+        # error-path API. Peers are still mid-collective while we unwind, so
+        # on the failure path leave the group to the launcher, as main did.
+        if finished:
+            destroy_distributed()
