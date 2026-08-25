@@ -305,6 +305,38 @@ class TestMuon:
         assert embedding.grad is not None, "set_to_none=False must keep the tensor"
         assert embedding.grad.abs().sum().item() == 0.0
 
+    def test_zero_grad_without_delegated_params(self):
+        """A model whose parameters are all Muon-eligible leaves _adam as None."""
+        torch.manual_seed(0)
+        model = nn.Linear(32, 32, bias=False)  # single 2D param, aspect ratio 1.0
+        optimizer = build_optimizer(model, OptimizerConfig(name="muon", lr=0.01))
+        assert optimizer._adam is None
+
+        model(torch.randn(4, 32)).sum().backward()
+        assert model.weight.grad is not None
+
+        optimizer.zero_grad()
+        assert model.weight.grad is None
+
+    def test_no_delegated_params_step_and_roundtrip(self):
+        """step/state_dict/load_state_dict must tolerate _adam being None."""
+        torch.manual_seed(0)
+        model = nn.Linear(32, 32, bias=False)
+        optimizer = build_optimizer(model, OptimizerConfig(name="muon", lr=0.01))
+        assert optimizer._adam is None
+
+        optimizer.zero_grad()
+        model(torch.randn(4, 32)).sum().backward()
+        optimizer.step()
+
+        sd = optimizer.state_dict()
+        assert "_adam_state" not in sd
+
+        model2 = nn.Linear(32, 32, bias=False)
+        optimizer2 = build_optimizer(model2, OptimizerConfig(name="muon", lr=0.01))
+        optimizer2.load_state_dict(sd)
+        assert optimizer2._adam is None
+
 
 class TestAdamW:
     def test_build_adamw(self):
