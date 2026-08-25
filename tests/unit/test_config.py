@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import random
+import sys
 
 import numpy as np
 import pytest
@@ -1125,6 +1126,17 @@ class TestConfigPlugins:
         """A bare string would iterate as characters downstream."""
         with pytest.raises(ValueError, match="plugins must be a list of module paths"):
             JobConfig(plugins="my_experiment.components")
+
+    def test_plugins_resolve_from_sys_argv_when_cli_args_omitted(self, tmp_path, monkeypatch):
+        """Omitting ``cli_args`` falls back to ``sys.argv``, and that path must
+        still import plugins before the overlay."""
+        _write_plugin(tmp_path, monkeypatch, "kf_plugin_argv", "kf_plugin_ds_argv")
+        monkeypatch.setattr(sys, "argv", ["train.py", '--plugins=["kf_plugin_argv"]'])
+
+        config = load_config()
+
+        assert config.plugins == ["kf_plugin_argv"]
+        assert "kf_plugin_ds_argv" in registry.list_video_datasets()
 
 
 # ---------------------------------------------------------------------------
