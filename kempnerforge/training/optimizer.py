@@ -412,6 +412,16 @@ class Muon(torch.optim.Optimizer):
         if adam_state is not None and self._adam is not None:
             self._adam.load_state_dict(adam_state)
 
+    def zero_grad(self, set_to_none: bool = True) -> None:
+        """Zero both Muon's own parameters and the inner AdamW's.
+
+        Only the Muon half is registered with the base class, so the inherited
+        ``zero_grad`` would leave every delegated parameter accumulating.
+        """
+        super().zero_grad(set_to_none=set_to_none)
+        if self._adam is not None:
+            self._adam.zero_grad(set_to_none=set_to_none)
+
     @torch.no_grad()
     def step(self, closure=None):
         loss = None

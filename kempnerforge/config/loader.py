@@ -2,14 +2,16 @@
 
 Loading pipeline:
   1. Start with default JobConfig
-  2. Load TOML file (if provided) and overlay
-  3. Apply CLI overrides (--model.dim=512 style)
-  4. Return JobConfig instance (call .validate(world_size) at distributed setup time)
+  2. Import the modules listed in the `plugins` key (registry side effects)
+  3. Load TOML file (if provided) and overlay
+  4. Apply CLI overrides (--model.dim=512 style)
+  5. Return JobConfig instance (call .validate(world_size) at distributed setup time)
 """
 
 from __future__ import annotations
 
 import ast
+import importlib
 import sys
 import tomllib
 import types
@@ -285,6 +287,35 @@ def _parse_cli_overrides(args: list[str]) -> dict[str, Any]:
     return overrides
 
 
+def _plugin_module_names(raw: Any) -> list[str]:
+    """Normalize a raw ``plugins`` value to a list of module paths."""
+    names = [raw] if isinstance(raw, str) else raw
+    if not isinstance(names, list) or not all(isinstance(n, str) for n in names):
+        raise ValueError(
+            "Config key 'plugins' must be a list of module paths "
+            f'(e.g. plugins = ["my_experiment.components"]); got {raw!r}'
+        )
+    return names
+
+
+def _import_plugins(raw: Any) -> None:
+    """Import config-declared modules for their registry side effects.
+
+    ``import_module`` is idempotent, so repeated ``load_config`` calls in one
+    process never re-run a module body.
+    """
+    for name in _plugin_module_names(raw):
+        try:
+            importlib.import_module(name)
+        except Exception as e:
+            raise ValueError(
+                f"Failed to import plugin module {name!r} from config key 'plugins': "
+                f"{type(e).__name__}: {e}. Plugin modules must be on sys.path (the "
+                "launch directory is not) — add their directory to PYTHONPATH, or "
+                "install them."
+            ) from e
+
+
 def load_toml(path: str | Path) -> dict[str, Any]:
     """Load a TOML file and return its contents as a dict."""
     path = Path(path)
@@ -304,6 +335,9 @@ def load_config(
     Cross-config validation (e.g., parallelism vs world_size) requires calling
     config.validate(world_size=...) separately at distributed setup time.
 
+    Modules named by the top-level ``plugins`` key are imported before the
+    overlay, so components they register are visible to those validations.
+
     Args:
         config_path: Path to a TOML config file (or None for defaults).
         cli_args: CLI arguments to parse (defaults to sys.argv[1:]).
@@ -313,15 +347,25 @@ def load_config(
     """
     config = JobConfig()
 
-    # Layer 1: TOML file
-    if config_path is not None:
-        toml_data = load_toml(config_path)
-        config = _apply_dict_to_dataclass(config, toml_data)
+    toml_data: dict[str, Any] = load_toml(config_path) if config_path is not None else {}
 
-    # Layer 2: CLI overrides
     if cli_args is None:
         cli_args = sys.argv[1:]
     overrides = _parse_cli_overrides(cli_args)
+
+    # Plugins are imported before either layer is overlaid: sub-config
+    # __post_init__ validators resolve names against the registry at
+    # construction time, so a plugin's components must already be registered.
+    # A CLI list replaces the TOML one, mirroring the overlay.
+    plugins = overrides.get("plugins", toml_data.get("plugins"))
+    if plugins is not None:
+        _import_plugins(plugins)
+
+    # Layer 1: TOML file
+    if config_path is not None:
+        config = _apply_dict_to_dataclass(config, toml_data)
+
+    # Layer 2: CLI overrides
     if overrides:
         config = _apply_dict_to_dataclass(config, overrides)
 

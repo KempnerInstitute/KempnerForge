@@ -99,7 +99,55 @@ calls `registry.register`, the entry never lands. Typical approach:
   imports it so the registration runs.
 - Third-party code (not landed in `kempnerforge/`) can import its
   registration module explicitly before calling `load_config` or
-  `build_parallel_model`.
+  `build_parallel_model`, or declare it in the `plugins` config key
+  below.
+
+### The `plugins` config key
+
+`plugins` is a top-level list of module paths that `load_config` imports
+*before* the TOML is applied to the dataclasses:
+
+```toml
+plugins = ["examples.my_experiment.components"]
+
+[video]
+dataset_type = "my_corpus"   # registered by the module above
+```
+
+That ordering is the point: the `__post_init__` validators that resolve
+a name against the registry (`video.dataset_type`, `adapter.type`,
+`vision_encoder.type`, …) run during the overlay, so a later import
+would be too late. It keeps experiments standalone — an
+`examples/<name>/` run registers its own components without any core
+module importing it.
+
+Modules have to be on `sys.path`. The launch directory is *not* — a
+module that sits next to the run needs `PYTHONPATH=<its dir>`. An
+in-repo `examples/<name>/` module resolves because a `uv sync` editable
+install puts the repo root on `sys.path`; anything outside the repo must
+be installed or on `PYTHONPATH`. A missing or failing module raises a
+`ValueError` naming it, and `--plugins=["pkg.mod"]` overrides the TOML
+list like any other field.
+
+Four rules for plugin authors, all from the distributed contract:
+
+- **Register the same thing on every rank.** `load_config` runs on every
+  rank before `init_distributed`, so all ranks import the same list in
+  the same order. Never branch registration on rank, host, or cwd —
+  ranks would build different modules and the DCP load would mismatch.
+- **Do not consume global RNG at import time.** Seeding happens just
+  after the config load, so today it is harmless, but it is not a
+  guarantee to lean on.
+- **No blocking I/O or collectives at import time.** The import runs
+  before `init_distributed`, so a rank stalled reading a manifest never
+  reaches the rendezvous — the other ranks then fail there, minutes
+  later and far from the cause.
+- **Keep `plugins` in the config you resume with.** The list is not
+  recorded in the checkpoint. Resuming with a list that builds a
+  different component fails the load with `Missing key in checkpoint
+  state_dict` rather than training a mismatched model — but a component
+  whose parameters are a strict subset of the saved ones would load
+  silently.
 
 ## Adding a new category
 
