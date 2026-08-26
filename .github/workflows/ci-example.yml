@@ -3,20 +3,37 @@ name: CI (examples)
 on:
   push:
     branches: [main]
+    paths:
+      - "examples/vlm/**"
   pull_request:
     branches: [main]
-    # Scoped to `examples/` and its deps so the filter actually filters. Core is
-    # deliberately not listed: the unfiltered `push` above is what catches a core
-    # change that breaks an example tier without touching `examples/`.
     paths:
-      - "examples/**"
-      - "pyproject.toml"
-      - "uv.lock"
-      - ".github/workflows/ci-example.yml"
+      - "examples/vlm/**"
   workflow_dispatch:
 
+permissions:
+  contents: read
+  pull-requests: read
+
 jobs:
-  example-tests:
+  # Per-example gate, so touching one example does not run another's tests. Each
+  # new example adds one output + filter here and one job below.
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      vlm: ${{ steps.filter.outputs.vlm }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            vlm:
+              - "examples/vlm/**"
+
+  vlm-tests:
+    needs: changes
+    if: needs.changes.outputs.vlm == 'true' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
