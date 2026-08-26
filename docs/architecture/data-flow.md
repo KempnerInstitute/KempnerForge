@@ -2,9 +2,9 @@
 
 The path a batch of tokens takes from the dataloader to a committed
 gradient update. Follow this page with
-[`scripts/train.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/scripts/train.py)
-open in another tab — line numbers move, but the structure below maps
-one-to-one onto the training loop body.
+[`kempnerforge/training/loop.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/training/loop.py)
+open in another tab — the structure below maps one-to-one onto the
+training loop body.
 
 ## One-slide view
 
@@ -36,7 +36,7 @@ if shutdown_handler.should_shutdown(): save + break
 ## Startup, once
 
 Before the loop starts,
-[`scripts/train.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/scripts/train.py)
+[`run_training`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/training/entry.py)
 initializes the collaborators:
 
 - **`init_distributed(config.distributed, seed=...)`** from

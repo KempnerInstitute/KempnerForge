@@ -121,7 +121,7 @@ z-loss — exercises all three paths together.
 
 ## See also
 
-- [Training loop § Non-PP step](training-loop.md#non-pp-step-pp_enabled-is-false)
+- [Training loop § Non-PP step](training-loop.md#non-pp-step-text_step)
   — where `loss_fn(logits, labels)` is called.
 - [Configuration § TrainConfig](../configuration/config-sections.md) —
   `loss_fn`, `ce_chunk_size`, `z_loss_weight`.

@@ -150,8 +150,8 @@ The `action="raise"` mode raises `RuntimeError` instead of returning
 ## Limitations
 
 - **NaN action isn't in config.** Fixed at `"warn"` / `max_consecutive=10`
-  in `scripts/train.py:85`. Change the source if you need something
-  different.
+  in `run_training` (`kempnerforge/training/entry.py`). Change the source
+  if you need something different.
 - **No gradient scan in the hot path.** `check_gradients` exists but
   isn't wired in. Add it if you're hunting a specific gradient
   pathology; expect a small per-step cost (one `isfinite` + `.all()`

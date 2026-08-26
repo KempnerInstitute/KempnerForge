@@ -71,7 +71,7 @@ repeat already-seen batches.
 
 ### PP path (`pp_schedule` provided)
 
-Mirrors the [PP training step](training-loop.md#pp-step-pp_enabled-is-true):
+Mirrors the [PP training step](training-loop.md#pp-step-pipeline_step):
 collects `eval_steps` batches into full tensors, feeds through
 `pp_schedule.step(..., losses=pp_losses)`, averages the per-microbatch
 losses on the last stage, then broadcasts a single scalar across the
