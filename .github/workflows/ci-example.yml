@@ -5,11 +5,11 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+    # Scoped to `examples/` and its deps so the filter actually filters. Core is
+    # deliberately not listed: the unfiltered `push` above is what catches a core
+    # change that breaks an example tier without touching `examples/`.
     paths:
-      # `kempnerforge/**` because the examples import core, so a core-only change
-      # can break an example tier without touching anything under `examples/`.
       - "examples/**"
-      - "kempnerforge/**"
       - "pyproject.toml"
       - "uv.lock"
       - ".github/workflows/ci-example.yml"
