@@ -508,3 +508,38 @@ class TestFsdpWrapTransformerBlocksHelper:
         # Each captured object should be a TransformerBlock, not a sub-module.
         for layer in captured:
             assert isinstance(layer, TransformerBlock)
+
+    def test_pipeline_stage_module_gets_block_level_wrap(self, monkeypatch):
+        """A PipelineStageModule defines no ``cross_attention_layers``.
+
+        The helper must wrap its blocks rather than raise AttributeError, which
+        is what every ``pp > 1`` run hit before the guard was added.
+        """
+        from unittest.mock import MagicMock
+
+        import kempnerforge.distributed.parallel as parallel_mod
+        from kempnerforge.distributed.parallel import (
+            _fsdp_wrap_transformer_blocks,
+            default_mp_policy,
+        )
+        from kempnerforge.distributed.pipeline_parallel import build_stage_module
+
+        captured: list[object] = []
+
+        def fake_fully_shard(mod, **kwargs):  # noqa: ARG001
+            captured.append(mod)
+
+        monkeypatch.setattr(parallel_mod, "fully_shard", fake_fully_shard)
+
+        cfg = ModelConfig(dim=64, n_layers=4, n_heads=4, n_kv_heads=4, vocab_size=256)
+        stage = build_stage_module(cfg, pp_rank=0, pp_size=2)
+        assert not hasattr(stage, "cross_attention_layers")
+
+        ep_sub = _fsdp_wrap_transformer_blocks(
+            stage, MagicMock(), default_mp_policy(), reshard_after_forward=False
+        )
+
+        assert ep_sub == 0
+        assert len(captured) == 2  # this stage owns 2 of the 4 blocks
+        for layer in captured:
+            assert isinstance(layer, TransformerBlock)

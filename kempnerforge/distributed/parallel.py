@@ -19,6 +19,7 @@ from __future__ import annotations
 import contextlib
 import logging
 from functools import partial
+from typing import TYPE_CHECKING
 
 import torch
 from torch.distributed._composable.fsdp import MixedPrecisionPolicy, fully_shard
@@ -32,6 +33,10 @@ from torch.distributed.device_mesh import DeviceMesh
 from kempnerforge.config.registry import registry
 from kempnerforge.config.schema import ActivationCheckpointing
 from kempnerforge.model.transformer import Transformer, TransformerBlock
+
+if TYPE_CHECKING:
+    # Import-cycle-free: pipeline_parallel does not import this module.
+    from kempnerforge.distributed.pipeline_parallel import PipelineStageModule
 
 logger = logging.getLogger(__name__)
 
@@ -182,7 +187,7 @@ def _has_ep_moe(module: torch.nn.Module) -> bool:
 
 
 def _fsdp_wrap_transformer_blocks(
-    transformer: Transformer,
+    transformer: Transformer | PipelineStageModule,
     dp_mesh: DeviceMesh,
     policy: MixedPrecisionPolicy,
     reshard_after_forward: bool | int,
@@ -234,9 +239,10 @@ def _fsdp_wrap_transformer_blocks(
             reshard_after_forward=reshard_after_forward,
         )
 
-    # Cross-Attention blocks (Cross-Attention arch only). Empty dict
-    # for non-CA configs.
-    for ca_block in transformer.cross_attention_layers.values():
+    # Cross-Attention blocks (Cross-Attention arch only). Empty dict for
+    # non-CA configs, and absent entirely on a PipelineStageModule, which
+    # defines no cross_attention_layers.
+    for ca_block in getattr(transformer, "cross_attention_layers", {}).values():
         fully_shard(
             ca_block,
             mesh=dp_mesh,
@@ -248,7 +254,7 @@ def _fsdp_wrap_transformer_blocks(
 
 
 def apply_fsdp2(
-    model: Transformer,
+    model: Transformer | PipelineStageModule,
     device_mesh: DeviceMesh,
     mp_policy: MixedPrecisionPolicy | None = None,
     reshard_after_forward: bool | int = True,
