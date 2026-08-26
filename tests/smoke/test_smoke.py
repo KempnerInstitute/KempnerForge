@@ -566,7 +566,7 @@ class TestAutoResume:
     barrier timeout, RNG restoration, StatefulDataLoader replay with monotonic
     batches_yielded, train_state.pt ownership gate, and scheduler continuity.
 
-    Requires a pre-tokenized dataset (``--data-path``) because ``scripts/train.py``
+    Requires a pre-tokenized dataset (``--data-path``) because training
     falls back to synthetic ``torch.randint`` batches when no data source is
     configured, which bypasses StatefulDataLoader entirely.
     """

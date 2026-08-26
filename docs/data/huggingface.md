@@ -61,7 +61,7 @@ tokenizer_path = "meta-llama/Llama-3-8B"
 Stream mode is an `IterableDataset`:
 
 - No `__len__`, no sampler (the dataset is its own iterator).
-- `scripts/train.py` wraps it in a plain `torch.utils.data.DataLoader`,
+- `build_data_pipeline` wraps it in a plain `torch.utils.data.DataLoader`,
   not `StatefulDataLoader`.
 - Distributed sharding happens inside the iterator:
   `if doc_idx % world_size != rank: continue`. Each rank takes every

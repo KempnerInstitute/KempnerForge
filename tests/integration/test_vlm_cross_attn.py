@@ -175,7 +175,7 @@ class TestFreezeStageHook:
         """A two-stage freeze schedule flips requires_grad at the
         configured step boundaries. The transition is deterministic and
         idempotent: running effective_freeze + apply_freeze_specs at the
-        boundary matches the on-the-fly hook in scripts/train.py.
+        boundary matches the on-the-fly hook in training/loop.py.
         """
         cfg = _tiny_ca_configs(
             freeze=[
@@ -336,7 +336,7 @@ class TestFreezeStageHook:
             FreezeStage(start_step=5, specs=(FreezeSpec("adaptor", True),)),
         ]
         # The validation fires when effective_freeze is called with
-        # valid_modules=set(module_patterns.keys()), which scripts/train.py
+        # valid_modules=set(module_patterns.keys()), which freeze_meta_at_step
         # does at every save and at resume.
         valid_modules = set(cfg[3].module_patterns.keys())
         with pytest.raises(ValueError, match="adaptor"):

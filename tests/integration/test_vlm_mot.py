@@ -254,7 +254,7 @@ class TestMoTPlusMoESmoke:
 
 class TestWarmStartFromJD:
     """Step 7 hook: copy a JD checkpoint's dense block weights into every
-    per-modality copy in every MoTBlock. The hook lives in scripts/train.py
+    per-modality copy in every MoTBlock. The hook lives in restore_checkpoint
     next to ckpt_mgr.load; here we exercise it in isolation to confirm
     the helper translates correctly under the parallel-built MoT model."""
 

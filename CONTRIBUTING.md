@@ -202,6 +202,7 @@ CI runs on every push to `main` and every PR. All jobs must pass before merge.
 | `lint` | `ruff check` + `ruff format --check` + `pyright` | Every push/PR |
 | `unit-tests` | `pytest tests/unit/ -v --timeout=60` | Every push/PR |
 | `gpu-tests` | `pytest tests/integration/` | Manual dispatch |
+| `<example>-tests` | that example's hermetic test tiers, one pytest session per tier | Pushes/PRs touching `examples/<example>/` |
 
 The most common CI failure is `ruff format --check`. Run `uv run ruff format --check kempnerforge/ tests/ scripts/` locally before pushing.
 
@@ -361,7 +362,7 @@ If your feature needs a new training configuration (e.g., a new parallelism comb
 
 ### New training hook
 
-Hooks extend the training loop without modifying `scripts/train.py`:
+Hooks extend the training loop without modifying it:
 
 ```python
 from kempnerforge.training.hooks import TrainingHook, StepContext

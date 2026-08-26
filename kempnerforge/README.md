@@ -56,7 +56,7 @@ flowchart TB
     CLI[CLI overrides] --> JC
 
     %% Layer 2: training loop
-    JC --> TL[scripts/train.py<br/>training loop]
+    JC --> TL[training/loop.py<br/>training loop]
 
     %% Layer 3: subsystems (each a compact vertical stack)
     TL --> Model

@@ -46,7 +46,7 @@ and `data.hf_dataset_name` — the single-source paths are ignored.
 
 ## What happens at construction
 
-In `scripts/train.py`:
+In `training/data_pipeline.py`:
 
 1. Each `DatasetSource` builds a sub-dataset — `MemoryMappedDataset`
    or `HuggingFaceDataset` — with the global `tokenizer_path` and
@@ -147,7 +147,7 @@ single-phase list at startup. Using both `data.phases` and
 
 ## How phases execute
 
-Inside `scripts/train.py`:
+Inside `training/loop.py`:
 
 ```python
 # --- Phase activation in the training loop ---
@@ -175,7 +175,7 @@ Two effects:
 
 ### Resume into the right phase
 
-On auto-resume, `scripts/train.py` replays the phase activations
+On auto-resume, `build_phase_state` replays the phase activations
 against the current `step` so the sampler and LR scale are correct
 before the training loop starts:
 

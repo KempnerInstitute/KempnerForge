@@ -56,7 +56,7 @@ Each `[[data.datasets]]` block is a
 At least one of `path` / `hf_name` must be set per source, enforced by
 `DataConfig.__post_init__`.
 
-When any `[[data.datasets]]` is present, `scripts/train.py` builds a
+When any `[[data.datasets]]` is present, `build_data_pipeline` builds a
 [`MixtureDataset`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/data/dataset.py)
 over the sub-datasets and drives it with a
 [`MixtureSampler`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/data/sampler.py).
@@ -77,7 +77,7 @@ per-dataset metrics.
 ### Per-dataset metrics
 
 When the mixture is active and the metrics interval fires,
-`scripts/train.py` emits two series per dataset name:
+The training loop emits two series per dataset name:
 
 - `loss/{name}` — mean loss of samples from that dataset in the
   accumulation window.
@@ -138,7 +138,7 @@ Constraints (validated in `DataConfig.__post_init__`):
 
 On the first training step where `step >= phase.start_step`, the loop
 in
-[`scripts/train.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/scripts/train.py)
+[`training/data_pipeline.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/training/data_pipeline.py)
 does two things:
 
 1. Builds a new `weights` list by overriding the original declared
@@ -182,7 +182,7 @@ anneal_start_step = 40_000
 anneal_weights    = { web = 0.1, code = 0.9 }
 ```
 
-`scripts/train.py` converts this into a one-element `TrainingPhase`
+`build_phase_state` converts this into a one-element `TrainingPhase`
 list internally:
 
 ```python

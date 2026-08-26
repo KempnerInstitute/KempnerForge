@@ -202,6 +202,9 @@ uv run pytest examples/vlm/eval/tests/unit
 uv run pytest examples/vlm/eval/tests/integration
 ```
 
+CI runs the unit tier on pushes and PRs that touch `examples/vlm/`; the
+integration tier stays manual, since real lmms-eval is not installed there.
+
 Keep the two directories in separate pytest sessions: in a combined run the unit
 conftest's injected fake replaces the `adapter` module in `sys.modules` after the
 integration modules have bound the real one, so the monkeypatch-based integration

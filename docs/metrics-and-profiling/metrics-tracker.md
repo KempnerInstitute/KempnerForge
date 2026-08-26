@@ -2,14 +2,14 @@
 
 [`MetricsTracker`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/metrics/tracker.py)
 is the central per-step metric collector. One instance is created once in
-`scripts/train.py`; the training loop bookends every step with
+`training/entry.py::run_training`; the training loop bookends every step with
 `start_step()` / `end_step()` and the tracker handles timing, smoothing,
 stdout formatting, and backend dispatch.
 
 ## Wiring
 
 ```python
-# scripts/train.py
+# training/entry.py::run_training
 tracker = MetricsTracker(config, num_gpus=world_size)
 tracker.init_backends(config)     # lazy rank-0 init
 ...
@@ -157,7 +157,7 @@ training loop calls `log_eval` after `run_eval`, and separately for MoE
 and per-dataset breakdowns:
 
 ```python
-# scripts/train.py
+# training/loop.py
 tracker.log_eval(moe_metrics, step)     # moe/aux_loss, moe/expert_balance
 tracker.log_eval(ds_metrics, step)      # per-source loss
 tracker.log_eval(eval_metrics, step)    # eval loss
@@ -174,7 +174,7 @@ def close(self) -> None:
         backend.close()
 ```
 
-Called at the end of `scripts/train.py`. WandB and MLflow close the run;
+Called at the end of `run_training`. WandB and MLflow close the run;
 TensorBoard flushes the event file.
 
 ## Logger: `get_logger`, `format_metrics`

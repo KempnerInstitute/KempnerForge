@@ -52,7 +52,7 @@ and resume with `pp=2`.
 ## Application order with PP
 
 The non-PP path goes through `build_parallel_model`. PP has its own
-path in `scripts/train.py`:
+path in `training/entry.py::build_model`:
 
 ```python
 # PP + TP
@@ -123,7 +123,7 @@ phase (only warmup and drain) and the bubble overhead is maximal;
 ## Training step under PP
 
 The PP branch in
-[`scripts/train.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/scripts/train.py)
+[`training/loop.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/training/loop.py)
 looks very different from the non-PP step:
 
 ```python
@@ -160,7 +160,7 @@ That's not ideal: 1F1B sends many microbatches through each stage, and
 resharding between them triggers a fresh all-gather every
 microbatch. The docstring on `pipeline_parallel.py` recommends
 `reshard_after_forward=False` for PP to amortize the all-gather over
-`n_microbatches`, but the current `scripts/train.py` doesn't thread
+`n_microbatches`, but the current `build_model` doesn't thread
 the flag through. If you're running PP at scale and can't fit the
 extra all-gathers, pass it manually. See [FSDP2](fsdp2.md) — the
 **`reshard_after_forward`** section.

@@ -167,7 +167,7 @@ class TestForward:
         loss = cross_entropy_loss(logits, labels_out)
         assert float(loss.item()) == 0.0
         # The short-circuit returns a tensor with no graph; mirror what
-        # scripts/train.py does when nan_detector skips the step.
+        # the training loop does when nan_detector skips the step.
         optimizer.zero_grad()
 
         # Subsequent real step updates the params normally.
@@ -223,7 +223,7 @@ class TestInnerTransformer:
 
 class TestTokenAccounting:
     def test_text_token_count_excludes_pad_and_prompt(self):
-        """scripts/train.py measures 'text_tokens_trained' as
+        """The VLM step body measures 'text_tokens_trained' as
         (labels != -100).sum(). Verify the math matches what the
         train-loop VLM branch would compute."""
         cfg = _tiny_vlm_configs(num_image_tokens=8)

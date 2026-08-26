@@ -67,7 +67,7 @@ no `run_id` mints a new one; it is written back to `MetricsConfig` and the
 training loop persists it in `ckpt_extra`:
 
 ```python
-# scripts/train.py
+# training/loop.py::checkpoint_extra
 if config.metrics.mlflow_run_id:
     ckpt_extra["mlflow_run_id"] = config.metrics.mlflow_run_id
 ```

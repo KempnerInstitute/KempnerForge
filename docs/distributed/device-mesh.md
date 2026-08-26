@@ -8,7 +8,7 @@ shape and dimension order of that mesh are load-bearing.
 ## Dimension order
 
 ```python
-# scripts/train.py
+# training/runtime.py::setup_distributed
 device_mesh = init_distributed(config.distributed, seed=config.train.seed)
 ```
 
