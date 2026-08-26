@@ -43,7 +43,7 @@ Why:
 
 Not used under pipeline parallel — the PP schedule manages its own
 sync internally. See
-[Training loop § PP step](training-loop.md#pp-step-pp_enabled-is-true).
+[Training loop § PP step](training-loop.md#pp-step-pipeline_step).
 
 ## `clip_grad_norm_`
 
