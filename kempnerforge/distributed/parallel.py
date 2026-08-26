@@ -204,8 +204,10 @@ def _fsdp_wrap_transformer_blocks(
     fires after both complete.
 
     Cross-Attention blocks (when present) are wrapped once each, like
-    dense ``TransformerBlock``s. The dict is empty for non-CA configs,
-    so iteration is a no-op on the JD / text-only paths.
+    dense ``TransformerBlock``s. ``cross_attention_layers`` has three
+    states, all handled: absent, on a ``PipelineStageModule``, which
+    defines no such attribute; empty, on the JD / text-only paths; and
+    populated, on Cross-Attention configs. Only the third wraps anything.
 
     Shared by ``apply_fsdp2`` (for text Transformers) and
     ``_apply_fsdp_vlm`` (for the inner Transformer of a VLMWrapper) so
