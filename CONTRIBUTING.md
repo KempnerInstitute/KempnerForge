@@ -362,7 +362,7 @@ If your feature needs a new training configuration (e.g., a new parallelism comb
 
 ### New training hook
 
-Hooks extend the training loop without modifying `scripts/train.py`:
+Hooks extend the training loop without modifying it:
 
 ```python
 from kempnerforge.training.hooks import TrainingHook, StepContext

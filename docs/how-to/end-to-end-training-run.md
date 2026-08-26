@@ -208,4 +208,4 @@ Extensions from here:
 - [Generation](../training/generation.md) — `generate()` internals
   and KV-cache API.
 - [Training loop](../training/training-loop.md) — what
-  `scripts/train.py` actually does at each step.
+  the training loop actually does at each step.

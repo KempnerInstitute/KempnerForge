@@ -26,7 +26,7 @@ Debug config: configs/train/debug.toml (4-layer, 256-dim, no dataset_path)
 HF streaming demo: configs/train/hf_wikitext.toml (works out of the box with gpt2 tokenizer)
 Train entry point: scripts/train.py
 Default duration: debug.toml max_steps=100, batch_size=4, seq_len=512
-Dataset options (scripts/train.py): config.data.datasets (mixture), config.data.dataset_path (pre-tokenized .npy), config.data.hf_dataset_name (HuggingFace)
+Dataset options (training/data_pipeline.py): config.data.datasets (mixture), config.data.dataset_path (pre-tokenized .npy), config.data.hf_dataset_name (HuggingFace)
 Smoke-test artifact: checkpoints/debug/ (from debug.toml)
 <!-- context-end -->
 
@@ -34,7 +34,7 @@ Smoke-test artifact: checkpoints/debug/ (from debug.toml)
 Assume preflight has passed.
 
 1. Pick a config:
-    - **No local data, no internet**: use `configs/train/debug.toml`. `scripts/train.py` falls back to random-token batches when no dataset is configured, which is enough to exercise the training loop end-to-end.
+    - **No local data, no internet**: use `configs/train/debug.toml`. training falls back to random-token batches when no dataset is configured, which is enough to exercise the training loop end-to-end.
     - **Fast iteration with HF streaming (recommended when internet is available)**: use `configs/train/hf_wikitext.toml`. Tokenizer is `gpt2` (small, cached on first use). Streams wikitext-103. Real data means the loss curve is interpretable.
     - **User has pre-tokenized data**: use `configs/train/debug.toml` with `--data.dataset_path=<path>`.
 
@@ -72,7 +72,7 @@ Assume preflight has passed.
 - `nvidia-smi` returns to idle after the process exits (no zombie CUDA contexts).
 
 ## Gotchas
-- `debug.toml` has no dataset configured by default. `scripts/train.py` detects this and feeds random-token batches (see the `dataloader is None` branch around line 508); the smoke test still exercises forward/backward/optimizer. Loss will not be meaningful, so for a true "is this converging" signal use `hf_wikitext.toml` or supply `--data.dataset_path`.
+- `debug.toml` has no dataset configured by default. Training detects this and feeds random-token batches (see the `batches.has_data` fallback in `training/loop.py::text_step`); the smoke test still exercises forward/backward/optimizer. Loss will not be meaningful, so for a true "is this converging" signal use `hf_wikitext.toml` or supply `--data.dataset_path`.
 - HF streaming writes to `~/.cache/huggingface/` on first use. On read-only home directories, set `HF_HOME=/tmp/hf_cache` before the run.
 - Do not use `torchrun` for a one-GPU smoke test. `python scripts/train.py ...` is correct because FSDP2 with world_size=1 initializes a single-rank process group internally.
 - If the user is on an A100, `compile_model=true` may add 2 to 3 minutes to the first step. Pass `--train.compile_model=false` for a faster first iteration during smoke testing.

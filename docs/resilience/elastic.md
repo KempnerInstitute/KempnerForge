@@ -69,7 +69,7 @@ var directly, so they're cheap to call frequently.
 Called once during training startup:
 
 ```python
-# scripts/train.py
+# training/runtime.py::setup_distributed
 log_job_info()
 ```
 
@@ -106,7 +106,7 @@ else:
     scheduler_state = "fresh"
 ```
 
-In practice you don't need this — `scripts/train.py` handles warmup
+In practice you don't need this — `setup_distributed` handles warmup
 restoration via the scheduler's own `state_dict`. The branch is useful
 for one-off behaviors (e.g. "only print config diff on first run").
 
@@ -119,7 +119,7 @@ if info and info.array_task_id is not None:
     # Use shard to pick a config variant, data shard, etc.
 ```
 
-`scripts/train.py` doesn't read `array_task_id` — wire it through CLI
+The training entry point doesn't read `array_task_id` — wire it through CLI
 overrides if you want per-array-task config variants.
 
 ## See also

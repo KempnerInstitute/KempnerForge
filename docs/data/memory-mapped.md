@@ -52,7 +52,7 @@ At training time, `__getitem__(idx)`:
 2. Slices `seq_len` tokens starting at `local_idx * seq_len`.
 3. Returns `{"input_ids": tokens[:-1], "labels": tokens[1:]}`.
 
-Note: `scripts/train.py` passes `seq_len + 1` to the constructor so
+Note: the data pipeline passes `seq_len + 1` to the constructor so
 the sliced window contains one extra token, and the `[:-1]` / `[1:]`
 split produces inputs and next-token labels of length `seq_len` each.
 
@@ -69,7 +69,7 @@ pack_sequences = false            # see below
 tokenizer_path = ""               # only required when pack_sequences=true
 ```
 
-`scripts/train.py` picks this path when `data.dataset_path` is set
+`build_data_pipeline` picks this path when `data.dataset_path` is set
 and `data.datasets` is empty.
 
 ## Sequence packing

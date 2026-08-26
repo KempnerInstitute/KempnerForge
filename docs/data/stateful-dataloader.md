@@ -12,7 +12,7 @@ wraps `torch.utils.data.DataLoader` with three additions:
 ## Construction
 
 ```python
-# scripts/train.py
+# training/data_pipeline.py
 dataloader = StatefulDataLoader(
     dataset,
     batch_size=tc.batch_size,
@@ -90,30 +90,26 @@ Effect: on the next `__iter__()`, the sampler yields its index list
 minus the first `batches_yielded * batch_size` elements. Training
 picks up at the exact same sample boundary.
 
-## The wiring gap
+## Save and restore
 
-The infrastructure works, but `scripts/train.py` **does not currently
-pass the dataloader to `ckpt_mgr.save()`**:
+The training loop passes `dataloader=` at every save site, so the loader
+position travels with the checkpoint:
 
 ```python
-# scripts/train.py
+# training/loop.py::run_training_loop
 ckpt_mgr.save(
     step=step,
     tokens_seen=tokens_seen,
     scheduler=scheduler,
+    dataloader=data.dataloader,
     extra=ckpt_extra,
-    # no dataloader=...
 )
 ```
 
-Consequence: on resume, the dataloader restarts from batch 0 of the
-current epoch. With deterministic seeding and a shuffled sampler, this
-means a few batches get replayed but the loss trajectory is otherwise
-indistinguishable from an uninterrupted run.
-
-For exact-batch-level reproducibility, pass `dataloader=dataloader`
-into `ckpt_mgr.save` yourself — `build_train_state` picks it up
-automatically. See
+An emergency checkpoint taken mid-epoch records e.g.
+`{'epoch': 7, 'batches_yielded': 14, 'sampler': {...}}`, and `__iter__`
+re-applies the skip on resume, so training picks up at the same sample
+boundary rather than at batch 0. See
 [Checkpointing § Train state](../checkpointing/train-state.md#dataloader-state).
 
 ## Worker RNG

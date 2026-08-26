@@ -75,7 +75,7 @@ profile(
 ## Loop integration
 
 ```python
-# scripts/train.py
+# training/entry.py::run_training
 prof = build_profiler(config.profiling, rank=rank)
 ...
 if prof is not None:

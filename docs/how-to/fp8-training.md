@@ -34,7 +34,7 @@ One field in `[train]`:
 mixed_precision = "fp8"
 ```
 
-That's the whole surface. `scripts/train.py` picks it up via
+That's the whole surface. `build_model` picks it up via
 [`TrainConfig.is_fp8`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/config/training.py),
 `build_parallel_model` calls `apply_float8(model)` after TP/EP and
 before AC/FSDP2, and FSDP2 picks bf16 master weights (FP8 is a

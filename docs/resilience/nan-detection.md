@@ -9,7 +9,7 @@ loop stops so a human can roll back to an earlier checkpoint.
 ## Wiring
 
 ```python
-# scripts/train.py
+# training/entry.py::run_training
 nan_detector = NaNDetector(action="warn", max_consecutive=10)
 ...
 # Inside the training loop, after backward:
@@ -25,7 +25,7 @@ if not nan_detector.check_loss(avg_loss, step):
 Two things to note:
 
 - **`action="warn"` and `max_consecutive=10` are hardcoded in
-  `scripts/train.py`** — not exposed as TOML config. If you want
+  `training/entry.py`** — not exposed as TOML config. If you want
   `"skip"` or `"raise"` behavior, edit the script or construct the
   detector yourself.
 - **`check_gradients` is *not* called by the training loop.** Gradient
@@ -108,7 +108,7 @@ When this trips, the training loop *stops* — it doesn't roll back
 automatically:
 
 ```python
-# scripts/train.py
+# training/loop.py::run_training_loop
 if nan_detector.should_rollback:
     logger.error("Too many consecutive NaNs — stopping")
     break

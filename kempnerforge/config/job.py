@@ -237,7 +237,7 @@ class JobConfig:
                     "The vlm-cross-attention branch will address PP integration."
                 )
             # VLM + MoE is supported. The FSDP2 wrap helper is EP-MoE aware
-            # for both paths (Fix 5), and scripts/train.py routes set_moe_step
+            # for both paths (Fix 5), and the step body routes set_moe_step
             # / get_moe_aux_loss through inner_transformer(model) so the VLM
             # wrapper does not hide the MoE methods. Live-tested on a tiny
             # CA + MoE config: CE 10.4 -> 4.5 over 8 steps under 2-GPU FSDP2;

@@ -168,7 +168,7 @@ class TestInnerTransformerUnderCompileAndFsdp:
     def test_inner_transformer_under_compile_and_fsdp(self, distributed_env):
         """torch.compile(wrapper) + real fully_shard does not break the
         inner_transformer unwrap helper used by MoE call sites in
-        scripts/train.py."""
+        training/entry.py::build_model."""
         mesh = distributed_env
         compiled = _build(_tiny_cfg(), mesh, compile_model=True)
         inner = inner_transformer(compiled)

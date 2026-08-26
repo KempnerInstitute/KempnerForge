@@ -225,7 +225,7 @@ build_parallel_model(model_config, device, mesh, ...)
 
 Every box that isn't "hardcoded class" goes through a registry lookup.
 Pipeline parallelism (not shown) is applied outside this flow — it
-splits the model into stages in `scripts/train.py` *before*
+splits the model into stages in `training/entry.py::build_model` *before*
 `build_parallel_model` runs on each stage.
 
 ## See also

@@ -146,7 +146,7 @@ size, not transplanted from the save. `seed` is already in
 Evaluation uses `DistributedSampler(eval_dataset, shuffle=False)`:
 
 ```python
-# scripts/train.py
+# training/data_pipeline.py::build_eval_dataloader
 eval_sampler = DistributedSampler(
     eval_dataset, num_replicas=dp_size, rank=dp_rank,
     shuffle=False, seed=tc.seed,

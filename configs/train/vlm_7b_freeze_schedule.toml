@@ -6,13 +6,13 @@
 # max_seq_len allocation (CA): max_text_len only. The residual stream is
 # text-only; image features flow as K/V into separate CrossAttentionBlocks.
 #
-# Exercises the FreezeStage hook in scripts/train.py:
+# Exercises the FreezeStage hook in training/loop.py:
 #   - step 0..9: vision encoder frozen, everything else trainable.
 #   - step 10: freeze adapter (typical "pretrain CA blocks first" recipe).
 #   - step 20: unfreeze adapter (typical "now align embeddings" recipe).
 #
 # checkpoint.interval matches one transition step (10) to exercise
-# the async-save fence: the FreezeStage hook in scripts/train.py
+# the async-save fence: the FreezeStage hook in training/loop.py
 # calls flush_pending_save() before applying the transition, so the
 # in-flight save's metadata.json lands with the pre-transition spec
 # (adapter trainable) and only the next save records the post-
