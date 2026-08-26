@@ -89,7 +89,7 @@ then `on_checkpoint_save`.
 Hooks are created in-process, not from TOML:
 
 ```python
-from kempnerforge.training.entry import run_training
+from kempnerforge.training import run_training
 from kempnerforge.training.hooks import HookRunner
 
 run_training(config, hooks=HookRunner([MyHook1(), MyHook2()]))

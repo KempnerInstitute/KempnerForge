@@ -1,22 +1,37 @@
-# Run VLM evaluation
+# VLM evaluation via lmms-eval
 
-Evaluate a vision-language model (VLM) checkpoint on any standard multimodal
-benchmark (MMMU, MMBench, ScienceQA, SEED, AI2D, …) by integrating the
+Evaluate a KempnerForge vision-language model (VLM) checkpoint on any standard
+multimodal benchmark (MMMU, MMBench, ScienceQA, SEED, AI2D, …) by integrating the
 [lmms-eval](https://github.com/EvolvingLMMs-Lab/lmms-eval) harness.
 
-[Run evaluation](run-evaluation.md).
+A custom lmms-eval *chat model* loads `VLMWrapper` directly from the DCP
+checkpoint. The pieces are [`adapter.py`](adapter.py) (the `KempnerForgeVLM`
+adapter) and [`vlm_eval_harness.py`](vlm_eval_harness.py) (the CLI). The harness
+constructs `KempnerForgeVLM` itself and passes the instance to
+`simple_evaluate(model=...)` — there is no lmms-eval entry-point registration,
+and the core `kempnerforge` package carries no lmms-eval-facing code. For
+text-model evaluation (loss/perplexity and the `lm-eval` harness this example
+parallels), see [Run evaluation](../../../docs/how-to/run-evaluation.md).
 
-| Entry point | When to use |
-|-------------|-------------|
-| `scripts/vlm_eval_harness.py` | Downstream VLM benchmarks via lmms-eval, on any DCP checkpoint |
+## Contents
 
-A custom lmms-eval *chat model* loads `VLMWrapper` directly from the DCP checkpoint. The pieces are:
-[`kempnerforge/eval/vlm/adapter.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/eval/vlm/adapter.py)
-(the `KempnerForgeVLM` adapter),
-[`kempnerforge/eval/vlm/manifest.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/eval/vlm/manifest.py)
-(the lmms-eval registration manifest), and
-[`scripts/vlm_eval_harness.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/scripts/vlm_eval_harness.py)
-(the CLI).
+```
+examples/vlm/eval/
+├── README.md
+├── adapter.py              # KempnerForgeVLM: lmms-eval chat model over a DCP checkpoint
+├── vlm_eval_harness.py     # CLI: constructs the adapter, runs simple_evaluate
+└── tests/
+    ├── conftest.py         # path bootstrap + tiny VLM fixtures
+    ├── integration/        # real-lmms-eval tests (skip when it is absent)
+    │   ├── test_vlm_eval.py             # DCP-roundtrip generate_until (image + video)
+    │   └── test_lmms_eval_contract.py   # pins the real API the unit fake imitates
+    └── unit/
+        ├── __init__.py     # load-bearing package marker (see its docstring)
+        ├── conftest.py     # injects the hermetic fake lmms_eval
+        ├── _fake_lmms_eval.py
+        ├── test_adapter.py           # CPU unit tests for the adapter (fake lmms_eval)
+        └── test_import_isolation.py  # `import kempnerforge` must not need lmms-eval
+```
 
 ## What's on this page
 
@@ -26,20 +41,20 @@ A custom lmms-eval *chat model* loads `VLMWrapper` directly from the DCP checkpo
 - [Video evaluation](#video-evaluation) — evaluating a video checkpoint
 - [Limitations](#limitations) — single-GPU, MoMa, multi-turn/few-shot/multi-image, flattening, no KV cache
 - [Cluster environment notes](#cluster-environment-notes) — torchvision / libstdc++ gotchas
+- [Run the tests](#run-the-tests) — two separate pytest sessions
 
 ## Install lmms-eval
 
 `lmms-eval` is an **optional dependency** and is intentionally NOT declared in
-`pyproject.toml`. Install
-it into your environment before running:
+`pyproject.toml`. Install it into your environment before running:
 
 ```bash
 uv pip install lmms-eval
 ```
 
-The `lmms_eval.models` entry point that exposes the `kempnerforge_vlm` model is
-declared in `pyproject.toml` as metadata only — it does not pull lmms-eval in as
-a dependency, and `import kempnerforge` works without lmms-eval installed.
+lmms-eval stays out of the core package entirely: the adapter lives here in the
+example and is imported only by the harness (or these tests), so
+`import kempnerforge` works without lmms-eval installed.
 
 **Video evaluation** additionally needs the `av` (PyAV) video-decoding
 dependency, which ships in the optional `video` group:
@@ -55,14 +70,14 @@ required. (Image-only evaluation does not need this group.)
 
 ```bash
 # One task, write results JSON
-uv run python scripts/vlm_eval_harness.py \
+uv run python examples/vlm/eval/vlm_eval_harness.py \
     --config     configs/train/vlm_jd.toml \
     --checkpoint checkpoints/vlm/step_10000 \
     --tasks      mmmu_val \
     --output     results/vlm_step_10000.json
 
 # Several tasks, quick partial run (4 examples per task)
-uv run python scripts/vlm_eval_harness.py \
+uv run python examples/vlm/eval/vlm_eval_harness.py \
     --config     configs/train/vlm_jd.toml \
     --checkpoint checkpoints/vlm/step_10000 \
     --tasks      mmmu_val,mmbench_en_dev,scienceqa_img \
@@ -99,7 +114,7 @@ is decoded into frames and fed to the model as a single clip. This needs the `av
 video group (see [Install lmms-eval](#install-lmms-eval)).
 
 ```bash
-uv run python scripts/vlm_eval_harness.py \
+uv run python examples/vlm/eval/vlm_eval_harness.py \
     --config     configs/train/vlm_video_webvid.toml \
     --checkpoint checkpoints/vlm_video/step_10000 \
     --tasks      <a video generate_until task> \
@@ -170,15 +185,41 @@ PyTorch. Two gotchas seen on the Kempner cluster:
 - **`GLIBCXX_… not found` when importing the evaluator.** lmms-eval's
   `simple_evaluate` pulls in a library that needs a newer `libstdc++` than the
   system one. Put a newer `libstdc++` first on the library path, e.g.
-  `LD_LIBRARY_PATH=<conda-env>/lib uv run python scripts/vlm_eval_harness.py …`.
+  `LD_LIBRARY_PATH=<conda-env>/lib uv run python examples/vlm/eval/vlm_eval_harness.py …`.
+  The integration tests import the evaluator too and need the same workaround.
+
+## Run the tests
+
+These tests are standalone — they live outside the repo's `tests/` tree (the
+main suite's `testpaths`), so run them explicitly, as **two separate
+invocations**:
+
+```bash
+# Hermetic unit tests — always run (a fake lmms_eval is injected; no GPU/network)
+uv run pytest examples/vlm/eval/tests/unit
+
+# Integration tests — need real lmms-eval installed; skip otherwise
+uv run pytest examples/vlm/eval/tests/integration
+```
+
+Keep the two directories in separate pytest sessions: in a combined run the unit
+conftest's injected fake replaces the `adapter` module in `sys.modules` after the
+integration modules have bound the real one, so the monkeypatch-based integration
+tests patch the wrong module object and fail.
+
+The opt-in end-to-end test runs a small slice of a real task against a real
+checkpoint (GPU node):
+
+```bash
+KF_VLM_EVAL_CONFIG=/path/to/train_config.toml \
+KF_VLM_EVAL_CHECKPOINT=/path/to/checkpoints/step_N \
+KF_VLM_EVAL_TASK=mmmu_val \
+uv run pytest examples/vlm/eval/tests/integration/test_vlm_eval.py -k real_task
+```
 
 ## See also
 
-- [Run evaluation](run-evaluation.md) — text-model loss/perplexity and the
-  `lm-eval` harness this page parallels.
-- [End-to-end training run](end-to-end-training-run.md) — produces the
-  checkpoints this harness consumes.
-- [`kempnerforge/eval/vlm/adapter.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/eval/vlm/adapter.py)
-  and
-  [`scripts/vlm_eval_harness.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/scripts/vlm_eval_harness.py)
-  — the adapter and CLI this page documents.
+- [Run evaluation](../../../docs/how-to/run-evaluation.md) — text-model
+  loss/perplexity and the `lm-eval` harness this example parallels.
+- [End-to-end training run](../../../docs/how-to/end-to-end-training-run.md) —
+  produces the checkpoints this harness consumes.

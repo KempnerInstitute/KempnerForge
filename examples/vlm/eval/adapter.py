@@ -12,7 +12,7 @@ This module implements ``KempnerForgeVLM``, an lmms-eval ``chat`` model
 standard multimodal benchmarks lmms-eval implements as ``generate_until`` tasks
 (MMMU, MMBench, ScienceQA, SEED, AI2D, ...). It is loaded directly from a DCP checkpoint,
 and is arch-agnostic across the generative VLM arches.
-v1 scope and deliberate choices (see docs/how-to/run-vlm-evaluation.md):
+v1 scope and deliberate choices (see this example's README.md):
 
 - **Generation: no transformer KV cache, single-GPU, batched.** The decode loop
   re-runs the transformer (including the vision encoder + adapter) over the
@@ -513,8 +513,7 @@ def _generate_batch(
 class KempnerForgeVLM(lmms):
     """lmms-eval chat model over a KempnerForge ``VLMWrapper`` (see module docstring).
 
-    Model args (parsed by the base ``create_from_arg_string`` from a
-    ``key=value,...`` string):
+    Constructor args (the harness passes these straight from its CLI flags):
 
     - ``config`` (required): path to the KempnerForge TOML the checkpoint was
       trained with.

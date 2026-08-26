@@ -2,7 +2,7 @@
 """KempnerForge training entry point.
 
 A thin CLI wrapper: parse argv, load the config, and hand off to
-``kempnerforge.training.entry.run_training``.
+``kempnerforge.training.run_training``.
 
 Usage:
     # Single GPU
@@ -26,7 +26,7 @@ from __future__ import annotations
 import sys
 
 from kempnerforge.config.loader import load_config
-from kempnerforge.training.entry import run_training
+from kempnerforge.training import run_training
 
 
 def main() -> None:

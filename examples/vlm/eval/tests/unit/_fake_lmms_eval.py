@@ -1,11 +1,11 @@
 """Dependency-free fakes for the ``lmms_eval`` API surface the VLM adapter uses.
 
-``lmms-eval`` is an optional, *undeclared* dependency, so
-``kempnerforge.eval.vlm.adapter`` / ``manifest`` import it at module top and cannot be
-imported without it. ``conftest.py`` injects these fakes into ``sys.modules`` so the unit
-tests run (and contribute coverage) in CI, where ``lmms-eval`` is absent. The fakes
-reproduce ONLY the behavior the adapter relies on; their fidelity to the real package is
-pinned by the gated contract test in ``tests/integration/`` (``test_lmms_eval_contract``).
+``lmms-eval`` is an optional, *undeclared* dependency, so ``adapter.py`` imports it at
+module top and cannot be imported without it. ``conftest.py`` injects these fakes into
+``sys.modules`` so the unit tests always run, with or without real lmms-eval installed.
+The fakes reproduce ONLY the behavior the adapter relies on; their fidelity to the real
+package is pinned by the gated contract test in
+``../integration/test_lmms_eval_contract.py``.
 
 Verified against the installed ``lmms_eval`` source:
 
@@ -15,7 +15,6 @@ Verified against the installed ``lmms_eval`` source:
 - ``utils.Collator``: groups by ``group_fn(item)`` (a dict; key built from sorted items
   with list values tupled), sorts each group by ``sort_fn(item)``, ``get_batched(n)``
   yields lists of ``<= n`` while recording reorder indices, ``get_original`` inverts them.
-- ``models.registry_v2.ModelManifest``: frozen dataclass requiring >= 1 class path.
 - ``api.model.lmms``: base sets ``_rank=0/_world_size=1/cache_hook/task_dict`` and exposes
   ``rank``/``world_size`` properties.
 - ``api.instance.Instance``: dataclass exposing ``.args`` (the arguments tuple).
@@ -121,23 +120,6 @@ class Collator:
 
 
 # --------------------------------------------------------------------------- #
-# lmms_eval.models.registry_v2.ModelManifest
-# --------------------------------------------------------------------------- #
-
-
-@dataclasses.dataclass(frozen=True)
-class ModelManifest:
-    model_id: str
-    simple_class_path: str | None = None
-    chat_class_path: str | None = None
-    aliases: tuple = ()
-
-    def __post_init__(self) -> None:
-        if self.simple_class_path is None and self.chat_class_path is None:
-            raise ValueError(f"ModelManifest('{self.model_id}') requires at least one class path")
-
-
-# --------------------------------------------------------------------------- #
 # lmms_eval.api.model.lmms
 # --------------------------------------------------------------------------- #
 
@@ -214,16 +196,12 @@ def build_modules() -> dict[str, types.ModuleType]:
     api_instance = _mod("lmms_eval.api.instance", Instance=Instance)
     protocol = _mod("lmms_eval.protocol", ChatMessages=ChatMessages)
     utils = _mod("lmms_eval.utils", Collator=Collator)
-    models = _mod("lmms_eval.models")
-    registry_v2 = _mod("lmms_eval.models.registry_v2", ModelManifest=ModelManifest)
 
     root.api = api
     root.protocol = protocol
     root.utils = utils
-    root.models = models
     api.model = api_model
     api.instance = api_instance
-    models.registry_v2 = registry_v2
 
     return {
         "lmms_eval": root,
@@ -232,6 +210,4 @@ def build_modules() -> dict[str, types.ModuleType]:
         "lmms_eval.api.instance": api_instance,
         "lmms_eval.protocol": protocol,
         "lmms_eval.utils": utils,
-        "lmms_eval.models": models,
-        "lmms_eval.models.registry_v2": registry_v2,
     }
