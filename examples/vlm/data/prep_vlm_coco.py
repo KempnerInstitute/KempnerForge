@@ -22,8 +22,8 @@ Output columns:
 
 Modes:
 - Default — single split. Reads one JSON (``--caption-json``) and writes
-  a bare ``Dataset``. ``--num-samples`` defaults to ``500`` so a no-flag
-  invocation is a small, fast smoke prep.
+  a bare ``Dataset``. ``--num-samples`` defaults to ``500``, so leaving it
+  alone keeps the prep a small, fast smoke run.
 - ``--all-splits`` — also reads the sibling ``coco_karpathy_val.json``
   and ``coco_karpathy_test.json`` next to ``--caption-json`` and writes a
   ``DatasetDict`` keyed by ``train`` / ``val`` / ``test``.
@@ -34,19 +34,20 @@ image as Arrow shards are written. Decoded pixels are never held in a
 Python list — peak RAM stays flat regardless of dataset size.
 
 Examples:
-    # 1. Smoke-test prep (small slice, single split — default flags):
-    uv run python scripts/prep_vlm_coco.py \\
+    # 1. Smoke-test prep (small slice, single split):
+    uv run python examples/vlm/data/prep_vlm_coco.py \\
+        --caption-json /path/to/coco-captions/coco_karpathy_train.json \\
+        --image-root /path/to/coco/images \\
         --out /tmp/vlm_coco_smoke \\
         --num-samples 500
 
     # 2. Full dataset, all 3 splits, ready for training + eval:
-    uv run python scripts/prep_vlm_coco.py \\
+    uv run python examples/vlm/data/prep_vlm_coco.py \\
+        --caption-json /path/to/coco-captions/coco_karpathy_train.json \\
+        --image-root /path/to/coco/images \\
         --out /path/to/datasets/coco-karpathy \\
         --num-samples 0 \\
         --all-splits
-
-Defaults point at the Kempner shared testbed COCO paths; override with
-``--caption-json`` / ``--image-root`` for other dataset layouts.
 """
 
 from __future__ import annotations
@@ -55,12 +56,6 @@ import argparse
 import json
 import os
 from pathlib import Path
-
-_DEFAULT_CAPTION_JSON = (
-    "/n/holylfs06/LABS/kempner_shared/Everyone/testbed/annotations/"
-    "coco-captions/raw/coco_karpathy_train.json"
-)
-_DEFAULT_IMAGE_ROOT = "/n/holylfs06/LABS/kempner_shared/Everyone/testbed/vision/coco/raw"
 
 
 def _build_split(caption_json: str, image_root: str, num_samples: int, split_label: str):
@@ -130,10 +125,15 @@ def main() -> None:
         epilog=(
             "Examples:\n"
             "  # Smoke prep (default 500 samples, single split):\n"
-            "  uv run python scripts/prep_vlm_coco.py --out /tmp/vlm_coco_smoke\n"
+            "  uv run python examples/vlm/data/prep_vlm_coco.py \\\n"
+            "      --caption-json /path/to/coco-captions/coco_karpathy_train.json \\\n"
+            "      --image-root /path/to/coco/images \\\n"
+            "      --out /tmp/vlm_coco_smoke\n"
             "\n"
             "  # Full dataset, all 3 splits, for training + eval:\n"
-            "  uv run python scripts/prep_vlm_coco.py \\\n"
+            "  uv run python examples/vlm/data/prep_vlm_coco.py \\\n"
+            "      --caption-json /path/to/coco-captions/coco_karpathy_train.json \\\n"
+            "      --image-root /path/to/coco/images \\\n"
             "      --out /path/to/datasets/coco-karpathy \\\n"
             "      --num-samples 0 --all-splits"
         ),
@@ -149,16 +149,16 @@ def main() -> None:
     )
     ap.add_argument(
         "--caption-json",
-        default=_DEFAULT_CAPTION_JSON,
+        required=True,
         help=(
             "Karpathy-split COCO caption JSON to read. With --all-splits this "
             "selects the directory; sibling val/test JSONs are picked up "
-            "automatically. Default: shared testbed train split."
+            "automatically."
         ),
     )
     ap.add_argument(
         "--image-root",
-        default=_DEFAULT_IMAGE_ROOT,
+        required=True,
         help="Root directory the JSON's relative image paths resolve against.",
     )
     ap.add_argument(
@@ -166,8 +166,8 @@ def main() -> None:
         type=int,
         default=500,
         help=(
-            "Per-split sample cap (0 = all rows). Default 500 keeps the "
-            "no-flag invocation a fast smoke prep; pass 0 for a real run."
+            "Per-split sample cap (0 = all rows). Default 500 keeps a "
+            "smoke prep fast; pass 0 for a real run."
         ),
     )
     ap.add_argument(
