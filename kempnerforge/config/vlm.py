@@ -161,7 +161,7 @@ class VLMConfig:
         """Whether this arch can autoregressively generate token-by-token.
 
         Generation-only consumers (e.g. the lmms-eval chat adapter in
-        ``kempnerforge/eval/vlm``) query this to fail fast on arches that
+        ``examples/vlm/eval``) query this to fail fast on arches that
         cannot decode autoregressively. Defaults to ``True`` (the common
         case); a non-causal arch overrides it to ``False`` (see
         ``MoMaConfig``).
