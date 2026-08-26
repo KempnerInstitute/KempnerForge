@@ -161,12 +161,12 @@ class TrainingSession:
 # ---------------------------------------------------------------------------
 
 
-def _clip_grads(model: torch.nn.Module, max_norm: float) -> float:
+def clip_grads(model: torch.nn.Module, max_norm: float) -> float:
     grad_norm = clip_grad_norm_(model, max_norm)
     return grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
 
 
-def _add_moe_losses(loss: torch.Tensor, model: torch.nn.Module, mc: Any) -> torch.Tensor:
+def add_moe_losses(loss: torch.Tensor, model: torch.nn.Module, mc: Any) -> torch.Tensor:
     """MoE auxiliary + router z-loss terms (only called when ``mc.is_moe``)."""
     aux_loss = inner_transformer(model).get_moe_aux_loss()  # type: ignore[attr-defined]
     loss = loss + mc.moe_aux_loss_weight * aux_loss
@@ -231,7 +231,7 @@ def pipeline_step(session: TrainingSession, step: int) -> StepResult:
     else:
         avg_loss = 0.0
 
-    grad_norm_val = _clip_grads(model, tc.grad_clip_norm)
+    grad_norm_val = clip_grads(model, tc.grad_clip_norm)
 
     # Broadcast loss and grad_norm from last PP stage to all PP stages
     loss_tensor = torch.tensor([avg_loss, grad_norm_val], device=device)
@@ -272,7 +272,7 @@ def vlm_step(session: TrainingSession, step: int) -> StepResult:
             total_text_tokens += int((labels_out != -100).sum().item())
 
             if mc.is_moe:
-                loss = _add_moe_losses(loss, model, mc)
+                loss = add_moe_losses(loss, model, mc)
 
             scaled_loss = loss / tc.grad_accum_steps
             scaled_loss.backward()
@@ -280,7 +280,7 @@ def vlm_step(session: TrainingSession, step: int) -> StepResult:
 
     return StepResult(
         loss=total_loss / tc.grad_accum_steps,
-        grad_norm=_clip_grads(model, tc.grad_clip_norm),
+        grad_norm=clip_grads(model, tc.grad_clip_norm),
         text_tokens=total_text_tokens,
     )
 
@@ -337,7 +337,7 @@ def text_step(session: TrainingSession, step: int) -> StepResult:
                             ds_loss_counts[name] = ds_loss_counts.get(name, 0) + 1
 
             if mc.is_moe:
-                loss = _add_moe_losses(loss, model, mc)
+                loss = add_moe_losses(loss, model, mc)
 
             scaled_loss = loss / tc.grad_accum_steps
             scaled_loss.backward()
@@ -345,7 +345,7 @@ def text_step(session: TrainingSession, step: int) -> StepResult:
 
     return StepResult(
         loss=total_loss / tc.grad_accum_steps,
-        grad_norm=_clip_grads(model, tc.grad_clip_norm),
+        grad_norm=clip_grads(model, tc.grad_clip_norm),
         dataset_token_counts=ds_token_counts,
         dataset_loss_sums=ds_loss_sums,
         dataset_loss_counts=ds_loss_counts,
