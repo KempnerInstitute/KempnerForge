@@ -26,6 +26,11 @@ jobs:
       - uses: astral-sh/setup-uv@v6
       - run: uv sync --group video
       - run: uv run pytest tests/unit/ -v --timeout=60 --cov --cov-branch --cov-report=xml
+      # Example tests are outside the root `testpaths`, so each tier is named here
+      # explicitly. Each needs its own pytest session: the VLM-eval unit conftest
+      # injects a fake `lmms_eval` that would leak into a tier sharing the session.
+      # The matching integration tier needs the real, undeclared lmms-eval; manual only.
+      - run: uv run pytest examples/vlm/eval/tests/unit -v --timeout=60
       - name: Upload coverage reports to Codecov
         uses: codecov/codecov-action@v5
         with:
