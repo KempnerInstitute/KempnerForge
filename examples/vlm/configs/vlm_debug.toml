@@ -1,17 +1,18 @@
-# VLM smoke config — Mixture-of-Transformers (MoT) arch, tiny LLM + random vision encoder.
+# VLM smoke config — tiny LLM + random vision encoder.
 #
 # Mode: smoke.
 #
 # Runs end-to-end in <1 minute on 1 GPU. Uses RandomVisionEncoder so no
-# HF download is needed. Per-modality Q/K/V/O + per-modality FFN at every
-# layer, single global self-attention (Liang et al. 2024 Algorithm 1).
+# HF download is needed; pair with any HF image-text dataset (the default
+# below is a placeholder). For a real vision encoder, see
+# examples/vlm/configs/vlm_7b_siglip2.toml.
 #
 # max_seq_len allocation (JD/MoT): residual_image_tokens + max_text_len.
 # Image tokens prepend the text sequence in the residual stream, so the
 # budget must cover both modalities.
 #
 # Usage:
-#   uv run python scripts/train.py configs/train/vlm_debug_mot.toml \
+#   uv run python examples/vlm/train.py examples/vlm/configs/vlm_debug.toml \
 #       --data.hf_dataset_name=... --data.tokenizer_path=gpt2
 
 [model]
@@ -30,7 +31,7 @@ feature_dim = 384
 num_tokens = 64
 
 [vlm]
-arch = "mot"
+arch = "joint_decoder"
 
 [train]
 batch_size = 2
@@ -70,7 +71,7 @@ pin_memory = true
 dp_shard = -1
 
 [checkpoint]
-dir = "checkpoints/vlm_debug_mot"
+dir = "checkpoints/vlm_debug"
 interval = 25
 keep_last_n = 2
 

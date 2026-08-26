@@ -23,7 +23,7 @@
 #   Leaves ~90 GB / H100 for activations and grad accumulation headroom.
 #
 # Usage:
-#   uv run torchrun --nproc_per_node=4 scripts/train.py configs/train/vlm_7b_siglip2.toml
+#   uv run torchrun --nproc_per_node=4 examples/vlm/train.py examples/vlm/configs/vlm_7b_siglip2.toml
 #
 # Data:
 #   Default hf_dataset_name is a 30-sample COCO val substitute

@@ -71,14 +71,14 @@ required. (Image-only evaluation does not need this group.)
 ```bash
 # One task, write results JSON
 uv run python examples/vlm/eval/vlm_eval_harness.py \
-    --config     configs/train/vlm_jd.toml \
+    --config     examples/vlm/configs/vlm_7b.toml \
     --checkpoint checkpoints/vlm/step_10000 \
     --tasks      mmmu_val \
     --output     results/vlm_step_10000.json
 
 # Several tasks, quick partial run (4 examples per task)
 uv run python examples/vlm/eval/vlm_eval_harness.py \
-    --config     configs/train/vlm_jd.toml \
+    --config     examples/vlm/configs/vlm_7b.toml \
     --checkpoint checkpoints/vlm/step_10000 \
     --tasks      mmmu_val,mmbench_en_dev,scienceqa_img \
     --limit      4
@@ -115,7 +115,7 @@ video group (see [Install lmms-eval](#install-lmms-eval)).
 
 ```bash
 uv run python examples/vlm/eval/vlm_eval_harness.py \
-    --config     configs/train/vlm_video_webvid.toml \
+    --config     examples/vlm/configs/vlm_video_webvid.toml \
     --checkpoint checkpoints/vlm_video/step_10000 \
     --tasks      <a video generate_until task> \
     --limit      4

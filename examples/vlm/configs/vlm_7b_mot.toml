@@ -29,7 +29,7 @@
 #   loss: 11.6 -> 6.4 over 50 steps (clear convergence on real data)
 #
 # Usage:
-#   uv run torchrun --nproc_per_node=4 scripts/train.py configs/train/vlm_7b_mot.toml
+#   uv run torchrun --nproc_per_node=4 examples/vlm/train.py examples/vlm/configs/vlm_7b_mot.toml
 #
 # Default points at a 30-sample COCO val substitute (sayakpaul/coco-30-val-2014)
 # so a fresh clone runs without external setup. For real training, override

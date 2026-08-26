@@ -17,7 +17,7 @@
 # (paper §2.4), deferred to a follow-up.
 #
 # Usage:
-#   uv run python scripts/train.py configs/train/vlm_debug_moma.toml \
+#   uv run python examples/vlm/train.py examples/vlm/configs/vlm_debug_moma.toml \
 #       --data.hf_dataset_name=... --data.tokenizer_path=gpt2
 
 [model]

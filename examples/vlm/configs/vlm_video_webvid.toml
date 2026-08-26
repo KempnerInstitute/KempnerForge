@@ -12,7 +12,7 @@
 #   8 frames -> 8*49 = 392 visual + 64 text = 456 <= 576.
 #
 # Launch (single node, 4 GPUs):
-#   uv run torchrun --nproc_per_node=4 scripts/train.py configs/train/vlm_video_webvid.toml
+#   uv run torchrun --nproc_per_node=4 examples/vlm/train.py examples/vlm/configs/vlm_video_webvid.toml
 #
 # Quick smoke (no SigLIP download, a few clips; pair with a small step count):
 #   ... --vision_encoder.type=random --vision_encoder.num_tokens=196 \
@@ -44,7 +44,7 @@ max_text_len = 64
 freeze = [{module = "vision_encoder", frozen = true}]
 
 [video]
-data_root = "/n/holylfs06/LABS/kempner_shared/Everyone/testbed/video/webvid-10m"
+data_root = "path-to-webvid-10m"
 split = "train"
 fps = 2.0
 max_frames = 8

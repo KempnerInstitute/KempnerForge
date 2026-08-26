@@ -19,8 +19,8 @@
 # transition spec (adapter frozen).
 #
 # Usage:
-#   uv run torchrun --nproc_per_node=4 scripts/train.py \
-#       configs/train/vlm_7b_freeze_schedule.toml
+#   uv run torchrun --nproc_per_node=4 examples/vlm/train.py \
+#       examples/vlm/configs/vlm_7b_freeze_schedule.toml
 #
 # Default points at a 30-sample COCO val substitute (sayakpaul/coco-30-val-2014)
 # so a fresh clone runs without external setup. For real training, override

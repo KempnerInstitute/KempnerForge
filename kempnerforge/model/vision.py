@@ -47,7 +47,7 @@ class RandomVisionEncoder(VisionEncoder):
     same image produces the same tokens across calls; independent of
     model weights so it works under FSDP2 without sharding a real encoder.
 
-    Used in tests and the ``vlm_debug.toml`` smoke config.
+    Used in tests and in VLM smoke configs.
     """
 
     def __init__(self, num_tokens: int = 16, feature_dim: int = 768, seed: int = 0) -> None:

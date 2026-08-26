@@ -19,8 +19,8 @@
 #     through the VLMWrapper without exposing them as wrapper attrs.
 #
 # Usage:
-#   uv run torchrun --nproc_per_node=2 scripts/train.py \
-#       configs/train/vlm_debug_moe.toml \
+#   uv run torchrun --nproc_per_node=2 examples/vlm/train.py \
+#       examples/vlm/configs/vlm_debug_moe.toml \
 #       --data.hf_dataset_name=<dataset> --data.tokenizer_path=gpt2
 
 [model]
