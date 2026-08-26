@@ -35,12 +35,12 @@ Python list — peak RAM stays flat regardless of dataset size.
 
 Examples:
     # 1. Smoke-test prep (small slice, single split — default flags):
-    uv run python scripts/prep_vlm_coco.py \\
+    uv run python examples/vlm/data/prep_vlm_coco.py \\
         --out /tmp/vlm_coco_smoke \\
         --num-samples 500
 
     # 2. Full dataset, all 3 splits, ready for training + eval:
-    uv run python scripts/prep_vlm_coco.py \\
+    uv run python examples/vlm/data/prep_vlm_coco.py \\
         --out /path/to/datasets/coco-karpathy \\
         --num-samples 0 \\
         --all-splits
@@ -130,10 +130,10 @@ def main() -> None:
         epilog=(
             "Examples:\n"
             "  # Smoke prep (default 500 samples, single split):\n"
-            "  uv run python scripts/prep_vlm_coco.py --out /tmp/vlm_coco_smoke\n"
+            "  uv run python examples/vlm/data/prep_vlm_coco.py --out /tmp/vlm_coco_smoke\n"
             "\n"
             "  # Full dataset, all 3 splits, for training + eval:\n"
-            "  uv run python scripts/prep_vlm_coco.py \\\n"
+            "  uv run python examples/vlm/data/prep_vlm_coco.py \\\n"
             "      --out /path/to/datasets/coco-karpathy \\\n"
             "      --num-samples 0 --all-splits"
         ),
