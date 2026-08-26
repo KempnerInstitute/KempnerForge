@@ -1,0 +1,29 @@
+name: CI (examples)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    paths:
+      # `kempnerforge/**` because the examples import core, so a core-only change
+      # can break an example tier without touching anything under `examples/`.
+      - "examples/**"
+      - "kempnerforge/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/ci-example.yml"
+  workflow_dispatch:
+
+jobs:
+  example-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --group video
+      # Example tests are outside the root `testpaths`, so each tier is named here
+      # explicitly. Each needs its own pytest session: the VLM-eval unit conftest
+      # injects a fake `lmms_eval` that would leak into a tier sharing the session.
+      # The matching integration tier needs the real, undeclared lmms-eval; manual only.
+      - run: uv run pytest examples/vlm/eval/tests/unit -v --timeout=60
