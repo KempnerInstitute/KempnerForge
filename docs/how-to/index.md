@@ -28,8 +28,10 @@ with runnable code (or a link to a notebook, config, or script that runs it)
 - [Run evaluation](run-evaluation.md) — `run_eval()` during training,
   standalone `scripts/eval.py`, `scripts/eval_harness.py` for
   lm-eval-harness.
-- [Run VLM evaluation](run-vlm-evaluation.md) — multimodal benchmarks via
-  lmms-eval, on any VLM DCP checkpoint.
+- [VLM evaluation](https://github.com/KempnerInstitute/KempnerForge/tree/main/examples/vlm/eval)
+  — multimodal benchmarks via lmms-eval, on any VLM DCP checkpoint. Lives with
+  the example it belongs to, `examples/vlm/eval/`, and is documented by its own
+  README.
 - [Generate from checkpoint](generate-from-checkpoint.md) — load a DCP
   checkpoint, call `generate()` with temperature / top-k / top-p,
   interact with `KVCache`.
@@ -70,7 +72,6 @@ end-to-end-training-run
 scaling-guide
 slurm-distributed-setup
 run-evaluation
-run-vlm-evaluation
 generate-from-checkpoint
 debug-training-regressions
 compare-optimizers

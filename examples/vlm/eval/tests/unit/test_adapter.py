@@ -4,7 +4,7 @@ A faithful fake ``lmms_eval`` is injected by ``conftest.py`` (lmms-eval is an op
 undeclared dependency), so these tests always run — in CI without lmms-eval and locally —
 exercising the adapter's helpers, guards, and decode loop on a tiny random VLM: no GPU, no
 real checkpoint, no network. Real-package fidelity is pinned by the gated contract test in
-``tests/integration/``.
+``../integration/test_lmms_eval_contract.py``.
 """
 
 from __future__ import annotations
@@ -13,21 +13,7 @@ import json
 
 import pytest
 import torch
-from lmms_eval.api.instance import Instance
-from lmms_eval.protocol import ChatMessages
-from PIL import Image
-
-from kempnerforge.config.data import DataConfig
-from kempnerforge.config.registry import registry
-from kempnerforge.config.schema import AdapterConfig, JobConfig, ModelConfig, VisionEncoderConfig
-from kempnerforge.config.video import VideoConfig
-from kempnerforge.config.vlm import VLMConfig
-from kempnerforge.data.vlm_dataset import (
-    DEFAULT_IMAGE_MEAN,
-    DEFAULT_IMAGE_STD,
-    pil_to_tensor,
-)
-from kempnerforge.eval.vlm.adapter import (
+from adapter import (
     KempnerForgeVLM,
     _build_model,
     _check_generative,
@@ -42,6 +28,20 @@ from kempnerforge.eval.vlm.adapter import (
     _resolve_dtype,
     _resolve_gen_kwargs,
     _to_pil,
+)
+from lmms_eval.api.instance import Instance
+from lmms_eval.protocol import ChatMessages
+from PIL import Image
+
+from kempnerforge.config.data import DataConfig
+from kempnerforge.config.registry import registry
+from kempnerforge.config.schema import AdapterConfig, JobConfig, ModelConfig, VisionEncoderConfig
+from kempnerforge.config.video import VideoConfig
+from kempnerforge.config.vlm import VLMConfig
+from kempnerforge.data.vlm_dataset import (
+    DEFAULT_IMAGE_MEAN,
+    DEFAULT_IMAGE_STD,
+    pil_to_tensor,
 )
 from kempnerforge.model.vlm import VLMWrapper, build_vlm_wrapper
 
@@ -191,9 +191,7 @@ class TestRenderRequestVideo:
 
     def test_video_decoded_to_frames(self, monkeypatch, vcfg):
         frames = [_img(), _img(), _img()]
-        monkeypatch.setattr(
-            "kempnerforge.eval.vlm.adapter.decode_video_frames", lambda path, **kw: frames
-        )
+        monkeypatch.setattr("adapter.decode_video_frames", lambda path, **kw: frames)
         out_frames, prompt = _render_request(_chat([_text("describe"), _video("clip.mp4")]), vcfg)
         assert out_frames is frames
         assert prompt == "describe"
@@ -206,7 +204,7 @@ class TestRenderRequestVideo:
             captured.update(kw)
             return [_img()]
 
-        monkeypatch.setattr("kempnerforge.eval.vlm.adapter.decode_video_frames", _fake)
+        monkeypatch.setattr("adapter.decode_video_frames", _fake)
         _render_request(_chat([_video("c.mp4")]), vcfg)
         assert captured["path"] == "c.mp4"
         assert captured["fps"] == vcfg.fps
@@ -254,10 +252,8 @@ class TestRenderRequestVideo:
 
     def test_no_frames_decoded_warns(self, monkeypatch, vcfg):
         rec = _RecordingLogger()
-        monkeypatch.setattr("kempnerforge.eval.vlm.adapter.logger", rec)
-        monkeypatch.setattr(
-            "kempnerforge.eval.vlm.adapter.decode_video_frames", lambda path, **kw: []
-        )
+        monkeypatch.setattr("adapter.logger", rec)
+        monkeypatch.setattr("adapter.decode_video_frames", lambda path, **kw: [])
         frames, _ = _render_request(_chat([_video("c.mp4")]), vcfg)
         assert frames == []
         assert any("zero clip" in m for m in rec.warnings)
@@ -471,7 +467,7 @@ class TestGenerateBatchSingle:
     def test_overlong_prompt_is_left_truncated(self, arch_wrapper, monkeypatch):
         """A prompt that exceeds the budget (but leaves room) is left-truncated with a warning."""
         rec = _RecordingLogger()
-        monkeypatch.setattr("kempnerforge.eval.vlm.adapter.logger", rec)
+        monkeypatch.setattr("adapter.logger", rec)
         # Size the prompt from the wrapper's own num_image_tokens (0 for CA, 8 for JD/MoT)
         # so it overflows the budget by 6 on every arch — no hardcoded image-token count.
         # budget = max_seq_len(64) - num_image_tokens - max_new_tokens(2).
@@ -641,11 +637,9 @@ def _video_job_config(tiny_video_configs) -> JobConfig:
 
 
 def _patch_loaders(monkeypatch, job: JobConfig, model) -> None:
-    monkeypatch.setattr("kempnerforge.eval.vlm.adapter._load_config", lambda _p: job)
-    monkeypatch.setattr("kempnerforge.eval.vlm.adapter._load_weights", lambda *a, **k: model)
-    monkeypatch.setattr(
-        "kempnerforge.eval.vlm.adapter.build_tokenizer", lambda _p: _MockTokenizer()
-    )
+    monkeypatch.setattr("adapter._load_config", lambda _p: job)
+    monkeypatch.setattr("adapter._load_weights", lambda *a, **k: model)
+    monkeypatch.setattr("adapter.build_tokenizer", lambda _p: _MockTokenizer())
 
 
 # ---------------------------------------------------------------------------
@@ -697,20 +691,20 @@ class TestFirstStop:
 class TestLogCheckpointMetadata:
     def test_missing_metadata_is_noop(self, tmp_path, monkeypatch):
         rec = _RecordingLogger()
-        monkeypatch.setattr("kempnerforge.eval.vlm.adapter.logger", rec)
+        monkeypatch.setattr("adapter.logger", rec)
         _log_checkpoint_metadata(tmp_path)
         assert rec.infos == [] and rec.warnings == []
 
     def test_valid_metadata_logged(self, tmp_path, monkeypatch):
         rec = _RecordingLogger()
-        monkeypatch.setattr("kempnerforge.eval.vlm.adapter.logger", rec)
+        monkeypatch.setattr("adapter.logger", rec)
         (tmp_path / "metadata.json").write_text(json.dumps({"step": 7, "tokens_seen": 1234}))
         _log_checkpoint_metadata(tmp_path)
         assert any("step=7" in m and "tokens_seen=1234" in m for m in rec.infos)
 
     def test_malformed_metadata_warns_not_raises(self, tmp_path, monkeypatch):
         rec = _RecordingLogger()
-        monkeypatch.setattr("kempnerforge.eval.vlm.adapter.logger", rec)
+        monkeypatch.setattr("adapter.logger", rec)
         (tmp_path / "metadata.json").write_text("{not valid json")
         _log_checkpoint_metadata(tmp_path)  # must not raise
         assert any("Could not read" in m for m in rec.warnings)
@@ -724,7 +718,7 @@ class TestLogCheckpointMetadata:
 class TestLoadConfig:
     def test_non_vlm_config_rejected(self, monkeypatch, tiny_job_config):
         monkeypatch.setattr(
-            "kempnerforge.eval.vlm.adapter.load_config",
+            "adapter.load_config",
             lambda _p, cli_args=None: tiny_job_config,
         )
         with pytest.raises(ValueError, match="not a VLM config"):
@@ -732,9 +726,7 @@ class TestLoadConfig:
 
     def test_vlm_config_accepted(self, monkeypatch, tiny_vlm_configs):
         job = _vlm_job_config(tiny_vlm_configs)
-        monkeypatch.setattr(
-            "kempnerforge.eval.vlm.adapter.load_config", lambda _p, cli_args=None: job
-        )
+        monkeypatch.setattr("adapter.load_config", lambda _p, cli_args=None: job)
         assert _load_config("ignored.toml") is job
 
 
@@ -760,18 +752,18 @@ class TestInitGuards:
     @pytest.mark.parametrize("arch", NON_GENERATIVE_ARCHES)
     def test_non_generative_fails_fast_before_load(self, monkeypatch, tiny_vlm_configs, arch):
         job = _vlm_job_config(tiny_vlm_configs, arch=arch)
-        monkeypatch.setattr("kempnerforge.eval.vlm.adapter._load_config", lambda _p: job)
+        monkeypatch.setattr("adapter._load_config", lambda _p: job)
 
         def _must_not_load(*args, **kwargs):
             raise AssertionError("model load must not run for an unsupported arch")
 
-        monkeypatch.setattr("kempnerforge.eval.vlm.adapter._load_weights", _must_not_load)
+        monkeypatch.setattr("adapter._load_weights", _must_not_load)
         with pytest.raises(ValueError, match="non-causal"):
             KempnerForgeVLM(config="x", checkpoint="y", device="cpu", dtype="float32")
 
     def test_ignored_kwargs_warn(self, monkeypatch, tiny_vlm_configs, tiny_vlm_wrapper):
         rec = _RecordingLogger()
-        monkeypatch.setattr("kempnerforge.eval.vlm.adapter.logger", rec)
+        monkeypatch.setattr("adapter.logger", rec)
         _patch_loaders(monkeypatch, _vlm_job_config(tiny_vlm_configs), tiny_vlm_wrapper)
         KempnerForgeVLM(config="x", checkpoint="y", device="cpu", dtype="float32", bogus=1)
         assert any("bogus" in m for m in rec.warnings)
@@ -888,7 +880,7 @@ class TestGenerateUntilVideo:
         _patch_loaders(monkeypatch, job, tiny_video_vlm_wrapper)
         # Two real frames per clip; zero-padded to frames_per_clip (== 2) downstream.
         monkeypatch.setattr(
-            "kempnerforge.eval.vlm.adapter.decode_video_frames",
+            "adapter.decode_video_frames",
             lambda path, **kw: [_img(), _img()],
         )
         vlm = KempnerForgeVLM(
@@ -959,7 +951,7 @@ class TestGenerateUntilFaultTolerance:
 
     def test_bad_request_skipped_others_complete(self, monkeypatch, tiny_vlm_configs):
         rec = _RecordingLogger()
-        monkeypatch.setattr("kempnerforge.eval.vlm.adapter.logger", rec)
+        monkeypatch.setattr("adapter.logger", rec)
         vlm = self._vlm(monkeypatch, tiny_vlm_configs)
         img = _img()
 
@@ -993,7 +985,7 @@ class TestGenerateUntilFaultTolerance:
 
     def test_empty_prompt_is_guarded(self, monkeypatch, tiny_vlm_configs):
         rec = _RecordingLogger()
-        monkeypatch.setattr("kempnerforge.eval.vlm.adapter.logger", rec)
+        monkeypatch.setattr("adapter.logger", rec)
         vlm = self._vlm(monkeypatch, tiny_vlm_configs, batch_size=1)
 
         def doc_to_messages(doc):
@@ -1014,7 +1006,7 @@ class TestGenerateUntilFaultTolerance:
     def test_all_requests_bad_returns_empties(self, monkeypatch, tiny_vlm_configs):
         # Every request in the chunk fails -> generation is short-circuited (no empty
         # stack/cat) and each slot returns "", order preserved.
-        monkeypatch.setattr("kempnerforge.eval.vlm.adapter.logger", _RecordingLogger())
+        monkeypatch.setattr("adapter.logger", _RecordingLogger())
         vlm = self._vlm(monkeypatch, tiny_vlm_configs)
 
         def doc_to_messages(doc):
@@ -1039,13 +1031,13 @@ class TestGenerateUntilFaultTolerance:
         # document — here a RuntimeError from _render_request — is isolated as ""
         # with a warning rather than aborting the whole run.
         rec = _RecordingLogger()
-        monkeypatch.setattr("kempnerforge.eval.vlm.adapter.logger", rec)
+        monkeypatch.setattr("adapter.logger", rec)
         vlm = self._vlm(monkeypatch, tiny_vlm_configs, batch_size=1)
 
         def boom(*_a, **_k):
             raise RuntimeError("boom")
 
-        monkeypatch.setattr("kempnerforge.eval.vlm.adapter._render_request", boom)
+        monkeypatch.setattr("adapter._render_request", boom)
 
         def doc_to_messages(doc):
             del doc
@@ -1070,7 +1062,7 @@ class TestGenerateUntilFaultTolerance:
         def interrupt(*_a, **_k):
             raise KeyboardInterrupt
 
-        monkeypatch.setattr("kempnerforge.eval.vlm.adapter._render_request", interrupt)
+        monkeypatch.setattr("adapter._render_request", interrupt)
 
         def doc_to_messages(doc):
             del doc
@@ -1090,7 +1082,7 @@ class TestGenerateUntilFaultTolerance:
         # A bad image path raises FileNotFoundError (subclass of OSError) inside _to_pil;
         # it is isolated as "" like other per-document failures.
         rec = _RecordingLogger()
-        monkeypatch.setattr("kempnerforge.eval.vlm.adapter.logger", rec)
+        monkeypatch.setattr("adapter.logger", rec)
         vlm = self._vlm(monkeypatch, tiny_vlm_configs, batch_size=1)
 
         def doc_to_messages(doc):
@@ -1111,7 +1103,7 @@ class TestGenerateUntilFaultTolerance:
         # A task whose max_new_tokens over-budgets the context skips its own requests
         # (via _ContextBudgetError) instead of aborting the whole run.
         rec = _RecordingLogger()
-        monkeypatch.setattr("kempnerforge.eval.vlm.adapter.logger", rec)
+        monkeypatch.setattr("adapter.logger", rec)
         vlm = self._vlm(monkeypatch, tiny_vlm_configs)  # tiny max_seq_len == 64
         img = _img()
 
