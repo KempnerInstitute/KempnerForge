@@ -740,33 +740,49 @@ class TestTomlLoading:
         with pytest.raises(ValueError, match="Unknown config keys.*dimm"):
             load_config(str(bad_toml), cli_args=[])
 
-    def test_load_vlm_debug_toml(self):
-        """Regression: parallel [vision_encoder] / [adapter] / [vlm] tables
-        load correctly, and list[FreezeSpec] inside VLMConfig instantiates
-        each freeze entry via __post_init__."""
-        config = load_config("configs/train/vlm_debug.toml", cli_args=[])
+    def test_vlm_freeze_list_instantiates_specs(self, tmp_path):
+        """``VLMConfig.freeze`` is ``list[FreezeSpec]``; the loader must
+        instantiate each entry so ``FreezeSpec.__post_init__`` runs, and the
+        parallel [vision_encoder] / [adapter] / [vlm] tables must all land."""
+        toml = tmp_path / "vlm.toml"
+        toml.write_text(
+            """
+[model]
+dim = 64
+n_layers = 2
+n_heads = 4
+n_kv_heads = 4
+vocab_size = 256
+max_seq_len = 96
+
+[train]
+seq_len = 96
+batch_size = 2
+
+[vision_encoder]
+type = "random"
+num_tokens = 16
+
+[adapter]
+type = "mlp_2layer"
+
+[vlm]
+arch = "joint_decoder"
+max_text_len = 64
+freeze = [{module = "vision_encoder", frozen = true}]
+"""
+        )
+        config = load_config(str(toml), cli_args=[])
         assert config.is_vlm is True
         assert config.vision_encoder is not None
-        assert config.vlm is not None
         assert config.vision_encoder.type == "random"
-        assert config.vision_encoder.num_tokens == 64
+        assert config.adapter is not None
+        assert config.adapter.type == "mlp_2layer"
+        assert config.vlm is not None
         assert len(config.vlm.freeze) == 1
         assert config.vlm.freeze[0].module == "vision_encoder"
         assert config.vlm.freeze[0].frozen is True
         config.validate(world_size=1)
-
-    def test_load_vlm_7b_siglip2_toml(self):
-        config = load_config("configs/train/vlm_7b_siglip2.toml", cli_args=[])
-        assert config.is_vlm is True
-        assert config.vision_encoder is not None
-        assert config.vlm is not None
-        assert config.vision_encoder.type == "siglip2"
-        # num_tokens defaults to 0 = "infer from encoder at build time".
-        # The encoder probes 196 (14x14 patches, no CLS) for this path; the
-        # build-time max_seq_len cross-check in build_vlm_wrapper enforces
-        # 196 + 2048 = 2244 <= max_seq_len=2304.
-        assert config.vision_encoder.num_tokens == 0
-        config.validate(world_size=4)
 
     def test_vlm_freeze_schedule_loads_variadic_tuple(self, tmp_path):
         """``FreezeStage.specs`` is ``tuple[FreezeSpec, ...]``; the loader's

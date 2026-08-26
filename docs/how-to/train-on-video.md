@@ -44,7 +44,7 @@ build- and config-time checks enforce this and fail before any GPU work.
 
 A video run adds a `[video]` section (sibling of `[vision_encoder]` /
 `[adapter]` / `[vlm]`) and a token-reducing connector. See
-`configs/train/vlm_video_webvid.toml` for a complete example; the key parts:
+`examples/vlm/configs/vlm_video_webvid.toml` for a complete example; the key parts:
 
 ```toml
 [adapter]
@@ -55,7 +55,7 @@ pool_window = 2           # 14×14 grid -> 7×7 = 49 tokens/frame
 arch = "joint_decoder"    # also: cross_attention | mot | moma
 
 [video]
-data_root = "/path/to/webvid-10m"
+data_root = "path-to-webvid-10m"
 dataset_type = "webvid"      # registry key; add styles via @registry.register_video_dataset
 dataset_name = "webvid-10M"  # corpus dir under raw/<dataset_name>/data (WebVid style)
 sampling_policy = "uniform"  # registry key; the frame-sampling policy
@@ -85,10 +85,10 @@ requires it.
 
 ```bash
 # 4-GPU video training (Joint-Decoder)
-uv run torchrun --nproc_per_node=4 scripts/train.py configs/train/vlm_video_webvid.toml
+uv run torchrun --nproc_per_node=4 examples/vlm/train.py examples/vlm/configs/vlm_video_webvid.toml
 
 # Quick smoke: no SigLIP download, a few clips, few steps
-uv run torchrun --nproc_per_node=2 scripts/train.py configs/train/vlm_video_webvid.toml \
+uv run torchrun --nproc_per_node=2 examples/vlm/train.py examples/vlm/configs/vlm_video_webvid.toml \
     --vision_encoder.type=random --vision_encoder.num_tokens=196 \
     --vision_encoder.feature_dim=768 --video.max_samples=256 --train.max_steps=20
 ```
