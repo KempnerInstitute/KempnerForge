@@ -508,3 +508,92 @@ class TestFsdpWrapTransformerBlocksHelper:
         # Each captured object should be a TransformerBlock, not a sub-module.
         for layer in captured:
             assert isinstance(layer, TransformerBlock)
+
+
+class TestApplyFsdp2GuardedAttributes:
+    """Drive the public ``apply_fsdp2`` over the three states of
+    ``cross_attention_layers``: absent, empty, populated.
+
+    ``fully_shard`` is monkeypatched and the mesh is a mock, so these run on CPU
+    with no process group. Going through ``apply_fsdp2`` rather than the block
+    helper is deliberate: it is the call site every run takes, and it also covers
+    the top-level wrap the helper does not perform.
+    """
+
+    def _capture(self, monkeypatch):
+        import kempnerforge.distributed.parallel as parallel_mod
+
+        captured: list[object] = []
+
+        def fake_fully_shard(mod, **kwargs):  # noqa: ARG001
+            captured.append(mod)
+
+        monkeypatch.setattr(parallel_mod, "fully_shard", fake_fully_shard)
+        return captured
+
+    def _dp_mesh(self):
+        from unittest.mock import MagicMock
+
+        mesh = MagicMock()
+        mesh.mesh_dim_names = ("dp_shard",)
+        return mesh
+
+    def test_pipeline_stage_module_is_wrapped(self, monkeypatch):
+        """A PipelineStageModule defines no ``cross_attention_layers``.
+
+        Before the guard, every ``pp > 1`` run raised AttributeError here.
+        """
+        from kempnerforge.distributed.parallel import apply_fsdp2
+        from kempnerforge.distributed.pipeline_parallel import build_stage_module
+
+        captured = self._capture(monkeypatch)
+        cfg = ModelConfig(dim=64, n_layers=4, n_heads=4, n_kv_heads=4, vocab_size=256)
+        stage = build_stage_module(cfg, pp_rank=0, pp_size=2)
+        assert not hasattr(stage, "cross_attention_layers")
+
+        apply_fsdp2(stage, self._dp_mesh(), reshard_after_forward=False)
+
+        # This stage owns 2 of the 4 blocks, then the top-level wrap.
+        assert len(captured) == 3
+        assert all(isinstance(m, TransformerBlock) for m in captured[:2])
+        assert captured[-1] is stage
+
+    def test_cross_attention_blocks_are_wrapped(self, monkeypatch):
+        """Populated ``cross_attention_layers`` -- the loop body the guard protects.
+
+        Without a CA model the loop exits at zero iterations, so nothing ever
+        wraps a CrossAttentionBlock.
+        """
+        from kempnerforge.config.vlm import CrossAttentionConfig
+        from kempnerforge.distributed.parallel import apply_fsdp2
+        from kempnerforge.model.cross_attention import CrossAttentionBlock
+        from kempnerforge.model.transformer import Transformer
+
+        captured = self._capture(monkeypatch)
+        cfg = ModelConfig(dim=64, n_layers=4, n_heads=4, n_kv_heads=4, vocab_size=256)
+        transformer = Transformer(
+            cfg, vlm_config=CrossAttentionConfig(cross_attention_every_n_layers=2)
+        )
+        assert len(transformer.cross_attention_layers) == 2
+
+        apply_fsdp2(transformer, self._dp_mesh())
+
+        # 4 transformer blocks, 2 cross-attention blocks, then the top-level wrap.
+        assert len(captured) == 7
+        assert sum(isinstance(m, CrossAttentionBlock) for m in captured) == 2
+        assert captured[-1] is transformer
+
+    def test_empty_cross_attention_dict_wraps_nothing_extra(self, monkeypatch):
+        """A plain Transformer has the attribute but it is empty."""
+        from kempnerforge.distributed.parallel import apply_fsdp2
+        from kempnerforge.model.transformer import Transformer
+
+        captured = self._capture(monkeypatch)
+        cfg = ModelConfig(dim=64, n_layers=2, n_heads=4, n_kv_heads=4, vocab_size=256)
+        transformer = Transformer(cfg)
+        assert len(transformer.cross_attention_layers) == 0
+
+        apply_fsdp2(transformer, self._dp_mesh())
+
+        assert len(captured) == 3  # 2 blocks + top-level, no CA wraps
+        assert captured[-1] is transformer
