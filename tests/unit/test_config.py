@@ -741,9 +741,10 @@ class TestTomlLoading:
             load_config(str(bad_toml), cli_args=[])
 
     def test_vlm_freeze_list_instantiates_specs(self, tmp_path):
-        """``VLMConfig.freeze`` is ``list[FreezeSpec]``; the loader must
-        instantiate each entry so ``FreezeSpec.__post_init__`` runs, and the
-        parallel [vision_encoder] / [adapter] / [vlm] tables must all land."""
+        """``VLMConfig.freeze`` is ``list[FreezeSpec]``; the loader must turn
+        each TOML table into a ``FreezeSpec``, and the parallel
+        [vision_encoder] / [adapter] / [vlm] tables must all land. The entries
+        differ from the field default, so a no-op loader fails here."""
         toml = tmp_path / "vlm.toml"
         toml.write_text(
             """
@@ -769,7 +770,10 @@ type = "mlp_2layer"
 [vlm]
 arch = "joint_decoder"
 max_text_len = 64
-freeze = [{module = "vision_encoder", frozen = true}]
+freeze = [
+    {module = "adapter", frozen = true},
+    {module = "transformer", frozen = false},
+]
 """
         )
         config = load_config(str(toml), cli_args=[])
@@ -779,9 +783,11 @@ freeze = [{module = "vision_encoder", frozen = true}]
         assert config.adapter is not None
         assert config.adapter.type == "mlp_2layer"
         assert config.vlm is not None
-        assert len(config.vlm.freeze) == 1
-        assert config.vlm.freeze[0].module == "vision_encoder"
-        assert config.vlm.freeze[0].frozen is True
+        # Attribute access fails if the entries stayed raw dicts.
+        assert [(f.module, f.frozen) for f in config.vlm.freeze] == [
+            ("adapter", True),
+            ("transformer", False),
+        ]
         config.validate(world_size=1)
 
     def test_vlm_freeze_schedule_loads_variadic_tuple(self, tmp_path):
