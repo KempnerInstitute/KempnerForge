@@ -21,14 +21,14 @@ directory). On clusters where importing lmms-eval's evaluator fails with
 
 Usage:
     uv run python examples/vlm/eval/vlm_eval_harness.py \
-        --config configs/train/vlm_jd.toml \
+        --config examples/vlm/configs/vlm_7b.toml \
         --checkpoint checkpoints/vlm/step_10000 \
         --tasks mmmu_val \
         --output results/vlm_step_10000.json
 
     # Quick partial run (4 examples per task)
     uv run python examples/vlm/eval/vlm_eval_harness.py \
-        --config configs/train/vlm_jd.toml \
+        --config examples/vlm/configs/vlm_7b.toml \
         --checkpoint checkpoints/vlm/step_10000 \
         --tasks mmmu_val,mmbench_en_dev \
         --limit 4

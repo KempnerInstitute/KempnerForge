@@ -69,19 +69,24 @@ def test_machine_specific_path_check_fires(tmp_path: Path) -> None:
 
 
 def test_vlm_debug_toml() -> None:
-    """Regression: parallel [vision_encoder] / [adapter] / [vlm] tables load
-    correctly, and list[FreezeSpec] inside VLMConfig instantiates each freeze
-    entry via __post_init__."""
+    """Parallel [vision_encoder] / [vlm] tables each load into their own config."""
     config = load_config(str(CONFIG_DIR / "vlm_debug.toml"), cli_args=[])
     assert config.is_vlm is True
     assert config.vision_encoder is not None
     assert config.vlm is not None
     assert config.vision_encoder.type == "random"
     assert config.vision_encoder.num_tokens == 64
-    assert len(config.vlm.freeze) == 1
-    assert config.vlm.freeze[0].module == "vision_encoder"
-    assert config.vlm.freeze[0].frozen is True
     config.validate(world_size=1)
+
+
+def test_vlm_video_webvid_toml() -> None:
+    """The only preset declaring both an [adapter] table and a TOML freeze list,
+    so it is the one that exercises list[FreezeSpec] instantiation."""
+    config = load_config(str(CONFIG_DIR / "vlm_video_webvid.toml"), cli_args=[])
+    assert config.adapter is not None
+    assert config.vlm is not None
+    # Attribute access fails if the entries stayed raw dicts.
+    assert [(f.module, f.frozen) for f in config.vlm.freeze] == [("vision_encoder", True)]
 
 
 def test_vlm_7b_siglip2_toml() -> None:
