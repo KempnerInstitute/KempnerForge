@@ -1,18 +1,22 @@
 # Training loop
 
 Companion to [Data flow](../architecture/data-flow.md): where that page
-maps the whole step onto one diagram,
-[`scripts/train.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/scripts/train.py)
-zooms into the two step bodies (PP vs non-PP), the conditional paths,
-and the periodic work.
+maps the whole step onto one diagram, this one zooms into the step
+bodies (PP vs non-PP), the conditional paths, and the periodic work.
 
-## Two step bodies
+The loop lives in
+[`kempnerforge/training/loop.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/training/loop.py);
+`scripts/train.py` is a thin CLI wrapper that loads the config and calls
+`kempnerforge.training.entry.run_training`.
 
-`scripts/train.py` has a single outer loop but two internal step bodies
-selected on `pp_enabled = config.distributed.pp > 1`. The paths diverge
-on how microbatching interacts with the communication pattern.
+## Step bodies
 
-### Non-PP step (`pp_enabled is False`)
+`run_training_loop` has a single outer loop and calls one step body per
+step — `text_step`, `vlm_step`, or `pipeline_step`, picked once by
+`select_step_fn(config)`. The PP and non-PP paths diverge on how
+microbatching interacts with the communication pattern.
+
+### Non-PP step (`text_step`)
 
 ```python
 for micro_step in range(tc.grad_accum_steps):
@@ -34,11 +38,11 @@ Key mechanics:
   collective fires per optimizer step instead of `grad_accum_steps`.
 - **Per-dataset metrics** — if the dataloader is a `MixtureDataset`,
   per-dataset loss is computed inside the `no_sync` block while logits
-  are still alive (`scripts/train.py` lines 606-622).
+  are still alive, and returned on the `StepResult`.
 - **Loss scaling** — `loss / grad_accum_steps` keeps the effective
   learning rate invariant to the accumulation factor.
 
-### PP step (`pp_enabled is True`)
+### PP step (`pipeline_step`)
 
 ```python
 input_ids_list, labels_list = [], []
@@ -60,8 +64,7 @@ to the schedule (`1f1b` / `gpipe`, built by
 [`build_pipeline_schedule`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/distributed/pipeline_parallel.py)).
 The schedule splits along dim 0 internally; the Python loop only sees
 one `step()` call. Loss is meaningful only on the last stage and is
-broadcast across the PP dimension for logging
-(`scripts/train.py` lines 556-571).
+broadcast across the PP dimension for logging.
 
 ## Gradient clipping and NaN check
 
@@ -157,31 +160,34 @@ runs. See [Resilience § NCCL health](../resilience/index.md).
 
 ## Entry-point setup
 
-Before the loop:
+`kempnerforge.training.entry.run_training(config)` runs the build phases
+in order, then hands a `TrainingSession` to `run_training_loop`:
 
 1. `load_config(path, cli_args)` — TOML + CLI overrides into a
-   `JobConfig` dataclass.
-2. `init_distributed(config.distributed, seed=...)` — `dist.init_process_group`,
-   `DeviceMesh`, seeded RNG.
+   `JobConfig` dataclass (done by `scripts/train.py`).
+2. `setup_distributed(config)` — `dist.init_process_group`, `DeviceMesh`,
+   seeded RNG, world-size validation; returns a `RuntimeContext`.
 3. `build_loss_fn(tc)` — loss registry lookup with optional z-loss wrap
    (see [Losses](losses.md)).
-4. `build_parallel_model(...)` — architecture + full parallelism stack
-   (see [Parallelism order](../architecture/parallelism-order.md)).
+4. `build_model(config, runtime, loss_fn)` — architecture + full
+   parallelism stack (see
+   [Parallelism order](../architecture/parallelism-order.md)), plus the
+   `PipelineBundle` when `distributed.pp > 1`.
 5. `build_optimizer(model, config.optimizer)` — decay grouping +
    registry lookup (see [Optimizers](optimizers.md)).
 6. `build_scheduler(optimizer, config.scheduler, max_steps=tc.max_steps)` —
    warmup + decay LambdaLR (see [Schedulers](schedulers.md)).
-7. `CheckpointManager(...)`, `resolve_resume_path(...)` — auto-resume
-   from the `latest` symlink.
-8. `MetricsTracker`, `HookRunner`, data pipeline, optional eval
-   dataloader, optional profiler.
+7. `build_checkpoint_manager(...)` + `restore_checkpoint(...)` —
+   auto-resume from the `latest` symlink.
+8. `MetricsTracker`, profiler, `build_data_pipeline`,
+   `build_eval_dataloader`, `build_phase_state`, `HookRunner`.
 
 The full list with links lives in
 [Data flow § Startup, once](../architecture/data-flow.md#startup-once).
 
 ## Shutdown
 
-After the loop:
+At the end of `run_training_loop`, then in `run_training`:
 
 ```python
 prof.stop()

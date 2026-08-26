@@ -10,7 +10,7 @@ diagnose each.
 
 | Tool | What it catches | Config | Enabled by default? |
 |------|------------------|:------:|:-------------------:|
-| [`NaNDetector`](../resilience/nan-detection.md) | NaN/Inf in loss | hardcoded in `scripts/train.py` | yes (warn mode) |
+| [`NaNDetector`](../resilience/nan-detection.md) | NaN/Inf in loss | hardcoded in `kempnerforge/training/entry.py` | yes (warn mode) |
 | [`MetricsTracker`](../metrics-and-profiling/metrics-tracker.md) | loss, grad-norm, tok/s, MFU, memory | `[metrics]` | yes |
 | [`DeviceMemoryMonitor`](../metrics-and-profiling/memory-monitor.md) | per-interval peak memory, snapshot export | manual instantiation | no |
 | [`torch.profiler` wrapper](../metrics-and-profiling/profiler.md) | kernel traces, efficiency breakdown | `[profiling]` | no |
@@ -25,7 +25,7 @@ when default-on signals point at a specific failure mode.
 **Symptom:** one step shows `loss NaN`, the next might too, training
 keeps running.
 
-**What the codebase does:** `scripts/train.py` instantiates
+**What the codebase does:** `run_training` instantiates
 `NaNDetector(action="warn", max_consecutive=10)` at startup. Each
 step's `avg_loss` flows through
 [`check_loss()`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/resilience/health.py),
@@ -51,7 +51,7 @@ you from optimizing into garbage. The usual flow:
 ### Configuration caveat
 
 `action` and `max_consecutive` are **hardcoded** in
-`scripts/train.py:85` — there's no TOML knob. If you need
+`kempnerforge/training/entry.py` — there's no TOML knob. If you need
 `action="raise"` (fail fast) or `action="skip"` without the warning,
 edit the source. See
 [Resilience § NaN detection § Limitations](../resilience/nan-detection.md#limitations).

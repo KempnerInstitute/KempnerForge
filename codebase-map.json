@@ -775,7 +775,8 @@
         "freeze_params(model, specs, module_patterns) -> dict",
         "apply_freeze_specs(model, specs, module_patterns) -> dict",
         "canonical_freeze_meta(specs) -> list[dict]",
-        "effective_freeze(step, base_specs, schedule, valid_modules) -> list[FreezeSpec]"
+        "effective_freeze(step, base_specs, schedule, valid_modules) -> list[FreezeSpec]",
+        "freeze_meta_at_step(step, config) -> list[dict]"
       ],
       "tested_by": [
         "tests/unit/test_freeze.py::TestFreezeParams",
@@ -827,6 +828,87 @@
         "tests/unit/test_training_hooks.py::TestStepContext",
         "tests/unit/test_training_hooks.py::TestTrainingHook",
         "tests/unit/test_training_hooks.py::TestAllEvents"
+      ]
+    },
+    "kempnerforge/training/runtime.py": {
+      "classes": {
+        "RuntimeContext": {
+          "purpose": "Ranks, device, DeviceMesh, and the DP view of it"
+        },
+        "PipelineBundle": {
+          "purpose": "PP rank/size/schedule (pp > 1 only); the process group is derived on demand"
+        }
+      },
+      "functions": [
+        "setup_distributed(config) -> RuntimeContext",
+        "pp_group(runtime) -> ProcessGroup"
+      ],
+      "tested_by": [
+        "tests/unit/test_train_entry.py"
+      ]
+    },
+    "kempnerforge/training/data_pipeline.py": {
+      "classes": {
+        "DataPipeline": {
+          "purpose": "Training dataset/loader plus mixture dataset, sampler, weights"
+        },
+        "PhaseState": {
+          "purpose": "Data-annealing phases plus the active index and lr_scale"
+        }
+      },
+      "functions": [
+        "build_data_pipeline(config, runtime) -> DataPipeline",
+        "build_eval_dataloader(config, runtime) -> DataLoader | None",
+        "build_phase_state(config, data, step) -> PhaseState",
+        "advance_phases(state, data, step) -> bool"
+      ],
+      "tested_by": [
+        "tests/unit/test_train_entry.py::TestBuildDataPipeline",
+        "tests/unit/test_train_entry.py::TestPhaseState",
+        "tests/unit/test_train_entry.py::TestAdvancePhases"
+      ]
+    },
+    "kempnerforge/training/loop.py": {
+      "classes": {
+        "BatchStream": {
+          "purpose": "Dataloader + live iterator with epoch restart"
+        },
+        "StepResult": {
+          "purpose": "Loss, grad norm, text-token and per-dataset counters from one step"
+        },
+        "TrainingSession": {
+          "purpose": "Collaborators the step loop needs after the build phase"
+        }
+      },
+      "functions": [
+        "run_training_loop(session, step, tokens_seen) -> tuple[int, int]",
+        "select_step_fn(config) -> StepFn",
+        "text_step(session, step) -> StepResult",
+        "vlm_step(session, step) -> StepResult",
+        "pipeline_step(session, step) -> StepResult",
+        "checkpoint_extra(config, step, phases) -> dict"
+      ],
+      "tested_by": [
+        "tests/unit/test_train_entry.py::TestRunTrainingLoop",
+        "tests/unit/test_train_entry.py::TestBatchStream",
+        "tests/unit/test_train_entry.py::TestSelectStepFn",
+        "tests/unit/test_train_entry.py::TestCheckpointExtra",
+        "tests/e2e/test_training_e2e.py"
+      ]
+    },
+    "kempnerforge/training/entry.py": {
+      "purpose": "Training job orchestration — build phases, run the loop, tear down",
+      "functions": [
+        "run_training(config, step_fn=None, hooks=None)",
+        "build_model(config, runtime, loss_fn) -> tuple[Module, PipelineBundle | None]",
+        "build_checkpoint_manager(config, runtime, model, optimizer, pipeline) -> CheckpointManager",
+        "restore_checkpoint(config, model, scheduler, ckpt_mgr) -> tuple[int, int]"
+      ],
+      "tested_by": [
+        "tests/unit/test_train_entry.py::TestRunTraining",
+        "tests/unit/test_train_entry.py::TestBuildPhaseHelpers",
+        "tests/e2e/test_training_e2e.py",
+        "tests/smoke/test_smoke.py"
       ]
     },
     "kempnerforge/data/dataset.py": {
@@ -1293,7 +1375,7 @@
   },
   "scripts": {
     "scripts/train.py": {
-      "purpose": "Main training entry point — config, distributed setup, training loop, checkpointing",
+      "purpose": "Training CLI wrapper — parses argv, loads the config, calls run_training()",
       "entry": "main()",
       "tested_by": [
         "tests/integration/test_train_step.py",

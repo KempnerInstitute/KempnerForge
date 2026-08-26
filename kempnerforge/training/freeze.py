@@ -20,6 +20,9 @@ training step from a ``base`` list (always-on) and a list of
 post-transition state in metadata), at load (computes the expected
 metadata for the compare), and at the training-loop hook site
 (applies stage transitions when ``step`` reaches them).
+
+``freeze_meta_at_step`` composes the last two into the single expression
+both the save and the resume path use.
 """
 
 from __future__ import annotations
@@ -29,7 +32,7 @@ from collections.abc import Iterable, Mapping
 
 import torch.nn as nn
 
-from kempnerforge.config.vlm import FreezeSpec, FreezeStage
+from kempnerforge.config.vlm import FreezeSpec, FreezeStage, VLMConfig
 
 
 def freeze_params(
@@ -134,3 +137,17 @@ def effective_freeze(
             by_module[spec.module] = spec
 
     return list(by_module.values())
+
+
+def freeze_meta_at_step(step: int, config: VLMConfig) -> list[dict[str, object]]:
+    """Canonical freeze metadata for ``config`` at ``step``.
+
+    Save and resume must derive this identically — otherwise the
+    ``vlm_freeze_expected`` compare rejects checkpoints this code wrote — so
+    both go through here. Passing the config's alias set means a TOML typo
+    raises instead of silently no-op'ing the freeze.
+    """
+    valid_modules = set(config.module_patterns.keys())
+    return canonical_freeze_meta(
+        effective_freeze(step, config.freeze, config.freeze_schedule, valid_modules)
+    )

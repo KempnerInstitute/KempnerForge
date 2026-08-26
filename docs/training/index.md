@@ -21,8 +21,8 @@ hooks
 ```
 
 - **[Training loop](training-loop.md)** — a reader's walkthrough of
-  [`scripts/train.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/scripts/train.py):
-  setup, the two step bodies (PP vs non-PP), phase transitions,
+  [`kempnerforge/training/loop.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/training/loop.py):
+  setup, the step bodies (PP vs non-PP), phase transitions,
   periodic work.
 - **[Optimizers](optimizers.md)** — `adamw`, `lion`, `muon`,
   `schedule_free_adamw`: the four registered optimizers, when to pick
