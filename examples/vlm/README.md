@@ -51,6 +51,11 @@ Video needs PyAV: `uv sync --group video`.
 Tests: `uv run pytest examples/vlm/tests/ -v` (they are outside the core
 `testpaths`, so run them by path).
 
+## Data prep
+
+`data/prep_vlm_coco.py` writes a COCO-Karpathy `save_to_disk` directory for
+`data.hf_dataset_name` to point at.
+
 ## Evaluation
 
 Benchmark evaluation of the resulting checkpoints lives in `eval/`.
