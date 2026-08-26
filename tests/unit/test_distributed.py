@@ -543,3 +543,42 @@ class TestFsdpWrapTransformerBlocksHelper:
         assert len(captured) == 2  # this stage owns 2 of the 4 blocks
         for layer in captured:
             assert isinstance(layer, TransformerBlock)
+
+    def test_cross_attention_blocks_are_wrapped(self, monkeypatch):
+        """Cross-Attention configs populate ``cross_attention_layers``.
+
+        Covers the loop body the guard protects: without a CA model the loop
+        exits at zero iterations, so nothing ever wraps a CrossAttentionBlock.
+        """
+        from unittest.mock import MagicMock
+
+        import kempnerforge.distributed.parallel as parallel_mod
+        from kempnerforge.config.vlm import CrossAttentionConfig
+        from kempnerforge.distributed.parallel import (
+            _fsdp_wrap_transformer_blocks,
+            default_mp_policy,
+        )
+        from kempnerforge.model.cross_attention import CrossAttentionBlock
+        from kempnerforge.model.transformer import Transformer
+
+        captured: list[object] = []
+
+        def fake_fully_shard(mod, **kwargs):  # noqa: ARG001
+            captured.append(mod)
+
+        monkeypatch.setattr(parallel_mod, "fully_shard", fake_fully_shard)
+
+        cfg = ModelConfig(dim=64, n_layers=4, n_heads=4, n_kv_heads=4, vocab_size=256)
+        transformer = Transformer(
+            cfg, vlm_config=CrossAttentionConfig(cross_attention_every_n_layers=2)
+        )
+        assert len(transformer.cross_attention_layers) == 2
+
+        ep_sub = _fsdp_wrap_transformer_blocks(
+            transformer, MagicMock(), default_mp_policy(), reshard_after_forward=True
+        )
+
+        assert ep_sub == 0
+        # 4 transformer blocks, then the 2 cross-attention blocks.
+        assert len(captured) == 6
+        assert sum(isinstance(m, CrossAttentionBlock) for m in captured) == 2
