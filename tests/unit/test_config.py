@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import random
 import sys
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -723,6 +724,23 @@ class TestTomlLoading:
         config = load_config("configs/train/7b.toml", cli_args=[])
         assert config.scheduler.name == SchedulerType.cosine
         assert isinstance(config.scheduler.name, SchedulerType)
+
+    @pytest.mark.parametrize(
+        "config_path",
+        sorted(str(p) for p in Path("configs").rglob("*.toml")),
+        ids=lambda p: str(p).replace("configs/", "").replace("/", ":"),
+    )
+    def test_shipped_config_loads(self, config_path):
+        """Every TOML under configs/ must load.
+
+        `configs/model/moe_small.toml` shipped without its `[model]` section
+        header and was unloadable from the day it was added, because no test
+        exercised the shipped presets. This sweeps all of them so the next one
+        cannot ship broken. Load only -- `validate()` needs a world size and is
+        covered separately.
+        """
+        config = load_config(config_path, cli_args=[])
+        assert config.model.dim > 0, f"{config_path} loaded but has no model dim"
 
     def test_missing_toml_raises(self):
         with pytest.raises(FileNotFoundError):
