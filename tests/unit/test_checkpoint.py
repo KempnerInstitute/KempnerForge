@@ -915,6 +915,63 @@ class TestAsyncLatestSymlinkSafety:
         assert tokens == 1000
         assert any("interrupted async flush" in r.getMessage() for r in records)
 
+    def test_auto_resume_falls_back_when_given_the_resolved_path(self, tmp_path, monkeypatch):
+        """Auto-resume passes the path it resolved, and must still fall back.
+
+        This is the shape production takes: ``training/entry.py`` calls
+        ``resolve_resume_path()`` and hands the result to ``load(path=...)``.
+        Treating a passed path as "the user asked for this" made every
+        production call explicit and left the fallback unreachable.
+        """
+        from unittest.mock import MagicMock
+
+        self._build_ckpt(tmp_path, 10, complete=True)
+        incomplete = self._build_ckpt(tmp_path, 20, complete=False)
+
+        mgr = self._mgr(tmp_path, AsyncCheckpointMode.async_pinned)
+        monkeypatch.setattr("kempnerforge.checkpoint.manager.dcp.load", MagicMock())
+
+        step, tokens, _ = mgr.load(path=str(incomplete))
+
+        assert step == 10, "auto-resume did not fall back to the newest COMPLETE checkpoint"
+        assert tokens == 1000
+
+    def test_explicit_load_path_still_fails_loudly(self, tmp_path, monkeypatch):
+        """A user-named checkpoint is honored as-is, broken or not.
+
+        The fallback is for auto-resume only. When ``checkpoint.load_path`` is
+        set the caller asked for that directory by name, so a missing DCP
+        ``.metadata`` must surface rather than being silently substituted.
+        """
+        from unittest.mock import MagicMock
+
+        self._build_ckpt(tmp_path, 10, complete=True)
+        incomplete = self._build_ckpt(tmp_path, 20, complete=False)
+
+        mgr = self._mgr(tmp_path, AsyncCheckpointMode.async_pinned)
+        mgr.config.load_path = str(incomplete)
+        monkeypatch.setattr("kempnerforge.checkpoint.manager.dcp.load", MagicMock())
+
+        step, tokens, _ = mgr.load(path=str(incomplete))
+
+        assert step == 20, "explicit load_path was not honored as-is"
+        assert tokens == 2000
+
+    def test_complete_checkpoint_resumes_unchanged(self, tmp_path, monkeypatch):
+        """Regression guard: a durable checkpoint is never redirected."""
+        from unittest.mock import MagicMock
+
+        self._build_ckpt(tmp_path, 10, complete=True)
+        newest = self._build_ckpt(tmp_path, 20, complete=True)
+
+        mgr = self._mgr(tmp_path, AsyncCheckpointMode.async_pinned)
+        monkeypatch.setattr("kempnerforge.checkpoint.manager.dcp.load", MagicMock())
+
+        step, tokens, _ = mgr.load(path=str(newest))
+
+        assert step == 20
+        assert tokens == 2000
+
     def test_resume_no_fallback_when_dcp_excluded(self, tmp_path, monkeypatch):
         from unittest.mock import MagicMock
 
