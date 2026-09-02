@@ -307,8 +307,9 @@ class TestNextTokenLabelContract:
 
     def test_prompt_filling_the_budget_is_in_range(self):
         """A prompt that leaves no room for a caption must not raise or produce a
-        negative-index slice; it degrades to an unsupervised row. (Rejecting such
-        a prompt up front is a separate concern, validated at dataset init.)"""
+        negative-index slice. It degrades to a row with nothing (or only EOS)
+        supervised; rejecting such a prompt up front is a separate concern and is
+        not validated here."""
         tok = _MockTokenizer()
         for prompt_chars in (7, 8, 12):
             _, labels = _tokenize_and_mask(tok, "xyz", max_text_len=8, prompt="a" * prompt_chars)
