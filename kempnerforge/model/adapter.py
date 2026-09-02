@@ -228,10 +228,13 @@ class AvgPoolAdapter(VisionAdapter):
         x, per, valid = _pad_grid_to_windows(x, w)
         b, _, _, c = x.shape
         # Group into windows and average over real (unpadded) cells only.
-        sums = x.view(b, per, w, per, w, c).sum(dim=(2, 4))  # (B, per, per, C)
         if valid is None:
+            sums = x.view(b, per, w, per, w, c).sum(dim=(2, 4))  # (B, per, per, C)
             pooled = (sums / (w * w)).reshape(b, per * per, c)
         else:
+            # Zero the padded cells through `valid` rather than trusting the pad
+            # value, so numerator and denominator are masked by the same tensor.
+            sums = (x * valid).view(b, per, w, per, w, c).sum(dim=(2, 4))
             counts = valid.view(b, per, w, per, w, 1).to(sums.dtype).sum(dim=(2, 4)).clamp_(min=1)
             pooled = (sums / counts).reshape(b, per * per, c)
         return self.proj(pooled)
