@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import math
+
 import pytest
 import torch
+import torch.nn.functional as F
 
 # Importing the module registers the builders under the shared registry.
-import kempnerforge.model.adapter  # noqa: F401
+import kempnerforge.model.adapter
 from kempnerforge.config.adapter import AdapterConfig
 from kempnerforge.config.registry import registry
 from kempnerforge.model.adapter import (
@@ -22,6 +25,70 @@ from kempnerforge.model.adapter import (
 )
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+_LOUD_PAD_VALUE = 1e4
+
+
+class _LoudPadF:
+    """Stand-in for ``torch.nn.functional`` that pads floats with a huge value.
+
+    Lets a test prove the pooling adapters *mask* padded patches rather than
+    relying on them being zero: with padding masked out, the pooled output must
+    not move when the pad value changes.
+    """
+
+    def __getattr__(self, name):
+        return getattr(F, name)
+
+    def pad(self, t, pad, mode="constant", value=None):
+        if t.dtype.is_floating_point:
+            return F.pad(t, pad, mode, _LOUD_PAD_VALUE)
+        return F.pad(t, pad, mode, value)
+
+
+def _reference_pool_windows(num_tokens: int, window: int) -> list[list[int]]:
+    """Flat patch indices per output window, computed independently of the module.
+
+    ``ceil(grid/window)**2`` windows in row-major order; each lists only the real
+    (in-grid) patches it covers, so a ragged edge window is short.
+    """
+    grid = math.isqrt(num_tokens)
+    assert grid * grid == num_tokens
+    per = math.ceil(grid / window)
+    windows = []
+    for i in range(per):
+        for j in range(per):
+            windows.append(
+                [
+                    r * grid + c
+                    for r in range(i * window, min((i + 1) * window, grid))
+                    for c in range(j * window, min((j + 1) * window, grid))
+                ]
+            )
+    return windows
+
+
+def _reference_attentional_pool(
+    adapter: AttentionalPoolAdapter, x: torch.Tensor, window: int
+) -> torch.Tensor:
+    """Brute-force attentional pool: per window, attend over its real patches only.
+
+    Builds no padded tensor at all, so it is an independent check of the padded +
+    masked implementation rather than a restatement of it.
+    """
+    b, _, c = x.shape
+    heads, head_dim = adapter.pool_heads, adapter.head_dim
+    outs = []
+    for idx in _reference_pool_windows(x.shape[1], window):
+        patches = x[:, idx]  # (B, k_real, C)
+        k_real = patches.shape[1]
+        q = adapter.q_proj(patches.mean(dim=1, keepdim=True))
+        q = q.view(b, 1, heads, head_dim).transpose(1, 2)
+        k = adapter.k_proj(patches).view(b, k_real, heads, head_dim).transpose(1, 2)
+        v = adapter.v_proj(patches).view(b, k_real, heads, head_dim).transpose(1, 2)
+        attn = F.scaled_dot_product_attention(q, k, v).transpose(1, 2).reshape(b, c)
+        outs.append(adapter.out_proj(adapter.o_proj(attn)))
+    return torch.stack(outs, dim=1)
 
 
 # ---------------------------------------------------------------------------
@@ -303,6 +370,22 @@ class TestPadGridToWindows:
         assert bool(valid[:, :4, :4].all())
         assert not bool(valid[:, 4:, :].any()) and not bool(valid[:, :, 4:].any())
 
+    @pytest.mark.parametrize(
+        ("n_in", "window"),
+        [(16, 3), (49, 3), (4, 3), (100, 3), (25, 2), (196, 3)],
+    )
+    def test_every_window_keeps_at_least_one_real_patch(self, n_in, window):
+        # ceil padding never produces an all-padded window: the last window starts
+        # at (per-1)*window < grid. The pooling adapters rely on this (their query
+        # denominator would otherwise be zero), so pin it rather than trust the
+        # defensive clamp.
+        x = torch.randn(1, n_in, 4)
+        padded, per, valid = _pad_grid_to_windows(x, window)
+        if valid is None:
+            return  # divisible: no padding at all
+        counts = valid.view(1, per, window, per, window, 1).sum(dim=(2, 4))
+        assert int(counts.min()) >= 1
+
 
 # ---------------------------------------------------------------------------
 # AvgPoolAdapter
@@ -393,6 +476,19 @@ class TestAvgPoolAdapter:
         # real patch; mean over that 1 patch = 15.0 (a /(w*w)=/9 bug gives ~1.67).
         assert torch.allclose(out[0, 3], torch.full((4,), 15.0))
 
+    @pytest.mark.parametrize(("n_in", "window"), [(16, 3), (49, 3), (4, 3), (196, 3)])
+    def test_pad_value_does_not_leak(self, monkeypatch, n_in, window):
+        """Padded cells are excluded from the average, not merely zero-valued."""
+        torch.manual_seed(0)
+        adapter = AvgPoolAdapter(in_dim=8, out_dim=4, pool_window=window)
+        x = torch.randn(2, n_in, 8)
+        with torch.no_grad():
+            baseline = adapter(x)
+            monkeypatch.setattr(kempnerforge.model.adapter, "F", _LoudPadF())
+            loud = adapter(x)
+        assert torch.isfinite(loud).all()
+        assert torch.allclose(baseline, loud, atol=1e-5)
+
     def test_forward_rejects_nonpositive_window_override(self):
         adapter = AvgPoolAdapter(in_dim=8, out_dim=4, pool_window=2)
         with pytest.raises(ValueError, match="pool_window must be positive"):
@@ -451,6 +547,84 @@ class TestAttentionalPoolAdapter:
             real = x[:, 15:16]  # (1, 1, 32) — the window's only real patch
             ref = adapter.out_proj(adapter.o_proj(adapter.v_proj(real)))  # (1, 1, 16)
         assert torch.allclose(out[:, 3:4], ref, atol=1e-5)
+
+    def test_worst_ragged_edge_remainder_one(self):
+        # grid % window == 1 is the worst ragged edge: the corner window covers a
+        # single real patch. 7x7 grid, window 3 -> ceil(7/3)=3 -> 9 tokens, and the
+        # last window's only real cell is (6,6) = flat index 48.
+        torch.manual_seed(0)
+        adapter = AttentionalPoolAdapter(in_dim=32, out_dim=16, pool_window=3, pool_heads=4).eval()
+        x = torch.randn(1, 49, 32)  # 7x7 grid
+        with torch.no_grad():
+            out = adapter(x)
+            ref = adapter.out_proj(adapter.o_proj(adapter.v_proj(x[:, 48:49])))
+        assert out.shape == (1, 9, 16)
+        assert torch.allclose(out[:, 8:9], ref, atol=1e-5)
+
+    def test_window_larger_than_grid(self):
+        # window > grid: everything pools into a single token (ceil(2/3)=1), with
+        # the 5 padded cells of the 3x3 window masked out.
+        adapter = AttentionalPoolAdapter(in_dim=32, out_dim=16, pool_window=3, pool_heads=4)
+        out = adapter(torch.randn(2, 4, 32))  # 2x2 grid
+        assert out.shape == (2, 1, 16)
+        assert adapter.output_num_tokens(4) == 1
+        assert torch.isfinite(out).all()
+
+    def test_window_equals_grid(self):
+        # window == grid is divisible, so it takes the unmasked path and emits one
+        # token per image.
+        adapter = AttentionalPoolAdapter(in_dim=32, out_dim=16, pool_window=4, pool_heads=4)
+        out = adapter(torch.randn(2, 16, 32))  # 4x4 grid
+        assert out.shape == (2, 1, 16)
+        assert adapter.output_num_tokens(16) == 1
+
+    def test_non_square_input_raises(self):
+        # A non-perfect-square token count is still rejected: ragged pooling relaxes
+        # the divisibility requirement, not the square-grid one.
+        adapter = AttentionalPoolAdapter(in_dim=32, out_dim=16, pool_window=3, pool_heads=4)
+        with pytest.raises(ValueError, match="square patch grid"):
+            adapter(torch.randn(1, 8, 32))  # 8 is not a perfect square
+
+    # (196, 2) and (16, 4) are divisible; the rest are ragged, including the
+    # remainder-1 worst edge (49, 3) and window > grid (4, 3).
+    @pytest.mark.parametrize(
+        ("n_in", "window"), [(16, 3), (49, 3), (4, 3), (196, 3), (196, 2), (16, 4), (25, 2)]
+    )
+    def test_matches_independent_per_window_reference(self, n_in, window):
+        """Output equals a brute-force pool that attends over real patches only.
+
+        Cross-checks the padded + masked implementation against a formulation that
+        never materializes padding, so a leak or a window-ordering error shows up.
+        """
+        torch.manual_seed(0)
+        adapter = AttentionalPoolAdapter(
+            in_dim=32, out_dim=16, pool_window=window, pool_heads=4
+        ).eval()
+        x = torch.randn(2, n_in, 32)
+        with torch.no_grad():
+            got = adapter(x)
+            want = _reference_attentional_pool(adapter, x, window)
+        assert got.shape == want.shape
+        assert torch.allclose(got, want, atol=1e-5)
+
+    @pytest.mark.parametrize(("n_in", "window"), [(16, 3), (49, 3), (4, 3), (196, 3)])
+    def test_pad_value_does_not_leak(self, monkeypatch, n_in, window):
+        """Padded patches are masked out, not merely zero.
+
+        Padding with a huge value instead of zero must not move the output; if the
+        mask were dropped, the padded keys would dominate every edge window.
+        """
+        torch.manual_seed(0)
+        adapter = AttentionalPoolAdapter(
+            in_dim=32, out_dim=16, pool_window=window, pool_heads=4
+        ).eval()
+        x = torch.randn(2, n_in, 32)
+        with torch.no_grad():
+            baseline = adapter(x)
+            monkeypatch.setattr(kempnerforge.model.adapter, "F", _LoudPadF())
+            loud = adapter(x)
+        assert torch.isfinite(loud).all()
+        assert torch.allclose(baseline, loud, atol=1e-5)
 
     def test_heads_must_divide_dim(self):
         with pytest.raises(ValueError, match="divisible by"):
