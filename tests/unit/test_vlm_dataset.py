@@ -235,6 +235,11 @@ class TestNextTokenLabelContract:
             ("abc", "", 8),  # empty prompt string
             ("ab", "a", 8),  # prompt_len == 1
             ("a", None, 2),  # minimum legal max_text_len
+            # prompt at and beyond the budget: prompt_len is measured before
+            # truncation, so these pin that it still lines up with the boundary.
+            ("xyz", "aaaaaaa", 8),  # prompt fills max_text_len - 1
+            ("xyz", "aaaaaaaa", 8),  # prompt fills max_text_len
+            ("xyz", "aaaaaaaaaaaa", 8),  # prompt longer than max_text_len
         ],
     )
     def test_matches_derived_contract(self, text, prompt, max_text_len):
