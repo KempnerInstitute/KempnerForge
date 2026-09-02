@@ -53,6 +53,7 @@ Architecture hyperparameters and MoE knobs.
 | `n_layers` | `int` | `32` | number of transformer blocks |
 | `n_heads` | `int` | `32` | attention heads |
 | `n_kv_heads` | `int \| None` | `None` | GQA: `None` → MHA (= `n_heads`), `1` → MQA, else GQA |
+| `head_dim_override` | `int` | `0` | `0` → `head_dim` is `dim // n_heads`; a positive value decouples the attention width, so `n_heads * head_dim` need not equal `dim` |
 | `vocab_size` | `int` | `32000` | embedding table size |
 | `ffn_dim_multiplier` | `float` | `1.0` | scales Llama-style `4·dim·(2/3)` hidden width |
 | `ffn_hidden_dim` | `int \| None` | `None` | hard-override the computed FFN width |
@@ -245,7 +246,7 @@ DCP-based checkpointing.
 | `keep_last_n` | `int` | `3` | retain the most recent N checkpoints (`<= 0` keeps all); steps saved by `dyn_ckpt_window` are always kept |
 | `load_path` | `str \| None` | `None` | explicit resume path (overrides `latest` symlink) |
 | `export_dtype` | `"float32" \| "bfloat16"` | `"bfloat16"` | dtype for HF exports via `scripts/convert_checkpoint.py` |
-| `exclude_from_loading` | `list[str]` | `[]` | FQN prefixes to skip on load (e.g. to reinit a head) |
+| `exclude_from_loading` | `list[str]` | `[]` | state keys to skip when warm-starting from `load_path` — `"model"` and/or `"optimizer"`; ignored on a resume, which always restores full state |
 
 ### `[checkpoint.dyn_ckpt_window]` — `DynamicCheckpointWindow`
 

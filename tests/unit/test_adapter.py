@@ -515,3 +515,101 @@ class TestBuildAdapterPooling:
         adapter = build_adapter(cfg, in_dim=32, out_dim=16)
         assert isinstance(adapter, AttentionalPoolAdapter)
         assert adapter.pool_heads == 8
+
+
+# ---------------------------------------------------------------------------
+# mlp_2layer pre_norm
+# ---------------------------------------------------------------------------
+
+
+class TestMLP2LayerPreNorm:
+    def test_default_builds_no_norm(self):
+        adapter = MLP2LayerAdapter(in_dim=32, out_dim=16)
+        assert adapter.ln_q is None
+        assert not [k for k in adapter.state_dict() if "ln_q" in k]
+
+    @pytest.mark.parametrize("empty", ["", None])
+    def test_empty_pre_norm_is_the_default_path(self, empty):
+        adapter = MLP2LayerAdapter(in_dim=32, out_dim=16, pre_norm=empty)
+        assert adapter.ln_q is None
+
+    def test_rmsnorm_pre_norm_is_built_over_the_input_dim(self):
+        from kempnerforge.model.norm import RMSNorm
+
+        adapter = MLP2LayerAdapter(in_dim=32, out_dim=16, pre_norm="rmsnorm")
+        assert isinstance(adapter.ln_q, RMSNorm)
+        assert adapter.ln_q.weight.shape == (32,)  # in_dim, not out_dim
+
+    def test_layernorm_pre_norm_is_built(self):
+        adapter = MLP2LayerAdapter(in_dim=32, out_dim=16, pre_norm="layernorm")
+        assert isinstance(adapter.ln_q, torch.nn.LayerNorm)
+        assert adapter.ln_q.normalized_shape == (32,)
+
+    def test_forward_applies_the_norm_before_the_first_projection(self):
+        adapter = MLP2LayerAdapter(in_dim=32, out_dim=16, pre_norm="rmsnorm").to(DEVICE)
+        x = torch.randn(2, 4, 32, device=DEVICE)
+        expected = adapter.proj2(adapter.act(adapter.proj1(adapter.ln_q(x))))
+        assert torch.equal(adapter(x), expected)
+
+    def test_the_norm_actually_changes_the_output(self):
+        """Guards against an ln_q that is built but never called."""
+        torch.manual_seed(0)
+        with_norm = MLP2LayerAdapter(in_dim=32, out_dim=16, pre_norm="rmsnorm").to(DEVICE)
+        x = torch.randn(2, 4, 32, device=DEVICE) * 10.0  # far off unit scale
+        bare = with_norm.proj2(with_norm.act(with_norm.proj1(x)))
+        assert not torch.allclose(with_norm(x), bare)
+
+    def test_reset_parameters_reinitializes_the_norm_after_meta_build(self):
+        """The meta-device build path calls to_empty() then reset_parameters();
+        init_weights skips 1-D params, so the norm's own re-init is what keeps
+        ln_q from holding uninitialized memory."""
+        with torch.device("meta"):
+            adapter = MLP2LayerAdapter(in_dim=32, out_dim=16, pre_norm="layernorm")
+        adapter.to_empty(device=torch.device("cpu"))
+        with torch.no_grad():
+            adapter.ln_q.weight.fill_(float("nan"))
+            adapter.ln_q.bias.fill_(float("nan"))
+        adapter.reset_parameters()
+        assert torch.equal(adapter.ln_q.weight, torch.ones(32))
+        assert torch.equal(adapter.ln_q.bias, torch.zeros(32))
+
+    def test_default_build_is_rng_identical_to_no_pre_norm_argument(self):
+        """`pre_norm` must not perturb the RNG stream when off, or the whole
+        model's init would shift for existing configs."""
+        torch.manual_seed(7)
+        without = MLP2LayerAdapter(in_dim=32, out_dim=16)
+        torch.manual_seed(7)
+        with_empty = MLP2LayerAdapter(in_dim=32, out_dim=16, pre_norm="")
+        assert torch.equal(without.proj1.weight, with_empty.proj1.weight)
+        assert torch.equal(without.proj2.weight, with_empty.proj2.weight)
+
+
+class TestAdapterConfigPreNorm:
+    def test_default_is_off_and_maps_to_none(self):
+        cfg = AdapterConfig()
+        assert cfg.pre_norm == ""
+        assert cfg.extra_kwargs()["pre_norm"] is None
+
+    @pytest.mark.parametrize("norm", ["rmsnorm", "layernorm"])
+    def test_registered_norms_are_accepted_and_forwarded(self, norm):
+        cfg = AdapterConfig(pre_norm=norm)
+        assert cfg.extra_kwargs()["pre_norm"] == norm
+        adapter = build_adapter(cfg, in_dim=32, out_dim=16)
+        assert isinstance(adapter, MLP2LayerAdapter)
+        assert adapter.ln_q is not None
+
+    def test_unknown_pre_norm_is_rejected_at_config_time(self):
+        with pytest.raises(ValueError, match="Unknown adapter.pre_norm"):
+            AdapterConfig(pre_norm="nope")
+
+    def test_the_error_names_the_registered_options(self):
+        with pytest.raises(ValueError, match="rmsnorm"):
+            AdapterConfig(pre_norm="nope")
+
+    def test_pre_norm_is_ignored_by_the_other_adapter_types(self):
+        """Non-mlp_2layer builders swallow it via **_, so a shared [adapter]
+        section carrying pre_norm must not break them."""
+        for adapter_type in ("linear", "avgpool", "attentional_pool"):
+            cfg = AdapterConfig(type=adapter_type, pre_norm="rmsnorm", pool_heads=8)
+            adapter = build_adapter(cfg, in_dim=32, out_dim=16)
+            assert not isinstance(adapter, MLP2LayerAdapter)

@@ -1289,3 +1289,93 @@ class TestEvalConfig:
         config = JobConfig()
         config.eval = EvalConfig(enabled=False)
         config.validate()  # Should not raise even without data source
+
+
+# ---------------------------------------------------------------------------
+# ModelConfig head geometry -- inferred by default, decoupled by override
+# ---------------------------------------------------------------------------
+
+
+class TestModelConfigHeadDim:
+    """``head_dim_override`` decouples head width; ``head_dim`` stays derived."""
+
+    def test_override_is_a_field_and_head_dim_stays_derived(self):
+        import dataclasses
+
+        names = {f.name for f in dataclasses.fields(ModelConfig)}
+        assert "head_dim_override" in names  # settable from TOML
+        assert "head_dim" not in names  # derived, never stored
+        assert isinstance(ModelConfig.head_dim, property)
+
+    def test_default_infers_dim_over_n_heads(self):
+        cfg = ModelConfig(dim=64, n_layers=2, n_heads=8, vocab_size=32)
+        assert cfg.head_dim == 8
+        assert cfg.n_heads * cfg.head_dim == cfg.dim
+
+    def test_override_decouples_head_width_from_dim(self):
+        cfg = ModelConfig(dim=1024, n_layers=2, n_heads=16, head_dim_override=128, vocab_size=32)
+        assert cfg.head_dim == 128
+        assert cfg.n_heads * cfg.head_dim == 2048 != cfg.dim
+
+    def test_override_equal_to_the_inferred_value_is_a_no_op(self):
+        inferred = ModelConfig(dim=64, n_layers=2, n_heads=8, vocab_size=32)
+        explicit = ModelConfig(dim=64, n_layers=2, n_heads=8, head_dim_override=8, vocab_size=32)
+        assert inferred.head_dim == explicit.head_dim == 8
+
+    def test_head_dim_follows_a_later_dim_or_n_heads_change(self):
+        """The derived value must not go stale. A stored+mutated head_dim would
+        survive a TOML/CLI overlay onto a default config and silently change
+        the architecture (see test_toml_overlay_does_not_leave_a_stale_head_dim)."""
+        cfg = ModelConfig(dim=64, n_layers=2, n_heads=8, vocab_size=32)
+        assert cfg.head_dim == 8
+        cfg.dim, cfg.n_heads = 1024, 16
+        assert cfg.head_dim == 64
+
+    def test_indivisible_dim_is_rejected_only_without_an_override(self):
+        with pytest.raises(ValueError, match="divisible by n_heads"):
+            ModelConfig(dim=100, n_layers=2, n_heads=8, vocab_size=32)
+        # An explicit override lifts the requirement, which is the point.
+        cfg = ModelConfig(dim=100, n_layers=2, n_heads=8, head_dim_override=16, vocab_size=32)
+        assert cfg.head_dim == 16
+
+    def test_negative_override_is_rejected_at_config_time(self):
+        with pytest.raises(ValueError, match="head_dim_override must be non-negative"):
+            ModelConfig(dim=64, n_layers=2, n_heads=8, head_dim_override=-1, vocab_size=32)
+
+    @pytest.mark.parametrize("override", [0, 8, 128])
+    def test_round_trip_through_asdict_is_stable(self, override):
+        import dataclasses
+
+        cfg = ModelConfig(dim=64, n_layers=2, n_heads=8, head_dim_override=override, vocab_size=32)
+        again = ModelConfig(**dataclasses.asdict(cfg))
+        assert again.head_dim == cfg.head_dim
+
+    def test_num_params_estimate_tracks_the_decoupled_head_dim(self):
+        base = dict(dim=1024, n_layers=2, n_heads=16, vocab_size=256, max_seq_len=64)
+        coupled = ModelConfig(**base)  # head_dim 64
+        wide = ModelConfig(**base, head_dim_override=128)
+        assert wide.num_params_estimate > coupled.num_params_estimate
+
+    def test_override_is_settable_from_toml(self, tmp_path):
+        path = tmp_path / "c.toml"
+        path.write_text(
+            "[model]\ndim = 1024\nn_layers = 2\nn_heads = 16\nn_kv_heads = 16\n"
+            "head_dim_override = 128\nvocab_size = 256\n"
+        )
+        assert load_config(str(path), cli_args=[]).model.head_dim == 128
+
+    def test_toml_overlay_does_not_leave_a_stale_head_dim(self, tmp_path):
+        """A TOML that sets dim/n_heads but no override must get dim // n_heads.
+
+        load_config overlays the TOML onto an already-constructed default
+        ModelConfig, carrying every unspecified field forward. A head_dim
+        resolved in __post_init__ and stored would be carried forward from the
+        4096/32 default and silently override the real geometry.
+        """
+        path = tmp_path / "c.toml"
+        path.write_text(
+            "[model]\ndim = 256\nn_layers = 2\nn_heads = 4\nn_kv_heads = 4\nvocab_size = 256\n"
+        )
+        model = load_config(str(path), cli_args=[]).model
+        assert model.head_dim_override == 0
+        assert model.head_dim == 64  # 256 // 4, not the 4096 // 32 default
