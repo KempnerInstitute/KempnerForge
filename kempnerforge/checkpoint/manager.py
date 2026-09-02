@@ -613,7 +613,11 @@ class CheckpointManager:
         ``dcp.load`` with "metadata is None". An explicitly requested
         path is honored as-is (caller intent; fail loudly if broken).
         """
-        explicit = path is not None or bool(self.config.load_path)
+        # "Explicit" means the *user* named a checkpoint, not merely that a path
+        # argument was passed: auto-resume passes the path it resolved, so
+        # testing `path is not None` marked every production call explicit and
+        # left the fallback below unreachable.
+        explicit = bool(self.config.load_path)
         if explicit or self._dcp_complete(resolved):
             return resolved
         fallback = self._newest_complete_checkpoint()
