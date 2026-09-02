@@ -726,3 +726,54 @@ class TestFramePaddingMask:
         with torch.no_grad():
             logits, _ = w(pix, ids, frame_mask=fm)
         assert torch.isfinite(logits).all(), f"{arch}: NaN/inf with an all-padded clip"
+
+
+# ---------------------------------------------------------------------------
+# The config-driven knobs through a real build_vlm_wrapper
+# ---------------------------------------------------------------------------
+
+
+class TestVLMConfigDrivenKnobs:
+    """``model.head_dim_override`` and ``adapter.pre_norm`` are only useful if
+    they survive the build path the trainer actually uses."""
+
+    @staticmethod
+    def _wrapper(*, head_dim_override: int = 0, pre_norm: str = "") -> VLMWrapper:
+        return build_vlm_wrapper(
+            ModelConfig(
+                dim=64,
+                n_layers=2,
+                n_heads=4,
+                n_kv_heads=4,
+                head_dim_override=head_dim_override,
+                vocab_size=256,
+                max_seq_len=64,
+            ),
+            VisionEncoderConfig(type="random", feature_dim=96, num_tokens=8),
+            AdapterConfig(pre_norm=pre_norm),
+            VLMConfig(max_text_len=32),
+        )
+
+    def test_decoupled_head_dim_reaches_the_inner_transformer(self):
+        w = self._wrapper(head_dim_override=32)  # 4 * 32 = 128 != dim 64
+        sd = w.state_dict()
+        assert sd["transformer.layers.0.attention.q_proj.weight"].shape == (128, 64)
+        assert sd["transformer.layers.0.attention.o_proj.weight"].shape == (64, 128)
+
+    def test_adapter_pre_norm_appears_in_the_wrapper_state_dict(self):
+        assert [k for k in self._wrapper(pre_norm="rmsnorm").state_dict() if "ln_q" in k] == [
+            "adapter.ln_q.weight"
+        ]
+        assert not [k for k in self._wrapper().state_dict() if "ln_q" in k]
+
+    def test_both_knobs_train_end_to_end(self):
+        torch.manual_seed(0)
+        w = self._wrapper(head_dim_override=32, pre_norm="rmsnorm").to(DEVICE)
+        pix = torch.randn(2, 3, 16, 16, device=DEVICE)
+        ids = torch.randint(0, 256, (2, 16), device=DEVICE)
+        logits, labels = w(pix, ids, ids.clone())
+        assert logits.shape == (2, 16, 256)
+        assert labels.shape == (2, 16)
+        logits.sum().backward()
+        grad = w.adapter.ln_q.weight.grad
+        assert grad is not None and torch.isfinite(grad).all() and (grad != 0).any()
