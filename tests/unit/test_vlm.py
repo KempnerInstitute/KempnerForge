@@ -777,3 +777,62 @@ class TestVLMConfigDrivenKnobs:
         logits.sum().backward()
         grad = w.adapter.ln_q.weight.grad
         assert grad is not None and torch.isfinite(grad).all() and (grad != 0).any()
+
+    @pytest.mark.parametrize("arch", ["joint_decoder", "cross_attention", "mot", "moma"])
+    def test_every_attention_module_honors_the_decoupled_head_dim(self, arch):
+        """The sweep that matters: an attention that still computed
+        ``dim // n_heads`` internally would be silently wrong, not rejected.
+        Cross-attention keeps its own head count's width unless the override is
+        set, which it is here.
+        """
+        from kempnerforge.model.attention import Attention
+        from kempnerforge.model.cross_attention import CrossAttention
+        from kempnerforge.model.mot import MoTAttention
+
+        vlm_cfgs = {
+            "joint_decoder": JointDecoderConfig(max_text_len=32),
+            "cross_attention": CrossAttentionConfig(
+                max_text_len=32, cross_attention_every_n_layers=2
+            ),
+            "mot": MoTConfig(max_text_len=32),
+            "moma": MoMaConfig(max_text_len=32),
+        }
+        model_cfg = ModelConfig(
+            dim=64,
+            n_layers=2,
+            n_heads=4,
+            n_kv_heads=4,
+            head_dim_override=32,  # 4 * 32 = 128 != dim 64
+            ffn_hidden_dim=128,
+            vocab_size=256,
+            max_seq_len=64,
+        )
+        w = build_vlm_wrapper(
+            model_cfg,
+            VisionEncoderConfig(type="random", feature_dim=96, num_tokens=8),
+            AdapterConfig(),
+            vlm_cfgs[arch],
+        )
+        found = [
+            (n, m.head_dim)
+            for n, m in w.named_modules()
+            if isinstance(m, (Attention, MoTAttention, CrossAttention))
+        ]
+        assert found, f"{arch}: no attention modules found"
+        assert all(hd == 32 for _, hd in found), found
+
+    def test_rope_and_flops_read_the_same_head_dim(self):
+        """RoPE table width and the FLOP model both derive from
+        config.head_dim, so both must track the override."""
+        from kempnerforge.metrics.mfu import estimate_model_flops_per_token
+        from kempnerforge.model.position import precompute_rope_frequencies
+
+        cfg = ModelConfig(
+            dim=64, n_layers=2, n_heads=4, n_kv_heads=4, head_dim_override=32, vocab_size=256
+        )
+        cos, _ = precompute_rope_frequencies(cfg.head_dim, cfg.max_seq_len)
+        assert cos.shape[-1] == 32 // 2
+        wider = ModelConfig(
+            dim=64, n_layers=2, n_heads=4, n_kv_heads=4, head_dim_override=64, vocab_size=256
+        )
+        assert estimate_model_flops_per_token(wider, 64) > estimate_model_flops_per_token(cfg, 64)
