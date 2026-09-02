@@ -242,21 +242,26 @@ class TestNextTokenLabelContract:
             ("xyz", "aaaaaaaaaaaa", 8),  # prompt longer than max_text_len
         ],
     )
-    def test_matches_derived_contract(self, text, prompt, max_text_len):
+    @pytest.mark.parametrize("with_eos", [True, False])
+    def test_matches_derived_contract(self, text, prompt, max_text_len, with_eos):
         tok = _MockTokenizer()
+        if not with_eos:
+            tok.eos_token_id = None
         ids, labels = _tokenize_and_mask(tok, text, max_text_len, prompt)
 
         # --- input_ids properties (stated, not copied from the implementation)
         real = list(tok(text)["input_ids"])
         prompt_ids = list(tok(prompt)["input_ids"]) if prompt is not None else []
-        budget = max_text_len - 1  # one slot reserved for the appended EOS
+        # With an EOS one slot is reserved for it; without, the full budget is text.
+        budget = max_text_len - 1 if with_eos else max_text_len
         kept = (prompt_ids + real)[:budget]
-        n = len(kept) + 1
+        n = len(kept) + (1 if with_eos else 0)
         assert ids.shape == (max_text_len,)
         assert ids[: len(kept)].tolist() == kept
-        # EOS always lands in input_ids: truncation reserves its slot, so it can
-        # never be the token that falls off the end.
-        assert ids[len(kept)].item() == tok.eos_token_id
+        if with_eos:
+            # EOS always lands in input_ids: truncation reserves its slot, so it
+            # can never be the token that falls off the end.
+            assert ids[len(kept)].item() == tok.eos_token_id
         assert (ids[n:] == 0).all()  # pad
 
         # --- labels match the derived contract exactly
