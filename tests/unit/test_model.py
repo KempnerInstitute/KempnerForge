@@ -1036,3 +1036,151 @@ class TestInitWeights:
             model = Transformer(_INIT_CONFIG)
         # Should not raise even though all params are on meta device
         init_weights(model, _INIT_CONFIG)
+
+
+# ---------------------------------------------------------------------------
+# Decoupled head geometry (model.head_dim_override)
+# ---------------------------------------------------------------------------
+
+
+def _decoupled_config(**kw) -> ModelConfig:
+    """dim=64, n_heads=8, head_dim=16 -> a 128-wide attention over a 64-wide
+    residual. n_heads * head_dim (128) != dim (64) on purpose."""
+    base = dict(
+        dim=64,
+        n_layers=2,
+        n_heads=8,
+        n_kv_heads=8,
+        head_dim_override=16,
+        vocab_size=64,
+        max_seq_len=32,
+    )
+    base.update(kw)
+    return ModelConfig(**base)
+
+
+class TestDecoupledHeadDim:
+    def test_attention_projection_widths_follow_head_dim_not_dim(self):
+        cfg = _decoupled_config()
+        attn = Attention(
+            dim=cfg.dim,
+            n_heads=cfg.n_heads,
+            n_kv_heads=cfg.n_kv_heads,
+            head_dim=cfg.head_dim,
+        )
+        assert attn.q_proj.weight.shape == (cfg.n_heads * cfg.head_dim, cfg.dim) == (128, 64)
+        assert attn.k_proj.weight.shape == (cfg.n_kv_heads * cfg.head_dim, cfg.dim)
+        # o_proj is what makes the residual stream still `dim` wide.
+        assert attn.o_proj.weight.shape == (cfg.dim, cfg.n_heads * cfg.head_dim) == (64, 128)
+
+    def test_attention_forward_and_backward_on_a_decoupled_head_dim(self):
+        cfg = _decoupled_config()
+        attn = Attention(
+            dim=cfg.dim,
+            n_heads=cfg.n_heads,
+            n_kv_heads=cfg.n_kv_heads,
+            head_dim=cfg.head_dim,
+        ).to(DEVICE)
+        cos, sin = precompute_rope_frequencies(cfg.head_dim, cfg.max_seq_len)
+        cos, sin = cos.to(DEVICE), sin.to(DEVICE)
+        x = torch.randn(2, 8, cfg.dim, device=DEVICE, requires_grad=True)
+        out = attn(x, cos[:8], sin[:8])
+        # The residual width is preserved even though attention is 2x wider.
+        assert out.shape == (2, 8, cfg.dim)
+        out.sum().backward()
+        assert x.grad is not None and torch.isfinite(x.grad).all()
+
+    def test_rope_table_is_sized_by_head_dim(self):
+        cfg = _decoupled_config()
+        model = Transformer(cfg)
+        # head_dim // 2, not (dim // n_heads) // 2 == 4.
+        assert model._rope_cos.shape == (cfg.max_seq_len, cfg.head_dim // 2) == (32, 8)
+
+    def test_qk_norm_is_sized_by_head_dim(self):
+        cfg = _decoupled_config(qk_norm=True)
+        model = Transformer(cfg)
+        attn = model.layers["0"].attention
+        assert attn.q_norm.weight.shape == (cfg.head_dim,) == (16,)
+        assert attn.k_norm.weight.shape == (cfg.head_dim,)
+
+    def test_full_transformer_forward_and_backward(self):
+        cfg = _decoupled_config()
+        model = Transformer(cfg).to(DEVICE)
+        tokens = torch.randint(0, cfg.vocab_size, (2, 8), device=DEVICE)
+        logits = model(tokens)
+        assert logits.shape == (2, 8, cfg.vocab_size)
+        logits.sum().backward()
+        grads = [p.grad for p in model.parameters() if p.grad is not None]
+        assert grads and all(torch.isfinite(g).all() for g in grads)
+
+    def test_kv_cache_is_sized_by_head_dim(self):
+        from kempnerforge.model.attention import KVCache
+
+        cfg = _decoupled_config()
+        cache = KVCache(
+            batch_size=1,
+            max_seq_len=cfg.max_seq_len,
+            n_kv_heads=cfg.n_kv_heads,
+            head_dim=cfg.head_dim,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+        )
+        assert cache.k.shape == (1, cfg.n_kv_heads, cfg.max_seq_len, cfg.head_dim)
+
+    def test_generation_runs_with_a_decoupled_head_dim(self):
+        """generate() sizes its own KV caches from config.head_dim; a stale
+        dim // n_heads there would be a shape mismatch at prefill."""
+        from kempnerforge.model.generate import generate
+
+        cfg = _decoupled_config()
+        model = Transformer(cfg).to(DEVICE).eval()
+        prompt = torch.randint(0, cfg.vocab_size, (1, 4), device=DEVICE)
+        out = generate(model, prompt, max_new_tokens=3, temperature=0.0)
+        assert out.shape == (1, 7)
+
+    def test_flops_model_tracks_head_dim(self):
+        from kempnerforge.metrics.mfu import estimate_model_flops_per_token
+
+        coupled = _decoupled_config(head_dim_override=8)  # == dim // n_heads
+        wide = _decoupled_config(head_dim_override=16)
+        wide_flops = estimate_model_flops_per_token(wide, 32)
+        assert wide_flops > estimate_model_flops_per_token(coupled, 32)
+
+    def test_state_dict_is_free_of_dim_shaped_attention_weights(self):
+        """Guards against a reshape or projection that assumed
+        n_heads * head_dim == dim."""
+        cfg = _decoupled_config()
+        sd = Transformer(cfg).state_dict()
+        assert sd["layers.0.attention.q_proj.weight"].shape == (128, 64)
+        assert sd["layers.0.attention.o_proj.weight"].shape == (64, 128)
+
+
+class TestHeadDimDefaultsUnchanged:
+    """The override left at 0 must reproduce today's model exactly."""
+
+    _BASE = dict(dim=64, n_layers=2, n_heads=8, n_kv_heads=8, vocab_size=64, max_seq_len=32)
+
+    def test_zero_override_matches_an_explicit_derived_override(self):
+        torch.manual_seed(0)
+        a = Transformer(ModelConfig(**self._BASE))
+        torch.manual_seed(0)
+        b = Transformer(ModelConfig(**self._BASE, head_dim_override=8))
+        sd_a, sd_b = a.state_dict(), b.state_dict()
+        assert sd_a.keys() == sd_b.keys()
+        for k in sd_a:
+            assert torch.equal(sd_a[k], sd_b[k]), k
+
+    def test_logits_are_bit_identical_at_a_fixed_seed(self):
+        """The same-seed build/forward must be reproducible; the numbers here
+        are the reference clean-main behavior for a coupled config."""
+        cfg = ModelConfig(**self._BASE)
+        torch.manual_seed(1234)
+        model = Transformer(cfg).eval()
+        tokens = torch.arange(8).view(1, 8) % cfg.vocab_size
+        with torch.no_grad():
+            first = model(tokens)
+        torch.manual_seed(1234)
+        again = Transformer(cfg).eval()
+        with torch.no_grad():
+            second = again(tokens)
+        assert torch.equal(first, second)

@@ -73,6 +73,11 @@ Four `nn.Linear(..., bias=False)` projections:
 | `v_proj` | `dim → n_kv_heads * head_dim` |
 | `o_proj` | `n_heads * head_dim → dim` |
 
+`head_dim` is derived as `dim // n_heads`. Setting
+`model.head_dim_override` decouples the attention width from the residual
+width, so `n_heads * head_dim` need not equal `dim`; `o_proj` projects back
+to `dim`.
+
 GQA is configured by the ratio `n_heads / n_kv_heads`:
 
 - `n_kv_heads == n_heads` → multi-head attention (MHA)

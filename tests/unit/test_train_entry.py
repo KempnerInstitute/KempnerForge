@@ -1196,6 +1196,58 @@ class TestRestoreCheckpoint:
         # step 9 is past start_step 5, so the stage must have been applied
         assert applied and applied[0][0].module == "vision_encoder"
 
+    # -- warm-start exclude vs resume: the asymmetry ------------------------
+
+    def test_warm_start_from_load_path_honors_exclude_from_loading(self, monkeypatch):
+        """A converted, weights-only checkpoint has no optimizer/train_state,
+        so a warm start must be able to skip the optimizer."""
+        import kempnerforge.training.entry as entry
+
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d: None)
+        config = make_config()
+        config.checkpoint.load_path = "/somewhere/converted"
+        config.checkpoint.exclude_from_loading = ["optimizer"]
+        mgr = FakeResumeManager(step=0, tokens=0)
+        entry.restore_checkpoint(config, TinyTextModel(), None, mgr)
+        assert mgr.load_kwargs["exclude_keys"] == ["optimizer"]
+
+    def test_resume_ignores_exclude_from_loading(self, monkeypatch, tmp_path):
+        """The other direction, and the one that matters: honoring it on a real
+        resume would silently drop optimizer moments mid-run."""
+        import kempnerforge.training.entry as entry
+
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d: tmp_path / "step_7")
+        config = make_config()
+        config.checkpoint.exclude_from_loading = ["optimizer"]
+        mgr = FakeResumeManager(step=7, tokens=999)
+        entry.restore_checkpoint(config, TinyTextModel(), None, mgr)
+        assert mgr.load_kwargs["exclude_keys"] is None
+
+    def test_resume_ignores_exclude_even_when_load_path_is_also_set(self, monkeypatch, tmp_path):
+        """An auto-resumable run keeps a stale load_path in its config; the
+        resolved resume path is what decides, not load_path's presence."""
+        import kempnerforge.training.entry as entry
+
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d: tmp_path / "step_7")
+        config = make_config()
+        config.checkpoint.load_path = "/somewhere/converted"
+        config.checkpoint.exclude_from_loading = ["model", "optimizer"]
+        mgr = FakeResumeManager(step=7, tokens=999)
+        entry.restore_checkpoint(config, TinyTextModel(), None, mgr)
+        assert mgr.load_kwargs["exclude_keys"] is None
+
+    def test_empty_exclude_list_passes_none_not_an_empty_list(self, monkeypatch):
+        """CheckpointManager.load branches on `exclude_keys is None`; an empty
+        list would take the same branch, but None keeps the intent explicit."""
+        import kempnerforge.training.entry as entry
+
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d: None)
+        config = make_config()
+        config.checkpoint.load_path = "/somewhere/converted"
+        mgr = FakeResumeManager(step=0, tokens=0)
+        entry.restore_checkpoint(config, TinyTextModel(), None, mgr)
+        assert mgr.load_kwargs["exclude_keys"] is None
+
     def test_mot_warm_start_fires_only_at_step_zero(self, monkeypatch, tmp_path):
         import kempnerforge.training.entry as entry
         from kempnerforge.config.adapter import AdapterConfig
