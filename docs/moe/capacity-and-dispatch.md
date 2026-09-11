@@ -116,8 +116,8 @@ Activation memory and compute scale with `total_tokens = num_tokens × top_k`,
 whatever the routing looks like — a hot expert costs no more than a balanced
 one. The counts stay on the device; the dispatch never syncs with the host.
 
-On CPU `_grouped_mm` loops over the groups with plain matmuls. That path is
-for tests and debugging only.
+The same call runs on CPU through torch's reference kernel, so the unit
+tests exercise this exact dispatch.
 
 ### Path B: sequential loop (fp32)
 

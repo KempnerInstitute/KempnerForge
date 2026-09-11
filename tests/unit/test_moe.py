@@ -698,6 +698,24 @@ class TestGroupedGEMM:
         assert out.shape == (0, 32)
         assert not out.requires_grad
 
+    def test_packed_no_tokens_returns_empty(self):
+        """The packed variant short-circuits the same way when nothing was routed."""
+        from kempnerforge.model.moe import _HAS_GROUPED_MM, grouped_expert_forward_packed
+
+        if not _HAS_GROUPED_MM:
+            pytest.skip("torch._grouped_mm not available")
+
+        up_w, down_w = torch.randn(3, 32, 64), torch.randn(3, 64, 32)
+        out = grouped_expert_forward_packed(
+            torch.zeros(0, 32),
+            torch.zeros(3, dtype=torch.long),
+            up_w,
+            down_w,
+            None,
+            torch.nn.functional.gelu,
+        )
+        assert out.shape == (0, 32)
+
 
 class TestScaleByExpertLoad:
     """The vectorised per-expert rescale matches the per-expert loop it replaced."""
@@ -730,6 +748,30 @@ class TestScaleByExpertLoad:
 
         out = scale_by_expert_load(torch.zeros(0, 8), torch.zeros(4, dtype=torch.long), 4)
         assert out.shape == (0, 8)
+
+
+class TestGroupedPathBf16:
+    """bf16 inputs take the grouped path inside ``MoEMLP``; it must agree with the loop."""
+
+    def test_gradient_scale_matches_sequential(self, monkeypatch):
+        import kempnerforge.model.moe as moe_mod
+
+        if not moe_mod._HAS_GROUPED_MM:
+            pytest.skip("torch._grouped_mm not available")
+
+        torch.manual_seed(0)
+        moe = build_moe(dim=64, hidden_dim=128, num_experts=4, top_k=2, gradient_scale=True)
+        moe = moe.to(torch.bfloat16).train()
+        x = torch.randn(2, 16, 64, dtype=torch.bfloat16)
+
+        grouped = moe(x)
+        grouped.float().pow(2).mean().backward()
+        for name, p in moe.named_parameters():
+            assert p.grad is not None, name
+
+        monkeypatch.setattr(moe_mod, "_HAS_GROUPED_MM", False)
+        sequential = moe(x)
+        torch.testing.assert_close(grouped, sequential, atol=2e-2, rtol=2e-2)
 
 
 class TestCapacityFactor:
@@ -1212,6 +1254,20 @@ class TestPackedExperts:
         moe_packed.eval()
         moe_unpacked.eval()
         return moe_packed, moe_unpacked
+
+    def test_grouped_packed_matches_unpacked_bf16(self):
+        """In bf16 both layouts take the grouped path inside MoEMLP and must be identical."""
+        from kempnerforge.model.moe import _HAS_GROUPED_MM
+
+        if not _HAS_GROUPED_MM:
+            pytest.skip("torch._grouped_mm not available")
+
+        torch.manual_seed(42)
+        moe_packed, moe_unpacked = self._build_matched_pair("silu")
+        moe_packed.to(torch.bfloat16)
+        moe_unpacked.to(torch.bfloat16)
+        x = torch.randn(2, 16, 64, dtype=torch.bfloat16)
+        assert torch.equal(moe_packed(x), moe_unpacked(x))
 
     def test_sequential_packed_matches_unpacked_swiglu(self):
         """Packed MoE and unpacked MoE with identical weights produce identical output."""

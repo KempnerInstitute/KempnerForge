@@ -27,19 +27,15 @@ def _grouped_mm(x: torch.Tensor, weight: torch.Tensor, offs: torch.Tensor) -> to
     """``(M, K) @ (E, K, N) -> (M, N)`` with the rows of ``x`` grouped by ``offs``.
 
     ``offs`` is the int32 inclusive prefix sum of the per-group row counts: group ``i``
-    is ``x[offs[i-1]:offs[i]] @ weight[i]``. Empty groups are allowed. On CUDA this is
-    one ragged ``torch._grouped_mm`` call. The CPU path is for tests and debugging and
-    loops over the groups.
+    is ``x[offs[i-1]:offs[i]] @ weight[i]``. Empty groups are allowed. One ragged
+    ``torch._grouped_mm`` call on any device.
     """
-    if x.is_cuda:
-        out = torch._grouped_mm(x, weight, offs=offs)
-        if out.requires_grad and not torch.compiler.is_compiling():
-            # The kernel's backward rejects expanded (stride-0) gradients, e.g. from
-            # ``out.sum().backward()``; materialise them before they reach it.
-            out.register_hook(_contiguous_grad)
-        return out
-    counts = torch.diff(offs, prepend=offs.new_zeros(1)).tolist()
-    return torch.cat([xi @ weight[i] for i, xi in enumerate(x.split(counts))])
+    out = torch._grouped_mm(x, weight, offs=offs)
+    if out.requires_grad and not torch.compiler.is_compiling():
+        # The kernel's backward rejects expanded (stride-0) gradients, e.g. from
+        # ``out.sum().backward()``; materialise them before they reach it.
+        out.register_hook(_contiguous_grad)
+    return out
 
 
 def _group_offsets(
