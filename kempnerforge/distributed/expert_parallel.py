@@ -183,7 +183,7 @@ def ep_dispatch_and_compute(
 
         # Map global expert IDs to local indices for bincount.
         local_ids = sorted_ids - local_expert_start
-        tokens_per_expert = torch.bincount(local_ids, minlength=num_local_experts).tolist()
+        tokens_per_expert = torch.bincount(local_ids, minlength=num_local_experts)
 
         if moe.packed_experts:
             local_output_sorted = grouped_expert_forward_packed(
@@ -205,25 +205,17 @@ def ep_dispatch_and_compute(
         unsort_by_expert = torch.argsort(sort_by_expert)
         local_output = local_output_sorted[unsort_by_expert]
 
-        if moe.packed_experts:
-            # grouped_mm over the full packed tensor touches every expert row →
-            # AccumulateGrad on up_w/down_w/gate_w always fires when there is
-            # at least one token. If zero tokens arrived locally, grouped_mm
-            # short-circuits; add an explicit zero contribution to keep the
-            # packed params in the autograd graph for FSDP2.
-            if sum(tokens_per_expert) == 0:
-                _zero = moe.up_w.sum() * 0 + moe.down_w.sum() * 0
-                if moe._is_swiglu:
-                    _zero = _zero + moe.gate_w.sum() * 0
-                local_output = local_output + _zero
-        else:
-            # Unpacked: grouped_expert_forward stacks per-expert Linear weights
-            # into a temporary — experts with zero tokens never appear in the
-            # graph. Force AccumulateGrad to fire on each unused expert.
-            for i in range(num_local_experts):
-                if tokens_per_expert[i] == 0:
-                    for p in moe.experts[i].parameters():
-                        local_output = local_output + p.sum() * 0
+        if sorted_recv.shape[0] == 0:
+            # No token reached this rank, so the grouped GEMM short-circuited and the
+            # local expert params are not in the graph. Add a zero contribution so their
+            # AccumulateGrad hooks fire and FSDP2's reduce-scatter completes. (With any
+            # token present every expert's weight enters the GEMM, empty groups included.)
+            params = (
+                [moe.up_w, moe.down_w] + ([moe.gate_w] if moe._is_swiglu else [])
+                if moe.packed_experts
+                else list(moe.experts.parameters())
+            )
+            local_output = local_output + sum(p.sum() for p in params) * 0
     else:
         local_output = torch.zeros_like(received_tokens)
         if moe.packed_experts:
@@ -267,13 +259,10 @@ def ep_dispatch_and_compute(
             local_ids = received_expert_ids - local_expert_start
             tpe = torch.bincount(local_ids, minlength=num_local_experts)
             avg_tokens = total_recv / max(num_local_experts, 1)
-            for i in range(num_local_experts):
-                global_id = local_expert_start + i
-                mask = received_expert_ids == global_id
-                count = tpe[i].item()
-                if count > 0:
-                    scale = avg_tokens / count
-                    local_output[mask] = local_output[mask] * scale
+            scale = (avg_tokens / tpe.clamp(min=1).double()).float()
+            local_output = (local_output.float() * scale[local_ids].unsqueeze(-1)).to(
+                local_output.dtype
+            )
 
     # Keep dispatch all-to-all in the autograd graph. When all local experts
     # are unused, local_output has no gradient path to received_tokens, so
