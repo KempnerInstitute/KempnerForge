@@ -99,7 +99,9 @@ class TestRaggedMatchesPadded:
         padded = _padded_reference(x_sorted, counts, experts)
         assert torch.equal(ragged, padded)
         for got, want in zip(
-            _grads(ragged, x, experts, grad_out), _grads(padded, x, experts, grad_out)
+            _grads(ragged, x, experts, grad_out),
+            _grads(padded, x, experts, grad_out),
+            strict=True,
         ):
             assert torch.equal(got, want)
 
