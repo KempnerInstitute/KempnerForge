@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -17,132 +19,109 @@ _HAS_GROUPED_MM = hasattr(torch, "_grouped_mm")
 _GROUPED_MM_DTYPES = {torch.bfloat16, torch.float16}
 
 
+def _contiguous_grad(grad: torch.Tensor) -> torch.Tensor:
+    return grad.contiguous()
+
+
+def _grouped_mm(x: torch.Tensor, weight: torch.Tensor, offs: torch.Tensor) -> torch.Tensor:
+    """``(M, K) @ (E, K, N) -> (M, N)`` with the rows of ``x`` grouped by ``offs``.
+
+    ``offs`` is the int32 inclusive prefix sum of the per-group row counts: group ``i``
+    is ``x[offs[i-1]:offs[i]] @ weight[i]``. Empty groups are allowed. On CUDA this is
+    one ragged ``torch._grouped_mm`` call. The CPU path is for tests and debugging and
+    loops over the groups.
+    """
+    if x.is_cuda:
+        out = torch._grouped_mm(x, weight, offs=offs)
+        if out.requires_grad and not torch.compiler.is_compiling():
+            # The kernel's backward rejects expanded (stride-0) gradients, e.g. from
+            # ``out.sum().backward()``; materialise them before they reach it.
+            out.register_hook(_contiguous_grad)
+        return out
+    counts = torch.diff(offs, prepend=offs.new_zeros(1)).tolist()
+    return torch.cat([xi @ weight[i] for i, xi in enumerate(x.split(counts))])
+
+
+def _group_offsets(
+    x_sorted: torch.Tensor, tokens_per_expert: torch.Tensor | Sequence[int]
+) -> torch.Tensor:
+    counts = torch.as_tensor(tokens_per_expert, dtype=torch.int32, device=x_sorted.device)
+    return torch.cumsum(counts, 0, dtype=torch.int32)
+
+
 def grouped_expert_forward(
     x_sorted: torch.Tensor,
-    tokens_per_expert: list[int],
+    tokens_per_expert: torch.Tensor | Sequence[int],
     experts: nn.ModuleList,
 ) -> torch.Tensor:
-    """Batched expert computation using ``torch._grouped_mm``.
+    """Run every expert on its own token group with ragged grouped GEMMs.
 
-    Replaces the sequential expert loop with 2-3 grouped matrix multiplies
-    (one CUDA kernel each), giving significant speedup when many experts are
-    active.
+    Each expert sees exactly its tokens -- nothing is padded to the busiest expert --
+    so memory and time follow the total number of routed tokens, not the imbalance.
 
     Args:
         x_sorted: (total_tokens, dim) token features sorted by expert index.
-        tokens_per_expert: Number of tokens assigned to each expert, in order.
+        tokens_per_expert: (E,) token count per expert, in expert order.
         experts: Expert modules whose weights are stacked for the grouped GEMM.
 
     Returns:
-        (total_tokens, dim) expert outputs in the same sorted order as input.
+        (total_tokens, dim) expert outputs in the same sorted order as the input.
     """
-    num_experts = len(experts)
-    total_tokens, dim = x_sorted.shape
-    max_tokens = max(tokens_per_expert)
-
-    if max_tokens == 0 or total_tokens == 0:
+    if x_sorted.shape[0] == 0:
         return torch.zeros_like(x_sorted)
-
-    is_swiglu = hasattr(experts[0], "gate_proj")
-
-    # Stack expert weights into (E, in, out) for grouped matmul.
-    # nn.Linear stores weight as (out, in), so transpose to (in, out).
+    offs = _group_offsets(x_sorted, tokens_per_expert)
+    # nn.Linear stores weight as (out, in); the grouped GEMM wants (E, in, out).
     up_w = torch.stack([e.up_proj.weight.t() for e in experts])  # type: ignore[reportCallIssue, reportAttributeAccessIssue]  # (E, dim, H)
     down_w = torch.stack([e.down_proj.weight.t() for e in experts])  # type: ignore[reportCallIssue, reportAttributeAccessIssue]  # (E, H, dim)
-    if is_swiglu:
+    if hasattr(experts[0], "gate_proj"):
         gate_w = torch.stack([e.gate_proj.weight.t() for e in experts])  # type: ignore[reportCallIssue, reportAttributeAccessIssue]  # (E, dim, H)
-
-    # Pad token groups into (E, max_tokens, dim) for uniform batch size.
-    x_padded = x_sorted.new_zeros(num_experts, max_tokens, dim)
-    offset = 0
-    for i, count in enumerate(tokens_per_expert):
-        if count > 0:
-            x_padded[i, :count] = x_sorted[offset : offset + count]
-        offset += count
-
-    # Grouped matmuls — 3 for SwiGLU, 2 for StandardMLP.
-    if is_swiglu:
-        gate = torch._grouped_mm(x_padded, gate_w)  # (E, M, H)
-        up = torch._grouped_mm(x_padded, up_w)  # (E, M, H)
-        hidden = F.silu(gate) * up  # (E, M, H)
+        hidden = F.silu(_grouped_mm(x_sorted, gate_w, offs)) * _grouped_mm(x_sorted, up_w, offs)
     else:
-        hidden = torch._grouped_mm(x_padded, up_w)  # (E, M, H)
         act_fn = experts[0]._activation
-        hidden = act_fn(hidden)  # type: ignore[reportCallIssue]
-
-    out_padded = torch._grouped_mm(hidden, down_w)  # (E, M, dim)
-
-    # Unpad back to flat sorted order.
-    output = torch.zeros_like(x_sorted)
-    offset = 0
-    for i, count in enumerate(tokens_per_expert):
-        if count > 0:
-            output[offset : offset + count] = out_padded[i, :count]
-        offset += count
-
-    return output
+        hidden = act_fn(_grouped_mm(x_sorted, up_w, offs))  # type: ignore[reportCallIssue]
+    return _grouped_mm(hidden, down_w, offs)
 
 
 def grouped_expert_forward_packed(
     x_sorted: torch.Tensor,
-    tokens_per_expert: list[int],
+    tokens_per_expert: torch.Tensor | Sequence[int],
     up_w: torch.Tensor,
     down_w: torch.Tensor,
     gate_w: torch.Tensor | None,
     activation,
 ) -> torch.Tensor:
-    """Batched expert computation over pre-packed weights.
-
-    Same as ``grouped_expert_forward`` but consumes packed weight tensors
-    directly — no per-step ``torch.stack`` over an ``nn.ModuleList``.
+    """Same as ``grouped_expert_forward`` over pre-packed ``(E, in, out)`` weights.
 
     Args:
         x_sorted: (total_tokens, dim) token features sorted by expert index.
-        tokens_per_expert: Number of tokens assigned to each expert, in order.
+        tokens_per_expert: (E,) token count per expert, in expert order.
         up_w: (E, dim, hidden) packed up-projection weights.
         down_w: (E, hidden, dim) packed down-projection weights.
         gate_w: (E, dim, hidden) packed gate weights for SwiGLU, else None.
-        activation: Activation function applied to the up-projection output
-            when ``gate_w`` is None. SwiGLU hardcodes silu.
+        activation: Applied to the up-projection when ``gate_w`` is None.
 
     Returns:
-        (total_tokens, dim) expert outputs in the same sorted order as input.
+        (total_tokens, dim) expert outputs in the same sorted order as the input.
     """
-    num_experts = up_w.shape[0]
-    total_tokens, dim = x_sorted.shape
-    max_tokens = max(tokens_per_expert)
-
-    if max_tokens == 0 or total_tokens == 0:
+    if x_sorted.shape[0] == 0:
         return torch.zeros_like(x_sorted)
-
-    # Pad token groups into (E, max_tokens, dim) for uniform batch size.
-    x_padded = x_sorted.new_zeros(num_experts, max_tokens, dim)
-    offset = 0
-    for i, count in enumerate(tokens_per_expert):
-        if count > 0:
-            x_padded[i, :count] = x_sorted[offset : offset + count]
-        offset += count
-
-    # Grouped matmuls — 3 for SwiGLU, 2 for StandardMLP.
+    offs = _group_offsets(x_sorted, tokens_per_expert)
     if gate_w is not None:
-        gate = torch._grouped_mm(x_padded, gate_w)  # (E, M, H)
-        up = torch._grouped_mm(x_padded, up_w)  # (E, M, H)
-        hidden = F.silu(gate) * up  # (E, M, H)
+        hidden = F.silu(_grouped_mm(x_sorted, gate_w, offs)) * _grouped_mm(x_sorted, up_w, offs)
     else:
-        hidden = torch._grouped_mm(x_padded, up_w)  # (E, M, H)
-        hidden = activation(hidden)
+        hidden = activation(_grouped_mm(x_sorted, up_w, offs))
+    return _grouped_mm(hidden, down_w, offs)
 
-    out_padded = torch._grouped_mm(hidden, down_w)  # (E, M, dim)
 
-    # Unpad back to flat sorted order.
-    output = torch.zeros_like(x_sorted)
-    offset = 0
-    for i, count in enumerate(tokens_per_expert):
-        if count > 0:
-            output[offset : offset + count] = out_padded[i, :count]
-        offset += count
-
-    return output
+def scale_by_expert_load(
+    expert_out: torch.Tensor, tokens_per_expert: torch.Tensor, num_experts: int
+) -> torch.Tensor:
+    """Rescale each expert's rows (sorted by expert) by ``avg_tokens / its token count``."""
+    total = expert_out.shape[0]
+    avg_tokens = total / max(num_experts, 1)
+    scale = (avg_tokens / tokens_per_expert.clamp(min=1).double()).float()
+    rows = scale.repeat_interleave(tokens_per_expert, output_size=total)
+    return (expert_out.float() * rows.unsqueeze(-1)).to(expert_out.dtype)
 
 
 def _apply_capacity(
@@ -285,9 +264,7 @@ class MoEMLP(nn.Module):
             sorted_weights = flat_weights[sort_order]
 
             x_sorted = x_flat[sorted_token_ids]
-            tokens_per_expert = torch.bincount(
-                sorted_expert_ids, minlength=self.num_experts
-            ).tolist()
+            tokens_per_expert = torch.bincount(sorted_expert_ids, minlength=self.num_experts)
 
             if self.packed_experts:
                 expert_out = grouped_expert_forward_packed(
@@ -304,16 +281,7 @@ class MoEMLP(nn.Module):
             # Per-expert gradient scaling: normalize by utilization ratio so
             # high-traffic experts don't dominate learning (DeepSeek-V3 Sec 3.2).
             if self.gradient_scale and self.training:
-                total_assignments = sum(tokens_per_expert)
-                avg_tokens = total_assignments / max(self.num_experts, 1)
-                offset = 0
-                for count in tokens_per_expert:
-                    if count > 0:
-                        scale = avg_tokens / count
-                        expert_out[offset : offset + count] = (
-                            expert_out[offset : offset + count] * scale
-                        )
-                    offset += count
+                expert_out = scale_by_expert_load(expert_out, tokens_per_expert, self.num_experts)
 
             # Weighted scatter-add back to output.
             expert_out = expert_out * sorted_weights.unsqueeze(-1)

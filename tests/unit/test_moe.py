@@ -670,6 +670,67 @@ class TestGroupedGEMM:
         for p in moe.parameters():
             assert p.grad is not None
 
+    def test_grouped_accepts_tensor_counts(self):
+        """Token counts may arrive as a device tensor (no host sync) or a list."""
+        from kempnerforge.model.moe import _HAS_GROUPED_MM, grouped_expert_forward
+
+        if not _HAS_GROUPED_MM:
+            pytest.skip("torch._grouped_mm not available")
+
+        torch.manual_seed(0)
+        experts = torch.nn.ModuleList([SwiGLUMLP(32, 64) for _ in range(4)])
+        counts = [3, 0, 5, 2]
+        x = torch.randn(sum(counts), 32)
+
+        from_list = grouped_expert_forward(x, counts, experts)
+        from_tensor = grouped_expert_forward(x, torch.tensor(counts), experts)
+        assert torch.equal(from_list, from_tensor)
+
+    def test_grouped_no_tokens_returns_empty(self):
+        """With no routed tokens the output is empty and no expert enters the graph."""
+        from kempnerforge.model.moe import _HAS_GROUPED_MM, grouped_expert_forward
+
+        if not _HAS_GROUPED_MM:
+            pytest.skip("torch._grouped_mm not available")
+
+        experts = torch.nn.ModuleList([SwiGLUMLP(32, 64) for _ in range(3)])
+        out = grouped_expert_forward(torch.zeros(0, 32), torch.zeros(3, dtype=torch.long), experts)
+        assert out.shape == (0, 32)
+        assert not out.requires_grad
+
+
+class TestScaleByExpertLoad:
+    """The vectorised per-expert rescale matches the per-expert loop it replaced."""
+
+    @staticmethod
+    def _loop_reference(expert_out, counts, num_experts):
+        out = expert_out.clone()
+        avg = out.shape[0] / max(num_experts, 1)
+        offset = 0
+        for count in counts:
+            if count > 0:
+                out[offset : offset + count] = out[offset : offset + count] * (avg / count)
+            offset += count
+        return out
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    def test_matches_loop(self, dtype):
+        from kempnerforge.model.moe import scale_by_expert_load
+
+        torch.manual_seed(0)
+        counts = [7, 0, 2, 11, 4]
+        x = torch.randn(sum(counts), 16).to(dtype)
+        got = scale_by_expert_load(x, torch.tensor(counts), len(counts))
+        want = self._loop_reference(x, counts, len(counts))
+        assert got.dtype == dtype
+        torch.testing.assert_close(got, want, atol=0, rtol=0)
+
+    def test_empty_input(self):
+        from kempnerforge.model.moe import scale_by_expert_load
+
+        out = scale_by_expert_load(torch.zeros(0, 8), torch.zeros(4, dtype=torch.long), 4)
+        assert out.shape == (0, 8)
+
 
 class TestCapacityFactor:
     """Capacity factor token dropping."""
