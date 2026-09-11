@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import random
+
 import pytest
 import torch
 from PIL import Image
@@ -93,24 +95,51 @@ class TestTokenizeAndMask:
         ids, labels = _tokenize_and_mask(tok, "abc", max_text_len=8, prompt=None)
         assert ids.shape == (8,)
         assert labels.shape == (8,)
-        assert ids[:3].tolist() == [1, 2, 3]
-        assert ids[3].item() == 0  # pad
-        assert labels[3].item() == -100  # pad masked
+        assert ids[:4].tolist() == [1, 2, 3, 28]  # caption + appended EOS
+        assert ids[4].item() == 0  # pad
+        assert labels[:4].tolist() == [2, 3, 28, -100]  # next-token; "c" predicts EOS
+        assert labels[4].item() == -100  # pad masked
 
     def test_prompt_masks_labels(self):
         tok = _MockTokenizer()
         ids, labels = _tokenize_and_mask(tok, text="xyz", max_text_len=8, prompt="ab")
-        # Prompt "ab" = 2 tokens; target "xyz" = 3 tokens; total 5 tokens.
-        assert ids[:5].tolist() == [1, 2, 24, 25, 26]
-        assert labels[:2].tolist() == [-100, -100]  # prompt masked
-        assert labels[2:5].tolist() == [24, 25, 26]  # targets not masked
-        assert labels[5].item() == -100  # pad masked
+        # Prompt "ab" (2 tokens) + target "xyz" (3) + appended EOS (28).
+        assert ids[:6].tolist() == [1, 2, 24, 25, 26, 28]
+        # Next-token: the last prompt token predicts the first target (24), the
+        # last caption token predicts EOS; earlier prompt-predicting positions masked.
+        assert labels[0].item() == -100
+        assert labels[1:5].tolist() == [24, 25, 26, 28]
+        assert labels[5].item() == -100  # EOS has no successor
 
     def test_truncation(self):
         tok = _MockTokenizer()
         ids, labels = _tokenize_and_mask(tok, text="abcdefghij", max_text_len=4, prompt=None)
-        assert ids.tolist() == [1, 2, 3, 4]
-        assert labels.tolist() == [1, 2, 3, 4]
+        assert ids.tolist() == [1, 2, 3, 28]  # caption truncated to fit the appended EOS
+        assert labels.tolist() == [2, 3, 28, -100]
+
+    def test_single_token_caption_supervises_eos(self):
+        """A one-token caption still yields a supervised target (the appended
+        EOS), so it is never an all--100 row."""
+        tok = _MockTokenizer()
+        ids, labels = _tokenize_and_mask(tok, "a", max_text_len=8, prompt=None)
+        assert ids[:2].tolist() == [1, 28]  # "a" + EOS
+        assert labels[0].item() == 28  # predict EOS (learn to stop)
+        assert (labels[1:] == -100).all()
+
+    def test_empty_caption_all_masked(self):
+        """An empty caption has no target (a lone EOS has no successor)."""
+        tok = _MockTokenizer()
+        _, labels = _tokenize_and_mask(tok, "", max_text_len=8, prompt=None)
+        assert (labels == -100).all()
+
+    def test_no_eos_tokenizer_appends_nothing(self):
+        """A tokenizer with no EOS id appends nothing and keeps up to
+        max_text_len caption tokens (the no-EOS branch of the append)."""
+        tok = _MockTokenizer()
+        tok.eos_token_id = None
+        ids, labels = _tokenize_and_mask(tok, "abcde", max_text_len=4, prompt=None)
+        assert ids.tolist() == [1, 2, 3, 4]  # no EOS slot reserved; kept full 4 tokens
+        assert labels.tolist() == [2, 3, 4, -100]  # next-token; last real token unsupervised
 
     def test_prompt_mask_with_bpe_tokenizer(self):
         """Regression: BPE (gpt2) and SentencePiece tokenizers are not
@@ -118,8 +147,8 @@ class TestTokenizeAndMask:
         from ``tokenize(prompt + text)`` at the boundary (tokens can
         merge or split). The implementation must tokenize the prompt and
         text independently and concatenate the id lists, so the
-        ``labels[:len(prompt_ids)]`` mask lines up exactly with the
-        prompt boundary. Verified end-to-end on the gpt2 tokenizer.
+        prompt/target boundary is exact and only prompt-predicting
+        positions are masked. Verified end-to-end on the gpt2 tokenizer.
         """
         from transformers import AutoTokenizer
 
@@ -136,10 +165,11 @@ class TestTokenizeAndMask:
 
         # input_ids exactly matches the independent-concat form.
         assert ids[:n].tolist() == expected_ids
-        # Prompt portion of labels is -100.
-        assert (labels[: len(prompt_ids)] == -100).all()
-        # Target portion is the independently-tokenized text ids, byte-for-byte.
-        assert labels[len(prompt_ids) : n].tolist() == text_ids
+        # Positions predicting a prompt token are -100 (the last prompt token
+        # predicts the first target, so it stays supervised).
+        assert (labels[: len(prompt_ids) - 1] == -100).all()
+        # Target labels are the independently-tokenized text ids, byte-for-byte.
+        assert labels[len(prompt_ids) - 1 : n - 1].tolist() == text_ids
 
     def test_prompt_mask_under_bpe_merge_keeps_target_intact(self):
         """Concrete BPE case: ``tokenize("foo") + tokenize("bar")`` can
@@ -163,7 +193,163 @@ class TestTokenizeAndMask:
         assert ids[:split_total].tolist() == prompt_ids + text_ids
         # Target is exactly tokenize(text) — a regression would show up
         # here as a drift in the label ids (not just their length).
-        assert labels[len(prompt_ids) : len(prompt_ids) + len(text_ids)].tolist() == text_ids
+        assert (
+            labels[len(prompt_ids) - 1 : len(prompt_ids) - 1 + len(text_ids)].tolist() == text_ids
+        )
+
+
+def _expected_next_token_labels(ids: list[int], prompt_len: int, max_text_len: int) -> list[int]:
+    """Index-by-index restatement of the label contract, derived from the loss.
+
+    ``cross_entropy_loss`` does not shift, and the VLM arches hand it logits
+    over the text positions, so position ``t`` scores a prediction of token
+    ``t+1``. Written as an explicit loop (not tensor slices) so it cannot
+    share an off-by-one with the implementation it checks.
+    """
+    labels = [-100] * max_text_len
+    for t in range(max_text_len):
+        nxt = t + 1
+        if nxt >= len(ids):
+            continue  # no successor token to predict
+        if nxt <= prompt_len - 1:
+            continue  # successor is a prompt token: given, not supervised
+        labels[t] = ids[nxt]
+    return labels
+
+
+class TestNextTokenLabelContract:
+    """Cross-checks ``_tokenize_and_mask`` against an independently derived
+    statement of the contract, instead of against fitted literals."""
+
+    @pytest.mark.parametrize(
+        ("text", "prompt", "max_text_len"),
+        [
+            ("abc", None, 8),  # ordinary caption, room to spare
+            ("abc", "ab", 8),  # prompted caption
+            ("abcdefg", None, 8),  # caption exactly max_text_len - 1 tokens
+            ("abcdefgh", None, 8),  # caption exactly max_text_len tokens
+            ("abcdefghijkl", None, 8),  # caption longer than the budget
+            ("abcdefgh", "qrs", 8),  # prompt + overlong caption
+            ("a", None, 8),  # single-token caption
+            ("", None, 8),  # empty caption
+            ("abc", "", 8),  # empty prompt string
+            ("ab", "a", 8),  # prompt_len == 1
+            ("a", None, 2),  # minimum legal max_text_len
+            # prompt at and beyond the budget: prompt_len is measured before
+            # truncation, so these pin that it still lines up with the boundary.
+            ("xyz", "aaaaaaa", 8),  # prompt fills max_text_len - 1
+            ("xyz", "aaaaaaaa", 8),  # prompt fills max_text_len
+            ("xyz", "aaaaaaaaaaaa", 8),  # prompt longer than max_text_len
+        ],
+    )
+    @pytest.mark.parametrize("with_eos", [True, False])
+    def test_matches_derived_contract(self, text, prompt, max_text_len, with_eos):
+        tok = _MockTokenizer()
+        if not with_eos:
+            tok.eos_token_id = None
+        ids, labels = _tokenize_and_mask(tok, text, max_text_len, prompt)
+
+        # --- input_ids properties (stated, not copied from the implementation)
+        real = list(tok(text)["input_ids"])
+        prompt_ids = list(tok(prompt)["input_ids"]) if prompt is not None else []
+        # With an EOS one slot is reserved for it; without, the full budget is text.
+        budget = max_text_len - 1 if with_eos else max_text_len
+        kept = (prompt_ids + real)[:budget]
+        n = len(kept) + (1 if with_eos else 0)
+        assert ids.shape == (max_text_len,)
+        assert ids[: len(kept)].tolist() == kept
+        if with_eos:
+            # EOS always lands in input_ids: truncation reserves its slot, so it
+            # can never be the token that falls off the end.
+            assert ids[len(kept)].item() == tok.eos_token_id
+        assert (ids[n:] == 0).all()  # pad
+
+        # --- labels match the derived contract exactly
+        prompt_len = min(len(prompt_ids), n)
+        assert labels.tolist() == _expected_next_token_labels(
+            ids[:n].tolist(), prompt_len, max_text_len
+        )
+
+    def test_prompt_mask_boundary_both_directions(self):
+        """The two indices either side of the prompt boundary, pinned.
+
+        With shifted labels the prompt occupies ``ids[0 .. prompt_len-1]``, so
+        ``labels[prompt_len-1]`` predicts the *first caption token* and must stay
+        supervised, while ``labels[prompt_len-2]`` predicts the last prompt token
+        and must be masked. Widening the mask by one silently drops the first
+        caption token; narrowing it leaks a prompt token into the loss.
+        """
+        tok = _MockTokenizer()
+        prompt, text = "abcd", "xyz"
+        prompt_len = len(tok(prompt)["input_ids"])  # 4
+        ids, labels = _tokenize_and_mask(tok, text, max_text_len=16, prompt=prompt)
+
+        first_caption_id = tok(text)["input_ids"][0]
+        assert ids[prompt_len].item() == first_caption_id
+        # Supervised: predicts the first caption token.
+        assert labels[prompt_len - 1].item() == first_caption_id
+        # Masked: would predict the last prompt token.
+        assert labels[prompt_len - 2].item() == -100
+        # And every earlier position is masked too (none leak).
+        assert (labels[: prompt_len - 1] == -100).all()
+
+    def test_eos_is_a_supervised_target(self):
+        """The last caption token predicts EOS, so captions learn to stop."""
+        tok = _MockTokenizer()
+        _, labels = _tokenize_and_mask(tok, "hello", max_text_len=16, prompt="ab")
+        supervised = labels[labels != -100].tolist()
+        assert supervised[-1] == tok.eos_token_id
+        assert supervised.count(tok.eos_token_id) == 1
+
+    def test_eos_survives_an_overlong_caption(self):
+        """Truncation reserves the EOS slot, so a caption longer than the budget
+        still ends in a supervised stop target rather than a dropped one."""
+        tok = _MockTokenizer()
+        ids, labels = _tokenize_and_mask(tok, "abcdefghij", max_text_len=5, prompt=None)
+        assert ids[-1].item() == tok.eos_token_id
+        assert labels[-2].item() == tok.eos_token_id
+        assert labels[-1].item() == -100  # EOS has no successor
+
+    def test_prompt_filling_the_budget_is_in_range(self):
+        """A prompt that leaves no room for a caption must not raise or produce a
+        negative-index slice. It degrades to a row with nothing (or only EOS)
+        supervised; rejecting such a prompt up front is a separate concern and is
+        not validated here."""
+        tok = _MockTokenizer()
+        for prompt_chars in (7, 8, 12):
+            _, labels = _tokenize_and_mask(tok, "xyz", max_text_len=8, prompt="a" * prompt_chars)
+            assert labels.shape == (8,)
+            assert (labels == -100).all() or (labels != -100).sum() == 1
+
+    def test_labels_are_identical_across_ranks(self, monkeypatch):
+        """Every DP rank must build byte-identical labels for a given index.
+
+        Label construction is pure in ``(tokenizer, text, max_text_len, prompt)``,
+        so a rank-dependent or RNG-dependent path here would desync the loss
+        across ranks. Emulates two ranks in-process: distinct rank environment
+        and distinct global RNG state, separate tokenizer instances, same index.
+        """
+        from transformers import AutoTokenizer
+
+        captions = ["a red bus", "two dogs running", "a bowl of soup"]
+        index = 1
+
+        def build(rank: int) -> tuple[bytes, bytes]:
+            monkeypatch.setenv("RANK", str(rank))
+            monkeypatch.setenv("LOCAL_RANK", str(rank))
+            monkeypatch.setenv("WORLD_SIZE", "2")
+            random.seed(rank)
+            torch.manual_seed(rank)
+            tok = AutoTokenizer.from_pretrained("gpt2")
+            ids, labels = _tokenize_and_mask(
+                tok, captions[index], max_text_len=16, prompt="Describe: "
+            )
+            return ids.numpy().tobytes(), labels.numpy().tobytes()
+
+        ids0, labels0 = build(0)
+        ids1, labels1 = build(1)
+        assert ids0 == ids1
+        assert labels0 == labels1
 
 
 # ---------------------------------------------------------------------------
