@@ -29,6 +29,10 @@ class AdapterConfig:
             ``out_dim``"; ignored by the other types.
         activation: Activation between the two MLP projections. One of
             ``"gelu"`` (default), ``"silu"``, ``"relu"``. ``mlp_2layer`` only.
+        pre_norm: Norm applied to the vision features before ``mlp_2layer``'s
+            first projection (exposed as ``ln_q``), by norm-registry key
+            (``"rmsnorm"`` / ``"layernorm"``). ``""`` (default) disables it;
+            ``mlp_2layer`` only.
         pool_window: Pooling kernel side for the pooling adapters (e.g. ``2``
             for image 2×2, ``3`` for video 3×3); ignored by projection adapters.
         pool_heads: Number of attention heads for ``attentional_pool``; must
@@ -38,6 +42,7 @@ class AdapterConfig:
     type: str = "mlp_2layer"
     hidden_dim: int = 0
     activation: str = "gelu"
+    pre_norm: str = ""
     pool_window: int = 2
     pool_heads: int = 16
 
@@ -60,6 +65,16 @@ class AdapterConfig:
             raise ValueError(
                 f"Unknown adapter.activation: {self.activation!r}. Options: 'gelu', 'silu', 'relu'."
             )
+        if self.pre_norm:
+            # Validate against the norm registry (populated by the import above),
+            # so any registered norm type is accepted; "" disables the pre-norm.
+            try:
+                registry.get("norm", self.pre_norm)
+            except KeyError as exc:
+                raise ValueError(
+                    f"Unknown adapter.pre_norm: {self.pre_norm!r}. Must be a registered norm "
+                    "type (e.g. 'rmsnorm', 'layernorm'), or '' to disable the pre-norm."
+                ) from exc
         if self.pool_window <= 0:
             raise ValueError(f"adapter.pool_window must be positive (got {self.pool_window})")
         if self.pool_heads <= 0:
@@ -75,6 +90,7 @@ class AdapterConfig:
         return {
             "hidden_dim": self.hidden_dim or None,
             "activation": self.activation,
+            "pre_norm": self.pre_norm or None,
             "pool_window": self.pool_window,
             "pool_heads": self.pool_heads,
         }

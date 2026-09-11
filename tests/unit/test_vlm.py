@@ -726,3 +726,113 @@ class TestFramePaddingMask:
         with torch.no_grad():
             logits, _ = w(pix, ids, frame_mask=fm)
         assert torch.isfinite(logits).all(), f"{arch}: NaN/inf with an all-padded clip"
+
+
+# ---------------------------------------------------------------------------
+# The config-driven knobs through a real build_vlm_wrapper
+# ---------------------------------------------------------------------------
+
+
+class TestVLMConfigDrivenKnobs:
+    """``model.head_dim_override`` and ``adapter.pre_norm`` are only useful if
+    they survive the build path the trainer actually uses."""
+
+    @staticmethod
+    def _wrapper(*, head_dim_override: int = 0, pre_norm: str = "") -> VLMWrapper:
+        return build_vlm_wrapper(
+            ModelConfig(
+                dim=64,
+                n_layers=2,
+                n_heads=4,
+                n_kv_heads=4,
+                head_dim_override=head_dim_override,
+                vocab_size=256,
+                max_seq_len=64,
+            ),
+            VisionEncoderConfig(type="random", feature_dim=96, num_tokens=8),
+            AdapterConfig(pre_norm=pre_norm),
+            VLMConfig(max_text_len=32),
+        )
+
+    def test_decoupled_head_dim_reaches_the_inner_transformer(self):
+        w = self._wrapper(head_dim_override=32)  # 4 * 32 = 128 != dim 64
+        sd = w.state_dict()
+        assert sd["transformer.layers.0.attention.q_proj.weight"].shape == (128, 64)
+        assert sd["transformer.layers.0.attention.o_proj.weight"].shape == (64, 128)
+
+    def test_adapter_pre_norm_appears_in_the_wrapper_state_dict(self):
+        assert [k for k in self._wrapper(pre_norm="rmsnorm").state_dict() if "ln_q" in k] == [
+            "adapter.ln_q.weight"
+        ]
+        assert not [k for k in self._wrapper().state_dict() if "ln_q" in k]
+
+    def test_both_knobs_train_end_to_end(self):
+        torch.manual_seed(0)
+        w = self._wrapper(head_dim_override=32, pre_norm="rmsnorm").to(DEVICE)
+        pix = torch.randn(2, 3, 16, 16, device=DEVICE)
+        ids = torch.randint(0, 256, (2, 16), device=DEVICE)
+        logits, labels = w(pix, ids, ids.clone())
+        assert logits.shape == (2, 16, 256)
+        assert labels.shape == (2, 16)
+        logits.sum().backward()
+        grad = w.adapter.ln_q.weight.grad
+        assert grad is not None and torch.isfinite(grad).all() and (grad != 0).any()
+
+    @pytest.mark.parametrize("arch", ["joint_decoder", "cross_attention", "mot", "moma"])
+    def test_every_attention_module_honors_the_decoupled_head_dim(self, arch):
+        """The sweep that matters: an attention that still computed
+        ``dim // n_heads`` internally would be silently wrong, not rejected.
+        Cross-attention keeps its own head count's width unless the override is
+        set, which it is here.
+        """
+        from kempnerforge.model.attention import Attention
+        from kempnerforge.model.cross_attention import CrossAttention
+        from kempnerforge.model.mot import MoTAttention
+
+        vlm_cfgs = {
+            "joint_decoder": JointDecoderConfig(max_text_len=32),
+            "cross_attention": CrossAttentionConfig(
+                max_text_len=32, cross_attention_every_n_layers=2
+            ),
+            "mot": MoTConfig(max_text_len=32),
+            "moma": MoMaConfig(max_text_len=32),
+        }
+        model_cfg = ModelConfig(
+            dim=64,
+            n_layers=2,
+            n_heads=4,
+            n_kv_heads=4,
+            head_dim_override=32,  # 4 * 32 = 128 != dim 64
+            ffn_hidden_dim=128,
+            vocab_size=256,
+            max_seq_len=64,
+        )
+        w = build_vlm_wrapper(
+            model_cfg,
+            VisionEncoderConfig(type="random", feature_dim=96, num_tokens=8),
+            AdapterConfig(),
+            vlm_cfgs[arch],
+        )
+        found = [
+            (n, m.head_dim)
+            for n, m in w.named_modules()
+            if isinstance(m, (Attention, MoTAttention, CrossAttention))
+        ]
+        assert found, f"{arch}: no attention modules found"
+        assert all(hd == 32 for _, hd in found), found
+
+    def test_rope_and_flops_read_the_same_head_dim(self):
+        """RoPE table width and the FLOP model both derive from
+        config.head_dim, so both must track the override."""
+        from kempnerforge.metrics.mfu import estimate_model_flops_per_token
+        from kempnerforge.model.position import precompute_rope_frequencies
+
+        cfg = ModelConfig(
+            dim=64, n_layers=2, n_heads=4, n_kv_heads=4, head_dim_override=32, vocab_size=256
+        )
+        cos, _ = precompute_rope_frequencies(cfg.head_dim, cfg.max_seq_len)
+        assert cos.shape[-1] == 32 // 2
+        wider = ModelConfig(
+            dim=64, n_layers=2, n_heads=4, n_kv_heads=4, head_dim_override=64, vocab_size=256
+        )
+        assert estimate_model_flops_per_token(wider, 64) > estimate_model_flops_per_token(cfg, 64)

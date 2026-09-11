@@ -230,7 +230,8 @@ class Attention(nn.Module):
             with self._sdpa_context():
                 out = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
 
-        # Reshape back: (batch, n_heads, seq_len, head_dim) → (batch, seq_len, dim)
+        # Reshape back: (batch, n_heads, seq_len, head_dim) →
+        # (batch, seq_len, n_heads * head_dim), which o_proj maps to dim.
         out = out.transpose(1, 2).contiguous().view(batch, seq_len, -1)
 
         return self.o_proj(out)

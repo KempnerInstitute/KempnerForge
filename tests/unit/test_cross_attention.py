@@ -317,3 +317,80 @@ def test_cross_attention_shape_parametrize(batch, seq_len, num_image_tokens):
     out.sum().backward()
     assert x.grad is not None
     assert img.grad is not None
+
+
+# ---------------------------------------------------------------------------
+# head_dim threading
+# ---------------------------------------------------------------------------
+
+
+class TestCrossAttentionHeadDim:
+    def test_block_defaults_to_dim_over_n_heads(self):
+        block = CrossAttentionBlock(dim=32, n_heads=4, n_kv_heads=4, ffn_hidden_dim=64)
+        assert block.attn.head_dim == 8
+
+    def test_block_threads_an_explicit_head_dim(self):
+        block = CrossAttentionBlock(dim=32, n_heads=4, n_kv_heads=4, ffn_hidden_dim=64, head_dim=16)
+        assert block.attn.head_dim == 16
+        assert block.attn.q_proj.weight.shape == (64, 32)  # n_heads * head_dim, dim
+        assert block.attn.o_proj.weight.shape == (32, 64)
+
+    def test_forward_preserves_the_residual_width_when_decoupled(self):
+        block = CrossAttentionBlock(
+            dim=32, n_heads=4, n_kv_heads=4, ffn_hidden_dim=64, head_dim=16
+        ).to(DEVICE)
+        x = torch.randn(2, 6, 32, device=DEVICE, requires_grad=True)
+        img = torch.randn(2, 5, 32, device=DEVICE)
+        out = block(x, img)
+        assert out.shape == (2, 6, 32)
+        out.sum().backward()
+        assert x.grad is not None and torch.isfinite(x.grad).all()
+
+
+class TestTransformerCrossAttentionHeadDim:
+    """The transformer must only forward a *decoupled* model head_dim.
+
+    Cross-attention has its own head count (``vlm.cross_attention_n_heads``).
+    Forwarding a coupled model's ``dim // n_heads`` unconditionally would
+    resize every cross-attention block whenever that count differs from
+    ``model.n_heads`` -- a silent parameter-shape and checkpoint break.
+    """
+
+    @staticmethod
+    def _build(*, ca_n_heads: int, head_dim_override: int = 0):
+        from kempnerforge.config.schema import ModelConfig
+        from kempnerforge.config.vlm import CrossAttentionConfig
+        from kempnerforge.model.transformer import Transformer
+
+        model_cfg = ModelConfig(
+            dim=64,
+            n_layers=2,
+            n_heads=8,
+            n_kv_heads=8,
+            head_dim_override=head_dim_override,
+            vocab_size=64,
+            max_seq_len=32,
+        )
+        vlm_cfg = CrossAttentionConfig(
+            cross_attention_every_n_layers=1, cross_attention_n_heads=ca_n_heads
+        )
+        return model_cfg, Transformer(model_cfg, vlm_config=vlm_cfg)
+
+    def test_coupled_model_keeps_cross_attentions_own_dim_over_n_heads(self):
+        _, model = self._build(ca_n_heads=2)  # 2 != model n_heads 8
+        attn = model.cross_attention_layers["0"].attn
+        assert attn.head_dim == 32  # dim 64 // ca n_heads 2, not the model's 8
+        assert attn.q_proj.weight.shape == (64, 64)
+
+    def test_coupled_model_with_matching_head_count_is_unaffected(self):
+        cfg, model = self._build(ca_n_heads=0)  # 0 -> inherit model n_heads
+        attn = model.cross_attention_layers["0"].attn
+        assert attn.n_heads == cfg.n_heads
+        assert attn.head_dim == cfg.head_dim == 8
+
+    def test_decoupled_model_head_dim_reaches_cross_attention(self):
+        cfg, model = self._build(ca_n_heads=0, head_dim_override=16)
+        attn = model.cross_attention_layers["0"].attn
+        assert cfg.head_dim == 16
+        assert attn.head_dim == 16
+        assert attn.q_proj.weight.shape == (cfg.n_heads * 16, cfg.dim) == (128, 64)

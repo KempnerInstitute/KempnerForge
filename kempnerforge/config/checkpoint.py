@@ -69,6 +69,8 @@ class CheckpointConfig:
     keep_last_n: int = 3  # recent ckpts kept (<=0 keeps all); dynamic milestones always kept
     load_path: str | None = None  # Path to load from (for resumption)
     export_dtype: Literal["float32", "bfloat16"] = "bfloat16"
+    # State keys to skip when warm-starting from ``load_path``: "model" and/or
+    # "optimizer". Ignored on a resume, which always restores full state.
     exclude_from_loading: list[str] = field(default_factory=list)
     # If the saved checkpoint's VLM freeze metadata differs from the current
     # config's freeze specs, the load path raises by default. Setting this
