@@ -19,7 +19,10 @@ from kempnerforge.resilience.health import (
     NaNDetector,
     check_gpu_health,
 )
-from kempnerforge.resilience.signal_handler import ShutdownHandler
+from kempnerforge.resilience.signal_handler import (
+    ShutdownHandler,
+    ignore_shutdown_signals_in_worker,
+)
 
 # ---------------------------------------------------------------------------
 # ShutdownHandler
@@ -493,6 +496,24 @@ class TestSLURM:
                     os.environ.pop(k, None)
 
 
+def _durable_step_dir(base, step: int, pp_stages: int = 0):
+    """Create a ``step_N`` directory that looks like a completed DCP save.
+
+    ``resolve_resume_path`` treats DCP's ``.metadata`` as the durability marker,
+    so a directory without one stands for an interrupted save.
+    """
+    d = base / f"step_{step}"
+    d.mkdir()
+    if pp_stages:
+        for k in range(pp_stages):
+            stage = d / f"pp{k}"
+            stage.mkdir()
+            (stage / ".metadata").write_text("")
+    else:
+        (d / ".metadata").write_text("")
+    return d
+
+
 class TestResumePathResolution:
     def test_no_checkpoint_dir(self, tmp_path):
         assert resolve_resume_path(str(tmp_path / "nonexistent")) is None
@@ -517,15 +538,14 @@ class TestResumePathResolution:
     def test_fallback_to_highest_step(self, tmp_path):
         # Create step directories without "latest" symlink
         for step in [10, 50, 30]:
-            d = tmp_path / f"step_{step}"
-            d.mkdir()
+            _durable_step_dir(tmp_path, step)
 
         result = resolve_resume_path(str(tmp_path))
         assert result is not None
         assert result.name == "step_50"
 
     def test_ignores_non_step_dirs(self, tmp_path):
-        (tmp_path / "step_100").mkdir()
+        _durable_step_dir(tmp_path, 100)
         (tmp_path / "other_dir").mkdir()
         (tmp_path / "step_abc").mkdir()  # Not a valid step dir (will cause error)
 
@@ -538,8 +558,7 @@ class TestResumePathResolution:
 
     def test_latest_broken_symlink_falls_back(self, tmp_path):
         # Create a checkpoint directory
-        step_dir = tmp_path / "step_50"
-        step_dir.mkdir()
+        _durable_step_dir(tmp_path, 50)
 
         # Create broken "latest" symlink pointing to nonexistent
         latest = tmp_path / "latest"
@@ -558,7 +577,7 @@ class TestResumePathResolution:
     def test_latest_symlink_takes_priority_over_higher_step(self, tmp_path):
         """latest symlink should be used even if higher step dirs exist."""
         for step in [10, 50, 100]:
-            (tmp_path / f"step_{step}").mkdir()
+            _durable_step_dir(tmp_path, step)
 
         # Point latest at step_50 (not the highest)
         latest = tmp_path / "latest"
@@ -570,7 +589,7 @@ class TestResumePathResolution:
 
     def test_single_step_dir(self, tmp_path):
         """Works with exactly one step directory."""
-        (tmp_path / "step_1").mkdir()
+        _durable_step_dir(tmp_path, 1)
 
         result = resolve_resume_path(str(tmp_path))
         assert result is not None
@@ -579,9 +598,102 @@ class TestResumePathResolution:
     def test_step_dirs_with_large_numbers(self, tmp_path):
         """Handles large step numbers correctly (sorts numerically, not lexically)."""
         for step in [9, 100, 1000, 20]:
-            (tmp_path / f"step_{step}").mkdir()
+            _durable_step_dir(tmp_path, step)
 
         result = resolve_resume_path(str(tmp_path))
         assert result is not None
         # Numerically highest is 1000, not lexically highest "step_9"
         assert result.name == "step_1000"
+
+    # -- durability of the step_N fallback (#177) --------------------------
+
+    def test_skips_incomplete_newest_and_falls_back(self, tmp_path):
+        """An interrupted save must not be selected over an older durable one.
+
+        This is the #177 failure: the emergency save dies part-way, leaving a
+        step dir with no DCP `.metadata`, and auto-resume picks it and fails in
+        dcp.load with "metadata is None".
+        """
+        _durable_step_dir(tmp_path, 10)
+        (tmp_path / "step_20").mkdir()  # interrupted save: no .metadata
+
+        result = resolve_resume_path(str(tmp_path))
+        assert result is not None
+        assert result.name == "step_10"
+
+    def test_returns_none_when_no_step_dir_is_durable(self, tmp_path):
+        """Better to start fresh than to resume into a directory that cannot load."""
+        for step in [10, 20]:
+            (tmp_path / f"step_{step}").mkdir()
+
+        assert resolve_resume_path(str(tmp_path)) is None
+
+    def test_accepts_pipeline_parallel_layout(self, tmp_path):
+        """Under PP each stage writes its own pp{k}/.metadata, not a flat one."""
+        _durable_step_dir(tmp_path, 30, pp_stages=2)
+
+        result = resolve_resume_path(str(tmp_path))
+        assert result is not None
+        assert result.name == "step_30"
+
+    def test_skips_incomplete_pipeline_parallel_dir(self, tmp_path):
+        """A pp{k}/ subdir without .metadata is still an interrupted save."""
+        _durable_step_dir(tmp_path, 10, pp_stages=2)
+        partial = tmp_path / "step_20"
+        (partial / "pp0").mkdir(parents=True)  # stage dir exists, never finished
+
+        result = resolve_resume_path(str(tmp_path))
+        assert result is not None
+        assert result.name == "step_10"
+
+
+# ---------------------------------------------------------------------------
+# DataLoader worker signal shielding (#177)
+# ---------------------------------------------------------------------------
+
+
+class TestWorkerSignalShielding:
+    """SIGTERM is delivered to the process group, so it reaches DataLoader
+    workers too. Workers that die take the emergency checkpoint with them:
+    the main process fails fetching its next batch and raises before the loop
+    reaches its should_shutdown() check.
+    """
+
+    def _restoring(self, fn):
+        """Run fn with the process's shutdown-signal handlers restored after."""
+        saved = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGUSR1)}
+        try:
+            fn()
+        finally:
+            for s, h in saved.items():
+                signal.signal(s, h)
+
+    def test_ignores_both_shutdown_signals(self):
+        def check():
+            ignore_shutdown_signals_in_worker(0)
+            assert signal.getsignal(signal.SIGTERM) is signal.SIG_IGN
+            assert signal.getsignal(signal.SIGUSR1) is signal.SIG_IGN
+
+        self._restoring(check)
+
+    def test_sigterm_does_not_kill_the_caller(self):
+        """The point of the shield: the signal arrives and is survived."""
+
+        def check():
+            ignore_shutdown_signals_in_worker(0)
+            os.kill(os.getpid(), signal.SIGTERM)  # would terminate by default
+
+        self._restoring(check)
+
+    def test_dataloader_installs_the_shield(self):
+        """StatefulDataLoader must wire the shield, not just export it."""
+        from torch.utils.data import TensorDataset
+
+        from kempnerforge.config.schema import DataConfig
+        from kempnerforge.data.dataloader import StatefulDataLoader
+
+        dataset = TensorDataset(torch.arange(8).float().unsqueeze(1))
+        loader = StatefulDataLoader(
+            dataset, batch_size=2, config=DataConfig(num_workers=2, pin_memory=False)
+        )
+        assert loader._dataloader.worker_init_fn is ignore_shutdown_signals_in_worker
