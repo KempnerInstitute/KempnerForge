@@ -16,6 +16,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from kempnerforge.config.schema import DataConfig
 from kempnerforge.data.sampler import DistributedSampler, MixtureSampler
+from kempnerforge.resilience.signal_handler import ignore_shutdown_signals_in_worker
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +59,10 @@ class StatefulDataLoader:
             "prefetch_factor": config.prefetch_factor if config.num_workers > 0 else None,
             "persistent_workers": config.num_workers > 0,
             "drop_last": True,
+            # Workers must survive a group-delivered SIGTERM so the in-flight
+            # step can finish and the emergency checkpoint can be written.
+            # Never called when num_workers == 0.
+            "worker_init_fn": ignore_shutdown_signals_in_worker,
         }
         if collate_fn is not None:
             loader_kwargs["collate_fn"] = collate_fn
