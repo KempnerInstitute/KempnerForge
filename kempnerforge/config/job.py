@@ -197,6 +197,16 @@ class JobConfig:
                 "splitting. Use FSDP, TP, or EP instead."
             )
 
+        if self.distributed.pp > 1 and self.data.pack_sequences:
+            raise ValueError(
+                "Sequence packing + Pipeline Parallelism is not supported. "
+                "PipelineStageModule.forward receives only hidden states, so doc_ids "
+                "never reaches the stages and packed documents would attend across "
+                "document boundaries while the labels still mask those positions -- "
+                "silently training on cross-document context. "
+                "Set data.pack_sequences=false, or train without pipeline parallelism."
+            )
+
         if self.distributed.ep > 1:
             if not self.model.is_moe:
                 raise ValueError("ep > 1 requires an MoE model (num_experts > 0)")

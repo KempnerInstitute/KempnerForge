@@ -490,6 +490,18 @@ class TestJobConfig:
         )
         config.validate(world_size=2)  # Should not raise — dense + PP is fine
 
+    def test_validate_packing_with_pp_rejected(self):
+        config = JobConfig(
+            data=DataConfig(pack_sequences=True),
+            distributed=DistributedConfig(pp=2, dp_shard=1),
+        )
+        with pytest.raises(ValueError, match="Sequence packing.*Pipeline Parallelism"):
+            config.validate(world_size=2)
+
+    def test_validate_packing_without_pp_passes(self):
+        config = JobConfig(data=DataConfig(pack_sequences=True))
+        config.validate(world_size=1)  # Should not raise — packing is fine without PP
+
     def test_validate_vlm_seq_len_too_short(self):
         config = JobConfig(
             model=ModelConfig(max_seq_len=1024),
