@@ -89,6 +89,27 @@ class TestComputePackedOutput:
         assert result["labels"].dtype == torch.long
         assert result["doc_ids"].dtype == torch.long
 
+    def test_doc_ids_match_sequential_reference(self):
+        """Vectorized doc_id assignment matches a literal carry-the-counter loop."""
+
+        def reference(tokens: np.ndarray, eos_token_id: int) -> np.ndarray:
+            doc_ids = np.zeros(len(tokens), dtype=np.int64)
+            doc_id = 0
+            for i in range(len(tokens)):
+                doc_ids[i] = doc_id
+                if tokens[i] == eos_token_id:
+                    doc_id += 1
+            return doc_ids
+
+        rng = np.random.default_rng(0)
+        for _ in range(50):
+            # Small vocab so EOS is dense: boundaries, runs of consecutive EOS,
+            # and EOS at either end all show up across the draws.
+            tokens = rng.integers(0, 4, size=int(rng.integers(3, 64))).astype(np.int64)
+            result = _compute_packed_output(tokens, eos_token_id=0)
+            # _compute_packed_output returns the input half of the doc ids.
+            assert result["doc_ids"].tolist() == reference(tokens, 0)[:-1].tolist()
+
 
 # ---------------------------------------------------------------------------
 # Attention mask for packed sequences

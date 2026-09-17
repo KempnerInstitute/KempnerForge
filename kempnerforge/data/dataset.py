@@ -41,13 +41,12 @@ def _compute_packed_output(tokens: np.ndarray, eos_token_id: int) -> dict[str, t
         cross-document boundaries), and ``doc_ids`` (seq_len, integer document
         assignment per input token for attention masking).
     """
-    # Assign a document ID to each token: increment after every EOS
+    # Assign a document ID to each token: increment after every EOS, i.e.
+    # doc_ids[i] is the number of EOS tokens strictly before i. Vectorized
+    # because this runs per __getitem__, once per token -- a Python loop here
+    # costs seq_len interpreter iterations on every sample the loader yields.
     doc_ids = np.zeros(len(tokens), dtype=np.int64)
-    doc_id = 0
-    for i in range(len(tokens)):
-        doc_ids[i] = doc_id
-        if tokens[i] == eos_token_id:
-            doc_id += 1
+    doc_ids[1:] = np.cumsum(tokens[:-1] == eos_token_id)
 
     token_tensor = torch.from_numpy(tokens.copy()).long()
     doc_id_tensor = torch.from_numpy(doc_ids.copy())
