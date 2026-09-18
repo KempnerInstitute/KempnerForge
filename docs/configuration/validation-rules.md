@@ -28,6 +28,14 @@ File:
 - `dim % n_heads == 0` (head dim is integral).
 - `n_heads % n_kv_heads == 0` (GQA replication factor is integral).
 - `sdpa_backend ∈ {"auto", "flash", "efficient", "cudnn", "math"}`.
+- `attention_backend ∈ {"sdpa", "flex"}`.
+- `attention_backend = "flex"` requires `16 ≤ dim // n_heads ≤ 256` (FlexAttention
+  Triton-template limits), and warns that `sdpa_backend` is ignored when set.
+- `attention_backend = "flex"` requires `train.seq_len ≥ 128`, FlexAttention's
+  mask block size. Below one block the compiled kernel returns incorrect
+  results (documents leak into each other) and there is no block sparsity to
+  exploit anyway.
+- `pp > 1` rejects `data.pack_sequences` (pipeline stages never receive `doc_ids`).
 - When `num_experts > 0` (MoE):
   - `moe_top_k > 0`
   - `moe_top_k ≤ num_experts`

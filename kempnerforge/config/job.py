@@ -10,7 +10,7 @@ from kempnerforge.config.data import DataConfig
 from kempnerforge.config.distributed import DistributedConfig
 from kempnerforge.config.eval import EvalConfig
 from kempnerforge.config.metrics import MetricsConfig
-from kempnerforge.config.model import ModelConfig
+from kempnerforge.config.model import FLEX_BLOCK_SIZE, ModelConfig
 from kempnerforge.config.optimizer import OptimizerConfig
 from kempnerforge.config.profiling import ProfilingConfig
 from kempnerforge.config.scheduler import SchedulerConfig
@@ -205,6 +205,15 @@ class JobConfig:
                 "document boundaries while the labels still mask those positions -- "
                 "silently training on cross-document context. "
                 "Set data.pack_sequences=false, or train without pipeline parallelism."
+            )
+
+        if self.model.attention_backend == "flex" and self.train.seq_len < FLEX_BLOCK_SIZE:
+            raise ValueError(
+                f"attention_backend='flex' requires train.seq_len >= {FLEX_BLOCK_SIZE} "
+                f"(got {self.train.seq_len}). That is FlexAttention's mask block size; "
+                "below one block the compiled kernel silently returns incorrect results "
+                "(documents leak into each other), and a sub-block sequence has no block "
+                "sparsity to exploit anyway. Use attention_backend='sdpa' instead."
             )
 
         if self.distributed.ep > 1:

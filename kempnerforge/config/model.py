@@ -18,6 +18,14 @@ class Activation(StrEnum):
     relu = "relu"
 
 
+# FlexAttention's mask block size. Sequences shorter than one block are rejected
+# under attention_backend="flex": the compiled kernel returns incorrect results
+# there -- measured, cross-document attention leaks below 128 and is exact at or
+# above it -- and a sub-block sequence has no block sparsity to exploit anyway,
+# so flex would be pure overhead even if it were correct.
+FLEX_BLOCK_SIZE = 128
+
+
 @dataclass
 class ModelConfig:
     """Architecture hyperparameters for a transformer model."""
@@ -41,6 +49,13 @@ class ModelConfig:
     # SDPA backend: "auto" lets PyTorch select (recommended). Override to force
     # a specific kernel for benchmarking or debugging.
     sdpa_backend: str = "auto"  # "auto", "flash", "efficient", "cudnn", "math"
+    # Attention backend. "sdpa" is the existing behavior: causal SDPA, or a dense
+    # (B, 1, S, S) mask when packing is on -- which drops SDPA off FlashAttention.
+    # "flex" routes packed batches through FlexAttention's sparse BlockMask, which
+    # skips fully-masked blocks instead of computing them. Only affects packed runs
+    # (data.pack_sequences); unpacked batches take the is_causal SDPA fast path
+    # under either backend.
+    attention_backend: str = "sdpa"  # "sdpa", "flex"
 
     # MoE (all defaults produce a dense model -- zero behavior change)
     num_experts: int = 0  # 0 = dense, >0 = MoE
@@ -83,6 +98,27 @@ class ModelConfig:
                 f"Unknown sdpa_backend: '{self.sdpa_backend}'. "
                 "Options: 'auto', 'flash', 'efficient', 'cudnn', 'math'"
             )
+
+        # Attention backend validation
+        if self.attention_backend not in ("sdpa", "flex"):
+            raise ValueError(
+                f"Unknown attention_backend: '{self.attention_backend}'. Options: 'sdpa', 'flex'"
+            )
+        if self.attention_backend == "flex":
+            if not 16 <= self.head_dim <= 256:
+                raise ValueError(
+                    f"attention_backend='flex' requires 16 <= head_dim <= 256, got "
+                    f"{self.head_dim} (dim={self.dim} // n_heads={self.n_heads}). "
+                    "FlexAttention's Triton template does not lower outside that range."
+                )
+            if self.sdpa_backend != "auto":
+                import logging
+
+                logging.getLogger(__name__).warning(
+                    "sdpa_backend=%r is ignored when attention_backend='flex' -- the flex "
+                    "path does not route through the SDPA kernel selector.",
+                    self.sdpa_backend,
+                )
 
         # MoE validation
         if self.num_experts > 0:

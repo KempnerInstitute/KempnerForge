@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import random
 import sys
 from pathlib import Path
@@ -192,6 +193,36 @@ class TestModelConfig:
     def test_sdpa_backend_rejects_unknown(self):
         with pytest.raises(ValueError, match="Unknown sdpa_backend"):
             ModelConfig(sdpa_backend="fa3")
+
+    # --- Attention backend config ---
+
+    def test_attention_backend_default_is_sdpa(self):
+        assert ModelConfig().attention_backend == "sdpa"
+
+    def test_attention_backend_accepts_valid_values(self):
+        for backend in ("sdpa", "flex"):
+            assert ModelConfig(attention_backend=backend).attention_backend == backend
+
+    def test_attention_backend_rejects_unknown(self):
+        with pytest.raises(ValueError, match="Unknown attention_backend"):
+            ModelConfig(attention_backend="flash3")
+
+    def test_flex_rejects_head_dim_below_16(self):
+        """FlexAttention's Triton template does not lower below head_dim 16."""
+        with pytest.raises(ValueError, match="16 <= head_dim <= 256"):
+            ModelConfig(dim=64, n_heads=8, attention_backend="flex")
+
+    def test_flex_rejects_head_dim_above_256(self):
+        with pytest.raises(ValueError, match="16 <= head_dim <= 256"):
+            ModelConfig(dim=512, n_heads=1, attention_backend="flex")
+
+    def test_flex_accepts_head_dim_at_the_bounds(self):
+        assert ModelConfig(dim=64, n_heads=4, attention_backend="flex").head_dim == 16
+        assert ModelConfig(dim=256, n_heads=1, attention_backend="flex").head_dim == 256
+
+    def test_sdpa_does_not_constrain_head_dim(self):
+        """The bound is a flex kernel limit, not an architecture limit."""
+        assert ModelConfig(dim=64, n_heads=8).head_dim == 8
 
 
 # ---------------------------------------------------------------------------
@@ -502,6 +533,27 @@ class TestJobConfig:
         config = JobConfig(data=DataConfig(pack_sequences=True))
         config.validate(world_size=1)  # Should not raise — packing is fine without PP
 
+    def test_validate_flex_rejects_seq_len_below_block_size(self):
+        """Below one FlexAttention block the compiled kernel leaks across documents."""
+        config = JobConfig(
+            model=ModelConfig(attention_backend="flex"),
+            train=TrainConfig(seq_len=64),
+        )
+        with pytest.raises(ValueError, match="requires train.seq_len >= 128"):
+            config.validate(world_size=1)
+
+    def test_validate_flex_accepts_seq_len_at_block_size(self):
+        config = JobConfig(
+            model=ModelConfig(attention_backend="flex"),
+            train=TrainConfig(seq_len=128),
+        )
+        config.validate(world_size=1)  # Should not raise — exactly one block is fine
+
+    def test_validate_sdpa_allows_short_seq_len(self):
+        """The bound is a flex kernel limit, not a general one."""
+        config = JobConfig(train=TrainConfig(seq_len=64))
+        config.validate(world_size=1)  # Should not raise
+
     def test_validate_vlm_seq_len_too_short(self):
         config = JobConfig(
             model=ModelConfig(max_seq_len=1024),
@@ -548,6 +600,38 @@ class TestJobConfig:
             train=TrainConfig(seq_len=600),
         )
         config.validate(world_size=1)  # Should not raise.
+
+
+class TestFlexSdpaBackendWarning:
+    """``sdpa_backend`` selects an SDPA kernel, which the flex path never uses,
+    so setting both is a silent no-op worth warning about.
+
+    ``kempnerforge.metrics.logger._configure_root`` sets ``propagate = False``
+    on the ``kempnerforge`` logger, which blocks pytest's caplog (attached at
+    the python root). Re-enable propagation around each test so caplog can see
+    records from ``kempnerforge.config.model``. Without this the tests pass in
+    isolation and fail once any earlier test has configured logging.
+    """
+
+    def setup_method(self):
+        self._kf_logger = logging.getLogger("kempnerforge")
+        self._old_propagate = self._kf_logger.propagate
+        self._kf_logger.propagate = True
+
+    def teardown_method(self):
+        self._kf_logger.propagate = self._old_propagate
+
+    def test_warns_when_sdpa_backend_set_under_flex(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="kempnerforge.config.model"):
+            ModelConfig(attention_backend="flex", sdpa_backend="flash")
+        assert any(
+            "ignored when attention_backend='flex'" in r.getMessage() for r in caplog.records
+        )
+
+    def test_silent_when_sdpa_backend_set_under_sdpa(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="kempnerforge.config.model"):
+            ModelConfig(attention_backend="sdpa", sdpa_backend="flash")
+        assert not any("ignored when attention_backend" in r.getMessage() for r in caplog.records)
 
 
 class TestHfEncoderOverrideWarning:
