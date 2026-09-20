@@ -146,3 +146,129 @@ class TestGetDpMesh:
         mesh = distributed_env
         dp_mesh = get_dp_mesh(mesh)
         assert dp_mesh is not None
+
+
+class TestFSDP2FlexAttention:
+    """Packed FlexAttention under FSDP2.
+
+    The interaction worth checking is ``default_mp_policy``'s
+    ``cast_forward_inputs=True``: FSDP2 walks the forward inputs at each wrapped
+    module boundary and casts them to bf16. ``doc_ids`` is an int64 index tensor
+    and a ``BlockMask`` is not a tensor at all, so either could plausibly be
+    mangled on the way in -- and a mangled mask does not raise, it silently
+    stops isolating documents.
+    """
+
+    SEQ = 256
+    CONFIG = ModelConfig(
+        dim=256,
+        n_layers=4,
+        n_heads=4,
+        n_kv_heads=4,
+        vocab_size=1000,
+        max_seq_len=256,
+        attention_backend="flex",
+    )
+
+    def _batch(self):
+        torch.manual_seed(0)
+        tokens = torch.randint(0, 1000, (2, self.SEQ), device="cuda")
+        half = self.SEQ // 2
+        row = [0] * half + [1] * (self.SEQ - half)
+        return tokens, torch.tensor([row] * 2, device="cuda"), half
+
+    def _model(self, mesh, backend="flex", ac_mode=None):
+        from dataclasses import replace
+
+        torch.manual_seed(42)
+        model = Transformer(replace(self.CONFIG, attention_backend=backend)).cuda()
+        if ac_mode is not None:
+            apply_ac(model, ac_mode)
+        apply_fsdp2(model, mesh)
+        return model
+
+    def test_flex_matches_sdpa_under_fsdp(self, distributed_env):
+        """Sharding parameters must not change which tokens attend to which.
+
+        Tolerance is bf16-sized because ``default_mp_policy`` computes in bf16;
+        the exactness claim lives in the isolation test below, which is
+        dtype-independent.
+        """
+        tokens, doc_ids, _ = self._batch()
+        with torch.no_grad():
+            expected = self._model(distributed_env, backend="sdpa")(tokens, doc_ids=doc_ids)
+            actual = self._model(distributed_env, backend="flex")(tokens, doc_ids=doc_ids)
+        torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+    def test_doc_ids_survive_the_forward_input_cast(self, distributed_env):
+        """int64 doc_ids must reach attention unmangled by the bf16 input cast.
+
+        Exact equality, not a tolerance: document 1 may not move *at all* when
+        document 0 changes. If the cast corrupted doc_ids the mask would widen
+        silently and this is the only thing that would notice.
+        """
+        tokens, doc_ids, boundary = self._batch()
+        model = self._model(distributed_env)
+        perturbed = tokens.clone()
+        perturbed[:, :boundary] = (perturbed[:, :boundary] + 1) % 1000
+        with torch.no_grad():
+            base = model(tokens, doc_ids=doc_ids)
+            moved = model(perturbed, doc_ids=doc_ids)
+        torch.testing.assert_close(base[:, boundary:], moved[:, boundary:], rtol=0, atol=0)
+        assert not torch.allclose(base[:, :boundary], moved[:, :boundary])
+
+    def test_explicit_block_mask_survives_fsdp_input_cast(self, distributed_env):
+        """The `block_mask=` escape hatch passes a BlockMask through the cast.
+
+        Transformer.forward normally builds the mask internally, below this
+        boundary, so this is the one path where a BlockMask is handed to a
+        sharded module as a forward argument.
+        """
+        from kempnerforge.model.masking import build_doc_causal_block_mask
+
+        tokens, doc_ids, boundary = self._batch()
+        model = self._model(distributed_env)
+        block_mask = build_doc_causal_block_mask(doc_ids, torch.device("cuda"))
+
+        perturbed = tokens.clone()
+        perturbed[:, :boundary] = (perturbed[:, :boundary] + 1) % 1000
+        with torch.no_grad():
+            from_doc_ids = model(tokens, doc_ids=doc_ids)
+            from_block_mask = model(tokens, block_mask=block_mask)
+            moved = model(perturbed, block_mask=block_mask)
+
+        torch.testing.assert_close(from_block_mask, from_doc_ids, rtol=0, atol=0)
+        torch.testing.assert_close(
+            from_block_mask[:, boundary:], moved[:, boundary:], rtol=0, atol=0
+        )
+
+    def test_flex_backward_under_fsdp(self, distributed_env):
+        tokens, doc_ids, _ = self._batch()
+        model = self._model(distributed_env)
+        model(tokens, doc_ids=doc_ids).sum().backward()
+        for name, param in model.named_parameters():
+            assert param.grad is not None, f"no gradient for {name}"
+            grad = param.grad.to_local() if hasattr(param.grad, "to_local") else param.grad
+            assert torch.isfinite(grad).all(), f"non-finite gradient for {name}"
+
+    @pytest.mark.parametrize(
+        "ac_mode",
+        [ActivationCheckpointing.selective, ActivationCheckpointing.full],
+        ids=["ac_selective", "ac_full"],
+    )
+    def test_flex_with_activation_checkpointing_under_fsdp(self, distributed_env, ac_mode):
+        """AC + FSDP2 + flex, the full production stack for a packed run."""
+        tokens, doc_ids, boundary = self._batch()
+        model = self._model(distributed_env, ac_mode=ac_mode)
+
+        perturbed = tokens.clone()
+        perturbed[:, :boundary] = (perturbed[:, :boundary] + 1) % 1000
+        with torch.no_grad():
+            base = model(tokens, doc_ids=doc_ids)
+            moved = model(perturbed, doc_ids=doc_ids)
+        torch.testing.assert_close(base[:, boundary:], moved[:, boundary:], rtol=0, atol=0)
+
+        model(tokens, doc_ids=doc_ids).sum().backward()
+        for name, param in model.named_parameters():
+            grad = param.grad.to_local() if hasattr(param.grad, "to_local") else param.grad
+            assert grad is not None and torch.isfinite(grad).all(), name
