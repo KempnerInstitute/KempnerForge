@@ -78,7 +78,7 @@ uv run python benchmarks/micro/runner.py --output results.json
 
 | Module | Covers |
 |--------|--------|
-| [`micro/bench_forward.py`](micro/bench_forward.py) | Forward pass, forward+backward, attention, MLP (125M model) |
+| [`micro/bench_forward.py`](micro/bench_forward.py) | Forward pass, forward+backward, attention, MLP (125M model); plus packed-attention throughput and peak memory, dense-mask SDPA vs FlexAttention, across seq_len / document count / GQA |
 | [`micro/bench_moe.py`](micro/bench_moe.py) | MoE forward+backward, router comparison, grouped GEMM vs Python loop |
 | [`micro/bench_optimizer.py`](micro/bench_optimizer.py) | Step time and memory for every registered optimizer |
 | [`micro/bench_data.py`](micro/bench_data.py) | Memory-mapped iteration, sequence packing, mixture sampling (CPU only) |

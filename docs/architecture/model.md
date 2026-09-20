@@ -88,23 +88,35 @@ After Q/K/V are computed, KV heads are expanded to `n_heads` via
 When `qk_norm=True`, per-head `RMSNorm(head_dim)` is applied to Q and K
 before RoPE. Stabilizes attention logits at scale (Gemma, DeepSeek-V3).
 
-### Three attention paths
+### Four attention paths
 
-1. **Packed sequences** (`doc_ids` passed in): a block-diagonal causal
-   mask isolates documents within one packed sequence. Built from
+1. **Packed sequences via FlexAttention** (`attention_backend="flex"` with
+   `doc_ids`): `Transformer.forward` builds one `BlockMask` per forward
+   (`kempnerforge/model/masking.py`) and shares it across every layer. The
+   mask predicate compiles into the attention kernel and fully-masked
+   blocks are skipped rather than computed. GQA goes through `enable_gqa`,
+   so repeated K/V heads are never materialized.
+2. **Packed sequences via dense mask** (`attention_backend="sdpa"`, the
+   default, with `doc_ids`): a block-diagonal causal mask built from
    `doc_ids.unsqueeze(2) == doc_ids.unsqueeze(1)` intersected with the
    causal triangle, then passed to
-   `F.scaled_dot_product_attention(..., attn_mask=...)`.
-2. **Standard causal** (training and prefill, no `doc_ids`): SDPA with
-   `is_causal=True`.
-3. **Single-token decode** (`seq_len == 1` with a KV cache): no mask —
+   `F.scaled_dot_product_attention(..., attn_mask=...)`. An explicit
+   `attn_mask` is not a FlashAttention-2 shape, so SDPA falls back to the
+   mem-efficient kernel and the `(B, 1, S, S)` mask is rebuilt in every
+   layer. This path also carries `key_padding_mask` (VLM video), which the
+   flex path does not.
+3. **Standard causal** (training and prefill, no `doc_ids`): SDPA with
+   `is_causal=True`. Both backends take this path when packing is off.
+4. **Single-token decode** (`seq_len == 1` with a KV cache): no mask —
    the query attends to all cached positions. `is_causal=True` here
    would incorrectly restrict attention to only the first key.
 
-A fourth, slower path fires only when `capture_attention_weights=True`:
+A fifth, slower path fires only when `capture_attention_weights=True`:
 `_attention_with_weights` computes `softmax(Q·Kᵀ / √d)` manually so
 attention weights can be extracted for interpretability. Don't enable it
-for training runs.
+for training runs, and note it is SDPA-only — the flex kernel fuses the
+mask and never forms an attention-weight matrix, so combining the two
+raises.
 
 ### KV cache placement
 
@@ -116,7 +128,48 @@ copies.
 ### SDPA backend
 
 `sdpa_backend` (default `"auto"`) selects flash / mem-efficient / cudnn /
-math via a context manager. `"auto"` lets PyTorch pick.
+math via a context manager. `"auto"` lets PyTorch pick. It has no effect
+under `attention_backend="flex"`, which never routes through the SDPA
+kernel selector; setting both logs a warning.
+
+### Attention backend
+
+`attention_backend` (default `"sdpa"`) chooses between paths 1 and 2 above.
+It only matters when packing is on — an unpacked batch takes the
+`is_causal` fast path either way — and the default is bit-identical to the
+behaviour before flex existed.
+
+Measured on one H200, 125M params (`dim=768`, 12 layers), forward+backward,
+8 documents per sequence
+([`benchmarks/micro/bench_forward.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/benchmarks/micro/bench_forward.py)):
+
+| seq_len | `sdpa` packed | `flex` packed | speedup | peak memory |
+|---|---|---|---|---|
+| 512 | 278k tok/s | 199k tok/s | 0.72x | 4.97 → 4.87 GB |
+| 2048 | 236k tok/s | 310k tok/s | **1.31x** | 10.16 → 9.36 GB |
+| 8192 | 124k tok/s | 290k tok/s | **2.34x** | 12.60 → 9.38 GB |
+
+Three things worth reading off that table:
+
+- **Flex loses below ~1k.** The mask block size is 128, so a short sequence
+  has little block sparsity to exploit and pays mask-construction and
+  kernel-launch overhead for nothing. `seq_len < 128` is rejected outright
+  (it is also numerically wrong there under `torch.compile`).
+- **The gap widens with sequence length**, because the dense path's cost is
+  quadratic in `seq_len` while the block-diagonal one is closer to
+  quadratic in *document* length. At 8192 the dense-mask path is slower
+  than not packing at all (124k vs 236k tok/s unpacked) — packing was
+  costing throughput rather than saving it. Flex at 8192 (290k) is *faster*
+  than unpacked causal, because block-diagonal attention does strictly less
+  work than full causal.
+- **Memory falls by the size of the mask.** The `(B, 1, S, S)` bool tensor
+  is what flex deletes: 3.2 GB at `S=8192`.
+
+More documents per sequence makes the mask sparser, so flex improves while
+the dense path does not move at all (at `S=2048`: 296k / 313k / 313k tok/s
+for 2 / 16 / 64 documents, against a flat 236k for `sdpa`). GQA widens the
+gap further (1.37x at `S=2048`, `n_heads=12`, `n_kv_heads=4`), since flex
+passes `enable_gqa` instead of materializing repeated K/V heads.
 
 ## MLP
 
