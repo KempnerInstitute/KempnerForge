@@ -49,10 +49,11 @@ def build_doc_causal_block_mask(doc_ids: torch.Tensor, device: torch.device) -> 
     keeps the mask correct under tensor parallelism, where each rank holds only
     a shard of the heads.
 
-    ``seq_len`` must be at least ``FLEX_BLOCK_SIZE``: below it a compiled model
-    silently leaks attention across document boundaries, so ``JobConfig.validate``
-    rejects that configuration outright. The kernel itself is fine at those
-    lengths -- the fault is somewhere in the compiled graph and is not root-caused.
+    ``seq_len`` must be at least ``FLEX_BLOCK_SIZE``: below it an Inductor-compiled
+    model silently leaks attention across document boundaries, so
+    ``JobConfig.validate`` rejects that configuration outright. This kernel is not
+    the culprit -- it is exact at those lengths, as is the same model under
+    ``backend="eager"`` or ``"aot_eager"``; only Inductor codegen diverges.
 
     Args:
         doc_ids: Per-token document ids, shape ``(batch, seq_len)``.
