@@ -49,9 +49,10 @@ def build_doc_causal_block_mask(doc_ids: torch.Tensor, device: torch.device) -> 
     keeps the mask correct under tensor parallelism, where each rank holds only
     a shard of the heads.
 
-    ``seq_len`` must be at least ``FLEX_BLOCK_SIZE``. Below one block the
-    compiled kernel silently returns wrong results -- documents leak into each
-    other -- so ``JobConfig.validate`` rejects that configuration outright.
+    ``seq_len`` must be at least ``FLEX_BLOCK_SIZE``: below it a compiled model
+    silently leaks attention across document boundaries, so ``JobConfig.validate``
+    rejects that configuration outright. The kernel itself is fine at those
+    lengths -- the fault is somewhere in the compiled graph and is not root-caused.
 
     Args:
         doc_ids: Per-token document ids, shape ``(batch, seq_len)``.

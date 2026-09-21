@@ -209,19 +209,26 @@ class TestModelConfig:
 
     def test_flex_rejects_head_dim_below_16(self):
         """FlexAttention's Triton template does not lower below head_dim 16."""
-        with pytest.raises(ValueError, match="16 <= head_dim <= 256"):
+        with pytest.raises(ValueError, match="head_dim >= 16"):
             ModelConfig(dim=64, n_heads=8, attention_backend="flex")
 
-    def test_flex_rejects_head_dim_above_256(self):
-        with pytest.raises(ValueError, match="16 <= head_dim <= 256"):
-            ModelConfig(dim=512, n_heads=1, attention_backend="flex")
-
-    def test_flex_accepts_head_dim_at_the_bounds(self):
+    def test_flex_accepts_head_dim_at_the_floor(self):
         assert ModelConfig(dim=64, n_heads=4, attention_backend="flex").head_dim == 16
-        assert ModelConfig(dim=256, n_heads=1, attention_backend="flex").head_dim == 256
+
+    @pytest.mark.parametrize("head_dim", [256, 320, 384, 512])
+    def test_flex_accepts_large_head_dim(self, head_dim):
+        """There is no upper bound: these were measured correct on H200.
+
+        An earlier revision capped head_dim at 256, which rejected working
+        configurations. The usable set is not an interval either -- 192 fails to
+        compile while 128 and 256 are fine -- so it is deliberately not expressed
+        as a range; unsupported sizes surface as a loud compile-time error.
+        """
+        config = ModelConfig(dim=head_dim, n_heads=1, attention_backend="flex")
+        assert config.head_dim == head_dim
 
     def test_sdpa_does_not_constrain_head_dim(self):
-        """The bound is a flex kernel limit, not an architecture limit."""
+        """The floor is a flex kernel limit, not an architecture limit."""
         assert ModelConfig(dim=64, n_heads=8).head_dim == 8
 
 
