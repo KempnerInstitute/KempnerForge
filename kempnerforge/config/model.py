@@ -30,9 +30,16 @@ class Activation(StrEnum):
 # tracing, AOTAutograd and the FlexAttention kernel are all innocent (bare
 # compiled flex_attention also matches a dense reference at these lengths). It
 # further needs graph scale: proj + rope + flex + o_proj compiled on its own is
-# exact at seq_len 32, while a one-layer Transformer is not. Not reduced further;
-# the bound is empirical. It costs nothing either way, since a sub-block sequence
-# has no block sparsity to exploit.
+# exact at seq_len 32, while a one-layer Transformer is not. Not reduced further.
+#
+# Not fixed by upgrading: reproduced with bit-identical drift on torch 2.11.0+cu128,
+# 2.13.0+cu129 and 2.14.0+cu130, so this bound is not a temporary workaround waiting
+# on a release. The dense-mask SDPA path is unaffected at every length, eager and
+# compiled alike -- this is specific to FlexAttention under Inductor, and existing
+# packed runs on the default backend are not at risk.
+#
+# It costs nothing either way, since a sub-block sequence has no block sparsity
+# to exploit.
 FLEX_BLOCK_SIZE = 128
 
 # Smallest head_dim FlexAttention's Triton template will lower; 8 fails with
