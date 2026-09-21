@@ -197,27 +197,31 @@ class JobConfig:
                 "splitting. Use FSDP, TP, or EP instead."
             )
 
+        # Why this is an error rather than a warning: PipelineStageModule.forward
+        # receives only hidden states, so doc_ids never reaches the stages and
+        # packed documents attend across each other. The labels still carry -100
+        # at the boundaries, so the loss looks correct while attention leaks --
+        # there is no signal in the training curve that would reveal it.
+        # Measured on 2 GPUs: pp=2 output matches unpacked causal attention
+        # exactly, rather than the packed reference.
         if self.distributed.pp > 1 and self.data.pack_sequences:
             raise ValueError(
                 "Sequence packing + Pipeline Parallelism is not supported. "
-                "PipelineStageModule.forward receives only hidden states, so doc_ids "
-                "never reaches the stages and packed documents would attend across "
-                "document boundaries while the labels still mask those positions -- "
-                "silently training on cross-document context. "
                 "Set data.pack_sequences=false, or train without pipeline parallelism."
             )
 
+        # Why this is an error rather than a warning: below FLEX_BLOCK_SIZE an
+        # Inductor-compiled model silently leaks attention across document
+        # boundaries. The same model under backend="eager"/"aot_eager" is exact,
+        # as is the FlexAttention kernel on its own, so this is Inductor codegen
+        # rather than a fault in the kernel or in tracing; it reproduces
+        # identically on torch 2.11/2.13/2.14 and is not reduced further. The
+        # bound costs nothing: a sequence shorter than the mask block size has no
+        # block sparsity to exploit, so flex would be pure overhead regardless.
         if self.model.attention_backend == "flex" and self.train.seq_len < FLEX_BLOCK_SIZE:
             raise ValueError(
-                f"attention_backend='flex' requires train.seq_len >= {FLEX_BLOCK_SIZE} "
-                f"(got {self.train.seq_len}). Below that, an Inductor-compiled model "
-                "silently leaks attention across document boundaries; the same model under "
-                "backend='eager' or 'aot_eager' is exact, as is the FlexAttention kernel on "
-                "its own, so this is an Inductor codegen issue rather than a fault in the "
-                "kernel or in tracing. Not reduced further; the bound is empirical. "
-                "It costs nothing in practice: a sequence shorter "
-                "than the mask block size has no block sparsity to exploit, so flex would "
-                "be pure overhead. Use attention_backend='sdpa' instead."
+                f"attention_backend='flex' requires train.seq_len >= {FLEX_BLOCK_SIZE}, "
+                f"got {self.train.seq_len}. Use attention_backend='sdpa' for shorter sequences."
             )
 
         if self.distributed.ep > 1:
