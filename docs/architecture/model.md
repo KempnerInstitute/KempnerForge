@@ -153,8 +153,11 @@ Three things worth reading off that table:
 
 - **Flex loses below ~1k.** The mask block size is 128, so a short sequence
   has little block sparsity to exploit and pays mask-construction and
-  kernel-launch overhead for nothing. `seq_len < 128` is rejected outright
-  (it is also numerically wrong there under `torch.compile`).
+  kernel-launch overhead for nothing. `seq_len < 128` is rejected outright,
+  because a compiled model also leaks attention across document boundaries
+  there. The kernel is correct at those lengths in isolation, so the fault
+  sits somewhere in the compiled graph rather than in FlexAttention; the
+  cause is unestablished and the bound is empirical.
 - **The gap widens with sequence length**, because the dense path's cost is
   quadratic in `seq_len` while the block-diagonal one is closer to
   quadratic in *document* length. At 8192 the dense-mask path is slower
