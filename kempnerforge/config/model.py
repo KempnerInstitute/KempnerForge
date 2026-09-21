@@ -23,11 +23,16 @@ class Activation(StrEnum):
 # boundaries below it and is exact at or above it -- measured at seq_len
 # 32/64/96/120/127 (leaking) against 128/129/130/160/200/256/300/384/512/1000/
 # 2048 (exact), for head_dim 32, 64 and 128 alike, so this is a sequence-length
-# effect rather than a head-dimension one. The kernel is *not* at fault: bare
-# compiled flex_attention matches a dense reference at those same short lengths,
-# so the divergence only appears once the call sits inside a compiled Transformer
-# graph. Root cause unestablished; the bound is empirical. It costs nothing
-# either way, since a sub-block sequence has no block sparsity to exploit.
+# effect rather than a head-dimension one.
+#
+# Localized to Inductor codegen: the same model compiled with backend="eager" or
+# backend="aot_eager" is exact, and only backend="inductor" leaks -- so dynamo
+# tracing, AOTAutograd and the FlexAttention kernel are all innocent (bare
+# compiled flex_attention also matches a dense reference at these lengths). It
+# further needs graph scale: proj + rope + flex + o_proj compiled on its own is
+# exact at seq_len 32, while a one-layer Transformer is not. Not reduced further;
+# the bound is empirical. It costs nothing either way, since a sub-block sequence
+# has no block sparsity to exploit.
 FLEX_BLOCK_SIZE = 128
 
 # Smallest head_dim FlexAttention's Triton template will lower; 8 fails with

@@ -210,11 +210,12 @@ class JobConfig:
         if self.model.attention_backend == "flex" and self.train.seq_len < FLEX_BLOCK_SIZE:
             raise ValueError(
                 f"attention_backend='flex' requires train.seq_len >= {FLEX_BLOCK_SIZE} "
-                f"(got {self.train.seq_len}). Below that, a compiled model silently leaks "
-                "attention across document boundaries. The FlexAttention kernel itself is "
-                "correct at those lengths in isolation, so the fault is somewhere in the "
-                "compiled graph rather than the kernel, and the cause is not established; "
-                "the bound is empirical. It costs nothing in practice: a sequence shorter "
+                f"(got {self.train.seq_len}). Below that, an Inductor-compiled model "
+                "silently leaks attention across document boundaries; the same model under "
+                "backend='eager' or 'aot_eager' is exact, as is the FlexAttention kernel on "
+                "its own, so this is an Inductor codegen issue rather than a fault in the "
+                "kernel or in tracing. Not reduced further; the bound is empirical. "
+                "It costs nothing in practice: a sequence shorter "
                 "than the mask block size has no block sparsity to exploit, so flex would "
                 "be pure overhead. Use attention_backend='sdpa' instead."
             )
