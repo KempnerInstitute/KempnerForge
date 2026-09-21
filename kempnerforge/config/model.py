@@ -18,12 +18,29 @@ class Activation(StrEnum):
     relu = "relu"
 
 
-# FlexAttention's mask block size. Sequences shorter than one block are rejected
-# under attention_backend="flex": the compiled kernel returns incorrect results
-# there -- measured, cross-document attention leaks below 128 and is exact at or
-# above it -- and a sub-block sequence has no block sparsity to exploit anyway,
-# so flex would be pure overhead even if it were correct.
+# FlexAttention's mask block size, and the seq_len floor for
+# attention_backend="flex". A compiled model leaks attention across document
+# boundaries below it and is exact at or above it -- measured at seq_len
+# 32/64/96/120/127 (leaking) against 128/129/130/160/200/256/300/384/512/1000/
+# 2048 (exact), for head_dim 32, 64 and 128 alike, so this is a sequence-length
+# effect rather than a head-dimension one. The kernel is *not* at fault: bare
+# compiled flex_attention matches a dense reference at those same short lengths,
+# so the divergence only appears once the call sits inside a compiled Transformer
+# graph. Root cause unestablished; the bound is empirical. It costs nothing
+# either way, since a sub-block sequence has no block sparsity to exploit.
 FLEX_BLOCK_SIZE = 128
+
+# Smallest head_dim FlexAttention's Triton template will lower; 8 fails with
+# "NYI: embedding dimension". There is deliberately no upper bound: head_dim
+# 256, 320, 384 and 512 were all measured correct (forward and backward, ~2e-6
+# against a dense reference on H200 / torch 2.11). The set of usable sizes is
+# not an interval, though -- head_dim 192 fails to compile there ("No valid
+# triton configs", shared-memory exhaustion) while 128 and 256 on either side
+# of it are fine. That failure is a loud compile-time error rather than silent
+# corruption, so it is documented rather than guarded: a config-time check
+# cannot predict which sizes Triton can tile on a given GPU, and rejecting an
+# interval would block the many large head_dims that do work.
+FLEX_MIN_HEAD_DIM = 16
 
 
 @dataclass
@@ -105,11 +122,12 @@ class ModelConfig:
                 f"Unknown attention_backend: '{self.attention_backend}'. Options: 'sdpa', 'flex'"
             )
         if self.attention_backend == "flex":
-            if not 16 <= self.head_dim <= 256:
+            if self.head_dim < FLEX_MIN_HEAD_DIM:
                 raise ValueError(
-                    f"attention_backend='flex' requires 16 <= head_dim <= 256, got "
+                    f"attention_backend='flex' requires head_dim >= {FLEX_MIN_HEAD_DIM}, got "
                     f"{self.head_dim} (dim={self.dim} // n_heads={self.n_heads}). "
-                    "FlexAttention's Triton template does not lower outside that range."
+                    "FlexAttention's Triton template does not lower below that "
+                    "(head_dim 8 fails with 'NYI: embedding dimension')."
                 )
             if self.sdpa_backend != "auto":
                 import logging

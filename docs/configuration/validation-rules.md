@@ -29,12 +29,19 @@ File:
 - `n_heads % n_kv_heads == 0` (GQA replication factor is integral).
 - `sdpa_backend ∈ {"auto", "flash", "efficient", "cudnn", "math"}`.
 - `attention_backend ∈ {"sdpa", "flex"}`.
-- `attention_backend = "flex"` requires `16 ≤ dim // n_heads ≤ 256` (FlexAttention
-  Triton-template limits), and warns that `sdpa_backend` is ignored when set.
-- `attention_backend = "flex"` requires `train.seq_len ≥ 128`, FlexAttention's
-  mask block size. Below one block the compiled kernel returns incorrect
-  results (documents leak into each other) and there is no block sparsity to
-  exploit anyway.
+- `attention_backend = "flex"` requires `dim // n_heads ≥ 16` (below that the
+  Triton template fails to lower), and warns that `sdpa_backend` is ignored when
+  set. There is no upper bound — head_dim 256/320/384/512 are all verified
+  working. Note the usable set is not an interval: head_dim 192 fails to compile
+  on H200 / torch 2.11 while 128 and 256 are fine. That surfaces as a loud
+  compile-time error, not silent corruption, so it is documented rather than
+  guarded.
+- `attention_backend = "flex"` requires `train.seq_len ≥ 128`. Below that a
+  compiled model silently leaks attention across document boundaries. The
+  kernel is correct at those lengths in isolation, so the fault lies in the
+  compiled graph rather than the kernel; the cause is unestablished and the
+  bound is empirical. It costs nothing, since a sequence below the mask block
+  size has no block sparsity to exploit.
 - `pp > 1` rejects `data.pack_sequences` (pipeline stages never receive `doc_ids`).
 - When `num_experts > 0` (MoE):
   - `moe_top_k > 0`

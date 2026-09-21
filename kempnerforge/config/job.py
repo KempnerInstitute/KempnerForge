@@ -210,10 +210,13 @@ class JobConfig:
         if self.model.attention_backend == "flex" and self.train.seq_len < FLEX_BLOCK_SIZE:
             raise ValueError(
                 f"attention_backend='flex' requires train.seq_len >= {FLEX_BLOCK_SIZE} "
-                f"(got {self.train.seq_len}). That is FlexAttention's mask block size; "
-                "below one block the compiled kernel silently returns incorrect results "
-                "(documents leak into each other), and a sub-block sequence has no block "
-                "sparsity to exploit anyway. Use attention_backend='sdpa' instead."
+                f"(got {self.train.seq_len}). Below that, a compiled model silently leaks "
+                "attention across document boundaries. The FlexAttention kernel itself is "
+                "correct at those lengths in isolation, so the fault is somewhere in the "
+                "compiled graph rather than the kernel, and the cause is not established; "
+                "the bound is empirical. It costs nothing in practice: a sequence shorter "
+                "than the mask block size has no block sparsity to exploit, so flex would "
+                "be pure overhead. Use attention_backend='sdpa' instead."
             )
 
         if self.distributed.ep > 1:
