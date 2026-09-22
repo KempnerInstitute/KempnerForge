@@ -131,6 +131,14 @@ class JobConfig:
                 "the VLM wrapper, so a [vlm] section (and [vision_encoder]) is required."
             )
 
+        # Pipeline stages never receive doc_ids, so packing would silently train
+        # on cross-document context. See issue #204.
+        if self.distributed.pp > 1 and self.data.pack_sequences:
+            raise ValueError(
+                "Sequence packing + Pipeline Parallelism is not supported. "
+                "Set data.pack_sequences=false, or train without pipeline parallelism."
+            )
+
     @property
     def is_vlm(self) -> bool:
         """Whether this job builds a ``VLMWrapper`` around the text backbone."""
@@ -195,19 +203,6 @@ class JobConfig:
                 "MoE + Pipeline Parallelism is not supported. MoE layers use "
                 "data-dependent routing that is incompatible with pipeline stage "
                 "splitting. Use FSDP, TP, or EP instead."
-            )
-
-        # Why this is an error rather than a warning: PipelineStageModule.forward
-        # receives only hidden states, so doc_ids never reaches the stages and
-        # packed documents attend across each other. The labels still carry -100
-        # at the boundaries, so the loss looks correct while attention leaks --
-        # there is no signal in the training curve that would reveal it.
-        # Measured on 2 GPUs: pp=2 output matches unpacked causal attention
-        # exactly, rather than the packed reference.
-        if self.distributed.pp > 1 and self.data.pack_sequences:
-            raise ValueError(
-                "Sequence packing + Pipeline Parallelism is not supported. "
-                "Set data.pack_sequences=false, or train without pipeline parallelism."
             )
 
         if self.distributed.ep > 1:
