@@ -131,6 +131,14 @@ class JobConfig:
                 "the VLM wrapper, so a [vlm] section (and [vision_encoder]) is required."
             )
 
+        # Below one mask block, an Inductor-compiled model leaks attention across
+        # document boundaries; see FLEX_BLOCK_SIZE for the measurements.
+        if self.model.attention_backend == "flex" and self.train.seq_len < FLEX_BLOCK_SIZE:
+            raise ValueError(
+                f"attention_backend='flex' requires train.seq_len >= {FLEX_BLOCK_SIZE}, "
+                f"got {self.train.seq_len}. Use attention_backend='sdpa' for shorter sequences."
+            )
+
         # Pipeline stages never receive doc_ids, so packing would silently train
         # on cross-document context. See issue #204.
         if self.distributed.pp > 1 and self.data.pack_sequences:
@@ -203,20 +211,6 @@ class JobConfig:
                 "MoE + Pipeline Parallelism is not supported. MoE layers use "
                 "data-dependent routing that is incompatible with pipeline stage "
                 "splitting. Use FSDP, TP, or EP instead."
-            )
-
-        # Why this is an error rather than a warning: below FLEX_BLOCK_SIZE an
-        # Inductor-compiled model silently leaks attention across document
-        # boundaries. The same model under backend="eager"/"aot_eager" is exact,
-        # as is the FlexAttention kernel on its own, so this is Inductor codegen
-        # rather than a fault in the kernel or in tracing; it reproduces
-        # identically on torch 2.11/2.13/2.14 and is not reduced further. The
-        # bound costs nothing: a sequence shorter than the mask block size has no
-        # block sparsity to exploit, so flex would be pure overhead regardless.
-        if self.model.attention_backend == "flex" and self.train.seq_len < FLEX_BLOCK_SIZE:
-            raise ValueError(
-                f"attention_backend='flex' requires train.seq_len >= {FLEX_BLOCK_SIZE}, "
-                f"got {self.train.seq_len}. Use attention_backend='sdpa' for shorter sequences."
             )
 
         if self.distributed.ep > 1:

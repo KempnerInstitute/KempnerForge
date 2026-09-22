@@ -544,23 +544,22 @@ class TestJobConfig:
         config = JobConfig(distributed=DistributedConfig(pp=2, dp_shard=1))
         config.validate(world_size=2)  # Should not raise — PP alone is fine
 
-    def test_validate_flex_rejects_seq_len_below_block_size(self):
-        """Below one FlexAttention block the compiled kernel leaks across documents."""
-        config = JobConfig(
-            model=ModelConfig(attention_backend="flex"),
-            train=TrainConfig(seq_len=64),
-        )
+    def test_flex_rejects_seq_len_below_block_size_at_construction(self):
+        """Decidable from the config alone, so it fires in __post_init__."""
         with pytest.raises(ValueError, match="requires train.seq_len >= 128"):
-            config.validate(world_size=1)
+            JobConfig(
+                model=ModelConfig(attention_backend="flex"),
+                train=TrainConfig(seq_len=64),
+            )
 
-    def test_validate_flex_accepts_seq_len_at_block_size(self):
+    def test_flex_accepts_seq_len_at_block_size(self):
         config = JobConfig(
             model=ModelConfig(attention_backend="flex"),
             train=TrainConfig(seq_len=128),
         )
         config.validate(world_size=1)  # Should not raise — exactly one block is fine
 
-    def test_validate_sdpa_allows_short_seq_len(self):
+    def test_sdpa_allows_short_seq_len(self):
         """The bound is a flex kernel limit, not a general one."""
         config = JobConfig(train=TrainConfig(seq_len=64))
         config.validate(world_size=1)  # Should not raise
