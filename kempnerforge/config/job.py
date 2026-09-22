@@ -131,6 +131,14 @@ class JobConfig:
                 "the VLM wrapper, so a [vlm] section (and [vision_encoder]) is required."
             )
 
+        # Pipeline stages never receive doc_ids, so packing would silently train
+        # on cross-document context. See issue #204.
+        if self.distributed.pp > 1 and self.data.pack_sequences:
+            raise ValueError(
+                "Sequence packing + Pipeline Parallelism is not supported. "
+                "Set data.pack_sequences=false, or train without pipeline parallelism."
+            )
+
     @property
     def is_vlm(self) -> bool:
         """Whether this job builds a ``VLMWrapper`` around the text backbone."""
