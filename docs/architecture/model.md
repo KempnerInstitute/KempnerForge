@@ -145,19 +145,20 @@ Measured on one H200, 125M params (`dim=768`, 12 layers), forward+backward,
 
 | seq_len | `sdpa` packed | `flex` packed | speedup | peak memory |
 |---|---|---|---|---|
-| 512 | 278k tok/s | 199k tok/s | 0.72x | 4.97 → 4.87 GB |
+| 512 | 279k tok/s | 294k tok/s | 1.05x | 4.97 → 4.87 GB |
 | 2048 | 236k tok/s | 310k tok/s | **1.31x** | 10.16 → 9.36 GB |
 | 8192 | 124k tok/s | 290k tok/s | **2.34x** | 12.60 → 9.38 GB |
 
 Three things worth reading off that table:
 
-- **Flex loses below ~1k.** The mask block size is 128, so a short sequence
-  has little block sparsity to exploit and pays mask-construction and
-  kernel-launch overhead for nothing. `seq_len < 128` is rejected outright,
-  because a compiled model also leaks attention across document boundaries
-  there. The kernel is correct at those lengths in isolation, so the fault
-  sits somewhere in the compiled graph rather than in FlexAttention; the
-  cause is unestablished and the bound is empirical.
+- **The win shrinks toward short sequences, but does not reverse.** At 512 the
+  two are near parity (1.05x): the mask block size is 128, so a short sequence
+  has little block sparsity to exploit and mask construction is a larger share
+  of the step. Separately, `seq_len < 128` is rejected outright, because an
+  Inductor-compiled model leaks attention across document boundaries there.
+  That is a correctness bound, not a performance one — the kernel is exact at
+  those lengths in isolation, so the fault sits in Inductor codegen rather than
+  in FlexAttention; the cause is unestablished and the bound is empirical.
 - **The gap widens with sequence length**, because the dense path's cost is
   quadratic in `seq_len` while the block-diagonal one is closer to
   quadratic in *document* length. At 8192 the dense-mask path is slower

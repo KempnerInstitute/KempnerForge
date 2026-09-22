@@ -218,3 +218,46 @@ class TestTensorParallelFlexAttention:
             assert torch.isfinite(
                 param.grad.to_local() if hasattr(param.grad, "to_local") else param.grad
             ).all(), name
+
+
+class TestTensorParallelMatchesSingleGPU:
+    """Sharding must not change the answer, only where it is computed.
+
+    The other TP tests compare backends against each other under TP, or check
+    that ranks agree with one another. Neither would catch sharding that is
+    wrong in the same way everywhere -- all ranks can agree on the wrong answer.
+    This compares against an unsharded model built from identical weights.
+    """
+
+    SEQ = 256
+
+    def _inputs(self, device):
+        torch.manual_seed(0)
+        tokens = torch.randint(0, 1000, (2, self.SEQ), device=device)
+        half = self.SEQ // 2
+        row = [0] * half + [1] * (self.SEQ - half)
+        return tokens, torch.tensor([row] * 2, device=device), half
+
+    @pytest.mark.parametrize("backend", ["sdpa", "flex"])
+    @pytest.mark.parametrize("packed", [False, True], ids=["unpacked", "packed"])
+    def test_matches_unsharded_reference(self, tp_mesh, backend, packed):
+        config = replace(TP_FLEX_CONFIG, attention_backend=backend)
+        device = torch.device("cuda")
+        tokens, doc_ids, _ = self._inputs(device)
+        kwargs = {"doc_ids": doc_ids} if packed else {}
+
+        # Same seed on both, so any difference is sharding rather than init.
+        torch.manual_seed(42)
+        reference = Transformer(config).cuda().eval()
+        torch.manual_seed(42)
+        sharded = Transformer(config).cuda()
+        apply_tensor_parallel(sharded, tp_mesh)
+        sharded.eval()
+
+        with torch.no_grad():
+            expected = reference(tokens, **kwargs)
+            actual = sharded(tokens, **kwargs)
+
+        # TP changes reduction order in the row-parallel all-reduce, so this is
+        # a numerical-agreement bound rather than bit-equality.
+        torch.testing.assert_close(actual, expected, rtol=2e-4, atol=2e-4)

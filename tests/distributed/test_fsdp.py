@@ -272,3 +272,46 @@ class TestFSDP2FlexAttention:
         for name, param in model.named_parameters():
             grad = param.grad.to_local() if hasattr(param.grad, "to_local") else param.grad
             assert grad is not None and torch.isfinite(grad).all(), name
+
+
+class TestFSDP2MatchesSingleGPU:
+    """Parameter sharding must not change the answer.
+
+    As with TP, the other FSDP tests compare backends against each other under
+    FSDP; none check the sharded model against an unsharded one.
+    """
+
+    SEQ = 256
+    CONFIG = ModelConfig(
+        dim=256, n_layers=4, n_heads=4, n_kv_heads=4, vocab_size=1000, max_seq_len=256
+    )
+
+    def _inputs(self):
+        torch.manual_seed(0)
+        tokens = torch.randint(0, 1000, (2, self.SEQ), device="cuda")
+        half = self.SEQ // 2
+        row = [0] * half + [1] * (self.SEQ - half)
+        return tokens, torch.tensor([row] * 2, device="cuda")
+
+    @pytest.mark.parametrize("backend", ["sdpa", "flex"])
+    @pytest.mark.parametrize("packed", [False, True], ids=["unpacked", "packed"])
+    def test_matches_unsharded_reference(self, distributed_env, backend, packed):
+        from dataclasses import replace
+
+        config = replace(self.CONFIG, attention_backend=backend)
+        tokens, doc_ids = self._inputs()
+        kwargs = {"doc_ids": doc_ids} if packed else {}
+
+        torch.manual_seed(42)
+        reference = Transformer(config).cuda().to(torch.bfloat16).eval()
+        torch.manual_seed(42)
+        sharded = Transformer(config).cuda()
+        apply_fsdp2(sharded, distributed_env)
+        sharded.eval()
+
+        with torch.no_grad():
+            expected = reference(tokens, **kwargs)
+            actual = sharded(tokens, **kwargs)
+
+        # default_mp_policy computes in bf16, so this is a bf16-sized bound.
+        torch.testing.assert_close(actual.float(), expected.float(), rtol=2e-2, atol=2e-2)
