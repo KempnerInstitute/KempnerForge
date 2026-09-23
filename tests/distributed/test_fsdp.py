@@ -153,10 +153,11 @@ class TestFSDP2FlexAttention:
 
     The interaction worth checking is ``default_mp_policy``'s
     ``cast_forward_inputs=True``: FSDP2 walks the forward inputs at each wrapped
-    module boundary and casts them to bf16. ``doc_ids`` is an int64 index tensor
-    and a ``BlockMask`` is not a tensor at all, so either could plausibly be
-    mangled on the way in -- and a mangled mask does not raise, it silently
-    stops isolating documents.
+    module boundary and casts them to bf16, and ``doc_ids`` is an int64 index
+    tensor that could plausibly be mangled on the way in -- a mangled mask does
+    not raise, it silently stops isolating documents. The ``BlockMask`` itself
+    is built inside ``Transformer.forward``, below this boundary, so it never
+    crosses the cast.
     """
 
     SEQ = 256
@@ -216,31 +217,6 @@ class TestFSDP2FlexAttention:
             moved = model(perturbed, doc_ids=doc_ids)
         torch.testing.assert_close(base[:, boundary:], moved[:, boundary:], rtol=0, atol=0)
         assert not torch.allclose(base[:, :boundary], moved[:, :boundary])
-
-    def test_explicit_block_mask_survives_fsdp_input_cast(self, distributed_env):
-        """The `block_mask=` escape hatch passes a BlockMask through the cast.
-
-        Transformer.forward normally builds the mask internally, below this
-        boundary, so this is the one path where a BlockMask is handed to a
-        sharded module as a forward argument.
-        """
-        from kempnerforge.model.masking import build_doc_causal_block_mask
-
-        tokens, doc_ids, boundary = self._batch()
-        model = self._model(distributed_env)
-        block_mask = build_doc_causal_block_mask(doc_ids, torch.device("cuda"))
-
-        perturbed = tokens.clone()
-        perturbed[:, :boundary] = (perturbed[:, :boundary] + 1) % 1000
-        with torch.no_grad():
-            from_doc_ids = model(tokens, doc_ids=doc_ids)
-            from_block_mask = model(tokens, block_mask=block_mask)
-            moved = model(perturbed, block_mask=block_mask)
-
-        torch.testing.assert_close(from_block_mask, from_doc_ids, rtol=0, atol=0)
-        torch.testing.assert_close(
-            from_block_mask[:, boundary:], moved[:, boundary:], rtol=0, atol=0
-        )
 
     def test_flex_backward_under_fsdp(self, distributed_env):
         tokens, doc_ids, _ = self._batch()
