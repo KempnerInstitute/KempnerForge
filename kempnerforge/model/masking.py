@@ -26,6 +26,7 @@ from torch.nn.attention.flex_attention import BlockMask, create_block_mask, flex
 # that it ignores ``functools.lru_cache`` wrappers and traces the wrapped body
 # directly, which it flags as a silent-incorrectness risk.
 _FLEX_COMPILED = torch.compile(flex_attention, dynamic=False)
+_CREATE_BLOCK_MASK_COMPILED = torch.compile(create_block_mask, dynamic=False)
 
 
 def flex_attention_fn(compiled: bool) -> Callable[..., Any]:
@@ -77,14 +78,18 @@ def _build_doc_causal_block_mask(doc_ids: torch.Tensor, device: torch.device) ->
     """
     batch, seq_len = doc_ids.shape
     # int32 halves the index-load cost inside the mask kernel. The dataset emits
-    # int64; one sequence never holds anywhere near 2**31 documents.
-    doc_ids = doc_ids.to(torch.int32)
+    # int64; one sequence never holds anywhere near 2**31 documents. Moving to
+    # `device` here too, so the signature means what it says rather than quietly
+    # requiring the caller to have done it.
+    doc_ids = doc_ids.to(device=device, dtype=torch.int32)
 
     def mask_mod(
         b: torch.Tensor, h: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor
     ) -> torch.Tensor:
         return (kv_idx <= q_idx) & (doc_ids[b, q_idx] == doc_ids[b, kv_idx])
 
-    return create_block_mask(
-        mask_mod, B=batch, H=None, Q_LEN=seq_len, KV_LEN=seq_len, device=device
-    )
+    # Compiled on CUDA: eager construction costs ~3 ms per forward regardless of
+    # batch, which is pure overhead at small per-rank work. CPU stays eager to
+    # keep unit tests off Inductor's C++ codegen path.
+    builder = _CREATE_BLOCK_MASK_COMPILED if device.type == "cuda" else create_block_mask
+    return builder(mask_mod, B=batch, H=None, Q_LEN=seq_len, KV_LEN=seq_len, device=device)

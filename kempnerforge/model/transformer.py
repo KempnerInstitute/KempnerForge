@@ -329,7 +329,6 @@ class Transformer(nn.Module):
         modality: ModalityContext | None = None,
         kv_caches: list[KVCache] | None = None,
         doc_ids: torch.Tensor | None = None,
-        block_mask: BlockMask | None = None,
     ) -> torch.Tensor:
         """Forward pass.
 
@@ -436,9 +435,9 @@ class Transformer(nn.Module):
         # rather than the dense (B, 1, S, S) mask each Attention would otherwise
         # rebuild. key_padding_mask (VLM video) is not folded into the BlockMask,
         # so those batches stay on the dense SDPA path.
+        block_mask = None
         if (
-            block_mask is None
-            and doc_ids is not None
+            doc_ids is not None
             and key_padding_mask is None
             and self.config.attention_backend == "flex"
         ):
