@@ -33,8 +33,8 @@ def flex_attention_fn(compiled: bool) -> Callable[..., Any]:
     """Return the ``flex_attention`` callable to use.
 
     Args:
-        compiled: Whether to return the ``torch.compile``d kernel. True on CUDA;
-            False on CPU, where the eager decomposition keeps unit tests off
+        compiled: Whether to return the ``torch.compile``-wrapped kernel. True on
+            CUDA; False on CPU, where the eager decomposition keeps unit tests off
             Inductor's C++ codegen path. Note torch 2.11 has no CPU backward for
             FlexAttention, so the CPU path is forward-only.
     """
