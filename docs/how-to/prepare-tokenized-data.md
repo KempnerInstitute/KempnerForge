@@ -189,8 +189,8 @@ or padded) is fine.
 lengths.** The default `"sdpa"` backend builds a dense `(B, 1, S, S)` mask
 in every layer, which is not a FlashAttention-2 shape, so packing costs
 throughput instead of saving it — at `seq_len = 8192` the dense path runs
-at 124k tok/s against 236k unpacked, while flex reaches 290k. Below about
-1k tokens the default is faster and flex is rejected outright under 128.
+at 124k tok/s against 236k unpacked, while flex reaches 300k. Below about
+1k the two are near parity, and flex is rejected outright under 128.
 See [Model § Attention backend](../architecture/model.md) for the full
 table.
 
