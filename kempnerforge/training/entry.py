@@ -106,6 +106,8 @@ def build_model(
     pp_size = get_pp_size(device_mesh)
 
     tp_enabled_pp = "tp" in device_mesh.mesh_dim_names  # type: ignore[reportOperatorIssue]
+    # Sequence packing needs doc_ids at every stage; see PipelineStageModule.
+    packed = config.data.pack_sequences
 
     # apply_{float8,ac,fsdp2} are annotated for Transformer; a stage module
     # exposes the same block structure, hence the cast.
@@ -113,7 +115,10 @@ def build_model(
         # Meta-device init: same pattern as non-PP TP path.
         # Avoids OOM for large PP stages that don't fit on one GPU before TP shards them.
         with torch.device("meta"):
-            stage_mod = cast("Transformer", build_stage_module(config.model, pp_rank, pp_size))
+            stage_mod = cast(
+                "Transformer",
+                build_stage_module(config.model, pp_rank, pp_size, carries_doc_ids=packed),
+            )
         apply_tensor_parallel(stage_mod, device_mesh)
         if tc.is_fp8:
             apply_float8(stage_mod)
@@ -125,7 +130,7 @@ def build_model(
     else:
         stage_mod = cast(
             "Transformer",
-            build_stage_module(config.model, pp_rank, pp_size).to(
+            build_stage_module(config.model, pp_rank, pp_size, carries_doc_ids=packed).to(
                 device=device, dtype=tc.param_dtype
             ),
         )
@@ -149,6 +154,7 @@ def build_model(
         batch_size=tc.batch_size,
         seq_len=tc.seq_len,
         param_dtype=tc.param_dtype,
+        carries_doc_ids=packed,
     )
     pp_schedule = build_pipeline_schedule(
         stage=pp_stage,

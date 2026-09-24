@@ -528,17 +528,34 @@ class TestJobConfig:
         )
         config.validate(world_size=2)  # Should not raise — dense + PP is fine
 
-    def test_packing_with_pp_rejected_at_construction(self):
-        """Decidable from the config alone, so it fires in __post_init__."""
-        with pytest.raises(ValueError, match="Sequence packing.*Pipeline Parallelism"):
-            JobConfig(
-                data=DataConfig(pack_sequences=True),
-                distributed=DistributedConfig(pp=2, dp_shard=1),
-            )
+    def test_validate_packing_with_pp_passes(self):
+        """doc_ids now rides the pipeline, so the dense-mask path supports both."""
+        config = JobConfig(
+            data=DataConfig(pack_sequences=True),
+            distributed=DistributedConfig(pp=2, dp_shard=1),
+        )
+        config.validate(world_size=2)  # Should not raise
+
+    def test_validate_packing_with_pp_and_flex_passes(self):
+        """Pipeline stages build their own BlockMask, so flex works under PP too."""
+        config = JobConfig(
+            model=ModelConfig(attention_backend="flex"),
+            data=DataConfig(pack_sequences=True),
+            distributed=DistributedConfig(pp=2, dp_shard=1),
+        )
+        config.validate(world_size=2)  # Should not raise
+
+    def test_validate_flex_with_pp_but_no_packing_passes(self):
+        """Without packing there are no doc_ids to lose."""
+        config = JobConfig(
+            model=ModelConfig(attention_backend="flex"),
+            distributed=DistributedConfig(pp=2, dp_shard=1),
+        )
+        config.validate(world_size=2)  # Should not raise
 
     def test_packing_without_pp_passes(self):
         config = JobConfig(data=DataConfig(pack_sequences=True))
-        config.validate(world_size=1)  # Should not raise — packing is fine without PP
+        config.validate(world_size=1)  # Should not raise
 
     def test_pp_without_packing_passes(self):
         config = JobConfig(distributed=DistributedConfig(pp=2, dp_shard=1))
