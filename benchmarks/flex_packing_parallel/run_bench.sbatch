@@ -13,7 +13,7 @@
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=384G
-#SBATCH --time=04:00:00
+#SBATCH --time=06:00:00
 #SBATCH --output=%x_%j.log
 
 set -u
@@ -32,7 +32,7 @@ export BENCH_OUT_DIR="$BENCH/results"
 mkdir -p "$BENCH_OUT_DIR" "$TRITON_CACHE_DIR" "$TORCHINDUCTOR_CACHE_DIR"
 cd "$REPO" || exit 1
 
-for mode in fsdp tp tp_fsdp; do
+for mode in fsdp tp tp_fsdp pp; do
   rm -f "$BENCH_OUT_DIR/flex_parallel_${mode}.txt"
   MODE=$mode uv run torchrun --nproc_per_node=4 \
     "$BENCH/bench_flex_parallel.py" >"$BENCH_OUT_DIR/${mode}_raw.log" 2>&1

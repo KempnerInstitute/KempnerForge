@@ -12,21 +12,21 @@ Three arms per cell, all at the same per-rank batch:
 * ``sdpa+pack``  -- ``doc_ids`` with the dense ``(B, 1, S, S)`` mask, rebuilt per layer.
 * ``flex+pack``  -- ``doc_ids`` with one FlexAttention ``BlockMask`` per forward.
 
+Read the ratio *within* a strategy. Global batch differs between strategies
+(FSDP replicates data, TP does not), so the columns are not comparable across
+modes and are not meant to be.
+
 Two measurement choices that matter:
 
 * **Per-rank batch is fixed**, so ``seq_len`` is the only variable. Scaling batch
   with length would confound the two.
-* **Tokens/sec counts global tokens** (``batch x dp_size x seq_len``). TP ranks all
-  process the *same* batch, so counting them would inflate throughput by the TP
-  degree and make TP look free.
-
-Pipeline parallelism is absent deliberately: ``PipelineStageModule`` does not carry
-``doc_ids`` on this branch, so a PP arm would silently measure unpacked attention
-rather than the thing being benchmarked.
+* **Tokens/sec counts global tokens.** TP ranks all process the *same* batch, so
+  counting them would inflate throughput by the TP degree and make TP look free.
+  Pipeline ranks likewise share one global batch, split into microbatches.
 
 Usage (see ``run_bench.sbatch``)::
 
-    MODE={fsdp,tp,tp_fsdp} torchrun --nproc_per_node=4 bench_flex_parallel.py
+    MODE={fsdp,tp,tp_fsdp,pp} torchrun --nproc_per_node=4 bench_flex_parallel.py
 """
 
 from __future__ import annotations
@@ -36,9 +36,15 @@ import os
 from collections.abc import Callable
 
 import torch
+import torch.nn.functional as F
 
 from kempnerforge.config.schema import ActivationCheckpointing, DistributedConfig, ModelConfig
 from kempnerforge.distributed.parallel import build_parallel_model
+from kempnerforge.distributed.pipeline_parallel import (
+    build_pipeline_schedule,
+    build_pipeline_stage,
+    build_stage_module,
+)
 from kempnerforge.distributed.setup import get_world_info, init_distributed
 
 MODE = os.environ.get("MODE", "fsdp")
@@ -52,8 +58,11 @@ MESHES: dict[str, dict[str, int]] = {
     "fsdp": dict(dp_shard=WORLD, tp=1, pp=1),
     "tp": dict(dp_shard=1, tp=WORLD, pp=1),
     "tp_fsdp": dict(dp_shard=max(WORLD // 2, 1), tp=2, pp=1),
+    "pp": dict(dp_shard=1, tp=1, pp=WORLD),
 }
-SEQ_LENS: tuple[int, ...] = (512, 1024, 2048, 4096, 8192, 16384)
+SEQ_LENS: tuple[int, ...] = tuple(
+    int(s) for s in os.environ.get("BENCH_SEQ_LENS", "512,1024,2048,4096,8192,16384").split(",")
+)
 BATCH = 2  # per rank, fixed
 DOCS = 8
 
@@ -98,12 +107,86 @@ def timed(step: Callable[[], None], warmup: int = 4, iters: int = 8) -> tuple[fl
     return start.elapsed_time(end) / iters, torch.cuda.max_memory_allocated() / 1e9
 
 
+def _loss_fn(output: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    return F.cross_entropy(output.flatten(0, 1).float(), target.flatten())
+
+
+def _dense_step(
+    config: ModelConfig, mesh, device: torch.device, seq_len: int, packed: bool
+) -> Callable[[], None]:
+    """FSDP / TP / TP+FSDP: one sharded model, ordinary forward+backward."""
+    model = build_parallel_model(
+        config,
+        device,
+        mesh,
+        ac_mode=ActivationCheckpointing.none,
+        param_dtype=torch.bfloat16,
+        compile_model=False,
+    )
+    tokens = torch.randint(0, config.vocab_size, (BATCH, seq_len), device=device)
+    kwargs = {"doc_ids": doc_ids_for(BATCH, seq_len, device)} if packed else {}
+
+    def step() -> None:
+        model(tokens, **kwargs).sum().backward()
+        model.zero_grad(set_to_none=True)
+
+    return step
+
+
+def _pipeline_step(
+    config: ModelConfig, mesh, device: torch.device, seq_len: int, packed: bool, rank: int
+) -> Callable[[], None]:
+    """PP: the schedule owns forward+backward across stages.
+
+    Global batch is ``BATCH * WORLD`` split into ``WORLD`` microbatches, so the
+    per-microbatch size matches the per-rank batch the other modes use, and the
+    global batch matches FSDP's.
+    """
+    global_batch = BATCH * WORLD
+    stage_module = build_stage_module(
+        config, pp_rank=rank, pp_size=WORLD, carries_doc_ids=packed
+    ).to(device=device, dtype=torch.bfloat16)
+    stage = build_pipeline_stage(
+        stage_module,
+        mesh,
+        device,
+        batch_size=BATCH,  # per microbatch
+        seq_len=seq_len,
+        param_dtype=torch.bfloat16,
+        carries_doc_ids=packed,
+    )
+    schedule = build_pipeline_schedule(
+        stage, n_microbatches=WORLD, loss_fn=_loss_fn, schedule="gpipe"
+    )
+
+    tokens = torch.randint(0, config.vocab_size, (global_batch, seq_len), device=device)
+    labels = torch.randint(0, config.vocab_size, (global_batch, seq_len), device=device)
+    doc_ids = doc_ids_for(global_batch, seq_len, device) if packed else None
+    is_first, is_last = rank == 0, rank == WORLD - 1
+
+    def step() -> None:
+        losses: list[torch.Tensor] = []
+        if is_first:
+            args = (tokens, doc_ids) if packed else (tokens,)
+            schedule.step(*args, target=labels, losses=losses)
+        elif is_last:
+            schedule.step(target=labels, losses=losses)
+        else:
+            schedule.step()
+        stage_module.zero_grad(set_to_none=True)
+
+    return step
+
+
 def main() -> None:
     rank, local_rank, world = get_world_info()
     dims = MESHES[MODE]
     mesh = init_distributed(DistributedConfig(**dims), seed=42)
     device = torch.device(f"cuda:{local_rank}")
+    torch.cuda.set_device(device)
     dp_size = world // (dims["tp"] * dims["pp"])
+    # PP stages share one global batch rather than replicating it.
+    tokens_per_step_batch = BATCH * WORLD if MODE == "pp" else BATCH * dp_size
 
     log(f"### MODE={MODE} world={world} {dims} dp_size={dp_size} batch/rank={BATCH}", rank)
     log(f"### {torch.cuda.get_device_name(0)}  torch {torch.__version__}  docs/seq={DOCS}", rank)
@@ -121,29 +204,18 @@ def main() -> None:
             try:
                 torch.manual_seed(0)
                 config = ModelConfig(**BASE, attention_backend=backend)
-                model = build_parallel_model(
-                    config,
-                    device,
-                    mesh,
-                    ac_mode=ActivationCheckpointing.none,
-                    param_dtype=torch.bfloat16,
-                    compile_model=False,
-                )
-                tokens = torch.randint(0, config.vocab_size, (BATCH, seq_len), device=device)
-                kwargs = {"doc_ids": doc_ids_for(BATCH, seq_len, device)} if packed else {}
-
-                def step(m=model, t=tokens, k=kwargs) -> None:
-                    m(t, **k).sum().backward()
-                    m.zero_grad(set_to_none=True)
-
+                if MODE == "pp":
+                    step = _pipeline_step(config, mesh, device, seq_len, packed, rank)
+                else:
+                    step = _dense_step(config, mesh, device, seq_len, packed)
                 ms, gb = timed(step)
-                tok_s[arm] = (BATCH * dp_size * seq_len) / (ms / 1000)
+                tok_s[arm] = (tokens_per_step_batch * seq_len) / (ms / 1000)
                 peak_gb[arm] = gb
-                del model, tokens
+                del step
             except Exception as exc:  # noqa: BLE001 - one OOM must not end the sweep
                 tok_s[arm] = float("nan")
                 peak_gb[arm] = float("nan")
-                log(f"  {arm} @ {seq_len}: FAILED {type(exc).__name__}: {str(exc)[:60]}", rank)
+                log(f"  {arm} @ {seq_len}: FAILED {type(exc).__name__}: {str(exc)[:70]}", rank)
             torch.cuda.empty_cache()
 
         ratio = tok_s["flex+pack"] / tok_s["sdpa+pack"]
