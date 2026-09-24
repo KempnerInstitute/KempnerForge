@@ -56,23 +56,24 @@ forward path differentiable.
 
 ## Unused-expert kludge
 
-If a local expert receives **zero tokens** in a step, its parameters
-never enter the autograd graph — and FSDP2's reduce-scatter, which
-fires only after every param in a unit has accumulated a gradient,
-hangs forever.
-
-`ep_dispatch_and_compute` forces an
-`AccumulateGrad` hook to fire on each unused expert by adding a
-zero-valued sum of its parameters into the output:
+FSDP2's reduce-scatter fires only after every parameter in a unit has
+accumulated a gradient. With the grouped GEMM every local expert's
+weight enters the kernel even when its token group is empty, so
+gradients (zeros) exist for all of them. The one exception is a rank
+that receives **no tokens at all** in a step: the grouped GEMM
+short-circuits and the local expert parameters never enter the graph.
+`ep_dispatch_and_compute` then adds a zero-valued sum of those
+parameters into the output so their `AccumulateGrad` hooks still fire:
 
 ```python
-for i in range(num_local_experts):
-    if tokens_per_expert[i] == 0:
-        for p in moe.experts[i].parameters():
-            local_output = local_output + p.sum() * 0
+if sorted_recv.shape[0] == 0:
+    local_output = local_output + sum(p.sum() for p in params) * 0
 ```
 
-Similar zero-contributions handle the packed-expert path and the
+The sequential fallback (fp32) keeps its per-expert version of the
+same trick.
+
+A similar zero-contribution handles the
 case where the dispatch all-to-all would otherwise have no gradient
 edge back from `local_output` to `received_tokens` (which would
 cause the backward all-to-all to be skipped on one side —

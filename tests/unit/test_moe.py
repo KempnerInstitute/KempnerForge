@@ -670,6 +670,109 @@ class TestGroupedGEMM:
         for p in moe.parameters():
             assert p.grad is not None
 
+    def test_grouped_accepts_tensor_counts(self):
+        """Token counts may arrive as a device tensor (no host sync) or a list."""
+        from kempnerforge.model.moe import _HAS_GROUPED_MM, grouped_expert_forward
+
+        if not _HAS_GROUPED_MM:
+            pytest.skip("torch._grouped_mm not available")
+
+        torch.manual_seed(0)
+        experts = torch.nn.ModuleList([SwiGLUMLP(32, 64) for _ in range(4)])
+        counts = [3, 0, 5, 2]
+        x = torch.randn(sum(counts), 32)
+
+        from_list = grouped_expert_forward(x, counts, experts)
+        from_tensor = grouped_expert_forward(x, torch.tensor(counts), experts)
+        assert torch.equal(from_list, from_tensor)
+
+    def test_grouped_no_tokens_returns_empty(self):
+        """With no routed tokens the output is empty and no expert enters the graph."""
+        from kempnerforge.model.moe import _HAS_GROUPED_MM, grouped_expert_forward
+
+        if not _HAS_GROUPED_MM:
+            pytest.skip("torch._grouped_mm not available")
+
+        experts = torch.nn.ModuleList([SwiGLUMLP(32, 64) for _ in range(3)])
+        out = grouped_expert_forward(torch.zeros(0, 32), torch.zeros(3, dtype=torch.long), experts)
+        assert out.shape == (0, 32)
+        assert not out.requires_grad
+
+    def test_packed_no_tokens_returns_empty(self):
+        """The packed variant short-circuits the same way when nothing was routed."""
+        from kempnerforge.model.moe import _HAS_GROUPED_MM, grouped_expert_forward_packed
+
+        if not _HAS_GROUPED_MM:
+            pytest.skip("torch._grouped_mm not available")
+
+        up_w, down_w = torch.randn(3, 32, 64), torch.randn(3, 64, 32)
+        out = grouped_expert_forward_packed(
+            torch.zeros(0, 32),
+            torch.zeros(3, dtype=torch.long),
+            up_w,
+            down_w,
+            None,
+            torch.nn.functional.gelu,
+        )
+        assert out.shape == (0, 32)
+
+
+class TestScaleByExpertLoad:
+    """The vectorised per-expert rescale matches the per-expert loop it replaced."""
+
+    @staticmethod
+    def _loop_reference(expert_out, counts, num_experts):
+        out = expert_out.clone()
+        avg = out.shape[0] / max(num_experts, 1)
+        offset = 0
+        for count in counts:
+            if count > 0:
+                out[offset : offset + count] = out[offset : offset + count] * (avg / count)
+            offset += count
+        return out
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    def test_matches_loop(self, dtype):
+        from kempnerforge.model.moe import scale_by_expert_load
+
+        torch.manual_seed(0)
+        counts = [7, 0, 2, 11, 4]
+        x = torch.randn(sum(counts), 16).to(dtype)
+        got = scale_by_expert_load(x, torch.tensor(counts), len(counts))
+        want = self._loop_reference(x, counts, len(counts))
+        assert got.dtype == dtype
+        torch.testing.assert_close(got, want, atol=0, rtol=0)
+
+    def test_empty_input(self):
+        from kempnerforge.model.moe import scale_by_expert_load
+
+        out = scale_by_expert_load(torch.zeros(0, 8), torch.zeros(4, dtype=torch.long), 4)
+        assert out.shape == (0, 8)
+
+
+class TestGroupedPathBf16:
+    """bf16 inputs take the grouped path inside ``MoEMLP``; it must agree with the loop."""
+
+    def test_gradient_scale_matches_sequential(self, monkeypatch):
+        import kempnerforge.model.moe as moe_mod
+
+        if not moe_mod._HAS_GROUPED_MM:
+            pytest.skip("torch._grouped_mm not available")
+
+        torch.manual_seed(0)
+        moe = build_moe(dim=64, hidden_dim=128, num_experts=4, top_k=2, gradient_scale=True)
+        moe = moe.to(torch.bfloat16).train()
+        x = torch.randn(2, 16, 64, dtype=torch.bfloat16)
+
+        grouped = moe(x)
+        grouped.float().pow(2).mean().backward()
+        for name, p in moe.named_parameters():
+            assert p.grad is not None, name
+
+        monkeypatch.setattr(moe_mod, "_HAS_GROUPED_MM", False)
+        sequential = moe(x)
+        torch.testing.assert_close(grouped, sequential, atol=2e-2, rtol=2e-2)
+
 
 class TestCapacityFactor:
     """Capacity factor token dropping."""
@@ -1151,6 +1254,20 @@ class TestPackedExperts:
         moe_packed.eval()
         moe_unpacked.eval()
         return moe_packed, moe_unpacked
+
+    def test_grouped_packed_matches_unpacked_bf16(self):
+        """In bf16 both layouts take the grouped path inside MoEMLP and must be identical."""
+        from kempnerforge.model.moe import _HAS_GROUPED_MM
+
+        if not _HAS_GROUPED_MM:
+            pytest.skip("torch._grouped_mm not available")
+
+        torch.manual_seed(42)
+        moe_packed, moe_unpacked = self._build_matched_pair("silu")
+        moe_packed.to(torch.bfloat16)
+        moe_unpacked.to(torch.bfloat16)
+        x = torch.randn(2, 16, 64, dtype=torch.bfloat16)
+        assert torch.equal(moe_packed(x), moe_unpacked(x))
 
     def test_sequential_packed_matches_unpacked_swiglu(self):
         """Packed MoE and unpacked MoE with identical weights produce identical output."""
