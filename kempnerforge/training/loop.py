@@ -193,12 +193,14 @@ def pipeline_step(session: TrainingSession, step: int) -> StepResult:
 
     # Collect microbatches into a full batch for the schedule.
     # schedule.step() splits along dim 0 into n_microbatches.
-    input_ids_list, labels_list = [], []
+    input_ids_list, labels_list, doc_ids_list = [], [], []
     for _ in range(tc.grad_accum_steps):
         if batches.has_data:
             batch = batches.next_batch()
             input_ids_list.append(batch["input_ids"].to(device))
             labels_list.append(batch["labels"].to(device))
+            if "doc_ids" in batch:
+                doc_ids_list.append(batch["doc_ids"].to(device))
         else:
             input_ids_list.append(
                 torch.randint(0, mc.vocab_size, (tc.batch_size, tc.seq_len), device=device)
@@ -209,6 +211,12 @@ def pipeline_step(session: TrainingSession, step: int) -> StepResult:
 
     full_input = torch.cat(input_ids_list, dim=0)
     full_labels = torch.cat(labels_list, dim=0)
+    # Packed runs pass doc_ids as a second schedule argument so it is split into
+    # microbatches in lockstep with the tokens; each stage then forwards it down
+    # the pipe, because a schedule only hands arguments to stage 0.
+    stage_args = (full_input,)
+    if doc_ids_list:
+        stage_args = (full_input, torch.cat(doc_ids_list, dim=0))
 
     # The schedule handles forward/backward for all microbatches.
     # First stage needs input; last stage needs target for loss.
@@ -219,7 +227,7 @@ def pipeline_step(session: TrainingSession, step: int) -> StepResult:
     pp_losses: list[torch.Tensor] = []
 
     if is_first:
-        pipeline.schedule.step(full_input, target=full_labels, losses=pp_losses)
+        pipeline.schedule.step(*stage_args, target=full_labels, losses=pp_losses)
     elif is_last:
         pipeline.schedule.step(target=full_labels, losses=pp_losses)
     else:

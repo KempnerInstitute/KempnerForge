@@ -46,7 +46,6 @@ File:
   unaffected at every length, so existing packed runs are not at risk. Not
   reduced further; the bound is empirical. It costs nothing, since a sequence
   below the mask block size has no block sparsity to exploit.
-- `pp > 1` rejects `data.pack_sequences` (pipeline stages never receive `doc_ids`).
 - When `num_experts > 0` (MoE):
   - `moe_top_k > 0`
   - `moe_top_k ≤ num_experts`
