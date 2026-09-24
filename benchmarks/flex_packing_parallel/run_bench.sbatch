@@ -17,16 +17,19 @@
 #SBATCH --output=%x_%j.log
 
 set -u
-REPO="${REPO:-$HOME/KempnerForge}"
+REPO="${BENCH_REPO:-$HOME/KempnerForge}"
 BENCH="$REPO/benchmarks/flex_packing_parallel"
-SCRATCH="${SCRATCH:-/n/netscratch/kempner_dev/Lab/tngotiaoco}"
+
+# Not $SCRATCH: the cluster already exports that as /n/netscratch, which is not
+# writable. Override with BENCH_CACHE_DIR if your scratch lives elsewhere.
+CACHE_DIR="${BENCH_CACHE_DIR:-/n/netscratch/kempner_dev/Lab/$USER}"
 
 # Keep compile caches off NFS; they are large and rewritten constantly.
-export TRITON_CACHE_DIR="$SCRATCH/triton"
-export TORCHINDUCTOR_CACHE_DIR="$SCRATCH/inductor"
+export TRITON_CACHE_DIR="$CACHE_DIR/triton"
+export TORCHINDUCTOR_CACHE_DIR="$CACHE_DIR/inductor"
 export BENCH_OUT_DIR="$BENCH/results"
 
-mkdir -p "$BENCH_OUT_DIR"
+mkdir -p "$BENCH_OUT_DIR" "$TRITON_CACHE_DIR" "$TORCHINDUCTOR_CACHE_DIR"
 cd "$REPO" || exit 1
 
 for mode in fsdp tp tp_fsdp; do
