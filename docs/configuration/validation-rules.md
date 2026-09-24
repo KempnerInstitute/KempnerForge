@@ -28,6 +28,25 @@ File:
 - `dim % n_heads == 0` (head dim is integral).
 - `n_heads % n_kv_heads == 0` (GQA replication factor is integral).
 - `sdpa_backend ∈ {"auto", "flash", "efficient", "cudnn", "math"}`.
+- `attention_backend ∈ {"sdpa", "flex"}`.
+- `attention_backend = "flex"` requires `dim // n_heads ≥ 16` (below that the
+  Triton template fails to lower), and warns that `sdpa_backend` is ignored when
+  set. There is no upper bound — head_dim 256/320/384/512 are all verified
+  working. Note the usable set is not an interval: head_dim 192 fails to compile
+  on H200 / torch 2.11 while 128 and 256 are fine. That surfaces as a loud
+  compile-time error, not silent corruption, so it is documented rather than
+  guarded.
+- `attention_backend = "flex"` requires `train.seq_len ≥ 128`. Below that an
+  Inductor-compiled model silently leaks attention across document boundaries.
+  Localized to Inductor codegen: the same model under `backend="eager"` or
+  `backend="aot_eager"` is exact, as is the FlexAttention kernel on its own, and
+  a single attention block compiled by Inductor is exact too — it takes a larger
+  graph to trigger. Reproduced identically on torch 2.11/2.13/2.14 (cu128 and
+  cu130), so it is not waiting on a release. The dense-mask `"sdpa"` path is
+  unaffected at every length, so existing packed runs are not at risk. Not
+  reduced further; the bound is empirical. It costs nothing, since a sequence
+  below the mask block size has no block sparsity to exploit.
+- `pp > 1` rejects `data.pack_sequences` (pipeline stages never receive `doc_ids`).
 - When `num_experts > 0` (MoE):
   - `moe_top_k > 0`
   - `moe_top_k ≤ num_experts`

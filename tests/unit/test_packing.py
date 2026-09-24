@@ -366,6 +366,83 @@ class TestModelWithPacking:
             assert torch.isfinite(p.grad).all()
 
 
+class TestPackedModelFlexBackend:
+    """Model-level parity for ``attention_backend="flex"``.
+
+    FlexAttention raises on CPU as soon as an input requires grad -- even for a
+    forward, because autograd would need a backward node it does not have on CPU
+    in torch 2.11. Every case here therefore runs under ``torch.no_grad()``;
+    gradient and compiled-kernel coverage lives in
+    ``tests/integration/test_compile.py::TestFlexCompile``.
+    """
+
+    def _model(self, backend: str, **overrides):
+        from kempnerforge.config.schema import ModelConfig
+        from kempnerforge.model.transformer import Transformer
+
+        torch.manual_seed(0)
+        config = ModelConfig(
+            dim=64,
+            n_layers=2,
+            n_heads=4,
+            vocab_size=256,
+            max_seq_len=32,
+            attention_backend=backend,
+            **overrides,
+        )
+        return Transformer(config).eval()
+
+    @pytest.mark.parametrize("overrides", [{}, {"n_kv_heads": 2}], ids=["mha", "gqa"])
+    def test_matches_sdpa_backend(self, overrides):
+        """Same weights, same batch: flex reproduces the dense-mask SDPA output.
+
+        The GQA case matters on its own -- flex passes ``enable_gqa`` instead of
+        materializing repeated K/V heads, so it exercises a different kernel path.
+        """
+        tokens = torch.randint(0, 256, (2, 16), generator=torch.Generator().manual_seed(7))
+        doc_ids = torch.tensor([[0] * 6 + [1] * 10, [0] * 16])
+        with torch.no_grad():
+            out_sdpa = self._model("sdpa", **overrides)(tokens, doc_ids=doc_ids)
+            out_flex = self._model("flex", **overrides)(tokens, doc_ids=doc_ids)
+        torch.testing.assert_close(out_flex, out_sdpa)
+
+    def test_single_doc_matches_causal(self):
+        model = self._model("flex")
+        tokens = torch.randint(0, 256, (1, 8), generator=torch.Generator().manual_seed(1))
+        with torch.no_grad():
+            out_causal = model(tokens)
+            out_packed = model(tokens, doc_ids=torch.zeros(1, 8, dtype=torch.long))
+        torch.testing.assert_close(out_causal, out_packed)
+
+    def test_cross_doc_isolation(self):
+        """Perturbing document 0 must not move any document-1 output at all."""
+        model = self._model("flex")
+        tokens = torch.randint(0, 256, (1, 16), generator=torch.Generator().manual_seed(3))
+        doc_ids = torch.tensor([[0] * 6 + [1] * 10])
+        perturbed = tokens.clone()
+        perturbed[0, :6] = (perturbed[0, :6] + 1) % 256
+        with torch.no_grad():
+            base = model(tokens, doc_ids=doc_ids)
+            moved = model(perturbed, doc_ids=doc_ids)
+        torch.testing.assert_close(base[:, 6:], moved[:, 6:], rtol=0, atol=0)
+        assert not torch.allclose(base[:, :6], moved[:, :6])
+
+    def test_no_doc_ids_is_bit_identical_to_sdpa(self):
+        """Unpacked batches build no BlockMask and take the is_causal SDPA path."""
+        tokens = torch.randint(0, 256, (2, 16), generator=torch.Generator().manual_seed(5))
+        with torch.no_grad():
+            out_sdpa = self._model("sdpa")(tokens)
+            out_flex = self._model("flex")(tokens)
+        torch.testing.assert_close(out_flex, out_sdpa, rtol=0, atol=0)
+
+    def test_rejects_doc_ids_shorter_than_the_sequence(self):
+        """Guards the VLM image-prefix case, where doc_ids would misalign."""
+        model = self._model("flex")
+        tokens = torch.randint(0, 256, (1, 16))
+        with pytest.raises(ValueError, match="doc_ids length"), torch.no_grad():
+            model(tokens, doc_ids=torch.zeros(1, 8, dtype=torch.long))
+
+
 # ---------------------------------------------------------------------------
 # MemoryMappedDataset with packing
 # ---------------------------------------------------------------------------

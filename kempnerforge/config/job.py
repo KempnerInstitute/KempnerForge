@@ -10,7 +10,7 @@ from kempnerforge.config.data import DataConfig
 from kempnerforge.config.distributed import DistributedConfig
 from kempnerforge.config.eval import EvalConfig
 from kempnerforge.config.metrics import MetricsConfig
-from kempnerforge.config.model import ModelConfig
+from kempnerforge.config.model import FLEX_BLOCK_SIZE, ModelConfig
 from kempnerforge.config.optimizer import OptimizerConfig
 from kempnerforge.config.profiling import ProfilingConfig
 from kempnerforge.config.scheduler import SchedulerConfig
@@ -129,6 +129,14 @@ class JobConfig:
             raise ValueError(
                 "[video] is set but [vlm] is missing; video training runs through "
                 "the VLM wrapper, so a [vlm] section (and [vision_encoder]) is required."
+            )
+
+        # Below one mask block, an Inductor-compiled model leaks attention across
+        # document boundaries; see FLEX_BLOCK_SIZE for the measurements.
+        if self.model.attention_backend == "flex" and self.train.seq_len < FLEX_BLOCK_SIZE:
+            raise ValueError(
+                f"attention_backend='flex' requires train.seq_len >= {FLEX_BLOCK_SIZE}, "
+                f"got {self.train.seq_len}. Use attention_backend='sdpa' for shorter sequences."
             )
 
         # Pipeline stages never receive doc_ids, so packing would silently train
