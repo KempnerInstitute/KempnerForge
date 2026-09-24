@@ -89,6 +89,62 @@ class TestComputePackedOutput:
         assert result["labels"].dtype == torch.long
         assert result["doc_ids"].dtype == torch.long
 
+    def test_matches_sequential_reference(self):
+        """Every output matches a literal, obviously-correct transcription.
+
+        Covers labels as well as doc_ids: the boundary masking is the subtler
+        half, and the half whose failure is silent -- masked labels keep the
+        loss looking healthy whatever attention does.
+        """
+
+        def reference(tokens: np.ndarray, eos_token_id: int):
+            """Carry a counter and mask boundaries, the slow obvious way."""
+            n = len(tokens)
+            doc_ids = np.zeros(n, dtype=np.int64)
+            doc_id = 0
+            for i in range(n):
+                doc_ids[i] = doc_id
+                if tokens[i] == eos_token_id:
+                    doc_id += 1
+
+            # The function is handed seq_len + 1 tokens: the extra one gives the
+            # last input position something to predict. Inputs are tokens[:-1]
+            # and labels tokens[1:], so the doc ids split the same way.
+            input_ids = tokens[:-1]
+            labels = tokens[1:].copy()
+            for i in range(n - 1):
+                if doc_ids[i] != doc_ids[i + 1]:
+                    labels[i] = -100
+            return input_ids, labels, doc_ids[:-1]
+
+        rng = np.random.default_rng(0)
+        for _ in range(50):
+            # Small vocab so EOS is dense: boundaries, runs of consecutive EOS,
+            # and EOS at either end all show up across the draws.
+            tokens = rng.integers(0, 4, size=int(rng.integers(3, 64))).astype(np.int64)
+            result = _compute_packed_output(tokens, eos_token_id=0)
+            expected_inputs, expected_labels, expected_doc_ids = reference(tokens, 0)
+
+            assert result["input_ids"].tolist() == expected_inputs.tolist()
+            assert result["labels"].tolist() == expected_labels.tolist()
+            assert result["doc_ids"].tolist() == expected_doc_ids.tolist()
+
+    def test_reference_draws_actually_exercise_boundaries(self):
+        """Guards the test above: random draws must contain masked labels.
+
+        If the vocab or length ranges were ever changed such that EOS stopped
+        appearing, the comparison would still pass while checking nothing.
+        """
+        rng = np.random.default_rng(0)
+        masked = boundaries = 0
+        for _ in range(50):
+            tokens = rng.integers(0, 4, size=int(rng.integers(3, 64))).astype(np.int64)
+            result = _compute_packed_output(tokens, eos_token_id=0)
+            masked += int((result["labels"] == -100).sum())
+            boundaries += int(result["doc_ids"].max())
+        assert masked > 0, "no boundary labels were masked; the draws test nothing"
+        assert boundaries > 0, "no multi-document sequences were generated"
+
 
 # ---------------------------------------------------------------------------
 # Attention mask for packed sequences
