@@ -11,7 +11,7 @@ Design choices:
 
 from __future__ import annotations
 
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 import torch
 import torch.nn as nn
@@ -23,11 +23,15 @@ from kempnerforge.model.attention import Attention, KVCache
 from kempnerforge.model.cross_attention import CrossAttentionBlock
 from kempnerforge.model.embedding import OutputHead, TokenEmbedding
 from kempnerforge.model.init import init_weights
+from kempnerforge.model.masking import build_doc_causal_block_mask
 from kempnerforge.model.mlp import build_mlp
 from kempnerforge.model.modality import ModalityContext
 from kempnerforge.model.moe import MoEMLP, build_moe
 from kempnerforge.model.moma import ExpertChoiceMoE, MoMaBlock, MoMaFFN
 from kempnerforge.model.mot import MoTBlock
+
+if TYPE_CHECKING:
+    from torch.nn.attention.flex_attention import BlockMask
 from kempnerforge.model.norm import build_norm
 from kempnerforge.model.position import precompute_rope_frequencies
 
@@ -88,6 +92,7 @@ class TransformerBlock(nn.Module):
         kv_cache: KVCache | None = None,
         doc_ids: torch.Tensor | None = None,
         key_padding_mask: torch.Tensor | None = None,
+        block_mask: BlockMask | None = None,
     ) -> torch.Tensor:
         # Pre-norm attention with residual
         x = x + self.attention(
@@ -97,6 +102,7 @@ class TransformerBlock(nn.Module):
             kv_cache=kv_cache,
             doc_ids=doc_ids,
             key_padding_mask=key_padding_mask,
+            block_mask=block_mask,
         )
         # Pre-norm MLP with residual
         x = x + self.mlp(self.mlp_norm(x))
@@ -430,6 +436,28 @@ class Transformer(nn.Module):
         cos = self._rope_cos[start_pos : start_pos + seq_len]  # type: ignore[reportOptionalSubscript]
         sin = self._rope_sin[start_pos : start_pos + seq_len]  # type: ignore[reportOptionalSubscript]
 
+        # Packed sequences under attention_backend="flex": build the sparse
+        # block-diagonal causal mask once here and share it across every layer,
+        # rather than the dense (B, 1, S, S) mask each Attention would otherwise
+        # rebuild. key_padding_mask (VLM video) is not folded into the BlockMask,
+        # so those batches stay on the dense SDPA path.
+        block_mask = None
+        if (
+            doc_ids is not None
+            and key_padding_mask is None
+            and self.config.attention_backend == "flex"
+        ):
+            if doc_ids.shape[1] != seq_len:
+                raise ValueError(
+                    f"doc_ids length ({doc_ids.shape[1]}) does not match the sequence "
+                    f"length reaching attention ({seq_len}). Sequence packing is not "
+                    "supported for arches that prepend image tokens to the residual stream."
+                )
+            block_mask = build_doc_causal_block_mask(doc_ids, h.device)
+            # The BlockMask supersedes doc_ids; clearing it keeps the dense
+            # SDPA mask branch in Attention.forward unreachable on this path.
+            doc_ids = None
+
         # MoMa path: single residual stream + shared SDPA + per-modality
         # MoE FFN groups. modality_ids tags every position and the
         # ``MoMaFFN`` uses these tags to dispatch tokens to per-modality
@@ -501,7 +529,13 @@ class Transformer(nn.Module):
             for i, layer in enumerate(self.layers.values()):
                 cache = kv_caches[i] if kv_caches is not None else None
                 h = layer(
-                    h, cos, sin, kv_cache=cache, doc_ids=doc_ids, key_padding_mask=key_padding_mask
+                    h,
+                    cos,
+                    sin,
+                    kv_cache=cache,
+                    doc_ids=doc_ids,
+                    key_padding_mask=key_padding_mask,
+                    block_mask=block_mask,
                 )
                 if ca_iter is not None and (i + 1) % self._ca_cadence == 0:
                     ca = next(ca_iter, None)

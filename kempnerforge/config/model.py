@@ -18,6 +18,43 @@ class Activation(StrEnum):
     relu = "relu"
 
 
+# FlexAttention's mask block size, and the seq_len floor for
+# attention_backend="flex". A compiled model leaks attention across document
+# boundaries below it and is exact at or above it -- measured at seq_len
+# 32/64/96/120/127 (leaking) against 128/129/130/160/200/256/300/384/512/1000/
+# 2048 (exact), for head_dim 32, 64 and 128 alike, so this is a sequence-length
+# effect rather than a head-dimension one.
+#
+# Localized to Inductor codegen: the same model compiled with backend="eager" or
+# backend="aot_eager" is exact, and only backend="inductor" leaks -- so dynamo
+# tracing, AOTAutograd and the FlexAttention kernel are all innocent (bare
+# compiled flex_attention also matches a dense reference at these lengths). It
+# further needs graph scale: proj + rope + flex + o_proj compiled on its own is
+# exact at seq_len 32, while a one-layer Transformer is not. Not reduced further.
+#
+# Not fixed by upgrading: reproduced with bit-identical drift on torch 2.11.0+cu128,
+# 2.13.0+cu129 and 2.14.0+cu130, so this bound is not a temporary workaround waiting
+# on a release. The dense-mask SDPA path is unaffected at every length, eager and
+# compiled alike -- this is specific to FlexAttention under Inductor, and existing
+# packed runs on the default backend are not at risk.
+#
+# It costs nothing either way, since a sub-block sequence has no block sparsity
+# to exploit.
+FLEX_BLOCK_SIZE = 128
+
+# Smallest head_dim FlexAttention's Triton template will lower; 8 fails with
+# "NYI: embedding dimension". There is deliberately no upper bound: head_dim
+# 256, 320, 384 and 512 were all measured correct (forward and backward, ~2e-6
+# against a dense reference on H200 / torch 2.11). The set of usable sizes is
+# not an interval, though -- head_dim 192 fails to compile there ("No valid
+# triton configs", shared-memory exhaustion) while 128 and 256 on either side
+# of it are fine. That failure is a loud compile-time error rather than silent
+# corruption, so it is documented rather than guarded: a config-time check
+# cannot predict which sizes Triton can tile on a given GPU, and rejecting an
+# interval would block the many large head_dims that do work.
+FLEX_MIN_HEAD_DIM = 16
+
+
 @dataclass
 class ModelConfig:
     """Architecture hyperparameters for a transformer model."""
@@ -46,6 +83,13 @@ class ModelConfig:
     # SDPA backend: "auto" lets PyTorch select (recommended). Override to force
     # a specific kernel for benchmarking or debugging.
     sdpa_backend: str = "auto"  # "auto", "flash", "efficient", "cudnn", "math"
+    # Attention backend. "sdpa" is the existing behavior: causal SDPA, or a dense
+    # (B, 1, S, S) mask when packing is on -- which drops SDPA off FlashAttention.
+    # "flex" routes packed batches through FlexAttention's sparse BlockMask, which
+    # skips fully-masked blocks instead of computing them. Only affects packed runs
+    # (data.pack_sequences); unpacked batches take the is_causal SDPA fast path
+    # under either backend.
+    attention_backend: str = "sdpa"  # "sdpa", "flex"
 
     # MoE (all defaults produce a dense model -- zero behavior change)
     num_experts: int = 0  # 0 = dense, >0 = MoE
@@ -97,6 +141,28 @@ class ModelConfig:
                 f"Unknown sdpa_backend: '{self.sdpa_backend}'. "
                 "Options: 'auto', 'flash', 'efficient', 'cudnn', 'math'"
             )
+
+        # Attention backend validation
+        if self.attention_backend not in ("sdpa", "flex"):
+            raise ValueError(
+                f"Unknown attention_backend: '{self.attention_backend}'. Options: 'sdpa', 'flex'"
+            )
+        if self.attention_backend == "flex":
+            if self.head_dim < FLEX_MIN_HEAD_DIM:
+                raise ValueError(
+                    f"attention_backend='flex' requires head_dim >= {FLEX_MIN_HEAD_DIM}, got "
+                    f"{self.head_dim} (dim={self.dim} // n_heads={self.n_heads}). "
+                    "FlexAttention's Triton template does not lower below that "
+                    "(head_dim 8 fails with 'NYI: embedding dimension')."
+                )
+            if self.sdpa_backend != "auto":
+                import logging
+
+                logging.getLogger(__name__).warning(
+                    "sdpa_backend=%r is ignored when attention_backend='flex' -- the flex "
+                    "path does not route through the SDPA kernel selector.",
+                    self.sdpa_backend,
+                )
 
         # MoE validation
         if self.num_experts > 0:

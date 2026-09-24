@@ -9,14 +9,19 @@ GQA is the general case:
 from __future__ import annotations
 
 import contextlib
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
+from kempnerforge.model.masking import flex_attention_fn
 from kempnerforge.model.norm import RMSNorm
 from kempnerforge.model.position import apply_rope
+
+if TYPE_CHECKING:
+    from torch.nn.attention.flex_attention import BlockMask
 
 _SDPA_BACKENDS = {
     "flash": SDPBackend.FLASH_ATTENTION,
@@ -122,6 +127,7 @@ class Attention(nn.Module):
         kv_cache: KVCache | None = None,
         doc_ids: torch.Tensor | None = None,
         key_padding_mask: torch.Tensor | None = None,
+        block_mask: BlockMask | None = None,
     ) -> torch.Tensor:
         """Forward pass.
 
@@ -138,10 +144,23 @@ class Attention(nn.Module):
                 visual tokens of padded video frames). Combined with the causal
                 (and doc) mask; fully-masked query rows are unmasked to keep
                 softmax finite.
+            block_mask: Optional FlexAttention ``BlockMask`` encoding the same
+                block-diagonal causal mask ``doc_ids`` would build, but sparse:
+                fully-masked blocks are skipped by the kernel instead of
+                computed. Built once per forward by ``Transformer.forward``
+                when ``attention_backend="flex"``. Mutually exclusive with
+                ``doc_ids``, ``key_padding_mask``, and ``kv_cache``.
 
         Returns:
             Output tensor of shape (batch, seq_len, dim).
         """
+        if block_mask is not None and self.capture_attention_weights:
+            raise NotImplementedError(
+                "capture_attention_weights requires attention_backend='sdpa'. "
+                "FlexAttention fuses the mask into the kernel and never materializes "
+                "the attention weight matrix."
+            )
+
         batch, seq_len, _ = x.shape
 
         # Project to Q, K, V
@@ -169,8 +188,10 @@ class Attention(nn.Module):
         if kv_cache is not None:
             k, v = kv_cache.update(k, v)
 
-        # Expand KV heads for GQA: (batch, n_kv_heads, seq, dim) → (batch, n_heads, seq, dim)
-        if self.n_rep > 1:
+        # Expand KV heads for GQA: (batch, n_kv_heads, seq, dim) → (batch, n_heads, seq, dim).
+        # FlexAttention expands internally via enable_gqa, so the flex path skips
+        # materializing the repeated heads entirely.
+        if self.n_rep > 1 and block_mask is None:
             k = k.repeat_interleave(self.n_rep, dim=1)
             v = v.repeat_interleave(self.n_rep, dim=1)
 
@@ -187,6 +208,23 @@ class Attention(nn.Module):
                 q, k, v, seq_len, doc_ids, kv_cache, key_padding_mask
             )
             self.last_attention_weights = attn_weights.detach().cpu()
+        elif block_mask is not None:
+            # Packed sequences via FlexAttention. The BlockMask already encodes
+            # causal AND same-document, so doc_ids carries no extra information
+            # here. key_padding_mask is deliberately not folded in -- that path
+            # (VLM video) stays on the dense SDPA mask below.
+            assert kv_cache is None and key_padding_mask is None, (
+                "block_mask does not compose with kv_cache decode or key_padding_mask; "
+                "those cases use the dense SDPA mask."
+            )
+            out = flex_attention_fn(q.is_cuda)(
+                q,
+                k,
+                v,
+                block_mask=block_mask,
+                scale=self.head_dim**-0.5,
+                enable_gqa=self.n_rep > 1,
+            )
         elif doc_ids is not None or key_padding_mask is not None:
             # An explicit attn_mask is not a FlashAttention-2 shape, so SDPA falls
             # back to the mem-efficient/math kernel here. The image-prefix video
