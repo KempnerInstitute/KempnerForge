@@ -952,7 +952,8 @@ def _stub_pp(monkeypatch, stage: FakeStageModule, calls: dict):
     import kempnerforge.distributed.pipeline_parallel as pp
     import kempnerforge.training.entry as entry
 
-    monkeypatch.setattr(pp, "build_stage_module", lambda cfg, r, s: stage)
+    # **k absorbs carries_doc_ids, which build_model passes when packing is on.
+    monkeypatch.setattr(pp, "build_stage_module", lambda cfg, r, s, **k: stage)
     monkeypatch.setattr(pp, "get_pp_rank", lambda _m: 1)
     monkeypatch.setattr(pp, "get_pp_size", lambda _m: 2)
     monkeypatch.setattr(pp, "build_pipeline_stage", lambda *a, **k: "STAGE")

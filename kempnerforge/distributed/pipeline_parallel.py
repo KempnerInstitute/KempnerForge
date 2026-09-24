@@ -31,6 +31,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from kempnerforge.config.schema import ModelConfig
 from kempnerforge.model.embedding import OutputHead, TokenEmbedding
 from kempnerforge.model.init import init_weights
+from kempnerforge.model.masking import build_doc_causal_block_mask
 from kempnerforge.model.norm import build_norm
 from kempnerforge.model.position import precompute_rope_frequencies
 from kempnerforge.model.transformer import TransformerBlock
@@ -133,6 +134,7 @@ class PipelineStageModule(nn.Module):
         stage_id: int,
         num_stages: int,
         layer_range: tuple[int, int],
+        carries_doc_ids: bool = False,
     ) -> None:
         super().__init__()
         self.config = config
@@ -140,6 +142,12 @@ class PipelineStageModule(nn.Module):
         self.num_stages = num_stages
         self.is_first = stage_id == 0
         self.is_last = stage_id == num_stages - 1
+        # Sequence packing: doc_ids has to reach every stage, but a pipeline
+        # schedule only hands arguments to stage 0. Each non-final stage
+        # therefore returns it alongside the hidden states so it rides the pipe.
+        # Fixed at construction because PipelineStage infers the I/O signature
+        # once, so it cannot vary per call.
+        self.carries_doc_ids = carries_doc_ids
 
         start, end = layer_range
 
@@ -189,16 +197,22 @@ class PipelineStageModule(nn.Module):
             )
         init_weights(self, self.config)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, doc_ids: torch.Tensor | None = None
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Forward pass for this pipeline stage.
 
         Args:
             x: For stage 0: token IDs of shape (batch, seq_len).
                For other stages: hidden states of shape (batch, seq_len, dim).
+            doc_ids: Per-token document ids, shape (batch, seq_len), when
+                sequence packing is on. Stage 0 receives it from the schedule;
+                later stages receive it from the previous stage's output.
 
         Returns:
             For last stage: logits of shape (batch, seq_len, vocab_size).
-            For other stages: hidden states of shape (batch, seq_len, dim).
+            For other stages: hidden states, or ``(hidden_states, doc_ids)``
+            when ``carries_doc_ids`` is set.
         """
         # First stage: embed tokens
         if self.is_first and self.token_embedding is not None:
@@ -212,16 +226,33 @@ class PipelineStageModule(nn.Module):
         cos = self._rope_cos[:seq_len]  # type: ignore[reportOptionalSubscript]
         sin = self._rope_sin[:seq_len]  # type: ignore[reportOptionalSubscript]
 
+        # Packed sequences under attention_backend="flex": build the BlockMask
+        # once here and share it across this stage's layers, mirroring
+        # Transformer.forward. Each stage builds its own from the doc_ids it
+        # received -- cheap next to attention, and a BlockMask is not a tensor,
+        # so it could not ride the pipe between stages anyway.
+        block_mask = None
+        layer_doc_ids = doc_ids
+        if doc_ids is not None and self.config.attention_backend == "flex":
+            block_mask = build_doc_causal_block_mask(doc_ids, x.device)
+            # The BlockMask supersedes doc_ids; clearing it keeps the dense
+            # SDPA mask branch in Attention.forward unreachable on this path.
+            layer_doc_ids = None
+
         # Run through assigned layers
         for layer in self.layers.values():
-            x = layer(x, cos, sin)
+            x = layer(x, cos, sin, doc_ids=layer_doc_ids, block_mask=block_mask)
 
         # Last stage: norm + output head
         if self.is_last:
             x = self.norm(x)  # type: ignore[reportOptionalCall]
             if self.output_head is not None:
                 x = self.output_head(x)
+            return x
 
+        if self.carries_doc_ids:
+            assert doc_ids is not None, "carries_doc_ids stage reached without doc_ids"
+            return x, doc_ids
         return x
 
 
@@ -234,6 +265,7 @@ def build_stage_module(
     config: ModelConfig,
     pp_rank: int,
     pp_size: int,
+    carries_doc_ids: bool = False,
 ) -> PipelineStageModule:
     """Build the model chunk for a specific pipeline stage.
 
@@ -241,6 +273,8 @@ def build_stage_module(
         config: Model configuration.
         pp_rank: This process's pipeline rank (0-indexed).
         pp_size: Total number of pipeline stages.
+        carries_doc_ids: Thread ``doc_ids`` through the pipeline (sequence
+            packing). Non-final stages then return ``(hidden_states, doc_ids)``.
 
     Returns:
         A PipelineStageModule containing only the parameters for this stage.
@@ -253,6 +287,7 @@ def build_stage_module(
         stage_id=pp_rank,
         num_stages=pp_size,
         layer_range=layer_range,
+        carries_doc_ids=carries_doc_ids,
     )
 
 
@@ -263,6 +298,7 @@ def build_pipeline_stage(
     batch_size: int,
     seq_len: int,
     param_dtype: torch.dtype = torch.bfloat16,
+    carries_doc_ids: bool = False,
 ) -> torch.distributed.pipelining.PipelineStage:  # type: ignore[reportAttributeAccessIssue]
     """Wrap a stage module in a PipelineStage for schedule execution.
 
@@ -294,6 +330,13 @@ def build_pipeline_stage(
                 dtype=param_dtype,
                 device=device,
             ),
+        )
+    if carries_doc_ids:
+        # Every stage takes doc_ids as a second argument: stage 0 from the
+        # schedule, later stages from the previous stage's output tuple.
+        input_args = (
+            *input_args,
+            torch.zeros(batch_size, seq_len, dtype=torch.long, device=device),
         )
 
     return PipelineStage(
