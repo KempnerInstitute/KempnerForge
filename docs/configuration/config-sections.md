@@ -53,6 +53,7 @@ Architecture hyperparameters and MoE knobs.
 | `n_layers` | `int` | `32` | number of transformer blocks |
 | `n_heads` | `int` | `32` | attention heads |
 | `n_kv_heads` | `int \| None` | `None` | GQA: `None` → MHA (= `n_heads`), `1` → MQA, else GQA |
+| `head_dim_override` | `int` | `0` | `0` → `head_dim` is `dim // n_heads`; a positive value decouples the attention width, so `n_heads * head_dim` need not equal `dim` |
 | `vocab_size` | `int` | `32000` | embedding table size |
 | `ffn_dim_multiplier` | `float` | `1.0` | scales Llama-style `4·dim·(2/3)` hidden width |
 | `ffn_hidden_dim` | `int \| None` | `None` | hard-override the computed FFN width |

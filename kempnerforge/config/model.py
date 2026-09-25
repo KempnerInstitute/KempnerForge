@@ -63,6 +63,7 @@ class ModelConfig:
     n_layers: int = 32
     n_heads: int = 32
     n_kv_heads: int | None = None  # None -> same as n_heads (MHA)
+    head_dim_override: int = 0  # 0 -> dim // n_heads
     vocab_size: int = 32000
     ffn_dim_multiplier: float = 1.0
     ffn_hidden_dim: int | None = None  # Override computed hidden dim
@@ -112,10 +113,18 @@ class ModelConfig:
             raise ValueError("vocab_size must be positive")
         if self.n_kv_heads <= 0:
             raise ValueError("n_kv_heads must be positive")
+        if self.head_dim_override < 0:
+            raise ValueError(
+                f"head_dim_override must be non-negative (got {self.head_dim_override}); "
+                "0 infers dim // n_heads"
+            )
 
         # Divisibility checks
-        if self.dim % self.n_heads != 0:
-            raise ValueError(f"dim ({self.dim}) must be divisible by n_heads ({self.n_heads})")
+        if self.head_dim_override == 0 and self.dim % self.n_heads != 0:
+            raise ValueError(
+                f"dim ({self.dim}) must be divisible by n_heads ({self.n_heads}) "
+                "unless head_dim_override is set"
+            )
         if self.n_heads % self.n_kv_heads != 0:
             raise ValueError(
                 f"n_heads ({self.n_heads}) must be divisible by n_kv_heads ({self.n_kv_heads})"
@@ -179,7 +188,13 @@ class ModelConfig:
 
     @property
     def head_dim(self) -> int:
-        return self.dim // self.n_heads
+        """Per-head attention width.
+
+        Derived rather than stored so a later ``dim`` / ``n_heads`` change (a
+        TOML or CLI overlay onto a default config) cannot leave a stale value
+        behind. ``head_dim_override`` decouples it from ``dim``.
+        """
+        return self.head_dim_override or self.dim // self.n_heads
 
     @property
     def computed_ffn_hidden_dim(self) -> int:
