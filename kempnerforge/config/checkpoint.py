@@ -81,6 +81,13 @@ class CheckpointConfig:
     def __post_init__(self) -> None:
         if self.interval <= 0:
             raise ValueError("interval must be positive")
+        if not isinstance(self.exclude_from_loading, list) or any(
+            k not in ("model", "optimizer") for k in self.exclude_from_loading
+        ):
+            raise ValueError(
+                "exclude_from_loading accepts only 'model' and/or 'optimizer' "
+                f"(got {self.exclude_from_loading!r})"
+            )
 
     def should_save(self, step: int) -> bool:
         """Whether to write a checkpoint at ``step``.
