@@ -87,21 +87,6 @@ Architecture hyperparameters and MoE knobs.
 Computed properties: `is_moe`, `head_dim`, `computed_ffn_hidden_dim`,
 `num_params_estimate`.
 
-## `[adapter]` — `AdapterConfig`
-
-The vision→LLM connector of a VLM run; read only when `[vlm]` is set, and
-omitting it selects `mlp_2layer` with the defaults below.
-[`kempnerforge/config/adapter.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/config/adapter.py).
-
-| Field | Type | Default | Purpose |
-|-------|------|---------|---------|
-| `type` | `str` | `"mlp_2layer"` | `adapter` registry key: `mlp_2layer` / `linear` keep the token count, `avgpool` / `attentional_pool` pool the patch grid |
-| `hidden_dim` | `int` | `0` | `mlp_2layer` hidden width; `0` → `model.dim` |
-| `activation` | `str` | `"gelu"` | activation between the `mlp_2layer` projections: `"gelu"`, `"silu"`, `"relu"` |
-| `pre_norm` | `str` | `""` | `norm` registry key (`"rmsnorm"` / `"layernorm"`) for a norm over the vision features ahead of `mlp_2layer`'s first projection (`adapter.ln_q`); `""` builds none |
-| `pool_window` | `int` | `2` | pooling kernel side for `avgpool` / `attentional_pool` |
-| `pool_heads` | `int` | `16` | attention heads for `attentional_pool`; must divide the vision feature dim |
-
 ## `[train]` — `TrainConfig`
 
 Training-loop hyperparameters.
