@@ -159,7 +159,6 @@ class MLP2LayerAdapter(VisionAdapter):
                 f"Unknown adapter activation: {activation!r}. Options: {list(_ADAPTER_ACTIVATIONS)}"
             )
         hidden = hidden_dim if hidden_dim and hidden_dim > 0 else out_dim
-        # Ahead of proj1, so the projection sees normalized features whatever the encoder's scale.
         self.ln_q = build_norm(pre_norm, in_dim) if pre_norm else None
         self.proj1 = nn.Linear(in_dim, hidden, bias=True)
         self.act = _ADAPTER_ACTIVATIONS[activation]()
@@ -171,12 +170,7 @@ class MLP2LayerAdapter(VisionAdapter):
         Used after ``to_empty(device=...)`` on a meta-device build.
         """
         if self.ln_q is not None:
-            reset = getattr(self.ln_q, "reset_parameters", None)
-            if callable(reset):
-                reset()
-            else:  # RMSNorm has no reset_parameters()
-                for name, param in self.ln_q.named_parameters():
-                    (nn.init.zeros_ if name.endswith("bias") else nn.init.ones_)(param)
+            self.ln_q.reset_parameters()  # type: ignore[reportCallIssue]
         self.proj1.reset_parameters()
         self.proj2.reset_parameters()
 

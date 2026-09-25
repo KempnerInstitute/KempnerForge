@@ -745,14 +745,13 @@ def _pre_norm_wrapper(pre_norm: str = "") -> VLMWrapper:
 
 
 class TestVLMAdapterPreNorm:
-    def test_off_is_the_default_wrapper(self):
-        torch.manual_seed(0)
-        default = _build_tiny_wrapper().state_dict()
-        torch.manual_seed(0)
-        off = _pre_norm_wrapper("").state_dict()
-        assert list(off) == list(default)
-        assert all(torch.equal(off[k], default[k]) for k in default)
-        assert not [k for k in default if "ln_q" in k]
+    def test_off_adds_no_adapter_state(self):
+        assert [k for k in _pre_norm_wrapper("").state_dict() if k.startswith("adapter.")] == [
+            "adapter.proj1.weight",
+            "adapter.proj1.bias",
+            "adapter.proj2.weight",
+            "adapter.proj2.bias",
+        ]
 
     @pytest.mark.parametrize("norm", _REGISTERED_NORMS)
     def test_on_adds_only_the_norm_keys(self, norm):

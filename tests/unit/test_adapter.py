@@ -23,6 +23,7 @@ from kempnerforge.model.adapter import (
     build_adapter,
     pooled_token_count,
 )
+from kempnerforge.model.norm import build_norm
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -825,6 +826,11 @@ class TestMLP2LayerPreNorm:
         assert (adapter.ln_q.weight.grad != 0).any()
 
     @pytest.mark.parametrize("norm", _REGISTERED_NORMS)
+    def test_every_registered_norm_has_reset_parameters(self, norm):
+        """The adapter re-initializes its norm by calling reset_parameters()."""
+        assert callable(getattr(build_norm(norm, 32), "reset_parameters", None))
+
+    @pytest.mark.parametrize("norm", _REGISTERED_NORMS)
     def test_reset_parameters_restores_the_norm_after_a_meta_build(self, norm):
         """The meta-device path runs to_empty() then reset_parameters(); the
         norm must come back to its constructor init, not keep whatever memory
@@ -841,9 +847,8 @@ class TestMLP2LayerPreNorm:
             assert torch.equal(v, fresh.ln_q.state_dict()[k]), k
         assert all(torch.isfinite(p).all() for p in adapter.parameters())
 
-    def test_reset_parameters_defers_to_a_norm_that_has_its_own(self):
-        """A registered norm with its own reset_parameters() is re-initialized
-        by it, not by the weight->1 / bias->0 fallback."""
+    def test_reset_parameters_delegates_to_the_norm(self):
+        """The norm's own reset_parameters() is the only init applied to it."""
         calls: list[str] = []
 
         class _Norm(torch.nn.Module):
@@ -859,6 +864,18 @@ class TestMLP2LayerPreNorm:
         adapter.reset_parameters()
         assert calls == ["reset"]
         assert torch.equal(adapter.ln_q.weight, torch.full((32,), 0.5))
+
+
+class _PluginNorm(torch.nn.LayerNorm):
+    pass
+
+
+@pytest.fixture
+def plugin_norm():
+    name = "adapter_pre_norm_test_plugin"
+    registry.register("norm", name, _PluginNorm)
+    yield name
+    registry._get_store("norm").pop(name)
 
 
 class TestAdapterConfigPreNorm:
@@ -877,17 +894,31 @@ class TestAdapterConfigPreNorm:
         assert adapter.ln_q is not None
         assert adapter(torch.randn(1, 4, 32)).shape == (1, 4, 16)
 
-    def test_unknown_norm_is_rejected_naming_the_registered_ones(self):
+    def test_a_norm_registered_at_runtime_is_accepted_and_built(self, plugin_norm):
+        adapter = build_adapter(AdapterConfig(pre_norm=plugin_norm), in_dim=32, out_dim=16)
+        assert type(adapter.ln_q) is _PluginNorm
+
+    @pytest.mark.parametrize("adapter_type", ["mlp_2layer", "avgpool"])
+    def test_unknown_norm_is_rejected_naming_the_registered_ones(self, adapter_type):
         with pytest.raises(ValueError, match=r"Unknown adapter\.pre_norm: 'nope'") as info:
-            AdapterConfig(pre_norm="nope")
+            AdapterConfig(type=adapter_type, pre_norm="nope")
         for norm in _REGISTERED_NORMS:
             assert norm in str(info.value)
 
     @pytest.mark.parametrize("adapter_type", ["linear", "avgpool", "attentional_pool"])
     def test_other_adapter_types_ignore_it(self, adapter_type):
-        """A shared [adapter] section carrying pre_norm must not break the
-        builders that have no use for it."""
-        cfg = AdapterConfig(type=adapter_type, pre_norm="rmsnorm", pool_heads=8)
-        adapter = build_adapter(cfg, in_dim=32, out_dim=16)
-        assert not isinstance(adapter, MLP2LayerAdapter)
-        assert not hasattr(adapter, "ln_q")
+        """pre_norm changes neither the state nor the output of the adapters
+        that have no use for it; 25 tokens also takes the ragged pooling path."""
+        x = torch.randn(2, 25, 32) * 10.0
+        built = []
+        for pre_norm in ("", "rmsnorm"):
+            torch.manual_seed(0)
+            cfg = AdapterConfig(type=adapter_type, pre_norm=pre_norm, pool_heads=8)
+            built.append(build_adapter(cfg, in_dim=32, out_dim=16))
+        off, on = built
+        assert not isinstance(on, MLP2LayerAdapter)
+        if adapter_type != "linear":
+            assert _pad_grid_to_windows(x, off.pool_window)[2] is not None
+        assert list(on.state_dict()) == list(off.state_dict())
+        with torch.no_grad():
+            assert torch.equal(on(x), off(x))
