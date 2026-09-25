@@ -753,3 +753,143 @@ class TestBuildAdapterPooling:
         adapter = build_adapter(cfg, in_dim=32, out_dim=16)
         assert isinstance(adapter, AttentionalPoolAdapter)
         assert adapter.pool_heads == 8
+
+
+# ---------------------------------------------------------------------------
+# mlp_2layer pre_norm
+# ---------------------------------------------------------------------------
+
+_REGISTERED_NORMS = sorted(registry.list("norm"))
+_PROJECTION_KEYS = {"proj1.weight", "proj1.bias", "proj2.weight", "proj2.bias"}
+
+
+def _reference_projections(seed: int, in_dim: int, hidden: int, out_dim: int):
+    """The two ``nn.Linear`` draws a plain 2-layer MLP makes at ``seed``; every
+    ``mlp_2layer`` build must reproduce them for its projections."""
+    torch.manual_seed(seed)
+    return torch.nn.Linear(in_dim, hidden), torch.nn.Linear(hidden, out_dim)
+
+
+class TestMLP2LayerPreNorm:
+    def test_registry_has_norms_to_test(self):
+        """Refuse rather than pass vacuously if the norm registry is empty."""
+        assert _REGISTERED_NORMS
+
+    @pytest.mark.parametrize("kwargs", [{}, {"pre_norm": ""}], ids=["absent", "empty"])
+    def test_off_builds_no_module_and_no_state(self, kwargs):
+        adapter = MLP2LayerAdapter(in_dim=32, out_dim=16, **kwargs)
+        assert adapter.ln_q is None
+        assert "ln_q" not in dict(adapter.named_modules())
+        assert set(adapter.state_dict()) == _PROJECTION_KEYS
+
+    @pytest.mark.parametrize("pre_norm", [None, "", *_REGISTERED_NORMS])
+    def test_projections_draw_the_same_rng_as_a_bare_mlp(self, pre_norm):
+        """Off, the knob builds nothing; on, the registered norms are
+        constant-initialized -- either way proj1/proj2 get the draw a plain
+        2-layer MLP gets, so no existing config's init shifts."""
+        ref1, ref2 = _reference_projections(11, 32, 16, 16)
+        torch.manual_seed(11)
+        adapter = MLP2LayerAdapter(in_dim=32, out_dim=16, pre_norm=pre_norm)
+        for ours, ref in ((adapter.proj1, ref1), (adapter.proj2, ref2)):
+            assert torch.equal(ours.weight, ref.weight)
+            assert torch.equal(ours.bias, ref.bias)
+
+    @pytest.mark.parametrize("norm", _REGISTERED_NORMS)
+    def test_norm_is_built_over_the_input_dim(self, norm):
+        adapter = MLP2LayerAdapter(in_dim=32, out_dim=16, pre_norm=norm)
+        assert adapter.ln_q is not None
+        # Every norm parameter spans in_dim: the norm sits on the vision
+        # features ahead of proj1, not on the hidden width.
+        assert all(p.shape == (32,) for p in adapter.ln_q.parameters())
+        assert set(adapter.state_dict()) == _PROJECTION_KEYS | {
+            f"ln_q.{k}" for k in adapter.ln_q.state_dict()
+        }
+
+    @pytest.mark.parametrize("norm", _REGISTERED_NORMS)
+    def test_forward_is_norm_then_mlp(self, norm):
+        torch.manual_seed(0)
+        adapter = MLP2LayerAdapter(in_dim=32, out_dim=16, pre_norm=norm).to(DEVICE)
+        x = torch.randn(2, 4, 32, device=DEVICE) * 10.0  # far from unit scale
+        with torch.no_grad():
+            expected = adapter.proj2(adapter.act(adapter.proj1(adapter.ln_q(x))))
+            bare = adapter.proj2(adapter.act(adapter.proj1(x)))
+            out = adapter(x)
+        assert out.shape == (2, 4, 16)
+        assert torch.equal(out, expected)
+        assert not torch.allclose(out, bare)  # the norm is on the path, not merely built
+
+    @pytest.mark.parametrize("norm", _REGISTERED_NORMS)
+    def test_norm_receives_gradient(self, norm):
+        adapter = MLP2LayerAdapter(in_dim=32, out_dim=16, pre_norm=norm).to(DEVICE)
+        adapter(torch.randn(2, 4, 32, device=DEVICE)).sum().backward()
+        for name, p in adapter.ln_q.named_parameters():
+            assert p.grad is not None and torch.isfinite(p.grad).all(), name
+        assert (adapter.ln_q.weight.grad != 0).any()
+
+    @pytest.mark.parametrize("norm", _REGISTERED_NORMS)
+    def test_reset_parameters_restores_the_norm_after_a_meta_build(self, norm):
+        """The meta-device path runs to_empty() then reset_parameters(); the
+        norm must come back to its constructor init, not keep whatever memory
+        to_empty handed it."""
+        fresh = MLP2LayerAdapter(in_dim=32, out_dim=16, pre_norm=norm)
+        with torch.device("meta"):
+            adapter = MLP2LayerAdapter(in_dim=32, out_dim=16, pre_norm=norm)
+        adapter.to_empty(device=torch.device("cpu"))
+        with torch.no_grad():
+            for p in adapter.ln_q.parameters():
+                p.fill_(float("nan"))
+        adapter.reset_parameters()
+        for k, v in adapter.ln_q.state_dict().items():
+            assert torch.equal(v, fresh.ln_q.state_dict()[k]), k
+        assert all(torch.isfinite(p).all() for p in adapter.parameters())
+
+    def test_reset_parameters_defers_to_a_norm_that_has_its_own(self):
+        """A registered norm with its own reset_parameters() is re-initialized
+        by it, not by the weight->1 / bias->0 fallback."""
+        calls: list[str] = []
+
+        class _Norm(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.full((32,), 0.5))
+
+            def reset_parameters(self):
+                calls.append("reset")
+
+        adapter = MLP2LayerAdapter(in_dim=32, out_dim=16, pre_norm="rmsnorm")
+        adapter.ln_q = _Norm()
+        adapter.reset_parameters()
+        assert calls == ["reset"]
+        assert torch.equal(adapter.ln_q.weight, torch.full((32,), 0.5))
+
+
+class TestAdapterConfigPreNorm:
+    def test_default_is_off(self):
+        cfg = AdapterConfig()
+        assert cfg.pre_norm == ""
+        assert cfg.extra_kwargs()["pre_norm"] is None
+        assert build_adapter(cfg, in_dim=32, out_dim=16).ln_q is None
+
+    @pytest.mark.parametrize("norm", _REGISTERED_NORMS)
+    def test_every_registered_norm_is_accepted_and_built(self, norm):
+        cfg = AdapterConfig(pre_norm=norm)
+        assert cfg.extra_kwargs()["pre_norm"] == norm
+        adapter = build_adapter(cfg, in_dim=32, out_dim=16)
+        assert isinstance(adapter, MLP2LayerAdapter)
+        assert adapter.ln_q is not None
+        assert adapter(torch.randn(1, 4, 32)).shape == (1, 4, 16)
+
+    def test_unknown_norm_is_rejected_naming_the_registered_ones(self):
+        with pytest.raises(ValueError, match=r"Unknown adapter\.pre_norm: 'nope'") as info:
+            AdapterConfig(pre_norm="nope")
+        for norm in _REGISTERED_NORMS:
+            assert norm in str(info.value)
+
+    @pytest.mark.parametrize("adapter_type", ["linear", "avgpool", "attentional_pool"])
+    def test_other_adapter_types_ignore_it(self, adapter_type):
+        """A shared [adapter] section carrying pre_norm must not break the
+        builders that have no use for it."""
+        cfg = AdapterConfig(type=adapter_type, pre_norm="rmsnorm", pool_heads=8)
+        adapter = build_adapter(cfg, in_dim=32, out_dim=16)
+        assert not isinstance(adapter, MLP2LayerAdapter)
+        assert not hasattr(adapter, "ln_q")
