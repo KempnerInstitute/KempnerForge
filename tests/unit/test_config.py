@@ -1416,7 +1416,7 @@ class TestEvalConfig:
 
 
 # ---------------------------------------------------------------------------
-# ModelConfig head geometry -- inferred by default, decoupled by override
+# ModelConfig.head_dim_override
 # ---------------------------------------------------------------------------
 
 
@@ -1427,8 +1427,8 @@ class TestModelConfigHeadDim:
         import dataclasses
 
         names = {f.name for f in dataclasses.fields(ModelConfig)}
-        assert "head_dim_override" in names  # settable from TOML
-        assert "head_dim" not in names  # derived, never stored
+        assert "head_dim_override" in names
+        assert "head_dim" not in names
         assert isinstance(ModelConfig.head_dim, property)
 
     def test_default_infers_dim_over_n_heads(self):
@@ -1458,7 +1458,6 @@ class TestModelConfigHeadDim:
     def test_indivisible_dim_is_rejected_only_without_an_override(self):
         with pytest.raises(ValueError, match="divisible by n_heads"):
             ModelConfig(dim=100, n_layers=2, n_heads=8, vocab_size=32)
-        # An explicit override lifts the requirement, which is the point.
         cfg = ModelConfig(dim=100, n_layers=2, n_heads=8, head_dim_override=16, vocab_size=32)
         assert cfg.head_dim == 16
 
@@ -1476,7 +1475,7 @@ class TestModelConfigHeadDim:
 
     def test_num_params_estimate_tracks_the_decoupled_head_dim(self):
         base = dict(dim=1024, n_layers=2, n_heads=16, vocab_size=256, max_seq_len=64)
-        coupled = ModelConfig(**base)  # head_dim 64
+        coupled = ModelConfig(**base)
         wide = ModelConfig(**base, head_dim_override=128)
         assert wide.num_params_estimate > coupled.num_params_estimate
 
@@ -1502,4 +1501,4 @@ class TestModelConfigHeadDim:
         )
         model = load_config(str(path), cli_args=[]).model
         assert model.head_dim_override == 0
-        assert model.head_dim == 64  # 256 // 4, not the 4096 // 32 default
+        assert model.head_dim == 64

@@ -332,8 +332,8 @@ class TestCrossAttentionHeadDim:
     def test_block_threads_an_explicit_head_dim(self):
         block = CrossAttentionBlock(dim=32, n_heads=4, n_kv_heads=4, ffn_hidden_dim=64, head_dim=16)
         assert block.attn.head_dim == 16
-        assert block.attn.q_proj.weight.shape == (64, 32)  # n_heads * head_dim, dim
-        assert block.attn.o_proj.weight.shape == (32, 64)
+        assert block.attn.q_proj.weight.shape == (4 * 16, 32)
+        assert block.attn.o_proj.weight.shape == (32, 4 * 16)
 
     def test_forward_preserves_the_residual_width_when_decoupled(self):
         block = CrossAttentionBlock(
@@ -377,9 +377,9 @@ class TestTransformerCrossAttentionHeadDim:
         return model_cfg, Transformer(model_cfg, vlm_config=vlm_cfg)
 
     def test_coupled_model_keeps_cross_attentions_own_dim_over_n_heads(self):
-        _, model = self._build(ca_n_heads=2)  # 2 != model n_heads 8
+        _, model = self._build(ca_n_heads=2)
         attn = model.cross_attention_layers["0"].attn
-        assert attn.head_dim == 32  # dim 64 // ca n_heads 2, not the model's 8
+        assert attn.head_dim == 32  # 64 // 2, not the model's 8
         assert attn.q_proj.weight.shape == (64, 64)
 
     def test_coupled_model_with_matching_head_count_is_unaffected(self):

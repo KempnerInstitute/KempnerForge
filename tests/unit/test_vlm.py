@@ -729,7 +729,7 @@ class TestFramePaddingMask:
 
 
 # ---------------------------------------------------------------------------
-# The decoupled head dim through a real build_vlm_wrapper
+# Decoupled head_dim
 # ---------------------------------------------------------------------------
 
 
@@ -797,7 +797,7 @@ class TestVLMDecoupledHeadDim:
             n_layers=2,
             n_heads=4,
             n_kv_heads=4,
-            head_dim_override=32,  # 4 * 32 = 128 != dim 64
+            head_dim_override=32,
             ffn_hidden_dim=128,
             vocab_size=256,
             max_seq_len=64,

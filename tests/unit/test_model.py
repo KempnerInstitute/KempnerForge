@@ -1039,7 +1039,7 @@ class TestInitWeights:
 
 
 # ---------------------------------------------------------------------------
-# Decoupled head geometry (model.head_dim_override)
+# Decoupled head_dim
 # ---------------------------------------------------------------------------
 
 
@@ -1070,7 +1070,6 @@ class TestDecoupledHeadDim:
         )
         assert attn.q_proj.weight.shape == (cfg.n_heads * cfg.head_dim, cfg.dim) == (128, 64)
         assert attn.k_proj.weight.shape == (cfg.n_kv_heads * cfg.head_dim, cfg.dim)
-        # o_proj is what makes the residual stream still `dim` wide.
         assert attn.o_proj.weight.shape == (cfg.dim, cfg.n_heads * cfg.head_dim) == (64, 128)
 
     def test_attention_forward_and_backward_on_a_decoupled_head_dim(self):
@@ -1085,7 +1084,6 @@ class TestDecoupledHeadDim:
         cos, sin = cos.to(DEVICE), sin.to(DEVICE)
         x = torch.randn(2, 8, cfg.dim, device=DEVICE, requires_grad=True)
         out = attn(x, cos[:8], sin[:8])
-        # The residual width is preserved even though attention is 2x wider.
         assert out.shape == (2, 8, cfg.dim)
         out.sum().backward()
         assert x.grad is not None and torch.isfinite(x.grad).all()
@@ -1093,7 +1091,6 @@ class TestDecoupledHeadDim:
     def test_rope_table_is_sized_by_head_dim(self):
         cfg = _decoupled_config()
         model = Transformer(cfg)
-        # head_dim // 2, not (dim // n_heads) // 2 == 4.
         assert model._rope_cos.shape == (cfg.max_seq_len, cfg.head_dim // 2) == (32, 8)
 
     def test_qk_norm_is_sized_by_head_dim(self):

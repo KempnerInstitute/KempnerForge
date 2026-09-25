@@ -63,11 +63,7 @@ class ModelConfig:
     n_layers: int = 32
     n_heads: int = 32
     n_kv_heads: int | None = None  # None -> same as n_heads (MHA)
-    # 0 -> head_dim is dim // n_heads (Llama-style coupling). A positive value
-    # decouples the attention width from the residual width, so n_heads *
-    # head_dim need not equal dim (Qwen3: dim=1024, n_heads=16, head_dim=128 ->
-    # a 2048-wide attention over a 1024-wide residual). Read via `head_dim`.
-    head_dim_override: int = 0
+    head_dim_override: int = 0  # 0 -> dim // n_heads
     vocab_size: int = 32000
     ffn_dim_multiplier: float = 1.0
     ffn_hidden_dim: int | None = None  # Override computed hidden dim
@@ -117,14 +113,13 @@ class ModelConfig:
             raise ValueError("vocab_size must be positive")
         if self.n_kv_heads <= 0:
             raise ValueError("n_kv_heads must be positive")
-
-        # Divisibility checks. dim must split evenly across heads only when the
-        # head dim is inferred; head_dim_override lifts that requirement.
         if self.head_dim_override < 0:
             raise ValueError(
                 f"head_dim_override must be non-negative (got {self.head_dim_override}); "
                 "0 infers dim // n_heads"
             )
+
+        # Divisibility checks
         if self.head_dim_override == 0 and self.dim % self.n_heads != 0:
             raise ValueError(
                 f"dim ({self.dim}) must be divisible by n_heads ({self.n_heads}) "

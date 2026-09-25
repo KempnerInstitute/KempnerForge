@@ -194,10 +194,7 @@ class Transformer(nn.Module):
         if isinstance(vlm_config, CrossAttentionConfig):
             self._ca_cadence = vlm_config.cross_attention_every_n_layers
             n_h, n_kv = vlm_config.resolved_heads(config.n_heads)
-            # Forward the model's head_dim only when it is explicitly
-            # decoupled. Under the default coupling cross-attention keeps its
-            # own dim // n_heads, so a custom cross_attention_n_heads keeps the
-            # width it has today.
+            # Cross-attention uses dim // its own n_heads unless head_dim is decoupled.
             ca_head_dim = config.head_dim if config.head_dim_override else None
             num_ca_blocks = config.n_layers // self._ca_cadence
             for k in range(num_ca_blocks):
