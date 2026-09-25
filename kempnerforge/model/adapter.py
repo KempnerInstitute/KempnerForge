@@ -7,9 +7,8 @@ between the vision encoder and the transformer in ``VLMWrapper``.
 Two families:
 
 - **Projection adapters** keep the token count (``out_tokens == num_tokens``):
-  ``mlp_2layer`` (default, the canonical LLaVA-family 2-layer MLP, with an
-  optional pre-projection norm) and ``linear`` (single ``nn.Linear``, an
-  ablation baseline).
+  ``mlp_2layer`` (default, the canonical LLaVA-family 2-layer MLP) and
+  ``linear`` (single ``nn.Linear``, an ablation baseline).
 - **Pooling adapters** reduce the token count by pooling the square patch grid
   before projecting: ``avgpool`` (window-average, the cheapest reducer) and
   ``attentional_pool`` (Molmo2-style per-window multi-head attention with the
@@ -160,9 +159,7 @@ class MLP2LayerAdapter(VisionAdapter):
                 f"Unknown adapter activation: {activation!r}. Options: {list(_ADAPTER_ACTIVATIONS)}"
             )
         hidden = hidden_dim if hidden_dim and hidden_dim > 0 else out_dim
-        # Sits ahead of proj1 so the projection sees unit-scale features instead
-        # of absorbing the encoder's output scale; None builds nothing, leaving
-        # the default module, state dict and RNG stream untouched.
+        # Ahead of proj1, so the projection sees normalized features whatever the encoder's scale.
         self.ln_q = build_norm(pre_norm, in_dim) if pre_norm else None
         self.proj1 = nn.Linear(in_dim, hidden, bias=True)
         self.act = _ADAPTER_ACTIVATIONS[activation]()
@@ -177,7 +174,7 @@ class MLP2LayerAdapter(VisionAdapter):
             reset = getattr(self.ln_q, "reset_parameters", None)
             if callable(reset):
                 reset()
-            else:  # a bare gain (+ bias) norm such as RMSNorm: weight -> 1, bias -> 0
+            else:  # RMSNorm has no reset_parameters()
                 for name, param in self.ln_q.named_parameters():
                     (nn.init.zeros_ if name.endswith("bias") else nn.init.ones_)(param)
         self.proj1.reset_parameters()

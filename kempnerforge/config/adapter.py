@@ -65,7 +65,7 @@ class AdapterConfig:
                 f"Unknown adapter.activation: {self.activation!r}. Options: 'gelu', 'silu', 'relu'."
             )
         if self.pre_norm:
-            import kempnerforge.model.norm  # noqa: F401, PLC0415  (registers the norms)
+            import kempnerforge.model.norm  # noqa: F401, PLC0415
 
             norms = tuple(registry.list("norm"))
             if self.pre_norm not in norms:

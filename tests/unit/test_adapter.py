@@ -798,8 +798,6 @@ class TestMLP2LayerPreNorm:
     def test_norm_is_built_over_the_input_dim(self, norm):
         adapter = MLP2LayerAdapter(in_dim=32, out_dim=16, pre_norm=norm)
         assert adapter.ln_q is not None
-        # Every norm parameter spans in_dim: the norm sits on the vision
-        # features ahead of proj1, not on the hidden width.
         assert all(p.shape == (32,) for p in adapter.ln_q.parameters())
         assert set(adapter.state_dict()) == _PROJECTION_KEYS | {
             f"ln_q.{k}" for k in adapter.ln_q.state_dict()
@@ -812,11 +810,11 @@ class TestMLP2LayerPreNorm:
         x = torch.randn(2, 4, 32, device=DEVICE) * 10.0  # far from unit scale
         with torch.no_grad():
             expected = adapter.proj2(adapter.act(adapter.proj1(adapter.ln_q(x))))
-            bare = adapter.proj2(adapter.act(adapter.proj1(x)))
+            without_norm = adapter.proj2(adapter.act(adapter.proj1(x)))
             out = adapter(x)
         assert out.shape == (2, 4, 16)
         assert torch.equal(out, expected)
-        assert not torch.allclose(out, bare)  # the norm is on the path, not merely built
+        assert not torch.allclose(out, without_norm)
 
     @pytest.mark.parametrize("norm", _REGISTERED_NORMS)
     def test_norm_receives_gradient(self, norm):
