@@ -1196,8 +1196,6 @@ class TestRestoreCheckpoint:
         # step 9 is past start_step 5, so the stage must have been applied
         assert applied and applied[0][0].module == "vision_encoder"
 
-    # -- exclude_from_loading: forwarded on a warm start, dropped on a resume --
-
     @pytest.mark.parametrize(
         ("resume_found", "load_path", "exclude", "want_exclude"),
         [
