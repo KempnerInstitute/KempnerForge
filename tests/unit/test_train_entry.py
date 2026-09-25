@@ -1196,6 +1196,77 @@ class TestRestoreCheckpoint:
         # step 9 is past start_step 5, so the stage must have been applied
         assert applied and applied[0][0].module == "vision_encoder"
 
+    # -- exclude_from_loading: forwarded on a warm start, dropped on a resume --
+
+    @pytest.mark.parametrize(
+        ("resume_found", "load_path", "exclude", "want_exclude"),
+        [
+            (False, "/somewhere/converted", ["optimizer"], ["optimizer"]),
+            (False, "/somewhere/converted", ["model"], ["model"]),
+            (False, "/somewhere/converted", ["model", "optimizer"], ["model", "optimizer"]),
+            (False, "/somewhere/converted", [], None),
+            (True, None, ["optimizer"], None),
+            (True, None, [], None),
+            (True, "/somewhere/converted", ["optimizer"], None),
+            (True, "/somewhere/converted", ["model", "optimizer"], None),
+            (True, "/somewhere/converted", [], None),
+        ],
+    )
+    def test_exclude_from_loading_truth_table(
+        self, monkeypatch, tmp_path, resume_found, load_path, exclude, want_exclude
+    ):
+        import kempnerforge.training.entry as entry
+
+        resume = tmp_path / "step_7" if resume_found else None
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d: resume)
+        config = make_config()
+        config.checkpoint.load_path = load_path
+        config.checkpoint.exclude_from_loading = exclude
+        mgr = FakeResumeManager(step=7 if resume_found else 0, tokens=0)
+        entry.restore_checkpoint(config, TinyTextModel(), None, mgr)
+        assert mgr.load_kwargs["path"] == (str(resume) if resume_found else None)
+        assert mgr.load_kwargs["exclude_keys"] == want_exclude
+
+    def test_resume_with_stale_load_path_restores_full_state(self, monkeypatch, tmp_path):
+        """A requeued run keeps its warm-start config; the resume must still
+        load the optimizer, or momentum silently resets mid-run."""
+        import kempnerforge.training.entry as entry
+
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d: tmp_path / "step_7")
+        config = make_config()
+        config.checkpoint.load_path = "/somewhere/converted"
+        config.checkpoint.exclude_from_loading = ["optimizer"]
+        mgr = FakeResumeManager(step=7, tokens=999)
+        assert entry.restore_checkpoint(config, TinyTextModel(), None, mgr) == (7, 999)
+        assert mgr.load_kwargs["path"] == str(tmp_path / "step_7")
+        assert mgr.load_kwargs["exclude_keys"] is None
+
+    def test_exclude_alone_does_not_trigger_a_load(self, monkeypatch):
+        import kempnerforge.training.entry as entry
+
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d: None)
+        config = make_config()
+        config.checkpoint.exclude_from_loading = ["optimizer"]
+        mgr = FakeResumeManager()
+        assert entry.restore_checkpoint(config, TinyTextModel(), None, mgr) == (0, 0)
+        assert mgr.load_kwargs == {}
+
+    def test_warm_start_exclude_leaves_the_vlm_freeze_probe_alone(self, monkeypatch):
+        """Excluding state keys does not skip the freeze-metadata check; a
+        weights-only checkpoint has no metadata.json, so the probe yields 0."""
+        import kempnerforge.training.entry as entry
+        from kempnerforge.training.freeze import freeze_meta_at_step
+
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d: None)
+        config = _vlm_config()
+        config.checkpoint.load_path = "/somewhere/converted"
+        config.checkpoint.exclude_from_loading = ["model"]
+        mgr = FakeResumeManager(step=0, tokens=0, saved_step=None)
+        entry.restore_checkpoint(config, TinyTextModel(), None, mgr)
+        assert mgr.peeked == [None]
+        assert mgr.load_kwargs["vlm_freeze_expected"] == freeze_meta_at_step(0, config.vlm)
+        assert mgr.load_kwargs["exclude_keys"] == ["model"]
+
     def test_mot_warm_start_fires_only_at_step_zero(self, monkeypatch, tmp_path):
         import kempnerforge.training.entry as entry
         from kempnerforge.config.adapter import AdapterConfig

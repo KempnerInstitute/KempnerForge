@@ -218,9 +218,18 @@ def restore_checkpoint(
         probe_step = ckpt_mgr.peek_saved_step(str(resume_path) if resume_path else None) or 0
         vlm_freeze_expected = freeze_meta_at_step(probe_step, vlm_cfg)
 
+    # A warm start (fine-tune from checkpoint.load_path, no in-place resume)
+    # honors checkpoint.exclude_from_loading, so a weights-only checkpoint --
+    # e.g. a converted external model with no optimizer/train_state -- loads
+    # cleanly. A real resume (resume_path set) always restores full state, or
+    # it would silently drop optimizer moments.
+    warm_start_exclude = (
+        (config.checkpoint.exclude_from_loading or None) if resume_path is None else None
+    )
     step, tokens_seen, ckpt_extra_loaded = ckpt_mgr.load(
         path=str(resume_path) if resume_path else None,
         scheduler=scheduler,
+        exclude_keys=warm_start_exclude,
         vlm_freeze_expected=vlm_freeze_expected,
     )
     if ckpt_extra_loaded.get("wandb_run_id"):
