@@ -143,9 +143,9 @@ def _pipeline_step(
     global batch matches FSDP's.
     """
     global_batch = BATCH * WORLD
-    stage_module = build_stage_module(
-        config, pp_rank=rank, pp_size=WORLD, carries_doc_ids=packed
-    ).to(device=device, dtype=torch.bfloat16)
+    stage_module = build_stage_module(config, pp_rank=rank, pp_size=WORLD).to(
+        device=device, dtype=torch.bfloat16
+    )
     stage = build_pipeline_stage(
         stage_module,
         mesh,
@@ -153,7 +153,6 @@ def _pipeline_step(
         batch_size=BATCH,  # per microbatch
         seq_len=seq_len,
         param_dtype=torch.bfloat16,
-        carries_doc_ids=packed,
     )
     schedule = build_pipeline_schedule(
         stage, n_microbatches=WORLD, loss_fn=_loss_fn, schedule="gpipe"
@@ -164,15 +163,20 @@ def _pipeline_step(
     doc_ids = doc_ids_for(global_batch, seq_len, device) if packed else None
     is_first, is_last = rank == 0, rank == WORLD - 1
 
+    # doc_ids rides the schedule kwargs, which reach every stage and are split
+    # into micro-batches alongside the tokens. It must not be a positional arg:
+    # those are transmitted between stages, and PipelineStage marks every
+    # received buffer as requiring grad without checking dtype.
+    kw = {"doc_ids": doc_ids} if packed else {}
+
     def step() -> None:
         losses: list[torch.Tensor] = []
         if is_first:
-            args = (tokens, doc_ids) if packed else (tokens,)
-            schedule.step(*args, target=labels, losses=losses)
+            schedule.step(tokens, target=labels, losses=losses, **kw)
         elif is_last:
-            schedule.step(target=labels, losses=losses)
+            schedule.step(target=labels, losses=losses, **kw)
         else:
-            schedule.step()
+            schedule.step(**kw)
         stage_module.zero_grad(set_to_none=True)
 
     return step
