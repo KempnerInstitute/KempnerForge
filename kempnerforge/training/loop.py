@@ -211,12 +211,11 @@ def pipeline_step(session: TrainingSession, step: int) -> StepResult:
 
     full_input = torch.cat(input_ids_list, dim=0)
     full_labels = torch.cat(labels_list, dim=0)
-    # Packed runs pass doc_ids as a second schedule argument so it is split into
-    # microbatches in lockstep with the tokens; each stage then forwards it down
-    # the pipe, because a schedule only hands arguments to stage 0.
-    stage_args = (full_input,)
-    if doc_ids_list:
-        stage_args = (full_input, torch.cat(doc_ids_list, dim=0))
+    # Packed runs pass doc_ids as a schedule *kwarg*. Positional args reach only
+    # stage 0, but kwargs are handed to every stage, and both are split into
+    # micro-batches the same way -- so alignment with the tokens is automatic and
+    # doc_ids never becomes an activation the backward pass tries to grade.
+    pp_kwargs = {"doc_ids": torch.cat(doc_ids_list, dim=0)} if doc_ids_list else {}
 
     # The schedule handles forward/backward for all microbatches.
     # First stage needs input; last stage needs target for loss.
@@ -227,11 +226,11 @@ def pipeline_step(session: TrainingSession, step: int) -> StepResult:
     pp_losses: list[torch.Tensor] = []
 
     if is_first:
-        pipeline.schedule.step(*stage_args, target=full_labels, losses=pp_losses)
+        pipeline.schedule.step(full_input, target=full_labels, losses=pp_losses, **pp_kwargs)
     elif is_last:
-        pipeline.schedule.step(target=full_labels, losses=pp_losses)
+        pipeline.schedule.step(target=full_labels, losses=pp_losses, **pp_kwargs)
     else:
-        pipeline.schedule.step()
+        pipeline.schedule.step(**pp_kwargs)
 
     # Loss is only meaningful on the last stage
     if is_last and pp_losses:
