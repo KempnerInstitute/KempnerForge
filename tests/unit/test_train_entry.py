@@ -1471,8 +1471,8 @@ class FakeSchedule:
         self.loss = loss
         self.calls: list = []
 
-    def step(self, *args, target=None, losses=None):
-        self.calls.append({"args": args, "target": target})
+    def step(self, *args, target=None, losses=None, **kwargs):
+        self.calls.append({"args": args, "target": target, "kwargs": kwargs})
         if losses is not None:
             losses.append(torch.tensor(self.loss))
 
@@ -1528,6 +1528,64 @@ class TestPipelineStep:
         session = make_session(make_config())  # pipeline=None
         with pytest.raises(RuntimeError, match="requires TrainingSession.pipeline"):
             pipeline_step(session, 0)
+
+
+class TestPipelineStepPacked:
+    """``doc_ids`` reaches the schedule as a kwarg, on every rank.
+
+    Two reasons it cannot be positional. A schedule hands positional args to
+    stage 0 only, so later stages would never see them; and a positional arg
+    becomes an inter-stage activation, which ``PipelineStage`` marks as
+    requiring grad without checking dtype -- so an integer tensor fails as soon
+    as a backward pass exists. Shape-level coverage misses both: the pipeline
+    still runs, it just attends across document boundaries.
+    """
+
+    def _packed_session(self, monkeypatch, rank, size, sched, *, packed=True):
+        import kempnerforge.training.loop as loop
+        from kempnerforge.training.runtime import PipelineBundle
+
+        monkeypatch.setattr(loop, "pp_group", lambda _r: "PPGROUP")
+        monkeypatch.setattr(loop.dist, "broadcast", lambda *a, **k: None)
+
+        batch = {
+            "input_ids": torch.zeros(2, 8, dtype=torch.long),
+            "labels": torch.zeros(2, 8, dtype=torch.long),
+        }
+        if packed:
+            batch["doc_ids"] = torch.tensor([[0] * 4 + [1] * 4] * 2)
+
+        config = make_config()
+        config.distributed.pp = size
+        return make_session(
+            config,
+            data=DataPipeline(dataloader=[batch] * 4),
+            pipeline=PipelineBundle(rank=rank, size=size, schedule=sched),
+        )
+
+    @pytest.mark.parametrize("rank,size,label", [(0, 2, "first"), (1, 2, "last"), (1, 3, "middle")])
+    def test_doc_ids_arrive_as_a_kwarg(self, monkeypatch, rank, size, label):
+        sched = FakeSchedule()
+        session = self._packed_session(monkeypatch, rank, size, sched)
+        session.step_fn(session, 0)
+
+        call = sched.calls[0]
+        assert "doc_ids" in call["kwargs"], f"{label} stage received no doc_ids"
+        # The guard that matters: never positional.
+        assert not any(
+            isinstance(a, torch.Tensor)
+            and a.dtype == torch.long
+            and a.dim() == 2
+            and torch.equal(a, call["kwargs"]["doc_ids"])
+            for a in call["args"][1:]
+        ), f"{label} stage passed doc_ids positionally"
+
+    def test_unpacked_batch_sends_no_doc_ids(self, monkeypatch):
+        """An unpacked run must not grow a kwarg it never had."""
+        sched = FakeSchedule()
+        session = self._packed_session(monkeypatch, 0, 2, sched, packed=False)
+        session.step_fn(session, 0)
+        assert sched.calls[0]["kwargs"] == {}
 
 
 class TinyVlmModel(nn.Module):
