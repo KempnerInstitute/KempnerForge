@@ -1465,6 +1465,16 @@ class TestModelConfigHeadDim:
         with pytest.raises(ValueError, match="head_dim_override must be non-negative"):
             ModelConfig(dim=64, n_layers=2, n_heads=8, head_dim_override=-1, vocab_size=32)
 
+    @pytest.mark.parametrize("odd", [1, 7, 97])
+    def test_odd_override_is_rejected_at_config_time(self, odd):
+        with pytest.raises(ValueError, match=rf"must be even for rotary embeddings \(got {odd}\)"):
+            ModelConfig(dim=64, n_layers=2, n_heads=8, head_dim_override=odd, vocab_size=32)
+
+    @pytest.mark.parametrize(("override", "expected"), [(0, 8), (2, 2), (8, 8), (96, 96)])
+    def test_even_override_is_accepted_and_zero_infers(self, override, expected):
+        cfg = ModelConfig(dim=64, n_layers=2, n_heads=8, head_dim_override=override, vocab_size=32)
+        assert cfg.head_dim == expected
+
     @pytest.mark.parametrize("override", [0, 8, 128])
     def test_round_trip_through_asdict_is_stable(self, override):
         import dataclasses

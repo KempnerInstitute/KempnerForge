@@ -118,6 +118,11 @@ class ModelConfig:
                 f"head_dim_override must be non-negative (got {self.head_dim_override}); "
                 "0 infers dim // n_heads"
             )
+        if self.head_dim_override % 2:
+            raise ValueError(
+                "head_dim_override must be even for rotary embeddings "
+                f"(got {self.head_dim_override})"
+            )
 
         # Divisibility checks
         if self.head_dim_override == 0 and self.dim % self.n_heads != 0:
