@@ -77,6 +77,10 @@ If both are set, `resume_path` wins (auto-resume takes precedence
 over the static config). This is deliberate: SLURM requeues should
 always pick up where they left off, not re-load the initial
 `load_path` every time.
+`exclude_from_loading` follows the same rule: it applies only to the
+`load_path` warm start, so when a resume wins it is dropped with
+`load_path` and a weights-only warm start silently becomes a full
+resume. Use an empty `dir` to guarantee the warm start.
 
 ## Symlink updates
 
