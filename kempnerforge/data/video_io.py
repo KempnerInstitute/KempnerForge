@@ -171,10 +171,12 @@ def _decode_seek(container: Any, stream: Any, targets: list[float]) -> list[PILI
     The first targets are decoded from the start of the stream without a seek,
     so the time origin and the first frames are exactly serial's. After a match
     the same decode keeps running. On reaching a keyframe whose pending target
-    is further away than the last keyframe interval, so at least one whole
-    group can be skipped, it seeks backward to the keyframe at or before that
-    target and decodes forward from there. Seeking once per target instead
-    would re-decode a group once for every target inside it.
+    is more than two keyframe intervals away (the last interval measured), so
+    at least two whole groups can be skipped, it seeks backward to the keyframe
+    at or before that target and decodes forward from there; a seek costs about
+    as much as decoding one group, so a single group is decoded through.
+    Seeking once per target instead would re-decode a group once for every
+    target inside it.
 
     Raises ``_SeekUnreliableError`` whenever identical selection cannot be
     guaranteed: no ``time_base``, a frame without a timestamp, a seek that
@@ -221,7 +223,7 @@ def _decode_seek(container: Any, stream: Any, targets: list[float]) -> list[PILI
                 matched = True
             elif matched and frame.key_frame:
                 gop_s = None if prev_key_t is None else t - prev_key_t
-                if gop_s is None or tgt - t > gop_s:
+                if gop_s is None or tgt - t > 2 * gop_s:
                     skip_ahead = True
                     break
             if frame.key_frame:

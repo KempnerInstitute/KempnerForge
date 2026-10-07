@@ -610,7 +610,7 @@ class TestSeekMatchesSerialH264:
 
         path = tmp_path / "clip.mp4"
         _write_h264_mp4(path, n_frames=200, open_gop=True)
-        targets = [0.0] + [3.6 * m - pre_s for m in (1, 2, 3, 4)]  # 3 GOPs apart: seeks
+        targets = [0.0] + [4.8 * m - pre_s for m in (1, 2, 3, 4)]  # 4 GOPs apart: seeks
         expected, _ = _run_direct(path, _decode_serial, targets)
         try:
             got, counter = _run_direct(path, _decode_seek, targets)
@@ -685,7 +685,7 @@ class TestSeekCodecShapes:
         _write_indexed_clip(
             path, n_frames=200, codec="libx265", codec_options={"x265-params": params}
         )
-        targets = [0.0] + [3.6 * m - pre_s for m in (1, 2, 3, 4)]
+        targets = [0.0] + [4.8 * m - pre_s for m in (1, 2, 3, 4)]
         expected, _ = _run_direct(path, _decode_serial, targets)
         try:
             got, counter = _run_direct(path, _decode_seek, targets)
@@ -717,10 +717,10 @@ class TestSeekCodecShapes:
         _write_indexed_clip(
             path, n_frames=200, codec="libx264", fmt="mpegts", codec_options={"x264-params": params}
         )
-        expected = _serial_reference(path, 2.0, 4, 8)
+        expected = _serial_reference(path, 2.0, 1, 4)
         reasons = []
         monkeypatch.setattr(video_io, "_log_fallback_once", reasons.append)
-        got = video_io.decode_video_frames(str(path), fps=2.0, min_frames=4, max_frames=8)
+        got = video_io.decode_video_frames(str(path), fps=2.0, min_frames=1, max_frames=4)
         assert reasons == ["_SeekUnreliableError"]
         assert [f.tobytes() for f in got] == [f.tobytes() for f in expected]
 
@@ -889,6 +889,7 @@ class _FakeContainer:
     ``seek`` moves to the last keyframe at or before the requested time, then
     ``land_late`` keyframes further; ``land_on_any_frame`` moves to the frame at
     that time instead, and ``empty_after_seek`` leaves nothing to decode.
+    ``first_frame_key=False`` leaves frame 0 unflagged.
     """
 
     def __init__(
@@ -900,9 +901,11 @@ class _FakeContainer:
         land_on_any_frame=False,
         empty_after_seek=False,
         timed=True,
+        first_frame_key=True,
     ):
         self.frames = [
-            _FakeFrame(i, i / 10 if timed else None, i % gop == 0) for i in range(n_frames)
+            _FakeFrame(i, i / 10 if timed else None, i % gop == 0 and (i > 0 or first_frame_key))
+            for i in range(n_frames)
         ]
         self.gop = gop
         self.land_late = land_late
@@ -940,10 +943,30 @@ class TestSeekCursor:
         assert _decode_seek(seek, self._STREAM, targets) == [0, 5, 15, 50, 99]
         assert _decode_serial(serial, self._STREAM, targets) == [0, 5, 15, 50, 99]
         # 1.5 s is reached by decoding on through the 1 s keyframe; 5 s and 9.9 s
-        # lie over a whole group away, so the decode seeks to their keyframes.
+        # lie more than two groups away, so the decode seeks to their keyframes.
         assert seek.seeks == [5.0, 9.9]
         assert seek.decoded == 21 + 11 + 10
         assert serial.decoded == 100
+
+    @pytest.mark.parametrize(("target", "seeks", "decoded"), [(2.5, [], 26), (3.5, [3.5], 17)])
+    def test_seeks_only_when_two_groups_can_be_skipped(self, target, seeks, decoded):
+        """From the 1 s keyframe, 2.5 s leaves one whole group (1-2 s) to skip, so the
+        decode runs on; 3.5 s leaves two (1-2 s and 2-3 s), so it seeks."""
+        from kempnerforge.data.video_io import _decode_seek
+
+        container = _FakeContainer(100, gop=10)
+        assert _decode_seek(container, self._STREAM, [0.0, target]) == [0, round(target * 10)]
+        assert container.seeks == seeks
+        assert container.decoded == decoded
+
+    def test_seeks_without_a_measured_keyframe_interval(self):
+        """No keyframe precedes the first one met after a match, so there is no interval
+        to compare against: the decode seeks."""
+        from kempnerforge.data.video_io import _decode_seek
+
+        container = _FakeContainer(100, gop=10, first_frame_key=False)
+        assert _decode_seek(container, self._STREAM, [0.0, 2.5]) == [0, 25]
+        assert container.seeks == [2.5]
 
     def test_seek_landing_past_its_target_raises(self):
         from kempnerforge.data.video_io import _decode_seek, _SeekUnreliableError
