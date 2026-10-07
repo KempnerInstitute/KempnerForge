@@ -44,17 +44,31 @@ build- and config-time checks enforce this and fail before any GPU work.
 
 ## Configure it
 
-A video run adds a `[video]` section (sibling of `[vision_encoder]` /
-`[adapter]` / `[vlm]`) and a token-reducing connector. The key parts of a
-video config:
+A video run is a text training config with these sections on top: set the
+`[model]`, `[train]` and `[data]` keys in the text config's own tables, and add
+`[vision_encoder]`, a token-reducing `[adapter]`, `[vlm]` and `[video]`:
 
 ```toml
+[model]
+max_seq_len = 576            # 8 frames × 49 + 64 text = 456, plus headroom
+
+[train]
+seq_len = 576                # at most model.max_seq_len
+
+[data]
+tokenizer_path = "<tokenizer>"
+
+[vision_encoder]
+type = "<encoder>"            # a registered encoder
+path = "<pretrained-weights>" # for encoders that load pretrained weights
+
 [adapter]
 type = "avgpool"          # or "attentional_pool"; pools patches per frame
 pool_window = 2           # 14×14 grid -> 7×7 = 49 tokens/frame
 
 [vlm]
 arch = "joint_decoder"    # also: cross_attention | mot | moma
+max_text_len = 64
 
 [video]
 data_root = "<path-to-corpus>"
@@ -68,6 +82,11 @@ min_frames = 4
 frame_size = 224
 max_samples = 0              # 0 = full manifest; set small for a smoke
 ```
+
+The residual stream's visual tokens (`max_frames` × tokens per frame; none for
+`cross_attention`) plus `vlm.max_text_len` must fit `model.max_seq_len`: the
+config check enforces this when `vision_encoder.num_tokens` is set, and the model
+build does when the encoder infers it.
 
 The dataset side is **pluggable**: `dataset_type` selects a builder from the
 `video_dataset` registry (`"webvid"` ships; other styles — HuggingFace video
