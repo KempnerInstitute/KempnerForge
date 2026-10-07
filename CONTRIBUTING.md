@@ -309,8 +309,8 @@ tests/
 
 ## Where to Contribute
 
-- **Examples (`examples/<name>/`) are the place for most new work:** an experiment's configs, its own `train.py`, data-preparation and conversion scripts, evaluation, and any custom components it registers through the config's `plugins` list. Keep each example self-contained, with its own README and tests, so it can be removed without touching core.
-- **Core (`kempnerforge/`) takes only general building blocks that any model can use:** an optimizer, a scheduler, a norm, router or MLP, a parallelism axis, or a general model option. A new building block enters through the registry or a general config field, and every code change in core, bug fixes included, comes with tests. Core never imports or names anything under `examples/`, and PRs that touch core get the `core` label.
+- **Examples (`examples/<name>/`) are the place for most new work:** an experiment's configs, its own `train.py`, data-preparation and conversion scripts, evaluation, and any custom components it registers through the config's `plugins` list. Keep each example self-contained, with its own README and tests.
+- **Core (`kempnerforge/`) takes only general building blocks that any model can use:** an optimizer, a scheduler, a norm, router or MLP, a parallelism axis, or a general model option. A new building block enters through the registry or a general config field, and every code change in core, bug fixes included, comes with tests. Core never imports or names anything under `examples/`. Anything that goes into core needs a PR labelled `core`, and it is merged only after the KempnerForge team approves it.
 - **When in doubt, start in an example.** Move something into core once a second, unrelated use needs it.
 
 ## Adding a New Feature
