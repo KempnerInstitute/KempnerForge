@@ -35,14 +35,14 @@ Python list — peak RAM stays flat regardless of dataset size.
 
 Examples:
     # 1. Smoke-test prep (small slice, single split):
-    uv run python examples/vlm/data/prep_vlm_coco.py \\
+    uv run python examples/vlm/scripts/prep_vlm_coco.py \\
         --caption-json /path/to/coco-captions/coco_karpathy_train.json \\
         --image-root /path/to/coco/images \\
         --out /tmp/vlm_coco_smoke \\
         --num-samples 500
 
     # 2. Full dataset, all 3 splits, ready for training + eval:
-    uv run python examples/vlm/data/prep_vlm_coco.py \\
+    uv run python examples/vlm/scripts/prep_vlm_coco.py \\
         --caption-json /path/to/coco-captions/coco_karpathy_train.json \\
         --image-root /path/to/coco/images \\
         --out /path/to/datasets/coco-karpathy \\
@@ -125,13 +125,13 @@ def main() -> None:
         epilog=(
             "Examples:\n"
             "  # Smoke prep (default 500 samples, single split):\n"
-            "  uv run python examples/vlm/data/prep_vlm_coco.py \\\n"
+            "  uv run python examples/vlm/scripts/prep_vlm_coco.py \\\n"
             "      --caption-json /path/to/coco-captions/coco_karpathy_train.json \\\n"
             "      --image-root /path/to/coco/images \\\n"
             "      --out /tmp/vlm_coco_smoke\n"
             "\n"
             "  # Full dataset, all 3 splits, for training + eval:\n"
-            "  uv run python examples/vlm/data/prep_vlm_coco.py \\\n"
+            "  uv run python examples/vlm/scripts/prep_vlm_coco.py \\\n"
             "      --caption-json /path/to/coco-captions/coco_karpathy_train.json \\\n"
             "      --image-root /path/to/coco/images \\\n"
             "      --out /path/to/datasets/coco-karpathy \\\n"

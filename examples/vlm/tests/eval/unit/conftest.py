@@ -1,6 +1,6 @@
 """Hermetic fake ``lmms_eval`` for the VLM-eval unit tests.
 
-``lmms-eval`` is an optional, undeclared dependency, so ``adapter.py`` cannot be imported
+``lmms-eval`` is an optional, undeclared dependency, so ``lmms_adapter.py`` cannot be imported
 without it and these tests would otherwise skip wherever it is absent. This conftest
 installs a faithful in-repo fake (``_fake_lmms_eval``) into ``sys.modules`` at import time
 so the tests always run and exercise our code. The fake is installed unconditionally
@@ -24,7 +24,7 @@ import pytest
 
 from . import _fake_lmms_eval
 
-_ADAPTER_MODULES = ("adapter",)
+_ADAPTER_MODULES = ("lmms_adapter",)
 _FAKE_MODULES = _fake_lmms_eval.build_modules()
 _MANAGED = (*_FAKE_MODULES.keys(), *_ADAPTER_MODULES)
 _SAVED = {name: sys.modules.get(name) for name in _MANAGED}
