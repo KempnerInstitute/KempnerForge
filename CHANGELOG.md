@@ -119,6 +119,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `CONTRIBUTING.md` gains a "Where to Contribute" section: most new work goes in a self-contained example under `examples/`, and only general building blocks go in core.
 - **MoE expert dispatch is ragged.** `grouped_expert_forward` and `grouped_expert_forward_packed` call `torch._grouped_mm` with per-expert offsets instead of padding every expert's token group to the busiest expert's count, so activation memory and compute follow the number of routed tokens rather than the routing imbalance. Outputs and gradients are bit-identical to the padded path; the sequential fp32 fallback is unchanged. `tokens_per_expert` is passed as a device tensor (no host sync), and the per-expert gradient-scaling loops in `MoEMLP._local_forward` and `ep_dispatch_and_compute` are vectorised (`scale_by_expert_load`).
   - Tests: `tests/unit/test_moe.py` (tensor counts, empty input, `TestScaleByExpertLoad`, bf16 grouped-path checks), `tests/unit/test_expert_parallel.py` (single-rank EP compute on CPU), `tests/integration/test_moe_grouped_gemm.py` (bit-identity with the padded dispatch, forward and gradients; layer, compile and memory checks on CUDA), `tests/distributed/test_ep.py::TestEPMatchesLocalDispatch`.
   - Docs: `docs/moe/capacity-and-dispatch.md`, `docs/distributed/expert-parallelism.md`.
