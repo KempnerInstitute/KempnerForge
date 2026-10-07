@@ -18,6 +18,18 @@ _WEBVID_CLIP = (
 _AV_AVAILABLE = importlib.util.find_spec("av") is not None
 
 
+def _encoder_available(name: str) -> bool:
+    """Whether the installed PyAV build bundles the encoder ``name``."""
+    if not _AV_AVAILABLE:
+        return False
+    import av
+
+    return name in av.codecs_available
+
+
+_H264_AVAILABLE = _encoder_available("libx264")
+
+
 # ---------------------------------------------------------------------------
 # sample_timestamps (pure policy, no decoder)
 # ---------------------------------------------------------------------------
@@ -155,6 +167,166 @@ class TestDecodeSynthetic:
         _write_mp4(path, n_frames=3, fps=10)  # shorter than min_frames request
         frames = decode_video_frames(str(path), fps=2.0, min_frames=4, max_frames=8)
         assert len(frames) >= 1
+
+
+def _index_frame(i: int, size: int = 64):
+    """An RGB frame encoding ``i`` in binary: 8-px stripe ``b`` is white when bit ``b`` is set."""
+    import numpy as np
+
+    arr = np.zeros((size, size, 3), dtype=np.uint8)
+    for b in range(8):
+        if (i >> b) & 1:
+            arr[:, 8 * b : 8 * b + 8] = 255
+    return arr
+
+
+def _frame_index(img) -> int:
+    """The index ``_index_frame`` encoded; stripe interiors survive lossy coding."""
+    import numpy as np
+
+    luma = np.asarray(img.convert("L"), dtype=np.float64)
+    return sum(1 << b for b in range(8) if luma[:, 8 * b + 2 : 8 * b + 6].mean() > 128)
+
+
+def _write_indexed_clip(
+    path,
+    n_frames: int,
+    fps: int = 10,
+    *,
+    codec: str = "mpeg4",
+    fmt: str | None = None,
+    codec_options: dict | None = None,
+    container_options: dict | None = None,
+) -> None:
+    """Encode ``n_frames`` frames, frame ``i`` showing ``_index_frame(i)``."""
+    import av
+
+    with av.open(str(path), mode="w", format=fmt, options=container_options or {}) as container:
+        stream = container.add_stream(codec, rate=fps)
+        stream.width = 64
+        stream.height = 64
+        stream.pix_fmt = "yuv420p"
+        if codec_options:
+            stream.codec_context.options = codec_options
+        for i in range(n_frames):
+            frame = av.VideoFrame.from_ndarray(_index_frame(i), format="rgb24")
+            for packet in stream.encode(frame):
+                container.mux(packet)
+        for packet in stream.encode():  # flush
+            container.mux(packet)
+
+
+def _write_shifted_mp4(src, dst, offset_s: float) -> None:
+    """Remux ``src`` with every packet timestamp shifted later by ``offset_s``."""
+    import av
+
+    with av.open(str(src)) as ic, av.open(str(dst), mode="w") as oc:
+        istream = ic.streams.video[0]
+        ostream = oc.add_stream_from_template(istream)
+        shift = round(offset_s / istream.time_base)
+        for packet in ic.demux(istream):
+            if packet.pts is None:
+                continue
+            packet.pts += shift
+            if packet.dts is not None:
+                packet.dts += shift
+            packet.stream = ostream
+            oc.mux(packet)
+
+
+def _first_frame_time(path) -> float | None:
+    """Presentation time of the first decoded frame (``None`` without a timestamp)."""
+    import av
+
+    with av.open(str(path)) as container:
+        return next(container.decode(container.streams.video[0])).time
+
+
+@pytest.mark.skipif(not _AV_AVAILABLE, reason="requires the 'av' package")
+class TestDecodeStartOffset:
+    """Frame times count from the first decoded frame, since sample targets start at 0 s."""
+
+    @pytest.mark.parametrize("offset_s", [0.0, 0.5, 5.0])
+    def test_start_offset_selects_same_frames(self, tmp_path, offset_s):
+        from kempnerforge.data.video_io import decode_video_frames
+
+        src = tmp_path / "src.mp4"
+        shifted = tmp_path / "shifted.mp4"
+        _write_indexed_clip(src, n_frames=20, fps=10)  # 2 s
+        _write_shifted_mp4(src, shifted, offset_s)
+        assert _first_frame_time(shifted) == pytest.approx(offset_s)
+        got = decode_video_frames(str(shifted), fps=2.0, min_frames=4, max_frames=4)
+        ref = decode_video_frames(str(src), fps=2.0, min_frames=4, max_frames=4)
+        # Targets [0, 2/3, 4/3, 2] s; the last sits past the final frame (1.9 s).
+        assert [_frame_index(f) for f in got] == [0, 7, 14, 19]
+        assert [f.tobytes() for f in got] == [f.tobytes() for f in ref]
+
+    def test_b_frame_delay_keeps_selection(self, tmp_path):
+        """MPEG-4 B-frames in AVI: the stream starts at 0 s but its first frame at 33 ms."""
+        import av
+
+        from kempnerforge.data.video_io import decode_video_frames
+
+        path = tmp_path / "bframes.avi"
+        _write_indexed_clip(path, n_frames=60, fps=30, fmt="avi", codec_options={"bf": "2"})
+        with av.open(str(path)) as container:
+            assert container.streams.video[0].start_time == 0
+        assert _first_frame_time(path) == pytest.approx(1 / 30)
+        frames = decode_video_frames(str(path), fps=2.0, min_frames=4, max_frames=4)
+        assert [_frame_index(f) for f in frames] == [0, 20, 40, 59]
+
+    @pytest.mark.skipif(not _H264_AVAILABLE, reason="requires the libx264 encoder")
+    def test_h264_b_frame_delay_keeps_selection(self, tmp_path):
+        """H.264 B-frames in MP4 without an edit list: the first frame is at 67 ms."""
+        from kempnerforge.data.video_io import decode_video_frames
+
+        path = tmp_path / "bframes.mp4"
+        _write_indexed_clip(
+            path,
+            n_frames=60,
+            fps=30,
+            codec="libx264",
+            codec_options={"x264-params": "bframes=2:b-adapt=0"},
+            container_options={"use_editlist": "0"},
+        )
+        assert _first_frame_time(path) == pytest.approx(2 / 30)
+        frames = decode_video_frames(str(path), fps=2.0, min_frames=4, max_frames=4)
+        assert [_frame_index(f) for f in frames] == [0, 20, 40, 59]
+
+    def test_zero_start_matches_absolute_times(self, tmp_path):
+        """With the first frame at 0 s, each target takes the first frame whose
+        absolute time is within 1 ms of or after it, as before."""
+        import av
+
+        from kempnerforge.data.video_io import _video_duration_seconds, decode_video_frames
+
+        path = tmp_path / "clip.mp4"
+        _write_indexed_clip(path, n_frames=45, fps=30, codec_options={"bf": "2"})
+        with av.open(str(path)) as container:
+            stream = container.streams.video[0]
+            targets = sample_timestamps(_video_duration_seconds(stream, container), 8.0, 12, 12)
+            decoded = [(f.time, f.to_image().tobytes()) for f in container.decode(stream)]
+        assert decoded[0][0] == 0.0
+        last = decoded[-1][1]
+        expected = [next((b for t, b in decoded if t + 1e-3 >= tgt), last) for tgt in targets]
+        frames = decode_video_frames(str(path), fps=8.0, min_frames=12, max_frames=12)
+        assert [f.tobytes() for f in frames] == expected
+
+    @pytest.mark.skipif(not _H264_AVAILABLE, reason="requires the libx264 encoder")
+    def test_frames_without_timestamps_count_as_zero(self, tmp_path, monkeypatch):
+        """A raw H.264 stream has no timestamps: the first frame takes the 0 s target and
+        later targets fall back to the last frame."""
+        from types import SimpleNamespace
+
+        import kempnerforge.data.video_io as video_io
+
+        path = tmp_path / "clip.h264"
+        _write_indexed_clip(path, n_frames=20, fps=10, codec="libx264", fmt="h264")
+        assert _first_frame_time(path) is None
+        fixed = SimpleNamespace(get_sampling_policy=lambda name: lambda *args: [0.0, 0.5, 1.0])
+        monkeypatch.setattr(video_io, "registry", fixed)
+        frames = video_io.decode_video_frames(str(path), fps=2.0, min_frames=1, max_frames=4)
+        assert [_frame_index(f) for f in frames] == [0, 19, 19]
 
 
 class TestSamplingPolicyRegistry:
