@@ -1,7 +1,7 @@
 # How-to Guides
 
 End-to-end researcher workflows. Each guide is a single coherent narrative
-with runnable code (or a link to a notebook, config, or script that runs it)
+with runnable code (or a link to a config or script that runs it)
 — the reason most researchers come to the docs in the first place.
 
 ## Core workflow
