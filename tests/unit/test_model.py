@@ -6,6 +6,7 @@ import math
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from kempnerforge.config.schema import ModelConfig
 from kempnerforge.model.attention import Attention
@@ -155,6 +156,12 @@ class TestAttention:
         attn = Attention(dim=128, n_heads=4, n_kv_heads=4)
         assert attn.q_norm is None
         assert attn.k_norm is None
+
+    def test_qk_norm_eps(self):
+        default = Attention(dim=128, n_heads=4, n_kv_heads=4, qk_norm=True)
+        custom = Attention(dim=128, n_heads=4, n_kv_heads=4, qk_norm=True, norm_eps=1e-6)
+        assert (default.q_norm.eps, default.k_norm.eps) == (1e-5, 1e-5)
+        assert (custom.q_norm.eps, custom.k_norm.eps) == (1e-6, 1e-6)
 
     def test_qk_norm_bounds_attention_logits(self):
         """QK-Norm should produce bounded Q/K regardless of input scale."""
@@ -376,6 +383,110 @@ class TestTransformer:
         assert m2.layers["0"].attention.q_norm is None
         # Same parameter count
         assert sum(p.numel() for p in m1.parameters()) == sum(p.numel() for p in m2.parameters())
+
+
+# ---------------------------------------------------------------------------
+# QK-norm epsilon on every model path
+# ---------------------------------------------------------------------------
+
+
+_QK_EPS = 1e-6
+_QK_N_IMAGE = 4
+_QK_ARCHS = ("text", "joint_decoder", "cross_attention", "mot", "moma", "pp_stage")
+
+
+def _qk_norm_model(arch: str) -> torch.nn.Module:
+    """Two-layer qk_norm model with a non-default ``norm_eps``.
+
+    The small ``init_std`` keeps the q/k projections near the eps scale, where
+    1e-6 and 1e-5 give clearly different norm outputs.
+    """
+    from kempnerforge.config.vlm import (
+        CrossAttentionConfig,
+        JointDecoderConfig,
+        MoMaConfig,
+        MoTConfig,
+    )
+    from kempnerforge.distributed.pipeline_parallel import PipelineStageModule
+
+    cfg = ModelConfig(
+        dim=64,
+        n_layers=2,
+        n_heads=4,
+        n_kv_heads=2,
+        vocab_size=128,
+        max_seq_len=32,
+        ffn_hidden_dim=128,
+        qk_norm=True,
+        norm_eps=_QK_EPS,
+        init_std=1e-3,
+    )
+    if arch == "pp_stage":
+        return PipelineStageModule(cfg, stage_id=0, num_stages=2, layer_range=(0, 2))
+    vlm_config = {
+        "text": None,
+        "joint_decoder": JointDecoderConfig(max_text_len=8),
+        "cross_attention": CrossAttentionConfig(cross_attention_every_n_layers=1, max_text_len=8),
+        "mot": MoTConfig(max_text_len=8),
+        "moma": MoMaConfig(
+            max_text_len=8,
+            moma_experts_per_modality={"image": 2, "text": 2},
+            moma_gumbel_noise=False,
+        ),
+    }[arch]
+    return Transformer(cfg, vlm_config=vlm_config, num_image_tokens=_QK_N_IMAGE)
+
+
+def _qk_norm_forward(model: torch.nn.Module, arch: str) -> None:
+    b, t = 2, 8
+    tokens = torch.randint(0, 128, (b, t), device=DEVICE)
+    if arch == "cross_attention":
+        features = torch.randn(b, _QK_N_IMAGE, 64, device=DEVICE)
+        model(tokens, modality=ModalityContext(image_features=features))
+    elif arch in ("mot", "moma"):
+        ids = torch.ones(b, _QK_N_IMAGE + t, dtype=torch.long, device=DEVICE)
+        ids[:, :_QK_N_IMAGE] = 0
+        prefix = torch.randn(b, _QK_N_IMAGE, 64, device=DEVICE)
+        ctx = ModalityContext(
+            prefix_embeds=prefix, output_slice=slice(_QK_N_IMAGE, None), modality_ids=ids
+        )
+        model(tokens, modality=ctx)
+    else:
+        model(tokens)
+
+
+def _qk_norms(model: torch.nn.Module) -> dict[str, RMSNorm]:
+    return {
+        name: module
+        for name, module in model.named_modules()
+        if isinstance(module, RMSNorm) and {"q_norm", "k_norm"} & set(name.split("."))
+    }
+
+
+class TestQKNormEps:
+    """Every q/k norm on every model path uses ``model.norm_eps``."""
+
+    @pytest.mark.parametrize("arch", _QK_ARCHS)
+    def test_every_qk_norm_uses_norm_eps(self, arch):
+        norms = _qk_norms(_qk_norm_model(arch))
+        # 2 layers x (q, k), per modality under MoT
+        assert len(norms) == (8 if arch == "mot" else 4)
+        assert {name: norm.eps for name, norm in norms.items()} == dict.fromkeys(norms, _QK_EPS)
+
+    @pytest.mark.parametrize("arch", _QK_ARCHS)
+    def test_qk_norm_output_matches_reference_rmsnorm(self, arch):
+        model = _qk_norm_model(arch).to(DEVICE).eval()
+        calls = []
+        for norm in _qk_norms(model).values():
+            norm.register_forward_hook(lambda m, args, out: calls.append((m.weight, args[0], out)))
+        with torch.no_grad():
+            _qk_norm_forward(model, arch)
+        assert len(calls) == (8 if arch == "mot" else 4)
+        for weight, x, out in calls:
+            ref = F.rms_norm(x, (x.shape[-1],), weight, eps=_QK_EPS)
+            old = F.rms_norm(x, (x.shape[-1],), weight, eps=1e-5)
+            assert (ref - old).abs().max() > 1e-2  # eps matters at this input scale
+            torch.testing.assert_close(out, ref)
 
 
 # ---------------------------------------------------------------------------

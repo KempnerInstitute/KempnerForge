@@ -114,13 +114,14 @@ qk_norm = true    # Gemma / DeepSeek-V3 style per-head RMSNorm on Q/K before RoP
 ```
 
 When set, `Attention.__init__` adds `self.q_norm` and `self.k_norm`
-(RMSNorm on `head_dim`) and applies them per-head before RoPE:
+(RMSNorm on `head_dim`, with `eps = model.norm_eps`) and applies them
+per-head before RoPE:
 
 ```python
 # kempnerforge/model/attention.py — Attention.__init__
 if qk_norm:
-    self.q_norm = RMSNorm(head_dim)
-    self.k_norm = RMSNorm(head_dim)
+    self.q_norm = RMSNorm(head_dim, eps=norm_eps)
+    self.k_norm = RMSNorm(head_dim, eps=norm_eps)
 ```
 
 Default is `false` (plain Llama / Mixtral). Flip it on for

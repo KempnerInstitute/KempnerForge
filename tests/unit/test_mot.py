@@ -111,6 +111,19 @@ class TestMoTAttentionStructural:
         attn = MoTAttention(dim=64, n_heads=4, n_kv_heads=4, modalities=("image", "text"))
         assert attn.q_norm is None and attn.k_norm is None
 
+    def test_qk_norm_uses_norm_eps(self):
+        attn = MoTAttention(
+            dim=64,
+            n_heads=4,
+            n_kv_heads=4,
+            modalities=("image", "text"),
+            qk_norm=True,
+            norm_eps=1e-6,
+        )
+        assert attn.q_norm is not None and attn.k_norm is not None
+        eps = {m: (attn.q_norm[m].eps, attn.k_norm[m].eps) for m in ("image", "text")}
+        assert eps == {"image": (1e-6, 1e-6), "text": (1e-6, 1e-6)}
+
     def test_invalid_modalities_raises(self):
         with pytest.raises(ValueError, match="at least one modality"):
             MoTAttention(dim=64, n_heads=4, n_kv_heads=4, modalities=())
