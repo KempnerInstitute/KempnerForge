@@ -108,7 +108,7 @@ calls `registry.register`, the entry never lands. Typical approach:
 *before* the TOML is applied to the dataclasses:
 
 ```toml
-plugins = ["examples.my_experiment.components"]
+plugins = ["my_project.components"]
 
 [video]
 dataset_type = "my_corpus"   # registered by the module above
@@ -117,15 +117,14 @@ dataset_type = "my_corpus"   # registered by the module above
 That ordering is the point: the `__post_init__` validators that resolve
 a name against the registry (`video.dataset_type`, `adapter.type`,
 `vision_encoder.type`, …) run during the overlay, so a later import
-would be too late. It keeps experiments standalone — an
-`examples/<name>/` run registers its own components without any core
-module importing it.
+would be too late. It keeps experiments standalone — a run registers
+its own components without any core module importing them.
 
 Modules have to be on `sys.path`. The launch directory is *not* — a
-module that sits next to the run needs `PYTHONPATH=<its dir>`. An
-in-repo `examples/<name>/` module resolves because a `uv sync` editable
-install puts the repo root on `sys.path`; anything outside the repo must
-be installed or on `PYTHONPATH`. A missing or failing module raises a
+module that sits next to the run needs `PYTHONPATH=<its dir>`. A module
+inside the repository resolves because a `uv sync` editable install puts
+the repo root on `sys.path`; anything outside the repo must be installed
+or on `PYTHONPATH`. A missing or failing module raises a
 `ValueError` naming it, and `--plugins=["pkg.mod"]` overrides the TOML
 list like any other field.
 

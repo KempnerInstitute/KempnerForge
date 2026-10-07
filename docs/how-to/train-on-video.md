@@ -45,8 +45,8 @@ build- and config-time checks enforce this and fail before any GPU work.
 ## Configure it
 
 A video run adds a `[video]` section (sibling of `[vision_encoder]` /
-`[adapter]` / `[vlm]`) and a token-reducing connector. See
-`examples/vlm/configs/vlm_video_webvid.toml` for a complete example; the key parts:
+`[adapter]` / `[vlm]`) and a token-reducing connector. The key parts of a
+video config:
 
 ```toml
 [adapter]
@@ -57,7 +57,7 @@ pool_window = 2           # 14×14 grid -> 7×7 = 49 tokens/frame
 arch = "joint_decoder"    # also: cross_attention | mot | moma
 
 [video]
-data_root = "path-to-webvid-10m"
+data_root = "<path-to-corpus>"
 dataset_type = "webvid"      # registry key; add styles via @registry.register_video_dataset
 dataset_name = "webvid-10M"  # corpus dir under raw/<dataset_name>/data (WebVid style)
 sampling_policy = "uniform"  # registry key; the frame-sampling policy
@@ -85,12 +85,16 @@ requires it.
 
 ## Launch
 
-```bash
-# 4-GPU video training (Joint-Decoder)
-uv run torchrun --nproc_per_node=4 examples/vlm/train.py examples/vlm/configs/vlm_video_webvid.toml
+A video config launches like any other config: an entry point loads it with
+`load_config` and calls `run_training`, which selects the VLM step from the
+config (`scripts/train.py` is one such entry point).
 
-# Quick smoke: no SigLIP download, a few clips, few steps
-uv run torchrun --nproc_per_node=2 examples/vlm/train.py examples/vlm/configs/vlm_video_webvid.toml \
+```bash
+# 4 GPUs
+uv run torchrun --nproc_per_node=4 <train-script> <video-config>.toml
+
+# Quick smoke: random encoder (no weight download), a few clips, few steps
+uv run torchrun --nproc_per_node=2 <train-script> <video-config>.toml \
     --vision_encoder.type=random --vision_encoder.num_tokens=196 \
     --vision_encoder.feature_dim=768 --video.max_samples=256 --train.max_steps=20
 ```

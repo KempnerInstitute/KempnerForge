@@ -102,8 +102,6 @@ auto-resume). Start with:
 ## What's next
 
 - {doc}`quickstart` covers multi-GPU, MoE, and hooks if you skipped them.
-- {doc}`notebooks` has interactive examples for model inspection,
-  activation extraction, and MoE routing diagnostics.
 - Production configs (7B, 13B, 70B) live in
   [`configs/train/`](https://github.com/KempnerInstitute/KempnerForge/tree/main/configs/train);
   scale them up with

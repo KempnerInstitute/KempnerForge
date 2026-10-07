@@ -35,9 +35,24 @@ uv run jupyter nbconvert --to notebook --execute examples/notebooks/01_inspect_m
 | 5 | [`05_optimizer_comparison.ipynb`](05_optimizer_comparison.ipynb) | Train the same model with AdamW / Muon / Lion / Schedule-Free AdamW, plot loss curves |
 | 6 | [`06_moe_routing.ipynb`](06_moe_routing.ipynb) | Build a MoE model, visualize per-layer expert utilization |
 
+## When to open which
+
+- **Debugging a config**: start with notebook 1 — it builds the model from
+  your config and prints every layer's shape.
+- **Interpretability setup**: notebooks 2 and 3 cover the attention-capture
+  and activation-extraction APIs you'll use in a larger probing pipeline.
+- **Checkpoint round-trips**: notebook 4 is the minimal reproduction of
+  "train → save → load → generate" that you can adapt for evaluating any
+  checkpoint.
+- **Optimizer ablations**: notebook 5 is the reference pattern for a
+  controlled comparison with per-optimizer LR sweeps.
+- **MoE diagnostics**: notebook 6 shows how to read `get_expert_counts()`
+  output and spot dead or hot experts.
+
 ## Requirements
 
 - 1 GPU (falls back to CPU where possible, but attention/training is slow)
 - Dev dependencies installed via `uv sync` from the repo root
 
-Notebook outputs are stripped on commit (via the `nbstripout` pre-commit hook) to keep diffs clean.
+Notebook outputs are stripped on commit (via the `nbstripout` pre-commit hook) to keep diffs clean,
+so you'll see empty outputs until you run them.

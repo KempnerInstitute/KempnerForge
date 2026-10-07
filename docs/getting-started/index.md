@@ -1,6 +1,6 @@
 # Getting Started
 
-Four pages that take you from a fresh clone to a running model. Read in order if
+Three pages that take you from a fresh clone to a running model. Read in order if
 you're new; skip around if you know what you're looking for.
 
 ```{toctree}
@@ -9,7 +9,6 @@ you're new; skip around if you know what you're looking for.
 install
 quickstart
 first-training-run
-notebooks
 ```
 
 ## What each page covers
@@ -25,14 +24,10 @@ then extend via hooks. Every step is a single command.
 actually does: what the log line means, what's in the checkpoint directory,
 how auto-resume finds the latest step, and what to change next.
 
-**{doc}`notebooks`** — summaries of the six interactive notebooks under
-`examples/notebooks/` and when to open each.
-
 ## Prerequisites before you start
 
 - A Linux host with Python 3.12+ and at least one NVIDIA GPU (H100/H200/A100).
-  CPU-only also works for the inspection notebooks; training steps will be
-  slow.
+  CPU-only also works for the unit tests; training steps will be slow.
 - [uv](https://docs.astral.sh/uv/) installed. All commands in these pages use
   `uv run`, which activates the project venv automatically — you do not need
   to `source .venv/bin/activate` yourself.
