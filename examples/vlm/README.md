@@ -27,6 +27,7 @@ starting points.
 | `vlm_7b_siglip2.toml` | joint_decoder | siglip2 | real-run starting point |
 | `vlm_7b_siglip2_cross_attn.toml` | cross_attention | siglip2 | real-run starting point |
 | `vlm_video_webvid.toml` | joint_decoder | siglip2 | video (WebVid-10M) |
+| `vlm_qwen3_0.6b_joint_decoder_webvid.toml` | joint_decoder | siglip2 | video, from a pretrained backbone |
 
 Paths in these configs are placeholders (`data_root = "path-to-webvid-10m"`) —
 point them at your own data and output directories, or override on the CLI.
@@ -50,6 +51,35 @@ Video needs PyAV: `uv sync --group video`.
 
 Tests: `uv run pytest examples/vlm/tests/ -v` (they are outside the core
 `testpaths`, so run them by path).
+
+## Video from a pretrained backbone
+
+`vlm_qwen3_0.6b_joint_decoder_webvid.toml` trains video captioning on a frozen
+pretrained 0.6B backbone, with a pretrained vision encoder and a fresh `avgpool`
+adapter that both train. The backbone's attention is wider than its model dim
+(`head_dim_override = 128`).
+
+Build its starting checkpoint once, with the converter described under
+*Start from a pretrained backbone*:
+
+```bash
+uv run python examples/vlm/scripts/convert_hf_backbone.py \
+    --hf-dir Qwen/Qwen3-0.6B \
+    --config examples/vlm/configs/vlm_qwen3_0.6b_joint_decoder_webvid.toml \
+    --out path-to-init-checkpoint
+```
+
+Then set `[video].data_root`, `[checkpoint].load_path` and `[checkpoint].dir`,
+and train:
+
+```bash
+uv run torchrun --nproc_per_node=4 examples/vlm/train.py \
+    examples/vlm/configs/vlm_qwen3_0.6b_joint_decoder_webvid.toml
+```
+
+The first run loads the converted weights only (`exclude_from_loading =
+["optimizer"]`); a resume from `[checkpoint].dir` restores the full training
+state. For a short shakedown, add `--train.max_steps=20 --video.max_samples=512`.
 
 ## Data prep
 
