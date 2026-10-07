@@ -162,6 +162,93 @@ class TestPipelineParallelEquivalence:
             # which is a different tensor entirely.
             assert not torch.allclose(packed, unpacked, rtol=1e-3, atol=1e-3)
 
+    @pytest.mark.parametrize("attention_backend", ["sdpa", "flex"])
+    def test_packed_pipeline_gradients_match_single_gpu(self, attention_backend):
+        """Backward parity, not merely backward liveness.
+
+        ``test_packed_pipeline_training_step`` asserts that gradients exist and
+        are finite, which a backward applying the *wrong* mask would also
+        satisfy. This pins the values: the mask has to be right in backward as
+        well as forward.
+
+        The reference is a single full-batch backward. That is what the pipeline
+        reproduces: the schedule divides accumulated gradients by
+        ``n_microbatches`` (``scale_grads`` defaults to True, which torch
+        documents as the setting to use with a mean-reduction loss), so the
+        result is the *average* over micro-batches, not the sum. For equal
+        micro-batches that equals the gradient of the full-batch mean loss.
+
+        An earlier version of this test summed per-micro-batch losses instead,
+        and failed by exactly a factor of ``n_microbatches``.
+        """
+        import torch.nn.functional as F
+
+        from kempnerforge.config.schema import DistributedConfig
+        from kempnerforge.distributed.pipeline_parallel import (
+            build_pipeline_schedule,
+            build_pipeline_stage,
+        )
+        from kempnerforge.distributed.setup import init_distributed
+
+        def loss_fn(out: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+            return F.cross_entropy(out.flatten(0, 1).float(), target.flatten())
+
+        rank = int(os.environ["RANK"])
+        world = int(os.environ["WORLD_SIZE"])
+        device = torch.device(f"cuda:{rank}")
+        torch.cuda.set_device(device)
+        mesh = init_distributed(DistributedConfig(dp_shard=1, tp=1, pp=world), seed=42)
+
+        stage_module, reference = self._stage_and_reference(
+            device, attention_backend=attention_backend
+        )
+        stage = build_pipeline_stage(
+            stage_module,
+            mesh,
+            device,
+            batch_size=BATCH // N_MICROBATCHES,
+            seq_len=SEQ,
+            param_dtype=torch.float32,
+        )
+        schedule = build_pipeline_schedule(
+            stage,
+            n_microbatches=N_MICROBATCHES,
+            loss_fn=loss_fn,
+            schedule="1f1b",
+        )
+
+        gen = torch.Generator().manual_seed(7)
+        tokens = torch.randint(0, CONFIG.vocab_size, (BATCH, SEQ), generator=gen).to(device)
+        labels = torch.randint(0, CONFIG.vocab_size, (BATCH, SEQ), generator=gen).to(device)
+        doc_ids = _doc_ids(BATCH, SEQ, device)
+
+        stage_module.zero_grad(set_to_none=True)
+        losses: list[torch.Tensor] = []
+        if rank == 0:
+            schedule.step(tokens, doc_ids=doc_ids, target=labels, losses=losses)
+        elif rank == world - 1:
+            schedule.step(doc_ids=doc_ids, target=labels, losses=losses)
+        else:
+            schedule.step(doc_ids=doc_ids)
+
+        reference.zero_grad(set_to_none=True)
+        loss_fn(reference(tokens, doc_ids=doc_ids), labels).backward()
+
+        compared, largest = 0, 0.0
+        for name, param in stage_module.named_parameters():
+            ref_grad = reference.get_parameter(name).grad
+            assert param.grad is not None, f"rank {rank}: {name} has no gradient"
+            assert ref_grad is not None, f"rank {rank}: reference {name} has no gradient"
+            torch.testing.assert_close(
+                param.grad, ref_grad, rtol=2e-4, atol=2e-5, msg=lambda m, n=name: f"{n}: {m}"
+            )
+            largest = max(largest, ref_grad.abs().max().item())
+            compared += 1
+
+        assert compared, f"rank {rank}: compared no parameters"
+        # All-zero gradients would satisfy assert_close on both sides.
+        assert largest > 1e-6, f"rank {rank}: reference gradients are ~zero ({largest:.2e})"
+
     @pytest.mark.parametrize("schedule_name", ["1f1b", "gpipe"])
     @pytest.mark.parametrize("attention_backend", ["sdpa", "flex"])
     def test_packed_pipeline_training_step(self, schedule_name, attention_backend):
