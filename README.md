@@ -195,7 +195,7 @@ v0.1 ships these skills: `install-and-verify`, `cluster-config`, `smoke-test`, `
 
 The [documentation site](docs/index.md) is the canonical reference. Key entry points:
 
-- [Getting started](docs/getting-started/index.md): install, first run, notebooks
+- [Getting started](docs/getting-started/index.md): install, first run
 - [Architecture](docs/architecture/index.md): model forward pass, parallelism order, data flow
 - [How-to guides](docs/how-to/index.md): end-to-end workflows, scaling, debugging, FP8, MoE experiments, interpretability
 - [Configuration](docs/configuration/index.md): config sections, CLI overrides, validation rules, registry
