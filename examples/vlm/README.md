@@ -56,6 +56,35 @@ Tests: `uv run pytest examples/vlm/tests/ -v` (they are outside the core
 `data/prep_vlm_coco.py` writes a COCO-Karpathy `save_to_disk` directory for
 `data.hf_dataset_name` to point at.
 
+## Start from a pretrained backbone
+
+`scripts/convert_hf_backbone.py` writes a complete VLM checkpoint for a config:
+the transformer from a pretrained Hugging Face decoder (a local directory or a
+Hub id holding `config.json` and `*.safetensors`), the vision encoder from
+`[vision_encoder]`, and a freshly initialised adapter.
+
+```bash
+uv run python examples/vlm/scripts/convert_hf_backbone.py \
+    --hf-dir <model-dir-or-hub-id> \
+    --config examples/vlm/configs/<config>.toml \
+    --out path-to-init-checkpoint
+```
+
+Warm-start from it, weights only:
+
+```toml
+[checkpoint]
+load_path = "path-to-init-checkpoint"
+exclude_from_loading = ["optimizer"]
+```
+
+The script writes nothing when the config disagrees with the source's
+`config.json` (shapes, RoPE base, norm eps, embedding tying, activation), when a
+weight has no counterpart or the wrong shape, or when `--out` is non-empty or
+inside the source. The source's `model_type` must be one the script supports
+(`SUPPORTED_MODEL_TYPES`). `--seed` (default `[train].seed`) seeds every freshly
+initialised weight, so a rerun writes an identical checkpoint.
+
 ## Evaluation
 
 Benchmark evaluation of the resulting checkpoints lives in `eval/`.
