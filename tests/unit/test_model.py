@@ -386,19 +386,29 @@ class TestTransformer:
 
 
 # ---------------------------------------------------------------------------
-# QK-norm epsilon on every model path
+# norm_eps on every norm of every model path
 # ---------------------------------------------------------------------------
 
 
-_QK_EPS = 1e-6
-_QK_N_IMAGE = 4
-_QK_ARCHS = ("text", "joint_decoder", "cross_attention", "mot", "moma", "pp_stage")
+_EPS = 1e-6
+_N_IMAGE = 4
+# Norms in each two-layer model: per layer the attention/MLP pre-norms and the q/k norms,
+# plus the final norm; two more per cross-attention block; MoT keeps a copy per modality
+# and adds per-modality final norms; the first pipeline stage has no final norm.
+_NORM_COUNTS = {
+    "text": 9,
+    "joint_decoder": 9,
+    "cross_attention": 13,
+    "mot": 19,
+    "moma": 9,
+    "pp_stage": 8,
+}
 
 
-def _qk_norm_model(arch: str) -> torch.nn.Module:
+def _norm_eps_model(arch: str) -> torch.nn.Module:
     """Two-layer qk_norm model with a non-default ``norm_eps``.
 
-    The small ``init_std`` keeps the q/k projections near the eps scale, where
+    The small ``init_std`` keeps every norm's input near the eps scale, where
     1e-6 and 1e-5 give clearly different norm outputs.
     """
     from kempnerforge.config.vlm import (
@@ -418,7 +428,7 @@ def _qk_norm_model(arch: str) -> torch.nn.Module:
         max_seq_len=32,
         ffn_hidden_dim=128,
         qk_norm=True,
-        norm_eps=_QK_EPS,
+        norm_eps=_EPS,
         init_std=1e-3,
     )
     if arch == "pp_stage":
@@ -434,56 +444,55 @@ def _qk_norm_model(arch: str) -> torch.nn.Module:
             moma_gumbel_noise=False,
         ),
     }[arch]
-    return Transformer(cfg, vlm_config=vlm_config, num_image_tokens=_QK_N_IMAGE)
+    return Transformer(cfg, vlm_config=vlm_config, num_image_tokens=_N_IMAGE)
 
 
-def _qk_norm_forward(model: torch.nn.Module, arch: str) -> None:
+def _norm_eps_forward(model: torch.nn.Module, arch: str) -> None:
     b, t = 2, 8
     tokens = torch.randint(0, 128, (b, t), device=DEVICE)
+    image = torch.randn(b, _N_IMAGE, 64, device=DEVICE) * 1e-3
     if arch == "cross_attention":
-        features = torch.randn(b, _QK_N_IMAGE, 64, device=DEVICE)
-        model(tokens, modality=ModalityContext(image_features=features))
+        model(tokens, modality=ModalityContext(image_features=image))
     elif arch in ("mot", "moma"):
-        ids = torch.ones(b, _QK_N_IMAGE + t, dtype=torch.long, device=DEVICE)
-        ids[:, :_QK_N_IMAGE] = 0
-        prefix = torch.randn(b, _QK_N_IMAGE, 64, device=DEVICE)
+        ids = torch.ones(b, _N_IMAGE + t, dtype=torch.long, device=DEVICE)
+        ids[:, :_N_IMAGE] = 0
         ctx = ModalityContext(
-            prefix_embeds=prefix, output_slice=slice(_QK_N_IMAGE, None), modality_ids=ids
+            prefix_embeds=image, output_slice=slice(_N_IMAGE, None), modality_ids=ids
         )
         model(tokens, modality=ctx)
     else:
         model(tokens)
 
 
-def _qk_norms(model: torch.nn.Module) -> dict[str, RMSNorm]:
+def _norms(model: torch.nn.Module) -> dict[str, torch.nn.Module]:
     return {
         name: module
         for name, module in model.named_modules()
-        if isinstance(module, RMSNorm) and {"q_norm", "k_norm"} & set(name.split("."))
+        if isinstance(module, (RMSNorm, torch.nn.LayerNorm))
     }
 
 
-class TestQKNormEps:
-    """Every q/k norm on every model path uses ``model.norm_eps``."""
+class TestNormEps:
+    """Every norm on every model path uses ``model.norm_eps``."""
 
-    @pytest.mark.parametrize("arch", _QK_ARCHS)
-    def test_every_qk_norm_uses_norm_eps(self, arch):
-        norms = _qk_norms(_qk_norm_model(arch))
-        # 2 layers x (q, k), per modality under MoT
-        assert len(norms) == (8 if arch == "mot" else 4)
-        assert {name: norm.eps for name, norm in norms.items()} == dict.fromkeys(norms, _QK_EPS)
+    @pytest.mark.parametrize("arch", list(_NORM_COUNTS))
+    def test_every_norm_uses_norm_eps(self, arch):
+        norms = _norms(_norm_eps_model(arch))
+        assert len(norms) == _NORM_COUNTS[arch]
+        assert {name: norm.eps for name, norm in norms.items()} == dict.fromkeys(norms, _EPS)
 
-    @pytest.mark.parametrize("arch", _QK_ARCHS)
-    def test_qk_norm_output_matches_reference_rmsnorm(self, arch):
-        model = _qk_norm_model(arch).to(DEVICE).eval()
+    @pytest.mark.parametrize("arch", list(_NORM_COUNTS))
+    def test_norm_output_matches_reference_rmsnorm(self, arch):
+        model = _norm_eps_model(arch).to(DEVICE).eval()
         calls = []
-        for norm in _qk_norms(model).values():
+        for norm in _norms(model).values():
             norm.register_forward_hook(lambda m, args, out: calls.append((m.weight, args[0], out)))
         with torch.no_grad():
-            _qk_norm_forward(model, arch)
-        assert len(calls) == (8 if arch == "mot" else 4)
+            _norm_eps_forward(model, arch)
+        # MoT's shared final norm is unused; its per-modality final norms run instead
+        assert len(calls) == _NORM_COUNTS[arch] - (1 if arch == "mot" else 0)
         for weight, x, out in calls:
-            ref = F.rms_norm(x, (x.shape[-1],), weight, eps=_QK_EPS)
+            ref = F.rms_norm(x, (x.shape[-1],), weight, eps=_EPS)
             old = F.rms_norm(x, (x.shape[-1],), weight, eps=1e-5)
             assert (ref - old).abs().max() > 1e-2  # eps matters at this input scale
             torch.testing.assert_close(out, ref)

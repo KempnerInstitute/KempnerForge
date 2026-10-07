@@ -136,8 +136,9 @@ norm_eps  = 1e-5
 ```
 
 Used by both the attention pre-norm and the MLP pre-norm on every
-block, plus the final norm before the output head. Same two keys
-(`rmsnorm`, `layernorm`) — flip via config, no code change.
+block (cross-attention blocks included), plus the final norm before the
+output head; `norm_eps` also sets the q/k norms, which are always RMSNorm.
+Same two keys (`rmsnorm`, `layernorm`) — flip via config, no code change.
 
 ## Register a new MLP variant
 

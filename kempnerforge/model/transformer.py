@@ -204,6 +204,7 @@ class Transformer(nn.Module):
                     ffn_hidden_dim=config.computed_ffn_hidden_dim,
                     norm_type=config.norm_type,
                     activation=config.activation,
+                    norm_eps=config.norm_eps,
                 )
 
         # Final normalization. Used by the non-MoT path. MoT uses
