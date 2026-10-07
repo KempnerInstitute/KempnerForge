@@ -270,6 +270,20 @@ class TestConfigRefusals:
             ({"norm_type": "layernorm"}, ["model.norm_type='layernorm'"]),
             ({"num_experts": 2}, ["model.num_experts > 0"]),
         ],
+        ids=[
+            "rope_theta",
+            "norm_eps",
+            "n_layers",
+            "n_kv_heads",
+            "ffn_hidden_dim",
+            "vocab_size",
+            "dim",
+            "activation",
+            "tie_embeddings",
+            "qk_norm",
+            "norm_type",
+            "num_experts",
+        ],
     )
     def test_target_disagrees_with_the_source(
         self, tied: Path, tmp_path: Path, override: dict[str, Any], problems: list[str]
@@ -372,6 +386,7 @@ class TestWeightRefusals:
     @pytest.mark.parametrize(
         ("name", "match"),
         [("config.json", "no config.json"), ("model.safetensors", r"no \*.safetensors")],
+        ids=["config", "weights"],
     )
     def test_missing_source_file(
         self, tied_copy: Path, tmp_path: Path, name: str, match: str
