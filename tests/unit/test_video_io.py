@@ -461,6 +461,21 @@ def _run_direct(path, fn, targets):
         return fn(container, stream, list(targets)), container
 
 
+def _mark_every_packet_key(src, dst) -> None:
+    """Remux ``src`` with every packet flagged as a keyframe, as an index without a sync table."""
+    import av
+
+    with av.open(str(src)) as ic, av.open(str(dst), mode="w") as oc:
+        istream = ic.streams.video[0]
+        ostream = oc.add_stream_from_template(istream)
+        for packet in ic.demux(istream):
+            if packet.pts is None:
+                continue
+            packet.is_keyframe = True
+            packet.stream = ostream
+            oc.mux(packet)
+
+
 def _damage_packet(src, dst, at_s: float) -> None:
     """Copy ``src`` to ``dst`` with the packet presented at ``at_s`` overwritten by 0xFF."""
     import shutil
@@ -709,6 +724,25 @@ class TestSeekCodecShapes:
         assert reasons == ["_SeekUnreliableError"]
         assert [f.tobytes() for f in got] == [f.tobytes() for f in expected]
 
+    def test_index_listing_every_frame_as_a_seek_point(self, tmp_path, monkeypatch):
+        """A seek then lands on a P-frame, which decodes without its reference frame."""
+        import kempnerforge.data.video_io as video_io
+
+        src = tmp_path / "src.mp4"
+        dst = tmp_path / "every_frame_key.mp4"
+        options = {"g": "30", "sc_threshold": "1000000000"}
+        _write_indexed_clip(src, n_frames=300, codec_options=options)  # 30 s
+        _mark_every_packet_key(src, dst)
+        with pytest.raises(video_io._SeekUnreliableError):
+            _run_direct(dst, video_io._decode_seek, [0.0, 10.0])
+        expected = _serial_reference(dst, 2.0, 1, 4)
+        reasons = []
+        monkeypatch.setattr(video_io, "_log_fallback_once", reasons.append)
+        got = video_io.decode_video_frames(str(dst), fps=2.0, min_frames=1, max_frames=4)
+        assert reasons == ["_SeekUnreliableError"]
+        assert [_frame_index(f) for f in got] == [0, 100, 200, 299 % 256]
+        assert [f.tobytes() for f in got] == [f.tobytes() for f in expected]
+
     @pytest.mark.skipif(not _H264_AVAILABLE, reason="requires the libx264 encoder")
     def test_raw_h264_falls_back(self, tmp_path, monkeypatch):
         """A raw H.264 stream has no timestamps to seek by."""
@@ -853,16 +887,26 @@ class _FakeContainer:
     """A 10 fps stream with a keyframe every ``gop`` frames.
 
     ``seek`` moves to the last keyframe at or before the requested time, then
-    ``land_late`` keyframes further; ``empty_after_seek`` leaves nothing to
-    decode after a seek.
+    ``land_late`` keyframes further; ``land_on_any_frame`` moves to the frame at
+    that time instead, and ``empty_after_seek`` leaves nothing to decode.
     """
 
-    def __init__(self, n_frames, gop, *, land_late=0, empty_after_seek=False, timed=True):
+    def __init__(
+        self,
+        n_frames,
+        gop,
+        *,
+        land_late=0,
+        land_on_any_frame=False,
+        empty_after_seek=False,
+        timed=True,
+    ):
         self.frames = [
             _FakeFrame(i, i / 10 if timed else None, i % gop == 0) for i in range(n_frames)
         ]
         self.gop = gop
         self.land_late = land_late
+        self.land_on_any_frame = land_on_any_frame
         self.empty_after_seek = empty_after_seek
         self.pos = 0
         self.seeks: list[float] = []
@@ -871,7 +915,8 @@ class _FakeContainer:
     def seek(self, offset, *, stream, backward, any_frame):
         t = float(offset * stream.time_base)
         self.seeks.append(t)
-        key = int(t * 10 + 1e-6) // self.gop * self.gop
+        index = int(t * 10 + 1e-6)
+        key = index if self.land_on_any_frame else index // self.gop * self.gop
         self.pos = len(self.frames) if self.empty_after_seek else key + self.land_late * self.gop
 
     def decode(self, stream):
@@ -906,6 +951,13 @@ class TestSeekCursor:
         container = _FakeContainer(100, gop=10, land_late=1)
         with pytest.raises(_SeekUnreliableError, match="seek to 5.000s landed at 6.000s"):
             _decode_seek(container, self._STREAM, [0.0, 5.0])
+
+    def test_seek_landing_on_a_non_keyframe_raises(self):
+        from kempnerforge.data.video_io import _decode_seek, _SeekUnreliableError
+
+        container = _FakeContainer(100, gop=10, land_on_any_frame=True)
+        with pytest.raises(_SeekUnreliableError, match="seek to 5.500s landed on a non-keyframe"):
+            _decode_seek(container, self._STREAM, [0.0, 5.5])
 
     def test_nothing_decodable_after_a_seek_raises(self):
         from kempnerforge.data.video_io import _decode_seek, _SeekUnreliableError

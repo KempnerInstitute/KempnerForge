@@ -178,7 +178,9 @@ def _decode_seek(container: Any, stream: Any, targets: list[float]) -> list[PILI
 
     Raises ``_SeekUnreliableError`` whenever identical selection cannot be
     guaranteed: no ``time_base``, a frame without a timestamp, a seek that
-    lands past its target (frames may have been skipped), or a seek after
+    lands past its target (frames may have been skipped) or on a frame that is
+    not a keyframe (the container's index named a seek point the stream does
+    not have, so frames decode without their references), or a seek after
     which nothing decodes.
     """
     tb = stream.time_base
@@ -205,6 +207,8 @@ def _decode_seek(container: Any, stream: Any, targets: list[float]) -> list[PILI
                     start = ft
                 elif ft - start > tgt + _MATCH_EPS_S:
                     raise _SeekUnreliableError(f"seek to {tgt:.3f}s landed at {ft - start:.3f}s")
+                elif not frame.key_frame:
+                    raise _SeekUnreliableError(f"seek to {tgt:.3f}s landed on a non-keyframe")
             t = ft - start
             if t + _MATCH_EPS_S >= tgt:
                 img = frame.to_image()
