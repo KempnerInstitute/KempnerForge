@@ -29,6 +29,9 @@ class AdapterConfig:
             ``out_dim``"; ignored by the other types.
         activation: Activation between the two MLP projections. One of
             ``"gelu"`` (default), ``"silu"``, ``"relu"``. ``mlp_2layer`` only.
+        pre_norm: Norm-registry key (``"rmsnorm"`` / ``"layernorm"``) for a norm
+            over the vision features ahead of ``mlp_2layer``'s first projection
+            (exposed as ``ln_q``); ``""`` (default) builds none. ``mlp_2layer`` only.
         pool_window: Pooling kernel side for the pooling adapters (e.g. ``2``
             for image 2×2, ``3`` for video 3×3); ignored by projection adapters.
         pool_heads: Number of attention heads for ``attentional_pool``; must
@@ -38,6 +41,7 @@ class AdapterConfig:
     type: str = "mlp_2layer"
     hidden_dim: int = 0
     activation: str = "gelu"
+    pre_norm: str = ""
     pool_window: int = 2
     pool_heads: int = 16
 
@@ -60,6 +64,15 @@ class AdapterConfig:
             raise ValueError(
                 f"Unknown adapter.activation: {self.activation!r}. Options: 'gelu', 'silu', 'relu'."
             )
+        if self.pre_norm:
+            import kempnerforge.model.norm  # noqa: F401, PLC0415
+
+            norms = tuple(registry.list("norm"))
+            if self.pre_norm not in norms:
+                raise ValueError(
+                    f"Unknown adapter.pre_norm: {self.pre_norm!r}. Registered norms: "
+                    f"{sorted(norms)}; '' builds none."
+                )
         if self.pool_window <= 0:
             raise ValueError(f"adapter.pool_window must be positive (got {self.pool_window})")
         if self.pool_heads <= 0:
@@ -75,6 +88,7 @@ class AdapterConfig:
         return {
             "hidden_dim": self.hidden_dim or None,
             "activation": self.activation,
+            "pre_norm": self.pre_norm or None,
             "pool_window": self.pool_window,
             "pool_heads": self.pool_heads,
         }

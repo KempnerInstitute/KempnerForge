@@ -8,9 +8,13 @@ from __future__ import annotations
 
 import pytest
 import torch
+import torch.distributed.checkpoint as dcp
+from torch.distributed.checkpoint.api import CheckpointException
+from torch.distributed.checkpoint.state_dict import get_model_state_dict, set_model_state_dict
 
 from kempnerforge.config.adapter import AdapterConfig
 from kempnerforge.config.model import ModelConfig
+from kempnerforge.config.registry import registry
 from kempnerforge.config.vision import VisionEncoderConfig
 from kempnerforge.config.vlm import (
     CrossAttentionConfig,
@@ -726,3 +730,84 @@ class TestFramePaddingMask:
         with torch.no_grad():
             logits, _ = w(pix, ids, frame_mask=fm)
         assert torch.isfinite(logits).all(), f"{arch}: NaN/inf with an all-padded clip"
+
+
+# ---------------------------------------------------------------------------
+# adapter.pre_norm through build_vlm_wrapper
+# ---------------------------------------------------------------------------
+
+_REGISTERED_NORMS = sorted(registry.list("norm"))
+
+
+def _pre_norm_wrapper(pre_norm: str = "") -> VLMWrapper:
+    mc, vc, _, lc = _tiny_configs()
+    return build_vlm_wrapper(mc, vc, AdapterConfig(pre_norm=pre_norm), lc)
+
+
+class TestVLMAdapterPreNorm:
+    def test_off_adds_no_adapter_state(self):
+        assert [k for k in _pre_norm_wrapper("").state_dict() if k.startswith("adapter.")] == [
+            "adapter.proj1.weight",
+            "adapter.proj1.bias",
+            "adapter.proj2.weight",
+            "adapter.proj2.bias",
+        ]
+
+    @pytest.mark.parametrize("norm", _REGISTERED_NORMS)
+    def test_on_adds_only_the_norm_keys(self, norm):
+        """Everything else -- the transformer built after the adapter
+        included -- keeps the same init, so the norm costs no RNG."""
+        torch.manual_seed(0)
+        off = _pre_norm_wrapper("").state_dict()
+        torch.manual_seed(0)
+        w = _pre_norm_wrapper(norm)
+        on = w.state_dict()
+        assert [k for k in on if k not in off] == [
+            f"adapter.ln_q.{k}" for k in w.adapter.ln_q.state_dict()
+        ]
+        assert [k for k in off if k not in on] == []
+        assert all(torch.equal(on[k], off[k]) for k in off)
+
+    def test_trains_end_to_end(self):
+        torch.manual_seed(0)
+        w = _pre_norm_wrapper("rmsnorm").to(DEVICE)
+        pix = torch.randn(2, 3, 16, 16, device=DEVICE)
+        ids = torch.randint(0, 256, (2, 16), device=DEVICE)
+        logits, labels = w(pix, ids, ids.clone())
+        assert logits.shape == (2, 16, 256)
+        assert labels.shape == (2, 16)
+        logits.float().logsumexp(-1).mean().backward()
+        grad = w.adapter.ln_q.weight.grad
+        assert grad is not None and torch.isfinite(grad).all() and (grad != 0).any()
+
+
+class TestVLMAdapterPreNormCheckpoint:
+    """The same ``get_model_state_dict`` template and ``dcp.load`` call that
+    ``CheckpointManager.load`` makes, in a single process."""
+
+    @staticmethod
+    def _save(wrapper: VLMWrapper, path) -> None:
+        dcp.save({"model": get_model_state_dict(wrapper)}, checkpoint_id=str(path))
+
+    def test_round_trip_restores_the_norm(self, tmp_path):
+        torch.manual_seed(0)
+        source = _pre_norm_wrapper("layernorm")
+        with torch.no_grad():
+            source.adapter.ln_q.weight.mul_(3.0)
+            source.adapter.ln_q.bias.add_(0.25)
+        self._save(source, tmp_path)
+        torch.manual_seed(1)
+        target = _pre_norm_wrapper("layernorm")
+        template = {"model": get_model_state_dict(target)}
+        dcp.load(template, checkpoint_id=str(tmp_path))
+        set_model_state_dict(target, template["model"])
+        for k, v in source.state_dict().items():
+            assert torch.equal(target.state_dict()[k], v), k
+
+    def test_checkpoint_without_the_norm_refuses_a_model_with_it(self, tmp_path):
+        """DCP rejects a template key the checkpoint lacks, so a checkpoint
+        saved with pre_norm off cannot be loaded into a pre_norm model."""
+        self._save(_pre_norm_wrapper(""), tmp_path)
+        target = _pre_norm_wrapper("rmsnorm")
+        with pytest.raises(CheckpointException, match=r"adapter\.ln_q\.weight"):
+            dcp.load({"model": get_model_state_dict(target)}, checkpoint_id=str(tmp_path))
