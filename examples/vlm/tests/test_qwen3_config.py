@@ -106,6 +106,10 @@ def test_paths_are_placeholders_and_wandb_is_off(config: JobConfig) -> None:
     assert "wandb_project" not in raw["metrics"] and "wandb_run_name" not in raw["metrics"]
 
 
-def test_validates_for_the_target_world_size(config: JobConfig) -> None:
-    config.validate(world_size=16)
-    assert config.train.batch_size * 16 == 256
+@pytest.mark.parametrize(
+    ("world_size", "cli_args"), [(16, []), (4, ["--train.grad_accum_steps=4"])]
+)
+def test_validates_at_a_global_batch_of_256(world_size: int, cli_args: list[str]) -> None:
+    config = load_config(str(CONFIG), cli_args=cli_args)
+    config.validate(world_size=world_size)
+    assert config.train.batch_size * config.train.grad_accum_steps * world_size == 256
