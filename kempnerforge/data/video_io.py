@@ -22,19 +22,24 @@ image preprocessing (``pil_to_tensor``) used on the single-image path.
 
 from __future__ import annotations
 
+import itertools
+import statistics
+from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
 from kempnerforge.config.registry import registry
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
+    from fractions import Fraction
+
     from PIL.Image import Image as PILImage
 
 # AV_TIME_BASE: container.duration is expressed in microseconds.
 _AV_TIME_BASE = 1_000_000.0
 
-# Formats whose container duration is an end time on the stream clock, not a span:
-# Matroska/WebM give the segment's end, NUT its last timestamp.
-_END_TIME_DURATION_FORMATS = frozenset({"matroska", "webm", "nut"})
+# A seek target this far (about 68 years) past a stream's start lies beyond its end, yet
+# stays within int64 when a demuxer rescales it to nanoseconds.
+_PAST_END_S = 1 << 31
 
 
 @registry.register_sampling_policy("uniform")
@@ -68,24 +73,92 @@ def sample_timestamps(
 
 
 def _video_duration_seconds(stream: Any, container: Any) -> float:
-    """Best-effort clip duration in seconds from PyAV stream/container metadata.
-
-    The span is measured from the stream's start, the origin of frame times: where
-    the container duration is an end time (``_END_TIME_DURATION_FORMATS``), the
-    stream's start time is subtracted. NUT's end is its last frame's time, so its
-    span is one frame short.
-    """
+    """Best-effort clip duration in seconds from PyAV stream/container metadata."""
     if stream.duration is not None and stream.time_base is not None:
         return float(stream.duration * stream.time_base)
     if container.duration is not None:
-        duration = float(container.duration) / _AV_TIME_BASE
-        end_time = not _END_TIME_DURATION_FORMATS.isdisjoint(container.format.name.split(","))
-        if end_time and stream.start_time is not None and stream.time_base is not None:
-            duration -= float(stream.start_time * stream.time_base)
-        return duration
+        return float(container.duration) / _AV_TIME_BASE
     if stream.frames and stream.average_rate:
         return float(stream.frames) / float(stream.average_rate)
     return 0.0
+
+
+def _presented(packets: Iterable[Any]) -> list[tuple[int, int]]:
+    """``(pts, duration)`` of the presented packets, an unknown duration as 0.
+
+    A packet is presented when it has a presentation timestamp and is not flagged
+    discard (decoded only as a reference, e.g. ahead of an edit list's start).
+    """
+    return [(p.pts, p.duration or 0) for p in packets if p.pts is not None and not p.is_discard]
+
+
+def _span(
+    start: int, runs: list[list[tuple[int, int]]], time_base: Fraction
+) -> tuple[float, float]:
+    """``(start, span)`` in seconds, the span ending where the last presented packet ends.
+
+    ``runs`` are ``_presented`` lists, each from one contiguous read. A last packet
+    without a duration lasts the median step between presentation timestamps, taken
+    within runs so the gap between two reads is not a step.
+    """
+    end, duration = max(max(run) for run in runs)
+    if not duration:
+        pts = (sorted(p for p, _ in run) for run in runs)
+        steps = [b - a for run in pts for a, b in itertools.pairwise(run) if b > a]
+        duration = statistics.median(steps) if steps else 0
+    return float(start * time_base), float((end + duration - start) * time_base)
+
+
+def _video_extent(path: str) -> tuple[float, float] | None:
+    """Start and span in seconds of the first video stream, from its packet timestamps.
+
+    The start is the earliest presentation timestamp (PTS) of a presented packet
+    (``_presented``); the span runs from it to the end of the last presented packet
+    (``_span``). Returns ``None`` when no packet has a PTS (a raw elementary stream).
+
+    The reads are bounded. A packet is presented no earlier than it is decoded, and
+    decode timestamps never decrease, so the start is settled once a packet's decode
+    timestamp reaches the earliest PTS seen: only the first reordered packets are read.
+    For the end, a backward seek past the stream's end lands on its last seek point;
+    when that is a presented keyframe, the packets from it to the end of the file hold
+    the last presented one, since no packet decoded before a keyframe is presented after
+    it. Every packet is read instead when the input's size is unknown (a pipe), the seek
+    fails, or it lands off a keyframe, as in containers that seek by bisecting
+    timestamps, where timestamps rebuilt from the landing need not match a read from
+    the start.
+    """
+    import av
+
+    with av.open(path) as container:
+        stream = container.streams.video[0]
+        time_base = stream.time_base
+        if time_base is None:
+            return None
+        packets = container.demux(stream)
+        head: list[tuple[int, int]] = []
+        start = None
+        for packet in packets:
+            pts, dts = packet.pts, packet.dts
+            if pts is not None and not packet.is_discard:
+                head.append((pts, packet.duration or 0))
+                start = pts if start is None else min(start, pts)
+            if start is not None and dts is not None and dts >= start and len(head) > 1:
+                break
+        else:  # the whole stream was read
+            return None if start is None else _span(start, [head], time_base)
+        if container.size <= 0:  # no known size (a pipe): read on instead of seeking
+            return _span(start, [head + _presented(packets)], time_base)
+        try:
+            container.seek(start + int(_PAST_END_S / time_base), stream=stream)
+            tail = container.demux(stream)
+            landing = next(tail)
+            ends = _presented(itertools.chain([landing], tail))
+        except av.FFmpegError:
+            landing, ends = None, []
+        if landing is not None and landing.is_keyframe and _presented([landing]):
+            return _span(start, [head, ends], time_base)
+    with av.open(path) as container:
+        return _span(start, [_presented(container.demux(container.streams.video[0]))], time_base)
 
 
 def decode_video_frames(
@@ -97,11 +170,15 @@ def decode_video_frames(
     ``"uniform"`` = ``sample_timestamps``) and read in a single decode pass: each
     target timestamp is mapped to the first decoded frame at or after it
     (timestamps past the last frame map to the last frame, so the final frame is
-    always returned). Frame times are measured from the first frame that has a
-    timestamp, so a stream whose timestamps start after zero is sampled like one
-    starting at zero; a frame without a timestamp counts as time zero. The returned
-    list has length equal to the number of sampled timestamps (``<= max_frames``), or
-    is empty when the file has no decodable video stream.
+    always returned). Frame times and the sampled span come from the video stream's
+    packet timestamps (``_video_extent``): times count from the stream's start, so a
+    stream whose timestamps start after zero is sampled like one starting at zero, and
+    the span ends where its last frame ends, whatever the container's duration covers.
+    Without packet timestamps (a raw elementary stream), the span comes from the
+    container metadata and times count from the first frame that has a timestamp; a
+    frame without a timestamp counts as time zero. The returned list has length equal to the
+    number of sampled timestamps (``<= max_frames``), or is empty when the file has no
+    decodable video stream.
 
     Raises whatever ``av`` raises on a missing/corrupt file; callers that train
     over noisy data should catch and substitute an empty clip.
@@ -121,13 +198,16 @@ def decode_video_frames(
             return images
         stream = container.streams.video[0]
         stream.thread_type = "AUTO"
-        duration_s = _video_duration_seconds(stream, container)
+        extent = _video_extent(path)
+        if extent is None:
+            start, duration_s = None, _video_duration_seconds(stream, container)
+        else:
+            start, duration_s = extent
         targets = sample(duration_s, fps, min_frames, max_frames)
 
         j = 0
         eps = 1e-3
         last_frame = None
-        start = None
         for frame in container.decode(stream):
             ft = frame.time
             if ft is None:

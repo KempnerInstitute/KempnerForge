@@ -217,22 +217,59 @@ def _write_indexed_clip(
             container.mux(packet)
 
 
-def _remux_shifted(src, dst, offset_s: float) -> None:
-    """Remux ``src`` into ``dst`` (container from its suffix), timestamps ``offset_s`` later."""
+def _remux_shifted(src, dst, offset_s: float, *, from_keyframe: int = 0) -> None:
+    """Remux ``src``'s video into ``dst`` (container from its suffix), timestamps ``offset_s``
+    later; ``from_keyframe=k`` drops the packets before the k-th keyframe in decode order."""
     import av
 
     with av.open(str(src)) as ic, av.open(str(dst), mode="w") as oc:
         istream = ic.streams.video[0]
         ostream = oc.add_stream_from_template(istream)
         shift = round(offset_s / istream.time_base)
+        keyframes = 0
         for packet in ic.demux(istream):
             if packet.pts is None:
+                continue
+            keyframes += packet.is_keyframe
+            if keyframes <= from_keyframe:
                 continue
             packet.pts += shift
             if packet.dts is not None:
                 packet.dts += shift
             packet.stream = ostream
             oc.mux(packet)
+
+
+def _write_audio_first_clip(path, n_frames: int, fps: int, video_start_s: float) -> None:
+    """An indexed clip from ``video_start_s`` with PCM audio from 0.5 s before to 0.5 s after."""
+    from fractions import Fraction
+
+    import av
+    import numpy as np
+
+    rate = 8000
+    with av.open(str(path), mode="w") as container:
+        audio = container.add_stream("pcm_s16le", rate=rate)
+        video = container.add_stream("mpeg4", rate=fps)
+        video.width = video.height = 64
+        video.pix_fmt = "yuv420p"
+        first = round((video_start_s - 0.5) * rate)
+        last = round((video_start_s + n_frames / fps + 0.5) * rate)
+        for pts in range(first, last, rate // 10):
+            samples = av.AudioFrame.from_ndarray(
+                np.zeros((1, rate // 10), np.int16), format="s16", layout="mono"
+            )
+            samples.sample_rate, samples.pts, samples.time_base = rate, pts, Fraction(1, rate)
+            for packet in audio.encode(samples):
+                container.mux(packet)
+        for i in range(n_frames):
+            frame = av.VideoFrame.from_ndarray(_index_frame(i), format="rgb24")
+            frame.pts, frame.time_base = round(video_start_s * fps) + i, Fraction(1, fps)
+            for packet in video.encode(frame):
+                container.mux(packet)
+        for stream in (video, audio):
+            for packet in stream.encode():
+                container.mux(packet)
 
 
 def _first_frame_time(path) -> float | None:
@@ -243,55 +280,144 @@ def _first_frame_time(path) -> float | None:
         return next(container.decode(container.streams.video[0])).time
 
 
+def _full_extent(path) -> tuple[float, float]:
+    """Start and span from every presented packet, the reference for the bounded read."""
+    import itertools
+    import statistics
+
+    import av
+
+    with av.open(str(path)) as container:
+        stream = container.streams.video[0]
+        time_base = stream.time_base
+        shown = [
+            (p.pts, p.duration or 0)
+            for p in container.demux(stream)
+            if p.pts is not None and not p.is_discard
+        ]
+    pts = sorted(p for p, _ in shown)
+    last, duration = max(shown)
+    duration = duration or statistics.median(b - a for a, b in itertools.pairwise(pts) if b > a)
+    return float(pts[0] * time_base), float((last + duration - pts[0]) * time_base)
+
+
+def _rule_indices(path, start: float, span: float) -> list[int]:
+    """The 4-frame selection with frame times counted from ``start`` over ``span``."""
+    import av
+
+    with av.open(str(path)) as container:
+        decoded = [
+            (f.time - start, _frame_index(f.to_image()))
+            for f in container.decode(container.streams.video[0])
+        ]
+    last = decoded[-1][1]
+    targets = sample_timestamps(span, 2.0, 4, 4)
+    return [next((i for t, i in decoded if t + 1e-3 >= tgt), last) for tgt in targets]
+
+
+def _indices(path, **sampling) -> list[int]:
+    from kempnerforge.data.video_io import decode_video_frames
+
+    sampling = sampling or dict(fps=2.0, min_frames=4, max_frames=4)
+    return [_frame_index(f) for f in decode_video_frames(str(path), **sampling)]
+
+
+class _CountingContainer:
+    """Forwards to a PyAV input container, counting its seeks and demuxed packets."""
+
+    def __init__(self, container, counts):
+        self._container, self._counts = container, counts
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return self._container.__exit__(*exc)
+
+    def __getattr__(self, name):
+        return getattr(self._container, name)
+
+    def seek(self, *args, **kwargs):
+        self._counts["seeks"] += 1
+        return self._container.seek(*args, **kwargs)
+
+    def demux(self, *args, **kwargs):
+        for packet in self._container.demux(*args, **kwargs):
+            self._counts["packets"] += 1
+            yield packet
+
+
+@pytest.fixture
+def counted_open(monkeypatch):
+    """Patch ``av.open`` to count opens, seeks and demuxed packets."""
+    import av
+
+    counts = {"opens": 0, "seeks": 0, "packets": 0}
+    real_open = av.open
+
+    def _open(*args, **kwargs):
+        counts["opens"] += 1
+        return _CountingContainer(real_open(*args, **kwargs), counts)
+
+    monkeypatch.setattr(av, "open", _open)
+    return counts
+
+
+# (suffix, encoder, encoder options): the containers and codecs a stream offset is checked in.
+_X264_BFRAMES = {"x264-params": "bframes=2:b-adapt=0"}
+_OFFSET_CASES = {
+    "mp4": ("mp4", "mpeg4", None),
+    "mov-bframes": ("mov", "mpeg4", {"bf": "2"}),  # an edit list holds the B-frame delay
+    "mkv": ("mkv", "mpeg4", None),
+    "webm": ("webm", "libvpx-vp9", None),
+    "nut-bframes": ("nut", "mpeg4", {"bf": "2"}),
+    "flv": ("flv", "flv", None),  # packets carry no duration
+    "asf": ("asf", "wmv2", None),
+    "asf-bframes": ("asf", "mpeg4", {"bf": "2"}),  # no stream start time
+    "mpegts": ("ts", "mpeg2video", {"bf": "2"}),
+    "mpegps": ("mpg", "mpeg2video", {"bf": "2"}),
+    "ogg": ("ogv", "libvpx", None),
+    "mp4-h264-bframes": ("mp4", "libx264", _X264_BFRAMES),
+    "mkv-h264-bframes": ("mkv", "libx264", _X264_BFRAMES),
+}
+
+
 @pytest.mark.skipif(not _AV_AVAILABLE, reason="requires the 'av' package")
 class TestDecodeStartOffset:
-    """Frame times count from the first timestamped frame, since sample targets start at 0 s."""
+    """Frame times and the sampled span come from the video packets' timestamps, so a
+    stream that starts after 0 s is sampled like one that starts at 0 s."""
 
     @pytest.mark.parametrize("offset_s", [0.0, 0.5, 5.0])
-    @pytest.mark.parametrize(
-        ("suffix", "codec"),
-        [("mp4", "mpeg4"), ("mkv", "mpeg4"), ("webm", "libvpx-vp9"), ("flv", "flv")],
-    )
-    def test_start_offset_selects_same_frames(self, tmp_path, suffix, codec, offset_s):
-        """MP4 reports a stream duration; MKV and WebM a container duration that ends at
-        the last frame's end time, FLV one that spans the clip."""
-        from kempnerforge.data.video_io import decode_video_frames
-
-        if codec == "libvpx-vp9" and not _VP9_AVAILABLE:
-            pytest.skip("requires the libvpx-vp9 encoder")
+    @pytest.mark.parametrize("case", list(_OFFSET_CASES))
+    def test_start_offset_selects_same_frames(self, tmp_path, case, offset_s):
+        """A copy whose timestamps start ``offset_s`` later selects the same frames."""
+        suffix, codec, options = _OFFSET_CASES[case]
+        if not _encoder_available(codec):
+            pytest.skip(f"requires the {codec} encoder")
         src = tmp_path / f"src.{suffix}"
         base = tmp_path / f"base.{suffix}"
         shifted = tmp_path / f"shifted.{suffix}"
-        _write_indexed_clip(src, n_frames=20, fps=10, codec=codec)  # 2 s
+        _write_indexed_clip(src, n_frames=20, fps=10, codec=codec, codec_options=options)  # 2 s
         _remux_shifted(src, base, 0.0)
         _remux_shifted(src, shifted, offset_s)
-        assert _first_frame_time(shifted) == pytest.approx(offset_s)
-        got = decode_video_frames(str(shifted), fps=2.0, min_frames=4, max_frames=4)
-        ref = decode_video_frames(str(base), fps=2.0, min_frames=4, max_frames=4)
-        assert [f.tobytes() for f in got] == [f.tobytes() for f in ref]
-        if suffix != "flv":  # a remuxed FLV's span ends at its last frame's time
-            # Targets [0, 2/3, 4/3, 2] s; the last sits past the final frame (1.9 s).
-            assert [_frame_index(f) for f in got] == [0, 7, 14, 19]
+        assert _first_frame_time(shifted) == pytest.approx(_first_frame_time(base) + offset_s)
+        # Targets [0, 2/3, 4/3, 2] s; the last sits past the final frame (1.9 s).
+        assert _indices(shifted) == _indices(base) == [0, 7, 14, 19]
 
     def test_b_frame_delay_keeps_selection(self, tmp_path):
         """MPEG-4 B-frames in AVI: the stream starts at 0 s but its first frame at 33 ms."""
         import av
-
-        from kempnerforge.data.video_io import decode_video_frames
 
         path = tmp_path / "bframes.avi"
         _write_indexed_clip(path, n_frames=60, fps=30, fmt="avi", codec_options={"bf": "2"})
         with av.open(str(path)) as container:
             assert container.streams.video[0].start_time == 0
         assert _first_frame_time(path) == pytest.approx(1 / 30)
-        frames = decode_video_frames(str(path), fps=2.0, min_frames=4, max_frames=4)
-        assert [_frame_index(f) for f in frames] == [0, 20, 40, 59]
+        assert _indices(path) == [0, 20, 40, 59]
 
     @pytest.mark.skipif(not _H264_AVAILABLE, reason="requires the libx264 encoder")
     def test_h264_b_frame_delay_keeps_selection(self, tmp_path):
         """H.264 B-frames in MP4 without an edit list: the first frame is at 67 ms."""
-        from kempnerforge.data.video_io import decode_video_frames
-
         path = tmp_path / "bframes.mp4"
         _write_indexed_clip(
             path,
@@ -302,21 +428,61 @@ class TestDecodeStartOffset:
             container_options={"use_editlist": "0"},
         )
         assert _first_frame_time(path) == pytest.approx(2 / 30)
-        frames = decode_video_frames(str(path), fps=2.0, min_frames=4, max_frames=4)
-        assert [_frame_index(f) for f in frames] == [0, 20, 40, 59]
+        assert _indices(path) == [0, 20, 40, 59]
+
+    @pytest.mark.parametrize("suffix", ["mkv", "ts"])
+    def test_open_gop_start_selects_same_frames(self, tmp_path, suffix):
+        """Cut at an open-GOP keyframe, a stream starts with frames that reference the
+        dropped group: the decoder skips them, yet they start the stream at any offset."""
+        src = tmp_path / f"src.{suffix}"
+        options = {"bf": "2", "g": "10"}  # MPEG-2 GOPs are open by default
+        _write_indexed_clip(src, n_frames=40, fps=10, codec="mpeg2video", codec_options=options)
+        selections = []
+        for offset_s in (0.0, 0.5, 5.0):
+            cut = tmp_path / f"cut_{offset_s}.{suffix}"
+            _remux_shifted(src, cut, offset_s, from_keyframe=1)
+            start, span = _full_extent(cut)
+            assert start < _first_frame_time(cut)  # the leading frames are skipped
+            selections.append(_indices(cut))
+            assert selections[-1] == _rule_indices(cut, start, span)
+        assert selections[0] == selections[1] == selections[2]
+
+    def test_audio_outside_the_video_is_ignored(self, tmp_path):
+        """Audio that starts before the video and ends after it moves neither the stream's
+        start nor its end: the selection matches a video-only copy's."""
+        _write_indexed_clip(tmp_path / "video.mkv", n_frames=20, fps=10)
+        assert _indices(tmp_path / "video.mkv") == [0, 7, 14, 19]
+        for offset_s in (0.0, 0.5, 5.0):
+            path = tmp_path / f"av_{offset_s}.mkv"
+            _write_audio_first_clip(path, n_frames=20, fps=10, video_start_s=offset_s + 0.5)
+            assert _indices(path) == [0, 7, 14, 19]
+
+    def test_discarded_preroll_does_not_start_the_stream(self, tmp_path):
+        """Frames ahead of an edit list's start are decoded but not shown: the stream
+        starts at the first shown frame."""
+        from kempnerforge.data.video_io import _video_extent
+
+        src = tmp_path / "src.mov"
+        _write_indexed_clip(src, n_frames=20, fps=10, codec_options={"g": "10"})
+        trimmed = tmp_path / "trimmed.mov"
+        _remux_shifted(src, trimmed, -0.3)  # frames 0-2 fall before 0 s
+        assert _video_extent(str(trimmed)) == pytest.approx((0.0, 1.7))
+        assert _indices(trimmed) == [3, 9, 15, 19]
 
     def test_zero_start_matches_absolute_times(self, tmp_path):
         """With the first frame at 0 s, each target takes the first frame whose
         absolute time is within 1 ms of or after it, as before."""
         import av
 
-        from kempnerforge.data.video_io import _video_duration_seconds, decode_video_frames
+        from kempnerforge.data.video_io import decode_video_frames
 
         path = tmp_path / "clip.mp4"
         _write_indexed_clip(path, n_frames=45, fps=30, codec_options={"bf": "2"})
+        start, span = _full_extent(path)
+        assert start == 0.0
+        targets = sample_timestamps(span, 8.0, 12, 12)
         with av.open(str(path)) as container:
             stream = container.streams.video[0]
-            targets = sample_timestamps(_video_duration_seconds(stream, container), 8.0, 12, 12)
             decoded = [(f.time, f.to_image().tobytes()) for f in container.decode(stream)]
         assert decoded[0][0] == 0.0
         last = decoded[-1][1]
@@ -335,14 +501,16 @@ class TestDecodeStartOffset:
         path = tmp_path / "clip.h264"
         _write_indexed_clip(path, n_frames=20, fps=10, codec="libx264", fmt="h264")
         assert _first_frame_time(path) is None
+        assert video_io._video_extent(str(path)) is None
         fixed = SimpleNamespace(get_sampling_policy=lambda name: lambda *args: [0.0, 0.5, 1.0])
         monkeypatch.setattr(video_io, "registry", fixed)
         frames = video_io.decode_video_frames(str(path), fps=2.0, min_frames=1, max_frames=4)
         assert [_frame_index(f) for f in frames] == [0, 19, 19]
 
     def test_origin_is_the_first_timestamped_frame(self, monkeypatch):
-        """An untimed frame ahead of the first timestamp counts as 0 s; later times count
-        from the first timestamped frame (5.0 s here)."""
+        """Without packet timestamps, an untimed frame ahead of the first timestamp counts
+        as 0 s; later times count from the first timestamped frame (5.0 s here)."""
+        from fractions import Fraction
         from types import SimpleNamespace
 
         import av
@@ -359,7 +527,11 @@ class TestDecodeStartOffset:
         class _Container:
             duration = None
             streams = SimpleNamespace(
-                video=[SimpleNamespace(duration=None, time_base=None, frames=0, average_rate=None)]
+                video=[
+                    SimpleNamespace(
+                        duration=None, time_base=Fraction(1, 10), frames=0, average_rate=None
+                    )
+                ]
             )
 
             def __enter__(self):
@@ -367,6 +539,9 @@ class TestDecodeStartOffset:
 
             def __exit__(self, *exc):
                 return False
+
+            def demux(self, stream):
+                return iter([SimpleNamespace(pts=None, dts=None, is_discard=False)] * 5)
 
             def decode(self, stream):
                 return (_Frame(i, t) for i, t in enumerate([None, 5.0, 5.1, 5.2, 5.3]))
@@ -378,40 +553,143 @@ class TestDecodeStartOffset:
         assert frames == [0, 3, 4]
 
 
-class TestVideoDuration:
-    """The clip span runs from the stream's start, where frame times start."""
+@pytest.mark.skipif(not _AV_AVAILABLE, reason="requires the 'av' package")
+class TestVideoExtent:
+    """``_video_extent`` reads the start and the end of the file, or every packet when a
+    seek to the end cannot be trusted."""
 
     @pytest.mark.parametrize(
-        ("format_name", "start_s", "span_s"),
+        ("suffix", "options"),
         [
-            ("matroska,webm", 5.0, 2.0),  # the segment ends at 7 s
-            ("nut", 5.0, 2.0),
-            ("flv", 5.0, 7.0),  # already a span
-            ("matroska,webm", None, 7.0),  # no start to subtract
+            ("mp4", {"bf": "2", "g": "10"}),
+            ("mkv", {"g": "10"}),
+            ("nut", {"bf": "2", "g": "10"}),
+            ("flv", {"g": "10"}),
+            ("avi", {"bf": "2", "g": "10"}),
         ],
     )
-    def test_container_duration(self, format_name, start_s, span_s):
-        from fractions import Fraction
+    def test_reads_only_the_first_and_last_groups(self, tmp_path, counted_open, suffix, options):
+        """On a 300-frame clip with a keyframe every 10 frames, the extent matches a full
+        read after reading under a tenth of the packets: the first few and the last group."""
+        from kempnerforge.data.video_io import _video_extent
+
+        path = tmp_path / f"clip.{suffix}"
+        codec = "flv" if suffix == "flv" else "mpeg4"
+        _write_indexed_clip(path, n_frames=300, fps=10, codec=codec, codec_options=options)
+        expected = _full_extent(path)
+        counted_open.update(opens=0, seeks=0, packets=0)
+        assert _video_extent(str(path)) == pytest.approx(expected)
+        assert expected[1] == pytest.approx(30.0)
+        assert counted_open["opens"] == 1
+        assert counted_open["seeks"] == 1
+        assert counted_open["packets"] <= 30
+
+    @pytest.mark.parametrize("suffix", ["ts", "mpg"])
+    def test_landing_off_a_keyframe_reads_every_packet(self, tmp_path, counted_open, suffix):
+        """MPEG-TS and MPEG-PS seek by bisecting timestamps and land on any packet, where
+        rebuilt timestamps need not match a read from the start: every packet is read."""
+        from kempnerforge.data.video_io import _video_extent
+
+        path = tmp_path / f"clip.{suffix}"
+        options = {"bf": "2", "g": "10"}
+        _write_indexed_clip(path, n_frames=40, fps=10, codec="mpeg2video", codec_options=options)
+        expected = _full_extent(path)
+        counted_open.update(opens=0, seeks=0, packets=0)
+        assert _video_extent(str(path)) == pytest.approx(expected)
+        assert expected[1] == pytest.approx(4.0)
+        assert counted_open["opens"] == 2
+
+    def test_failed_seek_reads_every_packet(self, tmp_path, counted_open):
+        """SWF cannot seek: the file is reopened and every packet read."""
+        from kempnerforge.data.video_io import _video_extent
+
+        path = tmp_path / "clip.swf"
+        _write_indexed_clip(path, n_frames=40, fps=10, codec="flv")
+        counted_open.update(opens=0, seeks=0, packets=0)
+        assert _video_extent(str(path)) == pytest.approx((0.0, 4.0))
+        assert counted_open["opens"] == 2
+
+    @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires named pipes")
+    def test_pipe_is_read_through(self, tmp_path, monkeypatch):
+        """A pipe has no size to seek within: its packets are read in a single pass."""
+        import threading
+
+        import av
+
+        from kempnerforge.data.video_io import _video_extent
+
+        clip = tmp_path / "clip.mkv"
+        _write_indexed_clip(clip, n_frames=40, fps=10, codec_options={"g": "10"})
+        pipe = tmp_path / "pipe"
+        os.mkfifo(pipe)
+        data = clip.read_bytes()
+
+        def _feed():
+            with open(pipe, "wb") as writer:
+                writer.write(data)
+
+        counts = {"opens": 0, "seeks": 0, "packets": 0}
+        real_open = av.open
+
+        def _open_once(*args, **kwargs):
+            counts["opens"] += 1
+            assert counts["opens"] == 1, "a pipe can be read only once"
+            return _CountingContainer(real_open(*args, **kwargs), counts)
+
+        monkeypatch.setattr(av, "open", _open_once)
+        feeder = threading.Thread(target=_feed, daemon=True)
+        feeder.start()
+        assert _video_extent(str(pipe)) == pytest.approx((0.0, 4.0))
+        feeder.join(timeout=10)
+        assert counts["seeks"] == 0
+
+    def test_stream_without_time_base(self, monkeypatch):
+        """A stream without a time base has no usable timestamps."""
         from types import SimpleNamespace
 
-        from kempnerforge.data.video_io import _video_duration_seconds
+        import av
 
-        stream = SimpleNamespace(
-            duration=None,
-            time_base=Fraction(1, 1000),
-            start_time=None if start_s is None else round(start_s * 1000),
-        )
-        container = SimpleNamespace(duration=7_000_000, format=SimpleNamespace(name=format_name))
-        assert _video_duration_seconds(stream, container) == pytest.approx(span_s)
+        from kempnerforge.data.video_io import _video_extent
 
-    def test_stream_duration_is_used_as_is(self):
+        class _Container:
+            streams = SimpleNamespace(video=[SimpleNamespace(time_base=None)])
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        monkeypatch.setattr(av, "open", lambda path: _Container())
+        assert _video_extent("clip") is None
+
+
+class TestSpan:
+    """``_span`` measures from the start to where the last presented packet ends."""
+
+    def test_last_packet_duration(self):
         from fractions import Fraction
-        from types import SimpleNamespace
 
-        from kempnerforge.data.video_io import _video_duration_seconds
+        from kempnerforge.data.video_io import _span
 
-        stream = SimpleNamespace(duration=2000, time_base=Fraction(1, 1000), start_time=5000)
-        assert _video_duration_seconds(stream, SimpleNamespace(duration=7_000_000)) == 2.0
+        runs = [[(10, 1), (13, 1), (11, 1), (12, 2)]]
+        assert _span(10, runs, Fraction(1, 10)) == pytest.approx((1.0, 0.4))
+
+    def test_missing_duration_is_the_median_step_within_runs(self):
+        """Steps 1, 2 and 6 give 2; the gap between the two reads (9 -> 20) is not a step."""
+        from fractions import Fraction
+
+        from kempnerforge.data.video_io import _span
+
+        runs = [[(0, 0), (3, 0), (1, 0), (9, 0)], [(20, 0)]]
+        assert _span(0, runs, Fraction(1, 1)) == (0.0, 22.0)
+
+    def test_single_packet_without_duration(self):
+        from fractions import Fraction
+
+        from kempnerforge.data.video_io import _span
+
+        assert _span(5, [[(5, 0)]], Fraction(1, 2)) == (2.5, 0.0)
 
 
 class TestSamplingPolicyRegistry:
