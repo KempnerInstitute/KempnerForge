@@ -6,7 +6,7 @@
 # avgpool (pool_window = 2) gives 64 tokens/frame, so 18 * 64 = 1152 visual +
 # 96 text = 1248 <= max_seq_len.
 #
-# Target: 16 GPUs, global batch 256, one epoch = 41905 steps.
+# Target: 16 GPUs, global batch 256, one epoch = 41904 steps.
 [model]
 dim = 1024
 n_layers = 28
