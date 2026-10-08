@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import itertools
 import statistics
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from typing import TYPE_CHECKING, Any
 
 from kempnerforge.config.registry import registry
@@ -123,40 +123,39 @@ def _rewind(container: Any, stream: Any, first: Any) -> Iterator[Any]:
     return itertools.chain([again], packets)
 
 
-def _video_extent(container: Any, stream: Any) -> tuple[tuple[float, float] | None, Iterator[Any]]:
-    """Start and span in seconds of a video stream from its packet timestamps, and the
-    stream's packets from its first, read in place from the open ``container``.
+def _all_packets(path: str) -> Iterator[Any]:
+    """Every packet of the first video stream, from a fresh open of ``path``."""
+    import av
+
+    with av.open(path) as container:
+        yield from container.demux(container.streams.video[0])
+
+
+def _read_extent(
+    container: Any, stream: Any, packets: Iterator[Any], restart: Callable[[], Iterator[Any]]
+) -> tuple[float, float] | None:
+    """Start and span in seconds of ``stream``, reading ``packets`` from its first and
+    then its end; ``None`` when no packet has a presentation timestamp.
 
     The start is the earliest presentation timestamp (PTS) of a presented packet
     (``_presented``); the span runs from it to the end of the last presented packet
-    (``_span``). The extent is ``None`` when it is not read: an input without a size (a
-    pipe) cannot seek back to its start, and a stream whose first packet is not a
-    keyframe with a timestamp (a raw elementary stream, or a container that marks no
-    keyframes) cannot seek at all.
-
-    The reads are bounded. A packet is presented no earlier than it is decoded, and
-    decode timestamps never decrease, so the start is settled once a packet's decode
-    timestamp reaches the earliest PTS seen: only the first reordered packets are read.
-    For the end, a backward seek past the stream's end lands on its last seek point;
-    when that is a presented keyframe, the packets from it to the end of the file hold
-    the last presented one, since no packet decoded before a keyframe is presented after
-    it. Every packet is read instead when that seek fails or lands elsewhere, as in
-    containers that seek by bisecting timestamps, where timestamps rebuilt from the
-    landing need not match a read from the start. The container then seeks back to the
-    first packet (``_rewind``).
+    (``_span``). The reads are bounded. A packet is presented no earlier than it is
+    decoded, and decode timestamps never decrease, so the start is settled once a
+    packet's decode timestamp reaches the earliest PTS seen: only the first reordered
+    packets are read. For the end, a backward seek past the stream's end lands on its
+    last seek point; when that is a presented keyframe, the packets from it to the end
+    of the file hold the last presented one, since no packet decoded before a keyframe
+    is presented after it. Every packet is read instead (``restart`` yields them from
+    the first) when that seek fails or lands elsewhere, as in containers that seek by
+    bisecting timestamps, where timestamps rebuilt from the landing need not match a
+    read from the start.
     """
     import av
 
-    packets = container.demux(stream)
     time_base = stream.time_base
-    if time_base is None or container.size <= 0:
-        return None, packets
-    first = next(packets)
-    if not first.is_keyframe or (first.pts is None and first.dts is None):
-        return None, itertools.chain([first], packets)
     head: list[tuple[int, int]] = []
     start = None
-    for packet in itertools.chain([first], packets):
+    for packet in packets:
         pts, dts = packet.pts, packet.dts
         if pts is not None and not packet.is_discard:
             head.append((pts, packet.duration or 0))
@@ -164,8 +163,7 @@ def _video_extent(container: Any, stream: Any) -> tuple[tuple[float, float] | No
         if start is not None and dts is not None and dts >= start and len(head) > 1:
             break
     else:  # the whole stream was read
-        extent = None if start is None else _span(start, [head], time_base)
-        return extent, _rewind(container, stream, first)
+        return None if start is None else _span(start, [head], time_base)
     try:
         container.seek(start + int(_PAST_END_S / time_base), stream=stream)
         tail = container.demux(stream)
@@ -174,10 +172,39 @@ def _video_extent(container: Any, stream: Any) -> tuple[tuple[float, float] | No
     except av.FFmpegError:
         landing, ends = None, []
     if landing is not None and landing.is_keyframe and _presented([landing]):
-        runs = [head, ends]
-    else:
-        runs = [_presented(_rewind(container, stream, first))]
-    return _span(start, runs, time_base), _rewind(container, stream, first)
+        return _span(start, [head, ends], time_base)
+    return _span(start, [_presented(restart())], time_base)
+
+
+def _video_extent(
+    container: Any, stream: Any, path: str
+) -> tuple[tuple[float, float] | None, Iterator[Any]]:
+    """Start and span in seconds of a video stream (``_read_extent``), and its packets
+    from the first, for decoding from the open ``container`` of ``path``.
+
+    The extent is ``None`` for a pipe, which can be read only once (an input without a
+    size), and for a stream without presentation timestamps. When the first packet is a
+    keyframe with a timestamp, the extent is read in ``container``, which then seeks
+    back to that packet (``_rewind``). Otherwise the container could not seek back to
+    it, so the extent is read from a second open of the file, and ``container`` is
+    left at its first packet.
+    """
+    import av
+
+    packets = container.demux(stream)
+    if stream.time_base is None or container.size <= 0:
+        return None, packets
+    first = next(packets)
+    if first.is_keyframe and (first.pts is not None or first.dts is not None):
+
+        def rewind() -> Iterator[Any]:
+            return _rewind(container, stream, first)
+
+        return _read_extent(container, stream, itertools.chain([first], packets), rewind), rewind()
+    with av.open(path) as probe:
+        video = probe.streams.video[0]
+        extent = _read_extent(probe, video, probe.demux(video), lambda: _all_packets(path))
+    return extent, itertools.chain([first], packets)
 
 
 def decode_video_frames(
@@ -193,11 +220,12 @@ def decode_video_frames(
     packet timestamps, read from the same open container (``_video_extent``): times
     count from the stream's start, so a stream whose timestamps start after zero is
     sampled like one starting at zero, and the span ends where its last frame ends,
-    whatever the container's duration covers. Where they are not read (a pipe, a raw
-    elementary stream), the span comes from the container metadata and times count
-    from the first frame that has a timestamp; a frame without a timestamp counts as
-    time zero. The returned list has length equal to the number of sampled timestamps
-    (``<= max_frames``), or is empty when the file has no decodable video stream.
+    whatever the container's duration covers. For a pipe, which can be read only once,
+    and a stream without timestamps (a raw elementary stream), the span comes from the
+    container metadata and times count from the first frame that has a timestamp; a
+    frame without a timestamp counts as time zero. The returned list has length equal
+    to the number of sampled timestamps (``<= max_frames``), or is empty when the file
+    has no decodable video stream.
 
     Raises whatever ``av`` raises on a missing/corrupt file, and ``RuntimeError`` if
     the container cannot seek back to the stream's first packet after reading its end;
@@ -218,7 +246,7 @@ def decode_video_frames(
             return images
         stream = container.streams.video[0]
         stream.thread_type = "AUTO"
-        extent, packets = _video_extent(container, stream)
+        extent, packets = _video_extent(container, stream, path)
         if extent is None:
             start, duration_s = None, _video_duration_seconds(stream, container)
         else:
