@@ -220,27 +220,29 @@ def _write_indexed_clip(
 def _remux_shifted(
     src, dst, offset_s: float, *, from_keyframe: int = 0, skip_packets: int = 0
 ) -> None:
-    """Remux ``src``'s video into ``dst`` (container from its suffix), timestamps ``offset_s``
-    later; ``from_keyframe=k`` drops the packets before the k-th keyframe in decode order,
-    and ``skip_packets=n`` the first n packets, so the copy starts off a keyframe."""
+    """Remux ``src``'s video and audio into ``dst`` (container from its suffix), timestamps
+    ``offset_s`` later; ``from_keyframe=k`` drops the video packets before the k-th keyframe
+    in decode order, and ``skip_packets=n`` the first n of them, so the copy starts off a
+    keyframe. Only video packets are counted, so an audio track is copied whole."""
     import av
 
     with av.open(str(src)) as ic, av.open(str(dst), mode="w") as oc:
-        istream = ic.streams.video[0]
-        ostream = oc.add_stream_from_template(istream)
-        shift = round(offset_s / istream.time_base)
+        streams = [s for s in ic.streams if s.type in ("video", "audio")]
+        outputs = {s.index: oc.add_stream_from_template(s) for s in streams}
         keyframes = seen = 0
-        for packet in ic.demux(istream):
+        for packet in ic.demux(streams):
             if packet.pts is None:
                 continue
-            keyframes += packet.is_keyframe
-            seen += 1
-            if keyframes <= from_keyframe or seen <= skip_packets:
-                continue
+            if packet.stream.type == "video":
+                keyframes += packet.is_keyframe
+                seen += 1
+                if keyframes <= from_keyframe or seen <= skip_packets:
+                    continue
+            shift = round(offset_s / packet.stream.time_base)
             packet.pts += shift
             if packet.dts is not None:
                 packet.dts += shift
-            packet.stream = ostream
+            packet.stream = outputs[packet.stream.index]
             oc.mux(packet)
 
 
@@ -270,6 +272,42 @@ def _write_audio_first_clip(path, n_frames: int, fps: int, video_start_s: float)
             frame = av.VideoFrame.from_ndarray(_index_frame(i), format="rgb24")
             frame.pts, frame.time_base = round(video_start_s * fps) + i, Fraction(1, fps)
             for packet in video.encode(frame):
+                container.mux(packet)
+        for stream in (video, audio):
+            for packet in stream.encode():
+                container.mux(packet)
+
+
+def _write_clip_with_audio(
+    path, n_frames: int, fps: int, *, codec, codec_options, tail_s=1.0
+) -> None:
+    """An indexed clip with a silent MP2 track that runs ``tail_s`` past the last frame."""
+    from fractions import Fraction
+
+    import av
+    import numpy as np
+
+    rate = 48000
+    with av.open(str(path), mode="w") as container:
+        video = container.add_stream(codec, rate=fps)
+        video.width = video.height = 64
+        video.pix_fmt = "yuv420p"
+        video.codec_context.time_base = Fraction(1, fps)
+        video.codec_context.options = codec_options
+        audio = container.add_stream("mp2", rate=rate)
+        audio.layout = "stereo"
+        for i in range(n_frames):
+            frame = av.VideoFrame.from_ndarray(_index_frame(i), format="rgb24")
+            frame.pts, frame.time_base = i, Fraction(1, fps)
+            for packet in video.encode(frame):
+                container.mux(packet)
+        samples = audio.codec_context.frame_size or 1152
+        for pts in range(0, round((n_frames / fps + tail_s) * rate), samples):
+            block = av.AudioFrame.from_ndarray(
+                np.zeros((1, 2 * samples), np.int16), format="s16", layout="stereo"
+            )
+            block.sample_rate, block.pts, block.time_base = rate, pts, Fraction(1, rate)
+            for packet in audio.encode(block):
                 container.mux(packet)
         for stream in (video, audio):
             for packet in stream.encode():
@@ -483,6 +521,24 @@ class TestDecodeStartOffset:
         else:  # targets [0, 2/3, 4/3, 2] s; the last sits past the final frame (1.9 s)
             expected = [0, 7, 14, 19]
         assert _indices(shifted) == _indices(base) == expected
+
+    @pytest.mark.skipif(not _H264_AVAILABLE, reason="requires the libx264 encoder")
+    @pytest.mark.skipif(not _encoder_available("mp2"), reason="requires the mp2 encoder")
+    @pytest.mark.parametrize("offset_s", [0.0, 0.5, 5.0])
+    @pytest.mark.parametrize("suffix", ["ts", "mkv"])
+    def test_cut_with_audio_measures_the_video_only(self, tmp_path, suffix, offset_s):
+        """A cut whose audio runs a second past the last frame is sampled over the video's
+        own span. MPEG-TS gets there by reading every packet, so a read that took in the
+        other streams would stretch the span; Matroska seeks to its last keyframe instead."""
+        src = tmp_path / f"src.{suffix}"
+        base = tmp_path / f"base.{suffix}"
+        shifted = tmp_path / f"shifted.{suffix}"
+        _write_clip_with_audio(src, 40, 10, codec="libx264", codec_options=_X264_GOP10)
+        _remux_shifted(src, base, 0.0, skip_packets=3)
+        _remux_shifted(src, shifted, offset_s, skip_packets=3)
+        start, span = _full_extent(base)  # the video stream's own extent
+        assert span == pytest.approx(_full_extent(shifted)[1])
+        assert _indices(shifted) == _indices(base) == _rule_indices(base, start, span)
 
     def test_b_frame_delay_keeps_selection(self, tmp_path):
         """MPEG-4 B-frames in AVI: the stream starts at 0 s but its first frame at 33 ms."""
