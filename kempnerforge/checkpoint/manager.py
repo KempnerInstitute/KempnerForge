@@ -544,7 +544,8 @@ class CheckpointManager:
             if load_model:
                 set_model_state_dict(self.model, dcp_state["model"])
             if load_optim:
-                dcp_state["optimizer"]["state"].update({fqn: {} for fqn in planner.unstepped})
+                param_states = cast("dict[str, Any]", dcp_state["optimizer"]["state"])
+                param_states.update({fqn: {} for fqn in planner.unstepped})
                 set_optimizer_state_dict(
                     self.model, self.optimizer, optim_state_dict=dcp_state["optimizer"]
                 )
