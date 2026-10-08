@@ -28,6 +28,7 @@ def _encoder_available(name: str) -> bool:
 
 
 _H264_AVAILABLE = _encoder_available("libx264")
+_VP9_AVAILABLE = _encoder_available("libvpx-vp9")
 
 
 # ---------------------------------------------------------------------------
@@ -216,8 +217,8 @@ def _write_indexed_clip(
             container.mux(packet)
 
 
-def _write_shifted_mp4(src, dst, offset_s: float) -> None:
-    """Remux ``src`` with every packet timestamp shifted later by ``offset_s``."""
+def _remux_shifted(src, dst, offset_s: float) -> None:
+    """Remux ``src`` into ``dst`` (container from its suffix), timestamps ``offset_s`` later."""
     import av
 
     with av.open(str(src)) as ic, av.open(str(dst), mode="w") as oc:
@@ -247,19 +248,30 @@ class TestDecodeStartOffset:
     """Frame times count from the first decoded frame, since sample targets start at 0 s."""
 
     @pytest.mark.parametrize("offset_s", [0.0, 0.5, 5.0])
-    def test_start_offset_selects_same_frames(self, tmp_path, offset_s):
+    @pytest.mark.parametrize(
+        ("suffix", "codec"),
+        [("mp4", "mpeg4"), ("mkv", "mpeg4"), ("webm", "libvpx-vp9"), ("flv", "flv")],
+    )
+    def test_start_offset_selects_same_frames(self, tmp_path, suffix, codec, offset_s):
+        """MP4 reports a stream duration; MKV and WebM a container duration that ends at
+        the last frame's end time, FLV one that spans the clip."""
         from kempnerforge.data.video_io import decode_video_frames
 
-        src = tmp_path / "src.mp4"
-        shifted = tmp_path / "shifted.mp4"
-        _write_indexed_clip(src, n_frames=20, fps=10)  # 2 s
-        _write_shifted_mp4(src, shifted, offset_s)
+        if codec == "libvpx-vp9" and not _VP9_AVAILABLE:
+            pytest.skip("requires the libvpx-vp9 encoder")
+        src = tmp_path / f"src.{suffix}"
+        base = tmp_path / f"base.{suffix}"
+        shifted = tmp_path / f"shifted.{suffix}"
+        _write_indexed_clip(src, n_frames=20, fps=10, codec=codec)  # 2 s
+        _remux_shifted(src, base, 0.0)
+        _remux_shifted(src, shifted, offset_s)
         assert _first_frame_time(shifted) == pytest.approx(offset_s)
         got = decode_video_frames(str(shifted), fps=2.0, min_frames=4, max_frames=4)
-        ref = decode_video_frames(str(src), fps=2.0, min_frames=4, max_frames=4)
-        # Targets [0, 2/3, 4/3, 2] s; the last sits past the final frame (1.9 s).
-        assert [_frame_index(f) for f in got] == [0, 7, 14, 19]
+        ref = decode_video_frames(str(base), fps=2.0, min_frames=4, max_frames=4)
         assert [f.tobytes() for f in got] == [f.tobytes() for f in ref]
+        if suffix != "flv":  # a remuxed FLV's span ends at its last frame's time
+            # Targets [0, 2/3, 4/3, 2] s; the last sits past the final frame (1.9 s).
+            assert [_frame_index(f) for f in got] == [0, 7, 14, 19]
 
     def test_b_frame_delay_keeps_selection(self, tmp_path):
         """MPEG-4 B-frames in AVI: the stream starts at 0 s but its first frame at 33 ms."""
@@ -327,6 +339,42 @@ class TestDecodeStartOffset:
         monkeypatch.setattr(video_io, "registry", fixed)
         frames = video_io.decode_video_frames(str(path), fps=2.0, min_frames=1, max_frames=4)
         assert [_frame_index(f) for f in frames] == [0, 19, 19]
+
+
+class TestVideoDuration:
+    """The clip span runs from the stream's start, where frame times start."""
+
+    @pytest.mark.parametrize(
+        ("format_name", "start_s", "span_s"),
+        [
+            ("matroska,webm", 5.0, 2.0),  # the segment ends at 7 s
+            ("nut", 5.0, 2.0),
+            ("flv", 5.0, 7.0),  # already a span
+            ("matroska,webm", None, 7.0),  # no start to subtract
+        ],
+    )
+    def test_container_duration(self, format_name, start_s, span_s):
+        from fractions import Fraction
+        from types import SimpleNamespace
+
+        from kempnerforge.data.video_io import _video_duration_seconds
+
+        stream = SimpleNamespace(
+            duration=None,
+            time_base=Fraction(1, 1000),
+            start_time=None if start_s is None else round(start_s * 1000),
+        )
+        container = SimpleNamespace(duration=7_000_000, format=SimpleNamespace(name=format_name))
+        assert _video_duration_seconds(stream, container) == pytest.approx(span_s)
+
+    def test_stream_duration_is_used_as_is(self):
+        from fractions import Fraction
+        from types import SimpleNamespace
+
+        from kempnerforge.data.video_io import _video_duration_seconds
+
+        stream = SimpleNamespace(duration=2000, time_base=Fraction(1, 1000), start_time=5000)
+        assert _video_duration_seconds(stream, SimpleNamespace(duration=7_000_000)) == 2.0
 
 
 class TestSamplingPolicyRegistry:

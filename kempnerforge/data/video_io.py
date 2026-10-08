@@ -32,6 +32,10 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 # AV_TIME_BASE: container.duration is expressed in microseconds.
 _AV_TIME_BASE = 1_000_000.0
 
+# Formats whose container duration is an end time on the stream clock, not a span:
+# Matroska/WebM give the segment's end, NUT its last timestamp.
+_END_TIME_DURATION_FORMATS = frozenset({"matroska", "webm", "nut"})
+
 
 @registry.register_sampling_policy("uniform")
 def sample_timestamps(
@@ -64,11 +68,21 @@ def sample_timestamps(
 
 
 def _video_duration_seconds(stream: Any, container: Any) -> float:
-    """Best-effort clip duration in seconds from PyAV stream/container metadata."""
+    """Best-effort clip duration in seconds from PyAV stream/container metadata.
+
+    The span is measured from the stream's start, the origin of frame times: where
+    the container duration is an end time (``_END_TIME_DURATION_FORMATS``), the
+    stream's start time is subtracted. NUT's end is its last frame's time, so its
+    span is one frame short.
+    """
     if stream.duration is not None and stream.time_base is not None:
         return float(stream.duration * stream.time_base)
     if container.duration is not None:
-        return float(container.duration) / _AV_TIME_BASE
+        duration = float(container.duration) / _AV_TIME_BASE
+        end_time = not _END_TIME_DURATION_FORMATS.isdisjoint(container.format.name.split(","))
+        if end_time and stream.start_time is not None and stream.time_base is not None:
+            duration -= float(stream.start_time * stream.time_base)
+        return duration
     if stream.frames and stream.average_rate:
         return float(stream.frames) / float(stream.average_rate)
     return 0.0
