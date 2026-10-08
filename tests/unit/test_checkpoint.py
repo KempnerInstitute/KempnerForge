@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import json
 import random
+import re
 from pathlib import Path
 
 import numpy as np
+import pytest
 import torch
+import torch.distributed.checkpoint as dcp
 
 from kempnerforge.checkpoint.async_save import AsyncCheckpointer
 from kempnerforge.checkpoint.state import (
@@ -1243,44 +1246,60 @@ class TestCheckpointManagerLoad:
 
 
 class _UsedAndUnused(torch.nn.Module):
-    """``unused`` is trainable but never reaches the loss, so it is never stepped."""
+    """``unused`` is trainable but reaches the loss only when ``both`` is set."""
 
     def __init__(self) -> None:
         super().__init__()
         self.used = torch.nn.Linear(4, 4)
         self.unused = torch.nn.Linear(4, 4)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.used(x)
+    def forward(self, x: torch.Tensor, both: bool = False) -> torch.Tensor:
+        return self.used(x) + self.unused(x) if both else self.used(x)
+
+
+class _Renamed(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.renamed = torch.nn.Linear(4, 4)
+        self.unused = torch.nn.Linear(4, 4)
+
+
+class _WithExtra(_UsedAndUnused):
+    def __init__(self) -> None:
+        super().__init__()
+        self.extra = torch.nn.Linear(4, 4)
 
 
 class TestResumeWithUnsteppedParameters:
     """A checkpoint holds optimizer state only for parameters that were stepped."""
 
     @staticmethod
-    def _build(seed, ckpt_dir):
+    def _build(seed, ckpt_dir, model_cls=_UsedAndUnused, freeze_unused=False):
         from kempnerforge.checkpoint.manager import CheckpointManager
 
         torch.manual_seed(seed)
-        model = _UsedAndUnused()
-        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-2)
+        model = model_cls()
+        if freeze_unused:
+            model.unused.requires_grad_(False)
+        trainable = [p for p in model.parameters() if p.requires_grad]
+        optimizer = torch.optim.AdamW(trainable, lr=1e-2)
         manager = CheckpointManager(CheckpointConfig(dir=str(ckpt_dir)), model, optimizer)
         return model, optimizer, manager
 
     @staticmethod
-    def _step(model, optimizer, seed):
+    def _step(model, optimizer, seed, both=False):
         x = torch.randn(3, 4, generator=torch.Generator().manual_seed(seed))
-        model(x).pow(2).sum().backward()
+        model(x, both=both).pow(2).sum().backward()
         optimizer.step()
         optimizer.zero_grad()
 
     @staticmethod
-    def _assert_same_run(model, optimizer, model2, optimizer2):
+    def _assert_same_run(model, optimizer, model2, optimizer2, stepped=("used.",)):
         for (name, p), p2 in zip(model.named_parameters(), model2.parameters(), strict=True):
             assert torch.equal(p, p2), name
             state, state2 = optimizer.state.get(p, {}), optimizer2.state.get(p2, {})
             assert state.keys() == state2.keys(), name
-            assert bool(state2) is name.startswith("used."), name
+            assert bool(state2) is name.startswith(stepped), name
             for key in state:
                 assert torch.equal(state[key], state2[key]), f"{name}.{key}"
 
@@ -1309,9 +1328,9 @@ class TestResumeWithUnsteppedParameters:
             mgr_logger.setLevel(prior_level)
 
         self._assert_same_run(model, optimizer, model2, optimizer2)
-        assert [r.getMessage() for r in records if "no optimizer state" in r.getMessage()] == [
-            "2 parameters had no optimizer state when saved and resume without it: "
-            "['unused.bias', 'unused.weight']"
+        assert [r.getMessage() for r in records if "never stepped" in r.getMessage()] == [
+            "2 parameters the saved optimizer held were never stepped and resume without "
+            "state: ['unused.bias', 'unused.weight']"
         ]
 
     def test_resumed_steps_match_the_uninterrupted_run(self, tmp_path):
@@ -1327,8 +1346,21 @@ class TestResumeWithUnsteppedParameters:
         self._step(model2, optimizer2, 3)
         self._assert_same_run(model, optimizer, model2, optimizer2)
 
+    def test_first_gradient_after_resume_matches_the_uninterrupted_run(self, tmp_path):
+        model, optimizer, manager = self._build(0, tmp_path)
+        self._step(model, optimizer, 1)
+        manager.save(step=1)
+        self._step(model, optimizer, 2, both=True)
+        self._step(model, optimizer, 3, both=True)
+
+        model2, optimizer2, manager2 = self._build(1, tmp_path)
+        manager2.load()
+        assert not optimizer2.state.get(model2.unused.weight)
+        self._step(model2, optimizer2, 2, both=True)
+        self._step(model2, optimizer2, 3, both=True)
+        self._assert_same_run(model, optimizer, model2, optimizer2, stepped=("used.", "unused."))
+
     def test_a_stepped_parameter_missing_part_of_its_state_still_fails(self, tmp_path):
-        import pytest
         from torch.distributed.checkpoint.api import CheckpointException
 
         model, optimizer, manager = self._build(0, tmp_path)
@@ -1341,19 +1373,62 @@ class TestResumeWithUnsteppedParameters:
         with pytest.raises(CheckpointException, match=missing + "exp_avg_sq"):
             manager2.load()
 
+    @pytest.mark.parametrize(
+        ("case", "named"),
+        [
+            ("frozen_at_save", "unused.weight"),
+            ("renamed_without_model", "renamed.weight"),
+            ("added_without_model", "extra.weight"),
+            ("integer_keyed", "used.weight"),
+        ],
+    )
+    def test_state_the_saved_optimizer_did_not_hold_still_fails(self, tmp_path, case, named):
+        """Checkpoints that never held a parameter's state still fail, as they always have."""
+        from torch.distributed.checkpoint.api import CheckpointException
+
+        model, optimizer, manager = self._build(0, tmp_path, freeze_unused=case == "frozen_at_save")
+        self._step(model, optimizer, 1, both=case == "added_without_model")
+        if case == "integer_keyed":
+            state = {"model": model.state_dict(), "optimizer": optimizer.state_dict()}
+            dcp.save(state, checkpoint_id=str(tmp_path / "step_1"))
+        else:
+            manager.save(step=1)
+
+        model_cls = {"renamed_without_model": _Renamed, "added_without_model": _WithExtra}
+        _, _, manager2 = self._build(1, tmp_path, model_cls=model_cls.get(case, _UsedAndUnused))
+        exclude = ["model"] if case.endswith("without_model") else None
+        with pytest.raises((CheckpointException, RuntimeError), match=re.escape(named)):
+            manager2.load(path=str(tmp_path / "step_1"), exclude_keys=exclude)
+
     def test_saved_state_counts_toward_whole_parameter_names(self):
         from kempnerforge.checkpoint.manager import _params_without_saved_state
 
         fqns = {"a.weight", "a.weight_scale", "b.bias", "c.weight", "model.c"}
+        fqns |= {"proj.weight", "proj.weight_scale"}
         saved_keys = [
             "model.c.weight",  # a model entry, not the state of the parameter "model.c"
             "optimizer.param_groups.0.lr",
             "optimizer.state.a.weight.step",
             "optimizer.state.b.bias.nested.moment",
             "optimizer.state.gone.weight.step",
+            "optimizer.state.proj.weight_scale.step",
         ]
         unstepped = _params_without_saved_state(fqns, saved_keys)
-        assert unstepped == {"a.weight_scale", "c.weight", "model.c"}
+        assert unstepped == {"a.weight_scale", "c.weight", "model.c", "proj.weight"}
+
+    def test_only_parameters_the_saved_optimizer_held_stay_stateless(self):
+        from kempnerforge.checkpoint.manager import _keep_unstepped_stateless
+
+        groups = [{"params": ["a.weight", "b.weight"]}, {"params": ["a.bias"]}]
+        held = {"param_groups": groups, "state": {"a.weight": {"step": 1}}}
+        _keep_unstepped_stateless(held, {"b.weight", "a.bias"}, Path("ckpt"))
+        assert held["state"] == {"a.weight": {"step": 1}, "b.weight": {}, "a.bias": {}}
+
+        unheld = {"param_groups": groups + [{"params": [0, 1]}], "state": {}}
+        message = "for 2 trainable parameters the saved optimizer did not hold: ['c', 'd']"
+        with pytest.raises(RuntimeError, match=re.escape(message)):
+            _keep_unstepped_stateless(unheld, {"b.weight", "c", "d"}, Path("ckpt"))
+        assert unheld["state"] == {}
 
 
 # ---------------------------------------------------------------------------

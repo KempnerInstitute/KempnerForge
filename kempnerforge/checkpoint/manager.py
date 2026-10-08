@@ -99,8 +99,9 @@ class _UnsteppedOptimizerStatePlanner(DefaultLoadPlanner):
 
     A fresh optimizer's template has state for every trainable parameter, but a
     checkpoint has none for parameters that had not received a gradient when it
-    was saved. Those parameters are dropped from the load and recorded in
-    ``unstepped``; every other key stays required.
+    was saved. Parameters with no saved state at all are dropped from the load and
+    recorded in ``unstepped`` for the caller to confirm against the saved
+    ``param_groups``; every other key stays required.
     """
 
     def __init__(self) -> None:
@@ -120,6 +121,25 @@ class _UnsteppedOptimizerStatePlanner(DefaultLoadPlanner):
             for fqn in self.unstepped:
                 del optim_state["state"][fqn]
         super().set_up_planner(state_dict, metadata, is_coordinator)
+
+
+def _keep_unstepped_stateless(
+    optim_state: dict[str, Any], unstepped: set[str], where: Path
+) -> None:
+    """Give never-stepped parameters empty optimizer state once the saved optimizer lists them.
+
+    ``optim_state`` holds the loaded ``param_groups``, which list every parameter the saved
+    optimizer held, stepped or not. A parameter without saved state that they do not list was
+    never part of that optimizer, so the load fails instead of guessing its state.
+    """
+    held = {fqn for group in optim_state["param_groups"] for fqn in group["params"]}
+    unheld = sorted(unstepped - held)
+    if unheld:
+        raise RuntimeError(
+            f"Missing optimizer state in {where} for {len(unheld)} trainable parameters "
+            f"the saved optimizer did not hold: {unheld[:8]}"
+        )
+    optim_state["state"].update({fqn: {} for fqn in unstepped})
 
 
 def _load_train_state(path: Path) -> dict[str, Any]:
@@ -541,18 +561,19 @@ class CheckpointManager:
                 planner=planner,
             )
 
+            if load_optim:
+                optim_state = cast("dict[str, Any]", dcp_state["optimizer"])
+                _keep_unstepped_stateless(optim_state, planner.unstepped, dcp_dir)
             if load_model:
                 set_model_state_dict(self.model, dcp_state["model"])
             if load_optim:
-                param_states = cast("dict[str, Any]", dcp_state["optimizer"]["state"])
-                param_states.update({fqn: {} for fqn in planner.unstepped})
                 set_optimizer_state_dict(
                     self.model, self.optimizer, optim_state_dict=dcp_state["optimizer"]
                 )
             if planner.unstepped:
                 logger.info(
-                    f"{len(planner.unstepped)} parameters had no optimizer state when saved "
-                    f"and resume without it: {sorted(planner.unstepped)[:8]}"
+                    f"{len(planner.unstepped)} parameters the saved optimizer held were never "
+                    f"stepped and resume without state: {sorted(planner.unstepped)[:8]}"
                 )
 
         # Load non-distributed state. On NFS/Lustre, independent stat()
