@@ -79,7 +79,16 @@ uv run torchrun --nproc_per_node=4 examples/vlm/train.py \
 
 The first run loads the converted weights only (`exclude_from_loading =
 ["optimizer"]`); a resume from `[checkpoint].dir` restores the full training
-state. For a short shakedown, add `--train.max_steps=20 --video.max_samples=512`.
+state. A finished run also saves its last step to `[checkpoint].dir`, so run a
+shakedown in a directory of its own, with a short warmup so the loss moves
+within its 20 steps:
+
+```bash
+uv run torchrun --nproc_per_node=4 examples/vlm/train.py \
+    examples/vlm/configs/vlm_qwen3_0.6b_joint_decoder_webvid.toml \
+    --train.max_steps=20 --video.max_samples=512 --scheduler.warmup_steps=5 \
+    --checkpoint.dir=path-to-shakedown-dir
+```
 
 ## Data prep
 
