@@ -135,6 +135,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Resume no longer fails when a trainable parameter never received a gradient**: such a parameter has no saved optimizer state and resumes without it; every other optimizer key is still required.
 - **`checkpoint.exclude_from_loading` is now honoured on a `load_path` warm start** (ignored on a resume); keys other than `"model"`/`"optimizer"` are rejected.
 - **Sequence packing is now rejected under pipeline parallelism** instead of silently training on cross-document context. `PipelineStageModule.forward` receives only hidden states and `pipeline_step` never read `batch["doc_ids"]`, so with `pp > 1` and `data.pack_sequences = true` the packed documents attended across each other while the labels still masked the boundary positions -- the loss looked correct while attention leaked, which is why it went unnoticed. `JobConfig.validate` now raises. Packing without PP and PP without packing are both unchanged; no shipped config sets `pack_sequences`, so no existing run is affected.
   - `kempnerforge/config/job.py` (+ `tests/unit/test_config.py`).

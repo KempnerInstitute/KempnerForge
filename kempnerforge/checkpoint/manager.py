@@ -14,12 +14,15 @@ import logging
 import os
 import shutil
 import stat
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, cast
 
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
+from torch.distributed.checkpoint import DefaultLoadPlanner
+from torch.distributed.checkpoint.metadata import STATE_DICT_TYPE, Metadata
 from torch.distributed.checkpoint.state_dict import (
     get_model_state_dict,
     get_optimizer_state_dict,
@@ -39,6 +42,8 @@ _METADATA_FILE = "metadata.json"
 # DCP writes this file LAST, once all shards are durable. Its presence is the
 # authoritative signal that a checkpoint's distributed state is loadable.
 _DCP_METADATA_FILE = ".metadata"
+# Key prefix of per-parameter optimizer state in a checkpoint saved by this manager.
+_OPTIM_STATE_PREFIX = "optimizer.state."
 
 
 def _intersect_freeze_meta_by_module(
@@ -70,6 +75,51 @@ def _intersect_freeze_meta_by_module(
         [e for e in saved if e["module"] in shared],
         [e for e in expected if e["module"] in shared],
     )
+
+
+def _params_without_saved_state(fqns: set[str], saved_keys: Iterable[str]) -> set[str]:
+    """Return the parameters in ``fqns`` with no optimizer state among ``saved_keys``.
+
+    A checkpoint holds optimizer state only for parameters that had received a
+    gradient when it was saved. Each saved state key counts toward the longest
+    parameter name it starts with, so a state of any layout marks its parameter.
+    """
+    with_state: set[str] = set()
+    for key in saved_keys:
+        if key.startswith(_OPTIM_STATE_PREFIX):
+            name = key.removeprefix(_OPTIM_STATE_PREFIX)
+            while name not in fqns and "." in name:
+                name = name.rsplit(".", 1)[0]
+            with_state.add(name)
+    return fqns - with_state
+
+
+class _UnsteppedOptimizerStatePlanner(DefaultLoadPlanner):
+    """Load planner that leaves out the optimizer state of never-stepped parameters.
+
+    A fresh optimizer's template has state for every trainable parameter, but a
+    checkpoint has none for parameters that had not received a gradient when it
+    was saved. Those parameters are dropped from the load and recorded in
+    ``unstepped``; every other key stays required.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.unstepped: set[str] = set()
+
+    def set_up_planner(
+        self,
+        state_dict: STATE_DICT_TYPE,
+        metadata: Metadata | None = None,
+        is_coordinator: bool = False,
+    ) -> None:
+        optim_state = state_dict.get("optimizer")
+        if optim_state is not None and metadata is not None:
+            fqns = set(optim_state["state"])
+            self.unstepped = _params_without_saved_state(fqns, metadata.state_dict_metadata)
+            for fqn in self.unstepped:
+                del optim_state["state"][fqn]
+        super().set_up_planner(state_dict, metadata, is_coordinator)
 
 
 def _load_train_state(path: Path) -> dict[str, Any]:
@@ -483,13 +533,25 @@ class CheckpointManager:
             dcp_state["optimizer"] = get_optimizer_state_dict(self.model, self.optimizer)
 
         if dcp_state:
-            dcp.load(dcp_state, checkpoint_id=str(dcp_dir), process_group=self._process_group)
+            planner = _UnsteppedOptimizerStatePlanner()
+            dcp.load(
+                dcp_state,
+                checkpoint_id=str(dcp_dir),
+                process_group=self._process_group,
+                planner=planner,
+            )
 
             if load_model:
                 set_model_state_dict(self.model, dcp_state["model"])
             if load_optim:
+                dcp_state["optimizer"]["state"].update({fqn: {} for fqn in planner.unstepped})
                 set_optimizer_state_dict(
                     self.model, self.optimizer, optim_state_dict=dcp_state["optimizer"]
+                )
+            if planner.unstepped:
+                logger.info(
+                    f"{len(planner.unstepped)} parameters had no optimizer state when saved "
+                    f"and resume without it: {sorted(planner.unstepped)[:8]}"
                 )
 
         # Load non-distributed state. On NFS/Lustre, independent stat()

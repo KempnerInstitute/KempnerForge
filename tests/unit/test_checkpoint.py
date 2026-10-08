@@ -1242,6 +1242,119 @@ class TestCheckpointManagerLoad:
             assert torch.equal(rev, lev), "exp_avg_sq not restored"
 
 
+class _UsedAndUnused(torch.nn.Module):
+    """``unused`` is trainable but never reaches the loss, so it is never stepped."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.used = torch.nn.Linear(4, 4)
+        self.unused = torch.nn.Linear(4, 4)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.used(x)
+
+
+class TestResumeWithUnsteppedParameters:
+    """A checkpoint holds optimizer state only for parameters that were stepped."""
+
+    @staticmethod
+    def _build(seed, ckpt_dir):
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        torch.manual_seed(seed)
+        model = _UsedAndUnused()
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-2)
+        manager = CheckpointManager(CheckpointConfig(dir=str(ckpt_dir)), model, optimizer)
+        return model, optimizer, manager
+
+    @staticmethod
+    def _step(model, optimizer, seed):
+        x = torch.randn(3, 4, generator=torch.Generator().manual_seed(seed))
+        model(x).pow(2).sum().backward()
+        optimizer.step()
+        optimizer.zero_grad()
+
+    @staticmethod
+    def _assert_same_run(model, optimizer, model2, optimizer2):
+        for (name, p), p2 in zip(model.named_parameters(), model2.parameters(), strict=True):
+            assert torch.equal(p, p2), name
+            state, state2 = optimizer.state.get(p, {}), optimizer2.state.get(p2, {})
+            assert state.keys() == state2.keys(), name
+            assert bool(state2) is name.startswith("used."), name
+            for key in state:
+                assert torch.equal(state[key], state2[key]), f"{name}.{key}"
+
+    def test_resume_leaves_never_stepped_parameters_stateless(self, tmp_path):
+        import logging
+
+        model, optimizer, manager = self._build(0, tmp_path)
+        self._step(model, optimizer, 1)
+        manager.save(step=1)
+
+        records: list[logging.LogRecord] = []
+
+        class _Capture(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                records.append(record)
+
+        mgr_logger = logging.getLogger("kempnerforge.checkpoint.manager")
+        handler, prior_level = _Capture(level=logging.INFO), mgr_logger.level
+        mgr_logger.addHandler(handler)
+        mgr_logger.setLevel(logging.INFO)
+        try:
+            model2, optimizer2, manager2 = self._build(1, tmp_path)
+            assert manager2.load() == (1, 0, {})
+        finally:
+            mgr_logger.removeHandler(handler)
+            mgr_logger.setLevel(prior_level)
+
+        self._assert_same_run(model, optimizer, model2, optimizer2)
+        assert [r.getMessage() for r in records if "no optimizer state" in r.getMessage()] == [
+            "2 parameters had no optimizer state when saved and resume without it: "
+            "['unused.bias', 'unused.weight']"
+        ]
+
+    def test_resumed_steps_match_the_uninterrupted_run(self, tmp_path):
+        model, optimizer, manager = self._build(0, tmp_path)
+        self._step(model, optimizer, 1)
+        manager.save(step=1)
+        self._step(model, optimizer, 2)
+        self._step(model, optimizer, 3)
+
+        model2, optimizer2, manager2 = self._build(1, tmp_path)
+        manager2.load()
+        self._step(model2, optimizer2, 2)
+        self._step(model2, optimizer2, 3)
+        self._assert_same_run(model, optimizer, model2, optimizer2)
+
+    def test_a_stepped_parameter_missing_part_of_its_state_still_fails(self, tmp_path):
+        import pytest
+        from torch.distributed.checkpoint.api import CheckpointException
+
+        model, optimizer, manager = self._build(0, tmp_path)
+        self._step(model, optimizer, 1)
+        del optimizer.state[model.used.weight]["exp_avg_sq"]
+        manager.save(step=1)
+
+        _, _, manager2 = self._build(1, tmp_path)
+        missing = r"Missing key in checkpoint state_dict: optimizer\.state\.used\.weight\."
+        with pytest.raises(CheckpointException, match=missing + "exp_avg_sq"):
+            manager2.load()
+
+    def test_saved_state_counts_toward_whole_parameter_names(self):
+        from kempnerforge.checkpoint.manager import _params_without_saved_state
+
+        fqns = {"a.weight", "a.weight_scale", "b.bias", "c.weight"}
+        saved_keys = [
+            "model.c.weight",
+            "optimizer.param_groups.0.lr",
+            "optimizer.state.a.weight.step",
+            "optimizer.state.b.bias.nested.moment",
+            "optimizer.state.gone.weight.step",
+        ]
+        assert _params_without_saved_state(fqns, saved_keys) == {"a.weight_scale", "c.weight"}
+
+
 # ---------------------------------------------------------------------------
 # Resume with a different component build (config `plugins` changed)
 # ---------------------------------------------------------------------------
