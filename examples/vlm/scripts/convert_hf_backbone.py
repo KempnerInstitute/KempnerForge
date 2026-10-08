@@ -11,7 +11,7 @@ Nothing is written unless the target config matches the source's own
 ``config.json``, every source weight maps onto the transformer with the right
 shape, and every transformer weight is filled. Initialisation is seeded
 (``--seed``, default ``[train].seed``), so the same inputs always produce the
-same checkpoint.
+same weights.
 
 Usage:
     uv run python examples/vlm/scripts/convert_hf_backbone.py \\
@@ -128,24 +128,32 @@ def check_config(hf_config: dict[str, Any], model: ModelConfig) -> None:
         raise ValueError("target config does not match the source:\n  " + "\n  ".join(problems))
 
 
-def resolve_source(hf_dir: str) -> Path:
-    """A local model directory as given, else a Hub model id fetched (or read from cache)."""
+def resolve_source(hf_dir: str, pattern: str) -> Path:
+    """The local model directory ``hf_dir``, or the snapshot of Hub id ``hf_dir`` with its
+    top-level files matching ``pattern`` fetched (or read from the cache)."""
     path = Path(hf_dir)
     if path.is_dir():
         return path
     from huggingface_hub import snapshot_download
 
-    logger.info("Fetching %s from the Hugging Face Hub", hf_dir)
-    return Path(snapshot_download(repo_id=hf_dir, allow_patterns=["config.json", "*.safetensors"]))
+    logger.info("Fetching %s of %s from the Hugging Face Hub", pattern, hf_dir)
+    return Path(
+        snapshot_download(repo_id=hf_dir, allow_patterns=[pattern], ignore_patterns=["*/*"])
+    )
 
 
-def load_source(source: Path) -> tuple[dict[str, Any], dict[str, torch.Tensor]]:
-    """Read ``config.json`` and every ``*.safetensors`` file in ``source``."""
-    from safetensors.torch import load_file
-
+def load_source_config(source: Path) -> dict[str, Any]:
+    """Read ``config.json`` in ``source``."""
     config_file = source / "config.json"
     if not config_file.is_file():
         raise FileNotFoundError(f"no config.json in {source}")
+    return json.loads(config_file.read_text())
+
+
+def load_source_weights(source: Path) -> dict[str, torch.Tensor]:
+    """Read every top-level ``*.safetensors`` file in ``source``."""
+    from safetensors.torch import load_file
+
     files = sorted(source.glob("*.safetensors"))
     if not files:
         raise FileNotFoundError(f"no *.safetensors weights in {source}")
@@ -156,7 +164,7 @@ def load_source(source: Path) -> tuple[dict[str, Any], dict[str, torch.Tensor]]:
         if repeated:
             raise ValueError(f"{file.name} repeats keys from another file: {sorted(repeated)[:5]}")
         state.update(part)
-    return json.loads(config_file.read_text()), state
+    return state
 
 
 def map_state_dict(
@@ -198,11 +206,11 @@ def convert(hf_dir: str, config_path: str, out: str, seed: int | None = None) ->
     if out_path.exists() and (not out_path.is_dir() or any(out_path.iterdir())):
         raise FileExistsError(f"{out_path} already exists and is not an empty directory")
 
-    source = resolve_source(hf_dir)
+    source = resolve_source(hf_dir, "config.json")
     if source.resolve() in (out_path.resolve(), *out_path.resolve().parents):
         raise ValueError(f"refusing to write inside the source model directory {source.resolve()}")
-    hf_config, hf_state = load_source(source)
-    check_config(hf_config, config.model)
+    check_config(load_source_config(source), config.model)
+    hf_state = load_source_weights(resolve_source(hf_dir, "*.safetensors"))
     converted = map_state_dict(hf_state, config.model.tie_embeddings)
 
     seed = config.train.seed if seed is None else seed

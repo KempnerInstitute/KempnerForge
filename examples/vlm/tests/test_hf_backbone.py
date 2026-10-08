@@ -76,11 +76,15 @@ def _save_source(path: Path, *, tie: bool) -> Any:
 def _toml(value: Any) -> str:
     if isinstance(value, bool):
         return "true" if value else "false"
-    return json.dumps(value) if isinstance(value, str) else repr(value)
+    return json.dumps(value) if isinstance(value, (str, list)) else repr(value)
 
 
 def _target(
-    tmp_path: Path, *, model: dict[str, Any] | None = None, vlm: dict[str, Any] | None = None
+    tmp_path: Path,
+    *,
+    model: dict[str, Any] | None = None,
+    vlm: dict[str, Any] | None = None,
+    checkpoint: dict[str, Any] | None = None,
 ) -> str:
     """Write a tiny VLM config over ``TARGET_MODEL``; ``vlm={}`` drops the VLM sections."""
     sections: dict[str, dict[str, Any]] = {"model": {**TARGET_MODEL, **(model or {})}}
@@ -88,7 +92,7 @@ def _target(
         sections["vision_encoder"] = {"type": "random", "num_tokens": 4, "feature_dim": 32}
         sections["vlm"] = {"arch": "joint_decoder", "max_text_len": 32, **(vlm or {})}
     sections["train"] = {"seq_len": 64, "seed": 7}
-    sections["checkpoint"] = {"dir": str(tmp_path / "run")}
+    sections["checkpoint"] = {"dir": str(tmp_path / "run"), **(checkpoint or {})}
     path = tmp_path / "target.toml"
     path.write_text(
         "\n".join(
@@ -239,9 +243,60 @@ class TestRoundTrip:
         monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_snapshot_download)
         out = conv.convert("some-org/some-model", _target(tmp_path), str(tmp_path / "out"))
         assert calls == [
-            {"repo_id": "some-org/some-model", "allow_patterns": ["config.json", "*.safetensors"]}
+            {"repo_id": "some-org/some-model", "allow_patterns": [p], "ignore_patterns": ["*/*"]}
+            for p in ("config.json", "*.safetensors")
         ]
         assert (out / ".metadata").is_file()
+
+    def test_hub_config_is_checked_before_any_weights_are_fetched(
+        self, tied: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import huggingface_hub
+
+        patterns: list[list[str]] = []
+
+        def fake_snapshot_download(**kwargs: Any) -> str:
+            patterns.append(kwargs["allow_patterns"])
+            return str(tied)
+
+        monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_snapshot_download)
+        config = _target(tmp_path, model={"rope_theta": 1e4})
+        with pytest.raises(ValueError, match="rope_theta"):
+            conv.convert("some-org/some-model", config, str(tmp_path / "out"))
+        assert patterns == [["config.json"]]
+
+    def test_weights_in_subfolders_are_ignored(self, tied_copy: Path, tmp_path: Path) -> None:
+        (tied_copy / "sub").mkdir()
+        save_file({"model.norm.weight": torch.zeros(64)}, tied_copy / "sub" / "x.safetensors")
+        out = conv.convert(str(tied_copy), _target(tmp_path), str(tmp_path / "out"))
+        assert not torch.equal(_read_dcp(out)["model.transformer.norm.weight"], torch.zeros(64))
+
+    def test_warm_start_from_the_config_restores_the_converted_checkpoint(
+        self, tied: Path, tmp_path: Path
+    ) -> None:
+        """The README path: ``load_path`` plus ``exclude_from_loading = ["optimizer"]``."""
+        from kempnerforge.training.entry import restore_checkpoint
+
+        out = tmp_path / "init"
+        warm = {"load_path": str(out), "exclude_from_loading": ["optimizer"]}
+        config_path = _target(tmp_path, checkpoint=warm)
+        conv.convert(str(tied), config_path, str(out))
+
+        config = load_config(config_path, cli_args=[])
+        assert config.vlm is not None and config.vision_encoder is not None
+        assert config.adapter is not None
+        torch.manual_seed(1234)
+        model = build_vlm_wrapper(config.model, config.vision_encoder, config.adapter, config.vlm)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        manager = CheckpointManager(config.checkpoint, model, optimizer)
+        assert restore_checkpoint(config, model, None, manager) == (0, 0)
+
+        saved = _read_dcp(out)
+        state = model.state_dict()
+        assert {f"model.{key}" for key in state} == set(saved)
+        for key, tensor in state.items():
+            assert torch.equal(tensor, saved[f"model.{key}"]), key
+        assert not optimizer.state
 
 
 class TestConfigRefusals:
@@ -252,6 +307,10 @@ class TestConfigRefusals:
             ({"norm_eps": 1e-6}, ["rms_norm_eps=1e-05 but model.norm_eps=1e-06"]),
             ({"n_layers": 3}, ["num_hidden_layers=2 but model.n_layers=3"]),
             ({"n_kv_heads": 4}, ["num_key_value_heads=2 but model.n_kv_heads=4"]),
+            (
+                {"n_heads": 8},
+                ["num_attention_heads=4 but model.n_heads=8", "head_dim=16 but model.head_dim=8"],
+            ),
             (
                 {"ffn_hidden_dim": 128},
                 ["intermediate_size=96 but model.computed_ffn_hidden_dim=128"],
@@ -275,6 +334,7 @@ class TestConfigRefusals:
             "norm_eps",
             "n_layers",
             "n_kv_heads",
+            "n_heads",
             "ffn_hidden_dim",
             "vocab_size",
             "dim",
@@ -301,7 +361,10 @@ class TestConfigRefusals:
     @pytest.mark.parametrize(
         ("edit", "match"),
         [
-            (lambda c: c.update(model_type="llama"), "model_type 'llama' is not supported"),
+            (
+                lambda c: c.update(model_type="unsupported"),
+                "model_type 'unsupported' is not supported",
+            ),
             (lambda c: c.pop("head_dim"), "config.json has no head_dim"),
             (
                 lambda c: c["rope_parameters"].update(rope_type="yarn"),

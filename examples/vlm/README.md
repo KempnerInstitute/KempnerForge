@@ -83,7 +83,7 @@ The script writes nothing when the config disagrees with the source's
 weight has no counterpart or the wrong shape, or when `--out` is non-empty or
 inside the source. The source's `model_type` must be one the script supports
 (`SUPPORTED_MODEL_TYPES`). `--seed` (default `[train].seed`) seeds every freshly
-initialised weight, so a rerun writes an identical checkpoint.
+initialised weight, so a rerun writes identical weights.
 
 ## Evaluation
 
