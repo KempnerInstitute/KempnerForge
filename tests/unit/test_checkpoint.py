@@ -1344,15 +1344,16 @@ class TestResumeWithUnsteppedParameters:
     def test_saved_state_counts_toward_whole_parameter_names(self):
         from kempnerforge.checkpoint.manager import _params_without_saved_state
 
-        fqns = {"a.weight", "a.weight_scale", "b.bias", "c.weight"}
+        fqns = {"a.weight", "a.weight_scale", "b.bias", "c.weight", "model.c"}
         saved_keys = [
-            "model.c.weight",
+            "model.c.weight",  # a model entry, not the state of the parameter "model.c"
             "optimizer.param_groups.0.lr",
             "optimizer.state.a.weight.step",
             "optimizer.state.b.bias.nested.moment",
             "optimizer.state.gone.weight.step",
         ]
-        assert _params_without_saved_state(fqns, saved_keys) == {"a.weight_scale", "c.weight"}
+        unstepped = _params_without_saved_state(fqns, saved_keys)
+        assert unstepped == {"a.weight_scale", "c.weight", "model.c"}
 
 
 # ---------------------------------------------------------------------------
