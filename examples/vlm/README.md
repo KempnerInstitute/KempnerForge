@@ -77,6 +77,10 @@ uv run torchrun --nproc_per_node=4 examples/vlm/train.py \
     examples/vlm/configs/vlm_qwen3_0.6b_joint_decoder_webvid.toml
 ```
 
+The config targets 16 GPUs at a global batch of 256, and `batch_size = 16`
+takes about 100 GB per GPU; on 4 GPUs, add `--train.grad_accum_steps=4` to keep
+the global batch.
+
 The first run loads the converted weights only (`exclude_from_loading =
 ["optimizer"]`); a resume from `[checkpoint].dir` restores the full training
 state. A finished run also saves its last step to `[checkpoint].dir`, so run a
