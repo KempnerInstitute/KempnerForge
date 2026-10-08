@@ -345,6 +345,25 @@ class TestCheckpointConfig:
         with pytest.raises(ValueError, match="interval must be positive"):
             CheckpointConfig(interval=0)
 
+    @pytest.mark.parametrize("keys", [[], ["model"], ["optimizer"], ["model", "optimizer"]])
+    def test_exclude_from_loading_accepts_the_two_state_keys(self, keys):
+        assert CheckpointConfig(exclude_from_loading=keys).exclude_from_loading == keys
+
+    @pytest.mark.parametrize(
+        "keys",
+        [["lm_head"], ["Optimizer"], ["optimizer", "scheduler"], "optimizer", ["model", 3]],
+    )
+    def test_exclude_from_loading_rejects_anything_else(self, keys):
+        """Anything else would be a silent no-op in CheckpointManager.load."""
+        with pytest.raises(ValueError, match="exclude_from_loading"):
+            CheckpointConfig(exclude_from_loading=keys)  # type: ignore[arg-type]
+
+    def test_exclude_from_loading_is_validated_from_toml(self, tmp_path):
+        toml = tmp_path / "ckpt.toml"
+        toml.write_text('[checkpoint]\nexclude_from_loading = ["lm_head"]\n')
+        with pytest.raises(ValueError, match="exclude_from_loading"):
+            load_config(str(toml), cli_args=[])
+
     def test_dyn_ckpt_window_defaults_to_none(self):
         # Opt-in: no dyn_ckpt_window means pure interval cadence.
         assert CheckpointConfig().dyn_ckpt_window is None
@@ -1464,6 +1483,16 @@ class TestModelConfigHeadDim:
     def test_negative_override_is_rejected_at_config_time(self):
         with pytest.raises(ValueError, match="head_dim_override must be non-negative"):
             ModelConfig(dim=64, n_layers=2, n_heads=8, head_dim_override=-1, vocab_size=32)
+
+    @pytest.mark.parametrize("odd", [1, 7, 97])
+    def test_odd_override_is_rejected_at_config_time(self, odd):
+        with pytest.raises(ValueError, match=rf"must be even for rotary embeddings \(got {odd}\)"):
+            ModelConfig(dim=64, n_layers=2, n_heads=8, head_dim_override=odd, vocab_size=32)
+
+    @pytest.mark.parametrize(("override", "expected"), [(0, 8), (2, 2), (8, 8), (96, 96)])
+    def test_even_override_is_accepted_and_zero_infers(self, override, expected):
+        cfg = ModelConfig(dim=64, n_layers=2, n_heads=8, head_dim_override=override, vocab_size=32)
+        assert cfg.head_dim == expected
 
     @pytest.mark.parametrize("override", [0, 8, 128])
     def test_round_trip_through_asdict_is_stable(self, override):

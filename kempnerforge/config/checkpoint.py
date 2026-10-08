@@ -69,6 +69,7 @@ class CheckpointConfig:
     keep_last_n: int = 3  # recent ckpts kept (<=0 keeps all); dynamic milestones always kept
     load_path: str | None = None  # Path to load from (for resumption)
     export_dtype: Literal["float32", "bfloat16"] = "bfloat16"
+    # "model"/"optimizer" to skip on a load_path warm start (never on a resume)
     exclude_from_loading: list[str] = field(default_factory=list)
     # If the saved checkpoint's VLM freeze metadata differs from the current
     # config's freeze specs, the load path raises by default. Setting this
@@ -79,6 +80,13 @@ class CheckpointConfig:
     def __post_init__(self) -> None:
         if self.interval <= 0:
             raise ValueError("interval must be positive")
+        if not isinstance(self.exclude_from_loading, list) or any(
+            k not in ("model", "optimizer") for k in self.exclude_from_loading
+        ):
+            raise ValueError(
+                "exclude_from_loading accepts only 'model' and/or 'optimizer' "
+                f"(got {self.exclude_from_loading!r})"
+            )
 
     def should_save(self, step: int) -> bool:
         """Whether to write a checkpoint at ``step``.
