@@ -272,6 +272,19 @@ def _write_audio_first_clip(path, n_frames: int, fps: int, video_start_s: float)
                 container.mux(packet)
 
 
+def _end_edit_list_at(src, dst, end_s: float) -> None:
+    """Copy an MP4 whose edit list holds one edit, ending that edit at ``end_s``."""
+    import struct
+
+    data = bytearray(src.read_bytes())
+    elst, mvhd = data.index(b"elst"), data.index(b"mvhd")
+    assert data[elst + 4] == 0 and struct.unpack_from(">I", data, elst + 8)[0] == 1
+    assert data[mvhd + 4] == 0  # version 0: the movie timescale follows two 32-bit times
+    timescale = struct.unpack_from(">I", data, mvhd + 16)[0]
+    struct.pack_into(">I", data, elst + 12, round(end_s * timescale))
+    dst.write_bytes(bytes(data))
+
+
 def _first_frame_time(path) -> float | None:
     """Presentation time of the first decoded frame (``None`` without a timestamp)."""
     import av
@@ -583,6 +596,74 @@ class TestVideoExtent:
         assert counted_open["opens"] == 1
         assert counted_open["seeks"] == 1
         assert counted_open["packets"] <= 30
+
+    def test_stream_within_the_first_reordered_packets(self, tmp_path):
+        """A one-frame clip ends before the start is settled: that read is the whole stream."""
+        from kempnerforge.data.video_io import _video_extent
+
+        path = tmp_path / "frame.mp4"
+        _write_indexed_clip(path, n_frames=1, fps=10)
+        assert _video_extent(str(path)) == pytest.approx((0.0, 0.1))
+
+    def test_one_frame_last_group(self, tmp_path):
+        """Intra-only FLV: the end read holds only the last frame."""
+        from kempnerforge.data.video_io import _video_extent
+
+        path = tmp_path / "intra.flv"
+        _write_indexed_clip(path, n_frames=20, fps=10, codec="flv", codec_options={"g": "1"})
+        assert _video_extent(str(path)) == pytest.approx((0.0, 2.0))
+
+    def test_one_end_packet_without_duration_takes_the_step_from_the_start(self, monkeypatch):
+        """When the end read is one packet without a duration, the step between the packets
+        read at the start stands in for it; the start read keeps two packets for that."""
+        from fractions import Fraction
+        from types import SimpleNamespace
+
+        import av
+
+        from kempnerforge.data.video_io import _video_extent
+
+        def packet(i):
+            return SimpleNamespace(
+                pts=i, dts=i, duration=0, is_keyframe=i in (0, 9), is_discard=False
+            )
+
+        class _Container:
+            size = 1000
+            streams = SimpleNamespace(video=[SimpleNamespace(time_base=Fraction(1, 10))])
+
+            def __init__(self):
+                self.packets = [packet(i) for i in range(10)]
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def demux(self, stream):
+                return iter(self.packets)
+
+            def seek(self, offset, stream):
+                self.packets = self.packets[9:]  # the last keyframe group: one packet
+
+        monkeypatch.setattr(av, "open", lambda path: _Container())
+        assert _video_extent("clip") == pytest.approx((0.0, 1.0))
+
+    @pytest.mark.parametrize(
+        ("end_s", "span_s", "indices"), [(1.5, 1.5, [0, 5, 10, 14]), (0.95, 1.0, [0, 4, 7, 9])]
+    )
+    def test_frames_past_the_edit_list_end_are_not_shown(self, tmp_path, end_s, span_s, indices):
+        """An MP4 edit list that ends early leaves the later frames decode-only: the span
+        ends with the last shown frame, also when the last keyframe lies past the edit."""
+        from kempnerforge.data.video_io import _video_extent
+
+        src = tmp_path / "src.mp4"
+        _write_indexed_clip(src, n_frames=20, fps=10, codec_options={"bf": "2", "g": "10"})
+        clip = tmp_path / "trimmed.mp4"
+        _end_edit_list_at(src, clip, end_s)
+        assert _video_extent(str(clip)) == pytest.approx((0.0, span_s))
+        assert _indices(clip) == indices
 
     @pytest.mark.parametrize("suffix", ["ts", "mpg"])
     def test_landing_off_a_keyframe_reads_every_packet(self, tmp_path, counted_open, suffix):
