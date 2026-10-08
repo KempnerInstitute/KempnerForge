@@ -386,11 +386,11 @@ class TestTransformer:
 
 
 # ---------------------------------------------------------------------------
-# norm_eps on every norm of every model path
+# norm_eps on every norm of the text, VLM-arch and first-pipeline-stage models
 # ---------------------------------------------------------------------------
 
 
-_EPS = 1e-6
+_EPS_VALUES = (1e-6, 1e-3)  # neither is the 1e-5 default the norms used to fall back to
 _N_IMAGE = 4
 # Norms in each two-layer model: per layer the attention/MLP pre-norms and the q/k norms,
 # plus the final norm; two more per cross-attention block; MoT keeps a copy per modality
@@ -405,11 +405,11 @@ _NORM_COUNTS = {
 }
 
 
-def _norm_eps_model(arch: str) -> torch.nn.Module:
-    """Two-layer qk_norm model with a non-default ``norm_eps``.
+def _norm_eps_model(arch: str, eps: float) -> torch.nn.Module:
+    """Two-layer qk_norm model with ``norm_eps=eps``; ``pp_stage`` is the first of two stages.
 
-    The small ``init_std`` keeps every norm's input near the eps scale, where
-    1e-6 and 1e-5 give clearly different norm outputs.
+    The small ``init_std`` keeps every norm's input near the eps scale, where the tested
+    eps values and the 1e-5 default give clearly different norm outputs.
     """
     from kempnerforge.config.vlm import (
         CrossAttentionConfig,
@@ -428,7 +428,7 @@ def _norm_eps_model(arch: str) -> torch.nn.Module:
         max_seq_len=32,
         ffn_hidden_dim=128,
         qk_norm=True,
-        norm_eps=_EPS,
+        norm_eps=eps,
         init_std=1e-3,
     )
     if arch == "pp_stage":
@@ -473,17 +473,19 @@ def _norms(model: torch.nn.Module) -> dict[str, torch.nn.Module]:
 
 
 class TestNormEps:
-    """Every norm on every model path uses ``model.norm_eps``."""
+    """Every norm of the text, VLM-arch and first-pipeline-stage models uses ``model.norm_eps``."""
 
+    @pytest.mark.parametrize("eps", _EPS_VALUES)
     @pytest.mark.parametrize("arch", list(_NORM_COUNTS))
-    def test_every_norm_uses_norm_eps(self, arch):
-        norms = _norms(_norm_eps_model(arch))
+    def test_every_norm_uses_norm_eps(self, arch, eps):
+        norms = _norms(_norm_eps_model(arch, eps))
         assert len(norms) == _NORM_COUNTS[arch]
-        assert {name: norm.eps for name, norm in norms.items()} == dict.fromkeys(norms, _EPS)
+        assert {name: norm.eps for name, norm in norms.items()} == dict.fromkeys(norms, eps)
 
+    @pytest.mark.parametrize("eps", _EPS_VALUES)
     @pytest.mark.parametrize("arch", list(_NORM_COUNTS))
-    def test_norm_output_matches_reference_rmsnorm(self, arch):
-        model = _norm_eps_model(arch).to(DEVICE).eval()
+    def test_norm_output_matches_reference_rmsnorm(self, arch, eps):
+        model = _norm_eps_model(arch, eps).to(DEVICE).eval()
         calls = []
         for norm in _norms(model).values():
             norm.register_forward_hook(lambda m, args, out: calls.append((m.weight, args[0], out)))
@@ -492,7 +494,7 @@ class TestNormEps:
         # MoT's shared final norm is unused; its per-modality final norms run instead
         assert len(calls) == _NORM_COUNTS[arch] - (1 if arch == "mot" else 0)
         for weight, x, out in calls:
-            ref = F.rms_norm(x, (x.shape[-1],), weight, eps=_EPS)
+            ref = F.rms_norm(x, (x.shape[-1],), weight, eps=eps)
             old = F.rms_norm(x, (x.shape[-1],), weight, eps=1e-5)
             assert (ref - old).abs().max() > 1e-2  # eps matters at this input scale
             torch.testing.assert_close(out, ref)
