@@ -194,3 +194,107 @@ class TestPipelineScheduleConfig:
         assert PipelineSchedule.schedule_1f1b == "1f1b"
         assert PipelineSchedule.gpipe == "gpipe"
         assert PipelineSchedule.interleaved_1f1b == "interleaved_1f1b"
+
+
+# ---------------------------------------------------------------------------
+# Sequence packing across stages
+# ---------------------------------------------------------------------------
+
+
+class TestStageModuleDocIds:
+    """``doc_ids`` reaches stages as a schedule kwarg, never as a pipe activation.
+
+    A schedule splits kwargs into micro-batches exactly as it splits args, but
+    hands them to every stage directly instead of transmitting them between
+    stages. That distinction is load-bearing: ``PipelineStage`` calls
+    ``requires_grad_(True)`` on every *received* buffer without checking dtype,
+    so an integer tensor on the pipe raises as soon as a backward pass exists.
+
+    The end-to-end assertions -- forward parity against a single GPU, and a real
+    training step -- need live ranks and live in ``tests/distributed/test_pp.py``.
+
+    FlexAttention has no CPU backward in torch 2.11 and raises as soon as an
+    input requires grad, so the flex cases run under ``torch.no_grad()``, the
+    same constraint ``tests/unit/test_packing.py`` works under.
+    """
+
+    @staticmethod
+    def _doc_ids(batch: int, seq_len: int) -> torch.Tensor:
+        """Two documents per row, split down the middle."""
+        half = seq_len // 2
+        return torch.tensor([[0] * half + [1] * (seq_len - half)] * batch)
+
+    @pytest.mark.parametrize("stage_id,layers", [(0, (0, 4)), (1, (4, 8))], ids=["first", "last"])
+    def test_forward_returns_a_bare_tensor(self, small_config, stage_id, layers):
+        """Nothing rides the pipe but the hidden states -- with or without doc_ids.
+
+        Returning a tuple is how the first attempt at this broke: every extra
+        element becomes an inter-stage activation that the backward pass tries
+        to grade, which an int64 tensor cannot survive.
+        """
+        module = PipelineStageModule(
+            small_config, stage_id=stage_id, num_stages=2, layer_range=layers
+        )
+        x = (
+            torch.randint(0, 256, (2, 16))
+            if stage_id == 0
+            else torch.randn(2, 16, small_config.dim)
+        )
+        for kwargs in ({}, {"doc_ids": self._doc_ids(2, 16)}):
+            out = module(x, **kwargs)
+            assert isinstance(out, torch.Tensor), f"{kwargs.keys()} produced {type(out)}"
+
+    @pytest.mark.parametrize("backend", ["sdpa", "flex"])
+    def test_doc_ids_reach_attention(self, backend):
+        """Packed output must differ from unpacked on the same weights and tokens.
+
+        This is the assertion that would have caught the original bug. A shape
+        check still passes if ``doc_ids`` is accepted and then dropped on the
+        floor, which is exactly how the leak stayed invisible -- labels carry
+        -100 at boundaries, so the loss curve looks fine.
+        """
+        config = ModelConfig(
+            dim=64,
+            n_layers=8,
+            n_heads=4,
+            vocab_size=256,
+            max_seq_len=32,
+            attention_backend=backend,
+        )
+        torch.manual_seed(0)
+        module = PipelineStageModule(config, stage_id=0, num_stages=2, layer_range=(0, 4))
+        tokens = torch.randint(0, 256, (2, 16), generator=torch.Generator().manual_seed(7))
+
+        with torch.no_grad():
+            packed = module(tokens, self._doc_ids(2, 16))
+            unpacked = module(tokens)
+
+        assert not torch.allclose(packed, unpacked, rtol=1e-3, atol=1e-3)
+
+    def test_flex_stage_matches_sdpa_stage(self):
+        """The BlockMask a stage builds for itself means what the dense mask means.
+
+        A ``BlockMask`` is not a tensor, so it could not be transmitted between
+        stages even if integers could; each stage constructs its own from the
+        ``doc_ids`` it was handed. This checks that construction agrees with the
+        dense-mask path on identical weights.
+        """
+
+        def stage(backend: str) -> PipelineStageModule:
+            config = ModelConfig(
+                dim=64,
+                n_layers=8,
+                n_heads=4,
+                vocab_size=256,
+                max_seq_len=32,
+                attention_backend=backend,
+            )
+            torch.manual_seed(0)
+            return PipelineStageModule(config, stage_id=0, num_stages=2, layer_range=(0, 4))
+
+        tokens = torch.randint(0, 256, (2, 16), generator=torch.Generator().manual_seed(7))
+        doc_ids = self._doc_ids(2, 16)
+        with torch.no_grad():
+            out_sdpa = stage("sdpa")(tokens, doc_ids)
+            out_flex = stage("flex")(tokens, doc_ids)
+        torch.testing.assert_close(out_flex, out_sdpa)

@@ -31,6 +31,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from kempnerforge.config.schema import ModelConfig
 from kempnerforge.model.embedding import OutputHead, TokenEmbedding
 from kempnerforge.model.init import init_weights
+from kempnerforge.model.masking import build_doc_causal_block_mask
 from kempnerforge.model.norm import build_norm
 from kempnerforge.model.position import precompute_rope_frequencies
 from kempnerforge.model.transformer import TransformerBlock
@@ -140,7 +141,6 @@ class PipelineStageModule(nn.Module):
         self.num_stages = num_stages
         self.is_first = stage_id == 0
         self.is_last = stage_id == num_stages - 1
-
         start, end = layer_range
 
         # Token embedding — only on first stage
@@ -189,12 +189,19 @@ class PipelineStageModule(nn.Module):
             )
         init_weights(self, self.config)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, doc_ids: torch.Tensor | None = None) -> torch.Tensor:
         """Forward pass for this pipeline stage.
 
         Args:
             x: For stage 0: token IDs of shape (batch, seq_len).
                For other stages: hidden states of shape (batch, seq_len, dim).
+            doc_ids: Per-token document ids, shape (batch, seq_len), when
+                sequence packing is on. Supplied as a *schedule kwarg*: the
+                schedule splits it into micro-batches alongside the tokens and
+                hands it to every stage directly. It must not travel between
+                stages as an activation -- ``PipelineStage`` calls
+                ``requires_grad_(True)`` on every received buffer without
+                checking dtype, which an integer tensor cannot satisfy.
 
         Returns:
             For last stage: logits of shape (batch, seq_len, vocab_size).
@@ -212,9 +219,22 @@ class PipelineStageModule(nn.Module):
         cos = self._rope_cos[:seq_len]  # type: ignore[reportOptionalSubscript]
         sin = self._rope_sin[:seq_len]  # type: ignore[reportOptionalSubscript]
 
+        # Packed sequences under attention_backend="flex": build the BlockMask
+        # once here and share it across this stage's layers, mirroring
+        # Transformer.forward. Each stage builds its own from the doc_ids it
+        # was handed -- cheap next to attention, and a BlockMask is not a tensor,
+        # so it could not be transmitted between stages anyway.
+        block_mask = None
+        layer_doc_ids = doc_ids
+        if doc_ids is not None and self.config.attention_backend == "flex":
+            block_mask = build_doc_causal_block_mask(doc_ids, x.device)
+            # The BlockMask supersedes doc_ids; clearing it keeps the dense
+            # SDPA mask branch in Attention.forward unreachable on this path.
+            layer_doc_ids = None
+
         # Run through assigned layers
         for layer in self.layers.values():
-            x = layer(x, cos, sin)
+            x = layer(x, cos, sin, doc_ids=layer_doc_ids, block_mask=block_mask)
 
         # Last stage: norm + output head
         if self.is_last:
@@ -295,6 +315,8 @@ def build_pipeline_stage(
                 device=device,
             ),
         )
+    # doc_ids is deliberately absent here: it reaches stages as a schedule
+    # kwarg, which is neither transmitted nor shape-inferred.
 
     return PipelineStage(
         submodule=stage_module,
