@@ -252,6 +252,14 @@ class TestCrossAttentionBlock:
         out = block(x, img)
         assert out.shape == (2, 6, 32)
 
+    def test_norm_eps(self):
+        default = CrossAttentionBlock(dim=32, n_heads=4, n_kv_heads=4, ffn_hidden_dim=64)
+        custom = CrossAttentionBlock(
+            dim=32, n_heads=4, n_kv_heads=4, ffn_hidden_dim=64, norm_type="layernorm", norm_eps=1e-6
+        )
+        assert (default.attn_norm.eps, default.mlp_norm.eps) == (1e-5, 1e-5)
+        assert (custom.attn_norm.eps, custom.mlp_norm.eps) == (1e-6, 1e-6)
+
     def test_ca_zero_init_residual_identity(self):
         """With Wo and MLP.down_proj zero-initialized (the construction
         defaults), block(x, img) is bit-equal to x. Required for warm-start
