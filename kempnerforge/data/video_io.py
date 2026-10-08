@@ -97,11 +97,11 @@ def decode_video_frames(
     ``"uniform"`` = ``sample_timestamps``) and read in a single decode pass: each
     target timestamp is mapped to the first decoded frame at or after it
     (timestamps past the last frame map to the last frame, so the final frame is
-    always returned). Frame times are measured from the first decoded frame, so a
-    stream whose timestamps start after zero is sampled like one starting at zero;
-    a frame without a timestamp counts as time zero. The returned list has length
-    equal to the number of sampled timestamps (``<= max_frames``), or is empty when
-    the file has no decodable video stream.
+    always returned). Frame times are measured from the first frame that has a
+    timestamp, so a stream whose timestamps start after zero is sampled like one
+    starting at zero; a frame without a timestamp counts as time zero. The returned
+    list has length equal to the number of sampled timestamps (``<= max_frames``), or
+    is empty when the file has no decodable video stream.
 
     Raises whatever ``av`` raises on a missing/corrupt file; callers that train
     over noisy data should catch and substitute an empty clip.

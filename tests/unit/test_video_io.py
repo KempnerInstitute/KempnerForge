@@ -245,7 +245,7 @@ def _first_frame_time(path) -> float | None:
 
 @pytest.mark.skipif(not _AV_AVAILABLE, reason="requires the 'av' package")
 class TestDecodeStartOffset:
-    """Frame times count from the first decoded frame, since sample targets start at 0 s."""
+    """Frame times count from the first timestamped frame, since sample targets start at 0 s."""
 
     @pytest.mark.parametrize("offset_s", [0.0, 0.5, 5.0])
     @pytest.mark.parametrize(
@@ -339,6 +339,43 @@ class TestDecodeStartOffset:
         monkeypatch.setattr(video_io, "registry", fixed)
         frames = video_io.decode_video_frames(str(path), fps=2.0, min_frames=1, max_frames=4)
         assert [_frame_index(f) for f in frames] == [0, 19, 19]
+
+    def test_origin_is_the_first_timestamped_frame(self, monkeypatch):
+        """An untimed frame ahead of the first timestamp counts as 0 s; later times count
+        from the first timestamped frame (5.0 s here)."""
+        from types import SimpleNamespace
+
+        import av
+
+        import kempnerforge.data.video_io as video_io
+
+        class _Frame:
+            def __init__(self, index, time):
+                self.index, self.time = index, time
+
+            def to_image(self):
+                return self.index
+
+        class _Container:
+            duration = None
+            streams = SimpleNamespace(
+                video=[SimpleNamespace(duration=None, time_base=None, frames=0, average_rate=None)]
+            )
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def decode(self, stream):
+                return (_Frame(i, t) for i, t in enumerate([None, 5.0, 5.1, 5.2, 5.3]))
+
+        monkeypatch.setattr(av, "open", lambda path: _Container())
+        fixed = SimpleNamespace(get_sampling_policy=lambda name: lambda *args: [0.0, 0.15, 0.25])
+        monkeypatch.setattr(video_io, "registry", fixed)
+        frames = video_io.decode_video_frames("clip", fps=2.0, min_frames=1, max_frames=4)
+        assert frames == [0, 3, 4]
 
 
 class TestVideoDuration:
