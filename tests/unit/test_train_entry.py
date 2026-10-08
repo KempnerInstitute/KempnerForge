@@ -234,6 +234,54 @@ class TestBatchStream:
         stream.reset()
         assert int(stream.next_batch()["input_ids"]) == 0
 
+    # -- worker teardown (#177) -------------------------------------------
+
+    def test_close_is_safe_without_a_loader(self):
+        BatchStream(DataPipeline()).close()  # must not raise
+
+    def test_close_is_safe_on_a_worker_free_loader(self):
+        stream = BatchStream(DataPipeline(dataloader=_fake_batches(3)))
+        stream.next_batch()
+        stream.close()
+        assert stream._iter is None
+
+    def test_close_drains_the_workers_explicitly(self):
+        """Shielded workers ignore SIGTERM, so terminate() cannot reap them.
+
+        close() must go through the loader's own sentinel path instead, or the
+        interpreter blocks at exit joining daemonic children that refuse to die.
+        """
+
+        class _FakeIterator:
+            def __init__(self):
+                self.shutdown_calls = 0
+
+            def _shutdown_workers(self):
+                self.shutdown_calls += 1
+
+        class _FakeInner:
+            def __init__(self):
+                self._iterator = _FakeIterator()
+
+        class _FakeLoader:
+            def __init__(self):
+                self._dataloader = _FakeInner()
+
+        loader = _FakeLoader()
+        iterator = loader._dataloader._iterator
+        stream = BatchStream(DataPipeline(dataloader=loader))
+
+        stream.close()
+
+        assert iterator.shutdown_calls == 1
+        assert loader._dataloader._iterator is None
+
+    def test_close_is_idempotent(self):
+        stream = BatchStream(DataPipeline(dataloader=_fake_batches(3)))
+        stream.next_batch()
+        stream.close()
+        stream.close()  # a second pass must not raise
+
     def test_ensure_started_is_idempotent(self):
         stream = BatchStream(DataPipeline(dataloader=_fake_batches(3)))
         stream.ensure_started()
