@@ -1661,6 +1661,40 @@ class TestSeekDecodeWork:
         assert (counts[16] > 0) is sparse
         assert counts[1] >= counts[16]
 
+    @pytest.mark.parametrize("suffix", ["mkv", "mp4"])
+    def test_audio_past_the_video_does_not_move_the_seek_path(self, tmp_path, monkeypatch, suffix):
+        """The seeking decoder samples the span ``_video_extent`` gives it, so an audio
+        track running past the last frame reaches it exactly as it reaches a serial pass:
+        whatever the span, the frames are the same and no test depends on the difference."""
+        path = tmp_path / f"clip.{suffix}"
+        _write_clip_with_audio(path, 200, 10, codec="mpeg4", codec_options={"g": "10"}, tail_s=2.0)
+        frames, counter = self._decode_counting(
+            path, monkeypatch, 16, fps=2.0, min_frames=4, max_frames=4
+        )
+        assert [f.tobytes() for f in frames] == [
+            f.tobytes() for f in _serial_reference(path, 2.0, 4, 4)
+        ]
+        assert counter.seeks > 0  # the clip is long enough that seeking pays
+
+    @pytest.mark.parametrize("suffix", ["mp4", "mkv"])
+    @pytest.mark.parametrize("max_frames", [4, 16])
+    def test_decoder_reporting_nothing_in_flight(self, tmp_path, monkeypatch, suffix, max_frames):
+        """A slice-threaded decoder (MPEG-2) reports no frames in flight, so a flush costs
+        it nothing and any whole group is worth skipping. That is the rule's own reading,
+        not a special case: the seeks stay bounded by one per target and the frames are
+        still the serial pass's."""
+        path = tmp_path / f"mpeg2.{suffix}"
+        _write_indexed_clip(
+            path, n_frames=200, fps=10, codec="mpeg2video", codec_options={"g": "10", "bf": "2"}
+        )
+        frames, counter = self._decode_counting(
+            path, monkeypatch, 16, fps=2.0, min_frames=4, max_frames=max_frames
+        )
+        assert [f.tobytes() for f in frames] == [
+            f.tobytes() for f in _serial_reference(path, 2.0, 4, max_frames)
+        ]
+        assert counter.seeks <= max_frames - 1
+
 
 @pytest.mark.skipif(not _AV_AVAILABLE, reason="requires the 'av' package")
 class TestSeekDamage:
