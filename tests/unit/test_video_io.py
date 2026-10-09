@@ -1472,7 +1472,7 @@ class TestSeekCodecShapes:
 class TestSeekDecodeWork:
     """Seeking skips whole groups for sparse targets and never adds work for dense ones."""
 
-    def _decode_counting(self, path, monkeypatch, threads, **cfg):
+    def _decode_counting(self, path, _monkeypatch, threads, **cfg):
         """Frames, plus the seeks and frames the decoder itself spent.
 
         The counters start once the extent probe has run, whose own bounded reads are
@@ -1496,9 +1496,10 @@ class TestSeekDecodeWork:
             container.seeks = container.decoded = 0
             return result
 
-        monkeypatch.setattr(av, "open", _open)
-        monkeypatch.setattr(video_io, "_video_extent", _extent)
-        frames = video_io.decode_video_frames(str(path), **cfg)
+        with pytest.MonkeyPatch.context() as patch:  # undone per call, so calls do not nest
+            patch.setattr(av, "open", _open)
+            patch.setattr(video_io, "_video_extent", _extent)
+            frames = video_io.decode_video_frames(str(path), **cfg)
         assert len(opened) == 1  # no fallback reopen
         return frames, opened[0]
 
@@ -1533,6 +1534,46 @@ class TestSeekDecodeWork:
             f.tobytes() for f in _serial_reference(path, 2.0, min_frames, max_frames)
         ]
         assert (counter.seeks, counter.decoded) == (seeks, decoded)
+
+    @pytest.mark.parametrize(
+        ("suffix", "codec", "options"),
+        [
+            ("mp4", "mpeg4", {"g": "10", "bf": "2"}),
+            ("mkv", "mpeg4", {"g": "10"}),
+            ("webm", "libvpx-vp9", {"g": "10"}),
+            (
+                "mkv",
+                "libx265",
+                {"x265-params": "keyint=10:min-keyint=10:scenecut=0:log-level=error"},
+            ),
+            ("mp4", "libx264", {"x264-params": "keyint=20:min-keyint=20:scenecut=0:bframes=2"}),
+        ],
+    )
+    @pytest.mark.parametrize("sparse", [True, False])
+    def test_the_decision_holds_across_codecs_and_containers(
+        self, tmp_path, monkeypatch, suffix, codec, options, sparse
+    ):
+        """Over 20 s, four targets sit 6.67 s apart and sixteen 1.33 s apart, so the first
+        leave whole groups behind and the second at most one. A 16-deep decoder loses 30
+        frames to a flush, so it seeks only for the sparse ones, whatever the codec, the
+        container or the keyframe spacing; a decoder holding nothing in flight has less to
+        lose, so it never seeks less. Both return the serial pass's frames."""
+        if not _encoder_available(codec):
+            pytest.skip(f"requires the {codec} encoder")
+        path = tmp_path / f"clip.{suffix}"
+        _write_indexed_clip(path, n_frames=200, fps=10, codec=codec, codec_options=options)
+        max_frames = 4 if sparse else 16
+        min_frames = 4
+        expected = [f.tobytes() for f in _serial_reference(path, 2.0, min_frames, max_frames)]
+        counts = {}
+        for threads in (16, 1):
+            frames, counter = self._decode_counting(
+                path, monkeypatch, threads, fps=2.0, min_frames=min_frames, max_frames=max_frames
+            )
+            assert [f.tobytes() for f in frames] == expected
+            counts[threads] = counter.seeks
+        assert (counts[16] > 0) is sparse
+        assert counts[1] >= counts[16]
 
 
 @pytest.mark.skipif(not _AV_AVAILABLE, reason="requires the 'av' package")
