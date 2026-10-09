@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import itertools
 import os
 
 import pytest
@@ -334,6 +335,27 @@ def _write_clip_at_times(path, times, *, codec="mpeg4", rate=10) -> None:
             container.mux(packet)
 
 
+def _write_clip_holding_its_last_frame(path, times, last_s: float, *, codec="mpeg4") -> None:
+    """A clip at ``times`` whose last frame is held ``last_s`` seconds, remuxed into
+    ``path``'s container. The durations are muxed explicitly so the source's container
+    duration covers that held frame; a muxer that drops per-packet durations then leaves
+    the container duration as the only record of where the clip ends."""
+    import av
+
+    source = path.with_suffix(".source.mp4")
+    _write_clip_at_times(source, times, codec=codec)
+    steps = [b - a for a, b in itertools.pairwise(times)] + [last_s]
+    with av.open(str(source)) as ic, av.open(str(path), mode="w") as oc:
+        istream = ic.streams.video[0]
+        ostream = oc.add_stream_from_template(istream)
+        for packet, held in zip(
+            (p for p in ic.demux(istream) if p.pts is not None), steps, strict=True
+        ):
+            packet.duration = round(held / istream.time_base)
+            packet.stream = ostream
+            oc.mux(packet)
+
+
 def _end_edit_list_at(src, dst, end_s: float) -> None:
     """Copy an MP4 whose edit list holds one edit, ending that edit at ``end_s``."""
     import struct
@@ -384,6 +406,11 @@ def _extent_of(path) -> tuple[float, float] | None:
 
     with av.open(str(path)) as container:
         return _video_extent(container, container.streams.video[0], str(path))[0]
+
+
+def _video_extent_of(path):
+    """``_video_extent``'s start and span for a clip."""
+    return _extent_of(path)
 
 
 def _decoded_pts(packets) -> list[int]:
@@ -564,13 +591,29 @@ class TestDecodeStartOffset:
         assert span == pytest.approx(_full_extent(shifted)[1])
         assert _indices(shifted) == _indices(base) == _rule_indices(base, start, span)
 
+    @pytest.mark.parametrize("start_s", [0.0, 0.9])
+    @pytest.mark.parametrize("suffix", ["mkv", "asf"])
+    def test_last_frame_held_past_the_last_timestamp(self, tmp_path, suffix, start_s):
+        """Frames at 0, 0.1, 0.8 and 1.0 s with the last held a second, remuxed into a
+        container that keeps the duration but drops the per-packet ones. Nothing in the
+        packets says the clip runs to 2 s, and no step between timestamps comes close."""
+        source = tmp_path / f"held.{suffix}"
+        times = [start_s + t for t in (0.0, 0.1, 0.8, 1.0)]
+        _write_clip_holding_its_last_frame(source, times, 1.0)
+        start, span = _video_extent_of(source)
+        assert span == pytest.approx(2.0)
+        assert _indices(source) == [0, 2, 3, 3]
+
+    @pytest.mark.parametrize("start_s", [0.0, 0.1, 0.5])
     @pytest.mark.parametrize("suffix", ["flv", "asf", "mp4", "mkv"])
-    def test_one_frame_clip_samples_its_whole_length(self, tmp_path, suffix):
+    def test_one_frame_clip_samples_its_whole_length(self, tmp_path, suffix, start_s):
         """A single frame leaves no step between timestamps to measure, so the span comes
-        from the metadata; a zero span would return one frame where four were asked for."""
+        from the metadata; a zero span would return one frame where four were asked for.
+        Starting the frame after zero makes a duration read as an end time land exactly on
+        that zero span, which is why a reading has to leave the frame a positive time."""
         codec = {"flv": "flv", "asf": "wmv2"}.get(suffix, "mpeg4")
         path = tmp_path / f"one.{suffix}"
-        _write_indexed_clip(path, n_frames=1, fps=10, codec=codec)
+        _write_clip_at_times(path, [start_s], codec=codec)
         assert _indices(path) == [0, 0, 0, 0]
 
     @pytest.mark.parametrize("suffix", ["flv", "asf", "mkv", "mp4"])
@@ -1038,6 +1081,26 @@ class TestSpan:
         from kempnerforge.data.video_io import _span
 
         assert _span(0, [[(0, 0)]], Fraction(1, 10), 0.1) == pytest.approx((0.0, 0.1))
+
+    def test_a_reading_must_leave_the_frames_a_positive_time(self):
+        """One frame at 0.1 s with a 0.1 s length: read as an end time it would put the
+        stream's whole length behind its own start and leave nothing to show."""
+        from fractions import Fraction
+
+        from kempnerforge.data.video_io import _span
+
+        assert _span(100, [[(100, 0)]], Fraction(1, 1000), 0.1) == pytest.approx((0.1, 0.1))
+
+    def test_an_unreported_duration_is_not_an_end_time_of_zero(self):
+        """No duration reported anywhere arrives as zero. Read as an end time on a stream
+        whose timestamps are negative that would place the end two seconds past the start,
+        so it is ruled out and the step between the timestamps is used instead."""
+        from fractions import Fraction
+
+        from kempnerforge.data.video_io import _span
+
+        runs = [[(-2000, 0), (-1900, 0)], [(-1800, 0), (-1700, 0)]]
+        assert _span(-2000, runs, Fraction(1, 1000), 0.0) == pytest.approx((-2.0, 0.4))
 
     def test_unusable_metadata_falls_back_to_the_median_step(self):
         """Metadata that does not even reach the last timestamp says nothing: steps 1, 2
