@@ -35,7 +35,10 @@ the raw calls break resume.
 
 Three top-level keys. DCP introspects the state dicts, finds
 `DTensor` / `ShardedTensor` parameters, and writes each shard to disk
-with enough metadata to reassemble.
+with enough metadata to reassemble. The third is empty whenever every
+parameter has optimizer state, and an empty entry writes no key at all,
+so an ordinary run's checkpoints keep the two-key shape any reader
+already expects.
 
 What's in each:
 
@@ -199,6 +202,13 @@ empty state afterwards, so a run in which part of the model has not
 yet been reached resumes. Every other state the template asks for
 stays required: a parameter with missing or partial state, or one the
 saved optimizer did not hold, fails the load.
+
+A checkpoint written before the record existed carries no such evidence,
+and an absent state cannot be told apart from one that went missing, so
+a never-stepped parameter in one of those still fails the load. Start
+from it with `[checkpoint].load_path` and
+`exclude_from_loading = ["optimizer"]`, which restores the weights and
+begins with a fresh optimizer.
 
 Loading with a different GPU count triggers DCP's automatic
 resharding — see [Resharding](resharding.md).
