@@ -2000,6 +2000,33 @@ class TestSeekFallback:
         fallback_lines = [r for r in caplog.records if "falling back" in r.message]
         assert len(fallback_lines) == 1
 
+    @pytest.mark.parametrize("suffix", ["mkv", "mp4"])
+    def test_stream_starting_off_a_keyframe_never_reaches_the_seeking_decoder(
+        self, tmp_path, monkeypatch, suffix
+    ):
+        """A stream-copy cut has no keyframe to seek back to, so there would be nothing to
+        replay if a seek went wrong: it is decoded serially from the packets in hand."""
+        import kempnerforge.data.video_io as video_io
+
+        src = tmp_path / f"src.{suffix}"
+        cut = tmp_path / f"cut.{suffix}"
+        _write_indexed_clip(
+            src,
+            n_frames=40,
+            fps=10,
+            codec="libx264" if _H264_AVAILABLE else "mpeg4",
+            codec_options={"x264-params": "keyint=10:min-keyint=10:scenecut=0"}
+            if _H264_AVAILABLE
+            else {"g": "10"},
+        )
+        _remux_shifted(src, cut, 0.0, skip_packets=3)
+        expected = [f.tobytes() for f in _serial_reference(cut, 2.0, 4, 4)]
+        monkeypatch.setattr(
+            video_io, "_decode_seek", lambda *a: pytest.fail("seeking a stream it cannot replay")
+        )
+        frames = video_io.decode_video_frames(str(cut), fps=2.0, min_frames=4, max_frames=4)
+        assert [f.tobytes() for f in frames] == expected
+
     @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires named pipes")
     @pytest.mark.parametrize("suffix", ["mkv", "ts", "mp4"])
     def test_pipe_never_reaches_the_seeking_decoder(self, tmp_path, monkeypatch, suffix):
