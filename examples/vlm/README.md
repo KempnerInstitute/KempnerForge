@@ -51,6 +51,24 @@ Video needs PyAV: `uv sync --group video`.
 Tests: `uv run pytest examples/vlm/tests/ -v` (they are outside the core
 `testpaths`, so run them by path).
 
+## Train on video
+
+`vlm_video_webvid.toml` is the video preset (Joint-Decoder plus a `[video]`
+section). The core [Train on video](../../docs/how-to/train-on-video.md) how-to
+explains that section, the frame sampling and the token budget.
+
+```bash
+# 4 GPUs
+uv run torchrun --nproc_per_node=4 examples/vlm/train.py \
+    examples/vlm/configs/vlm_video_webvid.toml
+
+# Quick smoke: random encoder (no weight download), a few clips, few steps
+uv run torchrun --nproc_per_node=2 examples/vlm/train.py \
+    examples/vlm/configs/vlm_video_webvid.toml \
+    --vision_encoder.type=random --vision_encoder.num_tokens=196 \
+    --vision_encoder.feature_dim=768 --video.max_samples=256 --train.max_steps=20
+```
+
 ## Data prep
 
 `data/prep_vlm_coco.py` writes a COCO-Karpathy `save_to_disk` directory for

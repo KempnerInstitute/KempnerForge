@@ -44,20 +44,34 @@ build- and config-time checks enforce this and fail before any GPU work.
 
 ## Configure it
 
-A video run adds a `[video]` section (sibling of `[vision_encoder]` /
-`[adapter]` / `[vlm]`) and a token-reducing connector. See
-`examples/vlm/configs/vlm_video_webvid.toml` for a complete example; the key parts:
+A video run is a text training config with these sections on top: set the
+`[model]`, `[train]` and `[data]` keys in the text config's own tables, and add
+`[vision_encoder]`, a token-reducing `[adapter]`, `[vlm]` and `[video]`:
 
 ```toml
+[model]
+max_seq_len = 576            # 8 frames × 49 + 64 text = 456, plus headroom
+
+[train]
+seq_len = 576                # at most model.max_seq_len
+
+[data]
+tokenizer_path = "<tokenizer>"
+
+[vision_encoder]
+type = "siglip2"              # a registered encoder ("random" needs no weights)
+path = "<pretrained-weights>" # the weights a pretrained encoder loads
+
 [adapter]
 type = "avgpool"          # or "attentional_pool"; pools patches per frame
 pool_window = 2           # 14×14 grid -> 7×7 = 49 tokens/frame
 
 [vlm]
 arch = "joint_decoder"    # also: cross_attention | mot | moma
+max_text_len = 64
 
 [video]
-data_root = "path-to-webvid-10m"
+data_root = "<path-to-corpus>"
 dataset_type = "webvid"      # registry key; add styles via @registry.register_video_dataset
 dataset_name = "webvid-10M"  # corpus dir under raw/<dataset_name>/data (WebVid style)
 sampling_policy = "uniform"  # registry key; the frame-sampling policy
@@ -68,6 +82,11 @@ min_frames = 4
 frame_size = 224
 max_samples = 0              # 0 = full manifest; set small for a smoke
 ```
+
+The residual stream's visual tokens (`max_frames` × tokens per frame; none for
+`cross_attention`) plus `vlm.max_text_len` must fit `model.max_seq_len`: the
+config check enforces this when `vision_encoder.num_tokens` is set, and the model
+build does when the encoder infers it.
 
 The dataset side is **pluggable**: `dataset_type` selects a builder from the
 `video_dataset` registry (`"webvid"` ships; other styles — HuggingFace video
@@ -85,12 +104,16 @@ requires it.
 
 ## Launch
 
-```bash
-# 4-GPU video training (Joint-Decoder)
-uv run torchrun --nproc_per_node=4 examples/vlm/train.py examples/vlm/configs/vlm_video_webvid.toml
+A video config launches like any other config: an entry point loads it with
+`load_config` and calls `run_training`, which selects the VLM step from the
+config (`scripts/train.py` is one such entry point).
 
-# Quick smoke: no SigLIP download, a few clips, few steps
-uv run torchrun --nproc_per_node=2 examples/vlm/train.py examples/vlm/configs/vlm_video_webvid.toml \
+```bash
+# 4 GPUs
+uv run torchrun --nproc_per_node=4 <train-script> <video-config>.toml
+
+# Quick smoke: random encoder (no weight download), a few clips, few steps
+uv run torchrun --nproc_per_node=2 <train-script> <video-config>.toml \
     --vision_encoder.type=random --vision_encoder.num_tokens=196 \
     --vision_encoder.feature_dim=768 --video.max_samples=256 --train.max_steps=20
 ```

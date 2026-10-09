@@ -16,4 +16,4 @@ docs:
   model inspection, interpretability, and MoE diagnostics.
 
 For the notebook catalogue with short descriptions, see
-[`docs/getting-started/notebooks.md`](../docs/getting-started/notebooks.md).
+[`notebooks/README.md`](notebooks/README.md).
