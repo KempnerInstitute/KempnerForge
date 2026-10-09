@@ -93,20 +93,37 @@ def _presented(packets: Iterable[Any]) -> list[tuple[int, int]]:
 
 
 def _span(
-    start: int, runs: list[list[tuple[int, int]]], time_base: Fraction
+    start: int, runs: list[list[tuple[int, int]]], time_base: Fraction, metadata: float
 ) -> tuple[float, float]:
-    """``(start, span)`` in seconds, the span ending where the last presented packet ends.
+    """``(start, span)`` in seconds, the span ending where the last presented frame ends.
 
-    ``runs`` are ``_presented`` lists, each from one contiguous read. A last packet
-    without a duration lasts the median step between presentation timestamps, taken
-    within runs so the gap between two reads is not a step.
+    ``runs`` are ``_presented`` lists, each from one contiguous read. The packets place
+    the last frame's start exactly, and when that packet carries a duration they place
+    its end too, which is the span.
+
+    A packet without a duration leaves the end unknown: the packets bound the span from
+    below, by the extent from the first timestamp to the last, but only the container's
+    ``metadata`` duration knows how long that last frame is shown, which on
+    variable-rate video is not the step between any two timestamps and on a one-frame
+    stream has no step at all. A duration is reported either as a length or as an end
+    time on the stream clock, and the two differ by the stream's start, so the one that
+    cannot be read as reaching the last timestamp is ruled out; if neither does, the
+    metadata is unusable and the last frame is given the median step between the
+    timestamps read, taken within runs so the gap between two reads is not a step.
     """
     end, duration = max(max(run) for run in runs)
-    if not duration:
-        pts = (sorted(p for p, _ in run) for run in runs)
-        steps = [b - a for run in pts for a, b in itertools.pairwise(run) if b > a]
-        duration = statistics.median(steps) if steps else 0
-    return float(start * time_base), float((end + duration - start) * time_base)
+    if duration:
+        return float(start * time_base), float((end + duration - start) * time_base)
+    begins = float(start * time_base)
+    extent = float((end - start) * time_base)
+    if metadata - begins >= extent:  # reaches the last timestamp as an end time
+        return begins, metadata - begins
+    if metadata >= extent:  # reaches it as a length
+        return begins, metadata
+    pts = (sorted(p for p, _ in run) for run in runs)
+    steps = [b - a for run in pts for a, b in itertools.pairwise(run) if b > a]
+    shown = statistics.median(steps) if steps else 0
+    return begins, float((end + shown - start) * time_base)
 
 
 def _rewind(container: Any, stream: Any, first: Any) -> Iterator[Any]:
@@ -138,8 +155,9 @@ def _read_extent(
     then its end; ``None`` when no packet has a presentation timestamp.
 
     The start is the earliest presentation timestamp (PTS) of a presented packet
-    (``_presented``); the span runs from it to the end of the last presented packet
-    (``_span``). The reads are bounded. A packet is presented no earlier than it is
+    (``_presented``); the span runs from it to the end of the last presented frame
+    (``_span``, which falls back to the container's duration where the packets do not
+    give that end). The reads are bounded. A packet is presented no earlier than it is
     decoded, and decode timestamps never decrease, so the start is settled once a
     packet's decode timestamp reaches the earliest PTS seen: only the first reordered
     packets are read. For the end, a backward seek past the stream's end lands on its
@@ -153,6 +171,7 @@ def _read_extent(
     import av
 
     time_base = stream.time_base
+    metadata = _video_duration_seconds(stream, container)
     head: list[tuple[int, int]] = []
     start = None
     for packet in packets:
@@ -163,7 +182,7 @@ def _read_extent(
         if start is not None and dts is not None and dts >= start and len(head) > 1:
             break
     else:  # the whole stream was read
-        return None if start is None else _span(start, [head], time_base)
+        return None if start is None else _span(start, [head], time_base, metadata)
     try:
         container.seek(start + int(_PAST_END_S / time_base), stream=stream)
         tail = container.demux(stream)
@@ -172,8 +191,8 @@ def _read_extent(
     except av.FFmpegError:
         landing, ends = None, []
     if landing is not None and landing.is_keyframe and _presented([landing]):
-        return _span(start, [head, ends], time_base)
-    return _span(start, [_presented(restart())], time_base)
+        return _span(start, [head, ends], time_base, metadata)
+    return _span(start, [_presented(restart())], time_base, metadata)
 
 
 def _video_extent(
