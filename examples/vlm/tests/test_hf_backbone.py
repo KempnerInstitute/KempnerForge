@@ -243,8 +243,11 @@ class TestRoundTrip:
         monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_snapshot_download)
         out = conv.convert("some-org/some-model", _target(tmp_path), str(tmp_path / "out"))
         assert calls == [
-            {"repo_id": "some-org/some-model", "allow_patterns": [p], "ignore_patterns": ["*/*"]}
-            for p in ("config.json", "*.safetensors")
+            {"repo_id": "some-org/some-model", "allow_patterns": p, "ignore_patterns": ["*/*"]}
+            for p in (
+                ["config.json"],
+                ["*.safetensors", "*model.safetensors.index.json"],
+            )
         ]
         assert (out / ".metadata").is_file()
 
@@ -375,8 +378,23 @@ class TestConfigRefusals:
                 "rope_scaling uses rope_type='linear'",
             ),
             (lambda c: c.update(use_sliding_window=True), "use_sliding_window is set"),
+            (lambda c: c.update(attention_bias=True), "attention_bias is set"),
+            (
+                # The two spellings of the theta disagree, and which one a release
+                # reads decides the positions, so neither is taken.
+                lambda c: c.update(rope_theta=1e6, rope_parameters={"rope_theta": 1e4}),
+                r"rope_theta=1000000.0 but rope_parameters.rope_theta=10000.0",
+            ),
         ],
-        ids=["model_type", "missing_key", "rope_parameters", "rope_scaling", "sliding_window"],
+        ids=[
+            "model_type",
+            "missing_key",
+            "rope_parameters",
+            "rope_scaling",
+            "sliding_window",
+            "attention_bias",
+            "rope_theta_disagrees_with_itself",
+        ],
     )
     def test_source_the_target_cannot_express(
         self, tied_copy: Path, tmp_path: Path, edit: Callable[[dict[str, Any]], Any], match: str
@@ -387,9 +405,94 @@ class TestConfigRefusals:
         config_file.write_text(json.dumps(hf_config))
         _refuses(tied_copy, _target(tmp_path), tmp_path / "out", ValueError, match)
 
+    def test_the_nested_rope_theta_is_the_one_compared(
+        self, tied_copy: Path, tmp_path: Path
+    ) -> None:
+        """``rope_parameters`` overrides the top-level field, so that is what must match."""
+        config_file = tied_copy / "config.json"
+        hf_config = json.loads(config_file.read_text())
+        hf_config["rope_parameters"] = {"rope_type": "default", "rope_theta": 1e4}
+        hf_config.pop("rope_theta", None)
+        config_file.write_text(json.dumps(hf_config))
+        _refuses(
+            tied_copy,
+            _target(tmp_path, model={"rope_theta": 1e6}),
+            tmp_path / "out",
+            ValueError,
+            r"rope_theta=10000.0 but model.rope_theta=1000000.0",
+        )
+        out = conv.convert(
+            str(tied_copy), _target(tmp_path, model={"rope_theta": 1e4}), str(tmp_path / "out")
+        )
+        assert (out / ".metadata").is_file()
+
     def test_text_only_config(self, tied: Path, tmp_path: Path) -> None:
         config = _target(tmp_path, vlm={})
         _refuses(tied, config, tmp_path / "out", ValueError, r"has no \[vlm\] section")
+
+
+class TestNormEpsilon:
+    """The source normalises with one epsilon; every norm of the target must use it."""
+
+    @staticmethod
+    def _transformer(eps: float) -> torch.nn.Module:
+        from kempnerforge.config.model import ModelConfig
+        from kempnerforge.model.transformer import Transformer
+
+        return Transformer(ModelConfig(**{**TARGET_MODEL, "norm_eps": eps}))
+
+    def test_a_norm_with_another_epsilon_is_named(self) -> None:
+        transformer = self._transformer(1e-5)
+        conv.check_norm_eps(transformer, 1e-5)  # the built model agrees with the source
+
+        transformer.layers["0"].attention_norm.eps = 1e-6
+        with pytest.raises(ValueError, match=r"layers.0.attention_norm"):
+            conv.check_norm_eps(transformer, 1e-5)
+
+    def test_the_epsilon_is_read_off_the_model_not_the_config(
+        self, tied_copy: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A norm that takes its epsilon elsewhere is caught before anything is written."""
+        build = conv.build_vlm_wrapper
+
+        def tampered(*args: Any, **kwargs: Any) -> Any:
+            wrapper = build(*args, **kwargs)
+            wrapper.transformer.norm.eps = 1e-3
+            return wrapper
+
+        monkeypatch.setattr(conv, "build_vlm_wrapper", tampered)
+        _refuses(
+            tied_copy,
+            _target(tmp_path),
+            tmp_path / "out",
+            ValueError,
+            r"rms_norm_eps=1e-05, but 1 norms of the built transformer use another epsilon",
+        )
+
+    def test_a_source_epsilon_every_norm_uses_converts(
+        self, tied_copy: Path, tmp_path: Path
+    ) -> None:
+        """At an epsilon the attention norms do not take from the config, converting refuses."""
+        config_file = tied_copy / "config.json"
+        hf_config = json.loads(config_file.read_text())
+        hf_config["rms_norm_eps"] = 1e-6
+        config_file.write_text(json.dumps(hf_config))
+        config = _target(tmp_path, model={"norm_eps": 1e-6})
+
+        elsewhere = {
+            name: module.eps
+            for name, module in self._transformer(1e-6).named_modules()
+            if isinstance(getattr(module, "eps", None), float) and module.eps != 1e-6
+        }
+        if elsewhere:
+            message = _refuses(
+                tied_copy, config, tmp_path / "out", ValueError, "use another epsilon"
+            )
+            assert all(name in message for name in sorted(elsewhere)[:5]), message
+        else:
+            assert (
+                Path(conv.convert(str(tied_copy), config, str(tmp_path / "out"))) / ".metadata"
+            ).is_file()
 
 
 class TestWeightRefusals:
@@ -456,6 +559,76 @@ class TestWeightRefusals:
     ) -> None:
         (tied_copy / name).unlink()
         _refuses(tied_copy, _target(tmp_path), tmp_path / "out", FileNotFoundError, match)
+
+
+def _shard(source: Path, split: Callable[[str], str]) -> dict[str, str]:
+    """Re-save the source's weights as the shards ``split`` assigns each tensor to."""
+    weights = load_file(source / "model.safetensors")
+    (source / "model.safetensors").unlink()
+    weight_map = {key: split(key) for key in weights}
+    for name in sorted(set(weight_map.values())):
+        save_file(
+            {k: v for k, v in weights.items() if weight_map[k] == name},
+            source / name,
+            metadata={"format": "pt"},
+        )
+    (source / "model.safetensors.index.json").write_text(json.dumps({"weight_map": weight_map}))
+    return weight_map
+
+
+class TestShardIndex:
+    """A sharded source names its files and tensors; the files on disk must match."""
+
+    @staticmethod
+    def _two_shards(key: str) -> str:
+        tail = "model-00002-of-00002.safetensors"
+        return tail if key.startswith("model.layers.1.") else "model-00001-of-00002.safetensors"
+
+    def test_an_indexed_source_converts(self, tied_copy: Path, tmp_path: Path) -> None:
+        _shard(tied_copy, self._two_shards)
+        out = conv.convert(str(tied_copy), _target(tmp_path), str(tmp_path / "out"))
+        assert (out / ".metadata").is_file()
+
+    def test_a_shard_replaced_by_another_file_is_refused(
+        self, tied_copy: Path, tmp_path: Path
+    ) -> None:
+        """A stale file whose tensors happen to fit does not stand in for a named shard."""
+        weight_map = _shard(tied_copy, self._two_shards)
+        second = tied_copy / "model-00002-of-00002.safetensors"
+        stale = load_file(second)
+        second.unlink()
+        save_file(stale, tied_copy / "model.safetensors", metadata={"format": "pt"})
+        message = _refuses(
+            tied_copy, _target(tmp_path), tmp_path / "out", ValueError, "lists 2 shards"
+        )
+        assert "model-00002-of-00002.safetensors" in message, message
+        assert "model.safetensors" in message, message
+        assert set(weight_map.values()) == {
+            "model-00001-of-00002.safetensors",
+            "model-00002-of-00002.safetensors",
+        }
+
+    def test_a_shard_holding_other_tensors_is_refused(
+        self, tied_copy: Path, tmp_path: Path
+    ) -> None:
+        _shard(tied_copy, self._two_shards)
+        second = tied_copy / "model-00002-of-00002.safetensors"
+        weights = load_file(second)
+        weights.pop(next(iter(weights)))
+        save_file(weights, second, metadata={"format": "pt"})
+        _refuses(
+            tied_copy,
+            _target(tmp_path),
+            tmp_path / "out",
+            ValueError,
+            r"model-00002-of-00002.safetensors holds \d+ tensors but the index assigns it",
+        )
+
+    def test_an_index_without_a_weight_map_is_refused(
+        self, tied_copy: Path, tmp_path: Path
+    ) -> None:
+        (tied_copy / "model.safetensors.index.json").write_text(json.dumps({"metadata": {}}))
+        _refuses(tied_copy, _target(tmp_path), tmp_path / "out", ValueError, "has no weight_map")
 
 
 class TestOutputRefusals:

@@ -41,6 +41,8 @@ logger = logging.getLogger(__name__)
 
 SUPPORTED_MODEL_TYPES = ("qwen3",)
 
+_INDEX_FILE = "model.safetensors.index.json"
+
 EMBED_KEY = "token_embedding.embedding.weight"
 HEAD_KEY = "output_head.proj.weight"
 _HF_EMBED_KEY = "model.embed_tokens.weight"
@@ -77,10 +79,22 @@ def map_key(hf_key: str) -> str | None:
     return f"layers.{match.group(1)}.{_LAYER_LEAVES[match.group(2)]}"
 
 
-def _rope_theta(hf_config: dict[str, Any]) -> Any:
-    if "rope_theta" in hf_config:
-        return hf_config["rope_theta"]
-    return (hf_config.get("rope_parameters") or {}).get("rope_theta")
+def _rope_theta(hf_config: dict[str, Any]) -> tuple[Any, str | None]:
+    """The RoPE theta the source applies, and a problem if its two spellings disagree.
+
+    A ``rope_parameters`` entry overrides the top-level field in current
+    transformers, while older releases read only the top-level one, so a source
+    that sets both to different values applies a different theta depending on
+    the release reading it and is refused rather than resolved here.
+    """
+    top = hf_config.get("rope_theta")
+    nested = (hf_config.get("rope_parameters") or {}).get("rope_theta")
+    if top is not None and nested is not None and top != nested:
+        return nested, (
+            f"rope_theta={top!r} but rope_parameters.rope_theta={nested!r}; "
+            "which of the two applies depends on the transformers release"
+        )
+    return (top if nested is None else nested), None
 
 
 def check_config(hf_config: dict[str, Any], model: ModelConfig) -> None:
@@ -104,9 +118,10 @@ def check_config(hf_config: dict[str, Any], model: ModelConfig) -> None:
         "tie_word_embeddings": ("tie_embeddings", model.tie_embeddings),
         "hidden_act": ("activation", str(model.activation)),
     }
-    problems = []
+    rope_theta, rope_problem = _rope_theta(hf_config)
+    problems = [rope_problem] if rope_problem else []
     for hf_key, (kf_name, kf_value) in pairs.items():
-        hf_value = _rope_theta(hf_config) if hf_key == "rope_theta" else hf_config.get(hf_key)
+        hf_value = rope_theta if hf_key == "rope_theta" else hf_config.get(hf_key)
         if hf_value is None:
             problems.append(f"config.json has no {hf_key}")
         elif hf_value != kf_value:
@@ -118,6 +133,11 @@ def check_config(hf_config: dict[str, Any], model: ModelConfig) -> None:
             problems.append(f"{spec_key} uses rope_type={rope_type!r}; only plain RoPE converts")
     if hf_config.get("use_sliding_window"):
         problems.append("use_sliding_window is set; only full attention converts")
+    if hf_config.get("attention_bias"):
+        problems.append(
+            "attention_bias is set, so the source declares query/key/value/output biases "
+            "that the transformer has no parameters for"
+        )
     if not model.qk_norm:
         problems.append("the source normalises q/k per head, so model.qk_norm must be true")
     if str(model.norm_type) != "rmsnorm":
@@ -128,18 +148,16 @@ def check_config(hf_config: dict[str, Any], model: ModelConfig) -> None:
         raise ValueError("target config does not match the source:\n  " + "\n  ".join(problems))
 
 
-def resolve_source(hf_dir: str, pattern: str) -> Path:
+def resolve_source(hf_dir: str, patterns: list[str]) -> Path:
     """The local model directory ``hf_dir``, or the snapshot of Hub id ``hf_dir`` with its
-    top-level files matching ``pattern`` fetched (or read from the cache)."""
+    top-level files matching ``patterns`` fetched (or read from the cache)."""
     path = Path(hf_dir)
     if path.is_dir():
         return path
     from huggingface_hub import snapshot_download
 
-    logger.info("Fetching %s of %s from the Hugging Face Hub", pattern, hf_dir)
-    return Path(
-        snapshot_download(repo_id=hf_dir, allow_patterns=[pattern], ignore_patterns=["*/*"])
-    )
+    logger.info("Fetching %s of %s from the Hugging Face Hub", patterns, hf_dir)
+    return Path(snapshot_download(repo_id=hf_dir, allow_patterns=patterns, ignore_patterns=["*/*"]))
 
 
 def load_source_config(source: Path) -> dict[str, Any]:
@@ -151,10 +169,20 @@ def load_source_config(source: Path) -> dict[str, Any]:
 
 
 def load_source_weights(source: Path) -> dict[str, torch.Tensor]:
-    """Read every top-level ``*.safetensors`` file in ``source``."""
+    """Read ``source``'s weights, following its shard index when it has one.
+
+    A sharded source names every file and every tensor in ``_INDEX_FILE``. Reading
+    the directory instead would accept a stale or unrelated file in place of a
+    shard the index names, so the files and their contents are matched against it
+    and any difference refuses the source. Only an unindexed source is read by
+    listing its ``*.safetensors`` files.
+    """
     from safetensors.torch import load_file
 
     files = sorted(source.glob("*.safetensors"))
+    index_file = source / _INDEX_FILE
+    if index_file.is_file():
+        return _load_indexed_weights(source, files, json.loads(index_file.read_text()), load_file)
     if not files:
         raise FileNotFoundError(f"no *.safetensors weights in {source}")
     state: dict[str, torch.Tensor] = {}
@@ -165,6 +193,58 @@ def load_source_weights(source: Path) -> dict[str, torch.Tensor]:
             raise ValueError(f"{file.name} repeats keys from another file: {sorted(repeated)[:5]}")
         state.update(part)
     return state
+
+
+def _load_indexed_weights(
+    source: Path, files: list[Path], index: dict[str, Any], load_file: Any
+) -> dict[str, torch.Tensor]:
+    """Read exactly the files the index names, with exactly the tensors it assigns them."""
+    weight_map = index.get("weight_map")
+    if not isinstance(weight_map, dict) or not weight_map:
+        raise ValueError(f"{source / _INDEX_FILE} has no weight_map")
+    keys_by_file: dict[str, set[str]] = {}
+    for key, name in weight_map.items():
+        keys_by_file.setdefault(name, set()).add(key)
+    on_disk = {file.name for file in files}
+    absent = sorted(keys_by_file.keys() - on_disk)
+    unlisted = sorted(on_disk - keys_by_file.keys())
+    if absent or unlisted:
+        raise ValueError(
+            f"{source / _INDEX_FILE} lists {len(keys_by_file)} shards; {len(absent)} are missing "
+            f"{absent[:5]} and {len(unlisted)} files it does not list are present {unlisted[:5]}"
+        )
+    state: dict[str, torch.Tensor] = {}
+    for name, keys in sorted(keys_by_file.items()):
+        part = load_file(source / name)
+        if set(part) != keys:
+            raise ValueError(
+                f"{name} holds {len(part)} tensors but the index assigns it {len(keys)}: "
+                f"missing {sorted(keys - set(part))[:5]}, unlisted {sorted(set(part) - keys)[:5]}"
+            )
+        state.update(part)
+    return state
+
+
+def check_norm_eps(transformer: torch.nn.Module, rms_norm_eps: float) -> None:
+    """Raise ``ValueError`` if a norm the source's epsilon should reach does not use it.
+
+    The source normalises with one epsilon throughout, so every norm the built
+    transformer runs must use it. Which value a norm ends up with is a property
+    of the model rather than of the config field it is meant to come from, so it
+    is read back off the built modules: a norm that takes its epsilon elsewhere
+    changes the outputs while every config value still agrees.
+    """
+    wrong = {
+        name: module.eps
+        for name, module in transformer.named_modules()
+        if isinstance(getattr(module, "eps", None), float) and module.eps != rms_norm_eps
+    }
+    if wrong:
+        named = sorted(wrong.items())
+        raise ValueError(
+            f"the source normalises with rms_norm_eps={rms_norm_eps!r}, but {len(wrong)} norms "
+            f"of the built transformer use another epsilon: {named[:5]}"
+        )
 
 
 def map_state_dict(
@@ -206,11 +286,13 @@ def convert(hf_dir: str, config_path: str, out: str, seed: int | None = None) ->
     if out_path.exists() and (not out_path.is_dir() or any(out_path.iterdir())):
         raise FileExistsError(f"{out_path} already exists and is not an empty directory")
 
-    source = resolve_source(hf_dir, "config.json")
+    source = resolve_source(hf_dir, ["config.json"])
     if source.resolve() in (out_path.resolve(), *out_path.resolve().parents):
         raise ValueError(f"refusing to write inside the source model directory {source.resolve()}")
-    check_config(load_source_config(source), config.model)
-    hf_state = load_source_weights(resolve_source(hf_dir, "*.safetensors"))
+    hf_config = load_source_config(source)
+    check_config(hf_config, config.model)
+    weights_dir = resolve_source(hf_dir, ["*.safetensors", f"*{_INDEX_FILE}"])
+    hf_state = load_source_weights(weights_dir)
     converted = map_state_dict(hf_state, config.model.tie_embeddings)
 
     seed = config.train.seed if seed is None else seed
@@ -222,6 +304,7 @@ def convert(hf_dir: str, config_path: str, out: str, seed: int | None = None) ->
         config.vlm,
         frames_per_clip=config.video.max_frames if config.video is not None else 1,
     )
+    check_norm_eps(wrapper.transformer, hf_config["rms_norm_eps"])
     target = wrapper.transformer.state_dict()
     extra = sorted(converted.keys() - target.keys())
     missing = sorted(target.keys() - converted.keys())
