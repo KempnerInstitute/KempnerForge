@@ -158,6 +158,61 @@ class TestMFU:
 
 
 # ---------------------------------------------------------------------------
+# Decoupled head_dim
+# ---------------------------------------------------------------------------
+
+
+class TestMFUDecoupledHeadDim:
+    """The attention term scales with the attention width ``n_heads * head_dim``,
+    which equals ``dim`` only while the head width is inferred."""
+
+    @staticmethod
+    def _attention_term(override: int, s1: int, s2: int) -> int:
+        """Isolate the per-token attention FLOPs by varying only seq_len: the
+        parameter term is constant, so the difference is that term alone."""
+        cfg = ModelConfig(
+            dim=64,
+            n_layers=2,
+            n_heads=4,
+            n_kv_heads=2,
+            head_dim_override=override,
+            vocab_size=256,
+            max_seq_len=256,
+        )
+        return estimate_model_flops_per_token(cfg, seq_len=s2) - estimate_model_flops_per_token(
+            cfg, seq_len=s1
+        )
+
+    def test_attention_term_follows_the_decoupled_width(self):
+        # 4 heads * 32 = a 128-wide attention over a 64-wide residual.
+        assert self._attention_term(32, 32, 64) == 12 * 2 * (4 * 32) * (64 - 32)
+
+    def test_attention_term_is_unchanged_when_inferred(self):
+        assert self._attention_term(0, 32, 64) == 12 * 2 * 64 * (64 - 32)
+
+    def test_a_wider_head_costs_proportionally_more(self):
+        assert self._attention_term(32, 32, 64) == 2 * self._attention_term(16, 32, 64)
+
+    def test_moe_attention_term_follows_the_decoupled_width(self):
+        def flops(s: int) -> int:
+            cfg = ModelConfig(
+                dim=64,
+                n_layers=2,
+                n_heads=4,
+                n_kv_heads=2,
+                head_dim_override=32,
+                vocab_size=256,
+                max_seq_len=256,
+                num_experts=4,
+                moe_top_k=2,
+            )
+            assert cfg.is_moe
+            return estimate_model_flops_per_token(cfg, seq_len=s)
+
+        assert flops(64) - flops(32) == 12 * 2 * (4 * 32) * (64 - 32)
+
+
+# ---------------------------------------------------------------------------
 # Memory tracking
 # ---------------------------------------------------------------------------
 
