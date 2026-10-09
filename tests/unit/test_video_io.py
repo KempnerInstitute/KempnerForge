@@ -375,6 +375,26 @@ def _write_clip_with_audio(
                 container.mux(packet)
 
 
+def _write_clip_at_times(path, times, *, codec="mpeg4", rate=10) -> None:
+    """An indexed clip whose frame ``i`` is presented at ``times[i]`` seconds."""
+    from fractions import Fraction
+
+    import av
+
+    with av.open(str(path), mode="w") as container:
+        stream = container.add_stream(codec, rate=rate)
+        stream.width = stream.height = 64
+        stream.pix_fmt = "yuv420p"
+        stream.codec_context.time_base = Fraction(1, 1000)
+        for i, at in enumerate(times):
+            frame = av.VideoFrame.from_ndarray(_index_frame(i), format="rgb24")
+            frame.pts, frame.time_base = round(at * 1000), Fraction(1, 1000)
+            for packet in stream.encode(frame):
+                container.mux(packet)
+        for packet in stream.encode():
+            container.mux(packet)
+
+
 def _end_edit_list_at(src, dst, end_s: float) -> None:
     """Copy an MP4 whose edit list holds one edit, ending that edit at ``end_s``."""
     import struct
@@ -441,13 +461,17 @@ def _fresh_pts(path) -> list[int]:
 class _FakeContainer:
     """An open input over a list of fake packets, as ``_video_extent`` reads one: ``demux``
     reads on from the current position and ``seek`` moves it to the last keyframe at or
-    before the target (decode time, else presentation time), like a backward seek."""
+    before the target (decode time, else presentation time), like a backward seek.
+    ``metadata`` is the container's reported duration in microseconds, if it has one."""
 
-    def __init__(self, packets, time_base, size=1000):
+    def __init__(self, packets, time_base, size=1000, metadata=None):
         from types import SimpleNamespace
 
         self.packets, self.size, self.at, self.seeks = packets, size, 0, []
-        self.streams = SimpleNamespace(video=[SimpleNamespace(time_base=time_base)])
+        self.duration = metadata  # microseconds, as a container reports it
+        self.streams = SimpleNamespace(
+            video=[SimpleNamespace(time_base=time_base, duration=None, frames=0, average_rate=None)]
+        )
 
     def demux(self, stream):
         return iter(self.packets[self.at :])
@@ -600,6 +624,25 @@ class TestDecodeStartOffset:
         start, span = _full_extent(base)  # the video stream's own extent
         assert span == pytest.approx(_full_extent(shifted)[1])
         assert _indices(shifted) == _indices(base) == _rule_indices(base, start, span)
+
+    @pytest.mark.parametrize("suffix", ["flv", "asf", "mp4", "mkv"])
+    def test_one_frame_clip_samples_its_whole_length(self, tmp_path, suffix):
+        """A single frame leaves no step between timestamps to measure, so the span comes
+        from the metadata; a zero span would return one frame where four were asked for."""
+        codec = {"flv": "flv", "asf": "wmv2"}.get(suffix, "mpeg4")
+        path = tmp_path / f"one.{suffix}"
+        _write_indexed_clip(path, n_frames=1, fps=10, codec=codec)
+        assert _indices(path) == [0, 0, 0, 0]
+
+    @pytest.mark.parametrize("suffix", ["flv", "asf", "mkv", "mp4"])
+    def test_variable_frame_rate_is_measured_by_its_packets(self, tmp_path, suffix):
+        """Frames at 0, 0.1, 0.8 and 1.0 s: no step between timestamps describes the clip,
+        so the span must come from the last frame's own end, not from an average."""
+        codec = {"flv": "flv", "asf": "wmv2"}.get(suffix, "mpeg4")
+        path = tmp_path / f"vfr.{suffix}"
+        _write_clip_at_times(path, [0.0, 0.1, 0.8, 1.0], codec=codec)
+        start, span = _full_extent(path)
+        assert _indices(path) == _rule_indices(path, start, span)
 
     def test_b_frame_delay_keeps_selection(self, tmp_path):
         """MPEG-4 B-frames in AVI: the stream starts at 0 s but its first frame at 33 ms."""
@@ -1005,31 +1048,74 @@ class TestVideoExtent:
 
 
 class TestSpan:
-    """``_span`` measures from the start to where the last presented packet ends."""
+    """``_span`` measures from the start to where the last presented frame ends."""
 
-    def test_last_packet_duration(self):
+    def test_last_packet_duration_is_the_end(self):
+        """With a duration on the last packet the end is known, whatever the metadata."""
         from fractions import Fraction
 
         from kempnerforge.data.video_io import _span
 
         runs = [[(10, 1), (13, 1), (11, 1), (12, 2)]]
-        assert _span(10, runs, Fraction(1, 10)) == pytest.approx((1.0, 0.4))
+        assert _span(10, runs, Fraction(1, 10), 99.0) == pytest.approx((1.0, 0.4))
 
-    def test_missing_duration_is_the_median_step_within_runs(self):
-        """Steps 1, 2 and 6 give 2; the gap between the two reads (9 -> 20) is not a step."""
+    def test_metadata_gives_the_end_the_packets_do_not(self):
+        """Variable-rate packets at 0, 0.1, 0.8 and 1.0 s with no duration: the last frame
+        is shown for a second, which no step between timestamps says and only the
+        metadata duration knows."""
+        from fractions import Fraction
+
+        from kempnerforge.data.video_io import _span
+
+        runs = [[(0, 0), (100, 0)], [(800, 0), (1000, 0)]]
+        assert _span(0, runs, Fraction(1, 1000), 2.0) == pytest.approx((0.0, 2.0))
+
+    def test_metadata_read_as_an_end_time_when_a_length_would_fall_short(self):
+        """A duration reported as an end on the stream clock (Matroska, ASF) covers the
+        stream's start as well, so the span is what is left after it."""
+        from fractions import Fraction
+
+        from kempnerforge.data.video_io import _span
+
+        runs = [[(5000, 0), (5100, 0)], [(6900, 0)]]
+        assert _span(5000, runs, Fraction(1, 1000), 7.0) == pytest.approx((5.0, 2.0))
+
+    def test_metadata_read_as_a_length_when_an_end_time_would_fall_short(self):
+        """A duration reported as a length (MP4, FLV) is the span itself: read as an end
+        time it would not even reach the last timestamp. The step between the timestamps
+        read is half the length the metadata gives the last frame, so the two differ."""
+        from fractions import Fraction
+
+        from kempnerforge.data.video_io import _span
+
+        runs = [[(5000, 0), (5050, 0)], [(6900, 0)]]
+        assert _span(5000, runs, Fraction(1, 1000), 2.0) == pytest.approx((5.0, 2.0))
+
+    def test_single_packet_takes_its_length_from_the_metadata(self):
+        """One frame leaves no step to measure, so without the metadata the span would
+        collapse to zero and the clip would yield a single frame."""
+        from fractions import Fraction
+
+        from kempnerforge.data.video_io import _span
+
+        assert _span(0, [[(0, 0)]], Fraction(1, 10), 0.1) == pytest.approx((0.0, 0.1))
+
+    def test_unusable_metadata_falls_back_to_the_median_step(self):
+        """Metadata that does not even reach the last timestamp says nothing: steps 1, 2
+        and 6 give 2, and the gap between the two reads (9 -> 20) is not a step."""
         from fractions import Fraction
 
         from kempnerforge.data.video_io import _span
 
         runs = [[(0, 0), (3, 0), (1, 0), (9, 0)], [(20, 0)]]
-        assert _span(0, runs, Fraction(1, 1)) == (0.0, 22.0)
+        assert _span(0, runs, Fraction(1, 1), 0.0) == (0.0, 22.0)
 
-    def test_single_packet_without_duration(self):
+    def test_single_packet_without_usable_metadata(self):
         from fractions import Fraction
 
         from kempnerforge.data.video_io import _span
 
-        assert _span(5, [[(5, 0)]], Fraction(1, 2)) == (2.5, 0.0)
+        assert _span(5, [[(5, 0)]], Fraction(1, 2), 0.0) == (2.5, 0.0)
 
 
 # ---------------------------------------------------------------------------
