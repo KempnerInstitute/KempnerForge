@@ -366,6 +366,13 @@ def _decode_seek(
     skipped) or on a frame that is not a keyframe (the container's index named a seek
     point the stream does not have, so frames decode without their references), or a
     seek after which nothing decodes.
+
+    Two of those are expected rather than exceptional, and reading either as a fault
+    would be a misreading. A container that indexes by decode time lands past a target
+    that sits within the stream's reorder delay of a keyframe, and the last target,
+    which the span places just past the final frame, can leave a sparsely indexed
+    container with nothing to return. Both fall back to the serial pass and return
+    exactly its frames, at the cost of reading the clip again.
     """
     time_base = stream.time_base
     images: list[PILImage] = []
