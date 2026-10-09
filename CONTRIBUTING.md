@@ -307,6 +307,12 @@ tests/
   conftest.py    — Shared fixtures (tiny configs, data helpers)
 ```
 
+## Where to Contribute
+
+- **Examples (`examples/<name>/`) are the place for most new work:** an experiment's configs, its own `train.py`, data-preparation and conversion scripts, evaluation, and any custom components it registers through the config's `plugins` list, as long as a plain-string config field selects them — the enum-backed selectors (the scheduler name, the model norm and activation) accept only their built-in values. Keep each example self-contained, with its own README and tests.
+- **Core (`kempnerforge/`) takes only general building blocks that any model can use:** an optimizer, a scheduler, a norm, router or MLP, a parallelism axis, or a general model option. A new building block enters through the registry or a general config field, and every code change in core, bug fixes included, comes with tests. Core contains no reference to `examples/`; example modules reach it only through the `plugins` list the config names. Anything that goes into core needs a PR labeled `core`, and it is merged only after the KempnerForge team approves it.
+- **When in doubt, start in an example.** Move something into core once a second, unrelated use needs it.
+
 ## Adding a New Feature
 
 ### New config field
