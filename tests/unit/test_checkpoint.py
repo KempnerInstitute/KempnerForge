@@ -1464,36 +1464,36 @@ class TestResumeWithUnsteppedParameters:
         assert unheld["state"] == {}
 
     @pytest.mark.parametrize(
-        ("case", "mutate", "message"),
+        ("mutate", "message"),
         [
-            (
-                "whole_state_missing",
+            pytest.param(
                 lambda state: state["optimizer"]["state"].pop("unused.weight"),
                 "Missing key in checkpoint state_dict: optimizer.state.unused.weight.",
+                id="whole_state_missing",
             ),
-            (
-                "state_omitted",
+            pytest.param(
                 lambda state: state["optimizer"].update(state={}),
                 "Missing key in checkpoint state_dict: optimizer.state.",
+                id="state_omitted",
             ),
-            (
-                "state_key_renamed",
+            pytest.param(
                 lambda state: state["optimizer"]["state"].update(
                     renamed=state["optimizer"]["state"].pop("unused.weight")
                 ),
                 "Missing key in checkpoint state_dict: optimizer.state.unused.weight.",
+                id="state_key_renamed",
             ),
-            (
-                "record_contradicts_saved_state",
+            pytest.param(
                 lambda state: state.update(
                     optimizer_never_stepped={"unused.weight": torch.zeros((), dtype=torch.bool)}
                 ),
                 "recorded as never stepped but have saved optimizer state: ['unused.weight']",
+                id="record_contradicts_saved_state",
             ),
         ],
     )
     def test_a_stepped_parameter_without_a_sound_record_still_fails(
-        self, tmp_path, case, mutate, message
+        self, tmp_path, mutate, message
     ):
         """State that went missing is not a parameter that never received a gradient."""
         from torch.distributed.checkpoint.api import CheckpointException
