@@ -131,3 +131,16 @@ def test_entry_point_requires_a_config(monkeypatch: pytest.MonkeyPatch) -> None:
     with pytest.raises(SystemExit) as exc:
         module.main()
     assert exc.value.code == 1
+
+
+def test_eval_test_doubles_do_not_reach_this_tier() -> None:
+    """The eval unit tests put a fake ``lmms_eval`` in ``sys.modules``; sharing a session
+    with them must not leave it standing in for the real package here. A real install is
+    fine -- the fakes are the ones with no ``__file__``."""
+    doubles = sorted(
+        name
+        for name, module in list(sys.modules.items())
+        if (name == "lmms_eval" or name.startswith("lmms_eval."))
+        and getattr(module, "__file__", None) is None
+    )
+    assert not doubles, f"fake lmms_eval modules are live outside their own tier: {doubles}"
