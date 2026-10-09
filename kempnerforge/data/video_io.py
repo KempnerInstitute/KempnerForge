@@ -339,7 +339,9 @@ def _decode_seek(
 
     Selection matches ``_decode_serial`` byte-for-byte: frame times count from ``start``,
     each target takes the first frame with ``time + _MATCH_EPS_S >= target`` (one frame
-    may satisfy several targets), and targets past the last frame take that frame.
+    may satisfy several targets), and targets past the last frame take that frame. Where
+    several targets take the same frame they are handed one image rather than one each,
+    which a serial pass builds separately; the pixels are the same, the object is not.
 
     The first targets are decoded from ``packets``, the stream from its first packet,
     without a seek, so the first frames are exactly serial's. After a match the same
@@ -351,8 +353,10 @@ def _decode_seek(
     (the frame-threading latency, which only a decode populates, hence reading it here);
     a seek discards them and must decode as many again before output resumes, so it
     costs about twice that. Seeking therefore pays when the whole groups in between hold
-    more frames than that, counted at the last group's length. With no group measured
-    yet it seeks. A seek that lands no further than where it was decided means the
+    more frames than that, counted at the longest keyframe interval seen so a stream
+    whose keyframes are irregularly spaced, as a scene cut leaves them, is never credited
+    with more groups than it has. With no interval measured yet it seeks. A seek that
+    lands no further than where it was decided means the
     container indexes fewer seek points than the stream has keyframes, so the rest of
     the clip is decoded without seeking. Seeking once per target instead would re-decode
     a group once for every target inside it.
@@ -379,6 +383,7 @@ def _decode_seek(
         last = None
         matched = False
         prev_key_t: float | None = None
+        gop_s = 0.0  # the longest keyframe interval seen, so groups are never over-counted
         group = 0  # frames decoded since the last keyframe
         skip_ahead = False
         for frame in (frame for packet in packets for frame in packet.decode()):
@@ -403,13 +408,15 @@ def _decode_seek(
                 tgt = targets[j]
                 matched = True
             elif matched and frame.key_frame and seeking:
-                gop_s = None if prev_key_t is None else t - prev_key_t
-                skippable = None if not gop_s or gop_s < 0 else (tgt - t) // gop_s * group
+                longest = gop_s if prev_key_t is None else max(gop_s, t - prev_key_t)
+                skippable = None if not longest or longest < 0 else (tgt - t) // longest * group
                 if skippable is None or skippable > 2 * (stream.codec_context.delay or 0):
                     skip_ahead = True
                     decided_at = t
                     break
             if frame.key_frame:
+                if prev_key_t is not None:
+                    gop_s = max(gop_s, t - prev_key_t)
                 prev_key_t = t
                 group = 0
             group += 1

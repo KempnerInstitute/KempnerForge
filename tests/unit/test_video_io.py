@@ -1828,10 +1828,13 @@ class _FakeSeekContainer:
     """A 10 fps stream with a keyframe every ``gop`` frames.
 
     ``seek`` moves to the last keyframe at or before the requested time, then
-    ``land_late`` keyframes further; ``land_at_start`` lands on the first frame, as a
-    container whose index holds a single entry; ``land_on_any_frame`` moves to the frame at
-    that time instead, and ``empty_after_seek`` leaves nothing to decode.
-    ``first_frame_key=False`` leaves frame 0 unflagged.
+    ``land_late`` keyframes further, or on the frame at ``land_at_s`` whatever was asked
+    for, as a container whose index is coarser than the stream's keyframes; ``land_at_start``
+    lands on the first frame, as a container whose index holds a single entry;
+    ``land_on_any_frame`` moves to the frame at that time instead, and
+    ``empty_after_seek`` leaves nothing to decode.
+    ``first_frame_key=False`` leaves frame 0 unflagged, and ``keys`` names the keyframes
+    outright, for a stream whose keyframes are not evenly spaced.
     """
 
     def __init__(
@@ -1840,20 +1843,25 @@ class _FakeSeekContainer:
         gop,
         *,
         land_late=0,
+        land_at_s=None,
         land_at_start=False,
         land_on_any_frame=False,
         empty_after_seek=False,
         timed=True,
         first_frame_key=True,
+        keys=None,
     ):
+        def is_key(i):
+            if keys is not None:
+                return i in keys
+            return i % gop == 0 and (i > 0 or first_frame_key)
+
         self.frames = [
-            _FakeSeekFrame(
-                i, i / 10 if timed else None, i % gop == 0 and (i > 0 or first_frame_key)
-            )
-            for i in range(n_frames)
+            _FakeSeekFrame(i, i / 10 if timed else None, is_key(i)) for i in range(n_frames)
         ]
         self.gop = gop
         self.land_late = land_late
+        self.land_at_s = land_at_s
         self.land_at_start = land_at_start
         self.land_on_any_frame = land_on_any_frame
         self.empty_after_seek = empty_after_seek
@@ -1865,8 +1873,15 @@ class _FakeSeekContainer:
         t = float(offset * stream.time_base)
         self.seeks.append(t)
         index = int(t * 10 + 1e-6)
-        key = index if self.land_on_any_frame else index // self.gop * self.gop
+        if self.land_on_any_frame:
+            key = index
+        else:  # the last keyframe at or before the requested time
+            key = max(
+                (i for i, f in enumerate(self.frames) if f.key_frame and i <= index), default=0
+            )
         landed = 0 if self.land_at_start else max(0, key + self.land_late * self.gop)
+        if self.land_at_s is not None:
+            landed = int(self.land_at_s * 10 + 1e-6)
         self.pos = len(self.frames) if self.empty_after_seek else landed
 
     def demux(self, stream):
@@ -1928,6 +1943,16 @@ class TestSeekCursor:
         assert _run_fake(container, [0.0, 2.5], delay=1000) == [0, 25]
         assert container.seeks == [2.5]
 
+    def test_irregular_keyframes_are_counted_at_their_longest_interval(self):
+        """Keyframes at 0, 1, 2 and 2.2 s, with the decision taken at 2.2 s. Measuring only
+        the interval just ended, 0.2 s, makes the 0.8 s to the target look like four whole
+        groups of two frames and so 8 frames worth skipping, when the second behind it is
+        a whole second and does not even fit once. Counted at the longest interval seen,
+        nothing whole is skippable and a decoder holding 2 frames decodes on."""
+        container = _FakeSeekContainer(100, gop=10, keys={0, 10, 20, 22})
+        assert _run_fake(container, [2.0, 3.0], delay=2) == [20, 30]
+        assert container.seeks == []
+
     def test_seek_landing_past_its_target_raises(self):
         from kempnerforge.data.video_io import _SeekUnreliableError
 
@@ -1948,6 +1973,16 @@ class TestSeekCursor:
         container = _FakeSeekContainer(100, gop=10, empty_after_seek=True)
         with pytest.raises(_SeekUnreliableError, match="no frames decodable at or after 5.000s"):
             _run_fake(container, [0.0, 5.0])
+
+    def test_a_seek_landing_before_its_decision_but_after_the_start(self):
+        """A container whose index is coarser than the stream's keyframes lands short of
+        where the decision was made, which is what says the index cannot be trusted: the
+        rest is decoded without seeking. The decision here is taken at 4 s and the seek
+        lands at 2 s, strictly inside the stream, so a decision point left unset at the
+        stream's own start would not account for it."""
+        container = _FakeSeekContainer(200, gop=10, land_at_s=2.0)
+        assert _run_fake(container, [3.0, 9.0, 19.9]) == [30, 90, 199]
+        assert container.seeks == [9.0]  # 19.9 s is then reached by decoding on
 
     def test_frame_without_timestamp_raises(self):
         from kempnerforge.data.video_io import _SeekUnreliableError
@@ -2098,6 +2133,32 @@ class TestSeekFallback:
         assert "error" not in result, result.get("error")
         assert (counts["opens"], counts["seeks"]) == (1, 0)
         assert _frame_index(result["frames"][0]) == 0
+
+    def test_fallback_covers_a_decoder_error_not_only_an_unreliable_seek(
+        self, tmp_path, monkeypatch
+    ):
+        """The seeking decoder also raises through ``av``: a seek it issues can fail
+        outright. That is recoverable in the same way, so it must reach the serial pass
+        rather than the caller."""
+        import errno
+
+        import av
+
+        import kempnerforge.data.video_io as video_io
+
+        path = tmp_path / "clip.mp4"
+        _write_mp4(path, n_frames=40, gop_size=12)
+        expected = _serial_reference(path, 2.0, 4, 8)
+
+        def _raise(container, stream, packets, targets, start):
+            raise av.error.PermissionError(errno.EPERM, "cannot seek there")
+
+        reasons = []
+        monkeypatch.setattr(video_io, "_decode_seek", _raise)
+        monkeypatch.setattr(video_io, "_log_fallback_once", reasons.append)
+        got = video_io.decode_video_frames(str(path), fps=2.0, min_frames=4, max_frames=8)
+        assert reasons == ["PermissionError"]
+        assert [f.tobytes() for f in got] == [f.tobytes() for f in expected]
 
     def test_fallback_replays_inside_the_same_container(self, tmp_path, monkeypatch):
         """The serial fallback re-reads the stream through the container already open, so
