@@ -59,8 +59,8 @@ seq_len = 576                # at most model.max_seq_len
 tokenizer_path = "<tokenizer>"
 
 [vision_encoder]
-type = "<encoder>"            # a registered encoder
-path = "<pretrained-weights>" # for encoders that load pretrained weights
+type = "siglip2"              # a registered encoder ("random" needs no weights)
+path = "<pretrained-weights>" # the weights a pretrained encoder loads
 
 [adapter]
 type = "avgpool"          # or "attentional_pool"; pools patches per frame
