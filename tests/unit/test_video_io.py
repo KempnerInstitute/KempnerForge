@@ -1021,12 +1021,13 @@ class TestSpan:
 
     def test_metadata_read_as_a_length_when_an_end_time_would_fall_short(self):
         """A duration reported as a length (MP4, FLV) is the span itself: read as an end
-        time it would not even reach the last timestamp."""
+        time it would not even reach the last timestamp. The step between the timestamps
+        read is half the length the metadata gives the last frame, so the two differ."""
         from fractions import Fraction
 
         from kempnerforge.data.video_io import _span
 
-        runs = [[(5000, 0), (5100, 0)], [(6900, 0)]]
+        runs = [[(5000, 0), (5050, 0)], [(6900, 0)]]
         assert _span(5000, runs, Fraction(1, 1000), 2.0) == pytest.approx((5.0, 2.0))
 
     def test_single_packet_takes_its_length_from_the_metadata(self):
