@@ -66,6 +66,23 @@ def test_attention_is_wider_than_the_model(config: JobConfig) -> None:
     assert attention.q_norm is not None and attention.q_norm.weight.shape == (128,)
 
 
+def test_the_decoder_normalises_with_the_source_epsilon(config: JobConfig) -> None:
+    """Every norm the block runs must use the epsilon the backbone was trained with.
+
+    The config value alone does not settle this: a norm that takes its epsilon
+    from somewhere else normalises differently while the config still reads as
+    intended, so the built block is asked directly.
+    """
+    block = TransformerBlock(config.model, layer_idx=0)
+    epsilons = {
+        name: module.eps
+        for name, module in block.named_modules()
+        if isinstance(getattr(module, "eps", None), float)
+    }
+    assert set(epsilons) >= {"attention.q_norm", "attention.k_norm", "attention_norm", "mlp_norm"}
+    assert epsilons == dict.fromkeys(epsilons, SOURCE["rms_norm_eps"])
+
+
 def test_vision_tokens_and_caption_fit_the_context(config: JobConfig) -> None:
     assert config.vision_encoder is not None and config.adapter is not None
     assert config.video is not None and config.vlm is not None
@@ -101,6 +118,10 @@ def test_paths_are_placeholders_and_wandb_is_off(config: JobConfig) -> None:
     assert config.video is not None
     assert config.video.data_root == "path-to-webvid-10m"
     assert config.checkpoint.dir == "path-to-output-dir"
+    assert config.checkpoint.load_path == "path-to-init-checkpoint"
+    # Left at its default, every run would write its events into the same
+    # relative directory, mixing a shakedown's with the real run's.
+    assert config.metrics.tensorboard_dir == "path-to-tensorboard-dir"
     assert config.metrics.enable_wandb is False
     raw = tomllib.loads(CONFIG.read_text())
     assert "wandb_project" not in raw["metrics"] and "wandb_run_name" not in raw["metrics"]
