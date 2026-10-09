@@ -136,20 +136,25 @@ def _span(
     ``metadata`` duration knows how long that last frame is shown, which on
     variable-rate video is not the step between any two timestamps and on a one-frame
     stream has no step at all. A duration is reported either as a length or as an end
-    time on the stream clock, and the two differ by the stream's start, so the one that
-    cannot be read as reaching the last timestamp is ruled out; if neither does, the
-    metadata is unusable and the last frame is given the median step between the
-    timestamps read, taken within runs so the gap between two reads is not a step.
+    time on the stream clock, and the two differ by the stream's start, so a reading is
+    taken only where it reaches the last timestamp and leaves the frames a positive
+    time to be shown in; a one-frame stream, whose extent is zero, is what the second
+    rules out. Where no duration is reported at all it arrives here as zero, which says
+    nothing and is not an end time. With neither reading left the last frame is given
+    the median step between the timestamps read, taken within runs so the gap between
+    two reads is not a step.
     """
     end, duration = max(max(run) for run in runs)
     if duration:
         return float(start * time_base), float((end + duration - start) * time_base)
     begins = float(start * time_base)
     extent = float((end - start) * time_base)
-    if metadata - begins >= extent:  # reaches the last timestamp as an end time
-        return begins, metadata - begins
-    if metadata >= extent:  # reaches it as a length
-        return begins, metadata
+    if metadata > 0:
+        as_end = metadata - begins  # read as an end time on the stream clock
+        if as_end >= extent and as_end > 0:
+            return begins, as_end
+        if metadata >= extent:  # read as a length
+            return begins, metadata
     pts = (sorted(p for p, _ in run) for run in runs)
     steps = [b - a for run in pts for a, b in itertools.pairwise(run) if b > a]
     shown = statistics.median(steps) if steps else 0
@@ -272,11 +277,13 @@ def decode_video_frames(
     always returned). Frame times and the sampled span come from the video stream's
     packet timestamps, read from the same open container (``_video_extent``): times
     count from the stream's start, so a stream whose timestamps start after zero is
-    sampled like one starting at zero, and the span ends where its last frame ends,
-    whatever the container's duration covers. For a pipe, which can be read only once,
-    and a stream without timestamps (a raw elementary stream), the span comes from the
-    container metadata and times count from the first frame that has a timestamp; a
-    frame without a timestamp counts as time zero. The returned list has length equal
+    sampled like one starting at zero, and the span ends where its last frame ends.
+    Where the last packet carries no duration, the container's duration supplies that
+    end, read as a length or as an end time, so a duration that covers other streams
+    can extend it; for a pipe, which can be read only once, and a stream without
+    timestamps (a raw elementary stream), the whole span comes from the container
+    metadata and times count from the first frame that has a timestamp; a frame
+    without a timestamp counts as time zero. The returned list has length equal
     to the number of sampled timestamps (``<= max_frames``), or is empty when the file
     has no decodable video stream.
 
