@@ -38,7 +38,8 @@ SOURCE_CONFIG = {
     "num_key_value_heads": 2,
     "head_dim": 16,
     "intermediate_size": 96,
-    # Equal to the attention q/k-norm eps, so the logits below match bit for bit.
+    # The epsilon every norm of the built transformer uses, so the logits below
+    # match bit for bit.
     "rms_norm_eps": 1e-5,
     "rope_theta": 1e6,
     "max_position_embeddings": 64,
@@ -243,13 +244,57 @@ class TestRoundTrip:
         monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_snapshot_download)
         out = conv.convert("some-org/some-model", _target(tmp_path), str(tmp_path / "out"))
         assert calls == [
-            {"repo_id": "some-org/some-model", "allow_patterns": p, "ignore_patterns": ["*/*"]}
+            {
+                "repo_id": "some-org/some-model",
+                "allow_patterns": p,
+                "ignore_patterns": ["*/*"],
+                "revision": None,  # the snapshot is not named for a commit here
+            }
             for p in (
                 ["config.json"],
-                ["*.safetensors", "*model.safetensors.index.json"],
+                ["*.safetensors", "*.safetensors.index*.json"],
             )
         ]
         assert (out / ".metadata").is_file()
+
+    def test_hub_weights_are_fetched_at_the_commit_the_config_came_from(
+        self, tied: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A moving default branch must not check one revision and convert another."""
+        import huggingface_hub
+
+        commit = "0" * 40
+        snapshot = tmp_path / "cache" / commit
+        shutil.copytree(tied, snapshot)
+        calls: list[Any] = []
+
+        def fake_snapshot_download(**kwargs: Any) -> str:
+            calls.append(kwargs.get("revision"))
+            return str(snapshot)
+
+        monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_snapshot_download)
+        out = conv.convert("some-org/some-model", _target(tmp_path), str(tmp_path / "out"))
+        assert calls == [None, commit], calls
+        assert (out / ".metadata").is_file()
+
+    def test_a_source_that_moves_between_the_two_fetches_is_refused(
+        self, tied: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import huggingface_hub
+
+        snapshots = [tmp_path / "cache" / ("0" * 40), tmp_path / "cache" / ("1" * 40)]
+        for snapshot in snapshots:
+            shutil.copytree(tied, snapshot)
+        served = iter(snapshots)
+
+        def fake_snapshot_download(**kwargs: Any) -> str:
+            return str(next(served))
+
+        monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_snapshot_download)
+        out = tmp_path / "out"
+        with pytest.raises(ValueError, match="moved between the two requests"):
+            conv.convert("some-org/some-model", _target(tmp_path), str(out))
+        assert not out.exists(), "a refused conversion must write nothing"
 
     def test_hub_config_is_checked_before_any_weights_are_fetched(
         self, tied: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -370,20 +415,34 @@ class TestConfigRefusals:
             ),
             (lambda c: c.pop("head_dim"), "config.json has no head_dim"),
             (
-                lambda c: c["rope_parameters"].update(rope_type="yarn"),
-                "rope_parameters uses rope_type='yarn'",
+                lambda c: c["rope_parameters"].update(rope_type="yarn", factor=2.0),
+                "the source uses rope_type='yarn'",
             ),
             (
                 lambda c: c.update(rope_scaling={"type": "linear", "factor": 2.0}),
-                "rope_scaling uses rope_type='linear'",
+                "the source uses rope_type='linear'",
+            ),
+            (
+                # The library's own validation is the source's problem, and refuses it.
+                lambda c: c["rope_parameters"].update(rope_type="yarn"),
+                "the installed transformers does not accept the source's config",
             ),
             (lambda c: c.update(use_sliding_window=True), "use_sliding_window is set"),
             (lambda c: c.update(attention_bias=True), "attention_bias is set"),
             (
-                # The two spellings of the theta disagree, and which one a release
-                # reads decides the positions, so neither is taken.
+                # Each spelling of the theta decides the positions, and which one a
+                # release reads differs, so a source that disagrees with itself is
+                # refused rather than resolved.
                 lambda c: c.update(rope_theta=1e6, rope_parameters={"rope_theta": 1e4}),
-                r"rope_theta=1000000.0 but rope_parameters.rope_theta=10000.0",
+                "the source gives more than one RoPE theta",
+            ),
+            (
+                lambda c: c.update(rope_theta=1e6, rope_scaling={"rope_theta": 1e4}),
+                "rope_scaling.rope_theta=10000.0",
+            ),
+            (
+                lambda c: c.update(rope_scaling={"rope_type": "default", "type": "linear"}),
+                "rope_scaling gives both rope_type='default' and type='linear'",
             ),
         ],
         ids=[
@@ -391,9 +450,12 @@ class TestConfigRefusals:
             "missing_key",
             "rope_parameters",
             "rope_scaling",
+            "rope_parameters_the_library_rejects",
             "sliding_window",
             "attention_bias",
             "rope_theta_disagrees_with_itself",
+            "rope_scaling_carries_another_theta",
+            "rope_scaling_names_two_types",
         ],
     )
     def test_source_the_target_cannot_express(
@@ -404,6 +466,35 @@ class TestConfigRefusals:
         edit(hf_config)
         config_file.write_text(json.dumps(hf_config))
         _refuses(tied_copy, _target(tmp_path), tmp_path / "out", ValueError, match)
+
+    def test_the_theta_compared_is_the_one_the_library_resolves(
+        self, tied_copy: Path, tmp_path: Path
+    ) -> None:
+        """Whichever field the installed transformers reads is what the target must match."""
+        from transformers import AutoConfig
+
+        config_file = tied_copy / "config.json"
+        hf_config = json.loads(config_file.read_text())
+        for field in ("rope_theta", "rope_parameters", "rope_scaling"):
+            hf_config.pop(field, None)
+        hf_config["rope_scaling"] = {"rope_type": "default", "rope_theta": 1e4}
+        config_file.write_text(json.dumps(hf_config))
+        resolved = AutoConfig.for_model(
+            "qwen3", **{k: v for k, v in hf_config.items() if k != "model_type"}
+        )
+        assert (resolved.rope_parameters or {})["rope_theta"] == 1e4
+
+        _refuses(
+            tied_copy,
+            _target(tmp_path, model={"rope_theta": 1e6}),
+            tmp_path / "out",
+            ValueError,
+            "rope_theta=10000.0 but model.rope_theta=1000000.0",
+        )
+        out = conv.convert(
+            str(tied_copy), _target(tmp_path, model={"rope_theta": 1e4}), str(tmp_path / "out")
+        )
+        assert (out / ".metadata").is_file()
 
     def test_the_nested_rope_theta_is_the_one_compared(
         self, tied_copy: Path, tmp_path: Path
@@ -469,30 +560,43 @@ class TestNormEpsilon:
             r"rms_norm_eps=1e-05, but 1 norms of the built transformer use another epsilon",
         )
 
-    def test_a_source_epsilon_every_norm_uses_converts(
-        self, tied_copy: Path, tmp_path: Path
+    def test_a_source_at_another_epsilon_converts_only_if_it_reproduces(
+        self, sources: Sources, tmp_path: Path
     ) -> None:
-        """At an epsilon the attention norms do not take from the config, converting refuses."""
-        config_file = tied_copy / "config.json"
-        hf_config = json.loads(config_file.read_text())
-        hf_config["rms_norm_eps"] = 1e-6
-        config_file.write_text(json.dumps(hf_config))
-        config = _target(tmp_path, model={"norm_eps": 1e-6})
+        """At an epsilon of its own, the conversion either declines or reproduces the source.
 
-        elsewhere = {
-            name: module.eps
-            for name, module in self._transformer(1e-6).named_modules()
-            if isinstance(getattr(module, "eps", None), float) and module.eps != 1e-6
-        }
-        if elsewhere:
-            message = _refuses(
-                tied_copy, config, tmp_path / "out", ValueError, "use another epsilon"
-            )
-            assert all(name in message for name in sorted(elsewhere)[:5]), message
-        else:
-            assert (
-                Path(conv.convert(str(tied_copy), config, str(tmp_path / "out"))) / ".metadata"
-            ).is_file()
+        What it must never do is write a checkpoint whose outputs differ, so the
+        test asserts the outputs rather than re-deriving the condition to refuse on.
+        """
+        source = Path(shutil.copytree(sources[True][0], tmp_path / "source"))
+        hf_config = json.loads((source / "config.json").read_text())
+        hf_config["rms_norm_eps"] = 1e-6
+        (source / "config.json").write_text(json.dumps(hf_config))
+        from transformers import Qwen3ForCausalLM
+
+        hf_model = Qwen3ForCausalLM.from_pretrained(source).eval()
+        config_path = _target(tmp_path, model={"norm_eps": 1e-6})
+        out = tmp_path / "out"
+
+        try:
+            conv.convert(str(source), config_path, str(out))
+        except ValueError as error:
+            assert "use another epsilon" in str(error), error
+            assert not out.exists(), "a refused conversion must write nothing"
+            return
+
+        config = load_config(config_path, cli_args=[])
+        assert config.vlm is not None and config.vision_encoder is not None
+        assert config.adapter is not None
+        torch.manual_seed(1234)
+        model = build_vlm_wrapper(config.model, config.vision_encoder, config.adapter, config.vlm)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        CheckpointManager(config.checkpoint, model, optimizer).load(
+            path=str(out), exclude_keys=["optimizer"]
+        )
+        tokens = torch.randint(0, 128, (2, 48), generator=torch.Generator().manual_seed(3))
+        with torch.no_grad():
+            assert torch.equal(model.transformer(tokens), hf_model(input_ids=tokens).logits)
 
 
 class TestWeightRefusals:
@@ -561,18 +665,22 @@ class TestWeightRefusals:
         _refuses(tied_copy, _target(tmp_path), tmp_path / "out", FileNotFoundError, match)
 
 
-def _shard(source: Path, split: Callable[[str], str]) -> dict[str, str]:
+def _shard(
+    source: Path, split: Callable[[str], str], index: str = "model.safetensors.index.json"
+) -> dict[str, str]:
     """Re-save the source's weights as the shards ``split`` assigns each tensor to."""
     weights = load_file(source / "model.safetensors")
     (source / "model.safetensors").unlink()
     weight_map = {key: split(key) for key in weights}
     for name in sorted(set(weight_map.values())):
+        path = source / name
+        path.parent.mkdir(parents=True, exist_ok=True)
         save_file(
             {k: v for k, v in weights.items() if weight_map[k] == name},
-            source / name,
+            path,
             metadata={"format": "pt"},
         )
-    (source / "model.safetensors.index.json").write_text(json.dumps({"weight_map": weight_map}))
+    (source / index).write_text(json.dumps({"weight_map": weight_map}))
     return weight_map
 
 
@@ -602,11 +710,56 @@ class TestShardIndex:
             tied_copy, _target(tmp_path), tmp_path / "out", ValueError, "lists 2 shards"
         )
         assert "model-00002-of-00002.safetensors" in message, message
-        assert "model.safetensors" in message, message
         assert set(weight_map.values()) == {
             "model-00001-of-00002.safetensors",
             "model-00002-of-00002.safetensors",
         }
+
+    def test_a_variant_index_is_followed_too(self, tied_copy: Path, tmp_path: Path) -> None:
+        """An index named for a weights variant is still the authority on the shards."""
+        _shard(tied_copy, self._two_shards, index="model.safetensors.index.fp16.json")
+        out = conv.convert(str(tied_copy), _target(tmp_path), str(tmp_path / "out"))
+        assert (out / ".metadata").is_file()
+
+        (tied_copy / "model-00002-of-00002.safetensors").unlink()
+        _refuses(tied_copy, _target(tmp_path), tmp_path / "out2", ValueError, "lists 2 shards")
+
+    def test_two_indexes_are_refused(self, tied_copy: Path, tmp_path: Path) -> None:
+        _shard(tied_copy, self._two_shards)
+        (tied_copy / "model.safetensors.index.fp16.json").write_text(
+            (tied_copy / "model.safetensors.index.json").read_text()
+        )
+        _refuses(
+            tied_copy, _target(tmp_path), tmp_path / "out", ValueError, "holds 2 shard indexes"
+        )
+
+    @pytest.mark.parametrize("prefix", ["./", "shards/"], ids=["relative", "subdirectory"])
+    def test_an_index_name_is_read_relative_to_the_source(
+        self, tied_copy: Path, tmp_path: Path, prefix: str
+    ) -> None:
+        """A loader joins the name to the source directory, so these shards are present."""
+        _shard(tied_copy, lambda key: f"{prefix}{self._two_shards(key)}")
+        out = conv.convert(str(tied_copy), _target(tmp_path), str(tmp_path / "out"))
+        assert (out / ".metadata").is_file()
+
+    def test_an_index_name_outside_the_source_is_refused(
+        self, tied_copy: Path, tmp_path: Path
+    ) -> None:
+        _shard(tied_copy, lambda key: f"../{self._two_shards(key)}")
+        _refuses(tied_copy, _target(tmp_path), tmp_path / "out", ValueError, "which is outside")
+
+    def test_a_file_the_index_does_not_name_is_left_alone(
+        self, tied_copy: Path, tmp_path: Path
+    ) -> None:
+        """A second weights variant beside the indexed one is nothing the load reads."""
+        _shard(tied_copy, self._two_shards)
+        save_file(
+            {"model.norm.weight": torch.zeros(64)},
+            tied_copy / "model.fp16.safetensors",
+            metadata={"format": "pt"},
+        )
+        out = conv.convert(str(tied_copy), _target(tmp_path), str(tmp_path / "out"))
+        assert not torch.equal(_read_dcp(out)["model.transformer.norm.weight"], torch.zeros(64))
 
     def test_a_shard_holding_other_tensors_is_refused(
         self, tied_copy: Path, tmp_path: Path

@@ -42,7 +42,13 @@ logger = logging.getLogger(__name__)
 
 SUPPORTED_MODEL_TYPES = ("qwen3",)
 
-_INDEX_FILE = "model.safetensors.index.json"
+# A shard index is named for the weights file it indexes, with an optional variant
+# before the suffix (``model.safetensors.index.fp16.json``), so it is matched rather
+# than named: an index the conversion did not recognise would silently read the
+# directory instead, which is what the index exists to prevent.
+_INDEX_GLOB = "*.safetensors.index*.json"
+# A snapshot directory is named after the commit it holds.
+_COMMIT = re.compile(r"[0-9a-f]{40}")
 
 EMBED_KEY = "token_embedding.embedding.weight"
 HEAD_KEY = "output_head.proj.weight"
@@ -80,22 +86,56 @@ def map_key(hf_key: str) -> str | None:
     return f"layers.{match.group(1)}.{_LAYER_LEAVES[match.group(2)]}"
 
 
-def _rope_theta(hf_config: dict[str, Any]) -> tuple[Any, str | None]:
-    """The RoPE theta the source applies, and a problem if its two spellings disagree.
+def _source_rope(hf_config: dict[str, Any]) -> tuple[Any, Any, list[str]]:
+    """The RoPE the installed transformers resolves for the source, and how it is ambiguous.
 
-    A ``rope_parameters`` entry overrides the top-level field in current
-    transformers, while older releases read only the top-level one, so a source
-    that sets both to different values applies a different theta depending on
-    the release reading it and is refused rather than resolved here.
+    A theta can be written in three places and a scaling type in two, and which
+    one wins has changed between releases. Rather than re-implement that, the
+    installed library resolves the config and its answer is what the conversion
+    is checked against. A source whose own fields disagree is refused instead of
+    resolved, because those are exactly the configs another release could read
+    differently; a source that spells its RoPE one way reads the same everywhere.
     """
-    top = hf_config.get("rope_theta")
-    nested = (hf_config.get("rope_parameters") or {}).get("rope_theta")
-    if top is not None and nested is not None and top != nested:
-        return nested, (
-            f"rope_theta={top!r} but rope_parameters.rope_theta={nested!r}; "
-            "which of the two applies depends on the transformers release"
+    problems: list[str] = []
+    declared = {
+        field: value
+        for field, value in (
+            ("rope_theta", hf_config.get("rope_theta")),
+            (
+                "rope_parameters.rope_theta",
+                (hf_config.get("rope_parameters") or {}).get("rope_theta"),
+            ),
+            ("rope_scaling.rope_theta", (hf_config.get("rope_scaling") or {}).get("rope_theta")),
         )
-    return (top if nested is None else nested), None
+        if value is not None
+    }
+    if len(set(declared.values())) > 1:
+        spelled = ", ".join(f"{field}={value!r}" for field, value in sorted(declared.items()))
+        problems.append(
+            f"the source gives more than one RoPE theta ({spelled}); "
+            "which one applies depends on the transformers release"
+        )
+    for spec_key in ("rope_scaling", "rope_parameters"):
+        spec = hf_config.get(spec_key) or {}
+        kinds = {spec[key] for key in ("rope_type", "type") if key in spec}
+        if len(kinds) > 1:
+            problems.append(
+                f"{spec_key} gives both rope_type={spec['rope_type']!r} and type={spec['type']!r}; "
+                "which one applies depends on the transformers release"
+            )
+
+    from transformers import AutoConfig
+
+    source_config = {k: v for k, v in hf_config.items() if k != "model_type"}
+    try:
+        resolved = AutoConfig.for_model(hf_config["model_type"], **source_config)
+    except Exception as error:  # noqa: BLE001 - any rejection is the source's, and refuses it
+        problems.append(f"the installed transformers does not accept the source's config: {error}")
+        return None, None, problems
+    parameters = getattr(resolved, "rope_parameters", None) or {}
+    theta = parameters.get("rope_theta", getattr(resolved, "rope_theta", None))
+    rope_type = parameters.get("rope_type", "default")
+    return theta, rope_type, problems
 
 
 def check_config(hf_config: dict[str, Any], model: ModelConfig) -> None:
@@ -119,19 +159,19 @@ def check_config(hf_config: dict[str, Any], model: ModelConfig) -> None:
         "tie_word_embeddings": ("tie_embeddings", model.tie_embeddings),
         "hidden_act": ("activation", str(model.activation)),
     }
-    rope_theta, rope_problem = _rope_theta(hf_config)
-    problems = [rope_problem] if rope_problem else []
+    rope_theta, rope_type, problems = _source_rope(hf_config)
+    if (rope_theta, rope_type) == (None, None):
+        # The library refused the config, which is already reported; what it would
+        # have resolved for the theta is unknown rather than missing.
+        pairs.pop("rope_theta")
     for hf_key, (kf_name, kf_value) in pairs.items():
         hf_value = rope_theta if hf_key == "rope_theta" else hf_config.get(hf_key)
         if hf_value is None:
             problems.append(f"config.json has no {hf_key}")
         elif hf_value != kf_value:
             problems.append(f"{hf_key}={hf_value!r} but model.{kf_name}={kf_value!r}")
-    for spec_key in ("rope_scaling", "rope_parameters"):
-        spec = hf_config.get(spec_key) or {}
-        rope_type = spec.get("rope_type", spec.get("type", "default"))
-        if rope_type != "default":
-            problems.append(f"{spec_key} uses rope_type={rope_type!r}; only plain RoPE converts")
+    if rope_type not in (None, "default"):
+        problems.append(f"the source uses rope_type={rope_type!r}; only plain RoPE converts")
     if hf_config.get("use_sliding_window"):
         problems.append("use_sliding_window is set; only full attention converts")
     if hf_config.get("attention_bias"):
@@ -149,16 +189,29 @@ def check_config(hf_config: dict[str, Any], model: ModelConfig) -> None:
         raise ValueError("target config does not match the source:\n  " + "\n  ".join(problems))
 
 
-def resolve_source(hf_dir: str, patterns: list[str]) -> Path:
-    """The local model directory ``hf_dir``, or the snapshot of Hub id ``hf_dir`` with its
-    top-level files matching ``patterns`` fetched (or read from the cache)."""
+def resolve_source(
+    hf_dir: str, patterns: list[str], revision: str | None = None
+) -> tuple[Path, str | None]:
+    """Resolve ``hf_dir`` to a directory, and to the commit it came from when it is a Hub id.
+
+    A local directory is returned as it is. A Hub id is fetched (or read from the
+    cache) for its top-level files matching ``patterns``, at ``revision`` when one
+    is given. The commit comes back so that a second fetch of the same source can
+    ask for the same one: a repository's default branch can move between two
+    requests, which would otherwise check one revision and convert another.
+    """
     path = Path(hf_dir)
     if path.is_dir():
-        return path
+        return path, None
     from huggingface_hub import snapshot_download
 
     logger.info("Fetching %s of %s from the Hugging Face Hub", patterns, hf_dir)
-    return Path(snapshot_download(repo_id=hf_dir, allow_patterns=patterns, ignore_patterns=["*/*"]))
+    local = Path(
+        snapshot_download(
+            repo_id=hf_dir, allow_patterns=patterns, ignore_patterns=["*/*"], revision=revision
+        )
+    )
+    return local, (local.name if _COMMIT.fullmatch(local.name) else None)
 
 
 def load_source_config(source: Path) -> dict[str, Any]:
@@ -172,18 +225,26 @@ def load_source_config(source: Path) -> dict[str, Any]:
 def load_source_weights(source: Path) -> dict[str, torch.Tensor]:
     """Read ``source``'s weights, following its shard index when it has one.
 
-    A sharded source names every file and every tensor in ``_INDEX_FILE``. Reading
-    the directory instead would accept a stale or unrelated file in place of a
-    shard the index names, so the files and their contents are matched against it
-    and any difference refuses the source. Only an unindexed source is read by
-    listing its ``*.safetensors`` files.
+    A sharded source names every file and every tensor in its index. Reading the
+    directory instead would accept a stale or unrelated file in place of a shard
+    the index names, so an indexed source is read through its index alone and any
+    difference refuses it. A source carrying more than one index is refused too,
+    since which one a loader picks depends on the variant it was asked for. Only
+    an unindexed source is read by listing its top-level ``*.safetensors`` files.
     """
     from safetensors.torch import load_file
 
     files = sorted(source.glob("*.safetensors"))
-    index_file = source / _INDEX_FILE
-    if index_file.is_file():
-        return _load_indexed_weights(source, files, json.loads(index_file.read_text()), load_file)
+    indexes = sorted(source.glob(_INDEX_GLOB))
+    if len(indexes) > 1:
+        raise ValueError(
+            f"{source} holds {len(indexes)} shard indexes {[p.name for p in indexes]}; "
+            "which one applies depends on the variant a loader asks for"
+        )
+    if indexes:
+        return _load_indexed_weights(
+            source, indexes[0], json.loads(indexes[0].read_text()), load_file
+        )
     if not files:
         raise FileNotFoundError(f"no *.safetensors weights in {source}")
     state: dict[str, torch.Tensor] = {}
@@ -197,29 +258,38 @@ def load_source_weights(source: Path) -> dict[str, torch.Tensor]:
 
 
 def _load_indexed_weights(
-    source: Path, files: list[Path], index: dict[str, Any], load_file: Any
+    source: Path, index_file: Path, index: dict[str, Any], load_file: Any
 ) -> dict[str, torch.Tensor]:
-    """Read exactly the files the index names, with exactly the tensors it assigns them."""
+    """Read exactly the files the index names, with exactly the tensors it assigns them.
+
+    A shard name is read relative to the source directory, as a loader reads it,
+    so ``./shard.safetensors`` and a name in a subdirectory both resolve; a name
+    that leaves the directory does not. Files the index does not name are left
+    alone rather than refused: nothing reads them, so a second weights variant
+    beside the indexed one is no reason to decline.
+    """
     weight_map = index.get("weight_map")
     if not isinstance(weight_map, dict) or not weight_map:
-        raise ValueError(f"{source / _INDEX_FILE} has no weight_map")
-    keys_by_file: dict[str, set[str]] = {}
+        raise ValueError(f"{index_file} has no weight_map")
+    root = source.resolve()
+    keys_by_shard: dict[Path, set[str]] = {}
     for key, name in weight_map.items():
-        keys_by_file.setdefault(name, set()).add(key)
-    on_disk = {file.name for file in files}
-    absent = sorted(keys_by_file.keys() - on_disk)
-    unlisted = sorted(on_disk - keys_by_file.keys())
-    if absent or unlisted:
+        shard = (source / name).resolve()
+        if root not in shard.parents:
+            raise ValueError(f"{index_file} names {name!r}, which is outside {source}")
+        keys_by_shard.setdefault(shard, set()).add(key)
+    absent = sorted(str(shard.relative_to(root)) for shard in keys_by_shard if not shard.is_file())
+    if absent:
         raise ValueError(
-            f"{source / _INDEX_FILE} lists {len(keys_by_file)} shards; {len(absent)} are missing "
-            f"{absent[:5]} and {len(unlisted)} files it does not list are present {unlisted[:5]}"
+            f"{index_file} lists {len(keys_by_shard)} shards, of which {len(absent)} "
+            f"are missing: {absent[:5]}"
         )
     state: dict[str, torch.Tensor] = {}
-    for name, keys in sorted(keys_by_file.items()):
-        part = load_file(source / name)
+    for shard, keys in sorted(keys_by_shard.items()):
+        part = load_file(shard)
         if set(part) != keys:
             raise ValueError(
-                f"{name} holds {len(part)} tensors but the index assigns it {len(keys)}: "
+                f"{shard.name} holds {len(part)} tensors but the index assigns it {len(keys)}: "
                 f"missing {sorted(keys - set(part))[:5]}, unlisted {sorted(set(part) - keys)[:5]}"
             )
         state.update(part)
@@ -287,15 +357,14 @@ def convert(hf_dir: str, config_path: str, out: str, seed: int | None = None) ->
     if out_path.exists() and (not out_path.is_dir() or any(out_path.iterdir())):
         raise FileExistsError(f"{out_path} already exists and is not an empty directory")
 
-    source = resolve_source(hf_dir, ["config.json"])
+    source, commit = resolve_source(hf_dir, ["config.json"])
     if source.resolve() in (out_path.resolve(), *out_path.resolve().parents):
         raise ValueError(f"refusing to write inside the source model directory {source.resolve()}")
     hf_config = load_source_config(source)
     check_config(hf_config, config.model)
-    weights_dir = resolve_source(hf_dir, ["*.safetensors", f"*{_INDEX_FILE}"])
-    hf_state = load_source_weights(weights_dir)
-    converted = map_state_dict(hf_state, config.model.tie_embeddings)
 
+    # Everything that depends only on the target is settled before the weights are
+    # fetched, so a source this config cannot host costs no download.
     seed = config.train.seed if seed is None else seed
     torch.manual_seed(seed)
     wrapper = build_vlm_wrapper(
@@ -306,6 +375,16 @@ def convert(hf_dir: str, config_path: str, out: str, seed: int | None = None) ->
         frames_per_clip=config.video.max_frames if config.video is not None else 1,
     )
     check_norm_eps(wrapper.transformer, hf_config["rms_norm_eps"])
+
+    weights_dir, _ = resolve_source(hf_dir, ["*.safetensors", _INDEX_GLOB], revision=commit)
+    if weights_dir.resolve() != source.resolve():
+        raise ValueError(
+            f"{hf_dir} resolved to {source} for its config and {weights_dir} for its weights; "
+            "the source moved between the two requests"
+        )
+    hf_state = load_source_weights(weights_dir)
+    converted = map_state_dict(hf_state, config.model.tie_embeddings)
+
     target = wrapper.transformer.state_dict()
     extra = sorted(converted.keys() - target.keys())
     missing = sorted(target.keys() - converted.keys())
