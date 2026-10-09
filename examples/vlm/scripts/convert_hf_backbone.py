@@ -8,10 +8,11 @@ backbone's weights, and the whole model is written as one DCP that
 ``exclude_from_loading = ["optimizer"]``.
 
 Nothing is written unless the target config matches the source's own
-``config.json``, every source weight maps onto the transformer with the right
-shape, and every transformer weight is filled. Initialisation is seeded
-(``--seed``, default ``[train].seed``), so the same inputs always produce the
-same weights.
+``config.json``, the files on disk match the source's shard index, every source
+weight maps onto the transformer with the right shape, every transformer weight
+is filled, and the built model normalises with the source's epsilon.
+Initialisation is seeded (``--seed``, default ``[train].seed``), so the same
+inputs always produce the same weights.
 
 Usage:
     uv run python examples/vlm/scripts/convert_hf_backbone.py \\

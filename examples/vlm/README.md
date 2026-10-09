@@ -79,11 +79,17 @@ exclude_from_loading = ["optimizer"]
 ```
 
 The script writes nothing when the config disagrees with the source's
-`config.json` (shapes, RoPE base, norm eps, embedding tying, activation), when a
-weight has no counterpart or the wrong shape, or when `--out` is non-empty or
-inside the source. The source's `model_type` must be one the script supports
-(`SUPPORTED_MODEL_TYPES`). `--seed` (default `[train].seed`) seeds every freshly
-initialised weight, so a rerun writes identical weights.
+`config.json` (shapes, RoPE base, norm eps, embedding tying, activation), when
+the source declares parameters the transformer has no place for, when a weight
+has no counterpart or the wrong shape, or when `--out` is non-empty or inside
+the source. A sharded source is read through its `model.safetensors.index.json`
+and refused when the files on disk do not match it. The normalisation epsilon is
+checked against the norms the built model actually runs, not only against the
+config field, so a backbone whose attention norms normalise with a different
+epsilon than the source is refused rather than converted. The source's
+`model_type` must be one the script supports (`SUPPORTED_MODEL_TYPES`).
+`--seed` (default `[train].seed`) seeds every freshly initialised weight, so a
+rerun writes identical weights.
 
 ## Evaluation
 
