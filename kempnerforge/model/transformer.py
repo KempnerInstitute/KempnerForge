@@ -194,6 +194,8 @@ class Transformer(nn.Module):
         if isinstance(vlm_config, CrossAttentionConfig):
             self._ca_cadence = vlm_config.cross_attention_every_n_layers
             n_h, n_kv = vlm_config.resolved_heads(config.n_heads)
+            # Cross-attention uses dim // its own n_heads unless head_dim is decoupled.
+            ca_head_dim = config.head_dim if config.head_dim_override else None
             num_ca_blocks = config.n_layers // self._ca_cadence
             for k in range(num_ca_blocks):
                 self.cross_attention_layers[str(k)] = CrossAttentionBlock(
@@ -203,6 +205,7 @@ class Transformer(nn.Module):
                     ffn_hidden_dim=config.computed_ffn_hidden_dim,
                     norm_type=config.norm_type,
                     activation=config.activation,
+                    head_dim=ca_head_dim,
                 )
 
         # Final normalization. Used by the non-MoT path. MoT uses
