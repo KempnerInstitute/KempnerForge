@@ -69,8 +69,8 @@ uv run python examples/vlm/scripts/convert_hf_backbone.py \
     --out path-to-init-checkpoint
 ```
 
-Then set `[video].data_root`, `[checkpoint].load_path` and `[checkpoint].dir`,
-and train:
+Then set `[video].data_root`, `[checkpoint].load_path`, `[checkpoint].dir` and
+`[metrics].tensorboard_dir`, and train:
 
 ```bash
 uv run torchrun --nproc_per_node=4 examples/vlm/train.py \
@@ -83,15 +83,16 @@ the global batch.
 
 The first run loads the converted weights only (`exclude_from_loading =
 ["optimizer"]`); a resume from `[checkpoint].dir` restores the full training
-state. A finished run also saves its last step to `[checkpoint].dir`, so run a
-shakedown in a directory of its own, with a short warmup so the loss moves
-within its 20 steps:
+state. A finished run also saves its last step to `[checkpoint].dir`, so give a
+shakedown its own checkpoint and metrics directories, and a short warmup so the
+loss moves within its 20 steps:
 
 ```bash
 uv run torchrun --nproc_per_node=4 examples/vlm/train.py \
     examples/vlm/configs/vlm_qwen3_0.6b_joint_decoder_webvid.toml \
     --train.max_steps=20 --video.max_samples=512 --scheduler.warmup_steps=5 \
-    --checkpoint.dir=path-to-shakedown-dir
+    --checkpoint.dir=path-to-shakedown-dir \
+    --metrics.tensorboard_dir=path-to-shakedown-dir/tb
 ```
 
 ## Data prep

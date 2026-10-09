@@ -87,3 +87,4 @@ async_mode = "async"
 log_interval = 20
 enable_wandb = false
 enable_tensorboard = true
+tensorboard_dir = "path-to-tensorboard-dir"
