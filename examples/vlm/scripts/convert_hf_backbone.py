@@ -86,7 +86,7 @@ def map_key(hf_key: str) -> str | None:
     return f"layers.{match.group(1)}.{_LAYER_LEAVES[match.group(2)]}"
 
 
-def _source_rope(hf_config: dict[str, Any]) -> tuple[Any, Any, list[str]]:
+def _source_rope(hf_config: dict[str, Any]) -> tuple[Any, Any, dict[str, Any], list[str]]:
     """The RoPE the installed transformers resolves for the source, and how it is ambiguous.
 
     A theta can be written in three places and a scaling type in two, and which
@@ -94,7 +94,9 @@ def _source_rope(hf_config: dict[str, Any]) -> tuple[Any, Any, list[str]]:
     installed library resolves the config and its answer is what the conversion
     is checked against. A source whose own fields disagree is refused instead of
     resolved, because those are exactly the configs another release could read
-    differently; a source that spells its RoPE one way reads the same everywhere.
+    differently; a source that spells its RoPE one way reads the same in every
+    release that knows that spelling. The spellings it used come back with the
+    answer, so a refusal can say whether the value is the source's or a default.
     """
     problems: list[str] = []
     declared = {
@@ -131,11 +133,11 @@ def _source_rope(hf_config: dict[str, Any]) -> tuple[Any, Any, list[str]]:
         resolved = AutoConfig.for_model(hf_config["model_type"], **source_config)
     except Exception as error:  # noqa: BLE001 - any rejection is the source's, and refuses it
         problems.append(f"the installed transformers does not accept the source's config: {error}")
-        return None, None, problems
+        return None, None, declared, problems
     parameters = getattr(resolved, "rope_parameters", None) or {}
     theta = parameters.get("rope_theta", getattr(resolved, "rope_theta", None))
     rope_type = parameters.get("rope_type", "default")
-    return theta, rope_type, problems
+    return theta, rope_type, declared, problems
 
 
 def check_config(hf_config: dict[str, Any], model: ModelConfig) -> None:
@@ -159,7 +161,7 @@ def check_config(hf_config: dict[str, Any], model: ModelConfig) -> None:
         "tie_word_embeddings": ("tie_embeddings", model.tie_embeddings),
         "hidden_act": ("activation", str(model.activation)),
     }
-    rope_theta, rope_type, problems = _source_rope(hf_config)
+    rope_theta, rope_type, declared_rope, problems = _source_rope(hf_config)
     if (rope_theta, rope_type) == (None, None):
         # The library refused the config, which is already reported; what it would
         # have resolved for the theta is unknown rather than missing.
@@ -168,7 +170,16 @@ def check_config(hf_config: dict[str, Any], model: ModelConfig) -> None:
         hf_value = rope_theta if hf_key == "rope_theta" else hf_config.get(hf_key)
         if hf_value is None:
             problems.append(f"config.json has no {hf_key}")
-        elif hf_value != kf_value:
+        elif hf_value == kf_value:
+            continue
+        elif hf_key == "rope_theta" and not declared_rope:
+            # The value is the library's own default, so grepping config.json for it
+            # finds nothing.
+            problems.append(
+                f"config.json gives no RoPE theta, so the installed transformers applies "
+                f"{hf_value!r}, but model.{kf_name}={kf_value!r}"
+            )
+        else:
             problems.append(f"{hf_key}={hf_value!r} but model.{kf_name}={kf_value!r}")
     if rope_type not in (None, "default"):
         problems.append(f"the source uses rope_type={rope_type!r}; only plain RoPE converts")
@@ -282,7 +293,8 @@ def _load_indexed_weights(
     if absent:
         raise ValueError(
             f"{index_file} lists {len(keys_by_shard)} shards, of which {len(absent)} "
-            f"are missing: {absent[:5]}"
+            f"are missing: {absent[:5]}. Only a source's top-level files are fetched "
+            "from the Hub, so a shard the index places in a subdirectory is absent here"
         )
     state: dict[str, torch.Tensor] = {}
     for shard, keys in sorted(keys_by_shard.items()):

@@ -58,6 +58,8 @@ TARGET_MODEL = {
     "max_seq_len": 64,
 }
 
+_ROPE_FIELDS = ("rope_theta", "rope_parameters", "rope_scaling")
+
 Sources = dict[bool, tuple[Path, Any]]
 
 
@@ -444,6 +446,12 @@ class TestConfigRefusals:
                 lambda c: c.update(rope_scaling={"rope_type": "default", "type": "linear"}),
                 "rope_scaling gives both rope_type='default' and type='linear'",
             ),
+            (
+                # The value compared is then the library's own default, which the
+                # user's file does not contain anywhere.
+                lambda c: [c.pop(field, None) for field in _ROPE_FIELDS],
+                "config.json gives no RoPE theta, so the installed transformers applies",
+            ),
         ],
         ids=[
             "model_type",
@@ -456,6 +464,7 @@ class TestConfigRefusals:
             "rope_theta_disagrees_with_itself",
             "rope_scaling_carries_another_theta",
             "rope_scaling_names_two_types",
+            "rope_theta_declared_nowhere",
         ],
     )
     def test_source_the_target_cannot_express(
