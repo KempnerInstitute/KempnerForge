@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import importlib.util
 import itertools
+import logging
 import os
+from fractions import Fraction
+from types import SimpleNamespace
 
 import pytest
 
@@ -29,6 +32,7 @@ def _encoder_available(name: str) -> bool:
 
 
 _H264_AVAILABLE = _encoder_available("libx264")
+_HEVC_AVAILABLE = _encoder_available("libx265")
 _VP9_AVAILABLE = _encoder_available("libvpx-vp9")
 
 
@@ -120,8 +124,14 @@ class TestDecodeVideoFramesIntegration:
             decode_video_frames("/no/such/video.mp4", fps=2.0, min_frames=4, max_frames=8)
 
 
-def _write_mp4(path, n_frames: int, size: int = 32, fps: int = 10) -> None:
-    """Encode a tiny solid-color clip with PyAV (av is a hard dependency)."""
+def _write_mp4(
+    path, n_frames: int, size: int = 32, fps: int = 10, gop_size: int | None = None
+) -> None:
+    """Encode a tiny solid-color clip with PyAV (av is a hard dependency).
+
+    ``gop_size`` pins the keyframe cadence (frame 0, then every ``gop_size``
+    frames), which the seek tests rely on; ``None`` keeps encoder defaults.
+    """
     import av
     import numpy as np
 
@@ -130,6 +140,11 @@ def _write_mp4(path, n_frames: int, size: int = 32, fps: int = 10) -> None:
         stream.width = size
         stream.height = size
         stream.pix_fmt = "yuv420p"
+        if gop_size is not None:
+            # Scene-change detection must be suppressed alongside gop_size:
+            # the changing gray otherwise promotes every frame to a keyframe.
+            stream.codec_context.gop_size = gop_size
+            stream.codec_context.options = {"sc_threshold": "1000000000"}
         for i in range(n_frames):
             arr = np.full((size, size, 3), (i * 17) % 256, dtype=np.uint8)
             frame = av.VideoFrame.from_ndarray(arr, format="rgb24")
@@ -137,6 +152,52 @@ def _write_mp4(path, n_frames: int, size: int = 32, fps: int = 10) -> None:
                 container.mux(packet)
         for packet in stream.encode():  # flush
             container.mux(packet)
+
+
+def _write_h264_mp4(
+    path, n_frames: int, size: int = 64, fps: int = 10, gop_size: int = 12, open_gop: bool = False
+) -> None:
+    """Encode an H.264 clip with B-frames (and optionally open GOPs).
+
+    Produces the codec features the mpeg4 fixture cannot: presentation
+    reordering (pts != dts) and, with ``open_gop``, leading B-frames that
+    reference across GOP boundaries. ``b-adapt=0`` forces a fixed B-frame
+    pattern and a moving stripe gives the encoder real motion.
+    """
+    import av
+    import numpy as np
+
+    params = f"keyint={gop_size}:min-keyint={gop_size}:scenecut=0:bframes=2:b-adapt=0"
+    if open_gop:
+        params += ":open-gop=1"
+    with av.open(str(path), mode="w") as container:
+        stream = container.add_stream("libx264", rate=fps)
+        stream.width = size
+        stream.height = size
+        stream.pix_fmt = "yuv420p"
+        stream.codec_context.options = {"x264-params": params}
+        for i in range(n_frames):
+            arr = np.full((size, size, 3), (i * 7) % 200, dtype=np.uint8)
+            arr[:, (i * 5) % size] = 255  # moving stripe: motion for B-frames
+            frame = av.VideoFrame.from_ndarray(arr, format="rgb24")
+            for packet in stream.encode(frame):
+                container.mux(packet)
+        for packet in stream.encode():  # flush
+            container.mux(packet)
+
+
+def _serial_reference(path, fps: float, min_frames: int, max_frames: int) -> list:
+    """Ground-truth frames via the serial reference pass (bypasses seeking)."""
+    import av
+
+    from kempnerforge.data.video_io import _decode_serial, _video_extent
+
+    with av.open(str(path)) as container:
+        stream = container.streams.video[0]
+        stream.thread_type = "AUTO"
+        (start, span), packets, _ = _video_extent(container, stream, str(path))
+        targets = sample_timestamps(span, fps, min_frames, max_frames)
+        return _decode_serial(packets, targets, start)
 
 
 @pytest.mark.skipif(not _AV_AVAILABLE, reason="requires the 'av' package")
@@ -796,7 +857,7 @@ class TestVideoExtent:
         expected, fresh = _full_extent(path), _fresh_pts(path)
         counted_open.update(opens=0, seeks=0, packets=0)
         with av.open(str(path)) as container:
-            extent, packets = _video_extent(container, container.streams.video[0], str(path))
+            extent, packets, _ = _video_extent(container, container.streams.video[0], str(path))
             assert extent == pytest.approx(expected)
             assert (counted_open["opens"], counted_open["seeks"]) == (1, 2)
             assert counted_open["packets"] <= 30
@@ -854,7 +915,7 @@ class TestVideoExtent:
         expected, fresh = _full_extent(path), _fresh_pts(path)
         counted_open.update(opens=0, seeks=0, packets=0)
         with av.open(str(path)) as container:
-            extent, packets = _video_extent(container, container.streams.video[0], str(path))
+            extent, packets, _ = _video_extent(container, container.streams.video[0], str(path))
             assert extent == pytest.approx(expected)
             assert (counted_open["opens"], counted_open["seeks"]) == (1, 3)
             assert _decoded_pts(packets) == fresh
@@ -875,7 +936,7 @@ class TestVideoExtent:
         expected, fresh = _full_extent(path), _fresh_pts(path)
         counted_open.update(opens=0, seeks=0, packets=0)
         with av.open(str(path)) as container:
-            extent, packets = _video_extent(container, container.streams.video[0], str(path))
+            extent, packets, _ = _video_extent(container, container.streams.video[0], str(path))
             assert extent == pytest.approx(expected)
             assert counted_open["opens"] == 3
             assert _decoded_pts(packets) == fresh
@@ -947,7 +1008,7 @@ class TestVideoExtent:
         order += [(11, 6), (9, 7), (8, 8), (10, 9)]
         packets = [_fake_packet(pts, dts, key=pts in (3, 11), duration=1) for pts, dts in order]
         container = _FakeContainer(packets, Fraction(1, 10))
-        extent, rest = _video_extent(container, container.streams.video[0], "clip")
+        extent, rest, _ = _video_extent(container, container.streams.video[0], "clip")
         assert extent == pytest.approx((0.0, 1.2))
         assert list(rest) == packets
 
@@ -960,7 +1021,7 @@ class TestVideoExtent:
 
         packets = [_fake_packet(i, i, key=i in (0, 9)) for i in range(10)]
         container = _FakeContainer(packets, Fraction(1, 10))
-        extent, rest = _video_extent(container, container.streams.video[0], "clip")
+        extent, rest, _ = _video_extent(container, container.streams.video[0], "clip")
         assert extent == pytest.approx((0.0, 1.0))
         assert list(rest) == packets
         assert container.seeks[-1] == 0  # back to the first packet's decode time
@@ -983,7 +1044,7 @@ class TestVideoExtent:
 
         packets = [_fake_packet(i, i, key=i % 5 == 0, duration=1) for i in range(12)]
         container = _NoFarSeek(packets, Fraction(1, 10))
-        extent, rest = _video_extent(container, container.streams.video[0], "clip")
+        extent, rest, _ = _video_extent(container, container.streams.video[0], "clip")
         assert extent == pytest.approx((0.0, 1.2))
         assert list(rest) == packets
         assert container.seeks == [0, 0]
@@ -1025,7 +1086,7 @@ class TestVideoExtent:
         from kempnerforge.data.video_io import _video_extent
 
         container = _FakeContainer([_fake_packet(0, 0, key=True)], None)
-        extent, rest = _video_extent(container, container.streams.video[0], "clip")
+        extent, rest, _ = _video_extent(container, container.streams.video[0], "clip")
         assert extent is None and len(list(rest)) == 1 and container.seeks == []
 
 
@@ -1128,6 +1189,1032 @@ class TestSpan:
         from kempnerforge.data.video_io import _span
 
         assert _span(5, [[(5, 0)]], Fraction(1, 2), 0.0) == (2.5, 0.0)
+
+
+# ---------------------------------------------------------------------------
+# seek-based decoding (parity with the serial reference, guards, fallback)
+# ---------------------------------------------------------------------------
+
+
+def _assert_seek_parity(path, monkeypatch, *, fps, min_frames, max_frames):
+    """Seek-path frames equal the serial reference, with no fallback to serial.
+
+    A silent fallback would make parity trivially true, so ``_decode_serial``
+    is spied on. Frames are compared by bytes, not identity: the seek path
+    reuses one image for targets that share a frame.
+    """
+    import kempnerforge.data.video_io as video_io
+
+    expected = _serial_reference(path, fps, min_frames, max_frames)
+    fell_back = []
+    original = video_io._decode_serial
+
+    def _spy(*args, **kwargs):
+        fell_back.append(True)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(video_io, "_decode_serial", _spy)
+    got = video_io.decode_video_frames(
+        str(path), fps=fps, min_frames=min_frames, max_frames=max_frames
+    )
+    assert not fell_back, "seek path unexpectedly fell back to serial decode"
+    assert [f.tobytes() for f in got] == [f.tobytes() for f in expected]
+    return got
+
+
+class _WorkCountingContainer:
+    """Wraps an ``av`` container, counting seeks and decoded frames."""
+
+    def __init__(self, container) -> None:
+        self._container = container
+        self.seeks = 0
+        self.decoded = 0
+
+    def __enter__(self):
+        self._container.__enter__()
+        return self
+
+    def __exit__(self, *exc):
+        return self._container.__exit__(*exc)
+
+    def __getattr__(self, name):
+        return getattr(self._container, name)
+
+    def seek(self, *args, **kwargs):
+        self.seeks += 1
+        return self._container.seek(*args, **kwargs)
+
+    def decode(self, *args, **kwargs):
+        for frame in self._container.decode(*args, **kwargs):
+            self.decoded += 1
+            yield frame
+
+    def demux(self, *args, **kwargs):
+        for packet in self._container.demux(*args, **kwargs):
+            yield _CountingPacket(packet, self)
+
+
+class _CountingPacket:
+    """Forwards to a packet, counting the frames its ``decode`` returns."""
+
+    def __init__(self, packet, counter):
+        self._packet, self._counter = packet, counter
+
+    def __getattr__(self, name):
+        return getattr(self._packet, name)
+
+    def decode(self):
+        frames = self._packet.decode()
+        self._counter.decoded += len(frames)
+        return frames
+
+
+def _run_direct(path, fn, targets):
+    """Run ``_decode_seek`` or ``_decode_serial`` on explicit targets; no fallback.
+
+    The extent probe's own reads are not counted: the counters start at the decode."""
+    import av
+
+    from kempnerforge.data.video_io import _decode_seek, _video_extent
+
+    with av.open(str(path)) as raw:
+        container = _WorkCountingContainer(raw)
+        stream = raw.streams.video[0]
+        stream.thread_type = "AUTO"
+        extent, packets, _ = _video_extent(container, stream, str(path))
+        start = 0.0 if extent is None else extent[0]
+        container.seeks = container.decoded = 0
+        if fn is _decode_seek:
+            return fn(container, stream, packets, list(targets), start), container
+        return fn(packets, list(targets), start), container
+
+
+def _mark_every_packet_key(src, dst) -> None:
+    """Remux ``src`` with every packet flagged as a keyframe, as an index without a sync table."""
+    import av
+
+    with av.open(str(src)) as ic, av.open(str(dst), mode="w") as oc:
+        istream = ic.streams.video[0]
+        ostream = oc.add_stream_from_template(istream)
+        for packet in ic.demux(istream):
+            if packet.pts is None:
+                continue
+            packet.is_keyframe = True
+            packet.stream = ostream
+            oc.mux(packet)
+
+
+def _damage_packet(src, dst, at_s: float) -> None:
+    """Copy ``src`` to ``dst`` with the packet presented at ``at_s`` overwritten by 0xFF."""
+    import shutil
+
+    import av
+
+    shutil.copyfile(src, dst)
+    with av.open(str(src)) as container:
+        stream = container.streams.video[0]
+        packets = [p for p in container.demux(stream) if p.size]
+        packet = min(packets, key=lambda p: abs(p.pts * stream.time_base - at_s))
+        pos, size = packet.pos, packet.size
+    with open(dst, "r+b") as fh:
+        fh.seek(pos)
+        fh.write(b"\xff" * size)
+
+
+@pytest.mark.skipif(not _AV_AVAILABLE, reason="requires the 'av' package")
+class TestKeyframeFixture:
+    """gop_size must actually control the fixture's keyframe cadence."""
+
+    def test_gop_size_controls_keyframe_cadence(self, tmp_path):
+        import av
+
+        path = tmp_path / "gop.mp4"
+        _write_mp4(path, n_frames=40, gop_size=12)
+        with av.open(str(path)) as container:
+            stream = container.streams.video[0]
+            packets = [p for p in container.demux(stream) if p.pts is not None]
+        assert [i for i, p in enumerate(packets) if p.is_keyframe] == [0, 12, 24, 36]
+
+
+@pytest.mark.skipif(not _AV_AVAILABLE, reason="requires the 'av' package")
+class TestSeekMatchesSerial:
+    """The seek path must select byte-identical frames to the serial pass."""
+
+    def test_sparse_targets_long_clip(self, tmp_path, monkeypatch):
+        path = tmp_path / "clip.mp4"
+        _write_mp4(path, n_frames=200, gop_size=12)  # 20s, 17 GOPs
+        _assert_seek_parity(path, monkeypatch, fps=2.0, min_frames=1, max_frames=4)
+
+    def test_dense_targets_min_eq_max(self, tmp_path, monkeypatch):
+        path = tmp_path / "clip.mp4"
+        _write_mp4(path, n_frames=40, gop_size=12)  # 4s
+        _assert_seek_parity(path, monkeypatch, fps=8.0, min_frames=16, max_frames=16)
+
+    def test_duplicate_targets_dense_short_clip(self, tmp_path, monkeypatch):
+        path = tmp_path / "clip.mp4"
+        _write_mp4(path, n_frames=10, gop_size=5)  # 1s; 16 targets over 10 frames
+        _assert_seek_parity(path, monkeypatch, fps=2.0, min_frames=16, max_frames=16)
+
+    def test_single_keyframe_clip(self, tmp_path, monkeypatch):
+        path = tmp_path / "clip.mp4"
+        _write_mp4(path, n_frames=60, gop_size=999)  # one group: never seeks
+        _assert_seek_parity(path, monkeypatch, fps=2.0, min_frames=4, max_frames=8)
+
+    def test_short_clip_tail_fill(self, tmp_path, monkeypatch):
+        path = tmp_path / "short.mp4"
+        _write_mp4(path, n_frames=3)  # shorter than min_frames -> tail-fill
+        _assert_seek_parity(path, monkeypatch, fps=2.0, min_frames=4, max_frames=8)
+
+    @pytest.mark.parametrize("offset_s", [0.5, 5.0])
+    def test_start_time_shifted_clip(self, tmp_path, monkeypatch, offset_s):
+        src = tmp_path / "src.mp4"
+        dst = tmp_path / "shifted.mp4"
+        _write_mp4(src, n_frames=200, gop_size=12)
+        _remux_shifted(src, dst, offset_s=offset_s)
+        # Seeks go to the first frame's time plus the target.
+        got = _assert_seek_parity(dst, monkeypatch, fps=2.0, min_frames=1, max_frames=4)
+        ref = _serial_reference(src, 2.0, 1, 4)
+        assert [f.tobytes() for f in got] == [f.tobytes() for f in ref]
+
+
+@pytest.mark.skipif(not _H264_AVAILABLE, reason="requires a PyAV build with the libx264 encoder")
+class TestSeekMatchesSerialH264:
+    """Parity on the codec shape of real data: H.264 with B-frames.
+
+    The mpeg4 fixtures above never exercise presentation reordering; real
+    clips are mostly H.264, where it always occurs. ``open_gop`` adds
+    leading B-frames that are dropped after a mid-stream seek.
+    """
+
+    def test_fixture_has_b_frames_and_reordering(self, tmp_path):
+        import av
+        from av.video.frame import PictureType
+
+        path = tmp_path / "h264.mp4"
+        _write_h264_mp4(path, n_frames=60, open_gop=True)
+        with av.open(str(path)) as container:
+            stream = container.streams.video[0]
+            packets = [p for p in container.demux(stream) if p.pts is not None]
+        # B-frames are stored out of presentation order: dts != pts somewhere.
+        assert any(p.dts is not None and p.dts != p.pts for p in packets)
+        with av.open(str(path)) as container:
+            types = {
+                PictureType(int(f.pict_type)).name
+                for f in container.decode(container.streams.video[0])
+            }
+        assert "B" in types
+
+    @pytest.mark.parametrize("open_gop", [False, True])
+    def test_sparse_targets_long_clip(self, tmp_path, monkeypatch, open_gop):
+        path = tmp_path / "clip.mp4"
+        _write_h264_mp4(path, n_frames=200, open_gop=open_gop)  # 20s, 1.2s GOPs
+        _assert_seek_parity(path, monkeypatch, fps=2.0, min_frames=1, max_frames=4)
+
+    @pytest.mark.parametrize("open_gop", [False, True])
+    def test_dense_targets_min_eq_max(self, tmp_path, monkeypatch, open_gop):
+        path = tmp_path / "clip.mp4"
+        _write_h264_mp4(path, n_frames=60, open_gop=open_gop)  # 6s
+        _assert_seek_parity(path, monkeypatch, fps=8.0, min_frames=16, max_frames=16)
+
+    @pytest.mark.parametrize("open_gop", [False, True])
+    def test_explicit_targets_straddle_gop_boundaries(self, tmp_path, open_gop):
+        # Targets just after each keyframe time (keyint=12 @ 10fps -> 1.2s
+        # GOPs), where open-GOP leading B-frames sit; drives _decode_seek
+        # directly so a serial fallback cannot mask a divergence.
+        from kempnerforge.data.video_io import _decode_seek, _decode_serial
+
+        path = tmp_path / "clip.mp4"
+        _write_h264_mp4(path, n_frames=120, open_gop=open_gop)
+        targets = [0.05, 2.45, 4.85, 7.25, 9.65, 11.9]
+        got, _ = _run_direct(path, _decode_seek, targets)
+        expected, _ = _run_direct(path, _decode_serial, targets)
+        assert [f.tobytes() for f in got] == [f.tobytes() for f in expected]
+
+    @pytest.mark.parametrize("pre_s", [0.05, 0.1, 0.15, 0.2, 0.25])
+    def test_open_gop_targets_before_a_keyframe(self, tmp_path, monkeypatch, pre_s):
+        """A target in the leading B-frames before an open-GOP keyframe: those frames
+        are dropped after a seek, so the seek must either match or report itself."""
+        from kempnerforge.data.video_io import _decode_seek, _decode_serial, _SeekUnreliableError
+
+        path = tmp_path / "clip.mp4"
+        _write_h264_mp4(path, n_frames=200, open_gop=True)
+        targets = [0.0] + [4.8 * m - pre_s for m in (1, 2, 3, 4)]  # 4 GOPs apart: seeks
+        expected, _ = _run_direct(path, _decode_serial, targets)
+        try:
+            got, counter = _run_direct(path, _decode_seek, targets)
+        except _SeekUnreliableError as e:
+            assert "landed" in str(e)
+        else:
+            assert [f.tobytes() for f in got] == [f.tobytes() for f in expected]
+        _assert_seek_parity(path, monkeypatch, fps=2.0, min_frames=1, max_frames=4)
+
+
+@pytest.mark.skipif(not _AV_AVAILABLE, reason="requires the 'av' package")
+class TestSeekFrameIdentity:
+    """Targets must map to the expected source frames, not just the right count."""
+
+    def test_picks_expected_source_frames(self, tmp_path):
+        import numpy as np
+
+        from kempnerforge.data.video_io import decode_video_frames
+
+        path = tmp_path / "clip.mp4"
+        _write_mp4(path, n_frames=20, fps=10)  # 2s; frame i is solid (i*17)%256 gray
+        frames = decode_video_frames(str(path), fps=2.0, min_frames=4, max_frames=4)
+        assert len(frames) == 4
+        # Targets [0, 2/3, 4/3, 2.0] -> first frame at/after each: 0, 7, 14;
+        # the final target sits past the last PTS -> tail-fills with frame 19.
+        expected = [0, 7 * 17, 14 * 17, (19 * 17) % 256]
+        means = [float(np.asarray(f.convert("L")).mean()) for f in frames]
+        for got, want in zip(means, expected, strict=True):
+            assert abs(got - want) <= 4.0  # mpeg4 encode/decode roundtrip tolerance
+
+
+@pytest.mark.skipif(not _AV_AVAILABLE, reason="requires the 'av' package")
+class TestSeekFirstGroup:
+    """The first targets are decoded from the start of the stream, never after a seek."""
+
+    def test_raw_mpeg4_with_b_frames(self, tmp_path):
+        """A raw MPEG-4 stream with B-frames: seeks go by decode time, and the keyframe
+        shown at 0.3 s is stored at decode time 0, so a seek to 0 s lands there."""
+        import av
+
+        from kempnerforge.data.video_io import _decode_seek, _decode_serial, decode_video_frames
+
+        path = tmp_path / "clip.m4v"
+        options = {"g": "3", "bf": "2", "sc_threshold": "1000000000"}
+        _write_indexed_clip(path, n_frames=60, fmt="m4v", codec_options=options)
+        with av.open(str(path)) as container:
+            stream = container.streams.video[0]
+            container.seek(0, stream=stream, backward=True, any_frame=False)
+            assert next(container.decode(stream)).time == pytest.approx(0.3)
+        targets = [0.0, 0.15, 0.25]
+        got, counter = _run_direct(path, _decode_seek, targets)
+        expected, _ = _run_direct(path, _decode_serial, targets)
+        assert [_frame_index(f) for f in got] == [0, 2, 3]
+        assert [f.tobytes() for f in got] == [f.tobytes() for f in expected]
+        assert counter.seeks == 0
+        frames = decode_video_frames(str(path), fps=2.0, min_frames=4, max_frames=16)
+        assert [f.tobytes() for f in frames] == [
+            f.tobytes() for f in _serial_reference(path, 2.0, 4, 16)
+        ]
+
+
+@pytest.mark.skipif(not _AV_AVAILABLE, reason="requires the 'av' package")
+class TestSeekCodecShapes:
+    """Parity on stream shapes where seeking is hard; a guard may route them to serial."""
+
+    @pytest.mark.skipif(not _HEVC_AVAILABLE, reason="requires the libx265 encoder")
+    @pytest.mark.parametrize("pre_s", [0.05, 0.1, 0.15, 0.2])
+    def test_hevc_open_gop_targets_before_a_keyframe(self, tmp_path, monkeypatch, pre_s):
+        from kempnerforge.data.video_io import _decode_seek, _decode_serial, _SeekUnreliableError
+
+        path = tmp_path / "hevc.mp4"
+        params = "keyint=12:min-keyint=12:scenecut=0:bframes=2:b-adapt=0:open-gop=1:log-level=error"
+        _write_indexed_clip(
+            path, n_frames=200, codec="libx265", codec_options={"x265-params": params}
+        )
+        targets = [0.0] + [4.8 * m - pre_s for m in (1, 2, 3, 4)]
+        expected, _ = _run_direct(path, _decode_serial, targets)
+        try:
+            got, counter = _run_direct(path, _decode_seek, targets)
+        except _SeekUnreliableError as e:
+            assert "landed" in str(e)
+        else:
+            assert [f.tobytes() for f in got] == [f.tobytes() for f in expected]
+        _assert_seek_parity(path, monkeypatch, fps=2.0, min_frames=1, max_frames=4)
+
+    @pytest.mark.skipif(not _H264_AVAILABLE, reason="requires the libx264 encoder")
+    def test_intra_refresh(self, tmp_path, monkeypatch):
+        """Periodic intra refresh instead of keyframes: no clean point to seek to."""
+        path = tmp_path / "intra_refresh.mp4"
+        params = "keyint=30:intra-refresh=1:bframes=0:scenecut=0"
+        _write_indexed_clip(
+            path, n_frames=150, codec="libx264", codec_options={"x264-params": params}
+        )
+        _assert_seek_parity(path, monkeypatch, fps=2.0, min_frames=1, max_frames=4)
+        _assert_seek_parity(path, monkeypatch, fps=2.0, min_frames=4, max_frames=16)
+
+    @pytest.mark.skipif(not _H264_AVAILABLE, reason="requires the libx264 encoder")
+    def test_mpegts_falls_back_on_inexact_seek(self, tmp_path, monkeypatch):
+        """MPEG-TS has no index, so a seek lands near its target, here past it."""
+        import kempnerforge.data.video_io as video_io
+
+        path = tmp_path / "clip.ts"
+        params = "keyint=12:min-keyint=12:scenecut=0:bframes=2"
+        _write_indexed_clip(
+            path, n_frames=200, codec="libx264", fmt="mpegts", codec_options={"x264-params": params}
+        )
+        expected = _serial_reference(path, 2.0, 1, 4)
+        reasons = []
+        monkeypatch.setattr(video_io, "_log_fallback_once", reasons.append)
+        got = video_io.decode_video_frames(str(path), fps=2.0, min_frames=1, max_frames=4)
+        assert reasons == ["_SeekUnreliableError"]
+        assert [f.tobytes() for f in got] == [f.tobytes() for f in expected]
+
+    def test_index_listing_every_frame_as_a_seek_point(self, tmp_path, monkeypatch):
+        """A seek then lands on a P-frame, which decodes without its reference frame."""
+        import kempnerforge.data.video_io as video_io
+
+        src = tmp_path / "src.mp4"
+        dst = tmp_path / "every_frame_key.mp4"
+        options = {"g": "30", "sc_threshold": "1000000000"}
+        _write_indexed_clip(src, n_frames=300, codec_options=options)  # 30 s
+        _mark_every_packet_key(src, dst)
+        with pytest.raises(video_io._SeekUnreliableError):
+            _run_direct(dst, video_io._decode_seek, [0.0, 10.0])
+        expected = _serial_reference(dst, 2.0, 1, 4)
+        reasons = []
+        monkeypatch.setattr(video_io, "_log_fallback_once", reasons.append)
+        got = video_io.decode_video_frames(str(dst), fps=2.0, min_frames=1, max_frames=4)
+        assert reasons == ["_SeekUnreliableError"]
+        assert [_frame_index(f) for f in got] == [0, 100, 200, 299 % 256]
+        assert [f.tobytes() for f in got] == [f.tobytes() for f in expected]
+
+    @pytest.mark.skipif(not _H264_AVAILABLE, reason="requires the libx264 encoder")
+    def test_raw_h264_is_decoded_without_seeking(self, tmp_path, monkeypatch):
+        """A raw H.264 stream has no packet timestamps to seek by, so it is decoded
+        serially from the start: no seek is attempted and none has to be undone."""
+        import kempnerforge.data.video_io as video_io
+
+        path = tmp_path / "clip.h264"
+        _write_indexed_clip(path, n_frames=30, codec="libx264", fmt="h264")
+        reasons = []
+        monkeypatch.setattr(video_io, "_log_fallback_once", reasons.append)
+        monkeypatch.setattr(
+            video_io, "_decode_seek", lambda *a: pytest.fail("seeking a stream without timestamps")
+        )
+        frames = video_io.decode_video_frames(str(path), fps=2.0, min_frames=4, max_frames=8)
+        assert reasons == []
+        assert [_frame_index(f) for f in frames] == [0]
+
+    @pytest.mark.skipif(not _H264_AVAILABLE, reason="requires the libx264 encoder")
+    def test_variable_frame_rate(self, tmp_path, monkeypatch):
+        from fractions import Fraction
+
+        import av
+        import numpy as np
+
+        path = tmp_path / "vfr.mp4"
+        gaps = np.random.default_rng(0).choice([16, 33, 50, 100, 250], size=150)
+        pts = np.concatenate([[0], np.cumsum(gaps)[:-1]]).tolist()
+        params = "keyint=20:min-keyint=20:scenecut=0:bframes=2"
+        with av.open(str(path), mode="w") as container:
+            stream = container.add_stream("libx264", rate=30)
+            stream.width = stream.height = 64
+            stream.pix_fmt = "yuv420p"
+            stream.codec_context.time_base = Fraction(1, 1000)
+            stream.time_base = Fraction(1, 1000)
+            stream.codec_context.options = {"x264-params": params}
+            for i, t in enumerate(pts):
+                frame = av.VideoFrame.from_ndarray(_index_frame(i), format="rgb24")
+                frame.pts = int(t)
+                frame.time_base = Fraction(1, 1000)
+                for packet in stream.encode(frame):
+                    container.mux(packet)
+            for packet in stream.encode():
+                container.mux(packet)
+        for cfg in ((2.0, 1, 4), (2.0, 4, 16), (4.0, 2, 48)):
+            _assert_seek_parity(path, monkeypatch, fps=cfg[0], min_frames=cfg[1], max_frames=cfg[2])
+
+    @pytest.mark.skipif(not _VP9_AVAILABLE, reason="requires the libvpx-vp9 encoder")
+    def test_vp9_hidden_alt_ref_frames(self, tmp_path, monkeypatch):
+        path = tmp_path / "clip.webm"
+        options = {"auto-alt-ref": "1", "lag-in-frames": "16", "g": "30"}
+        options |= {"deadline": "realtime", "cpu-used": "8"}
+        _write_indexed_clip(path, n_frames=150, codec="libvpx-vp9", codec_options=options)
+        _assert_seek_parity(path, monkeypatch, fps=2.0, min_frames=1, max_frames=4)
+        _assert_seek_parity(path, monkeypatch, fps=2.0, min_frames=4, max_frames=16)
+
+
+@pytest.mark.skipif(not _AV_AVAILABLE, reason="requires the 'av' package")
+class TestSeekDecodeWork:
+    """Seeking skips whole groups for sparse targets and never adds work for dense ones."""
+
+    def _decode_counting(self, path, _monkeypatch, threads, **cfg):
+        """Frames, plus the seeks and frames the decoder itself spent.
+
+        The counters start once the extent probe has run, whose own bounded reads are
+        measured in ``TestVideoExtent``, and ``threads`` pins the decoder's depth, which
+        the seek decision weighs and which would otherwise follow the host's core count.
+        """
+        import av
+
+        import kempnerforge.data.video_io as video_io
+
+        real_open, real_extent = av.open, video_io._video_extent
+        opened = []
+
+        def _open(*args, **kwargs):
+            opened.append(_WorkCountingContainer(real_open(*args, **kwargs)))
+            return opened[-1]
+
+        def _extent(container, stream, path_):
+            stream.codec_context.thread_count = threads
+            result = real_extent(container, stream, path_)
+            container.seeks = container.decoded = 0
+            return result
+
+        with pytest.MonkeyPatch.context() as patch:  # undone per call, so calls do not nest
+            patch.setattr(av, "open", _open)
+            patch.setattr(video_io, "_video_extent", _extent)
+            frames = video_io.decode_video_frames(str(path), **cfg)
+        assert len(opened) == 1  # no fallback reopen
+        return frames, opened[0]
+
+    # 20 s at 10 fps with a keyframe every 12 frames: a group is 1.2 s. ``max_frames``
+    # sets the spacing, and with it how many whole groups a decode could skip between
+    # one target's keyframe and the next target: none at 16 targets (1.33 s apart), one
+    # at 8 (2.86 s) and four at 4 (6.67 s), so 0, 12 and 48 frames. A seek throws away
+    # the frames the decoder holds in flight and decodes them again, twice ``threads - 1``
+    # here, so it pays above 0 frames single-threaded and above 30 at 16 threads.
+    @pytest.mark.parametrize(
+        ("max_frames", "threads", "seeks", "decoded"),
+        [
+            (16, 1, 0, 200),
+            (16, 16, 0, 200),
+            (8, 1, 7, 99),
+            (8, 16, 0, 200),
+            (4, 1, 3, 47),
+            (4, 16, 3, 47),
+        ],
+    )
+    def test_seeks_when_the_groups_skipped_outweigh_the_decoder_flush(
+        self, tmp_path, monkeypatch, max_frames, threads, seeks, decoded
+    ):
+        """Whatever it decides, the frames are the serial pass's."""
+        path = tmp_path / "clip.mp4"
+        _write_mp4(path, n_frames=200, gop_size=12)
+        min_frames = 4 if max_frames == 16 else max_frames
+        frames, counter = self._decode_counting(
+            path, monkeypatch, threads, fps=2.0, min_frames=min_frames, max_frames=max_frames
+        )
+        assert [f.tobytes() for f in frames] == [
+            f.tobytes() for f in _serial_reference(path, 2.0, min_frames, max_frames)
+        ]
+        assert (counter.seeks, counter.decoded) == (seeks, decoded)
+
+    @pytest.mark.parametrize(
+        ("suffix", "codec", "options"),
+        [
+            ("mp4", "mpeg4", {"g": "10", "bf": "2"}),
+            ("mkv", "mpeg4", {"g": "10"}),
+            ("webm", "libvpx-vp9", {"g": "10"}),
+            (
+                "mkv",
+                "libx265",
+                {"x265-params": "keyint=10:min-keyint=10:scenecut=0:log-level=error"},
+            ),
+            ("mp4", "libx264", {"x264-params": "keyint=20:min-keyint=20:scenecut=0:bframes=2"}),
+        ],
+    )
+    @pytest.mark.parametrize("sparse", [True, False])
+    def test_the_decision_holds_across_codecs_and_containers(
+        self, tmp_path, monkeypatch, suffix, codec, options, sparse
+    ):
+        """Over 20 s, four targets sit 6.67 s apart and sixteen 1.33 s apart, so the first
+        leave whole groups behind and the second at most one. A 16-deep decoder loses 30
+        frames to a flush, so it seeks only for the sparse ones, whatever the codec, the
+        container or the keyframe spacing; a decoder holding nothing in flight has less to
+        lose, so it never seeks less. Both return the serial pass's frames."""
+        if not _encoder_available(codec):
+            pytest.skip(f"requires the {codec} encoder")
+        path = tmp_path / f"clip.{suffix}"
+        _write_indexed_clip(path, n_frames=200, fps=10, codec=codec, codec_options=options)
+        max_frames = 4 if sparse else 16
+        min_frames = 4
+        expected = [f.tobytes() for f in _serial_reference(path, 2.0, min_frames, max_frames)]
+        counts = {}
+        for threads in (16, 1):
+            frames, counter = self._decode_counting(
+                path, monkeypatch, threads, fps=2.0, min_frames=min_frames, max_frames=max_frames
+            )
+            assert [f.tobytes() for f in frames] == expected
+            counts[threads] = counter.seeks
+        assert (counts[16] > 0) is sparse
+        assert counts[1] >= counts[16]
+
+    @pytest.mark.parametrize("suffix", ["mkv", "mp4"])
+    def test_audio_past_the_video_does_not_move_the_seek_path(self, tmp_path, monkeypatch, suffix):
+        """The seeking decoder samples the span ``_video_extent`` gives it, so an audio
+        track running past the last frame reaches it exactly as it reaches a serial pass:
+        whatever the span, the frames are the same and no test depends on the difference."""
+        path = tmp_path / f"clip.{suffix}"
+        _write_clip_with_audio(path, 200, 10, codec="mpeg4", codec_options={"g": "10"}, tail_s=2.0)
+        frames, counter = self._decode_counting(
+            path, monkeypatch, 16, fps=2.0, min_frames=4, max_frames=4
+        )
+        assert [f.tobytes() for f in frames] == [
+            f.tobytes() for f in _serial_reference(path, 2.0, 4, 4)
+        ]
+        assert counter.seeks > 0  # the clip is long enough that seeking pays
+
+    @pytest.mark.parametrize("suffix", ["mp4", "mkv"])
+    @pytest.mark.parametrize("max_frames", [4, 16])
+    def test_decoder_reporting_nothing_in_flight(self, tmp_path, monkeypatch, suffix, max_frames):
+        """A slice-threaded decoder (MPEG-2) reports no frames in flight, so a flush costs
+        it nothing and any whole group is worth skipping. That is the rule's own reading,
+        not a special case: the seeks stay bounded by one per target and the frames are
+        still the serial pass's."""
+        path = tmp_path / f"mpeg2.{suffix}"
+        _write_indexed_clip(
+            path, n_frames=200, fps=10, codec="mpeg2video", codec_options={"g": "10", "bf": "2"}
+        )
+        frames, counter = self._decode_counting(
+            path, monkeypatch, 16, fps=2.0, min_frames=4, max_frames=max_frames
+        )
+        assert [f.tobytes() for f in frames] == [
+            f.tobytes() for f in _serial_reference(path, 2.0, 4, max_frames)
+        ]
+        assert counter.seeks <= max_frames - 1
+
+
+@pytest.mark.skipif(not _AV_AVAILABLE, reason="requires the 'av' package")
+class TestSeekDamage:
+    """Damage in a stretch the seek skips is never decoded, unlike in a serial pass."""
+
+    def _clips(self, tmp_path, damage_at_s):
+        clean = tmp_path / "clean.mp4"
+        damaged = tmp_path / "damaged.mp4"
+        _write_mp4(clean, n_frames=300, gop_size=12)  # 30 s; targets 0, 10, 20, 30 s
+        _damage_packet(clean, damaged, damage_at_s)
+        return clean, damaged
+
+    def test_damage_in_skipped_stretch_returns_frames(self, tmp_path):
+        import av
+
+        from kempnerforge.data.video_io import decode_video_frames
+
+        clean, damaged = self._clips(tmp_path, damage_at_s=5.0)  # between the 0 s and 10 s groups
+        with pytest.raises(av.FFmpegError):
+            _serial_reference(damaged, 2.0, 1, 4)
+        got = decode_video_frames(str(damaged), fps=2.0, min_frames=1, max_frames=4)
+        ref = decode_video_frames(str(clean), fps=2.0, min_frames=1, max_frames=4)
+        assert [f.tobytes() for f in got] == [f.tobytes() for f in ref]
+
+    def test_damage_in_sampled_group_raises(self, tmp_path):
+        import av
+
+        from kempnerforge.data.video_io import decode_video_frames
+
+        _, damaged = self._clips(tmp_path, damage_at_s=9.8)  # the 9.6 s group holds 10 s
+        with pytest.raises(av.FFmpegError):
+            decode_video_frames(str(damaged), fps=2.0, min_frames=1, max_frames=4)
+
+
+class _FakeSeekFrame:
+    """Decoded-frame stand-in; ``to_image`` returns the frame's index."""
+
+    def __init__(self, index: int, time: float | None, key_frame: bool) -> None:
+        self.index = index
+        self.time = time
+        self.key_frame = key_frame
+
+    def to_image(self) -> int:
+        return self.index
+
+
+class _FakeSeekPacket:
+    """Packet stand-in holding one frame."""
+
+    def __init__(self, frame):
+        self._frame = frame
+
+    def decode(self):
+        return [self._frame]
+
+
+class _FakeSeekContainer:
+    """A 10 fps stream with a keyframe every ``gop`` frames.
+
+    ``seek`` moves to the last keyframe at or before the requested time, then
+    ``land_late`` keyframes further, or on the frame at ``land_at_s`` whatever was asked
+    for, as a container whose index is coarser than the stream's keyframes; ``land_at_start``
+    lands on the first frame, as a container whose index holds a single entry;
+    ``land_on_any_frame`` moves to the frame at that time instead, and
+    ``empty_after_seek`` leaves nothing to decode.
+    ``first_frame_key=False`` leaves frame 0 unflagged, and ``keys`` names the keyframes
+    outright, for a stream whose keyframes are not evenly spaced.
+    """
+
+    def __init__(
+        self,
+        n_frames,
+        gop,
+        *,
+        land_late=0,
+        land_at_s=None,
+        land_at_start=False,
+        land_on_any_frame=False,
+        empty_after_seek=False,
+        timed=True,
+        first_frame_key=True,
+        keys=None,
+    ):
+        def is_key(i):
+            if keys is not None:
+                return i in keys
+            return i % gop == 0 and (i > 0 or first_frame_key)
+
+        self.frames = [
+            _FakeSeekFrame(i, i / 10 if timed else None, is_key(i)) for i in range(n_frames)
+        ]
+        self.gop = gop
+        self.land_late = land_late
+        self.land_at_s = land_at_s
+        self.land_at_start = land_at_start
+        self.land_on_any_frame = land_on_any_frame
+        self.empty_after_seek = empty_after_seek
+        self.pos = 0
+        self.seeks: list[float] = []
+        self.decoded = 0
+
+    def seek(self, offset, *, stream, backward, any_frame):
+        t = float(offset * stream.time_base)
+        self.seeks.append(t)
+        index = int(t * 10 + 1e-6)
+        if self.land_on_any_frame:
+            key = index
+        else:  # the last keyframe at or before the requested time
+            key = max(
+                (i for i, f in enumerate(self.frames) if f.key_frame and i <= index), default=0
+            )
+        landed = 0 if self.land_at_start else max(0, key + self.land_late * self.gop)
+        if self.land_at_s is not None:
+            landed = int(self.land_at_s * 10 + 1e-6)
+        self.pos = len(self.frames) if self.empty_after_seek else landed
+
+    def demux(self, stream):
+        while self.pos < len(self.frames):
+            self.pos += 1
+            self.decoded += 1
+            yield _FakeSeekPacket(self.frames[self.pos - 1])
+
+
+def _fake_seek_stream(delay: int = 0):
+    """A stream stand-in whose decoder reports ``delay`` frames in flight."""
+    return SimpleNamespace(time_base=Fraction(1, 1000), codec_context=SimpleNamespace(delay=delay))
+
+
+def _run_fake(container, targets, delay: int = 0):
+    """``_decode_seek`` over a simulated stream, from its first packet."""
+    from kempnerforge.data.video_io import _decode_seek
+
+    stream = _fake_seek_stream(delay)
+    return _decode_seek(container, stream, container.demux(stream), list(targets), 0.0)
+
+
+class TestSeekCursor:
+    """The seek decisions and guards, on a simulated stream."""
+
+    def test_seeks_only_over_whole_groups(self):
+        from kempnerforge.data.video_io import _decode_serial
+
+        targets = [0.0, 0.5, 1.5, 5.0, 9.9]
+        seek = _FakeSeekContainer(100, gop=10)  # 10 s, a keyframe every second
+        serial = _FakeSeekContainer(100, gop=10)
+        assert _run_fake(seek, targets) == [0, 5, 15, 50, 99]
+        assert _decode_serial(serial.demux(None), targets, 0.0) == [0, 5, 15, 50, 99]
+        # 1.5 s sits inside the group the decode is already in, so nothing whole can be
+        # skipped and it runs on; 5 s and 9.9 s leave whole groups behind, so it seeks.
+        assert seek.seeks == [5.0, 9.9]
+        assert seek.decoded == 21 + 11 + 10
+        assert serial.decoded == 100
+
+    @pytest.mark.parametrize(
+        ("delay", "target", "seeks", "decoded"),
+        [(0, 2.5, [2.5], 17), (5, 2.5, [], 26), (5, 3.5, [3.5], 17), (10, 3.5, [], 36)],
+    )
+    def test_seeks_when_the_groups_skipped_outweigh_the_decoder_flush(
+        self, delay, target, seeks, decoded
+    ):
+        """At the 1 s keyframe, 2.5 s leaves one whole group (1-2 s) to skip and 3.5 s two,
+        so 10 and 20 frames; a seek costs the twice-``delay`` frames the flush throws away
+        and decodes again, so each target is skipped only by a decoder shallow enough."""
+        container = _FakeSeekContainer(100, gop=10)
+        assert _run_fake(container, [0.0, target], delay=delay) == [0, round(target * 10)]
+        assert container.seeks == seeks
+        assert container.decoded == decoded
+
+    def test_seeks_without_a_measured_keyframe_interval(self):
+        """No keyframe precedes the first one met after a match, so there is no interval
+        to compare against: the decode seeks."""
+        container = _FakeSeekContainer(100, gop=10, first_frame_key=False)
+        assert _run_fake(container, [0.0, 2.5], delay=1000) == [0, 25]
+        assert container.seeks == [2.5]
+
+    def test_irregular_keyframes_are_counted_at_their_longest_interval(self):
+        """Keyframes at 0, 1, 2 and 2.2 s, with the decision taken at 2.2 s. Measuring only
+        the interval just ended, 0.2 s, makes the 0.8 s to the target look like four whole
+        groups of two frames and so 8 frames worth skipping, when the second behind it is
+        a whole second and does not even fit once. Counted at the longest interval seen,
+        nothing whole is skippable and a decoder holding 2 frames decodes on."""
+        container = _FakeSeekContainer(100, gop=10, keys={0, 10, 20, 22})
+        assert _run_fake(container, [2.0, 3.0], delay=2) == [20, 30]
+        assert container.seeks == []
+
+    def test_seek_landing_past_its_target_raises(self):
+        from kempnerforge.data.video_io import _SeekUnreliableError
+
+        container = _FakeSeekContainer(100, gop=10, land_late=1)
+        with pytest.raises(_SeekUnreliableError, match="seek to 5.000s landed at 6.000s"):
+            _run_fake(container, [0.0, 5.0])
+
+    def test_seek_landing_on_a_non_keyframe_raises(self):
+        from kempnerforge.data.video_io import _SeekUnreliableError
+
+        container = _FakeSeekContainer(100, gop=10, land_on_any_frame=True)
+        with pytest.raises(_SeekUnreliableError, match="seek to 5.500s landed on a non-keyframe"):
+            _run_fake(container, [0.0, 5.5])
+
+    def test_nothing_decodable_after_a_seek_raises(self):
+        from kempnerforge.data.video_io import _SeekUnreliableError
+
+        container = _FakeSeekContainer(100, gop=10, empty_after_seek=True)
+        with pytest.raises(_SeekUnreliableError, match="no frames decodable at or after 5.000s"):
+            _run_fake(container, [0.0, 5.0])
+
+    def test_a_seek_landing_before_its_decision_but_after_the_start(self):
+        """A container whose index is coarser than the stream's keyframes lands short of
+        where the decision was made, which is what says the index cannot be trusted: the
+        rest is decoded without seeking. The decision here is taken at 4 s and the seek
+        lands at 2 s, strictly inside the stream, so a decision point left unset at the
+        stream's own start would not account for it."""
+        container = _FakeSeekContainer(200, gop=10, land_at_s=2.0)
+        assert _run_fake(container, [3.0, 9.0, 19.9]) == [30, 90, 199]
+        assert container.seeks == [9.0]  # 19.9 s is then reached by decoding on
+
+    def test_frame_without_timestamp_raises(self):
+        from kempnerforge.data.video_io import _SeekUnreliableError
+
+        container = _FakeSeekContainer(10, gop=5, timed=False)
+        with pytest.raises(_SeekUnreliableError, match="without a timestamp"):
+            _run_fake(container, [0.0])
+
+    def test_a_seek_landing_where_it_decided_stops_seeking(self):
+        """A container that indexes fewer seek points than the stream has keyframes lands
+        back where the decode already was: it decodes the rest without seeking again."""
+        container = _FakeSeekContainer(100, gop=10, land_at_start=True)
+        assert _run_fake(container, [0.0, 5.0, 9.9]) == [0, 50, 99]
+        assert len(container.seeks) == 1
+
+
+@pytest.mark.skipif(not _AV_AVAILABLE, reason="requires the 'av' package")
+class TestSeekFallback:
+    """Unreliable seeks must degrade to the serial pass, never to wrong frames."""
+
+    def test_falls_back_to_serial_on_unreliable_seek(self, tmp_path, monkeypatch):
+        import kempnerforge.data.video_io as video_io
+
+        path = tmp_path / "clip.mp4"
+        _write_mp4(path, n_frames=40, gop_size=12)
+        expected = _serial_reference(path, 2.0, 4, 8)
+
+        def _raise(container, stream, packets, targets, start):
+            raise video_io._SeekUnreliableError("test")
+
+        monkeypatch.setattr(video_io, "_decode_seek", _raise)
+        got = video_io.decode_video_frames(str(path), fps=2.0, min_frames=4, max_frames=8)
+        assert [f.tobytes() for f in got] == [f.tobytes() for f in expected]
+
+    def test_fallback_logged_once_per_cause(self, tmp_path, monkeypatch, caplog):
+        import kempnerforge.data.video_io as video_io
+
+        path = tmp_path / "clip.mp4"
+        _write_mp4(path, n_frames=40, gop_size=12)
+
+        def _raise(container, stream, packets, targets, start):
+            raise video_io._SeekUnreliableError("test")
+
+        monkeypatch.setattr(video_io, "_decode_seek", _raise)
+        monkeypatch.setattr(logging.getLogger("kempnerforge"), "propagate", True)
+        video_io._log_fallback_once.cache_clear()
+        with caplog.at_level(logging.DEBUG, logger="kempnerforge.data.video_io"):
+            for _ in range(3):
+                video_io.decode_video_frames(str(path), fps=2.0, min_frames=4, max_frames=8)
+        fallback_lines = [r for r in caplog.records if "falling back" in r.message]
+        assert len(fallback_lines) == 1
+
+    @pytest.mark.parametrize("suffix", ["mkv", "mp4"])
+    def test_stream_starting_off_a_keyframe_never_reaches_the_seeking_decoder(
+        self, tmp_path, monkeypatch, suffix
+    ):
+        """A stream-copy cut has no keyframe to seek back to, so there would be nothing to
+        replay if a seek went wrong: it is decoded serially from the packets in hand."""
+        import kempnerforge.data.video_io as video_io
+
+        src = tmp_path / f"src.{suffix}"
+        cut = tmp_path / f"cut.{suffix}"
+        _write_indexed_clip(
+            src,
+            n_frames=40,
+            fps=10,
+            codec="libx264" if _H264_AVAILABLE else "mpeg4",
+            codec_options={"x264-params": "keyint=10:min-keyint=10:scenecut=0"}
+            if _H264_AVAILABLE
+            else {"g": "10"},
+        )
+        _remux_shifted(src, cut, 0.0, skip_packets=3)
+        expected = [f.tobytes() for f in _serial_reference(cut, 2.0, 4, 4)]
+        monkeypatch.setattr(
+            video_io, "_decode_seek", lambda *a: pytest.fail("seeking a stream it cannot replay")
+        )
+        frames = video_io.decode_video_frames(str(cut), fps=2.0, min_frames=4, max_frames=4)
+        assert [f.tobytes() for f in frames] == expected
+
+    @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires named pipes")
+    @pytest.mark.parametrize("suffix", ["mkv", "ts", "mp4"])
+    def test_pipe_never_reaches_the_seeking_decoder(self, tmp_path, monkeypatch, suffix):
+        """A pipe is read once and cannot be rewound, so there is no fallback to make: it
+        is decoded serially without a seek, which would otherwise hang on the drained pipe."""
+        import threading
+
+        import av
+
+        import kempnerforge.data.video_io as video_io
+
+        clip = tmp_path / f"clip.{suffix}"
+        _write_indexed_clip(clip, n_frames=20, fps=10, codec_options={"g": "10"})
+        pipe = tmp_path / "pipe"
+        os.mkfifo(pipe)
+        data = clip.read_bytes()
+        counts = {"opens": 0, "seeks": 0}
+        real_open = av.open
+
+        class _NoSeek:
+            def __init__(self, container):
+                self._container = container
+
+            def __enter__(self):
+                self._container.__enter__()
+                return self
+
+            def __exit__(self, *exc):
+                return self._container.__exit__(*exc)
+
+            def __getattr__(self, name):
+                return getattr(self._container, name)
+
+            def seek(self, *args, **kwargs):
+                counts["seeks"] += 1
+                raise AssertionError("seeking a pipe")
+
+        def _open(*args, **kwargs):
+            counts["opens"] += 1
+            assert counts["opens"] == 1, "the pipe was opened twice"
+            return _NoSeek(real_open(*args, **kwargs))
+
+        monkeypatch.setattr(av, "open", _open)
+        monkeypatch.setattr(
+            video_io, "_decode_seek", lambda *a: pytest.fail("seeking a stream read once")
+        )
+        result = {}
+
+        def _feed():
+            with open(pipe, "wb") as writer:
+                writer.write(data)
+
+        def _decode():
+            try:
+                result["frames"] = video_io.decode_video_frames(
+                    str(pipe), fps=2.0, min_frames=4, max_frames=4
+                )
+            except BaseException as e:  # noqa: BLE001 - reported below
+                result["error"] = e
+
+        feeder = threading.Thread(target=_feed, daemon=True)
+        worker = threading.Thread(target=_decode, daemon=True)
+        feeder.start()
+        worker.start()
+        worker.join(timeout=30)
+        if worker.is_alive():  # release a reader blocked on a second open of the pipe
+            os.close(os.open(pipe, os.O_WRONLY | os.O_NONBLOCK))
+            pytest.fail("decoding the pipe hung")
+        assert "error" not in result, result.get("error")
+        assert (counts["opens"], counts["seeks"]) == (1, 0)
+        assert _frame_index(result["frames"][0]) == 0
+
+    def test_fallback_covers_a_decoder_error_not_only_an_unreliable_seek(
+        self, tmp_path, monkeypatch
+    ):
+        """The seeking decoder also raises through ``av``: a seek it issues can fail
+        outright. That is recoverable in the same way, so it must reach the serial pass
+        rather than the caller."""
+        import errno
+
+        import av
+
+        import kempnerforge.data.video_io as video_io
+
+        path = tmp_path / "clip.mp4"
+        _write_mp4(path, n_frames=40, gop_size=12)
+        expected = _serial_reference(path, 2.0, 4, 8)
+
+        def _raise(container, stream, packets, targets, start):
+            raise av.error.PermissionError(errno.EPERM, "cannot seek there")
+
+        reasons = []
+        monkeypatch.setattr(video_io, "_decode_seek", _raise)
+        monkeypatch.setattr(video_io, "_log_fallback_once", reasons.append)
+        got = video_io.decode_video_frames(str(path), fps=2.0, min_frames=4, max_frames=8)
+        assert reasons == ["PermissionError"]
+        assert [f.tobytes() for f in got] == [f.tobytes() for f in expected]
+
+    def test_fallback_replays_inside_the_same_container(self, tmp_path, monkeypatch):
+        """The serial fallback re-reads the stream through the container already open, so
+        the input is opened once; reopening it would hang on a stream that is not a file."""
+        import av
+
+        import kempnerforge.data.video_io as video_io
+
+        path = tmp_path / "clip.mp4"
+        _write_mp4(path, n_frames=40, gop_size=12)
+        expected = _serial_reference(path, 2.0, 4, 8)
+
+        def _raise(container, stream, packets, targets, start):
+            raise video_io._SeekUnreliableError("test")
+
+        opens = []
+        real_open = av.open
+        monkeypatch.setattr(video_io, "_decode_seek", _raise)
+        monkeypatch.setattr(
+            av, "open", lambda p, *a, **k: (opens.append(p), real_open(p, *a, **k))[1]
+        )
+        got = video_io.decode_video_frames(str(path), fps=2.0, min_frames=4, max_frames=8)
+        assert len(opens) == 1
+        assert [f.tobytes() for f in got] == [f.tobytes() for f in expected]
+
+    @pytest.mark.skipif(not _H264_AVAILABLE, reason="requires the libx264 encoder")
+    def test_landing_check_raises_on_dropped_leading_frames(self, tmp_path):
+        """Seeking to 9.45 s lands on the open-GOP keyframe at 9.6 s: the leading
+        B-frames before it, which serial selects from, are dropped."""
+        from kempnerforge.data.video_io import _decode_seek, _decode_serial, _SeekUnreliableError
+
+        path = tmp_path / "clip.mp4"
+        _write_h264_mp4(path, n_frames=120, open_gop=True)
+        frames, _ = _run_direct(path, _decode_serial, [0.0, 9.45, 9.55])
+        # Serial takes the 9.5 s B-frame for 9.45 s, not the keyframe the seek reaches.
+        assert frames[1].tobytes() != frames[2].tobytes()
+        with pytest.raises(_SeekUnreliableError, match="seek to 9.450s landed at 9.600s"):
+            _run_direct(path, _decode_seek, [0.0, 9.45])
+
+    def test_audio_only_returns_empty(self, tmp_path):
+        import av
+        import numpy as np
+
+        from kempnerforge.data.video_io import decode_video_frames
+
+        path = tmp_path / "audio.wav"
+        with av.open(str(path), mode="w") as container:
+            stream = container.add_stream("pcm_s16le", rate=8000)
+            samples = np.zeros((1, 800), dtype=np.int16)
+            frame = av.AudioFrame.from_ndarray(samples, format="s16", layout="mono")
+            frame.sample_rate = 8000
+            for packet in stream.encode(frame):
+                container.mux(packet)
+            for packet in stream.encode():
+                container.mux(packet)
+        assert decode_video_frames(str(path), fps=2.0, min_frames=4, max_frames=8) == []
 
 
 class TestSamplingPolicyRegistry:
