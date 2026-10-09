@@ -1091,6 +1091,16 @@ class TestSpan:
 
         assert _span(100, [[(100, 0)]], Fraction(1, 1000), 0.1) == pytest.approx((0.1, 0.1))
 
+    def test_a_duration_shorter_than_the_packets_is_not_used(self):
+        """MPEG-PS reports a tenth of a second for a two-second clip. Neither reading
+        reaches the last timestamp, so the metadata says nothing and the step stands in."""
+        from fractions import Fraction
+
+        from kempnerforge.data.video_io import _span
+
+        runs = [[(0, 0), (100, 0)], [(1900, 0), (2000, 0)]]
+        assert _span(0, runs, Fraction(1, 1000), 0.1) == pytest.approx((0.0, 2.1))
+
     def test_an_unreported_duration_is_not_an_end_time_of_zero(self):
         """No duration reported anywhere arrives as zero. Read as an end time on a stream
         whose timestamps are negative that would place the end two seconds past the start,
