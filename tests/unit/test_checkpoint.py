@@ -1490,6 +1490,17 @@ class TestResumeWithUnsteppedParameters:
                 "recorded as never stepped but have saved optimizer state: ['unused.weight']",
                 id="record_contradicts_saved_state",
             ),
+            pytest.param(
+                lambda state: (
+                    state.update(
+                        optimizer_never_stepped={"unused.weight": torch.zeros((), dtype=torch.bool)}
+                    ),
+                    state["optimizer"]["state"].pop("unused.weight"),
+                    state["optimizer"]["param_groups"][0]["params"].remove("unused.weight"),
+                ),
+                "the saved optimizer did not hold: ['unused.weight']",
+                id="record_names_a_parameter_the_groups_omit",
+            ),
         ],
     )
     def test_a_stepped_parameter_without_a_sound_record_still_fails(
@@ -1512,7 +1523,9 @@ class TestResumeWithUnsteppedParameters:
         dcp.save(saved, checkpoint_id=str(tmp_path / "step_1"))
 
         _, _, manager2 = self._build(1, tmp_path)
-        with pytest.raises((CheckpointException, ValueError), match=re.escape(message)):
+        with pytest.raises(
+            (CheckpointException, ValueError, RuntimeError), match=re.escape(message)
+        ):
             manager2.load(path=str(tmp_path / "step_1"))
 
     def test_an_opaque_optimizer_entry_keeps_its_loaded_state(self, tmp_path, monkeypatch):
