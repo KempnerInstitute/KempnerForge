@@ -14,9 +14,11 @@ in `kempnerforge/checkpoint/manager.py`.
 ## What goes into the DCP shard
 
 ```python
+optim_state = get_optimizer_state_dict(self.model, self.optimizer)
 dcp_state = {
-    "model":     get_model_state_dict(self.model),
-    "optimizer": get_optimizer_state_dict(self.model, self.optimizer),
+    "model":                   get_model_state_dict(self.model),
+    "optimizer":               optim_state,
+    "optimizer_never_stepped": _never_stepped_record(optim_state),
 }
 self._async_ckpt.save(
     dcp_state, checkpoint_id=str(dcp_dir), process_group=self._process_group
@@ -31,9 +33,12 @@ index) and keep the FSDP/DTensor sharding intact, which is what makes
 load (and resharding) line up by name. See [Loading](#loading) for why
 the raw calls break resume.
 
-Two top-level keys — `"model"` and `"optimizer"`. DCP introspects the
-state dicts, finds `DTensor` / `ShardedTensor` parameters, and
-writes each shard to disk with enough metadata to reassemble.
+Three top-level keys. DCP introspects the state dicts, finds
+`DTensor` / `ShardedTensor` parameters, and writes each shard to disk
+with enough metadata to reassemble. The third is empty whenever every
+parameter has optimizer state, and an empty entry writes no key at all,
+so an ordinary run's checkpoints keep the two-key shape any reader
+already expects.
 
 What's in each:
 
@@ -45,6 +50,12 @@ What's in each:
   `step` counters; Lion's `exp_avg`; Muon's internal state. All
   per-parameter tensors live on the same device and parallelism
   shape as the parameter, so DCP saves them symmetrically.
+- **never-stepped record** — one entry per parameter the optimizer
+  holds without any state, i.e. one that had not yet received a
+  gradient. An optimizer creates per-parameter state lazily, so there
+  is nothing to save for those, and once the checkpoint is written
+  that is indistinguishable from state that went missing. The record
+  keeps the distinction for the load — see [Loading](#loading).
 
 Not in the DCP shard: scheduler, dataloader, RNG, and training
 metadata. Those go in `train_state.pt` alongside —
@@ -183,6 +194,21 @@ optimizer.
 > `dcp.load` repopulates them. The model side would work with either
 > call — its parameters are always allocated — but we use the matching
 > getter/setter for symmetry.
+
+The template allocates state for every trainable parameter, while the
+checkpoint has none for the parameters recorded as never stepped. A
+load planner drops exactly those from the template and gives them
+empty state afterwards, so a run in which part of the model has not
+yet been reached resumes. Every other state the template asks for
+stays required: a parameter with missing or partial state, or one the
+saved optimizer did not hold, fails the load.
+
+A checkpoint written before the record existed carries no such evidence,
+and an absent state cannot be told apart from one that went missing, so
+a never-stepped parameter in one of those still fails the load. Start
+from it with `[checkpoint].load_path` and
+`exclude_from_loading = ["optimizer"]`, which restores the weights and
+begins with a fresh optimizer.
 
 Loading with a different GPU count triggers DCP's automatic
 resharding — see [Resharding](resharding.md).

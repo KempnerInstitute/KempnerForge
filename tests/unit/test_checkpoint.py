@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import json
 import random
+import re
 from pathlib import Path
 
 import numpy as np
+import pytest
 import torch
+import torch.distributed.checkpoint as dcp
 
 from kempnerforge.checkpoint.async_save import AsyncCheckpointer
 from kempnerforge.checkpoint.state import (
@@ -1240,6 +1243,341 @@ class TestCheckpointManagerLoad:
         for (rea, rev), (lea, lev) in zip(ref_moments, loaded, strict=True):
             assert torch.equal(rea, lea), "exp_avg not restored"
             assert torch.equal(rev, lev), "exp_avg_sq not restored"
+
+
+class _UsedAndUnused(torch.nn.Module):
+    """``unused`` is trainable but reaches the loss only when ``both`` is set."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.used = torch.nn.Linear(4, 4)
+        self.unused = torch.nn.Linear(4, 4)
+
+    def forward(self, x: torch.Tensor, both: bool = False) -> torch.Tensor:
+        return self.used(x) + self.unused(x) if both else self.used(x)
+
+
+class _Renamed(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.renamed = torch.nn.Linear(4, 4)
+        self.unused = torch.nn.Linear(4, 4)
+
+
+class _WithExtra(_UsedAndUnused):
+    def __init__(self) -> None:
+        super().__init__()
+        self.extra = torch.nn.Linear(4, 4)
+
+
+class _CountingOptimizer(torch.optim.Optimizer):
+    """Optimizer whose whole per-parameter state is a plain step counter."""
+
+    def __init__(self, params, lr: float = 1e-2) -> None:
+        super().__init__(params, {"lr": lr})
+
+    @torch.no_grad()
+    def step(self, closure=None) -> None:  # type: ignore[override]
+        for group in self.param_groups:
+            for param in group["params"]:
+                if param.grad is None:
+                    continue
+                state = self.state[param]
+                state["step"] = state.get("step", 0) + 1
+                param.add_(param.grad, alpha=-group["lr"])
+
+
+class TestResumeWithUnsteppedParameters:
+    """A checkpoint holds optimizer state only for parameters that were stepped."""
+
+    @staticmethod
+    def _build(seed, ckpt_dir, model_cls=_UsedAndUnused, freeze_unused=False):
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        torch.manual_seed(seed)
+        model = model_cls()
+        if freeze_unused:
+            model.unused.requires_grad_(False)
+        trainable = [p for p in model.parameters() if p.requires_grad]
+        optimizer = torch.optim.AdamW(trainable, lr=1e-2)
+        manager = CheckpointManager(CheckpointConfig(dir=str(ckpt_dir)), model, optimizer)
+        return model, optimizer, manager
+
+    @staticmethod
+    def _step(model, optimizer, seed, both=False):
+        x = torch.randn(3, 4, generator=torch.Generator().manual_seed(seed))
+        model(x, both=both).pow(2).sum().backward()
+        optimizer.step()
+        optimizer.zero_grad()
+
+    @staticmethod
+    def _assert_same_run(model, optimizer, model2, optimizer2, stepped=("used.",)):
+        for (name, p), p2 in zip(model.named_parameters(), model2.parameters(), strict=True):
+            assert torch.equal(p, p2), name
+            state, state2 = optimizer.state.get(p, {}), optimizer2.state.get(p2, {})
+            assert state.keys() == state2.keys(), name
+            assert bool(state2) is name.startswith(stepped), name
+            for key in state:
+                assert torch.equal(state[key], state2[key]), f"{name}.{key}"
+
+    def test_resume_leaves_never_stepped_parameters_stateless(self, tmp_path):
+        import logging
+
+        model, optimizer, manager = self._build(0, tmp_path)
+        self._step(model, optimizer, 1)
+        manager.save(step=1)
+
+        records: list[logging.LogRecord] = []
+
+        class _Capture(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                records.append(record)
+
+        mgr_logger = logging.getLogger("kempnerforge.checkpoint.manager")
+        handler, prior_level = _Capture(level=logging.INFO), mgr_logger.level
+        mgr_logger.addHandler(handler)
+        mgr_logger.setLevel(logging.INFO)
+        try:
+            model2, optimizer2, manager2 = self._build(1, tmp_path)
+            assert manager2.load() == (1, 0, {})
+        finally:
+            mgr_logger.removeHandler(handler)
+            mgr_logger.setLevel(prior_level)
+
+        self._assert_same_run(model, optimizer, model2, optimizer2)
+        assert [r.getMessage() for r in records if "never stepped" in r.getMessage()] == [
+            "2 parameters the saved optimizer held were never stepped and resume without "
+            "state: ['unused.bias', 'unused.weight']"
+        ]
+
+    def test_resumed_steps_match_the_uninterrupted_run(self, tmp_path):
+        model, optimizer, manager = self._build(0, tmp_path)
+        self._step(model, optimizer, 1)
+        manager.save(step=1)
+        self._step(model, optimizer, 2)
+        self._step(model, optimizer, 3)
+
+        model2, optimizer2, manager2 = self._build(1, tmp_path)
+        manager2.load()
+        self._step(model2, optimizer2, 2)
+        self._step(model2, optimizer2, 3)
+        self._assert_same_run(model, optimizer, model2, optimizer2)
+
+    def test_first_gradient_after_resume_matches_the_uninterrupted_run(self, tmp_path):
+        model, optimizer, manager = self._build(0, tmp_path)
+        self._step(model, optimizer, 1)
+        manager.save(step=1)
+        self._step(model, optimizer, 2, both=True)
+        self._step(model, optimizer, 3, both=True)
+
+        model2, optimizer2, manager2 = self._build(1, tmp_path)
+        manager2.load()
+        assert not optimizer2.state.get(model2.unused.weight)
+        self._step(model2, optimizer2, 2, both=True)
+        self._step(model2, optimizer2, 3, both=True)
+        self._assert_same_run(model, optimizer, model2, optimizer2, stepped=("used.", "unused."))
+
+    def test_a_stepped_parameter_missing_part_of_its_state_still_fails(self, tmp_path):
+        from torch.distributed.checkpoint.api import CheckpointException
+
+        model, optimizer, manager = self._build(0, tmp_path)
+        self._step(model, optimizer, 1)
+        del optimizer.state[model.used.weight]["exp_avg_sq"]
+        manager.save(step=1)
+
+        _, _, manager2 = self._build(1, tmp_path)
+        missing = r"Missing key in checkpoint state_dict: optimizer\.state\.used\.weight\."
+        with pytest.raises(CheckpointException, match=missing + "exp_avg_sq"):
+            manager2.load()
+
+    @pytest.mark.parametrize(
+        ("case", "named"),
+        [
+            ("frozen_at_save", "unused.weight"),
+            ("renamed_without_model", "renamed.weight"),
+            ("added_without_model", "extra.weight"),
+            ("integer_keyed", "used.weight"),
+        ],
+    )
+    def test_state_the_saved_optimizer_did_not_hold_still_fails(self, tmp_path, case, named):
+        """Checkpoints that never held a parameter's state still fail, as they always have."""
+        from torch.distributed.checkpoint.api import CheckpointException
+
+        model, optimizer, manager = self._build(0, tmp_path, freeze_unused=case == "frozen_at_save")
+        self._step(model, optimizer, 1, both=case == "added_without_model")
+        if case == "integer_keyed":
+            state = {"model": model.state_dict(), "optimizer": optimizer.state_dict()}
+            dcp.save(state, checkpoint_id=str(tmp_path / "step_1"))
+        else:
+            manager.save(step=1)
+
+        model_cls = {"renamed_without_model": _Renamed, "added_without_model": _WithExtra}
+        _, _, manager2 = self._build(1, tmp_path, model_cls=model_cls.get(case, _UsedAndUnused))
+        exclude = ["model"] if case.endswith("without_model") else None
+        with pytest.raises((CheckpointException, RuntimeError), match=re.escape(named)):
+            manager2.load(path=str(tmp_path / "step_1"), exclude_keys=exclude)
+
+    def test_the_save_records_the_parameters_held_without_state(self):
+        from kempnerforge.checkpoint.manager import _never_stepped_record
+
+        optim_state = {
+            # "b" carries the empty state a resumed never-stepped parameter has.
+            "state": {"a.weight": {"step": 1}, "b": {}},
+            "param_groups": [{"params": ["a.weight", "b"]}, {"params": ["c.bias"]}],
+        }
+        record = _never_stepped_record(optim_state)
+        assert sorted(record) == ["b", "c.bias"]
+        assert all(isinstance(entry, torch.Tensor) for entry in record.values())
+
+    def test_only_recorded_parameters_count_as_never_stepped(self):
+        from kempnerforge.checkpoint.manager import _params_recorded_never_stepped
+
+        # "absent" has neither state nor a record, so it is not taken as never
+        # stepped and its load fails on the missing state.
+        fqns = {"a.weight", "absent", "proj.weight", "proj.weight_scale"}
+        saved_keys = [
+            "model.proj.weight",  # a model entry, not optimizer state
+            "optimizer.param_groups.0.lr",
+            "optimizer.state.a.weight.nested.moment",
+            "optimizer.state.proj.weight_scale.step",
+            "optimizer_never_stepped.proj.weight",
+            "optimizer_never_stepped.not.in.this.model",
+        ]
+        assert _params_recorded_never_stepped(fqns, saved_keys) == {"proj.weight"}
+
+        contradicted = "recorded as never stepped but have saved optimizer state: ['a.weight']"
+        with pytest.raises(ValueError, match=re.escape(contradicted)):
+            _params_recorded_never_stepped(fqns, [*saved_keys, "optimizer_never_stepped.a.weight"])
+
+    def test_only_parameters_the_saved_optimizer_held_stay_stateless(self):
+        from kempnerforge.checkpoint.manager import _restore_never_stepped
+
+        groups = [{"params": ["a.weight", "b.weight"]}, {"params": ["a.bias"]}]
+        held = {"param_groups": groups, "state": {"a.weight": {"step": 1}}}
+        _restore_never_stepped(held, {"b.weight", "a.bias"}, Path("ckpt"))
+        assert held["state"] == {"a.weight": {"step": 1}, "b.weight": {}, "a.bias": {}}
+
+        unheld = {"param_groups": groups + [{"params": [0, 1]}], "state": {}}
+        message = "for 2 trainable parameters the saved optimizer did not hold: ['c', 'd']"
+        with pytest.raises(RuntimeError, match=re.escape(message)):
+            _restore_never_stepped(unheld, {"b.weight", "c", "d"}, Path("ckpt"))
+        assert unheld["state"] == {}
+
+    @pytest.mark.parametrize(
+        ("mutate", "message"),
+        [
+            pytest.param(
+                lambda state: state["optimizer"]["state"].pop("unused.weight"),
+                "Missing key in checkpoint state_dict: optimizer.state.unused.weight.",
+                id="whole_state_missing",
+            ),
+            pytest.param(
+                lambda state: state["optimizer"].update(state={}),
+                "Missing key in checkpoint state_dict: optimizer.state.",
+                id="state_omitted",
+            ),
+            pytest.param(
+                lambda state: state["optimizer"]["state"].update(
+                    renamed=state["optimizer"]["state"].pop("unused.weight")
+                ),
+                "Missing key in checkpoint state_dict: optimizer.state.unused.weight.",
+                id="state_key_renamed",
+            ),
+            pytest.param(
+                lambda state: state.update(
+                    optimizer_never_stepped={"unused.weight": torch.zeros((), dtype=torch.bool)}
+                ),
+                "recorded as never stepped but have saved optimizer state: ['unused.weight']",
+                id="record_contradicts_saved_state",
+            ),
+            pytest.param(
+                lambda state: (
+                    state.update(
+                        optimizer_never_stepped={"unused.weight": torch.zeros((), dtype=torch.bool)}
+                    ),
+                    state["optimizer"]["state"].pop("unused.weight"),
+                    state["optimizer"]["param_groups"][0]["params"].remove("unused.weight"),
+                ),
+                "the saved optimizer did not hold: ['unused.weight']",
+                id="record_names_a_parameter_the_groups_omit",
+            ),
+        ],
+    )
+    def test_a_stepped_parameter_without_a_sound_record_still_fails(
+        self, tmp_path, mutate, message
+    ):
+        """State that went missing is not a parameter that never received a gradient."""
+        from torch.distributed.checkpoint.api import CheckpointException
+        from torch.distributed.checkpoint.state_dict import (
+            get_model_state_dict,
+            get_optimizer_state_dict,
+        )
+
+        model, optimizer, _ = self._build(0, tmp_path)
+        self._step(model, optimizer, 1, both=True)
+        saved = {
+            "model": get_model_state_dict(model),
+            "optimizer": get_optimizer_state_dict(model, optimizer),
+        }
+        mutate(saved)
+        dcp.save(saved, checkpoint_id=str(tmp_path / "step_1"))
+
+        _, _, manager2 = self._build(1, tmp_path)
+        with pytest.raises(
+            (CheckpointException, ValueError, RuntimeError), match=re.escape(message)
+        ):
+            manager2.load(path=str(tmp_path / "step_1"))
+
+    def test_an_opaque_optimizer_entry_keeps_its_loaded_state(self, tmp_path, monkeypatch):
+        """A checkpoint that stores the optimizer as one entry loads it whole."""
+        from torch.distributed.checkpoint import FileSystemReader, _version
+        from torch.distributed.checkpoint.state_dict import (
+            get_model_state_dict,
+            get_optimizer_state_dict,
+        )
+
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        def build(seed):
+            torch.manual_seed(seed)
+            model = _UsedAndUnused()
+            return model, _CountingOptimizer(model.parameters())
+
+        model, optimizer = build(0)
+        for seed in (1, 2):
+            self._step(model, optimizer, seed, both=True)
+        saved = {
+            "model": get_model_state_dict(model),
+            "optimizer": get_optimizer_state_dict(model, optimizer),
+        }
+        # A state of plain counters held no tensors, so older writers kept the
+        # whole optimizer as a single entry instead of one key per state value.
+        monkeypatch.setattr(_version, "_derived_version", "2_3")
+        dcp.save(saved, checkpoint_id=str(tmp_path / "step_1"))
+        monkeypatch.undo()
+        index = FileSystemReader(str(tmp_path / "step_1")).read_metadata()
+        assert "optimizer" in index.state_dict_metadata
+
+        model2, optimizer2 = build(1)
+        manager2 = CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model2, optimizer2)
+        manager2.load(path=str(tmp_path / "step_1"))
+        assert [optimizer2.state[p] for p in model2.parameters()] == [{"step": 2}] * 4
+
+    def test_a_resumed_run_saves_and_resumes_again(self, tmp_path):
+        """The second checkpoint records the never-stepped parameter the first one did."""
+        model, optimizer, manager = self._build(0, tmp_path)
+        self._step(model, optimizer, 1)
+        manager.save(step=1)
+
+        model2, optimizer2, manager2 = self._build(1, tmp_path)
+        manager2.load()
+        self._step(model2, optimizer2, 2)
+        manager2.save(step=2)
+
+        model3, optimizer3, manager3 = self._build(2, tmp_path)
+        assert manager3.load() == (2, 0, {})
+        self._step(model, optimizer, 2)
+        self._assert_same_run(model, optimizer, model3, optimizer3)
 
 
 # ---------------------------------------------------------------------------

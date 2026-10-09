@@ -14,12 +14,15 @@ import logging
 import os
 import shutil
 import stat
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, cast
 
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
+from torch.distributed.checkpoint import DefaultLoadPlanner
+from torch.distributed.checkpoint.metadata import STATE_DICT_TYPE, Metadata
 from torch.distributed.checkpoint.state_dict import (
     get_model_state_dict,
     get_optimizer_state_dict,
@@ -39,6 +42,13 @@ _METADATA_FILE = "metadata.json"
 # DCP writes this file LAST, once all shards are durable. Its presence is the
 # authoritative signal that a checkpoint's distributed state is loadable.
 _DCP_METADATA_FILE = ".metadata"
+# Key prefix of per-parameter optimizer state in a checkpoint saved by this manager.
+_OPTIM_STATE_PREFIX = "optimizer.state."
+# Top-level entry naming the parameters the optimizer held without state at save
+# time. It sits beside the optimizer rather than inside it, so it changes neither
+# the optimizer's own layout nor what an older reader, which ignores it, loads.
+_NEVER_STEPPED_KEY = "optimizer_never_stepped"
+_NEVER_STEPPED_PREFIX = f"{_NEVER_STEPPED_KEY}."
 
 
 def _intersect_freeze_meta_by_module(
@@ -70,6 +80,104 @@ def _intersect_freeze_meta_by_module(
         [e for e in saved if e["module"] in shared],
         [e for e in expected if e["module"] in shared],
     )
+
+
+def _never_stepped_record(optim_state: dict[str, Any]) -> dict[str, torch.Tensor]:
+    """Record the parameters the optimizer holds without any state.
+
+    An optimizer keeps state only for parameters that have received a gradient,
+    and a checkpoint stores only what it keeps. A missing state and a state that
+    never existed look the same once the optimizer is gone, so the save writes
+    the distinction down while it still has it: one entry per parameter the
+    param groups list and the state omits. The entries are tensors so that they
+    stay separate keys in the checkpoint's own index, which is all the load
+    reads; the value itself is never loaded.
+    """
+    state = optim_state["state"]
+    return {
+        fqn: torch.zeros((), dtype=torch.bool)
+        for group in optim_state["param_groups"]
+        for fqn in group["params"]
+        if not state.get(fqn)
+    }
+
+
+def _params_recorded_never_stepped(fqns: set[str], saved_keys: Iterable[str]) -> set[str]:
+    """Return the parameters in ``fqns`` the save recorded as holding no state.
+
+    A record entry names one whole parameter, so the name is the rest of its
+    key. A parameter whose state is simply absent is not recorded and stays in
+    the load, which then fails on it, and a recorded parameter that also has
+    saved state makes the two disagree, so the load fails rather than drop the
+    state it does have. Each state key counts toward the longest parameter name
+    it starts with, so a state of any layout marks its parameter.
+    """
+    recorded: set[str] = set()
+    with_state: set[str] = set()
+    for key in saved_keys:
+        if key.startswith(_NEVER_STEPPED_PREFIX):
+            recorded.add(key.removeprefix(_NEVER_STEPPED_PREFIX))
+        elif key.startswith(_OPTIM_STATE_PREFIX):
+            name = key.removeprefix(_OPTIM_STATE_PREFIX)
+            while name and name not in fqns:
+                name = name.rpartition(".")[0]
+            with_state.add(name)
+    recorded &= fqns
+    contradicted = sorted(recorded & with_state)
+    if contradicted:
+        raise ValueError(
+            f"{len(contradicted)} parameters are recorded as never stepped but have saved "
+            f"optimizer state: {contradicted[:8]}"
+        )
+    return recorded
+
+
+class _NeverSteppedStatePlanner(DefaultLoadPlanner):
+    """Load planner that leaves out the optimizer state the save recorded as absent.
+
+    A fresh optimizer's template has state for every trainable parameter, but a
+    checkpoint has none for parameters that had not received a gradient when it
+    was saved. Those are dropped from the load and kept in ``never_stepped`` for
+    the caller to confirm against the saved ``param_groups``; every other key
+    stays required, including one whose state is missing without a record.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.never_stepped: set[str] = set()
+
+    def set_up_planner(
+        self,
+        state_dict: STATE_DICT_TYPE,
+        metadata: Metadata | None = None,
+        is_coordinator: bool = False,
+    ) -> None:
+        optim_state = state_dict.get("optimizer")
+        if optim_state is not None and metadata is not None:
+            fqns = set(optim_state["state"])
+            self.never_stepped = _params_recorded_never_stepped(fqns, metadata.state_dict_metadata)
+            for fqn in self.never_stepped:
+                del optim_state["state"][fqn]
+        super().set_up_planner(state_dict, metadata, is_coordinator)
+
+
+def _restore_never_stepped(
+    optim_state: dict[str, Any], never_stepped: set[str], where: Path
+) -> None:
+    """Give the recorded parameters empty optimizer state once the saved optimizer lists them.
+
+    ``optim_state`` holds the loaded ``param_groups``, which list every parameter the saved
+    optimizer held, stepped or not. A recorded parameter they do not list was never part of
+    that optimizer, so the load fails instead of guessing its state.
+    """
+    held = {fqn for group in optim_state["param_groups"] for fqn in group["params"]}
+    unheld = sorted(never_stepped - held)
+    if unheld:
+        raise RuntimeError(
+            f"Missing optimizer state in {where} for {len(unheld)} trainable parameters "
+            f"the saved optimizer did not hold: {unheld[:8]}"
+        )
+    optim_state["state"].update({fqn: {} for fqn in never_stepped})
 
 
 def _load_train_state(path: Path) -> dict[str, Any]:
@@ -252,9 +360,11 @@ class CheckpointManager:
         # repopulate them. A freshly-constructed optimizer's raw state_dict() is
         # empty, so the moments would be silently dropped on resume (Adam momentum
         # resets to zero -> non-bit-exact resume; see manager load()).
+        optim_state = get_optimizer_state_dict(self.model, self.optimizer)
         dcp_state = {
             "model": get_model_state_dict(self.model),
-            "optimizer": get_optimizer_state_dict(self.model, self.optimizer),
+            "optimizer": optim_state,
+            _NEVER_STEPPED_KEY: _never_stepped_record(optim_state),
         }
         # Dispatch the DCP save. For async modes this returns immediately but
         # FIRST awaits the previous in-flight flush, so any deferred
@@ -483,13 +593,27 @@ class CheckpointManager:
             dcp_state["optimizer"] = get_optimizer_state_dict(self.model, self.optimizer)
 
         if dcp_state:
-            dcp.load(dcp_state, checkpoint_id=str(dcp_dir), process_group=self._process_group)
+            planner = _NeverSteppedStatePlanner()
+            dcp.load(
+                dcp_state,
+                checkpoint_id=str(dcp_dir),
+                process_group=self._process_group,
+                planner=planner,
+            )
 
+            if load_optim:
+                optim_state = cast("dict[str, Any]", dcp_state["optimizer"])
+                _restore_never_stepped(optim_state, planner.never_stepped, dcp_dir)
             if load_model:
                 set_model_state_dict(self.model, dcp_state["model"])
             if load_optim:
                 set_optimizer_state_dict(
                     self.model, self.optimizer, optim_state_dict=dcp_state["optimizer"]
+                )
+            if planner.never_stepped:
+                logger.info(
+                    f"{len(planner.never_stepped)} parameters the saved optimizer held were never "
+                    f"stepped and resume without state: {sorted(planner.never_stepped)[:8]}"
                 )
 
         # Load non-distributed state. On NFS/Lustre, independent stat()
