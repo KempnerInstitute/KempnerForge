@@ -135,6 +135,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Video frames are selected relative to the video stream's start.** `decode_video_frames` compared absolute frame timestamps with sample targets that start at 0 s, so a stream starting later (a container start offset or a B-frame delay) returned shifted frames, or only its first frame; frame times and the sampled span now come from the video packets' own timestamps, read at the start and end of the file, rather than from container metadata.
 - **`checkpoint.exclude_from_loading` is now honoured on a `load_path` warm start** (ignored on a resume); keys other than `"model"`/`"optimizer"` are rejected.
 - **Sequence packing is now rejected under pipeline parallelism** instead of silently training on cross-document context. `PipelineStageModule.forward` receives only hidden states and `pipeline_step` never read `batch["doc_ids"]`, so with `pp > 1` and `data.pack_sequences = true` the packed documents attended across each other while the labels still masked the boundary positions -- the loss looked correct while attention leaked, which is why it went unnoticed. `JobConfig.validate` now raises. Packing without PP and PP without packing are both unchanged; no shipped config sets `pack_sequences`, so no existing run is affected.
   - `kempnerforge/config/job.py` (+ `tests/unit/test_config.py`).
