@@ -27,16 +27,20 @@ def _dcp_durable(ckpt_dir: Path) -> bool:
 
     Accepts both layouts: a flat directory, and the per-stage ``pp{k}/``
     subdirectories written under pipeline parallelism.
+
+    Under pipeline parallelism *every* stage must be durable. Each stage saves
+    through its own process group, so an interrupted save can leave the earlier
+    stages complete and the later ones empty; resuming into that mix fails in
+    ``dcp.load`` on the stages that have no ``.metadata``, or resumes them from
+    different steps. An empty stage list is not durable either -- ``all()`` is
+    vacuously true on it, and a directory with no stage at all holds nothing.
     """
     if (ckpt_dir / _DCP_METADATA_FILE).exists():
         return True
     if not ckpt_dir.is_dir():
         return False
-    return any(
-        (d / _DCP_METADATA_FILE).exists()
-        for d in ckpt_dir.iterdir()
-        if d.is_dir() and d.name.startswith("pp")
-    )
+    stages = [d for d in ckpt_dir.iterdir() if d.is_dir() and d.name.startswith("pp")]
+    return bool(stages) and all((d / _DCP_METADATA_FILE).exists() for d in stages)
 
 
 @dataclass

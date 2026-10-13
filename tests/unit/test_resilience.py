@@ -646,6 +646,32 @@ class TestResumePathResolution:
         assert result is not None
         assert result.name == "step_10"
 
+    def test_skips_partly_saved_pipeline_parallel_dir(self, tmp_path):
+        """Some stages durable and others not is still an interrupted save.
+
+        Each stage saves through its own process group, so a save cut short
+        leaves the earlier stages complete and the later ones empty. Resuming
+        into that mix fails in ``dcp.load`` on the stages with no ``.metadata``,
+        or resumes them from a different step than the ones that did finish.
+        """
+        _durable_step_dir(tmp_path, 10, pp_stages=2)
+        partial = _durable_step_dir(tmp_path, 20, pp_stages=2)
+        (partial / "pp1" / ".metadata").unlink()  # stage 1 never finished
+
+        result = resolve_resume_path(str(tmp_path))
+        assert result is not None
+        assert result.name == "step_10"
+
+    def test_step_dir_without_stage_dirs_is_not_durable(self, tmp_path):
+        """A directory holding no stage at all holds nothing to resume from."""
+        _durable_step_dir(tmp_path, 10)
+        empty = tmp_path / "step_20"
+        (empty / "not_a_stage").mkdir(parents=True)
+
+        result = resolve_resume_path(str(tmp_path))
+        assert result is not None
+        assert result.name == "step_10"
+
 
 # ---------------------------------------------------------------------------
 # DataLoader worker signal shielding (#177)

@@ -1297,6 +1297,34 @@ class TestRestoreCheckpoint:
         assert entry.restore_checkpoint(config, TinyTextModel(), None, mgr) == (0, 0)
         assert mgr.load_kwargs == {}
 
+    @pytest.mark.parametrize("rank", [0, 1])
+    def test_only_rank_zero_resolves_the_resume_path(self, monkeypatch, tmp_path, rank):
+        """Every rank must resume from the same checkpoint.
+
+        Resolution stats ``.metadata`` to test durability, and on shared
+        storage those stats can disagree briefly across ranks. A rank that
+        disagrees resumes from a different step, or hangs in the collective
+        load when it skips one the other ranks take. Only rank 0 looks, and
+        its answer is broadcast.
+        """
+        import kempnerforge.training.entry as entry
+
+        looked: list = []
+        chosen = tmp_path / "step_7"
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda d: looked.append(d) or chosen)
+        monkeypatch.setattr(entry.dist, "is_initialized", lambda: True)
+        monkeypatch.setattr(entry.dist, "get_rank", lambda: rank)
+        monkeypatch.setattr(
+            entry.dist,
+            "broadcast_object_list",
+            lambda lst, src=0: lst.__setitem__(0, str(chosen)),
+        )
+
+        mgr = FakeResumeManager(step=7, tokens=1234)
+        assert entry.restore_checkpoint(make_config(), TinyTextModel(), None, mgr) == (7, 1234)
+        assert mgr.load_kwargs["path"] == str(chosen)
+        assert len(looked) == (1 if rank == 0 else 0), "non-zero ranks must not stat the tree"
+
     def test_warm_start_exclude_leaves_the_vlm_freeze_probe_alone(self, monkeypatch):
         """Excluding state keys does not skip the freeze-metadata check; a
         weights-only checkpoint has no metadata.json, so the probe yields 0."""
