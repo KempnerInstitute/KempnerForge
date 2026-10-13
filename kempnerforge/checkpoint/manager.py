@@ -394,6 +394,11 @@ class CheckpointManager:
         """
         ckpt_dir = self._resolve_load_path(path)
         if ckpt_dir is None:
+            requested = path if path is not None else self.config.load_path
+            if requested:
+                # A named checkpoint that is missing is a config error (typo, moved
+                # dir); silently training from random init would hide it.
+                raise FileNotFoundError(f"Checkpoint not found: {requested}")
             logger.info("No checkpoint found — starting from scratch")
             return 0, 0, {}
 
