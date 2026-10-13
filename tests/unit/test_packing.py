@@ -89,6 +89,62 @@ class TestComputePackedOutput:
         assert result["labels"].dtype == torch.long
         assert result["doc_ids"].dtype == torch.long
 
+    def test_matches_sequential_reference(self):
+        """Every output matches a literal, obviously-correct transcription.
+
+        Covers labels as well as doc_ids: the boundary masking is the subtler
+        half, and the half whose failure is silent -- masked labels keep the
+        loss looking healthy whatever attention does.
+        """
+
+        def reference(tokens: np.ndarray, eos_token_id: int):
+            """Carry a counter and mask boundaries, the slow obvious way."""
+            n = len(tokens)
+            doc_ids = np.zeros(n, dtype=np.int64)
+            doc_id = 0
+            for i in range(n):
+                doc_ids[i] = doc_id
+                if tokens[i] == eos_token_id:
+                    doc_id += 1
+
+            # The function is handed seq_len + 1 tokens: the extra one gives the
+            # last input position something to predict. Inputs are tokens[:-1]
+            # and labels tokens[1:], so the doc ids split the same way.
+            input_ids = tokens[:-1]
+            labels = tokens[1:].copy()
+            for i in range(n - 1):
+                if doc_ids[i] != doc_ids[i + 1]:
+                    labels[i] = -100
+            return input_ids, labels, doc_ids[:-1]
+
+        rng = np.random.default_rng(0)
+        for _ in range(50):
+            # Small vocab so EOS is dense: boundaries, runs of consecutive EOS,
+            # and EOS at either end all show up across the draws.
+            tokens = rng.integers(0, 4, size=int(rng.integers(3, 64))).astype(np.int64)
+            result = _compute_packed_output(tokens, eos_token_id=0)
+            expected_inputs, expected_labels, expected_doc_ids = reference(tokens, 0)
+
+            assert result["input_ids"].tolist() == expected_inputs.tolist()
+            assert result["labels"].tolist() == expected_labels.tolist()
+            assert result["doc_ids"].tolist() == expected_doc_ids.tolist()
+
+    def test_reference_draws_actually_exercise_boundaries(self):
+        """Guards the test above: random draws must contain masked labels.
+
+        If the vocab or length ranges were ever changed such that EOS stopped
+        appearing, the comparison would still pass while checking nothing.
+        """
+        rng = np.random.default_rng(0)
+        masked = boundaries = 0
+        for _ in range(50):
+            tokens = rng.integers(0, 4, size=int(rng.integers(3, 64))).astype(np.int64)
+            result = _compute_packed_output(tokens, eos_token_id=0)
+            masked += int((result["labels"] == -100).sum())
+            boundaries += int(result["doc_ids"].max())
+        assert masked > 0, "no boundary labels were masked; the draws test nothing"
+        assert boundaries > 0, "no multi-document sequences were generated"
+
 
 # ---------------------------------------------------------------------------
 # Attention mask for packed sequences
@@ -308,6 +364,83 @@ class TestModelWithPacking:
         for p in tiny_model.parameters():
             assert p.grad is not None
             assert torch.isfinite(p.grad).all()
+
+
+class TestPackedModelFlexBackend:
+    """Model-level parity for ``attention_backend="flex"``.
+
+    FlexAttention raises on CPU as soon as an input requires grad -- even for a
+    forward, because autograd would need a backward node it does not have on CPU
+    in torch 2.11. Every case here therefore runs under ``torch.no_grad()``;
+    gradient and compiled-kernel coverage lives in
+    ``tests/integration/test_compile.py::TestFlexCompile``.
+    """
+
+    def _model(self, backend: str, **overrides):
+        from kempnerforge.config.schema import ModelConfig
+        from kempnerforge.model.transformer import Transformer
+
+        torch.manual_seed(0)
+        config = ModelConfig(
+            dim=64,
+            n_layers=2,
+            n_heads=4,
+            vocab_size=256,
+            max_seq_len=32,
+            attention_backend=backend,
+            **overrides,
+        )
+        return Transformer(config).eval()
+
+    @pytest.mark.parametrize("overrides", [{}, {"n_kv_heads": 2}], ids=["mha", "gqa"])
+    def test_matches_sdpa_backend(self, overrides):
+        """Same weights, same batch: flex reproduces the dense-mask SDPA output.
+
+        The GQA case matters on its own -- flex passes ``enable_gqa`` instead of
+        materializing repeated K/V heads, so it exercises a different kernel path.
+        """
+        tokens = torch.randint(0, 256, (2, 16), generator=torch.Generator().manual_seed(7))
+        doc_ids = torch.tensor([[0] * 6 + [1] * 10, [0] * 16])
+        with torch.no_grad():
+            out_sdpa = self._model("sdpa", **overrides)(tokens, doc_ids=doc_ids)
+            out_flex = self._model("flex", **overrides)(tokens, doc_ids=doc_ids)
+        torch.testing.assert_close(out_flex, out_sdpa)
+
+    def test_single_doc_matches_causal(self):
+        model = self._model("flex")
+        tokens = torch.randint(0, 256, (1, 8), generator=torch.Generator().manual_seed(1))
+        with torch.no_grad():
+            out_causal = model(tokens)
+            out_packed = model(tokens, doc_ids=torch.zeros(1, 8, dtype=torch.long))
+        torch.testing.assert_close(out_causal, out_packed)
+
+    def test_cross_doc_isolation(self):
+        """Perturbing document 0 must not move any document-1 output at all."""
+        model = self._model("flex")
+        tokens = torch.randint(0, 256, (1, 16), generator=torch.Generator().manual_seed(3))
+        doc_ids = torch.tensor([[0] * 6 + [1] * 10])
+        perturbed = tokens.clone()
+        perturbed[0, :6] = (perturbed[0, :6] + 1) % 256
+        with torch.no_grad():
+            base = model(tokens, doc_ids=doc_ids)
+            moved = model(perturbed, doc_ids=doc_ids)
+        torch.testing.assert_close(base[:, 6:], moved[:, 6:], rtol=0, atol=0)
+        assert not torch.allclose(base[:, :6], moved[:, :6])
+
+    def test_no_doc_ids_is_bit_identical_to_sdpa(self):
+        """Unpacked batches build no BlockMask and take the is_causal SDPA path."""
+        tokens = torch.randint(0, 256, (2, 16), generator=torch.Generator().manual_seed(5))
+        with torch.no_grad():
+            out_sdpa = self._model("sdpa")(tokens)
+            out_flex = self._model("flex")(tokens)
+        torch.testing.assert_close(out_flex, out_sdpa, rtol=0, atol=0)
+
+    def test_rejects_doc_ids_shorter_than_the_sequence(self):
+        """Guards the VLM image-prefix case, where doc_ids would misalign."""
+        model = self._model("flex")
+        tokens = torch.randint(0, 256, (1, 16))
+        with pytest.raises(ValueError, match="doc_ids length"), torch.no_grad():
+            model(tokens, doc_ids=torch.zeros(1, 8, dtype=torch.long))
 
 
 # ---------------------------------------------------------------------------

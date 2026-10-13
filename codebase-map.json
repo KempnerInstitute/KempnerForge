@@ -2,7 +2,7 @@
   "meta": {
     "description": "KempnerForge codebase map — files, classes, functions, tests, and registry entries",
     "updated": "2026-05-11",
-    "note": "Keep in sync as phases are implemented. Latest landings: VLM (Joint-Decoder, Cross-Attention, Mixture-of-Transformers) + freeze schedule + vision encoder registry + checkpoint helpers (peek_saved_step, flush_pending_save, cross-arch freeze-meta intersection) + FSDP2 helpers (_fsdp_wrap_transformer_blocks, _apply_fsdp_vlm, _build_vlm)."
+    "note": "Keep in sync as phases are implemented. Latest landings: VLM (Joint-Decoder, Cross-Attention, Mixture-of-Transformers) + freeze schedule + vision encoder registry + checkpoint helpers (peek_saved_step, flush_pending_save, cross-arch freeze-meta intersection) + FSDP2 helpers (_fsdp_wrap_transformer_blocks, _apply_fsdp_vlm, _build_vlm). Also: FlexAttention packed-attention backend (model/masking.py, ModelConfig.attention_backend)."
   },
   "source": {
     "kempnerforge/config/registry.py": {
@@ -469,6 +469,18 @@
         "tests/unit/test_generate.py::TestKVCache",
         "tests/unit/test_packing.py::TestPackedAttentionMask",
         "tests/unit/test_hooks.py::TestAttentionWeightCapture"
+      ]
+    },
+    "kempnerforge/model/masking.py": {
+      "functions": [
+        "flex_attention_fn(compiled) -> Callable  # torch.compile'd on CUDA, eager on CPU",
+        "build_doc_causal_block_mask(doc_ids, device) -> BlockMask  # block-diagonal causal"
+      ],
+      "purpose": "FlexAttention BlockMask builders for packed sequences (model.attention_backend='flex'); replaces the dense (B, 1, S, S) SDPA mask",
+      "tested_by": [
+        "tests/unit/test_masking.py",
+        "tests/unit/test_packing.py::TestPackedModelFlexBackend",
+        "tests/integration/test_compile.py::TestFlexCompile"
       ]
     },
     "kempnerforge/model/mlp.py": {

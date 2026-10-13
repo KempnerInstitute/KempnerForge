@@ -19,6 +19,9 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
         self.eps = eps
 
+    def reset_parameters(self) -> None:
+        nn.init.ones_(self.weight)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # float32 for numerical stability, then cast back
         dtype = x.dtype

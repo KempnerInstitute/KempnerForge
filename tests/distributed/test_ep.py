@@ -7,6 +7,7 @@ Requires at least 2 GPUs for EP tests. Most tests use ep=2 with 4 experts.
 
 from __future__ import annotations
 
+import copy
 import os
 
 import pytest
@@ -128,6 +129,33 @@ class TestEPForward:
                 if counts.sum() > 0:
                     has_counts = True
         assert has_counts, "No expert counts recorded"
+
+
+class TestEPMatchesLocalDispatch:
+    """Every EP rank holds the same batch, so EP must reproduce the single-rank forward."""
+
+    @pytest.mark.parametrize("config", [EP_CONFIG, EP_CONFIG_PACKED], ids=["unpacked", "packed"])
+    def test_ep_output_matches_single_rank(self, ep_only_mesh, config):
+        torch.manual_seed(0)
+        reference = Transformer(config).cuda().to(torch.bfloat16)  # bf16 takes the grouped path
+        model = copy.deepcopy(reference)
+        apply_expert_parallel(model, ep_only_mesh)
+
+        torch.manual_seed(1)
+        tokens = torch.randint(0, 512, (2, 32), device="cuda")
+        with torch.no_grad():
+            expected = reference(tokens)
+            out = model(tokens)
+        torch.testing.assert_close(out, expected, atol=2e-2, rtol=2e-2)
+
+    def test_ep_grouped_backward_all_params(self, ep_only_mesh):
+        model = Transformer(EP_CONFIG).cuda().to(torch.bfloat16)
+        apply_expert_parallel(model, ep_only_mesh)
+        tokens = torch.randint(0, 512, (2, 32), device="cuda")
+        model(tokens).float().pow(2).mean().backward()
+        for name, p in model.named_parameters():
+            assert p.grad is not None, f"No gradient for {name}"
+            assert torch.isfinite(p.grad).all(), name
 
 
 class TestEPPlusFSDP:

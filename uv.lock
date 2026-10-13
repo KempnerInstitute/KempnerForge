@@ -1444,7 +1444,7 @@ requires-dist = [
     { name = "datasets" },
     { name = "tensorboard" },
     { name = "tokenizers" },
-    { name = "torch", specifier = ">=2.4", index = "https://download.pytorch.org/whl/cu128" },
+    { name = "torch", specifier = ">=2.6", index = "https://download.pytorch.org/whl/cu128" },
     { name = "torchao", specifier = ">=0.17.0" },
     { name = "transformers" },
     { name = "wandb" },

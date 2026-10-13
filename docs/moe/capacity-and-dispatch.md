@@ -95,31 +95,29 @@ bf16/fp16 inputs — the meta registration rejects fp32.
 
 ### Path A: grouped GEMM (bf16/fp16)
 
-The fast path when available:
+The fast path when available. Tokens are sorted by expert and the per-expert
+counts become an `int32` prefix sum that tells the kernel where each group
+starts, so no expert is padded to another's size:
 
 ```python
 # kempnerforge/model/moe.py — grouped_expert_forward (trimmed)
-x_padded = x_sorted.new_zeros(num_experts, max_tokens, dim)
-# ... pack per-expert token groups into (E, max_tokens, dim) with padding ...
+offs = torch.cumsum(tokens_per_expert, 0, dtype=torch.int32)        # (E,)
 if is_swiglu:
-    gate    = torch._grouped_mm(x_padded, gate_w)     # (E, M, H)
-    up      = torch._grouped_mm(x_padded, up_w)       # (E, M, H)
-    hidden  = F.silu(gate) * up
+    hidden = F.silu(_grouped_mm(x_sorted, gate_w, offs)) * _grouped_mm(x_sorted, up_w, offs)
 else:
-    hidden  = torch._grouped_mm(x_padded, up_w)
-    hidden  = activation(hidden)
-out_padded  = torch._grouped_mm(hidden, down_w)       # (E, M, dim)
+    hidden = activation(_grouped_mm(x_sorted, up_w, offs))
+out = _grouped_mm(hidden, down_w, offs)                               # (total_tokens, dim)
 ```
 
-Three batched matmuls for SwiGLU (gate + up + down) or two for
-standard MLP (up + down). The `(E, max_tokens, dim)` padding is
-wasted compute — if one expert gets 100 tokens and another gets 2,
-both tensors sit at `max_tokens=100` padded. Imbalanced routing
-amplifies this.
+`_grouped_mm` is one ragged `torch._grouped_mm(x, w, offs=offs)` call on CUDA:
+group `i` (rows `offs[i-1]:offs[i]`) is multiplied by `w[i]`, and empty groups
+are fine. Three calls for SwiGLU (gate + up + down), two for a standard MLP.
+Activation memory and compute scale with `total_tokens = num_tokens × top_k`,
+whatever the routing looks like — a hot expert costs no more than a balanced
+one. The counts stay on the device; the dispatch never syncs with the host.
 
-Implementation detail: the padding is also why capacity factor
-helps throughput under EP. Bounded max per expert ⇒ bounded
-padding ⇒ predictable compute.
+The same call runs on CPU through torch's reference kernel, so the unit
+tests exercise this exact dispatch.
 
 ### Path B: sequential loop (fp32)
 
