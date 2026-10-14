@@ -402,11 +402,15 @@ _NORM_COUNTS = {
     "mot": 19,
     "moma": 9,
     "pp_stage": 8,
+    "adapter": 1,
 }
 
 
 def _norm_eps_model(arch: str, eps: float) -> torch.nn.Module:
     """Two-layer qk_norm model with ``norm_eps=eps``; ``pp_stage`` is the first of two stages.
+
+    ``adapter`` is an ``mlp_2layer`` vision adapter with a pre-norm, the one norm
+    that lives outside the transformer.
 
     The small ``init_std`` keeps every norm's input near the eps scale, where the tested
     eps values and the 1e-5 default give clearly different norm outputs.
@@ -418,6 +422,17 @@ def _norm_eps_model(arch: str, eps: float) -> torch.nn.Module:
         MoTConfig,
     )
     from kempnerforge.distributed.pipeline_parallel import PipelineStageModule
+
+    if arch == "adapter":
+        from kempnerforge.config.adapter import AdapterConfig
+        from kempnerforge.model.adapter import build_adapter
+
+        return build_adapter(
+            AdapterConfig(type="mlp_2layer", pre_norm="rmsnorm"),
+            in_dim=64,
+            out_dim=64,
+            norm_eps=eps,
+        )
 
     cfg = ModelConfig(
         dim=64,
@@ -451,7 +466,9 @@ def _norm_eps_forward(model: torch.nn.Module, arch: str) -> None:
     b, t = 2, 8
     tokens = torch.randint(0, 128, (b, t), device=DEVICE)
     image = torch.randn(b, _N_IMAGE, 64, device=DEVICE) * 1e-3
-    if arch == "cross_attention":
+    if arch == "adapter":
+        model(image)
+    elif arch == "cross_attention":
         model(tokens, modality=ModalityContext(image_features=image))
     elif arch in ("mot", "moma"):
         ids = torch.ones(b, _N_IMAGE + t, dtype=torch.long, device=DEVICE)
@@ -473,7 +490,7 @@ def _norms(model: torch.nn.Module) -> dict[str, torch.nn.Module]:
 
 
 class TestNormEps:
-    """Every norm of the text, VLM-arch and first-pipeline-stage models uses ``model.norm_eps``."""
+    """Every norm of the text, VLM, pipeline-stage and adapter models uses ``model.norm_eps``."""
 
     @pytest.mark.parametrize("eps", _EPS_VALUES)
     @pytest.mark.parametrize("arch", list(_NORM_COUNTS))
