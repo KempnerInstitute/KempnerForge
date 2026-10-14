@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # pyright: reportMissingImports=false
-# ^ lmms-eval is an optional, undeclared dependency; see adapter.py's directive.
+# ^ lmms-eval is an optional, undeclared dependency; see lmms_adapter.py's directive.
 """Run lmms-eval benchmarks on a KempnerForge VLM checkpoint.
 
 Evaluates a VLM checkpoint via the ``KempnerForgeVLM`` lmms-eval chat-model
-adapter (the sibling ``adapter.py``), on the standard benchmarks lmms-eval
+adapter (the sibling ``lmms_adapter.py``), on the standard benchmarks lmms-eval
 implements as ``generate_until`` tasks (MMMU, MMBench, ScienceQA, SEED, AI2D,
 ...). The harness constructs the adapter itself and passes the instance to
 ``simple_evaluate`` — there is no lmms-eval entry-point registration.
@@ -20,14 +20,14 @@ directory). On clusters where importing lmms-eval's evaluator fails with
 (e.g. ``LD_LIBRARY_PATH=<conda>/lib``).
 
 Usage:
-    uv run python examples/vlm/eval/vlm_eval_harness.py \
+    uv run python examples/vlm/eval.py \
         --config examples/vlm/configs/vlm_7b.toml \
         --checkpoint checkpoints/vlm/step_10000 \
         --tasks mmmu_val \
         --output results/vlm_step_10000.json
 
     # Quick partial run (4 examples per task)
-    uv run python examples/vlm/eval/vlm_eval_harness.py \
+    uv run python examples/vlm/eval.py \
         --config examples/vlm/configs/vlm_7b.toml \
         --checkpoint checkpoints/vlm/step_10000 \
         --tasks mmmu_val,mmbench_en_dev \
@@ -119,8 +119,8 @@ def main() -> None:
 
     # The adapter imports lmms-eval at module top; the guard above already proved
     # it importable. The script's own directory is sys.path[0], so the sibling
-    # adapter.py resolves as a top-level module.
-    from adapter import KempnerForgeVLM
+    # lmms_adapter.py resolves as a top-level module.
+    from lmms_adapter import KempnerForgeVLM
 
     logger.info(f"Running lmms-eval: tasks={args.tasks}, checkpoint={args.checkpoint}")
 
