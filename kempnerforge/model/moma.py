@@ -431,6 +431,7 @@ class MoMaBlock(nn.Module):
             head_dim=config.head_dim,
             qk_norm=config.qk_norm,
             sdpa_backend=config.sdpa_backend,
+            norm_eps=config.norm_eps,
         )
         self.mlp_norm = build_norm(config.norm_type, config.dim, eps=config.norm_eps)
         self.mlp = MoMaFFN(

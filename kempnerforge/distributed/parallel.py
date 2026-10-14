@@ -435,7 +435,9 @@ def _build_vlm(
     # extra vlm_config / num_image_tokens kwargs the VLM path needs).
     ctx = torch.device("meta") if tp_enabled else contextlib.nullcontext()
     with ctx:
-        adapter = build_adapter(adapter_config, in_dim=in_dim, out_dim=model_config.dim)
+        adapter = build_adapter(
+            adapter_config, in_dim=in_dim, out_dim=model_config.dim, norm_eps=model_config.norm_eps
+        )
         # Pooling adapters reduce the token count; size the transformer's
         # image-prefix split on the adapter's output, not the raw patch count.
         visual_tokens = frames_per_clip * adapter.output_num_tokens(encoder.num_tokens)

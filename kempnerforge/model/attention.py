@@ -86,6 +86,7 @@ class Attention(nn.Module):
         head_dim: int | None = None,
         qk_norm: bool = False,
         sdpa_backend: str = "auto",
+        norm_eps: float = 1e-5,
     ) -> None:
         super().__init__()
         self.n_heads = n_heads
@@ -101,8 +102,8 @@ class Attention(nn.Module):
         self.o_proj = nn.Linear(n_heads * self.head_dim, dim, bias=False)
 
         # Per-head QK normalization (Gemma, DeepSeek-V3)
-        self.q_norm = RMSNorm(self.head_dim) if qk_norm else None
-        self.k_norm = RMSNorm(self.head_dim) if qk_norm else None
+        self.q_norm = RMSNorm(self.head_dim, eps=norm_eps) if qk_norm else None
+        self.k_norm = RMSNorm(self.head_dim, eps=norm_eps) if qk_norm else None
 
         # Attention weight capture (analysis only — not for training)
         self.capture_attention_weights = False

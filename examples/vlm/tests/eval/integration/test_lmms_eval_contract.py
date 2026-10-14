@@ -1,5 +1,5 @@
 # pyright: reportMissingImports=false
-# ^ lmms-eval is an optional, undeclared dependency; see adapter.py's directive.
+# ^ lmms-eval is an optional, undeclared dependency; see lmms_adapter.py's directive.
 """Contract tests pinning the real ``lmms_eval`` API to what this example assumes.
 
 The VLM-eval unit tests run against an in-repo fake ``lmms_eval``
