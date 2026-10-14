@@ -283,12 +283,19 @@ def _load_hf_hub(model_id: str) -> dict[str, torch.Tensor]:
 
 def _build_hf_config(config: ModelConfig) -> dict:
     """Build a HuggingFace-compatible config.json from ModelConfig."""
+    if config.dim % config.n_heads != 0:
+        raise ValueError(
+            f"Cannot export dim ({config.dim}) not divisible by n_heads ({config.n_heads}): "
+            "the target architectures require it even when head_dim is set explicitly."
+        )
     hf_config = {
         "hidden_size": config.dim,
         "intermediate_size": config.computed_ffn_hidden_dim,
         "num_hidden_layers": config.n_layers,
         "num_attention_heads": config.n_heads,
         "num_key_value_heads": config.n_kv_heads,
+        # Explicit: a decoupled width is not recoverable from dim // n_heads.
+        "head_dim": config.head_dim,
         "vocab_size": config.vocab_size,
         "max_position_embeddings": config.max_seq_len,
         "rope_theta": config.rope_theta,
