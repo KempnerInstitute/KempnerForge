@@ -849,3 +849,45 @@ class TestDeterminism:
         explicit = self._convert(tied, tmp_path, "b", seed=7)  # the target's [train].seed
         for key in default:
             assert torch.equal(default[key], explicit[key]), key
+
+
+class TestSourceRopeTypeFallback:
+    """The scaling type survives a transformers release that resolves no ``rope_parameters``."""
+
+    _SCALED = {
+        "model_type": "qwen3",
+        "rope_theta": 1e6,
+        "rope_scaling": {"type": "linear", "factor": 2.0},
+    }
+
+    @staticmethod
+    def _bare_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
+        """Resolve like a release that predates ``rope_parameters``: theta only."""
+        import types
+
+        import transformers
+
+        resolved = types.SimpleNamespace(rope_theta=1e6)
+        monkeypatch.setattr(transformers.AutoConfig, "for_model", lambda *args, **kwargs: resolved)
+
+    def test_declared_scaling_survives_a_bare_resolution(self, monkeypatch) -> None:
+        self._bare_resolution(monkeypatch)
+        _, rope_type, _, problems = conv._source_rope(dict(self._SCALED))
+        assert rope_type == "linear"
+        assert problems == []
+
+    def test_declared_default_still_reads_as_plain(self, monkeypatch) -> None:
+        self._bare_resolution(monkeypatch)
+        cfg = dict(self._SCALED, rope_scaling={"type": "default"})
+        _, rope_type, _, problems = conv._source_rope(cfg)
+        assert rope_type == "default"
+        assert problems == []
+
+    def test_conflicting_scaling_types_are_refused(self) -> None:
+        cfg = {
+            "model_type": "qwen3",
+            "rope_scaling": {"type": "linear", "factor": 2.0},
+            "rope_parameters": {"rope_type": "yarn", "factor": 2.0, "rope_theta": 1e6},
+        }
+        _, _, _, problems = conv._source_rope(cfg)
+        assert any("more than one RoPE scaling type" in p for p in problems)

@@ -90,7 +90,9 @@ def _source_rope(hf_config: dict[str, Any]) -> tuple[Any, Any, dict[str, Any], l
     """The RoPE the installed transformers resolves for the source, and how it is ambiguous.
 
     A theta can be written in three places and a scaling type in two, and which
-    one wins has changed between releases. Rather than re-implement that, the
+    one wins has changed between releases. A release that resolves no scaling
+    field at all falls back to the type the source declares, so a scaled source
+    never reads as plain. Rather than re-implement that, the
     installed library resolves the config and its answer is what the conversion
     is checked against. A source whose own fields disagree is refused instead of
     resolved, because those are exactly the configs another release could read
@@ -117,6 +119,7 @@ def _source_rope(hf_config: dict[str, Any]) -> tuple[Any, Any, dict[str, Any], l
             f"the source gives more than one RoPE theta ({spelled}); "
             "which one applies depends on the transformers release"
         )
+    declared_types: dict[str, Any] = {}
     for spec_key in ("rope_scaling", "rope_parameters"):
         spec = hf_config.get(spec_key) or {}
         kinds = {spec[key] for key in ("rope_type", "type") if key in spec}
@@ -125,6 +128,14 @@ def _source_rope(hf_config: dict[str, Any]) -> tuple[Any, Any, dict[str, Any], l
                 f"{spec_key} gives both rope_type={spec['rope_type']!r} and type={spec['type']!r}; "
                 "which one applies depends on the transformers release"
             )
+        elif kinds:
+            declared_types[spec_key] = next(iter(kinds))
+    if len(set(declared_types.values())) > 1:
+        spelled = ", ".join(f"{field}={value!r}" for field, value in sorted(declared_types.items()))
+        problems.append(
+            f"the source gives more than one RoPE scaling type ({spelled}); "
+            "which one applies depends on the transformers release"
+        )
 
     from transformers import AutoConfig
 
@@ -136,7 +147,10 @@ def _source_rope(hf_config: dict[str, Any]) -> tuple[Any, Any, dict[str, Any], l
         return None, None, declared, problems
     parameters = getattr(resolved, "rope_parameters", None) or {}
     theta = parameters.get("rope_theta", getattr(resolved, "rope_theta", None))
-    rope_type = parameters.get("rope_type", "default")
+    # A release too old to resolve rope_parameters would otherwise read every
+    # source as unscaled; the type the source itself declares fills that gap.
+    declared_type = next(iter(set(declared_types.values())), None)
+    rope_type = parameters.get("rope_type") or declared_type or "default"
     return theta, rope_type, declared, problems
 
 
