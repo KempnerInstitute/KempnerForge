@@ -21,9 +21,6 @@ once you want a real run:
 - **{doc}`how-to/end-to-end-training-run`** — flagship walkthrough:
   tokenize → write a config → launch 1 GPU → launch 4 GPUs → resume →
   generate. The integration test of the docs.
-- **{doc}`getting-started/notebooks`** — six interactive notebooks for
-  model inspection, attention visualization, activation extraction,
-  checkpoint analysis, optimizer comparison, MoE routing.
 
 ## Looking for something specific?
 

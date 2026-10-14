@@ -11,7 +11,7 @@ There is no `pip install kempnerforge` — you work from a clone.
   for you. No manual Python install needed.
 - **CUDA 12.8 toolkit** — PyTorch wheels are pulled from the CUDA 12.8 index.
 - **NVIDIA GPU** for any training or distributed test (H100, H200, or A100).
-  Unit tests and the inspection notebooks run on CPU.
+  Unit tests run on CPU.
 - **uv** — install once per machine:
 
   ```bash

@@ -91,23 +91,45 @@ uv run torchrun --nproc_per_node=4 scripts/train.py configs/train/debug.toml \
 
 ## 7. Extend the training loop without forking `train.py`
 
-See [`examples/custom_hook.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/examples/custom_hook.py)
-for four example hooks:
+Subclass `TrainingHook`, override only the events you need, and pass the
+hooks to `run_training`. Save this as `my_train.py`:
 
-- `GradNormHistogramHook` — per-layer gradient norms to WandB
-- `LearningDynamicsHook` — weight norms and gradient SNR
-- `EarlyStoppingHook` — stop if eval loss plateaus
-- `ExpertLoadBalanceHook` — MoE expert utilization metrics
+```python
+import sys
 
-Register them in your own script by subclassing `TrainingHook`.
+from kempnerforge.config.loader import load_config
+from kempnerforge.training import run_training
+from kempnerforge.training.hooks import HookRunner, StepContext, TrainingHook
+
+
+class LossPrinter(TrainingHook):
+    """Print the loss and learning rate every ``interval`` steps."""
+
+    def __init__(self, interval: int = 10) -> None:
+        self.interval = interval
+
+    def on_step_end(self, ctx: StepContext) -> None:
+        if ctx.step % self.interval == 0:
+            print(f"step {ctx.step}: loss {ctx.loss:.4f}, lr {ctx.lr:.2e}")
+
+
+if __name__ == "__main__":
+    config = load_config(sys.argv[1], cli_args=sys.argv[2:])
+    run_training(config, hooks=HookRunner([LossPrinter()]))
+```
+
+```bash
+uv run python my_train.py configs/train/debug.toml \
+  --checkpoint.dir=/tmp/kf_quickstart/step7
+```
+
+{doc}`../training/hooks` lists every event and what it receives. Gradients
+are already zeroed when `on_step_end` fires.
 
 ## Next steps
 
 - **Understand the run**: {doc}`first-training-run` explains the log line,
   the checkpoint directory layout, and auto-resume.
-- **Interactive exploration**: {doc}`notebooks` lists six Jupyter notebooks
-  (model inspection, attention visualization, activation extraction,
-  checkpoint analysis, optimizer comparison, MoE routing).
 - **Scale up**: see
   [README § Training Configurations](https://github.com/KempnerInstitute/KempnerForge#training-configurations)
   for 7B / 13B / 70B configs.

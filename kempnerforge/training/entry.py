@@ -106,7 +106,6 @@ def build_model(
     pp_size = get_pp_size(device_mesh)
 
     tp_enabled_pp = "tp" in device_mesh.mesh_dim_names  # type: ignore[reportOperatorIssue]
-
     # apply_{float8,ac,fsdp2} are annotated for Transformer; a stage module
     # exposes the same block structure, hence the cast.
     if tp_enabled_pp:

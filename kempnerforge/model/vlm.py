@@ -451,7 +451,9 @@ def build_vlm_wrapper(
     # config-time check is skipped and the residual-stream allocation goes
     # unchecked until the model actually runs. This guard fills that gap.
     in_dim = vision_config.feature_dim or encoder.feature_dim
-    adapter = build_adapter(adapter_config, in_dim=in_dim, out_dim=model_config.dim)
+    adapter = build_adapter(
+        adapter_config, in_dim=in_dim, out_dim=model_config.dim, norm_eps=model_config.norm_eps
+    )
     # Visual tokens entering the LLM = the adapter's output count (pooling
     # adapters reduce it; projection adapters are the identity), not the raw
     # encoder patch count. This drives the residual budget and MoT's split.

@@ -39,8 +39,7 @@ jobs:
       - uses: actions/checkout@v5
       - uses: astral-sh/setup-uv@v6
       - run: uv sync --group video
-      # Example tests are outside the root `testpaths`, so each tier is named here
-      # explicitly. Each needs its own pytest session: the VLM-eval unit conftest
-      # injects a fake `lmms_eval` that would leak into a tier sharing the session.
-      # The matching integration tier needs the real, undeclared lmms-eval; manual only.
-      - run: uv run pytest examples/vlm/eval/tests/unit -v --timeout=60
+      # Example tests are outside the root `testpaths`, so they are named here by path.
+      # The eval integration tier needs the real, undeclared lmms-eval and must not
+      # share a session with the unit tier's injected fake `lmms_eval`; manual only.
+      - run: uv run pytest examples/vlm/tests --ignore=examples/vlm/tests/eval/integration -v --timeout=60
