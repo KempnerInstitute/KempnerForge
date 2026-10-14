@@ -54,6 +54,7 @@ class TransformerBlock(nn.Module):
             head_dim=config.head_dim,
             qk_norm=config.qk_norm,
             sdpa_backend=config.sdpa_backend,
+            norm_eps=config.norm_eps,
         )
 
         self.mlp_norm = build_norm(config.norm_type, config.dim, eps=config.norm_eps)
@@ -203,6 +204,7 @@ class Transformer(nn.Module):
                     ffn_hidden_dim=config.computed_ffn_hidden_dim,
                     norm_type=config.norm_type,
                     activation=config.activation,
+                    norm_eps=config.norm_eps,
                 )
 
         # Final normalization. Used by the non-MoT path. MoT uses
