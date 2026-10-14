@@ -55,4 +55,5 @@ uv run jupyter nbconvert --to notebook --execute examples/notebooks/01_inspect_m
 - Dev dependencies installed via `uv sync` from the repo root
 
 Notebook outputs are stripped on commit (via the `nbstripout` pre-commit hook) to keep diffs clean,
-so you'll see empty outputs until you run them.
+so you'll see empty outputs until you run them. The notebooks are meant to be run, not just read:
+open them in JupyterLab rather than a static viewer.
