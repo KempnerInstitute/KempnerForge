@@ -27,7 +27,7 @@ raises `KeyError` with an "Available: […]" hint when a name is missing;
 | `optimizer` | `adamw`, `lion`, `muon`, `schedule_free_adamw` | `optimizer.name` |
 | `scheduler` | `cosine`, `linear`, `wsd`, `constant`, `rex`, `none` | `scheduler.name` |
 | `loss` | `cross_entropy`, `chunked_cross_entropy` | `train.loss_fn` |
-| `norm` | `rmsnorm`, `layernorm` | `model.norm_type` |
+| `norm` | `rmsnorm`, `layernorm` | `model.norm_type`, `adapter.pre_norm` |
 | `router` | `softmax_topk`, `sigmoid_topk` | `model.moe_router` |
 | `mlp` | `swiglu`, `standard_gelu`, `standard_relu` | `model.activation` (mapped) |
 
