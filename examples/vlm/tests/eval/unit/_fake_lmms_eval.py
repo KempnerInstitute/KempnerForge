@@ -1,6 +1,6 @@
 """Dependency-free fakes for the ``lmms_eval`` API surface the VLM adapter uses.
 
-``lmms-eval`` is an optional, *undeclared* dependency, so ``adapter.py`` imports it at
+``lmms-eval`` is an optional, *undeclared* dependency, so ``lmms_adapter.py`` imports it at
 module top and cannot be imported without it. ``conftest.py`` injects these fakes into
 ``sys.modules`` so the unit tests always run, with or without real lmms-eval installed.
 The fakes reproduce ONLY the behavior the adapter relies on; their fidelity to the real
