@@ -952,7 +952,7 @@ def _stub_pp(monkeypatch, stage: FakeStageModule, calls: dict):
     import kempnerforge.distributed.pipeline_parallel as pp
     import kempnerforge.training.entry as entry
 
-    monkeypatch.setattr(pp, "build_stage_module", lambda cfg, r, s: stage)
+    monkeypatch.setattr(pp, "build_stage_module", lambda cfg, r, s, **k: stage)
     monkeypatch.setattr(pp, "get_pp_rank", lambda _m: 1)
     monkeypatch.setattr(pp, "get_pp_size", lambda _m: 2)
     monkeypatch.setattr(pp, "build_pipeline_stage", lambda *a, **k: "STAGE")
@@ -1195,6 +1195,75 @@ class TestRestoreCheckpoint:
         entry.restore_checkpoint(config, TinyTextModel(), None, FakeResumeManager(step=9))
         # step 9 is past start_step 5, so the stage must have been applied
         assert applied and applied[0][0].module == "vision_encoder"
+
+    @pytest.mark.parametrize(
+        ("resume_found", "load_path", "exclude", "want_exclude"),
+        [
+            (False, "/somewhere/converted", ["optimizer"], ["optimizer"]),
+            (False, "/somewhere/converted", ["model"], ["model"]),
+            (False, "/somewhere/converted", ["model", "optimizer"], ["model", "optimizer"]),
+            (False, "/somewhere/converted", [], None),
+            (True, None, ["optimizer"], None),
+            (True, None, [], None),
+            (True, "/somewhere/converted", ["optimizer"], None),
+            (True, "/somewhere/converted", ["model", "optimizer"], None),
+            (True, "/somewhere/converted", [], None),
+        ],
+    )
+    def test_exclude_from_loading_truth_table(
+        self, monkeypatch, tmp_path, resume_found, load_path, exclude, want_exclude
+    ):
+        import kempnerforge.training.entry as entry
+
+        resume = tmp_path / "step_7" if resume_found else None
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d: resume)
+        config = make_config()
+        config.checkpoint.load_path = load_path
+        config.checkpoint.exclude_from_loading = exclude
+        mgr = FakeResumeManager(step=7 if resume_found else 0, tokens=0)
+        entry.restore_checkpoint(config, TinyTextModel(), None, mgr)
+        assert mgr.load_kwargs["path"] == (str(resume) if resume_found else None)
+        assert mgr.load_kwargs["exclude_keys"] == want_exclude
+
+    def test_resume_with_stale_load_path_restores_full_state(self, monkeypatch, tmp_path):
+        """A requeued run keeps its warm-start config; the resume must still
+        load the optimizer, or momentum silently resets mid-run."""
+        import kempnerforge.training.entry as entry
+
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d: tmp_path / "step_7")
+        config = make_config()
+        config.checkpoint.load_path = "/somewhere/converted"
+        config.checkpoint.exclude_from_loading = ["optimizer"]
+        mgr = FakeResumeManager(step=7, tokens=999)
+        assert entry.restore_checkpoint(config, TinyTextModel(), None, mgr) == (7, 999)
+        assert mgr.load_kwargs["path"] == str(tmp_path / "step_7")
+        assert mgr.load_kwargs["exclude_keys"] is None
+
+    def test_exclude_alone_does_not_trigger_a_load(self, monkeypatch):
+        import kempnerforge.training.entry as entry
+
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d: None)
+        config = make_config()
+        config.checkpoint.exclude_from_loading = ["optimizer"]
+        mgr = FakeResumeManager()
+        assert entry.restore_checkpoint(config, TinyTextModel(), None, mgr) == (0, 0)
+        assert mgr.load_kwargs == {}
+
+    def test_warm_start_exclude_leaves_the_vlm_freeze_probe_alone(self, monkeypatch):
+        """Excluding state keys does not skip the freeze-metadata check; a
+        weights-only checkpoint has no metadata.json, so the probe yields 0."""
+        import kempnerforge.training.entry as entry
+        from kempnerforge.training.freeze import freeze_meta_at_step
+
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d: None)
+        config = _vlm_config()
+        config.checkpoint.load_path = "/somewhere/converted"
+        config.checkpoint.exclude_from_loading = ["model"]
+        mgr = FakeResumeManager(step=0, tokens=0, saved_step=None)
+        entry.restore_checkpoint(config, TinyTextModel(), None, mgr)
+        assert mgr.peeked == [None]
+        assert mgr.load_kwargs["vlm_freeze_expected"] == freeze_meta_at_step(0, config.vlm)
+        assert mgr.load_kwargs["exclude_keys"] == ["model"]
 
     def test_mot_warm_start_fires_only_at_step_zero(self, monkeypatch, tmp_path):
         import kempnerforge.training.entry as entry
@@ -1471,8 +1540,8 @@ class FakeSchedule:
         self.loss = loss
         self.calls: list = []
 
-    def step(self, *args, target=None, losses=None):
-        self.calls.append({"args": args, "target": target})
+    def step(self, *args, target=None, losses=None, **kwargs):
+        self.calls.append({"args": args, "target": target, "kwargs": kwargs})
         if losses is not None:
             losses.append(torch.tensor(self.loss))
 
@@ -1528,6 +1597,64 @@ class TestPipelineStep:
         session = make_session(make_config())  # pipeline=None
         with pytest.raises(RuntimeError, match="requires TrainingSession.pipeline"):
             pipeline_step(session, 0)
+
+
+class TestPipelineStepPacked:
+    """``doc_ids`` reaches the schedule as a kwarg, on every rank.
+
+    Two reasons it cannot be positional. A schedule hands positional args to
+    stage 0 only, so later stages would never see them; and a positional arg
+    becomes an inter-stage activation, which ``PipelineStage`` marks as
+    requiring grad without checking dtype -- so an integer tensor fails as soon
+    as a backward pass exists. Shape-level coverage misses both: the pipeline
+    still runs, it just attends across document boundaries.
+    """
+
+    def _packed_session(self, monkeypatch, rank, size, sched, *, packed=True):
+        import kempnerforge.training.loop as loop
+        from kempnerforge.training.runtime import PipelineBundle
+
+        monkeypatch.setattr(loop, "pp_group", lambda _r: "PPGROUP")
+        monkeypatch.setattr(loop.dist, "broadcast", lambda *a, **k: None)
+
+        batch = {
+            "input_ids": torch.zeros(2, 8, dtype=torch.long),
+            "labels": torch.zeros(2, 8, dtype=torch.long),
+        }
+        if packed:
+            batch["doc_ids"] = torch.tensor([[0] * 4 + [1] * 4] * 2)
+
+        config = make_config()
+        config.distributed.pp = size
+        return make_session(
+            config,
+            data=DataPipeline(dataloader=[batch] * 4),
+            pipeline=PipelineBundle(rank=rank, size=size, schedule=sched),
+        )
+
+    @pytest.mark.parametrize("rank,size,label", [(0, 2, "first"), (1, 2, "last"), (1, 3, "middle")])
+    def test_doc_ids_arrive_as_a_kwarg(self, monkeypatch, rank, size, label):
+        sched = FakeSchedule()
+        session = self._packed_session(monkeypatch, rank, size, sched)
+        session.step_fn(session, 0)
+
+        call = sched.calls[0]
+        assert "doc_ids" in call["kwargs"], f"{label} stage received no doc_ids"
+        # The guard that matters: never positional.
+        assert not any(
+            isinstance(a, torch.Tensor)
+            and a.dtype == torch.long
+            and a.dim() == 2
+            and torch.equal(a, call["kwargs"]["doc_ids"])
+            for a in call["args"][1:]
+        ), f"{label} stage passed doc_ids positionally"
+
+    def test_unpacked_batch_sends_no_doc_ids(self, monkeypatch):
+        """An unpacked run must not grow a kwarg it never had."""
+        sched = FakeSchedule()
+        session = self._packed_session(monkeypatch, 0, 2, sched, packed=False)
+        session.step_fn(session, 0)
+        assert sched.calls[0]["kwargs"] == {}
 
 
 class TinyVlmModel(nn.Module):

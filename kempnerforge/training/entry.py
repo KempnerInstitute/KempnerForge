@@ -106,7 +106,6 @@ def build_model(
     pp_size = get_pp_size(device_mesh)
 
     tp_enabled_pp = "tp" in device_mesh.mesh_dim_names  # type: ignore[reportOperatorIssue]
-
     # apply_{float8,ac,fsdp2} are annotated for Transformer; a stage module
     # exposes the same block structure, hence the cast.
     if tp_enabled_pp:
@@ -218,9 +217,14 @@ def restore_checkpoint(
         probe_step = ckpt_mgr.peek_saved_step(str(resume_path) if resume_path else None) or 0
         vlm_freeze_expected = freeze_meta_at_step(probe_step, vlm_cfg)
 
+    # A resume always restores full state; the exclusion applies only to a load_path warm start.
+    warm_start_exclude = (
+        (config.checkpoint.exclude_from_loading or None) if resume_path is None else None
+    )
     step, tokens_seen, ckpt_extra_loaded = ckpt_mgr.load(
         path=str(resume_path) if resume_path else None,
         scheduler=scheduler,
+        exclude_keys=warm_start_exclude,
         vlm_freeze_expected=vlm_freeze_expected,
     )
     if ckpt_extra_loaded.get("wandb_run_id"):

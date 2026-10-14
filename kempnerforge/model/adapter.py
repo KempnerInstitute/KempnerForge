@@ -32,6 +32,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from kempnerforge.config.registry import registry
+from kempnerforge.model.norm import build_norm
 
 _ADAPTER_ACTIVATIONS: dict[str, type[nn.Module]] = {
     "gelu": nn.GELU,
@@ -133,11 +134,13 @@ class VisionAdapter(nn.Module):
 class MLP2LayerAdapter(VisionAdapter):
     """2-layer MLP from image-feature dim to LLM embedding dim.
 
-    Architecture: ``Linear(in_dim, hidden) -> activation -> Linear(hidden, out_dim)``.
-    ``hidden_dim=None`` defaults to ``out_dim``. Keeps the token count.
+    Architecture: ``[pre_norm ->] Linear(in_dim, hidden) -> activation ->
+    Linear(hidden, out_dim)``. ``hidden_dim=None`` defaults to ``out_dim``;
+    ``pre_norm`` (a norm-registry key) adds ``ln_q`` (built with ``norm_eps``)
+    over the vision features and ``None`` builds none. Keeps the token count.
 
     ``reset_parameters`` is provided so callers that materialize adapters
-    from meta can re-initialize weights with the standard Linear defaults.
+    from meta can re-initialize weights with the standard defaults.
     """
 
     def __init__(
@@ -146,6 +149,8 @@ class MLP2LayerAdapter(VisionAdapter):
         out_dim: int,
         hidden_dim: int | None = None,
         activation: str = "gelu",
+        pre_norm: str | None = None,
+        norm_eps: float = 1e-5,
     ) -> None:
         super().__init__()
         if in_dim <= 0 or out_dim <= 0:
@@ -155,19 +160,24 @@ class MLP2LayerAdapter(VisionAdapter):
                 f"Unknown adapter activation: {activation!r}. Options: {list(_ADAPTER_ACTIVATIONS)}"
             )
         hidden = hidden_dim if hidden_dim and hidden_dim > 0 else out_dim
+        self.ln_q = build_norm(pre_norm, in_dim, eps=norm_eps) if pre_norm else None
         self.proj1 = nn.Linear(in_dim, hidden, bias=True)
         self.act = _ADAPTER_ACTIVATIONS[activation]()
         self.proj2 = nn.Linear(hidden, out_dim, bias=True)
 
     def reset_parameters(self) -> None:
-        """Re-run ``nn.Linear`` default init on both projections.
+        """Re-init the projections and the pre-norm, if any.
 
         Used after ``to_empty(device=...)`` on a meta-device build.
         """
+        if self.ln_q is not None:
+            self.ln_q.reset_parameters()  # type: ignore[reportCallIssue]
         self.proj1.reset_parameters()
         self.proj2.reset_parameters()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.ln_q is not None:
+            x = self.ln_q(x)
         return self.proj2(self.act(self.proj1(x)))
 
 
@@ -344,6 +354,8 @@ def _build_mlp_2layer(
     out_dim: int,
     hidden_dim: int | None = None,
     activation: str = "gelu",
+    pre_norm: str | None = None,
+    norm_eps: float = 1e-5,
     **_: Any,
 ) -> VisionAdapter:
     return MLP2LayerAdapter(
@@ -351,6 +363,8 @@ def _build_mlp_2layer(
         out_dim=out_dim,
         hidden_dim=hidden_dim,
         activation=activation,
+        pre_norm=pre_norm,
+        norm_eps=norm_eps,
     )
 
 
@@ -386,7 +400,9 @@ def _build_attentional_pool(
     )
 
 
-def build_adapter(adapter_config, in_dim: int, out_dim: int) -> VisionAdapter:
+def build_adapter(
+    adapter_config, in_dim: int, out_dim: int, norm_eps: float = 1e-5
+) -> VisionAdapter:
     """Dispatch to the registered adapter builder.
 
     Args:
@@ -394,10 +410,14 @@ def build_adapter(adapter_config, in_dim: int, out_dim: int) -> VisionAdapter:
             ``type`` and ``extra_kwargs()``).
         in_dim: Source feature dim (the vision encoder's ``feature_dim``).
         out_dim: Target embedding dim (the transformer's ``dim``).
+        norm_eps: Epsilon for any norm the adapter builds (pass ``model.norm_eps``);
+            builders without norms swallow it via ``**_``.
 
     Returns:
         A ``VisionAdapter`` with signature ``(B, N, in_dim) -> (B, M, out_dim)``,
         where ``M == adapter.output_num_tokens(N)``.
     """
     builder = registry.get_adapter(adapter_config.type)
-    return builder(in_dim=in_dim, out_dim=out_dim, **adapter_config.extra_kwargs())
+    return builder(
+        in_dim=in_dim, out_dim=out_dim, norm_eps=norm_eps, **adapter_config.extra_kwargs()
+    )

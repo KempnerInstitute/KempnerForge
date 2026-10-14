@@ -85,7 +85,7 @@ After Q/K/V are computed, KV heads are expanded to `n_heads` via
 
 ### QK-Norm
 
-When `qk_norm=True`, per-head `RMSNorm(head_dim)` is applied to Q and K
+When `qk_norm=True`, per-head `RMSNorm(head_dim, eps=norm_eps)` is applied to Q and K
 before RoPE. Stabilizes attention logits at scale (Gemma, DeepSeek-V3).
 
 ### Three attention paths
