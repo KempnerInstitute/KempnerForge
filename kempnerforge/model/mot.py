@@ -64,6 +64,7 @@ class MoTAttention(nn.Module):
         modalities: tuple[str, ...],
         head_dim: int | None = None,
         qk_norm: bool = False,
+        norm_eps: float = 1e-5,
     ) -> None:
         super().__init__()
         if not modalities:
@@ -97,10 +98,10 @@ class MoTAttention(nn.Module):
 
         if qk_norm:
             self.q_norm: nn.ModuleDict | None = nn.ModuleDict(
-                {m: RMSNorm(self.head_dim) for m in self.modalities}
+                {m: RMSNorm(self.head_dim, eps=norm_eps) for m in self.modalities}
             )
             self.k_norm: nn.ModuleDict | None = nn.ModuleDict(
-                {m: RMSNorm(self.head_dim) for m in self.modalities}
+                {m: RMSNorm(self.head_dim, eps=norm_eps) for m in self.modalities}
             )
         else:
             self.q_norm = None
@@ -257,6 +258,7 @@ class MoTBlock(nn.Module):
             modalities=self.modalities,
             head_dim=config.head_dim,
             qk_norm=config.qk_norm,
+            norm_eps=config.norm_eps,
         )
         self.mlp_norm = nn.ModuleDict(
             {

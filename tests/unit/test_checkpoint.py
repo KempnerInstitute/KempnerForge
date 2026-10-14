@@ -7,6 +7,7 @@ import random
 from pathlib import Path
 
 import numpy as np
+import pytest
 import torch
 
 from kempnerforge.checkpoint.async_save import AsyncCheckpointer
@@ -956,6 +957,26 @@ class TestAsyncLatestSymlinkSafety:
 
         assert step == 20, "explicit load_path was not honored as-is"
         assert tokens == 2000
+
+    def test_missing_load_path_raises(self, tmp_path):
+        """A typo'd or moved ``load_path`` must not silently train from scratch."""
+        mgr = self._mgr(tmp_path, AsyncCheckpointMode.async_pinned)
+        mgr.config.load_path = str(tmp_path / "does_not_exist" / "step_100")
+
+        with pytest.raises(FileNotFoundError, match="does_not_exist"):
+            mgr.load()
+
+    def test_missing_explicit_path_raises(self, tmp_path):
+        mgr = self._mgr(tmp_path, AsyncCheckpointMode.async_pinned)
+
+        with pytest.raises(FileNotFoundError, match="nope"):
+            mgr.load(path=str(tmp_path / "nope"))
+
+    def test_empty_dir_without_load_path_starts_from_scratch(self, tmp_path):
+        """Auto-resume from an empty checkpoint dir stays silent."""
+        mgr = self._mgr(tmp_path, AsyncCheckpointMode.async_pinned)
+
+        assert mgr.load() == (0, 0, {})
 
     def test_complete_checkpoint_resumes_unchanged(self, tmp_path, monkeypatch):
         """Regression guard: a durable checkpoint is never redirected."""

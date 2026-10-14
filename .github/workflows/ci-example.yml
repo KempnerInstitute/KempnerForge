@@ -44,3 +44,4 @@ jobs:
       # injects a fake `lmms_eval` that would leak into a tier sharing the session.
       # The matching integration tier needs the real, undeclared lmms-eval; manual only.
       - run: uv run pytest examples/vlm/eval/tests/unit -v --timeout=60
+      - run: uv run pytest examples/vlm/tests -v --timeout=60
