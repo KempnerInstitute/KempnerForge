@@ -136,7 +136,6 @@ sbatch scripts/slurm/singlenode.sh configs/train/7b.toml
 Further reading:
 - [`docs/getting-started/quickstart.md`](docs/getting-started/quickstart.md): 5-minute walkthrough (install → debug → multi-GPU → custom data → optimizer swap → MoE → hooks)
 - [`docs/how-to/end-to-end-training-run.md`](docs/how-to/end-to-end-training-run.md): tokenize → config → 1 GPU → 4 GPUs → resume → generate
-- [`examples/notebooks/`](examples/notebooks/): 6 Jupyter notebooks (model inspection, attention visualization, activation extraction, checkpoint analysis, optimizer comparison, MoE routing)
 
 ## Agent-ready
 
@@ -160,7 +159,7 @@ v0.1 ships these skills: `install-and-verify`, `cluster-config`, `smoke-test`, `
 
 The [documentation site](docs/index.md) is the canonical reference. Key entry points:
 
-- [Getting started](docs/getting-started/index.md): install, first run, notebooks
+- [Getting started](docs/getting-started/index.md): install, quickstart, first run
 - [Architecture](docs/architecture/index.md): model forward pass, parallelism order, data flow
 - [How-to guides](docs/how-to/index.md): end-to-end workflows, scaling, debugging, FP8, MoE experiments, interpretability
 - [Configuration](docs/configuration/index.md): config sections, CLI overrides, validation rules, registry
