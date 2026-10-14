@@ -143,6 +143,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The query/key norms, the cross-attention block norms and the adapter pre-norm use `model.norm_eps`**: they used a fixed 1e-5; the default `norm_eps = 1e-5` is unchanged.
 - `ci-example.yml` now also runs the VLM example's config tests in `examples/vlm/tests`, which no workflow ran.
 - **Video frames are selected relative to the video stream's start.** `decode_video_frames` compared absolute frame timestamps with sample targets that start at 0 s, so a stream starting later (a container start offset or a B-frame delay) returned shifted frames, or only its first frame; frame times and the sampled span now come from the video packets' own timestamps, read at the start and end of the file, rather than from container metadata.
 - **`checkpoint.exclude_from_loading` is now honoured on a `load_path` warm start** (ignored on a resume); keys other than `"model"`/`"optimizer"` are rejected.
