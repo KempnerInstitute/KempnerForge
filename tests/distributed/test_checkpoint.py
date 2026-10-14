@@ -173,6 +173,42 @@ class TestCheckpointRoundTrip:
             assert torch.equal(rea, lea), f"param {i}: exp_avg not restored bit-exactly"
             assert torch.equal(rev, lev), f"param {i}: exp_avg_sq not restored bit-exactly"
 
+    def test_resume_with_a_never_stepped_parameter(self, distributed_env, shared_tmp_dir):
+        """A sharded parameter that never received a gradient has no saved optimizer
+        state; resume restores every other parameter's state and leaves it stateless."""
+        from torch.distributed.tensor import DTensor
+
+        from kempnerforge.config.schema import OptimizerConfig
+
+        def build(seed):
+            torch.manual_seed(seed)
+            model = Transformer(SMALL_CONFIG).cuda()
+            model.unused = torch.nn.Linear(128, 128).cuda()  # never in the forward
+            apply_fsdp2(model, distributed_env)
+            return model, build_optimizer(model, OptimizerConfig(lr=1e-3, fused=False))
+
+        def local(t):
+            return t.to_local() if isinstance(t, DTensor) else t
+
+        model, opt = build(42)
+        for _ in range(2):
+            tokens = torch.randint(0, 512, (2, 32), device="cuda")
+            model(tokens).sum().backward()
+            opt.step()
+            opt.zero_grad()
+        config = CheckpointConfig(dir=shared_tmp_dir, keep_last_n=2)
+        CheckpointManager(config, model, opt).save(step=2)
+
+        model2, opt2 = build(7)
+        assert CheckpointManager(config, model2, opt2).load()[0] == 2
+        for (name, p), p2 in zip(model.named_parameters(), model2.parameters(), strict=True):
+            assert torch.equal(local(p), local(p2)), name
+            state, state2 = opt.state.get(p, {}), opt2.state.get(p2, {})
+            assert state.keys() == state2.keys(), name
+            assert bool(state2) is not name.startswith("unused."), name
+            for key in state:
+                assert torch.equal(local(state[key]), local(state2[key])), f"{name}.{key}"
+
     def test_latest_symlink(self, distributed_env, shared_tmp_dir):
         """The 'latest' symlink should point to the most recent checkpoint."""
         mesh = distributed_env

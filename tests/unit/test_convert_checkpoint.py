@@ -289,6 +289,79 @@ class TestBuildHFConfig:
         assert hf_cfg["num_experts_per_tok"] == 2
         assert hf_cfg["router_aux_loss_coef"] == 0.01
 
+    def test_head_dim_is_exported(self):
+        """A decoupled width is not recoverable from dim // n_heads, so the
+        export must carry it explicitly."""
+        coupled = ModelConfig(dim=64, n_layers=2, n_heads=4, vocab_size=256)
+        assert _build_hf_config(coupled)["head_dim"] == 16
+
+        decoupled = ModelConfig(
+            dim=64, n_layers=2, n_heads=4, n_kv_heads=2, head_dim_override=32, vocab_size=256
+        )
+        hf_cfg = _build_hf_config(decoupled)
+        assert hf_cfg["head_dim"] == 32 != decoupled.dim // decoupled.n_heads
+
+    def test_moe_head_dim_is_exported(self):
+        mc = ModelConfig(
+            dim=64,
+            n_layers=2,
+            n_heads=4,
+            n_kv_heads=2,
+            head_dim_override=32,
+            vocab_size=256,
+            num_experts=4,
+            moe_top_k=2,
+        )
+        assert _build_hf_config(mc)["head_dim"] == 32
+
+    def test_dim_indivisible_by_n_heads_is_rejected(self):
+        """``head_dim_override`` lifts that requirement for training, but the
+        target architectures reject it even with an explicit head_dim."""
+        mc = ModelConfig(
+            dim=100, n_layers=2, n_heads=8, n_kv_heads=8, head_dim_override=16, vocab_size=256
+        )
+        with pytest.raises(ValueError, match="not divisible by n_heads"):
+            _build_hf_config(mc)
+
+    @pytest.mark.parametrize("override", [0, 32])
+    def test_exported_config_rebuilds_the_attention_shapes(self, override):
+        """The end the export exists for: a model built from config.json must
+        take the checkpoint's attention weights."""
+        import torch
+
+        transformers = pytest.importorskip("transformers")
+
+        from kempnerforge.model.transformer import Transformer
+
+        mc = ModelConfig(
+            dim=64,
+            n_layers=1,
+            n_heads=4,
+            n_kv_heads=2,
+            head_dim_override=override,
+            vocab_size=256,
+            max_seq_len=64,
+        )
+        hf_cfg = _build_hf_config(mc)
+        cfg = transformers.LlamaConfig(
+            hidden_size=hf_cfg["hidden_size"],
+            num_attention_heads=hf_cfg["num_attention_heads"],
+            num_key_value_heads=hf_cfg["num_key_value_heads"],
+            head_dim=hf_cfg["head_dim"],
+            intermediate_size=hf_cfg["intermediate_size"],
+            num_hidden_layers=hf_cfg["num_hidden_layers"],
+            vocab_size=hf_cfg["vocab_size"],
+            max_position_embeddings=hf_cfg["max_position_embeddings"],
+        )
+        with torch.device("meta"):
+            kf = Transformer(mc).state_dict()
+            hf = transformers.LlamaForCausalLM(cfg).state_dict()
+        for proj in ("q_proj", "k_proj", "v_proj", "o_proj"):
+            assert (
+                hf[f"model.layers.0.self_attn.{proj}.weight"].shape
+                == kf[f"layers.0.attention.{proj}.weight"].shape
+            ), proj
+
     def test_dense_has_no_moe_fields(self):
         mc = ModelConfig(dim=64, n_layers=4, n_heads=4, vocab_size=256)
         hf_cfg = _build_hf_config(mc)

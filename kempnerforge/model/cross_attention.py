@@ -132,13 +132,14 @@ class CrossAttentionBlock(nn.Module):
         norm_type: str = "rmsnorm",
         activation: str = "silu",
         head_dim: int | None = None,
+        norm_eps: float = 1e-5,
     ) -> None:
         super().__init__()
-        self.attn_norm = build_norm(norm_type, dim)
+        self.attn_norm = build_norm(norm_type, dim, eps=norm_eps)
         self.attn = CrossAttention(
             dim=dim, n_heads=n_heads, n_kv_heads=n_kv_heads, head_dim=head_dim
         )
-        self.mlp_norm = build_norm(norm_type, dim)
+        self.mlp_norm = build_norm(norm_type, dim, eps=norm_eps)
         self.mlp = build_mlp(dim=dim, hidden_dim=ffn_hidden_dim, activation=activation)
 
         # Zero-init MLP output projection. SwiGLU uses down_proj; StandardMLP

@@ -3,8 +3,8 @@
 Two jobs:
 
 1. Path bootstrap: put the example root on ``sys.path`` so every test imports
-   the adapter as the bare top-level module ``adapter`` — the same name the
-   harness resolves when run as a script beside it.
+   the adapter as the bare top-level module ``lmms_adapter`` — the same name
+   ``eval.py`` resolves when run as a script beside it.
 2. Tiny VLM fixtures: this example is standalone (outside the main suite's
    ``testpaths``), so the tiny-model fixtures its tests use are duplicated here
    rather than shared from the repo-root ``tests/conftest.py``, which keeps its
@@ -31,7 +31,7 @@ from kempnerforge.config.schema import (
 )
 from kempnerforge.config.video import VideoConfig
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 
 # ---------------------------------------------------------------------------
