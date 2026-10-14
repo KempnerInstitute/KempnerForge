@@ -202,7 +202,7 @@ CI runs on every push to `main` and every PR. All jobs must pass before merge.
 | `lint` | `ruff check` + `ruff format --check` + `pyright` | Every push/PR |
 | `unit-tests` | `pytest tests/unit/ -v --timeout=60` | Every push/PR |
 | `gpu-tests` | `pytest tests/integration/` | Manual dispatch |
-| `<example>-tests` | that example's hermetic test tiers, one pytest session per tier | Pushes/PRs touching `examples/<example>/` |
+| `<example>-tests` | `examples/<example>/tests` in one pytest session, manual-only tiers excluded | Pushes/PRs touching `examples/<example>/` |
 
 The most common CI failure is `ruff format --check`. Run `uv run ruff format --check kempnerforge/ tests/ scripts/` locally before pushing.
 
@@ -306,6 +306,12 @@ tests/
   smoke/         — Parallelism config matrix (--smoke)
   conftest.py    — Shared fixtures (tiny configs, data helpers)
 ```
+
+## Where to Contribute
+
+- **Examples (`examples/<name>/`) are the place for most new work:** an experiment's configs, its own `train.py`, data-preparation and conversion scripts, evaluation, and any custom components it registers through the config's `plugins` list, as long as a plain-string config field selects them; the enum-backed selectors (the scheduler name, the model norm and activation) accept only their built-in values. Keep each example self-contained, with its own README and tests.
+- **Core (`kempnerforge/`) takes only general building blocks that any model can use:** an optimizer, a scheduler, a norm, router or MLP, a parallelism axis, or a general model option. A new building block enters through the registry or a general config field, and every code change in core, bug fixes included, comes with tests. Core contains no reference to `examples/`; example modules reach it only through the `plugins` list the config names. Anything that goes into core needs a PR labeled `core`, and it is merged only after the KempnerForge team approves it.
+- **When in doubt, start in an example.** Move something into core once a second, unrelated use needs it.
 
 ## Adding a New Feature
 
