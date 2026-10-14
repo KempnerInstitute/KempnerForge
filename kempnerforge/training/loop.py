@@ -38,6 +38,11 @@ logger = get_logger(__name__)
 LossFn = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
 
 
+# Seconds to wait on a worker after SIGKILL before giving up on it. SIGKILL
+# cannot be caught, so this only covers the kernel reaping the process.
+_WORKER_KILL_TIMEOUT_S = 5.0
+
+
 class BatchStream:
     """The training dataloader plus its live iterator.
 
@@ -103,6 +108,16 @@ class BatchStream:
         iterator = getattr(inner, "_iterator", None)
         if iterator is not None and hasattr(iterator, "_shutdown_workers"):
             iterator._shutdown_workers()
+            # Backstop. The sentinel drain above is the clean path, but these
+            # workers ignore SIGTERM by design, so `terminate()` cannot reap one
+            # that failed to take the sentinel -- only SIGKILL, which cannot be
+            # ignored. Without this, a single stuck worker blocks interpreter
+            # exit forever, which is the failure this shield would otherwise
+            # reintroduce by removing the usual way out.
+            for worker in getattr(iterator, "_workers", ()):
+                if worker.is_alive():
+                    worker.kill()
+                    worker.join(timeout=_WORKER_KILL_TIMEOUT_S)
         if hasattr(inner, "_iterator"):
             inner._iterator = None
 

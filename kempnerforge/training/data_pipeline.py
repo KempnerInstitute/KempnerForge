@@ -287,7 +287,10 @@ def _build_hf_pipeline(config: JobConfig, dp_rank: int, dp_size: int) -> DataPip
             num_workers=config.data.num_workers,
             pin_memory=config.data.pin_memory,
             prefetch_factor=(config.data.prefetch_factor if config.data.num_workers > 0 else None),
-            # See StatefulDataLoader: workers survive a group-delivered SIGTERM.
+            # Both of these match StatefulDataLoader, the wrapper every other
+            # loader here goes through: workers survive a group-delivered
+            # SIGTERM, and they are kept across epochs rather than respawned.
+            persistent_workers=config.data.num_workers > 0,
             worker_init_fn=ignore_shutdown_signals_in_worker,
         )
         logger.info(

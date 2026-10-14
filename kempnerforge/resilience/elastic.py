@@ -149,6 +149,16 @@ def resolve_resume_path(checkpoint_dir: str) -> Path | None:
             f"produced it did not complete"
         )
 
+    if step_dirs:
+        # Behaviour is unchanged -- the caller starts from step 0 -- but this is
+        # the one path where a run that plainly meant to resume does not. Before
+        # the durability test it failed inside dcp.load instead, which was at
+        # least loud, so say so at a level nobody filters out.
+        logger.error(
+            f"Auto-resume: {len(step_dirs)} checkpoint directories under "
+            f"{base} and none has durable DCP state; starting from step 0. "
+            f"Every saved step would have to be re-trained."
+        )
     return None
 
 

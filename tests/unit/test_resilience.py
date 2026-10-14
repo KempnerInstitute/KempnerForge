@@ -662,6 +662,46 @@ class TestResumePathResolution:
         assert result is not None
         assert result.name == "step_10"
 
+    @staticmethod
+    def _let_caplog_see_kempnerforge(monkeypatch):
+        """``_configure_root`` sets ``propagate = False`` on the ``kempnerforge``
+        logger, which blocks pytest's caplog at the python root. Same workaround
+        as ``TestFlexSdpaBackendWarning`` in ``test_config.py``; without it these
+        pass alone and fail once anything else has configured logging.
+        """
+        import logging
+
+        monkeypatch.setattr(logging.getLogger("kempnerforge"), "propagate", True)
+
+    def test_no_durable_checkpoint_is_reported_at_error(self, tmp_path, caplog, monkeypatch):
+        """A run that plainly meant to resume, and cannot, must not whisper.
+
+        Before the durability test this failed inside dcp.load, which was at
+        least loud. Returning None is the better behaviour, but every saved step
+        has to be re-trained, so it is reported at a level nobody filters out.
+        """
+        import logging
+
+        self._let_caplog_see_kempnerforge(monkeypatch)
+        partial = tmp_path / "step_20"
+        (partial / "pp0").mkdir(parents=True)
+
+        with caplog.at_level(logging.ERROR):
+            assert resolve_resume_path(str(tmp_path)) is None
+
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert errors, "no ERROR record for a resume that found nothing durable"
+        assert "starting from step 0" in errors[0].getMessage()
+
+    def test_an_empty_dir_does_not_report_an_error(self, tmp_path, caplog, monkeypatch):
+        """Nothing to resume from is ordinary; only unusable checkpoints are not."""
+        import logging
+
+        self._let_caplog_see_kempnerforge(monkeypatch)
+        with caplog.at_level(logging.ERROR):
+            assert resolve_resume_path(str(tmp_path)) is None
+        assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
     def test_step_dir_without_stage_dirs_is_not_durable(self, tmp_path):
         """A directory holding no stage at all holds nothing to resume from."""
         _durable_step_dir(tmp_path, 10)

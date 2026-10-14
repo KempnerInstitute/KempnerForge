@@ -276,6 +276,53 @@ class TestBatchStream:
         assert iterator.shutdown_calls == 1
         assert loader._dataloader._iterator is None
 
+    @pytest.mark.parametrize("alive", [True, False], ids=["stuck", "already-gone"])
+    def test_close_kills_a_worker_the_drain_left_behind(self, alive):
+        """SIGKILL is the only way out for a worker that ignored the sentinel.
+
+        These workers ignore SIGTERM by design, so terminate() cannot reap one
+        that failed to drain. Without a kill the interpreter blocks at exit on a
+        daemonic child that refuses to die -- the exact hang the shield would
+        otherwise reintroduce by removing the usual escape.
+        """
+
+        class _FakeWorker:
+            def __init__(self, alive):
+                self._alive = alive
+                self.killed = 0
+                self.joined = 0
+
+            def is_alive(self):
+                return self._alive
+
+            def kill(self):
+                self.killed += 1
+                self._alive = False
+
+            def join(self, timeout=None):
+                self.joined += 1
+
+        class _FakeIterator:
+            def __init__(self, worker):
+                self._workers = [worker]
+
+            def _shutdown_workers(self):
+                pass  # the drain that did not take
+
+        class _FakeInner:
+            def __init__(self, worker):
+                self._iterator = _FakeIterator(worker)
+
+        class _FakeLoader:
+            def __init__(self, worker):
+                self._dataloader = _FakeInner(worker)
+
+        worker = _FakeWorker(alive)
+        BatchStream(DataPipeline(dataloader=_FakeLoader(worker))).close()
+
+        assert worker.killed == (1 if alive else 0)
+        assert worker.joined == (1 if alive else 0)
+
     def test_close_is_idempotent(self):
         stream = BatchStream(DataPipeline(dataloader=_fake_batches(3)))
         stream.next_batch()
