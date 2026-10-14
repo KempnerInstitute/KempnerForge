@@ -117,7 +117,7 @@ dataset_type = "my_corpus"   # registered by the module above
 That ordering is the point: the `__post_init__` validators that resolve
 a name against the registry (`video.dataset_type`, `adapter.type`,
 `vision_encoder.type`, …) run during the overlay, so a later import
-would be too late. It keeps experiments standalone — a run registers
+would be too late. It keeps experiments standalone: a run registers
 its own components without any core module importing them.
 
 Modules have to be on `sys.path`. The launch directory is *not* — a

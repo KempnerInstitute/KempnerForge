@@ -37,7 +37,7 @@ uv run jupyter nbconvert --to notebook --execute examples/notebooks/01_inspect_m
 
 ## When to open which
 
-- **Debugging a config**: start with notebook 1 — it builds the model from
+- **Debugging a config**: start with notebook 1, which builds the model from
   your config and prints every layer's shape.
 - **Interpretability setup**: notebooks 2 and 3 cover the attention-capture
   and activation-extraction APIs you'll use in a larger probing pipeline.
