@@ -255,6 +255,30 @@ class TestTransformerPositionIdsValidation:
         bad = torch.zeros(2, 6, dtype=torch.long, device=DEVICE)
         self._assert_rejected_before_embedding(bad, r"residual shape \(2, 9\)", n_prefix=3)
 
+    def test_uninitialized_rope_tables_rejected_before_embedding(self):
+        """A model materialized with to_empty() has no RoPE tables until
+        init_weights_and_freqs() runs, so position_ids cannot be validated or used."""
+        config = ModelConfig(
+            dim=_DIM, n_layers=1, n_heads=_N_HEADS, vocab_size=_VOCAB, max_seq_len=_MAX_SEQ_LEN
+        )
+        with torch.device("meta"):
+            model = Transformer(config)
+        model.to_empty(device=DEVICE)
+        calls = _embedding_calls(model)
+        tokens = self._tokens()
+        good = torch.arange(6, device=DEVICE).expand(2, -1).contiguous()
+
+        msg = r"RoPE tables not initialized; call init_weights_and_freqs\(\)"
+        with pytest.raises(ValueError, match=msg):
+            model(tokens, position_ids=good)
+        assert calls == []
+
+        # Control: once initialized the same call runs, so the empty list above is meaningful.
+        model.init_weights_and_freqs()
+        with torch.no_grad():
+            model(tokens, position_ids=good)
+        assert calls == [1]
+
     def test_inputs_embeds_route_checks_its_own_length(self):
         model = _tiny_model(n_layers=1)
         modality = ModalityContext(inputs_embeds=torch.randn(2, 6, _DIM, device=DEVICE))
