@@ -212,8 +212,7 @@ class TestCheckpointRoundTrip:
     def test_save_before_the_first_step_leaves_the_run_unchanged(
         self, distributed_env, shared_tmp_dir
     ):
-        """A sharded save at step 0 must leave the (fused) AdamW as it was, and a resume
-        from it must train like a run that never saved."""
+        """A sharded step-0 save and its resume must train like a run that never saved."""
         from torch.distributed.tensor import DTensor
 
         from kempnerforge.config.schema import OptimizerConfig

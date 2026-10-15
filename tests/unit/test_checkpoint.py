@@ -1601,10 +1601,7 @@ class TestResumeWithUnsteppedParameters:
 
 
 class TestSaveBeforeFirstStep:
-    """Before the first optimizer step there is no optimizer state to save, and reading
-    the optimizer through torch's getter would give it some: a dummy step that leaves
-    AdamW one step ahead in its bias correction. So the save writes none, and a load
-    that finds no optimizer starts it fresh, warning only past step 0."""
+    """Saving before the first optimizer step, and loading a checkpoint with no optimizer."""
 
     MODEL_CONFIG = ModelConfig(dim=64, n_layers=2, n_heads=2, vocab_size=256, max_seq_len=64)
 
@@ -1626,8 +1623,7 @@ class TestSaveBeforeFirstStep:
 
     @pytest.mark.parametrize("name", ["adamw", "muon"])
     def test_save_and_resume_leave_the_run_unchanged(self, tmp_path, name):
-        """Regression: the step-0 save left AdamW at step 1 with zero moments, so the
-        run shrank its first update and then differed from one that never saved."""
+        """A step-0 save and its resume leave the run as if it never saved."""
         from kempnerforge.checkpoint.manager import CheckpointManager
 
         reference = self._train(*self._build(name))
@@ -1646,7 +1642,7 @@ class TestSaveBeforeFirstStep:
             assert torch.equal(ref, b), "resuming from the step-0 checkpoint changed the run"
 
     def test_the_checkpoint_holds_no_optimizer_state(self, tmp_path):
-        """Nothing to save: the step-0 checkpoint has no optimizer entry at all."""
+        """The step-0 checkpoint has no optimizer entry."""
         from kempnerforge.checkpoint.manager import CheckpointManager
 
         model, opt = self._build("adamw")
@@ -1656,8 +1652,7 @@ class TestSaveBeforeFirstStep:
         assert not [k for k in keys if k.startswith("optimizer")], "the save wrote the optimizer"
 
     def _load_model_only(self, tmp_path, train_step):
-        """Load a checkpoint holding the weights alone, optionally with a train state at
-        ``train_step``; return the source model, the loaded run, and its warnings."""
+        """Load a weights-only checkpoint, plus a train state at ``train_step`` if given."""
         import logging
 
         from torch.distributed.checkpoint.state_dict import get_model_state_dict
@@ -1693,7 +1688,7 @@ class TestSaveBeforeFirstStep:
         return source, model, opt, loaded, [r.getMessage() for r in records]
 
     def test_a_checkpoint_without_an_optimizer_loads_like_a_pretrained_model(self, tmp_path):
-        """Model weights alone load as a warm start would: fresh optimizer, no warning."""
+        """A weights-only checkpoint loads with a fresh optimizer and no warning."""
         source, model, opt, loaded, warnings = self._load_model_only(tmp_path, train_step=None)
         assert loaded == (0, 0, {})
         for want, got in zip(source.parameters(), model.parameters(), strict=True):
@@ -1702,14 +1697,14 @@ class TestSaveBeforeFirstStep:
         assert not warnings, f"nothing was lost at step 0, yet: {warnings}"
 
     def test_past_step_zero_a_missing_optimizer_is_warned_about(self, tmp_path):
-        """Past step 0 the run's optimizer moments are gone, so the resume says so."""
+        """Past step 0, a checkpoint without an optimizer loads with a warning."""
         _, _, opt, loaded, warnings = self._load_model_only(tmp_path, train_step=5)
         assert loaded[0] == 5
         assert not opt.state, "the optimizer should start fresh"
         assert any("no optimizer state at step 5" in w for w in warnings), warnings
 
     def test_loading_it_empties_an_optimizer_that_has_stepped(self, tmp_path):
-        """The load restores what the checkpoint holds: an optimizer with no state."""
+        """Loading the step-0 checkpoint empties an optimizer that has stepped."""
         from kempnerforge.checkpoint.manager import CheckpointManager
 
         model, opt = self._build("adamw")

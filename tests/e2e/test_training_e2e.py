@@ -502,13 +502,7 @@ def test_resume_determinism_2gpu_fsdp(tmp_path):
 
 @pytest.mark.e2e
 def test_step_zero_checkpoint_leaves_training_unchanged(tmp_path):
-    """A run that checkpoints its initial weights must train exactly like one that does not.
-
-    ``dyn_ckpt_window`` from step 0 saves before the first optimizer step. That save
-    used to leave AdamW one step ahead in its bias correction (torch's getter gives an
-    optimizer with no state a dummy step), so the losses parted from step 2 on. No
-    warmup, so the first update is not zero and the shift shows at once.
-    """
+    """A run that checkpoints at step 0 must log the same losses as one that does not."""
     data_dir = _make_learnable_shard(tmp_path)
     common = [
         DEBUG_CONFIG,

@@ -147,9 +147,7 @@ class _NeverSteppedStatePlanner(DefaultLoadPlanner):
     the caller to confirm against the saved ``param_groups``; every other key
     stays required, including one whose state is missing without a record.
 
-    A checkpoint with no optimizer entry at all, saved before the first optimizer
-    step or holding model weights alone, has the whole template emptied instead,
-    and ``optimizer_missing`` tells the caller to start the optimizer fresh.
+    With no optimizer entry saved, it empties the template and sets ``optimizer_missing``.
     """
 
     def __init__(self) -> None:
