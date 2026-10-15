@@ -98,7 +98,5 @@ exclude_lines = [
     "pragma: no cover",
     "if TYPE_CHECKING:",
     "raise NotImplementedError",
-    # A stub body: a line that is only `...`. Unanchored, the pattern also matched
-    # `tuple[str, ...]` in a signature, which excludes the whole function.
     "^\\s*\\.\\.\\.$",
 ]
