@@ -394,8 +394,13 @@ class Muon(torch.optim.Optimizer):
         defaults = dict(lr=lr, momentum=momentum, weight_decay=weight_decay, ns_steps=ns_steps)
         super().__init__(muon_params, defaults)
 
+    @property
+    def inner_optimizers(self) -> tuple[torch.optim.Optimizer, ...]:
+        """Optimizers holding parameters that Muon's own ``param_groups`` do not list."""
+        return (self._adam,) if self._adam is not None else ()
+
     def state_dict(self) -> dict:
-        """Include internal AdamW state so DCP checkpoints are complete."""
+        """Include internal AdamW state in the plain ``state_dict()``."""
         sd = super().state_dict()
         if self._adam is not None:
             sd["_adam_state"] = self._adam.state_dict()

@@ -209,6 +209,53 @@ class TestCheckpointRoundTrip:
             for key in state:
                 assert torch.equal(local(state[key]), local(state2[key])), f"{name}.{key}"
 
+    def test_muon_resume_restores_inner_adamw_state(self, distributed_env, shared_tmp_dir):
+        """Muon's inner AdamW must be restored into a FRESH optimizer too."""
+        from kempnerforge.config.schema import OptimizerConfig
+
+        mesh = distributed_env
+        config = ModelConfig(dim=128, n_layers=2, n_heads=2, vocab_size=2048, max_seq_len=64)
+
+        def build():
+            torch.manual_seed(42)
+            model = Transformer(config).cuda()
+            apply_fsdp2(model, mesh)
+            return model, build_optimizer(model, OptimizerConfig(name="muon", lr=1e-3))
+
+        def snapshot(optimizer):
+            """Per-rank (sharded) clones of every state entry, in param order."""
+            return [
+                (name, value.detach().clone())
+                for group in optimizer.param_groups
+                for p in group["params"]
+                for name, value in sorted(optimizer.state.get(p, {}).items())
+            ]
+
+        model, opt = build()
+        inner_shapes = {tuple(p.shape) for g in opt._adam.param_groups for p in g["params"]}
+        assert (2048, 128) in inner_shapes, "the embedding should be on the inner AdamW"
+        for _ in range(3):
+            tokens = torch.randint(0, config.vocab_size, (2, 32), device="cuda")
+            model(tokens).sum().backward()
+            opt.step()
+            opt.zero_grad()
+        refs = {"Muon": snapshot(opt), "inner AdamW": snapshot(opt._adam)}
+        assert all(refs.values()), "optimizer had no state to test"
+
+        CheckpointManager(CheckpointConfig(dir=shared_tmp_dir, keep_last_n=2), model, opt).save(
+            step=3, tokens_seen=192
+        )
+
+        model2, opt2 = build()
+        assert not snapshot(opt2._adam), "fresh inner AdamW should have empty state before load"
+        CheckpointManager(CheckpointConfig(dir=shared_tmp_dir, keep_last_n=2), model2, opt2).load()
+
+        loaded = {"Muon": snapshot(opt2), "inner AdamW": snapshot(opt2._adam)}
+        for what, ref in refs.items():
+            assert [n for n, _ in loaded[what]] == [n for n, _ in ref], f"{what} not restored"
+            for (name, r), (_, t) in zip(ref, loaded[what], strict=True):
+                assert torch.equal(r, t), f"{what} {name} not restored bit-exactly"
+
     def test_latest_symlink(self, distributed_env, shared_tmp_dir):
         """The 'latest' symlink should point to the most recent checkpoint."""
         mesh = distributed_env
