@@ -16,10 +16,13 @@ from pathlib import Path
 
 import pytest
 import recipe
+import torch
 
+from kempnerforge.config.adapter import AdapterConfig
 from kempnerforge.config.loader import load_config
 from kempnerforge.config.registry import registry
-from kempnerforge.config.vlm import FreezeSpec
+from kempnerforge.config.vlm import FreezeSpec, FreezeStage
+from kempnerforge.model.adapter import build_adapter
 
 EXAMPLE_ROOT = Path(__file__).resolve().parents[1]
 CONFIG_DIR = EXAMPLE_ROOT / "configs"
@@ -30,6 +33,18 @@ MANIFEST = CONFIG_DIR / "image_understanding_manifest.json"
 # Content hashes of the two pinned source artifacts (read-only audit values).
 STAGE1_YML_SHA256 = "d3e8e7546be8ae9342633aab2ab37892717c87704405a60484d84d75ca24dce1"
 STAGE2_YML_SHA256 = "ad51bd30c335b3f559b9dc95fd56ab7c1fc3d38bfc40e2ca7f3f17d3eb58165c"
+
+# Registered connectors by how they treat the patch grid.
+POOLING_CONNECTORS = ("avgpool", "attentional_pool")
+PROJECTION_CONNECTORS = ("linear", "mlp_2layer")
+
+STAGE1_RESOLVED = {
+    "stage1_shard_listing": "shard-listing-v1",
+    "stage1_shard_hashes": "shard-hashes-v1",
+    "stage1_loader_workers": "4",
+    "source_dependency_versions": "lock-v1",
+    "source_runtime_commit": "0123abc",
+}
 
 BASE_CYCLE = (
     "coco-captions",
@@ -280,6 +295,32 @@ def stage2_vlm() -> recipe.ImageUnderstandingConfig:
     return config.vlm
 
 
+def _with_geometry(
+    vlm: recipe.ImageUnderstandingConfig, *, connector_type: str | None = None, **changes: object
+) -> recipe.ImageUnderstandingConfig:
+    """``vlm`` with geometry fields (and optionally the connector) changed, revalidated."""
+    assert vlm.stage is not None
+    geometry = dataclasses.replace(vlm.stage.geometry, **changes)
+    extra = {} if connector_type is None else {"connector_type": connector_type}
+    return dataclasses.replace(
+        vlm, stage=dataclasses.replace(vlm.stage, geometry=geometry), **extra
+    )
+
+
+def _raw_manifest() -> dict:
+    return json.loads(MANIFEST.read_bytes())
+
+
+def _config_with_manifest(
+    vlm: recipe.ImageUnderstandingConfig, directory: Path, raw: dict
+) -> recipe.ImageUnderstandingConfig:
+    """``vlm`` pinned to a manifest written from ``raw``, so the pin matches its bytes."""
+    path = directory / "manifest.json"
+    path.write_text(json.dumps(raw, indent=2))
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    return dataclasses.replace(vlm, source_manifest=str(path), source_manifest_sha256=digest)
+
+
 class TestStageContracts:
     def test_arch_dispatches_to_the_registered_subclass(self) -> None:
         assert registry.get_vlm_config(recipe.ARCH_NAME) is recipe.ImageUnderstandingConfig
@@ -412,23 +453,14 @@ class TestStrictParsing:
 
 class TestTokenBudgets:
     def test_declared_budget_must_match_the_connector_derivation(self, stage1_vlm) -> None:
-        assert stage1_vlm.stage is not None
-        geo = stage1_vlm.stage.geometry
         with pytest.raises(ValueError, match="connector-derived count"):
-            dataclasses.replace(geo, tokens_per_view=300)
+            _with_geometry(stage1_vlm, tokens_per_view=300)
 
-    def test_budget_follows_the_geometry_not_a_constant(self) -> None:
-        """A different connector geometry yields a different validated budget."""
-        geo = recipe.PackGeometry(
-            image_size=512,
-            patch_size=16,
-            pool_window=4,
-            tile_grid=1,
-            include_global_view=False,
-            tokens_per_view=64,
-            pack_budget=12288,
-        )
-        assert geo.tokens_per_image == 64
+    def test_declared_budget_must_be_positive(self, stage1_vlm) -> None:
+        assert stage1_vlm.stage is not None
+        for tokens in (0, -256):
+            with pytest.raises(ValueError, match="tokens_per_view must be positive"):
+                dataclasses.replace(stage1_vlm.stage.geometry, tokens_per_view=tokens)
 
     def test_indivisible_geometry_is_rejected(self, stage1_vlm) -> None:
         assert stage1_vlm.stage is not None
@@ -451,6 +483,84 @@ class TestTokenBudgets:
             dataclasses.replace(stage1_vlm.stage.geometry, include_global_view=True)
 
 
+class TestConnectorDerivedBudget:
+    """A 512 px view with 16 px patches is a 32 x 32 grid: 1024 patch tokens."""
+
+    @pytest.mark.parametrize("connector", POOLING_CONNECTORS)
+    @pytest.mark.parametrize(("window", "tokens"), [(2, 256), (4, 64)])
+    def test_pooling_connector_reduces_by_its_window(
+        self, stage1_vlm, connector: str, window: int, tokens: int
+    ) -> None:
+        vlm = _with_geometry(
+            stage1_vlm, connector_type=connector, pool_window=window, tokens_per_view=tokens
+        )
+        assert vlm.stage is not None
+        assert vlm.stage.geometry.tokens_per_image == tokens
+        with pytest.raises(ValueError, match="connector-derived count"):
+            _with_geometry(
+                stage1_vlm,
+                connector_type=connector,
+                pool_window=window,
+                tokens_per_view=tokens + 1,
+            )
+
+    @pytest.mark.parametrize("connector", PROJECTION_CONNECTORS)
+    def test_projection_connector_keeps_every_patch(
+        self, stage1_vlm, stage2_vlm, connector: str
+    ) -> None:
+        one_view = _with_geometry(
+            stage1_vlm, connector_type=connector, pool_window=1, tokens_per_view=1024
+        )
+        assert one_view.stage is not None
+        assert one_view.stage.geometry.tokens_per_image == 1024
+        # Stage 2 is a 3 x 3 tiling plus a global view: ten views.
+        ten_views = _with_geometry(
+            stage2_vlm, connector_type=connector, pool_window=1, tokens_per_view=1024
+        )
+        assert ten_views.stage is not None
+        assert ten_views.stage.geometry.tokens_per_image == 10240
+
+    @pytest.mark.parametrize("connector", PROJECTION_CONNECTORS)
+    def test_projection_connector_refuses_the_pooled_count(
+        self, stage1_vlm, connector: str
+    ) -> None:
+        """Switching only the connector leaves 256 declared; the connector yields 1024."""
+        with pytest.raises(ValueError, match=r"pool_window \(2\) must be 1"):
+            dataclasses.replace(stage1_vlm, connector_type=connector)
+        with pytest.raises(ValueError, match="connector-derived count"):
+            _with_geometry(stage1_vlm, connector_type=connector, pool_window=1)
+
+    @pytest.mark.parametrize("connector", PROJECTION_CONNECTORS)
+    def test_projection_connector_carries_no_pool_window(self, stage1_vlm, connector: str) -> None:
+        """The right count with a leftover window still contradicts the connector."""
+        with pytest.raises(ValueError, match=r"pool_window \(2\) must be 1"):
+            _with_geometry(stage1_vlm, connector_type=connector, tokens_per_view=1024)
+
+    @pytest.mark.parametrize(
+        ("connector", "window", "tokens"),
+        [
+            ("avgpool", 2, 256),
+            ("avgpool", 4, 64),
+            ("attentional_pool", 2, 256),
+            ("linear", 1, 1024),
+            ("mlp_2layer", 1, 1024),
+        ],
+    )
+    def test_derived_count_is_what_the_built_adapter_emits(
+        self, stage1_vlm, connector: str, window: int, tokens: int
+    ) -> None:
+        assert stage1_vlm.stage is not None
+        geometry = dataclasses.replace(stage1_vlm.stage.geometry, pool_window=window)
+        adapter = build_adapter(AdapterConfig(type=connector, pool_window=window), 32, 32)
+        emitted = adapter(torch.zeros(1, 1024, 32)).shape[1]
+        assert emitted == tokens
+        assert geometry.connector_tokens_per_view(connector) == tokens
+
+    def test_loader_refuses_a_connector_switch(self) -> None:
+        with pytest.raises(ValueError, match=r"pool_window \(2\) must be 1"):
+            load_config(str(STAGE1_TOML), cli_args=["--vlm.connector_type=linear"])
+
+
 class TestFreezePolicy:
     def test_stage1_requires_a_frozen_lm(self, stage1_vlm) -> None:
         with pytest.raises(ValueError, match="requires freeze to include"):
@@ -465,6 +575,111 @@ class TestFreezePolicy:
         for module in ("vision_encoder", "adapter"):
             with pytest.raises(ValueError, match="must not include"):
                 dataclasses.replace(stage1_vlm, freeze=[*base, FreezeSpec(module, True)])
+
+    def test_the_last_directive_per_module_decides(self, stage1_vlm, stage2_vlm) -> None:
+        """The runtime keeps one directive per module and the last one wins."""
+        unfrozen_last = [FreezeSpec("transformer", True), FreezeSpec("transformer", False)]
+        with pytest.raises(ValueError, match="requires freeze to include"):
+            dataclasses.replace(stage1_vlm, freeze=unfrozen_last)
+        frozen_last = unfrozen_last[::-1]
+        assert dataclasses.replace(stage1_vlm, freeze=frozen_last).freeze == frozen_last
+        with pytest.raises(ValueError, match="conflicts with a frozen"):
+            dataclasses.replace(stage2_vlm, freeze=frozen_last)
+
+        tower_unfrozen_last = [
+            FreezeSpec("vision_encoder", True),
+            FreezeSpec("vision_encoder", False),
+        ]
+        assert (
+            dataclasses.replace(stage2_vlm, freeze=tower_unfrozen_last).freeze
+            == tower_unfrozen_last
+        )
+        with pytest.raises(ValueError, match="must not include"):
+            dataclasses.replace(stage2_vlm, freeze=tower_unfrozen_last[::-1])
+
+    @pytest.mark.parametrize("module", ["vision_encoder", "adapter"])
+    def test_a_schedule_cannot_freeze_the_tower_or_connector(
+        self, stage1_vlm, stage2_vlm, module: str
+    ) -> None:
+        schedule = [FreezeStage(1000, (FreezeSpec(module, True),))]
+        for vlm in (stage1_vlm, stage2_vlm):
+            with pytest.raises(ValueError, match="must not include") as err:
+                dataclasses.replace(vlm, freeze_schedule=schedule)
+            assert "step 1000" in str(err.value)
+
+    def test_a_schedule_cannot_unfreeze_the_stage1_lm(self, stage1_vlm) -> None:
+        schedule = [FreezeStage(5000, (FreezeSpec("transformer", False),))]
+        with pytest.raises(ValueError, match="requires freeze to include") as err:
+            dataclasses.replace(stage1_vlm, freeze_schedule=schedule)
+        assert "step 5000" in str(err.value)
+
+    def test_a_schedule_cannot_freeze_the_stage2_lm(self, stage2_vlm) -> None:
+        schedule = [FreezeStage(5000, (FreezeSpec("transformer", True),))]
+        with pytest.raises(ValueError, match="conflicts with a frozen") as err:
+            dataclasses.replace(stage2_vlm, freeze_schedule=schedule)
+        assert "step 5000" in str(err.value)
+
+    def test_a_later_transition_is_checked_after_an_earlier_harmless_one(self, stage1_vlm) -> None:
+        schedule = [
+            FreezeStage(100, (FreezeSpec("adapter", False),)),
+            FreezeStage(200, (FreezeSpec("transformer", False),)),
+        ]
+        with pytest.raises(ValueError, match="requires freeze to include") as err:
+            dataclasses.replace(stage1_vlm, freeze_schedule=schedule)
+        assert "step 200" in str(err.value)
+
+    def test_every_state_the_run_passes_through_is_checked(self, stage2_vlm) -> None:
+        """A transient violation counts even when a later transition repairs it."""
+        transient = [
+            FreezeStage(100, (FreezeSpec("vision_encoder", True),)),
+            FreezeStage(200, (FreezeSpec("vision_encoder", False),)),
+        ]
+        with pytest.raises(ValueError, match="must not include") as err:
+            dataclasses.replace(stage2_vlm, freeze_schedule=transient)
+        assert "step 100" in str(err.value)
+
+        with pytest.raises(ValueError, match="conflicts with a frozen") as err:
+            dataclasses.replace(
+                stage2_vlm,
+                freeze=[FreezeSpec("transformer", True)],
+                freeze_schedule=[FreezeStage(100, (FreezeSpec("transformer", False),))],
+            )
+        assert "build time" in str(err.value)
+
+    def test_a_schedule_that_keeps_the_policy_is_accepted(self, stage1_vlm, stage2_vlm) -> None:
+        stage1_schedule = [
+            FreezeStage(100, (FreezeSpec("transformer", True),)),
+            FreezeStage(200, (FreezeSpec("adapter", False),)),
+        ]
+        vlm1 = dataclasses.replace(stage1_vlm, freeze_schedule=stage1_schedule)
+        assert vlm1.freeze_schedule == stage1_schedule
+        stage2_schedule = [
+            FreezeStage(
+                100, (FreezeSpec("vision_encoder", False), FreezeSpec("transformer", False))
+            )
+        ]
+        vlm2 = dataclasses.replace(stage2_vlm, freeze_schedule=stage2_schedule)
+        assert vlm2.freeze_schedule == stage2_schedule
+
+    def test_directives_must_name_a_recipe_module(self, stage2_vlm) -> None:
+        """A raw pattern could freeze part of a module the policy treats as whole."""
+        for module in ("transformer.layers.*", "vision_encoder.*", "mot"):
+            with pytest.raises(ValueError, match="not in known module aliases"):
+                dataclasses.replace(stage2_vlm, freeze=[FreezeSpec(module, True)])
+            with pytest.raises(ValueError, match="not in known module aliases"):
+                dataclasses.replace(
+                    stage2_vlm, freeze_schedule=[FreezeStage(10, (FreezeSpec(module, True),))]
+                )
+
+    @pytest.mark.parametrize("alias", ["transformer", "vision_encoder", "adapter"])
+    def test_recipe_aliases_must_cover_whole_modules(self, stage1_vlm, alias: str) -> None:
+        """Redefining an alias narrows what a freeze directive on it touches."""
+        narrowed = {**stage1_vlm.module_patterns, alias: [f"{alias}.layers.0.*"]}
+        with pytest.raises(ValueError, match=rf"module_patterns\['{alias}'\]"):
+            dataclasses.replace(stage1_vlm, module_patterns=narrowed)
+        missing = {k: v for k, v in stage1_vlm.module_patterns.items() if k != alias}
+        with pytest.raises(ValueError, match=rf"module_patterns\['{alias}'\]"):
+            dataclasses.replace(stage1_vlm, module_patterns=missing)
 
 
 class TestLaunchGating:
@@ -496,16 +711,18 @@ class TestLaunchGating:
         assert "stage1_shard_listing" not in message
 
     def test_stage1_launch_allowed_once_resolved(self, stage1_vlm) -> None:
-        resolved = dataclasses.replace(
-            stage1_vlm,
-            production_launch=True,
-            stage1_shard_listing="shard-listing-v1",
-            stage1_shard_hashes="shard-hashes-v1",
-            stage1_loader_workers="4",
-            source_dependency_versions="lock-v1",
-            source_runtime_commit="0123abc",
-        )
+        resolved = dataclasses.replace(stage1_vlm, production_launch=True, **STAGE1_RESOLVED)
         assert resolved.unresolved_launch_fields() == []
+
+    def test_production_launch_with_a_wrong_manifest_pin_is_refused(self, stage1_vlm) -> None:
+        """Every other launch requirement is met; only the pin is wrong."""
+        with pytest.raises(ValueError, match="content hash mismatch"):
+            dataclasses.replace(
+                stage1_vlm,
+                production_launch=True,
+                source_manifest_sha256="0" * 64,
+                **STAGE1_RESOLVED,
+            )
 
     def test_stage2_launch_allowed_once_resolved(self, stage2_vlm) -> None:
         resolved = dataclasses.replace(
@@ -572,55 +789,103 @@ class TestManifest:
             dataset_class="PackedWebdataset", name="datacomp-1b", epoch_size=700000000
         )
 
-    def test_edited_manifest_is_refused_by_the_hash_pin(self, tmp_path: Path, stage1_vlm) -> None:
-        raw = json.loads(MANIFEST.read_bytes())
-        raw["stage2_sources"] = raw["stage2_sources"][:-1]
-        tampered = tmp_path / "tampered.json"
-        tampered.write_text(json.dumps(raw, indent=2))
-        config = dataclasses.replace(stage1_vlm, source_manifest=str(tampered))
+    def test_wrong_pin_is_refused_when_the_config_is_built(self, stage1_vlm) -> None:
         with pytest.raises(ValueError, match="content hash mismatch"):
-            recipe.load_source_manifest(config)
+            dataclasses.replace(stage1_vlm, source_manifest_sha256="0" * 64)
+
+    @pytest.mark.parametrize("path", [STAGE1_TOML, STAGE2_TOML], ids=lambda p: p.name)
+    def test_wrong_pin_is_refused_while_loading_a_config(self, path: Path) -> None:
+        with pytest.raises(ValueError, match="content hash mismatch"):
+            load_config(str(path), cli_args=["--vlm.source_manifest_sha256=" + "f" * 64])
+
+    def test_missing_manifest_is_refused_when_the_config_is_built(
+        self, tmp_path: Path, stage1_vlm
+    ) -> None:
+        with pytest.raises(ValueError, match="cannot read"):
+            dataclasses.replace(stage1_vlm, source_manifest=str(tmp_path / "absent.json"))
+
+    def test_edited_manifest_is_refused_by_the_loader(self, tmp_path: Path, stage1_vlm) -> None:
+        """The pin is checked again at load, since the file can change after the
+        config was built."""
+        raw = _raw_manifest()
+        raw["stage2_sources"] = raw["stage2_sources"][:-1]
+        (tmp_path / stage1_vlm.source_manifest).write_text(json.dumps(raw, indent=2))
+        with pytest.raises(ValueError, match="content hash mismatch"):
+            recipe.load_source_manifest(stage1_vlm, base_dir=tmp_path)
 
     def test_truncated_manifest_is_refused_by_the_count_guard(
         self, tmp_path: Path, stage1_vlm
     ) -> None:
         """Even with a matching hash, a list that disagrees with its own
         recorded counts is refused rather than silently accepted."""
-        raw = json.loads(MANIFEST.read_bytes())
+        raw = _raw_manifest()
         raw["stage2_sources"] = raw["stage2_sources"][:-1]
-        tampered = tmp_path / "tampered.json"
-        tampered.write_text(json.dumps(raw, indent=2))
-        digest = hashlib.sha256(tampered.read_bytes()).hexdigest()
-        config = dataclasses.replace(
-            stage1_vlm, source_manifest=str(tampered), source_manifest_sha256=digest
-        )
+        config = _config_with_manifest(stage1_vlm, tmp_path, raw)
         with pytest.raises(ValueError, match="refusing a truncated"):
             recipe.load_source_manifest(config)
 
     def test_malformed_provenance_hash_is_refused(self, tmp_path: Path, stage1_vlm) -> None:
-        raw = json.loads(MANIFEST.read_bytes())
+        raw = _raw_manifest()
         raw["provenance"]["artifacts"][0]["sha256"] = "OPEN"
-        tampered = tmp_path / "tampered.json"
-        tampered.write_text(json.dumps(raw, indent=2))
-        digest = hashlib.sha256(tampered.read_bytes()).hexdigest()
-        config = dataclasses.replace(
-            stage1_vlm, source_manifest=str(tampered), source_manifest_sha256=digest
-        )
+        config = _config_with_manifest(stage1_vlm, tmp_path, raw)
         with pytest.raises(ValueError, match="malformed sha256"):
             recipe.load_source_manifest(config)
 
     def test_manifest_with_unknown_block_is_refused(self, tmp_path: Path, stage1_vlm) -> None:
-        raw = json.loads(MANIFEST.read_bytes())
+        raw = _raw_manifest()
         raw["extra_block"] = {}
-        tampered = tmp_path / "tampered.json"
-        tampered.write_text(json.dumps(raw, indent=2))
-        digest = hashlib.sha256(tampered.read_bytes()).hexdigest()
-        config = dataclasses.replace(
-            stage1_vlm, source_manifest=str(tampered), source_manifest_sha256=digest
-        )
+        config = _config_with_manifest(stage1_vlm, tmp_path, raw)
         with pytest.raises(ValueError, match="unknown keys"):
             recipe.load_source_manifest(config)
 
     def test_bad_manifest_reference_hash_format_is_refused(self, stage1_vlm) -> None:
         with pytest.raises(ValueError, match="64 lowercase hex"):
             dataclasses.replace(stage1_vlm, source_manifest_sha256="abc123")
+
+
+class TestManifestContainers:
+    """Iterating a JSON string or object also yields strings, so a source list
+    given as either would pass any check that only looks at its items."""
+
+    @pytest.mark.parametrize("bad", ["abc", {"a": 1, "b": 2}], ids=["string", "object"])
+    def test_sources_must_be_a_list(self, tmp_path: Path, stage1_vlm, bad) -> None:
+        raw = _raw_manifest()
+        raw["stage2_sources"] = bad
+        # Counts that agree with the iteration, so only the container check can refuse it.
+        raw["source_counts"] = {"occurrences": len(bad), "unique": len(set(bad))}
+        config = _config_with_manifest(stage1_vlm, tmp_path, raw)
+        with pytest.raises(ValueError, match="stage2_sources must be a list"):
+            recipe.load_source_manifest(config)
+
+    @pytest.mark.parametrize("field", ["open", "notes"])
+    @pytest.mark.parametrize("bad", ["abc", {"a": 1}], ids=["string", "object"])
+    def test_provenance_lists_must_be_lists(
+        self, tmp_path: Path, stage1_vlm, field: str, bad
+    ) -> None:
+        raw = _raw_manifest()
+        raw["provenance"][field] = bad
+        config = _config_with_manifest(stage1_vlm, tmp_path, raw)
+        with pytest.raises(ValueError, match=rf"provenance\.{field} must be a list"):
+            recipe.load_source_manifest(config)
+
+    @pytest.mark.parametrize("bad", [[], [1, 2], ["ok", ""], ["ok", "  "], ["ok", None]])
+    def test_source_entries_must_be_non_empty_strings(
+        self, tmp_path: Path, stage1_vlm, bad: list
+    ) -> None:
+        raw = _raw_manifest()
+        raw["stage2_sources"] = bad
+        raw["source_counts"] = {"occurrences": len(bad), "unique": len(set(bad))}
+        config = _config_with_manifest(stage1_vlm, tmp_path, raw)
+        with pytest.raises(ValueError, match="non-empty"):
+            recipe.load_source_manifest(config)
+
+    @pytest.mark.parametrize("field", ["open", "notes"])
+    @pytest.mark.parametrize("bad", [[1], [""], ["ok", None]])
+    def test_provenance_entries_must_be_non_empty_strings(
+        self, tmp_path: Path, stage1_vlm, field: str, bad: list
+    ) -> None:
+        raw = _raw_manifest()
+        raw["provenance"][field] = bad
+        config = _config_with_manifest(stage1_vlm, tmp_path, raw)
+        with pytest.raises(ValueError, match="non-empty"):
+            recipe.load_source_manifest(config)

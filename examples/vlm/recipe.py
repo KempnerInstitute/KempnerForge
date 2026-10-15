@@ -5,7 +5,9 @@ subclass (``arch = "image_understanding"``) carrying the stage settings,
 pack geometry, tower/connector selection, precision policy, and
 provenance state of the two pinned source training runs, plus a loader
 for the recipe manifest that stores the stage-2 ordered source list and
-the sha256 of each pinned source artifact.
+the sha256 of each pinned source artifact. The config pins the manifest
+by sha256 too, checked against the file's bytes when the config is built
+and again when the manifest is loaded.
 
 Reach it from TOML through the existing seams: ``plugins = ["recipe"]``
 imports this module (registering the arch) before ``[vlm]`` is parsed,
@@ -21,8 +23,10 @@ Three contract rules are enforced here rather than documented:
   the runtime trains untied (``lm_untie_at_runtime``). No validator
   couples the two sides.
 - Token budgets are validated, not hard-coded. ``tokens_per_view`` must
-  equal the connector-derived count from the declared geometry, so the
-  per-view cost follows the connector rather than a constant.
+  equal the count the selected connector yields for the declared geometry
+  (a pooling connector reduces by its window, a projection connector keeps
+  every patch), so the per-view cost follows the connector rather than a
+  constant.
 - Unresolved provenance blocks a production launch. Fields whose
   historical value is not established hold the ``OPEN`` sentinel; a
   config with ``production_launch = true`` refuses to construct while
@@ -37,8 +41,9 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from kempnerforge.config.adapter import AdapterConfig
 from kempnerforge.config.registry import registry
-from kempnerforge.config.vlm import FreezeSpec, VLMConfig
+from kempnerforge.config.vlm import DEFAULT_MODULE_PATTERNS, FreezeSpec, VLMConfig
 
 ARCH_NAME = "image_understanding"
 
@@ -49,6 +54,10 @@ OPEN = "OPEN"
 CONFIGS_DIR = Path(__file__).resolve().parent / "configs"
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+# Modules the freeze policy is defined over; the tower and connector always train.
+_RECIPE_MODULES: tuple[str, ...] = ("transformer", "vision_encoder", "adapter")
+_ALWAYS_TRAINED: tuple[str, ...] = ("vision_encoder", "adapter")
 
 # OPEN-provenance fields that must be resolved before a production launch,
 # per stage. Stage 2 additionally requires a non-empty ``init_checkpoint``.
@@ -81,10 +90,11 @@ def _is_unresolved(value: str) -> bool:
 class PackGeometry:
     """Per-stage visual geometry and the packer budget derived from it.
 
-    ``tokens_per_view`` is the declared packer cost of one view and must
-    equal the connector-derived count
-    ``(image_size / patch_size / pool_window) ** 2``; the validator
-    refuses any disagreement so the budget tracks the connector.
+    ``pool_window`` is the connector's pooling window, 1 for a connector
+    that keeps every patch. ``tokens_per_view`` is the declared packer
+    cost of one view; ``ImageUnderstandingConfig`` refuses any
+    disagreement with ``connector_tokens_per_view`` so the budget tracks
+    the selected connector.
     """
 
     image_size: int
@@ -96,7 +106,14 @@ class PackGeometry:
     pack_budget: int
 
     def __post_init__(self) -> None:
-        for name in ("image_size", "patch_size", "pool_window", "tile_grid", "pack_budget"):
+        for name in (
+            "image_size",
+            "patch_size",
+            "pool_window",
+            "tile_grid",
+            "tokens_per_view",
+            "pack_budget",
+        ):
             if getattr(self, name) <= 0:
                 raise ValueError(f"geometry.{name} must be positive (got {getattr(self, name)})")
         if self.image_size % self.patch_size != 0:
@@ -104,18 +121,10 @@ class PackGeometry:
                 f"geometry.image_size ({self.image_size}) must be divisible by "
                 f"patch_size ({self.patch_size})"
             )
-        patches_per_side = self.image_size // self.patch_size
-        if patches_per_side % self.pool_window != 0:
+        if self.patches_per_side % self.pool_window != 0:
             raise ValueError(
-                f"geometry: patches per side ({patches_per_side}) must be divisible by "
+                f"geometry: patches per side ({self.patches_per_side}) must be divisible by "
                 f"pool_window ({self.pool_window})"
-            )
-        derived = (patches_per_side // self.pool_window) ** 2
-        if self.tokens_per_view != derived:
-            raise ValueError(
-                f"geometry.tokens_per_view ({self.tokens_per_view}) must equal the "
-                f"connector-derived count ({derived}) for image_size={self.image_size}, "
-                f"patch_size={self.patch_size}, pool_window={self.pool_window}"
             )
         if self.tile_grid == 1 and self.include_global_view:
             raise ValueError(
@@ -127,6 +136,15 @@ class PackGeometry:
                 f"geometry.pack_budget ({self.pack_budget}) must exceed tokens_per_image "
                 f"({self.tokens_per_image}); a pack must fit one maximal image plus text"
             )
+
+    @property
+    def patches_per_side(self) -> int:
+        return self.image_size // self.patch_size
+
+    def connector_tokens_per_view(self, connector_type: str) -> int:
+        """Tokens one view yields through ``connector_type``, as the runtime counts them."""
+        adapter = AdapterConfig(type=connector_type, pool_window=self.pool_window)
+        return adapter.output_num_tokens(self.patches_per_side**2)
 
     @property
     def views_per_image(self) -> int:
@@ -251,8 +269,9 @@ class ImageUnderstandingConfig(VLMConfig):
     The residual-stream layout is joint-decoder (image tokens prepended
     to text), inherited from the base class. ``freeze`` defaults to
     empty; each stage contract declares its freeze policy explicitly and
-    the validator checks it against ``stage.train_lm`` (the tower and
-    connector train in both stages).
+    the validator checks the effective freeze state, at build time and
+    after every ``freeze_schedule`` transition, against ``stage.train_lm``
+    (the tower and connector train in both stages).
     """
 
     arch: str = ARCH_NAME
@@ -313,8 +332,10 @@ class ImageUnderstandingConfig(VLMConfig):
                 "vlm.source_manifest_sha256 must be 64 lowercase hex characters "
                 f"(got {self.source_manifest_sha256!r})"
             )
+        _read_pinned_manifest(manifest_path(self), self.source_manifest_sha256)
         if self.stage is None:
             raise ValueError("the image-understanding contract requires a [vlm.stage] table")
+        self._validate_token_budget()
         for name in _OPEN_FIELD_NAMES:
             if not getattr(self, name).strip():
                 raise ValueError(
@@ -352,23 +373,65 @@ class ImageUnderstandingConfig(VLMConfig):
                 f"vlm.connector_hidden_dim must be >= 0 (got {self.connector_hidden_dim})"
             )
 
+    def _validate_token_budget(self) -> None:
+        assert self.stage is not None
+        # Late import, as in _validate_connector: the model package pulls in torch.
+        from kempnerforge.model.adapter import POOLING_ADAPTER_TYPES  # noqa: PLC0415
+
+        geometry = self.stage.geometry
+        if self.connector_type not in POOLING_ADAPTER_TYPES and geometry.pool_window != 1:
+            raise ValueError(
+                f"geometry.pool_window ({geometry.pool_window}) must be 1 for connector "
+                f"{self.connector_type!r}, which keeps every patch; pooling connectors: "
+                f"{sorted(POOLING_ADAPTER_TYPES)}"
+            )
+        derived = geometry.connector_tokens_per_view(self.connector_type)
+        if geometry.tokens_per_view != derived:
+            raise ValueError(
+                f"geometry.tokens_per_view ({geometry.tokens_per_view}) must equal the "
+                f"connector-derived count ({derived}) for connector {self.connector_type!r} "
+                f"with image_size={geometry.image_size}, patch_size={geometry.patch_size}, "
+                f"pool_window={geometry.pool_window}"
+            )
+
     def _validate_freeze_policy(self) -> None:
         assert self.stage is not None
-        frozen_modules = {spec.module for spec in self.freeze if spec.frozen}
-        for module in ("vision_encoder", "adapter"):
-            if module in frozen_modules:
+        for alias in _RECIPE_MODULES:
+            if self.module_patterns.get(alias) != DEFAULT_MODULE_PATTERNS[alias]:
                 raise ValueError(
-                    f"the recipe trains the tower and connector in both stages; "
-                    f"freeze must not include {module!r}"
+                    f"vlm.module_patterns[{alias!r}] must be {DEFAULT_MODULE_PATTERNS[alias]} "
+                    "so a freeze directive covers the whole module "
+                    f"(got {self.module_patterns.get(alias)!r})"
                 )
-        lm_frozen = "transformer" in frozen_modules
-        if self.stage.train_lm and lm_frozen:
-            raise ValueError("stage.train_lm=true conflicts with a frozen 'transformer'")
-        if not self.stage.train_lm and not lm_frozen:
-            raise ValueError(
-                "stage.train_lm=false requires freeze to include "
-                "{ module = 'transformer', frozen = true }"
-            )
+        # Late import, as in _validate_connector: the training package pulls in torch.
+        from kempnerforge.training.freeze import effective_freeze  # noqa: PLC0415
+
+        # The runtime keeps the last directive per module and applies scheduled stages
+        # on top, so check the state the run starts in and the state after each stage.
+        known = set(_RECIPE_MODULES)
+        states = [("build time", effective_freeze(0, self.freeze, [], known))]
+        for transition in self.freeze_schedule:
+            step = transition.start_step
+            specs = effective_freeze(step, self.freeze, self.freeze_schedule, known)
+            states.append((f"step {step}", specs))
+        for where, specs in states:
+            frozen = {spec.module for spec in specs if spec.frozen}
+            for module in _ALWAYS_TRAINED:
+                if module in frozen:
+                    raise ValueError(
+                        "the recipe trains the tower and connector in both stages; "
+                        f"freeze must not include {module!r} (frozen at {where})"
+                    )
+            lm_frozen = "transformer" in frozen
+            if self.stage.train_lm and lm_frozen:
+                raise ValueError(
+                    f"stage.train_lm=true conflicts with a frozen 'transformer' at {where}"
+                )
+            if not self.stage.train_lm and not lm_frozen:
+                raise ValueError(
+                    "stage.train_lm=false requires freeze to include "
+                    f"{{ module = 'transformer', frozen = true }} (trainable at {where})"
+                )
 
     def unresolved_launch_fields(self) -> list[str]:
         """Names of fields a production launch of this stage still needs."""
@@ -439,6 +502,30 @@ def _require_keys(block: dict, allowed: set[str], where: str) -> None:
         raise ValueError(f"manifest {where}: missing keys {sorted(missing)}")
 
 
+def _require_str_list(value: object, where: str) -> list[str]:
+    """A JSON array of non-empty strings; iterating a string or object also yields strings."""
+    if not isinstance(value, list):
+        raise ValueError(f"manifest {where} must be a list, got {type(value).__name__}")
+    if not all(isinstance(item, str) and item.strip() for item in value):
+        raise ValueError(f"manifest {where} entries must be non-empty strings")
+    return value
+
+
+def _read_pinned_manifest(path: Path, expected_sha256: str) -> bytes:
+    """The manifest's bytes, refused unless they hash to the pin."""
+    try:
+        data = path.read_bytes()
+    except OSError as exc:
+        raise ValueError(f"vlm.source_manifest: cannot read {path}: {exc}") from exc
+    digest = hashlib.sha256(data).hexdigest()
+    if digest != expected_sha256:
+        raise ValueError(
+            f"manifest content hash mismatch for {path}: vlm.source_manifest_sha256 is "
+            f"{expected_sha256}, the file hashes to {digest}"
+        )
+    return data
+
+
 def manifest_path(config: ImageUnderstandingConfig, base_dir: Path | None = None) -> Path:
     """Resolve the manifest reference; relative paths anchor at ``configs/``."""
     path = Path(config.source_manifest)
@@ -458,14 +545,7 @@ def load_source_manifest(
     feed a run.
     """
     path = manifest_path(config, base_dir)
-    data = path.read_bytes()
-    digest = hashlib.sha256(data).hexdigest()
-    if digest != config.source_manifest_sha256:
-        raise ValueError(
-            f"manifest content hash mismatch for {path}: expected "
-            f"{config.source_manifest_sha256}, got {digest}"
-        )
-    raw = json.loads(data)
+    raw = json.loads(_read_pinned_manifest(path, config.source_manifest_sha256))
     _require_keys(
         raw,
         {
@@ -487,14 +567,11 @@ def load_source_manifest(
         if entry["byte_size"] <= 0:
             raise ValueError(f"manifest artifact {entry['label']!r}: byte_size must be positive")
         artifacts.append(ManifestArtifact(**entry))
-    open_items = raw["provenance"]["open"]
-    notes = raw["provenance"]["notes"]
-    for label, items in (("open", open_items), ("notes", notes)):
-        if not all(isinstance(item, str) and item.strip() for item in items):
-            raise ValueError(f"manifest provenance.{label} entries must be non-empty strings")
+    open_items = _require_str_list(raw["provenance"]["open"], "provenance.open")
+    notes = _require_str_list(raw["provenance"]["notes"], "provenance.notes")
     _require_keys(raw["stage1_source"], {"dataset_class", "name", "epoch_size"}, "stage1_source")
-    sources = raw["stage2_sources"]
-    if not sources or not all(isinstance(s, str) and s.strip() for s in sources):
+    sources = _require_str_list(raw["stage2_sources"], "stage2_sources")
+    if not sources:
         raise ValueError("manifest stage2_sources must be a non-empty list of non-empty names")
     _require_keys(raw["source_counts"], {"occurrences", "unique"}, "source_counts")
     if raw["source_counts"]["occurrences"] != len(sources):
