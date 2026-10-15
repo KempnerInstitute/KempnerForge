@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **VLM example: video captioning config on a pretrained 0.6B backbone** (`examples/vlm/configs/vlm_qwen3_0.6b_joint_decoder_webvid.toml`), warm-started weights-only from the converted checkpoint.
 - **VLM example: converter from a pretrained Hugging Face backbone** (`examples/vlm/scripts/convert_hf_backbone.py`): writes a complete warm-start checkpoint for a VLM config and refuses any mismatch with the source's `config.json`, shard index, keys, shapes, or the epsilon the built model normalises with.
 - **`adapter.pre_norm`**: an optional norm-registry norm over the vision features ahead of `mlp_2layer`'s first projection (`adapter.ln_q`), re-initialized through the norm's `reset_parameters()` (added to `RMSNorm`); `""` (default) builds none, so existing configs are unchanged.
 - **Sequence packing under pipeline parallelism**, for both attention backends. `doc_ids` now reaches every pipeline stage, so `pp > 1` with `data.pack_sequences = true` trains with real block-diagonal attention instead of being rejected. It travels as a schedule **kwarg**: positional args reach only stage 0, but kwargs are handed to every stage, and both are split into micro-batches the same way -- so alignment with the tokens is automatic and costs no extra sends.
