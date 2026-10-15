@@ -457,25 +457,60 @@ class TestValidation:
         config = ModelConfig(dim=32, n_layers=1, n_heads=4, vocab_size=64, max_seq_len=16)
         return Transformer(config)
 
+    @staticmethod
+    def _spy_embedding(model: Transformer) -> list[None]:
+        """One entry per token-embedding call; every rejection must leave it empty."""
+        assert model.token_embedding is not None
+        calls: list[None] = []
+        model.token_embedding.register_forward_pre_hook(lambda *_: calls.append(None))
+        return calls
+
     @pytest.mark.parametrize("dtype", [torch.int32, torch.float32, torch.bool])
     def test_rejects_non_int64_dtype(self, dtype):
+        model = self._model()
+        calls = self._spy_embedding(model)
         tokens = torch.randint(0, 64, (1, 8))
         with pytest.raises(ValueError, match="must be torch.long"):
-            self._model()(tokens, attention_group_ids=torch.zeros(1, 8, dtype=dtype))
+            model(tokens, attention_group_ids=torch.zeros(1, 8, dtype=dtype))
+        assert calls == []
 
-    @pytest.mark.parametrize("shape", [(1, 7), (2, 8), (8,)])
+    @pytest.mark.parametrize("shape", [(1, 7), (2, 8), (8,), (1, 8, 1)])
     def test_rejects_shape_mismatch(self, shape):
+        model = self._model()
+        calls = self._spy_embedding(model)
         tokens = torch.randint(0, 64, (1, 8))
-        with pytest.raises(ValueError, match="does not match the residual shape"):
-            self._model()(tokens, attention_group_ids=torch.zeros(shape, dtype=torch.long))
+        with pytest.raises(ValueError, match=r"does not match the residual shape \(1, 8\)"):
+            model(tokens, attention_group_ids=torch.zeros(shape, dtype=torch.long))
+        assert calls == []
 
     def test_shape_follows_the_residual_not_the_tokens(self):
+        model = self._model()
+        calls = self._spy_embedding(model)
         tokens = torch.randint(0, 64, (1, 8))
         modality = ModalityContext(prefix_embeds=torch.zeros(1, 4, 32))
-        with pytest.raises(ValueError, match="does not match the residual shape"):
-            self._model()(
+        with pytest.raises(ValueError, match=r"does not match the residual shape \(1, 12\)"):
+            model(
                 tokens, modality=modality, attention_group_ids=torch.zeros(1, 8, dtype=torch.long)
             )
+        assert calls == []
+
+    def test_valid_residual_shape_runs_and_embeds_once(self):
+        model = self._model()
+        calls = self._spy_embedding(model)
+        tokens = torch.randint(0, 64, (1, 8))
+        modality = ModalityContext(prefix_embeds=torch.zeros(1, 4, 32))
+        groups = torch.tensor([[0] * 4 + [-1] * 8])
+        out = model(tokens, modality=modality, attention_group_ids=groups)
+        assert out.shape == (1, 12, 64)
+        assert len(calls) == 1
+
+    def test_shape_follows_inputs_embeds(self):
+        model = self._model()
+        modality = ModalityContext(inputs_embeds=torch.zeros(1, 8, 32))
+        with pytest.raises(ValueError, match=r"does not match the residual shape \(1, 8\)"):
+            model(modality=modality, attention_group_ids=torch.zeros(1, 7, dtype=torch.long))
+        out = model(modality=modality, attention_group_ids=torch.zeros(1, 8, dtype=torch.long))
+        assert out.shape == (1, 8, 64)
 
     def test_rejects_kv_caches(self):
         caches = [
@@ -488,11 +523,12 @@ class TestValidation:
                 device=CPU,
             )
         ]
+        model = self._model()
+        calls = self._spy_embedding(model)
         tokens = torch.randint(0, 64, (1, 8))
         with pytest.raises(ValueError, match="training-only"):
-            self._model()(
-                tokens, kv_caches=caches, attention_group_ids=torch.zeros(1, 8, dtype=torch.long)
-            )
+            model(tokens, kv_caches=caches, attention_group_ids=torch.zeros(1, 8, dtype=torch.long))
+        assert calls == []
 
     @pytest.mark.parametrize(
         "vlm_config",
@@ -505,6 +541,8 @@ class TestValidation:
     def test_rejects_moma_and_mot_paths(self, vlm_config):
         config = ModelConfig(dim=32, n_layers=1, n_heads=4, vocab_size=64, max_seq_len=16)
         model = Transformer(config, vlm_config=vlm_config, num_image_tokens=4)
+        calls = self._spy_embedding(model)
         tokens = torch.randint(0, 64, (1, 4))
         with pytest.raises(ValueError, match="MoMa/MoT"):
             model(tokens, attention_group_ids=torch.zeros(1, 8, dtype=torch.long))
+        assert calls == []

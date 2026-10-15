@@ -1,9 +1,10 @@
 """Integration test: bidirectional visibility groups on the CUDA flex path.
 
 GPU-side assertions the CPU unit tier cannot make (torch 2.11 has no CPU
-FlexAttention backward): dense-vs-flex gradient parity with groups, the
-compiled kernel at lengths around the block size, recompile stability across
-group layouts, and a 16384-token pack against the dense reference.
+FlexAttention backward): dense-vs-flex gradient parity with groups, group ids
+past the int32 range against the dense reference, the compiled kernel at
+lengths around the block size, recompile stability across group layouts, and a
+16384-token pack against the dense reference.
 
 Mask semantics are covered exhaustively in ``tests/unit/test_attention_groups.py``.
 """
@@ -34,6 +35,22 @@ def _spans(seq: int, split: int) -> tuple[list[int], list[int], int, int]:
 def _splits(seq: int) -> list[int]:
     """Per-row document boundaries: different rows, so the mask must index the batch."""
     return [(seq * 2) // 3, seq // 3]
+
+
+def _paired_groups(seq: int, id_a: int, id_b: int) -> torch.Tensor:
+    """Group rows over the ``_splits`` documents: ``id_a`` and ``id_b`` on two disjoint
+    spans of document 0 (``id_b`` crosses the block edge in the longer row), and
+    ``id_b`` reused at the head of document 1."""
+    rows = []
+    for split in _splits(seq):
+        row = [-1] * seq
+        a_lo, a_hi = split * 35 // 100, split * 58 // 100
+        b_lo, b_hi = split * 65 // 100, split * 88 // 100
+        row[a_lo:a_hi] = [id_a] * (a_hi - a_lo)
+        row[b_lo:b_hi] = [id_b] * (b_hi - b_lo)
+        row[split : split + 20] = [id_b] * 20
+        rows.append(row)
+    return torch.tensor(rows)
 
 
 def _relative_errors(actual: torch.Tensor, reference: torch.Tensor) -> tuple[float, float]:
@@ -112,6 +129,52 @@ class TestFlexGroups:
             model(tokens, doc_ids=doc_ids, attention_group_ids=group_ids).sum().backward()
             models[backend] = model
         _assert_grads_match(models["sdpa"], models["flex"], bound=1e-5)
+
+    @pytest.mark.parametrize(
+        ("id_a", "id_b"),
+        [(2**31, 1), (2**31 + 1, 2**31 + 2), (5, 2**32 + 5)],
+        ids=["2**31", "2**31+small", "low-high-collision"],
+    )
+    def test_ids_beyond_int32_match_dense_reference(self, id_a, id_b):
+        """Group ids that a 32-bit cast would corrupt, against the dense int64 reference.
+
+        Two groups share a document. A cast to int32 makes every id from 2**31 up
+        negative, so the group vanishes, and folds 5 and 2**32 + 5 into one group.
+        The compiled flex path, eager and under an outer torch.compile, must match
+        the dense reference, and the reference must differ from each corrupted
+        labelling, so that the parity is informative.
+        """
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA required")
+
+        from torch._dynamo.utils import counters
+
+        torch._dynamo.reset()
+        counters.clear()
+        tokens, doc_ids, _ = self._batch()
+        group_ids = _paired_groups(self.SEQ, id_a, id_b).cuda()
+        sdpa = self._model("sdpa").eval()
+        flex = self._model("flex").eval()
+
+        def run(model, ids):
+            return model(tokens, doc_ids=doc_ids, attention_group_ids=ids)
+
+        with torch.no_grad():
+            reference = run(sdpa, group_ids)
+            torch.testing.assert_close(run(flex, group_ids), reference, rtol=2e-5, atol=2e-5)
+            kernel_graphs = counters["stats"]["unique_graphs"]
+            assert kernel_graphs > 0, "flex_attention did not compile"
+            compiled = torch.compile(flex)
+            torch.testing.assert_close(run(compiled, group_ids), reference, rtol=2e-5, atol=2e-5)
+            assert counters["stats"]["unique_graphs"] > kernel_graphs, "torch.compile did not run"
+            corrupted = {
+                "first group ungrouped": group_ids.masked_fill(group_ids == id_a, -1),
+                "second group ungrouped": group_ids.masked_fill(group_ids == id_b, -1),
+                "groups merged": group_ids.masked_fill(group_ids == id_b, id_a),
+            }
+            for label, ids in corrupted.items():
+                other = run(sdpa, ids)
+                assert not torch.allclose(other, reference, rtol=2e-5, atol=2e-5), label
 
     @pytest.mark.parametrize("seq", [FLEX_BLOCK_SIZE, 200, 300])
     def test_compiled_lengths_around_the_block_size(self, seq):

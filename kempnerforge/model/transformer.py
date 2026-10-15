@@ -434,6 +434,17 @@ class Transformer(nn.Module):
                 raise ValueError(
                     "attention_group_ids is not supported on the MoMa/MoT residual paths"
                 )
+            # Residual = prefix + text, taken from the input shapes so a bad
+            # shape fires before the embedding or any other compute.
+            text = tokens if tokens is not None else inputs_embeds
+            assert text is not None  # narrowed by the XOR check above
+            n_prefix = prefix_embeds.shape[1] if prefix_embeds is not None else 0
+            residual_shape = (text.shape[0], n_prefix + text.shape[1])
+            if tuple(attention_group_ids.shape) != residual_shape:
+                raise ValueError(
+                    f"attention_group_ids shape {tuple(attention_group_ids.shape)} does not "
+                    f"match the residual shape {residual_shape}"
+                )
 
         h = (
             self.token_embedding(tokens)  # type: ignore[reportOptionalCall]
@@ -459,12 +470,6 @@ class Transformer(nn.Module):
             self._rope_sin = self._rope_sin.to(h.device)  # type: ignore[reportOptionalMemberAccess]
         cos = self._rope_cos[start_pos : start_pos + seq_len]  # type: ignore[reportOptionalSubscript]
         sin = self._rope_sin[start_pos : start_pos + seq_len]  # type: ignore[reportOptionalSubscript]
-
-        if attention_group_ids is not None and attention_group_ids.shape != h.shape[:2]:
-            raise ValueError(
-                f"attention_group_ids shape {tuple(attention_group_ids.shape)} does not "
-                f"match the residual shape {tuple(h.shape[:2])}"
-            )
 
         # Packed sequences under attention_backend="flex": build the sparse
         # block-diagonal (causal-or-group) mask once here and share it across
