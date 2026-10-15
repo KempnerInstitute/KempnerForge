@@ -1,3 +1,10 @@
+/* The theme lets the logo fill the sidebar width. With the project name
+   hidden, a square mark then takes ~200px of permanent chrome above the
+   navigation; cap it so the nav keeps the space. */
+.sidebar-logo {
+    max-width: 140px;
+}
+
 .sidebar-brand {
     text-align: center;
 }
