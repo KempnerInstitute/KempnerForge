@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/logo.png" alt="KempnerForge" width="320"/>
+  <img src="docs/assets/logo.png" alt="KempnerForge" width="240"/>
 </p>
 
 <p align="center">
