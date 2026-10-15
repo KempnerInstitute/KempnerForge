@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import warnings
+
 import pytest
 import torch
 import torch.nn as nn
 
 from kempnerforge.config.schema import SchedulerConfig, SchedulerType
-from kempnerforge.training.scheduler import build_scheduler
+from kempnerforge.training.scheduler import _warmup_factor, build_scheduler
 
 
 def _make_optimizer(lr: float = 1.0) -> torch.optim.Optimizer:
@@ -357,3 +359,76 @@ class TestSchedulerConfigValidation:
     def test_rex_alpha_default(self):
         config = SchedulerConfig()
         assert config.rex_alpha == 1.0
+
+
+# ---------------------------------------------------------------------------
+# Warmup start factor
+# ---------------------------------------------------------------------------
+
+
+def _torch_linear_warmup_cosine(lr: float, warmup: int, start: float, decay: int, min_ratio):
+    """torch's SequentialLR(LinearLR, CosineAnnealingWarmRestarts), the reference.
+
+    With T_0 = the decay length the cosine never restarts inside the run, so this is
+    warmup-from-``start`` then cosine decay -- the schedule ``cosine`` must reproduce.
+    """
+    model = nn.Linear(4, 4)
+    opt = torch.optim.SGD(model.parameters(), lr=lr)
+    cosine = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        opt, T_0=decay, eta_min=lr * min_ratio
+    )
+    warm = torch.optim.lr_scheduler.LinearLR(opt, start_factor=start, total_iters=warmup)
+    sched = torch.optim.lr_scheduler.SequentialLR(opt, [warm, cosine], milestones=[warmup])
+    return opt, sched
+
+
+class TestWarmupStartFactor:
+    def test_default_is_bit_identical_to_warming_up_from_zero(self):
+        for warmup in (1, 7, 100, 2000):
+            for step in range(warmup + 3):
+                assert _warmup_factor(step, warmup) == min(1.0, step / warmup)
+
+    @pytest.mark.parametrize("name", ["cosine", "linear", "wsd", "constant", "rex"])
+    def test_every_warmup_schedule_starts_from_the_factor(self, name):
+        opt = _make_optimizer(lr=2.0)
+        cfg = SchedulerConfig(name=name, warmup_steps=100, warmup_start_factor=0.25)
+        sched = build_scheduler(opt, cfg, max_steps=1000)
+        assert opt.param_groups[0]["lr"] == pytest.approx(0.5)  # 2.0 * 0.25 at step 0
+        _step_to(sched, 50)
+        assert opt.param_groups[0]["lr"] == pytest.approx(2.0 * (0.25 + 0.75 * 0.5))
+        _step_to(sched, 50)
+        assert opt.param_groups[0]["lr"] == pytest.approx(2.0)  # peak at the end of warmup
+
+    def test_cosine_matches_torch_linear_warmup_then_cosine_step_for_step(self):
+        """Two groups with different LRs over a whole run, at rel 1e-12."""
+        warmup, start, max_steps, min_ratio = 30, 5e-4, 250, 0.1
+        lrs = (3e-4, 5e-5)
+        model = nn.Linear(4, 4)
+        opt = torch.optim.SGD(
+            [{"params": [model.weight], "lr": lrs[0]}, {"params": [model.bias], "lr": lrs[1]}]
+        )
+        sched = build_scheduler(
+            opt,
+            SchedulerConfig(
+                name="cosine",
+                warmup_steps=warmup,
+                warmup_start_factor=start,
+                min_lr_ratio=min_ratio,
+            ),
+            max_steps=max_steps,
+        )
+        with warnings.catch_warnings():
+            # SequentialLR calls the cosine's step(0) at the milestone, which torch warns about.
+            warnings.simplefilter("ignore")
+            refs = [
+                _torch_linear_warmup_cosine(lr, warmup, start, max_steps - warmup, min_ratio)
+                for lr in lrs
+            ]
+            for step in range(max_steps):
+                for group, (ref_opt, _) in zip(opt.param_groups, refs, strict=True):
+                    assert group["lr"] == pytest.approx(
+                        ref_opt.param_groups[0]["lr"], rel=1e-12, abs=0.0
+                    ), f"step {step}"
+                sched.step()
+                for _, ref in refs:
+                    ref.step()
