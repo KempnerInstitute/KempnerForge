@@ -256,8 +256,9 @@ class TestCheckpointRoundTrip:
             for (name, r), (_, t) in zip(ref, loaded[what], strict=True):
                 assert torch.equal(r, t), f"{what} {name} not restored bit-exactly"
 
+    @pytest.mark.parametrize("name", ["adamw", "muon"])
     def test_save_before_the_first_step_leaves_the_run_unchanged(
-        self, distributed_env, shared_tmp_dir
+        self, distributed_env, shared_tmp_dir, name
     ):
         """A sharded step-0 save and its resume must train like a run that never saved."""
         from torch.distributed.tensor import DTensor
@@ -268,7 +269,7 @@ class TestCheckpointRoundTrip:
             torch.manual_seed(42)
             model = Transformer(SMALL_CONFIG).cuda()
             apply_fsdp2(model, distributed_env)
-            return model, build_optimizer(model, OptimizerConfig(lr=1e-3))
+            return model, build_optimizer(model, OptimizerConfig(name=name, lr=1e-3))
 
         def train(model, opt):
             gen = torch.Generator(device="cuda").manual_seed(7 + dist.get_rank())
@@ -286,8 +287,11 @@ class TestCheckpointRoundTrip:
 
         config = CheckpointConfig(dir=shared_tmp_dir, keep_last_n=2)
         model, opt = build()
-        CheckpointManager(config, model, opt).save(step=0)
-        assert not opt.state, "the save left the getter's dummy state in the optimizer"
+        manager = CheckpointManager(config, model, opt)
+        manager.save(step=0)
+        assert not any(o.state for o in manager.checkpointed_optimizers), (
+            "the save left the getter's dummy state in an optimizer"
+        )
         saved = train(model, opt)
 
         model2, opt2 = build()

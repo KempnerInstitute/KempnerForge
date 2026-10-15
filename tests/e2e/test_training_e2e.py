@@ -518,7 +518,8 @@ def test_resume_determinism_muon_2gpu_fsdp(tmp_path):
 
 
 @pytest.mark.e2e
-def test_step_zero_checkpoint_leaves_training_unchanged(tmp_path):
+@pytest.mark.parametrize("overrides", [(), _MUON_RESUME_OVERRIDES], ids=["adamw", "muon"])
+def test_step_zero_checkpoint_leaves_training_unchanged(tmp_path, overrides):
     """A run that checkpoints at step 0 must log the same losses as one that does not."""
     data_dir = _make_learnable_shard(tmp_path)
     common = [
@@ -531,6 +532,7 @@ def test_step_zero_checkpoint_leaves_training_unchanged(tmp_path):
         "--model.vocab_size=256",
         f"--data.dataset_path={data_dir}",
         "--data.file_pattern=*.npy",
+        *overrides,
     ]
     plain = _run_training(common + [f"--checkpoint.dir={tmp_path}/plain"], timeout=300)
     _assert_training_complete(plain, expected_steps=10)

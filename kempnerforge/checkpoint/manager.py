@@ -392,7 +392,7 @@ class CheckpointManager:
         # empty, so the moments would be silently dropped on resume (Adam momentum
         # resets to zero -> non-bit-exact resume; see manager load()).
         dcp_state: dict[str, Any] = {"model": get_model_state_dict(self.model)}
-        if self.optimizer.state:
+        if any(optimizer.state for optimizer in self.checkpointed_optimizers):
             optim_state = get_optimizer_state_dict(self.model, self.checkpointed_optimizers)
             dcp_state["optimizer"] = optim_state
             dcp_state[_NEVER_STEPPED_KEY] = _never_stepped_record(optim_state)
@@ -639,7 +639,8 @@ class CheckpointManager:
             )
 
             if load_optim and planner.optimizer_missing:
-                self.optimizer.state.clear()
+                for optimizer in self.checkpointed_optimizers:
+                    optimizer.state.clear()
                 fresh_optimizer, load_optim = True, False
             if load_optim:
                 optim_state = cast("dict[str, Any]", dcp_state["optimizer"])
