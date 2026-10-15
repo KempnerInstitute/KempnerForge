@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 
 import pytest
 import torch
@@ -1168,6 +1169,59 @@ class TestInitWeights:
             and not n.endswith(("o_proj.weight", "down_proj.weight"))
         ]
         assert all(abs(s - 0.01) < 0.01 for s in stds)
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {},
+            {"qk_norm": True},
+            {"norm_type": "layernorm"},
+            {
+                "num_experts": 4,
+                "moe_top_k": 2,
+                "moe_frequency": 1,
+                "moe_router": "sigmoid_topk",
+            },
+        ],
+        ids=["dense", "qk_norm", "layernorm", "sigmoid_router"],
+    )
+    def test_materialized_state_matches_a_constructed_model(self, overrides):
+        """A meta build must end up where a direct build starts.
+
+        ``to_empty`` replaces every parameter and buffer with uninitialised
+        memory. Anything set in a constructor rather than by ``init_weights``
+        -- norm weights, the sigmoid router's bias, its utilisation buffer --
+        keeps that memory unless something restores it.
+
+        The poison step is load-bearing. Freed blocks often still hold the
+        values that were just in them, so an allocator handing back ones makes
+        the naive version of this test pass while the bug is present.
+        """
+        config = replace(_INIT_CONFIG, **overrides)
+
+        reference = Transformer(config)
+        reference.init_weights_and_freqs()
+
+        with torch.device("meta"):
+            model = Transformer(config)
+        model.to_empty(device="cpu")
+        for tensor in (*model.parameters(), *model.buffers()):
+            tensor.detach().fill_(float("nan"))
+        model.init_weights_and_freqs()
+
+        for name, param in model.named_parameters():
+            assert torch.isfinite(param).all(), f"{name} left uninitialised"
+        for name, buf in model.named_buffers():
+            assert torch.isfinite(buf).all(), f"buffer {name} left uninitialised"
+
+        # Constructor-set state is deterministic, so it must match exactly.
+        ref_params = dict(reference.named_parameters())
+        for name, param in model.named_parameters():
+            if param.dim() < 2:
+                assert torch.equal(param, ref_params[name]), name
+        ref_bufs = dict(reference.named_buffers())
+        for name, buf in model.named_buffers():
+            assert torch.equal(buf, ref_bufs[name]), f"buffer {name}"
 
     def test_skips_meta_parameters(self):
         """init_weights should skip parameters on meta device without error."""
