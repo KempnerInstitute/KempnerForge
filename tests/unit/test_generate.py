@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 from kempnerforge.config.schema import ModelConfig
@@ -271,3 +272,27 @@ class TestGenerate:
 
         with pytest.raises(ValueError, match="exceeds model max_seq_len"):
             generate(model, prompt, max_new_tokens=20, temperature=0)
+
+    @pytest.mark.parametrize(
+        "omitted",
+        [("token_embedding",), ("output_head",), ("token_embedding", "output_head")],
+    )
+    def test_rejects_model_without_embedding_or_head(self, monkeypatch, omitted):
+        """A model missing either module is rejected before the mode switch or any cache."""
+        allocated = []
+
+        def spy(*args, **kwargs):
+            allocated.append(args)
+            return KVCache(*args, **kwargs)
+
+        monkeypatch.setattr("kempnerforge.model.generate.KVCache", spy)
+        model = Transformer(_tiny_config(), **{f"include_{name}": False for name in omitted})
+        prompt = torch.randint(0, 128, (1, 4))
+        with pytest.raises(ValueError, match=r"generate\(\)") as exc_info:
+            generate(model, prompt, max_new_tokens=3, temperature=0)
+        # The message names the knob to restore for exactly the omitted modules.
+        message = str(exc_info.value)
+        for name in ("token_embedding", "output_head"):
+            assert (f"include_{name}=True" in message) == (name in omitted)
+        assert allocated == []
+        assert model.training
