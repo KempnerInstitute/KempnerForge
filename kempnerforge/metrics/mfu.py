@@ -114,24 +114,26 @@ def estimate_model_flops_per_token(config: ModelConfig, seq_len: int | None = No
 
 def _dense_flops_per_token(config: ModelConfig, seq_len: int) -> int:
     head_dim = config.head_dim
+    attn_dim = config.n_heads * head_dim
     attn_params = (
-        config.dim * (config.n_heads * head_dim)  # Q
+        config.dim * attn_dim  # Q
         + 2 * config.dim * (config.n_kv_heads * head_dim)  # type: ignore[reportOptionalOperand]  # K+V
-        + (config.n_heads * head_dim) * config.dim  # O
+        + attn_dim * config.dim  # O
     )
     mlp_params = 3 * config.dim * config.computed_ffn_hidden_dim  # SwiGLU
     per_layer = attn_params + mlp_params
     output_params = config.vocab_size * config.dim
     active_params = config.n_layers * per_layer + output_params
-    return 6 * active_params + 12 * config.n_layers * config.dim * seq_len
+    return 6 * active_params + 12 * config.n_layers * attn_dim * seq_len
 
 
 def _moe_flops_per_token(config: ModelConfig, seq_len: int) -> int:
     head_dim = config.head_dim
+    attn_dim = config.n_heads * head_dim
     attn_params = (
-        config.dim * (config.n_heads * head_dim)
+        config.dim * attn_dim
         + 2 * config.dim * (config.n_kv_heads * head_dim)  # type: ignore[reportOptionalOperand]
-        + (config.n_heads * head_dim) * config.dim
+        + attn_dim * config.dim
     )
     mlp_params = 3 * config.dim * config.computed_ffn_hidden_dim
 
@@ -144,7 +146,7 @@ def _moe_flops_per_token(config: ModelConfig, seq_len: int) -> int:
 
     output_params = config.vocab_size * config.dim
     active_params = dense_active + moe_active + output_params
-    return 6 * active_params + 12 * config.n_layers * config.dim * seq_len
+    return 6 * active_params + 12 * config.n_layers * attn_dim * seq_len
 
 
 def compute_mfu(

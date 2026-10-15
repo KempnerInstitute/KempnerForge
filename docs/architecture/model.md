@@ -73,6 +73,9 @@ Four `nn.Linear(..., bias=False)` projections:
 | `v_proj` | `dim → n_kv_heads * head_dim` |
 | `o_proj` | `n_heads * head_dim → dim` |
 
+`head_dim` defaults to `dim // n_heads`; `model.head_dim_override` sets it
+directly, so `n_heads * head_dim` need not equal `dim`.
+
 GQA is configured by the ratio `n_heads / n_kv_heads`:
 
 - `n_kv_heads == n_heads` → multi-head attention (MHA)
@@ -85,7 +88,7 @@ After Q/K/V are computed, KV heads are expanded to `n_heads` via
 
 ### QK-Norm
 
-When `qk_norm=True`, per-head `RMSNorm(head_dim)` is applied to Q and K
+When `qk_norm=True`, per-head `RMSNorm(head_dim, eps=norm_eps)` is applied to Q and K
 before RoPE. Stabilizes attention logits at scale (Gemma, DeepSeek-V3).
 
 ### Four attention paths

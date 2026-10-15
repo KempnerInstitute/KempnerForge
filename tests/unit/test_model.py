@@ -6,6 +6,7 @@ import math
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from kempnerforge.config.schema import ModelConfig
 from kempnerforge.model.attention import Attention
@@ -155,6 +156,12 @@ class TestAttention:
         attn = Attention(dim=128, n_heads=4, n_kv_heads=4)
         assert attn.q_norm is None
         assert attn.k_norm is None
+
+    def test_qk_norm_eps(self):
+        default = Attention(dim=128, n_heads=4, n_kv_heads=4, qk_norm=True)
+        custom = Attention(dim=128, n_heads=4, n_kv_heads=4, qk_norm=True, norm_eps=1e-6)
+        assert (default.q_norm.eps, default.k_norm.eps) == (1e-5, 1e-5)
+        assert (custom.q_norm.eps, custom.k_norm.eps) == (1e-6, 1e-6)
 
     def test_qk_norm_bounds_attention_logits(self):
         """QK-Norm should produce bounded Q/K regardless of input scale."""
@@ -376,6 +383,138 @@ class TestTransformer:
         assert m2.layers["0"].attention.q_norm is None
         # Same parameter count
         assert sum(p.numel() for p in m1.parameters()) == sum(p.numel() for p in m2.parameters())
+
+
+# ---------------------------------------------------------------------------
+# norm_eps on every norm of the text, VLM-arch and first-pipeline-stage models
+# ---------------------------------------------------------------------------
+
+
+_EPS_VALUES = (1e-6, 1e-3)  # neither is the 1e-5 default the norms used to fall back to
+_N_IMAGE = 4
+# Norms in each two-layer model: per layer the attention/MLP pre-norms and the q/k norms,
+# plus the final norm; two more per cross-attention block; MoT keeps a copy per modality
+# and adds per-modality final norms; the first pipeline stage has no final norm.
+_NORM_COUNTS = {
+    "text": 9,
+    "joint_decoder": 9,
+    "cross_attention": 13,
+    "mot": 19,
+    "moma": 9,
+    "pp_stage": 8,
+    "adapter": 1,
+}
+
+
+def _norm_eps_model(arch: str, eps: float) -> torch.nn.Module:
+    """Two-layer qk_norm model with ``norm_eps=eps``; ``pp_stage`` is the first of two stages.
+
+    ``adapter`` is an ``mlp_2layer`` vision adapter with a pre-norm, the one norm
+    that lives outside the transformer.
+
+    The small ``init_std`` keeps every norm's input near the eps scale, where the tested
+    eps values and the 1e-5 default give clearly different norm outputs.
+    """
+    from kempnerforge.config.vlm import (
+        CrossAttentionConfig,
+        JointDecoderConfig,
+        MoMaConfig,
+        MoTConfig,
+    )
+    from kempnerforge.distributed.pipeline_parallel import PipelineStageModule
+
+    if arch == "adapter":
+        from kempnerforge.config.adapter import AdapterConfig
+        from kempnerforge.model.adapter import build_adapter
+
+        return build_adapter(
+            AdapterConfig(type="mlp_2layer", pre_norm="rmsnorm"),
+            in_dim=64,
+            out_dim=64,
+            norm_eps=eps,
+        )
+
+    cfg = ModelConfig(
+        dim=64,
+        n_layers=2,
+        n_heads=4,
+        n_kv_heads=2,
+        vocab_size=128,
+        max_seq_len=32,
+        ffn_hidden_dim=128,
+        qk_norm=True,
+        norm_eps=eps,
+        init_std=1e-3,
+    )
+    if arch == "pp_stage":
+        return PipelineStageModule(cfg, stage_id=0, num_stages=2, layer_range=(0, 2))
+    vlm_config = {
+        "text": None,
+        "joint_decoder": JointDecoderConfig(max_text_len=8),
+        "cross_attention": CrossAttentionConfig(cross_attention_every_n_layers=1, max_text_len=8),
+        "mot": MoTConfig(max_text_len=8),
+        "moma": MoMaConfig(
+            max_text_len=8,
+            moma_experts_per_modality={"image": 2, "text": 2},
+            moma_gumbel_noise=False,
+        ),
+    }[arch]
+    return Transformer(cfg, vlm_config=vlm_config, num_image_tokens=_N_IMAGE)
+
+
+def _norm_eps_forward(model: torch.nn.Module, arch: str) -> None:
+    b, t = 2, 8
+    tokens = torch.randint(0, 128, (b, t), device=DEVICE)
+    image = torch.randn(b, _N_IMAGE, 64, device=DEVICE) * 1e-3
+    if arch == "adapter":
+        model(image)
+    elif arch == "cross_attention":
+        model(tokens, modality=ModalityContext(image_features=image))
+    elif arch in ("mot", "moma"):
+        ids = torch.ones(b, _N_IMAGE + t, dtype=torch.long, device=DEVICE)
+        ids[:, :_N_IMAGE] = 0
+        ctx = ModalityContext(
+            prefix_embeds=image, output_slice=slice(_N_IMAGE, None), modality_ids=ids
+        )
+        model(tokens, modality=ctx)
+    else:
+        model(tokens)
+
+
+def _norms(model: torch.nn.Module) -> dict[str, torch.nn.Module]:
+    return {
+        name: module
+        for name, module in model.named_modules()
+        if isinstance(module, (RMSNorm, torch.nn.LayerNorm))
+    }
+
+
+class TestNormEps:
+    """Every norm of the text, VLM, pipeline-stage and adapter models uses ``model.norm_eps``."""
+
+    @pytest.mark.parametrize("eps", _EPS_VALUES)
+    @pytest.mark.parametrize("arch", list(_NORM_COUNTS))
+    def test_every_norm_uses_norm_eps(self, arch, eps):
+        norms = _norms(_norm_eps_model(arch, eps))
+        assert len(norms) == _NORM_COUNTS[arch]
+        assert {name: norm.eps for name, norm in norms.items()} == dict.fromkeys(norms, eps)
+
+    @pytest.mark.parametrize("eps", _EPS_VALUES)
+    @pytest.mark.parametrize("arch", list(_NORM_COUNTS))
+    def test_norm_output_matches_reference_rmsnorm(self, arch, eps):
+        model = _norm_eps_model(arch, eps).to(DEVICE).eval()
+        calls = []
+        for norm in _norms(model).values():
+            norm.register_forward_hook(lambda m, args, out: calls.append((m.weight, args[0], out)))
+        with torch.no_grad():
+            _norm_eps_forward(model, arch)
+        # MoT's shared final norm is unused; its per-modality final norms run instead
+        assert len(calls) == _NORM_COUNTS[arch] - (1 if arch == "mot" else 0)
+        for weight, x, out in calls:
+            ref = F.rms_norm(x, (x.shape[-1],), weight, eps=eps)
+            old = F.rms_norm(x, (x.shape[-1],), weight, eps=1e-5)
+            assert (ref - old).abs().max() > 1e-2  # eps matters at this input scale
+            torch.testing.assert_close(out, ref)
 
 
 # ---------------------------------------------------------------------------
@@ -1036,3 +1175,148 @@ class TestInitWeights:
             model = Transformer(_INIT_CONFIG)
         # Should not raise even though all params are on meta device
         init_weights(model, _INIT_CONFIG)
+
+
+# ---------------------------------------------------------------------------
+# Decoupled head_dim
+# ---------------------------------------------------------------------------
+
+
+def _decoupled_config(**kw) -> ModelConfig:
+    """dim=64, n_heads=8, head_dim=16 -> a 128-wide attention over a 64-wide
+    residual. n_heads * head_dim (128) != dim (64) on purpose."""
+    base = dict(
+        dim=64,
+        n_layers=2,
+        n_heads=8,
+        n_kv_heads=8,
+        head_dim_override=16,
+        vocab_size=64,
+        max_seq_len=32,
+    )
+    base.update(kw)
+    return ModelConfig(**base)
+
+
+class TestDecoupledHeadDim:
+    def test_attention_projection_widths_follow_head_dim_not_dim(self):
+        cfg = _decoupled_config()
+        attn = Attention(
+            dim=cfg.dim,
+            n_heads=cfg.n_heads,
+            n_kv_heads=cfg.n_kv_heads,
+            head_dim=cfg.head_dim,
+        )
+        assert attn.q_proj.weight.shape == (cfg.n_heads * cfg.head_dim, cfg.dim) == (128, 64)
+        assert attn.k_proj.weight.shape == (cfg.n_kv_heads * cfg.head_dim, cfg.dim)
+        assert attn.o_proj.weight.shape == (cfg.dim, cfg.n_heads * cfg.head_dim) == (64, 128)
+
+    def test_attention_forward_and_backward_on_a_decoupled_head_dim(self):
+        cfg = _decoupled_config()
+        attn = Attention(
+            dim=cfg.dim,
+            n_heads=cfg.n_heads,
+            n_kv_heads=cfg.n_kv_heads,
+            head_dim=cfg.head_dim,
+        ).to(DEVICE)
+        cos, sin = precompute_rope_frequencies(cfg.head_dim, cfg.max_seq_len)
+        cos, sin = cos.to(DEVICE), sin.to(DEVICE)
+        x = torch.randn(2, 8, cfg.dim, device=DEVICE, requires_grad=True)
+        out = attn(x, cos[:8], sin[:8])
+        assert out.shape == (2, 8, cfg.dim)
+        out.sum().backward()
+        assert x.grad is not None and torch.isfinite(x.grad).all()
+
+    def test_rope_table_is_sized_by_head_dim(self):
+        cfg = _decoupled_config()
+        model = Transformer(cfg)
+        assert model._rope_cos.shape == (cfg.max_seq_len, cfg.head_dim // 2) == (32, 8)
+
+    def test_qk_norm_is_sized_by_head_dim(self):
+        cfg = _decoupled_config(qk_norm=True)
+        model = Transformer(cfg)
+        attn = model.layers["0"].attention
+        assert attn.q_norm.weight.shape == (cfg.head_dim,) == (16,)
+        assert attn.k_norm.weight.shape == (cfg.head_dim,)
+
+    def test_full_transformer_forward_and_backward(self):
+        cfg = _decoupled_config()
+        model = Transformer(cfg).to(DEVICE)
+        tokens = torch.randint(0, cfg.vocab_size, (2, 8), device=DEVICE)
+        logits = model(tokens)
+        assert logits.shape == (2, 8, cfg.vocab_size)
+        logits.sum().backward()
+        grads = [p.grad for p in model.parameters() if p.grad is not None]
+        assert grads and all(torch.isfinite(g).all() for g in grads)
+
+    def test_kv_cache_is_sized_by_head_dim(self):
+        from kempnerforge.model.attention import KVCache
+
+        cfg = _decoupled_config()
+        cache = KVCache(
+            batch_size=1,
+            max_seq_len=cfg.max_seq_len,
+            n_kv_heads=cfg.n_kv_heads,
+            head_dim=cfg.head_dim,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+        )
+        assert cache.k.shape == (1, cfg.n_kv_heads, cfg.max_seq_len, cfg.head_dim)
+
+    def test_generation_runs_with_a_decoupled_head_dim(self):
+        """generate() sizes its own KV caches from config.head_dim; a stale
+        dim // n_heads there would be a shape mismatch at prefill."""
+        from kempnerforge.model.generate import generate
+
+        cfg = _decoupled_config()
+        model = Transformer(cfg).to(DEVICE).eval()
+        prompt = torch.randint(0, cfg.vocab_size, (1, 4), device=DEVICE)
+        out = generate(model, prompt, max_new_tokens=3, temperature=0.0)
+        assert out.shape == (1, 7)
+
+    def test_flops_model_tracks_head_dim(self):
+        from kempnerforge.metrics.mfu import estimate_model_flops_per_token
+
+        coupled = _decoupled_config(head_dim_override=8)  # == dim // n_heads
+        wide = _decoupled_config(head_dim_override=16)
+        wide_flops = estimate_model_flops_per_token(wide, 32)
+        assert wide_flops > estimate_model_flops_per_token(coupled, 32)
+
+    def test_state_dict_is_free_of_dim_shaped_attention_weights(self):
+        """Guards against a reshape or projection that assumed
+        n_heads * head_dim == dim."""
+        cfg = _decoupled_config()
+        sd = Transformer(cfg).state_dict()
+        assert sd["layers.0.attention.q_proj.weight"].shape == (128, 64)
+        assert sd["layers.0.attention.o_proj.weight"].shape == (64, 128)
+
+
+class TestHeadDimDefaultsUnchanged:
+    """The override left at 0 must reproduce today's model exactly."""
+
+    _BASE = dict(dim=64, n_layers=2, n_heads=8, n_kv_heads=8, vocab_size=64, max_seq_len=32)
+
+    def test_zero_override_matches_an_explicit_derived_override(self):
+        torch.manual_seed(0)
+        a = Transformer(ModelConfig(**self._BASE))
+        torch.manual_seed(0)
+        b = Transformer(ModelConfig(**self._BASE, head_dim_override=8))
+        sd_a, sd_b = a.state_dict(), b.state_dict()
+        assert sd_a.keys() == sd_b.keys()
+        for k in sd_a:
+            assert torch.equal(sd_a[k], sd_b[k]), k
+
+    def test_logits_are_bit_identical_at_a_fixed_seed(self):
+        """The same-seed build/forward must be reproducible; the numbers here
+        are the reference clean-main behavior for a coupled config."""
+        cfg = ModelConfig(**self._BASE)
+        torch.manual_seed(1234)
+        model = Transformer(cfg).eval()
+        tokens = torch.arange(8).view(1, 8) % cfg.vocab_size
+        with torch.no_grad():
+            first = model(tokens)
+        torch.manual_seed(1234)
+        again = Transformer(cfg).eval()
+        with torch.no_grad():
+            second = again(tokens)
+        assert torch.equal(first, second)

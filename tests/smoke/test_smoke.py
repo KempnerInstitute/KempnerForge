@@ -213,7 +213,7 @@ def _train_args(config, ckpt_name, extra=None, vocab_size=None):
         "--metrics.enable_tensorboard=false",
         f"--checkpoint.dir={ckpt_dir}",
         "--checkpoint.interval=10",
-        "--checkpoint.keep_last_n=1",
+        "--checkpoint.keep_last_n=2",
     ]
     if vocab_size is not None:
         args.append(f"--model.vocab_size={vocab_size}")
