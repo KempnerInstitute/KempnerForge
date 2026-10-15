@@ -9,6 +9,16 @@ import torch.nn as nn
 from kempnerforge.config.schema import ModelConfig
 from kempnerforge.model.moe import MoEMLP
 from kempnerforge.model.mot import MoTAttention, MoTBlock
+from kempnerforge.model.norm import RMSNorm
+from kempnerforge.model.router import SigmoidTopKRouter
+
+# Modules holding construction-time state that ``to_empty`` discards and the
+# parameter loop below cannot reach: one-dimensional parameters and buffers.
+# Only these are reset, and only through deterministic fills. A blanket
+# ``reset_parameters()`` over every module would let ``nn.Linear`` overwrite the
+# initialisation below with its own, and would consume RNG, which can leave
+# replicas disagreeing across ranks.
+_RESETS_OWN_STATE = (RMSNorm, nn.LayerNorm, SigmoidTopKRouter)
 
 
 def init_weights(model: nn.Module, config: ModelConfig) -> None:
@@ -21,10 +31,17 @@ def init_weights(model: nn.Module, config: ModelConfig) -> None:
     - Residual output projections (o_proj, down_proj): scaled by 1/sqrt(2 * n_layers)
     - Cross-attention block residuals: zero-initialized (identity-at-init warm-start)
     - MoT per-modality residual projections: zero-initialized (identity-at-construction)
-    - Norm layers: weight=1 (already default)
+    - Norm layers and the sigmoid router's own state: reset to their
+      construction-time values, which a meta-device build does not preserve
     """
     std = config.init_std
     residual_scale = 1.0 / math.sqrt(2.0 * config.n_layers)
+
+    for module in model.modules():
+        if isinstance(module, _RESETS_OWN_STATE) and not any(
+            t.is_meta for t in (*module.parameters(recurse=False), *module.buffers(recurse=False))
+        ):
+            module.reset_parameters()
 
     for name, param in model.named_parameters():
         if param.is_meta:
