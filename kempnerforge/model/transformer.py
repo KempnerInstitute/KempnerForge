@@ -334,6 +334,7 @@ class Transformer(nn.Module):
         modality: ModalityContext | None = None,
         kv_caches: list[KVCache] | None = None,
         doc_ids: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Forward pass.
 
@@ -360,6 +361,17 @@ class Transformer(nn.Module):
             doc_ids: Optional per-token document IDs for packed sequences,
                 shape ``(batch, seq_len)``. Enables block-diagonal causal
                 attention that isolates documents within packed sequences.
+            position_ids: Optional explicit per-token RoPE positions, shape
+                ``(batch, seq_len)`` matching the residual reaching attention
+                (including any ``modality.prefix_embeds``), dtype int64,
+                values in ``[0, model.max_seq_len)``. Rows may differ, so
+                positions can e.g. restart at zero at each document of a
+                packed sequence. ``None`` (default) assigns contiguous
+                positions starting at the KV-cache fill level, exactly as
+                before. Cannot be combined with ``kv_caches`` (cached
+                generation derives positions from the cache fill level);
+                unsupported for MoT, which derives per-modality positions
+                internally.
 
         Returns:
             Logits tensor of shape ``(batch, out_seq_len, vocab_size)``
@@ -402,6 +414,48 @@ class Transformer(nn.Module):
                 raise ValueError(
                     "modality.modality_ids is training-only; cannot be combined with kv_caches"
                 )
+        # position_ids is fully validated here, before any compute.
+        if position_ids is not None:
+            if kv_caches is not None:
+                raise ValueError(
+                    "position_ids cannot be combined with kv_caches; cached generation "
+                    "derives positions from the cache fill level"
+                )
+            if self._mot_modalities:
+                raise ValueError(
+                    "position_ids is not supported for MoT models, which derive "
+                    "per-modality positions internally"
+                )
+            if position_ids.dtype != torch.int64:
+                raise ValueError(
+                    f"position_ids.dtype must be torch.int64, got {position_ids.dtype}"
+                )
+            if position_ids.ndim != 2:
+                raise ValueError(
+                    f"position_ids must have shape (batch, seq_len), got {position_ids.ndim} dims"
+                )
+            # The residual reaching attention is any prefix_embeds followed by the text.
+            text = tokens if tokens is not None else inputs_embeds
+            assert text is not None  # narrowed by the XOR check above
+            batch, text_len = text.shape[:2]
+            n_prefix = prefix_embeds.shape[1] if prefix_embeds is not None else 0
+            residual_shape = (batch, n_prefix + text_len)
+            if tuple(position_ids.shape) != residual_shape:
+                raise ValueError(
+                    f"position_ids shape {tuple(position_ids.shape)} does not match the "
+                    f"residual shape {residual_shape} reaching attention"
+                )
+            if self._rope_cos is None:
+                raise ValueError(
+                    "RoPE tables not initialized; call init_weights_and_freqs() after to_empty()"
+                )
+            n_positions = self._rope_cos.shape[0]
+            if bool((position_ids < 0).any()) or bool((position_ids >= n_positions).any()):
+                raise ValueError(
+                    f"position_ids must be in [0, {n_positions}) (the precomputed RoPE "
+                    f"table range, model.max_seq_len); got min {int(position_ids.min())}, "
+                    f"max {int(position_ids.max())}"
+                )
         # modality_ids dtype/shape checks. Shape against the residual seq_len
         # is checked downstream (when the residual is built); dtype is
         # checked here so the error fires before any compute.
@@ -432,8 +486,15 @@ class Transformer(nn.Module):
         if self._rope_cos.device != h.device:  # type: ignore[reportOptionalMemberAccess]
             self._rope_cos = self._rope_cos.to(h.device)  # type: ignore[reportOptionalMemberAccess]
             self._rope_sin = self._rope_sin.to(h.device)  # type: ignore[reportOptionalMemberAccess]
-        cos = self._rope_cos[start_pos : start_pos + seq_len]  # type: ignore[reportOptionalSubscript]
-        sin = self._rope_sin[start_pos : start_pos + seq_len]  # type: ignore[reportOptionalSubscript]
+        if position_ids is not None:
+            # Gather per-token frequencies: (batch, seq_len, head_dim // 2).
+            # apply_rope broadcasts the batched form over heads.
+            position_ids = position_ids.to(h.device)
+            cos = self._rope_cos[position_ids]  # type: ignore[reportOptionalSubscript]
+            sin = self._rope_sin[position_ids]  # type: ignore[reportOptionalSubscript]
+        else:
+            cos = self._rope_cos[start_pos : start_pos + seq_len]  # type: ignore[reportOptionalSubscript]
+            sin = self._rope_sin[start_pos : start_pos + seq_len]  # type: ignore[reportOptionalSubscript]
 
         # Packed sequences under attention_backend="flex": build the sparse
         # block-diagonal causal mask once here and share it across every layer,
