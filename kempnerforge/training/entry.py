@@ -236,7 +236,8 @@ def restore_checkpoint(
         probe_step = ckpt_mgr.peek_saved_step(str(resume_path) if resume_path else None) or 0
         vlm_freeze_expected = freeze_meta_at_step(probe_step, vlm_cfg)
 
-    # A resume always restores full state; the exclusion applies only to a load_path warm start.
+    # A resume always restores full state, each rank's own loader/RNG state
+    # included; the exclusion applies only to a load_path warm start.
     warm_start_exclude = (
         (config.checkpoint.exclude_from_loading or None) if resume_path is None else None
     )
@@ -245,6 +246,7 @@ def restore_checkpoint(
         scheduler=scheduler,
         exclude_keys=warm_start_exclude,
         vlm_freeze_expected=vlm_freeze_expected,
+        exact_resume=resume_path is not None,
     )
     if ckpt_extra_loaded.get("wandb_run_id"):
         config.metrics.wandb_run_id = ckpt_extra_loaded["wandb_run_id"]

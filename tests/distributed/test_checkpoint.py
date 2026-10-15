@@ -564,7 +564,7 @@ class TestPerRankState:
         self._seed_all(7)
         loader2 = _CursorLoader(cursor=-1)
         step, tokens_seen, _ = mgr.load(
-            path=str(Path(shared_tmp_dir) / "step_5"), dataloader=loader2
+            path=str(Path(shared_tmp_dir) / "step_5"), dataloader=loader2, exact_resume=True
         )
         assert step == 5 and tokens_seen == 320
         assert loader2.restored == {"cursor": 100 + rank}, (
@@ -586,7 +586,9 @@ class TestPerRankState:
         loader2.cursor = 200 + rank
         mgr.save(step=6, tokens_seen=384, dataloader=loader2)
         loader3 = _CursorLoader(cursor=-1)
-        step, _, _ = mgr.load(path=str(Path(shared_tmp_dir) / "step_6"), dataloader=loader3)
+        step, _, _ = mgr.load(
+            path=str(Path(shared_tmp_dir) / "step_6"), dataloader=loader3, exact_resume=True
+        )
         assert step == 6
         assert loader3.restored == {"cursor": 200 + rank}
         dist.barrier()
@@ -594,8 +596,10 @@ class TestPerRankState:
     def test_layout_change_refused_or_discarded_on_every_rank(
         self, distributed_env, shared_tmp_dir
     ):
-        """Same world size, another data-parallel layout: all ranks refuse, or
-        with the override all ranks discard; never a per-rank mix."""
+        """Same world size, another data-parallel layout: an exact resume refuses
+        on all ranks, or with the override discards on all ranks, never a
+        per-rank mix; a load that is not a resume restores rank 0's single
+        copy on every rank, as before."""
         from kempnerforge.config.schema import OptimizerConfig
 
         rank = dist.get_rank()
@@ -622,11 +626,13 @@ class TestPerRankState:
         CheckpointManager(cfg, model, opt, dp_info=saved_dp).save(
             step=5, tokens_seen=320, dataloader=_CursorLoader(cursor=100 + rank)
         )
+        saved_draws: list = [None] * world
+        dist.all_gather_object(saved_draws, self._draw())
 
         loader = _CursorLoader(cursor=-1)
         refusing = CheckpointManager(cfg, model, opt, dp_info=current_dp)
         with pytest.raises(ValueError, match="data-parallel layout"):
-            refusing.load(path=path, dataloader=loader)
+            refusing.load(path=path, dataloader=loader, exact_resume=True)
         assert loader.restored is None
 
         lenient = CheckpointConfig(
@@ -636,8 +642,17 @@ class TestPerRankState:
         self._seed_all(7)
         fresh = self._draw()
         self._seed_all(7)
-        step, tokens_seen, _ = mgr.load(path=path, dataloader=loader)
+        step, tokens_seen, _ = mgr.load(path=path, dataloader=loader, exact_resume=True)
         assert (step, tokens_seen) == (5, 320)
         assert loader.restored is None, f"rank {rank} restored a cursor across a layout change"
         assert self._draw() == fresh, f"rank {rank} restored RNG across a layout change"
+
+        # Evaluation or a load_path warm start: no resume context.
+        plain_loader = _CursorLoader(cursor=-1)
+        plain = CheckpointManager(cfg, model, opt, dp_info=current_dp)
+        self._seed_all(7)
+        step, _, _ = plain.load(path=path, dataloader=plain_loader, exclude_keys=["optimizer"])
+        assert step == 5
+        assert plain_loader.restored == {"cursor": 100}, f"rank {rank} did not get rank 0's cursor"
+        assert self._draw() == saved_draws[0], f"rank {rank} did not restore rank 0's RNG"
         dist.barrier()

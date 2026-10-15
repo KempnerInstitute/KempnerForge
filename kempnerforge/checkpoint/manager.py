@@ -6,8 +6,10 @@ which supports automatic resharding (save with N GPUs, load with M GPUs).
 Non-distributed state (scheduler, dataloader, training meta, RNG) is saved
 separately as a torch file written by rank 0 and broadcast from rank 0 on
 load. Dataloader and RNG state are per-rank: every rank's payload is gathered
-into a versioned envelope at save time, and each rank restores its own entry
-from the broadcast on load (see ``kempnerforge.checkpoint.state``).
+into a versioned envelope at save time, and on an exact resume
+(``load(exact_resume=True)``) each rank restores its own entry from the
+broadcast (see ``kempnerforge.checkpoint.state``). Any other load restores
+rank 0's single copy on every rank.
 """
 
 from __future__ import annotations
@@ -388,17 +390,18 @@ class CheckpointManager:
         return coords if all(dp is not None for dp in coords.values()) else None
 
     def _per_rank_view(self, train_state: dict[str, Any]) -> dict[str, Any]:
-        """This rank's view of the broadcast train state.
+        """This rank's view of the broadcast train state on an exact resume.
 
         A checkpoint with a per-rank envelope: the view replaces the legacy
         single-copy ``rng``/``dataloader`` keys (always rank 0's) with this
-        rank's own entry, selected by global rank. A topology or schema
-        mismatch refuses the load unless ``checkpoint.ignore_rank_state_mismatch``
-        downgrades it to a warning that discards the saved loader/RNG state.
-        The envelope check reads only state every rank shares, so all ranks
-        restore, refuse, or discard together. A legacy checkpoint (no
-        envelope) keeps its old behavior: rank 0's single copy restores on
-        every rank.
+        rank's own entry, selected by global rank. With an envelope it gathers
+        the current data-parallel layout (a collective), so every rank must
+        call it. A topology or schema mismatch refuses the load unless
+        ``checkpoint.ignore_rank_state_mismatch`` downgrades it to a warning
+        that discards the saved loader/RNG state. The envelope check reads
+        only state every rank shares, so all ranks restore, refuse, or discard
+        together. A legacy checkpoint (no envelope) keeps its old behavior:
+        rank 0's single copy restores on every rank.
         """
         envelope = train_state.get(PER_RANK_KEY)
         if envelope is None:
@@ -594,6 +597,7 @@ class CheckpointManager:
         dataloader: Any | None = None,
         exclude_keys: list[str] | None = None,
         vlm_freeze_expected: list[dict[str, Any]] | None = None,
+        exact_resume: bool = False,
     ) -> tuple[int, int, dict[str, Any]]:
         """Load a checkpoint and restore all state.
 
@@ -609,6 +613,14 @@ class CheckpointManager:
                 a mismatch raises ``ValueError`` unless the checkpoint
                 config has ``ignore_freeze_mismatch=True``, in which case
                 the load proceeds with a warning.
+            exact_resume: True only when the run resumes from its own
+                checkpoint (auto-resume). Each rank then restores its own
+                dataloader/RNG state from the per-rank envelope, which must
+                match this run's world size and data-parallel layout. Every
+                rank must pass the same value. False (a ``load_path`` warm
+                start, evaluation, any other load) restores the single-copy
+                ``rng``/``dataloader`` keys (rank 0's) on every rank with no
+                topology check.
 
         Returns:
             Tuple of (step, tokens_seen, extra) where extra contains any
@@ -764,8 +776,8 @@ class CheckpointManager:
                 train_state = object_list[0]
 
             assert train_state is not None, "train_state broadcast failed"
-            # Every rank gets its own loader/RNG view of the broadcast state.
-            train_state = self._per_rank_view(train_state)
+            if exact_resume:
+                train_state = self._per_rank_view(train_state)
             # Stash dataloader state if the caller can't yet provide the loader
             # object. Training loops construct the dataloader after load() so
             # apply_dataloader_state() can restore it once it exists.

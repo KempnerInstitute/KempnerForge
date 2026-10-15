@@ -149,7 +149,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Resume restores each rank's own dataloader/RNG state**: `train_state.pt` held only rank 0's copy and the load broadcast it to every rank; a versioned per-rank envelope (`per_rank`, schema v1) now records every rank's payload and data-parallel coordinates, is validated as a whole against the saved world size and data-parallel layout so every rank takes the same decision (`checkpoint.ignore_rank_state_mismatch` opts out), and legacy checkpoints keep loading unchanged.
+- **Resume restores each rank's own dataloader/RNG state**: `train_state.pt` held only rank 0's copy and the load broadcast it to every rank; a versioned per-rank envelope (`per_rank`, schema v1) now records every rank's payload and data-parallel coordinates, and an auto-resume of the run's own checkpoint (`load(exact_resume=True)`) validates it as a whole against the saved world size and data-parallel layout so every rank takes the same decision (`checkpoint.ignore_rank_state_mismatch` opts out); `load_path` warm starts, `scripts/eval.py` and legacy checkpoints keep loading unchanged.
 - **Resume no longer fails when a trainable parameter never received a gradient**: a checkpoint records which parameters its optimizer held without state and the load restores exactly those without it; state missing for any other parameter still fails the load.
 - **The query/key norms, the cross-attention block norms and the adapter pre-norm use `model.norm_eps`**: they used a fixed 1e-5; the default `norm_eps = 1e-5` is unchanged.
 - `ci-example.yml` now also runs the VLM example's config tests in `examples/vlm/tests`, which no workflow ran.

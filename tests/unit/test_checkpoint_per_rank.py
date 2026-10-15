@@ -28,6 +28,7 @@ from kempnerforge.checkpoint.state import (
     get_rng_state,
     restore_train_state,
     select_rank_state,
+    set_rng_state,
 )
 from kempnerforge.config.schema import AsyncCheckpointMode, CheckpointConfig
 
@@ -104,17 +105,29 @@ def _install_fake_world(
 
 
 def _save_four_rank_ckpt(tmp_path, monkeypatch, payloads, step: int, layout=None) -> list:
-    """Write a real ``step_N`` checkpoint whose envelope holds the payloads."""
+    """Write a real ``step_N`` checkpoint whose envelope holds the payloads.
+
+    The saving process is rank 0: its live RNG streams and loader are rank 0's,
+    so the single-copy ``rng``/``dataloader`` keys hold ``payloads[0]``.
+    """
     events: list = []
+
+    class Rank0Loader:
+        def state_dict(self):
+            return dict(payloads[0]["dataloader"])
+
     with monkeypatch.context() as m:
         _install_fake_world(m, payloads, events, layout=layout)
         mgr = _mock_mgr(tmp_path, m, dp_info=layout[0] if layout is not None else None)
-        mgr.save(step=step, tokens_seen=step * 64)
+        set_rng_state(payloads[0]["rng"])
+        mgr.save(step=step, tokens_seen=step * 64, dataloader=Rank0Loader())
     return events
 
 
-def _install_fake_load_world(m, rank: int, layout: dict | None, ckpt_dir: Path, gathers: list):
-    """Simulate global rank ``rank`` of a WORLD-rank job during ``load()``.
+def _install_fake_load_world(
+    m, rank: int, layout: dict | None, ckpt_dir: Path, gathers: list, world: int = WORLD
+):
+    """Simulate global rank ``rank`` of a ``world``-rank job during ``load()``.
 
     Broadcasts deliver rank 0's values (the file-existence flag, then the
     train state rank 0 reads). The gather delivers every rank's current
@@ -123,7 +136,7 @@ def _install_fake_load_world(m, rank: int, layout: dict | None, ckpt_dir: Path, 
     """
     m.setattr(mgr_mod.dist, "is_initialized", lambda: True)
     m.setattr(mgr_mod.dist, "get_rank", lambda: rank)
-    m.setattr(mgr_mod.dist, "get_world_size", lambda: WORLD)
+    m.setattr(mgr_mod.dist, "get_world_size", lambda: world)
     m.setattr(mgr_mod.dist, "new_group", lambda backend=None: "GLOO_PG")
     ts_path = ckpt_dir / "train_state.pt"
 
@@ -135,7 +148,7 @@ def _install_fake_load_world(m, rank: int, layout: dict | None, ckpt_dir: Path, 
 
     def fake_all_gather(obj_list, obj, group=None):
         gathers.append((obj, group))
-        for r in range(WORLD):
+        for r in range(world):
             obj_list[r] = (r, layout[r] if layout is not None else None)
 
     m.setattr(mgr_mod.dist, "broadcast_object_list", fake_broadcast)
@@ -143,7 +156,7 @@ def _install_fake_load_world(m, rank: int, layout: dict | None, ckpt_dir: Path, 
 
 
 def _load_in_layout(tmp_path, monkeypatch, rank: int, step: int, layout: dict | None, **cfg):
-    """Load as global rank ``rank`` of a WORLD-rank job with the given current
+    """Resume as global rank ``rank`` of a WORLD-rank job with the given current
     data-parallel layout. Seeds every generator with 555 right before the load,
     so a discarded state leaves seed 555's streams in place."""
     gathers: list = []
@@ -152,16 +165,16 @@ def _load_in_layout(tmp_path, monkeypatch, rank: int, step: int, layout: dict | 
         _install_fake_load_world(m, rank, layout, ckpt_dir, gathers)
         mgr = _mock_mgr(tmp_path, m, dp_info=layout[rank] if layout is not None else None, **cfg)
         _seed_all(555)
-        result = mgr.load(path=str(ckpt_dir))
+        result = mgr.load(path=str(ckpt_dir), exact_resume=True)
     return mgr, result, gathers
 
 
 def _load_as_rank(tmp_path, monkeypatch, rank: int, step: int, world_size: int = WORLD, **cfg):
-    """Load a checkpoint as a simulated rank of a ``world_size`` job."""
+    """Resume from a checkpoint as a simulated rank of a ``world_size`` job."""
     mgr = _mock_mgr(tmp_path, monkeypatch, **cfg)
     mgr._rank = rank
     mgr._world_size = world_size
-    result = mgr.load(path=str(Path(tmp_path) / f"step_{step}"))
+    result = mgr.load(path=str(Path(tmp_path) / f"step_{step}"), exact_resume=True)
     return mgr, result
 
 
@@ -359,6 +372,32 @@ class TestEnvelopeValidatedBeforeSelection:
         for r in range(WORLD):
             assert set(select_rank_state(env, rank=r, world_size=WORLD)) == {"rng"}
 
+    @staticmethod
+    def _cuda_envelope(without_cuda: list[int]) -> dict:
+        """Every entry carries a 'torch_cuda' capture except ranks ``without_cuda``."""
+        payloads, _ = _mk_payloads(seed_base=10, cursor_base=100)
+        for r, p in payloads.items():
+            p["rng"].pop("torch_cuda", None)
+            if r not in without_cuda:
+                p["rng"]["torch_cuda"] = torch.zeros(16, dtype=torch.uint8)
+        return {"version": 1, "world_size": WORLD, "data_parallel": None, "ranks": payloads}
+
+    @pytest.mark.parametrize("without_cuda", [[], list(range(WORLD))], ids=["all", "none"])
+    def test_torch_cuda_on_all_or_no_ranks_is_complete(self, without_cuda):
+        env = self._cuda_envelope(without_cuda)
+        for r in range(WORLD):
+            assert select_rank_state(env, rank=r, world_size=WORLD) is env["ranks"][r]
+
+    def test_torch_cuda_on_some_ranks_refused_on_every_rank(self):
+        """A rank without the CUDA capture would resume with fresh CUDA streams."""
+        env = self._cuda_envelope(without_cuda=[1])
+        reasons = []
+        for r in range(WORLD):
+            with pytest.raises(ValueError, match=r"'torch_cuda' missing on ranks \[1\]") as exc:
+                select_rank_state(env, rank=r, world_size=WORLD)
+            reasons.append(str(exc.value))
+        assert len(set(reasons)) == 1, f"ranks disagree: {reasons}"
+
     @pytest.mark.parametrize(
         ("defect", "reason"),
         [
@@ -386,7 +425,7 @@ class TestEnvelopeValidatedBeforeSelection:
             _seed_all(555)
             ref = _draw()
             _seed_all(555)
-            step, tokens, _ = mgr.load(path=str(Path(tmp_path) / "step_7"))
+            step, tokens, _ = mgr.load(path=str(Path(tmp_path) / "step_7"), exact_resume=True)
             assert (step, tokens) == (7, 448)
             assert mgr._pending_dataloader_state is None, f"rank {r} restored a loader cursor"
             assert _draw() == ref, f"rank {r} restored RNG from a defective envelope"
@@ -560,7 +599,7 @@ class TestLegacyAndTopology:
         _seed_all(555)
         ref = _draw()  # where seed 555's streams go when nothing restores RNG
         _seed_all(555)
-        step, tokens, _ = mgr.load(path=str(Path(tmp_path) / "step_7"))
+        step, tokens, _ = mgr.load(path=str(Path(tmp_path) / "step_7"), exact_resume=True)
         assert (step, tokens) == (7, 448)
         assert mgr._pending_dataloader_state is None
         assert _draw() == ref, "RNG must stay untouched when per-rank state is discarded"
@@ -731,6 +770,74 @@ class TestDataParallelLayout:
 
 
 # ---------------------------------------------------------------------------
+# Loads that are not an exact resume keep the single-copy behavior
+# ---------------------------------------------------------------------------
+
+
+class TestLoadsThatAreNotAResume:
+    """Only an exact resume restores per-rank state. Any other load restores
+    the single-copy keys (rank 0's) on every rank, with no topology check and
+    no extra collective, exactly as before the envelope existed."""
+
+    @pytest.mark.parametrize(
+        "world", [2, WORLD], ids=["world_size_change", "same_size_layout_change"]
+    )
+    def test_eval_style_load(self, tmp_path, monkeypatch, world):
+        """Weights-only load by a manager built without dp_info and called
+        without a resume context, as scripts/eval.py does. It cannot see the
+        new run's layout, so a same-size layout change is just the same size."""
+        payloads, expected = _mk_payloads(seed_base=1000, cursor_base=100)
+        _save_four_rank_ckpt(tmp_path, monkeypatch, payloads, step=7, layout=DP4)
+        ckpt_dir = tmp_path / "step_7"
+        gathers: list = []
+        for r in range(world):
+            with monkeypatch.context() as m:
+                _install_fake_load_world(m, r, None, ckpt_dir, gathers, world=world)
+                mgr = _mock_mgr(tmp_path, m)
+                _seed_all(555)
+                step, tokens, _ = mgr.load(path=str(ckpt_dir), exclude_keys=["optimizer"])
+            assert (step, tokens) == (7, 448)
+            assert mgr._pending_dataloader_state == {"cursor": 100, "prefetch_depth": 1}
+            assert _draw() == expected[0], f"rank {r} did not restore rank 0's copy"
+        assert gathers == []
+
+    @pytest.mark.parametrize(
+        ("world", "layout"),
+        [(2, {0: (0, 2), 1: (1, 2)}), (WORLD, DP2_TP2)],
+        ids=["world_size_change", "same_size_layout_change"],
+    )
+    def test_load_path_warm_start(self, tmp_path, monkeypatch, world, layout):
+        """Weights-only warm start through the training entry, by a manager that
+        records its layout as build_checkpoint_manager does."""
+        from kempnerforge.config.job import JobConfig
+        from kempnerforge.training.entry import restore_checkpoint
+
+        payloads, expected = _mk_payloads(seed_base=1000, cursor_base=100)
+        _save_four_rank_ckpt(tmp_path, monkeypatch, payloads, step=7, layout=DP4)
+        ckpt_dir = tmp_path / "step_7"
+        gathers: list = []
+        for r in range(world):
+            config = JobConfig(
+                checkpoint=CheckpointConfig(
+                    dir=str(tmp_path / "new_run"),
+                    load_path=str(ckpt_dir),
+                    exclude_from_loading=["optimizer"],
+                )
+            )
+            with monkeypatch.context() as m:
+                _install_fake_load_world(m, r, layout, ckpt_dir, gathers, world=world)
+                m.setattr("kempnerforge.checkpoint.manager.dcp.load", MagicMock())
+                model = torch.nn.Linear(4, 4)
+                opt = torch.optim.SGD(model.parameters(), lr=0.1)
+                mgr = CheckpointManager(config.checkpoint, model, opt, dp_info=layout[r])
+                _seed_all(555)
+                assert restore_checkpoint(config, model, None, mgr) == (7, 448)
+            assert mgr._pending_dataloader_state == {"cursor": 100, "prefetch_depth": 1}
+            assert _draw() == expected[0], f"rank {r} did not restore rank 0's copy"
+        assert gathers == []
+
+
+# ---------------------------------------------------------------------------
 # Mid-save interruption: durability ordering with the envelope present
 # ---------------------------------------------------------------------------
 
@@ -798,7 +905,7 @@ class TestMidSaveInterruption:
         # Fresh process: auto-resume lands on step_10 and restores ITS state.
         mgr2 = _mock_mgr(tmp_path, monkeypatch)
         _seed_all(555)
-        step, tokens, _ = mgr2.load()
+        step, tokens, _ = mgr2.load(exact_resume=True)
         assert (step, tokens) == (10, 640)
         assert mgr2._pending_dataloader_state == {"cursor": 10}
         assert _draw() == expected

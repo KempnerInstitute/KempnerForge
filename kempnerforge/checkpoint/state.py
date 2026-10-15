@@ -32,7 +32,8 @@ PER_RANK_KEY = "per_rank"
 PER_RANK_VERSION = 1
 
 # Streams get_rng_state() always captures; a per-rank entry missing one would
-# silently resume that rank with a fresh stream.
+# silently resume that rank with a fresh stream. "torch_cuda" is captured only
+# where CUDA is available, so every rank must carry the same set of streams.
 _RNG_STREAMS = ("python", "numpy", "torch_cpu")
 
 _MISMATCH_HINT = (
@@ -208,6 +209,17 @@ def _check_envelope(
             raise ValueError(
                 f"per-rank state envelope entry for rank {r} has a non-dict 'dataloader' state"
             )
+    rng_keys = [set(ranks[r]["rng"]) for r in range(world_size)]
+    shared = rng_keys[0].intersection(*rng_keys[1:])
+    gaps = []
+    for k in sorted(rng_keys[0].union(*rng_keys[1:]) - shared, key=repr):
+        lacking = [r for r in range(world_size) if k not in rng_keys[r]]
+        gaps.append(f"{k!r} missing on ranks {_ranks_text(lacking)}")
+    if gaps:
+        raise ValueError(
+            f"per-rank state envelope 'rng' captures differ across ranks: {'; '.join(gaps)}. "
+            f"Every rank must capture the same RNG streams"
+        )
     without_loader = [r for r in range(world_size) if "dataloader" not in ranks[r]]
     if without_loader and len(without_loader) < world_size:
         raise ValueError(
@@ -327,10 +339,11 @@ def restore_train_state(
         scheduler: LR scheduler to restore.
         dataloader: Stateful dataloader to restore.
 
-    Restores whatever ``rng``/``dataloader`` keys ``state`` carries. In
-    distributed runs the manager hands each rank its own view of the broadcast
+    Restores whatever ``rng``/``dataloader`` keys ``state`` carries. On an
+    exact resume the manager hands each rank its own view of the broadcast
     train state (its per-rank envelope entry overlaid on these keys) before
-    calling this.
+    calling this; any other load passes the broadcast state as is, so rank 0's
+    single copy restores on every rank.
 
     Returns:
         Tuple of (step, tokens_seen, extra) where extra contains any
