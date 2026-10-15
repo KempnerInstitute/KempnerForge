@@ -5,6 +5,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+import kempnerforge.training.optimizer as optimizer_module
 from kempnerforge.config.schema import OptimizerConfig
 from kempnerforge.training.optimizer import Muon, _is_muon_eligible, _newton_schulz, build_optimizer
 
@@ -40,6 +41,19 @@ class TestNewtonSchulz:
 
 
 class TestMuon:
+    def test_update_scale_uses_the_full_matrix_shape(self, monkeypatch):
+        """A row shard is scaled by the full matrix's shape, not its own."""
+        torch.manual_seed(0)
+        weight = nn.Parameter(torch.zeros(8, 4))
+        weight.grad = torch.randn(8, 4)
+        optimizer = Muon([{"params": [weight]}], [{"params": []}], lr=1.0, momentum=0.5)
+        shard = slice(0, 4)
+        monkeypatch.setattr(optimizer_module, "_get_local_tensor", lambda t: t[shard])
+        optimizer.step()
+        expected = -(2**0.5) * _newton_schulz(weight.grad[shard].float(), steps=5)
+        torch.testing.assert_close(weight.data[shard], expected)
+        assert torch.equal(weight.data[4:], torch.zeros(4, 4))
+
     def _make_model(self):
         return nn.Sequential(
             nn.Linear(32, 64),

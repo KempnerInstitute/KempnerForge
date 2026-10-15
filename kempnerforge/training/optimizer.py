@@ -16,6 +16,7 @@ All optimizers:
 from __future__ import annotations
 
 import logging
+import math
 
 import torch
 
@@ -480,7 +481,7 @@ class Muon(torch.optim.Optimizer):
                     update = update.view(original_shape)
 
                 # Scale: NS produces unit-norm rows, scale by sqrt(m/n)
-                m, n = buf_2d.shape
+                m, n = p.shape[0], math.prod(p.shape[1:])
                 update.mul_(max(1, m / n) ** 0.5)
 
                 # Decoupled weight decay
