@@ -44,12 +44,25 @@ _METADATA_FILE = "metadata.json"
 _DCP_METADATA_FILE = ".metadata"
 # Key prefix of per-parameter optimizer state in a checkpoint saved by this manager.
 _OPTIM_STATE_PREFIX = "optimizer.state."
+_OPTIM_PARAM_GROUPS_PREFIX = "optimizer.param_groups."
 # Top-level entry naming the parameters the optimizer held without state at save
 # time. It sits beside the optimizer rather than inside it, so it changes neither
 # the optimizer's own layout nor what an older reader, which ignores it, loads.
 _NEVER_STEPPED_KEY = "optimizer_never_stepped"
 _NEVER_STEPPED_PREFIX = f"{_NEVER_STEPPED_KEY}."
 _OPTIM_PREFIX = "optimizer."
+
+
+def _saved_optimizer_param_groups(dcp_dir: Path) -> int:
+    """Count the optimizer param groups in the DCP checkpoint at ``dcp_dir``."""
+    metadata = dcp.FileSystemReader(str(dcp_dir)).read_metadata()
+    return len(
+        {
+            key.removeprefix(_OPTIM_PARAM_GROUPS_PREFIX).split(".", 1)[0]
+            for key in metadata.state_dict_metadata
+            if key.startswith(_OPTIM_PARAM_GROUPS_PREFIX)
+        }
+    )
 
 
 def _intersect_freeze_meta_by_module(
@@ -257,6 +270,10 @@ class CheckpointManager:
         self.config = config
         self.model = model
         self.optimizer = optimizer
+        self.checkpointed_optimizers: list[torch.optim.Optimizer] = [
+            optimizer,
+            *getattr(optimizer, "inner_optimizers", ()),
+        ]
         self.base_dir = Path(config.dir)
         self._rank = dist.get_rank() if dist.is_initialized() else 0
         self._async_ckpt = AsyncCheckpointer(mode=config.async_mode)
@@ -376,7 +393,7 @@ class CheckpointManager:
         # resets to zero -> non-bit-exact resume; see manager load()).
         dcp_state: dict[str, Any] = {"model": get_model_state_dict(self.model)}
         if self.optimizer.state:
-            optim_state = get_optimizer_state_dict(self.model, self.optimizer)
+            optim_state = get_optimizer_state_dict(self.model, self.checkpointed_optimizers)
             dcp_state["optimizer"] = optim_state
             dcp_state[_NEVER_STEPPED_KEY] = _never_stepped_record(optim_state)
         # Dispatch the DCP save. For async modes this returns immediately but
@@ -605,10 +622,11 @@ class CheckpointManager:
         # fresh optimizer, so dcp.load would find no moment tensors to fill and the
         # AdamW momentum would silently reset to zero on resume.
         dcp_state: dict[str, Any] = {}
+        optimizers = self._optimizers_saved_in(dcp_dir) if load_optim else []
         if load_model:
             dcp_state["model"] = get_model_state_dict(self.model)
         if load_optim:
-            dcp_state["optimizer"] = get_optimizer_state_dict(self.model, self.optimizer)
+            dcp_state["optimizer"] = get_optimizer_state_dict(self.model, optimizers)
 
         fresh_optimizer = False
         if dcp_state:
@@ -630,7 +648,7 @@ class CheckpointManager:
                 set_model_state_dict(self.model, dcp_state["model"])
             if load_optim:
                 set_optimizer_state_dict(
-                    self.model, self.optimizer, optim_state_dict=dcp_state["optimizer"]
+                    self.model, optimizers, optim_state_dict=dcp_state["optimizer"]
                 )
             if planner.never_stepped:
                 logger.info(
@@ -784,6 +802,21 @@ class CheckpointManager:
             )
             return fallback
         return resolved
+
+    def _optimizers_saved_in(self, dcp_dir: Path) -> list[torch.optim.Optimizer]:
+        """Return the optimizers saved in ``dcp_dir``; warn if the inner ones are missing."""
+        inner = self.checkpointed_optimizers[1:]
+        if not inner or _saved_optimizer_param_groups(dcp_dir) != len(self.optimizer.param_groups):
+            return self.checkpointed_optimizers
+        name = type(self.optimizer).__name__
+        n_params = sum(p.numel() for opt in inner for g in opt.param_groups for p in g["params"])
+        logger.warning(
+            f"{dcp_dir} holds only {name}'s own optimizer state: it was saved before "
+            f"{name}'s inner optimizer was checkpointed. Resuming {name}'s state alone; the "
+            f"{n_params:,} parameters its inner optimizer updates start from fresh moments, "
+            f"so this resume is not bit-exact. Checkpoints saved from now on include them."
+        )
+        return self.checkpointed_optimizers[:1]
 
     def _cleanup(self) -> None:
         """Remove old checkpoints beyond the retention limit.

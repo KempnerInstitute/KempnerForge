@@ -1600,6 +1600,143 @@ class TestResumeWithUnsteppedParameters:
         self._assert_same_run(model, optimizer, model3, optimizer3)
 
 
+class TestMuonResume:
+    """Muon is checkpointed together with its inner AdamW."""
+
+    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    MODEL_CONFIG = ModelConfig(dim=64, n_layers=2, n_heads=2, vocab_size=4096, max_seq_len=64)
+
+    def _build(self, seed):
+        torch.manual_seed(seed)
+        model = Transformer(self.MODEL_CONFIG).to(self.DEVICE)
+        return model, build_optimizer(model, OptimizerConfig(name="muon", lr=1e-3, fused=False))
+
+    def _batches(self, n):
+        g = torch.Generator().manual_seed(123)
+        vocab = self.MODEL_CONFIG.vocab_size
+        return [torch.randint(0, vocab, (2, 32), generator=g).to(self.DEVICE) for _ in range(n)]
+
+    @staticmethod
+    def _train(model, opt, batches):
+        for tokens in batches:
+            logits = model(tokens)
+            torch.nn.functional.cross_entropy(logits.flatten(0, 1), tokens.flatten()).backward()
+            opt.step()
+            opt.zero_grad()
+
+    @staticmethod
+    def _state(opt):
+        """(name, tensor) for every state entry of ``opt``, in param order."""
+        return [
+            (name, value.clone())
+            for group in opt.param_groups
+            for p in group["params"]
+            for name, value in sorted(opt.state.get(p, {}).items())
+        ]
+
+    def _assert_same_state(self, opt, opt2, what):
+        saved, loaded = self._state(opt), self._state(opt2)
+        assert saved, f"fixture: {what} has no state to compare"
+        assert [n for n, _ in loaded] == [n for n, _ in saved], f"{what} state not restored"
+        for (name, s), (_, t) in zip(saved, loaded, strict=True):
+            assert torch.equal(s, t), f"{what} {name} not restored bit-exactly"
+
+    def test_checkpointed_optimizers_put_muon_first(self, tmp_path):
+        """Muon comes before its inner AdamW; an optimizer without inner ones is alone."""
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        model, opt = self._build(seed=0)
+        manager = CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model, opt)
+        assert manager.checkpointed_optimizers == [opt, opt._adam]
+
+        adamw = build_optimizer(model, OptimizerConfig(lr=1e-3, fused=False))
+        manager = CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model, adamw)
+        assert manager.checkpointed_optimizers == [adamw]
+
+    def test_resume_matches_an_uninterrupted_run(self, tmp_path):
+        """A resumed Muon run matches an uninterrupted one."""
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        batches = self._batches(6)
+        ref_model, ref_opt = self._build(seed=0)
+        self._train(ref_model, ref_opt, batches)
+
+        model, opt = self._build(seed=0)
+        inner_shapes = {tuple(p.shape) for g in opt._adam.param_groups for p in g["params"]}
+        assert (4096, 64) in inner_shapes, "fixture: the embedding should be on the inner AdamW"
+        self._train(model, opt, batches[:3])
+        CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model, opt).save(step=3)
+
+        model2, opt2 = self._build(seed=1)
+        CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model2, opt2).load()
+        self._assert_same_state(opt._adam, opt2._adam, "inner AdamW")
+
+        self._train(model2, opt2, batches[3:])
+        for (name, ref), p in zip(ref_model.named_parameters(), model2.parameters(), strict=True):
+            assert torch.equal(ref, p), f"{name} diverged from the uninterrupted run"
+
+    def test_checkpoint_without_inner_state_resumes_muon_and_warns(self, tmp_path):
+        """A checkpoint without the inner AdamW resumes Muon alone and warns."""
+        import logging
+
+        from torch.distributed.checkpoint.state_dict import (
+            get_model_state_dict,
+            get_optimizer_state_dict,
+        )
+
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        model, opt = self._build(seed=0)
+        self._train(model, opt, self._batches(3))
+        step_dir = tmp_path / "step_3"
+        state = {
+            "model": get_model_state_dict(model),
+            "optimizer": get_optimizer_state_dict(model, opt),
+        }
+        dcp.save(state, checkpoint_id=str(step_dir))
+
+        records: list[logging.LogRecord] = []
+
+        class _CaptureHandler(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                records.append(record)
+
+        target = logging.getLogger("kempnerforge.checkpoint.manager")
+        capture = _CaptureHandler(level=logging.WARNING)
+        target.addHandler(capture)
+        model2, opt2 = self._build(seed=1)
+        try:
+            CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model2, opt2).load(
+                path=str(step_dir)
+            )
+        finally:
+            target.removeHandler(capture)
+
+        assert any("holds only Muon's own optimizer state" in r.getMessage() for r in records)
+        self._assert_same_state(opt, opt2, "Muon")
+        assert not opt2._adam.state, "the inner AdamW should start fresh"
+        self._train(model2, opt2, self._batches(1))
+
+    def test_checkpoint_still_loads_into_muon_alone(self, tmp_path):
+        """A reader that passes Muon alone still loads Muon's state."""
+        from torch.distributed.checkpoint.state_dict import (
+            get_optimizer_state_dict,
+            set_optimizer_state_dict,
+        )
+
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        model, opt = self._build(seed=0)
+        self._train(model, opt, self._batches(3))
+        CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model, opt).save(step=3)
+
+        model2, opt2 = self._build(seed=1)
+        state = {"optimizer": get_optimizer_state_dict(model2, opt2)}
+        dcp.load(state, checkpoint_id=str(tmp_path / "step_3"))
+        set_optimizer_state_dict(model2, opt2, optim_state_dict=state["optimizer"])
+        self._assert_same_state(opt, opt2, "Muon")
+
+
 class TestSaveBeforeFirstStep:
     """Saving before the first optimizer step, and loading a checkpoint with no optimizer."""
 
