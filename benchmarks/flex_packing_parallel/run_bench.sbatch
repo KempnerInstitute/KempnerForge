@@ -11,6 +11,10 @@
 #SBATCH --job-name=flexpar
 #SBATCH --account=kempner_dev
 #SBATCH --partition=kempner_requeue
+# Pin the GPU type. A scavenger partition hands out whatever is free, so
+# without this the modes land on different hardware and the table compares
+# nothing. h200 also matches the single-GPU numbers in docs/architecture/model.md.
+#SBATCH --constraint=h200
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gpus-per-node=4
