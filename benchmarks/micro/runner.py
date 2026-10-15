@@ -148,11 +148,15 @@ def main() -> None:
 
     # Import and run each benchmark suite
     from benchmarks.micro.bench_data import run_data_benchmarks
-    from benchmarks.micro.bench_forward import run_forward_benchmarks
+    from benchmarks.micro.bench_forward import (
+        run_forward_benchmarks,
+        run_packed_attention_benchmarks,
+    )
     from benchmarks.micro.bench_moe import run_moe_benchmarks
     from benchmarks.micro.bench_optimizer import run_optimizer_benchmarks
 
     all_results.extend(run_forward_benchmarks())
+    all_results.extend(run_packed_attention_benchmarks())
     all_results.extend(run_moe_benchmarks())
     all_results.extend(run_data_benchmarks())
     all_results.extend(run_optimizer_benchmarks())
