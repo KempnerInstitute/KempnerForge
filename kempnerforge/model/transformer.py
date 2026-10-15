@@ -92,6 +92,7 @@ class TransformerBlock(nn.Module):
         *,
         kv_cache: KVCache | None = None,
         doc_ids: torch.Tensor | None = None,
+        attention_group_ids: torch.Tensor | None = None,
         key_padding_mask: torch.Tensor | None = None,
         block_mask: BlockMask | None = None,
     ) -> torch.Tensor:
@@ -102,6 +103,7 @@ class TransformerBlock(nn.Module):
             rope_sin,
             kv_cache=kv_cache,
             doc_ids=doc_ids,
+            attention_group_ids=attention_group_ids,
             key_padding_mask=key_padding_mask,
             block_mask=block_mask,
         )
@@ -334,6 +336,7 @@ class Transformer(nn.Module):
         modality: ModalityContext | None = None,
         kv_caches: list[KVCache] | None = None,
         doc_ids: torch.Tensor | None = None,
+        attention_group_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Forward pass.
 
@@ -360,6 +363,15 @@ class Transformer(nn.Module):
             doc_ids: Optional per-token document IDs for packed sequences,
                 shape ``(batch, seq_len)``. Enables block-diagonal causal
                 attention that isolates documents within packed sequences.
+            attention_group_ids: Optional per-token visibility group ids over
+                the residual stream, shape ``(batch, seq_len)``, int64;
+                negative means no group. Tokens sharing a nonnegative id see
+                each other bidirectionally (e.g. prefix-LM spans):
+                ``visible(q, k) = same_document AND (k <= q OR
+                same_nonnegative_group)``. Without ``doc_ids`` the row is one
+                document. ``None`` leaves attention unchanged, and all-negative
+                ids give the same visibility as ``None``. Training-only:
+                rejected with ``kv_caches`` and on the MoT/MoMa residual paths.
 
         Returns:
             Logits tensor of shape ``(batch, out_seq_len, vocab_size)``
@@ -409,6 +421,19 @@ class Transformer(nn.Module):
             raise ValueError(
                 f"modality.modality_ids.dtype must be torch.long, got {modality_ids.dtype}"
             )
+        if attention_group_ids is not None:
+            if attention_group_ids.dtype != torch.long:
+                raise ValueError(
+                    f"attention_group_ids.dtype must be torch.long, got {attention_group_ids.dtype}"
+                )
+            if kv_caches is not None:
+                raise ValueError(
+                    "attention_group_ids is training-only; cannot be combined with kv_caches"
+                )
+            if self._moma_modalities or self._mot_modalities:
+                raise ValueError(
+                    "attention_group_ids is not supported on the MoMa/MoT residual paths"
+                )
 
         h = (
             self.token_embedding(tokens)  # type: ignore[reportOptionalCall]
@@ -435,27 +460,39 @@ class Transformer(nn.Module):
         cos = self._rope_cos[start_pos : start_pos + seq_len]  # type: ignore[reportOptionalSubscript]
         sin = self._rope_sin[start_pos : start_pos + seq_len]  # type: ignore[reportOptionalSubscript]
 
+        if attention_group_ids is not None and attention_group_ids.shape != h.shape[:2]:
+            raise ValueError(
+                f"attention_group_ids shape {tuple(attention_group_ids.shape)} does not "
+                f"match the residual shape {tuple(h.shape[:2])}"
+            )
+
         # Packed sequences under attention_backend="flex": build the sparse
-        # block-diagonal causal mask once here and share it across every layer,
-        # rather than the dense (B, 1, S, S) mask each Attention would otherwise
-        # rebuild. key_padding_mask (VLM video) is not folded into the BlockMask,
-        # so those batches stay on the dense SDPA path.
+        # block-diagonal (causal-or-group) mask once here and share it across
+        # every layer, rather than the dense (B, 1, S, S) mask each Attention
+        # would otherwise rebuild. key_padding_mask (VLM video) is not folded
+        # into the BlockMask, so those batches stay on the dense SDPA path.
         block_mask = None
         if (
-            doc_ids is not None
+            (doc_ids is not None or attention_group_ids is not None)
             and key_padding_mask is None
             and self.config.attention_backend == "flex"
         ):
-            if doc_ids.shape[1] != seq_len:
+            if doc_ids is not None and doc_ids.shape[1] != seq_len:
                 raise ValueError(
                     f"doc_ids length ({doc_ids.shape[1]}) does not match the sequence "
                     f"length reaching attention ({seq_len}). Sequence packing is not "
                     "supported for arches that prepend image tokens to the residual stream."
                 )
-            block_mask = build_doc_causal_block_mask(doc_ids, h.device)
-            # The BlockMask supersedes doc_ids; clearing it keeps the dense
-            # SDPA mask branch in Attention.forward unreachable on this path.
+            if doc_ids is None:
+                # Groups without packing: one implicit document.
+                assert attention_group_ids is not None  # narrowed by the branch condition
+                doc_ids = torch.zeros_like(attention_group_ids)
+            block_mask = build_doc_causal_block_mask(doc_ids, h.device, attention_group_ids)
+            # The BlockMask supersedes doc_ids / attention_group_ids; clearing
+            # them keeps the dense SDPA mask branch in Attention.forward
+            # unreachable on this path.
             doc_ids = None
+            attention_group_ids = None
 
         # MoMa path: single residual stream + shared SDPA + per-modality
         # MoE FFN groups. modality_ids tags every position and the
@@ -533,6 +570,7 @@ class Transformer(nn.Module):
                     sin,
                     kv_cache=cache,
                     doc_ids=doc_ids,
+                    attention_group_ids=attention_group_ids,
                     key_padding_mask=key_padding_mask,
                     block_mask=block_mask,
                 )
