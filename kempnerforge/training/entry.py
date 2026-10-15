@@ -8,9 +8,11 @@ phase — without editing the shared script.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import cast
 
 import torch
+import torch.distributed as dist
 
 from kempnerforge.checkpoint.manager import CheckpointManager
 from kempnerforge.config.job import JobConfig
@@ -202,7 +204,20 @@ def restore_checkpoint(
     resume from. Also restores the metrics run ids, runs the MoT warm-start
     hook, and re-applies the effective freeze at the resumed step.
     """
-    resume_path = resolve_resume_path(config.checkpoint.dir)
+    # Every rank must resume from the same checkpoint. resolve_resume_path
+    # stats `.metadata` to test durability, and on NFS/Lustre independent
+    # stats can disagree briefly across ranks; ranks that disagree resume
+    # from different steps, or hang in the collective load below when some
+    # skip it. Use a rank-0-authoritative answer broadcast to all ranks,
+    # as CheckpointManager.load does for train_state.pt.
+    if dist.is_initialized():
+        chosen = [
+            str(resolve_resume_path(config.checkpoint.dir) or "") if dist.get_rank() == 0 else ""
+        ]
+        dist.broadcast_object_list(chosen, src=0)
+        resume_path = Path(chosen[0]) if chosen[0] else None
+    else:
+        resume_path = resolve_resume_path(config.checkpoint.dir)
     if not resume_path and not config.checkpoint.load_path:
         return 0, 0
 

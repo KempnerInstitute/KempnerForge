@@ -17,6 +17,31 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+# DCP writes this file last, once every shard is durable, so its presence is
+# the authoritative signal that a checkpoint directory is loadable.
+_DCP_METADATA_FILE = ".metadata"
+
+
+def _dcp_durable(ckpt_dir: Path) -> bool:
+    """Whether ``ckpt_dir`` holds a complete set of DCP shards.
+
+    Accepts both layouts: a flat directory, and the per-stage ``pp{k}/``
+    subdirectories written under pipeline parallelism.
+
+    Under pipeline parallelism *every* stage must be durable. Each stage saves
+    through its own process group, so an interrupted save can leave the earlier
+    stages complete and the later ones empty; resuming into that mix fails in
+    ``dcp.load`` on the stages that have no ``.metadata``, or resumes them from
+    different steps. An empty stage list is not durable either -- ``all()`` is
+    vacuously true on it, and a directory with no stage at all holds nothing.
+    """
+    if (ckpt_dir / _DCP_METADATA_FILE).exists():
+        return True
+    if not ckpt_dir.is_dir():
+        return False
+    stages = [d for d in ckpt_dir.iterdir() if d.is_dir() and d.name.startswith("pp")]
+    return bool(stages) and all((d / _DCP_METADATA_FILE).exists() for d in stages)
+
 
 @dataclass
 class SLURMInfo:
@@ -77,13 +102,20 @@ def resolve_resume_path(checkpoint_dir: str) -> Path | None:
 
     Checks:
       1. ``{checkpoint_dir}/latest`` symlink
-      2. Most recent ``step_N`` directory by step number
+      2. Most recent ``step_N`` directory *whose DCP shards are durable*
+
+    ``CheckpointManager`` only ever points ``latest`` at a durable checkpoint,
+    so (1) needs no further test. The ``step_N`` fallback has no such guarantee:
+    an interrupted save leaves a directory that exists but holds no ``.metadata``,
+    and resuming into it fails in ``dcp.load`` with "metadata is None". Skipping
+    incomplete directories turns an unrecoverable run into one that resumes from
+    the last durable checkpoint, whatever left the partial directory behind.
 
     Args:
         checkpoint_dir: Base checkpoint directory.
 
     Returns:
-        Path to the latest checkpoint, or None if none found.
+        Path to the latest usable checkpoint, or None if none found.
     """
     base = Path(checkpoint_dir)
     if not base.exists():
@@ -97,7 +129,7 @@ def resolve_resume_path(checkpoint_dir: str) -> Path | None:
             logger.info(f"Auto-resume: found latest checkpoint at {resolved}")
             return resolved
 
-    # Fall back to most recent step_N directory
+    # Fall back to the newest durable step_N directory, newest first.
     step_dirs = sorted(
         (
             d
@@ -105,13 +137,28 @@ def resolve_resume_path(checkpoint_dir: str) -> Path | None:
             if d.is_dir() and d.name.startswith("step_") and d.name.split("_")[1].isdigit()
         ),
         key=lambda d: int(d.name.split("_")[1]),
+        reverse=True,
     )
 
-    if step_dirs:
-        path = step_dirs[-1]
-        logger.info(f"Auto-resume: found checkpoint at {path}")
-        return path
+    for path in step_dirs:
+        if _dcp_durable(path):
+            logger.info(f"Auto-resume: found checkpoint at {path}")
+            return path
+        logger.warning(
+            f"Auto-resume: skipping {path} — no DCP .metadata, so the save that "
+            f"produced it did not complete"
+        )
 
+    if step_dirs:
+        # Behaviour is unchanged -- the caller starts from step 0 -- but this is
+        # the one path where a run that plainly meant to resume does not. Before
+        # the durability test it failed inside dcp.load instead, which was at
+        # least loud, so say so at a level nobody filters out.
+        logger.error(
+            f"Auto-resume: {len(step_dirs)} checkpoint directories under "
+            f"{base} and none has durable DCP state; starting from step 0. "
+            f"Every saved step would have to be re-trained."
+        )
     return None
 
 

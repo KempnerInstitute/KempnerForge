@@ -234,6 +234,101 @@ class TestBatchStream:
         stream.reset()
         assert int(stream.next_batch()["input_ids"]) == 0
 
+    # -- worker teardown (#177) -------------------------------------------
+
+    def test_close_is_safe_without_a_loader(self):
+        BatchStream(DataPipeline()).close()  # must not raise
+
+    def test_close_is_safe_on_a_worker_free_loader(self):
+        stream = BatchStream(DataPipeline(dataloader=_fake_batches(3)))
+        stream.next_batch()
+        stream.close()
+        assert stream._iter is None
+
+    def test_close_drains_the_workers_explicitly(self):
+        """Shielded workers ignore SIGTERM, so terminate() cannot reap them.
+
+        close() must go through the loader's own sentinel path instead, or the
+        interpreter blocks at exit joining daemonic children that refuse to die.
+        """
+
+        class _FakeIterator:
+            def __init__(self):
+                self.shutdown_calls = 0
+
+            def _shutdown_workers(self):
+                self.shutdown_calls += 1
+
+        class _FakeInner:
+            def __init__(self):
+                self._iterator = _FakeIterator()
+
+        class _FakeLoader:
+            def __init__(self):
+                self._dataloader = _FakeInner()
+
+        loader = _FakeLoader()
+        iterator = loader._dataloader._iterator
+        stream = BatchStream(DataPipeline(dataloader=loader))
+
+        stream.close()
+
+        assert iterator.shutdown_calls == 1
+        assert loader._dataloader._iterator is None
+
+    @pytest.mark.parametrize("alive", [True, False], ids=["stuck", "already-gone"])
+    def test_close_kills_a_worker_the_drain_left_behind(self, alive):
+        """SIGKILL is the only way out for a worker that ignored the sentinel.
+
+        These workers ignore SIGTERM by design, so terminate() cannot reap one
+        that failed to drain. Without a kill the interpreter blocks at exit on a
+        daemonic child that refuses to die -- the exact hang the shield would
+        otherwise reintroduce by removing the usual escape.
+        """
+
+        class _FakeWorker:
+            def __init__(self, alive):
+                self._alive = alive
+                self.killed = 0
+                self.joined = 0
+
+            def is_alive(self):
+                return self._alive
+
+            def kill(self):
+                self.killed += 1
+                self._alive = False
+
+            def join(self, timeout=None):
+                self.joined += 1
+
+        class _FakeIterator:
+            def __init__(self, worker):
+                self._workers = [worker]
+
+            def _shutdown_workers(self):
+                pass  # the drain that did not take
+
+        class _FakeInner:
+            def __init__(self, worker):
+                self._iterator = _FakeIterator(worker)
+
+        class _FakeLoader:
+            def __init__(self, worker):
+                self._dataloader = _FakeInner(worker)
+
+        worker = _FakeWorker(alive)
+        BatchStream(DataPipeline(dataloader=_FakeLoader(worker))).close()
+
+        assert worker.killed == (1 if alive else 0)
+        assert worker.joined == (1 if alive else 0)
+
+    def test_close_is_idempotent(self):
+        stream = BatchStream(DataPipeline(dataloader=_fake_batches(3)))
+        stream.next_batch()
+        stream.close()
+        stream.close()  # a second pass must not raise
+
     def test_ensure_started_is_idempotent(self):
         stream = BatchStream(DataPipeline(dataloader=_fake_batches(3)))
         stream.ensure_started()
@@ -1248,6 +1343,34 @@ class TestRestoreCheckpoint:
         mgr = FakeResumeManager()
         assert entry.restore_checkpoint(config, TinyTextModel(), None, mgr) == (0, 0)
         assert mgr.load_kwargs == {}
+
+    @pytest.mark.parametrize("rank", [0, 1])
+    def test_only_rank_zero_resolves_the_resume_path(self, monkeypatch, tmp_path, rank):
+        """Every rank must resume from the same checkpoint.
+
+        Resolution stats ``.metadata`` to test durability, and on shared
+        storage those stats can disagree briefly across ranks. A rank that
+        disagrees resumes from a different step, or hangs in the collective
+        load when it skips one the other ranks take. Only rank 0 looks, and
+        its answer is broadcast.
+        """
+        import kempnerforge.training.entry as entry
+
+        looked: list = []
+        chosen = tmp_path / "step_7"
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda d: looked.append(d) or chosen)
+        monkeypatch.setattr(entry.dist, "is_initialized", lambda: True)
+        monkeypatch.setattr(entry.dist, "get_rank", lambda: rank)
+        monkeypatch.setattr(
+            entry.dist,
+            "broadcast_object_list",
+            lambda lst, src=0: lst.__setitem__(0, str(chosen)),
+        )
+
+        mgr = FakeResumeManager(step=7, tokens=1234)
+        assert entry.restore_checkpoint(make_config(), TinyTextModel(), None, mgr) == (7, 1234)
+        assert mgr.load_kwargs["path"] == str(chosen)
+        assert len(looked) == (1 if rank == 0 else 0), "non-zero ranks must not stat the tree"
 
     def test_warm_start_exclude_leaves_the_vlm_freeze_probe_alone(self, monkeypatch):
         """Excluding state keys does not skip the freeze-metadata check; a
