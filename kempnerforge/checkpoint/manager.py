@@ -778,13 +778,7 @@ class CheckpointManager:
         return resolved
 
     def _optimizers_saved_in(self, dcp_dir: Path) -> list[torch.optim.Optimizer]:
-        """Return the optimizers whose state the checkpoint at ``dcp_dir`` holds.
-
-        A checkpoint saved before inner optimizers were checkpointed holds only the outer
-        optimizer's param groups. Loading the inner ones from it would fail on the state it
-        lacks, so the load restores the outer optimizer alone and leaves the inner ones
-        fresh, as every resume from it did before, and warns that it is not bit-exact.
-        """
+        """Return the optimizers saved in ``dcp_dir``; warn if the inner ones are missing."""
         inner = self.checkpointed_optimizers[1:]
         if not inner or _saved_optimizer_param_groups(dcp_dir) != len(self.optimizer.param_groups):
             return self.checkpointed_optimizers

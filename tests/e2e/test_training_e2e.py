@@ -432,8 +432,7 @@ def _check_resume_determinism(tmp_path, nproc: int, overrides: tuple[str, ...] =
     exactly, the loss trajectories diverge. Regression test for the bug where the
     manager used raw ``optimizer.state_dict()`` with DCP: a freshly-built
     optimizer's state is empty, so ``dcp.load`` had no moment tensors to fill and
-    AdamW momentum silently reset to zero on every resume. ``overrides`` are
-    appended to every run's arguments.
+    AdamW momentum silently reset to zero on every resume.
     """
     data_dir = _make_learnable_shard(tmp_path)
     common = [

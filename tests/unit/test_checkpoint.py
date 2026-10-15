@@ -1601,8 +1601,7 @@ class TestResumeWithUnsteppedParameters:
 
 
 class TestMuonResume:
-    """Muon hands the parameters Newton-Schulz cannot take to an inner AdamW that its
-    own param_groups do not list, so the manager checkpoints that AdamW alongside it."""
+    """Muon is checkpointed together with its inner AdamW."""
 
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     MODEL_CONFIG = ModelConfig(dim=64, n_layers=2, n_heads=2, vocab_size=4096, max_seq_len=64)
@@ -1643,8 +1642,7 @@ class TestMuonResume:
             assert torch.equal(s, t), f"{what} {name} not restored bit-exactly"
 
     def test_checkpointed_optimizers_put_muon_first(self, tmp_path):
-        """Muon comes before its inner AdamW, so its param groups stay where a reader
-        that passes Muon alone expects them; an optimizer without inner ones is alone."""
+        """Muon comes before its inner AdamW; an optimizer without inner ones is alone."""
         from kempnerforge.checkpoint.manager import CheckpointManager
 
         model, opt = self._build(seed=0)
@@ -1656,8 +1654,7 @@ class TestMuonResume:
         assert manager.checkpointed_optimizers == [adamw]
 
     def test_resume_matches_an_uninterrupted_run(self, tmp_path):
-        """Regression: DCP's helpers saw Muon alone and dropped the inner AdamW's
-        moments, so every resume restarted them from zero and diverged."""
+        """A resumed Muon run matches an uninterrupted one."""
         from kempnerforge.checkpoint.manager import CheckpointManager
 
         batches = self._batches(6)
@@ -1679,9 +1676,7 @@ class TestMuonResume:
             assert torch.equal(ref, p), f"{name} diverged from the uninterrupted run"
 
     def test_checkpoint_without_inner_state_resumes_muon_and_warns(self, tmp_path):
-        """A checkpoint saved before the inner AdamW was checkpointed holds Muon's state
-        alone. It still resumes, Muon's state restored and the inner AdamW fresh as every
-        resume from it left it, and warns, rather than failing on the keys it lacks."""
+        """A checkpoint without the inner AdamW resumes Muon alone and warns."""
         import logging
 
         from torch.distributed.checkpoint.state_dict import (
@@ -1723,8 +1718,7 @@ class TestMuonResume:
         self._train(model2, opt2, self._batches(1))
 
     def test_checkpoint_still_loads_into_muon_alone(self, tmp_path):
-        """A reader that passes Muon alone, as the manager did before, still loads Muon's
-        state from a checkpoint that holds the inner AdamW too."""
+        """A reader that passes Muon alone still loads Muon's state."""
         from torch.distributed.checkpoint.state_dict import (
             get_optimizer_state_dict,
             set_optimizer_state_dict,

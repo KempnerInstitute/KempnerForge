@@ -241,7 +241,7 @@ class TestMuon:
         assert len(adam_states) > 0, "Internal AdamW state was not restored"
 
     def test_inner_optimizers_lists_the_inner_adamw(self):
-        """CheckpointManager saves whatever inner_optimizers lists alongside Muon."""
+        """``inner_optimizers`` returns Muon's inner AdamW."""
         optimizer = build_optimizer(self._make_model(), OptimizerConfig(name="muon", lr=0.01))
         assert optimizer.inner_optimizers == (optimizer._adam,)
 

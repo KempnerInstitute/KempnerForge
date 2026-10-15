@@ -210,12 +210,7 @@ class TestCheckpointRoundTrip:
                 assert torch.equal(local(state[key]), local(state2[key])), f"{name}.{key}"
 
     def test_muon_resume_restores_inner_adamw_state(self, distributed_env, shared_tmp_dir):
-        """Muon's inner AdamW must be restored into a FRESH optimizer too.
-
-        Regression for the bug where DCP's helpers saw Muon alone: the inner AdamW's
-        parameters are not in Muon's own param_groups, so its moments never reached the
-        checkpoint and restarted from zero on every resume.
-        """
+        """Muon's inner AdamW must be restored into a FRESH optimizer too."""
         from kempnerforge.config.schema import OptimizerConfig
 
         mesh = distributed_env
