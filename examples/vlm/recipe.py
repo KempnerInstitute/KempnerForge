@@ -55,9 +55,13 @@ CONFIGS_DIR = Path(__file__).resolve().parent / "configs"
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
-# Modules the freeze policy is defined over; the tower and connector always train.
+# Modules the freeze policy is defined over, and the ones each stage trains; every other
+# recipe module is frozen in that stage.
 _RECIPE_MODULES: tuple[str, ...] = ("transformer", "vision_encoder", "adapter")
-_ALWAYS_TRAINED: tuple[str, ...] = ("vision_encoder", "adapter")
+_STAGE_TRAINABLE: dict[int, frozenset[str]] = {
+    1: frozenset({"vision_encoder", "adapter"}),
+    2: frozenset({"transformer", "vision_encoder", "adapter"}),
+}
 
 # OPEN-provenance fields that must be resolved before a production launch,
 # per stage. Stage 2 additionally requires a non-empty ``init_checkpoint``.
@@ -190,6 +194,8 @@ class StageSettings:
     run split its data over; the data-order contract depends on it, so
     it is recipe metadata, not a runtime parallelism knob.
     ``grad_clip_norm`` is 0.0 for no clipping (the recipe value).
+    ``train_lm`` declares the stage's LM policy and must match the stage
+    contract: stage 1 freezes the LM, stage 2 trains it.
     """
 
     stage: int
@@ -242,9 +248,13 @@ class StageSettings:
                 f"stage.vision_attn_implementation must be '' or 'sdpa' "
                 f"(got {self.vision_attn_implementation!r})"
             )
+        lm_trained = "transformer" in _STAGE_TRAINABLE[self.stage]
+        if self.train_lm != lm_trained:
+            raise ValueError(
+                f"stage {self.stage} {'trains' if lm_trained else 'freezes'} the LM; "
+                f"train_lm must be {'true' if lm_trained else 'false'}"
+            )
         if self.stage == 1:
-            if self.train_lm:
-                raise ValueError("stage 1 freezes the LM; train_lm must be false")
             if self.geometry.tile_grid != 1 or self.geometry.include_global_view:
                 raise ValueError("stage 1 is single-view; tiling is a stage-2 setting")
             if self.resume_reset_data_order:
@@ -270,8 +280,10 @@ class ImageUnderstandingConfig(VLMConfig):
     to text), inherited from the base class. ``freeze`` defaults to
     empty; each stage contract declares its freeze policy explicitly and
     the validator checks the effective freeze state, at build time and
-    after every ``freeze_schedule`` transition, against ``stage.train_lm``
-    (the tower and connector train in both stages).
+    after every ``freeze_schedule`` transition, against the stage
+    contract: stage 1 freezes the LM and trains the tower and connector,
+    stage 2 trains all three. ``stage.train_lm`` must agree with the
+    contract but never decides the check.
     """
 
     arch: str = ARCH_NAME
@@ -408,6 +420,8 @@ class ImageUnderstandingConfig(VLMConfig):
 
         # The runtime keeps the last directive per module and applies scheduled stages
         # on top, so check the state the run starts in and the state after each stage.
+        stage = self.stage.stage
+        trainable = _STAGE_TRAINABLE[stage]
         known = set(_RECIPE_MODULES)
         states = [("build time", effective_freeze(0, self.freeze, [], known))]
         for transition in self.freeze_schedule:
@@ -416,22 +430,17 @@ class ImageUnderstandingConfig(VLMConfig):
             states.append((f"step {step}", specs))
         for where, specs in states:
             frozen = {spec.module for spec in specs if spec.frozen}
-            for module in _ALWAYS_TRAINED:
-                if module in frozen:
+            for module in _RECIPE_MODULES:
+                if module in trainable and module in frozen:
                     raise ValueError(
-                        "the recipe trains the tower and connector in both stages; "
-                        f"freeze must not include {module!r} (frozen at {where})"
+                        f"stage {stage} trains {module!r}; freeze must not include it "
+                        f"(frozen at {where})"
                     )
-            lm_frozen = "transformer" in frozen
-            if self.stage.train_lm and lm_frozen:
-                raise ValueError(
-                    f"stage.train_lm=true conflicts with a frozen 'transformer' at {where}"
-                )
-            if not self.stage.train_lm and not lm_frozen:
-                raise ValueError(
-                    "stage.train_lm=false requires freeze to include "
-                    f"{{ module = 'transformer', frozen = true }} (trainable at {where})"
-                )
+                if module not in trainable and module not in frozen:
+                    raise ValueError(
+                        f"stage {stage} requires freeze to include "
+                        f"{{ module = {module!r}, frozen = true }} (trainable at {where})"
+                    )
 
     def unresolved_launch_fields(self) -> list[str]:
         """Names of fields a production launch of this stage still needs."""

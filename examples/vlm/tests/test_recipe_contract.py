@@ -561,20 +561,77 @@ class TestConnectorDerivedBudget:
             load_config(str(STAGE1_TOML), cli_args=["--vlm.connector_type=linear"])
 
 
+# The one directive per (stage, module) that breaks that stage's contract. Stage 1 freezes
+# the LM and trains the tower and connector; stage 2 trains all three.
+CONTRACT_BREAKS = [
+    pytest.param(1, FreezeSpec("transformer", False), id="stage1-lm-unfrozen"),
+    pytest.param(1, FreezeSpec("vision_encoder", True), id="stage1-tower-frozen"),
+    pytest.param(1, FreezeSpec("adapter", True), id="stage1-connector-frozen"),
+    pytest.param(2, FreezeSpec("transformer", True), id="stage2-lm-frozen"),
+    pytest.param(2, FreezeSpec("vision_encoder", True), id="stage2-tower-frozen"),
+    pytest.param(2, FreezeSpec("adapter", True), id="stage2-connector-frozen"),
+]
+
+
 class TestFreezePolicy:
     def test_stage1_requires_a_frozen_lm(self, stage1_vlm) -> None:
         with pytest.raises(ValueError, match="requires freeze to include"):
             dataclasses.replace(stage1_vlm, freeze=[])
 
-    def test_stage2_requires_a_trainable_lm(self, stage2_vlm) -> None:
-        with pytest.raises(ValueError, match="conflicts with a frozen"):
-            dataclasses.replace(stage2_vlm, freeze=[FreezeSpec("transformer", True)])
+    def test_a_declared_lm_flag_must_match_the_stage(self, stage1_vlm, stage2_vlm) -> None:
+        assert stage1_vlm.stage is not None and stage2_vlm.stage is not None
+        with pytest.raises(ValueError, match="stage 1 freezes the LM; train_lm must be false"):
+            dataclasses.replace(stage1_vlm.stage, train_lm=True)
+        with pytest.raises(ValueError, match="stage 2 trains the LM; train_lm must be true"):
+            dataclasses.replace(stage2_vlm.stage, train_lm=False)
 
-    def test_tower_and_connector_always_train(self, stage1_vlm) -> None:
-        base = list(stage1_vlm.freeze)
-        for module in ("vision_encoder", "adapter"):
-            with pytest.raises(ValueError, match="must not include"):
-                dataclasses.replace(stage1_vlm, freeze=[*base, FreezeSpec(module, True)])
+    def test_stage2_with_a_consistent_frozen_lm_is_refused(self, tmp_path: Path) -> None:
+        """train_lm=false and a frozen transformer agree with each other, not with stage 2."""
+        text = STAGE2_TOML.read_text()
+        for old, new in {
+            "train_lm = true": "train_lm = false",
+            "freeze = []": 'freeze = [{ module = "transformer", frozen = true }]',
+        }.items():
+            assert text.count(old) == 1
+            text = text.replace(old, new)
+        bad = tmp_path / "bad.toml"
+        bad.write_text(text)
+        with pytest.raises(ValueError, match="stage 2 trains the LM"):
+            load_config(str(bad), cli_args=[])
+
+    @pytest.mark.parametrize(
+        ("stage", "flag", "freeze"),
+        [(1, True, []), (2, False, [FreezeSpec("transformer", True)])],
+        ids=["stage1-lm-trainable", "stage2-lm-frozen"],
+    )
+    def test_the_freeze_state_is_checked_whatever_the_declared_flag(
+        self, stage1_vlm, stage2_vlm, stage: int, flag: bool, freeze: list[FreezeSpec]
+    ) -> None:
+        """The flag is forged to agree with the directives, so only the contract can refuse."""
+        vlm = {1: stage1_vlm, 2: stage2_vlm}[stage]
+        assert vlm.stage is not None
+        forged = dataclasses.replace(vlm.stage)
+        object.__setattr__(forged, "train_lm", flag)
+        with pytest.raises(ValueError, match=rf"stage {stage}.*'transformer'.*build time"):
+            dataclasses.replace(vlm, stage=forged, freeze=freeze)
+
+    @pytest.mark.parametrize(("stage", "breaker"), CONTRACT_BREAKS)
+    def test_build_time_freeze_must_match_the_stage_contract(
+        self, stage1_vlm, stage2_vlm, stage: int, breaker: FreezeSpec
+    ) -> None:
+        vlm = {1: stage1_vlm, 2: stage2_vlm}[stage]
+        kept = [spec for spec in vlm.freeze if spec.module != breaker.module]
+        with pytest.raises(ValueError, match=rf"stage {stage}.*'{breaker.module}'.*build time"):
+            dataclasses.replace(vlm, freeze=[*kept, breaker])
+
+    @pytest.mark.parametrize(("stage", "breaker"), CONTRACT_BREAKS)
+    def test_a_schedule_must_keep_the_stage_contract(
+        self, stage1_vlm, stage2_vlm, stage: int, breaker: FreezeSpec
+    ) -> None:
+        vlm = {1: stage1_vlm, 2: stage2_vlm}[stage]
+        schedule = [FreezeStage(1000, (breaker,))]
+        with pytest.raises(ValueError, match=rf"stage {stage}.*'{breaker.module}'.*step 1000"):
+            dataclasses.replace(vlm, freeze_schedule=schedule)
 
     def test_the_last_directive_per_module_decides(self, stage1_vlm, stage2_vlm) -> None:
         """The runtime keeps one directive per module and the last one wins."""
@@ -583,7 +640,7 @@ class TestFreezePolicy:
             dataclasses.replace(stage1_vlm, freeze=unfrozen_last)
         frozen_last = unfrozen_last[::-1]
         assert dataclasses.replace(stage1_vlm, freeze=frozen_last).freeze == frozen_last
-        with pytest.raises(ValueError, match="conflicts with a frozen"):
+        with pytest.raises(ValueError, match="must not include"):
             dataclasses.replace(stage2_vlm, freeze=frozen_last)
 
         tower_unfrozen_last = [
@@ -596,28 +653,6 @@ class TestFreezePolicy:
         )
         with pytest.raises(ValueError, match="must not include"):
             dataclasses.replace(stage2_vlm, freeze=tower_unfrozen_last[::-1])
-
-    @pytest.mark.parametrize("module", ["vision_encoder", "adapter"])
-    def test_a_schedule_cannot_freeze_the_tower_or_connector(
-        self, stage1_vlm, stage2_vlm, module: str
-    ) -> None:
-        schedule = [FreezeStage(1000, (FreezeSpec(module, True),))]
-        for vlm in (stage1_vlm, stage2_vlm):
-            with pytest.raises(ValueError, match="must not include") as err:
-                dataclasses.replace(vlm, freeze_schedule=schedule)
-            assert "step 1000" in str(err.value)
-
-    def test_a_schedule_cannot_unfreeze_the_stage1_lm(self, stage1_vlm) -> None:
-        schedule = [FreezeStage(5000, (FreezeSpec("transformer", False),))]
-        with pytest.raises(ValueError, match="requires freeze to include") as err:
-            dataclasses.replace(stage1_vlm, freeze_schedule=schedule)
-        assert "step 5000" in str(err.value)
-
-    def test_a_schedule_cannot_freeze_the_stage2_lm(self, stage2_vlm) -> None:
-        schedule = [FreezeStage(5000, (FreezeSpec("transformer", True),))]
-        with pytest.raises(ValueError, match="conflicts with a frozen") as err:
-            dataclasses.replace(stage2_vlm, freeze_schedule=schedule)
-        assert "step 5000" in str(err.value)
 
     def test_a_later_transition_is_checked_after_an_earlier_harmless_one(self, stage1_vlm) -> None:
         schedule = [
@@ -638,7 +673,7 @@ class TestFreezePolicy:
             dataclasses.replace(stage2_vlm, freeze_schedule=transient)
         assert "step 100" in str(err.value)
 
-        with pytest.raises(ValueError, match="conflicts with a frozen") as err:
+        with pytest.raises(ValueError, match="must not include") as err:
             dataclasses.replace(
                 stage2_vlm,
                 freeze=[FreezeSpec("transformer", True)],
