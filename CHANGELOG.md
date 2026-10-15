@@ -150,6 +150,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **Coverage counts functions whose signature contains `...`**: the `\.\.\.` exclude pattern in `pyproject.toml` now matches only a line that is a bare `...`; unanchored, it also matched annotations such as `tuple[str, ...]`, which dropped the whole function from coverage.
+- **Muon resume restores its inner AdamW**: the AdamW Muon runs for the parameters Newton-Schulz cannot take (norms, biases, and the embedding and output head when `vocab_size / dim > 10`) is not in Muon's `param_groups`, so `get_optimizer_state_dict` left it out of every checkpoint and each resume restarted its moments from zero. The manager now saves and loads it with Muon (`Muon.inner_optimizers`, gathered in `CheckpointManager.checkpointed_optimizers`); a checkpoint written before this resumes Muon's state alone and warns that the inner AdamW starts fresh. Muon checkpoints grow by those moments, about 8.4 GB for `7b_16gpu_muon.toml`.
 - **Resume no longer fails when a trainable parameter never received a gradient**: a checkpoint records which parameters its optimizer held without state and the load restores exactly those without it; state missing for any other parameter still fails the load.
 - **The query/key norms, the cross-attention block norms and the adapter pre-norm use `model.norm_eps`**: they used a fixed 1e-5; the default `norm_eps = 1e-5` is unchanged.
 - `ci-example.yml` now also runs the VLM example's config tests in `examples/vlm/tests`, which no workflow ran.
