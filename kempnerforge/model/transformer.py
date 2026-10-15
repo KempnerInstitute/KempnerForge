@@ -483,23 +483,18 @@ class Transformer(nn.Module):
         start_pos = kv_caches[0].seq_len if kv_caches is not None else 0
 
         # Slice RoPE frequencies for current positions (device transfer cached)
-        rope_cos, rope_sin = self._rope_cos, self._rope_sin
-        assert rope_cos is not None and rope_sin is not None, (
-            "RoPE tables not initialized; call init_weights_and_freqs() after to_empty()"
-        )
-        if rope_cos.device != h.device:
-            rope_cos = rope_cos.to(h.device)
-            rope_sin = rope_sin.to(h.device)
-            self._rope_cos, self._rope_sin = rope_cos, rope_sin
+        if self._rope_cos.device != h.device:  # type: ignore[reportOptionalMemberAccess]
+            self._rope_cos = self._rope_cos.to(h.device)  # type: ignore[reportOptionalMemberAccess]
+            self._rope_sin = self._rope_sin.to(h.device)  # type: ignore[reportOptionalMemberAccess]
         if position_ids is not None:
             # Gather per-token frequencies: (batch, seq_len, head_dim // 2).
             # apply_rope broadcasts the batched form over heads.
             position_ids = position_ids.to(h.device)
-            cos = rope_cos[position_ids]
-            sin = rope_sin[position_ids]
+            cos = self._rope_cos[position_ids]  # type: ignore[reportOptionalSubscript]
+            sin = self._rope_sin[position_ids]  # type: ignore[reportOptionalSubscript]
         else:
-            cos = rope_cos[start_pos : start_pos + seq_len]
-            sin = rope_sin[start_pos : start_pos + seq_len]
+            cos = self._rope_cos[start_pos : start_pos + seq_len]  # type: ignore[reportOptionalSubscript]
+            sin = self._rope_sin[start_pos : start_pos + seq_len]  # type: ignore[reportOptionalSubscript]
 
         # Packed sequences under attention_backend="flex": build the sparse
         # block-diagonal causal mask once here and share it across every layer,
