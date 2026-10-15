@@ -203,7 +203,9 @@ attribute is `None` and its state-dict keys never exist. Without the
 embedding, pass pre-embedded inputs through
 `ModalityContext(inputs_embeds=...)` (`tokens` raises); without the head,
 `forward` returns the final hidden states. `tie_embeddings=True` with
-either module omitted raises `ValueError`.
+either module omitted raises `ValueError`. So does `generate()`, and tensor
+parallelism is not supported for such a model (`apply_tensor_parallel`
+raises).
 
 Extra helpers on `Transformer`:
 

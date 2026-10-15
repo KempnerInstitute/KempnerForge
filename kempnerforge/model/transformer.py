@@ -120,6 +120,8 @@ class Transformer(nn.Module):
     state-dict keys. Without the embedding, pass pre-embedded inputs via
     ``modality.inputs_embeds``; without the head, ``forward`` returns the final
     hidden states. ``tie_embeddings=True`` requires both modules.
+    ``generate()`` rejects a model built without either module.
+    Tensor parallelism is not supported for such a model.
     """
 
     def __init__(

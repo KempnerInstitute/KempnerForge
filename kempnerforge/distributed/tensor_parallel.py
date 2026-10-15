@@ -113,14 +113,33 @@ def apply_tensor_parallel(
     Args:
         model: Transformer or PipelineStageModule to parallelize.
         device_mesh: Full DeviceMesh with a 'tp' dimension.
+
+    Raises:
+        ValueError: A Transformer built without its token embedding or output
+            head, raised before the mesh or the model is touched. Pipeline
+            stages, which hold only some modules, are accepted.
     """
+    is_pp_stage = hasattr(model, "stage_id")
+    if not is_pp_stage:
+        omitted = [
+            name
+            for name in ("token_embedding", "output_head")
+            if hasattr(model, name) and getattr(model, name) is None
+        ]
+        if omitted:
+            knobs = ", ".join(f"include_{name}=True" for name in omitted)
+            raise ValueError(
+                "tensor parallelism is not supported for a Transformer built without its token "
+                f"embedding or output head (omitted: {', '.join(omitted)}); rebuild it with "
+                f"{knobs} or set distributed.tp = 1"
+            )
+
     tp_mesh = get_tp_mesh(device_mesh)
     if tp_mesh is None:
         logger.warning("No 'tp' dimension in DeviceMesh — skipping tensor parallelism")
         return
 
     tie = getattr(getattr(model, "config", None), "tie_embeddings", False)
-    is_pp_stage = hasattr(model, "stage_id")
     is_moe = getattr(getattr(model, "config", None), "is_moe", False)
     # SequenceParallel requires TP on embedding/head (otherwise the unsharded
     # output head can't consume Shard(1) input from the final norm).

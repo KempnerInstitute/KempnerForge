@@ -70,7 +70,8 @@ def generate(
     """Generate tokens autoregressively with KV-cache.
 
     Args:
-        model: Transformer model (set to eval mode during generation).
+        model: Transformer model with both its token embedding and output head
+            (set to eval mode during generation).
         prompt_tokens: Input token ids, shape (batch, prompt_len).
         max_new_tokens: Maximum number of new tokens to generate.
         temperature: Sampling temperature. 0 = greedy decoding.
@@ -81,6 +82,21 @@ def generate(
     Returns:
         Full sequence (prompt + generated), shape (batch, total_len).
     """
+    omitted = [
+        name
+        for name, module in (
+            ("token_embedding", model.token_embedding),
+            ("output_head", model.output_head),
+        )
+        if module is None
+    ]
+    if omitted:
+        knobs = ", ".join(f"include_{name}=True" for name in omitted)
+        raise ValueError(
+            "generate() needs both the token embedding and the output head, but the model "
+            f"was built without: {', '.join(omitted)}; rebuild it with {knobs}"
+        )
+
     was_training = model.training
     model.eval()
 

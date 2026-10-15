@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import math
+from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.nn.functional as F
 
 from kempnerforge.config.schema import ModelConfig
+from kempnerforge.distributed.pipeline_parallel import PipelineStageModule
+from kempnerforge.distributed.tensor_parallel import apply_tensor_parallel
 from kempnerforge.model.attention import Attention
 from kempnerforge.model.embedding import OutputHead, TokenEmbedding
 from kempnerforge.model.init import init_weights
@@ -410,6 +413,13 @@ def _expected_keys(n_layers: int, *, embedding: bool = True, head: bool = True) 
     return keys
 
 
+class _UntouchedMesh:
+    """DeviceMesh stand-in that fails the test on any attribute access."""
+
+    def __getattr__(self, name):
+        raise AssertionError(f"device mesh accessed: {name}")
+
+
 class TestTransformerOptionalModules:
     """Constructor knobs include_token_embedding / include_output_head."""
 
@@ -512,6 +522,29 @@ class TestTransformerOptionalModules:
         tokens = torch.randint(0, 256, (2, 16), device=DEVICE)
         with torch.no_grad():
             assert torch.equal(default(tokens), explicit(tokens))
+
+    @pytest.mark.parametrize(
+        "omitted",
+        [("token_embedding",), ("output_head",), ("token_embedding", "output_head")],
+    )
+    def test_tensor_parallel_rejected_before_mesh_or_module_changes(self, small_config, omitted):
+        model = Transformer(small_config, **{f"include_{name}": False for name in omitted})
+        with pytest.raises(ValueError, match="tensor parallelism") as exc_info:
+            apply_tensor_parallel(model, _UntouchedMesh())
+        # The message names the knob to restore for exactly the omitted modules.
+        message = str(exc_info.value)
+        for name in ("token_embedding", "output_head"):
+            assert (f"include_{name}=True" in message) == (name in omitted)
+        assert not any(module._forward_hooks for module in model.modules())
+
+    def test_tensor_parallel_check_spares_complete_and_stage_models(self, small_config):
+        # A pipeline stage legitimately lacks the embedding and head, so it is not rejected.
+        stage = PipelineStageModule(small_config, stage_id=1, num_stages=3, layer_range=(0, 1))
+        assert stage.token_embedding is None
+        assert stage.output_head is None
+        no_tp_mesh = SimpleNamespace(mesh_dim_names=("dp",))
+        for model in (Transformer(small_config), stage):
+            apply_tensor_parallel(model, no_tp_mesh)  # no 'tp' dimension: skipped, no error
 
 
 # ---------------------------------------------------------------------------
