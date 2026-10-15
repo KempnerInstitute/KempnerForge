@@ -38,6 +38,11 @@ logger = get_logger(__name__)
 LossFn = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
 
 
+# Seconds to wait on a worker after SIGKILL before giving up on it. SIGKILL
+# cannot be caught, so this only covers the kernel reaping the process.
+_WORKER_KILL_TIMEOUT_S = 5.0
+
+
 class BatchStream:
     """The training dataloader plus its live iterator.
 
@@ -79,6 +84,42 @@ class BatchStream:
         inside the current epoch rather than restarting it.
         """
         self._iter = None
+
+    def close(self) -> None:
+        """Shut the loader's worker processes down explicitly.
+
+        Workers ignore SIGTERM (see ``ignore_shutdown_signals_in_worker``) so a
+        preemption signal cannot kill them out from under an in-flight step.
+        The same shield means ``Process.terminate()``, which is SIGTERM, cannot
+        reap them either: left to the interpreter's exit hook, the process would
+        block forever joining daemonic children that refuse to die. Draining
+        them through the loader's own sentinel path avoids that.
+
+        Rank-local and idempotent — it issues no collectives, so it is safe on
+        the exception path in ``train_loop``'s ``finally``.
+        """
+        self._iter = None
+        self._source = None
+        loader = self.pipeline.dataloader
+        if loader is None:
+            return
+        # StatefulDataLoader wraps a torch DataLoader; a plain loader is itself.
+        inner = getattr(loader, "_dataloader", loader)
+        iterator = getattr(inner, "_iterator", None)
+        if iterator is not None and hasattr(iterator, "_shutdown_workers"):
+            iterator._shutdown_workers()
+            # Backstop. The sentinel drain above is the clean path, but these
+            # workers ignore SIGTERM by design, so `terminate()` cannot reap one
+            # that failed to take the sentinel -- only SIGKILL, which cannot be
+            # ignored. Without this, a single stuck worker blocks interpreter
+            # exit forever, which is the failure this shield would otherwise
+            # reintroduce by removing the usual way out.
+            for worker in getattr(iterator, "_workers", ()):
+                if worker.is_alive():
+                    worker.kill()
+                    worker.join(timeout=_WORKER_KILL_TIMEOUT_S)
+        if hasattr(inner, "_iterator"):
+            inner._iterator = None
 
     def next_batch(self) -> dict[str, torch.Tensor]:
         if self.dataloader is None:
@@ -658,6 +699,8 @@ def run_training_loop(
             prof.stop()
             if runtime.rank == 0:
                 print_profiler_summary(prof, trace_dir=config.profiling.trace_dir)
+        # Dataloader workers ignore SIGTERM, so nothing else will reap them.
+        session.batches.close()
 
     if completed_normally and not config.checkpoint.should_save(step):
         ckpt_mgr.save(

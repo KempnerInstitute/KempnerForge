@@ -21,6 +21,33 @@ logger = logging.getLogger(__name__)
 _SHUTDOWN_SIGNALS = (signal.SIGTERM, signal.SIGUSR1)
 
 
+def ignore_shutdown_signals_in_worker(worker_id: int) -> None:
+    """``worker_init_fn`` that makes a DataLoader worker ignore shutdown signals.
+
+    SLURM preemption and ``torchrun`` teardown signal the whole process group,
+    not a single PID, so SIGTERM reaches every DataLoader worker as well as the
+    rank's main process. Workers install no handler, take the default action and
+    die at once. The main process — which handles the signal cooperatively, by
+    setting a flag and finishing its step — then fails fetching its next
+    micro-batch, and that failure escapes before the loop reaches its
+    ``should_shutdown()`` check, so no emergency checkpoint is written.
+
+    Ignoring the shutdown signals in the worker keeps it serving long enough for
+    the step to finish, which puts the emergency save back on the loop's normal
+    path rather than on an exception path.
+
+    The cost: ``multiprocessing.Process.terminate()`` is itself SIGTERM, so a
+    shielded worker cannot be reaped that way and the interpreter's exit hook
+    would block joining it. Workers must therefore be shut down explicitly
+    through the loader's sentinel path — see ``BatchStream.close``.
+
+    Args:
+        worker_id: Worker index, supplied by ``DataLoader``. Unused.
+    """
+    for sig in _SHUTDOWN_SIGNALS:
+        signal.signal(sig, signal.SIG_IGN)
+
+
 class ShutdownHandler:
     """Cooperative shutdown handler for long-running training jobs.
 
