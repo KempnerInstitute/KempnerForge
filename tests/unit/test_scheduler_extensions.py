@@ -361,17 +361,8 @@ class TestSchedulerConfigValidation:
         assert config.rex_alpha == 1.0
 
 
-# ---------------------------------------------------------------------------
-# Warmup start factor
-# ---------------------------------------------------------------------------
-
-
 def _torch_linear_warmup_cosine(lr: float, warmup: int, start: float, decay: int, min_ratio):
-    """torch's SequentialLR(LinearLR, CosineAnnealingWarmRestarts), the reference.
-
-    With T_0 = the decay length the cosine never restarts inside the run, so this is
-    warmup-from-``start`` then cosine decay -- the schedule ``cosine`` must reproduce.
-    """
+    """Linear warmup then cosine decay, built from torch schedulers."""
     model = nn.Linear(4, 4)
     opt = torch.optim.SGD(model.parameters(), lr=lr)
     cosine = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
@@ -393,11 +384,11 @@ class TestWarmupStartFactor:
         opt = _make_optimizer(lr=2.0)
         cfg = SchedulerConfig(name=name, warmup_steps=100, warmup_start_factor=0.25)
         sched = build_scheduler(opt, cfg, max_steps=1000)
-        assert opt.param_groups[0]["lr"] == pytest.approx(0.5)  # 2.0 * 0.25 at step 0
+        assert opt.param_groups[0]["lr"] == pytest.approx(0.5)
         _step_to(sched, 50)
         assert opt.param_groups[0]["lr"] == pytest.approx(2.0 * (0.25 + 0.75 * 0.5))
         _step_to(sched, 50)
-        assert opt.param_groups[0]["lr"] == pytest.approx(2.0)  # peak at the end of warmup
+        assert opt.param_groups[0]["lr"] == pytest.approx(2.0)
 
     def test_cosine_matches_torch_linear_warmup_then_cosine_step_for_step(self):
         """Two groups with different LRs over a whole run, at rel 1e-12."""
@@ -418,7 +409,6 @@ class TestWarmupStartFactor:
             max_steps=max_steps,
         )
         with warnings.catch_warnings():
-            # SequentialLR calls the cosine's step(0) at the milestone, which torch warns about.
             warnings.simplefilter("ignore")
             refs = [
                 _torch_linear_warmup_cosine(lr, warmup, start, max_steps - warmup, min_ratio)

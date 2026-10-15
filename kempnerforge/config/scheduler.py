@@ -21,8 +21,6 @@ class SchedulerConfig:
 
     name: SchedulerType = SchedulerType.cosine
     warmup_steps: int = 2000
-    # LR factor the linear warmup starts from (torch LinearLR's start_factor);
-    # applies to every schedule with a warmup. 0 warms up from zero.
     warmup_start_factor: float = 0.0
     decay_steps: int | None = None  # None -> decay over remaining steps
     min_lr_ratio: float = 0.1  # min_lr = lr * min_lr_ratio
