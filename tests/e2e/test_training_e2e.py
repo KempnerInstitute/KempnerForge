@@ -424,7 +424,7 @@ def _make_learnable_shard(tmp_path) -> str:
     return str(data_dir)
 
 
-def _check_resume_determinism(tmp_path, nproc: int) -> None:
+def _check_resume_determinism(tmp_path, nproc: int, overrides: tuple[str, ...] = ()) -> None:
     """An interrupted+resumed run must reproduce an uninterrupted reference
     bit-for-bit on the post-resume steps.
 
@@ -432,7 +432,8 @@ def _check_resume_determinism(tmp_path, nproc: int) -> None:
     exactly, the loss trajectories diverge. Regression test for the bug where the
     manager used raw ``optimizer.state_dict()`` with DCP: a freshly-built
     optimizer's state is empty, so ``dcp.load`` had no moment tensors to fill and
-    AdamW momentum silently reset to zero on every resume.
+    AdamW momentum silently reset to zero on every resume. ``overrides`` are
+    appended to every run's arguments.
     """
     data_dir = _make_learnable_shard(tmp_path)
     common = [
@@ -443,6 +444,7 @@ def _check_resume_determinism(tmp_path, nproc: int) -> None:
         "--model.vocab_size=256",
         f"--data.dataset_path={data_dir}",
         "--data.file_pattern=*.npy",
+        *overrides,
     ]
     reference = _run_training(
         common
@@ -498,6 +500,25 @@ def test_resume_determinism_single_gpu(tmp_path):
 def test_resume_determinism_2gpu_fsdp(tmp_path):
     """2 GPU FSDP: resumed run must match the uninterrupted reference bit-for-bit."""
     _check_resume_determinism(tmp_path, nproc=2)
+
+
+# Muon hands the parameters Newton-Schulz cannot take to an inner AdamW. The vocab_size
+# here overrides the 256 above so vocab_size / dim = 16 > 10 puts the embedding and output
+# head there next to the norms; the learnable shard only uses the first 256 token ids.
+_MUON_RESUME_OVERRIDES = ("--optimizer.name=muon", "--optimizer.lr=0.02", "--model.vocab_size=4096")
+
+
+@pytest.mark.e2e
+def test_resume_determinism_muon_single_gpu(tmp_path):
+    """Single GPU Muon: the inner AdamW must resume bit-for-bit too."""
+    _check_resume_determinism(tmp_path, nproc=1, overrides=_MUON_RESUME_OVERRIDES)
+
+
+@pytest.mark.e2e
+@requires_gpus(2)
+def test_resume_determinism_muon_2gpu_fsdp(tmp_path):
+    """2 GPU FSDP Muon: the inner AdamW must resume bit-for-bit too."""
+    _check_resume_determinism(tmp_path, nproc=2, overrides=_MUON_RESUME_OVERRIDES)
 
 
 # ============================================================================

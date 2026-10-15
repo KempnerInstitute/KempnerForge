@@ -394,8 +394,22 @@ class Muon(torch.optim.Optimizer):
         defaults = dict(lr=lr, momentum=momentum, weight_decay=weight_decay, ns_steps=ns_steps)
         super().__init__(muon_params, defaults)
 
+    @property
+    def inner_optimizers(self) -> tuple[torch.optim.Optimizer, ...]:
+        """Optimizers holding parameters that Muon's own ``param_groups`` do not list.
+
+        DCP's ``get_optimizer_state_dict`` / ``set_optimizer_state_dict`` keep only an
+        optimizer's ``state`` and ``param_groups``, so the inner AdamW reaches a checkpoint
+        only when it is passed alongside Muon, which ``CheckpointManager`` does.
+        """
+        return (self._adam,) if self._adam is not None else ()
+
     def state_dict(self) -> dict:
-        """Include internal AdamW state so DCP checkpoints are complete."""
+        """Include internal AdamW state in the plain ``state_dict()``.
+
+        DCP checkpoints drop these extra keys; they take the inner AdamW from
+        ``inner_optimizers`` instead.
+        """
         sd = super().state_dict()
         if self._adam is not None:
             sd["_adam_state"] = self._adam.state_dict()
