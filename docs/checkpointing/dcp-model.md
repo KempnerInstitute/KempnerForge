@@ -38,7 +38,8 @@ Three top-level keys. DCP introspects the state dicts, finds
 with enough metadata to reassemble. The third is empty whenever every
 parameter has optimizer state, and an empty entry writes no key at all,
 so an ordinary run's checkpoints keep the two-key shape any reader
-already expects.
+already expects. A save before the first optimizer step writes the model
+alone (see below).
 
 What's in each:
 
@@ -56,6 +57,18 @@ What's in each:
   is nothing to save for those, and once the checkpoint is written
   that is indistinguishable from state that went missing. The record
   keeps the distinction for the load — see [Loading](#loading).
+
+Before the first optimizer step (the step-0 checkpoint of a
+`dyn_ckpt_window` from step 0) the optimizer holds no state, so the
+save writes neither the optimizer nor the record. There is nothing to
+save then, and reading the optimizer would create state:
+`get_optimizer_state_dict` first gives an optimizer that holds none a
+dummy `lr=0` step, which leaves AdamW one step ahead in its bias
+correction. A load that finds no optimizer in a checkpoint — this one,
+or one holding model weights alone — loads it like a pretrained model:
+the weights and train state, with a fresh optimizer. Past step 0 it
+warns, because the run's optimizer moments are then missing and the
+resume does not continue it exactly.
 
 Not in the DCP shard: scheduler, dataloader, RNG, and training
 metadata. Those go in `train_state.pt` alongside —
