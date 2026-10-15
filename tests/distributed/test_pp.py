@@ -1,7 +1,7 @@
 """Pipeline-parallel equivalence against a single-GPU forward.
 
 Run with: torchrun --nproc_per_node=2 -m pytest tests/distributed/test_pp.py
-(or with 4 ranks, as the rest of tests/distributed/ runs)
+(or with 4 ranks)
 """
 
 from __future__ import annotations
