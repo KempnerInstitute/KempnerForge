@@ -1600,6 +1600,131 @@ class TestResumeWithUnsteppedParameters:
         self._assert_same_run(model, optimizer, model3, optimizer3)
 
 
+class TestSaveBeforeFirstStep:
+    """Before the first optimizer step there is no optimizer state to save, and reading
+    the optimizer through torch's getter would give it some: a dummy step that leaves
+    AdamW one step ahead in its bias correction. So the save writes none, and a load
+    that finds no optimizer starts it fresh, warning only past step 0."""
+
+    MODEL_CONFIG = ModelConfig(dim=64, n_layers=2, n_heads=2, vocab_size=256, max_seq_len=64)
+
+    def _build(self, name):
+        torch.manual_seed(0)
+        model = Transformer(self.MODEL_CONFIG)
+        return model, build_optimizer(model, OptimizerConfig(name=name, lr=1e-3, fused=False))
+
+    @staticmethod
+    def _train(model, opt):
+        g = torch.Generator().manual_seed(1)
+        for _ in range(4):
+            tokens = torch.randint(0, 256, (2, 32), generator=g)
+            logits = model(tokens)
+            torch.nn.functional.cross_entropy(logits.flatten(0, 1), tokens.flatten()).backward()
+            opt.step()
+            opt.zero_grad()
+        return [p.detach().clone() for p in model.parameters()]
+
+    @pytest.mark.parametrize("name", ["adamw", "muon"])
+    def test_save_and_resume_leave_the_run_unchanged(self, tmp_path, name):
+        """Regression: the step-0 save left AdamW at step 1 with zero moments, so the
+        run shrank its first update and then differed from one that never saved."""
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        reference = self._train(*self._build(name))
+
+        model, opt = self._build(name)
+        CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model, opt).save(step=0)
+        assert not opt.state, "the save left the getter's dummy state in the optimizer"
+        saved = self._train(model, opt)
+
+        model2, opt2 = self._build(name)
+        CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model2, opt2).load()
+        resumed = self._train(model2, opt2)
+
+        for ref, a, b in zip(reference, saved, resumed, strict=True):
+            assert torch.equal(ref, a), "saving at step 0 changed the run"
+            assert torch.equal(ref, b), "resuming from the step-0 checkpoint changed the run"
+
+    def test_the_checkpoint_holds_no_optimizer_state(self, tmp_path):
+        """Nothing to save: the step-0 checkpoint has no optimizer entry at all."""
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        model, opt = self._build("adamw")
+        CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model, opt).save(step=0)
+        keys = dcp.FileSystemReader(str(tmp_path / "step_0")).read_metadata().state_dict_metadata
+        assert keys, "fixture: the checkpoint should hold the model"
+        assert not [k for k in keys if k.startswith("optimizer")], "the save wrote the optimizer"
+
+    def _load_model_only(self, tmp_path, train_step):
+        """Load a checkpoint holding the weights alone, optionally with a train state at
+        ``train_step``; return the source model, the loaded run, and its warnings."""
+        import logging
+
+        from torch.distributed.checkpoint.state_dict import get_model_state_dict
+
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        source, _ = self._build("adamw")
+        step_dir = tmp_path / "pretrained"
+        dcp.save({"model": get_model_state_dict(source)}, checkpoint_id=str(step_dir))
+        if train_step is not None:
+            torch.save(
+                build_train_state(step=train_step, tokens_seen=0), step_dir / "train_state.pt"
+            )
+
+        torch.manual_seed(1)
+        model = Transformer(self.MODEL_CONFIG)
+        opt = build_optimizer(model, OptimizerConfig(name="adamw", lr=1e-3, fused=False))
+        records: list[logging.LogRecord] = []
+
+        class _CaptureHandler(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                records.append(record)
+
+        target = logging.getLogger("kempnerforge.checkpoint.manager")
+        capture = _CaptureHandler(level=logging.WARNING)
+        target.addHandler(capture)
+        try:
+            loaded = CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model, opt).load(
+                path=str(step_dir)
+            )
+        finally:
+            target.removeHandler(capture)
+        return source, model, opt, loaded, [r.getMessage() for r in records]
+
+    def test_a_checkpoint_without_an_optimizer_loads_like_a_pretrained_model(self, tmp_path):
+        """Model weights alone load as a warm start would: fresh optimizer, no warning."""
+        source, model, opt, loaded, warnings = self._load_model_only(tmp_path, train_step=None)
+        assert loaded == (0, 0, {})
+        for want, got in zip(source.parameters(), model.parameters(), strict=True):
+            assert torch.equal(want, got), "the load did not restore the weights"
+        assert not opt.state, "the optimizer should start fresh"
+        assert not warnings, f"nothing was lost at step 0, yet: {warnings}"
+
+    def test_past_step_zero_a_missing_optimizer_is_warned_about(self, tmp_path):
+        """Past step 0 the run's optimizer moments are gone, so the resume says so."""
+        _, _, opt, loaded, warnings = self._load_model_only(tmp_path, train_step=5)
+        assert loaded[0] == 5
+        assert not opt.state, "the optimizer should start fresh"
+        assert any("no optimizer state at step 5" in w for w in warnings), warnings
+
+    def test_loading_it_empties_an_optimizer_that_has_stepped(self, tmp_path):
+        """The load restores what the checkpoint holds: an optimizer with no state."""
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        model, opt = self._build("adamw")
+        manager = CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model, opt)
+        manager.save(step=0)
+        initial = [p.detach().clone() for p in model.parameters()]
+        self._train(model, opt)
+        assert opt.state, "fixture: training should have created optimizer state"
+
+        manager.load(path=str(tmp_path / "step_0"))
+        assert not opt.state, "the optimizer kept state the checkpoint does not hold"
+        for before, p in zip(initial, model.parameters(), strict=True):
+            assert torch.equal(before, p), "the load did not restore the initial weights"
+
+
 # ---------------------------------------------------------------------------
 # Resume with a different component build (config `plugins` changed)
 # ---------------------------------------------------------------------------

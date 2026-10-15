@@ -49,6 +49,7 @@ _OPTIM_STATE_PREFIX = "optimizer.state."
 # the optimizer's own layout nor what an older reader, which ignores it, loads.
 _NEVER_STEPPED_KEY = "optimizer_never_stepped"
 _NEVER_STEPPED_PREFIX = f"{_NEVER_STEPPED_KEY}."
+_OPTIM_PREFIX = "optimizer."
 
 
 def _intersect_freeze_meta_by_module(
@@ -132,6 +133,11 @@ def _params_recorded_never_stepped(fqns: set[str], saved_keys: Iterable[str]) ->
     return recorded
 
 
+def _holds_optimizer(saved_keys: Iterable[str]) -> bool:
+    """Return whether a checkpoint's keys include the optimizer entry, in either layout."""
+    return any(key == "optimizer" or key.startswith(_OPTIM_PREFIX) for key in saved_keys)
+
+
 class _NeverSteppedStatePlanner(DefaultLoadPlanner):
     """Load planner that leaves out the optimizer state the save recorded as absent.
 
@@ -140,11 +146,16 @@ class _NeverSteppedStatePlanner(DefaultLoadPlanner):
     was saved. Those are dropped from the load and kept in ``never_stepped`` for
     the caller to confirm against the saved ``param_groups``; every other key
     stays required, including one whose state is missing without a record.
+
+    A checkpoint with no optimizer entry at all, saved before the first optimizer
+    step or holding model weights alone, has the whole template emptied instead,
+    and ``optimizer_missing`` tells the caller to start the optimizer fresh.
     """
 
     def __init__(self) -> None:
         super().__init__()
         self.never_stepped: set[str] = set()
+        self.optimizer_missing = False
 
     def set_up_planner(
         self,
@@ -154,10 +165,15 @@ class _NeverSteppedStatePlanner(DefaultLoadPlanner):
     ) -> None:
         optim_state = state_dict.get("optimizer")
         if optim_state is not None and metadata is not None:
-            fqns = set(optim_state["state"])
-            self.never_stepped = _params_recorded_never_stepped(fqns, metadata.state_dict_metadata)
-            for fqn in self.never_stepped:
-                del optim_state["state"][fqn]
+            if not _holds_optimizer(metadata.state_dict_metadata):
+                optim_state.clear()
+                self.optimizer_missing = True
+            else:
+                fqns = set(optim_state["state"])
+                saved_keys = metadata.state_dict_metadata
+                self.never_stepped = _params_recorded_never_stepped(fqns, saved_keys)
+                for fqn in self.never_stepped:
+                    del optim_state["state"][fqn]
         super().set_up_planner(state_dict, metadata, is_coordinator)
 
 
@@ -360,12 +376,11 @@ class CheckpointManager:
         # repopulate them. A freshly-constructed optimizer's raw state_dict() is
         # empty, so the moments would be silently dropped on resume (Adam momentum
         # resets to zero -> non-bit-exact resume; see manager load()).
-        optim_state = get_optimizer_state_dict(self.model, self.optimizer)
-        dcp_state = {
-            "model": get_model_state_dict(self.model),
-            "optimizer": optim_state,
-            _NEVER_STEPPED_KEY: _never_stepped_record(optim_state),
-        }
+        dcp_state: dict[str, Any] = {"model": get_model_state_dict(self.model)}
+        if self.optimizer.state:
+            optim_state = get_optimizer_state_dict(self.model, self.optimizer)
+            dcp_state["optimizer"] = optim_state
+            dcp_state[_NEVER_STEPPED_KEY] = _never_stepped_record(optim_state)
         # Dispatch the DCP save. For async modes this returns immediately but
         # FIRST awaits the previous in-flight flush, so any deferred
         # `_pending_finalize` from the prior save is now durable. For sync
@@ -597,6 +612,7 @@ class CheckpointManager:
         if load_optim:
             dcp_state["optimizer"] = get_optimizer_state_dict(self.model, self.optimizer)
 
+        fresh_optimizer = False
         if dcp_state:
             planner = _NeverSteppedStatePlanner()
             dcp.load(
@@ -606,6 +622,9 @@ class CheckpointManager:
                 planner=planner,
             )
 
+            if load_optim and planner.optimizer_missing:
+                self.optimizer.state.clear()
+                fresh_optimizer, load_optim = True, False
             if load_optim:
                 optim_state = cast("dict[str, Any]", dcp_state["optimizer"])
                 _restore_never_stepped(optim_state, planner.never_stepped, dcp_dir)
@@ -663,9 +682,18 @@ class CheckpointManager:
                 dataloader=dataloader,
             )
             logger.info(f"Resumed from step {step}, {tokens_seen:,} tokens seen")
-            return step, tokens_seen, extra
+        else:
+            step, tokens_seen, extra = 0, 0, {}
 
-        return 0, 0, {}
+        if fresh_optimizer and step > 0:
+            logger.warning(
+                f"{dcp_dir} holds no optimizer state at step {step}: resuming with a fresh "
+                f"optimizer, so its moments restart from zero and this resume does not "
+                f"continue the saved run exactly."
+            )
+        elif fresh_optimizer:
+            logger.info(f"{dcp_dir} holds no optimizer state; the optimizer starts fresh")
+        return step, tokens_seen, extra
 
     def apply_dataloader_state(self, dataloader: Any) -> None:
         """Apply any dataloader state stashed during load().
