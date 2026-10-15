@@ -26,6 +26,7 @@ from kempnerforge.distributed.parallel import (
 )
 from kempnerforge.distributed.setup import destroy_distributed
 from kempnerforge.distributed.tensor_parallel import apply_tensor_parallel
+from kempnerforge.distributed.utils import get_dp_info
 from kempnerforge.metrics.logger import get_logger
 from kempnerforge.metrics.tracker import MetricsTracker
 from kempnerforge.model.mot import mot_warm_start_from_text_stack
@@ -172,6 +173,8 @@ def build_checkpoint_manager(
     With PP, each stage has different parameters — DCP needs a group scoped
     to ranks within the same PP stage (all non-PP mesh dimensions), and each
     stage saves DCP shards to its own subdirectory to avoid file collisions.
+    The manager records each rank's data-parallel coordinates, the partition
+    ``build_data_pipeline`` reads, with the per-rank loader/RNG state.
     """
     ckpt_pg = None
     ckpt_pp_rank = None
@@ -189,6 +192,7 @@ def build_checkpoint_manager(
         optimizer,
         process_group=ckpt_pg,
         pp_rank=ckpt_pp_rank,
+        dp_info=get_dp_info(device_mesh),
     )
 
 

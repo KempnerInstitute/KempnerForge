@@ -1004,23 +1004,34 @@ class TestPhaseTemperatureReachesSampler:
 
 
 class FakeSubMesh:
-    def __init__(self, key) -> None:
+    def __init__(self, key, coords=(0, 1)) -> None:
         self.key = key
+        self.coords = coords
 
     def get_group(self):
         return f"group:{self.key}"
 
+    def get_local_rank(self) -> int:
+        return self.coords[0]
+
+    def size(self) -> int:
+        return self.coords[1]
+
 
 class FakeMesh:
-    """Enough DeviceMesh surface for the build phases to run on CPU."""
+    """Enough DeviceMesh surface for the build phases to run on CPU.
 
-    def __init__(self, dims=("pp", "dp_shard")) -> None:
+    Every slice reports ``coords`` as its (local rank, size).
+    """
+
+    def __init__(self, dims=("pp", "dp_shard"), coords=(0, 1)) -> None:
         self.mesh_dim_names = dims
+        self.coords = coords
         self.sliced: list = []
 
     def __getitem__(self, key):
         self.sliced.append(key)
-        return FakeSubMesh(key)
+        return FakeSubMesh(key, self.coords)
 
 
 class FakeStageModule(nn.Module):
@@ -1180,6 +1191,27 @@ class TestBuildCheckpointManager:
             PipelineBundle(rank=0, size=2, schedule=None),
         )
         assert mgr._process_group == "group:('dp_shard', 'tp')"
+
+    def test_records_the_data_pipelines_partition(self, tmp_path):
+        """The manager records the (dp_rank, dp_size) the data pipeline reads."""
+        from kempnerforge.training.data_pipeline import build_data_pipeline
+        from kempnerforge.training.entry import build_checkpoint_manager
+
+        config = make_config()
+        config.checkpoint.dir = str(tmp_path / "c")
+        model = TinyTextModel()
+        opt = torch.optim.SGD(model.parameters(), lr=0.1)
+
+        single = build_checkpoint_manager(config, _runtime(), model, opt, None)
+        assert single._dp_info == (0, 1)
+
+        mesh = FakeMesh(("dp_replicate", "dp_shard", "tp"), coords=(5, 8))
+        runtime = dataclasses.replace(_runtime(), device_mesh=mesh)
+        mgr = build_checkpoint_manager(config, runtime, model, opt, None)
+        assert mgr._dp_info == (5, 8)
+        assert ("dp_replicate", "dp_shard") in mesh.sliced
+        data = build_data_pipeline(config, runtime)
+        assert (data.dp_rank, data.dp_size) == mgr._dp_info
 
 
 class FakeResumeManager:

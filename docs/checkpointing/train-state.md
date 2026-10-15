@@ -29,6 +29,7 @@ Entry points, both in
     "per_rank": {                         # schema v1: every rank's own state
         "version": 1,
         "world_size": W,
+        "data_parallel": {0: (dp_rank, dp_size), ...},  # or None if unrecorded
         "ranks": {
             0: {"rng": {...}, "dataloader": {...}},   # global rank -> payload
             # ... one entry per global rank 0..W-1
@@ -72,13 +73,29 @@ envelope records each rank's payload:
   per-rank state under a **different world size raises** with an
   actionable error: exact data/RNG continuity only exists on the
   saved topology, while model/optimizer resharding via DCP is
-  unaffected. To proceed anyway, set
-  `checkpoint.ignore_rank_state_mismatch = true`: the saved
-  loader/RNG state is discarded with a warning and data order /
-  random streams restart fresh (model, optimizer, scheduler and step
-  still resume).
+  unaffected.
+- `data_parallel`: every global rank's `(dp_rank, dp_size)`, the data
+  partition its loader read. The same world size can split into a
+  different partition per rank (for example DP=4 vs DP=2 x TP=2), so a
+  **different layout also raises**: a loader cursor is only valid on
+  the partition it was saved on. `None` when the saving
+  `CheckpointManager` was built without `dp_info` (the training entry
+  always passes it); the layout check is then skipped and only the
+  world size is checked.
 - `ranks`: one payload per global rank, holding that rank's `rng`
-  capture plus, when its loader is stateful, its `dataloader` state.
+  capture plus, when its loader is stateful, its `dataloader` state
+  (on every rank or none).
+
+The whole envelope is checked before any rank selects its entry: a
+missing, extra or incomplete entry (no full `rng` capture,
+`dataloader` state on only some ranks) refuses the load. The check
+reads only what every rank shares (the broadcast envelope, the world
+size, the gathered current layout), so all ranks restore, refuse, or
+discard together. To proceed past a refusal, set
+`checkpoint.ignore_rank_state_mismatch = true`: the saved loader/RNG
+state is discarded on every rank with a warning and data order /
+random streams restart fresh (model, optimizer, scheduler and step
+still resume).
 
 Compatibility:
 

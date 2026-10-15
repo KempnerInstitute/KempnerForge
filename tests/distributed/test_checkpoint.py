@@ -544,7 +544,9 @@ class TestPerRankState:
         opt.step()
         opt.zero_grad()
 
-        mgr = CheckpointManager(CheckpointConfig(dir=shared_tmp_dir, keep_last_n=3), model, opt)
+        mgr = CheckpointManager(
+            CheckpointConfig(dir=shared_tmp_dir, keep_last_n=3), model, opt, dp_info=(rank, world)
+        )
 
         # Distinct per-rank streams and cursors, as a divergent run has them.
         self._seed_all(1000 + rank)
@@ -553,6 +555,9 @@ class TestPerRankState:
 
         # The next values each generator produces without interruption.
         expected = self._draw()
+
+        saved = torch.load(Path(shared_tmp_dir) / "step_5" / "train_state.pt", weights_only=False)
+        assert saved["per_rank"]["data_parallel"] == {r: (r, world) for r in range(world)}
 
         # Scramble everything identically on every rank; only a genuinely
         # per-rank restore can bring the distinct streams back.
@@ -584,4 +589,55 @@ class TestPerRankState:
         step, _, _ = mgr.load(path=str(Path(shared_tmp_dir) / "step_6"), dataloader=loader3)
         assert step == 6
         assert loader3.restored == {"cursor": 200 + rank}
+        dist.barrier()
+
+    def test_layout_change_refused_or_discarded_on_every_rank(
+        self, distributed_env, shared_tmp_dir
+    ):
+        """Same world size, another data-parallel layout: all ranks refuse, or
+        with the override all ranks discard; never a per-rank mix."""
+        from kempnerforge.config.schema import OptimizerConfig
+
+        rank = dist.get_rank()
+        world = dist.get_world_size()
+        if world % 2:
+            pytest.skip("needs an even world size")
+        half = world // 2
+
+        torch.manual_seed(42)
+        model = Transformer(SMALL_CONFIG).cuda()
+        apply_fsdp2(model, distributed_env)
+        opt = build_optimizer(model, OptimizerConfig(lr=1e-3, fused=False))
+        model(torch.randint(0, 512, (2, 32), device="cuda")).sum().backward()
+        opt.step()
+        opt.zero_grad()
+
+        # Saved as dp x 2 (rank -> rank // 2), resumed as 2 x dp (rank -> rank % half).
+        # With 4 ranks, ranks 0 and 3 keep their own coordinates.
+        saved_dp = (rank // 2, half)
+        current_dp = (rank % half, half)
+        path = str(Path(shared_tmp_dir) / "step_5")
+        cfg = CheckpointConfig(dir=shared_tmp_dir, keep_last_n=3)
+        self._seed_all(1000 + rank)
+        CheckpointManager(cfg, model, opt, dp_info=saved_dp).save(
+            step=5, tokens_seen=320, dataloader=_CursorLoader(cursor=100 + rank)
+        )
+
+        loader = _CursorLoader(cursor=-1)
+        refusing = CheckpointManager(cfg, model, opt, dp_info=current_dp)
+        with pytest.raises(ValueError, match="data-parallel layout"):
+            refusing.load(path=path, dataloader=loader)
+        assert loader.restored is None
+
+        lenient = CheckpointConfig(
+            dir=shared_tmp_dir, keep_last_n=3, ignore_rank_state_mismatch=True
+        )
+        mgr = CheckpointManager(lenient, model, opt, dp_info=current_dp)
+        self._seed_all(7)
+        fresh = self._draw()
+        self._seed_all(7)
+        step, tokens_seen, _ = mgr.load(path=path, dataloader=loader)
+        assert (step, tokens_seen) == (5, 320)
+        assert loader.restored is None, f"rank {rank} restored a cursor across a layout change"
+        assert self._draw() == fresh, f"rank {rank} restored RNG across a layout change"
         dist.barrier()
