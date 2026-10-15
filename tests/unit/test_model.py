@@ -385,6 +385,135 @@ class TestTransformer:
         assert sum(p.numel() for p in m1.parameters()) == sum(p.numel() for p in m2.parameters())
 
 
+# State-dict keys of a default two-layer dense Transformer, enumerated by hand.
+_BLOCK_KEYS = (
+    "attention_norm.weight",
+    "attention.q_proj.weight",
+    "attention.k_proj.weight",
+    "attention.v_proj.weight",
+    "attention.o_proj.weight",
+    "mlp_norm.weight",
+    "mlp.gate_proj.weight",
+    "mlp.up_proj.weight",
+    "mlp.down_proj.weight",
+)
+_EMBEDDING_KEY = "token_embedding.embedding.weight"
+_HEAD_KEY = "output_head.proj.weight"
+
+
+def _expected_keys(n_layers: int, *, embedding: bool = True, head: bool = True) -> set[str]:
+    keys = {f"layers.{i}.{k}" for i in range(n_layers) for k in _BLOCK_KEYS} | {"norm.weight"}
+    if embedding:
+        keys.add(_EMBEDDING_KEY)
+    if head:
+        keys.add(_HEAD_KEY)
+    return keys
+
+
+class TestTransformerOptionalModules:
+    """Constructor knobs include_token_embedding / include_output_head."""
+
+    @pytest.fixture
+    def small_config(self):
+        return ModelConfig(
+            dim=128, n_layers=2, n_heads=4, n_kv_heads=4, vocab_size=256, max_seq_len=64
+        )
+
+    @pytest.fixture
+    def full(self, small_config):
+        return Transformer(small_config).to(DEVICE).eval()
+
+    @staticmethod
+    def _sharing_weights(full, config, **knobs):
+        """A knob-built model holding ``full``'s weights for every module it keeps."""
+        model = Transformer(config, **knobs).to(DEVICE).eval()
+        kept = model.state_dict().keys()
+        model.load_state_dict({k: v for k, v in full.state_dict().items() if k in kept})
+        return model
+
+    def test_no_embedding_accepts_inputs_embeds(self, small_config, full):
+        model = self._sharing_weights(full, small_config, include_token_embedding=False)
+        assert model.token_embedding is None
+        tokens = torch.randint(0, 256, (2, 16), device=DEVICE)
+        with torch.no_grad():
+            out = model(modality=ModalityContext(inputs_embeds=full.token_embedding(tokens)))
+            expected = full(tokens)
+        assert out.shape == (2, 16, 256)
+        assert torch.equal(out, expected)
+
+    def test_no_embedding_rejects_tokens(self, small_config):
+        model = Transformer(small_config, include_token_embedding=False).to(DEVICE)
+        tokens = torch.randint(0, 256, (1, 8), device=DEVICE)
+        with pytest.raises(
+            ValueError, match=r"include_token_embedding=False.*modality\.inputs_embeds"
+        ):
+            model(tokens)
+
+    def test_no_head_returns_hidden_states(self, small_config, full):
+        model = self._sharing_weights(full, small_config, include_output_head=False)
+        assert model.output_head is None
+        tokens = torch.randint(0, 256, (2, 16), device=DEVICE)
+        with torch.no_grad():
+            hidden = model(tokens)
+            logits = full(tokens)
+            sliced = model(tokens, modality=ModalityContext(output_slice=slice(10, None)))
+        assert hidden.shape == (2, 16, 128)
+        assert sliced.shape == (2, 6, 128)
+        # The head is the only thing the headless model leaves out.
+        assert torch.equal(full.output_head(hidden), logits)
+
+    def test_both_absent(self, small_config, full):
+        model = self._sharing_weights(
+            full, small_config, include_token_embedding=False, include_output_head=False
+        )
+        assert model.token_embedding is None
+        assert model.output_head is None
+        tokens = torch.randint(0, 256, (2, 16), device=DEVICE)
+        with torch.no_grad():
+            hidden = model(modality=ModalityContext(inputs_embeds=full.token_embedding(tokens)))
+            logits = full(tokens)
+        assert hidden.shape == (2, 16, 128)
+        assert torch.equal(full.output_head(hidden), logits)
+        with pytest.raises(ValueError, match="include_token_embedding=False"):
+            model(tokens)
+
+    @pytest.mark.parametrize(("embedding", "head"), [(False, True), (True, False), (False, False)])
+    def test_tie_embeddings_requires_both_modules(self, embedding, head):
+        config = ModelConfig(
+            dim=128, n_layers=2, n_heads=4, vocab_size=256, max_seq_len=64, tie_embeddings=True
+        )
+        with pytest.raises(ValueError, match="tie_embeddings=True requires both"):
+            Transformer(config, include_token_embedding=embedding, include_output_head=head)
+
+    @pytest.mark.parametrize(
+        ("embedding", "head"), [(True, True), (False, True), (True, False), (False, False)]
+    )
+    def test_omitted_modules_have_no_keys_or_parameters(self, small_config, embedding, head):
+        model = Transformer(
+            small_config, include_token_embedding=embedding, include_output_head=head
+        )
+        assert set(model.state_dict()) == _expected_keys(2, embedding=embedding, head=head)
+        # vocab_size * dim parameters per omitted module (untied)
+        omitted = (0 if embedding else 256 * 128) + (0 if head else 256 * 128)
+        n_params = sum(p.numel() for p in model.parameters())
+        assert n_params == small_config.num_params_estimate - omitted
+
+    def test_defaults_unchanged(self, small_config):
+        torch.manual_seed(0)
+        default = Transformer(small_config).to(DEVICE).eval()
+        torch.manual_seed(0)
+        explicit = (
+            Transformer(small_config, include_token_embedding=True, include_output_head=True)
+            .to(DEVICE)
+            .eval()
+        )
+        assert set(default.state_dict()) == _expected_keys(2)
+        assert set(explicit.state_dict()) == _expected_keys(2)
+        tokens = torch.randint(0, 256, (2, 16), device=DEVICE)
+        with torch.no_grad():
+            assert torch.equal(default(tokens), explicit(tokens))
+
+
 # ---------------------------------------------------------------------------
 # norm_eps on every norm of the text, VLM-arch and first-pipeline-stage models
 # ---------------------------------------------------------------------------
