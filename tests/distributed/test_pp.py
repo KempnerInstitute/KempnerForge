@@ -1,6 +1,7 @@
 """Pipeline-parallel equivalence against a single-GPU forward.
 
 Run with: torchrun --nproc_per_node=2 -m pytest tests/distributed/test_pp.py
+(or with 4 ranks, as the rest of tests/distributed/ runs)
 """
 
 from __future__ import annotations
@@ -22,7 +23,10 @@ pytestmark = pytest.mark.skipif(
 # seq_len is at/above FLEX_BLOCK_SIZE so the flex variant is a legal config;
 # below it, flex leaks under Inductor and JobConfig.validate rejects it.
 CONFIG = ModelConfig(dim=128, n_layers=4, n_heads=4, vocab_size=256, max_seq_len=128)
-BATCH, SEQ, N_MICROBATCHES = 4, 128, 2
+# One pipeline stage per rank, and 1F1B needs at least one micro-batch per stage,
+# so the micro-batch count follows the world size; each micro-batch keeps 2 rows.
+N_MICROBATCHES = max(2, int(os.environ.get("WORLD_SIZE", "2")))
+BATCH, SEQ = 2 * N_MICROBATCHES, 128
 
 
 def _doc_ids(batch: int, seq_len: int, device) -> torch.Tensor:
