@@ -44,7 +44,6 @@ _METADATA_FILE = "metadata.json"
 _DCP_METADATA_FILE = ".metadata"
 # Key prefix of per-parameter optimizer state in a checkpoint saved by this manager.
 _OPTIM_STATE_PREFIX = "optimizer.state."
-# Key prefix of the optimizer param groups in a checkpoint saved by this manager.
 _OPTIM_PARAM_GROUPS_PREFIX = "optimizer.param_groups."
 # Top-level entry naming the parameters the optimizer held without state at save
 # time. It sits beside the optimizer rather than inside it, so it changes neither
@@ -257,11 +256,6 @@ class CheckpointManager:
         self.config = config
         self.model = model
         self.optimizer = optimizer
-        # Every optimizer whose state the checkpoint holds: `optimizer` first, then
-        # the inner ones holding parameters its param_groups omit. DCP's state-dict
-        # helpers see only an optimizer's own state and param_groups, so Muon's
-        # AdamW for the parameters Newton-Schulz cannot take (1D, or too rectangular)
-        # must be passed alongside Muon or its moments are lost.
         self.checkpointed_optimizers: list[torch.optim.Optimizer] = [
             optimizer,
             *getattr(optimizer, "inner_optimizers", ()),
@@ -382,9 +376,7 @@ class CheckpointManager:
         # template with the optimizer moment tensors allocated so dcp.load can
         # repopulate them. A freshly-constructed optimizer's raw state_dict() is
         # empty, so the moments would be silently dropped on resume (Adam momentum
-        # resets to zero -> non-bit-exact resume; see manager load()). The inner
-        # optimizers share the "optimizer" entry, their param groups after the outer
-        # one's, so a reader that passes the outer optimizer alone still finds its state.
+        # resets to zero -> non-bit-exact resume; see manager load()).
         optim_state = get_optimizer_state_dict(self.model, self.checkpointed_optimizers)
         dcp_state = {
             "model": get_model_state_dict(self.model),

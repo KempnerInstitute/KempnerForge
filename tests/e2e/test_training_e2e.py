@@ -502,9 +502,6 @@ def test_resume_determinism_2gpu_fsdp(tmp_path):
     _check_resume_determinism(tmp_path, nproc=2)
 
 
-# Muon hands the parameters Newton-Schulz cannot take to an inner AdamW. The vocab_size
-# here overrides the 256 above so vocab_size / dim = 16 > 10 puts the embedding and output
-# head there next to the norms; the learnable shard only uses the first 256 token ids.
 _MUON_RESUME_OVERRIDES = ("--optimizer.name=muon", "--optimizer.lr=0.02", "--model.vocab_size=4096")
 
 

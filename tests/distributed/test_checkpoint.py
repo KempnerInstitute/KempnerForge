@@ -219,8 +219,6 @@ class TestCheckpointRoundTrip:
         from kempnerforge.config.schema import OptimizerConfig
 
         mesh = distributed_env
-        # vocab_size / dim = 16 > 10: the embedding and output head join the norms on
-        # the inner AdamW, which is fused on GPU.
         config = ModelConfig(dim=128, n_layers=2, n_heads=2, vocab_size=2048, max_seq_len=64)
 
         def build():

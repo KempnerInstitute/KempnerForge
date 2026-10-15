@@ -1600,18 +1600,11 @@ class TestResumeWithUnsteppedParameters:
         self._assert_same_run(model, optimizer, model3, optimizer3)
 
 
-# ---------------------------------------------------------------------------
-# Muon resume -- the inner AdamW is checkpointed alongside Muon
-# ---------------------------------------------------------------------------
-
-
 class TestMuonResume:
     """Muon hands the parameters Newton-Schulz cannot take to an inner AdamW that its
     own param_groups do not list, so the manager checkpoints that AdamW alongside it."""
 
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # vocab_size / dim = 64 > 10: the embedding and output head are too rectangular for
-    # Newton-Schulz and join the norms on the inner AdamW, as in 7b_16gpu_muon.toml.
     MODEL_CONFIG = ModelConfig(dim=64, n_layers=2, n_heads=2, vocab_size=4096, max_seq_len=64)
 
     def _build(self, seed):
