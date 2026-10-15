@@ -76,6 +76,13 @@ class CheckpointConfig:
     # to True downgrades the mismatch to a warning. Useful when intentionally
     # switching from frozen to trainable mid-training.
     ignore_freeze_mismatch: bool = False
+    # A checkpoint's per-rank dataloader/RNG state is exact only on the
+    # topology that saved it. If the world size changed (or the envelope is
+    # unreadable), the load raises by default. Setting this to True discards
+    # the saved per-rank loader/RNG state with a warning and resumes from
+    # model/optimizer/scheduler state only; data order and random streams
+    # restart fresh. Model/optimizer resharding never needs this flag.
+    ignore_rank_state_mismatch: bool = False
 
     def __post_init__(self) -> None:
         if self.interval <= 0:

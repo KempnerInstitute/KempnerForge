@@ -479,3 +479,109 @@ class TestAsyncSaveBarrierNoDeadlock:
             assert latest.exists()
             assert latest.resolve().name == "step_40"
         dist.barrier()
+
+
+class _CursorLoader:
+    """Minimal stateful loader with a rank-local cursor."""
+
+    def __init__(self, cursor: int) -> None:
+        self.cursor = cursor
+        self.restored: dict | None = None
+
+    def state_dict(self) -> dict:
+        return {"cursor": self.cursor}
+
+    def load_state_dict(self, state: dict) -> None:
+        self.restored = dict(state)
+        self.cursor = state["cursor"]
+
+
+class TestPerRankState:
+    """Each rank must restore ITS OWN dataloader cursor and RNG streams.
+
+    Regression for the rank-0 broadcast bug: ``train_state.pt`` held only
+    rank 0's ``rng``/``dataloader`` and ``load()`` broadcast that single copy
+    to every rank, so divergent cursors and random streams collapsed onto
+    rank 0's on every resume.
+    """
+
+    @staticmethod
+    def _seed_all(seed: int) -> None:
+        import random as pyrandom
+
+        import numpy as np
+
+        pyrandom.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+    @staticmethod
+    def _draw() -> tuple[float, float, float, float]:
+        import random as pyrandom
+
+        import numpy as np
+
+        return (
+            pyrandom.random(),
+            float(np.random.random()),
+            float(torch.rand(())),
+            float(torch.rand((), device="cuda")),
+        )
+
+    def test_each_rank_restores_its_own_loader_and_rng(self, distributed_env, shared_tmp_dir):
+        from kempnerforge.config.schema import OptimizerConfig
+
+        rank = dist.get_rank()
+        world = dist.get_world_size()
+
+        torch.manual_seed(42)
+        model = Transformer(SMALL_CONFIG).cuda()
+        apply_fsdp2(model, distributed_env)
+        opt = build_optimizer(model, OptimizerConfig(lr=1e-3, fused=False))
+        tokens = torch.randint(0, 512, (2, 32), device="cuda")
+        model(tokens).sum().backward()
+        opt.step()
+        opt.zero_grad()
+
+        mgr = CheckpointManager(CheckpointConfig(dir=shared_tmp_dir, keep_last_n=3), model, opt)
+
+        # Distinct per-rank streams and cursors, as a divergent run has them.
+        self._seed_all(1000 + rank)
+        loader = _CursorLoader(cursor=100 + rank)
+        mgr.save(step=5, tokens_seen=320, dataloader=loader)
+
+        # The next values each generator produces without interruption.
+        expected = self._draw()
+
+        # Scramble everything identically on every rank; only a genuinely
+        # per-rank restore can bring the distinct streams back.
+        self._seed_all(7)
+        loader2 = _CursorLoader(cursor=-1)
+        step, tokens_seen, _ = mgr.load(
+            path=str(Path(shared_tmp_dir) / "step_5"), dataloader=loader2
+        )
+        assert step == 5 and tokens_seen == 320
+        assert loader2.restored == {"cursor": 100 + rank}, (
+            f"rank {rank} restored {loader2.restored}, wanted its own cursor {100 + rank}"
+        )
+        got = self._draw()
+        assert got == expected, f"rank {rank} RNG streams are not its own"
+
+        # Every rank restored a DIFFERENT cursor (the actual regression).
+        cursors: list = [None] * world
+        dist.all_gather_object(cursors, loader2.cursor)
+        assert sorted(cursors) == [100 + r for r in range(world)]
+        draws: list = [None] * world
+        dist.all_gather_object(draws, got)
+        assert len(set(draws)) == world, "rank RNG streams collapsed onto one copy"
+
+        # Second consecutive resume: the resumed run saves a fresh envelope
+        # and restores it again.
+        loader2.cursor = 200 + rank
+        mgr.save(step=6, tokens_seen=384, dataloader=loader2)
+        loader3 = _CursorLoader(cursor=-1)
+        step, _, _ = mgr.load(path=str(Path(shared_tmp_dir) / "step_6"), dataloader=loader3)
+        assert step == 6
+        assert loader3.restored == {"cursor": 200 + rank}
+        dist.barrier()
