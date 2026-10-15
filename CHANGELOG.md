@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **VLM example: typed contract and pinned manifest for the two-stage image-understanding recipe** (`examples/vlm/recipe.py`, `examples/vlm/configs/image_understanding_*`): a registered `[vlm] arch = "image_understanding"` config with per-stage settings and connector-derived token-budget validation, a sha256-pinned ordered source-occurrence manifest, and OPEN provenance fields that refuse a production launch until resolved.
 - **VLM example: video captioning config on a pretrained 0.6B backbone** (`examples/vlm/configs/vlm_qwen3_0.6b_joint_decoder_webvid.toml`), warm-started weights-only from the converted checkpoint.
 - **VLM example: converter from a pretrained Hugging Face backbone** (`examples/vlm/scripts/convert_hf_backbone.py`): writes a complete warm-start checkpoint for a VLM config and refuses any mismatch with the source's `config.json`, shard index, keys, shapes, or the epsilon the built model normalises with.
 - **`adapter.pre_norm`**: an optional norm-registry norm over the vision features ahead of `mlp_2layer`'s first projection (`adapter.ln_q`), re-initialized through the norm's `reset_parameters()` (added to `RMSNorm`); `""` (default) builds none, so existing configs are unchanged.
