@@ -14,7 +14,9 @@ import pytest
 import torch
 
 from kempnerforge.config.schema import ModelConfig
+from kempnerforge.config.vlm import MoMaConfig
 from kempnerforge.model.attention import KVCache
+from kempnerforge.model.modality import ModalityContext
 from kempnerforge.model.position import apply_rope, precompute_rope_frequencies
 from kempnerforge.model.transformer import Transformer
 
@@ -37,6 +39,15 @@ def _tiny_model(n_layers: int = 2, seed: int = 0) -> Transformer:
         max_seq_len=_MAX_SEQ_LEN,
     )
     return Transformer(config).to(DEVICE).eval()
+
+
+def _embedding_calls(model: Transformer) -> list[int]:
+    """Record each call to the token embedding, the first compute in forward."""
+    calls: list[int] = []
+    model.token_embedding.register_forward_pre_hook(  # type: ignore[union-attr]
+        lambda module, args: calls.append(1)
+    )
+    return calls
 
 
 # ---------------------------------------------------------------------------
@@ -211,6 +222,52 @@ class TestTransformerPositionIdsValidation:
         with pytest.raises(ValueError, match=r"must be in \[0, "):
             model(self._tokens(), position_ids=bad)
 
+    def _assert_rejected_before_embedding(self, bad, match, n_prefix=0):
+        model = _tiny_model(n_layers=1)
+        calls = _embedding_calls(model)
+        tokens = self._tokens()
+        modality = (
+            ModalityContext(prefix_embeds=torch.randn(2, n_prefix, _DIM, device=DEVICE))
+            if n_prefix
+            else None
+        )
+        with pytest.raises(ValueError, match=match):
+            model(tokens, modality=modality, position_ids=bad)
+        assert calls == []
+
+        # Control: the spy fires on a valid forward, so the empty list above is meaningful.
+        good = torch.arange(n_prefix + tokens.shape[1], device=DEVICE).expand(2, -1).contiguous()
+        with torch.no_grad():
+            model(tokens, modality=modality, position_ids=good)
+        assert calls == [1]
+
+    def test_shape_mismatch_rejected_before_embedding(self):
+        bad = torch.zeros(2, 5, dtype=torch.long, device=DEVICE)
+        self._assert_rejected_before_embedding(bad, r"residual shape \(2, 6\)")
+
+    def test_out_of_range_id_rejected_before_embedding(self):
+        bad = torch.zeros(2, 6, dtype=torch.long, device=DEVICE)
+        bad[1, 3] = _MAX_SEQ_LEN
+        self._assert_rejected_before_embedding(bad, rf"must be in \[0, {_MAX_SEQ_LEN}\)")
+
+    def test_text_length_ids_rejected_when_prefix_embeds_set(self):
+        """With 3 prefix positions and 6 text tokens the residual is 9 long."""
+        bad = torch.zeros(2, 6, dtype=torch.long, device=DEVICE)
+        self._assert_rejected_before_embedding(bad, r"residual shape \(2, 9\)", n_prefix=3)
+
+    def test_inputs_embeds_route_checks_its_own_length(self):
+        model = _tiny_model(n_layers=1)
+        modality = ModalityContext(inputs_embeds=torch.randn(2, 6, _DIM, device=DEVICE))
+        bad = torch.zeros(2, 5, dtype=torch.long, device=DEVICE)
+        with pytest.raises(ValueError, match=r"residual shape \(2, 6\)"):
+            model(modality=modality, position_ids=bad)
+
+        contiguous = torch.arange(6, device=DEVICE).expand(2, -1).contiguous()
+        with torch.no_grad():
+            explicit = model(modality=modality, position_ids=contiguous)
+            default = model(modality=modality)
+        assert torch.equal(default, explicit)
+
     def test_rejects_kv_caches_combination(self):
         model = _tiny_model(n_layers=1)
         caches = [
@@ -247,3 +304,43 @@ class TestTransformerPositionIdsValidation:
         position_ids = torch.arange(8, device=DEVICE).unsqueeze(0)
         with pytest.raises(ValueError, match="not supported for MoT"):
             model(tokens, position_ids=position_ids)
+
+
+class TestPositionIdsMoMa:
+    def test_contiguous_positions_match_default_and_restart_differs(self):
+        """On the MoMa arch (image prefix, per-modality MoE FFN) explicit arange
+        positions reproduce the default forward bit-exactly, and positions that
+        restart at the text segment change the output (the control that makes
+        the equality meaningful). CPU only, where the expert-choice index_add
+        accumulation is deterministic."""
+        n_img, n_text = 4, 4
+        config = ModelConfig(
+            dim=32,
+            n_layers=2,
+            n_heads=4,
+            n_kv_heads=4,
+            vocab_size=_VOCAB,
+            max_seq_len=_MAX_SEQ_LEN,
+            ffn_hidden_dim=128,
+        )
+        vlm = MoMaConfig(moma_experts_per_modality={"image": 2, "text": 2}, moma_gumbel_noise=False)
+        torch.manual_seed(0)
+        model = Transformer(config, vlm_config=vlm, num_image_tokens=n_img).eval()
+
+        tokens = torch.randint(0, _VOCAB, (1, n_text))
+        modality_ids = torch.zeros(1, n_img + n_text, dtype=torch.long)
+        modality_ids[:, n_img:] = 1
+        modality = ModalityContext(
+            prefix_embeds=torch.randn(1, n_img, config.dim),
+            output_slice=slice(n_img, None),
+            modality_ids=modality_ids,
+        )
+        contiguous = torch.arange(n_img + n_text).unsqueeze(0)
+        restart = torch.cat([torch.arange(n_img), torch.arange(n_text)]).unsqueeze(0)
+
+        with torch.no_grad():
+            default = model(tokens, modality=modality)
+            explicit = model(tokens, modality=modality, position_ids=contiguous)
+            restarted = model(tokens, modality=modality, position_ids=restart)
+        assert torch.equal(default, explicit)
+        assert not torch.allclose(default, restarted)

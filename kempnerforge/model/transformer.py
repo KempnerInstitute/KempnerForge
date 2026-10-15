@@ -414,9 +414,7 @@ class Transformer(nn.Module):
                 raise ValueError(
                     "modality.modality_ids is training-only; cannot be combined with kv_caches"
                 )
-        # position_ids checks that need no residual. Shape against the
-        # residual is checked below (where the residual is built); the rest
-        # fires before any compute.
+        # position_ids is fully validated here, before any compute.
         if position_ids is not None:
             if kv_caches is not None:
                 raise ValueError(
@@ -436,6 +434,25 @@ class Transformer(nn.Module):
                 raise ValueError(
                     f"position_ids must have shape (batch, seq_len), got {position_ids.ndim} dims"
                 )
+            # The residual reaching attention is any prefix_embeds followed by the text.
+            text = tokens if tokens is not None else inputs_embeds
+            assert text is not None  # narrowed by the XOR check above
+            batch, text_len = text.shape[:2]
+            n_prefix = prefix_embeds.shape[1] if prefix_embeds is not None else 0
+            residual_shape = (batch, n_prefix + text_len)
+            if tuple(position_ids.shape) != residual_shape:
+                raise ValueError(
+                    f"position_ids shape {tuple(position_ids.shape)} does not match the "
+                    f"residual shape {residual_shape} reaching attention"
+                )
+            if self._rope_cos is not None:
+                n_positions = self._rope_cos.shape[0]
+                if bool((position_ids < 0).any()) or bool((position_ids >= n_positions).any()):
+                    raise ValueError(
+                        f"position_ids must be in [0, {n_positions}) (the precomputed RoPE "
+                        f"table range, model.max_seq_len); got min {int(position_ids.min())}, "
+                        f"max {int(position_ids.max())}"
+                    )
         # modality_ids dtype/shape checks. Shape against the residual seq_len
         # is checked downstream (when the residual is built); dtype is
         # checked here so the error fires before any compute.
@@ -472,18 +489,6 @@ class Transformer(nn.Module):
             rope_sin = rope_sin.to(h.device)
             self._rope_cos, self._rope_sin = rope_cos, rope_sin
         if position_ids is not None:
-            if position_ids.shape != (h.shape[0], seq_len):
-                raise ValueError(
-                    f"position_ids shape {tuple(position_ids.shape)} does not match the "
-                    f"residual shape {(h.shape[0], seq_len)} reaching attention"
-                )
-            n_positions = rope_cos.shape[0]
-            if bool((position_ids < 0).any()) or bool((position_ids >= n_positions).any()):
-                raise ValueError(
-                    f"position_ids must be in [0, {n_positions}) (the precomputed RoPE "
-                    f"table range, model.max_seq_len); got min {int(position_ids.min())}, "
-                    f"max {int(position_ids.max())}"
-                )
             # Gather per-token frequencies: (batch, seq_len, head_dim // 2).
             # apply_rope broadcasts the batched form over heads.
             position_ids = position_ids.to(h.device)
