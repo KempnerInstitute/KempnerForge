@@ -1649,6 +1649,19 @@ class TestMuonResume:
         for (name, s), (_, t) in zip(saved, loaded, strict=True):
             assert torch.equal(s, t), f"{what} {name} not restored bit-exactly"
 
+    def test_checkpointed_optimizers_put_muon_first(self, tmp_path):
+        """Muon comes before its inner AdamW, so its param groups stay where a reader
+        that passes Muon alone expects them; an optimizer without inner ones is alone."""
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        model, opt = self._build(seed=0)
+        manager = CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model, opt)
+        assert manager.checkpointed_optimizers == [opt, opt._adam]
+
+        adamw = build_optimizer(model, OptimizerConfig(lr=1e-3, fused=False))
+        manager = CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model, adamw)
+        assert manager.checkpointed_optimizers == [adamw]
+
     def test_resume_matches_an_uninterrupted_run(self, tmp_path):
         """Regression: DCP's helpers saw Muon alone and dropped the inner AdamW's
         moments, so every resume restarted them from zero and diverged."""

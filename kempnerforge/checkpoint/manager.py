@@ -53,17 +53,6 @@ _NEVER_STEPPED_KEY = "optimizer_never_stepped"
 _NEVER_STEPPED_PREFIX = f"{_NEVER_STEPPED_KEY}."
 
 
-def _checkpointed_optimizers(optimizer: torch.optim.Optimizer) -> list[torch.optim.Optimizer]:
-    """``optimizer`` plus the inner optimizers holding parameters its ``param_groups`` omit.
-
-    DCP's state-dict helpers see only an optimizer's own ``state`` and ``param_groups``.
-    Muon hands the parameters Newton-Schulz cannot take (1D, or too rectangular) to an
-    inner AdamW that it lists in ``inner_optimizers``; a checkpoint that does not pass
-    that AdamW alongside Muon loses its moments.
-    """
-    return [optimizer, *getattr(optimizer, "inner_optimizers", ())]
-
-
 def _saved_optimizer_param_groups(dcp_dir: Path) -> int:
     """Count the optimizer param groups in the DCP checkpoint at ``dcp_dir``."""
     metadata = dcp.FileSystemReader(str(dcp_dir)).read_metadata()
@@ -268,9 +257,15 @@ class CheckpointManager:
         self.config = config
         self.model = model
         self.optimizer = optimizer
-        # Every optimizer whose state the checkpoint holds: `optimizer` first,
-        # then any inner ones it hands parameters to (Muon's AdamW).
-        self._optimizers = _checkpointed_optimizers(optimizer)
+        # Every optimizer whose state the checkpoint holds: `optimizer` first, then
+        # the inner ones holding parameters its param_groups omit. DCP's state-dict
+        # helpers see only an optimizer's own state and param_groups, so Muon's
+        # AdamW for the parameters Newton-Schulz cannot take (1D, or too rectangular)
+        # must be passed alongside Muon or its moments are lost.
+        self.checkpointed_optimizers: list[torch.optim.Optimizer] = [
+            optimizer,
+            *getattr(optimizer, "inner_optimizers", ()),
+        ]
         self.base_dir = Path(config.dir)
         self._rank = dist.get_rank() if dist.is_initialized() else 0
         self._async_ckpt = AsyncCheckpointer(mode=config.async_mode)
@@ -390,7 +385,7 @@ class CheckpointManager:
         # resets to zero -> non-bit-exact resume; see manager load()). The inner
         # optimizers share the "optimizer" entry, their param groups after the outer
         # one's, so a reader that passes the outer optimizer alone still finds its state.
-        optim_state = get_optimizer_state_dict(self.model, self._optimizers)
+        optim_state = get_optimizer_state_dict(self.model, self.checkpointed_optimizers)
         dcp_state = {
             "model": get_model_state_dict(self.model),
             "optimizer": optim_state,
@@ -798,9 +793,9 @@ class CheckpointManager:
         lacks, so the load restores the outer optimizer alone and leaves the inner ones
         fresh, as every resume from it did before, and warns that it is not bit-exact.
         """
-        inner = self._optimizers[1:]
+        inner = self.checkpointed_optimizers[1:]
         if not inner or _saved_optimizer_param_groups(dcp_dir) != len(self.optimizer.param_groups):
-            return self._optimizers
+            return self.checkpointed_optimizers
         name = type(self.optimizer).__name__
         n_params = sum(p.numel() for opt in inner for g in opt.param_groups for p in g["params"])
         logger.warning(
@@ -809,7 +804,7 @@ class CheckpointManager:
             f"{n_params:,} parameters its inner optimizer updates start from fresh moments, "
             f"so this resume is not bit-exact. Checkpoints saved from now on include them."
         )
-        return self._optimizers[:1]
+        return self.checkpointed_optimizers[:1]
 
     def _cleanup(self) -> None:
         """Remove old checkpoints beyond the retention limit.
