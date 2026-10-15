@@ -205,6 +205,7 @@ def main() -> None:
         tok_s: dict[str, float] = {}
         peak_gb: dict[str, float] = {}
         for arm, backend, packed in ARMS:
+            failed = torch.zeros(1, device=device)
             try:
                 torch.manual_seed(0)
                 config = ModelConfig(**BASE, attention_backend=backend)
@@ -217,9 +218,17 @@ def main() -> None:
                 peak_gb[arm] = gb
                 del step
             except Exception as exc:  # noqa: BLE001 - one OOM must not end the sweep
+                failed.fill_(1)
+                log(f"  {arm} @ {seq_len}: FAILED {type(exc).__name__}: {str(exc)[:70]}", rank)
+
+            # Whether a cell failed has to be agreed on. Stages hold different
+            # amounts of memory under PP, so one rank can OOM while the others
+            # march on to the next cell and block forever on a collective that
+            # nobody will match.
+            torch.distributed.all_reduce(failed)
+            if failed.item() > 0:
                 tok_s[arm] = float("nan")
                 peak_gb[arm] = float("nan")
-                log(f"  {arm} @ {seq_len}: FAILED {type(exc).__name__}: {str(exc)[:70]}", rank)
             torch.cuda.empty_cache()
 
         ratio = tok_s["flex+pack"] / tok_s["sdpa+pack"]
