@@ -104,6 +104,8 @@ name = "muon"
 lr = 0.02
 muon_momentum = 0.95
 muon_ns_steps = 5
+muon_nesterov = false
+muon_adjust_lr = "original"
 muon_orthogonalize = "local"
 # muon_adam_lr omitted -> use same LR as Muon for 1D params
 weight_decay = 0.1
@@ -145,6 +147,23 @@ DTensor / FSDP2 notes:
 - `muon_adam_lr` unset (default) makes the internal AdamW use the same
   LR as Muon. Pass a smaller value (e.g. `muon_adam_lr = 1e-4`) if you
   want 1D params on a gentler schedule.
+
+Momentum and update scale:
+
+- `muon_nesterov = true` orthogonalizes the Nesterov look-ahead `g + μ·buf`
+  instead of the momentum buffer `buf` -- the default of Keller Jordan's
+  reference implementation and `torch.optim.Muon`.
+- `muon_adjust_lr` sets the factor on each orthogonalized `rows × cols` update,
+  with the same names as `torch.optim.Muon`'s `adjust_lr_fn`:
+  `"original"` (default) `sqrt(max(1, rows/cols))`; `"match_rms_adamw"`
+  `0.2·sqrt(max(rows, cols))`, which gives every matrix an AdamW-like update RMS
+  so AdamW's `lr` and `weight_decay` carry over; `"spectral_unclamped"`
+  `sqrt(rows/cols)`.
+- `rows × cols` is the matrix Newton-Schulz ran on: each rank's shard under
+  `muon_orthogonalize = "local"`, the full weight under `"exact"`. Under
+  `"local"`, `"original"` and `"match_rms_adamw"` keep a sharded update's RMS
+  close to the unsharded one, but `"spectral_unclamped"` shrinks it once the
+  shards are wider than tall, so pair that mode with `"exact"`.
 
 Newton-Schulz coefficients (hard-coded): `a = 3.4445, b = -4.7750, c =
 2.0315`, Frobenius-normalized input — standard values from the Muon
