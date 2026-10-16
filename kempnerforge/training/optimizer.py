@@ -20,7 +20,7 @@ import logging
 
 import torch
 
-from kempnerforge.config.optimizer import MUON_ORTHOGONALIZE_MODES
+from kempnerforge.config.optimizer import MUON_ADJUST_LR_MODES, MUON_ORTHOGONALIZE_MODES
 from kempnerforge.config.registry import registry
 from kempnerforge.config.schema import OptimizerConfig
 from kempnerforge.training.orthogonalize import orthogonalize_exact
@@ -326,6 +326,15 @@ def _orthogonalize_matrix(matrix: torch.Tensor, steps: int) -> torch.Tensor:
     return _newton_schulz(matrix.float(), steps=steps).to(matrix.dtype)
 
 
+def _muon_update_scale(adjust_lr: str, rows: int, cols: int) -> float:
+    """Factor on Muon's orthogonalized update for a ``rows`` x ``cols`` matrix."""
+    if adjust_lr == "match_rms_adamw":
+        return 0.2 * max(rows, cols) ** 0.5
+    if adjust_lr == "spectral_unclamped":
+        return (rows / cols) ** 0.5
+    return max(1, rows / cols) ** 0.5
+
+
 def _get_local_tensor(t: torch.Tensor) -> torch.Tensor:
     """Extract the local (non-DTensor) tensor from a possibly-sharded parameter.
 
@@ -368,6 +377,9 @@ class Muon(torch.optim.Optimizer):
         adam_eps: Epsilon for the AdamW fallback.
         ns_steps: Newton-Schulz iteration steps (default 5).
         adam_lr: Learning rate for AdamW fallback (1D params). None = same as lr.
+        nesterov: Feed Newton-Schulz the Nesterov look-ahead instead of the momentum buffer.
+        adjust_lr: Update scale: "original" sqrt(max(1, rows/cols)), "match_rms_adamw"
+            0.2 * sqrt(max(rows, cols)), or "spectral_unclamped" sqrt(rows/cols).
         orthogonalize: "local" runs Newton-Schulz on each rank's shard, "exact" on the full
             matrix.
     """
@@ -383,8 +395,12 @@ class Muon(torch.optim.Optimizer):
         adam_eps: float = 1e-8,
         ns_steps: int = 5,
         adam_lr: float | None = None,
+        nesterov: bool = False,
+        adjust_lr: str = "original",
         orthogonalize: str = "local",
     ):
+        if adjust_lr not in MUON_ADJUST_LR_MODES:
+            raise ValueError(f"adjust_lr must be one of {MUON_ADJUST_LR_MODES}, got {adjust_lr!r}")
         if orthogonalize not in MUON_ORTHOGONALIZE_MODES:
             raise ValueError(
                 f"orthogonalize must be one of {MUON_ORTHOGONALIZE_MODES}, got {orthogonalize!r}"
@@ -411,6 +427,8 @@ class Muon(torch.optim.Optimizer):
             momentum=momentum,
             weight_decay=weight_decay,
             ns_steps=ns_steps,
+            nesterov=nesterov,
+            adjust_lr=adjust_lr,
             orthogonalize=orthogonalize,
         )
         super().__init__(muon_params, defaults)
@@ -460,6 +478,8 @@ class Muon(torch.optim.Optimizer):
             momentum = group["momentum"]
             wd = group["weight_decay"]
             ns_steps = group["ns_steps"]
+            nesterov = group.get("nesterov", self.defaults["nesterov"])
+            adjust_lr = group.get("adjust_lr", self.defaults["adjust_lr"])
             orthogonalize = group.get("orthogonalize", self.defaults["orthogonalize"])
 
             params = [p for p in group["params"] if p.grad is not None]
@@ -478,7 +498,7 @@ class Muon(torch.optim.Optimizer):
                     state["momentum_buffer"] = torch.zeros_like(p.grad)
                 buf_local = _get_local_tensor(state["momentum_buffer"])
                 buf_local.mul_(momentum).add_(g_local)
-                inputs.append(buf_local)
+                inputs.append(g_local.add(buf_local, alpha=momentum) if nesterov else buf_local)
 
             matrices = [x.view(x.shape[0], -1) for x in inputs]
             newton_schulz = functools.partial(_orthogonalize_matrix, steps=ns_steps)
@@ -491,12 +511,11 @@ class Muon(torch.optim.Optimizer):
                 p_local = _get_local_tensor(p)
                 update = ortho.view(x.shape)
 
-                # Scale: NS produces unit-norm rows, scale by sqrt(m/n)
                 if orthogonalize == "exact":
                     m, n = p.shape[0], p.shape[1:].numel()
                 else:
                     m, n = ortho.shape
-                update.mul_(max(1, m / n) ** 0.5)
+                update.mul_(_muon_update_scale(adjust_lr, m, n))
 
                 # Decoupled weight decay
                 if wd > 0:
@@ -570,6 +589,8 @@ def _build_muon(
         adam_eps=config.eps,
         ns_steps=config.muon_ns_steps,
         adam_lr=config.muon_adam_lr,
+        nesterov=config.muon_nesterov,
+        adjust_lr=config.muon_adjust_lr,
         orthogonalize=config.muon_orthogonalize,
     )
 
