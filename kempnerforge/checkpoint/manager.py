@@ -444,8 +444,7 @@ class CheckpointManager:
                 f"still resume."
             )
             return view
-        if "rng" in entry:
-            view["rng"] = entry["rng"]
+        view["rng"] = entry["rng"]
         if "dataloader" in entry:
             view["dataloader"] = entry["dataloader"]
         return view

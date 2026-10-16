@@ -120,7 +120,8 @@ def _save_four_rank_ckpt(tmp_path, monkeypatch, payloads, step: int, layout=None
         _install_fake_world(m, payloads, events, layout=layout)
         mgr = _mock_mgr(tmp_path, m, dp_info=layout[0] if layout is not None else None)
         set_rng_state(payloads[0]["rng"])
-        mgr.save(step=step, tokens_seen=step * 64, dataloader=Rank0Loader())
+        loader = Rank0Loader() if "dataloader" in payloads[0] else None
+        mgr.save(step=step, tokens_seen=step * 64, dataloader=loader)
     return events
 
 
@@ -448,6 +449,21 @@ class TestFourRankSaveLoad:
             assert mgr._pending_dataloader_state == {"cursor": 100 + r, "prefetch_depth": 1 + r}
             assert _draw() == expected[r], f"rank {r} did not restore its own RNG streams"
 
+    def test_rng_only_entries_restore_rng_and_no_loader_state(self, tmp_path, monkeypatch):
+        """Without a stateful loader every entry is rng-only: each rank restores its
+        own RNG streams and no loader state is pending."""
+        payloads, expected = _mk_payloads(seed_base=1000, cursor_base=100)
+        for p in payloads.values():
+            del p["dataloader"]
+        _save_four_rank_ckpt(tmp_path, monkeypatch, payloads, step=7)
+
+        for r in range(WORLD):
+            _seed_all(555)
+            mgr, (step, _, _) = _load_as_rank(tmp_path, monkeypatch, rank=r, step=7)
+            assert step == 7
+            assert mgr._pending_dataloader_state is None
+            assert _draw() == expected[r], f"rank {r} did not restore its own RNG streams"
+
     def test_saved_entries_are_distinct_across_ranks(self, tmp_path, monkeypatch):
         payloads, _ = _mk_payloads(seed_base=1000, cursor_base=100)
         _save_four_rank_ckpt(tmp_path, monkeypatch, payloads, step=7)
@@ -735,8 +751,9 @@ class TestDataParallelLayout:
             {0: (0, 4), 1: (1, 4), 2: (2, 4), 3: (3, 0)},  # dp_size not positive
             {0: (0, 4), 1: (1, 4), 2: (2, 4), 3: ("3", 4)},  # not an int
             {0: (0, 4), 1: (1, 4), 2: (2, 4), 3: (3, 4, 1)},  # not a pair
+            {0: (0, 4), 1: (1, 4), 2: (2, 4), 3: (3, 4), 4: (0, 4), "x": (0, 4)},  # extra keys
         ],
-        ids=["absent", "list", "incomplete", "rank_range", "size", "str", "triple"],
+        ids=["absent", "list", "incomplete", "rank_range", "size", "str", "triple", "extra"],
     )
     @pytest.mark.parametrize("current", [DP4, None], ids=["current_dp4", "current_unknown"])
     def test_malformed_saved_layout_refused_on_every_rank(self, saved_layout, current):
