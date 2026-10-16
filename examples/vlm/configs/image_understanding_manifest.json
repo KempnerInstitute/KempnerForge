@@ -5,13 +5,13 @@
     "artifacts": [
       {
         "label": "stage1_resolved_config",
-        "path": "/n/holystore01/LABS/kempner_project_d/Lab/checkpoints/qwen3-siglip2-2stage/stage-1/qwen3-si-dcpacked-s1-50k-p16-512-k2mlp/20260728_093549/qwen3-si-dcpacked-s1-50k-p16-512-k2mlp_20260728_093549.yml",
+        "run_id": "qwen3-si-dcpacked-s1-50k-p16-512-k2mlp/20260728_093549/qwen3-si-dcpacked-s1-50k-p16-512-k2mlp_20260728_093549.yml",
         "sha256": "d3e8e7546be8ae9342633aab2ab37892717c87704405a60484d84d75ca24dce1",
         "byte_size": 2577
       },
       {
         "label": "stage2_resolved_config",
-        "path": "/n/holystore01/LABS/kempner_project_d/Lab/checkpoints/qwen3-siglip2-2stage/stage-2/qwen3-si-s2-ao-s1-50k-p16-512-k2mlp-tile-3x3-view-90k-pixmo-text/20260928_140202/qwen3-si-s2-ao-s1-50k-p16-512-k2mlp-tile-3x3-view-90k-pixmo-text_20260928_140202.yml",
+        "run_id": "qwen3-si-s2-ao-s1-50k-p16-512-k2mlp-tile-3x3-view-90k-pixmo-text/20260928_140202/qwen3-si-s2-ao-s1-50k-p16-512-k2mlp-tile-3x3-view-90k-pixmo-text_20260928_140202.yml",
         "sha256": "ad51bd30c335b3f559b9dc95fd56ab7c1fc3d38bfc40e2ca7f3f17d3eb58165c",
         "byte_size": 13700
       }
@@ -28,7 +28,7 @@
     ],
     "notes": [
       "stage 1 initializes from the published Qwen/Qwen3-0.6B and google/siglip2-so400m-patch16-512 weights with a fresh connector; no multimodal init checkpoint",
-      "stage 2 historical init: /n/holystore01/LABS/kempner_project_d/Lab/checkpoints/cross-modal/init/dcpacked-s1-50k-p16-512-k2mlp.pt (4731939817 bytes, relationship human_confirmed); tensor-level identity is not verified",
+      "stage 2 historical init: dcpacked-s1-50k-p16-512-k2mlp.pt (4731939817 bytes, relationship human_confirmed); tensor-level identity is not verified",
       "selected endpoint: step 90000, epoch 0, 180000 microbatches, mlflow run d918522c4dd949ecaf600898b919ecb7; the 72k-to-final-launch relationship is inferred_lineage",
       "historical connector kwargs: adapter_type avgpool, input_dim 1152, output_dim 1024, kernel 2, hidden_dim 1152"
     ]

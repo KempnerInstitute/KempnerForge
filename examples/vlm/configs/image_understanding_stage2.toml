@@ -60,7 +60,7 @@ lm_tie_embeddings_metadata = true
 lm_untie_at_runtime = true
 loss_reduction = "sample_mean"
 source_manifest = "image_understanding_manifest.json"
-source_manifest_sha256 = "41f821828b0b3723f10de6c6bfba5f6557d026db3aca2f38c1276d07dc768a83"
+source_manifest_sha256 = "4a398aae7930baf9e80ab073fb067c5204f324a6781a35b3b9c847e75808efab"
 production_launch = false
 init_checkpoint = ""  # a launch sets the stage-1 endpoint here; empty blocks production
 

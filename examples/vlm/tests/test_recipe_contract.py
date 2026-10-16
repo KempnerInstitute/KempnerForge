@@ -12,6 +12,9 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import re
+import tomllib
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -33,6 +36,21 @@ MANIFEST = CONFIG_DIR / "image_understanding_manifest.json"
 # Content hashes of the two pinned source artifacts (read-only audit values).
 STAGE1_YML_SHA256 = "d3e8e7546be8ae9342633aab2ab37892717c87704405a60484d84d75ca24dce1"
 STAGE2_YML_SHA256 = "ad51bd30c335b3f559b9dc95fd56ab7c1fc3d38bfc40e2ca7f3f17d3eb58165c"
+
+# Run identifiers of the two pinned source artifacts: <job name>/<timestamp>/<file name>.
+STAGE1_RUN_ID = (
+    "qwen3-si-dcpacked-s1-50k-p16-512-k2mlp/20260728_093549/"
+    "qwen3-si-dcpacked-s1-50k-p16-512-k2mlp_20260728_093549.yml"
+)
+STAGE2_RUN_ID = (
+    "qwen3-si-s2-ao-s1-50k-p16-512-k2mlp-tile-3x3-view-90k-pixmo-text/20260928_140202/"
+    "qwen3-si-s2-ao-s1-50k-p16-512-k2mlp-tile-3x3-view-90k-pixmo-text_20260928_140202.yml"
+)
+
+# An absolute path: "/" (or home-relative "~/") at the start of a string or after any
+# character that cannot continue a path token. Prose with an embedded path matches; hub ids
+# ("owner/name") and relative paths do not.
+ABSOLUTE_PATH = re.compile(r"(?<![\w.~/-])(?:/[\w.~-]|~/)")
 
 # Registered connectors by how they treat the patch grid.
 POOLING_CONNECTORS = ("avgpool", "attentional_pool")
@@ -309,6 +327,22 @@ def _with_geometry(
 
 def _raw_manifest() -> dict:
     return json.loads(MANIFEST.read_bytes())
+
+
+def _string_values(node: object) -> Iterator[str]:
+    """Every string value in a parsed JSON or TOML document, at any depth."""
+    if isinstance(node, str):
+        yield node
+    elif isinstance(node, dict):
+        for value in node.values():
+            yield from _string_values(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from _string_values(value)
+
+
+def _absolute_paths(document: object) -> list[str]:
+    return [text for text in _string_values(document) if ABSOLUTE_PATH.search(text)]
 
 
 def _config_with_manifest(
@@ -795,14 +829,32 @@ class TestManifest:
         digest = hashlib.sha256(MANIFEST.read_bytes()).hexdigest()
         assert digest == stage1_vlm.source_manifest_sha256
 
-    def test_provenance_records_the_source_artifact_hashes(self, stage1_vlm) -> None:
+    def test_provenance_records_the_source_run_ids_and_hashes(self, stage1_vlm) -> None:
         manifest = recipe.load_source_manifest(stage1_vlm)
         by_label = {a.label: a for a in manifest.artifacts}
         assert set(by_label) == {"stage1_resolved_config", "stage2_resolved_config"}
+        assert by_label["stage1_resolved_config"].run_id == STAGE1_RUN_ID
         assert by_label["stage1_resolved_config"].sha256 == STAGE1_YML_SHA256
         assert by_label["stage1_resolved_config"].byte_size == 2577
+        assert by_label["stage2_resolved_config"].run_id == STAGE2_RUN_ID
         assert by_label["stage2_resolved_config"].sha256 == STAGE2_YML_SHA256
         assert by_label["stage2_resolved_config"].byte_size == 13700
+
+    def test_init_checkpoint_is_named_by_file_name_only(self, stage1_vlm) -> None:
+        manifest = recipe.load_source_manifest(stage1_vlm)
+        init_notes = [n for n in manifest.notes if n.startswith("stage 2 historical init:")]
+        assert len(init_notes) == 1
+        assert init_notes[0].startswith(
+            "stage 2 historical init: dcpacked-s1-50k-p16-512-k2mlp.pt (4731939817 bytes,"
+        )
+
+    def test_provenance_artifact_must_use_run_id_not_path(self, tmp_path: Path, stage1_vlm) -> None:
+        raw = _raw_manifest()
+        entry = raw["provenance"]["artifacts"][0]
+        entry["path"] = entry.pop("run_id")
+        config = _config_with_manifest(stage1_vlm, tmp_path, raw)
+        with pytest.raises(ValueError, match="provenance artifact: unknown keys"):
+            recipe.load_source_manifest(config)
 
     def test_open_checklist_mirrors_the_config_fields(self, stage1_vlm) -> None:
         manifest = recipe.load_source_manifest(stage1_vlm)
@@ -876,6 +928,60 @@ class TestManifest:
     def test_bad_manifest_reference_hash_format_is_refused(self, stage1_vlm) -> None:
         with pytest.raises(ValueError, match="64 lowercase hex"):
             dataclasses.replace(stage1_vlm, source_manifest_sha256="abc123")
+
+
+class TestNoAbsolutePaths:
+    """Committed recipe files name external artifacts by run id and hash, never by location."""
+
+    @pytest.mark.parametrize(
+        "template",
+        ["{}", "init at {} (12 bytes)", "({})", "root={}"],
+        ids=["alone", "in prose", "bracketed", "assigned"],
+    )
+    def test_detector_flags_an_absolute_path_wherever_it_sits(
+        self, template: str, tmp_path: Path
+    ) -> None:
+        absolute = str(tmp_path / "dir" / "file.yml")
+        assert absolute.startswith("/")
+        assert ABSOLUTE_PATH.search(template.format(absolute))
+
+    def test_detector_flags_a_home_relative_path(self) -> None:
+        assert ABSOLUTE_PATH.search("~/dir/file")
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "Qwen/Qwen3-0.6B",
+            "run-name/20260728_093549/run-name_20260728_093549.yml",
+            "checkpoints/image_understanding_stage1",
+            "./dir/file",
+            "and/or 1/2 a / b dir/",
+            "",
+        ],
+    )
+    def test_detector_passes_relative_identifiers(self, text: str) -> None:
+        assert not ABSOLUTE_PATH.search(text)
+
+    def test_scan_reaches_strings_nested_in_tables_and_lists(self, tmp_path: Path) -> None:
+        run_file = str(tmp_path / "run.yml")
+        note = f"init {tmp_path / 'init.pt'} (1 bytes)"
+        document = {
+            "provenance": {
+                "artifacts": [{"run_id": run_file, "byte_size": 7}],
+                "notes": ["ok", note],
+            },
+            "flag": True,
+        }
+        assert _absolute_paths(document) == [run_file, note]
+
+    @pytest.mark.parametrize("path", [MANIFEST, STAGE1_TOML, STAGE2_TOML], ids=lambda p: p.name)
+    def test_committed_recipe_files_hold_no_absolute_path(self, path: Path) -> None:
+        if path.suffix == ".toml":
+            document = tomllib.loads(path.read_text())
+        else:
+            document = json.loads(path.read_bytes())
+        assert list(_string_values(document))
+        assert _absolute_paths(document) == []
 
 
 class TestManifestContainers:

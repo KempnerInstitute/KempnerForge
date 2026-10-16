@@ -457,10 +457,14 @@ class ImageUnderstandingConfig(VLMConfig):
 
 @dataclass(frozen=True)
 class ManifestArtifact:
-    """One pinned source artifact: recorded location and content hash."""
+    """One pinned source artifact: run identifier and content hash.
+
+    ``run_id`` reads ``<job name>/<timestamp>/<file name>``; it names the
+    artifact and is not a filesystem location.
+    """
 
     label: str
-    path: str
+    run_id: str
     sha256: str
     byte_size: int
 
@@ -570,7 +574,7 @@ def load_source_manifest(
     _require_keys(raw["provenance"], {"artifacts", "open", "notes"}, "provenance")
     artifacts = []
     for entry in raw["provenance"]["artifacts"]:
-        _require_keys(entry, {"label", "path", "sha256", "byte_size"}, "provenance artifact")
+        _require_keys(entry, {"label", "run_id", "sha256", "byte_size"}, "provenance artifact")
         if not _SHA256_RE.fullmatch(entry["sha256"]):
             raise ValueError(f"manifest artifact {entry['label']!r}: malformed sha256")
         if entry["byte_size"] <= 0:
