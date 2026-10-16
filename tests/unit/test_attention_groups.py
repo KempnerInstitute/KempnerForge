@@ -290,6 +290,16 @@ class TestDenseAttentionPath:
         visible = _from_visible(PACK_VISIBLE).expand_as(weights)
         assert torch.equal(weights != 0, visible)
 
+    def test_captured_weights_without_groups_are_block_diagonal_causal(self):
+        attn, x, cos, sin = self._setup(PACK_DOCS, seed=4)
+        attn.capture_attention_weights = True
+        with torch.no_grad():
+            attn(x, cos, sin, doc_ids=PACK_DOCS)
+        weights = attn.last_attention_weights
+        assert weights is not None
+        expected = _block_diag(_ones(6).tril(), _ones(4).tril(), _ones(2).tril())
+        assert torch.equal(weights != 0, expected.expand_as(weights))
+
 
 class TestFlexForwardParity:
     """Flex output against SDPA under the expected dense mask, fp64 on CPU."""
