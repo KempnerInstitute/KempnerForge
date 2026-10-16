@@ -1,0 +1,150 @@
+# Stage 2 contract of the two-stage image-understanding recipe.
+#
+# Full finetune (LM, tower, connector all train) on the pinned 273-occurrence
+# source mixture, 3x3 tiling plus a global view, answer-only loss,
+# bidirectional image attention scoped per view. The ordered source list and
+# provenance live in the manifest the [vlm] table references.
+#
+# A production launch of this stage requires init_checkpoint (a stage-1
+# endpoint) and every stage-2 OPEN provenance field to be resolved;
+# production_launch = true refuses to validate before then.
+#
+# The per-group optimizer values in [vlm.stage.optim_*] are the recipe
+# authority; the single [optimizer]/[scheduler] sections below mirror the
+# language group until per-group wiring lands, and the stage contract's
+# grad_clip_norm = 0.0 (no clipping) is authoritative over [train].
+
+plugins = ["recipe"]
+
+[model]
+dim = 1024
+n_layers = 28
+n_heads = 16
+n_kv_heads = 8
+head_dim_override = 128
+vocab_size = 151936
+ffn_hidden_dim = 3072
+norm_type = "rmsnorm"
+norm_eps = 1e-6
+activation = "silu"
+qk_norm = true
+rope_theta = 1000000.0
+tie_embeddings = false  # untied at runtime; the published LM's tie is metadata (see [vlm])
+max_seq_len = 16384
+
+# Dims are probed at build time (feature_dim 1152, num_tokens 1024 for p16-512);
+# the pinned geometry lives in [vlm.stage.geometry].
+[vision_encoder]
+type = "siglip2"
+path = "google/siglip2-so400m-patch16-512"
+
+[adapter]
+type = "avgpool"
+pool_window = 2
+hidden_dim = 1152
+
+[vlm]
+arch = "image_understanding"
+max_text_len = 256
+freeze = []
+lm_backbone_id = "Qwen/Qwen3-0.6B"
+tokenizer_id = "Qwen/Qwen3-0.6B"
+vision_tower_id = "google/siglip2-so400m-patch16-512"
+connector_type = "avgpool"
+connector_hidden_dim = 1152
+use_chat_template = true
+caption_prompt = "Provide a short caption for the image."
+vision_border = false
+nominal_text_context = 256
+lm_tie_embeddings_metadata = true
+lm_untie_at_runtime = true
+loss_reduction = "sample_mean"
+source_manifest = "image_understanding_manifest.json"
+source_manifest_sha256 = "4a398aae7930baf9e80ab073fb067c5204f324a6781a35b3b9c847e75808efab"
+production_launch = false
+init_checkpoint = ""  # a launch sets the stage-1 endpoint here; empty blocks production
+
+[vlm.stage]
+stage = 2
+max_steps = 90000
+epochs = 40
+seed = 1
+accumulation_steps = 2
+data_parallel_ranks = 16
+train_lm = true
+answer_only_loss = true
+image_attention = "bidirectional"
+bidirectional_scope = "view"
+vision_tower_precision = "mixed_bfloat16"
+vision_attn_implementation = "sdpa"
+resume_reset_data_order = true
+grad_clip_norm = 0.0
+
+[vlm.stage.geometry]
+image_size = 512
+patch_size = 16
+pool_window = 2
+tile_grid = 3
+include_global_view = true
+tokens_per_view = 256
+pack_budget = 16384
+
+[vlm.stage.optim_vision]
+lr = 1e-5
+warmup_steps = 6000
+schedule_steps = 84000
+min_lr = 1e-6
+start_factor = 5e-4
+
+[vlm.stage.optim_language]
+lr = 5e-5
+warmup_steps = 6000
+schedule_steps = 84000
+min_lr = 5e-6
+start_factor = 5e-4
+
+[vlm.stage.optim_mixer]
+lr = 1e-5
+warmup_steps = 6000
+schedule_steps = 84000
+min_lr = 1e-6
+start_factor = 5e-4
+
+[train]
+batch_size = 1
+seq_len = 16384
+max_steps = 90000
+grad_accum_steps = 2
+seed = 1
+compile_model = false
+activation_checkpointing = "full"
+
+[optimizer]
+name = "adamw"
+lr = 5e-5
+weight_decay = 0.1
+betas = [0.9, 0.95]
+eps = 1e-8
+fused = true
+
+[scheduler]
+name = "cosine"
+warmup_steps = 6000
+min_lr_ratio = 0.1
+
+[data]
+tokenizer_path = "Qwen/Qwen3-0.6B"
+num_workers = 4
+pin_memory = true
+
+[distributed]
+dp_shard = -1
+
+[checkpoint]
+dir = "checkpoints/image_understanding_stage2"
+interval = 6000
+keep_last_n = 2
+
+[metrics]
+log_interval = 10
+enable_wandb = false
