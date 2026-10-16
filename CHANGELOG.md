@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Exact Muon orthogonalization for sharded weights** (`optimizer.muon_orthogonalize = "exact"`). The default `"local"` runs Newton-Schulz on each rank's shard and scales it by the shard's shape, which keeps the update's RMS but not its direction: the result is not the full-matrix one and changes with the shard count. `"exact"` gathers each row-sharded matrix onto one rank of its shard group with an all-to-all, orthogonalizes it there, scatters it back and scales it by the full matrix's shape, so the update is bitwise the single-process one and each matrix's work runs once. Other sharded layouts are all-gathered.
+  - `kempnerforge/training/orthogonalize.py` (new): `orthogonalize_exact`.
+  - Tests: `tests/unit/test_orthogonalize.py`, which compares against one process bitwise over gloo with 2 and 4 ranks, uneven rows, an HSDP mesh and a column shard, and steps Muon on row shards in both modes; and `tests/distributed/test_muon_exact.py` (NCCL).
 - **VLM example: video captioning config on a pretrained 0.6B backbone** (`examples/vlm/configs/vlm_qwen3_0.6b_joint_decoder_webvid.toml`), warm-started weights-only from the converted checkpoint.
 - **VLM example: converter from a pretrained Hugging Face backbone** (`examples/vlm/scripts/convert_hf_backbone.py`): writes a complete warm-start checkpoint for a VLM config and refuses any mismatch with the source's `config.json`, shard index, keys, shapes, or the epsilon the built model normalises with.
 - **`adapter.pre_norm`**: an optional norm-registry norm over the vision features ahead of `mlp_2layer`'s first projection (`adapter.ln_q`), re-initialized through the norm's `reset_parameters()` (added to `RMSNorm`); `""` (default) builds none, so existing configs are unchanged.

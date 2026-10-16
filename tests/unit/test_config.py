@@ -291,6 +291,13 @@ class TestOptimizerConfig:
         with pytest.raises(ValueError, match="muon_ns_steps"):
             OptimizerConfig(muon_ns_steps=0)
 
+    def test_muon_orthogonalize_defaults_to_local(self):
+        assert OptimizerConfig().muon_orthogonalize == "local"
+
+    def test_rejects_unknown_muon_orthogonalize(self):
+        with pytest.raises(ValueError, match="muon_orthogonalize must be one of"):
+            OptimizerConfig(muon_orthogonalize="global")
+
     def test_rejects_negative_schedule_free_warmup(self):
         with pytest.raises(ValueError, match="schedule_free_warmup_steps"):
             OptimizerConfig(schedule_free_warmup_steps=-1)
