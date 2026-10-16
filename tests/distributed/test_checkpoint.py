@@ -378,6 +378,25 @@ class TestCheckpointSaveBarrier:
             f"rank {rank}: metadata.json not visible after save()"
         )
 
+    def test_a_failed_cleanup_does_not_hang_save(self, distributed_env, shared_tmp_dir):
+        """A checkpoint rank 0 cannot remove must not stop the save the other ranks wait on."""
+        import errno
+
+        from kempnerforge.config.schema import OptimizerConfig
+
+        model = Transformer(SMALL_CONFIG).cuda()
+        apply_fsdp2(model, distributed_env)
+        opt = build_optimizer(model, OptimizerConfig(lr=1e-3, fused=False))
+        mgr = CheckpointManager(CheckpointConfig(dir=shared_tmp_dir, keep_last_n=1), model, opt)
+
+        busy = OSError(errno.ENOTEMPTY, "Directory not empty")
+        with patch.object(mgr_mod.shutil, "rmtree", side_effect=busy):
+            mgr.save(step=1)
+            mgr.save(step=2)
+
+        if dist.get_rank() == 0:
+            assert (Path(shared_tmp_dir) / "step_1").is_dir(), "the failed removal deleted step_1"
+
 
 class TestCheckpointLoadDivergentExistence:
     """load() must not hang if ranks disagree about train_state.pt existence.

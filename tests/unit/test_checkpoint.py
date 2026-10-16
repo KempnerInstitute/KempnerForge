@@ -228,6 +228,33 @@ class TestCheckpointRetention:
         # All dynamic milestones kept; only the last keep_last_n=2 interval ckpts kept.
         assert remaining == [0, 1, 2, 4, 256, 512, 2000, 3000]
 
+    def test_cleanup_retries_a_checkpoint_it_could_not_remove(self, tmp_path, monkeypatch):
+        """A failed removal is logged instead of raised, and the next cleanup retries it."""
+        import errno
+
+        from kempnerforge.checkpoint import manager as mgr_mod
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        model = torch.nn.Linear(4, 4)
+        opt = torch.optim.SGD(model.parameters(), lr=0.1)
+        mgr = CheckpointManager(CheckpointConfig(dir=str(tmp_path), keep_last_n=2), model, opt)
+        for i in [10, 20, 30]:
+            (tmp_path / f"step_{i}").mkdir()
+
+        def busy(path, *args, **kwargs):
+            raise OSError(errno.ENOTEMPTY, "Directory not empty", str(path))
+
+        warnings: list[str] = []
+        monkeypatch.setattr(mgr_mod.shutil, "rmtree", busy)
+        monkeypatch.setattr(mgr_mod.logger, "warning", warnings.append)
+        mgr._cleanup()
+        assert (tmp_path / "step_10").is_dir()
+        assert len(warnings) == 1 and "step_10" in warnings[0], warnings
+
+        monkeypatch.undo()
+        mgr._cleanup()
+        assert sorted(d.name for d in tmp_path.iterdir() if d.is_dir()) == ["step_20", "step_30"]
+
 
 # ---------------------------------------------------------------------------
 # AsyncCheckpointer

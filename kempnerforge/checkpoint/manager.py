@@ -860,5 +860,11 @@ class CheckpointManager:
         for d in to_remove:
             if d.resolve() in protected:
                 continue
-            shutil.rmtree(d)
+            try:
+                shutil.rmtree(d)
+            except OSError as e:
+                logger.warning(
+                    f"Could not remove old checkpoint {d} ({e}); the next cleanup retries it"
+                )
+                continue
             logger.info(f"Removed old checkpoint: {d}")
