@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import warnings
-
 import pytest
 import torch
 import torch.nn as nn
@@ -408,17 +406,17 @@ class TestWarmupStartFactor:
             ),
             max_steps=max_steps,
         )
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            refs = [
-                _torch_linear_warmup_cosine(lr, warmup, start, max_steps - warmup, min_ratio)
-                for lr in lrs
-            ]
-            for step in range(max_steps):
-                for group, (ref_opt, _) in zip(opt.param_groups, refs, strict=True):
-                    assert group["lr"] == pytest.approx(
-                        ref_opt.param_groups[0]["lr"], rel=1e-12, abs=0.0
-                    ), f"step {step}"
-                sched.step()
-                for _, ref in refs:
-                    ref.step()
+        refs = [
+            _torch_linear_warmup_cosine(lr, warmup, start, max_steps - warmup, min_ratio)
+            for lr in lrs
+        ]
+        for step in range(max_steps):
+            for group, (ref_opt, _) in zip(opt.param_groups, refs, strict=True):
+                assert group["lr"] == pytest.approx(
+                    ref_opt.param_groups[0]["lr"], rel=1e-12, abs=0.0
+                ), f"step {step}"
+            opt.step()
+            sched.step()
+            for ref_opt, ref in refs:
+                ref_opt.step()
+                ref.step()
