@@ -4,7 +4,12 @@ Uses PyTorch Distributed Checkpoint (DCP) for model and optimizer state,
 which supports automatic resharding (save with N GPUs, load with M GPUs).
 
 Non-distributed state (scheduler, dataloader, training meta, RNG) is saved
-separately as a torch file and broadcast from rank 0 on load.
+separately as a torch file written by rank 0 and broadcast from rank 0 on
+load. Dataloader and RNG state are per-rank: every rank's payload is gathered
+into a versioned envelope at save time, and on an exact resume
+(``load(exact_resume=True)``) each rank restores its own entry from the
+broadcast (see ``kempnerforge.checkpoint.state``). Any other load restores
+rank 0's single copy on every rank.
 """
 
 from __future__ import annotations
@@ -31,7 +36,15 @@ from torch.distributed.checkpoint.state_dict import (
 )
 
 from kempnerforge.checkpoint.async_save import AsyncCheckpointer
-from kempnerforge.checkpoint.state import build_train_state, restore_train_state
+from kempnerforge.checkpoint.state import (
+    PER_RANK_KEY,
+    build_per_rank_envelope,
+    build_train_state,
+    capture_rank_state,
+    dp_coordinates,
+    restore_train_state,
+    select_rank_state,
+)
 from kempnerforge.config.schema import AsyncCheckpointMode, CheckpointConfig
 
 logger = logging.getLogger(__name__)
@@ -243,6 +256,11 @@ class CheckpointManager:
         config: Checkpoint configuration.
         model: The model (FSDP-wrapped or plain).
         optimizer: The optimizer.
+        dp_info: This rank's ``(dp_rank, dp_size)``, the data partition its
+            loader reads. Recorded with the per-rank loader/RNG state and
+            checked on load, so a resume under a different data-parallel
+            layout is refused even at the same world size. None records no
+            layout and checks only the world size.
     """
 
     def __init__(
@@ -252,7 +270,14 @@ class CheckpointManager:
         optimizer: torch.optim.Optimizer,
         process_group=None,
         pp_rank: int | None = None,
+        dp_info: tuple[int, int] | None = None,
     ) -> None:
+        self._dp_info = dp_coordinates(dp_info) if dp_info is not None else None
+        if dp_info is not None and self._dp_info is None:
+            raise ValueError(
+                f"dp_info must be (dp_rank, dp_size) ints with 0 <= dp_rank < dp_size, "
+                f"got {dp_info!r}"
+            )
         self.config = config
         self.model = model
         self.optimizer = optimizer
@@ -262,6 +287,7 @@ class CheckpointManager:
         ]
         self.base_dir = Path(config.dir)
         self._rank = dist.get_rank() if dist.is_initialized() else 0
+        self._world_size = dist.get_world_size() if dist.is_initialized() else 1
         self._async_ckpt = AsyncCheckpointer(mode=config.async_mode)
         self._process_group = process_group
         self._pp_rank = pp_rank
@@ -344,6 +370,85 @@ class CheckpointManager:
         if dist.is_initialized():
             dist.barrier(group=self._sync_group)
 
+    def _gather_rank_states(self, dataloader: Any | None) -> dict[str, Any]:
+        """Collect every rank's own loader/RNG payload into a versioned envelope.
+
+        Collective (all ranks call it at the same point in ``save()``). Uses
+        the dedicated gloo group so the gather cannot interleave with DCP
+        collectives an in-flight async flush is issuing on the default group
+        from its background thread. Entries are keyed by each payload's own
+        global rank rather than by gather position, so the envelope is correct
+        under any group ordering. Each rank's ``dp_info`` rides along to
+        record the data-parallel layout.
+        """
+        mine = (self._rank, self._dp_info, capture_rank_state(dataloader))
+        gathered: list[Any] = [mine]
+        if dist.is_initialized():
+            gathered = [None] * self._world_size
+            dist.all_gather_object(gathered, mine, group=self._sync_group)
+        entries = {int(rank): state for rank, _, state in gathered}
+        coords = {int(rank): dp for rank, dp, _ in gathered}
+        layout = coords if all(dp is not None for dp in coords.values()) else None
+        return build_per_rank_envelope(entries, world_size=self._world_size, data_parallel=layout)
+
+    def _gather_dp_layout(self) -> dict[int, tuple[int, int]] | None:
+        """This run's global rank -> ``(dp_rank, dp_size)``, or None if unknown.
+
+        Collective on the dedicated gloo group: each rank knows only its own
+        coordinates, and the envelope check needs the whole layout so every
+        rank reaches the same verdict.
+        """
+        mine = (self._rank, self._dp_info)
+        gathered: list[Any] = [mine]
+        if dist.is_initialized():
+            gathered = [None] * self._world_size
+            dist.all_gather_object(gathered, mine, group=self._sync_group)
+        coords = {int(rank): dp for rank, dp in gathered}
+        return coords if all(dp is not None for dp in coords.values()) else None
+
+    def _per_rank_view(self, train_state: dict[str, Any]) -> dict[str, Any]:
+        """This rank's view of the broadcast train state on an exact resume.
+
+        A checkpoint with a per-rank envelope: the view replaces the legacy
+        single-copy ``rng``/``dataloader`` keys (always rank 0's) with this
+        rank's own entry, selected by global rank. With an envelope it gathers
+        the current data-parallel layout (a collective), so every rank must
+        call it. A topology or schema mismatch refuses the load unless
+        ``checkpoint.ignore_rank_state_mismatch`` downgrades it to a warning
+        that discards the saved loader/RNG state. The envelope check reads
+        only state every rank shares, so all ranks restore, refuse, or discard
+        together. A legacy checkpoint (no envelope) keeps its old behavior:
+        rank 0's single copy restores on every rank.
+        """
+        envelope = train_state.get(PER_RANK_KEY)
+        if envelope is None:
+            if self._world_size > 1 and self._rank == 0:
+                logger.info(
+                    "Checkpoint has no per-rank state (legacy format); rank 0's "
+                    "dataloader/RNG state restores on every rank"
+                )
+            return train_state
+        view = {k: v for k, v in train_state.items() if k not in ("rng", "dataloader")}
+        layout = self._gather_dp_layout()
+        try:
+            entry = select_rank_state(
+                envelope, rank=self._rank, world_size=self._world_size, data_parallel=layout
+            )
+        except ValueError as e:
+            if not self.config.ignore_rank_state_mismatch:
+                raise
+            logger.warning(
+                f"Discarding saved per-rank dataloader/RNG state because "
+                f"checkpoint.ignore_rank_state_mismatch=true: {e}. Data order and "
+                f"random streams restart fresh; model/optimizer/scheduler/step "
+                f"still resume."
+            )
+            return view
+        view["rng"] = entry["rng"]
+        if "dataloader" in entry:
+            view["dataloader"] = entry["dataloader"]
+        return view
+
     def save(
         self,
         step: int,
@@ -398,6 +503,14 @@ class CheckpointManager:
         # before doing anything else.
         self._drain_pending_finalize()
 
+        # Gather every rank's own loader/RNG payload (collective, all ranks)
+        # so the checkpoint can hand each rank back its own cursor and random
+        # streams on resume; the legacy single-copy keys hold only rank 0's.
+        # Runs before rank 0 publishes train_state.pt, on the dedicated gloo
+        # group: the DCP flush dispatched above may still be issuing
+        # collectives on the default group from its background thread.
+        per_rank = self._gather_rank_states(dataloader)
+
         # Save non-distributed state (rank 0 only). These are small synchronous
         # writes; they finish well before `latest` is ever pointed here, so
         # the checkpoint dir is fully populated by commit time.
@@ -408,6 +521,7 @@ class CheckpointManager:
                 scheduler=scheduler,
                 dataloader=dataloader,
                 extra=extra,
+                per_rank=per_rank,
             )
             torch.save(train_state, ckpt_dir / _TRAIN_STATE_FILE)
 
@@ -499,6 +613,7 @@ class CheckpointManager:
         dataloader: Any | None = None,
         exclude_keys: list[str] | None = None,
         vlm_freeze_expected: list[dict[str, Any]] | None = None,
+        exact_resume: bool = False,
     ) -> tuple[int, int, dict[str, Any]]:
         """Load a checkpoint and restore all state.
 
@@ -514,6 +629,14 @@ class CheckpointManager:
                 a mismatch raises ``ValueError`` unless the checkpoint
                 config has ``ignore_freeze_mismatch=True``, in which case
                 the load proceeds with a warning.
+            exact_resume: True only when the run resumes from its own
+                checkpoint (auto-resume). Each rank then restores its own
+                dataloader/RNG state from the per-rank envelope, which must
+                match this run's world size and data-parallel layout. Every
+                rank must pass the same value. False (a ``load_path`` warm
+                start, evaluation, any other load) restores the single-copy
+                ``rng``/``dataloader`` keys (rank 0's) on every rank with no
+                topology check.
 
         Returns:
             Tuple of (step, tokens_seen, extra) where extra contains any
@@ -670,6 +793,8 @@ class CheckpointManager:
                 train_state = object_list[0]
 
             assert train_state is not None, "train_state broadcast failed"
+            if exact_resume:
+                train_state = self._per_rank_view(train_state)
             # Stash dataloader state if the caller can't yet provide the loader
             # object. Training loops construct the dataloader after load() so
             # apply_dataloader_state() can restore it once it exists.

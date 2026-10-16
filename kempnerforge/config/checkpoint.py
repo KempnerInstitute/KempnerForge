@@ -76,6 +76,15 @@ class CheckpointConfig:
     # to True downgrades the mismatch to a warning. Useful when intentionally
     # switching from frozen to trainable mid-training.
     ignore_freeze_mismatch: bool = False
+    # An auto-resume restores each rank's own dataloader/RNG state, which is
+    # exact only on the topology that saved it. If the world size or the
+    # data-parallel layout changed (or the envelope is unreadable or
+    # incomplete), the resume raises on every rank by default. Setting this
+    # to True discards the saved per-rank loader/RNG state on every rank with
+    # a warning and resumes from model/optimizer/scheduler state only; data
+    # order and random streams restart fresh. Model/optimizer resharding never
+    # needs this flag, and a load_path warm start never checks the topology.
+    ignore_rank_state_mismatch: bool = False
 
     def __post_init__(self) -> None:
         if self.interval <= 0:

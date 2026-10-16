@@ -94,7 +94,10 @@ def main() -> None:
         logger.error("No checkpoint found. Specify --checkpoint.load_path or --checkpoint.dir")
         sys.exit(1)
 
-    step, tokens_seen, _ = ckpt_mgr.load(path=load_path, exclude_keys=["optimizer"])
+    # Evaluation is not a resume: no per-rank loader/RNG restore or topology check.
+    step, tokens_seen, _ = ckpt_mgr.load(
+        path=load_path, exclude_keys=["optimizer"], exact_resume=False
+    )
     logger.info(f"Loaded checkpoint: step={step}, tokens_seen={tokens_seen:,}")
 
     # --- Eval data ---

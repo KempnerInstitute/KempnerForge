@@ -526,3 +526,180 @@ class TestAsyncSaveBarrierNoDeadlock:
             assert latest.exists()
             assert latest.resolve().name == "step_40"
         dist.barrier()
+
+
+class _CursorLoader:
+    """Minimal stateful loader with a rank-local cursor."""
+
+    def __init__(self, cursor: int) -> None:
+        self.cursor = cursor
+        self.restored: dict | None = None
+
+    def state_dict(self) -> dict:
+        return {"cursor": self.cursor}
+
+    def load_state_dict(self, state: dict) -> None:
+        self.restored = dict(state)
+        self.cursor = state["cursor"]
+
+
+class TestPerRankState:
+    """Each rank must restore ITS OWN dataloader cursor and RNG streams.
+
+    Regression for the rank-0 broadcast bug: ``train_state.pt`` held only
+    rank 0's ``rng``/``dataloader`` and ``load()`` broadcast that single copy
+    to every rank, so divergent cursors and random streams collapsed onto
+    rank 0's on every resume.
+    """
+
+    @staticmethod
+    def _seed_all(seed: int) -> None:
+        import random as pyrandom
+
+        import numpy as np
+
+        pyrandom.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+    @staticmethod
+    def _draw() -> tuple[float, float, float, float]:
+        import random as pyrandom
+
+        import numpy as np
+
+        return (
+            pyrandom.random(),
+            float(np.random.random()),
+            float(torch.rand(())),
+            float(torch.rand((), device="cuda")),
+        )
+
+    def test_each_rank_restores_its_own_loader_and_rng(self, distributed_env, shared_tmp_dir):
+        from kempnerforge.config.schema import OptimizerConfig
+
+        rank = dist.get_rank()
+        world = dist.get_world_size()
+
+        torch.manual_seed(42)
+        model = Transformer(SMALL_CONFIG).cuda()
+        apply_fsdp2(model, distributed_env)
+        opt = build_optimizer(model, OptimizerConfig(lr=1e-3, fused=False))
+        tokens = torch.randint(0, 512, (2, 32), device="cuda")
+        model(tokens).sum().backward()
+        opt.step()
+        opt.zero_grad()
+
+        mgr = CheckpointManager(
+            CheckpointConfig(dir=shared_tmp_dir, keep_last_n=3), model, opt, dp_info=(rank, world)
+        )
+
+        # Distinct per-rank streams and cursors, as a divergent run has them.
+        self._seed_all(1000 + rank)
+        loader = _CursorLoader(cursor=100 + rank)
+        mgr.save(step=5, tokens_seen=320, dataloader=loader)
+
+        # The next values each generator produces without interruption.
+        expected = self._draw()
+
+        saved = torch.load(Path(shared_tmp_dir) / "step_5" / "train_state.pt", weights_only=False)
+        assert saved["per_rank"]["data_parallel"] == {r: (r, world) for r in range(world)}
+
+        # Scramble everything identically on every rank; only a genuinely
+        # per-rank restore can bring the distinct streams back.
+        self._seed_all(7)
+        loader2 = _CursorLoader(cursor=-1)
+        step, tokens_seen, _ = mgr.load(
+            path=str(Path(shared_tmp_dir) / "step_5"), dataloader=loader2, exact_resume=True
+        )
+        assert step == 5 and tokens_seen == 320
+        assert loader2.restored == {"cursor": 100 + rank}, (
+            f"rank {rank} restored {loader2.restored}, wanted its own cursor {100 + rank}"
+        )
+        got = self._draw()
+        assert got == expected, f"rank {rank} RNG streams are not its own"
+
+        # Every rank restored a DIFFERENT cursor (the actual regression).
+        cursors: list = [None] * world
+        dist.all_gather_object(cursors, loader2.cursor)
+        assert sorted(cursors) == [100 + r for r in range(world)]
+        draws: list = [None] * world
+        dist.all_gather_object(draws, got)
+        assert len(set(draws)) == world, "rank RNG streams collapsed onto one copy"
+
+        # Second consecutive resume: the resumed run saves a fresh envelope
+        # and restores it again.
+        loader2.cursor = 200 + rank
+        mgr.save(step=6, tokens_seen=384, dataloader=loader2)
+        loader3 = _CursorLoader(cursor=-1)
+        step, _, _ = mgr.load(
+            path=str(Path(shared_tmp_dir) / "step_6"), dataloader=loader3, exact_resume=True
+        )
+        assert step == 6
+        assert loader3.restored == {"cursor": 200 + rank}
+        dist.barrier()
+
+    def test_layout_change_refused_or_discarded_on_every_rank(
+        self, distributed_env, shared_tmp_dir
+    ):
+        """Same world size, another data-parallel layout: an exact resume refuses
+        on all ranks, or with the override discards on all ranks, never a
+        per-rank mix; a load that is not a resume restores rank 0's single
+        copy on every rank, as before."""
+        from kempnerforge.config.schema import OptimizerConfig
+
+        rank = dist.get_rank()
+        world = dist.get_world_size()
+        if world % 2:
+            pytest.skip("needs an even world size")
+        half = world // 2
+
+        torch.manual_seed(42)
+        model = Transformer(SMALL_CONFIG).cuda()
+        apply_fsdp2(model, distributed_env)
+        opt = build_optimizer(model, OptimizerConfig(lr=1e-3, fused=False))
+        model(torch.randint(0, 512, (2, 32), device="cuda")).sum().backward()
+        opt.step()
+        opt.zero_grad()
+
+        # Saved as dp x 2 (rank -> rank // 2), resumed as 2 x dp (rank -> rank % half).
+        # With 4 ranks, ranks 0 and 3 keep their own coordinates.
+        saved_dp = (rank // 2, half)
+        current_dp = (rank % half, half)
+        path = str(Path(shared_tmp_dir) / "step_5")
+        cfg = CheckpointConfig(dir=shared_tmp_dir, keep_last_n=3)
+        self._seed_all(1000 + rank)
+        CheckpointManager(cfg, model, opt, dp_info=saved_dp).save(
+            step=5, tokens_seen=320, dataloader=_CursorLoader(cursor=100 + rank)
+        )
+        saved_draws: list = [None] * world
+        dist.all_gather_object(saved_draws, self._draw())
+
+        loader = _CursorLoader(cursor=-1)
+        refusing = CheckpointManager(cfg, model, opt, dp_info=current_dp)
+        with pytest.raises(ValueError, match="data-parallel layout"):
+            refusing.load(path=path, dataloader=loader, exact_resume=True)
+        assert loader.restored is None
+
+        lenient = CheckpointConfig(
+            dir=shared_tmp_dir, keep_last_n=3, ignore_rank_state_mismatch=True
+        )
+        mgr = CheckpointManager(lenient, model, opt, dp_info=current_dp)
+        self._seed_all(7)
+        fresh = self._draw()
+        self._seed_all(7)
+        step, tokens_seen, _ = mgr.load(path=path, dataloader=loader, exact_resume=True)
+        assert (step, tokens_seen) == (5, 320)
+        assert loader.restored is None, f"rank {rank} restored a cursor across a layout change"
+        assert self._draw() == fresh, f"rank {rank} restored RNG across a layout change"
+
+        # Evaluation or a load_path warm start: no resume context.
+        plain_loader = _CursorLoader(cursor=-1)
+        plain = CheckpointManager(cfg, model, opt, dp_info=current_dp)
+        self._seed_all(7)
+        step, _, _ = plain.load(path=path, dataloader=plain_loader, exclude_keys=["optimizer"])
+        assert step == 5
+        assert plain_loader.restored == {"cursor": 100}, f"rank {rank} did not get rank 0's cursor"
+        assert self._draw() == saved_draws[0], f"rank {rank} did not restore rank 0's RNG"
+        dist.barrier()
