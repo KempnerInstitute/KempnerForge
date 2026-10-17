@@ -19,6 +19,7 @@ from kempnerforge.checkpoint.state import (
     restore_train_state,
     set_rng_state,
 )
+from kempnerforge.config.registry import registry
 from kempnerforge.config.schema import (
     AsyncCheckpointMode,
     CheckpointConfig,
@@ -328,6 +329,18 @@ class TestAsyncCheckpointer:
 # ---------------------------------------------------------------------------
 
 
+def _mock_dcp_load(monkeypatch):
+    """Mock out ``dcp.load`` and the metadata read before it, for a checkpoint with an optimizer."""
+    from unittest.mock import MagicMock
+
+    reader = MagicMock()
+    reader.read_metadata.return_value.state_dict_metadata = {"optimizer": None}
+    monkeypatch.setattr(
+        "kempnerforge.checkpoint.manager.dcp.FileSystemReader", MagicMock(return_value=reader)
+    )
+    monkeypatch.setattr("kempnerforge.checkpoint.manager.dcp.load", MagicMock())
+
+
 def _make_mock_mgr(tmp_path, monkeypatch, *, ignore_freeze_mismatch=False):
     """Build a CheckpointManager with DCP calls mocked out (no distributed)."""
     from unittest.mock import MagicMock
@@ -341,7 +354,7 @@ def _make_mock_mgr(tmp_path, monkeypatch, *, ignore_freeze_mismatch=False):
     )
     mgr = CheckpointManager(config, model, opt)
     monkeypatch.setattr(mgr._async_ckpt, "save", MagicMock())
-    monkeypatch.setattr("kempnerforge.checkpoint.manager.dcp.load", MagicMock())
+    _mock_dcp_load(monkeypatch)
     return mgr
 
 
@@ -818,7 +831,6 @@ class TestAsyncLatestSymlinkSafety:
         dispatches the new one (no ``.metadata`` yet). ``wait()`` drains the
         last dispatched flush to durability.
         """
-        from unittest.mock import MagicMock
 
         from kempnerforge.checkpoint.manager import _DCP_METADATA_FILE
 
@@ -835,7 +847,7 @@ class TestAsyncLatestSymlinkSafety:
 
         monkeypatch.setattr(mgr._async_ckpt, "save", _save)
         monkeypatch.setattr(mgr._async_ckpt, "wait", _wait)
-        monkeypatch.setattr("kempnerforge.checkpoint.manager.dcp.load", MagicMock())
+        _mock_dcp_load(monkeypatch)
         return st
 
     def _latest_target(self, tmp_path):
@@ -881,8 +893,6 @@ class TestAsyncLatestSymlinkSafety:
         assert (tgt / ".metadata").exists()
 
     def test_sync_mode_commits_latest_immediately(self, tmp_path, monkeypatch):
-        from unittest.mock import MagicMock
-
         mgr = self._mgr(tmp_path, AsyncCheckpointMode.disabled)
         # Sync dcp.save is blocking; emulate it writing .metadata before return.
         from kempnerforge.checkpoint.manager import _DCP_METADATA_FILE
@@ -891,7 +901,7 @@ class TestAsyncLatestSymlinkSafety:
             (Path(checkpoint_id) / _DCP_METADATA_FILE).write_text("ok")
 
         monkeypatch.setattr(mgr._async_ckpt, "save", _save)
-        monkeypatch.setattr("kempnerforge.checkpoint.manager.dcp.load", MagicMock())
+        _mock_dcp_load(monkeypatch)
 
         mgr.save(step=7)
         tgt = self._latest_target(tmp_path)
@@ -909,7 +919,6 @@ class TestAsyncLatestSymlinkSafety:
 
     def test_resume_falls_back_to_newest_complete(self, tmp_path, monkeypatch):
         import logging
-        from unittest.mock import MagicMock
 
         self._build_ckpt(tmp_path, 10, complete=True)
         incomplete = self._build_ckpt(tmp_path, 20, complete=False)
@@ -917,7 +926,7 @@ class TestAsyncLatestSymlinkSafety:
         latest.symlink_to(incomplete.name)
 
         mgr = self._mgr(tmp_path, AsyncCheckpointMode.async_pinned)
-        monkeypatch.setattr("kempnerforge.checkpoint.manager.dcp.load", MagicMock())
+        _mock_dcp_load(monkeypatch)
 
         # Attach a handler directly to the manager logger. caplog captures
         # through a root handler and relies on propagation, which the full
@@ -953,13 +962,12 @@ class TestAsyncLatestSymlinkSafety:
         Treating a passed path as "the user asked for this" made every
         production call explicit and left the fallback unreachable.
         """
-        from unittest.mock import MagicMock
 
         self._build_ckpt(tmp_path, 10, complete=True)
         incomplete = self._build_ckpt(tmp_path, 20, complete=False)
 
         mgr = self._mgr(tmp_path, AsyncCheckpointMode.async_pinned)
-        monkeypatch.setattr("kempnerforge.checkpoint.manager.dcp.load", MagicMock())
+        _mock_dcp_load(monkeypatch)
 
         step, tokens, _ = mgr.load(path=str(incomplete))
 
@@ -973,14 +981,13 @@ class TestAsyncLatestSymlinkSafety:
         set the caller asked for that directory by name, so a missing DCP
         ``.metadata`` must surface rather than being silently substituted.
         """
-        from unittest.mock import MagicMock
 
         self._build_ckpt(tmp_path, 10, complete=True)
         incomplete = self._build_ckpt(tmp_path, 20, complete=False)
 
         mgr = self._mgr(tmp_path, AsyncCheckpointMode.async_pinned)
         mgr.config.load_path = str(incomplete)
-        monkeypatch.setattr("kempnerforge.checkpoint.manager.dcp.load", MagicMock())
+        _mock_dcp_load(monkeypatch)
 
         step, tokens, _ = mgr.load(path=str(incomplete))
 
@@ -1009,13 +1016,12 @@ class TestAsyncLatestSymlinkSafety:
 
     def test_complete_checkpoint_resumes_unchanged(self, tmp_path, monkeypatch):
         """Regression guard: a durable checkpoint is never redirected."""
-        from unittest.mock import MagicMock
 
         self._build_ckpt(tmp_path, 10, complete=True)
         newest = self._build_ckpt(tmp_path, 20, complete=True)
 
         mgr = self._mgr(tmp_path, AsyncCheckpointMode.async_pinned)
-        monkeypatch.setattr("kempnerforge.checkpoint.manager.dcp.load", MagicMock())
+        _mock_dcp_load(monkeypatch)
 
         step, tokens, _ = mgr.load(path=str(newest))
 
@@ -1023,15 +1029,13 @@ class TestAsyncLatestSymlinkSafety:
         assert tokens == 2000
 
     def test_resume_no_fallback_when_dcp_excluded(self, tmp_path, monkeypatch):
-        from unittest.mock import MagicMock
-
         self._build_ckpt(tmp_path, 10, complete=True)
         incomplete = self._build_ckpt(tmp_path, 20, complete=False)
         latest = Path(tmp_path) / "latest"
         latest.symlink_to(incomplete.name)
 
         mgr = self._mgr(tmp_path, AsyncCheckpointMode.async_pinned)
-        monkeypatch.setattr("kempnerforge.checkpoint.manager.dcp.load", MagicMock())
+        _mock_dcp_load(monkeypatch)
 
         # DCP fully excluded (fine-tune style): durability is irrelevant, the
         # incomplete `latest` target itself must still be honored.
@@ -1764,8 +1768,11 @@ class TestMuonResume:
         self._assert_same_state(opt, opt2, "Muon")
 
 
+REGISTERED_OPTIMIZERS = sorted(registry.list("optimizer"))
+
+
 class TestSaveBeforeFirstStep:
-    """Saving before the first optimizer step, and loading a checkpoint with no optimizer."""
+    """The step-0 save and a load without an optimizer, for every registered optimizer."""
 
     MODEL_CONFIG = ModelConfig(dim=64, n_layers=2, n_heads=2, vocab_size=256, max_seq_len=64)
 
@@ -1785,7 +1792,7 @@ class TestSaveBeforeFirstStep:
             opt.zero_grad()
         return [p.detach().clone() for p in model.parameters()]
 
-    @pytest.mark.parametrize("name", ["adamw", "muon"])
+    @pytest.mark.parametrize("name", REGISTERED_OPTIMIZERS)
     def test_save_and_resume_leave_the_run_unchanged(self, tmp_path, name):
         """A step-0 save and its resume leave the run as if it never saved."""
         from kempnerforge.checkpoint.manager import CheckpointManager
@@ -1808,7 +1815,7 @@ class TestSaveBeforeFirstStep:
             assert torch.equal(ref, a), "saving at step 0 changed the run"
             assert torch.equal(ref, b), "resuming from the step-0 checkpoint changed the run"
 
-    @pytest.mark.parametrize("name", ["adamw", "muon"])
+    @pytest.mark.parametrize("name", REGISTERED_OPTIMIZERS)
     def test_the_checkpoint_holds_no_optimizer_state(self, tmp_path, name):
         """The step-0 checkpoint has no optimizer entry."""
         from kempnerforge.checkpoint.manager import CheckpointManager
@@ -1870,7 +1877,7 @@ class TestSaveBeforeFirstStep:
         warnings = [r.getMessage() for r in records]
         return source, model, manager.checkpointed_optimizers, loaded, warnings
 
-    @pytest.mark.parametrize("name", ["adamw", "muon"])
+    @pytest.mark.parametrize("name", REGISTERED_OPTIMIZERS)
     def test_a_checkpoint_without_an_optimizer_loads_like_a_pretrained_model(self, tmp_path, name):
         """A weights-only checkpoint loads with a fresh optimizer and no warning."""
         source, model, optimizers, loaded, warnings = self._load_model_only(tmp_path, name)
@@ -1880,7 +1887,7 @@ class TestSaveBeforeFirstStep:
         assert not any(o.state for o in optimizers), "the optimizer should start fresh"
         assert not warnings, f"nothing was lost at step 0, yet: {warnings}"
 
-    @pytest.mark.parametrize("name", ["adamw", "muon"])
+    @pytest.mark.parametrize("name", REGISTERED_OPTIMIZERS)
     def test_past_step_zero_a_missing_optimizer_is_warned_about(self, tmp_path, name):
         """Past step 0, a checkpoint without an optimizer loads with a warning."""
         _, _, optimizers, loaded, warnings = self._load_model_only(tmp_path, name, train_step=5)
@@ -1888,9 +1895,9 @@ class TestSaveBeforeFirstStep:
         assert not any(o.state for o in optimizers), "the optimizer should start fresh"
         assert len(warnings) == 1 and "no optimizer state at step 5" in warnings[0], warnings
 
-    @pytest.mark.parametrize("name", ["adamw", "muon"])
+    @pytest.mark.parametrize("name", REGISTERED_OPTIMIZERS)
     def test_loading_it_empties_an_optimizer_that_has_stepped(self, tmp_path, name):
-        """Loading the step-0 checkpoint empties an optimizer that has stepped."""
+        """Loading the step-0 checkpoint returns a stepped optimizer to its freshly built state."""
         from kempnerforge.checkpoint.manager import CheckpointManager
 
         model, opt = self._build(name)
@@ -1901,9 +1908,8 @@ class TestSaveBeforeFirstStep:
         assert all(o.state for o in manager.checkpointed_optimizers), "fixture: no state to empty"
 
         manager.load(path=str(tmp_path / "step_0"))
-        assert not any(o.state for o in manager.checkpointed_optimizers), (
-            "an optimizer kept state the checkpoint does not hold"
-        )
+        _, fresh = self._build(name)
+        assert opt.state_dict() == fresh.state_dict(), "the load left the optimizer partly stepped"
         for before, p in zip(initial, model.parameters(), strict=True):
             assert torch.equal(before, p), "the load did not restore the initial weights"
 

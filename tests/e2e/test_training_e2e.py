@@ -29,6 +29,7 @@ from pathlib import Path
 
 import pytest
 
+from kempnerforge.training.optimizer import registry
 from tests.e2e.conftest import requires_gpus
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -518,9 +519,10 @@ def test_resume_determinism_muon_2gpu_fsdp(tmp_path):
 
 
 @pytest.mark.e2e
-@pytest.mark.parametrize("overrides", [(), _MUON_RESUME_OVERRIDES], ids=["adamw", "muon"])
-def test_step_zero_checkpoint_leaves_training_unchanged(tmp_path, overrides):
+@pytest.mark.parametrize("name", sorted(registry.list("optimizer")))
+def test_step_zero_checkpoint_leaves_training_unchanged(tmp_path, name):
     """A run that checkpoints at step 0 must log the same losses as one that does not."""
+    overrides = _MUON_RESUME_OVERRIDES if name == "muon" else (f"--optimizer.name={name}",)
     data_dir = _make_learnable_shard(tmp_path)
     common = [
         DEBUG_CONFIG,

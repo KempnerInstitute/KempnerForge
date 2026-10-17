@@ -17,6 +17,7 @@ import torch.distributed as dist
 
 from kempnerforge.checkpoint import manager as mgr_mod
 from kempnerforge.checkpoint.manager import CheckpointManager
+from kempnerforge.config.registry import registry
 from kempnerforge.config.schema import AsyncCheckpointMode, CheckpointConfig, ModelConfig
 from kempnerforge.distributed.parallel import apply_fsdp2
 from kempnerforge.model.transformer import Transformer
@@ -28,6 +29,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 SMALL_CONFIG = ModelConfig(dim=128, n_layers=2, n_heads=2, vocab_size=512, max_seq_len=64)
+REGISTERED_OPTIMIZERS = sorted(registry.list("optimizer"))
 
 # Shared filesystem temp directory (visible to all nodes)
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -256,7 +258,7 @@ class TestCheckpointRoundTrip:
             for (name, r), (_, t) in zip(ref, loaded[what], strict=True):
                 assert torch.equal(r, t), f"{what} {name} not restored bit-exactly"
 
-    @pytest.mark.parametrize("name", ["adamw", "muon"])
+    @pytest.mark.parametrize("name", REGISTERED_OPTIMIZERS)
     def test_save_before_the_first_step_leaves_the_run_unchanged(
         self, distributed_env, shared_tmp_dir, name
     ):

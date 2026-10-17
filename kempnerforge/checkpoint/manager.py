@@ -53,13 +53,12 @@ _NEVER_STEPPED_PREFIX = f"{_NEVER_STEPPED_KEY}."
 _OPTIM_PREFIX = "optimizer."
 
 
-def _saved_optimizer_param_groups(dcp_dir: Path) -> int:
-    """Count the optimizer param groups in the DCP checkpoint at ``dcp_dir``."""
-    metadata = dcp.FileSystemReader(str(dcp_dir)).read_metadata()
+def _saved_optimizer_param_groups(saved_keys: Iterable[str]) -> int:
+    """Count the optimizer param groups among a DCP checkpoint's keys."""
     return len(
         {
             key.removeprefix(_OPTIM_PARAM_GROUPS_PREFIX).split(".", 1)[0]
-            for key in metadata.state_dict_metadata
+            for key in saved_keys
             if key.startswith(_OPTIM_PARAM_GROUPS_PREFIX)
         }
     )
@@ -151,6 +150,11 @@ def _holds_optimizer(saved_keys: Iterable[str]) -> bool:
     return any(key == "optimizer" or key.startswith(_OPTIM_PREFIX) for key in saved_keys)
 
 
+def _reset_to_fresh(optimizer: torch.optim.Optimizer) -> None:
+    """Return ``optimizer`` to its freshly built state, keeping its param groups."""
+    optimizer.load_state_dict({"state": {}, "param_groups": optimizer.state_dict()["param_groups"]})
+
+
 class _NeverSteppedStatePlanner(DefaultLoadPlanner):
     """Load planner that leaves out the optimizer state the save recorded as absent.
 
@@ -159,14 +163,11 @@ class _NeverSteppedStatePlanner(DefaultLoadPlanner):
     was saved. Those are dropped from the load and kept in ``never_stepped`` for
     the caller to confirm against the saved ``param_groups``; every other key
     stays required, including one whose state is missing without a record.
-
-    With no optimizer entry saved, it empties the template and sets ``optimizer_missing``.
     """
 
     def __init__(self) -> None:
         super().__init__()
         self.never_stepped: set[str] = set()
-        self.optimizer_missing = False
 
     def set_up_planner(
         self,
@@ -176,15 +177,10 @@ class _NeverSteppedStatePlanner(DefaultLoadPlanner):
     ) -> None:
         optim_state = state_dict.get("optimizer")
         if optim_state is not None and metadata is not None:
-            if not _holds_optimizer(metadata.state_dict_metadata):
-                optim_state.clear()
-                self.optimizer_missing = True
-            else:
-                fqns = set(optim_state["state"])
-                saved_keys = metadata.state_dict_metadata
-                self.never_stepped = _params_recorded_never_stepped(fqns, saved_keys)
-                for fqn in self.never_stepped:
-                    del optim_state["state"][fqn]
+            fqns = set(optim_state["state"])
+            self.never_stepped = _params_recorded_never_stepped(fqns, metadata.state_dict_metadata)
+            for fqn in self.never_stepped:
+                del optim_state["state"][fqn]
         super().set_up_planner(state_dict, metadata, is_coordinator)
 
 
@@ -616,19 +612,27 @@ class CheckpointManager:
         load_model = exclude_keys is None or "model" not in exclude_keys
         load_optim = exclude_keys is None or "optimizer" not in exclude_keys
 
+        saved_keys = (
+            dcp.FileSystemReader(str(dcp_dir)).read_metadata().state_dict_metadata
+            if load_optim
+            else {}
+        )
+        fresh_optimizer = load_optim and not _holds_optimizer(saved_keys)
+        if fresh_optimizer:
+            load_optim = False
+
         # Build properly-structured (FSDP-sharded, moment-allocated) templates via
         # the DCP-aware getters so dcp.load can repopulate them, then write them
         # back with the setters. Raw optimizer.state_dict() would be empty on a
         # fresh optimizer, so dcp.load would find no moment tensors to fill and the
         # AdamW momentum would silently reset to zero on resume.
         dcp_state: dict[str, Any] = {}
-        optimizers = self._optimizers_saved_in(dcp_dir) if load_optim else []
+        optimizers = self._optimizers_saved_in(dcp_dir, saved_keys) if load_optim else []
         if load_model:
             dcp_state["model"] = get_model_state_dict(self.model)
         if load_optim:
             dcp_state["optimizer"] = get_optimizer_state_dict(self.model, optimizers)
 
-        fresh_optimizer = False
         if dcp_state:
             planner = _NeverSteppedStatePlanner()
             dcp.load(
@@ -638,10 +642,6 @@ class CheckpointManager:
                 planner=planner,
             )
 
-            if load_optim and planner.optimizer_missing:
-                for optimizer in self.checkpointed_optimizers:
-                    optimizer.state.clear()
-                fresh_optimizer, load_optim = True, False
             if load_optim:
                 optim_state = cast("dict[str, Any]", dcp_state["optimizer"])
                 _restore_never_stepped(optim_state, planner.never_stepped, dcp_dir)
@@ -656,6 +656,9 @@ class CheckpointManager:
                     f"{len(planner.never_stepped)} parameters the saved optimizer held were never "
                     f"stepped and resume without state: {sorted(planner.never_stepped)[:8]}"
                 )
+        if fresh_optimizer:
+            for optimizer in self.checkpointed_optimizers:
+                _reset_to_fresh(optimizer)
 
         # Load non-distributed state. On NFS/Lustre, independent stat()
         # calls can disagree briefly across ranks; if some ranks enter
@@ -804,10 +807,12 @@ class CheckpointManager:
             return fallback
         return resolved
 
-    def _optimizers_saved_in(self, dcp_dir: Path) -> list[torch.optim.Optimizer]:
+    def _optimizers_saved_in(
+        self, dcp_dir: Path, keys: Iterable[str]
+    ) -> list[torch.optim.Optimizer]:
         """Return the optimizers saved in ``dcp_dir``; warn if the inner ones are missing."""
         inner = self.checkpointed_optimizers[1:]
-        if not inner or _saved_optimizer_param_groups(dcp_dir) != len(self.optimizer.param_groups):
+        if not inner or _saved_optimizer_param_groups(keys) != len(self.optimizer.param_groups):
             return self.checkpointed_optimizers
         name = type(self.optimizer).__name__
         n_params = sum(p.numel() for opt in inner for g in opt.param_groups for p in g["params"])
