@@ -17,6 +17,7 @@ import torch.distributed as dist
 
 from kempnerforge.checkpoint import manager as mgr_mod
 from kempnerforge.checkpoint.manager import CheckpointManager
+from kempnerforge.config.registry import registry
 from kempnerforge.config.schema import AsyncCheckpointMode, CheckpointConfig, ModelConfig
 from kempnerforge.distributed.parallel import apply_fsdp2
 from kempnerforge.model.transformer import Transformer
@@ -28,6 +29,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 SMALL_CONFIG = ModelConfig(dim=128, n_layers=2, n_heads=2, vocab_size=512, max_seq_len=64)
+REGISTERED_OPTIMIZERS = sorted(registry.list("optimizer"))
 
 # Shared filesystem temp directory (visible to all nodes)
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -256,6 +258,52 @@ class TestCheckpointRoundTrip:
             for (name, r), (_, t) in zip(ref, loaded[what], strict=True):
                 assert torch.equal(r, t), f"{what} {name} not restored bit-exactly"
 
+    @pytest.mark.parametrize("name", REGISTERED_OPTIMIZERS)
+    def test_save_before_the_first_step_leaves_the_run_unchanged(
+        self, distributed_env, shared_tmp_dir, name
+    ):
+        """A sharded step-0 save and its resume must train like a run that never saved."""
+        from torch.distributed.tensor import DTensor
+
+        from kempnerforge.config.schema import OptimizerConfig
+
+        def build():
+            torch.manual_seed(42)
+            model = Transformer(SMALL_CONFIG).cuda()
+            apply_fsdp2(model, distributed_env)
+            return model, build_optimizer(model, OptimizerConfig(name=name, lr=1e-3))
+
+        def train(model, opt):
+            gen = torch.Generator(device="cuda").manual_seed(7 + dist.get_rank())
+            for _ in range(3):
+                tokens = torch.randint(0, 512, (2, 32), device="cuda", generator=gen)
+                model(tokens).sum().backward()
+                opt.step()
+                opt.zero_grad()
+            return [
+                (p.to_local() if isinstance(p, DTensor) else p).detach().clone()
+                for p in model.parameters()
+            ]
+
+        reference = train(*build())
+
+        config = CheckpointConfig(dir=shared_tmp_dir, keep_last_n=2)
+        model, opt = build()
+        manager = CheckpointManager(config, model, opt)
+        manager.save(step=0)
+        assert not any(o.state for o in manager.checkpointed_optimizers), (
+            "the save left the getter's dummy state in an optimizer"
+        )
+        saved = train(model, opt)
+
+        model2, opt2 = build()
+        CheckpointManager(config, model2, opt2).load()
+        resumed = train(model2, opt2)
+
+        for ref, a, b in zip(reference, saved, resumed, strict=True):
+            assert torch.equal(ref, a), "saving at step 0 changed the run"
+            assert torch.equal(ref, b), "resuming from the step-0 checkpoint changed the run"
+
     def test_latest_symlink(self, distributed_env, shared_tmp_dir):
         """The 'latest' symlink should point to the most recent checkpoint."""
         mesh = distributed_env
@@ -331,6 +379,25 @@ class TestCheckpointSaveBarrier:
         assert (step_dir / "metadata.json").exists(), (
             f"rank {rank}: metadata.json not visible after save()"
         )
+
+    def test_a_failed_cleanup_does_not_hang_save(self, distributed_env, shared_tmp_dir):
+        """A checkpoint rank 0 cannot remove must not stop the save the other ranks wait on."""
+        import errno
+
+        from kempnerforge.config.schema import OptimizerConfig
+
+        model = Transformer(SMALL_CONFIG).cuda()
+        apply_fsdp2(model, distributed_env)
+        opt = build_optimizer(model, OptimizerConfig(lr=1e-3, fused=False))
+        mgr = CheckpointManager(CheckpointConfig(dir=shared_tmp_dir, keep_last_n=1), model, opt)
+
+        busy = OSError(errno.ENOTEMPTY, "Directory not empty")
+        with patch.object(mgr_mod.shutil, "rmtree", side_effect=busy):
+            mgr.save(step=1)
+            mgr.save(step=2)
+
+        if dist.get_rank() == 0:
+            assert (Path(shared_tmp_dir) / "step_1").is_dir(), "the failed removal deleted step_1"
 
 
 class TestCheckpointLoadDivergentExistence:

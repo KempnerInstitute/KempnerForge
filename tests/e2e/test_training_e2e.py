@@ -29,6 +29,7 @@ from pathlib import Path
 
 import pytest
 
+from kempnerforge.training.optimizer import registry
 from tests.e2e.conftest import requires_gpus
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -515,6 +516,46 @@ def test_resume_determinism_muon_single_gpu(tmp_path):
 def test_resume_determinism_muon_2gpu_fsdp(tmp_path):
     """2 GPU FSDP Muon: the inner AdamW must resume bit-for-bit too."""
     _check_resume_determinism(tmp_path, nproc=2, overrides=_MUON_RESUME_OVERRIDES)
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize("name", sorted(registry.list("optimizer")))
+def test_step_zero_checkpoint_leaves_training_unchanged(tmp_path, name):
+    """A run that checkpoints at step 0 must log the same losses as one that does not."""
+    overrides = _MUON_RESUME_OVERRIDES if name == "muon" else (f"--optimizer.name={name}",)
+    data_dir = _make_learnable_shard(tmp_path)
+    common = [
+        DEBUG_CONFIG,
+        "--metrics.log_interval=1",
+        "--train.seed=1234",
+        "--train.compile_model=false",
+        "--train.max_steps=10",
+        "--scheduler.warmup_steps=0",
+        "--model.vocab_size=256",
+        f"--data.dataset_path={data_dir}",
+        "--data.file_pattern=*.npy",
+        *overrides,
+    ]
+    plain = _run_training(common + [f"--checkpoint.dir={tmp_path}/plain"], timeout=300)
+    _assert_training_complete(plain, expected_steps=10)
+    windowed = _run_training(
+        common
+        + [
+            f"--checkpoint.dir={tmp_path}/windowed",
+            "--checkpoint.dyn_ckpt_window.start=0",
+            "--checkpoint.dyn_ckpt_window.stop=8",
+        ],
+        timeout=300,
+    )
+    _assert_training_complete(windowed, expected_steps=10)
+    assert (tmp_path / "windowed" / "step_0").is_dir(), "the window did not save step 0"
+
+    plain_losses = _parse_losses_by_step(plain.stdout + plain.stderr)
+    windowed_losses = _parse_losses_by_step(windowed.stdout + windowed.stderr)
+    assert len(plain_losses) == 10, f"expected 10 logged steps, got {sorted(plain_losses)}"
+    assert windowed_losses == plain_losses, (
+        "saving at step 0 changed the losses -- the save left optimizer state behind"
+    )
 
 
 # ============================================================================

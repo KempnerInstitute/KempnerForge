@@ -129,6 +129,11 @@ everything, set `keep_last_n` to a large number — there's no
 "disable cleanup" flag (and the `__post_init__` check requires
 `keep_last_n >= 1`).
 
+A checkpoint it cannot remove is logged as a warning and left for the
+next cleanup to retry. On NFS a file closed a moment earlier can leave
+a `.nfs*` placeholder that makes the removal fail, and rank 0 must not
+leave `save()` while the other ranks wait in its barrier.
+
 ## Edge cases
 
 - **Empty checkpoint directory** — `resolve_resume_path` returns
