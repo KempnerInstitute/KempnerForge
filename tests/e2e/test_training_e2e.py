@@ -489,40 +489,42 @@ def _check_resume_determinism(tmp_path, nproc: int, overrides: tuple[str, ...] =
         )
 
 
+_MUON_OVERRIDES = ("--optimizer.name=muon", "--optimizer.lr=0.02", "--model.vocab_size=4096")
+_RESUMABLE_OPTIMIZERS = [
+    pytest.param(
+        name, marks=pytest.mark.xfail(strict=True, reason="#236: schedule_free_adamw cannot resume")
+    )
+    if name == "schedule_free_adamw"
+    else name
+    for name in sorted(registry.list("optimizer"))
+]
+
+
+def _optimizer_overrides(name: str) -> tuple[str, ...]:
+    """Overrides that train with the registered optimizer ``name``."""
+    return _MUON_OVERRIDES if name == "muon" else (f"--optimizer.name={name}",)
+
+
 @pytest.mark.e2e
-def test_resume_determinism_single_gpu(tmp_path):
+@pytest.mark.parametrize("name", _RESUMABLE_OPTIMIZERS)
+def test_resume_determinism_single_gpu(tmp_path, name):
     """Single GPU: resumed run must match the uninterrupted reference bit-for-bit."""
-    _check_resume_determinism(tmp_path, nproc=1)
+    _check_resume_determinism(tmp_path, nproc=1, overrides=_optimizer_overrides(name))
 
 
 @pytest.mark.e2e
 @requires_gpus(2)
-def test_resume_determinism_2gpu_fsdp(tmp_path):
+@pytest.mark.parametrize("name", _RESUMABLE_OPTIMIZERS)
+def test_resume_determinism_2gpu_fsdp(tmp_path, name):
     """2 GPU FSDP: resumed run must match the uninterrupted reference bit-for-bit."""
-    _check_resume_determinism(tmp_path, nproc=2)
-
-
-_MUON_RESUME_OVERRIDES = ("--optimizer.name=muon", "--optimizer.lr=0.02", "--model.vocab_size=4096")
-
-
-@pytest.mark.e2e
-def test_resume_determinism_muon_single_gpu(tmp_path):
-    """Single GPU Muon: the inner AdamW must resume bit-for-bit too."""
-    _check_resume_determinism(tmp_path, nproc=1, overrides=_MUON_RESUME_OVERRIDES)
-
-
-@pytest.mark.e2e
-@requires_gpus(2)
-def test_resume_determinism_muon_2gpu_fsdp(tmp_path):
-    """2 GPU FSDP Muon: the inner AdamW must resume bit-for-bit too."""
-    _check_resume_determinism(tmp_path, nproc=2, overrides=_MUON_RESUME_OVERRIDES)
+    _check_resume_determinism(tmp_path, nproc=2, overrides=_optimizer_overrides(name))
 
 
 @pytest.mark.e2e
 @pytest.mark.parametrize("name", sorted(registry.list("optimizer")))
 def test_step_zero_checkpoint_leaves_training_unchanged(tmp_path, name):
     """A run that checkpoints at step 0 must log the same losses as one that does not."""
-    overrides = _MUON_RESUME_OVERRIDES if name == "muon" else (f"--optimizer.name={name}",)
+    overrides = _optimizer_overrides(name)
     data_dir = _make_learnable_shard(tmp_path)
     common = [
         DEBUG_CONFIG,

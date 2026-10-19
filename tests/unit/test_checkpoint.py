@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import random
 import re
@@ -1769,6 +1770,17 @@ class TestMuonResume:
 
 
 REGISTERED_OPTIMIZERS = sorted(registry.list("optimizer"))
+RESUMABLE_OPTIMIZERS = [
+    pytest.param(
+        name,
+        marks=pytest.mark.xfail(
+            raises=ZeroDivisionError, strict=True, reason="#236: schedule_free_adamw cannot resume"
+        ),
+    )
+    if name == "schedule_free_adamw"
+    else name
+    for name in REGISTERED_OPTIMIZERS
+]
 
 
 class TestSaveBeforeFirstStep:
@@ -1912,6 +1924,89 @@ class TestSaveBeforeFirstStep:
         assert opt.state_dict() == fresh.state_dict(), "the load left the optimizer partly stepped"
         for before, p in zip(initial, model.parameters(), strict=True):
             assert torch.equal(before, p), "the load did not restore the initial weights"
+
+
+def _assert_same_state_dict(expected, actual, where="state_dict"):
+    """Assert two optimizer ``state_dict()``s hold the same values, tensors bit for bit."""
+    if isinstance(expected, torch.Tensor):
+        assert isinstance(actual, torch.Tensor) and torch.equal(expected, actual), where
+    elif isinstance(expected, dict):
+        assert expected.keys() == actual.keys(), f"{where}: keys {set(expected) ^ set(actual)}"
+        for key in expected:
+            _assert_same_state_dict(expected[key], actual[key], f"{where}[{key!r}]")
+    elif isinstance(expected, list | tuple):
+        assert len(expected) == len(actual), f"{where}: lengths differ"
+        for i, (e, a) in enumerate(zip(expected, actual, strict=True)):
+            _assert_same_state_dict(e, a, f"{where}[{i}]")
+    else:
+        assert expected == actual, f"{where}: {expected!r} != {actual!r}"
+
+
+class TestCheckpointEveryOptimizer:
+    """Saving and resuming keep every registered optimizer's state exactly."""
+
+    MODEL_CONFIG = ModelConfig(dim=64, n_layers=2, n_heads=2, vocab_size=256, max_seq_len=64)
+
+    def _build(self, name, seed):
+        torch.manual_seed(seed)
+        model = Transformer(self.MODEL_CONFIG)
+        return model, build_optimizer(model, OptimizerConfig(name=name, lr=1e-3, fused=False))
+
+    @staticmethod
+    def _batches(n):
+        g = torch.Generator().manual_seed(1)
+        return [torch.randint(0, 256, (2, 32), generator=g) for _ in range(n)]
+
+    @staticmethod
+    def _train(model, opt, batches):
+        for tokens in batches:
+            logits = model(tokens)
+            torch.nn.functional.cross_entropy(logits.flatten(0, 1), tokens.flatten()).backward()
+            opt.step()
+            opt.zero_grad()
+
+    @pytest.mark.parametrize("name", REGISTERED_OPTIMIZERS)
+    def test_saving_leaves_the_optimizer_unchanged(self, tmp_path, name):
+        """Saves at step 0 and mid-run change neither the optimizer's state nor the run."""
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        batches = self._batches(4)
+        reference, ref_opt = self._build(name, seed=0)
+        self._train(reference, ref_opt, batches)
+
+        model, opt = self._build(name, seed=0)
+        manager = CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model, opt)
+        for step, segment in ((0, batches[:2]), (2, batches[2:])):
+            before = copy.deepcopy(opt.state_dict())
+            manager.save(step=step)
+            _assert_same_state_dict(before, opt.state_dict(), f"after save(step={step})")
+            self._train(model, opt, segment)
+
+        _assert_same_state_dict(ref_opt.state_dict(), opt.state_dict())
+        for (n, ref), p in zip(reference.named_parameters(), model.parameters(), strict=True):
+            assert torch.equal(ref, p), f"{n} differs from the run that never saved"
+
+    @pytest.mark.parametrize("name", RESUMABLE_OPTIMIZERS)
+    def test_resume_restores_the_optimizer_exactly(self, tmp_path, name):
+        """A resume restores the saved optimizer state bit for bit and continues the run exactly."""
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        batches = self._batches(4)
+        reference, ref_opt = self._build(name, seed=0)
+        self._train(reference, ref_opt, batches)
+
+        model, opt = self._build(name, seed=0)
+        self._train(model, opt, batches[:2])
+        CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model, opt).save(step=2)
+
+        model2, opt2 = self._build(name, seed=1)
+        CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model2, opt2).load()
+        _assert_same_state_dict(opt.state_dict(), opt2.state_dict(), "after the load")
+        self._train(model2, opt2, batches[2:])
+
+        _assert_same_state_dict(ref_opt.state_dict(), opt2.state_dict())
+        for (n, ref), p in zip(reference.named_parameters(), model2.parameters(), strict=True):
+            assert torch.equal(ref, p), f"{n} differs from the uninterrupted run"
 
 
 # ---------------------------------------------------------------------------
