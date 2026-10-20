@@ -16,7 +16,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-from kempnerforge.model.masking import flex_attention_fn
+from kempnerforge.model.masking import flex_attention_fn, same_group_mask
 from kempnerforge.model.norm import RMSNorm
 from kempnerforge.model.position import apply_rope
 
@@ -127,6 +127,7 @@ class Attention(nn.Module):
         *,
         kv_cache: KVCache | None = None,
         doc_ids: torch.Tensor | None = None,
+        attention_group_ids: torch.Tensor | None = None,
         key_padding_mask: torch.Tensor | None = None,
         block_mask: BlockMask | None = None,
     ) -> torch.Tensor:
@@ -140,17 +141,24 @@ class Attention(nn.Module):
             doc_ids: Optional per-token document IDs for packed sequences,
                 shape (batch, seq_len). When provided, constructs a block-diagonal
                 causal mask so tokens only attend within their document.
+            attention_group_ids: Optional per-token visibility group ids,
+                shape (batch, seq_len); negative means no group. Tokens sharing
+                a nonnegative id see each other regardless of order:
+                ``visible(q, k) = same_document AND (k <= q OR
+                same_nonnegative_group)``. Document isolation and key validity
+                still apply. Not supported with ``kv_cache``.
             key_padding_mask: Optional per-key validity mask, shape
                 (batch, seq_len); ``True`` = attend, ``False`` = drop (e.g. the
                 visual tokens of padded video frames). Combined with the causal
                 (and doc) mask; fully-masked query rows are unmasked to keep
                 softmax finite.
             block_mask: Optional FlexAttention ``BlockMask`` encoding the same
-                block-diagonal causal mask ``doc_ids`` would build, but sparse:
-                fully-masked blocks are skipped by the kernel instead of
-                computed. Built once per forward by ``Transformer.forward``
+                mask ``doc_ids`` and ``attention_group_ids`` would build, but
+                sparse: fully-masked blocks are skipped by the kernel instead
+                of computed. Built once per forward by ``Transformer.forward``
                 when ``attention_backend="flex"``. Mutually exclusive with
-                ``doc_ids``, ``key_padding_mask``, and ``kv_cache``.
+                ``doc_ids``, ``attention_group_ids``, ``key_padding_mask``, and
+                ``kv_cache``.
 
         Returns:
             Output tensor of shape (batch, seq_len, dim).
@@ -198,7 +206,8 @@ class Attention(nn.Module):
 
         # Attention masking strategy:
         # 1. Packed sequences (doc_ids provided): block-diagonal causal mask that
-        #    isolates documents from each other within a packed sequence.
+        #    isolates documents from each other within a packed sequence, widened
+        #    by attention_group_ids to bidirectional spans inside a document.
         # 2. Standard causal: needed for training and prefill (Q seq == K seq).
         # 3. Single-token decode (seq_len=1 with KV cache): no mask needed — the
         #    query attends to all cached positions (is_causal=True would incorrectly
@@ -206,17 +215,18 @@ class Attention(nn.Module):
         if self.capture_attention_weights:
             # Manual attention for weight extraction (analysis only, not for training)
             out, attn_weights = self._attention_with_weights(
-                q, k, v, seq_len, doc_ids, kv_cache, key_padding_mask
+                q, k, v, seq_len, doc_ids, kv_cache, key_padding_mask, attention_group_ids
             )
             self.last_attention_weights = attn_weights.detach().cpu()
         elif block_mask is not None:
             # Packed sequences via FlexAttention. The BlockMask already encodes
-            # causal AND same-document, so doc_ids carries no extra information
-            # here. key_padding_mask is deliberately not folded in -- that path
+            # the whole predicate (causal-or-group AND same-document), so
+            # doc_ids and attention_group_ids carry no extra information here.
+            # key_padding_mask is deliberately not folded in: that path
             # (VLM video) stays on the dense SDPA mask below.
-            assert kv_cache is None and key_padding_mask is None, (
-                "block_mask does not compose with kv_cache decode or key_padding_mask; "
-                "those cases use the dense SDPA mask."
+            assert kv_cache is None and key_padding_mask is None and attention_group_ids is None, (
+                "block_mask does not compose with kv_cache decode, key_padding_mask, or "
+                "attention_group_ids; those cases use the dense SDPA mask."
             )
             out = flex_attention_fn(q.is_cuda)(
                 q,
@@ -226,7 +236,7 @@ class Attention(nn.Module):
                 scale=self.head_dim**-0.5,
                 enable_gqa=self.n_rep > 1,
             )
-        elif doc_ids is not None or key_padding_mask is not None:
+        elif doc_ids is not None or key_padding_mask is not None or attention_group_ids is not None:
             # An explicit attn_mask is not a FlashAttention-2 shape, so SDPA falls
             # back to the mem-efficient/math kernel here. The image-prefix video
             # arches (Joint-Decoder/MoMa here, MoT in mot.py) always pass a
@@ -244,14 +254,17 @@ class Attention(nn.Module):
             # branch's full-sequence causal mask would mis-handle a cached
             # (seq_len=1) decode rather than attend to all cached positions.
             assert kv_cache is None, (
-                "doc_ids / key_padding_mask are not supported with kv_cache decode "
-                "(would build an incorrect causal mask)."
+                "doc_ids / key_padding_mask / attention_group_ids are not supported with "
+                "kv_cache decode (would build an incorrect causal mask)."
             )
             seq_len_kv = k.shape[2]
-            # Explicit bool mask: causal, AND same-document (doc_ids), AND valid
+            # Explicit bool mask: causal OR same nonnegative group
+            # (attention_group_ids), AND same-document (doc_ids), AND valid
             # keys (key_padding_mask, e.g. dropping padded video frames' tokens).
             causal = torch.ones(seq_len, seq_len_kv, dtype=torch.bool, device=q.device).tril()
             attn_mask = causal.unsqueeze(0).unsqueeze(0)  # (1, 1, S, S_kv)
+            if attention_group_ids is not None:
+                attn_mask = attn_mask | same_group_mask(attention_group_ids)  # (B,1,S,S)
             if doc_ids is not None:
                 doc_mask = (doc_ids.unsqueeze(2) == doc_ids.unsqueeze(1)).unsqueeze(1)  # (B,1,S,S)
                 attn_mask = attn_mask & doc_mask
@@ -283,6 +296,7 @@ class Attention(nn.Module):
         doc_ids: torch.Tensor | None,
         kv_cache: KVCache | None,
         key_padding_mask: torch.Tensor | None = None,
+        attention_group_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute attention output and weights manually (for analysis).
 
@@ -299,9 +313,11 @@ class Attention(nn.Module):
         attn = torch.matmul(q, k.transpose(-2, -1)) * scale
 
         seq_len_kv = k.shape[2]
-        if doc_ids is not None or key_padding_mask is not None:
+        if doc_ids is not None or key_padding_mask is not None or attention_group_ids is not None:
             causal = torch.ones(seq_len, seq_len_kv, dtype=torch.bool, device=q.device).tril()
             valid = causal.unsqueeze(0).unsqueeze(0)  # (1, 1, S, S_kv)
+            if attention_group_ids is not None:
+                valid = valid | same_group_mask(attention_group_ids)
             if doc_ids is not None:
                 valid = valid & (doc_ids.unsqueeze(2) == doc_ids.unsqueeze(1)).unsqueeze(1)
             if key_padding_mask is not None:
