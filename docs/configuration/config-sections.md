@@ -140,6 +140,7 @@ LR schedule shape and warmup.
 |-------|------|---------|---------|
 | `name` | `"cosine" \| "linear" \| "wsd" \| "constant" \| "rex" \| "none"` | `"cosine"` | `scheduler` registry key |
 | `warmup_steps` | `int` | `2000` | linear warmup length |
+| `warmup_start_factor` | `float` | `0.0` | LR factor the warmup starts from (torch `LinearLR` `start_factor`) |
 | `decay_steps` | `int \| None` | `None` | `None` → decay over remaining steps |
 | `min_lr_ratio` | `float` | `0.1` | floor = `lr * min_lr_ratio` |
 | `stable_steps` | `int \| None` | `None` | WSD: steps at constant LR between warmup and decay |

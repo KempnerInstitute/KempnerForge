@@ -240,6 +240,11 @@ class TestMuon:
         adam_states = [s for s in optimizer2._adam.state.values() if s]
         assert len(adam_states) > 0, "Internal AdamW state was not restored"
 
+    def test_inner_optimizers_lists_the_inner_adamw(self):
+        """``inner_optimizers`` returns Muon's inner AdamW."""
+        optimizer = build_optimizer(self._make_model(), OptimizerConfig(name="muon", lr=0.01))
+        assert optimizer.inner_optimizers == (optimizer._adam,)
+
     def test_zero_grad_clears_delegated_params(self):
         """Params routed to the inner AdamW must be zeroed too.
 
@@ -324,6 +329,7 @@ class TestMuon:
         model = nn.Linear(32, 32, bias=False)
         optimizer = build_optimizer(model, OptimizerConfig(name="muon", lr=0.01))
         assert optimizer._adam is None
+        assert optimizer.inner_optimizers == ()
 
         optimizer.zero_grad()
         model(torch.randn(4, 32)).sum().backward()

@@ -129,6 +129,10 @@ DTensor / FSDP2 notes:
   identical to full-matrix orthogonalization.
 - Momentum buffers match the parameter dtype (`torch.zeros_like(p.grad)`),
   so DCP serializes them correctly on resume.
+- The internal AdamW's parameters are not in Muon's `param_groups`, so
+  `CheckpointManager` checkpoints it alongside Muon through
+  `Muon.inner_optimizers` and a resume restores both bit-exactly — see
+  [DCP model § Inner optimizers](../checkpointing/dcp-model.md#inner-optimizers).
 - `muon_adam_lr` unset (default) makes the internal AdamW use the same
   LR as Muon. Pass a smaller value (e.g. `muon_adam_lr = 1e-4`) if you
   want 1D params on a gentler schedule.
