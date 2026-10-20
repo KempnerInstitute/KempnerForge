@@ -450,6 +450,14 @@ class TestSchedulerConfig:
         with pytest.raises(ValueError, match="min_lr_ratio must be in"):
             SchedulerConfig(min_lr_ratio=-0.1)
 
+    def test_warmup_start_factor_defaults_to_zero(self):
+        assert SchedulerConfig().warmup_start_factor == 0.0
+
+    @pytest.mark.parametrize("value", [-0.1, 1.5])
+    def test_rejects_warmup_start_factor_outside_unit_interval(self, value):
+        with pytest.raises(ValueError, match="warmup_start_factor must be in"):
+            SchedulerConfig(warmup_start_factor=value)
+
 
 # ---------------------------------------------------------------------------
 # DataConfig

@@ -79,6 +79,7 @@ File:
 [`kempnerforge/config/scheduler.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/config/scheduler.py).
 
 - `warmup_steps ≥ 0`.
+- `warmup_start_factor ∈ [0, 1]`.
 - `min_lr_ratio ∈ [0, 1]`.
 - `wsd_decay_type ∈ {"cosine", "linear", "sqrt"}`.
 - `rex_alpha > 0`.

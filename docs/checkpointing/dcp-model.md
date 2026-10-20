@@ -14,7 +14,7 @@ in `kempnerforge/checkpoint/manager.py`.
 ## What goes into the DCP shard
 
 ```python
-optim_state = get_optimizer_state_dict(self.model, self.optimizer)
+optim_state = get_optimizer_state_dict(self.model, self.checkpointed_optimizers)
 dcp_state = {
     "model":                   get_model_state_dict(self.model),
     "optimizer":               optim_state,
@@ -24,6 +24,9 @@ self._async_ckpt.save(
     dcp_state, checkpoint_id=str(dcp_dir), process_group=self._process_group
 )
 ```
+
+`checkpointed_optimizers` is the optimizer plus any inner optimizers it
+hands parameters to — see [Inner optimizers](#inner-optimizers).
 
 `get_model_state_dict` / `get_optimizer_state_dict` are the DCP-aware
 helpers from `torch.distributed.checkpoint.state_dict` — **not** raw
@@ -38,7 +41,8 @@ Three top-level keys. DCP introspects the state dicts, finds
 with enough metadata to reassemble. The third is empty whenever every
 parameter has optimizer state, and an empty entry writes no key at all,
 so an ordinary run's checkpoints keep the two-key shape any reader
-already expects.
+already expects. A save before the first optimizer step writes the model
+alone (see below).
 
 What's in each:
 
@@ -47,9 +51,10 @@ What's in each:
   registered buffer. Under FSDP2 these are `DTensor`s; under TP
   they're `DTensor`s on a 2D mesh. DCP handles both.
 - **optimizer state** — AdamW's `exp_avg`, `exp_avg_sq`,
-  `step` counters; Lion's `exp_avg`; Muon's internal state. All
-  per-parameter tensors live on the same device and parallelism
-  shape as the parameter, so DCP saves them symmetrically.
+  `step` counters; Lion's `exp_avg`; Muon's `momentum_buffer`s plus
+  its inner AdamW's moments. All per-parameter tensors live on the
+  same device and parallelism shape as the parameter, so DCP saves
+  them symmetrically.
 - **never-stepped record** — one entry per parameter the optimizer
   holds without any state, i.e. one that had not yet received a
   gradient. An optimizer creates per-parameter state lazily, so there
@@ -57,9 +62,48 @@ What's in each:
   that is indistinguishable from state that went missing. The record
   keeps the distinction for the load — see [Loading](#loading).
 
+Before the first optimizer step (the step-0 checkpoint of a
+`dyn_ckpt_window` from step 0) none of the `checkpointed_optimizers`
+holds state, so the save writes neither the optimizer nor the record.
+There is nothing to save then, and reading the optimizer would create
+state: `get_optimizer_state_dict` first gives an optimizer that holds
+none a dummy `lr=0` step, which leaves AdamW one step ahead in its bias
+correction and makes `ScheduleFreeAdamW` divide by zero. A load that
+finds no optimizer in a checkpoint — this one, or one holding model
+weights alone — loads it like a pretrained model: the weights and train
+state, with every checkpointed optimizer reset to its freshly built
+state. It reads that from the DCP metadata before building any optimizer
+template, so no optimizer takes the dummy step. Past step 0 it warns,
+because the run's optimizer moments are then missing and the resume
+does not continue it exactly.
+
 Not in the DCP shard: scheduler, dataloader, RNG, and training
 metadata. Those go in `train_state.pt` alongside —
 [see Train state](train-state.md).
+
+### Inner optimizers
+
+`get_optimizer_state_dict` keeps only an optimizer's own `state` and
+`param_groups`; any other key its `state_dict()` returns is dropped.
+Muon hands the parameters Newton-Schulz cannot take — norms and
+biases, plus the embedding and output head whenever
+`vocab_size / dim > 10` — to an inner `torch.optim.AdamW` that its own
+`param_groups` do not list, so passing Muon alone would leave that
+AdamW's moments out of the checkpoint and restart them from zero on
+every resume.
+
+`Muon.inner_optimizers` names the inner AdamW, and the manager's
+`checkpointed_optimizers` — `[optimizer, *optimizer.inner_optimizers]` —
+go to both the getter and the setter. Their state shares the `"optimizer"` entry, keyed by parameter
+name like the rest, with the inner AdamW's param groups after Muon's —
+so a reader that passes Muon alone still finds Muon's state where it
+expects it.
+
+A Muon checkpoint saved before the inner AdamW was checkpointed holds
+only Muon's own param groups. The load detects that from the DCP
+metadata, restores Muon alone, leaves the inner AdamW fresh — as every
+resume from such a checkpoint did before — and logs a warning that the
+resume is not bit-exact. The next checkpoint it writes is complete.
 
 ## On-disk layout
 
@@ -169,12 +213,18 @@ Load is the mirror image of save:
 ```python
 dcp_state = {
     "model":     get_model_state_dict(self.model),
-    "optimizer": get_optimizer_state_dict(self.model, self.optimizer),
+    "optimizer": get_optimizer_state_dict(self.model, self.checkpointed_optimizers),
 }
 dcp.load(dcp_state, checkpoint_id=str(dcp_dir), process_group=self._process_group)
 set_model_state_dict(self.model, dcp_state["model"])
-set_optimizer_state_dict(self.model, self.optimizer, optim_state_dict=dcp_state["optimizer"])
+set_optimizer_state_dict(
+    self.model, self.checkpointed_optimizers, optim_state_dict=dcp_state["optimizer"]
+)
 ```
+
+A Muon checkpoint saved before the inner AdamW was checkpointed is the
+one exception: the load passes Muon alone — see
+[Inner optimizers](#inner-optimizers).
 
 The getter call gives DCP the **shape** to fill — it doesn't contain
 the saved data, just the tensor metadata (and, crucially, the
