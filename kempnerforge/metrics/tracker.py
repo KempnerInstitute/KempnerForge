@@ -507,10 +507,43 @@ def _import_mlflow() -> Any:
     return mlflow
 
 
-def _mlflow_databricks_ready() -> bool:
-    """True when Databricks credentials are present in the environment."""
-    has_token = bool(os.environ.get("DATABRICKS_TOKEN") or os.environ.get("DATABRICKS_API_TOKEN"))
-    return bool(os.environ.get("DATABRICKS_HOST")) and has_token
+_DATABRICKS_AUTH_ROUTES = (
+    "Databricks auth: env DATABRICKS_HOST and DATABRICKS_TOKEN; a ~/.databrickscfg profile via "
+    "a databricks://<profile> URI or DATABRICKS_CONFIG_PROFILE; SDK OAuth"
+)
+
+
+def _auth_hint(error: Exception) -> str:
+    """Where Databricks finds credentials, appended to a failure that may be a credentials one."""
+    if isinstance(error, (ImportError, TimeoutError)):  # a missing package or a slow server
+        return ""
+    return f" ({_DATABRICKS_AUTH_ROUTES})"
+
+
+def _databricks_profile(uri: str) -> str | None:
+    """The profile a ``databricks://<profile>`` tracking URI names; None for any other URI."""
+    scheme, separator, rest = uri.partition("://")
+    profile = rest.partition("/")[0]
+    if scheme != "databricks" or not separator or not profile or ":" in profile:
+        return None  # "scope:prefix" names a secret scope, not a profile
+    return profile
+
+
+def _prepare_databricks_auth(uri: str) -> None:
+    """Make SDK and artifact calls use the URI's profile, and let the token alias stand in.
+
+    Credentials are never read here: the SDK resolves them from the environment, a profile file
+    or OAuth. An operator-set DATABRICKS_CONFIG_PROFILE or DATABRICKS_TOKEN wins.
+    """
+    profile = _databricks_profile(uri)
+    if profile:
+        os.environ.setdefault("DATABRICKS_CONFIG_PROFILE", profile)
+    if os.environ.get("DATABRICKS_CONFIG_PROFILE"):
+        return  # the profile holds the credentials; the SDK prefers env, so an alias would win
+    # The Databricks SDK reads DATABRICKS_TOKEN; mirror the DATABRICKS_API_TOKEN
+    # name many keep in ~/.bashrc so either works.
+    if not os.environ.get("DATABRICKS_TOKEN") and os.environ.get("DATABRICKS_API_TOKEN"):
+        os.environ["DATABRICKS_TOKEN"] = os.environ["DATABRICKS_API_TOKEN"]
 
 
 def _resolve_mlflow_experiment(config: MetricsConfig, uri: str) -> str | None:
@@ -541,7 +574,7 @@ def _resolve_mlflow_experiment(config: MetricsConfig, uri: str) -> str | None:
         user = WorkspaceClient().current_user.me().user_name
         return f"/Users/{user}/{project}"
     except Exception as e:  # SDK missing, no creds, or API error
-        logger.warning(f"Could not auto-resolve Databricks experiment path: {e}")
+        logger.warning(f"Could not auto-resolve Databricks experiment path: {e}{_auth_hint(e)}")
         return None
 
 
@@ -618,11 +651,16 @@ class MLflowBackend(_LoggingBackend):
     call has a deadline: the run is set up and later ended on one owner thread (the active run is
     thread-local), and metric, param and tag calls go through a best-effort worker, so a slow
     server never stalls training.
+
+    The tracking URI resolves as config, then $MLFLOW_TRACKING_URI, then "databricks". Databricks
+    credentials are not pre-checked: init attempts the server calls, and a failure disables the
+    backend with a warning that names the auth routes.
     """
 
     def __init__(self, config: MetricsConfig, job_config: JobConfig | None = None) -> None:
         self._config = config
         self._job_config = job_config  # flattened to params lazily, only for a fresh run
+        self._uri = ""  # the resolved tracking URI, set when init starts
         self._active: bool | None = None  # None = not tried, True = live, False = failed
         self._run_started = False  # a run exists that close() must end
         self._resume_skip_below: int | None = None  # skip re-logging steps already in the run
@@ -640,20 +678,11 @@ class MLflowBackend(_LoggingBackend):
     def _ensure_init(self) -> None:
         if self._active is not None:
             return
-        uri = self._config.mlflow_tracking_uri
-        if uri.startswith("databricks"):
-            if not _mlflow_databricks_ready():
-                logger.warning(
-                    "enable_mlflow with tracking_uri='databricks' but DATABRICKS_HOST/token "
-                    "not set — disabling MLflow backend"
-                )
-                self._active = False
-                return
-            # The Databricks SDK reads DATABRICKS_TOKEN; mirror the DATABRICKS_API_TOKEN
-            # name many keep in ~/.bashrc so either works.
-            if not os.environ.get("DATABRICKS_TOKEN") and os.environ.get("DATABRICKS_API_TOKEN"):
-                os.environ["DATABRICKS_TOKEN"] = os.environ["DATABRICKS_API_TOKEN"]
+        self._uri = self._config.resolve_mlflow_tracking_uri()
+        on_databricks = self._uri.startswith("databricks")
         try:
+            if on_databricks:
+                _prepare_databricks_auth(self._uri)
             self._mlflow = _import_mlflow()
             # The training thread waits here at most once, for at most the init deadline.
             experiment, run_id, resumed, last_step = self._owner.start(_INIT_DEADLINE_S)
@@ -676,7 +705,8 @@ class MLflowBackend(_LoggingBackend):
             )
             self._active = False
         except Exception as e:  # mlflow talks to a remote server: network / auth / config errors
-            logger.warning(f"MLflow init failed: {e}")
+            hint = _auth_hint(e) if on_databricks else ""
+            logger.warning(f"MLflow init failed: {e}{hint}")
             self._active = False
 
     def _open_run(self) -> tuple[str | None, str, bool, int | None]:
@@ -685,7 +715,7 @@ class MLflowBackend(_LoggingBackend):
         Returns (experiment, run_id, resumed, last logged step); the caller applies it, so a
         start that finishes after the caller gave up changes nothing here.
         """
-        mlflow, uri = self._mlflow, self._config.mlflow_tracking_uri
+        mlflow, uri = self._mlflow, self._uri
         mlflow.set_tracking_uri(uri)
         try:
             experiment = _resolve_mlflow_experiment(self._config, uri)

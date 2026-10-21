@@ -11,7 +11,8 @@ mlflow_experiment = "/Experiments/my-project"   # absolute workspace path on Dat
 mlflow_run_name   = "7b-debug"                  # optional — MLflow auto-generates one
 ```
 
-Credentials come from the environment, never from config:
+Credentials never go in config. The Databricks SDK finds them in the environment, a
+`~/.databrickscfg` profile, or OAuth; from the environment:
 
 ```bash
 export DATABRICKS_HOST="https://<workspace>.cloud.databricks.com"
@@ -23,10 +24,17 @@ other ranks never touch MLflow.
 
 ## Tracking URI and experiment
 
-`mlflow_tracking_uri` defaults to `"databricks"`, which reads `DATABRICKS_HOST` +
-a token from the environment. If it is `"databricks"` but no credentials are set,
-the backend logs a warning and disables itself — it does not invent a local store.
-Point `mlflow_tracking_uri` at an MLflow server (`http(s)://…`) to log elsewhere.
+The tracking URI resolves in order: `mlflow_tracking_uri` → `$MLFLOW_TRACKING_URI` →
+`"databricks"`. `databricks://<profile>` selects a `~/.databrickscfg` profile and exports it
+as `DATABRICKS_CONFIG_PROFILE` (an operator-set value wins), so SDK and artifact calls use
+the same profile. `DATABRICKS_API_TOKEN` is mirrored into `DATABRICKS_TOKEN`, the name the
+SDK reads, unless a profile is selected (the SDK prefers environment variables over the
+profile file).
+
+Credentials are not pre-checked: init attempts the connection, and if it fails the backend
+logs a warning naming the auth routes (environment, profile, SDK OAuth) and disables itself;
+it does not invent a local store. Point `mlflow_tracking_uri` at an MLflow server
+(`http(s)://…`) to log elsewhere.
 
 The client is `mlflow-skinny` (tracking-only; no server or database backends). To
 log to a local SQLite store instead, install full `mlflow` and set
