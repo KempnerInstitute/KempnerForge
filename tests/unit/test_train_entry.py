@@ -71,9 +71,13 @@ class FakeCheckpointManager:
         self.saves: list[tuple[int, int, dict]] = []
         self.waits = 0
         self.flushes = 0
+        self.tracking_source = None
 
     def save(self, step, tokens_seen=0, scheduler=None, dataloader=None, extra=None) -> None:
         self.saves.append((step, tokens_seen, dict(extra or {})))
+
+    def set_tracking_source(self, source) -> None:
+        self.tracking_source = source
 
     def wait(self) -> None:
         self.waits += 1
@@ -798,6 +802,9 @@ class TestRunTraining:
             def log_eval(self, *_a) -> None:
                 pass
 
+            def tracking_entries(self) -> list:
+                return []
+
             def close(self) -> None:
                 closes.append(1)
 
@@ -819,6 +826,41 @@ class TestRunTraining:
         )
         assert destroys == [1]
         assert closes == [1, 1]
+
+    def test_checkpoint_manager_reads_the_trackers_live_runs(self, monkeypatch):
+        import kempnerforge.training.entry as entry
+        from kempnerforge.training.entry import run_training
+        from kempnerforge.training.loop import StepResult
+
+        live = [{"backend": "tensorboard", "log_dir": "logs"}]
+
+        class LiveTracker:
+            def __init__(self, *_a, **_k) -> None:
+                pass
+
+            def init_backends(self, _config) -> None:
+                pass
+
+            def start_step(self) -> None:
+                pass
+
+            def end_step(self, **_kw):
+                return None
+
+            def tracking_entries(self) -> list:
+                return live
+
+            def close(self) -> None:
+                pass
+
+        ckpt = _stub_entry(monkeypatch, TinyTextModel())
+        monkeypatch.setattr(entry, "MetricsTracker", LiveTracker)
+        assert ckpt.tracking_source is None
+        run_training(
+            make_config(max_steps=1), step_fn=lambda _s, _i: StepResult(loss=1.0, grad_norm=0.5)
+        )
+        assert ckpt.tracking_source is not None
+        assert ckpt.tracking_source() == live
 
     def test_injected_hooks_get_the_whole_lifecycle(self, monkeypatch):
         from kempnerforge.training.entry import run_training

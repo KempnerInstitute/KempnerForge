@@ -14,7 +14,7 @@ import logging
 import os
 import shutil
 import stat
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any, cast
 
@@ -51,6 +51,8 @@ _OPTIM_PARAM_GROUPS_PREFIX = "optimizer.param_groups."
 _NEVER_STEPPED_KEY = "optimizer_never_stepped"
 _NEVER_STEPPED_PREFIX = f"{_NEVER_STEPPED_KEY}."
 _OPTIM_PREFIX = "optimizer."
+# Reports the logging runs live at save time, one JSON-ready record each, for metadata.json.
+TrackingSource = Callable[[], list[dict[str, str]]]
 
 
 def _saved_optimizer_param_groups(saved_keys: Iterable[str]) -> int:
@@ -284,6 +286,8 @@ class CheckpointManager:
         # the flush completes (drained at the next save() or wait()), so
         # `latest` never points at a half-written checkpoint. (step, ckpt_dir).
         self._pending_finalize: tuple[int, Path] | None = None
+        # Late-bound because the tracker is built after the manager; see set_tracking_source().
+        self._tracking_source: TrackingSource | None = None
         # Dedicated gloo group for the manager's own synchronization
         # (the end-of-save barrier). dcp.async_save() runs its collective
         # planning (all_gather/reduce_scatter) on a background thread using
@@ -353,6 +357,29 @@ class CheckpointManager:
         """
         if dist.is_initialized():
             dist.barrier(group=self._sync_group)
+
+    def set_tracking_source(self, source: TrackingSource | None) -> None:
+        """Record the logging runs ``source`` reports in every later ``metadata.json``.
+
+        ``source`` returns one JSON-ready record per live run, and is called on rank 0 only,
+        inside ``save()``. The ``tracking`` key is omitted when it reports none. ``None``
+        detaches it.
+        """
+        if source is not None and not callable(source):
+            raise TypeError(
+                f"tracking source must be callable or None, got {type(source).__name__}"
+            )
+        self._tracking_source = source
+
+    def _tracking_entries(self) -> list[dict[str, str]]:
+        """The live logging runs for ``metadata.json``; a failing source costs the key only."""
+        if self._tracking_source is None:
+            return []
+        try:
+            return self._tracking_source()
+        except Exception as e:  # rank 0 only: a raise here would strand the other ranks
+            logger.warning(f"Could not record the tracking runs in {_METADATA_FILE}: {e}")
+            return []
 
     def save(
         self,
@@ -427,6 +454,9 @@ class CheckpointManager:
                 # a sorted, deduplicated list of {"module", "frozen"} dicts so
                 # the comparison on load is reorder-invariant.
                 meta["vlm_freeze"] = extra["vlm_freeze"]
+            tracking = self._tracking_entries()
+            if tracking:
+                meta["tracking"] = tracking
             (ckpt_dir / _METADATA_FILE).write_text(json.dumps(meta, indent=2))
 
         if sync_mode:

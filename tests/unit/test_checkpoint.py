@@ -653,6 +653,201 @@ class TestSaveVLMFreezeMetadata:
         assert "vlm_freeze" not in meta
 
 
+class TestSaveTrackingSidecar:
+    """``metadata.json`` lists the logging runs live at save time under a ``tracking`` key."""
+
+    MLFLOW = {
+        "backend": "mlflow",
+        "run_id": "run-1",
+        "experiment": "exp",
+        "tracking_uri": "http://localhost:5000",
+    }
+    WANDB = {
+        "backend": "wandb",
+        "run_id": "w-1",
+        "experiment": "proj",
+        "entity": "team",
+        "url": "https://tracking.example/team/proj/runs/w-1",
+    }
+    TENSORBOARD = {"backend": "tensorboard", "log_dir": "tb_logs"}
+
+    @staticmethod
+    def _sidecar(tmp_path, step):
+        with open(tmp_path / f"step_{step}" / "metadata.json") as f:
+            return json.load(f)
+
+    def test_block_carries_the_four_mlflow_fields(self, tmp_path, monkeypatch):
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        mgr.set_tracking_source(lambda: [self.MLFLOW])
+        mgr.save(step=1, tokens_seen=64)
+        meta = self._sidecar(tmp_path, 1)
+        assert meta == {"step": 1, "tokens_seen": 64, "tracking": [self.MLFLOW]}
+        assert set(meta["tracking"][0]) == {"backend", "run_id", "experiment", "tracking_uri"}
+
+    def test_every_live_backend_is_listed_in_order(self, tmp_path, monkeypatch):
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        mgr.set_tracking_source(lambda: [self.WANDB, self.TENSORBOARD, self.MLFLOW])
+        mgr.save(step=1)
+        assert self._sidecar(tmp_path, 1)["tracking"] == [self.WANDB, self.TENSORBOARD, self.MLFLOW]
+
+    def test_key_is_omitted_when_nothing_is_live(self, tmp_path, monkeypatch):
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        mgr.save(step=1)  # no source attached
+        mgr.set_tracking_source(list)  # attached, but no backend has a run
+        mgr.save(step=2)
+        for step in (1, 2):
+            text = (tmp_path / f"step_{step}" / "metadata.json").read_text()
+            assert text == json.dumps({"step": step, "tokens_seen": 0}, indent=2)
+
+    def test_detached_source_stops_recording(self, tmp_path, monkeypatch):
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        mgr.set_tracking_source(lambda: [self.MLFLOW])
+        mgr.save(step=1)
+        mgr.set_tracking_source(None)
+        mgr.save(step=2)
+        assert "tracking" in self._sidecar(tmp_path, 1)
+        assert "tracking" not in self._sidecar(tmp_path, 2)
+
+    def test_block_sits_beside_the_vlm_freeze_metadata(self, tmp_path, monkeypatch):
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        mgr.set_tracking_source(lambda: [self.MLFLOW])
+        freeze = _freeze_meta(("vision_encoder", True))
+        mgr.save(step=1, extra={"vlm_freeze": freeze})
+        meta = self._sidecar(tmp_path, 1)
+        assert meta["vlm_freeze"] == freeze
+        assert meta["tracking"] == [self.MLFLOW]
+
+    def test_each_save_records_the_runs_live_at_that_moment(self, tmp_path, monkeypatch):
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        live: list[dict[str, str]] = []
+        mgr.set_tracking_source(lambda: list(live))
+        mgr.save(step=1)  # before the first log of the process: no run yet
+        live.append(self.MLFLOW)
+        mgr.save(step=2)
+        live.append(self.TENSORBOARD)
+        mgr.save(step=3)
+        assert "tracking" not in self._sidecar(tmp_path, 1)
+        assert self._sidecar(tmp_path, 2)["tracking"] == [self.MLFLOW]
+        assert self._sidecar(tmp_path, 3)["tracking"] == [self.MLFLOW, self.TENSORBOARD]
+
+    def test_only_rank_zero_asks_the_source(self, tmp_path, monkeypatch):
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        asked: list[int] = []
+
+        def source():
+            asked.append(1)
+            return [self.MLFLOW]
+
+        mgr.set_tracking_source(source)
+        mgr._rank = 1  # the rank that does not write metadata.json
+        mgr.save(step=1)
+        assert asked == []
+        assert not (tmp_path / "step_1" / "metadata.json").exists()
+        mgr._rank = 0
+        mgr.save(step=2)
+        assert asked == [1]
+
+    def test_failing_source_costs_the_key_not_the_save(self, tmp_path, monkeypatch):
+        from kempnerforge.checkpoint import manager as mgr_mod
+
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+
+        def source():
+            raise RuntimeError("no run object")
+
+        warnings: list[str] = []
+        monkeypatch.setattr(mgr_mod.logger, "warning", warnings.append)
+        mgr.set_tracking_source(source)
+        mgr.save(step=1, tokens_seen=8)
+        assert self._sidecar(tmp_path, 1) == {"step": 1, "tokens_seen": 8}
+        assert (tmp_path / "step_1" / "train_state.pt").exists()
+        assert (tmp_path / "latest").resolve() == (tmp_path / "step_1").resolve()
+        assert len(warnings) == 1 and "no run object" in warnings[0]
+
+    def test_source_must_be_callable_or_none(self, tmp_path, monkeypatch):
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        with pytest.raises(TypeError, match="callable or None, got list"):
+            mgr.set_tracking_source([self.MLFLOW])  # type: ignore[arg-type]
+        mgr.save(step=1)  # nothing was attached
+        assert "tracking" not in self._sidecar(tmp_path, 1)
+
+    def test_train_state_is_untouched(self, tmp_path, monkeypatch):
+        extra = {"mlflow_run_id": "run-1", "wandb_run_id": "w-1", "phase_idx": 2}
+        plain = _make_mock_mgr(tmp_path / "plain", monkeypatch)
+        plain.save(step=1, extra=dict(extra))
+        tracked = _make_mock_mgr(tmp_path / "tracked", monkeypatch)
+        tracked.set_tracking_source(lambda: [self.MLFLOW, self.WANDB])
+        tracked.save(step=1, extra=dict(extra))
+        states = [
+            torch.load(root / "step_1" / "train_state.pt", weights_only=False)
+            for root in (tmp_path / "plain", tmp_path / "tracked")
+        ]
+        assert set(states[0]) == set(states[1])
+        assert "tracking" not in states[1]
+        assert {k: states[1][k] for k in extra} == extra
+
+    def test_trackers_live_runs_reach_the_sidecar(self, tmp_path, monkeypatch):
+        from kempnerforge.config.schema import JobConfig, MetricsConfig
+        from kempnerforge.metrics.tracker import MetricsTracker, _LoggingBackend
+
+        class Live(_LoggingBackend):
+            def log(self, metrics, step):
+                pass
+
+            def tracking_entry(self):
+                return dict(TestSaveTrackingSidecar.MLFLOW)
+
+        model = ModelConfig(dim=128, n_layers=2, n_heads=2, vocab_size=256)
+        tracker = MetricsTracker(JobConfig(model=model, metrics=MetricsConfig()), num_gpus=1)
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        mgr.set_tracking_source(tracker.tracking_entries)
+        mgr.save(step=1)
+        tracker._backends = [Live()]
+        mgr.save(step=2)
+        tracker.close()
+        mgr.save(step=3)
+        assert "tracking" not in self._sidecar(tmp_path, 1)
+        assert self._sidecar(tmp_path, 2)["tracking"] == [self.MLFLOW]
+        assert "tracking" not in self._sidecar(tmp_path, 3)
+
+    @pytest.mark.parametrize("recorded", [True, False], ids=["with-block", "without-block"])
+    def test_checkpoint_loads_and_resumes_with_or_without_the_block(self, tmp_path, recorded):
+        """A checkpoint written before the key existed resumes exactly as one that has it."""
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        def build():
+            model = torch.nn.Linear(4, 4)
+            return model, torch.optim.AdamW(model.parameters(), lr=1e-2)
+
+        torch.manual_seed(0)
+        model, opt = build()
+        model(torch.ones(2, 4)).sum().backward()
+        opt.step()
+        extra = {"mlflow_run_id": "run-1", "wandb_run_id": "w-1", "phase_idx": 2}
+        config = CheckpointConfig(dir=str(tmp_path / "ckpt"))
+        saver = CheckpointManager(config, model, opt)
+        saver.set_tracking_source(lambda: [self.MLFLOW, self.WANDB])
+        saver.save(step=3, tokens_seen=96, extra=extra)
+
+        sidecar = tmp_path / "ckpt" / "step_3" / "metadata.json"
+        meta = json.loads(sidecar.read_text())
+        assert "tracking" in meta
+        if not recorded:
+            del meta["tracking"]
+            sidecar.write_text(json.dumps(meta, indent=2))
+
+        model2, opt2 = build()
+        loader = CheckpointManager(config, model2, opt2)
+        loader.set_tracking_source(lambda: [self.MLFLOW])  # a resumed run records again
+        assert loader.peek_saved_step() == 3
+        step, tokens_seen, restored = loader.load()
+        assert (step, tokens_seen) == (3, 96)
+        assert restored == extra  # the run ids still resume from the torch state
+        for saved, loaded in zip(model.parameters(), model2.parameters(), strict=True):
+            assert torch.equal(saved, loaded)
+            assert torch.equal(opt.state[saved]["exp_avg"], opt2.state[loaded]["exp_avg"])
+
+
 class TestLoadVLMFreezeCompare:
     def test_match_passes(self, tmp_path, monkeypatch):
         mgr = _make_mock_mgr(tmp_path, monkeypatch)
