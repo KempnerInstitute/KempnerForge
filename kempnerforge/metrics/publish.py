@@ -5,8 +5,10 @@
 
 A checkpoint's ``metadata.json`` records the tracking backends that were active when
 it was saved. ``publish_metrics`` reads the MLflow entry and appends the metrics to
-that run at the checkpoint's step in a single ``log_batch`` request, which MLflow
-validates as a whole: it is stored entirely or not at all. The publisher never starts,
+that run at the checkpoint's step in a single ``log_batch`` request. Inputs are fully
+validated before anything is sent, but MLflow's ``log_batch`` permits partial writes,
+so a request that fails server side may still have stored some points. The publisher
+never starts,
 ends, or edits a run and keeps no state of its own, so several publishers can write to
 one run at once and the tracking server arbitrates. The call blocks on the server under
 MLflow's own HTTP timeout and retry settings, and authentication is whatever the MLflow
@@ -248,8 +250,10 @@ def publish_metrics(
         The target the metrics were appended to.
 
     Raises:
-        PublishRefused: The sidecar or the metrics are missing or malformed, or mlflow is
-            not installed; nothing was sent. Errors raised by MLflow itself (an invalid
+        PublishRefused: The sidecar or the metrics are missing or malformed, mlflow is
+            not installed, or the sidecar has no model_id while this process has an
+            active MLflow model (which ``log_batch`` would silently link); nothing was
+            sent. Errors raised by MLflow itself (an invalid
             metric name, which fails the whole request, or an unreachable server)
             propagate as raised.
     """
@@ -269,6 +273,18 @@ def publish_metrics(
             link["model_id"] = target.model_id
         else:
             logger.debug("installed mlflow cannot link metrics to a model; ignoring model_id")
+    else:
+        # log_batch fills model_id-less metrics with the process's active model
+        # (mlflow.get_active_model_id); refuse rather than mislink to an unrelated model.
+        get_ambient = getattr(mlflow, "get_active_model_id", None)
+        ambient = get_ambient() if get_ambient is not None else None
+        if ambient:
+            raise PublishRefused(
+                "the sidecar entry has no model_id but this process has an active MLflow "
+                f"model ({ambient}); log_batch would silently link the metrics to it. Clear "
+                "the active model (MLFLOW_ACTIVE_MODEL_ID / mlflow.set_active_model) or "
+                "record model_id in the sidecar"
+            )
 
     timestamp = _now_ms()
     batch = [

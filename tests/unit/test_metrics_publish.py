@@ -82,7 +82,8 @@ class _MetricWithoutModelId:
 class _FakeMlflow(types.ModuleType):
     """Stand-in `mlflow` recording what a publisher does.
 
-    Only ``MlflowClient(tracking_uri=...)`` and ``log_batch`` exist: touching anything
+    Only ``MlflowClient(tracking_uri=...)``, ``log_batch`` and ``get_active_model_id``
+    exist: touching anything
     else (``start_run``, ``set_tracking_uri``, ``end_run``, ...) raises AssertionError.
     ``reject`` models a store validating a whole request before keeping any of it,
     ``on_log_batch`` runs after a request is stored, ``init_error`` fails the client.
@@ -94,8 +95,10 @@ class _FakeMlflow(types.ModuleType):
         on_log_batch=None,
         reject=None,
         init_error: Exception | None = None,
+        active_model_id: str | None = None,
     ):
         super().__init__("mlflow")
+        self.active_model_id = active_model_id
         self.events: list[str] = []
         self.batches: list[types.SimpleNamespace] = []
         entities = types.ModuleType("mlflow.entities")
@@ -130,6 +133,9 @@ class _FakeMlflow(types.ModuleType):
                 raise AssertionError(f"publisher touched MlflowClient.{name}")
 
         self.MlflowClient = MlflowClient
+
+    def get_active_model_id(self):
+        return self.active_model_id
 
     def __getattr__(self, name):
         if name.startswith("__"):
@@ -416,6 +422,23 @@ class TestPublishMetrics:
         fake = _install_mlflow(monkeypatch)
         publish_metrics(_sidecar(tmp_path, tracking=tracking), {"a": 1.0})
         assert [m.model_id for m in fake.batches[0].metrics] == [None]
+
+    def test_ambient_active_model_refused_when_sidecar_has_no_model_id(self, tmp_path, monkeypatch):
+        """log_batch fills model_id-less metrics with the process's active model; the
+        publisher refuses rather than mislink them to an unrelated model."""
+        fake = _install_mlflow(monkeypatch, active_model_id="m-ambient")
+        ckpt = _sidecar(tmp_path, tracking=[_entry(model_id=None)])
+        with pytest.raises(PublishRefused, match="m-ambient"):
+            publish_metrics(ckpt, {"a": 1.0})
+        assert fake.events == []  # refused before any client was built
+
+    def test_ambient_active_model_is_overridden_by_the_sidecar_model_id(
+        self, tmp_path, monkeypatch
+    ):
+        fake = _install_mlflow(monkeypatch, active_model_id="m-ambient")
+        ckpt = _sidecar(tmp_path, tracking=[_entry(model_id="m-abc")])
+        publish_metrics(ckpt, {"a": 1.0})
+        assert [m.model_id for m in fake.batches[0].metrics] == ["m-abc"]
 
     def test_model_id_is_ignored_with_a_debug_note_when_mlflow_cannot_link(
         self, tmp_path, monkeypatch
