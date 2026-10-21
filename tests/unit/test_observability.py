@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import builtins
+import glob
 import importlib.abc
 import importlib.machinery
 import io
@@ -1689,17 +1690,35 @@ class TestTrackingEntries:
             }
 
     @pytest.mark.parametrize(
+        "setting",
+        ["rel_dir", Path("path_dir"), b"bytes_dir", 7],
+        ids=["str", "path", "bytes", "number"],
+    )
+    def test_tensorboard_entry_is_where_the_event_files_are_written(
+        self, tmp_path, monkeypatch, setting
+    ):
+        pytest.importorskip("tensorboard")
+        monkeypatch.chdir(tmp_path)  # relative settings create their directory here
+        config = MetricsConfig(enable_tensorboard=True, tensorboard_dir=setting)  # type: ignore[arg-type]
+        with closing(TensorBoardBackend(config)) as backend:
+            backend.log({"train/loss": 2.5}, step=1)
+            entry = backend.tracking_entry()
+            assert entry is not None
+            written = {os.path.dirname(p) for p in glob.glob("**/*tfevents*", recursive=True)}
+            assert written == {entry["log_dir"]}
+
+    @pytest.mark.parametrize(
         ("reported", "log_dir"),
         [
             ("logs/run", "logs/run"),
             (Path("logs/run"), "logs/run"),
             (" ", " "),
-            (b"logs/run", None),
+            (b"logs/run", "b'logs/run'"),
+            (7, "7"),
             ("", None),
             (None, None),
-            (7, None),
         ],
-        ids=["str", "path", "blank", "bytes", "empty", "none", "number"],
+        ids=["str", "path", "blank", "bytes", "number", "empty", "none"],
     )
     def test_tensorboard_entry_keeps_only_what_is_a_directory(self, reported, log_dir):
         backend = TensorBoardBackend(MetricsConfig(enable_tensorboard=True))

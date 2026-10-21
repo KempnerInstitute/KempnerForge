@@ -893,7 +893,7 @@ class TensorBoardBackend(_LoggingBackend):
         if self._closed or not writer:
             return None
         log_dir = writer.get_logdir()  # the writer's own: an empty setting makes it pick one
-        directory = str(log_dir) if isinstance(log_dir, (str, os.PathLike)) else ""
+        directory = str(log_dir) if log_dir else ""  # as the event writer converts it
         return {"backend": "tensorboard", "log_dir": directory} if directory else None
 
     def close(self) -> None:
