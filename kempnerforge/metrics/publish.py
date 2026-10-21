@@ -253,9 +253,9 @@ def publish_metrics(
         PublishRefused: The sidecar or the metrics are missing or malformed, mlflow is
             not installed, or the sidecar has no model_id while this process has an
             active MLflow model (which ``log_batch`` would silently link); nothing was
-            sent. Errors raised by MLflow itself (an invalid
-            metric name, which fails the whole request, or an unreachable server)
-            propagate as raised.
+            sent. Errors raised by MLflow itself (an invalid metric name, an
+            unreachable server) propagate as raised; a request that fails server side
+            may still have stored some of its points.
     """
     target = read_mlflow_target(checkpoint_dir)
     named = _prefixed_metrics(metrics, prefix)

@@ -85,7 +85,9 @@ class _FakeMlflow(types.ModuleType):
     Only ``MlflowClient(tracking_uri=...)``, ``log_batch`` and ``get_active_model_id``
     exist: touching anything
     else (``start_run``, ``set_tracking_uri``, ``end_run``, ...) raises AssertionError.
-    ``reject`` models a store validating a whole request before keeping any of it,
+    ``log_batch`` fills a missing metric model_id from the active model, as mlflow's
+    client does. ``reject`` fails a request before the fake stores it (a real store may
+    keep some of a failed batch: log_batch permits partial writes),
     ``on_log_batch`` runs after a request is stored, ``init_error`` fails the client.
     """
 
@@ -115,6 +117,9 @@ class _FakeMlflow(types.ModuleType):
 
             def log_batch(self, run_id, metrics=(), params=(), tags=(), synchronous=None):
                 fake.events.append("log_batch")
+                for m in metrics:  # mlflow: model_id=metric.model_id or get_active_model_id()
+                    if getattr(m, "model_id", None) is None:
+                        m.model_id = fake.active_model_id
                 if reject is not None:
                     reject(list(metrics))
                 call = types.SimpleNamespace(
@@ -461,7 +466,7 @@ class TestPublishMetrics:
             publish_metrics(_sidecar(tmp_path), {"a": 1.0})
         assert not isinstance(err.value, PublishRefused)
 
-    def test_a_request_the_store_rejects_stores_none_of_it(self, tmp_path, monkeypatch):
+    def test_a_rejected_request_propagates_the_stores_error(self, tmp_path, monkeypatch):
         def reject(metrics):
             if any("?" in m.key for m in metrics):
                 raise ValueError("invalid metric name")
