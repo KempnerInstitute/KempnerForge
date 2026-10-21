@@ -11,8 +11,12 @@ WandB, TensorBoard, MLflow) at a configurable interval.
 from __future__ import annotations
 
 import os
+import threading
 import time
+from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
+from functools import partial
 from typing import Any
 
 from kempnerforge.config.schema import JobConfig, MetricsConfig
@@ -284,6 +288,151 @@ class WandBBackend(_LoggingBackend):
             wandb.finish()
 
 
+# Tracking is a side channel: a slow or unreachable server may cost points, never a stalled rank.
+_CALL_DEADLINE_S = 60.0  # one metric / param / tag call
+_UPLOAD_DEADLINE_S = 180.0  # one artifact upload
+_DRAIN_DEADLINE_S = 30.0  # close() flush budget
+_QUEUE_MAX = 256  # pending calls before new ones are dropped
+_WARN_INTERVAL_S = 300.0  # minimum gap between repeats of a warning
+
+
+class _RateLimitedWarning:
+    """Warns on the first event, then at most once per interval, counting what it held back."""
+
+    def __init__(self, interval: float, clock: Callable[[], float] = time.monotonic) -> None:
+        self._interval = interval
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._last: float | None = None
+        self._held_back = 0
+
+    def __call__(self, message: str) -> None:
+        with self._lock:
+            now = self._clock()
+            if self._last is not None and now - self._last < self._interval:
+                self._held_back += 1
+                return
+            held_back, self._held_back, self._last = self._held_back, 0, now
+        suffix = f" ({held_back} similar warnings suppressed)" if held_back else ""
+        logger.warning(message + suffix)
+
+
+class _BestEffortWorker:
+    """Runs tracking calls off the training thread so a slow server cannot stall it.
+
+    One daemon thread takes calls in submission order. Each call runs on a short-lived thread
+    that the worker waits on for at most the call's deadline; a thread cannot be cancelled, so a
+    call past its deadline is abandoned and the next one proceeds. ``submit`` never blocks (a
+    full queue drops the new call), and failures, timeouts and drops only emit rate-limited
+    warnings.
+    """
+
+    def __init__(
+        self, name: str, *, max_queue: int, call_deadline: float, drain_deadline: float
+    ) -> None:
+        self._name = name
+        self._max_queue = max_queue
+        self._call_deadline = call_deadline
+        self._drain_deadline = drain_deadline
+        self._items: deque[tuple[str, Callable[[], Any], float]] = deque()
+        self._cv = threading.Condition()
+        self._busy = False  # a dequeued call is still being waited on
+        self._closed = False
+        self._thread = threading.Thread(target=self._consume, name=f"{name}-tracking", daemon=True)
+        self._warn_call = _RateLimitedWarning(_WARN_INTERVAL_S)
+        self._warn_drop = _RateLimitedWarning(_WARN_INTERVAL_S)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def submit(self, what: str, fn: Callable[[], Any], deadline: float | None = None) -> bool:
+        """Queue ``fn``; False if it was dropped (queue full or worker closed)."""
+        with self._cv:
+            if self._closed:
+                return False
+            accepted = len(self._items) < self._max_queue
+            if accepted:
+                limit = self._call_deadline if deadline is None else deadline
+                self._items.append((what, fn, limit))
+                self._cv.notify_all()
+        if not accepted:
+            self._warn_drop(
+                f"{self._name} tracking queue full ({self._max_queue}); dropping {what}"
+            )
+        return accepted
+
+    def flush(self, timeout: float) -> bool:
+        """Wait until every queued call has been attempted; False if ``timeout`` ran out first."""
+        end = time.monotonic() + timeout
+        with self._cv:
+            while self._items or self._busy:
+                remaining = end - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._cv.wait(remaining)
+        return True
+
+    def close(self) -> bool:
+        """Stop accepting calls and deliver the queued ones within the drain deadline."""
+        with self._cv:
+            self._closed = True
+            self._cv.notify_all()
+        drained = self.flush(self._drain_deadline)
+        if not drained:
+            with self._cv:
+                lost = len(self._items) + int(self._busy)
+                self._items.clear()
+            logger.warning(f"{self._name}: {lost} tracking call(s) not delivered before shutdown")
+        return drained
+
+    def _consume(self) -> None:
+        while True:
+            with self._cv:
+                while not self._items:
+                    if self._closed:
+                        return
+                    self._cv.wait()
+                what, fn, deadline = self._items.popleft()
+                self._busy = True
+            try:
+                self._run(what, fn, deadline)
+            except Exception as e:  # the worker must outlive any single call
+                self._warn_call(f"{self._name} {what} not run ({e}); points may be lost")
+            finally:
+                with self._cv:
+                    self._busy = False
+                    self._cv.notify_all()
+
+    def _run(self, what: str, fn: Callable[[], Any], deadline: float) -> None:
+        failure: list[Exception] = []
+
+        def call() -> None:
+            try:
+                fn()
+            except Exception as e:  # reported by the worker, not raised in a stray thread
+                failure.append(e)
+
+        thread = threading.Thread(target=call, name=f"{self._name}-call", daemon=True)
+        thread.start()
+        thread.join(deadline)
+        if thread.is_alive():
+            self._warn_call(
+                f"{self._name} {what} still running after {deadline:g}s; abandoning it, "
+                "points may be lost"
+            )
+        elif failure:
+            self._warn_call(f"{self._name} {what} failed ({failure[0]}); points may be lost")
+
+
+def _import_mlflow() -> Any:
+    """Import mlflow with bounded HTTP requests; values already set in the environment win."""
+    os.environ.setdefault("MLFLOW_HTTP_REQUEST_TIMEOUT", "30")
+    os.environ.setdefault("MLFLOW_HTTP_REQUEST_MAX_RETRIES", "3")
+    import mlflow
+
+    return mlflow
+
+
 def _mlflow_databricks_ready() -> bool:
     """True when Databricks credentials are present in the environment."""
     has_token = bool(os.environ.get("DATABRICKS_TOKEN") or os.environ.get("DATABRICKS_API_TOKEN"))
@@ -369,10 +518,22 @@ def _mlflow_last_step(mlflow: Any, run_id: str) -> int | None:
         return None
 
 
+# The worker thread has no active run (mlflow keeps it in thread-local state), so each call
+# below names its run; an implicit call there would silently start a new run.
+def _mlflow_log_metrics(mlflow: Any, run_id: str, metrics: dict[str, float], step: int) -> None:
+    mlflow.log_metrics({k: float(v) for k, v in metrics.items()}, step=step, run_id=run_id)
+
+
+def _mlflow_set_tag(mlflow: Any, run_id: str, key: str, value: str) -> None:
+    mlflow.MlflowClient().set_tag(run_id, key, value)  # fluent set_tags has no run_id
+
+
 class MLflowBackend(_LoggingBackend):
     """MLflow logging backend (Databricks-hosted or any MLflow tracking server).
 
-    Lazy init on first log; run ID written back to config for checkpoint resume.
+    Lazy init on first log; run ID written back to config for checkpoint resume. Run start and
+    end stay on the calling thread (the active run is thread-local); metric, param and tag calls
+    go through a best-effort worker so a slow server never stalls training.
     """
 
     def __init__(self, config: MetricsConfig, job_config: JobConfig | None = None) -> None:
@@ -381,7 +542,14 @@ class MLflowBackend(_LoggingBackend):
         self._active: bool | None = None  # None = not tried, True = live, False = failed
         self._run_started = False  # a run exists that close() must end
         self._resume_skip_below: int | None = None  # skip re-logging steps already in the run
-        self._log_failures = 0  # consecutive log failures (warn once, keep retrying)
+        self._mlflow: Any = None  # the imported module, set once the run exists
+        self._run_id = ""
+        self._worker = _BestEffortWorker(
+            "MLflow",
+            max_queue=_QUEUE_MAX,
+            call_deadline=_CALL_DEADLINE_S,
+            drain_deadline=_DRAIN_DEADLINE_S,
+        )
 
     def _ensure_init(self) -> None:
         if self._active is not None:
@@ -400,8 +568,7 @@ class MLflowBackend(_LoggingBackend):
             if not os.environ.get("DATABRICKS_TOKEN") and os.environ.get("DATABRICKS_API_TOKEN"):
                 os.environ["DATABRICKS_TOKEN"] = os.environ["DATABRICKS_API_TOKEN"]
         try:
-            import mlflow
-
+            mlflow = _import_mlflow()
             mlflow.set_tracking_uri(uri)
             try:
                 experiment = _resolve_mlflow_experiment(self._config, uri)
@@ -424,7 +591,10 @@ class MLflowBackend(_LoggingBackend):
                 )
             run, resumed = self._start_run(mlflow)
             self._run_started = True
+            self._mlflow = mlflow
+            self._run_id = run.info.run_id
             self._config.mlflow_run_id = run.info.run_id
+            self._worker.start()
             self._active = True
             logger.info(f"MLflow initialized: experiment={experiment} run_id={run.info.run_id}")
             if resumed:
@@ -458,23 +628,21 @@ class MLflowBackend(_LoggingBackend):
         return mlflow.start_run(**kwargs), False
 
     def _log_run_metadata(self, mlflow: Any) -> None:
-        """Log flattened config as params + host/slurm tags; non-fatal on error."""
+        """Queue flattened config as params + host/slurm tags; each call fails on its own."""
         import socket
 
         hyperparams = _flatten_config_params(self._job_config) if self._job_config else {}
         items = list(hyperparams.items())
-        # log_params caps at 100 per batch; guard each so one bad batch keeps the rest.
+        # log_params caps at 100 per batch; one call per batch so a bad batch keeps the rest.
         for i in range(0, len(items), 100):
-            try:
-                mlflow.log_params(dict(items[i : i + 100]))
-            except Exception as e:
-                logger.warning(f"MLflow log_params batch failed (skipping): {e}")
-        try:
-            mlflow.set_tags(
-                {"host": socket.gethostname(), "slurm_job_id": os.environ.get("SLURM_JOB_ID", "")}
+            batch = dict(items[i : i + 100])
+            self._worker.submit(
+                "log_params", partial(mlflow.log_params, batch, run_id=self._run_id)
             )
-        except Exception as e:
-            logger.warning(f"MLflow set_tags failed (continuing): {e}")
+        tags = {"host": socket.gethostname(), "slurm_job_id": os.environ.get("SLURM_JOB_ID", "")}
+        for key, value in tags.items():
+            call = partial(_mlflow_set_tag, mlflow, self._run_id, key, value)
+            self._worker.submit(f"set_tag {key}", call)
 
     def log(self, metrics: dict[str, float], step: int) -> None:
         self._ensure_init()
@@ -482,23 +650,15 @@ class MLflowBackend(_LoggingBackend):
             return
         if self._resume_skip_below is not None and step <= self._resume_skip_below:
             return  # already logged before this resume — avoid duplicate history points
-        import mlflow
-
-        try:
-            mlflow.log_metrics({k: float(v) for k, v in metrics.items()}, step=step)
-            self._log_failures = 0
-        except Exception as e:  # transient network/token failure: warn once, keep retrying
-            self._log_failures += 1
-            if self._log_failures == 1:
-                logger.warning(f"MLflow log failed ({e}); will keep retrying, points may be lost")
+        call = partial(_mlflow_log_metrics, self._mlflow, self._run_id, dict(metrics), step)
+        self._worker.submit("log_metrics", call)
 
     def close(self) -> None:
         if not self._run_started:
             return
         try:
-            import mlflow
-
-            mlflow.end_run()
+            self._worker.close()
+            self._mlflow.end_run()
         except Exception as e:  # teardown must not fail the job
             logger.warning(f"MLflow end_run failed ({e})")
         finally:
