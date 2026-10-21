@@ -291,8 +291,11 @@ class WandBBackend(_LoggingBackend):
 # Tracking is a side channel: a slow or unreachable server may cost points, never a stalled rank.
 _CALL_DEADLINE_S = 60.0  # one metric / param / tag call
 _UPLOAD_DEADLINE_S = 180.0  # one artifact upload
+_INIT_DEADLINE_S = 60.0  # experiment setup plus run start or resume, on the first log
+_END_DEADLINE_S = 60.0  # ending the run in close(), after the drain
 _DRAIN_DEADLINE_S = 30.0  # close() flush budget
 _QUEUE_MAX = 256  # pending calls before new ones are dropped
+_MAX_CALL_THREADS = 4  # live call threads, abandoned ones included, before new calls are dropped
 _WARN_INTERVAL_S = 300.0  # minimum gap between repeats of a warning
 
 
@@ -322,18 +325,27 @@ class _BestEffortWorker:
 
     One daemon thread takes calls in submission order. Each call runs on a short-lived thread
     that the worker waits on for at most the call's deadline; a thread cannot be cancelled, so a
-    call past its deadline is abandoned and the next one proceeds. ``submit`` never blocks (a
-    full queue drops the new call), and failures, timeouts and drops only emit rate-limited
-    warnings.
+    call past its deadline is abandoned and the next one proceeds. At most ``max_threads`` call
+    threads are alive at once, abandoned ones included; beyond that, calls are dropped until one
+    returns. ``submit`` never blocks (a full queue drops the new call), and failures, timeouts
+    and drops only emit rate-limited warnings.
     """
 
     def __init__(
-        self, name: str, *, max_queue: int, call_deadline: float, drain_deadline: float
+        self,
+        name: str,
+        *,
+        max_queue: int,
+        max_threads: int,
+        call_deadline: float,
+        drain_deadline: float,
     ) -> None:
         self._name = name
         self._max_queue = max_queue
+        self._max_threads = max_threads
         self._call_deadline = call_deadline
         self._drain_deadline = drain_deadline
+        self._calls: list[threading.Thread] = []  # call threads not yet seen to finish
         self._items: deque[tuple[str, Callable[[], Any], float]] = deque()
         self._cv = threading.Condition()
         self._busy = False  # a dequeued call is still being waited on
@@ -404,6 +416,13 @@ class _BestEffortWorker:
                     self._cv.notify_all()
 
     def _run(self, what: str, fn: Callable[[], Any], deadline: float) -> None:
+        self._calls = [thread for thread in self._calls if thread.is_alive()]
+        if len(self._calls) >= self._max_threads:
+            self._warn_drop(
+                f"{self._name}: {len(self._calls)} abandoned tracking calls have not returned; "
+                f"dropping {what}"
+            )
+            return
         failure: list[Exception] = []
 
         def call() -> None:
@@ -414,6 +433,7 @@ class _BestEffortWorker:
 
         thread = threading.Thread(target=call, name=f"{self._name}-call", daemon=True)
         thread.start()
+        self._calls.append(thread)
         thread.join(deadline)
         if thread.is_alive():
             self._warn_call(
@@ -424,10 +444,64 @@ class _BestEffortWorker:
             self._warn_call(f"{self._name} {what} failed ({failure[0]}); points may be lost")
 
 
+class _RunOwner:
+    """Starts and later ends a tracking run on one dedicated thread, waiting on each for a deadline.
+
+    mlflow keeps the active run, and the system metrics monitor tied to it, per thread, so the end
+    must run on the thread that ran the start. A caller that stops waiting is never blocked again:
+    a start that returns after its deadline is ended right away, and a late end is abandoned.
+    """
+
+    def __init__(self, name: str, start: Callable[[], Any], end: Callable[[], Any]) -> None:
+        self._start_fn = start
+        self._end_fn = end
+        self._started = threading.Event()  # start returned or raised
+        self._end_requested = threading.Event()
+        self._ended = threading.Event()  # end returned or raised, or there was nothing to end
+        self._result: Any = None
+        self._start_error: Exception | None = None
+        self._end_error: Exception | None = None
+        self._thread = threading.Thread(target=self._own, name=f"{name}-run", daemon=True)
+
+    def start(self, deadline: float) -> Any:
+        """Return what ``start`` returned; re-raise its error, or TimeoutError past ``deadline``."""
+        self._thread.start()
+        if not self._started.wait(deadline):
+            self._end_requested.set()  # the start still running is ended as soon as it returns
+            raise TimeoutError(f"no answer from the tracking server within {deadline:g}s")
+        if self._start_error is not None:
+            raise self._start_error
+        return self._result
+
+    def end(self, deadline: float) -> None:
+        """Run ``end`` on the owner thread; re-raise its error, or TimeoutError past deadline."""
+        self._end_requested.set()
+        if not self._ended.wait(deadline):
+            raise TimeoutError(f"no answer from the tracking server within {deadline:g}s")
+        if self._end_error is not None:
+            raise self._end_error
+
+    def _own(self) -> None:
+        try:
+            self._result = self._start_fn()
+        except Exception as e:  # raised again by start(), on the caller's thread
+            self._start_error = e
+        self._started.set()
+        if self._start_error is None:
+            self._end_requested.wait()
+            try:
+                self._end_fn()
+            except Exception as e:  # raised again by end()
+                self._end_error = e
+        self._ended.set()
+
+
 def _import_mlflow() -> Any:
     """Import mlflow with bounded HTTP requests; values already set in the environment win."""
     os.environ.setdefault("MLFLOW_HTTP_REQUEST_TIMEOUT", "30")
     os.environ.setdefault("MLFLOW_HTTP_REQUEST_MAX_RETRIES", "3")
+    # The Databricks SDK transport keeps its own request timeout; this caps how long it retries.
+    os.environ.setdefault("MLFLOW_DATABRICKS_ENDPOINT_HTTP_RETRY_TIMEOUT", "60")
     import mlflow
 
     return mlflow
@@ -528,12 +602,17 @@ def _mlflow_set_tag(mlflow: Any, run_id: str, key: str, value: str) -> None:
     mlflow.MlflowClient().set_tag(run_id, key, value)  # fluent set_tags has no run_id
 
 
+class _MlflowDisabled(Exception):
+    """A deliberate config error found during init: MLflow is disabled with this message."""
+
+
 class MLflowBackend(_LoggingBackend):
     """MLflow logging backend (Databricks-hosted or any MLflow tracking server).
 
-    Lazy init on first log; run ID written back to config for checkpoint resume. Run start and
-    end stay on the calling thread (the active run is thread-local); metric, param and tag calls
-    go through a best-effort worker so a slow server never stalls training.
+    Lazy init on first log; run ID written back to config for checkpoint resume. Every server
+    call has a deadline: the run is set up and later ended on one owner thread (the active run is
+    thread-local), and metric, param and tag calls go through a best-effort worker, so a slow
+    server never stalls training.
     """
 
     def __init__(self, config: MetricsConfig, job_config: JobConfig | None = None) -> None:
@@ -542,14 +621,16 @@ class MLflowBackend(_LoggingBackend):
         self._active: bool | None = None  # None = not tried, True = live, False = failed
         self._run_started = False  # a run exists that close() must end
         self._resume_skip_below: int | None = None  # skip re-logging steps already in the run
-        self._mlflow: Any = None  # the imported module, set once the run exists
+        self._mlflow: Any = None  # the imported module
         self._run_id = ""
         self._worker = _BestEffortWorker(
             "MLflow",
             max_queue=_QUEUE_MAX,
+            max_threads=_MAX_CALL_THREADS,
             call_deadline=_CALL_DEADLINE_S,
             drain_deadline=_DRAIN_DEADLINE_S,
         )
+        self._owner = _RunOwner("MLflow", start=self._open_run, end=lambda: self._mlflow.end_run())
 
     def _ensure_init(self) -> None:
         if self._active is not None:
@@ -568,39 +649,22 @@ class MLflowBackend(_LoggingBackend):
             if not os.environ.get("DATABRICKS_TOKEN") and os.environ.get("DATABRICKS_API_TOKEN"):
                 os.environ["DATABRICKS_TOKEN"] = os.environ["DATABRICKS_API_TOKEN"]
         try:
-            mlflow = _import_mlflow()
-            mlflow.set_tracking_uri(uri)
-            try:
-                experiment = _resolve_mlflow_experiment(self._config, uri)
-            except ValueError as e:  # bad $MLFLOW_EXPERIMENT: a deliberate config error
-                logger.warning(f"MLflow disabled: {e}")
-                self._active = False
-                return
-            if uri.startswith("databricks") and not experiment:
-                logger.warning(
-                    "MLflow disabled: could not resolve a Databricks experiment path "
-                    "(set mlflow_experiment or $MLFLOW_EXPERIMENT to an absolute path)"
-                )
-                self._active = False
-                return
-            if experiment:
-                mlflow.set_experiment(experiment)
-            if self._config.mlflow_log_system_metrics:
-                mlflow.set_system_metrics_sampling_interval(
-                    self._config.mlflow_system_metrics_interval
-                )
-            run, resumed = self._start_run(mlflow)
+            self._mlflow = _import_mlflow()
+            # The training thread waits here at most once, for at most the init deadline.
+            experiment, run_id, resumed, last_step = self._owner.start(_INIT_DEADLINE_S)
             self._run_started = True
-            self._mlflow = mlflow
-            self._run_id = run.info.run_id
-            self._config.mlflow_run_id = run.info.run_id
+            self._run_id = run_id
+            self._config.mlflow_run_id = run_id
             self._worker.start()
             self._active = True
-            logger.info(f"MLflow initialized: experiment={experiment} run_id={run.info.run_id}")
+            logger.info(f"MLflow initialized: experiment={experiment} run_id={run_id}")
             if resumed:
-                self._resume_skip_below = _mlflow_last_step(mlflow, run.info.run_id)
+                self._resume_skip_below = last_step
             else:
-                self._log_run_metadata(mlflow)
+                self._log_run_metadata(self._mlflow)
+        except _MlflowDisabled as e:
+            logger.warning(f"MLflow disabled: {e}")
+            self._active = False
         except ImportError:
             logger.warning(
                 "mlflow not installed — disabling MLflow backend (uv sync --group mlflow)"
@@ -609,6 +673,31 @@ class MLflowBackend(_LoggingBackend):
         except Exception as e:  # mlflow talks to a remote server: network / auth / config errors
             logger.warning(f"MLflow init failed: {e}")
             self._active = False
+
+    def _open_run(self) -> tuple[str | None, str, bool, int | None]:
+        """Every server step of init, run on the owner thread under the init deadline.
+
+        Returns (experiment, run_id, resumed, last logged step); the caller applies it, so a
+        start that finishes after the caller gave up changes nothing here.
+        """
+        mlflow, uri = self._mlflow, self._config.mlflow_tracking_uri
+        mlflow.set_tracking_uri(uri)
+        try:
+            experiment = _resolve_mlflow_experiment(self._config, uri)
+        except ValueError as e:  # bad $MLFLOW_EXPERIMENT: a deliberate config error
+            raise _MlflowDisabled(str(e)) from e
+        if uri.startswith("databricks") and not experiment:
+            raise _MlflowDisabled(
+                "could not resolve a Databricks experiment path "
+                "(set mlflow_experiment or $MLFLOW_EXPERIMENT to an absolute path)"
+            )
+        mlflow.set_experiment(experiment)  # never empty here: off Databricks a name always resolves
+        if self._config.mlflow_log_system_metrics:
+            mlflow.set_system_metrics_sampling_interval(self._config.mlflow_system_metrics_interval)
+        run, resumed = self._start_run(mlflow)
+        run_id = run.info.run_id
+        last_step = _mlflow_last_step(mlflow, run_id) if resumed else None
+        return experiment, run_id, resumed, last_step
 
     def _start_run(self, mlflow: Any) -> tuple[Any, bool]:
         """Start a run, or resume the saved run_id. If that run_id no longer exists, fall
@@ -658,7 +747,7 @@ class MLflowBackend(_LoggingBackend):
             return
         try:
             self._worker.close()
-            self._mlflow.end_run()
+            self._owner.end(_END_DEADLINE_S)
         except Exception as e:  # teardown must not fail the job
             logger.warning(f"MLflow end_run failed ({e})")
         finally:

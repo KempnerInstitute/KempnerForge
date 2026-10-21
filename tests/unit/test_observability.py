@@ -370,6 +370,10 @@ class _FakeMlflow:
         self.calls: list = []  # (call, run_id, thread id) of every metric / param / tag call
         self.lifecycle_threads: dict = {}  # thread id that ran start_run / end_run
         self.steps_at_end: list | None = None  # log_steps when end_run was called
+        self.sampling_intervals: list = []
+        self.ended: list = []  # run ids end_run found active on its own thread
+        self.monitor_alive = False  # stand-in for the system metrics monitor of the active run
+        self._active = threading.local()  # like mlflow, the active run is per thread
 
     def set_tracking_uri(self, *a, **k):
         pass
@@ -377,12 +381,14 @@ class _FakeMlflow:
     def set_experiment(self, *a, **k):
         pass
 
-    def set_system_metrics_sampling_interval(self, *a, **k):
-        pass
+    def set_system_metrics_sampling_interval(self, interval):
+        self.sampling_intervals.append(interval)
 
     def start_run(self, run_id=None, run_name=None, log_system_metrics=False):
         self.start_run_ids.append(run_id)
         self.lifecycle_threads["start_run"] = threading.get_ident()
+        self._active.run = self._run
+        self.monitor_alive = log_system_metrics
         return self._run
 
     def log_metrics(self, metrics, step=None, run_id=None):
@@ -398,6 +404,11 @@ class _FakeMlflow:
         self.lifecycle_threads["end_run"] = threading.get_ident()
         self.steps_at_end = list(self.log_steps)
         self.end_run_calls += 1
+        run = getattr(self._active, "run", None)
+        if run is not None:  # on any other thread than the one that started it, a no-op
+            self.ended.append(run.info.run_id)
+            self.monitor_alive = False
+            self._active.run = None
 
     def MlflowClient(self, *a, **k):
         steps = [types.SimpleNamespace(step=s) for s in self.history_steps]
@@ -409,7 +420,11 @@ class _FakeMlflow:
         return types.SimpleNamespace(get_metric_history=lambda run_id, key: steps, set_tag=set_tag)
 
 
-_MLFLOW_HTTP_ENV = ("MLFLOW_HTTP_REQUEST_TIMEOUT", "MLFLOW_HTTP_REQUEST_MAX_RETRIES")
+_MLFLOW_HTTP_ENV = (
+    "MLFLOW_HTTP_REQUEST_TIMEOUT",
+    "MLFLOW_HTTP_REQUEST_MAX_RETRIES",
+    "MLFLOW_DATABRICKS_ENDPOINT_HTTP_RETRY_TIMEOUT",
+)
 
 
 @pytest.fixture(autouse=True)
@@ -418,6 +433,26 @@ def _unset_mlflow_http_env(monkeypatch):
     for name in _MLFLOW_HTTP_ENV:
         monkeypatch.setenv(name, "")  # registers the restore even when the variable was unset
         monkeypatch.delenv(name)
+
+
+@pytest.fixture(autouse=True)
+def _close_what_the_test_built(monkeypatch):
+    """Close every MLflow backend and tracking worker a test builds, so no thread outlives it."""
+    built: list = []
+    for cls in (MLflowBackend, tracker_mod._BestEffortWorker):
+
+        def init(self, *args, _init=cls.__init__, **kwargs):
+            _init(self, *args, **kwargs)
+            built.append(self)
+
+        monkeypatch.setattr(cls, "__init__", init)
+    yield
+    for obj in reversed(built):  # a backend before its own worker
+        obj.close()
+    for worker in built:
+        if isinstance(worker, tracker_mod._BestEffortWorker) and worker._thread.ident is not None:
+            worker._thread.join(10)
+            assert not worker._thread.is_alive()
 
 
 def _flush(backend, timeout=10.0):
@@ -773,15 +808,18 @@ class TestMLflowBestEffort:
         assert spy.env_at_import == {
             "MLFLOW_HTTP_REQUEST_TIMEOUT": "30",
             "MLFLOW_HTTP_REQUEST_MAX_RETRIES": "3",
+            "MLFLOW_DATABRICKS_ENDPOINT_HTTP_RETRY_TIMEOUT": "60",
         }
 
     def test_operator_http_bounds_win(self, monkeypatch):
         monkeypatch.setenv("MLFLOW_HTTP_REQUEST_TIMEOUT", "7")
         monkeypatch.setenv("MLFLOW_HTTP_REQUEST_MAX_RETRIES", "9")
+        monkeypatch.setenv("MLFLOW_DATABRICKS_ENDPOINT_HTTP_RETRY_TIMEOUT", "11")
         spy = _import_mlflow_via_spy(monkeypatch)
         assert spy.env_at_import == {
             "MLFLOW_HTTP_REQUEST_TIMEOUT": "7",
             "MLFLOW_HTTP_REQUEST_MAX_RETRIES": "9",
+            "MLFLOW_DATABRICKS_ENDPOINT_HTTP_RETRY_TIMEOUT": "11",
         }
         assert os.environ["MLFLOW_HTTP_REQUEST_TIMEOUT"] == "7"  # untouched after init too
 
@@ -794,11 +832,14 @@ class TestMLflowBestEffort:
         backend.log({"train/loss": 1, "gpu/peak_gb": 2}, step=1)
         backend.log({"train/loss": 0.5}, step=2)
         backend.close()
-        # The active run is thread-local, so start and end stay on the calling thread.
-        assert fm.lifecycle_threads == {"start_run": caller, "end_run": caller}
+        # The active run is thread-local: start and end share one thread, never the caller.
+        owner = fm.lifecycle_threads["start_run"]
+        assert fm.lifecycle_threads == {"start_run": owner, "end_run": owner}
+        assert owner != caller
+        assert fm.ended == ["run-xyz"]  # end_run found the run it started, so it was ended
         assert {kind for kind, _, _ in fm.calls} == {"log_metrics", "log_params", "set_tag"}
         assert {run_id for _, run_id, _ in fm.calls} == {"run-xyz"}  # every call named its run
-        assert caller not in {thread for _, _, thread in fm.calls}  # none ran on the caller
+        assert {caller, owner}.isdisjoint(thread for _, _, thread in fm.calls)
         assert fm.log_steps == [1, 2]
         assert fm.logged_metrics == [{"train/loss": 1.0, "gpu/peak_gb": 2.0}, {"train/loss": 0.5}]
         assert all(type(v) is float for m in fm.logged_metrics for v in m.values())
@@ -883,12 +924,20 @@ class TestMLflowBestEffort:
         backend._worker._thread.join(5)
         assert not backend._worker._thread.is_alive()  # the worker stops with the backend
 
-    def test_close_returns_within_deadline_when_server_hangs(self, monkeypatch):
+    def test_close_returns_within_its_deadlines_when_server_hangs(self, monkeypatch):
         fm = _FakeMlflow()
         release = threading.Event()
         fm.log_metrics = lambda metrics, step=None, run_id=None: release.wait()
+        end_run = fm.end_run
+
+        def hung_end_run():
+            release.wait()
+            end_run()
+
+        fm.end_run = hung_end_run
         monkeypatch.setitem(sys.modules, "mlflow", fm)
         monkeypatch.setattr(tracker_mod, "_DRAIN_DEADLINE_S", 0.3)
+        monkeypatch.setattr(tracker_mod, "_END_DEADLINE_S", 0.3)
         warnings_seen = _capture_warnings(monkeypatch)
         backend = MLflowBackend(_mlflow_cfg())
         try:
@@ -896,11 +945,145 @@ class TestMLflowBestEffort:
                 backend.log({"train/loss": 1.0}, step=step)
             start = time.perf_counter()
             backend.close()  # must not raise
-            assert time.perf_counter() - start < 5.0  # the hung call alone allows 60 s
-            assert fm.end_run_calls == 1  # the run is still ended
+            assert time.perf_counter() - start < 5.0  # the hung calls alone allow 60 s each
             assert any("not delivered" in w for w in warnings_seen)
+            ending = [w for w in warnings_seen if "end_run" in w]
+            assert ending == [
+                "MLflow end_run failed (no answer from the tracking server within 0.3s)"
+            ]
+            assert backend._run_started is False and fm.ended == []
         finally:
             release.set()
+        backend._owner._thread.join(10)
+        assert fm.ended == ["run-xyz"]  # the abandoned end still lands once the server answers
+
+    @pytest.mark.parametrize(
+        "hang_at", ["workspace_client", "set_experiment", "start_run", "last_step_lookup"]
+    )
+    def test_init_stalls_the_caller_once_within_its_deadline(self, monkeypatch, hang_at):
+        fm = _FakeMlflow()
+        release = threading.Event()
+        hung: list = []
+
+        def hang(result=None):
+            hung.append(hang_at)
+            release.wait()
+            return result
+
+        cfg = _mlflow_cfg()
+        if hang_at == "workspace_client":  # auto-resolving the Databricks experiment path
+            monkeypatch.setenv("DATABRICKS_HOST", "https://x.cloud.databricks.com")
+            monkeypatch.setenv("DATABRICKS_TOKEN", "dapi-x")
+            monkeypatch.delenv("MLFLOW_EXPERIMENT", raising=False)
+            user = types.SimpleNamespace(user_name="me")
+            workspace = types.SimpleNamespace(
+                current_user=types.SimpleNamespace(me=lambda: hang(user))
+            )
+            fake_sdk = types.ModuleType("databricks.sdk")
+            fake_sdk.WorkspaceClient = lambda: workspace
+            monkeypatch.setitem(sys.modules, "databricks", types.ModuleType("databricks"))
+            monkeypatch.setitem(sys.modules, "databricks.sdk", fake_sdk)
+            cfg = MetricsConfig(enable_mlflow=True, mlflow_log_system_metrics=False)
+        elif hang_at == "set_experiment":
+            fm.set_experiment = lambda name: hang()
+        elif hang_at == "start_run":  # the run exists on the server; the answer is late
+            start_run = fm.start_run
+            fm.start_run = lambda **kw: hang(start_run(**kw))
+        else:
+            cfg = _mlflow_cfg(mlflow_run_id="run-xyz")
+            history = types.SimpleNamespace(get_metric_history=lambda run_id, key: hang([]))
+            fm.MlflowClient = lambda: history
+        saved_run_id = cfg.mlflow_run_id
+        monkeypatch.setitem(sys.modules, "mlflow", fm)
+        monkeypatch.setattr(tracker_mod, "_INIT_DEADLINE_S", 0.2)
+        warnings_seen = _capture_warnings(monkeypatch)
+        backend = MLflowBackend(cfg)
+        try:
+            start = time.perf_counter()
+            backend.log({"train/loss": 1.0}, step=1)
+            backend.log({"train/loss": 1.0}, step=2)  # init already gave up: no second wait
+            assert time.perf_counter() - start < 5.0
+            assert backend._active is False and backend._run_started is False
+            assert warnings_seen == [
+                "MLflow init failed: no answer from the tracking server within 0.2s"
+            ]
+        finally:
+            release.set()
+        backend._owner._thread.join(10)
+        assert not backend._owner._thread.is_alive()
+        assert hung == [hang_at]  # init ran once and was never retried
+        assert fm.ended == ["run-xyz"]  # a run that starts after init gave up is ended at once
+        assert fm.calls == [] and cfg.mlflow_run_id == saved_run_id  # and nothing reaches it
+
+    @pytest.mark.parametrize("enabled", [True, False])
+    def test_system_metrics_follow_the_config_and_stop_with_the_run(self, monkeypatch, enabled):
+        fm = _FakeMlflow()
+        monkeypatch.setitem(sys.modules, "mlflow", fm)
+        cfg = _mlflow_cfg(mlflow_log_system_metrics=enabled, mlflow_system_metrics_interval=2.5)
+        backend = MLflowBackend(cfg)
+        backend.log({"train/loss": 1.0}, step=1)
+        assert fm.monitor_alive is enabled
+        assert fm.sampling_intervals == ([2.5] if enabled else [])
+        backend.close()
+        assert fm.ended == ["run-xyz"] and fm.monitor_alive is False  # stopped before close returns
+
+
+class TestRunOwner:
+    def test_start_and_end_share_one_thread_that_is_not_the_caller(self):
+        seen: list = []
+
+        def start():
+            seen.append(("start", threading.get_ident()))
+            return "run"
+
+        def end():
+            seen.append(("end", threading.get_ident()))
+
+        owner = tracker_mod._RunOwner("T", start=start, end=end)
+        assert owner.start(5) == "run"
+        assert [what for what, _ in seen] == ["start"]  # the end waits for end()
+        owner.end(5)
+        assert [what for what, _ in seen] == ["start", "end"]
+        assert seen[0][1] == seen[1][1] != threading.get_ident()
+
+    def test_a_failed_start_raises_on_the_caller_and_leaves_nothing_to_end(self):
+        ended: list = []
+
+        def start():
+            raise RuntimeError("no server")
+
+        owner = tracker_mod._RunOwner("T", start=start, end=lambda: ended.append(1))
+        with pytest.raises(RuntimeError, match="no server"):
+            owner.start(5)
+        owner.end(5)
+        assert ended == []
+
+    def test_a_late_start_is_ended_as_soon_as_it_returns(self):
+        release, ended = threading.Event(), threading.Event()
+        owner = tracker_mod._RunOwner("T", start=release.wait, end=ended.set)
+        with pytest.raises(TimeoutError, match="within 0.1s"):
+            owner.start(0.1)
+        assert not ended.is_set()
+        release.set()
+        assert ended.wait(10)  # without an end() call: the caller had already given up
+
+    def test_a_late_or_failed_end_raises_on_the_caller(self):
+        release = threading.Event()
+        late = tracker_mod._RunOwner("T", start=lambda: None, end=release.wait)
+        late.start(5)
+        try:
+            with pytest.raises(TimeoutError, match="within 0.1s"):
+                late.end(0.1)
+        finally:
+            release.set()
+
+        def boom():
+            raise RuntimeError("end failed")
+
+        failing = tracker_mod._RunOwner("T", start=lambda: None, end=boom)
+        failing.start(5)
+        with pytest.raises(RuntimeError, match="end failed"):
+            failing.end(5)
 
 
 class TestBestEffortWorker:
@@ -909,11 +1092,34 @@ class TestBestEffortWorker:
         worker = tracker_mod._BestEffortWorker(
             "T",
             max_queue=kw.get("max_queue", 8),
+            max_threads=kw.get("max_threads", 4),
             call_deadline=kw.get("call_deadline", 5.0),
             drain_deadline=kw.get("drain_deadline", 5.0),
         )
         worker.start()
         return worker
+
+    def test_live_call_threads_are_capped(self, monkeypatch):
+        warnings_seen = _capture_warnings(monkeypatch)
+        worker = self._worker(max_threads=2, call_deadline=0.05)
+        release = threading.Event()
+        try:
+            for n in range(5):
+                worker.submit(f"call {n}", release.wait)
+            assert worker.flush(10)
+            # Two calls were abandoned at their deadline and still run; no third thread started.
+            assert len(worker._calls) == 2 and all(t.is_alive() for t in worker._calls)
+            dropped = [w for w in warnings_seen if "dropping" in w]
+            assert dropped == ["T: 2 abandoned tracking calls have not returned; dropping call 2"]
+        finally:
+            release.set()
+        for thread in worker._calls:
+            thread.join(10)
+        ran: list = []
+        worker.submit("after", lambda: ran.append(1))
+        assert worker.flush(10)
+        assert ran == [1]  # a call that returned frees its thread slot
+        worker.close()
 
     def test_per_call_deadline_overrides_the_default(self, monkeypatch):
         warnings_seen = _capture_warnings(monkeypatch)
