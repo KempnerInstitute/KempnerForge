@@ -1074,6 +1074,11 @@ class TestAsyncLatestSymlinkSafety:
             "kempnerforge.checkpoint.manager.dist.barrier",
             lambda *a, **k: barriers.append(True),
         )
+        # The per-rank gather is a collective too; fake a world of one.
+        monkeypatch.setattr(
+            "kempnerforge.checkpoint.manager.dist.all_gather_object",
+            lambda out, obj, group=None: out.__setitem__(0, obj),
+        )
         mgr.save(step=1)
         assert barriers, "save() did not barrier when distributed is initialized"
 
@@ -1149,6 +1154,7 @@ class TestSyncBarrierGroup:
         monkeypatch.setattr(mgr_mod.dist, "is_initialized", lambda: True)
         monkeypatch.setattr(mgr_mod.dist, "new_group", fake_new_group)
         monkeypatch.setattr(mgr_mod.dist, "get_rank", lambda: 0)
+        monkeypatch.setattr(mgr_mod.dist, "get_world_size", lambda: 1)
 
         mgr = self._mgr(tmp_path)
         assert calls["backend"] == "gloo"
@@ -1162,6 +1168,7 @@ class TestSyncBarrierGroup:
         monkeypatch.setattr(mgr_mod.dist, "is_initialized", lambda: True)
         monkeypatch.setattr(mgr_mod.dist, "new_group", lambda backend=None: "GLOO_PG")
         monkeypatch.setattr(mgr_mod.dist, "get_rank", lambda: 0)
+        monkeypatch.setattr(mgr_mod.dist, "get_world_size", lambda: 1)
         monkeypatch.setattr(mgr_mod.dist, "barrier", lambda group=None: barrier_calls.append(group))
 
         mgr = self._mgr(tmp_path)
