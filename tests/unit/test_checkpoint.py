@@ -797,6 +797,33 @@ class TestSaveTrackingSidecar:
         assert (tmp_path / "latest").resolve() == (tmp_path / "step_1").resolve()
         assert len(warnings) == 1 and reason in warnings[0]
 
+    @pytest.mark.parametrize(
+        "tracking",
+        [
+            "oops",
+            {"backend": "mlflow"},
+            ["mlflow"],
+            [{"backend": None}],
+            [{"run_id": "r"}],
+            [{"backend": " "}],
+        ],
+        ids=["string", "mapping", "string-entry", "no-name", "missing-name", "blank-name"],
+    )
+    def test_source_of_the_wrong_shape_costs_the_key_not_the_save(
+        self, tmp_path, monkeypatch, tracking
+    ):
+        from kempnerforge.checkpoint import manager as mgr_mod
+
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        warnings: list[str] = []
+        monkeypatch.setattr(
+            mgr_mod.logger, "warning", lambda msg, *args: warnings.append(msg % args)
+        )
+        mgr.set_tracking_source(lambda: tracking)
+        mgr.save(step=1, tokens_seen=8)
+        assert self._sidecar(tmp_path, 1) == {"step": 1, "tokens_seen": 8}
+        assert len(warnings) == 1 and "list of mappings" in warnings[0]
+
     def test_exception_that_cannot_be_formatted_costs_only_the_key(self, tmp_path, monkeypatch):
         import io
         import logging

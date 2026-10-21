@@ -892,11 +892,9 @@ class TensorBoardBackend(_LoggingBackend):
         writer: Any = self._writer  # None before the first log, False without tensorboard
         if self._closed or not writer:
             return None
-        try:  # the writer's own directory: an empty configured one makes it pick its own
-            log_dir = os.fsdecode(writer.get_logdir())
-        except TypeError:  # not a path
-            return None
-        return {"backend": "tensorboard", "log_dir": log_dir} if log_dir else None
+        log_dir = writer.get_logdir()  # the writer's own: an empty setting makes it pick one
+        directory = str(log_dir) if isinstance(log_dir, (str, os.PathLike)) else ""
+        return {"backend": "tensorboard", "log_dir": directory} if directory else None
 
     def close(self) -> None:
         if self._writer and self._writer is not False:

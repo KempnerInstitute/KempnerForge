@@ -1693,12 +1693,13 @@ class TestTrackingEntries:
         [
             ("logs/run", "logs/run"),
             (Path("logs/run"), "logs/run"),
-            (b"logs/run", "logs/run"),
+            (" ", " "),
+            (b"logs/run", None),
             ("", None),
             (None, None),
             (7, None),
         ],
-        ids=["str", "path", "bytes", "empty", "none", "number"],
+        ids=["str", "path", "blank", "bytes", "empty", "none", "number"],
     )
     def test_tensorboard_entry_keeps_only_what_is_a_directory(self, reported, log_dir):
         backend = TensorBoardBackend(MetricsConfig(enable_tensorboard=True))
@@ -1778,6 +1779,13 @@ class TestTrackingEntries:
         tracker._backends = [_EntryBackend(bad), _EntryBackend(kept)]
         assert tracker.tracking_entries() == [kept]  # one bad backend does not cost the others
         assert len(seen) == 1 and "_EntryBackend" in seen[0]
+
+    def test_tracker_keeps_a_blank_field_that_is_not_the_backend_name(self):
+        entry = {"backend": "tensorboard", "log_dir": "   "}  # a directory can be named so
+        tracker = self._tracker()
+        tracker._backends = [_EntryBackend(entry)]
+        assert tracker.tracking_entries() == [entry]
+        assert json.loads(json.dumps(tracker.tracking_entries())) == [entry]
 
     def test_tracker_copies_each_entry_once_into_a_plain_dict(self):
         once = _OnceItems(backend="lazy", run_id="r")  # a mapping that cannot be read twice

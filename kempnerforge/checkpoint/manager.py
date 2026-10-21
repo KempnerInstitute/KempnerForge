@@ -243,6 +243,16 @@ def _load_train_state(path: Path) -> dict[str, Any]:
     return torch.load(path, map_location="cpu", weights_only=False)
 
 
+def _names_backends(tracking: object) -> bool:
+    """True for a list of mappings that each name a ``backend``, the shape readers select on."""
+    return isinstance(tracking, list) and all(
+        isinstance(entry, dict)
+        and isinstance(entry.get("backend"), str)
+        and entry["backend"].strip()
+        for entry in tracking
+    )
+
+
 class CheckpointManager:
     """Manages save/load/cleanup of distributed checkpoints.
 
@@ -381,6 +391,8 @@ class CheckpointManager:
             try:
                 tracking = self._tracking_source()
                 if tracking:
+                    if not _names_backends(tracking):
+                        raise TypeError("expected a list of mappings that each name a backend")
                     return json.dumps({**meta, "tracking": tracking}, indent=2)
             except Exception as e:
                 logger.warning("Could not record the tracking runs in %s: %s", _METADATA_FILE, e)
