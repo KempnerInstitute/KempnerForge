@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **MLflow run metadata**: `metrics.mlflow_description` and `metrics.mlflow_tags` (default unset) set a new run's description and tags, and every new run is tagged with the git commit of the working directory (`mlflow.source.git.commit`, plus `mlflow.source.git.dirty`) and gets `config.json` (the resolved config) and the launch TOML as artifacts, all on the background worker with uploads on a 180 s deadline; a resumed run is left as it was.
 - **`scheduler.warmup_start_factor`** (default `0.0`): the LR factor every warmup starts from, torch `LinearLR`'s `start_factor`, so a schedule can take its first step at `lr * warmup_start_factor` instead of zero. With it, `cosine` reproduces torch's `SequentialLR([LinearLR(start_factor), CosineAnnealing...])` step for step. The default keeps every existing schedule bit-identical.
   - Tests: `tests/unit/test_scheduler_extensions.py::TestWarmupStartFactor` (default unchanged, every warmup schedule honours it, step-for-step parity of `cosine` with the torch schedule) and `tests/unit/test_config.py` (default and rejection).
 - **VLM example: video captioning config on a pretrained 0.6B backbone** (`examples/vlm/configs/vlm_qwen3_0.6b_joint_decoder_webvid.toml`), warm-started weights-only from the converted checkpoint.

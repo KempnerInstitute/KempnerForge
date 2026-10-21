@@ -8,10 +8,13 @@ import importlib.machinery
 import io
 import logging
 import os
+import shutil
+import subprocess
 import sys
 import threading
 import time
 import types
+from dataclasses import asdict
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -49,6 +52,7 @@ from kempnerforge.metrics.tracker import (
     TensorBoardBackend,
     WandBBackend,
     _flatten_config_params,
+    _git_state,
     _resolve_mlflow_experiment,
 )
 
@@ -369,8 +373,11 @@ class _FakeMlflow:
         self.end_run_calls = 0
         self.logged_params: list = []
         self.logged_tags: list = []  # (key, value) pairs set through MlflowClient().set_tag
+        self.last_set_tag_synchronous = None
+        self.logged_dicts: list = []  # (artifact file, dict) from MlflowClient().log_dict
+        self.uploaded_files: list = []  # (file name, bytes) from MlflowClient().log_artifact
         self.history_steps: list = []  # steps returned by MlflowClient().get_metric_history
-        self.calls: list = []  # (call, run_id, thread id) of every metric / param / tag call
+        self.calls: list = []  # (call, run_id, thread id) of every metric / param / tag / upload
         self.tracking_uris: list = []  # every URI handed to set_tracking_uri
         self.lifecycle_threads: dict = {}  # thread id that ran start_run / end_run
         self.steps_at_end: list | None = None  # log_steps when end_run was called
@@ -419,11 +426,26 @@ class _FakeMlflow:
     def MlflowClient(self, *a, **k):
         steps = [types.SimpleNamespace(step=s) for s in self.history_steps]
 
-        def set_tag(run_id, key, value):
+        def set_tag(run_id, key, value, synchronous=None):
             self.calls.append(("set_tag", run_id, threading.get_ident()))
             self.logged_tags.append((key, value))
+            self.last_set_tag_synchronous = synchronous
 
-        return types.SimpleNamespace(get_metric_history=lambda run_id, key: steps, set_tag=set_tag)
+        def log_dict(run_id, dictionary, artifact_file):
+            self.calls.append(("log_dict", run_id, threading.get_ident()))
+            self.logged_dicts.append((artifact_file, dictionary))
+
+        def log_artifact(run_id, local_path, artifact_path=None):
+            self.calls.append(("log_artifact", run_id, threading.get_ident()))
+            with open(local_path, "rb") as f:
+                self.uploaded_files.append((os.path.basename(local_path), f.read()))
+
+        return types.SimpleNamespace(
+            get_metric_history=lambda run_id, key: steps,
+            set_tag=set_tag,
+            log_dict=log_dict,
+            log_artifact=log_artifact,
+        )
 
 
 _MLFLOW_HTTP_ENV = (
@@ -457,6 +479,13 @@ def _unset_tracking_env(monkeypatch):
     for name in _TRACKING_ENV:
         monkeypatch.setenv(name, "")
         monkeypatch.delenv(name)
+
+
+@pytest.fixture(autouse=True)
+def _no_git_and_no_launch_toml(monkeypatch):
+    """Start each test outside any repository and with no config file on the command line."""
+    monkeypatch.setattr(tracker_mod, "_git_state", lambda: None)
+    monkeypatch.setattr(sys, "argv", ["pytest"])
 
 
 @pytest.fixture(autouse=True)
@@ -507,6 +536,12 @@ def _park_log_metrics(fm):
 def _capture_warnings(monkeypatch) -> list[str]:
     seen: list[str] = []
     monkeypatch.setattr(tracker_mod.logger, "warning", lambda msg, *a, **k: seen.append(str(msg)))
+    return seen
+
+
+def _capture_debug(monkeypatch) -> list[str]:
+    seen: list[str] = []
+    monkeypatch.setattr(tracker_mod.logger, "debug", lambda msg, *a, **k: seen.append(str(msg)))
     return seen
 
 
@@ -622,6 +657,7 @@ class TestMLflowBackend:
         _flush(backend)
         assert fm.last_log_metrics_synchronous is True
         assert fm.last_log_params_synchronous is True  # init param batches are pinned too
+        assert fm.last_set_tag_synchronous is True  # and so are the run tags
 
     def test_resume_skips_already_logged_steps(self, monkeypatch):
         """On resume, steps already recorded in the run are not re-logged. (Finding #2)"""
@@ -748,11 +784,11 @@ def _assert_names_auth_routes(message):
         assert route in message
 
 
-def _init_backend(monkeypatch, cfg, fm=None):
+def _init_backend(monkeypatch, cfg, fm=None, job=None):
     """Run a backend's lazy init (the first log) over a fake mlflow; return both."""
     fm = fm or _FakeMlflow()
     monkeypatch.setitem(sys.modules, "mlflow", fm)
-    backend = MLflowBackend(cfg)
+    backend = MLflowBackend(cfg, job_config=job)
     backend.log({"train/loss": 1.0}, step=1)
     return backend, fm
 
@@ -946,6 +982,294 @@ class TestMlflowDatabricksAuth:
         assert [path for path in opened if "databrickscfg" in path] == []
 
 
+def _job():
+    return JobConfig(model=ModelConfig(dim=128, n_layers=2, n_heads=2, vocab_size=256))
+
+
+def _started(monkeypatch, cfg, job=None):
+    """Init a backend through its first log and wait for its queued metadata calls to land."""
+    backend, fm = _init_backend(monkeypatch, cfg, job=job)
+    _flush(backend)
+    return backend, fm
+
+
+def _record_deadlines(monkeypatch, backend) -> dict:
+    """The deadline each submit to the backend's worker asked for (None = the worker default)."""
+    seen: dict = {}
+    submit = backend._worker.submit
+
+    def spy(what, fn, deadline=None):
+        seen[what] = deadline
+        return submit(what, fn, deadline)
+
+    monkeypatch.setattr(backend._worker, "submit", spy)
+    return seen
+
+
+def _init_repo(path, monkeypatch, commit=True):
+    """A git repository at `path`, made the working directory; returns a runner for git there."""
+    if shutil.which("git") is None:
+        pytest.skip("git is not installed")
+    for name in ("GIT_AUTHOR_NAME", "GIT_COMMITTER_NAME"):
+        monkeypatch.setenv(name, "tester")
+    for name in ("GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL"):
+        monkeypatch.setenv(name, "tester@example.com")
+
+    def git(*args):
+        cmd = ["git", "-c", "commit.gpgsign=false", *args]
+        return subprocess.run(
+            cmd, cwd=path, check=True, capture_output=True, text=True
+        ).stdout.strip()
+
+    path.mkdir()
+    git("init", "-q")
+    if commit:
+        (path / "a.txt").write_text("one\n")
+        git("add", "a.txt")
+        git("commit", "-q", "-m", "first")
+    monkeypatch.chdir(path)
+    return git
+
+
+@pytest.fixture
+def git_repo(tmp_path, monkeypatch):
+    """A repository with one commit as the working directory: (path, git runner)."""
+    path = tmp_path / "repo"
+    return path, _init_repo(path, monkeypatch)
+
+
+class TestMlflowRunMetadata:
+    """A new run gets its description, tags, git commit and config files; a resumed one none."""
+
+    def test_description_and_tags_are_set_on_a_new_run(self, monkeypatch):
+        cfg = _mlflow_cfg(
+            mlflow_description="ablation, no pooling", mlflow_tags={"team": "vlm", "stage": "2"}
+        )
+        _, fm = _started(monkeypatch, cfg)
+        keys = [key for key, _ in fm.logged_tags]
+        assert keys == ["host", "slurm_job_id", "mlflow.note.content", "team", "stage"]
+        tags = dict(fm.logged_tags)
+        assert tags["mlflow.note.content"] == "ablation, no pooling"
+        assert (tags["team"], tags["stage"]) == ("vlm", "2")
+        tag_calls = [(run_id, thread) for kind, run_id, thread in fm.calls if kind == "set_tag"]
+        assert {run_id for run_id, _ in tag_calls} == {"run-xyz"}  # every tag named its run
+        assert threading.get_ident() not in {thread for _, thread in tag_calls}
+
+    def test_configured_tags_override_the_automatic_ones(self, monkeypatch):
+        monkeypatch.setattr(tracker_mod, "_git_state", lambda: ("a" * 40, False))
+        cfg = _mlflow_cfg(mlflow_tags={"host": "my-node", "mlflow.source.git.commit": "pinned"})
+        _, fm = _started(monkeypatch, cfg)
+        tags = dict(fm.logged_tags)  # the last write to a key is the one that stays
+        assert tags["host"] == "my-node"
+        assert tags["mlflow.source.git.commit"] == "pinned"
+        assert tags["mlflow.source.git.dirty"] == "false"
+        assert [key for key, _ in fm.logged_tags].count("host") == 1
+
+    def test_nothing_is_applied_again_on_resume(self, monkeypatch, tmp_path):
+        toml = tmp_path / "run.toml"
+        toml.write_text("[train]\n")
+        monkeypatch.setattr(sys, "argv", ["train.py", str(toml)])
+        git_asked: list = []
+        monkeypatch.setattr(tracker_mod, "_git_state", lambda: git_asked.append(1))
+        cfg = _mlflow_cfg(
+            mlflow_run_id="existing-run", mlflow_description="d", mlflow_tags={"team": "vlm"}
+        )
+        backend, fm = _started(monkeypatch, cfg, job=_job())
+        assert backend._active is True and fm.start_run_ids == ["existing-run"]
+        assert fm.logged_tags == [] and fm.logged_params == []
+        assert fm.logged_dicts == [] and fm.uploaded_files == []
+        assert git_asked == []
+
+    def test_defaults_add_no_configured_metadata(self, monkeypatch):
+        job = _job()
+        _, fm = _started(monkeypatch, _mlflow_cfg(), job=job)
+        assert [key for key, _ in fm.logged_tags] == ["host", "slurm_job_id"]
+        params = {k: v for batch in fm.logged_params for k, v in batch.items()}
+        assert params == _flatten_config_params(job)
+        assert not [k for k in params if "mlflow_tags" in k or "mlflow_description" in k]
+        assert [name for name, _ in fm.logged_dicts] == ["config.json"]
+        assert fm.uploaded_files == []  # nothing named a launch config
+
+    def test_a_new_run_is_tagged_with_the_commit_it_runs_at(self, monkeypatch, git_repo):
+        monkeypatch.setattr(tracker_mod, "_git_state", _git_state)
+        repo, git = git_repo
+        _, fm = _started(monkeypatch, _mlflow_cfg())
+        assert dict(fm.logged_tags)["mlflow.source.git.commit"] == git("rev-parse", "HEAD")
+        assert dict(fm.logged_tags)["mlflow.source.git.dirty"] == "false"
+        (repo / "a.txt").write_text("changed\n")
+        _, fm = _started(monkeypatch, _mlflow_cfg())
+        assert dict(fm.logged_tags)["mlflow.source.git.dirty"] == "true"
+
+    def test_git_is_queried_on_the_worker_never_on_the_calling_thread(self, monkeypatch):
+        asked: list = []
+        monkeypatch.setattr(tracker_mod, "_git_state", lambda: asked.append(threading.get_ident()))
+        _started(monkeypatch, _mlflow_cfg())
+        assert len(asked) == 1 and asked[0] != threading.get_ident()
+
+    def test_an_unknown_dirty_state_sets_only_the_commit(self, monkeypatch):
+        monkeypatch.setattr(tracker_mod, "_git_state", lambda: ("b" * 40, None))
+        _, fm = _started(monkeypatch, _mlflow_cfg())
+        assert dict(fm.logged_tags)["mlflow.source.git.commit"] == "b" * 40
+        assert "mlflow.source.git.dirty" not in dict(fm.logged_tags)
+
+    def test_a_missing_git_skips_the_tag_without_a_warning(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(tracker_mod, "_git_state", _git_state)
+        monkeypatch.setenv("PATH", str(tmp_path))  # an empty directory: there is no git to run
+        warnings_seen = _capture_warnings(monkeypatch)
+        debug_seen = _capture_debug(monkeypatch)
+        backend, fm = _started(monkeypatch, _mlflow_cfg())
+        assert backend._active is True
+        assert [key for key, _ in fm.logged_tags] == ["host", "slurm_job_id"]
+        assert warnings_seen == []
+        assert any("git rev-parse did not run" in note for note in debug_seen)
+
+    def test_config_json_is_uploaded_with_the_upload_deadline_and_the_run_id(self, monkeypatch):
+        fm = _FakeMlflow()
+        monkeypatch.setitem(sys.modules, "mlflow", fm)
+        job = _job()
+        backend = MLflowBackend(_mlflow_cfg(), job_config=job)
+        deadlines = _record_deadlines(monkeypatch, backend)
+        backend.log({"train/loss": 1.0}, step=1)
+        _flush(backend)
+        assert fm.logged_dicts == [("config.json", asdict(job))]
+        assert deadlines["upload config.json"] == tracker_mod._UPLOAD_DEADLINE_S == 180.0
+        assert deadlines["set_tag host"] is None and deadlines["log_params"] is None
+        uploads = [(run_id, thread) for kind, run_id, thread in fm.calls if kind == "log_dict"]
+        assert [run_id for run_id, _ in uploads] == ["run-xyz"]
+        assert uploads[0][1] != threading.get_ident()
+
+    @pytest.mark.parametrize("relative", [False, True])
+    def test_the_launch_toml_is_uploaded_when_the_command_line_names_it(
+        self, monkeypatch, tmp_path, relative
+    ):
+        toml = tmp_path / "run.toml"
+        toml.write_text("[train]\nmax_steps = 3\n")
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(sys, "argv", ["train.py", "run.toml" if relative else str(toml)])
+        fm = _FakeMlflow()
+        monkeypatch.setitem(sys.modules, "mlflow", fm)
+        backend = MLflowBackend(_mlflow_cfg())
+        deadlines = _record_deadlines(monkeypatch, backend)
+        backend.log({"train/loss": 1.0}, step=1)
+        _flush(backend)
+        assert fm.uploaded_files == [("run.toml", toml.read_bytes())]
+        assert deadlines["upload launch config"] == tracker_mod._UPLOAD_DEADLINE_S
+        (run_id, thread) = [(r, t) for kind, r, t in fm.calls if kind == "log_artifact"][0]
+        assert run_id == "run-xyz" and thread != threading.get_ident()
+
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ["train.py"],
+            ["train.py", "--train.max_steps=5"],
+            ["pytest", "tests/unit"],
+            ["train.py", "missing.toml"],
+            ["train.py", "dir.toml"],
+        ],
+    )
+    def test_a_launch_config_that_is_not_there_is_skipped_quietly(
+        self, monkeypatch, tmp_path, argv
+    ):
+        (tmp_path / "dir.toml").mkdir()
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(sys, "argv", argv)
+        warnings_seen = _capture_warnings(monkeypatch)
+        debug_seen = _capture_debug(monkeypatch)
+        backend, fm = _started(monkeypatch, _mlflow_cfg())
+        assert backend._active is True and fm.uploaded_files == []
+        assert warnings_seen == []
+        assert any("launch config" in note for note in debug_seen)
+
+    def test_a_hung_upload_is_abandoned_at_the_upload_deadline(self, monkeypatch):
+        fm = _FakeMlflow()
+        release = threading.Event()
+        client = fm.MlflowClient
+
+        def hanging_client():
+            hung = client()
+            hung.log_dict = lambda run_id, dictionary, artifact_file: release.wait()
+            return hung
+
+        fm.MlflowClient = hanging_client
+        monkeypatch.setitem(sys.modules, "mlflow", fm)
+        monkeypatch.setattr(tracker_mod, "_UPLOAD_DEADLINE_S", 0.2)
+        warnings_seen = _capture_warnings(monkeypatch)
+        backend = MLflowBackend(_mlflow_cfg(), job_config=_job())
+        try:
+            backend.log({"train/loss": 1.0}, step=1)
+            backend.log({"train/loss": 0.5}, step=2)
+            _flush(backend)  # the 60 s call deadline would outlast this wait
+            assert fm.log_steps == [1, 2]  # metrics queued behind the hung upload still land
+            hung_warnings = [w for w in warnings_seen if "upload config.json" in w]
+            assert len(hung_warnings) == 1 and "0.2s" in hung_warnings[0]
+        finally:
+            release.set()
+
+
+def _completed(returncode=0, stdout="", stderr=""):
+    return subprocess.CompletedProcess(["git"], returncode, stdout, stderr)
+
+
+class TestGitState:
+    def test_reports_the_head_commit_and_whether_tracked_files_differ(self, git_repo):
+        repo, git = git_repo
+        sha = git("rev-parse", "HEAD")
+        assert _git_state() == (sha, False)
+        (repo / "untracked.txt").write_text("x")
+        assert _git_state() == (sha, False)  # an untracked file is not a difference
+        (repo / "a.txt").write_text("two\n")
+        assert _git_state() == (sha, True)
+
+    def test_nothing_to_report_outside_a_repository(self, monkeypatch, tmp_path):
+        if shutil.which("git") is None:
+            pytest.skip("git is not installed")
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.parent))
+        debug_seen = _capture_debug(monkeypatch)
+        assert _git_state() is None
+        assert len(debug_seen) == 1 and "git rev-parse exited" in debug_seen[0]
+
+    def test_nothing_to_report_before_the_first_commit(self, monkeypatch, tmp_path):
+        _init_repo(tmp_path / "empty", monkeypatch, commit=False)
+        assert _git_state() is None
+
+    @pytest.mark.parametrize(
+        ("outcomes", "state", "note"),
+        [
+            ([subprocess.TimeoutExpired("git", 10)], None, "git rev-parse did not run"),
+            ([_completed(128, stderr="fatal: not a git repository")], None, "exited 128: fatal"),
+            ([_completed(0, "HEAD\n")], None, "'HEAD', not a commit id"),
+            (
+                [_completed(0, "c" * 40 + "\n"), subprocess.TimeoutExpired("git", 10)],
+                ("c" * 40, None),
+                "git status did not run",
+            ),
+            (
+                [_completed(0, "c" * 40 + "\n"), _completed(1, stderr="fatal: index")],
+                ("c" * 40, None),
+                "git status exited 1",
+            ),
+            ([_completed(0, "d" * 64 + "\n"), _completed(0, " M a.txt\n")], ("d" * 64, True), ""),
+        ],
+    )
+    def test_a_failing_or_odd_git_never_raises(self, monkeypatch, outcomes, state, note):
+        queue = list(outcomes)
+
+        def run(cmd, **kwargs):
+            outcome = queue.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        monkeypatch.setattr(tracker_mod.subprocess, "run", run)
+        warnings_seen = _capture_warnings(monkeypatch)
+        debug_seen = _capture_debug(monkeypatch)
+        assert _git_state() == state
+        assert warnings_seen == []
+        assert len(debug_seen) == (1 if note else 0)
+        assert all(note in n for n in debug_seen)
+
+
 class TestResolveMlflowExperiment:
     def test_env_experiment_must_be_absolute_on_databricks(self, monkeypatch):
         """Non-absolute $MLFLOW_EXPERIMENT is rejected on Databricks (config-guard parity)."""
@@ -1087,7 +1411,8 @@ class TestMLflowBestEffort:
         assert fm.lifecycle_threads == {"start_run": owner, "end_run": owner}
         assert owner != caller
         assert fm.ended == ["run-xyz"]  # end_run found the run it started, so it was ended
-        assert {kind for kind, _, _ in fm.calls} == {"log_metrics", "log_params", "set_tag"}
+        kinds = {"log_metrics", "log_params", "set_tag", "log_dict"}
+        assert {kind for kind, _, _ in fm.calls} == kinds
         assert {run_id for _, run_id, _ in fm.calls} == {"run-xyz"}  # every call named its run
         assert {caller, owner}.isdisjoint(thread for _, _, thread in fm.calls)
         assert fm.log_steps == [1, 2]
@@ -1549,6 +1874,55 @@ class TestMetricsConfigMLflow:
         args = ["--metrics.mlflow_tracking_uri=databricks://profile-a"]
         from_cli = load_config(str(toml), cli_args=args).metrics
         assert from_cli.resolve_mlflow_tracking_uri() == "databricks://profile-a"
+
+    def test_run_metadata_is_unset_by_default(self):
+        cfg, other = MetricsConfig(), MetricsConfig()
+        assert cfg.mlflow_description is None and cfg.mlflow_tags == {}
+        assert cfg.mlflow_tags is not other.mlflow_tags
+
+    def test_toml_and_cli_set_the_run_metadata(self, tmp_path):
+        toml = tmp_path / "job.toml"
+        toml.write_text(
+            '[metrics]\nmlflow_description = "ablation"\n'
+            '[metrics.mlflow_tags]\nteam = "vlm"\nstage = "2"\n'
+        )
+        from_toml = load_config(str(toml), cli_args=[]).metrics
+        assert from_toml.mlflow_description == "ablation"
+        assert from_toml.mlflow_tags == {"team": "vlm", "stage": "2"}
+        args = ["--metrics.mlflow_description=from cli", "--metrics.mlflow_tags.team=cli"]
+        from_cli = load_config(str(toml), cli_args=args).metrics
+        assert from_cli.mlflow_description == "from cli"
+        assert from_cli.mlflow_tags["team"] == "cli"
+
+    @pytest.mark.parametrize("bad", ["", "   ", 5, ["a"]])
+    def test_description_must_be_a_non_empty_string(self, bad):
+        with pytest.raises(ValueError, match="mlflow_description must be a non-empty string"):
+            MetricsConfig(mlflow_description=bad)
+
+    @pytest.mark.parametrize(
+        ("tags", "message"),
+        [
+            (["team=vlm"], "mlflow_tags must be a table"),
+            ({"": "x"}, "mlflow_tags keys must be non-empty strings; got ''"),
+            ({" ": "x"}, "mlflow_tags keys must be non-empty strings; got ' '"),
+            ({7: "x"}, "mlflow_tags keys must be non-empty strings; got 7"),
+            ({"team": ""}, r"mlflow_tags\['team'\] must be a non-empty string; got ''"),
+            ({"team": "  "}, r"mlflow_tags\['team'\] must be a non-empty string"),
+            ({"attempt": 3}, r"mlflow_tags\['attempt'\] must be a non-empty string; got 3"),
+            ({"flag": True}, r"mlflow_tags\['flag'\] must be a non-empty string"),
+            ({"nested": {"a": "b"}}, r"mlflow_tags\['nested'\] must be a non-empty string"),
+            ({"ok": "fine", "bad": None}, r"mlflow_tags\['bad'\] must be a non-empty string"),
+        ],
+    )
+    def test_tags_must_map_non_empty_strings_to_non_empty_strings(self, tags, message):
+        with pytest.raises(ValueError, match=message):
+            MetricsConfig(mlflow_tags=tags)
+
+    def test_a_bad_value_in_a_toml_fails_at_config_load(self, tmp_path):
+        toml = tmp_path / "job.toml"
+        toml.write_text("[metrics.mlflow_tags]\nattempt = 3\n")
+        with pytest.raises(ValueError, match=r"mlflow_tags\['attempt'\]"):
+            load_config(str(toml), cli_args=[])
 
 
 # ---------------------------------------------------------------------------
