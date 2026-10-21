@@ -224,8 +224,9 @@ class MetricsTracker:
         """One record per backend with a live run, for a checkpoint's ``metadata.json``.
 
         Empty once ``close()`` has begun. Reads only what the backends already hold, so it
-        never waits on a server. A backend that cannot describe itself, or whose entry is not
-        a mapping of strings to non-blank strings, is skipped with a warning.
+        never waits on a server. Each entry is copied once into a plain dict; a backend that
+        cannot describe itself, or whose entry is not strings under a named ``backend``, is
+        skipped with a warning and costs no other backend its entry.
         """
         entries: list[dict[str, str]] = []
         if self._closed:
@@ -233,13 +234,12 @@ class MetricsTracker:
         for backend in self._backends:
             try:
                 entry = backend.tracking_entry()
-                if entry is not None and not _is_tracking_entry(entry):
-                    raise ValueError("not a mapping of strings to non-blank strings")
+                snapshot = None if entry is None else _tracking_snapshot(entry)
             except Exception as e:  # a third-party run object; never let it cost a save
-                logger.warning(f"{type(backend).__name__} tracking entry skipped ({e})")
+                logger.warning("%s tracking entry skipped (%s)", type(backend).__name__, e)
                 continue
-            if entry is not None:
-                entries.append(entry)
+            if snapshot is not None:
+                entries.append(snapshot)
         return entries
 
     def close(self) -> None:
@@ -249,13 +249,18 @@ class MetricsTracker:
             backend.close()
 
 
-def _is_tracking_entry(entry: object) -> bool:
-    """True for a mapping with a ``backend`` whose keys and values are all non-blank strings."""
-    return (
-        isinstance(entry, dict)
-        and bool(entry.get("backend"))
-        and all(isinstance(k, str) and isinstance(v, str) and v.strip() for k, v in entry.items())
-    )
+def _tracking_snapshot(entry: object) -> dict[str, str]:
+    """A plain copy of a backend's entry; ValueError unless it is strings under a named backend."""
+    if not isinstance(entry, dict):
+        raise ValueError(f"expected a mapping, got {type(entry).__name__}")
+    snapshot: dict[str, str] = {}
+    for key, value in entry.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            raise ValueError("keys and values must be strings")
+        snapshot[key] = value
+    if not snapshot.get("backend", "").strip():
+        raise ValueError("no backend name")
+    return snapshot
 
 
 # ---------------------------------------------------------------------------
@@ -887,8 +892,11 @@ class TensorBoardBackend(_LoggingBackend):
         writer: Any = self._writer  # None before the first log, False without tensorboard
         if self._closed or not writer:
             return None
-        # The writer's own directory: an empty configured one makes it pick its own.
-        return {"backend": "tensorboard", "log_dir": str(writer.get_logdir())}
+        try:  # the writer's own directory: an empty configured one makes it pick its own
+            log_dir = os.fsdecode(writer.get_logdir())
+        except TypeError:  # not a path
+            return None
+        return {"backend": "tensorboard", "log_dir": log_dir} if log_dir else None
 
     def close(self) -> None:
         if self._writer and self._writer is not False:

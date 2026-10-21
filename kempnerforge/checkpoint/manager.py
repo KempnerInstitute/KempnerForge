@@ -362,8 +362,8 @@ class CheckpointManager:
         """Record the logging runs ``source`` reports in every later ``metadata.json``.
 
         ``source`` returns one JSON-ready record per live run, and is called on rank 0 only,
-        inside ``save()``. The ``tracking`` key is omitted when it reports none, raises, or
-        returns what JSON cannot write. ``None`` detaches it.
+        inside ``save()``, so it must return promptly. The ``tracking`` key is omitted when it
+        reports none, raises, or returns what JSON cannot write. ``None`` detaches it.
         """
         if source is not None and not callable(source):
             raise TypeError(

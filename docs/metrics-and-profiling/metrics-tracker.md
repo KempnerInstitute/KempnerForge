@@ -185,11 +185,12 @@ def tracking_entries(self) -> list[dict[str, str]]:
 ```
 
 One record per backend that has a live run, each from the backend's own `tracking_entry()`
-(a backend that does not override it contributes nothing). `run_training` hands this to
-`CheckpointManager.set_tracking_source`, so every checkpoint's `metadata.json` names the runs
-it was trained under ([Checkpointing](../checkpointing/index.md)). It reads fields the
-backends already hold, never waits on a server, and returns an empty list before any run has
-started and after `close()`.
+(a backend that does not override it contributes nothing). A backend that raises, or whose
+entry is not strings under a named `backend`, is skipped with a warning. `run_training`
+hands this to `CheckpointManager.set_tracking_source`, so every checkpoint's `metadata.json`
+names the runs it was trained under ([Checkpointing](../checkpointing/index.md)). It reads
+fields the backends already hold, never waits on a server, and returns an empty list before
+any run has started and after `close()`.
 
 ## Logger: `get_logger`, `format_metrics`
 
