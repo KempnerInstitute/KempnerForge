@@ -579,6 +579,11 @@ def _resolve_mlflow_experiment(config: MetricsConfig, uri: str) -> str | None:
         return None
 
 
+# Run metadata, not hyperparameters: tag keys are user-typed and may be illegal as
+# MLflow param names, which would fail the whole 100-param batch containing them.
+_PARAM_SKIP = ("metrics.mlflow_tags", "metrics.mlflow_description")
+
+
 def _flatten_config_params(config: JobConfig, max_len: int = 250) -> dict[str, str]:
     """Flatten a JobConfig to dotted string keys (model.dim, ...) for mlflow.log_params.
 
@@ -587,6 +592,8 @@ def _flatten_config_params(config: JobConfig, max_len: int = 250) -> dict[str, s
     flat: dict[str, str] = {}
 
     def _walk(prefix: str, value: Any) -> None:
+        if prefix in _PARAM_SKIP or any(prefix.startswith(p + ".") for p in _PARAM_SKIP):
+            return
         if value is None:
             return
         if isinstance(value, dict):

@@ -1795,6 +1795,19 @@ class TestFlattenConfigParams:
         # Optional None sub-configs (vlm, adapter, vision_encoder) are skipped.
         assert not any(k.startswith("vlm") for k in params)
 
+    def test_run_metadata_fields_are_not_flattened_into_params(self):
+        """Tag keys are user-typed; an MLflow-illegal one must not poison a param batch."""
+        config = JobConfig(
+            model=ModelConfig(dim=128, n_layers=2, n_heads=2, vocab_size=256),
+            metrics=MetricsConfig(
+                mlflow_tags={"bad@key": "v"}, mlflow_description="run description"
+            ),
+        )
+        params = _flatten_config_params(config)
+        assert not any(k.startswith("metrics.mlflow_tags") for k in params)
+        assert "metrics.mlflow_description" not in params
+        assert "metrics.log_interval" in params  # the rest of metrics still flattens
+
     def test_flatten_truncates_long_values(self):
         config = JobConfig(model=ModelConfig(dim=128, n_layers=2, n_heads=2, vocab_size=256))
         params = _flatten_config_params(config, max_len=4)
