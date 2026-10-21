@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`Transformer` constructor knobs `include_token_embedding` / `include_output_head`**: build the general transformer without its token embedding and/or output head (the omitted module is `None` and registers no state-dict keys), for externally embedded inputs or hidden-state outputs; defaults unchanged.
 - **`scheduler.warmup_start_factor`** (default `0.0`): the LR factor every warmup starts from, torch `LinearLR`'s `start_factor`, so a schedule can take its first step at `lr * warmup_start_factor` instead of zero. With it, `cosine` reproduces torch's `SequentialLR([LinearLR(start_factor), CosineAnnealing...])` step for step. The default keeps every existing schedule bit-identical.
   - Tests: `tests/unit/test_scheduler_extensions.py::TestWarmupStartFactor` (default unchanged, every warmup schedule honours it, step-for-step parity of `cosine` with the torch schedule) and `tests/unit/test_config.py` (default and rejection).
 - **VLM example: video captioning config on a pretrained 0.6B backbone** (`examples/vlm/configs/vlm_qwen3_0.6b_joint_decoder_webvid.toml`), warm-started weights-only from the converted checkpoint.

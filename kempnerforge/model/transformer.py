@@ -114,6 +114,14 @@ class Transformer(nn.Module):
     """Full transformer model built from ModelConfig.
 
     Embedding → TransformerBlocks → Norm → Output Head
+
+    ``include_token_embedding=False`` / ``include_output_head=False`` build the
+    model without that module: the attribute is ``None`` and registers no
+    state-dict keys. Without the embedding, pass pre-embedded inputs via
+    ``modality.inputs_embeds``; without the head, ``forward`` returns the final
+    hidden states. ``tie_embeddings=True`` requires both modules.
+    ``generate()`` rejects a model built without either module.
+    Tensor parallelism is not supported for such a model.
     """
 
     def __init__(
@@ -122,12 +130,15 @@ class Transformer(nn.Module):
         *,
         vlm_config: VLMConfig | None = None,
         num_image_tokens: int = 0,
+        include_token_embedding: bool = True,
+        include_output_head: bool = True,
     ) -> None:
         super().__init__()
         self.config = config
 
-        # Token embedding (can be None for PP middle stages)
-        self.token_embedding: TokenEmbedding | None = TokenEmbedding(config.vocab_size, config.dim)
+        self.token_embedding: TokenEmbedding | None = (
+            TokenEmbedding(config.vocab_size, config.dim) if include_token_embedding else None
+        )
 
         # MoT branch: build MoTBlocks instead of TransformerBlocks. v1
         # enforces equal head counts across modalities (single global
@@ -228,12 +239,19 @@ class Transformer(nn.Module):
             for p in self.norm.parameters():
                 p.requires_grad_(False)
 
-        # Output head (can be None for PP non-final stages)
-        self.output_head: OutputHead | None = OutputHead(config.dim, config.vocab_size)
+        self.output_head: OutputHead | None = (
+            OutputHead(config.dim, config.vocab_size) if include_output_head else None
+        )
 
         # Weight tying
-        can_tie = self.token_embedding is not None and self.output_head is not None
-        if config.tie_embeddings and can_tie:
+        if config.tie_embeddings:
+            if self.token_embedding is None or self.output_head is None:
+                raise ValueError(
+                    "tie_embeddings=True requires both the token embedding and the output "
+                    f"head (got include_token_embedding={include_token_embedding}, "
+                    f"include_output_head={include_output_head}); keep both or set "
+                    "tie_embeddings=False"
+                )
             self.output_head.tie_weights(self.token_embedding)
 
         # Precompute RoPE cos/sin tables — stored as plain attributes (not buffers)
@@ -364,7 +382,9 @@ class Transformer(nn.Module):
         Returns:
             Logits tensor of shape ``(batch, out_seq_len, vocab_size)``
             where ``out_seq_len == seq_len`` normally or the sliced
-            length when ``modality.output_slice`` is set.
+            length when ``modality.output_slice`` is set. Built with
+            ``include_output_head=False``, returns the final hidden
+            states ``(batch, out_seq_len, dim)`` instead.
         """
         inputs_embeds = modality.inputs_embeds if modality is not None else None
         prefix_embeds = modality.prefix_embeds if modality is not None else None
@@ -377,6 +397,11 @@ class Transformer(nn.Module):
         if (tokens is None) == (inputs_embeds is None):
             raise ValueError(
                 "Transformer.forward requires exactly one of tokens or modality.inputs_embeds"
+            )
+        if tokens is not None and self.token_embedding is None:
+            raise ValueError(
+                "tokens were provided but the model was built with "
+                "include_token_embedding=False; pass embedded inputs via modality.inputs_embeds"
             )
         if kv_caches is not None:
             if output_slice is not None:
