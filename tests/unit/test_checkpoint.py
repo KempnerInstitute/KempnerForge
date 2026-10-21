@@ -747,14 +747,22 @@ class TestSaveTrackingSidecar:
         mgr.save(step=2)
         assert asked == [1]
 
-    def test_failing_source_costs_the_key_not_the_save(self, tmp_path, monkeypatch):
+    @pytest.mark.parametrize("failure", ["raises", "unwritable"])
+    def test_failing_source_costs_the_key_not_the_save(self, tmp_path, monkeypatch, failure):
         from kempnerforge.checkpoint import manager as mgr_mod
 
         mgr = _make_mock_mgr(tmp_path, monkeypatch)
 
-        def source():
+        def raises():
             raise RuntimeError("no run object")
 
+        def unwritable():
+            return [{"backend": "custom", "run_id": object()}]  # not JSON-ready
+
+        source, reason = {
+            "raises": (raises, "no run object"),
+            "unwritable": (unwritable, "not JSON serializable"),
+        }[failure]
         warnings: list[str] = []
         monkeypatch.setattr(mgr_mod.logger, "warning", warnings.append)
         mgr.set_tracking_source(source)
@@ -762,7 +770,7 @@ class TestSaveTrackingSidecar:
         assert self._sidecar(tmp_path, 1) == {"step": 1, "tokens_seen": 8}
         assert (tmp_path / "step_1" / "train_state.pt").exists()
         assert (tmp_path / "latest").resolve() == (tmp_path / "step_1").resolve()
-        assert len(warnings) == 1 and "no run object" in warnings[0]
+        assert len(warnings) == 1 and reason in warnings[0]
 
     def test_source_must_be_callable_or_none(self, tmp_path, monkeypatch):
         mgr = _make_mock_mgr(tmp_path, monkeypatch)
@@ -791,11 +799,16 @@ class TestSaveTrackingSidecar:
         from kempnerforge.metrics.tracker import MetricsTracker, _LoggingBackend
 
         class Live(_LoggingBackend):
+            closed = False
+
             def log(self, metrics, step):
                 pass
 
             def tracking_entry(self):
-                return dict(TestSaveTrackingSidecar.MLFLOW)
+                return None if self.closed else dict(TestSaveTrackingSidecar.MLFLOW)
+
+            def close(self):
+                self.closed = True
 
         model = ModelConfig(dim=128, n_layers=2, n_heads=2, vocab_size=256)
         tracker = MetricsTracker(JobConfig(model=model, metrics=MetricsConfig()), num_gpus=1)

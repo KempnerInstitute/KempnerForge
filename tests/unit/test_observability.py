@@ -1601,6 +1601,17 @@ class TestTrackingEntries:
         assert backend._run is False
         assert backend.tracking_entry() is None  # wandb is not installed
 
+    def test_wandb_has_no_entry_once_it_is_closed(self, monkeypatch):
+        import wandb
+
+        finished: list = []
+        monkeypatch.setattr(wandb, "finish", lambda *args, **kwargs: finished.append(1))
+        backend = _wandb_backend(monkeypatch, _FakeWandbRun())
+        assert backend.tracking_entry() is not None
+        backend.close()
+        assert finished == [1]
+        assert backend.tracking_entry() is None  # the run has finished
+
     # TensorBoard: the log directory once the writer is open
 
     def test_tensorboard_entry_names_the_log_dir_once_the_writer_is_open(self, tmp_path):
@@ -1612,6 +1623,18 @@ class TestTrackingEntries:
         assert backend.tracking_entry() is None
         backend.log({"train/loss": 2.5}, step=1)
         assert backend.tracking_entry() == {"backend": "tensorboard", "log_dir": log_dir}
+        backend.close()
+        assert backend.tracking_entry() is None  # the writer is closed
+
+    def test_tensorboard_entry_names_the_directory_the_writer_chose(self, tmp_path, monkeypatch):
+        pytest.importorskip("tensorboard")
+        monkeypatch.chdir(tmp_path)  # an empty setting makes the writer create runs/<stamp> here
+        backend = TensorBoardBackend(MetricsConfig(enable_tensorboard=True, tensorboard_dir=""))
+        backend.log({"train/loss": 2.5}, step=1)
+        entry = backend.tracking_entry()
+        assert entry is not None
+        assert entry["log_dir"].startswith("runs")
+        assert os.path.isdir(entry["log_dir"])
         backend.close()
 
     def test_tensorboard_has_no_entry_when_it_is_not_installed(self, monkeypatch):
@@ -1643,13 +1666,6 @@ class TestTrackingEntries:
         assert tracker.tracking_entries() == [kept]
         assert len(seen) == 1 and "_EntryBackend" in seen[0] and "boom" in seen[0]
 
-    def test_tracker_reports_nothing_once_closed(self):
-        tracker = self._tracker()
-        tracker._backends = [_EntryBackend({"backend": "live"})]
-        assert tracker.tracking_entries() == [{"backend": "live"}]
-        tracker.close()
-        assert tracker.tracking_entries() == []
-
     def test_other_ranks_hold_no_backends_so_report_nothing(self, monkeypatch):
         monkeypatch.setattr(dist, "is_initialized", lambda: True)
         monkeypatch.setattr(dist, "get_rank", lambda: 1)
@@ -1668,6 +1684,7 @@ class TestTrackingEntries:
 
         monkeypatch.setattr(wandb, "init", lambda **kwargs: _FakeWandbRun())
         monkeypatch.setattr(wandb, "log", lambda *args, **kwargs: None)
+        monkeypatch.setattr(wandb, "finish", lambda *args, **kwargs: None)
         config = JobConfig(
             model=ModelConfig(dim=128, n_layers=2, n_heads=2, vocab_size=256),
             metrics=_mlflow_cfg(
@@ -1691,6 +1708,7 @@ class TestTrackingEntries:
             "tracking_uri": "http://localhost:5000",
         }
         tracker.close()
+        assert tracker.tracking_entries() == []  # every run has ended
 
     def test_a_backend_without_a_live_run_is_left_out_of_a_multi_backend_run(
         self, monkeypatch, tmp_path

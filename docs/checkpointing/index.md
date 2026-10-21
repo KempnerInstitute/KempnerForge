@@ -47,8 +47,9 @@ live run at save time it also holds a `tracking` list, one entry per backend:
 ```
 
 - Each backend describes its own run, as it knows it: the resolved tracking URI and the
-  experiment name for MLflow, the project for wandb. `entity` and `url` appear when the wandb
-  run has them (an offline run has no URL). The MLflow entry always has all four fields.
+  experiment name for MLflow, the project for wandb, the writer's directory for TensorBoard.
+  `entity` and `url` appear when the wandb run has them (an offline run has no URL). The
+  MLflow entry always has all four fields.
 - A backend contributes only while its run is live, and runs start on the first log. A
   checkpoint saved before that (step 0, or soon after a resume when `checkpoint.interval` is
   shorter than `metrics.log_interval`) lacks the entry, and the key is omitted when no backend

@@ -362,8 +362,8 @@ class CheckpointManager:
         """Record the logging runs ``source`` reports in every later ``metadata.json``.
 
         ``source`` returns one JSON-ready record per live run, and is called on rank 0 only,
-        inside ``save()``. The ``tracking`` key is omitted when it reports none. ``None``
-        detaches it.
+        inside ``save()``. The ``tracking`` key is omitted when it reports none, raises, or
+        returns what JSON cannot write. ``None`` detaches it.
         """
         if source is not None and not callable(source):
             raise TypeError(
@@ -372,14 +372,16 @@ class CheckpointManager:
         self._tracking_source = source
 
     def _tracking_entries(self) -> list[dict[str, str]]:
-        """The live logging runs for ``metadata.json``; a failing source costs the key only."""
+        """The live logging runs for ``metadata.json``; a bad source costs the key, not the save."""
         if self._tracking_source is None:
             return []
         try:
-            return self._tracking_source()
+            entries = self._tracking_source()
+            json.dumps(entries)  # the write below must not be where a bad source surfaces
         except Exception as e:  # rank 0 only: a raise here would strand the other ranks
             logger.warning(f"Could not record the tracking runs in {_METADATA_FILE}: {e}")
             return []
+        return entries
 
     def save(
         self,

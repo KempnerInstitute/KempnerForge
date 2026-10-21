@@ -79,7 +79,6 @@ class MetricsTracker:
         # Logging backends (initialized lazily)
         self._backends: list[_LoggingBackend] = []
         self._backends_initialized = False
-        self._closed = False
 
     def _init_backends(self, config: JobConfig) -> None:
         """Lazily initialize logging backends (rank 0 only)."""
@@ -223,12 +222,9 @@ class MetricsTracker:
     def tracking_entries(self) -> list[dict[str, str]]:
         """One record per backend with a live run, for a checkpoint's ``metadata.json``.
 
-        Empty before any run has started, for a backend whose run could not start, and after
-        ``close()``. Reads only what the backends already hold, so it never waits on a server;
-        a backend that cannot describe itself is skipped with a warning.
+        Reads only what the backends already hold, so it never waits on a server. A backend
+        that cannot describe itself is skipped with a warning.
         """
-        if self._closed:
-            return []
         entries: list[dict[str, str]] = []
         for backend in self._backends:
             try:
@@ -242,7 +238,6 @@ class MetricsTracker:
 
     def close(self) -> None:
         """Flush and close all logging backends."""
-        self._closed = True
         for backend in self._backends:
             backend.close()
 
@@ -259,7 +254,10 @@ class _LoggingBackend:
         raise NotImplementedError
 
     def tracking_entry(self) -> dict[str, str] | None:
-        """This backend's record of its live run for a checkpoint; None while it has none."""
+        """This backend's record of its live run for a checkpoint.
+
+        None until its run starts, after a failed init, and once it is closed.
+        """
         return None
 
     def close(self) -> None:
@@ -275,6 +273,7 @@ class WandBBackend(_LoggingBackend):
     def __init__(self, config: MetricsConfig) -> None:
         self._config = config
         self._run = None
+        self._closed = False
 
     def _ensure_init(self) -> None:
         if self._run is not None:
@@ -309,7 +308,7 @@ class WandBBackend(_LoggingBackend):
 
     def tracking_entry(self) -> dict[str, str] | None:
         run: Any = self._run  # None before the first log, False after a failed init
-        if not run or run.disabled:  # a disabled run records nothing, whatever id it reports
+        if self._closed or not run or run.disabled:  # a disabled run records nothing
             return None
         entry = {"backend": "wandb", "run_id": run.id, "experiment": run.project}
         if entity := run.entity:
@@ -322,6 +321,7 @@ class WandBBackend(_LoggingBackend):
         if self._run and self._run is not False:
             import wandb
 
+            self._closed = True
             wandb.finish()
 
 
@@ -846,6 +846,7 @@ class TensorBoardBackend(_LoggingBackend):
     def __init__(self, config: MetricsConfig) -> None:
         self._config = config
         self._writer = None
+        self._closed = False
 
     def _ensure_init(self) -> None:
         if self._writer is not None:
@@ -867,10 +868,13 @@ class TensorBoardBackend(_LoggingBackend):
             self._writer.add_scalar(key, val, global_step=step)  # type: ignore[reportOptionalMemberAccess, reportAttributeAccessIssue]
 
     def tracking_entry(self) -> dict[str, str] | None:
-        if not self._writer:  # not opened yet, or tensorboard is not installed
+        writer: Any = self._writer  # None before the first log, False without tensorboard
+        if self._closed or not writer:
             return None
-        return {"backend": "tensorboard", "log_dir": self._config.tensorboard_dir}
+        # The writer's own directory: an empty configured one makes it pick its own.
+        return {"backend": "tensorboard", "log_dir": writer.get_logdir()}
 
     def close(self) -> None:
         if self._writer and self._writer is not False:
+            self._closed = True
             self._writer.close()  # type: ignore[reportAttributeAccessIssue]
