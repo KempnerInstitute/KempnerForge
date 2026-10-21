@@ -41,8 +41,8 @@ _SIDECAR_FILE = "metadata.json"
 _MLFLOW_BACKEND = "mlflow"
 # A larger batch is split by MLflow into requests that can succeed or fail separately.
 _MAX_METRICS_PER_CALL = 1000
-# The user:password@ part of a URL, which MLflow error text can quote from a tracking URI.
-_URL_USERINFO = re.compile(r"(?<=://)[^/\s@]+@")
+# MLflow errors quote tracking URIs verbatim, and a URI can carry credentials anywhere in it.
+_URL = re.compile(r"\b([a-zA-Z][a-zA-Z0-9+.-]*://)[^\s'\"<>]+")
 
 
 class PublishRefused(ValueError):
@@ -295,6 +295,11 @@ def publish_metrics(
     return target
 
 
+def _mask_urls(text: str) -> str:
+    """``text`` with everything after each ``scheme://`` hidden."""
+    return _URL.sub(r"\1<redacted>", text)
+
+
 def _load_metrics_file(path: str) -> Any:
     try:
         with open(path, "rb") as f:
@@ -325,10 +330,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         metrics = _load_metrics_file(args.metrics)
         target = publish_metrics(args.checkpoint_dir, metrics, prefix=args.prefix)
     except PublishRefused as e:
-        print(f"refused: {e}", file=sys.stderr)
+        print(f"refused: {_mask_urls(str(e))}", file=sys.stderr)
         return 2
-    except Exception as e:  # the MLflow client or server failed: no traceback, no URL credentials
-        print(f"failed: {type(e).__name__}: {_URL_USERINFO.sub('', str(e))}", file=sys.stderr)
+    except Exception as e:  # the MLflow client or server failed: one line, no traceback
+        print(f"failed: {type(e).__name__}: {_mask_urls(str(e))}", file=sys.stderr)
         return 1
     print(f"published {len(metrics)} metric(s) to run {target.run_id} at step {target.step}")
     return 0

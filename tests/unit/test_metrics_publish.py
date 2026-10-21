@@ -643,10 +643,23 @@ class TestCli:
         assert fake.events == []
 
     @pytest.mark.parametrize("failing_step", ["client", "log_batch"])
-    def test_mlflow_failure_exits_1_without_traceback_or_url_credentials(
-        self, tmp_path, monkeypatch, capsys, failing_step
+    @pytest.mark.parametrize(
+        ("raised", "shown"),
+        [
+            (
+                "cannot reach placeholder://user:secret-marker@tracking-placeholder/",
+                "cannot reach placeholder://<redacted>",
+            ),
+            (
+                "unsupported URI 'foo://tracking-placeholder/x?token=token-marker', retry",
+                "unsupported URI 'foo://<redacted>', retry",
+            ),
+        ],
+    )
+    def test_mlflow_failure_exits_1_without_traceback_or_urls(
+        self, tmp_path, monkeypatch, capsys, failing_step, raised, shown
     ):
-        error = RuntimeError("cannot reach placeholder://user:secret-marker@tracking-placeholder/")
+        error = RuntimeError(raised)
         hook = {"init_error": error} if failing_step == "client" else {"reject": _raiser(error)}
         _install_mlflow(monkeypatch, **hook)
 
@@ -655,7 +668,20 @@ class TestCli:
         out = capsys.readouterr()
         assert code == 1
         assert out.out == ""
-        assert out.err == "failed: RuntimeError: cannot reach placeholder://tracking-placeholder/\n"
+        assert out.err == f"failed: RuntimeError: {shown}\n"
+
+    def test_refusal_text_never_shows_a_url(self, tmp_path, monkeypatch, capsys):
+        _install_mlflow(monkeypatch)
+        key = "placeholder://user:secret-marker@tracking-placeholder/"
+        ckpt = tmp_path / "step_1"
+        ckpt.mkdir()
+        (ckpt / "metadata.json").write_text(f'{{"step": 1, "{key}": 1, "{key}": 2}}')
+
+        code = main([str(ckpt), "--metrics", str(_metrics_file(tmp_path))])
+
+        err = capsys.readouterr().err
+        assert code == 2
+        assert "duplicate key 'placeholder://<redacted>'" in err and "secret-marker" not in err
 
     def test_mlflow_failure_text_without_credentials_is_reported_as_is(
         self, tmp_path, monkeypatch, capsys
