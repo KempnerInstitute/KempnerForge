@@ -595,7 +595,12 @@ def _mlflow_last_step(mlflow: Any, run_id: str) -> int | None:
 # The worker thread has no active run (mlflow keeps it in thread-local state), so each call
 # below names its run; an implicit call there would silently start a new run.
 def _mlflow_log_metrics(mlflow: Any, run_id: str, metrics: dict[str, float], step: int) -> None:
-    mlflow.log_metrics({k: float(v) for k, v in metrics.items()}, step=step, run_id=run_id)
+    # synchronous=True: MLFLOW_ENABLE_ASYNC_LOGGING would otherwise divert these into
+    # mlflow's own unbounded queue with a blocking flush at shutdown; bounding lives in
+    # the worker, so the call itself must stay synchronous.
+    mlflow.log_metrics(
+        {k: float(v) for k, v in metrics.items()}, step=step, run_id=run_id, synchronous=True
+    )
 
 
 def _mlflow_set_tag(mlflow: Any, run_id: str, key: str, value: str) -> None:
@@ -726,7 +731,8 @@ class MLflowBackend(_LoggingBackend):
         for i in range(0, len(items), 100):
             batch = dict(items[i : i + 100])
             self._worker.submit(
-                "log_params", partial(mlflow.log_params, batch, run_id=self._run_id)
+                "log_params",
+                partial(mlflow.log_params, batch, run_id=self._run_id, synchronous=True),
             )
         tags = {"host": socket.gethostname(), "slurm_job_id": os.environ.get("SLURM_JOB_ID", "")}
         for key, value in tags.items():

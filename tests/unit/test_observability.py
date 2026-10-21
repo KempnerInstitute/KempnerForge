@@ -391,14 +391,16 @@ class _FakeMlflow:
         self.monitor_alive = log_system_metrics
         return self._run
 
-    def log_metrics(self, metrics, step=None, run_id=None):
+    def log_metrics(self, metrics, step=None, run_id=None, synchronous=None):
         self.calls.append(("log_metrics", run_id, threading.get_ident()))
         self.log_steps.append(step)
         self.logged_metrics.append(metrics)
+        self.last_log_metrics_synchronous = synchronous
 
-    def log_params(self, params, run_id=None):
+    def log_params(self, params, run_id=None, synchronous=None):
         self.calls.append(("log_params", run_id, threading.get_ident()))
         self.logged_params.append(params)
+        self.last_log_params_synchronous = synchronous
 
     def end_run(self):
         self.lifecycle_threads["end_run"] = threading.get_ident()
@@ -453,6 +455,12 @@ def _close_what_the_test_built(monkeypatch):
         if isinstance(worker, tracker_mod._BestEffortWorker) and worker._thread.ident is not None:
             worker._thread.join(10)
             assert not worker._thread.is_alive()
+    for t in threading.enumerate():  # abandoned call threads and standalone run owners
+        if t is threading.current_thread() or not t.is_alive():
+            continue
+        if t.name.endswith(("-tracking", "-call", "-run")):
+            t.join(15)
+            assert not t.is_alive(), f"leaked tracking thread: {t.name}"
 
 
 def _flush(backend, timeout=10.0):
@@ -465,7 +473,7 @@ def _park_log_metrics(fm):
     gate, entered = threading.Event(), threading.Event()
     deliver = fm.log_metrics
 
-    def parked(metrics, step=None, run_id=None):
+    def parked(metrics, step=None, run_id=None, synchronous=None):
         entered.set()
         gate.wait(timeout=10)
         deliver(metrics, step=step, run_id=run_id)
@@ -570,7 +578,7 @@ class TestMLflowBackend:
         fm = _FakeMlflow()
         state = {"n": 0}
 
-        def flaky_log(metrics, step=None, run_id=None):
+        def flaky_log(metrics, step=None, run_id=None, synchronous=None):
             state["n"] += 1
             if state["n"] == 1:
                 raise RuntimeError("transient network blip")
@@ -588,6 +596,19 @@ class TestMLflowBackend:
         assert state["n"] == 2  # second call actually attempted (no permanent disable)
         assert fm.log_steps == [2]
         assert len(warnings_seen) == 1 and "transient network blip" in warnings_seen[0]
+
+    def test_worker_calls_pin_synchronous_logging(self, monkeypatch):
+        """synchronous=True on worker calls: MLFLOW_ENABLE_ASYNC_LOGGING must not divert
+        work into mlflow's own unbounded queue, which would bypass the worker's bounds."""
+        monkeypatch.setenv("MLFLOW_ENABLE_ASYNC_LOGGING", "true")
+        fm = _FakeMlflow()
+        monkeypatch.setitem(sys.modules, "mlflow", fm)
+        job = JobConfig(model=ModelConfig(dim=128, n_layers=2, n_heads=2, vocab_size=256))
+        backend = MLflowBackend(_mlflow_cfg(), job_config=job)
+        backend.log({"train/loss": 1.0}, step=1)
+        _flush(backend)
+        assert fm.last_log_metrics_synchronous is True
+        assert fm.last_log_params_synchronous is True  # init param batches are pinned too
 
     def test_resume_skips_already_logged_steps(self, monkeypatch):
         """On resume, steps already recorded in the run are not re-logged. (Finding #2)"""
@@ -853,7 +874,7 @@ class TestMLflowBestEffort:
         release = threading.Event()
         attempted: list = []
 
-        def hung_log(metrics, step=None, run_id=None):
+        def hung_log(metrics, step=None, run_id=None, synchronous=None):
             attempted.append(step)
             release.wait()
 
@@ -927,7 +948,7 @@ class TestMLflowBestEffort:
     def test_close_returns_within_its_deadlines_when_server_hangs(self, monkeypatch):
         fm = _FakeMlflow()
         release = threading.Event()
-        fm.log_metrics = lambda metrics, step=None, run_id=None: release.wait()
+        fm.log_metrics = lambda metrics, step=None, run_id=None, synchronous=None: release.wait()
         end_run = fm.end_run
 
         def hung_end_run():
