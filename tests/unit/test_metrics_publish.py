@@ -83,12 +83,11 @@ class _FakeMlflow(types.ModuleType):
     """Stand-in `mlflow` recording what a publisher does.
 
     Only ``MlflowClient(tracking_uri=...)``, ``log_batch`` and ``get_active_model_id``
-    exist: touching anything
-    else (``start_run``, ``set_tracking_uri``, ``end_run``, ...) raises AssertionError.
-    ``log_batch`` fills a missing metric model_id from the active model, as mlflow's
-    client does. ``reject`` fails a request before the fake stores it (a real store may
-    keep some of a failed batch: log_batch permits partial writes),
-    ``on_log_batch`` runs after a request is stored, ``init_error`` fails the client.
+    exist: touching anything else (``start_run``, ``set_tracking_uri``, ``end_run``, ...)
+    raises AssertionError. ``log_batch`` fills a missing metric model_id from the active
+    model, as mlflow's client does. ``reject`` fails a request before the fake stores it
+    (a real store may keep part of a failed batch), ``on_log_batch`` runs after a request
+    is stored, and ``init_error`` fails the client.
     """
 
     def __init__(

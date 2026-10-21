@@ -8,12 +8,11 @@ it was saved. ``publish_metrics`` reads the MLflow entry and appends the metrics
 that run at the checkpoint's step in a single ``log_batch`` request. Inputs are fully
 validated before anything is sent, but MLflow's ``log_batch`` permits partial writes,
 so a request that fails server side may still have stored some points. The publisher
-never starts,
-ends, or edits a run and keeps no state of its own, so several publishers can write to
-one run at once and the tracking server arbitrates. The call blocks on the server under
-MLflow's own HTTP timeout and retry settings, and authentication is whatever the MLflow
-client finds in the environment. It is an offline tool: call it from one process, never
-from the training step.
+never starts, ends, or edits a run and keeps no state of its own, so several publishers
+can write to one run at once and the tracking server arbitrates. The call blocks on the
+server under MLflow's own HTTP timeout and retry settings, and authentication is
+whatever the MLflow client finds in the environment. It is an offline tool: call it from
+one process, never from the training step.
 
 Command line: ``python -m kempnerforge.metrics.publish <checkpoint_dir> --metrics <json>``.
 """
