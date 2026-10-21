@@ -74,6 +74,11 @@ def _mock_mgr(tmp_path, monkeypatch, dp_info=None, **cfg_kwargs) -> CheckpointMa
     config = CheckpointConfig(dir=str(tmp_path), keep_last_n=5, **cfg_kwargs)
     mgr = CheckpointManager(config, model, opt, dp_info=dp_info)
     monkeypatch.setattr(mgr._async_ckpt, "save", MagicMock())
+    reader = MagicMock()
+    reader.read_metadata.return_value.state_dict_metadata = {"optimizer": None}
+    monkeypatch.setattr(
+        "kempnerforge.checkpoint.manager.dcp.FileSystemReader", MagicMock(return_value=reader)
+    )
     monkeypatch.setattr("kempnerforge.checkpoint.manager.dcp.load", MagicMock())
     return mgr
 
