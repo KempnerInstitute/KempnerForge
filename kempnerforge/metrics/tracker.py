@@ -538,8 +538,6 @@ def _prepare_databricks_auth(uri: str) -> None:
     profile = _databricks_profile(uri)
     if profile:
         os.environ.setdefault("DATABRICKS_CONFIG_PROFILE", profile)
-    if os.environ.get("DATABRICKS_CONFIG_PROFILE"):
-        return  # the profile holds the credentials; the SDK prefers env, so an alias would win
     # The Databricks SDK reads DATABRICKS_TOKEN; mirror the DATABRICKS_API_TOKEN
     # name many keep in ~/.bashrc so either works.
     if not os.environ.get("DATABRICKS_TOKEN") and os.environ.get("DATABRICKS_API_TOKEN"):

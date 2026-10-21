@@ -839,20 +839,20 @@ class TestMlflowDatabricksAuth:
         [
             ({"DATABRICKS_API_TOKEN": "alias"}, "databricks", "alias"),
             ({"DATABRICKS_API_TOKEN": "alias", "DATABRICKS_TOKEN": "real"}, "databricks", "real"),
-            ({"DATABRICKS_API_TOKEN": "alias"}, "databricks://profile-a", None),
+            ({"DATABRICKS_API_TOKEN": "alias"}, "databricks://profile-a", "alias"),
             (
                 {"DATABRICKS_API_TOKEN": "alias", "DATABRICKS_CONFIG_PROFILE": "profile-b"},
                 "databricks",
-                None,
+                "alias",
             ),
             ({"DATABRICKS_API_TOKEN": "alias"}, "http://localhost:5000", None),
         ],
     )
-    def test_token_alias_stands_in_only_where_it_is_the_credential(
+    def test_token_alias_stands_in_for_an_unset_token_on_databricks(
         self, monkeypatch, env, uri, token
     ):
-        """The alias never overrides DATABRICKS_TOKEN, and is not mirrored when a profile holds
-        the credentials (the SDK prefers env over the profile file) or off Databricks."""
+        """DATABRICKS_API_TOKEN is mirrored into DATABRICKS_TOKEN on Databricks, with or without
+        a profile, never over a token the operator set, and not at all off Databricks."""
         for name, value in env.items():
             monkeypatch.setenv(name, value)
         cfg = MetricsConfig(enable_mlflow=True, mlflow_tracking_uri=uri, mlflow_experiment="/e")

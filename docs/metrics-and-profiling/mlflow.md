@@ -28,8 +28,8 @@ The tracking URI resolves in order: `mlflow_tracking_uri` → `$MLFLOW_TRACKING_
 `"databricks"`. `databricks://<profile>` selects a `~/.databrickscfg` profile and exports it
 as `DATABRICKS_CONFIG_PROFILE` (an operator-set value wins), so SDK and artifact calls use
 the same profile. `DATABRICKS_API_TOKEN` is mirrored into `DATABRICKS_TOKEN`, the name the
-SDK reads, unless a profile is selected (the SDK prefers environment variables over the
-profile file).
+SDK reads, when that is unset. The SDK prefers environment variables over a profile file, so
+unset a stale `DATABRICKS_API_TOKEN` when authenticating with a profile.
 
 Credentials are not pre-checked: init attempts the connection, and if it fails the backend
 logs a warning naming the auth routes (environment, profile, SDK OAuth) and disables itself;
