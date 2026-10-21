@@ -79,6 +79,7 @@ class MetricsTracker:
         # Logging backends (initialized lazily)
         self._backends: list[_LoggingBackend] = []
         self._backends_initialized = False
+        self._closed = False
 
     def _init_backends(self, config: JobConfig) -> None:
         """Lazily initialize logging backends (rank 0 only)."""
@@ -222,13 +223,18 @@ class MetricsTracker:
     def tracking_entries(self) -> list[dict[str, str]]:
         """One record per backend with a live run, for a checkpoint's ``metadata.json``.
 
-        Reads only what the backends already hold, so it never waits on a server. A backend
-        that cannot describe itself is skipped with a warning.
+        Empty once ``close()`` has begun. Reads only what the backends already hold, so it
+        never waits on a server. A backend that cannot describe itself, or whose entry is not
+        a mapping of strings to non-blank strings, is skipped with a warning.
         """
         entries: list[dict[str, str]] = []
+        if self._closed:
+            return entries
         for backend in self._backends:
             try:
                 entry = backend.tracking_entry()
+                if entry is not None and not _is_tracking_entry(entry):
+                    raise ValueError("not a mapping of strings to non-blank strings")
             except Exception as e:  # a third-party run object; never let it cost a save
                 logger.warning(f"{type(backend).__name__} tracking entry skipped ({e})")
                 continue
@@ -238,8 +244,18 @@ class MetricsTracker:
 
     def close(self) -> None:
         """Flush and close all logging backends."""
+        self._closed = True
         for backend in self._backends:
             backend.close()
+
+
+def _is_tracking_entry(entry: object) -> bool:
+    """True for a mapping with a ``backend`` whose keys and values are all non-blank strings."""
+    return (
+        isinstance(entry, dict)
+        and bool(entry.get("backend"))
+        and all(isinstance(k, str) and isinstance(v, str) and v.strip() for k, v in entry.items())
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -872,7 +888,7 @@ class TensorBoardBackend(_LoggingBackend):
         if self._closed or not writer:
             return None
         # The writer's own directory: an empty configured one makes it pick its own.
-        return {"backend": "tensorboard", "log_dir": writer.get_logdir()}
+        return {"backend": "tensorboard", "log_dir": str(writer.get_logdir())}
 
     def close(self) -> None:
         if self._writer and self._writer is not False:

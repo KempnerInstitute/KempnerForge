@@ -6,6 +6,7 @@ import copy
 import json
 import random
 import re
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -747,30 +748,78 @@ class TestSaveTrackingSidecar:
         mgr.save(step=2)
         assert asked == [1]
 
-    @pytest.mark.parametrize("failure", ["raises", "unwritable"])
-    def test_failing_source_costs_the_key_not_the_save(self, tmp_path, monkeypatch, failure):
-        from kempnerforge.checkpoint import manager as mgr_mod
+    @staticmethod
+    def _bad_sources():
+        """Sources that break in the ways a save on rank 0 alone must survive."""
 
-        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        class BadBool(list):
+            def __bool__(self):
+                raise RuntimeError("no truth value")
+
+        class BadItems(dict):
+            def items(self):
+                raise RuntimeError("no items")
+
+        def deeply_nested():
+            nested: list = []
+            for _ in range(sys.getrecursionlimit()):
+                nested = [nested]
+            return [{"backend": "custom", "deep": nested}]
 
         def raises():
             raise RuntimeError("no run object")
 
-        def unwritable():
-            return [{"backend": "custom", "run_id": object()}]  # not JSON-ready
-
-        source, reason = {
+        return {
             "raises": (raises, "no run object"),
-            "unwritable": (unwritable, "not JSON serializable"),
-        }[failure]
+            "unwritable": (
+                lambda: [{"backend": "custom", "run_id": object()}],
+                "JSON serializable",
+            ),
+            "truth-value": (lambda: BadBool([{"backend": "custom"}]), "no truth value"),
+            "items": (lambda: [BadItems(backend="custom")], "no items"),
+            "nested": (deeply_nested, "recursion"),
+        }
+
+    @pytest.mark.parametrize("failure", ["raises", "unwritable", "truth-value", "items", "nested"])
+    def test_failing_source_costs_the_key_not_the_save(self, tmp_path, monkeypatch, failure):
+        from kempnerforge.checkpoint import manager as mgr_mod
+
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        source, reason = self._bad_sources()[failure]
         warnings: list[str] = []
-        monkeypatch.setattr(mgr_mod.logger, "warning", warnings.append)
+        monkeypatch.setattr(
+            mgr_mod.logger, "warning", lambda msg, *args: warnings.append(msg % args)
+        )
         mgr.set_tracking_source(source)
         mgr.save(step=1, tokens_seen=8)
         assert self._sidecar(tmp_path, 1) == {"step": 1, "tokens_seen": 8}
         assert (tmp_path / "step_1" / "train_state.pt").exists()
         assert (tmp_path / "latest").resolve() == (tmp_path / "step_1").resolve()
         assert len(warnings) == 1 and reason in warnings[0]
+
+    def test_exception_that_cannot_be_formatted_costs_only_the_key(self, tmp_path, monkeypatch):
+        import io
+        import logging
+
+        class Unprintable(Exception):
+            def __str__(self):
+                raise RuntimeError("no message")
+
+        def source():
+            raise Unprintable()
+
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        mgr.set_tracking_source(source)
+        monkeypatch.setattr(logging, "raiseExceptions", False)  # a logging error is not raised
+        target = logging.getLogger("kempnerforge.checkpoint.manager")
+        handler = logging.StreamHandler(io.StringIO())
+        target.addHandler(handler)
+        try:
+            mgr.save(step=1, tokens_seen=8)
+        finally:
+            target.removeHandler(handler)
+        assert self._sidecar(tmp_path, 1) == {"step": 1, "tokens_seen": 8}
+        assert (tmp_path / "latest").resolve() == (tmp_path / "step_1").resolve()
 
     def test_source_must_be_callable_or_none(self, tmp_path, monkeypatch):
         mgr = _make_mock_mgr(tmp_path, monkeypatch)

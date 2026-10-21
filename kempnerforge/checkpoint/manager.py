@@ -371,17 +371,20 @@ class CheckpointManager:
             )
         self._tracking_source = source
 
-    def _tracking_entries(self) -> list[dict[str, str]]:
-        """The live logging runs for ``metadata.json``; a bad source costs the key, not the save."""
-        if self._tracking_source is None:
-            return []
-        try:
-            entries = self._tracking_source()
-            json.dumps(entries)  # the write below must not be where a bad source surfaces
-        except Exception as e:  # rank 0 only: a raise here would strand the other ranks
-            logger.warning(f"Could not record the tracking runs in {_METADATA_FILE}: {e}")
-            return []
-        return entries
+    def _sidecar_text(self, meta: dict[str, Any]) -> str:
+        """``meta`` as JSON, plus the live tracking runs when the source can supply them.
+
+        Everything that depends on the source sits inside one guard: it runs on rank 0 alone,
+        so a raise here would strand the other ranks. A bad source costs the ``tracking`` key.
+        """
+        if self._tracking_source is not None:
+            try:
+                tracking = self._tracking_source()
+                if tracking:
+                    return json.dumps({**meta, "tracking": tracking}, indent=2)
+            except Exception as e:
+                logger.warning("Could not record the tracking runs in %s: %s", _METADATA_FILE, e)
+        return json.dumps(meta, indent=2)
 
     def save(
         self,
@@ -456,10 +459,7 @@ class CheckpointManager:
                 # a sorted, deduplicated list of {"module", "frozen"} dicts so
                 # the comparison on load is reorder-invariant.
                 meta["vlm_freeze"] = extra["vlm_freeze"]
-            tracking = self._tracking_entries()
-            if tracking:
-                meta["tracking"] = tracking
-            (ckpt_dir / _METADATA_FILE).write_text(json.dumps(meta, indent=2))
+            (ckpt_dir / _METADATA_FILE).write_text(self._sidecar_text(meta))
 
         if sync_mode:
             # DCP shards are already durable — commit immediately.

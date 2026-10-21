@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 import types
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -1467,12 +1468,23 @@ def _wandb_backend(monkeypatch, run) -> WandBBackend:
     return backend
 
 
-class _EntryBackend(tracker_mod._LoggingBackend):
-    """Reports a fixed entry, or raises, so the tracker's aggregation can be driven directly."""
+class _HostileEntry(dict):
+    """A mapping that cannot be inspected."""
 
-    def __init__(self, entry=None, error=None):
+    def items(self):
+        raise RuntimeError("cannot list items")
+
+
+class _EntryBackend(tracker_mod._LoggingBackend):
+    """Reports a fixed entry, or raises, so the tracker's aggregation can be driven directly.
+
+    It never tracks its own closure, like a backend that leaves that to the tracker.
+    """
+
+    def __init__(self, entry=None, error=None, close_error=None):
         self._entry = entry
         self._error = error
+        self._close_error = close_error
 
     def log(self, metrics, step):
         pass
@@ -1481,6 +1493,10 @@ class _EntryBackend(tracker_mod._LoggingBackend):
         if self._error is not None:
             raise self._error
         return self._entry
+
+    def close(self):
+        if self._close_error is not None:
+            raise self._close_error
 
 
 class TestTrackingEntries:
@@ -1633,8 +1649,21 @@ class TestTrackingEntries:
         backend.log({"train/loss": 2.5}, step=1)
         entry = backend.tracking_entry()
         assert entry is not None
+        assert entry["log_dir"] == backend._writer.get_logdir()
         assert entry["log_dir"].startswith("runs")
         assert os.path.isdir(entry["log_dir"])
+        backend.close()
+
+    def test_tensorboard_entry_is_a_string_even_for_a_path_setting(self, tmp_path):
+        pytest.importorskip("tensorboard")
+        backend = TensorBoardBackend(
+            MetricsConfig(enable_tensorboard=True, tensorboard_dir=tmp_path / "tb")  # type: ignore[arg-type]
+        )
+        backend.log({"train/loss": 2.5}, step=1)
+        assert backend.tracking_entry() == {
+            "backend": "tensorboard",
+            "log_dir": str(tmp_path / "tb"),
+        }
         backend.close()
 
     def test_tensorboard_has_no_entry_when_it_is_not_installed(self, monkeypatch):
@@ -1665,6 +1694,70 @@ class TestTrackingEntries:
         tracker._backends = [_EntryBackend(error=RuntimeError("boom")), _EntryBackend(kept)]
         assert tracker.tracking_entries() == [kept]
         assert len(seen) == 1 and "_EntryBackend" in seen[0] and "boom" in seen[0]
+
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            ["backend"],
+            {},
+            {"run_id": "r"},
+            {"backend": ""},
+            {"backend": "x", "run_id": "  "},
+            {"backend": "x", "log_dir": Path("somewhere")},
+            {"backend": "x", "step": 3},
+            {"backend": "x", 1: "one"},
+            _HostileEntry(backend="x"),
+        ],
+        ids=[
+            "list",
+            "empty",
+            "no-backend",
+            "blank-backend",
+            "blank",
+            "path",
+            "number",
+            "key",
+            "hostile",
+        ],
+    )
+    def test_tracker_skips_an_entry_a_checkpoint_could_not_hold(self, monkeypatch, bad):
+        seen = _capture_warnings(monkeypatch)
+        tracker = self._tracker()
+        kept = {"backend": "kept", "run_id": "r"}
+        tracker._backends = [_EntryBackend(bad), _EntryBackend(kept)]
+        assert tracker.tracking_entries() == [kept]  # one bad backend does not cost the others
+        assert len(seen) == 1 and "_EntryBackend" in seen[0]
+
+    def test_tracker_reports_nothing_once_closed(self):
+        tracker = self._tracker()
+        tracker._backends = [_EntryBackend({"backend": "live"})]
+        assert tracker.tracking_entries() == [{"backend": "live"}]
+        tracker.close()
+        assert tracker.tracking_entries() == []  # whatever the backend itself reports
+
+    def test_tracker_reports_nothing_after_a_close_that_fails_part_way(self):
+        tracker = self._tracker()
+        tracker._backends = [
+            _EntryBackend({"backend": "first"}, close_error=RuntimeError("teardown")),
+            _EntryBackend({"backend": "later"}),
+        ]
+        with pytest.raises(RuntimeError, match="teardown"):
+            tracker.close()
+        assert tracker.tracking_entries() == []
+
+    def test_tracker_closed_before_its_backends_started_stays_empty(self, tmp_path):
+        pytest.importorskip("tensorboard")
+        config = JobConfig(
+            model=ModelConfig(dim=128, n_layers=2, n_heads=2, vocab_size=256),
+            metrics=MetricsConfig(enable_tensorboard=True, tensorboard_dir=str(tmp_path / "tb")),
+        )
+        tracker = MetricsTracker(config, num_gpus=1)
+        tracker.init_backends(config)
+        tracker.close()
+        tracker.log_eval({"eval/loss": 1.0}, step=1)  # a late log still starts the writer
+        assert tracker._backends[0].tracking_entry() is not None
+        assert tracker.tracking_entries() == []
+        tracker._backends[0].close()
 
     def test_other_ranks_hold_no_backends_so_report_nothing(self, monkeypatch):
         monkeypatch.setattr(dist, "is_initialized", lambda: True)
