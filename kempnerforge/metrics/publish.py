@@ -5,9 +5,10 @@
 
 A checkpoint's ``metadata.json`` records the tracking backends that were active when
 it was saved. ``publish_metrics`` reads the MLflow entry and appends the metrics to
-that run in one ``log_batch`` call at the checkpoint's step. It never starts, ends, or
-edits a run and keeps no state of its own, so several publishers can write to one run
-at once and the tracking server arbitrates. The call blocks on the server under
+that run at the checkpoint's step in a single ``log_batch`` request, which MLflow
+validates as a whole: it is stored entirely or not at all. The publisher never starts,
+ends, or edits a run and keeps no state of its own, so several publishers can write to
+one run at once and the tracking server arbitrates. The call blocks on the server under
 MLflow's own HTTP timeout and retry settings, and authentication is whatever the MLflow
 client finds in the environment. It is an offline tool: call it from one process, never
 from the training step.
@@ -23,6 +24,7 @@ import json
 import math
 import numbers
 import os
+import re
 import sys
 import time
 from collections.abc import Mapping, Sequence
@@ -36,6 +38,10 @@ logger = get_logger(__name__)
 
 _SIDECAR_FILE = "metadata.json"
 _MLFLOW_BACKEND = "mlflow"
+# A larger batch is split by MLflow into requests that can succeed or fail separately.
+_MAX_METRICS_PER_CALL = 1000
+# The user:password@ part of a URL, which MLflow error text can quote from a tracking URI.
+_URL_USERINFO = re.compile(r"(?<=://)[^/\s@]+@")
 
 
 class PublishRefused(ValueError):
@@ -51,6 +57,20 @@ class MlflowTarget:
     tracking_uri: str = field(repr=False)  # may embed credentials: keep it out of logs
     step: int
     model_id: str | None = None
+
+
+def _no_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    parsed: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in parsed:
+            raise ValueError(f"duplicate key {key!r}")
+        parsed[key] = value
+    return parsed
+
+
+def _parse_json(raw: bytes) -> Any:
+    """Parse JSON, refusing a repeated key rather than silently keeping the last one."""
+    return json.loads(raw, object_pairs_hook=_no_duplicate_keys)
 
 
 def _string_problem(entry: Mapping[str, Any], key: str) -> str | None:
@@ -72,9 +92,9 @@ def _load_sidecar(directory: Path) -> tuple[Path, dict[str, Any]]:
     if not sidecar.is_file():
         raise PublishRefused(f"{sidecar} not found; pass the checkpoint step directory")
     try:
-        meta = json.loads(sidecar.read_bytes())
+        meta = _parse_json(sidecar.read_bytes())
     except (OSError, ValueError) as e:
-        raise PublishRefused(f"{sidecar} is unreadable or not valid JSON: {e}") from e
+        raise PublishRefused(f"{sidecar} is unreadable or malformed JSON: {e}") from e
     if not isinstance(meta, dict):
         raise PublishRefused(f"{sidecar}: top level must be an object, got {type(meta).__name__}")
     return sidecar, meta
@@ -84,8 +104,7 @@ def _select_mlflow_entry(sidecar: Path, meta: dict[str, Any]) -> tuple[int, dict
     """The single ``backend == "mlflow"`` entry of the ``tracking`` list, with its index."""
     if "tracking" not in meta:
         raise PublishRefused(
-            f"{sidecar}: no 'tracking' block; the run that saved this checkpoint "
-            "recorded no tracking backend"
+            f"{sidecar}: no 'tracking' block; this checkpoint does not record a tracking backend"
         )
     tracking = meta["tracking"]
     if not isinstance(tracking, list):
@@ -124,7 +143,8 @@ def read_mlflow_target(checkpoint_dir: str | os.PathLike[str]) -> MlflowTarget:
 
     The sidecar needs a non-negative integer ``step`` and a ``tracking`` list holding
     exactly one entry with ``backend == "mlflow"`` whose ``run_id``, ``experiment`` and
-    ``tracking_uri`` are non-empty strings. ``model_id`` is optional.
+    ``tracking_uri`` are non-empty strings. ``model_id`` is optional. A key repeated
+    anywhere in the file is refused, since the last value would silently win.
 
     Raises:
         PublishRefused: Naming each missing or malformed item; nothing is inferred.
@@ -159,6 +179,19 @@ def read_mlflow_target(checkpoint_dir: str | os.PathLike[str]) -> MlflowTarget:
     )
 
 
+def _as_finite_float(value: object) -> float:
+    """``value`` as a float; raises ValueError saying why it is not a finite number."""
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
+        raise ValueError(f"must be a number, got {type(value).__name__}")
+    try:
+        number = float(value)
+    except OverflowError:
+        raise ValueError("is too large for a float") from None
+    if not math.isfinite(number):
+        raise ValueError(f"must be finite, got {number}")
+    return number
+
+
 def _prefixed_metrics(metrics: Mapping[str, float], prefix: str) -> dict[str, float]:
     """Validate ``metrics`` and return them keyed ``<prefix><name>`` as floats."""
     if not isinstance(prefix, str):
@@ -169,20 +202,28 @@ def _prefixed_metrics(metrics: Mapping[str, float], prefix: str) -> dict[str, fl
         )
     if not metrics:
         raise PublishRefused("no metrics to publish: the mapping is empty")
+    if len(metrics) > _MAX_METRICS_PER_CALL:
+        raise PublishRefused(
+            f"{len(metrics)} metrics exceed the {_MAX_METRICS_PER_CALL} one request can carry; "
+            "a larger batch would be split into requests that can succeed or fail separately"
+        )
     named: dict[str, float] = {}
     problems: list[str] = []
     for name, value in metrics.items():
         if not isinstance(name, str) or not name.strip():
             problems.append(f"metric name {name!r} must be a non-empty string")
-        elif isinstance(value, bool) or not isinstance(value, numbers.Real):
-            problems.append(f"metric {name!r} must be a number, got {type(value).__name__}")
-        elif not math.isfinite(value):
-            problems.append(f"metric {name!r} must be finite, got {value}")
-        else:
-            named[prefix + name] = float(value)
+            continue
+        try:
+            named[prefix + name] = _as_finite_float(value)
+        except ValueError as e:
+            problems.append(f"metric {name!r} {e}")
     if problems:
         raise PublishRefused("; ".join(problems))
     return named
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
 
 
 def publish_metrics(
@@ -193,14 +234,14 @@ def publish_metrics(
     """Append ``metrics`` to the MLflow run a checkpoint was trained under.
 
     Every metric is logged as ``<prefix><name>`` at the checkpoint's step by one
-    ``MlflowClient.log_batch`` call, on a client bound to the sidecar's tracking URI
+    ``MlflowClient.log_batch`` request, on a client bound to the sidecar's tracking URI
     (the process-wide MLflow tracking URI is left alone). When the sidecar entry carries
     a ``model_id`` and the installed MLflow can link metrics to a logged model, the
     metrics are linked to it; otherwise the ``model_id`` is ignored.
 
     Args:
         checkpoint_dir: Checkpoint step directory holding ``metadata.json``.
-        metrics: Metric name to finite number.
+        metrics: Metric name to finite number, at most 1000 of them (one request).
         prefix: Prepended verbatim to every name; may be empty.
 
     Returns:
@@ -208,7 +249,9 @@ def publish_metrics(
 
     Raises:
         PublishRefused: The sidecar or the metrics are missing or malformed, or mlflow is
-            not installed. All validation precedes the first call to the server.
+            not installed; nothing was sent. Errors raised by MLflow itself (an invalid
+            metric name, which fails the whole request, or an unreachable server)
+            propagate as raised.
     """
     target = read_mlflow_target(checkpoint_dir)
     named = _prefixed_metrics(metrics, prefix)
@@ -227,7 +270,7 @@ def publish_metrics(
         else:
             logger.debug("installed mlflow cannot link metrics to a model; ignoring model_id")
 
-    timestamp = int(time.time() * 1000)
+    timestamp = _now_ms()
     batch = [
         Metric(key=key, value=value, timestamp=timestamp, step=target.step, **link)
         for key, value in named.items()
@@ -240,13 +283,13 @@ def publish_metrics(
 def _load_metrics_file(path: str) -> Any:
     try:
         with open(path, "rb") as f:
-            return json.load(f)
+            return _parse_json(f.read())
     except (OSError, ValueError) as e:
         raise PublishRefused(f"cannot read metrics file {path!r}: {e}") from e
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Command-line entry point; returns the exit code (0 published, 2 refused)."""
+    """Command-line entry point; returns the exit code: 0 published, 2 refused, 1 failed."""
     parser = argparse.ArgumentParser(
         prog="python -m kempnerforge.metrics.publish",
         description="Append eval metrics to the MLflow run recorded in a checkpoint's "
@@ -269,6 +312,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     except PublishRefused as e:
         print(f"refused: {e}", file=sys.stderr)
         return 2
+    except Exception as e:  # the MLflow client or server failed: no traceback, no URL credentials
+        print(f"failed: {type(e).__name__}: {_URL_USERINFO.sub('', str(e))}", file=sys.stderr)
+        return 1
     print(f"published {len(metrics)} metric(s) to run {target.run_id} at step {target.step}")
     return 0
 

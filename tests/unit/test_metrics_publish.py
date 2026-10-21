@@ -6,7 +6,6 @@ import json
 import runpy
 import sys
 import threading
-import time
 import types
 from fractions import Fraction
 from pathlib import Path
@@ -25,7 +24,7 @@ from kempnerforge.metrics.publish import (
     read_mlflow_target,
 )
 
-URI = "http://localhost:5000"
+URI = "tracking-uri-placeholder"
 MISSING = object()  # drop the key from the synthetic sidecar
 
 
@@ -45,6 +44,13 @@ def _sidecar(tmp_path: Path, name: str = "step_120", **meta: Any) -> Path:
     ckpt.mkdir()
     (ckpt / "metadata.json").write_text(json.dumps(_drop_missing(body)))
     return ckpt
+
+
+def _raiser(error: Exception):
+    def _raise(*args: Any, **kwargs: Any) -> None:
+        raise error
+
+    return _raise
 
 
 class _Metric:
@@ -78,9 +84,17 @@ class _FakeMlflow(types.ModuleType):
 
     Only ``MlflowClient(tracking_uri=...)`` and ``log_batch`` exist: touching anything
     else (``start_run``, ``set_tracking_uri``, ``end_run``, ...) raises AssertionError.
+    ``reject`` models a store validating a whole request before keeping any of it,
+    ``on_log_batch`` runs after a request is stored, ``init_error`` fails the client.
     """
 
-    def __init__(self, metric_cls: type = _Metric, on_log_batch=None):
+    def __init__(
+        self,
+        metric_cls: type = _Metric,
+        on_log_batch=None,
+        reject=None,
+        init_error: Exception | None = None,
+    ):
         super().__init__("mlflow")
         self.events: list[str] = []
         self.batches: list[types.SimpleNamespace] = []
@@ -91,11 +105,15 @@ class _FakeMlflow(types.ModuleType):
 
         class MlflowClient:
             def __init__(self, tracking_uri=None, registry_uri=None):
+                if init_error is not None:
+                    raise init_error
                 fake.events.append("client")
                 self._uri = tracking_uri
 
             def log_batch(self, run_id, metrics=(), params=(), tags=(), synchronous=None):
                 fake.events.append("log_batch")
+                if reject is not None:
+                    reject(list(metrics))
                 call = types.SimpleNamespace(
                     tracking_uri=self._uri,
                     run_id=run_id,
@@ -139,7 +157,7 @@ class TestReadMlflowTarget:
         )
 
     def test_repr_keeps_the_tracking_uri_out_of_logs(self, tmp_path):
-        target = read_mlflow_target(_sidecar(tmp_path, tracking=[_entry(tracking_uri=URI)]))
+        target = read_mlflow_target(_sidecar(tmp_path))
         assert URI not in repr(target) and "run-1" in repr(target)
 
     def test_accepts_a_path_object_or_a_string(self, tmp_path):
@@ -182,17 +200,30 @@ class TestSidecarRefusals:
         ckpt = tmp_path / "step_1"
         ckpt.mkdir()
         (ckpt / "metadata.json").write_bytes(raw)
-        with pytest.raises(PublishRefused, match="not valid JSON"):
+        with pytest.raises(PublishRefused, match="malformed JSON"):
             read_mlflow_target(ckpt)
 
     def test_unreadable_sidecar(self, tmp_path, monkeypatch):
         ckpt = _sidecar(tmp_path)
+        monkeypatch.setattr(Path, "read_bytes", _raiser(PermissionError("denied")))
+        with pytest.raises(PublishRefused, match="unreadable or malformed JSON: denied"):
+            read_mlflow_target(ckpt)
 
-        def _deny(self, *args, **kwargs):
-            raise PermissionError("denied")
-
-        monkeypatch.setattr(Path, "read_bytes", _deny)
-        with pytest.raises(PublishRefused, match="unreadable or not valid JSON: denied"):
+    @pytest.mark.parametrize(
+        ("raw", "key"),
+        [
+            ('{"step": 1, "step": 2, "tracking": []}', "step"),
+            (
+                '{"step": 1, "tracking": [{"backend": "mlflow", "run_id": "a", "run_id": "b"}]}',
+                "run_id",
+            ),
+        ],
+    )
+    def test_repeated_key_is_refused_instead_of_the_last_one_winning(self, tmp_path, raw, key):
+        ckpt = tmp_path / "step_1"
+        ckpt.mkdir()
+        (ckpt / "metadata.json").write_text(raw)
+        with pytest.raises(PublishRefused, match=f"duplicate key '{key}'"):
             read_mlflow_target(ckpt)
 
     @pytest.mark.parametrize("body", [[], "text", 3, None])
@@ -304,11 +335,11 @@ class TestSidecarRefusals:
             assert fragment in message
 
     def test_refusals_never_echo_field_values(self, tmp_path):
-        marker = "http://localhost:5000/marker-not-to-be-echoed"
+        marker = "tracking-uri-marker-not-to-be-echoed"
         ckpt = _sidecar(tmp_path, tracking=[_entry(tracking_uri=marker, run_id=MISSING)])
         with pytest.raises(PublishRefused) as err:
             read_mlflow_target(ckpt)
-        assert "marker-not-to-be-echoed" not in str(err.value)
+        assert marker not in str(err.value)
 
 
 # ---------------------------------------------------------------------------
@@ -316,18 +347,12 @@ class TestSidecarRefusals:
 # ---------------------------------------------------------------------------
 
 
-def _now_ms() -> int:
-    return int(time.time() * 1000)
-
-
 class TestPublishMetrics:
     def test_appends_prefixed_metrics_at_the_sidecar_step(self, tmp_path, monkeypatch):
         fake = _install_mlflow(monkeypatch)
         ckpt = _sidecar(tmp_path, step=1500)
 
-        before = _now_ms()
         target = publish_metrics(ckpt, {"mmmu": 0.5, "mmbench": 2})
-        after = _now_ms()
 
         (batch,) = fake.batches
         assert batch.run_id == "run-1"
@@ -338,8 +363,14 @@ class TestPublishMetrics:
             ("eval/mmbench", 2.0, 1500),
         ]
         assert all(isinstance(m.value, float) for m in batch.metrics)
-        assert all(before <= m.timestamp <= after for m in batch.metrics)
+        assert all(isinstance(m.timestamp, int) and m.timestamp > 0 for m in batch.metrics)
         assert target == read_mlflow_target(ckpt)
+
+    def test_every_metric_carries_the_one_publish_time(self, tmp_path, monkeypatch):
+        fake = _install_mlflow(monkeypatch)
+        monkeypatch.setattr(publish_mod, "_now_ms", lambda: 1_700_000_000_123)
+        publish_metrics(_sidecar(tmp_path), {"a": 1.0, "b": 2.0})
+        assert [m.timestamp for m in fake.batches[0].metrics] == [1_700_000_000_123] * 2
 
     @pytest.mark.parametrize(
         ("prefix", "expected"), [("probe/", "probe/acc"), ("", "acc"), ("eval_", "eval_acc")]
@@ -358,7 +389,7 @@ class TestPublishMetrics:
         self, tmp_path, monkeypatch
     ):
         fake = _install_mlflow(monkeypatch)
-        uri = "http://localhost:5999"
+        uri = "tracking-uri-bound"
         publish_metrics(_sidecar(tmp_path, tracking=[_entry(tracking_uri=uri)]), {"acc": 1.0})
         assert fake.batches[0].tracking_uri == uri
 
@@ -367,6 +398,12 @@ class TestPublishMetrics:
         metrics = {"a": 3, "b": np.float32(0.25), "c": np.int64(4), "d": Fraction(1, 2)}
         publish_metrics(_sidecar(tmp_path), metrics)
         assert [m.value for m in fake.batches[0].metrics] == [3.0, 0.25, 4.0, 0.5]
+
+    def test_the_request_limit_is_one_batch(self, tmp_path, monkeypatch):
+        fake = _install_mlflow(monkeypatch)
+        metrics = {f"m{i}": float(i) for i in range(publish_mod._MAX_METRICS_PER_CALL)}
+        publish_metrics(_sidecar(tmp_path), metrics)
+        assert [len(b.metrics) for b in fake.batches] == [1000]
 
     def test_links_metrics_to_the_model_when_the_entry_has_one(self, tmp_path, monkeypatch):
         fake = _install_mlflow(monkeypatch)
@@ -396,13 +433,20 @@ class TestPublishMetrics:
         assert len(notes) == 1 and "model_id" in notes[0]
 
     def test_server_errors_propagate_unchanged(self, tmp_path, monkeypatch):
-        def _down(call):
-            raise RuntimeError("server unreachable")
-
-        _install_mlflow(monkeypatch, on_log_batch=_down)
+        _install_mlflow(monkeypatch, on_log_batch=_raiser(RuntimeError("server unreachable")))
         with pytest.raises(RuntimeError, match="server unreachable") as err:
             publish_metrics(_sidecar(tmp_path), {"a": 1.0})
         assert not isinstance(err.value, PublishRefused)
+
+    def test_a_request_the_store_rejects_stores_none_of_it(self, tmp_path, monkeypatch):
+        def reject(metrics):
+            if any("?" in m.key for m in metrics):
+                raise ValueError("invalid metric name")
+
+        fake = _install_mlflow(monkeypatch, reject=reject)
+        with pytest.raises(ValueError, match="invalid metric name"):
+            publish_metrics(_sidecar(tmp_path), {"ok": 1.0, "bad?": 2.0})
+        assert fake.events == ["client", "log_batch"] and fake.batches == []
 
     def test_refused_when_mlflow_is_not_installed(self, tmp_path, monkeypatch):
         monkeypatch.setitem(sys.modules, "mlflow", None)
@@ -412,12 +456,8 @@ class TestPublishMetrics:
     def test_concurrent_publishers_to_one_run_do_not_share_state(self, tmp_path, monkeypatch):
         barrier = threading.Barrier(2, timeout=10)
         fake = _install_mlflow(monkeypatch, on_log_batch=lambda call: barrier.wait())
-        first = _sidecar(
-            tmp_path, "step_1", tracking=[_entry(tracking_uri="http://localhost:5001")]
-        )
-        second = _sidecar(
-            tmp_path, "step_2", tracking=[_entry(tracking_uri="http://localhost:5002")]
-        )
+        first = _sidecar(tmp_path, "step_1", tracking=[_entry(tracking_uri="tracking-uri-1")])
+        second = _sidecar(tmp_path, "step_2", tracking=[_entry(tracking_uri="tracking-uri-2")])
         failures: list[BaseException] = []
 
         def _publish(ckpt: Path, prefix: str) -> None:
@@ -437,7 +477,7 @@ class TestPublishMetrics:
 
         assert failures == []
         seen = sorted((b.tracking_uri, b.metrics[0].key) for b in fake.batches)
-        assert seen == [("http://localhost:5001", "a/acc"), ("http://localhost:5002", "b/acc")]
+        assert seen == [("tracking-uri-1", "a/acc"), ("tracking-uri-2", "b/acc")]
 
 
 class TestRefusalsPrecedeThePublish:
@@ -460,11 +500,19 @@ class TestRefusalsPrecedeThePublish:
             ({"acc": float("nan")}, "metric 'acc' must be finite, got nan"),
             ({"acc": float("inf")}, "metric 'acc' must be finite, got inf"),
             ({"acc": float("-inf")}, "metric 'acc' must be finite, got -inf"),
+            ({"huge": 10**1000}, "metric 'huge' is too large for a float"),
         ],
     )
     def test_bad_metrics(self, tmp_path, monkeypatch, metrics, message):
         fake = _install_mlflow(monkeypatch)
         with pytest.raises(PublishRefused, match=message):
+            publish_metrics(_sidecar(tmp_path), metrics)
+        assert fake.events == []
+
+    def test_more_metrics_than_one_request_carries(self, tmp_path, monkeypatch):
+        fake = _install_mlflow(monkeypatch)
+        metrics = {f"m{i}": 1.0 for i in range(publish_mod._MAX_METRICS_PER_CALL + 1)}
+        with pytest.raises(PublishRefused, match="1001 metrics exceed the 1000 one request"):
             publish_metrics(_sidecar(tmp_path), metrics)
         assert fake.events == []
 
@@ -546,6 +594,13 @@ class TestCli:
         assert main([str(_sidecar(tmp_path)), "--metrics", str(metrics)]) == 2
         assert "cannot read metrics file" in capsys.readouterr().err
 
+    def test_metrics_file_with_a_repeated_name(self, tmp_path, monkeypatch, capsys):
+        fake = _install_mlflow(monkeypatch)
+        metrics = _metrics_file(tmp_path, raw='{"acc": 0.5, "acc": 0.9}')
+        assert main([str(_sidecar(tmp_path)), "--metrics", str(metrics)]) == 2
+        assert "duplicate key 'acc'" in capsys.readouterr().err
+        assert fake.events == []
+
     def test_metrics_file_that_is_not_an_object(self, tmp_path, monkeypatch, capsys):
         fake = _install_mlflow(monkeypatch)
         metrics = _metrics_file(tmp_path, body=[0.5])
@@ -559,6 +614,29 @@ class TestCli:
         assert main([str(_sidecar(tmp_path)), "--metrics", str(metrics)]) == 2
         assert "must be finite" in capsys.readouterr().err
         assert fake.events == []
+
+    @pytest.mark.parametrize("failing_step", ["client", "log_batch"])
+    def test_mlflow_failure_exits_1_without_traceback_or_url_credentials(
+        self, tmp_path, monkeypatch, capsys, failing_step
+    ):
+        error = RuntimeError("cannot reach placeholder://user:secret-marker@tracking-placeholder/")
+        hook = {"init_error": error} if failing_step == "client" else {"reject": _raiser(error)}
+        _install_mlflow(monkeypatch, **hook)
+
+        code = main([str(_sidecar(tmp_path)), "--metrics", str(_metrics_file(tmp_path))])
+
+        out = capsys.readouterr()
+        assert code == 1
+        assert out.out == ""
+        assert out.err == "failed: RuntimeError: cannot reach placeholder://tracking-placeholder/\n"
+
+    def test_mlflow_failure_text_without_credentials_is_reported_as_is(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        _install_mlflow(monkeypatch, reject=_raiser(RuntimeError("run not found")))
+        code = main([str(_sidecar(tmp_path)), "--metrics", str(_metrics_file(tmp_path))])
+        assert code == 1
+        assert capsys.readouterr().err == "failed: RuntimeError: run not found\n"
 
     def test_metrics_flag_is_required(self, tmp_path, capsys):
         with pytest.raises(SystemExit) as err:
