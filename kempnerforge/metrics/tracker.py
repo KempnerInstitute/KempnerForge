@@ -579,8 +579,7 @@ def _resolve_mlflow_experiment(config: MetricsConfig, uri: str) -> str | None:
         return None
 
 
-# Run metadata, not hyperparameters: tag keys are user-typed and may be illegal as
-# MLflow param names, which would fail the whole 100-param batch containing them.
+# Run metadata, not params: a user-typed tag key can be MLflow-illegal and fail its whole batch.
 _PARAM_SKIP = ("metrics.mlflow_tags", "metrics.mlflow_description")
 
 
