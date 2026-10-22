@@ -916,6 +916,9 @@ class TestMlflowDatabricksAuth:
         warn = tracker_mod._RateLimitedWarning(300.0)
         warn("log_metrics failed (https://u:p@h/x); points may be lost")
         assert warnings_seen == ["log_metrics failed (https://h/x); points may be lost"]
+        plain = "log_metrics failed (https://host?x=a@b#c@d)"
+        tracker_mod._RateLimitedWarning(300.0)(plain)  # a fresh limiter always shows its first
+        assert warnings_seen[-1] == plain
 
     def test_rejected_credentials_disable_with_the_auth_routes_named(self, monkeypatch):
         fm = _FakeMlflow()
