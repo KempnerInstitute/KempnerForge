@@ -152,6 +152,9 @@ File:
 [`kempnerforge/config/metrics.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/config/metrics.py).
 
 - `log_interval > 0`.
+- With `enable_mlflow` and a Databricks tracking URI, `mlflow_experiment` (when set) is an
+  absolute workspace path, starting with `/`. The URI is `mlflow_tracking_uri`, else
+  `$MLFLOW_TRACKING_URI`, else `"databricks"`, read when the config loads.
 - `mlflow_register_checkpoints` requires `enable_mlflow`.
 
 ### `ProfilingConfig`
