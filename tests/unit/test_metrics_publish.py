@@ -216,6 +216,15 @@ class TestReadMlflowTarget:
         read_mlflow_target(ckpt)
         assert "DATABRICKS_CONFIG_PROFILE" not in os.environ
 
+    @pytest.mark.parametrize(
+        ("uri", "profile"),
+        [("databricks://prof-a/", "prof-a"), ("databricks://prof-a/x:y", "prof-a")],
+    )
+    def test_profile_is_parsed_like_the_training_backend(self, tmp_path, uri, profile):
+        """Training takes the first path segment as the profile; publishing must agree."""
+        read_mlflow_target(_sidecar(tmp_path, tracking=[_entry(tracking_uri=uri)]))
+        assert os.environ["DATABRICKS_CONFIG_PROFILE"] == profile
+
     def test_token_alias_stands_in_like_the_training_backend(self, tmp_path, monkeypatch):
         """A DATABRICKS_API_TOKEN that lets training authenticate must let publishing too."""
         monkeypatch.setenv("DATABRICKS_API_TOKEN", "alias-token")
