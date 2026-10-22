@@ -563,10 +563,6 @@ class _RunOwner:
         self._ended.set()
 
 
-# scheme://user:token@host -> scheme://host: credentials must not reach checkpoint sidecars.
-_URI_USERINFO = re.compile(r"(?<=://)[^/?#\s]+@")
-
-
 def _import_mlflow() -> Any:
     """Import mlflow with bounded HTTP requests; values already set in the environment win."""
     os.environ.setdefault("MLFLOW_HTTP_REQUEST_TIMEOUT", "30")
