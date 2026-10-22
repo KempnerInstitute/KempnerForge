@@ -859,6 +859,28 @@ class TestMlflowDatabricksAuth:
         _init_backend(monkeypatch, cfg)
         assert os.environ.get("DATABRICKS_TOKEN") == token
 
+    def test_warnings_scrub_credentialed_uris(self, monkeypatch):
+        """mlflow and SDK errors can quote the tracking URI; logged warnings must not leak it."""
+        fm = _FakeMlflow()
+
+        def unreachable(*a, **k):
+            raise RuntimeError("cannot reach http://user:tok@host:5000/api?x=a@b")
+
+        fm.set_experiment = unreachable
+        warnings_seen = _capture_warnings(monkeypatch)
+        cfg = MetricsConfig(enable_mlflow=True, mlflow_experiment="/Users/me/p")
+        backend, _ = _init_backend(monkeypatch, cfg, fm)
+        assert backend._active is False
+        (message,) = warnings_seen
+        assert "user:tok@" not in message
+        assert "http://host:5000/api?x=a@b" in message  # the rest of the error stays readable
+
+    def test_rate_limited_warnings_scrub_credentialed_uris(self, monkeypatch):
+        warnings_seen = _capture_warnings(monkeypatch)
+        warn = tracker_mod._RateLimitedWarning(300.0)
+        warn("log_metrics failed (https://u:p@h/x); points may be lost")
+        assert warnings_seen == ["log_metrics failed (https://h/x); points may be lost"]
+
     def test_rejected_credentials_disable_with_the_auth_routes_named(self, monkeypatch):
         fm = _FakeMlflow()
 
