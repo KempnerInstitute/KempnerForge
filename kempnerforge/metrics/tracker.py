@@ -387,6 +387,14 @@ _MAX_CALL_THREADS = 4  # live call threads, abandoned ones included, before new 
 _WARN_INTERVAL_S = 300.0  # minimum gap between repeats of a warning
 
 
+# mlflow and SDK errors can quote a credentialed tracking URI; nothing logged may carry it.
+_URI_USERINFO = re.compile(r"(?<=://)[^/?#\s]+@")
+
+
+def _scrub_uris(text: str) -> str:
+    return _URI_USERINFO.sub("", text)
+
+
 class _RateLimitedWarning:
     """Warns on the first event, then at most once per interval, counting what it held back."""
 
@@ -405,7 +413,7 @@ class _RateLimitedWarning:
                 return
             held_back, self._held_back, self._last = self._held_back, 0, now
         suffix = f" ({held_back} similar warnings suppressed)" if held_back else ""
-        logger.warning(message + suffix)
+        logger.warning(_scrub_uris(message) + suffix)
 
 
 class _BestEffortWorker:
@@ -621,10 +629,6 @@ class _RunOwner:
         self._ended.set()
 
 
-# scheme://user:token@host -> scheme://host: credentials must not reach checkpoint sidecars.
-_URI_USERINFO = re.compile(r"(?<=://)[^/?#\s]+@")
-
-
 def _import_mlflow() -> Any:
     """Import mlflow with bounded HTTP requests; values already set in the environment win."""
     os.environ.setdefault("MLFLOW_HTTP_REQUEST_TIMEOUT", "30")
@@ -701,7 +705,9 @@ def _resolve_mlflow_experiment(config: MetricsConfig, uri: str) -> str | None:
         user = WorkspaceClient().current_user.me().user_name
         return f"/Users/{user}/{project}"
     except Exception as e:  # SDK missing, no creds, or API error
-        logger.warning(f"Could not auto-resolve Databricks experiment path: {e}{_auth_hint(e)}")
+        logger.warning(
+            _scrub_uris(f"Could not auto-resolve Databricks experiment path: {e}{_auth_hint(e)}")
+        )
         return None
 
 
@@ -855,7 +861,7 @@ class MLflowBackend(_LoggingBackend):
             else:
                 self._log_run_metadata(self._mlflow)
         except _MlflowDisabled as e:
-            logger.warning(f"MLflow disabled: {e}")
+            logger.warning(_scrub_uris(f"MLflow disabled: {e}"))
             self._active = False
         except ImportError:
             logger.warning(
@@ -864,7 +870,7 @@ class MLflowBackend(_LoggingBackend):
             self._active = False
         except Exception as e:  # mlflow talks to a remote server: network / auth / config errors
             hint = _auth_hint(e) if on_databricks else ""
-            logger.warning(f"MLflow init failed: {e}{hint}")
+            logger.warning(_scrub_uris(f"MLflow init failed: {e}{hint}"))
             self._active = False
 
     def _open_run(self) -> tuple[str | None, str, bool, int | None]:
@@ -906,7 +912,9 @@ class MLflowBackend(_LoggingBackend):
             except Exception as e:
                 if not _mlflow_run_gone(e):
                     raise  # transient/other error — don't fork a new run; let init disable
-                logger.warning(f"MLflow run_id={run_id} is gone ({e}); starting a new run")
+                logger.warning(
+                    _scrub_uris(f"MLflow run_id={run_id} is gone ({e}); starting a new run")
+                )
         return mlflow.start_run(**kwargs), False
 
     def _log_run_metadata(self, mlflow: Any) -> None:
@@ -995,7 +1003,7 @@ class MLflowBackend(_LoggingBackend):
             self._worker.close()
             self._owner.end(_END_DEADLINE_S)
         except Exception as e:  # teardown must not fail the job
-            logger.warning(f"MLflow end_run failed ({e})")
+            logger.warning(_scrub_uris(f"MLflow end_run failed ({e})"))
         finally:
             self._active = False
             self._run_started = False
