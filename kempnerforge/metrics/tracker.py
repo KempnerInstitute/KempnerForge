@@ -11,6 +11,7 @@ WandB, TensorBoard, MLflow) at a configurable interval.
 from __future__ import annotations
 
 import os
+import re
 import threading
 import time
 from collections import deque
@@ -554,6 +555,10 @@ class _RunOwner:
         self._ended.set()
 
 
+# scheme://user:token@host -> scheme://host: credentials must not reach checkpoint sidecars.
+_URI_USERINFO = re.compile(r"(?<=://)[^/\s]+@")
+
+
 def _import_mlflow() -> Any:
     """Import mlflow with bounded HTTP requests; values already set in the environment win."""
     os.environ.setdefault("MLFLOW_HTTP_REQUEST_TIMEOUT", "30")
@@ -842,7 +847,7 @@ class MLflowBackend(_LoggingBackend):
             "backend": "mlflow",
             "run_id": self._run_id,
             "experiment": self._experiment,
-            "tracking_uri": self._uri,
+            "tracking_uri": _URI_USERINFO.sub("", self._uri),
         }
         if self._active is not True or not all(value.strip() for value in entry.values()):
             return None

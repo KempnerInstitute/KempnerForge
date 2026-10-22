@@ -1543,6 +1543,17 @@ class TestTrackingEntries:
         assert all(isinstance(value, str) and value for value in entry.values())
 
     @pytest.mark.parametrize(
+        ("uri", "shown"),
+        [
+            ("http://user:token@localhost:5000/api", "http://localhost:5000/api"),
+            ("https://u:p@ss@host/x", "https://host/x"),
+        ],
+    )
+    def test_mlflow_entry_strips_credentials_from_the_uri(self, monkeypatch, uri, shown):
+        backend, _ = _init_backend(monkeypatch, _mlflow_cfg(mlflow_tracking_uri=uri))
+        assert backend.tracking_entry()["tracking_uri"] == shown
+
+    @pytest.mark.parametrize(
         ("cfg_kwargs", "env", "uri", "experiment"),
         [
             (
