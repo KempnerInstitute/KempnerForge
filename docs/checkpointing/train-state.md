@@ -145,7 +145,8 @@ KempnerForge uses this for:
 - `wandb_run_id` — so resumed runs append to the same W&B run rather
   than starting a new one.
 - `mlflow_run_id`: the same for MLflow; on resume, steps up to the last
-  `train/loss` step the run already holds are not logged again. The
+  `train/loss` step the run already holds are not logged again (best
+  effort: if reading the run's history fails, nothing is skipped). The
   checkpoint's `metadata.json` also records the live run as plain JSON,
   for tools that read it without loading this file.
 

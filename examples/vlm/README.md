@@ -276,7 +276,8 @@ Publishing is on by default and `--no-publish` turns it off. It needs the `mlflo
 `eval` dependency groups (`uv sync --group mlflow --group eval`, plus `video` for video
 tasks) and credentials for the run's tracking server, by any of the routes in
 [MLflow backend § Authentication](../../docs/metrics-and-profiling/mlflow.md#authentication).
-Publishing authenticates exactly as training does, so whatever route trains also publishes.
+Publishing authenticates the way training does, so a route that trains also publishes, except
+credentials embedded in the tracking URI, which checkpoints never record.
 Sync before `uv pip install lmms-eval`, since `uv sync` removes packages the lock does not
 list.
 

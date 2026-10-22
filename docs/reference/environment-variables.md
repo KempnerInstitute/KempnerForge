@@ -83,20 +83,22 @@ is a restart.
 
 ## Experiment tracking (MLflow / Databricks)
 
-Read by the MLflow backend
+Read by the metrics config
+([`kempnerforge/config/metrics.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/config/metrics.py),
+at load), the MLflow backend
 ([`kempnerforge/metrics/tracker.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/metrics/tracker.py)),
 the eval publisher
 ([`kempnerforge/metrics/publish.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/metrics/publish.py)),
-or the Databricks SDK they call. KempnerForge only fills these when they are unset (or
-empty), so a value you export always wins. Setup and auth routes:
-[MLflow backend](../metrics-and-profiling/mlflow.md).
+MLflow itself, or the Databricks SDK. KempnerForge only fills these when they are unset (the
+token alias also fills an empty `DATABRICKS_TOKEN`), so a non-empty value you export always
+wins. Setup and auth routes: [MLflow backend](../metrics-and-profiling/mlflow.md).
 
 | Variable | Read by | Purpose |
 |----------|---------|---------|
-| `MLFLOW_TRACKING_URI` | backend | Tracking URI when `metrics.mlflow_tracking_uri` is unset (config, then this, then `databricks`) |
+| `MLFLOW_TRACKING_URI` | config, backend | Tracking URI when `metrics.mlflow_tracking_uri` is unset (config, then this, then `databricks`) |
 | `MLFLOW_EXPERIMENT` | backend | Experiment when `metrics.mlflow_experiment` is unset; an absolute workspace path on Databricks |
 | `DATABRICKS_HOST`, `DATABRICKS_TOKEN` | SDK | The environment auth route; override a profile's values |
-| `DATABRICKS_API_TOKEN` | backend, publisher | Alias copied into an unset `DATABRICKS_TOKEN` for a Databricks URI |
+| `DATABRICKS_API_TOKEN` | backend, publisher | Alias copied into an unset or empty `DATABRICKS_TOKEN` for a Databricks URI |
 | `DATABRICKS_CONFIG_PROFILE` | SDK | `~/.databrickscfg` profile; set from a `databricks://<profile>` tracking URI by the backend and the publisher |
 | `DATABRICKS_AUTH_TYPE` | SDK | Never set by KempnerForge; `pat` is recommended in job scripts using token or profile auth |
 | `MLFLOW_HTTP_REQUEST_TIMEOUT` | MLflow | Set to `30` by the backend before importing `mlflow` |

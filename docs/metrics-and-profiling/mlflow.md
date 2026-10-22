@@ -265,7 +265,8 @@ server errored; URLs in either message are masked.
 
 From Python, `publish_metrics(checkpoint_dir, metrics, prefix="eval/")` does the same and returns
 the target; `read_mlflow_target(checkpoint_dir)` returns it without publishing: the run id,
-experiment, tracking URI, step and model id.
+experiment, tracking URI, step and model id. Both also prepare Databricks auth in the process
+environment, as described under credentials below.
 
 - **What it reads.** The single `mlflow` entry of the `tracking` list, whose `run_id`,
   `experiment` and `tracking_uri` must be non-empty strings, and `model_id` when present; plus a
@@ -283,12 +284,14 @@ experiment, tracking URI, step and model id.
   without MLflow); more than one `mlflow` entry; a field is missing or empty; the metrics are
   malformed; `mlflow` is not installed; or the sidecar has no `model_id` while the process has an
   active MLflow model, which `log_batch` would silently link the metrics to.
-- **Credentials.** It authenticates from the [routes above](#authentication) exactly as the
+- **Credentials.** It prepares auth from the [routes above](#authentication) the way the
   training backend does: it uses the recorded `tracking_uri` as written, a
   `databricks://<profile>` entry selects that profile (exported as `DATABRICKS_CONFIG_PROFILE`
-  unless already set, so artifact uploads authenticate too), and `DATABRICKS_API_TOKEN` stands
-  in for an unset `DATABRICKS_TOKEN`. Give the machine that publishes a profile of the same
-  name.
+  unless already set, so artifact uploads a harness makes later in the same process
+  authenticate too), and `DATABRICKS_API_TOKEN` stands in for an unset or empty
+  `DATABRICKS_TOKEN`. Credentials embedded in a tracking URI are stripped before the sidecar is
+  written, so that route does not carry over. Give the machine that publishes a profile of the
+  same name.
 
 A harness that scores checkpoints can publish through the same functions. Anything beyond
 metrics, such as a summary table or a `scores.json`, goes to the same run through
