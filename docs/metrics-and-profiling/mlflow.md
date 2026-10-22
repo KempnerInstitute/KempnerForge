@@ -109,6 +109,34 @@ the URI the backend resolved (config, then `$MLFLOW_TRACKING_URI`, then `"databr
 `MLflowBackend.tracking_entry()`; resume is unaffected and still restores `mlflow_run_id` from
 `train_state.pt`.
 
+## Registering checkpoints
+
+`mlflow_register_checkpoints = true` (default `false`; requires `enable_mlflow`) makes each
+checkpoint save also record an MLflow external logged model, so the run lists its checkpoints:
+
+- name `<run name>-step_<N>` (characters MLflow rejects in a model name become `_`, and the run
+  id stands in for an empty run name), `model_type = "checkpoint"`, linked to the run;
+- params `step` and `checkpoint_dir`, the absolute path the checkpoint was written to.
+
+Nothing is uploaded but the small descriptor MLflow keeps with any external model. The weights
+stay where they were saved, and `checkpoint.keep_last_n` can later delete the directory the
+model points at.
+
+The model id goes into that save's `metadata.json`, in the `mlflow` entry of `tracking`
+([Checkpointing](../checkpointing/index.md)):
+
+```json
+{"backend": "mlflow", "run_id": "<run id>", "experiment": "<experiment>", "tracking_uri": "<tracking uri>", "model_id": "<model id>"}
+```
+
+Registration is best effort and never fails a save. `save()` waits for it on rank 0 for at most
+30 seconds, while the other ranks wait at the save barrier. A server error or a timeout leaves
+that save's entry without `model_id` and logs a rate-limited warning, and while a timed-out call
+is still running, later saves skip registering. A step saved twice (an emergency save, or a
+resumed run re-running it) keeps the model it already has, and a resume registers nothing by
+itself. A save before the run's first log has no live run and registers nothing. MLflow itself
+logs two harmless "Failed to infer schema" warnings for each external model it creates.
+
 ## What gets logged
 
 - **Metrics** — the same backend dict as WandB/TensorBoard (`train/*`, `gpu/*`,
@@ -123,7 +151,8 @@ the URI the backend resolved (config, then `$MLFLOW_TRACKING_URI`, then `"databr
   `mlflow_system_metrics_interval` (seconds) for short test runs.
 
 No checkpoints are uploaded as artifacts — they stay on the filesystem (artifacts
-are the main MLflow storage cost).
+are the main MLflow storage cost); [registering](#registering-checkpoints) records where
+they are.
 
 ## Failure modes
 
