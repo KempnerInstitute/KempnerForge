@@ -537,10 +537,32 @@ class TestPublishResults:
 
         publish_results(_checkpoint(tmp_path), _results(), str(tmp_path / "blocked" / "r.json"))
 
-        (fallback,) = (tmp_path / "tmp").glob("r.*.scores-*.json")
+        (fallback,) = (tmp_path / "tmp").glob("eval-scores-*.json")
         assert json.loads(fallback.read_text()) == SCORES
         assert f"Saved the scores to {fallback} instead" in _warnings(caplog)
         assert _hint(caplog)[2] == str(fallback)
+
+    def test_a_symlink_loop_in_the_location_falls_back_too(self, tmp_path, monkeypatch, mlflow):
+        (tmp_path / "tmp").mkdir()
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "tmp"))
+        (tmp_path / "loop").symlink_to("loop")  # Path.resolve raises RuntimeError for a loop
+
+        assert publish_results(_checkpoint(tmp_path), _results(), str(tmp_path / "loop" / "r.json"))
+
+        assert len(list((tmp_path / "tmp").glob("eval-scores-*.json"))) == 1
+        assert len(mlflow.batches) == 1
+
+    def test_a_scores_name_too_long_for_the_file_system_falls_back_too(
+        self, tmp_path, monkeypatch, mlflow
+    ):
+        (tmp_path / "tmp").mkdir()
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "tmp"))
+        output = tmp_path / ("a" * 300 + ".json")  # no file system takes a 300-byte name
+
+        assert publish_results(_checkpoint(tmp_path), _results(), str(output))
+
+        assert len(list((tmp_path / "tmp").glob("eval-scores-*.json"))) == 1
+        assert len(mlflow.batches) == 1
 
     def test_publishing_goes_on_with_the_temporary_file_as_the_local_copy(
         self, tmp_path, monkeypatch, mlflow

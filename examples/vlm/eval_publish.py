@@ -216,14 +216,15 @@ def _save(path: Path, mapping: Mapping[str, float]) -> Path | None:
         path = path.resolve()
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text)
-    except OSError as e:
+    except (OSError, RuntimeError) as e:  # resolve() reports a symlink loop as RuntimeError
         logger.warning(f"Could not save the scores to {path}: {e}")
     else:
         logger.info(f"Scores saved to {path}")
         return path
     try:
-        prefix = f"{path.name.removesuffix('.json')}-"
-        with tempfile.NamedTemporaryFile("w", prefix=prefix, suffix=".json", delete=False) as f:
+        with tempfile.NamedTemporaryFile(
+            "w", prefix="eval-scores-", suffix=".json", delete=False
+        ) as f:
             f.write(text)
     except OSError as e:
         logger.warning(f"Could not save the scores to a temporary file either: {e}")
