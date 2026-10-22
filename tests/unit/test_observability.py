@@ -1547,6 +1547,8 @@ class TestTrackingEntries:
         [
             ("http://user:token@localhost:5000/api", "http://localhost:5000/api"),
             ("https://u:p@ss@host/x", "https://host/x"),
+            ("https://host?email=a@b", "https://host?email=a@b"),
+            ("http://u:t@host?x=a@b", "http://host?x=a@b"),
         ],
     )
     def test_mlflow_entry_strips_credentials_from_the_uri(self, monkeypatch, uri, shown):

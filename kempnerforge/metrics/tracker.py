@@ -556,7 +556,7 @@ class _RunOwner:
 
 
 # scheme://user:token@host -> scheme://host: credentials must not reach checkpoint sidecars.
-_URI_USERINFO = re.compile(r"(?<=://)[^/\s]+@")
+_URI_USERINFO = re.compile(r"(?<=://)[^/?#\s]+@")
 
 
 def _import_mlflow() -> Any:
