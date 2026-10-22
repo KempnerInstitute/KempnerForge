@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Checkpoint sidecar records the live tracking runs**: every checkpoint's `metadata.json` gains an additive top-level `tracking` list with one entry per logging backend that has a live run at save time (`mlflow`: `run_id`, `experiment`, `tracking_uri`; `wandb`: `run_id`, `experiment`, plus `entity` and `url` when known; `tensorboard`: `log_dir`), omitted when none is live, so the run behind a checkpoint can be found with a plain `json.load`; `MetricsTracker.tracking_entries()` feeds `CheckpointManager.set_tracking_source()`, and `train_state.pt`, DCP and resume are unchanged.
 - **`scheduler.warmup_start_factor`** (default `0.0`): the LR factor every warmup starts from, torch `LinearLR`'s `start_factor`, so a schedule can take its first step at `lr * warmup_start_factor` instead of zero. With it, `cosine` reproduces torch's `SequentialLR([LinearLR(start_factor), CosineAnnealing...])` step for step. The default keeps every existing schedule bit-identical.
   - Tests: `tests/unit/test_scheduler_extensions.py::TestWarmupStartFactor` (default unchanged, every warmup schedule honours it, step-for-step parity of `cosine` with the torch schedule) and `tests/unit/test_config.py` (default and rejection).
 - **VLM example: video captioning config on a pretrained 0.6B backbone** (`examples/vlm/configs/vlm_qwen3_0.6b_joint_decoder_webvid.toml`), warm-started weights-only from the converted checkpoint.
