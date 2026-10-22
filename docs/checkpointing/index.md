@@ -56,9 +56,10 @@ live run at save time it also holds a `tracking` list, one entry per backend:
   checkpoint saved before that (step 0, or soon after a resume when `checkpoint.interval` is
   shorter than `metrics.log_interval`) lacks the entry, and the key is omitted when no backend
   is live.
-- Values are recorded as resolved, the tracking URI included: keep credentials out of it
-  (the environment supplies them), and drop the `tracking` key before sharing a checkpoint
-  outside your team.
+- Values are recorded as resolved. Credentials embedded in the tracking URI
+  (`scheme://user:token@host`) are stripped at write time; authentication comes from the
+  environment. The URI, experiment path and run ids remain, so drop the `tracking` key
+  before sharing a checkpoint outside your team.
 - The key is additive. Older checkpoints lack it, nothing on the resume path reads it, and run
   ids still resume from `train_state.pt`.
 
