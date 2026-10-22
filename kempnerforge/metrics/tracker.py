@@ -238,7 +238,9 @@ class MetricsTracker:
                 entry = backend.tracking_entry()
                 snapshot = None if entry is None else _tracking_snapshot(entry)
             except Exception as e:  # a third-party run object; never let it cost a save
-                logger.warning("%s tracking entry skipped (%s)", type(backend).__name__, e)
+                logger.warning(
+                    "%s tracking entry skipped (%s)", type(backend).__name__, _error_text(e)
+                )
                 continue
             if snapshot is not None:
                 entries.append(snapshot)
@@ -393,6 +395,14 @@ _URI_USERINFO = re.compile(r"(?<=://)[^/?#\s]+@")
 
 def _scrub_uris(text: str) -> str:
     return _URI_USERINFO.sub("", text)
+
+
+def _error_text(error: BaseException) -> str:
+    """``error``'s message with URI credentials removed; never raises."""
+    try:
+        return _scrub_uris(str(error))
+    except Exception:
+        return f"<unprintable {type(error).__name__}>"
 
 
 class _RateLimitedWarning:

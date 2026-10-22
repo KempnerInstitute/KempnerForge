@@ -884,6 +884,9 @@ class TestMlflowDatabricksAuth:
         warn = tracker_mod._RateLimitedWarning(300.0)
         warn("log_metrics failed (https://u:p@h/x); points may be lost")
         assert warnings_seen == ["log_metrics failed (https://h/x); points may be lost"]
+        plain = "log_metrics failed (https://host?x=a@b#c@d)"
+        tracker_mod._RateLimitedWarning(300.0)(plain)  # a fresh limiter always shows its first
+        assert warnings_seen[-1] == plain
 
     def test_rejected_credentials_disable_with_the_auth_routes_named(self, monkeypatch):
         fm = _FakeMlflow()
@@ -1800,6 +1803,14 @@ class TestTrackingEntries:
         kept = {"backend": "kept"}
         tracker._backends = [_EntryBackend(error=Unprintable()), _EntryBackend(kept)]
         assert tracker.tracking_entries() == [kept]
+
+    def test_tracker_scrubs_credentials_from_a_backends_error(self, monkeypatch):
+        seen = _capture_formatted_warnings(monkeypatch)
+        tracker = self._tracker()
+        error = RuntimeError("no answer from https://u:tok@host/api")
+        tracker._backends = [_EntryBackend(error=error)]
+        assert tracker.tracking_entries() == []
+        assert len(seen) == 1 and "u:tok@" not in seen[0] and "https://host/api" in seen[0]
 
     @pytest.mark.parametrize(
         "bad",
