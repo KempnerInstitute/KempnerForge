@@ -1429,6 +1429,9 @@ docs = [
     { name = "sphinx-autodoc-typehints" },
     { name = "sphinx-copybutton" },
 ]
+eval = [
+    { name = "pandas" },
+]
 mlflow = [
     { name = "databricks-sdk" },
     { name = "mlflow-skinny" },
@@ -1472,6 +1475,7 @@ docs = [
     { name = "sphinx-autodoc-typehints", specifier = ">=2.0" },
     { name = "sphinx-copybutton", specifier = ">=0.5" },
 ]
+eval = [{ name = "pandas" }]
 mlflow = [
     { name = "databricks-sdk", specifier = ">=0.20" },
     { name = "mlflow-skinny", specifier = ">=3.1" },
