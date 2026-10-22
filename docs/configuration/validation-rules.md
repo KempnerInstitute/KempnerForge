@@ -152,6 +152,7 @@ File:
 [`kempnerforge/config/metrics.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/config/metrics.py).
 
 - `log_interval > 0`.
+- `mlflow_register_checkpoints` requires `enable_mlflow`.
 
 ### `ProfilingConfig`
 

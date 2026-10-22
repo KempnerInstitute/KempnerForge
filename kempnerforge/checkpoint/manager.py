@@ -53,6 +53,8 @@ _NEVER_STEPPED_PREFIX = f"{_NEVER_STEPPED_KEY}."
 _OPTIM_PREFIX = "optimizer."
 # Reports the logging runs live at save time, one JSON-ready record each, for metadata.json.
 TrackingSource = Callable[[], list[dict[str, str]]]
+# Registers a saved step with the logging backends: the fields each adds to its record, by backend.
+CheckpointRegistrar = Callable[[int, Path], dict[str, dict[str, str]]]
 
 
 def _saved_optimizer_param_groups(saved_keys: Iterable[str]) -> int:
@@ -296,8 +298,9 @@ class CheckpointManager:
         # the flush completes (drained at the next save() or wait()), so
         # `latest` never points at a half-written checkpoint. (step, ckpt_dir).
         self._pending_finalize: tuple[int, Path] | None = None
-        # Late-bound because the tracker is built after the manager; see set_tracking_source().
+        # Late-bound because the tracker is built after the manager; see the set_* methods.
         self._tracking_source: TrackingSource | None = None
+        self._registrar: CheckpointRegistrar | None = None
         # Dedicated gloo group for the manager's own synchronization
         # (the end-of-save barrier). dcp.async_save() runs its collective
         # planning (all_gather/reduce_scatter) on a background thread using
@@ -381,7 +384,44 @@ class CheckpointManager:
             )
         self._tracking_source = source
 
-    def _sidecar_text(self, meta: dict[str, Any]) -> str:
+    def set_checkpoint_registrar(self, registrar: CheckpointRegistrar | None) -> None:
+        """Record every later saved step with the logging backends through ``registrar``.
+
+        It is called on rank 0 only, inside ``save()``, with the step and its directory, and only
+        when a backend has a live run. The fields it returns, keyed by backend name, are merged
+        into that save's ``tracking`` records, so it may wait on a server but must bound the wait.
+        One that raises, or returns what a record cannot hold, costs only those fields. ``None``
+        detaches it.
+        """
+        if registrar is not None and not callable(registrar):
+            raise TypeError(
+                f"checkpoint registrar must be callable or None, got {type(registrar).__name__}"
+            )
+        self._registrar = registrar
+
+    def _registered(
+        self, tracking: list[dict[str, str]], step: int, ckpt_dir: Path
+    ) -> list[dict[str, str]]:
+        """``tracking`` plus the fields each backend adds for this checkpoint; as given if none."""
+        if self._registrar is None:
+            return tracking
+        try:
+            added = self._registrar(step, ckpt_dir)
+            if not isinstance(added, dict):
+                raise TypeError(f"expected a dict of fields by backend, got {type(added).__name__}")
+            merged = [{**entry, **added.get(entry["backend"], {})} for entry in tracking]
+            if not all(
+                isinstance(key, str) and isinstance(value, str)
+                for entry in merged
+                for key, value in entry.items()
+            ):
+                raise TypeError("fields must be strings")
+        except Exception as e:  # a bad registrar costs this save's fields, never the save
+            logger.warning("Could not register %s with the tracking backends: %s", ckpt_dir.name, e)
+            return tracking
+        return merged
+
+    def _sidecar_text(self, meta: dict[str, Any], ckpt_dir: Path) -> str:
         """``meta`` as JSON, plus the live tracking runs when the source can supply them.
 
         Everything that depends on the source sits inside one guard: it runs on rank 0 alone,
@@ -393,6 +433,7 @@ class CheckpointManager:
                 if tracking:
                     if not _names_backends(tracking):
                         raise TypeError("expected a list of mappings that each name a backend")
+                    tracking = self._registered(tracking, meta["step"], ckpt_dir)
                     return json.dumps({**meta, "tracking": tracking}, indent=2)
             except Exception as e:
                 logger.warning("Could not record the tracking runs in %s: %s", _METADATA_FILE, e)
@@ -471,7 +512,7 @@ class CheckpointManager:
                 # a sorted, deduplicated list of {"module", "frozen"} dicts so
                 # the comparison on load is reorder-invariant.
                 meta["vlm_freeze"] = extra["vlm_freeze"]
-            (ckpt_dir / _METADATA_FILE).write_text(self._sidecar_text(meta))
+            (ckpt_dir / _METADATA_FILE).write_text(self._sidecar_text(meta, ckpt_dir))
 
         if sync_mode:
             # DCP shards are already durable — commit immediately.

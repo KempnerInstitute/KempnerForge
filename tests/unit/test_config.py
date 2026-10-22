@@ -488,6 +488,22 @@ class TestMetricsConfig:
         with pytest.raises(ValueError, match="log_interval must be positive"):
             MetricsConfig(log_interval=-1)
 
+    def test_checkpoint_registration_is_off_by_default_and_set_from_toml_or_cli(self, tmp_path):
+        assert MetricsConfig().mlflow_register_checkpoints is False
+        assert load_config(None, cli_args=[]).metrics.mlflow_register_checkpoints is False
+        toml = tmp_path / "job.toml"
+        toml.write_text("[metrics]\nenable_mlflow = true\nmlflow_register_checkpoints = true\n")
+        assert load_config(str(toml), cli_args=[]).metrics.mlflow_register_checkpoints is True
+        args = ["--metrics.mlflow_register_checkpoints=false"]
+        assert load_config(str(toml), cli_args=args).metrics.mlflow_register_checkpoints is False
+
+    def test_checkpoint_registration_needs_the_mlflow_backend(self):
+        with pytest.raises(ValueError, match="mlflow_register_checkpoints requires enable_mlflow"):
+            MetricsConfig(mlflow_register_checkpoints=True)
+        with pytest.raises(ValueError, match="mlflow_register_checkpoints requires enable_mlflow"):
+            load_config(None, cli_args=["--metrics.mlflow_register_checkpoints=true"])
+        MetricsConfig(enable_mlflow=True, mlflow_register_checkpoints=True)
+
 
 # ---------------------------------------------------------------------------
 # ProfilingConfig

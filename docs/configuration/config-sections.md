@@ -319,6 +319,7 @@ Logging cadence and backend toggles.
 | `mlflow_run_id` | `str` | `""` | restored from checkpoint on resume; empty = new run |
 | `mlflow_log_system_metrics` | `bool` | `True` | sample CPU/GPU/memory on a background thread |
 | `mlflow_system_metrics_interval` | `float` | `10.0` | seconds between system-metric samples |
+| `mlflow_register_checkpoints` | `bool` | `False` | register each checkpoint save as an MLflow external model and record its `model_id` in `metadata.json`; requires `enable_mlflow` |
 
 ## `[profiling]` — `ProfilingConfig`
 
