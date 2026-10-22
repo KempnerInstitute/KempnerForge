@@ -2129,6 +2129,21 @@ class TestCheckpointRegistration:
         del fm.create_external_model  # the server recovers
         assert backend.register_checkpoint(7, tmp_path / "step_7") == {"model_id": "m-1"}
 
+    def test_the_warning_does_not_repeat_credentials_a_server_error_quotes(
+        self, monkeypatch, tmp_path
+    ):
+        fm = _FakeRegistry()
+
+        def refuse(**kwargs):
+            raise RuntimeError("POST http://user:token@mlflow.example:5000/api failed")
+
+        fm.create_external_model = refuse
+        warnings_seen = _capture_warnings(monkeypatch)
+        backend, _ = _registering_backend(monkeypatch, fm)
+        assert backend.register_checkpoint(5, tmp_path / "step_5") is None
+        assert "POST http://mlflow.example:5000/api failed" in warnings_seen[0]
+        assert "token" not in warnings_seen[0]
+
     @pytest.mark.parametrize("model_id", ["", "  ", None])
     def test_a_blank_model_id_is_never_recorded(self, monkeypatch, tmp_path, model_id):
         fm = _FakeRegistry()

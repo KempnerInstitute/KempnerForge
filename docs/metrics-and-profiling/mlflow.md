@@ -130,12 +130,13 @@ The model id goes into that save's `metadata.json`, in the `mlflow` entry of `tr
 ```
 
 Registration is best effort and never fails a save. `save()` waits for it on rank 0 for at most
-30 seconds, while the other ranks wait at the save barrier. A server error or a timeout leaves
-that save's entry without `model_id` and logs a rate-limited warning, and while a timed-out call
-is still running, later saves skip registering. A step saved twice (an emergency save, or a
-resumed run re-running it) keeps the model it already has, and a resume registers nothing by
-itself. A save before the run's first log has no live run and registers nothing. MLflow itself
-logs two harmless "Failed to infer schema" warnings for each external model it creates.
+15 seconds, a preemption save included, while the other ranks wait at the save barrier. A server
+error or a timeout leaves that save's entry without `model_id` and logs a rate-limited warning,
+and while a timed-out call is still running, later saves skip registering. A step saved twice (an
+emergency save, or a resumed run re-running it) keeps the model it already has, and a resume
+registers nothing by itself. A save before the run's first log has no live run and registers
+nothing. MLflow itself logs two harmless "Failed to infer schema" warnings for each external model
+it creates.
 
 ## What gets logged
 

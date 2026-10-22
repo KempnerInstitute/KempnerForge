@@ -380,7 +380,7 @@ _CALL_DEADLINE_S = 60.0  # one metric / param / tag call
 _UPLOAD_DEADLINE_S = 180.0  # one artifact upload
 _INIT_DEADLINE_S = 60.0  # experiment setup plus run start or resume, on the first log
 _END_DEADLINE_S = 60.0  # ending the run in close(), after the drain
-_REGISTER_DEADLINE_S = 30.0  # registering one checkpoint, awaited inside save()
+_REGISTER_DEADLINE_S = 15.0  # registering one checkpoint, awaited inside save()
 _DRAIN_DEADLINE_S = 30.0  # close() flush budget
 _QUEUE_MAX = 256  # pending calls before new ones are dropped
 _MAX_CALL_THREADS = 4  # live call threads, abandoned ones included, before new calls are dropped
@@ -960,8 +960,9 @@ class MLflowBackend(_LoggingBackend):
         try:
             return {"model_id": self._register(step, directory)}
         except Exception as e:  # a tracking server problem must never cost a save
+            reason = _URI_USERINFO.sub("", str(e))  # MLflow errors quote the tracking URI
             self._warn_register(
-                f"MLflow checkpoint registration did not complete at step {step} ({e}); "
+                f"MLflow checkpoint registration did not complete at step {step} ({reason}); "
                 "its tracking entry has no model_id"
             )
             return None
