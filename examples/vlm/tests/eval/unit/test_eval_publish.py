@@ -557,7 +557,8 @@ class TestPublishResults:
     ):
         (tmp_path / "tmp").mkdir()
         monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "tmp"))
-        output = tmp_path / ("a" * 300 + ".json")  # no file system takes a 300-byte name
+        limit = os.pathconf(tmp_path, "PC_NAME_MAX")
+        output = tmp_path / ("a" * limit + ".json")  # the scores name outgrows the limit
 
         assert publish_results(_checkpoint(tmp_path), _results(), str(output))
 
