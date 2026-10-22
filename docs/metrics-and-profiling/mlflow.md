@@ -32,7 +32,7 @@ by one of three routes:
 | Route | You provide | Used when |
 |-------|-------------|-----------|
 | Environment | `DATABRICKS_HOST` and `DATABRICKS_TOKEN` (a personal access token) | both are set; they win over a profile |
-| Profile | a `[<profile>]` section with `host` and `token` in `~/.databrickscfg` | the tracking URI is `databricks://<profile>`, or `$DATABRICKS_CONFIG_PROFILE` names it; otherwise the SDK's default profile, `[DEFAULT]` |
+| Profile | a `[<profile>]` section with `host` and `token` in `~/.databrickscfg` | the tracking URI is `databricks://<profile>`, or `$DATABRICKS_CONFIG_PROFILE` names it; otherwise the SDK's default profile (the `default_profile` of a `[__settings__]` section when the file has one, else `[DEFAULT]`) |
 | SDK OAuth | a service principal (`DATABRICKS_HOST`, `DATABRICKS_CLIENT_ID`, `DATABRICKS_CLIENT_SECRET`), or a user login from the Databricks CLI (`databricks auth login`, with the CLI on `PATH` where the job runs) | no token is configured and OAuth is |
 
 ```bash
@@ -51,6 +51,14 @@ token = <personal-access-token>
 The file holds tokens, so run `chmod 600 ~/.databrickscfg`. Select a profile with
 `mlflow_tracking_uri = "databricks://<profile>"` (or the same value in `$MLFLOW_TRACKING_URI`),
 or with `export DATABRICKS_CONFIG_PROFILE=<profile>`.
+
+**Pin token auth on compute nodes.** With the environment or profile route, add
+`export DATABRICKS_AUTH_TYPE=pat` to the job script. It tells the SDK to use token auth only
+and skip every other method it would otherwise try. On clusters whose compute nodes drop
+link-local metadata traffic, the default chain can stall on probes that never answer: every
+fresh client then waits about a minute, and the bounded init gives up with `no answer from the
+tracking server within 60s`. Pinning avoids the wait. Leave it unset for the OAuth route, or pin
+that route's own type (`oauth-m2m` for a service principal, `databricks-cli` for a CLI login).
 
 The SDK reads environment variables first and uses a profile only to fill in what they leave
 unset, so an exported `DATABRICKS_TOKEN` overrides the profile's token. `databricks://<profile>`
@@ -72,9 +80,11 @@ passes on the environment pair (`DATABRICKS_HOST` and a token under either name)
 profile section found in `~/.databrickscfg` (the profile named by a `databricks://<profile>`
 `$MLFLOW_TRACKING_URI`, else `$DATABRICKS_CONFIG_PROFILE`, else `DEFAULT`). With neither it
 warns without failing, naming the three routes, because it cannot verify OAuth offline. It
-reads only section names from the profile file, never the tokens, and it looks at the
-environment, not at `mlflow_tracking_uri` in a config. Add `--check-credentials` to also call
-the workspace through the SDK.
+reads only section names from the profile file, never the tokens, so it cannot see a
+`[__settings__]` default: name the profile if you rely on one. It looks at the environment,
+not at `mlflow_tracking_uri` in a config. Add `--check-credentials` to also call the workspace
+through the SDK; a failure is reported with its exception text, except for a malformed profile
+file, where only the exception class is shown because the parser quotes the offending line.
 
 Credentials are not pre-checked. Init, on the first `log()`, attempts the connection, and if it
 fails the backend logs a warning, naming the auth routes when the failure may be a credentials
@@ -109,10 +119,12 @@ explicit path.
 
 Compute nodes can reach less of the network than a login node, so check the tracking server from
 one before a long run. This calls it with the same client the backend uses, for any route and
-any URI; run it on the partition the training job will use, with `$MLFLOW_TRACKING_URI`
-exported if your config sets `mlflow_tracking_uri`:
+any URI. Run it on the partition the training job will use, with the exports the job script
+has (the auth pin above, and `$MLFLOW_TRACKING_URI` if your config sets `mlflow_tracking_uri`),
+so it tests what the job will run:
 
 ```bash
+export DATABRICKS_AUTH_TYPE=pat    # as in the job script; leave out for OAuth
 srun -p <partition> -N 1 -n 1 -t 00:05:00 uv run --group mlflow python -c \
   'import os, mlflow; print(mlflow.MlflowClient(os.environ.get("MLFLOW_TRACKING_URI") or "databricks").search_experiments(max_results=1))'
 ```
@@ -129,8 +141,8 @@ and the token alias above), imports `mlflow`, and starts the run on one dedicate
 waiting at most 60 s. On that thread it sets the tracking URI, resolves and sets the
 experiment, sets the system-metrics sampling interval, starts the run (or resumes
 `mlflow_run_id`), and, when resuming, reads the last step already logged. The same thread ends
-the run in `close()`, because mlflow keeps the active run, and its system-metrics monitor, per
-thread.
+the run in `close()`: mlflow keeps the active run per thread, and `end_run()` only ends, and
+stops the system-metrics monitor of, the run active on the calling thread.
 
 If the start does not answer in time, the backend disables itself with a warning, and a start
 that returns late is ended at once. Same two reasons as WandB for laziness: distributed setup
@@ -167,9 +179,10 @@ if ckpt_extra_loaded.get("mlflow_run_id"):
 Slurm restarts. If that run id no longer exists (e.g. it was deleted), the backend falls back to
 a fresh run instead of erroring, matching wandb's `resume="allow"`; any other error (a network
 or server problem) disables the backend rather than fork a new run. On resume it also skips
-re-logging any step the run already recorded, so re-executing the steps between the last
-checkpoint and the crash does not duplicate metric points, and it does not write the params and
-tags again.
+re-logging the steps the run already holds: every metric at or below the highest `train/loss`
+step in the run's history is dropped, so re-executing the steps between the last checkpoint and
+the crash does not duplicate points. If that history cannot be read, nothing is skipped. The
+params and tags are not written again.
 
 ## Finding a checkpoint's run
 
@@ -315,11 +328,16 @@ Every server call has a deadline.
 At most 256 calls wait in the queue (a new call is dropped when it is full), and at most 4
 call threads are alive at once, abandoned ones included (calls are dropped until one returns).
 Warnings about failed or abandoned calls, about dropped calls, and about registration are each
-rate limited to one per five minutes, with a count of what they held back. MLflow's own HTTP
-layer is bounded too: requests default to a 30 s timeout with 3 retries, and Databricks SDK
-requests to a 60 s retry budget (`MLFLOW_HTTP_REQUEST_TIMEOUT`,
-`MLFLOW_HTTP_REQUEST_MAX_RETRIES` and `MLFLOW_DATABRICKS_ENDPOINT_HTTP_RETRY_TIMEOUT`; a value
-already in the environment wins).
+rate limited to one per five minutes, with a count of what they held back.
+
+MLflow's own HTTP layer is bounded too, by defaults the training backend sets when it imports
+`mlflow` (a value already in the environment wins): requests time out after 30 s and retry 3
+times (`MLFLOW_HTTP_REQUEST_TIMEOUT`, `MLFLOW_HTTP_REQUEST_MAX_RETRIES`), and MLflow's
+Databricks SDK transport retries for at most 60 s
+(`MLFLOW_DATABRICKS_ENDPOINT_HTTP_RETRY_TIMEOUT`). A `WorkspaceClient` the backend builds
+itself, to resolve an automatic experiment path, keeps the SDK's own 300 s retry default, so
+only the 60 s init deadline bounds it. Other MLflow clients, the publisher and the connectivity
+check included, run with MLflow's own defaults.
 
 ## Failure modes
 
@@ -328,7 +346,8 @@ already in the environment wins).
 - `mlflow` is not installed: the warning says `uv sync --group mlflow`.
 - A deliberate config error: `$MLFLOW_EXPERIMENT` is not absolute on Databricks, or no experiment
   path could be resolved. The warning reads `MLflow disabled: <reason>`.
-- Anything else (network, auth, a start that outlasts its 60 s):
+- Anything else (network, auth, a start that outlasts its 60 s, which on compute nodes can be
+  the credential-chain stall that [pinning the auth type](#authentication) avoids):
   `MLflow init failed: <error>`, followed on Databricks by the auth routes when the failure may
   be a credentials one.
 

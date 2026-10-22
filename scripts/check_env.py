@@ -19,6 +19,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import configparser
 import json
 import os
 import re
@@ -350,7 +351,10 @@ def _databricks_profile() -> str:
 
     A databricks://<profile> $MLFLOW_TRACKING_URI, then $DATABRICKS_CONFIG_PROFILE, then DEFAULT.
     """
-    uri = urlparse(os.environ.get("MLFLOW_TRACKING_URI", ""))
+    try:
+        uri = urlparse(os.environ.get("MLFLOW_TRACKING_URI", ""))
+    except ValueError:  # an unbalanced "[" is rejected by urlparse; such a URI names no profile
+        uri = urlparse("")
     # databricks://scope:prefix names a secret scope, and userinfo is never a profile
     if uri.scheme == "databricks" and uri.netloc and not {":", "@"} & set(uri.netloc):
         return uri.netloc
@@ -406,7 +410,9 @@ def check_mlflow(check_credentials: bool = False) -> CheckResult:
             client = WorkspaceClient(profile=profile) if profile else WorkspaceClient()
             user = client.current_user.me().user_name
         except Exception as e:
-            return CheckResult("mlflow", WARN, f"{found} but SDK probe failed: {e}")
+            # configparser errors quote the offending profile line, which can be a token
+            detail = type(e).__name__ if isinstance(e, configparser.Error) else e
+            return CheckResult("mlflow", WARN, f"{found} but SDK probe failed: {detail}")
         return CheckResult("mlflow", OK, f"Databricks reachable, user={user}")
     return CheckResult("mlflow", OK, f"{found} (not validated)")
 

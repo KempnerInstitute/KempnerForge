@@ -437,11 +437,23 @@ class TestCheckMlflow:
         assert "unreadable" in r.message
 
     @pytest.mark.parametrize(
-        "uri", ["", "databricks", "databricks://scope:prefix", "databricks://id@host", "http://h:1"]
+        "uri",
+        [
+            "",
+            "databricks",
+            "databricks://scope:prefix",
+            "databricks://id@host",
+            "http://h:1",
+            "databricks://[",  # urlparse rejects an unbalanced bracket
+        ],
     )
     def test_uri_naming_no_profile_falls_back_to_default(self, monkeypatch, uri):
         monkeypatch.setenv("MLFLOW_TRACKING_URI", uri)
         assert check_env._databricks_profile() == "DEFAULT"
+
+    def test_malformed_tracking_uri_does_not_crash_the_preflight(self, monkeypatch):
+        monkeypatch.setenv("MLFLOW_TRACKING_URI", "databricks://[")
+        assert check_env.check_mlflow().status == check_env.WARN
 
     def test_values_are_never_printed(self, home, monkeypatch):
         cfg = home / ".databrickscfg"
@@ -509,6 +521,22 @@ class TestCheckMlflow:
         r = check_env.check_mlflow(check_credentials=True)
         assert r.status == check_env.WARN
         assert "profile DEFAULT" in r.message and "401 unauthorized" in r.message
+
+    def test_failed_probe_never_quotes_a_profile_line(self, home, monkeypatch):
+        """A malformed profile makes configparser quote the offending line, which can be a token."""
+        import configparser
+
+        (home / ".databrickscfg").write_text("[DEFAULT]\nhost = h\ntoken secret-value\n")
+
+        class _Quoting:
+            def __init__(self, **kwargs):
+                raise configparser.MissingSectionHeaderError("profile", 3, "token secret-value")
+
+        self._fake_sdk(monkeypatch, _Quoting)
+        r = check_env.check_mlflow(check_credentials=True)
+        assert r.status == check_env.WARN
+        assert "MissingSectionHeaderError" in r.message
+        assert "secret-value" not in json.dumps(r.to_dict()) + check_env.format_text([r])
 
     def test_check_credentials_does_not_probe_when_nothing_is_found(self, monkeypatch):
         seen: list[dict] = []
