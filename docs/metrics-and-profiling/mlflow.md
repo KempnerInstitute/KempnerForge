@@ -53,12 +53,13 @@ The file holds tokens, so run `chmod 600 ~/.databrickscfg`. Select a profile wit
 or with `export DATABRICKS_CONFIG_PROFILE=<profile>`.
 
 **Pin token auth on compute nodes.** With the environment or profile route, add
-`export DATABRICKS_AUTH_TYPE=pat` to the job script. It tells the SDK to use token auth only
-and skip every other method it would otherwise try. On clusters whose compute nodes drop
-link-local metadata traffic, the default chain can stall on probes that never answer: every
-fresh client then waits about a minute, and the bounded init gives up with `no answer from the
-tracking server within 60s`. Pinning avoids the wait. Leave it unset for the OAuth route, or pin
-that route's own type (`oauth-m2m` for a service principal, `databricks-cli` for a CLI login).
+`export DATABRICKS_AUTH_TYPE=pat` to the job script. It makes the SDK use token auth only and
+skip every other method. On a cluster whose compute nodes drop link-local metadata traffic, a
+fresh client was measured at about a minute without the pin, long enough for the bounded init
+to give up with `no answer from the tracking server within 60s`, and a few seconds with it. The
+cause was not traced to a specific SDK step, and the pin costs nothing where there is no stall.
+Leave it unset for the OAuth route, or pin that route's own type (`oauth-m2m` for a service
+principal, `databricks-cli` for a CLI login).
 
 The SDK reads environment variables first and uses a profile only to fill in what they leave
 unset, so an exported `DATABRICKS_TOKEN` overrides the profile's token. `databricks://<profile>`
@@ -83,8 +84,9 @@ warns without failing, naming the three routes, because it cannot verify OAuth o
 reads only section names from the profile file, never the tokens, so it cannot see a
 `[__settings__]` default: name the profile if you rely on one. It looks at the environment,
 not at `mlflow_tracking_uri` in a config. Add `--check-credentials` to also call the workspace
-through the SDK; a failure is reported with its exception text, except for a malformed profile
-file, where only the exception class is shown because the parser quotes the offending line.
+through the SDK. A failure is reported by exception class only, because the text can quote a
+token (a malformed profile line, a token with a stray newline); the connectivity check below
+prints the full error.
 
 Credentials are not pre-checked. Init, on the first `log()`, attempts the connection, and if it
 fails the backend logs a warning, naming the auth routes when the failure may be a credentials
@@ -346,10 +348,9 @@ check included, run with MLflow's own defaults.
 - `mlflow` is not installed: the warning says `uv sync --group mlflow`.
 - A deliberate config error: `$MLFLOW_EXPERIMENT` is not absolute on Databricks, or no experiment
   path could be resolved. The warning reads `MLflow disabled: <reason>`.
-- Anything else (network, auth, a start that outlasts its 60 s, which on compute nodes can be
-  the credential-chain stall that [pinning the auth type](#authentication) avoids):
-  `MLflow init failed: <error>`, followed on Databricks by the auth routes when the failure may
-  be a credentials one.
+- Anything else (network, auth, a start that outlasts its 60 s, which on compute nodes
+  [pinning the auth type](#authentication) can avoid): `MLflow init failed: <error>`, followed
+  on Databricks by the auth routes when the failure may be a credentials one.
 
 Warnings that quote an error strip `user:token@` from any URI first, since MLflow and SDK
 errors can quote a credentialed tracking URI.

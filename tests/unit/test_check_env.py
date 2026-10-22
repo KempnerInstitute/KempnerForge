@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import configparser
 import json
 import sys
 from pathlib import Path
@@ -510,7 +511,7 @@ class TestCheckMlflow:
         assert check_env.check_mlflow(check_credentials=True).status == check_env.OK
         assert seen == [{}]
 
-    def test_failed_probe_is_a_warn_naming_the_route(self, home, monkeypatch):
+    def test_failed_probe_is_a_warn_naming_the_route_and_error_class(self, home, monkeypatch):
         (home / ".databrickscfg").write_text("[DEFAULT]\nhost = h\n")
 
         class _Failing:
@@ -520,22 +521,35 @@ class TestCheckMlflow:
         self._fake_sdk(monkeypatch, _Failing)
         r = check_env.check_mlflow(check_credentials=True)
         assert r.status == check_env.WARN
-        assert "profile DEFAULT" in r.message and "401 unauthorized" in r.message
+        assert "profile DEFAULT" in r.message and "RuntimeError" in r.message
+        assert "401 unauthorized" not in r.message
 
-    def test_failed_probe_never_quotes_a_profile_line(self, home, monkeypatch):
-        """A malformed profile makes configparser quote the offending line, which can be a token."""
-        import configparser
+    @pytest.mark.parametrize(
+        "error",
+        [
+            # the parser quotes the offending profile line
+            configparser.MissingSectionHeaderError("profile", 3, "token secret-value"),
+            # request validation quotes the header it built from the token
+            ValueError("Invalid header value b'Bearer secret-value\\ncontinued'"),
+        ],
+        ids=["parser-line", "header-value"],
+    )
+    @pytest.mark.parametrize("route", ["profile", "env"])
+    def test_failed_probe_never_quotes_a_secret(self, home, monkeypatch, route, error):
+        if route == "profile":
+            (home / ".databrickscfg").write_text("[DEFAULT]\nhost = h\ntoken = secret-value\n")
+        else:
+            monkeypatch.setenv("DATABRICKS_HOST", "https://x.cloud.databricks.com")
+            monkeypatch.setenv("DATABRICKS_TOKEN", "secret-value")
 
-        (home / ".databrickscfg").write_text("[DEFAULT]\nhost = h\ntoken secret-value\n")
-
-        class _Quoting:
+        class _Raising:
             def __init__(self, **kwargs):
-                raise configparser.MissingSectionHeaderError("profile", 3, "token secret-value")
+                raise error
 
-        self._fake_sdk(monkeypatch, _Quoting)
+        self._fake_sdk(monkeypatch, _Raising)
         r = check_env.check_mlflow(check_credentials=True)
         assert r.status == check_env.WARN
-        assert "MissingSectionHeaderError" in r.message
+        assert type(error).__name__ in r.message
         assert "secret-value" not in json.dumps(r.to_dict()) + check_env.format_text([r])
 
     def test_check_credentials_does_not_probe_when_nothing_is_found(self, monkeypatch):

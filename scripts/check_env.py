@@ -19,7 +19,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import configparser
 import json
 import os
 import re
@@ -410,9 +409,8 @@ def check_mlflow(check_credentials: bool = False) -> CheckResult:
             client = WorkspaceClient(profile=profile) if profile else WorkspaceClient()
             user = client.current_user.me().user_name
         except Exception as e:
-            # configparser errors quote the offending profile line, which can be a token
-            detail = type(e).__name__ if isinstance(e, configparser.Error) else e
-            return CheckResult("mlflow", WARN, f"{found} but SDK probe failed: {detail}")
+            # the text can quote a token: a malformed profile line, or a header with a stray newline
+            return CheckResult("mlflow", WARN, f"{found} but SDK probe failed ({type(e).__name__})")
         return CheckResult("mlflow", OK, f"Databricks reachable, user={user}")
     return CheckResult("mlflow", OK, f"{found} (not validated)")
 
