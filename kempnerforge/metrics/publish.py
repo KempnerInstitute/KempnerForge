@@ -188,15 +188,17 @@ def _prepare_databricks_auth(tracking_uri: str) -> None:
 
     Artifact clients build their own SDK config from the environment and never see the
     tracking URI, so a ``databricks://<profile>`` URI selects that profile via
-    DATABRICKS_CONFIG_PROFILE (``databricks://`` and the ``databricks://scope:prefix``
-    secret-scope form select nothing), and DATABRICKS_API_TOKEN stands in for an unset
-    DATABRICKS_TOKEN. Operator-set values always win.
+    DATABRICKS_CONFIG_PROFILE (the profile is the first path segment; ``databricks://``
+    and the ``databricks://scope:prefix`` secret-scope form select nothing), and
+    DATABRICKS_API_TOKEN stands in for an unset or empty DATABRICKS_TOKEN. Operator-set
+    values always win.
     """
     if not tracking_uri.startswith("databricks"):
         return
-    rest = tracking_uri.removeprefix("databricks://")
-    if rest != tracking_uri and rest and ":" not in rest:
-        os.environ.setdefault("DATABRICKS_CONFIG_PROFILE", rest)
+    scheme, separator, rest = tracking_uri.partition("://")
+    profile = rest.partition("/")[0]
+    if scheme == "databricks" and separator and profile and ":" not in profile:
+        os.environ.setdefault("DATABRICKS_CONFIG_PROFILE", profile)
     if not os.environ.get("DATABRICKS_TOKEN") and os.environ.get("DATABRICKS_API_TOKEN"):
         os.environ["DATABRICKS_TOKEN"] = os.environ["DATABRICKS_API_TOKEN"]
 
