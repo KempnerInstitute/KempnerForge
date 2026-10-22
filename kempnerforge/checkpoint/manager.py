@@ -298,8 +298,7 @@ class CheckpointManager:
         # the flush completes (drained at the next save() or wait()), so
         # `latest` never points at a half-written checkpoint. (step, ckpt_dir).
         self._pending_finalize: tuple[int, Path] | None = None
-        # Late-bound because the tracker is built after the manager; see set_tracking_source()
-        # and set_checkpoint_registrar().
+        # Late-bound because the tracker is built after the manager; see the set_* methods.
         self._tracking_source: TrackingSource | None = None
         self._registrar: CheckpointRegistrar | None = None
         # Dedicated gloo group for the manager's own synchronization

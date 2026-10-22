@@ -775,10 +775,10 @@ _MODEL_NAME_UNSAFE = str.maketrans(dict.fromkeys("/:.%\"'", "_"))  # MLflow reje
 
 
 def _mlflow_register_checkpoint(mlflow: Any, run_id: str, step: int, directory: str) -> str:
-    """Id of the run's external model for ``step``: one an earlier save made, else a new one.
+    """Id of the run's external model for ``step``: a finished one an earlier save made, else new.
 
     The lookup keeps a step saved twice (an emergency save, a resume re-running it) from getting
-    two models.
+    two models; one a failed attempt left unfinished is not reused.
     """
     info = mlflow.get_run(run_id).info
     name = f"{(info.run_name or run_id).translate(_MODEL_NAME_UNSAFE)}-step_{step}"
@@ -786,7 +786,7 @@ def _mlflow_register_checkpoint(mlflow: Any, run_id: str, step: int, directory: 
         experiment_ids=[info.experiment_id], filter_string=f"name = '{name}'", output_format="list"
     )
     for model in saved:
-        if model.source_run_id == run_id:
+        if model.source_run_id == run_id and model.status == "READY":
             return model.model_id
     return mlflow.create_external_model(
         name=name,

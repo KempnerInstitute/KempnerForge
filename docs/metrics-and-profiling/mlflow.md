@@ -120,7 +120,8 @@ checkpoint save also record an MLflow external logged model, so the run lists it
 
 Nothing is uploaded but the small descriptor MLflow keeps with any external model. The weights
 stay where they were saved, and `checkpoint.keep_last_n` can later delete the directory the
-model points at.
+model points at. With an async checkpoint mode the model is made when the save is dispatched,
+before its shards are durable; `latest` still marks the last complete checkpoint.
 
 The model id goes into that save's `metadata.json`, in the `mlflow` entry of `tracking`
 ([Checkpointing](../checkpointing/index.md)):

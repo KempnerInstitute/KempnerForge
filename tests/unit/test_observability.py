@@ -1970,7 +1970,8 @@ class _FakeRegistry(_FakeMlflow):
             experiment_id=experiment_id,
         )
         self.created.append(fields)
-        model = types.SimpleNamespace(model_id=f"m-{len(self.models) + 1}", **fields)
+        model_id = f"m-{len(self.models) + 1}"
+        model = types.SimpleNamespace(model_id=model_id, status="READY", **fields)
         self.models.append(model)
         return model
 
@@ -2072,9 +2073,9 @@ class TestCheckpointRegistration:
     def test_a_resumed_run_reuses_the_models_of_steps_it_saved_before(self, monkeypatch, tmp_path):
         fm = _FakeRegistry()
 
-        def held(model_id, name, run):
+        def held(model_id, name, run, status="READY"):
             return types.SimpleNamespace(
-                model_id=model_id, name=name, source_run_id=run, experiment_id="7"
+                model_id=model_id, name=name, source_run_id=run, experiment_id="7", status=status
             )
 
         fm.models = [held("m-old", "run-a-step_5", "run-xyz"), held("m-x", "run-a-step_6", "other")]
@@ -2086,6 +2087,22 @@ class TestCheckpointRegistration:
         # another run's model of the same name is not this run's
         assert backend.register_checkpoint(6, tmp_path / "step_6") == {"model_id": "m-3"}
         assert [c["source_run_id"] for c in fm.created] == ["run-xyz"]
+
+    def test_a_model_a_failed_attempt_left_unfinished_is_not_reused(self, monkeypatch, tmp_path):
+        fm = _FakeRegistry()
+        create = fm.create_external_model
+
+        def create_then_fail(**kwargs):
+            create(**kwargs).status = "PENDING"  # persisted, but its descriptor never uploaded
+            raise RuntimeError("descriptor upload refused")
+
+        fm.create_external_model = create_then_fail
+        backend, _ = _registering_backend(monkeypatch, fm)
+        assert backend.register_checkpoint(5, tmp_path / "step_5") is None
+        del fm.create_external_model  # the server recovers
+        assert backend.register_checkpoint(5, tmp_path / "step_5") == {"model_id": "m-2"}
+        assert [m.status for m in fm.models] == ["PENDING", "READY"]
+        assert backend.register_checkpoint(5, tmp_path / "step_5") == {"model_id": "m-2"}
 
     def test_nothing_is_called_unless_the_gate_is_on(self, monkeypatch, tmp_path):
         backend, fm = _init_backend(monkeypatch, _mlflow_cfg(), _FakeRegistry())
