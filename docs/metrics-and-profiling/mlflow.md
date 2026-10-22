@@ -67,13 +67,13 @@ also exports the profile as `DATABRICKS_CONFIG_PROFILE` for the SDK and artifact
 that variable is already set; if you set it yourself, keep it equal to the URI's profile.
 
 ```{warning}
-`DATABRICKS_API_TOKEN` is not a name the SDK reads. The training backend mirrors it into
-`DATABRICKS_TOKEN` when that is unset and the tracking URI is Databricks, and from then on it is
-the environment route: it overrides a profile's token, so a stale export left in `~/.bashrc`
-fails authentication even though the profile itself is fine. Unset stale exports
-(`unset DATABRICKS_API_TOKEN DATABRICKS_TOKEN`) when you authenticate with a profile. Export
-`DATABRICKS_TOKEN` rather than the alias for anything else that talks to the workspace: the
-[publisher](#publishing-eval-results) does not mirror it.
+`DATABRICKS_API_TOKEN` is not a name the SDK reads. The training backend and the
+[publisher](#publishing-eval-results) mirror it into `DATABRICKS_TOKEN` when that is unset and
+the tracking URI is Databricks, and from then on it is the environment route: it overrides a
+profile's token, so a stale export left in `~/.bashrc` fails authentication even though the
+profile itself is fine. Unset stale exports (`unset DATABRICKS_API_TOKEN DATABRICKS_TOKEN`) when
+you authenticate with a profile. Export `DATABRICKS_TOKEN` rather than the alias for any other
+tool that talks to the workspace.
 ```
 
 `uv run python scripts/check_env.py --requires mlflow` reports which route a shell has. It
@@ -283,11 +283,12 @@ experiment, tracking URI, step and model id.
   without MLflow); more than one `mlflow` entry; a field is missing or empty; the metrics are
   malformed; `mlflow` is not installed; or the sidecar has no `model_id` while the process has an
   active MLflow model, which `log_batch` would silently link the metrics to.
-- **Credentials.** It authenticates like any MLflow client, from the
-  [routes above](#authentication), and uses the recorded `tracking_uri` as written, so a
-  `databricks://<profile>` entry selects that profile on the machine that publishes: give the
-  publisher a profile of the same name. Export `DATABRICKS_TOKEN`; the publisher, unlike the
-  training backend, does not mirror `DATABRICKS_API_TOKEN`.
+- **Credentials.** It authenticates from the [routes above](#authentication) exactly as the
+  training backend does: it uses the recorded `tracking_uri` as written, a
+  `databricks://<profile>` entry selects that profile (exported as `DATABRICKS_CONFIG_PROFILE`
+  unless already set, so artifact uploads authenticate too), and `DATABRICKS_API_TOKEN` stands
+  in for an unset `DATABRICKS_TOKEN`. Give the machine that publishes a profile of the same
+  name.
 
 A harness that scores checkpoints can publish through the same functions. Anything beyond
 metrics, such as a summary table or a `scores.json`, goes to the same run through

@@ -81,6 +81,28 @@ is a restart.
 | `NO_COLOR` | [`kempnerforge/metrics/logger.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/metrics/logger.py) | Disables ANSI color codes in logs when set to any truthy value |
 | `RANK` | same | Used to prefix log lines with the current rank |
 
+## Experiment tracking (MLflow / Databricks)
+
+Read by the MLflow backend
+([`kempnerforge/metrics/tracker.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/metrics/tracker.py)),
+the eval publisher
+([`kempnerforge/metrics/publish.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/metrics/publish.py)),
+or the Databricks SDK they call. KempnerForge only fills these when they are unset (or
+empty), so a value you export always wins. Setup and auth routes:
+[MLflow backend](../metrics-and-profiling/mlflow.md).
+
+| Variable | Read by | Purpose |
+|----------|---------|---------|
+| `MLFLOW_TRACKING_URI` | backend | Tracking URI when `metrics.mlflow_tracking_uri` is unset (config, then this, then `databricks`) |
+| `MLFLOW_EXPERIMENT` | backend | Experiment when `metrics.mlflow_experiment` is unset; an absolute workspace path on Databricks |
+| `DATABRICKS_HOST`, `DATABRICKS_TOKEN` | SDK | The environment auth route; override a profile's values |
+| `DATABRICKS_API_TOKEN` | backend, publisher | Alias copied into an unset `DATABRICKS_TOKEN` for a Databricks URI |
+| `DATABRICKS_CONFIG_PROFILE` | SDK | `~/.databrickscfg` profile; set from a `databricks://<profile>` tracking URI by the backend and the publisher |
+| `DATABRICKS_AUTH_TYPE` | SDK | Never set by KempnerForge; `pat` is recommended in job scripts using token or profile auth |
+| `MLFLOW_HTTP_REQUEST_TIMEOUT` | MLflow | Set to `30` by the backend before importing `mlflow` |
+| `MLFLOW_HTTP_REQUEST_MAX_RETRIES` | MLflow | Set to `3` by the backend before importing `mlflow` |
+| `MLFLOW_DATABRICKS_ENDPOINT_HTTP_RETRY_TIMEOUT` | MLflow | Set to `60` by the backend before importing `mlflow` |
+
 ## User-facing launch-script variables
 
 Read only by the SLURM helpers under
@@ -102,6 +124,7 @@ not by any Python module:
 | `srun` (SLURM) | `SLURM_*` (incl. `SLURM_PROCID`, `SLURM_LOCALID`, `SLURM_NTASKS`, `SLURM_JOB_*`) |
 | `scripts/slurm/_run_training.sh` | Exports `RANK`, `LOCAL_RANK`, `WORLD_SIZE`, `MASTER_ADDR`, `MASTER_PORT`, `NCCL_*`, `GLOO_*` before calling the trainer |
 | `init_distributed()` | Fills missing `RANK`/`LOCAL_RANK`/`WORLD_SIZE` from `SLURM_*`, missing `MASTER_ADDR`/`MASTER_PORT`, and all four `NCCL_*`/`GLOO_*` defaults |
+| MLflow backend, eval publisher | `DATABRICKS_CONFIG_PROFILE` (from a `databricks://<profile>` URI) and `DATABRICKS_TOKEN` (from `DATABRICKS_API_TOKEN`) when unset; the backend also fills the three `MLFLOW_*` HTTP defaults above |
 
 ## See also
 

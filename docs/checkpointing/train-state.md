@@ -115,6 +115,9 @@ can be threaded through `extra`:
 extra = {"phase_idx": phases.next_idx} if phases.phases else {}
 if config.metrics.wandb_run_id:
     extra["wandb_run_id"] = config.metrics.wandb_run_id
+if config.metrics.mlflow_run_id:
+    extra["mlflow_run_id"] = config.metrics.mlflow_run_id
+...
 return extra
 
 # training/loop.py::run_training_loop
@@ -131,6 +134,8 @@ the rest as the third tuple element:
 step, tokens_seen, extra = ckpt_mgr.load(path=..., scheduler=scheduler)
 if extra.get("wandb_run_id"):
     config.metrics.wandb_run_id = extra["wandb_run_id"]
+if extra.get("mlflow_run_id"):
+    config.metrics.mlflow_run_id = extra["mlflow_run_id"]
 ```
 
 KempnerForge uses this for:
@@ -139,6 +144,10 @@ KempnerForge uses this for:
   correct data mix without skipping forward).
 - `wandb_run_id` — so resumed runs append to the same W&B run rather
   than starting a new one.
+- `mlflow_run_id`: the same for MLflow; on resume, steps up to the last
+  `train/loss` step the run already holds are not logged again. The
+  checkpoint's `metadata.json` also records the live run as plain JSON,
+  for tools that read it without loading this file.
 
 Custom training workflows can use it for anything
 `torch.save`-serializable.
@@ -165,3 +174,5 @@ generator in there.
   why the current train.py doesn't pass the dataloader.
 - [Metrics § WandB resume](../metrics-and-profiling/index.md) — how
   `wandb_run_id` in `extra` enables resumed W&B runs.
+- [MLflow backend](../metrics-and-profiling/mlflow.md): how
+  `mlflow_run_id` resumes the same MLflow run.
