@@ -1801,6 +1801,14 @@ class TestTrackingEntries:
         tracker._backends = [_EntryBackend(error=Unprintable()), _EntryBackend(kept)]
         assert tracker.tracking_entries() == [kept]
 
+    def test_tracker_scrubs_credentials_from_a_backends_error(self, monkeypatch):
+        seen = _capture_formatted_warnings(monkeypatch)
+        tracker = self._tracker()
+        error = RuntimeError("no answer from https://u:tok@host/api")
+        tracker._backends = [_EntryBackend(error=error)]
+        assert tracker.tracking_entries() == []
+        assert len(seen) == 1 and "u:tok@" not in seen[0] and "https://host/api" in seen[0]
+
     @pytest.mark.parametrize(
         "bad",
         [
