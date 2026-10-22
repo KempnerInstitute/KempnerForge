@@ -68,8 +68,8 @@ that variable is already set; if you set it yourself, keep it equal to the URI's
 
 ```{warning}
 `DATABRICKS_API_TOKEN` is not a name the SDK reads. The training backend and the
-[publisher](#publishing-eval-results) mirror it into `DATABRICKS_TOKEN` when that is unset and
-the tracking URI is Databricks, and from then on it is the environment route: it overrides a
+[publisher](#publishing-eval-results) mirror it into `DATABRICKS_TOKEN` when that is unset or
+empty and the tracking URI is Databricks, and from then on it is the environment route: it overrides a
 profile's token, so a stale export left in `~/.bashrc` fails authentication even though the
 profile itself is fine. Unset stale exports (`unset DATABRICKS_API_TOKEN DATABRICKS_TOKEN`) when
 you authenticate with a profile. Export `DATABRICKS_TOKEN` rather than the alias for any other
@@ -289,8 +289,8 @@ environment, as described under credentials below.
   `databricks://<profile>` entry selects that profile (exported as `DATABRICKS_CONFIG_PROFILE`
   unless already set, so artifact uploads a harness makes later in the same process
   authenticate too), and `DATABRICKS_API_TOKEN` stands in for an unset or empty
-  `DATABRICKS_TOKEN`. Credentials embedded in a tracking URI are stripped before the sidecar is
-  written, so that route does not carry over. Give the machine that publishes a profile of the
+  `DATABRICKS_TOKEN`. `user:token@` credentials in a tracking URI are stripped before the
+  sidecar is written, so that route does not carry over. Give the machine that publishes a profile of the
   same name.
 
 A harness that scores checkpoints can publish through the same functions. Anything beyond

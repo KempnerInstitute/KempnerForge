@@ -91,7 +91,8 @@ the eval publisher
 ([`kempnerforge/metrics/publish.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/metrics/publish.py)),
 MLflow itself, or the Databricks SDK. KempnerForge only fills these when they are unset (the
 token alias also fills an empty `DATABRICKS_TOKEN`), so a non-empty value you export always
-wins. Setup and auth routes: [MLflow backend](../metrics-and-profiling/mlflow.md).
+wins. `scripts/check_env.py` reads the auth variables too, to report which route a shell has.
+Setup and auth routes: [MLflow backend](../metrics-and-profiling/mlflow.md).
 
 | Variable | Read by | Purpose |
 |----------|---------|---------|
@@ -126,7 +127,7 @@ not by any Python module:
 | `srun` (SLURM) | `SLURM_*` (incl. `SLURM_PROCID`, `SLURM_LOCALID`, `SLURM_NTASKS`, `SLURM_JOB_*`) |
 | `scripts/slurm/_run_training.sh` | Exports `RANK`, `LOCAL_RANK`, `WORLD_SIZE`, `MASTER_ADDR`, `MASTER_PORT`, `NCCL_*`, `GLOO_*` before calling the trainer |
 | `init_distributed()` | Fills missing `RANK`/`LOCAL_RANK`/`WORLD_SIZE` from `SLURM_*`, missing `MASTER_ADDR`/`MASTER_PORT`, and all four `NCCL_*`/`GLOO_*` defaults |
-| MLflow backend, eval publisher | `DATABRICKS_CONFIG_PROFILE` (from a `databricks://<profile>` URI) and `DATABRICKS_TOKEN` (from `DATABRICKS_API_TOKEN`) when unset; the backend also fills the three `MLFLOW_*` HTTP defaults above |
+| MLflow backend, eval publisher | `DATABRICKS_CONFIG_PROFILE` (from a `databricks://<profile>` URI) when unset and `DATABRICKS_TOKEN` (from `DATABRICKS_API_TOKEN`) when unset or empty; the backend also fills the three `MLFLOW_*` HTTP defaults above |
 
 ## See also
 
