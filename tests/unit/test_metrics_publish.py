@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import runpy
 import sys
 import threading
@@ -185,6 +186,29 @@ class TestReadMlflowTarget:
     def test_null_model_id_means_no_model(self, tmp_path):
         ckpt = _sidecar(tmp_path, tracking=[_entry(model_id=None)])
         assert read_mlflow_target(ckpt).model_id is None
+
+    def test_profile_uri_selects_the_profile_for_artifact_clients(self, tmp_path, monkeypatch):
+        """Artifact clients read only the environment, so the profile in a
+        databricks://<profile> URI must land in DATABRICKS_CONFIG_PROFILE."""
+        monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+        ckpt = _sidecar(tmp_path, tracking=[_entry(tracking_uri="databricks://prof-a")])
+        read_mlflow_target(ckpt)
+        assert os.environ["DATABRICKS_CONFIG_PROFILE"] == "prof-a"
+
+    def test_profile_export_never_overrides_the_operator(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", "operator")
+        ckpt = _sidecar(tmp_path, tracking=[_entry(tracking_uri="databricks://prof-a")])
+        read_mlflow_target(ckpt)
+        assert os.environ["DATABRICKS_CONFIG_PROFILE"] == "operator"
+
+    @pytest.mark.parametrize(
+        "uri", ["databricks://", "databricks://scope:prefix", "http://host:5000/api"]
+    )
+    def test_non_profile_uris_select_nothing(self, tmp_path, monkeypatch, uri):
+        monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+        ckpt = _sidecar(tmp_path, tracking=[_entry(tracking_uri=uri)])
+        read_mlflow_target(ckpt)
+        assert "DATABRICKS_CONFIG_PROFILE" not in os.environ
 
     def test_sidecar_filename_matches_the_checkpoint_writer(self):
         assert publish_mod._SIDECAR_FILE == checkpoint_manager._METADATA_FILE

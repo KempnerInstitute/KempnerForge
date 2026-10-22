@@ -145,7 +145,10 @@ def read_mlflow_target(checkpoint_dir: str | os.PathLike[str]) -> MlflowTarget:
     The sidecar needs a non-negative integer ``step`` and a ``tracking`` list holding
     exactly one entry with ``backend == "mlflow"`` whose ``run_id``, ``experiment`` and
     ``tracking_uri`` are non-empty strings. ``model_id`` is optional. A key repeated
-    anywhere in the file is refused, since the last value would silently win.
+    anywhere in the file is refused, since the last value would silently win. A
+    ``databricks://<profile>`` URI also selects that profile via
+    DATABRICKS_CONFIG_PROFILE (setdefault), so artifact clients authenticate like the
+    tracking client.
 
     Raises:
         PublishRefused: Naming each missing or malformed item; nothing is inferred.
@@ -171,6 +174,7 @@ def read_mlflow_target(checkpoint_dir: str | os.PathLike[str]) -> MlflowTarget:
     if problems:
         raise PublishRefused(f"{sidecar}: " + "; ".join(problems))
 
+    _export_profile(entry["tracking_uri"])
     return MlflowTarget(
         run_id=entry["run_id"],
         experiment=entry["experiment"],
@@ -178,6 +182,19 @@ def read_mlflow_target(checkpoint_dir: str | os.PathLike[str]) -> MlflowTarget:
         step=meta["step"],
         model_id=entry.get("model_id"),
     )
+
+
+def _export_profile(tracking_uri: str) -> None:
+    """Select the ``databricks://<profile>`` profile via DATABRICKS_CONFIG_PROFILE (setdefault).
+
+    Artifact clients build their own SDK config from the environment and never see the
+    tracking URI, so without this a profile-authenticated publish can upload metrics but
+    not artifacts. ``databricks://`` and the ``databricks://scope:prefix`` secret-scope
+    form select nothing; an operator-set value always wins.
+    """
+    rest = tracking_uri.removeprefix("databricks://")
+    if rest != tracking_uri and rest and ":" not in rest:
+        os.environ.setdefault("DATABRICKS_CONFIG_PROFILE", rest)
 
 
 def _as_finite_float(value: object) -> float:
