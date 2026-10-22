@@ -26,12 +26,17 @@ from lmms_adapter import resolve_checkpoint
 from kempnerforge.metrics.publish import PublishRefused, read_mlflow_target
 from kempnerforge.metrics.publish import main as publish_cli
 
-from ._fake_mlflow import install_mlflow, install_pandas, uninstall
+from ._fake_mlflow import break_import, install_mlflow, install_pandas, uninstall
 from .test_adapter import _patch_loaders, _vlm_job_config
 
 EXAMPLE_ROOT = Path(__file__).resolve().parents[3]
 URI = "tracking-uri-placeholder"
 MISSING = object()  # drops the key from the synthetic sidecar
+
+FIRST = datetime(2026, 10, 21, 9, 5, 7, 250, tzinfo=UTC)
+FIRST_STAMP = "20261021T090507.000250Z"
+SECOND = datetime(2026, 10, 22, tzinfo=UTC)
+SECOND_STAMP = "20261022T000000.000000Z"
 
 SCORES = {
     "mmbench_en_dev_gpt_eval_score": 41.5,
@@ -120,6 +125,20 @@ def _checkpoint(root: Path, name: str = "step_4000", **meta: Any) -> Path:
     return ckpt
 
 
+def _clock(monkeypatch, *moments: datetime) -> None:
+    """Make the timestamps of the next evaluations the given moments, in order."""
+    remaining = iter(moments)
+    clock = types.SimpleNamespace(now=lambda tz: next(remaining))
+    monkeypatch.setattr(eval_publish, "datetime", clock)
+
+
+def _raiser(error: Exception):
+    def raise_it(*args: Any, **kwargs: Any) -> None:
+        raise error
+
+    return raise_it
+
+
 def _hint(caplog) -> list[str]:
     """The arguments of the re-publish command the log offers."""
     (line,) = [m for m in caplog.messages if "python -m kempnerforge.metrics.publish" in m]
@@ -195,6 +214,13 @@ class TestCollectScores:
         assert [s.name for s in collect_scores(results)] == ["t_c"]
         assert "t/a,none" in _warnings(caplog) and "t/b,none" in _warnings(caplog)
 
+    def test_an_integer_too_large_for_a_float_is_left_out(self):
+        results = {
+            "results": {"t": {"a,none": 10**400, "b,none": 1}},
+            "higher_is_better": {"t": {"a": True, "b": True}},
+        }
+        assert [s.name for s in collect_scores(results)] == ["t_b"]
+
     def test_a_standard_error_that_is_not_finite_is_dropped(self):
         results = {
             "results": {"t": {"a,none": 0.5, "a_stderr,none": float("nan")}},
@@ -255,14 +281,12 @@ class TestCollectScores:
 
 class TestScoresPath:
     def test_beside_the_output_file(self, tmp_path):
-        assert scores_path_for("results/run.json", tmp_path / "step_1") == Path(
-            "results/run.scores.json"
-        )
+        path = scores_path_for("results/run.json", tmp_path / "step_1", FIRST_STAMP)
+        assert path == Path(f"results/run.{FIRST_STAMP}.scores.json")
 
     def test_named_for_the_run_and_step_without_an_output_file(self, tmp_path):
-        assert scores_path_for(None, tmp_path / "run" / "step_4000") == Path(
-            "run_step_4000.scores.json"
-        )
+        path = scores_path_for(None, tmp_path / "run" / "step_4000", FIRST_STAMP)
+        assert path == Path(f"run_step_4000.{FIRST_STAMP}.scores.json")
 
 
 class TestPublishResults:
@@ -304,21 +328,17 @@ class TestPublishResults:
     def test_the_table_and_scores_json_share_a_directory_per_evaluation(
         self, tmp_path, monkeypatch, mlflow
     ):
-        stamps = iter(
-            [datetime(2026, 10, 21, 9, 5, 7, 250, tzinfo=UTC), datetime(2026, 10, 22, tzinfo=UTC)]
-        )
-        clock = types.SimpleNamespace(now=lambda tz: next(stamps))
-        monkeypatch.setattr(eval_publish, "datetime", clock)
+        _clock(monkeypatch, FIRST, SECOND)
         ckpt = _checkpoint(tmp_path)
         publish_results(ckpt, _results(), None)
         publish_results(ckpt, _results(), None)
         assert [t.artifact_file for t in mlflow.tables] == [
-            "eval/step_4000/20261021T090507.000250Z/summary.json",
-            "eval/step_4000/20261022T000000.000000Z/summary.json",
+            f"eval/step_4000/{FIRST_STAMP}/summary.json",
+            f"eval/step_4000/{SECOND_STAMP}/summary.json",
         ]
         assert [d.artifact_file for d in mlflow.dicts] == [
-            "eval/step_4000/20261021T090507.000250Z/scores.json",
-            "eval/step_4000/20261022T000000.000000Z/scores.json",
+            f"eval/step_4000/{FIRST_STAMP}/scores.json",
+            f"eval/step_4000/{SECOND_STAMP}/scores.json",
         ]
 
     def test_only_logs_to_the_run_and_never_starts_ends_or_edits_one(self, tmp_path, mlflow):
@@ -328,7 +348,8 @@ class TestPublishResults:
 
     def test_the_scores_are_saved_before_anything_is_sent(self, tmp_path, monkeypatch):
         install_pandas(monkeypatch)
-        saved = tmp_path / "out" / "run.scores.json"
+        _clock(monkeypatch, FIRST)
+        saved = tmp_path / "out" / f"run.{FIRST_STAMP}.scores.json"
         on_disk: list[object] = []
 
         def on_call(method: str) -> None:
@@ -339,16 +360,39 @@ class TestPublishResults:
         publish_results(_checkpoint(tmp_path), _results(), str(tmp_path / "out" / "run.json"))
         assert on_disk == [SCORES]
 
-    def test_the_scores_are_saved_next_to_the_output_file(self, tmp_path, mlflow):
+    def test_the_scores_are_saved_next_to_the_output_file(self, tmp_path, monkeypatch, mlflow):
+        _clock(monkeypatch, FIRST)
         publish_results(_checkpoint(tmp_path), _results(), str(tmp_path / "out" / "run.json"))
-        assert json.loads((tmp_path / "out" / "run.scores.json").read_text()) == SCORES
+        saved = tmp_path / "out" / f"run.{FIRST_STAMP}.scores.json"
+        assert json.loads(saved.read_text()) == SCORES
 
     def test_without_an_output_file_the_scores_are_saved_in_the_working_directory(
-        self, tmp_path, mlflow
+        self, tmp_path, monkeypatch, mlflow
     ):
+        _clock(monkeypatch, FIRST)
         publish_results(_checkpoint(tmp_path / "run"), _results(), None)
-        saved = tmp_path / "cwd" / "run_step_4000.scores.json"
+        saved = tmp_path / "cwd" / f"run_step_4000.{FIRST_STAMP}.scores.json"
         assert json.loads(saved.read_text()) == SCORES
+
+    def test_every_evaluation_keeps_its_own_scores_and_its_own_recovery_command(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        install_pandas(monkeypatch)
+        install_mlflow(monkeypatch, fail={"log_batch": RuntimeError("down")})
+        _clock(monkeypatch, FIRST, SECOND)
+        ckpt = _checkpoint(tmp_path)
+        first, second = _results(), _results()
+        second["results"]["mmmu_val"]["mmmu_acc,none"] = 0.99
+
+        publish_results(ckpt, first, None)
+        first_hint = _hint(caplog)
+        caplog.clear()
+        publish_results(ckpt, second, None)
+        second_hint = _hint(caplog)
+
+        assert first_hint[2] != second_hint[2]
+        assert json.loads(Path(first_hint[2]).read_text())["mmmu_val_mmmu_acc"] == 0.31
+        assert json.loads(Path(second_hint[2]).read_text())["mmmu_val_mmmu_acc"] == 0.99
 
     @pytest.mark.parametrize(
         "meta",
@@ -356,8 +400,9 @@ class TestPublishResults:
         ids=["no-tracking-block", "no-mlflow-entry"],
     )
     def test_a_refusal_is_surfaced_verbatim_and_the_scores_are_kept(
-        self, tmp_path, mlflow, caplog, meta
+        self, tmp_path, monkeypatch, mlflow, caplog, meta
     ):
+        _clock(monkeypatch, FIRST)
         ckpt = _checkpoint(tmp_path, **meta)
         with pytest.raises(PublishRefused) as refusal:
             read_mlflow_target(ckpt)
@@ -368,7 +413,8 @@ class TestPublishResults:
         assert f"The scores were NOT published to MLflow. Refused: {refusal.value}" in _warnings(
             caplog
         )
-        assert json.loads(out.with_suffix(".scores.json").read_text()) == SCORES
+        saved = tmp_path / "out" / f"run.{FIRST_STAMP}.scores.json"
+        assert json.loads(saved.read_text()) == SCORES
         assert mlflow.events == [] and _hint(caplog)[0] == str(ckpt.resolve())
 
     def test_a_server_failure_warns_with_every_url_hidden(self, tmp_path, monkeypatch, caplog):
@@ -388,14 +434,12 @@ class TestPublishResults:
     ):
         install_pandas(monkeypatch)
         install_mlflow(monkeypatch, fail={"log_batch": RuntimeError("down")})
+        _clock(monkeypatch, FIRST)
         ckpt = _checkpoint(tmp_path)
         publish_results(ckpt, _results(), str(tmp_path / "out" / "run.json"))
         hint = _hint(caplog)
-        assert hint == [
-            str(ckpt.resolve()),
-            "--metrics",
-            str((tmp_path / "out" / "run.scores.json").resolve()),
-        ]
+        saved = tmp_path / "out" / f"run.{FIRST_STAMP}.scores.json"
+        assert hint == [str(ckpt.resolve()), "--metrics", str(saved.resolve())]
 
         retried = install_mlflow(monkeypatch)
         assert publish_cli(hint) == 0
@@ -417,6 +461,8 @@ class TestPublishResults:
         )
         assert "ValueError: table refused" in _warnings(caplog)
         assert len(mlflow.batches) == 1 and len(mlflow.dicts) == 1
+        assert "nothing re-uploads the table or scores.json" in _warnings(caplog)
+        assert _hint(caplog)[1] == "--metrics"
 
     def test_a_failed_scores_json_upload_is_reported(self, tmp_path, monkeypatch, caplog):
         install_pandas(monkeypatch)
@@ -426,6 +472,7 @@ class TestPublishResults:
 
         assert "the upload of the scores.json failed: OSError: no space" in _warnings(caplog)
         assert len(mlflow.tables) == 1
+        assert _hint(caplog)[1] == "--metrics"
 
     def test_a_client_that_cannot_be_built_fails_both_uploads(self, tmp_path, monkeypatch, caplog):
         install_pandas(monkeypatch)
@@ -452,6 +499,20 @@ class TestPublishResults:
         assert "pandas could not be imported" in _warnings(caplog)
         assert "uv sync --group eval" in _warnings(caplog)
         assert len(mlflow.batches) == 1 and mlflow.tables == [] and len(mlflow.dicts) == 1
+        assert _hint(caplog)[1] == "--metrics"
+
+    def test_a_dependency_that_breaks_when_imported_only_costs_its_upload(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        mlflow = install_mlflow(monkeypatch)
+        break_import(monkeypatch, "pandas", ValueError("numpy.dtype size changed"))
+
+        assert publish_results(_checkpoint(tmp_path), _results(), None) is False
+
+        assert "pandas could not be imported (ValueError: numpy.dtype size changed)" in _warnings(
+            caplog
+        )
+        assert len(mlflow.batches) == 1 and mlflow.tables == [] and len(mlflow.dicts) == 1
 
     def test_without_mlflow_the_core_refusal_is_surfaced(self, tmp_path, monkeypatch, caplog):
         install_pandas(monkeypatch)
@@ -473,12 +534,15 @@ class TestPublishResults:
         assert "Could not save the scores" in _warnings(caplog)
         assert len(mlflow.batches) == 1
 
-    def test_a_failure_without_a_saved_file_offers_no_hint(self, tmp_path, monkeypatch, caplog):
+    def test_when_neither_the_save_nor_the_publish_works_the_log_says_so(
+        self, tmp_path, monkeypatch, caplog
+    ):
         install_pandas(monkeypatch)
         install_mlflow(monkeypatch, fail={"log_batch": RuntimeError("down")})
         (tmp_path / "blocked").write_text("x")
         publish_results(_checkpoint(tmp_path), _results(), str(tmp_path / "blocked" / "r.json"))
         assert "NOT published" in _warnings(caplog)
+        assert "exist only in this log" in _warnings(caplog)
         assert not [m for m in caplog.messages if "python -m kempnerforge" in m]
 
     def test_results_without_scores_publish_nothing(self, tmp_path, mlflow, caplog):
@@ -531,6 +595,23 @@ class TestPreflight:
         preflight(_checkpoint(tmp_path), None)
         text = _warnings(caplog)
         assert "uv sync --group mlflow" in text and "uv sync --group eval" in text
+
+    def test_a_dependency_that_breaks_when_imported_is_a_warning_not_an_abort(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        install_mlflow(monkeypatch)
+        break_import(monkeypatch, "pandas", ValueError("numpy.dtype size changed"))
+        preflight(_checkpoint(tmp_path), None)
+        text = _warnings(caplog)
+        assert "pandas could not be imported (ValueError: numpy.dtype size changed)" in text
+        assert "uv sync --group eval" in text
+
+    def test_an_unreadable_sidecar_is_a_warning_not_an_abort(
+        self, tmp_path, monkeypatch, fakes, caplog
+    ):
+        monkeypatch.setattr(eval_publish, "read_mlflow_target", _raiser(PermissionError("denied")))
+        preflight(_checkpoint(tmp_path), None)
+        assert "could not be read (PermissionError: denied)" in _warnings(caplog)
 
 
 class TestResolveCheckpoint:
@@ -587,12 +668,14 @@ class TestEvalScript:
     def test_publishes_after_scoring_by_default(self, tmp_path, monkeypatch, run_eval, caplog):
         install_pandas(monkeypatch)
         mlflow = install_mlflow(monkeypatch)
+        _clock(monkeypatch, FIRST)
         out = tmp_path / "out" / "run.json"
 
         run_eval(_checkpoint(tmp_path), "--output", str(out))
 
         assert json.loads(out.read_text())["results"]["mmmu_val"]["mmmu_acc,none"] == 0.31
-        assert json.loads(out.with_suffix(".scores.json").read_text()) == SCORES
+        saved = tmp_path / "out" / f"run.{FIRST_STAMP}.scores.json"
+        assert json.loads(saved.read_text()) == SCORES
         assert {m.key for m in mlflow.batches[0].metrics} == {f"eval/{n}" for n in SCORES}
         assert len(mlflow.tables) == 1 and len(mlflow.dicts) == 1
 
@@ -603,7 +686,7 @@ class TestEvalScript:
 
         run_eval(_checkpoint(tmp_path), "--output", str(out), "--no-publish")
 
-        assert out.exists() and not out.with_suffix(".scores.json").exists()
+        assert out.exists() and list(out.parent.glob("*.scores.json")) == []
         assert mlflow.events == [] and "MLflow" not in caplog.text
 
     def test_a_missing_tracking_block_leaves_the_run_successful(
@@ -615,7 +698,7 @@ class TestEvalScript:
 
         run_eval(_checkpoint(tmp_path, tracking=MISSING), "--output", str(out))
 
-        assert out.exists() and out.with_suffix(".scores.json").exists()
+        assert out.exists() and len(list(out.parent.glob("*.scores.json"))) == 1
         assert caplog.text.count("no 'tracking' block") == 2  # before the scoring and after it
         assert mlflow.events == []
 
@@ -624,7 +707,25 @@ class TestEvalScript:
         install_mlflow(monkeypatch, fail={"log_batch": RuntimeError("down")})
         out = tmp_path / "run.json"
         run_eval(_checkpoint(tmp_path), "--output", str(out))
-        assert out.exists() and out.with_suffix(".scores.json").exists()
+        assert out.exists() and len(list(tmp_path.glob("run.*.scores.json"))) == 1
+
+    def test_a_broken_dependency_does_not_stop_the_scoring(
+        self, tmp_path, monkeypatch, run_eval, caplog
+    ):
+        install_mlflow(monkeypatch)
+        break_import(monkeypatch, "pandas", ValueError("numpy.dtype size changed"))
+        scored: list[int] = []
+        out = tmp_path / "out" / "run.json"
+
+        run_eval(
+            _checkpoint(tmp_path),
+            "--output",
+            str(out),
+            scoring=lambda: scored.append(1) or _results(),
+        )
+
+        assert scored == [1] and out.exists()
+        assert "pandas could not be imported (ValueError" in caplog.text
 
     def test_scores_belong_to_the_step_scored_even_if_latest_moves(
         self, tmp_path, monkeypatch, run_eval

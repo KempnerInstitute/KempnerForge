@@ -9,6 +9,8 @@ its test. ``FakePandas`` is a ``DataFrame`` that records its rows and columns.
 
 from __future__ import annotations
 
+import importlib.abc
+import importlib.machinery
 import sys
 import types
 from collections.abc import Callable, Mapping
@@ -126,3 +128,25 @@ def install_pandas(monkeypatch: pytest.MonkeyPatch) -> FakePandas:
 def uninstall(monkeypatch: pytest.MonkeyPatch, module: str) -> None:
     """Make ``import <module>`` raise ImportError, whether or not it is installed."""
     monkeypatch.setitem(sys.modules, module, None)
+
+
+class _BrokenFinder(importlib.abc.MetaPathFinder, importlib.abc.Loader):
+    def __init__(self, module: str, error: Exception):
+        self._module, self._error = module, error
+
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == self._module:
+            return importlib.machinery.ModuleSpec(fullname, self)
+        return None
+
+    def create_module(self, spec):
+        return None
+
+    def exec_module(self, module):
+        raise self._error
+
+
+def break_import(monkeypatch: pytest.MonkeyPatch, module: str, error: Exception) -> None:
+    """Make ``import <module>`` run and then raise ``error``, as a broken install does."""
+    monkeypatch.delitem(sys.modules, module, raising=False)
+    monkeypatch.setattr(sys, "meta_path", [_BrokenFinder(module, error), *sys.meta_path])

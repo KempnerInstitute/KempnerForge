@@ -5,11 +5,12 @@ and each score is appended through ``kempnerforge.metrics.publish`` as
 ``eval/<task>_<metric>`` at the checkpoint's step (``_<filter>`` follows when lmms-eval
 reports a filter other than ``none``). A summary table and ``scores.json`` go to the same
 run under ``eval/step_<N>/<UTC timestamp>/``: one directory per evaluation, so repeated or
-concurrent evaluations never append to or overwrite each other. No run is started, ended
-or edited.
+concurrent evaluations never append to or overwrite each other. The local scores file
+carries the same timestamp. No run is started, ended or edited.
 
 Publishing never fails a scoring run: the scores are written to a local file first, and
-every problem with MLflow is a warning that says how to publish the metrics later.
+every problem with the dependencies or with MLflow is a warning that says how to publish
+the metrics later.
 """
 
 from __future__ import annotations
@@ -37,8 +38,7 @@ from kempnerforge.metrics.publish import (
 logger = logging.getLogger(__name__)
 
 _TABLE_COLUMNS = ["step", "benchmark", "metric", "filter", "score", "stderr", "n_samples", "name"]
-# MLflow rejects names outside letters, digits, '_', '-', '.', ' ', ':' and '/', and lmms-eval
-# has tasks such as 'refcoco+_bbox_val' and metrics such as 'avg@4'.
+# lmms-eval names that MLflow rejects exist: task 'refcoco+_bbox_val', metric 'avg@4'.
 _NAME_SEPARATORS = re.compile(r"[^A-Za-z0-9.-]+")
 # MLflow errors quote tracking URIs verbatim, and a URI can carry credentials anywhere in it.
 _URL = re.compile(r"\b([a-zA-Z][a-zA-Z0-9+.-]*://)[^\s'\"<>]+")
@@ -147,11 +147,15 @@ def score_mapping(scores: Sequence[Score]) -> dict[str, float]:
     return {s.name: s.value for s in sorted(scores, key=lambda s: s.name)}
 
 
-def scores_path_for(output: str | None, checkpoint: Path) -> Path:
-    """Where the local scores file goes: beside ``output``, else in the working directory."""
+def scores_path_for(output: str | None, checkpoint: Path, stamp: str) -> Path:
+    """Where this evaluation's local scores file goes: beside ``output``, else in the cwd.
+
+    The timestamp keeps every evaluation's file, and the command that names it, intact.
+    """
     if output:
-        return Path(output).with_suffix(".scores.json")
-    return Path(f"{checkpoint.parent.name}_{checkpoint.name}.scores.json")
+        path = Path(output)
+        return path.with_name(f"{path.stem}.{stamp}.scores.json")
+    return Path(f"{checkpoint.parent.name}_{checkpoint.name}.{stamp}.scores.json")
 
 
 def _mask_urls(text: str) -> str:
@@ -163,11 +167,13 @@ def _failure(error: Exception) -> str:
 
 
 def _import(module: str) -> Any:
+    """``module``, or an ImportError naming its dependency group: a broken install can raise
+    errors that are not ImportErrors (a binary incompatibility is a ValueError)."""
     try:
         return importlib.import_module(module)
-    except ImportError as e:
+    except Exception as e:
         raise ImportError(
-            f"{module} could not be imported ({e}); "
+            f"{module} could not be imported ({_failure(e)}); "
             f"install it with: uv sync --group {_DEPENDENCY_GROUPS[module]}"
         ) from e
 
@@ -180,6 +186,8 @@ def preflight(checkpoint: Path, limit: int | float | None) -> None:
         target = read_mlflow_target(checkpoint)
     except PublishRefused as e:
         problems.append(str(e))
+    except Exception as e:
+        problems.append(f"the checkpoint's metadata.json could not be read ({_failure(e)})")
     for module in _DEPENDENCY_GROUPS:
         try:
             _import(module)
@@ -210,14 +218,20 @@ def _save(path: Path, mapping: Mapping[str, float]) -> Path | None:
     return path
 
 
+def _republish_command(checkpoint: Path, saved: Path) -> str:
+    ckpt, scores = (shlex.quote(str(p.resolve())) for p in (checkpoint, saved))
+    return f"python -m kempnerforge.metrics.publish {ckpt} --metrics {scores}"
+
+
 def _not_published(why: str, checkpoint: Path, saved: Path | None) -> None:
     logger.warning(f"The scores were NOT published to MLflow. {why}")
-    if saved is not None:
-        ckpt, scores = (shlex.quote(str(p.resolve())) for p in (checkpoint, saved))
-        logger.warning(
-            "To publish the metrics later (the summary table and scores.json are not part of "
-            f"it): python -m kempnerforge.metrics.publish {ckpt} --metrics {scores}"
-        )
+    if saved is None:
+        logger.warning("They could not be saved locally either, so they exist only in this log.")
+        return
+    logger.warning(
+        "To publish the metrics later (the summary table and scores.json are not part of it): "
+        + _republish_command(checkpoint, saved)
+    )
 
 
 def _upload_table(client: Any, target: MlflowTarget, scores: Sequence[Score], path: str) -> None:
@@ -269,8 +283,9 @@ def publish_results(checkpoint: Path, results: Mapping[str, Any], output: str | 
         )
         return False
 
+    stamp = f"{datetime.now(UTC):%Y%m%dT%H%M%S.%fZ}"
     mapping = score_mapping(scores)
-    saved = _save(scores_path_for(output, checkpoint), mapping)
+    saved = _save(scores_path_for(output, checkpoint, stamp), mapping)
     try:
         target = publish_metrics(checkpoint, mapping)
     except PublishRefused as e:
@@ -280,10 +295,15 @@ def publish_results(checkpoint: Path, results: Mapping[str, Any], output: str | 
         _not_published(f"Failed: {_failure(e)}", checkpoint, saved)
         return False
 
-    directory = f"eval/step_{target.step}/{datetime.now(UTC):%Y%m%dT%H%M%S.%fZ}"
+    directory = f"eval/step_{target.step}/{stamp}"
     problems = _upload_artifacts(target, scores, directory)
     for problem in problems:
         logger.warning(f"The metrics were published to MLflow, but {problem}")
+    if problems and saved is not None:
+        logger.warning(
+            "The saved scores can be sent as metrics again (nothing re-uploads the table or "
+            "scores.json): " + _republish_command(checkpoint, saved)
+        )
     if not problems:
         logger.info(
             f"Published {len(mapping)} scores to MLflow run {target.run_id} at step "

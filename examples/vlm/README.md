@@ -278,9 +278,12 @@ tasks) and the MLflow credentials of the run's tracking server in the environmen
 before `uv pip install lmms-eval`, since `uv sync` removes packages the lock does not list.
 
 A publishing problem never fails an evaluation. The scores are written first to a local
-file, `--output` with its suffix replaced by `.scores.json` (`results/run.json` gives
-`results/run.scores.json`), or `<run>_<step>.scores.json` in the working directory without
-`--output`. A refusal (a checkpoint without a `tracking` block, say) or a server failure is
+file named for the evaluation: `--output` with its suffix replaced by
+`.<UTC timestamp>.scores.json` (`results/run.json` gives
+`results/run.<timestamp>.scores.json`), or, without `--output`,
+`<run>_<step>.<timestamp>.scores.json` in the working directory. It carries the timestamp
+of the uploaded directory, and no later evaluation replaces it. A refusal (a checkpoint
+without a `tracking` block, say), a broken or missing dependency, or a server failure is
 logged as a warning together with the `python -m kempnerforge.metrics.publish` command that
 publishes the metrics later; that command sends the metrics only, not the table or
 `scores.json`. A `--limit` run publishes like any other, so pass `--no-publish` for smoke
