@@ -145,7 +145,9 @@ def read_mlflow_target(checkpoint_dir: str | os.PathLike[str]) -> MlflowTarget:
     The sidecar needs a non-negative integer ``step`` and a ``tracking`` list holding
     exactly one entry with ``backend == "mlflow"`` whose ``run_id``, ``experiment`` and
     ``tracking_uri`` are non-empty strings. ``model_id`` is optional. A key repeated
-    anywhere in the file is refused, since the last value would silently win.
+    anywhere in the file is refused, since the last value would silently win. A
+    Databricks URI also prepares auth the way the training backend does, so artifact
+    clients authenticate like the tracking client.
 
     Raises:
         PublishRefused: Naming each missing or malformed item; nothing is inferred.
@@ -171,6 +173,7 @@ def read_mlflow_target(checkpoint_dir: str | os.PathLike[str]) -> MlflowTarget:
     if problems:
         raise PublishRefused(f"{sidecar}: " + "; ".join(problems))
 
+    _prepare_databricks_auth(entry["tracking_uri"])
     return MlflowTarget(
         run_id=entry["run_id"],
         experiment=entry["experiment"],
@@ -178,6 +181,24 @@ def read_mlflow_target(checkpoint_dir: str | os.PathLike[str]) -> MlflowTarget:
         step=meta["step"],
         model_id=entry.get("model_id"),
     )
+
+
+def _prepare_databricks_auth(tracking_uri: str) -> None:
+    """Prepare Databricks auth exactly as the training backend does.
+
+    Artifact clients build their own SDK config from the environment and never see the
+    tracking URI, so a ``databricks://<profile>`` URI selects that profile via
+    DATABRICKS_CONFIG_PROFILE (``databricks://`` and the ``databricks://scope:prefix``
+    secret-scope form select nothing), and DATABRICKS_API_TOKEN stands in for an unset
+    DATABRICKS_TOKEN. Operator-set values always win.
+    """
+    if not tracking_uri.startswith("databricks"):
+        return
+    rest = tracking_uri.removeprefix("databricks://")
+    if rest != tracking_uri and rest and ":" not in rest:
+        os.environ.setdefault("DATABRICKS_CONFIG_PROFILE", rest)
+    if not os.environ.get("DATABRICKS_TOKEN") and os.environ.get("DATABRICKS_API_TOKEN"):
+        os.environ["DATABRICKS_TOKEN"] = os.environ["DATABRICKS_API_TOKEN"]
 
 
 def _as_finite_float(value: object) -> float:
