@@ -204,17 +204,18 @@ class TestReadMlflowTarget:
 
     def test_profile_export_never_overrides_the_operator(self, tmp_path, monkeypatch):
         monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", "operator")
+        monkeypatch.setenv("DATABRICKS_API_TOKEN", "alias-token")
         ckpt = _sidecar(tmp_path, tracking=[_entry(tracking_uri="databricks://prof-a")])
         read_mlflow_target(ckpt)
         assert os.environ["DATABRICKS_CONFIG_PROFILE"] == "operator"
+        assert os.environ["DATABRICKS_TOKEN"] == "alias-token"  # auth preparation ran
 
-    @pytest.mark.parametrize(
-        "uri", ["databricks://", "databricks://scope:prefix", "http://host:5000/api"]
-    )
-    def test_non_profile_uris_select_nothing(self, tmp_path, uri):
-        ckpt = _sidecar(tmp_path, tracking=[_entry(tracking_uri=uri)])
-        read_mlflow_target(ckpt)
+    @pytest.mark.parametrize("uri", ["databricks://", "databricks://scope:prefix"])
+    def test_non_profile_uris_select_nothing(self, tmp_path, monkeypatch, uri):
+        monkeypatch.setenv("DATABRICKS_API_TOKEN", "alias-token")
+        read_mlflow_target(_sidecar(tmp_path, tracking=[_entry(tracking_uri=uri)]))
         assert "DATABRICKS_CONFIG_PROFILE" not in os.environ
+        assert os.environ["DATABRICKS_TOKEN"] == "alias-token"  # auth preparation ran
 
     @pytest.mark.parametrize(
         ("uri", "profile"),
@@ -235,13 +236,20 @@ class TestReadMlflowTarget:
     def test_token_alias_never_overrides_databricks_token(self, tmp_path, monkeypatch):
         monkeypatch.setenv("DATABRICKS_TOKEN", "primary")
         monkeypatch.setenv("DATABRICKS_API_TOKEN", "alias-token")
-        read_mlflow_target(_sidecar(tmp_path, tracking=[_entry(tracking_uri="databricks")]))
+        read_mlflow_target(_sidecar(tmp_path, tracking=[_entry(tracking_uri="databricks://p")]))
         assert os.environ["DATABRICKS_TOKEN"] == "primary"
+        assert os.environ["DATABRICKS_CONFIG_PROFILE"] == "p"  # auth preparation ran
 
-    def test_token_alias_is_left_alone_off_databricks(self, tmp_path, monkeypatch):
+    def test_auth_is_prepared_only_for_databricks_uris(self, tmp_path, monkeypatch):
         monkeypatch.setenv("DATABRICKS_API_TOKEN", "alias-token")
-        read_mlflow_target(_sidecar(tmp_path, tracking=[_entry(tracking_uri="http://h:5000")]))
+        off = _sidecar(tmp_path, name="off", tracking=[_entry(tracking_uri="http://h:5000/x")])
+        read_mlflow_target(off)
         assert "DATABRICKS_TOKEN" not in os.environ
+        assert "DATABRICKS_CONFIG_PROFILE" not in os.environ
+        read_mlflow_target(
+            _sidecar(tmp_path, name="on", tracking=[_entry(tracking_uri="databricks")])
+        )
+        assert os.environ["DATABRICKS_TOKEN"] == "alias-token"
 
     def test_sidecar_filename_matches_the_checkpoint_writer(self):
         assert publish_mod._SIDECAR_FILE == checkpoint_manager._METADATA_FILE
