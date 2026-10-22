@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **VLM eval publishes to MLflow** (`examples/vlm/eval.py`): after scoring a checkpoint whose `metadata.json` records an MLflow run, the scores go to that run as `eval/<task>_<metric>` metrics at the checkpoint's step, with a summary table and `scores.json` uploaded beside them (needs the `mlflow` and new `eval` dependency groups); `--no-publish` opts out, and a refusal or server failure only warns.
 - **MLflow eval publisher** (`python -m kempnerforge.metrics.publish <checkpoint_dir> --metrics <json>`): appends `eval/<name>` metrics at the checkpoint's step to the MLflow run recorded in its `metadata.json` `tracking` block, never starts or ends a run, and refuses when that block lacks a usable mlflow entry.
 - **`scheduler.warmup_start_factor`** (default `0.0`): the LR factor every warmup starts from, torch `LinearLR`'s `start_factor`, so a schedule can take its first step at `lr * warmup_start_factor` instead of zero. With it, `cosine` reproduces torch's `SequentialLR([LinearLR(start_factor), CosineAnnealing...])` step for step. The default keeps every existing schedule bit-identical.
   - Tests: `tests/unit/test_scheduler_extensions.py::TestWarmupStartFactor` (default unchanged, every warmup schedule honours it, step-for-step parity of `cosine` with the torch schedule) and `tests/unit/test_config.py` (default and rejection).

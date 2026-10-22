@@ -9,6 +9,9 @@ implements as ``generate_until`` tasks (MMMU, MMBench, ScienceQA, SEED, AI2D,
 ...). The harness constructs the adapter itself and passes the instance to
 ``simple_evaluate`` — there is no lmms-eval entry-point registration.
 
+When the checkpoint's ``metadata.json`` records an MLflow run, the scores are also
+published to it (see ``eval_publish.py``); ``--no-publish`` turns that off.
+
 Requirements (lmms-eval is an OPTIONAL, separately-installed dependency, exactly
 like lm-eval for text evaluation):
 
@@ -102,6 +105,11 @@ def main() -> None:
         default=128,
         help="Fallback max new tokens; task gen_kwargs override it (default: 128)",
     )
+    parser.add_argument(
+        "--no-publish",
+        action="store_true",
+        help="Do not publish the scores to the MLflow run recorded in the checkpoint",
+    )
     args = parser.parse_args()
 
     # lmms-eval is optional and undeclared; import lazily with a helpful error.
@@ -120,9 +128,12 @@ def main() -> None:
     # The adapter imports lmms-eval at module top; the guard above already proved
     # it importable. The script's own directory is sys.path[0], so the sibling
     # lmms_adapter.py resolves as a top-level module.
-    from lmms_adapter import KempnerForgeVLM
+    from eval_publish import preflight, publish_results
+    from lmms_adapter import KempnerForgeVLM, resolve_checkpoint
 
     logger.info(f"Running lmms-eval: tasks={args.tasks}, checkpoint={args.checkpoint}")
+    # Resolved once: the scores are published at the step whose weights were scored.
+    checkpoint = resolve_checkpoint(args.checkpoint)
 
     model_args = (
         f"config={args.config},checkpoint={args.checkpoint},max_new_tokens={args.max_new_tokens}"
@@ -131,12 +142,14 @@ def main() -> None:
         model_args += f",dtype={args.dtype}"
     model = KempnerForgeVLM(
         config=args.config,
-        checkpoint=args.checkpoint,
+        checkpoint=str(checkpoint),
         device=args.device,
         batch_size=args.batch_size,
         max_new_tokens=args.max_new_tokens,
         dtype=args.dtype,  # None -> the adapter defaults it to train.param_dtype
     )
+    if not args.no_publish:
+        preflight(checkpoint, args.limit)
     results = simple_evaluate(
         model=model,
         # Record-only on the prebuilt-instance path: simple_evaluate never
@@ -170,6 +183,9 @@ def main() -> None:
         with open(output_path, "w") as f:
             json.dump(results, f, indent=2, default=str)
         logger.info(f"Results saved to {output_path}")
+
+    if results is not None and not args.no_publish:
+        publish_results(checkpoint, results, args.output)
 
 
 if __name__ == "__main__":
