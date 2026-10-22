@@ -10,8 +10,10 @@ stdout formatting, and backend dispatch.
 
 ```python
 # training/entry.py::run_training
-tracker = MetricsTracker(config, num_gpus=world_size)
-tracker.init_backends(config)     # lazy rank-0 init
+tracker = MetricsTracker(config, num_gpus=runtime.world_size)
+tracker.init_backends(config)     # builds the rank-0 backends
+ckpt_mgr.set_tracking_source(tracker.tracking_entries)
+ckpt_mgr.set_checkpoint_registrar(tracker.register_checkpoint)
 ...
 while step < tc.max_steps:
     tracker.start_step()
@@ -19,12 +21,13 @@ while step < tc.max_steps:
     tracker.end_step(step, loss=loss, grad_norm=gn, lr=lr,
                      tokens_in_step=tokens_per_step)
     ...
-tracker.close()
+tracker.close()                   # in a finally
 ```
 
-`init_backends` is separate from `__init__` because distributed init and
-config rewrites (e.g. restored `wandb_run_id`) happen between tracker
-construction and the first step.
+`init_backends` is separate from `__init__` so that constructing a tracker touches neither
+distributed state nor any backend: the rank check needs the process group, so
+`run_training` calls it after distributed init, once checkpoint restore has already written the
+resumed run ids into the config.
 
 ## Per-step flow
 
@@ -124,10 +127,11 @@ for backend in self._backends:
     backend.log(backend_dict, step=step)
 ```
 
-Backends are initialized lazily and only on rank 0:
+Backends are built by `init_backends`, on rank 0 only, and each starts its run on its first
+`log()`. They are independent toggles, so any combination can be enabled at once:
 
 ```python
-# kempnerforge/metrics/tracker.py — _init_backends
+# kempnerforge/metrics/tracker.py: _init_backends
 if dist.is_initialized() and dist.get_rank() != 0:
     return
 if mc.enable_wandb:
@@ -135,7 +139,7 @@ if mc.enable_wandb:
 if mc.enable_tensorboard:
     self._backends.append(TensorBoardBackend(mc))
 if mc.enable_mlflow:
-    self._backends.append(MLflowBackend(mc, hyperparams=_flatten_config_params(config)))
+    self._backends.append(MLflowBackend(mc, job_config=config))
 ```
 
 Non-rank-0 workers keep `_backends` empty; their `_log_step` call iterates
@@ -170,12 +174,15 @@ produce several side-by-side rows in WandB / TensorBoard.
 
 ```python
 def close(self) -> None:
+    self._closed = True
     for backend in self._backends:
         backend.close()
 ```
 
-Called at the end of `run_training`. WandB and MLflow close the run;
-TensorBoard flushes the event file.
+Called from a `finally` in `run_training`, so a run that raises still closes its backends. WandB
+finishes the run, MLflow drains its queued calls and ends the run (each bounded, see
+[MLflow](mlflow.md#bounded-calls)), and TensorBoard flushes the event file. Marking the tracker
+closed first makes `tracking_entries()` and `register_checkpoint()` return nothing afterwards.
 
 ## Tracking entries
 

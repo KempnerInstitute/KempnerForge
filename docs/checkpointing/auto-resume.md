@@ -63,6 +63,8 @@ if resume_path or config.checkpoint.load_path:
     )
     if ckpt_extra_loaded.get("wandb_run_id"):
         config.metrics.wandb_run_id = ckpt_extra_loaded["wandb_run_id"]
+    if ckpt_extra_loaded.get("mlflow_run_id"):
+        config.metrics.mlflow_run_id = ckpt_extra_loaded["mlflow_run_id"]
 ```
 
 So two things can trigger a resume:

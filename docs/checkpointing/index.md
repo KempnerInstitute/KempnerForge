@@ -22,7 +22,7 @@ contains two kinds of state:
 | File(s) | Contents | Format |
 |---------|----------|--------|
 | DCP shards (`.distcp` + `.metadata`) | Model + optimizer state, one shard per rank | [DCP § Model + optimizer](dcp-model.md) |
-| `train_state.pt` | step, tokens_seen, scheduler, RNG, extras (e.g. `phase_idx`, `wandb_run_id`) | [Train state](train-state.md) |
+| `train_state.pt` | step, tokens_seen, scheduler, RNG, extras (e.g. `phase_idx`, `wandb_run_id`, `mlflow_run_id`) | [Train state](train-state.md) |
 | `metadata.json` | Human-readable `{"step": N, "tokens_seen": M}`, plus the logging runs live at save time | Plain JSON, see below |
 | `latest` symlink | Points at the most recent `step_N` (updated atomically) | [Auto-resume](auto-resume.md) |
 
@@ -56,12 +56,18 @@ live run at save time it also holds a `tracking` list, one entry per backend:
   checkpoint saved before that (step 0, or soon after a resume when `checkpoint.interval` is
   shorter than `metrics.log_interval`) lacks the entry, and the key is omitted when no backend
   is live.
+- The training entry hands `CheckpointManager.set_tracking_source` the tracker's
+  [`tracking_entries`](../metrics-and-profiling/metrics-tracker.md#tracking-entries), which
+  `save()` reads on rank 0. A source that raises, or returns what JSON cannot hold, costs the
+  `tracking` key with a warning, never the save.
 - Values are recorded as resolved. Credentials embedded in the tracking URI
   (`scheme://user:token@host`) are stripped at write time; authentication comes from the
-  environment. The URI, experiment path and run ids remain, so drop the `tracking` key
-  before sharing a checkpoint outside your team.
+  environment, a profile or OAuth, never from this file. The URI, experiment path and run ids
+  remain, so drop the `tracking` key before sharing a checkpoint outside your team.
 - The key is additive. Older checkpoints lack it, nothing on the resume path reads it, and run
-  ids still resume from `train_state.pt`.
+  ids still resume from `train_state.pt`. Offline tools read it:
+  [`kempnerforge.metrics.publish`](../metrics-and-profiling/mlflow.md#publishing-eval-results)
+  appends eval metrics to the MLflow run its `mlflow` entry names.
 
 ## Key modules
 
