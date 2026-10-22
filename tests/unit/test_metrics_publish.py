@@ -33,6 +33,14 @@ def _drop_missing(mapping: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in mapping.items() if v is not MISSING}
 
 
+@pytest.fixture(autouse=True)
+def _no_databricks_auth_env(monkeypatch):
+    """Start without Databricks auth variables; whatever the publisher exports is undone."""
+    for name in ("DATABRICKS_CONFIG_PROFILE", "DATABRICKS_TOKEN", "DATABRICKS_API_TOKEN"):
+        monkeypatch.setenv(name, "")  # registers the restore even when the variable was unset
+        monkeypatch.delenv(name)
+
+
 def _entry(**overrides: Any) -> dict[str, Any]:
     entry = {"backend": "mlflow", "run_id": "run-1", "experiment": "exp", "tracking_uri": URI}
     return _drop_missing({**entry, **overrides})
@@ -187,10 +195,9 @@ class TestReadMlflowTarget:
         ckpt = _sidecar(tmp_path, tracking=[_entry(model_id=None)])
         assert read_mlflow_target(ckpt).model_id is None
 
-    def test_profile_uri_selects_the_profile_for_artifact_clients(self, tmp_path, monkeypatch):
+    def test_profile_uri_selects_the_profile_for_artifact_clients(self, tmp_path):
         """Artifact clients read only the environment, so the profile in a
         databricks://<profile> URI must land in DATABRICKS_CONFIG_PROFILE."""
-        monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
         ckpt = _sidecar(tmp_path, tracking=[_entry(tracking_uri="databricks://prof-a")])
         read_mlflow_target(ckpt)
         assert os.environ["DATABRICKS_CONFIG_PROFILE"] == "prof-a"
@@ -204,11 +211,28 @@ class TestReadMlflowTarget:
     @pytest.mark.parametrize(
         "uri", ["databricks://", "databricks://scope:prefix", "http://host:5000/api"]
     )
-    def test_non_profile_uris_select_nothing(self, tmp_path, monkeypatch, uri):
-        monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+    def test_non_profile_uris_select_nothing(self, tmp_path, uri):
         ckpt = _sidecar(tmp_path, tracking=[_entry(tracking_uri=uri)])
         read_mlflow_target(ckpt)
         assert "DATABRICKS_CONFIG_PROFILE" not in os.environ
+
+    def test_token_alias_stands_in_like_the_training_backend(self, tmp_path, monkeypatch):
+        """A DATABRICKS_API_TOKEN that lets training authenticate must let publishing too."""
+        monkeypatch.setenv("DATABRICKS_API_TOKEN", "alias-token")
+        ckpt = _sidecar(tmp_path, tracking=[_entry(tracking_uri="databricks://prof-a")])
+        read_mlflow_target(ckpt)
+        assert os.environ["DATABRICKS_TOKEN"] == "alias-token"
+
+    def test_token_alias_never_overrides_databricks_token(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("DATABRICKS_TOKEN", "primary")
+        monkeypatch.setenv("DATABRICKS_API_TOKEN", "alias-token")
+        read_mlflow_target(_sidecar(tmp_path, tracking=[_entry(tracking_uri="databricks")]))
+        assert os.environ["DATABRICKS_TOKEN"] == "primary"
+
+    def test_token_alias_is_left_alone_off_databricks(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("DATABRICKS_API_TOKEN", "alias-token")
+        read_mlflow_target(_sidecar(tmp_path, tracking=[_entry(tracking_uri="http://h:5000")]))
+        assert "DATABRICKS_TOKEN" not in os.environ
 
     def test_sidecar_filename_matches_the_checkpoint_writer(self):
         assert publish_mod._SIDECAR_FILE == checkpoint_manager._METADATA_FILE
