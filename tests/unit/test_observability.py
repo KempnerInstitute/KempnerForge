@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import builtins
 import importlib.abc
 import importlib.machinery
+import io
 import logging
 import os
 import sys
@@ -18,6 +20,7 @@ import torch.distributed as dist
 
 import kempnerforge.metrics.logger as log_mod
 import kempnerforge.metrics.tracker as tracker_mod
+from kempnerforge.config import load_config
 from kempnerforge.config.schema import (
     DataConfig,
     DatasetSource,
@@ -368,6 +371,7 @@ class _FakeMlflow:
         self.logged_tags: list = []  # (key, value) pairs set through MlflowClient().set_tag
         self.history_steps: list = []  # steps returned by MlflowClient().get_metric_history
         self.calls: list = []  # (call, run_id, thread id) of every metric / param / tag call
+        self.tracking_uris: list = []  # every URI handed to set_tracking_uri
         self.lifecycle_threads: dict = {}  # thread id that ran start_run / end_run
         self.steps_at_end: list | None = None  # log_steps when end_run was called
         self.sampling_intervals: list = []
@@ -375,8 +379,8 @@ class _FakeMlflow:
         self.monitor_alive = False  # stand-in for the system metrics monitor of the active run
         self._active = threading.local()  # like mlflow, the active run is per thread
 
-    def set_tracking_uri(self, *a, **k):
-        pass
+    def set_tracking_uri(self, uri):
+        self.tracking_uris.append(uri)
 
     def set_experiment(self, *a, **k):
         pass
@@ -437,6 +441,24 @@ def _unset_mlflow_http_env(monkeypatch):
         monkeypatch.delenv(name)
 
 
+_TRACKING_ENV = (
+    "MLFLOW_TRACKING_URI",
+    "MLFLOW_EXPERIMENT",
+    "DATABRICKS_HOST",
+    "DATABRICKS_TOKEN",
+    "DATABRICKS_API_TOKEN",
+    "DATABRICKS_CONFIG_PROFILE",
+)
+
+
+@pytest.fixture(autouse=True)
+def _unset_tracking_env(monkeypatch):
+    """Start each test without the shell's MLflow tracking and Databricks auth variables."""
+    for name in _TRACKING_ENV:
+        monkeypatch.setenv(name, "")
+        monkeypatch.delenv(name)
+
+
 @pytest.fixture(autouse=True)
 def _close_what_the_test_built(monkeypatch):
     """Close every MLflow backend and tracking worker a test builds, so no thread outlives it."""
@@ -491,7 +513,7 @@ def _capture_warnings(monkeypatch) -> list[str]:
 def _mlflow_cfg(**kw):
     base = dict(
         enable_mlflow=True,
-        mlflow_tracking_uri="http://localhost:5000",  # non-databricks: skip readiness gate
+        mlflow_tracking_uri="http://localhost:5000",  # off Databricks: a bare experiment name is ok
         mlflow_experiment="exp",
         mlflow_log_system_metrics=False,
     )
@@ -504,18 +526,9 @@ class TestMLflowBackend:
         backend = MLflowBackend(MetricsConfig(enable_mlflow=True))
         assert backend._active is None
 
-    def test_disabled_without_databricks_creds(self, monkeypatch):
-        """tracking_uri=databricks with no creds disables the backend before importing mlflow."""
-        for var in ("DATABRICKS_HOST", "DATABRICKS_TOKEN", "DATABRICKS_API_TOKEN"):
-            monkeypatch.delenv(var, raising=False)
-        backend = MLflowBackend(MetricsConfig(enable_mlflow=True))  # default uri = databricks
-        backend.log({"train/loss": 1.0}, step=1)
-        assert backend._active is False
-
     def test_mlflow_handles_import_error(self, monkeypatch):
         """ImportError inside _ensure_init flips _active to the False sentinel."""
         monkeypatch.setitem(sys.modules, "mlflow", None)
-        # Non-databricks URI so the readiness gate is skipped and the import is attempted.
         backend = MLflowBackend(
             MetricsConfig(enable_mlflow=True, mlflow_tracking_uri="http://localhost:5000")
         )
@@ -562,7 +575,7 @@ class TestMLflowBackend:
         monkeypatch.setitem(sys.modules, "mlflow", fake_mlflow)
         cfg = MetricsConfig(
             enable_mlflow=True,
-            mlflow_tracking_uri="http://localhost:5000",  # skip the databricks readiness gate
+            mlflow_tracking_uri="http://localhost:5000",
             mlflow_run_id="stale-id",
             mlflow_log_system_metrics=False,
         )
@@ -625,8 +638,6 @@ class TestMLflowBackend:
     def test_bad_env_experiment_disables_with_clear_message(self, monkeypatch):
         """Non-absolute $MLFLOW_EXPERIMENT on Databricks disables with a specific message,
         not the generic 'MLflow init failed'. (Finding #3)"""
-        monkeypatch.setenv("DATABRICKS_HOST", "https://x.cloud.databricks.com")
-        monkeypatch.setenv("DATABRICKS_TOKEN", "dapi-x")
         monkeypatch.setenv("MLFLOW_EXPERIMENT", "bare-name")  # not absolute
         warnings_seen: list = []
         monkeypatch.setattr(
@@ -645,9 +656,6 @@ class TestMLflowBackend:
     def test_null_experiment_disables_on_databricks(self, monkeypatch):
         """On Databricks, an unresolvable experiment (None) disables the backend instead of
         logging into the default experiment. (Finding #7)"""
-        monkeypatch.setenv("DATABRICKS_HOST", "https://x.cloud.databricks.com")
-        monkeypatch.setenv("DATABRICKS_TOKEN", "dapi-x")
-        monkeypatch.delenv("MLFLOW_EXPERIMENT", raising=False)
         monkeypatch.setattr(tracker_mod, "_resolve_mlflow_experiment", lambda cfg, uri: None)
         fm = _FakeMlflow()
         monkeypatch.setitem(sys.modules, "mlflow", fm)
@@ -715,6 +723,252 @@ class TestMLflowBackend:
         assert backend._active is True
         assert os.environ["DATABRICKS_TOKEN"] == "dapi-x"  # mirrored from API_TOKEN
         assert fm.logged_params and fm.logged_tags  # fresh-run metadata (params + tags) logged
+
+
+def _fake_databricks_sdk(monkeypatch, workspace_client):
+    """Serve `databricks.sdk.WorkspaceClient` from `workspace_client`, whatever is installed."""
+    sdk = types.ModuleType("databricks.sdk")
+    sdk.WorkspaceClient = workspace_client
+    monkeypatch.setitem(sys.modules, "databricks", types.ModuleType("databricks"))
+    monkeypatch.setitem(sys.modules, "databricks.sdk", sdk)
+
+
+def _workspace_of(user):
+    """The client WorkspaceClient() returns once credentials resolve."""
+    me = types.SimpleNamespace(user_name=user)
+    return types.SimpleNamespace(current_user=types.SimpleNamespace(me=lambda: me))
+
+
+def _no_credentials():
+    raise ValueError("default auth: cannot configure default credentials")
+
+
+def _assert_names_auth_routes(message):
+    for route in ("DATABRICKS_TOKEN", "~/.databrickscfg", "databricks://<profile>", "OAuth"):
+        assert route in message
+
+
+def _init_backend(monkeypatch, cfg, fm=None):
+    """Run a backend's lazy init (the first log) over a fake mlflow; return both."""
+    fm = fm or _FakeMlflow()
+    monkeypatch.setitem(sys.modules, "mlflow", fm)
+    backend = MLflowBackend(cfg)
+    backend.log({"train/loss": 1.0}, step=1)
+    return backend, fm
+
+
+class TestMlflowTrackingUri:
+    """The URI is the config field if set, else $MLFLOW_TRACKING_URI, else Databricks."""
+
+    def test_default_is_databricks_and_needs_no_credentials_in_the_env(self, monkeypatch):
+        cfg = MetricsConfig(enable_mlflow=True, mlflow_experiment="/Users/me/p")
+        backend, fm = _init_backend(monkeypatch, cfg)
+        assert backend._active is True  # no env gate: the server calls decide whether auth works
+        assert fm.tracking_uris == ["databricks"]
+
+    def test_env_uri_wins_over_the_default(self, monkeypatch):
+        monkeypatch.setenv("MLFLOW_TRACKING_URI", "http://localhost:5000")
+        cfg = MetricsConfig(enable_mlflow=True, mlflow_experiment="bare-name")  # off Databricks
+        backend, fm = _init_backend(monkeypatch, cfg)
+        assert backend._active is True
+        assert fm.tracking_uris == ["http://localhost:5000"]
+
+    def test_explicit_config_wins_over_env(self, monkeypatch):
+        monkeypatch.setenv("MLFLOW_TRACKING_URI", "databricks://profile-a")
+        cfg = _mlflow_cfg(mlflow_tracking_uri="http://localhost:5001")
+        backend, fm = _init_backend(monkeypatch, cfg)
+        assert backend._active is True
+        assert fm.tracking_uris == ["http://localhost:5001"]
+        assert "DATABRICKS_CONFIG_PROFILE" not in os.environ  # the env URI was never acted on
+
+
+class TestMlflowDatabricksAuth:
+    @staticmethod
+    def _profile_seen_by_sdk(monkeypatch, uri):
+        """Init over `uri` with the experiment auto-resolved: (profiles the SDK client was built
+        under, the fake mlflow)."""
+        built: list = []
+
+        def workspace_client():
+            built.append(os.environ.get("DATABRICKS_CONFIG_PROFILE"))
+            return _workspace_of("me")
+
+        _fake_databricks_sdk(monkeypatch, workspace_client)
+        backend, fm = _init_backend(
+            monkeypatch, MetricsConfig(enable_mlflow=True, mlflow_tracking_uri=uri)
+        )
+        assert backend._active is True
+        return built, fm
+
+    def test_profile_uri_selects_that_profile_for_sdk_calls(self, monkeypatch):
+        built, fm = self._profile_seen_by_sdk(monkeypatch, "databricks://profile-a")
+        assert built == ["profile-a"]
+        assert fm.tracking_uris == ["databricks://profile-a"]
+        assert os.environ["DATABRICKS_CONFIG_PROFILE"] == "profile-a"
+
+    def test_an_operator_set_profile_wins(self, monkeypatch):
+        monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", "profile-b")
+        built, _ = self._profile_seen_by_sdk(monkeypatch, "databricks://profile-a")
+        assert built == ["profile-b"]
+        assert os.environ["DATABRICKS_CONFIG_PROFILE"] == "profile-b"
+
+    @pytest.mark.parametrize("uri", ["databricks", "http://localhost:5000"])
+    def test_other_uris_select_no_profile(self, monkeypatch, uri):
+        cfg = MetricsConfig(enable_mlflow=True, mlflow_tracking_uri=uri, mlflow_experiment="/e")
+        backend, _ = _init_backend(monkeypatch, cfg)
+        assert backend._active is True
+        assert "DATABRICKS_CONFIG_PROFILE" not in os.environ
+
+    @pytest.mark.parametrize(
+        ("uri", "profile"),
+        [
+            ("databricks://profile-a", "profile-a"),
+            ("databricks://profile-a/", "profile-a"),
+            ("databricks", None),
+            ("databricks://", None),
+            ("databricks://scope:prefix", None),  # a secret scope, not a profile
+            ("databricks-uc://profile-a", None),
+            ("http://localhost:5000", None),
+        ],
+    )
+    def test_profile_a_uri_names(self, uri, profile):
+        assert tracker_mod._databricks_profile(uri) == profile
+
+    @pytest.mark.parametrize(
+        ("env", "uri", "token"),
+        [
+            ({"DATABRICKS_API_TOKEN": "alias"}, "databricks", "alias"),
+            ({"DATABRICKS_API_TOKEN": "alias", "DATABRICKS_TOKEN": "real"}, "databricks", "real"),
+            ({"DATABRICKS_API_TOKEN": "alias"}, "databricks://profile-a", "alias"),
+            (
+                {"DATABRICKS_API_TOKEN": "alias", "DATABRICKS_CONFIG_PROFILE": "profile-b"},
+                "databricks",
+                "alias",
+            ),
+            ({"DATABRICKS_API_TOKEN": "alias"}, "http://localhost:5000", None),
+        ],
+    )
+    def test_token_alias_stands_in_for_an_unset_token_on_databricks(
+        self, monkeypatch, env, uri, token
+    ):
+        """DATABRICKS_API_TOKEN is mirrored into DATABRICKS_TOKEN on Databricks, with or without
+        a profile, never over a token the operator set, and not at all off Databricks."""
+        for name, value in env.items():
+            monkeypatch.setenv(name, value)
+        cfg = MetricsConfig(enable_mlflow=True, mlflow_tracking_uri=uri, mlflow_experiment="/e")
+        _init_backend(monkeypatch, cfg)
+        assert os.environ.get("DATABRICKS_TOKEN") == token
+
+    def test_warnings_scrub_credentialed_uris(self, monkeypatch):
+        """mlflow and SDK errors can quote the tracking URI; logged warnings must not leak it."""
+        fm = _FakeMlflow()
+
+        def unreachable(*a, **k):
+            raise RuntimeError("cannot reach http://user:tok@host:5000/api?x=a@b")
+
+        fm.set_experiment = unreachable
+        warnings_seen = _capture_warnings(monkeypatch)
+        cfg = MetricsConfig(enable_mlflow=True, mlflow_experiment="/Users/me/p")
+        backend, _ = _init_backend(monkeypatch, cfg, fm)
+        assert backend._active is False
+        (message,) = warnings_seen
+        assert "user:tok@" not in message
+        assert "http://host:5000/api?x=a@b" in message  # the rest of the error stays readable
+
+    def test_rate_limited_warnings_scrub_credentialed_uris(self, monkeypatch):
+        warnings_seen = _capture_warnings(monkeypatch)
+        warn = tracker_mod._RateLimitedWarning(300.0)
+        warn("log_metrics failed (https://u:p@h/x); points may be lost")
+        assert warnings_seen == ["log_metrics failed (https://h/x); points may be lost"]
+        plain = "log_metrics failed (https://host?x=a@b#c@d)"
+        tracker_mod._RateLimitedWarning(300.0)(plain)  # a fresh limiter always shows its first
+        assert warnings_seen[-1] == plain
+
+    def test_rejected_credentials_disable_with_the_auth_routes_named(self, monkeypatch):
+        fm = _FakeMlflow()
+
+        def unauthenticated(*a, **k):
+            raise RuntimeError("401 Unauthenticated")
+
+        fm.set_experiment = unauthenticated
+        warnings_seen = _capture_warnings(monkeypatch)
+        cfg = MetricsConfig(enable_mlflow=True, mlflow_experiment="/Users/me/p")
+        backend, _ = _init_backend(monkeypatch, cfg, fm)  # must not raise
+        assert backend._active is False and fm.start_run_ids == []
+        (message,) = warnings_seen
+        assert message.startswith("MLflow init failed: 401 Unauthenticated (")
+        _assert_names_auth_routes(message)
+
+    def test_missing_credentials_disable_with_the_auth_routes_named(self, monkeypatch):
+        """No auth route resolves: the SDK builds no client, the experiment path cannot be
+        auto-resolved, and init disables with both messages instead of raising."""
+        _fake_databricks_sdk(monkeypatch, _no_credentials)
+        warnings_seen = _capture_warnings(monkeypatch)
+        backend, fm = _init_backend(monkeypatch, MetricsConfig(enable_mlflow=True))
+        assert backend._active is False and fm.start_run_ids == []
+        resolve_failed, disabled = warnings_seen
+        assert resolve_failed.startswith(
+            "Could not auto-resolve Databricks experiment path: "
+            "default auth: cannot configure default credentials ("
+        )
+        _assert_names_auth_routes(resolve_failed)
+        assert disabled == (
+            "MLflow disabled: could not resolve a Databricks experiment path "
+            "(set mlflow_experiment or $MLFLOW_EXPERIMENT to an absolute path)"
+        )
+
+    def test_a_missing_sdk_is_not_a_credentials_problem(self, monkeypatch):
+        monkeypatch.setitem(sys.modules, "databricks.sdk", None)  # the import raises ImportError
+        warnings_seen = _capture_warnings(monkeypatch)
+        backend, _ = _init_backend(monkeypatch, MetricsConfig(enable_mlflow=True))
+        assert backend._active is False
+        resolve_failed, _ = warnings_seen
+        assert resolve_failed.startswith("Could not auto-resolve Databricks experiment path: ")
+        assert "databrickscfg" not in resolve_failed
+
+    def test_a_failure_off_databricks_is_not_a_credentials_problem(self, monkeypatch):
+        fm = _FakeMlflow()
+
+        def refused(*a, **k):
+            raise ConnectionError("connection refused")
+
+        fm.set_experiment = refused
+        warnings_seen = _capture_warnings(monkeypatch)
+        backend, _ = _init_backend(monkeypatch, _mlflow_cfg(), fm)
+        assert backend._active is False
+        assert warnings_seen == ["MLflow init failed: connection refused"]
+
+    @pytest.mark.parametrize("credentials", ["found", "missing"])
+    def test_kf_never_opens_a_credential_file(self, monkeypatch, tmp_path, credentials):
+        """Credential files are the SDK's to read: init opens none itself, found or missing."""
+        opened: list[str] = []
+
+        def recording(real):
+            def wrapper(file, *args, **kwargs):
+                if not isinstance(file, int):  # a file descriptor names no path
+                    opened.append(os.fsdecode(file))
+                return real(file, *args, **kwargs)
+
+            return wrapper
+
+        for owner in (builtins, io, os):  # open(), io.open() behind pathlib, os.open()
+            monkeypatch.setattr(owner, "open", recording(owner.open))
+        credential_path = tmp_path / ".databrickscfg"
+        for read in (builtins.open, io.open, lambda path: os.open(path, os.O_RDONLY)):
+            with pytest.raises(FileNotFoundError):  # the recorder sees each way of opening it
+                read(credential_path)
+        assert len(opened) == 3 and all("databrickscfg" in path for path in opened)
+        opened.clear()
+
+        _fake_databricks_sdk(
+            monkeypatch,
+            (lambda: _workspace_of("me")) if credentials == "found" else _no_credentials,
+        )
+        cfg = MetricsConfig(enable_mlflow=True, mlflow_tracking_uri="databricks://profile-a")
+        backend, _ = _init_backend(monkeypatch, cfg)
+        assert backend._active is (credentials == "found")
+        backend.close()
+        assert [path for path in opened if "databrickscfg" in path] == []
 
 
 class TestResolveMlflowExperiment:
@@ -993,9 +1247,6 @@ class TestMLflowBestEffort:
 
         cfg = _mlflow_cfg()
         if hang_at == "workspace_client":  # auto-resolving the Databricks experiment path
-            monkeypatch.setenv("DATABRICKS_HOST", "https://x.cloud.databricks.com")
-            monkeypatch.setenv("DATABRICKS_TOKEN", "dapi-x")
-            monkeypatch.delenv("MLFLOW_EXPERIMENT", raising=False)
             user = types.SimpleNamespace(user_name="me")
             workspace = types.SimpleNamespace(
                 current_user=types.SimpleNamespace(me=lambda: hang(user))
@@ -1284,6 +1535,45 @@ class TestMetricsConfigMLflow:
             mlflow_experiment="bare-name",
         )
         assert cfg.mlflow_experiment == "bare-name"
+
+    def test_tracking_uri_is_unset_by_default(self):
+        assert MetricsConfig().mlflow_tracking_uri is None
+
+    @pytest.mark.parametrize(
+        ("field", "env", "uri"),
+        [
+            (None, None, "databricks"),
+            (None, "", "databricks"),  # an exported-but-empty variable counts as unset
+            (None, "http://localhost:5000", "http://localhost:5000"),
+            ("databricks://profile-a", "http://localhost:5000", "databricks://profile-a"),
+            ("sqlite:///mlflow.db", None, "sqlite:///mlflow.db"),
+        ],
+    )
+    def test_tracking_uri_resolves_field_then_env_then_databricks(
+        self, monkeypatch, field, env, uri
+    ):
+        if env is not None:
+            monkeypatch.setenv("MLFLOW_TRACKING_URI", env)
+        assert MetricsConfig(mlflow_tracking_uri=field).resolve_mlflow_tracking_uri() == uri
+
+    def test_experiment_rule_follows_the_resolved_uri(self, monkeypatch):
+        monkeypatch.setenv("MLFLOW_TRACKING_URI", "databricks://profile-a")
+        with pytest.raises(ValueError, match="absolute workspace path"):
+            MetricsConfig(enable_mlflow=True, mlflow_experiment="bare-name")
+        monkeypatch.setenv("MLFLOW_TRACKING_URI", "http://localhost:5000")
+        cfg = MetricsConfig(enable_mlflow=True, mlflow_experiment="bare-name")
+        assert cfg.mlflow_experiment == "bare-name"
+
+    def test_toml_and_cli_set_the_uri_explicitly(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("MLFLOW_TRACKING_URI", "http://localhost:5000")
+        toml = tmp_path / "job.toml"
+        toml.write_text('[metrics]\nmlflow_tracking_uri = "sqlite:///mlflow.db"\n')
+        assert load_config(None, cli_args=[]).metrics.mlflow_tracking_uri is None
+        from_toml = load_config(str(toml), cli_args=[]).metrics
+        assert from_toml.resolve_mlflow_tracking_uri() == "sqlite:///mlflow.db"
+        args = ["--metrics.mlflow_tracking_uri=databricks://profile-a"]
+        from_cli = load_config(str(toml), cli_args=args).metrics
+        assert from_cli.resolve_mlflow_tracking_uri() == "databricks://profile-a"
 
 
 # ---------------------------------------------------------------------------
