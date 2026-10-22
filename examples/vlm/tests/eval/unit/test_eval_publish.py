@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import runpy
 import shlex
 import subprocess
 import sys
+import tempfile
 import types
 from datetime import UTC, datetime
 from pathlib import Path
@@ -524,26 +526,66 @@ class TestPublishResults:
         assert "uv sync --group mlflow" in _warnings(caplog)
         assert _hint(caplog)
 
-    def test_a_scores_file_that_cannot_be_written_warns_and_publishing_goes_on(
-        self, tmp_path, mlflow, caplog
-    ):
-        (tmp_path / "blocked").write_text("a file where a directory is needed")
-        assert publish_results(
-            _checkpoint(tmp_path), _results(), str(tmp_path / "blocked" / "r.json")
-        )
-        assert "Could not save the scores" in _warnings(caplog)
-        assert len(mlflow.batches) == 1
-
-    def test_when_neither_the_save_nor_the_publish_works_the_log_says_so(
+    def test_an_unwritable_location_falls_back_to_a_temporary_file(
         self, tmp_path, monkeypatch, caplog
     ):
         install_pandas(monkeypatch)
         install_mlflow(monkeypatch, fail={"log_batch": RuntimeError("down")})
-        (tmp_path / "blocked").write_text("x")
+        (tmp_path / "tmp").mkdir()
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "tmp"))
+        (tmp_path / "blocked").write_text("a file where a directory is needed")
+
         publish_results(_checkpoint(tmp_path), _results(), str(tmp_path / "blocked" / "r.json"))
-        assert "NOT published" in _warnings(caplog)
-        assert "exist only in this log" in _warnings(caplog)
+
+        (fallback,) = (tmp_path / "tmp").glob("r.*.scores-*.json")
+        assert json.loads(fallback.read_text()) == SCORES
+        assert f"Saved the scores to {fallback} instead" in _warnings(caplog)
+        assert _hint(caplog)[2] == str(fallback)
+
+    def test_publishing_goes_on_with_the_temporary_file_as_the_local_copy(
+        self, tmp_path, monkeypatch, mlflow
+    ):
+        (tmp_path / "tmp").mkdir()
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "tmp"))
+        (tmp_path / "blocked").write_text("x")
+        assert publish_results(
+            _checkpoint(tmp_path), _results(), str(tmp_path / "blocked" / "r.json")
+        )
+        assert len(mlflow.batches) == 1
+
+    def test_with_no_local_copy_nothing_is_sent_and_the_exact_scores_are_logged(
+        self, tmp_path, monkeypatch, mlflow, caplog
+    ):
+        (tmp_path / "blocked").write_text("x")
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "blocked"))
+        results = _results()
+        results["results"]["mmmu_val"]["mmmu_acc,none"] = 0.123456789
+
+        assert (
+            publish_results(_checkpoint(tmp_path), results, str(tmp_path / "blocked" / "r.json"))
+            is False
+        )
+
+        assert mlflow.events == []
+        text = _warnings(caplog)
+        assert "nothing is sent without a local copy" in text
+        assert '"mmmu_val_mmmu_acc": 0.123456789' in text
         assert not [m for m in caplog.messages if "python -m kempnerforge" in m]
+
+    def test_the_recovery_command_needs_no_lookup_of_the_working_directory(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        install_pandas(monkeypatch)
+
+        def on_call(method: str) -> None:
+            if method == "log_table":
+                monkeypatch.setattr(os, "getcwd", _raiser(FileNotFoundError("cwd is gone")))
+
+        install_mlflow(monkeypatch, on_call=on_call, fail={"log_table": RuntimeError("down")})
+
+        assert publish_results(_checkpoint(tmp_path), _results(), None) is False
+
+        assert _hint(caplog)[1] == "--metrics"
 
     def test_results_without_scores_publish_nothing(self, tmp_path, mlflow, caplog):
         results = {"results": {"t": {"alias": "t"}}, "higher_is_better": {"t": {}}}

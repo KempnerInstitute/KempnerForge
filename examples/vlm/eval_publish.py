@@ -8,9 +8,10 @@ run under ``eval/step_<N>/<UTC timestamp>/``: one directory per evaluation, so r
 concurrent evaluations never append to or overwrite each other. The local scores file
 carries the same timestamp. No run is started, ended or edited.
 
-Publishing never fails a scoring run: the scores are written to a local file first, and
-every problem with the dependencies or with MLflow is a warning that says how to publish
-the metrics later.
+Publishing never fails a scoring run: the scores are written to a local file first (a
+temporary file if that location is unwritable; with no file at all nothing is sent and the
+scores go to the log), and every problem with the dependencies or with MLflow is a warning
+that says how to publish the metrics later.
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ import math
 import numbers
 import re
 import shlex
+import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -208,26 +210,35 @@ def preflight(checkpoint: Path, limit: int | float | None) -> None:
 
 
 def _save(path: Path, mapping: Mapping[str, float]) -> Path | None:
+    """Write the scores to ``path``, else to a temporary file; the absolute path, or None."""
+    text = json.dumps(mapping, indent=2) + "\n"
     try:
+        path = path.resolve()
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(mapping, indent=2) + "\n")
+        path.write_text(text)
     except OSError as e:
         logger.warning(f"Could not save the scores to {path}: {e}")
+    else:
+        logger.info(f"Scores saved to {path}")
+        return path
+    try:
+        prefix = f"{path.name.removesuffix('.json')}-"
+        with tempfile.NamedTemporaryFile("w", prefix=prefix, suffix=".json", delete=False) as f:
+            f.write(text)
+    except OSError as e:
+        logger.warning(f"Could not save the scores to a temporary file either: {e}")
         return None
-    logger.info(f"Scores saved to {path}")
-    return path
+    logger.warning(f"Saved the scores to {f.name} instead")
+    return Path(f.name)
 
 
 def _republish_command(checkpoint: Path, saved: Path) -> str:
-    ckpt, scores = (shlex.quote(str(p.resolve())) for p in (checkpoint, saved))
+    ckpt, scores = shlex.quote(str(checkpoint)), shlex.quote(str(saved))
     return f"python -m kempnerforge.metrics.publish {ckpt} --metrics {scores}"
 
 
-def _not_published(why: str, checkpoint: Path, saved: Path | None) -> None:
+def _not_published(why: str, checkpoint: Path, saved: Path) -> None:
     logger.warning(f"The scores were NOT published to MLflow. {why}")
-    if saved is None:
-        logger.warning("They could not be saved locally either, so they exist only in this log.")
-        return
     logger.warning(
         "To publish the metrics later (the summary table and scores.json are not part of it): "
         + _republish_command(checkpoint, saved)
@@ -268,8 +279,8 @@ def _upload_artifacts(target: MlflowTarget, scores: Sequence[Score], directory: 
 def publish_results(checkpoint: Path, results: Mapping[str, Any], output: str | None) -> bool:
     """Save the scores of ``results`` locally, then publish them; True if all of it landed.
 
-    ``checkpoint`` is the step directory the scored weights came from. A problem with the
-    scores or with MLflow is a warning, never an exception.
+    ``checkpoint`` is the absolute step directory the scored weights came from. A problem
+    with the scores or with MLflow is a warning, never an exception.
     """
     try:
         scores = collect_scores(results)
@@ -286,6 +297,12 @@ def publish_results(checkpoint: Path, results: Mapping[str, Any], output: str | 
     stamp = f"{datetime.now(UTC):%Y%m%dT%H%M%S.%fZ}"
     mapping = score_mapping(scores)
     saved = _save(scores_path_for(output, checkpoint, stamp), mapping)
+    if saved is None:
+        logger.warning(
+            "The scores were NOT published to MLflow: nothing is sent without a local copy. "
+            f"The scores:\n{json.dumps(mapping, indent=2)}"
+        )
+        return False
     try:
         target = publish_metrics(checkpoint, mapping)
     except PublishRefused as e:
@@ -299,7 +316,7 @@ def publish_results(checkpoint: Path, results: Mapping[str, Any], output: str | 
     problems = _upload_artifacts(target, scores, directory)
     for problem in problems:
         logger.warning(f"The metrics were published to MLflow, but {problem}")
-    if problems and saved is not None:
+    if problems:
         logger.warning(
             "The saved scores can be sent as metrics again (nothing re-uploads the table or "
             "scores.json): " + _republish_command(checkpoint, saved)

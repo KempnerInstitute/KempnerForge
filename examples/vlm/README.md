@@ -282,7 +282,9 @@ file named for the evaluation: `--output` with its suffix replaced by
 `.<UTC timestamp>.scores.json` (`results/run.json` gives
 `results/run.<timestamp>.scores.json`), or, without `--output`,
 `<run>_<step>.<timestamp>.scores.json` in the working directory. It carries the timestamp
-of the uploaded directory, and no later evaluation replaces it. A refusal (a checkpoint
+of the uploaded directory, and no later evaluation replaces it. If that location is not
+writable the file goes to the system temporary directory, and if no file can be written
+nothing is published and the scores are printed in the log. A refusal (a checkpoint
 without a `tracking` block, say), a broken or missing dependency, or a server failure is
 logged as a warning together with the `python -m kempnerforge.metrics.publish` command that
 publishes the metrics later; that command sends the metrics only, not the table or
