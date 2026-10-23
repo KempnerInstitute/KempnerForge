@@ -14,9 +14,7 @@ DEVICE = torch.device("cuda")
 DTYPE = torch.bfloat16
 
 
-def _moe_config(
-    num_experts: int = 8, top_k: int = 2, router: str = "softmax_topk"
-) -> ModelConfig:
+def _moe_config(num_experts: int = 8, top_k: int = 2, router: str = "softmax_topk") -> ModelConfig:
     return ModelConfig(
         dim=768,
         n_layers=4,
@@ -79,14 +77,18 @@ def run_moe_benchmarks() -> list[BenchmarkResult]:
     from kempnerforge.model.moe import build_moe
 
     config = _moe_config()
-    moe_layer = build_moe(
-        dim=config.dim,
-        hidden_dim=config.computed_ffn_hidden_dim,
-        num_experts=config.num_experts,
-        top_k=config.moe_top_k,
-        activation=config.activation.value,
-        router_type=config.moe_router,
-    ).to(device=DEVICE, dtype=DTYPE).eval()
+    moe_layer = (
+        build_moe(
+            dim=config.dim,
+            hidden_dim=config.computed_ffn_hidden_dim,
+            num_experts=config.num_experts,
+            top_k=config.moe_top_k,
+            activation=config.activation.value,
+            router_type=config.moe_router,
+        )
+        .to(device=DEVICE, dtype=DTYPE)
+        .eval()
+    )
     x = torch.randn(BATCH, SEQ, 768, device=DEVICE, dtype=DTYPE)
 
     orig_flag = moe_mod._HAS_GROUPED_MM
@@ -98,9 +100,7 @@ def run_moe_benchmarks() -> list[BenchmarkResult]:
         with torch.no_grad():
             layer(inp)
 
-    results.append(
-        run_benchmark(loop_fn, name="MoE dispatch: loop", tokens_per_iter=toks_per_iter)
-    )
+    results.append(run_benchmark(loop_fn, name="MoE dispatch: loop", tokens_per_iter=toks_per_iter))
 
     # Grouped GEMM (if available)
     moe_mod._HAS_GROUPED_MM = orig_flag
