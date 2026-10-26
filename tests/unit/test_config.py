@@ -337,6 +337,11 @@ class TestDistributedConfig:
         with pytest.raises(ValueError, match=f"cp={cp} is not supported"):
             DistributedConfig(cp=cp)
 
+    def test_rejects_context_parallel_with_an_explicit_dp_shard(self):
+        """An explicit dp_shard does not bypass the check; dp_shard=4, cp=2 leaves ranks out."""
+        with pytest.raises(ValueError, match="cp=2 is not supported"):
+            DistributedConfig(dp_shard=4, cp=2)
+
     def test_rejects_context_parallel_at_load(self, tmp_path):
         """A TOML key or CLI override fails at load, before any distributed init."""
         toml = tmp_path / "cp.toml"
