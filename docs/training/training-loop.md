@@ -152,7 +152,7 @@ After the step body, before advancing:
 | Eval | `step % eval_config.interval == 0` | [`run_eval`](evaluation.md), `on_eval_end` hook |
 | Profiler | every step | `prof.step()` advances the schedule |
 | Checkpoint | `step % checkpoint.interval == 0` | `ckpt_mgr.save(step)`, `on_checkpoint_save` hook |
-| Shutdown | SIGTERM / SIGUSR1 pending | `ckpt_mgr.save(emergency=True)`, break |
+| Shutdown | SIGTERM / SIGUSR1 pending | `ckpt_mgr.save(step)` unless the checkpoint tick just saved this step, break |
 
 `nccl_health_check_interval = 0` disables the all-reduce probe — it is
 off in every shipped config but worth enabling for long multi-node
