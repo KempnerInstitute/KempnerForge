@@ -698,6 +698,33 @@ class TestRunTrainingLoop:
         assert ckpt.saved_steps == expected
         assert handler.finished is True
 
+    @pytest.mark.parametrize("mode", ["disabled", "async", "async_with_pinned_mem"])
+    def test_shutdown_on_a_scheduled_step_commits_that_one_save(self, monkeypatch, tmp_path, mode):
+        """The real manager saves the step once and has committed it when the loop returns."""
+        from kempnerforge.checkpoint.manager import CheckpointManager
+        from kempnerforge.config.checkpoint import AsyncCheckpointMode
+
+        config = make_config(max_steps=10)
+        config.checkpoint.dir = str(tmp_path)
+        config.checkpoint.interval = 2
+        config.checkpoint.async_mode = AsyncCheckpointMode(mode)
+        session = make_session(config, shutdown_handler=FakeShutdownHandler(after_steps=2))
+        mgr = CheckpointManager(config.checkpoint, session.model, session.optimizer)
+        saved: list[int] = []
+        real_save = mgr.save
+
+        def counting_save(step: int, **kwargs: Any) -> None:
+            saved.append(step)
+            real_save(step, **kwargs)
+
+        monkeypatch.setattr(mgr, "save", counting_save)
+        session.checkpointer = mgr
+        step, _ = run_training_loop(session)
+        assert step == 2
+        assert saved == [2]
+        assert (tmp_path / "latest").resolve() == (tmp_path / "step_2").resolve()
+        assert (tmp_path / "step_2" / ".metadata").is_file()
+
     def test_hooks_fire_for_every_step_and_save(self):
         config = make_config(max_steps=4)
         config.checkpoint.interval = 2
