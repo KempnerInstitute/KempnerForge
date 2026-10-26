@@ -22,7 +22,7 @@ contains two kinds of state:
 | File(s) | Contents | Format |
 |---------|----------|--------|
 | DCP shards (`.distcp` + `.metadata`) | Model + optimizer state, one shard per rank | [DCP § Model + optimizer](dcp-model.md) |
-| `train_state.pt` | step, tokens_seen, scheduler, RNG, extras (e.g. `phase_idx`, `wandb_run_id`) | [Train state](train-state.md) |
+| `train_state.pt` | step, tokens_seen, scheduler, per-rank dataloader/RNG state, extras (e.g. `phase_idx`, `wandb_run_id`) | [Train state](train-state.md) |
 | `metadata.json` | Human-readable `{"step": N, "tokens_seen": M}` | Plain JSON |
 | `latest` symlink | Points at the most recent `step_N` (updated atomically) | [Auto-resume](auto-resume.md) |
 

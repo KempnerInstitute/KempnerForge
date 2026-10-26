@@ -18,14 +18,23 @@ Entry points, both in
 {
     "step":        int,                   # current training step
     "tokens_seen": int,                   # cumulative token count across DP ranks
-    "rng": {                              # full RNG capture (see below)
+    "rng": {                              # rank 0's RNG capture (see below)
         "python":     random.getstate(),
         "numpy":      np.random.get_state(),
         "torch_cpu":  torch.random.get_rng_state(),
         "torch_cuda": torch.cuda.get_rng_state(),   # if CUDA available
     },
     "scheduler":   scheduler.state_dict(),            # present if scheduler passed
-    "dataloader":  dataloader.state_dict(),           # present if dataloader passed
+    "dataloader":  dataloader.state_dict(),           # rank 0's; present if dataloader passed
+    "per_rank": {                         # schema v1: every rank's own state
+        "version": 1,
+        "world_size": W,
+        "data_parallel": {0: (dp_rank, dp_size), ...},  # or None if unrecorded
+        "ranks": {
+            0: {"rng": {...}, "dataloader": {...}},   # global rank -> payload
+            # ... one entry per global rank 0..W-1
+        },
+    },
     # ... plus whatever was in the `extra` dict
 }
 ```
@@ -42,10 +51,68 @@ if self._rank == 0:
     torch.save(train_state, ckpt_dir / "train_state.pt")
 ```
 
-Only global rank 0 writes — the file is not sharded. On load, rank
-0 reads and broadcasts it to every rank via
-`dist.broadcast_object_list` so all ranks agree on `step`, scheduler
-LR, RNG seeds, etc.
+Only global rank 0 writes; the file is not sharded. Before the
+write, every rank's own dataloader/RNG payload is gathered
+collectively (on the manager's dedicated gloo group) into the
+versioned `per_rank` envelope, so the single file still carries every
+rank's state. On load, rank 0 reads and broadcasts it to every rank
+via `dist.broadcast_object_list`; all ranks agree on `step` and
+scheduler state. On an exact resume (the training entry's auto-resume
+of the run's own checkpoint, `load(..., exact_resume=True)`) each rank
+then restores **its own** entry from `per_rank["ranks"]`, keyed by
+global rank. Any other load (a `load_path` warm start,
+`scripts/eval.py`) restores the single-copy `rng`/`dataloader` keys
+(rank 0's) on every rank with no topology check, exactly as before.
+
+## Per-rank state (schema v1)
+
+Dataloader cursors and RNG streams are rank-local: pipeline stages
+seed `seed + pp_rank`, CUDA streams diverge during training, and a
+stateful loader's position is its own rank's. The `per_rank`
+envelope records each rank's payload:
+
+- `version`: schema version, currently `1`. A newer version than
+  the running code understands refuses to load.
+- `world_size`: the topology that saved the checkpoint. Resuming
+  under a **different world size raises** with an actionable error:
+  exact data/RNG continuity only exists on the saved topology, while
+  model/optimizer resharding via DCP is unaffected.
+- `data_parallel`: every global rank's `(dp_rank, dp_size)`, the data
+  partition its loader read. The same world size can split into a
+  different partition per rank (for example DP=4 vs DP=2 x TP=2), so
+  resuming under a **different layout also raises**: a loader cursor
+  is only valid on the partition it was saved on. `None` when the saving
+  `CheckpointManager` was built without `dp_info` (the training entry
+  always passes it); the layout check is then skipped and only the
+  world size is checked.
+- `ranks`: one payload per global rank, holding that rank's `rng`
+  capture plus, when its loader is stateful, its `dataloader` state
+  (on every rank or none).
+
+The whole envelope is checked before any rank selects its entry: a
+missing, extra or incomplete entry (no full `rng` capture, an RNG
+stream such as `torch_cuda` or `dataloader` state on only some ranks)
+refuses the resume. The check reads only what every rank shares (the
+broadcast envelope, the world size, the gathered current layout), so
+all ranks restore, refuse, or discard together. To proceed past a
+refusal, set
+`checkpoint.ignore_rank_state_mismatch = true`: the saved loader/RNG
+state is discarded on every rank with a warning and data order /
+random streams restart fresh (model, optimizer, scheduler and step
+still resume).
+
+Compatibility:
+
+- **Old checkpoint, new reader**: no `per_rank` key, so rank 0's
+  single-copy `rng`/`dataloader` keys restore on every rank, exactly
+  as before.
+- **New checkpoint, old reader**: the single-copy keys (rank 0's)
+  are still written beside the envelope, so pre-envelope readers
+  keep loading. Their documented limitation is unchanged: they
+  restore rank 0's copy on every rank and ignore `per_rank`.
+- **Not a resume**: a `load_path` warm start or an evaluation load
+  ignores `per_rank` and restores the single-copy keys (rank 0's) on
+  every rank, exactly as before, on any world size or layout.
 
 ## RNG capture
 
