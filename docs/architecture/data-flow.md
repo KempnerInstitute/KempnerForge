@@ -233,8 +233,8 @@ In order:
   it) — `ckpt_mgr.save` writes a DCP checkpoint asynchronously and
   updates the `latest` symlink.
 - **Graceful shutdown** — if SIGTERM/SIGUSR1 fired,
-  `ckpt_mgr.save(emergency)` and exit; a step the checkpoint above
-  already saved is not saved again.
+  `ckpt_mgr.save(step)` as the emergency checkpoint, then exit; a step
+  the checkpoint above already saved is not saved again.
 
 ## Shutdown
 
