@@ -655,6 +655,19 @@ class TestRunTrainingLoop:
         assert handler.finished is True
         assert ckpt.waits == 1
 
+    def test_shutdown_on_a_scheduled_step_saves_it_once(self):
+        """Step 2 is on the schedule, so its save is the emergency checkpoint."""
+        config = make_config(max_steps=10)
+        config.checkpoint.interval = 2
+        ckpt = FakeCheckpointManager()
+        handler = FakeShutdownHandler(after_steps=2)
+        session = make_session(config, checkpointer=ckpt, shutdown_handler=handler)
+        step, _ = run_training_loop(session)
+        assert step == 2
+        assert ckpt.saved_steps == [2]
+        assert handler.finished is True
+        assert ckpt.waits == 1
+
     def test_hooks_fire_for_every_step_and_save(self):
         config = make_config(max_steps=4)
         config.checkpoint.interval = 2
