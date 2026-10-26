@@ -263,6 +263,10 @@ class TestTrainConfig:
         with pytest.raises(ValueError, match="'fp16' is not supported"):
             load_config(str(toml), cli_args=[])
 
+    def test_fp16_mixed_precision_is_rejected_from_cli(self) -> None:
+        with pytest.raises(ValueError, match="'fp16' is not supported"):
+            load_config(cli_args=["--train.mixed_precision=fp16"])
+
     def test_data_seed_defaults_to_none(self):
         assert TrainConfig().data_seed is None
 
