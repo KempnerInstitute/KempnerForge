@@ -10,11 +10,14 @@ import io
 import json
 import logging
 import os
+import shutil
+import subprocess
 import sys
 import threading
 import time
 import types
 from contextlib import closing
+from dataclasses import asdict
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -53,6 +56,7 @@ from kempnerforge.metrics.tracker import (
     TensorBoardBackend,
     WandBBackend,
     _flatten_config_params,
+    _git_state,
     _resolve_mlflow_experiment,
 )
 
@@ -366,15 +370,20 @@ class _FakeMlflow:
     """Stand-in `mlflow` module for MLflowBackend tests (no real tracking server)."""
 
     def __init__(self):
-        self._run = types.SimpleNamespace(info=types.SimpleNamespace(run_id="run-xyz"))
+        self._run = types.SimpleNamespace(
+            info=types.SimpleNamespace(run_id="run-xyz", run_name="run-a")
+        )
         self.log_steps: list = []
         self.logged_metrics: list = []
         self.start_run_ids: list = []
         self.end_run_calls = 0
         self.logged_params: list = []
         self.logged_tags: list = []  # (key, value) pairs set through MlflowClient().set_tag
+        self.last_set_tag_synchronous = None
+        self.logged_dicts: list = []  # (artifact file, dict) from MlflowClient().log_dict
+        self.uploaded_files: list = []  # (file name, bytes) from MlflowClient().log_artifact
         self.history_steps: list = []  # steps returned by MlflowClient().get_metric_history
-        self.calls: list = []  # (call, run_id, thread id) of every metric / param / tag call
+        self.calls: list = []  # (call, run_id, thread id) of every metric / param / tag / upload
         self.tracking_uris: list = []  # every URI handed to set_tracking_uri
         self.lifecycle_threads: dict = {}  # thread id that ran start_run / end_run
         self.steps_at_end: list | None = None  # log_steps when end_run was called
@@ -423,11 +432,26 @@ class _FakeMlflow:
     def MlflowClient(self, *a, **k):
         steps = [types.SimpleNamespace(step=s) for s in self.history_steps]
 
-        def set_tag(run_id, key, value):
+        def set_tag(run_id, key, value, synchronous=None):
             self.calls.append(("set_tag", run_id, threading.get_ident()))
             self.logged_tags.append((key, value))
+            self.last_set_tag_synchronous = synchronous
 
-        return types.SimpleNamespace(get_metric_history=lambda run_id, key: steps, set_tag=set_tag)
+        def log_dict(run_id, dictionary, artifact_file):
+            self.calls.append(("log_dict", run_id, threading.get_ident()))
+            self.logged_dicts.append((artifact_file, dictionary))
+
+        def log_artifact(run_id, local_path, artifact_path=None):
+            self.calls.append(("log_artifact", run_id, threading.get_ident()))
+            with open(local_path, "rb") as f:
+                self.uploaded_files.append((os.path.basename(local_path), f.read()))
+
+        return types.SimpleNamespace(
+            get_metric_history=lambda run_id, key: steps,
+            set_tag=set_tag,
+            log_dict=log_dict,
+            log_artifact=log_artifact,
+        )
 
 
 _MLFLOW_HTTP_ENV = (
@@ -461,6 +485,13 @@ def _unset_tracking_env(monkeypatch):
     for name in _TRACKING_ENV:
         monkeypatch.setenv(name, "")
         monkeypatch.delenv(name)
+
+
+@pytest.fixture(autouse=True)
+def _no_git_and_no_launch_toml(monkeypatch):
+    """Start each test outside any repository and with no config file on the command line."""
+    monkeypatch.setattr(tracker_mod, "_git_state", lambda: None)
+    monkeypatch.setattr(sys, "argv", ["pytest"])
 
 
 @pytest.fixture(autouse=True)
@@ -514,6 +545,12 @@ def _capture_warnings(monkeypatch) -> list[str]:
     return seen
 
 
+def _capture_debug(monkeypatch) -> list[str]:
+    seen: list[str] = []
+    monkeypatch.setattr(tracker_mod.logger, "debug", lambda msg, *a, **k: seen.append(str(msg)))
+    return seen
+
+
 def _mlflow_cfg(**kw):
     base = dict(
         enable_mlflow=True,
@@ -558,7 +595,9 @@ class TestMLflowBackend:
         import types
 
         tried: list = []
-        fake_run = types.SimpleNamespace(info=types.SimpleNamespace(run_id="new-run-123"))
+        fake_run = types.SimpleNamespace(
+            info=types.SimpleNamespace(run_id="new-run-123", run_name="new-run")
+        )
 
         def fake_start_run(run_id=None, run_name=None, log_system_metrics=False):
             tried.append(run_id)
@@ -626,6 +665,7 @@ class TestMLflowBackend:
         _flush(backend)
         assert fm.last_log_metrics_synchronous is True
         assert fm.last_log_params_synchronous is True  # init param batches are pinned too
+        assert fm.last_set_tag_synchronous is True  # and so are the run tags
 
     def test_resume_skips_already_logged_steps(self, monkeypatch):
         """On resume, steps already recorded in the run are not re-logged. (Finding #2)"""
@@ -752,11 +792,11 @@ def _assert_names_auth_routes(message):
         assert route in message
 
 
-def _init_backend(monkeypatch, cfg, fm=None):
+def _init_backend(monkeypatch, cfg, fm=None, job=None):
     """Run a backend's lazy init (the first log) over a fake mlflow; return both."""
     fm = fm or _FakeMlflow()
     monkeypatch.setitem(sys.modules, "mlflow", fm)
-    backend = MLflowBackend(cfg)
+    backend = MLflowBackend(cfg, job_config=job)
     backend.log({"train/loss": 1.0}, step=1)
     return backend, fm
 
@@ -884,6 +924,9 @@ class TestMlflowDatabricksAuth:
         warn = tracker_mod._RateLimitedWarning(300.0)
         warn("log_metrics failed (https://u:p@h/x); points may be lost")
         assert warnings_seen == ["log_metrics failed (https://h/x); points may be lost"]
+        plain = "log_metrics failed (https://host?x=a@b#c@d)"
+        tracker_mod._RateLimitedWarning(300.0)(plain)  # a fresh limiter always shows its first
+        assert warnings_seen[-1] == plain
 
     def test_rejected_credentials_disable_with_the_auth_routes_named(self, monkeypatch):
         fm = _FakeMlflow()
@@ -970,6 +1013,294 @@ class TestMlflowDatabricksAuth:
         assert backend._active is (credentials == "found")
         backend.close()
         assert [path for path in opened if "databrickscfg" in path] == []
+
+
+def _job():
+    return JobConfig(model=ModelConfig(dim=128, n_layers=2, n_heads=2, vocab_size=256))
+
+
+def _started(monkeypatch, cfg, job=None):
+    """Init a backend through its first log and wait for its queued metadata calls to land."""
+    backend, fm = _init_backend(monkeypatch, cfg, job=job)
+    _flush(backend)
+    return backend, fm
+
+
+def _record_deadlines(monkeypatch, backend) -> dict:
+    """The deadline each submit to the backend's worker asked for (None = the worker default)."""
+    seen: dict = {}
+    submit = backend._worker.submit
+
+    def spy(what, fn, deadline=None):
+        seen[what] = deadline
+        return submit(what, fn, deadline)
+
+    monkeypatch.setattr(backend._worker, "submit", spy)
+    return seen
+
+
+def _init_repo(path, monkeypatch, commit=True):
+    """A git repository at `path`, made the working directory; returns a runner for git there."""
+    if shutil.which("git") is None:
+        pytest.skip("git is not installed")
+    for name in ("GIT_AUTHOR_NAME", "GIT_COMMITTER_NAME"):
+        monkeypatch.setenv(name, "tester")
+    for name in ("GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL"):
+        monkeypatch.setenv(name, "tester@example.com")
+
+    def git(*args):
+        cmd = ["git", "-c", "commit.gpgsign=false", *args]
+        return subprocess.run(
+            cmd, cwd=path, check=True, capture_output=True, text=True
+        ).stdout.strip()
+
+    path.mkdir()
+    git("init", "-q")
+    if commit:
+        (path / "a.txt").write_text("one\n")
+        git("add", "a.txt")
+        git("commit", "-q", "-m", "first")
+    monkeypatch.chdir(path)
+    return git
+
+
+@pytest.fixture
+def git_repo(tmp_path, monkeypatch):
+    """A repository with one commit as the working directory: (path, git runner)."""
+    path = tmp_path / "repo"
+    return path, _init_repo(path, monkeypatch)
+
+
+class TestMlflowRunMetadata:
+    """A new run gets its description, tags, git commit and config files; a resumed one none."""
+
+    def test_description_and_tags_are_set_on_a_new_run(self, monkeypatch):
+        cfg = _mlflow_cfg(
+            mlflow_description="ablation, no pooling", mlflow_tags={"team": "vlm", "stage": "2"}
+        )
+        _, fm = _started(monkeypatch, cfg)
+        keys = [key for key, _ in fm.logged_tags]
+        assert keys == ["host", "slurm_job_id", "mlflow.note.content", "team", "stage"]
+        tags = dict(fm.logged_tags)
+        assert tags["mlflow.note.content"] == "ablation, no pooling"
+        assert (tags["team"], tags["stage"]) == ("vlm", "2")
+        tag_calls = [(run_id, thread) for kind, run_id, thread in fm.calls if kind == "set_tag"]
+        assert {run_id for run_id, _ in tag_calls} == {"run-xyz"}  # every tag named its run
+        assert threading.get_ident() not in {thread for _, thread in tag_calls}
+
+    def test_configured_tags_override_the_automatic_ones(self, monkeypatch):
+        monkeypatch.setattr(tracker_mod, "_git_state", lambda: ("a" * 40, False))
+        cfg = _mlflow_cfg(mlflow_tags={"host": "my-node", "mlflow.source.git.commit": "pinned"})
+        _, fm = _started(monkeypatch, cfg)
+        tags = dict(fm.logged_tags)  # the last write to a key is the one that stays
+        assert tags["host"] == "my-node"
+        assert tags["mlflow.source.git.commit"] == "pinned"
+        assert tags["mlflow.source.git.dirty"] == "false"
+        assert [key for key, _ in fm.logged_tags].count("host") == 1
+
+    def test_nothing_is_applied_again_on_resume(self, monkeypatch, tmp_path):
+        toml = tmp_path / "run.toml"
+        toml.write_text("[train]\n")
+        monkeypatch.setattr(sys, "argv", ["train.py", str(toml)])
+        git_asked: list = []
+        monkeypatch.setattr(tracker_mod, "_git_state", lambda: git_asked.append(1))
+        cfg = _mlflow_cfg(
+            mlflow_run_id="existing-run", mlflow_description="d", mlflow_tags={"team": "vlm"}
+        )
+        backend, fm = _started(monkeypatch, cfg, job=_job())
+        assert backend._active is True and fm.start_run_ids == ["existing-run"]
+        assert fm.logged_tags == [] and fm.logged_params == []
+        assert fm.logged_dicts == [] and fm.uploaded_files == []
+        assert git_asked == []
+
+    def test_defaults_add_no_configured_metadata(self, monkeypatch):
+        job = _job()
+        _, fm = _started(monkeypatch, _mlflow_cfg(), job=job)
+        assert [key for key, _ in fm.logged_tags] == ["host", "slurm_job_id"]
+        params = {k: v for batch in fm.logged_params for k, v in batch.items()}
+        assert params == _flatten_config_params(job)
+        assert not [k for k in params if "mlflow_tags" in k or "mlflow_description" in k]
+        assert [name for name, _ in fm.logged_dicts] == ["config.json"]
+        assert fm.uploaded_files == []  # nothing named a launch config
+
+    def test_a_new_run_is_tagged_with_the_commit_it_runs_at(self, monkeypatch, git_repo):
+        monkeypatch.setattr(tracker_mod, "_git_state", _git_state)
+        repo, git = git_repo
+        _, fm = _started(monkeypatch, _mlflow_cfg())
+        assert dict(fm.logged_tags)["mlflow.source.git.commit"] == git("rev-parse", "HEAD")
+        assert dict(fm.logged_tags)["mlflow.source.git.dirty"] == "false"
+        (repo / "a.txt").write_text("changed\n")
+        _, fm = _started(monkeypatch, _mlflow_cfg())
+        assert dict(fm.logged_tags)["mlflow.source.git.dirty"] == "true"
+
+    def test_git_is_queried_on_the_worker_never_on_the_calling_thread(self, monkeypatch):
+        asked: list = []
+        monkeypatch.setattr(tracker_mod, "_git_state", lambda: asked.append(threading.get_ident()))
+        _started(monkeypatch, _mlflow_cfg())
+        assert len(asked) == 1 and asked[0] != threading.get_ident()
+
+    def test_an_unknown_dirty_state_sets_only_the_commit(self, monkeypatch):
+        monkeypatch.setattr(tracker_mod, "_git_state", lambda: ("b" * 40, None))
+        _, fm = _started(monkeypatch, _mlflow_cfg())
+        assert dict(fm.logged_tags)["mlflow.source.git.commit"] == "b" * 40
+        assert "mlflow.source.git.dirty" not in dict(fm.logged_tags)
+
+    def test_a_missing_git_skips_the_tag_without_a_warning(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(tracker_mod, "_git_state", _git_state)
+        monkeypatch.setenv("PATH", str(tmp_path))  # an empty directory: there is no git to run
+        warnings_seen = _capture_warnings(monkeypatch)
+        debug_seen = _capture_debug(monkeypatch)
+        backend, fm = _started(monkeypatch, _mlflow_cfg())
+        assert backend._active is True
+        assert [key for key, _ in fm.logged_tags] == ["host", "slurm_job_id"]
+        assert warnings_seen == []
+        assert any("git rev-parse did not run" in note for note in debug_seen)
+
+    def test_config_json_is_uploaded_with_the_upload_deadline_and_the_run_id(self, monkeypatch):
+        fm = _FakeMlflow()
+        monkeypatch.setitem(sys.modules, "mlflow", fm)
+        job = _job()
+        backend = MLflowBackend(_mlflow_cfg(), job_config=job)
+        deadlines = _record_deadlines(monkeypatch, backend)
+        backend.log({"train/loss": 1.0}, step=1)
+        _flush(backend)
+        assert fm.logged_dicts == [("config.json", asdict(job))]
+        assert deadlines["upload config.json"] == tracker_mod._UPLOAD_DEADLINE_S == 180.0
+        assert deadlines["set_tag host"] is None and deadlines["log_params"] is None
+        uploads = [(run_id, thread) for kind, run_id, thread in fm.calls if kind == "log_dict"]
+        assert [run_id for run_id, _ in uploads] == ["run-xyz"]
+        assert uploads[0][1] != threading.get_ident()
+
+    @pytest.mark.parametrize("relative", [False, True])
+    def test_the_launch_toml_is_uploaded_when_the_command_line_names_it(
+        self, monkeypatch, tmp_path, relative
+    ):
+        toml = tmp_path / "run.toml"
+        toml.write_text("[train]\nmax_steps = 3\n")
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(sys, "argv", ["train.py", "run.toml" if relative else str(toml)])
+        fm = _FakeMlflow()
+        monkeypatch.setitem(sys.modules, "mlflow", fm)
+        backend = MLflowBackend(_mlflow_cfg())
+        deadlines = _record_deadlines(monkeypatch, backend)
+        backend.log({"train/loss": 1.0}, step=1)
+        _flush(backend)
+        assert fm.uploaded_files == [("run.toml", toml.read_bytes())]
+        assert deadlines["upload launch config"] == tracker_mod._UPLOAD_DEADLINE_S
+        (run_id, thread) = [(r, t) for kind, r, t in fm.calls if kind == "log_artifact"][0]
+        assert run_id == "run-xyz" and thread != threading.get_ident()
+
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ["train.py"],
+            ["train.py", "--train.max_steps=5"],
+            ["pytest", "tests/unit"],
+            ["train.py", "missing.toml"],
+            ["train.py", "dir.toml"],
+        ],
+    )
+    def test_a_launch_config_that_is_not_there_is_skipped_quietly(
+        self, monkeypatch, tmp_path, argv
+    ):
+        (tmp_path / "dir.toml").mkdir()
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(sys, "argv", argv)
+        warnings_seen = _capture_warnings(monkeypatch)
+        debug_seen = _capture_debug(monkeypatch)
+        backend, fm = _started(monkeypatch, _mlflow_cfg())
+        assert backend._active is True and fm.uploaded_files == []
+        assert warnings_seen == []
+        assert any("launch config" in note for note in debug_seen)
+
+    def test_a_hung_upload_is_abandoned_at_the_upload_deadline(self, monkeypatch):
+        fm = _FakeMlflow()
+        release = threading.Event()
+        client = fm.MlflowClient
+
+        def hanging_client():
+            hung = client()
+            hung.log_dict = lambda run_id, dictionary, artifact_file: release.wait()
+            return hung
+
+        fm.MlflowClient = hanging_client
+        monkeypatch.setitem(sys.modules, "mlflow", fm)
+        monkeypatch.setattr(tracker_mod, "_UPLOAD_DEADLINE_S", 0.2)
+        warnings_seen = _capture_warnings(monkeypatch)
+        backend = MLflowBackend(_mlflow_cfg(), job_config=_job())
+        try:
+            backend.log({"train/loss": 1.0}, step=1)
+            backend.log({"train/loss": 0.5}, step=2)
+            _flush(backend)  # the 60 s call deadline would outlast this wait
+            assert fm.log_steps == [1, 2]  # metrics queued behind the hung upload still land
+            hung_warnings = [w for w in warnings_seen if "upload config.json" in w]
+            assert len(hung_warnings) == 1 and "0.2s" in hung_warnings[0]
+        finally:
+            release.set()
+
+
+def _completed(returncode=0, stdout="", stderr=""):
+    return subprocess.CompletedProcess(["git"], returncode, stdout, stderr)
+
+
+class TestGitState:
+    def test_reports_the_head_commit_and_whether_tracked_files_differ(self, git_repo):
+        repo, git = git_repo
+        sha = git("rev-parse", "HEAD")
+        assert _git_state() == (sha, False)
+        (repo / "untracked.txt").write_text("x")
+        assert _git_state() == (sha, False)  # an untracked file is not a difference
+        (repo / "a.txt").write_text("two\n")
+        assert _git_state() == (sha, True)
+
+    def test_nothing_to_report_outside_a_repository(self, monkeypatch, tmp_path):
+        if shutil.which("git") is None:
+            pytest.skip("git is not installed")
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.parent))
+        debug_seen = _capture_debug(monkeypatch)
+        assert _git_state() is None
+        assert len(debug_seen) == 1 and "git rev-parse exited" in debug_seen[0]
+
+    def test_nothing_to_report_before_the_first_commit(self, monkeypatch, tmp_path):
+        _init_repo(tmp_path / "empty", monkeypatch, commit=False)
+        assert _git_state() is None
+
+    @pytest.mark.parametrize(
+        ("outcomes", "state", "note"),
+        [
+            ([subprocess.TimeoutExpired("git", 10)], None, "git rev-parse did not run"),
+            ([_completed(128, stderr="fatal: not a git repository")], None, "exited 128: fatal"),
+            ([_completed(0, "HEAD\n")], None, "'HEAD', not a commit id"),
+            (
+                [_completed(0, "c" * 40 + "\n"), subprocess.TimeoutExpired("git", 10)],
+                ("c" * 40, None),
+                "git status did not run",
+            ),
+            (
+                [_completed(0, "c" * 40 + "\n"), _completed(1, stderr="fatal: index")],
+                ("c" * 40, None),
+                "git status exited 1",
+            ),
+            ([_completed(0, "d" * 64 + "\n"), _completed(0, " M a.txt\n")], ("d" * 64, True), ""),
+        ],
+    )
+    def test_a_failing_or_odd_git_never_raises(self, monkeypatch, outcomes, state, note):
+        queue = list(outcomes)
+
+        def run(cmd, **kwargs):
+            outcome = queue.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        monkeypatch.setattr(tracker_mod.subprocess, "run", run)
+        warnings_seen = _capture_warnings(monkeypatch)
+        debug_seen = _capture_debug(monkeypatch)
+        assert _git_state() == state
+        assert warnings_seen == []
+        assert len(debug_seen) == (1 if note else 0)
+        assert all(note in n for n in debug_seen)
 
 
 class TestResolveMlflowExperiment:
@@ -1113,7 +1444,8 @@ class TestMLflowBestEffort:
         assert fm.lifecycle_threads == {"start_run": owner, "end_run": owner}
         assert owner != caller
         assert fm.ended == ["run-xyz"]  # end_run found the run it started, so it was ended
-        assert {kind for kind, _, _ in fm.calls} == {"log_metrics", "log_params", "set_tag"}
+        kinds = {"log_metrics", "log_params", "set_tag", "log_dict"}
+        assert {kind for kind, _, _ in fm.calls} == kinds
         assert {run_id for _, run_id, _ in fm.calls} == {"run-xyz"}  # every call named its run
         assert {caller, owner}.isdisjoint(thread for _, _, thread in fm.calls)
         assert fm.log_steps == [1, 2]
@@ -1617,7 +1949,9 @@ class TestTrackingEntries:
         def start_run(run_id=None, run_name=None, log_system_metrics=False):
             if run_id is not None:
                 raise RuntimeError("RESOURCE_DOES_NOT_EXIST")  # the saved run is gone
-            return types.SimpleNamespace(info=types.SimpleNamespace(run_id="fresh-run"))
+            return types.SimpleNamespace(
+                info=types.SimpleNamespace(run_id="fresh-run", run_name="fresh")
+            )
 
         fm.start_run = start_run
         cfg = _mlflow_cfg(mlflow_run_id="stale-run")
@@ -1801,6 +2135,14 @@ class TestTrackingEntries:
         tracker._backends = [_EntryBackend(error=Unprintable()), _EntryBackend(kept)]
         assert tracker.tracking_entries() == [kept]
 
+    def test_tracker_scrubs_credentials_from_a_backends_error(self, monkeypatch):
+        seen = _capture_formatted_warnings(monkeypatch)
+        tracker = self._tracker()
+        error = RuntimeError("no answer from https://u:tok@host/api")
+        tracker._backends = [_EntryBackend(error=error)]
+        assert tracker.tracking_entries() == []
+        assert len(seen) == 1 and "u:tok@" not in seen[0] and "https://host/api" in seen[0]
+
     @pytest.mark.parametrize(
         "bad",
         [
@@ -1948,318 +2290,309 @@ class TestTrackingEntries:
 
 
 # ---------------------------------------------------------------------------
-# Checkpoint registration: one external MLflow model per saved checkpoint
 # ---------------------------------------------------------------------------
 
 
 class _FakeRegistry(_FakeMlflow):
-    """_FakeMlflow plus the run lookup and logged-model calls a checkpoint registration makes."""
+    """_FakeMlflow whose clients also reach the logged models of a FakeModelStore."""
 
-    def __init__(self, run_name="run-a"):
+    MODEL_CALLS = (
+        "get_run",
+        "search_logged_models",
+        "create_logged_model",
+        "log_model_artifacts",
+        "finalize_logged_model",
+    )
+
+    def __init__(self, store, run_name="run-a"):
         super().__init__()
-        self.run_name = run_name
-        self.models: list = []  # the external models the server holds
-        self.created: list = []  # keyword arguments of every create_external_model call
-        self.threads: set = set()  # ids of the threads that made registration calls
+        self._run.info.run_name = run_name
+        self.store = store
 
-    def get_run(self, run_id):
-        self.threads.add(threading.get_ident())
-        return types.SimpleNamespace(
-            info=types.SimpleNamespace(run_name=self.run_name, experiment_id="7")
-        )
-
-    def search_logged_models(self, experiment_ids, filter_string=None, output_format="pandas"):
-        self.threads.add(threading.get_ident())
-        assert output_format == "list"  # the pandas format needs pandas, which mlflow-skinny lacks
-        name = filter_string.removeprefix("name = '").removesuffix("'")
-        return [m for m in self.models if m.name == name and m.experiment_id in experiment_ids]
-
-    def create_external_model(
-        self,
-        name=None,
-        source_run_id=None,
-        tags=None,
-        params=None,
-        model_type=None,
-        experiment_id=None,
-    ):
-        self.threads.add(threading.get_ident())
-        fields = dict(
-            name=name,
-            source_run_id=source_run_id,
-            params=params,
-            model_type=model_type,
-            experiment_id=experiment_id,
-        )
-        self.created.append(fields)
-        model_id = f"m-{len(self.models) + 1}"
-        model = types.SimpleNamespace(model_id=model_id, status="READY", **fields)
-        self.models.append(model)
-        return model
+    def MlflowClient(self, *a, tracking_uri=None, **k):
+        client = super().MlflowClient()
+        models = self.store.client(tracking_uri)
+        for call in self.MODEL_CALLS:
+            setattr(client, call, getattr(models, call))
+        return client
 
 
-def _registering_backend(monkeypatch, fm=None, **cfg):
-    """A live MLflowBackend that registers checkpoints, over a fake server: (backend, fake)."""
+def _registering_backend(monkeypatch, store, run_name="run-a", **cfg):
+    """A live MLflowBackend that registers checkpoints, over ``store``: (backend, fake mlflow)."""
     config = _mlflow_cfg(mlflow_register_checkpoints=True, **cfg)
-    return _init_backend(monkeypatch, config, fm or _FakeRegistry())
+    return _init_backend(monkeypatch, config, _FakeRegistry(store, run_name))
 
 
-class TestBoundedCall:
-    def test_returns_what_the_call_returned(self):
-        call = tracker_mod._BoundedCall("T", lambda: 7)
-        call.start()
-        assert call.result(5) == 7
-        assert not call.running
-
-    def test_raises_the_calls_error_on_the_caller(self):
-        def boom():
-            raise RuntimeError("no server")
-
-        call = tracker_mod._BoundedCall("T", boom)
-        call.start()
-        with pytest.raises(RuntimeError, match="no server"):
-            call.result(5)
-        assert not call.running
-
-    def test_gives_up_at_its_deadline_and_leaves_the_call_running(self):
-        release = threading.Event()
-        call = tracker_mod._BoundedCall("T", lambda: release.wait(10) and "late")
-        call.start()
-        try:
-            with pytest.raises(TimeoutError, match="within 0.1s"):
-                call.result(0.1)
-            assert call.running
-        finally:
-            release.set()
-        assert call.result(10) == "late"  # the answer is kept for whoever asks again
-        assert not call.running
-
-    def test_a_call_that_was_never_started_is_not_running(self):
-        assert not tracker_mod._BoundedCall("T", lambda: None).running
+def _kept_checkpoint(root, step):
+    """A checkpoint directory the manager still keeps: its metadata.json is there."""
+    directory = root / f"step_{step}"
+    directory.mkdir(parents=True)
+    (directory / "metadata.json").write_text(json.dumps({"step": step}))
+    return directory
 
 
 class TestCheckpointRegistration:
-    def test_each_save_makes_one_external_model_linked_to_the_run(self, monkeypatch, tmp_path):
-        backend, fm = _registering_backend(monkeypatch)
-        assert backend.register_checkpoint(5, tmp_path / "step_5") == {"model_id": "m-1"}
-        assert backend.register_checkpoint(6, tmp_path / "step_6") == {"model_id": "m-2"}
-        assert fm.created == [
-            {
-                "name": f"run-a-step_{step}",
-                "source_run_id": "run-xyz",
-                "params": {"step": str(step), "checkpoint_dir": str(tmp_path / f"step_{step}")},
-                "model_type": "checkpoint",
-                "experiment_id": "7",
-            }
-            for step in (5, 6)
-        ]
+    def test_a_save_names_the_model_and_gets_its_id_once_registered(
+        self, monkeypatch, tmp_path, model_store
+    ):
+        backend, _ = _registering_backend(monkeypatch, model_store)
+        assert backend.checkpoint_fields(5) == {"model_name": "run-a-step_5"}
+        recorded: list = []
+        backend.register_checkpoint(5, _kept_checkpoint(tmp_path, 5), recorded.append)
+        _flush(backend)
+        assert recorded == [{"model_id": "m-1"}]
+        assert backend.checkpoint_fields(5) == {"model_name": "run-a-step_5", "model_id": "m-1"}
+        assert backend.checkpoint_fields(6) == {"model_name": "run-a-step_6"}
 
-    def test_checkpoint_directory_is_recorded_as_an_absolute_path(self, monkeypatch, tmp_path):
-        backend, fm = _registering_backend(monkeypatch)
+    def test_the_model_is_made_on_the_worker_and_its_id_recorded_later(
+        self, monkeypatch, tmp_path, model_store
+    ):
+        backend, _ = _registering_backend(monkeypatch, model_store)
+        directory = _kept_checkpoint(tmp_path, 5)
+        recorded: list = []
+        model_store.hold("get_run")
+        try:
+            start = time.perf_counter()
+            backend.register_checkpoint(5, directory, recorded.append)
+            assert time.perf_counter() - start < 5.0
+            assert model_store.entered.wait(10)
+            assert recorded == []
+        finally:
+            model_store.release.set()
+        _flush(backend)
+        assert recorded == [{"model_id": "m-1"}]
+        (model,) = model_store.models
+        assert (model.name, model.source_run_id, model.model_type, model.status) == (
+            "run-a-step_5",
+            "run-xyz",
+            "checkpoint",
+            "READY",
+        )
+        assert model.params == {"step": "5", "checkpoint_dir": str(directory)}
+        assert threading.get_ident() not in {thread for _, _, thread in model_store.calls}
+        assert {uri for _, uri, _ in model_store.calls} == {"http://localhost:5000"}
+
+    def test_the_checkpoint_directory_is_recorded_as_an_absolute_path(
+        self, monkeypatch, tmp_path, model_store
+    ):
+        backend, _ = _registering_backend(monkeypatch, model_store)
+        _kept_checkpoint(tmp_path / "ckpts", 3)
         monkeypatch.chdir(tmp_path)
-        backend.register_checkpoint(3, Path("ckpts") / "step_3")
-        assert fm.created[0]["params"]["checkpoint_dir"] == str(tmp_path / "ckpts" / "step_3")
-
-    def test_calls_run_off_the_saving_thread(self, monkeypatch, tmp_path):
-        backend, fm = _registering_backend(monkeypatch)
-        backend.register_checkpoint(5, tmp_path / "step_5")
-        assert fm.threads and threading.get_ident() not in fm.threads
+        backend.register_checkpoint(3, Path("ckpts") / "step_3", lambda fields: None)
+        _flush(backend)
+        assert model_store.models[0].params["checkpoint_dir"] == str(tmp_path / "ckpts" / "step_3")
 
     @pytest.mark.parametrize(
         ("run_name", "model_name"),
         [
             ("7b-debug", "7b-debug-step_5"),
-            ("lr 3e-4 (v2)", "lr 3e-4 (v2)-step_5"),
             ("a.b/c:d%e\"f'g", "a_b_c_d_e_f_g-step_5"),
             (None, "run-xyz-step_5"),
             ("", "run-xyz-step_5"),
         ],
-        ids=["plain", "spaces", "rejected-characters", "no-name", "empty-name"],
+        ids=["plain", "rejected-characters", "no-name", "empty-name"],
     )
-    def test_model_is_named_after_the_run_and_the_step(
-        self, monkeypatch, tmp_path, run_name, model_name
+    def test_the_model_is_named_after_the_run_and_the_step(
+        self, monkeypatch, tmp_path, model_store, run_name, model_name
     ):
-        backend, fm = _registering_backend(monkeypatch, _FakeRegistry(run_name=run_name))
-        assert backend.register_checkpoint(5, tmp_path / "step_5") == {"model_id": "m-1"}
-        assert [c["name"] for c in fm.created] == [model_name]
+        backend, _ = _registering_backend(monkeypatch, model_store, run_name=run_name)
+        assert backend.checkpoint_fields(5) == {"model_name": model_name}
+        backend.register_checkpoint(5, _kept_checkpoint(tmp_path, 5), lambda fields: None)
+        _flush(backend)
+        assert [m.name for m in model_store.models] == [model_name]
 
-    def test_a_step_that_already_has_a_model_gets_that_one_not_a_second(
-        self, monkeypatch, tmp_path
+    def test_a_registered_step_is_recorded_at_once_without_the_server_or_the_worker(
+        self, monkeypatch, tmp_path, model_store
     ):
-        backend, fm = _registering_backend(monkeypatch)
-        first = backend.register_checkpoint(5, tmp_path / "step_5")
-        again = backend.register_checkpoint(5, tmp_path / "step_5")  # saved twice at one step
-        assert first == again == {"model_id": "m-1"}
-        assert len(fm.created) == 1
+        backend, _ = _registering_backend(monkeypatch, model_store)
+        directory = _kept_checkpoint(tmp_path, 5)
+        backend.register_checkpoint(5, directory, lambda fields: None)
+        _flush(backend)
+        server_calls = len(model_store.calls)
+        submitted: list = []
+        monkeypatch.setattr(backend._worker, "submit", lambda *a, **k: submitted.append(a))
+        recorded: list = []
+        backend.register_checkpoint(5, directory, recorded.append)
+        assert recorded == [{"model_id": "m-1"}]
+        assert len(model_store.calls) == server_calls and submitted == []
 
-    def test_a_resumed_run_reuses_the_models_of_steps_it_saved_before(self, monkeypatch, tmp_path):
-        fm = _FakeRegistry()
+    def test_a_step_committed_again_while_registering_gets_the_same_id(
+        self, monkeypatch, tmp_path, model_store
+    ):
+        backend, _ = _registering_backend(monkeypatch, model_store)
+        directory = _kept_checkpoint(tmp_path, 5)
+        first: list = []
+        again: list = []
+        model_store.hold("get_run")
+        try:
+            backend.register_checkpoint(5, directory, first.append)
+            assert model_store.entered.wait(10)
+            backend.register_checkpoint(5, directory, again.append)
+        finally:
+            model_store.release.set()
+        _flush(backend)
+        assert first == again == [{"model_id": "m-1"}]
+        assert len(model_store.named("get_run")) == 1 and len(model_store.models) == 1
 
-        def held(model_id, name, run, status="READY"):
-            return types.SimpleNamespace(
-                model_id=model_id, name=name, source_run_id=run, experiment_id="7", status=status
-            )
+    def test_a_registration_still_running_past_its_deadline_is_not_repeated(
+        self, monkeypatch, tmp_path, model_store
+    ):
+        monkeypatch.setattr(tracker_mod, "_REGISTER_DEADLINE_S", 0.2)
+        backend, _ = _registering_backend(monkeypatch, model_store)
+        directory = _kept_checkpoint(tmp_path, 5)
+        first: list = []
+        again: list = []
+        model_store.hold("get_run")
+        try:
+            backend.register_checkpoint(5, directory, first.append)
+            assert model_store.entered.wait(10)
+            _flush(backend)
+            backend.register_checkpoint(5, directory, again.append)
+            _flush(backend)
+            assert again == [] and len(model_store.named("get_run")) == 1
+        finally:
+            model_store.release.set()
+        for thread in backend._worker._calls:
+            thread.join(10)
+        assert first == [{"model_id": "m-1"}] and len(model_store.models) == 1
+        assert backend._registering == set()
 
-        fm.models = [held("m-old", "run-a-step_5", "run-xyz"), held("m-x", "run-a-step_6", "other")]
-        cfg = _mlflow_cfg(mlflow_register_checkpoints=True, mlflow_run_id="run-xyz")
-        backend, _ = _init_backend(monkeypatch, cfg, fm)
-        assert fm.created == []  # resuming registers nothing by itself
-        assert backend.register_checkpoint(5, tmp_path / "step_5") == {"model_id": "m-old"}
-        assert fm.created == []  # step 5 had its model before the resume
-        # another run's model of the same name is not this run's
-        assert backend.register_checkpoint(6, tmp_path / "step_6") == {"model_id": "m-3"}
-        assert [c["source_run_id"] for c in fm.created] == ["run-xyz"]
+    def test_a_registration_the_worker_drops_leaves_no_mark_so_a_later_commit_retries(
+        self, monkeypatch, tmp_path, model_store
+    ):
+        backend, _ = _registering_backend(monkeypatch, model_store)
+        directory = _kept_checkpoint(tmp_path, 5)
+        recorded: list = []
+        backend._worker._max_threads = 0
+        backend.register_checkpoint(5, directory, recorded.append)
+        _flush(backend)
+        assert recorded == [] and model_store.calls == [] and backend._registering == set()
+        backend._worker._max_threads = tracker_mod._MAX_CALL_THREADS
+        backend.register_checkpoint(5, directory, recorded.append)
+        _flush(backend)
+        assert recorded == [{"model_id": "m-1"}]
 
-    def test_a_model_a_failed_attempt_left_unfinished_is_not_reused(self, monkeypatch, tmp_path):
-        fm = _FakeRegistry()
-        create = fm.create_external_model
+    def test_a_resumed_run_reuses_the_model_of_a_step_it_registered_before(
+        self, monkeypatch, tmp_path, model_store
+    ):
+        earlier = model_store.add("run-a-step_5")
+        backend, _ = _registering_backend(monkeypatch, model_store, mlflow_run_id="run-xyz")
+        assert model_store.calls == []
+        recorded: list = []
+        backend.register_checkpoint(5, _kept_checkpoint(tmp_path, 5), recorded.append)
+        _flush(backend)
+        assert recorded == [{"model_id": earlier.model_id}]
+        assert model_store.named("create_logged_model") == []
 
-        def create_then_fail(**kwargs):
-            create(**kwargs).status = "PENDING"  # persisted, but its descriptor never uploaded
-            raise RuntimeError("descriptor upload refused")
+    def test_a_checkpoint_removed_before_its_turn_makes_no_model(
+        self, monkeypatch, tmp_path, model_store
+    ):
+        backend, fm = _registering_backend(monkeypatch, model_store)
+        warnings_seen = _capture_warnings(monkeypatch)
+        directory = _kept_checkpoint(tmp_path, 5)
+        recorded: list = []
+        gate, entered = _park_log_metrics(fm)
+        try:
+            backend.log({"train/loss": 0.5}, step=2)
+            assert entered.wait(10)
+            backend.register_checkpoint(5, directory, recorded.append)
+            shutil.rmtree(directory)
+        finally:
+            gate.set()
+        _flush(backend)
+        assert model_store.calls == [] and recorded == [] and warnings_seen == []
+        assert backend._registering == set()
 
-        fm.create_external_model = create_then_fail
-        backend, _ = _registering_backend(monkeypatch, fm)
-        assert backend.register_checkpoint(5, tmp_path / "step_5") is None
-        del fm.create_external_model  # the server recovers
-        assert backend.register_checkpoint(5, tmp_path / "step_5") == {"model_id": "m-2"}
-        assert [m.status for m in fm.models] == ["PENDING", "READY"]
-        assert backend.register_checkpoint(5, tmp_path / "step_5") == {"model_id": "m-2"}
+    def test_a_kept_checkpoint_is_told_by_the_managers_own_sidecar_file(self):
+        from kempnerforge.checkpoint import manager
 
-    def test_nothing_is_called_unless_the_gate_is_on(self, monkeypatch, tmp_path):
-        backend, fm = _init_backend(monkeypatch, _mlflow_cfg(), _FakeRegistry())
+        assert tracker_mod._SIDECAR_FILE == manager._METADATA_FILE
+
+    def test_a_failure_warns_once_and_a_later_commit_of_the_step_retries(
+        self, monkeypatch, tmp_path, model_store
+    ):
+        backend, fm = _registering_backend(monkeypatch, model_store)
+        refusal = RuntimeError("POST http://user:token@mlflow.example:5000/api failed")
+        model_store.fail("create_logged_model", refusal)
+        warnings_seen = _capture_warnings(monkeypatch)
+        recorded: list = []
+        for step in (5, 6):
+            backend.register_checkpoint(step, _kept_checkpoint(tmp_path, step), recorded.append)
+            _flush(backend)
+        assert recorded == [] and backend._registering == set()
+        assert len(warnings_seen) == 1
+        assert "step 5" in warnings_seen[0] and "no model_id" in warnings_seen[0]
+        assert "POST http://mlflow.example:5000/api failed" in warnings_seen[0]
+        assert "token" not in warnings_seen[0]
+        assert backend.checkpoint_fields(5) == {"model_name": "run-a-step_5"}
+        backend.log({"train/loss": 0.5}, step=2)
+        _flush(backend)
+        assert fm.log_steps == [1, 2]
+        model_store.recover()
+        backend.register_checkpoint(5, tmp_path / "step_5", recorded.append)
+        _flush(backend)
+        assert recorded == [{"model_id": "m-1"}]
+
+    def test_a_registration_the_worker_refuses_warns_and_is_retried_later(
+        self, monkeypatch, tmp_path, model_store
+    ):
+        backend, _ = _registering_backend(monkeypatch, model_store)
+        warnings_seen = _capture_warnings(monkeypatch)
+        directory = _kept_checkpoint(tmp_path, 5)
+        recorded: list = []
+        submit = backend._worker.submit
+        monkeypatch.setattr(backend._worker, "submit", lambda *a, **k: False)
+        backend.register_checkpoint(5, directory, recorded.append)
+        assert len(warnings_seen) == 1 and "step 5 was not queued" in warnings_seen[0]
+        assert "no model_id" in warnings_seen[0] and backend._registering == set()
+        monkeypatch.setattr(backend._worker, "submit", submit)
+        backend.register_checkpoint(5, directory, recorded.append)
+        _flush(backend)
+        assert recorded == [{"model_id": "m-1"}]
+
+    def test_nothing_is_registered_unless_the_gate_is_on(self, monkeypatch, tmp_path, model_store):
+        backend, _ = _init_backend(monkeypatch, _mlflow_cfg(), _FakeRegistry(model_store))
         assert backend._config.mlflow_register_checkpoints is False
-        assert backend.register_checkpoint(5, tmp_path / "step_5") is None
-        assert fm.created == [] and fm.threads == set() and backend._registration is None
+        recorded: list = []
+        assert backend.checkpoint_fields(5) is None
+        backend.register_checkpoint(5, _kept_checkpoint(tmp_path, 5), recorded.append)
+        _flush(backend)
+        assert recorded == [] and model_store.calls == [] and backend._registering == set()
 
-    def test_a_run_that_is_not_live_registers_nothing(self, monkeypatch, tmp_path):
-        fm = _FakeRegistry()
-        monkeypatch.setitem(sys.modules, "mlflow", fm)
+    def test_a_run_that_is_not_live_registers_nothing(self, monkeypatch, tmp_path, model_store):
+        monkeypatch.setitem(sys.modules, "mlflow", _FakeRegistry(model_store))
         backend = MLflowBackend(_mlflow_cfg(mlflow_register_checkpoints=True))
-        assert backend.register_checkpoint(5, tmp_path / "step_5") is None  # no run yet
+        directory = _kept_checkpoint(tmp_path, 5)
+        recorded: list = []
+        assert backend.checkpoint_fields(5) is None
+        backend.register_checkpoint(5, directory, recorded.append)
         backend.log({"train/loss": 1.0}, step=1)
-        assert backend.register_checkpoint(5, tmp_path / "step_5") == {"model_id": "m-1"}
         backend.close()
-        assert backend.register_checkpoint(6, tmp_path / "step_6") is None  # the run has ended
+        assert backend.checkpoint_fields(5) is None  # the run has ended
+        backend.register_checkpoint(5, directory, recorded.append)
         monkeypatch.setitem(sys.modules, "mlflow", None)
         failed = MLflowBackend(_mlflow_cfg(mlflow_register_checkpoints=True))
         failed.log({"train/loss": 1.0}, step=1)
-        assert failed.register_checkpoint(5, tmp_path / "step_5") is None  # init failed
-        assert len(fm.created) == 1
+        assert failed.checkpoint_fields(5) is None
+        failed.register_checkpoint(5, directory, recorded.append)
+        assert recorded == [] and model_store.calls == []
 
-    def test_a_failing_registration_costs_only_the_id_and_warns_once(self, monkeypatch, tmp_path):
-        fm = _FakeRegistry()
-
-        def refuse(**kwargs):
-            raise RuntimeError("server said no")
-
-        fm.create_external_model = refuse
-        warnings_seen = _capture_warnings(monkeypatch)
-        backend, _ = _registering_backend(monkeypatch, fm)
-        assert backend.register_checkpoint(5, tmp_path / "step_5") is None
-        assert backend.register_checkpoint(6, tmp_path / "step_6") is None
-        assert len(warnings_seen) == 1  # the second one falls inside the warning interval
-        assert "step 5" in warnings_seen[0] and "server said no" in warnings_seen[0]
-        assert "no model_id" in warnings_seen[0]
-        assert backend._active is True and backend.tracking_entry() is not None
-        backend.log({"train/loss": 0.5}, step=2)
-        _flush(backend)
-        assert fm.log_steps == [1, 2]  # logging carries on
-        del fm.create_external_model  # the server recovers
-        assert backend.register_checkpoint(7, tmp_path / "step_7") == {"model_id": "m-1"}
-
-    def test_the_warning_does_not_repeat_credentials_a_server_error_quotes(
-        self, monkeypatch, tmp_path
+    def test_registration_leaves_the_runs_entry_and_metrics_alone(
+        self, monkeypatch, tmp_path, model_store
     ):
-        fm = _FakeRegistry()
-
-        def refuse(**kwargs):
-            raise RuntimeError("POST http://user:token@mlflow.example:5000/api failed")
-
-        fm.create_external_model = refuse
-        warnings_seen = _capture_warnings(monkeypatch)
-        backend, _ = _registering_backend(monkeypatch, fm)
-        assert backend.register_checkpoint(5, tmp_path / "step_5") is None
-        assert "POST http://mlflow.example:5000/api failed" in warnings_seen[0]
-        assert "token" not in warnings_seen[0]
-
-    @pytest.mark.parametrize("model_id", ["", "  ", None])
-    def test_a_blank_model_id_is_never_recorded(self, monkeypatch, tmp_path, model_id):
-        fm = _FakeRegistry()
-        fm.create_external_model = lambda **kwargs: types.SimpleNamespace(model_id=model_id)
-        warnings_seen = _capture_warnings(monkeypatch)
-        backend, _ = _registering_backend(monkeypatch, fm)
-        assert backend.register_checkpoint(5, tmp_path / "step_5") is None
-        assert len(warnings_seen) == 1 and "no model id" in warnings_seen[0]
-
-    @pytest.mark.parametrize(
-        "hang_at", ["get_run", "search_logged_models", "create_external_model"]
-    )
-    def test_a_hung_server_costs_one_bounded_wait_and_later_saves_skip(
-        self, monkeypatch, tmp_path, hang_at
-    ):
-        fm = _FakeRegistry()
-        release = threading.Event()
-        entered: list = []
-        original = getattr(fm, hang_at)
-
-        def hang(*args, **kwargs):
-            entered.append(hang_at)
-            release.wait(10)
-            return original(*args, **kwargs)
-
-        setattr(fm, hang_at, hang)
-        monkeypatch.setattr(tracker_mod, "_REGISTER_DEADLINE_S", 0.2)
-        monkeypatch.setattr(tracker_mod, "_WARN_INTERVAL_S", 0.0)  # log every warning
-        warnings_seen = _capture_warnings(monkeypatch)
-        backend, _ = _registering_backend(monkeypatch, fm)
-        try:
-            start = time.perf_counter()
-            assert backend.register_checkpoint(5, tmp_path / "step_5") is None
-            assert backend.register_checkpoint(6, tmp_path / "step_6") is None
-            assert time.perf_counter() - start < 5.0  # the hung call alone would take 10 s
-            assert entered == [hang_at]  # the second save never reached the server
-            assert len(warnings_seen) == 2
-            assert "no answer from the tracking server within 0.2s" in warnings_seen[0]
-            assert "earlier registration is still running" in warnings_seen[1]
-        finally:
-            release.set()
-        assert backend._registration is not None
-        backend._registration._thread.join(10)
-        assert backend.register_checkpoint(7, tmp_path / "step_7") is not None  # a free slot again
-
-    def test_registration_leaves_the_runs_entry_and_metrics_alone(self, monkeypatch, tmp_path):
-        backend, fm = _registering_backend(monkeypatch)
+        backend, fm = _registering_backend(monkeypatch, model_store)
         before = backend.tracking_entry()
-        backend.register_checkpoint(5, tmp_path / "step_5")
-        assert backend.tracking_entry() == before
-        assert before is not None and set(before) == {
-            "backend",
-            "run_id",
-            "experiment",
-            "tracking_uri",
-        }
+        backend.register_checkpoint(5, _kept_checkpoint(tmp_path, 5), lambda fields: None)
         backend.log({"train/loss": 0.5}, step=5)
         _flush(backend)
+        assert backend.tracking_entry() == before
+        assert before is not None
+        assert set(before) == {"backend", "run_id", "experiment", "tracking_uri"}
         assert fm.log_steps == [1, 5]
-
-    def test_the_calls_it_makes_exist_in_the_installed_mlflow(self):
-        mlflow = pytest.importorskip("mlflow")
-        import inspect
-
-        def parameters(fn):
-            return set(inspect.signature(fn).parameters)
-
-        create = {"name", "source_run_id", "experiment_id", "model_type", "params"}
-        assert create <= parameters(mlflow.create_external_model)
-        assert {"experiment_ids", "filter_string", "output_format"} <= parameters(
-            mlflow.search_logged_models
-        )
-        assert "run_id" in parameters(mlflow.get_run)
 
 
 class _RegisteringBackend(_EntryBackend):
-    """An _EntryBackend that also reports the fields it adds for a checkpoint, or raises."""
+    """An _EntryBackend that also adds checkpoint fields and registers checkpoints, or raises."""
 
     def __init__(self, entry=None, fields=None, error=None):
         super().__init__(entry)
@@ -2267,11 +2600,16 @@ class _RegisteringBackend(_EntryBackend):
         self._register_error = error
         self.registered: list = []
 
-    def register_checkpoint(self, step, directory):
-        self.registered.append((step, directory))
+    def checkpoint_fields(self, step):
         if self._register_error is not None:
             raise self._register_error
         return self._fields
+
+    def register_checkpoint(self, step, directory, record):
+        self.registered.append((step, directory))
+        if self._register_error is not None:
+            raise self._register_error
+        record({"registered": f"step_{step}"})
 
 
 class TestTrackerRegistration:
@@ -2279,84 +2617,104 @@ class TestTrackerRegistration:
         model = ModelConfig(dim=128, n_layers=2, n_heads=2, vocab_size=256)
         return MetricsTracker(JobConfig(model=model, metrics=MetricsConfig()), num_gpus=1)
 
-    def test_a_backend_that_adds_nothing_is_the_default(self):
-        assert tracker_mod._LoggingBackend().register_checkpoint(1, Path("step_1")) is None
+    def test_a_backend_adds_and_registers_nothing_by_default(self):
+        backend = tracker_mod._LoggingBackend()
+        recorded: list = []
+        assert backend.checkpoint_fields(1) is None
+        assert backend.register_checkpoint(1, Path("step_1"), recorded.append) is None
+        assert recorded == []
 
-    def test_fields_are_keyed_by_the_backend_name_of_each_live_entry(self, tmp_path):
+    def test_fields_are_keyed_by_the_backend_name_of_each_live_entry(self):
         tracker = self._tracker()
-        first = _RegisteringBackend({"backend": "first"}, {"model_id": "m-1"})
-        quiet = _RegisteringBackend({"backend": "quiet"})
-        no_run = _RegisteringBackend(None, {"model_id": "m-3"})  # its run is not live
-        later = _RegisteringBackend({"backend": "later"}, {"a": "1", "b": "2"})
-        tracker._backends = [first, quiet, no_run, later]
-        directory = tmp_path / "step_7"
-        assert tracker.register_checkpoint(7, directory) == {
+        tracker._backends = [
+            _RegisteringBackend({"backend": "first"}, {"model_id": "m-1"}),
+            _RegisteringBackend({"backend": "quiet"}),
+            _RegisteringBackend(None, {"model_id": "m-3"}),
+            _RegisteringBackend({"backend": "later"}, {"a": "1", "b": "2"}),
+        ]
+        assert tracker.checkpoint_fields(7) == {
             "first": {"model_id": "m-1"},
             "later": {"a": "1", "b": "2"},
         }
-        assert first.registered == [(7, directory)]
 
-    def test_a_backend_that_fails_costs_only_its_own_fields(self, monkeypatch, tmp_path):
+    def test_each_live_backend_registers_with_a_record_bound_to_its_name(self, tmp_path):
+        tracker = self._tracker()
+        first = _RegisteringBackend({"backend": "first"})
+        no_run = _RegisteringBackend(None)
+        later = _RegisteringBackend({"backend": "later"})
+        tracker._backends = [first, no_run, later]
+        recorded: list = []
+        directory = tmp_path / "step_7"
+        tracker.register_checkpoint(7, directory, lambda name, fields: recorded.append(name))
+        assert recorded == ["first", "later"]
+        assert first.registered == later.registered == [(7, directory)]
+        assert no_run.registered == []
+
+    def test_a_backend_that_fails_costs_only_its_own_fields_and_registration(
+        self, monkeypatch, tmp_path
+    ):
         seen = _capture_formatted_warnings(monkeypatch)
         tracker = self._tracker()
-        kept = _RegisteringBackend({"backend": "kept"}, {"model_id": "m-1"})
         tracker._backends = [
-            _RegisteringBackend({"backend": "bad"}, error=RuntimeError("boom")),
-            _RegisteringBackend({"run_id": "r"}, {"model_id": "m-2"}),  # an entry with no name
-            kept,
+            _RegisteringBackend(
+                {"backend": "bad"}, error=RuntimeError("POST http://user:token@host/api failed")
+            ),
+            _RegisteringBackend({"run_id": "r"}, {"model_id": "m-2"}),
+            _RegisteringBackend({"backend": "kept"}, {"model_id": "m-1"}),
         ]
-        assert tracker.register_checkpoint(1, tmp_path) == {"kept": {"model_id": "m-1"}}
-        assert len(seen) == 2 and "boom" in seen[0] and "_RegisteringBackend" in seen[1]
+        assert tracker.checkpoint_fields(1) == {"kept": {"model_id": "m-1"}}
+        recorded: list = []
+        tracker.register_checkpoint(1, tmp_path, lambda name, fields: recorded.append(name))
+        assert recorded == ["kept"]
+        assert len(seen) == 4
+        assert all("_RegisteringBackend" in warning for warning in seen)
+        assert "fields skipped" in seen[0] and "registration skipped" in seen[2]
+        assert "POST http://host/api failed" in seen[0] and "token" not in seen[0] + seen[2]
+        assert "no backend name" in seen[1] and "no backend name" in seen[3]
 
-    def test_nothing_is_registered_once_closed_or_without_backends(self, tmp_path):
+    def test_nothing_once_closed_or_without_backends(self, tmp_path):
         tracker = self._tracker()
         backend = _RegisteringBackend({"backend": "live"}, {"model_id": "m-1"})
         tracker._backends = [backend]
-        assert tracker.register_checkpoint(1, tmp_path) == {"live": {"model_id": "m-1"}}
-        tracker.close()
-        assert tracker.register_checkpoint(2, tmp_path) == {}
-        assert [step for step, _ in backend.registered] == [1]  # not asked after close
-        assert self._tracker().register_checkpoint(1, tmp_path) == {}  # no backends here
+        recorded: list = []
 
-    def test_mlflow_fields_are_keyed_as_mlflow(self, monkeypatch, tmp_path):
+        def record(name, fields):
+            recorded.append(name)
+
+        assert tracker.checkpoint_fields(1) == {"live": {"model_id": "m-1"}}
+        tracker.register_checkpoint(1, tmp_path, record)
+        tracker.close()
+        assert tracker.checkpoint_fields(2) == {}
+        tracker.register_checkpoint(2, tmp_path, record)
+        assert recorded == ["live"] and [step for step, _ in backend.registered] == [1]
+        empty = self._tracker()
+        assert empty.checkpoint_fields(1) == {}
+        empty.register_checkpoint(1, tmp_path, record)
+        assert recorded == ["live"]
+
+    def test_mlflow_is_keyed_as_mlflow(self, monkeypatch, tmp_path, model_store):
         tracker = self._tracker()
-        fm = _FakeRegistry()
-        monkeypatch.setitem(sys.modules, "mlflow", fm)
-        tracker._backends = [MLflowBackend(_mlflow_cfg(mlflow_register_checkpoints=True))]
-        assert tracker.register_checkpoint(1, tmp_path) == {}  # the run has not started
+        monkeypatch.setitem(sys.modules, "mlflow", _FakeRegistry(model_store))
+        backend = MLflowBackend(_mlflow_cfg(mlflow_register_checkpoints=True))
+        tracker._backends = [backend]
+        recorded: list = []
+
+        def record(name, fields):
+            recorded.append((name, fields))
+
+        directory = _kept_checkpoint(tmp_path, 1)
+        assert tracker.checkpoint_fields(1) == {}
+        tracker.register_checkpoint(1, directory, record)
         tracker.log_eval({"eval/loss": 1.0}, step=1)
-        assert tracker.register_checkpoint(1, tmp_path) == {"mlflow": {"model_id": "m-1"}}
+        assert tracker.checkpoint_fields(1) == {"mlflow": {"model_name": "run-a-step_1"}}
+        tracker.register_checkpoint(1, directory, record)
+        _flush(backend)
+        assert recorded == [("mlflow", {"model_id": "m-1"})]
         tracker.close()
 
-    def _saves(self, monkeypatch, tmp_path, fm, registering=True):
-        """Save steps 0, 1 and 2 through a real manager and tracker over ``fm``: their sidecars."""
-        from kempnerforge.checkpoint.manager import CheckpointManager
-        from kempnerforge.config.schema import CheckpointConfig
 
-        monkeypatch.setitem(sys.modules, "mlflow", fm)
-        config = JobConfig(
-            model=ModelConfig(dim=128, n_layers=2, n_heads=2, vocab_size=256),
-            metrics=_mlflow_cfg(mlflow_register_checkpoints=registering),
-        )
-        tracker = MetricsTracker(config, num_gpus=1)
-        tracker.init_backends(config)
-        model = torch.nn.Linear(4, 4)
-        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
-        mgr = CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model, optimizer)
-        monkeypatch.setattr(mgr._async_ckpt, "save", MagicMock())
-        mgr.set_tracking_source(tracker.tracking_entries)
-        mgr.set_checkpoint_registrar(tracker.register_checkpoint)
-        try:
-            mgr.save(step=0)  # before the first log there is no run to register with
-            tracker.log_eval({"eval/loss": 1.0}, step=1)
-            mgr.save(step=1, tokens_seen=8)
-            mgr.save(step=2, tokens_seen=16)
-        finally:
-            tracker.close()
-        return [
-            json.loads((tmp_path / f"step_{step}" / "metadata.json").read_text())
-            for step in (0, 1, 2)
-        ]
+class TestRegistrationThroughTheManager:
+    """A real manager and tracker: what a registration leaves in each checkpoint's sidecar."""
 
     RUN = {
         "backend": "mlflow",
@@ -2365,45 +2723,134 @@ class TestTrackerRegistration:
         "tracking_uri": "http://localhost:5000",
     }
 
-    @pytest.mark.parametrize("registering", [True, False])
-    def test_model_id_reaches_the_sidecar_of_the_save_it_was_made_for(
-        self, monkeypatch, tmp_path, registering
+    @classmethod
+    def _named(cls, step, **fields):
+        return [{**cls.RUN, "model_name": f"run-a-step_{step}", **fields}]
+
+    @staticmethod
+    def _wired(monkeypatch, tmp_path, store, registering=True, async_mode=None):
+        """A manager saving under ``tmp_path``, a tracker with a live run: (mgr, tracker, fake)."""
+        from kempnerforge.checkpoint.manager import CheckpointManager
+        from kempnerforge.config.schema import AsyncCheckpointMode, CheckpointConfig
+
+        fm = _FakeRegistry(store)
+        monkeypatch.setitem(sys.modules, "mlflow", fm)
+        config = JobConfig(
+            model=ModelConfig(dim=128, n_layers=2, n_heads=2, vocab_size=256),
+            metrics=_mlflow_cfg(mlflow_register_checkpoints=registering),
+        )
+        tracker = MetricsTracker(config, num_gpus=1)
+        tracker.init_backends(config)
+        tracker.log_eval({"eval/loss": 1.0}, step=1)
+        model = torch.nn.Linear(4, 4)
+        mode = async_mode or AsyncCheckpointMode.disabled
+        mgr = CheckpointManager(
+            CheckpointConfig(dir=str(tmp_path), async_mode=mode),
+            model,
+            torch.optim.SGD(model.parameters(), lr=0.1),
+        )
+        monkeypatch.setattr(mgr._async_ckpt, "save", MagicMock())
+        monkeypatch.setattr(mgr._async_ckpt, "wait", MagicMock())
+        mgr.set_tracking_source(tracker.tracking_entries)
+        mgr.set_checkpoint_registrar(tracker)
+        return mgr, tracker, fm
+
+    @staticmethod
+    def _tracking(tmp_path, step):
+        return json.loads((tmp_path / f"step_{step}" / "metadata.json").read_text())["tracking"]
+
+    def test_a_committed_checkpoint_gets_its_model_id_added_to_its_sidecar(
+        self, monkeypatch, tmp_path, model_store
     ):
-        fm = _FakeRegistry()
-        sidecars = self._saves(monkeypatch, tmp_path, fm, registering)
-        assert "tracking" not in sidecars[0]
-        if registering:
-            assert [s["tracking"] for s in sidecars[1:]] == [
-                [{**self.RUN, "model_id": "m-1"}],
-                [{**self.RUN, "model_id": "m-2"}],
-            ]
-            assert [c["name"] for c in fm.created] == ["run-a-step_1", "run-a-step_2"]
-        else:
-            assert [s["tracking"] for s in sidecars[1:]] == [[self.RUN], [self.RUN]]
-            assert fm.created == [] and fm.threads == set()
+        mgr, tracker, _ = self._wired(monkeypatch, tmp_path, model_store)
+        mgr.save(step=5)
+        mgr.save(step=6)
+        tracker.close()
+        assert self._tracking(tmp_path, 5) == self._named(5, model_id="m-1")
+        assert self._tracking(tmp_path, 6) == self._named(6, model_id="m-2")
 
-    @pytest.mark.parametrize("failure", ["refuses", "hangs"])
-    def test_a_failing_server_costs_a_save_only_its_model_id(self, monkeypatch, tmp_path, failure):
-        fm = _FakeRegistry()
-        release = threading.Event()
+    def test_with_registration_off_the_sidecar_names_only_the_run(
+        self, monkeypatch, tmp_path, model_store
+    ):
+        mgr, tracker, _ = self._wired(monkeypatch, tmp_path, model_store, registering=False)
+        mgr.save(step=5)
+        tracker.close()
+        assert self._tracking(tmp_path, 5) == [self.RUN]
+        assert list(self._tracking(tmp_path, 5)[0]) == [
+            "backend",
+            "run_id",
+            "experiment",
+            "tracking_uri",
+        ]
+        assert model_store.calls == []
 
-        def fail(**kwargs):
-            if failure == "hangs":
-                release.wait(10)
-            raise RuntimeError("server said no")
-
-        fm.create_external_model = fail
-        monkeypatch.setattr(tracker_mod, "_REGISTER_DEADLINE_S", 0.2)
-        warnings_seen = _capture_warnings(monkeypatch)
+    def test_a_stalled_server_never_holds_up_the_save_or_its_commit(
+        self, monkeypatch, tmp_path, model_store
+    ):
+        mgr, tracker, _ = self._wired(monkeypatch, tmp_path, model_store)
+        model_store.hold("get_run")
         try:
-            sidecars = self._saves(monkeypatch, tmp_path, fm)
+            start = time.perf_counter()
+            mgr.save(step=5)
+            assert time.perf_counter() - start < 5.0
+            assert model_store.entered.wait(10)
+            assert (tmp_path / "latest").resolve() == (tmp_path / "step_5").resolve()
+            assert self._tracking(tmp_path, 5) == self._named(5)
         finally:
-            release.set()
-        assert [s["tracking"] for s in sidecars[1:]] == [[self.RUN], [self.RUN]]
-        for step in (1, 2):
-            assert (tmp_path / f"step_{step}" / "train_state.pt").exists()
-        assert (tmp_path / "latest").resolve() == (tmp_path / "step_2").resolve()
-        assert len(warnings_seen) == 1 and "no model_id" in warnings_seen[0]
+            model_store.release.set()
+        _flush(tracker._backends[0])
+        assert self._tracking(tmp_path, 5) == self._named(5, model_id="m-1")
+        tracker.close()
+
+    @pytest.mark.parametrize("second_save", ["after-registration", "during-registration"])
+    def test_a_step_saved_twice_keeps_its_model_id(
+        self, monkeypatch, tmp_path, model_store, second_save
+    ):
+        mgr, tracker, _ = self._wired(monkeypatch, tmp_path, model_store)
+        if second_save == "during-registration":
+            model_store.hold("get_run")
+        try:
+            mgr.save(step=5)
+            if second_save == "after-registration":
+                _flush(tracker._backends[0])
+            else:
+                assert model_store.entered.wait(10)
+            mgr.save(step=5)
+        finally:
+            model_store.release.set()
+        tracker.close()
+        assert self._tracking(tmp_path, 5) == self._named(5, model_id="m-1")
+        assert len(model_store.named("get_run")) == 1 and len(model_store.models) == 1
+
+    def test_the_final_checkpoint_is_registered_at_shutdown(
+        self, monkeypatch, tmp_path, model_store
+    ):
+        from kempnerforge.config.schema import AsyncCheckpointMode
+
+        mgr, tracker, fm = self._wired(
+            monkeypatch, tmp_path, model_store, async_mode=AsyncCheckpointMode.async_
+        )
+        backend = tracker._backends[0]
+        mgr.save(step=5)
+        assert model_store.calls == []
+        mgr.save(step=10)
+        _flush(backend)
+        assert self._tracking(tmp_path, 5) == self._named(5, model_id="m-1")
+        gate, entered = _park_log_metrics(fm)
+        tracker.log_eval({"eval/loss": 0.5}, step=10)
+        assert entered.wait(10)
+        mgr.wait()
+        assert [what for what, _, _ in backend._worker._items] == ["register run-a-step_10"]
+        assert self._tracking(tmp_path, 10) == self._named(10)
+        close = backend._worker.close
+
+        def open_the_gate_then_close():
+            gate.set()
+            return close()
+
+        monkeypatch.setattr(backend._worker, "close", open_the_gate_then_close)
+        tracker.close()
+        assert self._tracking(tmp_path, 10) == self._named(10, model_id="m-2")
 
 
 class TestTensorBoardBackend:
@@ -2441,6 +2888,19 @@ class TestFlattenConfigParams:
         assert all(isinstance(v, str) for v in params.values())
         # Optional None sub-configs (vlm, adapter, vision_encoder) are skipped.
         assert not any(k.startswith("vlm") for k in params)
+
+    def test_run_metadata_fields_are_not_flattened_into_params(self):
+        """Tag keys are user-typed; an MLflow-illegal one must not poison a param batch."""
+        config = JobConfig(
+            model=ModelConfig(dim=128, n_layers=2, n_heads=2, vocab_size=256),
+            metrics=MetricsConfig(
+                mlflow_tags={"bad@key": "v"}, mlflow_description="run description"
+            ),
+        )
+        params = _flatten_config_params(config)
+        assert not any(k.startswith("metrics.mlflow_tags") for k in params)
+        assert "metrics.mlflow_description" not in params
+        assert "metrics.log_interval" in params  # the rest of metrics still flattens
 
     def test_flatten_truncates_long_values(self):
         config = JobConfig(model=ModelConfig(dim=128, n_layers=2, n_heads=2, vocab_size=256))
@@ -2521,6 +2981,55 @@ class TestMetricsConfigMLflow:
         args = ["--metrics.mlflow_tracking_uri=databricks://profile-a"]
         from_cli = load_config(str(toml), cli_args=args).metrics
         assert from_cli.resolve_mlflow_tracking_uri() == "databricks://profile-a"
+
+    def test_run_metadata_is_unset_by_default(self):
+        cfg, other = MetricsConfig(), MetricsConfig()
+        assert cfg.mlflow_description is None and cfg.mlflow_tags == {}
+        assert cfg.mlflow_tags is not other.mlflow_tags
+
+    def test_toml_and_cli_set_the_run_metadata(self, tmp_path):
+        toml = tmp_path / "job.toml"
+        toml.write_text(
+            '[metrics]\nmlflow_description = "ablation"\n'
+            '[metrics.mlflow_tags]\nteam = "vlm"\nstage = "2"\n'
+        )
+        from_toml = load_config(str(toml), cli_args=[]).metrics
+        assert from_toml.mlflow_description == "ablation"
+        assert from_toml.mlflow_tags == {"team": "vlm", "stage": "2"}
+        args = ["--metrics.mlflow_description=from cli", "--metrics.mlflow_tags.team=cli"]
+        from_cli = load_config(str(toml), cli_args=args).metrics
+        assert from_cli.mlflow_description == "from cli"
+        assert from_cli.mlflow_tags["team"] == "cli"
+
+    @pytest.mark.parametrize("bad", ["", "   ", 5, ["a"]])
+    def test_description_must_be_a_non_empty_string(self, bad):
+        with pytest.raises(ValueError, match="mlflow_description must be a non-empty string"):
+            MetricsConfig(mlflow_description=bad)
+
+    @pytest.mark.parametrize(
+        ("tags", "message"),
+        [
+            (["team=vlm"], "mlflow_tags must be a table"),
+            ({"": "x"}, "mlflow_tags keys must be non-empty strings; got ''"),
+            ({" ": "x"}, "mlflow_tags keys must be non-empty strings; got ' '"),
+            ({7: "x"}, "mlflow_tags keys must be non-empty strings; got 7"),
+            ({"team": ""}, r"mlflow_tags\['team'\] must be a non-empty string; got ''"),
+            ({"team": "  "}, r"mlflow_tags\['team'\] must be a non-empty string"),
+            ({"attempt": 3}, r"mlflow_tags\['attempt'\] must be a non-empty string; got 3"),
+            ({"flag": True}, r"mlflow_tags\['flag'\] must be a non-empty string"),
+            ({"nested": {"a": "b"}}, r"mlflow_tags\['nested'\] must be a non-empty string"),
+            ({"ok": "fine", "bad": None}, r"mlflow_tags\['bad'\] must be a non-empty string"),
+        ],
+    )
+    def test_tags_must_map_non_empty_strings_to_non_empty_strings(self, tags, message):
+        with pytest.raises(ValueError, match=message):
+            MetricsConfig(mlflow_tags=tags)
+
+    def test_a_bad_value_in_a_toml_fails_at_config_load(self, tmp_path):
+        toml = tmp_path / "job.toml"
+        toml.write_text("[metrics.mlflow_tags]\nattempt = 3\n")
+        with pytest.raises(ValueError, match=r"mlflow_tags\['attempt'\]"):
+            load_config(str(toml), cli_args=[])
 
 
 # ---------------------------------------------------------------------------

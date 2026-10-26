@@ -71,6 +71,7 @@ File:
 - `betas[0], betas[1] ∈ [0, 1)`.
 - `muon_momentum ∈ (0, 1)`.
 - `muon_ns_steps > 0`.
+- `muon_orthogonalize ∈ {"local", "exact"}`.
 - `schedule_free_warmup_steps ≥ 0`.
 
 ### `SchedulerConfig`
@@ -152,6 +153,9 @@ File:
 [`kempnerforge/config/metrics.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/config/metrics.py).
 
 - `log_interval > 0`.
+- `mlflow_description`, when set, is a non-empty string.
+- `mlflow_tags` maps non-empty string names to non-empty string values; the error names
+  the offending key.
 - With `enable_mlflow` and a Databricks tracking URI, `mlflow_experiment` (when set) is an
   absolute workspace path, starting with `/`. The URI is `mlflow_tracking_uri`, else
   `$MLFLOW_TRACKING_URI`, else `"databricks"`, read when the config loads.

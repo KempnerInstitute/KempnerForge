@@ -104,6 +104,7 @@ name = "muon"
 lr = 0.02
 muon_momentum = 0.95
 muon_ns_steps = 5
+muon_orthogonalize = "local"
 # muon_adam_lr omitted -> use same LR as Muon for 1D params
 weight_decay = 0.1
 betas = [0.9, 0.95]                     # used by internal AdamW for 1D params
@@ -123,10 +124,20 @@ How it decides which path each parameter takes
 
 DTensor / FSDP2 notes:
 
-- Muon's orthogonalization runs on the **local shard**, not the full
-  weight. It calls `_get_local_tensor(p)` to unwrap DTensors before
-  Newton-Schulz. Empirically fine in practice; not mathematically
-  identical to full-matrix orthogonalization.
+- `muon_orthogonalize` sets where Newton-Schulz runs on a sharded weight.
+  `"local"` (default) orthogonalizes each rank's shard on its own, after
+  `_get_local_tensor(p)` unwraps the DTensor, and takes the update scale
+  from the shard's shape. That's cheap and keeps the update's RMS close to
+  the unsharded one, but its direction isn't the full-matrix result and
+  changes with the shard count. `"exact"` gathers each row-sharded matrix
+  onto one rank of its shard group with an all-to-all, orthogonalizes the
+  full matrix there and scatters the result back, and takes the scale from
+  the full matrix's shape. The update is then bitwise what one process
+  would compute, and each matrix's work runs once, spread across the group.
+  Other sharded layouts, such as tensor parallel, are all-gathered. The
+  cost is two all-to-alls per group of matrices per step. A resume keeps
+  the mode the checkpoint was saved with, and a checkpoint saved before
+  the option existed resumes with `"local"`.
 - Momentum buffers match the parameter dtype (`torch.zeros_like(p.grad)`),
   so DCP serializes them correctly on resume.
 - The internal AdamW's parameters are not in Muon's `param_groups`, so

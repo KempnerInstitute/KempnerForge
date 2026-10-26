@@ -205,7 +205,7 @@ entry comes from `MLflowBackend.tracking_entry()`; resume is unaffected and stil
 ## Registering checkpoints
 
 `mlflow_register_checkpoints = true` (default `false`; requires `enable_mlflow`) makes each
-checkpoint save also record an MLflow external logged model, so the run lists its checkpoints:
+committed checkpoint an MLflow external logged model, so the run lists its checkpoints:
 
 - name `<run name>-step_<N>` (characters MLflow rejects in a model name become `_`, and the run
   id stands in for an empty run name), `model_type = "checkpoint"`, linked to the run;
@@ -213,24 +213,32 @@ checkpoint save also record an MLflow external logged model, so the run lists it
 
 Nothing is uploaded but the small descriptor MLflow keeps with any external model. The weights
 stay where they were saved, and `checkpoint.keep_last_n` can later delete the directory the
-model points at. With an async checkpoint mode the model is made when the save is dispatched,
-before its shards are durable; `latest` still marks the last complete checkpoint.
+model points at.
 
-The model id goes into that save's `metadata.json`, in the `mlflow` entry of `tracking`
-([Checkpointing](../checkpointing/index.md)):
+Each save records the model's name in its `metadata.json`, in the `mlflow` entry of `tracking`
+([Checkpointing](../checkpointing/index.md)). Registration starts once the checkpoint is
+committed (`latest` points at it; with an async checkpoint mode, once its shards are durable),
+runs on the background worker, and adds the `model_id` to that entry when the server answers,
+replacing the file atomically:
 
 ```json
-{"backend": "mlflow", "run_id": "<run id>", "experiment": "<experiment>", "tracking_uri": "<tracking uri>", "model_id": "<model id>"}
+{"backend": "mlflow", "run_id": "<run id>", "experiment": "<experiment>", "tracking_uri": "<tracking uri>", "model_name": "<run name>-step_<N>", "model_id": "<model id>"}
 ```
 
-Registration is best effort and never fails a save. `save()` waits for it on rank 0 for at most
-15 seconds, a preemption save included, while the other ranks wait at the save barrier. A server
-error or a timeout leaves that save's entry without `model_id` and logs a rate-limited warning,
-and while a timed-out call is still running, later saves skip registering. A step saved twice (an
-emergency save, or a resumed run re-running it) keeps the model it already has, and a resume
-registers nothing by itself. A save before the run's first log has no live run and registers
-nothing. MLflow itself logs two harmless "Failed to infer schema" warnings for each external model
-it creates.
+A save never waits on the server for it, a preemption save included. Registration is best
+effort: a server error leaves the entry without `model_id` and logs a rate-limited warning, and
+the next commit of the same step tries again. A step saved twice (a shutdown save right after an
+interval save, or a resumed run re-running it) keeps one model, and the last `metadata.json` of
+that step still gets its `model_id`. A resume registers nothing by itself, and a checkpoint
+deleted before its turn comes is skipped. At shutdown, `close()` delivers a registration still
+queued within its drain budget, so the final checkpoint is registered too. A save before the
+run's first log has no `mlflow` entry, so its `metadata.json` gets neither field. MLflow itself
+logs two harmless "Failed to infer schema" warnings for each external model it creates.
+
+The eval publisher (`python -m kempnerforge.metrics.publish`) links its metrics to the entry's
+`model_id`. When the entry has only `model_name` (the registration failed or never finished),
+it finds the run's model of that name, or creates it, and links to that; it never writes
+`metadata.json`.
 
 **Models-tab leaderboard.** The id is also what lets eval scores be compared per checkpoint. The
 [publisher](#publishing-eval-results) links every metric it appends to the model its checkpoint
@@ -309,15 +317,32 @@ evaluation.
   and sent with `mlflow.log_metrics(dict, step=step)`.
 - **Params**: the full `JobConfig` flattened to dotted keys (`model.dim`, `optimizer.lr`,
   ...) once when a new run starts, via `mlflow.log_params` in batches of 100, with values cut
-  at 250 characters. Cheap searchable metadata, not artifacts.
-- **Tags**: `host` and `slurm_job_id`, also when a new run starts.
+  at 250 characters. Cheap searchable metadata, not artifacts. `metrics.mlflow_description`
+  and `metrics.mlflow_tags` are left out, since they become the description and tags below.
+- **Tags**, also when a new run starts: `host` and `slurm_job_id`; the git commit of the working
+  directory as `mlflow.source.git.commit`, with `mlflow.source.git.dirty` (`true` when tracked
+  files differ from it), skipped quietly when git or a repository is missing;
+  `metrics.mlflow_description` as the run description (`mlflow.note.content`); and every entry
+  of `metrics.mlflow_tags`. Configured tags are applied last, so one replaces an automatic tag
+  of the same key.
+- **Artifacts**, also when a new run starts: `config.json`, the resolved `JobConfig` (TOML, CLI
+  overrides and defaults applied), and the launch TOML under its own file name when the first
+  command-line argument names a `.toml` file (how `scripts/train.py` takes its config); without
+  one that upload is skipped.
 - **System metrics**: CPU / GPU / memory under `system/`, sampled on a
   background thread when `mlflow_log_system_metrics = true` (default). Lower
   `mlflow_system_metrics_interval` (seconds) for short test runs.
 
-A resumed run keeps the params and tags it has. No checkpoints are uploaded as artifacts: they
-stay on the filesystem (artifacts are the main MLflow storage cost);
-[registering](#registering-checkpoints) records where they are.
+A resumed run keeps the params, tags and artifacts it has. No checkpoints are uploaded as
+artifacts: they stay on the filesystem (artifacts are the main MLflow storage cost);
+[registering](#registering-checkpoints) records where they are. The description and tags are
+set in `[metrics]`:
+
+```toml
+[metrics]
+mlflow_description = "stage-2 video run"            # Markdown; the run description in the UI
+mlflow_tags        = { team = "vlm", stage = "2" }  # non-empty strings, name to value
+```
 
 ## Bounded calls
 
@@ -328,7 +353,8 @@ Every server call has a deadline.
 |------|---------|-------|
 | Run start or resume (first `log()`) | owner thread; the training thread waits | 60 s, then the backend disables itself |
 | Metric, param and tag calls | background worker, in submission order; `log()` only queues | 60 s each, then abandoned |
-| Checkpoint registration (opt-in) | its own thread; `save()` waits on rank 0 | 15 s |
+| Artifact uploads (a new run's `config.json` and launch TOML) | background worker | 180 s each, then abandoned |
+| Checkpoint registration (opt-in) | background worker, queued once the checkpoint is committed; `save()` never waits | 180 s, then abandoned |
 | `close()` | drains the queue, then ends the run on the owner thread | 30 s drain, then 60 s to end |
 
 At most 256 calls wait in the queue (a new call is dropped when it is full), and at most 4
@@ -360,9 +386,10 @@ Warnings that quote an error strip `user:token@` from any URI first, since MLflo
 errors can quote a credentialed tracking URI.
 
 After init, `log()` never raises and never waits: it queues the call. A call that fails or runs
-past its deadline costs its points. The worker does not retry it and the backend stays enabled,
-so logging recovers after a blip, and a full queue drops new calls. `close()` ends the run
-whenever one was started and swallows teardown errors as warnings.
+past its deadline costs only what it carried: its points, a batch of params, a tag or an
+upload. The worker does not retry it and the backend stays enabled, so logging recovers after a
+blip, and a full queue drops new calls. `close()` ends the run whenever one was started and
+swallows teardown errors as warnings.
 
 MLflow is an optional dependency: install with `uv sync --group mlflow` (pulls
 `mlflow-skinny` + `databricks-sdk`, plus `psutil` and `nvidia-ml-py` for system metrics).

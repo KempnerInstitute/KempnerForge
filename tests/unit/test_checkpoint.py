@@ -4,9 +4,13 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import random
 import re
+import shutil
+import stat
 import sys
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -937,12 +941,50 @@ class TestSaveTrackingSidecar:
             assert torch.equal(opt.state[saved]["exp_avg"], opt2.state[loaded]["exp_avg"])
 
 
-def _registrar_that_raises(step, path):
-    raise RuntimeError("no server")
+class _Registrar:
+    """Answers fixed checkpoint fields and keeps each registration, with where ``latest`` was."""
+
+    def __init__(self, fields=None, error=None):
+        self._fields = {} if fields is None else fields
+        self._error = error
+        self.asked: list[int] = []
+        self.registered: list[tuple[int, Path, Path | None]] = []
+        self.records: list = []
+
+    def checkpoint_fields(self, step):
+        self.asked.append(step)
+        return self._fields(step) if callable(self._fields) else self._fields
+
+    def register_checkpoint(self, step, directory, record):
+        latest = directory.parent / "latest"
+        self.registered.append((step, directory, latest.resolve() if latest.exists() else None))
+        self.records.append(record)
+        if self._error is not None:
+            raise self._error
+
+
+def _fields_that_raise(step):
+    raise RuntimeError("no fields")
+
+
+class _HeldLock:
+    """A lock that says whether it is held, to check what runs under it."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.held = False
+
+    def __enter__(self):
+        self._lock.acquire()
+        self.held = True
+
+    def __exit__(self, *exc):
+        self.held = False
+        self._lock.release()
 
 
 class TestSaveCheckpointRegistration:
-    """A registrar adds fields to the ``tracking`` records of the save it is called for."""
+    """A registrar adds fields to a save's ``tracking`` records, and registers it on commit."""
 
     MLFLOW = TestSaveTrackingSidecar.MLFLOW
     WANDB = TestSaveTrackingSidecar.WANDB
@@ -952,58 +994,45 @@ class TestSaveCheckpointRegistration:
         return TestSaveTrackingSidecar._sidecar(tmp_path, step)
 
     @staticmethod
-    def _warnings(monkeypatch):
+    def _log(monkeypatch, level):
         from kempnerforge.checkpoint import manager as mgr_mod
 
-        warnings: list[str] = []
-        monkeypatch.setattr(
-            mgr_mod.logger, "warning", lambda msg, *args: warnings.append(msg % args)
-        )
-        return warnings
+        seen: list[str] = []
+        monkeypatch.setattr(mgr_mod.logger, level, lambda msg, *args: seen.append(msg % args))
+        return seen
+
+    def _registered(self, tmp_path, monkeypatch, fields=None, tracking=None):
+        """A manager with a registrar and the given live runs, after a save of step 1."""
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        registrar = _Registrar(fields)
+        mgr.set_tracking_source(lambda: list(tracking or [self.WANDB, self.MLFLOW]))
+        mgr.set_checkpoint_registrar(registrar)
+        mgr.save(step=1, tokens_seen=8)
+        return mgr, registrar
 
     def test_fields_land_in_the_matching_record_of_the_save_they_were_made_for(
         self, tmp_path, monkeypatch
     ):
         mgr = _make_mock_mgr(tmp_path, monkeypatch)
         mgr.set_tracking_source(lambda: [self.WANDB, self.MLFLOW])
-        mgr.set_checkpoint_registrar(lambda step, path: {"mlflow": {"model_id": f"m-{step}"}})
+        mgr.set_checkpoint_registrar(
+            _Registrar(lambda step: {"mlflow": {"model_name": f"m{step}"}})
+        )
         mgr.save(step=1, tokens_seen=8)
         mgr.save(step=2, tokens_seen=16)
-        assert self._sidecar(tmp_path, 1)["tracking"] == [
-            self.WANDB,
-            {**self.MLFLOW, "model_id": "m-1"},
-        ]
-        assert self._sidecar(tmp_path, 2)["tracking"] == [
-            self.WANDB,
-            {**self.MLFLOW, "model_id": "m-2"},
-        ]
-        assert list(self._sidecar(tmp_path, 1)["tracking"][1])[-1] == "model_id"
-
-    def test_registrar_gets_the_step_and_its_checkpoint_directory_once_per_save(
-        self, tmp_path, monkeypatch
-    ):
-        mgr = _make_mock_mgr(tmp_path, monkeypatch)
-        asked: list[tuple[int, Path]] = []
-
-        def registrar(step, path):
-            asked.append((step, path))
-            return {}
-
-        mgr.set_tracking_source(lambda: [self.MLFLOW])
-        mgr.set_checkpoint_registrar(registrar)
-        mgr.save(step=1)
-        mgr.save(step=2)
-        assert asked == [(1, tmp_path / "step_1"), (2, tmp_path / "step_2")]
+        for step in (1, 2):
+            assert self._sidecar(tmp_path, step)["tracking"] == [
+                self.WANDB,
+                {**self.MLFLOW, "model_name": f"m{step}"},
+            ]
+        assert list(self._sidecar(tmp_path, 1)["tracking"][1])[-1] == "model_name"
 
     def test_fields_for_a_backend_without_a_record_are_dropped(self, tmp_path, monkeypatch):
-        mgr = _make_mock_mgr(tmp_path, monkeypatch)
-        mgr.set_tracking_source(lambda: [self.MLFLOW])
-        mgr.set_checkpoint_registrar(lambda step, path: {"wandb": {"model_id": "m-1"}})
-        mgr.save(step=1)
+        self._registered(tmp_path, monkeypatch, {"wandb": {"x": "1"}}, tracking=[self.MLFLOW])
         assert self._sidecar(tmp_path, 1)["tracking"] == [self.MLFLOW]
 
     @pytest.mark.parametrize(
-        "added", [None, {}, {"mlflow": {}}], ids=["none", "empty", "no-fields"]
+        "added", [None, {}, {"mlflow": {}}], ids=["no-registrar", "empty", "no-fields"]
     )
     def test_sidecar_is_byte_identical_when_there_is_nothing_to_add(
         self, tmp_path, monkeypatch, added
@@ -1013,59 +1042,49 @@ class TestSaveCheckpointRegistration:
         plain.save(step=1, tokens_seen=8)
         registered = _make_mock_mgr(tmp_path / "registered", monkeypatch)
         registered.set_tracking_source(lambda: [self.MLFLOW])
-        registered.set_checkpoint_registrar(None if added is None else lambda step, path: added)
+        registered.set_checkpoint_registrar(None if added is None else _Registrar(added))
         registered.save(step=1, tokens_seen=8)
         names = ("plain", "registered")
         texts = [(tmp_path / n / "step_1" / "metadata.json").read_text() for n in names]
         assert texts[0] == texts[1]
 
-    def test_registrar_is_not_asked_when_no_run_is_live(self, tmp_path, monkeypatch):
+    @pytest.mark.parametrize("source", [list, None], ids=["no-live-run", "no-source"])
+    def test_fields_are_asked_only_while_a_run_is_live(self, tmp_path, monkeypatch, source):
         mgr = _make_mock_mgr(tmp_path, monkeypatch)
-        asked: list[int] = []
-        mgr.set_tracking_source(list)
-        mgr.set_checkpoint_registrar(lambda step, path: asked.append(step) or {})
-        mgr.save(step=1, tokens_seen=8)
-        assert asked == []
-        assert self._sidecar(tmp_path, 1) == {"step": 1, "tokens_seen": 8}
-
-    def test_registrar_without_a_source_is_never_asked(self, tmp_path, monkeypatch):
-        mgr = _make_mock_mgr(tmp_path, monkeypatch)
-        asked: list[int] = []
-        mgr.set_checkpoint_registrar(lambda step, path: asked.append(step) or {})
-        mgr.save(step=1, tokens_seen=8)
-        assert asked == []
-        assert self._sidecar(tmp_path, 1) == {"step": 1, "tokens_seen": 8}
-
-    def test_only_rank_zero_asks_the_registrar(self, tmp_path, monkeypatch):
-        mgr = _make_mock_mgr(tmp_path, monkeypatch)
-        asked: list[int] = []
-        mgr.set_tracking_source(lambda: [self.MLFLOW])
-        mgr.set_checkpoint_registrar(lambda step, path: asked.append(step) or {})
-        mgr._rank = 1  # the rank that does not write metadata.json
-        mgr.save(step=1)
-        assert asked == []
-        mgr._rank = 0
-        mgr.save(step=2)
-        assert asked == [2]
-
-    @pytest.mark.parametrize(
-        ("registrar", "reason"),
-        [
-            pytest.param(_registrar_that_raises, "no server", id="raises"),
-            pytest.param(lambda step, path: ["mlflow"], "expected a dict", id="not-a-dict"),
-            pytest.param(lambda step, path: {"mlflow": "m-1"}, "not a mapping", id="no-fields"),
-            pytest.param(lambda step, path: {"mlflow": {"model_id": 7}}, "strings", id="value"),
-            pytest.param(lambda step, path: {"mlflow": {7: "m-1"}}, "strings", id="key"),
-        ],
-    )
-    def test_failing_registrar_costs_its_fields_not_the_records_or_the_save(
-        self, tmp_path, monkeypatch, registrar, reason
-    ):
-        mgr = _make_mock_mgr(tmp_path, monkeypatch)
-        warnings = self._warnings(monkeypatch)
-        mgr.set_tracking_source(lambda: [self.MLFLOW])
+        registrar = _Registrar({"mlflow": {"model_name": "m"}})
+        mgr.set_tracking_source(source)
         mgr.set_checkpoint_registrar(registrar)
         mgr.save(step=1, tokens_seen=8)
+        assert registrar.asked == []
+        assert self._sidecar(tmp_path, 1) == {"step": 1, "tokens_seen": 8}
+
+    def test_only_rank_zero_asks_for_fields_or_registers(self, tmp_path, monkeypatch):
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        registrar = _Registrar()
+        mgr.set_tracking_source(lambda: [self.MLFLOW])
+        mgr.set_checkpoint_registrar(registrar)
+        mgr._rank = 1
+        mgr.save(step=1)
+        assert registrar.asked == [] and registrar.registered == []
+        mgr._rank = 0
+        mgr.save(step=2)
+        assert registrar.asked == [2] and [r[0] for r in registrar.registered] == [2]
+
+    @pytest.mark.parametrize(
+        ("fields", "reason"),
+        [
+            pytest.param(_fields_that_raise, "no fields", id="raises"),
+            pytest.param(["mlflow"], "expected a dict", id="not-a-dict"),
+            pytest.param({"mlflow": "m-1"}, "not a mapping", id="no-fields"),
+            pytest.param({"mlflow": {"model_name": 7}}, "strings", id="value"),
+            pytest.param({"mlflow": {7: "m-1"}}, "strings", id="key"),
+        ],
+    )
+    def test_failing_fields_cost_only_the_fields_not_the_records_or_the_save(
+        self, tmp_path, monkeypatch, fields, reason
+    ):
+        warnings = self._log(monkeypatch, "warning")
+        _, registrar = self._registered(tmp_path, monkeypatch, fields, tracking=[self.MLFLOW])
         assert self._sidecar(tmp_path, 1) == {
             "step": 1,
             "tokens_seen": 8,
@@ -1073,19 +1092,30 @@ class TestSaveCheckpointRegistration:
         }
         assert (tmp_path / "step_1" / "train_state.pt").exists()
         assert (tmp_path / "latest").resolve() == (tmp_path / "step_1").resolve()
-        assert len(warnings) == 1 and "step_1" in warnings[0] and reason in warnings[0]
+        assert [r[0] for r in registrar.registered] == [1]
+        assert len(warnings) == 1 and "step 1" in warnings[0] and reason in warnings[0]
 
-    def test_registrar_must_be_callable_or_none_and_can_be_detached(self, tmp_path, monkeypatch):
+    def test_registrar_needs_both_methods_or_none_and_can_be_detached(self, tmp_path, monkeypatch):
+        class FieldsOnly:
+            def checkpoint_fields(self, step):
+                return {}
+
+        class NotCallable:
+            checkpoint_fields = register_checkpoint = "no"
+
         mgr = _make_mock_mgr(tmp_path, monkeypatch)
         mgr.set_tracking_source(lambda: [self.MLFLOW])
-        with pytest.raises(TypeError, match="callable or None, got dict"):
-            mgr.set_checkpoint_registrar({"mlflow": {}})  # type: ignore[arg-type]
-        mgr.set_checkpoint_registrar(lambda step, path: {"mlflow": {"model_id": "m-1"}})
+        for bad, name in (({}, "dict"), (FieldsOnly(), "FieldsOnly"), (NotCallable(), "Not")):
+            with pytest.raises(TypeError, match=f"register_checkpoint, or be None; got {name}"):
+                mgr.set_checkpoint_registrar(bad)  # type: ignore[arg-type]
+        registrar = _Registrar({"mlflow": {"model_name": "m"}})
+        mgr.set_checkpoint_registrar(registrar)
         mgr.save(step=1)
         mgr.set_checkpoint_registrar(None)
         mgr.save(step=2)
-        assert self._sidecar(tmp_path, 1)["tracking"] == [{**self.MLFLOW, "model_id": "m-1"}]
+        assert self._sidecar(tmp_path, 1)["tracking"] == [{**self.MLFLOW, "model_name": "m"}]
         assert self._sidecar(tmp_path, 2)["tracking"] == [self.MLFLOW]
+        assert [r[0] for r in registrar.registered] == [1]
 
     def test_train_state_is_untouched(self, tmp_path, monkeypatch):
         extra = {"mlflow_run_id": "run-1", "phase_idx": 2}
@@ -1094,17 +1124,201 @@ class TestSaveCheckpointRegistration:
         plain.save(step=1, extra=dict(extra))
         registered = _make_mock_mgr(tmp_path / "registered", monkeypatch)
         registered.set_tracking_source(lambda: [self.MLFLOW])
-        registered.set_checkpoint_registrar(lambda step, path: {"mlflow": {"model_id": "m-1"}})
+        registered.set_checkpoint_registrar(_Registrar({"mlflow": {"model_name": "m"}}))
         registered.save(step=1, extra=dict(extra))
         states = [
             torch.load(root / "step_1" / "train_state.pt", weights_only=False)
             for root in (tmp_path / "plain", tmp_path / "registered")
         ]
         assert set(states[0]) == set(states[1])
-        assert "model_id" not in states[1]
+        assert "model_name" not in states[1]
         assert {k: states[1][k] for k in extra} == extra
 
-    def test_trackers_registration_reaches_the_sidecar_by_backend_name(self, tmp_path, monkeypatch):
+    def test_a_checkpoint_is_registered_once_latest_points_at_it(self, tmp_path, monkeypatch):
+        mgr, registrar = self._registered(tmp_path, monkeypatch)
+        mgr.save(step=2)
+        assert registrar.registered == [
+            (step, tmp_path / f"step_{step}", (tmp_path / f"step_{step}").resolve())
+            for step in (1, 2)
+        ]
+
+    def test_an_async_checkpoint_is_registered_only_once_its_flush_is_committed(
+        self, tmp_path, monkeypatch
+    ):
+        mgr = TestAsyncLatestSymlinkSafety._mgr(tmp_path, AsyncCheckpointMode.async_pinned)
+        TestAsyncLatestSymlinkSafety._install_async_mock(mgr, monkeypatch)
+        registrar = _Registrar()
+        mgr.set_tracking_source(lambda: [self.MLFLOW])
+        mgr.set_checkpoint_registrar(registrar)
+        mgr.save(step=10)
+        assert registrar.registered == []
+        mgr.save(step=20)
+        mgr.wait()
+        assert registrar.registered == [
+            (step, tmp_path / f"step_{step}", (tmp_path / f"step_{step}").resolve())
+            for step in (10, 20)
+        ]
+
+    def test_a_checkpoint_whose_flush_fails_is_never_registered(self, tmp_path, monkeypatch):
+        mgr = TestAsyncLatestSymlinkSafety._mgr(tmp_path, AsyncCheckpointMode.async_pinned)
+        TestAsyncLatestSymlinkSafety._install_async_mock(mgr, monkeypatch)
+        registrar = _Registrar()
+        mgr.set_tracking_source(lambda: [self.MLFLOW])
+        mgr.set_checkpoint_registrar(registrar)
+        mgr.save(step=10)
+
+        def flush_fails():
+            raise RuntimeError("flush failed")
+
+        monkeypatch.setattr(mgr._async_ckpt, "wait", flush_fails)
+        with pytest.raises(RuntimeError, match="flush failed"):
+            mgr.wait()
+        assert registrar.registered == []
+        assert not (tmp_path / "latest").exists()
+
+    def test_a_registrar_that_raises_costs_only_the_registration(self, tmp_path, monkeypatch):
+        warnings = self._log(monkeypatch, "warning")
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        mgr.config.keep_last_n = 1
+        mgr.set_tracking_source(lambda: [self.MLFLOW])
+        mgr.set_checkpoint_registrar(_Registrar(error=RuntimeError("no server")))
+        mgr.save(step=1, tokens_seen=8)
+        mgr.save(step=2, tokens_seen=16)
+        assert (tmp_path / "latest").resolve() == (tmp_path / "step_2").resolve()
+        assert not (tmp_path / "step_1").exists()
+        assert self._sidecar(tmp_path, 2)["tracking"] == [self.MLFLOW]
+        assert len(warnings) == 2 and "step_2" in warnings[1] and "no server" in warnings[1]
+
+    def test_record_amends_one_record_atomically_through_a_temp_file(self, tmp_path, monkeypatch):
+        _, registrar = self._registered(tmp_path, monkeypatch, {"mlflow": {"model_name": "m"}})
+        sidecar = tmp_path / "step_1" / "metadata.json"
+        sidecar.chmod(0o640)
+        replaced: list = []
+        replace = os.replace
+
+        def spy(src, dst):
+            replaced.append((Path(src), Path(dst), Path(src).read_text()))
+            replace(src, dst)
+
+        monkeypatch.setattr(os, "replace", spy)
+        registrar.records[0]("mlflow", {"model_id": "m-1"})
+        ((src, dst, text),) = replaced
+        assert dst == sidecar and src.parent == sidecar.parent and not src.exists()
+        expected = {
+            "step": 1,
+            "tokens_seen": 8,
+            "tracking": [self.WANDB, {**self.MLFLOW, "model_name": "m", "model_id": "m-1"}],
+        }
+        assert sidecar.read_text() == text == json.dumps(expected, indent=2)
+        assert stat.S_IMODE(sidecar.stat().st_mode) == 0o640
+        assert sorted(p.name for p in sidecar.parent.iterdir()) == [
+            "metadata.json",
+            "train_state.pt",
+        ]
+
+    @pytest.mark.parametrize("failing", ["fsync", "replace"])
+    def test_a_failed_amend_leaves_the_sidecar_whole_and_never_raises(
+        self, tmp_path, monkeypatch, failing
+    ):
+        _, registrar = self._registered(tmp_path, monkeypatch)
+        sidecar = tmp_path / "step_1" / "metadata.json"
+        before = sidecar.read_bytes()
+
+        def refuse(*args):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(os, failing, refuse)
+        warnings = self._log(monkeypatch, "warning")
+        registrar.records[0]("mlflow", {"model_id": "m-1"})
+        assert sidecar.read_bytes() == before
+        assert sorted(p.name for p in sidecar.parent.iterdir()) == [
+            "metadata.json",
+            "train_state.pt",
+        ]
+        assert len(warnings) == 1 and "mlflow" in warnings[0] and "disk full" in warnings[0]
+
+    def test_record_skips_quietly_when_the_checkpoint_or_its_record_is_gone(
+        self, tmp_path, monkeypatch
+    ):
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        live: list = [self.MLFLOW]
+        registrar = _Registrar()
+        mgr.set_tracking_source(lambda: list(live))
+        mgr.set_checkpoint_registrar(registrar)
+        mgr.save(step=1)
+        live[:] = [self.WANDB]
+        mgr.save(step=2)
+        live.clear()
+        mgr.save(step=3)
+        texts = {step: (tmp_path / f"step_{step}" / "metadata.json").read_text() for step in (2, 3)}
+        shutil.rmtree(tmp_path / "step_1")
+        warnings = self._log(monkeypatch, "warning")
+        notes = self._log(monkeypatch, "debug")
+        for record in registrar.records:
+            record("mlflow", {"model_id": "m-1"})
+        assert warnings == [] and len(notes) == 3
+        assert "is gone" in notes[0] and all("no mlflow record" in n for n in notes[1:])
+        for step, text in texts.items():
+            assert (tmp_path / f"step_{step}" / "metadata.json").read_text() == text
+
+    @pytest.mark.parametrize(
+        ("backend", "fields", "step_on_file", "reason"),
+        [
+            ("mlflow", {"model_id": 7}, 1, "fields of strings"),
+            (None, {"model_id": "m-1"}, 1, "fields of strings"),
+            ("mlflow", {"model_id": "m-1"}, 99, "not the metadata of step 1"),
+        ],
+        ids=["value", "backend", "other-step"],
+    )
+    def test_record_refuses_unrecordable_fields_and_another_steps_sidecar(
+        self, tmp_path, monkeypatch, backend, fields, step_on_file, reason
+    ):
+        _, registrar = self._registered(tmp_path, monkeypatch)
+        sidecar = tmp_path / "step_1" / "metadata.json"
+        sidecar.write_text(sidecar.read_text().replace('"step": 1', f'"step": {step_on_file}'))
+        before = sidecar.read_text()
+        warnings = self._log(monkeypatch, "warning")
+        registrar.records[0](backend, fields)
+        assert sidecar.read_text() == before
+        assert len(warnings) == 1 and reason in warnings[0]
+
+    def test_sidecar_writes_amends_and_removals_hold_the_sidecar_lock(self, tmp_path, monkeypatch):
+        from kempnerforge.checkpoint import manager as mgr_mod
+
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        mgr.config.keep_last_n = 1
+        lock = _HeldLock()
+        mgr._sidecar_lock = lock  # type: ignore[assignment]
+        held: list = []
+        write_text, replace, rmtree = Path.write_text, os.replace, mgr_mod.shutil.rmtree
+
+        def written(path, *args, **kwargs):
+            if path.name == "metadata.json":
+                held.append(("write", lock.held))
+            return write_text(path, *args, **kwargs)
+
+        def replaced(*args):
+            held.append(("replace", lock.held))
+            return replace(*args)
+
+        def removed(*args, **kwargs):
+            held.append(("remove", lock.held))
+            return rmtree(*args, **kwargs)
+
+        monkeypatch.setattr(Path, "write_text", written)
+        monkeypatch.setattr(os, "replace", replaced)
+        monkeypatch.setattr(mgr_mod.shutil, "rmtree", removed)
+        registrar = _Registrar()
+        mgr.set_tracking_source(lambda: [self.MLFLOW])
+        mgr.set_checkpoint_registrar(registrar)
+        mgr.save(step=1)
+        registrar.records[0]("mlflow", {"model_id": "m-1"})
+        mgr.save(step=2)
+        assert held == [("write", True), ("replace", True), ("write", True), ("remove", True)]
+
+    def test_trackers_fields_and_registration_reach_the_sidecar_by_backend_name(
+        self, tmp_path, monkeypatch
+    ):
         from kempnerforge.config.schema import JobConfig, MetricsConfig
         from kempnerforge.metrics.tracker import MetricsTracker, _LoggingBackend
 
@@ -1115,18 +1329,21 @@ class TestSaveCheckpointRegistration:
             def tracking_entry(self):
                 return dict(TestSaveCheckpointRegistration.MLFLOW)
 
-            def register_checkpoint(self, step, directory):
-                return {"model_id": f"{directory.name}-registered"}
+            def checkpoint_fields(self, step):
+                return {"model_name": f"m-step_{step}"}
+
+            def register_checkpoint(self, step, directory, record):
+                record({"model_id": f"{directory.name}-registered"})
 
         model = ModelConfig(dim=128, n_layers=2, n_heads=2, vocab_size=256)
         tracker = MetricsTracker(JobConfig(model=model, metrics=MetricsConfig()), num_gpus=1)
         tracker._backends = [_LoggingBackend(), Registering()]
         mgr = _make_mock_mgr(tmp_path, monkeypatch)
         mgr.set_tracking_source(tracker.tracking_entries)
-        mgr.set_checkpoint_registrar(tracker.register_checkpoint)
+        mgr.set_checkpoint_registrar(tracker)
         mgr.save(step=3)
         assert self._sidecar(tmp_path, 3)["tracking"] == [
-            {**self.MLFLOW, "model_id": "step_3-registered"}
+            {**self.MLFLOW, "model_name": "m-step_3", "model_id": "step_3-registered"}
         ]
 
 
@@ -2115,10 +2332,20 @@ class TestMuonResume:
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     MODEL_CONFIG = ModelConfig(dim=64, n_layers=2, n_heads=2, vocab_size=4096, max_seq_len=64)
 
-    def _build(self, seed):
+    def _build(self, seed, **overrides):
         torch.manual_seed(seed)
         model = Transformer(self.MODEL_CONFIG).to(self.DEVICE)
-        return model, build_optimizer(model, OptimizerConfig(name="muon", lr=1e-3, fused=False))
+        config = OptimizerConfig(name="muon", lr=1e-3, fused=False, **overrides)
+        return model, build_optimizer(model, config)
+
+    @staticmethod
+    def _save_without(model, opt, key, ckpt_dir):
+        """Save ``opt`` as it was saved before its param groups had ``key``."""
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        for group in opt.param_groups:
+            del group[key]
+        CheckpointManager(CheckpointConfig(dir=str(ckpt_dir)), model, opt).save(step=3)
 
     def _batches(self, n):
         g = torch.Generator().manual_seed(123)
@@ -2243,6 +2470,124 @@ class TestMuonResume:
         state = {"optimizer": get_optimizer_state_dict(model2, opt2)}
         dcp.load(state, checkpoint_id=str(tmp_path / "step_3"))
         set_optimizer_state_dict(model2, opt2, optim_state_dict=state["optimizer"])
+        self._assert_same_state(opt, opt2, "Muon")
+
+    def test_checkpoint_saved_before_orthogonalize_resumes_as_local(self, tmp_path):
+        """A checkpoint saved before ``orthogonalize`` existed resumes with "local" and matches."""
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        batches = self._batches(6)
+        ref_model, ref_opt = self._build(seed=0)
+        self._train(ref_model, ref_opt, batches)
+
+        model, opt = self._build(seed=0)
+        self._train(model, opt, batches[:3])
+        self._save_without(model, opt, "orthogonalize", tmp_path)
+
+        model2, opt2 = self._build(seed=1)
+        CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model2, opt2).load()
+        assert {g["orthogonalize"] for g in opt2.param_groups} == {"local"}
+
+        self._train(model2, opt2, batches[3:])
+        for (name, ref), p in zip(ref_model.named_parameters(), model2.parameters(), strict=True):
+            assert torch.equal(ref, p), f"{name} diverged from the uninterrupted run"
+
+    def test_checkpoint_saved_before_orthogonalize_warns(self, tmp_path):
+        """Filling in a missing key logs one warning naming it; a complete checkpoint logs none."""
+        import logging
+
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        records: list[logging.LogRecord] = []
+
+        class _CaptureHandler(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                records.append(record)
+
+        def warnings_on_load(ckpt_dir) -> list[str]:
+            records.clear()
+            target = logging.getLogger("kempnerforge.checkpoint.manager")
+            capture = _CaptureHandler(level=logging.WARNING)
+            target.addHandler(capture)
+            model2, opt2 = self._build(seed=1)
+            try:
+                CheckpointManager(CheckpointConfig(dir=str(ckpt_dir)), model2, opt2).load()
+            finally:
+                target.removeHandler(capture)
+            return [r.getMessage() for r in records if "orthogonalize" in r.getMessage()]
+
+        model, opt = self._build(seed=0)
+        self._train(model, opt, self._batches(3))
+        CheckpointManager(CheckpointConfig(dir=str(tmp_path / "complete")), model, opt).save(step=3)
+        self._save_without(model, opt, "orthogonalize", tmp_path / "legacy")
+
+        assert warnings_on_load(tmp_path / "complete") == []
+        assert len(warnings_on_load(tmp_path / "legacy")) == 1
+
+    def test_checkpoint_saved_before_orthogonalize_ignores_the_configured_mode(self, tmp_path):
+        """It resumes with the mode it was trained with, as a newer checkpoint does."""
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        model, opt = self._build(seed=0)
+        self._train(model, opt, self._batches(3))
+        self._save_without(model, opt, "orthogonalize", tmp_path)
+
+        model2, opt2 = self._build(seed=1, muon_orthogonalize="exact")
+        CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model2, opt2).load()
+        assert {g["orthogonalize"] for g in opt2.param_groups} == {"local"}
+
+    def test_checkpoint_resumes_with_the_mode_it_was_saved_with(self, tmp_path):
+        """A checkpoint that has ``orthogonalize`` keeps it over the configured mode."""
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        model, opt = self._build(seed=0, muon_orthogonalize="exact")
+        self._train(model, opt, self._batches(3))
+        CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model, opt).save(step=3)
+
+        model2, opt2 = self._build(seed=1)
+        CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model2, opt2).load()
+        assert {g["orthogonalize"] for g in opt2.param_groups} == {"exact"}
+
+    def test_checkpoint_without_another_group_key_still_fails(self, tmp_path):
+        """Only the listed keys may be missing; a checkpoint without any other fails to load."""
+        from torch.distributed.checkpoint.api import CheckpointException
+
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        model, opt = self._build(seed=0)
+        self._train(model, opt, self._batches(3))
+        self._save_without(model, opt, "ns_steps", tmp_path)
+
+        model2, opt2 = self._build(seed=1)
+        missing = r"Missing key in checkpoint state_dict: optimizer\.param_groups\.\d+\.ns_steps"
+        with pytest.raises(CheckpointException, match=missing):
+            CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model2, opt2).load()
+
+    def test_checkpoint_without_inner_state_or_orthogonalize_resumes_muon(self, tmp_path):
+        """The oldest Muon checkpoints lack both the inner AdamW and ``orthogonalize``."""
+        from torch.distributed.checkpoint.state_dict import (
+            get_model_state_dict,
+            get_optimizer_state_dict,
+        )
+
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        model, opt = self._build(seed=0)
+        self._train(model, opt, self._batches(3))
+        for group in opt.param_groups:
+            del group["orthogonalize"]
+        step_dir = tmp_path / "step_3"
+        state = {
+            "model": get_model_state_dict(model),
+            "optimizer": get_optimizer_state_dict(model, opt),
+        }
+        dcp.save(state, checkpoint_id=str(step_dir))
+
+        model2, opt2 = self._build(seed=1)
+        CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model2, opt2).load(
+            path=str(step_dir)
+        )
+        assert {g["orthogonalize"] for g in opt2.param_groups} == {"local"}
         self._assert_same_state(opt, opt2, "Muon")
 
 
