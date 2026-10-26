@@ -12,11 +12,13 @@ from __future__ import annotations
 
 import os
 import re
+import subprocess
+import sys
 import threading
 import time
 from collections import deque
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -721,16 +723,20 @@ def _resolve_mlflow_experiment(config: MetricsConfig, uri: str) -> str | None:
         return None
 
 
+# Run metadata, not params: a user-typed tag key can be MLflow-illegal and fail its whole batch.
+_PARAM_SKIP = ("metrics.mlflow_tags", "metrics.mlflow_description")
+
+
 def _flatten_config_params(config: JobConfig, max_len: int = 250) -> dict[str, str]:
     """Flatten a JobConfig to dotted string keys (model.dim, ...) for mlflow.log_params.
 
     None is skipped; non-scalars are stringified; values truncated to max_len.
     """
-    from dataclasses import asdict
-
     flat: dict[str, str] = {}
 
     def _walk(prefix: str, value: Any) -> None:
+        if prefix in _PARAM_SKIP or any(prefix.startswith(p + ".") for p in _PARAM_SKIP):
+            return
         if value is None:
             return
         if isinstance(value, dict):
@@ -780,7 +786,83 @@ def _mlflow_log_metrics(mlflow: Any, run_id: str, metrics: dict[str, float], ste
 
 
 def _mlflow_set_tag(mlflow: Any, run_id: str, key: str, value: str) -> None:
-    mlflow.MlflowClient().set_tag(run_id, key, value)  # fluent set_tags has no run_id
+    # fluent set_tags has no run_id; synchronous=True for the same reason as in log_metrics
+    mlflow.MlflowClient().set_tag(run_id, key, value, synchronous=True)
+
+
+# mlflow's standard run tags: the description shown in its UI, and the code version.
+_NOTE_TAG = "mlflow.note.content"
+_GIT_COMMIT_TAG = "mlflow.source.git.commit"
+_GIT_DIRTY_TAG = "mlflow.source.git.dirty"
+_CONFIG_ARTIFACT = "config.json"
+_GIT_TIMEOUT_S = 10.0  # per git query; both fit inside the tag call's own deadline
+_GIT_SHA = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+
+
+def _git_output(*args: str) -> str | None:
+    """Stdout of ``git <args>`` in the working directory; None, noted at debug level, on failure."""
+    env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}  # no index lock for a read-only query
+    try:
+        done = subprocess.run(
+            ["git", *args],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            stdin=subprocess.DEVNULL,
+            env=env,
+            timeout=_GIT_TIMEOUT_S,
+        )
+    except (OSError, subprocess.SubprocessError) as e:  # no git binary, or no answer in time
+        logger.debug(f"MLflow: git {args[0]} did not run ({e})")
+        return None
+    if done.returncode != 0:
+        logger.debug(f"MLflow: git {args[0]} exited {done.returncode}: {done.stderr.strip()}")
+        return None
+    return done.stdout.strip()
+
+
+def _git_state() -> tuple[str, bool | None] | None:
+    """(commit sha, whether tracked files differ from it or None if unknown), else None.
+
+    Describes the repository at the working directory. Every failure (git absent, not a
+    repository, no commit yet, no answer in time) yields None or an unknown flag, never an error.
+    """
+    sha = _git_output("rev-parse", "HEAD")
+    if sha is None:
+        return None
+    if not _GIT_SHA.fullmatch(sha):
+        logger.debug(f"MLflow: git rev-parse printed {sha!r}, not a commit id")
+        return None
+    changes = _git_output("status", "--porcelain", "--untracked-files=no")
+    return sha, None if changes is None else bool(changes)
+
+
+def _mlflow_set_git_tags(mlflow: Any, run_id: str) -> None:
+    state = _git_state()
+    if state is None:
+        return
+    commit, dirty = state
+    _mlflow_set_tag(mlflow, run_id, _GIT_COMMIT_TAG, commit)
+    if dirty is not None:
+        _mlflow_set_tag(mlflow, run_id, _GIT_DIRTY_TAG, str(dirty).lower())
+
+
+def _mlflow_log_config(mlflow: Any, run_id: str, config: dict[str, Any]) -> None:
+    mlflow.MlflowClient().log_dict(run_id, config, _CONFIG_ARTIFACT)  # stringifies non-JSON values
+
+
+def _launch_toml_arg() -> str | None:
+    """The ``.toml`` path in argv[1], where the entry points take their config file from."""
+    argv = sys.argv
+    return argv[1] if len(argv) > 1 and argv[1].lower().endswith(".toml") else None
+
+
+def _mlflow_log_launch_toml(mlflow: Any, run_id: str, arg: str) -> None:
+    path = os.path.abspath(arg)
+    if not os.path.isfile(path):
+        logger.debug(f"MLflow: launch config {arg!r} is not a file; not uploaded")
+        return
+    mlflow.MlflowClient().log_artifact(run_id, path)
 
 
 class _MlflowDisabled(Exception):
@@ -818,8 +900,10 @@ class MLflowBackend(_LoggingBackend):
 
     Lazy init on first log; run ID written back to config for checkpoint resume. Every server
     call has a deadline: the run is set up and later ended on one owner thread (the active run is
-    thread-local), and metric, param and tag calls go through a best-effort worker, so a slow
-    server never stalls training. The one wait on the training thread is opt-in: with
+    thread-local), and metric, param, tag and artifact calls go through a best-effort worker, so a
+    slow server never stalls training. A new run (not a resumed one) also gets its description and
+    tags, the git commit, and the resolved config (plus the launch TOML) as artifacts.
+    The one wait on the training thread is opt-in: with
     ``mlflow_register_checkpoints``, each save awaits its checkpoint's model for a bounded time.
 
     The tracking URI resolves as config, then $MLFLOW_TRACKING_URI, then "databricks". Databricks
@@ -829,7 +913,7 @@ class MLflowBackend(_LoggingBackend):
 
     def __init__(self, config: MetricsConfig, job_config: JobConfig | None = None) -> None:
         self._config = config
-        self._job_config = job_config  # flattened to params lazily, only for a fresh run
+        self._job_config = job_config  # params and config.json come from it, for a fresh run only
         self._uri = ""  # the resolved tracking URI, set when init starts
         self._active: bool | None = None  # None = not tried, True = live, False = failed
         self._run_started = False  # a run exists that close() must end
@@ -928,7 +1012,11 @@ class MLflowBackend(_LoggingBackend):
         return mlflow.start_run(**kwargs), False
 
     def _log_run_metadata(self, mlflow: Any) -> None:
-        """Queue flattened config as params + host/slurm tags; each call fails on its own."""
+        """Queue a new run's params, tags and config artifacts; each call fails on its own.
+
+        The training thread only snapshots values here. Everything slow (git, file access, the
+        server) runs on the worker, so this never waits on any of it.
+        """
         import socket
 
         hyperparams = _flatten_config_params(self._job_config) if self._job_config else {}
@@ -940,10 +1028,23 @@ class MLflowBackend(_LoggingBackend):
                 "log_params",
                 partial(mlflow.log_params, batch, run_id=self._run_id, synchronous=True),
             )
+        self._worker.submit("set_git_tags", partial(_mlflow_set_git_tags, mlflow, self._run_id))
         tags = {"host": socket.gethostname(), "slurm_job_id": os.environ.get("SLURM_JOB_ID", "")}
+        if self._config.mlflow_description:
+            tags[_NOTE_TAG] = self._config.mlflow_description
+        tags.update(self._config.mlflow_tags)  # configured tags override the automatic ones
         for key, value in tags.items():
             call = partial(_mlflow_set_tag, mlflow, self._run_id, key, value)
             self._worker.submit(f"set_tag {key}", call)
+        if self._job_config is not None:
+            call = partial(_mlflow_log_config, mlflow, self._run_id, asdict(self._job_config))
+            self._worker.submit(f"upload {_CONFIG_ARTIFACT}", call, deadline=_UPLOAD_DEADLINE_S)
+        toml_arg = _launch_toml_arg()
+        if toml_arg is None:
+            logger.debug("MLflow: no launch config on the command line; none uploaded")
+        else:
+            call = partial(_mlflow_log_launch_toml, mlflow, self._run_id, toml_arg)
+            self._worker.submit("upload launch config", call, deadline=_UPLOAD_DEADLINE_S)
 
     def log(self, metrics: dict[str, float], step: int) -> None:
         self._ensure_init()

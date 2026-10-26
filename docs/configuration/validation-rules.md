@@ -153,6 +153,9 @@ File:
 [`kempnerforge/config/metrics.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/config/metrics.py).
 
 - `log_interval > 0`.
+- `mlflow_description`, when set, is a non-empty string.
+- `mlflow_tags` maps non-empty string names to non-empty string values; the error names
+  the offending key.
 - `mlflow_register_checkpoints` requires `enable_mlflow`.
 
 ### `ProfilingConfig`
