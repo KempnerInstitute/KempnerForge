@@ -335,7 +335,7 @@ class TestCheckMlflow:
             "DATABRICKS_CONFIG_PROFILE",
             "MLFLOW_TRACKING_URI",
         ):
-            monkeypatch.setenv(name, "")  # set first so teardown undoes what the code exports
+            monkeypatch.setenv(name, "")
             monkeypatch.delenv(name)
         monkeypatch.setenv("HOME", str(tmp_path))
         return tmp_path
@@ -445,7 +445,7 @@ class TestCheckMlflow:
             "databricks://scope:prefix",
             "databricks://id@host",
             "http://h:1",
-            "databricks://[",  # urlparse rejects an unbalanced bracket
+            "databricks://[",
         ],
     )
     def test_uri_naming_no_profile_falls_back_to_default(self, monkeypatch, uri):
@@ -527,9 +527,7 @@ class TestCheckMlflow:
     @pytest.mark.parametrize(
         "error",
         [
-            # the parser quotes the offending profile line
             configparser.MissingSectionHeaderError("profile", 3, "token secret-value"),
-            # request validation quotes the header it built from the token
             ValueError("Invalid header value b'Bearer secret-value\\ncontinued'"),
         ],
         ids=["parser-line", "header-value"],

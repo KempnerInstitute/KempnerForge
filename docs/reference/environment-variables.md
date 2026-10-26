@@ -105,6 +105,7 @@ Setup and auth routes: [MLflow backend](../metrics-and-profiling/mlflow.md).
 | `MLFLOW_HTTP_REQUEST_TIMEOUT` | MLflow | Set to `30` by the backend before importing `mlflow` |
 | `MLFLOW_HTTP_REQUEST_MAX_RETRIES` | MLflow | Set to `3` by the backend before importing `mlflow` |
 | `MLFLOW_DATABRICKS_ENDPOINT_HTTP_RETRY_TIMEOUT` | MLflow | Set to `60` by the backend before importing `mlflow` |
+| `MLFLOW_ACTIVE_MODEL_ID` | MLflow, publisher | MLflow's process-wide active model (`mlflow.set_active_model` sets one too); never set by KempnerForge. While one is set, the eval publisher refuses to publish unlinked metrics (the checkpoint's `mlflow` entry has neither `model_id` nor `model_name`), since `log_batch` would silently link them to it |
 
 ## User-facing launch-script variables
 

@@ -13,7 +13,7 @@ stdout formatting, and backend dispatch.
 tracker = MetricsTracker(config, num_gpus=runtime.world_size)
 tracker.init_backends(config)     # builds the rank-0 backends
 ckpt_mgr.set_tracking_source(tracker.tracking_entries)
-ckpt_mgr.set_checkpoint_registrar(tracker.register_checkpoint)
+ckpt_mgr.set_checkpoint_registrar(tracker)
 ...
 while step < tc.max_steps:
     tracker.start_step()
@@ -180,9 +180,10 @@ def close(self) -> None:
 ```
 
 Called from a `finally` in `run_training`, so a run that raises still closes its backends. WandB
-finishes the run, MLflow drains its queued calls and ends the run (each bounded, see
-[MLflow](mlflow.md#bounded-calls)), and TensorBoard flushes the event file. Marking the tracker
-closed first makes `tracking_entries()` and `register_checkpoint()` return nothing afterwards.
+finishes the run, MLflow drains its queued calls, checkpoint registrations included, and ends
+the run (each bounded, see [MLflow](mlflow.md#bounded-calls)), and TensorBoard flushes the event
+file. Marking the tracker closed first makes `tracking_entries()`, `checkpoint_fields()` and
+`register_checkpoint()` return nothing afterwards.
 
 ## Tracking entries
 

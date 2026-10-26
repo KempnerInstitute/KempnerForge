@@ -159,7 +159,7 @@ persists it in `ckpt_extra`:
 
 ```python
 # kempnerforge/metrics/tracker.py: MLflowBackend._ensure_init
-experiment, run_id, resumed, last_step = self._owner.start(_INIT_DEADLINE_S)
+experiment, run_id, run_name, resumed, last_step = self._owner.start(_INIT_DEADLINE_S)
 ...
 self._config.mlflow_run_id = run_id      # write back for checkpoint
 ```
@@ -184,7 +184,7 @@ or server problem) disables the backend rather than fork a new run. On resume it
 re-logging the steps the run already holds: every metric at or below the highest `train/loss`
 step in the run's history is dropped, so re-executing the steps between the last checkpoint and
 the crash does not duplicate points. If that history cannot be read, nothing is skipped. The
-params and tags are not written again.
+params, tags and artifacts are not written again.
 
 ## Finding a checkpoint's run
 
@@ -226,24 +226,22 @@ replacing the file atomically:
 ```
 
 A save never waits on the server for it, a preemption save included. Registration is best
-effort: a server error leaves the entry without `model_id` and logs a rate-limited warning, and
-the next commit of the same step tries again. A step saved twice (a shutdown save right after an
-interval save, or a resumed run re-running it) keeps one model, and the last `metadata.json` of
-that step still gets its `model_id`. A resume registers nothing by itself, and a checkpoint
-deleted before its turn comes is skipped. At shutdown, `close()` delivers a registration still
-queued within its drain budget, so the final checkpoint is registered too. A save before the
-run's first log has no `mlflow` entry, so its `metadata.json` gets neither field. MLflow itself
-logs two harmless "Failed to infer schema" warnings for each external model it creates.
+effort: a failure, such as a server error or a full queue, leaves the entry without `model_id`
+and logs a rate-limited warning, and the next commit of the same step tries again. A step saved
+twice (a shutdown save right after an interval save, or a resumed run re-running it) keeps one
+model, and the last `metadata.json` of that step still gets its `model_id`. A resume registers
+nothing by itself, and a checkpoint deleted before its turn comes is skipped. At shutdown,
+`close()` delivers a registration still queued within its 30 s drain budget, so the final
+checkpoint is registered too. A save before the run's first log has no `mlflow` entry, so its
+`metadata.json` gets neither field. MLflow itself logs two harmless "Failed to infer schema"
+warnings for each external model it creates.
 
-The eval publisher (`python -m kempnerforge.metrics.publish`) links its metrics to the entry's
-`model_id`. When the entry has only `model_name` (the registration failed or never finished),
-it finds the run's model of that name, or creates it, and links to that; it never writes
-`metadata.json`.
-
-**Models-tab leaderboard.** The id is also what lets eval scores be compared per checkpoint. The
-[publisher](#publishing-eval-results) links every metric it appends to the model its checkpoint
-registered, so the scores attach to per-checkpoint models: the experiment's Models tab can list
-the checkpoints with their scores side by side and rank them, and
+**Models-tab leaderboard.** The model is also what lets eval scores be compared per
+checkpoint. The [publisher](#publishing-eval-results) links every metric it appends to the
+entry's `model_id`. When the entry has only `model_name` (the registration failed or never
+finished), it finds the run's model of that name, or creates it, and links to that; it never
+writes `metadata.json`. The scores attach to per-checkpoint models: the experiment's Models tab
+can list the checkpoints with their scores side by side and rank them, and
 `MlflowClient.search_logged_models` filters and orders them by `metrics.<name>` from code.
 Without registration the scores still land in the run at the checkpoint's step, but nothing ties
 them to a per-checkpoint model.
@@ -272,26 +270,29 @@ when nothing was sent because the input is unusable, and 1 with `failed: …` wh
 server errored; URLs in either message are masked.
 
 From Python, `publish_metrics(checkpoint_dir, metrics, prefix="eval/")` does the same and returns
-the target; `read_mlflow_target(checkpoint_dir)` returns it without publishing: the run id,
-experiment, tracking URI, step and model id. Both also prepare Databricks auth in the process
+the target, with the `model_id` the metrics were linked to (`None` when unlinked);
+`read_mlflow_target(checkpoint_dir)` returns it without publishing: the run id, experiment,
+tracking URI, step, model id and model name. Both also prepare Databricks auth in the process
 environment, as described under credentials below.
 
 - **What it reads.** The single `mlflow` entry of the `tracking` list, whose `run_id`,
-  `experiment` and `tracking_uri` must be non-empty strings, and `model_id` when present; plus a
-  non-negative integer `step`. Nothing is inferred, and a key repeated anywhere in the file is
-  refused.
+  `experiment` and `tracking_uri` must be non-empty strings, and `model_id` and `model_name`
+  when present; plus a non-negative integer `step`. Nothing is inferred, and a key repeated
+  anywhere in the file is refused.
 - **What it sends.** One `log_batch` request through a client bound to the recorded tracking URI,
   after every metric has been checked: a non-empty name, a finite number, at most 1000 in all.
-  When the entry has a `model_id`, the metrics are linked to that model. It never starts, ends or
-  edits a run and keeps no state, so several publishers can write to one run at once. The call
-  blocks on the server under MLflow's own HTTP timeouts, so run it as a separate process, never
-  from the training step. `log_batch` is not atomic: a request that fails server side may still
-  have stored some points.
+  The metrics are linked to the checkpoint's model: the entry's `model_id`, else the run's model
+  named by `model_name`, found or created as [above](#registering-checkpoints). An entry with
+  neither publishes them unlinked. It never starts, ends or edits a run and keeps no state, so
+  several publishers can write to one run at once. The call blocks on the server under MLflow's
+  own HTTP timeouts, so run it as a separate process, never from the training step. `log_batch`
+  is not atomic: a request that fails server side may still have stored some points.
 - **When it refuses.** The directory has no `metadata.json`; there is no `tracking` list or no
   `mlflow` entry (a checkpoint saved before the run's first log, an older one, or training
   without MLflow); more than one `mlflow` entry; a field is missing or empty; the metrics are
-  malformed; `mlflow` is not installed; or the sidecar has no `model_id` while the process has an
-  active MLflow model, which `log_batch` would silently link the metrics to.
+  malformed; `mlflow` is not installed; or the entry has neither `model_id` nor `model_name`
+  while the process has an active MLflow model (`MLFLOW_ACTIVE_MODEL_ID` or
+  `mlflow.set_active_model`), which `log_batch` would silently link the metrics to.
 - **Credentials.** It prepares auth from the [routes above](#authentication) the way the
   training backend does: it uses the recorded `tracking_uri` as written, a
   `databricks://<profile>` entry selects that profile (exported as `DATABRICKS_CONFIG_PROFILE`
@@ -398,9 +399,10 @@ Without it, `enable_mlflow = true` logs a warning and no-ops.
 ## `close()`
 
 Called from `tracker.close()` at the end of training, in a `finally`, so a run that raises
-closes too. It stops accepting calls, gives the queued ones up to 30 s to be delivered, then
-runs `mlflow.end_run()` on the owner thread within 60 s; calls still queued after the drain are
-counted in a warning and dropped. No-op unless a run was started.
+closes too. It stops accepting calls, gives the queued ones (the final checkpoint's
+registration included) up to 30 s to be delivered, then runs `mlflow.end_run()` on the owner
+thread within 60 s; calls still queued after the drain are counted in a warning and dropped.
+No-op unless a run was started.
 
 ## See also
 

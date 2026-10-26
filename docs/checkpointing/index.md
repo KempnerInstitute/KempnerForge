@@ -59,8 +59,10 @@ live run at save time it also holds a `tracking` list, one entry per backend:
   is live.
 - The training entry hands `CheckpointManager.set_tracking_source` the tracker's
   [`tracking_entries`](../metrics-and-profiling/metrics-tracker.md#tracking-entries), which
-  `save()` reads on rank 0. A source that raises, or returns what JSON cannot hold, costs the
-  `tracking` key with a warning, never the save.
+  `save()` reads on rank 0, and `set_checkpoint_registrar` the tracker itself
+  ([Registering checkpoints](../metrics-and-profiling/metrics-tracker.md#registering-checkpoints)).
+  A source that raises, or returns what JSON cannot hold, costs the `tracking` key with a
+  warning, never the save; a registrar that fails costs only its fields or its registration.
 - Values are recorded as resolved. Credentials embedded in the tracking URI
   (`scheme://user:token@host`) are stripped at write time; authentication comes from the
   environment, a profile or OAuth, never from this file. The URI, experiment path and run ids
