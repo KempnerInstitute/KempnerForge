@@ -372,6 +372,16 @@ class TestMuon:
         optimizer = build_optimizer(nn.Linear(8, 8), config)
         assert optimizer.param_groups[0]["orthogonalize"] == "exact"
 
+    def test_state_saved_before_orthogonalize_loads_as_local(self):
+        """A state saved before ``orthogonalize`` existed loads with "local", whatever is set."""
+        weight = nn.Parameter(torch.zeros(4, 4))
+        saved = Muon([{"params": [weight]}], [{"params": []}]).state_dict()
+        for group in saved["param_groups"]:
+            del group["orthogonalize"]
+        optimizer = Muon([{"params": [weight]}], [{"params": []}], orthogonalize="exact")
+        optimizer.load_state_dict(saved)
+        assert optimizer.param_groups[0]["orthogonalize"] == "local"
+
 
 class TestAdamW:
     def test_build_adamw(self):
