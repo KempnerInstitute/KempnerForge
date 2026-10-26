@@ -11,8 +11,13 @@ WandB, TensorBoard, MLflow) at a configurable interval.
 from __future__ import annotations
 
 import os
+import re
+import threading
 import time
+from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
+from functools import partial
 from typing import Any
 
 from kempnerforge.config.schema import JobConfig, MetricsConfig
@@ -75,6 +80,7 @@ class MetricsTracker:
         # Logging backends (initialized lazily)
         self._backends: list[_LoggingBackend] = []
         self._backends_initialized = False
+        self._closed = False
 
     def _init_backends(self, config: JobConfig) -> None:
         """Lazily initialize logging backends (rank 0 only)."""
@@ -215,10 +221,49 @@ class MetricsTracker:
         """Initialize logging backends (call after distributed setup)."""
         self._init_backends(config)
 
+    def tracking_entries(self) -> list[dict[str, str]]:
+        """One record per backend with a live run, for a checkpoint's ``metadata.json``.
+
+        Empty once ``close()`` has begun. Reads only what the backends already hold, so it
+        never waits on a server. Each entry is copied once into a plain dict; a backend that
+        cannot describe itself, or whose entry is not strings under a named ``backend``, is
+        skipped with a warning and costs no other backend its entry.
+        """
+        entries: list[dict[str, str]] = []
+        if self._closed:
+            return entries
+        for backend in self._backends:
+            try:
+                entry = backend.tracking_entry()
+                snapshot = None if entry is None else _tracking_snapshot(entry)
+            except Exception as e:  # a third-party run object; never let it cost a save
+                logger.warning(
+                    "%s tracking entry skipped (%s)", type(backend).__name__, _error_text(e)
+                )
+                continue
+            if snapshot is not None:
+                entries.append(snapshot)
+        return entries
+
     def close(self) -> None:
         """Flush and close all logging backends."""
+        self._closed = True
         for backend in self._backends:
             backend.close()
+
+
+def _tracking_snapshot(entry: object) -> dict[str, str]:
+    """A plain copy of a backend's entry; ValueError unless it is strings under a named backend."""
+    if not isinstance(entry, dict):
+        raise ValueError(f"expected a mapping, got {type(entry).__name__}")
+    snapshot: dict[str, str] = {}
+    for key, value in entry.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            raise ValueError("keys and values must be strings")
+        snapshot[key] = value
+    if not snapshot.get("backend", "").strip():
+        raise ValueError("no backend name")
+    return snapshot
 
 
 # ---------------------------------------------------------------------------
@@ -231,6 +276,13 @@ class _LoggingBackend:
 
     def log(self, metrics: dict[str, float], step: int) -> None:
         raise NotImplementedError
+
+    def tracking_entry(self) -> dict[str, str] | None:
+        """This backend's record of its live run for a checkpoint.
+
+        None until its run starts, after a failed init, and once it is closed.
+        """
+        return None
 
     def close(self) -> None:
         pass
@@ -245,6 +297,7 @@ class WandBBackend(_LoggingBackend):
     def __init__(self, config: MetricsConfig) -> None:
         self._config = config
         self._run = None
+        self._closed = False
 
     def _ensure_init(self) -> None:
         if self._run is not None:
@@ -277,17 +330,295 @@ class WandBBackend(_LoggingBackend):
 
         wandb.log(metrics, step=step)
 
+    def tracking_entry(self) -> dict[str, str] | None:
+        run: Any = self._run  # None before the first log, False after a failed init
+        if self._closed or not run or run.disabled:  # a disabled run records nothing
+            return None
+        entry = {"backend": "wandb", "run_id": run.id, "experiment": run.project}
+        if entity := run.entity:
+            entry["entity"] = entity
+        if not run.offline and (url := run.url):  # an offline run has no URL, and asking warns
+            entry["url"] = url
+        return entry
+
     def close(self) -> None:
         if self._run and self._run is not False:
             import wandb
 
+            self._closed = True
             wandb.finish()
 
 
-def _mlflow_databricks_ready() -> bool:
-    """True when Databricks credentials are present in the environment."""
-    has_token = bool(os.environ.get("DATABRICKS_TOKEN") or os.environ.get("DATABRICKS_API_TOKEN"))
-    return bool(os.environ.get("DATABRICKS_HOST")) and has_token
+# Tracking is a side channel: a slow or unreachable server may cost points, never a stalled rank.
+_CALL_DEADLINE_S = 60.0  # one metric / param / tag call
+_UPLOAD_DEADLINE_S = 180.0  # one artifact upload
+_INIT_DEADLINE_S = 60.0  # experiment setup plus run start or resume, on the first log
+_END_DEADLINE_S = 60.0  # ending the run in close(), after the drain
+_DRAIN_DEADLINE_S = 30.0  # close() flush budget
+_QUEUE_MAX = 256  # pending calls before new ones are dropped
+_MAX_CALL_THREADS = 4  # live call threads, abandoned ones included, before new calls are dropped
+_WARN_INTERVAL_S = 300.0  # minimum gap between repeats of a warning
+
+
+# mlflow and SDK errors can quote a credentialed tracking URI; nothing logged may carry it.
+_URI_USERINFO = re.compile(r"(?<=://)[^/?#\s]+@")
+
+
+def _scrub_uris(text: str) -> str:
+    return _URI_USERINFO.sub("", text)
+
+
+def _error_text(error: BaseException) -> str:
+    """``error``'s message with URI credentials removed; never raises."""
+    try:
+        return _scrub_uris(str(error))
+    except Exception:
+        return f"<unprintable {type(error).__name__}>"
+
+
+class _RateLimitedWarning:
+    """Warns on the first event, then at most once per interval, counting what it held back."""
+
+    def __init__(self, interval: float, clock: Callable[[], float] = time.monotonic) -> None:
+        self._interval = interval
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._last: float | None = None
+        self._held_back = 0
+
+    def __call__(self, message: str) -> None:
+        with self._lock:
+            now = self._clock()
+            if self._last is not None and now - self._last < self._interval:
+                self._held_back += 1
+                return
+            held_back, self._held_back, self._last = self._held_back, 0, now
+        suffix = f" ({held_back} similar warnings suppressed)" if held_back else ""
+        logger.warning(_scrub_uris(message) + suffix)
+
+
+class _BestEffortWorker:
+    """Runs tracking calls off the training thread so a slow server cannot stall it.
+
+    One daemon thread takes calls in submission order. Each call runs on a short-lived thread
+    that the worker waits on for at most the call's deadline; a thread cannot be cancelled, so a
+    call past its deadline is abandoned and the next one proceeds. At most ``max_threads`` call
+    threads are alive at once, abandoned ones included; beyond that, calls are dropped until one
+    returns. ``submit`` never blocks (a full queue drops the new call), and failures, timeouts
+    and drops only emit rate-limited warnings.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        *,
+        max_queue: int,
+        max_threads: int,
+        call_deadline: float,
+        drain_deadline: float,
+    ) -> None:
+        self._name = name
+        self._max_queue = max_queue
+        self._max_threads = max_threads
+        self._call_deadline = call_deadline
+        self._drain_deadline = drain_deadline
+        self._calls: list[threading.Thread] = []  # call threads not yet seen to finish
+        self._items: deque[tuple[str, Callable[[], Any], float]] = deque()
+        self._cv = threading.Condition()
+        self._busy = False  # a dequeued call is still being waited on
+        self._closed = False
+        self._thread = threading.Thread(target=self._consume, name=f"{name}-tracking", daemon=True)
+        self._warn_call = _RateLimitedWarning(_WARN_INTERVAL_S)
+        self._warn_drop = _RateLimitedWarning(_WARN_INTERVAL_S)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def submit(self, what: str, fn: Callable[[], Any], deadline: float | None = None) -> bool:
+        """Queue ``fn``; False if it was dropped (queue full or worker closed)."""
+        with self._cv:
+            if self._closed:
+                return False
+            accepted = len(self._items) < self._max_queue
+            if accepted:
+                limit = self._call_deadline if deadline is None else deadline
+                self._items.append((what, fn, limit))
+                self._cv.notify_all()
+        if not accepted:
+            self._warn_drop(
+                f"{self._name} tracking queue full ({self._max_queue}); dropping {what}"
+            )
+        return accepted
+
+    def flush(self, timeout: float) -> bool:
+        """Wait until every queued call has been attempted; False if ``timeout`` ran out first."""
+        end = time.monotonic() + timeout
+        with self._cv:
+            while self._items or self._busy:
+                remaining = end - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._cv.wait(remaining)
+        return True
+
+    def close(self) -> bool:
+        """Stop accepting calls and deliver the queued ones within the drain deadline."""
+        with self._cv:
+            self._closed = True
+            self._cv.notify_all()
+        drained = self.flush(self._drain_deadline)
+        if not drained:
+            with self._cv:
+                lost = len(self._items) + int(self._busy)
+                self._items.clear()
+            logger.warning(f"{self._name}: {lost} tracking call(s) not delivered before shutdown")
+        return drained
+
+    def _consume(self) -> None:
+        while True:
+            with self._cv:
+                while not self._items:
+                    if self._closed:
+                        return
+                    self._cv.wait()
+                what, fn, deadline = self._items.popleft()
+                self._busy = True
+            try:
+                self._run(what, fn, deadline)
+            except Exception as e:  # the worker must outlive any single call
+                self._warn_call(f"{self._name} {what} not run ({e}); points may be lost")
+            finally:
+                with self._cv:
+                    self._busy = False
+                    self._cv.notify_all()
+
+    def _run(self, what: str, fn: Callable[[], Any], deadline: float) -> None:
+        self._calls = [thread for thread in self._calls if thread.is_alive()]
+        if len(self._calls) >= self._max_threads:
+            self._warn_drop(
+                f"{self._name}: {len(self._calls)} abandoned tracking calls have not returned; "
+                f"dropping {what}"
+            )
+            return
+        failure: list[Exception] = []
+
+        def call() -> None:
+            try:
+                fn()
+            except Exception as e:  # reported by the worker, not raised in a stray thread
+                failure.append(e)
+
+        thread = threading.Thread(target=call, name=f"{self._name}-call", daemon=True)
+        thread.start()
+        self._calls.append(thread)
+        thread.join(deadline)
+        if thread.is_alive():
+            self._warn_call(
+                f"{self._name} {what} still running after {deadline:g}s; abandoning it, "
+                "points may be lost"
+            )
+        elif failure:
+            self._warn_call(f"{self._name} {what} failed ({failure[0]}); points may be lost")
+
+
+class _RunOwner:
+    """Starts and later ends a tracking run on one dedicated thread, waiting on each for a deadline.
+
+    mlflow keeps the active run, and the system metrics monitor tied to it, per thread, so the end
+    must run on the thread that ran the start. A caller that stops waiting is never blocked again:
+    a start that returns after its deadline is ended right away, and a late end is abandoned.
+    """
+
+    def __init__(self, name: str, start: Callable[[], Any], end: Callable[[], Any]) -> None:
+        self._start_fn = start
+        self._end_fn = end
+        self._started = threading.Event()  # start returned or raised
+        self._end_requested = threading.Event()
+        self._ended = threading.Event()  # end returned or raised, or there was nothing to end
+        self._result: Any = None
+        self._start_error: Exception | None = None
+        self._end_error: Exception | None = None
+        self._thread = threading.Thread(target=self._own, name=f"{name}-run", daemon=True)
+
+    def start(self, deadline: float) -> Any:
+        """Return what ``start`` returned; re-raise its error, or TimeoutError past ``deadline``."""
+        self._thread.start()
+        if not self._started.wait(deadline):
+            self._end_requested.set()  # the start still running is ended as soon as it returns
+            raise TimeoutError(f"no answer from the tracking server within {deadline:g}s")
+        if self._start_error is not None:
+            raise self._start_error
+        return self._result
+
+    def end(self, deadline: float) -> None:
+        """Run ``end`` on the owner thread; re-raise its error, or TimeoutError past deadline."""
+        self._end_requested.set()
+        if not self._ended.wait(deadline):
+            raise TimeoutError(f"no answer from the tracking server within {deadline:g}s")
+        if self._end_error is not None:
+            raise self._end_error
+
+    def _own(self) -> None:
+        try:
+            self._result = self._start_fn()
+        except Exception as e:  # raised again by start(), on the caller's thread
+            self._start_error = e
+        self._started.set()
+        if self._start_error is None:
+            self._end_requested.wait()
+            try:
+                self._end_fn()
+            except Exception as e:  # raised again by end()
+                self._end_error = e
+        self._ended.set()
+
+
+def _import_mlflow() -> Any:
+    """Import mlflow with bounded HTTP requests; values already set in the environment win."""
+    os.environ.setdefault("MLFLOW_HTTP_REQUEST_TIMEOUT", "30")
+    os.environ.setdefault("MLFLOW_HTTP_REQUEST_MAX_RETRIES", "3")
+    # The Databricks SDK transport keeps its own request timeout; this caps how long it retries.
+    os.environ.setdefault("MLFLOW_DATABRICKS_ENDPOINT_HTTP_RETRY_TIMEOUT", "60")
+    import mlflow
+
+    return mlflow
+
+
+_DATABRICKS_AUTH_ROUTES = (
+    "Databricks auth: env DATABRICKS_HOST and DATABRICKS_TOKEN; a ~/.databrickscfg profile via "
+    "a databricks://<profile> URI or DATABRICKS_CONFIG_PROFILE; SDK OAuth"
+)
+
+
+def _auth_hint(error: Exception) -> str:
+    """Where Databricks finds credentials, appended to a failure that may be a credentials one."""
+    if isinstance(error, (ImportError, TimeoutError)):  # a missing package or a slow server
+        return ""
+    return f" ({_DATABRICKS_AUTH_ROUTES})"
+
+
+def _databricks_profile(uri: str) -> str | None:
+    """The profile a ``databricks://<profile>`` tracking URI names; None for any other URI."""
+    scheme, separator, rest = uri.partition("://")
+    profile = rest.partition("/")[0]
+    if scheme != "databricks" or not separator or not profile or ":" in profile:
+        return None  # "scope:prefix" names a secret scope, not a profile
+    return profile
+
+
+def _prepare_databricks_auth(uri: str) -> None:
+    """Make SDK and artifact calls use the URI's profile, and let the token alias stand in.
+
+    Credentials are never read here: the SDK resolves them from the environment, a profile file
+    or OAuth. An operator-set DATABRICKS_CONFIG_PROFILE or DATABRICKS_TOKEN wins.
+    """
+    profile = _databricks_profile(uri)
+    if profile:
+        os.environ.setdefault("DATABRICKS_CONFIG_PROFILE", profile)
+    # The Databricks SDK reads DATABRICKS_TOKEN; mirror the DATABRICKS_API_TOKEN
+    # name many keep in ~/.bashrc so either works.
+    if not os.environ.get("DATABRICKS_TOKEN") and os.environ.get("DATABRICKS_API_TOKEN"):
+        os.environ["DATABRICKS_TOKEN"] = os.environ["DATABRICKS_API_TOKEN"]
 
 
 def _resolve_mlflow_experiment(config: MetricsConfig, uri: str) -> str | None:
@@ -318,7 +649,9 @@ def _resolve_mlflow_experiment(config: MetricsConfig, uri: str) -> str | None:
         user = WorkspaceClient().current_user.me().user_name
         return f"/Users/{user}/{project}"
     except Exception as e:  # SDK missing, no creds, or API error
-        logger.warning(f"Could not auto-resolve Databricks experiment path: {e}")
+        logger.warning(
+            _scrub_uris(f"Could not auto-resolve Databricks experiment path: {e}{_auth_hint(e)}")
+        )
         return None
 
 
@@ -369,76 +702,116 @@ def _mlflow_last_step(mlflow: Any, run_id: str) -> int | None:
         return None
 
 
+# The worker thread has no active run (mlflow keeps it in thread-local state), so each call
+# below names its run; an implicit call there would silently start a new run.
+def _mlflow_log_metrics(mlflow: Any, run_id: str, metrics: dict[str, float], step: int) -> None:
+    # synchronous=True: MLFLOW_ENABLE_ASYNC_LOGGING would otherwise divert these into
+    # mlflow's own unbounded queue with a blocking flush at shutdown; bounding lives in
+    # the worker, so the call itself must stay synchronous.
+    mlflow.log_metrics(
+        {k: float(v) for k, v in metrics.items()}, step=step, run_id=run_id, synchronous=True
+    )
+
+
+def _mlflow_set_tag(mlflow: Any, run_id: str, key: str, value: str) -> None:
+    mlflow.MlflowClient().set_tag(run_id, key, value)  # fluent set_tags has no run_id
+
+
+class _MlflowDisabled(Exception):
+    """A deliberate config error found during init: MLflow is disabled with this message."""
+
+
 class MLflowBackend(_LoggingBackend):
     """MLflow logging backend (Databricks-hosted or any MLflow tracking server).
 
-    Lazy init on first log; run ID written back to config for checkpoint resume.
+    Lazy init on first log; run ID written back to config for checkpoint resume. Every server
+    call has a deadline: the run is set up and later ended on one owner thread (the active run is
+    thread-local), and metric, param and tag calls go through a best-effort worker, so a slow
+    server never stalls training.
+
+    The tracking URI resolves as config, then $MLFLOW_TRACKING_URI, then "databricks". Databricks
+    credentials are not pre-checked: init attempts the server calls, and a failure disables the
+    backend with a warning that names the auth routes.
     """
 
     def __init__(self, config: MetricsConfig, job_config: JobConfig | None = None) -> None:
         self._config = config
         self._job_config = job_config  # flattened to params lazily, only for a fresh run
+        self._uri = ""  # the resolved tracking URI, set when init starts
         self._active: bool | None = None  # None = not tried, True = live, False = failed
         self._run_started = False  # a run exists that close() must end
         self._resume_skip_below: int | None = None  # skip re-logging steps already in the run
-        self._log_failures = 0  # consecutive log failures (warn once, keep retrying)
+        self._mlflow: Any = None  # the imported module
+        self._run_id = ""
+        self._experiment = ""  # the experiment the run was set up in, set with the run id
+        self._worker = _BestEffortWorker(
+            "MLflow",
+            max_queue=_QUEUE_MAX,
+            max_threads=_MAX_CALL_THREADS,
+            call_deadline=_CALL_DEADLINE_S,
+            drain_deadline=_DRAIN_DEADLINE_S,
+        )
+        self._owner = _RunOwner("MLflow", start=self._open_run, end=lambda: self._mlflow.end_run())
 
     def _ensure_init(self) -> None:
         if self._active is not None:
             return
-        uri = self._config.mlflow_tracking_uri
-        if uri.startswith("databricks"):
-            if not _mlflow_databricks_ready():
-                logger.warning(
-                    "enable_mlflow with tracking_uri='databricks' but DATABRICKS_HOST/token "
-                    "not set — disabling MLflow backend"
-                )
-                self._active = False
-                return
-            # The Databricks SDK reads DATABRICKS_TOKEN; mirror the DATABRICKS_API_TOKEN
-            # name many keep in ~/.bashrc so either works.
-            if not os.environ.get("DATABRICKS_TOKEN") and os.environ.get("DATABRICKS_API_TOKEN"):
-                os.environ["DATABRICKS_TOKEN"] = os.environ["DATABRICKS_API_TOKEN"]
+        self._uri = self._config.resolve_mlflow_tracking_uri()
+        on_databricks = self._uri.startswith("databricks")
         try:
-            import mlflow
-
-            mlflow.set_tracking_uri(uri)
-            try:
-                experiment = _resolve_mlflow_experiment(self._config, uri)
-            except ValueError as e:  # bad $MLFLOW_EXPERIMENT: a deliberate config error
-                logger.warning(f"MLflow disabled: {e}")
-                self._active = False
-                return
-            if uri.startswith("databricks") and not experiment:
-                logger.warning(
-                    "MLflow disabled: could not resolve a Databricks experiment path "
-                    "(set mlflow_experiment or $MLFLOW_EXPERIMENT to an absolute path)"
-                )
-                self._active = False
-                return
-            if experiment:
-                mlflow.set_experiment(experiment)
-            if self._config.mlflow_log_system_metrics:
-                mlflow.set_system_metrics_sampling_interval(
-                    self._config.mlflow_system_metrics_interval
-                )
-            run, resumed = self._start_run(mlflow)
+            if on_databricks:
+                _prepare_databricks_auth(self._uri)
+            self._mlflow = _import_mlflow()
+            # The training thread waits here at most once, for at most the init deadline.
+            experiment, run_id, resumed, last_step = self._owner.start(_INIT_DEADLINE_S)
             self._run_started = True
-            self._config.mlflow_run_id = run.info.run_id
+            self._run_id = run_id
+            self._experiment = experiment or ""
+            self._config.mlflow_run_id = run_id
+            self._worker.start()
             self._active = True
-            logger.info(f"MLflow initialized: experiment={experiment} run_id={run.info.run_id}")
+            logger.info(f"MLflow initialized: experiment={experiment} run_id={run_id}")
             if resumed:
-                self._resume_skip_below = _mlflow_last_step(mlflow, run.info.run_id)
+                self._resume_skip_below = last_step
             else:
-                self._log_run_metadata(mlflow)
+                self._log_run_metadata(self._mlflow)
+        except _MlflowDisabled as e:
+            logger.warning(_scrub_uris(f"MLflow disabled: {e}"))
+            self._active = False
         except ImportError:
             logger.warning(
                 "mlflow not installed — disabling MLflow backend (uv sync --group mlflow)"
             )
             self._active = False
         except Exception as e:  # mlflow talks to a remote server: network / auth / config errors
-            logger.warning(f"MLflow init failed: {e}")
+            hint = _auth_hint(e) if on_databricks else ""
+            logger.warning(_scrub_uris(f"MLflow init failed: {e}{hint}"))
             self._active = False
+
+    def _open_run(self) -> tuple[str | None, str, bool, int | None]:
+        """Every server step of init, run on the owner thread under the init deadline.
+
+        Returns (experiment, run_id, resumed, last logged step); the caller applies it, so a
+        start that finishes after the caller gave up changes nothing here.
+        """
+        mlflow, uri = self._mlflow, self._uri
+        mlflow.set_tracking_uri(uri)
+        try:
+            experiment = _resolve_mlflow_experiment(self._config, uri)
+        except ValueError as e:  # bad $MLFLOW_EXPERIMENT: a deliberate config error
+            raise _MlflowDisabled(str(e)) from e
+        if uri.startswith("databricks") and not experiment:
+            raise _MlflowDisabled(
+                "could not resolve a Databricks experiment path "
+                "(set mlflow_experiment or $MLFLOW_EXPERIMENT to an absolute path)"
+            )
+        mlflow.set_experiment(experiment)  # never empty here: off Databricks a name always resolves
+        if self._config.mlflow_log_system_metrics:
+            mlflow.set_system_metrics_sampling_interval(self._config.mlflow_system_metrics_interval)
+        run, resumed = self._start_run(mlflow)
+        run_id = run.info.run_id
+        last_step = _mlflow_last_step(mlflow, run_id) if resumed else None
+        return experiment, run_id, resumed, last_step
 
     def _start_run(self, mlflow: Any) -> tuple[Any, bool]:
         """Start a run, or resume the saved run_id. If that run_id no longer exists, fall
@@ -454,27 +827,28 @@ class MLflowBackend(_LoggingBackend):
             except Exception as e:
                 if not _mlflow_run_gone(e):
                     raise  # transient/other error — don't fork a new run; let init disable
-                logger.warning(f"MLflow run_id={run_id} is gone ({e}); starting a new run")
+                logger.warning(
+                    _scrub_uris(f"MLflow run_id={run_id} is gone ({e}); starting a new run")
+                )
         return mlflow.start_run(**kwargs), False
 
     def _log_run_metadata(self, mlflow: Any) -> None:
-        """Log flattened config as params + host/slurm tags; non-fatal on error."""
+        """Queue flattened config as params + host/slurm tags; each call fails on its own."""
         import socket
 
         hyperparams = _flatten_config_params(self._job_config) if self._job_config else {}
         items = list(hyperparams.items())
-        # log_params caps at 100 per batch; guard each so one bad batch keeps the rest.
+        # log_params caps at 100 per batch; one call per batch so a bad batch keeps the rest.
         for i in range(0, len(items), 100):
-            try:
-                mlflow.log_params(dict(items[i : i + 100]))
-            except Exception as e:
-                logger.warning(f"MLflow log_params batch failed (skipping): {e}")
-        try:
-            mlflow.set_tags(
-                {"host": socket.gethostname(), "slurm_job_id": os.environ.get("SLURM_JOB_ID", "")}
+            batch = dict(items[i : i + 100])
+            self._worker.submit(
+                "log_params",
+                partial(mlflow.log_params, batch, run_id=self._run_id, synchronous=True),
             )
-        except Exception as e:
-            logger.warning(f"MLflow set_tags failed (continuing): {e}")
+        tags = {"host": socket.gethostname(), "slurm_job_id": os.environ.get("SLURM_JOB_ID", "")}
+        for key, value in tags.items():
+            call = partial(_mlflow_set_tag, mlflow, self._run_id, key, value)
+            self._worker.submit(f"set_tag {key}", call)
 
     def log(self, metrics: dict[str, float], step: int) -> None:
         self._ensure_init()
@@ -482,25 +856,29 @@ class MLflowBackend(_LoggingBackend):
             return
         if self._resume_skip_below is not None and step <= self._resume_skip_below:
             return  # already logged before this resume — avoid duplicate history points
-        import mlflow
+        call = partial(_mlflow_log_metrics, self._mlflow, self._run_id, dict(metrics), step)
+        self._worker.submit("log_metrics", call)
 
-        try:
-            mlflow.log_metrics({k: float(v) for k, v in metrics.items()}, step=step)
-            self._log_failures = 0
-        except Exception as e:  # transient network/token failure: warn once, keep retrying
-            self._log_failures += 1
-            if self._log_failures == 1:
-                logger.warning(f"MLflow log failed ({e}); will keep retrying, points may be lost")
+    def tracking_entry(self) -> dict[str, str] | None:
+        """The live run as its checkpoint reader needs it: all four fields non-blank, or none."""
+        entry = {
+            "backend": "mlflow",
+            "run_id": self._run_id,
+            "experiment": self._experiment,
+            "tracking_uri": _URI_USERINFO.sub("", self._uri),
+        }
+        if self._active is not True or not all(value.strip() for value in entry.values()):
+            return None
+        return entry
 
     def close(self) -> None:
         if not self._run_started:
             return
         try:
-            import mlflow
-
-            mlflow.end_run()
+            self._worker.close()
+            self._owner.end(_END_DEADLINE_S)
         except Exception as e:  # teardown must not fail the job
-            logger.warning(f"MLflow end_run failed ({e})")
+            logger.warning(_scrub_uris(f"MLflow end_run failed ({e})"))
         finally:
             self._active = False
             self._run_started = False
@@ -512,6 +890,7 @@ class TensorBoardBackend(_LoggingBackend):
     def __init__(self, config: MetricsConfig) -> None:
         self._config = config
         self._writer = None
+        self._closed = False
 
     def _ensure_init(self) -> None:
         if self._writer is not None:
@@ -532,6 +911,15 @@ class TensorBoardBackend(_LoggingBackend):
         for key, val in metrics.items():
             self._writer.add_scalar(key, val, global_step=step)  # type: ignore[reportOptionalMemberAccess, reportAttributeAccessIssue]
 
+    def tracking_entry(self) -> dict[str, str] | None:
+        writer: Any = self._writer  # None before the first log, False without tensorboard
+        if self._closed or not writer:
+            return None
+        log_dir = writer.get_logdir()  # the writer's own: an empty setting makes it pick one
+        directory = str(log_dir) if log_dir else ""  # as the event writer converts it
+        return {"backend": "tensorboard", "log_dir": directory} if directory else None
+
     def close(self) -> None:
         if self._writer and self._writer is not False:
+            self._closed = True
             self._writer.close()  # type: ignore[reportAttributeAccessIssue]

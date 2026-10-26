@@ -314,7 +314,7 @@ Logging cadence and backend toggles.
 | `wandb_run_id` | `str` | `""` | restored from checkpoint on resume; empty = new run |
 | `tensorboard_dir` | `str` | `"tb_logs"` | TB log directory |
 | `enable_mlflow` | `bool` | `False` | turn on MLflow backend (Databricks or local) |
-| `mlflow_tracking_uri` | `str` | `"databricks"` | tracking URI; backend disables if `databricks` is set without creds |
+| `mlflow_tracking_uri` | `str \| None` | `None` | tracking URI; `None` → `$MLFLOW_TRACKING_URI`, else `"databricks"`; `databricks://<profile>` selects a `~/.databrickscfg` profile |
 | `mlflow_experiment` | `str \| None` | `None` | absolute workspace path on Databricks; `None` → `$MLFLOW_EXPERIMENT`/auto |
 | `mlflow_run_name` | `str \| None` | `None` | `None` → auto-generated |
 | `mlflow_run_id` | `str` | `""` | restored from checkpoint on resume; empty = new run |
