@@ -44,11 +44,24 @@ _METADATA_FILE = "metadata.json"
 _DCP_METADATA_FILE = ".metadata"
 # Key prefix of per-parameter optimizer state in a checkpoint saved by this manager.
 _OPTIM_STATE_PREFIX = "optimizer.state."
+_OPTIM_PARAM_GROUPS_PREFIX = "optimizer.param_groups."
 # Top-level entry naming the parameters the optimizer held without state at save
 # time. It sits beside the optimizer rather than inside it, so it changes neither
 # the optimizer's own layout nor what an older reader, which ignores it, loads.
 _NEVER_STEPPED_KEY = "optimizer_never_stepped"
 _NEVER_STEPPED_PREFIX = f"{_NEVER_STEPPED_KEY}."
+_OPTIM_PREFIX = "optimizer."
+
+
+def _saved_optimizer_param_groups(saved_keys: Iterable[str]) -> int:
+    """Count the optimizer param groups among a DCP checkpoint's keys."""
+    return len(
+        {
+            key.removeprefix(_OPTIM_PARAM_GROUPS_PREFIX).split(".", 1)[0]
+            for key in saved_keys
+            if key.startswith(_OPTIM_PARAM_GROUPS_PREFIX)
+        }
+    )
 
 
 def _intersect_freeze_meta_by_module(
@@ -130,6 +143,16 @@ def _params_recorded_never_stepped(fqns: set[str], saved_keys: Iterable[str]) ->
             f"optimizer state: {contradicted[:8]}"
         )
     return recorded
+
+
+def _holds_optimizer(saved_keys: Iterable[str]) -> bool:
+    """Return whether a checkpoint's keys include the optimizer entry, in either layout."""
+    return any(key == "optimizer" or key.startswith(_OPTIM_PREFIX) for key in saved_keys)
+
+
+def _reset_to_fresh(optimizer: torch.optim.Optimizer) -> None:
+    """Return ``optimizer`` to its freshly built state, keeping its param groups."""
+    optimizer.load_state_dict({"state": {}, "param_groups": optimizer.state_dict()["param_groups"]})
 
 
 class _NeverSteppedStatePlanner(DefaultLoadPlanner):
@@ -243,6 +266,10 @@ class CheckpointManager:
         self.config = config
         self.model = model
         self.optimizer = optimizer
+        self.checkpointed_optimizers: list[torch.optim.Optimizer] = [
+            optimizer,
+            *getattr(optimizer, "inner_optimizers", ()),
+        ]
         self.base_dir = Path(config.dir)
         self._rank = dist.get_rank() if dist.is_initialized() else 0
         self._async_ckpt = AsyncCheckpointer(mode=config.async_mode)
@@ -360,12 +387,11 @@ class CheckpointManager:
         # repopulate them. A freshly-constructed optimizer's raw state_dict() is
         # empty, so the moments would be silently dropped on resume (Adam momentum
         # resets to zero -> non-bit-exact resume; see manager load()).
-        optim_state = get_optimizer_state_dict(self.model, self.optimizer)
-        dcp_state = {
-            "model": get_model_state_dict(self.model),
-            "optimizer": optim_state,
-            _NEVER_STEPPED_KEY: _never_stepped_record(optim_state),
-        }
+        dcp_state: dict[str, Any] = {"model": get_model_state_dict(self.model)}
+        if any(optimizer.state for optimizer in self.checkpointed_optimizers):
+            optim_state = get_optimizer_state_dict(self.model, self.checkpointed_optimizers)
+            dcp_state["optimizer"] = optim_state
+            dcp_state[_NEVER_STEPPED_KEY] = _never_stepped_record(optim_state)
         # Dispatch the DCP save. For async modes this returns immediately but
         # FIRST awaits the previous in-flight flush, so any deferred
         # `_pending_finalize` from the prior save is now durable. For sync
@@ -586,16 +612,26 @@ class CheckpointManager:
         load_model = exclude_keys is None or "model" not in exclude_keys
         load_optim = exclude_keys is None or "optimizer" not in exclude_keys
 
+        saved_keys = (
+            dcp.FileSystemReader(str(dcp_dir)).read_metadata().state_dict_metadata
+            if load_optim
+            else {}
+        )
+        fresh_optimizer = load_optim and not _holds_optimizer(saved_keys)
+        if fresh_optimizer:
+            load_optim = False
+
         # Build properly-structured (FSDP-sharded, moment-allocated) templates via
         # the DCP-aware getters so dcp.load can repopulate them, then write them
         # back with the setters. Raw optimizer.state_dict() would be empty on a
         # fresh optimizer, so dcp.load would find no moment tensors to fill and the
         # AdamW momentum would silently reset to zero on resume.
         dcp_state: dict[str, Any] = {}
+        optimizers = self._optimizers_saved_in(dcp_dir, saved_keys) if load_optim else []
         if load_model:
             dcp_state["model"] = get_model_state_dict(self.model)
         if load_optim:
-            dcp_state["optimizer"] = get_optimizer_state_dict(self.model, self.optimizer)
+            dcp_state["optimizer"] = get_optimizer_state_dict(self.model, optimizers)
 
         if dcp_state:
             planner = _NeverSteppedStatePlanner()
@@ -613,13 +649,16 @@ class CheckpointManager:
                 set_model_state_dict(self.model, dcp_state["model"])
             if load_optim:
                 set_optimizer_state_dict(
-                    self.model, self.optimizer, optim_state_dict=dcp_state["optimizer"]
+                    self.model, optimizers, optim_state_dict=dcp_state["optimizer"]
                 )
             if planner.never_stepped:
                 logger.info(
                     f"{len(planner.never_stepped)} parameters the saved optimizer held were never "
                     f"stepped and resume without state: {sorted(planner.never_stepped)[:8]}"
                 )
+        if fresh_optimizer:
+            for optimizer in self.checkpointed_optimizers:
+                _reset_to_fresh(optimizer)
 
         # Load non-distributed state. On NFS/Lustre, independent stat()
         # calls can disagree briefly across ranks; if some ranks enter
@@ -663,9 +702,18 @@ class CheckpointManager:
                 dataloader=dataloader,
             )
             logger.info(f"Resumed from step {step}, {tokens_seen:,} tokens seen")
-            return step, tokens_seen, extra
+        else:
+            step, tokens_seen, extra = 0, 0, {}
 
-        return 0, 0, {}
+        if fresh_optimizer and step > 0:
+            logger.warning(
+                f"{dcp_dir} holds no optimizer state at step {step}: resuming with a fresh "
+                f"optimizer, so its moments restart from zero and this resume does not "
+                f"continue the saved run exactly."
+            )
+        elif fresh_optimizer:
+            logger.info(f"{dcp_dir} holds no optimizer state; the optimizer starts fresh")
+        return step, tokens_seen, extra
 
     def apply_dataloader_state(self, dataloader: Any) -> None:
         """Apply any dataloader state stashed during load().
@@ -759,6 +807,23 @@ class CheckpointManager:
             return fallback
         return resolved
 
+    def _optimizers_saved_in(
+        self, dcp_dir: Path, keys: Iterable[str]
+    ) -> list[torch.optim.Optimizer]:
+        """Return the optimizers saved in ``dcp_dir``; warn if the inner ones are missing."""
+        inner = self.checkpointed_optimizers[1:]
+        if not inner or _saved_optimizer_param_groups(keys) != len(self.optimizer.param_groups):
+            return self.checkpointed_optimizers
+        name = type(self.optimizer).__name__
+        n_params = sum(p.numel() for opt in inner for g in opt.param_groups for p in g["params"])
+        logger.warning(
+            f"{dcp_dir} holds only {name}'s own optimizer state: it was saved before "
+            f"{name}'s inner optimizer was checkpointed. Resuming {name}'s state alone; the "
+            f"{n_params:,} parameters its inner optimizer updates start from fresh moments, "
+            f"so this resume is not bit-exact. Checkpoints saved from now on include them."
+        )
+        return self.checkpointed_optimizers[:1]
+
     def _cleanup(self) -> None:
         """Remove old checkpoints beyond the retention limit.
 
@@ -800,5 +865,11 @@ class CheckpointManager:
         for d in to_remove:
             if d.resolve() in protected:
                 continue
-            shutil.rmtree(d)
+            try:
+                shutil.rmtree(d)
+            except OSError as e:
+                logger.warning(
+                    f"Could not remove old checkpoint {d} ({e}); the next cleanup retries it"
+                )
+                continue
             logger.info(f"Removed old checkpoint: {d}")

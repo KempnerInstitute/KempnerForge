@@ -129,6 +129,7 @@ are shared (AdamW/Lion) or optimizer-specific.
 | `muon_momentum` | `float` | `0.95` | Muon momentum coefficient |
 | `muon_ns_steps` | `int` | `5` | Newton–Schulz iterations for Muon |
 | `muon_adam_lr` | `float \| None` | `None` | LR for 1-D params in Muon's AdamW fallback; `None` → same as `lr` |
+| `muon_orthogonalize` | `"local" \| "exact"` | `"local"` | Newton–Schulz on each rank's shard, or on the full matrix |
 | `schedule_free_warmup_steps` | `int` | `0` | internal warmup for schedule-free |
 
 ## `[scheduler]` — `SchedulerConfig`
@@ -140,6 +141,7 @@ LR schedule shape and warmup.
 |-------|------|---------|---------|
 | `name` | `"cosine" \| "linear" \| "wsd" \| "constant" \| "rex" \| "none"` | `"cosine"` | `scheduler` registry key |
 | `warmup_steps` | `int` | `2000` | linear warmup length |
+| `warmup_start_factor` | `float` | `0.0` | LR factor the warmup starts from (torch `LinearLR` `start_factor`) |
 | `decay_steps` | `int \| None` | `None` | `None` → decay over remaining steps |
 | `min_lr_ratio` | `float` | `0.1` | floor = `lr * min_lr_ratio` |
 | `stable_steps` | `int \| None` | `None` | WSD: steps at constant LR between warmup and decay |

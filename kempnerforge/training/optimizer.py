@@ -15,12 +15,15 @@ All optimizers:
 
 from __future__ import annotations
 
+import functools
 import logging
 
 import torch
 
+from kempnerforge.config.optimizer import MUON_ORTHOGONALIZE_MODES
 from kempnerforge.config.registry import registry
 from kempnerforge.config.schema import OptimizerConfig
+from kempnerforge.training.orthogonalize import orthogonalize_exact
 
 logger = logging.getLogger(__name__)
 
@@ -318,6 +321,11 @@ def _newton_schulz(G: torch.Tensor, steps: int = 5) -> torch.Tensor:
     return X
 
 
+def _orthogonalize_matrix(matrix: torch.Tensor, steps: int) -> torch.Tensor:
+    """Newton-Schulz in fp32, returned in ``matrix``'s dtype."""
+    return _newton_schulz(matrix.float(), steps=steps).to(matrix.dtype)
+
+
 def _get_local_tensor(t: torch.Tensor) -> torch.Tensor:
     """Extract the local (non-DTensor) tensor from a possibly-sharded parameter.
 
@@ -360,6 +368,8 @@ class Muon(torch.optim.Optimizer):
         adam_eps: Epsilon for the AdamW fallback.
         ns_steps: Newton-Schulz iteration steps (default 5).
         adam_lr: Learning rate for AdamW fallback (1D params). None = same as lr.
+        orthogonalize: "local" runs Newton-Schulz on each rank's shard, "exact" on the full
+            matrix.
     """
 
     def __init__(
@@ -373,7 +383,12 @@ class Muon(torch.optim.Optimizer):
         adam_eps: float = 1e-8,
         ns_steps: int = 5,
         adam_lr: float | None = None,
+        orthogonalize: str = "local",
     ):
+        if orthogonalize not in MUON_ORTHOGONALIZE_MODES:
+            raise ValueError(
+                f"orthogonalize must be one of {MUON_ORTHOGONALIZE_MODES}, got {orthogonalize!r}"
+            )
         adam_lr = adam_lr if adam_lr is not None else lr
         self._initial_lr = lr
         self._initial_adam_lr = adam_lr
@@ -391,11 +406,22 @@ class Muon(torch.optim.Optimizer):
             else None
         )
 
-        defaults = dict(lr=lr, momentum=momentum, weight_decay=weight_decay, ns_steps=ns_steps)
+        defaults = dict(
+            lr=lr,
+            momentum=momentum,
+            weight_decay=weight_decay,
+            ns_steps=ns_steps,
+            orthogonalize=orthogonalize,
+        )
         super().__init__(muon_params, defaults)
 
+    @property
+    def inner_optimizers(self) -> tuple[torch.optim.Optimizer, ...]:
+        """Optimizers holding parameters that Muon's own ``param_groups`` do not list."""
+        return (self._adam,) if self._adam is not None else ()
+
     def state_dict(self) -> dict:
-        """Include internal AdamW state so DCP checkpoints are complete."""
+        """Include internal AdamW state in the plain ``state_dict()``."""
         sd = super().state_dict()
         if self._adam is not None:
             sd["_adam_state"] = self._adam.state_dict()
@@ -434,15 +460,14 @@ class Muon(torch.optim.Optimizer):
             momentum = group["momentum"]
             wd = group["weight_decay"]
             ns_steps = group["ns_steps"]
+            orthogonalize = group.get("orthogonalize", self.defaults["orthogonalize"])
 
-            for p in group["params"]:
-                if p.grad is None:
-                    continue
-
+            params = [p for p in group["params"] if p.grad is not None]
+            inputs = []
+            for p in params:
                 # Work on local tensors to avoid DTensor/Tensor mixing.
                 # FSDP2 wraps params as DTensors; operating on the local
                 # shard directly sidesteps distributed tensor dispatch.
-                p_local = _get_local_tensor(p)
                 g_local = _get_local_tensor(p.grad)
 
                 # Momentum buffer: stored matching p.grad's type (DTensor if
@@ -453,20 +478,24 @@ class Muon(torch.optim.Optimizer):
                     state["momentum_buffer"] = torch.zeros_like(p.grad)
                 buf_local = _get_local_tensor(state["momentum_buffer"])
                 buf_local.mul_(momentum).add_(g_local)
+                inputs.append(buf_local)
 
-                # Reshape to 2D for Newton-Schulz if needed
-                original_shape = buf_local.shape
-                buf_2d = buf_local.view(buf_local.shape[0], -1) if buf_local.ndim > 2 else buf_local
+            matrices = [x.view(x.shape[0], -1) for x in inputs]
+            newton_schulz = functools.partial(_orthogonalize_matrix, steps=ns_steps)
+            if orthogonalize == "exact":
+                orthos = orthogonalize_exact(params, matrices, newton_schulz)
+            else:
+                orthos = [newton_schulz(matrix) for matrix in matrices]
 
-                # Orthogonalize
-                update = _newton_schulz(buf_2d.float(), steps=ns_steps)
-                update = update.to(buf_local.dtype)
-
-                if buf_local.ndim > 2:
-                    update = update.view(original_shape)
+            for p, x, ortho in zip(params, inputs, orthos, strict=True):
+                p_local = _get_local_tensor(p)
+                update = ortho.view(x.shape)
 
                 # Scale: NS produces unit-norm rows, scale by sqrt(m/n)
-                m, n = buf_2d.shape
+                if orthogonalize == "exact":
+                    m, n = p.shape[0], p.shape[1:].numel()
+                else:
+                    m, n = ortho.shape
                 update.mul_(max(1, m / n) ** 0.5)
 
                 # Decoupled weight decay
@@ -541,6 +570,7 @@ def _build_muon(
         adam_eps=config.eps,
         ns_steps=config.muon_ns_steps,
         adam_lr=config.muon_adam_lr,
+        orthogonalize=config.muon_orthogonalize,
     )
 
 

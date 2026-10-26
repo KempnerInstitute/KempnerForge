@@ -291,6 +291,13 @@ class TestOptimizerConfig:
         with pytest.raises(ValueError, match="muon_ns_steps"):
             OptimizerConfig(muon_ns_steps=0)
 
+    def test_muon_orthogonalize_defaults_to_local(self):
+        assert OptimizerConfig().muon_orthogonalize == "local"
+
+    def test_rejects_unknown_muon_orthogonalize(self):
+        with pytest.raises(ValueError, match="muon_orthogonalize must be one of"):
+            OptimizerConfig(muon_orthogonalize="global")
+
     def test_rejects_negative_schedule_free_warmup(self):
         with pytest.raises(ValueError, match="schedule_free_warmup_steps"):
             OptimizerConfig(schedule_free_warmup_steps=-1)
@@ -449,6 +456,14 @@ class TestSchedulerConfig:
     def test_rejects_min_lr_ratio_below_zero(self):
         with pytest.raises(ValueError, match="min_lr_ratio must be in"):
             SchedulerConfig(min_lr_ratio=-0.1)
+
+    def test_warmup_start_factor_defaults_to_zero(self):
+        assert SchedulerConfig().warmup_start_factor == 0.0
+
+    @pytest.mark.parametrize("value", [-0.1, 1.5])
+    def test_rejects_warmup_start_factor_outside_unit_interval(self, value):
+        with pytest.raises(ValueError, match="warmup_start_factor must be in"):
+            SchedulerConfig(warmup_start_factor=value)
 
 
 # ---------------------------------------------------------------------------

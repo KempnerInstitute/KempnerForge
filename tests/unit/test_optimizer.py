@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -240,6 +241,11 @@ class TestMuon:
         adam_states = [s for s in optimizer2._adam.state.values() if s]
         assert len(adam_states) > 0, "Internal AdamW state was not restored"
 
+    def test_inner_optimizers_lists_the_inner_adamw(self):
+        """``inner_optimizers`` returns Muon's inner AdamW."""
+        optimizer = build_optimizer(self._make_model(), OptimizerConfig(name="muon", lr=0.01))
+        assert optimizer.inner_optimizers == (optimizer._adam,)
+
     def test_zero_grad_clears_delegated_params(self):
         """Params routed to the inner AdamW must be zeroed too.
 
@@ -324,6 +330,7 @@ class TestMuon:
         model = nn.Linear(32, 32, bias=False)
         optimizer = build_optimizer(model, OptimizerConfig(name="muon", lr=0.01))
         assert optimizer._adam is None
+        assert optimizer.inner_optimizers == ()
 
         optimizer.zero_grad()
         model(torch.randn(4, 32)).sum().backward()
@@ -336,6 +343,34 @@ class TestMuon:
         optimizer2 = build_optimizer(model2, OptimizerConfig(name="muon", lr=0.01))
         optimizer2.load_state_dict(sd)
         assert optimizer2._adam is None
+
+    def test_exact_orthogonalize_matches_local_when_unsharded(self):
+        """Unsharded, exact and local orthogonalization step identically."""
+        torch.manual_seed(0)
+        grads = [torch.randn(16, 8), torch.randn(16, 8)]
+        weights = [nn.Parameter(torch.zeros(16, 8)) for _ in range(2)]
+        optimizers = [
+            Muon([{"params": [weight]}], [{"params": []}], lr=0.1, orthogonalize=mode)
+            for weight, mode in zip(weights, ("local", "exact"), strict=True)
+        ]
+        for grad in grads:
+            for weight, optimizer in zip(weights, optimizers, strict=True):
+                weight.grad = grad.clone()
+                optimizer.step()
+        assert torch.equal(weights[0].data, weights[1].data)
+
+    def test_rejects_unknown_orthogonalize(self):
+        with pytest.raises(ValueError, match="orthogonalize must be one of"):
+            Muon(
+                [{"params": [nn.Parameter(torch.zeros(2, 2))]}],
+                [{"params": []}],
+                orthogonalize="x",
+            )
+
+    def test_build_optimizer_passes_orthogonalize(self):
+        config = OptimizerConfig(name="muon", muon_orthogonalize="exact")
+        optimizer = build_optimizer(nn.Linear(8, 8), config)
+        assert optimizer.param_groups[0]["orthogonalize"] == "exact"
 
 
 class TestAdamW:

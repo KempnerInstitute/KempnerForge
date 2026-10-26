@@ -71,6 +71,7 @@ File:
 - `betas[0], betas[1] ∈ [0, 1)`.
 - `muon_momentum ∈ (0, 1)`.
 - `muon_ns_steps > 0`.
+- `muon_orthogonalize ∈ {"local", "exact"}`.
 - `schedule_free_warmup_steps ≥ 0`.
 
 ### `SchedulerConfig`
@@ -79,6 +80,7 @@ File:
 [`kempnerforge/config/scheduler.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/config/scheduler.py).
 
 - `warmup_steps ≥ 0`.
+- `warmup_start_factor ∈ [0, 1]`.
 - `min_lr_ratio ∈ [0, 1]`.
 - `wsd_decay_type ∈ {"cosine", "linear", "sqrt"}`.
 - `rex_alpha > 0`.

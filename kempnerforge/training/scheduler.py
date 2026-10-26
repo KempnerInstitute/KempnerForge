@@ -9,6 +9,8 @@ phase with a decay phase:
   - Constant:  warmup → flat LR (for ablations)
   - REX:       warmup → polynomial decay (1 - t/T)^alpha
   - None:      constant factor=1.0 (for schedule-free optimizers)
+
+Warmup ramps linearly from ``warmup_start_factor`` (default 0) to 1.
 """
 
 from __future__ import annotations
@@ -21,11 +23,11 @@ from kempnerforge.config.registry import registry
 from kempnerforge.config.schema import SchedulerConfig, SchedulerType
 
 
-def _warmup_factor(step: int, warmup_steps: int) -> float:
-    """Linear warmup from 0 to 1 over warmup_steps."""
+def _warmup_factor(step: int, warmup_steps: int, start_factor: float = 0.0) -> float:
+    """Linear warmup from start_factor to 1 over warmup_steps."""
     if warmup_steps == 0:
         return 1.0
-    return min(1.0, step / warmup_steps)
+    return start_factor + (1.0 - start_factor) * min(1.0, step / warmup_steps)
 
 
 def _cosine_decay(step: int, total_steps: int, min_ratio: float) -> float:
@@ -68,7 +70,7 @@ def _build_cosine(
 
     def lr_fn(step: int) -> float:
         if step < warmup:
-            return _warmup_factor(step, warmup)
+            return _warmup_factor(step, warmup, config.warmup_start_factor)
         return _cosine_decay(step - warmup, decay_steps, min_ratio)
 
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_fn)
@@ -86,7 +88,7 @@ def _build_linear(
 
     def lr_fn(step: int) -> float:
         if step < warmup:
-            return _warmup_factor(step, warmup)
+            return _warmup_factor(step, warmup, config.warmup_start_factor)
         return _linear_decay(step - warmup, decay_steps, min_ratio)
 
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_fn)
@@ -111,7 +113,7 @@ def _build_wsd(
 
     def lr_fn(step: int) -> float:
         if step < warmup:
-            return _warmup_factor(step, warmup)
+            return _warmup_factor(step, warmup, config.warmup_start_factor)
         if step < warmup + stable:
             return 1.0
         return decay_fn(step - warmup - stable, decay_steps, min_ratio)
@@ -129,7 +131,7 @@ def _build_constant(
 
     def lr_fn(step: int) -> float:
         if step < warmup:
-            return _warmup_factor(step, warmup)
+            return _warmup_factor(step, warmup, config.warmup_start_factor)
         return 1.0
 
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_fn)
@@ -148,7 +150,7 @@ def _build_rex(
 
     def lr_fn(step: int) -> float:
         if step < warmup:
-            return _warmup_factor(step, warmup)
+            return _warmup_factor(step, warmup, config.warmup_start_factor)
         progress = min(1.0, (step - warmup) / max(decay_steps, 1))
         return max(min_ratio, (1.0 - progress) ** alpha)
 
