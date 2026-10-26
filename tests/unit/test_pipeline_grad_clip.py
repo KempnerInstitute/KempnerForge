@@ -44,9 +44,14 @@ def _stage(model: nn.Sequential, stage: int, n_stages: int) -> nn.Sequential:
     return model[stage * per_stage : (stage + 1) * per_stage]
 
 
-def _reference(n_stages: int, no_grads: int | None) -> tuple[torch.Tensor, nn.Sequential]:
-    """One process clipping the whole model, without the gradients of stage ``no_grads``."""
-    model = _model()
+def _reference(
+    n_stages: int, no_grads: int | None, dtype: torch.dtype = torch.float32
+) -> tuple[torch.Tensor, nn.Sequential]:
+    """One process clipping the whole model, without the gradients of stage ``no_grads``.
+
+    The gradients are rounded to ``dtype`` and clipped in fp32.
+    """
+    model = _model().to(dtype).float()
     if no_grads is not None:
         for p in _stage(model, no_grads, n_stages).parameters():
             p.grad = None
@@ -58,19 +63,34 @@ def _model_norm(stage: nn.Module) -> float:
     sq = torch.tensor(0.0)
     for p in stage.parameters():
         if p.grad is not None:
-            sq = sq + p.grad.pow(2).sum()
+            sq = sq + p.grad.float().pow(2).sum()
     dist.all_reduce(sq)
     return sq.sqrt().item()
 
 
-def _check_stage(rank: int, world: int, port: int, with_group: bool, no_grads: int | None) -> None:
+def _assert_grads_close(actual: torch.Tensor, expected: torch.Tensor) -> None:
+    """A clipped gradient against the fp32 reference, to the precision of its own dtype."""
+    if actual.dtype == torch.float32:
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-7)
+    else:
+        torch.testing.assert_close(actual, expected.to(actual.dtype))
+
+
+def _check_stage(
+    rank: int,
+    world: int,
+    port: int,
+    with_group: bool,
+    no_grads: int | None,
+    dtype: torch.dtype = torch.float32,
+) -> None:
     """Clip this rank's stage and compare with one process clipping the whole model."""
     dist.init_process_group(
         "gloo", rank=rank, world_size=world, init_method=f"tcp://127.0.0.1:{port}"
     )
     try:
-        ref_norm, reference = _reference(world, no_grads)
-        stage = _stage(_model(), rank, world)
+        ref_norm, reference = _reference(world, no_grads, dtype)
+        stage = _stage(_model().to(dtype), rank, world)
         if rank == no_grads:
             for p in stage.parameters():
                 p.grad = None
@@ -81,18 +101,20 @@ def _check_stage(rank: int, world: int, port: int, with_group: bool, no_grads: i
             assert math.isclose(clipped_norm, math.sqrt(world) * MAX_NORM, rel_tol=1e-4)
             return
         torch.testing.assert_close(norm, ref_norm, rtol=1e-5, atol=0.0)
-        assert math.isclose(clipped_norm, MAX_NORM, rel_tol=1e-4)
+        assert math.isclose(clipped_norm, MAX_NORM, rel_tol=max(1e-4, torch.finfo(dtype).eps))
         expected = _stage(reference, rank, world).parameters()
         for p, q in zip(stage.parameters(), expected, strict=True):
             if q.grad is None:
                 assert p.grad is None
             else:
-                torch.testing.assert_close(p.grad, q.grad, rtol=1e-5, atol=1e-7)
+                _assert_grads_close(p.grad, q.grad)
     finally:
         dist.destroy_process_group()
 
 
-def _check_sharded_stage(rank: int, world: int, port: int) -> None:
+def _check_sharded_stage(
+    rank: int, world: int, port: int, dtype: torch.dtype = torch.float32
+) -> None:
     """pp=2 x dp_shard=2: each stage's parameters are row-sharded DTensors, as under FSDP2."""
     dist.init_process_group(
         "gloo", rank=rank, world_size=world, init_method=f"tcp://127.0.0.1:{port}"
@@ -100,8 +122,8 @@ def _check_sharded_stage(rank: int, world: int, port: int) -> None:
     try:
         mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("pp", "dp_shard"))
         pp_rank = mesh.get_local_rank("pp")
-        ref_norm, reference = _reference(2, None)
-        stage = _stage(_model(), pp_rank, 2)
+        ref_norm, reference = _reference(2, None, dtype)
+        stage = _stage(_model().to(dtype), pp_rank, 2)
         for layer in stage:
             for name, p in list(layer.named_parameters()):
                 sharded = nn.Parameter(
@@ -113,7 +135,7 @@ def _check_sharded_stage(rank: int, world: int, port: int) -> None:
         torch.testing.assert_close(norm, ref_norm, rtol=1e-5, atol=0.0)
         expected = _stage(reference, pp_rank, 2).parameters()
         for p, q in zip(stage.parameters(), expected, strict=True):
-            torch.testing.assert_close(p.grad.full_tensor(), q.grad, rtol=1e-5, atol=1e-7)
+            _assert_grads_close(p.grad.full_tensor(), q.grad)
     finally:
         dist.destroy_process_group()
 
@@ -208,3 +230,12 @@ class TestClipAcrossPipelineStages:
     def test_pipeline_step_with_fsdp2_matches_one_process(self):
         """Gradients from a real pipeline step with FSDP2 clip exactly as one process's do."""
         mp.spawn(_check_pipeline_step, args=(4, _free_port()), nprocs=4)
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+    def test_half_precision_stages_clip_with_the_fp32_norm(self, dtype):
+        """Stage norms far above 256 neither overflow in fp16 nor round in bf16."""
+        mp.spawn(_check_stage, args=(2, _free_port(), True, None, dtype), nprocs=2)
+
+    def test_half_precision_row_sharded_stages_clip_with_the_fp32_norm(self):
+        """fp16 DTensor gradients reduce their partial norms in fp32 as well."""
+        mp.spawn(_check_sharded_stage, args=(4, _free_port(), torch.float16), nprocs=4)
