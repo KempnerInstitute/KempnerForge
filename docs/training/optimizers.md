@@ -129,9 +129,9 @@ DTensor / FSDP2 notes:
 - `muon_orthogonalize` sets where Newton-Schulz runs on a sharded weight.
   `"local"` (default) orthogonalizes each rank's shard on its own, after
   `_get_local_tensor(p)` unwraps the DTensor, and takes the update scale
-  from the shard's shape. That's cheap and keeps the update's RMS close to
-  the unsharded one, but its direction isn't the full-matrix result and
-  changes with the shard count. `"exact"` gathers each row-sharded matrix
+  from the shard's shape. That's cheap, but its direction isn't the
+  full-matrix result and changes with the shard count, and so can its RMS
+  (see the update scale below). `"exact"` gathers each row-sharded matrix
   onto one rank of its shard group with an all-to-all, orthogonalizes the
   full matrix there and scatters the result back, and takes the scale from
   the full matrix's shape. The update is then bitwise what one process
@@ -163,10 +163,16 @@ Momentum and update scale:
   first two are also `torch.optim.Muon`'s `adjust_lr_fn` names; torch accepts
   `"spectral_unclamped"` only from 2.14 on.
 - `rows × cols` is the matrix Newton-Schulz ran on: each rank's shard under
-  `muon_orthogonalize = "local"`, the full weight under `"exact"`. Under
-  `"local"`, `"original"` and `"match_rms_adamw"` keep a sharded update's RMS
-  close to the unsharded one, but `"spectral_unclamped"` shrinks it once the
-  shards are wider than tall, so pair that mode with `"exact"`.
+  `muon_orthogonalize = "local"`, the full weight under `"exact"`, which gives
+  the unsharded update in every mode. Under `"local"`, a sharded update's RMS
+  stays close to the unsharded one while the shards are no wider than tall.
+  Once they are wider than tall it depends on the momentum's rank as well as
+  the mode, since each shard is orthogonalized on its own: `"original"` and
+  `"match_rms_adamw"` keep it close for a full-rank momentum but raise it for a
+  low-rank one, by up to roughly `sqrt(N)` over `N` shards, and
+  `"spectral_unclamped"` keeps it for a low-rank momentum but shrinks it for a
+  full-rank one. Use `"exact"` when the update's RMS has to match the
+  unsharded run.
 - A resume keeps the `muon_nesterov` and `muon_adjust_lr` the checkpoint was
   saved with, and a checkpoint saved before the options existed resumes with
   `false` and `"original"`.
