@@ -2082,6 +2082,38 @@ class TestMuonResume:
         for (name, ref), p in zip(ref_model.named_parameters(), model2.parameters(), strict=True):
             assert torch.equal(ref, p), f"{name} diverged from the uninterrupted run"
 
+    def test_checkpoint_saved_before_orthogonalize_warns(self, tmp_path):
+        """Filling in a missing key logs one warning naming it; a complete checkpoint logs none."""
+        import logging
+
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        records: list[logging.LogRecord] = []
+
+        class _CaptureHandler(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                records.append(record)
+
+        def warnings_on_load(ckpt_dir) -> list[str]:
+            records.clear()
+            target = logging.getLogger("kempnerforge.checkpoint.manager")
+            capture = _CaptureHandler(level=logging.WARNING)
+            target.addHandler(capture)
+            model2, opt2 = self._build(seed=1)
+            try:
+                CheckpointManager(CheckpointConfig(dir=str(ckpt_dir)), model2, opt2).load()
+            finally:
+                target.removeHandler(capture)
+            return [r.getMessage() for r in records if "orthogonalize" in r.getMessage()]
+
+        model, opt = self._build(seed=0)
+        self._train(model, opt, self._batches(3))
+        CheckpointManager(CheckpointConfig(dir=str(tmp_path / "complete")), model, opt).save(step=3)
+        self._save_without(model, opt, "orthogonalize", tmp_path / "legacy")
+
+        assert warnings_on_load(tmp_path / "complete") == []
+        assert len(warnings_on_load(tmp_path / "legacy")) == 1
+
     def test_checkpoint_saved_before_orthogonalize_ignores_the_configured_mode(self, tmp_path):
         """It resumes with the mode it was trained with, as a newer checkpoint does."""
         from kempnerforge.checkpoint.manager import CheckpointManager

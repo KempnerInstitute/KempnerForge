@@ -701,9 +701,9 @@ class CheckpointManager:
             dcp_state["optimizer"] = get_optimizer_state_dict(self.model, optimizers)
             filled = _drop_legacy_group_keys(dcp_state["optimizer"], optimizers, saved_keys)
             if filled:
-                logger.info(
-                    f"{dcp_dir} predates the optimizer param-group keys {sorted(filled)}; "
-                    f"resuming them with the values it was trained with: {filled}"
+                logger.warning(
+                    f"{dcp_dir} is missing optimizer param-group keys {sorted(filled)}; "
+                    f"resuming with {filled}"
                 )
 
         if dcp_state:
