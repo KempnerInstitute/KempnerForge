@@ -1,6 +1,4 @@
 # pyright: reportMissingImports=false
-# ^ mlflow is an optional dependency group; CI type-checks without it,
-#   so the lazy imports below would otherwise raise reportMissingImports.
 """The MLflow logged model of a checkpoint: one external model per run and step.
 
 The training backend registers each committed checkpoint through this module, and the eval
@@ -15,8 +13,8 @@ import os
 import tempfile
 from typing import Any
 
-_NAME_UNSAFE = str.maketrans(dict.fromkeys("/:.%\"'", "_"))  # MLflow rejects these in names
-_SEARCH_PAGE_SIZE = 50  # Databricks rejects larger pages
+_NAME_UNSAFE = str.maketrans(dict.fromkeys("/:.%\"'", "_"))
+_SEARCH_PAGE_SIZE = 50
 _READY = "READY"
 _MODEL_TYPE = "checkpoint"
 

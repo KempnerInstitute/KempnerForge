@@ -627,7 +627,7 @@ class TestPublishLinksTheCheckpointModel:
         ckpt = self._named(tmp_path)
         sidecar = (ckpt / "metadata.json").read_bytes()
         monkeypatch.chdir(tmp_path)
-        target = publish_metrics(ckpt.name, {"a": 1.0})  # a relative checkpoint path
+        target = publish_metrics(ckpt.name, {"a": 1.0})
         (model,) = model_store.models
         assert [m.model_id for m in fake.batches[0].metrics] == [model.model_id]
         assert target.model_id == model.model_id
@@ -635,7 +635,7 @@ class TestPublishLinksTheCheckpointModel:
         assert model.params == {"step": "120", "checkpoint_dir": str(tmp_path / "step_120")}
         assert fake.events.count("client") == 1
         assert {uri for _, uri, _ in model_store.calls} == {URI}
-        assert (ckpt / "metadata.json").read_bytes() == sidecar  # the sidecar is never written
+        assert (ckpt / "metadata.json").read_bytes() == sidecar
 
     def test_a_model_id_wins_over_the_model_name(self, tmp_path, monkeypatch, model_store):
         fake = self._install(monkeypatch, model_store)

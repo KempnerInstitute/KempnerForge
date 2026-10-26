@@ -2290,7 +2290,6 @@ class TestTrackingEntries:
 
 
 # ---------------------------------------------------------------------------
-# Checkpoint registration: one external MLflow model per committed checkpoint
 # ---------------------------------------------------------------------------
 
 
@@ -2355,7 +2354,7 @@ class TestCheckpointRegistration:
         try:
             start = time.perf_counter()
             backend.register_checkpoint(5, directory, recorded.append)
-            assert time.perf_counter() - start < 5.0  # the held call would take 10 s
+            assert time.perf_counter() - start < 5.0
             assert model_store.entered.wait(10)
             assert recorded == []
         finally:
@@ -2413,7 +2412,7 @@ class TestCheckpointRegistration:
         submitted: list = []
         monkeypatch.setattr(backend._worker, "submit", lambda *a, **k: submitted.append(a))
         recorded: list = []
-        backend.register_checkpoint(5, directory, recorded.append)  # the step committed again
+        backend.register_checkpoint(5, directory, recorded.append)
         assert recorded == [{"model_id": "m-1"}]
         assert len(model_store.calls) == server_calls and submitted == []
 
@@ -2428,7 +2427,7 @@ class TestCheckpointRegistration:
         try:
             backend.register_checkpoint(5, directory, first.append)
             assert model_store.entered.wait(10)
-            backend.register_checkpoint(5, directory, again.append)  # queued behind the first
+            backend.register_checkpoint(5, directory, again.append)
         finally:
             model_store.release.set()
         _flush(backend)
@@ -2447,7 +2446,7 @@ class TestCheckpointRegistration:
         try:
             backend.register_checkpoint(5, directory, first.append)
             assert model_store.entered.wait(10)
-            _flush(backend)  # the worker abandons the call at its deadline; it still runs
+            _flush(backend)
             backend.register_checkpoint(5, directory, again.append)
             _flush(backend)
             assert again == [] and len(model_store.named("get_run")) == 1
@@ -2464,7 +2463,7 @@ class TestCheckpointRegistration:
         backend, _ = _registering_backend(monkeypatch, model_store)
         directory = _kept_checkpoint(tmp_path, 5)
         recorded: list = []
-        backend._worker._max_threads = 0  # every call dropped, as with too many abandoned ones
+        backend._worker._max_threads = 0
         backend.register_checkpoint(5, directory, recorded.append)
         _flush(backend)
         assert recorded == [] and model_store.calls == [] and backend._registering == set()
@@ -2478,7 +2477,7 @@ class TestCheckpointRegistration:
     ):
         earlier = model_store.add("run-a-step_5")
         backend, _ = _registering_backend(monkeypatch, model_store, mlflow_run_id="run-xyz")
-        assert model_store.calls == []  # a resume registers nothing by itself
+        assert model_store.calls == []
         recorded: list = []
         backend.register_checkpoint(5, _kept_checkpoint(tmp_path, 5), recorded.append)
         _flush(backend)
@@ -2495,9 +2494,9 @@ class TestCheckpointRegistration:
         gate, entered = _park_log_metrics(fm)
         try:
             backend.log({"train/loss": 0.5}, step=2)
-            assert entered.wait(10)  # the worker is busy, so the registration waits its turn
+            assert entered.wait(10)
             backend.register_checkpoint(5, directory, recorded.append)
-            shutil.rmtree(directory)  # pruned by keep_last_n meanwhile
+            shutil.rmtree(directory)
         finally:
             gate.set()
         _flush(backend)
@@ -2521,14 +2520,14 @@ class TestCheckpointRegistration:
             backend.register_checkpoint(step, _kept_checkpoint(tmp_path, step), recorded.append)
             _flush(backend)
         assert recorded == [] and backend._registering == set()
-        assert len(warnings_seen) == 1  # the second falls inside the warning interval
+        assert len(warnings_seen) == 1
         assert "step 5" in warnings_seen[0] and "no model_id" in warnings_seen[0]
         assert "POST http://mlflow.example:5000/api failed" in warnings_seen[0]
         assert "token" not in warnings_seen[0]
         assert backend.checkpoint_fields(5) == {"model_name": "run-a-step_5"}
         backend.log({"train/loss": 0.5}, step=2)
         _flush(backend)
-        assert fm.log_steps == [1, 2]  # logging carries on
+        assert fm.log_steps == [1, 2]
         model_store.recover()
         backend.register_checkpoint(5, tmp_path / "step_5", recorded.append)
         _flush(backend)
@@ -2542,7 +2541,7 @@ class TestCheckpointRegistration:
         directory = _kept_checkpoint(tmp_path, 5)
         recorded: list = []
         submit = backend._worker.submit
-        monkeypatch.setattr(backend._worker, "submit", lambda *a, **k: False)  # queue full
+        monkeypatch.setattr(backend._worker, "submit", lambda *a, **k: False)
         backend.register_checkpoint(5, directory, recorded.append)
         assert len(warnings_seen) == 1 and "step 5 was not queued" in warnings_seen[0]
         assert "no model_id" in warnings_seen[0] and backend._registering == set()
@@ -2565,7 +2564,7 @@ class TestCheckpointRegistration:
         backend = MLflowBackend(_mlflow_cfg(mlflow_register_checkpoints=True))
         directory = _kept_checkpoint(tmp_path, 5)
         recorded: list = []
-        assert backend.checkpoint_fields(5) is None  # no run yet
+        assert backend.checkpoint_fields(5) is None
         backend.register_checkpoint(5, directory, recorded.append)
         backend.log({"train/loss": 1.0}, step=1)
         backend.close()
@@ -2574,7 +2573,7 @@ class TestCheckpointRegistration:
         monkeypatch.setitem(sys.modules, "mlflow", None)
         failed = MLflowBackend(_mlflow_cfg(mlflow_register_checkpoints=True))
         failed.log({"train/loss": 1.0}, step=1)
-        assert failed.checkpoint_fields(5) is None  # init failed
+        assert failed.checkpoint_fields(5) is None
         failed.register_checkpoint(5, directory, recorded.append)
         assert recorded == [] and model_store.calls == []
 
@@ -2630,7 +2629,7 @@ class TestTrackerRegistration:
         tracker._backends = [
             _RegisteringBackend({"backend": "first"}, {"model_id": "m-1"}),
             _RegisteringBackend({"backend": "quiet"}),
-            _RegisteringBackend(None, {"model_id": "m-3"}),  # its run is not live
+            _RegisteringBackend(None, {"model_id": "m-3"}),
             _RegisteringBackend({"backend": "later"}, {"a": "1", "b": "2"}),
         ]
         assert tracker.checkpoint_fields(7) == {
@@ -2660,7 +2659,7 @@ class TestTrackerRegistration:
             _RegisteringBackend(
                 {"backend": "bad"}, error=RuntimeError("POST http://user:token@host/api failed")
             ),
-            _RegisteringBackend({"run_id": "r"}, {"model_id": "m-2"}),  # an entry with no name
+            _RegisteringBackend({"run_id": "r"}, {"model_id": "m-2"}),
             _RegisteringBackend({"backend": "kept"}, {"model_id": "m-1"}),
         ]
         assert tracker.checkpoint_fields(1) == {"kept": {"model_id": "m-1"}}
@@ -2688,7 +2687,7 @@ class TestTrackerRegistration:
         assert tracker.checkpoint_fields(2) == {}
         tracker.register_checkpoint(2, tmp_path, record)
         assert recorded == ["live"] and [step for step, _ in backend.registered] == [1]
-        empty = self._tracker()  # no backends here
+        empty = self._tracker()
         assert empty.checkpoint_fields(1) == {}
         empty.register_checkpoint(1, tmp_path, record)
         assert recorded == ["live"]
@@ -2704,7 +2703,7 @@ class TestTrackerRegistration:
             recorded.append((name, fields))
 
         directory = _kept_checkpoint(tmp_path, 1)
-        assert tracker.checkpoint_fields(1) == {}  # the run has not started
+        assert tracker.checkpoint_fields(1) == {}
         tracker.register_checkpoint(1, directory, record)
         tracker.log_eval({"eval/loss": 1.0}, step=1)
         assert tracker.checkpoint_fields(1) == {"mlflow": {"model_name": "run-a-step_1"}}
@@ -2742,7 +2741,7 @@ class TestRegistrationThroughTheManager:
         )
         tracker = MetricsTracker(config, num_gpus=1)
         tracker.init_backends(config)
-        tracker.log_eval({"eval/loss": 1.0}, step=1)  # the run starts on the first log
+        tracker.log_eval({"eval/loss": 1.0}, step=1)
         model = torch.nn.Linear(4, 4)
         mode = async_mode or AsyncCheckpointMode.disabled
         mgr = CheckpointManager(
@@ -2793,8 +2792,8 @@ class TestRegistrationThroughTheManager:
         try:
             start = time.perf_counter()
             mgr.save(step=5)
-            assert time.perf_counter() - start < 5.0  # the held call would take 10 s
-            assert model_store.entered.wait(10)  # registering, and stalled
+            assert time.perf_counter() - start < 5.0
+            assert model_store.entered.wait(10)
             assert (tmp_path / "latest").resolve() == (tmp_path / "step_5").resolve()
             assert self._tracking(tmp_path, 5) == self._named(5)
         finally:
@@ -2816,7 +2815,7 @@ class TestRegistrationThroughTheManager:
                 _flush(tracker._backends[0])
             else:
                 assert model_store.entered.wait(10)
-            mgr.save(step=5)  # a shutdown save right after the interval save of the same step
+            mgr.save(step=5)
         finally:
             model_store.release.set()
         tracker.close()
@@ -2833,14 +2832,14 @@ class TestRegistrationThroughTheManager:
         )
         backend = tracker._backends[0]
         mgr.save(step=5)
-        assert model_store.calls == []  # its flush is not durable yet: nothing to register
-        mgr.save(step=10)  # step 5 is durable now, so committed and registered
+        assert model_store.calls == []
+        mgr.save(step=10)
         _flush(backend)
         assert self._tracking(tmp_path, 5) == self._named(5, model_id="m-1")
         gate, entered = _park_log_metrics(fm)
         tracker.log_eval({"eval/loss": 0.5}, step=10)
-        assert entered.wait(10)  # the worker is busy until close() opens the gate
-        mgr.wait()  # the end of the training loop commits step 10
+        assert entered.wait(10)
+        mgr.wait()
         assert [what for what, _, _ in backend._worker._items] == ["register run-a-step_10"]
         assert self._tracking(tmp_path, 10) == self._named(10)
         close = backend._worker.close

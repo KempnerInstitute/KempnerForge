@@ -949,7 +949,7 @@ class _Registrar:
         self._error = error
         self.asked: list[int] = []
         self.registered: list[tuple[int, Path, Path | None]] = []
-        self.records: list = []  # the record handed with each registration
+        self.records: list = []
 
     def checkpoint_fields(self, step):
         self.asked.append(step)
@@ -1063,7 +1063,7 @@ class TestSaveCheckpointRegistration:
         registrar = _Registrar()
         mgr.set_tracking_source(lambda: [self.MLFLOW])
         mgr.set_checkpoint_registrar(registrar)
-        mgr._rank = 1  # the rank that neither writes metadata.json nor commits
+        mgr._rank = 1
         mgr.save(step=1)
         assert registrar.asked == [] and registrar.registered == []
         mgr._rank = 0
@@ -1092,7 +1092,7 @@ class TestSaveCheckpointRegistration:
         }
         assert (tmp_path / "step_1" / "train_state.pt").exists()
         assert (tmp_path / "latest").resolve() == (tmp_path / "step_1").resolve()
-        assert [r[0] for r in registrar.registered] == [1]  # still registered on commit
+        assert [r[0] for r in registrar.registered] == [1]
         assert len(warnings) == 1 and "step 1" in warnings[0] and reason in warnings[0]
 
     def test_registrar_needs_both_methods_or_none_and_can_be_detached(self, tmp_path, monkeypatch):
@@ -1151,9 +1151,9 @@ class TestSaveCheckpointRegistration:
         mgr.set_tracking_source(lambda: [self.MLFLOW])
         mgr.set_checkpoint_registrar(registrar)
         mgr.save(step=10)
-        assert registrar.registered == []  # its flush is still pending
-        mgr.save(step=20)  # awaits step 10's flush, then commits it
-        mgr.wait()  # the end of the loop commits step 20
+        assert registrar.registered == []
+        mgr.save(step=20)
+        mgr.wait()
         assert registrar.registered == [
             (step, tmp_path / f"step_{step}", (tmp_path / f"step_{step}").resolve())
             for step in (10, 20)
@@ -1185,7 +1185,7 @@ class TestSaveCheckpointRegistration:
         mgr.save(step=1, tokens_seen=8)
         mgr.save(step=2, tokens_seen=16)
         assert (tmp_path / "latest").resolve() == (tmp_path / "step_2").resolve()
-        assert not (tmp_path / "step_1").exists()  # the commit still pruned
+        assert not (tmp_path / "step_1").exists()
         assert self._sidecar(tmp_path, 2)["tracking"] == [self.MLFLOW]
         assert len(warnings) == 2 and "step_2" in warnings[1] and "no server" in warnings[1]
 
@@ -1247,11 +1247,11 @@ class TestSaveCheckpointRegistration:
         mgr.set_checkpoint_registrar(registrar)
         mgr.save(step=1)
         live[:] = [self.WANDB]
-        mgr.save(step=2)  # saved without an mlflow record
+        mgr.save(step=2)
         live.clear()
-        mgr.save(step=3)  # saved without any record
+        mgr.save(step=3)
         texts = {step: (tmp_path / f"step_{step}" / "metadata.json").read_text() for step in (2, 3)}
-        shutil.rmtree(tmp_path / "step_1")  # pruned before its registration finished
+        shutil.rmtree(tmp_path / "step_1")
         warnings = self._log(monkeypatch, "warning")
         notes = self._log(monkeypatch, "debug")
         for record in registrar.records:
@@ -1313,7 +1313,7 @@ class TestSaveCheckpointRegistration:
         mgr.set_checkpoint_registrar(registrar)
         mgr.save(step=1)
         registrar.records[0]("mlflow", {"model_id": "m-1"})
-        mgr.save(step=2)  # prunes step 1
+        mgr.save(step=2)
         assert held == [("write", True), ("replace", True), ("write", True), ("remove", True)]
 
     def test_trackers_fields_and_registration_reach_the_sidecar_by_backend_name(

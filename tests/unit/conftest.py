@@ -11,7 +11,7 @@ import types
 import pytest
 
 EXTERNAL_TAG = "mlflow.model.isExternal"
-PAGE_LIMIT = 50  # Databricks rejects a larger page
+PAGE_LIMIT = 50
 
 
 class FakeModelStore:
@@ -24,7 +24,7 @@ class FakeModelStore:
     """
 
     def __init__(self) -> None:
-        self.runs = {"run-xyz": "7"}  # run id -> experiment id
+        self.runs = {"run-xyz": "7"}
         self.models: list[types.SimpleNamespace] = []
         self.calls: list[tuple[str, str | None, int]] = []
         self.page_sizes: list[int | None] = []

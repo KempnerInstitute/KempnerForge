@@ -56,7 +56,6 @@ _NEVER_STEPPED_PREFIX = f"{_NEVER_STEPPED_KEY}."
 _OPTIM_PREFIX = "optimizer."
 # Reports the logging runs live at save time, one JSON-ready record each, for metadata.json.
 TrackingSource = Callable[[], list[dict[str, str]]]
-# Adds fields to one backend's record in a saved checkpoint's metadata.json: (backend, fields).
 CheckpointRecord = Callable[[str, dict[str, str]], None]
 
 
@@ -365,10 +364,8 @@ class CheckpointManager:
         # the flush completes (drained at the next save() or wait()), so
         # `latest` never points at a half-written checkpoint. (step, ckpt_dir).
         self._pending_finalize: tuple[int, Path] | None = None
-        # Late-bound because the tracker is built after the manager; see the set_* methods.
         self._tracking_source: TrackingSource | None = None
         self._registrar: CheckpointRegistrar | None = None
-        # Serializes metadata.json writes and checkpoint removal with a registrar's later amends.
         self._sidecar_lock = threading.Lock()
         # Dedicated gloo group for the manager's own synchronization
         # (the end-of-save barrier). dcp.async_save() runs its collective
@@ -487,7 +484,7 @@ class CheckpointManager:
             merged = [{**entry, **added.get(entry["backend"], {})} for entry in tracking]
             if not all(_string_fields(entry) for entry in merged):
                 raise TypeError("fields must be strings")
-        except Exception as e:  # a bad registrar costs this save's fields, never the save
+        except Exception as e:
             logger.warning("Could not add the checkpoint fields of step %s: %s", step, e)
             return tracking
         return merged
@@ -518,7 +515,7 @@ class CheckpointManager:
             self._registrar.register_checkpoint(
                 step, ckpt_dir, partial(self._record, step, ckpt_dir)
             )
-        except Exception as e:  # a bad registrar costs this registration, never the commit
+        except Exception as e:
             logger.warning("Could not register %s with the tracking backends: %s", ckpt_dir.name, e)
 
     def _record(self, step: int, ckpt_dir: Path, backend: str, fields: dict[str, str]) -> None:
@@ -551,7 +548,7 @@ class CheckpointManager:
                     for entry in tracking
                 ]
                 _replace_file(path, json.dumps(meta, indent=2))
-        except Exception as e:  # a failed amend costs these fields, never its caller
+        except Exception as e:
             logger.warning("Could not record the %s fields in %s: %s", backend, path, e)
 
     def save(

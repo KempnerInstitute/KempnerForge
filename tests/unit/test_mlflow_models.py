@@ -56,7 +56,7 @@ class TestFindOrCreateCheckpointModel:
             "log_model_artifacts",
             "finalize_logged_model",
         ]
-        assert {uri for _, uri, _ in model_store.calls} == {"uri-a"}  # only the client given
+        assert {uri for _, uri, _ in model_store.calls} == {"uri-a"}
 
     def test_reuses_the_runs_ready_model_without_creating_one(self, model_store):
         model = model_store.add("run-a-step_5")
@@ -67,7 +67,7 @@ class TestFindOrCreateCheckpointModel:
     def test_takes_the_earliest_of_several_ready_models(self, model_store):
         first = model_store.add("run-a-step_5")
         model_store.add("run-a-step_5")
-        model_store.models.reverse()  # the server lists them in any order
+        model_store.models.reverse()
         assert _find_or_create(model_store) == first.model_id
 
     @pytest.mark.parametrize(

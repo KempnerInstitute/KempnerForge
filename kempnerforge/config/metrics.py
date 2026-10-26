@@ -33,7 +33,7 @@ class MetricsConfig:
     mlflow_run_id: str = ""  # Restored from checkpoint on resume; empty = new run
     mlflow_log_system_metrics: bool = True  # CPU/GPU/memory sampled on a background thread
     mlflow_system_metrics_interval: float = 10.0  # seconds between samples
-    mlflow_register_checkpoints: bool = False  # one external model per committed checkpoint
+    mlflow_register_checkpoints: bool = False
 
     def resolve_mlflow_tracking_uri(self) -> str:
         """The tracking URI in force: the field, else $MLFLOW_TRACKING_URI, else Databricks."""

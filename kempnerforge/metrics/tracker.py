@@ -34,9 +34,7 @@ from kempnerforge.metrics.mlflow_models import (
 
 logger = get_logger(__name__)
 
-# Adds fields to a backend's tracking entry of a saved checkpoint: (backend name, fields).
 TrackingRecord = Callable[[str, dict[str, str]], None]
-# The same, bound to one backend: (fields).
 BackendRecord = Callable[[dict[str, str]], None]
 
 
@@ -296,7 +294,7 @@ class MetricsTracker:
                 if entry is not None:
                     name = _tracking_snapshot(entry)["backend"]
                     backend.register_checkpoint(step, directory, partial(record, name))
-            except Exception as e:  # a third-party run object; never let it cost a commit
+            except Exception as e:
                 logger.warning(
                     "%s checkpoint registration skipped (%s)",
                     type(backend).__name__,
@@ -425,7 +423,7 @@ _CALL_DEADLINE_S = 60.0  # one metric / param / tag call
 _UPLOAD_DEADLINE_S = 180.0  # one artifact upload
 _INIT_DEADLINE_S = 60.0  # experiment setup plus run start or resume, on the first log
 _END_DEADLINE_S = 60.0  # ending the run in close(), after the drain
-_REGISTER_DEADLINE_S = 180.0  # one checkpoint registration: several requests, one an upload
+_REGISTER_DEADLINE_S = 180.0
 _DRAIN_DEADLINE_S = 30.0  # close() flush budget
 _QUEUE_MAX = 256  # pending calls before new ones are dropped
 _MAX_CALL_THREADS = 4  # live call threads, abandoned ones included, before new calls are dropped
@@ -873,7 +871,7 @@ class _MlflowDisabled(Exception):
     """A deliberate config error found during init: MLflow is disabled with this message."""
 
 
-_SIDECAR_FILE = "metadata.json"  # the checkpoint manager's, whose presence marks a kept checkpoint
+_SIDECAR_FILE = "metadata.json"
 
 
 class MLflowBackend(_LoggingBackend):
@@ -901,7 +899,7 @@ class MLflowBackend(_LoggingBackend):
         self._resume_skip_below: int | None = None  # skip re-logging steps already in the run
         self._mlflow: Any = None  # the imported module
         self._run_id = ""
-        self._run_name = ""  # as the server named the run; checkpoint model names start with it
+        self._run_name = ""
         self._experiment = ""  # the experiment the run was set up in, set with the run id
         self._worker = _BestEffortWorker(
             "MLflow",
@@ -911,9 +909,9 @@ class MLflowBackend(_LoggingBackend):
             drain_deadline=_DRAIN_DEADLINE_S,
         )
         self._owner = _RunOwner("MLflow", start=self._open_run, end=lambda: self._mlflow.end_run())
-        self._register_lock = threading.Lock()  # guards the two below, shared with the worker
-        self._model_ids: dict[int, str] = {}  # step -> id of the model registered for it
-        self._registering: set[int] = set()  # steps whose registration call is running
+        self._register_lock = threading.Lock()
+        self._model_ids: dict[int, str] = {}
+        self._registering: set[int] = set()
         self._warn_register = _RateLimitedWarning(_WARN_INTERVAL_S)
 
     def _ensure_init(self) -> None:
@@ -1118,9 +1116,9 @@ class MLflowBackend(_LoggingBackend):
                 client, self._run_id, name, step, str(directory)
             )
             with self._register_lock:
-                self._model_ids[step] = model_id  # before record: later saves and commits see it
+                self._model_ids[step] = model_id
             record({"model_id": model_id})
-        except Exception as e:  # a tracking server problem costs this checkpoint its model_id
+        except Exception as e:
             self._warn_register(
                 f"MLflow checkpoint registration did not complete at step {step} "
                 f"({_error_text(e)}); its tracking entry has no model_id"
