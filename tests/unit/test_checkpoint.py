@@ -1922,10 +1922,20 @@ class TestMuonResume:
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     MODEL_CONFIG = ModelConfig(dim=64, n_layers=2, n_heads=2, vocab_size=4096, max_seq_len=64)
 
-    def _build(self, seed):
+    def _build(self, seed, **overrides):
         torch.manual_seed(seed)
         model = Transformer(self.MODEL_CONFIG).to(self.DEVICE)
-        return model, build_optimizer(model, OptimizerConfig(name="muon", lr=1e-3, fused=False))
+        config = OptimizerConfig(name="muon", lr=1e-3, fused=False, **overrides)
+        return model, build_optimizer(model, config)
+
+    @staticmethod
+    def _save_without(model, opt, key, ckpt_dir):
+        """Save ``opt`` as it was saved before its param groups had ``key``."""
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        for group in opt.param_groups:
+            del group[key]
+        CheckpointManager(CheckpointConfig(dir=str(ckpt_dir)), model, opt).save(step=3)
 
     def _batches(self, n):
         g = torch.Generator().manual_seed(123)
@@ -2050,6 +2060,124 @@ class TestMuonResume:
         state = {"optimizer": get_optimizer_state_dict(model2, opt2)}
         dcp.load(state, checkpoint_id=str(tmp_path / "step_3"))
         set_optimizer_state_dict(model2, opt2, optim_state_dict=state["optimizer"])
+        self._assert_same_state(opt, opt2, "Muon")
+
+    def test_checkpoint_saved_before_orthogonalize_resumes_as_local(self, tmp_path):
+        """A checkpoint saved before ``orthogonalize`` existed resumes with "local" and matches."""
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        batches = self._batches(6)
+        ref_model, ref_opt = self._build(seed=0)
+        self._train(ref_model, ref_opt, batches)
+
+        model, opt = self._build(seed=0)
+        self._train(model, opt, batches[:3])
+        self._save_without(model, opt, "orthogonalize", tmp_path)
+
+        model2, opt2 = self._build(seed=1)
+        CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model2, opt2).load()
+        assert {g["orthogonalize"] for g in opt2.param_groups} == {"local"}
+
+        self._train(model2, opt2, batches[3:])
+        for (name, ref), p in zip(ref_model.named_parameters(), model2.parameters(), strict=True):
+            assert torch.equal(ref, p), f"{name} diverged from the uninterrupted run"
+
+    def test_checkpoint_saved_before_orthogonalize_warns(self, tmp_path):
+        """Filling in a missing key logs one warning naming it; a complete checkpoint logs none."""
+        import logging
+
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        records: list[logging.LogRecord] = []
+
+        class _CaptureHandler(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                records.append(record)
+
+        def warnings_on_load(ckpt_dir) -> list[str]:
+            records.clear()
+            target = logging.getLogger("kempnerforge.checkpoint.manager")
+            capture = _CaptureHandler(level=logging.WARNING)
+            target.addHandler(capture)
+            model2, opt2 = self._build(seed=1)
+            try:
+                CheckpointManager(CheckpointConfig(dir=str(ckpt_dir)), model2, opt2).load()
+            finally:
+                target.removeHandler(capture)
+            return [r.getMessage() for r in records if "orthogonalize" in r.getMessage()]
+
+        model, opt = self._build(seed=0)
+        self._train(model, opt, self._batches(3))
+        CheckpointManager(CheckpointConfig(dir=str(tmp_path / "complete")), model, opt).save(step=3)
+        self._save_without(model, opt, "orthogonalize", tmp_path / "legacy")
+
+        assert warnings_on_load(tmp_path / "complete") == []
+        assert len(warnings_on_load(tmp_path / "legacy")) == 1
+
+    def test_checkpoint_saved_before_orthogonalize_ignores_the_configured_mode(self, tmp_path):
+        """It resumes with the mode it was trained with, as a newer checkpoint does."""
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        model, opt = self._build(seed=0)
+        self._train(model, opt, self._batches(3))
+        self._save_without(model, opt, "orthogonalize", tmp_path)
+
+        model2, opt2 = self._build(seed=1, muon_orthogonalize="exact")
+        CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model2, opt2).load()
+        assert {g["orthogonalize"] for g in opt2.param_groups} == {"local"}
+
+    def test_checkpoint_resumes_with_the_mode_it_was_saved_with(self, tmp_path):
+        """A checkpoint that has ``orthogonalize`` keeps it over the configured mode."""
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        model, opt = self._build(seed=0, muon_orthogonalize="exact")
+        self._train(model, opt, self._batches(3))
+        CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model, opt).save(step=3)
+
+        model2, opt2 = self._build(seed=1)
+        CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model2, opt2).load()
+        assert {g["orthogonalize"] for g in opt2.param_groups} == {"exact"}
+
+    def test_checkpoint_without_another_group_key_still_fails(self, tmp_path):
+        """Only the listed keys may be missing; a checkpoint without any other fails to load."""
+        from torch.distributed.checkpoint.api import CheckpointException
+
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        model, opt = self._build(seed=0)
+        self._train(model, opt, self._batches(3))
+        self._save_without(model, opt, "ns_steps", tmp_path)
+
+        model2, opt2 = self._build(seed=1)
+        missing = r"Missing key in checkpoint state_dict: optimizer\.param_groups\.\d+\.ns_steps"
+        with pytest.raises(CheckpointException, match=missing):
+            CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model2, opt2).load()
+
+    def test_checkpoint_without_inner_state_or_orthogonalize_resumes_muon(self, tmp_path):
+        """The oldest Muon checkpoints lack both the inner AdamW and ``orthogonalize``."""
+        from torch.distributed.checkpoint.state_dict import (
+            get_model_state_dict,
+            get_optimizer_state_dict,
+        )
+
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        model, opt = self._build(seed=0)
+        self._train(model, opt, self._batches(3))
+        for group in opt.param_groups:
+            del group["orthogonalize"]
+        step_dir = tmp_path / "step_3"
+        state = {
+            "model": get_model_state_dict(model),
+            "optimizer": get_optimizer_state_dict(model, opt),
+        }
+        dcp.save(state, checkpoint_id=str(step_dir))
+
+        model2, opt2 = self._build(seed=1)
+        CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model2, opt2).load(
+            path=str(step_dir)
+        )
+        assert {g["orthogonalize"] for g in opt2.param_groups} == {"local"}
         self._assert_same_state(opt, opt2, "Muon")
 
 
