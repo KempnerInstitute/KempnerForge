@@ -88,12 +88,22 @@ class _MetricWithoutModelId:
         self.model_id = None
 
 
+_MODEL_CALLS = (
+    "get_run",
+    "search_logged_models",
+    "create_logged_model",
+    "log_model_artifacts",
+    "finalize_logged_model",
+)
+
+
 class _FakeMlflow(types.ModuleType):
     """Stand-in `mlflow` recording what a publisher does.
 
     Only ``MlflowClient(tracking_uri=...)``, ``log_batch`` and ``get_active_model_id``
-    exist: touching anything else (``start_run``, ``set_tracking_uri``, ``end_run``, ...)
-    raises AssertionError. ``log_batch`` fills a missing metric model_id from the active
+    exist, plus the logged-model calls of ``models`` (a FakeModelStore) when one is given:
+    touching anything else (``start_run``, ``set_tracking_uri``, ``end_run``, ...) raises
+    AssertionError. ``log_batch`` fills a missing metric model_id from the active
     model, as mlflow's client does. ``reject`` fails a request before the fake stores it
     (a real store may keep part of a failed batch), ``on_log_batch`` runs after a request
     is stored, and ``init_error`` fails the client.
@@ -106,6 +116,7 @@ class _FakeMlflow(types.ModuleType):
         reject=None,
         init_error: Exception | None = None,
         active_model_id: str | None = None,
+        models=None,
     ):
         super().__init__("mlflow")
         self.active_model_id = active_model_id
@@ -143,6 +154,9 @@ class _FakeMlflow(types.ModuleType):
                     on_log_batch(call)
 
             def __getattr__(self, name):
+                if models is not None and name in _MODEL_CALLS:
+                    fake.events.append(name)
+                    return getattr(models.client(self._uri), name)
                 raise AssertionError(f"publisher touched MlflowClient.{name}")
 
         self.MlflowClient = MlflowClient
@@ -194,6 +208,13 @@ class TestReadMlflowTarget:
     def test_null_model_id_means_no_model(self, tmp_path):
         ckpt = _sidecar(tmp_path, tracking=[_entry(model_id=None)])
         assert read_mlflow_target(ckpt).model_id is None
+
+    def test_reads_the_model_name_when_the_entry_has_one(self, tmp_path):
+        assert read_mlflow_target(_sidecar(tmp_path)).model_name is None
+        named = _sidecar(tmp_path, "step_121", tracking=[_entry(model_name="run-step_121")])
+        assert read_mlflow_target(named).model_name == "run-step_121"
+        unnamed = _sidecar(tmp_path, "step_122", tracking=[_entry(model_name=None)])
+        assert read_mlflow_target(unnamed).model_name is None
 
     def test_profile_uri_selects_the_profile_for_artifact_clients(self, tmp_path):
         """Artifact clients read only the environment, so the profile in a
@@ -372,9 +393,12 @@ class TestSidecarRefusals:
         ("value", "message"),
         [("", "is empty"), (7, "must be a string, got int"), ([], "must be a string, got list")],
     )
-    def test_model_id_when_present_must_be_a_non_empty_string(self, tmp_path, value, message):
-        ckpt = _sidecar(tmp_path, tracking=[_entry(model_id=value)])
-        with pytest.raises(PublishRefused, match=rf"'model_id' {message}"):
+    @pytest.mark.parametrize("field", ["model_id", "model_name"])
+    def test_model_fields_when_present_must_be_non_empty_strings(
+        self, tmp_path, field, value, message
+    ):
+        ckpt = _sidecar(tmp_path, tracking=[_entry(**{field: value})])
+        with pytest.raises(PublishRefused, match=rf"'{field}' {message}"):
             read_mlflow_target(ckpt)
 
     @pytest.mark.parametrize(
@@ -570,6 +594,83 @@ class TestPublishMetrics:
         assert failures == []
         seen = sorted((b.tracking_uri, b.metrics[0].key) for b in fake.batches)
         assert seen == [("tracking-uri-1", "a/acc"), ("tracking-uri-2", "b/acc")]
+
+
+class TestPublishLinksTheCheckpointModel:
+    """A sidecar that names its model but has no model_id: the publisher finds or makes it."""
+
+    NAME = "run-a-step_120"
+
+    @staticmethod
+    def _install(monkeypatch, model_store, **kwargs):
+        model_store.runs["run-1"] = "7"
+        return _install_mlflow(monkeypatch, models=model_store, **kwargs)
+
+    def _named(self, tmp_path, **entry):
+        return _sidecar(tmp_path, tracking=[_entry(model_name=self.NAME, **entry)])
+
+    def test_links_the_runs_model_of_that_name_without_creating_one(
+        self, tmp_path, monkeypatch, model_store
+    ):
+        fake = self._install(monkeypatch, model_store)
+        found = model_store.add(self.NAME, run_id="run-1")
+        target = publish_metrics(self._named(tmp_path), {"a": 1.0, "b": 2.0})
+        assert [m.model_id for m in fake.batches[0].metrics] == [found.model_id] * 2
+        assert target.model_id == found.model_id
+        assert fake.events == ["client", "get_run", "search_logged_models", "log_batch"]
+        assert len(model_store.models) == 1
+
+    def test_creates_the_model_when_the_run_has_none_and_links_it(
+        self, tmp_path, monkeypatch, model_store
+    ):
+        fake = self._install(monkeypatch, model_store, active_model_id="m-ambient")
+        ckpt = self._named(tmp_path)
+        sidecar = (ckpt / "metadata.json").read_bytes()
+        monkeypatch.chdir(tmp_path)
+        target = publish_metrics(ckpt.name, {"a": 1.0})  # a relative checkpoint path
+        (model,) = model_store.models
+        assert [m.model_id for m in fake.batches[0].metrics] == [model.model_id]
+        assert target.model_id == model.model_id
+        assert (model.name, model.source_run_id, model.status) == (self.NAME, "run-1", "READY")
+        assert model.params == {"step": "120", "checkpoint_dir": str(tmp_path / "step_120")}
+        assert fake.events.count("client") == 1
+        assert {uri for _, uri, _ in model_store.calls} == {URI}
+        assert (ckpt / "metadata.json").read_bytes() == sidecar  # the sidecar is never written
+
+    def test_a_model_id_wins_over_the_model_name(self, tmp_path, monkeypatch, model_store):
+        fake = self._install(monkeypatch, model_store)
+        target = publish_metrics(self._named(tmp_path, model_id="m-abc"), {"a": 1.0})
+        assert [m.model_id for m in fake.batches[0].metrics] == ["m-abc"]
+        assert target.model_id == "m-abc" and model_store.calls == []
+
+    def test_without_a_model_name_nothing_is_searched_or_created(
+        self, tmp_path, monkeypatch, model_store
+    ):
+        fake = self._install(monkeypatch, model_store)
+        target = publish_metrics(_sidecar(tmp_path), {"a": 1.0})
+        assert fake.events == ["client", "log_batch"] and model_store.calls == []
+        assert [m.model_id for m in fake.batches[0].metrics] == [None]
+        assert target.model_id is None
+
+    @pytest.mark.parametrize("model_id", [None, "m-abc"])
+    def test_an_mlflow_that_cannot_link_ignores_the_model(
+        self, tmp_path, monkeypatch, model_store, model_id
+    ):
+        fake = self._install(monkeypatch, model_store, metric_cls=_MetricWithoutModelId)
+        target = publish_metrics(self._named(tmp_path, model_id=model_id), {"a": 1.0})
+        assert fake.events == ["client", "log_batch"] and model_store.calls == []
+        assert [m.model_id for m in fake.batches[0].metrics] == [None]
+        assert target.model_id is None
+
+    def test_a_server_error_finding_the_model_propagates_before_any_metric_is_sent(
+        self, tmp_path, monkeypatch, model_store
+    ):
+        fake = self._install(monkeypatch, model_store)
+        model_store.fail("search_logged_models", RuntimeError("server unreachable"))
+        with pytest.raises(RuntimeError, match="server unreachable") as err:
+            publish_metrics(self._named(tmp_path), {"a": 1.0})
+        assert not isinstance(err.value, PublishRefused)
+        assert fake.batches == []
 
 
 class TestRefusalsPrecedeThePublish:
