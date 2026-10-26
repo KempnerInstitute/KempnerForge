@@ -680,6 +680,24 @@ class TestRunTrainingLoop:
         assert ckpt.saved_steps == [2, 3]
         assert handler.finished is True
 
+    @pytest.mark.parametrize(
+        "after_steps,expected",
+        [(6, [0, 1, 2, 4, 6]), (1, [0, 1])],
+        ids=["at-step-6", "at-step-1"],
+    )
+    def test_shutdown_inside_a_dynamic_window_saves_each_step_once(self, after_steps, expected):
+        """Inside the window milestones decide: step 1 is saved once and step 6 is still saved."""
+        config = make_config(max_steps=10)
+        config.checkpoint.interval = 2
+        config.checkpoint.dyn_ckpt_window = DynamicCheckpointWindow(start=0, stop=8)
+        ckpt = FakeCheckpointManager()
+        handler = FakeShutdownHandler(after_steps=after_steps)
+        session = make_session(config, checkpointer=ckpt, shutdown_handler=handler)
+        step, _ = run_training_loop(session)
+        assert step == after_steps
+        assert ckpt.saved_steps == expected
+        assert handler.finished is True
+
     def test_hooks_fire_for_every_step_and_save(self):
         config = make_config(max_steps=4)
         config.checkpoint.interval = 2
