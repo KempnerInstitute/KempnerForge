@@ -73,7 +73,8 @@ Algorithm:
 3. **If only one mesh** (pure FSDP, single GPU, plain tensors): call
    `torch.nn.utils.clip_grad_norm_` directly — the fast path.
 4. **If multiple meshes**: group gradients by mesh and compute each
-   group's `sum-of-squares` from per-gradient norms taken in fp32. A
+   group's `sum-of-squares` from per-gradient norms taken in at least
+   fp32 (fp16 and bf16 are promoted, fp64 stays fp64). A
    DTensor norm is partial over its shards, and squaring it runs the
    all-reduce that replicates it, so `.full_tensor()` only unwraps each
    group's sum. The groups' sums are added and combined with a plain
