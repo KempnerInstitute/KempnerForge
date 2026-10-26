@@ -264,7 +264,7 @@ def test_fp16_mixed_precision_rejected_at_launch(tmp_path: Path) -> None:
     )
     output = result.stdout + result.stderr
     assert result.returncode != 0, f"fp16 run was not rejected:\n{output[-2000:]}"
-    assert "mixed_precision='fp16' is not supported" in output, output[-2000:]
+    assert "ValueError: train.mixed_precision='fp16' is not supported" in output, output[-2000:]
     assert "Training complete" not in output
 
 
