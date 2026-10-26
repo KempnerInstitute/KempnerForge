@@ -117,13 +117,28 @@ the URI the backend resolved (config, then `$MLFLOW_TRACKING_URI`, then `"databr
 - **Params** — the full `JobConfig` flattened to dotted keys (`model.dim`,
   `optimizer.lr`, …) once at run start, via `mlflow.log_params`. Cheap searchable
   metadata, not artifacts.
-- **Tags** — `host` and `slurm_job_id`.
+- **Tags**: `host` and `slurm_job_id`; the git commit of the working directory as
+  `mlflow.source.git.commit`, with `mlflow.source.git.dirty` (`true` when tracked files differ
+  from it), skipped quietly when git or a repository is missing; `mlflow_description` as the
+  run description (`mlflow.note.content`); and every entry of `mlflow_tags`. Configured tags are
+  applied last, so one replaces an automatic tag of the same key.
+- **Artifacts**: `config.json`, the resolved `JobConfig` (TOML, CLI overrides and defaults
+  applied), and the launch TOML when the first command-line argument names a `.toml` file
+  (how `scripts/train.py` takes its config); without one that upload is skipped. Each upload
+  has a 180 s deadline on the background worker.
 - **System metrics** — CPU / GPU / memory under `system/`, sampled on a
   background thread when `mlflow_log_system_metrics = true` (default). Lower
   `mlflow_system_metrics_interval` (seconds) for short test runs.
 
-No checkpoints are uploaded as artifacts — they stay on the filesystem (artifacts
-are the main MLflow storage cost).
+Params, tags and artifacts are written once, when a new run starts; a resumed run keeps
+what it has. No checkpoints are uploaded as artifacts: they stay on the filesystem
+(artifacts are the main MLflow storage cost).
+
+```toml
+[metrics]
+mlflow_description = "stage-2 video run"            # Markdown; the run description in the UI
+mlflow_tags        = { team = "vlm", stage = "2" }  # non-empty strings, name to value
+```
 
 ## Failure modes
 
@@ -141,8 +156,8 @@ except Exception as e:     # network, auth, experiment-path, etc.
 
 `log()` never propagates and does not disable the backend on a transient error: it
 warns once and keeps retrying, so logging recovers after a blip. `close()` always ends
-the run (even if logging was disabled) and swallows teardown errors. Param/tag logging
-is separately guarded as well.
+the run (even if logging was disabled) and swallows teardown errors. Param, tag and
+artifact logging is separately guarded as well.
 
 MLflow is an optional dependency: install with `uv sync --group mlflow` (pulls
 `mlflow-skinny` + `databricks-sdk`). Without it, `enable_mlflow = true` logs a
