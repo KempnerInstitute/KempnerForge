@@ -52,7 +52,7 @@ class TestMuon:
         [("original", 2.0, 1.0), ("match_rms_adamw", 0.8, 0.8), ("spectral_unclamped", 2.0, 0.5)],
     )
     def test_update_scale_modes(self, adjust_lr, tall, wide):
-        """Each adjust_lr mode scales a 16x4 and a 4x16 matrix as torch.optim.Muon does."""
+        """Each adjust_lr mode's factor for a tall 16x4 and a wide 4x16 matrix."""
         assert _muon_update_scale(adjust_lr, 16, 4) == pytest.approx(tall)
         assert _muon_update_scale(adjust_lr, 4, 16) == pytest.approx(wide)
 

@@ -155,12 +155,13 @@ Momentum and update scale:
 - `muon_nesterov = true` orthogonalizes the Nesterov look-ahead `g + μ·buf`
   instead of the momentum buffer `buf` -- the default of Keller Jordan's
   reference implementation and `torch.optim.Muon`.
-- `muon_adjust_lr` sets the factor on each orthogonalized `rows × cols` update,
-  with the same names as `torch.optim.Muon`'s `adjust_lr_fn`:
+- `muon_adjust_lr` sets the factor on each orthogonalized `rows × cols` update:
   `"original"` (default) `sqrt(max(1, rows/cols))`; `"match_rms_adamw"`
   `0.2·sqrt(max(rows, cols))`, which gives every matrix an AdamW-like update RMS
   so AdamW's `lr` and `weight_decay` carry over; `"spectral_unclamped"`
-  `sqrt(rows/cols)`.
+  `sqrt(rows/cols)`, Bernstein's spectral scale without the clamp at 1. The
+  first two are also `torch.optim.Muon`'s `adjust_lr_fn` names; torch accepts
+  `"spectral_unclamped"` only from 2.14 on.
 - `rows × cols` is the matrix Newton-Schulz ran on: each rank's shard under
   `muon_orthogonalize = "local"`, the full weight under `"exact"`. Under
   `"local"`, `"original"` and `"match_rms_adamw"` keep a sharded update's RMS
