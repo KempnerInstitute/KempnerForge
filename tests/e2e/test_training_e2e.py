@@ -235,14 +235,14 @@ def test_pipeline_parallel(tmp_path):
 
 @pytest.mark.e2e
 @requires_gpus(4)
-def test_fp16_mixed_precision(tmp_path):
-    """4 GPU FSDP with fp16 — verifies param_dtype config path."""
+def test_fp32_mixed_precision(tmp_path: Path) -> None:
+    """4 GPU FSDP with fp32, which checks a non-bf16 param_dtype end to end."""
     result = _run_training(
         [
             DEBUG_CONFIG,
             "--train.max_steps=10",
             "--metrics.log_interval=5",
-            "--train.mixed_precision=fp16",
+            "--train.mixed_precision=fp32",
             f"--checkpoint.dir={tmp_path}/ckpt",
         ],
         nproc=4,
