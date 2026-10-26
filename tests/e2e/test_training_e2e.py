@@ -385,7 +385,7 @@ def test_checkpoint_save_and_resume(tmp_path):
     )
     _assert_training_complete(result, expected_steps=10)
     output = result.stdout + result.stderr
-    assert "Checkpoint saved" in output, "Checkpoint was not saved"
+    assert "Checkpoint committed" in output, "Checkpoint was not saved"
 
     # Phase 2: Resume — should pick up from step 10, train to step 15
     result = _run_training(
@@ -587,7 +587,7 @@ def test_pp_checkpoint_save_and_resume(tmp_path):
     )
     _assert_training_complete(result, expected_steps=10)
     output = result.stdout + result.stderr
-    assert "Checkpoint saved" in output, "PP checkpoint was not saved"
+    assert "Checkpoint committed" in output, "PP checkpoint was not saved"
 
     # Verify loss is meaningful before resume
     loss_phase1 = _parse_last_loss(output)
@@ -663,7 +663,9 @@ def test_sigterm_triggers_emergency_checkpoint(tmp_path):
 
     output = stdout + stderr
     assert "Shutdown requested" in output, f"Signal handler did not trigger:\n{output[-2000:]}"
-    assert "Checkpoint saved" in output, f"Emergency checkpoint was not saved:\n{output[-2000:]}"
+    assert "Checkpoint committed" in output, (
+        f"Emergency checkpoint was not saved:\n{output[-2000:]}"
+    )
 
 
 @pytest.mark.e2e
@@ -773,7 +775,7 @@ def test_moe_checkpoint_resume(tmp_path):
     )
     _assert_training_complete(result, expected_steps=10)
     output = result.stdout + result.stderr
-    assert "Checkpoint saved" in output, "MoE checkpoint was not saved"
+    assert "Checkpoint committed" in output, "MoE checkpoint was not saved"
 
     # Phase 2: Resume from checkpoint, train to step 15
     result = _run_training(
