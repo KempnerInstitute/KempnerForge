@@ -94,6 +94,21 @@ wandb's `resume="allow"`. On resume it also skips re-logging any step the run al
 recorded, so re-executing the steps between the last checkpoint and the crash does not
 duplicate metric points.
 
+## Finding a checkpoint's run
+
+Each checkpoint's `metadata.json` names the live run in its `tracking` list
+([Checkpointing](../checkpointing/index.md)):
+
+```json
+{"backend": "mlflow", "run_id": "<run id>", "experiment": "<experiment>", "tracking_uri": "<tracking uri>"}
+```
+
+All four fields are always present and non-empty, or the entry is left out. `tracking_uri` is
+the URI the backend resolved (config, then `$MLFLOW_TRACKING_URI`, then `"databricks"`) and
+`experiment` the name it set the run up under. The entry comes from
+`MLflowBackend.tracking_entry()`; resume is unaffected and still restores `mlflow_run_id` from
+`train_state.pt`.
+
 ## What gets logged
 
 - **Metrics** — the same backend dict as WandB/TensorBoard (`train/*`, `gpu/*`,
@@ -160,5 +175,7 @@ No-op unless the run is live.
   run-id-resume pattern.
 - [Checkpointing § Train state](../checkpointing/train-state.md) — how
   `mlflow_run_id` travels with the checkpoint.
+- [Checkpointing § `metadata.json`](../checkpointing/index.md): the `tracking` entry that
+  names a checkpoint's run.
 - [Configuration § `[metrics]`](../configuration/config-sections.md) — per-field
   reference for `MetricsConfig`.

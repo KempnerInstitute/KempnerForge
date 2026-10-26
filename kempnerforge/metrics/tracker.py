@@ -82,6 +82,7 @@ class MetricsTracker:
         # Logging backends (initialized lazily)
         self._backends: list[_LoggingBackend] = []
         self._backends_initialized = False
+        self._closed = False
 
     def _init_backends(self, config: JobConfig) -> None:
         """Lazily initialize logging backends (rank 0 only)."""
@@ -222,10 +223,49 @@ class MetricsTracker:
         """Initialize logging backends (call after distributed setup)."""
         self._init_backends(config)
 
+    def tracking_entries(self) -> list[dict[str, str]]:
+        """One record per backend with a live run, for a checkpoint's ``metadata.json``.
+
+        Empty once ``close()`` has begun. Reads only what the backends already hold, so it
+        never waits on a server. Each entry is copied once into a plain dict; a backend that
+        cannot describe itself, or whose entry is not strings under a named ``backend``, is
+        skipped with a warning and costs no other backend its entry.
+        """
+        entries: list[dict[str, str]] = []
+        if self._closed:
+            return entries
+        for backend in self._backends:
+            try:
+                entry = backend.tracking_entry()
+                snapshot = None if entry is None else _tracking_snapshot(entry)
+            except Exception as e:  # a third-party run object; never let it cost a save
+                logger.warning(
+                    "%s tracking entry skipped (%s)", type(backend).__name__, _error_text(e)
+                )
+                continue
+            if snapshot is not None:
+                entries.append(snapshot)
+        return entries
+
     def close(self) -> None:
         """Flush and close all logging backends."""
+        self._closed = True
         for backend in self._backends:
             backend.close()
+
+
+def _tracking_snapshot(entry: object) -> dict[str, str]:
+    """A plain copy of a backend's entry; ValueError unless it is strings under a named backend."""
+    if not isinstance(entry, dict):
+        raise ValueError(f"expected a mapping, got {type(entry).__name__}")
+    snapshot: dict[str, str] = {}
+    for key, value in entry.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            raise ValueError("keys and values must be strings")
+        snapshot[key] = value
+    if not snapshot.get("backend", "").strip():
+        raise ValueError("no backend name")
+    return snapshot
 
 
 # ---------------------------------------------------------------------------
@@ -238,6 +278,13 @@ class _LoggingBackend:
 
     def log(self, metrics: dict[str, float], step: int) -> None:
         raise NotImplementedError
+
+    def tracking_entry(self) -> dict[str, str] | None:
+        """This backend's record of its live run for a checkpoint.
+
+        None until its run starts, after a failed init, and once it is closed.
+        """
+        return None
 
     def close(self) -> None:
         pass
@@ -252,6 +299,7 @@ class WandBBackend(_LoggingBackend):
     def __init__(self, config: MetricsConfig) -> None:
         self._config = config
         self._run = None
+        self._closed = False
 
     def _ensure_init(self) -> None:
         if self._run is not None:
@@ -284,10 +332,22 @@ class WandBBackend(_LoggingBackend):
 
         wandb.log(metrics, step=step)
 
+    def tracking_entry(self) -> dict[str, str] | None:
+        run: Any = self._run  # None before the first log, False after a failed init
+        if self._closed or not run or run.disabled:  # a disabled run records nothing
+            return None
+        entry = {"backend": "wandb", "run_id": run.id, "experiment": run.project}
+        if entity := run.entity:
+            entry["entity"] = entity
+        if not run.offline and (url := run.url):  # an offline run has no URL, and asking warns
+            entry["url"] = url
+        return entry
+
     def close(self) -> None:
         if self._run and self._run is not False:
             import wandb
 
+            self._closed = True
             wandb.finish()
 
 
@@ -308,6 +368,14 @@ _URI_USERINFO = re.compile(r"(?<=://)[^/?#\s]+@")
 
 def _scrub_uris(text: str) -> str:
     return _URI_USERINFO.sub("", text)
+
+
+def _error_text(error: BaseException) -> str:
+    """``error``'s message with URI credentials removed; never raises."""
+    try:
+        return _scrub_uris(str(error))
+    except Exception:
+        return f"<unprintable {type(error).__name__}>"
 
 
 class _RateLimitedWarning:
@@ -758,6 +826,7 @@ class MLflowBackend(_LoggingBackend):
         self._resume_skip_below: int | None = None  # skip re-logging steps already in the run
         self._mlflow: Any = None  # the imported module
         self._run_id = ""
+        self._experiment = ""  # the experiment the run was set up in, set with the run id
         self._worker = _BestEffortWorker(
             "MLflow",
             max_queue=_QUEUE_MAX,
@@ -780,6 +849,7 @@ class MLflowBackend(_LoggingBackend):
             experiment, run_id, resumed, last_step = self._owner.start(_INIT_DEADLINE_S)
             self._run_started = True
             self._run_id = run_id
+            self._experiment = experiment or ""
             self._config.mlflow_run_id = run_id
             self._worker.start()
             self._active = True
@@ -889,6 +959,18 @@ class MLflowBackend(_LoggingBackend):
         call = partial(_mlflow_log_metrics, self._mlflow, self._run_id, dict(metrics), step)
         self._worker.submit("log_metrics", call)
 
+    def tracking_entry(self) -> dict[str, str] | None:
+        """The live run as its checkpoint reader needs it: all four fields non-blank, or none."""
+        entry = {
+            "backend": "mlflow",
+            "run_id": self._run_id,
+            "experiment": self._experiment,
+            "tracking_uri": _URI_USERINFO.sub("", self._uri),
+        }
+        if self._active is not True or not all(value.strip() for value in entry.values()):
+            return None
+        return entry
+
     def close(self) -> None:
         if not self._run_started:
             return
@@ -908,6 +990,7 @@ class TensorBoardBackend(_LoggingBackend):
     def __init__(self, config: MetricsConfig) -> None:
         self._config = config
         self._writer = None
+        self._closed = False
 
     def _ensure_init(self) -> None:
         if self._writer is not None:
@@ -928,6 +1011,15 @@ class TensorBoardBackend(_LoggingBackend):
         for key, val in metrics.items():
             self._writer.add_scalar(key, val, global_step=step)  # type: ignore[reportOptionalMemberAccess, reportAttributeAccessIssue]
 
+    def tracking_entry(self) -> dict[str, str] | None:
+        writer: Any = self._writer  # None before the first log, False without tensorboard
+        if self._closed or not writer:
+            return None
+        log_dir = writer.get_logdir()  # the writer's own: an empty setting makes it pick one
+        directory = str(log_dir) if log_dir else ""  # as the event writer converts it
+        return {"backend": "tensorboard", "log_dir": directory} if directory else None
+
     def close(self) -> None:
         if self._writer and self._writer is not False:
+            self._closed = True
             self._writer.close()  # type: ignore[reportAttributeAccessIssue]
