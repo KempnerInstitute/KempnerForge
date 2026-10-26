@@ -282,11 +282,12 @@ def publish_metrics(
 
     Raises:
         PublishRefused: The sidecar or the metrics are missing or malformed, mlflow is
-            not installed, or the sidecar entry gives no model to link while this
-            process has an active MLflow model (which ``log_batch`` would silently
-            link); nothing was sent. Errors raised by MLflow itself (an invalid metric
-            name, an unreachable server) propagate as raised; a request that fails
-            server side may still have stored some of its points.
+            not installed, or no model can be linked (the sidecar entry gives none, or
+            the installed MLflow cannot link one) while this process has an active
+            MLflow model (which ``log_batch`` would silently link); nothing was sent.
+            Errors raised by MLflow itself (an invalid metric name, an unreachable
+            server) propagate as raised; a request that fails server side may still
+            have stored some of its points.
     """
     target = read_mlflow_target(checkpoint_dir)
     named = _prefixed_metrics(metrics, prefix)
@@ -299,8 +300,10 @@ def publish_metrics(
         ) from e
 
     can_link = "model_id" in inspect.signature(Metric).parameters
+    if target.model_id is not None and not can_link:
+        logger.debug("installed mlflow cannot link metrics to a model; ignoring model_id")
     client = None
-    model_id = target.model_id
+    model_id = target.model_id if can_link else None
     if can_link and model_id is None and target.model_name is not None:
         client = mlflow.MlflowClient(tracking_uri=target.tracking_uri)
         model_id = find_or_create_checkpoint_model(
@@ -317,14 +320,11 @@ def publish_metrics(
         ambient = get_ambient() if get_ambient is not None else None
         if ambient:
             raise PublishRefused(
-                "the sidecar entry has no model_id but this process has an active MLflow "
+                "the metrics have no model to link to but this process has an active MLflow "
                 f"model ({ambient}); log_batch would silently link the metrics to it. Clear "
                 "the active model (MLFLOW_ACTIVE_MODEL_ID / mlflow.set_active_model) or "
                 "record model_id in the sidecar"
             )
-    elif not can_link:
-        logger.debug("installed mlflow cannot link metrics to a model; ignoring model_id")
-        model_id = None
 
     link: dict[str, str] = {} if model_id is None else {"model_id": model_id}
     timestamp = _now_ms()
