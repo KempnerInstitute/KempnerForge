@@ -1159,6 +1159,37 @@ class TestSaveCheckpointRegistration:
             for step in (10, 20)
         ]
 
+    def test_an_async_step_saved_again_is_committed_and_registered_once_after_its_last_flush(
+        self, tmp_path, monkeypatch
+    ):
+        mgr = TestAsyncLatestSymlinkSafety._mgr(tmp_path, AsyncCheckpointMode.async_pinned)
+        TestAsyncLatestSymlinkSafety._install_async_mock(mgr, monkeypatch)
+        registrar = _Registrar()
+        mgr.set_tracking_source(lambda: [self.MLFLOW])
+        mgr.set_checkpoint_registrar(registrar)
+        mgr.save(step=10)
+        mgr.save(step=10)
+        assert registrar.registered == []
+        assert not (tmp_path / "latest").exists()
+        mgr.wait()
+        step_dir = tmp_path / "step_10"
+        assert (tmp_path / "latest").resolve() == step_dir.resolve()
+        assert registrar.registered == [(10, step_dir, step_dir.resolve())]
+
+    def test_an_async_save_still_commits_the_pending_checkpoint_of_another_step(
+        self, tmp_path, monkeypatch
+    ):
+        mgr = TestAsyncLatestSymlinkSafety._mgr(tmp_path, AsyncCheckpointMode.async_pinned)
+        TestAsyncLatestSymlinkSafety._install_async_mock(mgr, monkeypatch)
+        registrar = _Registrar()
+        mgr.set_tracking_source(lambda: [self.MLFLOW])
+        mgr.set_checkpoint_registrar(registrar)
+        mgr.save(step=10)
+        mgr.save(step=20)
+        step_dir = tmp_path / "step_10"
+        assert (tmp_path / "latest").resolve() == step_dir.resolve()
+        assert registrar.registered == [(10, step_dir, step_dir.resolve())]
+
     def test_a_checkpoint_whose_flush_fails_is_never_registered(self, tmp_path, monkeypatch):
         mgr = TestAsyncLatestSymlinkSafety._mgr(tmp_path, AsyncCheckpointMode.async_pinned)
         TestAsyncLatestSymlinkSafety._install_async_mock(mgr, monkeypatch)

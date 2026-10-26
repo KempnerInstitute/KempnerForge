@@ -414,18 +414,21 @@ class CheckpointManager:
         self._register_committed(step, ckpt_dir)
         self._cleanup()
 
-    def _drain_pending_finalize(self) -> None:
+    def _drain_pending_finalize(self, overwriting: Path | None = None) -> None:
         """Commit a deferred async checkpoint once its flush is durable.
 
         Invoked after the pending DCP future has been awaited (next save()
         or an explicit wait()/flush). Rank 0 performs the symlink + cleanup;
         other ranks no-op (they never touch the symlink), mirroring save().
+        A checkpoint pending in ``overwriting``, the directory a new save's
+        flush is rewriting, is dropped uncommitted and unregistered; that
+        save's own deferred commit points `latest` at it and registers it.
         """
         if self._pending_finalize is None:
             return
         step, ckpt_dir = self._pending_finalize
         self._pending_finalize = None
-        if self._rank == 0:
+        if self._rank == 0 and ckpt_dir != overwriting:
             self._commit_latest(step, ckpt_dir)
 
     def _sync_barrier(self) -> None:
@@ -602,7 +605,7 @@ class CheckpointManager:
         # The prior async checkpoint's flush is now guaranteed durable (the
         # dispatch above awaited it). Commit its `latest` symlink + cleanup
         # before doing anything else.
-        self._drain_pending_finalize()
+        self._drain_pending_finalize(overwriting=ckpt_dir)
 
         # Save non-distributed state (rank 0 only). These are small synchronous
         # writes; they finish well before `latest` is ever pointed here, so
