@@ -130,6 +130,10 @@ File:
 - `dp_shard ∈ {-1} ∪ {1, 2, …}` (negative values other than `-1`
   rejected; `-1` is the auto-resolve sentinel).
 - `dp_replicate, tp, pp, cp, ep ≥ 1`.
+- `cp == 1`. Context parallelism is not implemented and the mesh has no
+  `cp` dimension, so `cp > 1` would build a mesh that leaves ranks out,
+  or train as plain FSDP when `cp` equals the world size. Rejecting it
+  here stops the run before `init_distributed`.
 
 World-size validation happens in `validate_world_size` (called from
 `JobConfig.validate`).
