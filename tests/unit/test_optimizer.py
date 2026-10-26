@@ -475,6 +475,19 @@ class TestMuon:
         optimizer.load_state_dict(saved)
         assert optimizer.param_groups[0]["orthogonalize"] == "local"
 
+    def test_state_saved_before_nesterov_and_adjust_lr_loads_the_old_update(self):
+        """A state saved before ``nesterov`` and ``adjust_lr`` loads with False and "original"."""
+        weight = nn.Parameter(torch.zeros(4, 4))
+        saved = Muon([{"params": [weight]}], [{"params": []}]).state_dict()
+        for group in saved["param_groups"]:
+            del group["nesterov"], group["adjust_lr"]
+        optimizer = Muon(
+            [{"params": [weight]}], [{"params": []}], nesterov=True, adjust_lr="match_rms_adamw"
+        )
+        optimizer.load_state_dict(saved)
+        assert optimizer.param_groups[0]["nesterov"] is False
+        assert optimizer.param_groups[0]["adjust_lr"] == "original"
+
 
 class TestAdamW:
     def test_build_adamw(self):

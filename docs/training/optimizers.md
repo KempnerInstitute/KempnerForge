@@ -166,6 +166,9 @@ Momentum and update scale:
   `"local"`, `"original"` and `"match_rms_adamw"` keep a sharded update's RMS
   close to the unsharded one, but `"spectral_unclamped"` shrinks it once the
   shards are wider than tall, so pair that mode with `"exact"`.
+- A resume keeps the `muon_nesterov` and `muon_adjust_lr` the checkpoint was
+  saved with, and a checkpoint saved before the options existed resumes with
+  `false` and `"original"`.
 
 Newton-Schulz coefficients (hard-coded): `a = 3.4445, b = -4.7750, c =
 2.0315`, Frobenius-normalized input — standard values from the Muon

@@ -385,7 +385,11 @@ class Muon(torch.optim.Optimizer):
             matrix.
     """
 
-    LEGACY_GROUP_DEFAULTS: ClassVar[dict[str, Any]] = {"orthogonalize": "local"}
+    LEGACY_GROUP_DEFAULTS: ClassVar[dict[str, Any]] = {
+        "orthogonalize": "local",
+        "nesterov": False,
+        "adjust_lr": "original",
+    }
 
     def __init__(
         self,
@@ -488,8 +492,8 @@ class Muon(torch.optim.Optimizer):
             momentum = group["momentum"]
             wd = group["weight_decay"]
             ns_steps = group["ns_steps"]
-            nesterov = group.get("nesterov", self.defaults["nesterov"])
-            adjust_lr = group.get("adjust_lr", self.defaults["adjust_lr"])
+            nesterov = group["nesterov"]
+            adjust_lr = group["adjust_lr"]
             orthogonalize = group["orthogonalize"]
 
             params = [p for p in group["params"] if p.grad is not None]
