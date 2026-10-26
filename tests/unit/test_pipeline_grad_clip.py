@@ -174,6 +174,22 @@ def _check_tp_stage(rank: int, world: int, port: int, pp: int, dtype: torch.dtyp
         dist.destroy_process_group()
 
 
+def _check_fp64_stage(rank: int, world: int, port: int) -> None:
+    """fp64 gradients keep an fp64 norm, since ``vector_norm`` cannot narrow them to fp32."""
+    dist.init_process_group(
+        "gloo", rank=rank, world_size=world, init_method=f"tcp://127.0.0.1:{port}"
+    )
+    try:
+        stage = _stage(_model().double(), rank, world)
+        norm_sq = torch.stack([p.grad.pow(2).sum() for p in stage.parameters()]).sum()
+        dist.all_reduce(norm_sq)
+        norm = clip_grad_norm_(stage, MAX_NORM, pp_group=dist.group.WORLD)
+        assert norm.dtype == torch.float64
+        torch.testing.assert_close(norm, norm_sq.sqrt())
+    finally:
+        dist.destroy_process_group()
+
+
 def _check_pipeline_step(rank: int, world: int, port: int) -> None:
     """A real 1F1B step with FSDP2 on pp=2 x dp_shard=2, clipped, against one process."""
     import torch.nn.functional as F
@@ -282,3 +298,7 @@ class TestClipAcrossPipelineStages:
         With ``pp=1`` there is no group, and the two meshes take the mixed-mesh path.
         """
         mp.spawn(_check_tp_stage, args=(2 * pp, _free_port(), pp, dtype), nprocs=2 * pp)
+
+    def test_fp64_stages_keep_an_fp64_norm(self):
+        """fp64 gradients clip with an fp64 norm instead of failing to narrow to fp32."""
+        mp.spawn(_check_fp64_stage, args=(2, _free_port()), nprocs=2)
