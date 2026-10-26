@@ -14,7 +14,7 @@ import logging
 import os
 import shutil
 import stat
-from collections.abc import Iterable
+from collections.abc import Container, Iterable
 from pathlib import Path
 from typing import Any, cast
 
@@ -62,6 +62,29 @@ def _saved_optimizer_param_groups(saved_keys: Iterable[str]) -> int:
             if key.startswith(_OPTIM_PARAM_GROUPS_PREFIX)
         }
     )
+
+
+def _drop_legacy_group_keys(
+    optim_state: dict[str, Any],
+    optimizers: Iterable[torch.optim.Optimizer],
+    saved_keys: Container[str],
+) -> dict[str, Any]:
+    """Drop from a load template the param-group keys its checkpoint predates.
+
+    An optimizer lists in ``LEGACY_GROUP_DEFAULTS`` the keys its param groups gained
+    after its checkpoints were first written, and fills each one in when it loads a
+    group without it. Only those keys are dropped, and only from the groups whose
+    saved copy lacks them; any other key a checkpoint lacks still fails the load.
+    Returns the dropped keys with the values they resume with.
+    """
+    owners = [optimizer for optimizer in optimizers for _ in optimizer.param_groups]
+    dropped: dict[str, Any] = {}
+    for index, (group, owner) in enumerate(zip(optim_state["param_groups"], owners, strict=True)):
+        for key, value in getattr(owner, "LEGACY_GROUP_DEFAULTS", {}).items():
+            if key in group and f"{_OPTIM_PARAM_GROUPS_PREFIX}{index}.{key}" not in saved_keys:
+                del group[key]
+                dropped[key] = value
+    return dropped
 
 
 def _intersect_freeze_meta_by_module(
@@ -632,6 +655,12 @@ class CheckpointManager:
             dcp_state["model"] = get_model_state_dict(self.model)
         if load_optim:
             dcp_state["optimizer"] = get_optimizer_state_dict(self.model, optimizers)
+            filled = _drop_legacy_group_keys(dcp_state["optimizer"], optimizers, saved_keys)
+            if filled:
+                logger.info(
+                    f"{dcp_dir} predates the optimizer param-group keys {sorted(filled)}; "
+                    f"resuming them with the values it was trained with: {filled}"
+                )
 
         if dcp_state:
             planner = _NeverSteppedStatePlanner()
