@@ -51,8 +51,9 @@ live run at save time it also holds a `tracking` list, one entry per backend:
   `entity` and `url` appear when the wandb run has them (an offline run has no URL). The
   MLflow entry always has all four fields shown. With
   [checkpoint registration](../metrics-and-profiling/mlflow.md#registering-checkpoints) on it
-  also has `model_name`, and gets `model_id` once the committed checkpoint is registered: the
-  file is then replaced atomically, after the save.
+  also has `model_name`, and gets `model_id` once the committed checkpoint is registered.
+  Every write of `metadata.json` replaces the file atomically, so a reader never sees a
+  partial one.
 - A backend contributes only while its run is live, and runs start on the first log. A
   checkpoint saved before that (step 0, or soon after a resume when `checkpoint.interval` is
   shorter than `metrics.log_interval`) lacks the entry, and the key is omitted when no backend

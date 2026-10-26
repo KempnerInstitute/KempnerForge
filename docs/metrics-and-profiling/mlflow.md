@@ -229,7 +229,9 @@ A save never waits on the server for it, a preemption save included. Registratio
 effort: a failure, such as a server error or a full queue, leaves the entry without `model_id`
 and logs a rate-limited warning, and the next commit of the same step tries again. A step saved
 twice (a shutdown save right after an interval save, or a resumed run re-running it) keeps one
-model, and the last `metadata.json` of that step still gets its `model_id`. A resume registers
+model, and the last `metadata.json` of that step still gets its `model_id`; with an async
+checkpoint mode the step is committed and registered once the second save's shards are
+durable. A resume registers
 nothing by itself, and a checkpoint deleted before its turn comes is skipped. At shutdown,
 `close()` delivers a registration still queued within its 30 s drain budget, so the final
 checkpoint is registered too. A save before the run's first log has no `mlflow` entry, so its
@@ -283,15 +285,15 @@ environment, as described under credentials below.
   after every metric has been checked: a non-empty name, a finite number, at most 1000 in all.
   The metrics are linked to the checkpoint's model: the entry's `model_id`, else the run's model
   named by `model_name`, found or created as [above](#registering-checkpoints). An entry with
-  neither publishes them unlinked. It never starts, ends or edits a run and keeps no state, so
+  neither, or an MLflow too old to link metrics to a model, publishes them unlinked. It never starts, ends or edits a run and keeps no state, so
   several publishers can write to one run at once. The call blocks on the server under MLflow's
   own HTTP timeouts, so run it as a separate process, never from the training step. `log_batch`
   is not atomic: a request that fails server side may still have stored some points.
 - **When it refuses.** The directory has no `metadata.json`; there is no `tracking` list or no
   `mlflow` entry (a checkpoint saved before the run's first log, an older one, or training
   without MLflow); more than one `mlflow` entry; a field is missing or empty; the metrics are
-  malformed; `mlflow` is not installed; or the entry has neither `model_id` nor `model_name`
-  while the process has an active MLflow model (`MLFLOW_ACTIVE_MODEL_ID` or
+  malformed; `mlflow` is not installed; or the metrics have no model to link to while the
+  process has an active MLflow model (`MLFLOW_ACTIVE_MODEL_ID` or
   `mlflow.set_active_model`), which `log_batch` would silently link the metrics to.
 - **Credentials.** It prepares auth from the [routes above](#authentication) the way the
   training backend does: it uses the recorded `tracking_uri` as written, a
@@ -384,7 +386,8 @@ check included, run with MLflow's own defaults.
   on Databricks by the auth routes when the failure may be a credentials one.
 
 Warnings that quote an error strip `user:token@` from any URI first, since MLflow and SDK
-errors can quote a credentialed tracking URI.
+errors can quote a credentialed tracking URI. The checkpoint manager's warnings about tracking
+entries and registration do the same.
 
 After init, `log()` never raises and never waits: it queues the call. A call that fails or runs
 past its deadline costs only what it carried: its points, a batch of params, a tag or an
