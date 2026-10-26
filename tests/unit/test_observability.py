@@ -2289,10 +2289,6 @@ class TestTrackingEntries:
             tracker.close()
 
 
-# ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
-
-
 class _FakeRegistry(_FakeMlflow):
     """_FakeMlflow whose clients also reach the logged models of a FakeModelStore."""
 
@@ -2568,7 +2564,7 @@ class TestCheckpointRegistration:
         backend.register_checkpoint(5, directory, recorded.append)
         backend.log({"train/loss": 1.0}, step=1)
         backend.close()
-        assert backend.checkpoint_fields(5) is None  # the run has ended
+        assert backend.checkpoint_fields(5) is None
         backend.register_checkpoint(5, directory, recorded.append)
         monkeypatch.setitem(sys.modules, "mlflow", None)
         failed = MLflowBackend(_mlflow_cfg(mlflow_register_checkpoints=True))

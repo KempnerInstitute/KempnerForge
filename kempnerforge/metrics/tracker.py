@@ -273,7 +273,7 @@ class MetricsTracker:
                     entry = backend.tracking_entry()
                     if entry is not None:
                         added[_tracking_snapshot(entry)["backend"]] = fields
-            except Exception as e:  # a third-party run object; never let it cost a save
+            except Exception as e:
                 logger.warning(
                     "%s checkpoint fields skipped (%s)", type(backend).__name__, _error_text(e)
                 )
