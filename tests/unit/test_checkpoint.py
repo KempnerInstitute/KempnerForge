@@ -1159,6 +1159,37 @@ class TestSaveCheckpointRegistration:
             for step in (10, 20)
         ]
 
+    def test_an_async_step_saved_again_is_committed_and_registered_once_after_its_last_flush(
+        self, tmp_path, monkeypatch
+    ):
+        mgr = TestAsyncLatestSymlinkSafety._mgr(tmp_path, AsyncCheckpointMode.async_pinned)
+        TestAsyncLatestSymlinkSafety._install_async_mock(mgr, monkeypatch)
+        registrar = _Registrar()
+        mgr.set_tracking_source(lambda: [self.MLFLOW])
+        mgr.set_checkpoint_registrar(registrar)
+        mgr.save(step=10)
+        mgr.save(step=10)
+        assert registrar.registered == []
+        assert not (tmp_path / "latest").exists()
+        mgr.wait()
+        step_dir = tmp_path / "step_10"
+        assert (tmp_path / "latest").resolve() == step_dir.resolve()
+        assert registrar.registered == [(10, step_dir, step_dir.resolve())]
+
+    def test_an_async_save_still_commits_the_pending_checkpoint_of_another_step(
+        self, tmp_path, monkeypatch
+    ):
+        mgr = TestAsyncLatestSymlinkSafety._mgr(tmp_path, AsyncCheckpointMode.async_pinned)
+        TestAsyncLatestSymlinkSafety._install_async_mock(mgr, monkeypatch)
+        registrar = _Registrar()
+        mgr.set_tracking_source(lambda: [self.MLFLOW])
+        mgr.set_checkpoint_registrar(registrar)
+        mgr.save(step=10)
+        mgr.save(step=20)
+        step_dir = tmp_path / "step_10"
+        assert (tmp_path / "latest").resolve() == step_dir.resolve()
+        assert registrar.registered == [(10, step_dir, step_dir.resolve())]
+
     def test_a_checkpoint_whose_flush_fails_is_never_registered(self, tmp_path, monkeypatch):
         mgr = TestAsyncLatestSymlinkSafety._mgr(tmp_path, AsyncCheckpointMode.async_pinned)
         TestAsyncLatestSymlinkSafety._install_async_mock(mgr, monkeypatch)
@@ -1188,6 +1219,42 @@ class TestSaveCheckpointRegistration:
         assert not (tmp_path / "step_1").exists()
         assert self._sidecar(tmp_path, 2)["tracking"] == [self.MLFLOW]
         assert len(warnings) == 2 and "step_2" in warnings[1] and "no server" in warnings[1]
+
+    @pytest.mark.parametrize("failing", ["fields", "register", "record", "source"])
+    def test_logged_failures_carry_no_uri_credentials(self, tmp_path, monkeypatch, failing):
+        error = RuntimeError("POST https://user:secret@tracking.example/api failed")
+
+        def raises(*args):
+            raise error
+
+        warnings = self._log(monkeypatch, "warning")
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        registrar = _Registrar(
+            raises if failing == "fields" else None, error if failing == "register" else None
+        )
+        mgr.set_tracking_source(raises if failing == "source" else lambda: [self.MLFLOW])
+        mgr.set_checkpoint_registrar(registrar)
+        mgr.save(step=1)
+        if failing == "record":
+            monkeypatch.setattr(os, "replace", raises)
+            registrar.records[0]("mlflow", {"model_id": "m-1"})
+        assert len(warnings) == 1 and "POST https://tracking.example/api failed" in warnings[0]
+        assert "user:secret@" not in warnings[0]
+
+    def test_an_unprintable_registrar_error_costs_only_the_registration(
+        self, tmp_path, monkeypatch
+    ):
+        class Unprintable(Exception):
+            def __str__(self):
+                raise RuntimeError("no text")
+
+        warnings = self._log(monkeypatch, "warning")
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        mgr.set_tracking_source(lambda: [self.MLFLOW])
+        mgr.set_checkpoint_registrar(_Registrar(error=Unprintable()))
+        mgr.save(step=1)
+        assert (tmp_path / "latest").resolve() == (tmp_path / "step_1").resolve()
+        assert len(warnings) == 1 and "<unprintable Unprintable>" in warnings[0]
 
     def test_record_amends_one_record_atomically_through_a_temp_file(self, tmp_path, monkeypatch):
         _, registrar = self._registered(tmp_path, monkeypatch, {"mlflow": {"model_name": "m"}})
@@ -1236,6 +1303,35 @@ class TestSaveCheckpointRegistration:
             "train_state.pt",
         ]
         assert len(warnings) == 1 and "mlflow" in warnings[0] and "disk full" in warnings[0]
+
+    @pytest.mark.parametrize("failing", ["fsync", "replace"])
+    def test_a_failed_rewrite_of_a_saved_step_leaves_its_sidecar_whole(
+        self, tmp_path, monkeypatch, failing
+    ):
+        mgr, _ = self._registered(tmp_path, monkeypatch)
+        sidecar = tmp_path / "step_1" / "metadata.json"
+        before = sidecar.read_bytes()
+
+        def refuse(*args):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(os, failing, refuse)
+        with pytest.raises(OSError, match="disk full"):
+            mgr.save(step=1, tokens_seen=16)
+        assert sidecar.read_bytes() == before
+        assert sorted(p.name for p in sidecar.parent.iterdir()) == [
+            "metadata.json",
+            "train_state.pt",
+        ]
+
+    def test_a_new_sidecar_gets_the_mode_of_a_plain_write(self, tmp_path, monkeypatch):
+        self._registered(tmp_path, monkeypatch)
+        step_dir = tmp_path / "step_1"
+        modes = {
+            stat.S_IMODE((step_dir / name).stat().st_mode)
+            for name in ("metadata.json", "train_state.pt")
+        }
+        assert len(modes) == 1
 
     def test_record_skips_quietly_when_the_checkpoint_or_its_record_is_gone(
         self, tmp_path, monkeypatch
@@ -1290,22 +1386,16 @@ class TestSaveCheckpointRegistration:
         lock = _HeldLock()
         mgr._sidecar_lock = lock  # type: ignore[assignment]
         held: list = []
-        write_text, replace, rmtree = Path.write_text, os.replace, mgr_mod.shutil.rmtree
+        replace, rmtree = os.replace, mgr_mod.shutil.rmtree
 
-        def written(path, *args, **kwargs):
-            if path.name == "metadata.json":
-                held.append(("write", lock.held))
-            return write_text(path, *args, **kwargs)
+        def replaced(src, dst):
+            held.append((Path(dst).parent.name, lock.held))
+            return replace(src, dst)
 
-        def replaced(*args):
-            held.append(("replace", lock.held))
-            return replace(*args)
+        def removed(path, *args, **kwargs):
+            held.append((f"remove {Path(path).name}", lock.held))
+            return rmtree(path, *args, **kwargs)
 
-        def removed(*args, **kwargs):
-            held.append(("remove", lock.held))
-            return rmtree(*args, **kwargs)
-
-        monkeypatch.setattr(Path, "write_text", written)
         monkeypatch.setattr(os, "replace", replaced)
         monkeypatch.setattr(mgr_mod.shutil, "rmtree", removed)
         registrar = _Registrar()
@@ -1314,7 +1404,12 @@ class TestSaveCheckpointRegistration:
         mgr.save(step=1)
         registrar.records[0]("mlflow", {"model_id": "m-1"})
         mgr.save(step=2)
-        assert held == [("write", True), ("replace", True), ("write", True), ("remove", True)]
+        assert held == [
+            ("step_1", True),
+            ("step_1", True),
+            ("step_2", True),
+            ("remove step_1", True),
+        ]
 
     def test_trackers_fields_and_registration_reach_the_sidecar_by_backend_name(
         self, tmp_path, monkeypatch

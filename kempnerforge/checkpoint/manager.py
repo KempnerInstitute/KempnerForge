@@ -9,13 +9,15 @@ separately as a torch file and broadcast from rank 0 on load.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
+import re
 import shutil
 import stat
-import tempfile
 import threading
+import uuid
 from collections.abc import Callable, Container, Iterable
 from functools import partial
 from pathlib import Path
@@ -307,18 +309,34 @@ def _string_fields(fields: object) -> bool:
 
 
 def _replace_file(path: Path, text: str) -> None:
-    """Replace ``path`` with ``text`` atomically: a temp file beside it, then a rename over it."""
-    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    """Replace ``path`` with ``text`` atomically: a temp file beside it, then a rename over it.
+
+    An existing file keeps its mode; a new one gets the mode a plain write would give it.
+    """
+    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
     try:
         with os.fdopen(fd, "w") as f:
-            os.fchmod(f.fileno(), stat.S_IMODE(path.stat().st_mode))
+            with contextlib.suppress(FileNotFoundError):
+                os.fchmod(f.fileno(), stat.S_IMODE(path.stat().st_mode))
             f.write(text)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, path)
     except BaseException:
-        Path(tmp).unlink(missing_ok=True)
+        tmp.unlink(missing_ok=True)
         raise
+
+
+_URI_USERINFO = re.compile(r"(?<=://)[^/?#\s]+@")
+
+
+def _error_text(error: BaseException) -> str:
+    """``error``'s message with the userinfo of every URI in it removed; never raises."""
+    try:
+        return _URI_USERINFO.sub("", str(error))
+    except Exception:
+        return f"<unprintable {type(error).__name__}>"
 
 
 class CheckpointManager:
@@ -414,18 +432,21 @@ class CheckpointManager:
         self._register_committed(step, ckpt_dir)
         self._cleanup()
 
-    def _drain_pending_finalize(self) -> None:
+    def _drain_pending_finalize(self, overwriting: Path | None = None) -> None:
         """Commit a deferred async checkpoint once its flush is durable.
 
         Invoked after the pending DCP future has been awaited (next save()
         or an explicit wait()/flush). Rank 0 performs the symlink + cleanup;
         other ranks no-op (they never touch the symlink), mirroring save().
+        A checkpoint pending in ``overwriting``, the directory a new save's
+        flush is rewriting, is dropped uncommitted and unregistered; that
+        save's own deferred commit points `latest` at it and registers it.
         """
         if self._pending_finalize is None:
             return
         step, ckpt_dir = self._pending_finalize
         self._pending_finalize = None
-        if self._rank == 0:
+        if self._rank == 0 and ckpt_dir != overwriting:
             self._commit_latest(step, ckpt_dir)
 
     def _sync_barrier(self) -> None:
@@ -485,7 +506,9 @@ class CheckpointManager:
             if not all(_string_fields(entry) for entry in merged):
                 raise TypeError("fields must be strings")
         except Exception as e:
-            logger.warning("Could not add the checkpoint fields of step %s: %s", step, e)
+            logger.warning(
+                "Could not add the checkpoint fields of step %s: %s", step, _error_text(e)
+            )
             return tracking
         return merged
 
@@ -504,7 +527,9 @@ class CheckpointManager:
                     tracking = self._with_checkpoint_fields(tracking, meta["step"])
                     return json.dumps({**meta, "tracking": tracking}, indent=2)
             except Exception as e:
-                logger.warning("Could not record the tracking runs in %s: %s", _METADATA_FILE, e)
+                logger.warning(
+                    "Could not record the tracking runs in %s: %s", _METADATA_FILE, _error_text(e)
+                )
         return json.dumps(meta, indent=2)
 
     def _register_committed(self, step: int, ckpt_dir: Path) -> None:
@@ -516,7 +541,11 @@ class CheckpointManager:
                 step, ckpt_dir, partial(self._record, step, ckpt_dir)
             )
         except Exception as e:
-            logger.warning("Could not register %s with the tracking backends: %s", ckpt_dir.name, e)
+            logger.warning(
+                "Could not register %s with the tracking backends: %s",
+                ckpt_dir.name,
+                _error_text(e),
+            )
 
     def _record(self, step: int, ckpt_dir: Path, backend: str, fields: dict[str, str]) -> None:
         """Add ``fields`` to ``backend``'s record in the ``metadata.json`` of step ``step``.
@@ -549,7 +578,9 @@ class CheckpointManager:
                 ]
                 _replace_file(path, json.dumps(meta, indent=2))
         except Exception as e:
-            logger.warning("Could not record the %s fields in %s: %s", backend, path, e)
+            logger.warning(
+                "Could not record the %s fields in %s: %s", backend, path, _error_text(e)
+            )
 
     def save(
         self,
@@ -602,7 +633,7 @@ class CheckpointManager:
         # The prior async checkpoint's flush is now guaranteed durable (the
         # dispatch above awaited it). Commit its `latest` symlink + cleanup
         # before doing anything else.
-        self._drain_pending_finalize()
+        self._drain_pending_finalize(overwriting=ckpt_dir)
 
         # Save non-distributed state (rank 0 only). These are small synchronous
         # writes; they finish well before `latest` is ever pointed here, so
@@ -626,7 +657,7 @@ class CheckpointManager:
                 meta["vlm_freeze"] = extra["vlm_freeze"]
             text = self._sidecar_text(meta)
             with self._sidecar_lock:
-                (ckpt_dir / _METADATA_FILE).write_text(text)
+                _replace_file(ckpt_dir / _METADATA_FILE, text)
 
         if sync_mode:
             # DCP shards are already durable — commit immediately.

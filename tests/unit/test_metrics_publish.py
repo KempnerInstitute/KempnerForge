@@ -553,6 +553,17 @@ class TestPublishMetrics:
         publish_metrics(ckpt, {"a": 1.0})
         assert [m.model_id for m in fake.batches[0].metrics] == ["m-abc"]
 
+    def test_ambient_active_model_refused_when_mlflow_cannot_link_the_sidecar_model_id(
+        self, tmp_path, monkeypatch
+    ):
+        fake = _install_mlflow(
+            monkeypatch, metric_cls=_MetricWithoutModelId, active_model_id="m-ambient"
+        )
+        ckpt = _sidecar(tmp_path, tracking=[_entry(model_id="m-abc")])
+        with pytest.raises(PublishRefused, match="m-ambient"):
+            publish_metrics(ckpt, {"a": 1.0})
+        assert fake.events == [] and fake.batches == []
+
     def test_model_id_is_ignored_with_a_debug_note_when_mlflow_cannot_link(
         self, tmp_path, monkeypatch
     ):
