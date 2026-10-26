@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 import builtins
+import glob
 import importlib.abc
 import importlib.machinery
 import io
+import json
 import logging
 import os
 import sys
 import threading
 import time
 import types
+from contextlib import closing
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -1457,6 +1461,501 @@ class TestRateLimitedWarning:
         warn("again")
         assert len(seen) == 2
         assert seen[1].startswith("again") and "2" in seen[1]
+
+
+# ---------------------------------------------------------------------------
+# Tracking entries: what a checkpoint's metadata.json records about the live runs
+# ---------------------------------------------------------------------------
+
+
+class _FakeWandbRun:
+    """Stand-in wandb run; ``url`` counts its reads, since asking an offline run warns."""
+
+    def __init__(self, *, entity="team", offline=False, disabled=False):
+        self.id = "run-1"
+        self.project = "proj"
+        self.entity = entity
+        self.offline = offline
+        self.disabled = disabled
+        self.url_reads = 0
+
+    @property
+    def url(self):
+        self.url_reads += 1
+        return None if self.offline else "https://tracking.example/team/proj/runs/run-1"
+
+
+def _wandb_backend(monkeypatch, run) -> WandBBackend:
+    """A WandBBackend whose lazy init (the first log) returns ``run`` instead of calling wandb."""
+    import wandb
+
+    monkeypatch.setattr(wandb, "init", lambda **kwargs: run)
+    monkeypatch.setattr(wandb, "log", lambda *args, **kwargs: None)
+    backend = WandBBackend(MetricsConfig(enable_wandb=True, wandb_project="proj"))
+    backend.log({"train/loss": 1.0}, step=1)
+    return backend
+
+
+def _capture_formatted_warnings(monkeypatch) -> list[str]:
+    """Tracker warnings as a handler would format them (messages logged with ``%s`` arguments)."""
+    seen: list[str] = []
+    monkeypatch.setattr(
+        tracker_mod.logger, "warning", lambda msg, *args, **kw: seen.append(msg % args)
+    )
+    return seen
+
+
+class _OnceItems(dict):
+    """A mapping whose items can be listed once."""
+
+    def __init__(self, **items):
+        super().__init__(**items)
+        self._listed = False
+
+    def items(self):
+        if self._listed:
+            raise RuntimeError("items listed twice")
+        self._listed = True
+        return super().items()
+
+
+class _HostileEntry(dict):
+    """A mapping that cannot be inspected."""
+
+    def items(self):
+        raise RuntimeError("cannot list items")
+
+
+class _EntryBackend(tracker_mod._LoggingBackend):
+    """Reports a fixed entry, or raises, so the tracker's aggregation can be driven directly.
+
+    It never tracks its own closure, like a backend that leaves that to the tracker.
+    """
+
+    def __init__(self, entry=None, error=None, close_error=None):
+        self._entry = entry
+        self._error = error
+        self._close_error = close_error
+
+    def log(self, metrics, step):
+        pass
+
+    def tracking_entry(self):
+        if self._error is not None:
+            raise self._error
+        return self._entry
+
+    def close(self):
+        if self._close_error is not None:
+            raise self._close_error
+
+
+class TestTrackingEntries:
+    def test_a_backend_without_a_descriptor_contributes_nothing(self):
+        assert tracker_mod._LoggingBackend().tracking_entry() is None
+
+    # MLflow: the four fields a checkpoint reader needs, or no entry at all
+
+    def test_mlflow_entry_is_exactly_the_four_reader_fields(self, monkeypatch):
+        backend, _ = _init_backend(monkeypatch, _mlflow_cfg())
+        entry = backend.tracking_entry()
+        assert entry == {
+            "backend": "mlflow",
+            "run_id": "run-xyz",
+            "experiment": "exp",
+            "tracking_uri": "http://localhost:5000",
+        }
+        assert all(isinstance(value, str) and value for value in entry.values())
+
+    @pytest.mark.parametrize(
+        ("uri", "shown"),
+        [
+            ("http://user:token@localhost:5000/api", "http://localhost:5000/api"),
+            ("https://u:p@ss@host/x", "https://host/x"),
+            ("https://host?email=a@b", "https://host?email=a@b"),
+            ("http://u:t@host?x=a@b", "http://host?x=a@b"),
+        ],
+    )
+    def test_mlflow_entry_strips_credentials_from_the_uri(self, monkeypatch, uri, shown):
+        backend, _ = _init_backend(monkeypatch, _mlflow_cfg(mlflow_tracking_uri=uri))
+        assert backend.tracking_entry()["tracking_uri"] == shown
+
+    @pytest.mark.parametrize(
+        ("cfg_kwargs", "env", "uri", "experiment"),
+        [
+            (
+                {"mlflow_tracking_uri": "http://localhost:5000", "mlflow_experiment": "exp"},
+                {},
+                "http://localhost:5000",
+                "exp",
+            ),
+            (
+                {},
+                {"MLFLOW_TRACKING_URI": "http://localhost:5001", "MLFLOW_EXPERIMENT": "env-exp"},
+                "http://localhost:5001",
+                "env-exp",
+            ),
+            ({"mlflow_experiment": "/Users/me/p"}, {}, "databricks", "/Users/me/p"),
+        ],
+        ids=["config", "environment", "default-uri"],
+    )
+    def test_mlflow_entry_reports_what_the_backend_resolved(
+        self, monkeypatch, cfg_kwargs, env, uri, experiment
+    ):
+        for name, value in env.items():
+            monkeypatch.setenv(name, value)
+        fm = _FakeMlflow()
+        experiments: list = []
+        fm.set_experiment = experiments.append
+        cfg = MetricsConfig(enable_mlflow=True, mlflow_log_system_metrics=False, **cfg_kwargs)
+        backend, _ = _init_backend(monkeypatch, cfg, fm)
+        entry = backend.tracking_entry()
+        assert entry is not None
+        assert entry["tracking_uri"] == fm.tracking_uris[-1] == uri
+        assert entry["experiment"] == experiments[-1] == experiment
+
+    def test_mlflow_entry_follows_the_run_that_was_actually_started(self, monkeypatch):
+        fm = _FakeMlflow()
+
+        def start_run(run_id=None, run_name=None, log_system_metrics=False):
+            if run_id is not None:
+                raise RuntimeError("RESOURCE_DOES_NOT_EXIST")  # the saved run is gone
+            return types.SimpleNamespace(info=types.SimpleNamespace(run_id="fresh-run"))
+
+        fm.start_run = start_run
+        cfg = _mlflow_cfg(mlflow_run_id="stale-run")
+        backend, _ = _init_backend(monkeypatch, cfg, fm)
+        entry = backend.tracking_entry()
+        assert entry is not None
+        assert entry["run_id"] == "fresh-run" == cfg.mlflow_run_id
+
+    def test_mlflow_has_no_entry_without_a_live_run(self, monkeypatch):
+        backend = MLflowBackend(_mlflow_cfg())
+        assert backend.tracking_entry() is None  # nothing has logged yet, so no run
+        monkeypatch.setitem(sys.modules, "mlflow", None)
+        backend.log({"train/loss": 1.0}, step=1)
+        assert backend._active is False
+        assert backend.tracking_entry() is None  # init failed: no run
+
+        live, _ = _init_backend(monkeypatch, _mlflow_cfg(), _FakeMlflow())
+        assert live.tracking_entry() is not None
+        live.close()
+        assert live.tracking_entry() is None  # the run has ended
+
+    @pytest.mark.parametrize("uri", ["", "   "], ids=["empty", "blank"])
+    def test_mlflow_never_reports_a_partial_entry(self, monkeypatch, uri):
+        backend, _ = _init_backend(monkeypatch, _mlflow_cfg(mlflow_tracking_uri=uri))
+        assert backend._active is True
+        assert backend.tracking_entry() is None  # a blank URI is not one a reader can use
+
+    # WandB: run id and project, plus the entity and URL when the run has them
+
+    def test_wandb_entry_carries_the_run_project_entity_and_url(self, monkeypatch):
+        backend = _wandb_backend(monkeypatch, _FakeWandbRun())
+        assert backend.tracking_entry() == {
+            "backend": "wandb",
+            "run_id": "run-1",
+            "experiment": "proj",
+            "entity": "team",
+            "url": "https://tracking.example/team/proj/runs/run-1",
+        }
+
+    def test_wandb_entry_leaves_out_what_the_run_does_not_have(self, monkeypatch):
+        run = _FakeWandbRun(entity="", offline=True)
+        backend = _wandb_backend(monkeypatch, run)
+        reads = run.url_reads
+        assert backend.tracking_entry() == {
+            "backend": "wandb",
+            "run_id": "run-1",
+            "experiment": "proj",
+        }
+        assert run.url_reads == reads  # an offline run is never asked for its URL
+
+    def test_wandb_has_no_entry_without_a_live_run(self, monkeypatch):
+        assert WandBBackend(MetricsConfig(enable_wandb=True)).tracking_entry() is None
+        assert _wandb_backend(monkeypatch, _FakeWandbRun(disabled=True)).tracking_entry() is None
+
+        monkeypatch.setitem(sys.modules, "wandb", None)
+        backend = WandBBackend(MetricsConfig(enable_wandb=True))
+        backend.log({"train/loss": 1.0}, step=1)
+        assert backend._run is False
+        assert backend.tracking_entry() is None  # wandb is not installed
+
+    def test_wandb_has_no_entry_once_it_is_closed(self, monkeypatch):
+        import wandb
+
+        finished: list = []
+        monkeypatch.setattr(wandb, "finish", lambda *args, **kwargs: finished.append(1))
+        backend = _wandb_backend(monkeypatch, _FakeWandbRun())
+        assert backend.tracking_entry() is not None
+        backend.close()
+        assert finished == [1]
+        assert backend.tracking_entry() is None  # the run has finished
+
+    # TensorBoard: the log directory once the writer is open
+
+    def test_tensorboard_entry_names_the_log_dir_once_the_writer_is_open(self, tmp_path):
+        pytest.importorskip("tensorboard")
+        log_dir = str(tmp_path / "tb")
+        config = MetricsConfig(enable_tensorboard=True, tensorboard_dir=log_dir)
+        with closing(TensorBoardBackend(config)) as backend:
+            assert backend.tracking_entry() is None
+            backend.log({"train/loss": 2.5}, step=1)
+            assert backend.tracking_entry() == {"backend": "tensorboard", "log_dir": log_dir}
+            backend.close()
+            assert backend.tracking_entry() is None  # the writer is closed
+
+    def test_tensorboard_entry_names_the_directory_the_writer_chose(self, tmp_path, monkeypatch):
+        pytest.importorskip("tensorboard")
+        monkeypatch.chdir(tmp_path)  # an empty setting makes the writer create runs/<stamp> here
+        config = MetricsConfig(enable_tensorboard=True, tensorboard_dir="")
+        with closing(TensorBoardBackend(config)) as backend:
+            backend.log({"train/loss": 2.5}, step=1)
+            entry = backend.tracking_entry()
+            assert entry is not None
+            assert entry["log_dir"] == backend._writer.get_logdir()
+            assert entry["log_dir"].startswith("runs")
+            assert os.path.isdir(entry["log_dir"])
+
+    def test_tensorboard_entry_is_a_string_even_for_a_path_setting(self, tmp_path):
+        pytest.importorskip("tensorboard")
+        config = MetricsConfig(enable_tensorboard=True, tensorboard_dir=tmp_path / "tb")  # type: ignore[arg-type]
+        with closing(TensorBoardBackend(config)) as backend:
+            backend.log({"train/loss": 2.5}, step=1)
+            assert backend.tracking_entry() == {
+                "backend": "tensorboard",
+                "log_dir": str(tmp_path / "tb"),
+            }
+
+    @pytest.mark.parametrize(
+        "setting",
+        ["rel_dir", Path("path_dir"), b"bytes_dir", 7],
+        ids=["str", "path", "bytes", "number"],
+    )
+    def test_tensorboard_entry_is_where_the_event_files_are_written(
+        self, tmp_path, monkeypatch, setting
+    ):
+        pytest.importorskip("tensorboard")
+        monkeypatch.chdir(tmp_path)  # relative settings create their directory here
+        config = MetricsConfig(enable_tensorboard=True, tensorboard_dir=setting)  # type: ignore[arg-type]
+        with closing(TensorBoardBackend(config)) as backend:
+            backend.log({"train/loss": 2.5}, step=1)
+            entry = backend.tracking_entry()
+            assert entry is not None
+            written = {os.path.dirname(p) for p in glob.glob("**/*tfevents*", recursive=True)}
+            assert written == {entry["log_dir"]}
+
+    @pytest.mark.parametrize(
+        ("reported", "log_dir"),
+        [
+            ("logs/run", "logs/run"),
+            (Path("logs/run"), "logs/run"),
+            (" ", " "),
+            (b"logs/run", "b'logs/run'"),
+            (7, "7"),
+            ("", None),
+            (None, None),
+        ],
+        ids=["str", "path", "blank", "bytes", "number", "empty", "none"],
+    )
+    def test_tensorboard_entry_keeps_only_what_is_a_directory(self, reported, log_dir):
+        backend = TensorBoardBackend(MetricsConfig(enable_tensorboard=True))
+        backend._writer = types.SimpleNamespace(get_logdir=lambda: reported)
+        expected = None if log_dir is None else {"backend": "tensorboard", "log_dir": log_dir}
+        assert backend.tracking_entry() == expected
+
+    def test_tensorboard_has_no_entry_when_it_is_not_installed(self, monkeypatch):
+        monkeypatch.setitem(sys.modules, "torch.utils.tensorboard", None)
+        backend = TensorBoardBackend(MetricsConfig(enable_tensorboard=True))
+        backend.log({"train/loss": 1.0}, step=1)
+        assert backend._writer is False
+        assert backend.tracking_entry() is None
+
+    # The tracker lists every backend that has one
+
+    def _tracker(self) -> MetricsTracker:
+        model = ModelConfig(dim=128, n_layers=2, n_heads=2, vocab_size=256)
+        return MetricsTracker(JobConfig(model=model, metrics=MetricsConfig()), num_gpus=1)
+
+    def test_tracker_lists_the_live_backends_in_order_and_skips_the_rest(self):
+        tracker = self._tracker()
+        first = {"backend": "first"}
+        last = {"backend": "last"}
+        tracker._backends = [_EntryBackend(first), _EntryBackend(), _EntryBackend(last)]
+        assert tracker.tracking_entries() == [first, last]
+        assert self._tracker().tracking_entries() == []
+
+    def test_tracker_skips_a_backend_that_cannot_describe_itself(self, monkeypatch):
+        seen = _capture_formatted_warnings(monkeypatch)
+        tracker = self._tracker()
+        kept = {"backend": "kept"}
+        tracker._backends = [_EntryBackend(error=RuntimeError("boom")), _EntryBackend(kept)]
+        assert tracker.tracking_entries() == [kept]
+        assert len(seen) == 1 and "_EntryBackend" in seen[0] and "boom" in seen[0]
+
+    def test_tracker_skips_a_backend_whose_error_cannot_be_printed(self, monkeypatch):
+        class Unprintable(Exception):
+            def __str__(self):
+                raise RuntimeError("no message")
+
+        monkeypatch.setattr(logging, "raiseExceptions", False)  # a logging error is not raised
+        tracker = self._tracker()
+        kept = {"backend": "kept"}
+        tracker._backends = [_EntryBackend(error=Unprintable()), _EntryBackend(kept)]
+        assert tracker.tracking_entries() == [kept]
+
+    def test_tracker_scrubs_credentials_from_a_backends_error(self, monkeypatch):
+        seen = _capture_formatted_warnings(monkeypatch)
+        tracker = self._tracker()
+        error = RuntimeError("no answer from https://u:tok@host/api")
+        tracker._backends = [_EntryBackend(error=error)]
+        assert tracker.tracking_entries() == []
+        assert len(seen) == 1 and "u:tok@" not in seen[0] and "https://host/api" in seen[0]
+
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            ["backend"],
+            {},
+            {"run_id": "r"},
+            {"backend": ""},
+            {"backend": "  "},
+            {"backend": "x", "log_dir": Path("somewhere")},
+            {"backend": "x", "step": 3},
+            {"backend": "x", 1: "one"},
+            _HostileEntry(backend="x"),
+        ],
+        ids=[
+            "list",
+            "empty",
+            "no-backend",
+            "empty-backend",
+            "blank-backend",
+            "path",
+            "number",
+            "key",
+            "hostile",
+        ],
+    )
+    def test_tracker_skips_an_entry_a_checkpoint_could_not_hold(self, monkeypatch, bad):
+        seen = _capture_formatted_warnings(monkeypatch)
+        tracker = self._tracker()
+        kept = {"backend": "kept", "run_id": "r"}
+        tracker._backends = [_EntryBackend(bad), _EntryBackend(kept)]
+        assert tracker.tracking_entries() == [kept]  # one bad backend does not cost the others
+        assert len(seen) == 1 and "_EntryBackend" in seen[0]
+
+    def test_tracker_keeps_a_blank_field_that_is_not_the_backend_name(self):
+        entry = {"backend": "tensorboard", "log_dir": "   "}  # a directory can be named so
+        tracker = self._tracker()
+        tracker._backends = [_EntryBackend(entry)]
+        assert tracker.tracking_entries() == [entry]
+        assert json.loads(json.dumps(tracker.tracking_entries())) == [entry]
+
+    def test_tracker_copies_each_entry_once_into_a_plain_dict(self):
+        once = _OnceItems(backend="lazy", run_id="r")  # a mapping that cannot be read twice
+        tracker = self._tracker()
+        tracker._backends = [_EntryBackend(once), _EntryBackend({"backend": "kept"})]
+        entries = tracker.tracking_entries()
+        assert entries == [{"backend": "lazy", "run_id": "r"}, {"backend": "kept"}]
+        assert type(entries[0]) is dict
+        json.dumps(entries)  # what the checkpoint writes cannot go back to the original
+
+    def test_tracker_reports_nothing_once_closed(self):
+        tracker = self._tracker()
+        tracker._backends = [_EntryBackend({"backend": "live"})]
+        assert tracker.tracking_entries() == [{"backend": "live"}]
+        tracker.close()
+        assert tracker.tracking_entries() == []  # whatever the backend itself reports
+
+    def test_tracker_reports_nothing_after_a_close_that_fails_part_way(self):
+        tracker = self._tracker()
+        tracker._backends = [
+            _EntryBackend({"backend": "first"}, close_error=RuntimeError("teardown")),
+            _EntryBackend({"backend": "later"}),
+        ]
+        with pytest.raises(RuntimeError, match="teardown"):
+            tracker.close()
+        assert tracker.tracking_entries() == []
+
+    def test_tracker_closed_before_its_backends_started_stays_empty(self, tmp_path):
+        pytest.importorskip("tensorboard")
+        config = JobConfig(
+            model=ModelConfig(dim=128, n_layers=2, n_heads=2, vocab_size=256),
+            metrics=MetricsConfig(enable_tensorboard=True, tensorboard_dir=str(tmp_path / "tb")),
+        )
+        tracker = MetricsTracker(config, num_gpus=1)
+        tracker.init_backends(config)
+        try:
+            tracker.close()
+            tracker.log_eval({"eval/loss": 1.0}, step=1)  # a late log still starts the writer
+            assert tracker._backends[0].tracking_entry() is not None
+            assert tracker.tracking_entries() == []
+        finally:
+            tracker._backends[0].close()
+
+    def test_other_ranks_hold_no_backends_so_report_nothing(self, monkeypatch):
+        monkeypatch.setattr(dist, "is_initialized", lambda: True)
+        monkeypatch.setattr(dist, "get_rank", lambda: 1)
+        config = JobConfig(
+            model=ModelConfig(dim=128, n_layers=2, n_heads=2, vocab_size=256),
+            metrics=MetricsConfig(enable_tensorboard=True),
+        )
+        tracker = MetricsTracker(config, num_gpus=1)
+        tracker.init_backends(config)
+        assert tracker.tracking_entries() == []
+
+    def test_every_active_backend_of_a_run_is_listed(self, monkeypatch, tmp_path):
+        pytest.importorskip("tensorboard")
+        monkeypatch.setitem(sys.modules, "mlflow", _FakeMlflow())
+        import wandb
+
+        monkeypatch.setattr(wandb, "init", lambda **kwargs: _FakeWandbRun())
+        monkeypatch.setattr(wandb, "log", lambda *args, **kwargs: None)
+        monkeypatch.setattr(wandb, "finish", lambda *args, **kwargs: None)
+        config = JobConfig(
+            model=ModelConfig(dim=128, n_layers=2, n_heads=2, vocab_size=256),
+            metrics=_mlflow_cfg(
+                enable_wandb=True,
+                wandb_project="proj",
+                enable_tensorboard=True,
+                tensorboard_dir=str(tmp_path / "tb"),
+            ),
+        )
+        tracker = MetricsTracker(config, num_gpus=1)
+        tracker.init_backends(config)
+        try:
+            assert tracker.tracking_entries() == []  # every backend starts its run on its first log
+
+            tracker.log_eval({"eval/loss": 1.0}, step=1)
+            entries = tracker.tracking_entries()
+            assert [entry["backend"] for entry in entries] == ["wandb", "tensorboard", "mlflow"]
+            assert entries[-1] == {
+                "backend": "mlflow",
+                "run_id": "run-xyz",
+                "experiment": "exp",
+                "tracking_uri": "http://localhost:5000",
+            }
+        finally:
+            tracker.close()
+        assert tracker.tracking_entries() == []  # every run has ended
+
+    def test_a_backend_without_a_live_run_is_left_out_of_a_multi_backend_run(
+        self, monkeypatch, tmp_path
+    ):
+        pytest.importorskip("tensorboard")
+        monkeypatch.setitem(sys.modules, "mlflow", None)  # not installed: its init fails
+        config = JobConfig(
+            model=ModelConfig(dim=128, n_layers=2, n_heads=2, vocab_size=256),
+            metrics=_mlflow_cfg(enable_tensorboard=True, tensorboard_dir=str(tmp_path / "tb")),
+        )
+        tracker = MetricsTracker(config, num_gpus=1)
+        tracker.init_backends(config)
+        try:
+            tracker.log_eval({"eval/loss": 1.0}, step=1)
+            assert [entry["backend"] for entry in tracker.tracking_entries()] == ["tensorboard"]
+        finally:
+            tracker.close()
 
 
 class TestTensorBoardBackend:

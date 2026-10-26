@@ -14,7 +14,7 @@ import logging
 import os
 import shutil
 import stat
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any, cast
 
@@ -51,6 +51,8 @@ _OPTIM_PARAM_GROUPS_PREFIX = "optimizer.param_groups."
 _NEVER_STEPPED_KEY = "optimizer_never_stepped"
 _NEVER_STEPPED_PREFIX = f"{_NEVER_STEPPED_KEY}."
 _OPTIM_PREFIX = "optimizer."
+# Reports the logging runs live at save time, one JSON-ready record each, for metadata.json.
+TrackingSource = Callable[[], list[dict[str, str]]]
 
 
 def _saved_optimizer_param_groups(saved_keys: Iterable[str]) -> int:
@@ -241,6 +243,16 @@ def _load_train_state(path: Path) -> dict[str, Any]:
     return torch.load(path, map_location="cpu", weights_only=False)
 
 
+def _names_backends(tracking: object) -> bool:
+    """True for a list of mappings that each name a ``backend``, the shape readers select on."""
+    return isinstance(tracking, list) and all(
+        isinstance(entry, dict)
+        and isinstance(entry.get("backend"), str)
+        and entry["backend"].strip()
+        for entry in tracking
+    )
+
+
 class CheckpointManager:
     """Manages save/load/cleanup of distributed checkpoints.
 
@@ -284,6 +296,8 @@ class CheckpointManager:
         # the flush completes (drained at the next save() or wait()), so
         # `latest` never points at a half-written checkpoint. (step, ckpt_dir).
         self._pending_finalize: tuple[int, Path] | None = None
+        # Late-bound because the tracker is built after the manager; see set_tracking_source().
+        self._tracking_source: TrackingSource | None = None
         # Dedicated gloo group for the manager's own synchronization
         # (the end-of-save barrier). dcp.async_save() runs its collective
         # planning (all_gather/reduce_scatter) on a background thread using
@@ -353,6 +367,36 @@ class CheckpointManager:
         """
         if dist.is_initialized():
             dist.barrier(group=self._sync_group)
+
+    def set_tracking_source(self, source: TrackingSource | None) -> None:
+        """Record the logging runs ``source`` reports in every later ``metadata.json``.
+
+        ``source`` returns one JSON-ready record per live run, and is called on rank 0 only,
+        inside ``save()``, so it must return promptly. The ``tracking`` key is omitted when it
+        reports none, raises, or returns what JSON cannot write. ``None`` detaches it.
+        """
+        if source is not None and not callable(source):
+            raise TypeError(
+                f"tracking source must be callable or None, got {type(source).__name__}"
+            )
+        self._tracking_source = source
+
+    def _sidecar_text(self, meta: dict[str, Any]) -> str:
+        """``meta`` as JSON, plus the live tracking runs when the source can supply them.
+
+        Everything that depends on the source sits inside one guard: it runs on rank 0 alone,
+        so a raise here would strand the other ranks. A bad source costs the ``tracking`` key.
+        """
+        if self._tracking_source is not None:
+            try:
+                tracking = self._tracking_source()
+                if tracking:
+                    if not _names_backends(tracking):
+                        raise TypeError("expected a list of mappings that each name a backend")
+                    return json.dumps({**meta, "tracking": tracking}, indent=2)
+            except Exception as e:
+                logger.warning("Could not record the tracking runs in %s: %s", _METADATA_FILE, e)
+        return json.dumps(meta, indent=2)
 
     def save(
         self,
@@ -427,7 +471,7 @@ class CheckpointManager:
                 # a sorted, deduplicated list of {"module", "frozen"} dicts so
                 # the comparison on load is reorder-invariant.
                 meta["vlm_freeze"] = extra["vlm_freeze"]
-            (ckpt_dir / _METADATA_FILE).write_text(json.dumps(meta, indent=2))
+            (ckpt_dir / _METADATA_FILE).write_text(self._sidecar_text(meta))
 
         if sync_mode:
             # DCP shards are already durable — commit immediately.
