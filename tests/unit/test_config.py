@@ -342,6 +342,13 @@ class TestDistributedConfig:
         with pytest.raises(ValueError, match="cp=2 is not supported"):
             DistributedConfig(dp_shard=4, cp=2)
 
+    def test_rejects_context_parallel_set_after_construction(self):
+        """A cp changed after construction is rejected when resolve() rebuilds the config."""
+        config = DistributedConfig()
+        config.cp = 2
+        with pytest.raises(ValueError, match="cp=2 is not supported"):
+            config.resolve(world_size=8)
+
     def test_rejects_context_parallel_at_load(self, tmp_path):
         """A TOML key or CLI override fails at load, before any distributed init."""
         toml = tmp_path / "cp.toml"
