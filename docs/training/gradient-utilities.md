@@ -82,6 +82,25 @@ Algorithm:
 Returns the **pre-clip** total norm as a scalar tensor — the value you
 log as `grad_norm` in metrics.
 
+### Under pipeline parallelism
+
+Each PP rank holds one stage, and a stage's own norm is not the model's.
+Pass the stages' process group as `pp_group`:
+
+```python
+grad_norm = clip_grad_norm_(stage, tc.grad_clip_norm, pp_group=device_mesh["pp"].get_group())
+```
+
+Each stage computes its sum of squares as in step 4, the sums are added
+over `pp_group`, and every stage scales by the coefficient of that
+whole-model norm. The clipped model then has norm `max_norm`, and every
+stage returns, and logs, the same pre-clip norm. Clipping each stage on
+its own instead leaves the model at `sqrt(pp) × max_norm` when every
+stage is above the threshold, and the different coefficients change the
+update's direction, not only its length. Every stage must make the
+call, including one without gradients, since the sum is a collective.
+`pipeline_step` in `training/loop.py` passes the group.
+
 ### `foreach` parameter
 
 `clip_grad_norm_(..., foreach=True)` is the default — faster on CUDA
