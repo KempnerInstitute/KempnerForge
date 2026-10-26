@@ -267,6 +267,13 @@ class TestTrainConfig:
         with pytest.raises(ValueError, match="'fp16' is not supported"):
             load_config(cli_args=["--train.mixed_precision=fp16"])
 
+    def test_fp16_set_after_construction_fails_in_param_dtype(self) -> None:
+        """Setting fp16 later skips __post_init__, so param_dtype raises the same error."""
+        config = TrainConfig()
+        config.mixed_precision = "fp16"
+        with pytest.raises(ValueError, match="'fp16' is not supported: .*no loss scaling"):
+            _ = config.param_dtype
+
     def test_data_seed_defaults_to_none(self):
         assert TrainConfig().data_seed is None
 
