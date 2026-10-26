@@ -30,7 +30,7 @@ optimizer.step() ; scheduler.step() ; optimizer.zero_grad()
 tracker.end_step(step, loss, grad_norm, lr, tokens_in_step)
 hook_runner.on_step_end(StepContext(...))
 [every N steps] eval, NCCL health, profiler.step, ckpt_mgr.save
-if shutdown_handler.should_shutdown(): save + break
+if shutdown_handler.should_shutdown(): save (unless saved above) + break
 ```
 
 ## Startup, once
@@ -232,7 +232,8 @@ In order:
   writes a DCP checkpoint asynchronously and updates the `latest`
   symlink.
 - **Graceful shutdown** — if SIGTERM/SIGUSR1 fired,
-  `ckpt_mgr.save(emergency)` and exit.
+  `ckpt_mgr.save(emergency)` and exit; a step the checkpoint above
+  already saved is not saved again.
 
 ## Shutdown
 
