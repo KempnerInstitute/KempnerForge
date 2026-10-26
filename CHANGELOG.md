@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **MLflow eval publisher** (`python -m kempnerforge.metrics.publish <checkpoint_dir> --metrics <json>`): appends `eval/<name>` metrics at the checkpoint's step to the MLflow run recorded in its `metadata.json` `tracking` block, never starts or ends a run, and refuses when that block lacks a usable mlflow entry.
 - **Exact Muon orthogonalization for sharded weights** (`optimizer.muon_orthogonalize = "exact"`). The default `"local"` runs Newton-Schulz on each rank's shard and scales it by the shard's shape, which keeps the update's RMS but not its direction: the result is not the full-matrix one and changes with the shard count. `"exact"` gathers each row-sharded matrix onto one rank of its shard group with an all-to-all, orthogonalizes it there, scatters it back and scales it by the full matrix's shape, so the update is bitwise the single-process one and each matrix's work runs once. Other sharded layouts are all-gathered.
   - `kempnerforge/training/orthogonalize.py` (new): `orthogonalize_exact`.
   - `pyproject.toml`: coverage follows the processes tests spawn (`concurrency = ["multiprocessing", "thread"]`, `parallel = true`), since pytest-cov 7 no longer does, so the gloo tests count toward coverage.
