@@ -1283,6 +1283,26 @@ class TestSaveCheckpointRegistration:
             "train_state.pt",
         ]
 
+    def test_a_replacement_never_opens_wider_than_the_sidecar_it_replaces(
+        self, tmp_path, monkeypatch
+    ):
+        _, registrar = self._registered(tmp_path, monkeypatch, {"mlflow": {"model_name": "m"}})
+        sidecar = tmp_path / "step_1" / "metadata.json"
+        sidecar.chmod(0o600)
+        created: list = []
+        real_open = os.open
+
+        def spy(path, flags, mode=0o777, *args, **kwargs):
+            if flags & os.O_CREAT:
+                created.append(mode)
+            return real_open(path, flags, mode, *args, **kwargs)
+
+        monkeypatch.setattr(os, "open", spy)
+        registrar.records[0]("mlflow", {"model_id": "m-1"})
+        assert created == [0o600]
+        assert stat.S_IMODE(sidecar.stat().st_mode) == 0o600
+        assert json.loads(sidecar.read_text())["tracking"][1]["model_id"] == "m-1"
+
     @pytest.mark.parametrize("failing", ["fsync", "replace"])
     def test_a_failed_amend_leaves_the_sidecar_whole_and_never_raises(
         self, tmp_path, monkeypatch, failing

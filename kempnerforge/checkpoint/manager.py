@@ -9,7 +9,6 @@ separately as a torch file and broadcast from rank 0 on load.
 
 from __future__ import annotations
 
-import contextlib
 import json
 import logging
 import os
@@ -311,14 +310,19 @@ def _string_fields(fields: object) -> bool:
 def _replace_file(path: Path, text: str) -> None:
     """Replace ``path`` with ``text`` atomically: a temp file beside it, then a rename over it.
 
-    An existing file keeps its mode; a new one gets the mode a plain write would give it.
+    An existing file keeps its mode, and its replacement is never readable more widely while it is
+    written; a new one gets the mode a plain write would give it.
     """
+    try:
+        mode: int | None = stat.S_IMODE(path.stat().st_mode)
+    except FileNotFoundError:
+        mode = None
     tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666 if mode is None else 0o600)
     try:
         with os.fdopen(fd, "w") as f:
-            with contextlib.suppress(FileNotFoundError):
-                os.fchmod(f.fileno(), stat.S_IMODE(path.stat().st_mode))
+            if mode is not None:
+                os.fchmod(f.fileno(), mode)
             f.write(text)
             f.flush()
             os.fsync(f.fileno())
