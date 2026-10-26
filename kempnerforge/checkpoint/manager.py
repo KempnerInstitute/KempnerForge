@@ -9,13 +9,14 @@ separately as a torch file and broadcast from rank 0 on load.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
 import shutil
 import stat
-import tempfile
 import threading
+import uuid
 from collections.abc import Callable, Container, Iterable
 from functools import partial
 from pathlib import Path
@@ -307,17 +308,22 @@ def _string_fields(fields: object) -> bool:
 
 
 def _replace_file(path: Path, text: str) -> None:
-    """Replace ``path`` with ``text`` atomically: a temp file beside it, then a rename over it."""
-    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    """Replace ``path`` with ``text`` atomically: a temp file beside it, then a rename over it.
+
+    An existing file keeps its mode; a new one gets the mode a plain write would give it.
+    """
+    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
     try:
         with os.fdopen(fd, "w") as f:
-            os.fchmod(f.fileno(), stat.S_IMODE(path.stat().st_mode))
+            with contextlib.suppress(FileNotFoundError):
+                os.fchmod(f.fileno(), stat.S_IMODE(path.stat().st_mode))
             f.write(text)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, path)
     except BaseException:
-        Path(tmp).unlink(missing_ok=True)
+        tmp.unlink(missing_ok=True)
         raise
 
 
@@ -629,7 +635,7 @@ class CheckpointManager:
                 meta["vlm_freeze"] = extra["vlm_freeze"]
             text = self._sidecar_text(meta)
             with self._sidecar_lock:
-                (ckpt_dir / _METADATA_FILE).write_text(text)
+                _replace_file(ckpt_dir / _METADATA_FILE, text)
 
         if sync_mode:
             # DCP shards are already durable — commit immediately.

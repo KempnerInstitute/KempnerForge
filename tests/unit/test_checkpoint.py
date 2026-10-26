@@ -1268,6 +1268,35 @@ class TestSaveCheckpointRegistration:
         ]
         assert len(warnings) == 1 and "mlflow" in warnings[0] and "disk full" in warnings[0]
 
+    @pytest.mark.parametrize("failing", ["fsync", "replace"])
+    def test_a_failed_rewrite_of_a_saved_step_leaves_its_sidecar_whole(
+        self, tmp_path, monkeypatch, failing
+    ):
+        mgr, _ = self._registered(tmp_path, monkeypatch)
+        sidecar = tmp_path / "step_1" / "metadata.json"
+        before = sidecar.read_bytes()
+
+        def refuse(*args):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(os, failing, refuse)
+        with pytest.raises(OSError, match="disk full"):
+            mgr.save(step=1, tokens_seen=16)
+        assert sidecar.read_bytes() == before
+        assert sorted(p.name for p in sidecar.parent.iterdir()) == [
+            "metadata.json",
+            "train_state.pt",
+        ]
+
+    def test_a_new_sidecar_gets_the_mode_of_a_plain_write(self, tmp_path, monkeypatch):
+        self._registered(tmp_path, monkeypatch)
+        step_dir = tmp_path / "step_1"
+        modes = {
+            stat.S_IMODE((step_dir / name).stat().st_mode)
+            for name in ("metadata.json", "train_state.pt")
+        }
+        assert len(modes) == 1
+
     def test_record_skips_quietly_when_the_checkpoint_or_its_record_is_gone(
         self, tmp_path, monkeypatch
     ):
@@ -1321,22 +1350,16 @@ class TestSaveCheckpointRegistration:
         lock = _HeldLock()
         mgr._sidecar_lock = lock  # type: ignore[assignment]
         held: list = []
-        write_text, replace, rmtree = Path.write_text, os.replace, mgr_mod.shutil.rmtree
+        replace, rmtree = os.replace, mgr_mod.shutil.rmtree
 
-        def written(path, *args, **kwargs):
-            if path.name == "metadata.json":
-                held.append(("write", lock.held))
-            return write_text(path, *args, **kwargs)
+        def replaced(src, dst):
+            held.append((Path(dst).parent.name, lock.held))
+            return replace(src, dst)
 
-        def replaced(*args):
-            held.append(("replace", lock.held))
-            return replace(*args)
+        def removed(path, *args, **kwargs):
+            held.append((f"remove {Path(path).name}", lock.held))
+            return rmtree(path, *args, **kwargs)
 
-        def removed(*args, **kwargs):
-            held.append(("remove", lock.held))
-            return rmtree(*args, **kwargs)
-
-        monkeypatch.setattr(Path, "write_text", written)
         monkeypatch.setattr(os, "replace", replaced)
         monkeypatch.setattr(mgr_mod.shutil, "rmtree", removed)
         registrar = _Registrar()
@@ -1345,7 +1368,12 @@ class TestSaveCheckpointRegistration:
         mgr.save(step=1)
         registrar.records[0]("mlflow", {"model_id": "m-1"})
         mgr.save(step=2)
-        assert held == [("write", True), ("replace", True), ("write", True), ("remove", True)]
+        assert held == [
+            ("step_1", True),
+            ("step_1", True),
+            ("step_2", True),
+            ("remove step_1", True),
+        ]
 
     def test_trackers_fields_and_registration_reach_the_sidecar_by_backend_name(
         self, tmp_path, monkeypatch
