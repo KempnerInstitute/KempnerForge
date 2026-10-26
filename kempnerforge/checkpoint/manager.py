@@ -13,6 +13,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import shutil
 import stat
 import threading
@@ -327,6 +328,17 @@ def _replace_file(path: Path, text: str) -> None:
         raise
 
 
+_URI_USERINFO = re.compile(r"(?<=://)[^/?#\s]+@")
+
+
+def _error_text(error: BaseException) -> str:
+    """``error``'s message with the userinfo of every URI in it removed; never raises."""
+    try:
+        return _URI_USERINFO.sub("", str(error))
+    except Exception:
+        return f"<unprintable {type(error).__name__}>"
+
+
 class CheckpointManager:
     """Manages save/load/cleanup of distributed checkpoints.
 
@@ -494,7 +506,9 @@ class CheckpointManager:
             if not all(_string_fields(entry) for entry in merged):
                 raise TypeError("fields must be strings")
         except Exception as e:
-            logger.warning("Could not add the checkpoint fields of step %s: %s", step, e)
+            logger.warning(
+                "Could not add the checkpoint fields of step %s: %s", step, _error_text(e)
+            )
             return tracking
         return merged
 
@@ -513,7 +527,9 @@ class CheckpointManager:
                     tracking = self._with_checkpoint_fields(tracking, meta["step"])
                     return json.dumps({**meta, "tracking": tracking}, indent=2)
             except Exception as e:
-                logger.warning("Could not record the tracking runs in %s: %s", _METADATA_FILE, e)
+                logger.warning(
+                    "Could not record the tracking runs in %s: %s", _METADATA_FILE, _error_text(e)
+                )
         return json.dumps(meta, indent=2)
 
     def _register_committed(self, step: int, ckpt_dir: Path) -> None:
@@ -525,7 +541,11 @@ class CheckpointManager:
                 step, ckpt_dir, partial(self._record, step, ckpt_dir)
             )
         except Exception as e:
-            logger.warning("Could not register %s with the tracking backends: %s", ckpt_dir.name, e)
+            logger.warning(
+                "Could not register %s with the tracking backends: %s",
+                ckpt_dir.name,
+                _error_text(e),
+            )
 
     def _record(self, step: int, ckpt_dir: Path, backend: str, fields: dict[str, str]) -> None:
         """Add ``fields`` to ``backend``'s record in the ``metadata.json`` of step ``step``.
@@ -558,7 +578,9 @@ class CheckpointManager:
                 ]
                 _replace_file(path, json.dumps(meta, indent=2))
         except Exception as e:
-            logger.warning("Could not record the %s fields in %s: %s", backend, path, e)
+            logger.warning(
+                "Could not record the %s fields in %s: %s", backend, path, _error_text(e)
+            )
 
     def save(
         self,

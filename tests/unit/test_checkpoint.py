@@ -1220,6 +1220,42 @@ class TestSaveCheckpointRegistration:
         assert self._sidecar(tmp_path, 2)["tracking"] == [self.MLFLOW]
         assert len(warnings) == 2 and "step_2" in warnings[1] and "no server" in warnings[1]
 
+    @pytest.mark.parametrize("failing", ["fields", "register", "record", "source"])
+    def test_logged_failures_carry_no_uri_credentials(self, tmp_path, monkeypatch, failing):
+        error = RuntimeError("POST https://user:secret@tracking.example/api failed")
+
+        def raises(*args):
+            raise error
+
+        warnings = self._log(monkeypatch, "warning")
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        registrar = _Registrar(
+            raises if failing == "fields" else None, error if failing == "register" else None
+        )
+        mgr.set_tracking_source(raises if failing == "source" else lambda: [self.MLFLOW])
+        mgr.set_checkpoint_registrar(registrar)
+        mgr.save(step=1)
+        if failing == "record":
+            monkeypatch.setattr(os, "replace", raises)
+            registrar.records[0]("mlflow", {"model_id": "m-1"})
+        assert len(warnings) == 1 and "POST https://tracking.example/api failed" in warnings[0]
+        assert "user:secret@" not in warnings[0]
+
+    def test_an_unprintable_registrar_error_costs_only_the_registration(
+        self, tmp_path, monkeypatch
+    ):
+        class Unprintable(Exception):
+            def __str__(self):
+                raise RuntimeError("no text")
+
+        warnings = self._log(monkeypatch, "warning")
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        mgr.set_tracking_source(lambda: [self.MLFLOW])
+        mgr.set_checkpoint_registrar(_Registrar(error=Unprintable()))
+        mgr.save(step=1)
+        assert (tmp_path / "latest").resolve() == (tmp_path / "step_1").resolve()
+        assert len(warnings) == 1 and "<unprintable Unprintable>" in warnings[0]
+
     def test_record_amends_one_record_atomically_through_a_temp_file(self, tmp_path, monkeypatch):
         _, registrar = self._registered(tmp_path, monkeypatch, {"mlflow": {"model_name": "m"}})
         sidecar = tmp_path / "step_1" / "metadata.json"
