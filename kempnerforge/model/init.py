@@ -12,12 +12,6 @@ from kempnerforge.model.mot import MoTAttention, MoTBlock
 from kempnerforge.model.norm import RMSNorm
 from kempnerforge.model.router import SigmoidTopKRouter
 
-# Modules holding construction-time state that ``to_empty`` discards and the
-# parameter loop below cannot reach: one-dimensional parameters and buffers.
-# Only these are reset, and only through deterministic fills. A blanket
-# ``reset_parameters()`` over every module would let ``nn.Linear`` overwrite the
-# initialisation below with its own, and would consume RNG, which can leave
-# replicas disagreeing across ranks.
 _RESETS_OWN_STATE = (RMSNorm, nn.LayerNorm, SigmoidTopKRouter)
 
 
@@ -33,6 +27,11 @@ def init_weights(model: nn.Module, config: ModelConfig) -> None:
     - MoT per-modality residual projections: zero-initialized (identity-at-construction)
     - Norm layers and the sigmoid router's own state: reset to their
       construction-time values, which a meta-device build does not preserve
+
+    Only the modules in ``_RESETS_OWN_STATE`` are reset, and only with deterministic
+    fills: a blanket ``reset_parameters()`` would also run ``nn.Linear``'s kaiming
+    init, which draws from the RNG and changes every weight drawn after it for the
+    same seed.
     """
     std = config.init_std
     residual_scale = 1.0 / math.sqrt(2.0 * config.n_layers)

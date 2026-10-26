@@ -1188,9 +1188,9 @@ class TestInitWeights:
     def test_materialized_state_matches_a_constructed_model(self, overrides):
         """A meta build must end up where a direct build starts.
 
-        ``to_empty`` replaces every parameter and buffer with uninitialised
+        ``to_empty`` replaces every parameter and buffer with uninitialized
         memory. Anything set in a constructor rather than by ``init_weights``
-        -- norm weights, the sigmoid router's bias, its utilisation buffer --
+        -- norm weights, the sigmoid router's bias, its utilization buffer --
         keeps that memory unless something restores it.
 
         The poison step is load-bearing. Freed blocks often still hold the
@@ -1210,11 +1210,10 @@ class TestInitWeights:
         model.init_weights_and_freqs()
 
         for name, param in model.named_parameters():
-            assert torch.isfinite(param).all(), f"{name} left uninitialised"
+            assert torch.isfinite(param).all(), f"{name} left uninitialized"
         for name, buf in model.named_buffers():
-            assert torch.isfinite(buf).all(), f"buffer {name} left uninitialised"
+            assert torch.isfinite(buf).all(), f"buffer {name} left uninitialized"
 
-        # Constructor-set state is deterministic, so it must match exactly.
         ref_params = dict(reference.named_parameters())
         for name, param in model.named_parameters():
             if param.dim() < 2:
