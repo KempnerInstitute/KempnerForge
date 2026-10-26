@@ -118,6 +118,72 @@ def _check_sharded_stage(rank: int, world: int, port: int) -> None:
         dist.destroy_process_group()
 
 
+def _check_pipeline_step(rank: int, world: int, port: int) -> None:
+    """A real 1F1B step with FSDP2 on pp=2 x dp_shard=2, clipped, against one process."""
+    import torch.nn.functional as F
+    from torch.distributed.fsdp import MixedPrecisionPolicy
+
+    from kempnerforge.config.schema import ModelConfig
+    from kempnerforge.distributed.parallel import apply_fsdp2
+    from kempnerforge.distributed.pipeline_parallel import (
+        build_pipeline_schedule,
+        build_pipeline_stage,
+        build_stage_module,
+    )
+    from kempnerforge.model.transformer import Transformer
+
+    def loss_fn(out: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        return F.cross_entropy(out.flatten(0, 1).float(), target.flatten())
+
+    n_micro, per_dp_batch, seq = 2, 4, 32
+    dist.init_process_group(
+        "gloo", rank=rank, world_size=world, init_method=f"tcp://127.0.0.1:{port}"
+    )
+    try:
+        mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("pp", "dp_shard"))
+        pp_rank, dp_rank = mesh.get_local_rank("pp"), mesh.get_local_rank("dp_shard")
+        config = ModelConfig(dim=64, n_layers=4, n_heads=4, vocab_size=128, max_seq_len=seq)
+        torch.manual_seed(0)
+        reference = Transformer(config)
+        stage_module = build_stage_module(config, pp_rank=pp_rank, pp_size=2)
+        own = stage_module.state_dict()
+        subset = {k: v for k, v in reference.state_dict().items() if k in own}
+        stage_module.load_state_dict(subset, strict=True)
+        fp32 = MixedPrecisionPolicy(param_dtype=torch.float32, reduce_dtype=torch.float32)
+        apply_fsdp2(stage_module, mesh, mp_policy=fp32)
+        stage = build_pipeline_stage(
+            stage_module,
+            mesh,
+            torch.device("cpu"),
+            batch_size=per_dp_batch // n_micro,
+            seq_len=seq,
+            param_dtype=torch.float32,
+        )
+        schedule = build_pipeline_schedule(
+            stage, n_microbatches=n_micro, loss_fn=loss_fn, schedule="1f1b"
+        )
+
+        generator = torch.Generator().manual_seed(7)
+        tokens = torch.randint(0, config.vocab_size, (2 * per_dp_batch, seq), generator=generator)
+        labels = torch.randint(0, config.vocab_size, (2 * per_dp_batch, seq), generator=generator)
+        rows = slice(dp_rank * per_dp_batch, (dp_rank + 1) * per_dp_batch)
+        if pp_rank == 0:
+            schedule.step(tokens[rows], target=labels[rows], losses=[])
+        else:
+            schedule.step(target=labels[rows], losses=[])
+        norm = clip_grad_norm_(stage_module, 0.05, pp_group=mesh["pp"].get_group())
+
+        loss_fn(reference(tokens), labels).backward()
+        ref_norm = clip_grad_norm_(reference, 0.05)
+        torch.testing.assert_close(norm, ref_norm, rtol=2e-4, atol=0.0)
+        for name, p in stage_module.named_parameters():
+            torch.testing.assert_close(
+                p.grad.full_tensor(), reference.get_parameter(name).grad, rtol=2e-4, atol=2e-5
+            )
+    finally:
+        dist.destroy_process_group()
+
+
 class TestClipAcrossPipelineStages:
     @pytest.mark.parametrize("world", [2, 4])
     def test_every_stage_clips_with_the_whole_model_norm(self, world):
@@ -138,3 +204,7 @@ class TestClipAcrossPipelineStages:
     def test_row_sharded_stages_match_one_process(self):
         """With pp=2 x dp_shard=2 the norm is reduced over the shards and over the stages."""
         mp.spawn(_check_sharded_stage, args=(4, _free_port()), nprocs=4)
+
+    def test_pipeline_step_with_fsdp2_matches_one_process(self):
+        """Gradients from a real pipeline step with FSDP2 clip exactly as one process's do."""
+        mp.spawn(_check_pipeline_step, args=(4, _free_port()), nprocs=4)
