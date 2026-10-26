@@ -137,7 +137,9 @@ DTensor / FSDP2 notes:
   the full matrix's shape. The update is then bitwise what one process
   would compute, and each matrix's work runs once, spread across the group.
   Other sharded layouts, such as tensor parallel, are all-gathered. The
-  cost is two all-to-alls per group of matrices per step.
+  cost is two all-to-alls per group of matrices per step. A resume keeps
+  the mode the checkpoint was saved with, and a checkpoint saved before
+  the option existed resumes with `"local"`.
 - Momentum buffers match the parameter dtype (`torch.zeros_like(p.grad)`),
   so DCP serializes them correctly on resume.
 - The internal AdamW's parameters are not in Muon's `param_groups`, so

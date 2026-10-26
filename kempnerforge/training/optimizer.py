@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import functools
 import logging
+from typing import Any, ClassVar
 
 import torch
 
@@ -384,6 +385,8 @@ class Muon(torch.optim.Optimizer):
             matrix.
     """
 
+    LEGACY_GROUP_DEFAULTS: ClassVar[dict[str, Any]] = {"orthogonalize": "local"}
+
     def __init__(
         self,
         muon_params: list[dict],
@@ -456,6 +459,13 @@ class Muon(torch.optim.Optimizer):
         if adam_state is not None and self._adam is not None:
             self._adam.load_state_dict(adam_state)
 
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        """Fill in the ``LEGACY_GROUP_DEFAULTS`` that a state saved before them lacks."""
+        super().__setstate__(state)
+        for group in self.param_groups:
+            for key, value in self.LEGACY_GROUP_DEFAULTS.items():
+                group.setdefault(key, value)
+
     def zero_grad(self, set_to_none: bool = True) -> None:
         """Zero both Muon's own parameters and the inner AdamW's.
 
@@ -480,7 +490,7 @@ class Muon(torch.optim.Optimizer):
             ns_steps = group["ns_steps"]
             nesterov = group.get("nesterov", self.defaults["nesterov"])
             adjust_lr = group.get("adjust_lr", self.defaults["adjust_lr"])
-            orthogonalize = group.get("orthogonalize", self.defaults["orthogonalize"])
+            orthogonalize = group["orthogonalize"]
 
             params = [p for p in group["params"] if p.grad is not None]
             inputs = []
