@@ -331,7 +331,7 @@ class TestDistributedConfig:
         with pytest.raises(ValueError, match="dp_shard must be"):
             DistributedConfig(dp_shard=-2)
 
-    @pytest.mark.parametrize("cp", [2, 4])
+    @pytest.mark.parametrize("cp", [2, 3, 4])
     def test_rejects_context_parallel(self, cp):
         """CP is not implemented, so cp > 1 would build a mesh without it."""
         with pytest.raises(ValueError, match=f"cp={cp} is not supported"):
