@@ -257,6 +257,12 @@ class TestTrainConfig:
         with pytest.raises(ValueError, match=match):
             TrainConfig(mixed_precision="fp16")
 
+    def test_fp16_mixed_precision_is_rejected_from_toml(self, tmp_path: Path) -> None:
+        toml = tmp_path / "fp16.toml"
+        toml.write_text('[train]\nmixed_precision = "fp16"\n')
+        with pytest.raises(ValueError, match="'fp16' is not supported"):
+            load_config(str(toml), cli_args=[])
+
     def test_data_seed_defaults_to_none(self):
         assert TrainConfig().data_seed is None
 
