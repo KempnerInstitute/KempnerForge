@@ -145,7 +145,10 @@ def read_mlflow_target(checkpoint_dir: str | os.PathLike[str]) -> MlflowTarget:
     The sidecar needs a non-negative integer ``step`` and a ``tracking`` list holding
     exactly one entry with ``backend == "mlflow"`` whose ``run_id``, ``experiment`` and
     ``tracking_uri`` are non-empty strings. ``model_id`` is optional. A key repeated
-    anywhere in the file is refused, since the last value would silently win.
+    anywhere in the file is refused, since the last value would silently win. For a
+    Databricks URI it also prepares auth in ``os.environ`` for the whole process, the way
+    the training backend does, so artifact uploads made later in the same process
+    authenticate like the tracking client.
 
     Raises:
         PublishRefused: Naming each missing or malformed item; nothing is inferred.
@@ -171,6 +174,7 @@ def read_mlflow_target(checkpoint_dir: str | os.PathLike[str]) -> MlflowTarget:
     if problems:
         raise PublishRefused(f"{sidecar}: " + "; ".join(problems))
 
+    _prepare_databricks_auth(entry["tracking_uri"])
     return MlflowTarget(
         run_id=entry["run_id"],
         experiment=entry["experiment"],
@@ -178,6 +182,26 @@ def read_mlflow_target(checkpoint_dir: str | os.PathLike[str]) -> MlflowTarget:
         step=meta["step"],
         model_id=entry.get("model_id"),
     )
+
+
+def _prepare_databricks_auth(tracking_uri: str) -> None:
+    """Prepare Databricks auth exactly as the training backend does.
+
+    Artifact clients build their own SDK config from the environment and never see the
+    tracking URI, so a ``databricks://<profile>`` URI selects that profile via
+    DATABRICKS_CONFIG_PROFILE (the profile is the first path segment; ``databricks://``
+    and the ``databricks://scope:prefix`` secret-scope form select nothing), and
+    DATABRICKS_API_TOKEN stands in for an unset or empty DATABRICKS_TOKEN. Non-empty
+    operator-set values always win.
+    """
+    if not tracking_uri.startswith("databricks"):
+        return
+    scheme, separator, rest = tracking_uri.partition("://")
+    profile = rest.partition("/")[0]
+    if scheme == "databricks" and separator and profile and ":" not in profile:
+        os.environ.setdefault("DATABRICKS_CONFIG_PROFILE", profile)
+    if not os.environ.get("DATABRICKS_TOKEN") and os.environ.get("DATABRICKS_API_TOKEN"):
+        os.environ["DATABRICKS_TOKEN"] = os.environ["DATABRICKS_API_TOKEN"]
 
 
 def _as_finite_float(value: object) -> float:

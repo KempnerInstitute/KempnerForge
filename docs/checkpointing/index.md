@@ -23,8 +23,43 @@ contains two kinds of state:
 |---------|----------|--------|
 | DCP shards (`.distcp` + `.metadata`) | Model + optimizer state, one shard per rank | [DCP § Model + optimizer](dcp-model.md) |
 | `train_state.pt` | step, tokens_seen, scheduler, RNG, extras (e.g. `phase_idx`, `wandb_run_id`) | [Train state](train-state.md) |
-| `metadata.json` | Human-readable `{"step": N, "tokens_seen": M}` | Plain JSON |
+| `metadata.json` | Human-readable `{"step": N, "tokens_seen": M}`, plus the logging runs live at save time | Plain JSON, see below |
 | `latest` symlink | Points at the most recent `step_N` (updated atomically) | [Auto-resume](auto-resume.md) |
+
+## `metadata.json`
+
+Written by rank 0 beside `train_state.pt`, and readable with a plain `json.load` (no torch).
+It holds `step` and `tokens_seen` (VLM runs add `vlm_freeze`). When a logging backend has a
+live run at save time it also holds a `tracking` list, one entry per backend:
+
+```json
+{
+  "step": 1000,
+  "tokens_seen": 4096000,
+  "tracking": [
+    {"backend": "wandb", "run_id": "<run id>", "experiment": "<project>",
+     "entity": "<entity>", "url": "<run url>"},
+    {"backend": "tensorboard", "log_dir": "tb_logs"},
+    {"backend": "mlflow", "run_id": "<run id>", "experiment": "<experiment>",
+     "tracking_uri": "<tracking uri>"}
+  ]
+}
+```
+
+- Each backend describes its own run, as it knows it: the resolved tracking URI and the
+  experiment name for MLflow, the project for wandb, the writer's directory for TensorBoard.
+  `entity` and `url` appear when the wandb run has them (an offline run has no URL). The
+  MLflow entry always has all four fields.
+- A backend contributes only while its run is live, and runs start on the first log. A
+  checkpoint saved before that (step 0, or soon after a resume when `checkpoint.interval` is
+  shorter than `metrics.log_interval`) lacks the entry, and the key is omitted when no backend
+  is live.
+- Values are recorded as resolved. Credentials embedded in the tracking URI
+  (`scheme://user:token@host`) are stripped at write time; authentication comes from the
+  environment. The URI, experiment path and run ids remain, so drop the `tracking` key
+  before sharing a checkpoint outside your team.
+- The key is additive. Older checkpoints lack it, nothing on the resume path reads it, and run
+  ids still resume from `train_state.pt`.
 
 ## Key modules
 

@@ -96,6 +96,8 @@ markers = [
 [tool.coverage.run]
 source = ["kempnerforge"]
 branch = true
+concurrency = ["multiprocessing", "thread"]
+parallel = true
 
 [tool.coverage.report]
 exclude_lines = [
