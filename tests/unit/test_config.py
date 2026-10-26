@@ -331,6 +331,28 @@ class TestDistributedConfig:
         with pytest.raises(ValueError, match="dp_shard must be"):
             DistributedConfig(dp_shard=-2)
 
+    @pytest.mark.parametrize("cp", [2, 4])
+    def test_rejects_context_parallel(self, cp):
+        """CP is not implemented, so cp > 1 would build a mesh without it."""
+        with pytest.raises(ValueError, match=f"cp={cp} is not supported"):
+            DistributedConfig(cp=cp)
+
+    def test_rejects_context_parallel_at_load(self, tmp_path):
+        """A TOML key or CLI override fails at load, before any distributed init."""
+        toml = tmp_path / "cp.toml"
+        toml.write_text("[distributed]\ncp = 2\n")
+        with pytest.raises(ValueError, match="cp=2 is not supported"):
+            load_config(str(toml), cli_args=[])
+        with pytest.raises(ValueError, match="cp=4 is not supported"):
+            load_config(cli_args=["--distributed.cp=4"])
+
+    def test_cp_one_still_loads(self, tmp_path):
+        """Configs that spell out the default cp = 1 keep loading."""
+        toml = tmp_path / "cp.toml"
+        toml.write_text("[distributed]\ncp = 1\n")
+        config = load_config(str(toml), cli_args=[])
+        assert config.distributed.resolve(world_size=8).dp_shard == 8
+
     def test_auto_dp_not_divisible(self):
         d = DistributedConfig(dp_shard=-1, tp=3)
         with pytest.raises(ValueError, match="not divisible"):
