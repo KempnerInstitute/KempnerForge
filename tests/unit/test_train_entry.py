@@ -668,6 +668,18 @@ class TestRunTrainingLoop:
         assert handler.finished is True
         assert ckpt.waits == 1
 
+    def test_shutdown_after_a_scheduled_save_still_saves_its_own_step(self):
+        """Step 2 is saved on the schedule; a shutdown at step 3 must still save step 3."""
+        config = make_config(max_steps=10)
+        config.checkpoint.interval = 2
+        ckpt = FakeCheckpointManager()
+        handler = FakeShutdownHandler(after_steps=3)
+        session = make_session(config, checkpointer=ckpt, shutdown_handler=handler)
+        step, _ = run_training_loop(session)
+        assert step == 3
+        assert ckpt.saved_steps == [2, 3]
+        assert handler.finished is True
+
     def test_hooks_fire_for_every_step_and_save(self):
         config = make_config(max_steps=4)
         config.checkpoint.interval = 2
