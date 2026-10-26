@@ -195,17 +195,22 @@ any run has started and after `close()`.
 ## Registering checkpoints
 
 ```python
-def register_checkpoint(self, step: int, directory: Path) -> dict[str, dict[str, str]]:
+def checkpoint_fields(self, step: int) -> dict[str, dict[str, str]]:
+    ...
+
+def register_checkpoint(self, step: int, directory: Path, record: TrackingRecord) -> None:
     ...
 ```
 
-Asks each backend with a live run for the fields it adds to its own tracking entry for a
-checkpoint just saved, keyed by backend name. Only `MLflowBackend` adds any, the `model_id` of
-the external model it registers when `mlflow_register_checkpoints` is on
-([MLflow](mlflow.md#registering-checkpoints)). A backend that raises costs only its own fields.
-`run_training` hands this to `CheckpointManager.set_checkpoint_registrar`, which merges the
-result into that save's `tracking` entries. It may wait on a server, within each backend's own
-deadline, and returns an empty dict after `close()`.
+`run_training` hands the tracker to `CheckpointManager.set_checkpoint_registrar`, which calls
+both on rank 0. `checkpoint_fields` runs inside `save()`: each backend with a live run names the
+fields it adds to its own entry of that save's `tracking` list, keyed by backend name, from what
+it already holds. `register_checkpoint` runs once the checkpoint is committed and must not block:
+each backend with a live run gets `record` bound to its own name and calls it, then or later from
+another thread, to add fields to its entry; the manager applies each call to that checkpoint's
+`metadata.json` atomically. Only `MLflowBackend` does either, when `mlflow_register_checkpoints`
+is on ([MLflow](mlflow.md#registering-checkpoints)). A backend that raises costs only its own
+fields or registration, and neither method does anything after `close()`.
 
 ## Logger: `get_logger`, `format_metrics`
 

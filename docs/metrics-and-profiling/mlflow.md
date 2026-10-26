@@ -112,7 +112,7 @@ the URI the backend resolved (config, then `$MLFLOW_TRACKING_URI`, then `"databr
 ## Registering checkpoints
 
 `mlflow_register_checkpoints = true` (default `false`; requires `enable_mlflow`) makes each
-checkpoint save also record an MLflow external logged model, so the run lists its checkpoints:
+committed checkpoint an MLflow external logged model, so the run lists its checkpoints:
 
 - name `<run name>-step_<N>` (characters MLflow rejects in a model name become `_`, and the run
   id stands in for an empty run name), `model_type = "checkpoint"`, linked to the run;
@@ -120,24 +120,32 @@ checkpoint save also record an MLflow external logged model, so the run lists it
 
 Nothing is uploaded but the small descriptor MLflow keeps with any external model. The weights
 stay where they were saved, and `checkpoint.keep_last_n` can later delete the directory the
-model points at. With an async checkpoint mode the model is made when the save is dispatched,
-before its shards are durable; `latest` still marks the last complete checkpoint.
+model points at.
 
-The model id goes into that save's `metadata.json`, in the `mlflow` entry of `tracking`
-([Checkpointing](../checkpointing/index.md)):
+Each save records the model's name in its `metadata.json`, in the `mlflow` entry of `tracking`
+([Checkpointing](../checkpointing/index.md)). Registration starts once the checkpoint is
+committed (`latest` points at it; with an async checkpoint mode, once its shards are durable),
+runs on the background worker, and adds the `model_id` to that entry when the server answers,
+replacing the file atomically:
 
 ```json
-{"backend": "mlflow", "run_id": "<run id>", "experiment": "<experiment>", "tracking_uri": "<tracking uri>", "model_id": "<model id>"}
+{"backend": "mlflow", "run_id": "<run id>", "experiment": "<experiment>", "tracking_uri": "<tracking uri>", "model_name": "<run name>-step_<N>", "model_id": "<model id>"}
 ```
 
-Registration is best effort and never fails a save. `save()` waits for it on rank 0 for at most
-15 seconds, a preemption save included, while the other ranks wait at the save barrier. A server
-error or a timeout leaves that save's entry without `model_id` and logs a rate-limited warning,
-and while a timed-out call is still running, later saves skip registering. A step saved twice (an
-emergency save, or a resumed run re-running it) keeps the model it already has, and a resume
-registers nothing by itself. A save before the run's first log has no live run and registers
-nothing. MLflow itself logs two harmless "Failed to infer schema" warnings for each external model
-it creates.
+A save never waits on the server for it, a preemption save included. Registration is best
+effort: a server error leaves the entry without `model_id` and logs a rate-limited warning, and
+the next commit of the same step tries again. A step saved twice (a shutdown save right after an
+interval save, or a resumed run re-running it) keeps one model, and the last `metadata.json` of
+that step still gets its `model_id`. A resume registers nothing by itself, and a checkpoint
+deleted before its turn comes is skipped. At shutdown, `close()` delivers a registration still
+queued within its drain budget, so the final checkpoint is registered too. A save before the
+run's first log has no `mlflow` entry, so its `metadata.json` gets neither field. MLflow itself
+logs two harmless "Failed to infer schema" warnings for each external model it creates.
+
+The eval publisher (`python -m kempnerforge.metrics.publish`) links its metrics to the entry's
+`model_id`. When the entry has only `model_name` (the registration failed or never finished),
+it finds the run's model of that name, or creates it, and links to that; it never writes
+`metadata.json`.
 
 ## What gets logged
 
