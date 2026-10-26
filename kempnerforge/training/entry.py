@@ -307,7 +307,7 @@ def run_training(
         tracker = MetricsTracker(config, num_gpus=runtime.world_size)
         tracker.init_backends(config)
         ckpt_mgr.set_tracking_source(tracker.tracking_entries)
-        ckpt_mgr.set_checkpoint_registrar(tracker.register_checkpoint)
+        ckpt_mgr.set_checkpoint_registrar(tracker)
 
         prof = build_profiler(config.profiling, rank=runtime.rank)
 

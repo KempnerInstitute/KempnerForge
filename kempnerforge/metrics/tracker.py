@@ -27,8 +27,17 @@ from kempnerforge.config.schema import JobConfig, MetricsConfig
 from kempnerforge.metrics.logger import format_metrics, get_logger
 from kempnerforge.metrics.memory import get_memory_stats, get_memory_utilization
 from kempnerforge.metrics.mfu import compute_mfu, get_gpu_peak_tflops
+from kempnerforge.metrics.mlflow_models import (
+    checkpoint_model_name,
+    find_or_create_checkpoint_model,
+)
 
 logger = get_logger(__name__)
+
+# Adds fields to a backend's tracking entry of a saved checkpoint: (backend name, fields).
+TrackingRecord = Callable[[str, dict[str, str]], None]
+# The same, bound to one backend: (fields).
+BackendRecord = Callable[[dict[str, str]], None]
 
 
 @dataclass
@@ -248,25 +257,51 @@ class MetricsTracker:
                 entries.append(snapshot)
         return entries
 
-    def register_checkpoint(self, step: int, directory: Path) -> dict[str, dict[str, str]]:
-        """What each backend with a live run adds to its tracking entry for a saved checkpoint.
+    def checkpoint_fields(self, step: int) -> dict[str, dict[str, str]]:
+        """What each backend with a live run adds to its tracking entry of the save at ``step``.
 
-        Keyed by backend name, for ``CheckpointManager.set_checkpoint_registrar``. A backend may
-        wait on its server, within its own deadline; one that fails costs only its own fields.
-        Empty once ``close()`` has begun.
+        Keyed by backend name; this tracker is what ``run_training`` hands to
+        ``CheckpointManager.set_checkpoint_registrar``. Reads only what the backends hold, so it
+        never waits on a server; a backend that fails costs only its own fields. Empty once
+        ``close()`` has begun.
         """
         added: dict[str, dict[str, str]] = {}
         if self._closed:
             return added
         for backend in self._backends:
             try:
-                fields = backend.register_checkpoint(step, directory)
-                entry = backend.tracking_entry() if fields else None
-                if fields and entry is not None:
-                    added[entry["backend"]] = fields
+                fields = backend.checkpoint_fields(step)
+                if fields:
+                    entry = backend.tracking_entry()
+                    if entry is not None:
+                        added[_tracking_snapshot(entry)["backend"]] = fields
             except Exception as e:  # a third-party run object; never let it cost a save
-                logger.warning("%s checkpoint registration skipped (%s)", type(backend).__name__, e)
+                logger.warning(
+                    "%s checkpoint fields skipped (%s)", type(backend).__name__, _error_text(e)
+                )
         return added
+
+    def register_checkpoint(self, step: int, directory: Path, record: TrackingRecord) -> None:
+        """Hand a committed checkpoint to each backend with a live run; never blocks.
+
+        Each backend gets ``record`` bound to its own name, so it can amend only its own tracking
+        entry, then or later from another thread. A backend that fails costs only its own
+        registration. Nothing is registered once ``close()`` has begun.
+        """
+        if self._closed:
+            return
+        for backend in self._backends:
+            try:
+                entry = backend.tracking_entry()
+                if entry is not None:
+                    name = _tracking_snapshot(entry)["backend"]
+                    backend.register_checkpoint(step, directory, partial(record, name))
+            except Exception as e:  # a third-party run object; never let it cost a commit
+                logger.warning(
+                    "%s checkpoint registration skipped (%s)",
+                    type(backend).__name__,
+                    _error_text(e),
+                )
 
     def close(self) -> None:
         """Flush and close all logging backends."""
@@ -307,12 +342,18 @@ class _LoggingBackend:
         """
         return None
 
-    def register_checkpoint(self, step: int, directory: Path) -> dict[str, str] | None:
-        """Fields to add to this backend's tracking entry for a checkpoint just saved, if any.
+    def checkpoint_fields(self, step: int) -> dict[str, str] | None:
+        """Fields this backend adds to its tracking entry of the checkpoint saved at ``step``.
 
-        Runs on the saving thread, so an implementation that waits on a server must bound it.
+        Runs on the saving thread, so it must answer from what the backend holds.
         """
         return None
+
+    def register_checkpoint(self, step: int, directory: Path, record: BackendRecord) -> None:
+        """Register a committed checkpoint; ``record(fields)`` adds to its tracking entry later.
+
+        Runs on the committing thread, so it must not block; ``record`` works from any thread.
+        """
 
     def close(self) -> None:
         pass
@@ -384,7 +425,7 @@ _CALL_DEADLINE_S = 60.0  # one metric / param / tag call
 _UPLOAD_DEADLINE_S = 180.0  # one artifact upload
 _INIT_DEADLINE_S = 60.0  # experiment setup plus run start or resume, on the first log
 _END_DEADLINE_S = 60.0  # ending the run in close(), after the drain
-_REGISTER_DEADLINE_S = 15.0  # registering one checkpoint, awaited inside save()
+_REGISTER_DEADLINE_S = 180.0  # one checkpoint registration: several requests, one an upload
 _DRAIN_DEADLINE_S = 30.0  # close() flush budget
 _QUEUE_MAX = 256  # pending calls before new ones are dropped
 _MAX_CALL_THREADS = 4  # live call threads, abandoned ones included, before new calls are dropped
@@ -550,43 +591,6 @@ class _BestEffortWorker:
             )
         elif failure:
             self._warn_call(f"{self._name} {what} failed ({failure[0]}); points may be lost")
-
-
-class _BoundedCall:
-    """One tracking call on its own daemon thread, awaited for at most a deadline.
-
-    A thread cannot be cancelled, so a call past its deadline is left to finish by itself;
-    ``running`` says whether it has.
-    """
-
-    def __init__(self, name: str, fn: Callable[[], Any]) -> None:
-        self._fn = fn
-        self._finished = threading.Event()  # fn returned or raised
-        self._result: Any = None
-        self._error: Exception | None = None
-        self._thread = threading.Thread(target=self._run, name=f"{name}-call", daemon=True)
-
-    @property
-    def running(self) -> bool:
-        return self._thread.is_alive() and not self._finished.is_set()
-
-    def start(self) -> None:
-        self._thread.start()
-
-    def result(self, deadline: float) -> Any:
-        """What the call returned; re-raise its error, or TimeoutError past ``deadline``."""
-        if not self._finished.wait(deadline):
-            raise TimeoutError(f"no answer from the tracking server within {deadline:g}s")
-        if self._error is not None:
-            raise self._error
-        return self._result
-
-    def _run(self) -> None:
-        try:
-            self._result = self._fn()
-        except Exception as e:  # raised again by result(), on the caller's thread
-            self._error = e
-        self._finished.set()
 
 
 class _RunOwner:
@@ -869,30 +873,7 @@ class _MlflowDisabled(Exception):
     """A deliberate config error found during init: MLflow is disabled with this message."""
 
 
-_MODEL_NAME_UNSAFE = str.maketrans(dict.fromkeys("/:.%\"'", "_"))  # MLflow rejects these in names
-
-
-def _mlflow_register_checkpoint(mlflow: Any, run_id: str, step: int, directory: str) -> str:
-    """Id of the run's external model for ``step``: a finished one an earlier save made, else new.
-
-    The lookup keeps a step saved twice (an emergency save, a resume re-running it) from getting
-    two models; one a failed attempt left unfinished is not reused.
-    """
-    info = mlflow.get_run(run_id).info
-    name = f"{(info.run_name or run_id).translate(_MODEL_NAME_UNSAFE)}-step_{step}"
-    saved = mlflow.search_logged_models(
-        experiment_ids=[info.experiment_id], filter_string=f"name = '{name}'", output_format="list"
-    )
-    for model in saved:
-        if model.source_run_id == run_id and model.status == "READY":
-            return model.model_id
-    return mlflow.create_external_model(
-        name=name,
-        source_run_id=run_id,
-        experiment_id=info.experiment_id,
-        model_type="checkpoint",
-        params={"step": str(step), "checkpoint_dir": directory},
-    ).model_id
+_SIDECAR_FILE = "metadata.json"  # the checkpoint manager's, whose presence marks a kept checkpoint
 
 
 class MLflowBackend(_LoggingBackend):
@@ -902,9 +883,9 @@ class MLflowBackend(_LoggingBackend):
     call has a deadline: the run is set up and later ended on one owner thread (the active run is
     thread-local), and metric, param, tag and artifact calls go through a best-effort worker, so a
     slow server never stalls training. A new run (not a resumed one) also gets its description and
-    tags, the git commit, and the resolved config (plus the launch TOML) as artifacts.
-    The one wait on the training thread is opt-in: with
-    ``mlflow_register_checkpoints``, each save awaits its checkpoint's model for a bounded time.
+    tags, the git commit, and the resolved config (plus the launch TOML) as artifacts. With
+    ``mlflow_register_checkpoints``, the same worker registers each committed checkpoint as an
+    external model, so a save never waits on the server for it.
 
     The tracking URI resolves as config, then $MLFLOW_TRACKING_URI, then "databricks". Databricks
     credentials are not pre-checked: init attempts the server calls, and a failure disables the
@@ -920,6 +901,7 @@ class MLflowBackend(_LoggingBackend):
         self._resume_skip_below: int | None = None  # skip re-logging steps already in the run
         self._mlflow: Any = None  # the imported module
         self._run_id = ""
+        self._run_name = ""  # as the server named the run; checkpoint model names start with it
         self._experiment = ""  # the experiment the run was set up in, set with the run id
         self._worker = _BestEffortWorker(
             "MLflow",
@@ -929,7 +911,9 @@ class MLflowBackend(_LoggingBackend):
             drain_deadline=_DRAIN_DEADLINE_S,
         )
         self._owner = _RunOwner("MLflow", start=self._open_run, end=lambda: self._mlflow.end_run())
-        self._registration: _BoundedCall | None = None  # the latest checkpoint registration
+        self._register_lock = threading.Lock()  # guards the two below, shared with the worker
+        self._model_ids: dict[int, str] = {}  # step -> id of the model registered for it
+        self._registering: set[int] = set()  # steps whose registration call is running
         self._warn_register = _RateLimitedWarning(_WARN_INTERVAL_S)
 
     def _ensure_init(self) -> None:
@@ -942,9 +926,10 @@ class MLflowBackend(_LoggingBackend):
                 _prepare_databricks_auth(self._uri)
             self._mlflow = _import_mlflow()
             # The training thread waits here at most once, for at most the init deadline.
-            experiment, run_id, resumed, last_step = self._owner.start(_INIT_DEADLINE_S)
+            experiment, run_id, run_name, resumed, last_step = self._owner.start(_INIT_DEADLINE_S)
             self._run_started = True
             self._run_id = run_id
+            self._run_name = run_name or ""
             self._experiment = experiment or ""
             self._config.mlflow_run_id = run_id
             self._worker.start()
@@ -967,11 +952,11 @@ class MLflowBackend(_LoggingBackend):
             logger.warning(_scrub_uris(f"MLflow init failed: {e}{hint}"))
             self._active = False
 
-    def _open_run(self) -> tuple[str | None, str, bool, int | None]:
+    def _open_run(self) -> tuple[str | None, str, str | None, bool, int | None]:
         """Every server step of init, run on the owner thread under the init deadline.
 
-        Returns (experiment, run_id, resumed, last logged step); the caller applies it, so a
-        start that finishes after the caller gave up changes nothing here.
+        Returns (experiment, run_id, run name, resumed, last logged step); the caller applies it,
+        so a start that finishes after the caller gave up changes nothing here.
         """
         mlflow, uri = self._mlflow, self._uri
         mlflow.set_tracking_uri(uri)
@@ -990,7 +975,7 @@ class MLflowBackend(_LoggingBackend):
         run, resumed = self._start_run(mlflow)
         run_id = run.info.run_id
         last_step = _mlflow_last_step(mlflow, run_id) if resumed else None
-        return experiment, run_id, resumed, last_step
+        return experiment, run_id, run.info.run_name, resumed, last_step
 
     def _start_run(self, mlflow: Any) -> tuple[Any, bool]:
         """Start a run, or resume the saved run_id. If that run_id no longer exists, fall
@@ -1067,45 +1052,82 @@ class MLflowBackend(_LoggingBackend):
             return None
         return entry
 
-    def register_checkpoint(self, step: int, directory: Path) -> dict[str, str] | None:
-        """The ``model_id`` of the external model made for this checkpoint, or None; never raises.
+    def _registers_checkpoints(self) -> bool:
+        return self._config.mlflow_register_checkpoints and self.tracking_entry() is not None
 
-        Only with ``mlflow_register_checkpoints`` on and a live run. The caller waits at most
-        ``_REGISTER_DEADLINE_S``; a failure or timeout warns (rate limited) and costs only the id.
-        One registration runs at a time: while one is past its deadline, later saves skip theirs.
+    def checkpoint_fields(self, step: int) -> dict[str, str] | None:
+        """The model name of the checkpoint saved at ``step``, plus its id once registered.
+
+        Only with ``mlflow_register_checkpoints`` on and a live run; answered from memory.
         """
-        if not self._config.mlflow_register_checkpoints or self.tracking_entry() is None:
+        if not self._registers_checkpoints():
             return None
-        try:
-            return {"model_id": self._register(step, directory)}
-        except Exception as e:  # a tracking server problem must never cost a save
-            reason = _URI_USERINFO.sub("", str(e))  # MLflow errors quote the tracking URI
+        fields = {"model_name": checkpoint_model_name(self._run_name or self._run_id, step)}
+        with self._register_lock:
+            model_id = self._model_ids.get(step)
+        if model_id is not None:
+            fields["model_id"] = model_id
+        return fields
+
+    def register_checkpoint(self, step: int, directory: Path, record: BackendRecord) -> None:
+        """Find or make the external model of a committed checkpoint, then record its id.
+
+        Only with ``mlflow_register_checkpoints`` on and a live run, and it never waits: a step
+        registered before is recorded at once from memory, and any other is queued on the worker,
+        which records the id when the server answers. A failure warns (rate limited) and costs
+        only the id; a later commit of the same step tries again.
+        """
+        if not self._registers_checkpoints():
+            return
+        with self._register_lock:
+            model_id = self._model_ids.get(step)
+        if model_id is not None:
+            record({"model_id": model_id})
+            return
+        name = checkpoint_model_name(self._run_name or self._run_id, step)
+        call = partial(self._register, step, name, directory.absolute(), record)
+        if not self._worker.submit(f"register {name}", call, deadline=_REGISTER_DEADLINE_S):
             self._warn_register(
-                f"MLflow checkpoint registration did not complete at step {step} ({reason}); "
+                f"MLflow checkpoint registration at step {step} was not queued; "
                 "its tracking entry has no model_id"
             )
-            return None
 
-    def _register(self, step: int, directory: Path) -> str:
-        """Make the checkpoint's model within ``_REGISTER_DEADLINE_S``; raises if it cannot."""
-        if self._registration is not None and self._registration.running:
-            raise RuntimeError("an earlier registration is still running")
-        call = _BoundedCall(
-            "MLflow",
-            partial(
-                _mlflow_register_checkpoint,
-                self._mlflow,
-                self._run_id,
-                step,
-                str(directory.absolute()),
-            ),
-        )
-        self._registration = call
-        call.start()
-        model_id = call.result(_REGISTER_DEADLINE_S)
-        if not isinstance(model_id, str) or not model_id.strip():
-            raise ValueError("the server returned no model id")
-        return model_id
+    def _register(self, step: int, name: str, directory: Path, record: BackendRecord) -> None:
+        """Worker call: find or make the model and record its id; failures only warn.
+
+        The step is marked in flight while this call runs, so a call queued behind it for the
+        same step (a step committed twice) records its id, or leaves it to this one if it is
+        still running past its deadline; a call the worker drops never leaves a mark.
+        """
+        with self._register_lock:
+            model_id = self._model_ids.get(step)
+            running = model_id is None and step in self._registering
+            if model_id is None and not running:
+                self._registering.add(step)
+        if model_id is not None:
+            record({"model_id": model_id})
+            return
+        if running:
+            return
+        try:
+            if not (directory / _SIDECAR_FILE).exists():
+                logger.debug(f"MLflow: {directory} was removed before it was registered")
+                return
+            client = self._mlflow.MlflowClient(tracking_uri=self._uri)
+            model_id = find_or_create_checkpoint_model(
+                client, self._run_id, name, step, str(directory)
+            )
+            with self._register_lock:
+                self._model_ids[step] = model_id  # before record: later saves and commits see it
+            record({"model_id": model_id})
+        except Exception as e:  # a tracking server problem costs this checkpoint its model_id
+            self._warn_register(
+                f"MLflow checkpoint registration did not complete at step {step} "
+                f"({_error_text(e)}); its tracking entry has no model_id"
+            )
+        finally:
+            with self._register_lock:
+                self._registering.discard(step)
 
     def close(self) -> None:
         if not self._run_started:

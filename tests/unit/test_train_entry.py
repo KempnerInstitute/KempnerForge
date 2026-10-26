@@ -809,8 +809,11 @@ class TestRunTraining:
             def tracking_entries(self) -> list:
                 return []
 
-            def register_checkpoint(self, _step, _directory) -> dict:
+            def checkpoint_fields(self, _step) -> dict:
                 return {}
+
+            def register_checkpoint(self, _step, _directory, _record) -> None:
+                pass
 
             def close(self) -> None:
                 closes.append(1)
@@ -857,8 +860,11 @@ class TestRunTraining:
             def tracking_entries(self) -> list:
                 return live
 
-            def register_checkpoint(self, _step, _directory) -> dict:
+            def checkpoint_fields(self, _step) -> dict:
                 return {}
+
+            def register_checkpoint(self, _step, _directory, _record) -> None:
+                pass
 
             def close(self) -> None:
                 pass
@@ -872,18 +878,16 @@ class TestRunTraining:
         assert ckpt.tracking_source is not None
         assert ckpt.tracking_source() == live
 
-    def test_checkpoint_manager_registers_saves_through_the_tracker(self, monkeypatch):
-        from pathlib import Path
-
+    def test_checkpoint_manager_registers_checkpoints_through_the_tracker(self, monkeypatch):
         import kempnerforge.training.entry as entry
         from kempnerforge.training.entry import run_training
         from kempnerforge.training.loop import StepResult
 
-        asked: list[tuple[int, Path]] = []
+        built: list = []
 
         class RegisteringTracker:
             def __init__(self, *_a, **_k) -> None:
-                pass
+                built.append(self)
 
             def init_backends(self, _config) -> None:
                 pass
@@ -897,9 +901,11 @@ class TestRunTraining:
             def tracking_entries(self) -> list:
                 return []
 
-            def register_checkpoint(self, step, directory) -> dict:
-                asked.append((step, directory))
-                return {"mlflow": {"model_id": f"m-{step}"}}
+            def checkpoint_fields(self, _step) -> dict:
+                return {}
+
+            def register_checkpoint(self, _step, _directory, _record) -> None:
+                pass
 
             def close(self) -> None:
                 pass
@@ -910,9 +916,7 @@ class TestRunTraining:
         run_training(
             make_config(max_steps=1), step_fn=lambda _s, _i: StepResult(loss=1.0, grad_norm=0.5)
         )
-        assert ckpt.checkpoint_registrar is not None
-        assert ckpt.checkpoint_registrar(3, Path("step_3")) == {"mlflow": {"model_id": "m-3"}}
-        assert asked == [(3, Path("step_3"))]
+        assert len(built) == 1 and ckpt.checkpoint_registrar is built[0]
 
     def test_injected_hooks_get_the_whole_lifecycle(self, monkeypatch):
         from kempnerforge.training.entry import run_training
