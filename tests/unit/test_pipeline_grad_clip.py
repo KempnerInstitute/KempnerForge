@@ -11,7 +11,8 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn as nn
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.tensor import Shard, distribute_tensor
+from torch.distributed.tensor import DTensor, Shard, distribute_tensor
+from torch.distributed.tensor.parallel import ColwiseParallel, RowwiseParallel, parallelize_module
 
 from kempnerforge.distributed.utils import clip_grad_norm_
 
@@ -140,6 +141,39 @@ def _check_sharded_stage(
         dist.destroy_process_group()
 
 
+def _check_tp_stage(rank: int, world: int, port: int, pp: int, dtype: torch.dtype) -> None:
+    """pp x tp=2: each stage's last two layers are Colwise and Rowwise on the tp mesh.
+
+    The stage's other layers stay plain tensors, as norms and embeddings do under
+    TP, so its gradients live on two meshes. With ``pp=1`` no group is passed.
+    """
+    dist.init_process_group(
+        "gloo", rank=rank, world_size=world, init_method=f"tcp://127.0.0.1:{port}"
+    )
+    try:
+        mesh = init_device_mesh("cpu", (pp, 2), mesh_dim_names=("pp", "tp"))
+        pp_rank = mesh.get_local_rank("pp")
+        ref_norm, reference = _reference(pp, None, dtype)
+        stage = _stage(_model().to(dtype), pp_rank, pp)
+        grads = [p.grad for p in stage.parameters()]
+        *_, colwise, rowwise = (name for name, _ in stage.named_children())
+        parallelize_module(
+            stage, mesh["tp"], {colwise: ColwiseParallel(), rowwise: RowwiseParallel()}
+        )
+        for p, g in zip(stage.parameters(), grads, strict=True):
+            if isinstance(p, DTensor):
+                p.grad = distribute_tensor(g, p.device_mesh, p.placements)
+        group = mesh["pp"].get_group() if pp > 1 else None
+        norm = clip_grad_norm_(stage, MAX_NORM, pp_group=group)
+        torch.testing.assert_close(norm, ref_norm, rtol=1e-5, atol=0.0)
+        expected = _stage(reference, pp_rank, pp).parameters()
+        for p, q in zip(stage.parameters(), expected, strict=True):
+            grad = p.grad.full_tensor() if isinstance(p.grad, DTensor) else p.grad
+            _assert_grads_close(grad, q.grad)
+    finally:
+        dist.destroy_process_group()
+
+
 def _check_pipeline_step(rank: int, world: int, port: int) -> None:
     """A real 1F1B step with FSDP2 on pp=2 x dp_shard=2, clipped, against one process."""
     import torch.nn.functional as F
@@ -239,3 +273,12 @@ class TestClipAcrossPipelineStages:
     def test_half_precision_row_sharded_stages_clip_with_the_fp32_norm(self):
         """fp16 DTensor gradients reduce their partial norms in fp32 as well."""
         mp.spawn(_check_sharded_stage, args=(4, _free_port(), torch.float16), nprocs=4)
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float16], ids=["fp32", "fp16"])
+    @pytest.mark.parametrize("pp", [1, 2])
+    def test_tp_sharded_stages_match_one_process(self, pp, dtype):
+        """Colwise, Rowwise and plain gradients are reduced over tp, then over the stages.
+
+        With ``pp=1`` there is no group, and the two meshes take the mixed-mesh path.
+        """
+        mp.spawn(_check_tp_stage, args=(2 * pp, _free_port(), pp, dtype), nprocs=2 * pp)
