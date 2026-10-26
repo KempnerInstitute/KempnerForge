@@ -109,10 +109,11 @@ def _norm_sq(grads: list[torch.Tensor], device: torch.device) -> torch.Tensor:
     """Squared L2 norm of ``grads`` as a plain fp32 tensor on ``device``.
 
     Gradients are grouped by mesh and each group's norm is computed via stack. A
-    DTensor group norm is a partial sum, so ``full_tensor()`` all-reduces it
-    before the groups are added. Each gradient's norm is taken in fp32: squared
-    in fp16, a norm above about 256 overflows to inf, and the clip coefficient
-    would then zero every gradient.
+    DTensor gradient's norm is partial over its shards, and ``.pow(2)``
+    all-reduces it into a replicated tensor, so ``full_tensor()`` only unwraps
+    the group's sum before the groups are added. Each gradient's norm is taken
+    in fp32: squared in fp16, a norm above about 256 overflows to inf, and the
+    clip coefficient would then zero every gradient.
     """
     groups: dict[int, list[torch.Tensor]] = defaultdict(list)
     for g in grads:
