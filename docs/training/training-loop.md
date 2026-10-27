@@ -64,7 +64,9 @@ to the schedule (`1f1b` / `gpipe`, built by
 [`build_pipeline_schedule`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/distributed/pipeline_parallel.py)).
 The schedule splits along dim 0 internally; the Python loop only sees
 one `step()` call. Loss is meaningful only on the last stage and is
-broadcast across the PP dimension for logging.
+broadcast across the PP dimension for logging. The gradient norm is not
+broadcast: every stage clips with the whole model's norm, so each one
+already has it.
 
 ## Gradient clipping and NaN check
 
@@ -82,6 +84,9 @@ if not nan_detector.check_loss(avg_loss, step):
 `clip_grad_norm_` is the DTensor-aware wrapper from
 [`kempnerforge.distributed.utils`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/distributed/utils.py) —
 see [Gradient utilities](gradient-utilities.md).
+Under PP, `pipeline_step` passes `pp_group=`, so the norm is summed over
+the stages and every stage scales by the same coefficient (see
+[Gradient utilities § Under pipeline parallelism](gradient-utilities.md#under-pipeline-parallelism)).
 `NaNDetector.check_loss` returns `False` on NaN / Inf, zeroes grads,
 and escalates to `should_rollback` after
 `nan_consecutive_max` bad steps (see

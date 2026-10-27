@@ -72,12 +72,16 @@ class FakeCheckpointManager:
         self.waits = 0
         self.flushes = 0
         self.tracking_source = None
+        self.checkpoint_registrar = None
 
     def save(self, step, tokens_seen=0, scheduler=None, dataloader=None, extra=None) -> None:
         self.saves.append((step, tokens_seen, dict(extra or {})))
 
     def set_tracking_source(self, source) -> None:
         self.tracking_source = source
+
+    def set_checkpoint_registrar(self, registrar) -> None:
+        self.checkpoint_registrar = registrar
 
     def wait(self) -> None:
         self.waits += 1
@@ -897,6 +901,12 @@ class TestRunTraining:
             def tracking_entries(self) -> list:
                 return []
 
+            def checkpoint_fields(self, _step) -> dict:
+                return {}
+
+            def register_checkpoint(self, _step, _directory, _record) -> None:
+                pass
+
             def close(self) -> None:
                 closes.append(1)
 
@@ -942,6 +952,12 @@ class TestRunTraining:
             def tracking_entries(self) -> list:
                 return live
 
+            def checkpoint_fields(self, _step) -> dict:
+                return {}
+
+            def register_checkpoint(self, _step, _directory, _record) -> None:
+                pass
+
             def close(self) -> None:
                 pass
 
@@ -953,6 +969,46 @@ class TestRunTraining:
         )
         assert ckpt.tracking_source is not None
         assert ckpt.tracking_source() == live
+
+    def test_checkpoint_manager_registers_checkpoints_through_the_tracker(self, monkeypatch):
+        import kempnerforge.training.entry as entry
+        from kempnerforge.training.entry import run_training
+        from kempnerforge.training.loop import StepResult
+
+        built: list = []
+
+        class RegisteringTracker:
+            def __init__(self, *_a, **_k) -> None:
+                built.append(self)
+
+            def init_backends(self, _config) -> None:
+                pass
+
+            def start_step(self) -> None:
+                pass
+
+            def end_step(self, **_kw):
+                return None
+
+            def tracking_entries(self) -> list:
+                return []
+
+            def checkpoint_fields(self, _step) -> dict:
+                return {}
+
+            def register_checkpoint(self, _step, _directory, _record) -> None:
+                pass
+
+            def close(self) -> None:
+                pass
+
+        ckpt = _stub_entry(monkeypatch, TinyTextModel())
+        monkeypatch.setattr(entry, "MetricsTracker", RegisteringTracker)
+        assert ckpt.checkpoint_registrar is None
+        run_training(
+            make_config(max_steps=1), step_fn=lambda _s, _i: StepResult(loss=1.0, grad_norm=0.5)
+        )
+        assert len(built) == 1 and ckpt.checkpoint_registrar is built[0]
 
     def test_injected_hooks_get_the_whole_lifecycle(self, monkeypatch):
         from kempnerforge.training.entry import run_training
@@ -1814,8 +1870,13 @@ class TestPipelineStep:
         def fake_broadcast(tensor, group_src=None, group=None):
             recorded["group_src"] = group_src
             recorded["group"] = group
+            recorded["broadcast_numel"] = tensor.numel()
+
+        def fake_all_reduce(tensor, op=None, group=None):
+            recorded["all_reduce_group"] = group
 
         monkeypatch.setattr(loop.dist, "broadcast", fake_broadcast)
+        monkeypatch.setattr(loop.dist, "all_reduce", fake_all_reduce)
         config = make_config()
         config.distributed.pp = size
         session = make_session(
@@ -1833,6 +1894,14 @@ class TestPipelineStep:
         assert isinstance(result.loss, float)
         assert rec["group"] == "PPGROUP"
         assert rec["group_src"] == 1  # last stage is the source
+
+    def test_every_stage_sums_the_grad_norm_and_only_the_loss_is_broadcast(self, monkeypatch):
+        """Each stage clips with the whole model's norm, so the broadcast carries the loss alone."""
+        sched = FakeSchedule()
+        session, rec = self._session(monkeypatch, rank=0, size=2, sched=sched)
+        session.step_fn(session, 0)
+        assert rec["all_reduce_group"] == "PPGROUP"
+        assert rec["broadcast_numel"] == 1
 
     def test_last_stage_passes_target_only(self, monkeypatch):
         sched = FakeSchedule()
@@ -1873,6 +1942,7 @@ class TestPipelineStepPacked:
 
         monkeypatch.setattr(loop, "pp_group", lambda _r: "PPGROUP")
         monkeypatch.setattr(loop.dist, "broadcast", lambda *a, **k: None)
+        monkeypatch.setattr(loop.dist, "all_reduce", lambda *a, **k: None)
 
         batch = {
             "input_ids": torch.zeros(2, 8, dtype=torch.long),
@@ -2306,6 +2376,7 @@ class TestPipelineSyntheticBatches:
 
         monkeypatch.setattr(loop, "pp_group", lambda _r: "G")
         monkeypatch.setattr(loop.dist, "broadcast", lambda *a, **k: None)
+        monkeypatch.setattr(loop.dist, "all_reduce", lambda *a, **k: None)
         sched = FakeSchedule()
         config = make_config()
         config.distributed.pp = 2

@@ -137,7 +137,7 @@ the short version:
 The 120-second window is a design parameter: emergency checkpoints
 must finish within it or the job is SIGKILL'd. Async DCP save times
 depend on model size, FSDP degree, and filesystem — measure on your
-cluster with `checkpoint.async_save = true` and a test run before
+cluster with `checkpoint.async_mode = "async"` and a test run before
 trusting the default for 70B+. If your save consistently overruns,
 raise `#SBATCH --signal=B:SIGTERM@<seconds>` accordingly.
 

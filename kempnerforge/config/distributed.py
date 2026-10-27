@@ -76,3 +76,9 @@ class DistributedConfig:
         ]:
             if val < 1:
                 raise ValueError(f"{name} must be >= 1")
+        if self.cp > 1:
+            raise ValueError(
+                f"cp={self.cp} is not supported: context parallelism is not implemented, "
+                "so cp > 1 would leave ranks out of the DeviceMesh or train as plain FSDP. "
+                "Set cp = 1 or remove it from the config."
+            )

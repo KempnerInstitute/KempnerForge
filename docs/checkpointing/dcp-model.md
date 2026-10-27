@@ -264,8 +264,9 @@ The template also holds every param-group key the optimizer has now,
 and DCP requires each one. An optimizer whose param groups gained a key
 after its checkpoints were first written lists it in
 `LEGACY_GROUP_DEFAULTS`, with the value those checkpoints were trained
-with: Muon lists `orthogonalize` as `"local"`, the only mode before the
-option existed. Where a checkpoint lacks a listed key, the load drops it
+with: Muon lists `orthogonalize` as `"local"`, `nesterov` as `False` and
+`adjust_lr` as `"original"`, the update it made before those options
+existed. Where a checkpoint lacks a listed key, the load drops it
 from the template, the optimizer fills in the listed value as it loads
 the groups, and the manager logs it. A checkpoint that lacks any other
 key still fails the load.

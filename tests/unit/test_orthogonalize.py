@@ -57,7 +57,7 @@ def _own_rows(full: torch.Tensor, mesh: DeviceMesh) -> torch.Tensor:
     return distribute_tensor(full, mesh, [Shard(0)], src_data_rank=None).to_local().clone()
 
 
-def _check_muon_rank(rank: int, world: int, port: int, orthogonalize: str) -> None:
+def _check_muon_rank(rank: int, world: int, port: int, orthogonalize: str, options: dict) -> None:
     """Step Muon on a row-sharded weight and compare with unsharded Muon."""
     dist.init_process_group(
         "gloo", rank=rank, world_size=world, init_method=f"tcp://127.0.0.1:{port}"
@@ -73,9 +73,13 @@ def _check_muon_rank(rank: int, world: int, port: int, orthogonalize: str) -> No
         )
         reference = nn.Parameter(full.clone() if exact else _own_rows(full, mesh))
         optimizer = Muon(
-            [{"params": [sharded]}], [{"params": []}], lr=0.1, orthogonalize=orthogonalize
+            [{"params": [sharded]}],
+            [{"params": []}],
+            lr=0.1,
+            orthogonalize=orthogonalize,
+            **options,
         )
-        ref_optimizer = Muon([{"params": [reference]}], [{"params": []}], lr=0.1)
+        ref_optimizer = Muon([{"params": [reference]}], [{"params": []}], lr=0.1, **options)
         for grad in grads:
             sharded.grad = distribute_tensor(grad.clone(), mesh, [Shard(0)], src_data_rank=None)
             reference.grad = grad.clone() if exact else _own_rows(grad, mesh)
@@ -114,7 +118,8 @@ class TestOrthogonalizeExact:
 
 
 class TestMuonOnRowShards:
+    @pytest.mark.parametrize("options", [{}, {"nesterov": True, "adjust_lr": "match_rms_adamw"}])
     @pytest.mark.parametrize("orthogonalize", ["local", "exact"])
-    def test_step_matches_unsharded_muon(self, orthogonalize):
+    def test_step_matches_unsharded_muon(self, orthogonalize, options):
         """Exact steps a shard as rows of the full matrix; local steps it as its own matrix."""
-        mp.spawn(_check_muon_rank, args=(2, _free_port(), orthogonalize), nprocs=2)
+        mp.spawn(_check_muon_rank, args=(2, _free_port(), orthogonalize, options), nprocs=2)

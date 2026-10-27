@@ -7,7 +7,13 @@ import torch
 import torch.nn as nn
 
 from kempnerforge.config.schema import OptimizerConfig
-from kempnerforge.training.optimizer import Muon, _is_muon_eligible, _newton_schulz, build_optimizer
+from kempnerforge.training.optimizer import (
+    Muon,
+    _is_muon_eligible,
+    _muon_update_scale,
+    _newton_schulz,
+    build_optimizer,
+)
 
 
 class TestNewtonSchulz:
@@ -41,6 +47,94 @@ class TestNewtonSchulz:
 
 
 class TestMuon:
+    @pytest.mark.parametrize(
+        ("adjust_lr", "tall", "wide"),
+        [("original", 2.0, 1.0), ("match_rms_adamw", 0.8, 0.8), ("spectral_unclamped", 2.0, 0.5)],
+    )
+    def test_update_scale_modes(self, adjust_lr, tall, wide):
+        """Each adjust_lr mode's factor for a tall 16x4 and a wide 4x16 matrix."""
+        assert _muon_update_scale(adjust_lr, 16, 4) == pytest.approx(tall)
+        assert _muon_update_scale(adjust_lr, 4, 16) == pytest.approx(wide)
+
+    @pytest.mark.parametrize(("rows", "cols"), [(16, 4), (4, 16)])
+    @pytest.mark.parametrize("adjust_lr", ["original", "match_rms_adamw", "spectral_unclamped"])
+    def test_adjust_lr_scales_the_step(self, adjust_lr, rows, cols):
+        """One step moves a tall or a wide weight by lr times the mode's scale times NS(grad)."""
+        torch.manual_seed(0)
+        weight = nn.Parameter(torch.zeros(rows, cols))
+        weight.grad = torch.randn(rows, cols)
+        optimizer = Muon([{"params": [weight]}], [{"params": []}], lr=0.1, adjust_lr=adjust_lr)
+        optimizer.step()
+        expected = -0.1 * _muon_update_scale(adjust_lr, rows, cols) * _newton_schulz(weight.grad)
+        torch.testing.assert_close(weight.data, expected)
+
+    def test_nesterov_orthogonalizes_the_lookahead(self):
+        """With nesterov, Newton-Schulz sees grad + momentum * buffer."""
+        torch.manual_seed(0)
+        grads = [torch.randn(8, 8), torch.randn(8, 8)]
+        weight = nn.Parameter(torch.zeros(8, 8))
+        optimizer = Muon([{"params": [weight]}], [{"params": []}], lr=0.1, nesterov=True)
+        expected = torch.zeros(8, 8)
+        buf = torch.zeros(8, 8)
+        for grad in grads:
+            weight.grad = grad.clone()
+            optimizer.step()
+            buf = 0.95 * buf + grad
+            expected -= 0.1 * _newton_schulz(grad + 0.95 * buf)
+        torch.testing.assert_close(weight.data, expected)
+
+    def test_nesterov_off_matches_the_plain_buffer(self):
+        """Without nesterov, Newton-Schulz sees the momentum buffer."""
+        torch.manual_seed(0)
+        grads = [torch.randn(8, 8), torch.randn(8, 8)]
+        weight = nn.Parameter(torch.zeros(8, 8))
+        optimizer = Muon([{"params": [weight]}], [{"params": []}], lr=0.1)
+        expected = torch.zeros(8, 8)
+        buf = torch.zeros(8, 8)
+        for grad in grads:
+            weight.grad = grad.clone()
+            optimizer.step()
+            buf = 0.95 * buf + grad
+            expected -= 0.1 * _newton_schulz(buf)
+        torch.testing.assert_close(weight.data, expected)
+
+    @pytest.mark.parametrize("adjust_lr", ["original", "match_rms_adamw"])
+    def test_tracks_torch_muon(self, adjust_lr):
+        """With nesterov, three steps land close to torch.optim.Muon's (which runs NS in bf16)."""
+        if not hasattr(torch.optim, "Muon"):
+            pytest.skip("torch.optim.Muon needs torch >= 2.9")
+        torch.manual_seed(0)
+        init = torch.randn(16, 8)
+        grads = [torch.randn(16, 8) for _ in range(3)]
+        ours = nn.Parameter(init.clone())
+        theirs = nn.Parameter(init.clone())
+        kf = Muon(
+            [{"params": [ours]}], [{"params": []}], lr=0.02, nesterov=True, adjust_lr=adjust_lr
+        )
+        ref = torch.optim.Muon(
+            [theirs],
+            lr=0.02,
+            weight_decay=0.0,
+            nesterov=True,
+            adjust_lr_fn=None if adjust_lr == "original" else adjust_lr,
+        )
+        for grad in grads:
+            ours.grad, theirs.grad = grad.clone(), grad.clone()
+            kf.step()
+            ref.step()
+        error = (ours.data - theirs.data).norm() / (theirs.data - init).norm()
+        assert error < 0.05
+
+    def test_rejects_unknown_adjust_lr(self):
+        with pytest.raises(ValueError, match="adjust_lr must be one of"):
+            Muon([{"params": [nn.Parameter(torch.zeros(2, 2))]}], [{"params": []}], adjust_lr="x")
+
+    def test_build_optimizer_passes_nesterov_and_adjust_lr(self):
+        config = OptimizerConfig(name="muon", muon_nesterov=True, muon_adjust_lr="match_rms_adamw")
+        optimizer = build_optimizer(nn.Linear(8, 8), config)
+        assert optimizer.param_groups[0]["nesterov"] is True
+        assert optimizer.param_groups[0]["adjust_lr"] == "match_rms_adamw"
+
     def _make_model(self):
         return nn.Sequential(
             nn.Linear(32, 64),
@@ -381,6 +475,19 @@ class TestMuon:
         optimizer = Muon([{"params": [weight]}], [{"params": []}], orthogonalize="exact")
         optimizer.load_state_dict(saved)
         assert optimizer.param_groups[0]["orthogonalize"] == "local"
+
+    def test_state_saved_before_nesterov_and_adjust_lr_loads_the_old_update(self):
+        """A state saved before ``nesterov`` and ``adjust_lr`` loads with False and "original"."""
+        weight = nn.Parameter(torch.zeros(4, 4))
+        saved = Muon([{"params": [weight]}], [{"params": []}]).state_dict()
+        for group in saved["param_groups"]:
+            del group["nesterov"], group["adjust_lr"]
+        optimizer = Muon(
+            [{"params": [weight]}], [{"params": []}], nesterov=True, adjust_lr="match_rms_adamw"
+        )
+        optimizer.load_state_dict(saved)
+        assert optimizer.param_groups[0]["nesterov"] is False
+        assert optimizer.param_groups[0]["adjust_lr"] == "original"
 
 
 class TestAdamW:
