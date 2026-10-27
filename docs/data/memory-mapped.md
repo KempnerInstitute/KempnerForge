@@ -16,14 +16,35 @@ A directory of shard files, one flat 1-D array per file:
 ├── shard_00000.npy     # or .bin
 ├── shard_00001.npy
 ├── ...
-└── metadata.yaml       # optional — produced by tatm
+└── metadata.yaml       # written by tatm; records the .bin dtype
 ```
 
-Supported formats:
+Each matched file is read according to its own suffix, so one
+`file_pattern` may match both formats. A matched file with any other
+suffix (a `metadata.yaml` or `tokenizer.json` caught by `"*"`, say) is
+an error that names the file.
 
 - **`.npy`** — standard numpy array. Dtype is read from the header.
-- **`.bin`** — raw binary, flat array of tokens. Dtype is inferred:
-  `uint32` if the file size is a multiple of 4, else `uint16`.
+- **`.bin`** — raw binary, flat array of tokens, with no header. Its
+  dtype is, in order:
+  1. `data.token_dtype` (`"uint16"` or `"uint32"`), or the source's own
+     `token_dtype` in a mixture, or `eval.token_dtype` for eval data.
+  2. `tokenized_info.dtype` in the `metadata.yaml` next to the shard,
+     which tatm writes. When both this and a `token_dtype` are set they
+     must agree.
+  3. Neither: the shards are read as `uint32`, with a warning that names
+     both ways to declare the dtype, provided every shard is a whole
+     number of `uint32` tokens. Any other size fits a `uint16` shard and
+     a truncated `uint32` shard alike, so the dataset raises instead.
+
+  Once the dtype is known, a shard whose size is not a whole number of
+  its tokens is rejected when the dataset is built. So is a
+  `metadata.yaml` that cannot be parsed or that records a dtype other
+  than `uint16` or `uint32`.
+
+A `uint16` corpus has to declare its dtype. Read as `uint32`, each pair
+of tokens fuses into one id far outside the vocabulary, and the run fails
+at the first embedding lookup.
 
 The shipped tokenization workflow is external (`tatm`); KempnerForge
 ships a validator, not a tokenizer:
@@ -41,7 +62,8 @@ On construction the dataset:
 
 1. Globs `data_dir/<file_pattern>` and sorts the result — deterministic
    ordering across nodes.
-2. Memory-maps every file.
+2. Resolves the dtype of every `.bin` shard (above), then memory-maps
+   every file.
 3. Computes a cumulative sample count: each file contributes
    `len(file) // seq_len` samples.
 
@@ -65,6 +87,7 @@ padding, no cross-file concatenation at the sample level.
 [data]
 dataset_path = "/path/to/tokens"
 file_pattern = "*.npy"            # or "*.bin"
+token_dtype = ""                  # .bin only: "uint16" or "uint32"; "" reads metadata.yaml
 pack_sequences = false            # see below
 tokenizer_path = ""               # only required when pack_sequences=true
 ```
@@ -120,8 +143,9 @@ sampler and dataloader, not the dataset itself (see
   expect cold-cache reads for the first epoch on corpora larger than
   system RAM. A 1-2% warmup overhead is typical.
 - `uint16` halves the on-disk footprint vs `uint32` and works for any
-  vocabulary ≤ 65535. Llama-3 / Mixtral-class tokenizers (vocab
-  ~128k) need `uint32`.
+  vocabulary ≤ 65535. Llama-3-class tokenizers (vocab 128,256) need
+  `uint32`. A small vocabulary may still be stored as `uint32`, so the
+  vocabulary size does not tell you the dtype; `metadata.yaml` does.
 
 ## See also
 
@@ -130,4 +154,5 @@ sampler and dataloader, not the dataset itself (see
   datasets compose via `MixtureDataset`.
 - [Sampler](sampler.md) — rank partitioning for this dataset type.
 - [`scripts/prepare_data.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/scripts/prepare_data.py) —
-  validator that prints the right `--data.*` flags.
+  validator that resolves the `.bin` dtype the way training does and
+  prints the right `--data.*` flags.
