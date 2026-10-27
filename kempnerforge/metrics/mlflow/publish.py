@@ -15,7 +15,7 @@ blocks on the server under MLflow's own HTTP timeout and retry settings, and
 authentication is whatever the MLflow client finds in the environment. It is an offline
 tool: call it from one process, never from the training step.
 
-Command line: ``python -m kempnerforge.metrics.publish <checkpoint_dir> --metrics <json>``.
+Command line: ``python -m kempnerforge.metrics.mlflow.publish <checkpoint_dir> --metrics <json>``.
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import Any
 
 from kempnerforge.metrics.logger import get_logger
-from kempnerforge.metrics.mlflow_models import find_or_create_checkpoint_model
+from kempnerforge.metrics.mlflow.models import find_or_create_checkpoint_model
 
 logger = get_logger(__name__)
 
@@ -354,7 +354,7 @@ def _load_metrics_file(path: str) -> Any:
 def main(argv: Sequence[str] | None = None) -> int:
     """Command-line entry point; returns the exit code: 0 published, 2 refused, 1 failed."""
     parser = argparse.ArgumentParser(
-        prog="python -m kempnerforge.metrics.publish",
+        prog="python -m kempnerforge.metrics.mlflow.publish",
         description="Append eval metrics to the MLflow run recorded in a checkpoint's "
         "metadata.json, at the checkpoint's step.",
     )

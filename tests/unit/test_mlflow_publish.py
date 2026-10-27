@@ -15,9 +15,9 @@ from typing import Any
 import numpy as np
 import pytest
 
-import kempnerforge.metrics.publish as publish_mod
+import kempnerforge.metrics.mlflow.publish as publish_mod
 from kempnerforge.checkpoint import manager as checkpoint_manager
-from kempnerforge.metrics.publish import (
+from kempnerforge.metrics.mlflow.publish import (
     MlflowTarget,
     PublishRefused,
     main,
@@ -262,7 +262,7 @@ class TestReadMlflowTarget:
     )
     def test_profile_matches_the_training_parser(self, tmp_path, uri):
         """The publisher and the trainer keep separate parsers; pin them to each other."""
-        from kempnerforge.metrics.tracker import _databricks_profile
+        from kempnerforge.metrics.mlflow.auth import _databricks_profile
 
         read_mlflow_target(_sidecar(tmp_path, tracking=[_entry(tracking_uri=uri)]))
         assert os.environ.get("DATABRICKS_CONFIG_PROFILE") == _databricks_profile(uri)
@@ -919,8 +919,8 @@ class TestCli:
         _install_mlflow(monkeypatch)
         argv = ["publish", str(_sidecar(tmp_path)), "--metrics", str(_metrics_file(tmp_path))]
         monkeypatch.setattr(sys, "argv", argv)
-        monkeypatch.delitem(sys.modules, "kempnerforge.metrics.publish")
+        monkeypatch.delitem(sys.modules, "kempnerforge.metrics.mlflow.publish")
         with pytest.raises(SystemExit) as err:
-            runpy.run_module("kempnerforge.metrics.publish", run_name="__main__")
+            runpy.run_module("kempnerforge.metrics.mlflow.publish", run_name="__main__")
         assert err.value.code == 0
         assert "published 1 metric(s)" in capsys.readouterr().out
