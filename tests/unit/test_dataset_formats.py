@@ -235,3 +235,30 @@ class TestTokenMetadataFile:
         (tmp_path / "metadata.yaml").write_text("tokenized_info: [dtype: uint16\n")
         ds = MemoryMappedDataset(str(tmp_path), seq_len=SEQ_LEN)
         assert _samples(ds) == _chunks(tokens)
+
+
+class TestMixedFileFormats:
+    @pytest.mark.parametrize("bin_sorts_first", [True, False], ids=["bin_first", "npy_first"])
+    def test_each_file_is_read_by_its_own_suffix(self, tmp_path, bin_sorts_first):
+        """The format of the first sorted file used to decide how every file was read."""
+        bin_tokens = np.arange(1000, 1067, dtype=np.uint16)
+        npy_tokens = np.arange(100_000, 100_064, dtype=np.uint32)
+        bin_name, npy_name = ("a", "b") if bin_sorts_first else ("b", "a")
+        _write_bin(tmp_path / f"shard_{bin_name}.bin", bin_tokens)
+        np.save(tmp_path / f"shard_{npy_name}.npy", npy_tokens)
+        _write_metadata(tmp_path, "uint16")
+        ds = MemoryMappedDataset(str(tmp_path), seq_len=SEQ_LEN, file_pattern="shard_*")
+        if bin_sorts_first:
+            assert _samples(ds) == _chunks(bin_tokens) + _chunks(npy_tokens)
+        else:
+            assert _samples(ds) == _chunks(npy_tokens) + _chunks(bin_tokens)
+
+    def test_a_matched_file_that_is_neither_bin_nor_npy_is_rejected(self, tmp_path):
+        """A broad pattern over a tatm directory also matches its metadata and tokenizer."""
+        _write_bin(tmp_path / "tokenized_0.bin", np.arange(64, dtype=np.uint32))
+        _write_metadata(tmp_path, "uint32")
+        (tmp_path / "tokenizer.json").write_text("{}")
+        with pytest.raises(ValueError, match="neither a .bin nor a .npy token file") as excinfo:
+            MemoryMappedDataset(str(tmp_path), seq_len=SEQ_LEN, file_pattern="*")
+        assert str(tmp_path / "metadata.yaml") in str(excinfo.value)
+        assert "2 such file(s)" in str(excinfo.value)
