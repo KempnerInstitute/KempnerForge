@@ -248,6 +248,26 @@ class TestReadMlflowTarget:
         read_mlflow_target(_sidecar(tmp_path, tracking=[_entry(tracking_uri=uri)]))
         assert os.environ["DATABRICKS_CONFIG_PROFILE"] == profile
 
+    @pytest.mark.parametrize(
+        "uri",
+        [
+            "databricks://profile-a",
+            "databricks://profile-a/",
+            "databricks://profile-a/x:y",
+            "databricks",
+            "databricks://",
+            "databricks://scope:prefix",
+            "databricks-uc://profile-a",
+            "http://localhost:5000",
+        ],
+    )
+    def test_profile_matches_the_training_parser(self, tmp_path, uri):
+        """The publisher and the trainer keep separate parsers; pin them to each other."""
+        from kempnerforge.metrics.tracker import _databricks_profile
+
+        read_mlflow_target(_sidecar(tmp_path, tracking=[_entry(tracking_uri=uri)]))
+        assert os.environ.get("DATABRICKS_CONFIG_PROFILE") == _databricks_profile(uri)
+
     def test_token_alias_stands_in_like_the_training_backend(self, tmp_path, monkeypatch):
         """A DATABRICKS_API_TOKEN that lets training authenticate must let publishing too."""
         monkeypatch.setenv("DATABRICKS_API_TOKEN", "alias-token")
