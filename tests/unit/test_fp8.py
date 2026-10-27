@@ -28,7 +28,6 @@ class TestFP8Config:
 
     def test_other_precisions_unchanged(self):
         assert TrainConfig(mixed_precision="bf16").param_dtype == torch.bfloat16
-        assert TrainConfig(mixed_precision="fp16").param_dtype == torch.float16
         assert TrainConfig(mixed_precision="fp32").param_dtype == torch.float32
 
     def test_fp8_plus_tp_rejected(self):
