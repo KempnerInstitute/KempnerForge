@@ -209,7 +209,8 @@ committed checkpoint an MLflow external logged model, so the run lists its check
 
 - name `<run name>-step_<N>` (characters MLflow rejects in a model name become `_`, and the run
   id stands in for an empty run name), `model_type = "checkpoint"`, linked to the run;
-- params `step` and `checkpoint_dir`, the absolute path the checkpoint was written to.
+- params `step` and `checkpoint_dir`, the absolute path of the step directory (publishing
+  through the `latest` symlink records the directory it points at).
 
 Nothing is uploaded but the small descriptor MLflow keeps with any external model. The weights
 stay where they were saved, and `checkpoint.keep_last_n` can later delete the directory the
