@@ -310,6 +310,15 @@ class TestOptimizerConfig:
         with pytest.raises(ValueError, match="muon_momentum"):
             OptimizerConfig(muon_momentum=0.0)
 
+    def test_muon_nesterov_and_adjust_lr_defaults(self):
+        config = OptimizerConfig()
+        assert config.muon_nesterov is False
+        assert config.muon_adjust_lr == "original"
+
+    def test_rejects_unknown_muon_adjust_lr(self):
+        with pytest.raises(ValueError, match="muon_adjust_lr must be one of"):
+            OptimizerConfig(muon_adjust_lr="rms")
+
     def test_rejects_bad_muon_ns_steps(self):
         with pytest.raises(ValueError, match="muon_ns_steps"):
             OptimizerConfig(muon_ns_steps=0)
