@@ -181,6 +181,7 @@ def _build_mixture_pipeline(
                 file_pattern=config.data.file_pattern,
                 pack_sequences=config.data.pack_sequences,
                 eos_token_id=eos_token_id,
+                token_dtype=src.token_dtype or config.data.token_dtype,
             )
         elif src.hf_name:
             if not config.data.tokenizer_path:
@@ -240,6 +241,7 @@ def _build_mmap_pipeline(
         file_pattern=config.data.file_pattern,
         pack_sequences=config.data.pack_sequences,
         eos_token_id=eos_token_id,
+        token_dtype=config.data.token_dtype,
     )
     sampler = DistributedSampler(
         dataset,
