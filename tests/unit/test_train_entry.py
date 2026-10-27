@@ -659,6 +659,98 @@ class TestRunTrainingLoop:
         assert handler.finished is True
         assert ckpt.waits == 1
 
+    def test_shutdown_on_a_scheduled_step_saves_it_once(self):
+        """The scheduled save at step 2, with its save hook, is the emergency checkpoint."""
+        config = make_config(max_steps=10)
+        config.checkpoint.interval = 2
+        ckpt = FakeCheckpointManager()
+        handler = FakeShutdownHandler(after_steps=2)
+        hook = RecordingHook()
+        session = make_session(
+            config, checkpointer=ckpt, shutdown_handler=handler, hooks=HookRunner([hook])
+        )
+        step, _ = run_training_loop(session)
+        assert step == 2
+        assert ckpt.saved_steps == [2]
+        assert hook.saves == [2]
+        assert handler.finished is True
+        assert ckpt.waits == 2
+
+    def test_shutdown_on_a_scheduled_step_waits_for_it_before_finishing(self, monkeypatch):
+        """The scheduled save is flushed while the shutdown watchdog is still armed."""
+        config = make_config(max_steps=10)
+        config.checkpoint.interval = 2
+        ckpt = FakeCheckpointManager()
+        handler = FakeShutdownHandler(after_steps=2)
+        finished_at_wait: list[bool] = []
+        real_wait = ckpt.wait
+
+        def wait() -> None:
+            finished_at_wait.append(handler.finished)
+            real_wait()
+
+        monkeypatch.setattr(ckpt, "wait", wait)
+        session = make_session(config, checkpointer=ckpt, shutdown_handler=handler)
+        run_training_loop(session)
+        assert finished_at_wait == [False, True]
+
+    def test_shutdown_after_a_scheduled_save_still_saves_its_own_step(self):
+        """Step 2 is saved on the schedule; a shutdown at step 3 must still save step 3."""
+        config = make_config(max_steps=10)
+        config.checkpoint.interval = 2
+        ckpt = FakeCheckpointManager()
+        handler = FakeShutdownHandler(after_steps=3)
+        session = make_session(config, checkpointer=ckpt, shutdown_handler=handler)
+        step, _ = run_training_loop(session)
+        assert step == 3
+        assert ckpt.saved_steps == [2, 3]
+        assert handler.finished is True
+
+    @pytest.mark.parametrize(
+        "after_steps,expected",
+        [(6, [0, 1, 2, 4, 6]), (1, [0, 1])],
+        ids=["at-step-6", "at-step-1"],
+    )
+    def test_shutdown_inside_a_dynamic_window_saves_each_step_once(self, after_steps, expected):
+        """Inside the window milestones decide: step 1 is saved once and step 6 is still saved."""
+        config = make_config(max_steps=10)
+        config.checkpoint.interval = 2
+        config.checkpoint.dyn_ckpt_window = DynamicCheckpointWindow(start=0, stop=8)
+        ckpt = FakeCheckpointManager()
+        handler = FakeShutdownHandler(after_steps=after_steps)
+        session = make_session(config, checkpointer=ckpt, shutdown_handler=handler)
+        step, _ = run_training_loop(session)
+        assert step == after_steps
+        assert ckpt.saved_steps == expected
+        assert handler.finished is True
+
+    @pytest.mark.parametrize("mode", ["disabled", "async", "async_with_pinned_mem"])
+    def test_shutdown_on_a_scheduled_step_commits_that_one_save(self, monkeypatch, tmp_path, mode):
+        """The real manager saves the step once and has committed it when the loop returns."""
+        from kempnerforge.checkpoint.manager import CheckpointManager
+        from kempnerforge.config.checkpoint import AsyncCheckpointMode
+
+        config = make_config(max_steps=10)
+        config.checkpoint.dir = str(tmp_path)
+        config.checkpoint.interval = 2
+        config.checkpoint.async_mode = AsyncCheckpointMode(mode)
+        session = make_session(config, shutdown_handler=FakeShutdownHandler(after_steps=2))
+        mgr = CheckpointManager(config.checkpoint, session.model, session.optimizer)
+        saved: list[int] = []
+        real_save = mgr.save
+
+        def counting_save(step: int, **kwargs: Any) -> None:
+            saved.append(step)
+            real_save(step, **kwargs)
+
+        monkeypatch.setattr(mgr, "save", counting_save)
+        session.checkpointer = mgr
+        step, _ = run_training_loop(session)
+        assert step == 2
+        assert saved == [2]
+        assert (tmp_path / "latest").resolve() == (tmp_path / "step_2").resolve()
+        assert (tmp_path / "step_2" / ".metadata").is_file()
+
     def test_hooks_fire_for_every_step_and_save(self):
         config = make_config(max_steps=4)
         config.checkpoint.interval = 2
