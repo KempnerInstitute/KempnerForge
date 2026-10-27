@@ -1371,6 +1371,21 @@ class TestAsyncLatestSymlinkSafety:
         step, _, _ = mgr.load()
         assert step == 200
 
+    def test_a_saves_directory_is_pruned_once_a_newer_save_is_under_way(
+        self, tmp_path, monkeypatch
+    ):
+        """Only the latest save is spared as in flight; older ones fall to ``keep_last_n``."""
+        mgr = self._mgr(tmp_path, AsyncCheckpointMode.async_)
+        mgr.config.keep_last_n = 1
+        self._install_async_mock(mgr, monkeypatch)
+
+        for step in (1, 2, 3):
+            mgr.save(step=step)
+        mgr.wait()
+
+        assert sorted(p.name for p in Path(tmp_path).glob("step_*")) == ["step_3"]
+        assert self._latest_target(tmp_path) == (Path(tmp_path) / "step_3").resolve()
+
     # --- coverage for the distributed barrier + resolution edge paths ---
 
     def test_save_runs_barrier_when_distributed(self, tmp_path, monkeypatch):
