@@ -925,6 +925,8 @@ class CheckpointManager:
             protected.add(latest.resolve())
         if self._pending_finalize is not None:
             protected.add(self._pending_finalize[1].resolve())
+        if self._inflight_dir is not None:
+            protected.add(self._inflight_dir.resolve())
 
         # Dynamic-window milestones (whatever steps the configured
         # dyn_ckpt_window strategy fires on) are the dense early-dynamics
