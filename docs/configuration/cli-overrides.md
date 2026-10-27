@@ -94,7 +94,9 @@ the dataclass type hint and coerces:
 
 `Literal` fields reject unknown strings at coercion time — a typo like
 `--train.mixed_precision=bfloat16` (should be `"bf16"`) fails before
-training starts.
+training starts. `"fp16"` passes this check on purpose and is then
+rejected by `TrainConfig.__post_init__`, whose error explains that
+fp16 would train with no loss scaling.
 
 ## Unknown keys
 

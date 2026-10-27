@@ -311,7 +311,7 @@ def publish_metrics(
             target.run_id,
             target.model_name,
             target.step,
-            str(Path(checkpoint_dir).absolute()),
+            str(Path(checkpoint_dir).resolve()),
         )
     if model_id is None:
         # log_batch fills model_id-less metrics with the process's active model

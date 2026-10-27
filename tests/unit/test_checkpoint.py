@@ -2454,12 +2454,13 @@ class TestMuonResume:
         return model, build_optimizer(model, config)
 
     @staticmethod
-    def _save_without(model, opt, key, ckpt_dir):
-        """Save ``opt`` as it was saved before its param groups had ``key``."""
+    def _save_without(model, opt, keys, ckpt_dir):
+        """Save ``opt`` as it was saved before its param groups had ``keys``."""
         from kempnerforge.checkpoint.manager import CheckpointManager
 
         for group in opt.param_groups:
-            del group[key]
+            for key in keys:
+                del group[key]
         CheckpointManager(CheckpointConfig(dir=str(ckpt_dir)), model, opt).save(step=3)
 
     def _batches(self, n):
@@ -2597,7 +2598,7 @@ class TestMuonResume:
 
         model, opt = self._build(seed=0)
         self._train(model, opt, batches[:3])
-        self._save_without(model, opt, "orthogonalize", tmp_path)
+        self._save_without(model, opt, ["orthogonalize"], tmp_path)
 
         model2, opt2 = self._build(seed=1)
         CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model2, opt2).load()
@@ -2634,7 +2635,7 @@ class TestMuonResume:
         model, opt = self._build(seed=0)
         self._train(model, opt, self._batches(3))
         CheckpointManager(CheckpointConfig(dir=str(tmp_path / "complete")), model, opt).save(step=3)
-        self._save_without(model, opt, "orthogonalize", tmp_path / "legacy")
+        self._save_without(model, opt, ["orthogonalize"], tmp_path / "legacy")
 
         assert warnings_on_load(tmp_path / "complete") == []
         assert len(warnings_on_load(tmp_path / "legacy")) == 1
@@ -2645,7 +2646,7 @@ class TestMuonResume:
 
         model, opt = self._build(seed=0)
         self._train(model, opt, self._batches(3))
-        self._save_without(model, opt, "orthogonalize", tmp_path)
+        self._save_without(model, opt, ["orthogonalize"], tmp_path)
 
         model2, opt2 = self._build(seed=1, muon_orthogonalize="exact")
         CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model2, opt2).load()
@@ -2663,6 +2664,54 @@ class TestMuonResume:
         CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model2, opt2).load()
         assert {g["orthogonalize"] for g in opt2.param_groups} == {"exact"}
 
+    @pytest.mark.parametrize(
+        "missing", [["nesterov", "adjust_lr"], ["orthogonalize", "nesterov", "adjust_lr"]]
+    )
+    def test_checkpoint_saved_before_nesterov_and_adjust_lr_resumes_with_the_old_update(
+        self, tmp_path, missing
+    ):
+        """A checkpoint without ``nesterov`` and ``adjust_lr`` resumes with the update it had."""
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        batches = self._batches(6)
+        ref_model, ref_opt = self._build(seed=0)
+        self._train(ref_model, ref_opt, batches)
+
+        model, opt = self._build(seed=0)
+        self._train(model, opt, batches[:3])
+        self._save_without(model, opt, missing, tmp_path)
+
+        model2, opt2 = self._build(seed=1, muon_nesterov=True, muon_adjust_lr="match_rms_adamw")
+        CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model2, opt2).load()
+        groups = {(g["orthogonalize"], g["nesterov"], g["adjust_lr"]) for g in opt2.param_groups}
+        assert groups == {("local", False, "original")}
+
+        self._train(model2, opt2, batches[3:])
+        for (name, ref), p in zip(ref_model.named_parameters(), model2.parameters(), strict=True):
+            assert torch.equal(ref, p), f"{name} diverged from the uninterrupted run"
+
+    def test_checkpoint_resumes_with_the_nesterov_and_adjust_lr_it_was_saved_with(self, tmp_path):
+        """A checkpoint keeps its ``nesterov`` and ``adjust_lr`` over the configured ones."""
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        options = {"muon_nesterov": True, "muon_adjust_lr": "match_rms_adamw"}
+        batches = self._batches(6)
+        ref_model, ref_opt = self._build(seed=0, **options)
+        self._train(ref_model, ref_opt, batches)
+
+        model, opt = self._build(seed=0, **options)
+        self._train(model, opt, batches[:3])
+        CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model, opt).save(step=3)
+
+        model2, opt2 = self._build(seed=1)
+        CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model2, opt2).load()
+        groups = {(g["nesterov"], g["adjust_lr"]) for g in opt2.param_groups}
+        assert groups == {(True, "match_rms_adamw")}
+
+        self._train(model2, opt2, batches[3:])
+        for (name, ref), p in zip(ref_model.named_parameters(), model2.parameters(), strict=True):
+            assert torch.equal(ref, p), f"{name} diverged from the uninterrupted run"
+
     def test_checkpoint_without_another_group_key_still_fails(self, tmp_path):
         """Only the listed keys may be missing; a checkpoint without any other fails to load."""
         from torch.distributed.checkpoint.api import CheckpointException
@@ -2671,7 +2720,7 @@ class TestMuonResume:
 
         model, opt = self._build(seed=0)
         self._train(model, opt, self._batches(3))
-        self._save_without(model, opt, "ns_steps", tmp_path)
+        self._save_without(model, opt, ["ns_steps"], tmp_path)
 
         model2, opt2 = self._build(seed=1)
         missing = r"Missing key in checkpoint state_dict: optimizer\.param_groups\.\d+\.ns_steps"
@@ -2679,7 +2728,7 @@ class TestMuonResume:
             CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model2, opt2).load()
 
     def test_checkpoint_without_inner_state_or_orthogonalize_resumes_muon(self, tmp_path):
-        """The oldest Muon checkpoints lack both the inner AdamW and ``orthogonalize``."""
+        """The oldest Muon checkpoints lack the inner AdamW and every legacy group key."""
         from torch.distributed.checkpoint.state_dict import (
             get_model_state_dict,
             get_optimizer_state_dict,
@@ -2690,7 +2739,7 @@ class TestMuonResume:
         model, opt = self._build(seed=0)
         self._train(model, opt, self._batches(3))
         for group in opt.param_groups:
-            del group["orthogonalize"]
+            del group["orthogonalize"], group["nesterov"], group["adjust_lr"]
         step_dir = tmp_path / "step_3"
         state = {
             "model": get_model_state_dict(model),
@@ -2702,7 +2751,8 @@ class TestMuonResume:
         CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model2, opt2).load(
             path=str(step_dir)
         )
-        assert {g["orthogonalize"] for g in opt2.param_groups} == {"local"}
+        groups = {(g["orthogonalize"], g["nesterov"], g["adjust_lr"]) for g in opt2.param_groups}
+        assert groups == {("local", False, "original")}
         self._assert_same_state(opt, opt2, "Muon")
 
 

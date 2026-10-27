@@ -60,6 +60,10 @@ File:
 
 - `batch_size`, `seq_len`, `max_steps`, `grad_accum_steps` all positive.
 - `grad_clip_norm > 0`.
+- `mixed_precision = "fp16"` is rejected, since there is no loss scaling; use `"bf16"`,
+  or `"fp32"` on GPUs without bf16. A TOML that sets it fails to load everywhere,
+  including `scripts/eval.py`, `generate.py` and `convert_checkpoint.py`, and a CLI
+  override cannot fix it, so edit the TOML.
 
 ### `OptimizerConfig`
 
@@ -71,6 +75,7 @@ File:
 - `betas[0], betas[1] ∈ [0, 1)`.
 - `muon_momentum ∈ (0, 1)`.
 - `muon_ns_steps > 0`.
+- `muon_adjust_lr ∈ {"original", "match_rms_adamw", "spectral_unclamped"}`.
 - `muon_orthogonalize ∈ {"local", "exact"}`.
 - `schedule_free_warmup_steps ≥ 0`.
 

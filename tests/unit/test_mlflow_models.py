@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import errno
 import inspect
+import os
+import shutil
 
 import pytest
 
@@ -55,8 +58,59 @@ class TestFindOrCreateCheckpointModel:
             "create_logged_model",
             "log_model_artifacts",
             "finalize_logged_model",
+            "search_logged_models",
         ]
         assert {uri for _, uri, _ in model_store.calls} == {"uri-a"}
+
+    def test_settles_on_a_model_made_earlier_while_it_made_its_own(self, model_store, monkeypatch):
+        rival: list = []
+        add = model_store.add
+
+        def rival_first(name, **kwargs):
+            if kwargs.get("status") == "PENDING" and not rival:
+                rival.append(add(name))
+            return add(name, **kwargs)
+
+        monkeypatch.setattr(model_store, "add", rival_first)
+        assert _find_or_create(model_store) == rival[0].model_id
+        assert [m.status for m in model_store.models] == ["READY", "READY"]
+
+    def test_keeps_its_own_model_when_the_search_does_not_list_it_yet(self, model_store):
+        client = model_store.client("uri-a")
+        search = client.search_logged_models
+        searched: list = []
+
+        def lagging(*args, **kwargs):
+            searched.append(kwargs)
+            page = search(*args, **kwargs)
+            return page if len(searched) == 1 else type(page)([], None)
+
+        client.search_logged_models = lagging
+        model_id = find_or_create_checkpoint_model(
+            client, "run-xyz", "run-a-step_5", 5, "ckpts/step_5"
+        )
+        (model,) = model_store.models
+        assert model_id == model.model_id and model.status == "READY"
+        assert len(searched) == 2
+
+    def test_a_temp_dir_that_cannot_be_removed_still_leaves_a_ready_model(
+        self, model_store, monkeypatch
+    ):
+        left: list = []
+
+        def busy(path, *args, **kwargs):
+            left.append(path)
+            raise OSError(errno.ENOTEMPTY, "Directory not empty", path)
+
+        monkeypatch.setattr(os, "rmdir", busy)
+        model_id = _find_or_create(model_store)
+        monkeypatch.undo()
+        for path in left:
+            if os.path.isabs(path):
+                shutil.rmtree(path, ignore_errors=True)
+        (model,) = model_store.models
+        assert model_id == model.model_id and model.status == "READY"
+        assert left
 
     def test_reuses_the_runs_ready_model_without_creating_one(self, model_store):
         model = model_store.add("run-a-step_5")
