@@ -12,11 +12,15 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import stat
+import threading
+import uuid
 from collections.abc import Callable, Container, Iterable
+from functools import partial
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Protocol, TypeGuard, cast
 
 import torch
 import torch.distributed as dist
@@ -53,6 +57,26 @@ _NEVER_STEPPED_PREFIX = f"{_NEVER_STEPPED_KEY}."
 _OPTIM_PREFIX = "optimizer."
 # Reports the logging runs live at save time, one JSON-ready record each, for metadata.json.
 TrackingSource = Callable[[], list[dict[str, str]]]
+CheckpointRecord = Callable[[str, dict[str, str]], None]
+
+
+class CheckpointRegistrar(Protocol):
+    """Records checkpoints with the logging backends, which this module never imports."""
+
+    def checkpoint_fields(self, step: int) -> dict[str, dict[str, str]]:
+        """Fields each backend adds to its record of the checkpoint saved at ``step``, by backend.
+
+        Called on rank 0 inside ``save()``, so it must answer from what it holds, never a server.
+        """
+        ...
+
+    def register_checkpoint(self, step: int, directory: Path, record: CheckpointRecord) -> None:
+        """Register the checkpoint at ``directory`` once ``latest`` points at it.
+
+        Called on rank 0 when the checkpoint is committed, so it must not block. ``record`` adds
+        fields to a backend's record in that checkpoint's ``metadata.json``, from any thread, later.
+        """
+        ...
 
 
 def _saved_optimizer_param_groups(saved_keys: Iterable[str]) -> int:
@@ -266,7 +290,7 @@ def _load_train_state(path: Path) -> dict[str, Any]:
     return torch.load(path, map_location="cpu", weights_only=False)
 
 
-def _names_backends(tracking: object) -> bool:
+def _names_backends(tracking: object) -> TypeGuard[list[dict[str, Any]]]:
     """True for a list of mappings that each name a ``backend``, the shape readers select on."""
     return isinstance(tracking, list) and all(
         isinstance(entry, dict)
@@ -274,6 +298,49 @@ def _names_backends(tracking: object) -> bool:
         and entry["backend"].strip()
         for entry in tracking
     )
+
+
+def _string_fields(fields: object) -> bool:
+    """True for a mapping of strings to strings, what a tracking record can hold."""
+    return isinstance(fields, dict) and all(
+        isinstance(key, str) and isinstance(value, str) for key, value in fields.items()
+    )
+
+
+def _replace_file(path: Path, text: str) -> None:
+    """Replace ``path`` with ``text`` atomically: a temp file beside it, then a rename over it.
+
+    An existing file keeps its mode, and its replacement is never readable more widely while it is
+    written; a new one gets the mode a plain write would give it.
+    """
+    try:
+        mode: int | None = stat.S_IMODE(path.stat().st_mode)
+    except FileNotFoundError:
+        mode = None
+    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666 if mode is None else 0o600)
+    try:
+        with os.fdopen(fd, "w") as f:
+            if mode is not None:
+                os.fchmod(f.fileno(), mode)
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+_URI_USERINFO = re.compile(r"(?<=://)[^/?#\s]+@")
+
+
+def _error_text(error: BaseException) -> str:
+    """``error``'s message with the userinfo of every URI in it removed; never raises."""
+    try:
+        return _URI_USERINFO.sub("", str(error))
+    except Exception:
+        return f"<unprintable {type(error).__name__}>"
 
 
 class CheckpointManager:
@@ -319,8 +386,9 @@ class CheckpointManager:
         # the flush completes (drained at the next save() or wait()), so
         # `latest` never points at a half-written checkpoint. (step, ckpt_dir).
         self._pending_finalize: tuple[int, Path] | None = None
-        # Late-bound because the tracker is built after the manager; see set_tracking_source().
         self._tracking_source: TrackingSource | None = None
+        self._registrar: CheckpointRegistrar | None = None
+        self._sidecar_lock = threading.Lock()
         # Dedicated gloo group for the manager's own synchronization
         # (the end-of-save barrier). dcp.async_save() runs its collective
         # planning (all_gather/reduce_scatter) on a background thread using
@@ -354,7 +422,7 @@ class CheckpointManager:
         return (self._dcp_dir(ckpt_dir) / _DCP_METADATA_FILE).exists()
 
     def _commit_latest(self, step: int, ckpt_dir: Path) -> None:
-        """Atomically point `latest` at a now-durable checkpoint, then prune.
+        """Atomically point `latest` at a now-durable checkpoint, register it, then prune.
 
         Rank 0 only. Called either inline (sync mode, DCP already durable) or
         deferred (async mode, after the flush future has resolved).
@@ -365,20 +433,24 @@ class CheckpointManager:
         tmp_link.symlink_to(ckpt_dir.name)
         tmp_link.rename(latest)
         logger.info(f"Checkpoint committed: {ckpt_dir} (step={step})")
+        self._register_committed(step, ckpt_dir)
         self._cleanup()
 
-    def _drain_pending_finalize(self) -> None:
+    def _drain_pending_finalize(self, overwriting: Path | None = None) -> None:
         """Commit a deferred async checkpoint once its flush is durable.
 
         Invoked after the pending DCP future has been awaited (next save()
         or an explicit wait()/flush). Rank 0 performs the symlink + cleanup;
         other ranks no-op (they never touch the symlink), mirroring save().
+        A checkpoint pending in ``overwriting``, the directory a new save's
+        flush is rewriting, is dropped uncommitted and unregistered; that
+        save's own deferred commit points `latest` at it and registers it.
         """
         if self._pending_finalize is None:
             return
         step, ckpt_dir = self._pending_finalize
         self._pending_finalize = None
-        if self._rank == 0:
+        if self._rank == 0 and ckpt_dir != overwriting:
             self._commit_latest(step, ckpt_dir)
 
     def _sync_barrier(self) -> None:
@@ -404,6 +476,46 @@ class CheckpointManager:
             )
         self._tracking_source = source
 
+    def set_checkpoint_registrar(self, registrar: CheckpointRegistrar | None) -> None:
+        """Record every later checkpoint with the logging backends through ``registrar``.
+
+        Both of its methods run on rank 0 only. ``checkpoint_fields`` is asked inside ``save()``
+        when a backend has a live run, and its fields join that save's ``tracking`` records.
+        ``register_checkpoint`` gets each checkpoint once it is committed, with a
+        ``record(backend, fields)`` that later adds fields to that backend's record, atomically
+        and from any thread. A registrar that raises, or answers what a record cannot hold, costs
+        only those fields or that registration, never the save or the commit. ``None`` detaches it.
+        """
+        if registrar is not None and not all(
+            callable(getattr(registrar, name, None))
+            for name in ("checkpoint_fields", "register_checkpoint")
+        ):
+            raise TypeError(
+                "checkpoint registrar must have callable checkpoint_fields and "
+                f"register_checkpoint, or be None; got {type(registrar).__name__}"
+            )
+        self._registrar = registrar
+
+    def _with_checkpoint_fields(
+        self, tracking: list[dict[str, str]], step: int
+    ) -> list[dict[str, str]]:
+        """``tracking`` plus the fields each backend adds for this save; as given if none."""
+        if self._registrar is None:
+            return tracking
+        try:
+            added = self._registrar.checkpoint_fields(step)
+            if not isinstance(added, dict):
+                raise TypeError(f"expected a dict of fields by backend, got {type(added).__name__}")
+            merged = [{**entry, **added.get(entry["backend"], {})} for entry in tracking]
+            if not all(_string_fields(entry) for entry in merged):
+                raise TypeError("fields must be strings")
+        except Exception as e:
+            logger.warning(
+                "Could not add the checkpoint fields of step %s: %s", step, _error_text(e)
+            )
+            return tracking
+        return merged
+
     def _sidecar_text(self, meta: dict[str, Any]) -> str:
         """``meta`` as JSON, plus the live tracking runs when the source can supply them.
 
@@ -416,10 +528,63 @@ class CheckpointManager:
                 if tracking:
                     if not _names_backends(tracking):
                         raise TypeError("expected a list of mappings that each name a backend")
+                    tracking = self._with_checkpoint_fields(tracking, meta["step"])
                     return json.dumps({**meta, "tracking": tracking}, indent=2)
             except Exception as e:
-                logger.warning("Could not record the tracking runs in %s: %s", _METADATA_FILE, e)
+                logger.warning(
+                    "Could not record the tracking runs in %s: %s", _METADATA_FILE, _error_text(e)
+                )
         return json.dumps(meta, indent=2)
+
+    def _register_committed(self, step: int, ckpt_dir: Path) -> None:
+        """Hand a just-committed checkpoint to the registrar, which must not block."""
+        if self._registrar is None:
+            return
+        try:
+            self._registrar.register_checkpoint(
+                step, ckpt_dir, partial(self._record, step, ckpt_dir)
+            )
+        except Exception as e:
+            logger.warning(
+                "Could not register %s with the tracking backends: %s",
+                ckpt_dir.name,
+                _error_text(e),
+            )
+
+    def _record(self, step: int, ckpt_dir: Path, backend: str, fields: dict[str, str]) -> None:
+        """Add ``fields`` to ``backend``'s record in the ``metadata.json`` of step ``step``.
+
+        The registrar's ``record``: callable from any thread, and it never raises. The file is read
+        and replaced atomically under the sidecar lock, so a reader always sees a whole file and an
+        amend never overwrites a newer save of the step. Only an existing record in that step's own
+        sidecar is amended: a checkpoint removed since, or saved without that backend's record, is
+        skipped quietly.
+        """
+        path = ckpt_dir / _METADATA_FILE
+        try:
+            if not isinstance(backend, str) or not _string_fields(fields):
+                raise TypeError("expected a backend name and fields of strings")
+            with self._sidecar_lock:
+                try:
+                    meta = json.loads(path.read_text())
+                except FileNotFoundError:
+                    logger.debug("%s is gone; the %s fields are not recorded", path, backend)
+                    return
+                if not isinstance(meta, dict) or meta.get("step") != step:
+                    raise ValueError(f"it is not the metadata of step {step}")
+                tracking = meta.get("tracking")
+                if not _names_backends(tracking) or all(e["backend"] != backend for e in tracking):
+                    logger.debug("%s has no %s record; its fields are not recorded", path, backend)
+                    return
+                meta["tracking"] = [
+                    {**entry, **fields} if entry["backend"] == backend else entry
+                    for entry in tracking
+                ]
+                _replace_file(path, json.dumps(meta, indent=2))
+        except Exception as e:
+            logger.warning(
+                "Could not record the %s fields in %s: %s", backend, path, _error_text(e)
+            )
 
     def save(
         self,
@@ -472,7 +637,7 @@ class CheckpointManager:
         # The prior async checkpoint's flush is now guaranteed durable (the
         # dispatch above awaited it). Commit its `latest` symlink + cleanup
         # before doing anything else.
-        self._drain_pending_finalize()
+        self._drain_pending_finalize(overwriting=ckpt_dir)
 
         # Save non-distributed state (rank 0 only). These are small synchronous
         # writes; they finish well before `latest` is ever pointed here, so
@@ -494,7 +659,9 @@ class CheckpointManager:
                 # a sorted, deduplicated list of {"module", "frozen"} dicts so
                 # the comparison on load is reorder-invariant.
                 meta["vlm_freeze"] = extra["vlm_freeze"]
-            (ckpt_dir / _METADATA_FILE).write_text(self._sidecar_text(meta))
+            text = self._sidecar_text(meta)
+            with self._sidecar_lock:
+                _replace_file(ckpt_dir / _METADATA_FILE, text)
 
         if sync_mode:
             # DCP shards are already durable — commit immediately.
@@ -939,7 +1106,8 @@ class CheckpointManager:
             if d.resolve() in protected:
                 continue
             try:
-                shutil.rmtree(d)
+                with self._sidecar_lock:
+                    shutil.rmtree(d)
             except OSError as e:
                 logger.warning(
                     f"Could not remove old checkpoint {d} ({e}); the next cleanup retries it"

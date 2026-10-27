@@ -129,6 +129,8 @@ are shared (AdamW/Lion) or optimizer-specific.
 | `muon_momentum` | `float` | `0.95` | Muon momentum coefficient |
 | `muon_ns_steps` | `int` | `5` | Newton–Schulz iterations for Muon |
 | `muon_adam_lr` | `float \| None` | `None` | LR for 1-D params in Muon's AdamW fallback; `None` → same as `lr` |
+| `muon_nesterov` | `bool` | `False` | Orthogonalize the Nesterov look-ahead instead of the momentum buffer |
+| `muon_adjust_lr` | `"original" \| "match_rms_adamw" \| "spectral_unclamped"` | `"original"` | Factor on each orthogonalized update |
 | `muon_orthogonalize` | `"local" \| "exact"` | `"local"` | Newton–Schulz on each rank's shard, or on the full matrix |
 | `schedule_free_warmup_steps` | `int` | `0` | internal warmup for schedule-free |
 
@@ -227,7 +229,7 @@ Parallelism dimensions and NCCL settings.
 | `tp` | `int` | `1` | tensor parallel |
 | `pp` | `int` | `1` | pipeline parallel |
 | `pp_schedule` | `"1f1b" \| "gpipe" \| "interleaved_1f1b"` | `"1f1b"` | pipeline schedule |
-| `cp` | `int` | `1` | context parallel (stub; PyTorch 2.11 ring attention) |
+| `cp` | `int` | `1` | context parallel; reserved, not implemented, must be `1` (`cp > 1` is rejected at load) |
 | `ep` | `int` | `1` | expert parallel (MoE only) |
 | `nccl_timeout_sec` | `int` | `1800` | NCCL collective timeout |
 | `backend` | `str` | `"cpu:gloo,cuda:nccl"` | `torch.distributed` backend mapping |
@@ -322,6 +324,7 @@ Logging cadence and backend toggles.
 | `mlflow_run_id` | `str` | `""` | restored from checkpoint on resume; empty = new run |
 | `mlflow_log_system_metrics` | `bool` | `True` | sample CPU/GPU/memory on a background thread |
 | `mlflow_system_metrics_interval` | `float` | `10.0` | seconds between system-metric samples |
+| `mlflow_register_checkpoints` | `bool` | `False` | register each committed checkpoint as an MLflow external model on the background worker; `metadata.json` records its `model_name` at save and its `model_id` once registered; requires `enable_mlflow` |
 
 ## `[profiling]` — `ProfilingConfig`
 

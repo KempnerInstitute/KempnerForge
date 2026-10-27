@@ -75,6 +75,7 @@ File:
 - `betas[0], betas[1] ∈ [0, 1)`.
 - `muon_momentum ∈ (0, 1)`.
 - `muon_ns_steps > 0`.
+- `muon_adjust_lr ∈ {"original", "match_rms_adamw", "spectral_unclamped"}`.
 - `muon_orthogonalize ∈ {"local", "exact"}`.
 - `schedule_free_warmup_steps ≥ 0`.
 
@@ -134,6 +135,10 @@ File:
 - `dp_shard ∈ {-1} ∪ {1, 2, …}` (negative values other than `-1`
   rejected; `-1` is the auto-resolve sentinel).
 - `dp_replicate, tp, pp, cp, ep ≥ 1`.
+- `cp == 1`. Context parallelism is not implemented and the mesh has no
+  `cp` dimension, so `cp > 1` would build a mesh that leaves ranks out,
+  or train as plain FSDP when `cp` equals the world size. Rejecting it
+  here stops the run before `init_distributed`.
 
 World-size validation happens in `validate_world_size` (called from
 `JobConfig.validate`).
@@ -160,6 +165,7 @@ File:
 - `mlflow_description`, when set, is a non-empty string.
 - `mlflow_tags` maps non-empty string names to non-empty string values; the error names
   the offending key.
+- `mlflow_register_checkpoints` requires `enable_mlflow`.
 
 ### `ProfilingConfig`
 

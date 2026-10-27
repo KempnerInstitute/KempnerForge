@@ -310,6 +310,15 @@ class TestOptimizerConfig:
         with pytest.raises(ValueError, match="muon_momentum"):
             OptimizerConfig(muon_momentum=0.0)
 
+    def test_muon_nesterov_and_adjust_lr_defaults(self):
+        config = OptimizerConfig()
+        assert config.muon_nesterov is False
+        assert config.muon_adjust_lr == "original"
+
+    def test_rejects_unknown_muon_adjust_lr(self):
+        with pytest.raises(ValueError, match="muon_adjust_lr must be one of"):
+            OptimizerConfig(muon_adjust_lr="rms")
+
     def test_rejects_bad_muon_ns_steps(self):
         with pytest.raises(ValueError, match="muon_ns_steps"):
             OptimizerConfig(muon_ns_steps=0)
@@ -353,6 +362,40 @@ class TestDistributedConfig:
     def test_rejects_bad_dp_shard(self):
         with pytest.raises(ValueError, match="dp_shard must be"):
             DistributedConfig(dp_shard=-2)
+
+    @pytest.mark.parametrize("cp", [2, 3, 4])
+    def test_rejects_context_parallel(self, cp):
+        """CP is not implemented, so cp > 1 would build a mesh without it."""
+        with pytest.raises(ValueError, match=f"cp={cp} is not supported"):
+            DistributedConfig(cp=cp)
+
+    def test_rejects_context_parallel_with_an_explicit_dp_shard(self):
+        """An explicit dp_shard does not bypass the check; dp_shard=4, cp=2 leaves ranks out."""
+        with pytest.raises(ValueError, match="cp=2 is not supported"):
+            DistributedConfig(dp_shard=4, cp=2)
+
+    def test_rejects_context_parallel_set_after_construction(self):
+        """A cp changed after construction is rejected when resolve() rebuilds the config."""
+        config = DistributedConfig()
+        config.cp = 2
+        with pytest.raises(ValueError, match="cp=2 is not supported"):
+            config.resolve(world_size=8)
+
+    def test_rejects_context_parallel_at_load(self, tmp_path):
+        """A TOML key or CLI override fails at load, before any distributed init."""
+        toml = tmp_path / "cp.toml"
+        toml.write_text("[distributed]\ncp = 2\n")
+        with pytest.raises(ValueError, match="cp=2 is not supported"):
+            load_config(str(toml), cli_args=[])
+        with pytest.raises(ValueError, match="cp=4 is not supported"):
+            load_config(cli_args=["--distributed.cp=4"])
+
+    def test_cp_one_still_loads(self, tmp_path):
+        """Configs that spell out the default cp = 1 keep loading."""
+        toml = tmp_path / "cp.toml"
+        toml.write_text("[distributed]\ncp = 1\n")
+        config = load_config(str(toml), cli_args=[])
+        assert config.distributed.resolve(world_size=8).dp_shard == 8
 
     def test_auto_dp_not_divisible(self):
         d = DistributedConfig(dp_shard=-1, tp=3)
@@ -517,6 +560,22 @@ class TestMetricsConfig:
     def test_rejects_negative_log_interval(self):
         with pytest.raises(ValueError, match="log_interval must be positive"):
             MetricsConfig(log_interval=-1)
+
+    def test_checkpoint_registration_is_off_by_default_and_set_from_toml_or_cli(self, tmp_path):
+        assert MetricsConfig().mlflow_register_checkpoints is False
+        assert load_config(None, cli_args=[]).metrics.mlflow_register_checkpoints is False
+        toml = tmp_path / "job.toml"
+        toml.write_text("[metrics]\nenable_mlflow = true\nmlflow_register_checkpoints = true\n")
+        assert load_config(str(toml), cli_args=[]).metrics.mlflow_register_checkpoints is True
+        args = ["--metrics.mlflow_register_checkpoints=false"]
+        assert load_config(str(toml), cli_args=args).metrics.mlflow_register_checkpoints is False
+
+    def test_checkpoint_registration_needs_the_mlflow_backend(self):
+        with pytest.raises(ValueError, match="mlflow_register_checkpoints requires enable_mlflow"):
+            MetricsConfig(mlflow_register_checkpoints=True)
+        with pytest.raises(ValueError, match="mlflow_register_checkpoints requires enable_mlflow"):
+            load_config(None, cli_args=["--metrics.mlflow_register_checkpoints=true"])
+        MetricsConfig(enable_mlflow=True, mlflow_register_checkpoints=True)
 
 
 # ---------------------------------------------------------------------------
