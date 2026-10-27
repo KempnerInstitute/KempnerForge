@@ -17,7 +17,7 @@ PAGE_LIMIT = 50
 class FakeModelStore:
     """An MLflow server's runs and logged models, reached through ``client(tracking_uri)``.
 
-    The client has the five ``MlflowClient`` calls a checkpoint model needs. ``calls`` lists
+    The client has the six ``MlflowClient`` calls a checkpoint model needs. ``calls`` lists
     each as (call, tracking URI, thread id), ``page_sizes`` the ``max_results`` of each search,
     and ``uploads`` the files uploaded per model id. ``fail(call, error)`` makes a call raise;
     ``hold(call)`` parks it, after setting ``entered``, until ``release`` is set.
@@ -139,6 +139,11 @@ class _FakeModelClient:
         self._store._enter("finalize_logged_model", self._uri)
         (model,) = [m for m in self._store.models if m.model_id == model_id]
         model.status = str(status)
+        return model
+
+    def get_logged_model(self, model_id):
+        self._store._enter("get_logged_model", self._uri)
+        (model,) = [m for m in self._store.models if m.model_id == model_id]
         return model
 
 

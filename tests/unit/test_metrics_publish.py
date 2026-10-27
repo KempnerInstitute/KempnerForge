@@ -92,6 +92,7 @@ _MODEL_CALLS = (
     "get_run",
     "search_logged_models",
     "create_logged_model",
+    "get_logged_model",
     "log_model_artifacts",
     "finalize_logged_model",
 )
