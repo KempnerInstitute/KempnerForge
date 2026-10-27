@@ -56,15 +56,16 @@ class TestMuon:
         assert _muon_update_scale(adjust_lr, 16, 4) == pytest.approx(tall)
         assert _muon_update_scale(adjust_lr, 4, 16) == pytest.approx(wide)
 
+    @pytest.mark.parametrize(("rows", "cols"), [(16, 4), (4, 16)])
     @pytest.mark.parametrize("adjust_lr", ["original", "match_rms_adamw", "spectral_unclamped"])
-    def test_adjust_lr_scales_the_step(self, adjust_lr):
-        """One step moves the weight by lr times the mode's scale times NS(grad)."""
+    def test_adjust_lr_scales_the_step(self, adjust_lr, rows, cols):
+        """One step moves a tall or a wide weight by lr times the mode's scale times NS(grad)."""
         torch.manual_seed(0)
-        weight = nn.Parameter(torch.zeros(16, 4))
-        weight.grad = torch.randn(16, 4)
+        weight = nn.Parameter(torch.zeros(rows, cols))
+        weight.grad = torch.randn(rows, cols)
         optimizer = Muon([{"params": [weight]}], [{"params": []}], lr=0.1, adjust_lr=adjust_lr)
         optimizer.step()
-        expected = -0.1 * _muon_update_scale(adjust_lr, 16, 4) * _newton_schulz(weight.grad)
+        expected = -0.1 * _muon_update_scale(adjust_lr, rows, cols) * _newton_schulz(weight.grad)
         torch.testing.assert_close(weight.data, expected)
 
     def test_nesterov_orthogonalizes_the_lookahead(self):
