@@ -1345,6 +1345,32 @@ class TestAsyncLatestSymlinkSafety:
         assert not dirs[1].exists()
         assert not dirs[2].exists()
 
+    @pytest.mark.parametrize(
+        "mode",
+        [AsyncCheckpointMode.async_, AsyncCheckpointMode.async_pinned],
+        ids=["async", "async_with_pinned_mem"],
+    )
+    def test_an_async_save_after_a_rewind_keeps_the_directory_it_writes(
+        self, tmp_path, monkeypatch, mode
+    ):
+        """Newer leftovers fill ``keep_last_n``, yet the save in flight keeps its directory."""
+        mgr = self._mgr(tmp_path, mode)
+        self._install_async_mock(mgr, monkeypatch)
+        for step in (100, 300, 400, 500):
+            self._build_ckpt(tmp_path, step, complete=True)
+        (Path(tmp_path) / "latest").symlink_to("step_100")
+
+        mgr.save(step=150)
+        mgr.save(step=200)
+        mgr.wait()
+
+        written = Path(tmp_path) / "step_200"
+        assert self._latest_target(tmp_path) == written.resolve()
+        assert (written / ".metadata").exists()
+        assert (written / "train_state.pt").exists()
+        step, _, _ = mgr.load()
+        assert step == 200
+
     # --- coverage for the distributed barrier + resolution edge paths ---
 
     def test_save_runs_barrier_when_distributed(self, tmp_path, monkeypatch):
