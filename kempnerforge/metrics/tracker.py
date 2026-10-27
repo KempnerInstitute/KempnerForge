@@ -1,6 +1,3 @@
-# pyright: reportMissingImports=false
-# ^ mlflow + databricks-sdk are an optional group; CI type-checks without them,
-#   so the lazy imports below would otherwise raise reportMissingImports.
 """Metrics collection, accumulation, and reporting.
 
 MetricsTracker aggregates per-step metrics (loss, grad norm, throughput,
@@ -942,7 +939,8 @@ class MLflowBackend(_LoggingBackend):
             self._active = False
         except ImportError:
             logger.warning(
-                "mlflow not installed — disabling MLflow backend (uv sync --group mlflow)"
+                "mlflow could not be imported; disabling MLflow backend "
+                "(the environment is incomplete, run: uv sync)"
             )
             self._active = False
         except Exception as e:  # mlflow talks to a remote server: network / auth / config errors

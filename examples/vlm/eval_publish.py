@@ -44,7 +44,10 @@ _TABLE_COLUMNS = ["step", "benchmark", "metric", "filter", "score", "stderr", "n
 _NAME_SEPARATORS = re.compile(r"[^A-Za-z0-9.-]+")
 # MLflow errors quote tracking URIs verbatim, and a URI can carry credentials anywhere in it.
 _URL = re.compile(r"\b([a-zA-Z][a-zA-Z0-9+.-]*://)[^\s'\"<>]+")
-_DEPENDENCY_GROUPS = {"mlflow": "mlflow", "pandas": "eval"}
+_INSTALL_HINTS = {
+    "mlflow": "the environment is incomplete, run: uv sync",
+    "pandas": "install it with: uv sync --group eval",
+}
 
 
 @dataclass(frozen=True)
@@ -169,14 +172,13 @@ def _failure(error: Exception) -> str:
 
 
 def _import(module: str) -> Any:
-    """``module``, or an ImportError naming its dependency group: a broken install can raise
+    """``module``, or an ImportError saying how to install it: a broken install can raise
     errors that are not ImportErrors (a binary incompatibility is a ValueError)."""
     try:
         return importlib.import_module(module)
     except Exception as e:
         raise ImportError(
-            f"{module} could not be imported ({_failure(e)}); "
-            f"install it with: uv sync --group {_DEPENDENCY_GROUPS[module]}"
+            f"{module} could not be imported ({_failure(e)}); {_INSTALL_HINTS[module]}"
         ) from e
 
 
@@ -190,7 +192,7 @@ def preflight(checkpoint: Path, limit: int | float | None) -> None:
         problems.append(str(e))
     except Exception as e:
         problems.append(f"the checkpoint's metadata.json could not be read ({_failure(e)})")
-    for module in _DEPENDENCY_GROUPS:
+    for module in _INSTALL_HINTS:
         try:
             _import(module)
         except ImportError as e:
