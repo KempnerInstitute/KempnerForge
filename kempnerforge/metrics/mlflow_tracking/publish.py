@@ -15,8 +15,7 @@ blocks on the server under MLflow's own HTTP timeout and retry settings, and
 authentication is whatever the MLflow client finds in the environment. It is an offline
 tool: call it from one process, never from the training step.
 
-Command line:
-``python -m kempnerforge.metrics.mlflow_tracking.publish <checkpoint_dir> --metrics <json>``.
+Command line: ``python -m kempnerforge.metrics.mlflow_tracking.publish <checkpoint_dir> --metrics <json>``.
 """
 
 from __future__ import annotations
