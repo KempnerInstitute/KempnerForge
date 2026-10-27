@@ -56,6 +56,13 @@ class TestDatasetSource:
         with pytest.raises(ValueError, match="positive"):
             DatasetSource(path="/data", weight=-1.0)
 
+    def test_token_dtype_defaults_to_empty(self):
+        assert DatasetSource(path="/data/code").token_dtype == ""
+
+    def test_token_dtype_rejects_anything_else(self):
+        with pytest.raises(ValueError, match=r"\[\[data.datasets\]\] token_dtype must be"):
+            DatasetSource(path="/data/code", token_dtype="int32")
+
     def test_must_have_path_or_hf_name(self):
         """Validated at DataConfig level (not DatasetSource) to allow TOML loader defaults."""
         with pytest.raises(ValueError, match="path or hf_name"):
