@@ -83,6 +83,7 @@ dataset = MemoryMappedDataset(
     data_dir=config.data.dataset_path,
     file_pattern=config.data.file_pattern,
     seq_len=config.train.seq_len,
+    token_dtype=config.data.token_dtype,
 )
 subset = Subset(dataset, list(range(2048)))   # bound the sample count
 
