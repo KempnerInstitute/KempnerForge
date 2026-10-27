@@ -36,16 +36,18 @@ def find_or_create_checkpoint_model(
     ``client`` is an ``mlflow.MlflowClient``; every call goes through it. Of several READY models
     of the run with that name, the earliest is used, so a checkpoint registered again (saved
     twice, re-run after a resume, or published) keeps one model; a model an interrupted attempt
-    left unfinished is never reused. A new model is made the way ``mlflow.create_external_model``
-    makes one: tagged external, typed ``checkpoint``, with params ``step`` and ``checkpoint_dir``,
-    MLflow's descriptor of an external model uploaded, then finalized READY. Server errors
-    propagate.
+    left unfinished is never reused. After making a model it reads the earliest READY one again,
+    so callers that make one at the same time settle on the same model. A new model is made the
+    way ``mlflow.create_external_model`` makes one: tagged external, typed ``checkpoint``, with
+    params ``step`` and ``checkpoint_dir``, MLflow's descriptor of an external model uploaded,
+    then finalized READY. Server errors propagate.
     """
     experiment_id = client.get_run(run_id).info.experiment_id
     model_id = _earliest_ready_model(client, experiment_id, run_id, name)
     if model_id is None:
         params = {"step": str(step), "checkpoint_dir": checkpoint_dir}
-        model_id = _create_external_model(client, experiment_id, run_id, name, params)
+        created = _create_external_model(client, experiment_id, run_id, name, params)
+        model_id = _earliest_ready_model(client, experiment_id, run_id, name) or created
     if not isinstance(model_id, str) or not model_id.strip():
         raise ValueError("the server returned no model id")
     return model_id
@@ -86,7 +88,7 @@ def _create_external_model(
         params=params,
         model_type=_MODEL_TYPE,
     )
-    with tempfile.TemporaryDirectory() as directory:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
         get_external_mlflow_model_spec(model).save(os.path.join(directory, MLMODEL_FILE_NAME))
         client.log_model_artifacts(model.model_id, directory)
     client.finalize_logged_model(model.model_id, _READY)

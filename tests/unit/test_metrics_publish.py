@@ -643,10 +643,24 @@ class TestPublishLinksTheCheckpointModel:
         assert [m.model_id for m in fake.batches[0].metrics] == [model.model_id]
         assert target.model_id == model.model_id
         assert (model.name, model.source_run_id, model.status) == (self.NAME, "run-1", "READY")
-        assert model.params == {"step": "120", "checkpoint_dir": str(tmp_path / "step_120")}
+        assert model.params == {
+            "step": "120",
+            "checkpoint_dir": str((tmp_path / "step_120").resolve()),
+        }
         assert fake.events.count("client") == 1
         assert {uri for _, uri, _ in model_store.calls} == {URI}
         assert (ckpt / "metadata.json").read_bytes() == sidecar
+
+    def test_a_model_made_through_a_symlink_records_the_directory_it_points_at(
+        self, tmp_path, monkeypatch, model_store
+    ):
+        self._install(monkeypatch, model_store)
+        ckpt = self._named(tmp_path)
+        latest = tmp_path / "latest"
+        latest.symlink_to(ckpt.name)
+        publish_metrics(latest, {"a": 1.0})
+        (model,) = model_store.models
+        assert model.params["checkpoint_dir"] == str(ckpt.resolve())
 
     def test_a_model_id_wins_over_the_model_name(self, tmp_path, monkeypatch, model_store):
         fake = self._install(monkeypatch, model_store)
