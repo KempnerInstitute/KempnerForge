@@ -113,13 +113,17 @@ ever points at a fully-flushed checkpoint.
 
 After updating the symlink, `CheckpointManager._cleanup()` keeps the
 `config.checkpoint.keep_last_n` highest-numbered `step_*` directories
-and removes the older ones, except three kinds it never removes:
+and removes the older ones, except two kinds it never removes:
 
 - the checkpoint `latest` points at;
-- the async checkpoint still being written, which `latest` points at
-  once its flush is durable;
 - every `dyn_ckpt_window` milestone, so the dense early checkpoints
   survive a finite `keep_last_n`.
+
+Nothing else is protected. An async save's directory survives while its
+flush runs only because it is normally the newest. When newer `step_*`
+directories are present, as after the manual rewind below, retention
+can delete it mid-save: the save fails, or the checkpoint is left
+without its shards.
 
 Default `keep_last_n = 3`. Set `keep_last_n = 0`, or any value `<= 0`,
 to keep every checkpoint: cleanup then removes nothing.
