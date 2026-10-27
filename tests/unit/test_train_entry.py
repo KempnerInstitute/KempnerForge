@@ -1778,8 +1778,13 @@ class TestPipelineStep:
         def fake_broadcast(tensor, group_src=None, group=None):
             recorded["group_src"] = group_src
             recorded["group"] = group
+            recorded["broadcast_numel"] = tensor.numel()
+
+        def fake_all_reduce(tensor, op=None, group=None):
+            recorded["all_reduce_group"] = group
 
         monkeypatch.setattr(loop.dist, "broadcast", fake_broadcast)
+        monkeypatch.setattr(loop.dist, "all_reduce", fake_all_reduce)
         config = make_config()
         config.distributed.pp = size
         session = make_session(
@@ -1797,6 +1802,14 @@ class TestPipelineStep:
         assert isinstance(result.loss, float)
         assert rec["group"] == "PPGROUP"
         assert rec["group_src"] == 1  # last stage is the source
+
+    def test_every_stage_sums_the_grad_norm_and_only_the_loss_is_broadcast(self, monkeypatch):
+        """Each stage clips with the whole model's norm, so the broadcast carries the loss alone."""
+        sched = FakeSchedule()
+        session, rec = self._session(monkeypatch, rank=0, size=2, sched=sched)
+        session.step_fn(session, 0)
+        assert rec["all_reduce_group"] == "PPGROUP"
+        assert rec["broadcast_numel"] == 1
 
     def test_last_stage_passes_target_only(self, monkeypatch):
         sched = FakeSchedule()
@@ -1837,6 +1850,7 @@ class TestPipelineStepPacked:
 
         monkeypatch.setattr(loop, "pp_group", lambda _r: "PPGROUP")
         monkeypatch.setattr(loop.dist, "broadcast", lambda *a, **k: None)
+        monkeypatch.setattr(loop.dist, "all_reduce", lambda *a, **k: None)
 
         batch = {
             "input_ids": torch.zeros(2, 8, dtype=torch.long),
@@ -2270,6 +2284,7 @@ class TestPipelineSyntheticBatches:
 
         monkeypatch.setattr(loop, "pp_group", lambda _r: "G")
         monkeypatch.setattr(loop.dist, "broadcast", lambda *a, **k: None)
+        monkeypatch.setattr(loop.dist, "all_reduce", lambda *a, **k: None)
         sched = FakeSchedule()
         config = make_config()
         config.distributed.pp = 2
