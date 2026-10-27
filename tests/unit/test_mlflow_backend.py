@@ -21,9 +21,9 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
-import kempnerforge.metrics.mlflow_tracking.auth as auth_mod
-import kempnerforge.metrics.mlflow_tracking.backend as backend_mod
-import kempnerforge.metrics.mlflow_tracking.worker as worker_mod
+import kempnerforge.metrics.mlflow.auth as auth_mod
+import kempnerforge.metrics.mlflow.backend as backend_mod
+import kempnerforge.metrics.mlflow.worker as worker_mod
 from kempnerforge.config import load_config
 from kempnerforge.config.schema import (
     DataConfig,
@@ -32,7 +32,7 @@ from kempnerforge.config.schema import (
     MetricsConfig,
     ModelConfig,
 )
-from kempnerforge.metrics.mlflow_tracking.backend import (
+from kempnerforge.metrics.mlflow.backend import (
     MLflowBackend,
     _flatten_config_params,
     _git_state,

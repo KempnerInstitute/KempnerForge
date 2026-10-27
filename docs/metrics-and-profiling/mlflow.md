@@ -1,6 +1,6 @@
 # MLflow backend
 
-[`MLflowBackend`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/metrics/mlflow_tracking/backend.py)
+[`MLflowBackend`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/metrics/mlflow/backend.py)
 logs metrics, params, and system utilization to MLflow. The default is a Databricks-hosted
 workspace, so we don't run a tracking server ourselves, but any MLflow tracking server works. It
 is opt-in. The logging backends are independent toggles, so WandB, TensorBoard and MLflow can be
@@ -158,7 +158,7 @@ mints a new one; `_ensure_init` writes it back to `MetricsConfig` and the traini
 persists it in `ckpt_extra`:
 
 ```python
-# kempnerforge/metrics/mlflow_tracking/backend.py: MLflowBackend._ensure_init
+# kempnerforge/metrics/mlflow/backend.py: MLflowBackend._ensure_init
 experiment, run_id, run_name, resumed, last_step = self._owner.start(_INIT_DEADLINE_S)
 ...
 self._config.mlflow_run_id = run_id      # write back for checkpoint
@@ -252,11 +252,11 @@ them to a per-checkpoint model.
 ## Publishing eval results
 
 Evaluation runs on a checkpoint after training, so its scores belong on the run that produced it.
-`kempnerforge.metrics.mlflow_tracking.publish` appends metrics to the MLflow run a checkpoint's
+`kempnerforge.metrics.mlflow.publish` appends metrics to the MLflow run a checkpoint's
 `metadata.json` records, at the checkpoint's step:
 
 ```bash
-uv run python -m kempnerforge.metrics.mlflow_tracking.publish <checkpoint_dir> --metrics <scores.json>
+uv run python -m kempnerforge.metrics.mlflow.publish <checkpoint_dir> --metrics <scores.json>
 ```
 
 `<checkpoint_dir>` is a step directory (the one holding `metadata.json`), and `<scores.json>` a

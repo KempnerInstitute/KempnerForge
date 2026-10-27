@@ -4,7 +4,7 @@
 """The MLflow logging backend, for Databricks or any MLflow tracking server.
 
 ``MetricsTracker`` builds ``MLflowBackend`` on rank 0 when ``metrics.enable_mlflow`` is on. Its
-server calls run on the threads of ``kempnerforge.metrics.mlflow_tracking.worker``, each under a deadline.
+server calls run on the threads of ``kempnerforge.metrics.mlflow.worker``, each under a deadline.
 """
 
 from __future__ import annotations
@@ -21,12 +21,12 @@ from typing import Any
 
 from kempnerforge.config.schema import JobConfig, MetricsConfig
 from kempnerforge.metrics.logger import get_logger
-from kempnerforge.metrics.mlflow_tracking.auth import _auth_hint, _prepare_databricks_auth
-from kempnerforge.metrics.mlflow_tracking.models import (
+from kempnerforge.metrics.mlflow.auth import _auth_hint, _prepare_databricks_auth
+from kempnerforge.metrics.mlflow.models import (
     checkpoint_model_name,
     find_or_create_checkpoint_model,
 )
-from kempnerforge.metrics.mlflow_tracking.worker import (
+from kempnerforge.metrics.mlflow.worker import (
     _WARN_INTERVAL_S,
     _BestEffortWorker,
     _RateLimitedWarning,
