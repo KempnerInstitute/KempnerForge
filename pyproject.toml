@@ -53,6 +53,10 @@ mlflow = [
     "psutil",
     "nvidia-ml-py",
 ]
+eval = [
+    # MlflowClient.log_table needs it; the VLM eval harness's MLflow publishing is its direct user.
+    "pandas",
+]
 
 [build-system]
 requires = ["hatchling"]
@@ -92,6 +96,8 @@ markers = [
 [tool.coverage.run]
 source = ["kempnerforge"]
 branch = true
+concurrency = ["multiprocessing", "thread"]
+parallel = true
 
 [tool.coverage.report]
 exclude_lines = [

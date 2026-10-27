@@ -177,6 +177,41 @@ def close(self) -> None:
 Called at the end of `run_training`. WandB and MLflow close the run;
 TensorBoard flushes the event file.
 
+## Tracking entries
+
+```python
+def tracking_entries(self) -> list[dict[str, str]]:
+    ...
+```
+
+One record per backend that has a live run, each from the backend's own `tracking_entry()`
+(a backend that does not override it contributes nothing). A backend that raises, or whose
+entry is not strings under a named `backend`, is skipped with a warning. `run_training`
+hands this to `CheckpointManager.set_tracking_source`, so every checkpoint's `metadata.json`
+names the runs it was trained under ([Checkpointing](../checkpointing/index.md)). It reads
+fields the backends already hold, never waits on a server, and returns an empty list before
+any run has started and after `close()`.
+
+## Registering checkpoints
+
+```python
+def checkpoint_fields(self, step: int) -> dict[str, dict[str, str]]:
+    ...
+
+def register_checkpoint(self, step: int, directory: Path, record: TrackingRecord) -> None:
+    ...
+```
+
+`run_training` hands the tracker to `CheckpointManager.set_checkpoint_registrar`, which calls
+both on rank 0. `checkpoint_fields` runs inside `save()`: each backend with a live run names the
+fields it adds to its own entry of that save's `tracking` list, keyed by backend name, from what
+it already holds. `register_checkpoint` runs once the checkpoint is committed and must not block:
+each backend with a live run gets `record` bound to its own name and calls it, then or later from
+another thread, to add fields to its entry; the manager applies each call to that checkpoint's
+`metadata.json` atomically. Only `MLflowBackend` does either, when `mlflow_register_checkpoints`
+is on ([MLflow](mlflow.md#registering-checkpoints)). A backend that raises costs only its own
+fields or registration, and neither method does anything after `close()`.
+
 ## Logger: `get_logger`, `format_metrics`
 
 Anywhere in the framework, call:
