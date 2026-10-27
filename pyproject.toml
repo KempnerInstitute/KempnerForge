@@ -15,6 +15,12 @@ dependencies = [
     "datasets",
     "tokenizers",
     "torchao>=0.17.0",
+    # Databricks-hosted experiment tracking; lazy-imported in metrics/mlflow/.
+    # mlflow-skinny = tracking-only client (no pandas/server); psutil+nvidia-ml-py = system metrics.
+    "mlflow-skinny>=3.1",
+    "databricks-sdk>=0.20",
+    "psutil",
+    "nvidia-ml-py",
 ]
 
 [dependency-groups]
@@ -44,14 +50,6 @@ video = [
     # PyAV bundles FFmpeg; optional so non-video installs stay lean. Required
     # only to decode clips (lazy-imported in kempnerforge/data/video_io.py).
     "av>=17.1.0",
-]
-mlflow = [
-    # Optional Databricks-hosted experiment tracking; lazy-imported in metrics/mlflow/.
-    # mlflow-skinny = tracking-only client (no pandas/server); psutil+nvidia-ml-py = system metrics.
-    "mlflow-skinny>=3.1",
-    "databricks-sdk>=0.20",
-    "psutil",
-    "nvidia-ml-py",
 ]
 eval = [
     # MlflowClient.log_table needs it; the VLM eval harness's MLflow publishing is its direct user.

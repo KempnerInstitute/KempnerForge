@@ -244,13 +244,18 @@ class TestMLflowBackend:
         assert backend._active is None
 
     def test_mlflow_handles_import_error(self, monkeypatch):
-        """ImportError inside _ensure_init flips _active to the False sentinel."""
+        """ImportError inside _ensure_init flips _active to False and warns to run uv sync."""
+        warnings_seen = _capture_warnings(monkeypatch)
         monkeypatch.setitem(sys.modules, "mlflow", None)
         backend = MLflowBackend(
             MetricsConfig(enable_mlflow=True, mlflow_tracking_uri="http://localhost:5000")
         )
         backend.log({"train/loss": 1.0}, step=1)
         assert backend._active is False
+        assert warnings_seen == [
+            "mlflow could not be imported; disabling MLflow backend "
+            "(the environment is incomplete, run: uv sync)"
+        ]
 
     def test_mlflow_handles_init_exception(self, monkeypatch):
         """A non-ImportError from mlflow (e.g. tracking/auth) flips _active = False."""

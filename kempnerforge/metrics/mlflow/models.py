@@ -1,4 +1,3 @@
-# pyright: reportMissingImports=false
 """The MLflow logged model of a checkpoint: one external model per run and step.
 
 The training backend registers each committed checkpoint through this module, and the eval
