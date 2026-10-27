@@ -1624,13 +1624,13 @@ class TestAsyncLatestSymlinkSafety:
     """
 
     @staticmethod
-    def _mgr(tmp_path, mode):
+    def _mgr(tmp_path, mode, pp_rank=None):
         from kempnerforge.checkpoint.manager import CheckpointManager
 
         model = torch.nn.Linear(4, 4)
         opt = torch.optim.SGD(model.parameters(), lr=0.1)
         cfg = CheckpointConfig(dir=str(tmp_path), keep_last_n=2, async_mode=mode)
-        return CheckpointManager(cfg, model, opt)
+        return CheckpointManager(cfg, model, opt, pp_rank=pp_rank)
 
     @staticmethod
     def _install_async_mock(mgr, monkeypatch):
@@ -1870,16 +1870,21 @@ class TestAsyncLatestSymlinkSafety:
         assert not dirs[1].exists()
         assert not dirs[2].exists()
 
+    @pytest.mark.parametrize("pp_rank", [None, 0], ids=["no_pp", "pp_stage_0"])
     @pytest.mark.parametrize(
         "mode",
         [AsyncCheckpointMode.async_, AsyncCheckpointMode.async_pinned],
         ids=["async", "async_with_pinned_mem"],
     )
     def test_an_async_save_after_a_rewind_keeps_the_directory_it_writes(
-        self, tmp_path, monkeypatch, mode
+        self, tmp_path, monkeypatch, mode, pp_rank
     ):
-        """Newer leftovers fill ``keep_last_n``, yet the save in flight keeps its directory."""
-        mgr = self._mgr(tmp_path, mode)
+        """Newer leftovers fill ``keep_last_n``, yet the save in flight keeps its directory.
+
+        Under pipeline parallelism a stage writes into ``step_N/pp<rank>``, and it is
+        ``step_N`` itself that retention must spare.
+        """
+        mgr = self._mgr(tmp_path, mode, pp_rank)
         self._install_async_mock(mgr, monkeypatch)
         for step in (100, 300, 400, 500):
             self._build_ckpt(tmp_path, step, complete=True)
@@ -1890,8 +1895,9 @@ class TestAsyncLatestSymlinkSafety:
         mgr.wait()
 
         written = Path(tmp_path) / "step_200"
+        shards = written / f"pp{pp_rank}" if pp_rank is not None else written
         assert self._latest_target(tmp_path) == written.resolve()
-        assert (written / ".metadata").exists()
+        assert (shards / ".metadata").exists()
         assert (written / "train_state.pt").exists()
         step, _, _ = mgr.load()
         assert step == 200
