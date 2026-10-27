@@ -202,8 +202,8 @@ class TrainingSession:
 # ---------------------------------------------------------------------------
 
 
-def clip_grads(model: torch.nn.Module, max_norm: float) -> float:
-    grad_norm = clip_grad_norm_(model, max_norm)
+def clip_grads(model: torch.nn.Module, max_norm: float, pp_group: Any = None) -> float:
+    grad_norm = clip_grad_norm_(model, max_norm, pp_group=pp_group)
     return grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
 
 
@@ -279,12 +279,12 @@ def pipeline_step(session: TrainingSession, step: int) -> StepResult:
     else:
         avg_loss = 0.0
 
-    grad_norm_val = clip_grads(model, tc.grad_clip_norm)
+    group = pp_group(session.runtime)
+    grad_norm_val = clip_grads(model, tc.grad_clip_norm, group)
 
-    # Broadcast loss and grad_norm from last PP stage to all PP stages
-    loss_tensor = torch.tensor([avg_loss, grad_norm_val], device=device)
-    dist.broadcast(loss_tensor, group_src=pipeline.size - 1, group=pp_group(session.runtime))
-    return StepResult(loss=loss_tensor[0].item(), grad_norm=loss_tensor[1].item())
+    loss_tensor = torch.tensor([avg_loss], device=device)
+    dist.broadcast(loss_tensor, group_src=pipeline.size - 1, group=group)
+    return StepResult(loss=loss_tensor.item(), grad_norm=grad_norm_val)
 
 
 def vlm_step(session: TrainingSession, step: int) -> StepResult:

@@ -178,7 +178,9 @@ optimizer.zero_grad()
 ```
 
 `clip_grad_norm_` wraps PyTorch's utility so it works with FSDP2 sharded
-parameters. The NaN detector returns `False` on NaN/Inf loss, zeroes
+parameters. Under pipeline parallelism `pipeline_step` also passes the PP
+group, so the norm covers every stage rather than this rank's own. The NaN
+detector returns `False` on NaN/Inf loss, zeroes
 the grads, and (after `max_consecutive`) signals a rollback to the
 previous checkpoint.
 
