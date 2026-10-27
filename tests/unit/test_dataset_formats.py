@@ -119,3 +119,37 @@ class TestDeclaredBinDtype:
         np.save(tmp_path / "shard_000.npy", tokens)
         ds = MemoryMappedDataset(str(tmp_path), seq_len=SEQ_LEN, token_dtype="uint32")
         assert _samples(ds) == _chunks(tokens)
+
+
+class TestPartialBinShards:
+    @pytest.mark.parametrize("missing_bytes", [1, 2, 3])
+    def test_truncated_uint32_shard_is_rejected(self, tmp_path, missing_bytes):
+        """The size guess read a uint32 shard missing 1 to 3 bytes as uint16 and trained on it."""
+        raw = np.arange(64, dtype=np.uint32).tobytes()[:-missing_bytes]
+        (tmp_path / "tokens_000.bin").write_bytes(raw)
+        _write_metadata(tmp_path, "uint32")
+        with pytest.raises(ValueError, match="not a whole number of uint32 tokens"):
+            MemoryMappedDataset(str(tmp_path), seq_len=SEQ_LEN, file_pattern="*.bin")
+
+    def test_truncated_uint16_shard_is_rejected(self, tmp_path):
+        raw = np.arange(64, dtype=np.uint16).tobytes()[:-1]
+        (tmp_path / "tokens_000.bin").write_bytes(raw)
+        with pytest.raises(ValueError, match="not a whole number of uint16 tokens"):
+            MemoryMappedDataset(
+                str(tmp_path), seq_len=SEQ_LEN, file_pattern="*.bin", token_dtype="uint16"
+            )
+
+    @pytest.mark.parametrize("missing_bytes", [1, 2, 3])
+    def test_undeclared_shard_that_is_not_whole_uint32_is_rejected(self, tmp_path, missing_bytes):
+        raw = np.arange(64, dtype=np.uint32).tobytes()[:-missing_bytes]
+        (tmp_path / "tokens_000.bin").write_bytes(raw)
+        with pytest.raises(ValueError, match="holds uint16 or uint32 tokens") as excinfo:
+            MemoryMappedDataset(str(tmp_path), seq_len=SEQ_LEN, file_pattern="*.bin")
+        assert "token_dtype" in str(excinfo.value)
+        assert str(tmp_path / "metadata.yaml") in str(excinfo.value)
+
+    def test_undeclared_odd_count_uint16_shard_is_rejected(self, tmp_path):
+        """Its size fits a uint16 shard and a truncated uint32 shard alike."""
+        _write_bin(tmp_path / "tokens_000.bin", np.arange(67, dtype=np.uint16))
+        with pytest.raises(ValueError, match="holds uint16 or uint32 tokens"):
+            MemoryMappedDataset(str(tmp_path), seq_len=SEQ_LEN, file_pattern="*.bin")
