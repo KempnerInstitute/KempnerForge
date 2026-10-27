@@ -5,14 +5,15 @@
 
 A checkpoint's ``metadata.json`` records the tracking backends that were active when
 it was saved. ``publish_metrics`` reads the MLflow entry and appends the metrics to
-that run at the checkpoint's step in a single ``log_batch`` request. Inputs are fully
-validated before anything is sent, but MLflow's ``log_batch`` permits partial writes,
-so a request that fails server side may still have stored some points. The publisher
-never starts, ends, or edits a run and keeps no state of its own, so several publishers
-can write to one run at once and the tracking server arbitrates. The call blocks on the
-server under MLflow's own HTTP timeout and retry settings, and authentication is
-whatever the MLflow client finds in the environment. It is an offline tool: call it from
-one process, never from the training step.
+that run at the checkpoint's step in a single ``log_batch`` request, linked to the
+checkpoint's logged model when the entry names one. Inputs are fully validated before
+anything is sent, but MLflow's ``log_batch`` permits partial writes, so a request that
+fails server side may still have stored some points. The publisher never starts, ends,
+or edits a run, never writes the sidecar, and keeps no state of its own, so several
+publishers can write to one run at once and the tracking server arbitrates. The call
+blocks on the server under MLflow's own HTTP timeout and retry settings, and
+authentication is whatever the MLflow client finds in the environment. It is an offline
+tool: call it from one process, never from the training step.
 
 Command line: ``python -m kempnerforge.metrics.publish <checkpoint_dir> --metrics <json>``.
 """
@@ -20,6 +21,7 @@ Command line: ``python -m kempnerforge.metrics.publish <checkpoint_dir> --metric
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import inspect
 import json
 import math
@@ -34,6 +36,7 @@ from pathlib import Path
 from typing import Any
 
 from kempnerforge.metrics.logger import get_logger
+from kempnerforge.metrics.mlflow_models import find_or_create_checkpoint_model
 
 logger = get_logger(__name__)
 
@@ -58,6 +61,7 @@ class MlflowTarget:
     tracking_uri: str = field(repr=False)  # may embed credentials: keep it out of logs
     step: int
     model_id: str | None = None
+    model_name: str | None = None
 
 
 def _no_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -144,7 +148,8 @@ def read_mlflow_target(checkpoint_dir: str | os.PathLike[str]) -> MlflowTarget:
 
     The sidecar needs a non-negative integer ``step`` and a ``tracking`` list holding
     exactly one entry with ``backend == "mlflow"`` whose ``run_id``, ``experiment`` and
-    ``tracking_uri`` are non-empty strings. ``model_id`` is optional. A key repeated
+    ``tracking_uri`` are non-empty strings. ``model_id`` and ``model_name`` are optional,
+    and non-empty strings when present. A key repeated
     anywhere in the file is refused, since the last value would silently win. For a
     Databricks URI it also prepares auth in ``os.environ`` for the whole process, the way
     the training backend does, so artifact uploads made later in the same process
@@ -166,8 +171,7 @@ def read_mlflow_target(checkpoint_dir: str | os.PathLike[str]) -> MlflowTarget:
         problems.append(f"'step' must be non-negative, got {step}")
 
     fields = ["run_id", "experiment", "tracking_uri"]
-    if entry.get("model_id") is not None:
-        fields.append("model_id")
+    fields += [key for key in ("model_id", "model_name") if entry.get(key) is not None]
     for key in fields:
         if problem := _string_problem(entry, key):
             problems.append(f"tracking[{index}]: {problem}")
@@ -181,6 +185,7 @@ def read_mlflow_target(checkpoint_dir: str | os.PathLike[str]) -> MlflowTarget:
         tracking_uri=entry["tracking_uri"],
         step=meta["step"],
         model_id=entry.get("model_id"),
+        model_name=entry.get("model_name"),
     )
 
 
@@ -260,9 +265,11 @@ def publish_metrics(
 
     Every metric is logged as ``<prefix><name>`` at the checkpoint's step by one
     ``MlflowClient.log_batch`` request, on a client bound to the sidecar's tracking URI
-    (the process-wide MLflow tracking URI is left alone). When the sidecar entry carries
-    a ``model_id`` and the installed MLflow can link metrics to a logged model, the
-    metrics are linked to it; otherwise the ``model_id`` is ignored.
+    (the process-wide MLflow tracking URI is left alone). When the installed MLflow can
+    link metrics to a logged model, they are linked to the sidecar entry's ``model_id``;
+    without one, to the run's READY model named by its ``model_name``, which is created
+    (an external model of this checkpoint directory) when the run has none. Otherwise, or
+    when the installed MLflow cannot link, the metrics are published unlinked.
 
     Args:
         checkpoint_dir: Checkpoint step directory holding ``metadata.json``.
@@ -270,15 +277,17 @@ def publish_metrics(
         prefix: Prepended verbatim to every name; may be empty.
 
     Returns:
-        The target the metrics were appended to.
+        The target the metrics were appended to, with the ``model_id`` they were linked
+        to (None when unlinked).
 
     Raises:
         PublishRefused: The sidecar or the metrics are missing or malformed, mlflow is
-            not installed, or the sidecar has no model_id while this process has an
-            active MLflow model (which ``log_batch`` would silently link); nothing was
-            sent. Errors raised by MLflow itself (an invalid metric name, an
-            unreachable server) propagate as raised; a request that fails server side
-            may still have stored some of its points.
+            not installed, or no model can be linked (the sidecar entry gives none, or
+            the installed MLflow cannot link one) while this process has an active
+            MLflow model (which ``log_batch`` would silently link); nothing was sent.
+            Errors raised by MLflow itself (an invalid metric name, an unreachable
+            server) propagate as raised; a request that fails server side may still
+            have stored some of its points.
     """
     target = read_mlflow_target(checkpoint_dir)
     named = _prefixed_metrics(metrics, prefix)
@@ -290,33 +299,43 @@ def publish_metrics(
             f"mlflow could not be imported ({e}); install it with: uv sync --group mlflow"
         ) from e
 
-    link: dict[str, str] = {}
-    if target.model_id is not None:
-        if "model_id" in inspect.signature(Metric).parameters:
-            link["model_id"] = target.model_id
-        else:
-            logger.debug("installed mlflow cannot link metrics to a model; ignoring model_id")
-    else:
+    can_link = "model_id" in inspect.signature(Metric).parameters
+    if target.model_id is not None and not can_link:
+        logger.debug("installed mlflow cannot link metrics to a model; ignoring model_id")
+    client = None
+    model_id = target.model_id if can_link else None
+    if can_link and model_id is None and target.model_name is not None:
+        client = mlflow.MlflowClient(tracking_uri=target.tracking_uri)
+        model_id = find_or_create_checkpoint_model(
+            client,
+            target.run_id,
+            target.model_name,
+            target.step,
+            str(Path(checkpoint_dir).resolve()),
+        )
+    if model_id is None:
         # log_batch fills model_id-less metrics with the process's active model
         # (mlflow.get_active_model_id); refuse rather than mislink to an unrelated model.
         get_ambient = getattr(mlflow, "get_active_model_id", None)
         ambient = get_ambient() if get_ambient is not None else None
         if ambient:
             raise PublishRefused(
-                "the sidecar entry has no model_id but this process has an active MLflow "
+                "the metrics have no model to link to but this process has an active MLflow "
                 f"model ({ambient}); log_batch would silently link the metrics to it. Clear "
                 "the active model (MLFLOW_ACTIVE_MODEL_ID / mlflow.set_active_model) or "
                 "record model_id in the sidecar"
             )
 
+    link: dict[str, str] = {} if model_id is None else {"model_id": model_id}
     timestamp = _now_ms()
     batch = [
         Metric(key=key, value=value, timestamp=timestamp, step=target.step, **link)
         for key, value in named.items()
     ]
-    client = mlflow.MlflowClient(tracking_uri=target.tracking_uri)
+    if client is None:
+        client = mlflow.MlflowClient(tracking_uri=target.tracking_uri)
     client.log_batch(target.run_id, metrics=batch, synchronous=True)
-    return target
+    return dataclasses.replace(target, model_id=model_id)
 
 
 def _mask_urls(text: str) -> str:

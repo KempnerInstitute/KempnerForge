@@ -72,12 +72,16 @@ class FakeCheckpointManager:
         self.waits = 0
         self.flushes = 0
         self.tracking_source = None
+        self.checkpoint_registrar = None
 
     def save(self, step, tokens_seen=0, scheduler=None, dataloader=None, extra=None) -> None:
         self.saves.append((step, tokens_seen, dict(extra or {})))
 
     def set_tracking_source(self, source) -> None:
         self.tracking_source = source
+
+    def set_checkpoint_registrar(self, registrar) -> None:
+        self.checkpoint_registrar = registrar
 
     def wait(self) -> None:
         self.waits += 1
@@ -805,6 +809,12 @@ class TestRunTraining:
             def tracking_entries(self) -> list:
                 return []
 
+            def checkpoint_fields(self, _step) -> dict:
+                return {}
+
+            def register_checkpoint(self, _step, _directory, _record) -> None:
+                pass
+
             def close(self) -> None:
                 closes.append(1)
 
@@ -850,6 +860,12 @@ class TestRunTraining:
             def tracking_entries(self) -> list:
                 return live
 
+            def checkpoint_fields(self, _step) -> dict:
+                return {}
+
+            def register_checkpoint(self, _step, _directory, _record) -> None:
+                pass
+
             def close(self) -> None:
                 pass
 
@@ -861,6 +877,46 @@ class TestRunTraining:
         )
         assert ckpt.tracking_source is not None
         assert ckpt.tracking_source() == live
+
+    def test_checkpoint_manager_registers_checkpoints_through_the_tracker(self, monkeypatch):
+        import kempnerforge.training.entry as entry
+        from kempnerforge.training.entry import run_training
+        from kempnerforge.training.loop import StepResult
+
+        built: list = []
+
+        class RegisteringTracker:
+            def __init__(self, *_a, **_k) -> None:
+                built.append(self)
+
+            def init_backends(self, _config) -> None:
+                pass
+
+            def start_step(self) -> None:
+                pass
+
+            def end_step(self, **_kw):
+                return None
+
+            def tracking_entries(self) -> list:
+                return []
+
+            def checkpoint_fields(self, _step) -> dict:
+                return {}
+
+            def register_checkpoint(self, _step, _directory, _record) -> None:
+                pass
+
+            def close(self) -> None:
+                pass
+
+        ckpt = _stub_entry(monkeypatch, TinyTextModel())
+        monkeypatch.setattr(entry, "MetricsTracker", RegisteringTracker)
+        assert ckpt.checkpoint_registrar is None
+        run_training(
+            make_config(max_steps=1), step_fn=lambda _s, _i: StepResult(loss=1.0, grad_norm=0.5)
+        )
+        assert len(built) == 1 and ckpt.checkpoint_registrar is built[0]
 
     def test_injected_hooks_get_the_whole_lifecycle(self, monkeypatch):
         from kempnerforge.training.entry import run_training
