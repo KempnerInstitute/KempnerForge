@@ -81,24 +81,42 @@ def _declared_token_dtype(directory: Path, token_dtype: str) -> str:
     return token_dtype or recorded
 
 
+def _token_dtype_remedy(directory: Path) -> str:
+    """Return the two ways to declare the dtype of the ``.bin`` shards in ``directory``."""
+    return (
+        f"set token_dtype to 'uint16' or 'uint32' (data.token_dtype, a [[data.datasets]] "
+        f"entry's token_dtype, or eval.token_dtype in a config), or record it as "
+        f"tokenized_info.dtype in {directory / TOKEN_METADATA_FILE}"
+    )
+
+
 def _bin_shard_dtype(path: Path, declared: str) -> np.dtype:
     """Return the dtype to read the raw ``.bin`` shard ``path`` with.
 
     A shard whose size is not a whole number of tokens of its declared dtype
-    is rejected: it is truncated, or it was written with another dtype.
+    is rejected: it is truncated, or it was written with another dtype. With
+    no declared dtype the shard is read as uint32 if its size is a whole
+    number of uint32 tokens, as an intact uint32 shard always is. Any other
+    size fits a uint16 shard and a truncated uint32 shard alike, so it is
+    rejected rather than guessed.
     """
     size = path.stat().st_size
-    if not declared:
-        return np.dtype(np.uint32 if size % 4 == 0 else np.uint16)
-    dtype = np.dtype(declared)
-    if size % dtype.itemsize:
+    dtype = np.dtype(declared or "uint32")
+    if size % dtype.itemsize == 0:
+        return dtype
+    if declared:
         raise ValueError(
             f"{path} is {size:,} bytes, which is not a whole number of {declared} tokens "
             f"({dtype.itemsize} bytes each), so the shard is truncated or was not written as "
             f"{declared}. Replace the shard, or correct the dtype declared for it (token_dtype "
             f"or {path.parent / TOKEN_METADATA_FILE})."
         )
-    return dtype
+    raise ValueError(
+        f"Cannot tell whether {path} holds uint16 or uint32 tokens: no dtype is declared for "
+        f"it, and its {size:,} bytes are not a whole number of uint32 tokens, so it is either "
+        f"uint16 data or a truncated uint32 shard. To read it, "
+        f"{_token_dtype_remedy(path.parent)}."
+    )
 
 
 def _bin_shard_dtypes(files: list[Path], token_dtype: str) -> dict[Path, np.dtype]:
@@ -111,6 +129,12 @@ def _bin_shard_dtypes(files: list[Path], token_dtype: str) -> dict[Path, np.dtyp
         if f.parent not in declared:
             declared[f.parent] = _declared_token_dtype(f.parent, token_dtype)
         dtypes[f] = _bin_shard_dtype(f, declared[f.parent])
+    for directory in sorted(d for d, dtype in declared.items() if not dtype):
+        logger.warning(
+            f"No token dtype is declared for the .bin shards in {directory}, so they are read "
+            f"as uint32. If they hold uint16 tokens, every token id is misread; to declare it, "
+            f"{_token_dtype_remedy(directory)}."
+        )
     return dtypes
 
 
@@ -166,7 +190,9 @@ class MemoryMappedDataset(Dataset):
     its dtype is ``token_dtype``, else the ``tokenized_info.dtype`` recorded in
     the ``metadata.yaml`` in its directory (tatm writes one). The two must
     agree when both are given, and a shard whose size is not a whole number
-    of tokens of that dtype is rejected.
+    of tokens of that dtype is rejected. When neither declares a dtype, the
+    shards are read as uint32 with a warning, provided each is a whole number
+    of uint32 tokens; otherwise the dataset refuses to guess and raises.
 
     File layout: each file stores a flat array of tokens. The dataset
     splits them into non-overlapping chunks of ``seq_len`` tokens.
@@ -177,7 +203,7 @@ class MemoryMappedDataset(Dataset):
         seq_len: Sequence length (number of tokens per sample).
         file_pattern: Glob pattern for data files.
         token_dtype: ``"uint16"`` or ``"uint32"`` for the ``.bin`` files, or
-            ``""`` to take it from their ``metadata.yaml``.
+            ``""`` to take it from their ``metadata.yaml`` as described above.
     """
 
     def __init__(
