@@ -678,6 +678,7 @@ def run_training_loop(
                         f"Shutdown requested at step {step}; "
                         "its scheduled checkpoint is the emergency checkpoint"
                     )
+                    ckpt_mgr.wait()
                 else:
                     logger.warning(
                         f"Shutdown requested at step {step} — saving emergency checkpoint"

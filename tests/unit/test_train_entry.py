@@ -670,7 +670,7 @@ class TestRunTrainingLoop:
         assert ckpt.saved_steps == [2]
         assert hook.saves == [2]
         assert handler.finished is True
-        assert ckpt.waits == 1
+        assert ckpt.waits == 2
 
     def test_shutdown_after_a_scheduled_save_still_saves_its_own_step(self):
         """Step 2 is saved on the schedule; a shutdown at step 3 must still save step 3."""
