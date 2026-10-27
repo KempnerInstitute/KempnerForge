@@ -129,6 +129,8 @@ are shared (AdamW/Lion) or optimizer-specific.
 | `muon_momentum` | `float` | `0.95` | Muon momentum coefficient |
 | `muon_ns_steps` | `int` | `5` | Newton–Schulz iterations for Muon |
 | `muon_adam_lr` | `float \| None` | `None` | LR for 1-D params in Muon's AdamW fallback; `None` → same as `lr` |
+| `muon_nesterov` | `bool` | `False` | Orthogonalize the Nesterov look-ahead instead of the momentum buffer |
+| `muon_adjust_lr` | `"original" \| "match_rms_adamw" \| "spectral_unclamped"` | `"original"` | Factor on each orthogonalized update |
 | `muon_orthogonalize` | `"local" \| "exact"` | `"local"` | Newton–Schulz on each rank's shard, or on the full matrix |
 | `schedule_free_warmup_steps` | `int` | `0` | internal warmup for schedule-free |
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+MUON_ADJUST_LR_MODES = ("original", "match_rms_adamw", "spectral_unclamped")
 MUON_ORTHOGONALIZE_MODES = ("local", "exact")
 
 
@@ -21,6 +22,8 @@ class OptimizerConfig:
     muon_momentum: float = 0.95  # Momentum coefficient for Muon
     muon_ns_steps: int = 5  # Newton-Schulz iteration steps for Muon
     muon_adam_lr: float | None = None  # LR for 1D params in Muon's AdamW fallback; None=same as lr
+    muon_nesterov: bool = False
+    muon_adjust_lr: str = "original"
     muon_orthogonalize: str = "local"
     # Schedule-Free specific
     schedule_free_warmup_steps: int = 0  # Internal warmup for schedule-free optimizer
@@ -36,6 +39,10 @@ class OptimizerConfig:
             raise ValueError("muon_momentum must be in (0, 1)")
         if self.muon_ns_steps <= 0:
             raise ValueError("muon_ns_steps must be positive")
+        if self.muon_adjust_lr not in MUON_ADJUST_LR_MODES:
+            raise ValueError(
+                f"muon_adjust_lr must be one of {MUON_ADJUST_LR_MODES}, got {self.muon_adjust_lr!r}"
+            )
         if self.muon_orthogonalize not in MUON_ORTHOGONALIZE_MODES:
             raise ValueError(
                 f"muon_orthogonalize must be one of {MUON_ORTHOGONALIZE_MODES}, "
