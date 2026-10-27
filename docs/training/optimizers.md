@@ -164,15 +164,13 @@ Momentum and update scale:
   `"spectral_unclamped"` only from 2.14 on.
 - `rows × cols` is the matrix Newton-Schulz ran on: each rank's shard under
   `muon_orthogonalize = "local"`, the full weight under `"exact"`, which gives
-  the unsharded update in every mode. Under `"local"`, a sharded update's RMS
-  stays close to the unsharded one while the shards are no wider than tall.
-  Once they are wider than tall it depends on the momentum's rank as well as
-  the mode, since each shard is orthogonalized on its own: `"original"` and
-  `"match_rms_adamw"` keep it close for a full-rank momentum but raise it for a
-  low-rank one, by up to roughly `sqrt(N)` over `N` shards, and
-  `"spectral_unclamped"` keeps it for a low-rank momentum but shrinks it for a
-  full-rank one. Use `"exact"` when the update's RMS has to match the
-  unsharded run.
+  the unsharded update in every mode. Under `"local"` the update's RMS
+  therefore depends on the sharding: whether the weight is split by rows or
+  by columns, into how many shards, and the momentum's rank. For example,
+  tensor parallelism's row-wise layers (`o_proj`, `down_proj`) split the
+  weight by columns, and over `N` such shards `"original"` raises a full-rank
+  momentum's update RMS by about `sqrt(N)`. Use `"exact"` when the update's
+  RMS has to match the unsharded run.
 - A resume keeps the `muon_nesterov` and `muon_adjust_lr` the checkpoint was
   saved with, and a checkpoint saved before the options existed resumes with
   `false` and `"original"`.
