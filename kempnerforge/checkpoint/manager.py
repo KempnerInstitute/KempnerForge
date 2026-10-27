@@ -902,12 +902,16 @@ class CheckpointManager:
     def _cleanup(self) -> None:
         """Remove old checkpoints beyond the retention limit.
 
-        Never removed regardless of retention: the current ``latest`` target
-        and the in-flight async checkpoint (``_pending_finalize``) — pruning
-        either would let a crash strand resume with no loadable checkpoint —
-        and any dynamic-window milestone (``CheckpointConfig.is_dynamic_milestone``),
-        so the dense early-dynamics checkpoints survive even with a finite
-        ``keep_last_n``.
+        Never removed regardless of retention: the current ``latest`` target,
+        the directory the last ``save()`` created (``_inflight_dir``), whose
+        async flush may still be running, a deferred async checkpoint
+        (``_pending_finalize``), and any dynamic-window milestone
+        (``CheckpointConfig.is_dynamic_milestone``), so the dense early-dynamics
+        checkpoints survive even with a finite ``keep_last_n``. A save drains
+        ``_pending_finalize``, which runs this cleanup, only after its own
+        flush is dispatched, so ``_inflight_dir`` is what keeps a checkpoint
+        that is not among the newest, as after a rewind, from being deleted
+        while it is written.
         """
         keep = self.config.keep_last_n
         if keep <= 0:
