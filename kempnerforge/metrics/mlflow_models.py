@@ -41,8 +41,8 @@ def find_or_create_checkpoint_model(
     model, and callers that race to make it settle on the one made first. Nothing waits: a
     PENDING model, still being made by another caller or left by one that died, is finished
     here by uploading the MLmodel descriptor built from that model and finalizing it READY,
-    unless it already reads READY, so a finished model's descriptor is never written again. A
-    finalize that raises is ignored when the model reads READY afterwards.
+    unless it already reads READY, so a caller that arrives after the model is finished does not
+    write it again. A finalize that raises is ignored when the model reads READY afterwards.
 
     A model is made only when the search lists none to use, the way
     ``mlflow.create_external_model`` makes one: tagged external, typed ``checkpoint``, with
@@ -50,10 +50,9 @@ def find_or_create_checkpoint_model(
     then finalized READY. The search is then run again, and the new model is returned only if
     it lists none to use. Server errors propagate.
 
-    Callers agree as long as a model shows in the search once the call that made it returns.
-    MLflow has no atomic create-if-absent, so a server that lists a model only later, after
-    another caller made, finished and searched for its own, can still leave them on different
-    models.
+    MLflow has no atomic create-if-absent, so this narrows the race rather than closing it: a
+    model stamped with an earlier creation time that becomes visible to searches only after
+    another caller has settled leaves the two on different models.
     """
     experiment_id = client.get_run(run_id).info.experiment_id
     model_id = _settled_model_id(client, experiment_id, run_id, name)
@@ -114,9 +113,10 @@ def _create_external_model(
 def _finish_external_model(client: Any, model: Any) -> None:
     """Upload the external MLmodel descriptor built from ``model``, then finalize it READY.
 
-    Does nothing when the model already reads READY, so a descriptor another caller finished is
-    never overwritten. Another caller may finish the same model at any time. A finalize that
-    raises is ignored when the model then reads READY, and re-raised otherwise.
+    Does nothing when the model already reads READY, so a caller that arrives after another one
+    finished it does not write its descriptor again; one that read PENDING just before can still
+    rewrite it. A finalize that raises is ignored when the model then reads READY, and re-raised
+    otherwise.
     """
     if client.get_logged_model(model.model_id).status == _READY:
         return
