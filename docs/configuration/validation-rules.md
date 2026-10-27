@@ -100,6 +100,7 @@ File:
 - `num_workers ≥ 0`.
 - `prefetch_factor ≥ 1`.
 - `mix_temperature > 0`.
+- `token_dtype ∈ {"", "uint16", "uint32"}`.
 - Every `DatasetSource` in `datasets` has `path` or `hf_name` set.
 - If `phases` is non-empty, `phases[*].start_step` is strictly
   monotonically increasing (and unique).
@@ -109,6 +110,7 @@ File:
 `DatasetSource`:
 
 - `weight > 0`.
+- `token_dtype ∈ {"", "uint16", "uint32"}`.
 
 `TrainingPhase`:
 
@@ -123,9 +125,14 @@ File:
 
 - `interval > 0`.
 - `steps > 0`.
+- `token_dtype ∈ {"", "uint16", "uint32"}`.
 
 (Data-source presence is enforced by `JobConfig.validate`, not here —
 a disabled eval is still a valid `EvalConfig`.)
+
+The `.bin` dtype itself is resolved, checked against `metadata.yaml`
+and against each shard's size when the dataset is built, not at config
+load; see [Memory-mapped dataset](../data/memory-mapped.md).
 
 ### `DistributedConfig`
 
