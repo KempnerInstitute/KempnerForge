@@ -140,7 +140,10 @@ else:
 # Loss lives only on the last stage
 avg_loss = sum(l.item() for l in pp_losses) / len(pp_losses) if is_last else 0.0
 
-# Broadcast loss + grad_norm to every PP stage for consistent logging
+grad_norm = clip_grad_norm_(model, tc.grad_clip_norm, pp_group=pp_group)
+
+# Broadcast the loss to every PP stage for consistent logging
+loss_tensor = torch.tensor([avg_loss], device=device)
 dist.broadcast(loss_tensor, group_src=pp_size - 1, group=pp_group)
 ```
 
@@ -149,6 +152,12 @@ across all microbatches internally. The training loop skips
 `maybe_no_sync`, `loss_fn`, and the manual microbatch loop — the
 schedule owns all of that. See
 [Training loop § PP step](../training/training-loop.md).
+
+The clip passes `pp_group`, so the squared stage norms are summed over
+the stages and every stage scales by the whole model's coefficient.
+Each stage then returns the same `grad_norm`, and only the loss needs
+the broadcast. See
+[Gradient utilities § Under pipeline parallelism](../training/gradient-utilities.md#under-pipeline-parallelism).
 
 ## FSDP2 interaction
 
