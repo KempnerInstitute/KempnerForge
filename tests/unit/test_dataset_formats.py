@@ -8,6 +8,8 @@ own suffix. Every test checks the exact tokens a sample holds.
 
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 import pytest
 import torch
@@ -23,6 +25,22 @@ def _write_bin(path, tokens) -> None:
 
 def _write_metadata(directory, dtype: str) -> None:
     (directory / "metadata.yaml").write_text(f"tokenized_info:\n  dtype: {dtype}\n")
+
+
+@pytest.fixture
+def dataset_warnings(caplog, monkeypatch):
+    """Warnings from the dataset module.
+
+    Once anything configures KempnerForge logging, the ``kempnerforge`` logger
+    stops propagating to the root logger where caplog listens.
+    """
+    monkeypatch.setattr(logging.getLogger("kempnerforge"), "propagate", True)
+    caplog.set_level(logging.WARNING, logger="kempnerforge.data.dataset")
+
+    def _messages() -> list[str]:
+        return [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+
+    return _messages
 
 
 def _samples(ds) -> list[list[int]]:
@@ -153,3 +171,36 @@ class TestPartialBinShards:
         _write_bin(tmp_path / "tokens_000.bin", np.arange(67, dtype=np.uint16))
         with pytest.raises(ValueError, match="holds uint16 or uint32 tokens"):
             MemoryMappedDataset(str(tmp_path), seq_len=SEQ_LEN, file_pattern="*.bin")
+
+
+class TestUndeclaredBinDtype:
+    def test_whole_uint32_shards_read_as_uint32_with_a_warning(self, tmp_path, dataset_warnings):
+        tokens = np.arange(100_000, 100_064, dtype=np.uint32)
+        _write_bin(tmp_path / "tokens_000.bin", tokens)
+        _write_bin(tmp_path / "tokens_001.bin", tokens + 64)
+        ds = MemoryMappedDataset(str(tmp_path), seq_len=SEQ_LEN, file_pattern="*.bin")
+        assert _samples(ds) == _chunks(tokens) + _chunks(tokens + 64)
+        warnings = dataset_warnings()
+        assert len(warnings) == 1
+        assert f"No token dtype is declared for the .bin shards in {tmp_path}" in warnings[0]
+        assert "token_dtype" in warnings[0]
+        assert str(tmp_path / "metadata.yaml") in warnings[0]
+
+    def test_metadata_without_a_dtype_counts_as_undeclared(self, tmp_path, dataset_warnings):
+        tokens = np.arange(64, dtype=np.uint32)
+        _write_bin(tmp_path / "tokens_000.bin", tokens)
+        (tmp_path / "metadata.yaml").write_text("name: raw corpus\ntokenized_info: {}\n")
+        ds = MemoryMappedDataset(str(tmp_path), seq_len=SEQ_LEN, file_pattern="*.bin")
+        assert _samples(ds) == _chunks(tokens)
+        assert any("No token dtype is declared" in m for m in dataset_warnings())
+
+    @pytest.mark.parametrize("declared_by", ["metadata", "token_dtype"])
+    def test_declared_shards_do_not_warn(self, tmp_path, dataset_warnings, declared_by):
+        _write_bin(tmp_path / "tokens_000.bin", np.arange(64, dtype=np.uint32))
+        kwargs = {}
+        if declared_by == "metadata":
+            _write_metadata(tmp_path, "uint32")
+        else:
+            kwargs["token_dtype"] = "uint32"
+        MemoryMappedDataset(str(tmp_path), seq_len=SEQ_LEN, file_pattern="*.bin", **kwargs)
+        assert dataset_warnings() == []
