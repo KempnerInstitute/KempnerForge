@@ -15,7 +15,7 @@ reads a directory of shard files, each a flat 1-D array of token IDs:
 | File extension | Encoding | Dtype rule |
 |----------------|----------|------------|
 | `*.npy` | NumPy mmap | dtype stored in header |
-| `*.bin` | Raw packed integers | inferred from size (4-byte multiple → uint32, else uint16), or from `metadata.yaml` |
+| `*.bin` | Raw packed integers | `data.token_dtype`, else `tokenized_info.dtype` in `metadata.yaml`; read as uint32 with a warning when neither declares it |
 
 One file is one flat array. The dataset concatenates shards logically
 and splits the concatenated stream into non-overlapping
@@ -41,8 +41,10 @@ uv run python scripts/prepare_data.py /path/to/tokenized/dataset
 ```
 
 Rolling your own: write flat arrays of uint16 / uint32 into `.bin` or
-`.npy` files, optionally drop a `metadata.yaml` alongside them, and
-point training at the directory.
+`.npy` files and point training at the directory. `.npy` files carry
+their dtype. `.bin` files do not, so declare it: set `data.token_dtype`,
+or drop a `metadata.yaml` (below) next to the shards. Undeclared `.bin`
+shards are read as uint32, which misreads a uint16 corpus.
 
 ### Validate with `prepare_data.py`
 
@@ -53,8 +55,12 @@ uv run python scripts/prepare_data.py /path/to/tokenized/dataset
 [`scripts/prepare_data.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/scripts/prepare_data.py)
 walks the directory, reports the shard count, size in GB, total token
 count, dtype, and (if `metadata.yaml` is present) the tokenizer name
-and vocab size. If the dtype is uint16 / uint32 the script prints the
-exact train-time flags:
+and vocab size. For `.bin` shards it resolves the dtype as training
+does, from `tokenized_info.dtype` in `metadata.yaml` or from
+`--token-dtype uint16|uint32`, and exits with an error when a shard is
+not a whole number of tokens of it. If no dtype is declared it says so
+rather than assuming uint32. If the dtype is uint16 / uint32 the script
+prints the exact train-time flags:
 
 ```
 Compatible with KempnerForge MemoryMappedDataset.
@@ -62,6 +68,7 @@ Compatible with KempnerForge MemoryMappedDataset.
 Train with:
   --data.dataset_path=/path/to/tokenized/dataset
   --data.file_pattern='*.bin'
+  --data.token_dtype=uint32
   --model.vocab_size=128256
 ```
 
@@ -71,15 +78,16 @@ Wire those into your TOML:
 [data]
 dataset_path = "/path/to/tokenized/dataset"
 file_pattern = "*.bin"
+token_dtype = "uint32"   # must agree with metadata.yaml when it records one
 
 [model]
 vocab_size = 128256   # must match what you tokenized with
 ```
 
-### Optional: `metadata.yaml` (tatm format)
+### `metadata.yaml` (tatm format)
 
-The validator reads `metadata.yaml` if present. Schema used by
-`tatm`:
+Training and the validator both read `tokenized_info.dtype` from the
+`metadata.yaml` next to `.bin` shards. Schema used by `tatm`:
 
 ```yaml
 tokenized_info:
@@ -88,10 +96,13 @@ tokenized_info:
   vocab_size: 128256
 ```
 
-If you generate shards yourself, dropping this file in the directory
-lets the validator print the right `vocab_size` flag and lets
-`.bin`-format shards bypass the heuristic dtype inference. It's
-optional — without it the validator still runs.
+If you generate `.bin` shards yourself, drop this file next to them or
+set `data.token_dtype`. Without either, training reads the shards as
+uint32 with a warning and refuses any shard that is not a whole number
+of uint32 tokens, since it could be uint16 or a truncated uint32 shard.
+A `metadata.yaml` that cannot be parsed, or that records a dtype other
+than uint16 or uint32, stops the run instead of being skipped. The file
+also lets the validator print the right `vocab_size` flag.
 
 ## Path B: HuggingFace streaming
 
