@@ -319,6 +319,7 @@ class CheckpointManager:
         # the flush completes (drained at the next save() or wait()), so
         # `latest` never points at a half-written checkpoint. (step, ckpt_dir).
         self._pending_finalize: tuple[int, Path] | None = None
+        self._inflight_dir: Path | None = None
         # Late-bound because the tracker is built after the manager; see set_tracking_source().
         self._tracking_source: TrackingSource | None = None
         # Dedicated gloo group for the manager's own synchronization
@@ -442,6 +443,7 @@ class CheckpointManager:
 
         # Create directory (all ranks)
         ckpt_dir.mkdir(parents=True, exist_ok=True)
+        self._inflight_dir = ckpt_dir
 
         # With PP, each stage has different parameters — save DCP shards to
         # a per-stage subdirectory to avoid .metadata file collisions.
