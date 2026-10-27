@@ -378,6 +378,7 @@ def build_eval_dataloader(config: JobConfig, runtime: RuntimeContext) -> Any | N
             data_dir=eval_config.dataset_path,
             seq_len=tc.seq_len + 1,
             file_pattern=eval_config.file_pattern,
+            token_dtype=eval_config.token_dtype,
         )
         logger.info(f"Eval dataset: {len(eval_dataset):,} samples from {eval_config.dataset_path}")
     elif eval_config.hf_dataset_name:
