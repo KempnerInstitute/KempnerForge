@@ -4,13 +4,26 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+TOKEN_DTYPES = ("uint16", "uint32")
+
+
+def check_token_dtype(value: str, key: str) -> None:
+    """Reject a ``token_dtype`` that is neither empty nor one of ``TOKEN_DTYPES``."""
+    if value and value not in TOKEN_DTYPES:
+        raise ValueError(
+            f"{key} must be 'uint16' or 'uint32', the integer type the raw .bin token "
+            f"shards were written with, or empty to take it from the metadata.yaml next "
+            f"to the shards; got {value!r}"
+        )
+
 
 @dataclass
 class DatasetSource:
     """A single data source in a multi-dataset mixture.
 
     Either ``path`` (pre-tokenized) or ``hf_name`` (HuggingFace) must be set.
-    ``weight`` controls the relative sampling probability.
+    ``weight`` controls the relative sampling probability. ``token_dtype``
+    overrides ``data.token_dtype`` for the ``.bin`` shards under ``path``.
     """
 
     path: str = ""  # Pre-tokenized data directory
@@ -18,10 +31,12 @@ class DatasetSource:
     name: str = ""  # Name for per-dataset metrics (auto-derived if empty)
     hf_name: str = ""  # HuggingFace dataset name
     hf_config: str = ""  # HuggingFace dataset config
+    token_dtype: str = ""
 
     def __post_init__(self) -> None:
         if self.weight <= 0:
             raise ValueError(f"Dataset weight must be positive, got {self.weight}")
+        check_token_dtype(self.token_dtype, "[[data.datasets]] token_dtype")
 
 
 @dataclass
@@ -48,10 +63,18 @@ class TrainingPhase:
 
 @dataclass
 class DataConfig:
-    """Data pipeline settings."""
+    """Data pipeline settings.
+
+    ``token_dtype`` is the integer type of the raw ``.bin`` token shards,
+    ``"uint16"`` or ``"uint32"``, for ``dataset_path`` and every ``datasets``
+    source that does not set its own. Left empty, the ``metadata.yaml`` next to
+    the shards decides, as ``MemoryMappedDataset`` describes. ``.npy`` shards
+    carry their dtype in their header and ignore it.
+    """
 
     dataset_path: str = ""
     file_pattern: str = "*.npy"  # Glob pattern for data files (e.g., "*.npy", "tokenized_*.bin")
+    token_dtype: str = ""
     tokenizer_path: str = ""
     num_workers: int = 4
     pin_memory: bool = True
@@ -82,6 +105,7 @@ class DataConfig:
             raise ValueError("prefetch_factor must be >= 1")
         if self.mix_temperature <= 0:
             raise ValueError("mix_temperature must be positive")
+        check_token_dtype(self.token_dtype, "data.token_dtype")
         for src in self.datasets:
             if not src.path and not src.hf_name:
                 raise ValueError(f"DatasetSource '{src.name}' must have either path or hf_name")
