@@ -204,3 +204,34 @@ class TestUndeclaredBinDtype:
             kwargs["token_dtype"] = "uint32"
         MemoryMappedDataset(str(tmp_path), seq_len=SEQ_LEN, file_pattern="*.bin", **kwargs)
         assert dataset_warnings() == []
+
+
+class TestTokenMetadataFile:
+    def test_unparseable_metadata_is_rejected(self, tmp_path):
+        """It must not fall through to reading the shards with no declared dtype."""
+        _write_bin(tmp_path / "tokens_000.bin", np.arange(64, dtype=np.uint16))
+        (tmp_path / "metadata.yaml").write_text("tokenized_info: [dtype: uint16\n")
+        with pytest.raises(ValueError, match="could not be read as YAML"):
+            MemoryMappedDataset(str(tmp_path), seq_len=SEQ_LEN, file_pattern="*.bin")
+
+    def test_unparseable_metadata_is_rejected_even_with_token_dtype(self, tmp_path):
+        _write_bin(tmp_path / "tokens_000.bin", np.arange(64, dtype=np.uint16))
+        (tmp_path / "metadata.yaml").write_text("tokenized_info: [dtype: uint16\n")
+        with pytest.raises(ValueError, match="could not be read as YAML"):
+            MemoryMappedDataset(
+                str(tmp_path), seq_len=SEQ_LEN, file_pattern="*.bin", token_dtype="uint16"
+            )
+
+    @pytest.mark.parametrize("recorded", ["int32", "uint8", "float16"])
+    def test_metadata_with_an_unsupported_dtype_is_rejected(self, tmp_path, recorded):
+        _write_bin(tmp_path / "tokens_000.bin", np.arange(64, dtype=np.uint32))
+        _write_metadata(tmp_path, recorded)
+        with pytest.raises(ValueError, match=f"records tokenized_info.dtype '{recorded}'"):
+            MemoryMappedDataset(str(tmp_path), seq_len=SEQ_LEN, file_pattern="*.bin")
+
+    def test_npy_only_directories_never_read_metadata(self, tmp_path):
+        tokens = np.arange(64, dtype=np.uint16)
+        np.save(tmp_path / "shard_000.npy", tokens)
+        (tmp_path / "metadata.yaml").write_text("tokenized_info: [dtype: uint16\n")
+        ds = MemoryMappedDataset(str(tmp_path), seq_len=SEQ_LEN)
+        assert _samples(ds) == _chunks(tokens)
