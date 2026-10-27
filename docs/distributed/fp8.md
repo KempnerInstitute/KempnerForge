@@ -127,7 +127,6 @@ tensor (torchao handles the interop).
 ```python
 _DTYPE_MAP = {
     "bf16": torch.bfloat16,
-    "fp16": torch.float16,
     "fp32": torch.float32,
     "fp8":  torch.bfloat16,  # FP8 compute with bf16 master weights
 }

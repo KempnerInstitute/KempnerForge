@@ -102,7 +102,7 @@ Training-loop hyperparameters.
 | `grad_clip_norm` | `float` | `1.0` | `clip_grad_norm_` cap |
 | `seed` | `int` | `42` | torch/numpy/python RNG seed |
 | `compile_model` | `bool` | `True` | wrap the model with `torch.compile` |
-| `mixed_precision` | `"bf16" \| "fp16" \| "fp32" \| "fp8"` | `"bf16"` | master-weight dtype; `"fp8"` uses bf16 masters with fp8 compute |
+| `mixed_precision` | `"bf16" \| "fp32" \| "fp8"` | `"bf16"` | master-weight dtype; `"fp8"` uses bf16 masters with fp8 compute; `"fp16"` is rejected (no loss scaling) |
 | `activation_checkpointing` | `"none" \| "full" \| "selective"` | `"none"` | AC policy |
 | `loss_fn` | `str` | `"cross_entropy"` | `loss` registry key (or `"chunked_cross_entropy"`) |
 | `z_loss_weight` | `float` | `0.0` | logit-magnitude regularizer (PaLM uses `1e-4`) |
