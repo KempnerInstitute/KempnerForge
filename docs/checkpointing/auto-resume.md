@@ -121,11 +121,8 @@ and removes the older ones, except three kinds it never removes:
 - every `dyn_ckpt_window` milestone, so the dense early checkpoints
   survive a finite `keep_last_n`.
 
-Default `keep_last_n = 3`. The `latest` symlink always points at the
-newest, never at one scheduled for removal. If you want to keep
-everything, set `keep_last_n` to a large number — there's no
-"disable cleanup" flag (and the `__post_init__` check requires
-`keep_last_n >= 1`).
+Default `keep_last_n = 3`. Set `keep_last_n = 0`, or any value `<= 0`,
+to keep every checkpoint: cleanup then removes nothing.
 
 A checkpoint it cannot remove is logged as a warning and left for the
 next cleanup to retry. On NFS a file closed a moment earlier can leave
