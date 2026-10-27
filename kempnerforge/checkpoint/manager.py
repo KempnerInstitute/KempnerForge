@@ -1070,7 +1070,7 @@ class CheckpointManager:
         """Remove old checkpoints beyond the retention limit.
 
         Never removed regardless of retention: the current ``latest`` target,
-        the directory the last ``save()`` created (``_inflight_dir``), whose
+        the directory the last ``save()`` writes into (``_inflight_dir``), whose
         async flush may still be running, a deferred async checkpoint
         (``_pending_finalize``), and any dynamic-window milestone
         (``CheckpointConfig.is_dynamic_milestone``), so the dense early-dynamics
