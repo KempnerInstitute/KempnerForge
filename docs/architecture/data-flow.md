@@ -234,7 +234,8 @@ In order:
   updates the `latest` symlink.
 - **Graceful shutdown** — if SIGTERM/SIGUSR1 fired,
   `ckpt_mgr.save(step)` as the emergency checkpoint, then exit; a step
-  the checkpoint above already saved is not saved again.
+  the checkpoint above already saved is not saved again, and the loop
+  waits for that save before it finishes the shutdown.
 
 ## Shutdown
 
