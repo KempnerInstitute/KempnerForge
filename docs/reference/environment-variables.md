@@ -86,12 +86,12 @@ is a restart.
 Read by the metrics config
 ([`kempnerforge/config/metrics.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/config/metrics.py),
 at load), the MLflow backend
-([`kempnerforge/metrics/mlflow/backend.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/metrics/mlflow/backend.py)),
+([`kempnerforge/metrics/mlflow_tracking/backend.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/metrics/mlflow_tracking/backend.py)),
 the eval publisher
-([`kempnerforge/metrics/mlflow/publish.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/metrics/mlflow/publish.py)),
+([`kempnerforge/metrics/mlflow_tracking/publish.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/metrics/mlflow_tracking/publish.py)),
 MLflow itself, or the Databricks SDK; the backend and the publisher prepare the Databricks
 variables through one helper in
-[`kempnerforge/metrics/mlflow/auth.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/metrics/mlflow/auth.py).
+[`kempnerforge/metrics/mlflow_tracking/auth.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/metrics/mlflow_tracking/auth.py).
 KempnerForge only fills these when they are unset (the token alias also fills an empty
 `DATABRICKS_TOKEN`), so a non-empty value you export always wins. `scripts/check_env.py` reads
 the auth variables too, to report which route a shell has.

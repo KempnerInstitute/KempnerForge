@@ -97,7 +97,7 @@ class MetricsTracker:
         if mc.enable_tensorboard:
             self._backends.append(TensorBoardBackend(mc))
         if mc.enable_mlflow:
-            from kempnerforge.metrics.mlflow.backend import MLflowBackend
+            from kempnerforge.metrics.mlflow_tracking.backend import MLflowBackend
 
             self._backends.append(MLflowBackend(mc, job_config=config))
 

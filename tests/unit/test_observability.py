@@ -133,7 +133,7 @@ class TestMetricsTracker:
     def test_init_backends_rank_zero_appends_mlflow(self, monkeypatch):
         """When rank-0 and enable_mlflow=True, init_backends appends an MLflowBackend."""
         monkeypatch.setattr(
-            "kempnerforge.metrics.mlflow.backend.MLflowBackend", MagicMock(name="FakeMLflow")
+            "kempnerforge.metrics.mlflow_tracking.backend.MLflowBackend", MagicMock(name="FakeMLflow")
         )
         config = JobConfig(
             model=ModelConfig(dim=128, n_layers=2, n_heads=2, vocab_size=256),

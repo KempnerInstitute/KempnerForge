@@ -1,7 +1,7 @@
 """Publish a checkpoint's lmms-eval scores to the MLflow run it was trained under.
 
 ``eval.py`` calls this after scoring. The run comes from the checkpoint's ``metadata.json``
-and each score is appended through ``kempnerforge.metrics.mlflow.publish`` as
+and each score is appended through ``kempnerforge.metrics.mlflow_tracking.publish`` as
 ``eval/<task>_<metric>`` at the checkpoint's step (``_<filter>`` follows when lmms-eval
 reports a filter other than ``none``). A summary table and ``scores.json`` go to the same
 run under ``eval/step_<N>/<UTC timestamp>/``: one directory per evaluation, so repeated or
@@ -30,7 +30,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from kempnerforge.metrics.mlflow.publish import (
+from kempnerforge.metrics.mlflow_tracking.publish import (
     MlflowTarget,
     PublishRefused,
     publish_metrics,
@@ -235,7 +235,7 @@ def _save(path: Path, mapping: Mapping[str, float]) -> Path | None:
 
 def _republish_command(checkpoint: Path, saved: Path) -> str:
     ckpt, scores = shlex.quote(str(checkpoint)), shlex.quote(str(saved))
-    return f"python -m kempnerforge.metrics.mlflow.publish {ckpt} --metrics {scores}"
+    return f"python -m kempnerforge.metrics.mlflow_tracking.publish {ckpt} --metrics {scores}"
 
 
 def _not_published(why: str, checkpoint: Path, saved: Path) -> None:
