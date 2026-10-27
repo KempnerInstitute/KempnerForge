@@ -23,6 +23,8 @@ from torch.utils.data import Dataset
 
 logger = logging.getLogger(__name__)
 
+TOKEN_FILE_SUFFIXES = (".bin", ".npy")
+
 
 def _compute_packed_output(tokens: np.ndarray, eos_token_id: int) -> dict[str, torch.Tensor]:
     """Compute input_ids, labels, and doc_ids for a packed token sequence.
@@ -65,17 +67,19 @@ def _compute_packed_output(tokens: np.ndarray, eos_token_id: int) -> dict[str, t
 
 
 class MemoryMappedDataset(Dataset):
-    """Pre-tokenized dataset backed by memory-mapped numpy files.
+    """Pre-tokenized dataset backed by memory-mapped token files.
 
-    Expects .npy files containing 1D arrays of uint16/uint32 token IDs
-    that have been pre-packed into fixed-length sequences.
+    Expects 1D arrays of uint16/uint32 token IDs that have been pre-packed
+    into fixed-length sequences, as ``.npy`` files or raw ``.bin`` shards.
+    Each matched file is read by its own suffix, so a pattern may match
+    both formats; a matched file with any other suffix is rejected.
 
     File layout: each file stores a flat array of tokens. The dataset
     splits them into non-overlapping chunks of ``seq_len`` tokens.
     Multiple files are concatenated logically.
 
     Args:
-        data_dir: Directory containing .npy token files.
+        data_dir: Directory containing .npy or .bin token files.
         seq_len: Sequence length (number of tokens per sample).
         file_pattern: Glob pattern for data files.
     """
@@ -99,9 +103,14 @@ class MemoryMappedDataset(Dataset):
         self._files = sorted(data_path.glob(file_pattern))
         if not self._files:
             raise FileNotFoundError(f"No files matching {file_pattern!r} in {data_dir}")
-
-        # Detect file format from extension
-        self._is_bin = self._files[0].suffix == ".bin"
+        unsupported = [f for f in self._files if f.suffix not in TOKEN_FILE_SUFFIXES]
+        if unsupported:
+            raise ValueError(
+                f"file_pattern {file_pattern!r} matches {unsupported[0]}, which is neither "
+                f"a .bin nor a .npy token file ({len(unsupported)} such file(s) in "
+                f"{data_dir}). MemoryMappedDataset reads raw .bin token shards and .npy "
+                f"arrays only; narrow file_pattern so that it matches token files only."
+            )
 
         # Memory-map all files and compute cumulative offsets
         self._mmaps: list[np.ndarray] = []
@@ -113,7 +122,7 @@ class MemoryMappedDataset(Dataset):
         # post-mortem debuggers all pin the partial `self` and its mmaps).
         try:
             for f in self._files:
-                if self._is_bin:
+                if f.suffix == ".bin":
                     # Raw binary: flat array of tokens. Infer dtype from file size
                     # or use uint32 (most common for modern tokenizers with vocab > 65535)
                     file_size = f.stat().st_size
