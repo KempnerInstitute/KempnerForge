@@ -167,6 +167,12 @@ rm latest
 ln -s step_5000 latest
 ```
 
+Move the abandoned `step_*` directories newer than step 5000 out of
+`checkpoints/` as well. Retention counts them among the newest, so they
+take the `keep_last_n` places of the rerun's own checkpoints, and with
+an async `async_mode` it can delete a directory a new save is still
+writing.
+
 Or override explicitly:
 
 ```toml
