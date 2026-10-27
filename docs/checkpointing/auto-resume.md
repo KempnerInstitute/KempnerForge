@@ -111,17 +111,15 @@ ever points at a fully-flushed checkpoint.
 
 ## Retention cleanup
 
-After updating the symlink, `CheckpointManager._cleanup()` trims the
-oldest checkpoints beyond `config.checkpoint.keep_last_n`:
+After updating the symlink, `CheckpointManager._cleanup()` keeps the
+`config.checkpoint.keep_last_n` highest-numbered `step_*` directories
+and removes the older ones, except three kinds it never removes:
 
-```python
-ckpt_dirs = sorted((d for d in self.base_dir.iterdir()
-                    if d.is_dir() and d.name.startswith("step_")),
-                   key=lambda d: int(d.name.split("_")[1]))
-to_remove = ckpt_dirs[:-keep] if len(ckpt_dirs) > keep else []
-for d in to_remove:
-    shutil.rmtree(d)
-```
+- the checkpoint `latest` points at;
+- the async checkpoint still being written, which `latest` points at
+  once its flush is durable;
+- every `dyn_ckpt_window` milestone, so the dense early checkpoints
+  survive a finite `keep_last_n`.
 
 Default `keep_last_n = 3`. The `latest` symlink always points at the
 newest, never at one scheduled for removal. If you want to keep
