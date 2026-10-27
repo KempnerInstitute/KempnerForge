@@ -4,7 +4,8 @@
 """The MLflow logging backend, for Databricks or any MLflow tracking server.
 
 ``MetricsTracker`` builds ``MLflowBackend`` on rank 0 when ``metrics.enable_mlflow`` is on. Its
-server calls run on the threads of ``kempnerforge.metrics.mlflow_tracking.worker``, each under a deadline.
+server calls run on the threads of ``kempnerforge.metrics.mlflow_tracking.worker``, each under a
+deadline.
 """
 
 from __future__ import annotations

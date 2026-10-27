@@ -1,7 +1,7 @@
 """MLflow publishing of the VLM eval harness: synthetic sidecars, fake mlflow and pandas.
 
-``kempnerforge.metrics.mlflow_tracking.publish`` is the real one; only ``mlflow`` and ``pandas`` are fakes
-(``_fake_mlflow``), so the tests need neither package.
+``kempnerforge.metrics.mlflow_tracking.publish`` is the real one; only ``mlflow`` and ``pandas``
+are fakes (``_fake_mlflow``), so the tests need neither package.
 """
 
 from __future__ import annotations
@@ -143,7 +143,9 @@ def _raiser(error: Exception):
 
 def _hint(caplog) -> list[str]:
     """The arguments of the re-publish command the log offers."""
-    (line,) = [m for m in caplog.messages if "python -m kempnerforge.metrics.mlflow_tracking.publish" in m]
+    (line,) = [
+        m for m in caplog.messages if "python -m kempnerforge.metrics.mlflow_tracking.publish" in m
+    ]
     words = shlex.split(line.split("python -m kempnerforge.metrics.mlflow_tracking.publish ")[1])
     assert words[1] == "--metrics"
     return words
