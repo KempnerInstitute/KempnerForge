@@ -158,7 +158,8 @@ Single dataset, HuggingFace source, or mixture; optional phase schedule.
 | Field | Type | Default | Purpose |
 |-------|------|---------|---------|
 | `dataset_path` | `str` | `""` | directory of pre-tokenized shards |
-| `file_pattern` | `str` | `"*.npy"` | glob inside `dataset_path` |
+| `file_pattern` | `str` | `"*.npy"` | glob inside `dataset_path`; each match is read by its own suffix, `.bin` or `.npy` |
+| `token_dtype` | `str` | `""` | dtype of raw `.bin` shards, `"uint16"` or `"uint32"`; `""` takes `tokenized_info.dtype` from the `metadata.yaml` beside them (see [Memory-mapped dataset](../data/memory-mapped.md)) |
 | `tokenizer_path` | `str` | `""` | path or HF id for the tokenizer |
 | `num_workers` | `int` | `4` | DataLoader workers |
 | `pin_memory` | `bool` | `True` | DataLoader pin memory |
@@ -184,6 +185,7 @@ Single dataset, HuggingFace source, or mixture; optional phase schedule.
 | `name` | `str` | `""` | name for per-dataset metrics (auto-derived if empty) |
 | `hf_name` | `str` | `""` | HF dataset id |
 | `hf_config` | `str` | `""` | HF dataset config |
+| `token_dtype` | `str` | `""` | dtype of this source's `.bin` shards; `""` uses `data.token_dtype` |
 
 Either `path` or `hf_name` must be set per source.
 
@@ -210,6 +212,7 @@ In-loop evaluation. Disabled by default.
 | `steps` | `int` | `50` | eval batches per evaluation |
 | `dataset_path` | `str` | `""` | pre-tokenized eval shards |
 | `file_pattern` | `str` | `"*.npy"` | glob inside `dataset_path` |
+| `token_dtype` | `str` | `""` | dtype of raw `.bin` eval shards, as `data.token_dtype` |
 | `hf_dataset_name` | `str \| None` | `None` | HF dataset id |
 | `hf_dataset_config` | `str \| None` | `None` | HF dataset config |
 | `hf_dataset_split` | `str` | `"validation"` | HF split |
