@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
-import importlib
 import inspect
 import json
 import math
@@ -274,7 +273,7 @@ def publish_metrics(
     target = read_mlflow_target(checkpoint_dir)
     named = _prefixed_metrics(metrics, prefix)
     try:
-        mlflow: Any = importlib.import_module("mlflow")
+        import mlflow
         from mlflow.entities import Metric
     except ImportError as e:
         raise PublishRefused(
