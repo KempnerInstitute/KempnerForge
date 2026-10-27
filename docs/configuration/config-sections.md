@@ -303,7 +303,8 @@ of the user's module.
 
 ## `[metrics]` — `MetricsConfig`
 
-Logging cadence and backend toggles.
+Logging cadence and backend toggles. The backends are independent, so any combination can be
+enabled in one run config.
 [`kempnerforge/config/metrics.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/config/metrics.py).
 
 | Field | Type | Default | Purpose |
@@ -325,6 +326,9 @@ Logging cadence and backend toggles.
 | `mlflow_log_system_metrics` | `bool` | `True` | sample CPU/GPU/memory on a background thread |
 | `mlflow_system_metrics_interval` | `float` | `10.0` | seconds between system-metric samples |
 | `mlflow_register_checkpoints` | `bool` | `False` | register each committed checkpoint as an MLflow external model on the background worker; `metadata.json` records its `model_name` at save and its `model_id` once registered; requires `enable_mlflow` |
+
+Credentials never go in config. The auth routes, the URI and experiment resolution, and the
+bounds on tracking calls are on the [MLflow backend](../metrics-and-profiling/mlflow.md) page.
 
 ## `[profiling]` — `ProfilingConfig`
 

@@ -274,8 +274,12 @@ evaluations never overwrite each other. No run is started, ended or edited.
 
 Publishing is on by default and `--no-publish` turns it off. It needs the `mlflow` and
 `eval` dependency groups (`uv sync --group mlflow --group eval`, plus `video` for video
-tasks) and the MLflow credentials of the run's tracking server in the environment. Sync
-before `uv pip install lmms-eval`, since `uv sync` removes packages the lock does not list.
+tasks) and credentials for the run's tracking server, by any of the routes in
+[MLflow backend § Authentication](../../docs/metrics-and-profiling/mlflow.md#authentication).
+Publishing authenticates the way training does, so a route that trains also publishes, except
+`user:token@` credentials in the tracking URI, which checkpoints never record.
+Sync before `uv pip install lmms-eval`, since `uv sync` removes packages the lock does not
+list.
 
 A publishing problem never fails an evaluation. The scores are written first to a local
 file named for the evaluation: `--output` with its suffix replaced by
