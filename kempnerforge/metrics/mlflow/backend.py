@@ -293,8 +293,7 @@ class MLflowBackend(_LoggingBackend):
         self._uri = self._config.resolve_mlflow_tracking_uri()
         on_databricks = self._uri.startswith("databricks")
         try:
-            if on_databricks:
-                _prepare_databricks_auth(self._uri)
+            _prepare_databricks_auth(self._uri)
             self._mlflow = _import_mlflow()
             # The training thread waits here at most once, for at most the init deadline.
             experiment, run_id, run_name, resumed, last_step = self._owner.start(_INIT_DEADLINE_S)

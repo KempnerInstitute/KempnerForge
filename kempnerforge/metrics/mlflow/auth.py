@@ -1,7 +1,8 @@
 """Databricks auth for MLflow: the environment the SDK and artifact clients read.
 
 Credentials are never read here: the Databricks SDK resolves them from the environment, a
-``~/.databrickscfg`` profile or OAuth.
+``~/.databrickscfg`` profile or OAuth. The training backend and the eval publisher both prepare
+the process environment through ``_prepare_databricks_auth``, so they authenticate alike.
 """
 
 from __future__ import annotations
@@ -33,9 +34,16 @@ def _databricks_profile(uri: str) -> str | None:
 def _prepare_databricks_auth(uri: str) -> None:
     """Make SDK and artifact calls use the URI's profile, and let the token alias stand in.
 
+    Artifact clients build their own SDK config from the environment and never see the tracking
+    URI, so a ``databricks://<profile>`` URI selects that profile via DATABRICKS_CONFIG_PROFILE
+    (the profile is the first path segment; ``databricks://`` and the
+    ``databricks://scope:prefix`` secret-scope form select nothing), and DATABRICKS_API_TOKEN
+    stands in for an unset or empty DATABRICKS_TOKEN. Non-empty operator-set values always win.
     Credentials are never read here: the SDK resolves them from the environment, a profile file
-    or OAuth. An operator-set DATABRICKS_CONFIG_PROFILE or DATABRICKS_TOKEN wins.
+    or OAuth. A URI that is not a Databricks one changes nothing.
     """
+    if not uri.startswith("databricks"):
+        return
     profile = _databricks_profile(uri)
     if profile:
         os.environ.setdefault("DATABRICKS_CONFIG_PROFILE", profile)

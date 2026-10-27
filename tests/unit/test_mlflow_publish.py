@@ -261,7 +261,7 @@ class TestReadMlflowTarget:
         ],
     )
     def test_profile_matches_the_training_parser(self, tmp_path, uri):
-        """The publisher and the trainer keep separate parsers; pin them to each other."""
+        """The publisher exports exactly the profile the trainer's parser names, for every URI."""
         from kempnerforge.metrics.mlflow.auth import _databricks_profile
 
         read_mlflow_target(_sidecar(tmp_path, tracking=[_entry(tracking_uri=uri)]))

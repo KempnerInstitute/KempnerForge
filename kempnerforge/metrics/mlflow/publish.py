@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Any
 
 from kempnerforge.metrics.logger import get_logger
+from kempnerforge.metrics.mlflow.auth import _prepare_databricks_auth
 from kempnerforge.metrics.mlflow.models import find_or_create_checkpoint_model
 
 logger = get_logger(__name__)
@@ -187,26 +188,6 @@ def read_mlflow_target(checkpoint_dir: str | os.PathLike[str]) -> MlflowTarget:
         model_id=entry.get("model_id"),
         model_name=entry.get("model_name"),
     )
-
-
-def _prepare_databricks_auth(tracking_uri: str) -> None:
-    """Prepare Databricks auth exactly as the training backend does.
-
-    Artifact clients build their own SDK config from the environment and never see the
-    tracking URI, so a ``databricks://<profile>`` URI selects that profile via
-    DATABRICKS_CONFIG_PROFILE (the profile is the first path segment; ``databricks://``
-    and the ``databricks://scope:prefix`` secret-scope form select nothing), and
-    DATABRICKS_API_TOKEN stands in for an unset or empty DATABRICKS_TOKEN. Non-empty
-    operator-set values always win.
-    """
-    if not tracking_uri.startswith("databricks"):
-        return
-    scheme, separator, rest = tracking_uri.partition("://")
-    profile = rest.partition("/")[0]
-    if scheme == "databricks" and separator and profile and ":" not in profile:
-        os.environ.setdefault("DATABRICKS_CONFIG_PROFILE", profile)
-    if not os.environ.get("DATABRICKS_TOKEN") and os.environ.get("DATABRICKS_API_TOKEN"):
-        os.environ["DATABRICKS_TOKEN"] = os.environ["DATABRICKS_API_TOKEN"]
 
 
 def _as_finite_float(value: object) -> float:
