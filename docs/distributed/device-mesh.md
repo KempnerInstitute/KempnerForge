@@ -126,11 +126,16 @@ the `dp_shard` axis. See
 
 ## Context parallelism
 
-`cp` appears in the parallelism arithmetic and the config schema but
-there is no `apply_context_parallel` function yet — CP is declared
-for validation but not wired. Attempting `cp > 1` passes the
-arithmetic check but produces no actual sequence parallelism. See the
-[planning issue](https://github.com/KempnerInstitute/KempnerForge/issues)
+Context parallelism is not implemented: there is no
+`apply_context_parallel`, and the mesh has no `cp` dimension. `cp`
+stays in the config schema and the parallelism arithmetic as a reserved
+field that must be `1`, so configs that set `cp = 1` still load.
+`DistributedConfig` rejects `cp > 1` as soon as the config is built,
+before `init_distributed` runs. Without that check, `cp` would only
+divide the world-size product: the mesh would cover `world_size / cp`
+ranks and leave the rest out or, with `cp` equal to the world size,
+train as plain FSDP over every rank. See the
+[issue tracker](https://github.com/KempnerInstitute/KempnerForge/issues)
 for status.
 
 ## One mesh, one barrier
