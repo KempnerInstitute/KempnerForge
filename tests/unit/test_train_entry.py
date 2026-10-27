@@ -672,6 +672,24 @@ class TestRunTrainingLoop:
         assert handler.finished is True
         assert ckpt.waits == 2
 
+    def test_shutdown_on_a_scheduled_step_waits_for_it_before_finishing(self, monkeypatch):
+        """The scheduled save is flushed while the shutdown watchdog is still armed."""
+        config = make_config(max_steps=10)
+        config.checkpoint.interval = 2
+        ckpt = FakeCheckpointManager()
+        handler = FakeShutdownHandler(after_steps=2)
+        finished_at_wait: list[bool] = []
+        real_wait = ckpt.wait
+
+        def wait() -> None:
+            finished_at_wait.append(handler.finished)
+            real_wait()
+
+        monkeypatch.setattr(ckpt, "wait", wait)
+        session = make_session(config, checkpointer=ckpt, shutdown_handler=handler)
+        run_training_loop(session)
+        assert finished_at_wait == [False, True]
+
     def test_shutdown_after_a_scheduled_save_still_saves_its_own_step(self):
         """Step 2 is saved on the schedule; a shutdown at step 3 must still save step 3."""
         config = make_config(max_steps=10)
