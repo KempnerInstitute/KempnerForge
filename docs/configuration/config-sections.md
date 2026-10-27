@@ -229,7 +229,7 @@ Parallelism dimensions and NCCL settings.
 | `tp` | `int` | `1` | tensor parallel |
 | `pp` | `int` | `1` | pipeline parallel |
 | `pp_schedule` | `"1f1b" \| "gpipe" \| "interleaved_1f1b"` | `"1f1b"` | pipeline schedule |
-| `cp` | `int` | `1` | context parallel (stub; PyTorch 2.11 ring attention) |
+| `cp` | `int` | `1` | context parallel; reserved, not implemented, must be `1` (`cp > 1` is rejected at load) |
 | `ep` | `int` | `1` | expert parallel (MoE only) |
 | `nccl_timeout_sec` | `int` | `1800` | NCCL collective timeout |
 | `backend` | `str` | `"cpu:gloo,cuda:nccl"` | `torch.distributed` backend mapping |

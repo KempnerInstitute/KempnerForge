@@ -21,8 +21,9 @@ TP → EP → [FP8] → AC → FSDP (dp_shard)
 
 Pipeline parallelism is applied separately in `training/entry.py::build_model`
 (split into stages *before* `build_parallel_model` runs on each
-stage), and DP replicate / CP are mesh dimensions without a dedicated
-apply step — they fall out of how the `DeviceMesh` is constructed.
+stage), and DP replicate is a mesh dimension without a dedicated
+apply step: it falls out of how the `DeviceMesh` is constructed.
+Context parallelism is not implemented, so `cp` must be `1`.
 Getting the order wrong is silent: gradients can be mathematically
 wrong but the loss curve looks plausible. Let the validator enforce
 the mesh shape, and pick your dimensions knowing what each costs.
@@ -35,7 +36,7 @@ the mesh shape, and pick your dimensions knowing what each costs.
 | **TP** | shards attention + MLP activations | every matmul (all-gather + reduce-scatter) | When a model is too big for FSDP alone, or `n_layers` is the bottleneck |
 | **PP** | shards layers across stages | once per micro-batch (P2P send/recv) | When TP+FSDP still can't fit (70B memory-tight) |
 | **EP** (MoE only) | shards expert weights | all-to-all on dispatch + combine | When expert weights dominate param budget; required at 32+ experts |
-| **CP** | shards along sequence | n/a (stub, not wired up) | Not yet |
+| **CP** | shards along sequence | n/a (not implemented; `cp > 1` is rejected) | Not yet |
 | **DP replicate** | none | all-reduce on grads across replicas | Rarely — shrinks all-reduce domain at memory cost |
 
 Matching principle: **cheap collectives first, expensive last**.
