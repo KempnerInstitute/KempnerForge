@@ -251,6 +251,29 @@ class TestTrainConfig:
         with pytest.raises(ValueError, match="grad_accum_steps must be positive"):
             TrainConfig(grad_accum_steps=0)
 
+    def test_rejects_fp16_mixed_precision(self) -> None:
+        """fp16 has no loss scaling, so it is rejected with bf16 or fp32 suggested."""
+        match = r"'fp16' is not supported: .*pure fp16 with no loss scaling.*'bf16', or 'fp32'"
+        with pytest.raises(ValueError, match=match):
+            TrainConfig(mixed_precision="fp16")
+
+    def test_fp16_mixed_precision_is_rejected_from_toml(self, tmp_path: Path) -> None:
+        toml = tmp_path / "fp16.toml"
+        toml.write_text('[train]\nmixed_precision = "fp16"\n')
+        with pytest.raises(ValueError, match="'fp16' is not supported"):
+            load_config(str(toml), cli_args=[])
+
+    def test_fp16_mixed_precision_is_rejected_from_cli(self) -> None:
+        with pytest.raises(ValueError, match="'fp16' is not supported"):
+            load_config(cli_args=["--train.mixed_precision=fp16"])
+
+    def test_fp16_set_after_construction_fails_in_param_dtype(self) -> None:
+        """Setting fp16 later skips __post_init__, so param_dtype raises the same error."""
+        config = TrainConfig()
+        config.mixed_precision = "fp16"
+        with pytest.raises(ValueError, match="'fp16' is not supported: .*no loss scaling"):
+            _ = config.param_dtype
+
     def test_data_seed_defaults_to_none(self):
         assert TrainConfig().data_seed is None
 
@@ -286,6 +309,15 @@ class TestOptimizerConfig:
     def test_rejects_bad_muon_momentum(self):
         with pytest.raises(ValueError, match="muon_momentum"):
             OptimizerConfig(muon_momentum=0.0)
+
+    def test_muon_nesterov_and_adjust_lr_defaults(self):
+        config = OptimizerConfig()
+        assert config.muon_nesterov is False
+        assert config.muon_adjust_lr == "original"
+
+    def test_rejects_unknown_muon_adjust_lr(self):
+        with pytest.raises(ValueError, match="muon_adjust_lr must be one of"):
+            OptimizerConfig(muon_adjust_lr="rms")
 
     def test_rejects_bad_muon_ns_steps(self):
         with pytest.raises(ValueError, match="muon_ns_steps"):
