@@ -813,6 +813,13 @@ class TestVLMParallelismSupport:
         with pytest.raises(ValueError, match=rf"vlm.arch='{arch}' does not support tensor"):
             job.validate(world_size=2)
 
+    @pytest.mark.parametrize("arch", ["mot", "moma"])
+    def test_tensor_parallel_reason_precedes_head_divisibility(self, arch):
+        """6 heads do not split over tp = 4, but the arch is what has to change."""
+        job = _vlm_job(arch, tp=4, n_heads=6)
+        with pytest.raises(ValueError, match=rf"vlm.arch='{arch}' does not support tensor"):
+            job.validate(world_size=4)
+
 
 class TestFlexSdpaBackendWarning:
     """``sdpa_backend`` selects an SDPA kernel, which the flex path never uses,
