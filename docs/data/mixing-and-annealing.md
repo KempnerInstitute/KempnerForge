@@ -44,8 +44,9 @@ dataset (`hf_name`). `DataConfig.__post_init__` rejects a
 Every mmap source globs the same `data.file_pattern`, and each matched
 file is read by its own suffix, so one pattern can cover a `.bin` source
 and an `.npy` source. The `.bin` dtype is resolved per source: its own
-`token_dtype`, else `data.token_dtype`, else the `metadata.yaml` in its
-directory (see [Memory-mapped dataset](memory-mapped.md)). Set it on the
+`token_dtype`, else `data.token_dtype`. Whichever applies must agree with
+the `metadata.yaml` in the source's directory, which decides when neither
+is set (see [Memory-mapped dataset](memory-mapped.md)). Set it on the
 source when sources differ, since `data.token_dtype` must agree with
 every source's `metadata.yaml`:
 
