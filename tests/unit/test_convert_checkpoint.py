@@ -398,6 +398,16 @@ class TestExportDtypeMetadata:
         dcp_to_hf(str(tmp_path / "dcp"), str(tmp_path / "hf"), tiny_model_config, dtype=dtype)
         assert _written(tmp_path / "hf") == ({dtype}, name)
 
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+    def test_transformers_loads_the_written_dtype(self, tmp_path, tiny_model_config, dtype):
+        """``from_pretrained(dtype="auto")`` follows torch_dtype, so a fixed
+        bfloat16 there would load these weights as bf16."""
+        transformers = pytest.importorskip("transformers")
+        _tiny_dcp(tmp_path / "dcp", tiny_model_config)
+        dcp_to_hf(str(tmp_path / "dcp"), str(tmp_path / "hf"), tiny_model_config, dtype=dtype)
+        model = transformers.AutoModelForCausalLM.from_pretrained(tmp_path / "hf", dtype="auto")
+        assert {p.dtype for p in model.parameters()} == {dtype}
+
 
 _TINY_TOML = """\
 [model]
