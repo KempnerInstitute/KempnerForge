@@ -2,17 +2,22 @@
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
 import pytest
+import torch
+import torch.distributed.checkpoint as dcp
+from safetensors.torch import load_file
 
 # Add scripts/ to path so we can import the conversion module
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 
-from convert_checkpoint import _build_hf_config, _hf_to_kf_key, _kf_to_hf_key
+from convert_checkpoint import _build_hf_config, _hf_to_kf_key, _kf_to_hf_key, dcp_to_hf
 
 from kempnerforge.config.schema import ModelConfig
+from kempnerforge.model.transformer import Transformer
 
 # ---------------------------------------------------------------------------
 # Key mapping: KempnerForge → HuggingFace
@@ -367,3 +372,27 @@ class TestBuildHFConfig:
         hf_cfg = _build_hf_config(mc)
         assert "num_local_experts" not in hf_cfg
         assert hf_cfg["model_type"] == "llama"
+
+
+def _tiny_dcp(path: Path, model_config: ModelConfig) -> None:
+    """Save a freshly initialized model as a single-process DCP checkpoint."""
+    dcp.save({"model": Transformer(model_config).state_dict()}, checkpoint_id=str(path))
+
+
+def _written(hf_dir: Path) -> tuple[set[torch.dtype], str]:
+    """The dtypes of an export's tensors and the ``torch_dtype`` its config.json names."""
+    weights = load_file(hf_dir / "model.safetensors")
+    hf_cfg = json.loads((hf_dir / "config.json").read_text())
+    return {t.dtype for t in weights.values()}, hf_cfg["torch_dtype"]
+
+
+class TestExportDtypeMetadata:
+    @pytest.mark.parametrize(
+        ("dtype", "name"),
+        [(torch.float32, "float32"), (torch.bfloat16, "bfloat16"), (torch.float16, "float16")],
+    )
+    def test_config_json_names_the_written_dtype(self, tmp_path, tiny_model_config, dtype, name):
+        """torch_dtype names the dtype the tensors were written in, not a fixed bfloat16."""
+        _tiny_dcp(tmp_path / "dcp", tiny_model_config)
+        dcp_to_hf(str(tmp_path / "dcp"), str(tmp_path / "hf"), tiny_model_config, dtype=dtype)
+        assert _written(tmp_path / "hf") == ({dtype}, name)
