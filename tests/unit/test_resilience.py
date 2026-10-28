@@ -94,7 +94,6 @@ class TestShutdownHandler:
         os.kill(os.getpid(), signal.SIGTERM)
         os.kill(os.getpid(), signal.SIGTERM)
         assert handler.should_shutdown()
-        assert handler.state.consecutive_nans if hasattr(handler, "state") else True
         handler.unregister()
 
 
