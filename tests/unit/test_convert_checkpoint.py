@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sys
 from pathlib import Path
 
@@ -463,3 +464,15 @@ class TestExportDtypePrecedence:
     def test_bfloat16_without_flag_or_config(self, tmp_path, monkeypatch):
         written = _run_dcp_to_hf(tmp_path, monkeypatch, None, None)
         assert written == ({torch.bfloat16}, "bfloat16")
+
+    @pytest.mark.parametrize(
+        ("export_dtype", "flag", "source"),
+        [(None, "float32", "--dtype"), ("float32", None, "checkpoint.export_dtype")],
+    )
+    def test_log_names_where_the_dtype_came_from(
+        self, tmp_path, monkeypatch, caplog, export_dtype, flag, source
+    ):
+        """The log line says whether the flag or the config chose the export dtype."""
+        with caplog.at_level(logging.INFO, logger="convert_checkpoint"):
+            _run_dcp_to_hf(tmp_path, monkeypatch, export_dtype, flag)
+        assert f"Export dtype: float32 (from {source})" in caplog.text
