@@ -90,7 +90,7 @@ class TestShutdownHandler:
         handler.finish()
 
     def test_multiple_signals_idempotent(self, monkeypatch):
-        """A second signal neither clears the request nor starts a second forced-exit timer."""
+        """A second signal keeps the request and the first timer, and arms no other."""
         started = []
 
         class RecordingTimer(threading.Timer):
@@ -104,11 +104,10 @@ class TestShutdownHandler:
         handler.register()
         try:
             os.kill(os.getpid(), signal.SIGTERM)
-            first_timer = handler._timer
             os.kill(os.getpid(), signal.SIGTERM)
             assert handler.should_shutdown()
-            assert first_timer is not None
-            assert handler._timer is first_timer
+            assert len(started) == 1
+            assert handler._timer is started[0]
         finally:
             for timer in started:
                 timer.cancel()
