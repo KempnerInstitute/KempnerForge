@@ -745,6 +745,58 @@ class TestJobConfig:
         config.validate(world_size=1)  # Should not raise.
 
 
+def _vlm_job(
+    arch: str | None,
+    *,
+    tp: int = 1,
+    ep: int = 1,
+    n_heads: int = 4,
+    num_experts: int = 0,
+    tie_embeddings: bool = False,
+) -> JobConfig:
+    """A small job on ``tp * ep`` ranks, text-only when ``arch`` is None, that is otherwise
+    valid, so the only check it can fail is the one a test sets up."""
+    vlm_sections = {}
+    if arch is not None:
+        vlm_sections = {
+            "vision_encoder": VisionEncoderConfig(type="random", num_tokens=8),
+            "adapter": AdapterConfig(),
+            "vlm": VLMConfig.for_arch(arch, max_text_len=32),
+        }
+    return JobConfig(
+        model=ModelConfig(
+            dim=16 * n_heads,
+            n_layers=2,
+            n_heads=n_heads,
+            vocab_size=256,
+            max_seq_len=128,
+            num_experts=num_experts,
+            moe_top_k=1,
+            tie_embeddings=tie_embeddings,
+        ),
+        train=TrainConfig(seq_len=64),
+        distributed=DistributedConfig(dp_shard=1, tp=tp, ep=ep),
+        **vlm_sections,
+    )
+
+
+class TestVLMParallelismSupport:
+    """``JobConfig.validate`` rejects the VLM arches that tensor or expert parallelism cannot
+    run, and names the arch ahead of the generic head and expert-count checks."""
+
+    @pytest.mark.parametrize(
+        ("arch", "reason"),
+        [
+            pytest.param("mot", "MoTBlock keeps its norms", id="mot"),
+            pytest.param("moma", "no entry for MoMaFFN", id="moma"),
+        ],
+    )
+    def test_tensor_parallel_rejected(self, arch, reason):
+        match = rf"vlm.arch='{arch}' does not support tensor parallelism .*{reason}.*tp = 1"
+        with pytest.raises(ValueError, match=match):
+            _vlm_job(arch, tp=2).validate(world_size=2)
+
+
 class TestFlexSdpaBackendWarning:
     """``sdpa_backend`` selects an SDPA kernel, which the flex path never uses,
     so setting both is a silent no-op worth warning about.
