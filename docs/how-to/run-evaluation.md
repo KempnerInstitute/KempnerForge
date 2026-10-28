@@ -24,7 +24,7 @@ interval             = 500          # steps between evals
 steps                = 50           # batches per eval
 dataset_path         = "/data/eval_set"
 file_pattern         = "*.bin"
-token_dtype          = "uint32"     # .bin dtype; "" reads metadata.yaml
+token_dtype          = "uint32"     # .bin dtype; "" reads metadata.yaml, not data.token_dtype
 # OR — HuggingFace eval data:
 # hf_dataset_name    = "wikitext"
 # hf_dataset_config  = "wikitext-103-raw-v1"
