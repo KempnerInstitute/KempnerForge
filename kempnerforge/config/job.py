@@ -231,6 +231,14 @@ class JobConfig:
             )
 
         if self.distributed.ep > 1:
+            if isinstance(self.vlm, MoTConfig):
+                raise ValueError(
+                    f"vlm.arch={self.vlm.arch!r} does not support expert parallelism "
+                    f"(distributed.ep={self.distributed.ep}): the FSDP2 wrap for expert-parallel "
+                    "blocks expects layer.attention and layer.mlp, and MoTBlock names its "
+                    "attention attn and keeps per-modality experts, so the model build fails. "
+                    "Set distributed.ep = 1; MoT with MoE trains without expert parallelism."
+                )
             if not self.model.is_moe:
                 raise ValueError("ep > 1 requires an MoE model (num_experts > 0)")
             if self.model.num_experts % self.distributed.ep != 0:
