@@ -188,6 +188,14 @@ class JobConfig:
                     "and FFNs per modality under other names, so the build fails or no parameter "
                     "is sharded. Set distributed.tp = 1."
                 )
+            if isinstance(self.vlm, MoMaConfig):
+                raise ValueError(
+                    f"vlm.arch={self.vlm.arch!r} does not support tensor parallelism "
+                    f"(distributed.tp={self.distributed.tp}): the tensor-parallel plan has no "
+                    "entry for MoMaFFN's per-modality expert groups, so they are never sharded, "
+                    "and with sequence parallelism on (untied embeddings) the forward fails on "
+                    "the sequence-sharded activations. Set distributed.tp = 1."
+                )
             if self.model.n_heads % self.distributed.tp != 0:
                 raise ValueError(
                     f"n_heads ({self.model.n_heads}) must be divisible by "
