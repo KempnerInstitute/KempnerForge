@@ -218,6 +218,36 @@ stages, so they can't be tied.
 eval.enabled && !eval.dataset_path && !eval.hf_dataset_name  →  ValueError
 ```
 
+### VLM architectures under tensor parallelism
+
+Checked first when `distributed.tp > 1`, ahead of head divisibility, so the
+error names the arch rather than a head count:
+
+```
+vlm.arch ∈ {"mot", "moma", "cross_attention"} && distributed.tp > 1  →  ValueError
+```
+
+The tensor-parallel plan
+([`apply_tensor_parallel`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/distributed/tensor_parallel.py))
+is written for `TransformerBlock` and walks `model.layers` only, so it cannot
+run these arches:
+
+- `mot`: `MoTBlock` keeps its norms, attention and FFNs per modality under
+  other names, so either no parameter is sharded at all or the build fails
+  with `KeyError: 'parameter name can't contain "."'`.
+- `moma`: the plan has no entry for `MoMaFFN`'s per-modality expert groups,
+  so they are never sharded, and with sequence parallelism on the first
+  forward fails on the sequence-sharded activations.
+- `cross_attention`: the blocks in `cross_attention_layers` are never
+  visited, so they are never sharded, and with sequence parallelism on the
+  first one fails on the sequence-sharded activations.
+
+Sequence parallelism is on unless the model is MoE or ties its embeddings.
+With it off these runs start, but the blocks the plan misses stay whole on
+every tensor-parallel rank, with no gradient reduction across that group, so
+they are rejected too. Set `distributed.tp = 1`. Text-only and
+`joint_decoder` jobs do not reach this check.
+
 ### Tensor-parallel head divisibility
 
 When `distributed.tp > 1`:
@@ -247,6 +277,16 @@ splitting. Use FSDP, TP, or EP instead.
 
 When `distributed.ep > 1`:
 
+- `vlm.arch` must not be `"mot"` or `"moma"`. Checked first, so these jobs
+  get their own reason whatever `model.num_experts` is:
+  - `mot`: the FSDP2 wrap for expert-parallel blocks expects
+    `layer.attention` and `layer.mlp`, and `MoTBlock` names its attention
+    `attn` and keeps its experts per modality, so the model build fails. MoT
+    with MoE trains with `ep = 1`.
+  - `moma`: `apply_expert_parallel` partitions `MoEMLP` experts only, and
+    MoMa's per-modality expert groups need an EP-aware dispatch that is not
+    wired yet. MoMa also requires `model.num_experts = 0`, which the next
+    check rejects, so this one has to come first to be seen at all.
 - `model.is_moe` must be `True` (the error reads
   `"ep > 1 requires an MoE model (num_experts > 0)"`).
 - `model.num_experts % distributed.ep == 0`.
