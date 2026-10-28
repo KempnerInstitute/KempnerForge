@@ -194,16 +194,11 @@ at 124k tok/s against 236k unpacked, while flex reaches 300k. Below about
 See [Model § Attention backend](../architecture/model.md) for the full
 table.
 
-Two caveats worth knowing before turning packing on:
-
-- **Pipeline parallelism is unsupported** and rejected in validation.
-  `PipelineStageModule.forward` takes only hidden states, so `doc_ids`
-  never reaches the stages.
-- **Eval does not pack.** `_EvalTensorDataset` emits no `doc_ids`, so
-  evaluation always runs plain causal attention even when training is
-  packed. Eval loss is therefore computed under slightly different
-  masking than training loss. Pre-existing, and worth remembering when
-  comparing the two curves.
+One caveat worth knowing before turning packing on: **eval does not
+pack.** `_EvalTensorDataset` emits no `doc_ids`, so evaluation always
+runs plain causal attention even when training is packed. Eval loss is
+therefore computed under slightly different masking than training loss.
+Pre-existing, and worth remembering when comparing the two curves.
 
 ## Resumption
 
