@@ -340,8 +340,10 @@ def main() -> None:
     p_export.add_argument("--config", required=True, help="TOML config file")
     p_export.add_argument(
         "--dtype",
-        default="bfloat16",
+        default=None,
         choices=["float32", "bfloat16", "float16"],
+        help="Export dtype; overrides checkpoint.export_dtype from --config "
+        "(default: that field, which is bfloat16 unless the TOML sets it)",
     )
 
     # HF → DCP
@@ -360,11 +362,12 @@ def main() -> None:
     }
 
     if args.command == "dcp-to-hf":
+        export_dtype = args.dtype if args.dtype is not None else config.checkpoint.export_dtype
         dcp_to_hf(
             dcp_dir=args.dcp_dir,
             hf_dir=args.hf_dir,
             model_config=config.model,
-            dtype=dtype_map[args.dtype],
+            dtype=dtype_map[export_dtype],
         )
     elif args.command == "hf-to-dcp":
         hf_to_dcp(
