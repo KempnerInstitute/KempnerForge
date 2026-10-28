@@ -239,6 +239,14 @@ class JobConfig:
                     "attention attn and keeps per-modality experts, so the model build fails. "
                     "Set distributed.ep = 1; MoT with MoE trains without expert parallelism."
                 )
+            if isinstance(self.vlm, MoMaConfig):
+                raise ValueError(
+                    f"vlm.arch={self.vlm.arch!r} does not support expert parallelism "
+                    f"(distributed.ep={self.distributed.ep}): apply_expert_parallel partitions "
+                    "MoEMLP experts only, and MoMa's per-modality expert groups need an EP-aware "
+                    "dispatch that is not wired yet, so every rank would keep every expert. Set "
+                    "distributed.ep = 1."
+                )
             if not self.model.is_moe:
                 raise ValueError("ep > 1 requires an MoE model (num_experts > 0)")
             if self.model.num_experts % self.distributed.ep != 0:
@@ -297,11 +305,6 @@ class JobConfig:
                         "MoMa + model.num_experts > 0 is rejected. MoMa derives expert "
                         "counts per modality from vlm.moma_experts_per_modality; set "
                         "model.num_experts=0 (the dense-LLM default) when using arch='moma'."
-                    )
-                if self.distributed.ep > 1:
-                    raise ValueError(
-                        "MoMa + Expert Parallelism is not supported in v1. Per-modality "
-                        "expert groups need EP-aware dispatch that is not yet wired."
                     )
                 if self.train.compile_model:
                     import logging
