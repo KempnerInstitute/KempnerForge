@@ -852,7 +852,7 @@ class TestVLMParallelismSupport:
             pytest.param("moma", 1, 1, 0, id="moma"),
         ],
     )
-    def test_supported_combinations_still_validate(self, arch, tp, ep, num_experts):
+    def test_other_combinations_still_validate(self, arch, tp, ep, num_experts):
         """The guards name arches, not VLMs in general: text and joint_decoder still pass
         under tensor parallelism, joint_decoder and cross-attention MoE under expert
         parallelism, and MoT MoE and MoMa without either."""
