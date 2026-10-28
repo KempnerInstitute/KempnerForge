@@ -83,3 +83,26 @@ class TestBinDtypeReport:
             prepare_data.validate(tmp_path)
         assert excinfo.value.code == 1
         assert "could not be read as YAML" in capsys.readouterr().err
+
+
+class TestCommandLine:
+    def test_token_dtype_flag_declares_the_dtype(self, tmp_path, capsys, monkeypatch):
+        """``--token-dtype`` reaches validation, so an undeclared uint16 corpus passes."""
+        _bin_shard(tmp_path, np.uint16, 4097)
+        monkeypatch.setattr(
+            sys, "argv", ["prepare_data.py", str(tmp_path), "--token-dtype", "uint16"]
+        )
+        prepare_data.main()
+        out = capsys.readouterr().out
+        assert "Tokens:     4,097\n" in out
+        assert "--data.token_dtype=uint16\n" in out
+
+    def test_token_dtype_flag_accepts_only_uint16_or_uint32(self, tmp_path, capsys, monkeypatch):
+        _bin_shard(tmp_path, np.uint32, 4096)
+        monkeypatch.setattr(
+            sys, "argv", ["prepare_data.py", str(tmp_path), "--token-dtype", "int32"]
+        )
+        with pytest.raises(SystemExit) as excinfo:
+            prepare_data.main()
+        assert excinfo.value.code == 2
+        assert "invalid choice: 'int32'" in capsys.readouterr().err
