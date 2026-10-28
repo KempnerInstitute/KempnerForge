@@ -237,7 +237,7 @@ run these arches:
   with `KeyError: 'parameter name can't contain "."'`.
 - `moma`: the plan has no entry for `MoMaFFN`'s per-modality expert groups,
   so they are never sharded, and with sequence parallelism on the first
-  forward fails on the sequence-sharded activations.
+  forward fails.
 - `cross_attention`: the blocks in `cross_attention_layers` are never
   visited, so they are never sharded, and with sequence parallelism on the
   first one fails on the sequence-sharded activations.
@@ -246,7 +246,7 @@ Sequence parallelism is on unless the model is MoE or ties its embeddings.
 With it off these runs start, but the blocks the plan misses stay whole on
 every tensor-parallel rank, with no gradient reduction across that group, so
 they are rejected too. Set `distributed.tp = 1`. Text-only and
-`joint_decoder` jobs do not reach this check.
+`joint_decoder` jobs pass this check.
 
 ### Tensor-parallel head divisibility
 
