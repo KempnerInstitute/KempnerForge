@@ -28,10 +28,14 @@ an error that names the file.
 - **`.bin`** — raw binary, flat array of tokens, with no header. Its
   dtype is, in order:
   1. `data.token_dtype` (`"uint16"` or `"uint32"`), or the source's own
-     `token_dtype` in a mixture, or `eval.token_dtype` for eval data.
+     `token_dtype` in a mixture, or `eval.token_dtype` for eval data,
+     which does not fall back to `data.token_dtype`.
   2. `tokenized_info.dtype` in the `metadata.yaml` next to the shard,
      which tatm writes. When both this and a `token_dtype` are set they
-     must agree.
+     must agree. The file is looked up in the directory of each matched
+     path: a shard in a subdirectory (matched by `**/*.bin`, say) needs
+     a `metadata.yaml` in that subdirectory, and a symlinked shard uses
+     the one beside the link, not beside its target.
   3. Neither: the shards are read as `uint32`, with a warning that names
      both ways to declare the dtype, provided every shard is a whole
      number of `uint32` tokens. Any other size fits a `uint16` shard and
