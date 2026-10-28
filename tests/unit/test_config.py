@@ -826,6 +826,18 @@ class TestVLMParallelismSupport:
         with pytest.raises(ValueError, match=rf"vlm.arch='{arch}' does not support tensor"):
             job.validate(world_size=4)
 
+    @pytest.mark.parametrize(
+        ("arch", "reason"),
+        [pytest.param("mot", "expects layer.attention and layer.mlp", id="mot")],
+    )
+    @pytest.mark.parametrize("num_experts", [0, 2, 3])
+    def test_expert_parallel_rejected(self, arch, reason, num_experts):
+        """0 experts would fail the MoE check and 3 the divisibility check by ep = 2; the
+        arch's reason comes first either way."""
+        match = rf"vlm.arch='{arch}' does not support expert parallelism .*{reason}.*ep = 1"
+        with pytest.raises(ValueError, match=match):
+            _vlm_job(arch, ep=2, num_experts=num_experts).validate(world_size=2)
+
 
 class TestFlexSdpaBackendWarning:
     """``sdpa_backend`` selects an SDPA kernel, which the flex path never uses,
