@@ -441,3 +441,11 @@ class TestExportDtypePrecedence:
     def test_config_alone_sets_the_dtype(self, tmp_path, monkeypatch):
         written = _run_dcp_to_hf(tmp_path, monkeypatch, "float32", None)
         assert written == ({torch.float32}, "float32")
+
+    @pytest.mark.parametrize(
+        ("flag", "dtype"), [("bfloat16", torch.bfloat16), ("float16", torch.float16)]
+    )
+    def test_flag_overrides_the_config(self, tmp_path, monkeypatch, flag, dtype):
+        """Even a flag that names the default wins over the TOML."""
+        written = _run_dcp_to_hf(tmp_path, monkeypatch, "float32", flag)
+        assert written == ({dtype}, flag)
