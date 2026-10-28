@@ -281,8 +281,12 @@ def _load_hf_hub(model_id: str) -> dict[str, torch.Tensor]:
     return hf_model.state_dict()
 
 
-def _build_hf_config(config: ModelConfig) -> dict:
-    """Build a HuggingFace-compatible config.json from ModelConfig."""
+def _build_hf_config(config: ModelConfig, dtype: torch.dtype = torch.bfloat16) -> dict:
+    """Build a HuggingFace-compatible config.json from ModelConfig.
+
+    ``torch_dtype`` names ``dtype``, the dtype the weights are written in, so
+    ``from_pretrained(..., dtype="auto")`` loads them at that precision.
+    """
     if config.dim % config.n_heads != 0:
         raise ValueError(
             f"Cannot export dim ({config.dim}) not divisible by n_heads ({config.n_heads}): "
@@ -301,7 +305,7 @@ def _build_hf_config(config: ModelConfig) -> dict:
         "rope_theta": config.rope_theta,
         "rms_norm_eps": config.norm_eps,
         "tie_word_embeddings": config.tie_embeddings,
-        "torch_dtype": "bfloat16",
+        "torch_dtype": str(dtype).removeprefix("torch."),
     }
 
     if config.is_moe:
