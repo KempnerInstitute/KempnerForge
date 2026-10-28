@@ -131,7 +131,8 @@ def dcp_to_hf(
         dcp_dir: Path to DCP checkpoint directory (e.g., checkpoints/step_10000).
         hf_dir: Output directory for HuggingFace model files.
         model_config: Model configuration for building the model skeleton.
-        dtype: Export dtype (default: bfloat16).
+        dtype: Export dtype (default: bfloat16), recorded as ``torch_dtype`` in
+            the written ``config.json``.
     """
     dcp_path = Path(dcp_dir)
     logger.info(f"Loading DCP checkpoint from {dcp_dir}")
@@ -177,7 +178,7 @@ def dcp_to_hf(
         logger.info(f"Saved HuggingFace checkpoint (torch): {hf_path}")
 
     # Write config.json for HF compatibility
-    hf_config = _build_hf_config(model_config)
+    hf_config = _build_hf_config(model_config, dtype)
     (hf_path / "config.json").write_text(json.dumps(hf_config, indent=2))
     logger.info(f"Wrote config.json with {len(hf_state)} tensors")
 
