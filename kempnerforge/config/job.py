@@ -236,8 +236,9 @@ class JobConfig:
                     f"vlm.arch={self.vlm.arch!r} does not support expert parallelism "
                     f"(distributed.ep={self.distributed.ep}): the FSDP2 wrap for expert-parallel "
                     "blocks expects layer.attention and layer.mlp, and MoTBlock names its "
-                    "attention attn and keeps per-modality experts, so the model build fails. "
-                    "Set distributed.ep = 1; MoT with MoE trains without expert parallelism."
+                    "attention attn and keeps its FFNs per modality, so a MoT model with experts "
+                    "fails to build. Set distributed.ep = 1; MoT with MoE trains without expert "
+                    "parallelism."
                 )
             if isinstance(self.vlm, MoMaConfig):
                 raise ValueError(
