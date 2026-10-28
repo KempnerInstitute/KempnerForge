@@ -212,7 +212,7 @@ In-loop evaluation. Disabled by default.
 | `steps` | `int` | `50` | eval batches per evaluation |
 | `dataset_path` | `str` | `""` | pre-tokenized eval shards |
 | `file_pattern` | `str` | `"*.npy"` | glob inside `dataset_path` |
-| `token_dtype` | `str` | `""` | dtype of raw `.bin` eval shards, as `data.token_dtype` |
+| `token_dtype` | `str` | `""` | dtype of raw `.bin` eval shards, `"uint16"` or `"uint32"`; `""` takes it from the `metadata.yaml` beside them, never from `data.token_dtype` |
 | `hf_dataset_name` | `str \| None` | `None` | HF dataset id |
 | `hf_dataset_config` | `str \| None` | `None` | HF dataset config |
 | `hf_dataset_split` | `str` | `"validation"` | HF split |
