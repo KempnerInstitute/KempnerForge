@@ -789,6 +789,9 @@ class TestVLMParallelismSupport:
         [
             pytest.param("mot", "MoTBlock keeps its norms", id="mot"),
             pytest.param("moma", "no entry for MoMaFFN", id="moma"),
+            pytest.param(
+                "cross_attention", "never visits the cross-attention blocks", id="cross_attention"
+            ),
         ],
     )
     def test_tensor_parallel_rejected(self, arch, reason):
@@ -802,18 +805,21 @@ class TestVLMParallelismSupport:
             pytest.param("mot", 2, False, id="mot-moe"),
             pytest.param("mot", 0, True, id="mot-tied"),
             pytest.param("moma", 0, True, id="moma-tied"),
+            pytest.param("cross_attention", 2, False, id="cross_attention-moe"),
+            pytest.param("cross_attention", 0, True, id="cross_attention-tied"),
         ],
     )
     def test_tensor_parallel_rejected_without_sequence_parallelism(
         self, arch, num_experts, tie_embeddings
     ):
         """MoE or tied embeddings turn sequence parallelism off, so the run starts, but the
-        plan still misses what these arches add: MoT shards no parameter, MoMa no expert."""
+        plan still misses what these arches add: MoT shards no parameter, MoMa no expert,
+        and every cross-attention block stays whole on every rank."""
         job = _vlm_job(arch, tp=2, num_experts=num_experts, tie_embeddings=tie_embeddings)
         with pytest.raises(ValueError, match=rf"vlm.arch='{arch}' does not support tensor"):
             job.validate(world_size=2)
 
-    @pytest.mark.parametrize("arch", ["mot", "moma"])
+    @pytest.mark.parametrize("arch", ["mot", "moma", "cross_attention"])
     def test_tensor_parallel_reason_precedes_head_divisibility(self, arch):
         """6 heads do not split over tp = 4, but the arch is what has to change."""
         job = _vlm_job(arch, tp=4, n_heads=6)
