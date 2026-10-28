@@ -103,6 +103,39 @@ def test_vlm_7b_siglip2_toml() -> None:
     config.validate(world_size=4)
 
 
+def _arch(path: Path) -> str:
+    return tomllib.loads(path.read_text())["vlm"]["arch"]
+
+
+UNSUPPORTED_PARALLELISM = [
+    pytest.param(path, "--distributed.tp=2", "tensor", id=f"{path.name}-tp")
+    for path in CONFIGS
+    if _arch(path) in {"mot", "moma", "cross_attention"}
+] + [
+    pytest.param(path, "--distributed.ep=2", "expert", id=f"{path.name}-ep")
+    for path in CONFIGS
+    if _arch(path) in {"mot", "moma"}
+]
+
+
+@pytest.mark.parametrize(("path", "override", "kind"), UNSUPPORTED_PARALLELISM)
+def test_preset_rejects_parallelism_its_arch_cannot_run(
+    path: Path, override: str, kind: str
+) -> None:
+    """Given the override a user would add, each MoT, MoMa and cross-attention preset fails
+    validation with its arch's reason, not later at model build or in the first forward."""
+    config = load_config(str(path), cli_args=[override])
+    match = rf"vlm.arch='{_arch(path)}' does not support {kind} parallelism"
+    with pytest.raises(ValueError, match=match):
+        config.validate(world_size=2)
+
+
+def test_cross_attention_moe_preset_keeps_expert_parallelism() -> None:
+    """The guards name arches, so the cross-attention MoE preset still validates with EP."""
+    config = load_config(str(CONFIG_DIR / "vlm_debug_moe.toml"), cli_args=["--distributed.ep=2"])
+    config.validate(world_size=2)
+
+
 def _load_entry_point() -> Any:
     spec = importlib.util.spec_from_file_location("_vlm_example_train", EXAMPLE_ROOT / "train.py")
     assert spec is not None and spec.loader is not None
