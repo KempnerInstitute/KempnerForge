@@ -202,8 +202,8 @@ class TrainingSession:
 # ---------------------------------------------------------------------------
 
 
-def clip_grads(model: torch.nn.Module, max_norm: float) -> float:
-    grad_norm = clip_grad_norm_(model, max_norm)
+def clip_grads(model: torch.nn.Module, max_norm: float, pp_group: Any = None) -> float:
+    grad_norm = clip_grad_norm_(model, max_norm, pp_group=pp_group)
     return grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
 
 
@@ -279,12 +279,12 @@ def pipeline_step(session: TrainingSession, step: int) -> StepResult:
     else:
         avg_loss = 0.0
 
-    grad_norm_val = clip_grads(model, tc.grad_clip_norm)
+    group = pp_group(session.runtime)
+    grad_norm_val = clip_grads(model, tc.grad_clip_norm, group)
 
-    # Broadcast loss and grad_norm from last PP stage to all PP stages
-    loss_tensor = torch.tensor([avg_loss, grad_norm_val], device=device)
-    dist.broadcast(loss_tensor, group_src=pipeline.size - 1, group=pp_group(session.runtime))
-    return StepResult(loss=loss_tensor[0].item(), grad_norm=loss_tensor[1].item())
+    loss_tensor = torch.tensor([avg_loss], device=device)
+    dist.broadcast(loss_tensor, group_src=pipeline.size - 1, group=group)
+    return StepResult(loss=loss_tensor.item(), grad_norm=grad_norm_val)
 
 
 def vlm_step(session: TrainingSession, step: int) -> StepResult:
@@ -660,7 +660,8 @@ def run_training_loop(
 
             # Checkpoint
             ckpt_extra = checkpoint_extra(config, step, phases)
-            if config.checkpoint.should_save(step):
+            saved_this_step = config.checkpoint.should_save(step)
+            if saved_this_step:
                 ckpt_mgr.save(
                     step=step,
                     tokens_seen=tokens_seen,
@@ -672,14 +673,23 @@ def run_training_loop(
 
             # Graceful shutdown
             if session.shutdown_handler.should_shutdown():
-                logger.warning(f"Shutdown requested at step {step} — saving emergency checkpoint")
-                ckpt_mgr.save(
-                    step=step,
-                    tokens_seen=tokens_seen,
-                    scheduler=scheduler,
-                    dataloader=data.dataloader,
-                    extra=ckpt_extra,
-                )
+                if saved_this_step:
+                    logger.warning(
+                        f"Shutdown requested at step {step}; "
+                        "its scheduled checkpoint is the emergency checkpoint"
+                    )
+                    ckpt_mgr.wait()
+                else:
+                    logger.warning(
+                        f"Shutdown requested at step {step} — saving emergency checkpoint"
+                    )
+                    ckpt_mgr.save(
+                        step=step,
+                        tokens_seen=tokens_seen,
+                        scheduler=scheduler,
+                        dataloader=data.dataloader,
+                        extra=ckpt_extra,
+                    )
                 session.shutdown_handler.finish()
                 break
 

@@ -127,6 +127,16 @@ class SigmoidTopKRouter(nn.Module):
         self.z_loss = torch.tensor(0.0)
         self.expert_counts: torch.Tensor = torch.zeros(num_experts)
 
+    def reset_parameters(self) -> None:
+        """Restore this router's construction-time state.
+
+        ``to_empty()`` on a meta build leaves both holding whatever the
+        allocator returns, and ``init_weights`` covers neither: ``expert_bias``
+        is one-dimensional and ``expert_ema`` is a buffer.
+        """
+        nn.init.zeros_(self.expert_bias)
+        self.expert_ema.fill_(1.0 / self.num_experts)  # type: ignore[reportCallIssue]
+
     def set_step(self, step: int, max_steps: int) -> None:
         """Set current training step for adaptive bias scheduling."""
         self._step = step

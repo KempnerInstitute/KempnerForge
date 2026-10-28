@@ -103,11 +103,15 @@ based on [`_is_muon_eligible`](https://github.com/KempnerInstitute/KempnerForge/
   highly-rectangular matrices (embeddings, output heads — where
   `X @ X^T` would be `vocab_size × vocab_size`).
 
-The builder logs the two counts:
+The builder logs the two counts. For `7b_16gpu_muon.toml`:
 
 ```
-Muon: 6,390,525,952 params (NS-orthogonalized), 525,336,576 params (AdamW fallback)
+Muon: 6,979,321,856 params (NS-orthogonalized), 1,050,939,392 params (AdamW fallback)
 ```
+
+Nearly all of the AdamW share is the embedding and the output head,
+128256 × 4096 each: the head is untied by default (`tie_embeddings = false`)
+and just as rectangular, so both fall back.
 
 **LR coupling.** Muon's scheduler sees only the Muon param groups.
 Before every Muon `step()`, the internal AdamW LR is rescaled by

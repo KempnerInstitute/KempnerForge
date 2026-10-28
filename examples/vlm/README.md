@@ -13,6 +13,7 @@ examples/vlm/
 ├── README.md
 ├── train.py              # training entry point
 ├── eval.py               # evaluation CLI: constructs the adapter, runs simple_evaluate
+├── eval_publish.py       # publishes the scores to the checkpoint's MLflow run
 ├── lmms_adapter.py       # KempnerForgeVLM: lmms-eval chat model over a DCP checkpoint
 ├── configs/              # TOML presets (below)
 ├── scripts/              # run-only utilities
@@ -23,12 +24,14 @@ examples/vlm/
         ├── conftest.py   # path bootstrap + tiny VLM fixtures
         ├── integration/  # real-lmms-eval tests (skip when it is absent)
         │   ├── test_vlm_eval.py            # DCP-roundtrip generate_until (image + video)
-        │   └── test_lmms_eval_contract.py  # pins the real API the unit fake imitates
+        │   └── test_lmms_eval_contract.py  # pins the real API the unit fake imitates + the results shape
         └── unit/
             ├── __init__.py               # load-bearing package marker (see its docstring)
             ├── conftest.py               # injects the hermetic fake lmms_eval
             ├── _fake_lmms_eval.py
+            ├── _fake_mlflow.py           # strict fakes of mlflow and pandas
             ├── test_adapter.py           # CPU unit tests for the adapter (fake lmms_eval)
+            ├── test_eval_publish.py      # MLflow publishing of the scores (fake mlflow, pandas)
             └── test_import_isolation.py  # `import kempnerforge` must not need lmms-eval
 ```
 
@@ -53,6 +56,7 @@ starting points.
 | `vlm_7b_siglip2.toml` | joint_decoder | siglip2 | real-run starting point |
 | `vlm_7b_siglip2_cross_attn.toml` | cross_attention | siglip2 | real-run starting point |
 | `vlm_video_webvid.toml` | joint_decoder | siglip2 | video (WebVid-10M) |
+| `vlm_qwen3_0.6b_joint_decoder_webvid.toml` | joint_decoder | siglip2 | video, from a pretrained backbone |
 
 Paths in these configs are placeholders (`data_root = "path-to-webvid-10m"`) —
 point them at your own data and output directories, or override on the CLI.
@@ -93,6 +97,49 @@ uv run torchrun --nproc_per_node=2 examples/vlm/train.py \
     examples/vlm/configs/vlm_video_webvid.toml \
     --vision_encoder.type=random --vision_encoder.num_tokens=196 \
     --vision_encoder.feature_dim=768 --video.max_samples=256 --train.max_steps=20
+```
+
+## Video from a pretrained backbone
+
+`vlm_qwen3_0.6b_joint_decoder_webvid.toml` trains video captioning on a frozen
+pretrained 0.6B backbone, with a pretrained vision encoder and a fresh `avgpool`
+adapter that both train. The backbone's attention is wider than its model dim
+(`head_dim_override = 128`).
+
+Build its starting checkpoint once, with the converter described under
+*Start from a pretrained backbone*:
+
+```bash
+uv run python examples/vlm/scripts/convert_hf_backbone.py \
+    --hf-dir Qwen/Qwen3-0.6B \
+    --config examples/vlm/configs/vlm_qwen3_0.6b_joint_decoder_webvid.toml \
+    --out path-to-init-checkpoint
+```
+
+Then set `[video].data_root`, `[checkpoint].load_path`, `[checkpoint].dir` and
+`[metrics].tensorboard_dir`, and train:
+
+```bash
+uv run torchrun --nproc_per_node=4 examples/vlm/train.py \
+    examples/vlm/configs/vlm_qwen3_0.6b_joint_decoder_webvid.toml
+```
+
+The config targets 16 GPUs at a global batch of 256, and `batch_size = 16`
+takes about 100 GB per GPU; on 4 GPUs, add `--train.grad_accum_steps=4` to keep
+the global batch.
+
+The first run loads the converted weights only (`exclude_from_loading =
+["optimizer"]`); a resume from `[checkpoint].dir` restores the full training
+state. A finished run also saves its last step to `[checkpoint].dir`, so give a
+shakedown its own checkpoint and metrics directories, and a short warmup so the
+loss moves within its 20 steps:
+
+```bash
+uv run torchrun --nproc_per_node=4 examples/vlm/train.py \
+    examples/vlm/configs/vlm_qwen3_0.6b_joint_decoder_webvid.toml \
+    --train.max_steps=20 --video.max_samples=512 --scheduler.warmup_steps=5 \
+    --checkpoint.dir=path-to-shakedown-dir \
+    --metrics.tensorboard_dir=path-to-shakedown-dir/tb
 ```
 
 ## Data prep
@@ -212,6 +259,41 @@ default benchmark set is still being decided.
 | `--dtype` | `None`(maps to model config setting) | model dtype |
 | `--batch-size` | `1` | requests decoded together (grouped by `gen_kwargs`) |
 | `--max-new-tokens` | `128` | fallback only; task `gen_kwargs` override it |
+| `--no-publish` | off | do not publish the scores to the MLflow run recorded in the checkpoint |
+
+### Publishing scores to MLflow
+
+When the checkpoint's `metadata.json` records an MLflow run (its `tracking` block),
+`eval.py` appends the scores to that run after scoring, next to the training curves.
+Each score becomes the metric `eval/<task>_<metric>` at the checkpoint's step
+(`_<filter>` follows when lmms-eval reports a filter other than `none`), through
+`kempnerforge.metrics.publish`. A summary table (one row per task and metric, with the
+standard error and sample count) and `scores.json` are uploaded to the same run under
+`eval/step_<N>/<UTC timestamp>/`, one directory per evaluation, so repeated or concurrent
+evaluations never overwrite each other. No run is started, ended or edited.
+
+Publishing is on by default and `--no-publish` turns it off. It needs the `mlflow` and
+`eval` dependency groups (`uv sync --group mlflow --group eval`, plus `video` for video
+tasks) and credentials for the run's tracking server, by any of the routes in
+[MLflow backend § Authentication](../../docs/metrics-and-profiling/mlflow.md#authentication).
+Publishing authenticates the way training does, so a route that trains also publishes, except
+`user:token@` credentials in the tracking URI, which checkpoints never record.
+Sync before `uv pip install lmms-eval`, since `uv sync` removes packages the lock does not
+list.
+
+A publishing problem never fails an evaluation. The scores are written first to a local
+file named for the evaluation: `--output` with its suffix replaced by
+`.<UTC timestamp>.scores.json` (`results/run.json` gives
+`results/run.<timestamp>.scores.json`), or, without `--output`,
+`<run>_<step>.<timestamp>.scores.json` in the working directory. It carries the timestamp
+of the uploaded directory, and no later evaluation replaces it. If that location is not
+writable the file goes to the system temporary directory, and if no file can be written
+nothing is published and the scores are printed in the log. A refusal (a checkpoint
+without a `tracking` block, say), a broken or missing dependency, or a server failure is
+logged as a warning together with the `python -m kempnerforge.metrics.publish` command that
+publishes the metrics later; that command sends the metrics only, not the table or
+`scores.json`. A `--limit` run publishes like any other, so pass `--no-publish` for smoke
+tests.
 
 ### Video evaluation
 

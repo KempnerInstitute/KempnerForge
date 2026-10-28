@@ -77,7 +77,7 @@ html_title = "KempnerForge"
 html_static_path = ["_static"]
 html_css_files = ["custom.css"]
 html_logo = "assets/logo.png"
-html_favicon = None
+html_favicon = "assets/favicon.png"
 html_theme_options = {
     "sidebar_hide_name": True,
     "source_repository": "https://github.com/KempnerInstitute/KempnerForge",

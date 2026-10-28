@@ -141,7 +141,7 @@ One kernel launch per expert (or more, per matmul). Fine for
 **Rule of thumb**: if you're in fp32, you're not doing real MoE
 training. The fallback exists for unit-testing and debugging the
 grouped path without a CUDA device. Production runs use bf16
-(default) or fp16, both of which hit the grouped path.
+(the default), which hits the grouped path.
 
 ## Packed experts
 

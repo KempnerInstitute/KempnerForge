@@ -169,17 +169,26 @@ def _check_generative(vlm_config: VLMConfig) -> None:
         )
 
 
+def resolve_checkpoint(checkpoint: str) -> Path:
+    """The concrete checkpoint directory ``checkpoint`` names.
+
+    A run directory resolves to its ``latest``/highest ``step_N`` via
+    ``resolve_resume_path``; a specific checkpoint directory is used as-is. Symlinks are
+    followed, so a ``latest`` link that moves later cannot change the directory.
+    """
+    return (resolve_resume_path(checkpoint) or Path(checkpoint)).resolve()
+
+
 def _load_weights(
     config: JobConfig, checkpoint: str, device: torch.device, dtype: torch.dtype
 ) -> VLMWrapper:
     """Build a ``VLMWrapper`` and load DCP weights for single-process eval.
 
-    Accepts either a run directory (resolved to its ``latest``/highest
-    ``step_N`` via ``resolve_resume_path``) or a specific checkpoint directory
-    (used as-is when ``resolve_resume_path`` finds nothing). DCP reshards on
-    load, so checkpoints saved under FSDP/PP load into the full model.
+    Accepts either a run directory or a specific checkpoint directory (see
+    ``resolve_checkpoint``). DCP reshards on load, so checkpoints saved under
+    FSDP/PP load into the full model.
     """
-    ckpt_path = resolve_resume_path(checkpoint) or Path(checkpoint)
+    ckpt_path = resolve_checkpoint(checkpoint)
     if not ckpt_path.exists():
         raise FileNotFoundError(f"Checkpoint path does not exist: {ckpt_path}")
     if not ckpt_path.is_dir():

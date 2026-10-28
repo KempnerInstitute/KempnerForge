@@ -21,12 +21,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 try:
     import tomllib
@@ -335,29 +337,66 @@ def check_wandb(check_credentials: bool = False) -> CheckResult:
     return CheckResult("wandb", OK, "WANDB_API_KEY set (not validated)")
 
 
+_MLFLOW_AUTH_ROUTES = (
+    "routes: (1) env DATABRICKS_HOST + DATABRICKS_TOKEN; (2) a ~/.databrickscfg profile, picked "
+    "by a databricks://<profile> $MLFLOW_TRACKING_URI or $DATABRICKS_CONFIG_PROFILE, else "
+    "DEFAULT; (3) SDK OAuth, which a preflight cannot verify offline"
+)
+_PROFILE_HEADER = re.compile(r"\s*\[(?P<name>.+)\]")
+
+
+def _databricks_profile() -> str:
+    """The ~/.databrickscfg profile MLflow reads, in priority order.
+
+    A databricks://<profile> $MLFLOW_TRACKING_URI, then $DATABRICKS_CONFIG_PROFILE, then DEFAULT.
+    """
+    try:
+        uri = urlparse(os.environ.get("MLFLOW_TRACKING_URI", ""))
+    except ValueError:
+        uri = urlparse("")
+    if uri.scheme == "databricks" and uri.netloc and not {":", "@"} & set(uri.netloc):
+        return uri.netloc
+    return os.environ.get("DATABRICKS_CONFIG_PROFILE") or "DEFAULT"
+
+
+def _profile_problem(profile: str) -> str | None:
+    """Why ~/.databrickscfg has no ``[profile]`` section, or None when it has one.
+
+    Only section headers are matched; keys and values (the tokens) are never parsed or kept.
+    """
+    try:
+        with (Path.home() / ".databrickscfg").open(encoding="utf-8", errors="replace") as f:
+            for line in f:
+                header = _PROFILE_HEADER.match(line)
+                if header and header["name"] == profile:
+                    return None
+    except FileNotFoundError:
+        return "~/.databrickscfg not found"
+    except OSError as e:
+        return f"~/.databrickscfg unreadable: {e.strerror or type(e).__name__}"
+    return f"~/.databrickscfg has no [{profile}] section"
+
+
 def check_mlflow(check_credentials: bool = False) -> CheckResult:
-    """Check Databricks credentials for MLflow; optionally validate via the SDK."""
+    """Check Databricks credentials for MLflow: the env pair, else a ~/.databrickscfg profile.
+
+    SDK OAuth cannot be verified offline, so with neither found the result is a WARN naming all
+    three routes. ``check_credentials`` validates the route found through the SDK.
+    """
     host = os.environ.get("DATABRICKS_HOST")
     token = os.environ.get("DATABRICKS_TOKEN") or os.environ.get("DATABRICKS_API_TOKEN")
-    if not host and not token:
-        return CheckResult(
-            "mlflow",
-            MISS,
-            "DATABRICKS_HOST and token not set",
-            "export DATABRICKS_HOST=... and DATABRICKS_API_TOKEN=... "
-            "(needed for metrics.enable_mlflow with tracking_uri=databricks)",
-        )
-    if not host:
-        return CheckResult(
-            "mlflow", MISS, "token set but DATABRICKS_HOST missing", "export DATABRICKS_HOST=..."
-        )
-    if not token:
-        return CheckResult(
-            "mlflow",
-            MISS,
-            "DATABRICKS_HOST set but token missing",
-            "export DATABRICKS_API_TOKEN=... (or DATABRICKS_TOKEN)",
-        )
+    profile = None
+    if host and token:
+        found = "DATABRICKS_HOST + token set"
+    else:
+        profile = _databricks_profile()
+        if problem := _profile_problem(profile):
+            return CheckResult(
+                "mlflow",
+                WARN,
+                f"no Databricks credentials found ({problem}); {_MLFLOW_AUTH_ROUTES}",
+            )
+        found = f"profile {profile} found in ~/.databrickscfg"
     if check_credentials:
         # The SDK authenticates from DATABRICKS_TOKEN; mirror the DATABRICKS_API_TOKEN
         # alias the MLflow backend applies so the probe matches runtime behavior.
@@ -366,11 +405,12 @@ def check_mlflow(check_credentials: bool = False) -> CheckResult:
         try:
             from databricks.sdk import WorkspaceClient  # type: ignore
 
-            user = WorkspaceClient().current_user.me().user_name
+            client = WorkspaceClient(profile=profile) if profile else WorkspaceClient()
+            user = client.current_user.me().user_name
         except Exception as e:
-            return CheckResult("mlflow", WARN, f"credentials set but SDK probe failed: {e}")
+            return CheckResult("mlflow", WARN, f"{found} but SDK probe failed ({type(e).__name__})")
         return CheckResult("mlflow", OK, f"Databricks reachable, user={user}")
-    return CheckResult("mlflow", OK, "DATABRICKS_HOST + token set (not validated)")
+    return CheckResult("mlflow", OK, f"{found} (not validated)")
 
 
 def check_hf(check_credentials: bool = False) -> CheckResult:

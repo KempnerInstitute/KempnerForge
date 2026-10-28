@@ -71,9 +71,17 @@ class FakeCheckpointManager:
         self.saves: list[tuple[int, int, dict]] = []
         self.waits = 0
         self.flushes = 0
+        self.tracking_source = None
+        self.checkpoint_registrar = None
 
     def save(self, step, tokens_seen=0, scheduler=None, dataloader=None, extra=None) -> None:
         self.saves.append((step, tokens_seen, dict(extra or {})))
+
+    def set_tracking_source(self, source) -> None:
+        self.tracking_source = source
+
+    def set_checkpoint_registrar(self, registrar) -> None:
+        self.checkpoint_registrar = registrar
 
     def wait(self) -> None:
         self.waits += 1
@@ -651,6 +659,98 @@ class TestRunTrainingLoop:
         assert handler.finished is True
         assert ckpt.waits == 1
 
+    def test_shutdown_on_a_scheduled_step_saves_it_once(self):
+        """The scheduled save at step 2, with its save hook, is the emergency checkpoint."""
+        config = make_config(max_steps=10)
+        config.checkpoint.interval = 2
+        ckpt = FakeCheckpointManager()
+        handler = FakeShutdownHandler(after_steps=2)
+        hook = RecordingHook()
+        session = make_session(
+            config, checkpointer=ckpt, shutdown_handler=handler, hooks=HookRunner([hook])
+        )
+        step, _ = run_training_loop(session)
+        assert step == 2
+        assert ckpt.saved_steps == [2]
+        assert hook.saves == [2]
+        assert handler.finished is True
+        assert ckpt.waits == 2
+
+    def test_shutdown_on_a_scheduled_step_waits_for_it_before_finishing(self, monkeypatch):
+        """The scheduled save is flushed while the shutdown watchdog is still armed."""
+        config = make_config(max_steps=10)
+        config.checkpoint.interval = 2
+        ckpt = FakeCheckpointManager()
+        handler = FakeShutdownHandler(after_steps=2)
+        finished_at_wait: list[bool] = []
+        real_wait = ckpt.wait
+
+        def wait() -> None:
+            finished_at_wait.append(handler.finished)
+            real_wait()
+
+        monkeypatch.setattr(ckpt, "wait", wait)
+        session = make_session(config, checkpointer=ckpt, shutdown_handler=handler)
+        run_training_loop(session)
+        assert finished_at_wait == [False, True]
+
+    def test_shutdown_after_a_scheduled_save_still_saves_its_own_step(self):
+        """Step 2 is saved on the schedule; a shutdown at step 3 must still save step 3."""
+        config = make_config(max_steps=10)
+        config.checkpoint.interval = 2
+        ckpt = FakeCheckpointManager()
+        handler = FakeShutdownHandler(after_steps=3)
+        session = make_session(config, checkpointer=ckpt, shutdown_handler=handler)
+        step, _ = run_training_loop(session)
+        assert step == 3
+        assert ckpt.saved_steps == [2, 3]
+        assert handler.finished is True
+
+    @pytest.mark.parametrize(
+        "after_steps,expected",
+        [(6, [0, 1, 2, 4, 6]), (1, [0, 1])],
+        ids=["at-step-6", "at-step-1"],
+    )
+    def test_shutdown_inside_a_dynamic_window_saves_each_step_once(self, after_steps, expected):
+        """Inside the window milestones decide: step 1 is saved once and step 6 is still saved."""
+        config = make_config(max_steps=10)
+        config.checkpoint.interval = 2
+        config.checkpoint.dyn_ckpt_window = DynamicCheckpointWindow(start=0, stop=8)
+        ckpt = FakeCheckpointManager()
+        handler = FakeShutdownHandler(after_steps=after_steps)
+        session = make_session(config, checkpointer=ckpt, shutdown_handler=handler)
+        step, _ = run_training_loop(session)
+        assert step == after_steps
+        assert ckpt.saved_steps == expected
+        assert handler.finished is True
+
+    @pytest.mark.parametrize("mode", ["disabled", "async", "async_with_pinned_mem"])
+    def test_shutdown_on_a_scheduled_step_commits_that_one_save(self, monkeypatch, tmp_path, mode):
+        """The real manager saves the step once and has committed it when the loop returns."""
+        from kempnerforge.checkpoint.manager import CheckpointManager
+        from kempnerforge.config.checkpoint import AsyncCheckpointMode
+
+        config = make_config(max_steps=10)
+        config.checkpoint.dir = str(tmp_path)
+        config.checkpoint.interval = 2
+        config.checkpoint.async_mode = AsyncCheckpointMode(mode)
+        session = make_session(config, shutdown_handler=FakeShutdownHandler(after_steps=2))
+        mgr = CheckpointManager(config.checkpoint, session.model, session.optimizer)
+        saved: list[int] = []
+        real_save = mgr.save
+
+        def counting_save(step: int, **kwargs: Any) -> None:
+            saved.append(step)
+            real_save(step, **kwargs)
+
+        monkeypatch.setattr(mgr, "save", counting_save)
+        session.checkpointer = mgr
+        step, _ = run_training_loop(session)
+        assert step == 2
+        assert saved == [2]
+        assert (tmp_path / "latest").resolve() == (tmp_path / "step_2").resolve()
+        assert (tmp_path / "step_2" / ".metadata").is_file()
+
     def test_hooks_fire_for_every_step_and_save(self):
         config = make_config(max_steps=4)
         config.checkpoint.interval = 2
@@ -798,6 +898,15 @@ class TestRunTraining:
             def log_eval(self, *_a) -> None:
                 pass
 
+            def tracking_entries(self) -> list:
+                return []
+
+            def checkpoint_fields(self, _step) -> dict:
+                return {}
+
+            def register_checkpoint(self, _step, _directory, _record) -> None:
+                pass
+
             def close(self) -> None:
                 closes.append(1)
 
@@ -819,6 +928,87 @@ class TestRunTraining:
         )
         assert destroys == [1]
         assert closes == [1, 1]
+
+    def test_checkpoint_manager_reads_the_trackers_live_runs(self, monkeypatch):
+        import kempnerforge.training.entry as entry
+        from kempnerforge.training.entry import run_training
+        from kempnerforge.training.loop import StepResult
+
+        live = [{"backend": "tensorboard", "log_dir": "logs"}]
+
+        class LiveTracker:
+            def __init__(self, *_a, **_k) -> None:
+                pass
+
+            def init_backends(self, _config) -> None:
+                pass
+
+            def start_step(self) -> None:
+                pass
+
+            def end_step(self, **_kw):
+                return None
+
+            def tracking_entries(self) -> list:
+                return live
+
+            def checkpoint_fields(self, _step) -> dict:
+                return {}
+
+            def register_checkpoint(self, _step, _directory, _record) -> None:
+                pass
+
+            def close(self) -> None:
+                pass
+
+        ckpt = _stub_entry(monkeypatch, TinyTextModel())
+        monkeypatch.setattr(entry, "MetricsTracker", LiveTracker)
+        assert ckpt.tracking_source is None
+        run_training(
+            make_config(max_steps=1), step_fn=lambda _s, _i: StepResult(loss=1.0, grad_norm=0.5)
+        )
+        assert ckpt.tracking_source is not None
+        assert ckpt.tracking_source() == live
+
+    def test_checkpoint_manager_registers_checkpoints_through_the_tracker(self, monkeypatch):
+        import kempnerforge.training.entry as entry
+        from kempnerforge.training.entry import run_training
+        from kempnerforge.training.loop import StepResult
+
+        built: list = []
+
+        class RegisteringTracker:
+            def __init__(self, *_a, **_k) -> None:
+                built.append(self)
+
+            def init_backends(self, _config) -> None:
+                pass
+
+            def start_step(self) -> None:
+                pass
+
+            def end_step(self, **_kw):
+                return None
+
+            def tracking_entries(self) -> list:
+                return []
+
+            def checkpoint_fields(self, _step) -> dict:
+                return {}
+
+            def register_checkpoint(self, _step, _directory, _record) -> None:
+                pass
+
+            def close(self) -> None:
+                pass
+
+        ckpt = _stub_entry(monkeypatch, TinyTextModel())
+        monkeypatch.setattr(entry, "MetricsTracker", RegisteringTracker)
+        assert ckpt.checkpoint_registrar is None
+        run_training(
+            make_config(max_steps=1), step_fn=lambda _s, _i: StepResult(loss=1.0, grad_norm=0.5)
+        )
+        assert len(built) == 1 and ckpt.checkpoint_registrar is built[0]
 
     def test_injected_hooks_get_the_whole_lifecycle(self, monkeypatch):
         from kempnerforge.training.entry import run_training
@@ -1680,8 +1870,13 @@ class TestPipelineStep:
         def fake_broadcast(tensor, group_src=None, group=None):
             recorded["group_src"] = group_src
             recorded["group"] = group
+            recorded["broadcast_numel"] = tensor.numel()
+
+        def fake_all_reduce(tensor, op=None, group=None):
+            recorded["all_reduce_group"] = group
 
         monkeypatch.setattr(loop.dist, "broadcast", fake_broadcast)
+        monkeypatch.setattr(loop.dist, "all_reduce", fake_all_reduce)
         config = make_config()
         config.distributed.pp = size
         session = make_session(
@@ -1699,6 +1894,14 @@ class TestPipelineStep:
         assert isinstance(result.loss, float)
         assert rec["group"] == "PPGROUP"
         assert rec["group_src"] == 1  # last stage is the source
+
+    def test_every_stage_sums_the_grad_norm_and_only_the_loss_is_broadcast(self, monkeypatch):
+        """Each stage clips with the whole model's norm, so the broadcast carries the loss alone."""
+        sched = FakeSchedule()
+        session, rec = self._session(monkeypatch, rank=0, size=2, sched=sched)
+        session.step_fn(session, 0)
+        assert rec["all_reduce_group"] == "PPGROUP"
+        assert rec["broadcast_numel"] == 1
 
     def test_last_stage_passes_target_only(self, monkeypatch):
         sched = FakeSchedule()
@@ -1739,6 +1942,7 @@ class TestPipelineStepPacked:
 
         monkeypatch.setattr(loop, "pp_group", lambda _r: "PPGROUP")
         monkeypatch.setattr(loop.dist, "broadcast", lambda *a, **k: None)
+        monkeypatch.setattr(loop.dist, "all_reduce", lambda *a, **k: None)
 
         batch = {
             "input_ids": torch.zeros(2, 8, dtype=torch.long),
@@ -2172,6 +2376,7 @@ class TestPipelineSyntheticBatches:
 
         monkeypatch.setattr(loop, "pp_group", lambda _r: "G")
         monkeypatch.setattr(loop.dist, "broadcast", lambda *a, **k: None)
+        monkeypatch.setattr(loop.dist, "all_reduce", lambda *a, **k: None)
         sched = FakeSchedule()
         config = make_config()
         config.distributed.pp = 2
