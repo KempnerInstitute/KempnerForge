@@ -88,13 +88,20 @@ class TestShutdownHandler:
         assert handler._timer.daemon
         handler.finish()
 
-    def test_multiple_signals_idempotent(self):
-        handler = ShutdownHandler(timeout_sec=0)
+    def test_multiple_signals_idempotent(self, monkeypatch):
+        """A second signal neither clears the request nor starts a second forced-exit timer."""
+        handler = ShutdownHandler(timeout_sec=60)
+        monkeypatch.setattr(handler, "_force_exit", lambda: None)
         handler.register()
-        os.kill(os.getpid(), signal.SIGTERM)
-        os.kill(os.getpid(), signal.SIGTERM)
-        assert handler.should_shutdown()
-        handler.unregister()
+        try:
+            os.kill(os.getpid(), signal.SIGTERM)
+            first_timer = handler._timer
+            os.kill(os.getpid(), signal.SIGTERM)
+            assert handler.should_shutdown()
+            assert first_timer is not None
+            assert handler._timer is first_timer
+        finally:
+            handler.finish()
 
 
 # ---------------------------------------------------------------------------
