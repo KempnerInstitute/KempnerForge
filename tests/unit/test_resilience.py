@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import signal
+import threading
 
 import torch
 
@@ -90,6 +91,14 @@ class TestShutdownHandler:
 
     def test_multiple_signals_idempotent(self, monkeypatch):
         """A second signal neither clears the request nor starts a second forced-exit timer."""
+        started = []
+
+        class RecordingTimer(threading.Timer):
+            def start(self):
+                started.append(self)
+                super().start()
+
+        monkeypatch.setattr(threading, "Timer", RecordingTimer)
         handler = ShutdownHandler(timeout_sec=60)
         monkeypatch.setattr(handler, "_force_exit", lambda: None)
         handler.register()
@@ -101,6 +110,8 @@ class TestShutdownHandler:
             assert first_timer is not None
             assert handler._timer is first_timer
         finally:
+            for timer in started:
+                timer.cancel()
             handler.finish()
 
 
