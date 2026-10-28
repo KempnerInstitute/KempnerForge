@@ -130,12 +130,12 @@ See
 
 The plan is written for `TransformerBlock`, and `apply_tensor_parallel`
 walks `model.layers` only. `JobConfig.validate` therefore rejects `tp > 1`
-for the VLM arches it cannot run, ahead of the head-divisibility check:
+for these three VLM arches, ahead of the head-divisibility check:
 
 | `vlm.arch` | What the plan misses |
 |------------|----------------------|
 | `mot` | Every module: `MoTBlock` keeps its norms, attention and FFNs per modality under other names, so the build fails or nothing is sharded |
-| `moma` | `MoMaFFN`'s per-modality expert groups, which are never sharded and, with SequenceParallel on, fail on the sequence-sharded activations |
+| `moma` | `MoMaFFN`'s per-modality expert groups, which are never sharded; with SequenceParallel on, the first forward fails |
 | `cross_attention` | The blocks in `cross_attention_layers`, which are never sharded and, with SequenceParallel on, fail on the sequence-sharded activations |
 
 With SequenceParallel off (MoE or tied embeddings) these runs would start,
