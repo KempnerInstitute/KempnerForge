@@ -157,6 +157,15 @@ class TestPartialBinShards:
                 str(tmp_path), seq_len=SEQ_LEN, file_pattern="*.bin", token_dtype="uint16"
             )
 
+    def test_a_truncated_shard_after_a_whole_one_is_rejected(self, tmp_path):
+        """Every shard is checked, not only the first in its directory."""
+        _write_bin(tmp_path / "tokens_000.bin", np.arange(64, dtype=np.uint32))
+        raw = np.arange(64, dtype=np.uint32).tobytes()[:-2]
+        (tmp_path / "tokens_001.bin").write_bytes(raw)
+        _write_metadata(tmp_path, "uint32")
+        with pytest.raises(ValueError, match=r"tokens_001\.bin is 254 bytes, which is not a whole"):
+            MemoryMappedDataset(str(tmp_path), seq_len=SEQ_LEN, file_pattern="*.bin")
+
     @pytest.mark.parametrize("missing_bytes", [1, 2, 3])
     def test_undeclared_shard_that_is_not_whole_uint32_is_rejected(self, tmp_path, missing_bytes):
         raw = np.arange(64, dtype=np.uint32).tobytes()[:-missing_bytes]
