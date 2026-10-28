@@ -90,8 +90,9 @@ class TestShutdownHandler:
         handler.finish()
 
     def test_multiple_signals_idempotent(self, monkeypatch):
-        """A second signal keeps the request and the first timer, and arms no other."""
+        """A second SIGTERM changes nothing: same request, same armed timer, no forced exit."""
         started = []
+        forced = []
 
         class RecordingTimer(threading.Timer):
             def start(self):
@@ -100,7 +101,7 @@ class TestShutdownHandler:
 
         monkeypatch.setattr(threading, "Timer", RecordingTimer)
         handler = ShutdownHandler(timeout_sec=60)
-        monkeypatch.setattr(handler, "_force_exit", lambda: None)
+        monkeypatch.setattr(handler, "_force_exit", lambda: forced.append(True))
         handler.register()
         try:
             os.kill(os.getpid(), signal.SIGTERM)
@@ -110,6 +111,7 @@ class TestShutdownHandler:
             assert len(started) == 1
             assert handler._timer is started[0]
             assert not started[0].finished.is_set()
+            assert not forced
         finally:
             for timer in started:
                 timer.cancel()
