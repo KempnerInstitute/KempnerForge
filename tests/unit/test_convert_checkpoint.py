@@ -449,3 +449,7 @@ class TestExportDtypePrecedence:
         """Even a flag that names the default wins over the TOML."""
         written = _run_dcp_to_hf(tmp_path, monkeypatch, "float32", flag)
         assert written == ({dtype}, flag)
+
+    def test_bfloat16_without_flag_or_config(self, tmp_path, monkeypatch):
+        written = _run_dcp_to_hf(tmp_path, monkeypatch, None, None)
+        assert written == ({torch.bfloat16}, "bfloat16")
