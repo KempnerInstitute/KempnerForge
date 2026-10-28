@@ -17,7 +17,7 @@ from kempnerforge.config.scheduler import SchedulerConfig
 from kempnerforge.config.training import TrainConfig
 from kempnerforge.config.video import VideoConfig
 from kempnerforge.config.vision import VisionEncoderConfig
-from kempnerforge.config.vlm import MoMaConfig, VLMConfig
+from kempnerforge.config.vlm import MoMaConfig, MoTConfig, VLMConfig
 
 # Vision-encoder types whose builders load a HuggingFace model and probe
 # feature_dim / num_tokens from the model's config. Setting these knobs
@@ -180,6 +180,14 @@ class JobConfig:
             )
 
         if self.distributed.tp > 1:
+            if isinstance(self.vlm, MoTConfig):
+                raise ValueError(
+                    f"vlm.arch={self.vlm.arch!r} does not support tensor parallelism "
+                    f"(distributed.tp={self.distributed.tp}): the tensor-parallel plan is keyed "
+                    "on TransformerBlock's module names, and MoTBlock keeps its norms, attention "
+                    "and FFNs per modality under other names, so the build fails or no parameter "
+                    "is sharded. Set distributed.tp = 1."
+                )
             if self.model.n_heads % self.distributed.tp != 0:
                 raise ValueError(
                     f"n_heads ({self.model.n_heads}) must be divisible by "
