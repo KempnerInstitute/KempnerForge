@@ -841,6 +841,23 @@ class TestVLMParallelismSupport:
         with pytest.raises(ValueError, match=match):
             _vlm_job(arch, ep=2, num_experts=num_experts).validate(world_size=2)
 
+    @pytest.mark.parametrize(
+        ("arch", "tp", "ep", "num_experts"),
+        [
+            pytest.param(None, 2, 1, 0, id="text-tp"),
+            pytest.param("joint_decoder", 2, 1, 0, id="joint_decoder-tp"),
+            pytest.param("joint_decoder", 1, 2, 2, id="joint_decoder-moe-ep"),
+            pytest.param("cross_attention", 1, 2, 2, id="cross_attention-moe-ep"),
+            pytest.param("mot", 1, 1, 2, id="mot-moe"),
+            pytest.param("moma", 1, 1, 0, id="moma"),
+        ],
+    )
+    def test_supported_combinations_still_validate(self, arch, tp, ep, num_experts):
+        """The guards name arches, not VLMs in general: text and joint_decoder still pass
+        under tensor parallelism, joint_decoder and cross-attention MoE under expert
+        parallelism, and MoT MoE and MoMa without either."""
+        _vlm_job(arch, tp=tp, ep=ep, num_experts=num_experts).validate(world_size=tp * ep)
+
 
 class TestFlexSdpaBackendWarning:
     """``sdpa_backend`` selects an SDPA kernel, which the flex path never uses,
