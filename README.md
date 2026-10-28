@@ -171,7 +171,7 @@ Configs set `[model.vlm]` with `arch`, the encoder registry key, the number of i
 3. If the arch needs new modules (e.g. `CrossAttentionBlock` for Cross-Attention), add them under `kempnerforge/model/` and wire them into `Transformer.__init__` behind an `isinstance(config.vlm, MyConfig)` guard so non-arch builds stay zero-cost.
 4. Drop the arch name from `_RESERVED_ARCHS` in `kempnerforge/config/vlm.py` if it was reserved.
 
-The TOML loader picks up the new arch automatically — `[model.vlm]` with `arch = "<arch_name>"` instantiates the right subclass. `VLMWrapper.forward` is unchanged.
+The TOML loader picks up the new arch automatically — `[model.vlm]` with `arch = "<arch_name>"` instantiates the right subclass. `VLMWrapper.forward` is unchanged. `JobConfig.validate` rejects tensor and expert parallelism only for the arches it names, so if a new arch cannot run either one, add its rejection there next to the MoT, MoMa and Cross-Attention ones.
 
 ## Agent-ready
 
