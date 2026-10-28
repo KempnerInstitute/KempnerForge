@@ -17,7 +17,7 @@ from kempnerforge.config.scheduler import SchedulerConfig
 from kempnerforge.config.training import TrainConfig
 from kempnerforge.config.video import VideoConfig
 from kempnerforge.config.vision import VisionEncoderConfig
-from kempnerforge.config.vlm import MoMaConfig, MoTConfig, VLMConfig
+from kempnerforge.config.vlm import CrossAttentionConfig, MoMaConfig, MoTConfig, VLMConfig
 
 # Vision-encoder types whose builders load a HuggingFace model and probe
 # feature_dim / num_tokens from the model's config. Setting these knobs
@@ -195,6 +195,15 @@ class JobConfig:
                     "entry for MoMaFFN's per-modality expert groups, so they are never sharded, "
                     "and with sequence parallelism on (untied embeddings) the forward fails on "
                     "the sequence-sharded activations. Set distributed.tp = 1."
+                )
+            if isinstance(self.vlm, CrossAttentionConfig):
+                raise ValueError(
+                    f"vlm.arch={self.vlm.arch!r} does not support tensor parallelism "
+                    f"(distributed.tp={self.distributed.tp}): apply_tensor_parallel shards "
+                    "model.layers only and never visits the cross-attention blocks, so they are "
+                    "never sharded, and with sequence parallelism on (no MoE, untied embeddings) "
+                    "the first one fails on the sequence-sharded activations. Set "
+                    "distributed.tp = 1."
                 )
             if self.model.n_heads % self.distributed.tp != 0:
                 raise ValueError(
