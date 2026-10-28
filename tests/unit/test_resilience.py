@@ -106,6 +106,7 @@ class TestShutdownHandler:
             os.kill(os.getpid(), signal.SIGTERM)
             os.kill(os.getpid(), signal.SIGTERM)
             assert handler.should_shutdown()
+            assert handler.signal_received == signal.SIGTERM
             assert len(started) == 1
             assert handler._timer is started[0]
             assert not started[0].finished.is_set()
