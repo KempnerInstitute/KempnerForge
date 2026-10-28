@@ -108,6 +108,7 @@ class TestShutdownHandler:
             assert handler.should_shutdown()
             assert len(started) == 1
             assert handler._timer is started[0]
+            assert not started[0].finished.is_set()
         finally:
             for timer in started:
                 timer.cancel()
