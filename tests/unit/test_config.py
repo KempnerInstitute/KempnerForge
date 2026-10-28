@@ -828,12 +828,15 @@ class TestVLMParallelismSupport:
 
     @pytest.mark.parametrize(
         ("arch", "reason"),
-        [pytest.param("mot", "expects layer.attention and layer.mlp", id="mot")],
+        [
+            pytest.param("mot", "expects layer.attention and layer.mlp", id="mot"),
+            pytest.param("moma", "partitions MoEMLP experts only", id="moma"),
+        ],
     )
     @pytest.mark.parametrize("num_experts", [0, 2, 3])
     def test_expert_parallel_rejected(self, arch, reason, num_experts):
-        """0 experts would fail the MoE check and 3 the divisibility check by ep = 2; the
-        arch's reason comes first either way."""
+        """0 experts would fail the MoE check, 3 the divisibility check by ep = 2, and any
+        count above 0 MoMa's own num_experts check; the arch's reason comes first."""
         match = rf"vlm.arch='{arch}' does not support expert parallelism .*{reason}.*ep = 1"
         with pytest.raises(ValueError, match=match):
             _vlm_job(arch, ep=2, num_experts=num_experts).validate(world_size=2)
