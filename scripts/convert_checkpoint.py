@@ -362,7 +362,11 @@ def main() -> None:
     }
 
     if args.command == "dcp-to-hf":
-        export_dtype = args.dtype if args.dtype is not None else config.checkpoint.export_dtype
+        if args.dtype is not None:
+            export_dtype, source = args.dtype, "--dtype"
+        else:
+            export_dtype, source = config.checkpoint.export_dtype, "checkpoint.export_dtype"
+        logger.info(f"Export dtype: {export_dtype} (from {source})")
         dcp_to_hf(
             dcp_dir=args.dcp_dir,
             hf_dir=args.hf_dir,
