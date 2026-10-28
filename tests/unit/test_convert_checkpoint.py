@@ -14,8 +14,9 @@ from safetensors.torch import load_file
 # Add scripts/ to path so we can import the conversion module
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 
-from convert_checkpoint import _build_hf_config, _hf_to_kf_key, _kf_to_hf_key, dcp_to_hf
+from convert_checkpoint import _build_hf_config, _hf_to_kf_key, _kf_to_hf_key, dcp_to_hf, main
 
+from kempnerforge.config.loader import load_config
 from kempnerforge.config.schema import ModelConfig
 from kempnerforge.model.transformer import Transformer
 
@@ -396,3 +397,47 @@ class TestExportDtypeMetadata:
         _tiny_dcp(tmp_path / "dcp", tiny_model_config)
         dcp_to_hf(str(tmp_path / "dcp"), str(tmp_path / "hf"), tiny_model_config, dtype=dtype)
         assert _written(tmp_path / "hf") == ({dtype}, name)
+
+
+_TINY_TOML = """\
+[model]
+dim = 64
+n_layers = 2
+n_heads = 2
+n_kv_heads = 2
+vocab_size = 256
+max_seq_len = 64
+"""
+
+
+def _run_dcp_to_hf(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, export_dtype: str | None, flag: str | None
+) -> tuple[set[torch.dtype], str]:
+    """Export a tiny checkpoint through the CLI and return what it wrote.
+
+    ``export_dtype`` goes in the TOML's ``[checkpoint]`` table and ``flag`` is
+    passed as ``--dtype``; ``None`` leaves either out.
+    """
+    toml = tmp_path / "job.toml"
+    table = "" if export_dtype is None else f'[checkpoint]\nexport_dtype = "{export_dtype}"\n'
+    toml.write_text(_TINY_TOML + table)
+    _tiny_dcp(tmp_path / "dcp", load_config(toml, cli_args=[]).model)
+    argv = ["convert_checkpoint.py", "dcp-to-hf", "--config", str(toml)]
+    argv += ["--dcp-dir", str(tmp_path / "dcp"), "--hf-dir", str(tmp_path / "hf")]
+    if flag is not None:
+        argv += ["--dtype", flag]
+    monkeypatch.setattr(sys, "argv", argv)
+    main()
+    return _written(tmp_path / "hf")
+
+
+class TestExportDtypePrecedence:
+    """dcp-to-hf takes ``--dtype``, then ``checkpoint.export_dtype``, then bfloat16."""
+
+    def test_flag_alone_sets_the_dtype(self, tmp_path, monkeypatch):
+        written = _run_dcp_to_hf(tmp_path, monkeypatch, None, "float16")
+        assert written == ({torch.float16}, "float16")
+
+    def test_config_alone_sets_the_dtype(self, tmp_path, monkeypatch):
+        written = _run_dcp_to_hf(tmp_path, monkeypatch, "float32", None)
+        assert written == ({torch.float32}, "float32")
