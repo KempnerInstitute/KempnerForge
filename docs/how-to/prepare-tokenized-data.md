@@ -15,7 +15,7 @@ reads a directory of shard files, each a flat 1-D array of token IDs:
 | File extension | Encoding | Dtype rule |
 |----------------|----------|------------|
 | `*.npy` | NumPy mmap | dtype stored in header |
-| `*.bin` | Raw packed integers | `data.token_dtype`, else `tokenized_info.dtype` in `metadata.yaml`; read as uint32 with a warning when neither declares it |
+| `*.bin` | Raw packed integers | `data.token_dtype` or `tokenized_info.dtype` in `metadata.yaml`, which must agree when both are set; read as uint32 with a warning when neither declares it |
 
 One file is one flat array. The dataset concatenates shards logically
 and splits the concatenated stream into non-overlapping
