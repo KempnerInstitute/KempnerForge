@@ -926,6 +926,7 @@ class TestNanSkippedStep:
         step, tokens_seen = run_training_loop(session)
         assert step == 2
         assert ckpt.saves == [(2, tokens_seen, {})]
+        assert ckpt.waits == 1
         assert epochs == [2]
         assert handler.finished is True
 
