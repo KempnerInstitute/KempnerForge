@@ -118,11 +118,15 @@ def _check_data_partition(rank: int, world: int, port: int, data_dir: str) -> No
         mine = [list(data.dataloader.sampler), list(eval_loader.sampler)]
         everyone: list = [None] * world
         dist.all_gather_object(everyone, ((data.dp_rank, data.dp_size), mine))
-        assert [info for info, _ in everyone] == [(r, world) for r in range(world)]
+        dp_infos = [info for info, _ in everyone]
+        assert dp_infos == [(r, world) for r in range(world)], f"DP info by rank: {dp_infos}"
         for loader, samples in enumerate(mine):
             seen = [i for _, theirs in everyone for i in theirs[loader]]
-            assert len(samples) > 0
-            assert len(seen) == len(set(seen)) == world * len(samples)
+            assert len(samples) > 0, f"rank {rank}, loader {loader}: no samples"
+            assert len(seen) == len(set(seen)) == world * len(samples), (
+                f"loader {loader}: {len(seen)} samples, {len(set(seen))} distinct, "
+                f"expected {world * len(samples)} disjoint"
+            )
     finally:
         dist.destroy_process_group()
 
