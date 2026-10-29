@@ -1607,6 +1607,90 @@ class TestRestoreCheckpoint:
         assert copied == []  # mid-flight resume already has MoT-shaped state
 
 
+class TestRestoreFromSavedCheckpoints:
+    """``restore_checkpoint`` with a real ``CheckpointManager`` and ``resolve_resume_path``."""
+
+    @staticmethod
+    def _run(ckpt_dir, seed, load_path=None, exclude=()):
+        """A fresh run in ``ckpt_dir``: its config, model, optimizer and checkpoint manager."""
+        from kempnerforge.training.entry import build_checkpoint_manager
+
+        config = make_config()
+        config.checkpoint.dir = str(ckpt_dir)
+        config.checkpoint.load_path = load_path
+        config.checkpoint.exclude_from_loading = list(exclude)
+        torch.manual_seed(seed)
+        model = TinyTextModel()
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        mgr = build_checkpoint_manager(config, _runtime(), model, optimizer, None)
+        return config, model, optimizer, mgr
+
+    def _saved(self, ckpt_dir, seed, step):
+        """Save step ``step`` of a run that has taken an optimizer step; return its weights."""
+        _, model, optimizer, mgr = self._run(ckpt_dir, seed)
+        model(torch.tensor([[1, 2, 3]])).sum().backward()
+        optimizer.step()
+        mgr.save(step=step, tokens_seen=step * 10)
+        return [p.detach().clone() for p in model.parameters()]
+
+    @staticmethod
+    def _same(weights, model):
+        """Whether ``model`` holds exactly ``weights``."""
+        return all(torch.equal(w, p) for w, p in zip(weights, model.parameters(), strict=True))
+
+    def test_an_interrupted_first_save_starts_over(self, tmp_path):
+        """Shards written, ``train_state.pt`` not yet: nothing to resume, so start from scratch."""
+        from kempnerforge.training.entry import restore_checkpoint
+
+        run = tmp_path / "run"
+        saved = self._saved(run, seed=0, step=4)
+        for name in ("train_state.pt", "metadata.json"):
+            (run / "step_4" / name).unlink()
+        (run / "latest").unlink()
+
+        config, model, optimizer, mgr = self._run(run, seed=1)
+        initial = [p.detach().clone() for p in model.parameters()]
+
+        assert restore_checkpoint(config, model, None, mgr) == (0, 0)
+        assert self._same(initial, model), "the run did not keep its own initial weights"
+        assert not self._same(saved, model), "fixture: the saved weights should differ"
+        assert not optimizer.state, "the run should start with a fresh optimizer"
+
+    def test_an_interrupted_first_save_of_a_warm_start_warm_starts_again(self, tmp_path):
+        """With ``load_path`` set, the run goes back to the warm start it began from."""
+        from kempnerforge.training.entry import restore_checkpoint
+
+        pretrained = self._saved(tmp_path / "pretrained", seed=2, step=100)
+        run = tmp_path / "run"
+        self._saved(run, seed=0, step=4)
+        (run / "step_4" / "train_state.pt").unlink()
+        (run / "latest").unlink()
+
+        config, model, optimizer, mgr = self._run(
+            run, seed=1, load_path=str(tmp_path / "pretrained" / "step_100"), exclude=["optimizer"]
+        )
+
+        assert restore_checkpoint(config, model, None, mgr) == (100, 1000)
+        assert self._same(pretrained, model), "the run did not load its warm start"
+        assert not optimizer.state, "the warm start excludes the optimizer"
+
+    def test_latest_without_its_train_state_is_refused(self, tmp_path):
+        """A committed checkpoint that lost ``train_state.pt`` stops the run before it loads."""
+        from kempnerforge.training.entry import restore_checkpoint
+
+        run = tmp_path / "run"
+        self._saved(run, seed=0, step=4)
+        (run / "step_4" / "train_state.pt").unlink()
+
+        config, model, optimizer, mgr = self._run(run, seed=1)
+        initial = [p.detach().clone() for p in model.parameters()]
+
+        with pytest.raises(FileNotFoundError, match="holds optimizer state but no train_state.pt"):
+            restore_checkpoint(config, model, None, mgr)
+        assert self._same(initial, model), "the refused load changed the weights"
+        assert not optimizer.state, "the refused load filled the optimizer"
+
+
 # ---------------------------------------------------------------------------
 # Data-pipeline source builders, driven under fakes
 # ---------------------------------------------------------------------------
