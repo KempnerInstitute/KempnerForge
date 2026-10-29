@@ -225,7 +225,7 @@ Parallelism dimensions and NCCL settings.
 | Field | Type | Default | Purpose |
 |-------|------|---------|---------|
 | `dp_shard` | `int` | `-1` | FSDP shard degree; `-1` → auto (use remaining GPUs) |
-| `dp_replicate` | `int` | `1` | DDP-style replication over FSDP groups |
+| `dp_replicate` | `int` | `1` | replicates the `dp_shard` groups (HSDP), and every rank in `dp_replicate × dp_shard` reads its own data; with no `dp_shard` dimension (it resolves to 1, no TP or EP), FSDP2 shards over `dp_replicate` instead |
 | `tp` | `int` | `1` | tensor parallel |
 | `pp` | `int` | `1` | pipeline parallel |
 | `pp_schedule` | `"1f1b" \| "gpipe" \| "interleaved_1f1b"` | `"1f1b"` | pipeline schedule |

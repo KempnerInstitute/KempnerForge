@@ -37,7 +37,7 @@ the mesh shape, and pick your dimensions knowing what each costs.
 | **PP** | shards layers across stages | once per micro-batch (P2P send/recv) | When TP+FSDP still can't fit (70B memory-tight) |
 | **EP** (MoE only) | shards expert weights | all-to-all on dispatch + combine | When expert weights dominate param budget; required at 32+ experts |
 | **CP** | shards along sequence | n/a (not implemented; `cp > 1` is rejected) | Not yet |
-| **DP replicate** | none | all-reduce on grads across replicas | Rarely — shrinks all-reduce domain at memory cost |
+| **DP replicate** | none with a `dp_shard` dimension (HSDP replicates the shards); without one, FSDP2 shards over it like `dp_shard` | all-reduce on grads across replicas (HSDP) | Rarely — shrinks all-reduce domain at memory cost |
 
 Matching principle: **cheap collectives first, expensive last**.
 FSDP fires one all-gather per step; TP fires one per matmul. At

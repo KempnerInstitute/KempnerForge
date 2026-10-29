@@ -1,0 +1,216 @@
+"""Data-parallel rank and size on real DeviceMeshes, on CPU over gloo.
+
+Also the data loaders and an HSDP training step that use them. Each mesh has the
+dimension names and order ``init_distributed`` builds: ``pp``, ``dp_replicate``,
+``dp_shard``, ``ep``, ``tp``, with a size-1 ``dp_shard`` inserted when ``tp`` or
+``ep`` is active.
+"""
+
+from __future__ import annotations
+
+import socket
+
+import pytest
+import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+import torch.nn.functional as F
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.fsdp import MixedPrecisionPolicy
+from torch.distributed.tensor import DTensor, Replicate, Shard
+
+from kempnerforge.config.data import DataConfig
+from kempnerforge.config.eval import EvalConfig
+from kempnerforge.config.job import JobConfig
+from kempnerforge.config.model import ModelConfig
+from kempnerforge.config.training import TrainConfig
+from kempnerforge.distributed.parallel import apply_fsdp2
+from kempnerforge.distributed.utils import clip_grad_norm_, get_dp_info
+from kempnerforge.model.transformer import Transformer
+from kempnerforge.training.data_pipeline import build_data_pipeline, build_eval_dataloader
+from kempnerforge.training.runtime import RuntimeContext
+
+HSDP_LAYOUTS = {
+    "dp_replicate2_dp_shard2": (
+        ("dp_replicate", "dp_shard"),
+        (2, 2),
+        [(0, 4), (1, 4), (2, 4), (3, 4)],
+    ),
+    "dp_replicate2_dp_shard4": (
+        ("dp_replicate", "dp_shard"),
+        (2, 4),
+        [(rank, 8) for rank in range(8)],
+    ),
+    "dp_replicate2_tp2": (
+        ("dp_replicate", "dp_shard", "tp"),
+        (2, 1, 2),
+        [(0, 2), (0, 2), (1, 2), (1, 2)],
+    ),
+    "dp_replicate2_ep2": (
+        ("dp_replicate", "dp_shard", "ep"),
+        (2, 1, 2),
+        [(0, 2), (0, 2), (1, 2), (1, 2)],
+    ),
+    "pp2_dp_replicate2_dp_shard2": (
+        ("pp", "dp_replicate", "dp_shard"),
+        (2, 2, 2),
+        [(0, 4), (1, 4), (2, 4), (3, 4)] * 2,
+    ),
+}
+
+OTHER_LAYOUTS = {
+    "dp_shard4": (("dp_shard",), (4,), [(0, 4), (1, 4), (2, 4), (3, 4)]),
+    "dp_replicate4": (("dp_replicate",), (4,), [(0, 4), (1, 4), (2, 4), (3, 4)]),
+    "dp_shard2_tp2": (("dp_shard", "tp"), (2, 2), [(0, 2), (0, 2), (1, 2), (1, 2)]),
+    "dp_shard1_ep2_tp2": (("dp_shard", "ep", "tp"), (1, 2, 2), [(0, 1)] * 4),
+    "pp2_dp_shard2": (("pp", "dp_shard"), (2, 2), [(0, 2), (1, 2), (0, 2), (1, 2)]),
+    "pp2_dp_replicate2": (("pp", "dp_replicate"), (2, 2), [(0, 2), (1, 2), (0, 2), (1, 2)]),
+    "pp4": (("pp",), (4,), [(0, 1)] * 4),
+}
+
+
+def _free_port() -> int:
+    """An unused local TCP port for the gloo rendezvous."""
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _init(rank: int, world: int, port: int) -> None:
+    """Join a ``world``-rank gloo group."""
+    dist.init_process_group(
+        "gloo", rank=rank, world_size=world, init_method=f"tcp://127.0.0.1:{port}"
+    )
+
+
+def _check_layouts(rank: int, world: int, port: int, layouts: list) -> None:
+    """Build each ``(names, sizes, expected)`` mesh and compare this rank's DP info."""
+    _init(rank, world, port)
+    try:
+        for names, sizes, expected in layouts:
+            mesh = init_device_mesh("cpu", sizes, mesh_dim_names=names)
+            got = get_dp_info(mesh)
+            assert got == expected[rank], f"mesh {names} of {sizes}, rank {rank}: {got}"
+    finally:
+        dist.destroy_process_group()
+
+
+def _check_data_partition(rank: int, world: int, port: int, data_dir: str) -> None:
+    """Build the training and eval loaders on a 2 x 2 HSDP mesh; each rank reads its own part."""
+    _init(rank, world, port)
+    try:
+        mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("dp_replicate", "dp_shard"))
+        runtime = RuntimeContext(
+            rank=rank,
+            local_rank=rank,
+            world_size=world,
+            device=torch.device("cpu"),
+            device_mesh=mesh,
+        )
+        config = JobConfig(
+            model=ModelConfig(dim=8, n_layers=1, n_heads=1, vocab_size=16, max_seq_len=64),
+            train=TrainConfig(batch_size=2, seq_len=15, compile_model=False),
+            data=DataConfig(dataset_path=data_dir, num_workers=0),
+            eval=EvalConfig(enabled=True, dataset_path=data_dir),
+        )
+        data = build_data_pipeline(config, runtime)
+        eval_loader = build_eval_dataloader(config, runtime)
+        mine = [list(data.dataloader.sampler), list(eval_loader.sampler)]
+        everyone: list = [None] * world
+        dist.all_gather_object(everyone, ((data.dp_rank, data.dp_size), mine))
+        dp_infos = [info for info, _ in everyone]
+        assert dp_infos == [(r, world) for r in range(world)], f"DP info by rank: {dp_infos}"
+        for loader, samples in enumerate(mine):
+            seen = [i for _, theirs in everyone for i in theirs[loader]]
+            assert len(samples) > 0, f"rank {rank}, loader {loader}: no samples"
+            assert len(seen) == len(set(seen)) == world * len(samples), (
+                f"loader {loader}: {len(seen)} samples, {len(set(seen))} distinct, "
+                f"expected {world * len(samples)} disjoint"
+            )
+    finally:
+        dist.destroy_process_group()
+
+
+def _loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    """Mean token cross-entropy, as the default training loss computes it."""
+    return F.cross_entropy(logits.flatten(0, 1).float(), labels.flatten())
+
+
+def _check_hsdp_step(rank: int, world: int, port: int) -> None:
+    """One FSDP2 step on a 2 x 2 HSDP mesh, each rank on its DP rank's rows, against one process.
+
+    The batch has two rows per rank, sized from the world rather than from
+    ``get_dp_info``, so a DP rank shared by two ranks repeats rows and drops others.
+    """
+    seq = 16
+    _init(rank, world, port)
+    try:
+        mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("dp_replicate", "dp_shard"))
+        config = ModelConfig(dim=64, n_layers=2, n_heads=4, vocab_size=128, max_seq_len=seq)
+        torch.manual_seed(0)
+        reference = Transformer(config)
+        model = Transformer(config)
+        model.load_state_dict(reference.state_dict())
+        fp32 = MixedPrecisionPolicy(param_dtype=torch.float32, reduce_dtype=torch.float32)
+        apply_fsdp2(model, mesh, mp_policy=fp32)
+
+        generator = torch.Generator().manual_seed(7)
+        tokens = torch.randint(0, config.vocab_size, (2 * world, seq), generator=generator)
+        labels = torch.randint(0, config.vocab_size, (2 * world, seq), generator=generator)
+        dp_rank, _ = get_dp_info(mesh)
+        rows = slice(2 * dp_rank, 2 * dp_rank + 2)
+        _loss(model(tokens[rows]), labels[rows]).backward()
+        norm = clip_grad_norm_(model, 0.05)
+
+        _loss(reference(tokens), labels).backward()
+        ref_norm = clip_grad_norm_(reference, 0.05)
+        norm = norm.full_tensor() if isinstance(norm, DTensor) else norm
+        placements = {name: p.placements for name, p in model.named_parameters()}
+        grads = {name: p.grad.full_tensor() for name, p in model.named_parameters()}
+        torch.testing.assert_close(norm, ref_norm, rtol=1e-5, atol=0.0)
+        for name, grad in grads.items():
+            assert placements[name] == (Replicate(), Shard(0)), name
+            torch.testing.assert_close(
+                grad, reference.get_parameter(name).grad, rtol=1e-5, atol=1e-7
+            )
+    finally:
+        dist.destroy_process_group()
+
+
+class TestGetDpInfoOnRealMeshes:
+    @pytest.mark.parametrize("layout", list(HSDP_LAYOUTS))
+    def test_hsdp_meshes_give_one_dp_rank_per_data_shard(self, layout):
+        """Under HSDP every (dp_replicate, dp_shard) pair reads its own data.
+
+        The DP rank is the row-major index of the pair, so on a mesh of DP dims
+        alone it equals the global rank. Ranks that differ only in ``pp``,
+        ``tp`` or ``ep`` share it, and the DP size is dp_replicate x dp_shard.
+        """
+        world = len(HSDP_LAYOUTS[layout][2])
+        mp.spawn(_check_layouts, args=(world, _free_port(), [HSDP_LAYOUTS[layout]]), nprocs=world)
+
+    @pytest.mark.parametrize("layout", list(OTHER_LAYOUTS))
+    def test_meshes_without_hsdp_keep_their_dp_ranks(self, layout):
+        """One DP dim, or none under pure PP, gives the same DP info as before HSDP."""
+        world = len(OTHER_LAYOUTS[layout][2])
+        mp.spawn(_check_layouts, args=(world, _free_port(), [OTHER_LAYOUTS[layout]]), nprocs=world)
+
+
+class TestDataPipelineOnHsdp:
+    def test_training_and_eval_loaders_split_the_data_over_both_dp_dims(self, mmap_data_dir):
+        """With dp_replicate=2 x dp_shard=2 the four ranks read four disjoint parts.
+
+        The loaders are built where training builds them, from ``get_dp_info``,
+        so a rank that shared another's part would repeat its samples.
+        """
+        mp.spawn(_check_data_partition, args=(4, _free_port(), mmap_data_dir), nprocs=4)
+
+
+class TestHsdpTrainingStep:
+    def test_step_matches_one_process_on_the_global_batch(self):
+        """FSDP2 on (dp_replicate, dp_shard) shards each parameter as (Replicate, Shard(0)).
+
+        Each rank trains on the rows its DP rank selects, and the clipped gradients,
+        averaged over all four ranks, equal one process's on every row.
+        """
+        mp.spawn(_check_hsdp_step, args=(4, _free_port()), nprocs=4)
