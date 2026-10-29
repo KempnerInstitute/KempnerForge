@@ -36,6 +36,11 @@ HSDP_LAYOUTS = {
         (2, 2),
         [(0, 4), (1, 4), (2, 4), (3, 4)],
     ),
+    "dp_replicate2_dp_shard4": (
+        ("dp_replicate", "dp_shard"),
+        (2, 4),
+        [(rank, 8) for rank in range(8)],
+    ),
     "dp_replicate2_tp2": (
         ("dp_replicate", "dp_shard", "tp"),
         (2, 1, 2),
