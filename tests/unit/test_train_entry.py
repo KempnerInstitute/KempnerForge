@@ -929,6 +929,24 @@ class TestNanSkippedStep:
         assert epochs == [2]
         assert handler.finished is True
 
+    def test_nan_stop_is_not_saved_even_with_a_shutdown_pending(self):
+        """The NaN that trips the stop ends the run before the shutdown check: no save."""
+        config = make_config(max_steps=10)
+        ckpt = FakeCheckpointManager()
+        handler = FakeShutdownHandler(after_steps=2)
+        session = make_session(
+            config,
+            loss_fn=lambda logits, labels: logits.sum() * float("nan"),
+            nan_detector=NaNDetector(action="warn", max_consecutive=2),
+            checkpointer=ckpt,
+            shutdown_handler=handler,
+        )
+        step, _ = run_training_loop(session)
+        assert step == 1
+        assert handler.checks == 1
+        assert ckpt.saves == []
+        assert handler.finished is False
+
 
 # ---------------------------------------------------------------------------
 # run_training wiring
