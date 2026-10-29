@@ -901,6 +901,15 @@ class TestNanSkippedStep:
         assert calls == ["profiler"]
         assert logged == [1]
 
+    def test_skipped_last_step_makes_no_final_save(self):
+        """A run whose last step is skipped is not a clean finish, so it writes no final save."""
+        config = make_config(max_steps=3)
+        config.checkpoint.interval = 100
+        ckpt = FakeCheckpointManager()
+        step, _ = run_training_loop(make_session(config, checkpointer=ckpt, step_fn=_nan_on({2})))
+        assert step == 3
+        assert ckpt.saves == []
+
     def test_phase_lr_scale_applies_to_the_next_steps_lr(self):
         config = make_config(max_steps=1)
         session = make_session(config, phases=PhaseState(lr_scale=0.5), step_fn=_nan_on({0}))
