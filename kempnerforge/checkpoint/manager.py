@@ -761,6 +761,11 @@ class CheckpointManager:
         Returns:
             Tuple of (step, tokens_seen, extra) where extra contains any
             additional keys saved via ``build_train_state(extra=...)``.
+
+        Raises:
+            FileNotFoundError: No checkpoint resolves although one was named, or the
+                checkpoint holds optimizer state that this load restores but has no
+                ``train_state.pt``. Raised before any state is loaded.
         """
         ckpt_dir = self._resolve_load_path(path)
         if ckpt_dir is None:
@@ -855,6 +860,19 @@ class CheckpointManager:
         if fresh_optimizer:
             load_optim = False
 
+        train_state_path = ckpt_dir / _TRAIN_STATE_FILE
+        train_state_exists = self._train_state_exists(train_state_path)
+        if load_optim and not train_state_exists:
+            raise FileNotFoundError(
+                f"Cannot resume {ckpt_dir}: it holds optimizer state but no {_TRAIN_STATE_FILE}, "
+                f"so loading it would continue its weights and optimizer moments from step 0 and "
+                f"restart the LR schedule and the data stream. Its save stopped before writing "
+                f"{_TRAIN_STATE_FILE}, or the file was lost. Restore the file, resume from an "
+                f"earlier complete step_N, or start from its weights alone: a new checkpoint.dir "
+                f"with checkpoint.load_path pointing at it and "
+                f'checkpoint.exclude_from_loading = ["optimizer"].'
+            )
+
         # Build properly-structured (FSDP-sharded, moment-allocated) templates via
         # the DCP-aware getters so dcp.load can repopulate them, then write them
         # back with the setters. Raw optimizer.state_dict() would be empty on a
@@ -900,19 +918,6 @@ class CheckpointManager:
             for optimizer in self.checkpointed_optimizers:
                 _reset_to_fresh(optimizer)
 
-        # Load non-distributed state. On NFS/Lustre, independent stat()
-        # calls can disagree briefly across ranks; if some ranks enter
-        # this branch and others don't, the broadcast_object_list below
-        # hangs. Use a rank-0-authoritative existence check broadcast to
-        # all ranks so every rank takes the same branch.
-        train_state_path = ckpt_dir / _TRAIN_STATE_FILE
-        if dist.is_initialized():
-            exists_flag = [train_state_path.exists() if self._rank == 0 else False]
-            dist.broadcast_object_list(exists_flag, src=0)
-            train_state_exists = bool(exists_flag[0])
-        else:
-            train_state_exists = train_state_path.exists()
-
         if train_state_exists:
             train_state = (
                 _load_train_state(train_state_path)
@@ -954,6 +959,19 @@ class CheckpointManager:
         elif fresh_optimizer:
             logger.info(f"{dcp_dir} holds no optimizer state; the optimizer starts fresh")
         return step, tokens_seen, extra
+
+    def _train_state_exists(self, path: Path) -> bool:
+        """Whether ``path`` exists, as rank 0 sees it, on every rank.
+
+        On NFS/Lustre independent stat() calls can disagree briefly across ranks. Ranks that
+        disagree take different branches of ``load()``: some raise or skip the train state while
+        the others wait in its broadcast and hang. Rank 0 checks, and its answer is broadcast.
+        """
+        if not dist.is_initialized():
+            return path.exists()
+        exists_flag = [path.exists() if self._rank == 0 else False]
+        dist.broadcast_object_list(exists_flag, src=0)
+        return bool(exists_flag[0])
 
     def apply_dataloader_state(self, dataloader: Any) -> None:
         """Apply any dataloader state stashed during load().

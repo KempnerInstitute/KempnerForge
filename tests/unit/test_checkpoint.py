@@ -2269,6 +2269,9 @@ class TestResumeWithUnsteppedParameters:
         if case == "integer_keyed":
             state = {"model": model.state_dict(), "optimizer": optimizer.state_dict()}
             dcp.save(state, checkpoint_id=str(tmp_path / "step_1"))
+            torch.save(
+                build_train_state(step=1, tokens_seen=0), tmp_path / "step_1" / "train_state.pt"
+            )
         else:
             manager.save(step=1)
 
@@ -2382,6 +2385,7 @@ class TestResumeWithUnsteppedParameters:
         }
         mutate(saved)
         dcp.save(saved, checkpoint_id=str(tmp_path / "step_1"))
+        torch.save(build_train_state(step=1, tokens_seen=0), tmp_path / "step_1" / "train_state.pt")
 
         _, _, manager2 = self._build(1, tmp_path)
         with pytest.raises(
@@ -2416,6 +2420,7 @@ class TestResumeWithUnsteppedParameters:
         monkeypatch.setattr(_version, "_derived_version", "2_3")
         dcp.save(saved, checkpoint_id=str(tmp_path / "step_1"))
         monkeypatch.undo()
+        torch.save(build_train_state(step=2, tokens_seen=0), tmp_path / "step_1" / "train_state.pt")
         index = FileSystemReader(str(tmp_path / "step_1")).read_metadata()
         assert "optimizer" in index.state_dict_metadata
 
@@ -2546,6 +2551,7 @@ class TestMuonResume:
             "optimizer": get_optimizer_state_dict(model, opt),
         }
         dcp.save(state, checkpoint_id=str(step_dir))
+        torch.save(build_train_state(step=3, tokens_seen=0), step_dir / "train_state.pt")
 
         records: list[logging.LogRecord] = []
 
@@ -2746,6 +2752,7 @@ class TestMuonResume:
             "optimizer": get_optimizer_state_dict(model, opt),
         }
         dcp.save(state, checkpoint_id=str(step_dir))
+        torch.save(build_train_state(step=3, tokens_seen=0), step_dir / "train_state.pt")
 
         model2, opt2 = self._build(seed=1)
         CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model2, opt2).load(
