@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 
+import pytest
 import torch
 
 from kempnerforge.config.schema import ModelConfig, ProfilingConfig
@@ -17,6 +18,8 @@ from kempnerforge.metrics.mfu import (
     estimate_model_flops_per_token,
     get_gpu_peak_tflops,
 )
+from kempnerforge.model.moe import MoEMLP
+from kempnerforge.model.transformer import Transformer
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -155,6 +158,52 @@ class TestMFU:
         result = compute_mfu(SMALL_CONFIG, tokens_per_sec=1e6, num_gpus=1)
         assert math.isfinite(result)
         assert result > 0
+
+
+def _built_flops_per_token(model: Transformer, seq_len: int) -> int:
+    """PaLM ``6*P + 12*L*D*S`` with ``P`` read from the modules the model built."""
+    config = model.config
+    active = model.output_head.proj.weight.numel()
+    for layer in model.layers.values():
+        attn = layer.attention
+        active += sum(
+            m.weight.numel() for m in (attn.q_proj, attn.k_proj, attn.v_proj, attn.o_proj)
+        )
+        mlp = layer.mlp
+        if isinstance(mlp, MoEMLP):
+            active += mlp.router.top_k * sum(p.numel() for p in mlp.experts[0].parameters())
+            if mlp.shared_expert is not None:
+                active += sum(p.numel() for p in mlp.shared_expert.parameters())
+        else:
+            active += sum(p.numel() for p in mlp.parameters())
+    return 6 * active + 12 * config.n_layers * config.n_heads * config.head_dim * seq_len
+
+
+class TestMFUMoEExperts:
+    """The MoE term counts the experts a model builds: ``moe_top_k`` routed and every
+    shared one at the expert FFN width, with dense layers at the dense width."""
+
+    @pytest.mark.parametrize(
+        "shared,multiplier,frequency",
+        [(0, 0.5, 1), (1, 0.5, 1), (2, 1.0, 1), (3, 0.5, 2)],
+    )
+    def test_flops_match_the_built_model(self, shared, multiplier, frequency):
+        config = ModelConfig(
+            dim=64,
+            n_layers=4,
+            n_heads=4,
+            vocab_size=256,
+            max_seq_len=64,
+            num_experts=4,
+            moe_top_k=2,
+            moe_shared_experts=shared,
+            moe_expert_ffn_multiplier=multiplier,
+            moe_frequency=frequency,
+        )
+        model = Transformer(config)
+        assert estimate_model_flops_per_token(config, seq_len=64) == _built_flops_per_token(
+            model, 64
+        )
 
 
 # ---------------------------------------------------------------------------
