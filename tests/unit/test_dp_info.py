@@ -58,15 +58,15 @@ HSDP_LAYOUTS = {
     ),
 }
 
-OTHER_LAYOUTS = [
-    (("dp_shard",), (4,), [(0, 4), (1, 4), (2, 4), (3, 4)]),
-    (("dp_replicate",), (4,), [(0, 4), (1, 4), (2, 4), (3, 4)]),
-    (("dp_shard", "tp"), (2, 2), [(0, 2), (0, 2), (1, 2), (1, 2)]),
-    (("dp_shard", "ep", "tp"), (1, 2, 2), [(0, 1)] * 4),
-    (("pp", "dp_shard"), (2, 2), [(0, 2), (1, 2), (0, 2), (1, 2)]),
-    (("pp", "dp_replicate"), (2, 2), [(0, 2), (1, 2), (0, 2), (1, 2)]),
-    (("pp",), (4,), [(0, 1)] * 4),
-]
+OTHER_LAYOUTS = {
+    "dp_shard4": (("dp_shard",), (4,), [(0, 4), (1, 4), (2, 4), (3, 4)]),
+    "dp_replicate4": (("dp_replicate",), (4,), [(0, 4), (1, 4), (2, 4), (3, 4)]),
+    "dp_shard2_tp2": (("dp_shard", "tp"), (2, 2), [(0, 2), (0, 2), (1, 2), (1, 2)]),
+    "dp_shard1_ep2_tp2": (("dp_shard", "ep", "tp"), (1, 2, 2), [(0, 1)] * 4),
+    "pp2_dp_shard2": (("pp", "dp_shard"), (2, 2), [(0, 2), (1, 2), (0, 2), (1, 2)]),
+    "pp2_dp_replicate2": (("pp", "dp_replicate"), (2, 2), [(0, 2), (1, 2), (0, 2), (1, 2)]),
+    "pp4": (("pp",), (4,), [(0, 1)] * 4),
+}
 
 
 def _free_port() -> int:
@@ -183,9 +183,11 @@ class TestGetDpInfoOnRealMeshes:
         world = len(HSDP_LAYOUTS[layout][2])
         mp.spawn(_check_layouts, args=(world, _free_port(), [HSDP_LAYOUTS[layout]]), nprocs=world)
 
-    def test_meshes_without_hsdp_keep_their_dp_ranks(self):
+    @pytest.mark.parametrize("layout", list(OTHER_LAYOUTS))
+    def test_meshes_without_hsdp_keep_their_dp_ranks(self, layout):
         """One DP dim, or none under pure PP, gives the same DP info as before HSDP."""
-        mp.spawn(_check_layouts, args=(4, _free_port(), OTHER_LAYOUTS), nprocs=4)
+        world = len(OTHER_LAYOUTS[layout][2])
+        mp.spawn(_check_layouts, args=(world, _free_port(), [OTHER_LAYOUTS[layout]]), nprocs=world)
 
 
 class TestDataPipelineOnHsdp:
