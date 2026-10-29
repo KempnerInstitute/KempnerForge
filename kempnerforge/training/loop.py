@@ -477,6 +477,18 @@ def _log_periodic_metrics(session: TrainingSession, result: StepResult, step: in
         tracker.log_eval(ds_metrics, step)
 
 
+def _advance_lr_schedule(session: TrainingSession) -> None:
+    """Step the scheduler, then scale the new LR by the active phase's ``lr_scale``.
+
+    Runs once per step, a step skipped for a non-finite loss included, so
+    the schedule stays aligned with the step counter.
+    """
+    session.scheduler.step()
+    if session.phases.lr_scale != 1.0:
+        for pg in session.optimizer.param_groups:
+            pg["lr"] *= session.phases.lr_scale
+
+
 def _apply_freeze_stages(session: TrainingSession, step: int) -> None:
     """FreezeStage hook: apply any stage whose start_step matches this boundary.
 
@@ -574,17 +586,13 @@ def run_training_loop(
                 if session.nan_detector.should_rollback:
                     logger.error("Too many consecutive NaNs — stopping")
                     break
+                _advance_lr_schedule(session)
                 step += 1
                 continue
 
             # Optimizer step
             optimizer.step()
-            scheduler.step()
-
-            # Phase LR scaling (applied after scheduler computes base LR)
-            if phases.lr_scale != 1.0:
-                for pg in optimizer.param_groups:
-                    pg["lr"] *= phases.lr_scale
+            _advance_lr_schedule(session)
 
             optimizer.zero_grad()
 
