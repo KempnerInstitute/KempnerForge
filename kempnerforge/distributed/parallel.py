@@ -136,8 +136,9 @@ def apply_float8(model: Transformer, enable_fsdp_float8_all_gather: bool = True)
     Must be called AFTER apply_tensor_parallel / apply_expert_parallel
     and BEFORE apply_ac / apply_fsdp2.
 
-    MoE expert modules (experts and shared_expert) are excluded because they use
-    grouped GEMM (torch._grouped_mm) which bypasses Float8Linear.forward().
+    Routed MoE experts are excluded because they use grouped GEMM
+    (torch._grouped_mm), which bypasses Float8Linear.forward(). The shared expert
+    is a plain Linear call; the same name filter excludes it, by convention.
 
     Args:
         model: Transformer model.
