@@ -528,6 +528,37 @@ def _apply_step_transitions(session: TrainingSession, step: int) -> None:
         session.batches.reset()
 
 
+def _shutdown_if_requested(
+    session: TrainingSession, step: int, tokens_seen: int, *, saved_this_step: bool
+) -> bool:
+    """Write the emergency checkpoint and finish when a shutdown is pending.
+
+    Returns True when the loop must stop. With ``saved_this_step``, the
+    scheduled save of ``step`` is the emergency checkpoint, so it is drained
+    with ``wait()`` rather than written twice.
+    """
+    if not session.shutdown_handler.should_shutdown():
+        return False
+    ckpt_mgr = session.checkpointer
+    if saved_this_step:
+        logger.warning(
+            f"Shutdown requested at step {step}; "
+            "its scheduled checkpoint is the emergency checkpoint"
+        )
+        ckpt_mgr.wait()
+    else:
+        logger.warning(f"Shutdown requested at step {step} — saving emergency checkpoint")
+        ckpt_mgr.save(
+            step=step,
+            tokens_seen=tokens_seen,
+            scheduler=session.scheduler,
+            dataloader=session.data.dataloader,
+            extra=checkpoint_extra(session.config, step, session.phases),
+        )
+    session.shutdown_handler.finish()
+    return True
+
+
 def run_training_loop(
     session: TrainingSession, *, step: int = 0, tokens_seen: int = 0
 ) -> tuple[int, int]:
@@ -689,25 +720,7 @@ def run_training_loop(
                 hooks.on_checkpoint_save(step, config.checkpoint.dir)
 
             # Graceful shutdown
-            if session.shutdown_handler.should_shutdown():
-                if saved_this_step:
-                    logger.warning(
-                        f"Shutdown requested at step {step}; "
-                        "its scheduled checkpoint is the emergency checkpoint"
-                    )
-                    ckpt_mgr.wait()
-                else:
-                    logger.warning(
-                        f"Shutdown requested at step {step} — saving emergency checkpoint"
-                    )
-                    ckpt_mgr.save(
-                        step=step,
-                        tokens_seen=tokens_seen,
-                        scheduler=scheduler,
-                        dataloader=data.dataloader,
-                        extra=ckpt_extra,
-                    )
-                session.shutdown_handler.finish()
+            if _shutdown_if_requested(session, step, tokens_seen, saved_this_step=saved_this_step):
                 break
 
             # Clean-completion marker for the unconditional final save after the
