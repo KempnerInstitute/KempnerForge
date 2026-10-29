@@ -24,7 +24,8 @@ for micro_step in range(grad_accum_steps):       ── maybe_no_sync sets
     └─ (loss / grad_accum_steps).backward()       ── gradient accumulation
 
 grad_norm = clip_grad_norm_(model, grad_clip_norm)
-if NaN: zero_grad, skip, maybe stop
+if NaN: zero_grad, maybe stop, skip the update; still run scheduler.step(),
+        freeze stages / phases and the shutdown check
 optimizer.step() ; scheduler.step() ; optimizer.zero_grad()
 
 tracker.end_step(step, loss, grad_norm, lr, tokens_in_step)
@@ -168,7 +169,15 @@ After the microbatch loop:
 grad_norm = clip_grad_norm_(model, tc.grad_clip_norm)
 
 if not nan_detector.check_loss(avg_loss, step):
-    optimizer.zero_grad(); step += 1; continue   # skip this step
+    optimizer.zero_grad()
+    if nan_detector.should_rollback:
+        break
+    _advance_lr_schedule(session)            # scheduler.step() + phase LR scaling
+    step += 1
+    _apply_step_transitions(session, step)   # freeze stages, then phases (section 9)
+    if _shutdown_if_requested(session, step, tokens_seen, saved_this_step=False):
+        break
+    continue                                 # no update, token count, metrics or hooks
 
 optimizer.step()
 scheduler.step()
@@ -183,6 +192,13 @@ group, so the norm covers every stage rather than this rank's own. The NaN
 detector returns `False` on NaN/Inf loss, zeroes
 the grads, and (after `max_consecutive`) signals a rollback to the
 previous checkpoint.
+
+A skipped step still counts as a step (section 8): it advances the LR
+schedule, applies the freeze stages and the phases (section 9) due at
+the new step, and runs the shutdown check (section 11), so all three
+stay on the step counter. It skips the update, the token count
+(section 8), metrics and hooks (section 10), and the rest of the
+periodic work in section 11.
 
 Phase LR scaling applies *after* the scheduler — it multiplies the base
 LR that `scheduler.step()` just computed.
@@ -237,7 +253,9 @@ In order:
 - **Graceful shutdown** — if SIGTERM/SIGUSR1 fired,
   `ckpt_mgr.save(step)` as the emergency checkpoint, then exit; a step
   the checkpoint above already saved is not saved again, and the loop
-  waits for that save before it finishes the shutdown.
+  waits for that save before it finishes the shutdown. A NaN-skipped
+  step (section 7) runs this check too; the checkpoint above never
+  saves such a step, so it always writes its own emergency checkpoint.
 
 ## Shutdown
 
