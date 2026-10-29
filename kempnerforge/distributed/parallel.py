@@ -164,7 +164,8 @@ def apply_float8(model: Transformer, enable_fsdp_float8_all_gather: bool = True)
         """Skip modules that shouldn't use Float8.
 
         Excluded:
-        - Expert Linears: use grouped GEMM (torch._grouped_mm), not Linear.forward()
+        - Routed expert Linears: use grouped GEMM (torch._grouped_mm), not Linear.forward()
+        - Shared expert: a plain Linear call, excluded with the routed experts by convention
         - Router gate: small output dim (num_experts) often not divisible by 16,
           which torch._scaled_mm requires. Also not compute-bound.
         """
