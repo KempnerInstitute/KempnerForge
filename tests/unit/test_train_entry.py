@@ -856,6 +856,13 @@ class TestNanSkippedStep:
         assert step == 2
         assert session.scheduler.last_epoch == 2
 
+    def test_skipped_step_adds_no_tokens(self):
+        """``tokens_seen`` counts the two steps that updated the model, not the skipped one."""
+        config = make_config(max_steps=3)
+        step, tokens_seen = run_training_loop(make_session(config, step_fn=_nan_on({1})))
+        assert step == 3
+        assert tokens_seen == 2 * config.train.batch_size * config.train.seq_len
+
     def test_phase_lr_scale_applies_to_the_next_steps_lr(self):
         config = make_config(max_steps=1)
         session = make_session(config, phases=PhaseState(lr_scale=0.5), step_fn=_nan_on({0}))
