@@ -35,7 +35,9 @@ dp_shard=32, ep=1, tp=4` config produces a 2D mesh with dim names
 before `ep` and `tp` in the dimension list. FSDP2 needs every
 parameter as a DTensor for the fused optimizer path to work; if TP has
 already made some params DTensors, FSDP2 has to upgrade the rest —
-which requires an (even trivial) `dp_shard` dimension.
+which requires an (even trivial) `dp_shard` dimension. With
+`dp_replicate > 1` this gives a 2D DP mesh `(dp_replicate, dp_shard=1)`,
+which `apply_fsdp2` and `get_dp_info` treat as HSDP.
 
 If every dimension is `1`, the mesh degenerates to a flat
 `("dp_shard",)` mesh of size `world_size` — still present, still what
@@ -74,8 +76,15 @@ Every apply function reads the sub-mesh it needs:
 
 `get_dp_info(mesh)` (in
 [`kempnerforge.distributed.utils`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/distributed/utils.py))
-collapses the DP axes into `(dp_rank, dp_size)` — the numbers the
-metrics tracker uses for "tokens seen across DP ranks".
+collapses the DP axes into `(dp_rank, dp_size)`: the partition the
+training and eval samplers split the data by, and the factor in
+"tokens seen across DP ranks". Only `dp_replicate` and `dp_shard` split
+the data, so ranks that differ only in `pp`, `ep` or `tp` share a DP
+rank, and a mesh with neither (pure PP) gives `(0, 1)`. Under HSDP,
+`dp_size = dp_replicate × dp_shard` and the DP rank is the row-major
+index of the rank's `(dp_replicate, dp_shard)` coordinates, read from
+the mesh without creating a process group. On a mesh of DP dimensions
+alone it equals the global rank.
 
 ## Example meshes
 
@@ -123,6 +132,21 @@ mesh: ("dp_shard", "ep", "tp") — size (4, 2, 4)
 shards attention within each EP group; FSDP shards the rest across
 the `dp_shard` axis. See
 [Parallelism recipes § MoE](../reference/parallelism-recipes.md#moe-mixtral-style-8-experts-top-2).
+
+### HSDP on 8 GPUs (no shipped config)
+
+```
+dp_replicate=2, dp_shard=4, tp=1, pp=1, cp=1, ep=1
+
+mesh: ("dp_replicate", "dp_shard") — size (2, 4)
+```
+
+`apply_fsdp2` gets both axes: it shards each parameter across the 4
+ranks of a `dp_shard` group and replicates it across the 2 groups (see
+[FSDP2 § HSDP](fsdp2.md#hsdp)). `get_dp_info` gives the 8 ranks DP
+ranks 0 to 7, so each reads its own data. Set it with
+`--distributed.dp_replicate=2` on 8 GPUs, where the default
+`dp_shard = -1` resolves to 4.
 
 ## Context parallelism
 
