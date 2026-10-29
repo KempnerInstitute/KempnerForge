@@ -2933,14 +2933,15 @@ class TestResumeWithoutTrainState:
         config = CheckpointConfig(dir=str(ckpt_dir), load_path=load_path)
         return model, optimizer, CheckpointManager(config, model, optimizer)
 
-    def _saved_without_train_state(self, tmp_path):
-        """A step-500 checkpoint of a stepped run whose ``train_state.pt`` is gone."""
+    def _saved_without_train_state(self, tmp_path, lost=("train_state.pt",)):
+        """A step-500 checkpoint of a stepped run whose files in ``lost`` are gone."""
         model, optimizer, manager = self._build(0, tmp_path / "run")
         model(torch.ones(2, 4)).sum().backward()
         optimizer.step()
         manager.save(step=500, tokens_seen=1_000_000)
         step_dir = tmp_path / "run" / "step_500"
-        (step_dir / "train_state.pt").unlink()
+        for name in lost:
+            (step_dir / name).unlink()
         return model, step_dir
 
     @staticmethod
@@ -2975,14 +2976,23 @@ class TestResumeWithoutTrainState:
         )
 
     @pytest.mark.parametrize(
+        "lost",
+        [("train_state.pt",), ("train_state.pt", "metadata.json")],
+        ids=["train_state_lost", "cut_short_before_both"],
+    )
+    @pytest.mark.parametrize(
         ("via", "exclude"),
         [("latest", None), ("resolved_path", None), ("load_path", None), ("load_path", ["model"])],
     )
     def test_loading_its_optimizer_state_is_refused_before_anything_loads(
-        self, tmp_path, via, exclude
+        self, tmp_path, via, exclude, lost
     ):
-        """Auto-resume (``latest`` or the path it resolved) and ``load_path`` all refuse it."""
-        _, step_dir = self._saved_without_train_state(tmp_path)
+        """Auto-resume (``latest`` or the path it resolved) and ``load_path`` all refuse it.
+
+        A save cut short after its shards has written neither ``train_state.pt`` nor
+        ``metadata.json``, so a missing ``metadata.json`` does not make it an import.
+        """
+        _, step_dir = self._saved_without_train_state(tmp_path, lost)
         if via == "load_path":
             model, optimizer, manager = self._build(1, tmp_path / "fresh", str(step_dir))
         else:
