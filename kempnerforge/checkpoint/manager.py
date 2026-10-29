@@ -903,10 +903,10 @@ class CheckpointManager:
                 f"Cannot resume {ckpt_dir}: it holds optimizer state but no {_TRAIN_STATE_FILE}, "
                 f"so loading it would continue its weights and optimizer moments from step 0 and "
                 f"restart the LR schedule and the data stream. Its save stopped before writing "
-                f"{_TRAIN_STATE_FILE}, or the file was lost. Restore the file, resume from an "
-                f"earlier complete step_N, or start from its weights alone: a new checkpoint.dir "
-                f"with checkpoint.load_path pointing at it and "
-                f'checkpoint.exclude_from_loading = ["optimizer"].'
+                f"{_TRAIN_STATE_FILE}, or the file was lost. Restore the file, or set a new "
+                f"checkpoint.dir with checkpoint.load_path pointing at an earlier complete "
+                f"step_N to resume from it, or at this checkpoint with "
+                f'checkpoint.exclude_from_loading = ["optimizer"] to start from its weights alone.'
             )
 
         # Build properly-structured (FSDP-sharded, moment-allocated) templates via
