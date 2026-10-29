@@ -231,7 +231,10 @@ when that step is not already on the save schedule — so a completed run's
 fully-trained model (including the WSD decay tail) is always recoverable
 and `latest` points at it. This mirrors the emergency checkpoint the
 preemption path writes on shutdown. The `should_save` guard avoids a
-duplicate when `max_steps` already coincided with the schedule.
+duplicate when `max_steps` already coincided with the schedule. A run
+whose last step is skipped for a NaN / Inf loss is not a clean finish:
+it ends without this checkpoint, unless a pending shutdown saves that
+step as its emergency checkpoint.
 
 `ckpt_mgr.wait()` is load-bearing — without it, a rank can exit before
 its async DCP write completes, corrupting the checkpoint for
