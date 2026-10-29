@@ -65,8 +65,10 @@ the uninterrupted run would have, with two exceptions:
   full `max_consecutive` more before it stops.
 - **Before the run's first optimizer update.** The checkpoint holds no
   optimizer state, so the resumed optimizer keeps the LR the scheduler
-  set at step 0 (0 under the default warmup) for its first update; the
-  schedule applies from the next step on.
+  set at step 0 (0 under the default warmup) for its first update. That
+  update still advances the optimizer's moments and step count, so the
+  resumed run does not rejoin the uninterrupted one, though its LR
+  follows the schedule from the next step on.
 
 Two edge cases:
 
