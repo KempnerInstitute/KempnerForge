@@ -2542,6 +2542,14 @@ class TestFreezeStageFence:
         run_training_loop(self._vlm_session(monkeypatch, start_step=99, order=order))
         assert order == []
 
+    def test_stage_due_on_the_last_finite_step_fires_on_it(self, monkeypatch):
+        """Step 2 is the last step, so the stage applies only if it runs after the step counts."""
+        order: list = []
+        session = self._vlm_session(monkeypatch, start_step=2, order=order)
+        session.config.train.max_steps = 2
+        run_training_loop(session)
+        assert order == ["flush", "freeze"]
+
     def test_stage_reached_by_a_nan_skipped_step_fires_on_it(self, monkeypatch):
         """Step 2 is reached by a NaN step and is the last one, so only that step can apply it."""
         order: list = []
