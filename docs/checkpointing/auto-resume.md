@@ -68,7 +68,7 @@ holds a complete save, it says so at ERROR level.
 resume_path = resolve_resume_path(config.checkpoint.dir)
 step, tokens_seen = 0, 0
 if resume_path and config.checkpoint.load_path:
-    logger.warning(...)  # rank 0: load_path is not used, naming both paths
+    logger.warning(...)  # rank 0, unless load_path is resume_path: load_path is not used
 if resume_path or config.checkpoint.load_path:
     step, tokens_seen, ckpt_extra_loaded = ckpt_mgr.load(
         path=str(resume_path) if resume_path else None,
@@ -92,7 +92,9 @@ If both are set, `resume_path` wins (auto-resume takes precedence
 over the static config). This is deliberate: SLURM requeues should
 always pick up where they left off, not re-load the initial
 `load_path` every time. Rank 0 logs a warning that names both paths,
-so a `load_path` meant as a rollback does not go unnoticed: see
+so a `load_path` meant as a rollback does not go unnoticed (unless
+`load_path` names the very checkpoint being resumed and excludes
+nothing, since the resume then does what it asks): see
 [Loading a specific step](#loading-a-specific-step).
 `exclude_from_loading` follows the same rule: it applies only to the
 `load_path` warm start, so when a resume wins it is dropped with
