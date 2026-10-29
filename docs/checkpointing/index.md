@@ -84,7 +84,7 @@ live run at save time it also holds a `tracking` list, one entry per backend:
   — `build_train_state` / `restore_train_state`, RNG capture.
 - [`kempnerforge/resilience/elastic.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/resilience/elastic.py)
   — `resolve_resume_path()` (checks the `latest` symlink and falls
-  back to the highest `step_N`).
+  back to the newest `step_N` whose save completed).
 - [`scripts/convert_checkpoint.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/scripts/convert_checkpoint.py)
   — `dcp-to-hf` and `hf-to-dcp` CLI.
 
