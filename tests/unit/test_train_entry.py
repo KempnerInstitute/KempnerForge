@@ -863,6 +863,44 @@ class TestNanSkippedStep:
         assert step == 3
         assert tokens_seen == 2 * config.train.batch_size * config.train.seq_len
 
+    def test_skipped_step_runs_no_eval_nccl_check_profiler_step_or_metrics(self, monkeypatch):
+        """Step 2 is due for eval and the NCCL check but is skipped, so only step 1's work runs."""
+        import kempnerforge.training.loop as loop
+        from kempnerforge.config.eval import EvalConfig
+
+        calls: list[str] = []
+        monkeypatch.setattr(loop, "run_eval", lambda *a, **k: calls.append("eval") or {})
+        monkeypatch.setattr(loop, "check_nccl_health", lambda: calls.append("nccl") or True)
+
+        class RecordingProfiler:
+            def start(self) -> None:
+                pass
+
+            def stop(self) -> None:
+                pass
+
+            def step(self) -> None:
+                calls.append("profiler")
+
+        config = make_config(max_steps=2)
+        config.eval = EvalConfig(enabled=True, interval=2, steps=1, dataset_path="/x")
+        config.train.nccl_health_check_interval = 2
+        session = make_session(
+            config,
+            step_fn=_nan_on({1}),
+            eval_dataloader=["BATCH"],
+            profiler=RecordingProfiler(),
+            runtime=dataclasses.replace(_runtime(), rank=1),
+        )
+        logged: list[int] = []
+        end_step = session.tracker.end_step
+        monkeypatch.setattr(
+            session.tracker, "end_step", lambda **kw: logged.append(kw["step"]) or end_step(**kw)
+        )
+        run_training_loop(session)
+        assert calls == ["profiler"]
+        assert logged == [1]
+
     def test_phase_lr_scale_applies_to_the_next_steps_lr(self):
         config = make_config(max_steps=1)
         session = make_session(config, phases=PhaseState(lr_scale=0.5), step_fn=_nan_on({0}))
