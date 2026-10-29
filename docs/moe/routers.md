@@ -145,6 +145,12 @@ shapes grow with `N`, so a checkpoint loads only into a model built
 with the same `N`. A negative `N` is rejected at config load and by
 `build_moe`.
 
+Under [Muon](../training/optimizers.md#muon) the fused MLP is one
+matrix per projection, so it is orthogonalized as a whole rather than
+as `N` expert matrices, and once its aspect ratio passes 10 Muon hands
+it to its AdamW fallback. On `configs/model/moe_small.toml` that
+happens from `N = 3`, where each projection is 21504 × 2048.
+
 DeepSeek's original motivation: the shared expert absorbs the
 "universal" capacity so routed experts can specialize. In practice,
 `moe_shared_experts=1` with `sigmoid_topk` reproduces the DeepSeek-V3
