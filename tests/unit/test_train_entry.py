@@ -921,16 +921,20 @@ class TestNanSkippedStep:
         phases = build_phase_state(config, data, step=0)
         return make_session(config, data=data, phases=phases, **overrides)
 
-    def test_phase_due_on_a_skipped_step_fires_on_it(self):
+    def test_phase_due_on_a_skipped_step_fires_on_it(self, monkeypatch):
         """Step 2 is reached by a NaN step and is the last one, so only that step can fire it."""
         session = self._phase_session(
             TrainingPhase(start_step=2, dataset_weights={"a": 5.0}, lr_scale=0.5),
             step_fn=_nan_on({1}),
         )
+        resets: list[int] = []
+        reset = session.batches.reset
+        monkeypatch.setattr(session.batches, "reset", lambda: resets.append(1) or reset())
         run_training_loop(session)
         assert session.phases.next_idx == 1
         assert session.phases.lr_scale == 0.5
         assert session.data.mixture_sampler.calls == [([5.0, 3.0], 1.0)]
+        assert resets == [1]
 
     def test_a_phase_reached_by_a_skipped_step_scales_the_lr_from_the_same_update(self):
         """The phase's ``lr_scale`` first applies to step 3's update, as in an all-finite run."""
