@@ -515,6 +515,19 @@ def _apply_freeze_stages(session: TrainingSession, step: int) -> None:
         logger.info(f"FreezeStage at step={step}: applied {flipped}")
 
 
+def _apply_step_transitions(session: TrainingSession, step: int) -> None:
+    """Apply the freeze stages and data phases due at ``step``.
+
+    Runs right after the step counter advances, on a step skipped for a
+    non-finite loss too, so a transition lands on its configured step. A
+    phase that fires drops the data iterator, so the next batch is drawn
+    with the new sampler weights.
+    """
+    _apply_freeze_stages(session, step)
+    if advance_phases(session.phases, session.data, step):
+        session.batches.reset()
+
+
 def run_training_loop(
     session: TrainingSession, *, step: int = 0, tokens_seen: int = 0
 ) -> tuple[int, int]:
@@ -588,7 +601,7 @@ def run_training_loop(
                     break
                 _advance_lr_schedule(session)
                 step += 1
-                _apply_freeze_stages(session, step)
+                _apply_step_transitions(session, step)
                 continue
 
             # Optimizer step
@@ -601,12 +614,7 @@ def run_training_loop(
             tokens_in_step = tc.batch_size * tc.seq_len * tc.grad_accum_steps * data.dp_size
             tokens_seen += tokens_in_step
 
-            _apply_freeze_stages(session, step)
-
-            # Phase transition check — a fired phase forces a data iterator
-            # refresh so the new sampler weights take effect.
-            if advance_phases(phases, data, step):
-                session.batches.reset()
+            _apply_step_transitions(session, step)
 
             # Metrics (report LR after phase scaling)
             current_lr = optimizer.param_groups[0]["lr"]
