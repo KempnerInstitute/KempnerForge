@@ -862,6 +862,31 @@ class TestNanSkippedStep:
         run_training_loop(session)
         assert session.optimizer.param_groups[0]["lr"] == pytest.approx(0.025)
 
+    def _phase_session(self, phase: TrainingPhase, **overrides: Any) -> TrainingSession:
+        """A two-step mixture run with one data phase; ``overrides`` go to ``make_session``."""
+        data = _mixture_pipeline()
+        data.dataloader = [
+            {
+                "input_ids": torch.zeros(2, 4, dtype=torch.long),
+                "labels": torch.zeros(2, 4, dtype=torch.long),
+            }
+        ]
+        config = make_config(max_steps=2)
+        config.data = DataConfig(phases=[phase])
+        phases = build_phase_state(config, data, step=0)
+        return make_session(config, data=data, phases=phases, **overrides)
+
+    def test_phase_due_on_a_skipped_step_fires_on_it(self):
+        """Step 2 is reached by a NaN step and is the last one, so only that step can fire it."""
+        session = self._phase_session(
+            TrainingPhase(start_step=2, dataset_weights={"a": 5.0}, lr_scale=0.5),
+            step_fn=_nan_on({1}),
+        )
+        run_training_loop(session)
+        assert session.phases.next_idx == 1
+        assert session.phases.lr_scale == 0.5
+        assert session.data.mixture_sampler.calls == [([5.0, 3.0], 1.0)]
+
 
 # ---------------------------------------------------------------------------
 # run_training wiring
