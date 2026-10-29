@@ -947,6 +947,18 @@ class TestNanSkippedStep:
         assert ckpt.saves == []
         assert handler.finished is False
 
+    def test_emergency_checkpoint_records_the_phase_the_skipped_step_entered(self):
+        ckpt = FakeCheckpointManager()
+        session = self._phase_session(
+            TrainingPhase(start_step=2, dataset_weights={"a": 5.0}),
+            checkpointer=ckpt,
+            shutdown_handler=FakeShutdownHandler(after_steps=2),
+            step_fn=_nan_on({1}),
+        )
+        step, tokens_seen = run_training_loop(session)
+        assert step == 2
+        assert ckpt.saves == [(2, tokens_seen, {"phase_idx": 1})]
+
 
 # ---------------------------------------------------------------------------
 # run_training wiring
@@ -2501,6 +2513,25 @@ class TestFreezeStageFence:
         session.step_fn = _nan_on({1}, vlm_step)
         run_training_loop(session)
         assert order == ["flush", "freeze"]
+
+    def test_emergency_checkpoint_on_that_step_is_written_after_the_flip(self, monkeypatch):
+        """Its saved freeze metadata then describes the model it was written from."""
+        from kempnerforge.training.freeze import freeze_meta_at_step
+
+        order: list = []
+        session = self._vlm_session(monkeypatch, start_step=2, order=order)
+        session.step_fn = _nan_on({1}, vlm_step)
+        session.shutdown_handler = FakeShutdownHandler(after_steps=2)
+        saved: list = []
+
+        def save(step: int, **kwargs: Any) -> None:
+            order.append("save")
+            saved.append((step, kwargs["extra"]))
+
+        monkeypatch.setattr(session.checkpointer, "save", save)
+        run_training_loop(session)
+        assert order == ["flush", "freeze", "save"]
+        assert saved == [(2, {"vlm_freeze": freeze_meta_at_step(2, session.config.vlm)})]
 
 
 # ---------------------------------------------------------------------------
