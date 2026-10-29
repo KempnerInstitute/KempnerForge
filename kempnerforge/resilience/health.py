@@ -42,7 +42,7 @@ class NaNDetector:
       - ``"skip"``: Skip the optimizer step (zero gradients).
       - ``"raise"``: Raise a ``RuntimeError``.
 
-    If consecutive NaN count exceeds ``max_consecutive``, the detector
+    Once the consecutive NaN count reaches ``max_consecutive``, the detector
     signals that a checkpoint rollback is recommended.
 
     Args:
