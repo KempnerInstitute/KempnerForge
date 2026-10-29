@@ -211,6 +211,18 @@ def _unused_load_path_message(config: JobConfig, resume_path: Path) -> str:
     )
 
 
+def _load_path_is_the_resume(config: JobConfig, resume_path: Path) -> bool:
+    """Whether ``checkpoint.load_path`` names the resumed checkpoint and excludes nothing.
+
+    The resume then loads what ``load_path`` asks for, so nothing in it goes unused. Both paths
+    are resolved, so a relative path or one through ``latest`` compares by its target.
+    """
+    ckpt = config.checkpoint
+    if not ckpt.load_path or ckpt.exclude_from_loading:
+        return False
+    return Path(ckpt.load_path).resolve() == resume_path.resolve()
+
+
 def restore_checkpoint(
     config: JobConfig,
     model: torch.nn.Module,
@@ -244,7 +256,12 @@ def restore_checkpoint(
     if not resume_path and not config.checkpoint.load_path:
         return 0, 0
     rank_zero = not dist.is_initialized() or dist.get_rank() == 0
-    if resume_path and config.checkpoint.load_path and rank_zero:
+    if (
+        resume_path
+        and config.checkpoint.load_path
+        and rank_zero
+        and not _load_path_is_the_resume(config, resume_path)
+    ):
         logger.warning(_unused_load_path_message(config, resume_path))
 
     vlm_cfg = config.vlm
