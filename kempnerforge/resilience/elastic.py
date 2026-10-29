@@ -121,8 +121,6 @@ def resolve_resume_path(checkpoint_dir: str) -> Path | None:
     Returns:
         Path to the latest usable checkpoint, or None if none found.
     """
-    from kempnerforge.checkpoint.manager import missing_train_state
-
     base = Path(checkpoint_dir)
     if not base.exists():
         return None
@@ -136,6 +134,8 @@ def resolve_resume_path(checkpoint_dir: str) -> Path | None:
             return resolved
 
     # Fall back to the newest step_N directory whose save completed.
+    from kempnerforge.checkpoint.manager import missing_train_state
+
     step_dirs = sorted(
         (
             d
