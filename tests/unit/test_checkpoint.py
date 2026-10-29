@@ -3030,6 +3030,66 @@ class TestResumeWithoutTrainState:
         assert self._fresh_start(imported) in records, records
 
 
+def _free_port() -> int:
+    """An unused local TCP port for a gloo rendezvous."""
+    import socket
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _load_with_a_stale_view(rank: int, world: int, port: int, ckpt_dir: str, stale: int) -> None:
+    """Save on every rank, then load while rank ``stale`` cannot see ``train_state.pt``."""
+    from datetime import timedelta
+    from unittest.mock import patch
+
+    import torch.distributed as dist
+
+    from kempnerforge.checkpoint.manager import CheckpointManager
+
+    dist.init_process_group(
+        "gloo",
+        rank=rank,
+        world_size=world,
+        init_method=f"tcp://127.0.0.1:{port}",
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        torch.manual_seed(0)
+        model = torch.nn.Linear(4, 4)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        model(torch.ones(2, 4)).sum().backward()
+        optimizer.step()
+        manager = CheckpointManager(CheckpointConfig(dir=ckpt_dir), model, optimizer)
+        manager.save(step=3, tokens_seen=30)
+        exists = Path.exists
+
+        def stale_exists(path: Path) -> bool:
+            return False if rank == stale and path.name == "train_state.pt" else exists(path)
+
+        with patch.object(Path, "exists", stale_exists):
+            if stale == 0:
+                refused = "holds optimizer state but no train_state.pt"
+                with pytest.raises(FileNotFoundError, match=refused):
+                    manager.load()
+            else:
+                assert manager.load() == (3, 30, {})
+    finally:
+        dist.destroy_process_group()
+
+
+class TestResumeWithoutTrainStateAcrossRanks:
+    """Every rank takes rank 0's view of ``train_state.pt``, so they refuse or load together."""
+
+    @pytest.mark.parametrize("stale", [0, 1], ids=["rank_0_sees_none", "rank_1_sees_none"])
+    def test_every_rank_follows_rank_zero(self, tmp_path, stale):
+        """No rank raises alone and leaves the others waiting in a collective."""
+        import torch.multiprocessing as mp
+
+        mp.spawn(_load_with_a_stale_view, args=(2, _free_port(), str(tmp_path), stale), nprocs=2)
+
+
 def _assert_same_state_dict(expected, actual, where="state_dict"):
     """Assert two optimizer ``state_dict()``s hold the same values, tensors bit for bit."""
     if isinstance(expected, torch.Tensor):
