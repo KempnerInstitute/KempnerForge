@@ -8,9 +8,11 @@ the optimizer's base LR by a schedule-dependent factor at each
 `scheduler.step()`.
 
 The training loop calls `scheduler.step()` once per step, a step skipped
-for a NaN / Inf loss included, so the schedule's step count always
-equals the loop's: warmup ends, decay starts and the decay completes on
-the configured steps however many steps were skipped. The Schedule-Free
+for a NaN / Inf loss included, so the schedule's step count keeps pace
+with the loop's: warmup ends, decay starts and the decay completes on
+the configured steps however many steps were skipped. A checkpoint
+whose scheduler had already fallen behind, saved by an earlier version
+that did not step it on skipped steps, keeps that lag after a resume. The Schedule-Free
 optimizer's own warmup (`optimizer.schedule_free_warmup_steps`) is
 different: it counts optimizer updates, so skipped steps delay it.
 
