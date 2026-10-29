@@ -1,8 +1,9 @@
-"""Data-parallel rank and size on real DeviceMeshes, and what reads them, on CPU over gloo.
+"""Data-parallel rank and size on real DeviceMeshes, on CPU over gloo.
 
-Each mesh has the dimension names and order ``init_distributed`` builds: ``pp``,
-``dp_replicate``, ``dp_shard``, ``ep``, ``tp``, with a size-1 ``dp_shard`` inserted
-when ``tp`` or ``ep`` is active.
+Also the data loaders and an HSDP training step that use them. Each mesh has the
+dimension names and order ``init_distributed`` builds: ``pp``, ``dp_replicate``,
+``dp_shard``, ``ep``, ``tp``, with a size-1 ``dp_shard`` inserted when ``tp`` or
+``ep`` is active.
 """
 
 from __future__ import annotations
@@ -13,14 +14,19 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+import torch.nn.functional as F
 from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.fsdp import MixedPrecisionPolicy
+from torch.distributed.tensor import DTensor, Replicate, Shard
 
 from kempnerforge.config.data import DataConfig
 from kempnerforge.config.eval import EvalConfig
 from kempnerforge.config.job import JobConfig
 from kempnerforge.config.model import ModelConfig
 from kempnerforge.config.training import TrainConfig
-from kempnerforge.distributed.utils import get_dp_info
+from kempnerforge.distributed.parallel import apply_fsdp2
+from kempnerforge.distributed.utils import clip_grad_norm_, get_dp_info
+from kempnerforge.model.transformer import Transformer
 from kempnerforge.training.data_pipeline import build_data_pipeline, build_eval_dataloader
 from kempnerforge.training.runtime import RuntimeContext
 
@@ -116,6 +122,50 @@ def _check_data_partition(rank: int, world: int, port: int, data_dir: str) -> No
         dist.destroy_process_group()
 
 
+def _loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    """Mean token cross-entropy, as the default training loss computes it."""
+    return F.cross_entropy(logits.flatten(0, 1).float(), labels.flatten())
+
+
+def _check_hsdp_step(rank: int, world: int, port: int) -> None:
+    """One FSDP2 step on a 2 x 2 HSDP mesh, each rank on its DP rank's rows, against one process.
+
+    The batch has two rows per rank, sized from the world rather than from
+    ``get_dp_info``, so a DP rank shared by two ranks repeats rows and drops others.
+    """
+    seq = 16
+    _init(rank, world, port)
+    try:
+        mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("dp_replicate", "dp_shard"))
+        config = ModelConfig(dim=64, n_layers=2, n_heads=4, vocab_size=128, max_seq_len=seq)
+        torch.manual_seed(0)
+        reference = Transformer(config)
+        model = Transformer(config)
+        model.load_state_dict(reference.state_dict())
+        fp32 = MixedPrecisionPolicy(param_dtype=torch.float32, reduce_dtype=torch.float32)
+        apply_fsdp2(model, mesh, mp_policy=fp32)
+
+        generator = torch.Generator().manual_seed(7)
+        tokens = torch.randint(0, config.vocab_size, (2 * world, seq), generator=generator)
+        labels = torch.randint(0, config.vocab_size, (2 * world, seq), generator=generator)
+        dp_rank, _ = get_dp_info(mesh)
+        rows = slice(2 * dp_rank, 2 * dp_rank + 2)
+        _loss(model(tokens[rows]), labels[rows]).backward()
+        norm = clip_grad_norm_(model, 0.05)
+
+        _loss(reference(tokens), labels).backward()
+        ref_norm = clip_grad_norm_(reference, 0.05)
+        norm = norm.full_tensor() if isinstance(norm, DTensor) else norm
+        torch.testing.assert_close(norm, ref_norm, rtol=1e-5, atol=0.0)
+        for name, p in model.named_parameters():
+            assert p.placements == (Replicate(), Shard(0)), name
+            torch.testing.assert_close(
+                p.grad.full_tensor(), reference.get_parameter(name).grad, rtol=1e-5, atol=1e-7
+            )
+    finally:
+        dist.destroy_process_group()
+
+
 class TestGetDpInfoOnRealMeshes:
     @pytest.mark.parametrize("layout", list(HSDP_LAYOUTS))
     def test_hsdp_meshes_give_one_dp_rank_per_data_shard(self, layout):
@@ -141,3 +191,13 @@ class TestDataPipelineOnHsdp:
         so a rank that shared another's part would repeat its samples.
         """
         mp.spawn(_check_data_partition, args=(4, _free_port(), mmap_data_dir), nprocs=4)
+
+
+class TestHsdpTrainingStep:
+    def test_step_matches_one_process_on_the_global_batch(self):
+        """FSDP2 on (dp_replicate, dp_shard) shards each parameter as (Replicate, Shard(0)).
+
+        Each rank trains on the rows its DP rank selects, and the clipped gradients,
+        averaged over all four ranks, equal one process's on every row.
+        """
+        mp.spawn(_check_hsdp_step, args=(4, _free_port()), nprocs=4)
