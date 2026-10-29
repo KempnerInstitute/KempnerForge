@@ -177,8 +177,9 @@ A rule-of-thumb: if you hit `should_rollback`, don't resume from the
 most recent checkpoint. It holds the weights from just before the NaN
 storm, so whatever state caused the explosion is baked in. That also
 holds for an emergency checkpoint a shutdown wrote during the storm:
-skipped steps leave the weights as they were (the sigmoid router's bias
-aside), so it carries the pre-storm weights under a later step.
+skipped steps leave the weights as they were (the sigmoid router's
+`expert_bias` aside), so it carries the pre-storm weights under a later
+step.
 
 ## Manual use
 
