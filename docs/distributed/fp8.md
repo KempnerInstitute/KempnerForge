@@ -31,18 +31,24 @@ So the converted set is:
 | Dense MLP `gate_proj`, `up_proj`, `down_proj` | yes | Standard `Linear` call path |
 | Final `output_head.proj` | yes | Standard `Linear` call path |
 | MoE `experts.*.{gate,up,down}_proj` | **no** | Bypass — uses `torch._grouped_mm` |
-| `shared_expert.*` | **no** | Same expert GEMM codepath |
+| `shared_expert.*` | **no** | By convention, to match the routed experts (a plain `Linear` call path) |
 | `router.gate` | **no** | Small output dim, not compute-bound |
 | `token_embedding` | no | Not a `Linear` — `nn.Embedding` |
 | Norms (RMSNorm) | no | Not a `Linear` |
 
 ## Exclusion rules
 
-**`"experts"` / `"shared_expert"` in fqn**: the MoE forward uses
+**`"experts"` in fqn**: the routed experts' forward uses
 `torch._grouped_mm` (grouped GEMM over stacked expert weights) when
 available. That call bypasses `Float8Linear.forward`, so wrapping
 the expert Linears does nothing useful and would surprise debugging.
 See [Expert parallelism § Local compute](expert-parallelism.md#dispatch--combine-flow).
+
+**`"shared_expert"` in fqn**: the shared expert never takes the
+grouped-GEMM path; `MoEMLP.forward` calls it as a plain module, so its
+projections are ordinary `Linear` calls. It is excluded by convention,
+to match the routed experts (see
+[MoE FP8 § Why the shared expert is excluded](../moe/moe-fp8.md#why-the-shared-expert-is-excluded)).
 
 **`"router"` in fqn**: the router gate's output dim is
 `num_experts`, typically 8-64. `torch._scaled_mm` (used inside
