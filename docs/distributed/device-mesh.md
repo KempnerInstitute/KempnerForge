@@ -109,7 +109,7 @@ mesh: ("pp", "dp_shard", "tp") — size (4, 2, 4)
 ```
 
 `pp` rank selects the stage, `tp` shards within the stage, `dp_shard`
-replicates the remaining across 2 ranks.
+shards the stage's parameters across 2 ranks.
 
 ### MoE on 32 GPUs, TP+EP+FSDP (`moe_ep_32gpu.toml`)
 
