@@ -35,7 +35,7 @@ either error or silently leave the tensor uninitialized (it warns).
 | Across save/load | Works | Caveat |
 |------------------|:-----:|--------|
 | `dp_shard` | yes | Any factor of the parameter shape |
-| `dp_replicate` | yes | Just adds replication on the load side |
+| `dp_replicate` | yes | With a `dp_shard` dimension it changes how many ranks hold each shard; without one, FSDP2 shards over it, so it reshards like `dp_shard` |
 | `tp` | yes | Heads must still divide evenly |
 | `ep` | yes | `num_experts` still must divide evenly |
 | World size | yes | Pure rebalance across fewer/more ranks |
