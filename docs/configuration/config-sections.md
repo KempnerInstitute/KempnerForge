@@ -87,7 +87,7 @@ Architecture hyperparameters and MoE knobs.
 | `moe_packed_experts` | `bool` | `False` | pack expert weights into one tensor per projection |
 
 Computed properties: `is_moe`, `head_dim`, `computed_ffn_hidden_dim`,
-`num_params_estimate`.
+`computed_expert_ffn_hidden_dim`, `num_params_estimate`.
 
 ## `[train]` — `TrainConfig`
 
