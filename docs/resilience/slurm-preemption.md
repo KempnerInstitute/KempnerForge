@@ -44,6 +44,15 @@ save as the emergency checkpoint instead of writing the step twice, and
 waits for it before `finish()`, so the forced-exit timer still bounds a
 stalled write.
 
+A step skipped for a NaN / Inf loss runs the same check, so a signal
+that arrives during a run of NaN steps is acted on at the next one
+rather than after the run. The schedule never saves a skipped step, so
+its shutdown writes the emergency checkpoint itself, and the checkpoint
+resumes on the same LR schedule and data position, with two exceptions
+listed in [NaN detection](nan-detection.md#what-a-skipped-step-still-does).
+The NaN that reaches `max_consecutive` is different: the loop stops on
+it before the check and saves nothing.
+
 ### Why cooperative, not `sys.exit`
 
 When the signal arrives, the handler does **not** call `sys.exit` or
@@ -61,10 +70,10 @@ process can inherit stale state (shared memory, port bindings) or hit a
 torch.distributed deadlock because peers think the group is still
 active.
 
-The training loop polls `should_shutdown()` after every step, at which
-point no collective is in flight. A checkpoint can be written safely,
-`ckpt_mgr.wait()` can flush the async writer, and the process group can
-be destroyed cleanly.
+The training loop polls `should_shutdown()` after every step, a
+NaN-skipped one included, at which point no collective is in flight.
+A checkpoint can be written safely, `ckpt_mgr.wait()` can flush the
+async writer, and the process group can be destroyed cleanly.
 
 ### Forced-exit timer
 
