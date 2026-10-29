@@ -856,6 +856,12 @@ class TestNanSkippedStep:
         assert step == 2
         assert session.scheduler.last_epoch == 2
 
+    def test_phase_lr_scale_applies_to_the_next_steps_lr(self):
+        config = make_config(max_steps=1)
+        session = make_session(config, phases=PhaseState(lr_scale=0.5), step_fn=_nan_on({0}))
+        run_training_loop(session)
+        assert session.optimizer.param_groups[0]["lr"] == pytest.approx(0.025)
+
 
 # ---------------------------------------------------------------------------
 # run_training wiring
