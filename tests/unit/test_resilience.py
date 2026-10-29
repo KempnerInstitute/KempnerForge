@@ -534,6 +534,21 @@ def _durable_step_dir(base, step: int, pp_stages: int = 0):
     return d
 
 
+def _saved_step_dir(base, step: int, *, optimizer: bool, train_state: bool, pp_stages: int = 0):
+    """Write a ``step_N`` with DCP, with or without optimizer state and ``train_state.pt``."""
+    import torch.distributed.checkpoint as dcp
+
+    d = base / f"step_{step}"
+    state = {"model": {"w": torch.zeros(2)}}
+    if optimizer:
+        state["optimizer"] = {"state": {"w": {"exp_avg": torch.zeros(2)}}}
+    for stage in [d / f"pp{k}" for k in range(pp_stages)] or [d]:
+        dcp.save(state, checkpoint_id=str(stage))
+    if train_state:
+        torch.save({"step": step, "tokens_seen": 0}, d / "train_state.pt")
+    return d
+
+
 class TestResumePathResolution:
     def test_no_checkpoint_dir(self, tmp_path):
         assert resolve_resume_path(str(tmp_path / "nonexistent")) is None
@@ -731,6 +746,50 @@ class TestResumePathResolution:
         result = resolve_resume_path(str(tmp_path))
         assert result is not None
         assert result.name == "step_10"
+
+    def test_skips_a_save_that_stopped_before_its_train_state(self, tmp_path, caplog, monkeypatch):
+        """DCP shards with optimizer state and no ``train_state.pt`` are a save cut short.
+
+        A synchronous save writes the shards, then ``train_state.pt``. Cut short in between,
+        the first save of a run leaves no ``latest``, and resuming the directory would continue
+        its weights and optimizer moments from step 0.
+        """
+        import logging
+
+        self._let_caplog_see_kempnerforge(monkeypatch)
+        _saved_step_dir(tmp_path, 10, optimizer=True, train_state=True)
+        stopped = _saved_step_dir(tmp_path, 20, optimizer=True, train_state=False)
+
+        with caplog.at_level(logging.WARNING):
+            result = resolve_resume_path(str(tmp_path))
+
+        assert result is not None
+        assert result.name == "step_10"
+        skipped = f"skipping {stopped}: it holds optimizer state but no train_state.pt"
+        assert any(skipped in r.getMessage() for r in caplog.records), caplog.text
+
+    def test_skips_a_pipeline_parallel_save_without_its_train_state(self, tmp_path):
+        """Every ``pp{k}`` stage holds optimizer state, and the shared train state is missing."""
+        _saved_step_dir(tmp_path, 10, optimizer=True, train_state=True, pp_stages=2)
+        _saved_step_dir(tmp_path, 20, optimizer=True, train_state=False, pp_stages=2)
+
+        result = resolve_resume_path(str(tmp_path))
+        assert result is not None
+        assert result.name == "step_10"
+
+    def test_none_when_every_save_lacks_its_train_state(self, tmp_path, caplog, monkeypatch):
+        """The first save of a run cut short: start from step 0, and say so at ERROR."""
+        import logging
+
+        self._let_caplog_see_kempnerforge(monkeypatch)
+        _saved_step_dir(tmp_path, 20, optimizer=True, train_state=False)
+
+        with caplog.at_level(logging.ERROR):
+            assert resolve_resume_path(str(tmp_path)) is None
+
+        errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+        assert errors, "no ERROR record for a resume that found no complete save"
+        assert "none holds a complete save; starting from step 0" in errors[0]
 
 
 # ---------------------------------------------------------------------------
