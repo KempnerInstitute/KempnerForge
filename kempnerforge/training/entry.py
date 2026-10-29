@@ -240,7 +240,8 @@ def restore_checkpoint(
 
     A checkpoint in ``checkpoint.dir`` takes precedence over ``checkpoint.load_path``, so a
     requeued warm start resumes rather than starting over; rank 0 then warns that
-    ``load_path`` is not used, naming both paths.
+    ``load_path`` is not used, naming both paths, unless ``load_path`` names the resumed
+    checkpoint and excludes nothing.
     """
     # Every rank must resume from the same checkpoint. resolve_resume_path
     # stats `.metadata` to test durability, and on NFS/Lustre independent
