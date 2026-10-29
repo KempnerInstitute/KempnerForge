@@ -726,10 +726,8 @@ def run_training_loop(
                 break
 
             # Clean-completion marker for the unconditional final save after the
-            # loop. Only reached when training completes without any errors, e.g.,
-            # no NaN/NCCL/shutdown breaks. If a run encounters a NaN, the last step
-            # is intentionally *not* saved because the actual model state would be
-            # `max_steps - 1`, not `max_steps`.
+            # loop. Only a finite step reaches it: a NaN/NCCL/shutdown break, or a
+            # last step skipped for a NaN, leaves the run without a final save.
             if step >= tc.max_steps:
                 completed_normally = True
 
