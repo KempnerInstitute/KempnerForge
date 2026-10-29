@@ -176,7 +176,8 @@ leave `save()` while the other ranks wait in its barrier.
   [Train state](train-state.md#when-train_statept-is-missing).
 - **`load_path` set and `dir` already has a checkpoint**: the
   checkpoint in `dir` is resumed, `load_path` is not used, and rank 0
-  warns, naming both paths.
+  warns, naming both paths, unless `load_path` names that checkpoint
+  and excludes nothing.
 - **Fresh checkpoint dir, `load_path` set** — `load_path` is used
   (the else branch). Training starts from the step in that
   checkpoint.

@@ -249,7 +249,7 @@ DCP-based checkpointing.
 | `dyn_ckpt_window` | `DynamicCheckpointWindow \| None` | `None` | optional dense save phase — see [`[checkpoint.dyn_ckpt_window]`](#checkpointdyn_ckpt_window--dynamiccheckpointwindow) |
 | `async_mode` | `"disabled" \| "async" \| "async_with_pinned_mem"` | `"disabled"` | DCP async-save mode |
 | `keep_last_n` | `int` | `3` | retain the most recent N checkpoints (`<= 0` keeps all); steps saved by `dyn_ckpt_window` are always kept |
-| `load_path` | `str \| None` | `None` | checkpoint to start from while `dir` holds none (a warm start); once `dir` has a checkpoint, auto-resume loads that instead and rank 0 warns that `load_path` is not used |
+| `load_path` | `str \| None` | `None` | checkpoint for training to start from while `dir` holds none (a warm start); once `dir` has a checkpoint, auto-resume loads that instead and rank 0 warns that `load_path` is not used, unless it names that checkpoint. `scripts/eval.py` and `scripts/generate.py` load `load_path` first |
 | `export_dtype` | `"float32" \| "bfloat16"` | `"bfloat16"` | dtype for HF exports via `scripts/convert_checkpoint.py` |
 | `exclude_from_loading` | `list[str]` | `[]` | state keys to skip when warm-starting from `load_path` — `"model"` and/or `"optimizer"`; ignored on a resume, which always restores full state |
 
