@@ -222,8 +222,9 @@ class ModelConfig:
         Rounded to a multiple of 16 for tensor-core alignment. With the default
         multiplier 1.0 this equals ``computed_ffn_hidden_dim`` (zero behavior
         change); set 0.5 for fine-grained experts so top-2 routing matches the
-        dense FFN's activated FLOPs (2 * F/2 = F). Applies to routed and shared
-        experts wherever they are built (build_moe and MoMa's ExpertChoiceMoE).
+        dense FFN's activated FLOPs (2 * F/2 = F). Routed experts are this wide
+        (build_moe and MoMa's ExpertChoiceMoE); build_moe's shared experts are one
+        MLP ``moe_shared_experts`` times this wide.
         """
         raw = int(self.computed_ffn_hidden_dim * self.moe_expert_ffn_multiplier)
         return max(16, 16 * round(raw / 16))
