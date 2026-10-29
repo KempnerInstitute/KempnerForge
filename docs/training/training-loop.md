@@ -78,7 +78,12 @@ if not nan_detector.check_loss(avg_loss, step):
     optimizer.zero_grad()
     if nan_detector.should_rollback:
         break
-    step += 1; continue
+    _advance_lr_schedule(session)
+    step += 1
+    _apply_step_transitions(session, step)
+    if _shutdown_if_requested(session, step, tokens_seen, saved_this_step=False):
+        break
+    continue
 ```
 
 `clip_grad_norm_` is the DTensor-aware wrapper from
@@ -91,6 +96,14 @@ the stages and every stage scales by the same coefficient (see
 and escalates to `should_rollback` after
 `nan_consecutive_max` bad steps (see
 [Resilience](../resilience/index.md)).
+
+A skipped step still counts as a step. It drops the optimizer update,
+the token count, metrics, hooks and every periodic tick below except the
+shutdown check, but the LR schedule advances, the freeze stages and data
+phases due at the new step are applied, and a pending shutdown writes
+the emergency checkpoint and stops the loop. The step that trips
+`should_rollback` stops before any of that. See
+[NaN detection § What a skipped step still does](../resilience/nan-detection.md#what-a-skipped-step-still-does).
 
 ## Optimizer and scheduler step
 
@@ -105,7 +118,9 @@ optimizer.zero_grad()
 Phase LR scaling runs *after* the scheduler — it multiplies the base
 LR that `scheduler.step()` just computed. This lets a curriculum phase
 (see [Data](../data/index.md)) halve the LR for a cooldown segment
-without rewriting the scheduler.
+without rewriting the scheduler. Both lines live in
+`_advance_lr_schedule`, which a NaN-skipped step also runs, so the
+schedule stays on the step counter.
 
 ## Phase transitions
 
@@ -158,6 +173,11 @@ After the step body, before advancing:
 | Profiler | every step | `prof.step()` advances the schedule |
 | Checkpoint | `checkpoint.should_save(step)`: `dyn_ckpt_window` milestones inside the window, every `checkpoint.interval` steps outside it | `ckpt_mgr.save(step)`, `on_checkpoint_save` hook |
 | Shutdown | SIGTERM / SIGUSR1 pending | `ckpt_mgr.save(step)`, or `ckpt_mgr.wait()` when the checkpoint tick just saved this step; then `finish()`, break |
+
+A step skipped for a NaN / Inf loss runs only the shutdown row, through
+the same `_shutdown_if_requested` helper. The checkpoint tick does not
+save a skipped step, so its shutdown always writes its own emergency
+checkpoint.
 
 `nccl_health_check_interval = 0` disables the all-reduce probe — it is
 off in every shipped config but worth enabling for long multi-node
