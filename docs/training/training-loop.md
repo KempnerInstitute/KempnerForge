@@ -92,10 +92,11 @@ see [Gradient utilities](gradient-utilities.md).
 Under PP, `pipeline_step` passes `pp_group=`, so the norm is summed over
 the stages and every stage scales by the same coefficient (see
 [Gradient utilities § Under pipeline parallelism](gradient-utilities.md#under-pipeline-parallelism)).
-`NaNDetector.check_loss` returns `False` on NaN / Inf, zeroes grads,
-and escalates to `should_rollback` after
-`nan_consecutive_max` bad steps (see
-[Resilience](../resilience/index.md)).
+`NaNDetector.check_loss` returns `False` on NaN / Inf, and the loop
+zeroes the grads. The detector escalates to `should_rollback` after
+`max_consecutive` bad steps in a row (`NaNDetector(max_consecutive=10)`
+in `kempnerforge/training/entry.py`; see
+[NaN detection](../resilience/nan-detection.md)).
 
 A skipped step still counts as a step. It drops the optimizer update,
 the token count, metrics, hooks and every periodic tick below except the
