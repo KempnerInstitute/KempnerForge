@@ -2920,6 +2920,54 @@ class TestSaveBeforeFirstStep:
             assert torch.equal(before, p), "the load did not restore the initial weights"
 
 
+class TestResumeWithoutTrainState:
+    """A checkpoint that holds optimizer state resumes only together with its ``train_state.pt``."""
+
+    @staticmethod
+    def _build(seed, ckpt_dir, load_path=None):
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        torch.manual_seed(seed)
+        model = torch.nn.Linear(4, 4)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        config = CheckpointConfig(dir=str(ckpt_dir), load_path=load_path)
+        return model, optimizer, CheckpointManager(config, model, optimizer)
+
+    def _saved_without_train_state(self, tmp_path):
+        """A step-500 checkpoint of a stepped run whose ``train_state.pt`` is gone."""
+        model, optimizer, manager = self._build(0, tmp_path / "run")
+        model(torch.ones(2, 4)).sum().backward()
+        optimizer.step()
+        manager.save(step=500, tokens_seen=1_000_000)
+        step_dir = tmp_path / "run" / "step_500"
+        (step_dir / "train_state.pt").unlink()
+        return model, step_dir
+
+    @pytest.mark.parametrize(
+        ("via", "exclude"),
+        [("latest", None), ("resolved_path", None), ("load_path", None), ("load_path", ["model"])],
+    )
+    def test_loading_its_optimizer_state_is_refused_before_anything_loads(
+        self, tmp_path, via, exclude
+    ):
+        """Auto-resume (``latest`` or the path it resolved) and ``load_path`` all refuse it."""
+        _, step_dir = self._saved_without_train_state(tmp_path)
+        if via == "load_path":
+            model, optimizer, manager = self._build(1, tmp_path / "fresh", str(step_dir))
+        else:
+            model, optimizer, manager = self._build(1, tmp_path / "run")
+        before = [p.detach().clone() for p in model.parameters()]
+
+        refused = f"Cannot resume {step_dir}: it holds optimizer state but no train_state.pt"
+        path = str(step_dir) if via == "resolved_path" else None
+        with pytest.raises(FileNotFoundError, match=re.escape(refused)):
+            manager.load(path=path, exclude_keys=exclude)
+
+        for want, got in zip(before, model.parameters(), strict=True):
+            assert torch.equal(want, got), "the refused load changed the weights"
+        assert not optimizer.state, "the refused load filled the optimizer"
+
+
 def _assert_same_state_dict(expected, actual, where="state_dict"):
     """Assert two optimizer ``state_dict()``s hold the same values, tensors bit for bit."""
     if isinstance(expected, torch.Tensor):
