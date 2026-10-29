@@ -83,9 +83,16 @@ The order the cross-section validator enforces (see
 4. **EP** — shard experts across ranks (MoE only).
 5. **FSDP (`dp_shard`)** — shard remaining params; the "fill the rest"
    dimension, usually `dp_shard=-1`.
-6. **DP replicate (`dp_replicate`)** — multiple full copies, typically
-   `1` until a recipe deliberately trades memory for smaller all-reduce
-   domains.
+6. **DP replicate (`dp_replicate`)** — with a `dp_shard` dimension,
+   multiple full copies, one per `dp_shard` group (HSDP: FSDP shards
+   within each group, gradients are all-reduced across groups, and
+   every rank in `dp_replicate × dp_shard` reads its own data). When
+   `dp_shard` resolves to 1 and neither TP nor EP is on, the mesh has
+   no `dp_shard` dimension and FSDP2 shards over `dp_replicate`
+   instead, like plain FSDP. Typically `1`, as in
+   every shipped config, until a recipe deliberately trades memory for
+   smaller all-reduce domains. See
+   [FSDP2 § HSDP](../distributed/fsdp2.md#hsdp).
 
 Rules of thumb from [the benchmarks](benchmarks.md):
 
