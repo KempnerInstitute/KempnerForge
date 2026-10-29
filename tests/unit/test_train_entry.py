@@ -1390,6 +1390,27 @@ class FakeResumeManager:
         return self._ret
 
 
+def _entry_warnings(call):
+    """Run ``call`` and return its result and the warnings the training entry logged."""
+    import logging
+
+    import kempnerforge.training.entry as entry
+
+    records: list[logging.LogRecord] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    handler = _Capture(level=logging.WARNING)
+    entry.logger.addHandler(handler)
+    try:
+        result = call()
+    finally:
+        entry.logger.removeHandler(handler)
+    return result, [r.getMessage() for r in records]
+
+
 def _vlm_config(**vlm_kw) -> JobConfig:
     from kempnerforge.config.adapter import AdapterConfig
     from kempnerforge.config.vision import VisionEncoderConfig
@@ -1605,6 +1626,95 @@ class TestRestoreCheckpoint:
         copied.clear()
         entry.restore_checkpoint(config, TinyTextModel(), None, FakeResumeManager(step=4))
         assert copied == []  # mid-flight resume already has MoT-shaped state
+
+    def test_a_resume_that_overrides_load_path_warns_naming_both(self, monkeypatch, tmp_path):
+        """A rollback through ``load_path`` into a ``dir`` that has checkpoints resumes instead."""
+        import kempnerforge.training.entry as entry
+
+        resume = tmp_path / "run" / "step_7"
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d: resume)
+        config = make_config()
+        config.checkpoint.dir = str(tmp_path / "run")
+        config.checkpoint.load_path = str(tmp_path / "run" / "step_3")
+        mgr = FakeResumeManager(step=7, tokens=70)
+
+        restored, warnings = _entry_warnings(
+            lambda: entry.restore_checkpoint(config, TinyTextModel(), None, mgr)
+        )
+
+        assert restored == (7, 70)
+        assert mgr.load_kwargs["path"] == str(resume)
+        assert len(warnings) == 1, warnings
+        for named in (
+            f"checkpoint.load_path={tmp_path / 'run' / 'step_3'} is not used",
+            f"checkpoint.dir={tmp_path / 'run'} already has a checkpoint",
+            f"resuming {resume} takes precedence",
+            "set checkpoint.dir to a new, empty directory",
+        ):
+            assert named in warnings[0], warnings[0]
+        assert "exclude_from_loading" not in warnings[0]
+
+    def test_the_warning_says_exclude_from_loading_is_not_applied(self, monkeypatch, tmp_path):
+        """A weights-only warm start that a resume overrides restores full state, and says so."""
+        import kempnerforge.training.entry as entry
+
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d: tmp_path / "step_7")
+        config = make_config()
+        config.checkpoint.load_path = "/somewhere/converted"
+        config.checkpoint.exclude_from_loading = ["optimizer"]
+        mgr = FakeResumeManager(step=7, tokens=70)
+
+        _, warnings = _entry_warnings(
+            lambda: entry.restore_checkpoint(config, TinyTextModel(), None, mgr)
+        )
+
+        assert mgr.load_kwargs["exclude_keys"] is None
+        assert len(warnings) == 1, warnings
+        dropped = "checkpoint.exclude_from_loading=['optimizer'] is not applied either"
+        assert dropped in warnings[0], warnings[0]
+
+    @pytest.mark.parametrize(
+        ("resume_found", "load_path"),
+        [(True, None), (False, "/somewhere/converted")],
+        ids=["resume_alone", "warm_start_alone"],
+    )
+    def test_no_warning_unless_a_resume_overrides_load_path(
+        self, monkeypatch, tmp_path, resume_found, load_path
+    ):
+        import kempnerforge.training.entry as entry
+
+        resume = tmp_path / "step_7" if resume_found else None
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d: resume)
+        config = make_config()
+        config.checkpoint.load_path = load_path
+
+        _, warnings = _entry_warnings(
+            lambda: entry.restore_checkpoint(config, TinyTextModel(), None, FakeResumeManager())
+        )
+
+        assert warnings == []
+
+    @pytest.mark.parametrize("rank", [0, 1])
+    def test_only_rank_zero_warns_that_load_path_is_not_used(self, monkeypatch, tmp_path, rank):
+        import kempnerforge.training.entry as entry
+
+        chosen = tmp_path / "step_7"
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d: chosen)
+        monkeypatch.setattr(entry.dist, "is_initialized", lambda: True)
+        monkeypatch.setattr(entry.dist, "get_rank", lambda: rank)
+        monkeypatch.setattr(
+            entry.dist,
+            "broadcast_object_list",
+            lambda lst, src=0: lst.__setitem__(0, str(chosen)),
+        )
+        config = make_config()
+        config.checkpoint.load_path = "/somewhere/step_3"
+
+        _, warnings = _entry_warnings(
+            lambda: entry.restore_checkpoint(config, TinyTextModel(), None, FakeResumeManager())
+        )
+
+        assert len(warnings) == (1 if rank == 0 else 0), warnings
 
 
 class TestRestoreFromSavedCheckpoints:
