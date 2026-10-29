@@ -89,9 +89,11 @@ Everything not caught by the three filter rules:
 | RMSNorm | no | not `Linear` |
 
 With `moe_frequency = 2` (alternating dense / MoE layers), the dense
-layers' MLPs get FP8 and the MoE layers' MLPs don't — which is fine,
-because the MoE layers' compute is dominated by grouped GEMM on the
-expert weights anyway.
+layers' MLPs get FP8 and the MoE layers' MLPs don't. That leaves both
+the routed experts' grouped GEMM and the shared expert in bf16: with
+`moe_shared_experts = N`, the shared expert does `N` expert-widths of
+work per token beside the `moe_top_k` routed ones, so at
+`N = moe_top_k` it is half of the MoE layers' MLP FLOPs.
 
 ## Memory and throughput
 
