@@ -8,6 +8,7 @@ phase — without editing the shared script.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import cast
 
@@ -215,12 +216,14 @@ def _load_path_is_the_resume(config: JobConfig, resume_path: Path) -> bool:
     """Whether ``checkpoint.load_path`` names the resumed checkpoint and excludes nothing.
 
     The resume then loads what ``load_path`` asks for, so nothing in it goes unused. Both paths
-    are resolved, so a relative path or one through ``latest`` compares by its target.
+    go through ``os.path.realpath``, so a relative path or one through ``latest`` compares by
+    its target. Unlike ``Path.resolve``, it does not raise on a symlink loop: only rank 0 runs
+    this, and a raise here would leave the other ranks waiting in the load's broadcast.
     """
     ckpt = config.checkpoint
     if not ckpt.load_path or ckpt.exclude_from_loading:
         return False
-    return Path(ckpt.load_path).resolve() == resume_path.resolve()
+    return os.path.realpath(ckpt.load_path) == os.path.realpath(resume_path)
 
 
 def restore_checkpoint(
