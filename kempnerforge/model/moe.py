@@ -406,6 +406,11 @@ def build_moe(
         bias_schedule: Bias update rate schedule (sigmoid router only).
         packed_experts: Pack expert weights into one tensor per projection.
     """
+    if shared_experts < 0:
+        raise ValueError(
+            f"shared_experts must be >= 0, got {shared_experts}. Pass the number of "
+            "shared experts every token goes through, or 0 for none."
+        )
     router_builder = registry.get("router", router_type)
     router_kwargs: dict[str, object] = {}
     if router_type == "sigmoid_topk":
