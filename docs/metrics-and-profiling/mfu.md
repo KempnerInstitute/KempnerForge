@@ -59,12 +59,16 @@ FLOPs. So `12*L*D*S` stays correct.
 
 ```python
 # kempnerforge/metrics/mfu.py — _moe_flops_per_token
+mlp_params        = 3 * dim * computed_ffn_hidden_dim
+expert_mlp_params = 3 * dim * computed_expert_ffn_hidden_dim
+
 n_moe_layers = sum(1 for i in range(n_layers) if (i + 1) % moe_frequency == 0)
 n_dense_layers = n_layers - n_moe_layers
 
 dense_active = n_dense_layers * (attn_params + mlp_params)
-shared_mlp   = moe_shared_experts * mlp_params
-moe_active   = n_moe_layers * (attn_params + moe_top_k * mlp_params + shared_mlp)
+routed_mlp   = moe_top_k * expert_mlp_params
+shared_mlp   = moe_shared_experts * expert_mlp_params
+moe_active   = n_moe_layers * (attn_params + routed_mlp + shared_mlp)
 
 active_params = dense_active + moe_active + output_params
 ```
@@ -72,13 +76,20 @@ active_params = dense_active + moe_active + output_params
 Key moves:
 
 - **Active, not total, params.** Only `top_k` experts run per token, so
-  the MoE MLP contribution is `top_k * mlp_params`, not
-  `num_experts * mlp_params`.
-- **Shared experts are always on.** `shared_mlp` is added unconditionally.
+  the routed contribution is `top_k * expert_mlp_params`, not
+  `num_experts * expert_mlp_params`.
+- **Experts at their own width.** Routed and shared experts are built
+  `computed_expert_ffn_hidden_dim` wide, which
+  `moe_expert_ffn_multiplier` sets apart from the dense FFN, so they
+  are counted with `expert_mlp_params`; dense layers keep `mlp_params`.
+- **Shared experts are always on.** `shared_mlp` is added unconditionally,
+  once per shared expert: the `moe_shared_experts` experts are one MLP
+  that many times the expert width (see
+  [Routers § Shared experts](../moe/routers.md#shared-experts)).
 - **MoE frequency.** `(i + 1) % moe_frequency == 0` matches whichever
   layers the config promotes to MoE; the rest stay dense.
 - **Router FLOPs ignored.** `dim × num_experts` is tiny compared to
-  `mlp_params`.
+  `expert_mlp_params`.
 
 The attention term (`12 * n_layers * dim * seq_len`) uses the full
 `n_layers` regardless of MoE vs dense — attention runs in every layer.
@@ -151,5 +162,6 @@ length, parallelism strategy):
 - [Metrics tracker](metrics-tracker.md) — where `compute_mfu` is called.
 - [Configuration § `[model]`](../configuration/config-sections.md) —
   `n_layers`, `dim`, `n_heads`, `n_kv_heads`, `computed_ffn_hidden_dim`,
-  `moe_frequency`, `moe_top_k`, `moe_shared_experts` all feed the formula.
+  `moe_frequency`, `moe_top_k`, `moe_shared_experts`,
+  `moe_expert_ffn_multiplier` all feed the formula.
 - [FP8](../distributed/fp8.md) — when to override `gpu_peak_tflops`.
