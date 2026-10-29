@@ -1399,6 +1399,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "datasets" },
+    { name = "pyyaml" },
     { name = "tensorboard" },
     { name = "tokenizers" },
     { name = "torch" },
@@ -1445,6 +1446,7 @@ video = [
 [package.metadata]
 requires-dist = [
     { name = "datasets" },
+    { name = "pyyaml" },
     { name = "tensorboard" },
     { name = "tokenizers" },
     { name = "torch", specifier = ">=2.6", index = "https://download.pytorch.org/whl/cu128" },

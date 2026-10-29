@@ -546,6 +546,34 @@ class TestDataConfig:
         with pytest.raises(ValueError, match="prefetch_factor must be >= 1"):
             DataConfig(prefetch_factor=0)
 
+    def test_token_dtype_defaults_to_empty(self):
+        assert DataConfig().token_dtype == ""
+
+    @pytest.mark.parametrize("dtype", ["uint16", "uint32"])
+    def test_token_dtype_accepts_uint16_and_uint32(self, dtype):
+        assert DataConfig(token_dtype=dtype).token_dtype == dtype
+
+    @pytest.mark.parametrize("dtype", ["int32", "uint8", "u2", "UINT16"])
+    def test_token_dtype_rejects_anything_else(self, dtype):
+        with pytest.raises(ValueError, match="data.token_dtype must be 'uint16' or 'uint32'"):
+            DataConfig(token_dtype=dtype)
+
+    def test_token_dtypes_load_from_toml_and_cli(self, tmp_path):
+        toml = tmp_path / "data.toml"
+        toml.write_text(
+            '[data]\ntoken_dtype = "uint16"\n\n'
+            '[[data.datasets]]\npath = "/d/a"\ntoken_dtype = "uint32"\n\n'
+            '[eval]\ntoken_dtype = "uint16"\n'
+        )
+        config = load_config(str(toml), cli_args=["--eval.token_dtype=uint32"])
+        assert config.data.token_dtype == "uint16"
+        assert config.data.datasets[0].token_dtype == "uint32"
+        assert config.eval.token_dtype == "uint32"
+
+    def test_invalid_token_dtype_override_fails_at_load(self):
+        with pytest.raises(ValueError, match="data.token_dtype must be 'uint16' or 'uint32'"):
+            load_config(cli_args=["--data.token_dtype=int32"])
+
 
 # ---------------------------------------------------------------------------
 # MetricsConfig
@@ -1525,6 +1553,13 @@ class TestEvalConfig:
     def test_rejects_zero_steps(self):
         with pytest.raises(ValueError, match="eval steps must be positive"):
             EvalConfig(steps=0)
+
+    def test_token_dtype_defaults_to_empty(self):
+        assert EvalConfig().token_dtype == ""
+
+    def test_token_dtype_rejects_anything_else(self):
+        with pytest.raises(ValueError, match="eval.token_dtype must be 'uint16' or 'uint32'"):
+            EvalConfig(token_dtype="int64")
 
     def test_validation_requires_data_source(self):
         config = JobConfig()

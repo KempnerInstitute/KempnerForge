@@ -31,6 +31,7 @@ Everything here is driven by `DataConfig` (`kempnerforge/config/data.py`):
 [data]
 dataset_path    = ""              # pre-tokenized shard directory
 file_pattern    = "*.npy"         # glob for shard files (also "*.bin")
+token_dtype     = ""              # .bin dtype, "uint16" / "uint32"; "" reads metadata.yaml
 tokenizer_path  = ""              # HF tokenizer name or local path
 num_workers     = 4
 pin_memory      = true

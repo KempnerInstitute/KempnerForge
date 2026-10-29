@@ -41,6 +41,23 @@ Each source can be either a mmap directory (`path`) or a HuggingFace
 dataset (`hf_name`). `DataConfig.__post_init__` rejects a
 `DatasetSource` that has neither.
 
+Every mmap source globs the same `data.file_pattern`, and each matched
+file is read by its own suffix, so one pattern can cover a `.bin` source
+and an `.npy` source. The `.bin` dtype is resolved per source: its own
+`token_dtype`, else `data.token_dtype`. Whichever applies must agree with
+the `metadata.yaml` in the source's directory, which decides when neither
+is set (see [Memory-mapped dataset](memory-mapped.md)). Set it on the
+source when sources differ, since `data.token_dtype` must agree with
+every source's `metadata.yaml`:
+
+```toml
+[[data.datasets]]
+path        = "/data/code_tokens"   # no metadata.yaml
+token_dtype = "uint16"
+weight      = 0.3
+name        = "code"
+```
+
 When `data.datasets` is non-empty, it overrides `data.dataset_path`
 and `data.hf_dataset_name` — the single-source paths are ignored.
 
@@ -50,7 +67,8 @@ In `training/data_pipeline.py`:
 
 1. Each `DatasetSource` builds a sub-dataset — `MemoryMappedDataset`
    or `HuggingFaceDataset` — with the global `tokenizer_path` and
-   `pack_sequences` setting.
+   `pack_sequences` setting, and its own `token_dtype` (or
+   `data.token_dtype`).
 2. `MixtureDataset(sub_datasets, names)` concatenates them:
 
    ```python

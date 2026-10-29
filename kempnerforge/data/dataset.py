@@ -19,9 +19,123 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import yaml
 from torch.utils.data import Dataset
 
+from kempnerforge.config.data import TOKEN_DTYPES, check_token_dtype
+
 logger = logging.getLogger(__name__)
+
+TOKEN_FILE_SUFFIXES = (".bin", ".npy")
+TOKEN_METADATA_FILE = "metadata.yaml"
+
+
+def recorded_token_dtype(directory: Path) -> str:
+    """Return the ``tokenized_info.dtype`` that ``directory/metadata.yaml`` records.
+
+    tatm writes this file next to the ``.bin`` shards it produces. Returns
+    ``""`` when nothing is recorded: the file is absent, or it has no
+    ``tokenized_info.dtype``. A file that cannot be read or parsed, or that
+    records a dtype other than ``uint16`` or ``uint32``, raises instead of
+    falling through, since the shards beside it would then be read with a
+    dtype that nothing declares.
+    """
+    path = directory / TOKEN_METADATA_FILE
+    if not path.exists():
+        return ""
+    try:
+        meta = yaml.safe_load(path.read_text())
+    except (OSError, UnicodeDecodeError, yaml.YAMLError) as e:
+        raise ValueError(
+            f"Cannot read the token dtype of the .bin shards in {directory}: {path} could not "
+            f"be read as YAML. Fix the file, or remove it if it does not describe these shards. "
+            f"({type(e).__name__}: {e})"
+        ) from e
+    info = meta.get("tokenized_info") if isinstance(meta, dict) else None
+    dtype = info.get("dtype") if isinstance(info, dict) else None
+    if dtype is None or dtype == "":
+        return ""
+    if dtype not in TOKEN_DTYPES:
+        raise ValueError(
+            f"{path} records tokenized_info.dtype {dtype!r}, but raw .bin token shards "
+            f"are read as 'uint16' or 'uint32'. Correct the file if the shards hold one of "
+            f"those, or rewrite them as uint16, uint32 or .npy."
+        )
+    return dtype
+
+
+def _declared_token_dtype(directory: Path, token_dtype: str) -> str:
+    """Return the dtype declared for the ``.bin`` shards in ``directory``, or ``""``.
+
+    ``token_dtype`` and the dtype that ``metadata.yaml`` records must agree when
+    both are set: one of them is wrong, and reading with the wrong one misreads
+    every token.
+    """
+    recorded = recorded_token_dtype(directory)
+    if token_dtype and recorded and token_dtype != recorded:
+        raise ValueError(
+            f"token_dtype is {token_dtype!r}, but {directory / TOKEN_METADATA_FILE} records "
+            f"tokenized_info.dtype {recorded!r} for the .bin shards beside it. One of the two "
+            f"is wrong; leave token_dtype empty to use the recorded dtype, or correct the file."
+        )
+    return token_dtype or recorded
+
+
+def _token_dtype_remedy(directory: Path) -> str:
+    """Return the two ways to declare the dtype of the ``.bin`` shards in ``directory``."""
+    return (
+        f"set token_dtype to 'uint16' or 'uint32' (data.token_dtype, a [[data.datasets]] "
+        f"entry's token_dtype, or eval.token_dtype in a config), or record it as "
+        f"tokenized_info.dtype in {directory / TOKEN_METADATA_FILE}"
+    )
+
+
+def _bin_shard_dtype(path: Path, declared: str) -> np.dtype:
+    """Return the dtype to read the raw ``.bin`` shard ``path`` with.
+
+    A shard whose size is not a whole number of tokens of its declared dtype
+    is rejected: it is truncated, or it was written with another dtype. With
+    no declared dtype the shard is read as uint32 if its size is a whole
+    number of uint32 tokens, as an intact uint32 shard always is. Any other
+    size fits a uint16 shard and a truncated uint32 shard alike, so it is
+    rejected rather than guessed.
+    """
+    size = path.stat().st_size
+    dtype = np.dtype(declared or "uint32")
+    if size % dtype.itemsize == 0:
+        return dtype
+    if declared:
+        raise ValueError(
+            f"{path} is {size:,} bytes, which is not a whole number of {declared} tokens "
+            f"({dtype.itemsize} bytes each), so the shard is truncated or was not written as "
+            f"{declared}. Replace the shard, or correct the dtype declared for it (token_dtype "
+            f"or {path.parent / TOKEN_METADATA_FILE})."
+        )
+    raise ValueError(
+        f"Cannot tell whether {path} holds uint16 or uint32 tokens: no dtype is declared for "
+        f"it, and its {size:,} bytes are not a whole number of uint32 tokens, so it is either "
+        f"uint16 data or a truncated uint32 shard. To read it, "
+        f"{_token_dtype_remedy(path.parent)}."
+    )
+
+
+def _bin_shard_dtypes(files: list[Path], token_dtype: str) -> dict[Path, np.dtype]:
+    """Resolve the dtype of every ``.bin`` file in ``files``, one directory at a time."""
+    declared: dict[Path, str] = {}
+    dtypes: dict[Path, np.dtype] = {}
+    for f in files:
+        if f.suffix != ".bin":
+            continue
+        if f.parent not in declared:
+            declared[f.parent] = _declared_token_dtype(f.parent, token_dtype)
+        dtypes[f] = _bin_shard_dtype(f, declared[f.parent])
+    for directory in sorted(d for d, dtype in declared.items() if not dtype):
+        logger.warning(
+            f"No token dtype is declared for the .bin shards in {directory}, so they are read "
+            f"as uint32. If they hold uint16 tokens, every token id is misread; to declare it, "
+            f"{_token_dtype_remedy(directory)}."
+        )
+    return dtypes
 
 
 def _compute_packed_output(tokens: np.ndarray, eos_token_id: int) -> dict[str, torch.Tensor]:
@@ -65,19 +179,31 @@ def _compute_packed_output(tokens: np.ndarray, eos_token_id: int) -> dict[str, t
 
 
 class MemoryMappedDataset(Dataset):
-    """Pre-tokenized dataset backed by memory-mapped numpy files.
+    """Pre-tokenized dataset backed by memory-mapped token files.
 
-    Expects .npy files containing 1D arrays of uint16/uint32 token IDs
-    that have been pre-packed into fixed-length sequences.
+    Expects 1D arrays of uint16/uint32 token IDs that have been pre-packed
+    into fixed-length sequences, as ``.npy`` files or raw ``.bin`` shards.
+    Each matched file is read by its own suffix, so a pattern may match
+    both formats; a matched file with any other suffix is rejected.
+
+    A ``.npy`` file carries its dtype in its header. A ``.bin`` file does not:
+    its dtype is ``token_dtype``, else the ``tokenized_info.dtype`` recorded in
+    the ``metadata.yaml`` in its directory (tatm writes one). The two must
+    agree when both are given, and a shard whose size is not a whole number
+    of tokens of that dtype is rejected. When neither declares a dtype, the
+    shards are read as uint32 with a warning, provided each is a whole number
+    of uint32 tokens; otherwise the dataset refuses to guess and raises.
 
     File layout: each file stores a flat array of tokens. The dataset
     splits them into non-overlapping chunks of ``seq_len`` tokens.
     Multiple files are concatenated logically.
 
     Args:
-        data_dir: Directory containing .npy token files.
+        data_dir: Directory containing .npy or .bin token files.
         seq_len: Sequence length (number of tokens per sample).
         file_pattern: Glob pattern for data files.
+        token_dtype: ``"uint16"`` or ``"uint32"`` for the ``.bin`` files, or
+            ``""`` to take it from their ``metadata.yaml`` as described above.
     """
 
     def __init__(
@@ -87,21 +213,29 @@ class MemoryMappedDataset(Dataset):
         file_pattern: str = "*.npy",
         pack_sequences: bool = False,
         eos_token_id: int | None = None,
+        token_dtype: str = "",
     ) -> None:
         self.seq_len = seq_len
         self._pack_sequences = pack_sequences
         self._eos_token_id = eos_token_id
         if pack_sequences and eos_token_id is None:
             raise ValueError("eos_token_id is required when pack_sequences=True")
+        check_token_dtype(token_dtype, "token_dtype")
 
         # Discover and sort data files for deterministic ordering
         data_path = Path(data_dir)
         self._files = sorted(data_path.glob(file_pattern))
         if not self._files:
             raise FileNotFoundError(f"No files matching {file_pattern!r} in {data_dir}")
-
-        # Detect file format from extension
-        self._is_bin = self._files[0].suffix == ".bin"
+        unsupported = [f for f in self._files if f.suffix not in TOKEN_FILE_SUFFIXES]
+        if unsupported:
+            raise ValueError(
+                f"file_pattern {file_pattern!r} matches {unsupported[0]}, which is neither "
+                f"a .bin nor a .npy token file ({len(unsupported)} such file(s) in "
+                f"{data_dir}). MemoryMappedDataset reads raw .bin token shards and .npy "
+                f"arrays only; narrow file_pattern so that it matches token files only."
+            )
+        bin_dtypes = _bin_shard_dtypes(self._files, token_dtype)
 
         # Memory-map all files and compute cumulative offsets
         self._mmaps: list[np.ndarray] = []
@@ -113,12 +247,9 @@ class MemoryMappedDataset(Dataset):
         # post-mortem debuggers all pin the partial `self` and its mmaps).
         try:
             for f in self._files:
-                if self._is_bin:
-                    # Raw binary: flat array of tokens. Infer dtype from file size
-                    # or use uint32 (most common for modern tokenizers with vocab > 65535)
-                    file_size = f.stat().st_size
-                    dtype = np.uint32 if file_size % 4 == 0 else np.uint16
-                    n_tokens = file_size // np.dtype(dtype).itemsize
+                if f.suffix == ".bin":
+                    dtype = bin_dtypes[f]
+                    n_tokens = f.stat().st_size // dtype.itemsize
                     mmap = np.memmap(str(f), dtype=dtype, mode="r", shape=(n_tokens,))
                 else:
                     mmap = np.load(str(f), mmap_mode="r")

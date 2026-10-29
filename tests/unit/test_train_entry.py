@@ -1089,6 +1089,101 @@ class TestBuildDataPipeline:
         assert data.mixture_weights == {"a": 1.0, "b": 3.0}
 
 
+class TestTokenDtypeReachesTheDatasets:
+    """``data.token_dtype``, a source's own ``token_dtype`` and ``eval.token_dtype``
+    decide how the raw ``.bin`` shards behind each dataset are read."""
+
+    SAMPLE = 17
+
+    def _shard(self, directory, dtype: str, start: int, *, metadata: bool = False):
+        """Write four samples of tokens as a raw .bin shard; return them sample by sample."""
+        import numpy as np
+
+        directory.mkdir()
+        tokens = np.arange(start, start + 4 * self.SAMPLE, dtype=dtype)
+        tokens.tofile(directory / "shard_000.bin")
+        if metadata:
+            (directory / "metadata.yaml").write_text(f"tokenized_info:\n  dtype: {dtype}\n")
+        return [tokens[i : i + self.SAMPLE].tolist() for i in range(0, tokens.size, self.SAMPLE)]
+
+    @staticmethod
+    def _tokens(sample) -> list[int]:
+        return torch.cat([sample["input_ids"], sample["labels"][-1:]]).tolist()
+
+    def test_data_token_dtype_reads_the_single_dataset(self, tmp_path):
+        expected = self._shard(tmp_path / "web", "uint16", 0)
+        config = make_config(seq_len=self.SAMPLE - 1)
+        config.data = DataConfig(
+            dataset_path=str(tmp_path / "web"),
+            file_pattern="*.bin",
+            token_dtype="uint16",
+            num_workers=0,
+        )
+        data = build_data_pipeline(config, _runtime())
+        assert data.dataloader is not None
+        dataset = data.dataloader.dataset
+        assert [self._tokens(dataset[i]) for i in range(len(dataset))] == expected
+
+    def test_each_mixture_source_resolves_its_own_dtype(self, tmp_path):
+        """One source records its dtype, one sets it, one inherits data.token_dtype."""
+        from kempnerforge.config.data import DatasetSource
+
+        recorded = self._shard(tmp_path / "web", "uint16", 0, metadata=True)
+        own = self._shard(tmp_path / "code", "uint32", 70_000)
+        inherited = self._shard(tmp_path / "books", "uint16", 500)
+        config = make_config(seq_len=self.SAMPLE - 1)
+        config.data = DataConfig(
+            datasets=[
+                DatasetSource(name="web", path=str(tmp_path / "web")),
+                DatasetSource(name="code", path=str(tmp_path / "code"), token_dtype="uint32"),
+                DatasetSource(name="books", path=str(tmp_path / "books")),
+            ],
+            file_pattern="*.bin",
+            token_dtype="uint16",
+            num_workers=0,
+        )
+        data = build_data_pipeline(config, _runtime())
+        mixture = data.mixture_dataset
+        assert mixture is not None
+        bounds = mixture.cumulative_sizes
+        got = {
+            name: [self._tokens(mixture[i]) for i in range(bounds[k], bounds[k + 1])]
+            for k, name in enumerate(mixture.dataset_names)
+        }
+        assert got == {"web": recorded, "code": own, "books": inherited}
+
+    def test_data_token_dtype_must_agree_with_a_source_metadata(self, tmp_path):
+        from kempnerforge.config.data import DatasetSource
+
+        self._shard(tmp_path / "web", "uint16", 0, metadata=True)
+        config = make_config(seq_len=self.SAMPLE - 1)
+        config.data = DataConfig(
+            datasets=[DatasetSource(name="web", path=str(tmp_path / "web"))],
+            file_pattern="*.bin",
+            token_dtype="uint32",
+            num_workers=0,
+        )
+        with pytest.raises(ValueError, match="records tokenized_info.dtype 'uint16'"):
+            build_data_pipeline(config, _runtime())
+
+    def test_eval_token_dtype_reads_the_eval_dataset(self, tmp_path):
+        from kempnerforge.config.eval import EvalConfig
+        from kempnerforge.training.data_pipeline import build_eval_dataloader
+
+        expected = self._shard(tmp_path / "heldout", "uint16", 300)
+        config = make_config(seq_len=self.SAMPLE - 1)
+        config.eval = EvalConfig(
+            enabled=True,
+            dataset_path=str(tmp_path / "heldout"),
+            file_pattern="*.bin",
+            token_dtype="uint16",
+        )
+        loader = build_eval_dataloader(config, _runtime())
+        assert loader is not None
+        dataset = loader.dataset
+        assert [self._tokens(dataset[i]) for i in range(len(dataset))] == expected
+
+
 class TestBuildEvalDataloader:
     def test_disabled_by_default(self):
         from kempnerforge.training.data_pipeline import build_eval_dataloader

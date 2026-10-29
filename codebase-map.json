@@ -1416,7 +1416,7 @@
     },
     "scripts/prepare_data.py": {
       "purpose": "Validate pre-tokenized datasets (.bin/.npy) for MemoryMappedDataset",
-      "entry": "validate(data_path)"
+      "entry": "validate(data_path, token_dtype)"
     },
     "scripts/eval_harness.py": {
       "purpose": "Run lm-eval-harness benchmarks on KempnerForge checkpoints (converts DCP to HF format)",
