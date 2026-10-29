@@ -15,6 +15,8 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from kempnerforge.checkpoint.manager import missing_train_state
+
 logger = logging.getLogger(__name__)
 
 # DCP writes this file last, once every shard is durable, so its presence is
@@ -102,14 +104,18 @@ def resolve_resume_path(checkpoint_dir: str) -> Path | None:
 
     Checks:
       1. ``{checkpoint_dir}/latest`` symlink
-      2. Most recent ``step_N`` directory *whose DCP shards are durable*
+      2. Most recent ``step_N`` directory *whose save completed*
 
-    ``CheckpointManager`` only ever points ``latest`` at a durable checkpoint,
-    so (1) needs no further test. The ``step_N`` fallback has no such guarantee:
+    ``CheckpointManager`` only ever points ``latest`` at a complete checkpoint,
+    so (1) needs no further test; one that lost files since is returned as is,
+    and the load reports it. The ``step_N`` fallback has no such guarantee:
     an interrupted save leaves a directory that exists but holds no ``.metadata``,
-    and resuming into it fails in ``dcp.load`` with "metadata is None". Skipping
-    incomplete directories turns an unrecoverable run into one that resumes from
-    the last durable checkpoint, whatever left the partial directory behind.
+    and resuming into it fails in ``dcp.load`` with "metadata is None". A save
+    that stopped after its DCP shards and before ``train_state.pt`` leaves
+    optimizer state without the step, LR schedule and data position that go with
+    it, which ``CheckpointManager.load`` refuses. Skipping both kinds turns an
+    unrecoverable run into one that resumes from the last complete checkpoint,
+    whatever left the partial directory behind.
 
     Args:
         checkpoint_dir: Base checkpoint directory.
@@ -142,8 +148,15 @@ def resolve_resume_path(checkpoint_dir: str) -> Path | None:
 
     for path in step_dirs:
         if _dcp_durable(path):
-            logger.info(f"Auto-resume: found checkpoint at {path}")
-            return path
+            if not missing_train_state(path):
+                logger.info(f"Auto-resume: found checkpoint at {path}")
+                return path
+            logger.warning(
+                f"Auto-resume: skipping {path}: it holds optimizer state but no "
+                f"train_state.pt, so the save that produced it did not complete or the "
+                f"file was lost"
+            )
+            continue
         logger.warning(
             f"Auto-resume: skipping {path} — no DCP .metadata, so the save that "
             f"produced it did not complete"
@@ -156,7 +169,7 @@ def resolve_resume_path(checkpoint_dir: str) -> Path | None:
         # least loud, so say so at a level nobody filters out.
         logger.error(
             f"Auto-resume: {len(step_dirs)} checkpoint directories under "
-            f"{base} and none has durable DCP state; starting from step 0. "
+            f"{base} and none holds a complete save; starting from step 0. "
             f"Every saved step would have to be re-trained."
         )
     return None

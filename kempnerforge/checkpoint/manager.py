@@ -199,6 +199,42 @@ def _holds_optimizer(saved_keys: Iterable[str]) -> bool:
     return any(key == "optimizer" or key.startswith(_OPTIM_PREFIX) for key in saved_keys)
 
 
+def missing_train_state(ckpt_dir: Path) -> bool:
+    """Whether checkpoint ``ckpt_dir`` holds optimizer state but no ``train_state.pt``.
+
+    ``save()`` writes ``train_state.pt`` right after the DCP shards, so such a checkpoint is a
+    save that stopped between the two, or one that lost the file, and ``load()`` refuses to
+    resume it. A checkpoint without optimizer state, such as an ``hf-to-dcp`` import, needs no
+    ``train_state.pt``. The DCP ``.metadata`` of ``ckpt_dir``, or of each ``pp{k}`` stage, is
+    read only when the file is absent. One that cannot be read is logged and counted as holding
+    no optimizer state, which leaves the load to report it.
+    """
+    if (ckpt_dir / _TRAIN_STATE_FILE).exists():
+        return False
+    if (ckpt_dir / _DCP_METADATA_FILE).exists():
+        dcp_dirs = [ckpt_dir]
+    elif ckpt_dir.is_dir():
+        dcp_dirs = sorted(
+            d
+            for d in ckpt_dir.iterdir()
+            if d.is_dir() and d.name.startswith("pp") and (d / _DCP_METADATA_FILE).exists()
+        )
+    else:
+        return False
+    for dcp_dir in dcp_dirs:
+        try:
+            saved_keys = dcp.FileSystemReader(str(dcp_dir)).read_metadata().state_dict_metadata
+        except Exception as e:
+            logger.warning(
+                f"Could not read {dcp_dir / _DCP_METADATA_FILE} to tell whether it holds "
+                f"optimizer state: {e}"
+            )
+            continue
+        if _holds_optimizer(saved_keys):
+            return True
+    return False
+
+
 def _reset_to_fresh(optimizer: torch.optim.Optimizer) -> None:
     """Return ``optimizer`` to its freshly built state, keeping its param groups."""
     optimizer.load_state_dict({"state": {}, "param_groups": optimizer.state_dict()["param_groups"]})
