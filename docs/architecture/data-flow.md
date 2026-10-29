@@ -189,9 +189,11 @@ optimizer.zero_grad()
 `clip_grad_norm_` wraps PyTorch's utility so it works with FSDP2 sharded
 parameters. Under pipeline parallelism `pipeline_step` also passes the PP
 group, so the norm covers every stage rather than this rank's own. The NaN
-detector returns `False` on NaN/Inf loss, zeroes
-the grads, and (after `max_consecutive`) signals a rollback to the
-previous checkpoint.
+detector returns `False` on NaN/Inf loss, and the loop zeroes the grads.
+After `max_consecutive` NaN steps in a row the detector sets
+`should_rollback` and the loop stops; rolling back to an earlier
+checkpoint is manual (see
+[NaN detection](../resilience/nan-detection.md#rollback-recommendation)).
 
 A skipped step still counts as a step (section 8): it advances the LR
 schedule, applies the freeze stages and the phases (section 9) due at
