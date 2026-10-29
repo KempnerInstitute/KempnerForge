@@ -532,6 +532,10 @@ class TestSharedExperts:
         model = Transformer(config)
         assert sum(p.numel() for p in model.parameters()) == config.num_params_estimate
 
+    def test_build_moe_rejects_negative_shared_experts(self):
+        with pytest.raises(ValueError, match="shared_experts must be >= 0, got -1"):
+            build_moe(dim=64, hidden_dim=32, num_experts=4, top_k=2, shared_experts=-1)
+
 
 class TestEPConfig:
     """Expert parallelism config validation (no GPU needed)."""
