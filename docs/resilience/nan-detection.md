@@ -116,19 +116,21 @@ if nan_detector.should_rollback:
 
 Rolling back is manual: resubmit with a new, empty `checkpoint.dir` and
 `checkpoint.load_path` pointing at an earlier `step_N` directory; with
-`exclude_from_loading` empty this restores its full state, including the
-scheduler's base LR, so a lower `optimizer.lr` in the resubmitted config
-does not take effect; schedule settings such as `scheduler.warmup_steps`
-do, from the restored step on. Keep the old
+`exclude_from_loading` empty this restores its full state. Its
+`train_state.pt` restores the scheduler's base LR whatever
+`exclude_from_loading` says, so a lower `optimizer.lr` in the resubmitted
+config does not take effect; schedule settings such as
+`scheduler.warmup_steps` do, from the restored step on. Keep the old
 `checkpoint.dir` and the run does not roll back: a checkpoint there takes
 precedence over `load_path`, so it resumes from the newest one, and rank 0
 warns that `load_path` is not used. The reason it's not automatic is that
 the *source* of the NaN determines what's safe:
 
-- **LR spike** — lower the LR or lengthen the warmup, and restart from an
-  earlier checkpoint. Only the warmup change reaches a rollback through
-  `load_path`: the restore brings back the saved base LR, so a lower
-  `optimizer.lr` does not take effect.
+- **LR spike** — lower the LR and restart from an earlier checkpoint. A
+  rollback through `load_path` brings back the saved base LR, so a lower
+  `optimizer.lr` does not take effect there; a new
+  `scheduler.warmup_steps` does, but lowers the LR only if it extends
+  past the restored step.
 - **Bad data** — skip the offending shard, restart from the same
   checkpoint.
 - **FP8 overflow** — reduce `distributed.fp8_interval` or disable FP8
