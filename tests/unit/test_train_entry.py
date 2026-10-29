@@ -1800,6 +1800,24 @@ class TestRestoreFromSavedCheckpoints:
         assert self._same(initial, model), "the refused load changed the weights"
         assert not optimizer.state, "the refused load filled the optimizer"
 
+    def test_load_path_into_a_dir_with_a_checkpoint_resumes_it_and_warns(self, tmp_path):
+        """The newest checkpoint in ``dir`` wins over ``load_path``, and the log names both."""
+        from kempnerforge.training.entry import restore_checkpoint
+
+        newest = self._saved(tmp_path / "run", seed=0, step=111)
+        requested = self._saved(tmp_path / "other", seed=2, step=999)
+        load_path = str(tmp_path / "other" / "step_999")
+        config, model, _, mgr = self._run(tmp_path / "run", seed=1, load_path=load_path)
+
+        restored, warnings = _entry_warnings(lambda: restore_checkpoint(config, model, None, mgr))
+
+        assert restored == (111, 1110)
+        assert self._same(newest, model), "the run did not resume its own newest checkpoint"
+        assert not self._same(requested, model), "fixture: the two checkpoints should differ"
+        assert len(warnings) == 1, warnings
+        assert f"checkpoint.load_path={load_path} is not used" in warnings[0], warnings[0]
+        assert f"resuming {tmp_path / 'run' / 'step_111'}" in warnings[0], warnings[0]
+
 
 # ---------------------------------------------------------------------------
 # Data-pipeline source builders, driven under fakes
