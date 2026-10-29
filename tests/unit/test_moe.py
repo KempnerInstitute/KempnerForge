@@ -478,6 +478,20 @@ class TestSharedExperts:
         # Sigmoid router → aux_loss is 0
         assert model.get_moe_aux_loss().item() == 0.0
 
+    @pytest.mark.parametrize("n", [2, 3])
+    def test_n_shared_experts_build_one_mlp_n_times_as_wide(self, n):
+        """N shared experts are one MLP N times the expert width, under the singular key."""
+        moe = build_moe(dim=64, hidden_dim=32, num_experts=4, top_k=2, shared_experts=n)
+        assert isinstance(moe.shared_expert, SwiGLUMLP)
+        assert moe.shared_expert.gate_proj.weight.shape == (n * 32, 64)
+        assert moe.shared_expert.up_proj.weight.shape == (n * 32, 64)
+        assert moe.shared_expert.down_proj.weight.shape == (64, n * 32)
+        assert sorted(k for k in moe.state_dict() if k.startswith("shared_expert.")) == [
+            "shared_expert.down_proj.weight",
+            "shared_expert.gate_proj.weight",
+            "shared_expert.up_proj.weight",
+        ]
+
 
 class TestEPConfig:
     """Expert parallelism config validation (no GPU needed)."""
