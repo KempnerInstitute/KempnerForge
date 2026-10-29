@@ -115,12 +115,12 @@ def _check_data_partition(rank: int, world: int, port: int, data_dir: str) -> No
         )
         data = build_data_pipeline(config, runtime)
         eval_loader = build_eval_dataloader(config, runtime)
-        assert (data.dp_rank, data.dp_size) == (rank, world)
         mine = [list(data.dataloader.sampler), list(eval_loader.sampler)]
         everyone: list = [None] * world
-        dist.all_gather_object(everyone, mine)
+        dist.all_gather_object(everyone, ((data.dp_rank, data.dp_size), mine))
+        assert [info for info, _ in everyone] == [(r, world) for r in range(world)]
         for loader, samples in enumerate(mine):
-            seen = [i for theirs in everyone for i in theirs[loader]]
+            seen = [i for _, theirs in everyone for i in theirs[loader]]
             assert len(samples) > 0
             assert len(seen) == len(set(seen)) == world * len(samples)
     finally:
@@ -161,11 +161,13 @@ def _check_hsdp_step(rank: int, world: int, port: int) -> None:
         _loss(reference(tokens), labels).backward()
         ref_norm = clip_grad_norm_(reference, 0.05)
         norm = norm.full_tensor() if isinstance(norm, DTensor) else norm
+        placements = {name: p.placements for name, p in model.named_parameters()}
+        grads = {name: p.grad.full_tensor() for name, p in model.named_parameters()}
         torch.testing.assert_close(norm, ref_norm, rtol=1e-5, atol=0.0)
-        for name, p in model.named_parameters():
-            assert p.placements == (Replicate(), Shard(0)), name
+        for name, grad in grads.items():
+            assert placements[name] == (Replicate(), Shard(0)), name
             torch.testing.assert_close(
-                p.grad.full_tensor(), reference.get_parameter(name).grad, rtol=1e-5, atol=1e-7
+                grad, reference.get_parameter(name).grad, rtol=1e-5, atol=1e-7
             )
     finally:
         dist.destroy_process_group()
