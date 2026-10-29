@@ -92,7 +92,9 @@ def estimate_model_flops_per_token(config: ModelConfig, seq_len: int | None = No
 
     Uses the PaLM paper approximation: ``6*P + 12*L*D*S``
 
-    For MoE: uses active params (top_k experts per layer, not all experts).
+    For MoE: uses active params, ``moe_top_k`` routed plus ``moe_shared_experts``
+    shared experts per MoE layer (not all experts), each at the expert FFN width
+    ``computed_expert_ffn_hidden_dim``; dense layers keep the dense FFN width.
     Excludes embedding (table lookup, not matmul). Includes output projection.
     The 12*L*D*S attention term does not discount GQA — FlashAttention expands
     GQA internally, so the hardware performs full attention compute.
@@ -136,13 +138,15 @@ def _moe_flops_per_token(config: ModelConfig, seq_len: int) -> int:
         + attn_dim * config.dim
     )
     mlp_params = 3 * config.dim * config.computed_ffn_hidden_dim
+    expert_mlp_params = 3 * config.dim * config.computed_expert_ffn_hidden_dim
 
     n_moe_layers = sum(1 for i in range(config.n_layers) if (i + 1) % config.moe_frequency == 0)
     n_dense_layers = config.n_layers - n_moe_layers
 
     dense_active = n_dense_layers * (attn_params + mlp_params)
-    shared_mlp = config.moe_shared_experts * mlp_params
-    moe_active = n_moe_layers * (attn_params + config.moe_top_k * mlp_params + shared_mlp)
+    routed_mlp = config.moe_top_k * expert_mlp_params
+    shared_mlp = config.moe_shared_experts * expert_mlp_params
+    moe_active = n_moe_layers * (attn_params + routed_mlp + shared_mlp)
 
     output_params = config.vocab_size * config.dim
     active_params = dense_active + moe_active + output_params
