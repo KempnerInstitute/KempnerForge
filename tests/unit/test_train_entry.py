@@ -887,6 +887,48 @@ class TestNanSkippedStep:
         assert session.phases.lr_scale == 0.5
         assert session.data.mixture_sampler.calls == [([5.0, 3.0], 1.0)]
 
+    def test_shutdown_is_acted_on_at_the_skipped_step(self):
+        """A pending shutdown is acted on at the first NaN step, not after the NaN run."""
+        config = make_config(max_steps=10)
+        ckpt = FakeCheckpointManager()
+        handler = FakeShutdownHandler(after_steps=1)
+        session = make_session(
+            config,
+            loss_fn=lambda logits, labels: logits.sum() * float("nan"),
+            nan_detector=NaNDetector(action="warn", max_consecutive=3),
+            checkpointer=ckpt,
+            shutdown_handler=handler,
+        )
+        step, _ = run_training_loop(session)
+        assert step == 1
+        assert handler.checks == 1
+        assert ckpt.saved_steps == [1]
+        assert handler.finished is True
+        assert ckpt.waits == 1
+
+    def test_shutdown_on_a_skipped_scheduled_step_saves_it_once(self, monkeypatch):
+        """The schedule skips a NaN step's save, so the emergency save is its only one."""
+        config = make_config(max_steps=10)
+        config.checkpoint.interval = 2
+        ckpt = FakeCheckpointManager()
+        handler = FakeShutdownHandler(after_steps=2)
+        session = make_session(
+            config, checkpointer=ckpt, shutdown_handler=handler, step_fn=_nan_on({1})
+        )
+        epochs: list[int] = []
+        real_save = ckpt.save
+
+        def save(step: int, **kwargs: Any) -> None:
+            epochs.append(kwargs["scheduler"].last_epoch)
+            real_save(step, **kwargs)
+
+        monkeypatch.setattr(ckpt, "save", save)
+        step, tokens_seen = run_training_loop(session)
+        assert step == 2
+        assert ckpt.saves == [(2, tokens_seen, {})]
+        assert epochs == [2]
+        assert handler.finished is True
+
 
 # ---------------------------------------------------------------------------
 # run_training wiring
