@@ -396,7 +396,10 @@ def build_moe(
         top_k: Experts selected per token.
         activation: MLP activation (registry key).
         router_type: Router registry key.
-        shared_experts: Number of shared experts (always active).
+        shared_experts: Number of shared experts (always active). They are built
+            as one MLP ``shared_experts * hidden_dim`` wide, which computes the sum
+            of that many ``hidden_dim``-wide experts (the DeepSeek-V2/V3 layout),
+            so the state-dict keys stay ``shared_expert.*`` for any count.
         capacity_factor: Token capacity per expert (0=unlimited, >0=cap).
         gradient_scale: Per-expert gradient normalization.
         sequence_aux_loss_weight: Sequence-level balance loss weight (sigmoid router only).
@@ -416,7 +419,7 @@ def build_moe(
 
     shared_expert = None
     if shared_experts > 0:
-        shared_expert = build_mlp(dim, hidden_dim, activation)
+        shared_expert = build_mlp(dim, hidden_dim * shared_experts, activation)
 
     return MoEMLP(
         router,
