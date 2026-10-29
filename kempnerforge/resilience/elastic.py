@@ -135,7 +135,7 @@ def resolve_resume_path(checkpoint_dir: str) -> Path | None:
             logger.info(f"Auto-resume: found latest checkpoint at {resolved}")
             return resolved
 
-    # Fall back to the newest durable step_N directory, newest first.
+    # Fall back to the newest step_N directory whose save completed.
     step_dirs = sorted(
         (
             d
