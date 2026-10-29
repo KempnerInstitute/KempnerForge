@@ -1740,6 +1740,25 @@ class TestRestoreCheckpoint:
 
         assert warnings == []
 
+    def test_no_warning_when_a_relative_resume_path_is_load_path(self, monkeypatch, tmp_path):
+        """A relative ``checkpoint.dir`` gives a relative resume path, compared by its target."""
+        from pathlib import Path
+
+        import kempnerforge.training.entry as entry
+
+        (tmp_path / "run" / "step_7").mkdir(parents=True)
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d: Path("run") / "step_7")
+        config = make_config()
+        config.checkpoint.dir = "run"
+        config.checkpoint.load_path = str(tmp_path / "run" / "step_7")
+
+        _, warnings = _entry_warnings(
+            lambda: entry.restore_checkpoint(config, TinyTextModel(), None, FakeResumeManager())
+        )
+
+        assert warnings == []
+
     def test_the_resumed_checkpoint_with_exclusions_still_warns(self, monkeypatch, tmp_path):
         """The resume restores full state, so the exclusions ``load_path`` asked for are dropped."""
         import kempnerforge.training.entry as entry
