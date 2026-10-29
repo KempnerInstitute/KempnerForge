@@ -7,6 +7,13 @@ Six schedulers are registered in
 the optimizer's base LR by a schedule-dependent factor at each
 `scheduler.step()`.
 
+The training loop calls `scheduler.step()` once per step, a step skipped
+for a NaN / Inf loss included, so the schedule's step count always
+equals the loop's: warmup ends, decay starts and the decay completes on
+the configured steps however many steps were skipped. The Schedule-Free
+optimizer's own warmup (`optimizer.schedule_free_warmup_steps`) is
+different: it counts optimizer updates, so skipped steps delay it.
+
 ## Shared warmup
 
 Every schedule (except `"none"`) warms up linearly from
