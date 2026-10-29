@@ -149,7 +149,10 @@ Under [Muon](../training/optimizers.md#muon) the fused MLP is one
 matrix per projection, so it is orthogonalized as a whole rather than
 as `N` expert matrices, and once its aspect ratio passes 10 Muon hands
 it to its AdamW fallback. On `configs/model/moe_small.toml` that
-happens from `N = 3`, where each projection is 21504 × 2048.
+happens from `N = 3`, where each projection is 21504 × 2048. Below
+that, the default `muon_adjust_lr = "original"` scales an update by
+`sqrt(max(1, rows / cols))`, so the fused `gate_proj` and `up_proj`
+take updates up to `sqrt(N)` times one expert's.
 
 DeepSeek's original motivation: the shared expert absorbs the
 "universal" capacity so routed experts can specialize. In practice,
