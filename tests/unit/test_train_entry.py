@@ -1781,6 +1781,24 @@ class TestRestoreCheckpoint:
 
         assert len(warnings) == 1, warnings
 
+    def test_a_looping_load_path_still_resumes_and_warns(self, monkeypatch, tmp_path):
+        """Comparing the paths must not raise: only rank 0 does it, and the others would hang."""
+        import kempnerforge.training.entry as entry
+
+        (tmp_path / "a").symlink_to(tmp_path / "b")
+        (tmp_path / "b").symlink_to(tmp_path / "a")
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d: tmp_path / "step_7")
+        config = make_config()
+        config.checkpoint.load_path = str(tmp_path / "a")
+        mgr = FakeResumeManager(step=7, tokens=70)
+
+        restored, warnings = _entry_warnings(
+            lambda: entry.restore_checkpoint(config, TinyTextModel(), None, mgr)
+        )
+
+        assert restored == (7, 70)
+        assert len(warnings) == 1, warnings
+
     def test_the_warning_is_logged_even_when_the_load_then_fails(self, monkeypatch, tmp_path):
         """It comes before the load, so a run that stops on a bad resume still says why."""
         import kempnerforge.training.entry as entry
