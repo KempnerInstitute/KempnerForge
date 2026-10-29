@@ -27,7 +27,8 @@ a `dp_shard` dimension, that is the 2D mesh
 `mesh["dp_replicate", "dp_shard"]`, and `fully_shard` runs hybrid
 sharding (HSDP):
 
-- Each parameter is a DTensor placed `(Replicate(), Shard(0))`: sharded
+- Without TP or EP, each parameter is a DTensor placed
+  `(Replicate(), Shard(0))`: sharded
   across the ranks of a `dp_shard` group, which together hold one full
   copy of the model, and replicated across the `dp_shard` groups, so the
   ranks of a `dp_replicate` group hold the same shard. On a 2 × 4 mesh,
@@ -48,6 +49,9 @@ sharding (HSDP):
 `ep > 1`, so `dp_replicate > 1` with TP or EP takes this path too, with
 one-rank `dp_shard` groups: the ranks of a `dp_replicate` group hold the
 same parameters, and their gradients are all-reduced over that group.
+A parameter TP has sharded keeps its `tp` placement as a third entry,
+for example `(Replicate(), Shard(0), Shard(1))`, so each rank holds its
+TP slice rather than a full copy.
 With `pp > 1`, a mesh with HSDP still fails at startup, in
 `build_checkpoint_manager`. No shipped config sets `dp_replicate > 1`.
 

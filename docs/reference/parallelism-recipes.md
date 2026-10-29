@@ -84,9 +84,10 @@ The order the cross-section validator enforces (see
 5. **FSDP (`dp_shard`)** — shard remaining params; the "fill the rest"
    dimension, usually `dp_shard=-1`.
 6. **DP replicate (`dp_replicate`)** — with a `dp_shard` dimension,
-   multiple full copies, one per `dp_shard` group (HSDP: FSDP shards
-   within each group, gradients are all-reduced across groups, and
-   every rank in `dp_replicate × dp_shard` reads its own data). When
+   multiple copies, one per `dp_shard` group: a full copy of the model
+   without TP or EP, or a TP slice of it with TP. This is HSDP: FSDP
+   shards within each group, gradients are all-reduced across groups,
+   and every rank in `dp_replicate × dp_shard` reads its own data. When
    `dp_shard` resolves to 1 and neither TP nor EP is on, the mesh has
    no `dp_shard` dimension and FSDP2 shards over `dp_replicate`
    instead, like plain FSDP. Typically `1`, as in
