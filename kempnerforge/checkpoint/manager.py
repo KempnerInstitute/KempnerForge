@@ -949,6 +949,10 @@ class CheckpointManager:
             logger.info(f"Resumed from step {step}, {tokens_seen:,} tokens seen")
         else:
             step, tokens_seen, extra = 0, 0, {}
+            logger.info(
+                f"{ckpt_dir} has no {_TRAIN_STATE_FILE}; the step counter, token count, LR "
+                f"schedule, data position and RNG state start fresh at step 0"
+            )
 
         if fresh_optimizer and step > 0:
             logger.warning(
