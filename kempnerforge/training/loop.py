@@ -588,6 +588,7 @@ def run_training_loop(
                     break
                 _advance_lr_schedule(session)
                 step += 1
+                _apply_freeze_stages(session, step)
                 continue
 
             # Optimizer step
