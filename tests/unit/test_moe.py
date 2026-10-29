@@ -492,6 +492,33 @@ class TestSharedExperts:
             "shared_expert.up_proj.weight",
         ]
 
+    @pytest.mark.parametrize("activation", ["silu", "gelu"])
+    def test_n_shared_experts_add_the_sum_of_n_experts(self, activation):
+        """The fused shared expert adds what N separate experts add together."""
+        n, dim, hidden = 3, 64, 32
+        torch.manual_seed(0)
+        moe = build_moe(
+            dim=dim,
+            hidden_dim=hidden,
+            num_experts=4,
+            top_k=2,
+            activation=activation,
+            shared_experts=n,
+        )
+        experts = [build_mlp(dim, hidden, activation) for _ in range(n)]
+        fused = {
+            name: torch.cat(
+                [e.state_dict()[name] for e in experts], dim=1 if name.startswith("down") else 0
+            )
+            for name in experts[0].state_dict()
+        }
+        moe.shared_expert.load_state_dict(fused)
+        routed_only = MoEMLP(moe.router, moe.experts)
+        x = torch.randn(2, 8, dim)
+        with torch.no_grad():
+            expected = routed_only(x) + sum(e(x) for e in experts)
+            torch.testing.assert_close(moe(x), expected)
+
 
 class TestEPConfig:
     """Expert parallelism config validation (no GPU needed)."""
