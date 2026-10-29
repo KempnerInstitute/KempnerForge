@@ -20,6 +20,37 @@ Two levels:
 Both wraps share the same `MixedPrecisionPolicy` and
 `reshard_after_forward` setting.
 
+## HSDP
+
+Both wraps use `get_dp_mesh(device_mesh)`. With `dp_replicate > 1` and
+a `dp_shard` dimension, that is the 2D mesh
+`mesh["dp_replicate", "dp_shard"]`, and `fully_shard` runs hybrid
+sharding (HSDP):
+
+- Each parameter is a DTensor placed `(Replicate(), Shard(0))`: sharded
+  across the ranks of a `dp_shard` group, which together hold one full
+  copy of the model, and replicated across the `dp_shard` groups, so the
+  ranks of a `dp_replicate` group hold the same shard. On a 2 × 4 mesh,
+  ranks 0 to 3 hold one copy and ranks 4 to 7 another, and ranks 0 and
+  4 hold the same shard.
+- In backward, gradients are reduce-scattered within each `dp_shard`
+  group, then all-reduced within each `dp_replicate` group, between the
+  ranks that hold the same shard, and averaged over all
+  `dp_replicate × dp_shard` ranks.
+- Each of those ranks reads its own data: `get_dp_info` gives
+  `dp_size = dp_replicate × dp_shard` (see
+  [Device mesh § Extracting sub-meshes](device-mesh.md#extracting-sub-meshes)).
+- DCP writes each shard once, not once per group, and an HSDP
+  checkpoint loads under a different `dp_replicate` and `dp_shard` split
+  (see [Resharding](../checkpointing/resharding.md)).
+
+`init_distributed` keeps a size-1 `dp_shard` whenever `tp > 1` or
+`ep > 1`, so `dp_replicate > 1` with TP or EP takes this path too, with
+one-rank `dp_shard` groups: the ranks of a `dp_replicate` group hold the
+same parameters, and their gradients are all-reduced over that group.
+With `pp > 1`, a mesh with HSDP still fails at startup, in
+`build_checkpoint_manager`. No shipped config sets `dp_replicate > 1`.
+
 ## Mixed precision policy
 
 ```python
