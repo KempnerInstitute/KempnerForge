@@ -202,8 +202,9 @@ def _holds_optimizer(saved_keys: Iterable[str]) -> bool:
 def missing_train_state(ckpt_dir: Path) -> bool:
     """Whether checkpoint ``ckpt_dir`` holds optimizer state but no ``train_state.pt``.
 
-    ``save()`` writes ``train_state.pt`` right after the DCP shards, so such a checkpoint is a
-    save that stopped between the two, or one that lost the file, and ``load()`` refuses to
+    ``save()`` writes ``train_state.pt`` with the DCP shards (after them in a synchronous save,
+    while an async save's shards still flush), so such a checkpoint is a save that stopped
+    before both were written, or one that lost the file, and ``load()`` refuses to
     resume it. A checkpoint without optimizer state, such as an ``hf-to-dcp`` import, needs no
     ``train_state.pt``. The DCP ``.metadata`` of ``ckpt_dir``, or of each ``pp{k}`` stage, is
     read only when the file is absent. One that cannot be read is logged and counted as holding
