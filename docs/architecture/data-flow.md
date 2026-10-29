@@ -62,10 +62,10 @@ initializes the collaborators:
   — owns DCP async save/load, latest-symlink, step_N directories.
 - **`resolve_resume_path(config.checkpoint.dir)`** from
   [`kempnerforge.resilience.elastic`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/resilience/elastic.py)
-  — follows the `latest` symlink or picks the highest `step_N`. If
-  non-`None`, `ckpt_mgr.load(resume_path)` restores model, optimizer,
-  scheduler, dataloader position, and RNG state before the loop
-  starts.
+  — follows the `latest` symlink or picks the newest `step_N` whose
+  save completed. If non-`None`, `ckpt_mgr.load(resume_path)` restores
+  model, optimizer, scheduler, dataloader position, and RNG state
+  before the loop starts.
 - **`MetricsTracker`** from
   [`kempnerforge.metrics.tracker`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/metrics/tracker.py)
   — per-step metrics + EMA smoothing + WandB / TensorBoard backends.
