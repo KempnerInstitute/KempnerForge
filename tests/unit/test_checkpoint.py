@@ -2943,6 +2943,37 @@ class TestResumeWithoutTrainState:
         (step_dir / "train_state.pt").unlink()
         return model, step_dir
 
+    @staticmethod
+    def _logged(call):
+        """Run ``call`` and return its result and the manager's records as (level, message)."""
+        import logging
+
+        records: list[logging.LogRecord] = []
+
+        class _Capture(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                records.append(record)
+
+        target = logging.getLogger("kempnerforge.checkpoint.manager")
+        handler, prior_level = _Capture(level=logging.INFO), target.level
+        target.addHandler(handler)
+        target.setLevel(logging.INFO)
+        try:
+            result = call()
+        finally:
+            target.removeHandler(handler)
+            target.setLevel(prior_level)
+        return result, [(r.levelname, r.getMessage()) for r in records]
+
+    @staticmethod
+    def _fresh_start(ckpt_dir):
+        """The record of a load that found no ``train_state.pt`` in ``ckpt_dir``."""
+        return (
+            "INFO",
+            f"{ckpt_dir} has no train_state.pt; the step counter, token count, LR schedule, "
+            f"data position and RNG state start fresh at step 0",
+        )
+
     @pytest.mark.parametrize(
         ("via", "exclude"),
         [("latest", None), ("resolved_path", None), ("load_path", None), ("load_path", ["model"])],
@@ -2966,6 +2997,37 @@ class TestResumeWithoutTrainState:
         for want, got in zip(before, model.parameters(), strict=True):
             assert torch.equal(want, got), "the refused load changed the weights"
         assert not optimizer.state, "the refused load filled the optimizer"
+
+    def test_its_weights_alone_load_at_step_zero_and_say_what_starts_fresh(self, tmp_path):
+        """Excluding the optimizer loads the weights, as a warm start from them does."""
+        source, step_dir = self._saved_without_train_state(tmp_path)
+        model, optimizer, manager = self._build(1, tmp_path / "fresh", str(step_dir))
+
+        loaded, records = self._logged(lambda: manager.load(exclude_keys=["optimizer"]))
+
+        assert loaded == (0, 0, {})
+        for want, got in zip(source.parameters(), model.parameters(), strict=True):
+            assert torch.equal(want, got), "the weights were not loaded"
+        assert not optimizer.state, "the optimizer should start fresh"
+        assert self._fresh_start(step_dir) in records, records
+
+    def test_a_checkpoint_without_an_optimizer_says_what_starts_fresh(self, tmp_path):
+        """A weights-only checkpoint, like an ``hf-to-dcp`` import, loads at step 0 and says so."""
+        from torch.distributed.checkpoint.state_dict import get_model_state_dict
+
+        source, _, _ = self._build(0, tmp_path / "unused")
+        imported = tmp_path / "pretrained"
+        dcp.save({"model": get_model_state_dict(source)}, checkpoint_id=str(imported))
+        model, optimizer, manager = self._build(1, tmp_path / "fresh", str(imported))
+
+        loaded, records = self._logged(manager.load)
+
+        assert loaded == (0, 0, {})
+        for want, got in zip(source.parameters(), model.parameters(), strict=True):
+            assert torch.equal(want, got), "the weights were not loaded"
+        assert not optimizer.state, "the optimizer should start fresh"
+        assert [message for level, message in records if level != "INFO"] == []
+        assert self._fresh_start(imported) in records, records
 
 
 def _assert_same_state_dict(expected, actual, where="state_dict"):
