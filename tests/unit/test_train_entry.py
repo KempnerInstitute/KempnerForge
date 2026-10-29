@@ -932,6 +932,29 @@ class TestNanSkippedStep:
         assert session.phases.lr_scale == 0.5
         assert session.data.mixture_sampler.calls == [([5.0, 3.0], 1.0)]
 
+    def test_a_phase_reached_by_a_skipped_step_scales_the_lr_from_the_same_update(self):
+        """The phase's ``lr_scale`` first applies to step 3's update, as in an all-finite run."""
+
+        def lr_at_each_step(nan_steps: set[int]) -> list[float]:
+            lrs: list[float] = []
+            body = _nan_on(nan_steps)
+
+            def step_fn(session: TrainingSession, step: int):
+                lrs.append(session.optimizer.param_groups[0]["lr"])
+                return body(session, step)
+
+            session = self._phase_session(
+                TrainingPhase(start_step=2, dataset_weights={"a": 5.0}, lr_scale=0.5),
+                step_fn=step_fn,
+            )
+            session.config.train.max_steps = 4
+            run_training_loop(session)
+            return lrs
+
+        finite = lr_at_each_step(set())
+        assert finite == pytest.approx([0.05, 0.05, 0.05, 0.025])
+        assert lr_at_each_step({1}) == finite
+
     def test_shutdown_is_acted_on_at_the_skipped_step(self):
         """A pending shutdown is acted on at the first NaN step, not after the NaN run."""
         config = make_config(max_steps=10)
