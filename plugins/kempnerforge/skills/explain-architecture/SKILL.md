@@ -68,7 +68,7 @@ Walk the user through the path a single forward+backward pass takes. Use the out
 - `kempnerforge/checkpoint/manager.py::CheckpointManager` orchestrates save and load. Uses `torch.distributed.checkpoint` (DCP), which automatically handles FSDP sharded state and reshards on load.
 - `checkpoint/state.py` defines what goes in the state dict: model, optimizer, scheduler, dataloader position, RNG state.
 - `checkpoint/async_save.py` wraps `dcp.async_save` so training continues while writes are in flight.
-- Resume follows the `latest` symlink in `checkpoint.dir`, falling back to the highest `step_N` directory.
+- Resume follows the `latest` symlink in `checkpoint.dir`, falling back to the newest `step_N` directory whose save completed.
 
 ### 8. Metrics and resilience
 - `kempnerforge/metrics/tracker.py::MetricsTracker` collects per-step scalars with optional EMA smoothing, then dispatches to enabled backends (wandb, tensorboard).
