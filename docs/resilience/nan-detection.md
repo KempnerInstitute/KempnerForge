@@ -114,12 +114,23 @@ if nan_detector.should_rollback:
     break
 ```
 
-Rolling back is manual: resubmit with `checkpoint.load_path` pointing at
-an earlier `step_N` directory. The reason it's not automatic is that
+Rolling back is manual: resubmit with a new, empty `checkpoint.dir` and
+`checkpoint.load_path` pointing at an earlier `step_N` directory; with
+`exclude_from_loading` empty this restores its full state. Its
+`train_state.pt` restores the scheduler's base LR whatever
+`exclude_from_loading` says, so a lower `optimizer.lr` in the resubmitted
+config does not take effect; schedule settings such as
+`scheduler.warmup_steps` do, from the restored step on. Keep the old
+`checkpoint.dir` and the run does not roll back: a checkpoint there takes
+precedence over `load_path`, so it resumes from the newest one, and rank 0
+warns that `load_path` is not used. The reason it's not automatic is that
 the *source* of the NaN determines what's safe:
 
-- **LR spike** — reduce `optimizer.lr` or `scheduler.warmup_steps`,
-  restart from an earlier checkpoint.
+- **LR spike** — lower the LR and restart from an earlier checkpoint. A
+  rollback through `load_path` brings back the saved base LR, so a lower
+  `optimizer.lr` does not take effect there; a new
+  `scheduler.warmup_steps` does, but lowers the LR only if it extends
+  past the restored step.
 - **Bad data** — skip the offending shard, restart from the same
   checkpoint.
 - **FP8 overflow** — reduce `distributed.fp8_interval` or disable FP8
@@ -168,5 +179,5 @@ The `action="raise"` mode raises `RuntimeError` instead of returning
   steps.
 - [GPU health](gpu-health.md) — coarser health check; run it at
   startup and after any NCCL failure.
-- [Checkpointing § Auto-resume](../checkpointing/auto-resume.md) —
-  where to point `checkpoint.load_path` when rolling back.
+- [Checkpointing § Auto-resume](../checkpointing/auto-resume.md#loading-a-specific-step) —
+  how to roll back to an earlier checkpoint.

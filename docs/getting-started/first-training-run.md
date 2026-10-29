@@ -76,12 +76,18 @@ uv run python scripts/train.py configs/train/debug.toml \
 needed — auto-resume is the default when `checkpoint.dir` contains a valid
 checkpoint.
 
-To explicitly point at a different checkpoint:
+To start a new run from a different checkpoint, give it its own
+checkpoint directory:
 
 ```bash
 uv run python scripts/train.py configs/train/debug.toml \
+  --checkpoint.dir=/tmp/kf_from_step_50 \
   --checkpoint.load_path=/tmp/kf_first_run/step_50
 ```
+
+`load_path` is used only while `checkpoint.dir` holds no checkpoint. With
+`--checkpoint.dir=/tmp/kf_first_run` the run would resume from `latest`
+instead, and warn that `load_path` is not used.
 
 ## Change something and re-run
 

@@ -1390,6 +1390,27 @@ class FakeResumeManager:
         return self._ret
 
 
+def _entry_warnings(call):
+    """Run ``call`` and return its result and the warnings the training entry logged."""
+    import logging
+
+    import kempnerforge.training.entry as entry
+
+    records: list[logging.LogRecord] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    handler = _Capture(level=logging.WARNING)
+    entry.logger.addHandler(handler)
+    try:
+        result = call()
+    finally:
+        entry.logger.removeHandler(handler)
+    return result, [r.getMessage() for r in records]
+
+
 def _vlm_config(**vlm_kw) -> JobConfig:
     from kempnerforge.config.adapter import AdapterConfig
     from kempnerforge.config.vision import VisionEncoderConfig
@@ -1605,6 +1626,319 @@ class TestRestoreCheckpoint:
         copied.clear()
         entry.restore_checkpoint(config, TinyTextModel(), None, FakeResumeManager(step=4))
         assert copied == []  # mid-flight resume already has MoT-shaped state
+
+    def test_a_resume_that_overrides_load_path_warns_naming_both(self, monkeypatch, tmp_path):
+        """A rollback through ``load_path`` into a ``dir`` that has checkpoints resumes instead."""
+        import kempnerforge.training.entry as entry
+
+        resume = tmp_path / "run" / "step_7"
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d: resume)
+        config = make_config()
+        config.checkpoint.dir = str(tmp_path / "run")
+        config.checkpoint.load_path = str(tmp_path / "run" / "step_3")
+        mgr = FakeResumeManager(step=7, tokens=70)
+
+        restored, warnings = _entry_warnings(
+            lambda: entry.restore_checkpoint(config, TinyTextModel(), None, mgr)
+        )
+
+        assert restored == (7, 70)
+        assert mgr.load_kwargs["path"] == str(resume)
+        assert len(warnings) == 1, warnings
+        for named in (
+            f"checkpoint.load_path={tmp_path / 'run' / 'step_3'} is not used",
+            f"checkpoint.dir={tmp_path / 'run'} already has a checkpoint",
+            f"resuming {resume} takes precedence",
+            "set checkpoint.dir to a new, empty directory",
+        ):
+            assert named in warnings[0], warnings[0]
+        assert "exclude_from_loading" not in warnings[0]
+
+    def test_the_warning_says_exclude_from_loading_is_not_applied(self, monkeypatch, tmp_path):
+        """A weights-only warm start that a resume overrides restores full state, and says so."""
+        import kempnerforge.training.entry as entry
+
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d: tmp_path / "step_7")
+        config = make_config()
+        config.checkpoint.load_path = "/somewhere/converted"
+        config.checkpoint.exclude_from_loading = ["optimizer"]
+        mgr = FakeResumeManager(step=7, tokens=70)
+
+        _, warnings = _entry_warnings(
+            lambda: entry.restore_checkpoint(config, TinyTextModel(), None, mgr)
+        )
+
+        assert mgr.load_kwargs["exclude_keys"] is None
+        assert len(warnings) == 1, warnings
+        dropped = "checkpoint.exclude_from_loading=['optimizer'] is not applied either"
+        assert dropped in warnings[0], warnings[0]
+
+    @pytest.mark.parametrize(
+        ("resume_found", "load_path"),
+        [(True, None), (False, "/somewhere/converted")],
+        ids=["resume_alone", "warm_start_alone"],
+    )
+    def test_no_warning_unless_a_resume_overrides_load_path(
+        self, monkeypatch, tmp_path, resume_found, load_path
+    ):
+        import kempnerforge.training.entry as entry
+
+        resume = tmp_path / "step_7" if resume_found else None
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d: resume)
+        config = make_config()
+        config.checkpoint.load_path = load_path
+
+        _, warnings = _entry_warnings(
+            lambda: entry.restore_checkpoint(config, TinyTextModel(), None, FakeResumeManager())
+        )
+
+        assert warnings == []
+
+    @pytest.mark.parametrize("rank", [0, 1])
+    def test_only_rank_zero_warns_that_load_path_is_not_used(self, monkeypatch, tmp_path, rank):
+        import kempnerforge.training.entry as entry
+
+        chosen = tmp_path / "step_7"
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d: chosen)
+        monkeypatch.setattr(entry.dist, "is_initialized", lambda: True)
+        monkeypatch.setattr(entry.dist, "get_rank", lambda: rank)
+        monkeypatch.setattr(
+            entry.dist,
+            "broadcast_object_list",
+            lambda lst, src=0: lst.__setitem__(0, str(chosen)),
+        )
+        config = make_config()
+        config.checkpoint.load_path = "/somewhere/step_3"
+
+        _, warnings = _entry_warnings(
+            lambda: entry.restore_checkpoint(config, TinyTextModel(), None, FakeResumeManager())
+        )
+
+        assert len(warnings) == (1 if rank == 0 else 0), warnings
+
+    @pytest.mark.parametrize("form", ["absolute", "relative", "latest"])
+    def test_no_warning_when_load_path_is_the_resumed_checkpoint(self, monkeypatch, tmp_path, form):
+        """``load_path`` naming the checkpoint the resume picks asks for what happens anyway."""
+        import kempnerforge.training.entry as entry
+
+        resume = tmp_path / "run" / "step_7"
+        resume.mkdir(parents=True)
+        (tmp_path / "run" / "latest").symlink_to(resume)
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d: resume)
+        config = make_config()
+        config.checkpoint.dir = str(tmp_path / "run")
+        config.checkpoint.load_path = {
+            "absolute": str(resume),
+            "relative": "run/step_7",
+            "latest": str(tmp_path / "run" / "latest"),
+        }[form]
+
+        _, warnings = _entry_warnings(
+            lambda: entry.restore_checkpoint(config, TinyTextModel(), None, FakeResumeManager())
+        )
+
+        assert warnings == []
+
+    def test_no_warning_when_a_relative_resume_path_is_load_path(self, monkeypatch, tmp_path):
+        """A relative ``checkpoint.dir`` gives a relative resume path, compared by its target."""
+        from pathlib import Path
+
+        import kempnerforge.training.entry as entry
+
+        (tmp_path / "run" / "step_7").mkdir(parents=True)
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d: Path("run") / "step_7")
+        config = make_config()
+        config.checkpoint.dir = "run"
+        config.checkpoint.load_path = str(tmp_path / "run" / "step_7")
+
+        _, warnings = _entry_warnings(
+            lambda: entry.restore_checkpoint(config, TinyTextModel(), None, FakeResumeManager())
+        )
+
+        assert warnings == []
+
+    def test_the_resumed_checkpoint_with_exclusions_still_warns(self, monkeypatch, tmp_path):
+        """The resume restores full state, so the exclusions ``load_path`` asked for are dropped."""
+        import kempnerforge.training.entry as entry
+
+        resume = tmp_path / "step_7"
+        resume.mkdir()
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d: resume)
+        config = make_config()
+        config.checkpoint.load_path = str(resume)
+        config.checkpoint.exclude_from_loading = ["optimizer"]
+
+        _, warnings = _entry_warnings(
+            lambda: entry.restore_checkpoint(config, TinyTextModel(), None, FakeResumeManager())
+        )
+
+        assert len(warnings) == 1, warnings
+        assert "is not applied either" in warnings[0], warnings[0]
+
+    @pytest.mark.parametrize("form", ["relative", "symlink"])
+    def test_a_relative_or_linked_load_path_to_another_checkpoint_warns(
+        self, monkeypatch, tmp_path, form
+    ):
+        import kempnerforge.training.entry as entry
+
+        resume = tmp_path / "run" / "step_7"
+        other = tmp_path / "run" / "step_3"
+        resume.mkdir(parents=True)
+        other.mkdir()
+        (tmp_path / "rollback").symlink_to(other)
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d: resume)
+        config = make_config()
+        config.checkpoint.dir = str(tmp_path / "run")
+        config.checkpoint.load_path = "run/step_3" if form == "relative" else "rollback"
+
+        _, warnings = _entry_warnings(
+            lambda: entry.restore_checkpoint(config, TinyTextModel(), None, FakeResumeManager())
+        )
+
+        assert len(warnings) == 1, warnings
+
+    def test_a_looping_load_path_still_resumes_and_warns(self, monkeypatch, tmp_path):
+        """Comparing the paths must not raise: only rank 0 does it, and the others would hang."""
+        import kempnerforge.training.entry as entry
+
+        (tmp_path / "a").symlink_to(tmp_path / "b")
+        (tmp_path / "b").symlink_to(tmp_path / "a")
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d: tmp_path / "step_7")
+        config = make_config()
+        config.checkpoint.load_path = str(tmp_path / "a")
+        mgr = FakeResumeManager(step=7, tokens=70)
+
+        restored, warnings = _entry_warnings(
+            lambda: entry.restore_checkpoint(config, TinyTextModel(), None, mgr)
+        )
+
+        assert restored == (7, 70)
+        assert len(warnings) == 1, warnings
+
+    def test_the_warning_is_logged_even_when_the_load_then_fails(self, monkeypatch, tmp_path):
+        """It comes before the load, so a run that stops on a bad resume still says why."""
+        import kempnerforge.training.entry as entry
+
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d: tmp_path / "step_7")
+        config = make_config()
+        config.checkpoint.load_path = "/somewhere/step_3"
+
+        class FailingResumeManager(FakeResumeManager):
+            def load(self, **kw):
+                raise FileNotFoundError("step_7 has no train_state.pt")
+
+        def restore() -> None:
+            with pytest.raises(FileNotFoundError, match="no train_state.pt"):
+                entry.restore_checkpoint(config, TinyTextModel(), None, FailingResumeManager())
+
+        _, warnings = _entry_warnings(restore)
+
+        assert len(warnings) == 1, warnings
+
+
+class TestRestoreFromSavedCheckpoints:
+    """``restore_checkpoint`` with a real ``CheckpointManager`` and ``resolve_resume_path``."""
+
+    @staticmethod
+    def _run(ckpt_dir, seed, load_path=None, exclude=()):
+        """A fresh run in ``ckpt_dir``: its config, model, optimizer and checkpoint manager."""
+        from kempnerforge.training.entry import build_checkpoint_manager
+
+        config = make_config()
+        config.checkpoint.dir = str(ckpt_dir)
+        config.checkpoint.load_path = load_path
+        config.checkpoint.exclude_from_loading = list(exclude)
+        torch.manual_seed(seed)
+        model = TinyTextModel()
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        mgr = build_checkpoint_manager(config, _runtime(), model, optimizer, None)
+        return config, model, optimizer, mgr
+
+    def _saved(self, ckpt_dir, seed, step):
+        """Save step ``step`` of a run that has taken an optimizer step; return its weights."""
+        _, model, optimizer, mgr = self._run(ckpt_dir, seed)
+        model(torch.tensor([[1, 2, 3]])).sum().backward()
+        optimizer.step()
+        mgr.save(step=step, tokens_seen=step * 10)
+        return [p.detach().clone() for p in model.parameters()]
+
+    @staticmethod
+    def _same(weights, model):
+        """Whether ``model`` holds exactly ``weights``."""
+        return all(torch.equal(w, p) for w, p in zip(weights, model.parameters(), strict=True))
+
+    def test_an_interrupted_first_save_starts_over(self, tmp_path):
+        """Shards written, ``train_state.pt`` not yet: nothing to resume, so start from scratch."""
+        from kempnerforge.training.entry import restore_checkpoint
+
+        run = tmp_path / "run"
+        saved = self._saved(run, seed=0, step=4)
+        for name in ("train_state.pt", "metadata.json"):
+            (run / "step_4" / name).unlink()
+        (run / "latest").unlink()
+
+        config, model, optimizer, mgr = self._run(run, seed=1)
+        initial = [p.detach().clone() for p in model.parameters()]
+
+        assert restore_checkpoint(config, model, None, mgr) == (0, 0)
+        assert self._same(initial, model), "the run did not keep its own initial weights"
+        assert not self._same(saved, model), "fixture: the saved weights should differ"
+        assert not optimizer.state, "the run should start with a fresh optimizer"
+
+    def test_an_interrupted_first_save_of_a_warm_start_warm_starts_again(self, tmp_path):
+        """With ``load_path`` set, the run goes back to the warm start it began from."""
+        from kempnerforge.training.entry import restore_checkpoint
+
+        pretrained = self._saved(tmp_path / "pretrained", seed=2, step=100)
+        run = tmp_path / "run"
+        self._saved(run, seed=0, step=4)
+        (run / "step_4" / "train_state.pt").unlink()
+        (run / "latest").unlink()
+
+        config, model, optimizer, mgr = self._run(
+            run, seed=1, load_path=str(tmp_path / "pretrained" / "step_100"), exclude=["optimizer"]
+        )
+
+        assert restore_checkpoint(config, model, None, mgr) == (100, 1000)
+        assert self._same(pretrained, model), "the run did not load its warm start"
+        assert not optimizer.state, "the warm start excludes the optimizer"
+
+    def test_latest_without_its_train_state_is_refused(self, tmp_path):
+        """A committed checkpoint that lost ``train_state.pt`` stops the run before it loads."""
+        from kempnerforge.training.entry import restore_checkpoint
+
+        run = tmp_path / "run"
+        self._saved(run, seed=0, step=4)
+        (run / "step_4" / "train_state.pt").unlink()
+
+        config, model, optimizer, mgr = self._run(run, seed=1)
+        initial = [p.detach().clone() for p in model.parameters()]
+
+        with pytest.raises(FileNotFoundError, match="holds optimizer state but no train_state.pt"):
+            restore_checkpoint(config, model, None, mgr)
+        assert self._same(initial, model), "the refused load changed the weights"
+        assert not optimizer.state, "the refused load filled the optimizer"
+
+    def test_load_path_into_a_dir_with_a_checkpoint_resumes_it_and_warns(self, tmp_path):
+        """The newest checkpoint in ``dir`` wins over ``load_path``, and the log names both."""
+        from kempnerforge.training.entry import restore_checkpoint
+
+        newest = self._saved(tmp_path / "run", seed=0, step=111)
+        requested = self._saved(tmp_path / "other", seed=2, step=999)
+        load_path = str(tmp_path / "other" / "step_999")
+        config, model, _, mgr = self._run(tmp_path / "run", seed=1, load_path=load_path)
+
+        restored, warnings = _entry_warnings(lambda: restore_checkpoint(config, model, None, mgr))
+
+        assert restored == (111, 1110)
+        assert self._same(newest, model), "the run did not resume its own newest checkpoint"
+        assert not self._same(requested, model), "fixture: the two checkpoints should differ"
+        assert len(warnings) == 1, warnings
+        assert f"checkpoint.load_path={load_path} is not used" in warnings[0], warnings[0]
+        assert f"resuming {tmp_path / 'run' / 'step_111'}" in warnings[0], warnings[0]
 
 
 # ---------------------------------------------------------------------------

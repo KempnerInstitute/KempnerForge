@@ -165,10 +165,13 @@ NCCL collective that can't complete (peer already killed).
 `check_nccl_health()` from [NCCL liveness](nccl-liveness.md) is useful
 for detecting this proactively.
 
-**Checkpoint exists but resume starts from step 0.** Inspect
-`checkpoint/latest` — the symlink may be stale if a previous save
-crashed mid-write. See [Auto-resume](../checkpointing/auto-resume.md)
-for the resolution order.
+**Checkpoint exists but resume starts from step 0.** Look for
+`Auto-resume: skipping` warnings in the log. Without a `latest`
+symlink, the resolver skips every `step_N` whose save did not complete
+(no DCP `.metadata`, or optimizer state without `train_state.pt`), and
+when none completed it starts from step 0, or from
+`checkpoint.load_path` if one is set, with an ERROR. See
+[Auto-resume](../checkpointing/auto-resume.md) for the resolution order.
 
 ## See also
 

@@ -67,7 +67,7 @@ class CheckpointConfig:
     dyn_ckpt_window: DynamicCheckpointWindow | None = None  # opt-in dense window
     async_mode: AsyncCheckpointMode = AsyncCheckpointMode.disabled
     keep_last_n: int = 3  # recent ckpts kept (<=0 keeps all); dynamic milestones always kept
-    load_path: str | None = None  # Path to load from (for resumption)
+    load_path: str | None = None  # Training warm start; a checkpoint in dir takes precedence
     export_dtype: Literal["float32", "bfloat16"] = "bfloat16"
     # "model"/"optimizer" to skip on a load_path warm start (never on a resume)
     exclude_from_loading: list[str] = field(default_factory=list)

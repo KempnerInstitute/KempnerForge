@@ -8,6 +8,7 @@ phase — without editing the shared script.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import cast
 
@@ -192,6 +193,39 @@ def build_checkpoint_manager(
     )
 
 
+def _unused_load_path_message(config: JobConfig, resume_path: Path) -> str:
+    """The warning that a resume from ``checkpoint.dir`` wins over ``checkpoint.load_path``."""
+    ckpt = config.checkpoint
+    message = (
+        f"checkpoint.load_path={ckpt.load_path} is not used: checkpoint.dir={ckpt.dir} already "
+        f"has a checkpoint, and resuming {resume_path} takes precedence so that a requeued run "
+        f"continues where it stopped."
+    )
+    if ckpt.exclude_from_loading:
+        message += (
+            f" checkpoint.exclude_from_loading={ckpt.exclude_from_loading} is not applied "
+            f"either: a resume restores full state."
+        )
+    return message + (
+        " To start from load_path instead, for example to roll back to an earlier step, "
+        "set checkpoint.dir to a new, empty directory."
+    )
+
+
+def _load_path_is_the_resume(config: JobConfig, resume_path: Path) -> bool:
+    """Whether ``checkpoint.load_path`` names the resumed checkpoint and excludes nothing.
+
+    The resume then loads what ``load_path`` asks for, so nothing in it goes unused. Both paths
+    go through ``os.path.realpath``, so a relative path or one through ``latest`` compares by
+    its target. Unlike ``Path.resolve``, it does not raise on a symlink loop: only rank 0 runs
+    this, and a raise here would leave the other ranks waiting in the load's broadcast.
+    """
+    ckpt = config.checkpoint
+    if not ckpt.load_path or ckpt.exclude_from_loading:
+        return False
+    return os.path.realpath(ckpt.load_path) == os.path.realpath(resume_path)
+
+
 def restore_checkpoint(
     config: JobConfig,
     model: torch.nn.Module,
@@ -203,6 +237,11 @@ def restore_checkpoint(
     Returns ``(step, tokens_seen)`` — ``(0, 0)`` when there is nothing to
     resume from. Also restores the metrics run ids, runs the MoT warm-start
     hook, and re-applies the effective freeze at the resumed step.
+
+    A checkpoint in ``checkpoint.dir`` takes precedence over ``checkpoint.load_path``, so a
+    requeued warm start resumes rather than starting over; rank 0 then warns that
+    ``load_path`` is not used, naming both paths, unless ``load_path`` names the resumed
+    checkpoint and excludes nothing.
     """
     # Every rank must resume from the same checkpoint. resolve_resume_path
     # stats `.metadata` to test durability, and on NFS/Lustre independent
@@ -220,6 +259,14 @@ def restore_checkpoint(
         resume_path = resolve_resume_path(config.checkpoint.dir)
     if not resume_path and not config.checkpoint.load_path:
         return 0, 0
+    rank_zero = not dist.is_initialized() or dist.get_rank() == 0
+    if (
+        resume_path
+        and config.checkpoint.load_path
+        and rank_zero
+        and not _load_path_is_the_resume(config, resume_path)
+    ):
+        logger.warning(_unused_load_path_message(config, resume_path))
 
     vlm_cfg = config.vlm
     # On resume the expected freeze metadata reflects the post-transition

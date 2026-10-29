@@ -113,7 +113,9 @@ checkpoints/pretrained/
 
 Point a training config at this directory via
 `[checkpoint] load_path = "checkpoints/pretrained"` and
-training picks it up like any other DCP checkpoint.
+training picks it up like any other DCP checkpoint, as a warm start
+at step 0. `load_path` is used while the run's `checkpoint.dir` holds
+no checkpoint; once the run has saved one, a restart resumes from it.
 
 ## Key mapping
 
@@ -181,7 +183,8 @@ Not included: tokenizer files. Copy `tokenizer.json`, `tokenizer_config.json`,
   variants (MLA, linear attention) need additional mapping.
 - **No optimizer state** — HF format doesn't carry optimizer state,
   so `hf-to-dcp` produces a checkpoint with **model weights only**.
-  Training resumes with a fresh optimizer.
+  Training starts with a fresh optimizer, and with no `train_state.pt`
+  the step counter, LR schedule and data position start fresh too.
 - **Missing keys on `hf-to-dcp`** — the HF model may not have some
   KempnerForge-specific buffers (e.g. `freqs_cis` for RoPE). These
   stay at default init; the warning is informational, not an error.

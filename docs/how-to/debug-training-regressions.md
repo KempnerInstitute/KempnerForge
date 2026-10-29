@@ -44,9 +44,16 @@ you from optimizing into garbage. The usual flow:
 
 1. Grep the log for the first NaN step → get `N`.
 2. Identify the last clean checkpoint at `step_M` where `M < N`.
-3. Restart with `--checkpoint.load_path=checkpoints/<run>/step_M` and
-   a lower LR or a reduced spike-prone feature (e.g., turn off FP8 if
-   you were testing it).
+3. Restart with a new `--checkpoint.dir` and
+   `--checkpoint.load_path=checkpoints/<run>/step_M`, and a reduced
+   spike-prone feature (e.g., turn off FP8 if you were testing it). A
+   lower `--optimizer.lr` does not take effect here, because the
+   restore brings back the saved base LR, and a longer warmup lowers
+   the LR only if it extends past `step_M`. Keeping the old
+   `--checkpoint.dir` resumes its newest
+   checkpoint instead, since `load_path` is not used while
+   `checkpoint.dir` holds a checkpoint (rank 0 logs a warning naming
+   both paths).
 
 ### Configuration caveat
 

@@ -163,6 +163,38 @@ Practical implication: keep `extra=` values to primitives, lists,
 dicts, and tensors. Don't stuff a live logger, process group, or
 generator in there.
 
+## When `train_state.pt` is missing
+
+`save()` writes `train_state.pt` with the DCP shards (right after them in
+a synchronous save, while an async save's shards are still flushing), and
+moves `latest` only once both are written, so every checkpoint it
+completes has one. A checkpoint whose shards hold
+optimizer state but that has no `train_state.pt` was cut short between
+the two writes, or lost the file afterwards. Resuming it would continue
+its weights and optimizer moments from step 0, with the LR schedule
+restarting its warmup and the data stream starting over. So:
+
+- `CheckpointManager.load` raises `FileNotFoundError`, naming the
+  directory, before it loads anything, whenever the load would restore
+  that optimizer state: on auto-resume through `latest`, and from
+  `checkpoint.load_path`. Rank 0 checks for the file and broadcasts its
+  answer, so every rank raises together.
+- The `step_N` scan of [auto-resume](auto-resume.md) skips such a
+  directory with a warning and takes the newest complete one. When none
+  is complete, training starts from step 0 (or from
+  `checkpoint.load_path`, if set), which it reports at ERROR level.
+- To start from its weights alone, warm-start a new run from it: a new
+  `checkpoint.dir`, `checkpoint.load_path` pointing at it, and
+  `checkpoint.exclude_from_loading = ["optimizer"]`.
+
+A checkpoint whose shards hold no optimizer state needs no
+`train_state.pt`: an `hf-to-dcp` import, for example. It loads at step
+0 with a fresh optimizer. A load that excludes the optimizer is not
+refused either (`scripts/eval.py` passes `exclude_keys=["optimizer"]`):
+without `train_state.pt` it loads the weights alone at step 0. Either
+way an INFO line says that the step counter, token count, LR schedule,
+data position and RNG state start fresh.
+
 ## See also
 
 - [DCP model + optimizer](dcp-model.md) — what DCP handles that

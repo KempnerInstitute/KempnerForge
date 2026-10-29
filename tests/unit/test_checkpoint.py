@@ -2269,6 +2269,9 @@ class TestResumeWithUnsteppedParameters:
         if case == "integer_keyed":
             state = {"model": model.state_dict(), "optimizer": optimizer.state_dict()}
             dcp.save(state, checkpoint_id=str(tmp_path / "step_1"))
+            torch.save(
+                build_train_state(step=1, tokens_seen=0), tmp_path / "step_1" / "train_state.pt"
+            )
         else:
             manager.save(step=1)
 
@@ -2382,6 +2385,7 @@ class TestResumeWithUnsteppedParameters:
         }
         mutate(saved)
         dcp.save(saved, checkpoint_id=str(tmp_path / "step_1"))
+        torch.save(build_train_state(step=1, tokens_seen=0), tmp_path / "step_1" / "train_state.pt")
 
         _, _, manager2 = self._build(1, tmp_path)
         with pytest.raises(
@@ -2416,6 +2420,7 @@ class TestResumeWithUnsteppedParameters:
         monkeypatch.setattr(_version, "_derived_version", "2_3")
         dcp.save(saved, checkpoint_id=str(tmp_path / "step_1"))
         monkeypatch.undo()
+        torch.save(build_train_state(step=2, tokens_seen=0), tmp_path / "step_1" / "train_state.pt")
         index = FileSystemReader(str(tmp_path / "step_1")).read_metadata()
         assert "optimizer" in index.state_dict_metadata
 
@@ -2546,6 +2551,7 @@ class TestMuonResume:
             "optimizer": get_optimizer_state_dict(model, opt),
         }
         dcp.save(state, checkpoint_id=str(step_dir))
+        torch.save(build_train_state(step=3, tokens_seen=0), step_dir / "train_state.pt")
 
         records: list[logging.LogRecord] = []
 
@@ -2746,6 +2752,7 @@ class TestMuonResume:
             "optimizer": get_optimizer_state_dict(model, opt),
         }
         dcp.save(state, checkpoint_id=str(step_dir))
+        torch.save(build_train_state(step=3, tokens_seen=0), step_dir / "train_state.pt")
 
         model2, opt2 = self._build(seed=1)
         CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model2, opt2).load(
@@ -2911,6 +2918,186 @@ class TestSaveBeforeFirstStep:
         assert opt.state_dict() == fresh.state_dict(), "the load left the optimizer partly stepped"
         for before, p in zip(initial, model.parameters(), strict=True):
             assert torch.equal(before, p), "the load did not restore the initial weights"
+
+
+class TestResumeWithoutTrainState:
+    """A checkpoint that holds optimizer state resumes only together with its ``train_state.pt``."""
+
+    @staticmethod
+    def _build(seed, ckpt_dir, load_path=None):
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        torch.manual_seed(seed)
+        model = torch.nn.Linear(4, 4)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        config = CheckpointConfig(dir=str(ckpt_dir), load_path=load_path)
+        return model, optimizer, CheckpointManager(config, model, optimizer)
+
+    def _saved_without_train_state(self, tmp_path, lost=("train_state.pt",)):
+        """A step-500 checkpoint of a stepped run whose files in ``lost`` are gone."""
+        model, optimizer, manager = self._build(0, tmp_path / "run")
+        model(torch.ones(2, 4)).sum().backward()
+        optimizer.step()
+        manager.save(step=500, tokens_seen=1_000_000)
+        step_dir = tmp_path / "run" / "step_500"
+        for name in lost:
+            (step_dir / name).unlink()
+        return model, step_dir
+
+    @staticmethod
+    def _logged(call):
+        """Run ``call`` and return its result and the manager's records as (level, message)."""
+        import logging
+
+        records: list[logging.LogRecord] = []
+
+        class _Capture(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                records.append(record)
+
+        target = logging.getLogger("kempnerforge.checkpoint.manager")
+        handler, prior_level = _Capture(level=logging.INFO), target.level
+        target.addHandler(handler)
+        target.setLevel(logging.INFO)
+        try:
+            result = call()
+        finally:
+            target.removeHandler(handler)
+            target.setLevel(prior_level)
+        return result, [(r.levelname, r.getMessage()) for r in records]
+
+    @staticmethod
+    def _fresh_start(ckpt_dir):
+        """The record of a load that found no ``train_state.pt`` in ``ckpt_dir``."""
+        return (
+            "INFO",
+            f"{ckpt_dir} has no train_state.pt; the step counter, token count, LR schedule, "
+            f"data position and RNG state start fresh at step 0",
+        )
+
+    @pytest.mark.parametrize(
+        "lost",
+        [("train_state.pt",), ("train_state.pt", "metadata.json")],
+        ids=["train_state_lost", "cut_short_before_both"],
+    )
+    @pytest.mark.parametrize(
+        ("via", "exclude"),
+        [("latest", None), ("resolved_path", None), ("load_path", None), ("load_path", ["model"])],
+    )
+    def test_loading_its_optimizer_state_is_refused_before_anything_loads(
+        self, tmp_path, via, exclude, lost
+    ):
+        """Auto-resume (``latest`` or the path it resolved) and ``load_path`` all refuse it.
+
+        A save cut short after its shards has written neither ``train_state.pt`` nor
+        ``metadata.json``, so a missing ``metadata.json`` does not make it an import.
+        """
+        _, step_dir = self._saved_without_train_state(tmp_path, lost)
+        if via == "load_path":
+            model, optimizer, manager = self._build(1, tmp_path / "fresh", str(step_dir))
+        else:
+            model, optimizer, manager = self._build(1, tmp_path / "run")
+        before = [p.detach().clone() for p in model.parameters()]
+
+        refused = f"Cannot resume {step_dir}: it holds optimizer state but no train_state.pt"
+        path = str(step_dir) if via == "resolved_path" else None
+        with pytest.raises(FileNotFoundError, match=re.escape(refused)):
+            manager.load(path=path, exclude_keys=exclude)
+
+        for want, got in zip(before, model.parameters(), strict=True):
+            assert torch.equal(want, got), "the refused load changed the weights"
+        assert not optimizer.state, "the refused load filled the optimizer"
+
+    def test_its_weights_alone_load_at_step_zero_and_say_what_starts_fresh(self, tmp_path):
+        """Excluding the optimizer loads the weights, as a warm start from them does."""
+        source, step_dir = self._saved_without_train_state(tmp_path)
+        model, optimizer, manager = self._build(1, tmp_path / "fresh", str(step_dir))
+
+        loaded, records = self._logged(lambda: manager.load(exclude_keys=["optimizer"]))
+
+        assert loaded == (0, 0, {})
+        for want, got in zip(source.parameters(), model.parameters(), strict=True):
+            assert torch.equal(want, got), "the weights were not loaded"
+        assert not optimizer.state, "the optimizer should start fresh"
+        assert self._fresh_start(step_dir) in records, records
+
+    def test_a_checkpoint_without_an_optimizer_says_what_starts_fresh(self, tmp_path):
+        """A weights-only checkpoint, like an ``hf-to-dcp`` import, loads at step 0 and says so."""
+        from torch.distributed.checkpoint.state_dict import get_model_state_dict
+
+        source, _, _ = self._build(0, tmp_path / "unused")
+        imported = tmp_path / "pretrained"
+        dcp.save({"model": get_model_state_dict(source)}, checkpoint_id=str(imported))
+        model, optimizer, manager = self._build(1, tmp_path / "fresh", str(imported))
+
+        loaded, records = self._logged(manager.load)
+
+        assert loaded == (0, 0, {})
+        for want, got in zip(source.parameters(), model.parameters(), strict=True):
+            assert torch.equal(want, got), "the weights were not loaded"
+        assert not optimizer.state, "the optimizer should start fresh"
+        assert [message for level, message in records if level != "INFO"] == []
+        assert self._fresh_start(imported) in records, records
+
+
+def _free_port() -> int:
+    """An unused local TCP port for a gloo rendezvous."""
+    import socket
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _load_with_a_stale_view(rank: int, world: int, port: int, ckpt_dir: str, stale: int) -> None:
+    """Save on every rank, then load while rank ``stale`` cannot see ``train_state.pt``."""
+    from datetime import timedelta
+    from unittest.mock import patch
+
+    import torch.distributed as dist
+
+    from kempnerforge.checkpoint.manager import CheckpointManager
+
+    dist.init_process_group(
+        "gloo",
+        rank=rank,
+        world_size=world,
+        init_method=f"tcp://127.0.0.1:{port}",
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        torch.manual_seed(0)
+        model = torch.nn.Linear(4, 4)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        model(torch.ones(2, 4)).sum().backward()
+        optimizer.step()
+        manager = CheckpointManager(CheckpointConfig(dir=ckpt_dir), model, optimizer)
+        manager.save(step=3, tokens_seen=30)
+        exists = Path.exists
+
+        def stale_exists(path: Path) -> bool:
+            return False if rank == stale and path.name == "train_state.pt" else exists(path)
+
+        with patch.object(Path, "exists", stale_exists):
+            if stale == 0:
+                refused = "holds optimizer state but no train_state.pt"
+                with pytest.raises(FileNotFoundError, match=refused):
+                    manager.load()
+            else:
+                assert manager.load() == (3, 30, {})
+    finally:
+        dist.destroy_process_group()
+
+
+class TestResumeWithoutTrainStateAcrossRanks:
+    """Every rank takes rank 0's view of ``train_state.pt``, so they refuse or load together."""
+
+    @pytest.mark.parametrize("stale", [0, 1], ids=["rank_0_sees_none", "rank_1_sees_none"])
+    def test_every_rank_follows_rank_zero(self, tmp_path, stale):
+        """No rank raises alone and leaves the others waiting in a collective."""
+        import torch.multiprocessing as mp
+
+        mp.spawn(_load_with_a_stale_view, args=(2, _free_port(), str(tmp_path), stale), nprocs=2)
 
 
 def _assert_same_state_dict(expected, actual, where="state_dict"):
