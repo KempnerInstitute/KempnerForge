@@ -23,14 +23,16 @@ def resolve_resume_path(checkpoint_dir: str) -> Path | None:
         if resolved.exists():
             return resolved
 
-    # 2. highest-numbered step_N directory
+    # 2. newest step_N directory whose save completed
     step_dirs = sorted(
         (d for d in base.iterdir()
          if d.is_dir() and d.name.startswith("step_") and d.name.split("_")[1].isdigit()),
         key=lambda d: int(d.name.split("_")[1]),
+        reverse=True,
     )
-    if step_dirs:
-        return step_dirs[-1]
+    for d in step_dirs:
+        if _dcp_durable(d) and not missing_train_state(d):
+            return d
 
     return None
 ```
@@ -40,13 +42,22 @@ Two fallbacks:
 1. **`latest` symlink** — the canonical pointer, updated atomically
    after every successful save (see [Symlink updates](#symlink-updates)
    below). Used in all healthy cases.
-2. **Highest `step_N` directory** — a safety net. If the symlink
+2. **Newest complete `step_N` directory**: a safety net. If the symlink
    is missing (disk corruption, manual `rm`, never created because
-   no save has completed), the resolver scans for the highest-numbered
-   `step_N` directory and uses that.
+   no save has completed), the resolver scans the `step_N` directories
+   from the highest number down and uses the first whose save completed.
+   It skips, with a warning, a directory without DCP's `.metadata` (a
+   save cut short while writing its shards) and one whose shards hold
+   optimizer state but that has no `train_state.pt` (a save cut short
+   between the two, or a copy that lost the file). Resuming the second
+   kind would continue its weights and optimizer moments from step 0.
+   A directory whose shards hold no optimizer state, such as an
+   `hf-to-dcp` import, needs no `train_state.pt`.
 
 If neither path finds anything, the function returns `None` and
-training starts from step 0.
+training starts from step 0, or from `checkpoint.load_path` when one is
+set. When `step_N` directories exist but none
+holds a complete save, it says so at ERROR level.
 
 ## Where it's called
 
@@ -56,6 +67,8 @@ training starts from step 0.
 ```python
 resume_path = resolve_resume_path(config.checkpoint.dir)
 step, tokens_seen = 0, 0
+if resume_path and config.checkpoint.load_path:
+    logger.warning(...)  # rank 0: load_path is not used, naming both paths
 if resume_path or config.checkpoint.load_path:
     step, tokens_seen, ckpt_extra_loaded = ckpt_mgr.load(
         path=str(resume_path) if resume_path else None,
@@ -69,20 +82,22 @@ if resume_path or config.checkpoint.load_path:
 
 So two things can trigger a resume:
 
-- **`resume_path` found** — auto-resume; user passed nothing.
-- **`config.checkpoint.load_path` set** — explicit override; skip
-  the symlink lookup and load from that path. Useful for loading
-  pretrained weights, fine-tuning from a specific checkpoint, or
-  debugging.
+- **`resume_path` found**: auto-resume; user passed nothing.
+- **`config.checkpoint.load_path` set**: a warm start from that
+  path, used only while `checkpoint.dir` holds no checkpoint. Useful
+  for loading pretrained weights, fine-tuning from a specific
+  checkpoint, or debugging.
 
 If both are set, `resume_path` wins (auto-resume takes precedence
 over the static config). This is deliberate: SLURM requeues should
 always pick up where they left off, not re-load the initial
-`load_path` every time.
+`load_path` every time. Rank 0 logs a warning that names both paths,
+so a `load_path` meant as a rollback does not go unnoticed: see
+[Loading a specific step](#loading-a-specific-step).
 `exclude_from_loading` follows the same rule: it applies only to the
 `load_path` warm start, so when a resume wins it is dropped with
-`load_path` and a weights-only warm start silently becomes a full
-resume. Use an empty `dir` to guarantee the warm start.
+`load_path` and a weights-only warm start becomes a full resume, which
+the same warning states. Use an empty `dir` to guarantee the warm start.
 
 ## Symlink updates
 
@@ -141,14 +156,25 @@ leave `save()` while the other ranks wait in its barrier.
   `None`, training starts from step 0. No error.
 - **`latest` symlink points at a removed directory** — the resolver
   checks `resolved.exists()` after following the link; if it
-  doesn't, it falls through to the highest-`step_N` scan. This
+  doesn't, it falls through to the `step_N` scan. This
   catches the case where someone rm-rf'd a checkpoint but left the
   symlink.
-- **Corrupted `step_N` directory** — `resolve_resume_path` doesn't
-  verify the contents. If DCP can't load from the resolved path,
-  `ckpt_mgr.load` raises and training aborts. In practice, async
-  saves either complete or leave a truncated directory that DCP
-  detects and errors on clearly.
+- **Corrupted `step_N` directory**: `resolve_resume_path` checks
+  only that a save completed (DCP's `.metadata`, and `train_state.pt`
+  when the shards hold optimizer state), not the contents. If DCP
+  can't load from the resolved path, `ckpt_mgr.load` raises and
+  training aborts.
+- **Checkpoint without `train_state.pt`**: when `latest` or
+  `load_path` names a checkpoint whose shards hold optimizer state but
+  that has no `train_state.pt`, `ckpt_mgr.load` raises
+  `FileNotFoundError` before it loads anything, instead of resuming its
+  weights and optimizer moments at step 0. To start from its weights
+  alone, use a new `dir` with `load_path` pointing at it and
+  `exclude_from_loading = ["optimizer"]`. See
+  [Train state](train-state.md#when-train_statept-is-missing).
+- **`load_path` set and `dir` already has a checkpoint**: the
+  checkpoint in `dir` is resumed, `load_path` is not used, and rank 0
+  warns, naming both paths.
 - **Fresh checkpoint dir, `load_path` set** — `load_path` is used
   (the else branch). Training starts from the step in that
   checkpoint.
@@ -175,16 +201,21 @@ take the `keep_last_n` places of the rerun's own checkpoints, and with
 an async `async_mode` it can delete a directory a new save is still
 writing.
 
-Or override explicitly:
+Or start a new checkpoint directory from it, which leaves the
+original run untouched:
 
 ```toml
 [checkpoint]
+dir = "checkpoints_from_5000"
 load_path = "checkpoints/step_5000"
 ```
 
-The explicit override skips the symlink; SLURM requeues will still
-try auto-resume first (finding nothing newer than step 5000, they'll
-fall through to `load_path`).
+`load_path` is used only while `dir` holds no checkpoint. With
+`exclude_from_loading` empty it restores the full state of step 5000,
+and requeues of the new run resume from its own checkpoints in the new
+`dir`. Setting `load_path` to `step_5000` while `dir` stays
+`checkpoints` does not roll back: the run resumes from the newest
+checkpoint there, and rank 0 warns that `load_path` is not used.
 
 ## Resilience interaction
 
