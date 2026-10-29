@@ -31,6 +31,7 @@ from kempnerforge.training.data_pipeline import (
 from kempnerforge.training.hooks import HookRunner, TrainingHook
 from kempnerforge.training.loop import (
     BatchStream,
+    StepFn,
     TrainingSession,
     checkpoint_extra,
     pipeline_step,
@@ -119,6 +120,7 @@ class RecordingHook(TrainingHook):
         self.begins = 0
         self.ends: list[tuple[int, int]] = []
         self.steps: list[int] = []
+        self.lrs: list[float] = []
         self.saves: list[int] = []
 
     def on_train_begin(self, config: JobConfig) -> None:
@@ -126,6 +128,7 @@ class RecordingHook(TrainingHook):
 
     def on_step_end(self, ctx) -> None:
         self.steps.append(ctx.step)
+        self.lrs.append(ctx.lr)
 
     def on_checkpoint_save(self, step: int, path: str) -> None:
         self.saves.append(step)
@@ -212,6 +215,16 @@ def _make_tracker(config: JobConfig):
     from kempnerforge.metrics.tracker import MetricsTracker
 
     return MetricsTracker(config, num_gpus=1)
+
+
+def _nan_on(steps: set[int], step_fn: StepFn = text_step) -> StepFn:
+    """Wrap a step body so the iterations that start at ``steps`` report a NaN loss."""
+
+    def nan_step(session: TrainingSession, step: int):
+        result = step_fn(session, step)
+        return dataclasses.replace(result, loss=float("nan")) if step in steps else result
+
+    return nan_step
 
 
 # ---------------------------------------------------------------------------
@@ -809,6 +822,39 @@ class TestRunTrainingLoop:
         session = make_session(config, phases=PhaseState(lr_scale=0.5))
         run_training_loop(session)
         assert session.optimizer.param_groups[0]["lr"] == pytest.approx(0.025)
+
+
+class TestNanSkippedStep:
+    """A step skipped for a non-finite loss still crosses the step boundary.
+
+    It skips the optimizer update, but the LR schedule, the step-keyed
+    transitions and the shutdown check move with the step counter as on a
+    finite step.
+    """
+
+    def test_lr_schedule_stays_on_the_step_counter(self):
+        config = make_config(max_steps=6)
+        hook = RecordingHook()
+        session = make_session(config, step_fn=_nan_on({1, 3}), hooks=HookRunner([hook]))
+        session.scheduler = torch.optim.lr_scheduler.LambdaLR(
+            session.optimizer, lambda s: 1.0 / (1 + s)
+        )
+        step, _ = run_training_loop(session)
+        assert step == 6
+        assert session.scheduler.last_epoch == 6
+        assert hook.steps == [1, 3, 5, 6]
+        assert hook.lrs == pytest.approx([0.05 / (1 + s) for s in hook.steps])
+
+    def test_nan_stop_leaves_the_schedule_on_the_returned_step(self):
+        config = make_config(max_steps=10)
+        session = make_session(
+            config,
+            step_fn=_nan_on(set(range(10))),
+            nan_detector=NaNDetector(action="warn", max_consecutive=3),
+        )
+        step, _ = run_training_loop(session)
+        assert step == 2
+        assert session.scheduler.last_epoch == 2
 
 
 # ---------------------------------------------------------------------------
