@@ -536,6 +536,12 @@ class TestSharedExperts:
         with pytest.raises(ValueError, match="shared_experts must be >= 0, got -1"):
             build_moe(dim=64, hidden_dim=32, num_experts=4, top_k=2, shared_experts=-1)
 
+    def test_zero_shared_experts_build_no_shared_expert(self):
+        """N = 0 builds no shared expert, so its state dict has no shared_expert keys."""
+        moe = build_moe(dim=64, hidden_dim=32, num_experts=4, top_k=2, shared_experts=0)
+        assert moe.shared_expert is None
+        assert not [k for k in moe.state_dict() if k.startswith("shared_expert.")]
+
 
 class TestEPConfig:
     """Expert parallelism config validation (no GPU needed)."""
