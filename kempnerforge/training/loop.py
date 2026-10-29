@@ -633,6 +633,8 @@ def run_training_loop(
                 _advance_lr_schedule(session)
                 step += 1
                 _apply_step_transitions(session, step)
+                if _shutdown_if_requested(session, step, tokens_seen, saved_this_step=False):
+                    break
                 continue
 
             # Optimizer step
