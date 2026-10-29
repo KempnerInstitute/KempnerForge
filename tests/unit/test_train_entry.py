@@ -1020,7 +1020,8 @@ class TestNanSkippedStep:
         assert ckpt.saves == []
         assert handler.finished is False
 
-    def test_emergency_checkpoint_records_the_phase_the_skipped_step_entered(self):
+    def test_emergency_checkpoint_records_the_phase_the_skipped_step_entered(self, monkeypatch):
+        """It also saves the dataloader, so the resume continues from the same data position."""
         ckpt = FakeCheckpointManager()
         session = self._phase_session(
             TrainingPhase(start_step=2, dataset_weights={"a": 5.0}),
@@ -1028,9 +1029,19 @@ class TestNanSkippedStep:
             shutdown_handler=FakeShutdownHandler(after_steps=2),
             step_fn=_nan_on({1}),
         )
+        loaders: list = []
+        real_save = ckpt.save
+
+        def save(step: int, **kwargs: Any) -> None:
+            loaders.append(kwargs.get("dataloader"))
+            real_save(step, **kwargs)
+
+        monkeypatch.setattr(ckpt, "save", save)
         step, tokens_seen = run_training_loop(session)
         assert step == 2
         assert ckpt.saves == [(2, tokens_seen, {"phase_idx": 1})]
+        assert loaders == [session.data.dataloader]
+        assert loaders[0] is not None
 
     def test_resume_from_its_emergency_checkpoint_matches_an_uninterrupted_run(self, tmp_path):
         """The real manager carries the skipped step's weights, schedule and RNG across."""
