@@ -768,6 +768,15 @@ class TestResumePathResolution:
         skipped = f"skipping {stopped}: it holds optimizer state but no train_state.pt"
         assert any(skipped in r.getMessage() for r in caplog.records), caplog.text
 
+    def test_keeps_a_weights_only_checkpoint_without_train_state(self, tmp_path):
+        """A checkpoint without optimizer state, like an ``hf-to-dcp`` import, needs none."""
+        _saved_step_dir(tmp_path, 10, optimizer=True, train_state=True)
+        _saved_step_dir(tmp_path, 20, optimizer=False, train_state=False)
+
+        result = resolve_resume_path(str(tmp_path))
+        assert result is not None
+        assert result.name == "step_20"
+
     def test_skips_a_pipeline_parallel_save_without_its_train_state(self, tmp_path):
         """Every ``pp{k}`` stage holds optimizer state, and the shared train state is missing."""
         _saved_step_dir(tmp_path, 10, optimizer=True, train_state=True, pp_stages=2)
@@ -790,6 +799,32 @@ class TestResumePathResolution:
         errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
         assert errors, "no ERROR record for a resume that found no complete save"
         assert "none holds a complete save; starting from step 0" in errors[0]
+
+    def test_latest_is_followed_even_without_its_train_state(self, tmp_path):
+        """``latest`` names a committed checkpoint; if it lost the file, the load refuses it."""
+        _saved_step_dir(tmp_path, 10, optimizer=True, train_state=True)
+        _saved_step_dir(tmp_path, 20, optimizer=True, train_state=False)
+        (tmp_path / "latest").symlink_to("step_20")
+
+        result = resolve_resume_path(str(tmp_path))
+        assert result is not None
+        assert result.name == "step_20"
+
+    def test_unreadable_dcp_metadata_is_left_for_the_load(self, tmp_path, caplog, monkeypatch):
+        """An empty ``.metadata`` does not count as optimizer state; the load reports it."""
+        import logging
+
+        self._let_caplog_see_kempnerforge(monkeypatch)
+        _saved_step_dir(tmp_path, 10, optimizer=True, train_state=True)
+        damaged = _durable_step_dir(tmp_path, 20)
+
+        with caplog.at_level(logging.WARNING):
+            result = resolve_resume_path(str(tmp_path))
+
+        assert result is not None
+        assert result.name == "step_20"
+        unread = f"Could not read {damaged / '.metadata'} to tell whether it holds optimizer state"
+        assert any(unread in r.getMessage() for r in caplog.records), caplog.text
 
 
 # ---------------------------------------------------------------------------
