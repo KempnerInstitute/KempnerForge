@@ -105,18 +105,20 @@ for module in model.modules():
 
 The router (`moe.router`) is **not** sharded — every rank keeps the
 full router weights so it can make the routing decision locally
-before dispatch. Shared experts (`moe.shared_expert`) are also kept
-on every rank.
+before dispatch. The shared experts (`moe.shared_expert`, one MLP
+`moe_shared_experts` times the expert width) are also kept whole on
+every EP rank.
 
 ## Composition with other parallelisms
 
 EP runs after TP and before FSDP2 — see
 [Parallelism order](../architecture/parallelism-order.md).
 
-- **EP + TP**: TP shards the non-MoE Linears (attention q/k/v/o and
-  shared-expert gate/up/down) along the `tp` mesh dim. EP shards the
-  routed experts along `ep`. Dense TP layers are untouched by
-  `apply_expert_parallel`.
+- **EP + TP**: TP shards attention q/k/v/o, and the MLPs of dense
+  layers, along the `tp` mesh dim. EP shards the routed experts along
+  `ep`. The TP plan leaves an MoE layer's whole `mlp` alone, so its
+  router and shared expert stay replicated on every TP rank. Dense TP
+  layers are untouched by `apply_expert_parallel`.
 - **EP + FSDP2**: FSDP2 wraps the MoE layer's `attention` and `mlp`
   **separately** (per-sub-module wrapping) rather than the whole
   block — see [FSDP2 § EP-MoE](fsdp2.md#ep-moe-per-sub-module-wrapping).
