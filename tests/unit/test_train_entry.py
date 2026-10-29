@@ -959,6 +959,43 @@ class TestNanSkippedStep:
         assert step == 2
         assert ckpt.saves == [(2, tokens_seen, {"phase_idx": 1})]
 
+    def test_resume_from_its_emergency_checkpoint_matches_an_uninterrupted_run(self, tmp_path):
+        """The real manager carries the skipped step's weights, schedule and RNG across."""
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        def run(ckpt_dir, shutdown_after=None, resume=False):
+            config = make_config(max_steps=5)
+            config.checkpoint.dir = str(ckpt_dir)
+            config.checkpoint.interval = 100
+            model = TinyTextModel()
+            optimizer = torch.optim.AdamW(model.parameters(), lr=0.05)
+            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda s: 1.0 / (1 + s))
+            session = make_session(
+                config,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                step_fn=_nan_on({1}),
+                shutdown_handler=FakeShutdownHandler(after_steps=shutdown_after),
+            )
+            session.checkpointer = CheckpointManager(config.checkpoint, model, optimizer)
+            step, tokens_seen = 0, 0
+            if resume:
+                step, tokens_seen, _ = session.checkpointer.load(scheduler=scheduler)
+            return session, run_training_loop(session, step=step, tokens_seen=tokens_seen)
+
+        torch.manual_seed(0)
+        full, full_end = run(tmp_path / "full")
+        torch.manual_seed(0)
+        _, stop_end = run(tmp_path / "split", shutdown_after=2)
+        torch.manual_seed(1)
+        resumed, resumed_end = run(tmp_path / "split", resume=True)
+        assert stop_end[0] == 2
+        assert resumed_end == full_end
+        assert resumed.scheduler.last_epoch == full.scheduler.last_epoch == 5
+        params = zip(full.model.parameters(), resumed.model.parameters(), strict=True)
+        assert all(torch.equal(p, q) for p, q in params)
+
 
 # ---------------------------------------------------------------------------
 # run_training wiring
