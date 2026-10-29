@@ -169,8 +169,9 @@ def resolve_resume_path(checkpoint_dir: str) -> Path | None:
         # least loud, so say so at a level nobody filters out.
         logger.error(
             f"Auto-resume: {len(step_dirs)} checkpoint directories under "
-            f"{base} and none holds a complete save; starting from step 0. "
-            f"Every saved step would have to be re-trained."
+            f"{base} and none holds a complete save; starting from step 0, or from "
+            f"checkpoint.load_path if one is set. Every saved step would have to be "
+            f"re-trained."
         )
     return None
 
