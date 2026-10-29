@@ -183,6 +183,11 @@ class ModelConfig:
                 )
             if self.moe_expert_ffn_multiplier <= 0:
                 raise ValueError("moe_expert_ffn_multiplier must be positive")
+            if self.moe_shared_experts < 0:
+                raise ValueError(
+                    f"moe_shared_experts must be >= 0, got {self.moe_shared_experts}. Set it "
+                    "to the number of shared experts every token goes through, or 0 for none."
+                )
             if self.moe_router_z_loss_weight < 0:
                 raise ValueError("moe_router_z_loss_weight must be non-negative")
 
