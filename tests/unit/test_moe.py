@@ -519,6 +519,19 @@ class TestSharedExperts:
             expected = routed_only(x) + sum(e(x) for e in experts)
             torch.testing.assert_close(moe(x), expected)
 
+    @pytest.mark.parametrize("n,multiplier", [(2, 1.0), (4, 1.0), (3, 0.5)])
+    def test_param_estimate_matches_n_shared_experts(self, n, multiplier):
+        """num_params_estimate counts the parameters a model with N shared experts builds."""
+        config = ModelConfig(
+            **_SMALL,
+            num_experts=4,
+            moe_top_k=2,
+            moe_shared_experts=n,
+            moe_expert_ffn_multiplier=multiplier,
+        )
+        model = Transformer(config)
+        assert sum(p.numel() for p in model.parameters()) == config.num_params_estimate
+
 
 class TestEPConfig:
     """Expert parallelism config validation (no GPU needed)."""
