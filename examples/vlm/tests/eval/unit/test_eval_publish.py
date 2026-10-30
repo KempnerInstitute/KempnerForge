@@ -660,7 +660,7 @@ class TestPreflight:
         uninstall(monkeypatch, "pandas")
         preflight(_checkpoint(tmp_path), None)
         text = _warnings(caplog)
-        assert "the environment is incomplete, run: uv sync" in text
+        assert "the environment is incomplete, run: uv sync --group eval" in text
         assert "uv sync --group eval" in text and "--group mlflow" not in text
 
     def test_a_dependency_that_breaks_when_imported_is_a_warning_not_an_abort(

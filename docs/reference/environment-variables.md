@@ -101,7 +101,7 @@ Setup and auth routes: [MLflow backend](../metrics-and-profiling/mlflow.md).
 |----------|---------|---------|
 | `MLFLOW_TRACKING_URI` | config, backend | Tracking URI when `metrics.mlflow_tracking_uri` is unset (config, then this, then `databricks`) |
 | `MLFLOW_EXPERIMENT` | backend | Experiment when `metrics.mlflow_experiment` is unset; an absolute workspace path on Databricks |
-| `DATABRICKS_HOST`, `DATABRICKS_TOKEN` | SDK | The environment auth route; override a profile's values |
+| `DATABRICKS_HOST`, `DATABRICKS_TOKEN` | SDK | The environment auth route; override the values of a profile selected by a `databricks://<profile>` URI or `DATABRICKS_CONFIG_PROFILE`, and with none selected, setting either one makes the SDK ignore `~/.databrickscfg` |
 | `DATABRICKS_API_TOKEN` | backend, publisher | Alias copied into an unset or empty `DATABRICKS_TOKEN` for a Databricks URI |
 | `DATABRICKS_CONFIG_PROFILE` | SDK | `~/.databrickscfg` profile; set from a `databricks://<profile>` tracking URI by the backend and the publisher |
 | `DATABRICKS_AUTH_TYPE` | SDK | Never set by KempnerForge; `pat` is recommended in job scripts using token or profile auth |

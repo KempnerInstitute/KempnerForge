@@ -30,7 +30,7 @@ by one of three routes:
 | Route | You provide | Used when |
 |-------|-------------|-----------|
 | Environment | `DATABRICKS_HOST` and `DATABRICKS_TOKEN` (a personal access token) | both are set; they win over a profile |
-| Profile | a `[<profile>]` section with `host` and `token` in `~/.databrickscfg` | the tracking URI is `databricks://<profile>`, or `$DATABRICKS_CONFIG_PROFILE` names it; otherwise the SDK's default profile (the `default_profile` of a `[__settings__]` section when the file has one, else `[DEFAULT]`) |
+| Profile | a `[<profile>]` section with `host` and `token` in `~/.databrickscfg` | the tracking URI is `databricks://<profile>`, or `$DATABRICKS_CONFIG_PROFILE` names it; otherwise, when no `DATABRICKS_HOST`, `DATABRICKS_TOKEN` or other credential variable is set, the SDK's default profile (the `default_profile` of a `[__settings__]` section when the file has one, else `[DEFAULT]`) |
 | SDK OAuth | a service principal (`DATABRICKS_HOST`, `DATABRICKS_CLIENT_ID`, `DATABRICKS_CLIENT_SECRET`), or a user login from the Databricks CLI (`databricks auth login`, with the CLI on `PATH` where the job runs) | no token is configured and OAuth is |
 
 ```bash
@@ -59,19 +59,25 @@ cause was not traced to a specific SDK step, and the pin costs nothing where the
 Leave it unset for the OAuth route, or pin that route's own type (`oauth-m2m` for a service
 principal, `databricks-cli` for a CLI login).
 
-The SDK reads environment variables first and uses a profile only to fill in what they leave
-unset, so an exported `DATABRICKS_TOKEN` overrides the profile's token. `databricks://<profile>`
-also exports the profile as `DATABRICKS_CONFIG_PROFILE` for the SDK and artifact calls, unless
-that variable is already set; if you set it yourself, keep it equal to the URI's profile.
+When a profile is selected, by a `databricks://<profile>` URI or `$DATABRICKS_CONFIG_PROFILE`, the
+SDK reads environment variables first and uses the profile only to fill in what they leave unset,
+so an exported `DATABRICKS_TOKEN` overrides the profile's token. With none selected (a plain
+`databricks` URI and no `$DATABRICKS_CONFIG_PROFILE`), an exported `DATABRICKS_HOST`,
+`DATABRICKS_TOKEN` or other credential variable makes the SDK ignore `~/.databrickscfg`. To
+combine a profile with exported variables, select it. For token auth with none selected, export
+both `DATABRICKS_HOST` and a token, or neither. `databricks://<profile>` also exports the profile
+as `DATABRICKS_CONFIG_PROFILE` for the SDK and artifact calls, unless that variable is already
+set; if you set it yourself, keep it equal to the URI's profile.
 
 ```{warning}
 `DATABRICKS_API_TOKEN` is not a name the SDK reads. The training backend and the
 [publisher](#publishing-eval-results) mirror it into `DATABRICKS_TOKEN` when that is unset or
-empty and the tracking URI is Databricks, and from then on it is the environment route: it overrides a
-profile's token, so a stale export left in `~/.bashrc` fails authentication even though the
-profile itself is fine. Unset stale exports (`unset DATABRICKS_API_TOKEN DATABRICKS_TOKEN`) when
-you authenticate with a profile. Export `DATABRICKS_TOKEN` rather than the alias for any other
-tool that talks to the workspace.
+empty and the tracking URI is Databricks, and from then on it is the environment route: a stale
+export left in `~/.bashrc` overrides a selected profile's token, and with none selected it makes
+the SDK ignore `~/.databrickscfg`, even though the profile itself is fine. Unset stale exports
+(`unset DATABRICKS_API_TOKEN DATABRICKS_TOKEN DATABRICKS_HOST`) when you authenticate with a
+profile. Export `DATABRICKS_TOKEN` rather than the alias for any other tool that talks to the
+workspace.
 ```
 
 `uv run python scripts/check_env.py --requires mlflow` reports which route a shell has. It
@@ -375,12 +381,15 @@ check included, run with MLflow's own defaults.
 
 ## Failure modes
 
-`_ensure_init` disables the backend for the rest of the run on any failure, with one warning:
+`_ensure_init` disables the backend for the rest of the run on any failure, with a warning:
 
-- `mlflow` cannot be imported, so the environment is incomplete: the warning says to run
+- An import failed, `mlflow` itself or something it imports, so the environment is incomplete:
+  the warning reads `MLflow backend disabled by a failed import (<error>)` and says to run
   `uv sync`.
 - A deliberate config error: `$MLFLOW_EXPERIMENT` is not absolute on Databricks, or no experiment
-  path could be resolved. The warning reads `MLflow disabled: <reason>`.
+  path could be resolved. The warning reads `MLflow disabled: <reason>`. For an unresolved path,
+  an earlier warning gives the cause: `Could not auto-resolve Databricks experiment path: <error>`,
+  followed by the auth routes when the error may be a credentials one.
 - Anything else (network, auth, a start that outlasts its 60 s, which on compute nodes
   [pinning the auth type](#authentication) can avoid): `MLflow init failed: <error>`, followed
   on Databricks by the auth routes when the failure may be a credentials one.

@@ -309,10 +309,10 @@ class MLflowBackend(_LoggingBackend):
         except _MlflowDisabled as e:
             logger.warning(_scrub_uris(f"MLflow disabled: {e}"))
             self._active = False
-        except ImportError:
+        except ImportError as e:
             logger.warning(
-                "mlflow could not be imported; disabling MLflow backend "
-                "(the environment is incomplete, run: uv sync)"
+                f"MLflow backend disabled by a failed import ({e}); "
+                "the environment is incomplete, run: uv sync"
             )
             self._active = False
         except Exception as e:  # mlflow talks to a remote server: network / auth / config errors
