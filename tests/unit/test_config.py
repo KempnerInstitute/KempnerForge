@@ -850,6 +850,12 @@ class TestVLMParallelismSupport:
         job = _vlm_job(arch, tp=2, num_experts=num_experts, tie_embeddings=tie_embeddings)
         job.validate(world_size=2)
 
+    def test_a_pipeline_parallel_vlm_gets_the_pipeline_error_under_tensor_parallelism(self):
+        """Pipeline stages run tensor parallelism without sequence parallelism, so a dense VLM
+        with pp > 1 reaches the VLM + pipeline-parallel error, not the sequence-parallel one."""
+        with pytest.raises(ValueError, match=r"VLM \+ Pipeline Parallelism is not supported"):
+            _vlm_job("joint_decoder", tp=2, pp=2).validate(world_size=4)
+
     def test_errors_name_the_arch_of_the_config_class(self):
         """The checks act on the config's class, and the arch field can name another arch
         after a ``--vlm.arch`` override, so the error names the class's arch."""
