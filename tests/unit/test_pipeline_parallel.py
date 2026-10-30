@@ -1,11 +1,18 @@
 """Unit tests for pipeline parallelism (no GPU required)."""
 
+import socket
+from types import SimpleNamespace
+
 import pytest
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from torch.distributed.device_mesh import init_device_mesh
 
 from kempnerforge.config.schema import ModelConfig, PipelineSchedule
 from kempnerforge.distributed.pipeline_parallel import (
     PipelineStageModule,
+    build_stage_group,
     build_stage_module,
     compute_layer_assignment,
 )
@@ -298,3 +305,38 @@ class TestStageModuleDocIds:
             out_sdpa = stage("sdpa")(tokens, doc_ids)
             out_flex = stage("flex")(tokens, doc_ids)
         torch.testing.assert_close(out_flex, out_sdpa)
+
+
+def _free_port() -> int:
+    """An unused local TCP port for the gloo rendezvous."""
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def _check_stage_group_with_pp_second(rank: int, world: int, port: int) -> None:
+    """On a ``(dp_shard=2, pp=2)`` mesh, stage 0 is ranks 0 and 2, stage 1 ranks 1 and 3."""
+    dist.init_process_group(
+        "gloo", rank=rank, world_size=world, init_method=f"tcp://127.0.0.1:{port}"
+    )
+    try:
+        mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("dp_shard", "pp"))
+        group = build_stage_group(mesh)
+        members = [0, 2] if rank % 2 == 0 else [1, 3]
+        assert dist.get_process_group_ranks(group) == members
+        total = torch.tensor([float(rank)])
+        dist.all_reduce(total, group=group)
+        assert total.item() == sum(members)
+    finally:
+        dist.destroy_process_group()
+
+
+class TestBuildStageGroup:
+    def test_stages_follow_the_pp_coordinate_wherever_pp_sits(self):
+        """Each rank gets the ranks at its own ``pp`` coordinate, here strided, and only them."""
+        mp.spawn(_check_stage_group_with_pp_second, args=(4, _free_port()), nprocs=4)
+
+    @pytest.mark.parametrize("names", [("dp_shard", "tp"), None])
+    def test_a_mesh_without_a_pp_dimension_is_rejected(self, names):
+        with pytest.raises(ValueError, match="needs a 'pp' mesh dimension"):
+            build_stage_group(SimpleNamespace(mesh_dim_names=names))

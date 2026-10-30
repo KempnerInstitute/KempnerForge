@@ -23,8 +23,10 @@ Note on FSDP reshard policy:
 from __future__ import annotations
 
 import logging
+from typing import cast
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
 
@@ -68,6 +70,26 @@ def get_pp_size(device_mesh: DeviceMesh) -> int:
     if pp_mesh is None:
         return 1
     return pp_mesh.size()
+
+
+def build_stage_group(device_mesh: DeviceMesh) -> dist.ProcessGroup:
+    """Create one process group per pipeline stage and return the one holding this rank.
+
+    A stage's group holds every rank at the same ``pp`` coordinate of ``device_mesh``,
+    whatever its other dimensions are, so under pure pipeline parallelism it holds this
+    rank alone. Every rank creates every stage's group in stage order with
+    ``torch.distributed.new_group``, which is collective over the default process group:
+    every rank must call this at the same point.
+
+    Raises:
+        ValueError: ``device_mesh`` has no ``pp`` dimension.
+    """
+    dim_names = device_mesh.mesh_dim_names or ()
+    if "pp" not in dim_names:
+        raise ValueError(f"build_stage_group needs a 'pp' mesh dimension, got dims {dim_names}")
+    stages = device_mesh.mesh.unbind(dim_names.index("pp"))
+    group, _ = dist.new_subgroups_by_enumeration([stage.flatten().tolist() for stage in stages])
+    return cast("dist.ProcessGroup", group)
 
 
 # ---------------------------------------------------------------------------
