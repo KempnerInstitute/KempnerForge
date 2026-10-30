@@ -133,6 +133,11 @@ def ep_dispatch_and_compute(
         local_expert_start: First global expert index on this rank.
         num_local_experts: Number of experts on this rank.
         ep_world_size: Number of ranks in the EP group.
+        gradient_scale: Scale each local expert's output by the average expert
+            load over its own load, as ``MoEMLP._local_forward`` does. The EP ranks
+            hold the same tokens, so a local expert receives ``ep_world_size``
+            copies of its load, and the average over all experts in those units is
+            ``num_tokens * top_k / num_local_experts``.
 
     Returns:
         output: (num_tokens, dim) weighted combination of expert outputs.
@@ -279,7 +284,7 @@ def ep_dispatch_and_compute(
         if total_recv > 0:
             local_ids = received_expert_ids - local_expert_start
             tpe = torch.bincount(local_ids, minlength=num_local_experts)
-            avg_tokens = total_recv / max(num_local_experts, 1)
+            avg_tokens = num_tokens * top_k / max(num_local_experts, 1)
             scale = (avg_tokens / tpe.clamp(min=1).double()).float()
             local_output = (local_output.float() * scale[local_ids].unsqueeze(-1)).to(
                 local_output.dtype
