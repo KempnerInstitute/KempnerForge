@@ -402,10 +402,15 @@ class TestCallersSettleOnOneModel:
 
     @pytest.mark.parametrize(
         ("status", "model_type"),
-        [("FAILED", "checkpoint"), ("UNSPECIFIED", "checkpoint"), ("PENDING", None)],
-        ids=["failed", "unspecified", "another-tools-pending"],
+        [
+            ("FAILED", "checkpoint"),
+            ("UNSPECIFIED", "checkpoint"),
+            ("PENDING", None),
+            ("READY", None),
+        ],
+        ids=["failed", "unspecified", "another-tools-pending", "another-tools-ready"],
     )
-    def test_a_failed_unspecified_or_other_tools_pending_model_is_never_chosen(
+    def test_a_failed_unspecified_or_another_tools_model_is_never_chosen(
         self, model_store, status, model_type
     ):
         skipped = model_store.add("run-a-step_5", status=status, model_type=model_type)

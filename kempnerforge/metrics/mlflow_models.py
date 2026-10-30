@@ -37,9 +37,9 @@ def find_or_create_checkpoint_model(
 
     ``client`` is an ``mlflow.MlflowClient``; every call goes through it. That model is the
     earliest created (by creation time, then id) of the run's models with that name that are
-    READY, or PENDING and typed ``checkpoint``, read from every page of the search; a FAILED or
-    UNSPECIFIED one, or a PENDING one of another type (another tool still logging it), is never
-    used. So a checkpoint registered again (saved twice, re-run after a resume, or published)
+    typed ``checkpoint`` and READY or PENDING, read from every page of the search; a FAILED or
+    UNSPECIFIED one, or one of another type (a model another tool logged under that name), is
+    never used. So a checkpoint registered again (saved twice, re-run after a resume, or published)
     keeps one model, and callers that race to make it settle on the one made first. Nothing
     waits: a PENDING model, still being made by another caller or left by one that died, is
     finished here by uploading the MLmodel descriptor built from that model and finalizing it
@@ -111,7 +111,7 @@ def _earliest_live_model(
 
 
 def _is_live(model: Any) -> bool:
-    return model.status == _READY or (model.status == _PENDING and model.model_type == _MODEL_TYPE)
+    return model.model_type == _MODEL_TYPE and model.status in (_READY, _PENDING)
 
 
 def _create_external_model(
