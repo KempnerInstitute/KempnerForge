@@ -256,7 +256,8 @@ class HuggingFaceVLMDataset(Dataset):
             dataset). Positions predicting prompt tokens are ``-100``; the
             last prompt token still predicts the first caption token. A row
             whose prompt leaves no room in ``max_text_len`` for a caption
-            token has every label masked.
+            token has every label masked. A ``None`` value means the row has
+            no prompt; any other non-string value raises ``TypeError``.
         image_size: Target square image size. Default 224.
         image_mean / image_std: Normalization stats. Defaults match
             SigLIP's ``(0.5, 0.5, 0.5)``.
@@ -330,9 +331,13 @@ class HuggingFaceVLMDataset(Dataset):
             raise TypeError(
                 f"Dataset field {self._text_field!r} must be str, got {type(text_val).__name__}"
             )
-        prompt_str = prompt_val if isinstance(prompt_val, str) else None
+        if prompt_val is not None and not isinstance(prompt_val, str):
+            raise TypeError(
+                f"Dataset field {self._prompt_field!r} must be str or None, "
+                f"got {type(prompt_val).__name__}"
+            )
         input_ids, labels = _tokenize_and_mask(
-            self._tokenizer, text_val, self._max_text_len, prompt_str
+            self._tokenizer, text_val, self._max_text_len, prompt_val
         )
         return {"pixel_values": pixels, "input_ids": input_ids, "labels": labels}
 

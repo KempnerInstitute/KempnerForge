@@ -359,6 +359,30 @@ class TestNextTokenLabelContract:
         assert labels0 == labels1
 
 
+def _prompted_dataset(tmp_path, monkeypatch, prompts: list) -> HuggingFaceVLMDataset:
+    """A real ``HuggingFaceVLMDataset`` whose rows pair caption ``"xyz"`` with ``prompts``."""
+    from datasets import Dataset
+
+    Dataset.from_dict(
+        {
+            "image": [_make_image(32, 50 + i) for i in range(len(prompts))],
+            "caption": ["xyz"] * len(prompts),
+            "prompt": prompts,
+        }
+    ).save_to_disk(str(tmp_path / "prompted"))
+    monkeypatch.setattr(vlm_dataset, "build_tokenizer", lambda path: _MockTokenizer())
+    return HuggingFaceVLMDataset(
+        dataset_name=str(tmp_path / "prompted"),
+        split="train",
+        image_field="image",
+        text_field="caption",
+        tokenizer_path="unused",
+        max_text_len=8,
+        prompt_field="prompt",
+        image_size=16,
+    )
+
+
 class TestPromptRoom:
     """A prompt must leave room in ``max_text_len`` for one caption token, which the
     last prompt token predicts, plus the EOS that caption token predicts when the
@@ -422,26 +446,7 @@ class TestPromptRoom:
         """``prompt_field`` prompts are known only per row, so building the dataset
         does not check them; a row whose prompt leaves no room is masked when it is
         read, and the rows around it are unaffected."""
-        from datasets import Dataset
-
-        Dataset.from_dict(
-            {
-                "image": [_make_image(32, 50), _make_image(32, 100), _make_image(32, 150)],
-                "caption": ["xyz", "xyz", "xyz"],
-                "prompt": ["ab", "a" * 7, "a" * 6],
-            }
-        ).save_to_disk(str(tmp_path / "prompted"))
-        monkeypatch.setattr(vlm_dataset, "build_tokenizer", lambda path: _MockTokenizer())
-        ds = HuggingFaceVLMDataset(
-            dataset_name=str(tmp_path / "prompted"),
-            split="train",
-            image_field="image",
-            text_field="caption",
-            tokenizer_path="unused",
-            max_text_len=8,
-            prompt_field="prompt",
-            image_size=16,
-        )
+        ds = _prompted_dataset(tmp_path, monkeypatch, ["ab", "a" * 7, "a" * 6])
         supervised = [ds[i]["labels"][ds[i]["labels"] != -100].tolist() for i in range(3)]
         assert supervised == [[24, 25, 26, 28], [], [24, 28]]
         assert ds[1]["input_ids"].shape == (8,)
@@ -680,6 +685,18 @@ class TestHuggingFaceVLMDataset:
         wrapper = _Wrapper(mixed, tokenizer_path="gpt2", max_text_len=4)
         with pytest.raises(TypeError, match="must be str"):
             _ = wrapper[0]
+
+    def test_getitem_rejects_a_non_string_prompt(self, tmp_path, monkeypatch):
+        """A prompt value that is not a string is rejected, not dropped as no prompt."""
+        ds = _prompted_dataset(tmp_path, monkeypatch, [["ab"]])
+        with pytest.raises(TypeError, match="'prompt' must be str or None, got list"):
+            _ = ds[0]
+
+    def test_missing_prompt_trains_as_an_unprompted_caption(self, tmp_path, monkeypatch):
+        """``None`` is how a string column stores a missing value: that row has no prompt."""
+        ds = _prompted_dataset(tmp_path, monkeypatch, ["ab", None])
+        _, unprompted = _tokenize_and_mask(_MockTokenizer(), "xyz", max_text_len=8, prompt=None)
+        assert torch.equal(ds[1]["labels"], unprompted)
 
     def test_collator_wired_through_stateful_dataloader(self, tiny_hf_dataset):
         """VLMCollator reaches the batch when passed via collate_fn.
