@@ -157,6 +157,23 @@ class TestModelConfig:
         m = ModelConfig(num_experts=0, moe_top_k=99)
         assert m.is_moe is False
 
+    @pytest.mark.parametrize(
+        ("num_experts", "tie_embeddings", "expected"),
+        [
+            pytest.param(0, False, True, id="dense-untied"),
+            pytest.param(2, False, False, id="moe"),
+            pytest.param(0, True, False, id="tied"),
+            pytest.param(2, True, False, id="moe-tied"),
+        ],
+    )
+    def test_tp_sequence_parallel_only_for_dense_untied_models(
+        self, num_experts, tie_embeddings, expected
+    ):
+        """Tensor parallelism shards activations along the sequence only when the model is
+        dense and does not tie its embeddings."""
+        m = ModelConfig(num_experts=num_experts, moe_top_k=1, tie_embeddings=tie_embeddings)
+        assert m.tp_sequence_parallel is expected
+
     def test_moe_rejects_zero_top_k(self):
         with pytest.raises(ValueError, match="moe_top_k must be positive"):
             ModelConfig(num_experts=8, moe_top_k=0)
