@@ -162,7 +162,7 @@ see [Parallelism recipes](../reference/parallelism-recipes.md).
 | `n_layers` blocks FSDP (e.g. 70B on 32 GPUs) | Yes — memory forces it |
 | Need to shard attention weights (huge `dim`, few layers) | Yes |
 | MoE | Yes, for attention only — TP on experts is replaced by EP |
-| VLM | Only with SequenceParallel off (MoE or tied embeddings), and never for `mot` (see [VLM architectures](#vlm-architectures)) |
+| VLM | Only with SequenceParallel off (MoE or tied embeddings, and only tied embeddings for `moma`), and never for `mot` (see [VLM architectures](#vlm-architectures)) |
 
 The rule of thumb and supporting benchmarks are in
 [Parallelism recipes § Choosing a parallelism combination](../reference/parallelism-recipes.md#choosing-a-parallelism-combination).
