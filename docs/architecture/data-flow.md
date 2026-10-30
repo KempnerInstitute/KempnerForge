@@ -179,7 +179,9 @@ optimizer.zero_grad()
 
 `clip_grad_norm_` wraps PyTorch's utility so it works with FSDP2 sharded
 parameters. Under pipeline parallelism `pipeline_step` also passes the PP
-group, so the norm covers every stage rather than this rank's own. The NaN
+group, so the norm covers every stage rather than this rank's own; under
+expert parallelism it reads the EP group from the model and covers every
+rank's experts. The NaN
 detector returns `False` on NaN/Inf loss, zeroes
 the grads, and (after `max_consecutive`) signals a rollback to the
 previous checkpoint.
