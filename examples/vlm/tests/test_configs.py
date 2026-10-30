@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 
 from kempnerforge.config.loader import load_config
+from kempnerforge.config.schema import JobConfig
 
 EXAMPLE_ROOT = Path(__file__).resolve().parents[1]
 CONFIG_DIR = EXAMPLE_ROOT / "configs"
@@ -103,15 +104,29 @@ def test_vlm_7b_siglip2_toml() -> None:
     config.validate(world_size=4)
 
 
-def _arch(path: Path) -> str:
+def _preset(path: Path) -> JobConfig | None:
+    """The preset as ``load_config`` builds it, or None if it does not load.
+
+    The parallelism cases are drawn from the presets at collection time, so a preset that
+    does not load is left to ``test_config_loads_and_validates`` to report, rather than
+    stopping the collection of every test in this module.
+    """
+    try:
+        return load_config(str(path), cli_args=[])
+    except (ValueError, TypeError, KeyError, NotImplementedError):
+        return None
+
+
+def _arch(path: Path) -> str | None:
     """The preset's arch as the loader resolves it, which defaults a missing ``arch`` line."""
-    vlm = load_config(str(path), cli_args=[]).vlm
-    assert vlm is not None, f"{path.name} has no [vlm] section"
-    return vlm.arch
+    config = _preset(path)
+    return config.vlm.arch if config is not None and config.vlm is not None else None
 
 
 def _tp_sequence_parallel(path: Path) -> bool:
-    return load_config(str(path), cli_args=[]).model.tp_sequence_parallel
+    """Whether the preset is a VLM that tensor parallelism runs with sequence parallelism."""
+    config = _preset(path)
+    return config is not None and config.vlm is not None and config.model.tp_sequence_parallel
 
 
 UNSUPPORTED_PARALLELISM = [
@@ -139,7 +154,7 @@ def test_preset_rejects_parallelism_its_arch_cannot_run(
 
 
 TENSOR_PARALLEL_KEPT = [
-    path for path in CONFIGS if _arch(path) != "mot" and not _tp_sequence_parallel(path)
+    path for path in CONFIGS if _arch(path) not in {None, "mot"} and not _tp_sequence_parallel(path)
 ]
 
 
