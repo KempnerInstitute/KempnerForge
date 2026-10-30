@@ -2,7 +2,8 @@
 
 With one rank every expert is local and ``all_to_all_single`` is the identity, so
 ``ep_dispatch_and_compute`` must reproduce ``MoEMLP._local_forward`` exactly. Multi-rank
-behaviour is covered by ``tests/distributed/test_ep.py``.
+gradients and clipping are checked on CPU in ``tests/unit/test_ep_gradients.py``, and
+the multi-GPU forward in ``tests/distributed/test_ep.py``.
 """
 
 from __future__ import annotations
