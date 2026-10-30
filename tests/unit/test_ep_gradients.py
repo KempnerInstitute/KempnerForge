@@ -30,6 +30,7 @@ from kempnerforge.training.loop import add_moe_losses
 
 SEQ = 16
 ROWS = 2
+MAX_NORM = 0.05
 FP32 = MixedPrecisionPolicy(param_dtype=torch.float32, reduce_dtype=torch.float32)
 UNPACKED_EXPERT = re.compile(r"(.*\.mlp\.experts)\.(\d+)\.(.*)")
 PACKED_EXPERT = (".mlp.up_w", ".mlp.down_w", ".mlp.gate_w")
@@ -208,6 +209,32 @@ def _check_norm(rank, world, port, names, sizes, overrides) -> None:
         dist.destroy_process_group()
 
 
+def _check_clipping(rank, world, port, names, sizes, overrides) -> None:
+    """A clip that binds leaves one process's gradients, and the EP copies equal.
+
+    The copies of the parameters every EP rank holds must agree to fp32 rounding:
+    clipped by different coefficients they would differ by the coefficients' ratio.
+    """
+    _init(rank, world, port)
+    try:
+        step = _step(names, sizes, overrides)
+        assert clip_grad_norm_(step.model, MAX_NORM) > 2 * MAX_NORM
+        clip_grad_norm_(step.reference, MAX_NORM)
+        _assert_grads_match(step)
+        for name, p in step.model.named_parameters():
+            if _is_expert(name):
+                continue
+            assert p.grad is not None, name
+            local = p.grad.to_local() if isinstance(p.grad, DTensor) else p.grad
+            copies = [torch.empty_like(local) for _ in range(_ep_size(step.mesh))]
+            dist.all_gather(copies, local.contiguous(), group=step.mesh["ep"].get_group())
+            scale = float(local.abs().max())
+            for copy in copies:
+                torch.testing.assert_close(copy, local, rtol=1e-5, atol=1e-5 * scale, msg=name)
+    finally:
+        dist.destroy_process_group()
+
+
 class TestExpertParallelGradients:
     @pytest.mark.parametrize("layout", list(LAYOUTS))
     def test_expert_gradients_match_one_process(self, layout):
@@ -224,3 +251,7 @@ class TestClipUnderExpertParallelism:
     def test_ep_ranks_return_the_whole_model_norm(self, layout):
         """The norm covers every rank's experts, so all EP ranks return the same norm."""
         _spawn(_check_norm, *LAYOUTS[layout])
+
+    def test_clipping_keeps_the_ep_copies_equal(self):
+        """EP ranks scale by one coefficient, so their copies of shared gradients stay equal."""
+        _spawn(_check_clipping, *LAYOUTS["dp_shard2_ep2_packed"])
