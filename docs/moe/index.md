@@ -57,7 +57,7 @@ this section.
 - **MoE + TP on experts**: not supported. Expert weights stay replicated
   across the TP group.
 - **MoE + PP**: not supported — the config validator raises in
-  `JobConfig.__post_init__`.
+  `JobConfig.validate`.
 - **MoE + EP**: supported. `num_experts` must be divisible by
   `ep_world_size`, and VLMs with `vlm.arch = "mot"` or `"moma"` are
   rejected (see
