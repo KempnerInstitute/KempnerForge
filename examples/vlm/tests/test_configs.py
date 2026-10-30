@@ -107,10 +107,14 @@ def _arch(path: Path) -> str:
     return tomllib.loads(path.read_text())["vlm"]["arch"]
 
 
+def _tp_sequence_parallel(path: Path) -> bool:
+    return load_config(str(path), cli_args=[]).model.tp_sequence_parallel
+
+
 UNSUPPORTED_PARALLELISM = [
     pytest.param(path, "--distributed.tp=2", "tensor", id=f"{path.name}-tp")
     for path in CONFIGS
-    if _arch(path) in {"mot", "moma", "cross_attention"}
+    if _arch(path) == "mot" or _tp_sequence_parallel(path)
 ] + [
     pytest.param(path, "--distributed.ep=2", "expert", id=f"{path.name}-ep")
     for path in CONFIGS
@@ -122,8 +126,9 @@ UNSUPPORTED_PARALLELISM = [
 def test_preset_rejects_parallelism_its_arch_cannot_run(
     path: Path, override: str, kind: str
 ) -> None:
-    """Given the override a user would add, each MoT, MoMa and cross-attention preset fails
-    validation with its arch's reason, not later at model build or in the first forward."""
+    """Given the override a user would add, each preset that cannot run it fails validation
+    with its arch's reason, not later at model build or in the first forward: every MoT
+    preset, and under tensor parallelism every preset with sequence parallelism on."""
     config = load_config(str(path), cli_args=[override])
     match = rf"vlm.arch='{_arch(path)}' does not support {kind} parallelism"
     with pytest.raises(ValueError, match=match):

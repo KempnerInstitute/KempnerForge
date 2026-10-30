@@ -798,45 +798,58 @@ def _vlm_job(
 
 
 class TestVLMParallelismSupport:
-    """``JobConfig.validate`` rejects the VLM arches that tensor or expert parallelism cannot
+    """``JobConfig.validate`` rejects the VLM jobs that tensor or expert parallelism cannot
     run, and names the arch ahead of the generic head and expert-count checks."""
 
     @pytest.mark.parametrize(
         ("arch", "reason"),
         [
             pytest.param("mot", "MoTBlock keeps its norms", id="mot"),
-            pytest.param("moma", "no entry for MoMaFFN", id="moma"),
-            pytest.param(
-                "cross_attention", "never visits the cross-attention blocks", id="cross_attention"
-            ),
+            pytest.param("joint_decoder", "mixed torch.Tensor and DTensor", id="joint_decoder"),
+            pytest.param("moma", "mixed torch.Tensor and DTensor", id="moma"),
+            pytest.param("cross_attention", "mixed torch.Tensor and DTensor", id="cross_attention"),
         ],
     )
     def test_tensor_parallel_rejected(self, arch, reason):
+        """A dense model with untied embeddings runs tensor parallelism with sequence
+        parallelism, whose first forward no VLM arch survives."""
         match = rf"vlm.arch='{arch}' does not support tensor parallelism .*{reason}.*tp = 1"
         with pytest.raises(ValueError, match=match):
             _vlm_job(arch, tp=2).validate(world_size=2)
 
     @pytest.mark.parametrize(
-        ("arch", "num_experts", "tie_embeddings"),
-        [
-            pytest.param("mot", 2, False, id="mot-moe"),
-            pytest.param("mot", 0, True, id="mot-tied"),
-            pytest.param("moma", 0, True, id="moma-tied"),
-            pytest.param("cross_attention", 2, False, id="cross_attention-moe"),
-            pytest.param("cross_attention", 0, True, id="cross_attention-tied"),
-        ],
+        ("num_experts", "tie_embeddings"),
+        [pytest.param(2, False, id="moe"), pytest.param(0, True, id="tied")],
     )
-    def test_tensor_parallel_rejected_without_sequence_parallelism(
-        self, arch, num_experts, tie_embeddings
+    def test_mot_tensor_parallel_rejected_without_sequence_parallelism(
+        self, num_experts, tie_embeddings
     ):
-        """MoE or tied embeddings turn sequence parallelism off, so the run starts, but the
-        plan still misses what these arches add: MoT shards no parameter, MoMa no expert,
-        and every cross-attention block stays whole on every rank."""
-        job = _vlm_job(arch, tp=2, num_experts=num_experts, tie_embeddings=tie_embeddings)
-        with pytest.raises(ValueError, match=rf"vlm.arch='{arch}' does not support tensor"):
+        """MoE or tied embeddings turn sequence parallelism off, so a MoT run starts, but the
+        plan shards none of its parameters."""
+        job = _vlm_job("mot", tp=2, num_experts=num_experts, tie_embeddings=tie_embeddings)
+        with pytest.raises(ValueError, match=r"vlm.arch='mot' does not support tensor"):
             job.validate(world_size=2)
 
-    @pytest.mark.parametrize("arch", ["mot", "moma", "cross_attention"])
+    @pytest.mark.parametrize(
+        ("arch", "num_experts", "tie_embeddings"),
+        [
+            pytest.param("joint_decoder", 2, False, id="joint_decoder-moe"),
+            pytest.param("joint_decoder", 0, True, id="joint_decoder-tied"),
+            pytest.param("cross_attention", 2, False, id="cross_attention-moe"),
+            pytest.param("cross_attention", 0, True, id="cross_attention-tied"),
+            pytest.param("moma", 0, True, id="moma-tied"),
+        ],
+    )
+    def test_tensor_parallel_without_sequence_parallelism_validates(
+        self, arch, num_experts, tie_embeddings
+    ):
+        """With sequence parallelism off these train and match an unsharded copy: the plan
+        shards the transformer blocks, and the cross-attention blocks and MoMa's expert
+        groups stay whole on every rank, as MoE experts do in text models."""
+        job = _vlm_job(arch, tp=2, num_experts=num_experts, tie_embeddings=tie_embeddings)
+        job.validate(world_size=2)
+
+    @pytest.mark.parametrize("arch", ["mot", "joint_decoder", "moma", "cross_attention"])
     def test_tensor_parallel_reason_precedes_head_divisibility(self, arch):
         """6 heads do not split over tp = 4, but the arch is what has to change."""
         job = _vlm_job(arch, tp=4, n_heads=6)
@@ -862,7 +875,6 @@ class TestVLMParallelismSupport:
         ("arch", "tp", "ep", "num_experts"),
         [
             pytest.param(None, 2, 1, 0, id="text-tp"),
-            pytest.param("joint_decoder", 2, 1, 0, id="joint_decoder-tp"),
             pytest.param("joint_decoder", 1, 2, 2, id="joint_decoder-moe-ep"),
             pytest.param("cross_attention", 1, 2, 2, id="cross_attention-moe-ep"),
             pytest.param("mot", 1, 1, 2, id="mot-moe"),
@@ -870,9 +882,9 @@ class TestVLMParallelismSupport:
         ],
     )
     def test_other_combinations_still_validate(self, arch, tp, ep, num_experts):
-        """The guards name arches, not VLMs in general: text and joint_decoder still pass
-        under tensor parallelism, joint_decoder and cross-attention MoE under expert
-        parallelism, and MoT MoE and MoMa without either."""
+        """The guards stop at what fails: a dense text model still passes under tensor
+        parallelism with sequence parallelism on, joint_decoder and cross-attention MoE under
+        expert parallelism, and MoT MoE and MoMa without either."""
         _vlm_job(arch, tp=tp, ep=ep, num_experts=num_experts).validate(world_size=tp * ep)
 
 

@@ -17,7 +17,7 @@ from kempnerforge.config.scheduler import SchedulerConfig
 from kempnerforge.config.training import TrainConfig
 from kempnerforge.config.video import VideoConfig
 from kempnerforge.config.vision import VisionEncoderConfig
-from kempnerforge.config.vlm import CrossAttentionConfig, MoMaConfig, MoTConfig, VLMConfig
+from kempnerforge.config.vlm import MoMaConfig, MoTConfig, VLMConfig
 
 # Vision-encoder types whose builders load a HuggingFace model and probe
 # feature_dim / num_tokens from the model's config. Setting these knobs
@@ -188,22 +188,19 @@ class JobConfig:
                     "and FFNs per modality under other names, so the build fails or no parameter "
                     "is sharded. Set distributed.tp = 1."
                 )
-            if isinstance(self.vlm, MoMaConfig):
+            if (
+                self.vlm is not None
+                and self.distributed.pp == 1
+                and self.model.tp_sequence_parallel
+            ):
                 raise ValueError(
-                    f"vlm.arch={self.vlm.arch!r} does not support tensor parallelism "
-                    f"(distributed.tp={self.distributed.tp}): the tensor-parallel plan has no "
-                    "entry for MoMaFFN's per-modality expert groups, so they are never sharded, "
-                    "and with sequence parallelism on (untied embeddings) the first forward "
-                    "fails. Set distributed.tp = 1."
-                )
-            if isinstance(self.vlm, CrossAttentionConfig):
-                raise ValueError(
-                    f"vlm.arch={self.vlm.arch!r} does not support tensor parallelism "
-                    f"(distributed.tp={self.distributed.tp}): apply_tensor_parallel shards "
-                    "model.layers only and never visits the cross-attention blocks, so they are "
-                    "never sharded, and with sequence parallelism on (no MoE, untied embeddings) "
-                    "the first one fails on the sequence-sharded activations. Set "
-                    "distributed.tp = 1."
+                    f"vlm.arch={self.vlm.arch!r} does not support tensor parallelism with "
+                    f"sequence parallelism on (distributed.tp={self.distributed.tp}): tensor "
+                    "parallelism shards the activations along the sequence for a dense model "
+                    "with untied embeddings, and the first forward then fails on mixed "
+                    "torch.Tensor and DTensor operands. Set distributed.tp = 1. VLM arches "
+                    "other than MoT run under tensor parallelism only with sequence "
+                    "parallelism off, which an MoE model or tied embeddings give."
                 )
             if self.model.n_heads % self.distributed.tp != 0:
                 raise ValueError(
