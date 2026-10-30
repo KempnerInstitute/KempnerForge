@@ -3,16 +3,20 @@
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 import torch
+from torch.distributed.tensor.parallel import SequenceParallel
 
 from kempnerforge.config.schema import ModelConfig
+from kempnerforge.distributed import tensor_parallel
+from kempnerforge.distributed.pipeline_parallel import PipelineStageModule
 from kempnerforge.distributed.setup import _detect_ib_interface, _set_nccl_env, get_world_info
 from kempnerforge.distributed.tensor_parallel import _build_block_tp_plan
 from kempnerforge.distributed.utils import clip_grad_norm_
-from kempnerforge.model.transformer import TransformerBlock
+from kempnerforge.model.transformer import Transformer, TransformerBlock
 
 
 def _make_block(activation: str = "silu") -> TransformerBlock:
@@ -121,6 +125,91 @@ class TestBuildBlockTPPlan:
         block = _make_block(activation="silu")
         plan = _build_block_tp_plan(block, sequence_parallel=False)
         assert len(plan) == 7
+
+
+class TestApplyTensorParallelSequenceParallel:
+    """``apply_tensor_parallel`` takes the sequence-parallel decision from
+    ``ModelConfig.tp_sequence_parallel``, which config validation reads too."""
+
+    @staticmethod
+    def _config(num_experts: int = 0, tie_embeddings: bool = False) -> ModelConfig:
+        return ModelConfig(
+            dim=64,
+            n_layers=2,
+            n_heads=4,
+            vocab_size=128,
+            num_experts=num_experts,
+            moe_top_k=1,
+            tie_embeddings=tie_embeddings,
+        )
+
+    @staticmethod
+    def _sequence_parallel_norms(monkeypatch, model) -> tuple[list[bool], bool]:
+        """Whether each block's norms, and the final norm, get ``SequenceParallel``."""
+        calls = []
+        monkeypatch.setattr(tensor_parallel, "get_tp_mesh", lambda mesh: mesh)
+        monkeypatch.setattr(
+            tensor_parallel,
+            "parallelize_module",
+            lambda module, mesh, plan: calls.append((module, plan)),
+        )
+        tensor_parallel.apply_tensor_parallel(model, SimpleNamespace(size=lambda: 1))
+        blocks = [
+            isinstance(plan.get("attention_norm"), SequenceParallel)
+            and isinstance(plan.get("mlp_norm"), SequenceParallel)
+            for module, plan in calls
+            if isinstance(module, TransformerBlock)
+        ]
+        final = any(
+            isinstance(plan.get("norm"), SequenceParallel)
+            for module, plan in calls
+            if module is model
+        )
+        return blocks, final
+
+    @pytest.mark.parametrize(
+        ("num_experts", "tie_embeddings"),
+        [
+            pytest.param(0, False, id="dense-untied"),
+            pytest.param(2, False, id="moe"),
+            pytest.param(0, True, id="tied"),
+        ],
+    )
+    def test_norms_get_sequence_parallel_as_the_config_says(
+        self, monkeypatch, num_experts, tie_embeddings
+    ):
+        config = self._config(num_experts, tie_embeddings)
+        blocks, final = self._sequence_parallel_norms(monkeypatch, Transformer(config))
+        expected = config.tp_sequence_parallel
+        assert blocks == [expected, expected]
+        assert final is expected
+
+    def test_a_pipeline_stage_runs_without_sequence_parallel(self, monkeypatch):
+        """Pipeline stages hand plain tensors to each other, so even a dense untied model's
+        stage gets no ``SequenceParallel``."""
+        stage = PipelineStageModule(self._config(), stage_id=1, num_stages=2, layer_range=(1, 2))
+        blocks, final = self._sequence_parallel_norms(monkeypatch, stage)
+        assert blocks == [False]
+        assert final is False
+
+    @pytest.mark.parametrize(
+        ("tie_embeddings", "is_moe", "expected"),
+        [
+            pytest.param(False, False, True, id="dense-untied"),
+            pytest.param(False, True, False, id="moe"),
+            pytest.param(True, False, False, id="tied"),
+        ],
+    )
+    def test_a_config_without_the_property_keeps_the_tie_and_moe_rule(
+        self, monkeypatch, tie_embeddings, is_moe, expected
+    ):
+        """A model whose config has no ``tp_sequence_parallel`` gets the rule it had before
+        the property existed."""
+        model = Transformer(self._config())
+        model.config = SimpleNamespace(tie_embeddings=tie_embeddings, is_moe=is_moe)
+        blocks, final = self._sequence_parallel_norms(monkeypatch, model)
+        assert blocks == [expected, expected]
+        assert final is expected
 
 
 # ---------------------------------------------------------------------------

@@ -157,6 +157,23 @@ class TestModelConfig:
         m = ModelConfig(num_experts=0, moe_top_k=99)
         assert m.is_moe is False
 
+    @pytest.mark.parametrize(
+        ("num_experts", "tie_embeddings", "expected"),
+        [
+            pytest.param(0, False, True, id="dense-untied"),
+            pytest.param(2, False, False, id="moe"),
+            pytest.param(0, True, False, id="tied"),
+            pytest.param(2, True, False, id="moe-tied"),
+        ],
+    )
+    def test_tp_sequence_parallel_only_for_dense_untied_models(
+        self, num_experts, tie_embeddings, expected
+    ):
+        """Tensor parallelism shards activations along the sequence only when the model is
+        dense and does not tie its embeddings."""
+        m = ModelConfig(num_experts=num_experts, moe_top_k=1, tie_embeddings=tie_embeddings)
+        assert m.tp_sequence_parallel is expected
+
     def test_moe_rejects_zero_top_k(self):
         with pytest.raises(ValueError, match="moe_top_k must be positive"):
             ModelConfig(num_experts=8, moe_top_k=0)
@@ -743,6 +760,193 @@ class TestJobConfig:
             train=TrainConfig(seq_len=600),
         )
         config.validate(world_size=1)  # Should not raise.
+
+
+def _vlm_job(
+    arch: str | None,
+    *,
+    tp: int = 1,
+    ep: int = 1,
+    pp: int = 1,
+    n_heads: int = 4,
+    num_experts: int = 0,
+    tie_embeddings: bool = False,
+) -> JobConfig:
+    """A small job on ``tp * ep * pp`` ranks, text-only when ``arch`` is None, that is
+    otherwise valid, so the only check it can fail is the one a test sets up.
+
+    Cross-attention gets a block on every layer: the default cadence of 4 would give these
+    2 layers none, a model that runs like a text-only one.
+    """
+    vlm_sections = {}
+    if arch is not None:
+        arch_fields = {"cross_attention_every_n_layers": 1} if arch == "cross_attention" else {}
+        vlm_sections = {
+            "vision_encoder": VisionEncoderConfig(type="random", num_tokens=8),
+            "adapter": AdapterConfig(),
+            "vlm": VLMConfig.for_arch(arch, max_text_len=32, **arch_fields),
+        }
+    return JobConfig(
+        model=ModelConfig(
+            dim=16 * n_heads,
+            n_layers=2,
+            n_heads=n_heads,
+            vocab_size=256,
+            max_seq_len=128,
+            num_experts=num_experts,
+            moe_top_k=1,
+            tie_embeddings=tie_embeddings,
+        ),
+        train=TrainConfig(seq_len=64),
+        distributed=DistributedConfig(dp_shard=1, tp=tp, ep=ep, pp=pp),
+        **vlm_sections,
+    )
+
+
+class TestVLMParallelismSupport:
+    """``JobConfig.validate`` rejects the VLM jobs that tensor or expert parallelism cannot
+    run, and names the arch ahead of the generic head and expert-count checks."""
+
+    @pytest.mark.parametrize(
+        ("arch", "reason"),
+        [
+            pytest.param("mot", "MoTBlock renames the attention modules", id="mot"),
+            pytest.param("joint_decoder", "mixed torch.Tensor and DTensor", id="joint_decoder"),
+            pytest.param("moma", "mixed torch.Tensor and DTensor", id="moma"),
+            pytest.param("cross_attention", "mixed torch.Tensor and DTensor", id="cross_attention"),
+        ],
+    )
+    def test_tensor_parallel_rejected(self, arch, reason):
+        """A dense model with untied embeddings runs tensor parallelism with sequence
+        parallelism, whose first forward no VLM arch survives."""
+        match = (
+            rf"vlm.arch='{arch}' does not support tensor parallelism.*\(distributed.tp=2\)"
+            rf".*{reason}.*tp = 1"
+        )
+        with pytest.raises(ValueError, match=match):
+            _vlm_job(arch, tp=2).validate(world_size=2)
+
+    @pytest.mark.parametrize(
+        ("arch", "ways"),
+        [
+            pytest.param(
+                "joint_decoder", "an MoE model or tied embeddings give", id="joint_decoder"
+            ),
+            pytest.param(
+                "cross_attention", "an MoE model or tied embeddings give", id="cross_attention"
+            ),
+            pytest.param("moma", r"tied embeddings give \(MoMa keeps", id="moma"),
+        ],
+    )
+    def test_sequence_parallel_error_names_the_ways_to_turn_it_off(self, arch, ways):
+        """MoMa keeps ``model.num_experts = 0``, so tied embeddings are its only way."""
+        match = rf"only with sequence parallelism off, which {ways}"
+        with pytest.raises(ValueError, match=match):
+            _vlm_job(arch, tp=2).validate(world_size=2)
+
+    @pytest.mark.parametrize(
+        ("num_experts", "tie_embeddings"),
+        [pytest.param(2, False, id="moe"), pytest.param(0, True, id="tied")],
+    )
+    def test_mot_tensor_parallel_rejected_without_sequence_parallelism(
+        self, num_experts, tie_embeddings
+    ):
+        """MoE or tied embeddings turn sequence parallelism off, so a MoT run starts, but the
+        plan shards none of its parameters."""
+        job = _vlm_job("mot", tp=2, num_experts=num_experts, tie_embeddings=tie_embeddings)
+        with pytest.raises(ValueError, match=r"vlm.arch='mot' does not support tensor"):
+            job.validate(world_size=2)
+
+    @pytest.mark.parametrize(
+        ("arch", "num_experts", "tie_embeddings"),
+        [
+            pytest.param("joint_decoder", 2, False, id="joint_decoder-moe"),
+            pytest.param("joint_decoder", 0, True, id="joint_decoder-tied"),
+            pytest.param("cross_attention", 2, False, id="cross_attention-moe"),
+            pytest.param("cross_attention", 0, True, id="cross_attention-tied"),
+            pytest.param("moma", 0, True, id="moma-tied"),
+        ],
+    )
+    def test_tensor_parallel_without_sequence_parallelism_validates(
+        self, arch, num_experts, tie_embeddings
+    ):
+        """With sequence parallelism off these train and match an unsharded copy: the plan
+        shards the transformer blocks, and the cross-attention blocks and MoMa's expert
+        groups stay whole on every rank, as MoE experts do in text models."""
+        job = _vlm_job(arch, tp=2, num_experts=num_experts, tie_embeddings=tie_embeddings)
+        job.validate(world_size=2)
+
+    def test_a_pipeline_parallel_vlm_gets_the_pipeline_error_under_tensor_parallelism(self):
+        """Pipeline stages run tensor parallelism without sequence parallelism, so a dense VLM
+        with pp > 1 reaches the VLM + pipeline-parallel error, not the sequence-parallel one."""
+        with pytest.raises(ValueError, match=r"VLM \+ Pipeline Parallelism is not supported"):
+            _vlm_job("joint_decoder", tp=2, pp=2).validate(world_size=4)
+
+    def test_errors_name_the_arch_of_the_config_class(self):
+        """The checks act on the config's class, and the arch field can name another arch
+        after a ``--vlm.arch`` override, so the error names the class's arch."""
+        job = _vlm_job("moma", ep=2)
+        assert job.vlm is not None
+        job.vlm.arch = "joint_decoder"
+        with pytest.raises(ValueError, match=r"vlm.arch='moma' does not support expert"):
+            job.validate(world_size=2)
+
+    @pytest.mark.parametrize("arch", ["mot", "joint_decoder", "moma", "cross_attention"])
+    def test_tensor_parallel_reason_precedes_head_divisibility(self, arch):
+        """6 heads do not split over tp = 4, but the arch's reason comes first."""
+        job = _vlm_job(arch, tp=4, n_heads=6)
+        with pytest.raises(ValueError, match=rf"vlm.arch='{arch}' does not support tensor"):
+            job.validate(world_size=4)
+
+    @pytest.mark.parametrize(
+        ("arch", "reason"),
+        [
+            pytest.param("mot", "expects layer.attention and layer.mlp", id="mot"),
+            pytest.param("moma", "partitions MoEMLP experts only", id="moma"),
+        ],
+    )
+    @pytest.mark.parametrize("num_experts", [0, 2, 3])
+    def test_expert_parallel_rejected(self, arch, reason, num_experts):
+        """0 experts would fail the MoE check, 3 the divisibility check by ep = 2, and any
+        count above 0 MoMa's own num_experts check; the arch's reason comes first."""
+        match = (
+            rf"vlm.arch='{arch}' does not support expert parallelism \(distributed.ep=2\)"
+            rf".*{reason}.*ep = 1"
+        )
+        with pytest.raises(ValueError, match=match):
+            _vlm_job(arch, ep=2, num_experts=num_experts).validate(world_size=2)
+
+    def test_moe_pipeline_error_offers_mot_only_fsdp(self):
+        """MoT runs neither tensor nor expert parallelism, so the MoE + PP error offers it FSDP
+        alone, and still offers all three to a text MoE model."""
+        with pytest.raises(ValueError, match=r"Use FSDP instead; MoT runs neither TP nor EP"):
+            _vlm_job("mot", pp=2, num_experts=2).validate(world_size=2)
+        with pytest.raises(ValueError, match=r"Use FSDP, TP, or EP instead"):
+            _vlm_job(None, pp=2, num_experts=2).validate(world_size=2)
+
+    def test_mot_expert_parallel_error_points_at_the_missing_moe_losses(self):
+        """The fix it gives, ep = 1, trains MoT with MoE without its MoE losses (#308), so the
+        error says so and links the issue."""
+        with pytest.raises(ValueError, match=r"ep = 1\. MoT with MoE then trains, but without"):
+            _vlm_job("mot", ep=2, num_experts=2).validate(world_size=2)
+        with pytest.raises(ValueError, match=r"KempnerForge/issues/308"):
+            _vlm_job("mot", ep=2, num_experts=2).validate(world_size=2)
+
+    @pytest.mark.parametrize(
+        ("arch", "tp", "ep", "num_experts"),
+        [
+            pytest.param(None, 2, 1, 0, id="text-tp"),
+            pytest.param("joint_decoder", 1, 2, 2, id="joint_decoder-moe-ep"),
+            pytest.param("cross_attention", 1, 2, 2, id="cross_attention-moe-ep"),
+            pytest.param("mot", 1, 1, 2, id="mot-moe"),
+            pytest.param("moma", 1, 1, 0, id="moma"),
+        ],
+    )
+    def test_other_combinations_still_validate(self, arch, tp, ep, num_experts):
+        """The guards stop at what fails: a dense text model still passes under tensor
+        parallelism with sequence parallelism on, joint_decoder and cross-attention MoE under
+        expert parallelism, and MoT MoE and MoMa without either."""
+        _vlm_job(arch, tp=tp, ep=ep, num_experts=num_experts).validate(world_size=tp * ep)
 
 
 class TestFlexSdpaBackendWarning:

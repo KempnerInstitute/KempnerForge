@@ -64,6 +64,7 @@
           "purpose": "Architecture hyperparameters (dim, layers, heads, vocab, MoE, QK-norm)",
           "properties": [
             "is_moe",
+            "tp_sequence_parallel",
             "head_dim",
             "computed_ffn_hidden_dim",
             "num_params_estimate"

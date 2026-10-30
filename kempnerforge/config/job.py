@@ -17,7 +17,7 @@ from kempnerforge.config.scheduler import SchedulerConfig
 from kempnerforge.config.training import TrainConfig
 from kempnerforge.config.video import VideoConfig
 from kempnerforge.config.vision import VisionEncoderConfig
-from kempnerforge.config.vlm import MoMaConfig, VLMConfig
+from kempnerforge.config.vlm import MoMaConfig, MoTConfig, VLMConfig
 
 # Vision-encoder types whose builders load a HuggingFace model and probe
 # feature_dim / num_tokens from the model's config. Setting these knobs
@@ -25,6 +25,15 @@ from kempnerforge.config.vlm import MoMaConfig, VLMConfig
 # user mistake. The "random" stub is excluded because it has no model
 # to probe and the user-supplied values are the actual values.
 _HF_VISION_ENCODER_TYPES = frozenset({"siglip2", "clip"})
+
+
+def _arch_of(vlm: VLMConfig) -> str:
+    """The arch of ``vlm``'s class, which is what the parallelism checks act on.
+
+    The instance's ``arch`` field can name another arch, for example after a
+    ``--vlm.arch`` override, which keeps the class the TOML section built.
+    """
+    return type(vlm).arch
 
 
 @dataclass
@@ -180,6 +189,34 @@ class JobConfig:
             )
 
         if self.distributed.tp > 1:
+            if isinstance(self.vlm, MoTConfig):
+                raise ValueError(
+                    f"vlm.arch={_arch_of(self.vlm)!r} does not support tensor parallelism "
+                    f"(distributed.tp={self.distributed.tp}): the tensor-parallel plan is keyed "
+                    "on TransformerBlock's module names, and MoTBlock renames the attention "
+                    "modules (attn_norm, attn) and holds mlp_norm and mlp as per-modality "
+                    "ModuleDicts, so the build fails or no parameter is sharded. Set "
+                    "distributed.tp = 1."
+                )
+            if (
+                self.vlm is not None
+                and self.distributed.pp == 1
+                and self.model.tp_sequence_parallel
+            ):
+                ways = (
+                    "tied embeddings give (MoMa keeps model.num_experts = 0)"
+                    if isinstance(self.vlm, MoMaConfig)
+                    else "an MoE model or tied embeddings give"
+                )
+                raise ValueError(
+                    f"vlm.arch={_arch_of(self.vlm)!r} does not support tensor parallelism with "
+                    f"sequence parallelism on (distributed.tp={self.distributed.tp}): tensor "
+                    "parallelism shards the activations along the sequence for a dense model "
+                    "with untied embeddings, and the first forward then fails on mixed "
+                    "torch.Tensor and DTensor operands. Set distributed.tp = 1. This arch "
+                    "runs under tensor parallelism only with sequence parallelism off, which "
+                    f"{ways}."
+                )
             if self.model.n_heads % self.distributed.tp != 0:
                 raise ValueError(
                     f"n_heads ({self.model.n_heads}) must be divisible by "
@@ -199,13 +236,36 @@ class JobConfig:
             )
 
         if self.model.is_moe and self.distributed.pp > 1:
+            alternatives = (
+                "Use FSDP instead; MoT runs neither TP nor EP."
+                if isinstance(self.vlm, MoTConfig)
+                else "Use FSDP, TP, or EP instead."
+            )
             raise ValueError(
                 "MoE + Pipeline Parallelism is not supported. MoE layers use "
                 "data-dependent routing that is incompatible with pipeline stage "
-                "splitting. Use FSDP, TP, or EP instead."
+                f"splitting. {alternatives}"
             )
 
         if self.distributed.ep > 1:
+            if isinstance(self.vlm, MoTConfig):
+                raise ValueError(
+                    f"vlm.arch={_arch_of(self.vlm)!r} does not support expert parallelism "
+                    f"(distributed.ep={self.distributed.ep}): the FSDP2 wrap for expert-parallel "
+                    "blocks expects layer.attention and layer.mlp, and MoTBlock names its "
+                    "attention attn and keeps its FFNs per modality, so a MoT model with experts "
+                    "fails to build. Set distributed.ep = 1. MoT with MoE then trains, but "
+                    "without its load-balancing loss, router z-loss, bias schedule or balance "
+                    "metric (https://github.com/KempnerInstitute/KempnerForge/issues/308)."
+                )
+            if isinstance(self.vlm, MoMaConfig):
+                raise ValueError(
+                    f"vlm.arch={_arch_of(self.vlm)!r} does not support expert parallelism "
+                    f"(distributed.ep={self.distributed.ep}): apply_expert_parallel partitions "
+                    "MoEMLP experts only, and MoMa's per-modality expert groups need an EP-aware "
+                    "dispatch that is not wired yet, so every rank would keep every expert. Set "
+                    "distributed.ep = 1."
+                )
             if not self.model.is_moe:
                 raise ValueError("ep > 1 requires an MoE model (num_experts > 0)")
             if self.model.num_experts % self.distributed.ep != 0:
@@ -264,11 +324,6 @@ class JobConfig:
                         "MoMa + model.num_experts > 0 is rejected. MoMa derives expert "
                         "counts per modality from vlm.moma_experts_per_modality; set "
                         "model.num_experts=0 (the dense-LLM default) when using arch='moma'."
-                    )
-                if self.distributed.ep > 1:
-                    raise ValueError(
-                        "MoMa + Expert Parallelism is not supported in v1. Per-modality "
-                        "expert groups need EP-aware dispatch that is not yet wired."
                     )
                 if self.train.compile_model:
                     import logging

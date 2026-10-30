@@ -192,6 +192,18 @@ class ModelConfig:
         return self.num_experts > 0
 
     @property
+    def tp_sequence_parallel(self) -> bool:
+        """Whether tensor parallelism runs this model with ``SequenceParallel``.
+
+        ``apply_tensor_parallel`` shards activations along the sequence between blocks
+        unless the embeddings are tied, since sharding the output head's columns would also
+        shard the shared embedding weight, or the model is MoE, since boolean indexing in
+        expert dispatch breaks sequence-sharded DTensors. Pipeline stages also run without
+        it; that depends on the stage, not on this config.
+        """
+        return not self.tie_embeddings and not self.is_moe
+
+    @property
     def head_dim(self) -> int:
         """Per-head attention width.
 

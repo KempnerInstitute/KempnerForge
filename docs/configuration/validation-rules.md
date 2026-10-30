@@ -218,6 +218,41 @@ stages, so they can't be tied.
 eval.enabled && !eval.dataset_path && !eval.hf_dataset_name  →  ValueError
 ```
 
+### VLM architectures under tensor parallelism
+
+Checked first when `distributed.tp > 1`, ahead of head divisibility, so the
+error names the arch rather than a head count:
+
+```
+isinstance(vlm, MoTConfig) && distributed.tp > 1             →  ValueError
+vlm set && distributed.tp > 1 && sequence parallelism on     →  ValueError
+```
+
+The tensor-parallel plan
+([`apply_tensor_parallel`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/distributed/tensor_parallel.py))
+is written for `TransformerBlock` and walks `model.layers` only. The
+checks act on the class of the `[vlm]` config, and the errors name that
+class's arch.
+
+- `mot`: `MoTBlock` renames the attention modules (`attn_norm`, `attn`) and
+  holds `mlp_norm` and `mlp` as per-modality `ModuleDict`s, so the build
+  fails with `KeyError: 'parameter name can't contain "."'` or no parameter
+  is sharded.
+- Every other arch, with sequence parallelism on: the plan shards the
+  activations along the sequence for a dense model with untied embeddings
+  (`ModelConfig.tp_sequence_parallel`, without pipeline parallelism), and the
+  first forward fails on mixed `torch.Tensor` and `DTensor` operands, in
+  `joint_decoder` and `moma` where the image prefix joins the token
+  embeddings and in `cross_attention` in the first cross-attention block.
+
+With sequence parallelism off, which an MoE model or tied embeddings give
+(for `moma` only tied embeddings, since MoMa keeps `model.num_experts = 0`),
+`joint_decoder`, `cross_attention` and `moma` train under tensor parallelism
+and match an unsharded model with the same weights. The plan shards the
+transformer blocks, and the cross-attention blocks and MoMa's expert groups
+stay whole on every tensor-parallel rank and compute the same result there,
+as MoE experts do in text models. Otherwise set `distributed.tp = 1`.
+
 ### Tensor-parallel head divisibility
 
 When `distributed.tp > 1`:
@@ -241,12 +276,25 @@ model.is_moe && distributed.pp > 1  →  ValueError
 ```
 
 Rationale: routing is data-dependent and resists pipeline-stage
-splitting. Use FSDP, TP, or EP instead.
+splitting. Use FSDP, TP, or EP instead; for `vlm.arch = "mot"` the error
+offers FSDP alone, since MoT runs neither TP nor EP.
 
 ### Expert parallel
 
 When `distributed.ep > 1`:
 
+- `vlm.arch` must not be `"mot"` or `"moma"`. Checked first, so these jobs
+  get their own reason whatever `model.num_experts` is:
+  - `mot`: the FSDP2 wrap for expert-parallel blocks expects
+    `layer.attention` and `layer.mlp`, and `MoTBlock` names its attention
+    `attn` and keeps its experts per modality, so the model build fails. MoT
+    with MoE trains with `ep = 1`, but without its load-balancing loss,
+    router z-loss, bias schedule or balance metric
+    ([#308](https://github.com/KempnerInstitute/KempnerForge/issues/308)).
+  - `moma`: `apply_expert_parallel` partitions `MoEMLP` experts only, and
+    MoMa's per-modality expert groups need an EP-aware dispatch that is not
+    wired yet. MoMa also requires `model.num_experts = 0`, which the next
+    check rejects, so this one has to come first to be seen at all.
 - `model.is_moe` must be `True` (the error reads
   `"ep > 1 requires an MoE model (num_experts > 0)"`).
 - `model.num_experts % distributed.ep == 0`.

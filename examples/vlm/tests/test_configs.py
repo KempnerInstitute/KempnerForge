@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 
 from kempnerforge.config.loader import load_config
+from kempnerforge.config.schema import JobConfig
 
 EXAMPLE_ROOT = Path(__file__).resolve().parents[1]
 CONFIG_DIR = EXAMPLE_ROOT / "configs"
@@ -101,6 +102,102 @@ def test_vlm_7b_siglip2_toml() -> None:
     # 196 + 2048 = 2244 <= max_seq_len=2304.
     assert config.vision_encoder.num_tokens == 0
     config.validate(world_size=4)
+
+
+def _preset(path: Path) -> JobConfig | None:
+    """The preset as ``load_config`` builds it, or None if it does not load.
+
+    The parallelism cases are drawn from the presets at collection time, so a preset that
+    does not load is left to ``test_config_loads_and_validates`` to report, rather than
+    stopping the collection of every test in this module.
+    """
+    try:
+        return load_config(str(path), cli_args=[])
+    except (ValueError, TypeError, KeyError, NotImplementedError):
+        return None
+
+
+def _arch(path: Path) -> str | None:
+    """The preset's arch as the loader resolves it, which defaults a missing ``arch`` line."""
+    config = _preset(path)
+    return config.vlm.arch if config is not None and config.vlm is not None else None
+
+
+def _tp_sequence_parallel(path: Path) -> bool:
+    """Whether the preset is a VLM that tensor parallelism runs with sequence parallelism."""
+    config = _preset(path)
+    return config is not None and config.vlm is not None and config.model.tp_sequence_parallel
+
+
+UNSUPPORTED_PARALLELISM = [
+    pytest.param(path, "--distributed.tp=2", "tensor", id=f"{path.name}-tp")
+    for path in CONFIGS
+    if _arch(path) == "mot" or _tp_sequence_parallel(path)
+] + [
+    pytest.param(path, "--distributed.ep=2", "expert", id=f"{path.name}-ep")
+    for path in CONFIGS
+    if _arch(path) in {"mot", "moma"}
+]
+
+
+REJECTION_REASONS = {
+    ("tensor", "mot"): "MoTBlock renames the attention modules",
+    ("expert", "mot"): "expects layer.attention and layer.mlp",
+    ("expert", "moma"): "partitions MoEMLP experts only",
+}
+
+
+@pytest.mark.parametrize(("path", "override", "kind"), UNSUPPORTED_PARALLELISM)
+def test_preset_rejects_parallelism_its_arch_cannot_run(
+    path: Path, override: str, kind: str
+) -> None:
+    """Given the override a user would add, each preset that cannot run it fails validation
+    with its arch's reason, not later at model build or in the first forward: every MoT
+    preset, and under tensor parallelism every preset with sequence parallelism on."""
+    config = load_config(str(path), cli_args=[override])
+    arch = _arch(path)
+    reason = REJECTION_REASONS.get((kind, arch), "with sequence parallelism on")
+    match = rf"vlm.arch='{arch}' does not support {kind} parallelism.*{reason}"
+    with pytest.raises(ValueError, match=match):
+        config.validate(world_size=2)
+
+
+TENSOR_PARALLEL_KEPT = [
+    path for path in CONFIGS if _arch(path) not in {None, "mot"} and not _tp_sequence_parallel(path)
+]
+
+
+@pytest.mark.parametrize("path", TENSOR_PARALLEL_KEPT, ids=lambda path: path.name)
+def test_preset_keeps_tensor_parallelism_with_sequence_parallelism_off(path: Path) -> None:
+    """MoE or tied embeddings turn sequence parallelism off, and every arch but MoT trains
+    under tensor parallelism then, so these presets still validate with it."""
+    config = load_config(str(path), cli_args=["--distributed.tp=2"])
+    config.validate(world_size=2)
+
+
+def test_presets_cover_every_arch_and_both_tensor_parallel_outcomes() -> None:
+    """The parallelism cases come from the presets, so removing a preset would drop its cases
+    without a failure: every arch keeps a preset, and so does each tensor-parallel outcome."""
+    assert {_arch(path) for path in CONFIGS} >= {"joint_decoder", "cross_attention", "mot", "moma"}
+    assert CONFIG_DIR / "vlm_debug_moe.toml" in TENSOR_PARALLEL_KEPT
+    assert any(_tp_sequence_parallel(path) for path in CONFIGS)
+
+
+def test_an_arch_override_is_reported_as_the_presets_arch() -> None:
+    """``--vlm.arch`` keeps the preset's MoMa config class, which is what the expert-parallel
+    check acts on, so the error names ``moma`` rather than the overridden field."""
+    config = load_config(
+        str(CONFIG_DIR / "vlm_debug_moma.toml"),
+        cli_args=["--vlm.arch=joint_decoder", "--distributed.ep=2", "--model.num_experts=2"],
+    )
+    with pytest.raises(ValueError, match=r"vlm.arch='moma' does not support expert parallelism"):
+        config.validate(world_size=2)
+
+
+def test_cross_attention_moe_preset_keeps_expert_parallelism() -> None:
+    """The guards name arches, so the cross-attention MoE preset still validates with EP."""
+    config = load_config(str(CONFIG_DIR / "vlm_debug_moe.toml"), cli_args=["--distributed.ep=2"])
+    config.validate(world_size=2)
 
 
 def _load_entry_point() -> Any:
