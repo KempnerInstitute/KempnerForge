@@ -17,13 +17,7 @@ from kempnerforge.config.registry import registry
 
 
 def _zero_on_graph(logits: torch.Tensor) -> torch.Tensor:
-    """Exact float32 zero that stays on the autograd graph of ``logits``.
-
-    The loss of a batch with no supervised label: backward still runs through the
-    model, so the collectives it drives (FSDP's gradient reduce-scatter) run on this
-    rank as on ranks with labels. Its gradient with respect to ``logits`` is exactly
-    zero, and its value is zero whatever ``logits`` holds.
-    """
+    """An exact float32 zero that stays on the autograd graph of ``logits``."""
     return logits[..., :0].sum().float()
 
 
@@ -33,8 +27,8 @@ def cross_entropy_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tens
 
     Uses ``ignore_index=-100`` so packed-sequence boundary tokens (labeled -100
     by the dataset) are excluded from the loss. When no -100 labels are present,
-    this has zero overhead. A batch with every label ``-100`` returns
-    ``_zero_on_graph(logits)``.
+    this has zero overhead. A batch with every label ``-100`` returns an exact
+    float32 zero that stays on the autograd graph of ``logits``.
     """
     flat_labels = labels.view(-1)
     if (flat_labels == -100).all():
@@ -58,7 +52,8 @@ def chunked_cross_entropy_loss(
 
     Uses ``ignore_index=-100`` so packed-sequence boundary tokens are excluded.
     When no -100 labels are present, this has zero overhead. A batch with every
-    label ``-100`` returns ``_zero_on_graph(logits)``.
+    label ``-100`` returns an exact float32 zero that stays on the autograd graph
+    of ``logits``.
 
     Note: the input logit tensor (B*S, V) is still fully materialized by the
     model's output head before reaching this function. For deeper savings

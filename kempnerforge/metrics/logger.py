@@ -68,8 +68,7 @@ class _RankFormatter(logging.Formatter):
 class _RankFilter(logging.Filter):
     """Only allow log records from the specified rank, and records marked for every rank.
 
-    A record logged with ``extra={"every_rank": True}`` passes on every rank, for
-    an event that only the rank that logs it can see.
+    A record logged with ``extra={"every_rank": True}`` passes on every rank.
     """
 
     def __init__(self, rank: int = 0) -> None:

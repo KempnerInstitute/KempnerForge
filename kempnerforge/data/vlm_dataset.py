@@ -141,9 +141,10 @@ def _min_text_len_for_prompt(num_prompt_tokens: int, tokenizer: Any) -> int:
 def check_prompt_fits(tokenizer: Any, prompt: str, max_text_len: int) -> None:
     """Reject a prompt that leaves no room in ``max_text_len`` for a caption token.
 
-    A dataset whose prompt is fixed for the whole run calls this once when it is
-    built, since such a prompt would leave every sample training on EOS alone or
-    on nothing. ``_tokenize_and_mask`` applies the same bound to each sample.
+    Args:
+        tokenizer: The tokenizer the samples are built with.
+        prompt: The prompt, fixed for the whole run.
+        max_text_len: The fixed text length of every sample.
 
     Raises:
         ValueError: ``max_text_len`` is below the prompt's token count plus one
@@ -199,13 +200,6 @@ def _check_prompt_column_has_room(
 ) -> None:
     """Reject a prompt column in which no row leaves room for a caption token.
 
-    Reads ``prompt_field`` in row order and returns at the first row whose prompt
-    leaves that room: one with no prompt (``None``), or one whose prompt fits the
-    bound ``check_prompt_fits`` enforces. A usable column is therefore read only up
-    to that row, and ``_tokenize_and_mask`` masks any later prompt that does not
-    fit; a column with no such row is read to its end. The captions and the
-    ``max_text_len >= 2`` minimum that ``VLMConfig`` enforces are not checked here.
-
     Args:
         rows: A ``datasets.Dataset`` with a ``prompt_field`` column.
         prompt_field: The prompt column's name.
@@ -213,7 +207,7 @@ def _check_prompt_column_has_room(
         max_text_len: The fixed text length of every sample.
 
     Raises:
-        TypeError: A prompt read before that row is neither a ``str`` nor ``None``.
+        TypeError: A prompt read is neither a ``str`` nor ``None``.
         ValueError: The column has rows and none of them leaves room for a caption
             token; the message names the shortest prompt's token count and the
             ``max_text_len`` it needs.
@@ -275,9 +269,8 @@ def _tokenize_and_mask(
 
     A prompt that leaves no room for a caption token (the bound
     ``check_prompt_fits`` enforces) masks every label, so the sample adds no
-    loss instead of training on EOS alone or on nothing; each process, on every
-    rank, logs a warning at the 1st, 2nd, 4th, ... such sample. Truncating a
-    long caption is unaffected.
+    loss; each process, on every rank, logs a warning at the 1st, 2nd, 4th, ...
+    such sample. Truncating a long caption is unaffected.
     """
     if prompt is not None:
         prompt_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
