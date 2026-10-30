@@ -164,6 +164,32 @@ mesh: ("dp_shard", "ep", "tp") → (4, 2, 4)
 Benchmark and reproducer: [Benchmarks § MoE Expert
 Parallelism](../reference/benchmarks.md#moe-expert-parallelism).
 
+## Gradients and clipping
+
+The ranks of an EP group differ only in `ep`, so they share a DP rank
+and read the same batch: `ep` splits the experts, not the data. The
+global batch, and the tokens counted per step, are those of the DP
+dimensions alone, as without EP.
+
+Each local expert therefore receives every token routed to it once
+from each rank of its EP group, and its weight gradient sums the
+gradients of `ep` ranks' losses, while FSDP2 averages over the DP mesh
+only. `ep_dispatch_and_compute` divides the gradient that enters the
+local expert compute by `ep` and multiplies the gradient it hands back
+to the tokens by `ep`. The routed-expert gradients are then the mean
+over the EP group, equal to one process's on the same batch, and every
+other gradient is unchanged. Both factors are exact when `ep` is a
+power of two.
+
+The routers, the shared experts and every parameter outside the MoE
+layers have a copy on each EP rank. FSDP2 does not reduce their
+gradients over `ep`, so the copies stay equal only as long as the EP
+ranks compute and scale those gradients alike. `clip_grad_norm_`
+therefore sums the routed experts' squared norms over the EP group and
+averages the copies', and every EP rank clips by the whole model's norm
+with the same coefficient; see
+[Gradient utilities § Under expert parallelism](../training/gradient-utilities.md#under-expert-parallelism).
+
 ## Gradient scaling (optional)
 
 When `moe_gradient_scale = true`, the output of each local expert is
