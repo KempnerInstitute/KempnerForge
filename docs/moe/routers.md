@@ -120,9 +120,9 @@ forwards the right kwargs to whichever router is selected (only
 
 ## Shared experts
 
-Independent of the router. When `moe_shared_experts > 0`, a
-`SwiGLUMLP`-style expert runs on **every token** and its output is
-*added* to the routed experts' weighted sum:
+Independent of the router. `moe_shared_experts = N` adds `N` shared
+experts that run on **every token**; their output is *added* to the
+routed experts' weighted sum:
 
 ```python
 # kempnerforge/model/moe.py — MoEMLP.forward
@@ -131,10 +131,34 @@ if self.shared_expert is not None:
     output = output + self.shared_expert(x_flat)
 ```
 
+The `N` shared experts are built as **one** `SwiGLUMLP` (or
+`StandardMLP`) whose hidden width is `N` times the routed expert's,
+`N × computed_expert_ffn_hidden_dim`. Hidden units do not interact, so
+this MLP computes exactly the sum of `N` separate expert-width MLPs:
+the rows of its input projections (`gate_proj` and `up_proj` under
+SwiGLU, `up_proj` otherwise) and the columns of its `down_proj` are
+theirs, stacked. DeepSeek-V2/V3 build theirs the same way (in Hugging
+Face, `intermediate_size = moe_intermediate_size * n_shared_experts`).
+The state-dict keys stay `mlp.shared_expert.*` for every `N`, so
+checkpoints saved with `moe_shared_experts = 1` load unchanged; the
+shapes grow with `N`, so a checkpoint loads only into a model built
+with the same `N`. A negative `N` is rejected at config load and by
+`build_moe`.
+
+Under [Muon](../training/optimizers.md#muon) the fused MLP is one
+matrix per projection, so it is orthogonalized as a whole rather than
+as `N` expert matrices, and once its aspect ratio passes 10 Muon hands
+it to its AdamW fallback. On `configs/model/moe_small.toml` that
+happens from `N = 3`, where each projection is 21504 × 2048. Below
+that, the default `muon_adjust_lr = "original"` scales an update by
+`sqrt(max(1, rows / cols))`, so the fused `gate_proj` and `up_proj`
+take updates up to `sqrt(N)` times one expert's.
+
 DeepSeek's original motivation: the shared expert absorbs the
 "universal" capacity so routed experts can specialize. In practice,
 `moe_shared_experts=1` with `sigmoid_topk` reproduces the DeepSeek-V3
-pattern; `0` (the default) is Mixtral-style "all experts are routed."
+pattern (DeepSeek-V2-Lite uses 2); `0` (the default) is Mixtral-style
+"all experts are routed."
 
 ## Picking a router
 

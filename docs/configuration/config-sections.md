@@ -78,6 +78,7 @@ Architecture hyperparameters and MoE knobs.
 | `moe_frequency` | `int` | `1` | MoE every N layers (1=all, 2=alternating) |
 | `moe_router` | `str` | `"softmax_topk"` | `router` registry key |
 | `moe_shared_experts` | `int` | `0` | shared experts that always process every token |
+| `moe_expert_ffn_multiplier` | `float` | `1.0` | each expert's FFN width as a multiple of the dense FFN width (`computed_expert_ffn_hidden_dim`); `0.5` for fine-grained experts |
 | `moe_aux_loss_weight` | `float` | `0.01` | coefficient in training loss |
 | `moe_capacity_factor` | `float` | `0.0` | `0` → no drop; `>0` → cap tokens/expert (typical `1.25`) |
 | `moe_sequence_aux_loss_weight` | `float` | `0.0` | sequence-level balance loss (0 = off) |
@@ -86,7 +87,7 @@ Architecture hyperparameters and MoE knobs.
 | `moe_packed_experts` | `bool` | `False` | pack expert weights into one tensor per projection |
 
 Computed properties: `is_moe`, `head_dim`, `computed_ffn_hidden_dim`,
-`num_params_estimate`.
+`computed_expert_ffn_hidden_dim`, `num_params_estimate`.
 
 ## `[train]` — `TrainConfig`
 

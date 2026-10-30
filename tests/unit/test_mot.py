@@ -75,6 +75,25 @@ def test_mot_finegrained_experts():
     assert moe.experts[0].gate_proj.weight.shape[0] == cfg.computed_ffn_hidden_dim // 2
 
 
+def test_mot_shared_experts_are_n_times_as_wide():
+    """Each MoT modality builds N shared experts as one MLP N times the expert width."""
+    cfg = ModelConfig(
+        dim=64,
+        n_layers=2,
+        n_heads=4,
+        vocab_size=128,
+        max_seq_len=64,
+        num_experts=4,
+        moe_top_k=2,
+        moe_shared_experts=3,
+        moe_expert_ffn_multiplier=0.5,
+    )
+    block = MoTBlock(cfg, modalities=("image", "text"), layer_idx=0)
+    for modality in ("image", "text"):
+        shared = block.mlp[modality].shared_expert
+        assert shared.gate_proj.weight.shape[0] == 3 * cfg.computed_expert_ffn_hidden_dim
+
+
 # ---------------------------------------------------------------------------
 # MoTAttention — structural
 # ---------------------------------------------------------------------------

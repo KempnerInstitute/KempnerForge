@@ -165,6 +165,10 @@ class TestModelConfig:
         with pytest.raises(ValueError, match="moe_frequency must be positive"):
             ModelConfig(num_experts=8, moe_frequency=0)
 
+    def test_moe_rejects_negative_shared_experts(self):
+        with pytest.raises(ValueError, match="moe_shared_experts must be >= 0, got -1"):
+            ModelConfig(num_experts=8, moe_shared_experts=-1)
+
     def test_moe_param_estimate(self):
         dense = ModelConfig(dim=256, n_layers=2, n_heads=4, vocab_size=1000)
         moe = ModelConfig(

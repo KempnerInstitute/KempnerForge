@@ -52,6 +52,7 @@ File:
   - `moe_frequency > 0`
   - `moe_sequence_aux_loss_weight ≥ 0`
   - `moe_bias_schedule ∈ {"constant", "cosine_decay", "linear_warmup"}`
+  - `moe_shared_experts ≥ 0`
 
 ### `TrainConfig`
 
