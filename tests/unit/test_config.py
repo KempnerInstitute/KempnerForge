@@ -767,12 +767,13 @@ def _vlm_job(
     *,
     tp: int = 1,
     ep: int = 1,
+    pp: int = 1,
     n_heads: int = 4,
     num_experts: int = 0,
     tie_embeddings: bool = False,
 ) -> JobConfig:
-    """A small job on ``tp * ep`` ranks, text-only when ``arch`` is None, that is otherwise
-    valid, so the only check it can fail is the one a test sets up."""
+    """A small job on ``tp * ep * pp`` ranks, text-only when ``arch`` is None, that is
+    otherwise valid, so the only check it can fail is the one a test sets up."""
     vlm_sections = {}
     if arch is not None:
         vlm_sections = {
@@ -792,7 +793,7 @@ def _vlm_job(
             tie_embeddings=tie_embeddings,
         ),
         train=TrainConfig(seq_len=64),
-        distributed=DistributedConfig(dp_shard=1, tp=tp, ep=ep),
+        distributed=DistributedConfig(dp_shard=1, tp=tp, ep=ep, pp=pp),
         **vlm_sections,
     )
 
@@ -879,6 +880,14 @@ class TestVLMParallelismSupport:
         match = rf"vlm.arch='{arch}' does not support expert parallelism .*{reason}.*ep = 1"
         with pytest.raises(ValueError, match=match):
             _vlm_job(arch, ep=2, num_experts=num_experts).validate(world_size=2)
+
+    def test_moe_pipeline_error_offers_mot_only_fsdp(self):
+        """MoT runs neither tensor nor expert parallelism, so the MoE + PP error offers it FSDP
+        alone, and still offers all three to a text MoE model."""
+        with pytest.raises(ValueError, match=r"Use FSDP instead; MoT runs neither TP nor EP"):
+            _vlm_job("mot", pp=2, num_experts=2).validate(world_size=2)
+        with pytest.raises(ValueError, match=r"Use FSDP, TP, or EP instead"):
+            _vlm_job(None, pp=2, num_experts=2).validate(world_size=2)
 
     def test_mot_expert_parallel_error_points_at_the_missing_moe_losses(self):
         """The fix it gives, ep = 1, trains MoT with MoE without its MoE losses (#308), so the

@@ -231,10 +231,15 @@ class JobConfig:
             )
 
         if self.model.is_moe and self.distributed.pp > 1:
+            alternatives = (
+                "Use FSDP instead; MoT runs neither TP nor EP."
+                if isinstance(self.vlm, MoTConfig)
+                else "Use FSDP, TP, or EP instead."
+            )
             raise ValueError(
                 "MoE + Pipeline Parallelism is not supported. MoE layers use "
                 "data-dependent routing that is incompatible with pipeline stage "
-                "splitting. Use FSDP, TP, or EP instead."
+                f"splitting. {alternatives}"
             )
 
         if self.distributed.ep > 1:
