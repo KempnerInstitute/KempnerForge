@@ -273,7 +273,8 @@ model.is_moe && distributed.pp > 1  →  ValueError
 ```
 
 Rationale: routing is data-dependent and resists pipeline-stage
-splitting. Use FSDP, TP, or EP instead.
+splitting. Use FSDP, TP, or EP instead; for `vlm.arch = "mot"` the error
+offers FSDP alone, since MoT runs neither TP nor EP.
 
 ### Expert parallel
 
@@ -284,7 +285,9 @@ When `distributed.ep > 1`:
   - `mot`: the FSDP2 wrap for expert-parallel blocks expects
     `layer.attention` and `layer.mlp`, and `MoTBlock` names its attention
     `attn` and keeps its experts per modality, so the model build fails. MoT
-    with MoE trains with `ep = 1`.
+    with MoE trains with `ep = 1`, but without its load-balancing loss,
+    router z-loss, bias schedule or balance metric
+    ([#308](https://github.com/KempnerInstitute/KempnerForge/issues/308)).
   - `moma`: `apply_expert_parallel` partitions `MoEMLP` experts only, and
     MoMa's per-modality expert groups need an EP-aware dispatch that is not
     wired yet. MoMa also requires `model.num_experts = 0`, which the next
