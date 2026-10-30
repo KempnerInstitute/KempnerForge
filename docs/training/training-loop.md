@@ -87,6 +87,9 @@ see [Gradient utilities](gradient-utilities.md).
 Under PP, `pipeline_step` passes `pp_group=`, so the norm is summed over
 the stages and every stage scales by the same coefficient (see
 [Gradient utilities § Under pipeline parallelism](gradient-utilities.md#under-pipeline-parallelism)).
+Under EP it reads the EP group from the model, so the norm covers every
+rank's experts (see
+[Gradient utilities § Under expert parallelism](gradient-utilities.md#under-expert-parallelism)).
 `NaNDetector.check_loss` returns `False` on NaN / Inf, zeroes grads,
 and escalates to `should_rollback` after
 `nan_consecutive_max` bad steps (see
