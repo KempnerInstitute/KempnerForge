@@ -402,12 +402,21 @@ def expert_parallel_params(
 
     Each EP rank holds its own slice of these and a copy of every other parameter.
     Returns ``([], None)`` when no ``MoEMLP`` has ``ep_world_size > 1``.
+
+    Raises:
+        ValueError: Two ``MoEMLP`` layers record different EP groups, so no single
+            group covers every routed expert.
     """
     params: list[torch.nn.Parameter] = []
     group: dist.ProcessGroup | None = None
     for module in model.modules():
         if not isinstance(module, MoEMLP) or module.ep_world_size <= 1:
             continue
+        if group is not None and module.ep_group is not group:
+            raise ValueError(
+                "MoE layers record different expert-parallel groups, so no single group "
+                "covers every routed expert; apply_expert_parallel gives all layers one group"
+            )
         group = module.ep_group
         if module.packed_experts:
             params += [module.up_w, module.down_w]
