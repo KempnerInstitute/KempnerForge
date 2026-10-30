@@ -235,6 +235,19 @@ def _check_clipping(rank, world, port, names, sizes, overrides) -> None:
         dist.destroy_process_group()
 
 
+def _check_without_ep(rank, world, port, names, sizes, overrides) -> None:
+    """Without ``ep``, an MoE model's clipped norm and gradients match one process."""
+    _init(rank, world, port)
+    try:
+        step = _step(names, sizes, overrides)
+        norm = clip_grad_norm_(step.model, MAX_NORM)
+        ref_norm = clip_grad_norm_(step.reference, MAX_NORM)
+        torch.testing.assert_close(norm, ref_norm, rtol=1e-5, atol=0.0)
+        _assert_grads_match(step)
+    finally:
+        dist.destroy_process_group()
+
+
 class TestExpertParallelGradients:
     @pytest.mark.parametrize("layout", list(LAYOUTS))
     def test_expert_gradients_match_one_process(self, layout):
@@ -255,3 +268,7 @@ class TestClipUnderExpertParallelism:
     def test_clipping_keeps_the_ep_copies_equal(self):
         """EP ranks scale by one coefficient, so their copies of shared gradients stay equal."""
         _spawn(_check_clipping, *LAYOUTS["dp_shard2_ep2_packed"])
+
+    def test_moe_without_ep_matches_one_process(self):
+        """Without ``ep`` the norm and gradients of an MoE model are those of one process."""
+        _spawn(_check_without_ep, ("dp_shard",), (2,), {})
