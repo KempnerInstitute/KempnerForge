@@ -159,6 +159,60 @@ def check_prompt_fits(tokenizer: Any, prompt: str, max_text_len: int) -> None:
         )
 
 
+def _prompt_or_none(value: Any, prompt_field: str) -> str | None:
+    """The value of ``prompt_field`` in a row, which must be a ``str`` or ``None``.
+
+    Raises:
+        TypeError: ``value`` is neither a ``str`` nor ``None``.
+    """
+    if value is not None and not isinstance(value, str):
+        raise TypeError(
+            f"Dataset field {prompt_field!r} must be str or None, got {type(value).__name__}"
+        )
+    return value
+
+
+def _check_prompt_column_has_room(
+    rows: Any, prompt_field: str, tokenizer: Any, max_text_len: int
+) -> None:
+    """Reject a prompt column in which no row leaves room for a caption token.
+
+    Reads ``prompt_field`` in row order and returns at the first row that trains on
+    something: one with no prompt (``None``), or one whose prompt fits the bound
+    ``check_prompt_fits`` enforces. A usable column is therefore read only up to
+    that row, and ``_tokenize_and_mask`` masks any later prompt that does not fit;
+    a column with no such row is read to its end.
+
+    Args:
+        rows: A ``datasets.Dataset`` with a ``prompt_field`` column.
+        prompt_field: The prompt column's name.
+        tokenizer: The tokenizer the samples are built with.
+        max_text_len: The fixed text length of every sample.
+
+    Raises:
+        TypeError: A prompt read before that row is neither a ``str`` nor ``None``.
+        ValueError: The column has rows and none of them leaves room for a caption
+            token; the message names the shortest prompt's token count and the
+            ``max_text_len`` it needs.
+    """
+    shortest: int | None = None
+    for row in rows.select_columns([prompt_field]):
+        prompt = _prompt_or_none(row[prompt_field], prompt_field)
+        if prompt is None:
+            return
+        num_prompt_tokens = len(tokenizer(prompt, add_special_tokens=False)["input_ids"])
+        if _min_text_len_for_prompt(num_prompt_tokens, tokenizer) <= max_text_len:
+            return
+        shortest = num_prompt_tokens if shortest is None else min(shortest, num_prompt_tokens)
+    if shortest is not None:
+        raise ValueError(
+            f"No prompt in column {prompt_field!r} leaves room in max_text_len={max_text_len} "
+            f"for a caption token: the shortest is {shortest} tokens (needs max_text_len >= "
+            f"{_min_text_len_for_prompt(shortest, tokenizer)}); raise vlm.max_text_len or "
+            "shorten the prompts"
+        )
+
+
 def _warn_sample_masked_for_prompt(min_text_len: int, max_text_len: int) -> None:
     masked = next(_samples_masked_for_prompt)
     if masked & (masked - 1) == 0:
@@ -257,8 +311,10 @@ class HuggingFaceVLMDataset(Dataset):
             dataset). Positions predicting prompt tokens are ``-100``; the
             last prompt token still predicts the first caption token. A row
             whose prompt leaves no room in ``max_text_len`` for a caption
-            token has every label masked. A ``None`` value means the row has
-            no prompt; any other non-string value raises ``TypeError``.
+            token has every label masked, and building the dataset raises
+            ``ValueError`` when no row leaves that room
+            (``_check_prompt_column_has_room``). A ``None`` value means the
+            row has no prompt; any other non-string value raises ``TypeError``.
         image_size: Target square image size. Default 224.
         image_mean / image_std: Normalization stats. Defaults match
             SigLIP's ``(0.5, 0.5, 0.5)``.
@@ -313,6 +369,8 @@ class HuggingFaceVLMDataset(Dataset):
         self._image_std = image_std
         self._max_text_len = max_text_len
         self._tokenizer = build_tokenizer(tokenizer_path)
+        if prompt_field is not None:
+            _check_prompt_column_has_room(ds, prompt_field, self._tokenizer, max_text_len)
         logger.info(
             f"HuggingFaceVLMDataset: {dataset_name} [{split}], {len(self._ds):,} samples, "
             f"image_size={image_size}, max_text_len={max_text_len}"
@@ -326,19 +384,16 @@ class HuggingFaceVLMDataset(Dataset):
         pixels = pil_to_tensor(
             row[self._image_field], self._image_size, self._image_mean, self._image_std
         )
-        prompt_val = row[self._prompt_field] if self._prompt_field is not None else None
         text_val = row[self._text_field]
         if not isinstance(text_val, str):
             raise TypeError(
                 f"Dataset field {self._text_field!r} must be str, got {type(text_val).__name__}"
             )
-        if prompt_val is not None and not isinstance(prompt_val, str):
-            raise TypeError(
-                f"Dataset field {self._prompt_field!r} must be str or None, "
-                f"got {type(prompt_val).__name__}"
-            )
+        prompt = None
+        if self._prompt_field is not None:
+            prompt = _prompt_or_none(row[self._prompt_field], self._prompt_field)
         input_ids, labels = _tokenize_and_mask(
-            self._tokenizer, text_val, self._max_text_len, prompt_val
+            self._tokenizer, text_val, self._max_text_len, prompt
         )
         return {"pixel_values": pixels, "input_ids": input_ids, "labels": labels}
 
