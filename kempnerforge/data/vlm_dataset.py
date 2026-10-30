@@ -177,11 +177,12 @@ def _check_prompt_column_has_room(
 ) -> None:
     """Reject a prompt column in which no row leaves room for a caption token.
 
-    Reads ``prompt_field`` in row order and returns at the first row that trains on
-    something: one with no prompt (``None``), or one whose prompt fits the bound
-    ``check_prompt_fits`` enforces. A usable column is therefore read only up to
-    that row, and ``_tokenize_and_mask`` masks any later prompt that does not fit;
-    a column with no such row is read to its end.
+    Reads ``prompt_field`` in row order and returns at the first row whose prompt
+    leaves that room: one with no prompt (``None``), or one whose prompt fits the
+    bound ``check_prompt_fits`` enforces. A usable column is therefore read only up
+    to that row, and ``_tokenize_and_mask`` masks any later prompt that does not
+    fit; a column with no such row is read to its end. The captions and the
+    ``max_text_len >= 2`` minimum that ``VLMConfig`` enforces are not checked here.
 
     Args:
         rows: A ``datasets.Dataset`` with a ``prompt_field`` column.
