@@ -250,7 +250,7 @@ DCP-based checkpointing.
 | `async_mode` | `"disabled" \| "async" \| "async_with_pinned_mem"` | `"disabled"` | DCP async-save mode |
 | `keep_last_n` | `int` | `3` | retain the most recent N checkpoints (`<= 0` keeps all); steps saved by `dyn_ckpt_window` are always kept |
 | `load_path` | `str \| None` | `None` | explicit resume path (overrides `latest` symlink) |
-| `export_dtype` | `"float32" \| "bfloat16"` | `"bfloat16"` | dtype for HF exports via `scripts/convert_checkpoint.py` |
+| `export_dtype` | `"float32" \| "bfloat16"` | `"bfloat16"` | dtype for HF exports via `scripts/convert_checkpoint.py dcp-to-hf` when its `--dtype` flag is not given; the flag wins and also takes `float16` (see [HuggingFace conversion](../checkpointing/hf-conversion.md#dtypes)) |
 | `exclude_from_loading` | `list[str]` | `[]` | state keys to skip when warm-starting from `load_path` — `"model"` and/or `"optimizer"`; ignored on a resume, which always restores full state |
 
 ### `[checkpoint.dyn_ckpt_window]` — `DynamicCheckpointWindow`

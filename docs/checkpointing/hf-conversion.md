@@ -32,7 +32,7 @@ What happens:
    time with `strict=False` — each stage holds a disjoint slice of
    the full model.
 3. Convert state dict keys from KempnerForge → HF naming.
-4. Cast to the requested dtype (default `bfloat16`).
+4. Cast every tensor to the export dtype (see [Dtypes](#dtypes)).
 5. Write `model.safetensors` (or fall back to `pytorch_model.bin`
    if the `safetensors` package isn't installed) plus a
    `config.json` compatible with `AutoModelForCausalLM`.
@@ -45,11 +45,24 @@ exports/my_model/
 
 ### Dtypes
 
+The export dtype is the first of:
+
+1. `--dtype`, when given: `bfloat16`, `float16` or `float32`.
+2. `export_dtype` in the `[checkpoint]` table of the `--config` TOML:
+   `bfloat16` or `float32`.
+3. `bfloat16`, that field's default.
+
 ```bash
---dtype bfloat16      # default
---dtype float16       # e.g. for vLLM
+--dtype bfloat16      # wins over export_dtype = "float32" in the TOML
+--dtype float16       # e.g. for vLLM; only the flag accepts float16
 --dtype float32       # rarely useful; largest files
 ```
+
+The script logs the dtype and where it came from, e.g.
+`Export dtype: float32 (from checkpoint.export_dtype)`, and records it as
+`torch_dtype` in the exported `config.json`, so
+`from_pretrained(..., dtype="auto")` loads the weights at the precision
+they were written in.
 
 No optimizer / scheduler / RNG — only weights. If you need those,
 keep the DCP checkpoint; HF format doesn't carry them.
@@ -157,6 +170,7 @@ For a dense model:
   "num_hidden_layers": 32,
   "num_attention_heads": 32,
   "num_key_value_heads": 8,
+  "head_dim": 128,
   "vocab_size": 128256,
   "max_position_embeddings": 4096,
   "rope_theta": 500000.0,
@@ -165,6 +179,9 @@ For a dense model:
   "torch_dtype": "bfloat16"
 }
 ```
+
+`torch_dtype` is the export dtype, so a `float32` or `float16` export
+names that dtype instead of `bfloat16`.
 
 For MoE the architecture is `MixtralForCausalLM` and three extra
 fields (`num_local_experts`, `num_experts_per_tok`,

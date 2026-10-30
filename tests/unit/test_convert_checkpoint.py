@@ -2,17 +2,24 @@
 
 from __future__ import annotations
 
+import json
+import logging
 import sys
 from pathlib import Path
 
 import pytest
+import torch
+import torch.distributed.checkpoint as dcp
+from safetensors.torch import load_file
 
 # Add scripts/ to path so we can import the conversion module
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 
-from convert_checkpoint import _build_hf_config, _hf_to_kf_key, _kf_to_hf_key
+from convert_checkpoint import _build_hf_config, _hf_to_kf_key, _kf_to_hf_key, dcp_to_hf, main
 
+from kempnerforge.config.loader import load_config
 from kempnerforge.config.schema import ModelConfig
+from kempnerforge.model.transformer import Transformer
 
 # ---------------------------------------------------------------------------
 # Key mapping: KempnerForge → HuggingFace
@@ -367,3 +374,105 @@ class TestBuildHFConfig:
         hf_cfg = _build_hf_config(mc)
         assert "num_local_experts" not in hf_cfg
         assert hf_cfg["model_type"] == "llama"
+
+
+def _tiny_dcp(path: Path, model_config: ModelConfig) -> None:
+    """Save a freshly initialized model as a single-process DCP checkpoint."""
+    dcp.save({"model": Transformer(model_config).state_dict()}, checkpoint_id=str(path))
+
+
+def _written(hf_dir: Path) -> tuple[set[torch.dtype], str]:
+    """The dtypes of an export's tensors and the ``torch_dtype`` its config.json names."""
+    weights = load_file(hf_dir / "model.safetensors")
+    hf_cfg = json.loads((hf_dir / "config.json").read_text())
+    return {t.dtype for t in weights.values()}, hf_cfg["torch_dtype"]
+
+
+class TestExportDtypeMetadata:
+    @pytest.mark.parametrize(
+        ("dtype", "name"),
+        [(torch.float32, "float32"), (torch.bfloat16, "bfloat16"), (torch.float16, "float16")],
+    )
+    def test_config_json_names_the_written_dtype(self, tmp_path, tiny_model_config, dtype, name):
+        """torch_dtype names the dtype the tensors were written in, not a fixed bfloat16."""
+        _tiny_dcp(tmp_path / "dcp", tiny_model_config)
+        dcp_to_hf(str(tmp_path / "dcp"), str(tmp_path / "hf"), tiny_model_config, dtype=dtype)
+        assert _written(tmp_path / "hf") == ({dtype}, name)
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+    def test_transformers_loads_the_written_dtype(self, tmp_path, tiny_model_config, dtype):
+        """``from_pretrained(dtype="auto")`` follows torch_dtype, so a fixed
+        bfloat16 there would load these weights as bf16."""
+        transformers = pytest.importorskip("transformers")
+        _tiny_dcp(tmp_path / "dcp", tiny_model_config)
+        dcp_to_hf(str(tmp_path / "dcp"), str(tmp_path / "hf"), tiny_model_config, dtype=dtype)
+        model = transformers.AutoModelForCausalLM.from_pretrained(tmp_path / "hf", dtype="auto")
+        assert {p.dtype for p in model.parameters()} == {dtype}
+
+
+_TINY_TOML = """\
+[model]
+dim = 64
+n_layers = 2
+n_heads = 2
+n_kv_heads = 2
+vocab_size = 256
+max_seq_len = 64
+"""
+
+
+def _run_dcp_to_hf(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, export_dtype: str | None, flag: str | None
+) -> tuple[set[torch.dtype], str]:
+    """Export a tiny checkpoint through the CLI and return what it wrote.
+
+    ``export_dtype`` goes in the TOML's ``[checkpoint]`` table and ``flag`` is
+    passed as ``--dtype``; ``None`` leaves either out.
+    """
+    toml = tmp_path / "job.toml"
+    table = "" if export_dtype is None else f'[checkpoint]\nexport_dtype = "{export_dtype}"\n'
+    toml.write_text(_TINY_TOML + table)
+    _tiny_dcp(tmp_path / "dcp", load_config(toml, cli_args=[]).model)
+    argv = ["convert_checkpoint.py", "dcp-to-hf", "--config", str(toml)]
+    argv += ["--dcp-dir", str(tmp_path / "dcp"), "--hf-dir", str(tmp_path / "hf")]
+    if flag is not None:
+        argv += ["--dtype", flag]
+    monkeypatch.setattr(sys, "argv", argv)
+    main()
+    return _written(tmp_path / "hf")
+
+
+class TestExportDtypePrecedence:
+    """dcp-to-hf takes ``--dtype``, then ``checkpoint.export_dtype``, then bfloat16."""
+
+    def test_flag_alone_sets_the_dtype(self, tmp_path, monkeypatch):
+        written = _run_dcp_to_hf(tmp_path, monkeypatch, None, "float16")
+        assert written == ({torch.float16}, "float16")
+
+    def test_config_alone_sets_the_dtype(self, tmp_path, monkeypatch):
+        written = _run_dcp_to_hf(tmp_path, monkeypatch, "float32", None)
+        assert written == ({torch.float32}, "float32")
+
+    @pytest.mark.parametrize(
+        ("flag", "dtype"), [("bfloat16", torch.bfloat16), ("float16", torch.float16)]
+    )
+    def test_flag_overrides_the_config(self, tmp_path, monkeypatch, flag, dtype):
+        """Even a flag that names the default wins over the TOML."""
+        written = _run_dcp_to_hf(tmp_path, monkeypatch, "float32", flag)
+        assert written == ({dtype}, flag)
+
+    def test_bfloat16_without_flag_or_config(self, tmp_path, monkeypatch):
+        written = _run_dcp_to_hf(tmp_path, monkeypatch, None, None)
+        assert written == ({torch.bfloat16}, "bfloat16")
+
+    @pytest.mark.parametrize(
+        ("export_dtype", "flag", "source"),
+        [(None, "float32", "--dtype"), ("float32", None, "checkpoint.export_dtype")],
+    )
+    def test_log_names_where_the_dtype_came_from(
+        self, tmp_path, monkeypatch, caplog, export_dtype, flag, source
+    ):
+        """The log line says whether the flag or the config chose the export dtype."""
+        with caplog.at_level(logging.INFO, logger="convert_checkpoint"):
+            _run_dcp_to_hf(tmp_path, monkeypatch, export_dtype, flag)
+        assert f"Export dtype: float32 (from {source})" in caplog.text
