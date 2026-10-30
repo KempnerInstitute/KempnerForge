@@ -70,8 +70,10 @@ Algorithm:
 1. Collect all non-`None` `.grad` tensors from the model.
 2. Build a `mesh_key` per gradient (DTensor's `_spec.mesh` id, or `0`
    for plain tensors).
-3. **If only one mesh** (pure FSDP, single GPU, plain tensors): call
-   `torch.nn.utils.clip_grad_norm_` directly — the fast path.
+3. **If only one mesh** (pure FSDP, single GPU, plain tensors) and no
+   pipeline or expert parallelism: call `torch.nn.utils.clip_grad_norm_`
+   directly — the fast path. Under either of those, the norm is summed
+   over the stages' or the EP group as described below.
 4. **If multiple meshes**: group gradients by mesh and compute each
    group's `sum-of-squares` from per-gradient norms taken in at least
    fp32 (fp16 and bf16 are promoted, fp64 stays fp64). A
@@ -116,12 +118,14 @@ and, in one all-reduce over that group, sums the routed experts'
 squared norms and averages the squared norms of the copies. Every EP
 rank then returns the whole model's norm and scales by the same
 coefficient, so its copies of the shared parameters stay equal to the
-other ranks'. Clipping each rank by its own norm instead scales the
+other ranks' as long as every EP rank computes them identically; the
+norm is the same on every EP rank even when the copies differ in the
+last bits. Clipping each rank by its own norm instead scales the
 copies by different coefficients, and nothing reduces them over `ep`
 afterwards, so they drift apart. Every EP rank must make the call,
 since the sum is a collective. How the expert gradients themselves are
 averaged over the group is in
-[Expert parallelism](../distributed/expert-parallelism.md).
+[Expert parallelism § Gradients and clipping](../distributed/expert-parallelism.md#gradients-and-clipping).
 
 ### `foreach` parameter
 
