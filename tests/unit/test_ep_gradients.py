@@ -40,6 +40,7 @@ LAYOUTS = {
     "ep2": (("dp_shard", "ep"), (1, 2), {}),
     "ep4": (("dp_shard", "ep"), (1, 4), {}),
     "dp_shard2_ep2_packed": (("dp_shard", "ep"), (2, 2), {"moe_packed_experts": True}),
+    "dp_shard2_ep2_shared": (("dp_shard", "ep"), (2, 2), {"moe_shared_experts": 1}),
     "dp_replicate2_ep2": (("dp_replicate", "dp_shard", "ep"), (2, 1, 2), {}),
     "ep2_tp2": (("dp_shard", "ep", "tp"), (1, 2, 2), {}),
 }
