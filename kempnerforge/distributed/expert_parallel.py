@@ -388,3 +388,26 @@ def apply_expert_parallel(model: torch.nn.Module, device_mesh: DeviceMesh | None
     logger.info(
         f"Applied expert parallelism: ep_size={ep_size}, ep_rank={ep_rank}, layers={applied}"
     )
+
+
+def expert_parallel_params(
+    model: torch.nn.Module,
+) -> tuple[list[torch.nn.Parameter], dist.ProcessGroup | None]:
+    """The routed-expert parameters that EP splits across ranks, and the EP group.
+
+    Each EP rank holds its own slice of these and a copy of every other parameter.
+    Returns ``([], None)`` when no ``MoEMLP`` has ``ep_world_size > 1``.
+    """
+    params: list[torch.nn.Parameter] = []
+    group: dist.ProcessGroup | None = None
+    for module in model.modules():
+        if not isinstance(module, MoEMLP) or module.ep_world_size <= 1:
+            continue
+        group = module.ep_group
+        if module.packed_experts:
+            params += [module.up_w, module.down_w]
+            if module._is_swiglu:
+                params.append(module.gate_w)
+        else:
+            params += module.experts.parameters()
+    return params, group
