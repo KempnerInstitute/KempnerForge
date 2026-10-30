@@ -773,13 +773,18 @@ def _vlm_job(
     tie_embeddings: bool = False,
 ) -> JobConfig:
     """A small job on ``tp * ep * pp`` ranks, text-only when ``arch`` is None, that is
-    otherwise valid, so the only check it can fail is the one a test sets up."""
+    otherwise valid, so the only check it can fail is the one a test sets up.
+
+    Cross-attention gets a block on every layer: the default cadence of 4 would give these
+    2 layers none, a model that runs like a text-only one.
+    """
     vlm_sections = {}
     if arch is not None:
+        arch_fields = {"cross_attention_every_n_layers": 1} if arch == "cross_attention" else {}
         vlm_sections = {
             "vision_encoder": VisionEncoderConfig(type="random", num_tokens=8),
             "adapter": AdapterConfig(),
-            "vlm": VLMConfig.for_arch(arch, max_text_len=32),
+            "vlm": VLMConfig.for_arch(arch, max_text_len=32, **arch_fields),
         }
     return JobConfig(
         model=ModelConfig(
