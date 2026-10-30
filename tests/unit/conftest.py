@@ -35,7 +35,9 @@ class FakeModelStore:
         self._held: set[str] = set()
         self._clock = itertools.count(1000)
 
-    def add(self, name, run_id="run-xyz", status="READY", experiment_id="7"):
+    def add(
+        self, name, run_id="run-xyz", status="READY", experiment_id="7", model_type="checkpoint"
+    ):
         """Put a model on the server, as an earlier registration would have; return it."""
         model_id = f"m-{len(self.models) + 1}"
         model = types.SimpleNamespace(
@@ -48,7 +50,7 @@ class FakeModelStore:
             artifact_location=f"store://models/{model_id}/artifacts",
             tags={},
             params={},
-            model_type=None,
+            model_type=model_type,
         )
         self.models.append(model)
         return model
