@@ -115,12 +115,14 @@ waits at a barrier until every stage's save has completed; only then
 does rank 0 move `latest` and prune.
 
 A save that fails on any rank (a DCP write or async flush, or rank 0's
-`train_state.pt`, `metadata.json` or commit) fails on every rank, and
-`latest` stays where it was. The barriers that end `save()`, `wait()`
-and `flush_pending_save()` carry each rank's outcome: a rank whose own
-part failed raises that error, and every other rank raises a
+`train_state.pt`, `metadata.json` or move of `latest`) fails on every
+rank, and `latest` never points at it. The barriers that end `save()`,
+`wait()` and `flush_pending_save()` carry each rank's outcome: a rank
+whose own part failed raises that error, and every other rank raises a
 `RuntimeError` naming the ranks that failed, so no rank is left waiting
-for one that has already raised.
+for one that has already raised. Pruning runs only once `latest` has
+moved, so an error while pruning fails no rank (see
+[Retention cleanup](#retention-cleanup)).
 
 ## Retention cleanup
 
@@ -142,9 +144,11 @@ Default `keep_last_n = 3`. Set `keep_last_n = 0`, or any value `<= 0`,
 to keep every checkpoint: cleanup then removes nothing.
 
 A checkpoint it cannot remove is logged as a warning and left for the
-next cleanup to retry. On NFS a file closed a moment earlier can leave
-a `.nfs*` placeholder that makes the removal fail, and rank 0 must not
-leave `save()` while the other ranks wait in its barrier.
+next cleanup to retry; on NFS a file closed a moment earlier can leave
+a `.nfs*` placeholder that makes the removal fail. Any other error
+while pruning is logged the same way: cleanup runs after `latest` has
+moved, so the checkpoint is already committed and the save still
+succeeds on every rank.
 
 ## Edge cases
 

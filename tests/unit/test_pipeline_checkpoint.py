@@ -15,6 +15,7 @@ import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 import torch.multiprocessing as mp
 from torch.distributed.checkpoint.filesystem import FileSystemWriter
+from torch.distributed.checkpoint.staging import DefaultStager
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor import DTensor
@@ -246,11 +247,16 @@ def _no_space_left(*args: Any, **kwargs: Any) -> Any:
 def _fail_part(rank: int, world: int, failing: str) -> None:
     """Make one rank's part of the save fail, as named by ``failing``.
 
-    ``"shards"`` is the DCP write of the last rank, ``"metadata"`` the ``metadata.json`` that
-    rank 0 alone writes.
+    ``"shards"`` is the DCP write of the last rank, ``"staging"`` the copy of its state that an
+    async save takes before that write starts, ``"metadata"`` the ``metadata.json`` that rank 0
+    alone writes, and ``"pruning"`` rank 0's removal of old checkpoints once ``latest`` has moved.
     """
     if failing == "shards" and rank == world - 1:
         FileSystemWriter.write_data = _no_space_left
+    if failing == "staging" and rank == world - 1:
+        DefaultStager.stage = _no_space_left
+    if failing == "pruning" and rank == 0:
+        manager_module.CheckpointManager._cleanup = _no_space_left
     if failing == "metadata" and rank == 0:
         replace_file = manager_module._replace_file
 
@@ -271,9 +277,13 @@ def _check_a_failed_save(
     ckpt_dir: str,
     async_mode: AsyncCheckpointMode,
     failing: str,
+    saved_first: bool,
     out_dir: str,
 ) -> None:
-    """One rank's part of the save fails; write how ``save`` and ``wait`` end on this rank."""
+    """One rank's part of the save fails; write how ``save`` and ``wait`` end on this rank.
+
+    With ``saved_first``, step 1 is saved before the part starts failing.
+    """
     dist.init_process_group(
         "gloo", rank=rank, world_size=world, init_method=f"tcp://127.0.0.1:{port}"
     )
@@ -284,6 +294,8 @@ def _check_a_failed_save(
         manager = build_checkpoint_manager(
             config, runtime, stage, _stepped_optimizer(stage), pipeline
         )
+        if saved_first:
+            manager.save(1, tokens_seen=TOKENS)
         _fail_part(rank, world, failing)
         try:
             manager.save(STEP, tokens_seen=TOKENS)
@@ -294,6 +306,59 @@ def _check_a_failed_save(
         Path(out_dir, f"rank{rank}").write_text(outcome)
     finally:
         dist.destroy_process_group()
+
+
+def _outcomes(
+    tmp_path: Path,
+    shape: tuple[int, ...],
+    names: tuple[str, ...],
+    async_mode: AsyncCheckpointMode,
+    failing: str,
+    saved_first: bool = False,
+) -> dict[int, str]:
+    """How ``save`` and ``wait`` ended on each rank of ``_check_a_failed_save``, by rank.
+
+    Fails the test when a rank is still in ``save()`` or ``wait()`` 45 seconds in.
+    """
+    world = math.prod(shape)
+    out_dir = tmp_path / "outcomes"
+    out_dir.mkdir()
+    context = mp.spawn(
+        _check_a_failed_save,
+        args=(
+            world,
+            _free_port(),
+            shape,
+            names,
+            str(tmp_path / "ckpt"),
+            async_mode,
+            failing,
+            saved_first,
+            str(out_dir),
+        ),
+        nprocs=world,
+        join=False,
+    )
+    deadline = time.monotonic() + 45
+    while not context.join(timeout=1):
+        if time.monotonic() > deadline:
+            for process in context.processes:
+                process.terminate()
+            waiting = sorted(set(range(world)) - {int(p.name[4:]) for p in out_dir.iterdir()})
+            pytest.fail(f"ranks {waiting} still in save() or wait() after the {failing} failed")
+    outcomes = {int(p.name[4:]): p.read_text() for p in out_dir.iterdir()}
+    assert sorted(outcomes) == list(range(world))
+    return outcomes
+
+
+def _assert_every_rank_raised(outcomes: dict[int, str], failed: list[int]) -> None:
+    """The ranks in ``failed`` raised the failure itself, every other rank an error naming them."""
+    for rank, outcome in outcomes.items():
+        if rank in failed:
+            assert "No space left on device" in outcome, f"rank {rank}: {outcome}"
+        else:
+            expected = f"RuntimeError: Checkpoint save failed on ranks {failed}"
+            assert outcome == expected, f"rank {rank}: {outcome}"
 
 
 class TestPipelineCheckpointSaveAndResume:
@@ -340,6 +405,7 @@ class TestAFailedSaveFailsEveryRank:
             ((2,), ("pp",), AsyncCheckpointMode.async_, "shards", [1]),
             ((2, 2), ("pp", "dp_shard"), AsyncCheckpointMode.disabled, "shards", [2, 3]),
             ((2, 2), ("pp", "dp_shard"), AsyncCheckpointMode.async_, "shards", [2, 3]),
+            ((2, 2), ("pp", "dp_shard"), AsyncCheckpointMode.async_, "staging", [3]),
             ((2,), ("pp",), AsyncCheckpointMode.disabled, "metadata", [0]),
             ((2,), ("dp_shard",), AsyncCheckpointMode.disabled, "metadata", [0]),
             ((2,), ("dp_shard",), AsyncCheckpointMode.async_, "metadata", [0]),
@@ -350,6 +416,7 @@ class TestAFailedSaveFailsEveryRank:
             "pp2-async-shards",
             "pp2-fsdp2-shards",
             "pp2-fsdp2-async-shards",
+            "pp2-fsdp2-async-staging",
             "pp2-metadata",
             "fsdp2-metadata",
             "fsdp2-async-metadata",
@@ -364,37 +431,38 @@ class TestAFailedSaveFailsEveryRank:
         The ranks in ``failed`` raise the failure itself: the rank whose part failed, and the
         other ranks DCP saves with. Every other rank raises a ``RuntimeError`` naming them.
         """
-        world = math.prod(shape)
-        out_dir = tmp_path / "outcomes"
-        out_dir.mkdir()
-        context = mp.spawn(
-            _check_a_failed_save,
-            args=(
-                world,
-                _free_port(),
-                shape,
-                names,
-                str(tmp_path / "ckpt"),
-                async_mode,
-                failing,
-                str(out_dir),
-            ),
-            nprocs=world,
-            join=False,
-        )
-        deadline = time.monotonic() + 45
-        while not context.join(timeout=1):
-            if time.monotonic() > deadline:
-                for process in context.processes:
-                    process.terminate()
-                waiting = sorted(set(range(world)) - {int(p.name[4:]) for p in out_dir.iterdir()})
-                pytest.fail(f"ranks {waiting} still in save() or wait(); ranks {failed} failed")
-        outcomes = {int(p.name[4:]): p.read_text() for p in out_dir.iterdir()}
-        assert sorted(outcomes) == list(range(world))
-        for rank, outcome in outcomes.items():
-            if rank in failed:
-                assert "No space left on device" in outcome, f"rank {rank}: {outcome}"
-            else:
-                expected = f"RuntimeError: Checkpoint save failed on ranks {failed}"
-                assert outcome == expected, f"rank {rank}: {outcome}"
+        outcomes = _outcomes(tmp_path, shape, names, async_mode, failing)
+        _assert_every_rank_raised(outcomes, failed)
         assert not (tmp_path / "ckpt" / "latest").exists()
+
+    def test_a_save_that_fails_to_stage_still_commits_the_one_before(self, tmp_path):
+        """The last rank cannot stage the next async save after every rank flushed step 1.
+
+        That save raises on every rank and is never committed; ``latest`` names step 1.
+        """
+        outcomes = _outcomes(
+            tmp_path,
+            (2, 2),
+            ("pp", "dp_shard"),
+            AsyncCheckpointMode.async_,
+            "staging",
+            saved_first=True,
+        )
+        _assert_every_rank_raised(outcomes, [3])
+        assert (tmp_path / "ckpt" / "latest").resolve().name == "step_1"
+
+    @pytest.mark.parametrize(
+        ("shape", "names", "async_mode"),
+        [
+            ((2,), ("pp",), AsyncCheckpointMode.disabled),
+            ((2,), ("dp_shard",), AsyncCheckpointMode.async_),
+        ],
+        ids=["pp2", "fsdp2-async"],
+    )
+    def test_a_pruning_error_once_latest_moved_fails_no_rank(
+        self, tmp_path, shape, names, async_mode
+    ):
+        """Rank 0 cannot prune after moving ``latest``; the committed save returns on every rank."""
+        outcomes = _outcomes(tmp_path, shape, names, async_mode, "pruning")
+        assert outcomes == {0: "returned", 1: "returned"}
+        assert (tmp_path / "ckpt" / "latest").resolve().name == f"step_{STEP}"

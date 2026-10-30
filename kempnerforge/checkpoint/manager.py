@@ -438,7 +438,10 @@ class CheckpointManager:
         """Atomically point `latest` at a now-durable checkpoint, register it, then prune.
 
         Rank 0 only. Called either inline (sync mode, DCP already durable) or
-        deferred (async mode, after the flush future has resolved).
+        deferred (async mode, after the flush future has resolved). Raises only
+        while `latest` still names the previous checkpoint: once it names this
+        one the checkpoint is committed, so an error while pruning is logged and
+        the next commit prunes again.
         """
         latest = self._latest_link()
         tmp_link = latest.with_suffix(".tmp")
@@ -447,7 +450,10 @@ class CheckpointManager:
         tmp_link.rename(latest)
         logger.info(f"Checkpoint committed: {ckpt_dir} (step={step})")
         self._register_committed(step, ckpt_dir)
-        self._cleanup()
+        try:
+            self._cleanup()
+        except Exception as e:
+            logger.warning(f"Could not prune old checkpoints after committing {ckpt_dir} ({e})")
 
     def _drain_pending_finalize(
         self, overwriting: Path | None = None, error: BaseException | None = None
@@ -675,19 +681,24 @@ class CheckpointManager:
         # FIRST awaits the previous in-flight flush, so any deferred
         # `_pending_finalize` from the prior save is now durable. For sync
         # mode (disabled) dcp.save() blocks until THIS checkpoint is durable.
-        error = _attempt(
-            self._async_ckpt.save,
-            dcp_state,
-            checkpoint_id=str(dcp_dir),
-            process_group=self._process_group,
-        )
+        flush_error = _attempt(self._async_ckpt.wait)
+        error = flush_error
+        if flush_error is None:
+            error = _attempt(
+                self._async_ckpt.save,
+                dcp_state,
+                checkpoint_id=str(dcp_dir),
+                process_group=self._process_group,
+            )
 
         sync_mode = self.config.async_mode == AsyncCheckpointMode.disabled
 
-        # The prior async checkpoint's flush is now guaranteed durable (the
-        # dispatch above awaited it). Commit its `latest` symlink + cleanup
-        # before doing anything else.
-        error = self._drain_pending_finalize(overwriting=ckpt_dir, error=error)
+        # The prior async checkpoint's flush has now ended (the wait above
+        # awaited it). Commit its `latest` symlink + cleanup before doing
+        # anything else.
+        drain_error = self._drain_pending_finalize(overwriting=ckpt_dir, error=flush_error)
+        if drain_error is not None:
+            error = drain_error
 
         # Save non-distributed state (rank 0 only). These are small synchronous
         # writes; they finish well before `latest` is ever pointed here, so

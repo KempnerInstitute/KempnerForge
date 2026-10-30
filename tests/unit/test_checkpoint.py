@@ -11,6 +11,7 @@ import shutil
 import stat
 import sys
 import threading
+from concurrent.futures import Future
 from pathlib import Path
 
 import numpy as np
@@ -1926,7 +1927,7 @@ def _no_space(*args: object, **kwargs: object) -> None:
 
 
 class TestAFailedSaveCommitsNothing:
-    """A part of ``save()`` or ``wait()`` that raises reaches the caller; ``latest`` stays put."""
+    """A part of a save that raises reaches the caller, and that save is never committed."""
 
     @staticmethod
     def _mgr(tmp_path, mode):
@@ -1935,6 +1936,26 @@ class TestAFailedSaveCommitsNothing:
         model = torch.nn.Linear(4, 4)
         opt = torch.optim.SGD(model.parameters(), lr=0.1)
         return CheckpointManager(CheckpointConfig(dir=str(tmp_path), async_mode=mode), model, opt)
+
+    @staticmethod
+    def _flushes(monkeypatch, failure: BaseException | None = None) -> list[str]:
+        """Make each ``dcp.async_save`` a flush that has ended, failed with ``failure`` if given.
+
+        Returns the checkpoint ids the saves were dispatched to.
+        """
+        dispatched: list[str] = []
+
+        def async_save(state_dict, checkpoint_id, process_group=None):
+            dispatched.append(checkpoint_id)
+            flush: Future[None] = Future()
+            if failure is None:
+                flush.set_result(None)
+            else:
+                flush.set_exception(failure)
+            return flush
+
+        monkeypatch.setattr("kempnerforge.checkpoint.async_save.dcp.async_save", async_save)
+        return dispatched
 
     def test_a_failed_shard_write_skips_the_train_state(self, tmp_path, monkeypatch):
         mgr = self._mgr(tmp_path, AsyncCheckpointMode.disabled)
@@ -2001,14 +2022,47 @@ class TestAFailedSaveCommitsNothing:
 
     def test_a_flush_that_failed_before_the_next_save_commits_nothing(self, tmp_path, monkeypatch):
         mgr = self._mgr(tmp_path, AsyncCheckpointMode.async_)
-        monkeypatch.setattr(mgr._async_ckpt, "save", lambda *a, **k: None)
+        dispatched = self._flushes(monkeypatch, OSError(28, "No space left on device"))
         mgr.save(step=1)
-        monkeypatch.setattr(mgr._async_ckpt, "save", _no_space)
         with pytest.raises(OSError, match="No space left"):
             mgr.save(step=2)
+        assert dispatched == [str(tmp_path / "step_1")]
         assert mgr._pending_finalize is None
         assert not (tmp_path / "latest").exists()
         assert not (tmp_path / "step_2" / "train_state.pt").exists()
+
+    def test_a_save_that_fails_to_dispatch_still_commits_the_one_before(
+        self, tmp_path, monkeypatch
+    ):
+        """Staging step 2 fails after step 1's flush ended: only step 2 is dropped."""
+        mgr = self._mgr(tmp_path, AsyncCheckpointMode.async_)
+        self._flushes(monkeypatch)
+        mgr.save(step=1)
+        monkeypatch.setattr("kempnerforge.checkpoint.async_save.dcp.async_save", _no_space)
+        with pytest.raises(OSError, match="No space left"):
+            mgr.save(step=2)
+        assert (tmp_path / "latest").resolve() == (tmp_path / "step_1").resolve()
+        assert not (tmp_path / "step_2" / "train_state.pt").exists()
+        mgr.wait()
+        assert (tmp_path / "latest").resolve() == (tmp_path / "step_1").resolve()
+
+    @pytest.mark.parametrize(
+        "mode", [AsyncCheckpointMode.disabled, AsyncCheckpointMode.async_], ids=str
+    )
+    def test_a_pruning_error_once_latest_moved_fails_nothing(self, tmp_path, monkeypatch, mode):
+        """A checkpoint is committed once ``latest`` names it; pruning after that only warns."""
+        mgr = self._mgr(tmp_path, mode)
+        monkeypatch.setattr(mgr._async_ckpt, "save", lambda *a, **k: None)
+        monkeypatch.setattr(mgr, "_cleanup", _no_space)
+        warned: list[str] = []
+        monkeypatch.setattr(
+            "kempnerforge.checkpoint.manager.logger.warning",
+            lambda message, *args: warned.append(str(message)),
+        )
+        mgr.save(step=1)
+        mgr.wait()
+        assert (tmp_path / "latest").resolve() == (tmp_path / "step_1").resolve()
+        assert any("No space left" in message for message in warned), warned
 
 
 # ---------------------------------------------------------------------------
