@@ -201,6 +201,12 @@ and expert params correctly. Disabled by default — it changes
 gradient magnitudes and should be validated against a baseline run
 before flipping on.
 
+`avg_tokens` is the average load over all `num_experts` experts, as in
+`MoEMLP._local_forward`. A local expert receives a copy of its tokens
+from each EP rank, so in those units the average is
+`num_tokens · top_k / num_local_experts`, and EP leaves the scale, and
+with it the forward pass, unchanged.
+
 ## See also
 
 - [MoE overview](../moe/index.md) — architecture, routers, auxiliary
