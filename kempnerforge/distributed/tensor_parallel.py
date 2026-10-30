@@ -109,7 +109,8 @@ def apply_tensor_parallel(
 
     PP stages use basic TP without SequenceParallel to avoid DTensors at
     stage boundaries. SequenceParallel is also disabled when weights are
-    tied.
+    tied or the model is MoE, as ``ModelConfig.tp_sequence_parallel`` says;
+    a config without that property gets the same tie and MoE rule.
 
     Args:
         model: Transformer or PipelineStageModule to parallelize.
@@ -123,7 +124,10 @@ def apply_tensor_parallel(
     config = getattr(model, "config", None)
     tie = getattr(config, "tie_embeddings", False)
     is_pp_stage = hasattr(model, "stage_id")
-    seq_parallel = not is_pp_stage and getattr(config, "tp_sequence_parallel", True)
+    is_moe = getattr(config, "is_moe", False)
+    seq_parallel = not is_pp_stage and getattr(
+        config, "tp_sequence_parallel", not tie and not is_moe
+    )
 
     # Token embedding: wrap output as DTensor Replicate so the first block's
     # SequenceParallel norm properly redistributes to Shard(1). Without this,
