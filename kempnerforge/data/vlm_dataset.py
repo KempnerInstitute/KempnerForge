@@ -172,6 +172,28 @@ def _prompt_or_none(value: Any, prompt_field: str) -> str | None:
     return value
 
 
+def _check_prompt_column_is_string(rows: Any, prompt_field: str) -> None:
+    """Reject a prompt column whose type admits a value that is neither a string nor missing.
+
+    Args:
+        rows: A ``datasets.Dataset`` with a ``prompt_field`` column.
+        prompt_field: The prompt column's name.
+
+    Raises:
+        TypeError: The column is not a ``datasets.Value`` of dtype ``string`` or
+            ``large_string``, or ``null`` when no row has a prompt.
+        ValueError: ``prompt_field`` is not a column of ``rows``.
+    """
+    from datasets import Value
+
+    feature = rows.select_columns([prompt_field]).features[prompt_field]
+    if not (isinstance(feature, Value) and feature.dtype in ("string", "large_string", "null")):
+        raise TypeError(
+            f"Dataset field {prompt_field!r} must be a string column (a Value of dtype "
+            f"'string' or 'large_string', or 'null' when no row has a prompt), got {feature}"
+        )
+
+
 def _check_prompt_column_has_room(
     rows: Any, prompt_field: str, tokenizer: Any, max_text_len: int
 ) -> None:
@@ -313,9 +335,10 @@ class HuggingFaceVLMDataset(Dataset):
             last prompt token still predicts the first caption token. A row
             whose prompt leaves no room in ``max_text_len`` for a caption
             token has every label masked, and building the dataset raises
-            ``ValueError`` when no row leaves that room
-            (``_check_prompt_column_has_room``). A ``None`` value means the
-            row has no prompt; any other non-string value raises ``TypeError``.
+            ``ValueError`` when no row leaves that room. A ``None`` value
+            means the row has no prompt. Building the dataset raises
+            ``TypeError`` unless the column holds strings (dtype ``string``
+            or ``large_string``, or ``null`` when no row has a prompt).
         image_size: Target square image size. Default 224.
         image_mean / image_std: Normalization stats. Defaults match
             SigLIP's ``(0.5, 0.5, 0.5)``.
@@ -371,6 +394,7 @@ class HuggingFaceVLMDataset(Dataset):
         self._max_text_len = max_text_len
         self._tokenizer = build_tokenizer(tokenizer_path)
         if prompt_field is not None:
+            _check_prompt_column_is_string(ds, prompt_field)
             _check_prompt_column_has_room(ds, prompt_field, self._tokenizer, max_text_len)
         logger.info(
             f"HuggingFaceVLMDataset: {dataset_name} [{split}], {len(self._ds):,} samples, "

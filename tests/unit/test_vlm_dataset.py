@@ -383,18 +383,28 @@ class _RecordingHandler(logging.Handler):
 
 
 def _prompted_dataset(
-    tmp_path, monkeypatch, prompts: list, tokenizer: _MockTokenizer | None = None
+    tmp_path,
+    monkeypatch,
+    prompts: list,
+    tokenizer: _MockTokenizer | None = None,
+    prompt_dtype: str | None = None,
 ) -> HuggingFaceVLMDataset:
-    """A real ``HuggingFaceVLMDataset`` whose rows pair caption ``"xyz"`` with ``prompts``."""
-    from datasets import Dataset
+    """A real ``HuggingFaceVLMDataset`` whose rows pair caption ``"xyz"`` with ``prompts``.
 
-    Dataset.from_dict(
+    The prompt column is cast to ``Value(prompt_dtype)`` when ``prompt_dtype`` is given.
+    """
+    from datasets import Dataset, Value
+
+    rows = Dataset.from_dict(
         {
             "image": [_make_image(32, 50 + i) for i in range(len(prompts))],
             "caption": ["xyz"] * len(prompts),
             "prompt": prompts,
         }
-    ).save_to_disk(str(tmp_path / "prompted"))
+    )
+    if prompt_dtype is not None:
+        rows = rows.cast_column("prompt", Value(prompt_dtype))
+    rows.save_to_disk(str(tmp_path / "prompted"))
     tok = tokenizer if tokenizer is not None else _MockTokenizer()
     monkeypatch.setattr(vlm_dataset, "build_tokenizer", lambda path: tok)
     return HuggingFaceVLMDataset(
@@ -542,9 +552,45 @@ class TestPromptColumnRoom:
     def test_an_empty_dataset_is_not_rejected(self, tmp_path, monkeypatch):
         assert len(_prompted_dataset(tmp_path, monkeypatch, [])) == 0
 
-    def test_a_non_string_prompt_read_while_building_raises(self, tmp_path, monkeypatch):
-        with pytest.raises(TypeError, match="'prompt' must be str or None, got list"):
-            _prompted_dataset(tmp_path, monkeypatch, [["ab"]])
+
+class TestPromptColumnType:
+    """Building the dataset rejects a prompt column whose type admits a value that is
+    neither a string nor missing, whatever its rows hold, so every rank fails while
+    building it instead of the rank that reads such a value failing mid-run while its
+    peers wait in a collective."""
+
+    @pytest.mark.parametrize(
+        "prompts",
+        [[None, ["ab"], None, None], [["ab"]], [None, 3], [None, b"ab"], [None, {"text": "ab"}]],
+        ids=["list-after-a-missing-row", "list", "int", "bytes", "struct"],
+    )
+    def test_a_column_of_another_type_is_rejected_before_any_row_is_read(
+        self, tmp_path, monkeypatch, prompts
+    ):
+        from datasets import Dataset
+
+        feature = Dataset.from_dict({"prompt": prompts}).features["prompt"]
+        tok = _CountingTokenizer()
+        with pytest.raises(
+            TypeError,
+            match=rf"'prompt' must be a string column.*'null' when no row has a prompt.*got "
+            rf"{re.escape(str(feature))}$",
+        ):
+            _prompted_dataset(tmp_path, monkeypatch, prompts, tok)
+        assert tok.texts == []
+
+    @pytest.mark.parametrize(
+        ("prompts", "dtype"),
+        [(["ab", None], "string"), (["ab", None], "large_string"), ([None, None], "null")],
+    )
+    def test_a_string_column_or_one_with_no_prompt_is_admitted(
+        self, tmp_path, monkeypatch, prompts, dtype
+    ):
+        ds = _prompted_dataset(tmp_path, monkeypatch, prompts, prompt_dtype=dtype)
+        assert ds._ds.features["prompt"].dtype == dtype
+        for i, prompt in enumerate(prompts):
+            _, labels = _tokenize_and_mask(_MockTokenizer(), "xyz", max_text_len=8, prompt=prompt)
+            assert torch.equal(ds[i]["labels"], labels)
 
 
 # ---------------------------------------------------------------------------
@@ -783,9 +829,11 @@ class TestHuggingFaceVLMDataset:
 
     def test_getitem_rejects_a_non_string_prompt(self, tmp_path, monkeypatch):
         """A prompt value that is not a string is rejected, not dropped as no prompt."""
-        ds = _prompted_dataset(tmp_path, monkeypatch, [None, ["ab"]])
+        ds = _prompted_dataset(tmp_path, monkeypatch, ["ab"])
+        row = {"image": _make_image(32), "caption": "xyz", "prompt": ["ab"]}
+        monkeypatch.setattr(ds, "_ds", [row])
         with pytest.raises(TypeError, match="'prompt' must be str or None, got list"):
-            _ = ds[1]
+            _ = ds[0]
 
     def test_missing_prompt_trains_as_an_unprompted_caption(self, tmp_path, monkeypatch):
         """``None`` is how a string column stores a missing value: that row has no prompt."""
