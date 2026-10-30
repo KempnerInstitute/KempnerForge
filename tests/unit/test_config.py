@@ -819,7 +819,10 @@ class TestVLMParallelismSupport:
     def test_tensor_parallel_rejected(self, arch, reason):
         """A dense model with untied embeddings runs tensor parallelism with sequence
         parallelism, whose first forward no VLM arch survives."""
-        match = rf"vlm.arch='{arch}' does not support tensor parallelism .*{reason}.*tp = 1"
+        match = (
+            rf"vlm.arch='{arch}' does not support tensor parallelism.*\(distributed.tp=2\)"
+            rf".*{reason}.*tp = 1"
+        )
         with pytest.raises(ValueError, match=match):
             _vlm_job(arch, tp=2).validate(world_size=2)
 
@@ -890,7 +893,7 @@ class TestVLMParallelismSupport:
 
     @pytest.mark.parametrize("arch", ["mot", "joint_decoder", "moma", "cross_attention"])
     def test_tensor_parallel_reason_precedes_head_divisibility(self, arch):
-        """6 heads do not split over tp = 4, but the arch is what has to change."""
+        """6 heads do not split over tp = 4, but the arch's reason comes first."""
         job = _vlm_job(arch, tp=4, n_heads=6)
         with pytest.raises(ValueError, match=rf"vlm.arch='{arch}' does not support tensor"):
             job.validate(world_size=4)
@@ -906,7 +909,10 @@ class TestVLMParallelismSupport:
     def test_expert_parallel_rejected(self, arch, reason, num_experts):
         """0 experts would fail the MoE check, 3 the divisibility check by ep = 2, and any
         count above 0 MoMa's own num_experts check; the arch's reason comes first."""
-        match = rf"vlm.arch='{arch}' does not support expert parallelism .*{reason}.*ep = 1"
+        match = (
+            rf"vlm.arch='{arch}' does not support expert parallelism \(distributed.ep=2\)"
+            rf".*{reason}.*ep = 1"
+        )
         with pytest.raises(ValueError, match=match):
             _vlm_job(arch, ep=2, num_experts=num_experts).validate(world_size=2)
 
