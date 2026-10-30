@@ -197,7 +197,9 @@ def _assert_grads_match(step: _Step) -> None:
     for name, p in step.reference.named_parameters():
         assert p.grad is not None, name
         scale = float(p.grad.abs().max())
-        torch.testing.assert_close(got[name], p.grad, rtol=1e-4, atol=1e-5 * scale, msg=name)
+        torch.testing.assert_close(
+            got[name], p.grad, rtol=1e-4, atol=1e-5 * scale, msg=lambda m, name=name: f"{name}: {m}"
+        )
 
 
 def _check_gradients(rank, world, port, names, sizes, overrides, micro_steps) -> None:
@@ -233,7 +235,8 @@ def _check_clipping(rank, world, port, names, sizes, overrides) -> None:
     _init(rank, world, port)
     try:
         step = _step(names, sizes, overrides)
-        assert clip_grad_norm_(step.model, MAX_NORM) > 2 * MAX_NORM
+        norm = clip_grad_norm_(step.model, MAX_NORM)
+        assert norm > 2 * MAX_NORM, f"the clip does not bind: norm {float(norm)}"
         torch.nn.utils.clip_grad_norm_(step.reference.parameters(), MAX_NORM)
         _assert_grads_match(step)
         for name, p in step.model.named_parameters():
@@ -245,7 +248,13 @@ def _check_clipping(rank, world, port, names, sizes, overrides) -> None:
             dist.all_gather(copies, local.contiguous(), group=step.mesh["ep"].get_group())
             scale = float(local.abs().max())
             for copy in copies:
-                torch.testing.assert_close(copy, local, rtol=1e-5, atol=1e-5 * scale, msg=name)
+                torch.testing.assert_close(
+                    copy,
+                    local,
+                    rtol=1e-5,
+                    atol=1e-5 * scale,
+                    msg=lambda m, name=name: f"{name}: {m}",
+                )
     finally:
         dist.destroy_process_group()
 
@@ -268,7 +277,9 @@ def _check_gradient_scale(rank, world, port, names, sizes, overrides) -> None:
     _init(rank, world, port)
     try:
         step = _step(names, sizes, overrides)
-        assert abs(step.loss - step.reference_loss) <= 1e-6 * abs(step.reference_loss)
+        assert abs(step.loss - step.reference_loss) <= 1e-6 * abs(step.reference_loss), (
+            f"loss {step.loss} against one process's {step.reference_loss}"
+        )
         _assert_grads_match(step)
     finally:
         dist.destroy_process_group()
