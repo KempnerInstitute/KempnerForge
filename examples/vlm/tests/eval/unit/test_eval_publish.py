@@ -523,7 +523,8 @@ class TestPublishResults:
         assert publish_results(_checkpoint(tmp_path), _results(), None) is False
 
         assert "Refused: mlflow could not be imported" in _warnings(caplog)
-        assert "uv sync --group mlflow" in _warnings(caplog)
+        assert "the environment is incomplete, run: uv sync" in _warnings(caplog)
+        assert "--group mlflow" not in _warnings(caplog)
         assert _hint(caplog)
 
     def test_an_unwritable_location_falls_back_to_a_temporary_file(
@@ -652,14 +653,15 @@ class TestPreflight:
         assert "pass --no-publish to silence this" in text
         assert "--limit" not in text
 
-    def test_missing_packages_are_named_with_their_dependency_group(
+    def test_missing_packages_are_named_with_how_to_install_them(
         self, tmp_path, monkeypatch, caplog
     ):
         uninstall(monkeypatch, "mlflow")
         uninstall(monkeypatch, "pandas")
         preflight(_checkpoint(tmp_path), None)
         text = _warnings(caplog)
-        assert "uv sync --group mlflow" in text and "uv sync --group eval" in text
+        assert "the environment is incomplete, run: uv sync --group eval" in text
+        assert "uv sync --group eval" in text and "--group mlflow" not in text
 
     def test_a_dependency_that_breaks_when_imported_is_a_warning_not_an_abort(
         self, tmp_path, monkeypatch, caplog

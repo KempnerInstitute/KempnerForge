@@ -598,7 +598,7 @@ class TestPublishMetrics:
 
     def test_refused_when_mlflow_is_not_installed(self, tmp_path, monkeypatch):
         monkeypatch.setitem(sys.modules, "mlflow", None)
-        with pytest.raises(PublishRefused, match="uv sync --group mlflow"):
+        with pytest.raises(PublishRefused, match="the environment is incomplete, run: uv sync$"):
             publish_metrics(_sidecar(tmp_path), {"a": 1.0})
 
     def test_concurrent_publishers_to_one_run_do_not_share_state(self, tmp_path, monkeypatch):
