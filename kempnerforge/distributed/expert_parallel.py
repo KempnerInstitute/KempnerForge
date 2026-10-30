@@ -85,6 +85,19 @@ def _all_to_all(
     return _AllToAll.apply(x, output_split_sizes, input_split_sizes, group)
 
 
+class _ScaleGrad(torch.autograd.Function):
+    """Identity in the forward pass; multiplies the gradient by ``scale`` in the backward."""
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, scale: float) -> torch.Tensor:
+        ctx.scale = scale
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        return grad_output * ctx.scale, None
+
+
 # ---------------------------------------------------------------------------
 # EP dispatch / combine
 # ---------------------------------------------------------------------------
@@ -102,6 +115,13 @@ def ep_dispatch_and_compute(
     gradient_scale: bool = False,
 ) -> torch.Tensor:
     """All-to-all dispatch, local expert compute, all-to-all combine.
+
+    The local experts receive the tokens of every rank in the EP group, so their
+    weight gradients sum the gradients of ``ep_world_size`` ranks' losses, while
+    FSDP2 averages over the DP mesh alone. The gradient entering the local expert
+    compute is divided by ``ep_world_size`` and the gradient it passes back to the
+    tokens is multiplied by it: the routed-expert gradients become the mean over the
+    EP group, as if the experts were not split, and every other gradient is unchanged.
 
     Args:
         x: (num_tokens, dim) flattened token representations.
@@ -151,6 +171,7 @@ def ep_dispatch_and_compute(
 
     # --- 4. All-to-all: send tokens to expert-owning ranks ---
     received_tokens = _all_to_all(x_sorted, recv_counts_list, send_counts_list, ep_group)
+    received_tokens = _ScaleGrad.apply(received_tokens, float(ep_world_size))
 
     # Also exchange expert indices (as float for autograd compatibility, detached)
     sorted_expert_ids_float = sorted_flat_indices.float().unsqueeze(-1)
@@ -272,6 +293,7 @@ def ep_dispatch_and_compute(
     # Adding a zero-valued contribution preserves the graph edge without
     # changing any gradient values.
     local_output = local_output + received_tokens.sum() * 0
+    local_output = _ScaleGrad.apply(local_output, 1.0 / ep_world_size)
 
     # --- 6. All-to-all: return processed tokens to originating ranks ---
     # Reverse the all-to-all (swap send/recv counts)
