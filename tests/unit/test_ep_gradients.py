@@ -37,6 +37,7 @@ PACKED_EXPERT = (".mlp.up_w", ".mlp.down_w", ".mlp.gate_w")
 
 LAYOUTS = {
     "ep2": (("dp_shard", "ep"), (1, 2), {}),
+    "ep4": (("dp_shard", "ep"), (1, 4), {}),
     "dp_shard2_ep2_packed": (("dp_shard", "ep"), (2, 2), {"moe_packed_experts": True}),
     "dp_replicate2_ep2": (("dp_replicate", "dp_shard", "ep"), (2, 1, 2), {}),
     "ep2_tp2": (("dp_shard", "ep", "tp"), (1, 2, 2), {}),
@@ -277,13 +278,18 @@ class TestExpertParallelGradients:
         """Two micro-steps under ``maybe_no_sync`` accumulate one process's gradients."""
         _spawn(_check_gradients, ("dp_shard", "ep"), (2, 2), {}, 2)
 
-    def test_gradient_scale_matches_one_process(self):
+    @pytest.mark.parametrize(
+        "sizes", [pytest.param((2, 2), id="dp_shard2_ep2"), pytest.param((1, 4), id="ep4")]
+    )
+    def test_gradient_scale_matches_one_process(self, sizes):
         """``moe_gradient_scale`` averages the load over all experts, as without EP."""
-        _spawn(_check_gradient_scale, ("dp_shard", "ep"), (2, 2), {"moe_gradient_scale": True})
+        _spawn(_check_gradient_scale, ("dp_shard", "ep"), sizes, {"moe_gradient_scale": True})
 
 
 class TestClipUnderExpertParallelism:
-    @pytest.mark.parametrize("layout", ["dp_shard2_ep2_packed", "dp_replicate2_ep2", "ep2_tp2"])
+    @pytest.mark.parametrize(
+        "layout", ["dp_shard2_ep2_packed", "dp_replicate2_ep2", "ep2_tp2", "ep4"]
+    )
     def test_ep_ranks_return_the_whole_model_norm(self, layout):
         """The norm covers every rank's experts, so all EP ranks return the same norm."""
         _spawn(_check_norm, *LAYOUTS[layout])
