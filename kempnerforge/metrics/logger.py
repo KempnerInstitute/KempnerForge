@@ -1,6 +1,7 @@
 """Rank-aware logging utilities for KempnerForge.
 
 Provides a simple logging setup that:
+
 - Only emits from rank 0 by default (avoids duplicate log lines), except a
   record logged with ``extra={"every_rank": True}``, which every rank emits
 - Supports color-coded output for key metrics
