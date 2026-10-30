@@ -23,7 +23,8 @@ scattering, inflating the global sequence dimension. The first block's
 SequenceParallel norm naturally handles the Replicate → Shard(1) transition.
 
 SequenceParallel is disabled when tie_embeddings=True (ColwiseParallel on
-the output head imposes incompatible sharding on the shared weight).
+the output head imposes incompatible sharding on the shared weight) and for
+MoE models; ``ModelConfig.tp_sequence_parallel`` holds the condition.
 
 Pipeline parallel stages use basic TP (no SequenceParallel) to avoid
 DTensors at PP stage boundaries.
@@ -119,14 +120,10 @@ def apply_tensor_parallel(
         logger.warning("No 'tp' dimension in DeviceMesh — skipping tensor parallelism")
         return
 
-    tie = getattr(getattr(model, "config", None), "tie_embeddings", False)
+    config = getattr(model, "config", None)
+    tie = getattr(config, "tie_embeddings", False)
     is_pp_stage = hasattr(model, "stage_id")
-    is_moe = getattr(getattr(model, "config", None), "is_moe", False)
-    # SequenceParallel requires TP on embedding/head (otherwise the unsharded
-    # output head can't consume Shard(1) input from the final norm).
-    # Disabled for MoE: boolean indexing in expert dispatch breaks Shard(1) DTensors,
-    # and alternating SP-on/SP-off blocks create DTensor transition errors.
-    seq_parallel = not is_pp_stage and not tie and not is_moe
+    seq_parallel = not is_pp_stage and getattr(config, "tp_sequence_parallel", True)
 
     # Token embedding: wrap output as DTensor Replicate so the first block's
     # SequenceParallel norm properly redistributes to Shard(1). Without this,
