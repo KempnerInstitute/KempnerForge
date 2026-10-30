@@ -157,7 +157,9 @@ mesh: ("dp_shard", "ep", "tp") → (4, 2, 4)
 
 - Each EP group (size 2) splits the 8 experts as `experts 0-3` on
   rank 0 and `experts 4-7` on rank 1.
-- Within each EP group, TP shards the per-expert Linears along `tp=4`.
+- Within each EP group, TP shards the attention projections along
+  `tp=4`; the TP plan leaves the MoE layers whole, so their experts
+  are replicated over `tp`.
 - FSDP shards the remaining params across the `dp_shard=4` axis with
   per-sub-module wrapping.
 
