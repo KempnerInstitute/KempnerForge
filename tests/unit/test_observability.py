@@ -576,9 +576,27 @@ class TestMLflowBackend:
         )
         backend.log({"train/loss": 1.0}, step=1)
         assert backend._active is False
+        assert len(warnings_seen) == 1
+        assert warnings_seen[0].startswith("MLflow backend disabled by a failed import (")
+        assert "mlflow" in warnings_seen[0]
+        assert warnings_seen[0].endswith("the environment is incomplete, run: uv sync")
+
+    def test_an_import_error_from_another_package_names_it_in_the_warning(self, monkeypatch):
+        """Every import init makes is covered, so the warning carries the one that failed."""
+        warnings_seen = _capture_warnings(monkeypatch)
+
+        def _no_sdk(*args, **kwargs):
+            raise ImportError("No module named 'databricks.sdk'")
+
+        fm = _FakeMlflow()
+        fm.set_tracking_uri = _no_sdk
+        monkeypatch.setitem(sys.modules, "mlflow", fm)
+        backend = MLflowBackend(_mlflow_cfg())
+        backend.log({"train/loss": 1.0}, step=1)
+        assert backend._active is False
         assert warnings_seen == [
-            "mlflow could not be imported; disabling MLflow backend "
-            "(the environment is incomplete, run: uv sync)"
+            "MLflow backend disabled by a failed import (No module named 'databricks.sdk'); "
+            "the environment is incomplete, run: uv sync"
         ]
 
     def test_mlflow_handles_init_exception(self, monkeypatch):

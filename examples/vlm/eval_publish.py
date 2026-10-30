@@ -45,7 +45,7 @@ _NAME_SEPARATORS = re.compile(r"[^A-Za-z0-9.-]+")
 # MLflow errors quote tracking URIs verbatim, and a URI can carry credentials anywhere in it.
 _URL = re.compile(r"\b([a-zA-Z][a-zA-Z0-9+.-]*://)[^\s'\"<>]+")
 _INSTALL_HINTS = {
-    "mlflow": "the environment is incomplete, run: uv sync",
+    "mlflow": "the environment is incomplete, run: uv sync --group eval",
     "pandas": "install it with: uv sync --group eval",
 }
 

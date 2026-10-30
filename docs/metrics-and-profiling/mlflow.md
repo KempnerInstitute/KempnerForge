@@ -377,7 +377,8 @@ check included, run with MLflow's own defaults.
 
 `_ensure_init` disables the backend for the rest of the run on any failure, with one warning:
 
-- `mlflow` cannot be imported, so the environment is incomplete: the warning says to run
+- An import failed, `mlflow` itself or something it imports, so the environment is incomplete:
+  the warning reads `MLflow backend disabled by a failed import (<error>)` and says to run
   `uv sync`.
 - A deliberate config error: `$MLFLOW_EXPERIMENT` is not absolute on Databricks, or no experiment
   path could be resolved. The warning reads `MLflow disabled: <reason>`.
