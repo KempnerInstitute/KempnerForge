@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 import torch
+from torch.distributed.tensor.parallel import SequenceParallel
 
 from kempnerforge.config.schema import ModelConfig
+from kempnerforge.distributed import tensor_parallel
 from kempnerforge.distributed.setup import _detect_ib_interface, _set_nccl_env, get_world_info
 from kempnerforge.distributed.tensor_parallel import _build_block_tp_plan
 from kempnerforge.distributed.utils import clip_grad_norm_
-from kempnerforge.model.transformer import TransformerBlock
+from kempnerforge.model.transformer import Transformer, TransformerBlock
 
 
 def _make_block(activation: str = "silu") -> TransformerBlock:
@@ -121,6 +124,41 @@ class TestBuildBlockTPPlan:
         block = _make_block(activation="silu")
         plan = _build_block_tp_plan(block, sequence_parallel=False)
         assert len(plan) == 7
+
+
+class TestApplyTensorParallelSequenceParallel:
+    """``apply_tensor_parallel`` takes the sequence-parallel decision from
+    ``ModelConfig.tp_sequence_parallel``, which config validation reads too."""
+
+    @pytest.mark.parametrize(
+        ("num_experts", "tie_embeddings"),
+        [
+            pytest.param(0, False, id="dense-untied"),
+            pytest.param(2, False, id="moe"),
+            pytest.param(0, True, id="tied"),
+        ],
+    )
+    def test_norms_get_sequence_parallel_as_the_config_says(
+        self, monkeypatch, num_experts, tie_embeddings
+    ):
+        config = ModelConfig(
+            dim=64,
+            n_layers=2,
+            n_heads=4,
+            vocab_size=128,
+            num_experts=num_experts,
+            moe_top_k=1,
+            tie_embeddings=tie_embeddings,
+        )
+        plans = []
+        monkeypatch.setattr(tensor_parallel, "get_tp_mesh", lambda mesh: mesh)
+        monkeypatch.setattr(
+            tensor_parallel, "parallelize_module", lambda module, mesh, plan: plans.append(plan)
+        )
+        tensor_parallel.apply_tensor_parallel(Transformer(config), SimpleNamespace(size=lambda: 1))
+        styles = [style for plan in plans for style in plan.values()]
+        uses_sequence_parallel = any(isinstance(style, SequenceParallel) for style in styles)
+        assert uses_sequence_parallel is config.tp_sequence_parallel
 
 
 # ---------------------------------------------------------------------------
