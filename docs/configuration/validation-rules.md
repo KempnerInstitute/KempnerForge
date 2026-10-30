@@ -224,13 +224,15 @@ Checked first when `distributed.tp > 1`, ahead of head divisibility, so the
 error names the arch rather than a head count:
 
 ```
-vlm.arch == "mot" && distributed.tp > 1                      →  ValueError
+isinstance(vlm, MoTConfig) && distributed.tp > 1             →  ValueError
 vlm set && distributed.tp > 1 && sequence parallelism on     →  ValueError
 ```
 
 The tensor-parallel plan
 ([`apply_tensor_parallel`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/distributed/tensor_parallel.py))
-is written for `TransformerBlock` and walks `model.layers` only.
+is written for `TransformerBlock` and walks `model.layers` only. The
+checks act on the class of the `[vlm]` config, and the errors name that
+class's arch.
 
 - `mot`: `MoTBlock` renames the attention modules (`attn_norm`, `attn`) and
   holds `mlp_norm` and `mlp` as per-modality `ModuleDict`s, so the build
@@ -243,7 +245,8 @@ is written for `TransformerBlock` and walks `model.layers` only.
   `joint_decoder` and `moma` where the image prefix joins the token
   embeddings and in `cross_attention` in the first cross-attention block.
 
-With sequence parallelism off, which an MoE model or tied embeddings give,
+With sequence parallelism off, which an MoE model or tied embeddings give
+(for `moma` only tied embeddings, since MoMa keeps `model.num_experts = 0`),
 `joint_decoder`, `cross_attention` and `moma` train under tensor parallelism
 and match an unsharded model with the same weights. The plan shards the
 transformer blocks, and the cross-attention blocks and MoMa's expert groups
