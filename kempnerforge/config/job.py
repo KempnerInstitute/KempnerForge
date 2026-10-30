@@ -27,6 +27,15 @@ from kempnerforge.config.vlm import MoMaConfig, MoTConfig, VLMConfig
 _HF_VISION_ENCODER_TYPES = frozenset({"siglip2", "clip"})
 
 
+def _arch_of(vlm: VLMConfig) -> str:
+    """The arch of ``vlm``'s class, which is what the parallelism checks act on.
+
+    The instance's ``arch`` field can name another arch, for example after a
+    ``--vlm.arch`` override, which keeps the class the TOML section built.
+    """
+    return type(vlm).arch
+
+
 @dataclass
 class JobConfig:
     """Top-level configuration aggregating all sub-configs.
@@ -182,7 +191,7 @@ class JobConfig:
         if self.distributed.tp > 1:
             if isinstance(self.vlm, MoTConfig):
                 raise ValueError(
-                    f"vlm.arch={self.vlm.arch!r} does not support tensor parallelism "
+                    f"vlm.arch={_arch_of(self.vlm)!r} does not support tensor parallelism "
                     f"(distributed.tp={self.distributed.tp}): the tensor-parallel plan is keyed "
                     "on TransformerBlock's module names, and MoTBlock renames the attention "
                     "modules (attn_norm, attn) and holds mlp_norm and mlp as per-modality "
@@ -195,7 +204,7 @@ class JobConfig:
                 and self.model.tp_sequence_parallel
             ):
                 raise ValueError(
-                    f"vlm.arch={self.vlm.arch!r} does not support tensor parallelism with "
+                    f"vlm.arch={_arch_of(self.vlm)!r} does not support tensor parallelism with "
                     f"sequence parallelism on (distributed.tp={self.distributed.tp}): tensor "
                     "parallelism shards the activations along the sequence for a dense model "
                     "with untied embeddings, and the first forward then fails on mixed "
@@ -231,7 +240,7 @@ class JobConfig:
         if self.distributed.ep > 1:
             if isinstance(self.vlm, MoTConfig):
                 raise ValueError(
-                    f"vlm.arch={self.vlm.arch!r} does not support expert parallelism "
+                    f"vlm.arch={_arch_of(self.vlm)!r} does not support expert parallelism "
                     f"(distributed.ep={self.distributed.ep}): the FSDP2 wrap for expert-parallel "
                     "blocks expects layer.attention and layer.mlp, and MoTBlock names its "
                     "attention attn and keeps its FFNs per modality, so a MoT model with experts "
@@ -240,7 +249,7 @@ class JobConfig:
                 )
             if isinstance(self.vlm, MoMaConfig):
                 raise ValueError(
-                    f"vlm.arch={self.vlm.arch!r} does not support expert parallelism "
+                    f"vlm.arch={_arch_of(self.vlm)!r} does not support expert parallelism "
                     f"(distributed.ep={self.distributed.ep}): apply_expert_parallel partitions "
                     "MoEMLP experts only, and MoMa's per-modality expert groups need an EP-aware "
                     "dispatch that is not wired yet, so every rank would keep every expert. Set "

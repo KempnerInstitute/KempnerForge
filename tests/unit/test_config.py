@@ -849,6 +849,15 @@ class TestVLMParallelismSupport:
         job = _vlm_job(arch, tp=2, num_experts=num_experts, tie_embeddings=tie_embeddings)
         job.validate(world_size=2)
 
+    def test_errors_name_the_arch_of_the_config_class(self):
+        """The checks act on the config's class, and the arch field can name another arch
+        after a ``--vlm.arch`` override, so the error names the class's arch."""
+        job = _vlm_job("moma", ep=2)
+        assert job.vlm is not None
+        job.vlm.arch = "joint_decoder"
+        with pytest.raises(ValueError, match=r"vlm.arch='moma' does not support expert"):
+            job.validate(world_size=2)
+
     @pytest.mark.parametrize("arch", ["mot", "joint_decoder", "moma", "cross_attention"])
     def test_tensor_parallel_reason_precedes_head_divisibility(self, arch):
         """6 heads do not split over tp = 4, but the arch is what has to change."""
