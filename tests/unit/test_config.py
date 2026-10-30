@@ -819,6 +819,24 @@ class TestVLMParallelismSupport:
             _vlm_job(arch, tp=2).validate(world_size=2)
 
     @pytest.mark.parametrize(
+        ("arch", "ways"),
+        [
+            pytest.param(
+                "joint_decoder", "an MoE model or tied embeddings give", id="joint_decoder"
+            ),
+            pytest.param(
+                "cross_attention", "an MoE model or tied embeddings give", id="cross_attention"
+            ),
+            pytest.param("moma", r"tied embeddings give \(MoMa keeps", id="moma"),
+        ],
+    )
+    def test_sequence_parallel_error_names_the_ways_to_turn_it_off(self, arch, ways):
+        """MoMa keeps ``model.num_experts = 0``, so tied embeddings are its only way."""
+        match = rf"only with sequence parallelism off, which {ways}"
+        with pytest.raises(ValueError, match=match):
+            _vlm_job(arch, tp=2).validate(world_size=2)
+
+    @pytest.mark.parametrize(
         ("num_experts", "tie_embeddings"),
         [pytest.param(2, False, id="moe"), pytest.param(0, True, id="tied")],
     )

@@ -203,14 +203,19 @@ class JobConfig:
                 and self.distributed.pp == 1
                 and self.model.tp_sequence_parallel
             ):
+                ways = (
+                    "tied embeddings give (MoMa keeps model.num_experts = 0)"
+                    if isinstance(self.vlm, MoMaConfig)
+                    else "an MoE model or tied embeddings give"
+                )
                 raise ValueError(
                     f"vlm.arch={_arch_of(self.vlm)!r} does not support tensor parallelism with "
                     f"sequence parallelism on (distributed.tp={self.distributed.tp}): tensor "
                     "parallelism shards the activations along the sequence for a dense model "
                     "with untied embeddings, and the first forward then fails on mixed "
-                    "torch.Tensor and DTensor operands. Set distributed.tp = 1. VLM arches "
-                    "other than MoT run under tensor parallelism only with sequence "
-                    "parallelism off, which an MoE model or tied embeddings give."
+                    "torch.Tensor and DTensor operands. Set distributed.tp = 1. This arch "
+                    "runs under tensor parallelism only with sequence parallelism off, which "
+                    f"{ways}."
                 )
             if self.model.n_heads % self.distributed.tp != 0:
                 raise ValueError(
