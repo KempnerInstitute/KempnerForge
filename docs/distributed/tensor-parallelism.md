@@ -129,17 +129,18 @@ See
 ## VLM architectures
 
 The plan is written for `TransformerBlock`, and `apply_tensor_parallel`
-walks `model.layers` only. `JobConfig.validate` therefore rejects `tp > 1`
-for these three VLM arches, ahead of the head-divisibility check:
+walks `model.layers` only. `JobConfig.validate` rejects `tp > 1`, ahead of
+the head-divisibility check, wherever a VLM run would fail or shard nothing:
 
-| `vlm.arch` | What the plan misses |
-|------------|----------------------|
-| `mot` | Every module: `MoTBlock` keeps its norms, attention and FFNs per modality under other names, so the build fails or nothing is sharded |
-| `moma` | `MoMaFFN`'s per-modality expert groups, which are never sharded; with SequenceParallel on, the first forward fails |
-| `cross_attention` | The blocks in `cross_attention_layers`, which are never sharded and, with SequenceParallel on, fail on the sequence-sharded activations |
+| `vlm.arch` | SequenceParallel on (dense, untied embeddings) | SequenceParallel off (MoE or tied embeddings) |
+|------------|------------------------------------------------|-----------------------------------------------|
+| `mot` | Rejected: the build fails with a `KeyError` | Rejected: nothing is sharded |
+| `joint_decoder`, `moma` | Rejected: the first forward fails where the image prefix joins the token embeddings | Trains |
+| `cross_attention` | Rejected: the first cross-attention block fails on the sequence-sharded activations | Trains |
 
-With SequenceParallel off (MoE or tied embeddings) these runs would start,
-but the blocks the plan misses would stay whole on every TP rank. See
+With SequenceParallel off the plan shards the transformer blocks, and the
+cross-attention blocks and MoMa's expert groups stay whole on every TP rank,
+as MoE experts do. See
 [Validation rules § VLM architectures under tensor parallelism](../configuration/validation-rules.md#vlm-architectures-under-tensor-parallelism).
 
 ## TP across vs within nodes
@@ -160,7 +161,7 @@ see [Parallelism recipes](../reference/parallelism-recipes.md).
 | `n_layers` blocks FSDP (e.g. 70B on 32 GPUs) | Yes — memory forces it |
 | Need to shard attention weights (huge `dim`, few layers) | Yes |
 | MoE | Yes, for attention only — TP on experts is replaced by EP |
-| VLM with `vlm.arch` `mot`, `moma` or `cross_attention` | No, rejected at validation (see [VLM architectures](#vlm-architectures)) |
+| VLM | Only with SequenceParallel off (MoE or tied embeddings), and never for `mot` (see [VLM architectures](#vlm-architectures)) |
 
 The rule of thumb and supporting benchmarks are in
 [Parallelism recipes § Choosing a parallelism combination](../reference/parallelism-recipes.md#choosing-a-parallelism-combination).
