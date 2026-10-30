@@ -138,6 +138,27 @@ def test_preset_rejects_parallelism_its_arch_cannot_run(
         config.validate(world_size=2)
 
 
+TENSOR_PARALLEL_KEPT = [
+    path for path in CONFIGS if _arch(path) != "mot" and not _tp_sequence_parallel(path)
+]
+
+
+@pytest.mark.parametrize("path", TENSOR_PARALLEL_KEPT, ids=lambda path: path.name)
+def test_preset_keeps_tensor_parallelism_with_sequence_parallelism_off(path: Path) -> None:
+    """MoE or tied embeddings turn sequence parallelism off, and every arch but MoT trains
+    under tensor parallelism then, so these presets still validate with it."""
+    config = load_config(str(path), cli_args=["--distributed.tp=2"])
+    config.validate(world_size=2)
+
+
+def test_presets_cover_every_arch_and_both_tensor_parallel_outcomes() -> None:
+    """The parallelism cases come from the presets, so removing a preset would drop its cases
+    without a failure: every arch keeps a preset, and so does each tensor-parallel outcome."""
+    assert {_arch(path) for path in CONFIGS} >= {"joint_decoder", "cross_attention", "mot", "moma"}
+    assert CONFIG_DIR / "vlm_debug_moe.toml" in TENSOR_PARALLEL_KEPT
+    assert any(_tp_sequence_parallel(path) for path in CONFIGS)
+
+
 def test_an_arch_override_is_reported_as_the_presets_arch() -> None:
     """``--vlm.arch`` keeps the preset's MoMa config class, which is what the expert-parallel
     check acts on, so the error names ``moma`` rather than the overridden field."""
