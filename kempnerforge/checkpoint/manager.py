@@ -343,6 +343,19 @@ def _error_text(error: BaseException) -> str:
         return f"<unprintable {type(error).__name__}>"
 
 
+def _attempt(action: Callable[..., object], *args: Any, **kwargs: Any) -> BaseException | None:
+    """Call ``action(*args, **kwargs)``; return the error it raised, or ``None``.
+
+    The error is an ``Exception`` or DCP's ``CheckpointException``, which derives from
+    ``BaseException`` only; anything else, such as ``KeyboardInterrupt``, propagates.
+    """
+    try:
+        action(*args, **kwargs)
+    except (Exception, dcp.CheckpointException) as e:
+        return e
+    return None
+
+
 class CheckpointManager:
     """Manages save/load/cleanup of distributed checkpoints.
 
@@ -436,45 +449,66 @@ class CheckpointManager:
         self._register_committed(step, ckpt_dir)
         self._cleanup()
 
-    def _drain_pending_finalize(self, overwriting: Path | None = None) -> None:
+    def _drain_pending_finalize(
+        self, overwriting: Path | None = None, error: BaseException | None = None
+    ) -> BaseException | None:
         """Commit a deferred async checkpoint once its flush is durable.
 
         Invoked on every rank after its pending DCP future has been awaited
-        (next save() or an explicit wait()/flush). Under PP every rank first
-        waits until every stage's flush is durable. Rank 0 then performs the
-        symlink + cleanup; other ranks never touch the symlink, mirroring save().
-        A checkpoint pending in ``overwriting``, the directory a new save's
-        flush is rewriting, is dropped uncommitted and unregistered; that
-        save's own deferred commit points `latest` at it and registers it.
+        (next save() or an explicit wait()/flush), with the error that wait
+        raised on this rank, if any. Under PP every rank first agrees that
+        every stage's flush is durable, so a flush that failed on any rank
+        raises on every rank and nothing is committed. Rank 0 then performs
+        the symlink + cleanup; other ranks never touch the symlink, mirroring
+        save(). A checkpoint pending in ``overwriting``, the directory a new
+        save's flush is rewriting, is dropped uncommitted and unregistered;
+        that save's own deferred commit points `latest` at it and registers it.
+
+        Returns the error this rank still has to report: ``error``, or the one
+        rank 0's commit raised.
         """
         if self._pending_finalize is None:
-            return
+            return error
         step, ckpt_dir = self._pending_finalize
         self._pending_finalize = None
-        self._await_every_stage()
-        if self._rank == 0 and ckpt_dir != overwriting:
-            self._commit_latest(step, ckpt_dir)
+        self._await_every_stage(error)
+        if self._rank == 0 and error is None and ckpt_dir != overwriting:
+            return _attempt(self._commit_latest, step, ckpt_dir)
+        return error
 
-    def _await_every_stage(self) -> None:
-        """Under PP, wait until every stage's DCP write is durable; a no-op otherwise.
+    def _await_every_stage(self, error: BaseException | None) -> None:
+        """Under PP, agree that every stage's DCP write is durable; a no-op otherwise.
 
         Each stage saves through its own process group, so this rank's write
         being durable covers its own stage only; without PP the save spans every
-        rank. Every rank calls this once its own write is durable. Collective on
-        the dedicated gloo group.
+        rank. Every rank calls this once its own write has ended, with the error
+        it raised, if any; under PP it then raises on every rank when any rank's
+        write failed (see ``_agree``).
         """
         if self._pp_rank is not None:
-            self._sync_barrier()
+            self._agree(error)
 
-    def _sync_barrier(self) -> None:
-        """Barrier on the manager's dedicated gloo group.
+    def _agree(self, error: BaseException | None) -> None:
+        """Barrier on the manager's dedicated gloo group that raises on every rank if any failed.
 
-        Used to fence non-rank-0 ranks behind rank-0's metadata writes
-        without sharing the default process group that DCP's async-save
-        background thread is concurrently issuing collectives on.
+        Every rank passes the error its own part of the save raised, or ``None``.
+        A rank with an error re-raises it; when any rank has one, every other rank
+        raises a ``RuntimeError`` naming the ranks that failed, so no rank is left
+        waiting in a later collective for a rank that has raised. The group is not
+        the default process group that DCP's async-save background thread issues
+        collectives on. Without an initialized process group, ``error`` is raised
+        if set.
         """
+        failed: list[int] = []
         if dist.is_initialized():
-            dist.barrier(group=self._sync_group)
+            flags = torch.zeros(dist.get_world_size(self._sync_group), dtype=torch.int32)
+            flags[dist.get_rank(self._sync_group)] = int(error is not None)
+            dist.all_reduce(flags, group=self._sync_group)
+            failed = flags.nonzero().flatten().tolist()
+        if error is not None:
+            raise error
+        if failed:
+            raise RuntimeError(f"Checkpoint save failed on ranks {failed}")
 
     def set_tracking_source(self, source: TrackingSource | None) -> None:
         """Record the logging runs ``source`` reports in every later ``metadata.json``.
@@ -641,8 +675,11 @@ class CheckpointManager:
         # FIRST awaits the previous in-flight flush, so any deferred
         # `_pending_finalize` from the prior save is now durable. For sync
         # mode (disabled) dcp.save() blocks until THIS checkpoint is durable.
-        self._async_ckpt.save(
-            dcp_state, checkpoint_id=str(dcp_dir), process_group=self._process_group
+        error = _attempt(
+            self._async_ckpt.save,
+            dcp_state,
+            checkpoint_id=str(dcp_dir),
+            process_group=self._process_group,
         )
 
         sync_mode = self.config.async_mode == AsyncCheckpointMode.disabled
@@ -650,43 +687,21 @@ class CheckpointManager:
         # The prior async checkpoint's flush is now guaranteed durable (the
         # dispatch above awaited it). Commit its `latest` symlink + cleanup
         # before doing anything else.
-        self._drain_pending_finalize(overwriting=ckpt_dir)
+        error = self._drain_pending_finalize(overwriting=ckpt_dir, error=error)
 
         # Save non-distributed state (rank 0 only). These are small synchronous
         # writes; they finish well before `latest` is ever pointed here, so
         # the checkpoint dir is fully populated by commit time.
-        if self._rank == 0:
-            train_state = build_train_state(
-                step=step,
-                tokens_seen=tokens_seen,
-                scheduler=scheduler,
-                dataloader=dataloader,
-                extra=extra,
+        if self._rank == 0 and error is None:
+            error = _attempt(
+                self._write_train_state, ckpt_dir, step, tokens_seen, scheduler, dataloader, extra
             )
-            torch.save(train_state, ckpt_dir / _TRAIN_STATE_FILE)
-
-            # Write human-readable metadata
-            meta: dict[str, Any] = {"step": step, "tokens_seen": tokens_seen}
-            if extra is not None and "vlm_freeze" in extra:
-                # Already canonicalized by canonical_freeze_meta(...); stored as
-                # a sorted, deduplicated list of {"module", "frozen"} dicts so
-                # the comparison on load is reorder-invariant.
-                meta["vlm_freeze"] = extra["vlm_freeze"]
-            text = self._sidecar_text(meta)
-            with self._sidecar_lock:
-                _replace_file(ckpt_dir / _METADATA_FILE, text)
 
         if sync_mode:
-            self._await_every_stage()
+            self._await_every_stage(error)
             # DCP shards are already durable — commit immediately.
-            if self._rank == 0:
-                self._commit_latest(step, ckpt_dir)
-        else:
-            # Async flush still in flight. Defer the `latest` swap + cleanup
-            # until it is durable (drained at the next save() or wait()), so
-            # a crash mid-flush leaves `latest` on the last GOOD step rather
-            # than a half-written one whose DCP `.metadata` is absent.
-            self._pending_finalize = (step, ckpt_dir)
+            if self._rank == 0 and error is None:
+                error = _attempt(self._commit_latest, step, ckpt_dir)
 
         # save() is a collective: non-rank-0 ranks must not return until
         # rank-0 has written train_state.pt + metadata.json (and, in sync
@@ -695,7 +710,40 @@ class CheckpointManager:
         # Uses the dedicated gloo group: the async DCP flush dispatched just
         # above runs collectives on the default process group from a
         # background thread, and sharing that group here deadlocks.
-        self._sync_barrier()
+        self._agree(error)
+
+        if not sync_mode:
+            self._pending_finalize = (step, ckpt_dir)
+
+    def _write_train_state(
+        self,
+        ckpt_dir: Path,
+        step: int,
+        tokens_seen: int,
+        scheduler: Any | None,
+        dataloader: Any | None,
+        extra: dict | None,
+    ) -> None:
+        """Write ``train_state.pt`` and ``metadata.json`` into ``ckpt_dir``: rank 0's save() part.
+
+        ``extra["vlm_freeze"]``, when present, is recorded in ``metadata.json`` as given:
+        ``canonical_freeze_meta`` has already sorted and deduplicated it, so the comparison
+        on load does not depend on order.
+        """
+        train_state = build_train_state(
+            step=step,
+            tokens_seen=tokens_seen,
+            scheduler=scheduler,
+            dataloader=dataloader,
+            extra=extra,
+        )
+        torch.save(train_state, ckpt_dir / _TRAIN_STATE_FILE)
+        meta: dict[str, Any] = {"step": step, "tokens_seen": tokens_seen}
+        if extra is not None and "vlm_freeze" in extra:
+            meta["vlm_freeze"] = extra["vlm_freeze"]
+        text = self._sidecar_text(meta)
+        with self._sidecar_lock:
+            _replace_file(ckpt_dir / _METADATA_FILE, text)
 
     def wait(self) -> None:
         """Block until any pending async checkpoint save completes.
@@ -703,11 +751,11 @@ class CheckpointManager:
         Once the flush is durable, commit its deferred `latest` symlink +
         cleanup. The training loop calls this after the loop exits, so the
         final checkpoint's `latest` is committed before process teardown.
+        A flush that failed on any rank raises on every rank, and nothing is
+        committed.
         """
-        self._async_ckpt.wait()
-        self._drain_pending_finalize()
-        if dist.is_initialized():
-            dist.barrier()
+        error = _attempt(self._async_ckpt.wait)
+        self._agree(self._drain_pending_finalize(error=error))
 
     def flush_pending_save(self) -> None:
         """Drain any in-flight async save before mutating model state.
@@ -721,12 +769,11 @@ class CheckpointManager:
 
         Also commits the deferred `latest` symlink for that save, so a
         transition (or any caller draining the queue) leaves `latest`
-        pointed at the now-durable checkpoint.
+        pointed at the now-durable checkpoint. A flush that failed on any
+        rank raises on every rank, and nothing is committed.
         """
-        self._async_ckpt.wait()
-        self._drain_pending_finalize()
-        if dist.is_initialized():
-            dist.barrier()
+        error = _attempt(self._async_ckpt.wait)
+        self._agree(self._drain_pending_finalize(error=error))
 
     def peek_saved_step(self, path: str | None = None) -> int | None:
         """Read ``step`` from a candidate checkpoint's metadata.json.

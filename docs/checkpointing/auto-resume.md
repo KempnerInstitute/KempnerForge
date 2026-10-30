@@ -114,6 +114,14 @@ each stage saves through its own process group, so every rank first
 waits at a barrier until every stage's save has completed; only then
 does rank 0 move `latest` and prune.
 
+A save that fails on any rank (a DCP write or async flush, or rank 0's
+`train_state.pt`, `metadata.json` or commit) fails on every rank, and
+`latest` stays where it was. The barriers that end `save()`, `wait()`
+and `flush_pending_save()` carry each rank's outcome: a rank whose own
+part failed raises that error, and every other rank raises a
+`RuntimeError` naming the ranks that failed, so no rank is left waiting
+for one that has already raised.
+
 ## Retention cleanup
 
 After updating the symlink, `CheckpointManager._cleanup()` keeps the

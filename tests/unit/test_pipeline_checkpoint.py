@@ -1,4 +1,4 @@
-"""Checkpoints under pipeline parallelism, on CPU over gloo."""
+"""Checkpoint saves across gloo ranks on CPU: under pipeline parallelism, and when a rank fails."""
 
 from __future__ import annotations
 
@@ -14,10 +14,12 @@ import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 import torch.multiprocessing as mp
+from torch.distributed.checkpoint.filesystem import FileSystemWriter
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor import DTensor
 
+from kempnerforge.checkpoint import manager as manager_module
 from kempnerforge.config.checkpoint import AsyncCheckpointMode, CheckpointConfig
 from kempnerforge.config.job import JobConfig
 from kempnerforge.config.model import ModelConfig
@@ -25,6 +27,7 @@ from kempnerforge.config.training import TrainConfig
 from kempnerforge.distributed.parallel import apply_fsdp2
 from kempnerforge.distributed.pipeline_parallel import build_stage_module
 from kempnerforge.distributed.tensor_parallel import apply_tensor_parallel
+from kempnerforge.model.transformer import Transformer
 from kempnerforge.training.entry import build_checkpoint_manager, restore_checkpoint
 from kempnerforge.training.runtime import PipelineBundle, RuntimeContext
 
@@ -52,10 +55,14 @@ def _stage_members(rank: int, shape: tuple[int, ...], names: tuple[str, ...]) ->
 
 
 def _stage(mesh: DeviceMesh, seed: int) -> torch.nn.Module:
-    """This rank's pipeline stage, tensor parallel and sharded the way ``build_model`` does it."""
+    """This rank's pipeline stage (the model, without ``pp``), parallelized like ``build_model``."""
     torch.manual_seed(seed)
-    stage = build_stage_module(MODEL, mesh.get_local_rank("pp"), mesh["pp"].size())
-    if "tp" in (mesh.mesh_dim_names or ()):
+    names = mesh.mesh_dim_names or ()
+    if "pp" in names:
+        stage = build_stage_module(MODEL, mesh.get_local_rank("pp"), mesh["pp"].size())
+    else:
+        stage = Transformer(MODEL)
+    if "tp" in names:
         apply_tensor_parallel(stage, mesh)
     fp32 = MixedPrecisionPolicy(param_dtype=torch.float32, reduce_dtype=torch.float32)
     apply_fsdp2(stage, mesh, mp_policy=fp32)
@@ -90,7 +97,7 @@ def _assert_same(actual: Any, expected: Any) -> None:
 
 def _job(
     rank: int, world: int, mesh: DeviceMesh, ckpt_dir: str, async_mode: AsyncCheckpointMode
-) -> tuple[JobConfig, RuntimeContext, PipelineBundle]:
+) -> tuple[JobConfig, RuntimeContext, PipelineBundle | None]:
     """The config, runtime and pipeline ``build_checkpoint_manager`` takes on this rank."""
     config = JobConfig(
         model=MODEL,
@@ -104,6 +111,8 @@ def _job(
         device=torch.device("cpu"),
         device_mesh=mesh,
     )
+    if "pp" not in (mesh.mesh_dim_names or ()):
+        return config, runtime, None
     pipeline = PipelineBundle(rank=mesh.get_local_rank("pp"), size=mesh["pp"].size(), schedule=None)
     return config, runtime, pipeline
 
@@ -230,6 +239,63 @@ def _check_latest_waits_for_every_stage(
         dist.destroy_process_group()
 
 
+def _no_space_left(*args: Any, **kwargs: Any) -> Any:
+    raise OSError(28, "No space left on device")
+
+
+def _fail_part(rank: int, world: int, failing: str) -> None:
+    """Make one rank's part of the save fail, as named by ``failing``.
+
+    ``"shards"`` is the DCP write of the last rank, ``"metadata"`` the ``metadata.json`` that
+    rank 0 alone writes.
+    """
+    if failing == "shards" and rank == world - 1:
+        FileSystemWriter.write_data = _no_space_left
+    if failing == "metadata" and rank == 0:
+        replace_file = manager_module._replace_file
+
+        def replace_all_but_metadata(path: Path, text: str) -> None:
+            if path.name == "metadata.json":
+                _no_space_left()
+            replace_file(path, text)
+
+        manager_module._replace_file = replace_all_but_metadata
+
+
+def _check_a_failed_save(
+    rank: int,
+    world: int,
+    port: int,
+    shape: tuple[int, ...],
+    names: tuple[str, ...],
+    ckpt_dir: str,
+    async_mode: AsyncCheckpointMode,
+    failing: str,
+    out_dir: str,
+) -> None:
+    """One rank's part of the save fails; write how ``save`` and ``wait`` end on this rank."""
+    dist.init_process_group(
+        "gloo", rank=rank, world_size=world, init_method=f"tcp://127.0.0.1:{port}"
+    )
+    try:
+        mesh = init_device_mesh("cpu", shape, mesh_dim_names=names)
+        config, runtime, pipeline = _job(rank, world, mesh, ckpt_dir, async_mode)
+        stage = _stage(mesh, seed=0)
+        manager = build_checkpoint_manager(
+            config, runtime, stage, _stepped_optimizer(stage), pipeline
+        )
+        _fail_part(rank, world, failing)
+        try:
+            manager.save(STEP, tokens_seen=TOKENS)
+            manager.wait()
+            outcome = "returned"
+        except BaseException as e:
+            outcome = f"{type(e).__name__}: {e}"
+        Path(out_dir, f"rank{rank}").write_text(outcome)
+    finally:
+        dist.destroy_process_group()
+
+
 class TestPipelineCheckpointSaveAndResume:
     @pytest.mark.parametrize(
         ("shape", "names", "async_mode"),
@@ -264,3 +330,71 @@ class TestLatestWaitsForEveryStage:
             args=(2, _free_port(), str(tmp_path / "ckpt"), async_mode),
             nprocs=2,
         )
+
+
+class TestAFailedSaveFailsEveryRank:
+    @pytest.mark.parametrize(
+        ("shape", "names", "async_mode", "failing", "failed"),
+        [
+            ((2,), ("pp",), AsyncCheckpointMode.disabled, "shards", [1]),
+            ((2,), ("pp",), AsyncCheckpointMode.async_, "shards", [1]),
+            ((2, 2), ("pp", "dp_shard"), AsyncCheckpointMode.disabled, "shards", [2, 3]),
+            ((2, 2), ("pp", "dp_shard"), AsyncCheckpointMode.async_, "shards", [2, 3]),
+            ((2,), ("pp",), AsyncCheckpointMode.disabled, "metadata", [0]),
+            ((2,), ("dp_shard",), AsyncCheckpointMode.disabled, "metadata", [0]),
+            ((2,), ("dp_shard",), AsyncCheckpointMode.async_, "metadata", [0]),
+            ((2,), ("dp_shard",), AsyncCheckpointMode.async_, "shards", [0, 1]),
+        ],
+        ids=[
+            "pp2-shards",
+            "pp2-async-shards",
+            "pp2-fsdp2-shards",
+            "pp2-fsdp2-async-shards",
+            "pp2-metadata",
+            "fsdp2-metadata",
+            "fsdp2-async-metadata",
+            "fsdp2-async-shards",
+        ],
+    )
+    def test_every_rank_raises_and_latest_stays_unset(
+        self, tmp_path, shape, names, async_mode, failing, failed
+    ):
+        """No rank is left waiting for one whose part failed, and none moves ``latest``.
+
+        The ranks in ``failed`` raise the failure itself: the rank whose part failed, and the
+        other ranks DCP saves with. Every other rank raises a ``RuntimeError`` naming them.
+        """
+        world = math.prod(shape)
+        out_dir = tmp_path / "outcomes"
+        out_dir.mkdir()
+        context = mp.spawn(
+            _check_a_failed_save,
+            args=(
+                world,
+                _free_port(),
+                shape,
+                names,
+                str(tmp_path / "ckpt"),
+                async_mode,
+                failing,
+                str(out_dir),
+            ),
+            nprocs=world,
+            join=False,
+        )
+        deadline = time.monotonic() + 45
+        while not context.join(timeout=1):
+            if time.monotonic() > deadline:
+                for process in context.processes:
+                    process.terminate()
+                waiting = sorted(set(range(world)) - {int(p.name[4:]) for p in out_dir.iterdir()})
+                pytest.fail(f"ranks {waiting} still in save() or wait(); ranks {failed} failed")
+        outcomes = {int(p.name[4:]): p.read_text() for p in out_dir.iterdir()}
+        assert sorted(outcomes) == list(range(world))
+        for rank, outcome in outcomes.items():
+            if rank in failed:
+                assert "No space left on device" in outcome, f"rank {rank}: {outcome}"
+            else:
+                expected = f"RuntimeError: Checkpoint save failed on ranks {failed}"
+                assert outcome == expected, f"rank {rank}: {outcome}"
+        assert not (tmp_path / "ckpt" / "latest").exists()
