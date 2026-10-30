@@ -105,6 +105,24 @@ update's direction, not only its length. Every stage must make the
 call, including one without gradients, since the sum is a collective.
 `pipeline_step` in `training/loop.py` passes the group.
 
+### Under expert parallelism
+
+With `ep > 1` each EP rank holds its own slice of the routed experts
+and a copy of every other parameter, so a rank's own norm is not the
+model's either. No argument is needed: `clip_grad_norm_` reads the EP
+group from the model's `MoEMLP` layers (`expert_parallel_params` in
+[`kempnerforge/distributed/expert_parallel.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/distributed/expert_parallel.py))
+and, in one all-reduce over that group, sums the routed experts'
+squared norms and averages the squared norms of the copies. Every EP
+rank then returns the whole model's norm and scales by the same
+coefficient, so its copies of the shared parameters stay equal to the
+other ranks'. Clipping each rank by its own norm instead scales the
+copies by different coefficients, and nothing reduces them over `ep`
+afterwards, so they drift apart. Every EP rank must make the call,
+since the sum is a collective. How the expert gradients themselves are
+averaged over the group is in
+[Expert parallelism](../distributed/expert-parallelism.md).
+
 ### `foreach` parameter
 
 `clip_grad_norm_(..., foreach=True)` is the default — faster on CUDA
