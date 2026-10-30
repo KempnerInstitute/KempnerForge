@@ -2,18 +2,23 @@
 
 from __future__ import annotations
 
+import itertools
+import logging
 import random
+import re
 
 import pytest
 import torch
 from PIL import Image
 
+from kempnerforge.data import vlm_dataset
 from kempnerforge.data.vlm_dataset import (
     DEFAULT_IMAGE_MEAN,
     DEFAULT_IMAGE_STD,
     HuggingFaceVLMDataset,
     VLMCollator,
     _tokenize_and_mask,
+    check_prompt_fits,
     frames_to_clip_tensor,
     pil_to_tensor,
 )
@@ -235,6 +240,7 @@ class TestNextTokenLabelContract:
             ("abc", "", 8),  # empty prompt string
             ("ab", "a", 8),  # prompt_len == 1
             ("a", None, 2),  # minimum legal max_text_len
+            ("xyz", "aaaaaa", 8),
             # prompt at and beyond the budget: prompt_len is measured before
             # truncation, so these pin that it still lines up with the boundary.
             ("xyz", "aaaaaaa", 8),  # prompt fills max_text_len - 1
@@ -266,9 +272,11 @@ class TestNextTokenLabelContract:
 
         # --- labels match the derived contract exactly
         prompt_len = min(len(prompt_ids), n)
-        assert labels.tolist() == _expected_next_token_labels(
-            ids[:n].tolist(), prompt_len, max_text_len
-        )
+        expected = _expected_next_token_labels(ids[:n].tolist(), prompt_len, max_text_len)
+        caption_slots = max_text_len - len(prompt_ids) - (1 if with_eos else 0)
+        if prompt is not None and caption_slots < 1:
+            expected = [-100] * max_text_len
+        assert labels.tolist() == expected
 
     def test_prompt_mask_boundary_both_directions(self):
         """The two indices either side of the prompt boundary, pinned.
@@ -310,16 +318,15 @@ class TestNextTokenLabelContract:
         assert labels[-2].item() == tok.eos_token_id
         assert labels[-1].item() == -100  # EOS has no successor
 
-    def test_prompt_filling_the_budget_is_in_range(self):
-        """A prompt that leaves no room for a caption must not raise or produce a
-        negative-index slice. It degrades to a row with nothing (or only EOS)
-        supervised; rejecting such a prompt up front is a separate concern and is
-        not validated here."""
+    def test_prompt_filling_the_budget_masks_every_label(self):
+        """A prompt that leaves no room for a caption token neither raises nor
+        produces a negative-index slice: the sample keeps its static shapes and
+        every label is masked, so it adds no loss instead of training on EOS alone."""
         tok = _MockTokenizer()
         for prompt_chars in (7, 8, 12):
-            _, labels = _tokenize_and_mask(tok, "xyz", max_text_len=8, prompt="a" * prompt_chars)
-            assert labels.shape == (8,)
-            assert (labels == -100).all() or (labels != -100).sum() == 1
+            ids, labels = _tokenize_and_mask(tok, "xyz", max_text_len=8, prompt="a" * prompt_chars)
+            assert ids.shape == labels.shape == (8,)
+            assert (labels == -100).all()
 
     def test_labels_are_identical_across_ranks(self, monkeypatch):
         """Every DP rank must build byte-identical labels for a given index.
@@ -350,6 +357,94 @@ class TestNextTokenLabelContract:
         ids1, labels1 = build(1)
         assert ids0 == ids1
         assert labels0 == labels1
+
+
+class TestPromptRoom:
+    """A prompt must leave room in ``max_text_len`` for one caption token, which the
+    last prompt token predicts, plus the EOS that caption token predicts when the
+    tokenizer defines one. With ``max_text_len = 8`` the longest prompt that fits is
+    6 tokens with an EOS and 7 without."""
+
+    @pytest.mark.parametrize(
+        ("eos_token_id", "prompt_tokens", "supervised"),
+        [(28, 6, [24, 28]), (None, 7, [24])],
+    )
+    def test_longest_fitting_prompt_supervises_a_caption_token(
+        self, eos_token_id, prompt_tokens, supervised
+    ):
+        tok = _MockTokenizer()
+        tok.eos_token_id = eos_token_id
+        prompt = "a" * prompt_tokens
+        _, labels = _tokenize_and_mask(tok, "xyz", max_text_len=8, prompt=prompt)
+        assert labels[labels != -100].tolist() == supervised
+        check_prompt_fits(tok, prompt, max_text_len=8)
+
+    @pytest.mark.parametrize(("eos_token_id", "prompt_tokens"), [(28, 7), (None, 8)])
+    def test_one_more_prompt_token_masks_the_sample_and_fails_the_check(
+        self, eos_token_id, prompt_tokens
+    ):
+        tok = _MockTokenizer()
+        tok.eos_token_id = eos_token_id
+        prompt = "a" * prompt_tokens
+        ids, labels = _tokenize_and_mask(tok, "xyz", max_text_len=8, prompt=prompt)
+        assert ids.shape == (8,)
+        assert (labels == -100).all()
+        with pytest.raises(
+            ValueError,
+            match=rf"prompt is {prompt_tokens} tokens.*needs max_text_len >= 9.*vlm\.max_text_len",
+        ):
+            check_prompt_fits(tok, prompt, max_text_len=8)
+
+    def test_truncating_a_long_caption_is_not_masked(self, monkeypatch, caplog):
+        monkeypatch.setattr(logging.getLogger("kempnerforge"), "propagate", True)
+        tok = _MockTokenizer()
+        with caplog.at_level(logging.WARNING, logger="kempnerforge.data.vlm_dataset"):
+            _, labels = _tokenize_and_mask(tok, "xyzxyzxyz", max_text_len=8, prompt="ab")
+        assert labels[labels != -100].tolist() == [24, 25, 26, 24, 25, 28]
+        assert caplog.records == []
+
+    def test_masked_samples_are_logged_at_powers_of_two(self, monkeypatch, caplog):
+        monkeypatch.setattr(vlm_dataset, "_samples_masked_for_prompt", itertools.count(1))
+        monkeypatch.setattr(logging.getLogger("kempnerforge"), "propagate", True)
+        tok = _MockTokenizer()
+        with caplog.at_level(logging.WARNING, logger="kempnerforge.data.vlm_dataset"):
+            for _ in range(5):
+                _tokenize_and_mask(tok, "xyz", max_text_len=8, prompt="a" * 7)
+        messages = [r.getMessage() for r in caplog.records]
+        assert [re.search(r"\((\d+) such samples", m).group(1) for m in messages] == [
+            "1",
+            "2",
+            "4",
+        ]
+        assert all("needs max_text_len >= 9" in m and "max_text_len=8" in m for m in messages)
+
+    def test_per_sample_prompts_are_masked_row_by_row(self, tmp_path, monkeypatch):
+        """``prompt_field`` prompts are known only per row, so building the dataset
+        does not check them; a row whose prompt leaves no room is masked when it is
+        read, and the rows around it are unaffected."""
+        from datasets import Dataset
+
+        Dataset.from_dict(
+            {
+                "image": [_make_image(32, 50), _make_image(32, 100), _make_image(32, 150)],
+                "caption": ["xyz", "xyz", "xyz"],
+                "prompt": ["ab", "a" * 7, "a" * 6],
+            }
+        ).save_to_disk(str(tmp_path / "prompted"))
+        monkeypatch.setattr(vlm_dataset, "build_tokenizer", lambda path: _MockTokenizer())
+        ds = HuggingFaceVLMDataset(
+            dataset_name=str(tmp_path / "prompted"),
+            split="train",
+            image_field="image",
+            text_field="caption",
+            tokenizer_path="unused",
+            max_text_len=8,
+            prompt_field="prompt",
+            image_size=16,
+        )
+        supervised = [ds[i]["labels"][ds[i]["labels"] != -100].tolist() for i in range(3)]
+        assert supervised == [[24, 25, 26, 28], [], [24, 28]]
+        assert ds[1]["input_ids"].shape == (8,)
 
 
 # ---------------------------------------------------------------------------

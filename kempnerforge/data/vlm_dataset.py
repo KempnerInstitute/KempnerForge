@@ -24,6 +24,7 @@ don't exercise the dataset path).
 
 from __future__ import annotations
 
+import itertools
 import logging
 from typing import Any
 
@@ -31,6 +32,8 @@ import torch
 from torch.utils.data import Dataset
 
 logger = logging.getLogger(__name__)
+
+_samples_masked_for_prompt = itertools.count(1)
 
 # SigLIP-style normalization defaults; pass explicit mean/std if your
 # vision encoder was trained with CLIP normalization.
@@ -126,6 +129,49 @@ def resolve_pad_id(tokenizer: Any) -> int:
     return pad_id
 
 
+def _min_text_len_for_prompt(num_prompt_tokens: int, tokenizer: Any) -> int:
+    """Smallest ``max_text_len`` that still supervises a caption token after a prompt.
+
+    Room for the prompt's tokens, one caption token (which the last prompt token
+    predicts), and the EOS that caption token predicts when the tokenizer has one.
+    """
+    return num_prompt_tokens + 1 + int(tokenizer.eos_token_id is not None)
+
+
+def check_prompt_fits(tokenizer: Any, prompt: str, max_text_len: int) -> None:
+    """Reject a prompt that leaves no room in ``max_text_len`` for a caption token.
+
+    A dataset whose prompt is fixed for the whole run calls this once when it is
+    built, since such a prompt would leave every sample training on EOS alone or
+    on nothing. ``_tokenize_and_mask`` applies the same bound to each sample.
+
+    Raises:
+        ValueError: ``max_text_len`` is below the prompt's token count plus one
+            caption token, plus one more when the tokenizer defines an EOS.
+    """
+    num_prompt_tokens = len(tokenizer(prompt, add_special_tokens=False)["input_ids"])
+    min_text_len = _min_text_len_for_prompt(num_prompt_tokens, tokenizer)
+    if min_text_len > max_text_len:
+        raise ValueError(
+            f"The prompt is {num_prompt_tokens} tokens, so max_text_len={max_text_len} "
+            f"leaves no room after it for a caption token (needs max_text_len >= "
+            f"{min_text_len}); raise vlm.max_text_len or shorten the prompt"
+        )
+
+
+def _warn_sample_masked_for_prompt(min_text_len: int, max_text_len: int) -> None:
+    masked = next(_samples_masked_for_prompt)
+    if masked & (masked - 1) == 0:
+        logger.warning(
+            "A prompt needs max_text_len >= %d to leave room for a caption token, but "
+            "max_text_len=%d: masked every label of that sample so it adds no loss "
+            "(%d such samples so far in this process, logged at powers of two)",
+            min_text_len,
+            max_text_len,
+            masked,
+        )
+
+
 def _tokenize_and_mask(
     tokenizer: Any,
     text: str,
@@ -148,15 +194,23 @@ def _tokenize_and_mask(
     tokenize prompt and text independently, then concatenate the id
     lists, so the prompt/target boundary is exact and only positions
     predicting prompt tokens are masked.
+
+    A prompt that leaves no room for a caption token (the bound
+    ``check_prompt_fits`` enforces) masks every label, so the sample adds no
+    loss instead of training on EOS alone or on nothing; each process logs a
+    warning at the 1st, 2nd, 4th, ... such sample. Truncating a long caption
+    is unaffected.
     """
     if prompt is not None:
         prompt_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
         text_ids = tokenizer(text, add_special_tokens=False)["input_ids"]
         full_ids = list(prompt_ids) + list(text_ids)
         prompt_len = min(len(prompt_ids), max_text_len)
+        min_text_len = _min_text_len_for_prompt(len(prompt_ids), tokenizer)
     else:
         full_ids = list(tokenizer(text, add_special_tokens=False)["input_ids"])
         prompt_len = 0
+        min_text_len = 0
 
     # Append EOS so the last caption token is trained to predict a stop token
     # (captions use add_special_tokens=False, so none is added otherwise);
@@ -180,6 +234,9 @@ def _tokenize_and_mask(
         labels[: n - 1] = ids_tensor[1:]
         if prompt_len > 1:
             labels[: prompt_len - 1] = -100
+    if min_text_len > max_text_len:
+        labels.fill_(-100)
+        _warn_sample_masked_for_prompt(min_text_len, max_text_len)
     return input_ids, labels
 
 
@@ -197,7 +254,9 @@ class HuggingFaceVLMDataset(Dataset):
         prompt_field: Optional column name for a prompt that should NOT
             be supervised (e.g. the instruction in an instruction-tuned
             dataset). Positions predicting prompt tokens are ``-100``; the
-            last prompt token still predicts the first caption token.
+            last prompt token still predicts the first caption token. A row
+            whose prompt leaves no room in ``max_text_len`` for a caption
+            token has every label masked.
         image_size: Target square image size. Default 224.
         image_mean / image_std: Normalization stats. Defaults match
             SigLIP's ``(0.5, 0.5, 0.5)``.

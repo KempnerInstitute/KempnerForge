@@ -361,3 +361,71 @@ class TestVideoDatasetRegistry:
 
         with pytest.raises(KeyError, match="video_dataset"):
             registry.get_video_dataset("bogus")
+
+
+class TestFixedPromptRoom:
+    """``[video].prompt`` is fixed for the whole run, so building the dataset rejects
+    one that leaves no room in ``max_text_len`` for a caption token (plus the EOS it
+    predicts when the tokenizer has one), before any sample is read."""
+
+    @staticmethod
+    def _manifest(root) -> None:
+        d = root / "raw" / "webvid-10M" / "data" / "train" / "partitions"
+        d.mkdir(parents=True)
+        (d / "0000.csv").write_text("videoid,name\n123456,xyz\n")
+
+    @staticmethod
+    def _use_mock_tokenizer(monkeypatch, eos_token_id: int | None = 28) -> None:
+        import transformers
+
+        tok = _MockTokenizer()
+        tok.eos_token_id = eos_token_id
+        monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", lambda *a, **k: tok)
+
+    def _build(self, root, prompt: str) -> WebVidVideoDataset:
+        return WebVidVideoDataset(
+            data_root=str(root),
+            split="train",
+            tokenizer_path="unused",
+            max_text_len=8,
+            max_frames=4,
+            min_frames=2,
+            fps=2.0,
+            frame_size=16,
+            prompt=prompt,
+        )
+
+    @pytest.mark.parametrize(("eos_token_id", "prompt_tokens"), [(28, 7), (None, 8)])
+    def test_prompt_without_room_is_rejected(
+        self, tmp_path, monkeypatch, eos_token_id, prompt_tokens
+    ):
+        self._manifest(tmp_path)
+        self._use_mock_tokenizer(monkeypatch, eos_token_id)
+        with pytest.raises(ValueError, match=r"needs max_text_len >= 9"):
+            self._build(tmp_path, "a" * prompt_tokens)
+
+    @pytest.mark.parametrize(
+        ("eos_token_id", "prompt_tokens", "supervised"),
+        [(28, 6, [24, 28]), (None, 7, [24])],
+    )
+    def test_longest_prompt_with_room_is_accepted(
+        self, tmp_path, monkeypatch, eos_token_id, prompt_tokens, supervised
+    ):
+        self._manifest(tmp_path)
+        self._use_mock_tokenizer(monkeypatch, eos_token_id)
+        ds = self._build(tmp_path, "a" * prompt_tokens)
+        monkeypatch.setattr(vd, "decode_video_frames", lambda *a, **k: _frames(2))
+        labels = ds[0]["labels"]
+        assert labels[labels != -100].tolist() == supervised
+
+    def test_build_video_dataset_checks_the_configured_prompt(self, tmp_path, monkeypatch):
+        from kempnerforge.config.video import VideoConfig
+        from kempnerforge.data.video_dataset import build_video_dataset
+
+        self._manifest(tmp_path)
+        self._use_mock_tokenizer(monkeypatch)
+        unset = VideoConfig(data_root=str(tmp_path), max_frames=4, min_frames=2)
+        assert len(build_video_dataset(unset, "unused", max_text_len=8)) == 1
+        overlong = VideoConfig(data_root=str(tmp_path), max_frames=4, min_frames=2, prompt="a" * 7)
+        with pytest.raises(ValueError, match=r"prompt is 7 tokens.*needs max_text_len >= 9"):
+            build_video_dataset(overlong, "unused", max_text_len=8)
