@@ -184,9 +184,10 @@ class JobConfig:
                 raise ValueError(
                     f"vlm.arch={self.vlm.arch!r} does not support tensor parallelism "
                     f"(distributed.tp={self.distributed.tp}): the tensor-parallel plan is keyed "
-                    "on TransformerBlock's module names, and MoTBlock keeps its norms, attention "
-                    "and FFNs per modality under other names, so the build fails or no parameter "
-                    "is sharded. Set distributed.tp = 1."
+                    "on TransformerBlock's module names, and MoTBlock renames the attention "
+                    "modules (attn_norm, attn) and holds mlp_norm and mlp as per-modality "
+                    "ModuleDicts, so the build fails or no parameter is sharded. Set "
+                    "distributed.tp = 1."
                 )
             if (
                 self.vlm is not None

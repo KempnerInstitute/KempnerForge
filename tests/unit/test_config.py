@@ -804,7 +804,7 @@ class TestVLMParallelismSupport:
     @pytest.mark.parametrize(
         ("arch", "reason"),
         [
-            pytest.param("mot", "MoTBlock keeps its norms", id="mot"),
+            pytest.param("mot", "MoTBlock renames the attention modules", id="mot"),
             pytest.param("joint_decoder", "mixed torch.Tensor and DTensor", id="joint_decoder"),
             pytest.param("moma", "mixed torch.Tensor and DTensor", id="moma"),
             pytest.param("cross_attention", "mixed torch.Tensor and DTensor", id="cross_attention"),
