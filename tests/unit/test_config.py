@@ -880,6 +880,14 @@ class TestVLMParallelismSupport:
         with pytest.raises(ValueError, match=match):
             _vlm_job(arch, ep=2, num_experts=num_experts).validate(world_size=2)
 
+    def test_mot_expert_parallel_error_points_at_the_missing_moe_losses(self):
+        """The fix it gives, ep = 1, trains MoT with MoE without its MoE losses (#308), so the
+        error says so and links the issue."""
+        with pytest.raises(ValueError, match=r"ep = 1\. MoT with MoE then trains, but without"):
+            _vlm_job("mot", ep=2, num_experts=2).validate(world_size=2)
+        with pytest.raises(ValueError, match=r"KempnerForge/issues/308"):
+            _vlm_job("mot", ep=2, num_experts=2).validate(world_size=2)
+
     @pytest.mark.parametrize(
         ("arch", "tp", "ep", "num_experts"),
         [
