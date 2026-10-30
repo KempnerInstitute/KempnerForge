@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import copy
 import errno
 import inspect
 import os
 import shutil
+import threading
 
 import pytest
 
@@ -16,10 +18,24 @@ from kempnerforge.metrics.mlflow_models import (
 from tests.unit.conftest import EXTERNAL_TAG, PAGE_LIMIT
 
 
-def _find_or_create(store):
+def _find_or_create(store, client=None):
     return find_or_create_checkpoint_model(
-        store.client("uri-a"), "run-xyz", "run-a-step_5", 5, "ckpts/step_5"
+        client or store.client("uri-a"), "run-xyz", "run-a-step_5", 5, "ckpts/step_5"
     )
+
+
+def _list_every_model_pending(store, client) -> None:
+    search = client.search_logged_models
+
+    def still_listed_pending(*args, **kwargs):
+        assert len(store.named("search_logged_models")) < 10, "it kept searching"
+        page = search(*args, **kwargs)
+        listed = [copy.copy(m) for m in page]
+        for m in listed:
+            m.status = "PENDING"
+        return type(page)(listed, page.token)
+
+    client.search_logged_models = still_listed_pending
 
 
 class TestCheckpointModelName:
@@ -56,6 +72,7 @@ class TestFindOrCreateCheckpointModel:
             "get_run",
             "search_logged_models",
             "create_logged_model",
+            "get_logged_model",
             "log_model_artifacts",
             "finalize_logged_model",
             "search_logged_models",
@@ -127,12 +144,11 @@ class TestFindOrCreateCheckpointModel:
     @pytest.mark.parametrize(
         ("held", "why"),
         [
-            ({"status": "PENDING"}, "left unfinished"),
             ({"status": "FAILED"}, "failed"),
             ({"run_id": "other-run"}, "another run's"),
             ({"experiment_id": "8"}, "another experiment's"),
         ],
-        ids=["pending", "failed", "other-run", "other-experiment"],
+        ids=["failed", "other-run", "other-experiment"],
     )
     def test_never_reuses_a_model_that_is_not_the_runs_ready_one(self, model_store, held, why):
         model_store.runs["other-run"] = "7"
@@ -169,6 +185,7 @@ class TestFindOrCreateCheckpointModel:
             "get_run",
             "search_logged_models",
             "create_logged_model",
+            "get_logged_model",
             "log_model_artifacts",
             "finalize_logged_model",
         ],
@@ -181,6 +198,7 @@ class TestFindOrCreateCheckpointModel:
 
     def test_the_calls_it_makes_exist_in_the_installed_mlflow(self):
         mlflow = pytest.importorskip("mlflow")
+        from mlflow.entities import LoggedModel, LoggedModelStatus
         from mlflow.models.model import MLMODEL_FILE_NAME
         from mlflow.models.utils import get_external_mlflow_model_spec
         from mlflow.utils.mlflow_tags import MLFLOW_MODEL_IS_EXTERNAL
@@ -203,5 +221,330 @@ class TestFindOrCreateCheckpointModel:
         } <= parameters(client.create_logged_model)
         assert {"model_id", "local_dir"} <= parameters(client.log_model_artifacts)
         assert {"model_id", "status"} <= parameters(client.finalize_logged_model)
+        assert "model_id" in parameters(client.get_logged_model)
+        assert "model_type" in parameters(LoggedModel)
         assert callable(get_external_mlflow_model_spec)
         assert (MLMODEL_FILE_NAME, MLFLOW_MODEL_IS_EXTERNAL) == ("MLmodel", EXTERNAL_TAG)
+        assert (
+            LoggedModelStatus.UNSPECIFIED,
+            LoggedModelStatus.PENDING,
+            LoggedModelStatus.READY,
+            LoggedModelStatus.FAILED,
+        ) == ("UNSPECIFIED", "PENDING", "READY", "FAILED")
+
+
+class _Race:
+    """Callers A and B of one checkpoint model: both search, then A creates first and parks.
+
+    B runs in the test's thread through ``client_b``. Its first search finds nothing, and when
+    it goes to create, A starts in thread ``a``, finds nothing either, creates the first model
+    and parks just before uploading its descriptor until ``resume_a`` is called. ``returned``
+    collects the id each caller returns.
+    """
+
+    def __init__(self, store) -> None:
+        self.client_a, self.client_b = store.client("uri-a"), store.client("uri-a")
+        self.returned: dict[str, str] = {}
+        self._created, self._resumed = threading.Event(), threading.Event()
+        upload_a, create_b = self.client_a.log_model_artifacts, self.client_b.create_logged_model
+
+        def a_parks_after_creating(model_id, local_dir):
+            self._created.set()
+            assert self._resumed.wait(10)
+            upload_a(model_id, local_dir)
+
+        def a_creates_first(*args, **kwargs):
+            self.a.start()
+            assert self._created.wait(10)
+            return create_b(*args, **kwargs)
+
+        self.client_a.log_model_artifacts = a_parks_after_creating
+        self.client_b.create_logged_model = a_creates_first
+        self.a = threading.Thread(
+            target=lambda: self.returned.update(a=_find_or_create(store, self.client_a))
+        )
+
+    def a_parked(self) -> bool:
+        return self.a.is_alive() and not self._resumed.is_set()
+
+    def resume_a(self) -> None:
+        self._resumed.set()
+        if self.a.is_alive():
+            self.a.join(10)
+
+
+class TestCallersSettleOnOneModel:
+    """Callers that find or make the same model at once, or after a creator died, agree on it."""
+
+    def test_a_caller_that_made_one_first_but_finalizes_last_gets_the_same_model(self, model_store):
+        race = _Race(model_store)
+        upload_b = race.client_b.log_model_artifacts
+        uploaded_by_b: list = []
+
+        def a_finalizes_while_b_finishes_its_model(model_id, local_dir):
+            uploaded_by_b.append(model_id)
+            if model_id == "m-1":
+                race.resume_a()
+            upload_b(model_id, local_dir)
+
+        race.client_b.log_model_artifacts = a_finalizes_while_b_finishes_its_model
+        try:
+            race.returned["b"] = _find_or_create(model_store, race.client_b)
+        finally:
+            race.resume_a()
+        assert race.returned == {"a": "m-1", "b": "m-1"}
+        assert [(m.model_id, m.status) for m in model_store.models] == [
+            ("m-1", "READY"),
+            ("m-2", "READY"),
+        ]
+        assert uploaded_by_b == ["m-2", "m-1"]
+        b, a = threading.get_ident(), race.a.ident
+        assert [t for call, _, t in model_store.calls if call == "finalize_logged_model"] == [
+            b,
+            a,
+            b,
+        ]
+
+    def test_a_caller_does_not_wait_for_a_creator_that_finishes_after_it_returned(
+        self, model_store
+    ):
+        race = _Race(model_store)
+        try:
+            race.returned["b"] = _find_or_create(model_store, race.client_b)
+            assert race.a_parked()
+            first = model_store.models[0]
+            assert (first.model_id, first.status) == ("m-1", "READY")
+            assert "model_id: m-1" in model_store.uploads["m-1"]["MLmodel"]
+        finally:
+            race.resume_a()
+        assert race.returned == {"a": "m-1", "b": "m-1"}
+        b = threading.get_ident()
+        assert [call for call, _, t in model_store.calls if t == b] == [
+            "get_run",
+            "search_logged_models",
+            "create_logged_model",
+            "get_logged_model",
+            "log_model_artifacts",
+            "finalize_logged_model",
+            "search_logged_models",
+            "get_logged_model",
+            "log_model_artifacts",
+            "finalize_logged_model",
+            "search_logged_models",
+        ]
+
+    def test_a_creator_that_resumes_after_its_model_was_finished_writes_nothing_more(
+        self, model_store
+    ):
+        client_a, client_b = model_store.client("uri-a"), model_store.client("uri-a")
+        created, resumed = threading.Event(), threading.Event()
+        create_a = client_a.create_logged_model
+
+        def a_parks_after_creating(*args, **kwargs):
+            model = create_a(*args, **kwargs)
+            created.set()
+            assert resumed.wait(10)
+            return model
+
+        client_a.create_logged_model = a_parks_after_creating
+        returned: dict[str, str] = {}
+        a = threading.Thread(
+            target=lambda: returned.update(a=_find_or_create(model_store, client_a))
+        )
+        a.start()
+        try:
+            assert created.wait(10)
+            returned["b"] = _find_or_create(model_store, client_b)
+        finally:
+            resumed.set()
+            a.join(10)
+        assert returned == {"a": "m-1", "b": "m-1"}
+        a_calls = [call for call, _, t in model_store.calls if t == a.ident]
+        assert "log_model_artifacts" not in a_calls and "finalize_logged_model" not in a_calls
+        assert len(model_store.named("log_model_artifacts")) == 1
+
+    def test_a_model_its_creator_left_pending_is_finished_by_the_next_caller(self, model_store):
+        left = model_store.add("run-a-step_5", status="PENDING")
+        assert _find_or_create(model_store) == left.model_id
+        assert left.status == "READY" and len(model_store.models) == 1
+        assert f"model_id: {left.model_id}" in model_store.uploads[left.model_id]["MLmodel"]
+        assert [call for call, _, _ in model_store.calls] == [
+            "get_run",
+            "search_logged_models",
+            "get_logged_model",
+            "log_model_artifacts",
+            "finalize_logged_model",
+            "search_logged_models",
+        ]
+
+    @pytest.mark.parametrize("status", ["READY", "PENDING"])
+    def test_after_finishing_one_it_takes_a_model_listed_later_that_wins_the_tie_on_id(
+        self, model_store, status
+    ):
+        tied = model_store.add("run-a-step_5", status=status)
+        found = model_store.add("run-a-step_5", status="PENDING")
+        found.creation_timestamp = tied.creation_timestamp
+        model_store.models.reverse()
+        client = model_store.client("uri-a")
+        search = client.search_logged_models
+
+        def lists_the_tied_one_late(*args, **kwargs):
+            page = search(*args, **kwargs)
+            if len(model_store.named("search_logged_models")) == 1:
+                return type(page)([m for m in page if m is not tied], page.token)
+            return page
+
+        client.search_logged_models = lists_the_tied_one_late
+        assert _find_or_create(model_store, client) == tied.model_id
+        assert _find_or_create(model_store) == tied.model_id
+        assert (found.status, tied.status) == ("READY", "READY")
+        assert model_store.named("create_logged_model") == []
+
+    @pytest.mark.parametrize(
+        ("status", "model_type"),
+        [
+            ("FAILED", "checkpoint"),
+            ("UNSPECIFIED", "checkpoint"),
+            ("PENDING", None),
+            ("READY", None),
+        ],
+        ids=["failed", "unspecified", "another-tools-pending", "another-tools-ready"],
+    )
+    def test_a_failed_unspecified_or_another_tools_model_is_never_chosen(
+        self, model_store, status, model_type
+    ):
+        skipped = model_store.add("run-a-step_5", status=status, model_type=model_type)
+        pending = model_store.add("run-a-step_5", status="PENDING")
+        assert _find_or_create(model_store) == pending.model_id
+        assert (skipped.status, pending.status) == (status, "READY")
+        assert list(model_store.uploads) == [pending.model_id]
+        assert model_store.named("create_logged_model") == []
+
+    @pytest.mark.parametrize("stale", [False, True], ids=["search-lists-it-failed", "stale-search"])
+    def test_a_model_marked_failed_after_the_search_is_left_failed(self, model_store, stale):
+        left = model_store.add("run-a-step_5", status="PENDING")
+        client = model_store.client("uri-a")
+        if stale:
+            _list_every_model_pending(model_store, client)
+        get = client.get_logged_model
+
+        def marked_failed_meanwhile(model_id):
+            if model_id == left.model_id:
+                left.status = "FAILED"
+            return get(model_id)
+
+        client.get_logged_model = marked_failed_meanwhile
+        model_id = _find_or_create(model_store, client)
+        assert model_id != left.model_id and left.status == "FAILED"
+        assert list(model_store.uploads) == [model_id]
+
+    def test_a_new_model_marked_failed_before_it_is_finished_is_an_error(self, model_store):
+        client = model_store.client("uri-a")
+        get = client.get_logged_model
+
+        def marked_failed_meanwhile(model_id):
+            (model,) = [m for m in model_store.models if m.model_id == model_id]
+            model.status = "FAILED"
+            return get(model_id)
+
+        client.get_logged_model = marked_failed_meanwhile
+        with pytest.raises(RuntimeError, match="reads FAILED, not READY"):
+            _find_or_create(model_store, client)
+        assert [m.status for m in model_store.models] == ["FAILED"]
+        assert model_store.uploads == {}
+
+    def test_a_new_model_the_server_reports_unspecified_is_still_finished(self, model_store):
+        client = model_store.client("uri-a")
+        get = client.get_logged_model
+
+        def reads_unspecified(model_id):
+            model = copy.copy(get(model_id))
+            model.status = "UNSPECIFIED"
+            return model
+
+        client.get_logged_model = reads_unspecified
+        model_id = _find_or_create(model_store, client)
+        (model,) = model_store.models
+        assert model_id == model.model_id and model.status == "READY"
+        assert list(model_store.uploads) == [model_id]
+
+    def test_a_search_that_still_lists_a_finished_model_pending_ends_on_it(self, model_store):
+        left = model_store.add("run-a-step_5", status="PENDING")
+        client = model_store.client("uri-a")
+        _list_every_model_pending(model_store, client)
+        assert _find_or_create(model_store, client) == left.model_id
+        assert left.status == "READY"
+        assert [call for call, _, _ in model_store.calls] == [
+            "get_run",
+            "search_logged_models",
+            "get_logged_model",
+            "log_model_artifacts",
+            "finalize_logged_model",
+            "search_logged_models",
+        ]
+
+    def test_when_the_second_search_lists_nothing_the_caller_returns_its_own(self, model_store):
+        client = model_store.client("uri-a")
+        search = client.search_logged_models
+
+        def lagging(*args, **kwargs):
+            page = search(*args, **kwargs)
+            first = len(model_store.named("search_logged_models")) == 1
+            return page if first else type(page)([], None)
+
+        client.search_logged_models = lagging
+        model_id = _find_or_create(model_store, client)
+        (model,) = model_store.models
+        assert model_id == model.model_id and model.status == "READY"
+        assert [call for call, _, _ in model_store.calls] == [
+            "get_run",
+            "search_logged_models",
+            "create_logged_model",
+            "get_logged_model",
+            "log_model_artifacts",
+            "finalize_logged_model",
+            "search_logged_models",
+        ]
+
+    @pytest.mark.parametrize("found_pending", [False, True], ids=["its-own", "found-pending"])
+    def test_a_finalize_refused_because_the_model_is_already_ready_is_tolerated(
+        self, model_store, found_pending
+    ):
+        if found_pending:
+            model_store.add("run-a-step_5", status="PENDING")
+        client = model_store.client("uri-a")
+        upload, finalize = client.log_model_artifacts, client.finalize_logged_model
+
+        def another_caller_finalizes_it_meanwhile(model_id, local_dir):
+            upload(model_id, local_dir)
+            model_store.client("uri-a").finalize_logged_model(model_id, "READY")
+
+        def refused_once_ready(model_id, status):
+            (model,) = [m for m in model_store.models if m.model_id == model_id]
+            if model.status == "READY":
+                raise RuntimeError("INVALID_STATE: the logged model is already finalized")
+            return finalize(model_id, status)
+
+        client.log_model_artifacts = another_caller_finalizes_it_meanwhile
+        client.finalize_logged_model = refused_once_ready
+        model_id = _find_or_create(model_store, client)
+        (model,) = model_store.models
+        assert model_id == model.model_id and model.status == "READY"
+        assert len(model_store.named("get_logged_model")) == 2
+
+    @pytest.mark.parametrize("found_pending", [False, True], ids=["its-own", "found-pending"])
+    @pytest.mark.parametrize("status", ["PENDING", "FAILED"])
+    def test_any_other_finalize_error_propagates(self, model_store, found_pending, status):
+        if found_pending:
+            model_store.add("run-a-step_5", status="PENDING")
+        client = model_store.client("uri-a")
+
+        def refused(model_id, _):
+            (model,) = [m for m in model_store.models if m.model_id == model_id]
+            model.status = status
+            raise RuntimeError("finalize refused")
+
+        client.finalize_logged_model = refused
+        with pytest.raises(RuntimeError, match="finalize refused"):
+            _find_or_create(model_store, client)
+        assert all(m.status != "READY" for m in model_store.models)
