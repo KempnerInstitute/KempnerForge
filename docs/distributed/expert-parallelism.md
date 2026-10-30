@@ -181,7 +181,9 @@ local expert compute by `ep` and multiplies the gradient it hands back
 to the tokens by `ep`. The routed-expert gradients are then the mean
 over the EP group, equal to one process's on the same batch, and every
 other gradient is unchanged. Both factors are exact when `ep` is a
-power of two.
+power of two. For other sizes the gradient handed back to the tokens,
+which reaches every parameter outside the routed experts, takes two
+extra roundings, which shows in bf16.
 
 The routers, the shared experts and every parameter outside the MoE
 layers have a copy on each EP rank. FSDP2 does not reduce their
