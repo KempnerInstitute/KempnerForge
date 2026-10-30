@@ -59,8 +59,10 @@ this section.
 - **MoE + PP**: not supported — the config validator raises in
   `JobConfig.__post_init__`.
 - **MoE + EP**: supported. `num_experts` must be divisible by
-  `ep_world_size`. See
-  [Expert parallelism](../distributed/expert-parallelism.md).
+  `ep_world_size`, and VLMs with `vlm.arch = "mot"` or `"moma"` are
+  rejected (see
+  [Validation rules § Expert parallel](../configuration/validation-rules.md#expert-parallel)).
+  See [Expert parallelism](../distributed/expert-parallelism.md).
 - **MoE + FP8**: supported with exclusions. Experts, shared expert, and
   router gate stay bf16 — [MoE + FP8](moe-fp8.md).
 
