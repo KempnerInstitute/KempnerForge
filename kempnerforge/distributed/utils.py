@@ -59,7 +59,8 @@ def clip_grad_norm_(
     via stack, then combines across groups.
 
     Falls back to ``torch.nn.utils.clip_grad_norm_`` when there is only one mesh
-    (pure FSDP or single-GPU).
+    (pure FSDP or single-GPU) and neither pipeline nor expert parallelism, whose
+    norms need a sum over their own group.
 
     Under pipeline parallelism ``model`` holds one stage, so pass the stages'
     process group as ``pp_group``: the squared stage norms are summed over it, and
