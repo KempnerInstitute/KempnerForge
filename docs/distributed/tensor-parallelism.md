@@ -135,7 +135,8 @@ the head-divisibility check, wherever a VLM run would fail or shard nothing:
 | `vlm.arch` | SequenceParallel on (dense, untied embeddings) | SequenceParallel off (MoE or tied embeddings) |
 |------------|------------------------------------------------|-----------------------------------------------|
 | `mot` | Rejected: the build fails with a `KeyError` | Rejected: nothing is sharded |
-| `joint_decoder`, `moma` | Rejected: the first forward fails where the image prefix joins the token embeddings | Trains |
+| `joint_decoder` | Rejected: the first forward fails where the image prefix joins the token embeddings | Trains |
+| `moma` | Rejected: the first forward fails where the image prefix joins the token embeddings | Trains with tied embeddings (MoMa keeps `model.num_experts = 0`) |
 | `cross_attention` | Rejected: the first cross-attention block fails on the sequence-sharded activations | Trains |
 
 With SequenceParallel off the plan shards the transformer blocks, and the
