@@ -1624,13 +1624,13 @@ class TestAsyncLatestSymlinkSafety:
     """
 
     @staticmethod
-    def _mgr(tmp_path, mode):
+    def _mgr(tmp_path, mode, pp_rank=None):
         from kempnerforge.checkpoint.manager import CheckpointManager
 
         model = torch.nn.Linear(4, 4)
         opt = torch.optim.SGD(model.parameters(), lr=0.1)
         cfg = CheckpointConfig(dir=str(tmp_path), keep_last_n=2, async_mode=mode)
-        return CheckpointManager(cfg, model, opt)
+        return CheckpointManager(cfg, model, opt, pp_rank=pp_rank)
 
     @staticmethod
     def _install_async_mock(mgr, monkeypatch):
@@ -1869,6 +1869,53 @@ class TestAsyncLatestSymlinkSafety:
         # keep_last_n=1 still prunes the genuinely-stale ones.
         assert not dirs[1].exists()
         assert not dirs[2].exists()
+
+    @pytest.mark.parametrize("pp_rank", [None, 0], ids=["no_pp", "pp_stage_0"])
+    @pytest.mark.parametrize(
+        "mode",
+        [AsyncCheckpointMode.async_, AsyncCheckpointMode.async_pinned],
+        ids=["async", "async_with_pinned_mem"],
+    )
+    def test_an_async_save_after_a_rewind_keeps_the_directory_it_writes(
+        self, tmp_path, monkeypatch, mode, pp_rank
+    ):
+        """Newer leftovers fill ``keep_last_n``, yet the save in flight keeps its directory.
+
+        Under pipeline parallelism a stage writes into ``step_N/pp<rank>``, and it is
+        ``step_N`` itself that retention must spare.
+        """
+        mgr = self._mgr(tmp_path, mode, pp_rank)
+        self._install_async_mock(mgr, monkeypatch)
+        for step in (100, 300, 400, 500):
+            self._build_ckpt(tmp_path, step, complete=True)
+        (Path(tmp_path) / "latest").symlink_to("step_100")
+
+        mgr.save(step=150)
+        mgr.save(step=200)
+        mgr.wait()
+
+        written = Path(tmp_path) / "step_200"
+        shards = written / f"pp{pp_rank}" if pp_rank is not None else written
+        assert self._latest_target(tmp_path) == written.resolve()
+        assert (shards / ".metadata").exists()
+        assert (written / "train_state.pt").exists()
+        step, _, _ = mgr.load()
+        assert step == 200
+
+    def test_a_saves_directory_is_pruned_once_a_newer_save_is_under_way(
+        self, tmp_path, monkeypatch
+    ):
+        """Only the latest save is spared as in flight; older ones fall to ``keep_last_n``."""
+        mgr = self._mgr(tmp_path, AsyncCheckpointMode.async_)
+        mgr.config.keep_last_n = 1
+        self._install_async_mock(mgr, monkeypatch)
+
+        for step in (1, 2, 3):
+            mgr.save(step=step)
+        mgr.wait()
+
+        assert sorted(p.name for p in Path(tmp_path).glob("step_*")) == ["step_3"]
+        assert self._latest_target(tmp_path) == (Path(tmp_path) / "step_3").resolve()
 
     # --- coverage for the distributed barrier + resolution edge paths ---
 

@@ -386,6 +386,7 @@ class CheckpointManager:
         # the flush completes (drained at the next save() or wait()), so
         # `latest` never points at a half-written checkpoint. (step, ckpt_dir).
         self._pending_finalize: tuple[int, Path] | None = None
+        self._inflight_dir: Path | None = None
         self._tracking_source: TrackingSource | None = None
         self._registrar: CheckpointRegistrar | None = None
         self._sidecar_lock = threading.Lock()
@@ -607,6 +608,7 @@ class CheckpointManager:
 
         # Create directory (all ranks)
         ckpt_dir.mkdir(parents=True, exist_ok=True)
+        self._inflight_dir = ckpt_dir
 
         # With PP, each stage has different parameters — save DCP shards to
         # a per-stage subdirectory to avoid .metadata file collisions.
@@ -1067,12 +1069,16 @@ class CheckpointManager:
     def _cleanup(self) -> None:
         """Remove old checkpoints beyond the retention limit.
 
-        Never removed regardless of retention: the current ``latest`` target
-        and the in-flight async checkpoint (``_pending_finalize``) — pruning
-        either would let a crash strand resume with no loadable checkpoint —
-        and any dynamic-window milestone (``CheckpointConfig.is_dynamic_milestone``),
-        so the dense early-dynamics checkpoints survive even with a finite
-        ``keep_last_n``.
+        Never removed regardless of retention: the current ``latest`` target,
+        the directory the last ``save()`` writes into (``_inflight_dir``), whose
+        async flush may still be running, a deferred async checkpoint
+        (``_pending_finalize``), and any dynamic-window milestone
+        (``CheckpointConfig.is_dynamic_milestone``), so the dense early-dynamics
+        checkpoints survive even with a finite ``keep_last_n``. A save drains
+        ``_pending_finalize``, which runs this cleanup, only after its own
+        flush is dispatched, so ``_inflight_dir`` is what keeps a checkpoint
+        that is not among the newest, as after a rewind, from being deleted
+        while it is written.
         """
         keep = self.config.keep_last_n
         if keep <= 0:
@@ -1090,6 +1096,8 @@ class CheckpointManager:
             protected.add(latest.resolve())
         if self._pending_finalize is not None:
             protected.add(self._pending_finalize[1].resolve())
+        if self._inflight_dir is not None:
+            protected.add(self._inflight_dir.resolve())
 
         # Dynamic-window milestones (whatever steps the configured
         # dyn_ckpt_window strategy fires on) are the dense early-dynamics
