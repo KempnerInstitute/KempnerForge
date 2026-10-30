@@ -477,6 +477,18 @@ def _log_periodic_metrics(session: TrainingSession, result: StepResult, step: in
         tracker.log_eval(ds_metrics, step)
 
 
+def _advance_lr_schedule(session: TrainingSession) -> None:
+    """Step the scheduler, then scale the new LR by the active phase's ``lr_scale``.
+
+    Runs once per step, a step skipped for a non-finite loss included, so
+    the schedule stays aligned with the step counter.
+    """
+    session.scheduler.step()
+    if session.phases.lr_scale != 1.0:
+        for pg in session.optimizer.param_groups:
+            pg["lr"] *= session.phases.lr_scale
+
+
 def _apply_freeze_stages(session: TrainingSession, step: int) -> None:
     """FreezeStage hook: apply any stage whose start_step matches this boundary.
 
@@ -501,6 +513,50 @@ def _apply_freeze_stages(session: TrainingSession, step: int) -> None:
     for stage in pending_stages:
         flipped = apply_freeze_specs(session.model, stage.specs, vlm_cfg.module_patterns)
         logger.info(f"FreezeStage at step={step}: applied {flipped}")
+
+
+def _apply_step_transitions(session: TrainingSession, step: int) -> None:
+    """Apply the freeze stages and data phases due at ``step``.
+
+    Runs right after the step counter advances, on a step skipped for a
+    non-finite loss too, so a transition lands on its configured step. A
+    phase that fires drops the data iterator, so the next batch is drawn
+    with the new sampler weights.
+    """
+    _apply_freeze_stages(session, step)
+    if advance_phases(session.phases, session.data, step):
+        session.batches.reset()
+
+
+def _shutdown_if_requested(
+    session: TrainingSession, step: int, tokens_seen: int, *, saved_this_step: bool
+) -> bool:
+    """Write the emergency checkpoint and finish when a shutdown is pending.
+
+    Returns True when the loop must stop. With ``saved_this_step``, the
+    scheduled save of ``step`` is the emergency checkpoint, so it is drained
+    with ``wait()`` rather than written twice.
+    """
+    if not session.shutdown_handler.should_shutdown():
+        return False
+    ckpt_mgr = session.checkpointer
+    if saved_this_step:
+        logger.warning(
+            f"Shutdown requested at step {step}; "
+            "its scheduled checkpoint is the emergency checkpoint"
+        )
+        ckpt_mgr.wait()
+    else:
+        logger.warning(f"Shutdown requested at step {step} — saving emergency checkpoint")
+        ckpt_mgr.save(
+            step=step,
+            tokens_seen=tokens_seen,
+            scheduler=session.scheduler,
+            dataloader=session.data.dataloader,
+            extra=checkpoint_extra(session.config, step, session.phases),
+        )
+    session.shutdown_handler.finish()
+    return True
 
 
 def run_training_loop(
@@ -574,17 +630,16 @@ def run_training_loop(
                 if session.nan_detector.should_rollback:
                     logger.error("Too many consecutive NaNs — stopping")
                     break
+                _advance_lr_schedule(session)
                 step += 1
+                _apply_step_transitions(session, step)
+                if _shutdown_if_requested(session, step, tokens_seen, saved_this_step=False):
+                    break
                 continue
 
             # Optimizer step
             optimizer.step()
-            scheduler.step()
-
-            # Phase LR scaling (applied after scheduler computes base LR)
-            if phases.lr_scale != 1.0:
-                for pg in optimizer.param_groups:
-                    pg["lr"] *= phases.lr_scale
+            _advance_lr_schedule(session)
 
             optimizer.zero_grad()
 
@@ -592,12 +647,7 @@ def run_training_loop(
             tokens_in_step = tc.batch_size * tc.seq_len * tc.grad_accum_steps * data.dp_size
             tokens_seen += tokens_in_step
 
-            _apply_freeze_stages(session, step)
-
-            # Phase transition check — a fired phase forces a data iterator
-            # refresh so the new sampler weights take effect.
-            if advance_phases(phases, data, step):
-                session.batches.reset()
+            _apply_step_transitions(session, step)
 
             # Metrics (report LR after phase scaling)
             current_lr = optimizer.param_groups[0]["lr"]
@@ -672,32 +722,12 @@ def run_training_loop(
                 hooks.on_checkpoint_save(step, config.checkpoint.dir)
 
             # Graceful shutdown
-            if session.shutdown_handler.should_shutdown():
-                if saved_this_step:
-                    logger.warning(
-                        f"Shutdown requested at step {step}; "
-                        "its scheduled checkpoint is the emergency checkpoint"
-                    )
-                    ckpt_mgr.wait()
-                else:
-                    logger.warning(
-                        f"Shutdown requested at step {step} — saving emergency checkpoint"
-                    )
-                    ckpt_mgr.save(
-                        step=step,
-                        tokens_seen=tokens_seen,
-                        scheduler=scheduler,
-                        dataloader=data.dataloader,
-                        extra=ckpt_extra,
-                    )
-                session.shutdown_handler.finish()
+            if _shutdown_if_requested(session, step, tokens_seen, saved_this_step=saved_this_step):
                 break
 
             # Clean-completion marker for the unconditional final save after the
-            # loop. Only reached when training completes without any errors, e.g.,
-            # no NaN/NCCL/shutdown breaks. If a run encounters a NaN, the last step
-            # is intentionally *not* saved because the actual model state would be
-            # `max_steps - 1`, not `max_steps`.
+            # loop. Only a finite step reaches it: a NaN/NCCL/shutdown break, or a
+            # last step skipped for a NaN, leaves the run without a final save.
             if step >= tc.max_steps:
                 completed_normally = True
 

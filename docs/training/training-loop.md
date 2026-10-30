@@ -78,7 +78,12 @@ if not nan_detector.check_loss(avg_loss, step):
     optimizer.zero_grad()
     if nan_detector.should_rollback:
         break
-    step += 1; continue
+    _advance_lr_schedule(session)
+    step += 1
+    _apply_step_transitions(session, step)
+    if _shutdown_if_requested(session, step, tokens_seen, saved_this_step=False):
+        break
+    continue
 ```
 
 `clip_grad_norm_` is the DTensor-aware wrapper from
@@ -87,10 +92,19 @@ see [Gradient utilities](gradient-utilities.md).
 Under PP, `pipeline_step` passes `pp_group=`, so the norm is summed over
 the stages and every stage scales by the same coefficient (see
 [Gradient utilities § Under pipeline parallelism](gradient-utilities.md#under-pipeline-parallelism)).
-`NaNDetector.check_loss` returns `False` on NaN / Inf, zeroes grads,
-and escalates to `should_rollback` after
-`nan_consecutive_max` bad steps (see
-[Resilience](../resilience/index.md)).
+`NaNDetector.check_loss` returns `False` on NaN / Inf, and the loop
+zeroes the grads. The detector escalates to `should_rollback` after
+`max_consecutive` bad steps in a row (`NaNDetector(max_consecutive=10)`
+in `kempnerforge/training/entry.py`; see
+[NaN detection](../resilience/nan-detection.md)).
+
+A skipped step still counts as a step. It drops the optimizer update,
+the token count, metrics, hooks and every periodic tick below except the
+shutdown check, but the LR schedule advances, the freeze stages and data
+phases due at the new step are applied, and a pending shutdown writes
+the emergency checkpoint and stops the loop. The step that trips
+`should_rollback` stops before any of that. See
+[NaN detection § What a skipped step still does](../resilience/nan-detection.md#what-a-skipped-step-still-does).
 
 ## Optimizer and scheduler step
 
@@ -105,7 +119,9 @@ optimizer.zero_grad()
 Phase LR scaling runs *after* the scheduler — it multiplies the base
 LR that `scheduler.step()` just computed. This lets a curriculum phase
 (see [Data](../data/index.md)) halve the LR for a cooldown segment
-without rewriting the scheduler.
+without rewriting the scheduler. Both lines live in
+`_advance_lr_schedule`, which a NaN-skipped step also runs, so the
+schedule stays on the step counter.
 
 ## Phase transitions
 
@@ -159,6 +175,11 @@ After the step body, before advancing:
 | Checkpoint | `checkpoint.should_save(step)`: `dyn_ckpt_window` milestones inside the window, every `checkpoint.interval` steps outside it | `ckpt_mgr.save(step)`, `on_checkpoint_save` hook |
 | Shutdown | SIGTERM / SIGUSR1 pending | `ckpt_mgr.save(step)`, or `ckpt_mgr.wait()` when the checkpoint tick just saved this step; then `finish()`, break |
 
+A step skipped for a NaN / Inf loss runs only the shutdown row, through
+the same `_shutdown_if_requested` helper. The checkpoint tick does not
+save a skipped step, so its shutdown always writes its own emergency
+checkpoint.
+
 `nccl_health_check_interval = 0` disables the all-reduce probe — it is
 off in every shipped config but worth enabling for long multi-node
 runs. See [Resilience § NCCL health](../resilience/index.md).
@@ -210,7 +231,10 @@ when that step is not already on the save schedule — so a completed run's
 fully-trained model (including the WSD decay tail) is always recoverable
 and `latest` points at it. This mirrors the emergency checkpoint the
 preemption path writes on shutdown. The `should_save` guard avoids a
-duplicate when `max_steps` already coincided with the schedule.
+duplicate when `max_steps` already coincided with the schedule. A run
+whose last step is skipped for a NaN / Inf loss is not a clean finish:
+it ends without this checkpoint, unless a pending shutdown saves that
+step as its emergency checkpoint.
 
 `ckpt_mgr.wait()` is load-bearing — without it, a rank can exit before
 its async DCP write completes, corrupting the checkpoint for

@@ -3,8 +3,10 @@
 [`NaNDetector`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/resilience/health.py)
 watches for NaN / Inf in the loss every step. When it fires, the
 training loop zeros gradients, skips the optimizer step, and increments
-a consecutive-NaN counter. If too many consecutive NaNs pile up, the
-loop stops so a human can roll back to an earlier checkpoint.
+a consecutive-NaN counter. The skipped step still counts as a step (see
+[What a skipped step still does](#what-a-skipped-step-still-does)). If
+too many consecutive NaNs pile up, the loop stops so a human can roll
+back to an earlier checkpoint.
 
 ## Wiring
 
@@ -18,7 +20,11 @@ if not nan_detector.check_loss(avg_loss, step):
     if nan_detector.should_rollback:
         logger.error("Too many consecutive NaNs — stopping")
         break
+    _advance_lr_schedule(session)            # scheduler.step(), then the phase lr_scale
     step += 1
+    _apply_step_transitions(session, step)   # FreezeStages and data phases due at step
+    if _shutdown_if_requested(session, step, tokens_seen, saved_this_step=False):
+        break
     continue
 ```
 
@@ -31,6 +37,48 @@ Two things to note:
 - **`check_gradients` is *not* called by the training loop.** Gradient
   NaNs typically manifest as loss NaNs on the next step anyway; skip it
   unless you're specifically debugging a gradient-explosion case.
+
+## What a skipped step still does
+
+A skipped step has consumed its batch, so it counts as a step: the step
+counter advances, and the LR schedule and the step-keyed transitions
+move with it. The update, the per-step reporting and every periodic
+tick except the shutdown check are dropped:
+
+| Work | On a skipped step |
+|------|-------------------|
+| Optimizer update | Skipped. Gradients are zeroed; weights and optimizer state stay as they were, except that the sigmoid router updates its `expert_bias` and `expert_ema` during the forward pass, before the loss is checked. |
+| `tokens_seen`, metrics, `on_step_end` hooks | Skipped. |
+| LR schedule | Advanced: `scheduler.step()`, then the active phase's `lr_scale`, so warmup and decay stay on the step counter. |
+| `FreezeStage` and data phases due at the new step | Applied. A `FreezeStage` waits behind the same async-save fence as on a finite step. |
+| Shutdown check | Run. A pending SIGTERM / SIGUSR1 writes the emergency checkpoint at the new step, then the loop stops. |
+| Eval, NCCL health check, scheduled checkpoint | Skipped until their next interval. |
+| Profiler step | Skipped; the profiler steps on the next finite step. |
+
+The checkpoint holds the weights as the skipped step left them, and the
+schedule, freeze state, data phase and data position are all those of
+the new step, so resuming from that emergency checkpoint continues as
+the uninterrupted run would have, with two exceptions:
+
+- **Partway through a run of NaN steps.** The consecutive-NaN count is
+  not checkpointed, so the resumed run counts from zero and allows a
+  full `max_consecutive` more before it stops.
+- **Before the run's first optimizer update.** The checkpoint holds no
+  optimizer state, so the resumed optimizer keeps the LR the scheduler
+  set at step 0 (0 under the default warmup) for its first update. That
+  update still advances the optimizer's moments and step count, so the
+  resumed run does not rejoin the uninterrupted one, though its LR
+  follows the schedule from the next step on.
+
+Two edge cases:
+
+- **The NaN that trips the stop.** `should_rollback` is checked first,
+  so that step ends the run without a checkpoint, even with a shutdown
+  pending (see [Rollback recommendation](#rollback-recommendation)).
+- **A fresh run whose first step is skipped.** PyTorch warns
+  "Detected call of `lr_scheduler.step()` before `optimizer.step()`".
+  That is expected: the skipped step uses up its LR value like any
+  other step.
 
 ## Three actions
 
@@ -126,8 +174,12 @@ the *source* of the NaN determines what's safe:
   for sensitive layers, restart.
 
 A rule-of-thumb: if you hit `should_rollback`, don't resume from the
-most recent checkpoint. It was written just before the NaN storm, so
-whatever state caused the explosion is baked in.
+most recent checkpoint. It holds the weights from just before the NaN
+storm, so whatever state caused the explosion is baked in. That also
+holds for an emergency checkpoint a shutdown wrote during the storm:
+skipped steps leave the weights as they were (the sigmoid router's
+`expert_bias` aside), so it carries the pre-storm weights under a later
+step.
 
 ## Manual use
 
