@@ -208,7 +208,7 @@ def _check_norm(rank, world, port, names, sizes, overrides) -> None:
     try:
         step = _step(names, sizes, overrides)
         norm = clip_grad_norm_(step.model, 1e9)
-        ref_norm = clip_grad_norm_(step.reference, 1e9)
+        ref_norm = torch.nn.utils.clip_grad_norm_(step.reference.parameters(), 1e9)
         torch.testing.assert_close(norm, ref_norm, rtol=1e-5, atol=0.0)
         peers = [torch.empty_like(norm) for _ in range(_ep_size(step.mesh))]
         dist.all_gather(peers, norm, group=step.mesh["ep"].get_group())
@@ -227,7 +227,7 @@ def _check_clipping(rank, world, port, names, sizes, overrides) -> None:
     try:
         step = _step(names, sizes, overrides)
         assert clip_grad_norm_(step.model, MAX_NORM) > 2 * MAX_NORM
-        clip_grad_norm_(step.reference, MAX_NORM)
+        torch.nn.utils.clip_grad_norm_(step.reference.parameters(), MAX_NORM)
         _assert_grads_match(step)
         for name, p in step.model.named_parameters():
             if _is_expert(name):
@@ -249,7 +249,7 @@ def _check_without_ep(rank, world, port, names, sizes, overrides) -> None:
     try:
         step = _step(names, sizes, overrides)
         norm = clip_grad_norm_(step.model, MAX_NORM)
-        ref_norm = clip_grad_norm_(step.reference, MAX_NORM)
+        ref_norm = torch.nn.utils.clip_grad_norm_(step.reference.parameters(), MAX_NORM)
         torch.testing.assert_close(norm, ref_norm, rtol=1e-5, atol=0.0)
         _assert_grads_match(step)
     finally:
