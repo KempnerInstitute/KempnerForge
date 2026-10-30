@@ -104,7 +104,10 @@ def test_vlm_7b_siglip2_toml() -> None:
 
 
 def _arch(path: Path) -> str:
-    return tomllib.loads(path.read_text())["vlm"]["arch"]
+    """The preset's arch as the loader resolves it, which defaults a missing ``arch`` line."""
+    vlm = load_config(str(path), cli_args=[]).vlm
+    assert vlm is not None, f"{path.name} has no [vlm] section"
+    return vlm.arch
 
 
 def _tp_sequence_parallel(path: Path) -> bool:
