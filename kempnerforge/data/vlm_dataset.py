@@ -169,6 +169,7 @@ def _warn_sample_masked_for_prompt(min_text_len: int, max_text_len: int) -> None
             min_text_len,
             max_text_len,
             masked,
+            extra={"every_rank": True},
         )
 
 
@@ -197,9 +198,9 @@ def _tokenize_and_mask(
 
     A prompt that leaves no room for a caption token (the bound
     ``check_prompt_fits`` enforces) masks every label, so the sample adds no
-    loss instead of training on EOS alone or on nothing; each process logs a
-    warning at the 1st, 2nd, 4th, ... such sample. Truncating a long caption
-    is unaffected.
+    loss instead of training on EOS alone or on nothing; each process, on every
+    rank, logs a warning at the 1st, 2nd, 4th, ... such sample. Truncating a
+    long caption is unaffected.
     """
     if prompt is not None:
         prompt_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]

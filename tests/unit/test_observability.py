@@ -3056,6 +3056,18 @@ class TestRankLogger:
         with patch.dict(os.environ, {"RANK": "3"}):
             assert f.filter(record) is False
 
+    def test_rank_filter_passes_a_record_logged_for_every_rank(self):
+        """``extra={"every_rank": True}`` lets a record through on any rank; only that marks it."""
+        f = _RankFilter(rank=0)
+        make = logging.getLogger("test").makeRecord
+        marked = make("test", logging.WARNING, "", 0, "msg", (), None, extra={"every_rank": True})
+        unmarked = make(
+            "test", logging.WARNING, "", 0, "msg", (), None, extra={"every_rank": False}
+        )
+        with patch.dict(os.environ, {"RANK": "3"}):
+            assert f.filter(marked) is True
+            assert f.filter(unmarked) is False
+
     def test_rank_filter_custom_rank(self):
         """Filter allowing rank 2 should pass rank 2 and block others."""
         f = _RankFilter(rank=2)

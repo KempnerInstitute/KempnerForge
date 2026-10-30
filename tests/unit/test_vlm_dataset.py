@@ -359,6 +359,17 @@ class TestNextTokenLabelContract:
         assert labels0 == labels1
 
 
+class _RecordingHandler(logging.Handler):
+    """Keeps every record that passes its filters."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+
 def _prompted_dataset(tmp_path, monkeypatch, prompts: list) -> HuggingFaceVLMDataset:
     """A real ``HuggingFaceVLMDataset`` whose rows pair caption ``"xyz"`` with ``prompts``."""
     from datasets import Dataset
@@ -441,6 +452,26 @@ class TestPromptRoom:
             "4",
         ]
         assert all("needs max_text_len >= 9" in m and "max_text_len=8" in m for m in messages)
+
+    def test_masked_sample_warning_passes_the_rank_zero_filter_on_every_rank(self, monkeypatch):
+        """KF's log handler drops records from every rank but 0, and a masked sample is
+        seen only by the rank that reads it, so its warning is marked for every rank."""
+        from kempnerforge.metrics.logger import _RankFilter
+
+        monkeypatch.setattr(vlm_dataset, "_samples_masked_for_prompt", itertools.count(1))
+        monkeypatch.setenv("RANK", "3")
+        handler = _RecordingHandler()
+        handler.addFilter(_RankFilter(rank=0))
+        dataset_logger = logging.getLogger("kempnerforge.data.vlm_dataset")
+        monkeypatch.setattr(dataset_logger, "handlers", [handler])
+        monkeypatch.setattr(dataset_logger, "propagate", False)
+        _tokenize_and_mask(_MockTokenizer(), "xyz", max_text_len=8, prompt="a" * 7)
+        dataset_logger.warning("an unmarked record")
+        assert [r.getMessage() for r in handler.records] == [
+            "A prompt needs max_text_len >= 9 to leave room for a caption token, but "
+            "max_text_len=8: masked every label of that sample so it adds no loss "
+            "(1 such samples so far in this process, logged at powers of two)"
+        ]
 
     def test_per_sample_prompts_are_masked_row_by_row(self, tmp_path, monkeypatch):
         """``prompt_field`` prompts are known only per row, so building the dataset
