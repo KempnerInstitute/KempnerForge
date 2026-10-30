@@ -23,6 +23,7 @@ from torch.distributed.tensor import DTensor
 
 from kempnerforge.config.model import ModelConfig
 from kempnerforge.distributed.parallel import build_parallel_model
+from kempnerforge.distributed.utils import clip_grad_norm_
 from kempnerforge.model.transformer import Transformer
 from kempnerforge.training.grad import maybe_no_sync
 from kempnerforge.training.loop import add_moe_losses
@@ -192,6 +193,21 @@ def _check_gradients(rank, world, port, names, sizes, overrides, micro_steps) ->
         dist.destroy_process_group()
 
 
+def _check_norm(rank, world, port, names, sizes, overrides) -> None:
+    """Every rank returns one process's norm, and the EP ranks the very same value."""
+    _init(rank, world, port)
+    try:
+        step = _step(names, sizes, overrides)
+        norm = clip_grad_norm_(step.model, 1e9)
+        ref_norm = clip_grad_norm_(step.reference, 1e9)
+        torch.testing.assert_close(norm, ref_norm, rtol=1e-5, atol=0.0)
+        peers = [torch.empty_like(norm) for _ in range(_ep_size(step.mesh))]
+        dist.all_gather(peers, norm, group=step.mesh["ep"].get_group())
+        assert all(torch.equal(peer, norm) for peer in peers), peers
+    finally:
+        dist.destroy_process_group()
+
+
 class TestExpertParallelGradients:
     @pytest.mark.parametrize("layout", list(LAYOUTS))
     def test_expert_gradients_match_one_process(self, layout):
@@ -201,3 +217,10 @@ class TestExpertParallelGradients:
     def test_accumulated_gradients_match_one_process(self):
         """Two micro-steps under ``maybe_no_sync`` accumulate one process's gradients."""
         _spawn(_check_gradients, ("dp_shard", "ep"), (2, 2), {}, 2)
+
+
+class TestClipUnderExpertParallelism:
+    @pytest.mark.parametrize("layout", ["dp_shard2_ep2_packed", "dp_replicate2_ep2", "ep2_tp2"])
+    def test_ep_ranks_return_the_whole_model_norm(self, layout):
+        """The norm covers every rank's experts, so all EP ranks return the same norm."""
+        _spawn(_check_norm, *LAYOUTS[layout])
