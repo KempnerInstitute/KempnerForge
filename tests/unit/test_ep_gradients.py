@@ -49,6 +49,8 @@ class _Step(NamedTuple):
     model: torch.nn.Module
     reference: Transformer
     mesh: DeviceMesh
+    loss: float
+    reference_loss: float
 
 
 def _free_port() -> int:
@@ -167,12 +169,18 @@ def _step(
     batches = torch.randint(
         0, config.vocab_size, (dp_size, micro_steps, ROWS, SEQ + 1), generator=generator
     )
+    loss = reference_loss = 0.0
     for micro, rows in enumerate(batches[dp_rank]):
         with maybe_no_sync(model, micro, micro_steps):
-            (_loss(model, rows, config) / micro_steps).backward()
-    for rows in batches.flatten(0, 1):
-        (_loss(reference, rows, config) / (dp_size * micro_steps)).backward()
-    return _Step(model, reference, mesh)
+            micro_loss = _loss(model, rows, config) / micro_steps
+            micro_loss.backward()
+        loss += micro_loss.item()
+    for index, rows in enumerate(batches.flatten(0, 1)):
+        micro_loss = _loss(reference, rows, config) / (dp_size * micro_steps)
+        micro_loss.backward()
+        if index // micro_steps == dp_rank:
+            reference_loss += micro_loss.item() * dp_size
+    return _Step(model, reference, mesh, loss, reference_loss)
 
 
 def _assert_grads_match(step: _Step) -> None:
@@ -248,6 +256,17 @@ def _check_without_ep(rank, world, port, names, sizes, overrides) -> None:
         dist.destroy_process_group()
 
 
+def _check_gradient_scale(rank, world, port, names, sizes, overrides) -> None:
+    """With ``moe_gradient_scale`` the loss and gradients still match one process."""
+    _init(rank, world, port)
+    try:
+        step = _step(names, sizes, overrides)
+        assert abs(step.loss - step.reference_loss) <= 1e-6 * abs(step.reference_loss)
+        _assert_grads_match(step)
+    finally:
+        dist.destroy_process_group()
+
+
 class TestExpertParallelGradients:
     @pytest.mark.parametrize("layout", list(LAYOUTS))
     def test_expert_gradients_match_one_process(self, layout):
@@ -257,6 +276,10 @@ class TestExpertParallelGradients:
     def test_accumulated_gradients_match_one_process(self):
         """Two micro-steps under ``maybe_no_sync`` accumulate one process's gradients."""
         _spawn(_check_gradients, ("dp_shard", "ep"), (2, 2), {}, 2)
+
+    def test_gradient_scale_matches_one_process(self):
+        """``moe_gradient_scale`` averages the load over all experts, as without EP."""
+        _spawn(_check_gradient_scale, ("dp_shard", "ep"), (2, 2), {"moe_gradient_scale": True})
 
 
 class TestClipUnderExpertParallelism:
