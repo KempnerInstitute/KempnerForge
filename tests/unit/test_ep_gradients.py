@@ -197,3 +197,7 @@ class TestExpertParallelGradients:
     def test_expert_gradients_match_one_process(self, layout):
         """Routed-expert gradients equal one process's, not ``ep`` times them."""
         _spawn(_check_gradients, *LAYOUTS[layout], 1)
+
+    def test_accumulated_gradients_match_one_process(self):
+        """Two micro-steps under ``maybe_no_sync`` accumulate one process's gradients."""
+        _spawn(_check_gradients, ("dp_shard", "ep"), (2, 2), {}, 2)
