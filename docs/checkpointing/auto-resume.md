@@ -109,7 +109,10 @@ Two details that matter:
 
 The symlink is updated **after** the DCP save completes (async save
 futures are resolved before the next save starts), so `latest` only
-ever points at a fully-flushed checkpoint.
+ever points at a fully-flushed checkpoint. Under pipeline parallelism
+each stage saves through its own process group, so every rank first
+waits at a barrier until every stage's save has completed; only then
+does rank 0 move `latest` and prune.
 
 ## Retention cleanup
 

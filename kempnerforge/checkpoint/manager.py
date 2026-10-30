@@ -439,9 +439,10 @@ class CheckpointManager:
     def _drain_pending_finalize(self, overwriting: Path | None = None) -> None:
         """Commit a deferred async checkpoint once its flush is durable.
 
-        Invoked after the pending DCP future has been awaited (next save()
-        or an explicit wait()/flush). Rank 0 performs the symlink + cleanup;
-        other ranks no-op (they never touch the symlink), mirroring save().
+        Invoked on every rank after its pending DCP future has been awaited
+        (next save() or an explicit wait()/flush). Under PP every rank first
+        waits until every stage's flush is durable. Rank 0 then performs the
+        symlink + cleanup; other ranks never touch the symlink, mirroring save().
         A checkpoint pending in ``overwriting``, the directory a new save's
         flush is rewriting, is dropped uncommitted and unregistered; that
         save's own deferred commit points `latest` at it and registers it.
@@ -450,8 +451,20 @@ class CheckpointManager:
             return
         step, ckpt_dir = self._pending_finalize
         self._pending_finalize = None
+        self._await_every_stage()
         if self._rank == 0 and ckpt_dir != overwriting:
             self._commit_latest(step, ckpt_dir)
+
+    def _await_every_stage(self) -> None:
+        """Under PP, wait until every stage's DCP write is durable; a no-op otherwise.
+
+        Each stage saves through its own process group, so this rank's write
+        being durable covers its own stage only; without PP the save spans every
+        rank. Every rank calls this once its own write is durable. Collective on
+        the dedicated gloo group.
+        """
+        if self._pp_rank is not None:
+            self._sync_barrier()
 
     def _sync_barrier(self) -> None:
         """Barrier on the manager's dedicated gloo group.
@@ -664,6 +677,7 @@ class CheckpointManager:
                 _replace_file(ckpt_dir / _METADATA_FILE, text)
 
         if sync_mode:
+            self._await_every_stage()
             # DCP shards are already durable — commit immediately.
             if self._rank == 0:
                 self._commit_latest(step, ckpt_dir)
