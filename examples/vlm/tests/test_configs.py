@@ -140,6 +140,13 @@ UNSUPPORTED_PARALLELISM = [
 ]
 
 
+REJECTION_REASONS = {
+    ("tensor", "mot"): "MoTBlock renames the attention modules",
+    ("expert", "mot"): "expects layer.attention and layer.mlp",
+    ("expert", "moma"): "partitions MoEMLP experts only",
+}
+
+
 @pytest.mark.parametrize(("path", "override", "kind"), UNSUPPORTED_PARALLELISM)
 def test_preset_rejects_parallelism_its_arch_cannot_run(
     path: Path, override: str, kind: str
@@ -148,7 +155,9 @@ def test_preset_rejects_parallelism_its_arch_cannot_run(
     with its arch's reason, not later at model build or in the first forward: every MoT
     preset, and under tensor parallelism every preset with sequence parallelism on."""
     config = load_config(str(path), cli_args=[override])
-    match = rf"vlm.arch='{_arch(path)}' does not support {kind} parallelism"
+    arch = _arch(path)
+    reason = REJECTION_REASONS.get((kind, arch), "with sequence parallelism on")
+    match = rf"vlm.arch='{arch}' does not support {kind} parallelism.*{reason}"
     with pytest.raises(ValueError, match=match):
         config.validate(world_size=2)
 
