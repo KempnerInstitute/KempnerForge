@@ -224,29 +224,31 @@ Checked first when `distributed.tp > 1`, ahead of head divisibility, so the
 error names the arch rather than a head count:
 
 ```
-vlm.arch ∈ {"mot", "moma", "cross_attention"} && distributed.tp > 1  →  ValueError
+vlm.arch == "mot" && distributed.tp > 1                      →  ValueError
+vlm set && distributed.tp > 1 && sequence parallelism on     →  ValueError
 ```
 
 The tensor-parallel plan
 ([`apply_tensor_parallel`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/distributed/tensor_parallel.py))
-is written for `TransformerBlock` and walks `model.layers` only, so it cannot
-run these arches:
+is written for `TransformerBlock` and walks `model.layers` only.
 
-- `mot`: `MoTBlock` keeps its norms, attention and FFNs per modality under
-  other names, so either no parameter is sharded at all or the build fails
-  with `KeyError: 'parameter name can't contain "."'`.
-- `moma`: the plan has no entry for `MoMaFFN`'s per-modality expert groups,
-  so they are never sharded, and with sequence parallelism on the first
-  forward fails.
-- `cross_attention`: the blocks in `cross_attention_layers` are never
-  visited, so they are never sharded, and with sequence parallelism on the
-  first one fails on the sequence-sharded activations.
+- `mot`: `MoTBlock` renames the attention modules (`attn_norm`, `attn`) and
+  holds `mlp_norm` and `mlp` as per-modality `ModuleDict`s, so the build
+  fails with `KeyError: 'parameter name can't contain "."'` or no parameter
+  is sharded.
+- Every other arch, with sequence parallelism on: the plan shards the
+  activations along the sequence for a dense model with untied embeddings
+  (`ModelConfig.tp_sequence_parallel`, without pipeline parallelism), and the
+  first forward fails on mixed `torch.Tensor` and `DTensor` operands, in
+  `joint_decoder` and `moma` where the image prefix joins the token
+  embeddings and in `cross_attention` in the first cross-attention block.
 
-Sequence parallelism is on unless the model is MoE or ties its embeddings.
-With it off these runs start, but the blocks the plan misses stay whole on
-every tensor-parallel rank, with no gradient reduction across that group, so
-they are rejected too. Set `distributed.tp = 1`. Text-only and
-`joint_decoder` jobs pass this check.
+With sequence parallelism off, which an MoE model or tied embeddings give,
+`joint_decoder`, `cross_attention` and `moma` train under tensor parallelism
+and match an unsharded model with the same weights. The plan shards the
+transformer blocks, and the cross-attention blocks and MoMa's expert groups
+stay whole on every tensor-parallel rank and compute the same result there,
+as MoE experts do in text models. Otherwise set `distributed.tp = 1`.
 
 ### Tensor-parallel head divisibility
 
