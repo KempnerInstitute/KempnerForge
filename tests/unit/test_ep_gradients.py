@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import re
 import socket
+from datetime import timedelta
 from typing import NamedTuple
 
 import pytest
@@ -65,11 +66,16 @@ def _init(rank: int, world: int, port: int) -> None:
     """Join a ``world``-rank gloo group, with one intra-op thread per rank.
 
     The ranks share the CPU, and one thread each keeps the step fast and its sums in
-    a fixed order.
+    a fixed order. The group's timeout ends a stuck collective after two minutes, so a
+    deadlock cannot hold the test job for the default half hour.
     """
     torch.set_num_threads(1)
     dist.init_process_group(
-        "gloo", rank=rank, world_size=world, init_method=f"tcp://127.0.0.1:{port}"
+        "gloo",
+        rank=rank,
+        world_size=world,
+        init_method=f"tcp://127.0.0.1:{port}",
+        timeout=timedelta(seconds=120),
     )
 
 
