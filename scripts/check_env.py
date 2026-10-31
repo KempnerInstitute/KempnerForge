@@ -19,9 +19,9 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import configparser
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -343,9 +343,8 @@ _MLFLOW_AUTH_ROUTES = (
     "SDK default profile ([__settings__] default_profile, else DEFAULT) and read only when no "
     "credential variable is set; (3) SDK OAuth, which a preflight cannot verify offline"
 )
-_PROFILE_HEADER = re.compile(r"\s*\[(?P<name>.+)\]")
 _SETTINGS_SECTION = "__settings__"
-_DEFAULT_PROFILE_KEY = re.compile(r"\s*default_profile\s*[=:]\s*(?P<name>.*)", re.IGNORECASE)
+_UNUSED_DEFAULT_SECTION = "\x00unused"
 
 _DATABRICKS_CREDENTIAL_VAR_AUTH: dict[str, str] = {
     "DATABRICKS_TOKEN": "pat",
@@ -391,45 +390,34 @@ def _selected_databricks_profile() -> str | None:
     return os.environ.get("DATABRICKS_CONFIG_PROFILE") or None
 
 
-def _default_databricks_profile() -> str:
-    """The SDK's default profile: a [__settings__] section's default_profile, else DEFAULT.
+def _read_databricks_config() -> tuple[frozenset[str], str, str | None]:
+    """The profiles ~/.databrickscfg offers, its default profile, and why it offers none.
 
-    Only that one key is parsed, in that one section, so no profile's values (the tokens) are
-    ever read. An unreadable file falls back to DEFAULT, which _profile_problem then reports.
+    Parsed with ConfigParser as the SDK parses it, so an indented line continues the value above
+    it rather than opening a section, and a file the SDK rejects is reported rather than passed.
+    A parse failure is named by exception class alone, because its text quotes the offending
+    line, which can be a token. ``[DEFAULT]`` is a profile only when it carries keys, and the
+    reserved ``[__settings__]`` section is never one.
     """
-    in_settings = False
+    parser = configparser.ConfigParser(default_section=_UNUSED_DEFAULT_SECTION)
     try:
         with (Path.home() / ".databrickscfg").open(encoding="utf-8", errors="replace") as f:
-            for line in f:
-                if header := _PROFILE_HEADER.match(line):
-                    in_settings = header["name"] == _SETTINGS_SECTION
-                elif (
-                    in_settings
-                    and (key := _DEFAULT_PROFILE_KEY.match(line))
-                    and (name := key["name"].strip())
-                ):
-                    return name
-    except OSError:
-        return "DEFAULT"
-    return "DEFAULT"
-
-
-def _profile_problem(profile: str) -> str | None:
-    """Why ~/.databrickscfg has no ``[profile]`` section, or None when it has one.
-
-    Only section headers are matched; keys and values (the tokens) are never parsed or kept.
-    """
-    try:
-        with (Path.home() / ".databrickscfg").open(encoding="utf-8", errors="replace") as f:
-            for line in f:
-                header = _PROFILE_HEADER.match(line)
-                if header and header["name"] == profile:
-                    return None
+            parser.read_file(f)
     except FileNotFoundError:
-        return "~/.databrickscfg not found"
+        return frozenset(), "DEFAULT", "~/.databrickscfg not found"
     except OSError as e:
-        return f"~/.databrickscfg unreadable: {e.strerror or type(e).__name__}"
-    return f"~/.databrickscfg has no [{profile}] section"
+        return (
+            frozenset(),
+            "DEFAULT",
+            f"~/.databrickscfg unreadable: {e.strerror or type(e).__name__}",
+        )
+    except configparser.Error as e:
+        return frozenset(), "DEFAULT", f"~/.databrickscfg is malformed ({type(e).__name__})"
+    profiles = {name for name in parser.sections() if name != _SETTINGS_SECTION}
+    if not parser.has_section("DEFAULT") or not parser.options("DEFAULT"):
+        profiles.discard("DEFAULT")
+    default = parser.get(_SETTINGS_SECTION, "default_profile", raw=True, fallback="").strip()
+    return frozenset(profiles), default or "DEFAULT", None
 
 
 def _databricks_env_credentials() -> tuple[str, ...]:
@@ -485,23 +473,28 @@ def check_mlflow(check_credentials: bool = False) -> CheckResult:
 
     ``check_credentials`` validates the resolved route through the SDK, naming a profile only
     when one is selected. It first exports DATABRICKS_TOKEN from DATABRICKS_API_TOKEN as the
-    backend does, so the probe authenticates the way the run will.
+    backend does, so the probe authenticates the way the run will. It is also the only way to
+    settle an environment route no offline evidence settles, so it runs even then.
     """
     selected = _selected_databricks_profile()
     env_credentials = () if selected else _databricks_env_credentials()
     if env_credentials:
         auth, reason = _databricks_env_auth()
-        if auth is None:
-            return CheckResult(
-                "mlflow",
-                WARN,
-                f"{', '.join(env_credentials)} set, so ~/.databrickscfg is not read, and the "
-                f"environment route is incomplete ({reason}); {_MLFLOW_AUTH_ROUTES}",
-            )
-        found = f"DATABRICKS_HOST + {auth} set"
+        unsettled = (
+            f"{', '.join(env_credentials)} set, so ~/.databrickscfg is not read, and the "
+            f"environment route is incomplete ({reason})"
+        )
+        if auth is None and not check_credentials:
+            return CheckResult("mlflow", WARN, f"{unsettled}; {_MLFLOW_AUTH_ROUTES}")
+        found = unsettled if auth is None else f"DATABRICKS_HOST + {auth} set"
     else:
-        profile = selected or _default_databricks_profile()
-        if problem := _profile_problem(profile):
+        profiles, default_profile, problem = _read_databricks_config()
+        profile = selected or default_profile
+        if profile == _SETTINGS_SECTION:
+            problem = f"[{_SETTINGS_SECTION}] is a reserved section name and cannot be a profile"
+        elif problem is None and profile not in profiles:
+            problem = f"~/.databrickscfg has no [{profile}] section"
+        if problem:
             return CheckResult(
                 "mlflow",
                 WARN,

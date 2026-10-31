@@ -709,16 +709,18 @@ class TestCheckMlflow:
         ids=["wrong-section", "empty-value", "left-the-section"],
     )
     def test_default_profile_outside_the_settings_section_is_ignored(self, home, text):
-        home.joinpath(".databrickscfg").write_text(text + "\n[DEFAULT]\nhost = h\n")
-        assert check_env._default_databricks_profile() == "DEFAULT"
+        home.joinpath(".databrickscfg").write_text(text)
+        assert check_env._read_databricks_config()[1] == "DEFAULT"
 
     def test_settings_default_profile_accepts_a_colon_delimiter(self, home):
         home.joinpath(".databrickscfg").write_text("[__settings__]\nDefault_Profile: work\n")
-        assert check_env._default_databricks_profile() == "work"
+        assert check_env._read_databricks_config()[1] == "work"
 
     def test_default_profile_falls_back_when_the_file_is_unreadable(self, home):
         (home / ".databrickscfg").mkdir()
-        assert check_env._default_databricks_profile() == "DEFAULT"
+        profiles, default, problem = check_env._read_databricks_config()
+        assert (profiles, default) == (frozenset(), "DEFAULT")
+        assert problem is not None and "unreadable" in problem
 
     def test_two_auth_methods_without_a_pin_are_a_warn(self, monkeypatch):
         """The SDK refuses to build a Config with more than one auth method configured."""
@@ -748,6 +750,77 @@ class TestCheckMlflow:
         r = check_env.check_mlflow()
         assert r.status == check_env.WARN
         assert f"DATABRICKS_AUTH_TYPE={pinned}" in r.message
+
+    def test_an_indented_section_inside_a_token_is_not_a_settings_section(self, home):
+        """ConfigParser continues the value above an indented line, and so does the check."""
+        home.joinpath(".databrickscfg").write_text(
+            "[DEFAULT]\nhost = h\ntoken = dapi-first-line\n"
+            "  [__settings__]\n  default_profile = dapi-secret-tail\n"
+        )
+        r = check_env.check_mlflow()
+        assert r.status == check_env.OK
+        assert "profile DEFAULT" in r.message
+        assert "dapi" not in r.message
+
+    def test_a_file_the_sdk_cannot_parse_is_a_warn_quoting_nothing_from_it(self, home):
+        home.joinpath(".databrickscfg").write_text(
+            "[__settings__]\ndefault_profile = alpha\n[__settings__]\ndefault_profile = beta\n"
+            "[alpha]\nhost = h\ntoken = dapi-secret\n"
+        )
+        r = check_env.check_mlflow()
+        assert r.status == check_env.WARN
+        assert "malformed (DuplicateSectionError)" in r.message
+        assert "dapi-secret" not in r.message
+        assert "alpha" not in r.message
+
+    def test_the_reserved_settings_section_is_not_a_default_profile(self, home):
+        home.joinpath(".databrickscfg").write_text(
+            "[__settings__]\ndefault_profile = __settings__\n[DEFAULT]\nhost = h\ntoken = t\n"
+        )
+        r = check_env.check_mlflow()
+        assert r.status == check_env.WARN
+        assert "reserved section name" in r.message
+
+    def test_the_reserved_settings_section_is_not_a_selected_profile(self, home, monkeypatch):
+        home.joinpath(".databrickscfg").write_text(
+            "[__settings__]\ndefault_profile = work\n[work]\nhost = h\ntoken = t\n"
+        )
+        monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", "__settings__")
+        r = check_env.check_mlflow()
+        assert r.status == check_env.WARN
+        assert "reserved section name" in r.message
+
+    def test_a_default_section_with_no_keys_is_not_a_profile(self, home):
+        """The SDK falls back to DEFAULT only when that section carries keys."""
+        home.joinpath(".databrickscfg").write_text("[DEFAULT]\n")
+        assert check_env.check_mlflow().status == check_env.WARN
+
+    def test_a_percent_in_a_token_is_not_read_as_an_interpolation(self, home):
+        home.joinpath(".databrickscfg").write_text("[DEFAULT]\nhost = h\ntoken = dapi-100%-of-it\n")
+        r = check_env.check_mlflow()
+        assert r.status == check_env.OK
+        assert "profile DEFAULT" in r.message
+
+    def test_an_environment_route_no_offline_evidence_settles_is_a_warn(self, home, monkeypatch):
+        monkeypatch.setenv("DATABRICKS_HOST", "https://x.cloud.databricks.com")
+        monkeypatch.setenv("ARM_CLIENT_ID", "an-id")
+        r = check_env.check_mlflow()
+        assert r.status == check_env.WARN
+        assert "~/.databrickscfg is not read" in r.message
+
+    def test_check_credentials_probes_an_environment_route_it_cannot_settle(
+        self, home, monkeypatch
+    ):
+        """Azure and the other routes a preflight cannot read are settled by the probe itself."""
+        (home / ".databrickscfg").write_text("[DEFAULT]\nhost = h\ntoken = t\n")
+        monkeypatch.setenv("DATABRICKS_HOST", "https://x.cloud.databricks.com")
+        monkeypatch.setenv("ARM_CLIENT_ID", "an-id")
+        monkeypatch.setenv("ARM_CLIENT_SECRET", "a-secret")
+        monkeypatch.setenv("ARM_TENANT_ID", "a-tenant")
+        seen: list[dict] = []
+        self._fake_sdk(monkeypatch, self._recording_client(seen))
+        assert check_env.check_mlflow(check_credentials=True).status == check_env.OK
+        assert seen == [{}]
 
     def test_check_credentials_does_not_force_a_profile_when_none_is_selected(
         self, home, monkeypatch
