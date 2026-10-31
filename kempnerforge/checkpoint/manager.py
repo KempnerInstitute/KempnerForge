@@ -677,10 +677,6 @@ class CheckpointManager:
             optim_state = get_optimizer_state_dict(self.model, self.checkpointed_optimizers)
             dcp_state["optimizer"] = optim_state
             dcp_state[_NEVER_STEPPED_KEY] = _never_stepped_record(optim_state)
-        # Dispatch the DCP save. For async modes this returns immediately but
-        # FIRST awaits the previous in-flight flush, so any deferred
-        # `_pending_finalize` from the prior save is now durable. For sync
-        # mode (disabled) dcp.save() blocks until THIS checkpoint is durable.
         flush_error = _attempt(self._async_ckpt.wait)
         error = flush_error
         if flush_error is None:
@@ -693,9 +689,6 @@ class CheckpointManager:
 
         sync_mode = self.config.async_mode == AsyncCheckpointMode.disabled
 
-        # The prior async checkpoint's flush has now ended (the wait above
-        # awaited it). Commit its `latest` symlink + cleanup before doing
-        # anything else.
         drain_error = self._drain_pending_finalize(overwriting=ckpt_dir, error=flush_error)
         if drain_error is not None:
             error = drain_error
