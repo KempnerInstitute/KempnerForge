@@ -751,6 +751,40 @@ class TestCheckMlflow:
         assert r.status == check_env.WARN
         assert f"DATABRICKS_AUTH_TYPE={pinned}" in r.message
 
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "[DEFAULT]\nhost = h\ntoken = {s}\n",
+            "[DEFAULT]\nhost = h\ntoken = head\n  [__settings__]\n  default_profile = {s}\n",
+            "[__settings__]\ndefault_profile = work\n  token = {s}\n[work]\nhost = h\n",
+            "[__settings__]\ndefault_profile =\n  token = {s}\n[DEFAULT]\nhost = h\n",
+            "[__settings__]\ndefault_profile = a\n[__settings__]\ndefault_profile = b\n"
+            "[a]\ntoken = {s}\n",
+            "[DEFAULT]\nhost = h\ntoken = {s}\n[DEFAULT]\ntoken = {s}\n",
+            "[a]\ntoken = {s}\n[a]\ntoken = {s}\n",
+            "{s}\n",
+            "[DEFAULT]\n{s}\n",
+            "[{s}]\nhost = h\n",
+        ],
+        ids=[
+            "plain-token",
+            "continued-into-a-settings-section",
+            "continued-under-default-profile",
+            "continued-under-an-empty-default-profile",
+            "duplicate-settings-section",
+            "duplicate-default-section",
+            "duplicate-profile-section",
+            "no-section-header",
+            "key-without-a-delimiter",
+            "section-name",
+        ],
+    )
+    def test_no_value_read_from_the_profile_file_reaches_the_message(self, home, text):
+        """Every line of the file can hold a token, so none of it is ever quoted back."""
+        secret = "dapi-never-quote-me"
+        home.joinpath(".databrickscfg").write_text(text.format(s=secret))
+        assert secret not in check_env.check_mlflow().message
+
     def test_an_indented_section_inside_a_token_is_not_a_settings_section(self, home):
         """ConfigParser continues the value above an indented line, and so does the check."""
         home.joinpath(".databrickscfg").write_text(
@@ -817,6 +851,25 @@ class TestCheckMlflow:
         assert r.status == check_env.WARN
         assert "spans more than one line" in r.message
         assert "dapi-secret" not in r.message
+
+    def test_an_empty_default_profile_continued_on_the_next_line_is_not_a_section_name(self, home):
+        """Stripping first would hide the continuation, leaving a token as the profile name."""
+        home.joinpath(".databrickscfg").write_text(
+            "[__settings__]\ndefault_profile =\n  token = dapi-secret\n[DEFAULT]\nhost = h\n"
+        )
+        r = check_env.check_mlflow()
+        assert r.status == check_env.WARN
+        assert "spans more than one line" in r.message
+        assert "dapi-secret" not in r.message
+
+    def test_a_default_section_whose_only_key_is_default_profile_is_still_a_profile(self, home):
+        """The SDK counts DEFAULT by its keys, default_profile among them."""
+        home.joinpath(".databrickscfg").write_text(
+            "[DEFAULT]\ndefault_profile = work\n[work]\nhost = h\n"
+        )
+        r = check_env.check_mlflow()
+        assert r.status == check_env.OK
+        assert "profile DEFAULT" in r.message
 
     def test_a_repeated_default_section_merges_as_the_sdk_merges_it(self, home):
         """ConfigParser takes a second [DEFAULT] as more keys, not a duplicate section."""

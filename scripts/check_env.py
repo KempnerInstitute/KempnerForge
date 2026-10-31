@@ -418,10 +418,10 @@ def _read_databricks_config() -> tuple[frozenset[str], str | None, str | None]:
     if parser.defaults():
         profiles.add("DEFAULT")
     parser.remove_option(parser.default_section, "default_profile")
-    default = parser.get(_SETTINGS_SECTION, "default_profile", raw=True, fallback="").strip()
+    default = parser.get(_SETTINGS_SECTION, "default_profile", raw=True, fallback="")
     if "\n" in default:
         return frozenset(profiles), None, None
-    return frozenset(profiles), default or "DEFAULT", None
+    return frozenset(profiles), default.strip() or "DEFAULT", None
 
 
 def _databricks_env_credentials() -> tuple[str, ...]:
