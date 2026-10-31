@@ -808,6 +808,42 @@ class TestCheckMlflow:
         assert r.status == check_env.WARN
         assert "~/.databrickscfg is not read" in r.message
 
+    def test_a_default_profile_spanning_more_than_one_line_is_not_a_section_name(self, home):
+        """Lines indented under default_profile continue its value and can be a token."""
+        home.joinpath(".databrickscfg").write_text(
+            "[__settings__]\ndefault_profile = work\n  token = dapi-secret\n[work]\nhost = h\n"
+        )
+        r = check_env.check_mlflow()
+        assert r.status == check_env.WARN
+        assert "spans more than one line" in r.message
+        assert "dapi-secret" not in r.message
+
+    def test_a_repeated_default_section_merges_as_the_sdk_merges_it(self, home):
+        """ConfigParser takes a second [DEFAULT] as more keys, not a duplicate section."""
+        home.joinpath(".databrickscfg").write_text("[DEFAULT]\nhost = h\n[DEFAULT]\ntoken = t\n")
+        r = check_env.check_mlflow()
+        assert r.status == check_env.OK
+        assert "profile DEFAULT" in r.message
+
+    def test_a_percent_in_a_default_profile_is_not_an_interpolation(self, home):
+        home.joinpath(".databrickscfg").write_text(
+            "[__settings__]\ndefault_profile = my%profile\n[my%profile]\nhost = h\n"
+        )
+        r = check_env.check_mlflow()
+        assert r.status == check_env.OK
+        assert "profile my%profile" in r.message
+
+    def test_a_default_profile_in_the_default_section_does_not_reach_the_settings_section(
+        self, home
+    ):
+        """ConfigParser propagates [DEFAULT] keys into every section; the SDK reads neither."""
+        home.joinpath(".databrickscfg").write_text(
+            "[DEFAULT]\nhost = h\ndefault_profile = work\n[__settings__]\n[work]\nhost = h\n"
+        )
+        r = check_env.check_mlflow()
+        assert r.status == check_env.OK
+        assert "profile DEFAULT" in r.message
+
     def test_check_credentials_probes_an_environment_route_it_cannot_settle(
         self, home, monkeypatch
     ):

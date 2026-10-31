@@ -344,7 +344,6 @@ _MLFLOW_AUTH_ROUTES = (
     "credential variable is set; (3) SDK OAuth, which a preflight cannot verify offline"
 )
 _SETTINGS_SECTION = "__settings__"
-_UNUSED_DEFAULT_SECTION = "\x00unused"
 
 _DATABRICKS_CREDENTIAL_VAR_AUTH: dict[str, str] = {
     "DATABRICKS_TOKEN": "pat",
@@ -390,16 +389,18 @@ def _selected_databricks_profile() -> str | None:
     return os.environ.get("DATABRICKS_CONFIG_PROFILE") or None
 
 
-def _read_databricks_config() -> tuple[frozenset[str], str, str | None]:
+def _read_databricks_config() -> tuple[frozenset[str], str | None, str | None]:
     """The profiles ~/.databrickscfg offers, its default profile, and why it offers none.
 
     Parsed with ConfigParser as the SDK parses it, so an indented line continues the value above
-    it rather than opening a section, and a file the SDK rejects is reported rather than passed.
-    A parse failure is named by exception class alone, because its text quotes the offending
-    line, which can be a token. ``[DEFAULT]`` is a profile only when it carries keys, and the
-    reserved ``[__settings__]`` section is never one.
+    it rather than opening a section, a repeated ``[DEFAULT]`` merges, and a file the SDK
+    rejects is reported rather than passed. A parse failure is named by exception class alone,
+    because its text quotes the offending line, which can be a token. ``[DEFAULT]`` is a profile
+    only when it carries keys, and the reserved ``[__settings__]`` section is never one. The
+    default profile is None when it spans more than one line, which no section name can, and it
+    is then never quoted back, because the lines under it can be a token.
     """
-    parser = configparser.ConfigParser(default_section=_UNUSED_DEFAULT_SECTION)
+    parser = configparser.ConfigParser()
     try:
         with (Path.home() / ".databrickscfg").open(encoding="utf-8", errors="replace") as f:
             parser.read_file(f)
@@ -414,9 +415,12 @@ def _read_databricks_config() -> tuple[frozenset[str], str, str | None]:
     except configparser.Error as e:
         return frozenset(), "DEFAULT", f"~/.databrickscfg is malformed ({type(e).__name__})"
     profiles = {name for name in parser.sections() if name != _SETTINGS_SECTION}
-    if not parser.has_section("DEFAULT") or not parser.options("DEFAULT"):
-        profiles.discard("DEFAULT")
+    if parser.defaults():
+        profiles.add("DEFAULT")
+    parser.remove_option(parser.default_section, "default_profile")
     default = parser.get(_SETTINGS_SECTION, "default_profile", raw=True, fallback="").strip()
+    if "\n" in default:
+        return frozenset(profiles), None, None
     return frozenset(profiles), default or "DEFAULT", None
 
 
@@ -490,7 +494,9 @@ def check_mlflow(check_credentials: bool = False) -> CheckResult:
     else:
         profiles, default_profile, problem = _read_databricks_config()
         profile = selected or default_profile
-        if profile == _SETTINGS_SECTION:
+        if profile is None:
+            problem = "the [__settings__] default_profile spans more than one line"
+        elif profile == _SETTINGS_SECTION:
             problem = f"[{_SETTINGS_SECTION}] is a reserved section name and cannot be a profile"
         elif problem is None and profile not in profiles:
             problem = f"~/.databrickscfg has no [{profile}] section"
