@@ -1,7 +1,9 @@
 """Rank-aware logging utilities for KempnerForge.
 
 Provides a simple logging setup that:
-- Only emits from rank 0 by default (avoids duplicate log lines)
+
+- Only emits from rank 0 by default (avoids duplicate log lines), except a
+  record logged with ``extra={"every_rank": True}``, which every rank emits
 - Supports color-coded output for key metrics
 - Integrates with Python's standard logging module
 """
@@ -64,13 +66,18 @@ class _RankFormatter(logging.Formatter):
 
 
 class _RankFilter(logging.Filter):
-    """Only allow log records from the specified rank."""
+    """Only allow log records from the specified rank, and records marked for every rank.
+
+    A record logged with ``extra={"every_rank": True}`` passes on every rank.
+    """
 
     def __init__(self, rank: int = 0) -> None:
         super().__init__()
         self.allowed_rank = rank
 
     def filter(self, record: logging.LogRecord) -> bool:
+        if getattr(record, "every_rank", False):
+            return True
         current_rank = int(os.environ.get("RANK", "0"))
         return current_rank == self.allowed_rank
 
@@ -104,7 +111,8 @@ def get_logger(name: str, rank_zero_only: bool = True) -> logging.Logger:
 
     Args:
         name: Logger name (typically __name__).
-        rank_zero_only: If True, only rank 0 emits logs.
+        rank_zero_only: If True, only rank 0 emits logs, except records logged
+            with ``extra={"every_rank": True}``, which every rank emits.
 
     Returns:
         A configured logging.Logger instance.

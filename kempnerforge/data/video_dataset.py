@@ -37,6 +37,7 @@ from kempnerforge.data.vlm_dataset import (
     DEFAULT_IMAGE_MEAN,
     DEFAULT_IMAGE_STD,
     _tokenize_and_mask,
+    check_prompt_fits,
     frames_to_clip_tensor,
     resolve_pad_id,
 )
@@ -81,6 +82,8 @@ class WebVidVideoDataset(VideoDataset):
         frame_size: Square pixel size per frame.
         max_samples: Cap the manifest (``0`` = all).
         prompt: Optional instruction prepended and masked from the loss.
+            Rejected here when it leaves no room in ``max_text_len`` for a
+            caption token (``check_prompt_fits``).
         image_mean / image_std: Per-channel normalization (SigLIP defaults).
     """
 
@@ -116,6 +119,8 @@ class WebVidVideoDataset(VideoDataset):
         )
         self._ids, self._caps = self._load_manifest(csv_dir, max_samples)
         self._tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+        if prompt:
+            check_prompt_fits(self._tokenizer, prompt, max_text_len)
         self._pad_id = resolve_pad_id(self._tokenizer)
         self._max_text_len = max_text_len
         self._max_frames = max_frames

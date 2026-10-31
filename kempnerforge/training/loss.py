@@ -16,17 +16,23 @@ import torch.nn.functional as F
 from kempnerforge.config.registry import registry
 
 
+def _zero_on_graph(logits: torch.Tensor) -> torch.Tensor:
+    """An exact float32 zero that stays on the autograd graph of ``logits``."""
+    return logits[..., :0].sum().float()
+
+
 @registry.register_loss("cross_entropy")
 def cross_entropy_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     """Standard cross-entropy loss for language modeling.
 
     Uses ``ignore_index=-100`` so packed-sequence boundary tokens (labeled -100
     by the dataset) are excluded from the loss. When no -100 labels are present,
-    this has zero overhead.
+    this has zero overhead. A batch with every label ``-100`` returns an exact
+    float32 zero that stays on the autograd graph of ``logits``.
     """
     flat_labels = labels.view(-1)
     if (flat_labels == -100).all():
-        return torch.tensor(0.0, device=logits.device, dtype=torch.float32)
+        return _zero_on_graph(logits)
     return F.cross_entropy(logits.view(-1, logits.size(-1)), flat_labels, ignore_index=-100)
 
 
@@ -45,7 +51,9 @@ def chunked_cross_entropy_loss(
     avoids that entirely.
 
     Uses ``ignore_index=-100`` so packed-sequence boundary tokens are excluded.
-    When no -100 labels are present, this has zero overhead.
+    When no -100 labels are present, this has zero overhead. A batch with every
+    label ``-100`` returns an exact float32 zero that stays on the autograd graph
+    of ``logits``.
 
     Note: the input logit tensor (B*S, V) is still fully materialized by the
     model's output head before reaching this function. For deeper savings
@@ -61,13 +69,13 @@ def chunked_cross_entropy_loss(
     flat_logits = logits.view(num_tokens, -1)
     flat_labels = labels.view(-1)
 
+    if (flat_labels == -100).all():
+        return _zero_on_graph(flat_logits)
     if num_tokens <= chunk_size:
         return F.cross_entropy(flat_logits, flat_labels, ignore_index=-100)
 
     # Count valid (non-masked) tokens for correct averaging with ignore_index
     valid_tokens = (flat_labels != -100).sum()
-    if valid_tokens == 0:
-        return torch.tensor(0.0, device=flat_logits.device, dtype=torch.float32)
 
     total_loss = torch.tensor(0.0, device=flat_logits.device, dtype=torch.float32)
     for i in range(0, num_tokens, chunk_size):
