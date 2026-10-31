@@ -779,11 +779,18 @@ class TestCheckMlflow:
             "section-name",
         ],
     )
-    def test_no_value_read_from_the_profile_file_reaches_the_message(self, home, text):
-        """Every line of the file can hold a token, so none of it is ever quoted back."""
+    def test_no_credential_in_the_profile_file_reaches_the_message(self, home, text):
+        """A credential can sit anywhere but the one field named for a profile, and is never
+        quoted back from any of them, however the parser surfaces it."""
         secret = "dapi-never-quote-me"
         home.joinpath(".databrickscfg").write_text(text.format(s=secret))
         assert secret not in check_env.check_mlflow().message
+
+    def test_the_settings_default_profile_is_named_in_the_message(self, home):
+        """That one field holds a profile name, which the docs say the check reads and which it
+        names so a missing section can be found; a credential does not belong in it."""
+        home.joinpath(".databrickscfg").write_text("[__settings__]\ndefault_profile = work\n")
+        assert "[work]" in check_env.check_mlflow().message
 
     def test_an_indented_section_inside_a_token_is_not_a_settings_section(self, home):
         """ConfigParser continues the value above an indented line, and so does the check."""
