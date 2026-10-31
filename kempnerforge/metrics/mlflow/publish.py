@@ -12,7 +12,7 @@ blocks on the server under MLflow's own HTTP timeout and retry settings, and
 authentication is whatever the MLflow client finds in the environment. It is an offline
 tool: call it from one process, never from the training step.
 
-Command line: ``python -m kempnerforge.metrics.publish <checkpoint_dir> --metrics <json>``.
+Command line: ``python -m kempnerforge.metrics.mlflow.publish <checkpoint_dir> --metrics <json>``.
 """
 
 from __future__ import annotations
@@ -33,7 +33,8 @@ from pathlib import Path
 from typing import Any
 
 from kempnerforge.metrics.logger import get_logger
-from kempnerforge.metrics.mlflow_models import find_or_create_checkpoint_model
+from kempnerforge.metrics.mlflow.auth import _prepare_databricks_auth
+from kempnerforge.metrics.mlflow.models import find_or_create_checkpoint_model
 
 logger = get_logger(__name__)
 
@@ -186,26 +187,6 @@ def read_mlflow_target(checkpoint_dir: str | os.PathLike[str]) -> MlflowTarget:
     )
 
 
-def _prepare_databricks_auth(tracking_uri: str) -> None:
-    """Prepare Databricks auth exactly as the training backend does.
-
-    Artifact clients build their own SDK config from the environment and never see the
-    tracking URI, so a ``databricks://<profile>`` URI selects that profile via
-    DATABRICKS_CONFIG_PROFILE (the profile is the first path segment; ``databricks://``
-    and the ``databricks://scope:prefix`` secret-scope form select nothing), and
-    DATABRICKS_API_TOKEN stands in for an unset or empty DATABRICKS_TOKEN. Non-empty
-    operator-set values always win.
-    """
-    if not tracking_uri.startswith("databricks"):
-        return
-    scheme, separator, rest = tracking_uri.partition("://")
-    profile = rest.partition("/")[0]
-    if scheme == "databricks" and separator and profile and ":" not in profile:
-        os.environ.setdefault("DATABRICKS_CONFIG_PROFILE", profile)
-    if not os.environ.get("DATABRICKS_TOKEN") and os.environ.get("DATABRICKS_API_TOKEN"):
-        os.environ["DATABRICKS_TOKEN"] = os.environ["DATABRICKS_API_TOKEN"]
-
-
 def _as_finite_float(value: object) -> float:
     """``value`` as a float; raises ValueError saying why it is not a finite number."""
     if isinstance(value, bool) or not isinstance(value, numbers.Real):
@@ -352,7 +333,7 @@ def _load_metrics_file(path: str) -> Any:
 def main(argv: Sequence[str] | None = None) -> int:
     """Command-line entry point; returns the exit code: 0 published, 2 refused, 1 failed."""
     parser = argparse.ArgumentParser(
-        prog="python -m kempnerforge.metrics.publish",
+        prog="python -m kempnerforge.metrics.mlflow.publish",
         description="Append eval metrics to the MLflow run recorded in a checkpoint's "
         "metadata.json, at the checkpoint's step.",
     )

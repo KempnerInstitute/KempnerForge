@@ -15,7 +15,7 @@ dependencies = [
     "datasets",
     "tokenizers",
     "torchao>=0.17.0",
-    # Databricks-hosted experiment tracking; lazy-imported in metrics/tracker.py.
+    # Databricks-hosted experiment tracking; lazy-imported in metrics/mlflow/.
     # mlflow-skinny = the tracking client (no pandas; it still pulls fastapi/uvicorn);
     # psutil+nvidia-ml-py = system metrics.
     "mlflow-skinny>=3.1",
