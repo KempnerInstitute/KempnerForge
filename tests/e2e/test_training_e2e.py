@@ -585,9 +585,15 @@ def test_step_zero_checkpoint_leaves_training_unchanged(tmp_path, name):
 
 @pytest.mark.e2e
 @requires_gpus(4)
-def test_pp_checkpoint_save_and_resume(tmp_path):
-    """4 GPU PP=2 + FSDP=2 — save checkpoint, resume, verify loss continuity."""
+@pytest.mark.parametrize(
+    ("pp", "layout"),
+    [(2, ["--distributed.dp_shard=2"]), (4, []), (2, ["--distributed.tp=2"])],
+    ids=["pp2-fsdp2", "pp4", "pp2-tp2"],
+)
+def test_pp_checkpoint_save_and_resume(tmp_path, pp, layout):
+    """4 GPU PP with FSDP, alone, or with TP: every stage saves a checkpoint, and it resumes."""
     ckpt_dir = str(tmp_path / "pp_ckpt")
+    parallelism = [f"--distributed.pp={pp}", *layout, f"--train.grad_accum_steps={pp}"]
 
     # Phase 1: Train 10 steps with PP, checkpoint at step 5
     result = _run_training(
@@ -595,9 +601,7 @@ def test_pp_checkpoint_save_and_resume(tmp_path):
             DEBUG_CONFIG,
             "--train.max_steps=10",
             "--metrics.log_interval=5",
-            "--distributed.pp=2",
-            "--distributed.dp_shard=2",
-            "--train.grad_accum_steps=2",
+            *parallelism,
             f"--checkpoint.dir={ckpt_dir}",
             "--checkpoint.interval=5",
         ],
@@ -606,6 +610,13 @@ def test_pp_checkpoint_save_and_resume(tmp_path):
     _assert_training_complete(result, expected_steps=10)
     output = result.stdout + result.stderr
     assert "Checkpoint committed" in output, "PP checkpoint was not saved"
+    step_dirs = list(Path(ckpt_dir).glob("step_*"))
+    assert {d.name for d in step_dirs} == {"step_5", "step_10"}
+    for step_dir in step_dirs:
+        stages = sorted(d.name for d in step_dir.iterdir() if d.is_dir())
+        assert stages == [f"pp{k}" for k in range(pp)], f"{step_dir}: {stages}"
+        missing = [s for s in stages if not (step_dir / s / ".metadata").is_file()]
+        assert not missing, f"{step_dir}: no .metadata in {missing}"
 
     # Verify loss is meaningful before resume
     loss_phase1 = _parse_last_loss(output)
@@ -619,9 +630,7 @@ def test_pp_checkpoint_save_and_resume(tmp_path):
             DEBUG_CONFIG,
             "--train.max_steps=15",
             "--metrics.log_interval=5",
-            "--distributed.pp=2",
-            "--distributed.dp_shard=2",
-            "--train.grad_accum_steps=2",
+            *parallelism,
             f"--checkpoint.dir={ckpt_dir}",
             "--checkpoint.interval=100",
         ],

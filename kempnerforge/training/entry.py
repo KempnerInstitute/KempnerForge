@@ -177,12 +177,10 @@ def build_checkpoint_manager(
     ckpt_pp_rank = None
     device_mesh = runtime.device_mesh
     if pipeline is not None and device_mesh is not None:
+        from kempnerforge.distributed.pipeline_parallel import build_stage_group
+
         ckpt_pp_rank = pipeline.rank
-        non_pp_dims = [d for d in device_mesh.mesh_dim_names if d != "pp"]  # type: ignore[reportOptionalIterable]
-        if len(non_pp_dims) == 1:
-            ckpt_pg = device_mesh[non_pp_dims[0]].get_group()
-        elif len(non_pp_dims) > 1:
-            ckpt_pg = device_mesh[tuple(non_pp_dims)].get_group()
+        ckpt_pg = build_stage_group(device_mesh)
     return CheckpointManager(
         config.checkpoint,
         model,

@@ -11,6 +11,7 @@ import shutil
 import stat
 import sys
 import threading
+from concurrent.futures import Future
 from pathlib import Path
 
 import numpy as np
@@ -1872,32 +1873,36 @@ class TestAsyncLatestSymlinkSafety:
 
     # --- coverage for the distributed barrier + resolution edge paths ---
 
-    def test_save_runs_barrier_when_distributed(self, tmp_path, monkeypatch):
+    @staticmethod
+    def _record_agreements(monkeypatch) -> list[object]:
+        """Run the manager's status agreement as a one-rank all-reduce, recording each one."""
+        groups: list[object] = []
+        monkeypatch.setattr("kempnerforge.checkpoint.manager.dist.is_initialized", lambda: True)
+        monkeypatch.setattr("kempnerforge.checkpoint.manager.dist.get_rank", lambda group=None: 0)
+        monkeypatch.setattr(
+            "kempnerforge.checkpoint.manager.dist.get_world_size", lambda group=None: 1
+        )
+        monkeypatch.setattr(
+            "kempnerforge.checkpoint.manager.dist.all_reduce",
+            lambda flags, group=None: groups.append(group),
+        )
+        return groups
+
+    def test_save_agrees_when_distributed(self, tmp_path, monkeypatch):
         from unittest.mock import MagicMock
 
         mgr = self._mgr(tmp_path, AsyncCheckpointMode.disabled)
         monkeypatch.setattr(mgr._async_ckpt, "save", MagicMock())
-        barriers = []
-        monkeypatch.setattr("kempnerforge.checkpoint.manager.dist.is_initialized", lambda: True)
-        monkeypatch.setattr(
-            "kempnerforge.checkpoint.manager.dist.barrier",
-            lambda *a, **k: barriers.append(True),
-        )
+        agreements = self._record_agreements(monkeypatch)
         mgr.save(step=1)
-        assert barriers, "save() did not barrier when distributed is initialized"
+        assert agreements, "save() did not agree with the other ranks when distributed"
 
-    def test_wait_and_flush_drain_and_barrier_when_distributed(self, tmp_path, monkeypatch):
+    def test_wait_and_flush_drain_and_agree_when_distributed(self, tmp_path, monkeypatch):
         mgr = self._mgr(tmp_path, AsyncCheckpointMode.async_pinned)
-        barriers = []
-        monkeypatch.setattr("kempnerforge.checkpoint.manager.dist.is_initialized", lambda: True)
-        monkeypatch.setattr(
-            "kempnerforge.checkpoint.manager.dist.barrier",
-            lambda *a, **k: barriers.append(True),
-        )
-        # No pending finalize: drain is a no-op, barrier still runs.
+        agreements = self._record_agreements(monkeypatch)
         mgr.wait()
         mgr.flush_pending_save()
-        assert len(barriers) == 2
+        assert len(agreements) == 2
 
     def test_newest_complete_none_when_base_dir_missing(self, tmp_path):
         mgr = self._mgr(tmp_path / "does_not_exist", AsyncCheckpointMode.async_pinned)
@@ -1915,6 +1920,149 @@ class TestAsyncLatestSymlinkSafety:
         # No complete checkpoint anywhere -> fallback is None -> resolved
         # is returned unchanged (caller then surfaces the real load error).
         assert mgr._resolve_dcp_load_dir(incomplete, None) == incomplete
+
+
+def _no_space(*args: object, **kwargs: object) -> None:
+    raise OSError(28, "No space left on device")
+
+
+class TestAFailedSaveCommitsNothing:
+    """A part of a save that raises reaches the caller, and that save is never committed."""
+
+    @staticmethod
+    def _mgr(tmp_path, mode):
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        model = torch.nn.Linear(4, 4)
+        opt = torch.optim.SGD(model.parameters(), lr=0.1)
+        return CheckpointManager(CheckpointConfig(dir=str(tmp_path), async_mode=mode), model, opt)
+
+    @staticmethod
+    def _flushes(monkeypatch, failure: BaseException | None = None) -> list[str]:
+        """Make each ``dcp.async_save`` a flush that has ended, failed with ``failure`` if given.
+
+        Returns the checkpoint ids the saves were dispatched to.
+        """
+        dispatched: list[str] = []
+
+        def async_save(state_dict, checkpoint_id, process_group=None):
+            dispatched.append(checkpoint_id)
+            flush: Future[None] = Future()
+            if failure is None:
+                flush.set_result(None)
+            else:
+                flush.set_exception(failure)
+            return flush
+
+        monkeypatch.setattr("kempnerforge.checkpoint.async_save.dcp.async_save", async_save)
+        return dispatched
+
+    def test_a_failed_shard_write_skips_the_train_state(self, tmp_path, monkeypatch):
+        mgr = self._mgr(tmp_path, AsyncCheckpointMode.disabled)
+        monkeypatch.setattr(mgr._async_ckpt, "save", _no_space)
+        with pytest.raises(OSError, match="No space left"):
+            mgr.save(step=1)
+        assert not (tmp_path / "step_1" / "train_state.pt").exists()
+        assert not (tmp_path / "latest").exists()
+
+    def test_a_dcp_failure_is_reported_to_the_other_ranks(self, tmp_path, monkeypatch):
+        """DCP's ``CheckpointException``, a ``BaseException``, still reaches the agreement."""
+        failure = dcp.CheckpointException("write failed", {})
+
+        def write(*args, **kwargs):
+            raise failure
+
+        mgr = self._mgr(tmp_path, AsyncCheckpointMode.disabled)
+        monkeypatch.setattr(mgr._async_ckpt, "save", write)
+        reported: list[list[int]] = []
+        monkeypatch.setattr("kempnerforge.checkpoint.manager.dist.is_initialized", lambda: True)
+        monkeypatch.setattr("kempnerforge.checkpoint.manager.dist.get_rank", lambda group=None: 0)
+        monkeypatch.setattr(
+            "kempnerforge.checkpoint.manager.dist.get_world_size", lambda group=None: 1
+        )
+        monkeypatch.setattr(
+            "kempnerforge.checkpoint.manager.dist.all_reduce",
+            lambda flags, group=None: reported.append(flags.tolist()),
+        )
+        with pytest.raises(dcp.CheckpointException) as raised:
+            mgr.save(step=1)
+        assert raised.value is failure
+        assert reported == [[1]]
+
+    @pytest.mark.parametrize(
+        "mode", [AsyncCheckpointMode.disabled, AsyncCheckpointMode.async_], ids=str
+    )
+    def test_a_failed_metadata_write_commits_nothing(self, tmp_path, monkeypatch, mode):
+        mgr = self._mgr(tmp_path, mode)
+        monkeypatch.setattr(mgr._async_ckpt, "save", lambda *a, **k: None)
+        monkeypatch.setattr(mgr._async_ckpt, "wait", lambda: None)
+        monkeypatch.setattr("kempnerforge.checkpoint.manager._replace_file", _no_space)
+        with pytest.raises(OSError, match="No space left"):
+            mgr.save(step=1)
+        mgr.wait()
+        assert not (tmp_path / "latest").exists()
+
+    def test_a_failed_commit_raises(self, tmp_path, monkeypatch):
+        mgr = self._mgr(tmp_path, AsyncCheckpointMode.disabled)
+        monkeypatch.setattr(mgr._async_ckpt, "save", lambda *a, **k: None)
+        monkeypatch.setattr(mgr, "_commit_latest", _no_space)
+        with pytest.raises(OSError, match="No space left"):
+            mgr.save(step=1)
+
+    @pytest.mark.parametrize("drain", ["wait", "flush_pending_save"])
+    def test_a_failed_flush_raises_and_commits_nothing(self, tmp_path, monkeypatch, drain):
+        mgr = self._mgr(tmp_path, AsyncCheckpointMode.async_)
+        monkeypatch.setattr(mgr._async_ckpt, "save", lambda *a, **k: None)
+        mgr.save(step=1)
+        monkeypatch.setattr(mgr._async_ckpt, "wait", _no_space)
+        with pytest.raises(OSError, match="No space left"):
+            getattr(mgr, drain)()
+        assert mgr._pending_finalize is None
+        assert not (tmp_path / "latest").exists()
+
+    def test_a_flush_that_failed_before_the_next_save_commits_nothing(self, tmp_path, monkeypatch):
+        mgr = self._mgr(tmp_path, AsyncCheckpointMode.async_)
+        dispatched = self._flushes(monkeypatch, OSError(28, "No space left on device"))
+        mgr.save(step=1)
+        with pytest.raises(OSError, match="No space left"):
+            mgr.save(step=2)
+        assert dispatched == [str(tmp_path / "step_1")]
+        assert mgr._pending_finalize is None
+        assert not (tmp_path / "latest").exists()
+        assert not (tmp_path / "step_2" / "train_state.pt").exists()
+
+    def test_a_save_that_fails_to_dispatch_still_commits_the_one_before(
+        self, tmp_path, monkeypatch
+    ):
+        """Staging step 2 fails after step 1's flush ended: only step 2 is dropped."""
+        mgr = self._mgr(tmp_path, AsyncCheckpointMode.async_)
+        self._flushes(monkeypatch)
+        mgr.save(step=1)
+        monkeypatch.setattr("kempnerforge.checkpoint.async_save.dcp.async_save", _no_space)
+        with pytest.raises(OSError, match="No space left"):
+            mgr.save(step=2)
+        assert (tmp_path / "latest").resolve() == (tmp_path / "step_1").resolve()
+        assert not (tmp_path / "step_2" / "train_state.pt").exists()
+        mgr.wait()
+        assert (tmp_path / "latest").resolve() == (tmp_path / "step_1").resolve()
+
+    @pytest.mark.parametrize(
+        "mode", [AsyncCheckpointMode.disabled, AsyncCheckpointMode.async_], ids=str
+    )
+    def test_a_pruning_error_once_latest_moved_fails_nothing(self, tmp_path, monkeypatch, mode):
+        """A checkpoint is committed once ``latest`` names it; pruning after that only warns."""
+        mgr = self._mgr(tmp_path, mode)
+        monkeypatch.setattr(mgr._async_ckpt, "save", lambda *a, **k: None)
+        monkeypatch.setattr(mgr, "_cleanup", _no_space)
+        warned: list[str] = []
+        monkeypatch.setattr(
+            "kempnerforge.checkpoint.manager.logger.warning",
+            lambda message, *args: warned.append(str(message)),
+        )
+        mgr.save(step=1)
+        mgr.wait()
+        assert (tmp_path / "latest").resolve() == (tmp_path / "step_1").resolve()
+        assert any("No space left" in message for message in warned), warned
 
 
 # ---------------------------------------------------------------------------
@@ -1942,9 +2090,11 @@ class TestSyncBarrierGroup:
         mgr = self._mgr(tmp_path)
         assert mgr._sync_group is None
 
-    def test_sync_barrier_noop_when_not_distributed(self, tmp_path):
-        # Must not raise when distributed is not initialized.
-        self._mgr(tmp_path)._sync_barrier()
+    def test_agree_without_a_process_group_raises_only_its_own_error(self, tmp_path):
+        mgr = self._mgr(tmp_path)
+        mgr._agree(None)
+        with pytest.raises(OSError, match="No space left"):
+            mgr._agree(OSError(28, "No space left on device"))
 
     def test_init_creates_dedicated_gloo_group(self, tmp_path, monkeypatch):
         import kempnerforge.checkpoint.manager as mgr_mod
@@ -1963,22 +2113,41 @@ class TestSyncBarrierGroup:
         assert calls["backend"] == "gloo"
         assert mgr._sync_group == "SENTINEL_GLOO_GROUP"
 
-    def test_sync_barrier_uses_dedicated_group_not_default(self, tmp_path, monkeypatch):
+    @staticmethod
+    def _four_ranks(monkeypatch, failing_elsewhere: list[int]) -> list[object]:
+        """Make this rank 0 of 4, with ``failing_elsewhere`` reporting a failure in the all-reduce.
+
+        Returns the groups the all-reduce was issued on.
+        """
         import kempnerforge.checkpoint.manager as mgr_mod
 
-        barrier_calls = []
+        groups: list[object] = []
+
+        def all_reduce(flags, group=None):
+            groups.append(group)
+            flags[failing_elsewhere] = 1
 
         monkeypatch.setattr(mgr_mod.dist, "is_initialized", lambda: True)
         monkeypatch.setattr(mgr_mod.dist, "new_group", lambda backend=None: "GLOO_PG")
-        monkeypatch.setattr(mgr_mod.dist, "get_rank", lambda: 0)
-        monkeypatch.setattr(mgr_mod.dist, "barrier", lambda group=None: barrier_calls.append(group))
+        monkeypatch.setattr(mgr_mod.dist, "get_rank", lambda group=None: 0)
+        monkeypatch.setattr(mgr_mod.dist, "get_world_size", lambda group=None: 4)
+        monkeypatch.setattr(mgr_mod.dist, "all_reduce", all_reduce)
+        return groups
 
-        mgr = self._mgr(tmp_path)
-        mgr._sync_barrier()
+    def test_agree_uses_dedicated_group_not_default(self, tmp_path, monkeypatch):
+        groups = self._four_ranks(monkeypatch, [])
+        self._mgr(tmp_path)._agree(None)
+        assert groups == ["GLOO_PG"]
 
-        # The barrier must target the dedicated gloo group, never the
-        # default group (group=None) that DCP's async thread uses.
-        assert barrier_calls == ["GLOO_PG"]
+    def test_agree_raises_on_every_rank_when_others_failed(self, tmp_path, monkeypatch):
+        self._four_ranks(monkeypatch, [1, 3])
+        with pytest.raises(RuntimeError, match=r"Checkpoint save failed on ranks \[1, 3\]"):
+            self._mgr(tmp_path)._agree(None)
+
+    def test_agree_reraises_this_ranks_own_error(self, tmp_path, monkeypatch):
+        self._four_ranks(monkeypatch, [2])
+        with pytest.raises(OSError, match="No space left"):
+            self._mgr(tmp_path)._agree(OSError(28, "No space left on device"))
 
 
 # ---------------------------------------------------------------------------

@@ -13,6 +13,8 @@ Entry points, all in
   `(start, end)` tuples, one per stage.
 - `build_stage_module(config, pp_rank, pp_size)` — instantiates a
   `PipelineStageModule` with only the params for this rank.
+- `build_stage_group(device_mesh)`: the process group of this rank's
+  stage, which checkpointing uses (see [Checkpointing](#checkpointing)).
 - `build_pipeline_stage(stage_module, ...)` — wraps it in
   `torch.distributed.pipelining.PipelineStage`.
 - `build_pipeline_schedule(stage, n_microbatches, loss_fn, schedule)`
@@ -176,19 +178,16 @@ extra all-gathers, pass it manually. See [FSDP2](fsdp2.md) — the
 
 ## Checkpointing
 
-DCP needs a process group scoped to ranks that share the **same
-parameters** — which is every non-PP mesh axis. `train.py` builds
-this with:
-
-```python
-non_pp_dims = [d for d in device_mesh.mesh_dim_names if d != "pp"]
-ckpt_pg = device_mesh[non_pp_dims[0]].get_group()  # 1D case
-# or a flat subgroup for multi-dim DP/TP/EP meshes
-```
-
-Each stage then saves its own DCP shard subdirectory
-(`checkpoints/step_N/stage_0/`, `stage_1/`, …) so different stages'
-files don't collide. See [Checkpointing](../checkpointing/index.md).
+Each stage saves a complete DCP checkpoint of its own into its own
+subdirectory (`checkpoints/step_N/pp0/`, `pp1/`, …), each with its own
+`.metadata`. DCP coordinates that save over the ranks that share the
+stage's parameters: every rank at the same `pp` coordinate, whatever
+the other mesh dimensions are, and the rank alone under pure PP.
+`build_checkpoint_manager` (in `training/entry.py`) gets the group
+from `build_stage_group(device_mesh)`. `torch.distributed.new_group`
+is collective over the default group, so every rank creates every
+stage's group, in stage order, and keeps the one that holds it. See
+[Checkpointing](../checkpointing/index.md).
 
 ## Config
 
