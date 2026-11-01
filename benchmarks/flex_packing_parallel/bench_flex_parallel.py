@@ -24,7 +24,7 @@ Two measurement choices that matter:
   counting them would inflate throughput by the TP degree and make TP look free.
   Pipeline ranks likewise share one global batch, split into microbatches.
 
-Usage (see ``run_bench.sbatch``)::
+Usage::
 
     MODE={fsdp,tp,tp_fsdp,pp} torchrun --nproc_per_node=4 bench_flex_parallel.py
 """
