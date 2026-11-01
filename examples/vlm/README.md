@@ -18,7 +18,8 @@ examples/vlm/
 ├── configs/              # TOML presets (below)
 ├── image_text/           # image-text dataset readers and chat renderer (below)
 ├── scripts/              # run-only utilities
-│   └── prep_vlm_coco.py  # COCO-Karpathy dataset prep
+│   ├── prep_vlm_coco.py  # COCO-Karpathy dataset prep
+│   └── convert_finevision_to_arrow.py  # FineVision parquet -> memory-mappable Arrow
 └── tests/
     ├── test_configs.py   # every preset loads and validates; the training entry point
     ├── image_text/       # reader and renderer tests (CPU)
@@ -158,6 +159,7 @@ recipe and renders them into the samples `VLMCollator` batches.
   ChartQA (human and augmented).
 - `pixmo.py`: PixMo captions, CapQA, pointing, counting and point-explanations;
   `points.py` writes the point answers.
+- `finevision.py`: FineVision subsets from their memory-mappable Arrow copy.
 - `render.py`: `ChatRenderer` applies the tokenizer's chat template (prompt then
   answer for single-turn rows, the full template for conversations) and trains only
   the assistant replies when `answer_only`. `RenderedDataset` draws one reference
@@ -165,7 +167,18 @@ recipe and renders them into the samples `VLMCollator` batches.
 
 Every sample carries one image, resized square to `image_size`, with no tiling or
 packing. PixMo-Count stores its points in pixels; they are converted to percent of
-the image, the unit the other PixMo sources use.
+the image, the unit the other PixMo sources use. `FineVisionArrow(max_images=1)`
+keeps only the rows with one image, using the per-row image counts `index.npz`
+stores; an index written without them takes the counts from `num_images`.
+
+Convert FineVision once:
+
+```bash
+uv run python examples/vlm/scripts/convert_finevision_to_arrow.py convert \
+    --src path-to-FineVision --dst path-to-FineVision-arrow --procs 8
+uv run python examples/vlm/scripts/convert_finevision_to_arrow.py index \
+    --src path-to-FineVision --dst path-to-FineVision-arrow
+```
 
 ## Start from a pretrained backbone
 
