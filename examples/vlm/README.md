@@ -156,13 +156,16 @@ recipe and renders them into the samples `VLMCollator` batches.
 
 - `testbed.py`: COCO Karpathy captions, VQAv2 (LAVIS layout), TextVQA, DocVQA and
   ChartQA (human and augmented).
+- `pixmo.py`: PixMo captions, CapQA, pointing, counting and point-explanations;
+  `points.py` writes the point answers.
 - `render.py`: `ChatRenderer` applies the tokenizer's chat template (prompt then
   answer for single-turn rows, the full template for conversations) and trains only
   the assistant replies when `answer_only`. `RenderedDataset` draws one reference
   answer per turn from a seed and the row index, so a resume draws the same answers.
 
 Every sample carries one image, resized square to `image_size`, with no tiling or
-packing.
+packing. PixMo-Count stores its points in pixels; they are converted to percent of
+the image, the unit the other PixMo sources use.
 
 ## Start from a pretrained backbone
 
