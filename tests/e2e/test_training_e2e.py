@@ -29,6 +29,7 @@ from pathlib import Path
 
 import pytest
 
+from kempnerforge.training.optimizer import registry
 from tests.e2e.conftest import requires_gpus
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -234,19 +235,37 @@ def test_pipeline_parallel(tmp_path):
 
 @pytest.mark.e2e
 @requires_gpus(4)
-def test_fp16_mixed_precision(tmp_path):
-    """4 GPU FSDP with fp16 — verifies param_dtype config path."""
+def test_fp32_mixed_precision(tmp_path: Path) -> None:
+    """4 GPU FSDP with fp32, which checks a non-bf16 param_dtype end to end."""
     result = _run_training(
         [
             DEBUG_CONFIG,
             "--train.max_steps=10",
             "--metrics.log_interval=5",
-            "--train.mixed_precision=fp16",
+            "--train.mixed_precision=fp32",
             f"--checkpoint.dir={tmp_path}/ckpt",
         ],
         nproc=4,
     )
     _assert_training_complete(result, expected_steps=10)
+
+
+@pytest.mark.e2e
+def test_fp16_mixed_precision_rejected_at_launch(tmp_path: Path) -> None:
+    """There is no loss scaling, so fp16 fails at config load, before any GPU work."""
+    result = _run_training(
+        [
+            DEBUG_CONFIG,
+            "--train.max_steps=10",
+            "--train.mixed_precision=fp16",
+            f"--checkpoint.dir={tmp_path}/ckpt",
+        ],
+        nproc=1,
+    )
+    output = result.stdout + result.stderr
+    assert result.returncode != 0, f"fp16 run was not rejected:\n{output[-2000:]}"
+    assert "ValueError: train.mixed_precision='fp16' is not supported" in output, output[-2000:]
+    assert "Training complete" not in output
 
 
 # ============================================================================
@@ -384,7 +403,7 @@ def test_checkpoint_save_and_resume(tmp_path):
     )
     _assert_training_complete(result, expected_steps=10)
     output = result.stdout + result.stderr
-    assert "Checkpoint saved" in output, "Checkpoint was not saved"
+    assert "Checkpoint committed" in output, "Checkpoint was not saved"
 
     # Phase 2: Resume — should pick up from step 10, train to step 15
     result = _run_training(
@@ -488,33 +507,75 @@ def _check_resume_determinism(tmp_path, nproc: int, overrides: tuple[str, ...] =
         )
 
 
+_MUON_OVERRIDES = ("--optimizer.name=muon", "--optimizer.lr=0.02", "--model.vocab_size=4096")
+_RESUMABLE_OPTIMIZERS = [
+    pytest.param(
+        name, marks=pytest.mark.xfail(strict=True, reason="#236: schedule_free_adamw cannot resume")
+    )
+    if name == "schedule_free_adamw"
+    else name
+    for name in sorted(registry.list("optimizer"))
+]
+
+
+def _optimizer_overrides(name: str) -> tuple[str, ...]:
+    """Overrides that train with the registered optimizer ``name``."""
+    return _MUON_OVERRIDES if name == "muon" else (f"--optimizer.name={name}",)
+
+
 @pytest.mark.e2e
-def test_resume_determinism_single_gpu(tmp_path):
+@pytest.mark.parametrize("name", _RESUMABLE_OPTIMIZERS)
+def test_resume_determinism_single_gpu(tmp_path, name):
     """Single GPU: resumed run must match the uninterrupted reference bit-for-bit."""
-    _check_resume_determinism(tmp_path, nproc=1)
+    _check_resume_determinism(tmp_path, nproc=1, overrides=_optimizer_overrides(name))
 
 
 @pytest.mark.e2e
 @requires_gpus(2)
-def test_resume_determinism_2gpu_fsdp(tmp_path):
+@pytest.mark.parametrize("name", _RESUMABLE_OPTIMIZERS)
+def test_resume_determinism_2gpu_fsdp(tmp_path, name):
     """2 GPU FSDP: resumed run must match the uninterrupted reference bit-for-bit."""
-    _check_resume_determinism(tmp_path, nproc=2)
-
-
-_MUON_RESUME_OVERRIDES = ("--optimizer.name=muon", "--optimizer.lr=0.02", "--model.vocab_size=4096")
+    _check_resume_determinism(tmp_path, nproc=2, overrides=_optimizer_overrides(name))
 
 
 @pytest.mark.e2e
-def test_resume_determinism_muon_single_gpu(tmp_path):
-    """Single GPU Muon: the inner AdamW must resume bit-for-bit too."""
-    _check_resume_determinism(tmp_path, nproc=1, overrides=_MUON_RESUME_OVERRIDES)
+@pytest.mark.parametrize("name", sorted(registry.list("optimizer")))
+def test_step_zero_checkpoint_leaves_training_unchanged(tmp_path, name):
+    """A run that checkpoints at step 0 must log the same losses as one that does not."""
+    overrides = _optimizer_overrides(name)
+    data_dir = _make_learnable_shard(tmp_path)
+    common = [
+        DEBUG_CONFIG,
+        "--metrics.log_interval=1",
+        "--train.seed=1234",
+        "--train.compile_model=false",
+        "--train.max_steps=10",
+        "--scheduler.warmup_steps=0",
+        "--model.vocab_size=256",
+        f"--data.dataset_path={data_dir}",
+        "--data.file_pattern=*.npy",
+        *overrides,
+    ]
+    plain = _run_training(common + [f"--checkpoint.dir={tmp_path}/plain"], timeout=300)
+    _assert_training_complete(plain, expected_steps=10)
+    windowed = _run_training(
+        common
+        + [
+            f"--checkpoint.dir={tmp_path}/windowed",
+            "--checkpoint.dyn_ckpt_window.start=0",
+            "--checkpoint.dyn_ckpt_window.stop=8",
+        ],
+        timeout=300,
+    )
+    _assert_training_complete(windowed, expected_steps=10)
+    assert (tmp_path / "windowed" / "step_0").is_dir(), "the window did not save step 0"
 
-
-@pytest.mark.e2e
-@requires_gpus(2)
-def test_resume_determinism_muon_2gpu_fsdp(tmp_path):
-    """2 GPU FSDP Muon: the inner AdamW must resume bit-for-bit too."""
-    _check_resume_determinism(tmp_path, nproc=2, overrides=_MUON_RESUME_OVERRIDES)
+    plain_losses = _parse_losses_by_step(plain.stdout + plain.stderr)
+    windowed_losses = _parse_losses_by_step(windowed.stdout + windowed.stderr)
+    assert len(plain_losses) == 10, f"expected 10 logged steps, got {sorted(plain_losses)}"
+    assert windowed_losses == plain_losses, (
+        "saving at step 0 changed the losses -- the save left optimizer state behind"
+    )
 
 
 # ============================================================================
@@ -544,7 +605,7 @@ def test_pp_checkpoint_save_and_resume(tmp_path):
     )
     _assert_training_complete(result, expected_steps=10)
     output = result.stdout + result.stderr
-    assert "Checkpoint saved" in output, "PP checkpoint was not saved"
+    assert "Checkpoint committed" in output, "PP checkpoint was not saved"
 
     # Verify loss is meaningful before resume
     loss_phase1 = _parse_last_loss(output)
@@ -620,7 +681,9 @@ def test_sigterm_triggers_emergency_checkpoint(tmp_path):
 
     output = stdout + stderr
     assert "Shutdown requested" in output, f"Signal handler did not trigger:\n{output[-2000:]}"
-    assert "Checkpoint saved" in output, f"Emergency checkpoint was not saved:\n{output[-2000:]}"
+    assert "Checkpoint committed" in output, (
+        f"Emergency checkpoint was not saved:\n{output[-2000:]}"
+    )
 
 
 @pytest.mark.e2e
@@ -730,7 +793,7 @@ def test_moe_checkpoint_resume(tmp_path):
     )
     _assert_training_complete(result, expected_steps=10)
     output = result.stdout + result.stderr
-    assert "Checkpoint saved" in output, "MoE checkpoint was not saved"
+    assert "Checkpoint committed" in output, "MoE checkpoint was not saved"
 
     # Phase 2: Resume from checkpoint, train to step 15
     result = _run_training(

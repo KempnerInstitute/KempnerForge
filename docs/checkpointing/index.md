@@ -22,9 +22,56 @@ contains two kinds of state:
 | File(s) | Contents | Format |
 |---------|----------|--------|
 | DCP shards (`.distcp` + `.metadata`) | Model + optimizer state, one shard per rank | [DCP § Model + optimizer](dcp-model.md) |
-| `train_state.pt` | step, tokens_seen, scheduler, RNG, extras (e.g. `phase_idx`, `wandb_run_id`) | [Train state](train-state.md) |
-| `metadata.json` | Human-readable `{"step": N, "tokens_seen": M}` | Plain JSON |
+| `train_state.pt` | step, tokens_seen, scheduler, RNG, extras (e.g. `phase_idx`, `wandb_run_id`, `mlflow_run_id`) | [Train state](train-state.md) |
+| `metadata.json` | Human-readable `{"step": N, "tokens_seen": M}`, plus the logging runs live at save time | Plain JSON, see below |
 | `latest` symlink | Points at the most recent `step_N` (updated atomically) | [Auto-resume](auto-resume.md) |
+
+## `metadata.json`
+
+Written by rank 0 beside `train_state.pt`, and readable with a plain `json.load` (no torch).
+It holds `step` and `tokens_seen` (VLM runs add `vlm_freeze`). When a logging backend has a
+live run at save time it also holds a `tracking` list, one entry per backend:
+
+```json
+{
+  "step": 1000,
+  "tokens_seen": 4096000,
+  "tracking": [
+    {"backend": "wandb", "run_id": "<run id>", "experiment": "<project>",
+     "entity": "<entity>", "url": "<run url>"},
+    {"backend": "tensorboard", "log_dir": "tb_logs"},
+    {"backend": "mlflow", "run_id": "<run id>", "experiment": "<experiment>",
+     "tracking_uri": "<tracking uri>"}
+  ]
+}
+```
+
+- Each backend describes its own run, as it knows it: the resolved tracking URI and the
+  experiment name for MLflow, the project for wandb, the writer's directory for TensorBoard.
+  `entity` and `url` appear when the wandb run has them (an offline run has no URL). The
+  MLflow entry always has all four fields shown. With
+  [checkpoint registration](../metrics-and-profiling/mlflow.md#registering-checkpoints) on it
+  also has `model_name`, and gets `model_id` once the committed checkpoint is registered.
+  Every write of `metadata.json` replaces the file atomically, so a reader never sees a
+  partial one.
+- A backend contributes only while its run is live, and runs start on the first log. A
+  checkpoint saved before that (step 0, or soon after a resume when `checkpoint.interval` is
+  shorter than `metrics.log_interval`) lacks the entry, and the key is omitted when no backend
+  is live.
+- The training entry hands `CheckpointManager.set_tracking_source` the tracker's
+  [`tracking_entries`](../metrics-and-profiling/metrics-tracker.md#tracking-entries), which
+  `save()` reads on rank 0, and `set_checkpoint_registrar` the tracker itself
+  ([Registering checkpoints](../metrics-and-profiling/metrics-tracker.md#registering-checkpoints)).
+  A source that raises, or returns what JSON cannot hold, costs the `tracking` key with a
+  warning, never the save; a registrar that fails costs only its fields or its registration.
+- Values are recorded as resolved. Credentials embedded in the tracking URI
+  (`scheme://user:token@host`) are stripped at write time; authentication comes from the
+  environment, a profile or OAuth, never from this file. The URI, experiment path and run ids
+  remain, so drop the `tracking` key before sharing a checkpoint outside your team.
+- The key is additive. Older checkpoints lack it, nothing on the resume path reads it, and run
+  ids still resume from `train_state.pt`. Offline tools read it:
+  [`kempnerforge.metrics.publish`](../metrics-and-profiling/mlflow.md#publishing-eval-results)
+  appends eval metrics to the MLflow run its `mlflow` entry names.
 
 ## Key modules
 

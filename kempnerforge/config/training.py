@@ -9,6 +9,12 @@ from typing import TYPE_CHECKING, Literal
 if TYPE_CHECKING:
     import torch
 
+_FP16_UNSUPPORTED = (
+    "train.mixed_precision='fp16' is not supported: it would train in pure fp16 "
+    "with no loss scaling, so small gradients underflow to zero. Use 'bf16', or "
+    "'fp32' on GPUs without bf16."
+)
+
 
 class ActivationCheckpointing(StrEnum):
     none = "none"
@@ -18,7 +24,12 @@ class ActivationCheckpointing(StrEnum):
 
 @dataclass
 class TrainConfig:
-    """Training hyperparameters."""
+    """Training hyperparameters.
+
+    ``"fp16"`` stays in the ``mixed_precision`` ``Literal`` only so the config loader
+    passes it on to ``__post_init__``, which rejects it with the reason; without it the
+    loader would fail first with a generic Literal error.
+    """
 
     batch_size: int = 8  # Per-device micro-batch size
     seq_len: int = 2048
@@ -47,18 +58,23 @@ class TrainConfig:
             raise ValueError("grad_accum_steps must be positive")
         if self.grad_clip_norm <= 0:
             raise ValueError("grad_clip_norm must be positive")
+        if self.mixed_precision == "fp16":
+            raise ValueError(_FP16_UNSUPPORTED)
 
     @property
     def param_dtype(self) -> torch.dtype:
         """Resolve mixed_precision to the master weight dtype.
 
         FP8 uses bf16 master weights -- FP8 is a compute mode, not a storage dtype.
+        A config switched to ``"fp16"`` after construction skips ``__post_init__``,
+        so ``"fp16"`` raises the same ``ValueError`` here.
         """
         import torch
 
+        if self.mixed_precision == "fp16":
+            raise ValueError(_FP16_UNSUPPORTED)
         _DTYPE_MAP = {
             "bf16": torch.bfloat16,
-            "fp16": torch.float16,
             "fp32": torch.float32,
             "fp8": torch.bfloat16,  # FP8 compute with bf16 master weights
         }

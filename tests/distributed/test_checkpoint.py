@@ -17,6 +17,7 @@ import torch.distributed as dist
 
 from kempnerforge.checkpoint import manager as mgr_mod
 from kempnerforge.checkpoint.manager import CheckpointManager
+from kempnerforge.config.registry import registry
 from kempnerforge.config.schema import AsyncCheckpointMode, CheckpointConfig, ModelConfig
 from kempnerforge.distributed.parallel import apply_fsdp2
 from kempnerforge.model.transformer import Transformer
@@ -28,6 +29,18 @@ pytestmark = pytest.mark.skipif(
 )
 
 SMALL_CONFIG = ModelConfig(dim=128, n_layers=2, n_heads=2, vocab_size=512, max_seq_len=64)
+REGISTERED_OPTIMIZERS = sorted(registry.list("optimizer"))
+RESUMABLE_OPTIMIZERS = [
+    pytest.param(
+        name,
+        marks=pytest.mark.xfail(
+            raises=ZeroDivisionError, strict=True, reason="#236: schedule_free_adamw cannot resume"
+        ),
+    )
+    if name == "schedule_free_adamw"
+    else name
+    for name in REGISTERED_OPTIMIZERS
+]
 
 # Shared filesystem temp directory (visible to all nodes)
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -53,6 +66,27 @@ def shared_tmp_dir():
     dist.barrier()
     if rank == 0:
         shutil.rmtree(d, ignore_errors=True)
+
+
+def _assert_same_local_state_dict(expected, actual, where="state_dict"):
+    """Assert two optimizer ``state_dict()``s hold the same values, local shards bit for bit."""
+    from torch.distributed.tensor import DTensor
+
+    if isinstance(expected, torch.Tensor):
+        assert isinstance(actual, torch.Tensor), where
+        if isinstance(expected, DTensor):
+            expected, actual = expected.to_local(), actual.to_local()
+        assert torch.equal(expected, actual), where
+    elif isinstance(expected, dict):
+        assert expected.keys() == actual.keys(), f"{where}: keys {set(expected) ^ set(actual)}"
+        for key in expected:
+            _assert_same_local_state_dict(expected[key], actual[key], f"{where}[{key!r}]")
+    elif isinstance(expected, list | tuple):
+        assert len(expected) == len(actual), f"{where}: lengths differ"
+        for i, (e, a) in enumerate(zip(expected, actual, strict=True)):
+            _assert_same_local_state_dict(e, a, f"{where}[{i}]")
+    else:
+        assert expected == actual, f"{where}: {expected!r} != {actual!r}"
 
 
 class TestCheckpointRoundTrip:
@@ -256,6 +290,93 @@ class TestCheckpointRoundTrip:
             for (name, r), (_, t) in zip(ref, loaded[what], strict=True):
                 assert torch.equal(r, t), f"{what} {name} not restored bit-exactly"
 
+    @pytest.mark.parametrize("name", REGISTERED_OPTIMIZERS)
+    def test_save_before_the_first_step_leaves_the_run_unchanged(
+        self, distributed_env, shared_tmp_dir, name
+    ):
+        """A sharded step-0 save and its resume must train like a run that never saved."""
+        from torch.distributed.tensor import DTensor
+
+        from kempnerforge.config.schema import OptimizerConfig
+
+        def build():
+            torch.manual_seed(42)
+            model = Transformer(SMALL_CONFIG).cuda()
+            apply_fsdp2(model, distributed_env)
+            return model, build_optimizer(model, OptimizerConfig(name=name, lr=1e-3))
+
+        def train(model, opt):
+            gen = torch.Generator(device="cuda").manual_seed(7 + dist.get_rank())
+            for _ in range(3):
+                tokens = torch.randint(0, 512, (2, 32), device="cuda", generator=gen)
+                model(tokens).sum().backward()
+                opt.step()
+                opt.zero_grad()
+            return [
+                (p.to_local() if isinstance(p, DTensor) else p).detach().clone()
+                for p in model.parameters()
+            ]
+
+        reference = train(*build())
+
+        config = CheckpointConfig(dir=shared_tmp_dir, keep_last_n=2)
+        model, opt = build()
+        manager = CheckpointManager(config, model, opt)
+        manager.save(step=0)
+        assert not any(o.state for o in manager.checkpointed_optimizers), (
+            "the save left the getter's dummy state in an optimizer"
+        )
+        saved = train(model, opt)
+
+        model2, opt2 = build()
+        CheckpointManager(config, model2, opt2).load()
+        resumed = train(model2, opt2)
+
+        for ref, a, b in zip(reference, saved, resumed, strict=True):
+            assert torch.equal(ref, a), "saving at step 0 changed the run"
+            assert torch.equal(ref, b), "resuming from the step-0 checkpoint changed the run"
+
+    @pytest.mark.parametrize("name", RESUMABLE_OPTIMIZERS)
+    def test_resume_restores_the_optimizer_exactly(self, distributed_env, shared_tmp_dir, name):
+        """FSDP2 resume restores the optimizer state bit for bit and continues the run exactly."""
+        from torch.distributed.tensor import DTensor
+
+        from kempnerforge.config.schema import OptimizerConfig
+
+        def build(seed):
+            torch.manual_seed(seed)
+            model = Transformer(SMALL_CONFIG).cuda()
+            apply_fsdp2(model, distributed_env)
+            return model, build_optimizer(model, OptimizerConfig(name=name, lr=1e-3))
+
+        def train(model, opt, segment):
+            for tokens in segment:
+                model(tokens).sum().backward()
+                opt.step()
+                opt.zero_grad()
+
+        def local_params(model):
+            return [p.to_local() if isinstance(p, DTensor) else p for p in model.parameters()]
+
+        gen = torch.Generator(device="cuda").manual_seed(7 + dist.get_rank())
+        batches = [torch.randint(0, 512, (2, 32), device="cuda", generator=gen) for _ in range(4)]
+        reference, ref_opt = build(seed=42)
+        train(reference, ref_opt, batches)
+
+        config = CheckpointConfig(dir=shared_tmp_dir, keep_last_n=2)
+        model, opt = build(seed=42)
+        train(model, opt, batches[:2])
+        CheckpointManager(config, model, opt).save(step=2)
+
+        model2, opt2 = build(seed=7)
+        CheckpointManager(config, model2, opt2).load()
+        _assert_same_local_state_dict(opt.state_dict(), opt2.state_dict(), "after the load")
+        train(model2, opt2, batches[2:])
+
+        _assert_same_local_state_dict(ref_opt.state_dict(), opt2.state_dict())
+        for ref, p in zip(local_params(reference), local_params(model2), strict=True):
+            assert torch.equal(ref, p), "the resumed run diverged from the uninterrupted one"
+
     def test_latest_symlink(self, distributed_env, shared_tmp_dir):
         """The 'latest' symlink should point to the most recent checkpoint."""
         mesh = distributed_env
@@ -331,6 +452,25 @@ class TestCheckpointSaveBarrier:
         assert (step_dir / "metadata.json").exists(), (
             f"rank {rank}: metadata.json not visible after save()"
         )
+
+    def test_a_failed_cleanup_does_not_hang_save(self, distributed_env, shared_tmp_dir):
+        """A checkpoint rank 0 cannot remove must not stop the save the other ranks wait on."""
+        import errno
+
+        from kempnerforge.config.schema import OptimizerConfig
+
+        model = Transformer(SMALL_CONFIG).cuda()
+        apply_fsdp2(model, distributed_env)
+        opt = build_optimizer(model, OptimizerConfig(lr=1e-3, fused=False))
+        mgr = CheckpointManager(CheckpointConfig(dir=shared_tmp_dir, keep_last_n=1), model, opt)
+
+        busy = OSError(errno.ENOTEMPTY, "Directory not empty")
+        with patch.object(mgr_mod.shutil, "rmtree", side_effect=busy):
+            mgr.save(step=1)
+            mgr.save(step=2)
+
+        if dist.get_rank() == 0:
+            assert (Path(shared_tmp_dir) / "step_1").is_dir(), "the failed removal deleted step_1"
 
 
 class TestCheckpointLoadDivergentExistence:

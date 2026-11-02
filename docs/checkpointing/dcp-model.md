@@ -41,7 +41,8 @@ Three top-level keys. DCP introspects the state dicts, finds
 with enough metadata to reassemble. The third is empty whenever every
 parameter has optimizer state, and an empty entry writes no key at all,
 so an ordinary run's checkpoints keep the two-key shape any reader
-already expects.
+already expects. A save before the first optimizer step writes the model
+alone (see below).
 
 What's in each:
 
@@ -60,6 +61,21 @@ What's in each:
   is nothing to save for those, and once the checkpoint is written
   that is indistinguishable from state that went missing. The record
   keeps the distinction for the load — see [Loading](#loading).
+
+Before the first optimizer step (the step-0 checkpoint of a
+`dyn_ckpt_window` from step 0) none of the `checkpointed_optimizers`
+holds state, so the save writes neither the optimizer nor the record.
+There is nothing to save then, and reading the optimizer would create
+state: `get_optimizer_state_dict` first gives an optimizer that holds
+none a dummy `lr=0` step, which leaves AdamW one step ahead in its bias
+correction and makes `ScheduleFreeAdamW` divide by zero. A load that
+finds no optimizer in a checkpoint — this one, or one holding model
+weights alone — loads it like a pretrained model: the weights and train
+state, with every checkpointed optimizer reset to its freshly built
+state. It reads that from the DCP metadata before building any optimizer
+template, so no optimizer takes the dummy step. Past step 0 it warns,
+because the run's optimizer moments are then missing and the resume
+does not continue it exactly.
 
 Not in the DCP shard: scheduler, dataloader, RNG, and training
 metadata. Those go in `train_state.pt` alongside —
@@ -243,6 +259,17 @@ a never-stepped parameter in one of those still fails the load. Start
 from it with `[checkpoint].load_path` and
 `exclude_from_loading = ["optimizer"]`, which restores the weights and
 begins with a fresh optimizer.
+
+The template also holds every param-group key the optimizer has now,
+and DCP requires each one. An optimizer whose param groups gained a key
+after its checkpoints were first written lists it in
+`LEGACY_GROUP_DEFAULTS`, with the value those checkpoints were trained
+with: Muon lists `orthogonalize` as `"local"`, `nesterov` as `False` and
+`adjust_lr` as `"original"`, the update it made before those options
+existed. Where a checkpoint lacks a listed key, the load drops it
+from the template, the optimizer fills in the listed value as it loads
+the groups, and the manager logs it. A checkpoint that lacks any other
+key still fails the load.
 
 Loading with a different GPU count triggers DCP's automatic
 resharding — see [Resharding](resharding.md).

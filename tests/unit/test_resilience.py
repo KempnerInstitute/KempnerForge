@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import signal
+import threading
 
 import torch
 
@@ -88,14 +89,33 @@ class TestShutdownHandler:
         assert handler._timer.daemon
         handler.finish()
 
-    def test_multiple_signals_idempotent(self):
-        handler = ShutdownHandler(timeout_sec=0)
+    def test_multiple_signals_idempotent(self, monkeypatch):
+        """A second SIGTERM changes nothing: same request, same armed timer, no forced exit."""
+        started = []
+        forced = []
+
+        class RecordingTimer(threading.Timer):
+            def start(self):
+                started.append(self)
+                super().start()
+
+        monkeypatch.setattr(threading, "Timer", RecordingTimer)
+        handler = ShutdownHandler(timeout_sec=60)
+        monkeypatch.setattr(handler, "_force_exit", lambda: forced.append(True))
         handler.register()
-        os.kill(os.getpid(), signal.SIGTERM)
-        os.kill(os.getpid(), signal.SIGTERM)
-        assert handler.should_shutdown()
-        assert handler.state.consecutive_nans if hasattr(handler, "state") else True
-        handler.unregister()
+        try:
+            os.kill(os.getpid(), signal.SIGTERM)
+            os.kill(os.getpid(), signal.SIGTERM)
+            assert handler.should_shutdown()
+            assert handler.signal_received == signal.SIGTERM
+            assert len(started) == 1
+            assert handler._timer is started[0]
+            assert not started[0].finished.is_set()
+            assert not forced
+        finally:
+            for timer in started:
+                timer.cancel()
+            handler.finish()
 
 
 # ---------------------------------------------------------------------------
