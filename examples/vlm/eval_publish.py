@@ -40,9 +40,7 @@ from kempnerforge.metrics.publish import (
 logger = logging.getLogger(__name__)
 
 _TABLE_COLUMNS = ["step", "benchmark", "metric", "filter", "score", "stderr", "n_samples", "name"]
-# lmms-eval names that MLflow rejects exist: task 'refcoco+_bbox_val', metric 'avg@4'.
 _NAME_SEPARATORS = re.compile(r"[^A-Za-z0-9.-]+")
-# MLflow errors quote tracking URIs verbatim, and a URI can carry credentials anywhere in it.
 _URL = re.compile(r"\b([a-zA-Z][a-zA-Z0-9+.-]*://)[^\s'\"<>]+")
 _DEPENDENCY_GROUPS = {"mlflow": "mlflow", "pandas": "eval"}
 
@@ -216,7 +214,7 @@ def _save(path: Path, mapping: Mapping[str, float]) -> Path | None:
         path = path.resolve()
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text)
-    except (OSError, RuntimeError) as e:  # resolve() reports a symlink loop as RuntimeError
+    except (OSError, RuntimeError) as e:
         logger.warning(f"Could not save the scores to {path}: {e}")
     else:
         logger.info(f"Scores saved to {path}")

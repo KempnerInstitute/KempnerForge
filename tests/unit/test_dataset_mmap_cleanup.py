@@ -65,7 +65,6 @@ def test_close_is_idempotent_and_releases_mmaps(tmp_path):
     ds.close()
     assert all(i.closed for i in inners)
 
-    # Second close is a no-op, not a crash.
     ds.close()
 
 

@@ -180,7 +180,8 @@ Include `Closes #N` to auto-close the issue on merge.
 - **Naming:** `snake_case` everywhere. Module names match their primary class/function.
 - **Imports:** sorted by ruff (`isort` rules). `kempnerforge` is first-party.
 - **Type annotations:** used throughout. Pyright runs in CI with zero errors — keep it that way.
-- **Comments:** only where the logic isn't self-evident. No docstrings on obvious methods.
+- **Comments:** none in source beyond what the code needs to work: shebang, `#SBATCH`, `# type:`, `# noqa:`, `# pyright:`, `# ruff:`, `# fmt:`, `# pragma: no cover`. Put it in a docstring or in `docs/`, or let naming and structure carry it.
+- **Docstrings:** document the public interface: contract, parameters, return value, exceptions, externally relevant behavior. Not a home for implementation narration, and not needed on an obvious method.
 
 ```bash
 # Auto-fix lint issues

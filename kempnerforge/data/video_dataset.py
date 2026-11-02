@@ -43,8 +43,6 @@ from kempnerforge.data.vlm_dataset import (
 
 logger = logging.getLogger(__name__)
 
-# WebVid layout: the metadata split directory ("val") differs from the video
-# directory name ("validation"); "train" matches both.
 _CSV_SUBDIR = {"train": "train", "validation": "val"}
 _VIDEO_SUBDIR = {"train": "train", "validation": "validation"}
 
@@ -108,9 +106,6 @@ class WebVidVideoDataset(VideoDataset):
             raise ValueError(f"split must be one of {tuple(_VIDEO_SUBDIR)} (got {split!r})")
         self._split = split
         self._video_dir = os.path.join(data_root, "raw", "videos", _VIDEO_SUBDIR[split])
-        # ``dataset_name`` names the on-disk corpus (e.g. "webvid-10M"); the WebVid
-        # *style* (CSV manifests + prefix-nested mp4s) is shared, so other
-        # WebVid-style datasets differ only by this directory.
         csv_dir = os.path.join(
             data_root, "raw", dataset_name, "data", _CSV_SUBDIR[split], "partitions"
         )
@@ -207,7 +202,6 @@ class WebVidVideoDataset(VideoDataset):
         prompt = self._prompt or None
         input_ids, labels = _tokenize_and_mask(self._tokenizer, caption, self._max_text_len, prompt)
         if not frames:
-            # Undecodable clip: keep static shapes but contribute no loss.
             labels = torch.full_like(labels, -100)
         return {
             "pixel_values": pixel_values,

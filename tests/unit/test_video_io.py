@@ -13,8 +13,6 @@ import pytest
 
 from kempnerforge.data.video_io import sample_timestamps
 
-# A known-good WebVid clip on the Kempner testbed; the decode integration test
-# is skipped when ``av`` or the data are unavailable (CI without either).
 _WEBVID_CLIP = (
     "/n/holylfs06/LABS/kempner_shared/Everyone/testbed/video/webvid-10m/"
     "raw/videos/train/21/2117/211794/21179416.mp4"
@@ -36,11 +34,6 @@ _HEVC_AVAILABLE = _encoder_available("libx265")
 _VP9_AVAILABLE = _encoder_available("libvpx-vp9")
 
 
-# ---------------------------------------------------------------------------
-# sample_timestamps (pure policy, no decoder)
-# ---------------------------------------------------------------------------
-
-
 class TestSampleTimestamps:
     def test_zero_duration_returns_single_start(self):
         assert sample_timestamps(0.0, fps=2.0, min_frames=4, max_frames=16) == [0.0]
@@ -58,19 +51,16 @@ class TestSampleTimestamps:
         assert all(b > a for a, b in zip(ts, ts[1:], strict=False))
 
     def test_caps_at_max_frames(self):
-        # 100s * 2fps = 200 desired, capped to 16, uniformly over [0, 100].
         ts = sample_timestamps(100.0, fps=2.0, min_frames=4, max_frames=16)
         assert len(ts) == 16
         assert ts[-1] == pytest.approx(100.0)
 
     def test_target_rate_when_under_cap(self):
-        # 2s * 2fps = 4 frames, within [4, 16].
         ts = sample_timestamps(2.0, fps=2.0, min_frames=4, max_frames=16)
         assert len(ts) == 4
         assert ts == pytest.approx([0.0, 2 / 3, 4 / 3, 2.0])
 
     def test_floors_at_min_frames(self):
-        # 1s * 2fps = 2 desired, raised to min_frames=4.
         ts = sample_timestamps(1.0, fps=2.0, min_frames=4, max_frames=16)
         assert len(ts) == 4
 
@@ -90,11 +80,6 @@ class TestSampleTimestamps:
     def test_min_below_one_raises(self):
         with pytest.raises(ValueError, match=">= 1"):
             sample_timestamps(10.0, fps=2.0, min_frames=0, max_frames=4)
-
-
-# ---------------------------------------------------------------------------
-# decode_video_frames (integration; needs av + the testbed data)
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.skipif(
@@ -141,8 +126,6 @@ def _write_mp4(
         stream.height = size
         stream.pix_fmt = "yuv420p"
         if gop_size is not None:
-            # Scene-change detection must be suppressed alongside gop_size:
-            # the changing gray otherwise promotes every frame to a keyframe.
             stream.codec_context.gop_size = gop_size
             stream.codec_context.options = {"sc_threshold": "1000000000"}
         for i in range(n_frames):
@@ -150,7 +133,7 @@ def _write_mp4(
             frame = av.VideoFrame.from_ndarray(arr, format="rgb24")
             for packet in stream.encode(frame):
                 container.mux(packet)
-        for packet in stream.encode():  # flush
+        for packet in stream.encode():
             container.mux(packet)
 
 
@@ -178,11 +161,11 @@ def _write_h264_mp4(
         stream.codec_context.options = {"x264-params": params}
         for i in range(n_frames):
             arr = np.full((size, size, 3), (i * 7) % 200, dtype=np.uint8)
-            arr[:, (i * 5) % size] = 255  # moving stripe: motion for B-frames
+            arr[:, (i * 5) % size] = 255
             frame = av.VideoFrame.from_ndarray(arr, format="rgb24")
             for packet in stream.encode(frame):
                 container.mux(packet)
-        for packet in stream.encode():  # flush
+        for packet in stream.encode():
             container.mux(packet)
 
 
@@ -210,7 +193,7 @@ class TestDecodeSynthetic:
         from kempnerforge.data.video_io import decode_video_frames
 
         path = tmp_path / "clip.mp4"
-        _write_mp4(path, n_frames=20, fps=10)  # ~2s
+        _write_mp4(path, n_frames=20, fps=10)
         frames = decode_video_frames(str(path), fps=2.0, min_frames=4, max_frames=8)
         assert 1 <= len(frames) <= 8
         assert all(isinstance(f, Image.Image) and f.mode == "RGB" for f in frames)
@@ -219,7 +202,7 @@ class TestDecodeSynthetic:
         from kempnerforge.data.video_io import decode_video_frames
 
         path = tmp_path / "clip.mp4"
-        _write_mp4(path, n_frames=40, fps=10)  # ~4s
+        _write_mp4(path, n_frames=40, fps=10)
         frames = decode_video_frames(str(path), fps=8.0, min_frames=4, max_frames=4)
         assert len(frames) == 4
 
@@ -227,7 +210,7 @@ class TestDecodeSynthetic:
         from kempnerforge.data.video_io import decode_video_frames
 
         path = tmp_path / "short.mp4"
-        _write_mp4(path, n_frames=3, fps=10)  # shorter than min_frames request
+        _write_mp4(path, n_frames=3, fps=10)
         frames = decode_video_frames(str(path), fps=2.0, min_frames=4, max_frames=8)
         assert len(frames) >= 1
 
@@ -275,7 +258,7 @@ def _write_indexed_clip(
             frame = av.VideoFrame.from_ndarray(_index_frame(i), format="rgb24")
             for packet in stream.encode(frame):
                 container.mux(packet)
-        for packet in stream.encode():  # flush
+        for packet in stream.encode():
             container.mux(packet)
 
 
@@ -424,7 +407,7 @@ def _end_edit_list_at(src, dst, end_s: float) -> None:
     data = bytearray(src.read_bytes())
     elst, mvhd = data.index(b"elst"), data.index(b"mvhd")
     assert data[elst + 4] == 0 and struct.unpack_from(">I", data, elst + 8)[0] == 1
-    assert data[mvhd + 4] == 0  # version 0: the movie timescale follows two 32-bit times
+    assert data[mvhd + 4] == 0
     timescale = struct.unpack_from(">I", data, mvhd + 16)[0]
     struct.pack_into(">I", data, elst + 12, round(end_s * timescale))
     dst.write_bytes(bytes(data))
@@ -495,7 +478,7 @@ class _FakeContainer:
         from types import SimpleNamespace
 
         self.packets, self.size, self.at, self.seeks = packets, size, 0, []
-        self.duration = metadata  # microseconds, as a container reports it
+        self.duration = metadata
         self.streams = SimpleNamespace(
             video=[SimpleNamespace(time_base=time_base, duration=None, frames=0, average_rate=None)]
         )
@@ -583,25 +566,23 @@ def counted_open(monkeypatch):
     return counts
 
 
-# (suffix, encoder, encoder options, packets cut from the start): the containers and codecs a
-# stream offset is checked in. A cut copy starts off a keyframe, as a stream copy cut can.
 _X264_BFRAMES = {"x264-params": "bframes=2:b-adapt=0"}
 _X264_GOP10 = {"x264-params": "keyint=10:min-keyint=10:scenecut=0:bframes=0"}
 _OFFSET_CASES = {
     "mp4": ("mp4", "mpeg4", None, 0),
-    "mov-bframes": ("mov", "mpeg4", {"bf": "2"}, 0),  # an edit list holds the B-frame delay
+    "mov-bframes": ("mov", "mpeg4", {"bf": "2"}, 0),
     "mkv": ("mkv", "mpeg4", None, 0),
     "webm": ("webm", "libvpx-vp9", None, 0),
     "nut-bframes": ("nut", "mpeg4", {"bf": "2"}, 0),
-    "flv": ("flv", "flv", None, 0),  # packets carry no duration
+    "flv": ("flv", "flv", None, 0),
     "asf": ("asf", "wmv2", None, 0),
-    "asf-bframes": ("asf", "mpeg4", {"bf": "2"}, 0),  # no stream start time
+    "asf-bframes": ("asf", "mpeg4", {"bf": "2"}, 0),
     "mpegts": ("ts", "mpeg2video", {"bf": "2"}, 0),
     "mpegps": ("mpg", "mpeg2video", {"bf": "2"}, 0),
     "ogg": ("ogv", "libvpx", None, 0),
     "mp4-h264-bframes": ("mp4", "libx264", _X264_BFRAMES, 0),
     "mkv-h264-bframes": ("mkv", "libx264", _X264_BFRAMES, 0),
-    "mkv-h264-cut": ("mkv", "libx264", _X264_GOP10, 3),  # its duration is an end time
+    "mkv-h264-cut": ("mkv", "libx264", _X264_GOP10, 3),
     "mp4-h264-cut": ("mp4", "libx264", _X264_GOP10, 3),
     "mpegts-h264-cut": ("ts", "libx264", _X264_GOP10, 3),
 }
@@ -627,10 +608,10 @@ class TestDecodeStartOffset:
         _remux_shifted(src, base, 0.0, skip_packets=cut)
         _remux_shifted(src, shifted, offset_s, skip_packets=cut)
         assert _first_frame_time(shifted) == pytest.approx(_first_frame_time(base) + offset_s)
-        if cut:  # frames 3-9 start the stream but the decoder skips them up to the keyframe
+        if cut:
             expected = _rule_indices(base, *_full_extent(base))
             assert expected[0] == 10
-        else:  # targets [0, 2/3, 4/3, 2] s; the last sits past the final frame (1.9 s)
+        else:
             expected = [0, 7, 14, 19]
         assert _indices(shifted) == _indices(base) == expected
 
@@ -648,7 +629,7 @@ class TestDecodeStartOffset:
         _write_clip_with_audio(src, 40, 10, codec="libx264", codec_options=_X264_GOP10)
         _remux_shifted(src, base, 0.0, skip_packets=3)
         _remux_shifted(src, shifted, offset_s, skip_packets=3)
-        start, span = _full_extent(base)  # the video stream's own extent
+        start, span = _full_extent(base)
         assert span == pytest.approx(_full_extent(shifted)[1])
         assert _indices(shifted) == _indices(base) == _rule_indices(base, start, span)
 
@@ -718,14 +699,14 @@ class TestDecodeStartOffset:
         """Cut at an open-GOP keyframe, a stream starts with frames that reference the
         dropped group: the decoder skips them, yet they start the stream at any offset."""
         src = tmp_path / f"src.{suffix}"
-        options = {"bf": "2", "g": "10"}  # MPEG-2 GOPs are open by default
+        options = {"bf": "2", "g": "10"}
         _write_indexed_clip(src, n_frames=40, fps=10, codec="mpeg2video", codec_options=options)
         selections = []
         for offset_s in (0.0, 0.5, 5.0):
             cut = tmp_path / f"cut_{offset_s}.{suffix}"
             _remux_shifted(src, cut, offset_s, from_keyframe=1)
             start, span = _full_extent(cut)
-            assert start < _first_frame_time(cut)  # the leading frames are skipped
+            assert start < _first_frame_time(cut)
             selections.append(_indices(cut))
             assert selections[-1] == _rule_indices(cut, start, span)
         assert selections[0] == selections[1] == selections[2]
@@ -746,7 +727,7 @@ class TestDecodeStartOffset:
         src = tmp_path / "src.mov"
         _write_indexed_clip(src, n_frames=20, fps=10, codec_options={"g": "10"})
         trimmed = tmp_path / "trimmed.mov"
-        _remux_shifted(src, trimmed, -0.3)  # frames 0-2 fall before 0 s
+        _remux_shifted(src, trimmed, -0.3)
         assert _extent_of(trimmed) == pytest.approx((0.0, 1.7))
         assert _indices(trimmed) == [3, 9, 15, 19]
 
@@ -989,7 +970,7 @@ class TestVideoExtent:
         feeder.start()
         worker.start()
         worker.join(timeout=30)
-        if worker.is_alive():  # release a reader blocked on a second open of the pipe
+        if worker.is_alive():
             os.close(os.open(pipe, os.O_WRONLY | os.O_NONBLOCK))
             pytest.fail("decoding the pipe hung")
         assert "error" not in result, result.get("error")
@@ -1024,7 +1005,7 @@ class TestVideoExtent:
         extent, rest, _ = _video_extent(container, container.streams.video[0], "clip")
         assert extent == pytest.approx((0.0, 1.0))
         assert list(rest) == packets
-        assert container.seeks[-1] == 0  # back to the first packet's decode time
+        assert container.seeks[-1] == 0
 
     def test_failed_end_seek_reads_every_packet(self):
         """A seek past the end that fails leaves the start to seek back to: every packet is
@@ -1074,7 +1055,7 @@ class TestVideoExtent:
 
         from kempnerforge.data.video_io import _rewind
 
-        first = _fake_packet(None, 0, key=True)  # pos 0, size 1
+        first = _fake_packet(None, 0, key=True)
         landing = _fake_packet(None, 0, key=True)
         landing.pos, landing.size = pos, size
         container = _FakeContainer([landing], Fraction(1, 10))
@@ -1189,11 +1170,6 @@ class TestSpan:
         from kempnerforge.data.video_io import _span
 
         assert _span(5, [[(5, 0)]], Fraction(1, 2), 0.0) == (2.5, 0.0)
-
-
-# ---------------------------------------------------------------------------
-# seek-based decoding (parity with the serial reference, guards, fallback)
-# ---------------------------------------------------------------------------
 
 
 def _assert_seek_parity(path, monkeypatch, *, fps, min_frames, max_frames):
@@ -1342,27 +1318,27 @@ class TestSeekMatchesSerial:
 
     def test_sparse_targets_long_clip(self, tmp_path, monkeypatch):
         path = tmp_path / "clip.mp4"
-        _write_mp4(path, n_frames=200, gop_size=12)  # 20s, 17 GOPs
+        _write_mp4(path, n_frames=200, gop_size=12)
         _assert_seek_parity(path, monkeypatch, fps=2.0, min_frames=1, max_frames=4)
 
     def test_dense_targets_min_eq_max(self, tmp_path, monkeypatch):
         path = tmp_path / "clip.mp4"
-        _write_mp4(path, n_frames=40, gop_size=12)  # 4s
+        _write_mp4(path, n_frames=40, gop_size=12)
         _assert_seek_parity(path, monkeypatch, fps=8.0, min_frames=16, max_frames=16)
 
     def test_duplicate_targets_dense_short_clip(self, tmp_path, monkeypatch):
         path = tmp_path / "clip.mp4"
-        _write_mp4(path, n_frames=10, gop_size=5)  # 1s; 16 targets over 10 frames
+        _write_mp4(path, n_frames=10, gop_size=5)
         _assert_seek_parity(path, monkeypatch, fps=2.0, min_frames=16, max_frames=16)
 
     def test_single_keyframe_clip(self, tmp_path, monkeypatch):
         path = tmp_path / "clip.mp4"
-        _write_mp4(path, n_frames=60, gop_size=999)  # one group: never seeks
+        _write_mp4(path, n_frames=60, gop_size=999)
         _assert_seek_parity(path, monkeypatch, fps=2.0, min_frames=4, max_frames=8)
 
     def test_short_clip_tail_fill(self, tmp_path, monkeypatch):
         path = tmp_path / "short.mp4"
-        _write_mp4(path, n_frames=3)  # shorter than min_frames -> tail-fill
+        _write_mp4(path, n_frames=3)
         _assert_seek_parity(path, monkeypatch, fps=2.0, min_frames=4, max_frames=8)
 
     @pytest.mark.parametrize("offset_s", [0.5, 5.0])
@@ -1371,7 +1347,6 @@ class TestSeekMatchesSerial:
         dst = tmp_path / "shifted.mp4"
         _write_mp4(src, n_frames=200, gop_size=12)
         _remux_shifted(src, dst, offset_s=offset_s)
-        # Seeks go to the first frame's time plus the target.
         got = _assert_seek_parity(dst, monkeypatch, fps=2.0, min_frames=1, max_frames=4)
         ref = _serial_reference(src, 2.0, 1, 4)
         assert [f.tobytes() for f in got] == [f.tobytes() for f in ref]
@@ -1395,7 +1370,6 @@ class TestSeekMatchesSerialH264:
         with av.open(str(path)) as container:
             stream = container.streams.video[0]
             packets = [p for p in container.demux(stream) if p.pts is not None]
-        # B-frames are stored out of presentation order: dts != pts somewhere.
         assert any(p.dts is not None and p.dts != p.pts for p in packets)
         with av.open(str(path)) as container:
             types = {
@@ -1407,20 +1381,17 @@ class TestSeekMatchesSerialH264:
     @pytest.mark.parametrize("open_gop", [False, True])
     def test_sparse_targets_long_clip(self, tmp_path, monkeypatch, open_gop):
         path = tmp_path / "clip.mp4"
-        _write_h264_mp4(path, n_frames=200, open_gop=open_gop)  # 20s, 1.2s GOPs
+        _write_h264_mp4(path, n_frames=200, open_gop=open_gop)
         _assert_seek_parity(path, monkeypatch, fps=2.0, min_frames=1, max_frames=4)
 
     @pytest.mark.parametrize("open_gop", [False, True])
     def test_dense_targets_min_eq_max(self, tmp_path, monkeypatch, open_gop):
         path = tmp_path / "clip.mp4"
-        _write_h264_mp4(path, n_frames=60, open_gop=open_gop)  # 6s
+        _write_h264_mp4(path, n_frames=60, open_gop=open_gop)
         _assert_seek_parity(path, monkeypatch, fps=8.0, min_frames=16, max_frames=16)
 
     @pytest.mark.parametrize("open_gop", [False, True])
     def test_explicit_targets_straddle_gop_boundaries(self, tmp_path, open_gop):
-        # Targets just after each keyframe time (keyint=12 @ 10fps -> 1.2s
-        # GOPs), where open-GOP leading B-frames sit; drives _decode_seek
-        # directly so a serial fallback cannot mask a divergence.
         from kempnerforge.data.video_io import _decode_seek, _decode_serial
 
         path = tmp_path / "clip.mp4"
@@ -1438,7 +1409,7 @@ class TestSeekMatchesSerialH264:
 
         path = tmp_path / "clip.mp4"
         _write_h264_mp4(path, n_frames=200, open_gop=True)
-        targets = [0.0] + [4.8 * m - pre_s for m in (1, 2, 3, 4)]  # 4 GOPs apart: seeks
+        targets = [0.0] + [4.8 * m - pre_s for m in (1, 2, 3, 4)]
         expected, _ = _run_direct(path, _decode_serial, targets)
         try:
             got, counter = _run_direct(path, _decode_seek, targets)
@@ -1459,15 +1430,13 @@ class TestSeekFrameIdentity:
         from kempnerforge.data.video_io import decode_video_frames
 
         path = tmp_path / "clip.mp4"
-        _write_mp4(path, n_frames=20, fps=10)  # 2s; frame i is solid (i*17)%256 gray
+        _write_mp4(path, n_frames=20, fps=10)
         frames = decode_video_frames(str(path), fps=2.0, min_frames=4, max_frames=4)
         assert len(frames) == 4
-        # Targets [0, 2/3, 4/3, 2.0] -> first frame at/after each: 0, 7, 14;
-        # the final target sits past the last PTS -> tail-fills with frame 19.
         expected = [0, 7 * 17, 14 * 17, (19 * 17) % 256]
         means = [float(np.asarray(f.convert("L")).mean()) for f in frames]
         for got, want in zip(means, expected, strict=True):
-            assert abs(got - want) <= 4.0  # mpeg4 encode/decode roundtrip tolerance
+            assert abs(got - want) <= 4.0
 
 
 @pytest.mark.skipif(not _AV_AVAILABLE, reason="requires the 'av' package")
@@ -1559,7 +1528,7 @@ class TestSeekCodecShapes:
         src = tmp_path / "src.mp4"
         dst = tmp_path / "every_frame_key.mp4"
         options = {"g": "30", "sc_threshold": "1000000000"}
-        _write_indexed_clip(src, n_frames=300, codec_options=options)  # 30 s
+        _write_indexed_clip(src, n_frames=300, codec_options=options)
         _mark_every_packet_key(src, dst)
         with pytest.raises(video_io._SeekUnreliableError):
             _run_direct(dst, video_io._decode_seek, [0.0, 10.0])
@@ -1655,19 +1624,13 @@ class TestSeekDecodeWork:
             container.seeks = container.decoded = 0
             return result
 
-        with pytest.MonkeyPatch.context() as patch:  # undone per call, so calls do not nest
+        with pytest.MonkeyPatch.context() as patch:
             patch.setattr(av, "open", _open)
             patch.setattr(video_io, "_video_extent", _extent)
             frames = video_io.decode_video_frames(str(path), **cfg)
-        assert len(opened) == 1  # no fallback reopen
+        assert len(opened) == 1
         return frames, opened[0]
 
-    # 20 s at 10 fps with a keyframe every 12 frames: a group is 1.2 s. ``max_frames``
-    # sets the spacing, and with it how many whole groups a decode could skip between
-    # one target's keyframe and the next target: none at 16 targets (1.33 s apart), one
-    # at 8 (2.86 s) and four at 4 (6.67 s), so 0, 12 and 48 frames. A seek throws away
-    # the frames the decoder holds in flight and decodes them again, twice ``threads - 1``
-    # here, so it pays above 0 frames single-threaded and above 30 at 16 threads.
     @pytest.mark.parametrize(
         ("max_frames", "threads", "seeks", "decoded"),
         [
@@ -1747,7 +1710,7 @@ class TestSeekDecodeWork:
         assert [f.tobytes() for f in frames] == [
             f.tobytes() for f in _serial_reference(path, 2.0, 4, 4)
         ]
-        assert counter.seeks > 0  # the clip is long enough that seeking pays
+        assert counter.seeks > 0
 
     @pytest.mark.parametrize("suffix", ["mp4", "mkv"])
     @pytest.mark.parametrize("max_frames", [4, 16])
@@ -1776,7 +1739,7 @@ class TestSeekDamage:
     def _clips(self, tmp_path, damage_at_s):
         clean = tmp_path / "clean.mp4"
         damaged = tmp_path / "damaged.mp4"
-        _write_mp4(clean, n_frames=300, gop_size=12)  # 30 s; targets 0, 10, 20, 30 s
+        _write_mp4(clean, n_frames=300, gop_size=12)
         _damage_packet(clean, damaged, damage_at_s)
         return clean, damaged
 
@@ -1785,7 +1748,7 @@ class TestSeekDamage:
 
         from kempnerforge.data.video_io import decode_video_frames
 
-        clean, damaged = self._clips(tmp_path, damage_at_s=5.0)  # between the 0 s and 10 s groups
+        clean, damaged = self._clips(tmp_path, damage_at_s=5.0)
         with pytest.raises(av.FFmpegError):
             _serial_reference(damaged, 2.0, 1, 4)
         got = decode_video_frames(str(damaged), fps=2.0, min_frames=1, max_frames=4)
@@ -1797,7 +1760,7 @@ class TestSeekDamage:
 
         from kempnerforge.data.video_io import decode_video_frames
 
-        _, damaged = self._clips(tmp_path, damage_at_s=9.8)  # the 9.6 s group holds 10 s
+        _, damaged = self._clips(tmp_path, damage_at_s=9.8)
         with pytest.raises(av.FFmpegError):
             decode_video_frames(str(damaged), fps=2.0, min_frames=1, max_frames=4)
 
@@ -1875,7 +1838,7 @@ class _FakeSeekContainer:
         index = int(t * 10 + 1e-6)
         if self.land_on_any_frame:
             key = index
-        else:  # the last keyframe at or before the requested time
+        else:
             key = max(
                 (i for i, f in enumerate(self.frames) if f.key_frame and i <= index), default=0
             )
@@ -1911,12 +1874,10 @@ class TestSeekCursor:
         from kempnerforge.data.video_io import _decode_serial
 
         targets = [0.0, 0.5, 1.5, 5.0, 9.9]
-        seek = _FakeSeekContainer(100, gop=10)  # 10 s, a keyframe every second
+        seek = _FakeSeekContainer(100, gop=10)
         serial = _FakeSeekContainer(100, gop=10)
         assert _run_fake(seek, targets) == [0, 5, 15, 50, 99]
         assert _decode_serial(serial.demux(None), targets, 0.0) == [0, 5, 15, 50, 99]
-        # 1.5 s sits inside the group the decode is already in, so nothing whole can be
-        # skipped and it runs on; 5 s and 9.9 s leave whole groups behind, so it seeks.
         assert seek.seeks == [5.0, 9.9]
         assert seek.decoded == 21 + 11 + 10
         assert serial.decoded == 100
@@ -1982,7 +1943,7 @@ class TestSeekCursor:
         stream's own start would not account for it."""
         container = _FakeSeekContainer(200, gop=10, land_at_s=2.0)
         assert _run_fake(container, [3.0, 9.0, 19.9]) == [30, 90, 199]
-        assert container.seeks == [9.0]  # 19.9 s is then reached by decoding on
+        assert container.seeks == [9.0]
 
     def test_frame_without_timestamp_raises(self):
         from kempnerforge.data.video_io import _SeekUnreliableError
@@ -2127,7 +2088,7 @@ class TestSeekFallback:
         feeder.start()
         worker.start()
         worker.join(timeout=30)
-        if worker.is_alive():  # release a reader blocked on a second open of the pipe
+        if worker.is_alive():
             os.close(os.open(pipe, os.O_WRONLY | os.O_NONBLOCK))
             pytest.fail("decoding the pipe hung")
         assert "error" not in result, result.get("error")
@@ -2193,7 +2154,6 @@ class TestSeekFallback:
         path = tmp_path / "clip.mp4"
         _write_h264_mp4(path, n_frames=120, open_gop=True)
         frames, _ = _run_direct(path, _decode_serial, [0.0, 9.45, 9.55])
-        # Serial takes the 9.5 s B-frame for 9.45 s, not the keyframe the seek reaches.
         assert frames[1].tobytes() != frames[2].tobytes()
         with pytest.raises(_SeekUnreliableError, match="seek to 9.450s landed at 9.600s"):
             _run_direct(path, _decode_seek, [0.0, 9.45])

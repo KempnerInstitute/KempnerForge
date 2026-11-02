@@ -84,6 +84,8 @@ Architecture hyperparameters and MoE knobs.
 | `moe_gradient_scale` | `bool` | `False` | per-expert gradient normalization |
 | `moe_bias_schedule` | `str` | `"constant"` | `"constant"`, `"cosine_decay"`, `"linear_warmup"` |
 | `moe_packed_experts` | `bool` | `False` | pack expert weights into one tensor per projection |
+| `moe_expert_ffn_multiplier` | `float` | `1.0` | expert FFN hidden width relative to dense (`0.5` → fine-grained) |
+| `moe_router_z_loss_weight` | `float` | `0.0` | router-logit z-loss coefficient (`0` = off) |
 
 Computed properties: `is_moe`, `head_dim`, `computed_ffn_hidden_dim`,
 `num_params_estimate`.
@@ -101,6 +103,7 @@ Training-loop hyperparameters.
 | `grad_accum_steps` | `int` | `1` | microbatches per optimizer step |
 | `grad_clip_norm` | `float` | `1.0` | `clip_grad_norm_` cap |
 | `seed` | `int` | `42` | torch/numpy/python RNG seed |
+| `data_seed` | `int \| None` | `None` | RNG seed for data and batch order; `None` → falls back to `seed` |
 | `compile_model` | `bool` | `True` | wrap the model with `torch.compile` |
 | `mixed_precision` | `"bf16" \| "fp32" \| "fp8"` | `"bf16"` | master-weight dtype; `"fp8"` uses bf16 masters with fp8 compute; `"fp16"` is rejected (no loss scaling) |
 | `activation_checkpointing` | `"none" \| "full" \| "selective"` | `"none"` | AC policy |
@@ -167,6 +170,9 @@ Single dataset, HuggingFace source, or mixture; optional phase schedule.
 | `hf_dataset_config` | `str \| None` | `None` | HF dataset config (e.g. `"wikitext-2-raw-v1"`) |
 | `hf_dataset_split` | `str` | `"train"` | HF split |
 | `hf_dataset_text_field` | `str` | `"text"` | field to tokenize |
+| `hf_dataset_image_field` | `str` | `"image"` | VLM only: image column |
+| `hf_dataset_prompt_field` | `str` | `""` | VLM only: prompt column (`""` = no prompt mask) |
+| `hf_image_size` | `int` | `224` | VLM only: target square image size |
 | `hf_streaming` | `bool` | `False` | use `IterableDataset` for large corpora |
 | `pack_sequences` | `bool` | `False` | document-aware packing with cross-doc isolation (feeds `doc_ids` to attention) |
 | `datasets` | `list[DatasetSource]` | `[]` | multi-dataset mixture (overrides `dataset_path`/`hf_dataset_name` when non-empty) |

@@ -8,7 +8,6 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-# Importing the module registers the builders under the shared registry.
 import kempnerforge.model.adapter
 from kempnerforge.config.adapter import AdapterConfig
 from kempnerforge.config.registry import registry
@@ -81,7 +80,7 @@ def _reference_attentional_pool(
     heads, head_dim = adapter.pool_heads, adapter.head_dim
     outs = []
     for idx in _reference_pool_windows(x.shape[1], window):
-        patches = x[:, idx]  # (B, k_real, C)
+        patches = x[:, idx]
         k_real = patches.shape[1]
         q = adapter.q_proj(patches.mean(dim=1, keepdim=True))
         q = q.view(b, 1, heads, head_dim).transpose(1, 2)
@@ -90,11 +89,6 @@ def _reference_attentional_pool(
         attn = F.scaled_dot_product_attention(q, k, v).transpose(1, 2).reshape(b, c)
         outs.append(adapter.out_proj(adapter.o_proj(attn)))
     return torch.stack(outs, dim=1)
-
-
-# ---------------------------------------------------------------------------
-# MLP2LayerAdapter
-# ---------------------------------------------------------------------------
 
 
 class TestMLP2LayerAdapter:
@@ -139,15 +133,8 @@ class TestMLP2LayerAdapter:
         adapter = MLP2LayerAdapter(in_dim=8, out_dim=4)
         w1 = adapter.proj1.weight.clone()
         adapter.reset_parameters()
-        # Not guaranteed bit-different (unlikely but possible), so just
-        # check it ran without error and weights are finite.
         assert torch.isfinite(adapter.proj1.weight).all()
         assert adapter.proj1.weight.shape == w1.shape
-
-
-# ---------------------------------------------------------------------------
-# LinearAdapter
-# ---------------------------------------------------------------------------
 
 
 class TestLinearAdapter:
@@ -179,20 +166,12 @@ class TestLinearAdapter:
     def test_no_hidden_dim_or_activation(self):
         """LinearAdapter has a single ``proj`` Linear; no hidden_dim or
         activation parameters exist. The builder must ignore them."""
-        # The dispatcher (build_adapter) passes hidden_dim/activation via
-        # AdapterConfig.extra_kwargs(); the linear builder swallows them.
         cfg = AdapterConfig(type="linear", hidden_dim=42, activation="silu")
         adapter = build_adapter(cfg, in_dim=8, out_dim=4)
         assert isinstance(adapter, LinearAdapter)
-        # No proj1/proj2 attributes; only proj.
         assert hasattr(adapter, "proj")
         assert not hasattr(adapter, "proj1")
         assert not hasattr(adapter, "proj2")
-
-
-# ---------------------------------------------------------------------------
-# Adapter registry
-# ---------------------------------------------------------------------------
 
 
 class TestAdapterRegistry:
@@ -225,11 +204,6 @@ class TestAdapterRegistry:
             @registry.register_adapter("adapter_smoke_test_dup")
             def _build_second(in_dim, out_dim, **_):  # noqa: ARG001
                 return MLP2LayerAdapter(in_dim=in_dim, out_dim=out_dim)
-
-
-# ---------------------------------------------------------------------------
-# AdapterConfig
-# ---------------------------------------------------------------------------
 
 
 class TestAdapterConfig:
@@ -265,11 +239,6 @@ class TestAdapterConfig:
         cfg = AdapterConfig(activation="silu")
         kwargs = cfg.extra_kwargs()
         assert kwargs["activation"] == "silu"
-
-
-# ---------------------------------------------------------------------------
-# build_adapter dispatch
-# ---------------------------------------------------------------------------
 
 
 class TestBuildAdapter:
@@ -309,24 +278,18 @@ class TestBuildAdapter:
         assert isinstance(adapter.act, nn.SiLU)
 
 
-# ---------------------------------------------------------------------------
-# pooled_token_count (pure helper, single source of truth for the post-pool
-# token count)
-# ---------------------------------------------------------------------------
-
-
 class TestPooledTokenCount:
     @pytest.mark.parametrize(
         ("n_in", "window", "expected"),
         [
-            (196, 2, 49),  # 14x14 grid, divisible -> 7x7
-            (256, 2, 64),  # 16x16 -> 8x8
-            (729, 3, 81),  # 27x27 (Molmo2 SigLIP 378/14) -> 9x9
-            (16, 2, 4),  # 4x4 -> 2x2
-            (16, 3, 4),  # 4x4 ragged: ceil(4/3)=2 -> 2x2
-            (100, 3, 16),  # 10x10 ragged: ceil(10/3)=4 -> 4x4
-            (16, 1, 16),  # window 1 == identity
-            (16, 4, 1),  # whole grid into one token
+            (196, 2, 49),
+            (256, 2, 64),
+            (729, 3, 81),
+            (16, 2, 4),
+            (16, 3, 4),
+            (100, 3, 16),
+            (16, 1, 16),
+            (16, 4, 1),
         ],
     )
     def test_counts(self, n_in, window, expected):
@@ -334,7 +297,7 @@ class TestPooledTokenCount:
 
     def test_non_square_grid_raises(self):
         with pytest.raises(ValueError, match="square patch grid"):
-            pooled_token_count(8, 2)  # 8 is not a perfect square
+            pooled_token_count(8, 2)
 
     def test_non_positive_window_raises(self):
         with pytest.raises(ValueError, match="window must be positive"):
@@ -354,20 +317,19 @@ class TestPadGridToWindows:
     grids through the masked SDPA path instead of the unmasked one."""
 
     def test_divisible_grid_builds_no_mask(self):
-        x = torch.randn(2, 16, 8)  # 4x4 grid; window 2 divides it
+        x = torch.randn(2, 16, 8)
         padded, per, valid = _pad_grid_to_windows(x, 2)
         assert per == 2
-        assert valid is None  # no mask built -> unmasked / bit-exact fast path
-        assert padded.shape == (2, 4, 4, 8)  # no padding for a divisible grid
+        assert valid is None
+        assert padded.shape == (2, 4, 4, 8)
 
     def test_ragged_grid_builds_mask_over_real_patches(self):
-        x = torch.randn(2, 16, 8)  # 4x4 grid; window 3 -> pad to 6x6
+        x = torch.randn(2, 16, 8)
         padded, per, valid = _pad_grid_to_windows(x, 3)
-        assert per == 2  # ceil(4/3)
+        assert per == 2
         assert padded.shape == (2, 6, 6, 8)
         assert valid is not None and valid.shape == (2, 6, 6, 1)
-        assert valid.sum().item() == 2 * 16  # exactly the 16 real patches per sample
-        # Real patches are the top-left 4x4 block; the padded rows/cols are False.
+        assert valid.sum().item() == 2 * 16
         assert bool(valid[:, :4, :4].all())
         assert not bool(valid[:, 4:, :].any()) and not bool(valid[:, :, 4:].any())
 
@@ -376,33 +338,24 @@ class TestPadGridToWindows:
         [(16, 3), (49, 3), (4, 3), (100, 3), (25, 2), (196, 3)],
     )
     def test_every_window_keeps_at_least_one_real_patch(self, n_in, window):
-        # ceil padding never produces an all-padded window: the last window starts
-        # at (per-1)*window < grid. The pooling adapters rely on this (their query
-        # denominator would otherwise be zero), so pin it rather than trust the
-        # defensive clamp.
         x = torch.randn(1, n_in, 4)
         padded, per, valid = _pad_grid_to_windows(x, window)
         if valid is None:
-            return  # divisible: no padding at all
+            return
         counts = valid.view(1, per, window, per, window, 1).sum(dim=(2, 4))
         assert int(counts.min()) >= 1
-
-
-# ---------------------------------------------------------------------------
-# AvgPoolAdapter
-# ---------------------------------------------------------------------------
 
 
 class TestAvgPoolAdapter:
     def test_forward_shape_divisible(self):
         adapter = AvgPoolAdapter(in_dim=96, out_dim=64, pool_window=2).to(DEVICE)
-        x = torch.randn(2, 16, 96, device=DEVICE)  # 4x4 grid
+        x = torch.randn(2, 16, 96, device=DEVICE)
         out = adapter(x)
-        assert out.shape == (2, 4, 64)  # 2x2 windows
+        assert out.shape == (2, 4, 64)
 
     def test_forward_shape_ragged(self):
         adapter = AvgPoolAdapter(in_dim=96, out_dim=64, pool_window=3).to(DEVICE)
-        x = torch.randn(2, 16, 96, device=DEVICE)  # 4x4 grid, ceil(4/3)=2
+        x = torch.randn(2, 16, 96, device=DEVICE)
         out = adapter(x)
         assert out.shape == (2, 4, 64)
 
@@ -419,16 +372,14 @@ class TestAvgPoolAdapter:
 
     def test_pool_window_override_in_forward(self):
         adapter = AvgPoolAdapter(in_dim=32, out_dim=16, pool_window=2)
-        x = torch.randn(1, 16, 32)  # 4x4 grid
-        # Override to window 4 -> ceil(4/4)=1 -> single token.
+        x = torch.randn(1, 16, 32)
         assert adapter(x, pool_window=4).shape == (1, 1, 16)
-        # Default still 2x2 -> 4 tokens.
         assert adapter(x).shape == (1, 4, 16)
 
     def test_non_square_input_raises(self):
         adapter = AvgPoolAdapter(in_dim=8, out_dim=4, pool_window=2)
         with pytest.raises(ValueError, match="square patch grid"):
-            adapter(torch.randn(1, 8, 8))  # 8 not a perfect square
+            adapter(torch.randn(1, 8, 8))
 
     def test_rejects_zero_dim(self):
         with pytest.raises(ValueError, match="must be positive"):
@@ -454,14 +405,11 @@ class TestAvgPoolAdapter:
     def test_divisible_pool_is_plain_mean(self):
         """With a divisible grid, the pooled value is the exact window mean."""
         adapter = AvgPoolAdapter(in_dim=4, out_dim=4, pool_window=2)
-        # Make proj an identity so we can read the pooled values directly.
         with torch.no_grad():
             adapter.proj.weight.copy_(torch.eye(4))
             adapter.proj.bias.zero_()
-        x = torch.arange(16.0).view(1, 16, 1).expand(1, 16, 4).contiguous()  # 4x4 grid
+        x = torch.arange(16.0).view(1, 16, 1).expand(1, 16, 4).contiguous()
         out = adapter(x)
-        # Top-left window = mean of grid cells (0,0),(0,1),(1,0),(1,1) =
-        # tokens 0,1,4,5 -> mean 2.5.
         assert torch.allclose(out[0, 0], torch.full((4,), 2.5))
 
     def test_ragged_edge_window_averages_only_real_patches(self):
@@ -471,10 +419,8 @@ class TestAvgPoolAdapter:
         with torch.no_grad():
             adapter.proj.weight.copy_(torch.eye(4))
             adapter.proj.bias.zero_()
-        x = torch.arange(16.0).view(1, 16, 1).expand(1, 16, 4).contiguous()  # 4x4 grid
-        out = adapter(x)  # (1, 4, 4): 2x2 windows, window 3 ragged
-        # Bottom-right window (token 3) has grid cell (3,3) = token 15 as its only
-        # real patch; mean over that 1 patch = 15.0 (a /(w*w)=/9 bug gives ~1.67).
+        x = torch.arange(16.0).view(1, 16, 1).expand(1, 16, 4).contiguous()
+        out = adapter(x)
         assert torch.allclose(out[0, 3], torch.full((4,), 15.0))
 
     @pytest.mark.parametrize(("n_in", "window"), [(16, 3), (49, 3), (4, 3), (196, 3)])
@@ -496,24 +442,18 @@ class TestAvgPoolAdapter:
             adapter(torch.randn(1, 16, 8), pool_window=0)
 
 
-# ---------------------------------------------------------------------------
-# AttentionalPoolAdapter
-# ---------------------------------------------------------------------------
-
-
 class TestAttentionalPoolAdapter:
     def test_forward_shape(self):
         adapter = AttentionalPoolAdapter(in_dim=96, out_dim=64, pool_window=2, pool_heads=16).to(
             DEVICE
         )
-        x = torch.randn(2, 16, 96, device=DEVICE)  # 4x4 grid
+        x = torch.randn(2, 16, 96, device=DEVICE)
         out = adapter(x)
         assert out.shape == (2, 4, 64)
 
     def test_is_vision_adapter(self):
         assert isinstance(AttentionalPoolAdapter(in_dim=16, out_dim=8, pool_heads=4), VisionAdapter)
 
-    # (196, 3) is ragged: 14x14 grid, 14 % 3 != 0 -> ceil(14/3)=5 -> 25.
     @pytest.mark.parametrize(("n_in", "window"), [(16, 2), (256, 2), (729, 3), (196, 3)])
     def test_output_num_tokens_matches_forward(self, n_in, window):
         adapter = AttentionalPoolAdapter(in_dim=32, out_dim=16, pool_window=window, pool_heads=4)
@@ -521,41 +461,30 @@ class TestAttentionalPoolAdapter:
         assert adapter(x).shape[1] == adapter.output_num_tokens(n_in)
 
     def test_ragged_grid_supported(self):
-        # 4x4 grid, window 3 -> ceil(4/3)=2 -> 2x2=4 tokens; edge windows pool only
-        # their real patches (padded patches masked out). No longer raises.
         adapter = AttentionalPoolAdapter(in_dim=96, out_dim=64, pool_window=3, pool_heads=16)
-        out = adapter(torch.randn(2, 16, 96))  # 4x4 grid, ragged for window 3
+        out = adapter(torch.randn(2, 16, 96))
         assert out.shape == (2, 4, 64)
         assert torch.isfinite(out).all()
 
     def test_output_num_tokens_ragged(self):
-        # Ragged grids are supported: the count is ceil(grid/window)**2, matching
-        # avgpool and the masked forward.
         adapter = AttentionalPoolAdapter(in_dim=96, out_dim=64, pool_window=3, pool_heads=16)
-        assert adapter.output_num_tokens(16) == 4  # 4x4 -> ceil(4/3)=2 -> 2x2
-        assert adapter.output_num_tokens(196) == 25  # 14x14 -> ceil(14/3)=5 -> 5x5
+        assert adapter.output_num_tokens(16) == 4
+        assert adapter.output_num_tokens(196) == 25
 
     def test_ragged_edge_window_pools_only_real_patches(self):
-        # 4x4 grid, window 3 -> 2x2 windows; the bottom-right window (output token
-        # 3) has exactly one real patch (index 15). With the padded patches masked,
-        # attention over a single key is the identity on its value, so that
-        # window's output must equal out_proj(o_proj(v_proj(patch_15))).
         torch.manual_seed(0)
         adapter = AttentionalPoolAdapter(in_dim=32, out_dim=16, pool_window=3, pool_heads=4).eval()
-        x = torch.randn(1, 16, 32)  # 4x4 grid
+        x = torch.randn(1, 16, 32)
         with torch.no_grad():
-            out = adapter(x)  # (1, 4, 16)
-            real = x[:, 15:16]  # (1, 1, 32) — the window's only real patch
-            ref = adapter.out_proj(adapter.o_proj(adapter.v_proj(real)))  # (1, 1, 16)
+            out = adapter(x)
+            real = x[:, 15:16]
+            ref = adapter.out_proj(adapter.o_proj(adapter.v_proj(real)))
         assert torch.allclose(out[:, 3:4], ref, atol=1e-5)
 
     def test_worst_ragged_edge_remainder_one(self):
-        # grid % window == 1 is the worst ragged edge: the corner window covers a
-        # single real patch. 7x7 grid, window 3 -> ceil(7/3)=3 -> 9 tokens, and the
-        # last window's only real cell is (6,6) = flat index 48.
         torch.manual_seed(0)
         adapter = AttentionalPoolAdapter(in_dim=32, out_dim=16, pool_window=3, pool_heads=4).eval()
-        x = torch.randn(1, 49, 32)  # 7x7 grid
+        x = torch.randn(1, 49, 32)
         with torch.no_grad():
             out = adapter(x)
             ref = adapter.out_proj(adapter.o_proj(adapter.v_proj(x[:, 48:49])))
@@ -563,31 +492,23 @@ class TestAttentionalPoolAdapter:
         assert torch.allclose(out[:, 8:9], ref, atol=1e-5)
 
     def test_window_larger_than_grid(self):
-        # window > grid: everything pools into a single token (ceil(2/3)=1), with
-        # the 5 padded cells of the 3x3 window masked out.
         adapter = AttentionalPoolAdapter(in_dim=32, out_dim=16, pool_window=3, pool_heads=4)
-        out = adapter(torch.randn(2, 4, 32))  # 2x2 grid
+        out = adapter(torch.randn(2, 4, 32))
         assert out.shape == (2, 1, 16)
         assert adapter.output_num_tokens(4) == 1
         assert torch.isfinite(out).all()
 
     def test_window_equals_grid(self):
-        # window == grid is divisible, so it takes the unmasked path and emits one
-        # token per image.
         adapter = AttentionalPoolAdapter(in_dim=32, out_dim=16, pool_window=4, pool_heads=4)
-        out = adapter(torch.randn(2, 16, 32))  # 4x4 grid
+        out = adapter(torch.randn(2, 16, 32))
         assert out.shape == (2, 1, 16)
         assert adapter.output_num_tokens(16) == 1
 
     def test_non_square_input_raises(self):
-        # A non-perfect-square token count is still rejected: ragged pooling relaxes
-        # the divisibility requirement, not the square-grid one.
         adapter = AttentionalPoolAdapter(in_dim=32, out_dim=16, pool_window=3, pool_heads=4)
         with pytest.raises(ValueError, match="square patch grid"):
-            adapter(torch.randn(1, 8, 32))  # 8 is not a perfect square
+            adapter(torch.randn(1, 8, 32))
 
-    # (196, 2) and (16, 4) are divisible; the rest are ragged, including the
-    # remainder-1 worst edge (49, 3) and window > grid (4, 3).
     @pytest.mark.parametrize(
         ("n_in", "window"), [(16, 3), (49, 3), (4, 3), (196, 3), (196, 2), (16, 4), (25, 2)]
     )
@@ -646,13 +567,10 @@ class TestAttentionalPoolAdapter:
             assert torch.isfinite(p.grad).all()
 
     def test_backward_grads_flow_ragged(self):
-        # window 3 on a 4x4 grid is ragged -> exercises the masked SDPA + masked-mean
-        # query + clamp(min=1) backward, which the divisible window=2 case above never
-        # hits. Guards against NaN grads on the edge-window path.
         adapter = AttentionalPoolAdapter(in_dim=32, out_dim=16, pool_window=3, pool_heads=4).to(
             DEVICE
         )
-        x = torch.randn(1, 16, 32, device=DEVICE, requires_grad=True)  # 4x4 grid, ragged
+        x = torch.randn(1, 16, 32, device=DEVICE, requires_grad=True)
         adapter(x).sum().backward()
         for p in adapter.parameters():
             assert p.grad is not None
@@ -668,11 +586,6 @@ class TestAttentionalPoolAdapter:
         adapter = AttentionalPoolAdapter(in_dim=16, out_dim=8, pool_window=2, pool_heads=4)
         with pytest.raises(ValueError, match="pool_window must be positive"):
             adapter(torch.randn(1, 16, 16), pool_window=0)
-
-
-# ---------------------------------------------------------------------------
-# Pooling adapters: registry + config wiring
-# ---------------------------------------------------------------------------
 
 
 class TestPoolingAdapterRegistry:
@@ -719,16 +632,12 @@ class TestAdapterConfigPooling:
         assert AdapterConfig(type="attentional_pool", pool_window=3).output_num_tokens(729) == 81
 
     def test_attentional_output_num_tokens_allows_ragged(self):
-        # attentional_pool now pools ragged edges (masked partial windows), so the
-        # config-time count uses the same ceil math as avgpool — no rejection.
         assert AdapterConfig(type="attentional_pool", pool_window=3).output_num_tokens(196) == 25
 
     def test_avgpool_output_num_tokens_allows_ragged(self):
-        # avgpool pools ragged edges, so the same ragged grid is fine (ceil math).
         assert AdapterConfig(type="avgpool", pool_window=3).output_num_tokens(196) == 25
 
     def test_output_num_tokens_passthrough_on_sentinel(self):
-        # num_tokens=0 ("infer at build time") must not trigger the square check.
         assert AdapterConfig(type="avgpool").output_num_tokens(0) == 0
 
     @pytest.mark.parametrize("adapter_type", ["avgpool", "attentional_pool"])
@@ -746,7 +655,7 @@ class TestBuildAdapterPooling:
         adapter = build_adapter(cfg, in_dim=32, out_dim=16)
         assert isinstance(adapter, AvgPoolAdapter)
         assert adapter.pool_window == 2
-        out = adapter(torch.randn(1, 16, 32))  # 4x4 grid -> 2x2
+        out = adapter(torch.randn(1, 16, 32))
         assert out.shape == (1, 4, 16)
 
     def test_dispatches_to_attentional_with_heads(self):
@@ -755,10 +664,6 @@ class TestBuildAdapterPooling:
         assert isinstance(adapter, AttentionalPoolAdapter)
         assert adapter.pool_heads == 8
 
-
-# ---------------------------------------------------------------------------
-# mlp_2layer pre_norm
-# ---------------------------------------------------------------------------
 
 _REGISTERED_NORMS = sorted(registry.list("norm"))
 _PROJECTION_KEYS = {"proj1.weight", "proj1.bias", "proj2.weight", "proj2.bias"}
@@ -808,7 +713,7 @@ class TestMLP2LayerPreNorm:
     def test_forward_is_norm_then_mlp(self, norm):
         torch.manual_seed(0)
         adapter = MLP2LayerAdapter(in_dim=32, out_dim=16, pre_norm=norm).to(DEVICE)
-        x = torch.randn(2, 4, 32, device=DEVICE) * 10.0  # far from unit scale
+        x = torch.randn(2, 4, 32, device=DEVICE) * 10.0
         with torch.no_grad():
             expected = adapter.proj2(adapter.act(adapter.proj1(adapter.ln_q(x))))
             without_norm = adapter.proj2(adapter.act(adapter.proj1(x)))

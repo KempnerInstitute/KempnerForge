@@ -42,12 +42,7 @@ logger = logging.getLogger(__name__)
 
 SUPPORTED_MODEL_TYPES = ("qwen3",)
 
-# A shard index is named for the weights file it indexes, with an optional variant
-# before the suffix (``model.safetensors.index.fp16.json``), so it is matched rather
-# than named: an index the conversion did not recognise would silently read the
-# directory instead, which is what the index exists to prevent.
 _INDEX_GLOB = "*.safetensors.index*.json"
-# A snapshot directory is named after the commit it holds.
 _COMMIT = re.compile(r"[0-9a-f]{40}")
 
 EMBED_KEY = "token_embedding.embedding.weight"
@@ -147,8 +142,6 @@ def _source_rope(hf_config: dict[str, Any]) -> tuple[Any, Any, dict[str, Any], l
         return None, None, declared, problems
     parameters = getattr(resolved, "rope_parameters", None) or {}
     theta = parameters.get("rope_theta", getattr(resolved, "rope_theta", None))
-    # A release too old to resolve rope_parameters would otherwise read every
-    # source as unscaled; the type the source itself declares fills that gap.
     declared_type = next(iter(set(declared_types.values())), None)
     rope_type = parameters.get("rope_type") or declared_type or "default"
     return theta, rope_type, declared, problems
@@ -177,8 +170,6 @@ def check_config(hf_config: dict[str, Any], model: ModelConfig) -> None:
     }
     rope_theta, rope_type, declared_rope, problems = _source_rope(hf_config)
     if (rope_theta, rope_type) == (None, None):
-        # The library refused the config, which is already reported; what it would
-        # have resolved for the theta is unknown rather than missing.
         pairs.pop("rope_theta")
     for hf_key, (kf_name, kf_value) in pairs.items():
         hf_value = rope_theta if hf_key == "rope_theta" else hf_config.get(hf_key)
@@ -187,8 +178,6 @@ def check_config(hf_config: dict[str, Any], model: ModelConfig) -> None:
         elif hf_value == kf_value:
             continue
         elif hf_key == "rope_theta" and not declared_rope:
-            # The value is the library's own default, so grepping config.json for it
-            # finds nothing.
             problems.append(
                 f"config.json gives no RoPE theta, so the installed transformers applies "
                 f"{hf_value!r}, but model.{kf_name}={kf_value!r}"
@@ -389,8 +378,6 @@ def convert(hf_dir: str, config_path: str, out: str, seed: int | None = None) ->
     hf_config = load_source_config(source)
     check_config(hf_config, config.model)
 
-    # Everything that depends only on the target is settled before the weights are
-    # fetched, so a source this config cannot host costs no download.
     seed = config.train.seed if seed is None else seed
     torch.manual_seed(seed)
     wrapper = build_vlm_wrapper(

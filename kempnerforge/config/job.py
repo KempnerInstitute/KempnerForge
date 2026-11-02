@@ -19,11 +19,6 @@ from kempnerforge.config.video import VideoConfig
 from kempnerforge.config.vision import VisionEncoderConfig
 from kempnerforge.config.vlm import MoMaConfig, VLMConfig
 
-# Vision-encoder types whose builders load a HuggingFace model and probe
-# feature_dim / num_tokens from the model's config. Setting these knobs
-# explicitly in the TOML overrides the probe and is almost always a
-# user mistake. The "random" stub is excluded because it has no model
-# to probe and the user-supplied values are the actual values.
 _HF_VISION_ENCODER_TYPES = frozenset({"siglip2", "clip"})
 
 
@@ -53,9 +48,6 @@ class JobConfig:
     adapter: AdapterConfig | None = None
     vlm: VLMConfig | None = None
     video: VideoConfig | None = None
-    # Module paths the loader imports before building this config, so
-    # out-of-tree components (an experiment's dataset, adapter, ...) are in
-    # the registry by the time a config field validates against it.
     plugins: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
@@ -76,16 +68,7 @@ class JobConfig:
                     "vision encoder section."
                 )
             if self.adapter is None:
-                # Materialize the default adapter so downstream callers always
-                # see a non-None AdapterConfig once [vlm] is present.
                 self.adapter = AdapterConfig()
-            # HF-backed encoder override warning. SigLIP2 / CLIP encoders
-            # probe their own feature_dim and num_tokens from the loaded
-            # HF model. Setting these to non-zero values in the TOML
-            # overrides the probe at build time and silently desyncs from
-            # the actual model, so warn the user. The override is still
-            # legal (the builder applies it post-probe) so this is a
-            # warning, not an error.
             if self.vision_encoder.type in _HF_VISION_ENCODER_TYPES and (
                 self.vision_encoder.feature_dim > 0 or self.vision_encoder.num_tokens > 0
             ):
@@ -103,16 +86,8 @@ class JobConfig:
                     self.vision_encoder.type,
                     " and ".join(overrides),
                 )
-            # max_seq_len cross-check. Effective residual-stream length is
-            # residual_stream_image_tokens(num_tokens) + max_text_len.
-            #   - Joint-Decoder / MoT: residual is num_tokens + max_text_len.
-            #   - Cross-Attention: residual is text-only (max_text_len), the
-            #     encoder's num_tokens flows side-channel into CA blocks.
-            # Only fires when num_tokens > 0; num_tokens == 0 (the "infer at
-            # build time" sentinel) defers the check to ``build_vlm_wrapper``
-            # / ``_build_vlm`` using the encoder's resolved value.
             if self.vision_encoder.num_tokens > 0:
-                assert self.adapter is not None  # materialized in __post_init__ when [vlm] set
+                assert self.adapter is not None
                 per_frame = self.adapter.output_num_tokens(self.vision_encoder.num_tokens)
                 frames = self.video.max_frames if self.video is not None else 1
                 visual_tokens = frames * per_frame
@@ -131,8 +106,6 @@ class JobConfig:
                 "the VLM wrapper, so a [vlm] section (and [vision_encoder]) is required."
             )
 
-        # Below one mask block, an Inductor-compiled model leaks attention across
-        # document boundaries; see FLEX_BLOCK_SIZE for the measurements.
         if self.model.attention_backend == "flex" and self.train.seq_len < FLEX_BLOCK_SIZE:
             raise ValueError(
                 f"attention_backend='flex' requires train.seq_len >= {FLEX_BLOCK_SIZE}, "
@@ -215,19 +188,10 @@ class JobConfig:
                 )
 
         if self.is_vlm:
-            assert self.vlm is not None  # narrowed by is_vlm
-            assert self.vision_encoder is not None  # __post_init__ enforces this
-            # train.seq_len drives the attention sequence length. The
-            # effective residual-stream length is
-            # vlm.residual_stream_image_tokens(num_tokens) + max_text_len:
-            #   - Joint-Decoder / MoT: residual_stream_image_tokens == num_tokens
-            #     (image tokens prepended to text).
-            #   - Cross-Attention: residual_stream_image_tokens == 0 (image
-            #     features flow side-channel into CA blocks; residual is
-            #     text-only).
-            # num_tokens=0 is deferred to build_vlm_wrapper.
+            assert self.vlm is not None
+            assert self.vision_encoder is not None
             if self.vision_encoder.num_tokens > 0:
-                assert self.adapter is not None  # materialized in __post_init__ when [vlm] set
+                assert self.adapter is not None
                 per_frame = self.adapter.output_num_tokens(self.vision_encoder.num_tokens)
                 frames = self.video.max_frames if self.video is not None else 1
                 visual_tokens = frames * per_frame
@@ -244,21 +208,8 @@ class JobConfig:
                     "VLM + Pipeline Parallelism is not supported on this branch. "
                     "The vlm-cross-attention branch will address PP integration."
                 )
-            # VLM + MoE is supported. The FSDP2 wrap helper is EP-MoE aware
-            # for both paths (Fix 5), and the step body routes set_moe_step
-            # / get_moe_aux_loss through inner_transformer(model) so the VLM
-            # wrapper does not hide the MoE methods. Live-tested on a tiny
-            # CA + MoE config: CE 10.4 -> 4.5 over 8 steps under 2-GPU FSDP2;
-            # aux_loss bounded; tests/integration + tests/distributed cover
-            # the build + forward + backward path. CrossAttentionBlocks
-            # themselves remain dense MLP; MoE lives in the text
-            # TransformerBlocks (where moe_frequency selects).
 
             if isinstance(self.vlm, MoMaConfig):
-                # MoMa carries its own per-modality expert counts on
-                # ``moma_experts_per_modality``; ``model.num_experts``
-                # would be a redundant second source of truth, so we
-                # reject it explicitly rather than silently ignoring.
                 if self.model.num_experts > 0:
                     raise ValueError(
                         "MoMa + model.num_experts > 0 is rejected. MoMa derives expert "
@@ -279,14 +230,6 @@ class JobConfig:
                         "graph breaks). Set compile_model=false for MoMa models."
                     )
 
-                # AC=full silently no-ops on MoMa because apply_ac matches
-                # isinstance(m, TransformerBlock) only and MoMaBlock is a
-                # sibling nn.Module. The selective branch wraps
-                # isinstance(m, Attention), and MoMaBlock.attention is a
-                # vanilla Attention, so 'selective' DOES work on MoMa today
-                # — only 'full' is broken. The cross-arch apply_ac refactor
-                # will make 'full' work; until then surface the silent
-                # no-op explicitly so fresh MoMa configs don't trust it.
                 if self.train.activation_checkpointing == "full":
                     import logging
 

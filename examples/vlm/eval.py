@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 # pyright: reportMissingImports=false
-# ^ lmms-eval is an optional, undeclared dependency; see lmms_adapter.py's directive.
 """Run lmms-eval benchmarks on a KempnerForge VLM checkpoint.
 
 Evaluates a VLM checkpoint via the ``KempnerForgeVLM`` lmms-eval chat-model
@@ -74,8 +73,6 @@ def main() -> None:
     parser.add_argument(
         "--checkpoint", type=str, required=True, help="DCP checkpoint dir (run dir or step_N dir)"
     )
-    # No default task suite: the representative default benchmark set is an open
-    # decision; --tasks is required until one is provided.
     parser.add_argument(
         "--tasks", type=str, required=True, help="Comma-separated lmms-eval task names"
     )
@@ -112,7 +109,6 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    # lmms-eval is optional and undeclared; import lazily with a helpful error.
     try:
         from lmms_eval.evaluator import simple_evaluate
     except ImportError as exc:
@@ -125,14 +121,10 @@ def main() -> None:
         )
         sys.exit(1)
 
-    # The adapter imports lmms-eval at module top; the guard above already proved
-    # it importable. The script's own directory is sys.path[0], so the sibling
-    # lmms_adapter.py resolves as a top-level module.
     from eval_publish import preflight, publish_results
     from lmms_adapter import KempnerForgeVLM, resolve_checkpoint
 
     logger.info(f"Running lmms-eval: tasks={args.tasks}, checkpoint={args.checkpoint}")
-    # Resolved once: the scores are published at the step whose weights were scored.
     checkpoint = resolve_checkpoint(args.checkpoint)
 
     model_args = (
@@ -146,15 +138,12 @@ def main() -> None:
         device=args.device,
         batch_size=args.batch_size,
         max_new_tokens=args.max_new_tokens,
-        dtype=args.dtype,  # None -> the adapter defaults it to train.param_dtype
+        dtype=args.dtype,
     )
     if not args.no_publish:
         preflight(checkpoint, args.limit)
     results = simple_evaluate(
         model=model,
-        # Record-only on the prebuilt-instance path: simple_evaluate never
-        # constructs or configures the model from these, it stores them in
-        # results["config"] so a run stays identifiable.
         model_args=model_args,
         tasks=args.tasks.split(","),
         device=args.device,
@@ -162,7 +151,6 @@ def main() -> None:
         limit=args.limit,
     )
 
-    # --- Print results ---
     print(f"\n{'=' * 60}")
     print("lmms-eval Results")
     print(f"{'=' * 60}")
@@ -176,7 +164,6 @@ def main() -> None:
                     print(f"    {metric}: {value}")
     print(f"{'=' * 60}\n")
 
-    # --- Save results ---
     if args.output:
         output_path = Path(args.output)
         output_path.parent.mkdir(parents=True, exist_ok=True)

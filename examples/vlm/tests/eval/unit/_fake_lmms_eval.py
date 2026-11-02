@@ -28,10 +28,6 @@ import types
 from collections.abc import Callable
 from typing import Any
 
-# --------------------------------------------------------------------------- #
-# lmms_eval.protocol.ChatMessages
-# --------------------------------------------------------------------------- #
-
 
 class _Content:
     def __init__(self, block: dict) -> None:
@@ -67,13 +63,7 @@ class ChatMessages:
         return images, videos, audios
 
 
-# --------------------------------------------------------------------------- #
-# lmms_eval.utils.Collator
-# --------------------------------------------------------------------------- #
-
-
 def _hashable_key(group: dict) -> tuple:
-    # Mirror the real Collator: list/tuple values are tupled so the dict is hashable.
     return tuple(
         (key, tuple(value) if isinstance(value, (list, tuple)) else value)
         for key, value in sorted(group.items())
@@ -101,7 +91,7 @@ class Collator:
             self._groups = [indexed]
 
     def get_batched(self, n: int = 1, batch_fn: Callable | None = None):
-        del batch_fn  # the adapter always passes None; size-by-n only
+        del batch_fn
         for group in self._groups:
             ordered = sorted(group, key=lambda pair: self._sort_fn(pair[1]))
             self.reorder_indices.extend(idx for idx, _ in ordered)
@@ -117,11 +107,6 @@ class Collator:
 
     def __len__(self) -> int:
         return self.size
-
-
-# --------------------------------------------------------------------------- #
-# lmms_eval.api.model.lmms
-# --------------------------------------------------------------------------- #
 
 
 class _CacheHook:
@@ -147,11 +132,6 @@ class lmms:  # noqa: N801 — mirrors the real lowercase class name
         return self._world_size
 
 
-# --------------------------------------------------------------------------- #
-# lmms_eval.api.instance.Instance
-# --------------------------------------------------------------------------- #
-
-
 @dataclasses.dataclass
 class Instance:
     request_type: str
@@ -170,11 +150,6 @@ class Instance:
     @property
     def args(self) -> tuple:
         return self.arguments if isinstance(self.arguments, tuple) else (self.arguments,)
-
-
-# --------------------------------------------------------------------------- #
-# Module tree assembly
-# --------------------------------------------------------------------------- #
 
 
 def build_modules() -> dict[str, types.ModuleType]:

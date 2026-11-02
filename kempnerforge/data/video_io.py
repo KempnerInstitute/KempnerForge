@@ -41,14 +41,10 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 logger = logging.getLogger(__name__)
 
-# AV_TIME_BASE: container.duration is expressed in microseconds.
 _AV_TIME_BASE = 1_000_000.0
 
-# A seek target this far (about 68 years) past a stream's start lies beyond its end, yet
-# stays within int64 when a demuxer rescales it to nanoseconds.
 _PAST_END_S = 1 << 31
 
-# Slack (seconds) when matching a decoded frame's timestamp against a target.
 _MATCH_EPS_S = 1e-3
 
 
@@ -150,10 +146,10 @@ def _span(
     begins = float(start * time_base)
     extent = float((end - start) * time_base)
     if metadata > 0:
-        as_end = metadata - begins  # read as an end time on the stream clock
+        as_end = metadata - begins
         if as_end >= extent and as_end > 0:
             return begins, as_end
-        if metadata >= extent:  # read as a length
+        if metadata >= extent:
             return begins, metadata
     pts = (sorted(p for p, _ in run) for run in runs)
     steps = [b - a for run in pts for a, b in itertools.pairwise(run) if b > a]
@@ -216,7 +212,7 @@ def _read_extent(
             start = pts if start is None else min(start, pts)
         if start is not None and dts is not None and dts >= start and len(head) > 1:
             break
-    else:  # the whole stream was read
+    else:
         return None if start is None else _span(start, [head], time_base, metadata)
     try:
         container.seek(start + int(_PAST_END_S / time_base), stream=stream)
@@ -302,7 +298,7 @@ def decode_video_frames(
     callers that train over noisy data should catch and substitute an empty clip.
     """
     try:
-        import av  # lazy: bundled-FFmpeg decoder, optional (the "video" dep group)
+        import av
     except ImportError as e:  # pragma: no cover - only triggered without PyAV installed
         raise ImportError(
             "Video decoding requires PyAV, an optional dependency. "
@@ -316,14 +312,14 @@ def decode_video_frames(
         stream = container.streams.video[0]
         stream.thread_type = "AUTO"
         extent, packets, rewind = _video_extent(container, stream, path)
-        if extent is None:  # no packet timestamps: the metadata span, times from frame one
+        if extent is None:
             targets = sample(
                 _video_duration_seconds(stream, container), fps, min_frames, max_frames
             )
             return _decode_serial(packets, targets, None)
         start, span = extent
         targets = sample(span, fps, min_frames, max_frames)
-        if rewind is None:  # the stream cannot be read twice: one serial pass, no seeking
+        if rewind is None:
             return _decode_serial(packets, targets, start)
         try:
             return _decode_seek(container, stream, packets, targets, start)
@@ -390,8 +386,8 @@ def _decode_seek(
         last = None
         matched = False
         prev_key_t: float | None = None
-        gop_s = 0.0  # the longest keyframe interval seen, so groups are never over-counted
-        group = 0  # frames decoded since the last keyframe
+        gop_s = 0.0
+        group = 0
         skip_ahead = False
         for frame in (frame for packet in packets for frame in packet.decode()):
             ft = frame.time
@@ -431,7 +427,6 @@ def _decode_seek(
         if skip_ahead:
             seeked = True
             continue
-        # EOF: the remaining targets sit past the last frame.
         if last is None:
             raise _SeekUnreliableError(f"no frames decodable at or after {tgt:.3f}s")
         tail = last.to_image()
@@ -467,8 +462,6 @@ def _decode_serial(
         last_frame = frame
         if j >= len(targets):
             break
-    # Trailing targets (e.g. the final ``duration_s`` timestamp, which sits
-    # just past the last frame's PTS) map to the last decoded frame.
     if j < len(targets) and last_frame is not None:
         tail = last_frame.to_image()
         images.extend(tail for _ in range(len(targets) - j))

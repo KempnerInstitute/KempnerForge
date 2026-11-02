@@ -87,7 +87,6 @@ def main() -> None:
     if args.checkpoint is None and args.hf_model is None:
         parser.error("Provide either --checkpoint (DCP) or --hf-model (HuggingFace)")
 
-    # --- Resolve HF model path ---
     hf_model_path = args.hf_model
     tmp_dir = None
 
@@ -95,7 +94,6 @@ def main() -> None:
         if args.config is None:
             parser.error("--config is required when using --checkpoint")
 
-        # Convert DCP → HuggingFace
         sys.path.insert(0, str(Path(__file__).resolve().parent))
         from convert_checkpoint import dcp_to_hf
 
@@ -112,7 +110,6 @@ def main() -> None:
             model_config=config.model,
         )
 
-    # --- Run lm-eval-harness ---
     try:
         import lm_eval
     except ImportError:
@@ -133,7 +130,6 @@ def main() -> None:
         num_fewshot=args.num_fewshot,
     )
 
-    # --- Print results ---
     print(f"\n{'=' * 60}")
     print("lm-eval-harness Results")
     print(f"{'=' * 60}")
@@ -147,7 +143,6 @@ def main() -> None:
                     print(f"    {metric}: {value}")
     print(f"{'=' * 60}\n")
 
-    # --- Save results ---
     if args.output:
         output_path = Path(args.output)
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -155,7 +150,6 @@ def main() -> None:
             json.dump(results, f, indent=2, default=str)
         logger.info(f"Results saved to {output_path}")
 
-    # Cleanup temp dir
     if tmp_dir is not None:
         import shutil
 
