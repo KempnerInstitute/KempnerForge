@@ -474,6 +474,10 @@ class TestConfigRefusals:
                 lambda c: [c.pop(field, None) for field in _ROPE_FIELDS],
                 "config.json gives no RoPE theta, so the installed transformers applies",
             ),
+            (
+                lambda c: c.pop("tie_word_embeddings"),
+                "config.json has no tie_word_embeddings",
+            ),
         ],
         ids=[
             "model_type",
@@ -487,6 +491,7 @@ class TestConfigRefusals:
             "rope_scaling_carries_another_theta",
             "rope_scaling_names_two_types",
             "rope_theta_declared_nowhere",
+            "tie_word_embeddings_missing",
         ],
     )
     def test_source_the_target_cannot_express(
