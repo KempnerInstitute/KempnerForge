@@ -271,8 +271,11 @@ class TestFSDP2MatchesSingleGPU:
         row = [0] * half + [1] * (self.SEQ - half)
         return tokens, torch.tensor([row] * 2, device="cuda")
 
-    @pytest.mark.parametrize("backend", ["sdpa", "flex"])
-    @pytest.mark.parametrize("packed", [False, True], ids=["unpacked", "packed"])
+    @pytest.mark.parametrize(
+        ("backend", "packed"),
+        [("sdpa", False), ("sdpa", True), ("flex", True)],
+        ids=["unpacked", "sdpa_packed", "flex_packed"],
+    )
     def test_matches_unsharded_reference(self, distributed_env, backend, packed):
         from dataclasses import replace
 

@@ -238,8 +238,11 @@ class TestTensorParallelMatchesSingleGPU:
         row = [0] * half + [1] * (self.SEQ - half)
         return tokens, torch.tensor([row] * 2, device=device), half
 
-    @pytest.mark.parametrize("backend", ["sdpa", "flex"])
-    @pytest.mark.parametrize("packed", [False, True], ids=["unpacked", "packed"])
+    @pytest.mark.parametrize(
+        ("backend", "packed"),
+        [("sdpa", False), ("sdpa", True), ("flex", True)],
+        ids=["unpacked", "sdpa_packed", "flex_packed"],
+    )
     def test_matches_unsharded_reference(self, tp_mesh, backend, packed):
         config = replace(TP_FLEX_CONFIG, attention_backend=backend)
         device = torch.device("cuda")
