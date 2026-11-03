@@ -258,6 +258,7 @@ DCP-based checkpointing.
 | `load_path` | `str \| None` | `None` | explicit resume path (overrides `latest` symlink) |
 | `export_dtype` | `"float32" \| "bfloat16"` | `"bfloat16"` | dtype for HF exports via `scripts/convert_checkpoint.py` |
 | `exclude_from_loading` | `list[str]` | `[]` | state keys to skip when warm-starting from `load_path` — `"model"` and/or `"optimizer"`; ignored on a resume, which always restores full state |
+| `ignore_freeze_mismatch` | `bool` | `False` | load a checkpoint whose VLM freeze metadata disagrees with the configured freeze specs, downgrading the error to a warning |
 
 ### `[checkpoint.dyn_ckpt_window]` — `DynamicCheckpointWindow`
 
