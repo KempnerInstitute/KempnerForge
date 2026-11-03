@@ -62,10 +62,10 @@ def grouped_expert_forward(
     if x_sorted.shape[0] == 0:
         return torch.zeros_like(x_sorted)
     offs = _group_offsets(x_sorted, tokens_per_expert)
-    up_w = torch.stack([e.up_proj.weight.t() for e in experts])  # type: ignore[reportCallIssue, reportAttributeAccessIssue]  # (E, dim, H)
-    down_w = torch.stack([e.down_proj.weight.t() for e in experts])  # type: ignore[reportCallIssue, reportAttributeAccessIssue]  # (E, H, dim)
+    up_w = torch.stack([e.up_proj.weight.t() for e in experts])  # type: ignore[reportCallIssue, reportAttributeAccessIssue]
+    down_w = torch.stack([e.down_proj.weight.t() for e in experts])  # type: ignore[reportCallIssue, reportAttributeAccessIssue]
     if hasattr(experts[0], "gate_proj"):
-        gate_w = torch.stack([e.gate_proj.weight.t() for e in experts])  # type: ignore[reportCallIssue, reportAttributeAccessIssue]  # (E, dim, H)
+        gate_w = torch.stack([e.gate_proj.weight.t() for e in experts])  # type: ignore[reportCallIssue, reportAttributeAccessIssue]
         hidden = F.silu(_grouped_mm(x_sorted, gate_w, offs)) * _grouped_mm(x_sorted, up_w, offs)
     else:
         act_fn = experts[0]._activation

@@ -108,7 +108,7 @@ def _dense_flops_per_token(config: ModelConfig, seq_len: int) -> int:
     attn_dim = config.n_heads * head_dim
     attn_params = (
         config.dim * attn_dim
-        + 2 * config.dim * (config.n_kv_heads * head_dim)  # type: ignore[reportOptionalOperand]  # K+V
+        + 2 * config.dim * (config.n_kv_heads * head_dim)  # type: ignore[reportOptionalOperand]
         + attn_dim * config.dim
     )
     mlp_params = 3 * config.dim * config.computed_ffn_hidden_dim

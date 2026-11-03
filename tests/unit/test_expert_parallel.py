@@ -60,7 +60,7 @@ def _ep(moe, x, weights, indices, gradient_scale=False):
         weights,
         indices,
         moe,
-        None,  # type: ignore[arg-type]  # no process group behind the identity all-to-all
+        None,  # type: ignore[arg-type]
         local_expert_start=0,
         num_local_experts=NUM_EXPERTS,
         ep_world_size=1,
