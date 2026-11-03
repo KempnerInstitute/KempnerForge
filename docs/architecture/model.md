@@ -133,9 +133,9 @@ copies.
 `sdpa_backend` (default `"auto"`) selects flash / mem-efficient / cudnn /
 math via a context manager. `"auto"` lets PyTorch pick. Under
 `attention_backend="flex"` it no longer reaches packed batches, which never
-route through the SDPA kernel selector, but unpacked ones still do: eval,
-which never packs, and any run with packing off. Setting both logs a
-warning.
+route through the SDPA kernel selector, but batches without `doc_ids` still
+do: eval, since `run_eval` never passes them, and any run with packing off.
+Setting both logs a warning.
 
 ### Attention backend
 

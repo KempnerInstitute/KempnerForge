@@ -195,9 +195,11 @@ the two are near parity below about 1k; on 4 GPUs under FSDP, flex is
 See [Model § Attention backend](../architecture/model.md) for the full
 table.
 
-One caveat worth knowing before turning packing on: **eval does not
-pack.** `_EvalTensorDataset` emits no `doc_ids`, so evaluation always
-runs plain causal attention even when training is packed. Eval loss is
+One caveat worth knowing before turning packing on: **eval has no
+document mask.** Eval windows hold several concatenated documents too,
+but `run_eval` never passes `doc_ids` to the model, so evaluation runs
+plain causal attention across document boundaries even when training is
+packed, whichever eval dataset is configured. Eval loss is
 therefore computed under slightly different masking than training loss.
 Pre-existing, and worth remembering when comparing the two curves.
 
