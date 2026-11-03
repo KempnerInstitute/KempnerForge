@@ -105,7 +105,7 @@ class TestDecodeVideoFramesIntegration:
     def test_missing_file_raises(self):
         from kempnerforge.data.video_io import decode_video_frames
 
-        with pytest.raises(Exception):  # noqa: B017,PT011 - any av/OS error is acceptable
+        with pytest.raises(Exception):  # noqa: B017,PT011
             decode_video_frames("/no/such/video.mp4", fps=2.0, min_frames=4, max_frames=8)
 
 
@@ -961,7 +961,7 @@ class TestVideoExtent:
                 result["frames"] = decode_video_frames(
                     str(pipe), fps=2.0, min_frames=4, max_frames=4
                 )
-            except BaseException as e:  # noqa: BLE001 - reported below
+            except BaseException as e:  # noqa: BLE001
                 result["error"] = e
 
         monkeypatch.setattr(av, "open", _open_once)
@@ -2080,7 +2080,7 @@ class TestSeekFallback:
                 result["frames"] = video_io.decode_video_frames(
                     str(pipe), fps=2.0, min_frames=4, max_frames=4
                 )
-            except BaseException as e:  # noqa: BLE001 - reported below
+            except BaseException as e:  # noqa: BLE001
                 result["error"] = e
 
         feeder = threading.Thread(target=_feed, daemon=True)

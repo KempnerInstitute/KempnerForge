@@ -34,7 +34,7 @@ from typing import TYPE_CHECKING, Any
 
 from kempnerforge.config.registry import registry
 
-if TYPE_CHECKING:  # pragma: no cover - typing only
+if TYPE_CHECKING:  # pragma: no cover
     from fractions import Fraction
 
     from PIL.Image import Image as PILImage
@@ -299,7 +299,7 @@ def decode_video_frames(
     """
     try:
         import av
-    except ImportError as e:  # pragma: no cover - only triggered without PyAV installed
+    except ImportError as e:  # pragma: no cover
         raise ImportError(
             "Video decoding requires PyAV, an optional dependency. "
             "Install the video extra: `uv sync --group video`."

@@ -137,7 +137,7 @@ leave `save()` while the other ranks wait in its barrier.
 
 ## Edge cases
 
-- **A rank wedged in the train-state broadcast** — PyTorch's
+- **A rank wedged in the train-state broadcast**: PyTorch's
   `broadcast_object_list` takes no `async_op`, so this call carries no
   per-operation timeout and inherits the process group's 1800 s default.
   A wedged rank still surfaces, just later than the other fast-fail

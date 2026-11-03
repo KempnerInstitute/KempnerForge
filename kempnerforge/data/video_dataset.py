@@ -187,7 +187,7 @@ class WebVidVideoDataset(VideoDataset):
                 max_frames=self._max_frames,
                 sampling_policy=self._sampling_policy,
             )
-        except Exception as e:  # noqa: BLE001 - any decode failure -> skip-with-mask
+        except Exception as e:  # noqa: BLE001
             logger.debug("video decode failed for %s: %s", path, e)
             frames = []
 

@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import kempnerforge.model.router  # noqa: F401 — triggers router registration
+import kempnerforge.model.router  # noqa: F401
 from kempnerforge.config.registry import registry
 from kempnerforge.model.mlp import build_mlp
 

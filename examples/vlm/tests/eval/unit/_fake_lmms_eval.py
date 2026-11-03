@@ -114,7 +114,7 @@ class _CacheHook:
         pass
 
 
-class lmms:  # noqa: N801 — mirrors the real lowercase class name
+class lmms:  # noqa: N801
     is_simple: bool = True
 
     def __init__(self) -> None:

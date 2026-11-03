@@ -137,7 +137,7 @@ def _source_rope(hf_config: dict[str, Any]) -> tuple[Any, Any, dict[str, Any], l
     source_config = {k: v for k, v in hf_config.items() if k != "model_type"}
     try:
         resolved = AutoConfig.for_model(hf_config["model_type"], **source_config)
-    except Exception as error:  # noqa: BLE001 - any rejection is the source's, and refuses it
+    except Exception as error:  # noqa: BLE001
         problems.append(f"the installed transformers does not accept the source's config: {error}")
         return None, None, declared, problems
     parameters = getattr(resolved, "rope_parameters", None) or {}
