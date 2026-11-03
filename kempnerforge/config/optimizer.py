@@ -21,10 +21,11 @@ class OptimizerConfig:
     # Muon-specific
     muon_momentum: float = 0.95  # Momentum coefficient for Muon
     muon_ns_steps: int = 5  # Newton-Schulz iteration steps for Muon
-    muon_adam_lr: float | None = None  # LR for 1D params in Muon's AdamW fallback; None=same as lr
+    muon_adam_lr: float | None = None  # LR for the params Muon leaves to AdamW; None=same as lr
     muon_nesterov: bool = False
     muon_adjust_lr: str = "original"
     muon_orthogonalize: str = "local"
+    muon_router: bool = False
     # Schedule-Free specific
     schedule_free_warmup_steps: int = 0  # Internal warmup for schedule-free optimizer
 

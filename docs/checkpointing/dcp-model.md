@@ -85,12 +85,11 @@ metadata. Those go in `train_state.pt` alongside —
 
 `get_optimizer_state_dict` keeps only an optimizer's own `state` and
 `param_groups`; any other key its `state_dict()` returns is dropped.
-Muon hands the parameters Newton-Schulz cannot take — norms and
-biases, plus the embedding and output head whenever
-`vocab_size / dim > 10` — to an inner `torch.optim.AdamW` that its own
-`param_groups` do not list, so passing Muon alone would leave that
-AdamW's moments out of the checkpoint and restart them from zero on
-every resume.
+Muon hands every parameter but the hidden `nn.Linear` weights — the
+embedding and output head, MoE router gates, norms and biases — to an
+inner `torch.optim.AdamW` that its own `param_groups` do not list, so
+passing Muon alone would leave that AdamW's moments out of the
+checkpoint and restart them from zero on every resume.
 
 `Muon.inner_optimizers` names the inner AdamW, and the manager's
 `checkpointed_optimizers` — `[optimizer, *optimizer.inner_optimizers]` —

@@ -10,14 +10,27 @@ import torch
 import torch.nn as nn
 from torch.overrides import TorchFunctionMode
 
-from kempnerforge.config.schema import OptimizerConfig
+from kempnerforge.config.schema import ModelConfig, OptimizerConfig
+from kempnerforge.model.moma import ExpertChoiceMoE
+from kempnerforge.model.transformer import Transformer
 from kempnerforge.training.optimizer import (
     Muon,
-    _is_muon_eligible,
     _muon_update_scale,
     _newton_schulz,
     build_optimizer,
 )
+
+
+def _split(optimizer: Muon) -> tuple[set[torch.Tensor], set[torch.Tensor]]:
+    """The parameters Muon orthogonalizes and the ones its inner AdamW updates."""
+    muon = {p for group in optimizer.param_groups for p in group["params"]}
+    adam = {
+        p
+        for inner in optimizer.inner_optimizers
+        for group in inner.param_groups
+        for p in group["params"]
+    }
+    return muon, adam
 
 
 class _OutputShapes(TorchFunctionMode):
@@ -224,27 +237,9 @@ class TestMuon:
         assert isinstance(optimizer, Muon)
         assert optimizer._adam is not None
 
-        # Muon params should all be eligible (2D with reasonable aspect ratio)
-        muon_params = [p for g in optimizer.param_groups for p in g["params"]]
-        for p in muon_params:
-            assert _is_muon_eligible(p), "Muon should only get NS-eligible params"
-
-    def test_rectangular_params_use_adam(self):
-        """Highly rectangular params (embeddings) should use AdamW, not Muon."""
-        model = nn.Sequential(
-            nn.Embedding(32000, 64),  # aspect ratio 500:1 — too rectangular
-            nn.Linear(64, 64),
-        )
-        config = OptimizerConfig(name="muon", lr=0.01)
-        optimizer = build_optimizer(model, config)
-
-        muon_params = [p for g in optimizer.param_groups for p in g["params"]]
-        adam_params = [p for g in optimizer._adam.param_groups for p in g["params"]]
-
-        # Embedding weight (32000x64) should be in AdamW
-        assert any(p.shape == (32000, 64) for p in adam_params)
-        # Linear weight (64x64) should be in Muon
-        assert any(p.shape == (64, 64) for p in muon_params)
+        muon, adam = _split(optimizer)
+        assert muon == {model[0].weight, model[2].weight}
+        assert adam == {model[0].bias, model[2].bias}
 
     def test_produces_finite_updates(self):
         """All parameters should remain finite after Muon steps."""
@@ -540,6 +535,76 @@ class TestMuon:
         optimizer.load_state_dict(saved)
         assert optimizer.param_groups[0]["nesterov"] is False
         assert optimizer.param_groups[0]["adjust_lr"] == "original"
+
+
+class TestMuonRouting:
+    """Muon takes the hidden ``nn.Linear`` weights; its inner AdamW takes the rest."""
+
+    @staticmethod
+    def _model(**overrides: Any) -> Transformer:
+        config = {"dim": 64, "n_layers": 1, "n_heads": 2, "vocab_size": 128, "max_seq_len": 16}
+        return Transformer(ModelConfig(**(config | overrides)))
+
+    @pytest.mark.parametrize("tie_embeddings", [False, True])
+    @pytest.mark.parametrize("vocab_size", [128, 4096])
+    def test_embedding_and_head_use_adam_at_any_vocab(self, vocab_size, tie_embeddings):
+        """A vocab within or beyond 10x the width leaves the embedding and head to AdamW."""
+        model = self._model(vocab_size=vocab_size, tie_embeddings=tie_embeddings)
+        assert model.token_embedding is not None and model.output_head is not None
+        head = model.output_head.proj.weight
+        hidden = {m.weight for m in model.modules() if isinstance(m, nn.Linear)} - {head}
+        muon, adam = _split(build_optimizer(model, OptimizerConfig(name="muon")))
+        assert muon == hidden
+        assert adam == set(model.parameters()) - hidden
+        assert {model.token_embedding.embedding.weight, head} <= adam
+
+    def test_vision_input_layers_use_adam(self):
+        """A patch-embedding conv and a position table go to AdamW at shapes NS could take."""
+        tower = nn.ModuleDict(
+            {
+                "patch_embedding": nn.Conv2d(3, 48, kernel_size=4, stride=4),
+                "position_embedding": nn.Embedding(16, 48),
+                "fc": nn.Linear(48, 48),
+            }
+        )
+        muon, adam = _split(build_optimizer(tower, OptimizerConfig(name="muon")))
+        assert muon == {tower["fc"].weight}
+        assert {tower["patch_embedding"].weight, tower["position_embedding"].weight} <= adam
+
+    def test_narrow_and_tall_linear_weights_use_muon(self):
+        """A Linear weight goes to Muon however rectangular it is."""
+        model = nn.Sequential(nn.Linear(256, 8), nn.Linear(8, 256))
+        muon, _ = _split(build_optimizer(model, OptimizerConfig(name="muon")))
+        assert muon == {model[0].weight, model[1].weight}
+
+    @pytest.mark.parametrize("muon_router", [None, False, True])
+    def test_moe_router_gate_follows_muon_router(self, muon_router):
+        """The router gate goes to Muon only with muon_router; the experts go to Muon always."""
+        model = self._model(num_experts=4, moe_top_k=2, moe_router="sigmoid_topk")
+        moe = model.layers["0"].mlp
+        options = {} if muon_router is None else {"muon_router": muon_router}
+        muon, adam = _split(build_optimizer(model, OptimizerConfig(name="muon", **options)))
+        on_muon = bool(muon_router)
+        assert (moe.router.gate.weight in muon) is on_muon
+        assert (moe.router.gate.weight in adam) is not on_muon
+        assert moe.router.expert_bias in adam
+        assert {expert.up_proj.weight for expert in moe.experts} <= muon
+
+    @pytest.mark.parametrize("muon_router", [False, True])
+    def test_moma_router_gate_follows_muon_router(self, muon_router):
+        """MoMa's expert-choice router gate follows muon_router too."""
+        moe = ExpertChoiceMoE(dim=32, hidden_dim=64, num_experts=4, capacity_factor=1.0)
+        config = OptimizerConfig(name="muon", muon_router=muon_router)
+        muon, adam = _split(build_optimizer(moe, config))
+        assert (moe.router.gate.weight in muon) is muon_router
+        assert (moe.router.gate.weight in adam) is not muon_router
+
+    def test_packed_experts_use_adam(self):
+        """Packed 3-D expert weights go to AdamW."""
+        model = self._model(num_experts=4, moe_top_k=2, moe_packed_experts=True)
+        moe = model.layers["0"].mlp
+        _, adam = _split(build_optimizer(model, OptimizerConfig(name="muon")))
+        assert {moe.up_w, moe.down_w, moe.gate_w} <= adam
 
 
 class TestAdamW:

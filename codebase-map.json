@@ -731,7 +731,7 @@
       "functions": [
         "build_optimizer(model, config) -> Optimizer",
         "_newton_schulz(G, steps) -> Tensor",
-        "_is_muon_eligible(param) -> bool",
+        "_muon_matrices(model, routers) -> set[Tensor]",
         "_should_decay(name, param) -> bool"
       ],
       "registry": [
