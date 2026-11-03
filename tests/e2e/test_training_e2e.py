@@ -1042,6 +1042,7 @@ def test_7b_tp_fsdp_compile(tmp_path):
     result = _run_training(
         [
             BENCH_CONFIG,
+            "--data.dataset_path=",
             "--train.max_steps=5",
             "--metrics.log_interval=5",
             "--distributed.tp=2",
