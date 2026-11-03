@@ -84,6 +84,7 @@ from kempnerforge.metrics.logger import get_logger
 from kempnerforge.model.generate import sample
 from kempnerforge.model.vlm import VLMWrapper, build_vlm_wrapper
 from kempnerforge.resilience.elastic import resolve_resume_path
+from kempnerforge.training.runtime import apply_matmul_precision
 
 logger = get_logger(__name__)
 
@@ -561,6 +562,7 @@ class KempnerForgeVLM(lmms):
             raise ValueError(f"max_new_tokens must be >= 1, got {self._default_max_new_tokens}")
         self._config = _load_config(config)
         assert self._config.vlm is not None  # guaranteed by is_vlm; narrows for the type checker
+        apply_matmul_precision(self._config.train)
         # Default the compute dtype to what the checkpoint was trained at
         # (config.train.param_dtype) unless an explicit dtype was passed.
         self._dtype = self._config.train.param_dtype if dtype is None else _resolve_dtype(dtype)

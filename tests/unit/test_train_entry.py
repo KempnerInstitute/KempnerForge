@@ -2075,6 +2075,34 @@ class TestSetupDistributed:
         rt.setup_distributed(config)
         assert seen["seed"] == 4242
 
+    @pytest.mark.parametrize(("tf32", "expected"), [(True, "high"), (False, "highest")])
+    def test_tf32_sets_the_matmul_precision(
+        self, monkeypatch: pytest.MonkeyPatch, tf32: bool, expected: str
+    ) -> None:
+        import kempnerforge.training.runtime as rt
+
+        monkeypatch.setattr(rt, "get_world_info", lambda: (0, 0, 1))
+        monkeypatch.setattr(rt, "init_distributed", lambda cfg, seed: None)
+        monkeypatch.setattr(rt, "log_job_info", lambda: None)
+        saved = torch.get_float32_matmul_precision()
+        torch.set_float32_matmul_precision("highest")
+        try:
+            rt.setup_distributed(make_config(tf32=tf32))
+            assert torch.get_float32_matmul_precision() == expected
+        finally:
+            torch.set_float32_matmul_precision(saved)
+
+    def test_tf32_off_leaves_an_existing_setting_alone(self) -> None:
+        from kempnerforge.training.runtime import apply_matmul_precision
+
+        saved = torch.get_float32_matmul_precision()
+        torch.set_float32_matmul_precision("medium")
+        try:
+            apply_matmul_precision(TrainConfig())
+            assert torch.get_float32_matmul_precision() == "medium"
+        finally:
+            torch.set_float32_matmul_precision(saved)
+
 
 class TestPpGroup:
     def test_derives_the_group_from_the_mesh(self):

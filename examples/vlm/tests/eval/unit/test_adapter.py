@@ -806,6 +806,26 @@ class TestInitGuards:
         vlm = KempnerForgeVLM(config="x", checkpoint="y", device="cpu", dtype="float16")
         assert vlm._dtype == torch.float16
 
+    @pytest.mark.parametrize(("tf32", "expected"), [(True, "high"), (False, "highest")])
+    def test_tf32_follows_the_checkpoint_config(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tiny_vlm_configs: tuple,
+        tiny_vlm_wrapper: torch.nn.Module,
+        tf32: bool,
+        expected: str,
+    ) -> None:
+        job = _vlm_job_config(tiny_vlm_configs)
+        job.train.tf32 = tf32
+        _patch_loaders(monkeypatch, job, tiny_vlm_wrapper)
+        saved = torch.get_float32_matmul_precision()
+        torch.set_float32_matmul_precision("highest")
+        try:
+            KempnerForgeVLM(config="x", checkpoint="y", device="cpu", dtype="float32")
+            assert torch.get_float32_matmul_precision() == expected
+        finally:
+            torch.set_float32_matmul_precision(saved)
+
 
 # ---------------------------------------------------------------------------
 # _build_model (frames_per_clip wiring for image vs video checkpoints)

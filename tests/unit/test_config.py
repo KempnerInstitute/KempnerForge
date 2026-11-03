@@ -274,6 +274,12 @@ class TestTrainConfig:
         with pytest.raises(ValueError, match="'fp16' is not supported: .*no loss scaling"):
             _ = config.param_dtype
 
+    def test_tf32_defaults_off(self) -> None:
+        assert TrainConfig().tf32 is False
+
+    def test_tf32_from_cli(self) -> None:
+        assert load_config(cli_args=["--train.tf32=true"]).train.tf32 is True
+
     def test_data_seed_defaults_to_none(self):
         assert TrainConfig().data_seed is None
 

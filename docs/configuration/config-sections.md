@@ -103,6 +103,7 @@ Training-loop hyperparameters.
 | `seed` | `int` | `42` | torch/numpy/python RNG seed |
 | `compile_model` | `bool` | `True` | wrap the model with `torch.compile` |
 | `mixed_precision` | `"bf16" \| "fp32" \| "fp8"` | `"bf16"` | master-weight dtype; `"fp8"` uses bf16 masters with fp8 compute; `"fp16"` is rejected (no loss scaling) |
+| `tf32` | `bool` | `False` | run fp32 matmuls (a frozen fp32 vision encoder, `mixed_precision = "fp32"`) on TF32 tensor cores via `torch.set_float32_matmul_precision("high")`; applied at startup by training, `scripts/eval.py` and the VLM lmms-eval adapter; `False` leaves torch's setting as it is |
 | `activation_checkpointing` | `"none" \| "full" \| "selective"` | `"none"` | AC policy |
 | `loss_fn` | `str` | `"cross_entropy"` | `loss` registry key (or `"chunked_cross_entropy"`) |
 | `z_loss_weight` | `float` | `0.0` | logit-magnitude regularizer (PaLM uses `1e-4`) |

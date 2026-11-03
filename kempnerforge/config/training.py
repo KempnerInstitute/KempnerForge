@@ -40,6 +40,7 @@ class TrainConfig:
     data_seed: int | None = None  # Overrides data/batch order only; None falls back to seed
     compile_model: bool = True
     mixed_precision: Literal["bf16", "fp16", "fp32", "fp8"] = "bf16"
+    tf32: bool = False
     activation_checkpointing: ActivationCheckpointing = ActivationCheckpointing.none
     loss_fn: str = "cross_entropy"  # Registry key for loss function
     z_loss_weight: float = 0.0  # Logit magnitude regularizer (PaLM uses 1e-4, 0=disabled)
