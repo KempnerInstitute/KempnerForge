@@ -206,9 +206,11 @@ class TestFSDP2FlexAttention:
 
         Exact equality, not a tolerance: document 1 may not move *at all* when
         document 0 changes. If the cast corrupted doc_ids the mask would widen
-        silently and this is the only thing that would notice.
+        silently and this is the only thing that would notice. The ids are 256
+        and 257, which bf16 rounds to the same value.
         """
         tokens, doc_ids, boundary = self._batch()
+        doc_ids += 256
         model = self._model(distributed_env)
         perturbed = tokens.clone()
         perturbed[:, :boundary] = (perturbed[:, :boundary] + 1) % 1000
