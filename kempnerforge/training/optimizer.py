@@ -33,6 +33,7 @@ logger = logging.getLogger(__name__)
 def _build_adamw(
     param_groups: list[dict],
     config: OptimizerConfig,
+    model: torch.nn.Module,
 ) -> torch.optim.Optimizer:
     return torch.optim.AdamW(
         param_groups,
@@ -122,6 +123,7 @@ class Lion(torch.optim.Optimizer):
 def _build_lion(
     param_groups: list[dict],
     config: OptimizerConfig,
+    model: torch.nn.Module,
 ) -> torch.optim.Optimizer:
     return Lion(
         param_groups,
@@ -277,6 +279,7 @@ class ScheduleFreeAdamW(torch.optim.Optimizer):
 def _build_schedule_free_adamw(
     param_groups: list[dict],
     config: OptimizerConfig,
+    model: torch.nn.Module,
 ) -> torch.optim.Optimizer:
     return ScheduleFreeAdamW(
         param_groups,
@@ -572,6 +575,7 @@ def _is_muon_eligible(param: torch.Tensor) -> bool:
 def _build_muon(
     param_groups: list[dict],
     config: OptimizerConfig,
+    model: torch.nn.Module,
 ) -> torch.optim.Optimizer:
     # Split: 2D params with reasonable aspect ratio get Muon, rest gets AdamW
     muon_groups = []
@@ -665,4 +669,4 @@ def build_optimizer(
     )
 
     builder = registry.get_optimizer(config.name)
-    return builder(param_groups, config)
+    return builder(param_groups, config, model)

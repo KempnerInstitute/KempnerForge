@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from kempnerforge.config.registry import registry
 from kempnerforge.config.schema import (
     ModelConfig,
     OptimizerConfig,
@@ -73,6 +74,25 @@ class TestBuildOptimizer:
                 opt_param_ids.add(id(p))
         model_param_ids = {id(p) for p in model.parameters() if p.requires_grad}
         assert opt_param_ids == model_param_ids
+
+    def test_builder_gets_the_param_groups_config_and_model(self, monkeypatch):
+        """The registered builder is called with the param groups, the config and the model."""
+        calls = []
+
+        def spy(
+            param_groups: list[dict], config: OptimizerConfig, model: torch.nn.Module
+        ) -> torch.optim.Optimizer:
+            calls.append((param_groups, config, model))
+            return torch.optim.SGD(param_groups, lr=config.lr)
+
+        monkeypatch.setitem(registry._get_store("optimizer"), "spy", spy)
+        model = Transformer(TINY_CONFIG)
+        config = OptimizerConfig(name="spy")
+        build_optimizer(model, config)
+        [(param_groups, got_config, got_model)] = calls
+        assert got_config is config
+        assert got_model is model
+        assert [group["weight_decay"] for group in param_groups] == [config.weight_decay, 0.0]
 
 
 # ---------------------------------------------------------------------------
