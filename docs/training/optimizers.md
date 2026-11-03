@@ -16,11 +16,19 @@ parameters into two groups:
 | decay | `param.ndim > 1` and `"bias"` not in name | `config.weight_decay` |
 | no-decay | 1D tensors, biases, norm scales | `0.0` |
 
-The rule is `_should_decay(name, param)` in
+The rule is `_should_decay(name, param, scope)` in
 [`optimizer.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/training/optimizer.py) —
 shared by all four optimizers. No decay on biases / norms is the
 Llama / GPT convention; Muon's 1D fallback AdamW inherits the same
-grouping.
+grouping. The token embedding and the output head are 2D, so they are
+decayed.
+
+`optimizer.weight_decay_scope` selects which rule applies:
+
+| Value | Effect |
+|-------|--------|
+| `"exclude_norms_and_biases"` (default) | the grouping above |
+| `"all"` | every parameter goes in the decay group, as `torch.optim.AdamW` does by default |
 
 ## `adamw`
 

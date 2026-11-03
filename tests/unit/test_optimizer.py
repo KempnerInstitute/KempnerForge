@@ -513,3 +513,78 @@ class TestAdamW:
             assert p.ndim >= 2
         for p in no_decay_group["params"]:
             assert p.ndim <= 1
+
+
+class TestWeightDecayScope:
+    """`optimizer.weight_decay_scope` selects which parameters receive weight decay."""
+
+    @staticmethod
+    def _model() -> nn.Module:
+        model = nn.Module()
+        model.embedding = nn.Embedding(16, 8)
+        model.linear = nn.Linear(8, 8, bias=True)
+        model.norm = nn.LayerNorm(8)
+        return model
+
+    def _groups(self, scope: str, name: str = "adamw"):
+        model = self._model()
+        config = OptimizerConfig(name=name, lr=0.01, weight_decay=0.1, weight_decay_scope=scope)
+        optimizer = build_optimizer(model, config)
+        named = {id(p): n for n, p in model.named_parameters()}
+        decay = {named[id(p)] for p in optimizer.param_groups[0]["params"]}
+        no_decay = {named[id(p)] for p in optimizer.param_groups[1]["params"]}
+        return decay, no_decay
+
+    def test_default_scope_is_backward_compatible(self):
+        assert OptimizerConfig(lr=0.01).weight_decay_scope == "exclude_norms_and_biases"
+
+    def test_default_excludes_norms_and_biases(self):
+        decay, no_decay = self._groups("exclude_norms_and_biases")
+        assert decay == {"embedding.weight", "linear.weight"}
+        assert no_decay == {"linear.bias", "norm.weight", "norm.bias"}
+
+    def test_all_decays_every_parameter(self):
+        decay, no_decay = self._groups("all")
+        assert decay == {
+            "embedding.weight",
+            "linear.weight",
+            "linear.bias",
+            "norm.weight",
+            "norm.bias",
+        }
+        assert no_decay == set()
+
+    def test_group_weight_decay_values_are_unchanged(self):
+        model = self._model()
+        config = OptimizerConfig(lr=0.01, weight_decay=0.1, weight_decay_scope="all")
+        optimizer = build_optimizer(model, config)
+        assert optimizer.param_groups[0]["weight_decay"] == 0.1
+        assert optimizer.param_groups[1]["weight_decay"] == 0.0
+
+    @pytest.mark.parametrize("name", ["adamw", "muon", "lion", "schedule_free_adamw"])
+    @pytest.mark.parametrize(
+        ("scope", "shrinks"), [("exclude_norms_and_biases", False), ("all", True)]
+    )
+    def test_scope_reaches_norm_weights_in_every_optimizer(self, name, scope, shrinks):
+        """A 1-D norm weight is decayed only under "all", whichever optimizer runs it.
+
+        Asserted through the parameter itself rather than through ``param_groups``,
+        because Muon re-splits the groups and keeps its AdamW fallback separately.
+        """
+        torch.manual_seed(0)
+        model = self._model()
+        config = OptimizerConfig(name=name, lr=0.1, weight_decay=0.5, weight_decay_scope=scope)
+        optimizer = build_optimizer(model, config)
+        before = model.norm.weight.detach().clone()
+        for param in model.parameters():
+            param.grad = torch.zeros_like(param)
+        optimizer.step()
+        after = model.norm.weight.detach()
+        if shrinks:
+            assert (after.abs() < before.abs()).all()
+        else:
+            assert torch.allclose(after, before)
+
+    def test_invalid_scope_is_rejected_with_the_valid_options(self):
+        with pytest.raises(ValueError, match="weight_decay_scope must be one of"):
+            OptimizerConfig(lr=0.01, weight_decay_scope="norms")

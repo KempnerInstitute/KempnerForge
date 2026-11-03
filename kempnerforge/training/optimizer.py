@@ -614,11 +614,23 @@ def _build_muon(
 # ---------------------------------------------------------------------------
 
 
-def _should_decay(name: str, param: torch.nn.Parameter) -> bool:
+def _should_decay(name: str, param: torch.nn.Parameter, scope: str) -> bool:
     """Decide whether a parameter should receive weight decay.
 
-    Excluded: 1D parameters (biases, norm scales/shifts), embedding weights.
+    Args:
+        name: Fully qualified parameter name.
+        param: The parameter itself.
+        scope: ``"exclude_norms_and_biases"`` keeps decay off every 1-D parameter
+            (norm scales and shifts) and any parameter whose name contains
+            ``"bias"``; 2-D parameters such as the token embedding and the output
+            head are decayed. ``"all"`` decays every parameter, which is what
+            ``torch.optim.AdamW`` does by default.
+
+    Returns:
+        True when the parameter belongs in the weight-decay group.
     """
+    if scope == "all":
+        return True
     if param.ndim <= 1:
         return False
     return "bias" not in name
@@ -643,7 +655,7 @@ def build_optimizer(
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        if _should_decay(name, param):
+        if _should_decay(name, param, config.weight_decay_scope):
             decay_params.append(param)
         else:
             no_decay_params.append(param)
