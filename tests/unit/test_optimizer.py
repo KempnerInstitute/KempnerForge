@@ -595,7 +595,7 @@ class TestWeightDecayScope:
             assert torch.allclose(after, before)
 
     def test_frozen_parameters_stay_out_of_every_group(self):
-        """"all" decays every trained parameter, not every parameter."""
+        """Under "all" every trained parameter is decayed, not every parameter."""
         model = self._model()
         model.norm.weight.requires_grad_(False)
         config = OptimizerConfig(lr=0.01, weight_decay=0.1, weight_decay_scope="all")

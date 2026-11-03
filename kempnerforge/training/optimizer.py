@@ -621,12 +621,13 @@ def _should_decay(name: str, param: torch.nn.Parameter, scope: str) -> bool:
     Args:
         name: Fully qualified parameter name.
         param: The parameter itself.
-        scope: ``"exclude_norms_and_biases"`` keeps decay off every 1-D parameter
-            (norm scales and shifts) and any parameter whose name contains
-            ``"bias"``. Everything else is decayed, which includes the token
-            embedding and the output head and any parameter of higher rank, such as
-            packed expert weights or a convolution kernel. ``"all"`` decays every
-            parameter, which is what ``torch.optim.AdamW`` does by default.
+        scope: ``"exclude_norms_and_biases"`` keeps decay off every parameter of
+            rank 1 or 0 (norm scales and shifts, and scalars) and any parameter
+            whose name contains ``"bias"``. Everything else is decayed, which
+            includes the token embedding, the output head and any parameter of
+            higher rank such as packed expert weights or a convolution kernel.
+            ``"all"`` decays every parameter, which is what ``torch.optim.AdamW``
+            does by default.
 
     Returns:
         True when the parameter belongs in the weight-decay group.

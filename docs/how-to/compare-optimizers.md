@@ -25,7 +25,7 @@ lr = 0.003
 All four go through
 [`build_optimizer`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/training/optimizer.py),
 which splits parameters into two groups before handing them to the
-chosen builder:
+chosen builder.
 
 Under the default `optimizer.weight_decay_scope`:
 
