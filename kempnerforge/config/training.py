@@ -43,7 +43,7 @@ class TrainConfig:
     activation_checkpointing: ActivationCheckpointing = ActivationCheckpointing.none
     loss_fn: str = "cross_entropy"  # Registry key for loss function
     z_loss_weight: float = 0.0  # Logit magnitude regularizer (PaLM uses 1e-4, 0=disabled)
-    ce_chunk_size: int = 0  # Token chunk size for chunked_cross_entropy (0=auto 4096)
+    ce_chunk_size: int = 0  # Tokens per chunk of the fp32 cross-entropy (0=auto 4096)
     shutdown_timeout_sec: float = 600.0  # Graceful shutdown timeout before forced exit
     nccl_health_check_interval: int = 0  # Check NCCL health every N steps (0=disabled)
 

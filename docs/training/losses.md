@@ -10,18 +10,61 @@ that wraps *either* — not a separate registry entry.
 ```toml
 [train]
 loss_fn = "cross_entropy"
+ce_chunk_size = 4096                    # 0 -> auto 4096
 ```
 
-Direct call to `F.cross_entropy` over flattened
-`(batch·seq_len, vocab_size)` logits and `(batch·seq_len,)` labels.
-`ignore_index = -100` is hard-coded; labels with `-100` are skipped in
-the reduction. This is how
+Mean cross-entropy over flattened `(batch·seq_len, vocab_size)` logits
+and `(batch·seq_len,)` labels. `ignore_index = -100` is hard-coded;
+labels with `-100` are skipped in the reduction. This is how
 [document-packed sequences](../data/index.md) mask out cross-document
 attention — tokens at packing boundaries get label `-100` so the loss
 doesn't cross document edges.
 
-Returns `0.0` (as a device tensor) when every label is `-100` — avoids
-a NaN from dividing by zero valid tokens.
+Returns `0.0` (as an fp32 device tensor) when every label is `-100` —
+avoids a NaN from dividing by zero valid tokens.
+
+### Computed in fp32, one chunk at a time
+
+Under `mixed_precision = "bf16"` the output head returns bf16 logits.
+`F.cross_entropy` on them would compute the log-softmax and its gradient
+in bf16; stacks that run the forward pass under `torch.autocast`
+compute cross-entropy in fp32 instead. Casting the whole logit tensor
+up front would allocate a full fp32 copy — 8.4 GB for `batch=4`,
+`seq=4096`, `vocab=128256` — and autograd would also keep fp32
+log-probabilities of the same size for the backward pass.
+
+The loss is instead a custom autograd function that works on
+`ce_chunk_size` tokens at a time, in fp32 (fp64 logits stay fp64):
+
+- **Forward**: takes each chunk's log-sum-exp and target logit in fp32
+  and keeps only the per-token log-sum-exp (one fp32 value per token).
+- **Backward**: recomputes each chunk's softmax from that log-sum-exp,
+  subtracts the one-hot target, and writes the gradient in the logits'
+  dtype. Rows labeled `-100` get a zero gradient.
+
+On CUDA both per-chunk steps are `torch.compile`d (once per process, as
+FlexAttention is) into fused kernels that read the bf16 logits
+directly, so not even a chunk is upcast in memory: beyond the logits
+and their gradient, the loss holds one value per token and one chunk of
+the gradient at a time. On CPU the same functions run eagerly, holding
+a few fp32 chunks (`ce_chunk_size × vocab_size × 4` bytes each). It
+does not shrink the logits themselves: the model's output head still
+materializes the `(batch, seq_len, vocab_size)` logit tensor.
+
+Measured on one H100 for `batch=4`, `seq=4096`, `vocab=128256` (bf16
+logits of 3.9 GiB), loss forward and backward:
+
+| | time | memory beyond the logits | loss error vs fp64 |
+|---|---|---|---|
+| `F.cross_entropy` on bf16 logits (before) | 12.4 ms | 11.7 GiB | 2.1e-3 |
+| `F.cross_entropy(logits.float())` | 35.4 ms | 23.5 GiB | 4.3e-8 |
+| `cross_entropy`, `ce_chunk_size = 4096` | 8.8 ms | 4.9 GiB | 7.5e-8 |
+
+The first call on each new chunk shape compiles for a few seconds.
+
+`ce_chunk_size = 0` in the config is a sentinel for "use the default
+4096" — see
+[`build_loss_fn`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/training/loss.py).
 
 ## `chunked_cross_entropy`
 
@@ -31,29 +74,8 @@ loss_fn = "chunked_cross_entropy"
 ce_chunk_size = 4096                    # 0 -> auto 4096
 ```
 
-Identical output to `cross_entropy`, but computed in chunks along the
-flattened token dimension. Use this when the full logit tensor would
-be large enough to matter — a 7B Llama-3 with `batch=4`, `seq=4096`,
-`vocab=128000` materializes an **8 GB** float32 cross-entropy
-intermediate if computed end-to-end.
-
-Mechanics:
-
-- The loop iterates `for i in range(0, num_tokens, chunk_size)` and
-  accumulates per-chunk loss with `reduction="sum"`.
-- At the end, divides by the number of non-ignored tokens across all
-  chunks to recover the mean.
-- `ignore_index = -100` is threaded through per chunk.
-
-Important: chunking saves memory **inside the loss kernel**, not in the
-output projection. The `(batch, seq_len, vocab_size)` logit tensor
-that the model produces is still materialized — `chunked_cross_entropy`
-only avoids the second full-size tensor that `F.cross_entropy`
-internally allocates for the softmax.
-
-`ce_chunk_size = 0` in the config is a sentinel for "use the default
-4096" — see
-[`build_loss_fn`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/training/loss.py).
+An alias of `cross_entropy`, kept so configs that name it still load.
+Both compute the same fp32 chunked loss and read `ce_chunk_size`.
 
 ## z-loss (logit magnitude regularizer)
 
@@ -107,12 +129,15 @@ per-layer router aux losses.
 
 ## Picking one
 
-| Situation | Loss | z-loss |
-|-----------|------|--------|
-| Small model, tight compile, small vocab | `cross_entropy` | off |
-| 7B+ with large vocab (≥ 50K) | `chunked_cross_entropy` | optional |
-| Muon / aggressive LRs / long runs | either | `1e-4` |
-| PaLM / Gemma-style recipe | `chunked_cross_entropy` | `1e-4` |
+The two cross-entropy names compute the same loss, so the choices are
+the chunk size and z-loss:
+
+| Situation | `ce_chunk_size` | z-loss |
+|-----------|-----------------|--------|
+| Default | `0` (4096) | off |
+| Large vocab (≥ 128K) and tight memory | smaller, e.g. `1024` | optional |
+| Muon / aggressive LRs / long runs | `0` (4096) | `1e-4` |
+| PaLM / Gemma-style recipe | `0` (4096) | `1e-4` |
 
 The shipped
 [`7b_16gpu_muon.toml`](https://github.com/KempnerInstitute/KempnerForge/blob/main/configs/train/7b_16gpu_muon.toml)

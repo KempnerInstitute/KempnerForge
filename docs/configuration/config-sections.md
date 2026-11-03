@@ -106,7 +106,7 @@ Training-loop hyperparameters.
 | `activation_checkpointing` | `"none" \| "full" \| "selective"` | `"none"` | AC policy |
 | `loss_fn` | `str` | `"cross_entropy"` | `loss` registry key (or `"chunked_cross_entropy"`) |
 | `z_loss_weight` | `float` | `0.0` | logit-magnitude regularizer (PaLM uses `1e-4`) |
-| `ce_chunk_size` | `int` | `0` | chunk size for `chunked_cross_entropy` (`0` → auto 4096) |
+| `ce_chunk_size` | `int` | `0` | tokens per chunk of the fp32 cross-entropy, for both `cross_entropy` and `chunked_cross_entropy` (`0` → auto 4096) |
 | `shutdown_timeout_sec` | `float` | `600.0` | graceful shutdown timeout before forced exit |
 | `nccl_health_check_interval` | `int` | `0` | NCCL liveness all-reduce every N steps (`0` = disabled) |
 
