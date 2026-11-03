@@ -172,7 +172,6 @@ def check_config(hf_config: dict[str, Any], model: ModelConfig) -> None:
         "vocab_size": ("vocab_size", model.vocab_size),
         "rms_norm_eps": ("norm_eps", model.norm_eps),
         "rope_theta": ("rope_theta", model.rope_theta),
-        "tie_word_embeddings": ("tie_embeddings", model.tie_embeddings),
         "hidden_act": ("activation", str(model.activation)),
     }
     rope_theta, rope_type, declared_rope, problems = _source_rope(hf_config)
@@ -195,6 +194,14 @@ def check_config(hf_config: dict[str, Any], model: ModelConfig) -> None:
             )
         else:
             problems.append(f"{hf_key}={hf_value!r} but model.{kf_name}={kf_value!r}")
+    source_ties = hf_config.get("tie_word_embeddings")
+    if source_ties is None:
+        problems.append("config.json has no tie_word_embeddings")
+    elif model.tie_embeddings and not source_ties:
+        problems.append(
+            "tie_word_embeddings=False but model.tie_embeddings=True, so the source's "
+            "separate output head would be discarded"
+        )
     if rope_type not in (None, "default"):
         problems.append(f"the source uses rope_type={rope_type!r}; only plain RoPE converts")
     if hf_config.get("use_sliding_window"):
@@ -345,9 +352,28 @@ def check_norm_eps(transformer: torch.nn.Module, rms_norm_eps: float) -> None:
 
 
 def map_state_dict(
-    hf_state: dict[str, torch.Tensor], tie_embeddings: bool
+    hf_state: dict[str, torch.Tensor], tie_embeddings: bool, source_ties: bool
 ) -> dict[str, torch.Tensor]:
-    """Rename source weights to transformer keys; a tied head shares the embedding."""
+    """Rename source weights to transformer keys.
+
+    Args:
+        hf_state: The source state dict. A source that ties its head omits
+            ``lm_head.weight`` entirely.
+        tie_embeddings: Whether the target transformer ties its output head to its
+            token embedding.
+        source_ties: Whether the source's config declares a tied head. A source that
+            declares an untied head and supplies none is an incomplete checkpoint, not
+            an invitation to invent one.
+
+    Returns:
+        The state dict keyed for the transformer. When the source ties its head, the
+        output head is filled from the token embedding, so a tied source can start an
+        untied target with the two already equal.
+
+    Raises:
+        ValueError: The target ties its head but the source's head differs from its
+            embedding, or a source key has no transformer key.
+    """
     state = dict(hf_state)
     if tie_embeddings:
         head, embed = state.pop(_HF_HEAD_KEY, None), state.get(_HF_EMBED_KEY)
@@ -367,7 +393,7 @@ def map_state_dict(
         raise ValueError(
             f"{len(unmapped)} source keys have no transformer key: {sorted(unmapped)[:10]}"
         )
-    if tie_embeddings and EMBED_KEY in converted:
+    if source_ties and EMBED_KEY in converted and HEAD_KEY not in converted:
         converted[HEAD_KEY] = converted[EMBED_KEY]
     return converted
 
@@ -409,7 +435,9 @@ def convert(hf_dir: str, config_path: str, out: str, seed: int | None = None) ->
             "the source moved between the two requests"
         )
     hf_state = load_source_weights(weights_dir)
-    converted = map_state_dict(hf_state, config.model.tie_embeddings)
+    converted = map_state_dict(
+        hf_state, config.model.tie_embeddings, bool(hf_config.get("tie_word_embeddings"))
+    )
 
     target = wrapper.transformer.state_dict()
     extra = sorted(converted.keys() - target.keys())

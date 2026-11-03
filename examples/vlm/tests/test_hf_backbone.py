@@ -222,6 +222,33 @@ class TestRoundTrip:
         with torch.no_grad():
             assert torch.equal(model.transformer(tokens), hf_model(input_ids=tokens).logits)
 
+    def test_tied_source_starts_an_untied_head_as_a_copy(
+        self, sources: Sources, tmp_path: Path
+    ) -> None:
+        """A tied source fills an untied target's head from its token embedding."""
+        source, hf_model = sources[True]
+        config_path = _target(tmp_path, model={"tie_embeddings": False})
+        out = tmp_path / "init"
+        conv.main(["--hf-dir", str(source), "--config", config_path, "--out", str(out)])
+
+        config = load_config(config_path, cli_args=[])
+        assert config.vlm is not None and config.vision_encoder is not None
+        assert config.adapter is not None
+        torch.manual_seed(1234)
+        model = build_vlm_wrapper(config.model, config.vision_encoder, config.adapter, config.vlm)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        manager = CheckpointManager(config.checkpoint, model, optimizer)
+        assert manager.load(path=str(out), exclude_keys=["optimizer"]) == (0, 0, {})
+
+        head, embed = model.transformer.output_head, model.transformer.token_embedding
+        assert head is not None and embed is not None
+        assert head.proj.weight is not embed.embedding.weight, "an untied target must not share"
+        assert torch.equal(head.proj.weight, embed.embedding.weight)
+
+        tokens = torch.randint(0, 128, (2, 48), generator=torch.Generator().manual_seed(3))
+        with torch.no_grad():
+            assert torch.equal(model.transformer(tokens), hf_model(input_ids=tokens).logits)
+
     def test_older_config_layout_converts(self, tied_copy: Path, tmp_path: Path) -> None:
         """Top-level ``rope_theta`` and a null ``rope_scaling``, as older exports write it."""
         config_file = tied_copy / "config.json"
@@ -371,10 +398,6 @@ class TestConfigRefusals:
                 ["hidden_size=64 but model.dim=128", "head_dim=16 but model.head_dim=32"],
             ),
             ({"activation": "gelu"}, ["hidden_act='silu' but model.activation='gelu'"]),
-            (
-                {"tie_embeddings": False},
-                ["tie_word_embeddings=True but model.tie_embeddings=False"],
-            ),
             ({"qk_norm": False}, ["model.qk_norm must be true"]),
             ({"norm_type": "layernorm"}, ["model.norm_type='layernorm'"]),
             ({"num_experts": 2}, ["model.num_experts > 0"]),
@@ -389,7 +412,6 @@ class TestConfigRefusals:
             "vocab_size",
             "dim",
             "activation",
-            "tie_embeddings",
             "qk_norm",
             "norm_type",
             "num_experts",
