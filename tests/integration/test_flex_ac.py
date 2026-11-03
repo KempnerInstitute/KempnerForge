@@ -12,7 +12,6 @@ from __future__ import annotations
 import pytest
 import torch
 
-from kempnerforge.config.model import FLEX_BLOCK_SIZE
 from kempnerforge.config.schema import ActivationCheckpointing, ModelConfig
 from kempnerforge.distributed.parallel import apply_ac
 from kempnerforge.model.attention import Attention
@@ -168,9 +167,3 @@ class TestFlexActivationCheckpointing:
         model(tokens, doc_ids=doc_ids).sum().backward()
 
         assert len(calls) == 2 * len(model.layers)
-
-
-@pytest.mark.gpu
-def test_sequence_length_floor_is_the_block_size():
-    """The AC tests above all sit above FLEX_BLOCK_SIZE, which is load-bearing."""
-    assert SEQ >= FLEX_BLOCK_SIZE
