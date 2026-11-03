@@ -75,6 +75,7 @@ File:
 - `betas[0], betas[1] ∈ [0, 1)`.
 - `muon_momentum ∈ (0, 1)`.
 - `muon_ns_steps > 0`.
+- `weight_decay_scope ∈ {"exclude_norms_and_biases", "all"}`.
 - `muon_adjust_lr ∈ {"original", "match_rms_adamw", "spectral_unclamped"}`.
 - `muon_orthogonalize ∈ {"local", "exact"}`.
 - `schedule_free_warmup_steps ≥ 0`.

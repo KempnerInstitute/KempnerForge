@@ -520,10 +520,17 @@ class TestWeightDecayScope:
 
     @staticmethod
     def _model() -> nn.Module:
+        """A model covering every shape the rule distinguishes.
+
+        ``scale`` is 0-D and ``proj_bias`` is 2-D but named like a bias, so the two
+        halves of the default rule are each exercised on their own.
+        """
         model = nn.Module()
         model.embedding = nn.Embedding(16, 8)
         model.linear = nn.Linear(8, 8, bias=True)
         model.norm = nn.LayerNorm(8)
+        model.scale = nn.Parameter(torch.ones(()))
+        model.proj_bias = nn.Parameter(torch.zeros(4, 4))
         return model
 
     def _groups(self, scope: str, name: str = "adamw"):
@@ -538,10 +545,10 @@ class TestWeightDecayScope:
     def test_default_scope_is_backward_compatible(self):
         assert OptimizerConfig(lr=0.01).weight_decay_scope == "exclude_norms_and_biases"
 
-    def test_default_excludes_norms_and_biases(self):
+    def test_default_excludes_norms_biases_and_scalars(self):
         decay, no_decay = self._groups("exclude_norms_and_biases")
         assert decay == {"embedding.weight", "linear.weight"}
-        assert no_decay == {"linear.bias", "norm.weight", "norm.bias"}
+        assert no_decay == {"linear.bias", "norm.weight", "norm.bias", "scale", "proj_bias"}
 
     def test_all_decays_every_parameter(self):
         decay, no_decay = self._groups("all")
@@ -551,6 +558,8 @@ class TestWeightDecayScope:
             "linear.bias",
             "norm.weight",
             "norm.bias",
+            "scale",
+            "proj_bias",
         }
         assert no_decay == set()
 
@@ -584,6 +593,16 @@ class TestWeightDecayScope:
             assert (after.abs() < before.abs()).all()
         else:
             assert torch.allclose(after, before)
+
+    def test_frozen_parameters_stay_out_of_every_group(self):
+        """"all" decays every trained parameter, not every parameter."""
+        model = self._model()
+        model.norm.weight.requires_grad_(False)
+        config = OptimizerConfig(lr=0.01, weight_decay=0.1, weight_decay_scope="all")
+        optimizer = build_optimizer(model, config)
+        held = {id(p) for group in optimizer.param_groups for p in group["params"]}
+        assert id(model.norm.weight) not in held
+        assert id(model.linear.weight) in held
 
     def test_invalid_scope_is_rejected_with_the_valid_options(self):
         with pytest.raises(ValueError, match="weight_decay_scope must be one of"):

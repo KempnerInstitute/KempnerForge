@@ -8,8 +8,9 @@ Builds optimizers with per-parameter-group settings:
   - Schedule-Free AdamW: eliminates LR schedule by averaging iterates
 
 All optimizers:
-  - Weight decay applied to matrix weights only
-  - Bias and norm parameters excluded from weight decay
+  - Weight decay follows optimizer.weight_decay_scope: by default every parameter
+    with ndim > 1 and no "bias" in its name is decayed, and "all" decays every
+    parameter
   - Fused kernel when available (PyTorch 2.x, AdamW only)
 """
 
@@ -622,9 +623,10 @@ def _should_decay(name: str, param: torch.nn.Parameter, scope: str) -> bool:
         param: The parameter itself.
         scope: ``"exclude_norms_and_biases"`` keeps decay off every 1-D parameter
             (norm scales and shifts) and any parameter whose name contains
-            ``"bias"``; 2-D parameters such as the token embedding and the output
-            head are decayed. ``"all"`` decays every parameter, which is what
-            ``torch.optim.AdamW`` does by default.
+            ``"bias"``. Everything else is decayed, which includes the token
+            embedding and the output head and any parameter of higher rank, such as
+            packed expert weights or a convolution kernel. ``"all"`` decays every
+            parameter, which is what ``torch.optim.AdamW`` does by default.
 
     Returns:
         True when the parameter belongs in the weight-decay group.

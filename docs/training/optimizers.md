@@ -23,7 +23,10 @@ Llama / GPT convention; Muon's 1D fallback AdamW inherits the same
 grouping. The token embedding and the output head are 2D, so they are
 decayed.
 
-`optimizer.weight_decay_scope` selects which rule applies:
+`optimizer.weight_decay_scope` selects which rule applies. It decides parameter
+group membership, so a run cannot change it across a resume: the saved optimizer
+state no longer lines up with the groups being built, and the load fails or leaves
+the groups without their `weight_decay`. Pick it before the first step.
 
 | Value | Effect |
 |-------|--------|

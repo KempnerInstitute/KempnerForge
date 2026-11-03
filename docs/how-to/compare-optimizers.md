@@ -27,10 +27,15 @@ All four go through
 which splits parameters into two groups before handing them to the
 chosen builder:
 
+Under the default `optimizer.weight_decay_scope`:
+
 - **Decay group** — 2D+ parameters without `"bias"` in the name get
   `weight_decay = config.weight_decay`.
 - **No-decay group** — 1D parameters (norm scales, biases) and any
   parameter whose name contains `"bias"` get `weight_decay = 0.0`.
+
+With `weight_decay_scope = "all"` every parameter joins the decay group
+and the no-decay group is empty.
 
 So `weight_decay` and `lr` mean the same thing across optimizers;
 `betas` is shared by AdamW, Lion (interpretation differs), Muon's

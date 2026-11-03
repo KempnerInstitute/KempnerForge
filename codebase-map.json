@@ -732,7 +732,7 @@
         "build_optimizer(model, config) -> Optimizer",
         "_newton_schulz(G, steps) -> Tensor",
         "_is_muon_eligible(param) -> bool",
-        "_should_decay(name, param) -> bool"
+        "_should_decay(name, param, scope) -> bool"
       ],
       "registry": [
         "@registry.register_optimizer('adamw')",

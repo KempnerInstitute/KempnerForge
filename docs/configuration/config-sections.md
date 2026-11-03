@@ -122,7 +122,8 @@ are shared (AdamW/Lion) or optimizer-specific.
 |-------|------|---------|---------|
 | `name` | `str` | `"adamw"` | one of `adamw`, `lion`, `muon`, `schedule_free_adamw` |
 | `lr` | `float` | `3e-4` | peak learning rate |
-| `weight_decay` | `float` | `0.1` | L2 on 2-D params |
+| `weight_decay` | `float` | `0.1` | decoupled weight decay, applied to the group `weight_decay_scope` selects |
+| `weight_decay_scope` | `"exclude_norms_and_biases" \| "all"` | `"exclude_norms_and_biases"` | which parameters are decayed; `"all"` decays every parameter, as `torch.optim.AdamW` does by default. Changing it across a resume is not supported |
 | `betas` | `tuple[float, float]` | `(0.9, 0.95)` | AdamW / Lion momenta |
 | `eps` | `float` | `1e-8` | numerical safety (AdamW) |
 | `fused` | `bool` | `True` | use fused AdamW when available |
