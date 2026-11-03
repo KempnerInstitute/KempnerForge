@@ -197,6 +197,8 @@ def check_config(hf_config: dict[str, Any], model: ModelConfig) -> None:
     source_ties = hf_config.get("tie_word_embeddings")
     if source_ties is None:
         problems.append("config.json has no tie_word_embeddings")
+    elif not isinstance(source_ties, bool):
+        problems.append(f"tie_word_embeddings={source_ties!r} is not true or false")
     elif model.tie_embeddings and not source_ties:
         problems.append(
             "tie_word_embeddings=False but model.tie_embeddings=True, so the source's "

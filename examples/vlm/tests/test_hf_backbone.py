@@ -249,6 +249,38 @@ class TestRoundTrip:
         with torch.no_grad():
             assert torch.equal(model.transformer(tokens), hf_model(input_ids=tokens).logits)
 
+    def test_tied_source_shipping_its_own_head_keeps_that_head(
+        self, tied_copy: Path, tmp_path: Path
+    ) -> None:
+        """A source declaring a tie but shipping a distinct head keeps the head it ships.
+
+        The untied target uses both tensors as the source supplied them, so there is
+        nothing to resolve. A tied target must discard one of the two and is refused.
+        """
+        _edit_weights(
+            tied_copy,
+            lambda w: w.update(lm_head=w["model.embed_tokens.weight"] + 1.0),
+        )
+        _edit_weights(tied_copy, lambda w: w.update({"lm_head.weight": w.pop("lm_head")}))
+
+        out = conv.convert(
+            str(tied_copy),
+            _target(tmp_path, model={"tie_embeddings": False}),
+            str(tmp_path / "untied"),
+        )
+        saved = _read_dcp(out)
+        head = saved["model.transformer.output_head.proj.weight"]
+        embed = saved["model.transformer.token_embedding.embedding.weight"]
+        assert not torch.equal(head, embed), "the source's own head must survive"
+
+        _refuses(
+            tied_copy,
+            _target(tmp_path, model={"tie_embeddings": True}),
+            tmp_path / "tied",
+            ValueError,
+            "differs from",
+        )
+
     def test_older_config_layout_converts(self, tied_copy: Path, tmp_path: Path) -> None:
         """Top-level ``rope_theta`` and a null ``rope_scaling``, as older exports write it."""
         config_file = tied_copy / "config.json"
@@ -478,6 +510,10 @@ class TestConfigRefusals:
                 lambda c: c.pop("tie_word_embeddings"),
                 "config.json has no tie_word_embeddings",
             ),
+            (
+                lambda c: c.update(tie_word_embeddings="false"),
+                "tie_word_embeddings='false' is not true or false",
+            ),
         ],
         ids=[
             "model_type",
@@ -492,6 +528,7 @@ class TestConfigRefusals:
             "rope_scaling_names_two_types",
             "rope_theta_declared_nowhere",
             "tie_word_embeddings_missing",
+            "tie_word_embeddings_not_bool",
         ],
     )
     def test_source_the_target_cannot_express(
