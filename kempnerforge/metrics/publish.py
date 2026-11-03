@@ -267,9 +267,10 @@ def publish_metrics(
     ``MlflowClient.log_batch`` request, on a client bound to the sidecar's tracking URI
     (the process-wide MLflow tracking URI is left alone). When the installed MLflow can
     link metrics to a logged model, they are linked to the sidecar entry's ``model_id``;
-    without one, to the run's READY model named by its ``model_name``, which is created
-    (an external model of this checkpoint directory) when the run has none. Otherwise, or
-    when the installed MLflow cannot link, the metrics are published unlinked.
+    without one, to the run's model named by its ``model_name`` that
+    ``find_or_create_checkpoint_model`` settles on (finishing it if PENDING), which is
+    created (an external model of this checkpoint directory) when the run has none.
+    Otherwise, or when the installed MLflow cannot link, the metrics are published unlinked.
 
     Args:
         checkpoint_dir: Checkpoint step directory holding ``metadata.json``.
