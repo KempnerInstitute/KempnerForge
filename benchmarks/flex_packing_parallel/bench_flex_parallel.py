@@ -31,6 +31,7 @@ Usage::
 
 from __future__ import annotations
 
+import gc
 import json
 import os
 from collections.abc import Callable
@@ -206,6 +207,7 @@ def main() -> None:
         peak_gb: dict[str, float] = {}
         for arm, backend, packed in ARMS:
             failed = torch.zeros(1, device=device)
+            step = None
             try:
                 torch.manual_seed(0)
                 config = ModelConfig(**BASE, attention_backend=backend)
@@ -216,15 +218,18 @@ def main() -> None:
                 ms, gb = timed(step)
                 tok_s[arm] = (tokens_per_step_batch * seq_len) / (ms / 1000)
                 peak_gb[arm] = gb
-                del step
             except Exception as exc:  # noqa: BLE001 - one OOM must not end the sweep
                 failed.fill_(1)
                 log(f"  {arm} @ {seq_len}: FAILED {type(exc).__name__}: {str(exc)[:70]}", rank)
+            del step
+            gc.collect()
 
-            # Whether a cell failed has to be agreed on. Stages hold different
-            # amounts of memory under PP, so one rank can OOM while the others
-            # march on to the next cell and block forever on a collective that
-            # nobody will match.
+            # Whether a cell failed has to be agreed on. That only helps while
+            # no rank is left inside a collective, as when every FSDP rank OOMs
+            # at the same allocation. A failure on one rank inside step(), such
+            # as an OOM on one PP stage, leaves the others waiting in an
+            # all-gather or a send/recv, and the sweep hangs until the NCCL
+            # timeout ends the job.
             torch.distributed.all_reduce(failed)
             if failed.item() > 0:
                 tok_s[arm] = float("nan")
