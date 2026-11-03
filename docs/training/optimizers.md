@@ -134,6 +134,12 @@ the module that owns it rather than by its shape:
   router with Muon, while Qwen3.8-Next keeps it on AdamW because Muon
   destabilized it early in training.
 
+A resume needs the split its checkpoint was saved with. One saved before
+Muon routed by module, from a model whose embedding or head Muon then
+orthogonalized, or saved with the other `muon_router`, fails to load and
+names the parameters that moved — see
+[DCP model § Loading](../checkpointing/dcp-model.md#loading).
+
 DTensor / FSDP2 notes:
 
 - `muon_orthogonalize` sets where Newton-Schulz runs on a sharded weight.

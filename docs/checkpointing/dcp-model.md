@@ -259,6 +259,17 @@ from it with `[checkpoint].load_path` and
 `exclude_from_loading = ["optimizer"]`, which restores the weights and
 begins with a fresh optimizer.
 
+A parameter whose optimizer changed since the save holds another
+optimizer's state. An embedding or output head that Muon
+orthogonalized before it routed parameters by module has a saved
+`momentum_buffer` where its AdamW now keeps `exp_avg`, `exp_avg_sq` and
+`step`, and a router gate swaps one set for the other when
+`optimizer.muon_router` changes. The load compares the template's state
+entries with the checkpoint's metadata before reading anything and fails
+naming those parameters, instead of leaving `dcp.load` to stop at the
+first missing key. Continuing from the weights takes the same warm start,
+from a `checkpoint.dir` that holds no checkpoint yet.
+
 The template also holds every param-group key the optimizer has now,
 and DCP requires each one. An optimizer whose param groups gained a key
 after its checkpoints were first written lists it in
