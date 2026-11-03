@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from typing import Any
+
 import pytest
 import torch
 import torch.nn as nn
+from torch.overrides import TorchFunctionMode
 
 from kempnerforge.config.schema import OptimizerConfig
 from kempnerforge.training.optimizer import (
@@ -14,6 +18,26 @@ from kempnerforge.training.optimizer import (
     _newton_schulz,
     build_optimizer,
 )
+
+
+class _OutputShapes(TorchFunctionMode):
+    """Records the shape of every tensor a torch function returns."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.shapes: set[tuple[int, ...]] = set()
+
+    def __torch_function__(
+        self,
+        func: Callable[..., Any],
+        types: tuple[type, ...],
+        args: tuple[Any, ...] = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> Any:
+        out = func(*args, **(kwargs or {}))
+        if isinstance(out, torch.Tensor):
+            self.shapes.add(tuple(out.shape))
+        return out
 
 
 class TestNewtonSchulz:
@@ -45,6 +69,24 @@ class TestNewtonSchulz:
         U2 = _newton_schulz(G, steps=5)
         torch.testing.assert_close(U1, U2)
 
+    def test_tall_matrix_matches_iterating_on_it(self):
+        """A tall matrix gets what iterating on it untransposed gives."""
+        torch.manual_seed(0)
+        G = torch.randn(48, 16, dtype=torch.float64)
+        X = G / (G.norm() + 1e-7)
+        for _ in range(5):
+            A = X @ X.T
+            X = 3.4445 * X + (-4.7750 * A + 2.0315 * A @ A) @ X
+        torch.testing.assert_close(_newton_schulz(G, steps=5), X)
+
+    def test_tall_matrix_forms_nothing_rows_by_rows(self):
+        """A tall matrix iterates on its transpose, so its Gram matrix is cols x cols."""
+        with _OutputShapes() as recorded:
+            U = _newton_schulz(torch.randn(64, 8), steps=5)
+        assert U.shape == (64, 8)
+        assert (8, 8) in recorded.shapes
+        assert (64, 64) not in recorded.shapes
+
 
 class TestMuon:
     @pytest.mark.parametrize(
@@ -67,6 +109,16 @@ class TestMuon:
         optimizer.step()
         expected = -0.1 * _muon_update_scale(adjust_lr, rows, cols) * _newton_schulz(weight.grad)
         torch.testing.assert_close(weight.data, expected)
+
+    def test_steps_a_4d_weight_whose_matrix_is_tall(self):
+        """A 4-D weight flattening to a tall matrix steps by NS of that matrix, in its own shape."""
+        torch.manual_seed(0)
+        weight = nn.Parameter(torch.zeros(64, 3, 2, 2))
+        weight.grad = torch.randn(64, 3, 2, 2)
+        Muon([{"params": [weight]}], [{"params": []}], lr=0.1).step()
+        matrix = weight.grad.view(64, 12)
+        expected = -0.1 * _muon_update_scale("original", 64, 12) * _newton_schulz(matrix)
+        torch.testing.assert_close(weight.data.view(64, 12), expected)
 
     def test_nesterov_orthogonalizes_the_lookahead(self):
         """With nesterov, Newton-Schulz sees grad + momentum * buffer."""

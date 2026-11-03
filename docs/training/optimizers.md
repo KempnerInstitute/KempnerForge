@@ -177,7 +177,8 @@ Momentum and update scale:
 
 Newton-Schulz coefficients (hard-coded): `a = 3.4445, b = -4.7750, c =
 2.0315`, Frobenius-normalized input — standard values from the Muon
-paper.
+paper. A tall matrix is iterated as its transpose, so the Gram matrix the
+iteration squares is `min(rows, cols)` on a side.
 
 The shipped
 [`7b_16gpu_muon.toml`](https://github.com/KempnerInstitute/KempnerForge/blob/main/configs/train/7b_16gpu_muon.toml)

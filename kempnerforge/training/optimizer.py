@@ -307,19 +307,23 @@ def _newton_schulz(G: torch.Tensor, steps: int = 5) -> torch.Tensor:
     convergence in 5 steps from a spectrally-normalized starting point.
 
     Cost: ~15 FLOPs per parameter per step — negligible vs forward/backward.
+    A tall G is iterated as G^T, so ``A`` is min(rows, cols) square.
     """
     assert G.ndim == 2
     a, b, c = 3.4445, -4.7750, 2.0315
 
     # Frobenius normalization (matches reference Muon; sufficient for NS convergence)
     X = G / (G.norm() + 1e-7)
+    tall = X.shape[0] > X.shape[1]
+    if tall:
+        X = X.T
 
     for _ in range(steps):
         A = X @ X.T
         B = b * A + c * A @ A
         X = a * X + B @ X
 
-    return X
+    return X.T if tall else X
 
 
 def _orthogonalize_matrix(matrix: torch.Tensor, steps: int) -> torch.Tensor:
