@@ -235,19 +235,19 @@ class TestFSDP2FlexAttention:
     def test_flex_with_activation_checkpointing_under_fsdp(self, distributed_env, ac_mode):
         """AC + FSDP2 + flex, the full production stack for a packed run."""
         tokens, doc_ids, boundary = self._batch()
+        half_vocab = self.CONFIG.vocab_size // 2
+        tokens[:, :boundary] %= half_vocab
+        tokens[:, boundary:] = tokens[:, boundary:] % half_vocab + half_vocab
         model = self._model(distributed_env, ac_mode=ac_mode)
 
-        perturbed = tokens.clone()
-        perturbed[:, :boundary] = (perturbed[:, :boundary] + 1) % 1000
-        with torch.no_grad():
-            base = model(tokens, doc_ids=doc_ids)
-            moved = model(perturbed, doc_ids=doc_ids)
-        torch.testing.assert_close(base[:, boundary:], moved[:, boundary:], rtol=0, atol=0)
-
-        model(tokens, doc_ids=doc_ids).sum().backward()
+        model(tokens, doc_ids=doc_ids)[:, boundary:].sum().backward()
         for name, param in model.named_parameters():
             grad = param.grad.to_local() if hasattr(param.grad, "to_local") else param.grad
             assert grad is not None and torch.isfinite(grad).all(), name
+
+        embedding_grad = model.token_embedding.embedding.weight.grad.full_tensor()
+        assert torch.count_nonzero(embedding_grad[:half_vocab]) == 0
+        assert torch.count_nonzero(embedding_grad[half_vocab:]) > 0
 
 
 class TestFSDP2MatchesSingleGPU:

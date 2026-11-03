@@ -15,6 +15,7 @@ import torch
 from kempnerforge.config.model import FLEX_BLOCK_SIZE
 from kempnerforge.config.schema import ActivationCheckpointing, ModelConfig
 from kempnerforge.distributed.parallel import apply_ac
+from kempnerforge.model.attention import Attention
 from kempnerforge.model.transformer import Transformer
 
 SEQ = 256
@@ -93,7 +94,8 @@ class TestFlexActivationCheckpointing:
         [ActivationCheckpointing.selective, ActivationCheckpointing.full],
         ids=["ac_selective", "ac_full"],
     )
-    def test_gradients_are_finite_and_match_sdpa(self, ac_mode):
+    @pytest.mark.parametrize("compiled", [False, True], ids=["eager", "compiled"])
+    def test_gradients_are_finite_and_match_sdpa(self, ac_mode, compiled):
         """Recompute must reproduce the same backward, not merely run."""
         if not torch.cuda.is_available():
             pytest.skip("CUDA required")
@@ -106,7 +108,8 @@ class TestFlexActivationCheckpointing:
 
         model = _model("flex")
         apply_ac(model, ac_mode)
-        model(tokens, doc_ids=doc_ids).sum().backward()
+        run = torch.compile(model) if compiled else model
+        run(tokens, doc_ids=doc_ids).sum().backward()
 
         assert {_unwrapped_name(n) for n, _ in model.named_parameters()} == set(expected)
         for name, param in model.named_parameters():
@@ -124,23 +127,47 @@ class TestFlexActivationCheckpointing:
         [ActivationCheckpointing.selective, ActivationCheckpointing.full],
         ids=["ac_selective", "ac_full"],
     )
-    def test_documents_stay_isolated(self, ac_mode):
+    @pytest.mark.parametrize("compiled", [False, True], ids=["eager", "compiled"])
+    def test_documents_stay_isolated(self, ac_mode, compiled):
         """Checkpointing recomputes attention; the mask must survive the recompute."""
         if not torch.cuda.is_available():
             pytest.skip("CUDA required")
 
         tokens, doc_ids, boundary = _batch()
-        model = _model("flex").eval()
+        model = _model("flex")
+        half_vocab = model.config.vocab_size // 2
+        tokens[:, :boundary] %= half_vocab
+        tokens[:, boundary:] = tokens[:, boundary:] % half_vocab + half_vocab
         apply_ac(model, ac_mode)
+        run = torch.compile(model) if compiled else model
 
-        perturbed = tokens.clone()
-        perturbed[:, :boundary] = (perturbed[:, :boundary] + 1) % 256
-        with torch.no_grad():
-            base = model(tokens, doc_ids=doc_ids)
-            moved = model(perturbed, doc_ids=doc_ids)
+        run(tokens, doc_ids=doc_ids)[:, boundary:].sum().backward()
 
-        torch.testing.assert_close(base[:, boundary:], moved[:, boundary:], rtol=0, atol=0)
-        assert not torch.allclose(base[:, :boundary], moved[:, :boundary])
+        grad = model.token_embedding.embedding.weight.grad
+        assert torch.count_nonzero(grad[:half_vocab]) == 0
+        assert torch.count_nonzero(grad[half_vocab:]) > 0
+
+    @pytest.mark.parametrize(
+        "ac_mode",
+        [ActivationCheckpointing.selective, ActivationCheckpointing.full],
+        ids=["ac_selective", "ac_full"],
+    )
+    def test_backward_reruns_attention(self, ac_mode):
+        """Both AC modes rerun attention in the backward, as the isolation test assumes."""
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA required")
+
+        tokens, doc_ids, _ = _batch()
+        model = _model("flex")
+        apply_ac(model, ac_mode)
+        calls = []
+        for module in model.modules():
+            if isinstance(module, Attention):
+                module.register_forward_pre_hook(lambda *_: calls.append(None))
+
+        model(tokens, doc_ids=doc_ids).sum().backward()
+
+        assert len(calls) == 2 * len(model.layers)
 
 
 @pytest.mark.gpu
