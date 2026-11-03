@@ -103,6 +103,7 @@ Training-loop hyperparameters.
 | `seed` | `int` | `42` | torch/numpy/python RNG seed |
 | `compile_model` | `bool` | `True` | wrap the model with `torch.compile` |
 | `mixed_precision` | `"bf16" \| "fp32" \| "fp8"` | `"bf16"` | master-weight dtype; `"fp8"` uses bf16 masters with fp8 compute; `"fp16"` is rejected (no loss scaling) |
+| `fp32_master_weights` | `bool` | `False` | keep parameters, gradients and optimizer state in fp32 and compute in `param_dtype` through FSDP2's mixed precision; without an FSDP2 wrap (1 GPU, a pp-only mesh) the forward runs under `torch.autocast` — see [FSDP2 § fp32 master weights](../distributed/fsdp2.md#fp32-master-weights) |
 | `activation_checkpointing` | `"none" \| "full" \| "selective"` | `"none"` | AC policy |
 | `loss_fn` | `str` | `"cross_entropy"` | `loss` registry key (or `"chunked_cross_entropy"`) |
 | `z_loss_weight` | `float` | `0.0` | logit-magnitude regularizer (PaLM uses `1e-4`) |
@@ -110,7 +111,8 @@ Training-loop hyperparameters.
 | `shutdown_timeout_sec` | `float` | `600.0` | graceful shutdown timeout before forced exit |
 | `nccl_health_check_interval` | `int` | `0` | NCCL liveness all-reduce every N steps (`0` = disabled) |
 
-Computed properties: `param_dtype`, `is_fp8`.
+Computed properties: `param_dtype` (compute dtype), `master_dtype` (storage dtype: fp32 with
+`fp32_master_weights`, otherwise `param_dtype`), `is_fp8`.
 
 ## `[optimizer]` — `OptimizerConfig`
 

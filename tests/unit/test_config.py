@@ -274,6 +274,26 @@ class TestTrainConfig:
         with pytest.raises(ValueError, match="'fp16' is not supported: .*no loss scaling"):
             _ = config.param_dtype
 
+    def test_fp32_master_weights_default_off(self) -> None:
+        t = TrainConfig()
+        assert t.fp32_master_weights is False
+        assert t.master_dtype == t.param_dtype == torch.bfloat16
+
+    @pytest.mark.parametrize(
+        ("mixed_precision", "compute"),
+        [("bf16", torch.bfloat16), ("fp8", torch.bfloat16), ("fp32", torch.float32)],
+    )
+    def test_fp32_master_weights_keep_the_compute_dtype(
+        self, mixed_precision: str, compute: torch.dtype
+    ) -> None:
+        t = TrainConfig(mixed_precision=mixed_precision, fp32_master_weights=True)
+        assert t.param_dtype == compute
+        assert t.master_dtype == torch.float32
+
+    def test_fp32_master_weights_from_cli(self) -> None:
+        config = load_config(cli_args=["--train.fp32_master_weights=true"])
+        assert config.train.master_dtype == torch.float32
+
     def test_data_seed_defaults_to_none(self):
         assert TrainConfig().data_seed is None
 

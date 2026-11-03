@@ -109,7 +109,8 @@ The confusing part of FP8 training is that parameters are still
 stored in bf16 — FP8 quantization happens at the matmul boundary:
 
 - Parameter storage: `bfloat16` (matches `mixed_precision: "bf16"`
-  master weights).
+  master weights), or `float32` with `fp32_master_weights = true`
+  (see [FSDP2 § fp32 master weights](fsdp2.md#fp32-master-weights)).
 - Forward matmul: quantize to `E4M3` → `torch._scaled_mm` →
   dequantize output.
 - Backward matmul: quantize to `E5M2` → `torch._scaled_mm` →
