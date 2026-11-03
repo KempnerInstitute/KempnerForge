@@ -156,10 +156,14 @@ forward+backward, 8 documents per sequence
 
 Three things worth reading off that table:
 
-- **The win shrinks toward short sequences, but does not reverse.** At 512 the
-  two are near parity (1.07x): the mask block size is 128, so a short sequence
-  has little block sparsity to exploit and mask construction is a larger share
-  of the step. Separately, `seq_len < 128` is rejected outright, because an
+- **The win shrinks toward short sequences, and on one GPU it does not
+  reverse.** At 512 the two are near parity (1.07x): the mask block size is
+  128, so a short sequence has little block sparsity to exploit and mask
+  construction is a larger share of the step. On 4 GPUs it does reverse: flex
+  runs at 0.90-0.95x of the dense mask from 512 to 2048 under FSDP, and at
+  0.93x at 512 under PP
+  ([`benchmarks/flex_packing_parallel/`](https://github.com/KempnerInstitute/KempnerForge/tree/main/benchmarks/flex_packing_parallel)).
+  Separately, `seq_len < 128` is rejected outright, because an
   Inductor-compiled model leaks attention across document boundaries there.
   That is a correctness bound, not a performance one — the kernel is exact at
   those lengths in isolation, so the fault sits in Inductor codegen rather than
