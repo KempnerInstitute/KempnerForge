@@ -1,0 +1,112 @@
+{
+  "mode": "fsdp",
+  "world": 4,
+  "mesh": {
+    "dp_shard": 4,
+    "tp": 1,
+    "pp": 1
+  },
+  "batch_per_rank": 2,
+  "docs": 8,
+  "model": {
+    "dim": 768,
+    "n_layers": 12,
+    "n_heads": 12,
+    "vocab_size": 32000,
+    "max_seq_len": 16384
+  },
+  "gpu": "NVIDIA H200",
+  "torch": "2.11.0+cu128",
+  "rows": [
+    {
+      "mode": "fsdp",
+      "seq_len": 512,
+      "tok_s": {
+        "unpacked": 115242.18096642965,
+        "sdpa+pack": 113127.68686228554,
+        "flex+pack": 101606.03809893489
+      },
+      "peak_gb": {
+        "unpacked": 0.87900928,
+        "sdpa+pack": 0.893435392,
+        "flex+pack": 0.879013376
+      },
+      "ratio": 0.8981535901341607
+    },
+    {
+      "mode": "fsdp",
+      "seq_len": 1024,
+      "tok_s": {
+        "unpacked": 217987.9491080799,
+        "sdpa+pack": 194397.15945341348,
+        "flex+pack": 181485.07285529704
+      },
+      "peak_gb": {
+        "unpacked": 1.507786752,
+        "sdpa+pack": 1.627812352,
+        "flex+pack": 1.436487168
+      },
+      "ratio": 0.9335788309128521
+    },
+    {
+      "mode": "fsdp",
+      "seq_len": 2048,
+      "tok_s": {
+        "unpacked": 388061.6067625694,
+        "sdpa+pack": 382106.23328105686,
+        "flex+pack": 363956.43709102785
+      },
+      "peak_gb": {
+        "unpacked": 2.61566464,
+        "sdpa+pack": 2.888864256,
+        "flex+pack": 2.686962176
+      },
+      "ratio": 0.9525006539825824
+    },
+    {
+      "mode": "fsdp",
+      "seq_len": 4096,
+      "tok_s": {
+        "unpacked": 768743.3717305225,
+        "sdpa+pack": 621032.3191583856,
+        "flex+pack": 720178.7827678601
+      },
+      "peak_gb": {
+        "unpacked": 5.002068992,
+        "sdpa+pack": 5.87898624,
+        "flex+pack": 4.787848704
+      },
+      "ratio": 1.1596478324088453
+    },
+    {
+      "mode": "fsdp",
+      "seq_len": 8192,
+      "tok_s": {
+        "unpacked": 872853.2338442426,
+        "sdpa+pack": 474549.87811322836,
+        "flex+pack": 1085259.4793683842
+      },
+      "peak_gb": {
+        "unpacked": 9.346490368,
+        "sdpa+pack": 12.639097344,
+        "flex+pack": 9.418353152
+      },
+      "ratio": 2.2869239450303676
+    },
+    {
+      "mode": "fsdp",
+      "seq_len": 16384,
+      "tok_s": {
+        "unpacked": 727291.6352442962,
+        "sdpa+pack": 306919.7164083102,
+        "flex+pack": 1132212.9074704146
+      },
+      "peak_gb": {
+        "unpacked": 18.466571264,
+        "sdpa+pack": 31.422330368,
+        "flex+pack": 18.538075648
+      },
+      "ratio": 3.688954625398444
+    }
+  ]
+}
