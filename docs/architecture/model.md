@@ -131,9 +131,11 @@ copies.
 ### SDPA backend
 
 `sdpa_backend` (default `"auto"`) selects flash / mem-efficient / cudnn /
-math via a context manager. `"auto"` lets PyTorch pick. It has no effect
-under `attention_backend="flex"`, which never routes through the SDPA
-kernel selector; setting both logs a warning.
+math via a context manager. `"auto"` lets PyTorch pick. Under
+`attention_backend="flex"` it no longer reaches packed batches, which never
+route through the SDPA kernel selector, but unpacked ones still do: eval,
+which never packs, and any run with packing off. Setting both logs a
+warning.
 
 ### Attention backend
 
@@ -169,8 +171,11 @@ Three things worth reading off that table:
   costing throughput rather than saving it. Flex at 8192 (300k) is *faster*
   than unpacked causal, because block-diagonal attention does strictly less
   work than full causal.
-- **Memory falls by the size of the mask.** The `(B, 1, S, S)` bool tensor
-  is what flex deletes: 3.2 GB at `S=8192`.
+- **Memory falls by the size of the masks.** The dense path keeps a
+  `(B, 1, S, S)` mask for every layer, at 2 bytes per element, and flex
+  keeps none. That accounts for the whole difference at every length: at
+  `S=8192`, `B=2` it is 12 × 268 MB = 3.2 GB, where a single bool mask
+  would be 134 MB.
 
 The `BlockMask` is built once per forward, not once per layer, and
 `create_block_mask` is itself compiled: 0.09 ms at `S=2048` and 0.30 ms at
