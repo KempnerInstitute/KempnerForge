@@ -10,10 +10,6 @@ from kempnerforge.model.attention import KVCache
 from kempnerforge.model.generate import generate, sample
 from kempnerforge.model.transformer import Transformer
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 
 def _tiny_config() -> ModelConfig:
     return ModelConfig(dim=64, n_layers=2, n_heads=2, vocab_size=128, max_seq_len=64)
@@ -24,11 +20,6 @@ def _tiny_model() -> Transformer:
     model = Transformer(config)
     model.eval()
     return model
-
-
-# ============================================================================
-# KVCache tests
-# ============================================================================
 
 
 class TestKVCache:
@@ -58,21 +49,18 @@ class TestKVCache:
             dtype=torch.float32,
             device=torch.device("cpu"),
         )
-        # First update: 3 tokens (prefill)
         k1 = torch.randn(1, 1, 3, 8)
         v1 = torch.randn(1, 1, 3, 8)
         k_all, v_all = cache.update(k1, v1)
         assert k_all.shape == (1, 1, 3, 8)
         assert cache.seq_len == 3
 
-        # Second update: 1 token (decode)
         k2 = torch.randn(1, 1, 1, 8)
         v2 = torch.randn(1, 1, 1, 8)
         k_all, v_all = cache.update(k2, v2)
         assert k_all.shape == (1, 1, 4, 8)
         assert cache.seq_len == 4
 
-        # Verify concatenation correctness
         assert torch.allclose(k_all[:, :, :3, :], k1)
         assert torch.allclose(k_all[:, :, 3:4, :], k2)
 
@@ -90,17 +78,12 @@ class TestKVCache:
         assert cache.v.shape == (1, 2, 8, 4)
 
 
-# ============================================================================
-# Sampling tests
-# ============================================================================
-
-
 class TestSampling:
     def test_greedy(self):
         """Temperature 0 should always pick the highest-logit token."""
         logits = torch.tensor([[1.0, 5.0, 2.0, 3.0]])
         token = sample(logits, temperature=0, top_k=0, top_p=1.0)
-        assert token.item() == 1  # index of 5.0
+        assert token.item() == 1
 
     def test_greedy_deterministic(self):
         """Greedy should be deterministic across calls."""
@@ -111,20 +94,17 @@ class TestSampling:
 
     def test_top_k_restricts(self):
         """Top-k should only sample from the top k tokens."""
-        # Make one token have very high logit, rest are very low
         logits = torch.full((1, 100), -100.0)
         logits[0, 42] = 10.0
         logits[0, 7] = 9.0
         logits[0, 99] = 8.0
 
-        # With top_k=1, should always pick token 42
         for _ in range(10):
             token = sample(logits.clone(), temperature=1.0, top_k=1, top_p=1.0)
             assert token.item() == 42
 
     def test_top_p_restricts(self):
         """Top-p should restrict to the nucleus of highest-probability tokens."""
-        # Token 0 has >99% probability after softmax
         logits = torch.tensor([[10.0, -10.0, -10.0, -10.0]])
         for _ in range(10):
             token = sample(logits.clone(), temperature=1.0, top_k=0, top_p=0.5)
@@ -134,12 +114,9 @@ class TestSampling:
         """High temperature should make distribution more uniform (higher entropy)."""
         logits = torch.tensor([[0.0, 1.0, 2.0, 3.0]])
 
-        # Low temperature: probabilities concentrate on max
         low_t = (logits / 0.1).softmax(dim=-1)
-        # High temperature: probabilities more uniform
         high_t = (logits / 10.0).softmax(dim=-1)
 
-        # Entropy of high-temperature should be greater
         entropy_low = -(low_t * low_t.log()).sum()
         entropy_high = -(high_t * high_t.log()).sum()
         assert entropy_high > entropy_low
@@ -150,11 +127,6 @@ class TestSampling:
         tokens = sample(logits, temperature=1.0, top_k=0, top_p=1.0)
         assert tokens.shape == (8,)
         assert (tokens >= 0).all() and (tokens < 64).all()
-
-
-# ============================================================================
-# Generation tests
-# ============================================================================
 
 
 class TestGenerate:
@@ -193,11 +165,9 @@ class TestGenerate:
         model = _tiny_model()
         prompt = torch.randint(0, 128, (1, 3))
 
-        # Generate once to discover what the model greedily predicts first
         full_output = generate(model, prompt, max_new_tokens=10, temperature=0)
         first_token = full_output[0, 3].item()
 
-        # Now use that token as EOS — generation must stop after 1 token
         output = generate(
             model,
             prompt,
@@ -265,7 +235,6 @@ class TestGenerate:
 
     def test_rejects_exceeding_max_seq_len(self):
         """Should raise if prompt + max_new_tokens exceeds model max_seq_len."""
-        # max_seq_len=64 from _tiny_config
         model = _tiny_model()
         prompt = torch.randint(0, 128, (1, 50))
         import pytest
@@ -290,7 +259,6 @@ class TestGenerate:
         prompt = torch.randint(0, 128, (1, 4))
         with pytest.raises(ValueError, match=r"generate\(\)") as exc_info:
             generate(model, prompt, max_new_tokens=3, temperature=0)
-        # The message names the knob to restore for exactly the omitted modules.
         message = str(exc_info.value)
         for name in ("token_embedding", "output_head"):
             assert (f"include_{name}=True" in message) == (name in omitted)

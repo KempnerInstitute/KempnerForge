@@ -22,17 +22,27 @@ shutdown_handler = ShutdownHandler(timeout_sec=config.train.shutdown_timeout_sec
 shutdown_handler.register()
 ...
 while step < tc.max_steps:
-    # ... train step, log, checkpoint ...
+    # ... train step, log ...
+    saved_this_step = config.checkpoint.should_save(step)
+    if saved_this_step:
+        ckpt_mgr.save(step=step, ...)
     if shutdown_handler.should_shutdown():
-        logger.warning(f"Shutdown requested at step {step} — saving emergency checkpoint")
-        ckpt_mgr.save(step=step, tokens_seen=tokens_seen,
-                      scheduler=scheduler, extra=ckpt_extra)
+        if saved_this_step:
+            ckpt_mgr.wait()
+        else:
+            logger.warning(f"Shutdown requested at step {step} — saving emergency checkpoint")
+            ckpt_mgr.save(step=step, tokens_seen=tokens_seen,
+                          scheduler=scheduler, extra=ckpt_extra)
         shutdown_handler.finish()
         break
 ```
 
 `register()` installs handlers for `SIGTERM` and `SIGUSR1`. `finish()`
 cancels the forced-exit timer and restores the previous signal handlers.
+A shutdown on a step the checkpoint schedule already saved reuses that
+save as the emergency checkpoint instead of writing the step twice, and
+waits for it before `finish()`, so the forced-exit timer still bounds a
+stalled write.
 
 ### Why cooperative, not `sys.exit`
 

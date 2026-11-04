@@ -15,12 +15,16 @@ All optimizers:
 
 from __future__ import annotations
 
+import functools
 import logging
+from typing import Any, ClassVar
 
 import torch
 
+from kempnerforge.config.optimizer import MUON_ADJUST_LR_MODES, MUON_ORTHOGONALIZE_MODES
 from kempnerforge.config.registry import registry
 from kempnerforge.config.schema import OptimizerConfig
+from kempnerforge.training.orthogonalize import orthogonalize_exact
 
 logger = logging.getLogger(__name__)
 
@@ -37,11 +41,6 @@ def _build_adamw(
         eps=config.eps,
         fused=config.fused and torch.cuda.is_available(),
     )
-
-
-# ---------------------------------------------------------------------------
-# Lion optimizer
-# ---------------------------------------------------------------------------
 
 
 class Lion(torch.optim.Optimizer):
@@ -97,18 +96,13 @@ class Lion(torch.optim.Optimizer):
 
                 m = state["exp_avg"]
 
-                # Update direction: sign of interpolated momentum + gradient
-                # .mul() (not in-place) creates a temporary — m is unchanged
                 update = (m.mul(beta1) + grad.mul(1 - beta1)).sign_()
 
-                # Decoupled weight decay
                 if wd > 0:
                     p.data.mul_(1 - lr * wd)
 
-                # Apply update
                 p.data.add_(update, alpha=-lr)
 
-                # Update momentum buffer
                 m.mul_(beta2).add_(grad, alpha=1 - beta2)
 
         return loss
@@ -124,11 +118,6 @@ def _build_lion(
         lr=config.lr,
         betas=config.betas,
     )
-
-
-# ---------------------------------------------------------------------------
-# Schedule-Free AdamW
-# ---------------------------------------------------------------------------
 
 
 class ScheduleFreeAdamW(torch.optim.Optimizer):
@@ -192,7 +181,6 @@ class ScheduleFreeAdamW(torch.optim.Optimizer):
             eps = group["eps"]
             wd = group["weight_decay"]
 
-            # Weight for Polyak averaging (accounts for variable LR during warmup)
             weight = lr * (1 - beta1)
 
             for p in group["params"]:
@@ -210,37 +198,24 @@ class ScheduleFreeAdamW(torch.optim.Optimizer):
                 z = state["z"]
                 v = state["v"]
 
-                # Second moment update
                 v.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
 
-                # Bias-corrected denominator
                 bc2 = 1 - beta2**k
                 denom = (v / bc2).sqrt().add_(eps)
 
-                # Update z (the iterate)
                 z.addcdiv_(grad, denom, value=-lr)
 
-                # Decoupled weight decay on z
                 if wd > 0:
                     z.mul_(1 - lr * wd)
 
-                # Polyak average coefficient
                 state["weight_sum"] += weight
                 ck = weight / state["weight_sum"]
 
-                # Update p.data via interpolation:
-                # x_new = (1 - ck) * x_old + ck * z
-                # y_new = (1 - beta1) * z + beta1 * x_new
-                # We don't store x explicitly — derive it from current y and z:
-                # x_old = (y_old - (1 - beta1) * z_old) / beta1
-                # But z changed, so we need a different approach.
-                # Store x explicitly for correctness:
                 if "x" not in state:
                     state["x"] = z.clone()
                 else:
                     state["x"].lerp_(z, ck)
 
-                # Set params to interpolated point for next gradient computation
                 p.data.copy_(z).lerp_(state["x"], beta1)
 
         return loss
@@ -283,11 +258,6 @@ def _build_schedule_free_adamw(
     )
 
 
-# ---------------------------------------------------------------------------
-# Muon optimizer
-# ---------------------------------------------------------------------------
-
-
 def _newton_schulz(G: torch.Tensor, steps: int = 5) -> torch.Tensor:
     """Approximate orthogonal projection via Newton-Schulz iteration.
 
@@ -307,7 +277,6 @@ def _newton_schulz(G: torch.Tensor, steps: int = 5) -> torch.Tensor:
     assert G.ndim == 2
     a, b, c = 3.4445, -4.7750, 2.0315
 
-    # Frobenius normalization (matches reference Muon; sufficient for NS convergence)
     X = G / (G.norm() + 1e-7)
 
     for _ in range(steps):
@@ -316,6 +285,20 @@ def _newton_schulz(G: torch.Tensor, steps: int = 5) -> torch.Tensor:
         X = a * X + B @ X
 
     return X
+
+
+def _orthogonalize_matrix(matrix: torch.Tensor, steps: int) -> torch.Tensor:
+    """Newton-Schulz in fp32, returned in ``matrix``'s dtype."""
+    return _newton_schulz(matrix.float(), steps=steps).to(matrix.dtype)
+
+
+def _muon_update_scale(adjust_lr: str, rows: int, cols: int) -> float:
+    """Factor on Muon's orthogonalized update for a ``rows`` x ``cols`` matrix."""
+    if adjust_lr == "match_rms_adamw":
+        return 0.2 * max(rows, cols) ** 0.5
+    if adjust_lr == "spectral_unclamped":
+        return (rows / cols) ** 0.5
+    return max(1, rows / cols) ** 0.5
 
 
 def _get_local_tensor(t: torch.Tensor) -> torch.Tensor:
@@ -360,7 +343,18 @@ class Muon(torch.optim.Optimizer):
         adam_eps: Epsilon for the AdamW fallback.
         ns_steps: Newton-Schulz iteration steps (default 5).
         adam_lr: Learning rate for AdamW fallback (1D params). None = same as lr.
+        nesterov: Feed Newton-Schulz the Nesterov look-ahead instead of the momentum buffer.
+        adjust_lr: Update scale: "original" sqrt(max(1, rows/cols)), "match_rms_adamw"
+            0.2 * sqrt(max(rows, cols)), or "spectral_unclamped" sqrt(rows/cols).
+        orthogonalize: "local" runs Newton-Schulz on each rank's shard, "exact" on the full
+            matrix.
     """
+
+    LEGACY_GROUP_DEFAULTS: ClassVar[dict[str, Any]] = {
+        "orthogonalize": "local",
+        "nesterov": False,
+        "adjust_lr": "original",
+    }
 
     def __init__(
         self,
@@ -373,12 +367,20 @@ class Muon(torch.optim.Optimizer):
         adam_eps: float = 1e-8,
         ns_steps: int = 5,
         adam_lr: float | None = None,
+        nesterov: bool = False,
+        adjust_lr: str = "original",
+        orthogonalize: str = "local",
     ):
+        if adjust_lr not in MUON_ADJUST_LR_MODES:
+            raise ValueError(f"adjust_lr must be one of {MUON_ADJUST_LR_MODES}, got {adjust_lr!r}")
+        if orthogonalize not in MUON_ORTHOGONALIZE_MODES:
+            raise ValueError(
+                f"orthogonalize must be one of {MUON_ORTHOGONALIZE_MODES}, got {orthogonalize!r}"
+            )
         adam_lr = adam_lr if adam_lr is not None else lr
         self._initial_lr = lr
         self._initial_adam_lr = adam_lr
 
-        # Create internal AdamW for 1D params
         self._adam = (
             torch.optim.AdamW(
                 adam_params,
@@ -391,7 +393,15 @@ class Muon(torch.optim.Optimizer):
             else None
         )
 
-        defaults = dict(lr=lr, momentum=momentum, weight_decay=weight_decay, ns_steps=ns_steps)
+        defaults = dict(
+            lr=lr,
+            momentum=momentum,
+            weight_decay=weight_decay,
+            ns_steps=ns_steps,
+            nesterov=nesterov,
+            adjust_lr=adjust_lr,
+            orthogonalize=orthogonalize,
+        )
         super().__init__(muon_params, defaults)
 
     @property
@@ -417,6 +427,13 @@ class Muon(torch.optim.Optimizer):
         if adam_state is not None and self._adam is not None:
             self._adam.load_state_dict(adam_state)
 
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        """Fill in the ``LEGACY_GROUP_DEFAULTS`` that a state saved before them lacks."""
+        super().__setstate__(state)
+        for group in self.param_groups:
+            for key, value in self.LEGACY_GROUP_DEFAULTS.items():
+                group.setdefault(key, value)
+
     def zero_grad(self, set_to_none: bool = True) -> None:
         """Zero both Muon's own parameters and the inner AdamW's.
 
@@ -439,50 +456,44 @@ class Muon(torch.optim.Optimizer):
             momentum = group["momentum"]
             wd = group["weight_decay"]
             ns_steps = group["ns_steps"]
+            nesterov = group["nesterov"]
+            adjust_lr = group["adjust_lr"]
+            orthogonalize = group["orthogonalize"]
 
-            for p in group["params"]:
-                if p.grad is None:
-                    continue
-
-                # Work on local tensors to avoid DTensor/Tensor mixing.
-                # FSDP2 wraps params as DTensors; operating on the local
-                # shard directly sidesteps distributed tensor dispatch.
-                p_local = _get_local_tensor(p)
+            params = [p for p in group["params"] if p.grad is not None]
+            inputs = []
+            for p in params:
                 g_local = _get_local_tensor(p.grad)
 
-                # Momentum buffer: stored matching p.grad's type (DTensor if
-                # FSDP2) so DCP can save/restore it correctly. We operate on
-                # the local shard for the actual computation.
                 state = self.state[p]
                 if "momentum_buffer" not in state:
                     state["momentum_buffer"] = torch.zeros_like(p.grad)
                 buf_local = _get_local_tensor(state["momentum_buffer"])
                 buf_local.mul_(momentum).add_(g_local)
+                inputs.append(g_local.add(buf_local, alpha=momentum) if nesterov else buf_local)
 
-                # Reshape to 2D for Newton-Schulz if needed
-                original_shape = buf_local.shape
-                buf_2d = buf_local.view(buf_local.shape[0], -1) if buf_local.ndim > 2 else buf_local
+            matrices = [x.view(x.shape[0], -1) for x in inputs]
+            newton_schulz = functools.partial(_orthogonalize_matrix, steps=ns_steps)
+            if orthogonalize == "exact":
+                orthos = orthogonalize_exact(params, matrices, newton_schulz)
+            else:
+                orthos = [newton_schulz(matrix) for matrix in matrices]
 
-                # Orthogonalize
-                update = _newton_schulz(buf_2d.float(), steps=ns_steps)
-                update = update.to(buf_local.dtype)
+            for p, x, ortho in zip(params, inputs, orthos, strict=True):
+                p_local = _get_local_tensor(p)
+                update = ortho.view(x.shape)
 
-                if buf_local.ndim > 2:
-                    update = update.view(original_shape)
+                if orthogonalize == "exact":
+                    m, n = p.shape[0], p.shape[1:].numel()
+                else:
+                    m, n = ortho.shape
+                update.mul_(_muon_update_scale(adjust_lr, m, n))
 
-                # Scale: NS produces unit-norm rows, scale by sqrt(m/n)
-                m, n = buf_2d.shape
-                update.mul_(max(1, m / n) ** 0.5)
-
-                # Decoupled weight decay
                 if wd > 0:
                     p_local.mul_(1 - lr * wd)
 
                 p_local.add_(update, alpha=-lr)
 
-        # Step the internal AdamW for 1D params.
-        # Scale Adam LR proportionally to Muon's current LR so the scheduler's
-        # warmup/decay applies to both — the scheduler only sees Muon's param_groups.
         if self._adam is not None:
             if self._initial_lr > 0:
                 scale = self.param_groups[0]["lr"] / self._initial_lr
@@ -502,7 +513,6 @@ def _is_muon_eligible(param: torch.Tensor) -> bool:
     """
     if param.ndim < 2:
         return False
-    # Aspect ratio check: max/min > 10 means too rectangular for NS
     m, n = param.shape[0], param.view(param.shape[0], -1).shape[1]
     return max(m, n) / max(min(m, n), 1) <= 10
 
@@ -512,7 +522,6 @@ def _build_muon(
     param_groups: list[dict],
     config: OptimizerConfig,
 ) -> torch.optim.Optimizer:
-    # Split: 2D params with reasonable aspect ratio get Muon, rest gets AdamW
     muon_groups = []
     adam_groups = []
 
@@ -546,12 +555,10 @@ def _build_muon(
         adam_eps=config.eps,
         ns_steps=config.muon_ns_steps,
         adam_lr=config.muon_adam_lr,
+        nesterov=config.muon_nesterov,
+        adjust_lr=config.muon_adjust_lr,
+        orthogonalize=config.muon_orthogonalize,
     )
-
-
-# ---------------------------------------------------------------------------
-# Optimizer construction
-# ---------------------------------------------------------------------------
 
 
 def _should_decay(name: str, param: torch.nn.Parameter) -> bool:
@@ -593,7 +600,6 @@ def build_optimizer(
         {"params": no_decay_params, "weight_decay": 0.0},
     ]
 
-    # Log parameter counts
     n_decay = sum(p.numel() for p in decay_params)
     n_no_decay = sum(p.numel() for p in no_decay_params)
     logger.info(

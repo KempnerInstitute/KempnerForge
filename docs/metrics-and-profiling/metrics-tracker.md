@@ -10,8 +10,10 @@ stdout formatting, and backend dispatch.
 
 ```python
 # training/entry.py::run_training
-tracker = MetricsTracker(config, num_gpus=world_size)
-tracker.init_backends(config)     # lazy rank-0 init
+tracker = MetricsTracker(config, num_gpus=runtime.world_size)
+tracker.init_backends(config)     # builds the rank-0 backends
+ckpt_mgr.set_tracking_source(tracker.tracking_entries)
+ckpt_mgr.set_checkpoint_registrar(tracker)
 ...
 while step < tc.max_steps:
     tracker.start_step()
@@ -19,12 +21,13 @@ while step < tc.max_steps:
     tracker.end_step(step, loss=loss, grad_norm=gn, lr=lr,
                      tokens_in_step=tokens_per_step)
     ...
-tracker.close()
+tracker.close()                   # in a finally
 ```
 
-`init_backends` is separate from `__init__` because distributed init and
-config rewrites (e.g. restored `wandb_run_id`) happen between tracker
-construction and the first step.
+`init_backends` is separate from `__init__` so that constructing a tracker touches neither
+distributed state nor any backend: the rank check needs the process group, so
+`run_training` calls it after distributed init, once checkpoint restore has already written the
+resumed run ids into the config.
 
 ## Per-step flow
 
@@ -124,10 +127,11 @@ for backend in self._backends:
     backend.log(backend_dict, step=step)
 ```
 
-Backends are initialized lazily and only on rank 0:
+Backends are built by `init_backends`, on rank 0 only, and each starts its run on its first
+`log()`. They are independent toggles, so any combination can be enabled at once:
 
 ```python
-# kempnerforge/metrics/tracker.py — _init_backends
+# kempnerforge/metrics/tracker.py: _init_backends
 if dist.is_initialized() and dist.get_rank() != 0:
     return
 if mc.enable_wandb:
@@ -135,7 +139,7 @@ if mc.enable_wandb:
 if mc.enable_tensorboard:
     self._backends.append(TensorBoardBackend(mc))
 if mc.enable_mlflow:
-    self._backends.append(MLflowBackend(mc, hyperparams=_flatten_config_params(config)))
+    self._backends.append(MLflowBackend(mc, job_config=config))
 ```
 
 Non-rank-0 workers keep `_backends` empty; their `_log_step` call iterates
@@ -170,12 +174,51 @@ produce several side-by-side rows in WandB / TensorBoard.
 
 ```python
 def close(self) -> None:
+    self._closed = True
     for backend in self._backends:
         backend.close()
 ```
 
-Called at the end of `run_training`. WandB and MLflow close the run;
-TensorBoard flushes the event file.
+Called from a `finally` in `run_training`, so a run that raises still closes its backends. WandB
+finishes the run, MLflow drains its queued calls, checkpoint registrations included, and ends
+the run (each bounded, see [MLflow](mlflow.md#bounded-calls)), and TensorBoard flushes the event
+file. Marking the tracker closed first makes `tracking_entries()`, `checkpoint_fields()` and
+`register_checkpoint()` return nothing afterwards.
+
+## Tracking entries
+
+```python
+def tracking_entries(self) -> list[dict[str, str]]:
+    ...
+```
+
+One record per backend that has a live run, each from the backend's own `tracking_entry()`
+(a backend that does not override it contributes nothing). A backend that raises, or whose
+entry is not strings under a named `backend`, is skipped with a warning. `run_training`
+hands this to `CheckpointManager.set_tracking_source`, so every checkpoint's `metadata.json`
+names the runs it was trained under ([Checkpointing](../checkpointing/index.md)). It reads
+fields the backends already hold, never waits on a server, and returns an empty list before
+any run has started and after `close()`.
+
+## Registering checkpoints
+
+```python
+def checkpoint_fields(self, step: int) -> dict[str, dict[str, str]]:
+    ...
+
+def register_checkpoint(self, step: int, directory: Path, record: TrackingRecord) -> None:
+    ...
+```
+
+`run_training` hands the tracker to `CheckpointManager.set_checkpoint_registrar`, which calls
+both on rank 0. `checkpoint_fields` runs inside `save()`: each backend with a live run names the
+fields it adds to its own entry of that save's `tracking` list, keyed by backend name, from what
+it already holds. `register_checkpoint` runs once the checkpoint is committed and must not block:
+each backend with a live run gets `record` bound to its own name and calls it, then or later from
+another thread, to add fields to its entry; the manager applies each call to that checkpoint's
+`metadata.json` atomically. Only `MLflowBackend` does either, when `mlflow_register_checkpoints`
+is on ([MLflow](mlflow.md#registering-checkpoints)). A backend that raises costs only its own
+fields or registration, and neither method does anything after `close()`.
 
 ## Logger: `get_logger`, `format_metrics`
 
@@ -196,6 +239,11 @@ Override rank filtering with `get_logger(__name__, rank_zero_only=False)`
 when you genuinely want every rank to log — e.g. for distributed-init
 debugging. Once the root logger is configured it's cached, so this flag
 only takes effect on the very first call.
+
+A single record can pass the filter instead: log it with
+`extra={"every_rank": True}` and every rank emits it. Use this for an event
+that only the logging rank sees, such as a problem with a sample that rank
+read.
 
 ## See also
 

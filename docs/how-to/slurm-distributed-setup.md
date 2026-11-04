@@ -37,6 +37,11 @@ Edit the header for your cluster:
 #SBATCH --time=24:00:00
 ```
 
+`<partition-name>` and `<account-name>` are the values your PI gave you.
+`scripts/slurm/7b_requeue.sh` needs a preemptible partition that requeues, and
+both it and `scripts/slurm/13b_validation.sh` pin a GPU model through
+`#SBATCH --constraint=<gpu-type>`, such as `h200`, `h100` or `a100`.
+
 ## Multi-node: `multinode.sh`
 
 ```bash
@@ -137,7 +142,7 @@ the short version:
 The 120-second window is a design parameter: emergency checkpoints
 must finish within it or the job is SIGKILL'd. Async DCP save times
 depend on model size, FSDP degree, and filesystem — measure on your
-cluster with `checkpoint.async_save = true` and a test run before
+cluster with `checkpoint.async_mode = "async"` and a test run before
 trusting the default for 70B+. If your save consistently overruns,
 raise `#SBATCH --signal=B:SIGTERM@<seconds>` accordingly.
 

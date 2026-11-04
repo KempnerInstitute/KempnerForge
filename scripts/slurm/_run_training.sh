@@ -1,18 +1,4 @@
 #!/bin/bash
-# Launch wrapper for running scripts/train.py under srun multi-node,
-# srun-direct pattern (one task per GPU). Mirrors scripts/slurm/multinode.sh
-# but for use inside an existing interactive allocation.
-#
-# Invoke from the repo root (same convention as multinode.sh):
-#   srun --jobid=<ID> --nodes=<N> --ntasks-per-node=<gpus_per_node> \
-#        --gpus-per-node=<G> --overlap \
-#        scripts/slurm/_run_training.sh <config.toml> [overrides...]
-#
-# Environment overrides:
-#   KEMPNERFORGE_LOG_DIR   where per-rank logs go (default: $SLURM_SUBMIT_DIR/logs/distributed or $PWD/logs/distributed)
-#
-# Per-rank logs go to $LOG_DIR/train_job<JOB>_rank<N>.log; rank 0 also
-# streams to stdout.
 
 set -eo pipefail
 

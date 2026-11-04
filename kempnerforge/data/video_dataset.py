@@ -37,14 +37,13 @@ from kempnerforge.data.vlm_dataset import (
     DEFAULT_IMAGE_MEAN,
     DEFAULT_IMAGE_STD,
     _tokenize_and_mask,
+    check_prompt_fits,
     frames_to_clip_tensor,
     resolve_pad_id,
 )
 
 logger = logging.getLogger(__name__)
 
-# WebVid layout: the metadata split directory ("val") differs from the video
-# directory name ("validation"); "train" matches both.
 _CSV_SUBDIR = {"train": "train", "validation": "val"}
 _VIDEO_SUBDIR = {"train": "train", "validation": "validation"}
 
@@ -81,6 +80,8 @@ class WebVidVideoDataset(VideoDataset):
         frame_size: Square pixel size per frame.
         max_samples: Cap the manifest (``0`` = all).
         prompt: Optional instruction prepended and masked from the loss.
+            Rejected here when it leaves no room in ``max_text_len`` for a
+            caption token (``check_prompt_fits``).
         image_mean / image_std: Per-channel normalization (SigLIP defaults).
     """
 
@@ -108,14 +109,13 @@ class WebVidVideoDataset(VideoDataset):
             raise ValueError(f"split must be one of {tuple(_VIDEO_SUBDIR)} (got {split!r})")
         self._split = split
         self._video_dir = os.path.join(data_root, "raw", "videos", _VIDEO_SUBDIR[split])
-        # ``dataset_name`` names the on-disk corpus (e.g. "webvid-10M"); the WebVid
-        # *style* (CSV manifests + prefix-nested mp4s) is shared, so other
-        # WebVid-style datasets differ only by this directory.
         csv_dir = os.path.join(
             data_root, "raw", dataset_name, "data", _CSV_SUBDIR[split], "partitions"
         )
         self._ids, self._caps = self._load_manifest(csv_dir, max_samples)
         self._tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+        if prompt:
+            check_prompt_fits(self._tokenizer, prompt, max_text_len)
         self._pad_id = resolve_pad_id(self._tokenizer)
         self._max_text_len = max_text_len
         self._max_frames = max_frames
@@ -192,7 +192,7 @@ class WebVidVideoDataset(VideoDataset):
                 max_frames=self._max_frames,
                 sampling_policy=self._sampling_policy,
             )
-        except Exception as e:  # noqa: BLE001 - any decode failure -> skip-with-mask
+        except Exception as e:  # noqa: BLE001
             logger.debug("video decode failed for %s: %s", path, e)
             frames = []
 
@@ -207,7 +207,6 @@ class WebVidVideoDataset(VideoDataset):
         prompt = self._prompt or None
         input_ids, labels = _tokenize_and_mask(self._tokenizer, caption, self._max_text_len, prompt)
         if not frames:
-            # Undecodable clip: keep static shapes but contribute no loss.
             labels = torch.full_like(labels, -100)
         return {
             "pixel_values": pixel_values,
