@@ -15,11 +15,6 @@ from kempnerforge.model.transformer import Transformer
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
-
-
 @pytest.fixture
 def small_config():
     return ModelConfig(dim=64, n_layers=4, n_heads=4, vocab_size=256, max_seq_len=32)
@@ -47,11 +42,6 @@ def small_dataset():
     return _Dataset()
 
 
-# ---------------------------------------------------------------------------
-# ActivationStore basics
-# ---------------------------------------------------------------------------
-
-
 class TestActivationStore:
     def test_capture_single_layer(self, small_model):
         store = ActivationStore(small_model, layers=["layers.0.attention"])
@@ -60,7 +50,7 @@ class TestActivationStore:
         small_model(tokens)
         act = store.get("layers.0.attention")
         assert act is not None
-        assert act.shape == (2, 16, 64)  # (batch, seq, dim)
+        assert act.shape == (2, 16, 64)
         assert act.device == torch.device("cpu")
         store.disable()
 
@@ -134,7 +124,7 @@ class TestActivationStore:
     def test_double_enable_is_idempotent(self, small_model):
         store = ActivationStore(small_model, layers=["layers.0.attention"])
         store.enable()
-        store.enable()  # Should not duplicate hooks
+        store.enable()
         tokens = torch.randint(0, 256, (2, 16), device=DEVICE)
         small_model(tokens)
         assert store.get("layers.0.attention") is not None
@@ -161,11 +151,6 @@ class TestActivationStore:
         store.disable()
 
 
-# ---------------------------------------------------------------------------
-# Attention weight capture
-# ---------------------------------------------------------------------------
-
-
 class TestAttentionWeightCapture:
     @pytest.fixture
     def attention_setup(self):
@@ -188,10 +173,8 @@ class TestAttentionWeightCapture:
         x = torch.randn(2, 16, 64, device=DEVICE)
         out = attn(x, rope_cos, rope_sin)
         assert attn.last_attention_weights is not None
-        # Shape: (batch, n_heads, seq_q, seq_k)
         assert attn.last_attention_weights.shape == (2, 4, 16, 16)
         assert attn.last_attention_weights.device == torch.device("cpu")
-        # Output shape should be unchanged
         assert out.shape == (2, 16, 64)
 
     def test_attention_weights_sum_to_one(self, attention_setup):
@@ -201,7 +184,6 @@ class TestAttentionWeightCapture:
         x = torch.randn(2, 16, 64, device=DEVICE)
         attn(x, rope_cos, rope_sin)
         weights = attn.last_attention_weights.float()
-        # Each row sums to 1.0 (softmax over keys)
         row_sums = weights.sum(dim=-1)
         assert torch.allclose(row_sums, torch.ones_like(row_sums), atol=1e-5)
 
@@ -212,7 +194,6 @@ class TestAttentionWeightCapture:
         x = torch.randn(1, 16, 64, device=DEVICE)
         attn(x, rope_cos, rope_sin)
         weights = attn.last_attention_weights.float()
-        # Check upper triangle is zero (strictly above diagonal)
         seq_len = weights.shape[-1]
         upper_mask = torch.triu(torch.ones(seq_len, seq_len), diagonal=1).bool()
         upper_values = weights[0, 0][upper_mask]
@@ -223,11 +204,9 @@ class TestAttentionWeightCapture:
         attn, rope_cos, rope_sin = attention_setup
         x = torch.randn(2, 16, 64, device=DEVICE)
 
-        # SDPA path
         attn.capture_attention_weights = False
         out_sdpa = attn(x, rope_cos, rope_sin)
 
-        # Manual path
         attn.capture_attention_weights = True
         out_manual = attn(x, rope_cos, rope_sin)
 
@@ -246,19 +225,14 @@ class TestAttentionWeightCapture:
         assert attn.last_attention_weights is None
 
 
-# ---------------------------------------------------------------------------
-# extract_representations
-# ---------------------------------------------------------------------------
-
-
 class TestExtractRepresentations:
     def test_basic_extraction(self, small_model, small_dataset):
         layers = ["layers.0.attention", "layers.1.mlp"]
         reps = extract_representations(small_model, small_dataset, layers, DEVICE, batch_size=8)
         assert set(reps.keys()) == set(layers)
         for name in layers:
-            assert reps[name].shape[0] == len(small_dataset)  # all samples
-            assert reps[name].shape[2] == 64  # model dim
+            assert reps[name].shape[0] == len(small_dataset)
+            assert reps[name].shape[2] == 64
 
     def test_max_samples(self, small_model, small_dataset):
         reps = extract_representations(
@@ -275,7 +249,7 @@ class TestExtractRepresentations:
         small_model.train()
         assert small_model.training
         extract_representations(small_model, small_dataset, ["layers.0.attention"], DEVICE)
-        assert small_model.training  # Should be restored to train mode
+        assert small_model.training
 
     def test_results_on_cpu(self, small_model, small_dataset):
         reps = extract_representations(small_model, small_dataset, ["layers.0.attention"], DEVICE)
@@ -287,11 +261,6 @@ class TestExtractRepresentations:
         reps = extract_representations(small_model, small_dataset, ["layers.0.attention"], DEVICE)
         act = reps["layers.0.attention"]
         assert act.abs().sum() > 0
-
-
-# ---------------------------------------------------------------------------
-# save_activations
-# ---------------------------------------------------------------------------
 
 
 class TestSaveActivations:
@@ -317,7 +286,7 @@ class TestSaveActivations:
         tokens = torch.randint(0, 256, (1, 8), device=DEVICE)
         small_model(tokens)
 
-        path = tmp_path / "acts"  # No extension
+        path = tmp_path / "acts"
         save_activations(store.activations, path)
         store.disable()
 
@@ -334,11 +303,6 @@ class TestSaveActivations:
         store.disable()
 
         assert path.exists()
-
-
-# ---------------------------------------------------------------------------
-# Integration: ActivationStore with Transformer
-# ---------------------------------------------------------------------------
 
 
 class TestActivationStoreIntegration:
@@ -374,7 +338,6 @@ class TestActivationStoreIntegration:
         small_model(tokens2)
         act2 = store.get("layers.0.attention")
 
-        # Different inputs should produce different activations
         assert not torch.allclose(act1, act2)
         store.disable()
 
@@ -384,5 +347,4 @@ class TestActivationStoreIntegration:
         store.enable()
         store.disable()
 
-        # Our hook handles should all have been removed
         assert len(store._hooks) == 0

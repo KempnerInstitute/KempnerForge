@@ -35,7 +35,6 @@ pytestmark = pytest.mark.skipif(
 
 SMALL_CONFIG = ModelConfig(dim=128, n_layers=2, n_heads=2, vocab_size=512, max_seq_len=64)
 
-# Shared filesystem temp directory (visible to all ranks)
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _TEST_TMP = _PROJECT_ROOT / ".test_tmp"
 
@@ -74,11 +73,6 @@ def _train_steps(model, optimizer, n_steps, scheduler=None):
     return losses
 
 
-# ---------------------------------------------------------------------------
-# 5a: Lion distributed test
-# ---------------------------------------------------------------------------
-
-
 class TestLionDistributed:
     def test_lion_fsdp_loss_decreases(self, distributed_env):
         """Lion + FSDP2: loss decreases over 20 training steps."""
@@ -92,7 +86,6 @@ class TestLionDistributed:
 
         losses = _train_steps(model, optimizer, n_steps=20)
 
-        # Average of last 5 should be lower than first 5
         early = sum(losses[:5]) / 5
         late = sum(losses[-5:]) / 5
         assert late < early, f"Loss did not decrease: early={early:.4f}, late={late:.4f}"
@@ -112,7 +105,6 @@ class TestLionDistributed:
         opt.step()
         opt.zero_grad()
 
-        # Re-forward + backward to confirm gradients flow after a full step
         out2 = model(tokens)
         out2.sum().backward()
 
@@ -131,43 +123,31 @@ class TestLionDistributed:
         opt_config = OptimizerConfig(name="lion", lr=1e-4, fused=False)
         optimizer = build_optimizer(model, opt_config)
 
-        # Train a few steps to build optimizer state (exp_avg buffer)
         _train_steps(model, optimizer, n_steps=5)
 
-        # Capture reference output
         tokens = torch.randint(0, SMALL_CONFIG.vocab_size, (2, 32), device="cuda")
         with torch.no_grad():
             ref_out = model(tokens).clone()
 
-        # Save checkpoint
         config = CheckpointConfig(dir=ckpt_dir, keep_last_n=2)
         mgr = CheckpointManager(config, model, optimizer)
         mgr.save(step=5, tokens_seen=320)
 
-        # Perturb model weights
         with torch.no_grad():
             for p in model.parameters():
                 p.add_(torch.randn_like(p) * 0.1)
 
-        # Verify output changed
         with torch.no_grad():
             perturbed_out = model(tokens)
         assert not torch.allclose(ref_out, perturbed_out, atol=1e-3)
 
-        # Load checkpoint
         mgr.load()
 
-        # Verify output matches reference
         with torch.no_grad():
             restored_out = model(tokens)
         assert torch.allclose(ref_out, restored_out, atol=1e-5), (
             f"Restored output differs: max diff={(ref_out - restored_out).abs().max().item()}"
         )
-
-
-# ---------------------------------------------------------------------------
-# 5b: Schedule-Free AdamW distributed test
-# ---------------------------------------------------------------------------
 
 
 class TestScheduleFreeDistributed:
@@ -197,31 +177,25 @@ class TestScheduleFreeDistributed:
         opt_config = OptimizerConfig(name="schedule_free_adamw", lr=0.025, fused=False)
         optimizer = build_optimizer(model, opt_config)
 
-        # Train a few steps to build optimizer state
         _train_steps(model, optimizer, n_steps=5)
 
         tokens = torch.randint(0, SMALL_CONFIG.vocab_size, (2, 32), device="cuda")
 
-        # Get training-mode output
         with torch.no_grad():
             train_out = model(tokens).clone()
 
-        # Switch to eval params (running average)
         optimizer.eval_params()
         with torch.no_grad():
             eval_out = model(tokens).clone()
 
-        # Eval and train outputs should differ (different parameter points)
         assert not torch.allclose(train_out, eval_out, atol=1e-5), (
             "eval_params() did not change model output"
         )
 
-        # Switch back to train params
         optimizer.train_params()
         with torch.no_grad():
             restored_out = model(tokens).clone()
 
-        # Should match the original training output
         assert torch.allclose(train_out, restored_out, atol=1e-5), (
             "train_params() did not restore training point"
         )
@@ -240,38 +214,27 @@ class TestScheduleFreeDistributed:
         )
         optimizer = build_optimizer(model, opt_config)
 
-        # Train to build state
         _train_steps(model, optimizer, n_steps=5)
 
-        # Capture reference output
         tokens = torch.randint(0, SMALL_CONFIG.vocab_size, (2, 32), device="cuda")
         with torch.no_grad():
             ref_out = model(tokens).clone()
 
-        # Save
         config = CheckpointConfig(dir=ckpt_dir, keep_last_n=2)
         mgr = CheckpointManager(config, model, optimizer)
         mgr.save(step=5, tokens_seen=320)
 
-        # Perturb model
         with torch.no_grad():
             for p in model.parameters():
                 p.add_(torch.randn_like(p) * 0.1)
 
-        # Load
         mgr.load()
 
-        # Verify output matches
         with torch.no_grad():
             restored_out = model(tokens)
         assert torch.allclose(ref_out, restored_out, atol=1e-5), (
             f"Restored output differs: max diff={(ref_out - restored_out).abs().max().item()}"
         )
-
-
-# ---------------------------------------------------------------------------
-# 5c: Optimizer-scheduler compatibility matrix
-# ---------------------------------------------------------------------------
 
 
 _COMPAT_PAIRS = [

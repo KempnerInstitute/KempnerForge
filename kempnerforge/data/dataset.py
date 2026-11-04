@@ -155,10 +155,6 @@ def _compute_packed_output(tokens: np.ndarray, eos_token_id: int) -> dict[str, t
         cross-document boundaries), and ``doc_ids`` (seq_len, integer document
         assignment per input token for attention masking).
     """
-    # Assign a document ID to each token: increment after every EOS, i.e.
-    # doc_ids[i] is the number of EOS tokens strictly before i. Vectorized
-    # because this runs per __getitem__, once per token -- a Python loop here
-    # costs seq_len interpreter iterations on every sample the loader yields.
     doc_ids = np.zeros(len(tokens), dtype=np.int64)
     doc_ids[1:] = np.cumsum(tokens[:-1] == eos_token_id)
 
@@ -170,8 +166,6 @@ def _compute_packed_output(tokens: np.ndarray, eos_token_id: int) -> dict[str, t
     input_doc_ids = doc_id_tensor[:-1]
     label_doc_ids = doc_id_tensor[1:]
 
-    # Mask labels at cross-document boundaries (first token of a new document
-    # should not be predicted from the last token of the previous document)
     cross_boundary = input_doc_ids != label_doc_ids
     labels[cross_boundary] = -100
 
@@ -222,7 +216,6 @@ class MemoryMappedDataset(Dataset):
             raise ValueError("eos_token_id is required when pack_sequences=True")
         check_token_dtype(token_dtype, "token_dtype")
 
-        # Discover and sort data files for deterministic ordering
         data_path = Path(data_dir)
         self._files = sorted(data_path.glob(file_pattern))
         if not self._files:
@@ -237,14 +230,10 @@ class MemoryMappedDataset(Dataset):
             )
         bin_dtypes = _bin_shard_dtypes(self._files, token_dtype)
 
-        # Memory-map all files and compute cumulative offsets
         self._mmaps: list[np.ndarray] = []
         self._cumulative_samples: list[int] = [0]
         total_tokens = 0
 
-        # If any open fails partway, close the ones we already opened so they
-        # don't leak via the exception traceback (pytest, logger.exception,
-        # post-mortem debuggers all pin the partial `self` and its mmaps).
         try:
             for f in self._files:
                 if f.suffix == ".bin":
@@ -267,7 +256,6 @@ class MemoryMappedDataset(Dataset):
             f"{total_tokens:,} tokens, {self._total_samples:,} samples (seq_len={seq_len})"
         )
 
-        # State for resumption
         self._epoch = 0
 
     def __len__(self) -> int:
@@ -277,7 +265,6 @@ class MemoryMappedDataset(Dataset):
         if idx < 0 or idx >= self._total_samples:
             raise IndexError(f"Index {idx} out of range [0, {self._total_samples})")
 
-        # Binary search for the file containing this sample
         file_idx = self._find_file(idx)
         local_idx = idx - self._cumulative_samples[file_idx]
         start = local_idx * self.seq_len
@@ -290,7 +277,6 @@ class MemoryMappedDataset(Dataset):
 
         token_tensor = torch.from_numpy(tokens.copy())
 
-        # Input: tokens[:-1], Target: tokens[1:] (standard causal LM)
         return {
             "input_ids": token_tensor[:-1],
             "labels": token_tensor[1:],
@@ -320,9 +306,6 @@ class MemoryMappedDataset(Dataset):
         for mm in self._mmaps:
             inner = getattr(mm, "_mmap", None)
             if inner is not None and not inner.closed:
-                # BufferError: live views into the mapping still exist — can't
-                # force-close safely; drop the ref and let GC finish it.
-                # ValueError: already closed by another code path.
                 with contextlib.suppress(BufferError, ValueError):
                     inner.close()
         self._mmaps.clear()
@@ -369,11 +352,9 @@ class HuggingFaceDataset(Dataset):
         self.text_field = text_field
         self._packing_enabled = pack_sequences
 
-        # Load tokenizer
         self._tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
         self._eos_id = self._tokenizer.eos_token_id or 0
 
-        # Load dataset and pack into fixed-length sequences
         logger.info(f"Loading HuggingFace dataset: {dataset_name} ({split})")
         raw_dataset = load_dataset(dataset_name, dataset_config, split=split)
         self._packed_sequences = self._pack_sequences(raw_dataset)
@@ -382,7 +363,6 @@ class HuggingFaceDataset(Dataset):
             f"(seq_len={seq_len}) from {len(raw_dataset)} documents"  # type: ignore[reportArgumentType]
         )
 
-        # State for resumption
         self._epoch = 0
         self._sample_idx = 0
 
@@ -393,7 +373,7 @@ class HuggingFaceDataset(Dataset):
         chunks of exactly (seq_len + 1) tokens. The +1 provides the target
         for the last input position.
         """
-        chunk_size = self.seq_len + 1  # +1 for the target offset
+        chunk_size = self.seq_len + 1
         buffer: list[int] = []
         packed: list[np.ndarray] = []
 
@@ -405,12 +385,10 @@ class HuggingFaceDataset(Dataset):
             buffer.extend(tokens)
             buffer.append(self._eos_id)
 
-            # Flush full chunks from buffer
             while len(buffer) >= chunk_size:
                 packed.append(np.array(buffer[:chunk_size], dtype=np.int64))
                 buffer = buffer[chunk_size:]
 
-        # Discard partial remainder (no padding — clean sequences only)
         return packed
 
     def __len__(self) -> int:
@@ -494,11 +472,9 @@ class StreamingHuggingFaceDataset(torch.utils.data.IterableDataset):
         self.shuffle_buffer_size = shuffle_buffer_size
         self._packing_enabled = pack_sequences
 
-        # Lazy-init tokenizer (avoid loading before fork in multiprocessing workers)
         self._tokenizer = None
         self._eos_id = None
 
-        # State for resumption
         self._epoch = 0
         self._rank_docs_consumed = 0
         self._skip_rank_docs = 0
@@ -526,27 +502,24 @@ class StreamingHuggingFaceDataset(torch.utils.data.IterableDataset):
             split=self.split,
             streaming=True,
         )
-        # Shuffle with seed + epoch for different order each epoch
         ds = ds.shuffle(seed=self.seed + self._epoch, buffer_size=self.shuffle_buffer_size)  # type: ignore[reportCallIssue]
         return ds
 
     def __iter__(self):
         self._ensure_tokenizer()
-        chunk_size = self.seq_len + 1  # +1 for target offset
+        chunk_size = self.seq_len + 1
         buffer: list[int] = []
 
         stream = self._load_stream()
 
-        doc_idx = 0  # Global document counter (all ranks)
-        rank_docs = 0  # Documents processed by this rank
+        doc_idx = 0
+        rank_docs = 0
 
         for example in stream:
-            # Distributed sharding: each rank takes every world_size-th doc
             if doc_idx % self.world_size != self.rank:
                 doc_idx += 1
                 continue
 
-            # Skip documents for resumption (fast-forward to saved position)
             if rank_docs < self._skip_rank_docs:
                 rank_docs += 1
                 doc_idx += 1
@@ -565,7 +538,6 @@ class StreamingHuggingFaceDataset(torch.utils.data.IterableDataset):
             doc_idx += 1
             self._rank_docs_consumed = rank_docs
 
-            # Yield full chunks from buffer
             while len(buffer) >= chunk_size:
                 chunk = buffer[:chunk_size]
                 buffer = buffer[chunk_size:]
@@ -579,7 +551,6 @@ class StreamingHuggingFaceDataset(torch.utils.data.IterableDataset):
                         "labels": token_tensor[1:],
                     }
 
-        # Epoch complete — reset for next iteration
         self._epoch += 1
         self._skip_rank_docs = 0
         self._rank_docs_consumed = 0

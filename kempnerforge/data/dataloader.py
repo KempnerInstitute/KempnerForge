@@ -59,16 +59,12 @@ class StatefulDataLoader:
             "prefetch_factor": config.prefetch_factor if config.num_workers > 0 else None,
             "persistent_workers": config.num_workers > 0,
             "drop_last": True,
-            # Workers must survive a group-delivered SIGTERM so the in-flight
-            # step can finish and the emergency checkpoint can be written.
-            # Never called when num_workers == 0.
             "worker_init_fn": ignore_shutdown_signals_in_worker,
         }
         if collate_fn is not None:
             loader_kwargs["collate_fn"] = collate_fn
         self._dataloader = DataLoader(dataset, **loader_kwargs)
 
-        # State tracking
         self._epoch = 0
         self._batches_yielded = 0
         self._iterator = None
@@ -80,9 +76,6 @@ class StatefulDataLoader:
 
     def __iter__(self):
         self.sampler.set_epoch(self._epoch)
-        # Re-apply skip on every iter() so double-resume within the same epoch
-        # stays aligned. The sampler consumes _skip once per iter(), and
-        # _batches_yielded persists across save/load so the skip is re-computable.
         if self._batches_yielded > 0:
             self.sampler.set_skip(self._batches_yielded * self.batch_size)
         self._iterator = iter(self._dataloader)
@@ -120,7 +113,6 @@ class StatefulDataLoader:
         self._epoch = state.get("epoch", 0)
         self._batches_yielded = state.get("batches_yielded", 0)
 
-        # Set sampler state for resumption
         if "sampler" in state:
             self.sampler.load_state_dict(state["sampler"])
 

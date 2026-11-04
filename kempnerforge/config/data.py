@@ -26,11 +26,11 @@ class DatasetSource:
     overrides ``data.token_dtype`` for the ``.bin`` shards under ``path``.
     """
 
-    path: str = ""  # Pre-tokenized data directory
-    weight: float = 1.0  # Relative sampling weight
-    name: str = ""  # Name for per-dataset metrics (auto-derived if empty)
-    hf_name: str = ""  # HuggingFace dataset name
-    hf_config: str = ""  # HuggingFace dataset config
+    path: str = ""
+    weight: float = 1.0
+    name: str = ""
+    hf_name: str = ""
+    hf_config: str = ""
     token_dtype: str = ""
 
     def __post_init__(self) -> None:
@@ -73,29 +73,25 @@ class DataConfig:
     """
 
     dataset_path: str = ""
-    file_pattern: str = "*.npy"  # Glob pattern for data files (e.g., "*.npy", "tokenized_*.bin")
+    file_pattern: str = "*.npy"
     token_dtype: str = ""
     tokenizer_path: str = ""
     num_workers: int = 4
     pin_memory: bool = True
     prefetch_factor: int = 2
-    # For HuggingFace datasets
     hf_dataset_name: str | None = None
-    hf_dataset_config: str | None = None  # Dataset config name (e.g., "wikitext-2-raw-v1")
+    hf_dataset_config: str | None = None
     hf_dataset_split: str = "train"
     hf_dataset_text_field: str = "text"
-    hf_dataset_image_field: str = "image"  # VLM only: image column name
-    hf_dataset_prompt_field: str = ""  # VLM only: prompt column name (empty = no prompt mask)
-    hf_image_size: int = 224  # VLM only: target square image size
-    hf_streaming: bool = False  # Use streaming (IterableDataset) for large HF datasets
-    pack_sequences: bool = False  # Document-aware packing with cross-doc isolation
-    # Multi-dataset mixing (overrides dataset_path/hf_dataset_name when non-empty)
+    hf_dataset_image_field: str = "image"
+    hf_dataset_prompt_field: str = ""
+    hf_image_size: int = 224
+    hf_streaming: bool = False
+    pack_sequences: bool = False
     datasets: list[DatasetSource] = field(default_factory=list)
-    mix_temperature: float = 1.0  # Temperature for weight scaling (1.0=as-is, >1=uniform)
-    # Phase scheduling (step-triggered weight/LR transitions)
+    mix_temperature: float = 1.0
     phases: list[TrainingPhase] = field(default_factory=list)
-    # Annealing shortcut (syntactic sugar for a common 2-phase pattern)
-    anneal_start_step: int = 0  # 0 = disabled
+    anneal_start_step: int = 0
     anneal_weights: dict[str, float] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -109,7 +105,6 @@ class DataConfig:
         for src in self.datasets:
             if not src.path and not src.hf_name:
                 raise ValueError(f"DatasetSource '{src.name}' must have either path or hf_name")
-        # Phase validation
         if self.phases:
             steps = [p.start_step for p in self.phases]
             if steps != sorted(steps) or len(steps) != len(set(steps)):

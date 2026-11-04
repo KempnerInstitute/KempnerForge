@@ -51,9 +51,6 @@ class DataPipeline:
     mixture_weights: dict[str, float] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        # Phase scheduling needs both mixture handles and a weight for every
-        # dataset name; either gap would surface only at the first transition,
-        # as an AttributeError or a KeyError.
         if (self.mixture_dataset is None) != (self.mixture_sampler is None):
             raise ValueError("mixture_dataset and mixture_sampler must be set together")
         if self.mixture_dataset is not None and set(self.mixture_weights) != set(
@@ -101,27 +98,21 @@ def _build_vlm_pipeline(config: JobConfig, dp_rank: int, dp_size: int) -> DataPi
     """Image (Joint-Decoder) or video VLM loader, selected by ``config.is_video``."""
     tc = config.train
     vlm_cfg = config.vlm
-    assert vlm_cfg is not None  # narrowed by is_vlm
+    assert vlm_cfg is not None
 
     if config.is_video:
-        # --- Video data path (a clip = ordered frames; same VLM wrapper) ---
-        assert config.video is not None  # narrowed by is_video
+        assert config.video is not None
         if not config.data.tokenizer_path:
             raise ValueError("Video training requires data.tokenizer_path")
 
         from kempnerforge.data.video_dataset import VideoCollator, build_video_dataset
 
         vcfg = config.video
-        # Dataset style is registry-selected via [video].dataset_type; the
-        # builder reads the rest of the knobs off vcfg.
         dataset: Any = build_video_dataset(vcfg, config.data.tokenizer_path, vlm_cfg.max_text_len)
         pad_id = _resolve_pad_id(config.data.tokenizer_path)
         collator: Any = VideoCollator(pad_id=pad_id, max_text_len=vlm_cfg.max_text_len)
         logger.info(f"Video dataset: {len(dataset):,} clips from {vcfg.data_root}")
     else:
-        # --- Image VLM (Joint-Decoder) data path ---
-        # Mixing VLM + text-only datasets in one run is out of scope on this
-        # branch. DatasetSource doesn't describe image sources yet; follow-up.
         if not config.data.hf_dataset_name or not config.data.tokenizer_path:
             raise ValueError("VLM training requires data.hf_dataset_name and data.tokenizer_path")
 
@@ -138,9 +129,6 @@ def _build_vlm_pipeline(config: JobConfig, dp_rank: int, dp_size: int) -> DataPi
             image_size=config.data.hf_image_size,
             dataset_config=config.data.hf_dataset_config,
         )
-        # Collator enforces fixed-length padding so all DP ranks see identical
-        # tensor shapes, and emits the image_positions slot (D18) for
-        # downstream multi-image work.
         collator = VLMCollator(
             pad_id=_resolve_pad_id(config.data.tokenizer_path),
             max_text_len=vlm_cfg.max_text_len,
@@ -266,11 +254,10 @@ def _build_hf_pipeline(config: JobConfig, dp_rank: int, dp_size: int) -> DataPip
     if not config.data.tokenizer_path:
         raise ValueError("data.tokenizer_path is required for HuggingFace datasets")
     hf_dataset_name = config.data.hf_dataset_name
-    if not hf_dataset_name:  # build_data_pipeline dispatches on this
+    if not hf_dataset_name:
         raise ValueError("data.hf_dataset_name is required for HuggingFace datasets")
 
     if config.data.hf_streaming:
-        # Streaming: on-the-fly tokenization, no full download needed
         dataset = StreamingHuggingFaceDataset(
             dataset_name=hf_dataset_name,
             split=config.data.hf_dataset_split,
@@ -289,9 +276,6 @@ def _build_hf_pipeline(config: JobConfig, dp_rank: int, dp_size: int) -> DataPip
             num_workers=config.data.num_workers,
             pin_memory=config.data.pin_memory,
             prefetch_factor=(config.data.prefetch_factor if config.data.num_workers > 0 else None),
-            # Both of these match StatefulDataLoader, the wrapper every other
-            # loader here goes through: workers survive a group-delivered
-            # SIGTERM, and they are kept across epochs rather than respawned.
             persistent_workers=config.data.num_workers > 0,
             worker_init_fn=ignore_shutdown_signals_in_worker,
         )
@@ -300,7 +284,6 @@ def _build_hf_pipeline(config: JobConfig, dp_rank: int, dp_size: int) -> DataPip
             f"({config.data.hf_dataset_split}), rank={dp_rank}/{dp_size}"
         )
     else:
-        # Eager: download, tokenize, and pack all sequences into memory
         dataset = HuggingFaceDataset(
             dataset_name=hf_dataset_name,
             split=config.data.hf_dataset_split,
@@ -337,8 +320,6 @@ def build_data_pipeline(config: JobConfig, runtime: RuntimeContext) -> DataPipel
     step bodies then run on random tokens.
     """
     eos_token_id = _resolve_eos_token_id(config)
-    # With PP, samplers use DP rank/size (not total world size) since all PP
-    # stages in the same DP group process the same batch.
     dp_rank, dp_size = get_dp_info(runtime.device_mesh)
 
     if config.is_vlm:
@@ -382,10 +363,6 @@ def build_eval_dataloader(config: JobConfig, runtime: RuntimeContext) -> Any | N
         )
         logger.info(f"Eval dataset: {len(eval_dataset):,} samples from {eval_config.dataset_path}")
     elif eval_config.hf_dataset_name:
-        # Rank 0 loads/tokenizes the HF eval dataset, then broadcasts the
-        # packed token tensor to all ranks via torch.distributed.broadcast.
-        # This avoids file-lock failures (flock) on cluster filesystems
-        # (Lustre, VAST) where load_dataset() would crash on all ranks.
         if runtime.rank == 0:
             eval_ds = HuggingFaceDataset(
                 dataset_name=eval_config.hf_dataset_name,
@@ -401,7 +378,6 @@ def build_eval_dataloader(config: JobConfig, runtime: RuntimeContext) -> Any | N
             packed = torch.empty(0, dtype=torch.long)
             n_seqs = torch.tensor([0], device=device)
 
-        # Single-process callers (and unit tests) have no group to broadcast on.
         if dist.is_initialized():
             dist.broadcast(n_seqs, src=0)
             if runtime.rank != 0:
@@ -480,7 +456,6 @@ def _apply_phase(
     mixture: MixtureDataset,
     sampler: MixtureSampler,
 ) -> None:
-    # A phase need not name every dataset; the rest keep their original weight.
     new_weights = [
         phase.dataset_weights.get(name, state.original_weights[name])
         for name in mixture.dataset_names

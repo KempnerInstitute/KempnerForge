@@ -50,7 +50,7 @@ def test_set_seed_same_across_dp_ranks():
     _set_seed(42, rank=0, pp_rank=0)
     py_dp0 = [random.random() for _ in range(4)]
 
-    _set_seed(42, rank=4, pp_rank=0)  # different DP rank, same PP stage
+    _set_seed(42, rank=4, pp_rank=0)
     py_dp4 = [random.random() for _ in range(4)]
 
     assert py_dp0 == py_dp4, (
@@ -73,12 +73,9 @@ def test_set_seed_matches_checkpoint_coverage():
     _set_seed(7, rank=0)
     state_b = get_rng_state()
 
-    # Python random state must be identical after reseeding.
     assert state_a["python"] == state_b["python"]
-    # NumPy state must be identical (tuple compare handles array contents).
     np_a = state_a["numpy"]
     np_b = state_b["numpy"]
     assert np_a[0] == np_b[0]
     assert (np_a[1] == np_b[1]).all()
-    # Torch CPU state must be identical.
     assert torch.equal(state_a["torch_cpu"], state_b["torch_cpu"])
