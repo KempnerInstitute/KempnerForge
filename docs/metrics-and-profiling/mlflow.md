@@ -1,6 +1,6 @@
 # MLflow backend
 
-[`MLflowBackend`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/metrics/tracker.py)
+[`MLflowBackend`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/metrics/mlflow/backend.py)
 logs metrics, params, and system utilization to MLflow. The default is a Databricks-hosted
 workspace, so we don't run a tracking server ourselves, but any MLflow tracking server works. It
 is opt-in. The logging backends are independent toggles, so WandB, TensorBoard and MLflow can be
@@ -80,17 +80,22 @@ profile. Export `DATABRICKS_TOKEN` rather than the alias for any other tool that
 workspace.
 ```
 
-`uv run python scripts/check_env.py --requires mlflow` reports which route a shell has. It
-passes on the environment pair (`DATABRICKS_HOST` and a token under either name), or on a
-profile section found in `~/.databrickscfg` (the profile named by a `databricks://<profile>`
-`$MLFLOW_TRACKING_URI`, else `$DATABRICKS_CONFIG_PROFILE`, else `DEFAULT`). With neither it
-warns without failing, naming the three routes, because it cannot verify OAuth offline. It
-reads only section names from the profile file, never the tokens, so it cannot see a
-`[__settings__]` default: name the profile if you rely on one. It looks at the environment,
-not at `mlflow_tracking_uri` in a config. Add `--check-credentials` to also call the workspace
-through the SDK. A failure is reported by exception class only, because the text can quote a
-token (a malformed profile line, a token with a stray newline); the connectivity check below
-prints the full error.
+`uv run python scripts/check_env.py --requires mlflow` reports which route a shell has,
+resolving it the way the SDK does. The profile file is the one `$DATABRICKS_CONFIG_FILE` names,
+else `~/.databrickscfg`. With a profile selected it passes on that profile's section in the
+file; when the file does not exist, the SDK reads nothing from it and authenticates from the
+environment, and the check judges that route instead. With none selected, any credential
+variable takes the environment route, which passes on `DATABRICKS_HOST` plus a token under
+either name, a username and password, or a client id and secret; with no credential variable
+set it reads the file and uses the SDK's default profile. Anything else warns without failing,
+naming the three routes, because it cannot verify OAuth, a CLI login or a metadata service
+offline. It parses the whole file, as the SDK does, but no value from the file reaches a
+message. It looks at the environment, not at `mlflow_tracking_uri` in a config. Add
+`--check-credentials` to also call the workspace through the SDK by that same resolution,
+naming a profile only when one is selected; it calls whenever the offline check passes or leaves
+an environment route unsettled. A failure is reported by exception class only,
+because the text can quote a token (a malformed profile line, a token with a stray newline);
+the connectivity check below prints the full error.
 
 Credentials are not pre-checked. Init, on the first `log()`, attempts the connection, and if it
 fails the backend logs a warning, naming the auth routes when the failure may be a credentials
@@ -162,7 +167,7 @@ mints a new one; `_ensure_init` writes it back to `MetricsConfig` and the traini
 persists it in `ckpt_extra`:
 
 ```python
-# kempnerforge/metrics/tracker.py: MLflowBackend._ensure_init
+# kempnerforge/metrics/mlflow/backend.py: MLflowBackend._ensure_init
 experiment, run_id, run_name, resumed, last_step = self._owner.start(_INIT_DEADLINE_S)
 ...
 self._config.mlflow_run_id = run_id      # write back for checkpoint
@@ -256,11 +261,11 @@ them to a per-checkpoint model.
 ## Publishing eval results
 
 Evaluation runs on a checkpoint after training, so its scores belong on the run that produced it.
-`kempnerforge.metrics.publish` appends metrics to the MLflow run a checkpoint's `metadata.json`
-records, at the checkpoint's step:
+`kempnerforge.metrics.mlflow.publish` appends metrics to the MLflow run a checkpoint's
+`metadata.json` records, at the checkpoint's step:
 
 ```bash
-uv run python -m kempnerforge.metrics.publish <checkpoint_dir> --metrics <scores.json>
+uv run python -m kempnerforge.metrics.mlflow.publish <checkpoint_dir> --metrics <scores.json>
 ```
 
 `<checkpoint_dir>` is a step directory (the one holding `metadata.json`), and `<scores.json>` a

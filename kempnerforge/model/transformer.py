@@ -338,6 +338,7 @@ class Transformer(nn.Module):
         modality: ModalityContext | None = None,
         kv_caches: list[KVCache] | None = None,
         doc_ids: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
         attention_group_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Forward pass.
@@ -366,6 +367,17 @@ class Transformer(nn.Module):
                 shape ``(batch, seq_len)`` over the residual stream. Enables
                 block-diagonal causal attention that isolates documents within
                 packed sequences.
+            position_ids: Optional explicit per-token RoPE positions, shape
+                ``(batch, seq_len)`` matching the residual reaching attention
+                (including any ``modality.prefix_embeds``), dtype int64,
+                values in ``[0, model.max_seq_len)``. Rows may differ, so
+                positions can e.g. restart at zero at each document of a
+                packed sequence. ``None`` (default) assigns contiguous
+                positions starting at the KV-cache fill level, exactly as
+                before. Cannot be combined with ``kv_caches`` (cached
+                generation derives positions from the cache fill level);
+                unsupported for MoT, which derives per-modality positions
+                internally.
             attention_group_ids: Optional per-token visibility group ids over
                 the residual stream, shape ``(batch, seq_len)``, int64;
                 negative means no group. Tokens sharing a nonnegative id see
@@ -422,6 +434,45 @@ class Transformer(nn.Module):
                 raise ValueError(
                     "attention_group_ids is training-only; cannot be combined with kv_caches"
                 )
+        text = tokens if tokens is not None else inputs_embeds
+        assert text is not None
+        batch = text.shape[0]
+        seq_len = text.shape[1] + (prefix_embeds.shape[1] if prefix_embeds is not None else 0)
+        if position_ids is not None:
+            if kv_caches is not None:
+                raise ValueError(
+                    "position_ids cannot be combined with kv_caches; cached generation "
+                    "derives positions from the cache fill level"
+                )
+            if self._mot_modalities:
+                raise ValueError(
+                    "position_ids is not supported for MoT models, which derive "
+                    "per-modality positions internally"
+                )
+            if position_ids.dtype != torch.int64:
+                raise ValueError(
+                    f"position_ids.dtype must be torch.int64, got {position_ids.dtype}"
+                )
+            if position_ids.ndim != 2:
+                raise ValueError(
+                    f"position_ids must have shape (batch, seq_len), got {position_ids.ndim} dims"
+                )
+            if tuple(position_ids.shape) != (batch, seq_len):
+                raise ValueError(
+                    f"position_ids shape {tuple(position_ids.shape)} does not match the "
+                    f"residual shape {(batch, seq_len)} reaching attention"
+                )
+            if self._rope_cos is None:
+                raise ValueError(
+                    "RoPE tables not initialized; call init_weights_and_freqs() after to_empty()"
+                )
+            n_positions = self._rope_cos.shape[0]
+            if bool((position_ids < 0).any()) or bool((position_ids >= n_positions).any()):
+                raise ValueError(
+                    f"position_ids must be in [0, {n_positions}) (the precomputed RoPE "
+                    f"table range, model.max_seq_len); got min {int(position_ids.min())}, "
+                    f"max {int(position_ids.max())}"
+                )
         if modality_ids is not None and modality_ids.dtype != torch.long:
             raise ValueError(
                 f"modality.modality_ids.dtype must be torch.long, got {modality_ids.dtype}"
@@ -438,11 +489,6 @@ class Transformer(nn.Module):
                 f"the residual order, got {mot_order!r}: MoT attends over its streams in that "
                 "order, so a mask over the residual would not line up with it."
             )
-
-        text = tokens if tokens is not None else inputs_embeds
-        assert text is not None
-        batch = text.shape[0]
-        seq_len = text.shape[1] + (prefix_embeds.shape[1] if prefix_embeds is not None else 0)
         self._validate_modality_ids(modality_ids, (batch, seq_len))
         attn_mask = build_attention_mask(
             backend=self.config.attention_backend,
@@ -471,8 +517,13 @@ class Transformer(nn.Module):
         if self._rope_cos.device != h.device:  # type: ignore[reportOptionalMemberAccess]
             self._rope_cos = self._rope_cos.to(h.device)  # type: ignore[reportOptionalMemberAccess]
             self._rope_sin = self._rope_sin.to(h.device)  # type: ignore[reportOptionalMemberAccess]
-        cos = self._rope_cos[start_pos : start_pos + seq_len]  # type: ignore[reportOptionalSubscript]
-        sin = self._rope_sin[start_pos : start_pos + seq_len]  # type: ignore[reportOptionalSubscript]
+        if position_ids is not None:
+            position_ids = position_ids.to(h.device)
+            cos = self._rope_cos[position_ids]  # type: ignore[reportOptionalSubscript]
+            sin = self._rope_sin[position_ids]  # type: ignore[reportOptionalSubscript]
+        else:
+            cos = self._rope_cos[start_pos : start_pos + seq_len]  # type: ignore[reportOptionalSubscript]
+            sin = self._rope_sin[start_pos : start_pos + seq_len]  # type: ignore[reportOptionalSubscript]
 
         if self._moma_modalities:
             assert modality_ids is not None
