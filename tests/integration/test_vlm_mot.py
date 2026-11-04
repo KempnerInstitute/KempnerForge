@@ -101,16 +101,12 @@ class TestBuildAndForward:
         cfg = _tiny_mot_configs()
         wrapper = _build(cfg)
         assert isinstance(wrapper, VLMWrapper)
-        # MoT extends the residual stream with num_image_tokens.
         assert wrapper.num_image_tokens == 8
-        # All layers are MoTBlocks.
         assert all(isinstance(layer, MoTBlock) for layer in wrapper.transformer.layers.values())
 
         pixels, input_ids, labels = _dummy_batch(wrapper)
         logits, _ = wrapper(pixels, input_ids, labels)
-        # output_slice trims the 8 image positions; logits cover text_len positions.
         assert logits.shape == (2, 16, cfg[0].vocab_size)
-        # Re-init per-modality o_proj / down_proj so backward exercises Q/K/V grads.
         with torch.no_grad():
             for layer in wrapper.transformer.layers.values():
                 for m in layer.modalities:
@@ -141,16 +137,11 @@ class TestBuildAndForward:
         wrapper = _build(cfg)
         trainable = {name for name, p in wrapper.named_parameters() if p.requires_grad}
         frozen = {name for name, p in wrapper.named_parameters() if not p.requires_grad}
-        # All transformer.layers params are frozen; transformer.norm is
-        # frozen because MoT does not use it (replaced by mot_norms);
-        # the rest (mot_norms, embedding, output head, adapter) is
-        # trainable.
         for n in frozen:
             if n.startswith("transformer."):
                 assert n.startswith("transformer.layers.") or n == "transformer.norm.weight", n
         assert any(n.startswith("transformer.mot_norms") for n in trainable)
         assert any(n.startswith("adapter") for n in trainable)
-        # Sanity: at least one per-modality projection is frozen.
         assert any("attn.q_proj." in n for n in frozen)
 
     def test_image_features_dtype_propagation(self):
@@ -214,12 +205,10 @@ class TestMoTPlusMoESmoke:
 
         cfg = _tiny_mot_configs(moe=True, n_layers=2)
         wrapper = _build(cfg)
-        # Layer 1 (i=1, (i+1) % moe_frequency == 0) has MoE FFNs per modality.
         layer1 = wrapper.transformer.layers["1"]
         assert isinstance(layer1, MoTBlock)
         for m in layer1.modalities:
             assert isinstance(layer1.mlp[m], MoEMLP)
-        # Layer 0 keeps dense per-modality FFNs.
         layer0 = wrapper.transformer.layers["0"]
         for m in layer0.modalities:
             assert not isinstance(layer0.mlp[m], MoEMLP)
@@ -240,7 +229,6 @@ class TestMoTPlusMoESmoke:
         logits, _ = wrapper(pixels, input_ids, labels)
         loss = logits.float().sum()
         loss.backward()
-        # At least one per-modality MoE expert receives a grad on layer 1.
         layer1 = wrapper.transformer.layers["1"]
         any_grad = False
         for m in layer1.modalities:
@@ -266,7 +254,6 @@ class TestWarmStartFromJD:
         from kempnerforge.model.mot import mot_warm_start_from_text_stack
         from kempnerforge.model.vlm import inner_transformer
 
-        # Build a JD model with the same backbone shape and dump its state.
         jd_cfg = (
             ModelConfig(
                 dim=64,
@@ -285,14 +272,11 @@ class TestWarmStartFromJD:
         ckpt_path = tmp_path / "jd_ckpt.pt"
         torch.save(jd_state, ckpt_path)
 
-        # Build a MoT model and run the warm-start helper.
         mot_cfg = _tiny_mot_configs(num_image_tokens=8, n_layers=2)
         mot_wrapper = _build(mot_cfg, param_dtype=torch.float32)
         source = torch.load(ckpt_path, map_location="cpu", weights_only=True)
         mot_warm_start_from_text_stack(inner_transformer(mot_wrapper), source)
 
-        # Per-modality copies equal the source dense weights. (Compare via
-        # the on-disk CPU state to avoid cross-device tensor compares.)
         mot_t = inner_transformer(mot_wrapper)
         for i in range(mot_cfg[0].n_layers):
             for m in mot_t.layers[str(i)].modalities:  # type: ignore[union-attr]
@@ -358,17 +342,14 @@ class TestFreezeStageHook:
             p for n, p in wrapper.named_parameters() if n.startswith("transformer.layers.")
         ]
 
-        # Step 0: layers trainable.
         for p in layer_params:
             assert p.requires_grad
 
-        # Step 3: layers frozen.
         specs = effective_freeze(3, cfg[3].freeze, cfg[3].freeze_schedule)  # type: ignore[union-attr]
         apply_freeze_specs(wrapper, specs, cfg[3].module_patterns)  # type: ignore[union-attr]
         for p in layer_params:
             assert not p.requires_grad
 
-        # Step 7: layers trainable again.
         specs = effective_freeze(7, cfg[3].freeze, cfg[3].freeze_schedule)  # type: ignore[union-attr]
         apply_freeze_specs(wrapper, specs, cfg[3].module_patterns)  # type: ignore[union-attr]
         for p in layer_params:

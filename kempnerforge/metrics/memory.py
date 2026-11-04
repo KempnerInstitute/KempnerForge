@@ -66,11 +66,6 @@ def reset_peak_memory(device: int = 0) -> None:
         torch.cuda.reset_peak_memory_stats(device)
 
 
-# ---------------------------------------------------------------------------
-# DeviceMemoryMonitor — per-step tracking with snapshot support
-# ---------------------------------------------------------------------------
-
-
 class DeviceMemoryMonitor:
     """Tracks GPU memory usage across training steps.
 
@@ -112,7 +107,6 @@ class DeviceMemoryMonitor:
 
         logger.info(f"[step {step}] {format_memory_stats(self.device)}")
 
-        # Check if we should capture a snapshot
         if (
             self.snapshot_step is not None
             and step == self.snapshot_step
@@ -120,7 +114,6 @@ class DeviceMemoryMonitor:
         ):
             self.capture_snapshot(step)
 
-        # Reset peak for next interval
         reset_peak_memory(self.device)
 
         return stats
@@ -145,9 +138,7 @@ class DeviceMemoryMonitor:
             snapshot_dir = Path(self.snapshot_dir)
             snapshot_dir.mkdir(parents=True, exist_ok=True)
 
-            # Record and export memory snapshot
             torch.cuda.memory._record_memory_history()
-            # Give it a moment to record current state
             torch.cuda.synchronize(self.device)
             snapshot = torch.cuda.memory._snapshot()
             torch.cuda.memory._record_memory_history(enabled=None)
@@ -162,6 +153,6 @@ class DeviceMemoryMonitor:
             logger.info(f"Memory snapshot saved: {path}")
             return str(path)
 
-        except Exception as e:  # best-effort diagnostic; CUDA, disk, or pickle errors
+        except Exception as e:
             logger.warning(f"Memory snapshot failed: {e}")
             return None
