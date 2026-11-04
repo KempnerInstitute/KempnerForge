@@ -103,12 +103,6 @@ def run_forward_benchmarks() -> list[BenchmarkResult]:
     return results
 
 
-# ---------------------------------------------------------------------------
-# Packed-sequence attention: dense-mask SDPA vs FlexAttention
-# ---------------------------------------------------------------------------
-
-# max_seq_len has to cover the longest sweep point. head_dim = 768 / 12 = 64,
-# comfortably inside FlexAttention's supported 16..256.
 PACKED_CONFIG = ModelConfig(
     dim=768,
     n_layers=12,
@@ -117,8 +111,6 @@ PACKED_CONFIG = ModelConfig(
     max_seq_len=8192,
 )
 
-# Batch shrinks as the sequence grows so each point moves a comparable number of
-# tokens and the dense (B, 1, S, S) mask stays addressable at S=8192.
 PACKED_SWEEP = [(512, 16), (2048, 8), (8192, 2)]
 DOCS_PER_SEQ = 8
 
@@ -145,16 +137,18 @@ def run_packed_attention_benchmarks() -> list[BenchmarkResult]:
     Three arms per shape:
 
     * ``unpacked``   -- no doc_ids, so SDPA takes its ``is_causal`` fast path.
-      The speed-of-light reference; it does no cross-document masking at all.
+      No cross-document masking, and no block skipping either, so flex+packed
+      can beat it at long sequences.
     * ``sdpa+packed`` -- today's packing. A dense (B, 1, S, S) bool mask is built
       per layer, which is not a FlashAttention-2 shape, so SDPA drops to the
       mem-efficient kernel.
     * ``flex+packed`` -- the same mask as a FlexAttention BlockMask, built once
       per forward, with fully-masked blocks skipped rather than computed.
 
-    The comparison that matters is arm 3 against arm 2; arm 1 bounds how much
-    of the gap is recoverable. Peak memory matters as much as tok/s here: the
-    dense mask is what flex deletes.
+    The comparison that matters is arm 3 against arm 2; arm 1 shows whether
+    packing pays at all. Two smaller sweeps at S=2048 vary the document count
+    and use GQA. Peak memory matters as much as tok/s here: the dense mask is
+    what flex deletes.
     """
     results: list[BenchmarkResult] = []
 
@@ -166,8 +160,6 @@ def run_packed_attention_benchmarks() -> list[BenchmarkResult]:
             m(ids, **kw).sum().backward()
             m.zero_grad(set_to_none=True)
 
-        # Above the default warmup: the first flex call pays Triton compilation,
-        # which must not land inside the timed window.
         results.append(
             run_benchmark(
                 step, warmup=6, iterations=10, name=label, tokens_per_iter=batch * seq_len
@@ -182,14 +174,11 @@ def run_packed_attention_benchmarks() -> list[BenchmarkResult]:
         bench(f"sdpa + packed        ({shape})", "sdpa", seq_len, batch, DOCS_PER_SEQ)
         bench(f"flex + packed        ({shape})", "flex", seq_len, batch, DOCS_PER_SEQ)
 
-    # Document count at fixed shape: more documents means a sparser block-diagonal
-    # mask, so flex should pull further ahead while dense SDPA is unaffected.
     for docs in (2, 16, 64):
         shape = f"S=2048, b=8, {docs} docs"
         bench(f"sdpa + packed        ({shape})", "sdpa", 2048, 8, docs)
         bench(f"flex + packed        ({shape})", "flex", 2048, 8, docs)
 
-    # GQA: flex passes enable_gqa instead of materializing repeated K/V heads.
     shape = f"S=2048, b=8, {DOCS_PER_SEQ} docs, GQA 12/4"
     bench(f"sdpa + packed        ({shape})", "sdpa", 2048, 8, DOCS_PER_SEQ, n_kv_heads=4)
     bench(f"flex + packed        ({shape})", "flex", 2048, 8, DOCS_PER_SEQ, n_kv_heads=4)
