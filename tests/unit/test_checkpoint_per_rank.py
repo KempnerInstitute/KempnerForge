@@ -112,14 +112,15 @@ def _install_fake_world(
     ``all_gather_object`` fills the output list with every rank's
     ``(global_rank, dp_coordinates, payload)``, exactly as the real collective
     would (coordinates from ``layout``, or None); events record the gather and
-    the barrier with the group they ran on.
+    the closing status agreement with the group they ran on, and the agreement
+    reports no failure on any rank.
     """
     monkeypatch.setattr(mgr_mod.dist, "is_initialized", lambda: True)
-    monkeypatch.setattr(mgr_mod.dist, "get_rank", lambda: 0)
-    monkeypatch.setattr(mgr_mod.dist, "get_world_size", lambda: WORLD)
+    monkeypatch.setattr(mgr_mod.dist, "get_rank", lambda group=None: 0)
+    monkeypatch.setattr(mgr_mod.dist, "get_world_size", lambda group=None: WORLD)
     monkeypatch.setattr(mgr_mod.dist, "new_group", lambda backend=None: "GLOO_PG")
     monkeypatch.setattr(
-        mgr_mod.dist, "barrier", lambda group=None: events.append(("barrier", group))
+        mgr_mod.dist, "all_reduce", lambda flags, group=None: events.append(("agree", group))
     )
 
     def fake_all_gather(obj_list, obj, group=None):
@@ -597,7 +598,7 @@ class TestFourRankSaveLoad:
         assert "torch_cpu" in payload["rng"]
 
     def test_collective_and_durability_ordering(self, tmp_path, monkeypatch):
-        """gather -> train_state write -> latest commit -> end barrier."""
+        """gather -> train_state write -> latest commit -> closing agreement."""
         payloads, _ = _mk_payloads(seed_base=1, cursor_base=1)
         events: list = []
         with monkeypatch.context() as m:
@@ -620,7 +621,7 @@ class TestFourRankSaveLoad:
             mgr.save(step=4)
 
         names = [e[0] for e in events]
-        assert names == ["gather", "write", "commit", "barrier"]
+        assert names == ["gather", "write", "commit", "agree"]
         assert events[0][1] == "GLOO_PG" and events[-1][1] == "GLOO_PG"
         assert events[1][1] == "train_state.pt"
 

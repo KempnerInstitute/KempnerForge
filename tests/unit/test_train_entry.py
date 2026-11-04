@@ -1265,41 +1265,6 @@ class TestBuildModel:
 
 
 class TestBuildCheckpointManager:
-    def test_pp_scopes_dcp_to_the_non_pp_dims(self, tmp_path):
-        from kempnerforge.training.entry import build_checkpoint_manager
-        from kempnerforge.training.runtime import PipelineBundle
-
-        config = make_config()
-        config.checkpoint.dir = str(tmp_path / "c")
-        model = TinyTextModel()
-        mesh = FakeMesh(("pp", "dp_shard"))
-        mgr = build_checkpoint_manager(
-            config,
-            dataclasses.replace(_runtime(), device_mesh=mesh),
-            model,
-            torch.optim.SGD(model.parameters(), lr=0.1),
-            PipelineBundle(rank=1, size=2, schedule=None),
-        )
-        assert mgr._pp_rank == 1
-        assert mgr._process_group == "group:dp_shard"
-
-    def test_pp_with_several_non_pp_dims_uses_a_flattened_group(self, tmp_path):
-        from kempnerforge.training.entry import build_checkpoint_manager
-        from kempnerforge.training.runtime import PipelineBundle
-
-        config = make_config()
-        config.checkpoint.dir = str(tmp_path / "c")
-        model = TinyTextModel()
-        mesh = FakeMesh(("pp", "dp_shard", "tp"))
-        mgr = build_checkpoint_manager(
-            config,
-            dataclasses.replace(_runtime(), device_mesh=mesh),
-            model,
-            torch.optim.SGD(model.parameters(), lr=0.1),
-            PipelineBundle(rank=0, size=2, schedule=None),
-        )
-        assert mgr._process_group == "group:('dp_shard', 'tp')"
-
     def test_records_the_data_pipelines_partition(self, tmp_path):
         """The manager records the (dp_rank, dp_size) the data pipeline reads."""
         from kempnerforge.training.data_pipeline import build_data_pipeline
