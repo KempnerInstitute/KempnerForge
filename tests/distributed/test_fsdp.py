@@ -145,12 +145,10 @@ class TestFSDP2FlexAttention:
     """Packed FlexAttention under FSDP2.
 
     The interaction worth checking is ``default_mp_policy``'s
-    ``cast_forward_inputs=True``: FSDP2 walks the forward inputs at each wrapped
-    module boundary and casts them to bf16, and ``doc_ids`` is an int64 index
-    tensor that could plausibly be mangled on the way in -- a mangled mask does
-    not raise, it silently stops isolating documents. The ``BlockMask`` itself
-    is built inside ``Transformer.forward``, below this boundary, so it never
-    crosses the cast.
+    ``cast_forward_inputs=True``: at each wrapped module FSDP2 casts the
+    floating-point forward inputs to bf16. The int64 ``doc_ids`` and the
+    ``BlockMask`` each block receives must come through unchanged, since a
+    mangled mask does not raise, it silently stops isolating documents.
     """
 
     SEQ = 256
@@ -236,11 +234,11 @@ class TestFSDP2FlexAttention:
         model = self._model(distributed_env, ac_mode=ac_mode)
 
         model(tokens, doc_ids=doc_ids)[:, boundary:].sum().backward()
+        embedding_grad = model.token_embedding.embedding.weight.grad.full_tensor()
         for name, param in model.named_parameters():
             grad = param.grad.to_local() if hasattr(param.grad, "to_local") else param.grad
             assert grad is not None and torch.isfinite(grad).all(), name
 
-        embedding_grad = model.token_embedding.embedding.weight.grad.full_tensor()
         assert torch.count_nonzero(embedding_grad[:half_vocab]) == 0
         assert torch.count_nonzero(embedding_grad[half_vocab:]) > 0
 
@@ -287,5 +285,4 @@ class TestFSDP2MatchesSingleGPU:
             expected = reference(tokens, **kwargs)
             actual = sharded(tokens, **kwargs)
 
-        # default_mp_policy computes in bf16, so this is a bf16-sized bound.
         torch.testing.assert_close(actual.float(), expected.float(), rtol=2e-2, atol=2e-2)
