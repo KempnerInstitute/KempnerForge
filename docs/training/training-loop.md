@@ -81,7 +81,9 @@ if not nan_detector.check_loss(avg_loss, step):
     _advance_lr_schedule(session)
     step += 1
     _apply_step_transitions(session, step)
-    if _shutdown_if_requested(session, step, tokens_seen, saved_this_step=False):
+    if _shutdown_if_requested(
+        session, step, tokens_seen, saved_this_step=False, nan_skipped=True
+    ):
         break
     continue
 ```
@@ -102,8 +104,9 @@ A skipped step still counts as a step. It drops the optimizer update,
 the token count, metrics, hooks and every periodic tick below except the
 shutdown check, but the LR schedule advances, the freeze stages and data
 phases due at the new step are applied, and a pending shutdown writes
-the emergency checkpoint and stops the loop. The step that trips
-`should_rollback` stops before any of that. See
+the emergency checkpoint, if every rank's weights are finite, and stops
+the loop. The step that trips `should_rollback` stops before any of
+that. See
 [NaN detection § What a skipped step still does](../resilience/nan-detection.md#what-a-skipped-step-still-does).
 
 ## Optimizer and scheduler step
@@ -177,8 +180,11 @@ After the step body, before advancing:
 
 A step skipped for a NaN / Inf loss runs only the shutdown row, through
 the same `_shutdown_if_requested` helper. The checkpoint tick does not
-save a skipped step, so its shutdown always writes its own emergency
-checkpoint.
+save a skipped step, so its shutdown writes its own emergency checkpoint,
+but only after an all-reduced check that every rank's parameters are
+finite: if a bad update has left NaN in them, it logs an ERROR and saves
+nothing (see
+[NaN detection § A shutdown after a bad update](../resilience/nan-detection.md#a-shutdown-after-a-bad-update)).
 
 `nccl_health_check_interval = 0` disables the all-reduce probe — it is
 off in every shipped config but worth enabling for long multi-node
