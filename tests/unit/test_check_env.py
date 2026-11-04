@@ -806,7 +806,7 @@ class TestCheckMlflow:
                 "error::EncodingWarning",
                 "-c",
                 code,
-                str(Path(check_env.__file__).parent),
+                str(Path(__file__).resolve().parents[2] / "scripts"),
             ],
             env={"HOME": str(home), "PATH": os.environ.get("PATH", "")},
             capture_output=True,
