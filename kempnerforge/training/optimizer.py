@@ -380,9 +380,9 @@ class Muon(torch.optim.Optimizer):
     for distributed Muon and works well in practice.
 
     Args:
-        muon_params: Parameter groups for Muon (2D+ weights).
+        muon_params: Parameter groups for Muon (the hidden ``nn.Linear`` weights).
         adam_params: Parameter groups for AdamW fallback (every other parameter).
-        lr: Learning rate for Muon (2D weights).
+        lr: Learning rate for Muon.
         momentum: Momentum coefficient (default 0.95).
         weight_decay: Decoupled weight decay.
         adam_betas: Betas for the AdamW fallback.
@@ -427,7 +427,7 @@ class Muon(torch.optim.Optimizer):
         self._initial_lr = lr
         self._initial_adam_lr = adam_lr
 
-        # Create internal AdamW for 1D params
+        # Create internal AdamW for the fallback params
         self._adam = (
             torch.optim.AdamW(
                 adam_params,
@@ -548,7 +548,7 @@ class Muon(torch.optim.Optimizer):
 
                 p_local.add_(update, alpha=-lr)
 
-        # Step the internal AdamW for 1D params.
+        # Step the internal AdamW for the fallback params.
         # Scale Adam LR proportionally to Muon's current LR so the scheduler's
         # warmup/decay applies to both — the scheduler only sees Muon's param_groups.
         if self._adam is not None:

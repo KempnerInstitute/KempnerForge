@@ -79,11 +79,11 @@ optimizers read it.
 ```toml
 [optimizer]
 name = "muon"
-lr = 0.003            # for 2D matrices (Newton-Schulz orthogonalized)
+lr = 0.003            # for the matrices Muon orthogonalizes
 weight_decay = 0.1
 muon_momentum = 0.95
 muon_ns_steps = 5
-muon_adam_lr = 3e-4   # Optional: LR for 1D params. Default = same as `lr`.
+muon_adam_lr = 3e-4   # Optional: LR for the AdamW fallback group. Default = same as `lr`.
 ```
 
 Muon orthogonalizes the 2D momentum update via a 5-step Newton-Schulz
@@ -98,8 +98,8 @@ module that owns it, with
 [`_muon_matrices`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/training/optimizer.py):
 
 - **Muon group**: the weight of every `nn.Linear` except the output
-  head, whatever its shape. Transformer blocks' weight matrices all
-  qualify.
+  head and, unless `muon_router = true`, the MoE router gates, whatever
+  its shape: the attention, MLP and unpacked expert projections.
 - **AdamW fallback group**: the token embedding and output head, any
   other `nn.Embedding` or conv kernel, MoE router gates (unless
   `muon_router = true`), packed expert weights, and 1D params (biases,
@@ -119,7 +119,7 @@ so both are there.
 Before every Muon `step()`, the internal AdamW LR is rescaled by
 `muon_current_lr / muon_initial_lr` so both groups follow the same
 warmup/decay curve. If you set `muon_adam_lr`, it's the *initial* LR
-for the 1D group, then tracks the Muon schedule shape.
+for the AdamW fallback group, then tracks the Muon schedule shape.
 
 **FSDP2 interaction.** Newton-Schulz runs on each rank's local shard
 of the weight matrix rather than the fully gathered matrix — an

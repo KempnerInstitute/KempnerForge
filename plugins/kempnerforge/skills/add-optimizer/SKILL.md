@@ -22,7 +22,7 @@ Optimizer builders live in: kempnerforge/training/optimizer.py
 Top-level builder: kempnerforge/training/optimizer.py::build_optimizer(model, config) — creates decay/no-decay param groups, looks up builder from registry, calls it
 Builder signature: fn(param_groups: list[dict], config: OptimizerConfig, model: torch.nn.Module) -> torch.optim.Optimizer
 Config dataclass: kempnerforge/config/optimizer.py::OptimizerConfig
-Existing fields: name, lr, weight_decay, betas, eps, fused, muon_momentum, muon_ns_steps, muon_adam_lr, schedule_free_warmup_steps
+Existing fields: name, lr, weight_decay, betas, eps, fused, muon_momentum, muon_ns_steps, muon_adam_lr, muon_nesterov, muon_adjust_lr, muon_orthogonalize, muon_router, schedule_free_warmup_steps
 Existing tests: tests/unit/test_optimizer.py, tests/unit/test_additional_optimizers.py
 <!-- context-end -->
 

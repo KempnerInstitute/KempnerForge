@@ -276,9 +276,9 @@ def _check_saved_state_matches(
             f"{where} holds another optimizer's state for {len(moved)} parameters: "
             f"{moved[:8]}. {first} was saved with "
             f"{sorted(saved[first])} and is now kept with {sorted(kept[first])}: its optimizer "
-            "changed since the save, as it does for an embedding or output head that Muon "
-            "used to orthogonalize, or for MoE router gates when optimizer.muon_router "
-            "changes. To continue from these weights with a fresh optimizer, set "
+            "changed since the save, e.g. optimizer.name or optimizer.muon_router changed, "
+            "or Muon used to orthogonalize it before it routed parameters by module. "
+            "To continue from these weights with a fresh optimizer, set "
             "checkpoint.load_path to this checkpoint and checkpoint.exclude_from_loading = "
             '["optimizer"], with a checkpoint.dir that holds no checkpoint yet.'
         )

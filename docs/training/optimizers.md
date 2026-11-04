@@ -19,7 +19,7 @@ parameters into two groups:
 The rule is `_should_decay(name, param)` in
 [`optimizer.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/training/optimizer.py) —
 shared by all four optimizers. No decay on biases / norms is the
-Llama / GPT convention; Muon's 1D fallback AdamW inherits the same
+Llama / GPT convention; Muon's fallback AdamW inherits the same
 grouping.
 
 ## `adamw`
@@ -130,14 +130,16 @@ the module that owns it rather than by its shape:
   tower's patch embedding), packed 3-D expert weights, norms and biases →
   internal AdamW fallback.
 - MoE router gates (`MoEMLP`'s and MoMa's) → internal AdamW, or Muon with
-  `muon_router = true`. Practice is split: Moonlight trained its MoE
-  router with Muon, while Qwen3.8-Next keeps it on AdamW because Muon
-  destabilized it early in training.
+  `muon_router = true`. Practice is split:
+  [Moonlight](https://arxiv.org/abs/2502.16982) trained its MoE router
+  with Muon, while [Qwen3.8-Next](https://arxiv.org/abs/2608.30320) keeps
+  it on AdamW because Muon destabilized it early in training.
 
 A resume needs the split its checkpoint was saved with. One saved before
 Muon routed by module, from a model whose embedding or head Muon then
 orthogonalized, or saved with the other `muon_router`, fails to load and
-names the parameters that moved — see
+names the parameters that moved. A Muon checkpoint saved before the inner
+AdamW was checkpointed is the exception — see
 [DCP model § Loading](../checkpointing/dcp-model.md#loading).
 
 DTensor / FSDP2 notes:
