@@ -5,10 +5,12 @@ on:
     branches: [main]
     paths:
       - "examples/vlm/**"
+      - "examples/image_understanding/**"
   pull_request:
     branches: [main]
     paths:
       - "examples/vlm/**"
+      - "examples/image_understanding/**"
   workflow_dispatch:
 
 permissions:
@@ -22,6 +24,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       vlm: ${{ steps.filter.outputs.vlm }}
+      image_understanding: ${{ steps.filter.outputs.image_understanding }}
     steps:
       - uses: actions/checkout@v5
       - uses: dorny/paths-filter@v3
@@ -30,6 +33,8 @@ jobs:
           filters: |
             vlm:
               - "examples/vlm/**"
+            image_understanding:
+              - "examples/image_understanding/**"
 
   vlm-tests:
     needs: changes
@@ -43,3 +48,13 @@ jobs:
       # The eval integration tier needs the real, undeclared lmms-eval and must not
       # share a session with the unit tier's injected fake `lmms_eval`; manual only.
       - run: uv run pytest examples/vlm/tests --ignore=examples/vlm/tests/eval/integration -v --timeout=60
+
+  image-understanding-tests:
+    needs: changes
+    if: needs.changes.outputs.image_understanding == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync
+      - run: uv run pytest examples/image_understanding/tests -v --timeout=60

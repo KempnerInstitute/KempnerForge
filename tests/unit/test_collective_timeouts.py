@@ -15,8 +15,6 @@ from datetime import timedelta
 import pytest
 import torch
 
-# Hold the real ``torch.ones`` before any test monkey-patches it, so the
-# replacement wrapper can still build a tensor without recursion.
 _REAL_TORCH_ONES = torch.ones
 
 
@@ -79,7 +77,7 @@ class TestCheckNcclHealthTimeout:
                 "check_nccl_health called dist.all_reduce synchronously — "
                 "the caller-supplied timeout cannot be enforced"
             )
-            tensor.fill_(2.0)  # world_size=2, simulates completed all-reduce
+            tensor.fill_(2.0)
             return fake_work
 
         monkeypatch.setattr(health.dist, "all_reduce", fake_all_reduce)
@@ -240,10 +238,3 @@ class TestNcclAsyncErrorHandlingEnvGuard:
         assert any("TORCH_NCCL_ASYNC_ERROR_HANDLING=0" in r.getMessage() for r in records), (
             "expected warning when TORCH_NCCL_ASYNC_ERROR_HANDLING=0"
         )
-
-
-# NOTE: There is no TestCheckpointBroadcastTimeout class here. PyTorch 2.11's
-# ``dist.broadcast_object_list`` does not accept ``async_op``, so the load-path
-# train_state broadcast in CheckpointManager cannot enforce a per-op timeout
-# and inherits the 1800s process-group default. The other fast-fail paths in
-# this module (init barrier, NCCL health, eval loss broadcast) still apply.

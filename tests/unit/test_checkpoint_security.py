@@ -31,8 +31,6 @@ class _Payload:
         self._marker = marker
 
     def __reduce__(self):
-        # Tells pickle: on load, call os.system(cmd). os.system is a stand-in
-        # for any arbitrary command the attacker chooses.
         return (os.system, (f"touch {self._marker}",))
 
 

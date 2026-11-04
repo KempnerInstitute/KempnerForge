@@ -39,10 +39,6 @@ def build_profiler(
     trace_dir = Path(config.trace_dir)
     trace_dir.mkdir(parents=True, exist_ok=True)
 
-    # Profile schedule: wait → warmup → active → repeat
-    # wait: skip steps before start_step
-    # warmup: 1 step to stabilize profiler
-    # active: profile for (end_step - start_step) steps
     wait_steps = max(0, config.start_step - 1)
     active_steps = config.end_step - config.start_step
 
@@ -183,7 +179,6 @@ def _save_profiler_summary(stats: dict, prof: torch.profiler.profile, trace_dir:
 
     out_path = Path(trace_dir) / "summary.md"
 
-    # Build top kernels table (clean markdown)
     kernel_rows = []
     events = sorted(
         prof.key_averages(),
@@ -198,7 +193,6 @@ def _save_profiler_summary(stats: dict, prof: torch.profiler.profile, trace_dir:
         pct = 100 * cuda_us / max(stats["total_cuda_time_us"], 1)
         calls = evt.count
         flops_str = f"{evt.flops / 1e9:.1f}" if evt.flops else "—"
-        # Truncate long kernel names
         if len(name) > 60:
             name = name[:57] + "..."
         kernel_rows.append(f"| {name} | {cuda_us / 1e3:.1f} | {pct:.1f} | {calls} | {flops_str} |")
