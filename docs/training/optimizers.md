@@ -16,11 +16,36 @@ parameters into two groups:
 | decay | `param.ndim > 1` and `"bias"` not in name | `config.weight_decay` |
 | no-decay | 1D tensors, biases, norm scales | `0.0` |
 
-The rule is `_should_decay(name, param)` in
+The rule is `_should_decay(name, param, scope)` in
 [`optimizer.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/training/optimizer.py) —
 shared by all four optimizers. No decay on biases / norms is the
 Llama / GPT convention; Muon's 1D fallback AdamW inherits the same
-grouping.
+grouping. The token embedding and the output head are 2D, so they are
+decayed.
+
+`optimizer.weight_decay_scope` selects which rule applies. It decides parameter
+group membership, so optimizer state saved under one scope cannot be loaded under
+another: depending on the optimizer the load fails, the first step fails, or Muon
+silently keeps the coefficients it was saved with. The training entry therefore
+records the scope in every checkpoint's `metadata.json`, and a resume that would
+restore saved optimizer state, on any rank, stops on every rank, before loading
+anything, when the checkpoint was saved under a different scope; the error names both
+scopes. A checkpoint that holds no optimizer state, such as one converted from Hugging
+Face or one saved before the first step, loads under either scope with a fresh
+optimizer. A checkpoint that does not record a scope was written under
+`"exclude_norms_and_biases"`, the only grouping that existed before the scope was
+recorded. To change the scope, start a new run from the checkpoint without its
+optimizer state: set `checkpoint.load_path` to it and
+`checkpoint.exclude_from_loading = ["optimizer"]`, with a `checkpoint.dir` that holds
+no checkpoint. Training auto-resumes from a checkpoint in `checkpoint.dir` in place of
+`load_path`, optimizer state included (see
+[Auto-resume](../checkpointing/auto-resume.md)). Code that builds its own
+`CheckpointManager` gets the same record and check by passing `weight_decay_scope`.
+
+| Value | Effect |
+|-------|--------|
+| `"exclude_norms_and_biases"` (default) | the grouping above |
+| `"all"` | every parameter goes in the decay group, as `torch.optim.AdamW` does by default |
 
 ## `adamw`
 
