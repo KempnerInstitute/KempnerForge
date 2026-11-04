@@ -381,13 +381,14 @@ def _set_encoder_precision(
     """Make the vision encoder compute in ``dtype``, wrapped by FSDP2 or not.
 
     A wrapped encoder's policy already casts its parameters and inputs, so only
-    its floating-point buffers are cast and its parameters keep their loaded
-    dtype. An unwrapped encoder is cast whole, and its floating-point inputs are
-    cast on the way in, as ``cast_forward_inputs`` does under FSDP2.
+    its floating-point buffers are cast, every registered name as ``Module.to``
+    does, and its parameters keep their loaded dtype. An unwrapped encoder is
+    cast whole, and its floating-point inputs are cast on the way in, as
+    ``cast_forward_inputs`` does under FSDP2.
     """
     if fsdp_wrapped:
         for module in encoder.modules():
-            for name, buffer in module.named_buffers(recurse=False):
+            for name, buffer in module.named_buffers(recurse=False, remove_duplicate=False):
                 if buffer.is_floating_point():
                     setattr(module, name, buffer.to(dtype))
         return

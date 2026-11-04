@@ -43,17 +43,22 @@ Seen = dict[str, tuple[torch.dtype, torch.dtype]]
 
 
 class _ConvEncoder(VisionEncoder):
-    """A Conv2d patch encoder with a floating-point buffer that casts nothing itself."""
+    """A Conv2d patch encoder that casts nothing itself, with one buffer under two names."""
 
     def __init__(self) -> None:
         super().__init__()
         self.num_tokens = (IMAGE_SIZE // PATCH) ** 2
         self.feature_dim = 24
         self.patch = nn.Conv2d(3, self.feature_dim, kernel_size=PATCH, stride=PATCH)
-        self.register_buffer("scale", torch.ones(1))
+        scale = torch.ones(1)
+        self.register_buffer("scale", scale)
+        self.register_buffer("scale_alias", scale)
 
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        return (self.patch(pixel_values) * self.get_buffer("scale")).flatten(2).transpose(1, 2)
+        scaled = (
+            self.patch(pixel_values) * self.get_buffer("scale") * self.get_buffer("scale_alias")
+        )
+        return scaled.flatten(2).transpose(1, 2)
 
 
 def _build_conv(path: str = "", **_: Any) -> VisionEncoder:
@@ -186,7 +191,9 @@ def _encoder_grads(wrapper: VLMWrapper) -> list[torch.Tensor]:
 
 
 def _float_buffer_dtypes(module: nn.Module) -> set[torch.dtype]:
-    return {b.dtype for b in module.buffers() if b.is_floating_point()}
+    return {
+        b.dtype for _, b in module.named_buffers(remove_duplicate=False) if b.is_floating_point()
+    }
 
 
 FRAMES = pytest.mark.parametrize("frames", [1, 2], ids=["image", "video"])
