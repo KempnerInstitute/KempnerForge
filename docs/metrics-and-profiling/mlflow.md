@@ -83,14 +83,17 @@ workspace.
 ```
 
 `uv run python scripts/check_env.py --requires mlflow` reports which route a shell has,
-resolving it the way the SDK does. With a profile selected it passes on that profile's section
-in `~/.databrickscfg`. With none selected, any credential variable takes the environment route,
-which passes on `DATABRICKS_HOST` plus a token under either name, a username and password, or a
-client id and secret; with no credential variable set it reads the file and uses the SDK's
-default profile. Anything else warns without failing, naming the three routes, because it
-cannot verify OAuth, a CLI login or a metadata service offline. It reads only section names
-from the profile file and the `default_profile` of a `[__settings__]` section, never the
-tokens. It looks at the environment, not at `mlflow_tracking_uri` in a config. Add
+resolving it the way the SDK does. The profile file is the one `$DATABRICKS_CONFIG_FILE` names,
+else `~/.databrickscfg`. With a profile selected it passes on that profile's section in the
+file; when the file does not exist, the SDK reads nothing from it and authenticates from the
+environment, and the check judges that route instead. With none selected, any credential
+variable takes the environment route, which passes on `DATABRICKS_HOST` plus a token under
+either name, a username and password, or a client id and secret; with no credential variable
+set it reads the file and uses the SDK's default profile. Anything else warns without failing,
+naming the three routes, because it cannot verify OAuth, a CLI login or a metadata service
+offline. It parses the whole file, as the SDK does, but the only text from the file a message
+can carry is a profile name: a section name, or a `default_profile` value given on the key's own
+line. It looks at the environment, not at `mlflow_tracking_uri` in a config. Add
 `--check-credentials` to also call the workspace through the SDK by that same resolution, which
 names a profile only when one is selected. A failure is reported by exception class only,
 because the text can quote a token (a malformed profile line, a token with a stray newline);

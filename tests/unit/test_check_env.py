@@ -314,6 +314,7 @@ class TestCheckMlflow:
         "DATABRICKS_METADATA_SERVICE_URL",
         "DATABRICKS_AUTH_TYPE",
         "DATABRICKS_CONFIG_PROFILE",
+        "DATABRICKS_CONFIG_FILE",
         "MLFLOW_TRACKING_URI",
     )
 
@@ -325,6 +326,10 @@ class TestCheckMlflow:
             monkeypatch.delenv(name)
         monkeypatch.setenv("HOME", str(tmp_path))
         return tmp_path
+
+    @staticmethod
+    def _read_config():
+        return check_env._read_databricks_config(*check_env._databricks_config_file())
 
     @staticmethod
     def _fake_sdk(monkeypatch, client_cls):
@@ -644,6 +649,105 @@ class TestCheckMlflow:
         assert r.status == check_env.WARN
         assert "no [my-profile] section" in r.message
 
+    @pytest.mark.parametrize(
+        "selector",
+        [
+            ("MLFLOW_TRACKING_URI", "databricks://my-profile"),
+            ("DATABRICKS_CONFIG_PROFILE", "my-profile"),
+        ],
+        ids=["tracking-uri", "config-profile"],
+    )
+    def test_a_selected_profile_without_a_profile_file_takes_the_environment_route(
+        self, monkeypatch, selector
+    ):
+        """The SDK reads nothing from a file that does not exist, so the environment decides."""
+        monkeypatch.setenv(*selector)
+        monkeypatch.setenv("DATABRICKS_HOST", "https://x.cloud.databricks.com")
+        monkeypatch.setenv("DATABRICKS_TOKEN", "dapi-xxx")
+        r = check_env.check_mlflow()
+        assert r.status == check_env.OK
+        assert "~/.databrickscfg not found, so profile my-profile is not read" in r.message
+        assert "DATABRICKS_HOST + token set" in r.message
+
+    def test_a_selected_profile_without_a_profile_file_needs_a_complete_environment(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", "my-profile")
+        monkeypatch.setenv("DATABRICKS_TOKEN", "dapi-xxx")
+        r = check_env.check_mlflow()
+        assert r.status == check_env.WARN
+        assert "environment route is incomplete (DATABRICKS_HOST not set)" in r.message
+        assert "dapi-xxx" not in r.message
+
+    def test_a_selected_profile_with_an_unreadable_profile_file_is_a_warn(self, home, monkeypatch):
+        """A file that exists but cannot be read is not a missing one: the SDK finds no profile."""
+        (home / ".databrickscfg").mkdir()
+        monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", "my-profile")
+        monkeypatch.setenv("DATABRICKS_HOST", "https://x.cloud.databricks.com")
+        monkeypatch.setenv("DATABRICKS_TOKEN", "dapi-xxx")
+        r = check_env.check_mlflow()
+        assert r.status == check_env.WARN
+        assert "unreadable" in r.message
+
+    def test_a_profile_file_below_a_regular_file_counts_as_missing(self, home, monkeypatch):
+        """The SDK tests the path for existence first, and a path through a file does not exist."""
+        (home / "plain").write_text("")
+        monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(home / "plain" / "x.cfg"))
+        monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", "my-profile")
+        monkeypatch.setenv("DATABRICKS_HOST", "https://x.cloud.databricks.com")
+        monkeypatch.setenv("DATABRICKS_TOKEN", "dapi-xxx")
+        r = check_env.check_mlflow()
+        assert r.status == check_env.OK
+        assert "not found, so profile my-profile is not read" in r.message
+
+    @pytest.mark.parametrize("token", ["dapi-xxx", ""], ids=["complete", "incomplete"])
+    def test_check_credentials_probes_a_selected_profile_without_a_profile_file(
+        self, monkeypatch, token
+    ):
+        """The probe names the profile as the run does, and runs even on an incomplete route."""
+        monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", "my-profile")
+        monkeypatch.setenv("DATABRICKS_HOST", "https://x.cloud.databricks.com")
+        if token:
+            monkeypatch.setenv("DATABRICKS_TOKEN", token)
+        seen: list[dict] = []
+        self._fake_sdk(monkeypatch, self._recording_client(seen))
+        assert check_env.check_mlflow(check_credentials=True).status == check_env.OK
+        assert seen == [{"profile": "my-profile"}]
+
+    def test_the_profile_file_is_the_one_databricks_config_file_names(self, home, monkeypatch):
+        alt = home / "alt.cfg"
+        alt.write_text("[DEFAULT]\nhost = h\ntoken = dapi-secret\n")
+        monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(alt))
+        r = check_env.check_mlflow()
+        assert r.status == check_env.OK
+        assert f"profile DEFAULT found in {alt}" in r.message
+
+    def test_a_missing_databricks_config_file_does_not_fall_back_to_the_home_file(
+        self, home, monkeypatch
+    ):
+        """The SDK reads only the file the variable names, whatever ~/.databrickscfg holds."""
+        (home / ".databrickscfg").write_text("[DEFAULT]\nhost = h\ntoken = dapi-secret\n")
+        missing = home / "missing.cfg"
+        monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(missing))
+        r = check_env.check_mlflow()
+        assert r.status == check_env.WARN
+        assert f"{missing} not found" in r.message
+
+    def test_an_empty_databricks_config_file_means_the_home_file(self, home, monkeypatch):
+        (home / ".databrickscfg").write_text("[DEFAULT]\nhost = h\n")
+        monkeypatch.setenv("DATABRICKS_CONFIG_FILE", "")
+        r = check_env.check_mlflow()
+        assert r.status == check_env.OK
+        assert "profile DEFAULT found in ~/.databrickscfg" in r.message
+
+    def test_databricks_config_file_expands_a_leading_tilde(self, home, monkeypatch):
+        (home / "alt.cfg").write_text("[work]\nhost = h\n")
+        monkeypatch.setenv("DATABRICKS_CONFIG_FILE", "~/alt.cfg")
+        monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", "work")
+        r = check_env.check_mlflow()
+        assert r.status == check_env.OK
+        assert "profile work found in ~/alt.cfg" in r.message
+
     def test_settings_default_profile_beats_the_default_section(self, home):
         home.joinpath(".databrickscfg").write_text(
             "[__settings__]\ndefault_profile = work\n\n[DEFAULT]\nhost = h\n\n[work]\nhost = h\n"
@@ -678,17 +782,18 @@ class TestCheckMlflow:
     )
     def test_default_profile_outside_the_settings_section_is_ignored(self, home, text):
         home.joinpath(".databrickscfg").write_text(text)
-        assert check_env._read_databricks_config()[1] == "DEFAULT"
+        assert self._read_config().default_profile == "DEFAULT"
 
     def test_settings_default_profile_accepts_a_colon_delimiter(self, home):
         home.joinpath(".databrickscfg").write_text("[__settings__]\nDefault_Profile: work\n")
-        assert check_env._read_databricks_config()[1] == "work"
+        assert self._read_config().default_profile == "work"
 
     def test_default_profile_falls_back_when_the_file_is_unreadable(self, home):
         (home / ".databrickscfg").mkdir()
-        profiles, default, problem = check_env._read_databricks_config()
-        assert (profiles, default) == (frozenset(), "DEFAULT")
-        assert problem is not None and "unreadable" in problem
+        config = self._read_config()
+        assert (config.profiles, config.default_profile) == (frozenset(), "DEFAULT")
+        assert config.problem is not None and "unreadable" in config.problem
+        assert not config.missing
 
     def test_two_auth_methods_without_a_pin_are_a_warn(self, monkeypatch):
         """The SDK refuses to build a Config with more than one auth method configured."""
@@ -827,14 +932,23 @@ class TestCheckMlflow:
         assert "spans more than one line" in r.message
         assert "dapi-secret" not in r.message
 
-    def test_an_empty_default_profile_continued_on_the_next_line_is_not_a_section_name(self, home):
-        """Stripping first would hide the continuation, leaving a token as the profile name."""
+    def test_a_default_profile_starting_on_the_next_line_names_that_profile(self, home):
+        """The SDK strips default_profile before it resolves it, newlines included."""
+        home.joinpath(".databrickscfg").write_text(
+            "[__settings__]\ndefault_profile =\n  work\n[work]\nhost = h\n"
+        )
+        r = check_env.check_mlflow()
+        assert r.status == check_env.OK
+        assert "profile work found in ~/.databrickscfg" in r.message
+
+    def test_a_continued_default_profile_naming_no_profile_is_not_quoted(self, home):
+        """A continuation line can be a token, so it is named only when it names a profile."""
         home.joinpath(".databrickscfg").write_text(
             "[__settings__]\ndefault_profile =\n  token = dapi-secret\n[DEFAULT]\nhost = h\n"
         )
         r = check_env.check_mlflow()
         assert r.status == check_env.WARN
-        assert "spans more than one line" in r.message
+        assert "default_profile names no section of ~/.databrickscfg" in r.message
         assert "dapi-secret" not in r.message
 
     def test_a_default_section_whose_only_key_is_default_profile_is_still_a_profile(self, home):
