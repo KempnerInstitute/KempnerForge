@@ -9,6 +9,7 @@ dispatch, and the data-pipeline builder.
 from __future__ import annotations
 
 import dataclasses
+from collections.abc import Iterator
 from typing import Any
 
 import pytest
@@ -2044,6 +2045,18 @@ class TestVlmStep:
             session.step_fn(session, 0)
 
 
+@pytest.fixture
+def restore_matmul_precision() -> Iterator[None]:
+    """Restore torch's fp32 matmul precision, both the legacy value and the per-backend ones."""
+    backends = (torch.backends.cuda.matmul, torch.backends.mkldnn.matmul)
+    legacy = torch.get_float32_matmul_precision()
+    saved = [backend.fp32_precision for backend in backends]
+    yield
+    torch.set_float32_matmul_precision(legacy)
+    for backend, value in zip(backends, saved, strict=True):
+        backend.fp32_precision = value
+
+
 class TestSetupDistributed:
     def test_builds_the_context_and_validates_against_world_size(self, monkeypatch):
         import kempnerforge.training.runtime as rt
@@ -2075,6 +2088,7 @@ class TestSetupDistributed:
         rt.setup_distributed(config)
         assert seen["seed"] == 4242
 
+    @pytest.mark.usefixtures("restore_matmul_precision")
     @pytest.mark.parametrize(("tf32", "expected"), [(True, "high"), (False, "highest")])
     def test_tf32_sets_the_matmul_precision(
         self, monkeypatch: pytest.MonkeyPatch, tf32: bool, expected: str
@@ -2084,24 +2098,17 @@ class TestSetupDistributed:
         monkeypatch.setattr(rt, "get_world_info", lambda: (0, 0, 1))
         monkeypatch.setattr(rt, "init_distributed", lambda cfg, seed: None)
         monkeypatch.setattr(rt, "log_job_info", lambda: None)
-        saved = torch.get_float32_matmul_precision()
         torch.set_float32_matmul_precision("highest")
-        try:
-            rt.setup_distributed(make_config(tf32=tf32))
-            assert torch.get_float32_matmul_precision() == expected
-        finally:
-            torch.set_float32_matmul_precision(saved)
+        rt.setup_distributed(make_config(tf32=tf32))
+        assert torch.get_float32_matmul_precision() == expected
 
+    @pytest.mark.usefixtures("restore_matmul_precision")
     def test_tf32_off_leaves_an_existing_setting_alone(self) -> None:
         from kempnerforge.training.runtime import apply_matmul_precision
 
-        saved = torch.get_float32_matmul_precision()
         torch.set_float32_matmul_precision("medium")
-        try:
-            apply_matmul_precision(TrainConfig())
-            assert torch.get_float32_matmul_precision() == "medium"
-        finally:
-            torch.set_float32_matmul_precision(saved)
+        apply_matmul_precision(TrainConfig())
+        assert torch.get_float32_matmul_precision() == "medium"
 
 
 class TestPpGroup:
