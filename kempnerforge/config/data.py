@@ -8,8 +8,8 @@ TOKEN_DTYPES = ("uint16", "uint32")
 
 
 def check_token_dtype(value: str, key: str) -> None:
-    """Reject a ``token_dtype`` that is neither empty nor one of ``TOKEN_DTYPES``."""
-    if value and value not in TOKEN_DTYPES:
+    """Reject a ``token_dtype`` that is neither ``""`` nor one of ``TOKEN_DTYPES``."""
+    if value != "" and value not in TOKEN_DTYPES:
         raise ValueError(
             f"{key} must be 'uint16' or 'uint32', the integer type the raw .bin token "
             f"shards were written with, or empty to take it from the metadata.yaml next "
