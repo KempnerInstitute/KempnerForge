@@ -5,6 +5,12 @@ streams prove that each rank saves and restores its own payload. Legacy
 checkpoints, topology mismatches, and mid-save interruption cover the
 compatibility and durability surface. Uses the mocked-DCP manager patterns
 from test_checkpoint.py.
+
+The layout fixtures ``DP4``, ``DP2_TP2`` and ``PP2_DP2`` are hand-enumerated
+global rank -> ``(dp_rank, dp_size)`` maps for a 4-rank job under
+``dp_shard=4``, under ``dp_shard=2`` with ``tp=2``, and under ``pp=2`` with
+``dp_shard=2``; the device mesh is row-major over
+``(pp, dp_replicate, dp_shard, ep, tp)``.
 """
 
 from __future__ import annotations
@@ -67,6 +73,21 @@ def _mk_payloads(
     return payloads, expected
 
 
+class _FakeScheduler:
+    """The scheduler surface the manager uses: ``state_dict`` / ``load_state_dict``."""
+
+    def __init__(self, last_lr: float) -> None:
+        self.last_lr = last_lr
+        self.restored: dict | None = None
+
+    def state_dict(self) -> dict:
+        return {"last_lr": self.last_lr}
+
+    def load_state_dict(self, state: dict) -> None:
+        self.restored = dict(state)
+        self.last_lr = state["last_lr"]
+
+
 def _mock_mgr(tmp_path, monkeypatch, dp_info=None, **cfg_kwargs) -> CheckpointManager:
     """CheckpointManager with DCP calls mocked out (same seam as test_checkpoint)."""
     model = torch.nn.Linear(4, 4)
@@ -109,7 +130,9 @@ def _install_fake_world(
     monkeypatch.setattr(mgr_mod.dist, "all_gather_object", fake_all_gather)
 
 
-def _save_four_rank_ckpt(tmp_path, monkeypatch, payloads, step: int, layout=None) -> list:
+def _save_four_rank_ckpt(
+    tmp_path, monkeypatch, payloads, step: int, layout=None, scheduler=None, extra=None
+) -> list:
     """Write a real ``step_N`` checkpoint whose envelope holds the payloads.
 
     The saving process is rank 0: its live RNG streams and loader are rank 0's,
@@ -126,7 +149,13 @@ def _save_four_rank_ckpt(tmp_path, monkeypatch, payloads, step: int, layout=None
         mgr = _mock_mgr(tmp_path, m, dp_info=layout[0] if layout is not None else None)
         set_rng_state(payloads[0]["rng"])
         loader = Rank0Loader() if "dataloader" in payloads[0] else None
-        mgr.save(step=step, tokens_seen=step * 64, dataloader=loader)
+        mgr.save(
+            step=step,
+            tokens_seen=step * 64,
+            scheduler=scheduler,
+            dataloader=loader,
+            extra=extra,
+        )
     return events
 
 
@@ -161,7 +190,9 @@ def _install_fake_load_world(
     m.setattr(mgr_mod.dist, "all_gather_object", fake_all_gather)
 
 
-def _load_in_layout(tmp_path, monkeypatch, rank: int, step: int, layout: dict | None, **cfg):
+def _load_in_layout(
+    tmp_path, monkeypatch, rank: int, step: int, layout: dict | None, scheduler=None, **cfg
+):
     """Resume as global rank ``rank`` of a WORLD-rank job with the given current
     data-parallel layout. Seeds every generator with 555 right before the load,
     so a discarded state leaves seed 555's streams in place."""
@@ -171,7 +202,7 @@ def _load_in_layout(tmp_path, monkeypatch, rank: int, step: int, layout: dict | 
         _install_fake_load_world(m, rank, layout, ckpt_dir, gathers)
         mgr = _mock_mgr(tmp_path, m, dp_info=layout[rank] if layout is not None else None, **cfg)
         _seed_all(555)
-        result = mgr.load(path=str(ckpt_dir), exact_resume=True)
+        result = mgr.load(path=str(ckpt_dir), scheduler=scheduler, exact_resume=True)
     return mgr, result, gathers
 
 
@@ -182,11 +213,6 @@ def _load_as_rank(tmp_path, monkeypatch, rank: int, step: int, world_size: int =
     mgr._world_size = world_size
     result = mgr.load(path=str(Path(tmp_path) / f"step_{step}"), exact_resume=True)
     return mgr, result
-
-
-# ---------------------------------------------------------------------------
-# Envelope schema (executable documentation of schema v1)
-# ---------------------------------------------------------------------------
 
 
 class TestPerRankEnvelopeSchema:
@@ -209,10 +235,11 @@ class TestPerRankEnvelopeSchema:
     @pytest.mark.parametrize(
         "layout",
         [
-            {0: (0, 2)},  # rank 1 missing
-            {0: (0, 2), 1: (2, 2)},  # dp_rank out of range
-            {0: (0, 2), 1: ("1", 2)},  # not an int
+            {0: (0, 2)},
+            {0: (0, 2), 1: (2, 2)},
+            {0: (0, 2), 1: ("1", 2)},
         ],
+        ids=["rank_missing", "dp_rank_out_of_range", "dp_rank_not_an_int"],
     )
     def test_build_refuses_malformed_layout(self, layout):
         with pytest.raises(ValueError, match="data-parallel layout"):
@@ -268,11 +295,19 @@ class TestPerRankEnvelopeSchema:
         "envelope",
         [
             "not-a-dict",
-            {"version": 1, "world_size": 1},  # no ranks
-            {"version": 1, "world_size": 1, "ranks": [("0", {})]},  # ranks not a dict
-            {"version": "1", "world_size": 1, "ranks": {0: {}}},  # version not int
-            {"version": 0, "world_size": 1, "ranks": {0: {}}},  # version < 1
-            {"version": 1, "world_size": "4", "ranks": {0: {}}},  # world_size not int
+            {"version": 1, "world_size": 1},
+            {"version": 1, "world_size": 1, "ranks": [("0", {})]},
+            {"version": "1", "world_size": 1, "ranks": {0: {}}},
+            {"version": 0, "world_size": 1, "ranks": {0: {}}},
+            {"version": 1, "world_size": "4", "ranks": {0: {}}},
+        ],
+        ids=[
+            "not_a_dict",
+            "no_ranks",
+            "ranks_not_a_dict",
+            "version_not_int",
+            "version_below_one",
+            "world_size_not_int",
         ],
     )
     def test_select_refuses_malformed(self, envelope):
@@ -290,11 +325,6 @@ class TestPerRankEnvelopeSchema:
         step, tokens, extra = restore_train_state(state)
         assert (step, tokens) == (3, 96)
         assert extra == {"phase_idx": 2}
-
-
-# ---------------------------------------------------------------------------
-# Whole-envelope validation before any entry is selected
-# ---------------------------------------------------------------------------
 
 
 def _defective_envelope(defect: str) -> dict:
@@ -437,18 +467,55 @@ class TestEnvelopeValidatedBeforeSelection:
             assert _draw() == ref, f"rank {r} restored RNG from a defective envelope"
 
 
-# ---------------------------------------------------------------------------
-# Four simulated ranks through the real manager save/load path
-# ---------------------------------------------------------------------------
+class TestGatherMustCoverTheWorld:
+    """A save whose gather does not cover the world says so, in those words.
+
+    A manager driven as a rank its world does not cover, the shape a unit test
+    takes when it sets ``_rank`` and fakes nothing else, would otherwise build
+    an envelope the load side could never restore completely. The error names
+    the world size expected, the ranks the gather returned, and the two ways
+    out, so the next caller fixes the fake instead of reading the envelope code.
+    """
+
+    def test_save_as_a_rank_the_world_does_not_cover_is_named(self, tmp_path, monkeypatch):
+        mgr = _mock_mgr(tmp_path, monkeypatch)
+        mgr._rank = 1
+
+        with pytest.raises(ValueError) as exc:
+            mgr.save(step=1)
+
+        message = str(exc.value)
+        assert "world_size=1" in message, message
+        assert "got ranks [1]" in message, message
+        assert "gather" in message, message
+        assert not (tmp_path / "step_1" / "train_state.pt").exists()
+
+    def test_a_complete_world_saves_as_a_non_zero_rank(self, tmp_path, monkeypatch):
+        """The other way out: a world size and a gather that cover every rank."""
+        payloads, _ = _mk_payloads(seed_base=10, cursor_base=100)
+        events: list = []
+        with monkeypatch.context() as m:
+            _install_fake_world(m, payloads, events)
+            mgr = _mock_mgr(tmp_path, m)
+            mgr._rank = 1
+            mgr.save(step=1)
+
+        assert ("gather", "GLOO_PG") in events
+        assert not (tmp_path / "step_1" / "train_state.pt").exists(), "only rank 0 writes the file"
 
 
 class TestFourRankSaveLoad:
     def test_each_rank_restores_its_own_loader_and_rng(self, tmp_path, monkeypatch):
+        """Each rank gets back its own cursor and RNG streams.
+
+        Every rank is re-seeded to the same scrambled state before its load, so
+        only a genuinely per-rank restore can reproduce the distinct streams.
+        """
         payloads, expected = _mk_payloads(seed_base=1000, cursor_base=100)
         _save_four_rank_ckpt(tmp_path, monkeypatch, payloads, step=7)
 
         for r in range(WORLD):
-            _seed_all(555)  # scramble, same on every rank, before each load
+            _seed_all(555)
             mgr, (step, tokens, _) = _load_as_rank(tmp_path, monkeypatch, rank=r, step=7)
             assert (step, tokens) == (7, 448)
             assert mgr._pending_dataloader_state == {"cursor": 100 + r, "prefetch_depth": 1 + r}
@@ -481,6 +548,7 @@ class TestFourRankSaveLoad:
         assert len(set(cpu_states)) == WORLD, "rank RNG captures are not distinct"
 
     def test_two_consecutive_resumes(self, tmp_path, monkeypatch):
+        """The resumed run saves a fresh envelope that wholly replaces the first."""
         first, exp_first = _mk_payloads(seed_base=1000, cursor_base=100)
         _save_four_rank_ckpt(tmp_path, monkeypatch, first, step=7)
         for r in (2, 3):
@@ -490,8 +558,6 @@ class TestFourRankSaveLoad:
             assert mgr._pending_dataloader_state == {"cursor": 100 + r, "prefetch_depth": 1 + r}
             assert _draw() == exp_first[r]
 
-        # The resumed run advances and saves again: a fresh envelope replaces
-        # the first one entirely, and the second resume restores it.
         second, exp_second = _mk_payloads(seed_base=2000, cursor_base=200)
         _save_four_rank_ckpt(tmp_path, monkeypatch, second, step=8)
         for r in range(WORLD):
@@ -559,11 +625,6 @@ class TestFourRankSaveLoad:
         assert events[1][1] == "train_state.pt"
 
 
-# ---------------------------------------------------------------------------
-# Legacy compatibility and topology validation
-# ---------------------------------------------------------------------------
-
-
 class TestLegacyAndTopology:
     def _write_legacy_ckpt(self, tmp_path, step: int):
         """A checkpoint exactly as the pre-envelope manager wrote it."""
@@ -587,16 +648,18 @@ class TestLegacyAndTopology:
             mgr, (step, tokens, _) = _load_as_rank(tmp_path, monkeypatch, rank=r, step=3)
             assert (step, tokens) == (3, 99)
             assert mgr._pending_dataloader_state == {"epoch": 2, "batches_yielded": 50}
-            assert _draw() == expected  # rank 0's copy, on every rank, as before
+            assert _draw() == expected
 
     def test_new_checkpoint_keeps_legacy_single_copy_keys(self, tmp_path, monkeypatch):
-        """Old readers keep working: the single-copy keys sit beside the envelope."""
+        """Old readers keep working: the single-copy keys sit beside the envelope.
+
+        A pre-envelope reader restores the flat keys and never looks at
+        ``per_rank``, which ``legacy_view`` emulates.
+        """
         payloads, _ = _mk_payloads(seed_base=1000, cursor_base=100)
         _save_four_rank_ckpt(tmp_path, monkeypatch, payloads, step=7)
         raw = torch.load(tmp_path / "step_7" / "train_state.pt", weights_only=False)
         assert "rng" in raw and raw[PER_RANK_KEY]["version"] == 1
-        # A legacy reader restores the flat keys and never looks at the
-        # envelope; emulate it with the documented single-copy limitation.
         legacy_view = {k: v for k, v in raw.items() if k != PER_RANK_KEY}
         step, tokens, extra = restore_train_state(legacy_view)
         assert (step, tokens) == (7, 448)
@@ -610,20 +673,24 @@ class TestLegacyAndTopology:
         assert "ignore_rank_state_mismatch" in str(exc.value)
 
     def test_world_size_mismatch_ignored_discards_loader_and_rng(self, tmp_path, monkeypatch):
+        """The override discards the saved loader/RNG state and leaves RNG untouched.
+
+        The manager is built before the reference draw because module init
+        itself consumes torch RNG.
+        """
         payloads, _ = _mk_payloads(seed_base=1000, cursor_base=100)
         _save_four_rank_ckpt(tmp_path, monkeypatch, payloads, step=7)
 
-        # Build the manager first: module init consumes torch RNG.
         mgr = _mock_mgr(tmp_path, monkeypatch, ignore_rank_state_mismatch=True)
         mgr._rank = 1
         mgr._world_size = 2
         _seed_all(555)
-        ref = _draw()  # where seed 555's streams go when nothing restores RNG
+        untouched = _draw()
         _seed_all(555)
         step, tokens, _ = mgr.load(path=str(Path(tmp_path) / "step_7"), exact_resume=True)
         assert (step, tokens) == (7, 448)
         assert mgr._pending_dataloader_state is None
-        assert _draw() == ref, "RNG must stay untouched when per-rank state is discarded"
+        assert _draw() == untouched, "RNG must stay untouched when per-rank state is discarded"
 
     def test_single_process_round_trip(self, tmp_path, monkeypatch):
         """The default non-distributed path uses the envelope end to end."""
@@ -654,15 +721,9 @@ class TestLegacyAndTopology:
             _load_as_rank(tmp_path, monkeypatch, rank=3, step=2, world_size=WORLD)
 
 
-# ---------------------------------------------------------------------------
-# Data-parallel layout: same world size does not mean same data partition
-# ---------------------------------------------------------------------------
-
-# Hand-enumerated global rank -> (dp_rank, dp_size) for a 4-rank job. The
-# device mesh is row-major over (pp, dp_replicate, dp_shard, ep, tp).
-DP4 = {0: (0, 4), 1: (1, 4), 2: (2, 4), 3: (3, 4)}  # dp_shard=4
-DP2_TP2 = {0: (0, 2), 1: (0, 2), 2: (1, 2), 3: (1, 2)}  # dp_shard=2, tp=2
-PP2_DP2 = {0: (0, 2), 1: (1, 2), 2: (0, 2), 3: (1, 2)}  # pp=2, dp_shard=2
+DP4 = {0: (0, 4), 1: (1, 4), 2: (2, 4), 3: (3, 4)}
+DP2_TP2 = {0: (0, 2), 1: (0, 2), 2: (1, 2), 3: (1, 2)}
+PP2_DP2 = {0: (0, 2), 1: (1, 2), 2: (0, 2), 3: (1, 2)}
 
 
 class TestDataParallelLayout:
@@ -687,8 +748,8 @@ class TestDataParallelLayout:
     @pytest.mark.parametrize(
         ("saved", "current"),
         [
-            (DP4, DP2_TP2),  # dp_size changes on every rank
-            (DP2_TP2, PP2_DP2),  # ranks 0 and 3 keep their own coordinates
+            (DP4, DP2_TP2),
+            (DP2_TP2, PP2_DP2),
         ],
         ids=["dp4_to_dp2tp2", "dp2tp2_to_pp2dp2"],
     )
@@ -721,6 +782,39 @@ class TestDataParallelLayout:
             assert mgr._pending_dataloader_state is None, f"rank {r} restored a loader cursor"
             assert _draw() == fresh, f"rank {r} restored RNG across a layout change"
 
+    def test_override_keeps_step_scheduler_and_extras(self, tmp_path, monkeypatch):
+        """Discarding the per-rank state drops only the loader and RNG keys.
+
+        Step, tokens, scheduler state and the extras must still restore, which
+        is what makes the override a usable way to move a run to a new
+        topology rather than a restart.
+        """
+        payloads, _ = _mk_payloads(seed_base=1000, cursor_base=100)
+        _save_four_rank_ckpt(
+            tmp_path,
+            monkeypatch,
+            payloads,
+            step=7,
+            layout=DP4,
+            scheduler=_FakeScheduler(0.5),
+            extra={"phase_idx": 2},
+        )
+        for r in range(WORLD):
+            scheduler = _FakeScheduler(0.0)
+            mgr, (step, tokens, extra), _ = _load_in_layout(
+                tmp_path,
+                monkeypatch,
+                rank=r,
+                step=7,
+                layout=DP2_TP2,
+                scheduler=scheduler,
+                ignore_rank_state_mismatch=True,
+            )
+            assert (step, tokens) == (7, 448)
+            assert mgr._pending_dataloader_state is None
+            assert scheduler.restored == {"last_lr": 0.5}, f"rank {r} lost the scheduler"
+            assert extra == {"phase_idx": 2}, f"rank {r} lost the extras"
+
     def test_unrecorded_saved_layout_checks_world_size_only(self, tmp_path, monkeypatch):
         """A manager built without coordinates records none; the load cannot
         compare layouts and validates only the world size."""
@@ -749,14 +843,14 @@ class TestDataParallelLayout:
     @pytest.mark.parametrize(
         "saved_layout",
         [
-            "absent",  # key missing from the envelope
-            [(0, 4), (1, 4), (2, 4), (3, 4)],  # not a mapping
-            {0: (0, 4), 1: (1, 4), 2: (2, 4)},  # rank 3 missing
-            {0: (0, 4), 1: (1, 4), 2: (2, 4), 3: (4, 4)},  # dp_rank out of range
-            {0: (0, 4), 1: (1, 4), 2: (2, 4), 3: (3, 0)},  # dp_size not positive
-            {0: (0, 4), 1: (1, 4), 2: (2, 4), 3: ("3", 4)},  # not an int
-            {0: (0, 4), 1: (1, 4), 2: (2, 4), 3: (3, 4, 1)},  # not a pair
-            {0: (0, 4), 1: (1, 4), 2: (2, 4), 3: (3, 4), 4: (0, 4), "x": (0, 4)},  # extra keys
+            "absent",
+            [(0, 4), (1, 4), (2, 4), (3, 4)],
+            {0: (0, 4), 1: (1, 4), 2: (2, 4)},
+            {0: (0, 4), 1: (1, 4), 2: (2, 4), 3: (4, 4)},
+            {0: (0, 4), 1: (1, 4), 2: (2, 4), 3: (3, 0)},
+            {0: (0, 4), 1: (1, 4), 2: (2, 4), 3: ("3", 4)},
+            {0: (0, 4), 1: (1, 4), 2: (2, 4), 3: (3, 4, 1)},
+            {0: (0, 4), 1: (1, 4), 2: (2, 4), 3: (3, 4), 4: (0, 4), "x": (0, 4)},
         ],
         ids=["absent", "list", "incomplete", "rank_range", "size", "str", "triple", "extra"],
     )
@@ -789,11 +883,6 @@ class TestDataParallelLayout:
         opt = torch.optim.SGD(model.parameters(), lr=0.1)
         mgr = CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model, opt, dp_info=[1, 2])
         assert mgr._dp_info == (1, 2)
-
-
-# ---------------------------------------------------------------------------
-# Loads that are not an exact resume keep the single-copy behavior
-# ---------------------------------------------------------------------------
 
 
 class TestLoadsThatAreNotAResume:
@@ -859,11 +948,6 @@ class TestLoadsThatAreNotAResume:
         assert gathers == []
 
 
-# ---------------------------------------------------------------------------
-# Mid-save interruption: durability ordering with the envelope present
-# ---------------------------------------------------------------------------
-
-
 class TestMidSaveInterruption:
     @staticmethod
     def _install_async_mock(mgr, monkeypatch):
@@ -888,7 +972,12 @@ class TestMidSaveInterruption:
     def test_interrupted_flush_resumes_from_last_durable_envelope(self, tmp_path, monkeypatch):
         """Crash mid-flush: train_state.pt (with envelope) of the torn step is
         already on disk, but `latest` and auto-resume stay on the last step
-        whose DCP shards are durable, and that step's per-rank state restores."""
+        whose DCP shards are durable, and that step's per-rank state restores.
+
+        The second save makes step_10 durable and committed while step_20's
+        flush is still in flight, and the process then "crashes" with no
+        ``wait()``. Resuming in a fresh manager must land on step_10.
+        """
 
         class Loader:
             def __init__(self):
@@ -913,18 +1002,13 @@ class TestMidSaveInterruption:
         mgr.save(step=10, tokens_seen=640, dataloader=loader)
         expected = _draw()
 
-        # Second save makes step_10 durable + committed; step_20's flush stays
-        # in flight and the process "crashes" here (wait() never runs).
         loader.cursor = 20
         mgr.save(step=20, tokens_seen=1280, dataloader=loader)
 
-        # Durability ordering: the torn checkpoint's train_state.pt was
-        # written before any commit, yet `latest` still names step_10.
         assert (tmp_path / "step_20" / "train_state.pt").exists()
         assert not (tmp_path / "step_20" / _DCP_METADATA_FILE).exists()
         assert (tmp_path / "latest").resolve() == (tmp_path / "step_10").resolve()
 
-        # Fresh process: auto-resume lands on step_10 and restores ITS state.
         mgr2 = _mock_mgr(tmp_path, monkeypatch)
         _seed_all(555)
         step, tokens, _ = mgr2.load(exact_resume=True)

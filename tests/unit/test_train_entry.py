@@ -1457,7 +1457,6 @@ class TestRestoreCheckpoint:
         entry.restore_checkpoint(config, TinyTextModel(), None, mgr)
         assert mgr.load_kwargs["path"] == (str(resume) if resume_found else None)
         assert mgr.load_kwargs["exclude_keys"] == want_exclude
-        # Only an auto-resume of the run's own checkpoint is an exact resume.
         assert mgr.load_kwargs["exact_resume"] is resume_found
 
     def test_resume_with_stale_load_path_restores_full_state(self, monkeypatch, tmp_path):

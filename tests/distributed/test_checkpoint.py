@@ -668,6 +668,13 @@ class TestPerRankState:
         )
 
     def test_each_rank_restores_its_own_loader_and_rng(self, distributed_env, shared_tmp_dir):
+        """Each rank saves distinct streams and a distinct cursor, and gets them back.
+
+        Every rank is re-seeded identically before the load, so only a genuinely
+        per-rank restore can bring the distinct streams back. A second
+        consecutive resume then checks that the resumed run saves a fresh
+        envelope and restores that one too.
+        """
         from kempnerforge.config.schema import OptimizerConfig
 
         rank = dist.get_rank()
@@ -686,19 +693,15 @@ class TestPerRankState:
             CheckpointConfig(dir=shared_tmp_dir, keep_last_n=3), model, opt, dp_info=(rank, world)
         )
 
-        # Distinct per-rank streams and cursors, as a divergent run has them.
         self._seed_all(1000 + rank)
         loader = _CursorLoader(cursor=100 + rank)
         mgr.save(step=5, tokens_seen=320, dataloader=loader)
 
-        # The next values each generator produces without interruption.
         expected = self._draw()
 
         saved = torch.load(Path(shared_tmp_dir) / "step_5" / "train_state.pt", weights_only=False)
         assert saved["per_rank"]["data_parallel"] == {r: (r, world) for r in range(world)}
 
-        # Scramble everything identically on every rank; only a genuinely
-        # per-rank restore can bring the distinct streams back.
         self._seed_all(7)
         loader2 = _CursorLoader(cursor=-1)
         step, tokens_seen, _ = mgr.load(
@@ -711,7 +714,6 @@ class TestPerRankState:
         got = self._draw()
         assert got == expected, f"rank {rank} RNG streams are not its own"
 
-        # Every rank restored a DIFFERENT cursor (the actual regression).
         cursors: list = [None] * world
         dist.all_gather_object(cursors, loader2.cursor)
         assert sorted(cursors) == [100 + r for r in range(world)]
@@ -719,8 +721,6 @@ class TestPerRankState:
         dist.all_gather_object(draws, got)
         assert len(set(draws)) == world, "rank RNG streams collapsed onto one copy"
 
-        # Second consecutive resume: the resumed run saves a fresh envelope
-        # and restores it again.
         loader2.cursor = 200 + rank
         mgr.save(step=6, tokens_seen=384, dataloader=loader2)
         loader3 = _CursorLoader(cursor=-1)
@@ -737,7 +737,12 @@ class TestPerRankState:
         """Same world size, another data-parallel layout: an exact resume refuses
         on all ranks, or with the override discards on all ranks, never a
         per-rank mix; a load that is not a resume restores rank 0's single
-        copy on every rank, as before."""
+        copy on every rank, as before.
+
+        The checkpoint is saved as dp x 2 (rank -> rank // 2) and resumed as
+        2 x dp (rank -> rank % half), so with 4 ranks only ranks 0 and 3 keep
+        their own coordinates.
+        """
         from kempnerforge.config.schema import OptimizerConfig
 
         rank = dist.get_rank()
@@ -754,8 +759,6 @@ class TestPerRankState:
         opt.step()
         opt.zero_grad()
 
-        # Saved as dp x 2 (rank -> rank // 2), resumed as 2 x dp (rank -> rank % half).
-        # With 4 ranks, ranks 0 and 3 keep their own coordinates.
         saved_dp = (rank // 2, half)
         current_dp = (rank % half, half)
         path = str(Path(shared_tmp_dir) / "step_5")
@@ -785,7 +788,6 @@ class TestPerRankState:
         assert loader.restored is None, f"rank {rank} restored a cursor across a layout change"
         assert self._draw() == fresh, f"rank {rank} restored RNG across a layout change"
 
-        # Evaluation or a load_path warm start: no resume context.
         plain_loader = _CursorLoader(cursor=-1)
         plain = CheckpointManager(cfg, model, opt, dp_info=current_dp)
         self._seed_all(7)

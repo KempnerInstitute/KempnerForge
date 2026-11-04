@@ -99,7 +99,9 @@ refusal, set
 `checkpoint.ignore_rank_state_mismatch = true`: the saved loader/RNG
 state is discarded on every rank with a warning and data order /
 random streams restart fresh (model, optimizer, scheduler and step
-still resume).
+still resume). See
+[Scaling a run to a different world size](resharding.md#scaling-a-run-to-a-different-world-size)
+for the scale-up recipe and what it costs.
 
 Compatibility:
 

@@ -5,11 +5,21 @@ which supports automatic resharding (save with N GPUs, load with M GPUs).
 
 Non-distributed state (scheduler, dataloader, training meta, RNG) is saved
 separately as a torch file written by rank 0 and broadcast from rank 0 on
-load. Dataloader and RNG state are per-rank: every rank's payload is gathered
+load. Scheduler and training meta restore from that single copy on every
+rank. Dataloader and RNG state are per-rank: every rank's payload is gathered
 into a versioned envelope at save time, and on an exact resume
 (``load(exact_resume=True)``) each rank restores its own entry from the
-broadcast (see ``kempnerforge.checkpoint.state``). Any other load restores
-rank 0's single copy on every rank.
+broadcast (see ``kempnerforge.checkpoint.state``). Any other load (a
+``load_path`` warm start, evaluation) restores rank 0's single copy on every
+rank.
+
+Resharding model and optimizer state is therefore free, but an exact resume
+is not: a rank's loader cursor and RNG streams are valid only on the world
+size and data-parallel layout that saved them, so an exact resume under a
+changed topology raises on every rank. Setting
+``checkpoint.ignore_rank_state_mismatch`` discards the saved loader/RNG state
+on every rank instead, leaving step, model, optimizer and scheduler to resume
+onto the new topology while data order and random streams restart fresh.
 """
 
 from __future__ import annotations

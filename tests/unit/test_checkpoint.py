@@ -327,6 +327,28 @@ def _make_mock_mgr(tmp_path, monkeypatch, *, ignore_freeze_mismatch=False):
     return mgr
 
 
+def _fake_world_of_two(mgr, monkeypatch):
+    """Let ``mgr`` save as either rank of a two-rank job.
+
+    ``save()`` gathers every rank's dataloader/RNG payload, so a manager driven
+    as a non-zero rank needs a world size and a gather that cover the whole
+    world; the gather hands back one payload per rank, as the real collective
+    would, and the barrier is a no-op.
+    """
+    from kempnerforge.checkpoint import manager as mgr_mod
+
+    mgr._world_size = 2
+    monkeypatch.setattr(mgr_mod.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(mgr_mod.dist, "barrier", lambda group=None: None)
+
+    def fake_all_gather(obj_list, obj, group=None):
+        _, dp_info, payload = obj
+        for r in range(len(obj_list)):
+            obj_list[r] = (r, dp_info, payload)
+
+    monkeypatch.setattr(mgr_mod.dist, "all_gather_object", fake_all_gather)
+
+
 class TestDataloaderStatePersistence:
     """Round-trip coverage for dataloader state across save -> load -> apply.
 
@@ -687,6 +709,7 @@ class TestSaveTrackingSidecar:
 
     def test_only_rank_zero_asks_the_source(self, tmp_path, monkeypatch):
         mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        _fake_world_of_two(mgr, monkeypatch)
         asked: list[int] = []
 
         def source():
@@ -1010,6 +1033,7 @@ class TestSaveCheckpointRegistration:
 
     def test_only_rank_zero_asks_for_fields_or_registers(self, tmp_path, monkeypatch):
         mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        _fake_world_of_two(mgr, monkeypatch)
         registrar = _Registrar()
         mgr.set_tracking_source(lambda: [self.MLFLOW])
         mgr.set_checkpoint_registrar(registrar)
@@ -1813,7 +1837,6 @@ class TestAsyncLatestSymlinkSafety:
             "kempnerforge.checkpoint.manager.dist.barrier",
             lambda *a, **k: barriers.append(True),
         )
-        # The per-rank gather is a collective too; fake a world of one.
         monkeypatch.setattr(
             "kempnerforge.checkpoint.manager.dist.all_gather_object",
             lambda out, obj, group=None: out.__setitem__(0, obj),

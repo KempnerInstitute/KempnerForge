@@ -4,6 +4,22 @@ Collects the full training state — model, optimizer, scheduler, dataloader,
 training metadata, and RNG states — into a single dict for DCP save/load.
 
 RNG state capture ensures exact reproducibility on resume.
+
+Dataloader and RNG state are per-rank. ``train_state.pt`` carries every rank's
+own payload under ``PER_RANK_KEY`` as a versioned envelope::
+
+    {"version": 1, "world_size": W, "data_parallel": layout | None,
+     "ranks": {global_rank: payload}}
+
+A payload holds that rank's own ``"rng"`` capture and, when its loader is
+stateful, its ``"dataloader"`` state (every rank or none). Every rank must
+capture the same RNG streams: ``"torch_cuda"`` is captured only where CUDA is
+available, and an entry missing a stream would silently resume that rank with a
+fresh one. ``layout`` maps every global rank to the ``(dp_rank, dp_size)`` data
+partition its loader read, or is None when the saving manager was not given it.
+The legacy single-copy ``"rng"``/``"dataloader"`` keys (always rank 0's) are
+still written beside the envelope, so readers that predate it keep loading,
+with their documented limitation that they restore rank 0's copy everywhere.
 """
 
 from __future__ import annotations
@@ -17,23 +33,9 @@ import torch
 
 logger = logging.getLogger(__name__)
 
-# Versioned per-rank state envelope, stored in train_state.pt under this key.
-# Schema v1:
-#   {"version": 1, "world_size": W, "data_parallel": layout | None,
-#    "ranks": {global_rank: payload}}
-# where each payload carries that rank's own "rng" capture and, when its
-# loader is stateful, its "dataloader" state (every rank or none). ``layout``
-# maps every global rank to the (dp_rank, dp_size) data partition its loader
-# read, or is None when the saving manager was not given it. The legacy
-# single-copy "rng"/"dataloader" keys (always rank 0's) are still written
-# beside the envelope, so readers that predate it keep loading; their
-# documented limitation is that they restore rank 0's copy on every rank.
 PER_RANK_KEY = "per_rank"
 PER_RANK_VERSION = 1
 
-# Streams get_rng_state() always captures; a per-rank entry missing one would
-# silently resume that rank with a fresh stream. "torch_cuda" is captured only
-# where CUDA is available, so every rank must carry the same set of streams.
 _RNG_STREAMS = ("python", "numpy", "torch_cpu")
 
 _MISMATCH_HINT = (
@@ -128,13 +130,19 @@ def build_per_rank_envelope(
 
     Requires exactly one payload per global rank ``0..world_size - 1``: a
     gather that lost a rank would otherwise save an envelope the load side
-    could never restore completely. ``data_parallel`` is the complete
-    global rank -> ``(dp_rank, dp_size)`` layout, or None when unknown.
+    could never restore completely. The ``ValueError`` for an incomplete set
+    names ``world_size``, the ranks the gather returned and both ways out, so
+    a caller driving a manager as another rank can fix the world it simulated.
+    ``data_parallel`` is the complete global rank -> ``(dp_rank, dp_size)``
+    layout, or None when unknown.
     """
     if sorted(entries) != list(range(world_size)):
         raise ValueError(
-            f"per-rank envelope needs one payload per rank 0..{world_size - 1}, "
-            f"got ranks {sorted(entries)}"
+            f"per-rank envelope needs one payload per rank 0..{world_size - 1} "
+            f"(world_size={world_size}), got ranks {sorted(entries)}. Every rank must "
+            f"reach save() and the gather must return each one's payload; a caller "
+            f"driving a manager as another rank must give it that rank's world size "
+            f"and a gather covering the whole world"
         )
     layout = None
     if data_parallel is not None:

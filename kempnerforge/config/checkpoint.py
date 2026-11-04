@@ -71,14 +71,6 @@ class CheckpointConfig:
     export_dtype: Literal["float32", "bfloat16"] = "bfloat16"
     exclude_from_loading: list[str] = field(default_factory=list)
     ignore_freeze_mismatch: bool = False
-    # An auto-resume restores each rank's own dataloader/RNG state, which is
-    # exact only on the topology that saved it. If the world size or the
-    # data-parallel layout changed (or the envelope is unreadable or
-    # incomplete), the resume raises on every rank by default. Setting this
-    # to True discards the saved per-rank loader/RNG state on every rank with
-    # a warning and resumes from model/optimizer/scheduler state only; data
-    # order and random streams restart fresh. Model/optimizer resharding never
-    # needs this flag, and a load_path warm start never checks the topology.
     ignore_rank_state_mismatch: bool = False
 
     def __post_init__(self) -> None:
