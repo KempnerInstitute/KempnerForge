@@ -14,27 +14,36 @@ Two pieces:
 
 ## `ShutdownHandler`
 
-Wired into the training loop at two points:
+Registered in `run_training`, and checked by `_shutdown_if_requested`
+at the end of every step, finite or skipped:
 
 ```python
 # training/entry.py::run_training
 shutdown_handler = ShutdownHandler(timeout_sec=config.train.shutdown_timeout_sec)
 shutdown_handler.register()
 ...
-while step < tc.max_steps:
-    # ... train step, log ...
-    saved_this_step = config.checkpoint.should_save(step)
-    if saved_this_step:
-        ckpt_mgr.save(step=step, ...)
-    if shutdown_handler.should_shutdown():
-        if saved_this_step:
-            ckpt_mgr.wait()
-        else:
-            logger.warning(f"Shutdown requested at step {step} — saving emergency checkpoint")
-            ckpt_mgr.save(step=step, tokens_seen=tokens_seen,
-                          scheduler=scheduler, extra=ckpt_extra)
-        shutdown_handler.finish()
-        break
+# training/loop.py::run_training_loop, on a step skipped for a NaN / Inf loss
+if _shutdown_if_requested(
+    session, step, tokens_seen, saved_this_step=False, nan_skipped=True
+):
+    break
+...
+# training/loop.py::run_training_loop, after a finite step's scheduled save
+if _shutdown_if_requested(session, step, tokens_seen, saved_this_step=saved_this_step):
+    break
+
+# training/loop.py::_shutdown_if_requested
+if not session.shutdown_handler.should_shutdown():
+    return False
+if saved_this_step:
+    ckpt_mgr.wait()
+elif nan_skipped and not params_are_finite(session.model, session.runtime.device):
+    logger.error(...)
+else:
+    ckpt_mgr.save(step=step, tokens_seen=tokens_seen, scheduler=session.scheduler,
+                  dataloader=session.data.dataloader, extra=...)
+session.shutdown_handler.finish()
+return True
 ```
 
 `register()` installs handlers for `SIGTERM` and `SIGUSR1`. `finish()`
