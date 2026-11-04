@@ -37,8 +37,8 @@ mixed_precision = "fp8"
 That's the whole surface. `build_model` picks it up via
 [`TrainConfig.is_fp8`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/config/training.py),
 `build_parallel_model` calls `apply_float8(model)` after TP/EP and
-before AC/FSDP2, and FSDP2 picks bf16 master weights (FP8 is a
-compute dtype only). No per-layer knobs.
+before AC/FSDP2, and the master weights stay bf16, or fp32 with
+`fp32_master_weights = true` (FP8 is a compute dtype only). No per-layer knobs.
 
 ### Reference config
 

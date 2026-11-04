@@ -105,7 +105,7 @@ Training-loop hyperparameters.
 | `seed` | `int` | `42` | torch/numpy/python RNG seed |
 | `data_seed` | `int \| None` | `None` | RNG seed for data and batch order; `None` → falls back to `seed` |
 | `compile_model` | `bool` | `True` | wrap the model with `torch.compile` |
-| `mixed_precision` | `"bf16" \| "fp32" \| "fp8"` | `"bf16"` | master-weight dtype; `"fp8"` uses bf16 masters with fp8 compute; `"fp16"` is rejected (no loss scaling) |
+| `mixed_precision` | `"bf16" \| "fp32" \| "fp8"` | `"bf16"` | compute dtype, and the master-weight dtype unless `fp32_master_weights` is set; `"fp8"` uses bf16 masters with fp8 compute; `"fp16"` is rejected (no loss scaling) |
 | `fp32_master_weights` | `bool` | `False` | keep parameters, gradients and optimizer state in fp32 and compute in `param_dtype` through FSDP2's mixed precision; without an FSDP2 wrap (1 GPU, a pp-only mesh) the forward runs under `torch.autocast` — see [FSDP2 § fp32 master weights](../distributed/fsdp2.md#fp32-master-weights) |
 | `activation_checkpointing` | `"none" \| "full" \| "selective"` | `"none"` | AC policy |
 | `loss_fn` | `str` | `"cross_entropy"` | `loss` registry key (or `"chunked_cross_entropy"`) |
