@@ -71,7 +71,8 @@ the uninterrupted run would have, with two exceptions:
   set at step 0 (0 under the default warmup) for its first update. That
   update still advances the optimizer's moments and step count, so the
   resumed run does not rejoin the uninterrupted one, though its LR
-  follows the schedule from the next step on.
+  follows the schedule from the next step on. Tracked in
+  [#481](https://github.com/KempnerInstitute/KempnerForge/issues/481).
 
 Two edge cases:
 
