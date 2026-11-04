@@ -41,33 +41,22 @@ class SoftmaxTopKRouter(nn.Module):
             weights:        (num_tokens, top_k) — renormalized routing weights.
             expert_indices: (num_tokens, top_k) — selected expert indices.
         """
-        # x: (num_tokens, dim)
-        logits = self.gate(x)  # (num_tokens, num_experts)
-        probs = F.softmax(logits, dim=-1)  # (num_tokens, num_experts)
+        logits = self.gate(x)
+        probs = F.softmax(logits, dim=-1)
 
-        # Select top-k experts per token
         weights, indices = torch.topk(probs, k=self.top_k, dim=-1)
 
-        # Renormalize weights over selected experts
         weights = weights / weights.sum(dim=-1, keepdim=True)
 
-        # Auxiliary load-balancing loss (Switch Transformer style):
-        #   L_aux = num_experts * sum_i(f_i * P_i)
-        # where f_i = fraction of tokens routed to expert i,
-        #       P_i = mean routing probability for expert i.
         num_tokens = x.shape[0]
 
-        # f_i: fraction of tokens assigned to each expert (via one_hot)
-        one_hot = F.one_hot(indices, num_classes=self.num_experts).float()  # (T, K, E)
-        tokens_per_expert = one_hot.sum(dim=(0, 1))  # (E,)
+        one_hot = F.one_hot(indices, num_classes=self.num_experts).float()
+        tokens_per_expert = one_hot.sum(dim=(0, 1))
         f = tokens_per_expert / (num_tokens * self.top_k)
 
-        # P_i: mean routing probability for each expert
-        p = probs.mean(dim=0)  # (E,)
+        p = probs.mean(dim=0)
 
         self.aux_loss = self.num_experts * (f * p).sum()
-        # Router z-loss (ST-MoE): penalizes large router logits. Always computed
-        # (like aux_loss); only added to the training loss when the weight > 0.
         self.z_loss = (torch.logsumexp(logits, dim=-1) ** 2).mean()
         self.expert_counts = tokens_per_expert.detach()
 
@@ -114,13 +103,10 @@ class SigmoidTopKRouter(nn.Module):
         self.sequence_aux_loss_weight = sequence_aux_loss_weight
         self.bias_schedule = bias_schedule
 
-        # Step tracking for adaptive bias schedule (set via set_step)
         self._step: int = 0
         self._max_steps: int = 1
 
-        # Learnable bias added to logits before sigmoid
         self.expert_bias = nn.Parameter(torch.zeros(num_experts))
-        # Running EMA of expert utilization (fraction of tokens per expert)
         self.register_buffer("expert_ema", torch.ones(num_experts) / num_experts)
 
         self.aux_loss = torch.tensor(0.0)
@@ -151,7 +137,7 @@ class SigmoidTopKRouter(nn.Module):
         if self.bias_schedule == "cosine_decay":
             return rate * 0.5 * (1.0 + math.cos(math.pi * progress))
         if self.bias_schedule == "linear_warmup":
-            return rate * min(1.0, progress * 10.0)  # warmup over first 10% of training
+            return rate * min(1.0, progress * 10.0)
         return rate
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -164,49 +150,35 @@ class SigmoidTopKRouter(nn.Module):
             weights:        (num_tokens, top_k) — routing weights (sigmoid scores).
             expert_indices: (num_tokens, top_k) — selected expert indices.
         """
-        logits = self.gate(x)  # (num_tokens, num_experts)
-        # Add bias for load balancing (detached — no gradient through bias adjustment)
+        logits = self.gate(x)
         scores = torch.sigmoid(logits + self.expert_bias)
 
-        # Select top-k experts per token
         weights, indices = torch.topk(scores, k=self.top_k, dim=-1)
 
-        # Normalize weights to sum to 1 per token (like DeepSeek-V3)
         weights = weights / weights.sum(dim=-1, keepdim=True)
 
-        # Track expert utilization
         num_tokens = x.shape[0]
-        one_hot = F.one_hot(indices, num_classes=self.num_experts).float()  # (T, K, E)
-        tokens_per_expert = one_hot.sum(dim=(0, 1))  # (E,)
+        one_hot = F.one_hot(indices, num_classes=self.num_experts).float()
+        tokens_per_expert = one_hot.sum(dim=(0, 1))
         self.expert_counts = tokens_per_expert.detach()
 
-        # Update EMA and adjust bias (training only, no gradient)
         if self.training:
             utilization = tokens_per_expert / (num_tokens * self.top_k + 1e-8)
-            # Cast to match buffer dtype (FSDP2 mixed precision may cast buffers to bf16)
             self.expert_ema.lerp_(utilization.to(self.expert_ema.dtype), 1.0 - self.ema_decay)  # type: ignore[reportCallIssue, reportArgumentType]
 
-            # Bias adjustment: push under-utilized experts up, over-utilized down
             effective_rate = self._effective_bias_rate()
             target = 1.0 / self.num_experts
             with torch.no_grad():
                 self.expert_bias.add_(effective_rate * (target - self.expert_ema.float()))  # type: ignore[reportOperatorIssue]
 
-        # Sequence-level auxiliary loss (Switch Transformer style, adapted for sigmoid):
-        #   L = num_experts * sum_i(f_i * P_i)
-        # where f_i = fraction of tokens routed to expert i (no gradient — hard assignment),
-        #       P_i = mean routing score for expert i (differentiable through sigmoid gate).
-        # Gradient flows through P_i, pushing the gate to lower scores for overloaded experts.
         if self.sequence_aux_loss_weight > 0:
             f = tokens_per_expert.detach() / (num_tokens * self.top_k + 1e-8)
-            p = scores.mean(dim=0)  # (num_experts,) — differentiable
+            p = scores.mean(dim=0)
             balance_loss = self.num_experts * (f * p).sum()
             self.aux_loss = self.sequence_aux_loss_weight * balance_loss
         else:
             self.aux_loss = torch.tensor(0.0, device=x.device)
 
-        # Router z-loss (ST-MoE): penalizes large router logits. Always computed
-        # (like aux_loss); only added to the training loss when the weight > 0.
         self.z_loss = (torch.logsumexp(logits, dim=-1) ** 2).mean()
 
         return weights, indices

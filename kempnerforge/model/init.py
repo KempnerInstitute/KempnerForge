@@ -46,26 +46,17 @@ def init_weights(model: nn.Module, config: ModelConfig) -> None:
         if param.is_meta:
             continue
         if param.dim() < 2:
-            # Bias and norm parameters: leave at default (zeros / ones)
             continue
 
-        # Cross-attention block residuals get zero-init so the block is
-        # identity at construction; downstream training learns a
-        # non-zero contribution from there.
         if name.startswith("cross_attention_layers.") and name.endswith(
             ("o_proj.weight", "down_proj.weight")
         ):
             nn.init.zeros_(param)
-        # Residual projections elsewhere get scaled init to prevent signal growth
         elif name.endswith(("o_proj.weight", "down_proj.weight")):
             nn.init.normal_(param, mean=0.0, std=std * residual_scale)
         else:
             nn.init.normal_(param, mean=0.0, std=std)
 
-    # MoT-specific zero-init for identity-at-construction residual.
-    # These FQNs do not match endswith("o_proj.weight") (per-modality
-    # ModuleDict nesting puts {modality} after o_proj), so they are
-    # handled by a second pass over modules.
     for module in model.modules():
         if isinstance(module, MoTAttention):
             for m in module.modalities:

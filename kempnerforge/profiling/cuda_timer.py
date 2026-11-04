@@ -111,5 +111,5 @@ class CUDATimerCollection:
             if timer._recorded:
                 result[name] = timer.elapsed_ms()
             else:
-                result[name] = 0.0  # Never completed or still running
+                result[name] = 0.0
         return result

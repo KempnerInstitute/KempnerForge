@@ -35,7 +35,6 @@ from kempnerforge.config.schema import ActivationCheckpointing
 from kempnerforge.model.transformer import Transformer, TransformerBlock
 
 if TYPE_CHECKING:
-    # Import-cycle-free: pipeline_parallel does not import this module.
     from kempnerforge.distributed.pipeline_parallel import PipelineStageModule
 
 logger = logging.getLogger(__name__)
@@ -61,7 +60,6 @@ def get_dp_mesh(device_mesh: DeviceMesh) -> DeviceMesh:
     has_shard = "dp_shard" in dim_names  # type: ignore[reportOperatorIssue]
 
     if has_replicate and has_shard:
-        # 2D HSDP: first dim = replicate, second dim = shard
         return device_mesh["dp_replicate", "dp_shard"]
     elif has_shard:
         return device_mesh["dp_shard"]
@@ -243,9 +241,6 @@ def _fsdp_wrap_transformer_blocks(
             reshard_after_forward=reshard_after_forward,
         )
 
-    # Cross-Attention blocks (Cross-Attention arch only). Empty dict for
-    # non-CA configs, and absent entirely on a PipelineStageModule, which
-    # defines no cross_attention_layers.
     for ca_block in getattr(transformer, "cross_attention_layers", {}).values():
         fully_shard(
             ca_block,
@@ -297,8 +292,6 @@ def apply_fsdp2(
 
     ep_sub_wrapped = _fsdp_wrap_transformer_blocks(model, dp_mesh, policy, reshard_after_forward)
 
-    # Top-level shard covers remaining params (embeddings, final norm, output
-    # head, and layer norms from EP-MoE blocks).
     fully_shard(
         model,
         mesh=dp_mesh,
@@ -336,7 +329,6 @@ def _apply_fsdp_vlm(
     if not has_dp_mesh(device_mesh):
         return
 
-    # Local import to avoid a hard dependency at module load time.
     from kempnerforge.model.vlm import VLMWrapper
 
     assert isinstance(wrapper, VLMWrapper), "_apply_fsdp_vlm expects a VLMWrapper"
@@ -422,7 +414,6 @@ def _build_vlm(
     assert adapter_config is not None, "_build_vlm requires adapter_config to be set"
     tp_enabled = device_mesh is not None and "tp" in device_mesh.mesh_dim_names  # type: ignore[reportOperatorIssue]
 
-    # 1. Vision encoder on CPU (real HF weights).
     encoder_builder = registry.get_vision_encoder(vision_config.type)
     encoder = encoder_builder(
         vision_config.path,
@@ -431,17 +422,11 @@ def _build_vlm(
     )
     in_dim = vision_config.feature_dim or encoder.feature_dim
 
-    # 2. Transformer + Adapter on meta (when TP is active) or CPU.
-    # VLM path always constructs Transformer directly (the registry's
-    # text-only builder takes a single ModelConfig and cannot accept the
-    # extra vlm_config / num_image_tokens kwargs the VLM path needs).
     ctx = torch.device("meta") if tp_enabled else contextlib.nullcontext()
     with ctx:
         adapter = build_adapter(
             adapter_config, in_dim=in_dim, out_dim=model_config.dim, norm_eps=model_config.norm_eps
         )
-        # Pooling adapters reduce the token count; size the transformer's
-        # image-prefix split on the adapter's output, not the raw patch count.
         visual_tokens = frames_per_clip * adapter.output_num_tokens(encoder.num_tokens)
         transformer = Transformer(
             model_config, vlm_config=vlm_config, num_image_tokens=visual_tokens
@@ -450,7 +435,6 @@ def _build_vlm(
     strategy = build_modality_strategy(vlm_config)
     wrapper = VLMWrapper(encoder, adapter, transformer, strategy, frames_per_clip=frames_per_clip)
 
-    # 3. Length cross-check now that num_tokens is resolved.
     required = wrapper.num_image_tokens + vlm_config.max_text_len
     if model_config.max_seq_len < required:
         raise ValueError(
@@ -459,7 +443,6 @@ def _build_vlm(
             f"({vlm_config.max_text_len}) = {required}"
         )
 
-    # 4. TP / EP / Float8 / AC on the transformer only.
     if tp_enabled:
         apply_tensor_parallel(transformer, device_mesh)  # type: ignore[reportArgumentType]
     apply_expert_parallel(transformer, device_mesh)
@@ -467,29 +450,22 @@ def _build_vlm(
         apply_float8(transformer)
     apply_ac(transformer, ac_mode)
 
-    # 5. FSDP2 (before materialization when meta-device path is used).
     encoder_frozen = _is_encoder_frozen(vlm_config.freeze)
     if device_mesh is not None:
         _apply_fsdp_vlm(wrapper, device_mesh, mp_policy, encoder_frozen=encoder_frozen)
 
-    # 6. Materialize and move to device.
     if tp_enabled:
         transformer.to_empty(device=device)
         transformer.init_weights_and_freqs()
         adapter.to_empty(device=device)
-        # Adapter contract (model/adapter.py): every registered adapter
-        # exposes reset_parameters() so meta-device builds can re-init the
-        # weights after to_empty. nn.Module itself does not declare the
-        # method, so pyright sees an unknown attr; suppress the report.
         adapter.reset_parameters()  # type: ignore[reportCallIssue,reportAttributeAccessIssue]
     else:
         transformer.to(device=device)
         adapter.to(device=device)
-    encoder.to(device)  # Keep HF dtype per D16.
+    encoder.to(device)
     transformer.to(dtype=param_dtype)
     adapter.to(dtype=param_dtype)
 
-    # 7. Freeze specs + eval() for fully frozen encoder.
     apply_freeze_specs(wrapper, vlm_config.freeze, vlm_config.module_patterns)
     if encoder_frozen:
         encoder.eval()
@@ -576,8 +552,6 @@ def build_parallel_model(
     from kempnerforge.distributed.expert_parallel import apply_expert_parallel
 
     if tp_enabled:
-        # Meta-device init: create model with zero memory, apply parallelisms,
-        # then materialize only the local shards on GPU.
         with torch.device("meta"):
             model = model_builder(model_config)
         apply_tensor_parallel(model, device_mesh)  # type: ignore[reportArgumentType]

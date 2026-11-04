@@ -16,9 +16,6 @@ import torch.distributed as dist
 
 logger = logging.getLogger(__name__)
 
-# Per-operation timeout for the PP eval loss broadcast. Shorter than the
-# 1800s process-group default so a diverged PP stage surfaces fast rather
-# than freezing eval for half an hour.
 _EVAL_BROADCAST_TIMEOUT_SEC = 300.0
 
 
@@ -72,7 +69,6 @@ def run_eval(
     model.eval()
 
     if pp_schedule is not None:
-        # --- PP eval path ---
         input_ids_list, labels_list = [], []
         eval_iter = iter(eval_dataloader)
         for _ in range(eval_steps):
@@ -128,7 +124,6 @@ def run_eval(
             else:
                 avg_loss = loss_tensor[0].item()
     else:
-        # --- Standard eval path ---
         total_loss = 0.0
         eval_iter = iter(eval_dataloader)
         for _ in range(eval_steps):

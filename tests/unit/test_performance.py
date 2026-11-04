@@ -26,11 +26,6 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SMALL_CONFIG = ModelConfig(dim=256, n_layers=4, n_heads=4, vocab_size=1000, max_seq_len=128)
 
 
-# ---------------------------------------------------------------------------
-# MFU
-# ---------------------------------------------------------------------------
-
-
 class TestMFU:
     def test_flops_per_token_positive(self):
         flops = estimate_model_flops_per_token(SMALL_CONFIG)
@@ -42,7 +37,6 @@ class TestMFU:
         assert estimate_model_flops_per_token(large) > estimate_model_flops_per_token(small)
 
     def test_compute_mfu_basic(self):
-        # 1M tokens/sec on a single GPU with 312 TFLOPS peak
         mfu = compute_mfu(SMALL_CONFIG, tokens_per_sec=1e6, num_gpus=1, gpu_peak_tflops=312.0)
         assert 0.0 < mfu < 1.0
 
@@ -53,7 +47,6 @@ class TestMFU:
     def test_compute_mfu_scales_with_gpus(self):
         mfu_1 = compute_mfu(SMALL_CONFIG, tokens_per_sec=1e6, num_gpus=1, gpu_peak_tflops=312.0)
         mfu_4 = compute_mfu(SMALL_CONFIG, tokens_per_sec=1e6, num_gpus=4, gpu_peak_tflops=312.0)
-        # Same throughput on 4 GPUs → lower MFU (more peak capacity)
         assert mfu_4 < mfu_1
 
     def test_gpu_peak_tflops_detected(self):
@@ -70,21 +63,17 @@ class TestMFU:
             max_seq_len=2048,
         )
         flops = estimate_model_flops_per_token(config)
-        # Llama 7B: ~41e9 FLOPS/token (6*7B + attention term)
         assert 30e9 < flops < 60e9
 
     def test_moe_uses_active_params_not_total(self):
         """MoE MFU counts only top_k experts per token, not all experts."""
         base = dict(dim=256, n_layers=4, n_heads=4, vocab_size=1000, max_seq_len=128)
         dense = ModelConfig(**base)
-        # 8 experts, top_k=2 → 2 active experts per token
         moe = ModelConfig(**base, num_experts=8, moe_top_k=2)
 
         dense_flops = estimate_model_flops_per_token(dense)
         moe_flops = estimate_model_flops_per_token(moe)
 
-        # MoE with top_k=2 should have ~2x the MLP flops of dense (2 experts active),
-        # NOT 8x (all experts). So MoE flops should be more than dense but less than 4x.
         assert moe_flops > dense_flops, "MoE should have more flops than dense (extra experts)"
         assert moe_flops < 4 * dense_flops, "MoE flops too high — counting all experts, not active"
 
@@ -206,11 +195,6 @@ class TestMFUMoEExperts:
         )
 
 
-# ---------------------------------------------------------------------------
-# Decoupled head_dim
-# ---------------------------------------------------------------------------
-
-
 class TestMFUDecoupledHeadDim:
     """The attention term scales with the attention width ``n_heads * head_dim``,
     which equals ``dim`` only while the head width is inferred."""
@@ -233,7 +217,6 @@ class TestMFUDecoupledHeadDim:
         )
 
     def test_attention_term_follows_the_decoupled_width(self):
-        # 4 heads * 32 = a 128-wide attention over a 64-wide residual.
         assert self._attention_term(32, 32, 64) == 12 * 2 * (4 * 32) * (64 - 32)
 
     def test_attention_term_is_unchanged_when_inferred(self):
@@ -261,11 +244,6 @@ class TestMFUDecoupledHeadDim:
         assert flops(64) - flops(32) == 12 * 2 * (4 * 32) * (64 - 32)
 
 
-# ---------------------------------------------------------------------------
-# Memory tracking
-# ---------------------------------------------------------------------------
-
-
 class TestMemory:
     def test_get_memory_stats_keys(self):
         stats = get_memory_stats()
@@ -285,17 +263,11 @@ class TestMemory:
     def test_memory_after_allocation(self):
         if not torch.cuda.is_available():
             return
-        # Allocate a tensor and check memory increased
         before = get_memory_stats()
         x = torch.randn(1024, 1024, device="cuda")
         after = get_memory_stats()
         assert after["allocated_gb"] >= before["allocated_gb"]
         del x
-
-
-# ---------------------------------------------------------------------------
-# Profiler
-# ---------------------------------------------------------------------------
 
 
 class TestProfiler:
@@ -320,7 +292,6 @@ class TestProfiler:
 
         timer = CUDATimer()
         timer.start()
-        # Do some GPU work
         x = torch.randn(1000, 1000, device="cuda")
         _ = x @ x
         timer.stop()
@@ -333,11 +304,10 @@ class TestProfiler:
 
         from kempnerforge.profiling.profiler import _analyze_profiler
 
-        # Create mock profiler events
         matmul_evt = MagicMock()
         matmul_evt.key = "aten::mm"
-        matmul_evt.self_device_time_total = 5000  # 5000 us
-        matmul_evt.flops = int(1e12)  # 1 TFLOP
+        matmul_evt.self_device_time_total = 5000
+        matmul_evt.flops = int(1e12)
 
         nccl_evt = MagicMock()
         nccl_evt.key = "nccl:allreduce"
@@ -361,7 +331,6 @@ class TestProfiler:
         assert stats["total_flops"] == int(1e12)
         assert "achieved_tflops" in stats
         assert "peak_tflops" in stats
-        # Matmul should be 5000/8000 = 62.5%
         assert abs(stats["matmul_pct"] - 62.5) < 0.1
 
     def test_save_profiler_summary_creates_file(self, tmp_path):
@@ -432,11 +401,6 @@ class TestProfiler:
         assert report["forward"] > 0
         assert "backward" in report
         assert "comm" in report
-
-
-# ---------------------------------------------------------------------------
-# torch.compile correctness
-# ---------------------------------------------------------------------------
 
 
 class TestCompile:

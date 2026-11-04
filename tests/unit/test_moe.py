@@ -32,10 +32,8 @@ class TestMoEMLP:
         out = moe(x)
         loss = out.sum()
         loss.backward()
-        # Router gradients
         assert moe.router.gate.weight.grad is not None
         assert moe.router.gate.weight.grad.abs().sum() > 0
-        # Expert gradients (at least some experts should have grads)
         expert_grads = [
             any(p.grad is not None and p.grad.abs().sum() > 0 for p in e.parameters())
             for e in moe.experts
@@ -76,13 +74,12 @@ class TestMoEMLP:
         moe(x)
         num_tokens = 2 * 16
         assert moe.expert_counts.shape == (8,)
-        assert moe.expert_counts.sum().item() == num_tokens * 2  # top_k=2
+        assert moe.expert_counts.sum().item() == num_tokens * 2
 
     def test_all_experts_independent(self):
         router = SoftmaxTopKRouter(dim=64, num_experts=4, top_k=2)
         experts = torch.nn.ModuleList([SwiGLUMLP(64, 128) for _ in range(4)])
         moe = MoEMLP(router, experts)
-        # Each expert should have its own parameters (not shared references)
         for i in range(4):
             for j in range(i + 1, 4):
                 params = zip(moe.experts[i].parameters(), moe.experts[j].parameters(), strict=True)
@@ -98,7 +95,6 @@ class TestMoEMLP:
         moe = build_moe(dim=64, hidden_dim=128, num_experts=4, top_k=2, activation="gelu")
         for expert in moe.experts:
             assert isinstance(expert, StandardMLP)
-        # Forward still works
         x = torch.randn(2, 16, 64)
         out = moe(x)
         assert out.shape == (2, 16, 64)
@@ -116,12 +112,9 @@ class TestMoEMLP:
         torch.manual_seed(42)
         dim, hidden_dim = 64, 128
 
-        # Build dense MLP
         dense = build_mlp(dim, hidden_dim, "silu")
 
-        # Build MoE with 1 expert, copy weights from dense
         moe = build_moe(dim=dim, hidden_dim=hidden_dim, num_experts=1, top_k=1)
-        # Copy dense weights into the single expert
         moe.experts[0].load_state_dict(dense.state_dict())
 
         x = torch.randn(2, 16, dim)
@@ -129,13 +122,8 @@ class TestMoEMLP:
             dense_out = dense(x)
             moe_out = moe(x)
 
-        # top_k=1, 1 expert → weight is always 1.0 after renormalization
         assert torch.allclose(dense_out, moe_out, atol=1e-5)
 
-
-# ---------------------------------------------------------------------------
-# TransformerBlock + Transformer integration
-# ---------------------------------------------------------------------------
 
 _SMALL = dict(dim=128, n_layers=4, n_heads=4, vocab_size=1000, max_seq_len=64)
 
@@ -159,9 +147,9 @@ class TestMoETransformer:
         model = Transformer(config)
         for name, layer in model.layers.items():
             idx = int(name)
-            if (idx + 1) % 2 == 0:  # layers 1, 3
+            if (idx + 1) % 2 == 0:
                 assert isinstance(layer.mlp, MoEMLP), f"layer {idx} should be MoE"
-            else:  # layers 0, 2
+            else:
                 assert isinstance(layer.mlp, SwiGLUMLP), f"layer {idx} should be dense"
 
     def test_moe_forward_shape(self):
@@ -221,10 +209,10 @@ class TestMoETransformer:
         with torch.no_grad():
             model(tokens)
         counts = model.get_expert_counts()
-        assert len(counts) == 4  # all 4 layers are MoE (frequency=1)
+        assert len(counts) == 4
         for _layer_idx, c in counts.items():
             assert c.shape == (4,)
-            assert c.sum().item() == 2 * 32 * 2  # batch * seq * top_k
+            assert c.sum().item() == 2 * 32 * 2
 
     def test_get_expert_counts_dense_returns_empty(self):
         config = ModelConfig(**_SMALL)
@@ -241,7 +229,6 @@ class TestMoETransformer:
         logits = model(tokens)
         loss = logits.sum()
         loss.backward()
-        # All parameters should have gradients
         for name, p in model.named_parameters():
             assert p.grad is not None, f"{name} has no gradient"
 
@@ -260,9 +247,9 @@ class TestMoETransformer:
         f = config.computed_ffn_hidden_dim
         model = Transformer(config)
         for _name, layer in model.layers.items():
-            if isinstance(layer.mlp, MoEMLP):  # layers 1, 3
+            if isinstance(layer.mlp, MoEMLP):
                 assert layer.mlp.experts[0].gate_proj.weight.shape[0] == f // 2
-            else:  # dense layers 0, 2
+            else:
                 assert layer.mlp.gate_proj.weight.shape[0] == f
 
     def test_finegrained_param_count_matches(self):
@@ -271,11 +258,6 @@ class TestMoETransformer:
         model = Transformer(config)
         actual = sum(p.numel() for p in model.parameters())
         assert actual == config.num_params_estimate
-
-
-# ---------------------------------------------------------------------------
-# SigmoidTopKRouter (DeepSeek-V3 style)
-# ---------------------------------------------------------------------------
 
 
 class TestSigmoidTopKRouter:
@@ -314,7 +296,7 @@ class TestSigmoidTopKRouter:
         x = torch.randn(32, 64)
         router(x)
         assert router.expert_counts.shape == (8,)
-        assert router.expert_counts.sum().item() == 32 * 2  # num_tokens * top_k
+        assert router.expert_counts.sum().item() == 32 * 2
 
     def test_ema_updates_in_training(self):
         router = SigmoidTopKRouter(dim=64, num_experts=4, top_k=2)
@@ -322,7 +304,6 @@ class TestSigmoidTopKRouter:
         initial_ema = router.expert_ema.clone()
         x = torch.randn(128, 64)
         router(x)
-        # EMA should shift from uniform initialization
         assert not torch.allclose(router.expert_ema, initial_ema)
 
     def test_ema_frozen_in_eval(self):
@@ -338,11 +319,9 @@ class TestSigmoidTopKRouter:
         router = SigmoidTopKRouter(dim=64, num_experts=4, top_k=2, bias_update_rate=0.01)
         router.train()
         initial_bias = router.expert_bias.data.clone()
-        # Run several forward passes to accumulate bias adjustments
         for _ in range(50):
             x = torch.randn(64, 64)
             router(x)
-        # Bias should have changed from zero initialization
         assert not torch.allclose(router.expert_bias.data, initial_bias)
 
     def test_backward_through_gate(self):
@@ -404,18 +383,12 @@ class TestSigmoidMoEIntegration:
             assert out.shape == (2, 32, 1000), f"Failed for router={router}"
 
 
-# ---------------------------------------------------------------------------
-# Shared Experts
-# ---------------------------------------------------------------------------
-
-
 class TestSharedExperts:
     def test_shared_expert_output_additive(self):
         """Shared expert output is added to routed expert output."""
         torch.manual_seed(42)
         moe_no_shared = build_moe(dim=64, hidden_dim=128, num_experts=4, top_k=2)
         moe_shared = build_moe(dim=64, hidden_dim=128, num_experts=4, top_k=2, shared_experts=1)
-        # Copy router and expert weights so only difference is shared expert
         moe_shared.router.load_state_dict(moe_no_shared.router.state_dict())
         for i in range(4):
             moe_shared.experts[i].load_state_dict(moe_no_shared.experts[i].state_dict())
@@ -423,7 +396,6 @@ class TestSharedExperts:
         with torch.no_grad():
             out_no_shared = moe_no_shared(x)
             out_shared = moe_shared(x)
-        # Shared expert adds something — outputs should differ
         assert not torch.allclose(out_no_shared, out_shared, atol=1e-6)
 
     def test_shared_expert_processes_all_tokens(self):
@@ -437,7 +409,6 @@ class TestSharedExperts:
         x = torch.randn(2, 16, 64)
         out = moe(x)
         out.sum().backward()
-        # Shared expert should have gradients
         for p in moe.shared_expert.parameters():
             assert p.grad is not None
             assert p.grad.abs().sum() > 0
@@ -445,7 +416,6 @@ class TestSharedExperts:
     def test_shared_expert_config(self):
         config = ModelConfig(**_SMALL, num_experts=4, moe_top_k=2, moe_shared_experts=1)
         model = Transformer(config).to(DEVICE)
-        # Check first MoE layer has a shared expert
         layer = model.layers["0"]
         assert isinstance(layer.mlp, MoEMLP)
         assert layer.mlp.shared_expert is not None
@@ -475,7 +445,6 @@ class TestSharedExperts:
         with torch.no_grad():
             out = model(tokens)
         assert out.shape == (2, 32, 1000)
-        # Sigmoid router → aux_loss is 0
         assert model.get_moe_aux_loss().item() == 0.0
 
     @pytest.mark.parametrize("n", [2, 3])
@@ -552,7 +521,7 @@ class TestEPConfig:
 
     def test_ep_in_world_size_product(self):
         config = DistributedConfig(ep=2, tp=2, dp_shard=2)
-        config.validate_world_size(8)  # 1 * 2 * 2 * 1 * 1 * 2 = 8
+        config.validate_world_size(8)
 
     def test_ep_world_size_mismatch(self):
         config = DistributedConfig(ep=2, tp=2)
@@ -611,7 +580,7 @@ class TestEPConfig:
             train=TrainConfig(seq_len=32),
             distributed=DistributedConfig(ep=2),
         )
-        config.validate(world_size=2)  # should not raise
+        config.validate(world_size=2)
 
     def test_ep_invalid_value(self):
         with pytest.raises(ValueError, match="ep must be >= 1"):
@@ -633,15 +602,12 @@ class TestGroupedGEMM:
         experts = torch.nn.ModuleList([SwiGLUMLP(dim, hidden) for _ in range(num_experts)])
         experts.eval()
 
-        # 20 tokens sorted by expert: 5, 7, 3, 5 per expert
         tokens_per_expert = [5, 7, 3, 5]
         total = sum(tokens_per_expert)
         x_sorted = torch.randn(total, dim)
 
-        # Grouped path
         grouped_out = grouped_expert_forward(x_sorted, tokens_per_expert, experts)
 
-        # Loop path
         loop_out = torch.zeros_like(x_sorted)
         offset = 0
         for i, count in enumerate(tokens_per_expert):
@@ -709,7 +675,6 @@ class TestGroupedGEMM:
 
         dim, hidden = 32, 64
         experts = torch.nn.ModuleList([SwiGLUMLP(dim, hidden) for _ in range(3)])
-        # Expert 1 gets 0 tokens
         tokens_per_expert = [4, 0, 6]
         x = torch.randn(10, dim)
 
@@ -729,7 +694,6 @@ class TestGroupedGEMM:
         out = moe(x)
         assert out.shape == (2, 16, 64)
 
-        # Backward should work
         out.sum().backward()
         for p in moe.parameters():
             assert p.grad is not None
@@ -847,14 +811,11 @@ class TestCapacityFactor:
 
         torch.manual_seed(0)
         num_tokens, top_k, num_experts = 100, 2, 4
-        # All tokens go to expert 0 → way over capacity
         indices = torch.zeros(num_tokens, top_k, dtype=torch.long)
         weights = torch.ones(num_tokens, top_k) / top_k
 
-        # capacity = ceil(100*2/4 * 1.0) = 50
         new_weights, new_indices = _apply_capacity(weights, indices, num_experts, 1.0)
 
-        # Expert 0 should have at most 50 tokens per slot
         for k in range(top_k):
             active = (new_weights[:, k] > 0).sum().item()
             assert active <= 50
@@ -915,11 +876,6 @@ class TestEPAttributes:
         assert moe.num_local_experts == 4
 
 
-# ---------------------------------------------------------------------------
-# Gradient scaling
-# ---------------------------------------------------------------------------
-
-
 class TestGradientScaling:
     def test_gradient_scale_disabled_by_default(self):
         moe = build_moe(dim=64, hidden_dim=128, num_experts=4, top_k=2)
@@ -944,9 +900,7 @@ class TestGradientScaling:
         x = torch.randn(2, 16, 64)
         out = moe(x)
         out.sum().backward()
-        # Router should have gradients
         assert moe.router.gate.weight.grad is not None
-        # At least some experts should have gradients
         expert_grads = [
             any(p.grad is not None and p.grad.abs().sum() > 0 for p in e.parameters())
             for e in moe.experts
@@ -970,7 +924,6 @@ class TestGradientScaling:
             top_k=2,
             gradient_scale=True,
         )
-        # Copy weights
         moe_scaled.load_state_dict(moe_no_scale.state_dict())
         moe_no_scale.train()
         moe_scaled.train()
@@ -979,12 +932,7 @@ class TestGradientScaling:
         with torch.no_grad():
             out_no_scale = moe_no_scale(x)
             out_scaled = moe_scaled(x)
-        # Outputs should differ when expert loads are imbalanced
-        # (with identical weights, routing is deterministic → same experts selected,
-        # but scaling changes magnitudes)
-        # Note: if routing happens to be perfectly balanced, outputs could be equal,
-        # so we test with enough tokens for imbalance to appear
-        assert not torch.allclose(out_no_scale, out_scaled, atol=1e-6) or True  # soft check
+        assert not torch.allclose(out_no_scale, out_scaled, atol=1e-6) or True
 
     def test_gradient_scale_no_effect_in_eval(self):
         """Gradient scaling only applies during training, not eval."""
@@ -1009,11 +957,6 @@ class TestGradientScaling:
         assert torch.allclose(out_scaled, out_no_scale, atol=1e-6)
 
 
-# ---------------------------------------------------------------------------
-# set_moe_step
-# ---------------------------------------------------------------------------
-
-
 class TestSetMoeStep:
     def test_set_moe_step_propagates(self):
         """set_moe_step propagates step to all sigmoid routers."""
@@ -1028,19 +971,13 @@ class TestSetMoeStep:
         """set_moe_step is a no-op for softmax routers (no set_step method needed)."""
         config = ModelConfig(**_SMALL, num_experts=4, moe_top_k=2, moe_router="softmax_topk")
         model = Transformer(config)
-        # Should not raise
         model.set_moe_step(42, 1000)
 
     def test_set_moe_step_noop_for_dense(self):
         """set_moe_step is a no-op for dense models."""
         config = ModelConfig(**_SMALL)
         model = Transformer(config)
-        model.set_moe_step(42, 1000)  # should not raise
-
-
-# ---------------------------------------------------------------------------
-# MoE config validation (sigmoid router features)
-# ---------------------------------------------------------------------------
+        model.set_moe_step(42, 1000)
 
 
 class TestMoESigmoidConfigValidation:
@@ -1097,10 +1034,8 @@ class TestMoESigmoidConfigValidation:
         tokens = torch.randint(0, 1000, (2, 32), device=DEVICE)
         logits = model(tokens)
         assert logits.shape == (2, 32, 1000)
-        # Aux loss should be positive with sequence_aux_loss_weight > 0
         aux = model.get_moe_aux_loss()
         assert aux.item() > 0.0
-        # Backward
         logits.sum().backward()
         for name, p in model.named_parameters():
             assert p.grad is not None, f"{name} has no gradient"
@@ -1138,8 +1073,6 @@ class TestPackedExperts:
         assert isinstance(moe.up_w, torch.nn.Parameter)
         assert isinstance(moe.down_w, torch.nn.Parameter)
         assert isinstance(moe.gate_w, torch.nn.Parameter)
-        # Packed mode drops the per-expert ModuleList — packed tensors are the
-        # sole source of truth.
         assert not hasattr(moe, "experts")
 
     def test_packed_standard_storage_no_gate(self):
@@ -1163,8 +1096,6 @@ class TestPackedExperts:
         dim, hidden, E = 64, 128, 4
         router = SoftmaxTopKRouter(dim=dim, num_experts=E, top_k=2)
         experts = torch.nn.ModuleList([SwiGLUMLP(dim, hidden) for _ in range(E)])
-        # Snapshot expected packed weights BEFORE handing to MoEMLP (which drops
-        # the ModuleList in packed mode).
         expected_up = torch.stack([e.up_proj.weight.t().contiguous() for e in experts])
         expected_down = torch.stack([e.down_proj.weight.t().contiguous() for e in experts])
         expected_gate = torch.stack([e.gate_proj.weight.t().contiguous() for e in experts])
@@ -1183,8 +1114,6 @@ class TestPackedExperts:
             activation="silu",
             packed_experts=True,
         )
-        # SwiGLU: outer activation handled by silu(gate) * up — the captured
-        # function is silu so the packed forward path can apply it directly.
         x = torch.randn(8, 128)
         torch.testing.assert_close(moe._packed_activation(x), torch.nn.functional.silu(x))
 
@@ -1214,7 +1143,7 @@ class TestPackedExperts:
             assert moe.packed_experts is True
             assert hasattr(moe, "up_w")
             assert hasattr(moe, "down_w")
-            assert hasattr(moe, "gate_w")  # _SMALL uses silu → SwiGLU
+            assert hasattr(moe, "gate_w")
 
     def test_packed_params_registered_on_module(self):
         """Packed tensors are nn.Parameters → discoverable via .parameters()."""
@@ -1230,8 +1159,6 @@ class TestPackedExperts:
         assert id(moe.up_w) in param_ids
         assert id(moe.down_w) in param_ids
         assert id(moe.gate_w) in param_ids
-
-    # ----- Phase 17b: packed forward equivalence -----
 
     def test_grouped_packed_matches_unpacked_swiglu(self):
         """grouped_expert_forward_packed matches grouped_expert_forward for SwiGLU."""
@@ -1379,7 +1306,6 @@ class TestPackedExperts:
         assert "up_w" in names
         assert "down_w" in names
         assert "gate_w" in names
-        # No per-expert Linear params remain.
         assert not any(n.startswith("experts.") for n in names)
 
     def test_transformer_forward_backward_packed(self):
