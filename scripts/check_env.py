@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import argparse
 import configparser
-import io
 import json
 import os
 import shutil
@@ -402,14 +401,13 @@ class _ProfileFile:
 def _read_databricks_config(name: str) -> _ProfileFile:
     """Read the Databricks profile file ``name`` the way the SDK reads it.
 
-    The path is expanded and tested for existence as the SDK does it, so a broken or looping
-    symlink, or a path through a regular file, is a missing file. It is parsed with ConfigParser
-    in the encoding ``ConfigParser.read`` uses, as the SDK parses it, so an indented line
-    continues the value above it rather than opening a section, a repeated ``[DEFAULT]`` merges,
-    and a file the SDK rejects is reported rather than passed. A failure is named by exception
-    class alone, because its text can quote the file, which can hold a token. ``[DEFAULT]`` is a
-    profile only when it carries keys, and the reserved ``[__settings__]`` section is never one.
-    The default profile is stripped before it is resolved, as the SDK strips it.
+    A path ``Path.exists()`` rejects, as the SDK tests it, is reported missing; a broken or
+    looping symlink and a path through a regular file are among them. The file is parsed with
+    ConfigParser in the encoding ``ConfigParser.read`` uses, so continuation lines, a repeated
+    ``[DEFAULT]`` and files the SDK rejects resolve as they do in the SDK. ``[DEFAULT]`` is a
+    profile only when it carries keys, ``[__settings__]`` never is one, and ``default_profile``
+    is stripped before it is resolved. A problem quotes no text from the file: an OS error is
+    named by its description, any other failure by its exception class.
     """
     try:
         path = Path(name).expanduser()
@@ -422,7 +420,7 @@ def _read_databricks_config(name: str) -> _ProfileFile:
         return _ProfileFile(frozenset(), "DEFAULT", True, f"{name} not found", missing=True)
     parser = configparser.ConfigParser()
     try:
-        with path.open(encoding=io.text_encoding(None)) as f:
+        with path.open(encoding="utf-8" if sys.flags.utf8_mode else "locale") as f:
             parser.read_file(f)
     except OSError as e:
         return _ProfileFile(

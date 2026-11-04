@@ -6,6 +6,8 @@ import codecs
 import configparser
 import json
 import locale
+import os
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -328,6 +330,15 @@ class TestCheckMlflow:
             monkeypatch.delenv(name)
         monkeypatch.setenv("HOME", str(tmp_path))
         return tmp_path
+
+    @staticmethod
+    def _no_user_database(monkeypatch):
+        import pwd
+
+        def getpwnam(name):
+            raise KeyError(name)
+
+        monkeypatch.setattr(pwd, "getpwnam", getpwnam)
 
     @staticmethod
     def _read_config():
@@ -720,6 +731,7 @@ class TestCheckMlflow:
         self, monkeypatch
     ):
         """The SDK skips the file before it expands the path, so no expansion error can arise."""
+        self._no_user_database(monkeypatch)
         monkeypatch.setenv("DATABRICKS_CONFIG_FILE", "~no_such_user_for_kf_tests/x.cfg")
         monkeypatch.setenv("DATABRICKS_HOST", "https://x.cloud.databricks.com")
         monkeypatch.setenv("DATABRICKS_TOKEN", "dapi-xxx")
@@ -728,6 +740,7 @@ class TestCheckMlflow:
         assert "DATABRICKS_HOST + token set" in r.message
 
     def test_an_unexpandable_profile_file_is_a_warn_when_it_must_be_read(self, monkeypatch):
+        self._no_user_database(monkeypatch)
         monkeypatch.setenv("DATABRICKS_CONFIG_FILE", "~no_such_user_for_kf_tests/x.cfg")
         monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", "my-profile")
         r = check_env.check_mlflow()
@@ -774,6 +787,31 @@ class TestCheckMlflow:
         assert r.status == check_env.WARN
         assert "malformed (UnicodeDecodeError)" in r.message
         assert "dapi-abc" not in r.message
+
+    def test_reading_the_profile_file_raises_no_encoding_warning(self, home):
+        """Under -X warn_default_encoding with warnings as errors the check still returns."""
+        (home / ".databrickscfg").write_text("[DEFAULT]\nhost = h\n")
+        code = (
+            "import sys; sys.path.insert(0, sys.argv[1]); import check_env; "
+            "print(check_env.check_mlflow().status)"
+        )
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-X",
+                "warn_default_encoding",
+                "-W",
+                "error::EncodingWarning",
+                "-c",
+                code,
+                str(Path(check_env.__file__).parent),
+            ],
+            env={"HOME": str(home), "PATH": os.environ.get("PATH", "")},
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert result.stdout.strip() == "OK", result.stderr[-800:]
 
     def test_the_profile_file_is_the_one_databricks_config_file_names(self, home, monkeypatch):
         alt = home / "alt.cfg"
@@ -1016,7 +1054,7 @@ class TestCheckMlflow:
         assert "dapi-secret" not in r.message
 
     def test_a_continued_default_profile_naming_no_profile_is_not_quoted(self, home):
-        """A continuation line can be a token, so it is named only when it names a profile."""
+        """A continuation line can be a token, so a message never names it."""
         home.joinpath(".databrickscfg").write_text(
             "[__settings__]\ndefault_profile =\n  token = dapi-secret\n[DEFAULT]\nhost = h\n"
         )
