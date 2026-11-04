@@ -76,19 +76,25 @@ class _ChunkedCrossEntropySum(torch.autograd.Function):
         return grad, None, None
 
 
+def _zero_on_graph(logits: torch.Tensor) -> torch.Tensor:
+    """An exact float32 zero that stays on the autograd graph of ``logits``."""
+    return logits[..., :0].sum().float()
+
+
 @registry.register_loss("cross_entropy")
 def cross_entropy_loss(
     logits: torch.Tensor, labels: torch.Tensor, chunk_size: int = _DEFAULT_CHUNK_SIZE
 ) -> torch.Tensor:
     """Mean cross-entropy over tokens not labeled ``-100``, in fp32 one ``chunk_size`` at a time.
 
-    Returns an fp32 ``0.0`` when every label is ``-100``.
+    A batch with every label ``-100`` returns an exact float32 zero that stays on the autograd
+    graph of ``logits``.
     """
     flat_logits = logits.reshape(-1, logits.shape[-1])
     flat_labels = labels.reshape(-1)
     valid_tokens = (flat_labels != -100).sum()
     if valid_tokens == 0:
-        return torch.tensor(0.0, device=logits.device, dtype=torch.float32)
+        return _zero_on_graph(logits)
     total = _ChunkedCrossEntropySum.apply(flat_logits, flat_labels, chunk_size)
     return total / valid_tokens
 

@@ -28,11 +28,6 @@ def model() -> _MiniVLM:
     return _MiniVLM()
 
 
-# ---------------------------------------------------------------------------
-# freeze_params
-# ---------------------------------------------------------------------------
-
-
 class TestFreezeParams:
     def test_freezes_matching(self, model):
         n = freeze_params(model, ["transformer.*"])
@@ -79,11 +74,6 @@ class TestFreezeParams:
             assert p.requires_grad == (not frozen)
 
 
-# ---------------------------------------------------------------------------
-# apply_freeze_specs
-# ---------------------------------------------------------------------------
-
-
 class TestApplyFreezeSpecs:
     def test_alias_resolves_via_pattern_map(self, model):
         totals = apply_freeze_specs(
@@ -122,11 +112,6 @@ class TestApplyFreezeSpecs:
             assert p.requires_grad
 
 
-# ---------------------------------------------------------------------------
-# canonical_freeze_meta
-# ---------------------------------------------------------------------------
-
-
 class TestCanonicalFreezeMeta:
     def test_reorder_invariant(self):
         a = canonical_freeze_meta(
@@ -154,11 +139,6 @@ class TestCanonicalFreezeMeta:
         assert canonical_freeze_meta([]) == []
 
 
-# ---------------------------------------------------------------------------
-# effective_freeze
-# ---------------------------------------------------------------------------
-
-
 class TestEffectiveFreeze:
     def test_empty_schedule_returns_base(self):
         from kempnerforge.training.freeze import effective_freeze
@@ -173,13 +153,10 @@ class TestEffectiveFreeze:
 
         base = [FreezeSpec("vision_encoder", True)]
         stage = FreezeStage(start_step=100, specs=(FreezeSpec("vision_encoder", False),))
-        # Before transition.
         before = effective_freeze(step=99, base=base, schedule=[stage])
         assert before == base
-        # At transition.
         at = effective_freeze(step=100, base=base, schedule=[stage])
         assert at == [FreezeSpec("vision_encoder", False)]
-        # After transition.
         after = effective_freeze(step=200, base=base, schedule=[stage])
         assert after == [FreezeSpec("vision_encoder", False)]
 
@@ -191,12 +168,12 @@ class TestEffectiveFreeze:
         stages = [
             FreezeStage(start_step=10, specs=(FreezeSpec("adapter", False),)),
             FreezeStage(start_step=20, specs=(FreezeSpec("vision_encoder", False),)),
-            FreezeStage(start_step=30, specs=(FreezeSpec("adapter", True),)),  # re-freeze adapter
+            FreezeStage(start_step=30, specs=(FreezeSpec("adapter", True),)),
         ]
         out = effective_freeze(step=100, base=base, schedule=stages)
         out_map = {s.module: s.frozen for s in out}
         assert out_map["vision_encoder"] is False
-        assert out_map["adapter"] is True  # last write wins
+        assert out_map["adapter"] is True
 
     def test_monotonic_order_independent_of_input(self):
         from kempnerforge.config.vlm import FreezeStage
@@ -215,7 +192,7 @@ class TestEffectiveFreeze:
     def test_module_key_validation_rejects_typo_in_base(self):
         from kempnerforge.training.freeze import effective_freeze
 
-        base = [FreezeSpec("vison_encoder", True)]  # typo
+        base = [FreezeSpec("vison_encoder", True)]
         with pytest.raises(ValueError, match="vison_encoder"):
             effective_freeze(
                 step=0,
@@ -231,7 +208,7 @@ class TestEffectiveFreeze:
         base = [FreezeSpec("vision_encoder", True)]
         stage = FreezeStage(
             start_step=10,
-            specs=(FreezeSpec("adaptor", False),),  # typo
+            specs=(FreezeSpec("adaptor", False),),
         )
         with pytest.raises(ValueError, match="adaptor"):
             effective_freeze(

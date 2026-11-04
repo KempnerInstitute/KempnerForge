@@ -40,11 +40,6 @@ from kempnerforge.model.vlm import (
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-# ---------------------------------------------------------------------------
-# VLMWrapper
-# ---------------------------------------------------------------------------
-
-
 def _tiny_configs(
     num_image_tokens: int = 8, feature_dim: int = 96
 ) -> tuple[ModelConfig, VisionEncoderConfig, AdapterConfig, VLMConfig]:
@@ -72,7 +67,6 @@ class TestVLMWrapper:
         input_ids = torch.randint(0, 256, (2, 20), device=DEVICE)
         labels = torch.full((2, 20), -100, dtype=torch.long, device=DEVICE)
         logits, labels_out = wrapper(pixels, input_ids, labels)
-        # output_slice drops the 8 image positions, so logits cover 20 text positions.
         assert logits.shape == (2, 20, 256)
         assert labels_out is labels
 
@@ -90,7 +84,6 @@ class TestVLMWrapper:
         wrapper = _build_tiny_wrapper().to(DEVICE)
         wrapper.adapter.to(torch.bfloat16)
         wrapper.transformer.to(torch.bfloat16)
-        # Leave vision_encoder in fp32 (default)
         pixels = torch.randn(1, 3, 16, 16, device=DEVICE)
         input_ids = torch.randint(0, 256, (1, 8), device=DEVICE)
         logits, _ = wrapper(pixels, input_ids)
@@ -102,7 +95,6 @@ class TestVLMWrapper:
         input_ids = torch.randint(0, 256, (1, 8), device=DEVICE)
         logits, _ = wrapper(pixels, input_ids)
         logits.sum().backward()
-        # Adapter always has grads; transformer params should have grads.
         for p in wrapper.adapter.parameters():
             assert p.grad is not None
         trainable = [p for p in wrapper.transformer.parameters() if p.requires_grad]
@@ -124,11 +116,6 @@ class TestVLMWrapper:
         assert isinstance(wrapper.transformer, Transformer)
 
 
-# ---------------------------------------------------------------------------
-# inner_transformer helper
-# ---------------------------------------------------------------------------
-
-
 class TestInnerTransformer:
     def test_unwraps_vlm_wrapper(self):
         wrapper = _build_tiny_wrapper()
@@ -145,8 +132,6 @@ class TestInnerTransformer:
         method even though VLMWrapper itself does not define it."""
         wrapper = _build_tiny_wrapper()
         inner = inner_transformer(wrapper)
-        # Not an MoE model, but set_moe_step is defined on Transformer; it
-        # should be reachable via the unwrap helper without raising.
         inner.set_moe_step(0, 100)  # type: ignore[attr-defined]
 
     def test_unwraps_torch_compile_around_vlm_wrapper(self):
@@ -182,23 +167,18 @@ class TestBuildVLMWrapperErrors:
         resolved ``num_tokens`` + ``max_text_len`` exceeds ``max_seq_len``.
         Regression guard for the validation gap.
         """
-        # RandomVisionEncoder's default num_tokens is 16 (see vision.py),
-        # so num_tokens=0 -> encoder resolves to 16 at build time.
-        # max_text_len=32 -> JD residual = 16 + 32 = 48. max_seq_len=32 < 48.
         mc = ModelConfig(dim=64, n_layers=2, n_heads=4, vocab_size=256, max_seq_len=32)
-        vc = VisionEncoderConfig(type="random", num_tokens=0)  # sentinel
+        vc = VisionEncoderConfig(type="random", num_tokens=0)
         ac = AdapterConfig()
         lc = VLMConfig(max_text_len=32)
         with pytest.raises(ValueError) as exc_info:
             build_vlm_wrapper(mc, vc, ac, lc)
-        # Error message must name max_seq_len, encoder.num_tokens, and
-        # max_text_len so the user can find the offending knobs.
         msg = str(exc_info.value)
         assert "max_seq_len" in msg
         assert "encoder.num_tokens" in msg
         assert "max_text_len" in msg
-        assert "32" in msg  # max_seq_len value
-        assert "16" in msg  # encoder.num_tokens value
+        assert "32" in msg
+        assert "16" in msg
 
     def test_build_time_check_skipped_for_cross_attention(self):
         """CA does not extend the residual stream — the build-time check
@@ -206,21 +186,13 @@ class TestBuildVLMWrapperErrors:
         as max_seq_len >= max_text_len. Without this carve-out, CA configs
         with num_tokens=0 (sentinel) would incorrectly raise.
         """
-        # max_seq_len=32, max_text_len=32 -> JD would fail (residual would
-        # be 16+32=48), but CA's residual is text-only (0+32=32).
         mc = ModelConfig(dim=64, n_layers=2, n_heads=4, vocab_size=256, max_seq_len=32)
         vc = VisionEncoderConfig(type="random", num_tokens=0)
         ac = AdapterConfig()
         lc = CrossAttentionConfig(max_text_len=32)
         wrapper = build_vlm_wrapper(mc, vc, ac, lc)
         assert isinstance(wrapper, VLMWrapper)
-        # CA's residual is text-only, so wrapper.num_image_tokens is 0.
         assert wrapper.num_image_tokens == 0
-
-
-# ---------------------------------------------------------------------------
-# _is_encoder_frozen
-# ---------------------------------------------------------------------------
 
 
 class TestIsEncoderFrozen:
@@ -245,11 +217,6 @@ class TestIsEncoderFrozen:
     def test_nested_key_counts(self):
         specs = [FreezeSpec("vision_encoder.layers.0", True)]
         assert _is_encoder_frozen(specs) is True
-
-
-# ---------------------------------------------------------------------------
-# ModalityStrategy: registry-based dispatch
-# ---------------------------------------------------------------------------
 
 
 def _ca_configs(
@@ -299,13 +266,11 @@ class TestModalityStrategies:
         input_ids = torch.randint(0, 256, (1, 16))
         ctx = strategy.prepare(wrapper, pixel_values, input_ids)
         assert ctx.prefix_embeds is not None
-        assert ctx.prefix_embeds.shape == (1, 8, 64)  # (B, N, dim)
+        assert ctx.prefix_embeds.shape == (1, 8, 64)
         assert ctx.output_slice == slice(8, None)
-        # CA-specific fields not set
         assert ctx.image_features is None
         assert ctx.image_mask is None
         assert ctx.inputs_embeds is None
-        # MoT-specific field not set
         assert ctx.modality_ids is None
 
     def test_mot_strategy_fills_prefix_slice_and_modality_ids(self):
@@ -321,7 +286,6 @@ class TestModalityStrategies:
         assert ctx.modality_ids is not None
         assert ctx.modality_ids.shape == (1, 8 + 16)
         assert ctx.modality_ids.dtype == torch.long
-        # Position-based: 0 for image positions, 1 for text positions.
         assert (ctx.modality_ids[:, :8] == 0).all()
         assert (ctx.modality_ids[:, 8:] == 1).all()
         assert ctx.inputs_embeds is None
@@ -347,7 +311,6 @@ class TestModalityStrategies:
         assert ctx.image_features is not None
         assert ctx.image_features.shape == (1, 8, 64)
         assert ctx.image_mask is None
-        # JD-specific fields not set
         assert ctx.prefix_embeds is None
         assert ctx.output_slice is None
         assert ctx.inputs_embeds is None
@@ -355,9 +318,7 @@ class TestModalityStrategies:
     def test_strategy_num_image_tokens_arch_specific(self):
         jd_wrapper = _build_tiny_wrapper(num_image_tokens=12)
         ca_wrapper = _build_ca_tiny_wrapper(num_image_tokens=12)
-        # JD: extends the residual stream by num_image_tokens.
         assert jd_wrapper.num_image_tokens == 12
-        # CA: residual stream is text-only, so no extension.
         assert ca_wrapper.num_image_tokens == 0
 
 
@@ -391,7 +352,6 @@ class TestVLMWrapperDispatch:
             def num_image_tokens(self, wrapper):  # noqa: ARG002
                 return 0
 
-        # Make a mock vlm config object with the right arch attribute
         class _Cfg:
             arch = "dispatch_smoke_test_arch"
 
@@ -427,12 +387,9 @@ class TestVLMWrapperDispatch:
         children() / state_dict() / named_parameters().
         """
         wrapper = _build_tiny_wrapper()
-        # Strategy is reachable as a plain attribute.
         assert wrapper.strategy is not None
-        # But not as a submodule.
         assert wrapper.strategy not in list(wrapper.children())
         assert "strategy" not in dict(wrapper.named_modules())
-        # State dict carries no strategy entries.
         for k in wrapper.state_dict():
             assert "strategy" not in k
 
@@ -456,16 +413,7 @@ class TestVLMWrapperDispatch:
         assert logits.shape == (1, 16, 256)
 
 
-# ---------------------------------------------------------------------------
-# Pooling connector (Phase 1): a pooling adapter reduces the visual-token
-# count between the encoder and the LLM. The whole VLM path must use the
-# adapter's output count (not encoder.num_tokens) for the prefix length,
-# output_slice, modality_ids, and MoT's positional split.
-# ---------------------------------------------------------------------------
-
-
 def _build_pooled_jd_wrapper(adapter_type: str = "avgpool", pool_window: int = 2) -> VLMWrapper:
-    # Encoder emits a 4x4 grid (16 tokens); a 2x2 pool -> 4 visual tokens.
     mc = ModelConfig(dim=64, n_layers=2, n_heads=4, vocab_size=256, max_seq_len=64)
     vc = VisionEncoderConfig(type="random", feature_dim=96, num_tokens=16)
     ac = AdapterConfig(type=adapter_type, pool_window=pool_window)
@@ -486,7 +434,6 @@ def _build_pooled_mot_wrapper(pool_window: int = 2) -> VLMWrapper:
 class TestPoolingConnector:
     @pytest.mark.parametrize("adapter_type", ["avgpool", "attentional_pool"])
     def test_num_image_tokens_is_pooled_count(self, adapter_type):
-        # 16 patch tokens, 2x2 pool -> 4 visual tokens.
         wrapper = _build_pooled_jd_wrapper(adapter_type, pool_window=2)
         assert wrapper.num_image_tokens == 4
 
@@ -498,7 +445,7 @@ class TestPoolingConnector:
         input_ids = torch.randint(0, 256, (2, 12))
         ctx = strategy.prepare(wrapper, pixels, input_ids)
         assert ctx.prefix_embeds is not None
-        assert ctx.prefix_embeds.shape == (2, 4, 64)  # pooled prefix, model dim
+        assert ctx.prefix_embeds.shape == (2, 4, 64)
         assert ctx.output_slice == slice(4, None)
 
     @pytest.mark.parametrize("adapter_type", ["avgpool", "attentional_pool"])
@@ -508,7 +455,6 @@ class TestPoolingConnector:
         input_ids = torch.randint(0, 256, (2, 20), device=DEVICE)
         with torch.no_grad():
             logits, _ = wrapper(pixels, input_ids)
-        # output_slice trims the 4 pooled positions -> logits cover text only.
         assert logits.shape == (2, 20, 256)
 
     def test_mot_split_uses_pooled_count(self):
@@ -521,11 +467,9 @@ class TestPoolingConnector:
         input_ids = torch.randint(0, 256, (2, 16), device=DEVICE)
         ctx = strategy.prepare(wrapper, pixels, input_ids)
         assert ctx.modality_ids is not None
-        assert ctx.modality_ids.shape == (2, 4 + 16)  # pooled prefix + text
+        assert ctx.modality_ids.shape == (2, 4 + 16)
         assert (ctx.modality_ids[:, :4] == 0).all()
         assert (ctx.modality_ids[:, 4:] == 1).all()
-        # End-to-end forward exercises the build-time _mot_n_image split,
-        # which must equal the runtime pooled prefix length (4).
         labels = torch.full((2, 16), -100, dtype=torch.long, device=DEVICE)
         logits, _ = wrapper(pixels, input_ids, labels)
         assert logits.shape == (2, 16, 256)
@@ -534,20 +478,10 @@ class TestPoolingConnector:
         """Regression: a non-pooling adapter must leave num_image_tokens ==
         encoder.num_tokens (the image path stays bit-for-bit unchanged)."""
         wrapper = _build_pooled_jd_wrapper("mlp_2layer", pool_window=2)
-        assert wrapper.num_image_tokens == 16  # no pooling -> unchanged
-
-
-# ---------------------------------------------------------------------------
-# Video forward (Phase 3): the wrapper consumes a (B, F, 3, H, W) clip batch.
-# _project_visual_features folds the frame axis through the encoder+pooler to
-# (B, F*P', dim); the static visual-token count (frames_per_clip * per-frame)
-# drives the residual budget + MoT's split and must equal the runtime prefix.
-# ---------------------------------------------------------------------------
+        assert wrapper.num_image_tokens == 16
 
 
 def _video_wrapper(vlm_cfg, frames: int = 4, *, ffn_hidden_dim: int | None = None) -> VLMWrapper:
-    # Encoder: 4x4 patch grid (16 tokens); avgpool 2x2 -> 4 tokens/frame.
-    # frames=4 -> 4*4 = 16 visual tokens in the residual prefix.
     mc_kwargs: dict[str, int] = {
         "dim": 64,
         "n_layers": 2,
@@ -565,7 +499,6 @@ def _video_wrapper(vlm_cfg, frames: int = 4, *, ffn_hidden_dim: int | None = Non
 
 class TestVideoForward:
     def test_num_image_tokens_is_frames_times_per_frame(self):
-        # 4 frames * (16 patches -> 2x2 pool -> 4) = 16 visual tokens.
         wrapper = _video_wrapper(JointDecoderConfig(max_text_len=8), frames=4)
         assert wrapper.num_image_tokens == 16
 
@@ -575,7 +508,7 @@ class TestVideoForward:
             wrapper, torch.randn(2, 4, 3, 16, 16), torch.randint(0, 256, (2, 6))
         )
         assert ctx.prefix_embeds is not None
-        assert ctx.prefix_embeds.shape == (2, 16, 64)  # (B, F*P', dim)
+        assert ctx.prefix_embeds.shape == (2, 16, 64)
         assert ctx.output_slice == slice(16, None)
 
     def test_static_count_matches_runtime_prefix(self):
@@ -604,7 +537,6 @@ class TestVideoForward:
         input_ids = torch.randint(0, 256, (2, 6), device=DEVICE)
         labels = torch.full((2, 6), -100, dtype=torch.long, device=DEVICE)
         logits, _ = wrapper(pixels, input_ids, labels)
-        # output_slice trims the F*P' visual prefix -> logits cover text only.
         assert logits.shape == (2, 6, 256)
 
     def test_video_forward_backward_grads(self):
@@ -620,12 +552,12 @@ class TestVideoForward:
     def test_image_path_unchanged_with_4d(self):
         """frames_per_clip=1 + a 4D image batch still works (image path intact)."""
         wrapper = _video_wrapper(JointDecoderConfig(max_text_len=8), frames=1).to(DEVICE).eval()
-        pixels = torch.randn(2, 3, 16, 16, device=DEVICE)  # 4D single-image batch
+        pixels = torch.randn(2, 3, 16, 16, device=DEVICE)
         input_ids = torch.randint(0, 256, (2, 6), device=DEVICE)
         with torch.no_grad():
             logits, _ = wrapper(pixels, input_ids)
         assert logits.shape == (2, 6, 256)
-        assert wrapper.num_image_tokens == 4  # per-frame pooled count, frames=1
+        assert wrapper.num_image_tokens == 4
 
     def test_video_forward_dtype_mismatch_cast(self):
         """Encoder fp32 + bf16 adapter/transformer: the cast inside the visual
@@ -633,7 +565,6 @@ class TestVideoForward:
         wrapper = _video_wrapper(JointDecoderConfig(max_text_len=8), frames=4).to(DEVICE)
         wrapper.adapter.to(torch.bfloat16)
         wrapper.transformer.to(torch.bfloat16)
-        # vision_encoder (RandomVisionEncoder) stays fp32
         pixels = torch.randn(2, 4, 3, 16, 16, device=DEVICE)
         input_ids = torch.randint(0, 256, (2, 6), device=DEVICE)
         logits, _ = wrapper(pixels, input_ids)
@@ -646,10 +577,8 @@ class TestVideoForward:
         frames_per_clip, so a mismatch is a clear error, not a confusing one."""
         wrapper = _video_wrapper(JointDecoderConfig(max_text_len=8), frames=4).to(DEVICE)
         input_ids = torch.randint(0, 256, (2, 6), device=DEVICE)
-        # 2-frame clip into a 4-frame wrapper.
         with pytest.raises(ValueError, match="frames-per-clip mismatch"):
             wrapper(torch.randn(2, 2, 3, 16, 16, device=DEVICE), input_ids)
-        # 4D single-image batch into a video (frames_per_clip>1) wrapper.
         with pytest.raises(ValueError, match="frames-per-clip mismatch"):
             wrapper(torch.randn(2, 3, 16, 16, device=DEVICE), input_ids)
 
@@ -672,9 +601,6 @@ class TestFramePaddingMask:
             "moma": MoMaConfig(max_text_len=8),
         }
         w = _video_wrapper(cfgs[arch], frames=4, ffn_hidden_dim=ffn).to(DEVICE).eval()
-        # Move off zero-init warm-start gating (e.g. MoT/CA zero-init o_proj) so
-        # the image path actually contributes — otherwise the no-mask control is
-        # vacuous (image gated off at init).
         with torch.no_grad():
             for p in w.parameters():
                 p.add_(0.02 * torch.randn_like(p))
@@ -683,11 +609,10 @@ class TestFramePaddingMask:
     def test_visual_token_mask_expands_per_frame(self):
         from kempnerforge.model.vlm import _visual_token_mask
 
-        fm = torch.tensor([[True, False, True]])  # 3 frames
-        out = _visual_token_mask(fm, num_visual_tokens=6)  # 2 tokens/frame
+        fm = torch.tensor([[True, False, True]])
+        out = _visual_token_mask(fm, num_visual_tokens=6)
         assert out.tolist() == [[True, True, False, False, True, True]]
         assert _visual_token_mask(None, 6) is None
-        # Non-divisible count (e.g. a future non-per-frame token) must fail loudly.
         with pytest.raises(ValueError, match="multiple of num_frames"):
             _visual_token_mask(fm, num_visual_tokens=7)
 
@@ -697,9 +622,9 @@ class TestFramePaddingMask:
         w = self._arch_wrapper(arch)
         ids = torch.randint(0, 256, (1, 6), device=DEVICE)
         pix = torch.randn(1, 4, 3, 16, 16, device=DEVICE)
-        fm = torch.tensor([[True, True, False, False]], device=DEVICE)  # frames 2,3 padded
+        fm = torch.tensor([[True, True, False, False]], device=DEVICE)
         pix2 = pix.clone()
-        pix2[:, 2:] = torch.randn(1, 2, 3, 16, 16, device=DEVICE)  # corrupt the padded frames
+        pix2[:, 2:] = torch.randn(1, 2, 3, 16, 16, device=DEVICE)
         with torch.no_grad():
             masked_a, _ = w(pix, ids, frame_mask=fm)
             masked_b, _ = w(pix2, ids, frame_mask=fm)
@@ -720,8 +645,6 @@ class TestFramePaddingMask:
 
     @pytest.mark.parametrize("arch", ["joint_decoder", "cross_attention", "mot", "moma"])
     def test_undecodable_clip_stays_finite(self, arch):
-        # An undecodable clip has frame_mask all-False; the NaN guard must keep
-        # softmax finite (no NaN poisoning the batch loss).
         torch.manual_seed(0)
         w = self._arch_wrapper(arch)
         ids = torch.randint(0, 256, (2, 6), device=DEVICE)
@@ -731,10 +654,6 @@ class TestFramePaddingMask:
             logits, _ = w(pix, ids, frame_mask=fm)
         assert torch.isfinite(logits).all(), f"{arch}: NaN/inf with an all-padded clip"
 
-
-# ---------------------------------------------------------------------------
-# adapter.pre_norm through build_vlm_wrapper
-# ---------------------------------------------------------------------------
 
 _REGISTERED_NORMS = sorted(registry.list("norm"))
 
@@ -813,11 +732,6 @@ class TestVLMAdapterPreNormCheckpoint:
             dcp.load({"model": get_model_state_dict(target)}, checkpoint_id=str(tmp_path))
 
 
-# ---------------------------------------------------------------------------
-# Decoupled head_dim
-# ---------------------------------------------------------------------------
-
-
 class TestVLMDecoupledHeadDim:
     """``model.head_dim_override`` is only useful if it survives the build path
     the trainer actually uses."""
@@ -840,7 +754,7 @@ class TestVLMDecoupledHeadDim:
         )
 
     def test_decoupled_head_dim_reaches_the_inner_transformer(self):
-        w = self._wrapper(head_dim_override=32)  # 4 * 32 = 128 != dim 64
+        w = self._wrapper(head_dim_override=32)
         sd = w.state_dict()
         assert sd["transformer.layers.0.attention.q_proj.weight"].shape == (128, 64)
         assert sd["transformer.layers.0.attention.o_proj.weight"].shape == (64, 128)

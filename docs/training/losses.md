@@ -20,8 +20,10 @@ labels with `-100` are skipped in the reduction. This is how
 attention — tokens at packing boundaries get label `-100` so the loss
 doesn't cross document edges.
 
-Returns `0.0` (as an fp32 device tensor) when every label is `-100` —
-avoids a NaN from dividing by zero valid tokens.
+When every label is `-100` it returns an exact fp32 zero that stays on
+the autograd graph of the logits, so there is no NaN from dividing by
+zero valid tokens and backward and FSDP's collectives still run on
+that rank.
 
 ### Computed in fp32, one chunk at a time
 
