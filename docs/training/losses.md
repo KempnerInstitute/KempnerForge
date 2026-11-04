@@ -10,11 +10,11 @@ that wraps *either* — not a separate registry entry.
 ```toml
 [train]
 loss_fn = "cross_entropy"
-ce_chunk_size = 4096                    # 0 -> auto 4096
 ```
 
-Mean cross-entropy over flattened `(batch·seq_len, vocab_size)` logits
-and `(batch·seq_len,)` labels. `ignore_index = -100` is hard-coded;
+Cross-entropy over flattened `(batch·seq_len, vocab_size)` logits and
+`(batch·seq_len,)` labels, computed in fp32 even when the logits are
+bf16 (fp64 logits stay fp64). `ignore_index = -100` is hard-coded;
 labels with `-100` are skipped in the reduction. This is how
 [document-packed sequences](../data/index.md) mask out cross-document
 attention — tokens at packing boundaries get label `-100` so the loss
@@ -25,18 +25,22 @@ the autograd graph of the logits, so there is no NaN from dividing by
 zero valid tokens and backward and FSDP's collectives still run on
 that rank.
 
-### Computed in fp32, one chunk at a time
+## `chunked_cross_entropy`
 
-Under `mixed_precision = "bf16"` the output head returns bf16 logits.
-`F.cross_entropy` on them would compute the log-softmax and its gradient
-in bf16; stacks that run the forward pass under `torch.autocast`
-compute cross-entropy in fp32 instead. Casting the whole logit tensor
-up front would allocate a full fp32 copy — 8.4 GB for `batch=4`,
-`seq=4096`, `vocab=128256` — and autograd would also keep fp32
+```toml
+[train]
+loss_fn = "chunked_cross_entropy"
+ce_chunk_size = 4096                    # 0 -> auto 4096
+```
+
+The same loss as `cross_entropy`, computed `ce_chunk_size` tokens at a
+time along the flattened token dimension, so no fp32 copy of the full
+logits is ever allocated. Use it when the logit tensor is large enough
+for that to matter: an fp32 copy for `batch=4`, `seq=4096`,
+`vocab=128256` is 8.4 GB, and autograd would keep fp32
 log-probabilities of the same size for the backward pass.
 
-The loss is instead a custom autograd function that works on
-`ce_chunk_size` tokens at a time, in fp32 (fp64 logits stay fp64):
+It is a custom autograd function:
 
 - **Forward**: takes each chunk's log-sum-exp and target logit in fp32
   and keeps only the per-token log-sum-exp (one fp32 value per token).
@@ -58,26 +62,15 @@ logits of 3.9 GiB), loss forward and backward:
 
 | | time | memory beyond the logits | loss error vs fp64 |
 |---|---|---|---|
-| `F.cross_entropy` on bf16 logits (before) | 12.4 ms | 11.7 GiB | 2.1e-3 |
+| `F.cross_entropy` on bf16 logits | 12.4 ms | 11.7 GiB | 2.1e-3 |
 | `F.cross_entropy(logits.float())` | 35.4 ms | 23.5 GiB | 4.3e-8 |
-| `cross_entropy`, `ce_chunk_size = 4096` | 8.8 ms | 4.9 GiB | 7.5e-8 |
+| `chunked_cross_entropy`, `ce_chunk_size = 4096` | 8.8 ms | 4.9 GiB | 7.5e-8 |
 
 The first call on each new chunk shape compiles for a few seconds.
 
 `ce_chunk_size = 0` in the config is a sentinel for "use the default
 4096" — see
 [`build_loss_fn`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/training/loss.py).
-
-## `chunked_cross_entropy`
-
-```toml
-[train]
-loss_fn = "chunked_cross_entropy"
-ce_chunk_size = 4096                    # 0 -> auto 4096
-```
-
-An alias of `cross_entropy`, kept so configs that name it still load.
-Both compute the same fp32 chunked loss and read `ce_chunk_size`.
 
 ## z-loss (logit magnitude regularizer)
 

@@ -16,7 +16,6 @@ import torch
 from kempnerforge.config.registry import registry
 
 _DEFAULT_CHUNK_SIZE = 4096
-_CHUNKED_LOSSES = ("cross_entropy", "chunked_cross_entropy")
 
 
 def _chunk_loss(chunk: torch.Tensor, target: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -43,8 +42,8 @@ _CHUNK_LOSS_COMPILED = torch.compile(_chunk_loss)
 _CHUNK_GRAD_COMPILED = torch.compile(_chunk_grad)
 
 
-class _ChunkedCrossEntropySum(torch.autograd.Function):
-    """Summed cross-entropy in at least fp32, one chunk of tokens at a time, softmax recomputed."""
+class _Fp32CrossEntropySum(torch.autograd.Function):
+    """Summed cross-entropy in at least fp32, ``chunk_size`` tokens at a time."""
 
     @staticmethod
     def forward(
@@ -67,6 +66,8 @@ class _ChunkedCrossEntropySum(torch.autograd.Function):
     def backward(ctx: Any, grad_total: torch.Tensor) -> tuple[torch.Tensor, None, None]:
         logits, labels, lse = ctx.saved_tensors
         chunk_grad = _CHUNK_GRAD_COMPILED if logits.is_cuda else _chunk_grad
+        if ctx.chunk_size >= logits.shape[0]:
+            return chunk_grad(logits, labels, lse, grad_total), None, None
         grad = torch.empty_like(logits)
         for start in range(0, logits.shape[0], ctx.chunk_size):
             stop = start + ctx.chunk_size
@@ -81,22 +82,29 @@ def _zero_on_graph(logits: torch.Tensor) -> torch.Tensor:
     return logits[..., :0].sum().float()
 
 
-@registry.register_loss("cross_entropy")
-def cross_entropy_loss(
-    logits: torch.Tensor, labels: torch.Tensor, chunk_size: int = _DEFAULT_CHUNK_SIZE
+def _fp32_cross_entropy(
+    logits: torch.Tensor, labels: torch.Tensor, chunk_size: int | None
 ) -> torch.Tensor:
-    """Mean cross-entropy over tokens not labeled ``-100``, in fp32 one ``chunk_size`` at a time.
-
-    A batch with every label ``-100`` returns an exact float32 zero that stays on the autograd
-    graph of ``logits``.
-    """
+    """Mean fp32 cross-entropy over tokens not labeled ``-100``; ``None`` means one chunk."""
     flat_logits = logits.reshape(-1, logits.shape[-1])
     flat_labels = labels.reshape(-1)
     valid_tokens = (flat_labels != -100).sum()
     if valid_tokens == 0:
         return _zero_on_graph(logits)
-    total = _ChunkedCrossEntropySum.apply(flat_logits, flat_labels, chunk_size)
+    size = flat_logits.shape[0] if chunk_size is None else chunk_size
+    total = _Fp32CrossEntropySum.apply(flat_logits, flat_labels, size)
     return total / valid_tokens
+
+
+@registry.register_loss("cross_entropy")
+def cross_entropy_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    """Standard cross-entropy loss for language modeling, computed in fp32.
+
+    Uses ``ignore_index=-100`` so packed-sequence boundary tokens (labeled -100
+    by the dataset) are excluded from the loss. A batch with every label ``-100``
+    returns an exact float32 zero that stays on the autograd graph of ``logits``.
+    """
+    return _fp32_cross_entropy(logits, labels, None)
 
 
 @registry.register_loss("chunked_cross_entropy")
@@ -105,8 +113,12 @@ def chunked_cross_entropy_loss(
     labels: torch.Tensor,
     chunk_size: int = _DEFAULT_CHUNK_SIZE,
 ) -> torch.Tensor:
-    """Alias of :func:`cross_entropy_loss`, kept so configs naming it still load."""
-    return cross_entropy_loss(logits, labels, chunk_size=chunk_size)
+    """Cross-entropy in fp32, ``chunk_size`` tokens at a time, never copying all logits to fp32.
+
+    Same loss as :func:`cross_entropy_loss`, including the all-``-100`` case. See
+    ``docs/training/losses.md`` for the memory it saves.
+    """
+    return _fp32_cross_entropy(logits, labels, chunk_size)
 
 
 def z_loss(logits: torch.Tensor, weight: float) -> torch.Tensor:
@@ -135,12 +147,12 @@ def build_loss_fn(config) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor
     """Build a composed loss function from training config.
 
     Follows the build_optimizer pattern: config in, callable out.
-    Binds chunk_size for both cross-entropy losses and composes z-loss, so the caller
+    Binds chunk_size for chunked CE and composes z-loss, so the caller
     gets a clean ``(logits, labels) -> Tensor`` interface.
     """
     base_fn = registry.get_loss(config.loss_fn)
 
-    if config.loss_fn in _CHUNKED_LOSSES:
+    if config.loss_fn == "chunked_cross_entropy":
         chunk_size = config.ce_chunk_size if config.ce_chunk_size > 0 else _DEFAULT_CHUNK_SIZE
         base_fn = functools.partial(base_fn, chunk_size=chunk_size)
 
