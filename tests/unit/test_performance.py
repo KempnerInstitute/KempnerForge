@@ -174,7 +174,7 @@ class TestMFUMoEExperts:
 
     @pytest.mark.parametrize(
         "shared,multiplier,frequency",
-        [(0, 0.5, 1), (1, 0.5, 1), (2, 1.0, 1), (3, 0.5, 2)],
+        [(0, 0.5, 1), (1, 0.5, 1), (2, 1.0, 1), (3, 0.5, 2), (1, 1.5, 1)],
     )
     def test_flops_match_the_built_model(self, shared, multiplier, frequency):
         config = ModelConfig(
