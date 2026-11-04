@@ -39,11 +39,6 @@ from kempnerforge.model.transformer import TransformerBlock
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Mesh helpers
-# ---------------------------------------------------------------------------
-
-
 def get_pp_mesh(device_mesh: DeviceMesh) -> DeviceMesh | None:
     """Extract the PP sub-mesh from a DeviceMesh.
 
@@ -68,11 +63,6 @@ def get_pp_size(device_mesh: DeviceMesh) -> int:
     if pp_mesh is None:
         return 1
     return pp_mesh.size()
-
-
-# ---------------------------------------------------------------------------
-# Layer assignment
-# ---------------------------------------------------------------------------
 
 
 def compute_layer_assignment(
@@ -111,11 +101,6 @@ def compute_layer_assignment(
     return assignments
 
 
-# ---------------------------------------------------------------------------
-# Stage model
-# ---------------------------------------------------------------------------
-
-
 class PipelineStageModule(nn.Module):
     """A model chunk for a single pipeline stage.
 
@@ -143,17 +128,14 @@ class PipelineStageModule(nn.Module):
         self.is_last = stage_id == num_stages - 1
         start, end = layer_range
 
-        # Token embedding — only on first stage
         self.token_embedding: TokenEmbedding | None = (
             TokenEmbedding(config.vocab_size, config.dim) if self.is_first else None
         )
 
-        # Assigned transformer blocks (string keys match full model for DCP compat)
         self.layers = nn.ModuleDict(
             {str(i): TransformerBlock(config, layer_idx=i) for i in range(start, end)}
         )
 
-        # Final norm + output head — only on last stage
         self.norm = (
             build_norm(config.norm_type, config.dim, eps=config.norm_eps) if self.is_last else None
         )
@@ -161,8 +143,6 @@ class PipelineStageModule(nn.Module):
             OutputHead(config.dim, config.vocab_size) if self.is_last else None
         )
 
-        # Precompute RoPE cos/sin tables and initialize weights.
-        # Skip when on meta device (no data); call init_weights_and_freqs() later.
         self._rope_cos = None
         self._rope_sin = None
         if not any(p.is_meta for p in self.parameters()):
@@ -207,11 +187,9 @@ class PipelineStageModule(nn.Module):
             For last stage: logits of shape (batch, seq_len, vocab_size).
             For other stages: hidden states of shape (batch, seq_len, dim).
         """
-        # First stage: embed tokens
         if self.is_first and self.token_embedding is not None:
             x = self.token_embedding(x)
 
-        # Slice RoPE for current sequence length (device transfer cached after first call)
         seq_len = x.shape[1]
         if self._rope_cos.device != x.device:  # type: ignore[reportOptionalMemberAccess]
             self._rope_cos = self._rope_cos.to(x.device)  # type: ignore[reportOptionalMemberAccess]
@@ -219,35 +197,21 @@ class PipelineStageModule(nn.Module):
         cos = self._rope_cos[:seq_len]  # type: ignore[reportOptionalSubscript]
         sin = self._rope_sin[:seq_len]  # type: ignore[reportOptionalSubscript]
 
-        # Packed sequences under attention_backend="flex": build the BlockMask
-        # once here and share it across this stage's layers, mirroring
-        # Transformer.forward. Each stage builds its own from the doc_ids it
-        # was handed -- cheap next to attention, and a BlockMask is not a tensor,
-        # so it could not be transmitted between stages anyway.
         block_mask = None
         layer_doc_ids = doc_ids
         if doc_ids is not None and self.config.attention_backend == "flex":
             block_mask = build_doc_causal_block_mask(doc_ids, x.device)
-            # The BlockMask supersedes doc_ids; clearing it keeps the dense
-            # SDPA mask branch in Attention.forward unreachable on this path.
             layer_doc_ids = None
 
-        # Run through assigned layers
         for layer in self.layers.values():
             x = layer(x, cos, sin, doc_ids=layer_doc_ids, block_mask=block_mask)
 
-        # Last stage: norm + output head
         if self.is_last:
             x = self.norm(x)  # type: ignore[reportOptionalCall]
             if self.output_head is not None:
                 x = self.output_head(x)
 
         return x
-
-
-# ---------------------------------------------------------------------------
-# Builder functions
-# ---------------------------------------------------------------------------
 
 
 def build_stage_module(
@@ -302,7 +266,6 @@ def build_pipeline_stage(
     pp_mesh = get_pp_mesh(device_mesh)
     pp_group = pp_mesh.get_group() if pp_mesh is not None else None
 
-    # Example input for shape inference
     if stage_module.is_first:
         input_args = (torch.zeros(batch_size, seq_len, dtype=torch.long, device=device),)
     else:
@@ -315,8 +278,6 @@ def build_pipeline_stage(
                 device=device,
             ),
         )
-    # doc_ids is deliberately absent here: it reaches stages as a schedule
-    # kwarg, which is neither transmitted nor shape-inferred.
 
     return PipelineStage(
         submodule=stage_module,
@@ -357,7 +318,6 @@ def build_pipeline_schedule(
     )
 
     if schedule == "interleaved_1f1b":
-        # Interleaved 1F1B expects a list of stages (multiple per rank)
         if not isinstance(stage, (list, tuple)):
             raise ValueError(
                 "interleaved_1f1b schedule requires a list of PipelineStage objects "

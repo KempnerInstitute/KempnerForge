@@ -46,10 +46,8 @@ def sample(
         sorted_logits, sorted_indices = logits.sort(dim=-1, descending=True)
         probs = sorted_logits.softmax(dim=-1)
         cumulative_probs = probs.cumsum(dim=-1)
-        # Mask tokens where cumulative prob (excluding current) exceeds top_p
         mask = (cumulative_probs - probs) >= top_p
         sorted_logits[mask] = float("-inf")
-        # Unsort back to original vocabulary order
         logits = torch.zeros_like(logits).scatter_(1, sorted_indices, sorted_logits)
 
     probs = logits.softmax(dim=-1)
@@ -97,17 +95,14 @@ def generate(
 
     dtype = next(model.parameters()).dtype
 
-    # Allocate one KV cache per layer
     kv_caches = [
         KVCache(batch_size, total_len, config.n_kv_heads, config.head_dim, dtype, device)  # type: ignore[reportArgumentType]
         for _ in range(config.n_layers)
     ]
 
-    # Prefill: forward the full prompt through the model
     logits = model(prompt_tokens, kv_caches=kv_caches)
     next_logits = logits[:, -1, :]
 
-    # Autoregressive decode loop
     generated = []
     done = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
@@ -120,7 +115,6 @@ def generate(
             if done.all():
                 break
 
-        # Single-token decode step
         next_logits = model(next_token.unsqueeze(1), kv_caches=kv_caches)[:, -1, :]
 
     if was_training:

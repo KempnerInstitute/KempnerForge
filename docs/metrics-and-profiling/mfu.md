@@ -104,6 +104,26 @@ The opposite problem — reporting fp8 peak while the kernel actually runs
 in bf16 — gives an overstated MFU. If you're mixing precision, match the
 peak to the dominant matmul format.
 
+## GPU telemetry fields
+
+`scripts/slurm/_dcgm_monitor.sh` samples these DCGM fields per node, one
+instance per node alongside training. Note the mixed units: `GPUTL` is a
+percentage while the `PROF` fields are fractions of 1.
+
+| ID | Name | Column | Unit | Meaning |
+|----|------|--------|------|---------|
+| 203 | `DCGM_FI_DEV_GPU_UTIL` | `GPUTL` | % | GPU active, coarse |
+| 1002 | `DCGM_FI_PROF_SM_ACTIVE` | `SMACT` | 0..1 | fraction of SMs active |
+| 1003 | `DCGM_FI_PROF_SM_OCCUPANCY` | `SMOCC` | 0..1 | warp occupancy per SM |
+| 1004 | `DCGM_FI_PROF_PIPE_TENSOR_ACTIVE` | `TENSO` | 0..1 | tensor pipe active, the MFU signal |
+| 1005 | `DCGM_FI_PROF_DRAM_ACTIVE` | `DRAMA` | 0..1 | HBM bandwidth use |
+| 252 | `DCGM_FI_DEV_FB_USED` | `FBUSD` | MiB | framebuffer used |
+| 155 | `DCGM_FI_DEV_POWER_USAGE` | `POWER` | W | board power |
+| 150 | `DCGM_FI_DEV_GPU_TEMP` | `TMPTR` | C | GPU temperature |
+
+The ids are DCGM's own; `dcgmi dmon -l` lists them, as does
+`/usr/include/dcgm_fields.h`.
+
 ## GPU detection
 
 ```python

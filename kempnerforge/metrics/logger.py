@@ -14,7 +14,6 @@ import logging
 import os
 import sys
 
-# ANSI color codes
 _COLORS = {
     "reset": "\033[0m",
     "bold": "\033[1m",

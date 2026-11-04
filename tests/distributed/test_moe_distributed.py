@@ -24,7 +24,6 @@ pytestmark = pytest.mark.skipif(
     reason="Requires torchrun launcher (RANK not set)",
 )
 
-# n_heads=8, n_kv_heads=4 divisible by TP=2 and TP=4
 _BASE = dict(dim=256, n_layers=4, n_heads=8, n_kv_heads=4, vocab_size=1000, max_seq_len=64)
 MOE_CONFIG = ModelConfig(**_BASE, num_experts=4, moe_top_k=2)
 MOE_PACKED_CONFIG = ModelConfig(**_BASE, num_experts=4, moe_top_k=2, moe_packed_experts=True)
@@ -203,7 +202,6 @@ class TestMoETP:
 
         for layer in model.layers.values():
             if isinstance(layer.mlp, MoEMLP):
-                # Expert params should be plain tensors, not DTensors
                 for p in layer.mlp.experts.parameters():
                     from torch.distributed.tensor import DTensor
 
@@ -273,11 +271,6 @@ class TestMoETPPlusFSDP:
         loss = out.sum()
         assert torch.isfinite(torch.tensor(loss.item()))
         loss.backward()
-
-
-# ---------------------------------------------------------------------------
-# Sigmoid router + gradient scaling + sequence aux loss under FSDP
-# ---------------------------------------------------------------------------
 
 
 class TestMoESigmoidFSDP:

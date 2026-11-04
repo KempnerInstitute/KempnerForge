@@ -19,13 +19,7 @@ from kempnerforge.model.norm import RMSNorm, build_norm
 from kempnerforge.model.position import apply_rope, precompute_rope_frequencies
 from kempnerforge.model.transformer import Transformer, TransformerBlock
 
-# Use GPU if available, otherwise CPU
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
-# ---------------------------------------------------------------------------
-# RMSNorm
-# ---------------------------------------------------------------------------
 
 
 class TestRMSNorm:
@@ -45,7 +39,6 @@ class TestRMSNorm:
         x = torch.randn(4, 32, 256, device=DEVICE)
         out = norm(x).float()
         rms = out.pow(2).mean(-1).sqrt()
-        # Not exactly 1.0 because of the learned weight, but close with default init (ones)
         assert torch.allclose(rms, torch.ones_like(rms), atol=0.05)
 
 
@@ -61,15 +54,10 @@ class TestBuildNorm:
             build_norm("batchnorm", 64)
 
 
-# ---------------------------------------------------------------------------
-# RoPE
-# ---------------------------------------------------------------------------
-
-
 class TestRoPE:
     def test_frequency_shape(self):
         cos, sin = precompute_rope_frequencies(head_dim=128, max_seq_len=256, theta=10000.0)
-        assert cos.shape == (256, 64)  # head_dim // 2
+        assert cos.shape == (256, 64)
         assert sin.shape == (256, 64)
 
     def test_real_dtype(self):
@@ -90,7 +78,7 @@ class TestRoPE:
 
     def test_apply_rope_shape(self):
         cos, sin = precompute_rope_frequencies(head_dim=64, max_seq_len=128)
-        x = torch.randn(2, 8, 128, 64)  # (batch, heads, seq, head_dim)
+        x = torch.randn(2, 8, 128, 64)
         out = apply_rope(x, cos, sin)
         assert out.shape == x.shape
 
@@ -103,14 +91,9 @@ class TestRoPE:
     def test_position_zero_is_identity_in_practice(self):
         """At position 0, apply_rope should not change the input."""
         cos, sin = precompute_rope_frequencies(head_dim=64, max_seq_len=4)
-        x = torch.randn(1, 1, 1, 64)  # single position
+        x = torch.randn(1, 1, 1, 64)
         out = apply_rope(x, cos[:1], sin[:1])
         assert torch.allclose(out, x, atol=1e-5)
-
-
-# ---------------------------------------------------------------------------
-# Attention
-# ---------------------------------------------------------------------------
 
 
 class TestAttention:
@@ -151,7 +134,7 @@ class TestAttention:
         attn = Attention(dim=128, n_heads=4, n_kv_heads=4, qk_norm=True)
         assert attn.q_norm is not None
         assert attn.k_norm is not None
-        assert attn.q_norm.weight.shape == (32,)  # head_dim = 128/4
+        assert attn.q_norm.weight.shape == (32,)
 
     def test_qk_norm_disabled_by_default(self):
         attn = Attention(dim=128, n_heads=4, n_kv_heads=4)
@@ -170,11 +153,9 @@ class TestAttention:
         cos, sin = precompute_rope_frequencies(32, 16)
         cos, sin = cos.to(DEVICE), sin.to(DEVICE)
 
-        # Large input that would cause attention logit explosion without norm
         x = torch.randn(1, 16, 128, device=DEVICE) * 100.0
         out_norm = attn_norm(x, cos, sin)
 
-        # Normalized version should still produce finite output with large inputs
         assert out_norm.isfinite().all()
 
     def test_qk_norm_with_gqa(self):
@@ -193,11 +174,6 @@ class TestAttention:
     def test_sdpa_backend_stored_on_module(self):
         attn = Attention(dim=128, n_heads=4, n_kv_heads=4, sdpa_backend="math")
         assert attn.sdpa_backend == "math"
-
-
-# ---------------------------------------------------------------------------
-# MLP
-# ---------------------------------------------------------------------------
 
 
 class TestMLP:
@@ -220,12 +196,7 @@ class TestMLP:
     def test_swiglu_has_three_matrices(self):
         mlp = SwiGLUMLP(256, 512)
         params = list(mlp.parameters())
-        assert len(params) == 3  # gate, up, down
-
-
-# ---------------------------------------------------------------------------
-# Embedding
-# ---------------------------------------------------------------------------
+        assert len(params) == 3
 
 
 class TestEmbedding:
@@ -246,11 +217,6 @@ class TestEmbedding:
         assert head.proj.weight is emb.embedding.weight
 
 
-# ---------------------------------------------------------------------------
-# TransformerBlock
-# ---------------------------------------------------------------------------
-
-
 class TestTransformerBlock:
     def test_output_shape(self):
         config = ModelConfig(dim=256, n_layers=1, n_heads=4, vocab_size=1000, max_seq_len=64)
@@ -269,11 +235,6 @@ class TestTransformerBlock:
         x = torch.randn(1, 16, 256, device=DEVICE)
         out = block(x, cos, sin)
         assert not torch.allclose(out, x)
-
-
-# ---------------------------------------------------------------------------
-# Full Transformer
-# ---------------------------------------------------------------------------
 
 
 class TestTransformer:
@@ -379,23 +340,13 @@ class TestTransformer:
         )
         m1 = Transformer(config_default)
         m2 = Transformer(config_explicit)
-        # Neither should have norm layers in attention
         assert m1.layers["0"].attention.q_norm is None
         assert m2.layers["0"].attention.q_norm is None
-        # Same parameter count
         assert sum(p.numel() for p in m1.parameters()) == sum(p.numel() for p in m2.parameters())
 
 
-# ---------------------------------------------------------------------------
-# norm_eps on every norm of the text, VLM-arch and first-pipeline-stage models
-# ---------------------------------------------------------------------------
-
-
-_EPS_VALUES = (1e-6, 1e-3)  # neither is the 1e-5 default the norms used to fall back to
+_EPS_VALUES = (1e-6, 1e-3)
 _N_IMAGE = 4
-# Norms in each two-layer model: per layer the attention/MLP pre-norms and the q/k norms,
-# plus the final norm; two more per cross-attention block; MoT keeps a copy per modality
-# and adds per-modality final norms; the first pipeline stage has no final norm.
 _NORM_COUNTS = {
     "text": 9,
     "joint_decoder": 9,
@@ -509,18 +460,12 @@ class TestNormEps:
             norm.register_forward_hook(lambda m, args, out: calls.append((m.weight, args[0], out)))
         with torch.no_grad():
             _norm_eps_forward(model, arch)
-        # MoT's shared final norm is unused; its per-modality final norms run instead
         assert len(calls) == _NORM_COUNTS[arch] - (1 if arch == "mot" else 0)
         for weight, x, out in calls:
             ref = F.rms_norm(x, (x.shape[-1],), weight, eps=eps)
             old = F.rms_norm(x, (x.shape[-1],), weight, eps=1e-5)
-            assert (ref - old).abs().max() > 1e-2  # eps matters at this input scale
+            assert (ref - old).abs().max() > 1e-2
             torch.testing.assert_close(out, ref)
-
-
-# ---------------------------------------------------------------------------
-# Modality-injection routes on Transformer.forward (ModalityContext)
-# ---------------------------------------------------------------------------
 
 
 _KWARG_CONFIG = ModelConfig(dim=128, n_layers=2, n_heads=4, vocab_size=256, max_seq_len=64)
@@ -576,7 +521,6 @@ class TestOutputSlice:
             sliced = model(tokens, modality=ModalityContext(output_slice=slice(5, None)))
         assert full.shape == (2, 20, 256)
         assert sliced.shape == (2, 15, 256)
-        # Sliced positions equal the tail of the full output
         assert torch.equal(sliced, full[:, 5:, :])
 
     def test_output_slice_none_matches_full(self):
@@ -705,7 +649,6 @@ class TestModalityIdsCrossArgs:
         model = Transformer(_KWARG_CONFIG).to(DEVICE)
         tokens = torch.randint(0, 256, (1, 8), device=DEVICE)
         prefix = torch.randn(1, 4, 128, device=DEVICE)
-        # int32 instead of long — should raise.
         bad_ids = torch.zeros(1, 12, dtype=torch.int32, device=DEVICE)
         with pytest.raises(ValueError, match="modality_ids.dtype must be torch.long"):
             model(
@@ -728,8 +671,6 @@ class TestModalityIdsCrossArgs:
             )
             for _ in range(_KWARG_CONFIG.n_layers)
         ]
-        # Use inputs_embeds (allowed with kv_caches; pipeline-PP path) so the
-        # modality_ids check is what fires, not prefix_embeds.
         embeds = torch.randn(1, 4, 128, device=DEVICE)
         ids = torch.zeros(1, 4, dtype=torch.long, device=DEVICE)
         with pytest.raises(ValueError, match="modality_ids is training-only"):
@@ -753,11 +694,6 @@ class TestModalityIdsCrossArgs:
                 modality=ModalityContext(prefix_embeds=prefix, modality_ids=ids),
             )
         assert out.shape == (1, 12, 256)
-
-
-# ---------------------------------------------------------------------------
-# MoT (Mixture-of-Transformers) integration on Transformer
-# ---------------------------------------------------------------------------
 
 
 def _mot_setup(
@@ -920,11 +856,6 @@ class TestMoT:
             assert model.layers["0"].attn.q_proj[m].weight.grad.abs().sum() > 0  # type: ignore[union-attr]
 
 
-# ---------------------------------------------------------------------------
-# Cross-Attention interleaving on Transformer
-# ---------------------------------------------------------------------------
-
-
 def _ca_setup(n_layers: int, cadence: int):
     """Tiny CrossAttentionConfig setup -> (model_config, vlm_config, num_image_tokens)."""
     from kempnerforge.config.vlm import CrossAttentionConfig
@@ -968,7 +899,6 @@ class TestCrossAttentionInterleaving:
         assert isinstance(lc, CrossAttentionConfig)
 
         model = Transformer(mc, vlm_config=lc, num_image_tokens=n_image).to(DEVICE).eval()
-        # Replace CA blocks with counters via monkeypatching forward.
         invocations: list[int] = []
         original = CrossAttentionBlock.forward
 
@@ -984,7 +914,6 @@ class TestCrossAttentionInterleaving:
                 model(tokens, modality=ModalityContext(image_features=img))
         finally:
             CrossAttentionBlock.forward = original  # type: ignore[method-assign]
-        # 7 CA blocks should have fired exactly once each.
         assert invocations == list(range(7))
 
     def test_text_only_path_bit_equal_when_no_vlm(self):
@@ -1006,14 +935,10 @@ class TestCrossAttentionInterleaving:
         cross_attention_layers keys) loads cleanly into a Transformer
         with an empty cross_attention_layers ModuleDict (strict=True).
         """
-        # Build a Transformer with an empty cross_attention_layers
-        # (text-only or JD config). Save its state_dict.
         config = ModelConfig(dim=64, n_layers=4, n_heads=4, vocab_size=256, max_seq_len=32)
         model_a = Transformer(config)
         state = {k: v for k, v in model_a.state_dict().items()}
-        # No cross_attention_layers entries should appear when the dict is empty.
         assert not any(k.startswith("cross_attention_layers.") for k in state)
-        # Build a fresh Transformer (also empty CA dict) and load.
         model_b = Transformer(config)
         missing_keys, unexpected_keys = model_b.load_state_dict(state, strict=True)
         assert missing_keys == []
@@ -1025,8 +950,8 @@ class TestCrossAttentionInterleaving:
         4 CA blocks): strict=True raises with a missing-keys error
         mentioning cross_attention_layers.
         """
-        model_4 = _ca_transformer(n_layers=8, cadence=4)  # K=2
-        model_2 = _ca_transformer(n_layers=8, cadence=2)  # K=4
+        model_4 = _ca_transformer(n_layers=8, cadence=4)
+        model_2 = _ca_transformer(n_layers=8, cadence=2)
         state_4 = model_4.state_dict()
         with pytest.raises(RuntimeError, match="cross_attention_layers"):
             model_2.load_state_dict(state_4, strict=True)
@@ -1045,7 +970,6 @@ class TestCrossAttentionInterleaving:
         for t in [1, 4, 7, 10]:
             tokens_a = torch.randint(0, 256, (1, seq_len), device=DEVICE)
             tokens_b = tokens_a.clone()
-            # Differ at positions [t..end]
             tokens_b[:, t:] = (tokens_b[:, t:] + 1) % 256
             with torch.no_grad():
                 out_a = model(tokens_a, modality=ModalityContext(image_features=img))
@@ -1069,7 +993,6 @@ class TestCrossAttentionInterleaving:
         )
         ca_model = Transformer(mc_ca, vlm_config=lc_ca, num_image_tokens=n_image).to(DEVICE).eval()
         text_model = Transformer(text_config).to(DEVICE).eval()
-        # Copy CA model's text-stack weights into text_model so backbone matches.
         text_state = {
             k: v for k, v in ca_model.state_dict().items() if "cross_attention_layers" not in k
         }
@@ -1112,10 +1035,6 @@ class TestCrossAttentionInterleaving:
         with pytest.raises(ValueError, match="image_features is training-only"):
             model(tokens, modality=ModalityContext(image_features=img), kv_caches=kv)
 
-
-# ---------------------------------------------------------------------------
-# Weight initialization
-# ---------------------------------------------------------------------------
 
 _INIT_CONFIG = ModelConfig(dim=128, n_layers=4, n_heads=4, vocab_size=256, max_seq_len=32)
 
@@ -1226,13 +1145,7 @@ class TestInitWeights:
         """init_weights should skip parameters on meta device without error."""
         with torch.device("meta"):
             model = Transformer(_INIT_CONFIG)
-        # Should not raise even though all params are on meta device
         init_weights(model, _INIT_CONFIG)
-
-
-# ---------------------------------------------------------------------------
-# Decoupled head_dim
-# ---------------------------------------------------------------------------
 
 
 def _decoupled_config(**kw) -> ModelConfig:
@@ -1330,7 +1243,7 @@ class TestDecoupledHeadDim:
     def test_flops_model_tracks_head_dim(self):
         from kempnerforge.metrics.mfu import estimate_model_flops_per_token
 
-        coupled = _decoupled_config(head_dim_override=8)  # == dim // n_heads
+        coupled = _decoupled_config(head_dim_override=8)
         wide = _decoupled_config(head_dim_override=16)
         wide_flops = estimate_model_flops_per_token(wide, 32)
         assert wide_flops > estimate_model_flops_per_token(coupled, 32)
