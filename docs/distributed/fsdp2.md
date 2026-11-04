@@ -52,8 +52,7 @@ same parameters, and their gradients are all-reduced over that group.
 A parameter TP has sharded keeps its `tp` placement as a third entry,
 for example `(Replicate(), Shard(0), Shard(1))`, so each rank holds its
 TP slice rather than a full copy.
-With `pp > 1`, a mesh with HSDP still fails at startup, in
-`build_checkpoint_manager`. No shipped config sets `dp_replicate > 1`.
+No shipped config sets `dp_replicate > 1`.
 
 ## Mixed precision policy
 
