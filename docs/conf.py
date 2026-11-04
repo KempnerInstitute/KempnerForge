@@ -94,7 +94,4 @@ html_theme_options = {
 
 nitpicky = False
 
-# Autosummary generates stubs for both package re-exports (e.g. kempnerforge.config.JobConfig)
-# and their defining submodules (kempnerforge.config.job.JobConfig). Docstring refs to the
-# short name then resolve to two targets; silence those ambiguities.
 suppress_warnings = ["ref.python"]

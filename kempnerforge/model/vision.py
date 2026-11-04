@@ -55,15 +55,10 @@ class RandomVisionEncoder(VisionEncoder):
         self.num_tokens = num_tokens
         self.feature_dim = feature_dim
         self._seed = seed
-        # Carry a trivial buffer so .to(device) / .to(dtype) have something
-        # to move; also lets VLMWrapper confirm the module actually lives
-        # on the target device.
         self.register_buffer("_anchor", torch.zeros(1, dtype=torch.float32), persistent=False)
 
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
         B = pixel_values.shape[0]
-        # Derive a per-image seed from the input so the same image yields
-        # the same tokens. Kept cheap: sum across spatial dims and cast.
         per_image = pixel_values.flatten(1).sum(dim=1)
         anchor = self.get_buffer("_anchor")
         out = torch.empty(
@@ -134,24 +129,17 @@ class _HFVisionEncoder(VisionEncoder):
         if not path:
             raise ValueError("vlm.vision_encoder_path must be set for HF-backed vision encoders")
         model = AutoModel.from_pretrained(path)
-        # Prefer .vision_model if present (CLIP, SigLIP family); otherwise
-        # assume the whole loaded model is the vision tower.
         vision_tower = getattr(model, "vision_model", model)
         self.vision_tower = vision_tower
         self._strip_cls = strip_cls
         self._has_cls_token = has_cls_token
 
-        # Resolve output shape from the HF config without an actual dry-run pass.
         cfg = getattr(vision_tower, "config", None)
         image_size = getattr(cfg, "image_size", 224) if cfg is not None else 224
         patch_size = getattr(cfg, "patch_size", 16) if cfg is not None else 16
         hidden = getattr(cfg, "hidden_size", None) if cfg is not None else None
         n_patches = (image_size // patch_size) ** 2
-        self.feature_dim = int(hidden) if hidden else -1  # -1 => resolve via dry run
-        # Three cases for num_tokens:
-        #   - has_cls_token + strip_cls:     n_patches      (CLIP, dropping CLS)
-        #   - has_cls_token + not strip_cls: n_patches + 1  (CLIP, keeping CLS)
-        #   - not has_cls_token:             n_patches      (SigLIP/SigLIP2)
+        self.feature_dim = int(hidden) if hidden else -1
         if has_cls_token and not strip_cls:
             self.num_tokens = n_patches + 1
         else:

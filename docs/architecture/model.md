@@ -128,6 +128,14 @@ ordering is intentional: cached keys already carry their rotary positions,
 and the cache stores `n_kv_heads` tensors, not the expanded `n_heads`
 copies.
 
+### Compiled FlexAttention helpers
+
+`kempnerforge/model/masking.py` compiles `flex_attention` and
+`create_block_mask` into plain module globals. They are globals rather than a
+cached factory on purpose: Dynamo warns that it ignores `functools.lru_cache`
+wrappers and traces the wrapped body directly, which it flags as a
+silent-incorrectness risk. Keep them module-level.
+
 ### SDPA backend
 
 `sdpa_backend` (default `"auto"`) selects flash / mem-efficient / cudnn /

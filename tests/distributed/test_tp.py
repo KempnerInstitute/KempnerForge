@@ -24,7 +24,6 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-# Config where n_heads and n_kv_heads are divisible by TP degree (2 or 4)
 TP_CONFIG = ModelConfig(
     dim=256, n_layers=2, n_heads=8, n_kv_heads=4, vocab_size=1000, max_seq_len=64
 )
@@ -43,8 +42,6 @@ TP_FLEX_CONFIG = ModelConfig(
     attention_backend="flex",
 )
 
-# TP degree must divide n_heads and n_kv_heads. When world_size > n_kv_heads
-# (e.g. 12 GPUs but only 4 kv_heads), use a sub-mesh of valid size.
 _VALID_TP_SIZES = [
     s for s in [2, 4, 8] if TP_CONFIG.n_heads % s == 0 and TP_CONFIG.n_kv_heads % s == 0
 ]
@@ -54,7 +51,6 @@ _VALID_TP_SIZES = [
 def tp_mesh():
     """Create a TP mesh that is compatible with TP_CONFIG head counts."""
     world_size = dist.get_world_size()
-    # Use full world if it divides heads, otherwise pick largest valid sub-mesh
     if TP_CONFIG.n_heads % world_size == 0 and TP_CONFIG.n_kv_heads % world_size == 0:
         tp_size = world_size
     else:
@@ -62,7 +58,6 @@ def tp_mesh():
         if not candidates:
             pytest.skip(f"No valid TP degree for world_size={world_size}")
         tp_size = max(candidates)
-    # Create a 2D mesh: (dp, tp) so only tp_size ranks participate in TP
     dp_size = world_size // tp_size
     mesh = init_device_mesh("cuda", (dp_size, tp_size), mesh_dim_names=("dp", "tp"))
     return mesh["tp"]
@@ -96,18 +91,15 @@ class TestTensorParallel:
         """With TP, all ranks should produce identical output (after all-reduce)."""
         mesh = tp_mesh
 
-        # Same model init seed across ranks
         torch.manual_seed(42)
         model = Transformer(TP_CONFIG).cuda()
         apply_tensor_parallel(model, mesh)
 
-        # Same input across all ranks
         torch.manual_seed(0)
         tokens = torch.randint(0, 1000, (1, 16), device="cuda")
         with torch.no_grad():
             out = model(tokens)
 
-        # Gather outputs from all ranks and compare
         all_outs = [torch.zeros_like(out) for _ in range(dist.get_world_size())]
         dist.all_gather(all_outs, out)
         for rank_out in all_outs[1:]:
@@ -129,15 +121,12 @@ class TestTPWithFSDP:
         tp_size = 2
         dp_size = world_size // tp_size
 
-        # Create a 2D mesh with separate DP and TP dimensions
         mesh_2d = init_device_mesh("cuda", (dp_size, tp_size), mesh_dim_names=("dp_shard", "tp"))
 
         model = Transformer(TP_CONFIG).cuda()
 
-        # Apply TP on the tp sub-mesh
         apply_tensor_parallel(model, mesh_2d)
 
-        # Apply FSDP2 on the dp sub-mesh
         dp_mesh = mesh_2d["dp_shard"]
         mp_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
         for layer in model.layers.values():

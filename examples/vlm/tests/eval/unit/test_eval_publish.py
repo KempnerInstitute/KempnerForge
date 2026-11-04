@@ -33,7 +33,7 @@ from .test_adapter import _patch_loaders, _vlm_job_config
 
 EXAMPLE_ROOT = Path(__file__).resolve().parents[3]
 URI = "tracking-uri-placeholder"
-MISSING = object()  # drops the key from the synthetic sidecar
+MISSING = object()
 
 FIRST = datetime(2026, 10, 21, 9, 5, 7, 250, tzinfo=UTC)
 FIRST_STAMP = "20261021T090507.000250Z"
@@ -46,8 +46,6 @@ SCORES = {
     "scienceqa_img_exact_match": 0.45,
     "scienceqa_img_exact_match_flexible-extract": 0.5,
 }
-# (step, benchmark, metric, filter, score, stderr, n_samples, name), ordered by task, metric
-# and filter.
 ROWS = [
     (
         4000,
@@ -483,7 +481,7 @@ class TestPublishResults:
         def on_call(method: str) -> None:
             if method == "client":
                 clients.append(method)
-                if len(clients) == 2:  # the first client belongs to the metrics publisher
+                if len(clients) == 2:
                     raise ConnectionError("no route")
 
         install_mlflow(monkeypatch, on_call=on_call)
@@ -545,7 +543,7 @@ class TestPublishResults:
     def test_a_symlink_loop_in_the_location_falls_back_too(self, tmp_path, monkeypatch, mlflow):
         (tmp_path / "tmp").mkdir()
         monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "tmp"))
-        (tmp_path / "loop").symlink_to("loop")  # Path.resolve raises RuntimeError for a loop
+        (tmp_path / "loop").symlink_to("loop")
 
         assert publish_results(_checkpoint(tmp_path), _results(), str(tmp_path / "loop" / "r.json"))
 
@@ -558,7 +556,7 @@ class TestPublishResults:
         (tmp_path / "tmp").mkdir()
         monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "tmp"))
         limit = os.pathconf(tmp_path, "PC_NAME_MAX")
-        output = tmp_path / ("a" * limit + ".json")  # the scores name outgrows the limit
+        output = tmp_path / ("a" * limit + ".json")
 
         assert publish_results(_checkpoint(tmp_path), _results(), str(output))
 
@@ -764,7 +762,7 @@ class TestEvalScript:
         run_eval(_checkpoint(tmp_path, tracking=MISSING), "--output", str(out))
 
         assert out.exists() and len(list(out.parent.glob("*.scores.json"))) == 1
-        assert caplog.text.count("no 'tracking' block") == 2  # before the scoring and after it
+        assert caplog.text.count("no 'tracking' block") == 2
         assert mlflow.events == []
 
     def test_a_server_failure_leaves_the_run_successful(self, tmp_path, monkeypatch, run_eval):
