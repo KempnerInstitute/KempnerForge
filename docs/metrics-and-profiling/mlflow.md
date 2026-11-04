@@ -92,8 +92,8 @@ either name, a username and password, or a client id and secret; with no credent
 set it reads the file and uses the SDK's default profile. Anything else warns without failing,
 naming the three routes, because it cannot verify OAuth, a CLI login or a metadata service
 offline. It parses the whole file, as the SDK does, but the only text from the file a message
-can carry is a profile name: a section name, or a `default_profile` value given on the key's own
-line. It looks at the environment, not at `mlflow_tracking_uri` in a config. Add
+can carry is a `default_profile` value written on the key's own line, which names a profile. It
+looks at the environment, not at `mlflow_tracking_uri` in a config. Add
 `--check-credentials` to also call the workspace through the SDK by that same resolution, which
 names a profile only when one is selected. A failure is reported by exception class only,
 because the text can quote a token (a malformed profile line, a token with a stray newline);

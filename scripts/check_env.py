@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import configparser
+import io
 import json
 import os
 import shutil
@@ -369,15 +370,12 @@ def _selected_databricks_profile() -> str | None:
     return os.environ.get("DATABRICKS_CONFIG_PROFILE") or None
 
 
-def _databricks_config_file() -> tuple[Path, str]:
-    """The profile file the SDK reads, and the name a message gives it.
+def _databricks_config_file() -> str:
+    """The profile file the SDK reads, as written and as a message names it.
 
-    The file $DATABRICKS_CONFIG_FILE names when it is set and not empty, else ~/.databrickscfg.
+    $DATABRICKS_CONFIG_FILE when it is set and not empty, else ~/.databrickscfg.
     """
-    named = os.environ.get("DATABRICKS_CONFIG_FILE")
-    if named:
-        return Path(named).expanduser(), named
-    return Path.home() / ".databrickscfg", "~/.databrickscfg"
+    return os.environ.get("DATABRICKS_CONFIG_FILE") or "~/.databrickscfg"
 
 
 @dataclass(frozen=True)
@@ -389,7 +387,7 @@ class _ProfileFile:
         default_profile: The profile the SDK falls back to, None when the stripped
             ``[__settings__] default_profile`` still spans more than one line.
         default_profile_quotable: False when that value began on a continuation line, whose
-            text can be a token, so a message names it only when it names a profile.
+            text can be a token, so no message names it.
         problem: Why the file offers no profile, or None.
         missing: The file does not exist, so the SDK reads nothing from it.
     """
@@ -401,27 +399,36 @@ class _ProfileFile:
     missing: bool = False
 
 
-def _read_databricks_config(path: Path, name: str) -> _ProfileFile:
-    """Read a Databricks profile file the way the SDK reads it; ``name`` is used in messages.
+def _read_databricks_config(name: str) -> _ProfileFile:
+    """Read the Databricks profile file ``name`` the way the SDK reads it.
 
-    Parsed with ConfigParser as the SDK parses it, so an indented line continues the value above
-    it rather than opening a section, a repeated ``[DEFAULT]`` merges, and a file the SDK
-    rejects is reported rather than passed. A parse failure is named by exception class alone,
-    because its text quotes the offending line, which can be a token. ``[DEFAULT]`` is a profile
-    only when it carries keys, and the reserved ``[__settings__]`` section is never one. The
-    default profile is stripped before it is resolved, as the SDK strips it.
+    The path is expanded and tested for existence as the SDK does it, so a broken or looping
+    symlink, or a path through a regular file, is a missing file. It is parsed with ConfigParser
+    in the encoding ``ConfigParser.read`` uses, as the SDK parses it, so an indented line
+    continues the value above it rather than opening a section, a repeated ``[DEFAULT]`` merges,
+    and a file the SDK rejects is reported rather than passed. A failure is named by exception
+    class alone, because its text can quote the file, which can hold a token. ``[DEFAULT]`` is a
+    profile only when it carries keys, and the reserved ``[__settings__]`` section is never one.
+    The default profile is stripped before it is resolved, as the SDK strips it.
     """
+    try:
+        path = Path(name).expanduser()
+        exists = path.exists()
+    except (OSError, RuntimeError) as e:
+        return _ProfileFile(
+            frozenset(), "DEFAULT", True, f"{name} cannot be resolved ({type(e).__name__})"
+        )
+    if not exists:
+        return _ProfileFile(frozenset(), "DEFAULT", True, f"{name} not found", missing=True)
     parser = configparser.ConfigParser()
     try:
-        with path.open(encoding="utf-8", errors="replace") as f:
+        with path.open(encoding=io.text_encoding(None)) as f:
             parser.read_file(f)
-    except (FileNotFoundError, NotADirectoryError):
-        return _ProfileFile(frozenset(), "DEFAULT", True, f"{name} not found", missing=True)
     except OSError as e:
         return _ProfileFile(
             frozenset(), "DEFAULT", True, f"{name} unreadable: {e.strerror or type(e).__name__}"
         )
-    except configparser.Error as e:
+    except (configparser.Error, UnicodeDecodeError) as e:
         return _ProfileFile(
             frozenset(), "DEFAULT", True, f"{name} is malformed ({type(e).__name__})"
         )
@@ -495,9 +502,9 @@ def check_mlflow(check_credentials: bool = False) -> CheckResult:
     settle an environment route no offline evidence settles, so it runs even then.
     """
     selected = _selected_databricks_profile()
-    config_path, config_name = _databricks_config_file()
+    config_name = _databricks_config_file()
     env_credentials = () if selected else _databricks_env_credentials()
-    config = None if env_credentials else _read_databricks_config(config_path, config_name)
+    config = None if env_credentials else _read_databricks_config(config_name)
     if config is None or (selected and config.missing):
         if config is None:
             skipped = f"{', '.join(env_credentials)} set, so {config_name} is not read"
@@ -512,13 +519,14 @@ def check_mlflow(check_credentials: bool = False) -> CheckResult:
         found = unsettled if auth is None else f"{found_prefix}DATABRICKS_HOST + {auth} set"
     else:
         profile = selected or config.default_profile
+        quotable = selected is not None or config.default_profile_quotable
         problem = config.problem
         if profile is None:
             problem = "the [__settings__] default_profile spans more than one line"
         elif profile == _SETTINGS_SECTION:
             problem = f"[{_SETTINGS_SECTION}] is a reserved section name and cannot be a profile"
         elif problem is None and profile not in config.profiles:
-            if selected or config.default_profile_quotable:
+            if quotable:
                 problem = f"{config_name} has no [{profile}] section"
             else:
                 problem = f"the [__settings__] default_profile names no section of {config_name}"
@@ -528,7 +536,11 @@ def check_mlflow(check_credentials: bool = False) -> CheckResult:
                 WARN,
                 f"no Databricks credentials found ({problem}); {_MLFLOW_AUTH_ROUTES}",
             )
-        found = f"profile {profile} found in {config_name}"
+        found = (
+            f"profile {profile} found in {config_name}"
+            if quotable
+            else f"profile named by [__settings__] default_profile found in {config_name}"
+        )
     if check_credentials:
         if not os.environ.get("DATABRICKS_TOKEN") and os.environ.get("DATABRICKS_API_TOKEN"):
             os.environ["DATABRICKS_TOKEN"] = os.environ["DATABRICKS_API_TOKEN"]

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import codecs
 import configparser
 import json
+import locale
 import sys
 from pathlib import Path
 from typing import Any
@@ -329,7 +331,7 @@ class TestCheckMlflow:
 
     @staticmethod
     def _read_config():
-        return check_env._read_databricks_config(*check_env._databricks_config_file())
+        return check_env._read_databricks_config(check_env._databricks_config_file())
 
     @staticmethod
     def _fake_sdk(monkeypatch, client_cls):
@@ -714,6 +716,65 @@ class TestCheckMlflow:
         assert check_env.check_mlflow(check_credentials=True).status == check_env.OK
         assert seen == [{"profile": "my-profile"}]
 
+    def test_an_unexpandable_profile_file_is_not_read_beside_environment_credentials(
+        self, monkeypatch
+    ):
+        """The SDK skips the file before it expands the path, so no expansion error can arise."""
+        monkeypatch.setenv("DATABRICKS_CONFIG_FILE", "~no_such_user_for_kf_tests/x.cfg")
+        monkeypatch.setenv("DATABRICKS_HOST", "https://x.cloud.databricks.com")
+        monkeypatch.setenv("DATABRICKS_TOKEN", "dapi-xxx")
+        r = check_env.check_mlflow()
+        assert r.status == check_env.OK
+        assert "DATABRICKS_HOST + token set" in r.message
+
+    def test_an_unexpandable_profile_file_is_a_warn_when_it_must_be_read(self, monkeypatch):
+        monkeypatch.setenv("DATABRICKS_CONFIG_FILE", "~no_such_user_for_kf_tests/x.cfg")
+        monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", "my-profile")
+        r = check_env.check_mlflow()
+        assert r.status == check_env.WARN
+        assert "cannot be resolved (RuntimeError)" in r.message
+
+    def test_a_looping_symlink_counts_as_a_missing_profile_file(self, home, monkeypatch):
+        """Path.exists() is False for a symlink loop, as the SDK tests the path."""
+        loop = home / "loop.cfg"
+        loop.symlink_to(loop)
+        monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(loop))
+        monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", "my-profile")
+        monkeypatch.setenv("DATABRICKS_HOST", "https://x.cloud.databricks.com")
+        monkeypatch.setenv("DATABRICKS_TOKEN", "dapi-xxx")
+        r = check_env.check_mlflow()
+        assert r.status == check_env.OK
+        assert "not found, so profile my-profile is not read" in r.message
+
+    def test_a_profile_file_that_cannot_be_tested_for_existence_is_a_warn(self, home, monkeypatch):
+        target = home / "locked.cfg"
+        real_exists = Path.exists
+
+        def exists(path, *args, **kwargs):
+            if path == target:
+                raise PermissionError(13, "Permission denied")
+            return real_exists(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "exists", exists)
+        monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(target))
+        r = check_env.check_mlflow()
+        assert r.status == check_env.WARN
+        assert "cannot be resolved (PermissionError)" in r.message
+
+    @pytest.mark.skipif(
+        not sys.flags.utf8_mode and codecs.lookup(locale.getencoding()).name != "utf-8",
+        reason="ConfigParser.read decodes in the locale encoding, which is not UTF-8 here",
+    )
+    def test_a_file_the_sdk_cannot_decode_is_a_warn_quoting_nothing_from_it(self, home):
+        """ConfigParser.read raises on bytes its encoding rejects, so the SDK cannot load it."""
+        home.joinpath(".databrickscfg").write_bytes(
+            b"[DEFAULT]\nhost = h\ntoken = dapi-abc\xffdef\n"
+        )
+        r = check_env.check_mlflow()
+        assert r.status == check_env.WARN
+        assert "malformed (UnicodeDecodeError)" in r.message
+        assert "dapi-abc" not in r.message
+
     def test_the_profile_file_is_the_one_databricks_config_file_names(self, home, monkeypatch):
         alt = home / "alt.cfg"
         alt.write_text("[DEFAULT]\nhost = h\ntoken = dapi-secret\n")
@@ -932,14 +993,27 @@ class TestCheckMlflow:
         assert "spans more than one line" in r.message
         assert "dapi-secret" not in r.message
 
-    def test_a_default_profile_starting_on_the_next_line_names_that_profile(self, home):
+    def test_a_default_profile_starting_on_the_next_line_resolves_without_being_named(self, home):
         """The SDK strips default_profile before it resolves it, newlines included."""
         home.joinpath(".databrickscfg").write_text(
             "[__settings__]\ndefault_profile =\n  work\n[work]\nhost = h\n"
         )
         r = check_env.check_mlflow()
         assert r.status == check_env.OK
-        assert "profile work found in ~/.databrickscfg" in r.message
+        assert "profile named by [__settings__] default_profile found in ~/.databrickscfg" in (
+            r.message
+        )
+        assert "work" not in r.message
+
+    def test_a_continued_default_profile_naming_a_section_is_still_not_quoted(self, home):
+        """Naming a section does not make a continuation line safe to print."""
+        home.joinpath(".databrickscfg").write_text(
+            "[__settings__]\ndefault_profile =\n  dapi-secret\n"
+            "[dapi-secret]\nhost = h\ntoken = dapi-secret\n"
+        )
+        r = check_env.check_mlflow()
+        assert r.status == check_env.OK
+        assert "dapi-secret" not in r.message
 
     def test_a_continued_default_profile_naming_no_profile_is_not_quoted(self, home):
         """A continuation line can be a token, so it is named only when it names a profile."""
