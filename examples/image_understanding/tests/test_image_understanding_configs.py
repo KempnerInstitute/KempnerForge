@@ -117,6 +117,18 @@ def test_stage2_trains_everything_from_a_stage1_checkpoint() -> None:
     assert config.checkpoint.exclude_from_loading == ["optimizer"]
 
 
+@pytest.mark.parametrize(("stage", "precision"), [(1, "fp32"), (2, "bf16")])
+def test_stage_sets_the_encoder_precision_apart_from_the_backbone(
+    stage: int, precision: str
+) -> None:
+    """The recipe trains SigLIP2 in fp32 in stage 1 and in bf16 in stage 2; the backbone in bf16."""
+    path = CONFIG_DIR / f"qwen3_0.6b_siglip2_stage{stage}.toml"
+    config = load_config(str(path), cli_args=[])
+    assert config.vision_encoder is not None
+    assert config.vision_encoder.mixed_precision == precision
+    assert config.train.mixed_precision == "bf16"
+
+
 @pytest.mark.parametrize(
     ("name", "world_size", "cli_args", "global_batch"),
     [

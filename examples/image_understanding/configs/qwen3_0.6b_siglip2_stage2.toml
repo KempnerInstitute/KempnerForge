@@ -32,6 +32,7 @@ max_seq_len = 512
 [vision_encoder]
 type = "siglip2"
 path = "google/siglip2-so400m-patch16-512"
+mixed_precision = "bf16"
 
 [adapter]
 type = "avgpool"

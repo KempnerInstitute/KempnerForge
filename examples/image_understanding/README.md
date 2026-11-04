@@ -90,7 +90,7 @@ change in this directory (or in core where the issue says so).
 | Documents with several images | [#434](https://github.com/KempnerInstitute/KempnerForge/issues/434) |
 | Tiling into a global view and a 3 × 3 grid of crops (stage 2) | [#435](https://github.com/KempnerInstitute/KempnerForge/issues/435) |
 | Per-module learning rates and schedules | [#439](https://github.com/KempnerInstitute/KempnerForge/issues/439) |
-| Vision-encoder precision separate from the backbone's | [#438](https://github.com/KempnerInstitute/KempnerForge/issues/438) |
+| Vision-encoder precision separate from the backbone's (in place: `[vision_encoder] mixed_precision`, `"fp32"` in stage 1 and `"bf16"` in stage 2) | [#438](https://github.com/KempnerInstitute/KempnerForge/issues/438) |
 | Untied output head from the tied Qwen3 checkpoint | [#441](https://github.com/KempnerInstitute/KempnerForge/issues/441) |
 | Evaluation parity: chat-template prompts, image attention, the recipe's scorers | [#443](https://github.com/KempnerInstitute/KempnerForge/issues/443) |
 | Run-comparison metrics: documents seen, token counts, MFU with the encoder | [#444](https://github.com/KempnerInstitute/KempnerForge/issues/444) |

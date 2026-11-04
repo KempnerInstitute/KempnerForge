@@ -22,7 +22,7 @@ from functools import partial
 from typing import TYPE_CHECKING
 
 import torch
-from torch.distributed._composable.fsdp import MixedPrecisionPolicy, fully_shard
+from torch.distributed._composable.fsdp import FSDPModule, MixedPrecisionPolicy, fully_shard
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     CheckpointImpl,
     apply_activation_checkpointing,
@@ -309,6 +309,7 @@ def _apply_fsdp_vlm(
     mp_policy: MixedPrecisionPolicy | None,
     *,
     encoder_frozen: bool,
+    encoder_mp_policy: MixedPrecisionPolicy | None = None,
     reshard_after_forward: bool | int = True,
 ) -> None:
     """FSDP2 wrap policy for a ``VLMWrapper``.
@@ -319,9 +320,10 @@ def _apply_fsdp_vlm(
         and VLM+MoE cannot deadlock).
       - Transformer root (embedding + final norm + output head): own unit.
       - Adapter: own unit (small, but keeps grad-sync scheduling symmetric).
-      - Vision encoder: wrapped only when not fully frozen. A frozen encoder
-        stays as a full replica in eval mode; replication is fine because
-        requires_grad=False means no grad-reduce participation.
+      - Vision encoder: wrapped only when not fully frozen, with
+        ``encoder_mp_policy`` when given and the shared policy otherwise.
+        A frozen encoder stays as a full replica in eval mode; replication
+        is fine because requires_grad=False means no grad-reduce participation.
       - The ``VLMWrapper`` itself is not wrapped (no direct parameters).
     """
     if not has_dp_mesh(device_mesh):
@@ -351,7 +353,7 @@ def _apply_fsdp_vlm(
         fully_shard(
             wrapper.vision_encoder,
             mesh=dp_mesh,
-            mp_policy=policy,
+            mp_policy=encoder_mp_policy or policy,
             reshard_after_forward=reshard_after_forward,
         )
     logger.info(
@@ -389,10 +391,14 @@ def _build_vlm(
       4. TP / EP / Float8 / AC are applied to the transformer only.
       5. FSDP2 is applied component-by-component (transformer blocks,
          transformer root, adapter, and vision encoder iff not frozen).
+         With ``vision_config.mixed_precision`` set, the encoder's unit
+         gets its own policy that computes in that dtype.
       6. Meta subtrees are materialized (transformer / adapter), the
          vision encoder is moved to ``device``, and the transformer and
          adapter are cast to ``param_dtype``. The vision encoder stays in
-         its HF dtype (D16) to avoid ViT LayerNorm numerical drift.
+         its HF dtype (D16) to avoid ViT LayerNorm numerical drift, unless
+         ``vision_config.mixed_precision`` is set and FSDP2 did not wrap
+         it; then it is cast to that dtype.
       7. Freeze specs are applied via ``apply_freeze_specs`` and a fully
          frozen encoder is switched to ``eval()``.
     """
@@ -449,8 +455,17 @@ def _build_vlm(
     apply_ac(transformer, ac_mode)
 
     encoder_frozen = _is_encoder_frozen(vlm_config.freeze)
+    encoder_dtype = vision_config.param_dtype
     if device_mesh is not None:
-        _apply_fsdp_vlm(wrapper, device_mesh, mp_policy, encoder_frozen=encoder_frozen)
+        _apply_fsdp_vlm(
+            wrapper,
+            device_mesh,
+            mp_policy,
+            encoder_frozen=encoder_frozen,
+            encoder_mp_policy=(
+                default_mp_policy(encoder_dtype) if encoder_dtype is not None else None
+            ),
+        )
 
     if tp_enabled:
         transformer.to_empty(device=device)
@@ -461,6 +476,8 @@ def _build_vlm(
         transformer.to(device=device)
         adapter.to(device=device)
     encoder.to(device)
+    if encoder_dtype is not None and not isinstance(wrapper.vision_encoder, FSDPModule):
+        wrapper.vision_encoder.to(dtype=encoder_dtype)
     transformer.to(dtype=param_dtype)
     adapter.to(dtype=param_dtype)
 
