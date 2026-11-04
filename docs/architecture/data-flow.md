@@ -176,7 +176,9 @@ if not nan_detector.check_loss(avg_loss, step):
     _advance_lr_schedule(session)            # scheduler.step() + phase LR scaling
     step += 1
     _apply_step_transitions(session, step)   # freeze stages, then phases (section 9)
-    if _shutdown_if_requested(session, step, tokens_seen, saved_this_step=False):
+    if _shutdown_if_requested(               # saves only finite weights (section 11)
+        session, step, tokens_seen, saved_this_step=False, nan_skipped=True
+    ):
         break
     continue                                 # no update, token count, metrics or hooks
 
@@ -258,7 +260,11 @@ In order:
   the checkpoint above already saved is not saved again, and the loop
   waits for that save before it finishes the shutdown. A NaN-skipped
   step (section 7) runs this check too; the checkpoint above never
-  saves such a step, so it always writes its own emergency checkpoint.
+  saves such a step, so it writes its own emergency checkpoint, but
+  only if an all-reduced check finds every rank's parameters finite.
+  After a bad update (a finite loss with non-finite gradients) they
+  are not, and the shutdown logs an ERROR and saves nothing (see
+  [NaN detection § A shutdown after a bad update](../resilience/nan-detection.md#a-shutdown-after-a-bad-update)).
 
 ## Shutdown
 
