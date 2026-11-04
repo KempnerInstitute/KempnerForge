@@ -1107,6 +1107,14 @@ class TestNanSkippedStep:
         assert mgr.load()[0] == 2
         assert all(torch.isfinite(p).all() for p in resumed.parameters())
 
+    def test_shutdown_on_a_skipped_step_with_finite_weights_still_saves_it(self, tmp_path):
+        """A NaN loss alone leaves the weights finite, so skipped step 4 is saved as ``latest``."""
+        step, handler = self._keep_last_one(tmp_path, _nan_on({3}))
+        assert step == 4
+        assert handler.finished is True
+        assert (tmp_path / "step_4" / ".metadata").is_file()
+        assert (tmp_path / "latest").resolve() == (tmp_path / "step_4").resolve()
+
 
 def _stub_entry(monkeypatch, model: nn.Module) -> FakeCheckpointManager:
     """Replace every phase run_training builds so the orchestration runs on CPU."""
