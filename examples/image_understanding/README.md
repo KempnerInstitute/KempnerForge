@@ -20,9 +20,11 @@ examples/image_understanding/
 ├── README.md
 ├── train.py              # training entry point
 ├── configs/              # TOML presets (below)
+├── image_text/           # image-text dataset readers and chat renderer (below)
 └── tests/
     ├── test_image_understanding_configs.py   # every preset loads and validates; the entry point
-    └── test_image_understanding_backbone.py  # the stage presets build the Qwen3-0.6B backbone
+    ├── test_image_understanding_backbone.py  # the stage presets build the Qwen3-0.6B backbone
+    └── image_text/       # reader and renderer tests (CPU)
 ```
 
 ## Configs
@@ -57,6 +59,21 @@ uv run torchrun --nproc_per_node=4 examples/image_understanding/train.py \
     --train.grad_accum_steps=8 \
     --checkpoint.load_path=/your/run/dir/step_50000 --checkpoint.dir=/your/stage2/dir
 ```
+
+## Image-text datasets
+
+`image_text/` reads the recipe's image-text sources and renders them into the
+samples `VLMCollator` batches.
+
+- `testbed.py`: COCO Karpathy captions, VQAv2 (LAVIS layout), TextVQA, DocVQA and
+  ChartQA (human and augmented).
+- `render.py`: `ChatRenderer` applies the tokenizer's chat template (prompt then
+  answer for single-turn rows, the full template for conversations) and trains only
+  the assistant replies when `answer_only`. `RenderedDataset` draws one reference
+  answer per turn from a seed and the row index, so a resume draws the same answers.
+
+Every sample carries one image, resized square to `image_size`, with no tiling or
+packing.
 
 ## Start from the pretrained backbone
 
@@ -101,7 +118,8 @@ single learning rate, the plain caption loss and the tied output head.
 ## Tests
 
 The tests live outside the repo's `tests/` tree (the main suite's
-`testpaths`), so run them by path. They need no GPU, network or download:
+`testpaths`), so run them by path. They need no GPU; the renderer tests download
+the `Qwen/Qwen3-0.6B` tokenizer once:
 
 ```bash
 uv run pytest examples/image_understanding/tests
