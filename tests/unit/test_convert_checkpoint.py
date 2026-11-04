@@ -489,8 +489,10 @@ def _llama_weights(model: Transformer) -> dict[str, torch.Tensor]:
     }
     for i, block in model.layers.items():
         prefix = f"model.layers.{i}"
-        weights[f"{prefix}.input_layernorm.weight"] = block.attention_norm.weight
-        weights[f"{prefix}.post_attention_layernorm.weight"] = block.mlp_norm.weight
+        weights[f"{prefix}.input_layernorm.weight"] = block.get_parameter("attention_norm.weight")
+        weights[f"{prefix}.post_attention_layernorm.weight"] = block.get_parameter(
+            "mlp_norm.weight"
+        )
         for proj in ("q_proj", "k_proj", "v_proj", "o_proj"):
             weights[f"{prefix}.self_attn.{proj}.weight"] = getattr(block.attention, proj).weight
         for proj in ("gate_proj", "up_proj", "down_proj"):
