@@ -1697,6 +1697,25 @@ class TestRestoreCheckpoint:
         assert restored == (7, 70)
         assert len(warnings) == 1, warnings
 
+    def test_a_bare_number_load_path_still_resumes_and_warns(self, monkeypatch, tmp_path):
+        """``--checkpoint.load_path=5000`` arrives as an int, and comparing it must not raise."""
+        import kempnerforge.training.entry as entry
+        from kempnerforge.config.loader import load_config
+
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d: tmp_path / "step_7")
+        config = make_config()
+        cli = load_config(cli_args=["--checkpoint.load_path=5000"])
+        config.checkpoint.load_path = cli.checkpoint.load_path
+        mgr = FakeResumeManager(step=7, tokens=70)
+
+        restored, warnings = _entry_warnings(
+            lambda: entry.restore_checkpoint(config, TinyTextModel(), None, mgr)
+        )
+
+        assert restored == (7, 70)
+        assert len(warnings) == 1, warnings
+        assert "checkpoint.load_path=5000 is not used" in warnings[0], warnings[0]
+
     def test_the_warning_is_logged_even_when_the_load_then_fails(self, monkeypatch, tmp_path):
         """It comes before the load, so a run that stops on a bad resume still says why."""
         import kempnerforge.training.entry as entry
