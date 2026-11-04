@@ -28,10 +28,6 @@ TP_CONFIG = ModelConfig(
     dim=256, n_layers=2, n_heads=8, n_kv_heads=4, vocab_size=1000, max_seq_len=64
 )
 
-# FlexAttention needs seq_len >= FLEX_BLOCK_SIZE, so this variant carries a
-# longer max_seq_len than TP_CONFIG. Heads are unchanged, since the point is
-# that the BlockMask is head-broadcast (H=None) and therefore indifferent to
-# how TP shards the head dimension.
 TP_FLEX_CONFIG = ModelConfig(
     dim=256,
     n_layers=2,
@@ -238,7 +234,6 @@ class TestTensorParallelMatchesSingleGPU:
         tokens, doc_ids, _ = self._inputs(device)
         kwargs = {"doc_ids": doc_ids} if packed else {}
 
-        # Same seed on both, so any difference is sharding rather than init.
         torch.manual_seed(42)
         reference = Transformer(config).cuda().eval()
         torch.manual_seed(42)
@@ -250,6 +245,4 @@ class TestTensorParallelMatchesSingleGPU:
             expected = reference(tokens, **kwargs)
             actual = sharded(tokens, **kwargs)
 
-        # TP changes reduction order in the row-parallel all-reduce, so this is
-        # a numerical-agreement bound rather than bit-equality.
         torch.testing.assert_close(actual, expected, rtol=2e-4, atol=2e-4)

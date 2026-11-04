@@ -3,7 +3,7 @@
 The single-GPU numbers in ``benchmarks/micro/bench_forward.py`` overstate what a
 distributed run sees: sharding and tensor parallelism add communication that
 attention does not, so the same attention saving is a smaller share of the step.
-This sweep measures that directly, one strategy at a time.
+This sweep measures that directly, one strategy at a time, on the same 134M model.
 
 Three arms per cell, all at the same per-rank batch:
 
@@ -52,8 +52,6 @@ MODE = os.environ.get("MODE", "fsdp")
 WORLD = int(os.environ.get("WORLD_SIZE", "1"))
 OUT_DIR = os.environ.get("BENCH_OUT_DIR", ".")
 
-# Same shape as micro/bench_forward.py's PACKED_CONFIG (134M params), so the
-# single-GPU table and this one are directly comparable.
 BASE: dict[str, int] = dict(dim=768, n_layers=12, n_heads=12, vocab_size=32000, max_seq_len=16384)
 MESHES: dict[str, dict[str, int]] = {
     "fsdp": dict(dp_shard=WORLD, tp=1, pp=1),
@@ -64,7 +62,7 @@ MESHES: dict[str, dict[str, int]] = {
 SEQ_LENS: tuple[int, ...] = tuple(
     int(s) for s in os.environ.get("BENCH_SEQ_LENS", "512,1024,2048,4096,8192,16384").split(",")
 )
-BATCH = 2  # per rank, fixed
+BATCH = 2
 DOCS = 8
 
 ARMS: tuple[tuple[str, str, bool], ...] = (
@@ -141,7 +139,8 @@ def _pipeline_step(
 
     Global batch is ``BATCH * WORLD`` split into ``WORLD`` microbatches, so the
     per-microbatch size matches the per-rank batch the other modes use, and the
-    global batch matches FSDP's.
+    global batch matches FSDP's. ``doc_ids`` goes in the schedule kwargs, since
+    positional args are sent between stages as grad-requiring buffers.
     """
     global_batch = BATCH * WORLD
     stage_module = build_stage_module(config, pp_rank=rank, pp_size=WORLD).to(
@@ -151,7 +150,7 @@ def _pipeline_step(
         stage_module,
         mesh,
         device,
-        batch_size=BATCH,  # per microbatch
+        batch_size=BATCH,
         seq_len=seq_len,
         param_dtype=torch.bfloat16,
     )
@@ -164,10 +163,6 @@ def _pipeline_step(
     doc_ids = doc_ids_for(global_batch, seq_len, device) if packed else None
     is_first, is_last = rank == 0, rank == WORLD - 1
 
-    # doc_ids rides the schedule kwargs, which reach every stage and are split
-    # into micro-batches alongside the tokens. It must not be a positional arg:
-    # those are transmitted between stages, and PipelineStage marks every
-    # received buffer as requiring grad without checking dtype.
     kw = {"doc_ids": doc_ids} if packed else {}
 
     def step() -> None:
@@ -190,7 +185,6 @@ def main() -> None:
     device = torch.device(f"cuda:{local_rank}")
     torch.cuda.set_device(device)
     dp_size = world // (dims["tp"] * dims["pp"])
-    # PP stages share one global batch rather than replicating it.
     tokens_per_step_batch = BATCH * WORLD if MODE == "pp" else BATCH * dp_size
 
     log(f"### MODE={MODE} world={world} {dims} dp_size={dp_size} batch/rank={BATCH}", rank)
@@ -218,18 +212,12 @@ def main() -> None:
                 ms, gb = timed(step)
                 tok_s[arm] = (tokens_per_step_batch * seq_len) / (ms / 1000)
                 peak_gb[arm] = gb
-            except Exception as exc:  # noqa: BLE001 - one OOM must not end the sweep
+            except Exception as exc:  # noqa: BLE001
                 failed.fill_(1)
                 log(f"  {arm} @ {seq_len}: FAILED {type(exc).__name__}: {str(exc)[:70]}", rank)
             del step
             gc.collect()
 
-            # Whether a cell failed has to be agreed on. That only helps while
-            # no rank is left inside a collective, as when every FSDP rank OOMs
-            # at the same allocation. A failure on one rank inside step(), such
-            # as an OOM on one PP stage, leaves the others waiting in an
-            # all-gather or a send/recv, and the sweep hangs until the NCCL
-            # timeout ends the job.
             torch.distributed.all_reduce(failed)
             if failed.item() > 0:
                 tok_s[arm] = float("nan")
