@@ -603,6 +603,24 @@ class TestRunTrainingLoop:
         assert ckpt.saves == []
         assert ckpt.waits == 1
 
+    def test_a_finite_loss_with_nan_gradients_skips_the_step(self):
+        """NaN gradients under a finite loss never reach the optimizer."""
+
+        def loss_fn(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+            logits.register_hook(lambda grad: torch.full_like(grad, float("nan")))
+            return logits.float().mean()
+
+        config = make_config(max_steps=10)
+        session = make_session(
+            config, loss_fn=loss_fn, nan_detector=NaNDetector(action="warn", max_consecutive=3)
+        )
+        before = [p.detach().clone() for p in session.model.parameters()]
+        step, _ = run_training_loop(session)
+        assert step == 2
+        assert session.nan_detector.state.total_nans == 3
+        for old, new in zip(before, session.model.parameters(), strict=True):
+            assert torch.equal(old, new)
+
     def test_shutdown_writes_an_emergency_checkpoint_and_finishes(self):
         config = make_config(max_steps=10)
         config.checkpoint.interval = 100

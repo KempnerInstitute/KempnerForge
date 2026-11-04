@@ -59,24 +59,35 @@ class NaNDetector:
         self.max_history = max_history
         self.state = NaNState()
 
-    def check_loss(self, loss: float, step: int) -> bool:
-        """Check a loss value for NaN/Inf.
+    def check_loss(self, loss: float, step: int, grad_norm: float | None = None) -> bool:
+        """Check a step's loss, and its gradient norm when given, for NaN/Inf.
 
         When running distributed, all-reduces a NaN flag so ALL ranks agree
         on whether to skip. Prevents rank desync where one rank sees NaN and
         skips its optimizer step while others proceed normally.
 
+        A finite loss does not guarantee finite gradients: a micro-batch whose
+        labels are all masked has an exact zero cross-entropy loss whatever its
+        activations, so the caller passes the gradient norm as well. Each rank's
+        norm goes into the same reduced flag, since the norms can differ between
+        ranks (under expert parallelism each covers the shared parameters and
+        only that rank's experts).
+
         Args:
             loss: The scalar loss value to check.
             step: Current training step.
+            grad_norm: The step's gradient norm, or ``None`` to check the loss alone.
 
         Returns:
-            True if the loss is valid (finite) on ALL ranks, False if any rank has NaN/Inf.
+            True if the loss and the gradient norm are finite on ALL ranks, False
+            if any rank has NaN/Inf in either.
 
         Raises:
             RuntimeError: If action is "raise" and NaN is detected.
         """
-        local_nan = not _is_finite(loss)
+        bad_loss = not _is_finite(loss)
+        bad_grad_norm = grad_norm is not None and not _is_finite(grad_norm)
+        local_nan = bad_loss or bad_grad_norm
 
         if dist.is_initialized():
             nan_flag = torch.tensor([1.0 if local_nan else 0.0], device="cuda")
@@ -98,7 +109,7 @@ class NaNDetector:
 
         if local_nan:
             msg = (
-                f"NaN/Inf loss at step {step} "
+                f"NaN/Inf {'loss' if bad_loss else 'gradient norm'} at step {step} "
                 f"(consecutive={self.state.consecutive_nans}, "
                 f"total={self.state.total_nans}, "
                 f"last_good_loss={self.state.last_good_loss:.4f} "
