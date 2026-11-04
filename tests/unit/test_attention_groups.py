@@ -570,11 +570,13 @@ class TestValidation:
         ],
         ids=["moma", "mot"],
     )
-    def test_rejects_moma_and_mot_paths(self, vlm_config):
+    def test_moma_and_mot_accept_group_ids(self, vlm_config):
         config = ModelConfig(dim=32, n_layers=1, n_heads=4, vocab_size=64, max_seq_len=16)
         model = Transformer(config, vlm_config=vlm_config, num_image_tokens=4)
-        calls = self._spy_embedding(model)
-        tokens = torch.randint(0, 64, (1, 4))
-        with pytest.raises(ValueError, match="MoMa/MoT"):
-            model(tokens, attention_group_ids=torch.zeros(1, 8, dtype=torch.long))
-        assert calls == []
+        modality = ModalityContext(
+            prefix_embeds=torch.zeros(1, 4, 32),
+            modality_ids=torch.tensor([[0] * 4 + [1] * 4]),
+        )
+        groups = torch.tensor([[0] * 4 + [-1] * 4])
+        out = model(torch.randint(0, 64, (1, 4)), modality=modality, attention_group_ids=groups)
+        assert out.shape == (1, 8, 64)

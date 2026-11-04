@@ -3,8 +3,9 @@
 GPU-side assertions the CPU unit tier cannot make (torch 2.11 has no CPU
 FlexAttention backward): dense-vs-flex gradient parity with groups, group ids
 past the int32 range against the dense reference, the compiled kernel at
-lengths around the block size, recompile stability across group layouts, and a
-16384-token pack against the dense reference.
+lengths around the block size, recompile stability across group layouts, a
+16384-token pack against the dense reference, and the MoT and MoMa blocks on
+the same compiled mask.
 
 Mask semantics are covered exhaustively in ``tests/unit/test_attention_groups.py``.
 """
@@ -16,6 +17,8 @@ import torch
 
 from kempnerforge.config.model import FLEX_BLOCK_SIZE
 from kempnerforge.config.schema import ModelConfig
+from kempnerforge.config.vlm import MoMaConfig, MoTConfig
+from kempnerforge.model.modality import ModalityContext
 from kempnerforge.model.transformer import Transformer
 
 
@@ -310,3 +313,137 @@ class TestFlexGroups:
         out = moved_at(slice(3333 + 450, 3333 + 451))
         torch.testing.assert_close(out[: 3333 + 400], base[: 3333 + 400], rtol=0, atol=0)
         assert not torch.allclose(out[3333 + 400], base[3333 + 400])
+
+
+def _vlm_model(arch: str, backend: str, seq: int, n_image: int, **overrides) -> Transformer:
+    """A two-layer MoT or MoMa model with redrawn weights, so no block is the identity.
+
+    MoMa experts take every token (``moma_capacity_factor=1.0``), so a last-bit
+    difference between the backends cannot change which tokens an expert picks.
+    """
+    torch.manual_seed(0)
+    config = ModelConfig(
+        dim=128,
+        n_layers=2,
+        n_heads=4,
+        vocab_size=256,
+        max_seq_len=seq,
+        attention_backend=backend,
+        **overrides,
+    )
+    vlm = (
+        MoTConfig(max_text_len=seq - n_image)
+        if arch == "mot"
+        else MoMaConfig(
+            moma_experts_per_modality={"image": 2, "text": 2},
+            moma_capacity_factor=1.0,
+            moma_gumbel_noise=False,
+        )
+    )
+    model = Transformer(config, vlm_config=vlm, num_image_tokens=n_image)
+    gen = torch.Generator().manual_seed(1)
+    with torch.no_grad():
+        for param in model.parameters():
+            param.copy_(torch.randn(param.shape, generator=gen) * 0.05)
+    return model.to("cuda")
+
+
+@pytest.mark.gpu
+class TestVLMArchesOnTheCompiledFlexPath:
+    """MoT and MoMa blocks take the same compiled-flex ``BlockMask`` as the text stack.
+
+    The residual is 64 image tokens then 192 text tokens; ``_splits`` puts the
+    document boundaries at 170 and 85, and ``_spans`` reuses group 0 in both
+    documents of each row.
+    """
+
+    SEQ = 256
+    N_IMAGE = 64
+
+    def _inputs(self) -> tuple[torch.Tensor, ModalityContext, torch.Tensor, torch.Tensor]:
+        gen = torch.Generator(device="cuda").manual_seed(0)
+        n_text = self.SEQ - self.N_IMAGE
+        tokens = torch.randint(0, 256, (2, n_text), device="cuda", generator=gen)
+        prefix = torch.randn(2, self.N_IMAGE, 128, device="cuda", generator=gen)
+        modality_ids = torch.ones(2, self.SEQ, dtype=torch.long, device="cuda")
+        modality_ids[:, : self.N_IMAGE] = 0
+        rows = [_spans(self.SEQ, split) for split in _splits(self.SEQ)]
+        doc_ids = torch.tensor([r[0] for r in rows], device="cuda")
+        group_ids = torch.tensor([r[1] for r in rows], device="cuda")
+        return (
+            tokens,
+            ModalityContext(prefix_embeds=prefix, modality_ids=modality_ids),
+            doc_ids,
+            group_ids,
+        )
+
+    @pytest.mark.parametrize("overrides", [{}, {"n_kv_heads": 2}], ids=["mha", "gqa"])
+    @pytest.mark.parametrize("arch", ["mot", "moma"])
+    def test_forward_matches_sdpa(self, arch, overrides):
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA required")
+
+        tokens, modality, doc_ids, group_ids = self._inputs()
+        with torch.no_grad():
+            out = {
+                backend: _vlm_model(arch, backend, self.SEQ, self.N_IMAGE, **overrides).eval()(
+                    tokens, modality=modality, doc_ids=doc_ids, attention_group_ids=group_ids
+                )
+                for backend in ("sdpa", "flex")
+            }
+        torch.testing.assert_close(out["flex"], out["sdpa"], rtol=2e-5, atol=2e-5)
+
+    @pytest.mark.parametrize("arch", ["mot", "moma"])
+    def test_gradients_match_sdpa(self, arch):
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA required")
+
+        tokens, modality, doc_ids, group_ids = self._inputs()
+        models = {}
+        for backend in ("sdpa", "flex"):
+            model = _vlm_model(arch, backend, self.SEQ, self.N_IMAGE)
+            out = model(tokens, modality=modality, doc_ids=doc_ids, attention_group_ids=group_ids)
+            out.float().logsumexp(dim=-1).mean().backward()
+            models[backend] = model
+        _assert_grads_match(models["sdpa"], models["flex"], bound=1e-4)
+
+    def test_mot_documents_stay_isolated(self):
+        """Moving row 0's second document leaves every other position bitwise unchanged."""
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA required")
+
+        tokens, modality, doc_ids, group_ids = self._inputs()
+        model = _vlm_model("mot", "flex", self.SEQ, self.N_IMAGE).eval()
+        split = _splits(self.SEQ)[0]
+        moved = tokens.clone()
+        moved[0, split - self.N_IMAGE :] = (moved[0, split - self.N_IMAGE :] + 1) % 256
+        with torch.no_grad():
+            base, out = (
+                model(t, modality=modality, doc_ids=doc_ids, attention_group_ids=group_ids)
+                for t in (tokens, moved)
+            )
+        torch.testing.assert_close(out[0, :split], base[0, :split], rtol=0, atol=0)
+        torch.testing.assert_close(out[1], base[1], rtol=0, atol=0)
+        assert not torch.allclose(out[0, split:], base[0, split:])
+
+    def test_moma_attention_stays_within_documents(self):
+        """Moving row 0's second document leaves the first block's attention
+        output bitwise unchanged everywhere else."""
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA required")
+
+        tokens, modality, doc_ids, group_ids = self._inputs()
+        model = _vlm_model("moma", "flex", self.SEQ, self.N_IMAGE).eval()
+        captured: list[torch.Tensor] = []
+        first = next(iter(model.layers.values()))
+        first.attention.register_forward_hook(lambda _m, _a, out: captured.append(out))  # type: ignore[reportAttributeAccessIssue]
+        split = _splits(self.SEQ)[0]
+        moved = tokens.clone()
+        moved[0, split - self.N_IMAGE :] = (moved[0, split - self.N_IMAGE :] + 1) % 256
+        with torch.no_grad():
+            for t in (tokens, moved):
+                model(t, modality=modality, doc_ids=doc_ids, attention_group_ids=group_ids)
+        base, out = captured
+        torch.testing.assert_close(out[0, :split], base[0, :split], rtol=0, atol=0)
+        torch.testing.assert_close(out[1], base[1], rtol=0, atol=0)
+        assert not torch.allclose(out[0, split:], base[0, split:])

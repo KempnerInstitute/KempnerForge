@@ -380,7 +380,13 @@ class TestPackedModelFlexBackend:
         """Guards the VLM image-prefix case, where doc_ids would misalign."""
         model = self._model("flex")
         tokens = torch.randint(0, 256, (1, 16))
-        with pytest.raises(ValueError, match="doc_ids length"), torch.no_grad():
+        with (
+            pytest.raises(
+                ValueError,
+                match=r"doc_ids shape \(1, 8\) does not match the residual shape \(1, 16\)",
+            ),
+            torch.no_grad(),
+        ):
             model(tokens, doc_ids=torch.zeros(1, 8, dtype=torch.long))
 
 

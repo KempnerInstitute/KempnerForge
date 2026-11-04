@@ -34,6 +34,7 @@ from kempnerforge.model.masking import (
     flex_attention_fn,
 )
 from kempnerforge.model.modality import ModalityContext
+from kempnerforge.model.mot import MoTAttention, MoTBlock
 from kempnerforge.model.transformer import Transformer, TransformerBlock
 
 CPU = torch.device("cpu")
@@ -340,8 +341,32 @@ class TestBuildAttentionMask:
         assert torch.equal(actual, expected)
 
     def test_rejects_doc_ids_shorter_than_the_residual_stream(self):
-        with pytest.raises(ValueError, match="does not match the sequence length"):
+        with pytest.raises(
+            ValueError, match=r"doc_ids shape \(1, 8\) does not match the residual shape \(1, 12\)"
+        ):
             build_attention_mask(backend="flex", batch=1, seq_len=12, device=CPU, doc_ids=self.DOCS)
+
+    def test_groups_without_documents_hand_no_document_ids_to_the_block_mask(self, monkeypatch):
+        seen: list[object] = []
+        real = masking.build_doc_causal_block_mask
+
+        def spy(doc_ids, device, group_ids=None):
+            seen.append(doc_ids)
+            return real(doc_ids, device, group_ids)
+
+        monkeypatch.setattr(masking, "build_doc_causal_block_mask", spy)
+        self._build("flex", group_ids=self.GROUPS)
+        assert len(seen) == 1
+        assert seen[0] is None
+
+    def test_the_block_mask_builder_takes_group_ids_alone(self):
+        mask = build_doc_causal_block_mask(None, CPU, self.GROUPS)
+        expected = visibility_oracle(8, None, self.GROUPS[0].tolist())
+        assert torch.equal(elementwise_mask_of(mask, 1, 8)[0], expected)
+
+    def test_the_block_mask_builder_needs_documents_or_groups(self):
+        with pytest.raises(ValueError, match="doc_ids or group_ids"):
+            build_doc_causal_block_mask(None, CPU)
 
 
 def elementwise_mask_of(block_mask: BlockMask, batch: int, seq_len: int) -> torch.Tensor:
@@ -372,6 +397,13 @@ class TestAttentionTakesExactlyOneMask:
 
     def test_the_block_passes_the_same_one_mask_through(self):
         params = list(inspect.signature(TransformerBlock.forward).parameters)
+        assert [p for p in params if "mask" in p or p.endswith("_ids")] == ["attn_mask"]
+
+    @pytest.mark.parametrize(
+        "forward", [MoTAttention.forward, MoTBlock.forward], ids=["attn", "block"]
+    )
+    def test_mot_takes_the_same_one_mask(self, forward):
+        params = list(inspect.signature(forward).parameters)
         assert [p for p in params if "mask" in p or p.endswith("_ids")] == ["attn_mask"]
 
     def test_the_transformer_boundary_still_takes_semantic_ids(self):
@@ -500,6 +532,43 @@ class TestKVCacheDecode:
         assert [mask for mask, _ in seen] == [None] * 5
         assert [length for _, length in seen] == [0, 1, 2, 3, 4]
 
+    @staticmethod
+    def _capturing_model(capture: bool) -> tuple[Transformer, list[None]]:
+        """A one-layer model whose attention records every call it receives."""
+        model = _tiny_model("sdpa", n_layers=1)
+        attention = next(iter(model.layers.values())).attention
+        attention.capture_attention_weights = capture  # type: ignore[reportAttributeAccessIssue]
+        calls: list[None] = []
+        attention.register_forward_pre_hook(lambda *_: calls.append(None))  # type: ignore[reportAttributeAccessIssue]
+        return model, calls
+
+    @pytest.mark.parametrize("capture", [False, True], ids=["fused", "capture_weights"])
+    def test_doc_ids_are_refused_with_a_cache_before_any_compute(self, capture):
+        model, calls = self._capturing_model(capture)
+        caches = self._caches(model, max_seq_len=16)
+        with pytest.raises(ValueError, match="doc_ids is training-only"):
+            model(
+                torch.zeros(1, 4, dtype=torch.long),
+                kv_caches=caches,
+                doc_ids=torch.zeros(1, 4, dtype=torch.long),
+            )
+        assert calls == []
+        assert caches[0].seq_len == 0
+
+    @pytest.mark.parametrize("capture", [False, True], ids=["fused", "capture_weights"])
+    def test_a_key_padding_mask_is_refused_with_a_cache_before_any_compute(self, capture):
+        """The mask is square over the residual stream, so it cannot follow a
+        cache's growing key axis; it is refused before any layer runs, on the
+        weight-capture path as on the fused one."""
+        model, calls = self._capturing_model(capture)
+        caches = self._caches(model, max_seq_len=16)
+        padding = torch.tensor([[True, False, True, True]])
+        modality = ModalityContext(inputs_embeds=torch.randn(1, 4, 64), key_padding_mask=padding)
+        with pytest.raises(ValueError, match="modality.key_padding_mask is training-only"):
+            model(modality=modality, kv_caches=caches)
+        assert calls == []
+        assert caches[0].seq_len == 0
+
 
 def _moma_model(backend: str) -> Transformer:
     torch.manual_seed(0)
@@ -556,11 +625,43 @@ class TestMaskInputsAreValidatedAgainstTheBatch:
         with pytest.raises(ValueError, match="does not match the residual shape"):
             build_attention_mask(backend=backend, batch=2, seq_len=8, device=CPU, **{name: value})
 
-    def test_the_dense_constructor_rejects_an_input_that_only_broadcasts(self):
-        with pytest.raises(ValueError, match="does not match the residual shape"):
-            build_dense_attention_mask(
-                batch=2, seq_len=8, device=CPU, doc_ids=torch.zeros(1, 8, dtype=torch.long)
+    @pytest.mark.parametrize("backend", ["sdpa", "flex"])
+    def test_one_forward_validates_its_mask_inputs_once(self, backend, monkeypatch):
+        calls: list[None] = []
+        real = masking._validate_mask_inputs
+
+        def spy(**kwargs):
+            calls.append(None)
+            real(**kwargs)
+
+        monkeypatch.setattr(masking, "_validate_mask_inputs", spy)
+        model = _tiny_model(backend, n_layers=2)
+        with torch.no_grad():
+            model(
+                torch.zeros(1, 8, dtype=torch.long),
+                doc_ids=torch.zeros(1, 8, dtype=torch.long),
+                attention_group_ids=torch.zeros(1, 8, dtype=torch.long),
             )
+        assert len(calls) == 1
+
+    def test_a_shape_error_reads_the_same_from_the_forward_and_the_constructor(self):
+        bad = torch.zeros(1, 7, dtype=torch.long)
+        with pytest.raises(ValueError) as from_forward:
+            _tiny_model("sdpa", n_layers=1)(
+                torch.zeros(1, 8, dtype=torch.long), attention_group_ids=bad
+            )
+        with pytest.raises(ValueError) as from_constructor:
+            build_attention_mask(backend="sdpa", batch=1, seq_len=8, device=CPU, group_ids=bad)
+        assert str(from_forward.value) == str(from_constructor.value)
+
+    @pytest.mark.parametrize("backend", ["sdpa", "flex"])
+    def test_short_doc_ids_on_a_text_model_name_the_residual_shape(self, backend):
+        model = _tiny_model(backend, n_layers=1)
+        with pytest.raises(
+            ValueError, match=r"doc_ids shape \(1, 7\) does not match the residual shape \(1, 8\)"
+        ) as caught:
+            model(torch.zeros(1, 8, dtype=torch.long), doc_ids=torch.zeros(1, 7, dtype=torch.long))
+        assert "image" not in str(caught.value)
 
     def test_a_transformer_forward_rejects_doc_ids_for_one_example_of_a_batch(self):
         model = _tiny_model("sdpa", n_layers=1)
@@ -578,24 +679,147 @@ class TestMaskInputsAreValidatedAgainstTheBatch:
             model(modality=modality)
 
 
-class TestMoTKeepsTheMaskInputValidation:
-    """MoT masks its own streams, so it never reaches the mask constructor.
+def _live_mot_model(backend: str, modalities: tuple[str, ...] = ("image", "text")) -> Transformer:
+    """A two-layer MoT model with every weight redrawn, so no block is the identity."""
+    torch.manual_seed(0)
+    model = Transformer(
+        ModelConfig(
+            dim=64,
+            n_layers=2,
+            n_heads=4,
+            vocab_size=64,
+            max_seq_len=16,
+            attention_backend=backend,
+        ),
+        vlm_config=MoTConfig(max_text_len=8, mot_modalities=modalities),
+        num_image_tokens=4,
+    ).eval()
+    gen = torch.Generator().manual_seed(1)
+    with torch.no_grad():
+        for param in model.parameters():
+            param.copy_(torch.randn(param.shape, generator=gen) * 0.2)
+    return model
 
-    Its mask inputs are validated all the same: dropping the check for one arch
-    would let a packed MoT forward run on a ``doc_ids`` that does not describe
-    its residual stream.
+
+class TestMoTGetsTheSharedMask:
+    """Every visibility rule reaches the MoT residual path on both backends.
+
+    MoT blocks take the one mask every other block takes, so packed documents
+    stay isolated and visibility groups apply. The residual is four image
+    tokens then eight text tokens; document 1 is the last four text tokens.
     """
+
+    PREFIX = torch.randn(1, 4, 64, generator=torch.Generator().manual_seed(2))
+    TOKENS = torch.randint(0, 64, (1, 8), generator=torch.Generator().manual_seed(3))
+    MODALITY_IDS = torch.tensor([[0] * 4 + [1] * 8])
+    DOCS = torch.tensor([[0] * 8 + [1] * 4])
+    GROUPS = torch.tensor([[0, 0, 0, 0, -1, -1, -1, -1, 1, 1, -1, -1]])
+
+    def _forward(
+        self,
+        model: Transformer,
+        tokens: torch.Tensor | None = None,
+        key_padding_mask: torch.Tensor | None = None,
+        **ids: torch.Tensor,
+    ) -> torch.Tensor:
+        modality = ModalityContext(
+            prefix_embeds=self.PREFIX,
+            modality_ids=self.MODALITY_IDS,
+            key_padding_mask=key_padding_mask,
+        )
+        with torch.no_grad():
+            return model(self.TOKENS if tokens is None else tokens, modality=modality, **ids)
+
+    @staticmethod
+    def _record_block_masks(model: Transformer) -> list[object]:
+        seen: list[object] = []
+        for layer in model.layers.values():
+            layer.attn.register_forward_pre_hook(  # type: ignore[reportAttributeAccessIssue]
+                lambda _m, _a, kwargs: seen.append(kwargs.get("attn_mask")), with_kwargs=True
+            )
+        return seen
+
+    @pytest.mark.parametrize("backend", ["sdpa", "flex"])
+    def test_packed_documents_are_isolated(self, backend):
+        model = _live_mot_model(backend)
+        moved = self.TOKENS.clone()
+        moved[:, :4] = (moved[:, :4] + 1) % 64
+        base = self._forward(model, doc_ids=self.DOCS)
+        out = self._forward(model, moved, doc_ids=self.DOCS)
+        torch.testing.assert_close(out[:, 8:], base[:, 8:], rtol=0, atol=0)
+        assert not torch.allclose(out[:, 4:8], base[:, 4:8])
+
+    @pytest.mark.parametrize("backend", ["sdpa", "flex"])
+    def test_a_group_member_sees_a_later_member(self, backend):
+        model = _live_mot_model(backend)
+        moved = self.TOKENS.clone()
+        moved[:, 5] = (moved[:, 5] + 1) % 64
+        causal = [self._forward(model, t, doc_ids=self.DOCS) for t in (self.TOKENS, moved)]
+        grouped = [
+            self._forward(model, t, doc_ids=self.DOCS, attention_group_ids=self.GROUPS)
+            for t in (self.TOKENS, moved)
+        ]
+        torch.testing.assert_close(causal[1][:, 8], causal[0][:, 8], rtol=0, atol=0)
+        assert not torch.allclose(grouped[1][:, 8], grouped[0][:, 8])
+
+    def test_flex_matches_sdpa_with_documents_and_groups(self):
+        out = {
+            backend: self._forward(
+                _live_mot_model(backend), doc_ids=self.DOCS, attention_group_ids=self.GROUPS
+            )
+            for backend in ("sdpa", "flex")
+        }
+        torch.testing.assert_close(out["flex"], out["sdpa"], rtol=1e-5, atol=1e-5)
+
+    @pytest.mark.parametrize("backend", ["sdpa", "flex"])
+    def test_every_mot_block_receives_the_one_shared_mask(self, backend):
+        model = _live_mot_model(backend)
+        seen = self._record_block_masks(model)
+        self._forward(model, doc_ids=self.DOCS)
+        assert len(seen) == len(model.layers)
+        assert seen[0] is not None
+        assert all(mask is seen[0] for mask in seen)
+
+    @pytest.mark.parametrize("backend", ["sdpa", "flex"])
+    def test_an_unmasked_forward_keeps_the_causal_fast_path(self, backend):
+        model = _live_mot_model(backend)
+        seen = self._record_block_masks(model)
+        self._forward(model)
+        assert seen == [None] * len(model.layers)
+
+    @pytest.mark.parametrize("backend", ["sdpa", "flex"])
+    def test_a_key_padding_mask_alone_is_the_causal_and_valid_mask(self, backend):
+        """The same dense mask MoT built for itself from key validity alone."""
+        padding = torch.ones(1, 12, dtype=torch.bool)
+        padding[0, :2] = False
+        padding[0, 7] = False
+        expected = torch.ones(12, 12, dtype=torch.bool).tril().view(1, 1, 12, 12)
+        expected = expected & padding.view(1, 1, 1, 12)
+        expected = expected | ~expected.any(dim=-1, keepdim=True)
+        model = _live_mot_model(backend)
+        seen = self._record_block_masks(model)
+        self._forward(model, key_padding_mask=padding)
+        assert isinstance(seen[0], torch.Tensor)
+        assert torch.equal(seen[0], expected)
 
     @pytest.mark.parametrize("backend", ["sdpa", "flex"])
     def test_rejects_doc_ids_shorter_than_the_residual_stream(self, backend):
-        model = _mot_model(backend)
-        tokens = torch.randint(0, 64, (1, 8), generator=torch.Generator().manual_seed(0))
-        modality = ModalityContext(
-            prefix_embeds=torch.zeros(1, 4, 64),
-            modality_ids=torch.zeros(1, 12, dtype=torch.long),
-        )
-        with pytest.raises(ValueError, match="does not match the sequence length"):
-            model(tokens, modality=modality, doc_ids=torch.zeros(1, 8, dtype=torch.long))
+        with pytest.raises(
+            ValueError, match=r"doc_ids shape \(1, 8\) does not match the residual shape \(1, 12\)"
+        ):
+            self._forward(_live_mot_model(backend), doc_ids=torch.zeros(1, 8, dtype=torch.long))
+
+    @pytest.mark.parametrize("name", ["doc_ids", "attention_group_ids"])
+    def test_a_text_first_modality_order_refuses_documents_and_groups(self, name):
+        """Its attention runs over text then image, so a residual-order mask would misalign."""
+        model = _live_mot_model("sdpa", modalities=("text", "image"))
+        ids = self.DOCS if name == "doc_ids" else self.GROUPS
+        with pytest.raises(ValueError, match="mot_modalities"):
+            self._forward(model, **{name: ids})
+
+    def test_a_text_first_modality_order_still_runs_without_them(self):
+        model = _live_mot_model("sdpa", modalities=("text", "image"))
+        assert self._forward(model).shape == (1, 12, 64)
 
 
 class TestInputsAreValidatedBeforeTheMaskIsBuilt:
@@ -639,19 +863,30 @@ class TestMoMaGetsTheSharedMask:
     """
 
     DOCS = torch.tensor([[0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1]])
+    GROUPS = torch.tensor([[0, 0, 0, -1, -1, -1, 1, 1, 1, -1, -1, -1]])
 
     @staticmethod
-    def _forward(model: Transformer, doc_ids: torch.Tensor | None) -> torch.Tensor:
+    def _forward(
+        model: Transformer, doc_ids: torch.Tensor | None, group_ids: torch.Tensor | None = None
+    ) -> torch.Tensor:
         embeds = torch.randn(1, 12, 64, generator=torch.Generator().manual_seed(1))
         modality = ModalityContext(
             inputs_embeds=embeds, modality_ids=torch.zeros(1, 12, dtype=torch.long)
         )
         with torch.no_grad():
-            return model(modality=modality, doc_ids=doc_ids)
+            return model(modality=modality, doc_ids=doc_ids, attention_group_ids=group_ids)
 
     def test_flex_isolates_documents_exactly_as_sdpa_does(self):
         packed = {b: self._forward(_moma_model(b), self.DOCS) for b in ("sdpa", "flex")}
         torch.testing.assert_close(packed["flex"], packed["sdpa"], rtol=1e-5, atol=1e-5)
+
+    def test_groups_reach_moma_on_both_backends(self):
+        grouped = {
+            b: self._forward(_moma_model(b), self.DOCS, self.GROUPS) for b in ("sdpa", "flex")
+        }
+        torch.testing.assert_close(grouped["flex"], grouped["sdpa"], rtol=1e-5, atol=1e-5)
+        ungrouped = self._forward(_moma_model("sdpa"), self.DOCS)
+        assert not torch.allclose(grouped["sdpa"], ungrouped, rtol=1e-5, atol=1e-5)
 
     @pytest.mark.parametrize("backend", ["sdpa", "flex"])
     def test_packing_actually_changes_the_moma_forward(self, backend):

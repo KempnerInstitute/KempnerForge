@@ -23,7 +23,7 @@ from kempnerforge.model.attention import Attention, KVCache
 from kempnerforge.model.cross_attention import CrossAttentionBlock
 from kempnerforge.model.embedding import OutputHead, TokenEmbedding
 from kempnerforge.model.init import init_weights
-from kempnerforge.model.masking import build_attention_mask, validate_mask_inputs
+from kempnerforge.model.masking import build_attention_mask
 from kempnerforge.model.mlp import build_mlp
 from kempnerforge.model.modality import ModalityContext
 from kempnerforge.model.moe import MoEMLP, build_moe
@@ -360,20 +360,23 @@ class Transformer(nn.Module):
                 the current cache fill level. Cross-arg invariant:
                 ``kv_caches`` forbids ``modality.prefix_embeds``,
                 ``modality.output_slice``, ``modality.image_features``,
-                and ``modality.modality_ids``
-                (all training-only).
+                ``modality.modality_ids``, ``modality.key_padding_mask``,
+                ``doc_ids`` and ``attention_group_ids`` (all training-only).
             doc_ids: Optional per-token document IDs for packed sequences,
-                shape ``(batch, seq_len)``. Enables block-diagonal causal
-                attention that isolates documents within packed sequences.
+                shape ``(batch, seq_len)`` over the residual stream. Enables
+                block-diagonal causal attention that isolates documents within
+                packed sequences.
             attention_group_ids: Optional per-token visibility group ids over
                 the residual stream, shape ``(batch, seq_len)``, int64;
                 negative means no group. Tokens sharing a nonnegative id see
                 each other bidirectionally (e.g. prefix-LM spans):
                 ``visible(q, k) = same_document AND (k <= q OR
                 same_nonnegative_group)``. Without ``doc_ids`` the row is one
-                document. ``None`` leaves attention unchanged, and all-negative
-                ids give the same visibility as ``None``. Training-only:
-                rejected with ``kv_caches`` and on the MoT/MoMa residual paths.
+                document. ``None`` leaves attention unchanged; all-negative ids
+                give the same visibility as ``None`` but still build a mask, so
+                ``None`` is the unmasked fast path. On MoT, ``doc_ids`` and
+                group ids need ``vlm.mot_modalities`` in residual order,
+                ``("image", "text")``.
 
         Returns:
             Logits tensor of shape ``(batch, out_seq_len, vocab_size)``
@@ -409,32 +412,47 @@ class Transformer(nn.Module):
                 raise ValueError(
                     "modality.modality_ids is training-only; cannot be combined with kv_caches"
                 )
+            if key_padding_mask is not None:
+                raise ValueError(
+                    "modality.key_padding_mask is training-only; cannot be combined with kv_caches"
+                )
+            if doc_ids is not None:
+                raise ValueError("doc_ids is training-only; cannot be combined with kv_caches")
+            if attention_group_ids is not None:
+                raise ValueError(
+                    "attention_group_ids is training-only; cannot be combined with kv_caches"
+                )
         if modality_ids is not None and modality_ids.dtype != torch.long:
             raise ValueError(
                 f"modality.modality_ids.dtype must be torch.long, got {modality_ids.dtype}"
             )
-        if attention_group_ids is not None:
-            if attention_group_ids.dtype != torch.long:
-                raise ValueError(
-                    f"attention_group_ids.dtype must be torch.long, got {attention_group_ids.dtype}"
-                )
-            if kv_caches is not None:
-                raise ValueError(
-                    "attention_group_ids is training-only; cannot be combined with kv_caches"
-                )
-            if self._moma_modalities or self._mot_modalities:
-                raise ValueError(
-                    "attention_group_ids is not supported on the MoMa/MoT residual paths"
-                )
-            text = tokens if tokens is not None else inputs_embeds
-            assert text is not None
-            n_prefix = prefix_embeds.shape[1] if prefix_embeds is not None else 0
-            residual_shape = (text.shape[0], n_prefix + text.shape[1])
-            if tuple(attention_group_ids.shape) != residual_shape:
-                raise ValueError(
-                    f"attention_group_ids shape {tuple(attention_group_ids.shape)} does not "
-                    f"match the residual shape {residual_shape}"
-                )
+        if attention_group_ids is not None and attention_group_ids.dtype != torch.long:
+            raise ValueError(
+                f"attention_group_ids.dtype must be torch.long, got {attention_group_ids.dtype}"
+            )
+        mot_order = self._mot_modalities
+        has_ids = doc_ids is not None or attention_group_ids is not None
+        if has_ids and mot_order and mot_order != ("image", "text"):
+            raise ValueError(
+                "doc_ids and attention_group_ids need vlm.mot_modalities = ('image', 'text'), "
+                f"the residual order, got {mot_order!r}: MoT attends over its streams in that "
+                "order, so a mask over the residual would not line up with it."
+            )
+
+        text = tokens if tokens is not None else inputs_embeds
+        assert text is not None
+        batch = text.shape[0]
+        seq_len = text.shape[1] + (prefix_embeds.shape[1] if prefix_embeds is not None else 0)
+        self._validate_modality_ids(modality_ids, (batch, seq_len))
+        attn_mask = build_attention_mask(
+            backend=self.config.attention_backend,
+            batch=batch,
+            seq_len=seq_len,
+            device=text.device,
+            doc_ids=doc_ids,
+            group_ids=attention_group_ids,
+            key_padding_mask=key_padding_mask,
+        )
 
         h = (
             self.token_embedding(tokens)  # type: ignore[reportOptionalCall]
@@ -448,8 +466,6 @@ class Transformer(nn.Module):
                 prefix_embeds = prefix_embeds.to(h.dtype)
             h = torch.cat([prefix_embeds, h], dim=1)
 
-        seq_len = h.shape[1]
-
         start_pos = kv_caches[0].seq_len if kv_caches is not None else 0
 
         if self._rope_cos.device != h.device:  # type: ignore[reportOptionalMemberAccess]
@@ -457,31 +473,6 @@ class Transformer(nn.Module):
             self._rope_sin = self._rope_sin.to(h.device)  # type: ignore[reportOptionalMemberAccess]
         cos = self._rope_cos[start_pos : start_pos + seq_len]  # type: ignore[reportOptionalSubscript]
         sin = self._rope_sin[start_pos : start_pos + seq_len]  # type: ignore[reportOptionalSubscript]
-
-        batch = h.shape[0]
-        self._validate_modality_ids(modality_ids, (batch, seq_len))
-        validate_mask_inputs(
-            batch=batch,
-            seq_len=seq_len,
-            doc_ids=doc_ids,
-            group_ids=attention_group_ids,
-            key_padding_mask=key_padding_mask,
-        )
-
-        mot_masks_its_own_streams = bool(self._mot_modalities)
-        attn_mask = (
-            None
-            if mot_masks_its_own_streams
-            else build_attention_mask(
-                backend=self.config.attention_backend,
-                batch=batch,
-                seq_len=seq_len,
-                device=h.device,
-                doc_ids=doc_ids,
-                group_ids=attention_group_ids,
-                key_padding_mask=key_padding_mask,
-            )
-        )
 
         if self._moma_modalities:
             assert modality_ids is not None
@@ -508,7 +499,7 @@ class Transformer(nn.Module):
                 "text": (cos[:t_text], sin[:t_text]),
             }
             for layer in self.layers.values():
-                streams = layer(streams, rope, key_padding_mask=key_padding_mask)
+                streams = layer(streams, rope, attn_mask=attn_mask)
             streams = {m: self.mot_norms[m](streams[m]) for m in self._mot_modalities}
             h = torch.cat([streams["image"], streams["text"]], dim=1)
         else:

@@ -204,14 +204,27 @@ class PipelineStageModule(nn.Module):
                 stages as an activation -- ``PipelineStage`` calls
                 ``requires_grad_(True)`` on every received buffer without
                 checking dtype, which an integer tensor cannot satisfy. Each
-                stage builds its own mask from them, once per forward: a
-                ``BlockMask`` is not a tensor and could not be transmitted
-                either.
+                stage builds its own document mask from these ids, once per
+                forward: a ``BlockMask`` is not a tensor and could not be
+                transmitted either. Document isolation is the only visibility
+                rule a stage applies; it takes no visibility group ids and no
+                key padding mask.
 
         Returns:
             For last stage: logits of shape (batch, seq_len, vocab_size).
             For other stages: hidden states of shape (batch, seq_len, dim).
+
+        Raises:
+            ValueError: If ``doc_ids`` is not shaped ``(batch, seq_len)``.
         """
+        attn_mask = build_attention_mask(
+            backend=self.config.attention_backend,
+            batch=x.shape[0],
+            seq_len=x.shape[1],
+            device=x.device,
+            doc_ids=doc_ids,
+        )
+
         if self.is_first and self.token_embedding is not None:
             x = self.token_embedding(x)
 
@@ -221,14 +234,6 @@ class PipelineStageModule(nn.Module):
             self._rope_sin = self._rope_sin.to(x.device)  # type: ignore[reportOptionalMemberAccess]
         cos = self._rope_cos[:seq_len]  # type: ignore[reportOptionalSubscript]
         sin = self._rope_sin[:seq_len]  # type: ignore[reportOptionalSubscript]
-
-        attn_mask = build_attention_mask(
-            backend=self.config.attention_backend,
-            batch=x.shape[0],
-            seq_len=seq_len,
-            device=x.device,
-            doc_ids=doc_ids,
-        )
 
         for layer in self.layers.values():
             x = layer(x, cos, sin, attn_mask=attn_mask)
