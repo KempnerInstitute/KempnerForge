@@ -61,9 +61,10 @@ resumes on the same LR schedule and data position, with two exceptions
 listed in [NaN detection](nan-detection.md#what-a-skipped-step-still-does).
 It writes one only if every rank's weights are finite: when a bad update
 (a finite loss with non-finite gradients) has already put NaN into the
-weights, the loop logs an ERROR, saves nothing and stops, so the
-requeued run resumes from the last checkpoint saved rather than from NaN
-weights (see
+weights, the loop logs an ERROR, saves nothing and stops, so `latest`
+still names the last checkpoint saved. That checkpoint holds NaN weights
+only if the bad update's own step saved one: its loss was finite, so its
+save was not checked (see
 [NaN detection § A shutdown after a bad update](nan-detection.md#a-shutdown-after-a-bad-update)).
 The NaN that reaches `max_consecutive` is different: the loop stops on
 it before the check and saves nothing.
