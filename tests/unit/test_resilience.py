@@ -25,10 +25,6 @@ from kempnerforge.resilience.signal_handler import (
     ignore_shutdown_signals_in_worker,
 )
 
-# ---------------------------------------------------------------------------
-# ShutdownHandler
-# ---------------------------------------------------------------------------
-
 
 class TestShutdownHandler:
     def test_initial_state(self):
@@ -39,15 +35,13 @@ class TestShutdownHandler:
     def test_register_and_unregister(self):
         handler = ShutdownHandler()
         handler.register()
-        # Should have our handler installed
         assert signal.getsignal(signal.SIGTERM) is not signal.SIG_DFL
         handler.unregister()
 
     def test_sigterm_sets_flag(self):
-        handler = ShutdownHandler(timeout_sec=0)  # No timeout for test
+        handler = ShutdownHandler(timeout_sec=0)
         handler.register()
         try:
-            # Simulate SIGTERM by sending to ourselves
             os.kill(os.getpid(), signal.SIGTERM)
             assert handler.should_shutdown()
             assert handler.signal_received == signal.SIGTERM
@@ -67,7 +61,6 @@ class TestShutdownHandler:
     def test_finish_cancels_timer(self):
         handler = ShutdownHandler(timeout_sec=60)
         handler.register()
-        # Trigger signal to start timer
         os.kill(os.getpid(), signal.SIGTERM)
         assert handler._timer is not None
         handler.finish()
@@ -77,7 +70,6 @@ class TestShutdownHandler:
         handler = ShutdownHandler(timeout_sec=0)
         handler.register()
         os.kill(os.getpid(), signal.SIGTERM)
-        # No timer created when timeout is 0
         assert handler._timer is None
         handler.unregister()
 
@@ -118,11 +110,6 @@ class TestShutdownHandler:
             handler.finish()
 
 
-# ---------------------------------------------------------------------------
-# NaN Detector
-# ---------------------------------------------------------------------------
-
-
 class TestNaNDetector:
     def test_finite_loss_returns_true(self):
         det = NaNDetector()
@@ -159,7 +146,7 @@ class TestNaNDetector:
         det.check_loss(float("nan"), step=2)
         det.check_loss(1.5, step=3)
         assert det.state.consecutive_nans == 0
-        assert det.state.total_nans == 2  # Total keeps accumulating
+        assert det.state.total_nans == 2
 
     def test_should_rollback(self):
         det = NaNDetector(action="warn", max_consecutive=3)
@@ -178,7 +165,6 @@ class TestNaNDetector:
 
     def test_skip_action(self):
         det = NaNDetector(action="skip")
-        # Should return False but not raise
         assert det.check_loss(float("nan"), step=1) is False
 
     def test_invalid_action_raises(self):
@@ -197,7 +183,7 @@ class TestNaNDetector:
         det = NaNDetector(action="warn", max_history=2)
         for i in range(5):
             det.check_loss(float("nan"), step=i)
-        assert len(det.state.nan_steps) == 2  # Capped at max_history
+        assert len(det.state.nan_steps) == 2
 
     def test_last_good_loss_tracked(self):
         det = NaNDetector(action="warn")
@@ -230,7 +216,6 @@ class TestNaNDetector:
         x = torch.randn(2, 4)
         loss = model(x).sum()
         loss.backward()
-        # Inject NaN into gradients
         model.weight.grad[0, 0] = float("nan")
 
         det = NaNDetector(action="warn")
@@ -248,11 +233,6 @@ class TestNaNDetector:
         det = NaNDetector(action="raise")
         with pytest.raises(RuntimeError, match="NaN/Inf gradient"):
             det.check_gradients(model, step=1)
-
-
-# ---------------------------------------------------------------------------
-# GPU health
-# ---------------------------------------------------------------------------
 
 
 class TestGPUHealth:
@@ -275,14 +255,8 @@ class TestGPUHealth:
         assert health["error"] == ""
 
 
-# ---------------------------------------------------------------------------
-# SLURM / Elastic
-# ---------------------------------------------------------------------------
-
-
 class TestSLURM:
     def test_not_slurm_returns_none(self):
-        # Remove SLURM env vars if present
         old = os.environ.pop("SLURM_JOB_ID", None)
         try:
             assert get_slurm_info() is None
@@ -371,7 +345,6 @@ class TestSLURM:
     def test_get_slurm_info_minimal_env(self):
         """Only SLURM_JOB_ID set — all other fields use defaults."""
         old = os.environ.pop("SLURM_JOB_ID", None)
-        # Clear all SLURM vars
         slurm_keys = [
             "SLURM_JOB_NAME",
             "SLURM_JOB_NODELIST",
@@ -542,12 +515,10 @@ class TestResumePathResolution:
         assert resolve_resume_path(str(tmp_path)) is None
 
     def test_latest_symlink(self, tmp_path):
-        # Create a checkpoint directory
         step_dir = tmp_path / "step_100"
         step_dir.mkdir()
         (step_dir / "metadata.json").write_text("{}")
 
-        # Create "latest" symlink
         latest = tmp_path / "latest"
         latest.symlink_to(step_dir.name)
 
@@ -556,7 +527,6 @@ class TestResumePathResolution:
         assert result.name == "step_100"
 
     def test_fallback_to_highest_step(self, tmp_path):
-        # Create step directories without "latest" symlink
         for step in [10, 50, 30]:
             _durable_step_dir(tmp_path, step)
 
@@ -567,29 +537,17 @@ class TestResumePathResolution:
     def test_ignores_non_step_dirs(self, tmp_path):
         _durable_step_dir(tmp_path, 100)
         (tmp_path / "other_dir").mkdir()
-        (tmp_path / "step_abc").mkdir()  # Not a valid step dir (will cause error)
+        (tmp_path / "step_abc").mkdir()
 
-        # Should find step_100 despite other dirs; step_abc would fail int parse
-        # but our filter only grabs dirs starting with "step_"
-        # Let's only have valid ones
         result = resolve_resume_path(str(tmp_path))
-        # step_abc will cause int("abc") to fail — let's test that separately
         assert result is not None
 
     def test_latest_broken_symlink_falls_back(self, tmp_path):
-        # Create a checkpoint directory
         _durable_step_dir(tmp_path, 50)
 
-        # Create broken "latest" symlink pointing to nonexistent
         latest = tmp_path / "latest"
         latest.symlink_to("step_999")
 
-        # Should still resolve via latest (which resolves to broken path)
-        # but the resolve will point to a non-existent path
-        # Our code checks latest.exists() which follows the symlink
-        # So broken symlink → latest.exists() is False... actually
-        # latest.exists() returns False for broken symlinks
-        # So it should fall back to step_50
         result = resolve_resume_path(str(tmp_path))
         assert result is not None
         assert result.name == "step_50"
@@ -599,7 +557,6 @@ class TestResumePathResolution:
         for step in [10, 50, 100]:
             _durable_step_dir(tmp_path, step)
 
-        # Point latest at step_50 (not the highest)
         latest = tmp_path / "latest"
         latest.symlink_to("step_50")
 
@@ -622,10 +579,7 @@ class TestResumePathResolution:
 
         result = resolve_resume_path(str(tmp_path))
         assert result is not None
-        # Numerically highest is 1000, not lexically highest "step_9"
         assert result.name == "step_1000"
-
-    # -- durability of the step_N fallback (#177) --------------------------
 
     def test_skips_incomplete_newest_and_falls_back(self, tmp_path):
         """An interrupted save must not be selected over an older durable one.
@@ -635,7 +589,7 @@ class TestResumePathResolution:
         dcp.load with "metadata is None".
         """
         _durable_step_dir(tmp_path, 10)
-        (tmp_path / "step_20").mkdir()  # interrupted save: no .metadata
+        (tmp_path / "step_20").mkdir()
 
         result = resolve_resume_path(str(tmp_path))
         assert result is not None
@@ -660,7 +614,7 @@ class TestResumePathResolution:
         """A pp{k}/ subdir without .metadata is still an interrupted save."""
         _durable_step_dir(tmp_path, 10, pp_stages=2)
         partial = tmp_path / "step_20"
-        (partial / "pp0").mkdir(parents=True)  # stage dir exists, never finished
+        (partial / "pp0").mkdir(parents=True)
 
         result = resolve_resume_path(str(tmp_path))
         assert result is not None
@@ -676,7 +630,7 @@ class TestResumePathResolution:
         """
         _durable_step_dir(tmp_path, 10, pp_stages=2)
         partial = _durable_step_dir(tmp_path, 20, pp_stages=2)
-        (partial / "pp1" / ".metadata").unlink()  # stage 1 never finished
+        (partial / "pp1" / ".metadata").unlink()
 
         result = resolve_resume_path(str(tmp_path))
         assert result is not None
@@ -733,11 +687,6 @@ class TestResumePathResolution:
         assert result.name == "step_10"
 
 
-# ---------------------------------------------------------------------------
-# DataLoader worker signal shielding (#177)
-# ---------------------------------------------------------------------------
-
-
 class TestWorkerSignalShielding:
     """SIGTERM is delivered to the process group, so it reaches DataLoader
     workers too. Workers that die take the emergency checkpoint with them:
@@ -767,7 +716,7 @@ class TestWorkerSignalShielding:
 
         def check():
             ignore_shutdown_signals_in_worker(0)
-            os.kill(os.getpid(), signal.SIGTERM)  # would terminate by default
+            os.kill(os.getpid(), signal.SIGTERM)
 
         self._restoring(check)
 

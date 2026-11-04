@@ -43,7 +43,7 @@ class PipelineBundle:
 def pp_group(runtime: RuntimeContext) -> Any:
     """The PP process group for this rank, derived on demand."""
     mesh = runtime.device_mesh
-    if mesh is None:  # unreachable: validate() rejects pp > 1 without a mesh
+    if mesh is None:
         raise RuntimeError("pipeline parallelism requires a device mesh")
     return mesh["pp"].get_group()
 

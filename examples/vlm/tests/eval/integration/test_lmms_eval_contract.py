@@ -1,5 +1,4 @@
 # pyright: reportMissingImports=false
-# ^ lmms-eval is an optional, undeclared dependency; see lmms_adapter.py's directive.
 """Contract tests pinning the real ``lmms_eval`` API to what this example assumes.
 
 The VLM-eval unit tests run against an in-repo fake ``lmms_eval``
@@ -18,7 +17,6 @@ import pytest
 
 lmms_eval = pytest.importorskip("lmms_eval")
 if getattr(lmms_eval, "__file__", None) is None:
-    # The unit fake (a bare module object) is active; contract tests need the real package.
     pytest.skip(
         "fake lmms_eval is active; skipping real-package contract tests", allow_module_level=True
     )
@@ -54,7 +52,6 @@ class TestChatMessagesContract:
 
 class TestCollatorContract:
     def test_group_sort_batch_and_restore(self):
-        # Mirrors the adapter: group_fn -> gen_kwargs dict, sort_fn -> -len(context).
         arr = [
             ("longest-context", None, {"max_new_tokens": 4}),
             ("c", None, {"max_new_tokens": 4}),
@@ -62,22 +59,17 @@ class TestCollatorContract:
         ]
         col = Collator(arr, lambda a: -len(a[0]), group_fn=lambda a: a[2], grouping=True)
         flat = [item for batch in col.get_batched(n=2, batch_fn=None) for item in batch]
-        assert sorted(map(id, flat)) == sorted(map(id, arr))  # all items present
-        assert col.get_original(flat) == arr  # original request order restored
+        assert sorted(map(id, flat)) == sorted(map(id, arr))
+        assert col.get_original(flat) == arr
 
 
 class TestSimpleEvaluateContract:
     def test_harness_call_shape(self):
         import inspect
 
-        # Unlike the api/protocol/utils imports above, importing the evaluator can
-        # fail on the cluster with `GLIBCXX_... not found` — an environment problem,
-        # not API drift; the README's libstdc++ note has the fix.
         from lmms_eval.evaluator import simple_evaluate
 
         sig = inspect.signature(simple_evaluate)
-        # Exactly the harness call: a prebuilt adapter instance + a record-only
-        # model_args string + tasks/device/batch_size/limit.
         sig.bind(
             model=object(),
             model_args="config=c.toml,checkpoint=ckpt",
@@ -85,9 +77,9 @@ class TestSimpleEvaluateContract:
             device="cuda",
             batch_size=1,
             limit=8,
-        )  # raises TypeError on drift
+        )
         required = [n for n, p in sig.parameters.items() if p.default is inspect.Parameter.empty]
-        assert required == ["model"]  # an lmms instance is accepted; everything else optional
+        assert required == ["model"]
         assert sig.parameters["model_args"].default is None
         assert sig.parameters["tasks"].default is None
         assert sig.parameters["limit"].default is None
@@ -110,7 +102,7 @@ class TestLmmsBaseContract:
         probe = _Probe()
         assert probe.rank == 0 and probe.world_size == 1
         assert probe.task_dict == {}
-        probe.cache_hook.add_partial("generate_until", ("ctx", {}), "out")  # no-op, must not raise
+        probe.cache_hook.add_partial("generate_until", ("ctx", {}), "out")
 
 
 class TestInstanceContract:
@@ -169,7 +161,6 @@ class TestResultsContract:
     def test_evaluate_returns_the_keys_the_publisher_reads(self):
         import inspect
 
-        # Importing the evaluator can fail with `GLIBCXX_... not found` on the cluster.
         from lmms_eval import evaluator
 
         source = inspect.getsource(evaluator.evaluate)

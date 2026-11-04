@@ -93,9 +93,7 @@ class TestBuildAndForward:
         cfg = _tiny_ca_configs()
         wrapper = _build(cfg)
         assert isinstance(wrapper, VLMWrapper)
-        # CA arch: residual stream is text-only.
         assert wrapper.num_image_tokens == 0
-        # 4 layers + cadence 2 -> 2 CA blocks.
         assert len(wrapper.transformer.cross_attention_layers) == 2
 
         pixels, input_ids, labels = _dummy_batch(wrapper)
@@ -103,7 +101,6 @@ class TestBuildAndForward:
         assert logits.shape == (2, 16, cfg[0].vocab_size)
         loss = logits.float().sum()
         loss.backward()
-        # Adapter and CA layers receive gradients (encoder is frozen).
         adapter_grads = [
             p.grad
             for n, p in wrapper.named_parameters()
@@ -125,15 +122,12 @@ class TestBuildAndForward:
         wrapper = _build(cfg)
         trainable = {name for name, p in wrapper.named_parameters() if p.requires_grad}
         frozen = {name for name, p in wrapper.named_parameters() if not p.requires_grad}
-        # CA params must be frozen.
         assert all(
             n.startswith("transformer.cross_attention_layers")
             for n in frozen
             if n.startswith("transformer.")
         )
-        # Regular transformer.layers params must be trainable.
         assert any(n.startswith("transformer.layers") for n in trainable)
-        # Adapter is trainable too.
         assert any(n.startswith("adapter") for n in trainable)
 
     def test_image_features_dtype_propagation(self):
@@ -144,11 +138,9 @@ class TestBuildAndForward:
         """
         cfg = _tiny_ca_configs()
         wrapper = _build(cfg, param_dtype=torch.bfloat16)
-        # Adapter params are bf16; encoder is in HF default (fp32).
         assert wrapper.adapter.proj1.weight.dtype == torch.bfloat16
         pixels, input_ids, _ = _dummy_batch(wrapper)
         logits, _ = wrapper(pixels, input_ids)
-        # Output dtype matches transformer (bf16).
         assert logits.dtype == torch.bfloat16
 
     def test_ca_compile_eager_parity(self):
@@ -156,7 +148,7 @@ class TestBuildAndForward:
         a small tolerance. Catches compile-graph divergence in the
         CA-interleaved forward path."""
         cfg = _tiny_ca_configs()
-        wrapper = _build(cfg, param_dtype=torch.float32)  # fp32 for tighter comparison
+        wrapper = _build(cfg, param_dtype=torch.float32)
         wrapper.eval()
         pixels, input_ids, _ = _dummy_batch(wrapper, batch=1, text_len=8)
 
@@ -183,7 +175,6 @@ class TestFreezeStageHook:
                 FreezeSpec("adapter", False),
             ],
         )
-        # Schedule: at step 3, freeze adapter. At step 7, unfreeze adapter.
         cfg[3].freeze_schedule = [
             FreezeStage(start_step=3, specs=(FreezeSpec("adapter", True),)),
             FreezeStage(start_step=7, specs=(FreezeSpec("adapter", False),)),
@@ -192,17 +183,14 @@ class TestFreezeStageHook:
 
         adapter_params = [p for n, p in wrapper.named_parameters() if n.startswith("adapter")]
 
-        # Step 0: adapter trainable (base spec).
         for p in adapter_params:
             assert p.requires_grad
 
-        # At step 3: apply effective_freeze and confirm adapter is frozen.
         specs = effective_freeze(3, cfg[3].freeze, cfg[3].freeze_schedule)
         apply_freeze_specs(wrapper, specs, cfg[3].module_patterns)
         for p in adapter_params:
             assert not p.requires_grad
 
-        # At step 7: unfreeze.
         specs = effective_freeze(7, cfg[3].freeze, cfg[3].freeze_schedule)
         apply_freeze_specs(wrapper, specs, cfg[3].module_patterns)
         for p in adapter_params:
@@ -217,11 +205,9 @@ class TestFreezeStageHook:
         cfg = _tiny_ca_configs(freeze=[FreezeSpec("adapter", True)])
         wrapper = _build(cfg, param_dtype=torch.float32)
 
-        # Snapshot adapter weights before the optimizer step.
         before = {
             n: p.detach().clone() for n, p in wrapper.named_parameters() if n.startswith("adapter")
         }
-        # Sanity: frozen really means requires_grad=False.
         assert all(
             not p.requires_grad for n, p in wrapper.named_parameters() if n.startswith("adapter")
         )
@@ -232,7 +218,6 @@ class TestFreezeStageHook:
             weight_decay=0.1,
         )
 
-        # Run 5 forward + backward + optimizer.step cycles.
         for _ in range(5):
             pixels, input_ids, labels = _dummy_batch(wrapper, batch=2, text_len=8)
             logits, _ = wrapper(pixels, input_ids, labels)
@@ -241,7 +226,6 @@ class TestFreezeStageHook:
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
 
-        # Adapter weights bit-identical (frozen + AdamW skips entire step).
         for n, p in wrapper.named_parameters():
             if n.startswith("adapter"):
                 assert torch.equal(p, before[n]), f"Frozen param drifted: {n}"
@@ -258,7 +242,6 @@ class TestFreezeStageHook:
         with torch.no_grad():
             logits_a, _ = wrapper_a(pixels, input_ids)
 
-        # Save state, build a fresh wrapper, load into it.
         state = wrapper_a.state_dict()
         wrapper_b = _build(cfg, param_dtype=torch.float32)
         wrapper_b.load_state_dict(state, strict=True)
@@ -303,17 +286,11 @@ class TestFreezeStageHook:
         jd_wrapper = _build(jd_cfg)
         ca_wrapper = _build(ca_cfg)
 
-        # Load JD state into CA wrapper (strict=False because CA has
-        # extra cross_attention_layers.* keys not in JD).
         jd_state = jd_wrapper.state_dict()
-        # Filter out JD-specific items that don't exist in CA (none expected
-        # in this setup since the backbone is identical).
         missing, unexpected = ca_wrapper.load_state_dict(jd_state, strict=False)
-        # CA-only keys appear in `missing` because JD didn't provide them.
         assert all(k.startswith("transformer.cross_attention_layers") for k in missing)
         assert unexpected == []
 
-        # Forward still works (CA layers at zero-init are identity).
         ca_wrapper.eval()
         pixels, input_ids, _ = _dummy_batch(ca_wrapper)
         with torch.no_grad():
@@ -329,15 +306,9 @@ class TestFreezeStageHook:
         with valid_modules set.
         """
         cfg = _tiny_ca_configs()
-        # FreezeStage with a typo'd module alias: "adaptor" not in
-        # module_patterns ({transformer, vision_encoder, adapter,
-        # cross_attention} for CrossAttentionConfig).
         cfg[3].freeze_schedule = [
             FreezeStage(start_step=5, specs=(FreezeSpec("adaptor", True),)),
         ]
-        # The validation fires when effective_freeze is called with
-        # valid_modules=set(module_patterns.keys()), which freeze_meta_at_step
-        # does at every save and at resume.
         valid_modules = set(cfg[3].module_patterns.keys())
         with pytest.raises(ValueError, match="adaptor"):
             effective_freeze(
@@ -379,14 +350,12 @@ class TestFreezeStageHook:
             ),
         )
         wrapper = _build(cfg, param_dtype=torch.float32)
-        # 4 layers, frequency=2 -> 2 MoE blocks (layers 1 and 3).
         from kempnerforge.model.moe import MoEMLP
 
         moe_blocks = sum(
             1 for layer in wrapper.transformer.layers.values() if isinstance(layer.mlp, MoEMLP)
         )
         assert moe_blocks == 2, f"expected 2 MoE blocks, got {moe_blocks}"
-        # 4 layers, CA cadence=2 -> 2 CA blocks. CA blocks remain dense.
         assert len(wrapper.transformer.cross_attention_layers) == 2
 
         opt = torch.optim.AdamW(wrapper.parameters(), lr=3e-3)
@@ -408,12 +377,10 @@ class TestFreezeStageHook:
             opt.zero_grad()
             losses.append((ce.item(), aux.item()))
 
-        # CE decreases.
         initial_ce, final_ce = losses[0][0], losses[-1][0]
         assert final_ce < initial_ce, (
             f"VLM + MoE: CE did not decrease ({initial_ce:.3f} -> {final_ce:.3f})"
         )
-        # aux_loss is non-zero throughout — router is producing real loss.
         assert all(a > 0 for _, a in losses), "aux_loss zeroed out"
 
     def test_ca_overfits_tiny_dataset(self):
@@ -431,14 +398,9 @@ class TestFreezeStageHook:
         wrapper = _build(cfg, param_dtype=torch.float32)
         wrapper.train()
 
-        # 8 distinct (pixels, input_ids) pairs.
         n_pairs = 8
         text_len = 8
         pixels_dataset = torch.randn(n_pairs, 3, 32, 32, device=DEVICE)
-        # Force a strong image -> text correlation: each label sequence
-        # is determined by the image (via a hash), so fitting the data
-        # requires using the image features. Otherwise text-only prior
-        # could match if labels were random.
         input_ids_dataset = torch.zeros(n_pairs, text_len, dtype=torch.long, device=DEVICE)
         for i in range(n_pairs):
             seed_val = int(pixels_dataset[i].sum().item() * 1000) % cfg[0].vocab_size
@@ -454,13 +416,10 @@ class TestFreezeStageHook:
             loss = loss_fn(logits.reshape(-1, cfg[0].vocab_size), labels.reshape(-1))
             return loss
 
-        # Initial loss: forward over the full mini-dataset.
         with torch.no_grad():
             initial_loss = _train_step(pixels_dataset, input_ids_dataset, input_ids_dataset).item()
 
-        # Train.
         for _ in range(200):
-            # Shuffle the 8-pair "epoch" each iteration.
             perm = torch.randperm(n_pairs, device=DEVICE)
             pixels_b = pixels_dataset[perm]
             ids_b = input_ids_dataset[perm]
@@ -476,11 +435,9 @@ class TestFreezeStageHook:
                 zero_pixels, input_ids_dataset, input_ids_dataset
             ).item()
 
-        # (a) Model learned: final loss is much smaller than initial.
         assert final_loss < 0.5 * initial_loss, (
             f"Model did not learn: initial={initial_loss:.3f}, final={final_loss:.3f}"
         )
-        # (b) Model uses images: loss with real images < loss with zero images.
         assert final_loss < loss_with_zero_images, (
             f"Model ignores images: real_img_loss={final_loss:.3f}, "
             f"zero_img_loss={loss_with_zero_images:.3f}"

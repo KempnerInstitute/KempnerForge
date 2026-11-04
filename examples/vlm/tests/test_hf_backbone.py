@@ -38,8 +38,6 @@ SOURCE_CONFIG = {
     "num_key_value_heads": 2,
     "head_dim": 16,
     "intermediate_size": 96,
-    # The epsilon every norm of the built transformer uses, so the logits below
-    # match bit for bit.
     "rms_norm_eps": 1e-5,
     "rope_theta": 1e6,
     "max_position_embeddings": 64,
@@ -70,7 +68,7 @@ def _save_source(path: Path, *, tie: bool) -> Any:
     model = Qwen3ForCausalLM(Qwen3Config(tie_word_embeddings=tie, **SOURCE_CONFIG)).eval()
     with torch.no_grad():
         for name, param in model.named_parameters():
-            if "norm" in name:  # all-ones norms would hide a swapped norm mapping
+            if "norm" in name:
                 param.copy_(1 + 0.5 * torch.randn_like(param))
     model.save_pretrained(path)
     return model
@@ -199,7 +197,7 @@ class TestRoundTrip:
         config = load_config(config_path, cli_args=[])
         assert config.vlm is not None and config.vision_encoder is not None
         assert config.adapter is not None
-        torch.manual_seed(1234)  # a different init, so only the load can make them agree
+        torch.manual_seed(1234)
         model = build_vlm_wrapper(config.model, config.vision_encoder, config.adapter, config.vlm)
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
         manager = CheckpointManager(config.checkpoint, model, optimizer)
@@ -309,7 +307,7 @@ class TestRoundTrip:
                 "repo_id": "some-org/some-model",
                 "allow_patterns": p,
                 "ignore_patterns": ["*/*"],
-                "revision": None,  # the snapshot is not named for a commit here
+                "revision": None,
             }
             for p in (
                 ["config.json"],
@@ -479,16 +477,12 @@ class TestConfigRefusals:
                 "the source uses rope_type='linear'",
             ),
             (
-                # The library's own validation is the source's problem, and refuses it.
                 lambda c: c["rope_parameters"].update(rope_type="yarn"),
                 "the installed transformers does not accept the source's config",
             ),
             (lambda c: c.update(use_sliding_window=True), "use_sliding_window is set"),
             (lambda c: c.update(attention_bias=True), "attention_bias is set"),
             (
-                # Each spelling of the theta decides the positions, and which one a
-                # release reads differs, so a source that disagrees with itself is
-                # refused rather than resolved.
                 lambda c: c.update(rope_theta=1e6, rope_parameters={"rope_theta": 1e4}),
                 "the source gives more than one RoPE theta",
             ),
@@ -501,8 +495,6 @@ class TestConfigRefusals:
                 "rope_scaling gives both rope_type='default' and type='linear'",
             ),
             (
-                # The value compared is then the library's own default, which the
-                # user's file does not contain anywhere.
                 lambda c: [c.pop(field, None) for field in _ROPE_FIELDS],
                 "config.json gives no RoPE theta, so the installed transformers applies",
             ),
@@ -607,7 +599,7 @@ class TestNormEpsilon:
 
     def test_a_norm_with_another_epsilon_is_named(self) -> None:
         transformer = self._transformer(1e-5)
-        conv.check_norm_eps(transformer, 1e-5)  # the built model agrees with the source
+        conv.check_norm_eps(transformer, 1e-5)
 
         transformer.layers["0"].attention_norm.eps = 1e-6
         with pytest.raises(ValueError, match=r"layers.0.attention_norm"):
@@ -910,7 +902,7 @@ class TestDeterminism:
 
     def test_default_seed_is_the_train_seed(self, tied: Path, tmp_path: Path) -> None:
         default = self._convert(tied, tmp_path, "a")
-        explicit = self._convert(tied, tmp_path, "b", seed=7)  # the target's [train].seed
+        explicit = self._convert(tied, tmp_path, "b", seed=7)
         for key in default:
             assert torch.equal(default[key], explicit[key]), key
 
