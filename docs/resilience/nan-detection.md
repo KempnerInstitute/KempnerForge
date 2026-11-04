@@ -23,7 +23,9 @@ if not nan_detector.check_loss(avg_loss, step):
     _advance_lr_schedule(session)            # scheduler.step(), then the phase lr_scale
     step += 1
     _apply_step_transitions(session, step)   # FreezeStages and data phases due at step
-    if _shutdown_if_requested(session, step, tokens_seen, saved_this_step=False):
+    if _shutdown_if_requested(               # saves only finite weights
+        session, step, tokens_seen, saved_this_step=False, nan_skipped=True
+    ):
         break
     continue
 ```
@@ -51,7 +53,7 @@ tick except the shutdown check are dropped:
 | `tokens_seen`, metrics, `on_step_end` hooks | Skipped. |
 | LR schedule | Advanced: `scheduler.step()`, then the active phase's `lr_scale`, so warmup and decay stay on the step counter. |
 | `FreezeStage` and data phases due at the new step | Applied. A `FreezeStage` waits behind the same async-save fence as on a finite step. |
-| Shutdown check | Run. A pending SIGTERM / SIGUSR1 writes the emergency checkpoint at the new step, then the loop stops. |
+| Shutdown check | Run. A pending SIGTERM / SIGUSR1 writes the emergency checkpoint at the new step, unless the weights are not finite (see [A shutdown after a bad update](#a-shutdown-after-a-bad-update)), then the loop stops. |
 | Eval, NCCL health check, scheduled checkpoint | Skipped until their next interval. |
 | Profiler step | Skipped; the profiler steps on the next finite step. |
 
@@ -79,6 +81,31 @@ Two edge cases:
   "Detected call of `lr_scheduler.step()` before `optimizer.step()`".
   That is expected: the skipped step uses up its LR value like any
   other step.
+
+### A shutdown after a bad update
+
+A run of NaN steps can start with a bad update: a step whose loss is
+finite but whose gradients are not, so the optimizer writes NaN / Inf
+into the weights and every loss after it is NaN. The steps that follow
+are skipped, but the weights they leave are not finite, and an
+emergency checkpoint of one of them would become `latest` and count
+toward `checkpoint.keep_last_n`. With `keep_last_n = 1` it would prune
+the last good checkpoint, and the requeued run would resume from NaN
+weights.
+
+So before it saves a skipped step, the shutdown check calls
+`params_are_finite` (`kempnerforge/resilience/health.py`): each rank
+checks the parameters it holds, and one all-reduce gives every rank the
+same answer. The check runs only when a shutdown is pending on a
+skipped step. If any parameter is not finite, the loop logs an ERROR,
+writes no checkpoint, finishes the shutdown and stops: `latest` still
+names the last checkpoint saved, and no older one is pruned to make
+room. A skipped step whose weights are finite, such as one whose NaN
+came from the data, writes its emergency checkpoint as before.
+
+The bad update's own step has a finite loss, so a shutdown or a
+scheduled save on that step is not checked and writes the weights it
+produced.
 
 ## Three actions
 
@@ -179,7 +206,8 @@ storm, so whatever state caused the explosion is baked in. That also
 holds for an emergency checkpoint a shutdown wrote during the storm:
 skipped steps leave the weights as they were (the sigmoid router's
 `expert_bias` aside), so it carries the pre-storm weights under a later
-step.
+step. A storm that a bad update started leaves no such checkpoint (see
+[A shutdown after a bad update](#a-shutdown-after-a-bad-update)).
 
 ## Manual use
 
@@ -198,6 +226,12 @@ for step, batch in enumerate(loader):
 `model.named_parameters()` and returns `False` on the first NaN grad.
 The `action="raise"` mode raises `RuntimeError` instead of returning
 `False` (the warning case still returns `False`).
+
+`params_are_finite(model, device)` from
+`kempnerforge.resilience.health` checks the parameters themselves and
+returns `False` if any rank holds a NaN / Inf one. When running
+distributed it all-reduces a flag on `device` (CUDA under NCCL), so
+every rank must call it.
 
 ## Limitations
 
