@@ -15,6 +15,7 @@ import torch.nn.functional as F
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard
 
+from kempnerforge.config.registry import registry
 from kempnerforge.config.schema import TrainConfig
 from kempnerforge.training.loss import (
     build_loss_fn,
@@ -30,9 +31,9 @@ ALL_MASKED_LOSSES = {
 }
 
 FP32_LOSSES = {
-    "cross_entropy": cross_entropy_loss,
+    "cross_entropy": functools.partial(cross_entropy_loss, fp32=True),
     **{
-        f"chunked_{size}": functools.partial(chunked_cross_entropy_loss, chunk_size=size)
+        f"chunked_{size}": functools.partial(chunked_cross_entropy_loss, chunk_size=size, fp32=True)
         for size in (1, 3, 7, 64, 4096)
     },
 }
@@ -134,7 +135,7 @@ class TestChunkedCrossEntropy:
 
 
 class TestFp32CrossEntropy:
-    """bf16 logits get an fp32 loss and gradient, in one pass or one chunk at a time."""
+    """With ``fp32=True``, bf16 logits get an fp32 loss and gradient, whole or chunked."""
 
     @pytest.mark.parametrize(
         "device",
@@ -204,7 +205,7 @@ class TestFp32CrossEntropy:
 
     def test_all_masked_returns_fp32_zero(self) -> None:
         logits = torch.randn(2, 8, 16).bfloat16()
-        loss = cross_entropy_loss(logits, torch.full((2, 8), -100))
+        loss = FP32_LOSSES["cross_entropy"](logits, torch.full((2, 8), -100))
         assert loss.dtype == torch.float32 and loss.item() == 0.0
 
     @pytest.mark.gpu
@@ -220,9 +221,9 @@ class TestFp32CrossEntropy:
         torch.cuda.reset_peak_memory_stats()
         before = torch.cuda.memory_allocated()
         if chunk_size is None:
-            cross_entropy_loss(logits, labels).backward()
+            cross_entropy_loss(logits, labels, fp32=True).backward()
         else:
-            chunked_cross_entropy_loss(logits, labels, chunk_size=chunk_size).backward()
+            chunked_cross_entropy_loss(logits, labels, chunk_size=chunk_size, fp32=True).backward()
         torch.cuda.synchronize()
         extra = torch.cuda.max_memory_allocated() - before
         grad_bytes = tokens * vocab * 2
@@ -283,8 +284,35 @@ class TestBuildLossFn:
         expected = chunked_cross_entropy_loss(logits, labels, chunk_size=16)
         torch.testing.assert_close(fn(logits, labels), expected)
 
-    def test_cross_entropy_ignores_the_chunk_size(self) -> None:
-        assert build_loss_fn(TrainConfig(ce_chunk_size=16)) is cross_entropy_loss
+    def test_fp32_off_returns_the_loss_unchanged(self) -> None:
+        assert build_loss_fn(TrainConfig()) is cross_entropy_loss
+
+    def test_fp32_off_keeps_bf16_logits_in_bf16(self) -> None:
+        logits = torch.randn(2, 8, 100).bfloat16()
+        loss = build_loss_fn(TrainConfig())(logits, torch.randint(0, 100, (2, 8)))
+        assert loss.dtype == torch.bfloat16
+
+    @pytest.mark.parametrize(
+        ("loss_fn", "ce_chunk_size", "keywords"),
+        [
+            ("cross_entropy", 16, {"fp32": True}),
+            ("chunked_cross_entropy", 0, {"chunk_size": 4096, "fp32": True}),
+            ("chunked_cross_entropy", 16, {"chunk_size": 16, "fp32": True}),
+        ],
+    )
+    def test_fp32_on_binds_fp32(self, loss_fn: str, ce_chunk_size: int, keywords: dict) -> None:
+        config = TrainConfig(loss_fn=loss_fn, ce_chunk_size=ce_chunk_size, fp32_cross_entropy=True)
+        fn = build_loss_fn(config)
+        assert isinstance(fn, functools.partial)
+        assert fn.keywords == keywords
+        logits = torch.randn(2, 8, 100).bfloat16()
+        assert fn(logits, torch.randint(0, 100, (2, 8))).dtype == torch.float32
+
+    def test_fp32_on_rejects_another_loss(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setitem(registry._get_store("loss"), "mse_test", lambda x, y: x)
+        config = TrainConfig(loss_fn="mse_test", fp32_cross_entropy=True)
+        with pytest.raises(ValueError, match="fp32_cross_entropy applies to"):
+            build_loss_fn(config)
 
     def test_chunked_ce_default_chunk_size(self):
         """ce_chunk_size=0 should default to 4096."""

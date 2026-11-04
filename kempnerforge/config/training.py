@@ -44,6 +44,7 @@ class TrainConfig:
     loss_fn: str = "cross_entropy"
     z_loss_weight: float = 0.0
     ce_chunk_size: int = 0
+    fp32_cross_entropy: bool = False
     shutdown_timeout_sec: float = 600.0
     nccl_health_check_interval: int = 0
 
