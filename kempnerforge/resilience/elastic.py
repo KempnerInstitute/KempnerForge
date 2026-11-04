@@ -95,7 +95,7 @@ def is_slurm_requeue() -> bool:
     return int(os.environ.get("SLURM_RESTART_COUNT", "0")) > 0
 
 
-def resolve_resume_path(checkpoint_dir: str) -> Path | None:
+def resolve_resume_path(checkpoint_dir: str, *, require_train_state: bool = True) -> Path | None:
     """Find the latest checkpoint for auto-resume.
 
     Checks:
@@ -117,6 +117,9 @@ def resolve_resume_path(checkpoint_dir: str) -> Path | None:
 
     Args:
         checkpoint_dir: Base checkpoint directory.
+        require_train_state: Skip a ``step_N`` whose shards hold optimizer state but
+            that has no ``train_state.pt``. A caller that loads the weights alone, which
+            such a checkpoint still holds in full, passes False to keep the newest one.
 
     Returns:
         Path to the latest usable checkpoint, or None if none found.
@@ -146,7 +149,7 @@ def resolve_resume_path(checkpoint_dir: str) -> Path | None:
 
     for path in step_dirs:
         if _dcp_durable(path):
-            if not missing_train_state(path):
+            if not require_train_state or not missing_train_state(path):
                 logger.info(f"Auto-resume: found checkpoint at {path}")
                 return path
             logger.warning(
