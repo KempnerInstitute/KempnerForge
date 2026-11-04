@@ -272,9 +272,9 @@ standard error and sample count) and `scores.json` are uploaded to the same run 
 `eval/step_<N>/<UTC timestamp>/`, one directory per evaluation, so repeated or concurrent
 evaluations never overwrite each other. No run is started, ended or edited.
 
-Publishing is on by default and `--no-publish` turns it off. It needs the `mlflow` and
-`eval` dependency groups (`uv sync --group mlflow --group eval`, plus `video` for video
-tasks) and credentials for the run's tracking server, by any of the routes in
+Publishing is on by default and `--no-publish` turns it off. It needs the `eval` dependency
+group (`uv sync --group eval`, plus `video` for video tasks; the MLflow client installs with
+KempnerForge) and credentials for the run's tracking server, by any of the routes in
 [MLflow backend § Authentication](../../docs/metrics-and-profiling/mlflow.md#authentication).
 Publishing authenticates the way training does, so a route that trains also publishes, except
 `user:token@` credentials in the tracking URI, which checkpoints never record.

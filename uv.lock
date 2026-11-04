@@ -1398,7 +1398,11 @@ name = "kempnerforge"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "databricks-sdk" },
     { name = "datasets" },
+    { name = "mlflow-skinny" },
+    { name = "nvidia-ml-py" },
+    { name = "psutil" },
     { name = "tensorboard" },
     { name = "tokenizers" },
     { name = "torch" },
@@ -1432,19 +1436,17 @@ docs = [
 eval = [
     { name = "pandas" },
 ]
-mlflow = [
-    { name = "databricks-sdk" },
-    { name = "mlflow-skinny" },
-    { name = "nvidia-ml-py" },
-    { name = "psutil" },
-]
 video = [
     { name = "av" },
 ]
 
 [package.metadata]
 requires-dist = [
+    { name = "databricks-sdk", specifier = ">=0.20" },
     { name = "datasets" },
+    { name = "mlflow-skinny", specifier = ">=3.1" },
+    { name = "nvidia-ml-py" },
+    { name = "psutil" },
     { name = "tensorboard" },
     { name = "tokenizers" },
     { name = "torch", specifier = ">=2.6", index = "https://download.pytorch.org/whl/cu128" },
@@ -1476,12 +1478,6 @@ docs = [
     { name = "sphinx-copybutton", specifier = ">=0.5" },
 ]
 eval = [{ name = "pandas" }]
-mlflow = [
-    { name = "databricks-sdk", specifier = ">=0.20" },
-    { name = "mlflow-skinny", specifier = ">=3.1" },
-    { name = "nvidia-ml-py" },
-    { name = "psutil" },
-]
 video = [{ name = "av", specifier = ">=17.1.0" }]
 
 [[package]]
