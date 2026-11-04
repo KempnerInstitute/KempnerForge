@@ -16,7 +16,6 @@ from kempnerforge.distributed.parallel import apply_ac, apply_fsdp2, get_dp_mesh
 from kempnerforge.distributed.setup import get_world_info
 from kempnerforge.model.transformer import Transformer
 
-# Skip entire module if not running under torchrun
 pytestmark = pytest.mark.skipif(
     "RANK" not in os.environ,
     reason="Requires torchrun launcher (RANK not set)",
@@ -36,7 +35,6 @@ class TestInitDistributed:
 
     def test_mesh_dim_names(self, distributed_env):
         mesh = distributed_env
-        # Default config: all DP → should have "dp_shard" dimension
         assert "dp_shard" in mesh.mesh_dim_names
 
     def test_cuda_device_set(self):
@@ -54,7 +52,6 @@ class TestFSDP2:
         mesh = distributed_env
         model = Transformer(SMALL_CONFIG).cuda()
         apply_fsdp2(model, mesh)
-        # Model should still be callable
         tokens = torch.randint(0, 1000, (2, 32), device="cuda")
         with torch.no_grad():
             out = model(tokens)
@@ -70,7 +67,6 @@ class TestFSDP2:
         loss = out.sum()
         loss.backward()
 
-        # All parameters should have gradients
         for name, p in model.named_parameters():
             assert p.grad is not None, f"No gradient for {name}"
 
@@ -90,13 +86,11 @@ class TestFSDP2:
         model = Transformer(SMALL_CONFIG).cuda()
         apply_fsdp2(model, mesh)
 
-        # Use same input across all ranks for deterministic comparison
         torch.manual_seed(0)
         tokens = torch.randint(0, 1000, (2, 32), device="cuda")
         out = model(tokens)
         loss = out.sum()
 
-        # Gather loss from all ranks — should be identical under FSDP2
         loss_val = loss.detach().clone()
         all_losses = [torch.zeros_like(loss_val) for _ in range(dist.get_world_size())]
         dist.all_gather(all_losses, loss_val)
@@ -105,7 +99,6 @@ class TestFSDP2:
                 f"Losses differ across ranks: {[v.item() for v in all_losses]}"
             )
 
-        # Also verify backward completes and clip_grad_norm_ works with DTensors
         loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         assert torch.isfinite(grad_norm), f"Grad norm not finite: {grad_norm}"

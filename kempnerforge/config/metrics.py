@@ -14,25 +14,23 @@ def _is_text(value: object) -> bool:
 class MetricsConfig:
     """Logging and metrics settings."""
 
-    log_interval: int = 10  # Log every N steps
+    log_interval: int = 10
     enable_wandb: bool = False
     enable_tensorboard: bool = False
     enable_mlflow: bool = False
     wandb_project: str = "kempnerforge"
-    wandb_run_name: str | None = None  # None -> auto-generated
-    wandb_run_id: str = ""  # Restored from checkpoint on resume; empty = new run
+    wandb_run_name: str | None = None
+    wandb_run_id: str = ""
     tensorboard_dir: str = "tb_logs"
 
-    # MLflow (Databricks-hosted or local); credentials never go in config, the SDK finds them.
-    # None -> $MLFLOW_TRACKING_URI, else "databricks"; or databricks://<profile>, http(s)://...
     mlflow_tracking_uri: str | None = None
-    mlflow_experiment: str | None = None  # absolute workspace path on Databricks; None -> env/auto
-    mlflow_run_name: str | None = None  # None -> auto-generated
-    mlflow_description: str | None = None  # run description (Markdown), set on a new run
-    mlflow_tags: dict[str, str] = field(default_factory=dict)  # extra run tags, set on a new run
-    mlflow_run_id: str = ""  # Restored from checkpoint on resume; empty = new run
-    mlflow_log_system_metrics: bool = True  # CPU/GPU/memory sampled on a background thread
-    mlflow_system_metrics_interval: float = 10.0  # seconds between samples
+    mlflow_experiment: str | None = None
+    mlflow_run_name: str | None = None
+    mlflow_description: str | None = None
+    mlflow_tags: dict[str, str] = field(default_factory=dict)
+    mlflow_run_id: str = ""
+    mlflow_log_system_metrics: bool = True
+    mlflow_system_metrics_interval: float = 10.0
     mlflow_register_checkpoints: bool = False
 
     def resolve_mlflow_tracking_uri(self) -> str:
@@ -59,7 +57,6 @@ class MetricsConfig:
                 raise ValueError(f"mlflow_tags keys must be non-empty strings; got {key!r}")
             if not _is_text(value):
                 raise ValueError(f"mlflow_tags[{key!r}] must be a non-empty string; got {value!r}")
-        # Databricks requires an absolute workspace path; fail fast at config load.
         if (
             self.enable_mlflow
             and self.mlflow_experiment is not None

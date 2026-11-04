@@ -7,16 +7,11 @@ from pathlib import Path
 
 import pytest
 
-# Add scripts/ to path so we can import the conversion module
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 
 from convert_checkpoint import _build_hf_config, _hf_to_kf_key, _kf_to_hf_key
 
 from kempnerforge.config.schema import ModelConfig
-
-# ---------------------------------------------------------------------------
-# Key mapping: KempnerForge → HuggingFace
-# ---------------------------------------------------------------------------
 
 
 class TestKFtoHFKeyMapping:
@@ -69,11 +64,6 @@ class TestKFtoHFKeyMapping:
         )
 
 
-# ---------------------------------------------------------------------------
-# Key mapping: HuggingFace → KempnerForge
-# ---------------------------------------------------------------------------
-
-
 class TestHFtoKFKeyMapping:
     def test_embedding(self):
         assert _hf_to_kf_key("model.embed_tokens.weight") == "token_embedding.embedding.weight"
@@ -103,11 +93,6 @@ class TestHFtoKFKeyMapping:
         )
 
 
-# ---------------------------------------------------------------------------
-# Round-trip: KF → HF → KF should be identity
-# ---------------------------------------------------------------------------
-
-
 class TestRoundTrip:
     @pytest.mark.parametrize(
         "kf_key",
@@ -129,16 +114,6 @@ class TestRoundTrip:
     )
     def test_kf_to_hf_to_kf(self, kf_key):
         assert _hf_to_kf_key(_kf_to_hf_key(kf_key)) == kf_key
-
-
-# ---------------------------------------------------------------------------
-# HuggingFace config generation
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
-# MoE key mapping: KempnerForge → HuggingFace
-# ---------------------------------------------------------------------------
 
 
 class TestMoEKFtoHFKeyMapping:
@@ -178,11 +153,6 @@ class TestMoEKFtoHFKeyMapping:
         )
 
 
-# ---------------------------------------------------------------------------
-# MoE key mapping: HuggingFace → KempnerForge
-# ---------------------------------------------------------------------------
-
-
 class TestMoEHFtoKFKeyMapping:
     def test_router_gate(self):
         assert _hf_to_kf_key("model.layers.0.mlp.gate.weight") == "layers.0.mlp.router.gate.weight"
@@ -209,11 +179,6 @@ class TestMoEHFtoKFKeyMapping:
         )
 
 
-# ---------------------------------------------------------------------------
-# MoE round-trip: KF → HF → KF should be identity
-# ---------------------------------------------------------------------------
-
-
 class TestMoERoundTrip:
     @pytest.mark.parametrize(
         "kf_key",
@@ -233,11 +198,6 @@ class TestMoERoundTrip:
     )
     def test_moe_kf_to_hf_to_kf(self, kf_key):
         assert _hf_to_kf_key(_kf_to_hf_key(kf_key)) == kf_key
-
-
-# ---------------------------------------------------------------------------
-# HuggingFace config generation
-# ---------------------------------------------------------------------------
 
 
 class TestBuildHFConfig:

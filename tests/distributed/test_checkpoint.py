@@ -42,7 +42,6 @@ RESUMABLE_OPTIMIZERS = [
     for name in REGISTERED_OPTIMIZERS
 ]
 
-# Shared filesystem temp directory (visible to all nodes)
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _TEST_TMP = _PROJECT_ROOT / ".test_tmp"
 
@@ -51,7 +50,6 @@ _TEST_TMP = _PROJECT_ROOT / ".test_tmp"
 def shared_tmp_dir():
     """Create a temp directory on the shared filesystem, cleaned up after use."""
     rank = dist.get_rank()
-    # Rank 0 creates, then broadcasts path
     if rank == 0:
         _TEST_TMP.mkdir(exist_ok=True)
         import tempfile
@@ -95,7 +93,6 @@ class TestCheckpointRoundTrip:
         mesh = distributed_env
         ckpt_dir = shared_tmp_dir
 
-        # Build model + FSDP
         torch.manual_seed(42)
         model = Transformer(SMALL_CONFIG).cuda()
         apply_fsdp2(model, mesh)
@@ -103,36 +100,29 @@ class TestCheckpointRoundTrip:
 
         opt = build_optimizer(model, OptimizerConfig(lr=1e-3, fused=False))
 
-        # Do a forward + backward to get non-trivial optimizer state
         tokens = torch.randint(0, 512, (2, 32), device="cuda")
         out = model(tokens)
         out.sum().backward()
         opt.step()
         opt.zero_grad()
 
-        # Capture reference output
         with torch.no_grad():
             ref_out = model(tokens).clone()
 
-        # Save
         config = CheckpointConfig(dir=ckpt_dir, keep_last_n=2)
         mgr = CheckpointManager(config, model, opt)
         mgr.save(step=1, tokens_seen=64)
 
-        # Perturb model to verify load actually restores
         with torch.no_grad():
             for p in model.parameters():
                 p.add_(torch.randn_like(p) * 0.1)
 
-        # Verify output changed
         with torch.no_grad():
             perturbed_out = model(tokens)
         assert not torch.allclose(ref_out, perturbed_out, atol=1e-3)
 
-        # Load
         mgr.load()
 
-        # Verify output matches reference
         with torch.no_grad():
             restored_out = model(tokens)
         assert torch.allclose(ref_out, restored_out, atol=1e-5), (
@@ -166,7 +156,6 @@ class TestCheckpointRoundTrip:
                         )
             return out
 
-        # Build, step a few times so the moments are non-trivial, then save.
         torch.manual_seed(42)
         model = Transformer(SMALL_CONFIG).cuda()
         apply_fsdp2(model, mesh)
@@ -187,8 +176,6 @@ class TestCheckpointRoundTrip:
             step=3, tokens_seen=192
         )
 
-        # FRESH model + FRESH optimizer (never stepped -> empty optimizer state),
-        # exactly the resume scenario. Then load.
         torch.manual_seed(42)
         model2 = Transformer(SMALL_CONFIG).cuda()
         apply_fsdp2(model2, mesh)
@@ -217,7 +204,7 @@ class TestCheckpointRoundTrip:
         def build(seed):
             torch.manual_seed(seed)
             model = Transformer(SMALL_CONFIG).cuda()
-            model.unused = torch.nn.Linear(128, 128).cuda()  # never in the forward
+            model.unused = torch.nn.Linear(128, 128).cuda()
             apply_fsdp2(model, distributed_env)
             return model, build_optimizer(model, OptimizerConfig(lr=1e-3, fused=False))
 
@@ -430,21 +417,17 @@ class TestCheckpointSaveBarrier:
                 time.sleep(sleep_sec)
             return real_torch_save(*args, **kwargs)
 
-        # Barrier before timing so all ranks start save() at roughly the
-        # same instant; isolates the signal we care about.
         dist.barrier()
         t0 = time.perf_counter()
         with patch.object(mgr_mod.torch, "save", side_effect=slow_on_rank0):
             mgr.save(step=1, tokens_seen=100)
         elapsed = time.perf_counter() - t0
 
-        # Every rank must have waited for rank-0's slow write.
         assert elapsed >= 0.4 * sleep_sec, (
             f"rank {rank}: save() returned after {elapsed:.3f}s — the "
             f"end-of-save barrier is missing. Expected >= {0.4 * sleep_sec:.3f}s."
         )
 
-        # And every rank observes rank-0's writes afterwards.
         step_dir = Path(ckpt_dir) / "step_1"
         assert (step_dir / "train_state.pt").exists(), (
             f"rank {rank}: train_state.pt not visible after save()"
@@ -495,13 +478,9 @@ class TestCheckpointLoadDivergentExistence:
         cfg = CheckpointConfig(dir=ckpt_dir, keep_last_n=2)
         mgr = CheckpointManager(cfg, model, opt)
 
-        # Save so there's something to load.
         mgr.save(step=1, tokens_seen=100)
         dist.barrier()
 
-        # Patch exists() so non-rank-0 sees the file as missing. Without
-        # the authoritative broadcast, non-rank-0 skips torch.load but
-        # rank 0 enters and calls broadcast_object_list — deadlock.
         real_exists = Path.exists
 
         def skewed_exists(self):
@@ -509,11 +488,6 @@ class TestCheckpointLoadDivergentExistence:
                 return False
             return real_exists(self)
 
-        # Wrap in a timeout via a CUDA event + sleep loop would be ideal;
-        # simpler: rely on the PG default timeout to surface a deadlock as
-        # a RuntimeError rather than blocking the test runner forever.
-        # With the fix, load() completes promptly; without, the test hangs
-        # until the PG timeout fires.
         with patch.object(Path, "exists", skewed_exists):
             step, tokens_seen, _ = mgr.load()
 
@@ -551,26 +525,14 @@ class TestAsyncCheckpointLatestSafety:
 
         latest = Path(ckpt_dir) / "latest"
 
-        # Mirror the real training loop exactly: periodic save() calls, then
-        # a single wait() after the loop (training/loop.py::run_training_loop).
-        # NO barriers are injected between/after save() here — a mid-flush collective on
-        # the default PG races DCP's own async-executor collective thread,
-        # an unrelated pre-existing hazard that has nothing to do with the
-        # `latest` symlink fix under test.
         for s in (10, 20, 30, 40):
             mgr.save(step=s)
-            # Rank-0 local check only (no collective): whenever `latest`
-            # resolves, it MUST be a durable checkpoint. Pre-fix it pointed
-            # at the in-flight step whose DCP `.metadata` did not exist yet.
             if rank == 0 and latest.exists():
                 target = latest.resolve()
                 assert (target / ".metadata").exists(), (
                     f"after save({s}): latest -> {target} has no DCP .metadata"
                 )
 
-        # Final drain (the training loop calls wait() after the loop); this
-        # commits the last deferred checkpoint. wait() ends with its own
-        # barrier, so all ranks resync here.
         mgr.wait()
         if rank == 0:
             assert latest.exists(), "latest missing after wait()"
@@ -578,9 +540,6 @@ class TestAsyncCheckpointLatestSafety:
             assert target.name == "step_40", f"latest -> {target.name}, want step_40"
             assert (target / ".metadata").exists(), "final latest not durable"
 
-        # No async flush is in flight after wait(), so this barrier cannot
-        # race a DCP collective; it just re-syncs before the collective
-        # load() (rank 0 did extra local fs asserts above).
         dist.barrier()
         step, tokens_seen, _ = mgr.load()
         assert step == 40, f"rank {rank}: resumed at step {step}, want 40"
@@ -601,13 +560,9 @@ class TestAsyncCheckpointLatestSafety:
         cfg = CheckpointConfig(dir=ckpt_dir, keep_last_n=5)
         mgr = CheckpointManager(cfg, model, opt)
 
-        # A real, complete checkpoint at step 1 (sync save -> durable).
         mgr.save(step=1, tokens_seen=64)
         dist.barrier()
 
-        # Simulate an interrupted async flush at step 2: rank 0 fabricates
-        # a step_2 dir with train_state/metadata but NO DCP `.metadata`,
-        # and repoints `latest` at it (exactly the crash-mid-flush state).
         if rank == 0:
             step2 = Path(ckpt_dir) / "step_2"
             step2.mkdir(parents=True, exist_ok=True)
@@ -620,7 +575,6 @@ class TestAsyncCheckpointLatestSafety:
             tmp.rename(link)
         dist.barrier()
 
-        # Resume must fall back to the durable step_1, not crash on step_2.
         step, tokens_seen, _ = mgr.load()
         assert step == 1, f"rank {rank}: expected fallback to step 1, got {step}"
         assert tokens_seen == 64
@@ -654,9 +608,6 @@ class TestAsyncSaveBarrierNoDeadlock:
         )
         mgr = CheckpointManager(cfg, model, opt)
 
-        # Tight loop, no training collectives between saves: the exact
-        # pattern that deadlocks pre-fix. Reaching the asserts at all means
-        # the gloo barrier did not race the in-flight DCP collective.
         for s in (10, 20, 30, 40):
             mgr.save(step=s)
         mgr.wait()

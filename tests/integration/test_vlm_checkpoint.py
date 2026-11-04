@@ -58,7 +58,7 @@ class TestSaveFreezeMetadata:
 
     def test_metadata_json_omits_when_not_vlm(self, tmp_path):
         mgr = _make_manager(tmp_path)
-        mgr.save(step=1)  # no extra
+        mgr.save(step=1)
         meta_path = tmp_path / "ckpt" / "step_1" / "metadata.json"
         meta = json.loads(meta_path.read_text())
         assert "vlm_freeze" not in meta
@@ -70,7 +70,6 @@ class TestLoadFreezeMismatch:
         freeze = _freeze(("vision_encoder", True))
         mgr.save(step=1, extra={"vlm_freeze": freeze})
 
-        # Fresh manager loads back; matching freeze list does not raise.
         mgr2 = _make_manager(tmp_path)
         step, _, _ = mgr2.load(vlm_freeze_expected=freeze)
         assert step == 1
@@ -84,7 +83,7 @@ class TestLoadFreezeMismatch:
 
         mgr2 = _make_manager(tmp_path)
         current = _freeze(("adapter", False), ("vision_encoder", True))
-        assert saved == current  # canonical_freeze_meta is sort-based
+        assert saved == current
         step, _, _ = mgr2.load(vlm_freeze_expected=current)
         assert step == 1
 
@@ -114,14 +113,14 @@ class TestLoadFreezeMismatch:
         mgr = _make_manager(tmp_path)
         mgr.save(step=1, extra={"vlm_freeze": _freeze(("vision_encoder", True))})
         mgr2 = _make_manager(tmp_path)
-        step, _, _ = mgr2.load()  # no vlm_freeze_expected
+        step, _, _ = mgr2.load()
         assert step == 1
 
     def test_no_saved_freeze_skips_check(self, tmp_path):
         """Older checkpoints saved without vlm_freeze metadata should
         not trip the compare when the current run is VLM."""
         mgr = _make_manager(tmp_path)
-        mgr.save(step=1)  # no extra
+        mgr.save(step=1)
         mgr2 = _make_manager(tmp_path)
         step, _, _ = mgr2.load(vlm_freeze_expected=_freeze(("vision_encoder", True)))
         assert step == 1
@@ -147,7 +146,6 @@ class TestCrossArchLoad:
         mgr.save(step=1, extra={"vlm_freeze": _freeze(("vision_encoder", True))})
 
         mgr2 = _make_manager(tmp_path)
-        # Simulate a future-arch config's expected: extra alias not in saved.
         expected = _freeze(("cross_attention", False), ("vision_encoder", True))
         step, _, _ = mgr2.load(vlm_freeze_expected=expected)
         assert step == 1
@@ -173,7 +171,6 @@ class TestCrossArchLoad:
         mgr.save(step=1, extra={"vlm_freeze": saved})
 
         mgr2 = _make_manager(tmp_path)
-        # Shared key vision_encoder differs in frozen state.
         mismatched = _freeze(("vision_encoder", False))
         with pytest.raises(ValueError, match="VLM freeze mismatch"):
             mgr2.load(vlm_freeze_expected=mismatched)
@@ -190,7 +187,6 @@ class TestCrossArchLoad:
         mismatched = _freeze(("vision_encoder", False))
         with pytest.raises(ValueError) as exc_info:
             mgr2.load(vlm_freeze_expected=mismatched)
-        # Error mentions cross-arch drops to help the user.
         assert "cross-arch" in str(exc_info.value)
         assert "cross_attention" in str(exc_info.value)
 
@@ -201,7 +197,6 @@ class TestCrossArchLoad:
         mgr.save(step=1, extra={"vlm_freeze": _freeze(("vision_encoder", True))})
 
         mgr2 = _make_manager(tmp_path)
-        # Wholly disjoint expected.
         weird_expected = _freeze(("cross_attention", False))
         step, _, _ = mgr2.load(vlm_freeze_expected=weird_expected)
         assert step == 1

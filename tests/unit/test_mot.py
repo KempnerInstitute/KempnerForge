@@ -75,11 +75,6 @@ def test_mot_finegrained_experts():
     assert moe.experts[0].gate_proj.weight.shape[0] == cfg.computed_ffn_hidden_dim // 2
 
 
-# ---------------------------------------------------------------------------
-# MoTAttention — structural
-# ---------------------------------------------------------------------------
-
-
 class TestMoTAttentionStructural:
     def test_construction_zero_init_o_proj(self):
         attn = MoTAttention(dim=64, n_heads=4, n_kv_heads=4, modalities=("image", "text"))
@@ -89,7 +84,6 @@ class TestMoTAttentionStructural:
     def test_per_modality_qkvo_projections_distinct(self):
         """After re-init, image and text Q-projections produce different Q for the same input."""
         attn = MoTAttention(dim=64, n_heads=4, n_kv_heads=4, modalities=("image", "text"))
-        # Re-init each q_proj with different random weights.
         torch.manual_seed(0)
         nn.init.normal_(attn.q_proj["image"].weight)
         torch.manual_seed(1)
@@ -132,17 +126,11 @@ class TestMoTAttentionStructural:
 
     def test_forward_streams_keys_must_match(self):
         attn = MoTAttention(dim=64, n_heads=4, n_kv_heads=4, modalities=("image", "text"))
-        # Re-init o_proj so output is non-trivially zero.
         for m in ("image", "text"):
             nn.init.normal_(attn.o_proj[m].weight)
         rope = {"image": _rope_for(4, 16), "text": _rope_for(4, 16)}
         with pytest.raises(ValueError, match="streams keys"):
             attn({"image": torch.randn(1, 4, 64)}, rope)
-
-
-# ---------------------------------------------------------------------------
-# MoTAttention — forward shapes / dtypes / paths
-# ---------------------------------------------------------------------------
 
 
 class TestMoTAttentionForward:
@@ -222,11 +210,6 @@ class TestMoTAttentionForward:
             for proj in (attn.q_proj[m], attn.k_proj[m], attn.v_proj[m], attn.o_proj[m]):
                 assert proj.weight.grad is not None
                 assert proj.weight.grad.abs().sum() > 0
-
-
-# ---------------------------------------------------------------------------
-# MoTAttention — Algorithm 1 reference parity + cross-modality flow
-# ---------------------------------------------------------------------------
 
 
 def _algorithm_1_reference(
@@ -328,14 +311,12 @@ class TestMoTAttentionNumerical:
         """
         torch.manual_seed(0)
         attn1 = MoTAttention(dim=64, n_heads=4, n_kv_heads=4, modalities=("image", "text"))
-        # Re-init: text weights random; image weights random initial.
         for m in ("image", "text"):
             nn.init.normal_(attn1.q_proj[m].weight)
             nn.init.normal_(attn1.k_proj[m].weight)
             nn.init.normal_(attn1.v_proj[m].weight)
             nn.init.normal_(attn1.o_proj[m].weight)
         attn2 = copy.deepcopy(attn1)
-        # Reset image-modality weights only on attn2.
         for proj in (attn2.q_proj, attn2.k_proj, attn2.v_proj, attn2.o_proj):
             nn.init.normal_(proj["image"].weight)
 
@@ -347,16 +328,10 @@ class TestMoTAttentionNumerical:
         assert torch.allclose(out1["text"], out2["text"], atol=1e-6)
 
 
-# ---------------------------------------------------------------------------
-# MoTBlock
-# ---------------------------------------------------------------------------
-
-
 class TestMoTBlock:
     def test_block_forward_shape_per_modality(self):
         cfg = _config(dim=64, n_heads=4)
         block = MoTBlock(cfg, modalities=("image", "text"), layer_idx=0)
-        # Re-init so block isn't identity.
         for m in ("image", "text"):
             nn.init.normal_(block.attn.o_proj[m].weight)
             nn.init.normal_(block.mlp[m].down_proj.weight)  # type: ignore[union-attr]
@@ -403,8 +378,6 @@ class TestMoTBlock:
         block = MoTBlock(cfg, modalities=("image", "text"), layer_idx=0)
         for p in block.parameters():
             p.requires_grad_(False)
-        # Re-init so block isn't identity (otherwise backward through identity
-        # produces uninteresting input grads).
         with torch.no_grad():
             for m in ("image", "text"):
                 nn.init.normal_(block.attn.o_proj[m].weight)
@@ -419,7 +392,6 @@ class TestMoTBlock:
         loss.backward()
         for p in block.parameters():
             assert p.grad is None
-        # Sanity: input grads do flow.
         assert streams["text"].grad is not None and streams["text"].grad.abs().sum() > 0
 
     def test_block_streams_keys_must_match(self):
@@ -434,7 +406,6 @@ class TestMoTBlock:
         block = MoTBlock(cfg, modalities=("image", "text"), layer_idx=0)
         assert block.attn.q_norm is not None
         assert "image" in block.attn.q_norm and "text" in block.attn.q_norm
-        # Re-init so block is non-identity, then sanity-check forward.
         for m in ("image", "text"):
             nn.init.normal_(block.attn.o_proj[m].weight)
             nn.init.normal_(block.mlp[m].down_proj.weight)  # type: ignore[union-attr]
@@ -443,11 +414,6 @@ class TestMoTBlock:
         out = block(streams, rope)
         assert torch.isfinite(out["image"]).all()
         assert torch.isfinite(out["text"]).all()
-
-
-# ---------------------------------------------------------------------------
-# Warm-start helper
-# ---------------------------------------------------------------------------
 
 
 class _MoTHarness(nn.Module):
@@ -517,18 +483,15 @@ def _synth_jd_state_dict(
 class TestWarmStartHelper:
     def test_no_op_on_non_mot_model(self):
         """Module without MoTBlock layers: helper does not modify anything."""
-        # Build a non-MoT module: one nn.Linear named "layers" (not a ModuleDict of MoTBlocks).
         non_mot = nn.Module()
         non_mot.layers = nn.ModuleDict({"0": nn.Linear(32, 32)})
         sentinel = non_mot.layers["0"].weight.detach().clone()
-        # Source state dict with arbitrary content.
         source = {"layers.0.foo.weight": torch.randn(32, 32)}
         mot_warm_start_from_text_stack(non_mot, source)
         assert torch.equal(non_mot.layers["0"].weight, sentinel)
 
     def test_no_op_when_module_has_no_layers(self):
         empty = nn.Module()
-        # Should not raise.
         mot_warm_start_from_text_stack(empty, {"layers.0.attention.q_proj.weight": torch.zeros(1)})
 
     def test_copies_dense_block_weights_to_per_modality_copies(self):
@@ -621,7 +584,6 @@ class TestWarmStartHelper:
         cfg = _config(dim=32, n_heads=2, n_kv_heads=2)
         harness = _MoTHarness(cfg, modalities=("image", "text"), n_layers=1)
         source = _synth_jd_state_dict(cfg, n_layers=1)
-        # Corrupt one source tensor's shape.
         source["layers.0.attention.q_proj.weight"] = torch.randn(8, 8)
         with pytest.raises(ValueError, match="shape mismatch"):
             mot_warm_start_from_text_stack(harness, source)
@@ -631,14 +593,11 @@ class TestWarmStartHelper:
         construction-time (zero-init) weights."""
         cfg = _config(dim=32, n_heads=2, n_kv_heads=2)
         harness = _MoTHarness(cfg, modalities=("image", "text"), n_layers=2)
-        # Only synth layer 0; layer 1 absent from source.
         source_full = _synth_jd_state_dict(cfg, n_layers=1)
         zero_o_proj = harness.layers["1"].attn.o_proj["image"].weight.detach().clone()
         mot_warm_start_from_text_stack(harness, source_full)
-        # Layer 0 warm-started.
         assert torch.equal(
             harness.layers["0"].attn.o_proj["image"].weight,
             source_full["layers.0.attention.o_proj.weight"],
         )
-        # Layer 1 untouched.
         assert torch.equal(harness.layers["1"].attn.o_proj["image"].weight, zero_o_proj)

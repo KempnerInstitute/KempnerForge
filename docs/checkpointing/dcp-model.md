@@ -148,28 +148,26 @@ checkpoints/step_1000/
 └── train_state.pt                 ← one per checkpoint, written by global rank 0
 ```
 
-Each stage also gets a process group scoped to that stage's DP + TP
-ranks:
+Each stage also gets a process group of its own ranks: every rank at
+the same `pp` coordinate, whatever the other mesh dimensions are (all
+of the stage's DP and TP ranks, or the rank alone under pure PP).
+`build_checkpoint_manager` in `training/entry.py` builds it:
 
 ```python
-# training/entry.py::build_checkpoint_manager
-non_pp_dims = [d for d in device_mesh.mesh_dim_names if d != "pp"]
-if len(non_pp_dims) == 1:
-    ckpt_pg = device_mesh[non_pp_dims[0]].get_group()
-elif len(non_pp_dims) > 1:
-    ckpt_pg = device_mesh[tuple(non_pp_dims)].get_group()
+ckpt_pg = build_stage_group(device_mesh)
 ckpt_mgr = CheckpointManager(config.checkpoint, model, optimizer,
-                             process_group=ckpt_pg, pp_rank=pp_rank)
+                             process_group=ckpt_pg, pp_rank=pipeline.rank)
 ```
 
-A 1-D mesh slice has to be indexed by the dim name directly;
-`tuple(...)` wrapping is only valid for ≥2 dims. Both branches land
-on the same thing semantically — every rank at the same PP position
-coordinating together.
+`build_stage_group` (in `distributed/pipeline_parallel.py`) creates
+every stage's group on every rank, in stage order, and returns the one
+that holds this rank, since `torch.distributed.new_group` is collective
+over the default group.
 
-Without the scoped group, DCP would try to coordinate across all
-world ranks (including other PP stages), and the stage-0 ranks
-would hang waiting for stage-1's shards.
+Without a per-stage group, DCP coordinates the save over every rank:
+it writes a single `.metadata`, into `pp0/`, that indexes the shards
+written into the other stages' directories, so the save succeeds and
+the other stages cannot load their checkpoint.
 
 ## Save modes
 
