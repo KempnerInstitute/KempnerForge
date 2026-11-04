@@ -379,21 +379,21 @@ def _databricks_config_file() -> str:
 
 @dataclass(frozen=True)
 class _ProfileFile:
-    """What a Databricks profile file offers, as far as a message may say.
+    """What a Databricks profile file offers the SDK.
 
     Attributes:
         profiles: The profile names it offers.
-        default_profile: The profile the SDK falls back to, None when the stripped
-            ``[__settings__] default_profile`` still spans more than one line.
-        default_profile_quotable: False when that value began on a continuation line, whose
-            text can be a token, so no message names it.
+        default_profile: The profile the SDK falls back to when none is selected: the stripped
+            ``[__settings__] default_profile``, else DEFAULT.
+        default_from_settings: The fallback is the ``[__settings__] default_profile``, a value
+            from the file, which no message may quote.
         problem: Why the file offers no profile, or None.
         missing: The file does not exist, so the SDK reads nothing from it.
     """
 
     profiles: frozenset[str]
-    default_profile: str | None
-    default_profile_quotable: bool
+    default_profile: str
+    default_from_settings: bool
     problem: str | None
     missing: bool = False
 
@@ -414,31 +414,28 @@ def _read_databricks_config(name: str) -> _ProfileFile:
         exists = path.exists()
     except (OSError, RuntimeError) as e:
         return _ProfileFile(
-            frozenset(), "DEFAULT", True, f"{name} cannot be resolved ({type(e).__name__})"
+            frozenset(), "DEFAULT", False, f"{name} cannot be resolved ({type(e).__name__})"
         )
     if not exists:
-        return _ProfileFile(frozenset(), "DEFAULT", True, f"{name} not found", missing=True)
+        return _ProfileFile(frozenset(), "DEFAULT", False, f"{name} not found", missing=True)
     parser = configparser.ConfigParser()
     try:
         with path.open(encoding="utf-8" if sys.flags.utf8_mode else "locale") as f:
             parser.read_file(f)
     except OSError as e:
         return _ProfileFile(
-            frozenset(), "DEFAULT", True, f"{name} unreadable: {e.strerror or type(e).__name__}"
+            frozenset(), "DEFAULT", False, f"{name} unreadable: {e.strerror or type(e).__name__}"
         )
     except (configparser.Error, UnicodeDecodeError) as e:
         return _ProfileFile(
-            frozenset(), "DEFAULT", True, f"{name} is malformed ({type(e).__name__})"
+            frozenset(), "DEFAULT", False, f"{name} is malformed ({type(e).__name__})"
         )
     profiles = {section for section in parser.sections() if section != _SETTINGS_SECTION}
     if parser.defaults():
         profiles.add("DEFAULT")
     parser.remove_option(parser.default_section, "default_profile")
-    raw = parser.get(_SETTINGS_SECTION, "default_profile", raw=True, fallback="")
-    default = raw.strip()
-    if "\n" in default:
-        return _ProfileFile(frozenset(profiles), None, False, None)
-    return _ProfileFile(frozenset(profiles), default or "DEFAULT", "\n" not in raw, None)
+    default = parser.get(_SETTINGS_SECTION, "default_profile", raw=True, fallback="").strip()
+    return _ProfileFile(frozenset(profiles), default or "DEFAULT", bool(default), None)
 
 
 def _databricks_env_credentials() -> tuple[str, ...]:
@@ -517,11 +514,9 @@ def check_mlflow(check_credentials: bool = False) -> CheckResult:
         found = unsettled if auth is None else f"{found_prefix}DATABRICKS_HOST + {auth} set"
     else:
         profile = selected or config.default_profile
-        quotable = selected is not None or config.default_profile_quotable
+        quotable = selected is not None or not config.default_from_settings
         problem = config.problem
-        if profile is None:
-            problem = "the [__settings__] default_profile spans more than one line"
-        elif profile == _SETTINGS_SECTION:
+        if profile == _SETTINGS_SECTION:
             problem = f"[{_SETTINGS_SECTION}] is a reserved section name and cannot be a profile"
         elif problem is None and profile not in config.profiles:
             if quotable:

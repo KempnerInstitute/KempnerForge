@@ -856,7 +856,10 @@ class TestCheckMlflow:
         )
         r = check_env.check_mlflow()
         assert r.status == check_env.OK
-        assert "profile work found in ~/.databrickscfg" in r.message
+        assert "profile named by [__settings__] default_profile found in ~/.databrickscfg" in (
+            r.message
+        )
+        assert self._read_config().default_profile == "work"
 
     def test_settings_default_profile_must_name_a_section_that_exists(self, home):
         home.joinpath(".databrickscfg").write_text(
@@ -864,7 +867,9 @@ class TestCheckMlflow:
         )
         r = check_env.check_mlflow()
         assert r.status == check_env.WARN
-        assert "no [work] section" in r.message
+        assert "the [__settings__] default_profile names no section of ~/.databrickscfg" in (
+            r.message
+        )
 
     def test_settings_default_profile_loses_to_a_selected_profile(self, home, monkeypatch):
         home.joinpath(".databrickscfg").write_text(
@@ -940,6 +945,8 @@ class TestCheckMlflow:
             "{s}\n",
             "[DEFAULT]\n{s}\n",
             "[{s}]\nhost = h\n",
+            "[__settings__]\ndefault_profile = {s}\n[DEFAULT]\nhost = h\n",
+            "[__settings__]\ndefault_profile = {s}\n[{s}]\nhost = h\n",
         ],
         ids=[
             "plain-token",
@@ -952,20 +959,36 @@ class TestCheckMlflow:
             "no-section-header",
             "key-without-a-delimiter",
             "section-name",
+            "default-profile-naming-no-section",
+            "default-profile-naming-a-section",
         ],
     )
     def test_no_credential_in_the_profile_file_reaches_the_message(self, home, text):
-        """A credential can sit anywhere but the one field named for a profile, and is never
-        quoted back from any of them, however the parser surfaces it."""
+        """A credential can sit anywhere in the file, default_profile included, and is never
+        quoted back, however the parser surfaces it."""
         secret = "dapi-never-quote-me"
         home.joinpath(".databrickscfg").write_text(text.format(s=secret))
         assert secret not in check_env.check_mlflow().message
 
-    def test_the_settings_default_profile_is_named_in_the_message(self, home):
-        """That one field holds a profile name, which the docs say the check reads and which it
-        names so a missing section can be found; a credential does not belong in it."""
-        home.joinpath(".databrickscfg").write_text("[__settings__]\ndefault_profile = work\n")
-        assert "[work]" in check_env.check_mlflow().message
+    @pytest.mark.parametrize(
+        ("sections", "status", "said"),
+        [
+            ("", check_env.WARN, "the [__settings__] default_profile names no section of"),
+            ("[my-work-profile]\nhost = h\n", check_env.OK, "profile named by"),
+        ],
+        ids=["names-no-section", "names-a-section"],
+    )
+    def test_the_settings_default_profile_is_never_named_in_the_message(
+        self, home, sections, status, said
+    ):
+        """default_profile is a value from the file, and no value from the file is quoted."""
+        home.joinpath(".databrickscfg").write_text(
+            "[__settings__]\ndefault_profile = my-work-profile\n" + sections
+        )
+        r = check_env.check_mlflow()
+        assert r.status == status
+        assert said in r.message
+        assert "my-work-profile" not in r.message
 
     def test_an_indented_section_inside_a_token_is_not_a_settings_section(self, home):
         """ConfigParser continues the value above an indented line, and so does the check."""
@@ -1031,7 +1054,9 @@ class TestCheckMlflow:
         )
         r = check_env.check_mlflow()
         assert r.status == check_env.WARN
-        assert "spans more than one line" in r.message
+        assert "the [__settings__] default_profile names no section of ~/.databrickscfg" in (
+            r.message
+        )
         assert "dapi-secret" not in r.message
 
     def test_a_default_profile_starting_on_the_next_line_resolves_without_being_named(self, home):
@@ -1088,7 +1113,8 @@ class TestCheckMlflow:
         )
         r = check_env.check_mlflow()
         assert r.status == check_env.OK
-        assert "profile my%profile" in r.message
+        assert "profile named by [__settings__] default_profile found" in r.message
+        assert self._read_config().default_profile == "my%profile"
 
     def test_a_default_profile_in_the_default_section_does_not_reach_the_settings_section(
         self, home

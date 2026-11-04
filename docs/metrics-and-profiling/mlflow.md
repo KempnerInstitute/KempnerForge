@@ -91,11 +91,11 @@ variable takes the environment route, which passes on `DATABRICKS_HOST` plus a t
 either name, a username and password, or a client id and secret; with no credential variable
 set it reads the file and uses the SDK's default profile. Anything else warns without failing,
 naming the three routes, because it cannot verify OAuth, a CLI login or a metadata service
-offline. It parses the whole file, as the SDK does, but the only text from the file a message
-can carry is a `default_profile` value written on the key's own line, which names a profile. It
-looks at the environment, not at `mlflow_tracking_uri` in a config. Add
-`--check-credentials` to also call the workspace through the SDK by that same resolution, which
-names a profile only when one is selected. A failure is reported by exception class only,
+offline. It parses the whole file, as the SDK does, but no value from the file reaches a
+message. It looks at the environment, not at `mlflow_tracking_uri` in a config. Add
+`--check-credentials` to also call the workspace through the SDK by that same resolution,
+naming a profile only when one is selected; it calls whenever the offline check passes or leaves
+an environment route unsettled. A failure is reported by exception class only,
 because the text can quote a token (a malformed profile line, a token with a stray newline);
 the connectivity check below prints the full error.
 
