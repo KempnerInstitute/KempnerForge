@@ -183,6 +183,8 @@ restarting its warmup and the data stream starting over. So:
   directory with a warning and takes the newest complete one. When none
   is complete, training starts from step 0 (or from
   `checkpoint.load_path`, if set), which it reports at ERROR level.
+  `scripts/eval.py` loads the weights alone, so its scan keeps such a
+  directory (`require_train_state=False`).
 - To start from its weights alone, warm-start a new run from it: a new
   `checkpoint.dir`, `checkpoint.load_path` pointing at it, and
   `checkpoint.exclude_from_loading = ["optimizer"]`.
