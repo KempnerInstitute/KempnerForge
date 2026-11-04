@@ -8,7 +8,6 @@ from benchmarks.micro.runner import BenchmarkResult, print_results, run_benchmar
 from kempnerforge.config.model import ModelConfig
 from kempnerforge.model.transformer import Transformer
 
-# 125M model for benchmarking (small enough to run quickly, large enough to be meaningful)
 BENCH_CONFIG = ModelConfig(
     dim=768,
     n_layers=12,
@@ -29,7 +28,6 @@ def run_forward_benchmarks() -> list[BenchmarkResult]:
     model = Transformer(BENCH_CONFIG).to(device=DEVICE, dtype=DTYPE).eval()
     toks_per_iter = BATCH * SEQ
 
-    # --- Forward only ---
     input_ids = torch.randint(0, BENCH_CONFIG.vocab_size, (BATCH, SEQ), device=DEVICE)
 
     def forward_fn(m=model, ids=input_ids):
@@ -44,7 +42,6 @@ def run_forward_benchmarks() -> list[BenchmarkResult]:
         )
     )
 
-    # --- Forward + Backward ---
     model.train()
 
     def forward_backward_fn(m=model, ids=input_ids):
@@ -61,7 +58,6 @@ def run_forward_benchmarks() -> list[BenchmarkResult]:
         )
     )
 
-    # --- Attention only (varying seq lengths) ---
     from kempnerforge.model.attention import Attention
     from kempnerforge.model.position import precompute_rope_frequencies
 
@@ -87,7 +83,6 @@ def run_forward_benchmarks() -> list[BenchmarkResult]:
             )
         )
 
-    # --- MLP only ---
     from kempnerforge.model.mlp import build_mlp
 
     mlp = build_mlp(

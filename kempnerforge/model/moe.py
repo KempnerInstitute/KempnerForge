@@ -8,14 +8,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import kempnerforge.model.router  # noqa: F401 — triggers router registration
+import kempnerforge.model.router  # noqa: F401
 from kempnerforge.config.registry import registry
 from kempnerforge.model.mlp import build_mlp
 
 _HAS_GROUPED_MM = hasattr(torch, "_grouped_mm")
 
-# torch._grouped_mm under torch.compile requires bf16/fp16 inputs
-# (the meta registration rejects fp32). Guard against this.
 _GROUPED_MM_DTYPES = {torch.bfloat16, torch.float16}
 
 
@@ -32,8 +30,6 @@ def _grouped_mm(x: torch.Tensor, weight: torch.Tensor, offs: torch.Tensor) -> to
     """
     out = torch._grouped_mm(x, weight, offs=offs)
     if out.requires_grad and not torch.compiler.is_compiling():
-        # The kernel's backward rejects expanded (stride-0) gradients, e.g. from
-        # ``out.sum().backward()``; materialise them before they reach it.
         out.register_hook(_contiguous_grad)
     return out
 
@@ -66,11 +62,10 @@ def grouped_expert_forward(
     if x_sorted.shape[0] == 0:
         return torch.zeros_like(x_sorted)
     offs = _group_offsets(x_sorted, tokens_per_expert)
-    # nn.Linear stores weight as (out, in); the grouped GEMM wants (E, in, out).
-    up_w = torch.stack([e.up_proj.weight.t() for e in experts])  # type: ignore[reportCallIssue, reportAttributeAccessIssue]  # (E, dim, H)
-    down_w = torch.stack([e.down_proj.weight.t() for e in experts])  # type: ignore[reportCallIssue, reportAttributeAccessIssue]  # (E, H, dim)
+    up_w = torch.stack([e.up_proj.weight.t() for e in experts])  # type: ignore[reportCallIssue, reportAttributeAccessIssue]
+    down_w = torch.stack([e.down_proj.weight.t() for e in experts])  # type: ignore[reportCallIssue, reportAttributeAccessIssue]
     if hasattr(experts[0], "gate_proj"):
-        gate_w = torch.stack([e.gate_proj.weight.t() for e in experts])  # type: ignore[reportCallIssue, reportAttributeAccessIssue]  # (E, dim, H)
+        gate_w = torch.stack([e.gate_proj.weight.t() for e in experts])  # type: ignore[reportCallIssue, reportAttributeAccessIssue]
         hidden = F.silu(_grouped_mm(x_sorted, gate_w, offs)) * _grouped_mm(x_sorted, up_w, offs)
     else:
         act_fn = experts[0]._activation
@@ -149,7 +144,6 @@ def _apply_capacity(
 
     weights = weights.clone()
     for k in range(top_k):
-        # Count per-expert assignments in this top_k slot.
         for e in range(num_experts):
             assigned = (indices[:, k] == e).nonzero(as_tuple=True)[0]
             if assigned.numel() <= capacity:
@@ -186,17 +180,12 @@ class MoEMLP(nn.Module):
         self.gradient_scale = gradient_scale
         self.packed_experts = packed_experts
 
-        # EP attributes — set by apply_expert_parallel(); defaults = no EP
         self.ep_world_size: int = 1
         self.ep_group = None
         self.local_expert_start: int = 0
         self.num_local_experts: int = len(experts)
 
         if packed_experts:
-            # Packed expert weights: stack per-expert (out, in) Linear weights into
-            # (E, in, out) tensors so grouped GEMM can consume them zero-copy.
-            # Drop the per-expert nn.ModuleList — the packed tensors are the
-            # sole source of truth. Tests / EP / FSDP2 read `self.up_w` etc.
             self._is_swiglu = hasattr(experts[0], "gate_proj")
             self.up_w = nn.Parameter(
                 torch.stack([e.up_proj.weight.t().contiguous() for e in experts])  # type: ignore[reportCallIssue, reportAttributeAccessIssue]
@@ -244,9 +233,8 @@ class MoEMLP(nn.Module):
 
         use_grouped = _HAS_GROUPED_MM and x_flat.dtype in _GROUPED_MM_DTYPES
         if use_grouped:
-            # Expand (token, k) pairs → flat entries sorted by expert.
-            flat_indices = indices.reshape(-1)  # (T*K,)
-            flat_weights = weights.reshape(-1)  # (T*K,)
+            flat_indices = indices.reshape(-1)
+            flat_weights = weights.reshape(-1)
             token_ids = (
                 torch.arange(num_tokens, device=x_flat.device)
                 .unsqueeze(1)
@@ -274,12 +262,9 @@ class MoEMLP(nn.Module):
             else:
                 expert_out = grouped_expert_forward(x_sorted, tokens_per_expert, self.experts)
 
-            # Per-expert gradient scaling: normalize by utilization ratio so
-            # high-traffic experts don't dominate learning (DeepSeek-V3 Sec 3.2).
             if self.gradient_scale and self.training:
                 expert_out = scale_by_expert_load(expert_out, tokens_per_expert, self.num_experts)
 
-            # Weighted scatter-add back to output.
             expert_out = expert_out * sorted_weights.unsqueeze(-1)
             output = torch.zeros(num_tokens, dim, dtype=x_flat.dtype, device=x_flat.device)
             output.scatter_add_(
@@ -289,7 +274,6 @@ class MoEMLP(nn.Module):
             )
         else:
             output = torch.zeros_like(x_flat)
-            # Precompute average tokens for gradient scaling
             if self.gradient_scale and self.training:
                 avg_tokens = num_tokens * top_k / max(self.num_experts, 1)
             for i in range(self.num_experts):
@@ -302,7 +286,6 @@ class MoEMLP(nn.Module):
                     if self.packed_experts
                     else self.experts[i](expert_input)
                 )
-                # Per-expert gradient scaling (DeepSeek-V3 Sec 3.2)
                 if self.gradient_scale and self.training:
                     tokens_i = (indices == i).sum().detach().float()
                     scale = avg_tokens / tokens_i.clamp(min=1.0)
@@ -336,12 +319,8 @@ class MoEMLP(nn.Module):
         B, L, D = x.shape
         x_flat = x.view(B * L, D)
 
-        # Route tokens → stores aux_loss as side effect
         weights, indices = self.router(x_flat)
 
-        # Capacity factor: cap tokens per expert, drop overflow.
-        # Dropped tokens get zero routing weight → no expert contribution,
-        # carried through unchanged by the residual connection.
         if self.capacity_factor > 0:
             weights, indices = _apply_capacity(
                 weights,

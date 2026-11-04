@@ -121,8 +121,10 @@ prefer these when you need the more recent figure.
 ## Reproduction
 
 Every config is submitted as its own SLURM job, so the allocation and the config are the same
-node set. The full sweep is 13 jobs and roughly 3.5 hours of compute, dominated by the four
-200-step headline runs.
+node set. Running them instead as `srun` node subsets of one large allocation hangs:
+`MASTER_ADDR` is the first node of the whole allocation, a subset need not contain it, and the
+rendezvous host is then unreachable. The full sweep is 13 jobs and roughly 3.5 hours of
+compute, dominated by the four 200-step headline runs.
 
 ```bash
 export DATA=/path/to/tokenized/fineweb-edu     # tokenized_*.bin shards

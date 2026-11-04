@@ -41,7 +41,6 @@ DEBUG_MOE_CONFIG = str(PROJECT_ROOT / "configs" / "train" / "debug_moe.toml")
 FP8_7B_CONFIG = str(PROJECT_ROOT / "configs" / "train" / "7b_16gpu_fp8.toml")
 CKPT_ROOT = PROJECT_ROOT / "checkpoints" / "_smoke_test"
 
-# Port counter to avoid collisions between tests in the same session
 _port_counter = 15600
 
 
@@ -57,9 +56,6 @@ def _find_free_port() -> int:
         return s.getsockname()[1]
 
 
-# ---------------------------------------------------------------------------
-# Launch helpers
-# ---------------------------------------------------------------------------
 def _run_torchrun(
     script: str,
     args: list[str],
@@ -125,7 +121,6 @@ def _run_srun(
         *args,
     ]
 
-    # Use file-based capture to avoid pipe deadlocks with srun
     log_dir = CKPT_ROOT / "_logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     tag = f"srun_{port}"
@@ -162,9 +157,6 @@ def _run(hw, script, args, timeout=180):
         return _run_torchrun(script, args, nproc=hw.total_gpus or 1, timeout=timeout)
 
 
-# ---------------------------------------------------------------------------
-# Assertion helpers
-# ---------------------------------------------------------------------------
 def _assert_train_ok(result, expected_steps=15):
     output = result.stdout + result.stderr
     assert result.returncode == 0, f"Training failed (exit {result.returncode}):\n{output[-3000:]}"
@@ -199,9 +191,6 @@ def _assert_eval_ok(result):
     return data
 
 
-# ---------------------------------------------------------------------------
-# Common args builders
-# ---------------------------------------------------------------------------
 def _train_args(config, ckpt_name, extra=None, vocab_size=None):
     """Build standard train args."""
     ckpt_dir = CKPT_ROOT / ckpt_name
@@ -239,17 +228,9 @@ def _eval_args(config, ckpt_name, tokenizer, vocab_size, extra=None):
     return args
 
 
-# ---------------------------------------------------------------------------
-# Skip helpers
-# ---------------------------------------------------------------------------
 def skip_unless_gpus(hw, n, reason=None):
     if hw.total_gpus < n:
         pytest.skip(reason or f"Requires {n}+ GPUs, have {hw.total_gpus}")
-
-
-# ============================================================================
-# Tests: CPU / No GPU
-# ============================================================================
 
 
 @pytest.mark.smoke
@@ -283,11 +264,6 @@ class TestCPU:
         assert "OK: 4 experts" in result.stdout
 
 
-# ============================================================================
-# Tests: Single GPU
-# ============================================================================
-
-
 @pytest.mark.smoke
 class TestSingleGPU:
     """Single-GPU tests. Skipped on CPU-only machines."""
@@ -309,11 +285,6 @@ class TestSingleGPU:
             nproc=1,
         )
         _assert_train_ok(result)
-
-
-# ============================================================================
-# Tests: Full pipeline — train → checkpoint → eval
-# ============================================================================
 
 
 @pytest.mark.smoke
@@ -410,11 +381,6 @@ class TestFullPipeline:
         _assert_eval_ok(result)
 
 
-# ============================================================================
-# Tests: Train-only — verify specific features don't crash
-# ============================================================================
-
-
 @pytest.mark.smoke
 class TestTrainFeatures:
     """Train-only tests for specific features. No eval — just verify no crash."""
@@ -425,7 +391,7 @@ class TestTrainFeatures:
             hw,
             TRAIN_SCRIPT,
             _train_args(DEBUG_CONFIG, "feat_compile", ["--train.compile_model=true"]),
-            timeout=300,  # compile is slow first time
+            timeout=300,
         )
         _assert_train_ok(result)
 
@@ -536,11 +502,6 @@ class TestTrainFeatures:
         _assert_train_ok(result)
 
 
-# ============================================================================
-# Tests: Checkpoint auto-resume (post-release fix regression coverage)
-# ============================================================================
-
-
 def _assert_resume_markers(output: str, expected_resume_step: int) -> None:
     """Assert the warm-resume log markers fire and carry the right step count."""
     assert "Auto-resume: found latest checkpoint" in output, (
@@ -628,11 +589,6 @@ class TestAutoResume:
         )
 
 
-# ============================================================================
-# Tests: Real-config sanity (post-release fix regression coverage)
-# ============================================================================
-
-
 @pytest.mark.smoke
 class TestRealConfigs:
     """Run the published production configs at reduced scope to catch drift.
@@ -676,11 +632,6 @@ class TestRealConfigs:
             f"FSDP2 float8 all-gather was not enabled:\n{output[-2000:]}"
         )
         _assert_train_ok(result, expected_steps=3)
-
-
-# ============================================================================
-# Session cleanup
-# ============================================================================
 
 
 @pytest.fixture(autouse=True, scope="session")

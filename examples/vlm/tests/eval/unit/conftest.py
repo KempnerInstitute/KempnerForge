@@ -33,8 +33,6 @@ _ADAPTER_MODULES = ("lmms_adapter",)
 _FAKE_MODULES = _fake_lmms_eval.build_modules()
 _MANAGED = (*_FAKE_MODULES.keys(), *_ADAPTER_MODULES)
 
-# What ``sys.modules`` held before this conftest touched it, and what this tier needs in
-# its place. The tier's own entries are captured once collection has imported them.
 _ORIGINALS: dict[str, ModuleType | None] = {name: sys.modules.get(name) for name in _MANAGED}
 _TIER: dict[str, ModuleType | None] = {}
 
@@ -47,8 +45,6 @@ def _apply(table: dict[str, ModuleType | None]) -> None:
             sys.modules[name] = module
 
 
-# Install the fakes and evict any real-bound adapter, so it re-imports against them when
-# the test modules below are collected.
 sys.modules.update(_FAKE_MODULES)
 for _name in _ADAPTER_MODULES:
     sys.modules.pop(_name, None)
