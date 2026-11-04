@@ -24,11 +24,9 @@ class TestCheckpointRoundtrip:
         """Model state dict save/load produces identical weights."""
         model = Transformer(CONFIG).to(DEVICE)
 
-        # Save
         state = model.state_dict()
         torch.save(state, tmp_path / "model.pt")
 
-        # Load into fresh model
         model2 = Transformer(CONFIG).to(DEVICE)
         model2.load_state_dict(torch.load(tmp_path / "model.pt", map_location=DEVICE))
 
@@ -43,7 +41,6 @@ class TestCheckpointRoundtrip:
         model = Transformer(CONFIG).to(DEVICE)
         opt = build_optimizer(model, OptimizerConfig(lr=1e-3, fused=False))
 
-        # Train a few steps to populate optimizer state
         for _ in range(3):
             tokens = torch.randint(0, 256, (2, 32), device=DEVICE)
             logits = model(tokens)
@@ -52,16 +49,13 @@ class TestCheckpointRoundtrip:
             opt.step()
             opt.zero_grad()
 
-        # Save
         torch.save(opt.state_dict(), tmp_path / "opt.pt")
 
-        # Load into fresh optimizer
         model2 = Transformer(CONFIG).to(DEVICE)
         model2.load_state_dict(model.state_dict())
         opt2 = build_optimizer(model2, OptimizerConfig(lr=1e-3, fused=False))
         opt2.load_state_dict(torch.load(tmp_path / "opt.pt", map_location=DEVICE))
 
-        # Compare state
         for pg1, pg2 in zip(opt.param_groups, opt2.param_groups, strict=True):
             assert pg1["lr"] == pg2["lr"]
             assert pg1["weight_decay"] == pg2["weight_decay"]
@@ -73,7 +67,6 @@ class TestCheckpointRoundtrip:
         opt = build_optimizer(model, OptimizerConfig(lr=1e-3, fused=False))
         sched = build_scheduler(opt, sched_config, max_steps=100)
 
-        # Advance scheduler
         for _ in range(10):
             opt.step()
             sched.step()
@@ -82,7 +75,6 @@ class TestCheckpointRoundtrip:
         assert state["step"] == 10
         assert state["tokens_seen"] == 5000
 
-        # Restore into fresh scheduler
         sched2 = build_scheduler(
             build_optimizer(Transformer(CONFIG).to(DEVICE), OptimizerConfig(lr=1e-3, fused=False)),
             sched_config,
@@ -97,10 +89,8 @@ class TestCheckpointRoundtrip:
         """RNG state save/restore produces identical random sequences."""
         rng_state = get_rng_state()
 
-        # Generate random values
         vals1 = torch.randn(10)
 
-        # Restore RNG and re-generate
         from kempnerforge.checkpoint.state import set_rng_state
 
         set_rng_state(rng_state)
@@ -115,11 +105,9 @@ class TestCheckpointRoundtrip:
         model = Transformer(CONFIG).to(DEVICE)
         opt = build_optimizer(model, OptimizerConfig(lr=1e-3, fused=False))
 
-        # Fixed data
         tokens = torch.randint(0, 256, (4, 32), device=DEVICE)
         labels = tokens.clone()
 
-        # Train 20 steps uninterrupted
         torch.manual_seed(42)
         model_ref = Transformer(CONFIG).to(DEVICE)
         model_ref.load_state_dict(model.state_dict())
@@ -133,7 +121,6 @@ class TestCheckpointRoundtrip:
             opt_ref.zero_grad()
         ref_loss = loss.item()
 
-        # Train 10 steps, save, load, train 10 more
         for _ in range(10):
             logits = model(tokens)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1))
@@ -141,17 +128,14 @@ class TestCheckpointRoundtrip:
             opt.step()
             opt.zero_grad()
 
-        # Save checkpoint
         torch.save(model.state_dict(), tmp_path / "model.pt")
         torch.save(opt.state_dict(), tmp_path / "opt.pt")
 
-        # Load into new model
         model2 = Transformer(CONFIG).to(DEVICE)
         model2.load_state_dict(torch.load(tmp_path / "model.pt", map_location=DEVICE))
         opt2 = build_optimizer(model2, OptimizerConfig(lr=1e-3, fused=False))
         opt2.load_state_dict(torch.load(tmp_path / "opt.pt", map_location=DEVICE))
 
-        # Train 10 more steps
         for _ in range(10):
             logits = model2(tokens)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1))
@@ -160,7 +144,6 @@ class TestCheckpointRoundtrip:
             opt2.zero_grad()
         resumed_loss = loss.item()
 
-        # Losses should be identical (deterministic, same data)
         assert abs(ref_loss - resumed_loss) < 1e-4, (
             f"Resumed loss differs: ref={ref_loss:.6f}, resumed={resumed_loss:.6f}"
         )

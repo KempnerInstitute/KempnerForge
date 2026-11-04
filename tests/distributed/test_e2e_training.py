@@ -29,7 +29,6 @@ from kempnerforge.model.transformer import Transformer
 from kempnerforge.training.grad import maybe_no_sync
 from kempnerforge.training.optimizer import build_optimizer
 
-# Skip if not under torchrun
 pytestmark = pytest.mark.skipif(
     "RANK" not in os.environ,
     reason="Requires torchrun launcher (RANK not set)",
@@ -37,7 +36,6 @@ pytestmark = pytest.mark.skipif(
 
 SMALL_CONFIG = ModelConfig(dim=128, n_layers=2, n_heads=2, vocab_size=256, max_seq_len=64)
 
-# Shared filesystem temp directory (visible to all nodes)
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _TEST_TMP = _PROJECT_ROOT / ".test_tmp"
 
@@ -61,7 +59,6 @@ class TestE2ETraining:
         model = _make_fsdp_model(SMALL_CONFIG, device, world_size)
         optimizer = build_optimizer(model, OptimizerConfig(lr=1e-3, fused=False))
 
-        # Fixed data across ranks (same seed → same data)
         torch.manual_seed(42)
         tokens = torch.randint(0, 256, (4, 32), device=device)
         labels = tokens.clone()
@@ -91,19 +88,16 @@ class TestE2ETraining:
         rank, local_rank, world_size = get_world_info()
         device = torch.device(f"cuda:{local_rank}")
 
-        # Use float32 to get exact loss comparison (bf16 has too little precision)
         fp32_policy = MixedPrecisionPolicy()
 
         torch.manual_seed(42)
         model = _make_fsdp_model(SMALL_CONFIG, device, world_size, mp_policy=fp32_policy)
         optimizer = build_optimizer(model, OptimizerConfig(lr=1e-3, fused=False))
 
-        # Fixed data
         torch.manual_seed(42)
         tokens = torch.randint(0, 256, (4, 32), device=device)
         labels = tokens.clone()
 
-        # Train 20 steps
         for _ in range(20):
             logits = model(tokens)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1))
@@ -111,14 +105,12 @@ class TestE2ETraining:
             optimizer.step()
             optimizer.zero_grad()
 
-        # Compute loss with the FINAL weights (training loss is pre-step)
         with torch.no_grad():
             logits = model(tokens)
             loss_before_save = F.cross_entropy(
                 logits.view(-1, logits.size(-1)), labels.view(-1)
             ).item()
 
-        # Save via DCP — all ranks must use the same directory
         import tempfile
 
         import torch.distributed.checkpoint as dcp
@@ -135,7 +127,6 @@ class TestE2ETraining:
             dcp.save({"model": model_state}, checkpoint_id=tmpdir)
             dist.barrier()
 
-            # Load into fresh model
             torch.manual_seed(42)
             model2 = _make_fsdp_model(SMALL_CONFIG, device, world_size, mp_policy=fp32_policy)
             model_state2 = get_model_state_dict(model2)
@@ -143,7 +134,6 @@ class TestE2ETraining:
             set_model_state_dict(model2, model_state2)
             dist.barrier()
 
-            # Compute loss on same data — should match
             with torch.no_grad():
                 logits2 = model2(tokens)
                 loss2 = F.cross_entropy(logits2.view(-1, logits2.size(-1)), labels.view(-1))
@@ -165,12 +155,10 @@ class TestE2ETraining:
         micro_batch = 2
         large_batch = micro_batch * grad_accum_steps
 
-        # Same data
         torch.manual_seed(42)
         all_tokens = torch.randint(0, 256, (large_batch, 32), device=device)
         all_labels = all_tokens.clone()
 
-        # --- Method 1: single large batch ---
         torch.manual_seed(99)
         model_large = _make_fsdp_model(SMALL_CONFIG, device, world_size)
 
@@ -178,10 +166,8 @@ class TestE2ETraining:
         loss_large = F.cross_entropy(logits.view(-1, logits.size(-1)), all_labels.view(-1))
         loss_large.backward()
 
-        # Collect gradients
         large_grad_norm = clip_grad_norm_(model_large, float("inf"))
 
-        # --- Method 2: accumulated micro-batches ---
         torch.manual_seed(99)
         model_accum = _make_fsdp_model(SMALL_CONFIG, device, world_size)
 
@@ -199,7 +185,6 @@ class TestE2ETraining:
 
         accum_grad_norm = clip_grad_norm_(model_accum, float("inf"))
 
-        # Gradient norms should be close (not exact due to floating point order)
         large_val = (
             large_grad_norm.item() if isinstance(large_grad_norm, torch.Tensor) else large_grad_norm
         )
@@ -207,7 +192,6 @@ class TestE2ETraining:
             accum_grad_norm.item() if isinstance(accum_grad_norm, torch.Tensor) else accum_grad_norm
         )
 
-        # Allow 5% relative tolerance
         rel_diff = abs(large_val - accum_val) / max(large_val, 1e-8)
         assert rel_diff < 0.05, (
             f"Gradient norms differ: large={large_val:.6f}, accum={accum_val:.6f}, "

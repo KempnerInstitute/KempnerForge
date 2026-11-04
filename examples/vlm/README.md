@@ -16,13 +16,10 @@ examples/vlm/
 ├── eval_publish.py       # publishes the scores to the checkpoint's MLflow run
 ├── lmms_adapter.py       # KempnerForgeVLM: lmms-eval chat model over a DCP checkpoint
 ├── configs/              # TOML presets (below)
-├── image_text/           # image-text dataset readers and chat renderer (below)
 ├── scripts/              # run-only utilities
-│   ├── prep_vlm_coco.py  # COCO-Karpathy dataset prep
-│   └── convert_finevision_to_arrow.py  # FineVision parquet -> memory-mappable Arrow
+│   └── prep_vlm_coco.py  # COCO-Karpathy dataset prep
 └── tests/
     ├── test_configs.py   # every preset loads and validates; the training entry point
-    ├── image_text/       # reader and renderer tests (CPU)
     └── eval/
         ├── conftest.py   # path bootstrap + tiny VLM fixtures
         ├── integration/  # real-lmms-eval tests (skip when it is absent)
@@ -149,36 +146,6 @@ uv run torchrun --nproc_per_node=4 examples/vlm/train.py \
 
 `scripts/prep_vlm_coco.py` writes a COCO-Karpathy `save_to_disk` directory for
 `data.hf_dataset_name` to point at.
-
-## Image-text datasets
-
-`image_text/` reads the image-text sources of a Qwen3 + SigLIP2 image-understanding
-recipe and renders them into the samples `VLMCollator` batches.
-
-- `testbed.py`: COCO Karpathy captions, VQAv2 (LAVIS layout), TextVQA, DocVQA and
-  ChartQA (human and augmented).
-- `pixmo.py`: PixMo captions, CapQA, pointing, counting and point-explanations;
-  `points.py` writes the point answers.
-- `finevision.py`: FineVision subsets from their memory-mappable Arrow copy.
-- `render.py`: `ChatRenderer` applies the tokenizer's chat template (prompt then
-  answer for single-turn rows, the full template for conversations) and trains only
-  the assistant replies when `answer_only`. `RenderedDataset` draws one reference
-  answer per turn from a seed and the row index, so a resume draws the same answers.
-
-Every sample carries one image, resized square to `image_size`, with no tiling or
-packing. PixMo-Count stores its points in pixels; they are converted to percent of
-the image, the unit the other PixMo sources use. `FineVisionArrow(max_images=1)`
-keeps only the rows with one image, using the per-row image counts `index.npz`
-stores; an index written without them takes the counts from `num_images`.
-
-Convert FineVision once:
-
-```bash
-uv run python examples/vlm/scripts/convert_finevision_to_arrow.py convert \
-    --src path-to-FineVision --dst path-to-FineVision-arrow --procs 8
-uv run python examples/vlm/scripts/convert_finevision_to_arrow.py index \
-    --src path-to-FineVision --dst path-to-FineVision-arrow
-```
 
 ## Start from a pretrained backbone
 
@@ -423,9 +390,8 @@ The tests live outside the repo's `tests/` tree (the main suite's `testpaths`),
 so run them by path, as **two separate sessions**:
 
 ```bash
-# Hermetic: the config, evaluation unit and image-text tests
-# (a fake lmms_eval is injected; no GPU, and no network beyond the Qwen3
-# tokenizer the image-text renderer tests download once)
+# Hermetic: the config tests and the evaluation unit tests
+# (a fake lmms_eval is injected; no GPU or network)
 uv run pytest examples/vlm/tests --ignore=examples/vlm/tests/eval/integration
 
 # Integration: needs real lmms-eval installed; skips otherwise

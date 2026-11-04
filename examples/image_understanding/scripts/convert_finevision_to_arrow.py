@@ -9,9 +9,9 @@ processes can share the work and a rerun skips finished files. ``index`` merges 
 fully converted subset's sidecars into ``<subset>/index.npz``; for a sidecar
 without image counts it reads them from the Arrow file.
 
-    uv run python examples/vlm/scripts/convert_finevision_to_arrow.py convert \\
+    uv run python examples/image_understanding/scripts/convert_finevision_to_arrow.py convert \\
         --src /path/to/FineVision --dst /path/to/FineVision-arrow --procs 8
-    uv run python examples/vlm/scripts/convert_finevision_to_arrow.py index \\
+    uv run python examples/image_understanding/scripts/convert_finevision_to_arrow.py index \\
         --src /path/to/FineVision --dst /path/to/FineVision-arrow
 """
 

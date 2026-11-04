@@ -63,7 +63,6 @@ registry.register("mlp", "standard_gelu", _build_standard_gelu)
 registry.register("mlp", "standard_relu", _build_standard_relu)
 
 
-# Map activation config names to registry keys
 _ACTIVATION_TO_MLP = {"silu": "swiglu", "gelu": "standard_gelu", "relu": "standard_relu"}
 
 

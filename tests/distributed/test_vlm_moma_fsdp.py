@@ -133,9 +133,7 @@ class TestBuildAndForward:
         mesh = distributed_env
         wrapper = _build(_tiny_moma_cfg(), mesh)
         real = wrapper._orig_mod if hasattr(wrapper, "_orig_mod") else wrapper
-        # MoMa uses the JD/MoT image-prefix residual layout.
         assert real.num_image_tokens == 8
-        # Layers are MoMaBlocks.
         assert all(isinstance(layer, MoMaBlock) for layer in real.transformer.layers.values())
 
         pixels, ids, labels = _dummy_batch(wrapper)
@@ -146,9 +144,6 @@ class TestBuildAndForward:
     def test_fsdp_sharded_grads_flow(self, distributed_env):
         mesh = distributed_env
         wrapper = _build(_tiny_moma_cfg(), mesh)
-        # MoMa's depth-scaled init on o_proj / down_proj keeps weights small
-        # but nonzero, so gradients flow without an explicit re-init step
-        # (unlike MoT's identity-at-construction zero-init).
         pixels, ids, labels = _dummy_batch(wrapper)
         logits, labels_out = wrapper(pixels, ids, labels)
         loss = cross_entropy_loss(logits, labels_out)
@@ -190,10 +185,9 @@ class TestFreezeStageUnderFsdp:
         for the FreezeStage hook semantics.
         """
         mesh = distributed_env
-        cfg = _tiny_moma_cfg(freeze=[FreezeSpec("moma", True)])  # main stack frozen
+        cfg = _tiny_moma_cfg(freeze=[FreezeSpec("moma", True)])
         wrapper = _build(cfg, mesh)
 
-        # Step 0: confirm moma stack frozen -> no grads on transformer.layers.*.
         pixels, ids, labels = _dummy_batch(wrapper)
         logits, labels_out = wrapper(pixels, ids, labels)
         loss = cross_entropy_loss(logits, labels_out)
@@ -202,7 +196,6 @@ class TestFreezeStageUnderFsdp:
             if n.startswith("transformer.layers."):
                 assert p.grad is None, f"frozen {n} got a grad"
 
-        # Unfreeze the main stack (simulating a FreezeStage transition).
         apply_freeze_specs(
             wrapper,
             [FreezeSpec("moma", False)],
@@ -214,10 +207,6 @@ class TestFreezeStageUnderFsdp:
         logits, labels_out = wrapper(pixels, ids, labels)
         loss = cross_entropy_loss(logits, labels_out)
         loss.backward()
-        # Post-unfreeze: every trainable per-layer param has a grad
-        # allocated. (EC routing may leave individual experts unselected
-        # in a given batch — they'd get zero grads but still have a grad
-        # tensor allocated by FSDP2.)
         for n, p in wrapper.named_parameters():
             if n.startswith("transformer.layers.") and p.requires_grad:
                 assert p.grad is not None, (
@@ -270,7 +259,6 @@ class TestEcRoutingTraining:
         """
         torch.manual_seed(42 + dist.get_rank())
         mc, vc, ac, lc = _tiny_moma_cfg(n_layers=4, num_image_tokens=4, gumbel_noise=False)
-        # Bump dim/ffn so the FFN is meaningful.
         mc.dim = 128
         mc.n_heads = 4
         mc.n_kv_heads = 4
@@ -310,8 +298,6 @@ class TestCheckpointRoundtrip:
         wrapper = _build(cfg, mesh)
         opt = build_optimizer(wrapper, OptimizerConfig(lr=1e-3, fused=False))
 
-        # shared_tmp_dir lives on the shared filesystem so DCP shards
-        # written by rank 0 are visible to rank 1 under multi-node srun.
         path_str = shared_tmp_dir
         rank = dist.get_rank()
 
@@ -334,7 +320,6 @@ class TestCheckpointRoundtrip:
         mgr2 = CheckpointManager(ckpt_cfg, wrapper2, opt2)
         step, _, _ = mgr2.load(path=str(path_str) + "/step_1", vlm_freeze_expected=freeze)
         assert step == 1
-        # Per-modality MoE keys survived round-trip: gate (router) + experts.
         per_modality_keys = [
             n
             for n, _ in wrapper2.named_parameters()

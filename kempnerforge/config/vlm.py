@@ -39,10 +39,6 @@ from typing import Any
 
 from kempnerforge.config.registry import registry
 
-# Default aliases: module-name keys expand to fnmatch patterns. Each alias
-# matches both the bare module attribute (a hypothetical param directly on
-# ``adapter``/``vision_encoder`` etc.) and all nested children, so freezing
-# by alias cannot silently miss a parameter.
 DEFAULT_MODULE_PATTERNS: dict[str, list[str]] = {
     "transformer": ["transformer", "transformer.*"],
     "vision_encoder": ["vision_encoder", "vision_encoder.*"],
@@ -77,9 +73,6 @@ class FreezeStage:
     specs: tuple[FreezeSpec, ...]
 
 
-# Reserved arches: known names not yet implemented. Loader/for_arch raise
-# ``NotImplementedError`` rather than ``ValueError`` so TOMLs that aim at
-# a future arch get a clear message about it.
 _RESERVED_ARCHS: tuple[str, ...] = ()
 
 
@@ -479,8 +472,6 @@ class MoMaConfig(VLMConfig):
 
     @property
     def is_generative(self) -> bool:
-        # Expert-choice routing is non-causal (see the class docstring), so MoMa
-        # cannot autoregressively generate; generation-only consumers reject it.
         return False
 
     def effective_capacity_factor(self, modality: str) -> float:

@@ -22,11 +22,6 @@ from kempnerforge.model.cross_attention import CrossAttention, CrossAttentionBlo
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-# ---------------------------------------------------------------------------
-# Structural
-# ---------------------------------------------------------------------------
-
-
 class TestCrossAttention:
     def test_output_shape_dtype_backward(self):
         ca = CrossAttention(dim=64, n_heads=4, n_kv_heads=4).to(DEVICE)
@@ -38,8 +33,6 @@ class TestCrossAttention:
         out.sum().backward()
         assert x.grad is not None
         assert img.grad is not None
-        # All projection weights receive gradients (Wo starts at zero so its
-        # grad reflects the reverse-mode product, not the value).
         assert ca.q_proj.weight.grad is not None
         assert ca.k_proj.weight.grad is not None
         assert ca.v_proj.weight.grad is not None
@@ -73,11 +66,6 @@ class TestCrossAttention:
         assert ca.n_rep == 2
 
 
-# ---------------------------------------------------------------------------
-# Numerical correctness
-# ---------------------------------------------------------------------------
-
-
 def _reference_cross_attention(
     ca: CrossAttention, x: torch.Tensor, image_features: torch.Tensor
 ) -> torch.Tensor:
@@ -95,7 +83,6 @@ def _reference_cross_attention(
         k = k.repeat_interleave(ca.n_rep, dim=2)
         v = v.repeat_interleave(ca.n_rep, dim=2)
 
-    # (B, T, H, d), (B, N, H, d) -> einsum to (B, H, T, N) attention scores
     scale = ca.head_dim**-0.5
     attn = torch.einsum("bthd,bnhd->bhtn", q, k) * scale
     attn = F.softmax(attn, dim=-1)
@@ -114,8 +101,6 @@ class TestCrossAttentionNumerical:
         """
         torch.manual_seed(0)
         ca = CrossAttention(dim=16, n_heads=2, n_kv_heads=2).to(DEVICE)
-        # Wo is zero-init by default; nudge it for this test so outputs
-        # are non-trivial. The reference uses the same weights.
         with torch.no_grad():
             ca.o_proj.weight.normal_(std=0.02)
         x = torch.randn(1, 4, 16, device=DEVICE)
@@ -151,8 +136,6 @@ class TestCrossAttentionNumerical:
             ca.o_proj.weight.normal_(std=0.05)
         x = torch.randn(1, 3, 8, dtype=torch.float64, requires_grad=True)
         img = torch.randn(1, 4, 8, dtype=torch.float64, requires_grad=True)
-        # Use torch.autograd.gradcheck on the input gradients only; param
-        # gradients are exercised by test_output_shape_dtype_backward.
         assert torch.autograd.gradcheck(
             lambda x_, img_: ca(x_, img_),
             (x, img),
@@ -202,10 +185,8 @@ class TestCrossAttentionNumerical:
             ca.o_proj.weight.normal_(std=0.02)
         x = torch.randn(1, 4, 16, device=DEVICE)
         img = torch.randn(1, 6, 16, device=DEVICE)
-        # Mask out position 2.
         mask = torch.ones(1, 6, dtype=torch.bool, device=DEVICE)
         mask[0, 2] = False
-        # Equivalent: drop position 2 from image_features entirely.
         img_dropped = torch.cat([img[:, :2, :], img[:, 3:, :]], dim=1)
         with torch.no_grad():
             out_masked = ca(x, img, image_mask=mask)
@@ -223,22 +204,12 @@ class TestCrossAttentionNumerical:
         ca = CrossAttention(dim=16, n_heads=2, n_kv_heads=2).to(DEVICE)
         with torch.no_grad():
             ca.o_proj.weight.normal_(std=0.02)
-        # Constant text input: every position is the same vector. So Q is the
-        # same per-head vector at every text position. With identical Q across
-        # text positions, the per-position attention weights over the image
-        # axis are identical, hence the per-position outputs are identical.
         x_const = torch.randn(1, 1, 16, device=DEVICE).expand(1, 5, 16).contiguous()
         img = torch.randn(1, 8, 16, device=DEVICE)
         with torch.no_grad():
             out = ca(x_const, img)
-        # All 5 text positions should produce the same output vector.
         for t in range(1, 5):
             torch.testing.assert_close(out[:, 0, :], out[:, t, :], atol=1e-5, rtol=1e-5)
-
-
-# ---------------------------------------------------------------------------
-# Block-level
-# ---------------------------------------------------------------------------
 
 
 class TestCrossAttentionBlock:
@@ -280,8 +251,6 @@ class TestCrossAttentionBlock:
         x = torch.randn(2, 6, 32, device=DEVICE)
         img = torch.randn(2, 8, 32, device=DEVICE)
         out = block(x, img)
-        # Loss that depends on ALL the block's outputs (so gradients reach
-        # every parameter, not just Wo). Sum of squared output works.
         loss = (out**2).sum()
         loss.backward()
         opt.step()
@@ -301,14 +270,8 @@ class TestCrossAttentionBlock:
         out.sum().backward()
         for p in block.parameters():
             assert p.grad is None
-        # Inputs still receive gradients.
         assert x.grad is not None
         assert img.grad is not None
-
-
-# ---------------------------------------------------------------------------
-# Variable shapes (parametrize)
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("batch", [1, 4])
@@ -325,11 +288,6 @@ def test_cross_attention_shape_parametrize(batch, seq_len, num_image_tokens):
     out.sum().backward()
     assert x.grad is not None
     assert img.grad is not None
-
-
-# ---------------------------------------------------------------------------
-# head_dim threading
-# ---------------------------------------------------------------------------
 
 
 class TestCrossAttentionHeadDim:
@@ -387,11 +345,11 @@ class TestTransformerCrossAttentionHeadDim:
     def test_coupled_model_keeps_cross_attentions_own_dim_over_n_heads(self):
         _, model = self._build(ca_n_heads=2)
         attn = model.cross_attention_layers["0"].attn
-        assert attn.head_dim == 32  # 64 // 2, not the model's 8
+        assert attn.head_dim == 32
         assert attn.q_proj.weight.shape == (64, 64)
 
     def test_coupled_model_with_matching_head_count_is_unaffected(self):
-        cfg, model = self._build(ca_n_heads=0)  # 0 -> inherit model n_heads
+        cfg, model = self._build(ca_n_heads=0)
         attn = model.cross_attention_layers["0"].attn
         assert attn.n_heads == cfg.n_heads
         assert attn.head_dim == cfg.head_dim == 8
