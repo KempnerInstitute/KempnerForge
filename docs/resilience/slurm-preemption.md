@@ -50,6 +50,12 @@ rather than after the run. The schedule never saves a skipped step, so
 its shutdown writes the emergency checkpoint itself, and the checkpoint
 resumes on the same LR schedule and data position, with two exceptions
 listed in [NaN detection](nan-detection.md#what-a-skipped-step-still-does).
+It writes one only if every rank's weights are finite: when a bad update
+(a finite loss with non-finite gradients) has already put NaN into the
+weights, the loop logs an ERROR, saves nothing and stops, so the
+requeued run resumes from the last checkpoint saved rather than from NaN
+weights (see
+[NaN detection § A shutdown after a bad update](nan-detection.md#a-shutdown-after-a-bad-update)).
 The NaN that reaches `max_consecutive` is different: the loop stops on
 it before the check and saves nothing.
 
@@ -167,7 +173,11 @@ step is long.
 
 **"Received SIGTERM" logged but no emergency checkpoint saved.** Usually
 means `shutdown_timeout_sec` was too short: the forced-exit timer fired
-while the async checkpoint was still writing. Increase the timeout.
+while the async checkpoint was still writing. Increase the timeout. If
+an ERROR says the parameters are not finite, the signal arrived during a
+run of NaN steps whose weights a bad update had already ruined, and the
+loop skipped the save on purpose; `latest` still names the last
+checkpoint saved.
 
 **Process hangs after "Shutdown requested".** Check for an in-flight
 NCCL collective that can't complete (peer already killed).
