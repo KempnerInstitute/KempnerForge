@@ -125,7 +125,7 @@ are shared (AdamW/Lion) or optimizer-specific.
 |-------|------|---------|---------|
 | `name` | `str` | `"adamw"` | one of `adamw`, `lion`, `muon`, `schedule_free_adamw` |
 | `lr` | `float` | `3e-4` | peak learning rate |
-| `weight_decay` | `float` | `0.1` | L2 on 2-D params |
+| `weight_decay` | `float` | `0.1` | decoupled weight decay, applied to the group `weight_decay_scope` selects |
 | `betas` | `tuple[float, float]` | `(0.9, 0.95)` | AdamW / Lion momenta |
 | `eps` | `float` | `1e-8` | numerical safety (AdamW) |
 | `fused` | `bool` | `True` | use fused AdamW when available |
@@ -136,6 +136,7 @@ are shared (AdamW/Lion) or optimizer-specific.
 | `muon_adjust_lr` | `"original" \| "match_rms_adamw" \| "spectral_unclamped"` | `"original"` | Factor on each orthogonalized update |
 | `muon_orthogonalize` | `"local" \| "exact"` | `"local"` | Newton–Schulz on each rank's shard, or on the full matrix |
 | `schedule_free_warmup_steps` | `int` | `0` | internal warmup for schedule-free |
+| `weight_decay_scope` | `"exclude_norms_and_biases" \| "all"` | `"exclude_norms_and_biases"` | which parameters are decayed; `"all"` decays every parameter, as `torch.optim.AdamW` does by default. A resume that restores optimizer state saved under the other scope is refused |
 
 ## `[scheduler]` — `SchedulerConfig`
 
