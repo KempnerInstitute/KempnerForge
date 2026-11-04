@@ -84,6 +84,21 @@ always pick up where they left off, not re-load the initial
 `load_path` and a weights-only warm start silently becomes a full
 resume. Use an empty `dir` to guarantee the warm start.
 
+A training checkpoint also holds `train_state.pt`, and `load_path` restores
+it: the step, token count, LR schedule, dataloader position and RNG state
+continue from the saved run, and the saved freeze metadata is compared with
+the new run's. To start a new stage from a previous stage's weights alone,
+add `"train_state"`:
+
+```toml
+[checkpoint]
+load_path = "/runs/stage1/step_50000"
+exclude_from_loading = ["optimizer", "train_state"]
+```
+
+The new run then begins at step 0 with its own warmup, data order and
+freeze specs, and only the model weights come from the checkpoint.
+
 ## Symlink updates
 
 Inside `CheckpointManager.save` (rank 0 only):
