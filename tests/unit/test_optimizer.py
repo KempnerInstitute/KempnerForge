@@ -23,12 +23,10 @@ class TestNewtonSchulz:
         G = torch.randn(64, 64)
         U = _newton_schulz(G, steps=5)
 
-        # U @ U^T should be close to identity (scaled)
         product = U @ U.T
         diag = torch.diag(product)
         off_diag = product - torch.diag(diag)
 
-        # Off-diagonal elements should be small (5 iterations is approximate)
         assert off_diag.abs().max() < 0.15
 
     def test_rectangular_matrix(self):
@@ -172,7 +170,6 @@ class TestMuon:
         assert isinstance(optimizer, Muon)
         assert optimizer._adam is not None
 
-        # Muon params should all be eligible (2D with reasonable aspect ratio)
         muon_params = [p for g in optimizer.param_groups for p in g["params"]]
         for p in muon_params:
             assert _is_muon_eligible(p), "Muon should only get NS-eligible params"
@@ -180,7 +177,7 @@ class TestMuon:
     def test_rectangular_params_use_adam(self):
         """Highly rectangular params (embeddings) should use AdamW, not Muon."""
         model = nn.Sequential(
-            nn.Embedding(32000, 64),  # aspect ratio 500:1 — too rectangular
+            nn.Embedding(32000, 64),
             nn.Linear(64, 64),
         )
         config = OptimizerConfig(name="muon", lr=0.01)
@@ -189,9 +186,7 @@ class TestMuon:
         muon_params = [p for g in optimizer.param_groups for p in g["params"]]
         adam_params = [p for g in optimizer._adam.param_groups for p in g["params"]]
 
-        # Embedding weight (32000x64) should be in AdamW
         assert any(p.shape == (32000, 64) for p in adam_params)
-        # Linear weight (64x64) should be in Muon
         assert any(p.shape == (64, 64) for p in muon_params)
 
     def test_produces_finite_updates(self):
@@ -262,16 +257,13 @@ class TestMuon:
         config = OptimizerConfig(name="muon", lr=0.02, muon_adam_lr=3e-4)
         optimizer = build_optimizer(model, config)
 
-        # Simulate scheduler halving the Muon LR
-        optimizer.param_groups[0]["lr"] = 0.01  # halved from 0.02
+        optimizer.param_groups[0]["lr"] = 0.01
 
-        # Run a step — Adam LR should scale proportionally
         x = torch.randn(4, 32)
         optimizer.zero_grad()
         model(x).sum().backward()
         optimizer.step()
 
-        # Adam LR should be halved too: 3e-4 * (0.01/0.02) = 1.5e-4
         expected_adam_lr = 3e-4 * (0.01 / 0.02)
         assert abs(optimizer._adam.param_groups[0]["lr"] - expected_adam_lr) < 1e-10
 
@@ -287,7 +279,6 @@ class TestMuon:
         model(x).sum().backward()
         optimizer.step()
 
-        # In non-FSDP case, momentum buffer should be a regular tensor
         for p in optimizer.param_groups[0]["params"]:
             if p in optimizer.state:
                 buf = optimizer.state[p]["momentum_buffer"]
@@ -301,26 +292,22 @@ class TestMuon:
         config = OptimizerConfig(name="muon", lr=0.02, muon_adam_lr=3e-4)
         optimizer = build_optimizer(model, config)
 
-        # Run a few steps to populate optimizer state
         x = torch.randn(8, 32)
         for _ in range(5):
             optimizer.zero_grad()
             nn.functional.cross_entropy(model(x), torch.randint(0, 10, (8,))).backward()
             optimizer.step()
 
-        # Save state
         sd = optimizer.state_dict()
         assert "_adam_state" in sd, "Internal AdamW state missing from state_dict"
         assert "_initial_lr" in sd
         assert "_initial_adam_lr" in sd
 
-        # Create a fresh optimizer and load state
         model2 = self._make_model()
         config2 = OptimizerConfig(name="muon", lr=0.02, muon_adam_lr=3e-4)
         optimizer2 = build_optimizer(model2, config2)
         optimizer2.load_state_dict(sd)
 
-        # Verify Muon momentum buffers match
         for p1, p2 in zip(
             [p for g in optimizer.param_groups for p in g["params"]],
             [p for g in optimizer2.param_groups for p in g["params"]],
@@ -331,7 +318,6 @@ class TestMuon:
                 buf2 = optimizer2.state[p2]["momentum_buffer"]
                 torch.testing.assert_close(buf1, buf2)
 
-        # Verify internal AdamW state was restored (non-empty)
         adam_states = [s for s in optimizer2._adam.state.values() if s]
         assert len(adam_states) > 0, "Internal AdamW state was not restored"
 
@@ -350,11 +336,9 @@ class TestMuon:
         """
         torch.manual_seed(0)
         model = nn.Sequential(
-            nn.Embedding(32000, 64),  # aspect ratio 500:1 -> inner AdamW
+            nn.Embedding(32000, 64),
             nn.Linear(64, 64),
         )
-        # lr tiny and no decay, so parameters barely move and the per-step
-        # gradient is constant unless it is accumulating.
         config = OptimizerConfig(name="muon", lr=1e-12, weight_decay=0.0)
         optimizer = build_optimizer(model, config)
         embedding = model[0].weight
@@ -408,7 +392,7 @@ class TestMuon:
     def test_zero_grad_without_delegated_params(self):
         """A model whose parameters are all Muon-eligible leaves _adam as None."""
         torch.manual_seed(0)
-        model = nn.Linear(32, 32, bias=False)  # single 2D param, aspect ratio 1.0
+        model = nn.Linear(32, 32, bias=False)
         optimizer = build_optimizer(model, OptimizerConfig(name="muon", lr=0.01))
         assert optimizer._adam is None
 
