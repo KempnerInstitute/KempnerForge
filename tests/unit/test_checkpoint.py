@@ -3121,6 +3121,17 @@ class TestResumeWithoutTrainState:
         assert [message for level, message in records if level != "INFO"] == []
         assert self._fresh_start(imported) in records, records
 
+    @pytest.mark.parametrize("kind", ["absent", "a_file"])
+    def test_a_path_that_is_no_directory_is_not_missing_its_train_state(self, tmp_path, kind):
+        """Only a checkpoint directory holds optimizer state, so any other path reports False."""
+        from kempnerforge.checkpoint.manager import missing_train_state
+
+        path = tmp_path / kind
+        if kind == "a_file":
+            path.write_text("")
+
+        assert not missing_train_state(path)
+
 
 def _free_port() -> int:
     """An unused local TCP port for a gloo rendezvous."""
