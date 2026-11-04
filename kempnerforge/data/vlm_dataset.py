@@ -24,6 +24,7 @@ don't exercise the dataset path).
 
 from __future__ import annotations
 
+import itertools
 import logging
 from typing import Any
 
@@ -32,8 +33,8 @@ from torch.utils.data import Dataset
 
 logger = logging.getLogger(__name__)
 
-# SigLIP-style normalization defaults; pass explicit mean/std if your
-# vision encoder was trained with CLIP normalization.
+_samples_masked_for_prompt = itertools.count(1)
+
 DEFAULT_IMAGE_MEAN = (0.5, 0.5, 0.5)
 DEFAULT_IMAGE_STD = (0.5, 0.5, 0.5)
 
@@ -64,8 +65,8 @@ def pil_to_tensor(
     img = img.convert("RGB").resize((image_size, image_size), Image.Resampling.BILINEAR)
     import numpy as np
 
-    arr = np.asarray(img, dtype=np.float32) / 255.0  # (H, W, 3)
-    t = torch.from_numpy(arr).permute(2, 0, 1).contiguous()  # (3, H, W)
+    arr = np.asarray(img, dtype=np.float32) / 255.0
+    t = torch.from_numpy(arr).permute(2, 0, 1).contiguous()
     mean_t = torch.tensor(mean, dtype=t.dtype).view(3, 1, 1)
     std_t = torch.tensor(std, dtype=t.dtype).view(3, 1, 1)
     return (t - mean_t) / std_t
@@ -126,6 +127,121 @@ def resolve_pad_id(tokenizer: Any) -> int:
     return pad_id
 
 
+def _min_text_len_for_prompt(num_prompt_tokens: int, tokenizer: Any) -> int:
+    """Smallest ``max_text_len`` that still supervises a caption token after a prompt.
+
+    Room for the prompt's tokens, one caption token (which the last prompt token
+    predicts), and the EOS that caption token predicts when the tokenizer has one.
+    """
+    return num_prompt_tokens + 1 + int(tokenizer.eos_token_id is not None)
+
+
+def check_prompt_fits(tokenizer: Any, prompt: str, max_text_len: int) -> None:
+    """Reject a prompt that leaves no room in ``max_text_len`` for a caption token.
+
+    Args:
+        tokenizer: The tokenizer the samples are built with.
+        prompt: The prompt, fixed for the whole run.
+        max_text_len: The fixed text length of every sample.
+
+    Raises:
+        ValueError: ``max_text_len`` is below the prompt's token count plus one
+            caption token, plus one more when the tokenizer defines an EOS.
+    """
+    num_prompt_tokens = len(tokenizer(prompt, add_special_tokens=False)["input_ids"])
+    min_text_len = _min_text_len_for_prompt(num_prompt_tokens, tokenizer)
+    if min_text_len > max_text_len:
+        raise ValueError(
+            f"The prompt is {num_prompt_tokens} tokens, so max_text_len={max_text_len} "
+            f"leaves no room after it for a caption token (needs max_text_len >= "
+            f"{min_text_len}); raise vlm.max_text_len or shorten the prompt"
+        )
+
+
+def _prompt_or_none(value: Any, prompt_field: str) -> str | None:
+    """The value of ``prompt_field`` in a row, which must be a ``str`` or ``None``.
+
+    Raises:
+        TypeError: ``value`` is neither a ``str`` nor ``None``.
+    """
+    if value is not None and not isinstance(value, str):
+        raise TypeError(
+            f"Dataset field {prompt_field!r} must be str or None, got {type(value).__name__}"
+        )
+    return value
+
+
+def _check_prompt_column_is_string(rows: Any, prompt_field: str) -> None:
+    """Reject a prompt column whose type admits a value that is neither a string nor missing.
+
+    Args:
+        rows: A ``datasets.Dataset`` with a ``prompt_field`` column.
+        prompt_field: The prompt column's name.
+
+    Raises:
+        TypeError: The column is not a ``datasets.Value`` of dtype ``string`` or
+            ``large_string``, or ``null`` when no row has a prompt.
+        ValueError: ``prompt_field`` is not a column of ``rows``.
+    """
+    from datasets import Value
+
+    feature = rows.select_columns([prompt_field]).features[prompt_field]
+    if not (isinstance(feature, Value) and feature.dtype in ("string", "large_string", "null")):
+        raise TypeError(
+            f"Dataset field {prompt_field!r} must be a string column (a Value of dtype "
+            f"'string' or 'large_string', or 'null' when no row has a prompt), got {feature}"
+        )
+
+
+def _check_prompt_column_has_room(
+    rows: Any, prompt_field: str, tokenizer: Any, max_text_len: int
+) -> None:
+    """Reject a prompt column in which no row leaves room for a caption token.
+
+    Args:
+        rows: A ``datasets.Dataset`` with a ``prompt_field`` column.
+        prompt_field: The prompt column's name.
+        tokenizer: The tokenizer the samples are built with.
+        max_text_len: The fixed text length of every sample.
+
+    Raises:
+        TypeError: A prompt read is neither a ``str`` nor ``None``.
+        ValueError: The column has rows and none of them leaves room for a caption
+            token; the message names the shortest prompt's token count and the
+            ``max_text_len`` it needs.
+    """
+    shortest: int | None = None
+    for row in rows.select_columns([prompt_field]):
+        prompt = _prompt_or_none(row[prompt_field], prompt_field)
+        if prompt is None:
+            return
+        num_prompt_tokens = len(tokenizer(prompt, add_special_tokens=False)["input_ids"])
+        if _min_text_len_for_prompt(num_prompt_tokens, tokenizer) <= max_text_len:
+            return
+        shortest = num_prompt_tokens if shortest is None else min(shortest, num_prompt_tokens)
+    if shortest is not None:
+        raise ValueError(
+            f"No prompt in column {prompt_field!r} leaves room in max_text_len={max_text_len} "
+            f"for a caption token: the shortest is {shortest} tokens (needs max_text_len >= "
+            f"{_min_text_len_for_prompt(shortest, tokenizer)}); raise vlm.max_text_len or "
+            "shorten the prompts"
+        )
+
+
+def _warn_sample_masked_for_prompt(min_text_len: int, max_text_len: int) -> None:
+    masked = next(_samples_masked_for_prompt)
+    if masked & (masked - 1) == 0:
+        logger.warning(
+            "A prompt needs max_text_len >= %d to leave room for a caption token, but "
+            "max_text_len=%d: masked every label of that sample so it adds no loss "
+            "(%d such samples so far in this process, logged at powers of two)",
+            min_text_len,
+            max_text_len,
+            masked,
+            extra={"every_rank": True},
+        )
+
+
 def _tokenize_and_mask(
     tokenizer: Any,
     text: str,
@@ -148,19 +264,23 @@ def _tokenize_and_mask(
     tokenize prompt and text independently, then concatenate the id
     lists, so the prompt/target boundary is exact and only positions
     predicting prompt tokens are masked.
+
+    A prompt that leaves no room for a caption token (the bound
+    ``check_prompt_fits`` enforces) masks every label, so the sample adds no
+    loss; each process, on every rank, logs a warning at the 1st, 2nd, 4th, ...
+    such sample. Truncating a long caption is unaffected.
     """
     if prompt is not None:
         prompt_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
         text_ids = tokenizer(text, add_special_tokens=False)["input_ids"]
         full_ids = list(prompt_ids) + list(text_ids)
         prompt_len = min(len(prompt_ids), max_text_len)
+        min_text_len = _min_text_len_for_prompt(len(prompt_ids), tokenizer)
     else:
         full_ids = list(tokenizer(text, add_special_tokens=False)["input_ids"])
         prompt_len = 0
+        min_text_len = 0
 
-    # Append EOS so the last caption token is trained to predict a stop token
-    # (captions use add_special_tokens=False, so none is added otherwise);
-    # reserve its slot within max_text_len. Skip when the tokenizer has no EOS.
     eos_id = tokenizer.eos_token_id
     if eos_id is not None:
         full_ids = full_ids[: max_text_len - 1] + [eos_id]
@@ -174,12 +294,12 @@ def _tokenize_and_mask(
     if n > 0:
         ids_tensor = torch.tensor(full_ids, dtype=torch.long)
         input_ids[:n] = ids_tensor
-        # Next-token targets: position i predicts token i+1; the last real token
-        # has no successor, and positions that would predict a prompt token stay
-        # masked so only response tokens are supervised.
         labels[: n - 1] = ids_tensor[1:]
         if prompt_len > 1:
             labels[: prompt_len - 1] = -100
+    if min_text_len > max_text_len:
+        labels.fill_(-100)
+        _warn_sample_masked_for_prompt(min_text_len, max_text_len)
     return input_ids, labels
 
 
@@ -197,7 +317,13 @@ class HuggingFaceVLMDataset(Dataset):
         prompt_field: Optional column name for a prompt that should NOT
             be supervised (e.g. the instruction in an instruction-tuned
             dataset). Positions predicting prompt tokens are ``-100``; the
-            last prompt token still predicts the first caption token.
+            last prompt token still predicts the first caption token. A row
+            whose prompt leaves no room in ``max_text_len`` for a caption
+            token has every label masked, and building the dataset raises
+            ``ValueError`` when no row leaves that room. A ``None`` value
+            means the row has no prompt. Building the dataset raises
+            ``TypeError`` unless the column holds strings (dtype ``string``
+            or ``large_string``, or ``null`` when no row has a prompt).
         image_size: Target square image size. Default 224.
         image_mean / image_std: Normalization stats. Defaults match
             SigLIP's ``(0.5, 0.5, 0.5)``.
@@ -223,16 +349,9 @@ class HuggingFaceVLMDataset(Dataset):
         from datasets import Dataset as HFDataset
         from datasets import load_dataset, load_from_disk
 
-        # When dataset_name points at an existing directory on disk (absolute
-        # or relative path), prefer load_from_disk. Otherwise treat it as an
-        # HF Hub id. This keeps the TOML contract unchanged while letting
-        # users preprocess a dataset once and load it without network access.
         is_local = os.path.isdir(dataset_name)
         if is_local:
             loaded = load_from_disk(dataset_name)
-            # load_from_disk returns a Dataset if the dir holds a single
-            # split, or a DatasetDict of splits; select by split name in
-            # the latter case.
             ds = loaded[split] if not isinstance(loaded, HFDataset) else loaded
         else:
             ds = load_dataset(dataset_name, dataset_config, split=split)
@@ -252,6 +371,9 @@ class HuggingFaceVLMDataset(Dataset):
         self._image_std = image_std
         self._max_text_len = max_text_len
         self._tokenizer = build_tokenizer(tokenizer_path)
+        if prompt_field is not None:
+            _check_prompt_column_is_string(ds, prompt_field)
+            _check_prompt_column_has_room(ds, prompt_field, self._tokenizer, max_text_len)
         logger.info(
             f"HuggingFaceVLMDataset: {dataset_name} [{split}], {len(self._ds):,} samples, "
             f"image_size={image_size}, max_text_len={max_text_len}"
@@ -265,15 +387,16 @@ class HuggingFaceVLMDataset(Dataset):
         pixels = pil_to_tensor(
             row[self._image_field], self._image_size, self._image_mean, self._image_std
         )
-        prompt_val = row[self._prompt_field] if self._prompt_field is not None else None
         text_val = row[self._text_field]
         if not isinstance(text_val, str):
             raise TypeError(
                 f"Dataset field {self._text_field!r} must be str, got {type(text_val).__name__}"
             )
-        prompt_str = prompt_val if isinstance(prompt_val, str) else None
+        prompt = None
+        if self._prompt_field is not None:
+            prompt = _prompt_or_none(row[self._prompt_field], self._prompt_field)
         input_ids, labels = _tokenize_and_mask(
-            self._tokenizer, text_val, self._max_text_len, prompt_str
+            self._tokenizer, text_val, self._max_text_len, prompt
         )
         return {"pixel_values": pixels, "input_ids": input_ids, "labels": labels}
 

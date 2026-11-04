@@ -12,7 +12,6 @@ import os
 import pytest
 import torch
 
-# Importing the module registers the builders under the shared registry.
 import kempnerforge.model.vision  # noqa: F401
 from kempnerforge.config.registry import registry
 from kempnerforge.model.vision import RandomVisionEncoder, VisionEncoder
@@ -82,15 +81,9 @@ class TestVisionEncoderRegistry:
 class TestHFEncoders:
     def test_siglip2_load(self):
         builder = registry.get_vision_encoder("siglip2")
-        # Use a tiny public checkpoint; swap to project-local if needed.
         enc = builder("google/siglip2-base-patch16-224")
         assert enc.num_tokens > 0
         assert enc.feature_dim > 0
-
-
-# ---------------------------------------------------------------------------
-# _HFVisionEncoder via mocked transformers.AutoModel
-# ---------------------------------------------------------------------------
 
 
 class _FakeOutput:
@@ -174,7 +167,6 @@ class TestHFVisionEncoderMocked:
 
         builder = registry.get_vision_encoder("siglip2")
         enc = builder("dummy/path")
-        # Default 224/16: 14*14 = 196 patches; no CLS, so num_tokens == n_patches.
         assert enc.feature_dim == 64
         assert enc.num_tokens == 196
         out = enc(torch.zeros(2, 3, 224, 224))
@@ -248,9 +240,8 @@ class TestHFVisionEncoderMocked:
         builder = registry.get_vision_encoder("clip")
         enc = builder("dummy/path")
         assert enc.feature_dim == 64
-        assert enc.num_tokens == 196  # CLS stripped
+        assert enc.num_tokens == 196
         out = enc(torch.zeros(1, 3, 224, 224))
-        # Fake tower returns 197 tokens; CLIP encoder strips the first.
         assert out.shape == (1, 196, 64)
 
     def test_builder_overrides_apply(self, monkeypatch):
@@ -294,8 +285,6 @@ class TestHFVisionEncoderMocked:
         class _BareAuto:
             @staticmethod
             def from_pretrained(path: str) -> torch.nn.Module:  # noqa: ARG004
-                # Top-level module IS the tower (no .vision_model attr).
-                # SigLIP-shape: no CLS at position 0.
                 return _FakeVisionTower(
                     image_size=64, patch_size=16, hidden_size=32, has_cls_token=False
                 )
@@ -306,6 +295,5 @@ class TestHFVisionEncoderMocked:
 
         builder = registry.get_vision_encoder("siglip2")
         enc = builder("dummy/path")
-        # 64 / 16 = 4; 4*4 = 16 patches; SigLIP -> no +1.
         assert enc.feature_dim == 32
         assert enc.num_tokens == 16

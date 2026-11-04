@@ -84,12 +84,9 @@ def clip_grad_norm_(
     if not grads:
         return torch.tensor(0.0)
 
-    # Check if all gradients share the same mesh (or are plain tensors).
-    # If so, use the fast standard path.
     mesh_keys = {_mesh_key(g) for g in grads}
 
     if len(mesh_keys) <= 1:
-        # Single mesh — standard path works
         return torch.nn.utils.clip_grad_norm_(
             model.parameters(),
             max_norm=max_norm,
