@@ -47,9 +47,59 @@ def flex_attention_fn(compiled: bool) -> Callable[..., Any]:
     return _FLEX_COMPILED if compiled else flex_attention
 
 
+def validate_mask_inputs(
+    *,
+    batch: int,
+    seq_len: int,
+    doc_ids: torch.Tensor | None = None,
+    group_ids: torch.Tensor | None = None,
+    key_padding_mask: torch.Tensor | None = None,
+) -> None:
+    """Reject mask inputs that do not describe this forward's residual stream.
+
+    Every input is indexed per (example, position), so one that merely
+    broadcasts would silently apply a single example's documents, groups or key
+    validity to the whole batch. Shapes must match exactly.
+
+    Separate from ``build_attention_mask`` so that an arch masking its own
+    streams, which never reaches the constructor, still validates the same
+    inputs: no arch may run on ids the others reject.
+
+    Args:
+        batch: Batch size of the residual stream.
+        seq_len: Length of the residual stream.
+        doc_ids: Optional per-token document ids.
+        group_ids: Optional per-token visibility group ids.
+        key_padding_mask: Optional per-key validity mask.
+
+    Raises:
+        ValueError: If any input's shape is not exactly ``(batch, seq_len)``.
+    """
+    if doc_ids is not None and doc_ids.ndim == 2 and doc_ids.shape[1] != seq_len:
+        raise ValueError(
+            f"doc_ids length ({doc_ids.shape[1]}) does not match the sequence "
+            f"length reaching attention ({seq_len}). Sequence packing is not "
+            "supported for arches that prepend image tokens to the residual stream."
+        )
+    expected = (batch, seq_len)
+    for name, tensor in (
+        ("doc_ids", doc_ids),
+        ("group_ids", group_ids),
+        ("key_padding_mask", key_padding_mask),
+    ):
+        if tensor is not None and tuple(tensor.shape) != expected:
+            raise ValueError(
+                f"{name} shape {tuple(tensor.shape)} does not match the residual "
+                f"shape {expected}. Mask inputs are indexed per example and "
+                "position, so a broadcastable shape would apply one example's "
+                "mask to the whole batch."
+            )
+
+
 def build_attention_mask(
     *,
     backend: str,
+    batch: int,
     seq_len: int,
     device: torch.device,
     doc_ids: torch.Tensor | None = None,
@@ -71,6 +121,7 @@ def build_attention_mask(
 
     Args:
         backend: ``ModelConfig.attention_backend``, ``"sdpa"`` or ``"flex"``.
+        batch: Batch size of the residual stream.
         seq_len: Query and key length, the residual stream's length.
         device: Device to materialize the mask on. Any ids passed must already
             be on it.
@@ -88,22 +139,23 @@ def build_attention_mask(
         or ``None`` when no term applies and attention is plain causal.
 
     Raises:
-        ValueError: If a ``BlockMask`` is called for and ``doc_ids`` is not as
-            long as the residual stream, which happens when an arch prepends
-            image tokens to a packed sequence.
+        ValueError: If any input's shape is not exactly ``(batch, seq_len)``,
+            per ``validate_mask_inputs``.
     """
+    validate_mask_inputs(
+        batch=batch,
+        seq_len=seq_len,
+        doc_ids=doc_ids,
+        group_ids=group_ids,
+        key_padding_mask=key_padding_mask,
+    )
     flexible = backend == "flex" and key_padding_mask is None
     if flexible and doc_ids is not None:
-        if doc_ids.shape[1] != seq_len:
-            raise ValueError(
-                f"doc_ids length ({doc_ids.shape[1]}) does not match the sequence "
-                f"length reaching attention ({seq_len}). Sequence packing is not "
-                "supported for arches that prepend image tokens to the residual stream."
-            )
         return build_doc_causal_block_mask(doc_ids, device, group_ids)
     if flexible and group_ids is not None:
         return build_doc_causal_block_mask(torch.zeros_like(group_ids), device, group_ids)
     return build_dense_attention_mask(
+        batch=batch,
         seq_len=seq_len,
         device=device,
         doc_ids=doc_ids,
@@ -131,6 +183,7 @@ def same_group_mask(group_ids: torch.Tensor) -> torch.Tensor:
 
 def build_dense_attention_mask(
     *,
+    batch: int,
     seq_len: int,
     device: torch.device,
     doc_ids: torch.Tensor | None = None,
@@ -154,6 +207,7 @@ def build_dense_attention_mask(
     all-causal tensor.
 
     Args:
+        batch: Batch size of the residual stream.
         seq_len: Query and key length.
         device: Device to materialize the causal term on. Any ids passed must
             already be on it.
@@ -166,7 +220,18 @@ def build_dense_attention_mask(
     Returns:
         Bool tensor of shape ``(batch, 1, seq_len, seq_len)``, or ``None`` when
         every optional term is ``None`` and the mask would be plain causal.
+
+    Raises:
+        ValueError: If any input's shape is not exactly ``(batch, seq_len)``,
+            per ``validate_mask_inputs``.
     """
+    validate_mask_inputs(
+        batch=batch,
+        seq_len=seq_len,
+        doc_ids=doc_ids,
+        group_ids=group_ids,
+        key_padding_mask=key_padding_mask,
+    )
     if doc_ids is None and group_ids is None and key_padding_mask is None:
         return None
     causal = torch.ones(seq_len, seq_len, dtype=torch.bool, device=device).tril()

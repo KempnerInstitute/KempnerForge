@@ -202,6 +202,7 @@ class PipelineStageModule(nn.Module):
 
         attn_mask = build_attention_mask(
             backend=self.config.attention_backend,
+            batch=x.shape[0],
             seq_len=seq_len,
             device=x.device,
             doc_ids=doc_ids,

@@ -23,7 +23,7 @@ from kempnerforge.model.attention import Attention, KVCache
 from kempnerforge.model.cross_attention import CrossAttentionBlock
 from kempnerforge.model.embedding import OutputHead, TokenEmbedding
 from kempnerforge.model.init import init_weights
-from kempnerforge.model.masking import build_attention_mask
+from kempnerforge.model.masking import build_attention_mask, validate_mask_inputs
 from kempnerforge.model.mlp import build_mlp
 from kempnerforge.model.modality import ModalityContext
 from kempnerforge.model.moe import MoEMLP, build_moe
@@ -300,6 +300,37 @@ class Transformer(nn.Module):
                 }
         return counts
 
+    def _validate_modality_ids(
+        self, modality_ids: torch.Tensor | None, residual_shape: tuple[int, int]
+    ) -> None:
+        """Check the per-token modality tag the MoMa and MoT paths route on.
+
+        A no-op for every other arch. Runs before the attention mask is built,
+        so an arch missing its tags says so instead of failing later on an
+        unrelated input.
+
+        Args:
+            modality_ids: The tag from the ``ModalityContext``, or ``None``.
+            residual_shape: ``(batch, seq_len)`` of the residual stream.
+
+        Raises:
+            ValueError: If the arch routes on ``modality_ids`` and it is absent
+                or does not cover the residual stream.
+        """
+        arch = "MoMa" if self._moma_modalities else "MoT" if self._mot_modalities else ""
+        if not arch:
+            return
+        if modality_ids is None:
+            raise ValueError(
+                f"{arch} model requires modality.modality_ids (got None). Build the "
+                f"ModalityContext via {arch}Strategy or set modality_ids explicitly."
+            )
+        if tuple(modality_ids.shape) != residual_shape:
+            raise ValueError(
+                f"modality.modality_ids shape {tuple(modality_ids.shape)} does not "
+                f"match residual shape {residual_shape}"
+            )
+
     def forward(
         self,
         tokens: torch.Tensor | None = None,
@@ -427,12 +458,23 @@ class Transformer(nn.Module):
         cos = self._rope_cos[start_pos : start_pos + seq_len]  # type: ignore[reportOptionalSubscript]
         sin = self._rope_sin[start_pos : start_pos + seq_len]  # type: ignore[reportOptionalSubscript]
 
+        batch = h.shape[0]
+        self._validate_modality_ids(modality_ids, (batch, seq_len))
+        validate_mask_inputs(
+            batch=batch,
+            seq_len=seq_len,
+            doc_ids=doc_ids,
+            group_ids=attention_group_ids,
+            key_padding_mask=key_padding_mask,
+        )
+
         mot_masks_its_own_streams = bool(self._mot_modalities)
         attn_mask = (
             None
             if mot_masks_its_own_streams
             else build_attention_mask(
                 backend=self.config.attention_backend,
+                batch=batch,
                 seq_len=seq_len,
                 device=h.device,
                 doc_ids=doc_ids,
@@ -442,16 +484,7 @@ class Transformer(nn.Module):
         )
 
         if self._moma_modalities:
-            if modality_ids is None:
-                raise ValueError(
-                    "MoMa model requires modality.modality_ids (got None). Build the "
-                    "ModalityContext via MoMaStrategy or set modality_ids explicitly."
-                )
-            if modality_ids.shape != h.shape[:2]:
-                raise ValueError(
-                    f"modality.modality_ids shape {tuple(modality_ids.shape)} does not "
-                    f"match residual shape {tuple(h.shape[:2])}"
-                )
+            assert modality_ids is not None
             for layer in self.layers.values():
                 h = layer(
                     h,
@@ -463,16 +496,6 @@ class Transformer(nn.Module):
                 )
             h = self.norm(h)
         elif self._mot_modalities:
-            if modality_ids is None:
-                raise ValueError(
-                    "MoT model requires modality.modality_ids (got None). Build the "
-                    "ModalityContext via MoTStrategy or set modality_ids explicitly."
-                )
-            if modality_ids.shape != h.shape[:2]:
-                raise ValueError(
-                    f"modality.modality_ids shape {tuple(modality_ids.shape)} does not "
-                    f"match residual shape {tuple(h.shape[:2])}"
-                )
             n_image = self._mot_n_image
             t_image = n_image
             t_text = h.shape[1] - n_image

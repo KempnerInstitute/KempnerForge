@@ -245,6 +245,7 @@ class TestDenseAttentionPath:
         seq_len: int = 12,
     ) -> torch.Tensor:
         mask = build_dense_attention_mask(
+            batch=doc_ids.shape[0] if doc_ids is not None else group_ids.shape[0],
             seq_len=seq_len,
             device=CPU,
             doc_ids=doc_ids,
