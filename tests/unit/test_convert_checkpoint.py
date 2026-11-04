@@ -477,3 +477,37 @@ class TestTiedExport:
         assert head is embedding
         assert embedding.dtype == torch.float32
         assert torch.equal(embedding, source.state_dict()["token_embedding.embedding.weight"])
+
+
+def _llama_weights(model: Transformer) -> dict[str, torch.Tensor]:
+    """A dense model's weights under the names ``LlamaForCausalLM`` loads them by."""
+    assert model.token_embedding is not None and model.output_head is not None
+    weights = {
+        "model.embed_tokens.weight": model.token_embedding.embedding.weight,
+        "model.norm.weight": model.norm.weight,
+        "lm_head.weight": model.output_head.proj.weight,
+    }
+    for i, block in model.layers.items():
+        prefix = f"model.layers.{i}"
+        weights[f"{prefix}.input_layernorm.weight"] = block.attention_norm.weight
+        weights[f"{prefix}.post_attention_layernorm.weight"] = block.mlp_norm.weight
+        for proj in ("q_proj", "k_proj", "v_proj", "o_proj"):
+            weights[f"{prefix}.self_attn.{proj}.weight"] = getattr(block.attention, proj).weight
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            weights[f"{prefix}.mlp.{proj}.weight"] = getattr(block.mlp, proj).weight
+    return weights
+
+
+class TestExportValues:
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+    def test_exported_tensors_are_the_source_weights(self, tmp_path, tiny_model_config, dtype):
+        """Each exported tensor is the source weight its name stands for, cast to the
+        export dtype, so a key mapping that swaps or drops weights fails here even
+        though every dtype comes out right."""
+        source = _random_dcp(tmp_path / "dcp", tiny_model_config)
+        dcp_to_hf(str(tmp_path / "dcp"), str(tmp_path / "hf"), tiny_model_config, dtype=dtype)
+        weights = load_file(tmp_path / "hf" / "model.safetensors")
+        expected = _llama_weights(source)
+        assert weights.keys() == expected.keys()
+        for name, tensor in expected.items():
+            assert torch.equal(weights[name], tensor.detach().to(dtype)), name
