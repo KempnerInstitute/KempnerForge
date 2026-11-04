@@ -6,6 +6,7 @@ import os
 import signal
 import threading
 
+import pytest
 import torch
 
 from kempnerforge.resilience.elastic import (
@@ -19,6 +20,7 @@ from kempnerforge.resilience.elastic import (
 from kempnerforge.resilience.health import (
     NaNDetector,
     check_gpu_health,
+    params_are_finite,
 )
 from kempnerforge.resilience.signal_handler import (
     ShutdownHandler,
@@ -233,6 +235,19 @@ class TestNaNDetector:
         det = NaNDetector(action="raise")
         with pytest.raises(RuntimeError, match="NaN/Inf gradient"):
             det.check_gradients(model, step=1)
+
+
+class TestParamsAreFinite:
+    def test_finite_parameters_pass(self):
+        model = torch.nn.Sequential(torch.nn.Linear(4, 4), torch.nn.Linear(4, 2))
+        assert params_are_finite(model, "cpu") is True
+
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+    def test_one_non_finite_value_in_any_parameter_fails(self, bad):
+        model = torch.nn.Sequential(torch.nn.Linear(4, 4), torch.nn.Linear(4, 2))
+        with torch.no_grad():
+            model[1].bias[1] = bad
+        assert params_are_finite(model, "cpu") is False
 
 
 class TestGPUHealth:
