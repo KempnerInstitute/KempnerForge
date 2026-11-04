@@ -193,6 +193,11 @@ def _holds_optimizer(saved_keys: Iterable[str]) -> bool:
     return any(key == "optimizer" or key.startswith(_OPTIM_PREFIX) for key in saved_keys)
 
 
+def _dcp_keys(dcp_dir: Path) -> dict[str, Any]:
+    """Return the keys the DCP index in ``dcp_dir`` lists, each with its storage metadata."""
+    return dcp.FileSystemReader(str(dcp_dir)).read_metadata().state_dict_metadata
+
+
 def _read_weight_decay_scope(ckpt_dir: Path) -> str:
     """Return the weight-decay scope recorded in a checkpoint's ``metadata.json``.
 
@@ -392,10 +397,12 @@ class CheckpointManager:
         model: The model (FSDP-wrapped or plain).
         optimizer: The optimizer.
         weight_decay_scope: The run's ``optimizer.weight_decay_scope``. When set, every save
-            records it in ``metadata.json``, and a load that does not exclude the optimizer
-            raises ``ValueError`` on every rank, before anything is loaded, when the checkpoint
-            was saved under a different scope. A checkpoint that does not record a scope
-            counts as ``"exclude_norms_and_biases"``.
+            records it in ``metadata.json``, and a load that restores optimizer state on any
+            rank raises ``ValueError`` on every rank, before anything is loaded, when the
+            checkpoint was saved under a different scope. A checkpoint that holds no optimizer
+            state, such as a converted one or one saved before the first step, loads under any
+            scope with a fresh optimizer. A checkpoint that does not record a scope counts as
+            ``"exclude_norms_and_biases"``.
     """
 
     def __init__(
@@ -880,21 +887,12 @@ class CheckpointManager:
                                 msg + " (set checkpoint.ignore_freeze_mismatch=true to override)"
                             )
 
-        if self._weight_decay_scope is not None and (
-            exclude_keys is None or "optimizer" not in exclude_keys
-        ):
-            self._check_weight_decay_scope(ckpt_dir)
-
         dcp_dir = ckpt_dir / f"pp{self._pp_rank}" if self._pp_rank is not None else ckpt_dir
 
         load_model = exclude_keys is None or "model" not in exclude_keys
         load_optim = exclude_keys is None or "optimizer" not in exclude_keys
 
-        saved_keys = (
-            dcp.FileSystemReader(str(dcp_dir)).read_metadata().state_dict_metadata
-            if load_optim
-            else {}
-        )
+        saved_keys = self._read_saved_keys(ckpt_dir, dcp_dir) if load_optim else {}
         fresh_optimizer = load_optim and not _holds_optimizer(saved_keys)
         if fresh_optimizer:
             load_optim = False
@@ -981,11 +979,61 @@ class CheckpointManager:
             logger.info(f"{dcp_dir} holds no optimizer state; the optimizer starts fresh")
         return step, tokens_seen, extra
 
+    def _read_saved_keys(self, ckpt_dir: Path, dcp_dir: Path) -> dict[str, Any]:
+        """Return the keys this rank's DCP index lists: ``dcp_dir``, its part of ``ckpt_dir``.
+
+        With a weight-decay scope every rank must call this. One all-reduce on the manager's
+        gloo group, which every rank enters even when its own read failed, tells every rank
+        whether any rank's index holds optimizer state; under PP each stage has its own index.
+        If one does, every rank checks the scope before this returns; otherwise none does.
+
+        Raises:
+            ValueError: The checkpoint fails the scope check (see ``_check_weight_decay_scope``).
+            RuntimeError: Another rank could not read its DCP index.
+            Exception: Whatever this rank's read of its DCP index raised.
+        """
+        if self._weight_decay_scope is None:
+            return _dcp_keys(dcp_dir)
+        keys: dict[str, Any] = {}
+        error: Exception | None = None
+        try:
+            keys = _dcp_keys(dcp_dir)
+        except Exception as e:
+            error = e
+        if self._optimizer_saved_on_any_rank(error, _holds_optimizer(keys)):
+            self._check_weight_decay_scope(ckpt_dir)
+        return keys
+
+    def _optimizer_saved_on_any_rank(self, error: Exception | None, holds: bool) -> bool:
+        """Return whether any rank's DCP index holds optimizer state, the same on every rank.
+
+        Every rank passes the error its read of its index raised, or ``None``, and whether its
+        index holds optimizer state. After one all-reduce on the manager's gloo group a rank
+        with an error re-raises it, and every other rank raises a ``RuntimeError`` naming the
+        ranks that failed. Without an initialized process group, ``error`` is raised if set.
+        """
+        if not dist.is_initialized():
+            if error is not None:
+                raise error
+            return holds
+        flags = torch.zeros(2, dist.get_world_size(self._sync_group), dtype=torch.int32)
+        rank = dist.get_rank(self._sync_group)
+        flags[0, rank] = int(error is not None)
+        flags[1, rank] = int(holds)
+        dist.all_reduce(flags, group=self._sync_group)
+        if error is not None:
+            raise error
+        failed = flags[0].nonzero().flatten().tolist()
+        if failed:
+            raise RuntimeError(f"Could not read the DCP index of the checkpoint on ranks {failed}")
+        return bool(flags[1].any())
+
     def _check_weight_decay_scope(self, ckpt_dir: Path) -> None:
         """Refuse a checkpoint saved under a weight-decay scope other than this manager's.
 
-        Rank 0 reads the checkpoint's scope and broadcasts it, or whatever stopped it reading,
-        so every rank raises or proceeds together and none is left waiting on the broadcast.
+        Every rank calls this or none does. Rank 0 reads the checkpoint's scope and broadcasts
+        it, or whatever stopped it reading, so every rank raises or proceeds together and none
+        is left waiting on the broadcast.
 
         Raises:
             ValueError: The checkpoint's scope differs from this manager's, or its
@@ -1011,7 +1059,9 @@ class CheckpointManager:
                 f"param groups, so the saved optimizer state cannot be loaded into this run's "
                 f"groups. Resume with weight_decay_scope={saved!r}, or start a new run from "
                 f"the checkpoint without its optimizer state: checkpoint.load_path="
-                f'{str(ckpt_dir)!r} with checkpoint.exclude_from_loading=["optimizer"].'
+                f'{str(ckpt_dir)!r} with checkpoint.exclude_from_loading=["optimizer"] and '
+                f"a checkpoint.dir that holds no checkpoint, since training auto-resumes from "
+                f"a checkpoint there in place of load_path, optimizer state included."
             )
 
     def apply_dataloader_state(self, dataloader: Any) -> None:

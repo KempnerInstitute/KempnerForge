@@ -1189,6 +1189,7 @@
             "flush_pending_save()",
             "peek_saved_step(path)",
             "load(path, scheduler, dataloader, exclude_keys, vlm_freeze_expected)",
+            "_read_saved_keys(ckpt_dir, dcp_dir) (this rank's DCP keys; checks the scope only when an all-reduce on the gloo group finds optimizer state on some rank)",
             "_check_weight_decay_scope(ckpt_dir) (rank 0 reads the saved scope and broadcasts it; every rank refuses a mismatch)",
             "apply_dataloader_state(dataloader)",
             "_resolve_load_path(path)",

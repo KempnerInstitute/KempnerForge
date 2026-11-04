@@ -27,14 +27,19 @@ decayed.
 group membership, so optimizer state saved under one scope cannot be loaded under
 another: depending on the optimizer the load fails, the first step fails, or Muon
 silently keeps the coefficients it was saved with. The training entry therefore
-records the scope in every checkpoint's `metadata.json`, and a resume that does not
-leave out the optimizer stops on every rank, before loading anything, when the
-checkpoint was saved under a different scope; the error names both scopes. This
-applies to a checkpoint saved before the first step as well. A checkpoint that does
-not record a scope was written under `"exclude_norms_and_biases"`, the only grouping
-that existed before the scope was recorded. To change the scope, start a new run from
-the checkpoint without its optimizer state: set `checkpoint.load_path` to it and
-`checkpoint.exclude_from_loading = ["optimizer"]`. Code that builds its own
+records the scope in every checkpoint's `metadata.json`, and a resume that would
+restore saved optimizer state, on any rank, stops on every rank, before loading
+anything, when the checkpoint was saved under a different scope; the error names both
+scopes. A checkpoint that holds no optimizer state, such as one converted from Hugging
+Face or one saved before the first step, loads under either scope with a fresh
+optimizer. A checkpoint that does not record a scope was written under
+`"exclude_norms_and_biases"`, the only grouping that existed before the scope was
+recorded. To change the scope, start a new run from the checkpoint without its
+optimizer state: set `checkpoint.load_path` to it and
+`checkpoint.exclude_from_loading = ["optimizer"]`, with a `checkpoint.dir` that holds
+no checkpoint. Training auto-resumes from a checkpoint in `checkpoint.dir` in place of
+`load_path`, optimizer state included (see
+[Auto-resume](../checkpointing/auto-resume.md)). Code that builds its own
 `CheckpointManager` gets the same record and check by passing `weight_decay_scope`.
 
 | Value | Effect |
