@@ -64,7 +64,8 @@ the uninterrupted run would have, with two exceptions:
 
 - **Partway through a run of NaN steps.** The consecutive-NaN count is
   not checkpointed, so the resumed run counts from zero and allows a
-  full `max_consecutive` more before it stops.
+  full `max_consecutive` more before it stops. Tracked in
+  [#480](https://github.com/KempnerInstitute/KempnerForge/issues/480).
 - **Before the run's first optimizer update.** The checkpoint holds no
   optimizer state, so the resumed optimizer keeps the LR the scheduler
   set at step 0 (0 under the default warmup) for its first update. That
