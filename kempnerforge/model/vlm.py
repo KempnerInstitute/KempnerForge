@@ -88,9 +88,6 @@ def _project_visual_features(wrapper: VLMWrapper, pixel_values: torch.Tensor) ->
     dtype (often fp32) while the adapter and transformer run in bf16.
     """
     is_video = pixel_values.dim() == 5
-    # The static visual-token count (residual budget, MoT's positional split) is
-    # sized for ``frames_per_clip``, so each clip must carry exactly that many
-    # frames. Validate here to turn a downstream shape/split error into a clear one.
     effective_frames = pixel_values.shape[1] if is_video else 1
     if effective_frames != wrapper.frames_per_clip:
         raise ValueError(
@@ -105,15 +102,11 @@ def _project_visual_features(wrapper: VLMWrapper, pixel_values: torch.Tensor) ->
     else:
         encoder_input = pixel_values
     feats = wrapper.vision_encoder(encoder_input)
-    # Adapter-agnostic dtype lookup: use the first adapter parameter's dtype
-    # so any registered adapter (mlp_2layer, linear, avgpool, ...) works
-    # without coupling to a specific submodule attribute.
     adapter_dtype = next(wrapper.adapter.parameters()).dtype
     if feats.dtype != adapter_dtype:
         feats = feats.to(adapter_dtype)
     embeds = wrapper.adapter(feats)
     if is_video:
-        # (B*F, P', dim) -> (B, F*P', dim): frame-contiguous, temporal order kept.
         embeds = embeds.reshape(b, f * embeds.shape[1], embeds.shape[2])
     return embeds
 
@@ -134,10 +127,6 @@ def _visual_token_mask(
         return None
     num_frames = frame_mask.shape[1]
     if num_visual_tokens % num_frames != 0:
-        # Visual tokens are frame-contiguous (F * tokens_per_frame), so the count
-        # must be divisible by the frame count. A future adapter that adds a
-        # non-per-frame token (e.g. a global/CLS token) would break this and
-        # silently misalign the mask -- fail loudly here instead.
         raise ValueError(
             f"_visual_token_mask: num_visual_tokens ({num_visual_tokens}) is not a "
             f"multiple of num_frames ({num_frames}); the per-frame expansion assumes "
@@ -184,7 +173,7 @@ class JointDecoderStrategy:
         frame_mask: torch.Tensor | None = None,
     ) -> ModalityContext:
         img_embeds = _project_visual_features(wrapper, pixel_values)
-        n = img_embeds.shape[1]  # pooling-aware: the adapter's actual visual-token count
+        n = img_embeds.shape[1]
         return ModalityContext(
             prefix_embeds=img_embeds,
             output_slice=slice(n, None),
@@ -224,7 +213,6 @@ class CrossAttentionStrategy:
         )
 
     def num_image_tokens(self, wrapper: VLMWrapper) -> int:  # noqa: ARG002
-        # Cross-Attention does not extend the residual stream.
         return 0
 
 
@@ -256,7 +244,7 @@ class MoTStrategy:
         frame_mask: torch.Tensor | None = None,
     ) -> ModalityContext:
         img_embeds = _project_visual_features(wrapper, pixel_values)
-        n = img_embeds.shape[1]  # pooling-aware: the adapter's actual visual-token count
+        n = img_embeds.shape[1]
         b, t_text = input_ids.shape
         modality_ids = torch.zeros(b, n + t_text, dtype=torch.long, device=input_ids.device)
         modality_ids[:, n:] = 1
@@ -302,7 +290,7 @@ class MoMaStrategy:
         frame_mask: torch.Tensor | None = None,
     ) -> ModalityContext:
         img_embeds = _project_visual_features(wrapper, pixel_values)
-        n = img_embeds.shape[1]  # pooling-aware: the adapter's actual visual-token count
+        n = img_embeds.shape[1]
         b, t_text = input_ids.shape
         modality_ids = torch.zeros(b, n + t_text, dtype=torch.long, device=input_ids.device)
         modality_ids[:, n:] = 1
@@ -351,17 +339,7 @@ class VLMWrapper(nn.Module):
         self.vision_encoder = vision_encoder
         self.adapter = adapter
         self.transformer = transformer
-        # Frames per video clip (1 for a single image). The static visual-token
-        # count is ``frames_per_clip * adapter.output_num_tokens(...)``; the
-        # strategies use it for ``num_image_tokens`` (residual budget, MoT split).
         self.frames_per_clip = frames_per_clip
-        # Strategy is a plain Python object (not nn.Module). nn.Module's
-        # __setattr__ only routes Module/Parameter/Tensor attributes into
-        # _modules/_parameters/_buffers, so plain objects are stored as
-        # ordinary attributes and stay outside the module tree by
-        # default. FSDP2 wraps modules; DCP serializes module params;
-        # neither sees the strategy. test_strategy_not_in_module_tree
-        # pins this contract.
         self.strategy = strategy
 
     @property
@@ -375,11 +353,6 @@ class VLMWrapper(nn.Module):
         labels: torch.Tensor | None = None,
         frame_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        # Route the text embedding through Transformer.forward so FSDP2's
-        # per-module hook intercepts the token_embedding call and
-        # materializes the DTensor weight before F.embedding runs. Doing
-        # the embedding externally (transformer.token_embedding(input_ids))
-        # bypasses FSDP and fails with "mixed torch.Tensor and DTensor".
         modality = self.strategy.prepare(self, pixel_values, input_ids, frame_mask=frame_mask)
         logits = self.transformer(tokens=input_ids, modality=modality)
         return logits, labels
@@ -395,8 +368,6 @@ def inner_transformer(model: nn.Module) -> nn.Module:
     under ``torch.compile`` and FSDP2 wrapping; it also makes the VLM
     branch visible at the call site rather than buried in ``__getattr__``.
     """
-    # torch.compile wraps the module in OptimizedModule; the original is
-    # exposed via ._orig_mod (documented in torch/_dynamo/eval_frame.py).
     if hasattr(model, "_orig_mod"):
         model = model._orig_mod  # type: ignore[attr-defined]
     return model.transformer if isinstance(model, VLMWrapper) else model
@@ -444,19 +415,10 @@ def build_vlm_wrapper(
         num_tokens=vision_config.num_tokens if vision_config.num_tokens > 0 else None,
         feature_dim=vision_config.feature_dim if vision_config.feature_dim > 0 else None,
     )
-    # Build-time max_seq_len cross-check using the encoder's resolved
-    # num_tokens. ``JobConfig.__post_init__`` runs the same check at config
-    # time only when ``vision_encoder.num_tokens > 0``; when the user leaves
-    # num_tokens=0 (the "infer from encoder at build time" sentinel) the
-    # config-time check is skipped and the residual-stream allocation goes
-    # unchecked until the model actually runs. This guard fills that gap.
     in_dim = vision_config.feature_dim or encoder.feature_dim
     adapter = build_adapter(
         adapter_config, in_dim=in_dim, out_dim=model_config.dim, norm_eps=model_config.norm_eps
     )
-    # Visual tokens entering the LLM = the adapter's output count (pooling
-    # adapters reduce it; projection adapters are the identity), not the raw
-    # encoder patch count. This drives the residual budget and MoT's split.
     visual_tokens = frames_per_clip * adapter.output_num_tokens(encoder.num_tokens)
     residual_image_tokens = vlm_config.residual_stream_image_tokens(visual_tokens)
     required = residual_image_tokens + vlm_config.max_text_len

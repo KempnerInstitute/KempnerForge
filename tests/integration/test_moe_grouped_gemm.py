@@ -68,7 +68,7 @@ def _routing(num_tokens: int, top_k: int, num_experts: int, hot_share: float | N
     idx = torch.randint(0, num_experts, (num_tokens * top_k,), device=DEVICE)
     if hot_share is not None:
         idx[: int(hot_share * idx.numel())] = 0
-    idx[idx == num_experts - 1] = num_experts - 2  # keep one expert empty
+    idx[idx == num_experts - 1] = num_experts - 2
     order = torch.argsort(idx, stable=True)
     return order, torch.bincount(idx[order], minlength=num_experts)
 

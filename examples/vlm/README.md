@@ -170,17 +170,17 @@ exclude_from_loading = ["optimizer"]
 ```
 
 The script writes nothing when the config disagrees with the source's
-`config.json` (shapes, RoPE base, norm eps, embedding tying, activation), when
-the source declares parameters the transformer has no place for, when a weight
-has no counterpart or the wrong shape, or when `--out` is non-empty or inside
-the source. A sharded source is read through its `model.safetensors.index.json`
-and refused when the files on disk do not match it. The normalisation epsilon is
-checked against the norms the built model actually runs, not only against the
-config field, so a backbone whose attention norms normalise with a different
-epsilon than the source is refused rather than converted. The source's
-`model_type` must be one the script supports (`SUPPORTED_MODEL_TYPES`).
-`--seed` (default `[train].seed`) seeds every freshly initialised weight, so a
-rerun writes identical weights.
+`config.json` (shapes, RoPE base, norm eps, activation), when the config ties
+its output head and the source does not, when the source declares parameters
+the transformer has no place for, when a weight has no counterpart or the wrong
+shape, or when `--out` is non-empty or inside the source. A sharded source is
+read through its `model.safetensors.index.json` and refused when the files on
+disk do not match it. The normalisation epsilon is checked against the norms
+the built model actually runs, not only against the config field, so a backbone
+whose attention norms normalise with a different epsilon than the source is
+refused rather than converted. The source's `model_type` must be one the script
+supports (`SUPPORTED_MODEL_TYPES`). `--seed` (default `[train].seed`) seeds
+every freshly initialised weight, so a rerun writes identical weights.
 
 ## Evaluation
 
@@ -274,8 +274,12 @@ evaluations never overwrite each other. No run is started, ended or edited.
 
 Publishing is on by default and `--no-publish` turns it off. It needs the `mlflow` and
 `eval` dependency groups (`uv sync --group mlflow --group eval`, plus `video` for video
-tasks) and the MLflow credentials of the run's tracking server in the environment. Sync
-before `uv pip install lmms-eval`, since `uv sync` removes packages the lock does not list.
+tasks) and credentials for the run's tracking server, by any of the routes in
+[MLflow backend § Authentication](../../docs/metrics-and-profiling/mlflow.md#authentication).
+Publishing authenticates the way training does, so a route that trains also publishes, except
+`user:token@` credentials in the tracking URI, which checkpoints never record.
+Sync before `uv pip install lmms-eval`, since `uv sync` removes packages the lock does not
+list.
 
 A publishing problem never fails an evaluation. The scores are written first to a local
 file named for the evaluation: `--output` with its suffix replaced by
