@@ -53,8 +53,6 @@ class Registry:
         """List all registered names in a category."""
         return list(self._get_store(category).keys())
 
-    # Convenience methods for common categories
-
     def register_model(self, name: str) -> Callable:
         """Decorator to register a model builder."""
 
@@ -253,5 +251,4 @@ class Registry:
         return self.list("dyn_ckpt_strategy")
 
 
-# Global registry instance
 registry = Registry()

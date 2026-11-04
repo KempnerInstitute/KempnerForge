@@ -76,29 +76,18 @@ def _frames(n: int, size: int = 16) -> list[Image.Image]:
     return [Image.new("RGB", (size, size), color=(i * 10 % 255, 0, 0)) for i in range(n)]
 
 
-# ---------------------------------------------------------------------------
-# Video path mapping (verified against the on-disk WebVid layout)
-# ---------------------------------------------------------------------------
-
-
 class TestVideoPath:
     def test_train_prefix_nesting(self):
         ds = _StubVideoDataset(["8469580"], ["x"], split="train")
         assert ds._video_path("8469580") == "/fake/videos/train/84/8469/846958/8469580.mp4"
 
     def test_short_id_prefix(self):
-        # id shorter than 6 chars: id[:6] is the whole id.
         ds = _StubVideoDataset(["84490"], ["x"], split="train")
         assert ds._video_path("84490") == "/fake/videos/train/84/8449/84490/84490.mp4"
 
     def test_validation_is_flat(self):
         ds = _StubVideoDataset(["10006310"], ["x"], split="validation")
         assert ds._video_path("10006310") == "/fake/videos/validation/10006310.mp4"
-
-
-# ---------------------------------------------------------------------------
-# __getitem__ (stubbed decoder)
-# ---------------------------------------------------------------------------
 
 
 class TestGetItem:
@@ -119,14 +108,12 @@ class TestGetItem:
         ds = _StubVideoDataset(["1"], ["a dog."], max_frames=8)
         item = ds[0]
         assert item["frame_mask"].tolist() == [True, True, True, False, False, False, False, False]
-        # Padded frames are zeros.
         assert torch.count_nonzero(item["pixel_values"][3:]) == 0
 
     def test_caption_is_supervised_when_frames_present(self, monkeypatch):
         monkeypatch.setattr(vd, "decode_video_frames", lambda *a, **k: _frames(4))
         ds = _StubVideoDataset(["1"], ["abc"], max_frames=8, max_text_len=8)
         item = ds[0]
-        # "abc" -> [1,2,3] + EOS(28); next-token labels [2,3,28,-100], rest -100.
         assert item["labels"][:4].tolist() == [2, 3, 28, -100]
         assert (item["labels"][4:] == -100).all()
 
@@ -139,7 +126,7 @@ class TestGetItem:
         item = ds[0]
         assert torch.count_nonzero(item["pixel_values"]) == 0
         assert not item["frame_mask"].any()
-        assert (item["labels"] == -100).all()  # no supervision for an unloadable clip
+        assert (item["labels"] == -100).all()
 
     def test_empty_decode_yields_zero_clip_no_loss(self, monkeypatch):
         monkeypatch.setattr(vd, "decode_video_frames", lambda *a, **k: [])
@@ -152,7 +139,6 @@ class TestGetItem:
         monkeypatch.setattr(vd, "decode_video_frames", lambda *a, **k: _frames(2))
         ds = _StubVideoDataset(["1"], ["xyz"], max_frames=4, max_text_len=8, prompt="ab")
         item = ds[0]
-        # prompt "ab": last prompt token predicts first target (24); caption + EOS(28).
         assert item["input_ids"][:6].tolist() == [1, 2, 24, 25, 26, 28]
         assert item["labels"][0].item() == -100
         assert item["labels"][1:5].tolist() == [24, 25, 26, 28]
@@ -181,11 +167,6 @@ class TestGetItem:
         )
         assert torch.equal(item["pixel_values"], expected_pv)
         assert torch.equal(item["frame_mask"], expected_mask)
-
-
-# ---------------------------------------------------------------------------
-# VideoCollator
-# ---------------------------------------------------------------------------
 
 
 class TestVideoCollator:
@@ -222,14 +203,6 @@ class TestVideoCollator:
         with pytest.raises(ValueError, match="max_text_len must be positive"):
             VideoCollator(pad_id=0, max_text_len=0)
 
-
-# ---------------------------------------------------------------------------
-# Real dataset integration: build a synthetic WebVid layout (CSV manifest +
-# a tiny encoded .mp4 at the prefix path) and exercise the real __init__,
-# manifest load, path mapping, __getitem__ decode, and the decode-failure
-# path. Uses av (a hard dependency) so it runs in CI; gpt2 tokenizer matches
-# the existing VLM dataset tests.
-# ---------------------------------------------------------------------------
 
 _AV_AVAILABLE = importlib.util.find_spec("av") is not None
 
@@ -279,12 +252,10 @@ class TestRealDatasetIntegration:
         assert len(ds) == 1
         item = ds[0]
         assert item["pixel_values"].shape == (8, 3, 32, 32)
-        assert item["frame_mask"].any()  # real frames decoded
-        assert (item["labels"] != -100).any()  # caption supervised
+        assert item["frame_mask"].any()
+        assert (item["labels"] != -100).any()
 
     def test_decode_failure_is_masked(self, tmp_path):
-        # Manifest points at a videoid with no .mp4 on disk -> decode raises,
-        # __getitem__ catches it and yields a zero clip with no loss.
         (self._manifest_dir(tmp_path) / "0000.csv").write_text("videoid,name\n999999,missing\n")
         ds = WebVidVideoDataset(
             data_root=str(tmp_path),
@@ -301,7 +272,7 @@ class TestRealDatasetIntegration:
         assert (item["labels"] == -100).all()
 
     def test_empty_manifest_raises(self, tmp_path):
-        self._manifest_dir(tmp_path)  # dir exists but no CSVs
+        self._manifest_dir(tmp_path)
         with pytest.raises(FileNotFoundError, match="No partition CSVs"):
             WebVidVideoDataset(
                 data_root=str(tmp_path),
@@ -314,8 +285,6 @@ class TestRealDatasetIntegration:
             )
 
     def test_build_video_dataset_with_custom_dataset_name(self, tmp_path):
-        # De-hardcoded: a custom dataset_name reads raw/<name>/data, and
-        # build_video_dataset dispatches via the registry (no hardcoded class).
         from kempnerforge.config.video import VideoConfig
         from kempnerforge.data.video_dataset import VideoDataset, build_video_dataset
 
@@ -361,3 +330,71 @@ class TestVideoDatasetRegistry:
 
         with pytest.raises(KeyError, match="video_dataset"):
             registry.get_video_dataset("bogus")
+
+
+class TestFixedPromptRoom:
+    """``[video].prompt`` is fixed for the whole run, so building the dataset rejects
+    one that leaves no room in ``max_text_len`` for a caption token (plus the EOS it
+    predicts when the tokenizer has one), before any sample is read."""
+
+    @staticmethod
+    def _manifest(root) -> None:
+        d = root / "raw" / "webvid-10M" / "data" / "train" / "partitions"
+        d.mkdir(parents=True)
+        (d / "0000.csv").write_text("videoid,name\n123456,xyz\n")
+
+    @staticmethod
+    def _use_mock_tokenizer(monkeypatch, eos_token_id: int | None = 28) -> None:
+        import transformers
+
+        tok = _MockTokenizer()
+        tok.eos_token_id = eos_token_id
+        monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", lambda *a, **k: tok)
+
+    def _build(self, root, prompt: str) -> WebVidVideoDataset:
+        return WebVidVideoDataset(
+            data_root=str(root),
+            split="train",
+            tokenizer_path="unused",
+            max_text_len=8,
+            max_frames=4,
+            min_frames=2,
+            fps=2.0,
+            frame_size=16,
+            prompt=prompt,
+        )
+
+    @pytest.mark.parametrize(("eos_token_id", "prompt_tokens"), [(28, 7), (None, 8)])
+    def test_prompt_without_room_is_rejected(
+        self, tmp_path, monkeypatch, eos_token_id, prompt_tokens
+    ):
+        self._manifest(tmp_path)
+        self._use_mock_tokenizer(monkeypatch, eos_token_id)
+        with pytest.raises(ValueError, match=r"needs max_text_len >= 9"):
+            self._build(tmp_path, "a" * prompt_tokens)
+
+    @pytest.mark.parametrize(
+        ("eos_token_id", "prompt_tokens", "supervised"),
+        [(28, 6, [24, 28]), (None, 7, [24])],
+    )
+    def test_longest_prompt_with_room_is_accepted(
+        self, tmp_path, monkeypatch, eos_token_id, prompt_tokens, supervised
+    ):
+        self._manifest(tmp_path)
+        self._use_mock_tokenizer(monkeypatch, eos_token_id)
+        ds = self._build(tmp_path, "a" * prompt_tokens)
+        monkeypatch.setattr(vd, "decode_video_frames", lambda *a, **k: _frames(2))
+        labels = ds[0]["labels"]
+        assert labels[labels != -100].tolist() == supervised
+
+    def test_build_video_dataset_checks_the_configured_prompt(self, tmp_path, monkeypatch):
+        from kempnerforge.config.video import VideoConfig
+        from kempnerforge.data.video_dataset import build_video_dataset
+
+        self._manifest(tmp_path)
+        self._use_mock_tokenizer(monkeypatch)
+        unset = VideoConfig(data_root=str(tmp_path), max_frames=4, min_frames=2)
+        assert len(build_video_dataset(unset, "unused", max_text_len=8)) == 1
+        overlong = VideoConfig(data_root=str(tmp_path), max_frames=4, min_frames=2, prompt="a" * 7)
+        with pytest.raises(ValueError, match=r"prompt is 7 tokens.*needs max_text_len >= 9"):
+            build_video_dataset(overlong, "unused", max_text_len=8)

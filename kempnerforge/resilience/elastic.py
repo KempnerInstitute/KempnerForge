@@ -17,8 +17,6 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-# DCP writes this file last, once every shard is durable, so its presence is
-# the authoritative signal that a checkpoint directory is loadable.
 _DCP_METADATA_FILE = ".metadata"
 
 
@@ -54,7 +52,7 @@ class SLURMInfo:
     ntasks_per_node: int
     restart_count: int
     partition: str
-    array_task_id: str | None  # None if not an array job
+    array_task_id: str | None
 
     @property
     def is_requeued(self) -> bool:
@@ -125,7 +123,6 @@ def resolve_resume_path(checkpoint_dir: str) -> Path | None:
     if not base.exists():
         return None
 
-    # Check "latest" symlink first
     latest = base / "latest"
     if latest.exists():
         resolved = latest.resolve()
@@ -133,7 +130,6 @@ def resolve_resume_path(checkpoint_dir: str) -> Path | None:
             logger.info(f"Auto-resume: found latest checkpoint at {resolved}")
             return resolved
 
-    # Fall back to the newest step_N directory whose save completed.
     from kempnerforge.checkpoint.manager import missing_train_state
 
     step_dirs = sorted(
@@ -163,11 +159,6 @@ def resolve_resume_path(checkpoint_dir: str) -> Path | None:
         )
 
     if step_dirs:
-        # Behavior is unchanged -- the caller starts from step 0, or from
-        # checkpoint.load_path -- but this is the one path where a run that
-        # plainly meant to resume does not. Before
-        # the durability test it failed inside dcp.load instead, which was at
-        # least loud, so say so at a level nobody filters out.
         logger.error(
             f"Auto-resume: {len(step_dirs)} checkpoint directories under "
             f"{base} and none holds a complete save; starting from step 0, or from "

@@ -29,7 +29,7 @@ class DynamicCheckpointWindow:
     become selectable by setting ``strategy``.
     """
 
-    start: int = 0  # 0 = capture initial weights before any training step
+    start: int = 0
     stop: int = 512
     strategy: str = "power2"
 
@@ -63,18 +63,13 @@ class CheckpointConfig:
     """Checkpointing settings."""
 
     dir: str = "checkpoints"
-    interval: int = 1000  # save every N steps; outside any dyn_ckpt_window
-    dyn_ckpt_window: DynamicCheckpointWindow | None = None  # opt-in dense window
+    interval: int = 1000
+    dyn_ckpt_window: DynamicCheckpointWindow | None = None
     async_mode: AsyncCheckpointMode = AsyncCheckpointMode.disabled
-    keep_last_n: int = 3  # recent ckpts kept (<=0 keeps all); dynamic milestones always kept
-    load_path: str | None = None  # Training warm start; a checkpoint in dir takes precedence
+    keep_last_n: int = 3
+    load_path: str | None = None
     export_dtype: Literal["float32", "bfloat16"] = "bfloat16"
-    # "model"/"optimizer" to skip on a load_path warm start (never on a resume)
     exclude_from_loading: list[str] = field(default_factory=list)
-    # If the saved checkpoint's VLM freeze metadata differs from the current
-    # config's freeze specs, the load path raises by default. Setting this
-    # to True downgrades the mismatch to a warning. Useful when intentionally
-    # switching from frozen to trainable mid-training.
     ignore_freeze_mismatch: bool = False
 
     def __post_init__(self) -> None:

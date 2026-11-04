@@ -1,18 +1,21 @@
 """Unit tests for pipeline parallelism (no GPU required)."""
 
+import socket
+from types import SimpleNamespace
+
 import pytest
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from torch.distributed.device_mesh import init_device_mesh
 
 from kempnerforge.config.schema import ModelConfig, PipelineSchedule
 from kempnerforge.distributed.pipeline_parallel import (
     PipelineStageModule,
+    build_stage_group,
     build_stage_module,
     compute_layer_assignment,
 )
-
-# ---------------------------------------------------------------------------
-# Layer assignment
-# ---------------------------------------------------------------------------
 
 
 class TestComputeLayerAssignment:
@@ -21,7 +24,6 @@ class TestComputeLayerAssignment:
         assert result == [(0, 8), (8, 16), (16, 24), (24, 32)]
 
     def test_uneven_split(self):
-        # 10 layers / 3 stages → 4, 3, 3 (earlier stages get extra)
         result = compute_layer_assignment(10, 3)
         assert result == [(0, 4), (4, 7), (7, 10)]
 
@@ -52,11 +54,6 @@ class TestComputeLayerAssignment:
                 for start, end in assignments:
                     all_layers.extend(range(start, end))
                 assert all_layers == list(range(n_layers))
-
-
-# ---------------------------------------------------------------------------
-# PipelineStageModule
-# ---------------------------------------------------------------------------
 
 
 @pytest.fixture
@@ -103,21 +100,18 @@ class TestPipelineStageModule:
         module = PipelineStageModule(small_config, stage_id=0, num_stages=2, layer_range=(0, 4))
         tokens = torch.randint(0, 256, (2, 16))
         out = module(tokens)
-        # Not last stage → hidden states
         assert out.shape == (2, 16, 64)
 
     def test_last_stage_forward_shape(self, small_config):
         module = PipelineStageModule(small_config, stage_id=1, num_stages=2, layer_range=(4, 8))
         hidden = torch.randn(2, 16, 64)
         out = module(hidden)
-        # Last stage → logits
         assert out.shape == (2, 16, 256)
 
     def test_single_stage_forward_shape(self, small_config):
         module = PipelineStageModule(small_config, stage_id=0, num_stages=1, layer_range=(0, 8))
         tokens = torch.randint(0, 256, (2, 16))
         out = module(tokens)
-        # Only stage → logits
         assert out.shape == (2, 16, 256)
 
     def test_chained_forward_matches_shapes(self, small_config):
@@ -142,11 +136,6 @@ class TestPipelineStageModule:
         stage = PipelineStageModule(small_config, stage_id=0, num_stages=2, layer_range=(0, 4))
         stage_params = sum(p.numel() for p in stage.parameters())
         assert stage_params < full_params
-
-
-# ---------------------------------------------------------------------------
-# build_stage_module
-# ---------------------------------------------------------------------------
 
 
 class TestBuildStageModule:
@@ -178,11 +167,6 @@ class TestBuildStageModule:
         assert all_keys == [str(i) for i in range(8)]
 
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-
-
 class TestPipelineScheduleConfig:
     def test_default_schedule(self):
         from kempnerforge.config.schema import DistributedConfig
@@ -194,11 +178,6 @@ class TestPipelineScheduleConfig:
         assert PipelineSchedule.schedule_1f1b == "1f1b"
         assert PipelineSchedule.gpipe == "gpipe"
         assert PipelineSchedule.interleaved_1f1b == "interleaved_1f1b"
-
-
-# ---------------------------------------------------------------------------
-# Sequence packing across stages
-# ---------------------------------------------------------------------------
 
 
 class TestStageModuleDocIds:
@@ -298,3 +277,38 @@ class TestStageModuleDocIds:
             out_sdpa = stage("sdpa")(tokens, doc_ids)
             out_flex = stage("flex")(tokens, doc_ids)
         torch.testing.assert_close(out_flex, out_sdpa)
+
+
+def _free_port() -> int:
+    """An unused local TCP port for the gloo rendezvous."""
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def _check_stage_group_with_pp_second(rank: int, world: int, port: int) -> None:
+    """On a ``(dp_shard=2, pp=2)`` mesh, stage 0 is ranks 0 and 2, stage 1 ranks 1 and 3."""
+    dist.init_process_group(
+        "gloo", rank=rank, world_size=world, init_method=f"tcp://127.0.0.1:{port}"
+    )
+    try:
+        mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("dp_shard", "pp"))
+        group = build_stage_group(mesh)
+        members = [0, 2] if rank % 2 == 0 else [1, 3]
+        assert dist.get_process_group_ranks(group) == members
+        total = torch.tensor([float(rank)])
+        dist.all_reduce(total, group=group)
+        assert total.item() == sum(members)
+    finally:
+        dist.destroy_process_group()
+
+
+class TestBuildStageGroup:
+    def test_stages_follow_the_pp_coordinate_wherever_pp_sits(self):
+        """Each rank gets the ranks at its own ``pp`` coordinate, here strided, and only them."""
+        mp.spawn(_check_stage_group_with_pp_second, args=(4, _free_port()), nprocs=4)
+
+    @pytest.mark.parametrize("names", [("dp_shard", "tp"), None])
+    def test_a_mesh_without_a_pp_dimension_is_rejected(self, names):
+        with pytest.raises(ValueError, match="needs a 'pp' mesh dimension"):
+            build_stage_group(SimpleNamespace(mesh_dim_names=names))

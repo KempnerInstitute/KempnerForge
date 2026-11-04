@@ -72,9 +72,6 @@ def _build(
         param_dtype=param_dtype,
         compile_model=compile_model,
     )
-    # When compile_model=True the returned wrapper may be a
-    # torch._dynamo.OptimizedModule around VLMWrapper; unwrap for
-    # isinstance check.
     real = model._orig_mod if hasattr(model, "_orig_mod") else model  # type: ignore[attr-defined]
     assert isinstance(real, VLMWrapper)
     return model  # type: ignore[return-value]
@@ -84,8 +81,6 @@ def _dummy_batch(
     wrapper, batch: int = 2, text_len: int = 16
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     pixels = torch.randn(batch, 3, 32, 32, device="cuda")
-    # Compose a rank-varying pattern: rank-dependent seed makes inputs differ
-    # across ranks, which is what DP ranks would see in practice.
     rank = dist.get_rank() if dist.is_initialized() else 0
     gen = torch.Generator(device="cpu").manual_seed(1000 + rank)
     ids = torch.randint(0, 256, (batch, text_len), generator=gen).cuda()
@@ -109,8 +104,6 @@ class TestBuildAndForward:
         logits, labels_out = wrapper(pixels, ids, labels)
         loss = cross_entropy_loss(logits, labels_out)
         loss.backward()
-        # Trainable params (adapter + transformer) receive grads; frozen
-        # encoder params do not.
         has_grad = [
             (name, p.grad is not None) for name, p in wrapper.named_parameters() if p.requires_grad
         ]
@@ -128,8 +121,6 @@ class TestVariableLengthRankConsistency:
         wrapper = _build(_tiny_cfg(num_image_tokens=8), mesh)
 
         rank = dist.get_rank()
-        # Rank 0 simulates shorter logical text; rank 1 simulates longer.
-        # Both pad to the same max_text_len=32 (from the config).
         logical_len = 5 if rank == 0 else 30
         max_text_len = 32
         pixels = torch.randn(2, 3, 32, 32, device="cuda")
@@ -141,8 +132,6 @@ class TestVariableLengthRankConsistency:
         logits, labels_out = wrapper(pixels, ids, labels)
         loss = cross_entropy_loss(logits, labels_out)
         loss.backward()
-        # Shape is identical across ranks; all_reduce on the loss would be
-        # well-formed. Run it explicitly to make the assertion concrete.
         t = torch.tensor([float(loss.item())], device="cuda")
         dist.all_reduce(t)
         assert torch.isfinite(t).all()
@@ -172,10 +161,7 @@ class TestInnerTransformerUnderCompileAndFsdp:
         mesh = distributed_env
         compiled = _build(_tiny_cfg(), mesh, compile_model=True)
         inner = inner_transformer(compiled)
-        # set_moe_step is a Transformer method, reachable through the inner
-        # ref even for a compiled wrapper.
         inner.set_moe_step(0, 100)  # type: ignore[attr-defined]
-        # The compiled wrapper is still callable end-to-end.
         pixels, ids, labels = _dummy_batch(compiled)
         logits, labels_out = compiled(pixels, ids, labels)
         loss = cross_entropy_loss(logits, labels_out)
@@ -192,19 +178,14 @@ class TestCheckpointRoundtrip:
         wrapper = _build(cfg_tuple, mesh)
         opt = build_optimizer(wrapper, OptimizerConfig(lr=1e-3, fused=False))
 
-        # shared_tmp_dir is on the shared filesystem and identical on every
-        # rank, so DCP shards from rank 0 are visible to rank 1 even under
-        # multi-node srun.
         path_str = shared_tmp_dir
         rank = dist.get_rank()
 
         cfg = CheckpointConfig(dir=str(path_str), interval=1)
         mgr = CheckpointManager(cfg, wrapper, opt)
-        # _tiny_cfg returns (ModelConfig, VisionEncoderConfig, AdapterConfig, VLMConfig)
         freeze = canonical_freeze_meta(cfg_tuple[3].freeze)
         mgr.save(step=1, extra={"vlm_freeze": freeze})
 
-        # Let rank 0 finish writing metadata.json before rank 1 reads it.
         dist.barrier()
 
         if rank == 0:
