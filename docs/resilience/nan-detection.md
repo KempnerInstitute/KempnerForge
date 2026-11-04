@@ -128,9 +128,18 @@ the *source* of the NaN determines what's safe:
 
 - **LR spike** — lower the LR and restart from an earlier checkpoint. A
   rollback through `load_path` brings back the saved base LR, so a lower
-  `optimizer.lr` does not take effect there; a new
-  `scheduler.warmup_steps` does, but lowers the LR only if it extends
-  past the restored step.
+  `optimizer.lr` does not take effect there. A longer
+  `scheduler.warmup_steps` does, but it can raise the LR as well as
+  lower it. One that ends before the restored step starts the decay
+  later, which never lowers the LR there. One that extends past it
+  scales the saved base LR by `step / warmup_steps` (with the default
+  `warmup_start_factor = 0`), so right after the restored step it lowers
+  the LR only when that ratio falls below the old schedule's factor
+  there (its LR at that step over the base LR). Restoring a 1000-step
+  cosine run (`optimizer.lr = 3e-4`, `min_lr_ratio = 0.1`, 10 warmup
+  steps) at step 500 with a warmup of 100 or 800 raises the LR at step
+  501 from 1.67e-4 to 1.88e-4; only a warmup longer than about 900 steps
+  lowers it.
 - **Bad data** — skip the offending shard, restart from the same
   checkpoint.
 - **FP8 overflow** — reduce `distributed.fp8_interval` or disable FP8
