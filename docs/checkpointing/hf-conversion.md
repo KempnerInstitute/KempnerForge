@@ -43,6 +43,11 @@ exports/my_model/
 └── model.safetensors        ← weights
 ```
 
+With tied embeddings the export still holds both `model.embed_tokens.weight`
+and `lm_head.weight`, the head as a copy of the embedding, since safetensors
+refuses tensors that share memory. `config.json` sets `tie_word_embeddings`,
+so transformers ties the two again when it loads the export.
+
 ### Dtypes
 
 The export dtype is the first of:
