@@ -268,6 +268,13 @@ class TestTrainConfig:
         with pytest.raises(ValueError, match="'fp16' is not supported: .*no loss scaling"):
             _ = config.param_dtype
 
+    def test_fp32_cross_entropy_defaults_off(self) -> None:
+        assert TrainConfig().fp32_cross_entropy is False
+
+    def test_fp32_cross_entropy_from_cli(self) -> None:
+        config = load_config(cli_args=["--train.fp32_cross_entropy=true"])
+        assert config.train.fp32_cross_entropy is True
+
     def test_data_seed_defaults_to_none(self):
         assert TrainConfig().data_seed is None
 
