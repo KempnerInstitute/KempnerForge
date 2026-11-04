@@ -88,7 +88,9 @@ def main() -> None:
         logger.error("No checkpoint found. Specify --checkpoint.load_path or --checkpoint.dir")
         sys.exit(1)
 
-    step, tokens_seen, _ = ckpt_mgr.load(path=load_path, exclude_keys=["optimizer"])
+    step, tokens_seen, _ = ckpt_mgr.load(
+        path=load_path, exclude_keys=["optimizer"], exact_resume=False
+    )
     logger.info(f"Loaded checkpoint: step={step}, tokens_seen={tokens_seen:,}")
 
     eval_config = config.eval

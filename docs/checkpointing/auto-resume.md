@@ -83,6 +83,14 @@ always pick up where they left off, not re-load the initial
 `load_path` warm start, so when a resume wins it is dropped with
 `load_path` and a weights-only warm start silently becomes a full
 resume. Use an empty `dir` to guarantee the warm start.
+Per-rank dataloader/RNG state follows it too: only the auto-resume is
+an exact resume, where each rank restores its own state and a changed
+world size or data-parallel layout is refused; a `load_path` warm
+start restores rank 0's single copy on every rank on any topology
+(see [Train state](train-state.md#per-rank-state-schema-v1)). To
+auto-resume onto a different topology anyway, set
+`checkpoint.ignore_rank_state_mismatch`: see
+[Scaling a run to a different world size](resharding.md#scaling-a-run-to-a-different-world-size).
 
 ## Symlink updates
 
