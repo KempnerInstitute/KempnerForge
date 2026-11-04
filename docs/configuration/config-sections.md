@@ -110,7 +110,7 @@ Training-loop hyperparameters.
 | `loss_fn` | `str` | `"cross_entropy"` | `loss` registry key (or `"chunked_cross_entropy"`) |
 | `z_loss_weight` | `float` | `0.0` | logit-magnitude regularizer (PaLM uses `1e-4`) |
 | `ce_chunk_size` | `int` | `0` | chunk size for `chunked_cross_entropy` (`0` → auto 4096) |
-| `fp32_cross_entropy` | `bool` | `False` | compute `cross_entropy` / `chunked_cross_entropy` and their gradient in fp32 from bf16 logits, without an fp32 copy of the logits — see [Losses § fp32 cross-entropy](../training/losses.md#fp32-cross-entropy) |
+| `fp32_cross_entropy` | `bool` | `False` | compute `cross_entropy` / `chunked_cross_entropy` and their gradient in fp32 from bf16 logits, without an fp32 copy of the logits; rejected for any other `loss_fn` — see [Losses § fp32 cross-entropy](../training/losses.md#fp32-cross-entropy) |
 | `shutdown_timeout_sec` | `float` | `600.0` | graceful shutdown timeout before forced exit |
 | `nccl_health_check_interval` | `int` | `0` | NCCL liveness all-reduce every N steps (`0` = disabled) |
 

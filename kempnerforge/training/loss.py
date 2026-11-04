@@ -13,10 +13,10 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
+from torch.autograd.function import once_differentiable
 
 from kempnerforge.config.registry import registry
-
-_FP32_LOSSES = ("cross_entropy", "chunked_cross_entropy")
+from kempnerforge.config.training import FP32_CROSS_ENTROPY_LOSSES
 
 
 def _chunk_loss(chunk: torch.Tensor, target: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -64,6 +64,7 @@ class _Fp32CrossEntropySum(torch.autograd.Function):
         return total
 
     @staticmethod
+    @once_differentiable
     def backward(ctx: Any, grad_total: torch.Tensor) -> tuple[torch.Tensor, None, None]:
         logits, labels, lse = ctx.saved_tensors
         chunk_grad = _CHUNK_GRAD_COMPILED if logits.is_cuda else _chunk_grad
@@ -87,8 +88,8 @@ def _fp32_cross_entropy(
     logits: torch.Tensor, labels: torch.Tensor, chunk_size: int | None
 ) -> torch.Tensor:
     """Mean fp32 cross-entropy over tokens not labeled ``-100``; ``None`` means one chunk."""
-    flat_logits = logits.reshape(-1, logits.shape[-1])
-    flat_labels = labels.reshape(-1)
+    flat_logits = logits.view(-1, logits.shape[-1])
+    flat_labels = labels.view(-1)
     valid_tokens = (flat_labels != -100).sum()
     if valid_tokens == 0:
         return _zero_on_graph(logits)
@@ -212,9 +213,9 @@ def build_loss_fn(config) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor
         base_fn = functools.partial(base_fn, chunk_size=chunk_size)
 
     if config.fp32_cross_entropy:
-        if config.loss_fn not in _FP32_LOSSES:
+        if config.loss_fn not in FP32_CROSS_ENTROPY_LOSSES:
             raise ValueError(
-                f"train.fp32_cross_entropy applies to {', '.join(_FP32_LOSSES)}, "
+                f"train.fp32_cross_entropy applies to {', '.join(FP32_CROSS_ENTROPY_LOSSES)}, "
                 f"not loss_fn={config.loss_fn!r}"
             )
         base_fn = functools.partial(base_fn, fp32=True)

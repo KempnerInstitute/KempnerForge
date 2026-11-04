@@ -208,6 +208,23 @@ class TestFp32CrossEntropy:
         loss = FP32_LOSSES["cross_entropy"](logits, torch.full((2, 8), -100))
         assert loss.dtype == torch.float32 and loss.item() == 0.0
 
+    def test_double_backward_raises(self) -> None:
+        logits = torch.randn(6, 50, requires_grad=True)
+        labels = torch.tensor([1, 2, -100, 3, 4, 5])
+        loss = FP32_LOSSES["cross_entropy"](logits, labels)
+        (grad,) = torch.autograd.grad(loss, logits, create_graph=True)
+        assert not grad.requires_grad
+        with pytest.raises(RuntimeError, match="does not require grad"):
+            grad.sum().backward()
+
+    def test_non_contiguous_logits_raise_as_without_fp32(self) -> None:
+        logits = torch.randn(2, 9, 50)[:, :-1]
+        labels = torch.randint(0, 50, (2, 8))
+        with pytest.raises(RuntimeError, match="view"):
+            cross_entropy_loss(logits, labels)
+        with pytest.raises(RuntimeError, match="view"):
+            FP32_LOSSES["cross_entropy"](logits, labels)
+
     @pytest.mark.gpu
     @pytest.mark.parametrize("chunk_size", [None, 1024])
     def test_peak_memory_holds_no_full_fp32_copy(self, chunk_size: int | None) -> None:
@@ -308,9 +325,16 @@ class TestBuildLossFn:
         logits = torch.randn(2, 8, 100).bfloat16()
         assert fn(logits, torch.randint(0, 100, (2, 8))).dtype == torch.float32
 
-    def test_fp32_on_rejects_another_loss(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_fp32_on_rejects_another_loss_when_the_config_loads(self) -> None:
+        with pytest.raises(ValueError, match="fp32_cross_entropy applies to"):
+            TrainConfig(loss_fn="mse_test", fp32_cross_entropy=True)
+
+    def test_fp32_on_rejects_a_loss_set_after_loading(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         monkeypatch.setitem(registry._get_store("loss"), "mse_test", lambda x, y: x)
-        config = TrainConfig(loss_fn="mse_test", fp32_cross_entropy=True)
+        config = TrainConfig(fp32_cross_entropy=True)
+        config.loss_fn = "mse_test"
         with pytest.raises(ValueError, match="fp32_cross_entropy applies to"):
             build_loss_fn(config)
 

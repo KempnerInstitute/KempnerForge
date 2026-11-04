@@ -9,6 +9,8 @@ from typing import TYPE_CHECKING, Literal
 if TYPE_CHECKING:
     import torch
 
+FP32_CROSS_ENTROPY_LOSSES = ("cross_entropy", "chunked_cross_entropy")
+
 _FP16_UNSUPPORTED = (
     "train.mixed_precision='fp16' is not supported: it would train in pure fp16 "
     "with no loss scaling, so small gradients underflow to zero. Use 'bf16', or "
@@ -61,6 +63,11 @@ class TrainConfig:
             raise ValueError("grad_clip_norm must be positive")
         if self.mixed_precision == "fp16":
             raise ValueError(_FP16_UNSUPPORTED)
+        if self.fp32_cross_entropy and self.loss_fn not in FP32_CROSS_ENTROPY_LOSSES:
+            raise ValueError(
+                f"train.fp32_cross_entropy applies to {', '.join(FP32_CROSS_ENTROPY_LOSSES)}, "
+                f"not loss_fn={self.loss_fn!r}"
+            )
 
     @property
     def param_dtype(self) -> torch.dtype:

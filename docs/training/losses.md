@@ -102,6 +102,17 @@ logits of 3.9 GiB), loss forward and backward:
 
 The first call on each new shape compiles for a few seconds.
 
+Limits:
+
+- If `torch.compile` is disabled or falls back to eager on CUDA,
+  whole-batch `cross_entropy` holds several fp32 tensors the size of
+  the logits at once in its backward; `chunked_cross_entropy` bounds
+  them to one chunk. Use `chunked_cross_entropy` if compile is off.
+- The backward cannot itself be differentiated: with `create_graph=True`
+  the gradient comes back detached, so a second backward through it
+  raises.
+- The flag is rejected for any `loss_fn` other than these two.
+
 ## z-loss (logit magnitude regularizer)
 
 ```toml
