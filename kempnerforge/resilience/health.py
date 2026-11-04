@@ -1,7 +1,7 @@
 """GPU health monitoring and NaN detection.
 
 Provides utilities for detecting common failures during training:
-  - NaN/Inf in loss or gradients
+  - NaN/Inf in loss, gradients or parameters
   - GPU availability and basic health
   - NCCL liveness via lightweight collectives
 """
@@ -14,6 +14,7 @@ from datetime import timedelta
 
 import torch
 import torch.distributed as dist
+from torch.distributed.tensor import DTensor
 
 logger = logging.getLogger(__name__)
 
@@ -147,6 +148,32 @@ class NaNDetector:
     def reset(self) -> None:
         """Reset NaN tracking state (e.g., after a rollback)."""
         self.state = NaNState()
+
+
+def params_are_finite(model: torch.nn.Module, device: torch.device | str) -> bool:
+    """Check that no rank holds a NaN/Inf parameter of ``model``.
+
+    Each rank checks the parameters it holds (the local shard of a
+    ``DTensor``). When running distributed, one all-reduce of a flag over
+    the default process group gives every rank the same answer, so this is
+    a collective that every rank must call.
+
+    Args:
+        model: The model, or this rank's pipeline stage of it.
+        device: Device for the all-reduced flag; it must suit the default
+            process group's backend (CUDA under NCCL).
+
+    Returns:
+        True if every parameter is finite on every rank.
+    """
+    with torch.no_grad():
+        nonfinite = torch.zeros(1, device=device)
+        for p in model.parameters():
+            local = p.to_local() if isinstance(p, DTensor) else p
+            nonfinite += (~torch.isfinite(local).all()).to(device)
+    if dist.is_initialized():
+        dist.all_reduce(nonfinite)
+    return nonfinite.item() == 0
 
 
 def check_gpu_health(device: int = 0) -> dict[str, bool | str]:
