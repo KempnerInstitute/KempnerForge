@@ -780,6 +780,16 @@ class TestResumePathResolution:
         unread = f"Could not read {damaged / '.metadata'} to tell whether it holds optimizer state"
         assert any(unread in r.getMessage() for r in caplog.records), caplog.text
 
+    def test_a_weights_only_caller_keeps_a_save_without_its_train_state(self, tmp_path):
+        """Evaluation loads the weights alone, so the newest save with durable shards serves it."""
+        _saved_step_dir(tmp_path, 10, optimizer=True, train_state=True)
+        _saved_step_dir(tmp_path, 20, optimizer=True, train_state=False)
+        (tmp_path / "step_30").mkdir()
+
+        result = resolve_resume_path(str(tmp_path), require_train_state=False)
+        assert result is not None
+        assert result.name == "step_20"
+
 
 class TestWorkerSignalShielding:
     """SIGTERM is delivered to the process group, so it reaches DataLoader
