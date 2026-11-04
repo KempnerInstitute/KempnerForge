@@ -15,10 +15,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 
 import check_env  # noqa: E402
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 
 def _fake_which(available: set[str]):
     def _which(binary):
@@ -48,11 +44,6 @@ def _fake_repo(tmp_path: Path) -> Path:
     (tmp_path / "configs").mkdir()
     (tmp_path / "kempnerforge").mkdir()
     return tmp_path
-
-
-# ---------------------------------------------------------------------------
-# Baseline
-# ---------------------------------------------------------------------------
 
 
 class TestCheckUv:
@@ -99,16 +90,10 @@ class TestCheckRepoLayout:
 
     def test_missing_dir(self, tmp_path):
         (tmp_path / "pyproject.toml").write_text("")
-        # configs/ and kempnerforge/ missing
         r = check_env.check_repo_layout(tmp_path)
         assert r.status == check_env.MISS
         assert "configs" in r.message
         assert "kempnerforge" in r.message
-
-
-# ---------------------------------------------------------------------------
-# GPU
-# ---------------------------------------------------------------------------
 
 
 class TestCheckGpu:
@@ -161,11 +146,6 @@ class TestCheckGpu:
         monkeypatch.setattr(Path, "exists", fake_exists)
         r = check_env.check_gpu()
         assert r.status == check_env.MISS
-
-
-# ---------------------------------------------------------------------------
-# SLURM
-# ---------------------------------------------------------------------------
 
 
 class TestCheckSlurm:
@@ -237,11 +217,6 @@ class TestCheckSlurm:
         assert "qos=env_qos" in r.message
 
 
-# ---------------------------------------------------------------------------
-# Multi-node
-# ---------------------------------------------------------------------------
-
-
 class TestCheckMultiNode:
     def test_no_config(self, tmp_path):
         r = check_env.check_multi_node(None, tmp_path)
@@ -275,9 +250,7 @@ class TestCheckMultiNode:
         repo = shared / "repo"
         repo.mkdir()
         cfg = {"network": {"shared_fs_root": str(shared)}}
-        # Force _fs_type to return something non-distributed
         monkeypatch.setattr(check_env, "_fs_type", lambda p: "ext4")
-        # Force IB path not to exist
         real_exists = Path.exists
 
         def fake_exists(self):
@@ -304,11 +277,6 @@ class TestCheckMultiNode:
         r = check_env.check_multi_node(cfg, repo)
         assert r.status == check_env.WARN
         assert "checkpoints_root" in r.message
-
-
-# ---------------------------------------------------------------------------
-# WandB, HF, gh
-# ---------------------------------------------------------------------------
 
 
 class TestCheckWandb:
@@ -477,7 +445,7 @@ class TestCheckMlflow:
         monkeypatch.setenv("DATABRICKS_API_TOKEN", "dapi-x")
         monkeypatch.delenv("DATABRICKS_TOKEN", raising=False)
 
-        class _WC:  # authenticates only when the SDK-native DATABRICKS_TOKEN is present
+        class _WC:
             def __init__(self):
                 import os as _os
 
@@ -621,11 +589,6 @@ class TestCheckGh:
         assert r.status == check_env.OK
 
 
-# ---------------------------------------------------------------------------
-# Orchestration
-# ---------------------------------------------------------------------------
-
-
 class TestParseRequires:
     @pytest.mark.parametrize(
         "raw,expected",
@@ -734,11 +697,6 @@ class TestFormatText:
         assert "fix: install cuda" in out
 
 
-# ---------------------------------------------------------------------------
-# main() end-to-end
-# ---------------------------------------------------------------------------
-
-
 class TestMain:
     def test_baseline_json(self, tmp_path, monkeypatch, capsys):
         repo = _fake_repo(tmp_path)
@@ -765,7 +723,7 @@ class TestMain:
     def test_miss_returns_one(self, tmp_path, monkeypatch):
         repo = _fake_repo(tmp_path)
         monkeypatch.setattr(check_env, "find_repo_root", lambda start=None: repo)
-        monkeypatch.setattr("shutil.which", _fake_which(set()))  # no uv
+        monkeypatch.setattr("shutil.which", _fake_which(set()))
         rc = check_env.main([])
         assert rc == 1
 
@@ -786,11 +744,6 @@ class TestMain:
         )
         rc = check_env.main(["--requires", ""])
         assert rc == 0
-
-
-# ---------------------------------------------------------------------------
-# do_init non-interactive path
-# ---------------------------------------------------------------------------
 
 
 class TestDoInitNonInteractive:

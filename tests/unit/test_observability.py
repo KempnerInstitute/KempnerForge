@@ -44,10 +44,6 @@ from kempnerforge.metrics.tracker import (
     WandBBackend,
 )
 
-# ---------------------------------------------------------------------------
-# MetricsTracker
-# ---------------------------------------------------------------------------
-
 
 class TestMetricsTracker:
     def _make_tracker(self, log_interval: int = 1) -> MetricsTracker:
@@ -91,7 +87,6 @@ class TestMetricsTracker:
         tracker = self._make_tracker()
         tracker.start_step()
         result = tracker.end_step(step=1, loss=2.0, grad_norm=1.0, lr=3e-4, tokens_in_step=100000)
-        # MFU is computed (may be > 1 in tests due to near-zero step time)
         assert result.mfu > 0.0
 
     def test_smoothed_metrics_updated(self):
@@ -106,7 +101,7 @@ class TestMetricsTracker:
 
     def test_close_without_backends(self):
         tracker = self._make_tracker()
-        tracker.close()  # Should not raise
+        tracker.close()
 
     def test_init_backends_rank_zero_appends_wandb(self, monkeypatch):
         """When rank-0 and enable_wandb=True, init_backends appends a WandBBackend."""
@@ -165,7 +160,7 @@ class TestMetricsTracker:
         )
         tracker = MetricsTracker(config, num_gpus=1)
         tracker.init_backends(config)
-        tracker.init_backends(config)  # second call is a no-op
+        tracker.init_backends(config)
         assert fake.call_count == 1
 
     def test_end_step_dispatches_to_backend(self):
@@ -211,22 +206,12 @@ class _FakeBackend:
         self.close_calls += 1
 
 
-# ---------------------------------------------------------------------------
-# StepMetrics
-# ---------------------------------------------------------------------------
-
-
 class TestStepMetrics:
     def test_defaults(self):
         m = StepMetrics()
         assert m.loss == 0.0
         assert m.mfu == 0.0
         assert m.mem_utilization == 0.0
-
-
-# ---------------------------------------------------------------------------
-# DeviceMemoryMonitor
-# ---------------------------------------------------------------------------
 
 
 class TestDeviceMemoryMonitor:
@@ -265,7 +250,6 @@ class TestDeviceMemoryMonitor:
         monitor = DeviceMemoryMonitor(snapshot_step=3, snapshot_dir=str(tmp_path / "snapshots"))
         monitor.report(step=3)
         assert monitor._snapshot_taken
-        # Second report at same step should not re-snapshot
         monitor.report(step=3)
         assert monitor._snapshot_taken
 
@@ -277,7 +261,6 @@ class TestDeviceMemoryMonitor:
 
     def test_capture_snapshot_handles_exception(self, monkeypatch, tmp_path):
         """Any exception inside capture_snapshot is swallowed; returns None."""
-        # Bypass the CPU-only early return so the try-block runs.
         monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
 
         def _boom(*args, **kwargs):
@@ -310,12 +293,7 @@ class TestMemoryHelpers:
     def test_reset_peak_memory_cpu_only(self, monkeypatch):
         """Without CUDA, reset_peak_memory is a no-op (must not raise)."""
         monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
-        reset_peak_memory(device=0)  # Should not raise
-
-
-# ---------------------------------------------------------------------------
-# Logging backends
-# ---------------------------------------------------------------------------
+        reset_peak_memory(device=0)
 
 
 class TestWandBBackend:
@@ -327,9 +305,7 @@ class TestWandBBackend:
     def test_log_without_init_triggers_init(self):
         config = MetricsConfig(enable_wandb=True)
         backend = WandBBackend(config)
-        # This will try to import wandb — if not installed, sets sentinel
         backend.log({"test": 1.0}, step=1)
-        # Either initialized or set to False sentinel
         assert backend._run is not None
 
     def test_wandb_handles_import_error(self, monkeypatch):
@@ -350,11 +326,6 @@ class TestWandBBackend:
         backend = WandBBackend(MetricsConfig(enable_wandb=True))
         backend.log({"loss": 1.0}, step=1)
         assert backend._run is False
-
-
-# ---------------------------------------------------------------------------
-# Tracking entries: what a checkpoint's metadata.json records about the live runs
-# ---------------------------------------------------------------------------
 
 
 class _FakeWandbRun:
@@ -443,8 +414,6 @@ class TestTrackingEntries:
     def test_a_backend_without_a_descriptor_contributes_nothing(self):
         assert tracker_mod._LoggingBackend().tracking_entry() is None
 
-    # WandB: run id and project, plus the entity and URL when the run has them
-
     def test_wandb_entry_carries_the_run_project_entity_and_url(self, monkeypatch):
         backend = _wandb_backend(monkeypatch, _FakeWandbRun())
         assert backend.tracking_entry() == {
@@ -464,7 +433,7 @@ class TestTrackingEntries:
             "run_id": "run-1",
             "experiment": "proj",
         }
-        assert run.url_reads == reads  # an offline run is never asked for its URL
+        assert run.url_reads == reads
 
     def test_wandb_has_no_entry_without_a_live_run(self, monkeypatch):
         assert WandBBackend(MetricsConfig(enable_wandb=True)).tracking_entry() is None
@@ -474,7 +443,7 @@ class TestTrackingEntries:
         backend = WandBBackend(MetricsConfig(enable_wandb=True))
         backend.log({"train/loss": 1.0}, step=1)
         assert backend._run is False
-        assert backend.tracking_entry() is None  # wandb is not installed
+        assert backend.tracking_entry() is None
 
     def test_wandb_has_no_entry_once_it_is_closed(self, monkeypatch):
         import wandb
@@ -485,9 +454,7 @@ class TestTrackingEntries:
         assert backend.tracking_entry() is not None
         backend.close()
         assert finished == [1]
-        assert backend.tracking_entry() is None  # the run has finished
-
-    # TensorBoard: the log directory once the writer is open
+        assert backend.tracking_entry() is None
 
     def test_tensorboard_entry_names_the_log_dir_once_the_writer_is_open(self, tmp_path):
         pytest.importorskip("tensorboard")
@@ -498,11 +465,11 @@ class TestTrackingEntries:
             backend.log({"train/loss": 2.5}, step=1)
             assert backend.tracking_entry() == {"backend": "tensorboard", "log_dir": log_dir}
             backend.close()
-            assert backend.tracking_entry() is None  # the writer is closed
+            assert backend.tracking_entry() is None
 
     def test_tensorboard_entry_names_the_directory_the_writer_chose(self, tmp_path, monkeypatch):
         pytest.importorskip("tensorboard")
-        monkeypatch.chdir(tmp_path)  # an empty setting makes the writer create runs/<stamp> here
+        monkeypatch.chdir(tmp_path)
         config = MetricsConfig(enable_tensorboard=True, tensorboard_dir="")
         with closing(TensorBoardBackend(config)) as backend:
             backend.log({"train/loss": 2.5}, step=1)
@@ -531,7 +498,7 @@ class TestTrackingEntries:
         self, tmp_path, monkeypatch, setting
     ):
         pytest.importorskip("tensorboard")
-        monkeypatch.chdir(tmp_path)  # relative settings create their directory here
+        monkeypatch.chdir(tmp_path)
         config = MetricsConfig(enable_tensorboard=True, tensorboard_dir=setting)  # type: ignore[arg-type]
         with closing(TensorBoardBackend(config)) as backend:
             backend.log({"train/loss": 2.5}, step=1)
@@ -566,8 +533,6 @@ class TestTrackingEntries:
         assert backend._writer is False
         assert backend.tracking_entry() is None
 
-    # The tracker lists every backend that has one
-
     def _tracker(self) -> MetricsTracker:
         model = ModelConfig(dim=128, n_layers=2, n_heads=2, vocab_size=256)
         return MetricsTracker(JobConfig(model=model, metrics=MetricsConfig()), num_gpus=1)
@@ -593,7 +558,7 @@ class TestTrackingEntries:
             def __str__(self):
                 raise RuntimeError("no message")
 
-        monkeypatch.setattr(logging, "raiseExceptions", False)  # a logging error is not raised
+        monkeypatch.setattr(logging, "raiseExceptions", False)
         tracker = self._tracker()
         kept = {"backend": "kept"}
         tracker._backends = [_EntryBackend(error=Unprintable()), _EntryBackend(kept)]
@@ -637,31 +602,31 @@ class TestTrackingEntries:
         tracker = self._tracker()
         kept = {"backend": "kept", "run_id": "r"}
         tracker._backends = [_EntryBackend(bad), _EntryBackend(kept)]
-        assert tracker.tracking_entries() == [kept]  # one bad backend does not cost the others
+        assert tracker.tracking_entries() == [kept]
         assert len(seen) == 1 and "_EntryBackend" in seen[0]
 
     def test_tracker_keeps_a_blank_field_that_is_not_the_backend_name(self):
-        entry = {"backend": "tensorboard", "log_dir": "   "}  # a directory can be named so
+        entry = {"backend": "tensorboard", "log_dir": "   "}
         tracker = self._tracker()
         tracker._backends = [_EntryBackend(entry)]
         assert tracker.tracking_entries() == [entry]
         assert json.loads(json.dumps(tracker.tracking_entries())) == [entry]
 
     def test_tracker_copies_each_entry_once_into_a_plain_dict(self):
-        once = _OnceItems(backend="lazy", run_id="r")  # a mapping that cannot be read twice
+        once = _OnceItems(backend="lazy", run_id="r")
         tracker = self._tracker()
         tracker._backends = [_EntryBackend(once), _EntryBackend({"backend": "kept"})]
         entries = tracker.tracking_entries()
         assert entries == [{"backend": "lazy", "run_id": "r"}, {"backend": "kept"}]
         assert type(entries[0]) is dict
-        json.dumps(entries)  # what the checkpoint writes cannot go back to the original
+        json.dumps(entries)
 
     def test_tracker_reports_nothing_once_closed(self):
         tracker = self._tracker()
         tracker._backends = [_EntryBackend({"backend": "live"})]
         assert tracker.tracking_entries() == [{"backend": "live"}]
         tracker.close()
-        assert tracker.tracking_entries() == []  # whatever the backend itself reports
+        assert tracker.tracking_entries() == []
 
     def test_tracker_reports_nothing_after_a_close_that_fails_part_way(self):
         tracker = self._tracker()
@@ -683,7 +648,7 @@ class TestTrackingEntries:
         tracker.init_backends(config)
         try:
             tracker.close()
-            tracker.log_eval({"eval/loss": 1.0}, step=1)  # a late log still starts the writer
+            tracker.log_eval({"eval/loss": 1.0}, step=1)
             assert tracker._backends[0].tracking_entry() is not None
             assert tracker.tracking_entries() == []
         finally:
@@ -813,7 +778,6 @@ class TestTensorBoardBackend:
         config = MetricsConfig(enable_tensorboard=True, tensorboard_dir=str(tmp_path / "tb"))
         backend = TensorBoardBackend(config)
         backend.log({"train/loss": 2.5}, step=1)
-        # Writer should be initialized (or False if tensorboard not installed)
         assert backend._writer is not None
         backend.close()
 
@@ -823,16 +787,6 @@ class TestTensorBoardBackend:
         backend = TensorBoardBackend(MetricsConfig(enable_tensorboard=True))
         backend.log({"loss": 1.0}, step=1)
         assert backend._writer is False
-
-
-# ---------------------------------------------------------------------------
-# Format helpers
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
-# Rank-aware logging
-# ---------------------------------------------------------------------------
 
 
 class TestRankLogger:
@@ -852,6 +806,18 @@ class TestRankLogger:
         record = logging.LogRecord("test", logging.INFO, "", 0, "msg", (), None)
         with patch.dict(os.environ, {"RANK": "3"}):
             assert f.filter(record) is False
+
+    def test_rank_filter_passes_a_record_logged_for_every_rank(self):
+        """``extra={"every_rank": True}`` lets a record through on any rank; only that marks it."""
+        f = _RankFilter(rank=0)
+        make = logging.getLogger("test").makeRecord
+        marked = make("test", logging.WARNING, "", 0, "msg", (), None, extra={"every_rank": True})
+        unmarked = make(
+            "test", logging.WARNING, "", 0, "msg", (), None, extra={"every_rank": False}
+        )
+        with patch.dict(os.environ, {"RANK": "3"}):
+            assert f.filter(marked) is True
+            assert f.filter(unmarked) is False
 
     def test_rank_filter_custom_rank(self):
         """Filter allowing rank 2 should pass rank 2 and block others."""
@@ -923,11 +889,6 @@ class TestRankLogger:
             root.handlers.extend(orig_handlers)
 
 
-# ---------------------------------------------------------------------------
-# Format metrics
-# ---------------------------------------------------------------------------
-
-
 class TestFormatMetrics:
     def test_format_metrics_basic(self):
         s = format_metrics(100, {"loss": "2.34", "lr": "3.00e-04"})
@@ -941,7 +902,7 @@ class TestFormatMetrics:
 
     def test_format_number_small_float(self):
         result = _format_number(3e-4)
-        assert "e" in result  # Scientific notation
+        assert "e" in result
 
     def test_format_number_regular_float(self):
         result = _format_number(2.34)

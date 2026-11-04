@@ -110,7 +110,6 @@ class ExpertChoiceSigmoidRouter(nn.Module):
         self.num_experts = num_experts
         self.capacity_factor = capacity_factor
         self.gumbel_noise = gumbel_noise
-        # Tracked for metrics / debugging (analogous to MoEMLP.expert_counts).
         self.expert_counts: torch.Tensor = torch.zeros(num_experts)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -132,25 +131,20 @@ class ExpertChoiceSigmoidRouter(nn.Module):
             )
         n_tokens, _ = x.shape
         if n_tokens == 0:
-            # Empty modality slice — return empty selections; caller handles.
             empty_scores = x.new_zeros(self.num_experts, 0)
             empty_indices = torch.zeros(self.num_experts, 0, dtype=torch.long, device=x.device)
             return empty_scores, empty_indices
 
-        logits = self.gate(x)  # (N, E)
+        logits = self.gate(x)
         if self.training and self.gumbel_noise:
             logits = logits + _gumbel_like(logits) - _gumbel_like(logits)
-        scores = torch.sigmoid(logits)  # (N, E), independent per expert
+        scores = torch.sigmoid(logits)
 
         k_e = max(1, math.ceil(self.capacity_factor * n_tokens))
         k_e = min(k_e, n_tokens)
 
-        # scores.t(): (E, N). For each expert (row), select the top-k_e tokens.
         topk_scores, topk_indices = torch.topk(scores.t(), k=k_e, dim=1)
 
-        # Per-expert utilization metric: how many tokens this expert handled.
-        # Always k_e (EC routing guarantees this), but recording for parity
-        # with the MoEMLP API.
         with torch.no_grad():
             counts = torch.full(
                 (self.num_experts,), float(k_e), device=x.device, dtype=torch.float32
@@ -228,23 +222,17 @@ class ExpertChoiceMoE(nn.Module):
             raise ValueError(f"ExpertChoiceMoE.forward expects (N, D); got shape {tuple(x.shape)}")
         n_tokens, _ = x.shape
         if n_tokens == 0:
-            return x  # Pass through empty modality slice.
+            return x
 
-        topk_scores, topk_indices = self.router(x)  # (E, k_e) each
+        topk_scores, topk_indices = self.router(x)
 
         out = torch.zeros_like(x)
-        # Sequential per-expert dispatch (the codebase's MoEMLP fallback
-        # uses the same sequential loop pattern). Grouped-GEMM EC dispatch
-        # is a future optimization once the operator is stable.
         for e in range(self.num_experts):
-            token_idx = topk_indices[e]  # (k_e,)
-            token_scores = topk_scores[e]  # (k_e,)
-            x_e = x.index_select(0, token_idx)  # (k_e, D)
-            out_e = self.experts[e](x_e)  # (k_e, D)
-            weighted = token_scores.unsqueeze(-1) * out_e  # (k_e, D)
-            # index_add (non-in-place) accumulates contributions from
-            # multiple experts that picked the same token. Autograd-safe
-            # for non-unique indices.
+            token_idx = topk_indices[e]
+            token_scores = topk_scores[e]
+            x_e = x.index_select(0, token_idx)
+            out_e = self.experts[e](x_e)
+            weighted = token_scores.unsqueeze(-1) * out_e
             out = out.index_add(0, token_idx, weighted)
         return out
 
@@ -341,33 +329,18 @@ class MoMaFFN(nn.Module):
         valid_flat = key_padding_mask.reshape(b * s) if key_padding_mask is not None else None
         out = torch.zeros_like(x_flat)
 
-        # ``total_routed`` counts positions matching *some* modality group (the
-        # modality_ids range check below); with well-formed modality_ids it
-        # equals b*s. We accumulate Python ints from ``idx.numel()`` (tensor
-        # metadata, no host sync) rather than a ``.all()`` reduction that would
-        # force a device->host sync every step. The per-modality routing set
-        # additionally drops padded positions so they never compete for capacity.
         total_routed = 0
         for i, m in enumerate(self.modalities):
-            # nonzero() avoids the boolean-mask copy and gives a 1-D index
-            # tensor we can feed to index_select + scatter.
-            mod_idx = (mod_flat == i).nonzero(as_tuple=False).squeeze(-1)  # (N_m,)
+            mod_idx = (mod_flat == i).nonzero(as_tuple=False).squeeze(-1)
             total_routed += mod_idx.numel()
             idx = mod_idx
             if valid_flat is not None:
-                # Drop padded (e.g. blank-frame) positions from the expert-choice
-                # competition: padded tokens must not consume expert capacity or
-                # change which real tokens the experts pick. They get zero FFN
-                # output; the outer residual skip carries them through unchanged.
                 keep = valid_flat.index_select(0, mod_idx).nonzero(as_tuple=False).squeeze(-1)
                 idx = mod_idx.index_select(0, keep)
             if idx.numel() == 0:
                 continue
-            x_m = x_flat.index_select(0, idx)  # (N_routed, D)
-            y_m = self.experts[m](x_m)  # (N_routed, D)
-            # The modality groups partition the position space, so indices are
-            # unique across iterations; index_copy on disjoint indices is safe
-            # and autograd-friendly.
+            x_m = x_flat.index_select(0, idx)
+            y_m = self.experts[m](x_m)
             out = out.index_copy(0, idx, y_m)
 
         if total_routed != b * s:
@@ -452,8 +425,6 @@ class MoMaBlock(nn.Module):
         doc_ids: torch.Tensor | None = None,
         key_padding_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # Pre-norm attention with residual (shared QKVO, single SDPA).
-        # kv_cache is intentionally omitted: EC routing is non-causal in v1.
         x = x + self.attention(
             self.attention_norm(x),
             rope_cos,
@@ -461,8 +432,6 @@ class MoMaBlock(nn.Module):
             doc_ids=doc_ids,
             key_padding_mask=key_padding_mask,
         )
-        # Pre-norm MoMa FFN with residual (per-modality EC-MoE groups). The
-        # key_padding_mask drops padded positions from expert-choice routing.
         x = x + self.mlp(
             self.mlp_norm(x), modality_ids=modality_ids, key_padding_mask=key_padding_mask
         )

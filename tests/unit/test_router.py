@@ -46,18 +46,15 @@ class TestSoftmaxTopKRouter:
         (P_i = 1/N), giving N * N * (1/N * 1/N) = 1.0.
         """
         router = SoftmaxTopKRouter(dim=64, num_experts=8, top_k=2)
-        # Zero out gate weights → uniform softmax probabilities
         router.gate.weight.data.zero_()
         x = torch.randn(1024, 64)
         router(x)
-        # With uniform routing, aux_loss ≈ 1.0
         assert abs(router.aux_loss.item() - 1.0) < 0.05
 
     def test_expert_counts(self):
         router = SoftmaxTopKRouter(dim=64, num_experts=8, top_k=2)
         x = torch.randn(100, 64)
         router(x)
-        # Each token picks top_k experts, so total assignments = num_tokens * top_k
         assert router.expert_counts.sum().item() == 100 * 2
         assert router.expert_counts.shape == (8,)
 
@@ -80,11 +77,6 @@ class TestSoftmaxTopKRouter:
         assert indices.shape == (10, 2)
 
 
-# ---------------------------------------------------------------------------
-# Sequence-level auxiliary loss (SigmoidTopKRouter)
-# ---------------------------------------------------------------------------
-
-
 class TestSigmoidSequenceAuxLoss:
     def test_aux_loss_zero_when_disabled(self):
         router = SigmoidTopKRouter(dim=64, num_experts=8, top_k=2, sequence_aux_loss_weight=0.0)
@@ -104,10 +96,7 @@ class TestSigmoidSequenceAuxLoss:
         router = SigmoidTopKRouter(dim=64, num_experts=4, top_k=2, sequence_aux_loss_weight=1.0)
         x = torch.randn(128, 64)
         router(x)
-        # With weight=1.0, loss = num_experts * sum(f_i * P_i)
-        # P_i ≈ 0.5 (sigmoid of random-ish values), sum(f_i) = 1
-        # So loss ≈ num_experts * 0.5 = 2.0 (order of magnitude)
-        assert router.aux_loss.item() > 0.1  # non-trivial
+        assert router.aux_loss.item() > 0.1
         assert torch.isfinite(router.aux_loss)
 
     def test_aux_loss_backward(self):
@@ -117,7 +106,6 @@ class TestSigmoidSequenceAuxLoss:
         x = torch.randn(64, 64)
         router(x)
         router.aux_loss.backward()
-        # Gradient flows through sigmoid scores → gate weights
         assert router.gate.weight.grad is not None
         assert router.gate.weight.grad.abs().sum() > 0
 
@@ -127,11 +115,6 @@ class TestSigmoidSequenceAuxLoss:
         router = builder(64, 8, 2, sequence_aux_loss_weight=0.01)
         assert isinstance(router, SigmoidTopKRouter)
         assert router.sequence_aux_loss_weight == 0.01
-
-
-# ---------------------------------------------------------------------------
-# Adaptive bias schedule (SigmoidTopKRouter)
-# ---------------------------------------------------------------------------
 
 
 class TestSigmoidBiasSchedule:
@@ -148,7 +131,6 @@ class TestSigmoidBiasSchedule:
         rate_mid = router._effective_bias_rate()
         router.set_step(1000, 1000)
         rate_end = router._effective_bias_rate()
-        # Cosine decay: start=full, mid=half, end≈0
         assert rate_start > rate_mid > rate_end
         assert abs(rate_start - router.bias_update_rate) < 1e-7
         assert abs(rate_mid - router.bias_update_rate * 0.5) < 1e-7
@@ -166,12 +148,11 @@ class TestSigmoidBiasSchedule:
         router = SigmoidTopKRouter(dim=64, num_experts=4, top_k=2, bias_schedule="linear_warmup")
         router.set_step(0, 1000)
         rate_start = router._effective_bias_rate()
-        router.set_step(50, 1000)  # 5% → within warmup
+        router.set_step(50, 1000)
         rate_warmup = router._effective_bias_rate()
-        router.set_step(200, 1000)  # 20% → past warmup (10%)
+        router.set_step(200, 1000)
         rate_post = router._effective_bias_rate()
         assert rate_start < rate_warmup < rate_post
-        # After warmup, should be at full rate
         assert abs(rate_post - router.bias_update_rate) < 1e-7
 
     def test_set_step_propagation(self):
@@ -193,13 +174,11 @@ class TestSigmoidBiasSchedule:
         )
         router.train()
 
-        # Early training: large bias update rate
         router.set_step(0, 1000)
         bias_before_early = router.expert_bias.data.clone()
         router(torch.randn(64, 64))
         delta_early = (router.expert_bias.data - bias_before_early).abs().max().item()
 
-        # Late training: small bias update rate
         router.set_step(990, 1000)
         bias_before_late = router.expert_bias.data.clone()
         router(torch.randn(64, 64))

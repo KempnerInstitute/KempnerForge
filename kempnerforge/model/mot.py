@@ -160,7 +160,6 @@ class MoTAttention(nn.Module):
                 q_m = self.q_norm[m](q_m)
                 k_m = self.k_norm[m](k_m)  # type: ignore[reportOptionalSubscript,reportOptionalCall]
 
-            # Transpose to (batch, heads, seq, head_dim) for RoPE + SDPA.
             q_m = q_m.transpose(1, 2)
             k_m = k_m.transpose(1, 2)
             v_m = v_m.transpose(1, 2)
@@ -173,7 +172,6 @@ class MoTAttention(nn.Module):
             ks.append(k_m)
             vs.append(v_m)
 
-        # Concat along the seq dim of (B, heads, T, head_dim).
         q = torch.cat(qs, dim=2)
         k = torch.cat(ks, dim=2)
         v = torch.cat(vs, dim=2)
@@ -183,19 +181,14 @@ class MoTAttention(nn.Module):
             v = v.repeat_interleave(self.n_rep, dim=1)
 
         if key_padding_mask is not None:
-            # Explicit mask: causal AND valid keys (drop padded video frames'
-            # visual tokens). Replaces the is_causal fast path.
             total_seq = q.shape[2]
             causal = torch.ones(total_seq, total_seq, dtype=torch.bool, device=q.device).tril()
             kv = key_padding_mask.view(batch, 1, 1, total_seq)
             attn_mask = causal.unsqueeze(0).unsqueeze(0) & kv
-            # NaN guard: unmask fully-masked query rows (e.g. an all-padded clip)
-            # so softmax stays finite; those outputs are discarded downstream.
             attn_mask = attn_mask | ~attn_mask.any(dim=-1, keepdim=True)
             out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         else:
             out = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
-        # (B, n_heads, total_seq, head_dim) -> (B, total_seq, n_heads, head_dim)
         out = out.transpose(1, 2).contiguous()
 
         out_streams: dict[str, torch.Tensor] = {}
@@ -300,8 +293,6 @@ class MoTBlock(nn.Module):
                 }
             )
 
-        # Zero-init per-modality down_proj on dense FFNs for warm-start identity.
-        # MoE FFNs have no single down_proj — they keep registry-default init.
         for m in self.modalities:
             mlp_m = self.mlp[m]
             if isinstance(mlp_m, MoEMLP):
@@ -328,11 +319,6 @@ class MoTBlock(nn.Module):
         return {m: post_attn[m] + mlp_out[m] for m in self.modalities}
 
 
-# ---------------------------------------------------------------------------
-# Warm-start helper
-# ---------------------------------------------------------------------------
-
-
 def _copy_weight(
     target_module: nn.Module,
     src_tensor: torch.Tensor,
@@ -353,9 +339,6 @@ def _copy_weight(
             f"target {tuple(target.shape)}"
         )
     src_cast = src_tensor.to(dtype=target.dtype, device=target.device)
-    # DTensor path: shard the source to the target's placement, then copy
-    # local-shard-to-local-shard. ``DTensor.copy_`` does not accept a plain
-    # tensor under FSDP2.
     if hasattr(target, "_local_tensor") and hasattr(target, "device_mesh"):
         from torch.distributed.tensor import distribute_tensor  # noqa: PLC0415
 

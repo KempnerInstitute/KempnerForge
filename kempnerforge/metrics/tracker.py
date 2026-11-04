@@ -68,14 +68,11 @@ class MetricsTracker:
         self.num_gpus = num_gpus
         self.gpu_peak_tflops = gpu_peak_tflops or get_gpu_peak_tflops()
 
-        # Smoothed metrics (exponential moving average)
         self._ema_alpha = 0.1
         self._smoothed: dict[str, float] = {}
 
-        # Per-step timing
         self._step_start: float = 0.0
 
-        # Logging backends (initialized lazily)
         self._backends: list[_LoggingBackend] = []
         self._backends_initialized = False
         self._closed = False
@@ -128,7 +125,6 @@ class MetricsTracker:
         step_time = time.perf_counter() - self._step_start
         tokens_per_sec = tokens_in_step / step_time if step_time > 0 else 0.0
 
-        # Compute MFU
         mfu = compute_mfu(
             self.model_config,
             tokens_per_sec=tokens_per_sec,
@@ -137,7 +133,6 @@ class MetricsTracker:
             seq_len=self.seq_len,
         )
 
-        # Memory stats
         mem_stats = get_memory_stats()
         mem_util = get_memory_utilization()
 
@@ -155,13 +150,11 @@ class MetricsTracker:
             mem_utilization=mem_util,
         )
 
-        # Update smoothed metrics
         self._update_smoothed("loss", loss)
         self._update_smoothed("tokens_per_sec", tokens_per_sec)
         self._update_smoothed("mfu", mfu)
         self._update_smoothed("step_time", step_time)
 
-        # Log at interval
         if step % self.metrics_config.log_interval == 0 or step == 1:
             self._log_step(step, metrics)
             return metrics
@@ -178,7 +171,6 @@ class MetricsTracker:
 
     def _log_step(self, step: int, metrics: StepMetrics) -> None:
         """Log metrics to stdout and all backends."""
-        # Stdout logging
         log_dict: dict[str, str | float | int] = {
             "loss": f"{metrics.loss:.4f}",
             "lr": f"{metrics.lr:.2e}",
@@ -190,7 +182,6 @@ class MetricsTracker:
         }
         logger.info(format_metrics(step, log_dict))
 
-        # Backend logging (numeric dict)
         backend_dict = {
             "train/loss": metrics.loss,
             "train/grad_norm": metrics.grad_norm,
@@ -204,7 +195,6 @@ class MetricsTracker:
             "gpu/mem_utilization": metrics.mem_utilization,
         }
 
-        # Smoothed metrics
         for key, val in self._smoothed.items():
             backend_dict[f"smoothed/{key}"] = val
 
@@ -236,7 +226,7 @@ class MetricsTracker:
             try:
                 entry = backend.tracking_entry()
                 snapshot = None if entry is None else _tracking_snapshot(entry)
-            except Exception as e:  # a third-party run object; never let it cost a save
+            except Exception as e:
                 logger.warning(
                     "%s tracking entry skipped (%s)", type(backend).__name__, _error_text(e)
                 )
@@ -312,11 +302,6 @@ def _tracking_snapshot(entry: object) -> dict[str, str]:
     return snapshot
 
 
-# ---------------------------------------------------------------------------
-# Logging backends
-# ---------------------------------------------------------------------------
-
-
 class _LoggingBackend:
     """Base class for metrics logging backends."""
 
@@ -376,8 +361,8 @@ class WandBBackend(_LoggingBackend):
             logger.info(f"WandB initialized: {self._run.url}")
         except ImportError:
             logger.warning("wandb not installed — disabling WandB backend")
-            self._run = False  # Sentinel: tried and failed
-        except Exception as e:  # wandb.init() can raise many third-party errors (network, auth)
+            self._run = False
+        except Exception as e:
             logger.warning(f"WandB init failed: {e}")
             self._run = False
 
@@ -390,13 +375,13 @@ class WandBBackend(_LoggingBackend):
         wandb.log(metrics, step=step)
 
     def tracking_entry(self) -> dict[str, str] | None:
-        run: Any = self._run  # None before the first log, False after a failed init
-        if self._closed or not run or run.disabled:  # a disabled run records nothing
+        run: Any = self._run
+        if self._closed or not run or run.disabled:
             return None
         entry = {"backend": "wandb", "run_id": run.id, "experiment": run.project}
         if entity := run.entity:
             entry["entity"] = entity
-        if not run.offline and (url := run.url):  # an offline run has no URL, and asking warns
+        if not run.offline and (url := run.url):
             entry["url"] = url
         return entry
 
@@ -408,7 +393,6 @@ class WandBBackend(_LoggingBackend):
             wandb.finish()
 
 
-# mlflow and SDK errors can quote a credentialed tracking URI; nothing logged may carry it.
 _URI_USERINFO = re.compile(r"(?<=://)[^/?#\s]+@")
 
 
@@ -452,11 +436,11 @@ class TensorBoardBackend(_LoggingBackend):
             self._writer.add_scalar(key, val, global_step=step)  # type: ignore[reportOptionalMemberAccess, reportAttributeAccessIssue]
 
     def tracking_entry(self) -> dict[str, str] | None:
-        writer: Any = self._writer  # None before the first log, False without tensorboard
+        writer: Any = self._writer
         if self._closed or not writer:
             return None
-        log_dir = writer.get_logdir()  # the writer's own: an empty setting makes it pick one
-        directory = str(log_dir) if log_dir else ""  # as the event writer converts it
+        log_dir = writer.get_logdir()
+        directory = str(log_dir) if log_dir else ""
         return {"backend": "tensorboard", "log_dir": directory} if directory else None
 
     def close(self) -> None:
