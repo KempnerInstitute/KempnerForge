@@ -37,6 +37,11 @@ Edit the header for your cluster:
 #SBATCH --time=24:00:00
 ```
 
+`<partition-name>` and `<account-name>` are the values your PI gave you.
+`scripts/slurm/7b_requeue.sh` needs a preemptible partition that requeues, and
+both it and `scripts/slurm/13b_validation.sh` pin a GPU model through
+`#SBATCH --constraint=<gpu-type>`, such as `h200`, `h100` or `a100`.
+
 ## Multi-node: `multinode.sh`
 
 ```bash

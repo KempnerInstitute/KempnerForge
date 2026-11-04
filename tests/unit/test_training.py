@@ -20,11 +20,6 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 TINY_CONFIG = ModelConfig(dim=64, n_layers=2, n_heads=2, vocab_size=256, max_seq_len=32)
 
 
-# ---------------------------------------------------------------------------
-# Optimizer
-# ---------------------------------------------------------------------------
-
-
 class TestBuildOptimizer:
     def test_creates_adamw(self):
         model = Transformer(TINY_CONFIG)
@@ -39,7 +34,6 @@ class TestBuildOptimizer:
     def test_weight_decay_split(self):
         model = Transformer(TINY_CONFIG)
         opt = build_optimizer(model, OptimizerConfig(weight_decay=0.1))
-        # Group 0: with decay, Group 1: no decay
         assert opt.param_groups[0]["weight_decay"] == 0.1
         assert opt.param_groups[1]["weight_decay"] == 0.0
 
@@ -75,20 +69,13 @@ class TestBuildOptimizer:
         assert opt_param_ids == model_param_ids
 
 
-# ---------------------------------------------------------------------------
-# Scheduler
-# ---------------------------------------------------------------------------
-
-
 class TestScheduler:
     def test_cosine_warmup_start(self):
         model = Transformer(TINY_CONFIG)
         opt = build_optimizer(model, OptimizerConfig(lr=1.0))
         sched = build_scheduler(opt, SchedulerConfig(warmup_steps=100), max_steps=1000)
-        # At init, LambdaLR applies lr_fn(0) = 0/100 = 0
         assert opt.param_groups[0]["lr"] == pytest.approx(0.0)
         sched.step()
-        # After 1 step: lr_fn(1) = 1/100 = 0.01
         assert opt.param_groups[0]["lr"] == pytest.approx(0.01, abs=1e-5)
 
     def test_cosine_warmup_end(self):
@@ -97,7 +84,6 @@ class TestScheduler:
         sched = build_scheduler(opt, SchedulerConfig(warmup_steps=100), max_steps=1000)
         for _ in range(100):
             sched.step()
-        # At step 100, should be at peak LR
         assert opt.param_groups[0]["lr"] == pytest.approx(1.0, abs=0.01)
 
     def test_cosine_decay_end(self):
@@ -107,7 +93,6 @@ class TestScheduler:
         sched = build_scheduler(opt, config, max_steps=1000)
         for _ in range(1000):
             sched.step()
-        # At end, should be at min_lr
         assert opt.param_groups[0]["lr"] == pytest.approx(0.1, abs=0.02)
 
     def test_linear_decay(self):
@@ -117,7 +102,6 @@ class TestScheduler:
         sched = build_scheduler(opt, config, max_steps=100)
         for _ in range(50):
             sched.step()
-        # Midpoint: should be ~0.5
         assert opt.param_groups[0]["lr"] == pytest.approx(0.5, abs=0.02)
 
     def test_wsd_stable_phase(self):
@@ -131,10 +115,8 @@ class TestScheduler:
             min_lr_ratio=0.0,
         )
         sched = build_scheduler(opt, config, max_steps=100)
-        # Step through warmup
         for _ in range(10):
             sched.step()
-        # During stable phase, LR should be 1.0
         for _ in range(80):
             sched.step()
             assert opt.param_groups[0]["lr"] == pytest.approx(1.0, abs=0.01)
@@ -152,7 +134,6 @@ class TestScheduler:
         sched = build_scheduler(opt, config, max_steps=100)
         for _ in range(100):
             sched.step()
-        # At end of decay, should be at min_lr
         assert opt.param_groups[0]["lr"] == pytest.approx(0.0, abs=0.02)
 
     def test_unknown_scheduler_raises(self):
@@ -166,13 +147,7 @@ class TestScheduler:
         opt = build_optimizer(model, OptimizerConfig(lr=1.0))
         sched = build_scheduler(opt, SchedulerConfig(warmup_steps=0), max_steps=100)
         sched.step()
-        # Should start at peak LR (no warmup)
         assert opt.param_groups[0]["lr"] > 0.9
-
-
-# ---------------------------------------------------------------------------
-# Gradient utilities
-# ---------------------------------------------------------------------------
 
 
 class TestGradUtils:
@@ -182,7 +157,7 @@ class TestGradUtils:
 
         model = Transformer(TINY_CONFIG)
         with maybe_no_sync(model, micro_step=2, grad_accum_steps=3):
-            pass  # Should not raise
+            pass
 
     def test_maybe_no_sync_intermediate_step(self):
         """On intermediate steps, should yield (no-op for non-FSDP models)."""
@@ -190,7 +165,7 @@ class TestGradUtils:
 
         model = Transformer(TINY_CONFIG)
         with maybe_no_sync(model, micro_step=0, grad_accum_steps=3):
-            pass  # Should not raise (no set_requires_gradient_sync on vanilla model)
+            pass
 
     def test_maybe_no_sync_fsdp2_branch(self):
         """When the model has set_requires_gradient_sync (FSDP2), the wrapper
@@ -210,18 +185,12 @@ class TestGradUtils:
         assert model.calls == [False, True]
 
 
-# ---------------------------------------------------------------------------
-# Integration: loss decreases
-# ---------------------------------------------------------------------------
-
-
 class TestTrainingIntegration:
     def test_loss_decreases(self):
         """Train a tiny model on a repeating batch — loss should decrease."""
         model = Transformer(TINY_CONFIG).to(DEVICE)
         opt = build_optimizer(model, OptimizerConfig(lr=1e-3, fused=False))
 
-        # Fixed repeating batch (same data each step → model can learn it)
         torch.manual_seed(123)
         tokens = torch.randint(0, 256, (4, 32), device=DEVICE)
         input_ids = tokens[:, :-1]
@@ -251,7 +220,6 @@ class TestTrainingIntegration:
         model = Transformer(TINY_CONFIG).to(DEVICE)
         opt = build_optimizer(model, OptimizerConfig(lr=3e-3, fused=False))
 
-        # Fixed batch
         torch.manual_seed(42)
         tokens = torch.randint(0, 256, (2, 32), device=DEVICE)
         input_ids = tokens[:, :-1]
@@ -267,5 +235,4 @@ class TestTrainingIntegration:
             opt.step()
             opt.zero_grad()
 
-        # Loss should be very low after memorizing one batch
         assert loss.item() < 1.0, f"Model failed to memorize: loss={loss.item():.4f}"

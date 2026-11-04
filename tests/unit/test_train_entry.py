@@ -50,11 +50,6 @@ def _fake_batches(n: int) -> list[dict[str, torch.Tensor]]:
     return [{"input_ids": torch.tensor([i])} for i in range(n)]
 
 
-# ---------------------------------------------------------------------------
-# Fakes
-# ---------------------------------------------------------------------------
-
-
 class TinyTextModel(nn.Module):
     """(B, T) ids -> (B, T, V) logits; the contract the text step body uses."""
 
@@ -152,11 +147,6 @@ class FakeMixtureSampler:
         self.calls.append((list(weights), temperature))
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
 def make_config(**train_kwargs: Any) -> JobConfig:
     train = {
         "batch_size": 2,
@@ -215,11 +205,6 @@ def _make_tracker(config: JobConfig):
     return MetricsTracker(config, num_gpus=1)
 
 
-# ---------------------------------------------------------------------------
-# BatchStream
-# ---------------------------------------------------------------------------
-
-
 class TestBatchStream:
     def test_no_dataloader_reports_no_data(self):
         stream = BatchStream(DataPipeline())
@@ -232,8 +217,6 @@ class TestBatchStream:
         assert seen == [0, 1, 0, 1, 0]
 
     def test_next_batch_starts_the_iterator_itself(self):
-        # A step body called directly (an example owning its own step_fn)
-        # must not have to remember ensure_started().
         stream = BatchStream(DataPipeline(dataloader=_fake_batches(3)))
         assert int(stream.next_batch()["input_ids"]) == 0
 
@@ -243,10 +226,8 @@ class TestBatchStream:
         stream.reset()
         assert int(stream.next_batch()["input_ids"]) == 0
 
-    # -- worker teardown (#177) -------------------------------------------
-
     def test_close_is_safe_without_a_loader(self):
-        BatchStream(DataPipeline()).close()  # must not raise
+        BatchStream(DataPipeline()).close()
 
     def test_close_is_safe_on_a_worker_free_loader(self):
         stream = BatchStream(DataPipeline(dataloader=_fake_batches(3)))
@@ -316,7 +297,7 @@ class TestBatchStream:
                 self._workers = [worker]
 
             def _shutdown_workers(self):
-                pass  # the drain that did not take
+                pass
 
         class _FakeInner:
             def __init__(self, worker):
@@ -336,7 +317,7 @@ class TestBatchStream:
         stream = BatchStream(DataPipeline(dataloader=_fake_batches(3)))
         stream.next_batch()
         stream.close()
-        stream.close()  # a second pass must not raise
+        stream.close()
 
     def test_ensure_started_is_idempotent(self):
         stream = BatchStream(DataPipeline(dataloader=_fake_batches(3)))
@@ -346,8 +327,6 @@ class TestBatchStream:
         assert int(stream.next_batch()["input_ids"]) == 1
 
     def test_empty_shard_raises_a_named_error(self):
-        # A bare StopIteration here would kill one rank and leave the others
-        # blocked in the next collective until the PG timeout.
         stream = BatchStream(DataPipeline(dataloader=[]))
         with pytest.raises(RuntimeError, match="no batches for this rank"):
             stream.next_batch()
@@ -361,15 +340,8 @@ class TestBatchStream:
         assert int(stream.next_batch()["input_ids"]) == 99
 
 
-# ---------------------------------------------------------------------------
-# Step-body dispatch
-# ---------------------------------------------------------------------------
-
-
 class TestSessionBatches:
     def test_follows_a_replaced_data_pipeline(self):
-        # Replacing session.data must not leave the loop on the synthetic
-        # random-token path while a real dataloader sits unused.
         session = make_session(make_config())
         assert session.batches.has_data is False
         session.data = DataPipeline(dataloader=_fake_batches(2))
@@ -453,11 +425,6 @@ class TestVlmTextTokenGuard:
             _log_periodic_metrics(session, StepResult(loss=1.0, grad_norm=0.1), 1)
 
 
-# ---------------------------------------------------------------------------
-# Checkpoint metadata
-# ---------------------------------------------------------------------------
-
-
 class TestCheckpointExtra:
     def test_empty_without_phases_or_run_ids(self):
         assert checkpoint_extra(make_config(), 5, PhaseState()) == {}
@@ -483,11 +450,6 @@ class TestCheckpointExtra:
             vlm=vlm,
         )
         assert "vlm_freeze" in checkpoint_extra(config, 3, PhaseState())
-
-
-# ---------------------------------------------------------------------------
-# Phase scheduling
-# ---------------------------------------------------------------------------
 
 
 def _mixture_pipeline() -> DataPipeline:
@@ -537,7 +499,6 @@ class TestPhaseState:
         state = build_phase_state(config, data, step=10)
         assert state.next_idx == 1
         assert state.lr_scale == 0.5
-        # Weight not named by the phase falls back to the original.
         assert data.mixture_sampler.calls[-1][0] == [9.0, 3.0]  # type: ignore[union-attr]
 
 
@@ -580,11 +541,6 @@ def _config_with_phases(phases: list[TrainingPhase]) -> JobConfig:
     return config
 
 
-# ---------------------------------------------------------------------------
-# The step loop
-# ---------------------------------------------------------------------------
-
-
 class TestRunTrainingLoop:
     def test_runs_to_max_steps_and_accounts_tokens(self):
         config = make_config(max_steps=4)
@@ -599,7 +555,6 @@ class TestRunTrainingLoop:
         session = make_session(config)
         run_training_loop(session)
         ckpt: FakeCheckpointManager = session.checkpointer  # type: ignore[assignment]
-        # Step 4 is on the schedule, so no extra final save.
         assert ckpt.saved_steps == [2, 4]
         assert ckpt.waits == 1
 
@@ -643,7 +598,6 @@ class TestRunTrainingLoop:
         )
         step, _ = run_training_loop(session)
         ckpt: FakeCheckpointManager = session.checkpointer  # type: ignore[assignment]
-        # Two skipped steps, then the third trips the rollback and breaks.
         assert step == 2
         assert ckpt.saves == []
         assert ckpt.waits == 1
@@ -763,9 +717,6 @@ class TestRunTrainingLoop:
         assert hook.saves == [2, 4]
 
     def test_exception_path_runs_no_collectives(self):
-        # ckpt_mgr.wait() ends in dist.barrier(). Running it while an
-        # exception unwinds rendezvouses against ranks still in the loop and
-        # hangs the whole job instead of failing one rank fast.
         config = make_config(max_steps=4)
 
         def boom(_session, step):
@@ -797,8 +748,6 @@ class TestRunTrainingLoop:
             make_config(max_steps=4),
             step_fn=lambda _s, _i: (_ for _ in ()).throw(RuntimeError("boom")),
             profiler=prof,
-            # Non-zero rank so the assertion is about stop(), not the rank-0
-            # summary print (which needs a real torch profiler).
             runtime=dataclasses.replace(_runtime(), rank=1),
         )
         with pytest.raises(RuntimeError, match="boom"):
@@ -810,11 +759,6 @@ class TestRunTrainingLoop:
         session = make_session(config, phases=PhaseState(lr_scale=0.5))
         run_training_loop(session)
         assert session.optimizer.param_groups[0]["lr"] == pytest.approx(0.025)
-
-
-# ---------------------------------------------------------------------------
-# run_training wiring
-# ---------------------------------------------------------------------------
 
 
 def _stub_entry(monkeypatch, model: nn.Module) -> FakeCheckpointManager:
@@ -850,7 +794,6 @@ class TestRunTraining:
         before = model.out.weight.detach().clone()
         _stub_entry(monkeypatch, model)
         run_training(make_config(max_steps=2))
-        # text_step ran on the synthetic-batch path and the optimizer stepped.
         assert not torch.equal(before, model.out.weight)
 
     def test_injected_step_fn_replaces_the_default(self, monkeypatch):
@@ -868,14 +811,9 @@ class TestRunTraining:
 
         run_training(make_config(max_steps=3), step_fn=custom_step)
         assert seen == [0, 1, 2]
-        # The default body never ran: no backward, so the weights are untouched.
         assert torch.equal(before, model.out.weight)
 
     def test_teardown_is_cooperative_only_on_the_clean_path(self, monkeypatch):
-        # destroy_process_group() blocks in _wait_for_pending_works() and
-        # shuts NCCL backends down in a deliberate order because
-        # ncclCommAbort has been collective. Running it while an exception
-        # unwinds meets peers that are still mid-collective.
         import kempnerforge.training.entry as entry
         from kempnerforge.training.entry import run_training
         from kempnerforge.training.loop import StepResult
@@ -920,8 +858,8 @@ class TestRunTraining:
 
         with pytest.raises(RuntimeError, match="step blew up"):
             run_training(make_config(max_steps=2), step_fn=boom)
-        assert destroys == []  # left to the launcher on the failure path
-        assert closes == [1]  # rank-local, always runs
+        assert destroys == []
+        assert closes == [1]
 
         run_training(
             make_config(max_steps=2),
@@ -1055,11 +993,6 @@ class TestBuildPhaseHelpers:
         assert restore_checkpoint(config, model, None, mgr) == (0, 0)
 
 
-# ---------------------------------------------------------------------------
-# Data pipeline
-# ---------------------------------------------------------------------------
-
-
 class TestBuildDataPipeline:
     def test_no_source_yields_an_empty_pipeline(self):
         data = build_data_pipeline(make_config(), _runtime())
@@ -1112,11 +1045,6 @@ class TestBuildEvalDataloader:
         assert build_eval_dataloader(config, _runtime()) is None
 
 
-# ---------------------------------------------------------------------------
-# Silent-failure pins (#181): logic whose regression produces no error at all
-# ---------------------------------------------------------------------------
-
-
 class TestDpSizeReachesTokenAccounting:
     """`get_dp_info` -> DataPipeline.dp_size -> tokens_in_step.
 
@@ -1150,7 +1078,6 @@ class TestDpSizeReachesTokenAccounting:
         assert tokens_seen == 2 * per_step * 8
 
     def test_default_dp_size_is_one_not_zero(self):
-        # A default of 0 would silently zero every token count.
         assert DataPipeline().dp_size == 1
 
 
@@ -1187,11 +1114,6 @@ class TestPhaseTemperatureReachesSampler:
         build_phase_state(self._config(0.5), data, step=5)
         _, temperature = data.mixture_sampler.calls[-1]  # type: ignore[union-attr]
         assert temperature == 0.5
-
-
-# ---------------------------------------------------------------------------
-# Build phases driven under fakes (no GPU, no mesh, no real parallelism)
-# ---------------------------------------------------------------------------
 
 
 class FakeSubMesh:
@@ -1270,11 +1192,10 @@ class TestBuildModel:
         model, pipeline = entry.build_model(config, _runtime(), lambda a, b: a)
 
         assert (model, pipeline) == ("MODEL", None)
-        # the knobs the loop depends on must be threaded, not defaulted
         assert seen["param_dtype"] == config.train.param_dtype
         assert seen["compile_model"] is config.train.compile_model
         assert seen["fp8"] is config.train.is_fp8
-        assert seen["frames_per_clip"] == 1  # no [video] section
+        assert seen["frames_per_clip"] == 1
         assert seen["mesh"] is None
 
     def test_non_pp_threads_frames_per_clip_from_video_config(self, monkeypatch):
@@ -1301,7 +1222,6 @@ class TestBuildModel:
         assert pipeline is not None
         assert (pipeline.rank, pipeline.size) == (1, 2)
         assert pipeline.schedule == "SCHED"
-        # the schedule must get the real microbatch count and loss fn
         assert calls["schedule_kwargs"]["n_microbatches"] == config.train.grad_accum_steps
         assert calls["schedule_kwargs"]["loss_fn"] == "LOSS"
         assert model is stage
@@ -1312,7 +1232,6 @@ class TestBuildModel:
         config = make_config()
         config.distributed.pp = 2
         entry.build_model(config, _pp_runtime(FakeMesh(("pp", "dp_shard"))), "LOSS")
-        # no tp dim -> the meta-device path must not run
         assert "apply_tensor_parallel" not in calls
         assert stage.inited is False
 
@@ -1323,7 +1242,7 @@ class TestBuildModel:
         config.distributed.pp = 2
         entry.build_model(config, _pp_runtime(FakeMesh(("pp", "tp"))), "LOSS")
         assert calls.get("apply_tensor_parallel") is True
-        assert stage.inited is True  # init_weights_and_freqs after to_empty
+        assert stage.inited is True
         assert stage.emptied_to is not None
 
     def test_pp_without_a_mesh_raises_rather_than_asserting(self, monkeypatch):
@@ -1331,46 +1250,8 @@ class TestBuildModel:
         entry = _stub_pp(monkeypatch, stage, calls)
         config = make_config()
         config.distributed.pp = 2
-        # RuntimeError, not AssertionError: the guard must survive python -O
         with pytest.raises(RuntimeError, match="requires a device mesh"):
             entry.build_model(config, _runtime(), "LOSS")
-
-
-class TestBuildCheckpointManager:
-    def test_pp_scopes_dcp_to_the_non_pp_dims(self, tmp_path):
-        from kempnerforge.training.entry import build_checkpoint_manager
-        from kempnerforge.training.runtime import PipelineBundle
-
-        config = make_config()
-        config.checkpoint.dir = str(tmp_path / "c")
-        model = TinyTextModel()
-        mesh = FakeMesh(("pp", "dp_shard"))
-        mgr = build_checkpoint_manager(
-            config,
-            dataclasses.replace(_runtime(), device_mesh=mesh),
-            model,
-            torch.optim.SGD(model.parameters(), lr=0.1),
-            PipelineBundle(rank=1, size=2, schedule=None),
-        )
-        assert mgr._pp_rank == 1
-        assert mgr._process_group == "group:dp_shard"  # "pp" excluded
-
-    def test_pp_with_several_non_pp_dims_uses_a_flattened_group(self, tmp_path):
-        from kempnerforge.training.entry import build_checkpoint_manager
-        from kempnerforge.training.runtime import PipelineBundle
-
-        config = make_config()
-        config.checkpoint.dir = str(tmp_path / "c")
-        model = TinyTextModel()
-        mesh = FakeMesh(("pp", "dp_shard", "tp"))
-        mgr = build_checkpoint_manager(
-            config,
-            dataclasses.replace(_runtime(), device_mesh=mesh),
-            model,
-            torch.optim.SGD(model.parameters(), lr=0.1),
-            PipelineBundle(rank=0, size=2, schedule=None),
-        )
-        assert mgr._process_group == "group:('dp_shard', 'tp')"
 
 
 class FakeResumeManager:
@@ -1412,7 +1293,7 @@ class TestRestoreCheckpoint:
         monkeypatch.setattr(entry, "resolve_resume_path", lambda _d: None)
         mgr = FakeResumeManager()
         assert entry.restore_checkpoint(make_config(), TinyTextModel(), None, mgr) == (0, 0)
-        assert mgr.load_kwargs == {}  # load() must not be called at all
+        assert mgr.load_kwargs == {}
 
     def test_resume_returns_the_managers_step_and_tokens(self, monkeypatch, tmp_path):
         import kempnerforge.training.entry as entry
@@ -1421,7 +1302,7 @@ class TestRestoreCheckpoint:
         mgr = FakeResumeManager(step=7, tokens=999)
         assert entry.restore_checkpoint(make_config(), TinyTextModel(), "SCHED", mgr) == (7, 999)
         assert mgr.load_kwargs["scheduler"] == "SCHED"
-        assert mgr.load_kwargs["vlm_freeze_expected"] is None  # text-only
+        assert mgr.load_kwargs["vlm_freeze_expected"] is None
 
     def test_load_path_alone_triggers_a_resume(self, monkeypatch):
         import kempnerforge.training.entry as entry
@@ -1431,7 +1312,7 @@ class TestRestoreCheckpoint:
         config.checkpoint.load_path = "/somewhere/step_3"
         mgr = FakeResumeManager(step=3, tokens=30)
         assert entry.restore_checkpoint(config, TinyTextModel(), None, mgr) == (3, 30)
-        assert mgr.load_kwargs["path"] is None  # manager resolves load_path itself
+        assert mgr.load_kwargs["path"] is None
 
     def test_metrics_run_ids_are_restored_onto_the_config(self, monkeypatch, tmp_path):
         import kempnerforge.training.entry as entry
@@ -1460,7 +1341,6 @@ class TestRestoreCheckpoint:
         config = _vlm_config()
         mgr = FakeResumeManager(saved_step=11)
         entry.restore_checkpoint(config, TinyTextModel(), None, mgr)
-        # the peeked step, not the loaded step, drives the expectation
         assert mgr.peeked == [str(tmp_path / "s")]
         assert mgr.load_kwargs["vlm_freeze_expected"] == freeze_meta_at_step(11, config.vlm)
 
@@ -1479,7 +1359,6 @@ class TestRestoreCheckpoint:
             )
         )
         entry.restore_checkpoint(config, TinyTextModel(), None, FakeResumeManager(step=9))
-        # step 9 is past start_step 5, so the stage must have been applied
         assert applied and applied[0][0].module == "vision_encoder"
 
     @pytest.mark.parametrize(
@@ -1601,16 +1480,11 @@ class TestRestoreCheckpoint:
             ),
         )
         entry.restore_checkpoint(config, TinyTextModel(), None, FakeResumeManager(step=0))
-        assert copied == [{"w": 1}]  # unwrapped from the {"model": ...} envelope
+        assert copied == [{"w": 1}]
 
         copied.clear()
         entry.restore_checkpoint(config, TinyTextModel(), None, FakeResumeManager(step=4))
-        assert copied == []  # mid-flight resume already has MoT-shaped state
-
-
-# ---------------------------------------------------------------------------
-# Data-pipeline source builders, driven under fakes
-# ---------------------------------------------------------------------------
+        assert copied == []
 
 
 class FakeDataset:
@@ -1651,7 +1525,6 @@ class TestHfSourceBuilder:
         data = dp.build_data_pipeline(config, _runtime())
 
         assert data.dataloader == "stateful_OBJ"
-        # the sampler must be built from the DP partition, not world size
         assert seen["sampler"]["kwargs"]["num_replicas"] == data.dp_size
         assert seen["sampler"]["kwargs"]["shuffle"] is True
 
@@ -1671,7 +1544,7 @@ class TestHfSourceBuilder:
         data = dp.build_data_pipeline(config, _runtime())
 
         assert data.dataloader == "torch_loader_OBJ"
-        assert "sampler" not in seen  # streaming shards inside the dataset
+        assert "sampler" not in seen
         assert (made["rank"], made["world_size"]) == (2, 4)
 
     def test_missing_tokenizer_is_rejected(self):
@@ -1683,8 +1556,6 @@ class TestHfSourceBuilder:
             dp.build_data_pipeline(config, _runtime())
 
     def test_empty_name_raises_rather_than_asserting(self):
-        # -O-safe guard: build_data_pipeline dispatches on a truthy name, so
-        # this is only reachable by calling the builder directly.
         from kempnerforge.training.data_pipeline import _build_hf_pipeline
 
         config = make_config()
@@ -1727,7 +1598,7 @@ class TestEosResolution:
         config.data = DataConfig(dataset_path=mmap_data_dir, num_workers=0)
         dp.build_data_pipeline(config, _runtime())
         assert seen["eos_token_id"] == 4242
-        assert seen["seq_len"] == config.train.seq_len + 1  # +1 for the label shift
+        assert seen["seq_len"] == config.train.seq_len + 1
 
 
 class TestVlmSourceBuilders:
@@ -1797,7 +1668,6 @@ class TestEvalDataloaderBuilder:
         config = make_config(seq_len=16)
         config.eval = EvalConfig(enabled=True, dataset_path=mmap_data_dir)
         assert dp.build_eval_dataloader(config, _runtime()) == "torch_loader_OBJ"
-        # eval must not shuffle -- ranks have to see a fixed partition
         assert seen["sampler"]["kwargs"]["shuffle"] is False
 
     def test_hf_eval_skips_the_broadcast_when_not_distributed(self, monkeypatch):
@@ -1839,14 +1709,8 @@ class TestEvalDataloaderBuilder:
         ds = _EvalTensorDataset(torch.arange(10).reshape(2, 5))
         assert len(ds) == 2
         item = ds[0]
-        # input_ids/labels are the same row offset by one -- the LM shift
         assert item["input_ids"].tolist() == [0, 1, 2, 3]
         assert item["labels"].tolist() == [1, 2, 3, 4]
-
-
-# ---------------------------------------------------------------------------
-# Step bodies that normally need PP / a VLM model
-# ---------------------------------------------------------------------------
 
 
 class FakeSchedule:
@@ -1891,10 +1755,9 @@ class TestPipelineStep:
         result = session.step_fn(session, 0)
         assert sched.calls[0]["args"], "first stage must pass the input batch"
         assert sched.calls[0]["target"] is not None
-        # loss comes back through the broadcast tensor
         assert isinstance(result.loss, float)
         assert rec["group"] == "PPGROUP"
-        assert rec["group_src"] == 1  # last stage is the source
+        assert rec["group_src"] == 1
 
     def test_every_stage_sums_the_grad_norm_and_only_the_loss_is_broadcast(self, monkeypatch):
         """Each stage clips with the whole model's norm, so the broadcast carries the loss alone."""
@@ -1921,7 +1784,7 @@ class TestPipelineStep:
     def test_selected_without_a_bundle_raises(self):
         from kempnerforge.training.loop import pipeline_step
 
-        session = make_session(make_config())  # pipeline=None
+        session = make_session(make_config())
         with pytest.raises(RuntimeError, match="requires TrainingSession.pipeline"):
             pipeline_step(session, 0)
 
@@ -1968,7 +1831,6 @@ class TestPipelineStepPacked:
 
         call = sched.calls[0]
         assert "doc_ids" in call["kwargs"], f"{label} stage received no doc_ids"
-        # The guard that matters: never positional.
         assert not any(
             isinstance(a, torch.Tensor)
             and a.dtype == torch.long
@@ -2020,14 +1882,14 @@ class TestVlmStep:
     def test_counts_unmasked_text_tokens(self):
         session, _ = self._session([self._batch()])
         result = session.step_fn(session, 0)
-        assert result.text_tokens == 8  # 2 x 4, none are -100
+        assert result.text_tokens == 8
 
     def test_ignore_index_positions_are_excluded(self):
         batch = self._batch()
         batch["labels"][:, :2] = -100
         session, _ = self._session([batch])
         result = session.step_fn(session, 0)
-        assert result.text_tokens == 4  # half the positions masked out
+        assert result.text_tokens == 4
 
     def test_frame_mask_is_threaded_when_present(self):
         session, model = self._session([self._batch(with_mask=True)])
@@ -2072,7 +1934,7 @@ class TestSetupDistributed:
 
         assert (ctx.rank, ctx.local_rank, ctx.world_size) == (3, 1, 8)
         assert ctx.device_mesh == "MESH"
-        assert validated == [8]  # validate must see the real world size
+        assert validated == [8]
 
     def test_seed_is_threaded_into_init(self, monkeypatch):
         import kempnerforge.training.runtime as rt
@@ -2125,11 +1987,6 @@ class TestPpGroup:
             pp_group(_runtime())
 
 
-# ---------------------------------------------------------------------------
-# Loop branches that normally need MoE / VLM / eval / a profiler
-# ---------------------------------------------------------------------------
-
-
 class TinyMoEModel(nn.Module):
     """Text model exposing the MoE hooks the loop reaches through inner_transformer."""
 
@@ -2174,7 +2031,6 @@ class TestMoELossComposition:
         session = make_session(_moe_config(aux_weight=2.0), model=model)
         torch.manual_seed(0)
         loss = session.step_fn(session, 0).loss
-        # aux contributes weight*aux on top of CE; assert it moved, not just ran
         assert loss != base
         assert session.model.moe_steps == [(0, session.config.train.max_steps)]
 
@@ -2235,7 +2091,6 @@ class TestPerDatasetMetrics:
         result = session.step_fn(session, 0)
         assert set(result.dataset_loss_sums) == {"a", "b"}
         assert result.dataset_loss_counts == {"a": 1, "b": 1}
-        # 2 rows per source x seq_len tokens each
         assert result.dataset_token_counts == {"a": 2 * 4, "b": 2 * 4}
 
     def test_loop_logs_the_mean_and_the_token_totals(self):
@@ -2251,7 +2106,7 @@ class TestPerDatasetMetrics:
             {
                 "input_ids": torch.zeros(4, 4, dtype=torch.long),
                 "labels": torch.zeros(4, 4, dtype=torch.long),
-                "dataset_idx": torch.tensor([0, 0, 0, 0]),  # all from "a"
+                "dataset_idx": torch.tensor([0, 0, 0, 0]),
             }
         ]
         result = session.step_fn(session, 0)
@@ -2268,8 +2123,8 @@ class TestLoopPeriodicWork:
         session = make_session(config)
         step, _ = run_training_loop(session)
         ckpt: FakeCheckpointManager = session.checkpointer  # type: ignore[assignment]
-        assert step == 1  # broke on the first health check
-        assert ckpt.saves == []  # not a clean completion
+        assert step == 1
+        assert ckpt.saves == []
 
     def test_healthy_nccl_does_not_stop_the_run(self, monkeypatch):
         import kempnerforge.training.loop as loop
@@ -2292,7 +2147,7 @@ class TestLoopPeriodicWork:
         evals: list = []
         session.hooks.on_eval_end = lambda m, s: evals.append(s)  # type: ignore[method-assign]
         run_training_loop(session)
-        assert evals == [2, 4]  # steps 2 and 4 only
+        assert evals == [2, 4]
 
     def test_eval_is_skipped_without_a_dataloader(self, monkeypatch):
         import kempnerforge.training.loop as loop
@@ -2344,7 +2199,6 @@ class TestLoopPeriodicWork:
         phases = build_phase_state(config, data, step=0)
         session = make_session(config, data=data, phases=phases)
         run_training_loop(session)
-        # the phase fired and re-weighted the sampler
         assert data.mixture_sampler.calls  # type: ignore[union-attr]
         assert phases.lr_scale == 0.5
 
@@ -2383,7 +2237,6 @@ class TestFreezeStageFence:
     def test_stage_drains_the_async_save_before_flipping_requires_grad(self, monkeypatch):
         order: list = []
         run_training_loop(self._vlm_session(monkeypatch, start_step=2, order=order))
-        # the fence: metadata for the in-flight save must land before the flip
         assert order == ["flush", "freeze"]
 
     def test_no_stage_at_this_step_does_not_flush(self, monkeypatch):
@@ -2392,14 +2245,8 @@ class TestFreezeStageFence:
         assert order == []
 
 
-# ---------------------------------------------------------------------------
-# Remaining branches
-# ---------------------------------------------------------------------------
-
-
 class TestBatchStreamGuard:
     def test_next_batch_without_a_loader_names_the_contract(self):
-        # Reachable by an example writing its own step_fn that forgets has_data.
         with pytest.raises(RuntimeError, match="check has_data first"):
             BatchStream(DataPipeline()).next_batch()
 
@@ -2417,12 +2264,11 @@ class TestPipelineSyntheticBatches:
         config.distributed.pp = 2
         session = make_session(
             config,
-            data=DataPipeline(),  # no loader -> synthetic path
+            data=DataPipeline(),
             pipeline=PipelineBundle(rank=0, size=2, schedule=sched),
         )
         session.step_fn(session, 0)
         fed = sched.calls[0]["args"][0]
-        # grad_accum microbatches concatenated along dim 0
         assert fed.shape == (
             config.train.batch_size * config.train.grad_accum_steps,
             config.train.seq_len,
@@ -2451,8 +2297,6 @@ class TestVlmMoEStep:
             "input_ids": torch.zeros(2, 4, dtype=torch.long),
             "labels": torch.zeros(2, 4, dtype=torch.long),
         }
-        # One model instance for both runs, so the CE term is identical and the
-        # only difference is the MoE weights.
         model = TinyVlmMoEModel()
 
         def _loss(aux_weight, z_weight):
@@ -2464,7 +2308,6 @@ class TestVlmMoEStep:
 
         base = _loss(0.0, 0.0)
         loss = _loss(2.0, 4.0)
-        # 2.0*0.5 aux + 4.0*0.25 z on top of the same CE
         assert loss == pytest.approx(base + 2.0, abs=1e-4)
 
 

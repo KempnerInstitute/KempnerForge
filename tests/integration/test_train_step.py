@@ -57,7 +57,6 @@ class TestTrainStep:
         model = Transformer(CONFIG).to(DEVICE)
         optimizer = build_optimizer(model, OptimizerConfig(lr=1e-2, fused=False))
 
-        # Snapshot initial params
         param_before = {
             n: p.clone().detach() for n, p in model.named_parameters() if p.requires_grad
         }
@@ -70,7 +69,6 @@ class TestTrainStep:
         loss.backward()
         optimizer.step()
 
-        # At least some params should have changed
         changed = 0
         for n, p in model.named_parameters():
             if n in param_before and not torch.equal(p.data, param_before[n]):
@@ -140,7 +138,6 @@ class TestTrainStep:
         model = Transformer(CONFIG).to(DEVICE)
         optimizer = build_optimizer(model, OptimizerConfig(lr=1e-3, fused=False))
 
-        # Fixed batch for memorization
         tokens = torch.randint(0, 256, (4, 32), device=DEVICE)
         labels = tokens.clone()
 
@@ -153,13 +150,7 @@ class TestTrainStep:
             optimizer.zero_grad()
             losses.append(loss.item())
 
-        # Loss should decrease
         assert losses[-1] < losses[0], f"Loss did not decrease: {losses[0]:.4f} → {losses[-1]:.4f}"
-
-
-# ---------------------------------------------------------------------------
-# MoE: Sigmoid router + gradient scaling + sequence aux loss
-# ---------------------------------------------------------------------------
 
 
 class TestMoESigmoidTrainStep:
@@ -181,7 +172,6 @@ class TestMoESigmoidTrainStep:
         logits = model(tokens)
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1))
 
-        # Aux loss should be positive with sequence_aux_loss_weight > 0
         aux_loss = model.get_moe_aux_loss()
         assert aux_loss.item() > 0, "Sigmoid sequence aux loss should be > 0"
 
@@ -206,7 +196,6 @@ class TestMoESigmoidTrainStep:
         total_loss = loss + MOE_SIGMOID_CONFIG.moe_aux_loss_weight * aux_loss
         total_loss.backward()
 
-        # Every parameter should have gradients (router + experts + attention)
         for name, param in model.named_parameters():
             if param.requires_grad:
                 assert param.grad is not None, f"No gradient for {name}"
@@ -217,14 +206,12 @@ class TestMoESigmoidTrainStep:
         model = Transformer(MOE_SIGMOID_CONFIG).to(DEVICE)
         model.train()
 
-        # Collect bias deltas at early vs late steps
         for layer in model.layers.values():
             if isinstance(layer.mlp, MoEMLP):
                 bias_before = layer.mlp.router.expert_bias.data.clone()
 
         tokens = torch.randint(0, 256, (2, 32), device=DEVICE)
 
-        # Early step
         model.set_moe_step(0, 100)
         with torch.no_grad():
             model(tokens)
@@ -233,7 +220,6 @@ class TestMoESigmoidTrainStep:
                 delta_early = (layer.mlp.router.expert_bias.data - bias_before).abs().max().item()
                 bias_before = layer.mlp.router.expert_bias.data.clone()
 
-        # Late step (cosine decay → near-zero update rate)
         model.set_moe_step(99, 100)
         with torch.no_grad():
             model(tokens)

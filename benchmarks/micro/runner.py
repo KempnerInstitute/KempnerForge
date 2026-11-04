@@ -71,17 +71,14 @@ def run_benchmark(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_cuda = device.type == "cuda"
 
-    # Warmup
     for _ in range(warmup):
         fn()
     if use_cuda:
         torch.cuda.synchronize()
 
-    # Reset peak memory
     if use_cuda:
         torch.cuda.reset_peak_memory_stats()
 
-    # Timed iterations
     if use_cuda:
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
@@ -146,7 +143,6 @@ def main() -> None:
 
     all_results: list[BenchmarkResult] = []
 
-    # Import and run each benchmark suite
     from benchmarks.micro.bench_data import run_data_benchmarks
     from benchmarks.micro.bench_forward import run_forward_benchmarks
     from benchmarks.micro.bench_moe import run_moe_benchmarks

@@ -55,10 +55,8 @@ def main() -> None:
     cli_args = sys.argv[2:]
     config = load_config(config_path, cli_args=cli_args)
 
-    # Force eval enabled
     config.eval.enabled = True
 
-    # --- Distributed setup ---
     rank, local_rank, world_size = get_world_info()
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
 
@@ -69,10 +67,8 @@ def main() -> None:
     tc = config.train
     mp_policy = default_mp_policy(tc.param_dtype)
 
-    # --- Loss function ---
     loss_fn = build_loss_fn(tc)
 
-    # --- Model (non-PP only for standalone eval) ---
     model = build_parallel_model(
         config.model,
         device,
@@ -84,8 +80,6 @@ def main() -> None:
         fp8=False,
     )
 
-    # --- Load checkpoint ---
-    # Use a dummy optimizer for CheckpointManager (required by DCP but not used)
     dummy_optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
     ckpt_mgr = CheckpointManager(config.checkpoint, model, dummy_optimizer)
 
@@ -99,7 +93,6 @@ def main() -> None:
     step, tokens_seen, _ = ckpt_mgr.load(path=load_path, exclude_keys=["optimizer"])
     logger.info(f"Loaded checkpoint: step={step}, tokens_seen={tokens_seen:,}")
 
-    # --- Eval data ---
     eval_config = config.eval
     dp_rank, dp_size = get_dp_info(device_mesh)
 
@@ -161,7 +154,6 @@ def main() -> None:
     )
     logger.info(f"Eval dataset: {len(eval_dataset):,} samples, {eval_config.steps} eval steps")
 
-    # --- Run eval ---
     metrics = run_eval(model, eval_dataloader, loss_fn, device, eval_config.steps)
 
     if rank == 0:
@@ -172,7 +164,6 @@ def main() -> None:
             print(f"  {key}: {value:.4f}")
         print(f"{'=' * 50}\n")
 
-        # Write results to JSON
         results = {"step": step, "tokens_seen": tokens_seen, **metrics}
         print(json.dumps(results, indent=2))
 

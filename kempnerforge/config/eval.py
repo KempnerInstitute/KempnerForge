@@ -10,12 +10,10 @@ class EvalConfig:
     """Evaluation pipeline settings (disabled by default)."""
 
     enabled: bool = False
-    interval: int = 1000  # Eval every N training steps
-    steps: int = 50  # Number of eval batches per evaluation
-    # Pre-tokenized eval data (same format as training)
+    interval: int = 1000
+    steps: int = 50
     dataset_path: str = ""
     file_pattern: str = "*.npy"
-    # HuggingFace eval data
     hf_dataset_name: str | None = None
     hf_dataset_config: str | None = None
     hf_dataset_split: str = "validation"

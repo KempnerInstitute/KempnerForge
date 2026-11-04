@@ -1,6 +1,4 @@
 # pyright: reportMissingImports=false
-# ^ mlflow is an optional dependency group; CI type-checks without it,
-#   so the lazy import below would otherwise raise reportMissingImports.
 """Append eval metrics to the MLflow run a checkpoint was trained under.
 
 A checkpoint's ``metadata.json`` records the tracking backends that were active when
@@ -42,9 +40,7 @@ logger = get_logger(__name__)
 
 _SIDECAR_FILE = "metadata.json"
 _MLFLOW_BACKEND = "mlflow"
-# A larger batch is split by MLflow into requests that can succeed or fail separately.
 _MAX_METRICS_PER_CALL = 1000
-# MLflow errors quote tracking URIs verbatim, and a URI can carry credentials anywhere in it.
 _URL = re.compile(r"\b([a-zA-Z][a-zA-Z0-9+.-]*://)[^\s'\"<>]+")
 
 
@@ -58,7 +54,7 @@ class MlflowTarget:
 
     run_id: str
     experiment: str
-    tracking_uri: str = field(repr=False)  # may embed credentials: keep it out of logs
+    tracking_uri: str = field(repr=False)
     step: int
     model_id: str | None = None
     model_name: str | None = None
@@ -315,8 +311,6 @@ def publish_metrics(
             str(Path(checkpoint_dir).resolve()),
         )
     if model_id is None:
-        # log_batch fills model_id-less metrics with the process's active model
-        # (mlflow.get_active_model_id); refuse rather than mislink to an unrelated model.
         get_ambient = getattr(mlflow, "get_active_model_id", None)
         ambient = get_ambient() if get_ambient is not None else None
         if ambient:
@@ -376,7 +370,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except PublishRefused as e:
         print(f"refused: {_mask_urls(str(e))}", file=sys.stderr)
         return 2
-    except Exception as e:  # the MLflow client or server failed: one line, no traceback
+    except Exception as e:
         print(f"failed: {type(e).__name__}: {_mask_urls(str(e))}", file=sys.stderr)
         return 1
     print(f"published {len(metrics)} metric(s) to run {target.run_id} at step {target.step}")

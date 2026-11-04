@@ -49,17 +49,10 @@ from kempnerforge.model.vlm import VLMWrapper, build_vlm_wrapper
 DEVICE = torch.device("cpu")
 
 
-# Arch coverage is DERIVED from the registry + the is_generative property (not a
-# hardcoded list) so new arches are swept automatically: generative arches get the
-# decode/generate sweeps, non-generative ones get the rejection guard. The single
-# explicit per-arch truth lives in tests/unit/test_vlm_config.py::TestIsGenerative.
 _ALL_VLM_ARCHS = tuple(sorted(registry.list_vlm_configs()))
 GENERATIVE_ARCHES = tuple(a for a in _ALL_VLM_ARCHS if VLMConfig.for_arch(a).is_generative)
 NON_GENERATIVE_ARCHES = tuple(a for a in _ALL_VLM_ARCHS if not VLMConfig.for_arch(a).is_generative)
 
-# Per-arch BUILD sizing for a tiny CPU wrapper (sizing only, NOT generativity policy):
-# CA needs a cross-attention cadence that fits the tiny layer count. Arches without an
-# entry build from defaults; a future arch needing knobs fails the build loudly here.
 _ARCH_BUILD_KWARGS = {"cross_attention": {"cross_attention_every_n_layers": 2}}
 
 
@@ -137,11 +130,6 @@ def _chat(content: list[dict], role: str = "user") -> ChatMessages:
 
 def _img(size: int = 8) -> Image.Image:
     return Image.new("RGB", (size, size), color=(120, 120, 120))
-
-
-# ---------------------------------------------------------------------------
-# _render_request (message -> prompt text + media guards)
-# ---------------------------------------------------------------------------
 
 
 class TestRenderRequest:
@@ -260,11 +248,6 @@ class TestRenderRequestVideo:
         assert any("zero clip" in m for m in rec.warnings)
 
 
-# ---------------------------------------------------------------------------
-# _frames_to_pixel_values (preprocessing glue)
-# ---------------------------------------------------------------------------
-
-
 class TestFramesToPixelValues:
     def test_shape_and_dtype(self):
         pv = _frames_to_pixel_values([_img()], image_size=16, device=DEVICE, dtype=torch.float32)
@@ -294,11 +277,6 @@ class TestFramesToPixelValues:
         from_pil = _frames_to_pixel_values([img], image_size=16, device=DEVICE, dtype=torch.float32)
         assert from_path.shape == (1, 3, 16, 16)
         assert torch.allclose(from_path, from_pil)
-
-
-# ---------------------------------------------------------------------------
-# _to_pil (str/path -> PIL normalization) + video str-image handling
-# ---------------------------------------------------------------------------
 
 
 class TestToPil:
@@ -339,12 +317,7 @@ def test_video_checkpoint_accepts_str_image_path(
         metadata={"task": "t", "doc_id": "d0", "repeats": 1},
     )
     out = vlm.generate_until([inst])
-    assert len(out) == 1 and len(out[0].split()) == 3  # processed, not skipped
-
-
-# ---------------------------------------------------------------------------
-# _resolve_gen_kwargs (defaults + task overrides)
-# ---------------------------------------------------------------------------
+    assert len(out) == 1 and len(out[0].split()) == 3
 
 
 class TestResolveGenKwargs:
@@ -376,7 +349,6 @@ class TestResolveGenKwargs:
         assert _resolve_gen_kwargs({"until": ["a", "b"]}, 64)["until"] == ["a", "b"]
 
     def test_explicit_zero_max_new_tokens_honored(self):
-        # 0 is a valid explicit value, not a "missing" fallback.
         assert _resolve_gen_kwargs({"max_new_tokens": 0}, 64)["max_new_tokens"] == 0
 
     def test_nonpositive_top_p_treated_as_disabled(self):
@@ -385,11 +357,6 @@ class TestResolveGenKwargs:
 
     def test_positive_top_p_honored_when_sampling(self):
         assert _resolve_gen_kwargs({"temperature": 0.5, "top_p": 0.1}, 64)["top_p"] == 0.1
-
-
-# ---------------------------------------------------------------------------
-# _generate_batch (cache-less batched decode loop) on a tiny random VLM
-# ---------------------------------------------------------------------------
 
 
 def _pixels(batch: int = 1) -> torch.Tensor:
@@ -426,8 +393,6 @@ class TestGenerateBatchSingle:
             _resolve_gen_kwargs({"max_new_tokens": 1}, 128),
             64,
         )[0]
-        # decode = space-joined ids, so the first space follows the first token:
-        # until=[" "] trims to exactly the first generated token.
         trimmed = _generate_batch(
             arch_wrapper,
             _MockTokenizer(),
@@ -459,8 +424,6 @@ class TestGenerateBatchSingle:
         assert out == [""]
 
     def test_no_room_raises_context_budget_error(self, arch_wrapper):
-        # _generate_batch still guards standalone; generate_until converts this into a
-        # per-task skip (see TestGenerateUntilFaultTolerance).
         r = _resolve_gen_kwargs({"max_new_tokens": 100}, 128)
         with pytest.raises(_ContextBudgetError, match="max_new_tokens"):
             _generate_batch(arch_wrapper, _MockTokenizer(), _pixels(), self._prompt(), r, 64)
@@ -469,9 +432,6 @@ class TestGenerateBatchSingle:
         """A prompt that exceeds the budget (but leaves room) is left-truncated with a warning."""
         rec = _RecordingLogger()
         monkeypatch.setattr("lmms_adapter.logger", rec)
-        # Size the prompt from the wrapper's own num_image_tokens (0 for CA, 8 for JD/MoT)
-        # so it overflows the budget by 6 on every arch — no hardcoded image-token count.
-        # budget = max_seq_len(64) - num_image_tokens - max_new_tokens(2).
         max_new = 2
         budget = 64 - arch_wrapper.num_image_tokens - max_new
         long_prompt = [torch.arange(1, budget + 7, dtype=torch.long)]
@@ -487,7 +447,6 @@ class TestGenerateBatchMulti:
     conditions must be tracked per row (every generative arch)."""
 
     def _prompts(self) -> list[torch.Tensor]:
-        # Deliberately different lengths so right-padding is exercised.
         return [
             torch.tensor([5, 9, 12, 3], dtype=torch.long),
             torch.tensor([7, 2], dtype=torch.long),
@@ -498,7 +457,7 @@ class TestGenerateBatchMulti:
         """Key correctness gate: a right-padded batch yields the same per-row
         continuation as decoding each request alone (greedy, float32)."""
         prompts = self._prompts()
-        pv = _pixels(len(prompts))  # (3, 3, 16, 16) — one image per request
+        pv = _pixels(len(prompts))
         r = _resolve_gen_kwargs({"max_new_tokens": 5}, 128)
         sequential = [
             _generate_batch(arch_wrapper, _MockTokenizer(), pv[i : i + 1], [prompts[i]], r, 64)[0]
@@ -534,12 +493,7 @@ class TestGenerateBatchMulti:
             _resolve_gen_kwargs({"max_new_tokens": 5}, 128),
             64,
         )
-        assert len(outs) == 3 and outs[0] == ""  # row 0 stops immediately on EOS
-
-
-# ---------------------------------------------------------------------------
-# _generate_batch frame_mask threading (video padded-frame masking)
-# ---------------------------------------------------------------------------
+        assert len(outs) == 3 and outs[0] == ""
 
 
 class _CaptureModel:
@@ -563,12 +517,12 @@ def test_generate_batch_threads_frame_mask_for_video():
     """A video batch passes the same (B, F) frame_mask into every model forward, so
     padded-frame visual tokens are masked from attention exactly as in training."""
     model = _CaptureModel(num_image_tokens=16)
-    pixel_values = torch.randn(2, 2, 3, 16, 16)  # (B, F=2, 3, H, W)
-    frame_mask = torch.tensor([[True, True], [True, False]])  # row 1: frame 2 padded
+    pixel_values = torch.randn(2, 2, 3, 16, 16)
+    frame_mask = torch.tensor([[True, True], [True, False]])
     prompt_ids = [torch.tensor([5, 9], dtype=torch.long), torch.tensor([7], dtype=torch.long)]
     r = _resolve_gen_kwargs({"max_new_tokens": 3}, 128)
     _generate_batch(model, _MockTokenizer(), pixel_values, prompt_ids, r, 64, frame_mask=frame_mask)
-    assert model.seen_frame_masks  # decode actually ran
+    assert model.seen_frame_masks
     assert all(fm is frame_mask for fm in model.seen_frame_masks)
 
 
@@ -582,11 +536,6 @@ def test_generate_batch_no_frame_mask_for_image():
     assert model.seen_frame_masks and all(fm is None for fm in model.seen_frame_masks)
 
 
-# ---------------------------------------------------------------------------
-# Guards: arch + not-implemented methods
-# ---------------------------------------------------------------------------
-
-
 class TestGuards:
     @pytest.mark.parametrize("arch", NON_GENERATIVE_ARCHES)
     def test_non_generative_arches_rejected(self, arch):
@@ -595,10 +544,10 @@ class TestGuards:
 
     @pytest.mark.parametrize("arch", GENERATIVE_ARCHES)
     def test_generative_arches_allowed(self, arch):
-        _check_generative(VLMConfig.for_arch(arch))  # must not raise
+        _check_generative(VLMConfig.for_arch(arch))
 
     def test_loglikelihood_not_implemented(self):
-        inst = KempnerForgeVLM.__new__(KempnerForgeVLM)  # bypass __init__ (no checkpoint needed)
+        inst = KempnerForgeVLM.__new__(KempnerForgeVLM)
         with pytest.raises(NotImplementedError, match="loglikelihood"):
             inst.loglikelihood([])
 
@@ -608,17 +557,9 @@ class TestGuards:
             inst.generate_until_multi_round([])
 
 
-# ---------------------------------------------------------------------------
-# Loader / __init__ helpers (build a VLM JobConfig + patch the heavy loaders so
-# the adapter can be constructed on CPU with no checkpoint).
-# ---------------------------------------------------------------------------
-
-
 def _vlm_job_config(tiny_vlm_configs, arch: str | None = None) -> JobConfig:
     mc, vc, ac, lc = tiny_vlm_configs
     if arch is not None:
-        # Build the real arch subclass (not a base VLMConfig with a mutated
-        # .arch) so per-arch config policy like is_generative is exercised.
         lc = VLMConfig.for_arch(arch, max_text_len=lc.max_text_len)
     return JobConfig(
         model=mc, vision_encoder=vc, adapter=ac, vlm=lc, data=DataConfig(tokenizer_path="mock")
@@ -643,11 +584,6 @@ def _patch_loaders(monkeypatch, job: JobConfig, model) -> None:
     monkeypatch.setattr("lmms_adapter.build_tokenizer", lambda _p: _MockTokenizer())
 
 
-# ---------------------------------------------------------------------------
-# _resolve_dtype
-# ---------------------------------------------------------------------------
-
-
 class TestResolveDtype:
     @pytest.mark.parametrize(
         "name,expected",
@@ -664,11 +600,6 @@ class TestResolveDtype:
             _resolve_dtype("float64")
 
 
-# ---------------------------------------------------------------------------
-# _first_stop
-# ---------------------------------------------------------------------------
-
-
 class TestFirstStop:
     def test_no_match_returns_none(self):
         assert _first_stop("hello world", ["xyz"]) is None
@@ -677,16 +608,10 @@ class TestFirstStop:
         assert _first_stop("abc", []) is None
 
     def test_earliest_of_multiple(self):
-        # "cd" at index 2 precedes "ef" at index 4.
         assert _first_stop("abcdef", ["ef", "cd"]) == 2
 
     def test_single_match_index(self):
         assert _first_stop("a.b", ["."]) == 1
-
-
-# ---------------------------------------------------------------------------
-# _log_checkpoint_metadata
-# ---------------------------------------------------------------------------
 
 
 class TestLogCheckpointMetadata:
@@ -707,13 +632,8 @@ class TestLogCheckpointMetadata:
         rec = _RecordingLogger()
         monkeypatch.setattr("lmms_adapter.logger", rec)
         (tmp_path / "metadata.json").write_text("{not valid json")
-        _log_checkpoint_metadata(tmp_path)  # must not raise
+        _log_checkpoint_metadata(tmp_path)
         assert any("Could not read" in m for m in rec.warnings)
-
-
-# ---------------------------------------------------------------------------
-# _load_config (VLM-only guard)
-# ---------------------------------------------------------------------------
 
 
 class TestLoadConfig:
@@ -731,22 +651,12 @@ class TestLoadConfig:
         assert _load_config("ignored.toml") is job
 
 
-# ---------------------------------------------------------------------------
-# _load_weights (path resolution / missing checkpoint)
-# ---------------------------------------------------------------------------
-
-
 class TestLoadWeights:
     def test_missing_checkpoint_raises(self, tmp_path, tiny_vlm_configs):
         job = _vlm_job_config(tiny_vlm_configs)
         missing = tmp_path / "no_such_checkpoint"
         with pytest.raises(FileNotFoundError, match="does not exist"):
             _load_weights(job, str(missing), torch.device("cpu"), torch.float32)
-
-
-# ---------------------------------------------------------------------------
-# KempnerForgeVLM.__init__ guards
-# ---------------------------------------------------------------------------
 
 
 @pytest.fixture
@@ -797,7 +707,6 @@ class TestInitGuards:
         assert vlm._frame_size == job.data.hf_image_size
 
     def test_dtype_defaults_from_config(self, monkeypatch, tiny_vlm_configs, tiny_vlm_wrapper):
-        # No explicit dtype -> use the checkpoint config's train.param_dtype.
         from kempnerforge.config.training import TrainConfig
 
         mc, vc, ac, lc = tiny_vlm_configs
@@ -814,7 +723,6 @@ class TestInitGuards:
         assert vlm._dtype == job.train.param_dtype == torch.float32
 
     def test_explicit_dtype_overrides_config(self, monkeypatch, tiny_vlm_configs, tiny_vlm_wrapper):
-        # An explicit dtype wins over the config default.
         _patch_loaders(monkeypatch, _vlm_job_config(tiny_vlm_configs), tiny_vlm_wrapper)
         vlm = KempnerForgeVLM(config="x", checkpoint="y", device="cpu", dtype="float16")
         assert vlm._dtype == torch.float16
@@ -837,11 +745,6 @@ class TestInitGuards:
         assert torch.get_float32_matmul_precision() == expected
 
 
-# ---------------------------------------------------------------------------
-# _build_model (frames_per_clip wiring for image vs video checkpoints)
-# ---------------------------------------------------------------------------
-
-
 class TestBuildModel:
     def test_video_config_sets_frames_per_clip(self, tiny_video_configs):
         job = _video_job_config(tiny_video_configs)
@@ -853,11 +756,6 @@ class TestBuildModel:
         job = _vlm_job_config(tiny_vlm_configs)
         model = _build_model(job, torch.device("cpu"), torch.float32)
         assert model.frames_per_clip == 1
-
-
-# ---------------------------------------------------------------------------
-# generate_until (end-to-end on a tiny VLM via the fake lmms-eval objects)
-# ---------------------------------------------------------------------------
 
 
 class TestGenerateUntil:
@@ -878,8 +776,6 @@ class TestGenerateUntil:
         vlm.task_dict = {
             "t": {"test": {"d0": {"q": "hi?"}, "d1": {"q": "describe the picture please"}}}
         }
-        # Different context strings (args[0]) so the Collator reorders the batch by length;
-        # get_original must then restore the original request order.
         specs = [("d0", "c"), ("d1", "cc")]
         instances = [
             Instance(
@@ -891,13 +787,12 @@ class TestGenerateUntil:
             for i, (doc_id, ctx) in enumerate(specs)
         ]
 
-        # Each request decoded alone (greedy → deterministic), in original order.
         singles = [vlm.generate_until([inst])[0] for inst in instances]
         batched = vlm.generate_until(instances)
 
-        assert batched == singles  # batching + reorder + get_original preserve per-request results
+        assert batched == singles
         assert all(isinstance(o, str) for o in batched)
-        assert all(len(o.split()) == 3 for o in batched)  # greedy emits exactly max_new_tokens
+        assert all(len(o.split()) == 3 for o in batched)
 
 
 class TestGenerateUntilVideo:
@@ -908,7 +803,6 @@ class TestGenerateUntilVideo:
     ):
         job = _video_job_config(tiny_video_configs)
         _patch_loaders(monkeypatch, job, tiny_video_vlm_wrapper)
-        # Two real frames per clip; zero-padded to frames_per_clip (== 2) downstream.
         monkeypatch.setattr(
             "lmms_adapter.decode_video_frames",
             lambda path, **kw: [_img(), _img()],
@@ -940,8 +834,6 @@ class TestGenerateUntilVideo:
             )
             for i, (doc_id, ctx) in enumerate(specs)
         ]
-        # Decoding each request alone must match the batched (stacked, 5-D) result; if the
-        # adapter folded frames with cat, the forward would trip the frames-per-clip check.
         singles = [vlm.generate_until([inst])[0] for inst in instances]
         batched = vlm.generate_until(instances)
         assert batched == singles
@@ -956,11 +848,6 @@ class TestGenerateUntilVideo:
         pixel_values = torch.stack([clip0, clip1], dim=0)
         assert pixel_values.shape == (2, 2, 3, 16, 16)
         assert pixel_values.ndim == 5
-
-
-# ---------------------------------------------------------------------------
-# generate_until fault tolerance + empty-prompt guard
-# ---------------------------------------------------------------------------
 
 
 class TestGenerateUntilFaultTolerance:
@@ -986,8 +873,6 @@ class TestGenerateUntilFaultTolerance:
         img = _img()
 
         def doc_to_messages(doc):
-            # The "bad" doc carries two images (multi-image -> NotImplementedError in
-            # _render_request); the "good" doc carries exactly one.
             content = [_text(doc["q"])] + [_image(img)] * doc["n_images"]
             return [{"role": "user", "content": content}]
 
@@ -1009,8 +894,8 @@ class TestGenerateUntilFaultTolerance:
             for i, (doc_id, ctx) in enumerate([("bad", "c"), ("good", "cc")])
         ]
         outs = vlm.generate_until(instances)
-        assert outs[0] == ""  # bad request isolated (order restored by get_original)
-        assert len(outs[1].split()) == 3  # good request completes normally
+        assert outs[0] == ""
+        assert len(outs[1].split()) == 3
         assert any("Skipping request" in m and "doc_id=bad" in m for m in rec.warnings)
 
     def test_empty_prompt_is_guarded(self, monkeypatch, tiny_vlm_configs):
@@ -1020,7 +905,6 @@ class TestGenerateUntilFaultTolerance:
 
         def doc_to_messages(doc):
             del doc
-            # One image, no text block -> empty flattened prompt.
             return [{"role": "user", "content": [_image(_img())]}]
 
         vlm.task_dict = {"t": {"test": {"d0": {}}}}
@@ -1034,8 +918,6 @@ class TestGenerateUntilFaultTolerance:
         assert any("empty prompt" in m for m in rec.warnings)
 
     def test_all_requests_bad_returns_empties(self, monkeypatch, tiny_vlm_configs):
-        # Every request in the chunk fails -> generation is short-circuited (no empty
-        # stack/cat) and each slot returns "", order preserved.
         monkeypatch.setattr("lmms_adapter.logger", _RecordingLogger())
         vlm = self._vlm(monkeypatch, tiny_vlm_configs)
 
@@ -1056,10 +938,6 @@ class TestGenerateUntilFaultTolerance:
         assert vlm.generate_until(instances) == ["", ""]
 
     def test_unexpected_error_isolated(self, monkeypatch, tiny_vlm_configs):
-        # The per-request handler catches Exception (broadened from the original
-        # NotImplementedError/OSError/ValueError), so an unexpected error on one
-        # document — here a RuntimeError from _render_request — is isolated as ""
-        # with a warning rather than aborting the whole run.
         rec = _RecordingLogger()
         monkeypatch.setattr("lmms_adapter.logger", rec)
         vlm = self._vlm(monkeypatch, tiny_vlm_configs, batch_size=1)
@@ -1084,9 +962,6 @@ class TestGenerateUntilFaultTolerance:
         assert any("Skipping request" in m and "doc_id=d0" in m for m in rec.warnings)
 
     def test_fatal_baseexception_propagates(self, monkeypatch, tiny_vlm_configs):
-        # The broadened catch is `except Exception`, so a BaseException (a Ctrl-C
-        # KeyboardInterrupt or a SystemExit) is NOT swallowed: it surfaces rather
-        # than being silently scored "", keeping a long eval run interruptible.
         vlm = self._vlm(monkeypatch, tiny_vlm_configs, batch_size=1)
 
         def interrupt(*_a, **_k):
@@ -1109,8 +984,6 @@ class TestGenerateUntilFaultTolerance:
             vlm.generate_until([inst])
 
     def test_missing_image_path_skipped(self, monkeypatch, tiny_vlm_configs):
-        # A bad image path raises FileNotFoundError (subclass of OSError) inside _to_pil;
-        # it is isolated as "" like other per-document failures.
         rec = _RecordingLogger()
         monkeypatch.setattr("lmms_adapter.logger", rec)
         vlm = self._vlm(monkeypatch, tiny_vlm_configs, batch_size=1)
@@ -1130,11 +1003,9 @@ class TestGenerateUntilFaultTolerance:
         assert any("Skipping request" in m and "doc_id=d0" in m for m in rec.warnings)
 
     def test_over_budget_chunk_skipped_not_aborted(self, monkeypatch, tiny_vlm_configs):
-        # A task whose max_new_tokens over-budgets the context skips its own requests
-        # (via _ContextBudgetError) instead of aborting the whole run.
         rec = _RecordingLogger()
         monkeypatch.setattr("lmms_adapter.logger", rec)
-        vlm = self._vlm(monkeypatch, tiny_vlm_configs)  # tiny max_seq_len == 64
+        vlm = self._vlm(monkeypatch, tiny_vlm_configs)
         img = _img()
 
         def doc_to_messages(doc):
