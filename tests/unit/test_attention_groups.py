@@ -488,11 +488,13 @@ class TestPackedWithPositionIds:
 
     Positions restart at zero in each document and document isolation keeps
     each document to itself, so every document of the pack equals the same
-    document run alone, its groups included.
+    document run alone, its groups included. Positions that change the gaps
+    inside one document change that document only.
     """
 
     DOCS = _t([[0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1]])
     POSITIONS = _t([[0, 1, 2, 3, 4, 0, 1, 2, 3, 4, 5, 6]])
+    SPREAD = _t([[0, 1, 2, 3, 4, 0, 2, 4, 6, 8, 10, 12]])
     GROUPS = _t([[0, 0, 0, -1, -1, 1, 1, -1, -1, 1, -1, -1]])
     TOKENS = torch.randint(0, 64, (1, 12), generator=torch.Generator().manual_seed(7))
 
@@ -528,17 +530,19 @@ class TestPackedWithPositionIds:
         torch.testing.assert_close(packed[:, :5], first, rtol=1e-5, atol=1e-5)
         torch.testing.assert_close(packed[:, 5:], second, rtol=1e-5, atol=1e-5)
 
-    def test_flex_matches_sdpa(self):
-        out = {b: self._packed(self._model(b), self.POSITIONS) for b in ("sdpa", "flex")}
+    @pytest.mark.parametrize("name", ["POSITIONS", "SPREAD"])
+    def test_flex_matches_sdpa(self, name):
+        positions = getattr(self, name)
+        out = {b: self._packed(self._model(b), positions) for b in ("sdpa", "flex")}
         torch.testing.assert_close(out["flex"], out["sdpa"], rtol=1e-5, atol=1e-5)
 
     @pytest.mark.parametrize("backend", ["sdpa", "flex"])
-    def test_restarted_positions_reach_only_the_later_document(self, backend):
+    def test_wider_gaps_change_only_the_later_document(self, backend):
         model = self._model(backend)
-        restarted = self._packed(model, self.POSITIONS)
+        spread = self._packed(model, self.SPREAD)
         contiguous = self._packed(model, None)
-        torch.testing.assert_close(restarted[:, :5], contiguous[:, :5], rtol=0, atol=0)
-        assert not torch.allclose(restarted[:, 5:], contiguous[:, 5:])
+        torch.testing.assert_close(spread[:, :5], contiguous[:, :5], rtol=0, atol=0)
+        assert (spread[:, 5:] - contiguous[:, 5:]).abs().max() > 1e-4
 
 
 class TestValidation:
