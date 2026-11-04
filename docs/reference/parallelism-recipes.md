@@ -78,7 +78,8 @@ The order the cross-section validator enforces (see
    the model into stage submodules.
 2. **TP** — shard attention heads and MLP within each PP stage; needs
    `n_heads % tp == 0`, `n_kv_heads % tp == 0`.
-3. **CP** — split along the sequence dimension (not wired up yet).
+3. **CP** — split along the sequence dimension (not wired up yet;
+   config validation rejects `cp > 1`).
 4. **EP** — shard experts across ranks (MoE only).
 5. **FSDP (`dp_shard`)** — shard remaining params; the "fill the rest"
    dimension, usually `dp_shard=-1`.

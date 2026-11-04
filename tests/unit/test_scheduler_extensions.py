@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 
 from kempnerforge.config.schema import SchedulerConfig, SchedulerType
-from kempnerforge.training.scheduler import build_scheduler
+from kempnerforge.training.scheduler import _warmup_factor, build_scheduler
 
 
 def _make_optimizer(lr: float = 1.0) -> torch.optim.Optimizer:
@@ -21,17 +21,11 @@ def _step_to(scheduler, n: int) -> None:
         scheduler.step()
 
 
-# ---------------------------------------------------------------------------
-# Constant with warmup
-# ---------------------------------------------------------------------------
-
-
 class TestConstantScheduler:
     def test_warmup_start(self):
         """LR should start at 0 during warmup."""
         opt = _make_optimizer()
         build_scheduler(opt, SchedulerConfig(name="constant", warmup_steps=100), 1000)
-        # LambdaLR applies lr_fn(0) at init → 0/100 = 0
         assert opt.param_groups[0]["lr"] == pytest.approx(0.0)
 
     def test_warmup_midpoint(self):
@@ -63,7 +57,6 @@ class TestConstantScheduler:
         """With warmup_steps=0, LR is constant from step 0."""
         opt = _make_optimizer()
         build_scheduler(opt, SchedulerConfig(name="constant", warmup_steps=0), 1000)
-        # LambdaLR at init: lr_fn(0) with no warmup → 1.0
         assert opt.param_groups[0]["lr"] == pytest.approx(1.0)
 
     def test_scheduler_type_enum(self):
@@ -73,11 +66,6 @@ class TestConstantScheduler:
         )
         _step_to(sched, 50)
         assert opt.param_groups[0]["lr"] == pytest.approx(1.0, abs=0.01)
-
-
-# ---------------------------------------------------------------------------
-# WSD decay type variants
-# ---------------------------------------------------------------------------
 
 
 class TestWSDDecayTypes:
@@ -101,7 +89,7 @@ class TestWSDDecayTypes:
 
     def test_cosine_stable_phase(self):
         opt, sched = self._make_wsd("cosine")
-        _step_to(sched, 30)  # In stable phase (step 10-50)
+        _step_to(sched, 30)
         assert opt.param_groups[0]["lr"] == pytest.approx(1.0, abs=0.01)
 
     def test_cosine_decay_end(self):
@@ -112,7 +100,7 @@ class TestWSDDecayTypes:
     def test_linear_decay_midpoint(self):
         """Linear decay at midpoint should be ~0.5."""
         opt, sched = self._make_wsd("linear")
-        _step_to(sched, 75)  # Midpoint of decay phase (step 50-100)
+        _step_to(sched, 75)
         assert opt.param_groups[0]["lr"] == pytest.approx(0.5, abs=0.05)
 
     def test_linear_decay_end(self):
@@ -126,7 +114,6 @@ class TestWSDDecayTypes:
         opt_linear, sched_linear = self._make_wsd("linear")
         _step_to(sched_sqrt, 75)
         _step_to(sched_linear, 75)
-        # Sqrt stays higher for longer
         assert opt_sqrt.param_groups[0]["lr"] > opt_linear.param_groups[0]["lr"]
 
     def test_sqrt_decay_end(self):
@@ -138,9 +125,9 @@ class TestWSDDecayTypes:
         """All decay types should produce the same LR during warmup and stable phases."""
         for dtype in ("cosine", "linear", "sqrt"):
             opt, sched = self._make_wsd(dtype)
-            _step_to(sched, 10)  # End of warmup
+            _step_to(sched, 10)
             assert opt.param_groups[0]["lr"] == pytest.approx(1.0, abs=0.01), dtype
-            _step_to(sched, 20)  # In stable phase
+            _step_to(sched, 20)
             assert opt.param_groups[0]["lr"] == pytest.approx(1.0, abs=0.01), dtype
 
     def test_all_variants_same_at_end(self):
@@ -159,16 +146,10 @@ class TestWSDDecayTypes:
         lrs = {}
         for dtype in ("cosine", "linear", "sqrt"):
             opt, sched = self._make_wsd(dtype)
-            _step_to(sched, 65)  # 30% through decay
+            _step_to(sched, 65)
             lrs[dtype] = opt.param_groups[0]["lr"]
-        # All should be different
         assert lrs["cosine"] != pytest.approx(lrs["linear"], abs=0.01)
         assert lrs["linear"] != pytest.approx(lrs["sqrt"], abs=0.01)
-
-
-# ---------------------------------------------------------------------------
-# REX scheduler
-# ---------------------------------------------------------------------------
 
 
 class TestREXScheduler:
@@ -209,7 +190,6 @@ class TestREXScheduler:
         )
         _step_to(sched_rex, 50)
         _step_to(sched_lin, 50)
-        # alpha=2: (1-0.5)^2 = 0.25 vs alpha=1: (1-0.5) = 0.5
         assert opt_rex.param_groups[0]["lr"] < opt_lin.param_groups[0]["lr"]
 
     def test_alpha_half_stays_high(self):
@@ -228,7 +208,6 @@ class TestREXScheduler:
         )
         _step_to(sched_rex, 50)
         _step_to(sched_lin, 50)
-        # alpha=0.5: (1-0.5)^0.5 ≈ 0.707 vs alpha=1: 0.5
         assert opt_rex.param_groups[0]["lr"] > opt_lin.param_groups[0]["lr"]
 
     def test_decay_to_zero(self):
@@ -265,16 +244,9 @@ class TestREXScheduler:
         opt = _make_optimizer(lr=1.0)
         config = SchedulerConfig(name="rex", warmup_steps=0, rex_alpha=2.0, min_lr_ratio=0.0)
         sched = build_scheduler(opt, config, max_steps=100)
-        # At step 0 (init): (1 - 0/100)^2 = 1.0
         assert opt.param_groups[0]["lr"] == pytest.approx(1.0)
         _step_to(sched, 50)
-        # At step 50: (1 - 50/100)^2 = 0.25
         assert opt.param_groups[0]["lr"] == pytest.approx(0.25, abs=0.01)
-
-
-# ---------------------------------------------------------------------------
-# TOML loading
-# ---------------------------------------------------------------------------
 
 
 class TestSchedulerTomlLoading:
@@ -336,11 +308,6 @@ wsd_decay_type = "sqrt"
         assert config.scheduler.rex_alpha == 2.0
 
 
-# ---------------------------------------------------------------------------
-# Config validation
-# ---------------------------------------------------------------------------
-
-
 class TestSchedulerConfigValidation:
     def test_scheduler_type_constant(self):
         assert SchedulerType.constant == "constant"
@@ -357,3 +324,66 @@ class TestSchedulerConfigValidation:
     def test_rex_alpha_default(self):
         config = SchedulerConfig()
         assert config.rex_alpha == 1.0
+
+
+def _torch_linear_warmup_cosine(lr: float, warmup: int, start: float, decay: int, min_ratio):
+    """Linear warmup then cosine decay, built from torch schedulers."""
+    model = nn.Linear(4, 4)
+    opt = torch.optim.SGD(model.parameters(), lr=lr)
+    cosine = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        opt, T_0=decay, eta_min=lr * min_ratio
+    )
+    warm = torch.optim.lr_scheduler.LinearLR(opt, start_factor=start, total_iters=warmup)
+    sched = torch.optim.lr_scheduler.SequentialLR(opt, [warm, cosine], milestones=[warmup])
+    return opt, sched
+
+
+class TestWarmupStartFactor:
+    def test_default_is_bit_identical_to_warming_up_from_zero(self):
+        for warmup in (1, 7, 100, 2000):
+            for step in range(warmup + 3):
+                assert _warmup_factor(step, warmup) == min(1.0, step / warmup)
+
+    @pytest.mark.parametrize("name", ["cosine", "linear", "wsd", "constant", "rex"])
+    def test_every_warmup_schedule_starts_from_the_factor(self, name):
+        opt = _make_optimizer(lr=2.0)
+        cfg = SchedulerConfig(name=name, warmup_steps=100, warmup_start_factor=0.25)
+        sched = build_scheduler(opt, cfg, max_steps=1000)
+        assert opt.param_groups[0]["lr"] == pytest.approx(0.5)
+        _step_to(sched, 50)
+        assert opt.param_groups[0]["lr"] == pytest.approx(2.0 * (0.25 + 0.75 * 0.5))
+        _step_to(sched, 50)
+        assert opt.param_groups[0]["lr"] == pytest.approx(2.0)
+
+    def test_cosine_matches_torch_linear_warmup_then_cosine_step_for_step(self):
+        """Two groups with different LRs over a whole run, at rel 1e-12."""
+        warmup, start, max_steps, min_ratio = 30, 5e-4, 250, 0.1
+        lrs = (3e-4, 5e-5)
+        model = nn.Linear(4, 4)
+        opt = torch.optim.SGD(
+            [{"params": [model.weight], "lr": lrs[0]}, {"params": [model.bias], "lr": lrs[1]}]
+        )
+        sched = build_scheduler(
+            opt,
+            SchedulerConfig(
+                name="cosine",
+                warmup_steps=warmup,
+                warmup_start_factor=start,
+                min_lr_ratio=min_ratio,
+            ),
+            max_steps=max_steps,
+        )
+        refs = [
+            _torch_linear_warmup_cosine(lr, warmup, start, max_steps - warmup, min_ratio)
+            for lr in lrs
+        ]
+        for step in range(max_steps):
+            for group, (ref_opt, _) in zip(opt.param_groups, refs, strict=True):
+                assert group["lr"] == pytest.approx(
+                    ref_opt.param_groups[0]["lr"], rel=1e-12, abs=0.0
+                ), f"step {step}"
+            opt.step()
+            sched.step()
+            for ref_opt, ref in refs:
+                ref_opt.step()
+                ref.step()

@@ -19,18 +19,13 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-# [step N] loss=.. | lr=.. | grad_norm=.. | tok/s=.. | mfu=..% | mem=../..GB | step_time=..s
-# tok/s may be "125,000" or "125k"/"1.2m" depending on formatter -- handle both.
 STEP_RE = re.compile(
     r"\[step (\d+)\].*?tok/s=([\d.,kKmM]+)\s*\|\s*mfu=([\d.]+)%\s*\|\s*"
     r"mem=([\d.]+)/[\d.]+GB\s*\|\s*step_time=([\d.]+)s"
 )
-# 70b_192gpu_tp4_fsdp48_r1  ->  (70b, 192, tp4_fsdp48, 1)
 NAME_RE = re.compile(r"^(?:preflight_)?(\d+b|moe\w*)_(\d+)gpu_(.+?)(?:_r(\d+))?$")
 
 
-# Steady-state = back half of the run (auto-discards compile + thermal warmup).
-# A 500-step headline medians over ~250 steady steps; a 30-step point over ~15.
 def _steady_window(n: int) -> int:
     return max(5, n // 2)
 
@@ -92,7 +87,7 @@ def pulse_summary(results_dir: Path) -> dict[str, str]:
     want = ("sm_active_pct", "tensor_active_pct", "dram_active_pct")
     by_config: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
     for csv in pdir.glob("*.csv"):
-        cfg = re.sub(r"_[^_]+_s\d+$", "", csv.stem)  # strip _<node>_sN
+        cfg = re.sub(r"_[^_]+_s\d+$", "", csv.stem)
         lines = csv.read_text(errors="replace").splitlines()
         if not lines:
             continue
@@ -103,7 +98,7 @@ def pulse_summary(results_dir: Path) -> dict[str, str]:
         for line in lines[1:]:
             cells = line.split(",")
             try:
-                if float(cells[col["gpu_util_pct"]]) <= 20:  # skip idle GPUs
+                if float(cells[col["gpu_util_pct"]]) <= 20:
                     continue
             except (ValueError, IndexError):
                 continue
@@ -140,7 +135,6 @@ def main() -> int:
     parsed = [r for r in (parse_log(p) for p in logs) if r]
     pulse = pulse_summary(rdir)
 
-    # Aggregate _rN repeats: key = (model, gpus, par)
     groups: dict[tuple, list[dict]] = defaultdict(list)
     for r in parsed:
         groups[(r["model"], r["gpus"], r["par"])].append(r)
@@ -164,10 +158,6 @@ def main() -> int:
             f"{mem:.1f} | {step:.2f} | {len(rs)} |"
         )
 
-    # Weak scaling per model: per-GPU batch is constant, so tok/s should grow
-    # linearly with GPU count. Efficiency = actual / ideal-linear, anchored at
-    # 32 GPUs (the published envelope edge) when available -- the 8-GPU 70B point
-    # is memory-bound (barely fits) and makes a misleadingly low baseline.
     print("\n## Weak-scaling efficiency\n")
     print(
         "_Per-GPU batch held constant; ideal = linear in GPU count. "

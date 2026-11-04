@@ -48,5 +48,6 @@ fp8
 - **Checkpointing under PP / TP / FSDP** — mesh-scoped DCP groups
   and resharding are in [Checkpointing](../checkpointing/index.md).
 - **Context parallelism** — `cp` is declared in config and checked in
-  validation but has no `apply_context_parallel` yet; see
+  validation, which accepts only `cp = 1` because there is no
+  `apply_context_parallel` yet; see
   [Device mesh § Context parallelism](device-mesh.md#context-parallelism).

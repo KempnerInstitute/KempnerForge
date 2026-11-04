@@ -29,6 +29,7 @@ from pathlib import Path
 
 import pytest
 
+from kempnerforge.training.optimizer import registry
 from tests.e2e.conftest import requires_gpus
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -115,11 +116,6 @@ def _parse_losses_by_step(output: str) -> dict[int, str]:
     return {int(s): loss for s, loss in re.findall(r"\[step (\d+)\] loss=([\d.]+)", output)}
 
 
-# ============================================================================
-# Single GPU
-# ============================================================================
-
-
 @pytest.mark.e2e
 def test_single_gpu_random_data(tmp_path):
     """Single GPU training with random data — basic smoke test."""
@@ -133,11 +129,6 @@ def test_single_gpu_random_data(tmp_path):
         nproc=1,
     )
     _assert_training_complete(result, expected_steps=10)
-
-
-# ============================================================================
-# Multi-GPU: FSDP
-# ============================================================================
 
 
 @pytest.mark.e2e
@@ -154,11 +145,6 @@ def test_fsdp_4gpu(tmp_path):
         nproc=4,
     )
     _assert_training_complete(result, expected_steps=10)
-
-
-# ============================================================================
-# Multi-GPU: Tensor Parallelism
-# ============================================================================
 
 
 @pytest.mark.e2e
@@ -197,11 +183,6 @@ def test_tp_plus_fsdp(tmp_path):
     _assert_training_complete(result, expected_steps=10)
 
 
-# ============================================================================
-# Multi-GPU: Pipeline Parallelism
-# ============================================================================
-
-
 @pytest.mark.e2e
 @requires_gpus(4)
 def test_pipeline_parallel(tmp_path):
@@ -220,28 +201,22 @@ def test_pipeline_parallel(tmp_path):
     )
     _assert_training_complete(result, expected_steps=10)
 
-    # Verify rank 0 reports actual loss (not 0.0 from PP stage 0)
     output = result.stdout + result.stderr
     loss = _parse_last_loss(output)
     assert loss is not None, "Could not parse loss from PP training output"
     assert loss > 0.0, f"PP training loss should be > 0 (got {loss})"
 
 
-# ============================================================================
-# Mixed Precision
-# ============================================================================
-
-
 @pytest.mark.e2e
 @requires_gpus(4)
-def test_fp16_mixed_precision(tmp_path):
-    """4 GPU FSDP with fp16 — verifies param_dtype config path."""
+def test_fp32_mixed_precision(tmp_path: Path) -> None:
+    """4 GPU FSDP with fp32, which checks a non-bf16 param_dtype end to end."""
     result = _run_training(
         [
             DEBUG_CONFIG,
             "--train.max_steps=10",
             "--metrics.log_interval=5",
-            "--train.mixed_precision=fp16",
+            "--train.mixed_precision=fp32",
             f"--checkpoint.dir={tmp_path}/ckpt",
         ],
         nproc=4,
@@ -249,9 +224,22 @@ def test_fp16_mixed_precision(tmp_path):
     _assert_training_complete(result, expected_steps=10)
 
 
-# ============================================================================
-# Data Pipeline
-# ============================================================================
+@pytest.mark.e2e
+def test_fp16_mixed_precision_rejected_at_launch(tmp_path: Path) -> None:
+    """There is no loss scaling, so fp16 fails at config load, before any GPU work."""
+    result = _run_training(
+        [
+            DEBUG_CONFIG,
+            "--train.max_steps=10",
+            "--train.mixed_precision=fp16",
+            f"--checkpoint.dir={tmp_path}/ckpt",
+        ],
+        nproc=1,
+    )
+    output = result.stdout + result.stderr
+    assert result.returncode != 0, f"fp16 run was not rejected:\n{output[-2000:]}"
+    assert "ValueError: train.mixed_precision='fp16' is not supported" in output, output[-2000:]
+    assert "Training complete" not in output
 
 
 @pytest.mark.e2e
@@ -274,7 +262,6 @@ def test_synthetic_data_pipeline(synthetic_data_dir, tmp_path):
     assert "Dataset:" in output, "Dataset was not loaded"
 
 
-# HuggingFace dataset overrides: clear dataset_path, set HF fields, use gpt2 tokenizer
 _HF_OVERRIDES = [
     "--data.dataset_path=",
     "--data.hf_dataset_name=wikitext",
@@ -360,18 +347,12 @@ def test_hf_streaming_4gpu(tmp_path):
     assert "streaming from" in output, "Streaming dataset was not loaded"
 
 
-# ============================================================================
-# Checkpoint Save + Resume
-# ============================================================================
-
-
 @pytest.mark.e2e
 @requires_gpus(4)
 def test_checkpoint_save_and_resume(tmp_path):
     """4 GPU FSDP — save checkpoint at step 5, resume and train to step 10."""
     ckpt_dir = str(tmp_path / "ckpt")
 
-    # Phase 1: Train to step 10, checkpoint at step 5
     result = _run_training(
         [
             DEBUG_CONFIG,
@@ -384,9 +365,8 @@ def test_checkpoint_save_and_resume(tmp_path):
     )
     _assert_training_complete(result, expected_steps=10)
     output = result.stdout + result.stderr
-    assert "Checkpoint saved" in output, "Checkpoint was not saved"
+    assert "Checkpoint committed" in output, "Checkpoint was not saved"
 
-    # Phase 2: Resume — should pick up from step 10, train to step 15
     result = _run_training(
         [
             DEBUG_CONFIG,
@@ -400,11 +380,6 @@ def test_checkpoint_save_and_resume(tmp_path):
     _assert_training_complete(result, expected_steps=15)
     output = result.stdout + result.stderr
     assert "step=10" in output, "Did not resume from step 10"
-
-
-# ============================================================================
-# Resume Determinism (regression: optimizer state must be restored bit-exactly)
-# ============================================================================
 
 
 def _make_learnable_shard(tmp_path) -> str:
@@ -424,7 +399,7 @@ def _make_learnable_shard(tmp_path) -> str:
     return str(data_dir)
 
 
-def _check_resume_determinism(tmp_path, nproc: int) -> None:
+def _check_resume_determinism(tmp_path, nproc: int, overrides: tuple[str, ...] = ()) -> None:
     """An interrupted+resumed run must reproduce an uninterrupted reference
     bit-for-bit on the post-resume steps.
 
@@ -443,6 +418,7 @@ def _check_resume_determinism(tmp_path, nproc: int) -> None:
         "--model.vocab_size=256",
         f"--data.dataset_path={data_dir}",
         "--data.file_pattern=*.npy",
+        *overrides,
     ]
     reference = _run_training(
         common
@@ -487,39 +463,95 @@ def _check_resume_determinism(tmp_path, nproc: int) -> None:
         )
 
 
+_MUON_OVERRIDES = ("--optimizer.name=muon", "--optimizer.lr=0.02", "--model.vocab_size=4096")
+_RESUMABLE_OPTIMIZERS = [
+    pytest.param(
+        name, marks=pytest.mark.xfail(strict=True, reason="#236: schedule_free_adamw cannot resume")
+    )
+    if name == "schedule_free_adamw"
+    else name
+    for name in sorted(registry.list("optimizer"))
+]
+
+
+def _optimizer_overrides(name: str) -> tuple[str, ...]:
+    """Overrides that train with the registered optimizer ``name``."""
+    return _MUON_OVERRIDES if name == "muon" else (f"--optimizer.name={name}",)
+
+
 @pytest.mark.e2e
-def test_resume_determinism_single_gpu(tmp_path):
+@pytest.mark.parametrize("name", _RESUMABLE_OPTIMIZERS)
+def test_resume_determinism_single_gpu(tmp_path, name):
     """Single GPU: resumed run must match the uninterrupted reference bit-for-bit."""
-    _check_resume_determinism(tmp_path, nproc=1)
+    _check_resume_determinism(tmp_path, nproc=1, overrides=_optimizer_overrides(name))
 
 
 @pytest.mark.e2e
 @requires_gpus(2)
-def test_resume_determinism_2gpu_fsdp(tmp_path):
+@pytest.mark.parametrize("name", _RESUMABLE_OPTIMIZERS)
+def test_resume_determinism_2gpu_fsdp(tmp_path, name):
     """2 GPU FSDP: resumed run must match the uninterrupted reference bit-for-bit."""
-    _check_resume_determinism(tmp_path, nproc=2)
+    _check_resume_determinism(tmp_path, nproc=2, overrides=_optimizer_overrides(name))
 
 
-# ============================================================================
-# Pipeline Parallel + Checkpoint
-# ============================================================================
+@pytest.mark.e2e
+@pytest.mark.parametrize("name", sorted(registry.list("optimizer")))
+def test_step_zero_checkpoint_leaves_training_unchanged(tmp_path, name):
+    """A run that checkpoints at step 0 must log the same losses as one that does not."""
+    overrides = _optimizer_overrides(name)
+    data_dir = _make_learnable_shard(tmp_path)
+    common = [
+        DEBUG_CONFIG,
+        "--metrics.log_interval=1",
+        "--train.seed=1234",
+        "--train.compile_model=false",
+        "--train.max_steps=10",
+        "--scheduler.warmup_steps=0",
+        "--model.vocab_size=256",
+        f"--data.dataset_path={data_dir}",
+        "--data.file_pattern=*.npy",
+        *overrides,
+    ]
+    plain = _run_training(common + [f"--checkpoint.dir={tmp_path}/plain"], timeout=300)
+    _assert_training_complete(plain, expected_steps=10)
+    windowed = _run_training(
+        common
+        + [
+            f"--checkpoint.dir={tmp_path}/windowed",
+            "--checkpoint.dyn_ckpt_window.start=0",
+            "--checkpoint.dyn_ckpt_window.stop=8",
+        ],
+        timeout=300,
+    )
+    _assert_training_complete(windowed, expected_steps=10)
+    assert (tmp_path / "windowed" / "step_0").is_dir(), "the window did not save step 0"
+
+    plain_losses = _parse_losses_by_step(plain.stdout + plain.stderr)
+    windowed_losses = _parse_losses_by_step(windowed.stdout + windowed.stderr)
+    assert len(plain_losses) == 10, f"expected 10 logged steps, got {sorted(plain_losses)}"
+    assert windowed_losses == plain_losses, (
+        "saving at step 0 changed the losses -- the save left optimizer state behind"
+    )
 
 
 @pytest.mark.e2e
 @requires_gpus(4)
-def test_pp_checkpoint_save_and_resume(tmp_path):
-    """4 GPU PP=2 + FSDP=2 — save checkpoint, resume, verify loss continuity."""
+@pytest.mark.parametrize(
+    ("pp", "layout"),
+    [(2, ["--distributed.dp_shard=2"]), (4, []), (2, ["--distributed.tp=2"])],
+    ids=["pp2-fsdp2", "pp4", "pp2-tp2"],
+)
+def test_pp_checkpoint_save_and_resume(tmp_path, pp, layout):
+    """4 GPU PP with FSDP, alone, or with TP: every stage saves a checkpoint, and it resumes."""
     ckpt_dir = str(tmp_path / "pp_ckpt")
+    parallelism = [f"--distributed.pp={pp}", *layout, f"--train.grad_accum_steps={pp}"]
 
-    # Phase 1: Train 10 steps with PP, checkpoint at step 5
     result = _run_training(
         [
             DEBUG_CONFIG,
             "--train.max_steps=10",
             "--metrics.log_interval=5",
-            "--distributed.pp=2",
-            "--distributed.dp_shard=2",
-            "--train.grad_accum_steps=2",
+            *parallelism,
             f"--checkpoint.dir={ckpt_dir}",
             "--checkpoint.interval=5",
         ],
@@ -527,23 +559,26 @@ def test_pp_checkpoint_save_and_resume(tmp_path):
     )
     _assert_training_complete(result, expected_steps=10)
     output = result.stdout + result.stderr
-    assert "Checkpoint saved" in output, "PP checkpoint was not saved"
+    assert "Checkpoint committed" in output, "PP checkpoint was not saved"
+    step_dirs = list(Path(ckpt_dir).glob("step_*"))
+    assert {d.name for d in step_dirs} == {"step_5", "step_10"}
+    for step_dir in step_dirs:
+        stages = sorted(d.name for d in step_dir.iterdir() if d.is_dir())
+        assert stages == [f"pp{k}" for k in range(pp)], f"{step_dir}: {stages}"
+        missing = [s for s in stages if not (step_dir / s / ".metadata").is_file()]
+        assert not missing, f"{step_dir}: no .metadata in {missing}"
 
-    # Verify loss is meaningful before resume
     loss_phase1 = _parse_last_loss(output)
     assert loss_phase1 is not None and loss_phase1 > 0.0, (
         f"PP phase 1 loss should be > 0 (got {loss_phase1})"
     )
 
-    # Phase 2: Resume from checkpoint, train to step 15
     result = _run_training(
         [
             DEBUG_CONFIG,
             "--train.max_steps=15",
             "--metrics.log_interval=5",
-            "--distributed.pp=2",
-            "--distributed.dp_shard=2",
-            "--train.grad_accum_steps=2",
+            *parallelism,
             f"--checkpoint.dir={ckpt_dir}",
             "--checkpoint.interval=100",
         ],
@@ -552,11 +587,6 @@ def test_pp_checkpoint_save_and_resume(tmp_path):
     _assert_training_complete(result, expected_steps=15)
     output = result.stdout + result.stderr
     assert "Resumed from step" in output, "PP did not resume from checkpoint"
-
-
-# ============================================================================
-# Signal Handler (graceful shutdown)
-# ============================================================================
 
 
 @pytest.mark.e2e
@@ -569,7 +599,6 @@ def test_sigterm_triggers_emergency_checkpoint(tmp_path):
     env.setdefault("RANK", "0")
     env.setdefault("LOCAL_RANK", "0")
 
-    # Start training with many steps so it's still running when we SIGTERM
     cmd = [
         sys.executable,
         TRAIN_SCRIPT,
@@ -577,7 +606,7 @@ def test_sigterm_triggers_emergency_checkpoint(tmp_path):
         "--train.max_steps=500",
         "--metrics.log_interval=1",
         f"--checkpoint.dir={ckpt_dir}",
-        "--checkpoint.interval=1000",  # no scheduled checkpoint
+        "--checkpoint.interval=1000",
     ]
 
     proc = subprocess.Popen(
@@ -589,8 +618,6 @@ def test_sigterm_triggers_emergency_checkpoint(tmp_path):
         cwd=str(PROJECT_ROOT),
     )
 
-    # Wait for training to start (look for first loss= in output),
-    # then send SIGTERM
     time.sleep(10)
     proc.send_signal(signal.SIGTERM)
 
@@ -603,7 +630,9 @@ def test_sigterm_triggers_emergency_checkpoint(tmp_path):
 
     output = stdout + stderr
     assert "Shutdown requested" in output, f"Signal handler did not trigger:\n{output[-2000:]}"
-    assert "Checkpoint saved" in output, f"Emergency checkpoint was not saved:\n{output[-2000:]}"
+    assert "Checkpoint committed" in output, (
+        f"Emergency checkpoint was not saved:\n{output[-2000:]}"
+    )
 
 
 @pytest.mark.e2e
@@ -612,16 +641,13 @@ def test_final_checkpoint_on_clean_completion(tmp_path):
     checkpoint, with `latest` pointing at it."""
     ckpt_dir = tmp_path / "final_ckpt"
 
-    # max_steps=10 with interval=1000 => no scheduled save lands (debug.toml
-    # configures no dyn_ckpt_window), so the only checkpoint must be the
-    # unconditional final save at step 10.
     result = _run_training(
         [
             DEBUG_CONFIG,
             "--train.max_steps=10",
             "--metrics.log_interval=5",
             f"--checkpoint.dir={ckpt_dir}",
-            "--checkpoint.interval=1000",  # no scheduled checkpoint
+            "--checkpoint.interval=1000",
         ],
         nproc=1,
     )
@@ -635,11 +661,6 @@ def test_final_checkpoint_on_clean_completion(tmp_path):
     assert latest.resolve().name == "step_10", (
         f"`latest` should resolve to step_10, got {latest.resolve().name!r}"
     )
-
-
-# ============================================================================
-# MoE Training
-# ============================================================================
 
 
 @pytest.mark.e2e
@@ -700,7 +721,6 @@ def test_moe_checkpoint_resume(tmp_path):
     """MoE checkpoint save + resume on 4 GPUs."""
     ckpt_dir = str(tmp_path / "moe_ckpt")
 
-    # Phase 1: Train 10 steps, checkpoint at step 5
     result = _run_training(
         [
             DEBUG_MOE_CONFIG,
@@ -713,9 +733,8 @@ def test_moe_checkpoint_resume(tmp_path):
     )
     _assert_training_complete(result, expected_steps=10)
     output = result.stdout + result.stderr
-    assert "Checkpoint saved" in output, "MoE checkpoint was not saved"
+    assert "Checkpoint committed" in output, "MoE checkpoint was not saved"
 
-    # Phase 2: Resume from checkpoint, train to step 15
     result = _run_training(
         [
             DEBUG_MOE_CONFIG,
@@ -730,10 +749,6 @@ def test_moe_checkpoint_resume(tmp_path):
     output = result.stdout + result.stderr
     assert "step=10" in output, "MoE did not resume from step 10"
 
-
-# ============================================================================
-# MoE: Sigmoid Router + Sequence Aux Loss + Gradient Scaling
-# ============================================================================
 
 _SIGMOID_MOE_OVERRIDES = [
     "--model.moe_router=sigmoid_topk",
@@ -778,11 +793,6 @@ def test_moe_sigmoid_fsdp_4gpu(tmp_path):
         nproc=4,
     )
     _assert_training_complete(result, expected_steps=10)
-
-
-# ============================================================================
-# FP8 Mixed Precision
-# ============================================================================
 
 
 @pytest.mark.e2e
@@ -842,11 +852,6 @@ def test_fp8_moe_fsdp_4gpu(tmp_path):
     _assert_training_complete(result, expected_steps=10)
     output = result.stdout + result.stderr
     assert "Float8" in output, "Float8 conversion was not applied"
-
-
-# ============================================================================
-# Z-Loss, Chunked CE, Muon Optimizer
-# ============================================================================
 
 
 @pytest.mark.e2e
@@ -945,11 +950,6 @@ def test_z_loss_chunked_ce_fsdp_4gpu(tmp_path):
     _assert_training_complete(result, expected_steps=10)
 
 
-# ============================================================================
-# Slow: Large Model
-# ============================================================================
-
-
 @pytest.mark.e2e
 @pytest.mark.slow
 @requires_gpus(4)
@@ -962,6 +962,7 @@ def test_7b_tp_fsdp_compile(tmp_path):
     result = _run_training(
         [
             BENCH_CONFIG,
+            "--data.dataset_path=",
             "--train.max_steps=5",
             "--metrics.log_interval=5",
             "--distributed.tp=2",

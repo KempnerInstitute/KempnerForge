@@ -31,7 +31,6 @@ def validate(data_path: Path) -> None:
         print(f"Error: not a directory: {data_path}", file=sys.stderr)
         sys.exit(1)
 
-    # Find shards
     bin_shards = sorted(data_path.glob("*.bin"))
     npy_shards = sorted(data_path.glob("*.npy"))
     shards = bin_shards or npy_shards
@@ -41,10 +40,8 @@ def validate(data_path: Path) -> None:
         print(f"Error: no .bin or .npy files in {data_path}", file=sys.stderr)
         sys.exit(1)
 
-    # Read tatm metadata if present
     metadata = _read_metadata(data_path)
 
-    # Analyze shards
     total_size = sum(s.stat().st_size for s in shards)
 
     if fmt == "npy":
@@ -64,7 +61,6 @@ def validate(data_path: Path) -> None:
         vocab_size = metadata["tokenized_info"].get("vocab_size")
         tokenizer_name = metadata["tokenized_info"].get("tokenizer")
 
-    # Print report
     print(f"\n{'=' * 60}")
     print(f"  {data_path}")
     print(f"{'=' * 60}")
@@ -77,7 +73,6 @@ def validate(data_path: Path) -> None:
     if vocab_size:
         print(f"  Vocab size: {vocab_size:,}")
 
-    # Compatibility check
     if sample_dtype not in (np.dtype("uint16"), np.dtype("uint32")):
         print(f"\n  WARNING: dtype {sample_dtype} — expected uint16 or uint32")
     else:

@@ -40,10 +40,6 @@ _ADAPTER_ACTIVATIONS: dict[str, type[nn.Module]] = {
     "relu": nn.ReLU,
 }
 
-# Registry keys of adapters that pool the patch grid (reduce token count). The
-# config layer (``AdapterConfig.output_num_tokens``) consults this to predict
-# the post-adapter token count without building the module. Keep in sync with
-# the registered pooling builders below.
 POOLING_ADAPTER_TYPES: tuple[str, ...] = ("avgpool", "attentional_pool")
 
 
@@ -104,9 +100,8 @@ def _pad_grid_to_windows(
         return x, per, None
     pad = padded - grid
     valid = torch.ones(b, grid, grid, 1, dtype=torch.bool, device=x.device)
-    # F.pad pads the last dim backward: (C:0,0)(W:0,pad)(H:0,pad).
     x = F.pad(x, (0, 0, 0, pad, 0, pad))
-    valid = F.pad(valid, (0, 0, 0, pad, 0, pad))  # (B, padded, padded, 1) bool
+    valid = F.pad(valid, (0, 0, 0, pad, 0, pad))
     return x, per, valid
 
 
@@ -237,13 +232,10 @@ class AvgPoolAdapter(VisionAdapter):
             raise ValueError(f"pool_window must be positive (got {w})")
         x, per, valid = _pad_grid_to_windows(x, w)
         b, _, _, c = x.shape
-        # Group into windows and average over real (unpadded) cells only.
         if valid is None:
-            sums = x.view(b, per, w, per, w, c).sum(dim=(2, 4))  # (B, per, per, C)
+            sums = x.view(b, per, w, per, w, c).sum(dim=(2, 4))
             pooled = (sums / (w * w)).reshape(b, per * per, c)
         else:
-            # Zero the padded cells through `valid` rather than trusting the pad
-            # value, so numerator and denominator are masked by the same tensor.
             sums = (x * valid).view(b, per, w, per, w, c).sum(dim=(2, 4))
             counts = valid.view(b, per, w, per, w, 1).to(sums.dtype).sum(dim=(2, 4)).clamp_(min=1)
             pooled = (sums / counts).reshape(b, per * per, c)
@@ -308,42 +300,32 @@ class AttentionalPoolAdapter(VisionAdapter):
         x, per, valid = _pad_grid_to_windows(x, w)
         b, _, _, c = x.shape
         k_win = w * w
-        # Ragged grid: each padded edge window pools only its real patches via a
-        # masked attention -- `valid` masks the padded patches out of the window's
-        # K/V (and the masked-mean query). Divisible grids return valid=None and
-        # stay bit-identical to the unmasked pooling.
         win_mask: torch.Tensor | None
         if valid is None:
             win_mask = None
         else:
-            # Window order must match `windows` below.
             win_mask = (
                 valid.view(b, per, w, per, w, 1)
                 .permute(0, 1, 3, 2, 4, 5)
                 .reshape(b * per * per, k_win)
             )
-        # (B, padded, padded, C) -> windows (B*per*per, w*w, C): each window's patches contiguous.
         windows = (
             x.view(b, per, w, per, w, c).permute(0, 1, 3, 2, 4, 5).reshape(b * per * per, k_win, c)
         )
         m = windows.shape[0]
         if win_mask is None:
-            query = windows.mean(dim=1, keepdim=True)  # (M, 1, C) — window mean as query
+            query = windows.mean(dim=1, keepdim=True)
         else:
-            # Query = mean over real patches only (every window has >=1 real patch,
-            # so the count is never zero).
-            wf = win_mask.unsqueeze(-1).to(windows.dtype)  # (M, k_win, 1)
+            wf = win_mask.unsqueeze(-1).to(windows.dtype)
             query = (windows * wf).sum(dim=1, keepdim=True) / wf.sum(dim=1, keepdim=True).clamp_(
                 min=1
             )
         q = self.q_proj(query).view(m, 1, self.pool_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(windows).view(m, k_win, self.pool_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(windows).view(m, k_win, self.pool_heads, self.head_dim).transpose(1, 2)
-        # Mask padded patches out of the K/V for edge windows; None -> plain SDPA
-        # (the divisible path, bit-identical to before).
         attn_mask = None if win_mask is None else win_mask.view(m, 1, 1, k_win)
-        attn = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)  # (M, H, 1, head_dim)
-        attn = attn.transpose(1, 2).reshape(m, c)  # (M, C)
+        attn = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        attn = attn.transpose(1, 2).reshape(m, c)
         pooled = self.o_proj(attn).view(b, per * per, c)
         return self.out_proj(pooled)
 

@@ -1,10 +1,4 @@
 # pyright: reportMissingImports=false
-# ^ lmms-eval is an optional, UNDECLARED dependency (it is installed separately,
-#   not listed in pyproject.toml). CI type-checks `kempnerforge/` without it
-#   installed, so the `lmms_eval` imports below would otherwise raise
-#   reportMissingImports. A file-level directive (not a `# type: ignore`, which
-#   reportUnnecessaryTypeIgnoreComment would flag as unnecessary in dev where
-#   lmms-eval *is* installed) scopes the relaxation to this one module.
 """lmms-eval chat-model adapter wrapping a KempnerForge ``VLMWrapper``.
 
 This module implements ``KempnerForgeVLM``, an lmms-eval ``chat`` model
@@ -105,19 +99,10 @@ def _resolve_dtype(dtype: str | torch.dtype) -> torch.dtype:
         raise ValueError(f"Unsupported dtype {dtype!r}; choose from {sorted(_DTYPES)}") from None
 
 
-# --------------------------------------------------------------------------- #
-# Loader
-# --------------------------------------------------------------------------- #
-
-
 def _build_model(config: JobConfig, device: torch.device, dtype: torch.dtype) -> VLMWrapper:
     assert config.vlm is not None, "internal: _build_model requires a VLM config"
     assert config.vision_encoder is not None, "internal: VLM config requires a vision encoder"
     assert config.adapter is not None, "internal: VLM config materializes a default adapter"
-    # A video checkpoint bakes num_image_tokens = frames_per_clip * tokens_per_frame
-    # into the transformer's residual/positional structure, so the eval must rebuild
-    # with the same frames_per_clip the training run used (mirrors build_model).
-    # Image configs default to 1.
     frames_per_clip = config.video.max_frames if config.video is not None else 1
     model = build_vlm_wrapper(
         config.model,
@@ -169,17 +154,26 @@ def _check_generative(vlm_config: VLMConfig) -> None:
         )
 
 
+def resolve_checkpoint(checkpoint: str) -> Path:
+    """The concrete checkpoint directory ``checkpoint`` names.
+
+    A run directory resolves to its ``latest``/highest ``step_N`` via
+    ``resolve_resume_path``; a specific checkpoint directory is used as-is. Symlinks are
+    followed, so a ``latest`` link that moves later cannot change the directory.
+    """
+    return (resolve_resume_path(checkpoint) or Path(checkpoint)).resolve()
+
+
 def _load_weights(
     config: JobConfig, checkpoint: str, device: torch.device, dtype: torch.dtype
 ) -> VLMWrapper:
     """Build a ``VLMWrapper`` and load DCP weights for single-process eval.
 
-    Accepts either a run directory (resolved to its ``latest``/highest
-    ``step_N`` via ``resolve_resume_path``) or a specific checkpoint directory
-    (used as-is when ``resolve_resume_path`` finds nothing). DCP reshards on
-    load, so checkpoints saved under FSDP/PP load into the full model.
+    Accepts either a run directory or a specific checkpoint directory (see
+    ``resolve_checkpoint``). DCP reshards on load, so checkpoints saved under
+    FSDP/PP load into the full model.
     """
-    ckpt_path = resolve_resume_path(checkpoint) or Path(checkpoint)
+    ckpt_path = resolve_checkpoint(checkpoint)
     if not ckpt_path.exists():
         raise FileNotFoundError(f"Checkpoint path does not exist: {ckpt_path}")
     if not ckpt_path.is_dir():
@@ -187,8 +181,6 @@ def _load_weights(
     model = _build_model(config, device, dtype)
     model.eval()
 
-    # Single-process DCP load: build the full (unsharded) model, then load the
-    # model shards into its state-dict.
     state_dict = {"model": model.state_dict()}
     dcp.load(state_dict, checkpoint_id=str(ckpt_path))
     model.load_state_dict(state_dict["model"])
@@ -196,11 +188,6 @@ def _load_weights(
     _log_checkpoint_metadata(ckpt_path)
     logger.info(f"Loaded VLM checkpoint from {ckpt_path}")
     return model
-
-
-# --------------------------------------------------------------------------- #
-# Request rendering + preprocessing
-# --------------------------------------------------------------------------- #
 
 
 def _render_request(
@@ -248,7 +235,6 @@ def _render_request(
     )
 
     if video_config is None:
-        # Image checkpoint: image-only, exactly one image per request.
         if videos:
             raise NotImplementedError(
                 "This is an image checkpoint (no [video] config) and cannot evaluate video. "
@@ -262,8 +248,6 @@ def _render_request(
             )
         return images, prompt
 
-    # Video checkpoint: exactly one visual — a video (decoded to frames) or a
-    # single image (treated as a 1-frame clip, zero-padded downstream).
     if len(videos) > 1:
         raise NotImplementedError(
             f"Multiple videos per request are not supported, got {len(videos)}. "
@@ -295,8 +279,6 @@ def _render_request(
             )
         return frames, prompt
     if len(images) == 1:
-        # A single image on a video checkpoint: a 1-frame clip (zero-padded to
-        # frames_per_clip downstream), consistent with how training pads short clips.
         return images, prompt
     raise NotImplementedError(
         f"A video-checkpoint request must carry exactly one video or one image, got "
@@ -339,11 +321,6 @@ def _frames_to_pixel_values(
     return torch.stack(tensors, dim=0).to(device=device, dtype=dtype)
 
 
-# --------------------------------------------------------------------------- #
-# Generation
-# --------------------------------------------------------------------------- #
-
-
 class _ContextBudgetError(ValueError):
     """No room for the prompt: max_new_tokens + image tokens exceed max_seq_len."""
 
@@ -368,7 +345,6 @@ def _resolve_gen_kwargs(gen_kwargs: dict[str, Any], default_max_new_tokens: int)
     max_new_tokens = default_max_new_tokens if mnt is None else int(mnt)
     temp = gen_kwargs.get("temperature")
     temperature = 0.0 if temp is None else float(temp)
-    # An explicit do_sample=False forces greedy even if a temperature is given.
     if not gen_kwargs.get("do_sample", temperature > 0):
         temperature = 0.0
 
@@ -377,7 +353,6 @@ def _resolve_gen_kwargs(gen_kwargs: dict[str, Any], default_max_new_tokens: int)
     top_p = gen_kwargs.get("top_p")
     top_p = 1.0 if top_p is None else float(top_p)
 
-    # Treat undefined `top_p` as diasbled
     if top_p <= 0:
         top_p = 1.0
     return {
@@ -436,9 +411,6 @@ def _generate_batch(
     device = pixel_values.device
     batch_size = len(prompt_ids)
 
-    # Length bound: image tokens (in-residual for JD/MoT; 0 for CA) + prompt +
-    # generated must fit the context. Reserve room for generation and left-
-    # truncate any over-budget prompt (per row).
     num_image_tokens = model.num_image_tokens
     prompt_budget = max_seq_len - num_image_tokens - max_new_tokens
     if prompt_budget <= 0:
@@ -462,7 +434,6 @@ def _generate_batch(
     row_index = torch.arange(batch_size, device=device)
 
     for _ in range(max_new_tokens):
-        # Rebuild the right-padded batch from prompt + tokens generated so far.
         seqs = [
             torch.cat([prompts[i], torch.tensor(generated[i], dtype=torch.long, device=device)])
             for i in range(batch_size)
@@ -474,9 +445,6 @@ def _generate_batch(
             input_ids[i, : s.shape[0]] = s
 
         logits, _ = model(pixel_values, input_ids, frame_mask=frame_mask)
-        # Each row's next-token logits sit at its own last real position (the
-        # output is already trimmed to text positions for JD/MoT; CA has no
-        # image prefix), not at [-1] (a pad for shorter rows).
         next_logits = logits[row_index, real_len - 1]
         next_tokens = sample(next_logits, temperature, top_k, top_p)
 
@@ -503,11 +471,6 @@ def _generate_batch(
         cut = _first_stop(text, until)
         outputs.append(text[:cut] if cut is not None else text)
     return outputs
-
-
-# --------------------------------------------------------------------------- #
-# Adapter
-# --------------------------------------------------------------------------- #
 
 
 class KempnerForgeVLM(lmms):
@@ -551,18 +514,11 @@ class KempnerForgeVLM(lmms):
         if self._default_max_new_tokens < 1:
             raise ValueError(f"max_new_tokens must be >= 1, got {self._default_max_new_tokens}")
         self._config = _load_config(config)
-        assert self._config.vlm is not None  # guaranteed by is_vlm; narrows for the type checker
-        # Default the compute dtype to what the checkpoint was trained at
-        # (config.train.param_dtype) unless an explicit dtype was passed.
+        assert self._config.vlm is not None
         self._dtype = self._config.train.param_dtype if dtype is None else _resolve_dtype(dtype)
         self._arch = self._config.vlm.arch
-        # Fail fast on non-generative arches before building/loading the model.
         _check_generative(self._config.vlm)
 
-        # Video vs image mode is a property of the checkpoint's config. A video
-        # checkpoint ([video] config) fixes frames_per_clip and resizes frames to
-        # config.video.frame_size; an image checkpoint is a 1-frame clip at
-        # config.data.hf_image_size.
         self._is_video = self._config.is_video
         if self._config.video is not None:
             self._frames_per_clip = self._config.video.max_frames
@@ -581,52 +537,33 @@ class KempnerForgeVLM(lmms):
         )
 
     def generate_until(self, requests: list[Instance]) -> list[str]:
-        # Group requests by gen_kwargs (a batch must share decode params) and,
-        # within a group, sort by context length so similar-length prompts batch
-        # together (less padding). Collator.get_original restores request order.
         def _collate(args: tuple[Any, ...]) -> int:
             return -len(args[0]) if isinstance(args[0], str) else 0
 
         re_ords = Collator(
             [request.args for request in requests],
             _collate,
-            group_fn=lambda args: args[2],  # args[2] == gen_kwargs
+            group_fn=lambda args: args[2],
             grouping=True,
         )
         results: list[str] = []
         pbar = tqdm(total=len(requests), disable=(self.rank != 0), desc="KempnerForge VLM")
         for chunk in re_ords.get_batched(n=self._batch_size, batch_fn=None):
-            # Every request in the chunk shares gen_kwargs (index 2); resolve once.
             resolved = _resolve_gen_kwargs(chunk[0][2], self._default_max_new_tokens)
-            # Per-request slots aligned to ``chunk``: ``None`` = filled by generation
-            # below; ``""`` = a request that failed to render/preprocess, isolated
-            # with a warning so one bad doc does not abort the whole run.
             chunk_outputs: list[str | None] = [None] * len(chunk)
             frames_batch: list[torch.Tensor] = []
             masks_batch: list[torch.Tensor] = []
             prompt_ids: list[torch.Tensor] = []
             for slot, args in enumerate(chunk):
                 try:
-                    # Chat 6-tuple: (context, doc_to_messages, gen_kwargs, doc_id, task, split).
                     doc = self.task_dict[args[4]][args[5]][args[3]]
                     messages = ChatMessages(messages=args[1](doc))
                     frames, prompt = _render_request(messages, self._config.video)
-                    # lmms-eval may deliver image content as a path/URL string;
-                    # normalize to PIL so both the image and video packers (strict
-                    # pil_to_tensor) accept it.
                     frames = [_to_pil(f) for f in frames]
-                    # Mirror training tokenization: no chat template, no <image>
-                    # placeholder, add_special_tokens=False (images go via pixel_values).
                     token_ids = self._tokenizer(prompt, add_special_tokens=False)["input_ids"]
                     if not token_ids:
-                        # No text to condition on. Image-prefix positions are trained
-                        # with -100 labels (and trimmed by output_slice), so there is
-                        # no valid position to predict an image-only first token.
                         raise ValueError("empty prompt after flattening (no text content)")
                     if self._is_video:
-                        # Fixed (frames_per_clip, 3, H, W) clip + per-frame validity
-                        # mask, zero-padded — identical to training. The mask hides
-                        # padded-frame visual tokens from attention.
                         clip, fmask = frames_to_clip_tensor(
                             frames, max_frames=self._frames_per_clip, frame_size=self._frame_size
                         )
@@ -639,25 +576,18 @@ class KempnerForgeVLM(lmms):
                         mask = None
                     prompt_tensor = torch.tensor(token_ids, dtype=torch.long, device=self._device)
                 except Exception as exc:
-                    # Isolate a bad request (unsupported content, decode failure, empty
-                    # prompt, ...) so the remaining requests still score.
                     logger.warning(
                         f"Skipping request (task={args[4]}, doc_id={args[3]}): "
                         f"{type(exc).__name__}: {exc}"
                     )
                     chunk_outputs[slot] = ""
                     continue
-                # Commit atomically: only reached when every step above succeeded, so a
-                # mid-request failure never leaves a partial entry in these lists.
                 frames_batch.append(pixels)
                 if mask is not None:
                     masks_batch.append(mask)
                 prompt_ids.append(prompt_tensor)
 
             if prompt_ids:
-                # Video: (B, F, 3, H, W) via stack (each request is one F-frame clip),
-                # with a (B, F) frame mask. Image: (B, 3, H, W) via cat. cat on video
-                # would fold frames into the batch and trip the frames-per-clip check.
                 if self._is_video:
                     pixel_values = torch.stack(frames_batch, dim=0)
                     frame_mask = torch.stack(masks_batch, dim=0)
@@ -675,16 +605,12 @@ class KempnerForgeVLM(lmms):
                         frame_mask=frame_mask,
                     )
                 except _ContextBudgetError as exc:
-                    # One task's gen_kwargs over-budgets the context; skip its requests
-                    # (they all share gen_kwargs) rather than aborting the whole run.
                     logger.warning(
                         f"Skipping {len(prompt_ids)} request(s) for task {chunk[0][4]}: {exc}"
                     )
                     gen_outputs = [""] * len(prompt_ids)
             else:
                 gen_outputs = []
-            # Scatter generated continuations back into the surviving (None) slots,
-            # preserving alignment with ``chunk`` (skipped slots keep their "").
             gen_iter = iter(gen_outputs)
             outputs = [o if o is not None else next(gen_iter) for o in chunk_outputs]
             for args, output in zip(chunk, outputs, strict=True):

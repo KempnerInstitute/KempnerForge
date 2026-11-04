@@ -116,12 +116,10 @@ class TestEPForward:
         model = Transformer(EP_CONFIG).cuda()
         apply_expert_parallel(model, ep_only_mesh)
 
-        # Use enough tokens to distribute across experts
         tokens = torch.randint(0, 512, (2, 32), device="cuda")
         with torch.no_grad():
             model(tokens)
 
-        # At least one MoE layer should have non-zero expert counts
         has_counts = False
         for layer in model.layers.values():
             if isinstance(layer.mlp, MoEMLP):
@@ -137,7 +135,7 @@ class TestEPMatchesLocalDispatch:
     @pytest.mark.parametrize("config", [EP_CONFIG, EP_CONFIG_PACKED], ids=["unpacked", "packed"])
     def test_ep_output_matches_single_rank(self, ep_only_mesh, config):
         torch.manual_seed(0)
-        reference = Transformer(config).cuda().to(torch.bfloat16)  # bf16 takes the grouped path
+        reference = Transformer(config).cuda().to(torch.bfloat16)
         model = copy.deepcopy(reference)
         apply_expert_parallel(model, ep_only_mesh)
 
@@ -203,7 +201,6 @@ class TestEPPlusFSDP:
         loss_val = loss.detach().clone()
         all_losses = [torch.zeros_like(loss_val) for _ in range(world_size)]
         dist.all_gather(all_losses, loss_val)
-        # All losses should be finite
         for i, v in enumerate(all_losses):
             assert torch.isfinite(v), f"Rank {i} loss not finite: {v.item()}"
 
@@ -223,7 +220,7 @@ class TestEPPacked:
             if isinstance(layer.mlp, MoEMLP):
                 assert layer.mlp.up_w.shape[0] == experts_per_rank
                 assert layer.mlp.down_w.shape[0] == experts_per_rank
-                assert layer.mlp.gate_w.shape[0] == experts_per_rank  # SwiGLU
+                assert layer.mlp.gate_w.shape[0] == experts_per_rank
                 assert isinstance(layer.mlp.up_w, torch.nn.Parameter)
                 assert isinstance(layer.mlp.down_w, torch.nn.Parameter)
                 assert isinstance(layer.mlp.gate_w, torch.nn.Parameter)

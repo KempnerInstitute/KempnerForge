@@ -63,6 +63,8 @@ if resume_path or config.checkpoint.load_path:
     )
     if ckpt_extra_loaded.get("wandb_run_id"):
         config.metrics.wandb_run_id = ckpt_extra_loaded["wandb_run_id"]
+    if ckpt_extra_loaded.get("mlflow_run_id"):
+        config.metrics.mlflow_run_id = ckpt_extra_loaded["mlflow_run_id"]
 ```
 
 So two things can trigger a resume:
@@ -107,30 +109,54 @@ Two details that matter:
 
 The symlink is updated **after** the DCP save completes (async save
 futures are resolved before the next save starts), so `latest` only
-ever points at a fully-flushed checkpoint.
+ever points at a fully-flushed checkpoint. Under pipeline parallelism
+each stage saves through its own process group, so every rank first
+waits at a barrier until every stage's save has completed; only then
+does rank 0 move `latest` and prune.
+
+A save that fails on any rank (a DCP write or async flush, or rank 0's
+`train_state.pt`, `metadata.json` or move of `latest`) fails on every
+rank, and `latest` never points at it. The barriers that end `save()`,
+`wait()` and `flush_pending_save()` carry each rank's outcome: a rank
+whose own part failed raises that error, and every other rank raises a
+`RuntimeError` naming the ranks that failed, so no rank is left waiting
+for one that has already raised. Pruning runs only once `latest` has
+moved, so an error while pruning fails no rank (see
+[Retention cleanup](#retention-cleanup)).
 
 ## Retention cleanup
 
-After updating the symlink, `CheckpointManager._cleanup()` trims the
-oldest checkpoints beyond `config.checkpoint.keep_last_n`:
+After updating the symlink, `CheckpointManager._cleanup()` keeps the
+`config.checkpoint.keep_last_n` highest-numbered `step_*` directories
+and removes the older ones, except two kinds it never removes:
 
-```python
-ckpt_dirs = sorted((d for d in self.base_dir.iterdir()
-                    if d.is_dir() and d.name.startswith("step_")),
-                   key=lambda d: int(d.name.split("_")[1]))
-to_remove = ckpt_dirs[:-keep] if len(ckpt_dirs) > keep else []
-for d in to_remove:
-    shutil.rmtree(d)
-```
+- the checkpoint `latest` points at;
+- every `dyn_ckpt_window` milestone, so the dense early checkpoints
+  survive a finite `keep_last_n`.
 
-Default `keep_last_n = 3`. The `latest` symlink always points at the
-newest, never at one scheduled for removal. If you want to keep
-everything, set `keep_last_n` to a large number — there's no
-"disable cleanup" flag (and the `__post_init__` check requires
-`keep_last_n >= 1`).
+Nothing else is protected. An async save's directory survives while its
+flush runs only because it is normally the newest. When newer `step_*`
+directories are present, as after the manual rewind below, retention
+can delete it mid-save: the save fails, or the checkpoint is left
+without its shards.
+
+Default `keep_last_n = 3`. Set `keep_last_n = 0`, or any value `<= 0`,
+to keep every checkpoint: cleanup then removes nothing.
+
+A checkpoint it cannot remove is logged as a warning and left for the
+next cleanup to retry; on NFS a file closed a moment earlier can leave
+a `.nfs*` placeholder that makes the removal fail. Any other error
+while pruning is logged the same way: cleanup runs after `latest` has
+moved, so the checkpoint is already committed and the save still
+succeeds on every rank.
 
 ## Edge cases
 
+- **A rank wedged in the train-state broadcast**: PyTorch's
+  `broadcast_object_list` takes no `async_op`, so this call carries no
+  per-operation timeout and inherits the process group's 1800 s default.
+  A wedged rank still surfaces, just later than the other fast-fail
+  paths in resume.
 - **Empty checkpoint directory** — `resolve_resume_path` returns
   `None`, training starts from step 0. No error.
 - **`latest` symlink points at a removed directory** — the resolver
@@ -163,6 +189,12 @@ rm latest
 ln -s step_5000 latest
 ```
 
+Move the abandoned `step_*` directories newer than step 5000 out of
+`checkpoints/` as well. Retention counts them among the newest, so they
+take the `keep_last_n` places of the rerun's own checkpoints, and with
+an async `async_mode` it can delete a directory a new save is still
+writing.
+
 Or override explicitly:
 
 ```toml
@@ -180,7 +212,7 @@ Auto-resume pairs with the SLURM preemption handler in
 [`kempnerforge/resilience/`](../resilience/index.md):
 
 1. SLURM sends `SIGTERM` on preemption.
-2. `SignalHandler` flags shutdown; the training loop finishes the
+2. `ShutdownHandler` flags shutdown; the training loop finishes the
    current step and saves an emergency checkpoint.
 3. `ckpt_mgr.wait()` flushes any async save before `destroy_distributed()`.
 4. SLURM requeues the job.

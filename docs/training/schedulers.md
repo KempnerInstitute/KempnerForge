@@ -9,13 +9,20 @@ the optimizer's base LR by a schedule-dependent factor at each
 
 ## Shared warmup
 
-Every schedule (except `"none"`) warms up linearly from `0` to `1.0`
-over `warmup_steps`. The helper is
+Every schedule (except `"none"`) warms up linearly from
+`warmup_start_factor` (default `0`) to `1.0` over `warmup_steps`. The
+helper is
 
 ```python
-def _warmup_factor(step, warmup_steps):
-    return min(1.0, step / warmup_steps)
+def _warmup_factor(step, warmup_steps, start_factor=0.0):
+    return start_factor + (1.0 - start_factor) * min(1.0, step / warmup_steps)
 ```
+
+`warmup_start_factor` is torch `LinearLR`'s `start_factor`: a non-zero
+value takes the first step at `base_lr * warmup_start_factor` rather
+than at zero. With it, `cosine` reproduces torch's
+`SequentialLR([LinearLR(start_factor), CosineAnnealingLR(...)])` step
+for step.
 
 So all the fields below describe the **decay** phase, after warmup
 completes.

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-import kempnerforge.model.vision  # noqa: F401  -- register encoder types
+import kempnerforge.model.vision  # noqa: F401
 from kempnerforge.config.registry import registry
 from kempnerforge.config.vision import VisionEncoderConfig
 

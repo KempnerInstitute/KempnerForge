@@ -17,6 +17,7 @@ import torch.distributed as dist
 
 from kempnerforge.checkpoint import manager as mgr_mod
 from kempnerforge.checkpoint.manager import CheckpointManager
+from kempnerforge.config.registry import registry
 from kempnerforge.config.schema import AsyncCheckpointMode, CheckpointConfig, ModelConfig
 from kempnerforge.distributed.parallel import apply_fsdp2
 from kempnerforge.model.transformer import Transformer
@@ -28,8 +29,19 @@ pytestmark = pytest.mark.skipif(
 )
 
 SMALL_CONFIG = ModelConfig(dim=128, n_layers=2, n_heads=2, vocab_size=512, max_seq_len=64)
+REGISTERED_OPTIMIZERS = sorted(registry.list("optimizer"))
+RESUMABLE_OPTIMIZERS = [
+    pytest.param(
+        name,
+        marks=pytest.mark.xfail(
+            raises=ZeroDivisionError, strict=True, reason="#236: schedule_free_adamw cannot resume"
+        ),
+    )
+    if name == "schedule_free_adamw"
+    else name
+    for name in REGISTERED_OPTIMIZERS
+]
 
-# Shared filesystem temp directory (visible to all nodes)
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _TEST_TMP = _PROJECT_ROOT / ".test_tmp"
 
@@ -38,7 +50,6 @@ _TEST_TMP = _PROJECT_ROOT / ".test_tmp"
 def shared_tmp_dir():
     """Create a temp directory on the shared filesystem, cleaned up after use."""
     rank = dist.get_rank()
-    # Rank 0 creates, then broadcasts path
     if rank == 0:
         _TEST_TMP.mkdir(exist_ok=True)
         import tempfile
@@ -55,13 +66,33 @@ def shared_tmp_dir():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def _assert_same_local_state_dict(expected, actual, where="state_dict"):
+    """Assert two optimizer ``state_dict()``s hold the same values, local shards bit for bit."""
+    from torch.distributed.tensor import DTensor
+
+    if isinstance(expected, torch.Tensor):
+        assert isinstance(actual, torch.Tensor), where
+        if isinstance(expected, DTensor):
+            expected, actual = expected.to_local(), actual.to_local()
+        assert torch.equal(expected, actual), where
+    elif isinstance(expected, dict):
+        assert expected.keys() == actual.keys(), f"{where}: keys {set(expected) ^ set(actual)}"
+        for key in expected:
+            _assert_same_local_state_dict(expected[key], actual[key], f"{where}[{key!r}]")
+    elif isinstance(expected, list | tuple):
+        assert len(expected) == len(actual), f"{where}: lengths differ"
+        for i, (e, a) in enumerate(zip(expected, actual, strict=True)):
+            _assert_same_local_state_dict(e, a, f"{where}[{i}]")
+    else:
+        assert expected == actual, f"{where}: {expected!r} != {actual!r}"
+
+
 class TestCheckpointRoundTrip:
     def test_save_load_fsdp(self, distributed_env, shared_tmp_dir):
         """Save and load under FSDP — model output should be identical."""
         mesh = distributed_env
         ckpt_dir = shared_tmp_dir
 
-        # Build model + FSDP
         torch.manual_seed(42)
         model = Transformer(SMALL_CONFIG).cuda()
         apply_fsdp2(model, mesh)
@@ -69,36 +100,29 @@ class TestCheckpointRoundTrip:
 
         opt = build_optimizer(model, OptimizerConfig(lr=1e-3, fused=False))
 
-        # Do a forward + backward to get non-trivial optimizer state
         tokens = torch.randint(0, 512, (2, 32), device="cuda")
         out = model(tokens)
         out.sum().backward()
         opt.step()
         opt.zero_grad()
 
-        # Capture reference output
         with torch.no_grad():
             ref_out = model(tokens).clone()
 
-        # Save
         config = CheckpointConfig(dir=ckpt_dir, keep_last_n=2)
         mgr = CheckpointManager(config, model, opt)
         mgr.save(step=1, tokens_seen=64)
 
-        # Perturb model to verify load actually restores
         with torch.no_grad():
             for p in model.parameters():
                 p.add_(torch.randn_like(p) * 0.1)
 
-        # Verify output changed
         with torch.no_grad():
             perturbed_out = model(tokens)
         assert not torch.allclose(ref_out, perturbed_out, atol=1e-3)
 
-        # Load
         mgr.load()
 
-        # Verify output matches reference
         with torch.no_grad():
             restored_out = model(tokens)
         assert torch.allclose(ref_out, restored_out, atol=1e-5), (
@@ -132,7 +156,6 @@ class TestCheckpointRoundTrip:
                         )
             return out
 
-        # Build, step a few times so the moments are non-trivial, then save.
         torch.manual_seed(42)
         model = Transformer(SMALL_CONFIG).cuda()
         apply_fsdp2(model, mesh)
@@ -153,8 +176,6 @@ class TestCheckpointRoundTrip:
             step=3, tokens_seen=192
         )
 
-        # FRESH model + FRESH optimizer (never stepped -> empty optimizer state),
-        # exactly the resume scenario. Then load.
         torch.manual_seed(42)
         model2 = Transformer(SMALL_CONFIG).cuda()
         apply_fsdp2(model2, mesh)
@@ -183,7 +204,7 @@ class TestCheckpointRoundTrip:
         def build(seed):
             torch.manual_seed(seed)
             model = Transformer(SMALL_CONFIG).cuda()
-            model.unused = torch.nn.Linear(128, 128).cuda()  # never in the forward
+            model.unused = torch.nn.Linear(128, 128).cuda()
             apply_fsdp2(model, distributed_env)
             return model, build_optimizer(model, OptimizerConfig(lr=1e-3, fused=False))
 
@@ -208,6 +229,140 @@ class TestCheckpointRoundTrip:
             assert bool(state2) is not name.startswith("unused."), name
             for key in state:
                 assert torch.equal(local(state[key]), local(state2[key])), f"{name}.{key}"
+
+    def test_muon_resume_restores_inner_adamw_state(self, distributed_env, shared_tmp_dir):
+        """Muon's inner AdamW must be restored into a FRESH optimizer too."""
+        from kempnerforge.config.schema import OptimizerConfig
+
+        mesh = distributed_env
+        config = ModelConfig(dim=128, n_layers=2, n_heads=2, vocab_size=2048, max_seq_len=64)
+
+        def build():
+            torch.manual_seed(42)
+            model = Transformer(config).cuda()
+            apply_fsdp2(model, mesh)
+            return model, build_optimizer(model, OptimizerConfig(name="muon", lr=1e-3))
+
+        def snapshot(optimizer):
+            """Per-rank (sharded) clones of every state entry, in param order."""
+            return [
+                (name, value.detach().clone())
+                for group in optimizer.param_groups
+                for p in group["params"]
+                for name, value in sorted(optimizer.state.get(p, {}).items())
+            ]
+
+        model, opt = build()
+        inner_shapes = {tuple(p.shape) for g in opt._adam.param_groups for p in g["params"]}
+        assert (2048, 128) in inner_shapes, "the embedding should be on the inner AdamW"
+        for _ in range(3):
+            tokens = torch.randint(0, config.vocab_size, (2, 32), device="cuda")
+            model(tokens).sum().backward()
+            opt.step()
+            opt.zero_grad()
+        refs = {"Muon": snapshot(opt), "inner AdamW": snapshot(opt._adam)}
+        assert all(refs.values()), "optimizer had no state to test"
+
+        CheckpointManager(CheckpointConfig(dir=shared_tmp_dir, keep_last_n=2), model, opt).save(
+            step=3, tokens_seen=192
+        )
+
+        model2, opt2 = build()
+        assert not snapshot(opt2._adam), "fresh inner AdamW should have empty state before load"
+        CheckpointManager(CheckpointConfig(dir=shared_tmp_dir, keep_last_n=2), model2, opt2).load()
+
+        loaded = {"Muon": snapshot(opt2), "inner AdamW": snapshot(opt2._adam)}
+        for what, ref in refs.items():
+            assert [n for n, _ in loaded[what]] == [n for n, _ in ref], f"{what} not restored"
+            for (name, r), (_, t) in zip(ref, loaded[what], strict=True):
+                assert torch.equal(r, t), f"{what} {name} not restored bit-exactly"
+
+    @pytest.mark.parametrize("name", REGISTERED_OPTIMIZERS)
+    def test_save_before_the_first_step_leaves_the_run_unchanged(
+        self, distributed_env, shared_tmp_dir, name
+    ):
+        """A sharded step-0 save and its resume must train like a run that never saved."""
+        from torch.distributed.tensor import DTensor
+
+        from kempnerforge.config.schema import OptimizerConfig
+
+        def build():
+            torch.manual_seed(42)
+            model = Transformer(SMALL_CONFIG).cuda()
+            apply_fsdp2(model, distributed_env)
+            return model, build_optimizer(model, OptimizerConfig(name=name, lr=1e-3))
+
+        def train(model, opt):
+            gen = torch.Generator(device="cuda").manual_seed(7 + dist.get_rank())
+            for _ in range(3):
+                tokens = torch.randint(0, 512, (2, 32), device="cuda", generator=gen)
+                model(tokens).sum().backward()
+                opt.step()
+                opt.zero_grad()
+            return [
+                (p.to_local() if isinstance(p, DTensor) else p).detach().clone()
+                for p in model.parameters()
+            ]
+
+        reference = train(*build())
+
+        config = CheckpointConfig(dir=shared_tmp_dir, keep_last_n=2)
+        model, opt = build()
+        manager = CheckpointManager(config, model, opt)
+        manager.save(step=0)
+        assert not any(o.state for o in manager.checkpointed_optimizers), (
+            "the save left the getter's dummy state in an optimizer"
+        )
+        saved = train(model, opt)
+
+        model2, opt2 = build()
+        CheckpointManager(config, model2, opt2).load()
+        resumed = train(model2, opt2)
+
+        for ref, a, b in zip(reference, saved, resumed, strict=True):
+            assert torch.equal(ref, a), "saving at step 0 changed the run"
+            assert torch.equal(ref, b), "resuming from the step-0 checkpoint changed the run"
+
+    @pytest.mark.parametrize("name", RESUMABLE_OPTIMIZERS)
+    def test_resume_restores_the_optimizer_exactly(self, distributed_env, shared_tmp_dir, name):
+        """FSDP2 resume restores the optimizer state bit for bit and continues the run exactly."""
+        from torch.distributed.tensor import DTensor
+
+        from kempnerforge.config.schema import OptimizerConfig
+
+        def build(seed):
+            torch.manual_seed(seed)
+            model = Transformer(SMALL_CONFIG).cuda()
+            apply_fsdp2(model, distributed_env)
+            return model, build_optimizer(model, OptimizerConfig(name=name, lr=1e-3))
+
+        def train(model, opt, segment):
+            for tokens in segment:
+                model(tokens).sum().backward()
+                opt.step()
+                opt.zero_grad()
+
+        def local_params(model):
+            return [p.to_local() if isinstance(p, DTensor) else p for p in model.parameters()]
+
+        gen = torch.Generator(device="cuda").manual_seed(7 + dist.get_rank())
+        batches = [torch.randint(0, 512, (2, 32), device="cuda", generator=gen) for _ in range(4)]
+        reference, ref_opt = build(seed=42)
+        train(reference, ref_opt, batches)
+
+        config = CheckpointConfig(dir=shared_tmp_dir, keep_last_n=2)
+        model, opt = build(seed=42)
+        train(model, opt, batches[:2])
+        CheckpointManager(config, model, opt).save(step=2)
+
+        model2, opt2 = build(seed=7)
+        CheckpointManager(config, model2, opt2).load()
+        _assert_same_local_state_dict(opt.state_dict(), opt2.state_dict(), "after the load")
+        train(model2, opt2, batches[2:])
+
+        _assert_same_local_state_dict(ref_opt.state_dict(), opt2.state_dict())
+        for ref, p in zip(local_params(reference), local_params(model2), strict=True):
+            assert torch.equal(ref, p), "the resumed run diverged from the uninterrupted one"
 
     def test_latest_symlink(self, distributed_env, shared_tmp_dir):
         """The 'latest' symlink should point to the most recent checkpoint."""
@@ -262,21 +417,17 @@ class TestCheckpointSaveBarrier:
                 time.sleep(sleep_sec)
             return real_torch_save(*args, **kwargs)
 
-        # Barrier before timing so all ranks start save() at roughly the
-        # same instant; isolates the signal we care about.
         dist.barrier()
         t0 = time.perf_counter()
         with patch.object(mgr_mod.torch, "save", side_effect=slow_on_rank0):
             mgr.save(step=1, tokens_seen=100)
         elapsed = time.perf_counter() - t0
 
-        # Every rank must have waited for rank-0's slow write.
         assert elapsed >= 0.4 * sleep_sec, (
             f"rank {rank}: save() returned after {elapsed:.3f}s — the "
             f"end-of-save barrier is missing. Expected >= {0.4 * sleep_sec:.3f}s."
         )
 
-        # And every rank observes rank-0's writes afterwards.
         step_dir = Path(ckpt_dir) / "step_1"
         assert (step_dir / "train_state.pt").exists(), (
             f"rank {rank}: train_state.pt not visible after save()"
@@ -284,6 +435,25 @@ class TestCheckpointSaveBarrier:
         assert (step_dir / "metadata.json").exists(), (
             f"rank {rank}: metadata.json not visible after save()"
         )
+
+    def test_a_failed_cleanup_does_not_hang_save(self, distributed_env, shared_tmp_dir):
+        """A checkpoint rank 0 cannot remove must not stop the save the other ranks wait on."""
+        import errno
+
+        from kempnerforge.config.schema import OptimizerConfig
+
+        model = Transformer(SMALL_CONFIG).cuda()
+        apply_fsdp2(model, distributed_env)
+        opt = build_optimizer(model, OptimizerConfig(lr=1e-3, fused=False))
+        mgr = CheckpointManager(CheckpointConfig(dir=shared_tmp_dir, keep_last_n=1), model, opt)
+
+        busy = OSError(errno.ENOTEMPTY, "Directory not empty")
+        with patch.object(mgr_mod.shutil, "rmtree", side_effect=busy):
+            mgr.save(step=1)
+            mgr.save(step=2)
+
+        if dist.get_rank() == 0:
+            assert (Path(shared_tmp_dir) / "step_1").is_dir(), "the failed removal deleted step_1"
 
 
 class TestCheckpointLoadDivergentExistence:
@@ -308,13 +478,9 @@ class TestCheckpointLoadDivergentExistence:
         cfg = CheckpointConfig(dir=ckpt_dir, keep_last_n=2)
         mgr = CheckpointManager(cfg, model, opt)
 
-        # Save so there's something to load.
         mgr.save(step=1, tokens_seen=100)
         dist.barrier()
 
-        # Patch exists() so non-rank-0 sees the file as missing. Without
-        # the authoritative broadcast, non-rank-0 skips torch.load but
-        # rank 0 enters and calls broadcast_object_list — deadlock.
         real_exists = Path.exists
 
         def skewed_exists(self):
@@ -322,11 +488,6 @@ class TestCheckpointLoadDivergentExistence:
                 return False
             return real_exists(self)
 
-        # Wrap in a timeout via a CUDA event + sleep loop would be ideal;
-        # simpler: rely on the PG default timeout to surface a deadlock as
-        # a RuntimeError rather than blocking the test runner forever.
-        # With the fix, load() completes promptly; without, the test hangs
-        # until the PG timeout fires.
         with patch.object(Path, "exists", skewed_exists):
             step, tokens_seen, _ = mgr.load()
 
@@ -364,26 +525,14 @@ class TestAsyncCheckpointLatestSafety:
 
         latest = Path(ckpt_dir) / "latest"
 
-        # Mirror the real training loop exactly: periodic save() calls, then
-        # a single wait() after the loop (training/loop.py::run_training_loop).
-        # NO barriers are injected between/after save() here — a mid-flush collective on
-        # the default PG races DCP's own async-executor collective thread,
-        # an unrelated pre-existing hazard that has nothing to do with the
-        # `latest` symlink fix under test.
         for s in (10, 20, 30, 40):
             mgr.save(step=s)
-            # Rank-0 local check only (no collective): whenever `latest`
-            # resolves, it MUST be a durable checkpoint. Pre-fix it pointed
-            # at the in-flight step whose DCP `.metadata` did not exist yet.
             if rank == 0 and latest.exists():
                 target = latest.resolve()
                 assert (target / ".metadata").exists(), (
                     f"after save({s}): latest -> {target} has no DCP .metadata"
                 )
 
-        # Final drain (the training loop calls wait() after the loop); this
-        # commits the last deferred checkpoint. wait() ends with its own
-        # barrier, so all ranks resync here.
         mgr.wait()
         if rank == 0:
             assert latest.exists(), "latest missing after wait()"
@@ -391,9 +540,6 @@ class TestAsyncCheckpointLatestSafety:
             assert target.name == "step_40", f"latest -> {target.name}, want step_40"
             assert (target / ".metadata").exists(), "final latest not durable"
 
-        # No async flush is in flight after wait(), so this barrier cannot
-        # race a DCP collective; it just re-syncs before the collective
-        # load() (rank 0 did extra local fs asserts above).
         dist.barrier()
         step, tokens_seen, _ = mgr.load()
         assert step == 40, f"rank {rank}: resumed at step {step}, want 40"
@@ -414,13 +560,9 @@ class TestAsyncCheckpointLatestSafety:
         cfg = CheckpointConfig(dir=ckpt_dir, keep_last_n=5)
         mgr = CheckpointManager(cfg, model, opt)
 
-        # A real, complete checkpoint at step 1 (sync save -> durable).
         mgr.save(step=1, tokens_seen=64)
         dist.barrier()
 
-        # Simulate an interrupted async flush at step 2: rank 0 fabricates
-        # a step_2 dir with train_state/metadata but NO DCP `.metadata`,
-        # and repoints `latest` at it (exactly the crash-mid-flush state).
         if rank == 0:
             step2 = Path(ckpt_dir) / "step_2"
             step2.mkdir(parents=True, exist_ok=True)
@@ -433,7 +575,6 @@ class TestAsyncCheckpointLatestSafety:
             tmp.rename(link)
         dist.barrier()
 
-        # Resume must fall back to the durable step_1, not crash on step_2.
         step, tokens_seen, _ = mgr.load()
         assert step == 1, f"rank {rank}: expected fallback to step 1, got {step}"
         assert tokens_seen == 64
@@ -467,9 +608,6 @@ class TestAsyncSaveBarrierNoDeadlock:
         )
         mgr = CheckpointManager(cfg, model, opt)
 
-        # Tight loop, no training collectives between saves: the exact
-        # pattern that deadlocks pre-fix. Reaching the asserts at all means
-        # the gloo barrier did not race the in-flight DCP collective.
         for s in (10, 20, 30, 40):
             mgr.save(step=s)
         mgr.wait()
