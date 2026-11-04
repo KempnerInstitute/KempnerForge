@@ -216,9 +216,9 @@ class Attention(nn.Module):
             )
             seq_len_kv = k.shape[2]
             causal = torch.ones(seq_len, seq_len_kv, dtype=torch.bool, device=q.device).tril()
-            attn_mask = causal.unsqueeze(0).unsqueeze(0)  # (1, 1, S, S_kv)
+            attn_mask = causal.unsqueeze(0).unsqueeze(0)
             if attention_group_ids is not None:
-                attn_mask = attn_mask | same_group_mask(attention_group_ids)  # (B,1,S,S)
+                attn_mask = attn_mask | same_group_mask(attention_group_ids)
             if doc_ids is not None:
                 doc_mask = (doc_ids.unsqueeze(2) == doc_ids.unsqueeze(1)).unsqueeze(1)
                 attn_mask = attn_mask & doc_mask
@@ -264,7 +264,7 @@ class Attention(nn.Module):
         seq_len_kv = k.shape[2]
         if doc_ids is not None or key_padding_mask is not None or attention_group_ids is not None:
             causal = torch.ones(seq_len, seq_len_kv, dtype=torch.bool, device=q.device).tril()
-            valid = causal.unsqueeze(0).unsqueeze(0)  # (1, 1, S, S_kv)
+            valid = causal.unsqueeze(0).unsqueeze(0)
             if attention_group_ids is not None:
                 valid = valid | same_group_mask(attention_group_ids)
             if doc_ids is not None:

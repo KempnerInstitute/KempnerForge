@@ -387,10 +387,8 @@ class Transformer(nn.Module):
                 raise ValueError(
                     "attention_group_ids is not supported on the MoMa/MoT residual paths"
                 )
-            # Residual = prefix + text, taken from the input shapes so a bad
-            # shape fires before the embedding or any other compute.
             text = tokens if tokens is not None else inputs_embeds
-            assert text is not None  # narrowed by the XOR check above
+            assert text is not None
             n_prefix = prefix_embeds.shape[1] if prefix_embeds is not None else 0
             residual_shape = (text.shape[0], n_prefix + text.shape[1])
             if tuple(attention_group_ids.shape) != residual_shape:
@@ -434,7 +432,7 @@ class Transformer(nn.Module):
                     "supported for arches that prepend image tokens to the residual stream."
                 )
             if doc_ids is None:
-                assert attention_group_ids is not None  # narrowed by the branch condition
+                assert attention_group_ids is not None
                 doc_ids = torch.zeros_like(attention_group_ids)
             block_mask = build_doc_causal_block_mask(doc_ids, h.device, attention_group_ids)
             doc_ids = None

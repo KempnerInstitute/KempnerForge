@@ -255,15 +255,18 @@ class TestFlexGroups:
 
         Six documents with block-unaligned boundaries, a pad tail under its own
         sentinel document id, and group ids 0 and 1 reused in every document at
-        unaligned offsets. Forward and backward parity, then exact isolation and
-        visibility checks on the flex model. Measured on H200: logits 5.9e-7 and
-        gradients 8.6e-7 of full scale at worst.
+        unaligned offsets. Forward and backward parity, then on the flex model:
+        moving document 1 leaves every other document and the pad tail untouched,
+        a late group-0 member reaches the group's first member but not the tokens
+        ahead of it, and a group-1 member reaches group 1's first member and not
+        group 0 before it. Measured on H200: logits 5.9e-7 and gradients 8.6e-7
+        of full scale at worst.
         """
         if not torch.cuda.is_available():
             pytest.skip("CUDA required")
 
         seq = 16384
-        bounds = [0, 1000, 3333, 6000, 9001, 12345, 16000, seq]  # last span: pad tail
+        bounds = [0, 1000, 3333, 6000, 9001, 12345, 16000, seq]
         doc_row = torch.empty(seq, dtype=torch.long)
         group_row = torch.full((seq,), -1, dtype=torch.long)
         for d, (lo, hi) in enumerate(zip(bounds[:-1], bounds[1:], strict=True)):
@@ -298,16 +301,12 @@ class TestFlexGroups:
 
         with torch.no_grad():
             base = flex(tokens, doc_ids=doc_ids, attention_group_ids=group_ids)[0]
-        # Document 1 moves; every other document, and the pad tail, does not.
         out = moved_at(slice(1000, 3333))
         torch.testing.assert_close(out[:1000], base[:1000], rtol=0, atol=0)
         torch.testing.assert_close(out[3333:], base[3333:], rtol=0, atol=0)
-        # In document 2 (from 3333): a late group-0 member reaches the first
-        # member, but not the tokens ahead of the group.
         out = moved_at(slice(3333 + 290, 3333 + 291))
         torch.testing.assert_close(out[: 3333 + 7], base[: 3333 + 7], rtol=0, atol=0)
         assert not torch.allclose(out[3333 + 7], base[3333 + 7])
-        # A group-1 member reaches group 1's first member, not group 0 before it.
         out = moved_at(slice(3333 + 450, 3333 + 451))
         torch.testing.assert_close(out[: 3333 + 400], base[: 3333 + 400], rtol=0, atol=0)
         assert not torch.allclose(out[3333 + 400], base[3333 + 400])

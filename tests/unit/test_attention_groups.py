@@ -10,6 +10,12 @@ enumerated by hand (``PACK_VISIBLE`` and the per-test tables) or by
 ``oracle_mask``, a plain-Python loop over every (q, k) pair that is itself
 pinned to the hand tables.
 
+``PACK_DOCS`` / ``PACK_GROUPS`` / ``PACK_VISIBLE`` are one pack covering every
+case: documents 0 and 1, groups 0 and 1, group 1 reused in both documents,
+repeated negative ids (-1 in document 0, -3 in document 1), and a pad tail
+under its own sentinel document id (-1). ``PACK_VISIBLE[q]`` is the set of keys
+query ``q`` may attend to, enumerated by hand.
+
 FlexAttention has no CPU backward in torch 2.11, so flex coverage here is
 forward-only; dense-vs-flex gradient parity is covered on GPU in
 ``tests/integration/test_attention_groups.py``.
@@ -54,24 +60,20 @@ def _ones(n: int) -> torch.Tensor:
     return torch.ones(n, n, dtype=torch.bool)
 
 
-# One pack covering every case: documents 0 and 1, groups 0 and 1, group 1
-# reused in both documents, repeated negative ids (-1 in document 0, -3 in
-# document 1), and a pad tail under its own sentinel document id (-1).
 PACK_DOCS = _t([[0, 0, 0, 0, 0, 0, 1, 1, 1, 1, -1, -1]])
 PACK_GROUPS = _t([[0, 0, -1, 1, 1, -1, 1, 1, -3, -3, -1, -1]])
-# Keys visible from each query, enumerated by hand.
 PACK_VISIBLE = [
-    {0, 1},  # q0: group 0 sees its later member
     {0, 1},
-    {0, 1, 2},  # q2: ungrouped; the equal id at q5 does not group them
-    {0, 1, 2, 3, 4},  # q3: group 1, document 0 members only
+    {0, 1},
+    {0, 1, 2},
+    {0, 1, 2, 3, 4},
     {0, 1, 2, 3, 4},
     {0, 1, 2, 3, 4, 5},
-    {6, 7},  # q6: document 1 reuses id 1 without joining document 0
     {6, 7},
-    {6, 7, 8},  # q8: equal negative ids stay causal
+    {6, 7},
+    {6, 7, 8},
     {6, 7, 8, 9},
-    {10},  # q10: pad sentinel document, causal
+    {10},
     {10, 11},
 ]
 
@@ -98,13 +100,9 @@ def oracle_mask(doc_ids: torch.Tensor, group_ids: torch.Tensor | None) -> torch.
 
 FIXTURES = {
     "pack": (PACK_DOCS, PACK_GROUPS),
-    # Membership is id equality alone; a group need not be contiguous.
     "noncontiguous_group": (_t([[0] * 8]), _t([[3, -1, 3, -1, 3, -1, -1, -1]])),
-    # Prefix-LM shape: a bidirectional prefix, causal text, then a second document.
     "prefix_lm": (_t([[0, 0, 0, 0, 0, 1, 1, 1]]), _t([[5, 5, 5, -1, -1, -1, -1, -1]])),
-    # Id 0 groups: "no group" is any negative id, not a falsy one.
     "group_id_zero": (_t([[0] * 8]), _t([[-1, -1, 0, 0, -1, -1, -1, -1]])),
-    # One span of ids running across a document boundary splits in two.
     "span_across_doc_boundary": (
         _t([[0, 0, 0, 0, 1, 1, 1, 1]]),
         _t([[-1, 2, 2, 2, 2, 2, -1, -1]]),
@@ -138,7 +136,7 @@ class TestSameGroupMask:
     """The dense group term used by the SDPA path."""
 
     def test_pack_pairs(self):
-        # Group 0 = {0, 1}, group 1 = {3, 4, 6, 7}: this term ignores documents.
+        """Group 0 = {0, 1}, group 1 = {3, 4, 6, 7}: this term ignores documents."""
         members = [{0, 1}, {3, 4, 6, 7}]
         expected = torch.tensor(
             [[any(q in m and k in m for m in members) for k in range(12)] for q in range(12)]
@@ -151,7 +149,7 @@ class TestSameGroupMask:
         assert not same_group_mask(_t([[-1, -1, -5, -5]])).any()
 
     def test_full_int64_range(self):
-        # An int32 view would make 2**31 negative and fold 2**32 + 5 onto 5.
+        """An int32 view would make 2**31 negative and fold 2**32 + 5 onto 5."""
         out = same_group_mask(_t([[2**31, 2**31, 2**32 + 5, 5]]))
         expected = _block_diag(_ones(2), _ones(1), _ones(1))
         assert torch.equal(out[0, 0], expected)
@@ -263,7 +261,7 @@ class TestDenseAttentionPath:
     def test_key_padding_drops_keys_inside_a_group(self):
         attn, x, cos, sin = self._setup(PACK_DOCS, seed=3)
         key_padding = torch.ones_like(PACK_DOCS, dtype=torch.bool)
-        key_padding[0, 4] = False  # a group-1 member becomes an invalid key
+        key_padding[0, 4] = False
         visible = PACK_VISIBLE.copy()
         visible[3] = {0, 1, 2, 3}
         visible[4] = {0, 1, 2, 3}
@@ -346,7 +344,7 @@ class TestTransformerForward:
     def _model(backend: str) -> Transformer:
         torch.manual_seed(0)
         config = ModelConfig(
-            dim=64,  # head_dim 16, the flex backend's floor
+            dim=64,
             n_layers=2,
             n_heads=4,
             vocab_size=64,
@@ -399,7 +397,7 @@ class TestTransformerForward:
     @pytest.mark.parametrize("backend", ["sdpa", "flex"])
     def test_group_member_sees_a_later_member(self, backend):
         tokens = self._tokens(seed=3)
-        moved = self._perturb(tokens, slice(1, 2))  # q1: group 0, after q0
+        moved = self._perturb(tokens, slice(1, 2))
         model = self._model(backend)
         with torch.no_grad():
             causal = model(tokens, doc_ids=PACK_DOCS), model(moved, doc_ids=PACK_DOCS)

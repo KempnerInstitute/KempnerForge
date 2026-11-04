@@ -81,7 +81,9 @@ def build_doc_causal_block_mask(
         device: Device on which to materialize the ``BlockMask``.
         group_ids: Optional per-token bidirectional-visibility group ids,
             shape ``(batch, seq_len)``; negative means no group. ``None``
-            keeps the mask exactly causal-within-document.
+            keeps the mask exactly causal-within-document. Ids are compared
+            at full int64 width, unlike ``doc_ids``, so any caller-defined id
+            is usable.
 
     Returns:
         A ``BlockMask`` over ``(batch, seq_len, seq_len)``, head-broadcast.
@@ -114,8 +116,6 @@ def _build_doc_causal_block_mask(
             return (kv_idx <= q_idx) & (doc_ids[b, q_idx] == doc_ids[b, kv_idx])
 
     else:
-        # Kept int64, unlike doc_ids: group ids are caller-defined, and an
-        # int32 cast would silently merge or ungroup ids outside its range.
         groups = group_ids.to(device=device)
 
         def mask_mod(
