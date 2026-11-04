@@ -85,6 +85,16 @@ class TestNaNDetectorDistributed:
         else:
             assert result is True
 
+    def test_bad_grad_norm_on_one_rank_skips_on_every_rank(self):
+        """A NaN gradient norm on rank 0 alone, with finite losses, fails the check everywhere."""
+        rank, _, _ = get_world_info()
+        det = NaNDetector(action="warn")
+        grad_norm = float("nan") if rank == 0 else 1.0
+        assert det.check_loss(0.0, step=1, grad_norm=grad_norm) is False
+        assert det.state.consecutive_nans == 1
+        assert det.check_loss(0.0, step=2, grad_norm=1.0) is True
+        assert det.state.consecutive_nans == 0
+
     def test_loss_nan_detection_all_ranks(self):
         """All ranks detect NaN loss independently."""
         det = NaNDetector(action="warn")
