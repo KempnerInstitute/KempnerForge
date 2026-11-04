@@ -33,7 +33,6 @@ def run_moe_benchmarks() -> list[BenchmarkResult]:
     results: list[BenchmarkResult] = []
     toks_per_iter = BATCH * SEQ
 
-    # --- MoE forward + backward (8 experts, top-2) ---
     config = _moe_config()
     model = Transformer(config).to(device=DEVICE, dtype=DTYPE)
     input_ids = torch.randint(0, 32000, (BATCH, SEQ), device=DEVICE)
@@ -54,7 +53,6 @@ def run_moe_benchmarks() -> list[BenchmarkResult]:
     del model
     torch.cuda.empty_cache()
 
-    # --- Router comparison: softmax_topk vs sigmoid_topk ---
     for router in ["softmax_topk", "sigmoid_topk"]:
         config = _moe_config(router=router)
         model = Transformer(config).to(device=DEVICE, dtype=DTYPE).eval()
@@ -74,7 +72,6 @@ def run_moe_benchmarks() -> list[BenchmarkResult]:
         del model
         torch.cuda.empty_cache()
 
-    # --- Grouped GEMM vs loop dispatch ---
     import kempnerforge.model.moe as moe_mod
     from kempnerforge.model.moe import build_moe
 
@@ -91,7 +88,6 @@ def run_moe_benchmarks() -> list[BenchmarkResult]:
 
     orig_flag = moe_mod._HAS_GROUPED_MM
 
-    # Loop dispatch (force by disabling grouped_mm)
     moe_mod._HAS_GROUPED_MM = False
 
     def loop_fn(layer=moe_layer, inp=x):
@@ -102,7 +98,6 @@ def run_moe_benchmarks() -> list[BenchmarkResult]:
         run_benchmark(loop_fn, name="MoE dispatch: loop", tokens_per_iter=toks_per_iter)
     )
 
-    # Grouped GEMM (if available)
     moe_mod._HAS_GROUPED_MM = orig_flag
     if orig_flag:
 

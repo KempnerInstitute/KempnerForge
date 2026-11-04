@@ -17,14 +17,12 @@ def run_data_benchmarks() -> list[BenchmarkResult]:
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir = Path(tmpdir)
 
-        # Create synthetic data files
-        seq_len = 513  # +1 for input/label split
+        seq_len = 513
         n_tokens = 100_000
         for i in range(4):
             tokens = np.random.randint(0, 32000, size=n_tokens, dtype=np.uint16)
             np.save(tmpdir / f"shard_{i}.npy", tokens)
 
-        # --- MemoryMappedDataset iteration ---
         from kempnerforge.data.dataset import MemoryMappedDataset
 
         dataset = MemoryMappedDataset(data_dir=str(tmpdir), seq_len=seq_len)
@@ -34,7 +32,6 @@ def run_data_benchmarks() -> list[BenchmarkResult]:
             for i in range(n):
                 _ = ds[i]
 
-        # Warmup
         for _ in range(2):
             mmap_iter()
 
@@ -54,7 +51,6 @@ def run_data_benchmarks() -> list[BenchmarkResult]:
             )
         )
 
-        # --- Packed dataset ---
         dataset_packed = MemoryMappedDataset(
             data_dir=str(tmpdir), seq_len=seq_len, pack_sequences=True, eos_token_id=2
         )
@@ -81,7 +77,6 @@ def run_data_benchmarks() -> list[BenchmarkResult]:
             )
         )
 
-        # --- MixtureSampler ---
         from kempnerforge.data.sampler import MixtureSampler
 
         base_size = n_tokens // seq_len

@@ -34,11 +34,6 @@ from kempnerforge.config.video import VideoConfig
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 
-# ---------------------------------------------------------------------------
-# Job configs
-# ---------------------------------------------------------------------------
-
-
 @pytest.fixture
 def tiny_job_config(tmp_path) -> JobConfig:
     """Minimal job config for fast testing."""
@@ -55,11 +50,6 @@ def tiny_job_config(tmp_path) -> JobConfig:
         scheduler=SchedulerConfig(warmup_steps=2),
         checkpoint=CheckpointConfig(dir=str(tmp_path / "checkpoints"), interval=5),
     )
-
-
-# ---------------------------------------------------------------------------
-# VLM configs / model
-# ---------------------------------------------------------------------------
 
 
 @pytest.fixture

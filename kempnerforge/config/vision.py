@@ -37,11 +37,6 @@ class VisionEncoderConfig:
     num_tokens: int = 0
 
     def __post_init__(self) -> None:
-        # Late import: importing the encoder module triggers the
-        # ``@registry.register_vision_encoder`` decorators that populate the
-        # registry. Without this, ``list_vision_encoders()`` would return an
-        # empty list when this dataclass is constructed before any encoder
-        # module has been imported (e.g. in unit-test isolation).
         import kempnerforge.model.vision  # noqa: F401, PLC0415
 
         registered = tuple(registry.list_vision_encoders())

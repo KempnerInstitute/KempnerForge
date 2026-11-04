@@ -34,7 +34,6 @@ class TestVLMConfigValidation:
             VLMConfig(max_text_len=0)
 
     def test_max_text_len_one_rejected(self):
-        # Needs >= 2: one caption token plus its next-token target.
         with pytest.raises(ValueError, match="max_text_len"):
             VLMConfig(max_text_len=1)
 
@@ -60,7 +59,6 @@ class TestVLMConfigValidation:
         cfg = VLMConfig()
         assert cfg.arch == "joint_decoder"
         assert cfg.freeze == [FreezeSpec("vision_encoder", True)]
-        # module_patterns is a copy, not shared with the module-level default
         assert cfg.module_patterns == DEFAULT_MODULE_PATTERNS
         assert cfg.module_patterns is not DEFAULT_MODULE_PATTERNS
 
@@ -79,13 +77,11 @@ class TestVLMConfigSubclasses:
         assert cfg.cross_attention_every_n_layers == 4
         assert cfg.cross_attention_n_heads == 0
         assert cfg.cross_attention_n_kv_heads == 0
-        # CA-specific module alias added to module_patterns
         assert "cross_attention" in cfg.module_patterns
         assert cfg.module_patterns["cross_attention"] == [
             "transformer.cross_attention_layers",
             "transformer.cross_attention_layers.*",
         ]
-        # Base aliases still present
         assert "transformer" in cfg.module_patterns
         assert "vision_encoder" in cfg.module_patterns
 
@@ -234,7 +230,6 @@ class TestMoTConfig:
             "transformer.layers",
             "transformer.layers.*",
         ]
-        # Base aliases still present.
         assert "transformer" in cfg.module_patterns
         assert "vision_encoder" in cfg.module_patterns
 
@@ -259,19 +254,19 @@ class TestMoTConfig:
     def test_resolved_image_heads_zero_inherits_model(self):
         cfg = MoTConfig()
         n, kv = cfg.resolved_image_heads(model_n_heads=32)
-        assert n == 32 and kv == 32  # MHA default (no model_n_kv_heads passed)
+        assert n == 32 and kv == 32
 
     def test_resolved_image_heads_inherits_model_gqa(self):
         """When the text backbone is GQA, image kv_heads inherits the text
         kv_heads default (so v1's equal-head-count check still passes)."""
         cfg = MoTConfig()
         n, kv = cfg.resolved_image_heads(model_n_heads=32, model_n_kv_heads=8)
-        assert n == 32 and kv == 8  # inherits text-side GQA
+        assert n == 32 and kv == 8
 
     def test_resolved_image_heads_explicit_n_kv_heads(self):
         cfg = MoTConfig(mot_image_n_kv_heads=4)
         n, kv = cfg.resolved_image_heads(model_n_heads=32)
-        assert n == 32 and kv == 4  # GQA on image path
+        assert n == 32 and kv == 4
 
     def test_resolved_image_heads_explicit_n_heads(self):
         cfg = MoTConfig(mot_image_n_heads=8)
@@ -358,7 +353,6 @@ class TestMoMaConfig:
             "transformer.layers",
             "transformer.layers.*",
         ]
-        # Base aliases still present.
         assert "transformer" in cfg.module_patterns
         assert "vision_encoder" in cfg.module_patterns
 

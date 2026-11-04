@@ -37,14 +37,6 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Key mapping: KempnerForge <-> HuggingFace (Llama-style)
-# ---------------------------------------------------------------------------
-
-# KempnerForge uses the same naming as Llama models with minor differences.
-# This mapping handles the translation.
-
-
 def _kf_to_hf_key(key: str) -> str:
     """Convert a KempnerForge state dict key to HuggingFace format.
 
@@ -56,24 +48,16 @@ def _kf_to_hf_key(key: str) -> str:
       KF: layers.{i}.mlp.shared_expert.*    → HF: model.layers.{i}.mlp.shared_experts.*
       KF: layers.{i}.mlp.experts.{j}.*      → HF: model.layers.{i}.mlp.experts.{j}.*
     """
-    # Embedding
     key = key.replace("token_embedding.embedding.weight", "model.embed_tokens.weight")
-    # Output head
     key = key.replace("output_head.proj.weight", "lm_head.weight")
-    # Transformer blocks
     if key.startswith("layers."):
         key = "model." + key
-        # Norms (before attention rename to avoid partial matches)
         key = key.replace(".attention_norm.", ".input_layernorm.")
         key = key.replace(".mlp_norm.", ".post_attention_layernorm.")
-        # Attention
         key = key.replace(".attention.", ".self_attn.")
-        # MoE: flatten router.gate → gate
         key = key.replace(".mlp.router.gate.", ".mlp.gate.")
         key = key.replace(".mlp.router.expert_bias", ".mlp.expert_bias")
-        # MoE: shared_expert → shared_experts (HF convention)
         key = key.replace(".mlp.shared_expert.", ".mlp.shared_experts.")
-    # Final norm (top-level only, after block handling)
     elif key == "norm.weight":
         key = "model.norm.weight"
     return key
@@ -81,31 +65,18 @@ def _kf_to_hf_key(key: str) -> str:
 
 def _hf_to_kf_key(key: str) -> str:
     """Convert a HuggingFace state dict key to KempnerForge format."""
-    # Embedding
     key = key.replace("model.embed_tokens.weight", "token_embedding.embedding.weight")
-    # Output head
     key = key.replace("lm_head.weight", "output_head.proj.weight")
-    # Final norm
     key = key.replace("model.norm.weight", "norm.weight")
-    # Transformer blocks
     if key.startswith("model.layers."):
         key = key.replace("model.layers.", "layers.", 1)
-        # Attention
         key = key.replace(".self_attn.", ".attention.")
-        # Norms
         key = key.replace(".input_layernorm.", ".attention_norm.")
         key = key.replace(".post_attention_layernorm.", ".mlp_norm.")
-        # MoE: gate → router.gate (but not gate_proj which is an MLP weight)
         key = key.replace(".mlp.gate.weight", ".mlp.router.gate.weight")
         key = key.replace(".mlp.expert_bias", ".mlp.router.expert_bias")
-        # MoE: shared_experts → shared_expert (KF uses singular)
         key = key.replace(".mlp.shared_experts.", ".mlp.shared_expert.")
     return key
-
-
-# ---------------------------------------------------------------------------
-# DCP → HuggingFace
-# ---------------------------------------------------------------------------
 
 
 def _detect_pp_stages(dcp_path: Path) -> list[Path]:
@@ -137,37 +108,28 @@ def dcp_to_hf(
     dcp_path = Path(dcp_dir)
     logger.info(f"Loading DCP checkpoint from {dcp_dir}")
 
-    # Build model on CPU to load state into
     model = Transformer(model_config)
 
-    # Detect PP stages
     pp_dirs = _detect_pp_stages(dcp_path)
     if pp_dirs:
         logger.info(f"Detected {len(pp_dirs)} PP stages: {[d.name for d in pp_dirs]}")
-        # Load each PP stage's DCP shards into the full model.
-        # Each stage has a disjoint subset of keys; loading sequentially
-        # fills in all parameters.
         for pp_path in pp_dirs:
             stage_state = {"model": model.state_dict()}
             dcp.load(stage_state, checkpoint_id=str(pp_path))
             model.load_state_dict(stage_state["model"], strict=False)
     else:
-        # Standard (non-PP) checkpoint
         state_dict = {"model": model.state_dict()}
         dcp.load(state_dict, checkpoint_id=dcp_dir)
         model.load_state_dict(state_dict["model"])
 
-    # Convert keys and dtype
     hf_state = {}
     for kf_key, tensor in model.state_dict().items():
         hf_key = _kf_to_hf_key(kf_key)
         hf_state[hf_key] = tensor.to(dtype)
 
-    # Save
     hf_path = Path(hf_dir)
     hf_path.mkdir(parents=True, exist_ok=True)
 
-    # Try safetensors first, fall back to torch
     try:
         from safetensors.torch import save_file
 
@@ -177,15 +139,9 @@ def dcp_to_hf(
         torch.save(hf_state, hf_path / "pytorch_model.bin")
         logger.info(f"Saved HuggingFace checkpoint (torch): {hf_path}")
 
-    # Write config.json for HF compatibility
     hf_config = _build_hf_config(model_config, dtype)
     (hf_path / "config.json").write_text(json.dumps(hf_config, indent=2))
     logger.info(f"Wrote config.json with {len(hf_state)} tensors")
-
-
-# ---------------------------------------------------------------------------
-# HuggingFace → DCP
-# ---------------------------------------------------------------------------
 
 
 def hf_to_dcp(
@@ -204,16 +160,13 @@ def hf_to_dcp(
     """
     hf_path = Path(hf_dir)
 
-    # Load HuggingFace state dict
     hf_state = _load_hf_local(hf_path) if hf_path.exists() else _load_hf_hub(hf_dir)
 
     logger.info(f"Loaded HuggingFace checkpoint: {len(hf_state)} tensors")
 
-    # Build KempnerForge model
     model = Transformer(model_config)
     kf_state = model.state_dict()
 
-    # Convert keys
     converted = {}
     unmapped = []
     for hf_key, tensor in hf_state.items():
@@ -226,29 +179,20 @@ def hf_to_dcp(
     if unmapped:
         logger.warning(f"Skipped {len(unmapped)} unmapped HF keys: {unmapped[:5]}...")
 
-    # Check for missing keys
     missing = set(kf_state.keys()) - set(converted.keys())
     if missing:
         logger.warning(f"Missing {len(missing)} keys (using random init): {list(missing)[:5]}...")
 
-    # Load converted weights
     model.load_state_dict(converted, strict=False)
 
-    # Save as DCP
     dcp_path = Path(dcp_dir)
     dcp_path.mkdir(parents=True, exist_ok=True)
     dcp.save({"model": model.state_dict()}, checkpoint_id=str(dcp_path))
     logger.info(f"Saved DCP checkpoint: {dcp_path}")
 
 
-# ---------------------------------------------------------------------------
-# HuggingFace loading helpers
-# ---------------------------------------------------------------------------
-
-
 def _load_hf_local(path: Path) -> dict[str, torch.Tensor]:
     """Load state dict from a local HuggingFace model directory."""
-    # Try safetensors first
     safetensor_files = list(path.glob("*.safetensors"))
     if safetensor_files:
         from safetensors.torch import load_file
@@ -258,7 +202,6 @@ def _load_hf_local(path: Path) -> dict[str, torch.Tensor]:
             state.update(load_file(f))
         return state
 
-    # Fall back to torch .bin files
     bin_files = list(path.glob("pytorch_model*.bin"))
     if bin_files:
         state = {}
@@ -299,7 +242,6 @@ def _build_hf_config(config: ModelConfig, dtype: torch.dtype = torch.bfloat16) -
         "num_hidden_layers": config.n_layers,
         "num_attention_heads": config.n_heads,
         "num_key_value_heads": config.n_kv_heads,
-        # Explicit: a decoupled width is not recoverable from dim // n_heads.
         "head_dim": config.head_dim,
         "vocab_size": config.vocab_size,
         "max_position_embeddings": config.max_seq_len,
@@ -322,18 +264,12 @@ def _build_hf_config(config: ModelConfig, dtype: torch.dtype = torch.bfloat16) -
     return hf_config
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Convert checkpoints between DCP and HuggingFace formats"
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    # DCP → HF
     p_export = subparsers.add_parser("dcp-to-hf", help="Export DCP checkpoint to HuggingFace")
     p_export.add_argument("--dcp-dir", required=True, help="DCP checkpoint directory")
     p_export.add_argument("--hf-dir", required=True, help="Output HuggingFace directory")
@@ -346,7 +282,6 @@ def main() -> None:
         "(default: that field, which is bfloat16 unless the TOML sets it)",
     )
 
-    # HF → DCP
     p_import = subparsers.add_parser("hf-to-dcp", help="Import HuggingFace weights to DCP")
     p_import.add_argument("--hf-dir", required=True, help="HF model directory or model ID")
     p_import.add_argument("--dcp-dir", required=True, help="Output DCP directory")
