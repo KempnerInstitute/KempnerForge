@@ -11,7 +11,9 @@ again" just works, as long as a checkpoint directory exists.
 
 ```python
 # kempnerforge/resilience/elastic.py (abridged — logging calls elided)
-def resolve_resume_path(checkpoint_dir: str) -> Path | None:
+def resolve_resume_path(
+    checkpoint_dir: str, *, require_train_state: bool = True
+) -> Path | None:
     base = Path(checkpoint_dir)
     if not base.exists():
         return None
@@ -31,7 +33,7 @@ def resolve_resume_path(checkpoint_dir: str) -> Path | None:
         reverse=True,
     )
     for d in step_dirs:
-        if _dcp_durable(d) and not missing_train_state(d):
+        if _dcp_durable(d) and not (require_train_state and missing_train_state(d)):
             return d
 
     return None
@@ -52,7 +54,9 @@ Two fallbacks:
    between the two, or a copy that lost the file). Resuming the second
    kind would continue its weights and optimizer moments from step 0.
    A directory whose shards hold no optimizer state, such as an
-   `hf-to-dcp` import, needs no `train_state.pt`.
+   `hf-to-dcp` import, needs no `train_state.pt`. A caller that loads
+   the weights alone, such as `scripts/eval.py`, passes
+   `require_train_state=False` and keeps the second kind.
 
 If neither path finds anything, the function returns `None` and
 training starts from step 0, or from `checkpoint.load_path` when one is
