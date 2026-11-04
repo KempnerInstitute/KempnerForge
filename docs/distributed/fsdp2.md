@@ -75,6 +75,19 @@ differ slightly from the FSDP2 path, and the pipeline then passes fp32
 activations between stages. `scripts/eval.py` builds its model in
 `param_dtype` either way.
 
+Limits of the autocast path:
+
+- On a pp-only mesh the whole `schedule.step()` runs under autocast,
+  backward included, because the schedule interleaves the two. PyTorch
+  recommends leaving autocast before backward. It trains (one
+  training-step test covers it), but its numerics and memory have not
+  been compared with the FSDP2 path.
+- An MoE model is rejected on a single GPU: its expert inputs would
+  stay fp32, which turns off grouped GEMM.
+
+`fp32_master_weights` with `mixed_precision = "fp32"` is rejected, since
+the weights are already fp32.
+
 ## `reshard_after_forward`
 
 ```python

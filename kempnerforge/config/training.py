@@ -61,6 +61,11 @@ class TrainConfig:
             raise ValueError("grad_clip_norm must be positive")
         if self.mixed_precision == "fp16":
             raise ValueError(_FP16_UNSUPPORTED)
+        if self.fp32_master_weights and self.mixed_precision == "fp32":
+            raise ValueError(
+                "train.fp32_master_weights has no effect with mixed_precision='fp32': the "
+                "weights are already fp32. Use it with 'bf16' or 'fp8', or turn it off."
+            )
 
     @property
     def param_dtype(self) -> torch.dtype:

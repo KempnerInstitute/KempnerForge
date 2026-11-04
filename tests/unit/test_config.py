@@ -275,7 +275,7 @@ class TestTrainConfig:
 
     @pytest.mark.parametrize(
         ("mixed_precision", "compute"),
-        [("bf16", torch.bfloat16), ("fp8", torch.bfloat16), ("fp32", torch.float32)],
+        [("bf16", torch.bfloat16), ("fp8", torch.bfloat16)],
     )
     def test_fp32_master_weights_keep_the_compute_dtype(
         self, mixed_precision: str, compute: torch.dtype
@@ -283,6 +283,10 @@ class TestTrainConfig:
         t = TrainConfig(mixed_precision=mixed_precision, fp32_master_weights=True)
         assert t.param_dtype == compute
         assert t.master_dtype == torch.float32
+
+    def test_fp32_master_weights_rejected_with_fp32(self) -> None:
+        with pytest.raises(ValueError, match="no effect with mixed_precision='fp32'"):
+            TrainConfig(mixed_precision="fp32", fp32_master_weights=True)
 
     def test_fp32_master_weights_from_cli(self) -> None:
         config = load_config(cli_args=["--train.fp32_master_weights=true"])
@@ -605,6 +609,21 @@ class TestJobConfig:
             model=ModelConfig(num_experts=8, moe_top_k=2),
         )
         config.validate(world_size=1)
+
+    def test_validate_moe_fp32_master_weights_on_one_gpu_rejected(self) -> None:
+        config = JobConfig(
+            model=ModelConfig(num_experts=8, moe_top_k=2),
+            train=TrainConfig(fp32_master_weights=True),
+        )
+        with pytest.raises(ValueError, match="fp32_master_weights with an MoE model"):
+            config.validate(world_size=1)
+
+    def test_validate_moe_fp32_master_weights_under_fsdp2_passes(self) -> None:
+        config = JobConfig(
+            model=ModelConfig(num_experts=8, moe_top_k=2),
+            train=TrainConfig(fp32_master_weights=True),
+        )
+        config.validate(world_size=2)
 
     def test_validate_dense_with_pp_passes(self):
         config = JobConfig(
