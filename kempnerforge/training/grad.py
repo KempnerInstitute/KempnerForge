@@ -31,7 +31,6 @@ def maybe_no_sync(
     if is_last_step or not hasattr(model, "set_requires_gradient_sync"):
         yield
     else:
-        # FSDP2 uses set_requires_gradient_sync instead of no_sync() context
         model.set_requires_gradient_sync(False)  # type: ignore[reportCallIssue]
         try:
             yield

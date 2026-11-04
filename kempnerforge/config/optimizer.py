@@ -17,17 +17,15 @@ class OptimizerConfig:
     weight_decay: float = 0.1
     betas: tuple[float, float] = (0.9, 0.95)
     eps: float = 1e-8
-    fused: bool = True  # Use fused AdamW when available
-    # Muon-specific
-    muon_momentum: float = 0.95  # Momentum coefficient for Muon
-    muon_ns_steps: int = 5  # Newton-Schulz iteration steps for Muon
-    muon_adam_lr: float | None = None  # LR for the params Muon leaves to AdamW; None=same as lr
+    fused: bool = True
+    muon_momentum: float = 0.95
+    muon_ns_steps: int = 5
+    muon_adam_lr: float | None = None
     muon_nesterov: bool = False
     muon_adjust_lr: str = "original"
     muon_orthogonalize: str = "local"
     muon_router: bool = False
-    # Schedule-Free specific
-    schedule_free_warmup_steps: int = 0  # Internal warmup for schedule-free optimizer
+    schedule_free_warmup_steps: int = 0
 
     def __post_init__(self) -> None:
         if self.lr <= 0:

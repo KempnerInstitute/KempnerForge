@@ -159,6 +159,12 @@ carries OOM risk and there is no cheap 175B preflight.
 One config, one job: 90 nodes for about 11 hours. This is a large allocation, so validate the
 launch path at small scale before submitting.
 
+Two launch constraints are load-bearing. `srun` runs with `--ntasks-per-node=4` and
+`--distribution=block:block` so ranks 0 to 3 land on node 0 and `LOCAL_RANK` maps one to one
+onto the four local GPUs; a plain `--ntasks=N` distributes cyclically and collides two ranks
+on one GPU. `--requeue` and `--signal` are deliberately unset, because on a plain long
+benchmark they can requeue at walltime and silently restart an 11-hour run.
+
 ```bash
 export DATA=/path/to/tokenized/fineweb-edu     # tokenized_*.bin shards
 export PARTITION=<gpu-partition>               # 4 GPUs per node

@@ -16,13 +16,13 @@ class PipelineSchedule(StrEnum):
 class DistributedConfig:
     """Parallelism dimensions and distributed settings."""
 
-    dp_shard: int = -1  # -1 -> auto (use all remaining GPUs)
+    dp_shard: int = -1
     dp_replicate: int = 1
     tp: int = 1
     pp: int = 1
     pp_schedule: PipelineSchedule = PipelineSchedule.schedule_1f1b
     cp: int = 1
-    ep: int = 1  # Expert parallelism degree (partitions MoE experts across ranks)
+    ep: int = 1
     nccl_timeout_sec: int = 1800
     backend: str = "cpu:gloo,cuda:nccl"
 

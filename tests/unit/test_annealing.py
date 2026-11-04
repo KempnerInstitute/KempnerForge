@@ -7,10 +7,6 @@ import pytest
 from kempnerforge.config.schema import DataConfig, TrainingPhase
 from kempnerforge.data.sampler import MixtureSampler
 
-# ---------------------------------------------------------------------------
-# TrainingPhase config
-# ---------------------------------------------------------------------------
-
 
 class TestTrainingPhase:
     def test_valid_phase(self):
@@ -48,11 +44,6 @@ class TestTrainingPhase:
         """Empty weights = no override (use original)."""
         p = TrainingPhase(start_step=10)
         assert p.dataset_weights == {}
-
-
-# ---------------------------------------------------------------------------
-# DataConfig phase validation
-# ---------------------------------------------------------------------------
 
 
 class TestDataConfigPhases:
@@ -107,11 +98,6 @@ class TestDataConfigPhases:
     def test_negative_anneal_start_step_rejected(self):
         with pytest.raises(ValueError, match="anneal_start_step"):
             DataConfig(anneal_start_step=-1)
-
-
-# ---------------------------------------------------------------------------
-# TOML loading
-# ---------------------------------------------------------------------------
 
 
 class TestAnnealingTomlLoading:
@@ -196,11 +182,6 @@ typo_field = "oops"
             load_config(str(toml_path), cli_args=[])
 
 
-# ---------------------------------------------------------------------------
-# MixtureSampler.update_weights
-# ---------------------------------------------------------------------------
-
-
 class TestUpdateWeights:
     def test_update_changes_proportions(self):
         """Updating weights shifts sampling proportions."""
@@ -208,13 +189,11 @@ class TestUpdateWeights:
         sampler = MixtureSampler(
             cumulative, weights=[0.5, 0.5], num_replicas=1, rank=0, shuffle=False
         )
-        # Initially ~50/50
         indices = list(sampler)
         ds0_before = sum(1 for i in indices if i < 500)
         ratio_before = ds0_before / len(indices)
         assert 0.4 < ratio_before < 0.6
 
-        # Update to 90/10
         sampler.update_weights([0.9, 0.1])
         indices = list(sampler)
         ds0_after = sum(1 for i in indices if i < 500)
@@ -243,17 +222,11 @@ class TestUpdateWeights:
         sampler = MixtureSampler(
             cumulative, weights=[0.5, 0.5], num_replicas=1, rank=0, shuffle=False
         )
-        # With high temperature, even 0.9/0.1 should be more uniform
         sampler.update_weights([0.9, 0.1], temperature=5.0)
         indices = list(sampler)
         ds0_count = sum(1 for i in indices if i < 500)
         ratio = ds0_count / len(indices)
         assert 0.4 < ratio < 0.75
-
-
-# ---------------------------------------------------------------------------
-# Phase transition logic (simulated)
-# ---------------------------------------------------------------------------
 
 
 class TestPhaseTransitionLogic:
@@ -277,13 +250,11 @@ class TestPhaseTransitionLogic:
                 sampler.update_weights(new_w)
                 phase_idx += 1
 
-        # After step 5, phase should be active
         assert phase_idx == 1
-        # Verify new weights took effect
         indices = list(sampler)
         ds0_count = sum(1 for i in indices if i < 100)
         ratio = ds0_count / len(indices)
-        assert ratio > 0.7  # ds0 should dominate with weight 0.9
+        assert ratio > 0.7
 
     def test_multiple_phases_activate_sequentially(self):
         """Multiple phases activate in order as steps progress."""
@@ -307,7 +278,6 @@ class TestPhaseTransitionLogic:
                 phase_idx += 1
 
         assert phase_idx == 2
-        # After phase 2 (step 10), ds1 should dominate
         indices = list(sampler)
         ds1_count = sum(1 for i in indices if i >= 500)
         ratio = ds1_count / len(indices)
@@ -320,7 +290,7 @@ class TestPhaseTransitionLogic:
         original = {"a": 0.5, "b": 0.5}
 
         new_w = [phase.dataset_weights.get(n, original[n]) for n in names]
-        assert new_w == [0.9, 0.5]  # 'b' falls back to original
+        assert new_w == [0.9, 0.5]
 
     def test_lr_scale_from_phase(self):
         """LR scale is correctly read from phase config."""
@@ -335,7 +305,7 @@ class TestPhaseTransitionLogic:
                 lr_scale = phases[phase_idx].lr_scale
                 phase_idx += 1
 
-        assert lr_scale == 0.1  # Last active phase
+        assert lr_scale == 0.1
 
     def test_resume_derives_phase_from_step(self):
         """On resume, correct phase is derived from current step."""
@@ -344,7 +314,6 @@ class TestPhaseTransitionLogic:
             TrainingPhase(start_step=50, dataset_weights={"a": 0.2, "b": 0.8}, lr_scale=0.1),
         ]
 
-        # Simulate resume at step 30 (should be in phase 0, before phase 1)
         resume_step = 30
         phase_idx = 0
         lr_scale = 1.0
@@ -353,10 +322,9 @@ class TestPhaseTransitionLogic:
                 lr_scale = phase.lr_scale
                 phase_idx = i + 1
 
-        assert phase_idx == 1  # Past first phase
+        assert phase_idx == 1
         assert lr_scale == 0.5
 
-        # Simulate resume at step 60 (both phases past)
         resume_step = 60
         phase_idx = 0
         lr_scale = 1.0
@@ -369,11 +337,6 @@ class TestPhaseTransitionLogic:
         assert lr_scale == 0.1
 
 
-# ---------------------------------------------------------------------------
-# Annealing shortcut equivalence
-# ---------------------------------------------------------------------------
-
-
 class TestAnnealingShortcut:
     def test_shortcut_produces_single_phase(self):
         """anneal_start_step + anneal_weights is equivalent to a single TrainingPhase."""
@@ -381,7 +344,6 @@ class TestAnnealingShortcut:
             anneal_start_step=500,
             anneal_weights={"code": 0.3, "text": 0.7},
         )
-        # Simulate the resolution logic from train.py
         active_phases = []
         if config.phases:
             active_phases = config.phases
@@ -429,7 +391,6 @@ class TestAnnealingShortcut:
         cumulative = [0, 500, 1000]
         names = ["code", "text"]
 
-        # Via shortcut
         shortcut_phase = TrainingPhase(start_step=100, dataset_weights={"code": 0.3, "text": 0.7})
         s1 = MixtureSampler(
             cumulative,
@@ -442,7 +403,6 @@ class TestAnnealingShortcut:
         new_w = [shortcut_phase.dataset_weights.get(n, 0.5) for n in names]
         s1.update_weights(new_w)
 
-        # Via explicit phase
         s2 = MixtureSampler(
             cumulative,
             weights=[0.5, 0.5],
