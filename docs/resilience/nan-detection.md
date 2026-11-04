@@ -101,7 +101,11 @@ skipped step. If any parameter is not finite, the loop logs an ERROR,
 writes no checkpoint, finishes the shutdown and stops: `latest` still
 names the last checkpoint saved, and no older one is pruned to make
 room. A skipped step whose weights are finite, such as one whose NaN
-came from the data, writes its emergency checkpoint as before.
+came from the data, writes its emergency checkpoint as before. Like any
+save, that checkpoint becomes `latest` and counts toward
+`checkpoint.keep_last_n`, so with `keep_last_n = 1` it replaces the
+checkpoint saved before the NaN run (see
+[Rollback recommendation](#rollback-recommendation)).
 
 The bad update's own step has a finite loss, so a shutdown or a
 scheduled save on that step is not checked and writes the weights it
