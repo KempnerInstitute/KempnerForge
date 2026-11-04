@@ -50,11 +50,6 @@ def _embedding_calls(model: Transformer) -> list[int]:
     return calls
 
 
-# ---------------------------------------------------------------------------
-# apply_rope with gathered (batch, seq_len, head_dim // 2) frequencies
-# ---------------------------------------------------------------------------
-
-
 class TestApplyRopeGathered:
     def test_hand_computed_rotation_at_gathered_positions(self):
         """Gathered cos/sin rotate each token by its own position's angles.
@@ -70,7 +65,6 @@ class TestApplyRopeGathered:
         cos_table, sin_table = precompute_rope_frequencies(head_dim, max_seq_len=8)
         position_ids = torch.tensor([[5, 2, 0], [1, 7, 3]])
 
-        # x: (batch=2, heads=1, seq=3, head_dim=4), distinct values per token
         x = torch.arange(1.0, 1.0 + 2 * 3 * head_dim).reshape(2, 1, 3, head_dim)
 
         out = apply_rope(x, cos_table[position_ids], sin_table[position_ids])
@@ -109,11 +103,6 @@ class TestApplyRopeGathered:
         bad = torch.randn(4)
         with pytest.raises(ValueError, match="got 1 dims"):
             apply_rope(x, bad, bad)
-
-
-# ---------------------------------------------------------------------------
-# Transformer.forward(position_ids=...)
-# ---------------------------------------------------------------------------
 
 
 class TestTransformerPositionIds:
@@ -235,7 +224,6 @@ class TestTransformerPositionIdsValidation:
             model(tokens, modality=modality, position_ids=bad)
         assert calls == []
 
-        # Control: the spy fires on a valid forward, so the empty list above is meaningful.
         good = torch.arange(n_prefix + tokens.shape[1], device=DEVICE).expand(2, -1).contiguous()
         with torch.no_grad():
             model(tokens, modality=modality, position_ids=good)
@@ -273,7 +261,6 @@ class TestTransformerPositionIdsValidation:
             model(tokens, position_ids=good)
         assert calls == []
 
-        # Control: once initialized the same call runs, so the empty list above is meaningful.
         model.init_weights_and_freqs()
         with torch.no_grad():
             model(tokens, position_ids=good)
