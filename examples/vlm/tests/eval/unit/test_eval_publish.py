@@ -692,6 +692,19 @@ class TestResolveCheckpoint:
             (run / f"step_{step}" / ".metadata").write_text("")
         assert resolve_checkpoint(str(run)) == (run / "step_200").resolve()
 
+    def test_a_run_directory_keeps_a_highest_step_without_its_train_state(self, tmp_path):
+        """Only the weights are loaded, so a save that lacks only ``train_state.pt`` serves."""
+        import torch
+        import torch.distributed.checkpoint as dcp
+
+        run = tmp_path / "run"
+        optimizer = {"state": {"w": {"m": torch.zeros(2)}}}
+        state = {"model": {"w": torch.zeros(2)}, "optimizer": optimizer}
+        for step in (100, 200):
+            dcp.save(state, checkpoint_id=str(run / f"step_{step}"))
+        torch.save({"step": 100, "tokens_seen": 0}, run / "step_100" / "train_state.pt")
+        assert resolve_checkpoint(str(run)) == (run / "step_200").resolve()
+
     def test_a_step_directory_is_used_as_is(self, tmp_path):
         step = tmp_path / "run" / "step_100"
         step.mkdir(parents=True)
