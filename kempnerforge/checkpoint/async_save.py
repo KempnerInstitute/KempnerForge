@@ -45,7 +45,6 @@ class AsyncCheckpointer:
                 stage has a different state dict — pass a group scoped to ranks
                 within the same PP stage. None uses the default global group.
         """
-        # Wait for any pending async save to complete first
         self.wait()
 
         if self.mode == AsyncCheckpointMode.disabled:

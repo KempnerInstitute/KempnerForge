@@ -63,6 +63,8 @@ if resume_path or config.checkpoint.load_path:
     )
     if ckpt_extra_loaded.get("wandb_run_id"):
         config.metrics.wandb_run_id = ckpt_extra_loaded["wandb_run_id"]
+    if ckpt_extra_loaded.get("mlflow_run_id"):
+        config.metrics.mlflow_run_id = ckpt_extra_loaded["mlflow_run_id"]
 ```
 
 So two things can trigger a resume:
@@ -135,6 +137,11 @@ leave `save()` while the other ranks wait in its barrier.
 
 ## Edge cases
 
+- **A rank wedged in the train-state broadcast**: PyTorch's
+  `broadcast_object_list` takes no `async_op`, so this call carries no
+  per-operation timeout and inherits the process group's 1800 s default.
+  A wedged rank still surfaces, just later than the other fast-fail
+  paths in resume.
 - **Empty checkpoint directory** — `resolve_resume_path` returns
   `None`, training starts from step 0. No error.
 - **`latest` symlink points at a removed directory** — the resolver
