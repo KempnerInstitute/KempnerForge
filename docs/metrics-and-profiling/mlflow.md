@@ -9,9 +9,8 @@ enabled together in one run config. Each receives the same metrics, and a checkp
 
 ## Setup
 
-```bash
-uv sync --group mlflow    # mlflow-skinny, databricks-sdk, psutil, nvidia-ml-py
-```
+The client installs with KempnerForge: `uv sync` brings in `mlflow-skinny` and `databricks-sdk`,
+plus `psutil` and `nvidia-ml-py` for system metrics. Turn the backend on in the config:
 
 ```toml
 [metrics]
@@ -21,8 +20,7 @@ mlflow_run_name   = "7b-debug"                  # optional; MLflow auto-generate
 ```
 
 Then give the job credentials by one of the routes below. The backend is constructed by
-`MetricsTracker._init_backends` on rank 0 only; other ranks never touch MLflow. Without the
-`mlflow` group, `enable_mlflow = true` logs a warning and no-ops.
+`MetricsTracker._init_backends` on rank 0 only; other ranks never touch MLflow.
 
 ## Authentication
 
@@ -133,7 +131,7 @@ so it tests what the job will run:
 
 ```bash
 export DATABRICKS_AUTH_TYPE=pat    # as in the job script; leave out for OAuth
-srun -p <partition> -N 1 -n 1 -t 00:05:00 uv run --group mlflow python -c \
+srun -p <partition> -N 1 -n 1 -t 00:05:00 uv run python -c \
   'import os, mlflow; print(mlflow.MlflowClient(os.environ.get("MLFLOW_TRACKING_URI") or "databricks").search_experiments(max_results=1))'
 ```
 
@@ -385,7 +383,9 @@ check included, run with MLflow's own defaults.
 
 `_ensure_init` disables the backend for the rest of the run on any failure, with a warning:
 
-- `mlflow` is not installed: the warning says `uv sync --group mlflow`.
+- An import failed, `mlflow` itself or something it imports, so the environment is incomplete:
+  the warning reads `MLflow backend disabled by a failed import (<error>)` and says to run
+  `uv sync`.
 - A deliberate config error: `$MLFLOW_EXPERIMENT` is not absolute on Databricks, or no experiment
   path could be resolved. The warning reads `MLflow disabled: <reason>`. For an unresolved path,
   an earlier warning gives the cause: `Could not auto-resolve Databricks experiment path: <error>`,
@@ -403,10 +403,6 @@ past its deadline costs only what it carried: its points, a batch of params, a t
 upload. The worker does not retry it and the backend stays enabled, so logging recovers after a
 blip, and a full queue drops new calls. `close()` ends the run whenever one was started and
 swallows teardown errors as warnings.
-
-MLflow is an optional dependency: install with `uv sync --group mlflow` (pulls
-`mlflow-skinny` + `databricks-sdk`, plus `psutil` and `nvidia-ml-py` for system metrics).
-Without it, `enable_mlflow = true` logs a warning and no-ops.
 
 ## `close()`
 
