@@ -465,3 +465,15 @@ class TestTiedExport:
         assert torch.equal(weights["model.embed_tokens.weight"], embedding)
         assert torch.equal(weights["lm_head.weight"], embedding)
         assert json.loads((tmp_path / "hf" / "config.json").read_text())["tie_word_embeddings"]
+
+    def test_transformers_loads_a_float32_export_tied(self, tmp_path, tiny_model_config):
+        """transformers ties the copied head back to the embedding, at float32."""
+        transformers = pytest.importorskip("transformers")
+        config = replace(tiny_model_config, tie_embeddings=True)
+        source = _random_dcp(tmp_path / "dcp", config)
+        dcp_to_hf(str(tmp_path / "dcp"), str(tmp_path / "hf"), config, dtype=torch.float32)
+        model = transformers.AutoModelForCausalLM.from_pretrained(tmp_path / "hf", dtype="auto")
+        head, embedding = model.get_output_embeddings().weight, model.get_input_embeddings().weight
+        assert head is embedding
+        assert embedding.dtype == torch.float32
+        assert torch.equal(embedding, source.state_dict()["token_embedding.embedding.weight"])
