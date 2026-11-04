@@ -209,13 +209,15 @@ def _load_path_is_the_resume(config: JobConfig, resume_path: Path) -> bool:
 
     The resume then loads what ``load_path`` asks for, so nothing in it goes unused. Both paths
     go through ``os.path.realpath``, so a relative path or one through ``latest`` compares by
-    its target. Unlike ``Path.resolve``, it does not raise on a symlink loop: only rank 0 runs
-    this, and a raise here would leave the other ranks waiting in the load's broadcast.
+    its target, and through ``str`` first: the config loader keeps a bare-number ``load_path``
+    such as ``--checkpoint.load_path=5000`` as an int. Unlike ``Path.resolve``,
+    ``os.path.realpath`` does not raise on a symlink loop: only rank 0 runs this, and a raise
+    here would leave the other ranks waiting in the load's broadcast.
     """
     ckpt = config.checkpoint
     if not ckpt.load_path or ckpt.exclude_from_loading:
         return False
-    return os.path.realpath(ckpt.load_path) == os.path.realpath(resume_path)
+    return os.path.realpath(str(ckpt.load_path)) == os.path.realpath(str(resume_path))
 
 
 def restore_checkpoint(
