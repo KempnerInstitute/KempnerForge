@@ -24,9 +24,18 @@ grouping. The token embedding and the output head are 2D, so they are
 decayed.
 
 `optimizer.weight_decay_scope` selects which rule applies. It decides parameter
-group membership, so a run cannot change it across a resume: the saved optimizer
-state no longer lines up with the groups being built, and the load fails or leaves
-the groups without their `weight_decay`. Pick it before the first step.
+group membership, so optimizer state saved under one scope cannot be loaded under
+another: depending on the optimizer the load fails, the first step fails, or Muon
+silently keeps the coefficients it was saved with. The training entry therefore
+records the scope in every checkpoint's `metadata.json`, and a resume that does not
+leave out the optimizer stops on every rank, before loading anything, when the
+checkpoint was saved under a different scope; the error names both scopes. This
+applies to a checkpoint saved before the first step as well. A checkpoint that does
+not record a scope was written under `"exclude_norms_and_biases"`, the only grouping
+that existed before the scope was recorded. To change the scope, start a new run from
+the checkpoint without its optimizer state: set `checkpoint.load_path` to it and
+`checkpoint.exclude_from_loading = ["optimizer"]`. Code that builds its own
+`CheckpointManager` gets the same record and check by passing `weight_decay_scope`.
 
 | Value | Effect |
 |-------|--------|

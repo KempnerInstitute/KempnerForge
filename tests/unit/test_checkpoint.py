@@ -34,7 +34,7 @@ from kempnerforge.config.schema import (
     OptimizerConfig,
 )
 from kempnerforge.model.transformer import Transformer
-from kempnerforge.training.optimizer import build_optimizer
+from kempnerforge.training.optimizer import _should_decay, build_optimizer
 
 
 class TestRNGState:
@@ -2926,3 +2926,247 @@ class TestComponentSwapOnResume:
         opt2 = build_optimizer(resumed, OptimizerConfig(lr=1e-3, fused=False))
         with pytest.raises(CheckpointException, match="Missing key in checkpoint"):
             CheckpointManager(CheckpointConfig(dir=ckpt_dir), resumed, opt2).load()
+
+
+WEIGHT_DECAY = 0.5
+DEFAULT_SCOPE, ALL_SCOPE = "exclude_norms_and_biases", "all"
+
+
+class TestWeightDecayScopeOnResume:
+    """A resume refuses a checkpoint saved under a different ``weight_decay_scope``."""
+
+    MODEL_CONFIG = ModelConfig(dim=64, n_layers=2, n_heads=2, vocab_size=256, max_seq_len=64)
+
+    def _build(self, name, scope, seed):
+        torch.manual_seed(seed)
+        model = Transformer(self.MODEL_CONFIG)
+        config = OptimizerConfig(
+            name=name, lr=1e-3, weight_decay=WEIGHT_DECAY, weight_decay_scope=scope, fused=False
+        )
+        return model, build_optimizer(model, config)
+
+    @staticmethod
+    def _train(model, opt, steps):
+        g = torch.Generator().manual_seed(1)
+        for _ in range(steps):
+            tokens = torch.randint(0, 256, (2, 32), generator=g)
+            logits = model(tokens)
+            torch.nn.functional.cross_entropy(logits.flatten(0, 1), tokens.flatten()).backward()
+            opt.step()
+            opt.zero_grad()
+
+    @staticmethod
+    def _manager(tmp_path, model, opt, scope):
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        return CheckpointManager(
+            CheckpointConfig(dir=str(tmp_path)), model, opt, weight_decay_scope=scope
+        )
+
+    def _save(self, tmp_path, name, scope, steps=3, record=True):
+        model, opt = self._build(name, scope, seed=0)
+        self._train(model, opt, steps)
+        self._manager(tmp_path, model, opt, scope if record else None).save(step=steps)
+        return tmp_path / f"step_{steps}"
+
+    def _resume(self, tmp_path, name, scope):
+        model, opt = self._build(name, scope, seed=1)
+        return model, opt, self._manager(tmp_path, model, opt, scope)
+
+    @staticmethod
+    def _by_name(model, manager):
+        names = {id(p): n for n, p in model.named_parameters()}
+        decay, state = {}, {}
+        for optimizer in manager.checkpointed_optimizers:
+            for group in optimizer.param_groups:
+                for p in group["params"]:
+                    decay[names[id(p)]] = group["weight_decay"]
+            for p, entries in optimizer.state.items():
+                for key, value in entries.items():
+                    copy_ = value.detach().clone() if torch.is_tensor(value) else value
+                    state[(names[id(p)], key)] = copy_
+        return decay, state
+
+    def test_the_save_records_the_scope(self, tmp_path):
+        """``metadata.json`` carries the scope the manager was built with."""
+        step_dir = self._save(tmp_path, "adamw", ALL_SCOPE)
+        assert json.loads((step_dir / "metadata.json").read_text())["weight_decay_scope"] == "all"
+
+    @pytest.mark.parametrize(
+        ("saved", "resumed"), [(DEFAULT_SCOPE, ALL_SCOPE), (ALL_SCOPE, DEFAULT_SCOPE)]
+    )
+    @pytest.mark.parametrize("name", REGISTERED_OPTIMIZERS)
+    def test_a_different_scope_is_refused_before_anything_loads(
+        self, tmp_path, name, saved, resumed
+    ):
+        """Every optimizer refuses a scope change both ways and leaves the live run untouched."""
+        self._save(tmp_path, name, saved)
+        model, _, manager = self._resume(tmp_path, name, resumed)
+        before = [p.detach().clone() for p in model.parameters()]
+        with pytest.raises(
+            ValueError, match=f"weight_decay_scope='{saved}', but this run uses '{resumed}'"
+        ):
+            manager.load()
+        for b, p in zip(before, model.parameters(), strict=True):
+            assert torch.equal(b, p), "a refused load changed the model"
+        assert not any(o.state for o in manager.checkpointed_optimizers)
+
+    @pytest.mark.parametrize("scope", [DEFAULT_SCOPE, ALL_SCOPE])
+    @pytest.mark.parametrize("name", RESUMABLE_OPTIMIZERS)
+    def test_the_same_scope_resumes_exactly(self, tmp_path, name, scope):
+        """A resume under the saved scope restores all optimizer state and continues exactly."""
+        model, opt = self._build(name, scope, seed=0)
+        self._train(model, opt, 3)
+        manager = self._manager(tmp_path, model, opt, scope)
+        manager.save(step=3)
+        decay, state = self._by_name(model, manager)
+        self._train(model, opt, 2)
+        reference = [p.detach().clone() for p in model.parameters()]
+
+        model2, opt2, manager2 = self._resume(tmp_path, name, scope)
+        manager2.load()
+        decay2, state2 = self._by_name(model2, manager2)
+        expected = {
+            n: WEIGHT_DECAY if _should_decay(n, p, scope) else 0.0
+            for n, p in model2.named_parameters()
+        }
+        assert decay == decay2 == expected
+        assert state, "the saved optimizer held no state to compare"
+        assert state2.keys() == state.keys()
+        for key, value in state.items():
+            if torch.is_tensor(value):
+                assert torch.equal(state2[key], value), key
+            else:
+                assert state2[key] == value, key
+        self._train(model2, opt2, 2)
+        for a, b in zip(reference, model2.parameters(), strict=True):
+            assert torch.equal(a, b), "the resumed run diverged from the uninterrupted one"
+
+    def test_a_checkpoint_without_a_recorded_scope_counts_as_the_default(self, tmp_path):
+        """A checkpoint written before the scope was recorded resumes only under the default."""
+        self._save(tmp_path, "muon", DEFAULT_SCOPE, record=False)
+        self._resume(tmp_path, "muon", DEFAULT_SCOPE)[2].load()
+        with pytest.raises(ValueError, match=f"weight_decay_scope='{DEFAULT_SCOPE}'"):
+            self._resume(tmp_path, "muon", ALL_SCOPE)[2].load()
+
+    def test_a_missing_metadata_file_counts_as_the_default(self, tmp_path):
+        """A checkpoint with optimizer state and no ``metadata.json`` resumes under the default."""
+        (self._save(tmp_path, "adamw", DEFAULT_SCOPE) / "metadata.json").unlink()
+        step, _, _ = self._resume(tmp_path, "adamw", DEFAULT_SCOPE)[2].load()
+        assert step == 3
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            b"\xff\xfe",
+            b"{not json",
+            b"null",
+            b"[]",
+            b'{"step": 3, "weight_decay_scope": "x"}',
+            b"[" * 100_000 + b"]" * 100_000,
+        ],
+        ids=["bad-encoding", "bad-json", "null", "list", "unknown-scope", "too-deep"],
+    )
+    def test_a_metadata_file_without_a_valid_scope_record_is_refused(self, tmp_path, content):
+        """Anything but a JSON object with a known scope fails the load with a clear error."""
+        (self._save(tmp_path, "adamw", ALL_SCOPE) / "metadata.json").write_bytes(content)
+        with pytest.raises(ValueError, match="Cannot check the weight_decay_scope"):
+            self._resume(tmp_path, "adamw", ALL_SCOPE)[2].load()
+
+    def test_an_unknown_recorded_scope_names_the_valid_ones(self, tmp_path):
+        """The error for an unknown recorded scope lists the scopes that exist."""
+        (self._save(tmp_path, "adamw", ALL_SCOPE) / "metadata.json").write_text(
+            json.dumps({"step": 3, "weight_decay_scope": "norms"})
+        )
+        with pytest.raises(ValueError, match="'norms', which is not one of"):
+            self._resume(tmp_path, "adamw", ALL_SCOPE)[2].load()
+
+    def test_excluding_the_optimizer_skips_the_check(self, tmp_path):
+        """A load that leaves out the optimizer state loads the model under any scope."""
+        self._save(tmp_path, "muon", DEFAULT_SCOPE)
+        model, _, manager = self._resume(tmp_path, "muon", ALL_SCOPE)
+        before = [p.detach().clone() for p in model.parameters()]
+        manager.load(exclude_keys=["optimizer"])
+        assert any(not torch.equal(b, p) for b, p in zip(before, model.parameters(), strict=True))
+        assert not any(o.state for o in manager.checkpointed_optimizers)
+
+    def test_a_checkpoint_without_optimizer_state_is_checked_too(self, tmp_path):
+        """The check depends on the run alone, so a step-0 checkpoint is refused as well."""
+        self._save(tmp_path, "adamw", DEFAULT_SCOPE, steps=0)
+        with pytest.raises(ValueError, match="but this run uses 'all'"):
+            self._resume(tmp_path, "adamw", ALL_SCOPE)[2].load()
+        step, _, _ = self._resume(tmp_path, "adamw", DEFAULT_SCOPE)[2].load()
+        assert step == 0
+
+    def test_a_manager_without_a_scope_neither_records_nor_checks(self, tmp_path):
+        """Callers that do not pass a scope keep the previous behavior."""
+        step_dir = self._save(tmp_path, "adamw", ALL_SCOPE, record=False)
+        assert "weight_decay_scope" not in json.loads((step_dir / "metadata.json").read_text())
+        model, opt = self._build("adamw", ALL_SCOPE, seed=1)
+        step, _, _ = self._manager(tmp_path, model, opt, None).load()
+        assert step == 3
+
+    def test_rank_zero_broadcasts_what_it_reads(self, tmp_path, monkeypatch):
+        """Rank 0 reads the checkpoint's scope and sends it to every rank."""
+        self._save(tmp_path, "adamw", ALL_SCOPE)
+        _, _, manager = self._resume(tmp_path, "adamw", DEFAULT_SCOPE)
+        sent = []
+        monkeypatch.setattr("kempnerforge.checkpoint.manager.dist.is_initialized", lambda: True)
+        monkeypatch.setattr(
+            "kempnerforge.checkpoint.manager.dist.broadcast_object_list",
+            lambda objects, src: sent.append((src, list(objects))),
+        )
+        with pytest.raises(ValueError, match="but this run uses"):
+            manager.load()
+        assert sent == [(0, [(ALL_SCOPE, None)])]
+
+    def test_other_ranks_act_on_what_rank_zero_sends(self, tmp_path, monkeypatch):
+        """A rank other than 0 never reads ``metadata.json``, so it cannot disagree with rank 0."""
+        step_dir = self._save(tmp_path, "adamw", DEFAULT_SCOPE)
+        (step_dir / "metadata.json").write_text("{not json")
+        _, _, manager = self._resume(tmp_path, "adamw", DEFAULT_SCOPE)
+        manager._rank = 1
+
+        def broadcast(objects, src):
+            objects[0] = (ALL_SCOPE, None)
+
+        monkeypatch.setattr("kempnerforge.checkpoint.manager.dist.is_initialized", lambda: True)
+        monkeypatch.setattr("kempnerforge.checkpoint.manager.dist.broadcast_object_list", broadcast)
+        with pytest.raises(ValueError, match="weight_decay_scope='all', but this run uses"):
+            manager.load()
+
+    @pytest.mark.parametrize(
+        "error", [OSError("disk gone"), RecursionError("too deep")], ids=["oserror", "recursion"]
+    )
+    def test_any_failure_on_rank_zero_is_broadcast(self, tmp_path, monkeypatch, error):
+        """Whatever stops rank 0 reading still reaches the broadcast, so no rank waits forever."""
+        self._save(tmp_path, "adamw", DEFAULT_SCOPE)
+        _, _, manager = self._resume(tmp_path, "adamw", DEFAULT_SCOPE)
+        sent = []
+
+        def fail(_ckpt_dir):
+            raise error
+
+        monkeypatch.setattr("kempnerforge.checkpoint.manager._read_weight_decay_scope", fail)
+        monkeypatch.setattr("kempnerforge.checkpoint.manager.dist.is_initialized", lambda: True)
+        monkeypatch.setattr(
+            "kempnerforge.checkpoint.manager.dist.broadcast_object_list",
+            lambda objects, src: sent.append(list(objects)),
+        )
+        with pytest.raises(ValueError, match="Cannot check the weight_decay_scope"):
+            manager.load()
+        assert sent == [[(None, f"{type(error).__name__}: {error}")]]
+
+    def test_other_ranks_raise_what_rank_zero_could_not_read(self, tmp_path, monkeypatch):
+        """A rank other than 0 raises the reason rank 0 sent, without reading anything itself."""
+        self._save(tmp_path, "adamw", DEFAULT_SCOPE)
+        _, _, manager = self._resume(tmp_path, "adamw", DEFAULT_SCOPE)
+        manager._rank = 1
+
+        def broadcast(objects, src):
+            objects[0] = (None, "rank 0 could not read it")
+
+        monkeypatch.setattr("kempnerforge.checkpoint.manager.dist.is_initialized", lambda: True)
+        monkeypatch.setattr("kempnerforge.checkpoint.manager.dist.broadcast_object_list", broadcast)
+        with pytest.raises(ValueError, match="rank 0 could not read it"):
+            manager.load()

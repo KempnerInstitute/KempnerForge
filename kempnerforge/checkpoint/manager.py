@@ -36,6 +36,7 @@ from torch.distributed.checkpoint.state_dict import (
 
 from kempnerforge.checkpoint.async_save import AsyncCheckpointer
 from kempnerforge.checkpoint.state import build_train_state, restore_train_state
+from kempnerforge.config.optimizer import WEIGHT_DECAY_SCOPES
 from kempnerforge.config.schema import AsyncCheckpointMode, CheckpointConfig
 
 logger = logging.getLogger(__name__)
@@ -48,6 +49,7 @@ _OPTIM_PARAM_GROUPS_PREFIX = "optimizer.param_groups."
 _NEVER_STEPPED_KEY = "optimizer_never_stepped"
 _NEVER_STEPPED_PREFIX = f"{_NEVER_STEPPED_KEY}."
 _OPTIM_PREFIX = "optimizer."
+_UNRECORDED_WEIGHT_DECAY_SCOPE = "exclude_norms_and_biases"
 TrackingSource = Callable[[], list[dict[str, str]]]
 CheckpointRecord = Callable[[str, dict[str, str]], None]
 
@@ -189,6 +191,35 @@ def _params_recorded_never_stepped(fqns: set[str], saved_keys: Iterable[str]) ->
 def _holds_optimizer(saved_keys: Iterable[str]) -> bool:
     """Return whether a checkpoint's keys include the optimizer entry, in either layout."""
     return any(key == "optimizer" or key.startswith(_OPTIM_PREFIX) for key in saved_keys)
+
+
+def _read_weight_decay_scope(ckpt_dir: Path) -> str:
+    """Return the weight-decay scope recorded in a checkpoint's ``metadata.json``.
+
+    A checkpoint with no ``metadata.json``, or one without the field, was written under
+    ``"exclude_norms_and_biases"``, the only grouping that existed before the scope was
+    recorded.
+
+    Raises:
+        ValueError: ``metadata.json`` exists but is not a readable JSON object, or it
+            records a scope outside ``WEIGHT_DECAY_SCOPES``.
+    """
+    metadata_path = ckpt_dir / _METADATA_FILE
+    if not metadata_path.exists():
+        return _UNRECORDED_WEIGHT_DECAY_SCOPE
+    try:
+        meta = json.loads(metadata_path.read_text())
+    except (OSError, ValueError) as e:
+        raise ValueError(f"cannot read {metadata_path}: {e}") from e
+    if not isinstance(meta, dict):
+        raise ValueError(f"{metadata_path} does not hold a JSON object")
+    scope = meta.get("weight_decay_scope", _UNRECORDED_WEIGHT_DECAY_SCOPE)
+    if scope not in WEIGHT_DECAY_SCOPES:
+        raise ValueError(
+            f"{metadata_path} records weight_decay_scope={scope!r}, which is not one of "
+            f"{WEIGHT_DECAY_SCOPES}"
+        )
+    return scope
 
 
 def _reset_to_fresh(optimizer: torch.optim.Optimizer) -> None:
@@ -347,6 +378,11 @@ class CheckpointManager:
         config: Checkpoint configuration.
         model: The model (FSDP-wrapped or plain).
         optimizer: The optimizer.
+        weight_decay_scope: The run's ``optimizer.weight_decay_scope``. When set, every save
+            records it in ``metadata.json``, and a load that does not exclude the optimizer
+            raises ``ValueError`` on every rank, before anything is loaded, when the checkpoint
+            was saved under a different scope. A checkpoint that does not record a scope
+            counts as ``"exclude_norms_and_biases"``.
     """
 
     def __init__(
@@ -356,6 +392,7 @@ class CheckpointManager:
         optimizer: torch.optim.Optimizer,
         process_group=None,
         pp_rank: int | None = None,
+        weight_decay_scope: str | None = None,
     ) -> None:
         self.config = config
         self.model = model
@@ -369,6 +406,7 @@ class CheckpointManager:
         self._async_ckpt = AsyncCheckpointer(mode=config.async_mode)
         self._process_group = process_group
         self._pp_rank = pp_rank
+        self._weight_decay_scope = weight_decay_scope
         self._pending_dataloader_state: dict[str, Any] | None = None
         self._pending_finalize: tuple[int, Path] | None = None
         self._tracking_source: TrackingSource | None = None
@@ -490,11 +528,14 @@ class CheckpointManager:
         return merged
 
     def _sidecar_text(self, meta: dict[str, Any]) -> str:
-        """``meta`` as JSON, plus the live tracking runs when the source can supply them.
+        """``meta`` as JSON, plus the run's ``weight_decay_scope`` when the manager has one and
+        the live tracking runs when the source can supply them.
 
         Everything that depends on the source sits inside one guard: it runs on rank 0 alone,
         so a raise here would strand the other ranks. A bad source costs the ``tracking`` key.
         """
+        if self._weight_decay_scope is not None:
+            meta = {**meta, "weight_decay_scope": self._weight_decay_scope}
         if self._tracking_source is not None:
             try:
                 tracking = self._tracking_source()
@@ -759,6 +800,11 @@ class CheckpointManager:
                                 msg + " (set checkpoint.ignore_freeze_mismatch=true to override)"
                             )
 
+        if self._weight_decay_scope is not None and (
+            exclude_keys is None or "optimizer" not in exclude_keys
+        ):
+            self._check_weight_decay_scope(ckpt_dir)
+
         dcp_dir = ckpt_dir / f"pp{self._pp_rank}" if self._pp_rank is not None else ckpt_dir
 
         load_model = exclude_keys is None or "model" not in exclude_keys
@@ -854,6 +900,39 @@ class CheckpointManager:
         elif fresh_optimizer:
             logger.info(f"{dcp_dir} holds no optimizer state; the optimizer starts fresh")
         return step, tokens_seen, extra
+
+    def _check_weight_decay_scope(self, ckpt_dir: Path) -> None:
+        """Refuse a checkpoint saved under a weight-decay scope other than this manager's.
+
+        Rank 0 reads the checkpoint's scope and broadcasts it, or whatever stopped it reading,
+        so every rank raises or proceeds together and none is left waiting on the broadcast.
+
+        Raises:
+            ValueError: The checkpoint's scope differs from this manager's, or its
+                ``metadata.json`` does not hold a valid scope record.
+        """
+        outcome: list[tuple[str | None, str | None]] = [(None, None)]
+        if self._rank == 0 or not dist.is_initialized():
+            try:
+                outcome[0] = (_read_weight_decay_scope(ckpt_dir), None)
+            except ValueError as e:
+                outcome[0] = (None, str(e))
+            except Exception as e:
+                outcome[0] = (None, f"{type(e).__name__}: {e}")
+        if dist.is_initialized():
+            dist.broadcast_object_list(outcome, src=0)
+        saved, error = outcome[0]
+        if error is not None:
+            raise ValueError(f"Cannot check the weight_decay_scope of {ckpt_dir}: {error}")
+        if saved != self._weight_decay_scope:
+            raise ValueError(
+                f"{ckpt_dir} was saved with optimizer.weight_decay_scope={saved!r}, but this "
+                f"run uses {self._weight_decay_scope!r}. The scope decides the optimizer's "
+                f"param groups, so the saved optimizer state cannot be loaded into this run's "
+                f"groups. Resume with weight_decay_scope={saved!r}, or start a new run from "
+                f"the checkpoint without its optimizer state: checkpoint.load_path="
+                f'{str(ckpt_dir)!r} with checkpoint.exclude_from_loading=["optimizer"].'
+            )
 
     def apply_dataloader_state(self, dataloader: Any) -> None:
         """Apply any dataloader state stashed during load().

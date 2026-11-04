@@ -1189,6 +1189,7 @@
             "flush_pending_save()",
             "peek_saved_step(path)",
             "load(path, scheduler, dataloader, exclude_keys, vlm_freeze_expected)",
+            "_check_weight_decay_scope(ckpt_dir) (rank 0 reads the saved scope and broadcasts it; every rank refuses a mismatch)",
             "apply_dataloader_state(dataloader)",
             "_resolve_load_path(path)",
             "_cleanup()"
@@ -1197,9 +1198,11 @@
       },
       "functions": [
         "_load_train_state(path) -> dict (ownership-gated torch.load with weights_only=False)",
-        "_intersect_freeze_meta_by_module(saved, expected) -> (saved_filt, expected_filt) (cross-arch drop-zero-match rule)"
+        "_intersect_freeze_meta_by_module(saved, expected) -> (saved_filt, expected_filt) (cross-arch drop-zero-match rule)",
+        "_read_weight_decay_scope(ckpt_dir) -> str (scope recorded in metadata.json; none recorded means exclude_norms_and_biases)"
       ],
       "tested_by": [
+        "tests/unit/test_checkpoint.py::TestWeightDecayScopeOnResume",
         "tests/unit/test_checkpoint.py::TestCheckpointRetention",
         "tests/unit/test_checkpoint.py::TestFlushPendingSave",
         "tests/unit/test_checkpoint.py::TestPeekSavedStep",

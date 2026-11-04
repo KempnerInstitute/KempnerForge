@@ -183,6 +183,7 @@ def build_checkpoint_manager(
         optimizer,
         process_group=ckpt_pg,
         pp_rank=ckpt_pp_rank,
+        weight_decay_scope=config.optimizer.weight_decay_scope,
     )
 
 

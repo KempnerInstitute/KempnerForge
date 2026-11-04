@@ -9,6 +9,7 @@ dispatch, and the data-pipeline builder.
 from __future__ import annotations
 
 import dataclasses
+import json
 from typing import Any
 
 import pytest
@@ -980,6 +981,19 @@ class TestBuildPhaseHelpers:
         )
         assert mgr._process_group is None
         assert mgr._pp_rank is None
+
+    def test_checkpoint_manager_records_the_weight_decay_scope(self, tmp_path):
+        from kempnerforge.training.entry import build_checkpoint_manager
+
+        config = make_config()
+        config.checkpoint.dir = str(tmp_path / "ckpt")
+        config.optimizer.weight_decay_scope = "all"
+        model = TinyTextModel()
+        build_checkpoint_manager(
+            config, _runtime(), model, torch.optim.SGD(model.parameters(), lr=0.1), None
+        ).save(step=0)
+        meta = json.loads((tmp_path / "ckpt" / "step_0" / "metadata.json").read_text())
+        assert meta["weight_decay_scope"] == "all"
 
     def test_restore_checkpoint_starts_from_scratch(self, tmp_path):
         from kempnerforge.training.entry import build_checkpoint_manager, restore_checkpoint
