@@ -48,9 +48,13 @@ you from optimizing into garbage. The usual flow:
    `--checkpoint.load_path=checkpoints/<run>/step_M`, and a reduced
    spike-prone feature (e.g., turn off FP8 if you were testing it). A
    lower `--optimizer.lr` does not take effect here, because the
-   restore brings back the saved base LR, and a longer warmup lowers
-   the LR only if it extends past `step_M`. Keeping the old
-   `--checkpoint.dir` resumes its newest
+   restore brings back the saved base LR. A longer
+   `--scheduler.warmup_steps` does, but it lowers the LR right after
+   `step_M` only when `M / warmup_steps` falls below the old schedule's
+   factor at step `M`, and can raise it otherwise, even when it extends
+   past `step_M` (see
+   [NaN detection § Rollback recommendation](../resilience/nan-detection.md#rollback-recommendation)).
+   Keeping the old `--checkpoint.dir` resumes its newest
    checkpoint instead, since `load_path` is not used while
    `checkpoint.dir` holds a checkpoint (rank 0 logs a warning naming
    both paths).
