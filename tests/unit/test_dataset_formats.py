@@ -86,7 +86,7 @@ class TestDeclaredBinDtype:
         assert _samples(ds) == _chunks(tokens)
 
     def test_shards_of_both_parities_in_one_uint16_corpus(self, tmp_path):
-        """The size guess read the even shard as uint32 and the odd one as uint16."""
+        """Every shard of a declared uint16 corpus is read as uint16, odd token count or even."""
         even = np.arange(0, 64, dtype=np.uint16)
         odd = np.arange(500, 567, dtype=np.uint16)
         _write_bin(tmp_path / "tokens_000.bin", even)
@@ -142,7 +142,7 @@ class TestDeclaredBinDtype:
 class TestPartialBinShards:
     @pytest.mark.parametrize("missing_bytes", [1, 2, 3])
     def test_truncated_uint32_shard_is_rejected(self, tmp_path, missing_bytes):
-        """The size guess read a uint32 shard missing 1 to 3 bytes as uint16 and trained on it."""
+        """A uint32 shard 1 to 3 bytes short of a whole token is rejected."""
         raw = np.arange(64, dtype=np.uint32).tobytes()[:-missing_bytes]
         (tmp_path / "tokens_000.bin").write_bytes(raw)
         _write_metadata(tmp_path, "uint32")
@@ -249,7 +249,7 @@ class TestTokenMetadataFile:
 class TestMixedFileFormats:
     @pytest.mark.parametrize("bin_sorts_first", [True, False], ids=["bin_first", "npy_first"])
     def test_each_file_is_read_by_its_own_suffix(self, tmp_path, bin_sorts_first):
-        """The format of the first sorted file used to decide how every file was read."""
+        """Each file is read by its own suffix, whichever format sorts first."""
         bin_tokens = np.arange(1000, 1067, dtype=np.uint16)
         npy_tokens = np.arange(100_000, 100_064, dtype=np.uint32)
         bin_name, npy_name = ("a", "b") if bin_sorts_first else ("b", "a")
