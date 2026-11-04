@@ -640,6 +640,40 @@ class TestJobConfig:
         with pytest.raises(ValueError, match="train.seq_len.*insufficient for VLM"):
             config.validate(world_size=1)
 
+    def test_tiled_views_count_toward_the_vlm_budget(self):
+        """3 × 3 crops plus the whole image are 10 views of 16 tokens: 160 + 64 text."""
+        config = JobConfig(
+            model=ModelConfig(max_seq_len=1024),
+            vision_encoder=VisionEncoderConfig(type="random", num_tokens=16),
+            adapter=AdapterConfig(),
+            vlm=VLMConfig(max_text_len=64, tile_grid=3),
+            train=TrainConfig(seq_len=200),
+        )
+        assert config.views_per_sample == 10
+        with pytest.raises(ValueError, match=r"residual_image_tokens \(160\)"):
+            config.validate(world_size=1)
+        config.train.seq_len = 224
+        config.validate(world_size=1)
+
+    def test_tiled_views_must_fit_max_seq_len_at_construction(self):
+        with pytest.raises(ValueError, match=r"residual_image_tokens \(160\)"):
+            JobConfig(
+                model=ModelConfig(max_seq_len=200),
+                vision_encoder=VisionEncoderConfig(type="random", num_tokens=16),
+                adapter=AdapterConfig(),
+                vlm=VLMConfig(max_text_len=64, tile_grid=3),
+            )
+
+    def test_views_per_sample_is_one_for_text_and_untiled_runs(self):
+        assert JobConfig().views_per_sample == 1
+        config = JobConfig(
+            model=ModelConfig(max_seq_len=1024),
+            vision_encoder=VisionEncoderConfig(type="random", num_tokens=16),
+            adapter=AdapterConfig(),
+            vlm=VLMConfig(max_text_len=64),
+        )
+        assert config.views_per_sample == 1
+
     def test_validate_vlm_pp_rejected(self):
         config = JobConfig(
             model=ModelConfig(max_seq_len=1024),

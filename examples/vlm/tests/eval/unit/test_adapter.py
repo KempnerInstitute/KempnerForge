@@ -42,6 +42,7 @@ from kempnerforge.data.vlm_dataset import (
     DEFAULT_IMAGE_MEAN,
     DEFAULT_IMAGE_STD,
     pil_to_tensor,
+    tile_image,
 )
 from kempnerforge.model.vlm import VLMWrapper, build_vlm_wrapper
 
@@ -276,6 +277,19 @@ class TestFramesToPixelValues:
         from_pil = _frames_to_pixel_values([img], image_size=16, device=DEVICE, dtype=torch.float32)
         assert from_path.shape == (1, 3, 16, 16)
         assert torch.allclose(from_path, from_pil)
+
+    def test_tiling_matches_the_training_preprocessor(self):
+        img = Image.new("RGB", (40, 24), color=(200, 30, 10))
+        pv = _frames_to_pixel_values(
+            [img], image_size=16, device=DEVICE, dtype=torch.float32, tile_grid=2
+        )
+        assert pv.shape == (1, 5, 3, 16, 16)
+        expected = tile_image(img, 16, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD, grid=2)
+        assert torch.equal(pv[0], expected)
+        crops = _frames_to_pixel_values(
+            [img], image_size=16, device=DEVICE, dtype=torch.float32, tile_grid=2, tile_global=False
+        )
+        assert crops.shape == (1, 4, 3, 16, 16)
 
 
 class TestToPil:
@@ -726,6 +740,19 @@ class TestBuildModel:
         job = _vlm_job_config(tiny_vlm_configs)
         model = _build_model(job, torch.device("cpu"), torch.float32)
         assert model.frames_per_clip == 1
+
+    def test_tiled_image_config_builds_for_its_views(self, tiny_vlm_configs):
+        mc, vc, ac, lc = tiny_vlm_configs
+        job = JobConfig(
+            model=mc,
+            vision_encoder=vc,
+            adapter=ac,
+            vlm=VLMConfig(max_text_len=8, tile_grid=2),
+            data=DataConfig(tokenizer_path="mock"),
+        )
+        model = _build_model(job, torch.device("cpu"), torch.float32)
+        assert model.frames_per_clip == job.views_per_sample == 5
+        assert model.num_image_tokens == 40
 
 
 class TestGenerateUntil:

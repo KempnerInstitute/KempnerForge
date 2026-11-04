@@ -73,6 +73,7 @@ from kempnerforge.data.vlm_dataset import (
     frames_to_clip_tensor,
     pil_to_tensor,
     resolve_pad_id,
+    tile_image,
 )
 from kempnerforge.metrics.logger import get_logger
 from kempnerforge.model.generate import sample
@@ -103,13 +104,12 @@ def _build_model(config: JobConfig, device: torch.device, dtype: torch.dtype) ->
     assert config.vlm is not None, "internal: _build_model requires a VLM config"
     assert config.vision_encoder is not None, "internal: VLM config requires a vision encoder"
     assert config.adapter is not None, "internal: VLM config materializes a default adapter"
-    frames_per_clip = config.video.max_frames if config.video is not None else 1
     model = build_vlm_wrapper(
         config.model,
         config.vision_encoder,
         config.adapter,
         config.vlm,
-        frames_per_clip=frames_per_clip,
+        frames_per_clip=config.views_per_sample,
     )
     return model.to(device=device, dtype=dtype)
 
@@ -305,7 +305,13 @@ def _to_pil(frame: Any) -> Any:
 
 
 def _frames_to_pixel_values(
-    frames: list[Any], image_size: int, device: torch.device, dtype: torch.dtype
+    frames: list[Any],
+    image_size: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    *,
+    tile_grid: int = 0,
+    tile_global: bool = True,
 ) -> torch.Tensor:
     """Convert an ordered list of frames to a ``(num_frames, 3, H, W)`` tensor.
 
@@ -313,11 +319,26 @@ def _frames_to_pixel_values(
     normalize) as the single source of truth. v1 passes a single image (a
     length-1 list); the list shape is the seam for future video (ordered
     frames). Each frame may be a ``PIL.Image`` or a path string (see ``_to_pil``).
+    With ``tile_grid`` each frame is cut into views by the training-time
+    ``tile_image`` and the tensor is ``(num_frames, views, 3, H, W)``.
     """
-    tensors = [
-        pil_to_tensor(_to_pil(frame), image_size, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD)
-        for frame in frames
-    ]
+    if tile_grid:
+        tensors = [
+            tile_image(
+                _to_pil(frame),
+                image_size,
+                DEFAULT_IMAGE_MEAN,
+                DEFAULT_IMAGE_STD,
+                grid=tile_grid,
+                include_global=tile_global,
+            )
+            for frame in frames
+        ]
+    else:
+        tensors = [
+            pil_to_tensor(_to_pil(frame), image_size, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD)
+            for frame in frames
+        ]
     return torch.stack(tensors, dim=0).to(device=device, dtype=dtype)
 
 
@@ -520,11 +541,12 @@ class KempnerForgeVLM(lmms):
         _check_generative(self._config.vlm)
 
         self._is_video = self._config.is_video
+        self._frames_per_clip = self._config.views_per_sample
+        self._tile_grid = self._config.vlm.tile_grid
+        self._tile_global = self._config.vlm.tile_global
         if self._config.video is not None:
-            self._frames_per_clip = self._config.video.max_frames
             self._frame_size = self._config.video.frame_size
         else:
-            self._frames_per_clip = 1
             self._frame_size = self._config.data.hf_image_size
 
         self._model = _load_weights(self._config, checkpoint, self._device, self._dtype)
@@ -571,7 +593,12 @@ class KempnerForgeVLM(lmms):
                         mask = fmask.to(device=self._device)
                     else:
                         pixels = _frames_to_pixel_values(
-                            frames, self._frame_size, self._device, self._dtype
+                            frames,
+                            self._frame_size,
+                            self._device,
+                            self._dtype,
+                            tile_grid=self._tile_grid,
+                            tile_global=self._tile_global,
                         )
                         mask = None
                     prompt_tensor = torch.tensor(token_ids, dtype=torch.long, device=self._device)
