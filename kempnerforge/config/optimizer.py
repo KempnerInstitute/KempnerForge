@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+WEIGHT_DECAY_SCOPES = ("exclude_norms_and_biases", "all")
 MUON_ADJUST_LR_MODES = ("original", "match_rms_adamw", "spectral_unclamped")
 MUON_ORTHOGONALIZE_MODES = ("local", "exact")
 
@@ -25,12 +26,18 @@ class OptimizerConfig:
     muon_adjust_lr: str = "original"
     muon_orthogonalize: str = "local"
     schedule_free_warmup_steps: int = 0
+    weight_decay_scope: str = "exclude_norms_and_biases"
 
     def __post_init__(self) -> None:
         if self.lr <= 0:
             raise ValueError("lr must be positive")
         if self.weight_decay < 0:
             raise ValueError("weight_decay must be non-negative")
+        if self.weight_decay_scope not in WEIGHT_DECAY_SCOPES:
+            raise ValueError(
+                f"weight_decay_scope must be one of {WEIGHT_DECAY_SCOPES}, "
+                f"got {self.weight_decay_scope!r}"
+            )
         if not (0 <= self.betas[0] < 1 and 0 <= self.betas[1] < 1):
             raise ValueError("betas must be in [0, 1)")
         if not (0 < self.muon_momentum < 1):
