@@ -220,6 +220,65 @@ class TestRoundTrip:
         with torch.no_grad():
             assert torch.equal(model.transformer(tokens), hf_model(input_ids=tokens).logits)
 
+    def test_tied_source_starts_an_untied_head_as_a_copy(
+        self, sources: Sources, tmp_path: Path
+    ) -> None:
+        """A tied source fills an untied target's head from its token embedding."""
+        source, hf_model = sources[True]
+        config_path = _target(tmp_path, model={"tie_embeddings": False})
+        out = tmp_path / "init"
+        conv.main(["--hf-dir", str(source), "--config", config_path, "--out", str(out)])
+
+        config = load_config(config_path, cli_args=[])
+        assert config.vlm is not None and config.vision_encoder is not None
+        assert config.adapter is not None
+        torch.manual_seed(1234)
+        model = build_vlm_wrapper(config.model, config.vision_encoder, config.adapter, config.vlm)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        manager = CheckpointManager(config.checkpoint, model, optimizer)
+        assert manager.load(path=str(out), exclude_keys=["optimizer"]) == (0, 0, {})
+
+        head, embed = model.transformer.output_head, model.transformer.token_embedding
+        assert head is not None and embed is not None
+        assert head.proj.weight is not embed.embedding.weight, "an untied target must not share"
+        assert torch.equal(head.proj.weight, embed.embedding.weight)
+
+        tokens = torch.randint(0, 128, (2, 48), generator=torch.Generator().manual_seed(3))
+        with torch.no_grad():
+            assert torch.equal(model.transformer(tokens), hf_model(input_ids=tokens).logits)
+
+    def test_tied_source_shipping_its_own_head_keeps_that_head(
+        self, tied_copy: Path, tmp_path: Path
+    ) -> None:
+        """A source declaring a tie but shipping a distinct head keeps the head it ships.
+
+        The untied target uses both tensors as the source supplied them, so there is
+        nothing to resolve. A tied target must discard one of the two and is refused.
+        """
+        _edit_weights(
+            tied_copy,
+            lambda w: w.update(lm_head=w["model.embed_tokens.weight"] + 1.0),
+        )
+        _edit_weights(tied_copy, lambda w: w.update({"lm_head.weight": w.pop("lm_head")}))
+
+        out = conv.convert(
+            str(tied_copy),
+            _target(tmp_path, model={"tie_embeddings": False}),
+            str(tmp_path / "untied"),
+        )
+        saved = _read_dcp(out)
+        head = saved["model.transformer.output_head.proj.weight"]
+        embed = saved["model.transformer.token_embedding.embedding.weight"]
+        assert not torch.equal(head, embed), "the source's own head must survive"
+
+        _refuses(
+            tied_copy,
+            _target(tmp_path, model={"tie_embeddings": True}),
+            tmp_path / "tied",
+            ValueError,
+            "differs from",
+        )
+
     def test_older_config_layout_converts(self, tied_copy: Path, tmp_path: Path) -> None:
         """Top-level ``rope_theta`` and a null ``rope_scaling``, as older exports write it."""
         config_file = tied_copy / "config.json"
@@ -369,10 +428,6 @@ class TestConfigRefusals:
                 ["hidden_size=64 but model.dim=128", "head_dim=16 but model.head_dim=32"],
             ),
             ({"activation": "gelu"}, ["hidden_act='silu' but model.activation='gelu'"]),
-            (
-                {"tie_embeddings": False},
-                ["tie_word_embeddings=True but model.tie_embeddings=False"],
-            ),
             ({"qk_norm": False}, ["model.qk_norm must be true"]),
             ({"norm_type": "layernorm"}, ["model.norm_type='layernorm'"]),
             ({"num_experts": 2}, ["model.num_experts > 0"]),
@@ -387,7 +442,6 @@ class TestConfigRefusals:
             "vocab_size",
             "dim",
             "activation",
-            "tie_embeddings",
             "qk_norm",
             "norm_type",
             "num_experts",
@@ -444,6 +498,14 @@ class TestConfigRefusals:
                 lambda c: [c.pop(field, None) for field in _ROPE_FIELDS],
                 "config.json gives no RoPE theta, so the installed transformers applies",
             ),
+            (
+                lambda c: c.pop("tie_word_embeddings"),
+                "config.json has no tie_word_embeddings",
+            ),
+            (
+                lambda c: c.update(tie_word_embeddings="false"),
+                "tie_word_embeddings='false' is not true or false",
+            ),
         ],
         ids=[
             "model_type",
@@ -457,6 +519,8 @@ class TestConfigRefusals:
             "rope_scaling_carries_another_theta",
             "rope_scaling_names_two_types",
             "rope_theta_declared_nowhere",
+            "tie_word_embeddings_missing",
+            "tie_word_embeddings_not_bool",
         ],
     )
     def test_source_the_target_cannot_express(
