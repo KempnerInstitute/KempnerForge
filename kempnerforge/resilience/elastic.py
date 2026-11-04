@@ -111,7 +111,9 @@ def resolve_resume_path(checkpoint_dir: str) -> Path | None:
     optimizer state without the step, LR schedule and data position that go with
     it, which ``CheckpointManager.load`` refuses. Skipping both kinds turns an
     unrecoverable run into one that resumes from the last complete checkpoint,
-    whatever left the partial directory behind.
+    whatever left the partial directory behind. When ``step_N`` directories
+    exist but none is complete, a run that meant to resume starts over, so that
+    is logged at ERROR.
 
     Args:
         checkpoint_dir: Base checkpoint directory.
