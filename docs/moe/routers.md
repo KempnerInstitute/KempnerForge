@@ -156,7 +156,8 @@ On `configs/model/moe_small.toml` that happens from `N = 3`, where
 2048 × 21504. Below that, the default `muon_adjust_lr = "original"`
 scales an update by `sqrt(max(1, rows / cols))`, which offsets the
 smaller entries of the taller orthogonalized matrix, so the per-entry
-update stays near one expert's.
+update stays near one expert's. `down_proj` is wider, so its factor
+is 1, and its per-entry update is about `1/sqrt(N)` of one expert's.
 
 DeepSeek's original motivation: the shared expert absorbs the
 "universal" capacity so routed experts can specialize. In practice,
