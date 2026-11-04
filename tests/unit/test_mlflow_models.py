@@ -11,7 +11,7 @@ import threading
 
 import pytest
 
-from kempnerforge.metrics.mlflow_models import (
+from kempnerforge.metrics.mlflow.models import (
     checkpoint_model_name,
     find_or_create_checkpoint_model,
 )
