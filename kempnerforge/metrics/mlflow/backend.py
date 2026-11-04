@@ -39,22 +39,20 @@ from kempnerforge.metrics.tracker import (
 
 logger = get_logger(__name__)
 
-# Tracking is a side channel: a slow or unreachable server may cost points, never a stalled rank.
-_CALL_DEADLINE_S = 60.0  # one metric / param / tag call
-_UPLOAD_DEADLINE_S = 180.0  # one artifact upload
-_INIT_DEADLINE_S = 60.0  # experiment setup plus run start or resume, on the first log
-_END_DEADLINE_S = 60.0  # ending the run in close(), after the drain
+_CALL_DEADLINE_S = 60.0
+_UPLOAD_DEADLINE_S = 180.0
+_INIT_DEADLINE_S = 60.0
+_END_DEADLINE_S = 60.0
 _REGISTER_DEADLINE_S = 180.0
-_DRAIN_DEADLINE_S = 30.0  # close() flush budget
-_QUEUE_MAX = 256  # pending calls before new ones are dropped
-_MAX_CALL_THREADS = 4  # live call threads, abandoned ones included, before new calls are dropped
+_DRAIN_DEADLINE_S = 30.0
+_QUEUE_MAX = 256
+_MAX_CALL_THREADS = 4
 
 
 def _import_mlflow() -> Any:
     """Import mlflow with bounded HTTP requests; values already set in the environment win."""
     os.environ.setdefault("MLFLOW_HTTP_REQUEST_TIMEOUT", "30")
     os.environ.setdefault("MLFLOW_HTTP_REQUEST_MAX_RETRIES", "3")
-    # The Databricks SDK transport keeps its own request timeout; this caps how long it retries.
     os.environ.setdefault("MLFLOW_DATABRICKS_ENDPOINT_HTTP_RETRY_TIMEOUT", "60")
     import mlflow
 
@@ -71,7 +69,7 @@ def _resolve_mlflow_experiment(config: MetricsConfig, uri: str) -> str | None:
     """
     on_databricks = uri.startswith("databricks")
     if config.mlflow_experiment:
-        return config.mlflow_experiment  # validated in MetricsConfig.__post_init__
+        return config.mlflow_experiment
     env_experiment = os.environ.get("MLFLOW_EXPERIMENT")
     if env_experiment:
         if on_databricks and not env_experiment.startswith("/"):
@@ -88,14 +86,13 @@ def _resolve_mlflow_experiment(config: MetricsConfig, uri: str) -> str | None:
 
         user = WorkspaceClient().current_user.me().user_name
         return f"/Users/{user}/{project}"
-    except Exception as e:  # SDK missing, no creds, or API error
+    except Exception as e:
         logger.warning(
             _scrub_uris(f"Could not auto-resolve Databricks experiment path: {e}{_auth_hint(e)}")
         )
         return None
 
 
-# Run metadata, not params: a user-typed tag key can be MLflow-illegal and fail its whole batch.
 _PARAM_SKIP = ("metrics.mlflow_tags", "metrics.mlflow_description")
 
 
@@ -146,34 +143,27 @@ def _mlflow_last_step(mlflow: Any, run_id: str) -> int | None:
         return None
 
 
-# The worker thread has no active run (mlflow keeps it in thread-local state), so each call
-# below names its run; an implicit call there would silently start a new run.
 def _mlflow_log_metrics(mlflow: Any, run_id: str, metrics: dict[str, float], step: int) -> None:
-    # synchronous=True: MLFLOW_ENABLE_ASYNC_LOGGING would otherwise divert these into
-    # mlflow's own unbounded queue with a blocking flush at shutdown; bounding lives in
-    # the worker, so the call itself must stay synchronous.
     mlflow.log_metrics(
         {k: float(v) for k, v in metrics.items()}, step=step, run_id=run_id, synchronous=True
     )
 
 
 def _mlflow_set_tag(mlflow: Any, run_id: str, key: str, value: str) -> None:
-    # fluent set_tags has no run_id; synchronous=True for the same reason as in log_metrics
     mlflow.MlflowClient().set_tag(run_id, key, value, synchronous=True)
 
 
-# mlflow's standard run tags: the description shown in its UI, and the code version.
 _NOTE_TAG = "mlflow.note.content"
 _GIT_COMMIT_TAG = "mlflow.source.git.commit"
 _GIT_DIRTY_TAG = "mlflow.source.git.dirty"
 _CONFIG_ARTIFACT = "config.json"
-_GIT_TIMEOUT_S = 10.0  # per git query; both fit inside the tag call's own deadline
+_GIT_TIMEOUT_S = 10.0
 _GIT_SHA = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 
 
 def _git_output(*args: str) -> str | None:
     """Stdout of ``git <args>`` in the working directory; None, noted at debug level, on failure."""
-    env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}  # no index lock for a read-only query
+    env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}
     try:
         done = subprocess.run(
             ["git", *args],
@@ -184,7 +174,7 @@ def _git_output(*args: str) -> str | None:
             env=env,
             timeout=_GIT_TIMEOUT_S,
         )
-    except (OSError, subprocess.SubprocessError) as e:  # no git binary, or no answer in time
+    except (OSError, subprocess.SubprocessError) as e:
         logger.debug(f"MLflow: git {args[0]} did not run ({e})")
         return None
     if done.returncode != 0:
@@ -220,7 +210,7 @@ def _mlflow_set_git_tags(mlflow: Any, run_id: str) -> None:
 
 
 def _mlflow_log_config(mlflow: Any, run_id: str, config: dict[str, Any]) -> None:
-    mlflow.MlflowClient().log_dict(run_id, config, _CONFIG_ARTIFACT)  # stringifies non-JSON values
+    mlflow.MlflowClient().log_dict(run_id, config, _CONFIG_ARTIFACT)
 
 
 def _launch_toml_arg() -> str | None:
@@ -262,15 +252,15 @@ class MLflowBackend(_LoggingBackend):
 
     def __init__(self, config: MetricsConfig, job_config: JobConfig | None = None) -> None:
         self._config = config
-        self._job_config = job_config  # params and config.json come from it, for a fresh run only
-        self._uri = ""  # the resolved tracking URI, set when init starts
-        self._active: bool | None = None  # None = not tried, True = live, False = failed
-        self._run_started = False  # a run exists that close() must end
-        self._resume_skip_below: int | None = None  # skip re-logging steps already in the run
-        self._mlflow: Any = None  # the imported module
+        self._job_config = job_config
+        self._uri = ""
+        self._active: bool | None = None
+        self._run_started = False
+        self._resume_skip_below: int | None = None
+        self._mlflow: Any = None
         self._run_id = ""
         self._run_name = ""
-        self._experiment = ""  # the experiment the run was set up in, set with the run id
+        self._experiment = ""
         self._worker = _BestEffortWorker(
             "MLflow",
             max_queue=_QUEUE_MAX,
@@ -292,7 +282,6 @@ class MLflowBackend(_LoggingBackend):
         try:
             _prepare_databricks_auth(self._uri)
             self._mlflow = _import_mlflow()
-            # The training thread waits here at most once, for at most the init deadline.
             experiment, run_id, run_name, resumed, last_step = self._owner.start(_INIT_DEADLINE_S)
             self._run_started = True
             self._run_id = run_id
@@ -315,7 +304,7 @@ class MLflowBackend(_LoggingBackend):
                 "the environment is incomplete, run: uv sync"
             )
             self._active = False
-        except Exception as e:  # mlflow talks to a remote server: network / auth / config errors
+        except Exception as e:
             hint = _auth_hint(e) if on_databricks else ""
             logger.warning(_scrub_uris(f"MLflow init failed: {e}{hint}"))
             self._active = False
@@ -330,14 +319,14 @@ class MLflowBackend(_LoggingBackend):
         mlflow.set_tracking_uri(uri)
         try:
             experiment = _resolve_mlflow_experiment(self._config, uri)
-        except ValueError as e:  # bad $MLFLOW_EXPERIMENT: a deliberate config error
+        except ValueError as e:
             raise _MlflowDisabled(str(e)) from e
         if uri.startswith("databricks") and not experiment:
             raise _MlflowDisabled(
                 "could not resolve a Databricks experiment path "
                 "(set mlflow_experiment or $MLFLOW_EXPERIMENT to an absolute path)"
             )
-        mlflow.set_experiment(experiment)  # never empty here: off Databricks a name always resolves
+        mlflow.set_experiment(experiment)
         if self._config.mlflow_log_system_metrics:
             mlflow.set_system_metrics_sampling_interval(self._config.mlflow_system_metrics_interval)
         run, resumed = self._start_run(mlflow)
@@ -358,7 +347,7 @@ class MLflowBackend(_LoggingBackend):
                 return mlflow.start_run(run_id=run_id, **kwargs), True
             except Exception as e:
                 if not _mlflow_run_gone(e):
-                    raise  # transient/other error — don't fork a new run; let init disable
+                    raise
                 logger.warning(
                     _scrub_uris(f"MLflow run_id={run_id} is gone ({e}); starting a new run")
                 )
@@ -374,7 +363,6 @@ class MLflowBackend(_LoggingBackend):
 
         hyperparams = _flatten_config_params(self._job_config) if self._job_config else {}
         items = list(hyperparams.items())
-        # log_params caps at 100 per batch; one call per batch so a bad batch keeps the rest.
         for i in range(0, len(items), 100):
             batch = dict(items[i : i + 100])
             self._worker.submit(
@@ -385,7 +373,7 @@ class MLflowBackend(_LoggingBackend):
         tags = {"host": socket.gethostname(), "slurm_job_id": os.environ.get("SLURM_JOB_ID", "")}
         if self._config.mlflow_description:
             tags[_NOTE_TAG] = self._config.mlflow_description
-        tags.update(self._config.mlflow_tags)  # configured tags override the automatic ones
+        tags.update(self._config.mlflow_tags)
         for key, value in tags.items():
             call = partial(_mlflow_set_tag, mlflow, self._run_id, key, value)
             self._worker.submit(f"set_tag {key}", call)
@@ -404,7 +392,7 @@ class MLflowBackend(_LoggingBackend):
         if self._active is not True:
             return
         if self._resume_skip_below is not None and step <= self._resume_skip_below:
-            return  # already logged before this resume — avoid duplicate history points
+            return
         call = partial(_mlflow_log_metrics, self._mlflow, self._run_id, dict(metrics), step)
         self._worker.submit("log_metrics", call)
 
@@ -503,7 +491,7 @@ class MLflowBackend(_LoggingBackend):
         try:
             self._worker.close()
             self._owner.end(_END_DEADLINE_S)
-        except Exception as e:  # teardown must not fail the job
+        except Exception as e:
             logger.warning(_scrub_uris(f"MLflow end_run failed ({e})"))
         finally:
             self._active = False

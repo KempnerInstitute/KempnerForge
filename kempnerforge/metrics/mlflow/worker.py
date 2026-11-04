@@ -18,7 +18,7 @@ from kempnerforge.metrics.tracker import _scrub_uris
 
 logger = get_logger(__name__)
 
-_WARN_INTERVAL_S = 300.0  # minimum gap between repeats of a warning
+_WARN_INTERVAL_S = 300.0
 
 
 class _RateLimitedWarning:
@@ -67,10 +67,10 @@ class _BestEffortWorker:
         self._max_threads = max_threads
         self._call_deadline = call_deadline
         self._drain_deadline = drain_deadline
-        self._calls: list[threading.Thread] = []  # call threads not yet seen to finish
+        self._calls: list[threading.Thread] = []
         self._items: deque[tuple[str, Callable[[], Any], float]] = deque()
         self._cv = threading.Condition()
-        self._busy = False  # a dequeued call is still being waited on
+        self._busy = False
         self._closed = False
         self._thread = threading.Thread(target=self._consume, name=f"{name}-tracking", daemon=True)
         self._warn_call = _RateLimitedWarning(_WARN_INTERVAL_S)
@@ -130,7 +130,7 @@ class _BestEffortWorker:
                 self._busy = True
             try:
                 self._run(what, fn, deadline)
-            except Exception as e:  # the worker must outlive any single call
+            except Exception as e:
                 self._warn_call(f"{self._name} {what} not run ({e}); points may be lost")
             finally:
                 with self._cv:
@@ -150,7 +150,7 @@ class _BestEffortWorker:
         def call() -> None:
             try:
                 fn()
-            except Exception as e:  # reported by the worker, not raised in a stray thread
+            except Exception as e:
                 failure.append(e)
 
         thread = threading.Thread(target=call, name=f"{self._name}-call", daemon=True)
@@ -177,9 +177,9 @@ class _RunOwner:
     def __init__(self, name: str, start: Callable[[], Any], end: Callable[[], Any]) -> None:
         self._start_fn = start
         self._end_fn = end
-        self._started = threading.Event()  # start returned or raised
+        self._started = threading.Event()
         self._end_requested = threading.Event()
-        self._ended = threading.Event()  # end returned or raised, or there was nothing to end
+        self._ended = threading.Event()
         self._result: Any = None
         self._start_error: Exception | None = None
         self._end_error: Exception | None = None
@@ -189,7 +189,7 @@ class _RunOwner:
         """Return what ``start`` returned; re-raise its error, or TimeoutError past ``deadline``."""
         self._thread.start()
         if not self._started.wait(deadline):
-            self._end_requested.set()  # the start still running is ended as soon as it returns
+            self._end_requested.set()
             raise TimeoutError(f"no answer from the tracking server within {deadline:g}s")
         if self._start_error is not None:
             raise self._start_error
@@ -206,13 +206,13 @@ class _RunOwner:
     def _own(self) -> None:
         try:
             self._result = self._start_fn()
-        except Exception as e:  # raised again by start(), on the caller's thread
+        except Exception as e:
             self._start_error = e
         self._started.set()
         if self._start_error is None:
             self._end_requested.wait()
             try:
                 self._end_fn()
-            except Exception as e:  # raised again by end()
+            except Exception as e:
                 self._end_error = e
         self._ended.set()

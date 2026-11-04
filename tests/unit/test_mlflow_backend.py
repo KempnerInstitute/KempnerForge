@@ -53,19 +53,19 @@ class _FakeMlflow:
         self.start_run_ids: list = []
         self.end_run_calls = 0
         self.logged_params: list = []
-        self.logged_tags: list = []  # (key, value) pairs set through MlflowClient().set_tag
+        self.logged_tags: list = []
         self.last_set_tag_synchronous = None
-        self.logged_dicts: list = []  # (artifact file, dict) from MlflowClient().log_dict
-        self.uploaded_files: list = []  # (file name, bytes) from MlflowClient().log_artifact
-        self.history_steps: list = []  # steps returned by MlflowClient().get_metric_history
-        self.calls: list = []  # (call, run_id, thread id) of every metric / param / tag / upload
-        self.tracking_uris: list = []  # every URI handed to set_tracking_uri
-        self.lifecycle_threads: dict = {}  # thread id that ran start_run / end_run
-        self.steps_at_end: list | None = None  # log_steps when end_run was called
+        self.logged_dicts: list = []
+        self.uploaded_files: list = []
+        self.history_steps: list = []
+        self.calls: list = []
+        self.tracking_uris: list = []
+        self.lifecycle_threads: dict = {}
+        self.steps_at_end: list | None = None
         self.sampling_intervals: list = []
-        self.ended: list = []  # run ids end_run found active on its own thread
-        self.monitor_alive = False  # stand-in for the system metrics monitor of the active run
-        self._active = threading.local()  # like mlflow, the active run is per thread
+        self.ended: list = []
+        self.monitor_alive = False
+        self._active = threading.local()
 
     def set_tracking_uri(self, uri):
         self.tracking_uris.append(uri)
@@ -99,7 +99,7 @@ class _FakeMlflow:
         self.steps_at_end = list(self.log_steps)
         self.end_run_calls += 1
         run = getattr(self._active, "run", None)
-        if run is not None:  # on any other thread than the one that started it, a no-op
+        if run is not None:
             self.ended.append(run.info.run_id)
             self.monitor_alive = False
             self._active.run = None
@@ -140,7 +140,7 @@ _MLFLOW_HTTP_ENV = (
 def _unset_mlflow_http_env(monkeypatch):
     """Start each test without the HTTP bounds; the caller's values are restored afterwards."""
     for name in _MLFLOW_HTTP_ENV:
-        monkeypatch.setenv(name, "")  # registers the restore even when the variable was unset
+        monkeypatch.setenv(name, "")
         monkeypatch.delenv(name)
 
 
@@ -181,13 +181,13 @@ def _close_what_the_test_built(monkeypatch):
 
         monkeypatch.setattr(cls, "__init__", init)
     yield
-    for obj in reversed(built):  # a backend before its own worker
+    for obj in reversed(built):
         obj.close()
     for worker in built:
         if isinstance(worker, worker_mod._BestEffortWorker) and worker._thread.ident is not None:
             worker._thread.join(10)
             assert not worker._thread.is_alive()
-    for t in threading.enumerate():  # abandoned call threads and standalone run owners
+    for t in threading.enumerate():
         if t is threading.current_thread() or not t.is_alive():
             continue
         if t.name.endswith(("-tracking", "-call", "-run")):
@@ -230,7 +230,7 @@ def _capture_debug(monkeypatch) -> list[str]:
 def _mlflow_cfg(**kw):
     base = dict(
         enable_mlflow=True,
-        mlflow_tracking_uri="http://localhost:5000",  # off Databricks: a bare experiment name is ok
+        mlflow_tracking_uri="http://localhost:5000",
         mlflow_experiment="exp",
         mlflow_log_system_metrics=False,
     )
@@ -324,8 +324,8 @@ class TestMLflowBackend:
         backend = MLflowBackend(cfg)
         backend.log({"train/loss": 1.0}, step=1)
         assert backend._active is True
-        assert cfg.mlflow_run_id == "new-run-123"  # wrote back the new id
-        assert tried == ["stale-id", None]  # tried resume, then started fresh
+        assert cfg.mlflow_run_id == "new-run-123"
+        assert tried == ["stale-id", None]
 
     def test_log_retries_after_transient_failure(self, monkeypatch):
         """A transient log error is swallowed (warned) but does NOT disable the backend;
@@ -343,12 +343,12 @@ class TestMLflowBackend:
         monkeypatch.setitem(sys.modules, "mlflow", fm)
         warnings_seen = _capture_warnings(monkeypatch)
         backend = MLflowBackend(_mlflow_cfg())
-        backend.log({"train/loss": 2.0}, step=1)  # fails in the worker, swallowed
+        backend.log({"train/loss": 2.0}, step=1)
         _flush(backend)
-        backend.log({"train/loss": 1.5}, step=2)  # must retry, not stay disabled
+        backend.log({"train/loss": 1.5}, step=2)
         _flush(backend)
         assert backend._active is True
-        assert state["n"] == 2  # second call actually attempted (no permanent disable)
+        assert state["n"] == 2
         assert fm.log_steps == [2]
         assert len(warnings_seen) == 1 and "transient network blip" in warnings_seen[0]
 
@@ -363,38 +363,38 @@ class TestMLflowBackend:
         backend.log({"train/loss": 1.0}, step=1)
         _flush(backend)
         assert fm.last_log_metrics_synchronous is True
-        assert fm.last_log_params_synchronous is True  # init param batches are pinned too
-        assert fm.last_set_tag_synchronous is True  # and so are the run tags
+        assert fm.last_log_params_synchronous is True
+        assert fm.last_set_tag_synchronous is True
 
     def test_resume_skips_already_logged_steps(self, monkeypatch):
         """On resume, steps already recorded in the run are not re-logged. (Finding #2)"""
         fm = _FakeMlflow()
-        fm.history_steps = [1, 2, 3, 4]  # run already has metrics up to step 4
+        fm.history_steps = [1, 2, 3, 4]
         monkeypatch.setitem(sys.modules, "mlflow", fm)
         backend = MLflowBackend(_mlflow_cfg(mlflow_run_id="existing-run"))
-        backend.log({"train/loss": 1.2}, step=3)  # already logged -> skip
-        backend.log({"train/loss": 1.0}, step=4)  # already logged -> skip
-        backend.log({"train/loss": 0.8}, step=5)  # new -> log
+        backend.log({"train/loss": 1.2}, step=3)
+        backend.log({"train/loss": 1.0}, step=4)
+        backend.log({"train/loss": 0.8}, step=5)
         _flush(backend)
         assert fm.log_steps == [5]
 
     def test_bad_env_experiment_disables_with_clear_message(self, monkeypatch):
         """Non-absolute $MLFLOW_EXPERIMENT on Databricks disables with a specific message,
         not the generic 'MLflow init failed'. (Finding #3)"""
-        monkeypatch.setenv("MLFLOW_EXPERIMENT", "bare-name")  # not absolute
+        monkeypatch.setenv("MLFLOW_EXPERIMENT", "bare-name")
         warnings_seen: list = []
         monkeypatch.setattr(
             backend_mod.logger, "warning", lambda msg, *a, **k: warnings_seen.append(str(msg))
         )
         fm = _FakeMlflow()
         monkeypatch.setitem(sys.modules, "mlflow", fm)
-        backend = MLflowBackend(MetricsConfig(enable_mlflow=True))  # default uri = databricks
+        backend = MLflowBackend(MetricsConfig(enable_mlflow=True))
         backend.log({"train/loss": 1.0}, step=1)
         assert backend._active is False
-        assert fm.start_run_ids == []  # never started a run
+        assert fm.start_run_ids == []
         text = " ".join(warnings_seen).lower()
         assert "absolute" in text and "disabled" in text
-        assert "init failed" not in text  # a deliberate config error, not an unexpected failure
+        assert "init failed" not in text
 
     def test_null_experiment_disables_on_databricks(self, monkeypatch):
         """On Databricks, an unresolvable experiment (None) disables the backend instead of
@@ -402,10 +402,10 @@ class TestMLflowBackend:
         monkeypatch.setattr(backend_mod, "_resolve_mlflow_experiment", lambda cfg, uri: None)
         fm = _FakeMlflow()
         monkeypatch.setitem(sys.modules, "mlflow", fm)
-        backend = MLflowBackend(MetricsConfig(enable_mlflow=True))  # uri = databricks
+        backend = MLflowBackend(MetricsConfig(enable_mlflow=True))
         backend.log({"train/loss": 1.0}, step=1)
         assert backend._active is False
-        assert fm.start_run_ids == []  # never started a run in the default experiment
+        assert fm.start_run_ids == []
 
     def test_resume_transient_error_does_not_fork(self, monkeypatch):
         """A transient error resuming a still-valid run must NOT fork a new run; it disables
@@ -415,15 +415,15 @@ class TestMLflowBackend:
         def start_run(run_id=None, run_name=None, log_system_metrics=False):
             fm.start_run_ids.append(run_id)
             if run_id is not None:
-                raise RuntimeError("503 Service Unavailable")  # transient; run still exists
+                raise RuntimeError("503 Service Unavailable")
             return fm._run
 
         fm.start_run = start_run
         monkeypatch.setitem(sys.modules, "mlflow", fm)
         backend = MLflowBackend(_mlflow_cfg(mlflow_run_id="live-run"))
         backend.log({"train/loss": 1.0}, step=1)
-        assert backend._active is False  # disabled, not forked
-        assert fm.start_run_ids == ["live-run"]  # only the resume attempt, no fresh start_run()
+        assert backend._active is False
+        assert fm.start_run_ids == ["live-run"]
 
     def test_close_ends_run_even_when_inactive(self, monkeypatch):
         """Once a run is started, close() ends it even if the backend was later marked
@@ -431,8 +431,8 @@ class TestMLflowBackend:
         fm = _FakeMlflow()
         monkeypatch.setitem(sys.modules, "mlflow", fm)
         backend = MLflowBackend(_mlflow_cfg())
-        backend.log({"train/loss": 1.0}, step=1)  # starts the run
-        backend._active = False  # simulate a later disable
+        backend.log({"train/loss": 1.0}, step=1)
+        backend._active = False
         backend.close()
         assert fm.end_run_calls == 1
 
@@ -447,7 +447,7 @@ class TestMLflowBackend:
         monkeypatch.setitem(sys.modules, "mlflow", fm)
         backend = MLflowBackend(_mlflow_cfg())
         backend.log({"train/loss": 1.0}, step=1)
-        backend.close()  # must not raise
+        backend.close()
 
     def test_databricks_token_mirror_and_metadata(self, monkeypatch):
         """DATABRICKS_API_TOKEN is mirrored to DATABRICKS_TOKEN, the system-metrics interval
@@ -458,14 +458,14 @@ class TestMLflowBackend:
         monkeypatch.setattr(backend_mod, "_resolve_mlflow_experiment", lambda c, u: "/Users/me/p")
         fm = _FakeMlflow()
         monkeypatch.setitem(sys.modules, "mlflow", fm)
-        cfg = MetricsConfig(enable_mlflow=True, mlflow_log_system_metrics=True)  # uri = databricks
+        cfg = MetricsConfig(enable_mlflow=True, mlflow_log_system_metrics=True)
         job = JobConfig(model=ModelConfig(dim=128, n_layers=2, n_heads=2, vocab_size=256))
         backend = MLflowBackend(cfg, job_config=job)
         backend.log({"train/loss": 1.0}, step=1)
         _flush(backend)
         assert backend._active is True
-        assert os.environ["DATABRICKS_TOKEN"] == "dapi-x"  # mirrored from API_TOKEN
-        assert fm.logged_params and fm.logged_tags  # fresh-run metadata (params + tags) logged
+        assert os.environ["DATABRICKS_TOKEN"] == "dapi-x"
+        assert fm.logged_params and fm.logged_tags
 
 
 def _fake_databricks_sdk(monkeypatch, workspace_client):
@@ -506,12 +506,12 @@ class TestMlflowTrackingUri:
     def test_default_is_databricks_and_needs_no_credentials_in_the_env(self, monkeypatch):
         cfg = MetricsConfig(enable_mlflow=True, mlflow_experiment="/Users/me/p")
         backend, fm = _init_backend(monkeypatch, cfg)
-        assert backend._active is True  # no env gate: the server calls decide whether auth works
+        assert backend._active is True
         assert fm.tracking_uris == ["databricks"]
 
     def test_env_uri_wins_over_the_default(self, monkeypatch):
         monkeypatch.setenv("MLFLOW_TRACKING_URI", "http://localhost:5000")
-        cfg = MetricsConfig(enable_mlflow=True, mlflow_experiment="bare-name")  # off Databricks
+        cfg = MetricsConfig(enable_mlflow=True, mlflow_experiment="bare-name")
         backend, fm = _init_backend(monkeypatch, cfg)
         assert backend._active is True
         assert fm.tracking_uris == ["http://localhost:5000"]
@@ -522,7 +522,7 @@ class TestMlflowTrackingUri:
         backend, fm = _init_backend(monkeypatch, cfg)
         assert backend._active is True
         assert fm.tracking_uris == ["http://localhost:5001"]
-        assert "DATABRICKS_CONFIG_PROFILE" not in os.environ  # the env URI was never acted on
+        assert "DATABRICKS_CONFIG_PROFILE" not in os.environ
 
 
 class TestMlflowDatabricksAuth:
@@ -569,7 +569,7 @@ class TestMlflowDatabricksAuth:
             ("databricks://profile-a/", "profile-a"),
             ("databricks", None),
             ("databricks://", None),
-            ("databricks://scope:prefix", None),  # a secret scope, not a profile
+            ("databricks://scope:prefix", None),
             ("databricks-uc://profile-a", None),
             ("http://localhost:5000", None),
         ],
@@ -616,7 +616,7 @@ class TestMlflowDatabricksAuth:
         assert backend._active is False
         (message,) = warnings_seen
         assert "user:tok@" not in message
-        assert "http://host:5000/api?x=a@b" in message  # the rest of the error stays readable
+        assert "http://host:5000/api?x=a@b" in message
 
     def test_rate_limited_warnings_scrub_credentialed_uris(self, monkeypatch):
         warnings_seen = _capture_warnings(monkeypatch)
@@ -624,7 +624,7 @@ class TestMlflowDatabricksAuth:
         warn("log_metrics failed (https://u:p@h/x); points may be lost")
         assert warnings_seen == ["log_metrics failed (https://h/x); points may be lost"]
         plain = "log_metrics failed (https://host?x=a@b#c@d)"
-        worker_mod._RateLimitedWarning(300.0)(plain)  # a fresh limiter always shows its first
+        worker_mod._RateLimitedWarning(300.0)(plain)
         assert warnings_seen[-1] == plain
 
     def test_rejected_credentials_disable_with_the_auth_routes_named(self, monkeypatch):
@@ -636,7 +636,7 @@ class TestMlflowDatabricksAuth:
         fm.set_experiment = unauthenticated
         warnings_seen = _capture_warnings(monkeypatch)
         cfg = MetricsConfig(enable_mlflow=True, mlflow_experiment="/Users/me/p")
-        backend, _ = _init_backend(monkeypatch, cfg, fm)  # must not raise
+        backend, _ = _init_backend(monkeypatch, cfg, fm)
         assert backend._active is False and fm.start_run_ids == []
         (message,) = warnings_seen
         assert message.startswith("MLflow init failed: 401 Unauthenticated (")
@@ -661,7 +661,7 @@ class TestMlflowDatabricksAuth:
         )
 
     def test_a_missing_sdk_is_not_a_credentials_problem(self, monkeypatch):
-        monkeypatch.setitem(sys.modules, "databricks.sdk", None)  # the import raises ImportError
+        monkeypatch.setitem(sys.modules, "databricks.sdk", None)
         warnings_seen = _capture_warnings(monkeypatch)
         backend, _ = _init_backend(monkeypatch, MetricsConfig(enable_mlflow=True))
         assert backend._active is False
@@ -688,17 +688,17 @@ class TestMlflowDatabricksAuth:
 
         def recording(real):
             def wrapper(file, *args, **kwargs):
-                if not isinstance(file, int):  # a file descriptor names no path
+                if not isinstance(file, int):
                     opened.append(os.fsdecode(file))
                 return real(file, *args, **kwargs)
 
             return wrapper
 
-        for owner in (builtins, io, os):  # open(), io.open() behind pathlib, os.open()
+        for owner in (builtins, io, os):
             monkeypatch.setattr(owner, "open", recording(owner.open))
         credential_path = tmp_path / ".databrickscfg"
         for read in (builtins.open, io.open, lambda path: os.open(path, os.O_RDONLY)):
-            with pytest.raises(FileNotFoundError):  # the recorder sees each way of opening it
+            with pytest.raises(FileNotFoundError):
                 read(credential_path)
         assert len(opened) == 3 and all("databrickscfg" in path for path in opened)
         opened.clear()
@@ -784,14 +784,14 @@ class TestMlflowRunMetadata:
         assert tags["mlflow.note.content"] == "ablation, no pooling"
         assert (tags["team"], tags["stage"]) == ("vlm", "2")
         tag_calls = [(run_id, thread) for kind, run_id, thread in fm.calls if kind == "set_tag"]
-        assert {run_id for run_id, _ in tag_calls} == {"run-xyz"}  # every tag named its run
+        assert {run_id for run_id, _ in tag_calls} == {"run-xyz"}
         assert threading.get_ident() not in {thread for _, thread in tag_calls}
 
     def test_configured_tags_override_the_automatic_ones(self, monkeypatch):
         monkeypatch.setattr(backend_mod, "_git_state", lambda: ("a" * 40, False))
         cfg = _mlflow_cfg(mlflow_tags={"host": "my-node", "mlflow.source.git.commit": "pinned"})
         _, fm = _started(monkeypatch, cfg)
-        tags = dict(fm.logged_tags)  # the last write to a key is the one that stays
+        tags = dict(fm.logged_tags)
         assert tags["host"] == "my-node"
         assert tags["mlflow.source.git.commit"] == "pinned"
         assert tags["mlflow.source.git.dirty"] == "false"
@@ -820,7 +820,7 @@ class TestMlflowRunMetadata:
         assert params == _flatten_config_params(job)
         assert not [k for k in params if "mlflow_tags" in k or "mlflow_description" in k]
         assert [name for name, _ in fm.logged_dicts] == ["config.json"]
-        assert fm.uploaded_files == []  # nothing named a launch config
+        assert fm.uploaded_files == []
 
     def test_a_new_run_is_tagged_with_the_commit_it_runs_at(self, monkeypatch, git_repo):
         monkeypatch.setattr(backend_mod, "_git_state", _git_state)
@@ -846,7 +846,7 @@ class TestMlflowRunMetadata:
 
     def test_a_missing_git_skips_the_tag_without_a_warning(self, monkeypatch, tmp_path):
         monkeypatch.setattr(backend_mod, "_git_state", _git_state)
-        monkeypatch.setenv("PATH", str(tmp_path))  # an empty directory: there is no git to run
+        monkeypatch.setenv("PATH", str(tmp_path))
         warnings_seen = _capture_warnings(monkeypatch)
         debug_seen = _capture_debug(monkeypatch)
         backend, fm = _started(monkeypatch, _mlflow_cfg())
@@ -930,8 +930,8 @@ class TestMlflowRunMetadata:
         try:
             backend.log({"train/loss": 1.0}, step=1)
             backend.log({"train/loss": 0.5}, step=2)
-            _flush(backend)  # the 60 s call deadline would outlast this wait
-            assert fm.log_steps == [1, 2]  # metrics queued behind the hung upload still land
+            _flush(backend)
+            assert fm.log_steps == [1, 2]
             hung_warnings = [w for w in warnings_seen if "upload config.json" in w]
             assert len(hung_warnings) == 1 and "0.2s" in hung_warnings[0]
         finally:
@@ -948,7 +948,7 @@ class TestGitState:
         sha = git("rev-parse", "HEAD")
         assert _git_state() == (sha, False)
         (repo / "untracked.txt").write_text("x")
-        assert _git_state() == (sha, False)  # an untracked file is not a difference
+        assert _git_state() == (sha, False)
         (repo / "a.txt").write_text("two\n")
         assert _git_state() == (sha, True)
 
@@ -1096,7 +1096,7 @@ def _import_mlflow_via_spy(monkeypatch) -> _ImportSpy:
     """Run the backend's first `import mlflow` for real, against a fake served by a spy."""
     fm = _FakeMlflow()
     spy = _ImportSpy(fm)
-    monkeypatch.setitem(sys.modules, "mlflow", fm)  # restores the original entry on teardown
+    monkeypatch.setitem(sys.modules, "mlflow", fm)
     del sys.modules["mlflow"]
     monkeypatch.setattr(sys, "meta_path", [spy, *sys.meta_path])
     backend = MLflowBackend(_mlflow_cfg())
@@ -1127,7 +1127,7 @@ class TestMLflowBestEffort:
             "MLFLOW_HTTP_REQUEST_MAX_RETRIES": "9",
             "MLFLOW_DATABRICKS_ENDPOINT_HTTP_RETRY_TIMEOUT": "11",
         }
-        assert os.environ["MLFLOW_HTTP_REQUEST_TIMEOUT"] == "7"  # untouched after init too
+        assert os.environ["MLFLOW_HTTP_REQUEST_TIMEOUT"] == "7"
 
     def test_calls_name_the_run_and_run_off_the_calling_thread(self, monkeypatch):
         fm = _FakeMlflow()
@@ -1138,14 +1138,13 @@ class TestMLflowBestEffort:
         backend.log({"train/loss": 1, "gpu/peak_gb": 2}, step=1)
         backend.log({"train/loss": 0.5}, step=2)
         backend.close()
-        # The active run is thread-local: start and end share one thread, never the caller.
         owner = fm.lifecycle_threads["start_run"]
         assert fm.lifecycle_threads == {"start_run": owner, "end_run": owner}
         assert owner != caller
-        assert fm.ended == ["run-xyz"]  # end_run found the run it started, so it was ended
+        assert fm.ended == ["run-xyz"]
         kinds = {"log_metrics", "log_params", "set_tag", "log_dict"}
         assert {kind for kind, _, _ in fm.calls} == kinds
-        assert {run_id for _, run_id, _ in fm.calls} == {"run-xyz"}  # every call named its run
+        assert {run_id for _, run_id, _ in fm.calls} == {"run-xyz"}
         assert {caller, owner}.isdisjoint(thread for _, _, thread in fm.calls)
         assert fm.log_steps == [1, 2]
         assert fm.logged_metrics == [{"train/loss": 1.0, "gpu/peak_gb": 2.0}, {"train/loss": 0.5}]
@@ -1173,9 +1172,9 @@ class TestMLflowBestEffort:
             start = time.perf_counter()
             for step in (1, 2, 3):
                 backend.log({"train/loss": 1.0}, step=step)
-            assert time.perf_counter() - start < 5.0  # the first call alone would block forever
+            assert time.perf_counter() - start < 5.0
             _flush(backend)
-            assert sorted(attempted) == [1, 2, 3]  # later calls still run after the first hung
+            assert sorted(attempted) == [1, 2, 3]
             assert len([w for w in warnings_seen if "log_metrics" in w]) == 1
         finally:
             release.set()
@@ -1189,17 +1188,17 @@ class TestMLflowBestEffort:
         backend = MLflowBackend(_mlflow_cfg())
         try:
             backend._ensure_init()
-            _flush(backend)  # run metadata delivered, queue empty
+            _flush(backend)
             backend.log({"train/loss": 1.0}, step=1)
-            assert entered.wait(10)  # the worker is parked inside the first call
+            assert entered.wait(10)
             start = time.perf_counter()
-            for step in (2, 3, 4, 5):  # 2 and 3 fill the queue; 4 and 5 are dropped
+            for step in (2, 3, 4, 5):
                 backend.log({"train/loss": 1.0}, step=step)
             assert time.perf_counter() - start < 5.0
         finally:
             gate.set()
         backend.close()
-        assert fm.log_steps == [1, 2, 3]  # the new items were dropped, not the queued ones
+        assert fm.log_steps == [1, 2, 3]
         assert len([w for w in warnings_seen if "queue full" in w]) == 1
 
     def test_metrics_are_snapshotted_when_queued(self, monkeypatch):
@@ -1208,10 +1207,10 @@ class TestMLflowBestEffort:
         monkeypatch.setitem(sys.modules, "mlflow", fm)
         backend = MLflowBackend(_mlflow_cfg())
         backend.log({"train/loss": 0.0}, step=1)
-        assert entered.wait(10)  # the worker is parked inside the first call
+        assert entered.wait(10)
         metrics = {"train/loss": 1.0}
-        backend.log(metrics, step=2)  # queued behind it, not yet read by the worker
-        metrics["train/loss"] = 99.0  # the caller reuses its dict once log() returns
+        backend.log(metrics, step=2)
+        metrics["train/loss"] = 99.0
         gate.set()
         backend.close()
         assert fm.logged_metrics == [{"train/loss": 0.0}, {"train/loss": 1.0}]
@@ -1223,13 +1222,13 @@ class TestMLflowBestEffort:
         backend = MLflowBackend(_mlflow_cfg())
         for step in (1, 2, 3):
             backend.log({"train/loss": 1.0}, step=step)
-        assert fm.log_steps == []  # the worker is parked at the gate; nothing delivered yet
+        assert fm.log_steps == []
         threading.Timer(0.2, gate.set).start()
         backend.close()
-        assert fm.steps_at_end == [1, 2, 3]  # end_run came after the queue was delivered
+        assert fm.steps_at_end == [1, 2, 3]
         assert fm.end_run_calls == 1
         backend._worker._thread.join(5)
-        assert not backend._worker._thread.is_alive()  # the worker stops with the backend
+        assert not backend._worker._thread.is_alive()
 
     def test_close_returns_within_its_deadlines_when_server_hangs(self, monkeypatch):
         fm = _FakeMlflow()
@@ -1251,8 +1250,8 @@ class TestMLflowBestEffort:
             for step in (1, 2, 3):
                 backend.log({"train/loss": 1.0}, step=step)
             start = time.perf_counter()
-            backend.close()  # must not raise
-            assert time.perf_counter() - start < 5.0  # the hung calls alone allow 60 s each
+            backend.close()
+            assert time.perf_counter() - start < 5.0
             assert any("not delivered" in w for w in warnings_seen)
             ending = [w for w in warnings_seen if "end_run" in w]
             assert ending == [
@@ -1262,7 +1261,7 @@ class TestMLflowBestEffort:
         finally:
             release.set()
         backend._owner._thread.join(10)
-        assert fm.ended == ["run-xyz"]  # the abandoned end still lands once the server answers
+        assert fm.ended == ["run-xyz"]
 
     @pytest.mark.parametrize(
         "hang_at", ["workspace_client", "set_experiment", "start_run", "last_step_lookup"]
@@ -1278,7 +1277,7 @@ class TestMLflowBestEffort:
             return result
 
         cfg = _mlflow_cfg()
-        if hang_at == "workspace_client":  # auto-resolving the Databricks experiment path
+        if hang_at == "workspace_client":
             user = types.SimpleNamespace(user_name="me")
             workspace = types.SimpleNamespace(
                 current_user=types.SimpleNamespace(me=lambda: hang(user))
@@ -1290,7 +1289,7 @@ class TestMLflowBestEffort:
             cfg = MetricsConfig(enable_mlflow=True, mlflow_log_system_metrics=False)
         elif hang_at == "set_experiment":
             fm.set_experiment = lambda name: hang()
-        elif hang_at == "start_run":  # the run exists on the server; the answer is late
+        elif hang_at == "start_run":
             start_run = fm.start_run
             fm.start_run = lambda **kw: hang(start_run(**kw))
         else:
@@ -1305,7 +1304,7 @@ class TestMLflowBestEffort:
         try:
             start = time.perf_counter()
             backend.log({"train/loss": 1.0}, step=1)
-            backend.log({"train/loss": 1.0}, step=2)  # init already gave up: no second wait
+            backend.log({"train/loss": 1.0}, step=2)
             assert time.perf_counter() - start < 5.0
             assert backend._active is False and backend._run_started is False
             assert warnings_seen == [
@@ -1315,9 +1314,9 @@ class TestMLflowBestEffort:
             release.set()
         backend._owner._thread.join(10)
         assert not backend._owner._thread.is_alive()
-        assert hung == [hang_at]  # init ran once and was never retried
-        assert fm.ended == ["run-xyz"]  # a run that starts after init gave up is ended at once
-        assert fm.calls == [] and cfg.mlflow_run_id == saved_run_id  # and nothing reaches it
+        assert hung == [hang_at]
+        assert fm.ended == ["run-xyz"]
+        assert fm.calls == [] and cfg.mlflow_run_id == saved_run_id
 
     @pytest.mark.parametrize("enabled", [True, False])
     def test_system_metrics_follow_the_config_and_stop_with_the_run(self, monkeypatch, enabled):
@@ -1329,7 +1328,7 @@ class TestMLflowBestEffort:
         assert fm.monitor_alive is enabled
         assert fm.sampling_intervals == ([2.5] if enabled else [])
         backend.close()
-        assert fm.ended == ["run-xyz"] and fm.monitor_alive is False  # stopped before close returns
+        assert fm.ended == ["run-xyz"] and fm.monitor_alive is False
 
 
 class TestRunOwner:
@@ -1345,7 +1344,7 @@ class TestRunOwner:
 
         owner = worker_mod._RunOwner("T", start=start, end=end)
         assert owner.start(5) == "run"
-        assert [what for what, _ in seen] == ["start"]  # the end waits for end()
+        assert [what for what, _ in seen] == ["start"]
         owner.end(5)
         assert [what for what, _ in seen] == ["start", "end"]
         assert seen[0][1] == seen[1][1] != threading.get_ident()
@@ -1369,7 +1368,7 @@ class TestRunOwner:
             owner.start(0.1)
         assert not ended.is_set()
         release.set()
-        assert ended.wait(10)  # without an end() call: the caller had already given up
+        assert ended.wait(10)
 
     def test_a_late_or_failed_end_raises_on_the_caller(self):
         release = threading.Event()
@@ -1411,7 +1410,6 @@ class TestBestEffortWorker:
             for n in range(5):
                 worker.submit(f"call {n}", release.wait)
             assert worker.flush(10)
-            # Two calls were abandoned at their deadline and still run; no third thread started.
             assert len(worker._calls) == 2 and all(t.is_alive() for t in worker._calls)
             dropped = [w for w in warnings_seen if "dropping" in w]
             assert dropped == ["T: 2 abandoned tracking calls have not returned; dropping call 2"]
@@ -1422,7 +1420,7 @@ class TestBestEffortWorker:
         ran: list = []
         worker.submit("after", lambda: ran.append(1))
         assert worker.flush(10)
-        assert ran == [1]  # a call that returned frees its thread slot
+        assert ran == [1]
         worker.close()
 
     def test_per_call_deadline_overrides_the_default(self, monkeypatch):
@@ -1436,8 +1434,7 @@ class TestBestEffortWorker:
             done.append("upload")
 
         try:
-            worker.submit("stuck", release.wait)  # default deadline: abandoned after 0.2 s
-            # The upload deadline lets a call run far past the default before it is abandoned.
+            worker.submit("stuck", release.wait)
             worker.submit("upload", slow_upload, deadline=backend_mod._UPLOAD_DEADLINE_S)
             assert worker.flush(10)
             assert done == ["upload"]
@@ -1470,7 +1467,7 @@ class TestBestEffortWorker:
         worker.submit("first", lambda: ran.append("first"))
         worker.submit("second", lambda: ran.append("second"))
         assert worker.flush(10)
-        assert ran == ["second"]  # the first call was lost, the worker kept going
+        assert ran == ["second"]
         assert len(warnings_seen) == 1 and "cannot start new thread" in warnings_seen[0]
         worker.close()
 
@@ -1509,8 +1506,6 @@ class _FakeWandbRun:
 
 
 class TestTrackingEntries:
-    # MLflow: the four fields a checkpoint reader needs, or no entry at all
-
     def test_mlflow_entry_is_exactly_the_four_reader_fields(self, monkeypatch):
         backend, _ = _init_backend(monkeypatch, _mlflow_cfg())
         entry = backend.tracking_entry()
@@ -1574,7 +1569,7 @@ class TestTrackingEntries:
 
         def start_run(run_id=None, run_name=None, log_system_metrics=False):
             if run_id is not None:
-                raise RuntimeError("RESOURCE_DOES_NOT_EXIST")  # the saved run is gone
+                raise RuntimeError("RESOURCE_DOES_NOT_EXIST")
             return types.SimpleNamespace(
                 info=types.SimpleNamespace(run_id="fresh-run", run_name="fresh")
             )
@@ -1588,22 +1583,22 @@ class TestTrackingEntries:
 
     def test_mlflow_has_no_entry_without_a_live_run(self, monkeypatch):
         backend = MLflowBackend(_mlflow_cfg())
-        assert backend.tracking_entry() is None  # nothing has logged yet, so no run
+        assert backend.tracking_entry() is None
         monkeypatch.setitem(sys.modules, "mlflow", None)
         backend.log({"train/loss": 1.0}, step=1)
         assert backend._active is False
-        assert backend.tracking_entry() is None  # init failed: no run
+        assert backend.tracking_entry() is None
 
         live, _ = _init_backend(monkeypatch, _mlflow_cfg(), _FakeMlflow())
         assert live.tracking_entry() is not None
         live.close()
-        assert live.tracking_entry() is None  # the run has ended
+        assert live.tracking_entry() is None
 
     @pytest.mark.parametrize("uri", ["", "   "], ids=["empty", "blank"])
     def test_mlflow_never_reports_a_partial_entry(self, monkeypatch, uri):
         backend, _ = _init_backend(monkeypatch, _mlflow_cfg(mlflow_tracking_uri=uri))
         assert backend._active is True
-        assert backend.tracking_entry() is None  # a blank URI is not one a reader can use
+        assert backend.tracking_entry() is None
 
     def test_every_active_backend_of_a_run_is_listed(self, monkeypatch, tmp_path):
         pytest.importorskip("tensorboard")
@@ -1625,7 +1620,7 @@ class TestTrackingEntries:
         tracker = MetricsTracker(config, num_gpus=1)
         tracker.init_backends(config)
         try:
-            assert tracker.tracking_entries() == []  # every backend starts its run on its first log
+            assert tracker.tracking_entries() == []
 
             tracker.log_eval({"eval/loss": 1.0}, step=1)
             entries = tracker.tracking_entries()
@@ -1638,13 +1633,13 @@ class TestTrackingEntries:
             }
         finally:
             tracker.close()
-        assert tracker.tracking_entries() == []  # every run has ended
+        assert tracker.tracking_entries() == []
 
     def test_a_backend_without_a_live_run_is_left_out_of_a_multi_backend_run(
         self, monkeypatch, tmp_path
     ):
         pytest.importorskip("tensorboard")
-        monkeypatch.setitem(sys.modules, "mlflow", None)  # not installed: its init fails
+        monkeypatch.setitem(sys.modules, "mlflow", None)
         config = JobConfig(
             model=ModelConfig(dim=128, n_layers=2, n_heads=2, vocab_size=256),
             metrics=_mlflow_cfg(enable_tensorboard=True, tensorboard_dir=str(tmp_path / "tb")),
@@ -2132,9 +2127,7 @@ class TestFlattenConfigParams:
         params = _flatten_config_params(config)
         assert params["model.dim"] == "128"
         assert params["metrics.log_interval"] == "7"
-        # mlflow.log_params requires string values.
         assert all(isinstance(v, str) for v in params.values())
-        # Optional None sub-configs (vlm, adapter, vision_encoder) are skipped.
         assert not any(k.startswith("vlm") for k in params)
 
     def test_run_metadata_fields_are_not_flattened_into_params(self):
@@ -2148,7 +2141,7 @@ class TestFlattenConfigParams:
         params = _flatten_config_params(config)
         assert not any(k.startswith("metrics.mlflow_tags") for k in params)
         assert "metrics.mlflow_description" not in params
-        assert "metrics.log_interval" in params  # the rest of metrics still flattens
+        assert "metrics.log_interval" in params
 
     def test_flatten_truncates_long_values(self):
         config = JobConfig(model=ModelConfig(dim=128, n_layers=2, n_heads=2, vocab_size=256))
@@ -2171,7 +2164,7 @@ class TestFlattenConfigParams:
         assert params["data.datasets.0.name"] == "ds_a"
         assert params["data.datasets.1.name"] == "ds_b"
         assert params["data.datasets.0.path"] == "/d/a"
-        assert "data.datasets" not in params  # not collapsed into one opaque key
+        assert "data.datasets" not in params
 
 
 class TestMetricsConfigMLflow:
@@ -2198,7 +2191,7 @@ class TestMetricsConfigMLflow:
         ("field", "env", "uri"),
         [
             (None, None, "databricks"),
-            (None, "", "databricks"),  # an exported-but-empty variable counts as unset
+            (None, "", "databricks"),
             (None, "http://localhost:5000", "http://localhost:5000"),
             ("databricks://profile-a", "http://localhost:5000", "databricks://profile-a"),
             ("sqlite:///mlflow.db", None, "sqlite:///mlflow.db"),

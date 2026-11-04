@@ -17,7 +17,7 @@ _DATABRICKS_AUTH_ROUTES = (
 
 def _auth_hint(error: Exception) -> str:
     """Where Databricks finds credentials, appended to a failure that may be a credentials one."""
-    if isinstance(error, (ImportError, TimeoutError)):  # a missing package or a slow server
+    if isinstance(error, (ImportError, TimeoutError)):
         return ""
     return f" ({_DATABRICKS_AUTH_ROUTES})"
 
@@ -27,7 +27,7 @@ def _databricks_profile(uri: str) -> str | None:
     scheme, separator, rest = uri.partition("://")
     profile = rest.partition("/")[0]
     if scheme != "databricks" or not separator or not profile or ":" in profile:
-        return None  # "scope:prefix" names a secret scope, not a profile
+        return None
     return profile
 
 
@@ -47,7 +47,5 @@ def _prepare_databricks_auth(uri: str) -> None:
     profile = _databricks_profile(uri)
     if profile:
         os.environ.setdefault("DATABRICKS_CONFIG_PROFILE", profile)
-    # The Databricks SDK reads DATABRICKS_TOKEN; mirror the DATABRICKS_API_TOKEN
-    # name many keep in ~/.bashrc so either works.
     if not os.environ.get("DATABRICKS_TOKEN") and os.environ.get("DATABRICKS_API_TOKEN"):
         os.environ["DATABRICKS_TOKEN"] = os.environ["DATABRICKS_API_TOKEN"]
