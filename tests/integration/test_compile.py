@@ -57,7 +57,6 @@ class TestCompileCorrectness:
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1))
         loss.backward()
 
-        # All parameters should have gradients
         for name, param in model.named_parameters():
             if param.requires_grad:
                 assert param.grad is not None, f"No gradient for {name}"
@@ -191,9 +190,7 @@ class TestFlexCompile:
             if scale == 0:
                 torch.testing.assert_close(actual, reference, rtol=0, atol=0)
                 continue
-            # Largest elementwise disagreement, as a fraction of full scale.
             elementwise = ((actual - reference).abs().max() / scale).item()
-            # Whole-tensor agreement, which a single bad element cannot hide in.
             relative_norm = ((actual - reference).norm() / reference.norm()).item()
             assert elementwise < 1e-5, f"{name}: elementwise {elementwise:.2e} of scale {scale:.2e}"
             assert relative_norm < 1e-5, f"{name}: relative norm {relative_norm:.2e}"
@@ -269,9 +266,6 @@ class TestFlexCompile:
             model(tokens, doc_ids=doc_ids).sum().backward()
             model.zero_grad(set_to_none=True)
 
-        # Warm up on two different layouts: flex may compile one or two
-        # block-sparsity specializations up front, a fixed startup cost rather
-        # than a per-step recompile.
         step(0)
         step(1)
         after_warmup = counters["stats"]["unique_graphs"]

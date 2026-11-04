@@ -86,7 +86,6 @@ def test_vlm_video_webvid_toml() -> None:
     config = load_config(str(CONFIG_DIR / "vlm_video_webvid.toml"), cli_args=[])
     assert config.adapter is not None
     assert config.vlm is not None
-    # Attribute access fails if the entries stayed raw dicts.
     assert [(f.module, f.frozen) for f in config.vlm.freeze] == [("vision_encoder", True)]
 
 
@@ -96,10 +95,6 @@ def test_vlm_7b_siglip2_toml() -> None:
     assert config.vision_encoder is not None
     assert config.vlm is not None
     assert config.vision_encoder.type == "siglip2"
-    # num_tokens defaults to 0 = "infer from encoder at build time". The
-    # encoder probes 196 (14x14 patches, no CLS) for this path; the build-time
-    # max_seq_len cross-check in build_vlm_wrapper enforces
-    # 196 + 2048 = 2244 <= max_seq_len=2304.
     assert config.vision_encoder.num_tokens == 0
     config.validate(world_size=4)
 

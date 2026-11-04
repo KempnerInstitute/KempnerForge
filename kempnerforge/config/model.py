@@ -18,40 +18,8 @@ class Activation(StrEnum):
     relu = "relu"
 
 
-# FlexAttention's mask block size, and the seq_len floor for
-# attention_backend="flex". A compiled model leaks attention across document
-# boundaries below it and is exact at or above it -- measured at seq_len
-# 32/64/96/120/127 (leaking) against 128/129/130/160/200/256/300/384/512/1000/
-# 2048 (exact), for head_dim 32, 64 and 128 alike, so this is a sequence-length
-# effect rather than a head-dimension one.
-#
-# Localized to Inductor codegen: the same model compiled with backend="eager" or
-# backend="aot_eager" is exact, and only backend="inductor" leaks -- so dynamo
-# tracing, AOTAutograd and the FlexAttention kernel are all innocent (bare
-# compiled flex_attention also matches a dense reference at these lengths). It
-# further needs graph scale: proj + rope + flex + o_proj compiled on its own is
-# exact at seq_len 32, while a one-layer Transformer is not. Not reduced further.
-#
-# Not fixed by upgrading: reproduced with bit-identical drift on torch 2.11.0+cu128,
-# 2.13.0+cu129 and 2.14.0+cu130, so this bound is not a temporary workaround waiting
-# on a release. The dense-mask SDPA path is unaffected at every length, eager and
-# compiled alike -- this is specific to FlexAttention under Inductor, and existing
-# packed runs on the default backend are not at risk.
-#
-# It costs nothing either way, since a sub-block sequence has no block sparsity
-# to exploit.
 FLEX_BLOCK_SIZE = 128
 
-# Smallest head_dim FlexAttention's Triton template will lower; 8 fails with
-# "NYI: embedding dimension". There is deliberately no upper bound: head_dim
-# 256, 320, 384 and 512 were all measured correct (forward and backward, ~2e-6
-# against a dense reference on H200 / torch 2.11). The set of usable sizes is
-# not an interval, though -- head_dim 192 fails to compile there ("No valid
-# triton configs", shared-memory exhaustion) while 128 and 256 on either side
-# of it are fine. That failure is a loud compile-time error rather than silent
-# corruption, so it is documented rather than guarded: a config-time check
-# cannot predict which sizes Triton can tile on a given GPU, and rejecting an
-# interval would block the many large head_dims that do work.
 FLEX_MIN_HEAD_DIM = 16
 
 
@@ -62,51 +30,41 @@ class ModelConfig:
     dim: int = 4096
     n_layers: int = 32
     n_heads: int = 32
-    n_kv_heads: int | None = None  # None -> same as n_heads (MHA)
-    head_dim_override: int = 0  # 0 -> dim // n_heads
+    n_kv_heads: int | None = None
+    head_dim_override: int = 0
     vocab_size: int = 32000
     ffn_dim_multiplier: float = 1.0
-    ffn_hidden_dim: int | None = None  # Override computed hidden dim
+    ffn_hidden_dim: int | None = None
     norm_type: NormType = NormType.rmsnorm
     norm_eps: float = 1e-5
     activation: Activation = Activation.silu
     max_seq_len: int = 2048
     rope_theta: float = 10000.0
     tie_embeddings: bool = False
-    qk_norm: bool = False  # Apply RMSNorm to Q/K per-head before RoPE (Gemma, DeepSeek-V3)
-    init_std: float = 0.02  # Std for weight initialization (GPT-2/Llama default)
-    model_type: str = "transformer"  # Registry key for model builder
-    # SDPA backend: "auto" lets PyTorch select (recommended). Override to force
-    # a specific kernel for benchmarking or debugging.
-    sdpa_backend: str = "auto"  # "auto", "flash", "efficient", "cudnn", "math"
-    # Attention backend. "sdpa" is the existing behavior: causal SDPA, or a dense
-    # (B, 1, S, S) mask when packing is on -- which drops SDPA off FlashAttention.
-    # "flex" routes packed batches through FlexAttention's sparse BlockMask, which
-    # skips fully-masked blocks instead of computing them. Only affects packed runs
-    # (data.pack_sequences); unpacked batches take the is_causal SDPA fast path
-    # under either backend.
-    attention_backend: str = "sdpa"  # "sdpa", "flex"
+    qk_norm: bool = False
+    init_std: float = 0.02
+    model_type: str = "transformer"
+    sdpa_backend: str = "auto"
+    attention_backend: str = "sdpa"
 
-    # MoE (all defaults produce a dense model -- zero behavior change)
-    num_experts: int = 0  # 0 = dense, >0 = MoE
-    moe_top_k: int = 2  # experts selected per token
-    moe_frequency: int = 1  # MoE every N layers (1=all, 2=alternating)
-    moe_router: str = "softmax_topk"  # registry key for router type
-    moe_shared_experts: int = 0  # shared experts that process all tokens
-    moe_aux_loss_weight: float = 0.01  # aux loss coefficient in training loss
-    moe_capacity_factor: float = 0.0  # 0=no drop, >0=cap tokens/expert (e.g. 1.25)
-    moe_sequence_aux_loss_weight: float = 0.0  # Sequence-level balance loss (0=off)
-    moe_gradient_scale: bool = False  # Per-expert gradient normalization
-    moe_bias_schedule: str = "constant"  # "constant", "cosine_decay", "linear_warmup"
-    moe_packed_experts: bool = False  # Pack expert weights into one tensor per projection
-    moe_expert_ffn_multiplier: float = 1.0  # expert FFN hidden vs dense (0.5 = fine-grained)
-    moe_router_z_loss_weight: float = 0.0  # router logit z-loss coeff (ST-MoE; 0=off)
+    num_experts: int = 0
+    moe_top_k: int = 2
+    moe_frequency: int = 1
+    moe_router: str = "softmax_topk"
+    moe_shared_experts: int = 0
+    moe_aux_loss_weight: float = 0.01
+    moe_capacity_factor: float = 0.0
+    moe_sequence_aux_loss_weight: float = 0.0
+    moe_gradient_scale: bool = False
+    moe_bias_schedule: str = "constant"
+    moe_packed_experts: bool = False
+    moe_expert_ffn_multiplier: float = 1.0
+    moe_router_z_loss_weight: float = 0.0
 
     def __post_init__(self) -> None:
         if self.n_kv_heads is None:
             self.n_kv_heads = self.n_heads
 
-        # Positivity checks first (before any division)
         if self.dim <= 0 or self.n_layers <= 0 or self.n_heads <= 0:
             raise ValueError("dim, n_layers, and n_heads must be positive")
         if self.vocab_size <= 0:
@@ -124,7 +82,6 @@ class ModelConfig:
                 f"(got {self.head_dim_override})"
             )
 
-        # Divisibility checks
         if self.head_dim_override == 0 and self.dim % self.n_heads != 0:
             raise ValueError(
                 f"dim ({self.dim}) must be divisible by n_heads ({self.n_heads}) "
@@ -135,14 +92,12 @@ class ModelConfig:
                 f"n_heads ({self.n_heads}) must be divisible by n_kv_heads ({self.n_kv_heads})"
             )
 
-        # SDPA backend validation
         if self.sdpa_backend not in ("auto", "flash", "efficient", "cudnn", "math"):
             raise ValueError(
                 f"Unknown sdpa_backend: '{self.sdpa_backend}'. "
                 "Options: 'auto', 'flash', 'efficient', 'cudnn', 'math'"
             )
 
-        # Attention backend validation
         if self.attention_backend not in ("sdpa", "flex"):
             raise ValueError(
                 f"Unknown attention_backend: '{self.attention_backend}'. Options: 'sdpa', 'flex'"
@@ -164,7 +119,6 @@ class ModelConfig:
                     self.sdpa_backend,
                 )
 
-        # MoE validation
         if self.num_experts > 0:
             if self.moe_top_k <= 0:
                 raise ValueError("moe_top_k must be positive when num_experts > 0")
@@ -218,7 +172,6 @@ class ModelConfig:
         """FFN hidden dimension, rounded to nearest multiple of 256 for hardware efficiency."""
         if self.ffn_hidden_dim is not None:
             return self.ffn_hidden_dim
-        # Llama-style: 4 * dim * (2/3) * ffn_dim_multiplier, rounded up to multiple of 256
         raw = int(4 * self.dim * (2 / 3) * self.ffn_dim_multiplier)
         return 256 * math.ceil(raw / 256)
 
@@ -245,17 +198,16 @@ class ModelConfig:
         h = self.computed_ffn_hidden_dim
         n_kv = self.n_kv_heads
         head_d = self.head_dim
-        # Per layer: attention (Q + K + V + O) + 2 norms
         attn = d * (self.n_heads * head_d) + 2 * d * (n_kv * head_d) + (self.n_heads * head_d) * d  # type: ignore[reportOptionalOperand]
-        mlp = d * h + d * h + h * d  # gate + up + down (SwiGLU has 3 matrices)
-        norm = 2 * d  # 2 norms per layer
+        mlp = d * h + d * h + h * d
+        norm = 2 * d
 
         if self.is_moe:
-            he = self.computed_expert_ffn_hidden_dim  # may be fine-grained (< h)
+            he = self.computed_expert_ffn_hidden_dim
             expert_mlp = d * he + d * he + he * d
             n_moe = sum(1 for i in range(self.n_layers) if (i + 1) % self.moe_frequency == 0)
             n_dense = self.n_layers - n_moe
-            router = d * self.num_experts  # gate linear per MoE layer
+            router = d * self.num_experts
             shared_mlp = self.moe_shared_experts * expert_mlp
             moe_per_layer = attn + self.num_experts * expert_mlp + router + shared_mlp + norm
             dense_per_layer = attn + mlp + norm

@@ -72,10 +72,8 @@ def _build_block_tp_plan(block, *, sequence_parallel: bool = True) -> dict:
     plan["attention.v_proj"] = ColwiseParallel(**col_kw)
     plan["attention.o_proj"] = RowwiseParallel(**row_kw)
 
-    # MoE blocks: skip all mlp.* entries — experts and router stay replicated.
-    # Dense blocks: shard MLP projections as before.
     if isinstance(block.mlp, MoEMLP):
-        pass  # No MLP entries — experts replicated, TP on attention only
+        pass
     elif isinstance(block.mlp, SwiGLUMLP):
         plan["mlp.gate_proj"] = ColwiseParallel(**col_kw)
         plan["mlp.up_proj"] = ColwiseParallel(**col_kw)
@@ -129,10 +127,6 @@ def apply_tensor_parallel(
         config, "tp_sequence_parallel", not tie and not is_moe
     )
 
-    # Token embedding: wrap output as DTensor Replicate so the first block's
-    # SequenceParallel norm properly redistributes to Shard(1). Without this,
-    # SequenceParallel receives a plain tensor and labels it Shard(1) without
-    # actually scattering, inflating the global sequence dimension.
     if seq_parallel and getattr(model, "token_embedding", None) is not None:
         from torch.distributed.tensor import DTensor
 
@@ -141,14 +135,10 @@ def apply_tensor_parallel(
 
         model.token_embedding.register_forward_hook(_wrap_replicate)  # type: ignore[reportAttributeAccessIssue]
 
-    # Transformer blocks
     for block in model.layers.values():  # type: ignore[reportCallIssue]
         plan = _build_block_tp_plan(block, sequence_parallel=seq_parallel)
         parallelize_module(block, tp_mesh, plan)  # type: ignore[reportArgumentType]
 
-        # Re-wrap attention/MLP outputs as DTensor Shard(1). Operations inside
-        # attention (SDPA, view, contiguous) strip DTensor metadata, causing
-        # "mixed torch.Tensor and DTensor" errors at the residual connection.
         if seq_parallel:
             from torch.distributed.tensor import DTensor
 
@@ -160,12 +150,9 @@ def apply_tensor_parallel(
             block.attention.register_forward_hook(_rewrap_shard1)  # type: ignore[reportAttributeAccessIssue]
             block.mlp.register_forward_hook(_rewrap_shard1)  # type: ignore[reportAttributeAccessIssue]
 
-    # Final norm: SequenceParallel (non-PP, non-tied only)
     if seq_parallel and getattr(model, "norm", None) is not None:
         parallelize_module(model, tp_mesh, {"norm": SequenceParallel()})
 
-    # Output head: split vocab dim, gather to Replicate for loss computation.
-    # Only when seq_parallel=True — matches the Shard(1) data flow from the final norm.
     if seq_parallel and not tie and getattr(model, "output_head", None) is not None:
         parallelize_module(
             model.output_head,  # type: ignore[reportArgumentType]
