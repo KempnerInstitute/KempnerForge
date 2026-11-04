@@ -406,8 +406,8 @@ def _read_databricks_config(name: str) -> _ProfileFile:
     ConfigParser in the encoding ``ConfigParser.read`` uses, so continuation lines, a repeated
     ``[DEFAULT]`` and files the SDK rejects resolve as they do in the SDK. ``[DEFAULT]`` is a
     profile only when it carries keys, ``[__settings__]`` never is one, and ``default_profile``
-    is stripped before it is resolved. A problem quotes no text from the file: an OS error is
-    named by its description, any other failure by its exception class.
+    is stripped before it is resolved. A problem quotes no text from the file: an OS error
+    opening or reading it is named by its description, any other failure by its exception class.
     """
     try:
         path = Path(name).expanduser()

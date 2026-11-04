@@ -793,11 +793,13 @@ class TestCheckMlflow:
         (home / ".databrickscfg").write_text("[DEFAULT]\nhost = h\n")
         code = (
             "import sys; sys.path.insert(0, sys.argv[1]); import check_env; "
-            "print(check_env.check_mlflow().status)"
+            "r = check_env.check_mlflow(); print(r.status, r.message)"
         )
         result = subprocess.run(
             [
                 sys.executable,
+                "-I",
+                "-S",
                 "-X",
                 "warn_default_encoding",
                 "-W",
@@ -811,7 +813,8 @@ class TestCheckMlflow:
             text=True,
             timeout=120,
         )
-        assert result.stdout.strip() == "OK", result.stderr[-800:]
+        assert result.returncode == 0, result.stderr[-800:]
+        assert result.stdout.startswith("OK profile DEFAULT found in ~/.databrickscfg")
 
     def test_the_profile_file_is_the_one_databricks_config_file_names(self, home, monkeypatch):
         alt = home / "alt.cfg"
