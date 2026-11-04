@@ -1,14 +1,26 @@
-"""Mask builders for packed self-attention.
+"""Attention mask builders.
 
-FlexAttention replaces the dense ``(B, 1, S, S)`` boolean mask that the packed
-path otherwise hands to ``F.scaled_dot_product_attention``: the mask predicate
+One predicate covers every visibility rule self-attention implements:
+
+``visible(q, k) = same_document(q, k)
+AND (k <= q OR same_nonnegative_group(q, k)) AND valid_key(k)``
+
+``build_attention_mask`` materializes it once per forward, in whichever form
+the configured backend consumes: a FlexAttention ``BlockMask`` under
+``attention_backend="flex"``, a dense ``(batch, 1, seq_len, seq_len)`` bool
+tensor for ``F.scaled_dot_product_attention`` otherwise, or ``None`` when no
+term applies and plain causal attention is already exact. ``Attention.forward``
+takes that one object and derives no mask of its own, so a further visibility
+rule is a new argument here rather than a new parameter on every attention
+signature.
+
+FlexAttention replaces the dense mask rather than computing it: the predicate
 is compiled into the attention kernel and fully-masked blocks are skipped
 rather than computed. For document packing the mask is block-diagonal and
 mostly zeros, so that is the difference between paying for the full S x S
-attention and paying only for the blocks inside a document.
-
-Both forms implement one predicate:
-``visible(q, k) = same_document AND (k <= q OR same_nonnegative_group)``.
+attention and paying only for the blocks inside a document. Key validity is
+deliberately not folded into the ``BlockMask``; those batches take the dense
+form instead.
 """
 
 from __future__ import annotations
@@ -35,8 +47,73 @@ def flex_attention_fn(compiled: bool) -> Callable[..., Any]:
     return _FLEX_COMPILED if compiled else flex_attention
 
 
+def build_attention_mask(
+    *,
+    backend: str,
+    seq_len: int,
+    device: torch.device,
+    doc_ids: torch.Tensor | None = None,
+    group_ids: torch.Tensor | None = None,
+    key_padding_mask: torch.Tensor | None = None,
+) -> torch.Tensor | BlockMask | None:
+    """Build the one attention mask for a forward pass.
+
+    The single entry point every caller uses: it owns which backend form the
+    semantics are expressed in, so callers pass ids and attention consumes one
+    mask. ``backend="flex"`` returns a ``BlockMask`` whenever the predicate is
+    expressible in it, which is every case except key validity; everything else
+    returns the dense form.
+
+    The returned mask is square over the residual stream, so it is valid only
+    for a forward whose keys are exactly its queries. Incremental decoding with
+    a ``KVCache`` grows the key axis every step and must re-derive its mask;
+    ``Attention.forward`` rejects a mask handed to it alongside a cache.
+
+    Args:
+        backend: ``ModelConfig.attention_backend``, ``"sdpa"`` or ``"flex"``.
+        seq_len: Query and key length, the residual stream's length.
+        device: Device to materialize the mask on. Any ids passed must already
+            be on it.
+        doc_ids: Optional per-token document ids, shape ``(batch, seq_len)``.
+            Tokens attend only within their own document.
+        group_ids: Optional per-token bidirectional-visibility group ids,
+            shape ``(batch, seq_len)``; negative means no group. Tokens sharing
+            a nonnegative id see each other regardless of order.
+        key_padding_mask: Optional per-key validity mask, shape
+            ``(batch, seq_len)``; ``True`` = attend, ``False`` = drop (e.g. the
+            visual tokens of padded video frames).
+
+    Returns:
+        A ``BlockMask``, a dense ``(batch, 1, seq_len, seq_len)`` bool tensor,
+        or ``None`` when no term applies and attention is plain causal.
+
+    Raises:
+        ValueError: If a ``BlockMask`` is called for and ``doc_ids`` is not as
+            long as the residual stream, which happens when an arch prepends
+            image tokens to a packed sequence.
+    """
+    flexible = backend == "flex" and key_padding_mask is None
+    if flexible and doc_ids is not None:
+        if doc_ids.shape[1] != seq_len:
+            raise ValueError(
+                f"doc_ids length ({doc_ids.shape[1]}) does not match the sequence "
+                f"length reaching attention ({seq_len}). Sequence packing is not "
+                "supported for arches that prepend image tokens to the residual stream."
+            )
+        return build_doc_causal_block_mask(doc_ids, device, group_ids)
+    if flexible and group_ids is not None:
+        return build_doc_causal_block_mask(torch.zeros_like(group_ids), device, group_ids)
+    return build_dense_attention_mask(
+        seq_len=seq_len,
+        device=device,
+        doc_ids=doc_ids,
+        group_ids=group_ids,
+        key_padding_mask=key_padding_mask,
+    )
+
+
 def same_group_mask(group_ids: torch.Tensor) -> torch.Tensor:
-    """Dense ``same_nonnegative_group`` term, for the SDPA mask path.
+    """Dense ``same_nonnegative_group`` term, for the dense mask path.
 
     The counterpart of the group term inside ``build_doc_causal_block_mask``.
 
@@ -50,6 +127,57 @@ def same_group_mask(group_ids: torch.Tensor) -> torch.Tensor:
     """
     same = group_ids.unsqueeze(2) == group_ids.unsqueeze(1)
     return (same & (group_ids >= 0).unsqueeze(2)).unsqueeze(1)
+
+
+def build_dense_attention_mask(
+    *,
+    seq_len: int,
+    device: torch.device,
+    doc_ids: torch.Tensor | None = None,
+    group_ids: torch.Tensor | None = None,
+    key_padding_mask: torch.Tensor | None = None,
+) -> torch.Tensor | None:
+    """Dense boolean mask for ``F.scaled_dot_product_attention``.
+
+    ``True`` means the query may attend to the key. Starts causal, widens by
+    the group term, then narrows by document isolation and key validity, so a
+    group never reaches across a document and never revives an invalid key.
+
+    A query row left with no reachable key -- the leading positions of an
+    all-padded clip, say -- would softmax over all ``-inf`` and yield NaN, so
+    such rows are unmasked instead. Their outputs are discarded downstream, by
+    ``output_slice`` or by the clip's labels being all ``-100``.
+
+    An explicit mask is not a FlashAttention-2 shape, so SDPA falls back to the
+    mem-efficient or math kernel whenever one is returned. ``None`` keeps the
+    ``is_causal`` fast path, which is why it is returned rather than an
+    all-causal tensor.
+
+    Args:
+        seq_len: Query and key length.
+        device: Device to materialize the causal term on. Any ids passed must
+            already be on it.
+        doc_ids: Optional per-token document ids, shape ``(batch, seq_len)``.
+        group_ids: Optional per-token group ids, shape ``(batch, seq_len)``;
+            negative means no group.
+        key_padding_mask: Optional per-key validity mask, shape
+            ``(batch, seq_len)``; ``True`` = attend.
+
+    Returns:
+        Bool tensor of shape ``(batch, 1, seq_len, seq_len)``, or ``None`` when
+        every optional term is ``None`` and the mask would be plain causal.
+    """
+    if doc_ids is None and group_ids is None and key_padding_mask is None:
+        return None
+    causal = torch.ones(seq_len, seq_len, dtype=torch.bool, device=device).tril()
+    mask = causal.unsqueeze(0).unsqueeze(0)
+    if group_ids is not None:
+        mask = mask | same_group_mask(group_ids)
+    if doc_ids is not None:
+        mask = mask & (doc_ids.unsqueeze(2) == doc_ids.unsqueeze(1)).unsqueeze(1)
+    if key_padding_mask is not None:
+        mask = mask & key_padding_mask.unsqueeze(1).unsqueeze(1)
+    return mask | ~mask.any(dim=-1, keepdim=True)
 
 
 def build_doc_causal_block_mask(

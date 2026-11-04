@@ -23,7 +23,7 @@ from kempnerforge.model.attention import Attention, KVCache
 from kempnerforge.model.cross_attention import CrossAttentionBlock
 from kempnerforge.model.embedding import OutputHead, TokenEmbedding
 from kempnerforge.model.init import init_weights
-from kempnerforge.model.masking import build_doc_causal_block_mask
+from kempnerforge.model.masking import build_attention_mask
 from kempnerforge.model.mlp import build_mlp
 from kempnerforge.model.modality import ModalityContext
 from kempnerforge.model.moe import MoEMLP, build_moe
@@ -89,20 +89,28 @@ class TransformerBlock(nn.Module):
         rope_sin: torch.Tensor,
         *,
         kv_cache: KVCache | None = None,
-        doc_ids: torch.Tensor | None = None,
-        attention_group_ids: torch.Tensor | None = None,
-        key_padding_mask: torch.Tensor | None = None,
-        block_mask: BlockMask | None = None,
+        attn_mask: torch.Tensor | BlockMask | None = None,
     ) -> torch.Tensor:
+        """Run attention and the MLP over the residual stream.
+
+        Args:
+            x: Residual stream, shape ``(batch, seq_len, dim)``.
+            rope_cos: RoPE cosine frequencies for this block's positions.
+            rope_sin: RoPE sine frequencies for this block's positions.
+            kv_cache: Optional KV cache for incremental generation.
+            attn_mask: The one mask from
+                ``kempnerforge.model.masking.build_attention_mask``, built once
+                per forward and shared by every block.
+
+        Returns:
+            The updated residual stream, shape ``(batch, seq_len, dim)``.
+        """
         x = x + self.attention(
             self.attention_norm(x),
             rope_cos,
             rope_sin,
             kv_cache=kv_cache,
-            doc_ids=doc_ids,
-            attention_group_ids=attention_group_ids,
-            key_padding_mask=key_padding_mask,
-            block_mask=block_mask,
+            attn_mask=attn_mask,
         )
         x = x + self.mlp(self.mlp_norm(x))
         return x
@@ -419,24 +427,19 @@ class Transformer(nn.Module):
         cos = self._rope_cos[start_pos : start_pos + seq_len]  # type: ignore[reportOptionalSubscript]
         sin = self._rope_sin[start_pos : start_pos + seq_len]  # type: ignore[reportOptionalSubscript]
 
-        block_mask = None
-        if (
-            (doc_ids is not None or attention_group_ids is not None)
-            and key_padding_mask is None
-            and self.config.attention_backend == "flex"
-        ):
-            if doc_ids is not None and doc_ids.shape[1] != seq_len:
-                raise ValueError(
-                    f"doc_ids length ({doc_ids.shape[1]}) does not match the sequence "
-                    f"length reaching attention ({seq_len}). Sequence packing is not "
-                    "supported for arches that prepend image tokens to the residual stream."
-                )
-            if doc_ids is None:
-                assert attention_group_ids is not None
-                doc_ids = torch.zeros_like(attention_group_ids)
-            block_mask = build_doc_causal_block_mask(doc_ids, h.device, attention_group_ids)
-            doc_ids = None
-            attention_group_ids = None
+        mot_masks_its_own_streams = bool(self._mot_modalities)
+        attn_mask = (
+            None
+            if mot_masks_its_own_streams
+            else build_attention_mask(
+                backend=self.config.attention_backend,
+                seq_len=seq_len,
+                device=h.device,
+                doc_ids=doc_ids,
+                group_ids=attention_group_ids,
+                key_padding_mask=key_padding_mask,
+            )
+        )
 
         if self._moma_modalities:
             if modality_ids is None:
@@ -451,7 +454,12 @@ class Transformer(nn.Module):
                 )
             for layer in self.layers.values():
                 h = layer(
-                    h, cos, sin, modality_ids, doc_ids=doc_ids, key_padding_mask=key_padding_mask
+                    h,
+                    cos,
+                    sin,
+                    modality_ids,
+                    attn_mask=attn_mask,
+                    key_padding_mask=key_padding_mask,
                 )
             h = self.norm(h)
         elif self._mot_modalities:
@@ -484,16 +492,7 @@ class Transformer(nn.Module):
             ca_iter = iter(self.cross_attention_layers.values()) if self._ca_cadence else None
             for i, layer in enumerate(self.layers.values()):
                 cache = kv_caches[i] if kv_caches is not None else None
-                h = layer(
-                    h,
-                    cos,
-                    sin,
-                    kv_cache=cache,
-                    doc_ids=doc_ids,
-                    attention_group_ids=attention_group_ids,
-                    key_padding_mask=key_padding_mask,
-                    block_mask=block_mask,
-                )
+                h = layer(h, cos, sin, kv_cache=cache, attn_mask=attn_mask)
                 if ca_iter is not None and (i + 1) % self._ca_cadence == 0:
                     ca = next(ca_iter, None)
                     if ca is not None:

@@ -31,7 +31,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from kempnerforge.config.schema import ModelConfig
 from kempnerforge.model.embedding import OutputHead, TokenEmbedding
 from kempnerforge.model.init import init_weights
-from kempnerforge.model.masking import build_doc_causal_block_mask
+from kempnerforge.model.masking import build_attention_mask
 from kempnerforge.model.norm import build_norm
 from kempnerforge.model.position import precompute_rope_frequencies
 from kempnerforge.model.transformer import TransformerBlock
@@ -181,7 +181,10 @@ class PipelineStageModule(nn.Module):
                 hands it to every stage directly. It must not travel between
                 stages as an activation -- ``PipelineStage`` calls
                 ``requires_grad_(True)`` on every received buffer without
-                checking dtype, which an integer tensor cannot satisfy.
+                checking dtype, which an integer tensor cannot satisfy. Each
+                stage builds its own mask from them, once per forward: a
+                ``BlockMask`` is not a tensor and could not be transmitted
+                either.
 
         Returns:
             For last stage: logits of shape (batch, seq_len, vocab_size).
@@ -197,14 +200,15 @@ class PipelineStageModule(nn.Module):
         cos = self._rope_cos[:seq_len]  # type: ignore[reportOptionalSubscript]
         sin = self._rope_sin[:seq_len]  # type: ignore[reportOptionalSubscript]
 
-        block_mask = None
-        layer_doc_ids = doc_ids
-        if doc_ids is not None and self.config.attention_backend == "flex":
-            block_mask = build_doc_causal_block_mask(doc_ids, x.device)
-            layer_doc_ids = None
+        attn_mask = build_attention_mask(
+            backend=self.config.attention_backend,
+            seq_len=seq_len,
+            device=x.device,
+            doc_ids=doc_ids,
+        )
 
         for layer in self.layers.values():
-            x = layer(x, cos, sin, doc_ids=layer_doc_ids, block_mask=block_mask)
+            x = layer(x, cos, sin, attn_mask=attn_mask)
 
         if self.is_last:
             x = self.norm(x)  # type: ignore[reportOptionalCall]

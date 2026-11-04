@@ -32,6 +32,7 @@ from kempnerforge.config.schema import ModelConfig
 from kempnerforge.config.vlm import MoMaConfig, MoTConfig
 from kempnerforge.model.attention import Attention, KVCache
 from kempnerforge.model.masking import (
+    build_dense_attention_mask,
     build_doc_causal_block_mask,
     flex_attention_fn,
     same_group_mask,
@@ -205,7 +206,11 @@ class TestBlockMaskPredicate:
 
 
 class TestDenseAttentionPath:
-    """The SDPA dense branch applies exactly the expected mask."""
+    """The SDPA dense branch applies exactly the mask it is handed.
+
+    ``Attention`` takes one mask and derives none, so every case here builds
+    the mask with ``build_dense_attention_mask`` and passes it in.
+    """
 
     @staticmethod
     def _rope_identity(seq_len: int, head_dim: int):
@@ -232,13 +237,31 @@ class TestDenseAttentionPath:
         cos, sin = self._rope_identity(seq_len, attn.head_dim)
         return attn, x, cos, sin
 
+    @staticmethod
+    def _mask(
+        doc_ids: torch.Tensor | None,
+        group_ids: torch.Tensor | None,
+        key_padding_mask: torch.Tensor | None = None,
+        seq_len: int = 12,
+    ) -> torch.Tensor:
+        mask = build_dense_attention_mask(
+            seq_len=seq_len,
+            device=CPU,
+            doc_ids=doc_ids,
+            group_ids=group_ids,
+            key_padding_mask=key_padding_mask,
+        )
+        assert mask is not None
+        return mask
+
     @pytest.mark.parametrize("n_kv_heads", [4, 2], ids=["mha", "gqa"])
     @pytest.mark.parametrize("name", sorted(FIXTURES))
     def test_forward_matches_the_reference(self, name, n_kv_heads):
         doc_ids, group_ids = FIXTURES[name]
         attn, x, cos, sin = self._setup(doc_ids, seed=0, n_kv_heads=n_kv_heads)
+        mask = self._mask(doc_ids, group_ids, seq_len=doc_ids.shape[1])
         with torch.no_grad():
-            out = attn(x, cos, sin, doc_ids=doc_ids, attention_group_ids=group_ids)
+            out = attn(x, cos, sin, attn_mask=mask)
             expected = self._reference(attn, x, oracle_mask(doc_ids, group_ids))
         torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
@@ -246,7 +269,7 @@ class TestDenseAttentionPath:
         attn, x, cos, sin = self._setup(PACK_DOCS, seed=1)
         expected_mask = oracle_mask(torch.zeros_like(PACK_GROUPS), PACK_GROUPS)
         with torch.no_grad():
-            out = attn(x, cos, sin, attention_group_ids=PACK_GROUPS)
+            out = attn(x, cos, sin, attn_mask=self._mask(None, PACK_GROUPS))
             expected = self._reference(attn, x, expected_mask)
         torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
@@ -254,8 +277,8 @@ class TestDenseAttentionPath:
         attn, x, cos, sin = self._setup(PACK_DOCS, seed=2)
         all_negative = torch.full_like(PACK_DOCS, -1)
         with torch.no_grad():
-            base = attn(x, cos, sin, doc_ids=PACK_DOCS)
-            grouped = attn(x, cos, sin, doc_ids=PACK_DOCS, attention_group_ids=all_negative)
+            base = attn(x, cos, sin, attn_mask=self._mask(PACK_DOCS, None))
+            grouped = attn(x, cos, sin, attn_mask=self._mask(PACK_DOCS, all_negative))
         torch.testing.assert_close(grouped, base, rtol=0, atol=0)
 
     def test_key_padding_drops_keys_inside_a_group(self):
@@ -267,14 +290,7 @@ class TestDenseAttentionPath:
         visible[4] = {0, 1, 2, 3}
         visible[5] = {0, 1, 2, 3, 5}
         with torch.no_grad():
-            out = attn(
-                x,
-                cos,
-                sin,
-                doc_ids=PACK_DOCS,
-                attention_group_ids=PACK_GROUPS,
-                key_padding_mask=key_padding,
-            )
+            out = attn(x, cos, sin, attn_mask=self._mask(PACK_DOCS, PACK_GROUPS, key_padding))
             expected = self._reference(attn, x, _from_visible(visible).unsqueeze(0))
         torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
@@ -282,7 +298,7 @@ class TestDenseAttentionPath:
         attn, x, cos, sin = self._setup(PACK_DOCS, seed=4)
         attn.capture_attention_weights = True
         with torch.no_grad():
-            attn(x, cos, sin, doc_ids=PACK_DOCS, attention_group_ids=PACK_GROUPS)
+            attn(x, cos, sin, attn_mask=self._mask(PACK_DOCS, PACK_GROUPS))
         weights = attn.last_attention_weights
         assert weights is not None
         visible = _from_visible(PACK_VISIBLE).expand_as(weights)
@@ -292,11 +308,18 @@ class TestDenseAttentionPath:
         attn, x, cos, sin = self._setup(PACK_DOCS, seed=4)
         attn.capture_attention_weights = True
         with torch.no_grad():
-            attn(x, cos, sin, doc_ids=PACK_DOCS)
+            attn(x, cos, sin, attn_mask=self._mask(PACK_DOCS, None))
         weights = attn.last_attention_weights
         assert weights is not None
         expected = _block_diag(_ones(6).tril(), _ones(4).tril(), _ones(2).tril())
         assert torch.equal(weights != 0, expected.expand_as(weights))
+
+    def test_a_block_mask_is_refused_while_capturing_weights(self):
+        attn, x, cos, sin = self._setup(PACK_DOCS, seed=5)
+        attn.capture_attention_weights = True
+        block_mask = build_doc_causal_block_mask(PACK_DOCS, CPU, PACK_GROUPS)
+        with pytest.raises(NotImplementedError, match="attention_backend='sdpa'"):
+            attn(x, cos, sin, attn_mask=block_mask)
 
 
 class TestFlexForwardParity:
