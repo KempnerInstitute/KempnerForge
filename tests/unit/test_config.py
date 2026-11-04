@@ -538,6 +538,18 @@ class TestDataConfig:
         with pytest.raises(ValueError, match="data.token_dtype must be 'uint16' or 'uint32'"):
             load_config(cli_args=["--data.token_dtype=int32"])
 
+    @pytest.mark.parametrize("value", ["0", "False", "None"])
+    def test_falsy_non_string_override_fails_at_load(self, value):
+        """The loader keeps ``0``, ``False`` and ``None`` as non-strings, so they fail too."""
+        with pytest.raises(ValueError, match="data.token_dtype must be 'uint16' or 'uint32'"):
+            load_config(cli_args=[f"--data.token_dtype={value}"])
+
+    def test_falsy_toml_value_fails_at_load(self, tmp_path):
+        toml = tmp_path / "data.toml"
+        toml.write_text("[data]\ntoken_dtype = false\n")
+        with pytest.raises(ValueError, match="data.token_dtype must be 'uint16' or 'uint32'"):
+            load_config(str(toml))
+
 
 class TestMetricsConfig:
     def test_rejects_zero_log_interval(self):
