@@ -6,17 +6,14 @@ The VLM step body still lives in core, so ``run_training`` selects it from
 ``config.is_vlm``; when it moves out here it becomes a ``step_fn=`` argument.
 
 Usage:
-    # Single GPU
-    uv run python examples/image_understanding/train.py \
-        examples/image_understanding/configs/debug.toml
-
     # Multi-GPU (single node, via torchrun)
     uv run torchrun --nproc_per_node=4 examples/image_understanding/train.py \
         examples/image_understanding/configs/qwen3_0.6b_siglip2_stage1.toml
 
     # With overrides
-    uv run python examples/image_understanding/train.py \
-        examples/image_understanding/configs/debug.toml --train.max_steps=20
+    uv run torchrun --nproc_per_node=4 examples/image_understanding/train.py \
+        examples/image_understanding/configs/qwen3_0.6b_siglip2_stage1.toml \
+        --train.grad_accum_steps=4
 """
 
 from __future__ import annotations

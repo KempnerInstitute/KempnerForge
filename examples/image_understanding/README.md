@@ -29,7 +29,6 @@ examples/image_understanding/
 
 | Config | Stage | Encoder | Trains | For |
 | --- | --- | --- | --- | --- |
-| `debug.toml` | 1 | random | connector | 1-GPU smoke, no download |
 | `qwen3_0.6b_siglip2_stage1.toml` | 1 | siglip2 | encoder + connector | captioning on a frozen backbone, 16 GPUs |
 | `qwen3_0.6b_siglip2_stage2.toml` | 2 | siglip2 | everything | instruction mixture from a stage-1 checkpoint, 16 GPUs |
 
@@ -40,16 +39,12 @@ pooled 2 × 2 to 256 visual tokens, plus `max_text_len = 256` text tokens, so
 `train.grad_accum_steps` to keep it.
 
 Paths in these configs are placeholders (`dir = "path-to-output-dir"`) and the
-dataset is a 30-image COCO stand-in, so a fresh clone validates and smokes.
+dataset is a 30-image COCO stand-in, so a fresh clone validates.
 Point them at your own data and output directories, or override on the CLI.
 
 ## Run it
 
 ```bash
-# 1-GPU smoke
-uv run python examples/image_understanding/train.py \
-    examples/image_understanding/configs/debug.toml
-
 # Stage 1 on 4 GPUs (grad accumulation keeps the global batch at 256)
 uv run torchrun --nproc_per_node=4 examples/image_understanding/train.py \
     examples/image_understanding/configs/qwen3_0.6b_siglip2_stage1.toml \

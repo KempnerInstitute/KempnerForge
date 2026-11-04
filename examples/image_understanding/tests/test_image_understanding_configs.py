@@ -57,7 +57,7 @@ def test_every_preset_is_the_recipe_architecture(path: Path) -> None:
     assert config.vlm is not None and config.adapter is not None
     assert config.vision_encoder is not None
     assert config.vlm.arch == "joint_decoder"
-    assert config.vision_encoder.type in ("siglip2", "random")
+    assert config.vision_encoder.type == "siglip2"
     assert (config.adapter.type, config.adapter.pool_window) == ("avgpool", 2)
     assert config.model.qk_norm is True
     assert str(config.model.norm_type) == "rmsnorm"
@@ -82,17 +82,6 @@ def test_machine_specific_path_check_fires(tmp_path: Path) -> None:
     home.write_text('[checkpoint]\ndir = "~/scratch/run"\n')
     with pytest.raises(AssertionError, match="home directory"):
         _assert_no_machine_specific_paths(home)
-
-
-def test_debug_toml_runs_on_one_gpu_without_a_download() -> None:
-    config = load_config(str(CONFIG_DIR / "debug.toml"), cli_args=[])
-    assert config.vision_encoder is not None and config.adapter is not None
-    assert config.vlm is not None
-    assert config.vision_encoder.type == "random"
-    visual = config.adapter.output_num_tokens(config.vision_encoder.num_tokens)
-    assert visual == 16
-    assert visual + config.vlm.max_text_len == config.model.max_seq_len == 272
-    config.validate(world_size=1)
 
 
 @pytest.mark.parametrize("stage", [1, 2])
@@ -160,7 +149,9 @@ def test_entry_point_passes_the_loaded_config_through(monkeypatch: pytest.Monkey
     seen: dict[str, Any] = {}
     monkeypatch.setattr(module, "run_training", lambda config: seen.update(config=config))
     monkeypatch.setattr(
-        sys, "argv", ["train.py", str(CONFIG_DIR / "debug.toml"), "--train.max_steps=3"]
+        sys,
+        "argv",
+        ["train.py", str(CONFIG_DIR / "qwen3_0.6b_siglip2_stage1.toml"), "--train.max_steps=3"],
     )
     module.main()
     assert seen["config"].is_vlm is True
