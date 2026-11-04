@@ -45,13 +45,18 @@ sharding (HSDP):
   checkpoint loads under a different `dp_replicate` and `dp_shard` split
   (see [Resharding](../checkpointing/resharding.md)).
 
-`init_distributed` keeps a size-1 `dp_shard` whenever `tp > 1` or
-`ep > 1`, so `dp_replicate > 1` with TP or EP takes this path too, with
-one-rank `dp_shard` groups: the ranks of a `dp_replicate` group hold the
-same parameters, and their gradients are all-reduced over that group.
+When `dp_shard` resolves to 1, `init_distributed` still keeps a size-1
+`dp_shard` if `tp > 1` or `ep > 1`, so `dp_replicate > 1` with TP or EP
+takes this path too, with one-rank `dp_shard` groups: the ranks of a
+`dp_replicate` group hold the same parameters, and their gradients are
+all-reduced over that group.
 A parameter TP has sharded keeps its `tp` placement as a third entry,
 for example `(Replicate(), Shard(0), Shard(1))`, so each rank holds its
 TP slice rather than a full copy.
+When `dp_shard` resolves to more than 1, the mesh has a `dp_shard`
+dimension of that size: `dp_replicate=2` with `tp=2` on 8 GPUs builds a
+`(dp_replicate, dp_shard, tp) = (2, 2, 2)` mesh, whose `dp_shard`
+groups have two ranks.
 No shipped config sets `dp_replicate > 1`.
 
 ## Mixed precision policy
