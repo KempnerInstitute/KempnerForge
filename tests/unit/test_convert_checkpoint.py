@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -436,3 +437,31 @@ class TestExportDtypePrecedence:
         with caplog.at_level(logging.INFO, logger="convert_checkpoint"):
             _run_dcp_to_hf(tmp_path, monkeypatch, export_dtype, flag)
         assert f"Export dtype: float32 (from {source})" in caplog.text
+
+
+def _random_dcp(path: Path, model_config: ModelConfig) -> Transformer:
+    """Save a model whose every weight, norms included, is drawn at random; return it."""
+    model = Transformer(model_config)
+    generator = torch.Generator().manual_seed(0)
+    with torch.no_grad():
+        for param in model.parameters():
+            param.normal_(generator=generator)
+    dcp.save({"model": model.state_dict()}, checkpoint_id=str(path))
+    return model
+
+
+class TestTiedExport:
+    """A model with tied embeddings exports at every dtype, float32 included."""
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+    def test_head_is_written_as_a_copy_of_the_embedding(self, tmp_path, tiny_model_config, dtype):
+        """At float32 the cast leaves the tied head on the embedding's storage, which
+        safetensors refuses, so the export writes the head as its own copy."""
+        config = replace(tiny_model_config, tie_embeddings=True)
+        source = _random_dcp(tmp_path / "dcp", config)
+        dcp_to_hf(str(tmp_path / "dcp"), str(tmp_path / "hf"), config, dtype=dtype)
+        weights = load_file(tmp_path / "hf" / "model.safetensors")
+        embedding = source.state_dict()["token_embedding.embedding.weight"].to(dtype)
+        assert torch.equal(weights["model.embed_tokens.weight"], embedding)
+        assert torch.equal(weights["lm_head.weight"], embedding)
+        assert json.loads((tmp_path / "hf" / "config.json").read_text())["tie_word_embeddings"]
