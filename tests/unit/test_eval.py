@@ -70,7 +70,6 @@ class TestRunEval:
 
     def test_perfect_model_low_loss(self):
         """A model that always predicts the correct class should have low loss."""
-        # All labels are token 0
         input_ids = torch.zeros(8, SEQ_LEN, dtype=torch.long)
         labels = torch.zeros(8, SEQ_LEN, dtype=torch.long)
         dataset = TensorDataset(input_ids, labels)
@@ -82,10 +81,6 @@ class TestRunEval:
 
         dl = DataLoader(dataset, batch_size=4, collate_fn=collate_fn)
 
-        # Bias the output head to strongly predict class 0.
-        # Also zero the embedding and set row 0 to ones so logits[0] is deterministically
-        # positive regardless of inherited global RNG state (otherwise loss depends on
-        # whether sum(embed(0)) lands above or below ~0.4, which is coin-flip-random).
         model = _TinyLM()
         with torch.no_grad():
             model.embed.weight.zero_()
@@ -109,7 +104,6 @@ class TestRunEval:
         """If dataloader has fewer batches than eval_steps, it should wrap around."""
         model = _TinyLM()
         dl = _make_eval_dataloader(num_samples=4, batch_size=4)
-        # 1 batch available but eval_steps=5 — should wrap without error
         metrics = run_eval(model, dl, _loss_fn, torch.device("cpu"), eval_steps=5)
         assert metrics["eval/loss"] > 0
 

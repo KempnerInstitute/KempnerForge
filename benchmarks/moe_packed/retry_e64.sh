@@ -1,17 +1,11 @@
 #!/bin/bash
-# Retry the E=64 cells with smaller batch to avoid OOM.
-# Both cells in the main suite OOM in backward at batch_size=4;
-# drop to batch_size=1 so we can get full 20-step tok/s numbers.
 
 set -uo pipefail
 
-# Resolve job id + nodelist so this works whether called from inside a job
-# allocation or from a detached shell that just exports SLURM_JOB_ID.
 if [ -z "${SLURM_JOB_NODELIST:-}" ]; then
     SLURM_JOB_NODELIST=$(scontrol show job "$SLURM_JOB_ID" | awk '/^   NodeList=/ {sub("^   NodeList=",""); print; exit}')
     export SLURM_JOB_NODELIST
 fi
-# Avoid inheriting a too-small CPUs-per-task from an outer srun wrapper.
 unset SLURM_CPUS_PER_TASK
 export MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -1)
 RESULTS_DIR="moe_packed_results"
@@ -52,7 +46,6 @@ run_experiment() {
     echo ""
 }
 
-# batch_size=1 to fit on 8 H200. Seq length kept the same so tok/s is comparable.
 TRAIN_COMMON_BS1="--train.max_steps=$STEPS --train.batch_size=1 --train.seq_len=4096 --train.grad_accum_steps=1 --train.compile_model=false --train.mixed_precision=bf16 --train.activation_checkpointing=full"
 
 run_experiment "05b_8gpu_moe_e64_fsdp2_ep4_unpacked_bs1" \

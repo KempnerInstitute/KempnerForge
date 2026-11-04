@@ -20,8 +20,6 @@ pytestmark = pytest.mark.skipif(
     reason="requires torchrun with >= 2 GPUs",
 )
 
-# seq_len is at/above FLEX_BLOCK_SIZE so the flex variant is a legal config;
-# below it, flex leaks under Inductor and JobConfig.validate rejects it.
 CONFIG = ModelConfig(dim=128, n_layers=4, n_heads=4, vocab_size=256, max_seq_len=128)
 N_MICROBATCHES = max(2, int(os.environ.get("WORLD_SIZE", "2")))
 BATCH, SEQ = 2 * N_MICROBATCHES, 128
@@ -57,7 +55,6 @@ class TestPipelineParallelEquivalence:
 
         own = stage_module.state_dict()
         subset = {k: v for k, v in ref_state.items() if k in own}
-        # A partial load would silently look like agreement, so pin the key sets.
         assert set(subset) == set(own), f"rank {rank}: missing {set(own) - set(subset)}"
         stage_module.load_state_dict(subset, strict=True)
 
@@ -97,7 +94,7 @@ class TestPipelineParallelEquivalence:
         with torch.no_grad():
             if rank == 0:
                 schedule.step(tokens)
-                return  # only the last stage produces logits
+                return
             pipeline_out = schedule.step()
             single_gpu_out = reference(tokens)
 
@@ -159,9 +156,6 @@ class TestPipelineParallelEquivalence:
 
         if rank == world - 1:
             torch.testing.assert_close(pipeline_out, packed, rtol=1e-5, atol=1e-5)
-            # Guards against the old failure mode reappearing: if doc_ids were
-            # dropped again the pipeline would land on the unpacked result,
-            # which is a different tensor entirely.
             assert not torch.allclose(packed, unpacked, rtol=1e-3, atol=1e-3)
 
     @pytest.mark.parametrize("attention_backend", ["sdpa", "flex"])
@@ -248,7 +242,6 @@ class TestPipelineParallelEquivalence:
             compared += 1
 
         assert compared, f"rank {rank}: compared no parameters"
-        # All-zero gradients would satisfy assert_close on both sides.
         assert largest > 1e-6, f"rank {rank}: reference gradients are ~zero ({largest:.2e})"
 
     @pytest.mark.parametrize("schedule_name", ["1f1b", "gpipe"])
@@ -308,7 +301,6 @@ class TestPipelineParallelEquivalence:
         else:
             schedule.step(doc_ids=doc_ids)
 
-        # Backward actually ran on this stage: every stage holds some gradient.
         grads = [p.grad for p in stage_module.parameters() if p.grad is not None]
         assert grads, f"rank {rank}: backward produced no gradients"
         assert all(torch.isfinite(g).all() for g in grads), f"rank {rank}: non-finite gradient"

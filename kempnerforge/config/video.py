@@ -51,9 +51,6 @@ class VideoConfig:
     prompt: str = ""
 
     def __post_init__(self) -> None:
-        # Late imports populate the dataset/sampling registries (their decorators
-        # run on import) and avoid a config->data import cycle; only hit for a
-        # video job. ``av`` is not required here (it is lazy inside the decoder).
         import kempnerforge.data.video_dataset  # noqa: F401, PLC0415
         import kempnerforge.data.video_io  # noqa: F401, PLC0415
         from kempnerforge.config.registry import registry  # noqa: PLC0415

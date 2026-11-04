@@ -72,20 +72,16 @@ class DistributedSampler(Sampler[int]):
         self.seed = seed
         self.drop_last = drop_last
 
-        # Compute per-rank sample count
         total = len(dataset)  # type: ignore[reportArgumentType]
         if drop_last:
-            # Drop remainder so all ranks get the same count
             self.num_samples = total // num_replicas
             self.total_size = self.num_samples * num_replicas
         else:
-            # Pad to make evenly divisible
             self.num_samples = math.ceil(total / num_replicas)
             self.total_size = self.num_samples * num_replicas
 
-        # State for resumption
         self._epoch = 0
-        self._skip = 0  # Number of samples to skip (for resumption)
+        self._skip = 0
 
     def set_epoch(self, epoch: int) -> None:
         """Set the epoch for deterministic re-shuffling."""
@@ -96,7 +92,6 @@ class DistributedSampler(Sampler[int]):
         self._skip = skip
 
     def __iter__(self):
-        # Generate deterministic permutation
         if self.shuffle:
             g = torch.Generator()
             g.manual_seed(self.seed + self._epoch)
@@ -104,22 +99,18 @@ class DistributedSampler(Sampler[int]):
         else:
             indices = list(range(len(self.dataset)))  # type: ignore[reportArgumentType]
 
-        # Handle uneven sizes
         if self.drop_last:
             indices = indices[: self.total_size]
         else:
-            # Pad by wrapping around
             padding = self.total_size - len(indices)
             indices += indices[:padding]
 
-        # Partition: each rank gets every num_replicas-th element
         indices = indices[self.rank : self.total_size : self.num_replicas]
         assert len(indices) == self.num_samples
 
-        # Skip-ahead for resumption
         if self._skip > 0:
             indices = indices[self._skip :]
-            self._skip = 0  # Reset after applying
+            self._skip = 0
 
         return iter(indices)
 
@@ -182,7 +173,6 @@ class MixtureSampler(Sampler[int]):
 
         _validate_weights(weights, "MixtureSampler(weights=...)")
 
-        # Apply temperature scaling and normalize
         if temperature != 1.0:
             import math as _math
 
@@ -201,7 +191,6 @@ class MixtureSampler(Sampler[int]):
         self.seed = seed
         self.drop_last = drop_last
 
-        # Per-dataset per-rank available count
         per_rank_avail = []
         for size in self._dataset_sizes:
             if drop_last:
@@ -209,11 +198,9 @@ class MixtureSampler(Sampler[int]):
             else:
                 per_rank_avail.append(math.ceil(size / num_replicas))
 
-        # Weighted allocation: how many samples from each dataset per epoch
         total_per_rank = sum(per_rank_avail)
         self._target_counts = [round(p * total_per_rank) for p in self._probs]
 
-        # Fix rounding to match total exactly
         diff = total_per_rank - sum(self._target_counts)
         sorted_idx = sorted(range(n), key=lambda i: -self._probs[i])
         for i in range(abs(diff)):
@@ -247,13 +234,11 @@ class MixtureSampler(Sampler[int]):
             if target <= 0 or size == 0:
                 continue
 
-            # Shuffled local indices for this dataset
             if self.shuffle:
                 indices = torch.randperm(size, generator=g).tolist()
             else:
                 indices = list(range(size))
 
-            # Partition for this rank (stride-based, like DistributedSampler)
             if self.drop_last:
                 usable = size - (size % self.num_replicas)
                 indices = indices[:usable]
@@ -267,22 +252,18 @@ class MixtureSampler(Sampler[int]):
             if not rank_indices:
                 continue
 
-            # Draw target samples (wrap around for oversampling)
             if target <= len(rank_indices):
                 drawn = rank_indices[:target]
             else:
                 reps = target // len(rank_indices) + 1
                 drawn = (rank_indices * reps)[:target]
 
-            # Convert to global MixtureDataset indices
             result.extend(idx + offset for idx in drawn)
 
-        # Shuffle all indices together for random interleaving
         if self.shuffle:
             perm = torch.randperm(len(result), generator=g)
             result = [result[p] for p in perm.tolist()]
 
-        # Skip for resumption
         if self._skip > 0:
             result = result[self._skip :]
             self._skip = 0
@@ -310,7 +291,6 @@ class MixtureSampler(Sampler[int]):
 
         _validate_weights(weights, "MixtureSampler.update_weights")
 
-        # Apply temperature scaling and normalize (same logic as __init__)
         if temperature != 1.0:
             import math as _math
 
@@ -323,7 +303,6 @@ class MixtureSampler(Sampler[int]):
             total_w = sum(weights)
             self._probs = [w / total_w for w in weights]
 
-        # Recompute per-dataset per-rank available count
         per_rank_avail = []
         for size in self._dataset_sizes:
             if self.drop_last:
@@ -334,7 +313,6 @@ class MixtureSampler(Sampler[int]):
         total_per_rank = sum(per_rank_avail)
         self._target_counts = [round(p * total_per_rank) for p in self._probs]
 
-        # Fix rounding to match total exactly
         diff = total_per_rank - sum(self._target_counts)
         sorted_idx = sorted(range(n), key=lambda i: -self._probs[i])
         for i in range(abs(diff)):

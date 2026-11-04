@@ -32,33 +32,24 @@ class TestClipGradNorm:
 
     def test_returns_total_norm(self):
         model = self._make_model_with_grad(1.0)
-        # 4x4 matrix of 1s → norm = sqrt(16) = 4.0
         norm = clip_grad_norm_(model, max_norm=100.0)
         assert abs(norm.item() - 4.0) < 1e-5
 
     def test_clips_when_above_max(self):
         model = self._make_model_with_grad(1.0)
-        # norm=4.0, clip to 2.0 → gradients scaled by 2.0/4.0 = 0.5
         clip_grad_norm_(model, max_norm=2.0)
         assert torch.allclose(model.weight.grad, torch.full((4, 4), 0.5), atol=1e-5)
 
     def test_no_clip_when_below_max(self):
         model = self._make_model_with_grad(1.0)
         original_grad = model.weight.grad.clone()
-        # norm=4.0, max_norm=10.0 → no clipping
         clip_grad_norm_(model, max_norm=10.0)
         assert torch.allclose(model.weight.grad, original_grad)
 
     def test_no_grads_returns_zero(self):
         model = torch.nn.Linear(4, 4, bias=False)
-        # No .grad set
         norm = clip_grad_norm_(model, max_norm=1.0)
         assert norm.item() == 0.0
-
-
-# ---------------------------------------------------------------------------
-# Tensor parallel plan builder
-# ---------------------------------------------------------------------------
 
 
 class TestBuildBlockTPPlan:
@@ -78,13 +69,12 @@ class TestBuildBlockTPPlan:
         plan = _build_block_tp_plan(block, sequence_parallel=False)
         assert "attention_norm" not in plan
         assert "mlp_norm" not in plan
-        # Projections should still be parallelized
         assert "attention.q_proj" in plan
         assert "attention.o_proj" in plan
 
     def test_swiglu_includes_gate_proj(self):
         """SwiGLU blocks should shard both gate_proj and up_proj."""
-        block = _make_block(activation="silu")  # SwiGLU
+        block = _make_block(activation="silu")
         plan = _build_block_tp_plan(block, sequence_parallel=False)
         assert "mlp.gate_proj" in plan
         assert "mlp.up_proj" in plan
@@ -92,7 +82,7 @@ class TestBuildBlockTPPlan:
 
     def test_standard_mlp_excludes_gate_proj(self):
         """Standard MLP blocks should only shard up_proj, not gate_proj."""
-        block = _make_block(activation="relu")  # StandardMLP
+        block = _make_block(activation="relu")
         plan = _build_block_tp_plan(block, sequence_parallel=False)
         assert "mlp.gate_proj" not in plan
         assert "mlp.up_proj" in plan
@@ -121,11 +111,6 @@ class TestBuildBlockTPPlan:
         block = _make_block(activation="silu")
         plan = _build_block_tp_plan(block, sequence_parallel=False)
         assert len(plan) == 7
-
-
-# ---------------------------------------------------------------------------
-# InfiniBand interface detection
-# ---------------------------------------------------------------------------
 
 
 class TestDetectIBInterface:
@@ -178,11 +163,6 @@ class TestDetectIBInterface:
             assert _detect_ib_interface() is None
 
 
-# ---------------------------------------------------------------------------
-# NCCL environment setup
-# ---------------------------------------------------------------------------
-
-
 class TestSetNcclEnv:
     def test_sets_ib_env_vars(self):
         """Should set NCCL and GLOO socket interface when IB is detected."""
@@ -200,10 +180,8 @@ class TestSetNcclEnv:
         """Should not override NCCL_SOCKET_IFNAME if already set."""
         env = {"NCCL_SOCKET_IFNAME": "eth0"}
         with patch.dict(os.environ, env, clear=True):
-            # _detect_ib_interface should NOT be called when env var is already set
             _set_nccl_env()
             assert os.environ["NCCL_SOCKET_IFNAME"] == "eth0"
-            # GLOO should default to the same value from env
             assert os.environ["GLOO_SOCKET_IFNAME"] == "eth0"
 
     def test_no_ib_detected(self):
@@ -216,13 +194,7 @@ class TestSetNcclEnv:
             _set_nccl_env()
             assert "NCCL_SOCKET_IFNAME" not in os.environ
             assert "GLOO_SOCKET_IFNAME" not in os.environ
-            # IB defaults should still be set
             assert os.environ["NCCL_IB_DISABLE"] == "0"
-
-
-# ---------------------------------------------------------------------------
-# get_world_info
-# ---------------------------------------------------------------------------
 
 
 class TestGetWorldInfo:
@@ -271,14 +243,6 @@ class TestGetWorldInfo:
             assert os.environ["WORLD_SIZE"] == "32"
 
 
-# ---------------------------------------------------------------------------
-# default_mp_policy / VLM build path on a single CPU process.
-# Real DeviceMesh wrap paths require multi-GPU and live in
-# tests/distributed/test_vlm_fsdp.py; the cases here exercise the
-# non-distributed dispatch + assertions that still run on plain CPU.
-# ---------------------------------------------------------------------------
-
-
 class TestDefaultMpPolicy:
     def test_cast_forward_inputs_is_set(self):
         """The VLM path relies on ``cast_forward_inputs=True`` so adapter
@@ -305,10 +269,8 @@ class TestApplyFsdpVLMGuards:
         from kempnerforge.distributed.parallel import _apply_fsdp_vlm
 
         fake_mesh = MagicMock()
-        fake_mesh.mesh_dim_names = ("tp",)  # no dp_shard / dp_replicate
+        fake_mesh.mesh_dim_names = ("tp",)
         wrapper = MagicMock()
-        # Should not raise even though wrapper is not a real VLMWrapper:
-        # the early-return runs before the isinstance assert.
         _apply_fsdp_vlm(wrapper, fake_mesh, mp_policy=None, encoder_frozen=False)
 
     def test_assert_on_non_vlm_wrapper(self):
@@ -373,7 +335,6 @@ class TestBuildParallelModelVLM:
             vlm_config=lc,
             param_dtype=torch.bfloat16,
         )
-        # Transformer + adapter cast to bf16; encoder stays in HF dtype (fp32 here).
         assert model.transformer.token_embedding.embedding.weight.dtype == torch.bfloat16
         assert model.adapter.proj1.weight.dtype == torch.bfloat16
 
@@ -384,9 +345,6 @@ class TestBuildParallelModelVLM:
         from kempnerforge.config.vlm import VLMConfig
         from kempnerforge.distributed.parallel import build_parallel_model
 
-        # Bypass the JobConfig __post_init__ check by setting num_tokens=0
-        # (deferred), then forcing the encoder to produce a real number of
-        # tokens that overflows max_seq_len at build time.
         mc = ModelConfig(
             dim=64,
             n_layers=2,
@@ -397,7 +355,7 @@ class TestBuildParallelModelVLM:
         )
         vc = VisionEncoderConfig(type="random", feature_dim=96, num_tokens=0)
         ac = AdapterConfig()
-        lc = VLMConfig(max_text_len=24)  # 16 + 24 = 40 > 32
+        lc = VLMConfig(max_text_len=24)
         with pytest.raises(ValueError, match="max_seq_len.*insufficient"):
             build_parallel_model(
                 mc,
@@ -441,8 +399,6 @@ class TestBuildParallelModelVLM:
         )
         vc = VisionEncoderConfig(type="random", feature_dim=96, num_tokens=8)
         ac = AdapterConfig()
-        # Mixed specs: alias+True plus a sub-pattern with frozen=False
-        # means _is_encoder_frozen returns False -> stays in train().
         lc = VLMConfig(
             max_text_len=32,
             freeze=[
@@ -466,7 +422,6 @@ class TestBuildParallelModelVLM:
 
         cfg = ModelConfig(dim=64, n_layers=2, n_heads=4, n_kv_heads=4, vocab_size=256)
         model = build_parallel_model(cfg, torch.device("cpu"), device_mesh=None)
-        # Plain Transformer, not VLMWrapper.
         from kempnerforge.model.transformer import Transformer
 
         assert isinstance(model, Transformer)
@@ -502,10 +457,8 @@ class TestFsdpWrapTransformerBlocksHelper:
         ep_sub = _fsdp_wrap_transformer_blocks(
             transformer, MagicMock(), default_mp_policy(), reshard_after_forward=True
         )
-        # Dense path: one wrap per block, none of them ep-sub-wrapped.
         assert ep_sub == 0
-        assert len(captured) == 2  # two transformer blocks
-        # Each captured object should be a TransformerBlock, not a sub-module.
+        assert len(captured) == 2
         for layer in captured:
             assert isinstance(layer, TransformerBlock)
 
@@ -553,7 +506,6 @@ class TestApplyFsdp2GuardedAttributes:
 
         apply_fsdp2(stage, self._dp_mesh(), reshard_after_forward=False)
 
-        # This stage owns 2 of the 4 blocks, then the top-level wrap.
         assert len(captured) == 3
         assert all(isinstance(m, TransformerBlock) for m in captured[:2])
         assert captured[-1] is stage
@@ -578,7 +530,6 @@ class TestApplyFsdp2GuardedAttributes:
 
         apply_fsdp2(transformer, self._dp_mesh())
 
-        # 4 transformer blocks, 2 cross-attention blocks, then the top-level wrap.
         assert len(captured) == 7
         assert sum(isinstance(m, CrossAttentionBlock) for m in captured) == 2
         assert captured[-1] is transformer
@@ -595,5 +546,5 @@ class TestApplyFsdp2GuardedAttributes:
 
         apply_fsdp2(transformer, self._dp_mesh())
 
-        assert len(captured) == 3  # 2 blocks + top-level, no CA wraps
+        assert len(captured) == 3
         assert captured[-1] is transformer
