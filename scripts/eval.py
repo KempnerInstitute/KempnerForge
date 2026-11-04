@@ -81,7 +81,7 @@ def main() -> None:
     dummy_optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
     ckpt_mgr = CheckpointManager(config.checkpoint, model, dummy_optimizer)
 
-    resume_path = resolve_resume_path(config.checkpoint.dir)
+    resume_path = resolve_resume_path(config.checkpoint.dir, require_train_state=False)
     load_path = config.checkpoint.load_path or (str(resume_path) if resume_path else None)
 
     if load_path is None:
