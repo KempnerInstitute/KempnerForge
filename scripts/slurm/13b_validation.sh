@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH --job-name=13b-validation
-#SBATCH --partition=<partition-name>     # e.g. gpu, kempner_dev
-#SBATCH --account=<account-name>         # your SLURM account
-#SBATCH --constraint=<gpu-type>          # e.g. h200, h100, a100
+#SBATCH --partition=<partition-name>
+#SBATCH --account=<account-name>
+#SBATCH --constraint=<gpu-type>
 #SBATCH --nodes=6
 #SBATCH --ntasks-per-node=4
 #SBATCH --gpus-per-node=4
@@ -12,9 +12,6 @@
 #SBATCH --output=logs/%j_%x.out
 #SBATCH --error=logs/%j_%x.err
 #SBATCH --signal=B:SIGTERM@120
-#
-# Full validation run: 13B model on 24 H200 GPUs (6 nodes x 4).
-# Tests: training, TP+FSDP, eval pipeline, checkpointing, profiling.
 
 set -euo pipefail
 

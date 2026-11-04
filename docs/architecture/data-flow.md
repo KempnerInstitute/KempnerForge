@@ -30,7 +30,7 @@ optimizer.step() ; scheduler.step() ; optimizer.zero_grad()
 tracker.end_step(step, loss, grad_norm, lr, tokens_in_step)
 hook_runner.on_step_end(StepContext(...))
 [every N steps] eval, NCCL health, profiler.step, ckpt_mgr.save
-if shutdown_handler.should_shutdown(): save + break
+if shutdown_handler.should_shutdown(): save (unless saved above) + break
 ```
 
 ## Startup, once
@@ -178,7 +178,9 @@ optimizer.zero_grad()
 ```
 
 `clip_grad_norm_` wraps PyTorch's utility so it works with FSDP2 sharded
-parameters. The NaN detector returns `False` on NaN/Inf loss, zeroes
+parameters. Under pipeline parallelism `pipeline_step` also passes the PP
+group, so the norm covers every stage rather than this rank's own. The NaN
+detector returns `False` on NaN/Inf loss, zeroes
 the grads, and (after `max_consecutive`) signals a rollback to the
 previous checkpoint.
 
@@ -228,11 +230,14 @@ In order:
 - **Eval** (every `eval_config.interval` steps) — runs `run_eval` on the
   eval dataloader, logs metrics, fires `on_eval_end` hooks.
 - **Profiler** — `prof.step()` advances the `torch.profiler` schedule.
-- **Checkpoint** (every `checkpoint.interval` steps) — `ckpt_mgr.save`
-  writes a DCP checkpoint asynchronously and updates the `latest`
-  symlink.
+- **Checkpoint** (`checkpoint.should_save(step)`: `dyn_ckpt_window`
+  milestones inside the window, every `checkpoint.interval` steps outside
+  it) — `ckpt_mgr.save` writes a DCP checkpoint asynchronously and
+  updates the `latest` symlink.
 - **Graceful shutdown** — if SIGTERM/SIGUSR1 fired,
-  `ckpt_mgr.save(emergency)` and exit.
+  `ckpt_mgr.save(step)` as the emergency checkpoint, then exit; a step
+  the checkpoint above already saved is not saved again, and the loop
+  waits for that save before it finishes the shutdown.
 
 ## Shutdown
 

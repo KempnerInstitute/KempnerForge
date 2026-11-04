@@ -19,12 +19,8 @@ import sys
 import pytest
 
 
-# ---------------------------------------------------------------------------
-# CLI options
-# ---------------------------------------------------------------------------
 def pytest_addoption(parser):
     group = parser.getgroup("smoke", "Smoke test options")
-    # --smoke is registered in tests/conftest.py (root) to work from any directory
     group.addoption("--slurm", action="store_true", default=False, help="Use srun launch mode")
     group.addoption(
         "--jobid",
@@ -67,9 +63,6 @@ def pytest_addoption(parser):
     )
 
 
-# ---------------------------------------------------------------------------
-# Hardware detection
-# ---------------------------------------------------------------------------
 def _detect_gpu_count() -> int:
     """Detect local GPU count without importing torch."""
     try:
@@ -105,8 +98,6 @@ def _detect_slurm_env(jobid: str | None) -> dict[str, str | int] | None:
         tasks_match = re.search(r"NumTasks=(\d+)", info)
         nodelist_match = re.search(r"(?<!\w)NodeList=(\S+)", info)
         state_match = re.search(r"JobState=(\w+)", info)
-        # AllocTRES reports the GPUs physically reserved for the job even on
-        # interactive salloc sessions where NumTasks defaults to 1.
         gres_match = re.search(r"AllocTRES=[^\n]*gres/gpu=(\d+)", info)
 
         if not all([nodes_match, nodelist_match, state_match]):
@@ -118,11 +109,8 @@ def _detect_slurm_env(jobid: str | None) -> dict[str, str | int] | None:
         total_tasks = int(tasks_match.group(1)) if tasks_match else nodes
         tasks_per_node = total_tasks // nodes
         gres_per_node = int(gres_match.group(1)) // nodes if gres_match else 0
-        # Prefer the GPU count from GRES: salloc without --ntasks reports
-        # NumTasks=1 but still reserves the requested GPUs.
         gpus_per_node = max(tasks_per_node, gres_per_node)
 
-        # Resolve master address
         hostnames = (
             subprocess.run(
                 ["scontrol", "show", "hostnames", nodelist_match.group(1)],
@@ -146,9 +134,6 @@ def _detect_slurm_env(jobid: str | None) -> dict[str, str | int] | None:
         return None
 
 
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
 class HardwareInfo:
     """Detected hardware capabilities."""
 

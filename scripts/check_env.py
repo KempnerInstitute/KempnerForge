@@ -21,29 +21,26 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 try:
     import tomllib
 except ImportError:  # pragma: no cover
     tomllib = None  # type: ignore[assignment]
 
-# ---------------------------------------------------------------------------
-# Status model
-# ---------------------------------------------------------------------------
 
 OK = "OK"
 WARN = "WARN"
 MISS = "MISS"
 
-# Tags accepted via --requires. Baseline (uv, repo-layout) runs always.
 KNOWN_TAGS = ("gpu", "slurm", "multi-node", "wandb", "mlflow", "hf", "gh")
-# Accepted for documentation symmetry but ignored (baseline always runs).
 BASELINE_ALIASES = ("uv", "repo-layout")
 
 DEFAULT_CLUSTER_CONFIG = "configs/cluster/local.toml"
@@ -64,11 +61,6 @@ class CheckResult:
         return d
 
 
-# ---------------------------------------------------------------------------
-# Path and config discovery
-# ---------------------------------------------------------------------------
-
-
 def find_repo_root(start: Path | None = None) -> Path:
     """Walk up from ``start`` (cwd by default) to find the KempnerForge root."""
     cur = (start or Path.cwd()).resolve()
@@ -87,11 +79,6 @@ def load_cluster_config(repo_root: Path, override: str | None = None) -> dict | 
         raise RuntimeError("Python 3.11+ required (tomllib unavailable)")
     with path.open("rb") as f:
         return tomllib.load(f)
-
-
-# ---------------------------------------------------------------------------
-# Baseline checks
-# ---------------------------------------------------------------------------
 
 
 def check_uv() -> CheckResult:
@@ -133,11 +120,6 @@ def check_repo_layout(repo_root: Path) -> CheckResult:
     )
 
 
-# ---------------------------------------------------------------------------
-# Tag checks
-# ---------------------------------------------------------------------------
-
-
 def check_gpu() -> CheckResult:
     """Check for an NVIDIA GPU. nvidia-smi preferred; /dev/nvidia* as fallback."""
     if shutil.which("nvidia-smi") is not None:
@@ -162,7 +144,6 @@ def check_gpu() -> CheckResult:
             name = parts[0] if parts else "?"
             driver = parts[1] if len(parts) > 1 else "?"
             return CheckResult("gpu", OK, f"{count}x {name}, driver {driver}")
-    # Container fallback: nvidia-smi may be missing even when GPUs work.
     if Path("/dev/nvidia0").exists() or Path("/proc/driver/nvidia/gpus").exists():
         return CheckResult("gpu", OK, "NVIDIA device nodes present (nvidia-smi unavailable)")
     return CheckResult(
@@ -335,42 +316,78 @@ def check_wandb(check_credentials: bool = False) -> CheckResult:
     return CheckResult("wandb", OK, "WANDB_API_KEY set (not validated)")
 
 
+_MLFLOW_AUTH_ROUTES = (
+    "routes: (1) env DATABRICKS_HOST + DATABRICKS_TOKEN; (2) a ~/.databrickscfg profile, picked "
+    "by a databricks://<profile> $MLFLOW_TRACKING_URI or $DATABRICKS_CONFIG_PROFILE, else "
+    "DEFAULT; (3) SDK OAuth, which a preflight cannot verify offline"
+)
+_PROFILE_HEADER = re.compile(r"\s*\[(?P<name>.+)\]")
+
+
+def _databricks_profile() -> str:
+    """The ~/.databrickscfg profile MLflow reads, in priority order.
+
+    A databricks://<profile> $MLFLOW_TRACKING_URI, then $DATABRICKS_CONFIG_PROFILE, then DEFAULT.
+    """
+    try:
+        uri = urlparse(os.environ.get("MLFLOW_TRACKING_URI", ""))
+    except ValueError:
+        uri = urlparse("")
+    if uri.scheme == "databricks" and uri.netloc and not {":", "@"} & set(uri.netloc):
+        return uri.netloc
+    return os.environ.get("DATABRICKS_CONFIG_PROFILE") or "DEFAULT"
+
+
+def _profile_problem(profile: str) -> str | None:
+    """Why ~/.databrickscfg has no ``[profile]`` section, or None when it has one.
+
+    Only section headers are matched; keys and values (the tokens) are never parsed or kept.
+    """
+    try:
+        with (Path.home() / ".databrickscfg").open(encoding="utf-8", errors="replace") as f:
+            for line in f:
+                header = _PROFILE_HEADER.match(line)
+                if header and header["name"] == profile:
+                    return None
+    except FileNotFoundError:
+        return "~/.databrickscfg not found"
+    except OSError as e:
+        return f"~/.databrickscfg unreadable: {e.strerror or type(e).__name__}"
+    return f"~/.databrickscfg has no [{profile}] section"
+
+
 def check_mlflow(check_credentials: bool = False) -> CheckResult:
-    """Check Databricks credentials for MLflow; optionally validate via the SDK."""
+    """Check Databricks credentials for MLflow: the env pair, else a ~/.databrickscfg profile.
+
+    SDK OAuth cannot be verified offline, so with neither found the result is a WARN naming all
+    three routes. ``check_credentials`` validates the route found through the SDK.
+    """
     host = os.environ.get("DATABRICKS_HOST")
     token = os.environ.get("DATABRICKS_TOKEN") or os.environ.get("DATABRICKS_API_TOKEN")
-    if not host and not token:
-        return CheckResult(
-            "mlflow",
-            MISS,
-            "DATABRICKS_HOST and token not set",
-            "export DATABRICKS_HOST=... and DATABRICKS_API_TOKEN=... "
-            "(needed for metrics.enable_mlflow with tracking_uri=databricks)",
-        )
-    if not host:
-        return CheckResult(
-            "mlflow", MISS, "token set but DATABRICKS_HOST missing", "export DATABRICKS_HOST=..."
-        )
-    if not token:
-        return CheckResult(
-            "mlflow",
-            MISS,
-            "DATABRICKS_HOST set but token missing",
-            "export DATABRICKS_API_TOKEN=... (or DATABRICKS_TOKEN)",
-        )
+    profile = None
+    if host and token:
+        found = "DATABRICKS_HOST + token set"
+    else:
+        profile = _databricks_profile()
+        if problem := _profile_problem(profile):
+            return CheckResult(
+                "mlflow",
+                WARN,
+                f"no Databricks credentials found ({problem}); {_MLFLOW_AUTH_ROUTES}",
+            )
+        found = f"profile {profile} found in ~/.databrickscfg"
     if check_credentials:
-        # The SDK authenticates from DATABRICKS_TOKEN; mirror the DATABRICKS_API_TOKEN
-        # alias the MLflow backend applies so the probe matches runtime behavior.
         if not os.environ.get("DATABRICKS_TOKEN") and os.environ.get("DATABRICKS_API_TOKEN"):
             os.environ["DATABRICKS_TOKEN"] = os.environ["DATABRICKS_API_TOKEN"]
         try:
             from databricks.sdk import WorkspaceClient  # type: ignore
 
-            user = WorkspaceClient().current_user.me().user_name
+            client = WorkspaceClient(profile=profile) if profile else WorkspaceClient()
+            user = client.current_user.me().user_name
         except Exception as e:
-            return CheckResult("mlflow", WARN, f"credentials set but SDK probe failed: {e}")
+            return CheckResult("mlflow", WARN, f"{found} but SDK probe failed ({type(e).__name__})")
         return CheckResult("mlflow", OK, f"Databricks reachable, user={user}")
-    return CheckResult("mlflow", OK, "DATABRICKS_HOST + token set (not validated)")
+    return CheckResult("mlflow", OK, f"{found} (not validated)")
 
 
 def check_hf(check_credentials: bool = False) -> CheckResult:
@@ -428,10 +445,6 @@ def check_gh() -> CheckResult:
     )
     return CheckResult("gh", OK, f"gh on PATH, {summary}")
 
-
-# ---------------------------------------------------------------------------
-# --init mode: interactive cluster config writer
-# ---------------------------------------------------------------------------
 
 LOCAL_TOML_TEMPLATE = """[cluster]
 name = "{cluster_name}"
@@ -584,11 +597,6 @@ def do_init(repo_root: Path, args: argparse.Namespace) -> int:
     return 0
 
 
-# ---------------------------------------------------------------------------
-# Orchestration
-# ---------------------------------------------------------------------------
-
-
 def parse_requires(raw: str | None) -> list[str]:
     """Comma-separated list; empty string or None means baseline only."""
     if raw is None or raw == "":
@@ -646,11 +654,6 @@ def format_text(results: list[CheckResult]) -> str:
 
 def exit_code_for(results: list[CheckResult]) -> int:
     return 1 if any(r.status == MISS for r in results) else 0
-
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 
 
 def build_argparser() -> argparse.ArgumentParser:
