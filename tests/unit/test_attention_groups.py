@@ -483,6 +483,64 @@ class TestTransformerForward:
         assert not torch.allclose(out["flex"], ungrouped)
 
 
+class TestPackedWithPositionIds:
+    """A packed batch with per-document positions and visibility groups together.
+
+    Positions restart at zero in each document and document isolation keeps
+    each document to itself, so every document of the pack equals the same
+    document run alone, its groups included.
+    """
+
+    DOCS = _t([[0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1]])
+    POSITIONS = _t([[0, 1, 2, 3, 4, 0, 1, 2, 3, 4, 5, 6]])
+    GROUPS = _t([[0, 0, 0, -1, -1, 1, 1, -1, -1, 1, -1, -1]])
+    TOKENS = torch.randint(0, 64, (1, 12), generator=torch.Generator().manual_seed(7))
+
+    @staticmethod
+    def _model(backend: str) -> Transformer:
+        torch.manual_seed(0)
+        config = ModelConfig(
+            dim=64,
+            n_layers=2,
+            n_heads=4,
+            vocab_size=64,
+            max_seq_len=16,
+            attention_backend=backend,
+        )
+        return Transformer(config).eval()
+
+    def _packed(self, model: Transformer, positions: torch.Tensor | None) -> torch.Tensor:
+        with torch.no_grad():
+            return model(
+                self.TOKENS,
+                doc_ids=self.DOCS,
+                position_ids=positions,
+                attention_group_ids=self.GROUPS,
+            )
+
+    @pytest.mark.parametrize("backend", ["sdpa", "flex"])
+    def test_each_document_matches_running_it_alone(self, backend):
+        model = self._model(backend)
+        packed = self._packed(model, self.POSITIONS)
+        with torch.no_grad():
+            first = model(self.TOKENS[:, :5], attention_group_ids=self.GROUPS[:, :5])
+            second = model(self.TOKENS[:, 5:], attention_group_ids=self.GROUPS[:, 5:])
+        torch.testing.assert_close(packed[:, :5], first, rtol=1e-5, atol=1e-5)
+        torch.testing.assert_close(packed[:, 5:], second, rtol=1e-5, atol=1e-5)
+
+    def test_flex_matches_sdpa(self):
+        out = {b: self._packed(self._model(b), self.POSITIONS) for b in ("sdpa", "flex")}
+        torch.testing.assert_close(out["flex"], out["sdpa"], rtol=1e-5, atol=1e-5)
+
+    @pytest.mark.parametrize("backend", ["sdpa", "flex"])
+    def test_restarted_positions_reach_only_the_later_document(self, backend):
+        model = self._model(backend)
+        restarted = self._packed(model, self.POSITIONS)
+        contiguous = self._packed(model, None)
+        torch.testing.assert_close(restarted[:, :5], contiguous[:, :5], rtol=0, atol=0)
+        assert not torch.allclose(restarted[:, 5:], contiguous[:, 5:])
+
+
 class TestValidation:
     @staticmethod
     def _model() -> Transformer:
