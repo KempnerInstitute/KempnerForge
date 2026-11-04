@@ -106,6 +106,33 @@ class TransformerBlock(nn.Module):
         return x
 
 
+def _write_inline_embeds(h: torch.Tensor, modality: ModalityContext) -> torch.Tensor:
+    """Write ``modality.inline_embeds`` over ``h`` at ``(inline_rows, inline_positions)``.
+
+    Out of place, so gradients reach both the token embedding and the inline
+    embeddings. Raises ``ValueError`` when an index falls outside ``h`` or the
+    embedding width differs.
+    """
+    embeds, rows, positions = (
+        modality.inline_embeds,
+        modality.inline_rows,
+        modality.inline_positions,
+    )
+    assert embeds is not None and rows is not None and positions is not None
+    batch, seq_len, dim = h.shape
+    if embeds.shape[1] != dim:
+        raise ValueError(
+            f"modality.inline_embeds width ({embeds.shape[1]}) does not match the model dim ({dim})"
+        )
+    if rows.numel() and (int(rows.min()) < 0 or int(rows.max()) >= batch):
+        raise ValueError(f"modality.inline_rows must index the batch of {batch} rows")
+    if positions.numel() and (int(positions.min()) < 0 or int(positions.max()) >= seq_len):
+        raise ValueError(
+            f"modality.inline_positions must index the sequence of {seq_len} positions"
+        )
+    return h.index_put((rows, positions), embeds.to(h.dtype))
+
+
 class Transformer(nn.Module):
     """Full transformer model built from ModelConfig.
 
@@ -303,9 +330,12 @@ class Transformer(nn.Module):
         Exactly one of ``tokens`` or ``modality.inputs_embeds`` must be
         provided. Modality-injection routes (``prefix_embeds``,
         ``output_slice``, ``image_features``, ``image_mask``,
-        ``modality_ids``) are grouped on the optional
+        ``modality_ids``, ``inline_embeds``) are grouped on the optional
         ``ModalityContext`` arg; see ``kempnerforge/model/modality.py``
-        for the full intra-context invariant table.
+        for the full intra-context invariant table. ``inline_embeds`` are
+        written over the embedded ``tokens`` at ``(inline_rows,
+        inline_positions)`` before the first layer, which is how a packed
+        row carries each document's image tokens before its own text.
 
         Args:
             tokens: Integer token ids, shape ``(batch, seq_len)``.
@@ -336,6 +366,7 @@ class Transformer(nn.Module):
         image_mask = modality.image_mask if modality is not None else None
         modality_ids = modality.modality_ids if modality is not None else None
         key_padding_mask = modality.key_padding_mask if modality is not None else None
+        inline_embeds = modality.inline_embeds if modality is not None else None
 
         if (tokens is None) == (inputs_embeds is None):
             raise ValueError(
@@ -358,6 +389,10 @@ class Transformer(nn.Module):
                 raise ValueError(
                     "modality.modality_ids is training-only; cannot be combined with kv_caches"
                 )
+            if inline_embeds is not None:
+                raise ValueError(
+                    "modality.inline_embeds is training-only; cannot be combined with kv_caches"
+                )
         if modality_ids is not None and modality_ids.dtype != torch.long:
             raise ValueError(
                 f"modality.modality_ids.dtype must be torch.long, got {modality_ids.dtype}"
@@ -369,6 +404,10 @@ class Transformer(nn.Module):
             else inputs_embeds
         )
         assert h is not None
+
+        if inline_embeds is not None:
+            assert modality is not None
+            h = _write_inline_embeds(h, modality)
 
         if prefix_embeds is not None:
             if prefix_embeds.dtype != h.dtype:

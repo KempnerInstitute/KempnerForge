@@ -259,7 +259,12 @@ def pipeline_step(session: TrainingSession, step: int) -> StepResult:
 
 
 def vlm_step(session: TrainingSession, step: int) -> StepResult:
-    """VLM step (no PP): pixel_values + input_ids forward, with a text-token count."""
+    """VLM step (no PP): pixel_values + input_ids forward, with a text-token count.
+
+    A packed batch also carries ``doc_ids`` and the image placement
+    (``image_rows``, ``image_starts``, ``image_tokens``), passed through to
+    the wrapper.
+    """
     config = session.config
     tc, mc = config.train, config.model
     device = session.runtime.device
@@ -280,11 +285,20 @@ def vlm_step(session: TrainingSession, step: int) -> StepResult:
         input_ids = batch["input_ids"].to(device)
         labels = batch["labels"].to(device)
         frame_mask = batch["frame_mask"].to(device) if "frame_mask" in batch else None
+        packed: dict[str, Any] = {
+            key: batch[key].to(device)
+            for key in ("doc_ids", "image_rows", "image_starts")
+            if key in batch
+        }
+        if "image_tokens" in batch:
+            packed["image_tokens"] = int(batch["image_tokens"])
 
         with maybe_no_sync(model, micro_step, tc.grad_accum_steps):
             if mc.is_moe:
                 inner_transformer(model).set_moe_step(step, tc.max_steps)  # type: ignore[attr-defined]
-            logits, labels_out = model(pixel_values, input_ids, labels, frame_mask=frame_mask)
+            logits, labels_out = model(
+                pixel_values, input_ids, labels, frame_mask=frame_mask, **packed
+            )
             loss = session.loss_fn(logits, labels_out)
 
             total_text_tokens += int((labels_out != -100).sum().item())

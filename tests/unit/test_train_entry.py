@@ -1854,9 +1854,11 @@ class TinyVlmModel(nn.Module):
         self.proj = nn.Linear(DIM, VOCAB)
         self.embed = nn.Embedding(VOCAB, DIM)
         self.seen_frame_mask: list = []
+        self.seen_packed: list = []
 
-    def forward(self, pixel_values, input_ids, labels, frame_mask=None):
+    def forward(self, pixel_values, input_ids, labels, frame_mask=None, **packed):
         self.seen_frame_mask.append(frame_mask)
+        self.seen_packed.append(packed)
         return self.proj(self.embed(input_ids)), labels
 
 
@@ -1894,6 +1896,24 @@ class TestVlmStep:
         session, model = self._session([self._batch(with_mask=True)])
         session.step_fn(session, 0)
         assert model.seen_frame_mask[0] is not None
+
+    def test_packed_keys_are_threaded_when_present(self):
+        batch = self._batch()
+        batch["doc_ids"] = torch.zeros(2, 4, dtype=torch.long)
+        batch["image_rows"] = torch.tensor([0, 1])
+        batch["image_starts"] = torch.tensor([0, 0])
+        batch["image_tokens"] = torch.tensor(2)
+        session, model = self._session([batch])
+        session.step_fn(session, 0)
+        packed = model.seen_packed[0]
+        assert set(packed) == {"doc_ids", "image_rows", "image_starts", "image_tokens"}
+        assert packed["image_tokens"] == 2
+        assert packed["doc_ids"].shape == (2, 4)
+
+    def test_unpacked_batches_pass_no_packed_keys(self):
+        session, model = self._session([self._batch()])
+        session.step_fn(session, 0)
+        assert model.seen_packed[0] == {}
 
     def test_frame_mask_is_none_for_image_batches(self):
         session, model = self._session([self._batch()])
