@@ -588,6 +588,12 @@ class TestWeightDecayScope:
         assert id(model.norm.weight) not in held
         assert id(model.linear.weight) in held
 
+    def test_a_positional_call_keeps_its_meaning(self):
+        """Fields that predate the scope keep their positions."""
+        config = OptimizerConfig("adamw", 0.001, 0.1, (0.9, 0.95))
+        assert (config.lr, config.weight_decay, config.betas) == (0.001, 0.1, (0.9, 0.95))
+        assert config.weight_decay_scope == "exclude_norms_and_biases"
+
     def test_invalid_scope_is_rejected_with_the_valid_options(self):
         with pytest.raises(ValueError, match="weight_decay_scope must be one of"):
             OptimizerConfig(lr=0.01, weight_decay_scope="norms")

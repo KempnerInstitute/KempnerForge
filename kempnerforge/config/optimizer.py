@@ -16,7 +16,6 @@ class OptimizerConfig:
     name: str = "adamw"
     lr: float = 3e-4
     weight_decay: float = 0.1
-    weight_decay_scope: str = "exclude_norms_and_biases"
     betas: tuple[float, float] = (0.9, 0.95)
     eps: float = 1e-8
     fused: bool = True
@@ -27,6 +26,7 @@ class OptimizerConfig:
     muon_adjust_lr: str = "original"
     muon_orthogonalize: str = "local"
     schedule_free_warmup_steps: int = 0
+    weight_decay_scope: str = "exclude_norms_and_biases"
 
     def __post_init__(self) -> None:
         if self.lr <= 0:
