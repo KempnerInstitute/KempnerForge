@@ -217,6 +217,24 @@ def _nan_on(steps: set[int], step_fn: StepFn = text_step) -> StepFn:
     return nan_step
 
 
+def _bad_update_on(bad_step: int, step_fn: StepFn = text_step) -> StepFn:
+    """Wrap a step body so the iteration that starts at ``bad_step`` makes a bad update.
+
+    Its loss stays finite but its gradients turn NaN, so the optimizer writes NaN
+    into the weights and every later loss is NaN.
+    """
+
+    def bad_update(session: TrainingSession, step: int):
+        result = step_fn(session, step)
+        if step == bad_step:
+            for p in session.model.parameters():
+                if p.grad is not None:
+                    p.grad.fill_(float("nan"))
+        return result
+
+    return bad_update
+
+
 class TestBatchStream:
     def test_no_dataloader_reports_no_data(self):
         stream = BatchStream(DataPipeline())
@@ -1037,6 +1055,57 @@ class TestNanSkippedStep:
         assert resumed.scheduler.last_epoch == full.scheduler.last_epoch == 5
         params = zip(full.model.parameters(), resumed.model.parameters(), strict=True)
         assert all(torch.equal(p, q) for p, q in params)
+
+    def _keep_last_one(
+        self, ckpt_dir, step_fn: StepFn, mode: str = "disabled"
+    ) -> tuple[int, FakeShutdownHandler]:
+        """Save every 2 steps with ``keep_last_n=1`` through the real manager; shut down at 4."""
+        from kempnerforge.checkpoint.manager import CheckpointManager
+        from kempnerforge.config.checkpoint import AsyncCheckpointMode
+
+        config = make_config(max_steps=10)
+        config.checkpoint.dir = str(ckpt_dir)
+        config.checkpoint.interval = 2
+        config.checkpoint.keep_last_n = 1
+        config.checkpoint.async_mode = AsyncCheckpointMode(mode)
+        handler = FakeShutdownHandler(after_steps=4)
+        session = make_session(config, step_fn=step_fn, shutdown_handler=handler)
+        session.checkpointer = CheckpointManager(
+            config.checkpoint, session.model, session.optimizer
+        )
+        step, _ = run_training_loop(session)
+        return step, handler
+
+    @pytest.mark.parametrize("mode", ["disabled", "async", "async_with_pinned_mem"])
+    def test_shutdown_after_a_bad_update_keeps_the_last_good_checkpoint(
+        self, monkeypatch, caplog, tmp_path, mode
+    ):
+        """The update into step 3 writes NaN weights, so skipped step 4's shutdown saves nothing.
+
+        Saved, those weights would become ``latest`` and, with ``keep_last_n=1``,
+        prune step 2, so a resume would load NaN weights.
+        """
+        import logging
+
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        monkeypatch.setattr(logging.getLogger("kempnerforge"), "propagate", True)
+        with caplog.at_level(logging.ERROR, logger="kempnerforge"):
+            step, handler = self._keep_last_one(tmp_path, _bad_update_on(2), mode)
+        assert step == 4
+        assert handler.finished is True
+        assert sorted(d.name for d in tmp_path.glob("step_*")) == ["step_2"]
+        assert (tmp_path / "latest").resolve() == (tmp_path / "step_2").resolve()
+        errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        assert any("parameters are not finite" in m for m in errors)
+        config = make_config()
+        config.checkpoint.dir = str(tmp_path)
+        resumed = TinyTextModel()
+        mgr = CheckpointManager(
+            config.checkpoint, resumed, torch.optim.SGD(resumed.parameters(), lr=0.05)
+        )
+        assert mgr.load()[0] == 2
+        assert all(torch.isfinite(p).all() for p in resumed.parameters())
 
 
 def _stub_entry(monkeypatch, model: nn.Module) -> FakeCheckpointManager:
