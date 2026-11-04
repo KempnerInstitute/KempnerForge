@@ -22,7 +22,8 @@ Field summary:
   ``"fp32"``), independent of ``train.mixed_precision``, for image and video
   runs alike. Unset, the encoder keeps the default: an FSDP2-wrapped encoder
   computes in the language model's dtype, and an unwrapped one in its loaded
-  dtype.
+  dtype. It applies to the training build (``build_parallel_model``);
+  ``build_vlm_wrapper`` leaves every dtype to its caller.
 """
 
 from __future__ import annotations

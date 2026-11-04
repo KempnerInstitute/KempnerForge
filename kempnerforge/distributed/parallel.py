@@ -362,6 +362,39 @@ def _apply_fsdp_vlm(
     )
 
 
+def _cast_floating_inputs(
+    dtype: torch.dtype, module: torch.nn.Module, args: tuple, kwargs: dict
+) -> tuple[tuple, dict]:
+    """Forward pre-hook that casts floating-point tensor arguments to ``dtype``."""
+
+    def cast(value):
+        if isinstance(value, torch.Tensor) and value.is_floating_point():
+            return value.to(dtype)
+        return value
+
+    return tuple(cast(a) for a in args), {k: cast(v) for k, v in kwargs.items()}
+
+
+def _set_encoder_precision(
+    encoder: torch.nn.Module, dtype: torch.dtype, *, fsdp_wrapped: bool
+) -> None:
+    """Make the vision encoder compute in ``dtype``, wrapped by FSDP2 or not.
+
+    A wrapped encoder's policy already casts its parameters and inputs, so only
+    its floating-point buffers are cast and its parameters keep their loaded
+    dtype. An unwrapped encoder is cast whole, and its floating-point inputs are
+    cast on the way in, as ``cast_forward_inputs`` does under FSDP2.
+    """
+    if fsdp_wrapped:
+        for module in encoder.modules():
+            for name, buffer in module.named_buffers(recurse=False):
+                if buffer.is_floating_point():
+                    setattr(module, name, buffer.to(dtype))
+        return
+    encoder.to(dtype=dtype)
+    encoder.register_forward_pre_hook(partial(_cast_floating_inputs, dtype), with_kwargs=True)
+
+
 def _build_vlm(
     model_config,
     vision_config,
@@ -397,8 +430,8 @@ def _build_vlm(
          vision encoder is moved to ``device``, and the transformer and
          adapter are cast to ``param_dtype``. The vision encoder stays in
          its HF dtype (D16) to avoid ViT LayerNorm numerical drift, unless
-         ``vision_config.mixed_precision`` is set and FSDP2 did not wrap
-         it; then it is cast to that dtype.
+         ``vision_config.mixed_precision`` is set; then
+         ``_set_encoder_precision`` makes it compute in that dtype.
       7. Freeze specs are applied via ``apply_freeze_specs`` and a fully
          frozen encoder is switched to ``eval()``.
     """
@@ -476,8 +509,12 @@ def _build_vlm(
         transformer.to(device=device)
         adapter.to(device=device)
     encoder.to(device)
-    if encoder_dtype is not None and not isinstance(wrapper.vision_encoder, FSDPModule):
-        wrapper.vision_encoder.to(dtype=encoder_dtype)
+    if encoder_dtype is not None:
+        _set_encoder_precision(
+            encoder,
+            encoder_dtype,
+            fsdp_wrapped=isinstance(wrapper.vision_encoder, FSDPModule),
+        )
     transformer.to(dtype=param_dtype)
     adapter.to(dtype=param_dtype)
 
