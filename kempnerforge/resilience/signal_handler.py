@@ -17,7 +17,6 @@ from types import FrameType
 
 logger = logging.getLogger(__name__)
 
-# Signals we intercept for graceful shutdown
 _SHUTDOWN_SIGNALS = (signal.SIGTERM, signal.SIGUSR1)
 
 
@@ -132,7 +131,6 @@ class ShutdownHandler:
         self._signal_received = sig
         logger.warning(f"Received {sig.name} — requesting graceful shutdown")
 
-        # Start a timer for forced exit
         if self._timeout_sec > 0 and self._timer is None:
             self._timer = threading.Timer(self._timeout_sec, self._force_exit)
             self._timer.daemon = True

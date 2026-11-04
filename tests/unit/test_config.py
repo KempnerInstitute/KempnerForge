@@ -34,10 +34,6 @@ from kempnerforge.config.schema import (
 )
 from kempnerforge.config.vlm import MoMaConfig
 
-# ---------------------------------------------------------------------------
-# ModelConfig
-# ---------------------------------------------------------------------------
-
 
 class TestModelConfig:
     def test_defaults(self):
@@ -45,7 +41,7 @@ class TestModelConfig:
         assert m.dim == 4096
         assert m.n_layers == 32
         assert m.n_heads == 32
-        assert m.n_kv_heads == 32  # resolved from None
+        assert m.n_kv_heads == 32
         assert m.head_dim == 128
 
     def test_n_kv_heads_defaults_to_n_heads(self):
@@ -62,7 +58,6 @@ class TestModelConfig:
 
     def test_ffn_hidden_dim_computed(self):
         m = ModelConfig(dim=4096, ffn_dim_multiplier=1.0)
-        # 4 * 4096 * 2/3 ≈ 10922.67, ceil to multiple of 256 = 11008
         assert m.computed_ffn_hidden_dim == 11008
 
     def test_ffn_hidden_dim_override(self):
@@ -70,7 +65,6 @@ class TestModelConfig:
         assert m.computed_ffn_hidden_dim == 8192
 
     def test_param_estimate_reasonable(self):
-        # Llama 7B-like config
         m = ModelConfig(dim=4096, n_layers=32, n_heads=32, vocab_size=32000)
         params = m.num_params_estimate
         assert 6e9 < params < 8e9, f"Expected ~6.7B params, got {params / 1e9:.2f}B"
@@ -99,8 +93,6 @@ class TestModelConfig:
         with pytest.raises(ValueError, match="vocab_size must be positive"):
             ModelConfig(vocab_size=0)
 
-    # --- MoE config ---
-
     def test_moe_defaults_are_dense(self):
         m = ModelConfig()
         assert m.num_experts == 0
@@ -123,7 +115,6 @@ class TestModelConfig:
         assert m.computed_expert_ffn_hidden_dim == m.computed_ffn_hidden_dim // 2
 
     def test_expert_ffn_isoflop_top2(self):
-        # top-2 with half-size experts matches the dense FFN's activated FLOPs (2 * F/2 = F)
         m = ModelConfig(
             dim=1024, n_heads=16, num_experts=4, moe_top_k=2, moe_expert_ffn_multiplier=0.5
         )
@@ -153,7 +144,6 @@ class TestModelConfig:
             ModelConfig(num_experts=8, moe_top_k=16)
 
     def test_moe_disabled_ignores_top_k(self):
-        # num_experts=0 → MoE disabled, top_k not validated
         m = ModelConfig(num_experts=0, moe_top_k=99)
         assert m.is_moe is False
 
@@ -170,16 +160,10 @@ class TestModelConfig:
         moe = ModelConfig(
             dim=256, n_layers=2, n_heads=4, vocab_size=1000, num_experts=8, moe_top_k=2
         )
-        # MoE should have more total params (8 experts vs 1 MLP per layer)
         assert moe.num_params_estimate > dense.num_params_estimate
-        # Roughly: MoE layers have 8x MLP params + router, dense has 1x
         dense_mlp = 3 * 256 * dense.computed_ffn_hidden_dim
-        ratio = (moe.num_params_estimate - dense.num_params_estimate) / (
-            2 * 7 * dense_mlp  # 2 layers, each gains 7 extra experts
-        )
-        assert 0.9 < ratio < 1.1  # close to 7x extra MLP params + small router overhead
-
-    # --- SDPA backend config ---
+        ratio = (moe.num_params_estimate - dense.num_params_estimate) / (2 * 7 * dense_mlp)
+        assert 0.9 < ratio < 1.1
 
     def test_sdpa_backend_default_is_auto(self):
         m = ModelConfig()
@@ -193,8 +177,6 @@ class TestModelConfig:
     def test_sdpa_backend_rejects_unknown(self):
         with pytest.raises(ValueError, match="Unknown sdpa_backend"):
             ModelConfig(sdpa_backend="fa3")
-
-    # --- Attention backend config ---
 
     def test_attention_backend_default_is_sdpa(self):
         assert ModelConfig().attention_backend == "sdpa"
@@ -230,11 +212,6 @@ class TestModelConfig:
     def test_sdpa_does_not_constrain_head_dim(self):
         """The floor is a flex kernel limit, not an architecture limit."""
         assert ModelConfig(dim=64, n_heads=8).head_dim == 8
-
-
-# ---------------------------------------------------------------------------
-# TrainConfig
-# ---------------------------------------------------------------------------
 
 
 class TestTrainConfig:
@@ -284,12 +261,7 @@ class TestTrainConfig:
     def test_effective_data_seed_overrides_when_set(self):
         t = TrainConfig(seed=123, data_seed=456)
         assert t.effective_data_seed == 456
-        assert t.seed == 123  # init seed stays independent
-
-
-# ---------------------------------------------------------------------------
-# OptimizerConfig
-# ---------------------------------------------------------------------------
+        assert t.seed == 123
 
 
 class TestOptimizerConfig:
@@ -335,11 +307,6 @@ class TestOptimizerConfig:
             OptimizerConfig(schedule_free_warmup_steps=-1)
 
 
-# ---------------------------------------------------------------------------
-# DistributedConfig
-# ---------------------------------------------------------------------------
-
-
 class TestDistributedConfig:
     def test_auto_dp_shard(self):
         d = DistributedConfig(dp_shard=-1, tp=2)
@@ -348,7 +315,7 @@ class TestDistributedConfig:
 
     def test_validate_world_size_matches(self):
         d = DistributedConfig(dp_shard=4, tp=2)
-        d.validate_world_size(world_size=8)  # Should not raise
+        d.validate_world_size(world_size=8)
 
     def test_validate_world_size_mismatch(self):
         d = DistributedConfig(dp_shard=4, tp=2)
@@ -403,11 +370,6 @@ class TestDistributedConfig:
             d.resolve(world_size=8)
 
 
-# ---------------------------------------------------------------------------
-# CheckpointConfig
-# ---------------------------------------------------------------------------
-
-
 class TestCheckpointConfig:
     def test_defaults(self):
         c = CheckpointConfig()
@@ -438,7 +400,6 @@ class TestCheckpointConfig:
             load_config(str(toml), cli_args=[])
 
     def test_dyn_ckpt_window_defaults_to_none(self):
-        # Opt-in: no dyn_ckpt_window means pure interval cadence.
         assert CheckpointConfig().dyn_ckpt_window is None
 
     def test_interval_only_saves_on_multiples(self):
@@ -462,20 +423,18 @@ class TestCheckpointConfig:
             interval=1000,
             dyn_ckpt_window=DynamicCheckpointWindow(start=0, stop=512),
         )
-        # Beyond stop, interval applies again.
         assert c.should_save(1000)
         assert c.should_save(2000)
         assert not c.should_save(1500)
 
     def test_dyn_ckpt_window_with_start_offset(self):
-        # Offset-based power2: save at start and at start + 2^k while <= stop.
         c = CheckpointConfig(
-            interval=10_000,  # large so the interval rule doesn't shadow the test
+            interval=10_000,
             dyn_ckpt_window=DynamicCheckpointWindow(start=1000, stop=1300),
         )
         for step in (1000, 1001, 1002, 1004, 1008, 1016, 1128, 1256):
             assert c.should_save(step), f"expected save at {step}"
-        for step in (999, 1003, 1005, 1100, 1300):  # 1300-1000=300, not a power of two
+        for step in (999, 1003, 1005, 1100, 1300):
             assert not c.should_save(step), f"unexpected save at {step}"
 
     def test_is_dynamic_milestone(self):
@@ -484,11 +443,9 @@ class TestCheckpointConfig:
         assert c.is_dynamic_milestone(256)
         assert not c.is_dynamic_milestone(300)
         assert not c.is_dynamic_milestone(1000)
-        # No window configured -> never a milestone, even at power-of-two steps.
         assert not CheckpointConfig().is_dynamic_milestone(4)
 
     def test_keep_last_n_allows_keep_all(self):
-        # <= 0 means retain all checkpoints (CheckpointManager._cleanup early-returns)
         assert CheckpointConfig(keep_last_n=0).keep_last_n == 0
         assert CheckpointConfig(keep_last_n=-1).keep_last_n == -1
 
@@ -503,11 +460,6 @@ class TestCheckpointConfig:
     def test_dyn_ckpt_window_rejects_unknown_strategy(self):
         with pytest.raises(ValueError, match="unknown dyn_ckpt_window.strategy"):
             DynamicCheckpointWindow(strategy="not_registered")
-
-
-# ---------------------------------------------------------------------------
-# ProfilingConfig
-# ---------------------------------------------------------------------------
 
 
 class TestSchedulerConfig:
@@ -532,11 +484,6 @@ class TestSchedulerConfig:
             SchedulerConfig(warmup_start_factor=value)
 
 
-# ---------------------------------------------------------------------------
-# DataConfig
-# ---------------------------------------------------------------------------
-
-
 class TestDataConfig:
     def test_rejects_negative_workers(self):
         with pytest.raises(ValueError, match="num_workers must be non-negative"):
@@ -545,11 +492,6 @@ class TestDataConfig:
     def test_rejects_zero_prefetch(self):
         with pytest.raises(ValueError, match="prefetch_factor must be >= 1"):
             DataConfig(prefetch_factor=0)
-
-
-# ---------------------------------------------------------------------------
-# MetricsConfig
-# ---------------------------------------------------------------------------
 
 
 class TestMetricsConfig:
@@ -578,20 +520,10 @@ class TestMetricsConfig:
         MetricsConfig(enable_mlflow=True, mlflow_register_checkpoints=True)
 
 
-# ---------------------------------------------------------------------------
-# ProfilingConfig
-# ---------------------------------------------------------------------------
-
-
 class TestProfilingConfig:
     def test_rejects_end_before_start(self):
         with pytest.raises(ValueError, match="end_step must be greater"):
             ProfilingConfig(start_step=10, end_step=5)
-
-
-# ---------------------------------------------------------------------------
-# JobConfig cross-validation
-# ---------------------------------------------------------------------------
 
 
 class TestJobConfig:
@@ -621,7 +553,7 @@ class TestJobConfig:
 
     def test_validate_passes_for_valid_config(self):
         config = JobConfig()
-        config.validate(world_size=1)  # Should not raise
+        config.validate(world_size=1)
 
     def test_validate_moe_with_pp_rejected(self):
         config = JobConfig(
@@ -635,14 +567,14 @@ class TestJobConfig:
         config = JobConfig(
             model=ModelConfig(num_experts=8, moe_top_k=2),
         )
-        config.validate(world_size=1)  # Should not raise
+        config.validate(world_size=1)
 
     def test_validate_dense_with_pp_passes(self):
         config = JobConfig(
             model=ModelConfig(tie_embeddings=False),
             distributed=DistributedConfig(pp=2, dp_shard=1),
         )
-        config.validate(world_size=2)  # Should not raise — dense + PP is fine
+        config.validate(world_size=2)
 
     def test_validate_packing_with_pp_passes(self):
         """doc_ids now rides the pipeline, so the dense-mask path supports both."""
@@ -650,7 +582,7 @@ class TestJobConfig:
             data=DataConfig(pack_sequences=True),
             distributed=DistributedConfig(pp=2, dp_shard=1),
         )
-        config.validate(world_size=2)  # Should not raise
+        config.validate(world_size=2)
 
     def test_validate_packing_with_pp_and_flex_passes(self):
         """Pipeline stages build their own BlockMask, so flex works under PP too."""
@@ -659,7 +591,7 @@ class TestJobConfig:
             data=DataConfig(pack_sequences=True),
             distributed=DistributedConfig(pp=2, dp_shard=1),
         )
-        config.validate(world_size=2)  # Should not raise
+        config.validate(world_size=2)
 
     def test_validate_flex_with_pp_but_no_packing_passes(self):
         """Without packing there are no doc_ids to lose."""
@@ -667,15 +599,15 @@ class TestJobConfig:
             model=ModelConfig(attention_backend="flex"),
             distributed=DistributedConfig(pp=2, dp_shard=1),
         )
-        config.validate(world_size=2)  # Should not raise
+        config.validate(world_size=2)
 
     def test_packing_without_pp_passes(self):
         config = JobConfig(data=DataConfig(pack_sequences=True))
-        config.validate(world_size=1)  # Should not raise
+        config.validate(world_size=1)
 
     def test_pp_without_packing_passes(self):
         config = JobConfig(distributed=DistributedConfig(pp=2, dp_shard=1))
-        config.validate(world_size=2)  # Should not raise — PP alone is fine
+        config.validate(world_size=2)
 
     def test_flex_rejects_seq_len_below_block_size_at_construction(self):
         """Decidable from the config alone, so it fires in __post_init__."""
@@ -690,12 +622,12 @@ class TestJobConfig:
             model=ModelConfig(attention_backend="flex"),
             train=TrainConfig(seq_len=128),
         )
-        config.validate(world_size=1)  # Should not raise — exactly one block is fine
+        config.validate(world_size=1)
 
     def test_sdpa_allows_short_seq_len(self):
         """The bound is a flex kernel limit, not a general one."""
         config = JobConfig(train=TrainConfig(seq_len=64))
-        config.validate(world_size=1)  # Should not raise
+        config.validate(world_size=1)
 
     def test_validate_vlm_seq_len_too_short(self):
         config = JobConfig(
@@ -728,7 +660,7 @@ class TestJobConfig:
             vlm=VLMConfig(max_text_len=512),
             train=TrainConfig(seq_len=64),
         )
-        config.validate(world_size=1)  # Should not raise — check deferred
+        config.validate(world_size=1)
 
     def test_validate_vlm_plus_moe_supported(self):
         """VLM + MoE is supported: cross-check passes. Live-tested on
@@ -742,7 +674,7 @@ class TestJobConfig:
             vlm=VLMConfig(max_text_len=512),
             train=TrainConfig(seq_len=600),
         )
-        config.validate(world_size=1)  # Should not raise.
+        config.validate(world_size=1)
 
 
 class TestFlexSdpaBackendWarning:
@@ -880,8 +812,6 @@ class TestMoMaAcFullWarning:
             train=TrainConfig(
                 seq_len=576,
                 activation_checkpointing=ac,
-                # Silence the sibling MoMa-compile warning so it can't
-                # accidentally satisfy our "no AC warning" assertions.
                 compile_model=False,
             ),
             vision_encoder=VisionEncoderConfig(type="random", feature_dim=256, num_tokens=64),
@@ -929,18 +859,13 @@ class TestMoMaAcFullWarning:
             ),
             vision_encoder=VisionEncoderConfig(type="random", feature_dim=256, num_tokens=64),
             adapter=AdapterConfig(),
-            vlm=VLMConfig(max_text_len=512),  # default arch = joint_decoder
+            vlm=VLMConfig(max_text_len=512),
         )
         with caplog.at_level("WARNING", logger="kempnerforge.config.job"):
             cfg.validate(world_size=1)
         assert not any(
             "AC=full is currently a no-op for MoMa" in r.getMessage() for r in caplog.records
         )
-
-
-# ---------------------------------------------------------------------------
-# TOML Loading
-# ---------------------------------------------------------------------------
 
 
 class TestTomlLoading:
@@ -1040,7 +965,6 @@ freeze = [
         assert config.adapter is not None
         assert config.adapter.type == "mlp_2layer"
         assert config.vlm is not None
-        # Attribute access fails if the entries stayed raw dicts.
         assert [(f.module, f.frozen) for f in config.vlm.freeze] == [
             ("adapter", True),
             ("transformer", False),
@@ -1148,11 +1072,6 @@ not_a_real_field = 99
             load_config(str(toml), cli_args=[])
 
 
-# ---------------------------------------------------------------------------
-# CLI Overrides
-# ---------------------------------------------------------------------------
-
-
 class TestCliOverrides:
     def test_int_override(self):
         config = load_config(cli_args=["--model.dim=512"])
@@ -1201,13 +1120,7 @@ class TestCliOverrides:
         )
         assert config.model.dim == 512
         assert config.train.max_steps == 50
-        # Non-overridden values preserved from TOML
         assert config.model.n_layers == 4
-
-
-# ---------------------------------------------------------------------------
-# CLI Parsing
-# ---------------------------------------------------------------------------
 
 
 class TestCliParsing:
@@ -1220,7 +1133,6 @@ class TestCliParsing:
         assert result == {"optimizer": {"lr": 3e-4}}
 
     def test_parse_bool_flag(self):
-        # Raw parse produces string "true"; coercion to bool happens in _apply_dict_to_dataclass
         result = _parse_cli_overrides(["--train.compile_model"])
         assert result == {"train": {"compile_model": "true"}}
 
@@ -1237,13 +1149,6 @@ class TestCliParsing:
         assert result == {"model": {"dim": 512, "n_layers": 8}}
 
 
-# ---------------------------------------------------------------------------
-# Plugin modules
-# ---------------------------------------------------------------------------
-
-# Registers a video dataset (VideoConfig validates dataset_type against the
-# registry in __post_init__, so it also pins the import-before-overlay order)
-# and records each execution of the module body.
 _PLUGIN_SRC = """\
 from kempnerforge.config.registry import registry
 
@@ -1422,11 +1327,6 @@ class TestConfigPlugins:
         assert "kf_plugin_ds_argv" in registry.list_video_datasets()
 
 
-# ---------------------------------------------------------------------------
-# Registry
-# ---------------------------------------------------------------------------
-
-
 class TestRegistry:
     def test_register_and_get(self):
         reg = Registry()
@@ -1506,11 +1406,6 @@ class TestRegistry:
             assert callable(registry.get("norm", name))
 
 
-# ---------------------------------------------------------------------------
-# EvalConfig
-# ---------------------------------------------------------------------------
-
-
 class TestEvalConfig:
     def test_defaults(self):
         ec = EvalConfig()
@@ -1535,22 +1430,17 @@ class TestEvalConfig:
     def test_validation_passes_with_dataset_path(self):
         config = JobConfig()
         config.eval = EvalConfig(enabled=True, dataset_path="/data/eval")
-        config.validate()  # Should not raise
+        config.validate()
 
     def test_validation_passes_with_hf_dataset(self):
         config = JobConfig()
         config.eval = EvalConfig(enabled=True, hf_dataset_name="wikitext")
-        config.validate()  # Should not raise
+        config.validate()
 
     def test_disabled_skips_validation(self):
         config = JobConfig()
         config.eval = EvalConfig(enabled=False)
-        config.validate()  # Should not raise even without data source
-
-
-# ---------------------------------------------------------------------------
-# ModelConfig.head_dim_override
-# ---------------------------------------------------------------------------
+        config.validate()
 
 
 class TestModelConfigHeadDim:

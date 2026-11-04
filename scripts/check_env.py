@@ -35,17 +35,12 @@ try:
 except ImportError:  # pragma: no cover
     tomllib = None  # type: ignore[assignment]
 
-# ---------------------------------------------------------------------------
-# Status model
-# ---------------------------------------------------------------------------
 
 OK = "OK"
 WARN = "WARN"
 MISS = "MISS"
 
-# Tags accepted via --requires. Baseline (uv, repo-layout) runs always.
 KNOWN_TAGS = ("gpu", "slurm", "multi-node", "wandb", "mlflow", "hf", "gh")
-# Accepted for documentation symmetry but ignored (baseline always runs).
 BASELINE_ALIASES = ("uv", "repo-layout")
 
 DEFAULT_CLUSTER_CONFIG = "configs/cluster/local.toml"
@@ -66,11 +61,6 @@ class CheckResult:
         return d
 
 
-# ---------------------------------------------------------------------------
-# Path and config discovery
-# ---------------------------------------------------------------------------
-
-
 def find_repo_root(start: Path | None = None) -> Path:
     """Walk up from ``start`` (cwd by default) to find the KempnerForge root."""
     cur = (start or Path.cwd()).resolve()
@@ -89,11 +79,6 @@ def load_cluster_config(repo_root: Path, override: str | None = None) -> dict | 
         raise RuntimeError("Python 3.11+ required (tomllib unavailable)")
     with path.open("rb") as f:
         return tomllib.load(f)
-
-
-# ---------------------------------------------------------------------------
-# Baseline checks
-# ---------------------------------------------------------------------------
 
 
 def check_uv() -> CheckResult:
@@ -135,11 +120,6 @@ def check_repo_layout(repo_root: Path) -> CheckResult:
     )
 
 
-# ---------------------------------------------------------------------------
-# Tag checks
-# ---------------------------------------------------------------------------
-
-
 def check_gpu() -> CheckResult:
     """Check for an NVIDIA GPU. nvidia-smi preferred; /dev/nvidia* as fallback."""
     if shutil.which("nvidia-smi") is not None:
@@ -164,7 +144,6 @@ def check_gpu() -> CheckResult:
             name = parts[0] if parts else "?"
             driver = parts[1] if len(parts) > 1 else "?"
             return CheckResult("gpu", OK, f"{count}x {name}, driver {driver}")
-    # Container fallback: nvidia-smi may be missing even when GPUs work.
     if Path("/dev/nvidia0").exists() or Path("/proc/driver/nvidia/gpus").exists():
         return CheckResult("gpu", OK, "NVIDIA device nodes present (nvidia-smi unavailable)")
     return CheckResult(
@@ -577,10 +556,6 @@ def check_gh() -> CheckResult:
     return CheckResult("gh", OK, f"gh on PATH, {summary}")
 
 
-# ---------------------------------------------------------------------------
-# --init mode: interactive cluster config writer
-# ---------------------------------------------------------------------------
-
 LOCAL_TOML_TEMPLATE = """[cluster]
 name = "{cluster_name}"
 scheduler = "{scheduler}"
@@ -732,11 +707,6 @@ def do_init(repo_root: Path, args: argparse.Namespace) -> int:
     return 0
 
 
-# ---------------------------------------------------------------------------
-# Orchestration
-# ---------------------------------------------------------------------------
-
-
 def parse_requires(raw: str | None) -> list[str]:
     """Comma-separated list; empty string or None means baseline only."""
     if raw is None or raw == "":
@@ -794,11 +764,6 @@ def format_text(results: list[CheckResult]) -> str:
 
 def exit_code_for(results: list[CheckResult]) -> int:
     return 1 if any(r.status == MISS for r in results) else 0
-
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 
 
 def build_argparser() -> argparse.ArgumentParser:

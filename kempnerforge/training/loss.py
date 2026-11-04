@@ -64,7 +64,6 @@ def chunked_cross_entropy_loss(
     if num_tokens <= chunk_size:
         return F.cross_entropy(flat_logits, flat_labels, ignore_index=-100)
 
-    # Count valid (non-masked) tokens for correct averaging with ignore_index
     valid_tokens = (flat_labels != -100).sum()
     if valid_tokens == 0:
         return torch.tensor(0.0, device=flat_logits.device, dtype=torch.float32)

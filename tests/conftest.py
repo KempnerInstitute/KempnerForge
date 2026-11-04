@@ -19,10 +19,6 @@ from kempnerforge.config.schema import (
 )
 from kempnerforge.config.video import VideoConfig
 
-# ---------------------------------------------------------------------------
-# CLI flags for opt-in test suites
-# ---------------------------------------------------------------------------
-
 
 def pytest_addoption(parser):
     parser.addoption("--e2e", action="store_true", default=False, help="Run end-to-end tests")
@@ -48,10 +44,6 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(skip_smoke)
 
 
-# ---------------------------------------------------------------------------
-# Model configs
-# ---------------------------------------------------------------------------
-
 TINY_MODEL_CONFIG = ModelConfig(dim=64, n_layers=2, n_heads=2, vocab_size=256, max_seq_len=64)
 
 SMALL_MODEL_CONFIG = ModelConfig(dim=128, n_layers=4, n_heads=4, vocab_size=512, max_seq_len=128)
@@ -65,11 +57,6 @@ def tiny_model_config() -> ModelConfig:
 @pytest.fixture
 def small_model_config() -> ModelConfig:
     return ModelConfig(dim=128, n_layers=4, n_heads=4, vocab_size=512, max_seq_len=128)
-
-
-# ---------------------------------------------------------------------------
-# Job configs
-# ---------------------------------------------------------------------------
 
 
 @pytest.fixture
@@ -88,11 +75,6 @@ def tiny_job_config(tmp_path) -> JobConfig:
         scheduler=SchedulerConfig(warmup_steps=2),
         checkpoint=CheckpointConfig(dir=str(tmp_path / "checkpoints"), interval=5),
     )
-
-
-# ---------------------------------------------------------------------------
-# VLM configs / model
-# ---------------------------------------------------------------------------
 
 
 @pytest.fixture
@@ -138,19 +120,9 @@ def tiny_video_vlm_wrapper(tiny_video_configs):
     return build_vlm_wrapper(mc, vc, ac, lc, frames_per_clip=video.max_frames).eval()
 
 
-# ---------------------------------------------------------------------------
-# Device
-# ---------------------------------------------------------------------------
-
-
 @pytest.fixture
 def device() -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
-# ---------------------------------------------------------------------------
-# Data helpers
-# ---------------------------------------------------------------------------
 
 
 @pytest.fixture

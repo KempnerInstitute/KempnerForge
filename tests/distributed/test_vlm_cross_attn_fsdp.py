@@ -104,10 +104,8 @@ class TestBuildAndForward:
     def test_build_2gpu_runs(self, distributed_env):
         mesh = distributed_env
         wrapper = _build(_tiny_ca_cfg(), mesh)
-        # CA arch: residual is text-only.
         real = wrapper._orig_mod if hasattr(wrapper, "_orig_mod") else wrapper
         assert real.num_image_tokens == 0
-        # 4 layers, cadence 2 -> 2 CA blocks.
         assert len(real.transformer.cross_attention_layers) == 2
 
         pixels, ids, labels = _dummy_batch(wrapper)
@@ -122,8 +120,6 @@ class TestBuildAndForward:
         logits, labels_out = wrapper(pixels, ids, labels)
         loss = cross_entropy_loss(logits, labels_out)
         loss.backward()
-        # Adapter, transformer.layers, and cross_attention_layers all get
-        # gradients; the frozen vision encoder does not.
         for name, p in wrapper.named_parameters():
             if p.requires_grad:
                 assert p.grad is not None, f"trainable {name} got no grad"
@@ -161,9 +157,6 @@ class TestInnerTransformerUnderCompileAndFsdp:
         mesh = distributed_env
         compiled = _build(_tiny_ca_cfg(), mesh, compile_model=True)
         inner = inner_transformer(compiled)
-        # set_moe_step is a Transformer method, reachable through inner
-        # ref even for a compiled wrapper. set_moe_step is a no-op for
-        # a non-MoE model but exercises the unwrap.
         inner.set_moe_step(0, 100)  # type: ignore[attr-defined]
         pixels, ids, labels = _dummy_batch(compiled)
         logits, labels_out = compiled(pixels, ids, labels)
@@ -181,9 +174,8 @@ class TestFreezeStageUnderFsdp:
         live grad on the next backward.
         """
         mesh = distributed_env
-        cfg = _tiny_ca_cfg(freeze=[FreezeSpec("adapter", True)])  # adapter starts frozen
+        cfg = _tiny_ca_cfg(freeze=[FreezeSpec("adapter", True)])
         wrapper = _build(cfg, mesh)
-        # Step 0: confirm adapter frozen -> no grads.
         pixels, ids, labels = _dummy_batch(wrapper)
         logits, labels_out = wrapper(pixels, ids, labels)
         loss = cross_entropy_loss(logits, labels_out)
@@ -191,21 +183,17 @@ class TestFreezeStageUnderFsdp:
         for n, p in wrapper.named_parameters():
             if n.startswith("adapter"):
                 assert p.grad is None, f"frozen {n} got a grad"
-        # Now unfreeze the adapter (simulating a FreezeStage transition).
         apply_freeze_specs(
             wrapper,
             [FreezeSpec("adapter", False)],
             cfg[3].module_patterns,  # type: ignore[union-attr]
         )
-        # Run another backward (must zero grads first since prior backward
-        # left frozen-param grads as None and trainable-param grads populated).
         for p in wrapper.parameters():
             p.grad = None
         pixels, ids, labels = _dummy_batch(wrapper, seed_offset=100)
         logits, labels_out = wrapper(pixels, ids, labels)
         loss = cross_entropy_loss(logits, labels_out)
         loss.backward()
-        # Post-unfreeze: adapter params should now receive grads under FSDP2.
         adapter_grads_present = [
             p.grad is not None for n, p in wrapper.named_parameters() if n.startswith("adapter")
         ]
@@ -275,7 +263,6 @@ class TestMoEWithVLM:
         )
         mc = cfg[0]
         wrapper = _build(cfg, distributed_env, param_dtype=torch.float32)
-        # 4 layers, frequency=2 -> 2 MoE blocks; cadence=2 -> 2 CA blocks.
         moe_blocks = sum(
             1 for layer in wrapper.transformer.layers.values() if isinstance(layer.mlp, MoEMLP)
         )
@@ -301,8 +288,6 @@ class TestMoEWithVLM:
             opt.zero_grad()
             losses.append((ce.item(), aux.item()))
 
-        # CE decreases (verifies that FSDP+MoE+CA together produce
-        # a learning signal, not that they merely don't crash).
         initial_ce, final_ce = losses[0][0], losses[-1][0]
         assert final_ce < initial_ce, (
             f"FSDP+MoE+CA: CE did not decrease ({initial_ce:.3f} -> {final_ce:.3f})"
@@ -322,8 +307,6 @@ class TestCheckpointRoundtrip:
         wrapper = _build(cfg, mesh)
         opt = build_optimizer(wrapper, OptimizerConfig(lr=1e-3, fused=False))
 
-        # shared_tmp_dir lives on the shared filesystem so DCP shards
-        # written by rank 0 are visible to rank 1 under multi-node srun.
         path_str = shared_tmp_dir
         rank = dist.get_rank()
 
@@ -342,14 +325,11 @@ class TestCheckpointRoundtrip:
             meta = json.loads((Path(path_str) / "step_1" / "metadata.json").read_text())
             assert meta["vlm_freeze"] == freeze
 
-        # Load into a fresh wrapper / optimizer, expecting no mismatch.
         wrapper2 = _build(cfg, mesh)
         opt2 = build_optimizer(wrapper2, OptimizerConfig(lr=1e-3, fused=False))
         mgr2 = CheckpointManager(ckpt_cfg, wrapper2, opt2)
         step, _, _ = mgr2.load(path=str(path_str) + "/step_1", vlm_freeze_expected=freeze)
         assert step == 1
-        # CA layers params survived round-trip.
         for n, _ in wrapper2.named_parameters():
             if "cross_attention_layers" in n:
-                # If the layer params loaded, they're present in named_parameters.
                 pass
