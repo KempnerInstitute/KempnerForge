@@ -1,4 +1,3 @@
-# pyright: reportMissingImports=false
 """Append eval metrics to the MLflow run a checkpoint was trained under.
 
 A checkpoint's ``metadata.json`` records the tracking backends that were active when
@@ -293,7 +292,7 @@ def publish_metrics(
         from mlflow.entities import Metric
     except ImportError as e:
         raise PublishRefused(
-            f"mlflow could not be imported ({e}); install it with: uv sync --group mlflow"
+            f"mlflow could not be imported ({e}); the environment is incomplete, run: uv sync"
         ) from e
 
     can_link = "model_id" in inspect.signature(Metric).parameters
