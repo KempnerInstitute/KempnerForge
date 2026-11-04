@@ -84,8 +84,8 @@ max_samples = 0              # 0 = full manifest; set small for a smoke
 ```
 
 The encoder runs every frame of a clip, so `[vision_encoder] mixed_precision`
-(`"bf16"` or `"fp32"`, unset by default) sets its dtype for video exactly as for
-images, independent of `train.mixed_precision`; see
+(`"bf16"` or `"fp32"`, unset by default) sets the dtype it computes in for video
+exactly as for images, independent of `train.mixed_precision`; see
 [FSDP2](../distributed/fsdp2.md#what-it-shards).
 
 The residual stream's visual tokens (`max_frames` × tokens per frame; none for

@@ -375,25 +375,59 @@ def _cast_floating_inputs(
     return tuple(cast(a) for a in args), {k: cast(v) for k, v in kwargs.items()}
 
 
+class _ComputeDtypeHooks:
+    """Forward hooks that run a module in ``dtype`` while its parameters keep their dtype.
+
+    ``pre_forward`` puts a cast copy in place of each floating-point parameter of
+    another dtype, one copy per parameter however many names it has, and casts the
+    floating-point inputs. ``post_forward`` puts the parameters back, also when the
+    forward raises. Autograd returns each copy's gradient to its parameter in the
+    parameter's dtype, so gradients and optimizer state keep the stored dtype, as
+    with an FSDP2 ``MixedPrecisionPolicy`` whose ``param_dtype`` is ``dtype``.
+    """
+
+    def __init__(self, dtype: torch.dtype) -> None:
+        self.dtype = dtype
+        self._stored: list[tuple[torch.nn.Module, str, torch.nn.Parameter]] = []
+
+    def pre_forward(self, module: torch.nn.Module, args: tuple, kwargs: dict) -> tuple[tuple, dict]:
+        copies: dict[int, torch.Tensor] = {}
+        for owner in module.modules():
+            for name, param in list(owner._parameters.items()):
+                if param is None or not param.is_floating_point() or param.dtype == self.dtype:
+                    continue
+                if id(param) not in copies:
+                    copies[id(param)] = param.to(self.dtype)
+                self._stored.append((owner, name, param))
+                owner._parameters[name] = copies[id(param)]  # type: ignore[assignment]
+        return _cast_floating_inputs(self.dtype, module, args, kwargs)
+
+    def post_forward(self, module: torch.nn.Module, args: tuple, output: object) -> None:
+        while self._stored:
+            owner, name, param = self._stored.pop()
+            owner._parameters[name] = param
+
+
 def _set_encoder_precision(
     encoder: torch.nn.Module, dtype: torch.dtype, *, fsdp_wrapped: bool
 ) -> None:
-    """Make the vision encoder compute in ``dtype``, wrapped by FSDP2 or not.
+    """Make the vision encoder compute in ``dtype`` while its parameters keep their dtype.
 
-    A wrapped encoder's policy already casts its parameters and inputs, so only
-    its floating-point buffers are cast, every registered name as ``Module.to``
-    does, and its parameters keep their loaded dtype. An unwrapped encoder is
-    cast whole, and its floating-point inputs are cast on the way in, as
-    ``cast_forward_inputs`` does under FSDP2.
+    Its floating-point buffers are cast to ``dtype``, every registered name as
+    ``Module.to`` does. A wrapped encoder's policy casts its parameters and inputs
+    for each forward; an unwrapped one gets ``_ComputeDtypeHooks``, which does the
+    same. Either way its parameters, gradients and optimizer state keep the dtype
+    the encoder was loaded in.
     """
+    for module in encoder.modules():
+        for name, buffer in module.named_buffers(recurse=False, remove_duplicate=False):
+            if buffer.is_floating_point():
+                setattr(module, name, buffer.to(dtype))
     if fsdp_wrapped:
-        for module in encoder.modules():
-            for name, buffer in module.named_buffers(recurse=False, remove_duplicate=False):
-                if buffer.is_floating_point():
-                    setattr(module, name, buffer.to(dtype))
         return
-    encoder.to(dtype=dtype)
-    encoder.register_forward_pre_hook(partial(_cast_floating_inputs, dtype), with_kwargs=True)
+    hooks = _ComputeDtypeHooks(dtype)
+    encoder.register_forward_pre_hook(hooks.pre_forward, with_kwargs=True)
+    encoder.register_forward_hook(hooks.post_forward, always_call=True)
 
 
 def _build_vlm(
@@ -429,9 +463,9 @@ def _build_vlm(
          gets its own policy that computes in that dtype.
       6. Meta subtrees are materialized (transformer / adapter), the
          vision encoder is moved to ``device``, and the transformer and
-         adapter are cast to ``param_dtype``. The vision encoder stays in
-         its HF dtype (D16) to avoid ViT LayerNorm numerical drift, unless
-         ``vision_config.mixed_precision`` is set; then
+         adapter are cast to ``param_dtype``. The vision encoder's
+         parameters stay in its HF dtype (D16) to avoid ViT LayerNorm
+         numerical drift; with ``vision_config.mixed_precision`` set,
          ``_set_encoder_precision`` makes it compute in that dtype.
       7. Freeze specs are applied via ``apply_freeze_specs`` and a fully
          frozen encoder is switched to ``eval()``.

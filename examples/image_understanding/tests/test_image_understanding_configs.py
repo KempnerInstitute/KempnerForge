@@ -121,7 +121,7 @@ def test_stage2_trains_everything_from_a_stage1_checkpoint() -> None:
 def test_stage_sets_the_encoder_precision_apart_from_the_backbone(
     stage: int, precision: str
 ) -> None:
-    """The recipe trains SigLIP2 in fp32 in stage 1 and in bf16 in stage 2; the backbone in bf16."""
+    """Stage 1 computes SigLIP2 in fp32 and stage 2 in bf16; the backbone computes in bf16."""
     path = CONFIG_DIR / f"qwen3_0.6b_siglip2_stage{stage}.toml"
     config = load_config(str(path), cli_args=[])
     assert config.vision_encoder is not None

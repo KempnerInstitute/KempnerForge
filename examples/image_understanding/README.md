@@ -39,6 +39,11 @@ pooled 2 × 2 to 256 visual tokens, plus `max_text_len = 256` text tokens, so
 (stage 1) and 512 (stage 2) on 16 GPUs; on fewer GPUs raise
 `train.grad_accum_steps` to keep it.
 
+Both presets set the encoder's precision apart from the backbone's with
+`[vision_encoder] mixed_precision`: SigLIP2 computes in fp32 in stage 1 and
+in bf16 in stage 2, while its weights and optimizer state stay in the fp32 it
+loads in and the backbone computes in bf16, on any number of GPUs.
+
 Paths in these configs are placeholders (`dir = "path-to-output-dir"`), and
 `data.hf_dataset_name` names `sayakpaul/coco-30-val-2014`, 30,000 COCO
 image-caption pairs (about 4.9 GB on first download), as a stand-in for the
@@ -100,7 +105,6 @@ change in this directory (or in core where the issue says so).
 | Documents with several images | [#434](https://github.com/KempnerInstitute/KempnerForge/issues/434) |
 | Tiling into a global view and a 3 × 3 grid of crops (stage 2) | [#435](https://github.com/KempnerInstitute/KempnerForge/issues/435) |
 | Per-module learning rates and schedules | [#439](https://github.com/KempnerInstitute/KempnerForge/issues/439) |
-| Vision-encoder precision separate from the backbone's (in place: `[vision_encoder] mixed_precision`, `"fp32"` in stage 1 and `"bf16"` in stage 2) | [#438](https://github.com/KempnerInstitute/KempnerForge/issues/438) |
 | Evaluation parity: chat-template prompts, image attention, the recipe's scorers | [#443](https://github.com/KempnerInstitute/KempnerForge/issues/443) |
 | Run-comparison metrics: documents seen, token counts, MFU with the encoder | [#444](https://github.com/KempnerInstitute/KempnerForge/issues/444) |
 

@@ -20,10 +20,13 @@ Field summary:
   ``JobConfig.__post_init__``.
 - ``mixed_precision`` is the dtype the encoder computes in (``"bf16"`` or
   ``"fp32"``), independent of ``train.mixed_precision``, for image and video
-  runs alike. Unset, the encoder keeps the default: an FSDP2-wrapped encoder
-  computes in the language model's dtype, and an unwrapped one in its loaded
-  dtype. It applies to the training build (``build_parallel_model``);
-  ``build_vlm_wrapper`` leaves every dtype to its caller.
+  runs alike. Its parameters, gradients and optimizer state keep the dtype
+  the encoder was loaded in, on any number of GPUs, and its floating-point
+  buffers take the set dtype. Unset, the encoder keeps the default: an
+  FSDP2-wrapped encoder computes in the language model's dtype, and an
+  unwrapped one in its loaded dtype. It applies to the training build
+  (``build_parallel_model``); ``build_vlm_wrapper`` leaves every dtype to
+  its caller.
 """
 
 from __future__ import annotations
