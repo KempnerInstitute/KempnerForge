@@ -2,11 +2,18 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 import torch.nn as nn
 
 from kempnerforge.config.schema import OptimizerConfig
-from kempnerforge.training.optimizer import Muon, _is_muon_eligible, _newton_schulz, build_optimizer
+from kempnerforge.training.optimizer import (
+    Muon,
+    _is_muon_eligible,
+    _muon_update_scale,
+    _newton_schulz,
+    build_optimizer,
+)
 
 
 class TestNewtonSchulz:
@@ -16,12 +23,10 @@ class TestNewtonSchulz:
         G = torch.randn(64, 64)
         U = _newton_schulz(G, steps=5)
 
-        # U @ U^T should be close to identity (scaled)
         product = U @ U.T
         diag = torch.diag(product)
         off_diag = product - torch.diag(diag)
 
-        # Off-diagonal elements should be small (5 iterations is approximate)
         assert off_diag.abs().max() < 0.15
 
     def test_rectangular_matrix(self):
@@ -40,6 +45,94 @@ class TestNewtonSchulz:
 
 
 class TestMuon:
+    @pytest.mark.parametrize(
+        ("adjust_lr", "tall", "wide"),
+        [("original", 2.0, 1.0), ("match_rms_adamw", 0.8, 0.8), ("spectral_unclamped", 2.0, 0.5)],
+    )
+    def test_update_scale_modes(self, adjust_lr, tall, wide):
+        """Each adjust_lr mode's factor for a tall 16x4 and a wide 4x16 matrix."""
+        assert _muon_update_scale(adjust_lr, 16, 4) == pytest.approx(tall)
+        assert _muon_update_scale(adjust_lr, 4, 16) == pytest.approx(wide)
+
+    @pytest.mark.parametrize(("rows", "cols"), [(16, 4), (4, 16)])
+    @pytest.mark.parametrize("adjust_lr", ["original", "match_rms_adamw", "spectral_unclamped"])
+    def test_adjust_lr_scales_the_step(self, adjust_lr, rows, cols):
+        """One step moves a tall or a wide weight by lr times the mode's scale times NS(grad)."""
+        torch.manual_seed(0)
+        weight = nn.Parameter(torch.zeros(rows, cols))
+        weight.grad = torch.randn(rows, cols)
+        optimizer = Muon([{"params": [weight]}], [{"params": []}], lr=0.1, adjust_lr=adjust_lr)
+        optimizer.step()
+        expected = -0.1 * _muon_update_scale(adjust_lr, rows, cols) * _newton_schulz(weight.grad)
+        torch.testing.assert_close(weight.data, expected)
+
+    def test_nesterov_orthogonalizes_the_lookahead(self):
+        """With nesterov, Newton-Schulz sees grad + momentum * buffer."""
+        torch.manual_seed(0)
+        grads = [torch.randn(8, 8), torch.randn(8, 8)]
+        weight = nn.Parameter(torch.zeros(8, 8))
+        optimizer = Muon([{"params": [weight]}], [{"params": []}], lr=0.1, nesterov=True)
+        expected = torch.zeros(8, 8)
+        buf = torch.zeros(8, 8)
+        for grad in grads:
+            weight.grad = grad.clone()
+            optimizer.step()
+            buf = 0.95 * buf + grad
+            expected -= 0.1 * _newton_schulz(grad + 0.95 * buf)
+        torch.testing.assert_close(weight.data, expected)
+
+    def test_nesterov_off_matches_the_plain_buffer(self):
+        """Without nesterov, Newton-Schulz sees the momentum buffer."""
+        torch.manual_seed(0)
+        grads = [torch.randn(8, 8), torch.randn(8, 8)]
+        weight = nn.Parameter(torch.zeros(8, 8))
+        optimizer = Muon([{"params": [weight]}], [{"params": []}], lr=0.1)
+        expected = torch.zeros(8, 8)
+        buf = torch.zeros(8, 8)
+        for grad in grads:
+            weight.grad = grad.clone()
+            optimizer.step()
+            buf = 0.95 * buf + grad
+            expected -= 0.1 * _newton_schulz(buf)
+        torch.testing.assert_close(weight.data, expected)
+
+    @pytest.mark.parametrize("adjust_lr", ["original", "match_rms_adamw"])
+    def test_tracks_torch_muon(self, adjust_lr):
+        """With nesterov, three steps land close to torch.optim.Muon's (which runs NS in bf16)."""
+        if not hasattr(torch.optim, "Muon"):
+            pytest.skip("torch.optim.Muon needs torch >= 2.9")
+        torch.manual_seed(0)
+        init = torch.randn(16, 8)
+        grads = [torch.randn(16, 8) for _ in range(3)]
+        ours = nn.Parameter(init.clone())
+        theirs = nn.Parameter(init.clone())
+        kf = Muon(
+            [{"params": [ours]}], [{"params": []}], lr=0.02, nesterov=True, adjust_lr=adjust_lr
+        )
+        ref = torch.optim.Muon(
+            [theirs],
+            lr=0.02,
+            weight_decay=0.0,
+            nesterov=True,
+            adjust_lr_fn=None if adjust_lr == "original" else adjust_lr,
+        )
+        for grad in grads:
+            ours.grad, theirs.grad = grad.clone(), grad.clone()
+            kf.step()
+            ref.step()
+        error = (ours.data - theirs.data).norm() / (theirs.data - init).norm()
+        assert error < 0.05
+
+    def test_rejects_unknown_adjust_lr(self):
+        with pytest.raises(ValueError, match="adjust_lr must be one of"):
+            Muon([{"params": [nn.Parameter(torch.zeros(2, 2))]}], [{"params": []}], adjust_lr="x")
+
+    def test_build_optimizer_passes_nesterov_and_adjust_lr(self):
+        config = OptimizerConfig(name="muon", muon_nesterov=True, muon_adjust_lr="match_rms_adamw")
+        optimizer = build_optimizer(nn.Linear(8, 8), config)
+        assert optimizer.param_groups[0]["nesterov"] is True
+        assert optimizer.param_groups[0]["adjust_lr"] == "match_rms_adamw"
+
     def _make_model(self):
         return nn.Sequential(
             nn.Linear(32, 64),
@@ -77,7 +170,6 @@ class TestMuon:
         assert isinstance(optimizer, Muon)
         assert optimizer._adam is not None
 
-        # Muon params should all be eligible (2D with reasonable aspect ratio)
         muon_params = [p for g in optimizer.param_groups for p in g["params"]]
         for p in muon_params:
             assert _is_muon_eligible(p), "Muon should only get NS-eligible params"
@@ -85,7 +177,7 @@ class TestMuon:
     def test_rectangular_params_use_adam(self):
         """Highly rectangular params (embeddings) should use AdamW, not Muon."""
         model = nn.Sequential(
-            nn.Embedding(32000, 64),  # aspect ratio 500:1 — too rectangular
+            nn.Embedding(32000, 64),
             nn.Linear(64, 64),
         )
         config = OptimizerConfig(name="muon", lr=0.01)
@@ -94,9 +186,7 @@ class TestMuon:
         muon_params = [p for g in optimizer.param_groups for p in g["params"]]
         adam_params = [p for g in optimizer._adam.param_groups for p in g["params"]]
 
-        # Embedding weight (32000x64) should be in AdamW
         assert any(p.shape == (32000, 64) for p in adam_params)
-        # Linear weight (64x64) should be in Muon
         assert any(p.shape == (64, 64) for p in muon_params)
 
     def test_produces_finite_updates(self):
@@ -167,16 +257,13 @@ class TestMuon:
         config = OptimizerConfig(name="muon", lr=0.02, muon_adam_lr=3e-4)
         optimizer = build_optimizer(model, config)
 
-        # Simulate scheduler halving the Muon LR
-        optimizer.param_groups[0]["lr"] = 0.01  # halved from 0.02
+        optimizer.param_groups[0]["lr"] = 0.01
 
-        # Run a step — Adam LR should scale proportionally
         x = torch.randn(4, 32)
         optimizer.zero_grad()
         model(x).sum().backward()
         optimizer.step()
 
-        # Adam LR should be halved too: 3e-4 * (0.01/0.02) = 1.5e-4
         expected_adam_lr = 3e-4 * (0.01 / 0.02)
         assert abs(optimizer._adam.param_groups[0]["lr"] - expected_adam_lr) < 1e-10
 
@@ -192,7 +279,6 @@ class TestMuon:
         model(x).sum().backward()
         optimizer.step()
 
-        # In non-FSDP case, momentum buffer should be a regular tensor
         for p in optimizer.param_groups[0]["params"]:
             if p in optimizer.state:
                 buf = optimizer.state[p]["momentum_buffer"]
@@ -206,26 +292,22 @@ class TestMuon:
         config = OptimizerConfig(name="muon", lr=0.02, muon_adam_lr=3e-4)
         optimizer = build_optimizer(model, config)
 
-        # Run a few steps to populate optimizer state
         x = torch.randn(8, 32)
         for _ in range(5):
             optimizer.zero_grad()
             nn.functional.cross_entropy(model(x), torch.randint(0, 10, (8,))).backward()
             optimizer.step()
 
-        # Save state
         sd = optimizer.state_dict()
         assert "_adam_state" in sd, "Internal AdamW state missing from state_dict"
         assert "_initial_lr" in sd
         assert "_initial_adam_lr" in sd
 
-        # Create a fresh optimizer and load state
         model2 = self._make_model()
         config2 = OptimizerConfig(name="muon", lr=0.02, muon_adam_lr=3e-4)
         optimizer2 = build_optimizer(model2, config2)
         optimizer2.load_state_dict(sd)
 
-        # Verify Muon momentum buffers match
         for p1, p2 in zip(
             [p for g in optimizer.param_groups for p in g["params"]],
             [p for g in optimizer2.param_groups for p in g["params"]],
@@ -236,7 +318,6 @@ class TestMuon:
                 buf2 = optimizer2.state[p2]["momentum_buffer"]
                 torch.testing.assert_close(buf1, buf2)
 
-        # Verify internal AdamW state was restored (non-empty)
         adam_states = [s for s in optimizer2._adam.state.values() if s]
         assert len(adam_states) > 0, "Internal AdamW state was not restored"
 
@@ -255,11 +336,9 @@ class TestMuon:
         """
         torch.manual_seed(0)
         model = nn.Sequential(
-            nn.Embedding(32000, 64),  # aspect ratio 500:1 -> inner AdamW
+            nn.Embedding(32000, 64),
             nn.Linear(64, 64),
         )
-        # lr tiny and no decay, so parameters barely move and the per-step
-        # gradient is constant unless it is accumulating.
         config = OptimizerConfig(name="muon", lr=1e-12, weight_decay=0.0)
         optimizer = build_optimizer(model, config)
         embedding = model[0].weight
@@ -313,7 +392,7 @@ class TestMuon:
     def test_zero_grad_without_delegated_params(self):
         """A model whose parameters are all Muon-eligible leaves _adam as None."""
         torch.manual_seed(0)
-        model = nn.Linear(32, 32, bias=False)  # single 2D param, aspect ratio 1.0
+        model = nn.Linear(32, 32, bias=False)
         optimizer = build_optimizer(model, OptimizerConfig(name="muon", lr=0.01))
         assert optimizer._adam is None
 
@@ -342,6 +421,57 @@ class TestMuon:
         optimizer2 = build_optimizer(model2, OptimizerConfig(name="muon", lr=0.01))
         optimizer2.load_state_dict(sd)
         assert optimizer2._adam is None
+
+    def test_exact_orthogonalize_matches_local_when_unsharded(self):
+        """Unsharded, exact and local orthogonalization step identically."""
+        torch.manual_seed(0)
+        grads = [torch.randn(16, 8), torch.randn(16, 8)]
+        weights = [nn.Parameter(torch.zeros(16, 8)) for _ in range(2)]
+        optimizers = [
+            Muon([{"params": [weight]}], [{"params": []}], lr=0.1, orthogonalize=mode)
+            for weight, mode in zip(weights, ("local", "exact"), strict=True)
+        ]
+        for grad in grads:
+            for weight, optimizer in zip(weights, optimizers, strict=True):
+                weight.grad = grad.clone()
+                optimizer.step()
+        assert torch.equal(weights[0].data, weights[1].data)
+
+    def test_rejects_unknown_orthogonalize(self):
+        with pytest.raises(ValueError, match="orthogonalize must be one of"):
+            Muon(
+                [{"params": [nn.Parameter(torch.zeros(2, 2))]}],
+                [{"params": []}],
+                orthogonalize="x",
+            )
+
+    def test_build_optimizer_passes_orthogonalize(self):
+        config = OptimizerConfig(name="muon", muon_orthogonalize="exact")
+        optimizer = build_optimizer(nn.Linear(8, 8), config)
+        assert optimizer.param_groups[0]["orthogonalize"] == "exact"
+
+    def test_state_saved_before_orthogonalize_loads_as_local(self):
+        """A state saved before ``orthogonalize`` existed loads with "local", whatever is set."""
+        weight = nn.Parameter(torch.zeros(4, 4))
+        saved = Muon([{"params": [weight]}], [{"params": []}]).state_dict()
+        for group in saved["param_groups"]:
+            del group["orthogonalize"]
+        optimizer = Muon([{"params": [weight]}], [{"params": []}], orthogonalize="exact")
+        optimizer.load_state_dict(saved)
+        assert optimizer.param_groups[0]["orthogonalize"] == "local"
+
+    def test_state_saved_before_nesterov_and_adjust_lr_loads_the_old_update(self):
+        """A state saved before ``nesterov`` and ``adjust_lr`` loads with False and "original"."""
+        weight = nn.Parameter(torch.zeros(4, 4))
+        saved = Muon([{"params": [weight]}], [{"params": []}]).state_dict()
+        for group in saved["param_groups"]:
+            del group["nesterov"], group["adjust_lr"]
+        optimizer = Muon(
+            [{"params": [weight]}], [{"params": []}], nesterov=True, adjust_lr="match_rms_adamw"
+        )
+        optimizer.load_state_dict(saved)
+        assert optimizer.param_groups[0]["nesterov"] is False
+        assert optimizer.param_groups[0]["adjust_lr"] == "original"
 
 
 class TestAdamW:

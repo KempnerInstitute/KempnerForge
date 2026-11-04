@@ -101,18 +101,12 @@ def build_model(
     )
 
     if device_mesh is None:
-        # Unreachable: JobConfig.validate rejects pp > 1 at world_size 1, the
-        # only case init_distributed returns no mesh. Explicit so it survives -O.
         raise RuntimeError("pipeline parallelism requires a device mesh")
     pp_rank = get_pp_rank(device_mesh)
     pp_size = get_pp_size(device_mesh)
 
     tp_enabled_pp = "tp" in device_mesh.mesh_dim_names  # type: ignore[reportOperatorIssue]
-    # apply_{float8,ac,fsdp2} are annotated for Transformer; a stage module
-    # exposes the same block structure, hence the cast.
     if tp_enabled_pp:
-        # Meta-device init: same pattern as non-PP TP path.
-        # Avoids OOM for large PP stages that don't fit on one GPU before TP shards them.
         with torch.device("meta"):
             stage_mod = cast("Transformer", build_stage_module(config.model, pp_rank, pp_size))
         apply_tensor_parallel(stage_mod, device_mesh)
@@ -204,12 +198,6 @@ def restore_checkpoint(
     resume from. Also restores the metrics run ids, runs the MoT warm-start
     hook, and re-applies the effective freeze at the resumed step.
     """
-    # Every rank must resume from the same checkpoint. resolve_resume_path
-    # stats `.metadata` to test durability, and on NFS/Lustre independent
-    # stats can disagree briefly across ranks; ranks that disagree resume
-    # from different steps, or hang in the collective load below when some
-    # skip it. Use a rank-0-authoritative answer broadcast to all ranks,
-    # as CheckpointManager.load does for train_state.pt.
     if dist.is_initialized():
         chosen = [
             str(resolve_resume_path(config.checkpoint.dir) or "") if dist.get_rank() == 0 else ""
@@ -222,17 +210,12 @@ def restore_checkpoint(
         return 0, 0
 
     vlm_cfg = config.vlm
-    # On resume the expected freeze metadata reflects the post-transition
-    # state at the saved step (effective_freeze handles step-boundary
-    # transitions). Peek at the saved step via metadata.json before invoking
-    # load() so the comparison uses the same step the checkpoint was written at.
     vlm_freeze_expected = None
     if config.is_vlm:
-        assert vlm_cfg is not None  # narrowed by is_vlm
+        assert vlm_cfg is not None
         probe_step = ckpt_mgr.peek_saved_step(str(resume_path) if resume_path else None) or 0
         vlm_freeze_expected = freeze_meta_at_step(probe_step, vlm_cfg)
 
-    # A resume always restores full state; the exclusion applies only to a load_path warm start.
     warm_start_exclude = (
         (config.checkpoint.exclude_from_loading or None) if resume_path is None else None
     )
@@ -247,12 +230,6 @@ def restore_checkpoint(
     if ckpt_extra_loaded.get("mlflow_run_id"):
         config.metrics.mlflow_run_id = ckpt_extra_loaded["mlflow_run_id"]
 
-    # MoT warm-start: translate dense TransformerBlock weights from a
-    # JD/text-only checkpoint into per-modality copies inside every
-    # MoTBlock. Runs once at the start of training (resume_path is
-    # None or step == 0); a real resume of an in-flight MoT run
-    # already has the MoT-shaped state in the checkpoint and skips
-    # this hook.
     if isinstance(vlm_cfg, MoTConfig) and vlm_cfg.mot_warm_start_from_text and step == 0:
         source = torch.load(vlm_cfg.mot_warm_start_path, map_location="cpu", weights_only=True)
         if isinstance(source, dict) and "model" in source:
@@ -262,9 +239,6 @@ def restore_checkpoint(
             f"MoT warm-start: copied dense block weights from {vlm_cfg.mot_warm_start_path}"
         )
 
-    # Apply effective freeze at the resumed step so requires_grad reflects
-    # the post-transition state of any stages with start_step <= loaded_step.
-    # Build-time apply only handles the base freeze list.
     if vlm_cfg is not None and vlm_cfg.freeze_schedule:
         valid_modules = set(vlm_cfg.module_patterns.keys())
         specs = effective_freeze(step, vlm_cfg.freeze, vlm_cfg.freeze_schedule, valid_modules)
@@ -287,7 +261,6 @@ def run_training(
     ``scripts/train.py`` uses.
     """
     runtime = setup_distributed(config)
-    # Bound before the try so the teardown can tell "never built" from "built".
     tracker: MetricsTracker | None = None
     finished = False
     try:
@@ -306,14 +279,12 @@ def run_training(
 
         tracker = MetricsTracker(config, num_gpus=runtime.world_size)
         tracker.init_backends(config)
+        ckpt_mgr.set_tracking_source(tracker.tracking_entries)
+        ckpt_mgr.set_checkpoint_registrar(tracker)
 
         prof = build_profiler(config.profiling, rank=runtime.rank)
 
         data = build_data_pipeline(config, runtime)
-        # Apply any dataloader state stashed during load(). Runs after dataloader
-        # construction because the loader's identity depends on phase scheduling
-        # that load() restores. No-op when resuming without a prior dataloader
-        # state or when the loader is not stateful (plain TorchDataLoader).
         if data.dataloader is not None:
             ckpt_mgr.apply_dataloader_state(data.dataloader)
 
@@ -343,16 +314,7 @@ def run_training(
         run_training_loop(session, step=step, tokens_seen=tokens_seen)
         finished = True
     finally:
-        # As a library call this can raise and the caller can keep going, so
-        # the metrics run must not outlive it. close() is rank-local: backends
-        # are built on rank 0 only, so it is a no-op elsewhere.
         if tracker is not None:
             tracker.close()
-        # destroy_process_group() is the cooperative teardown -- it blocks in
-        # _wait_for_pending_works() and shuts backends down in a deliberate
-        # order because ncclCommAbort has been collective in some NCCL
-        # versions; torch ships _abort_process_group() as the separate
-        # error-path API. Peers are still mid-collective while we unwind, so
-        # on the failure path leave the group to the launcher, as main did.
         if finished:
             destroy_distributed()

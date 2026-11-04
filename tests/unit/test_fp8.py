@@ -28,7 +28,6 @@ class TestFP8Config:
 
     def test_other_precisions_unchanged(self):
         assert TrainConfig(mixed_precision="bf16").param_dtype == torch.bfloat16
-        assert TrainConfig(mixed_precision="fp16").param_dtype == torch.float16
         assert TrainConfig(mixed_precision="fp32").param_dtype == torch.float32
 
     def test_fp8_plus_tp_rejected(self):
@@ -51,7 +50,7 @@ class TestFP8Config:
             train=TrainConfig(mixed_precision="fp8"),
             distributed=DistributedConfig(dp_shard=4),
         )
-        config.validate(world_size=4)  # should not raise
+        config.validate(world_size=4)
 
 
 class TestApplyFloat8:
@@ -60,7 +59,7 @@ class TestApplyFloat8:
     @pytest.fixture
     def small_transformer(self):
         from kempnerforge.config.schema import ModelConfig
-        from kempnerforge.model.transformer import Transformer  # triggers registration
+        from kempnerforge.model.transformer import Transformer
 
         mc = ModelConfig(dim=64, n_layers=2, n_heads=4, vocab_size=256)
         return Transformer(mc)
@@ -68,7 +67,7 @@ class TestApplyFloat8:
     @pytest.fixture
     def moe_transformer(self):
         from kempnerforge.config.schema import ModelConfig
-        from kempnerforge.model.transformer import Transformer  # triggers registration
+        from kempnerforge.model.transformer import Transformer
 
         mc = ModelConfig(
             dim=64,
@@ -86,7 +85,6 @@ class TestApplyFloat8:
 
         from kempnerforge.distributed.parallel import apply_float8
 
-        # Count nn.Linear before
         linears_before = sum(
             1 for m in small_transformer.modules() if isinstance(m, torch.nn.Linear)
         )
@@ -94,7 +92,6 @@ class TestApplyFloat8:
 
         apply_float8(small_transformer, enable_fsdp_float8_all_gather=False)
 
-        # All nn.Linear should now be Float8Linear
         float8_count = sum(1 for m in small_transformer.modules() if isinstance(m, Float8Linear))
         plain_linear_count = sum(
             1 for m in small_transformer.modules() if type(m) is torch.nn.Linear
@@ -110,7 +107,6 @@ class TestApplyFloat8:
 
         apply_float8(moe_transformer, enable_fsdp_float8_all_gather=False)
 
-        # Expert modules should still have plain nn.Linear
         for layer in moe_transformer.layers.values():
             if hasattr(layer.mlp, "experts"):
                 for expert in layer.mlp.experts:
@@ -120,13 +116,11 @@ class TestApplyFloat8:
                                 f"Expert sub-module {name} was converted to Float8Linear"
                             )
 
-        # Router gate should stay as plain nn.Linear (small dim, not divisible by 16)
         for layer in moe_transformer.layers.values():
             if hasattr(layer.mlp, "router"):
                 gate = layer.mlp.router.gate
                 assert type(gate) is torch.nn.Linear, "Router gate was converted to Float8Linear"
 
-        # Non-expert, non-router modules (attention, output) should be Float8Linear
         float8_count = sum(1 for m in moe_transformer.modules() if isinstance(m, Float8Linear))
         assert float8_count > 0, "No Float8Linear modules found — conversion failed"
 

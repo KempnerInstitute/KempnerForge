@@ -9,6 +9,12 @@ from typing import TYPE_CHECKING, Literal
 if TYPE_CHECKING:
     import torch
 
+_FP16_UNSUPPORTED = (
+    "train.mixed_precision='fp16' is not supported: it would train in pure fp16 "
+    "with no loss scaling, so small gradients underflow to zero. Use 'bf16', or "
+    "'fp32' on GPUs without bf16."
+)
+
 
 class ActivationCheckpointing(StrEnum):
     none = "none"
@@ -18,23 +24,28 @@ class ActivationCheckpointing(StrEnum):
 
 @dataclass
 class TrainConfig:
-    """Training hyperparameters."""
+    """Training hyperparameters.
 
-    batch_size: int = 8  # Per-device micro-batch size
+    ``"fp16"`` stays in the ``mixed_precision`` ``Literal`` only so the config loader
+    passes it on to ``__post_init__``, which rejects it with the reason; without it the
+    loader would fail first with a generic Literal error.
+    """
+
+    batch_size: int = 8
     seq_len: int = 2048
     max_steps: int = 100000
     grad_accum_steps: int = 1
     grad_clip_norm: float = 1.0
-    seed: int = 42  # Seeds parameter init, dropout, and (by default) data order
-    data_seed: int | None = None  # Overrides data/batch order only; None falls back to seed
+    seed: int = 42
+    data_seed: int | None = None
     compile_model: bool = True
     mixed_precision: Literal["bf16", "fp16", "fp32", "fp8"] = "bf16"
     activation_checkpointing: ActivationCheckpointing = ActivationCheckpointing.none
-    loss_fn: str = "cross_entropy"  # Registry key for loss function
-    z_loss_weight: float = 0.0  # Logit magnitude regularizer (PaLM uses 1e-4, 0=disabled)
-    ce_chunk_size: int = 0  # Token chunk size for chunked_cross_entropy (0=auto 4096)
-    shutdown_timeout_sec: float = 600.0  # Graceful shutdown timeout before forced exit
-    nccl_health_check_interval: int = 0  # Check NCCL health every N steps (0=disabled)
+    loss_fn: str = "cross_entropy"
+    z_loss_weight: float = 0.0
+    ce_chunk_size: int = 0
+    shutdown_timeout_sec: float = 600.0
+    nccl_health_check_interval: int = 0
 
     def __post_init__(self) -> None:
         if self.batch_size <= 0:
@@ -47,20 +58,25 @@ class TrainConfig:
             raise ValueError("grad_accum_steps must be positive")
         if self.grad_clip_norm <= 0:
             raise ValueError("grad_clip_norm must be positive")
+        if self.mixed_precision == "fp16":
+            raise ValueError(_FP16_UNSUPPORTED)
 
     @property
     def param_dtype(self) -> torch.dtype:
         """Resolve mixed_precision to the master weight dtype.
 
         FP8 uses bf16 master weights -- FP8 is a compute mode, not a storage dtype.
+        A config switched to ``"fp16"`` after construction skips ``__post_init__``,
+        so ``"fp16"`` raises the same ``ValueError`` here.
         """
         import torch
 
+        if self.mixed_precision == "fp16":
+            raise ValueError(_FP16_UNSUPPORTED)
         _DTYPE_MAP = {
             "bf16": torch.bfloat16,
-            "fp16": torch.float16,
             "fp32": torch.float32,
-            "fp8": torch.bfloat16,  # FP8 compute with bf16 master weights
+            "fp8": torch.bfloat16,
         }
         return _DTYPE_MAP[self.mixed_precision]
 

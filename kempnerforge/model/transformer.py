@@ -59,8 +59,6 @@ class TransformerBlock(nn.Module):
 
         self.mlp_norm = build_norm(config.norm_type, config.dim, eps=config.norm_eps)
 
-        # MoE placement: with moe_frequency=1, all layers are MoE.
-        # With moe_frequency=2, layers 1,3,5... are MoE (layer 0 stays dense).
         use_moe = config.is_moe and ((layer_idx + 1) % config.moe_frequency == 0)
         if use_moe:
             self.mlp = build_moe(
@@ -96,7 +94,6 @@ class TransformerBlock(nn.Module):
         key_padding_mask: torch.Tensor | None = None,
         block_mask: BlockMask | None = None,
     ) -> torch.Tensor:
-        # Pre-norm attention with residual
         x = x + self.attention(
             self.attention_norm(x),
             rope_cos,
@@ -107,7 +104,6 @@ class TransformerBlock(nn.Module):
             key_padding_mask=key_padding_mask,
             block_mask=block_mask,
         )
-        # Pre-norm MLP with residual
         x = x + self.mlp(self.mlp_norm(x))
         return x
 
@@ -128,19 +124,8 @@ class Transformer(nn.Module):
         super().__init__()
         self.config = config
 
-        # Token embedding (can be None for PP middle stages)
         self.token_embedding: TokenEmbedding | None = TokenEmbedding(config.vocab_size, config.dim)
 
-        # MoT branch: build MoTBlocks instead of TransformerBlocks. v1
-        # enforces equal head counts across modalities (single global
-        # SDPA over the concatenated multi-modality sequence).
-        # MoMa branch: build MoMaBlocks (shared Q/K/V/O attention +
-        # per-modality MoE FFN groups). The branches are mutually
-        # exclusive on layer construction; CA layers are still attached
-        # separately below for ``CrossAttentionConfig``.
-        # num_image_tokens flows in from the vision encoder via the VLM
-        # build path; it is unused for non-MoT arches but kept as a single
-        # constructor arg so the signature is uniform across arches.
         self._mot_modalities: tuple[str, ...] = ()
         self._mot_n_image: int = 0
         self._moma_modalities: tuple[str, ...] = ()
@@ -183,21 +168,15 @@ class Transformer(nn.Module):
                 }
             )
         else:
-            # Transformer blocks — use ModuleDict to preserve FQNs for DCP
             self.layers = nn.ModuleDict(
                 {str(i): TransformerBlock(config, layer_idx=i) for i in range(config.n_layers)}
             )
 
-        # Cross-Attention layers (only populated when vlm_config is a
-        # CrossAttentionConfig). Empty ModuleDict registers no
-        # state_dict keys, so JD checkpoints load unchanged on builds
-        # where this dict ends up empty.
         self.cross_attention_layers: nn.ModuleDict = nn.ModuleDict()
         self._ca_cadence: int = 0
         if isinstance(vlm_config, CrossAttentionConfig):
             self._ca_cadence = vlm_config.cross_attention_every_n_layers
             n_h, n_kv = vlm_config.resolved_heads(config.n_heads)
-            # Cross-attention uses dim // its own n_heads unless head_dim is decoupled.
             ca_head_dim = config.head_dim if config.head_dim_override else None
             num_ca_blocks = config.n_layers // self._ca_cadence
             for k in range(num_ca_blocks):
@@ -212,12 +191,6 @@ class Transformer(nn.Module):
                     norm_eps=config.norm_eps,
                 )
 
-        # Final normalization. Used by the non-MoT path. MoT uses
-        # per-modality ``mot_norms`` instead; ``self.norm`` is built
-        # regardless so cross-arch DCP loads can carry ``norm.weight``
-        # uniformly. When MoT is active, ``self.norm`` is unused in
-        # forward and is frozen so it does not appear as an orphan
-        # trainable parameter (its grad would always be ``None``).
         self.norm = build_norm(config.norm_type, config.dim, eps=config.norm_eps)
         self.mot_norms: nn.ModuleDict = nn.ModuleDict()
         if self._mot_modalities:
@@ -230,17 +203,12 @@ class Transformer(nn.Module):
             for p in self.norm.parameters():
                 p.requires_grad_(False)
 
-        # Output head (can be None for PP non-final stages)
         self.output_head: OutputHead | None = OutputHead(config.dim, config.vocab_size)
 
-        # Weight tying
         can_tie = self.token_embedding is not None and self.output_head is not None
         if config.tie_embeddings and can_tie:
             self.output_head.tie_weights(self.token_embedding)
 
-        # Precompute RoPE cos/sin tables — stored as plain attributes (not buffers)
-        # so model.to(bf16) doesn't cast them from float32.
-        # Skip when on meta device (no data); call init_weights_and_freqs() later.
         self._rope_cos = None
         self._rope_sin = None
         if not any(p.is_meta for p in self.parameters()):
@@ -318,11 +286,6 @@ class Transformer(nn.Module):
         counts: dict[int, dict[str, torch.Tensor]] = {}
         for name, layer in self.layers.items():
             if isinstance(layer.mlp, MoMaFFN):
-                # nn.ModuleDict.__getitem__ returns Module; cast back to the
-                # concrete expert-group type so pyright sees the
-                # ``expert_counts`` Tensor rather than ``Tensor | Module``.
-                # The cast is safe because ``MoMaFFN.__init__`` only ever
-                # writes ``ExpertChoiceMoE`` values into ``experts``.
                 counts[int(name)] = {
                     m: cast(ExpertChoiceMoE, layer.mlp.experts[m]).expert_counts
                     for m in layer.mlp.modalities
@@ -396,10 +359,6 @@ class Transformer(nn.Module):
                     "modality.output_slice is training-only; cannot be combined with kv_caches"
                 )
             if prefix_embeds is not None:
-                # If we ever allowed both, the RoPE slice below would start at
-                # start_pos (the cache's text fill level) but seq_len would
-                # include the prefix — positions would double-count the prefix
-                # at every decode step. Training-only.
                 raise ValueError(
                     "modality.prefix_embeds is training-only; cannot be combined with kv_caches"
                 )
@@ -408,15 +367,9 @@ class Transformer(nn.Module):
                     "modality.image_features is training-only; cannot be combined with kv_caches"
                 )
             if modality_ids is not None:
-                # MoT routes per-token through per-modality projections via
-                # modality_ids; KV-cache decode has no equivalent semantics
-                # (cache positions are pre-routed). Training-only for v1.
                 raise ValueError(
                     "modality.modality_ids is training-only; cannot be combined with kv_caches"
                 )
-        # modality_ids dtype/shape checks. Shape against the residual seq_len
-        # is checked downstream (when the residual is built); dtype is
-        # checked here so the error fires before any compute.
         if modality_ids is not None and modality_ids.dtype != torch.long:
             raise ValueError(
                 f"modality.modality_ids.dtype must be torch.long, got {modality_ids.dtype}"
@@ -451,31 +404,23 @@ class Transformer(nn.Module):
             if tokens is not None
             else inputs_embeds
         )
-        assert h is not None  # narrowed by the XOR check above
+        assert h is not None
 
         if prefix_embeds is not None:
-            # Cast to the text-embedding dtype so the concat does not promote.
             if prefix_embeds.dtype != h.dtype:
                 prefix_embeds = prefix_embeds.to(h.dtype)
             h = torch.cat([prefix_embeds, h], dim=1)
 
         seq_len = h.shape[1]
 
-        # Determine position offset from KV cache fill level
         start_pos = kv_caches[0].seq_len if kv_caches is not None else 0
 
-        # Slice RoPE frequencies for current positions (device transfer cached)
         if self._rope_cos.device != h.device:  # type: ignore[reportOptionalMemberAccess]
             self._rope_cos = self._rope_cos.to(h.device)  # type: ignore[reportOptionalMemberAccess]
             self._rope_sin = self._rope_sin.to(h.device)  # type: ignore[reportOptionalMemberAccess]
         cos = self._rope_cos[start_pos : start_pos + seq_len]  # type: ignore[reportOptionalSubscript]
         sin = self._rope_sin[start_pos : start_pos + seq_len]  # type: ignore[reportOptionalSubscript]
 
-        # Packed sequences under attention_backend="flex": build the sparse
-        # block-diagonal (causal-or-group) mask once here and share it across
-        # every layer, rather than the dense (B, 1, S, S) mask each Attention
-        # would otherwise rebuild. key_padding_mask (VLM video) is not folded
-        # into the BlockMask, so those batches stay on the dense SDPA path.
         block_mask = None
         if (
             (doc_ids is not None or attention_group_ids is not None)
@@ -489,23 +434,12 @@ class Transformer(nn.Module):
                     "supported for arches that prepend image tokens to the residual stream."
                 )
             if doc_ids is None:
-                # Groups without packing: one implicit document.
                 assert attention_group_ids is not None  # narrowed by the branch condition
                 doc_ids = torch.zeros_like(attention_group_ids)
             block_mask = build_doc_causal_block_mask(doc_ids, h.device, attention_group_ids)
-            # The BlockMask supersedes doc_ids / attention_group_ids; clearing
-            # them keeps the dense SDPA mask branch in Attention.forward
-            # unreachable on this path.
             doc_ids = None
             attention_group_ids = None
 
-        # MoMa path: single residual stream + shared SDPA + per-modality
-        # MoE FFN groups. modality_ids tags every position and the
-        # ``MoMaFFN`` uses these tags to dispatch tokens to per-modality
-        # expert groups (level-1 deterministic routing); within each
-        # group, expert-choice + Sigmoid routing picks experts
-        # (level-2 learned routing). EC routing is non-causal, so
-        # ``kv_caches`` is rejected upstream (training-only in v1).
         if self._moma_modalities:
             if modality_ids is None:
                 raise ValueError(
@@ -522,13 +456,6 @@ class Transformer(nn.Module):
                     h, cos, sin, modality_ids, doc_ids=doc_ids, key_padding_mask=key_padding_mask
                 )
             h = self.norm(h)
-        # MoT path: position-based image-then-text split, per-modality
-        # streams through the MoTBlock stack, single global SDPA per
-        # layer. modality_ids is required (presence + shape checked
-        # against the residual). v1 uses position-based routing; the
-        # tags are validated for shape but not value-matched against
-        # positions, so a future per-token scatter/gather can land
-        # without changing the public interface.
         elif self._mot_modalities:
             if modality_ids is None:
                 raise ValueError(
@@ -547,9 +474,6 @@ class Transformer(nn.Module):
                 "image": h[:, :t_image, :],
                 "text": h[:, t_image:, :],
             }
-            # Per-modality RoPE: each modality counts positions from 0
-            # within its own axis. Image and text share the same RoPE
-            # table since head_dim is shared.
             rope = {
                 "image": (cos[:t_image], sin[:t_image]),
                 "text": (cos[:t_text], sin[:t_text]),
@@ -557,15 +481,8 @@ class Transformer(nn.Module):
             for layer in self.layers.values():
                 streams = layer(streams, rope, key_padding_mask=key_padding_mask)
             streams = {m: self.mot_norms[m](streams[m]) for m in self._mot_modalities}
-            # Re-concat in image-then-text order to match the residual
-            # layout the rest of forward expects (output_slice + head).
             h = torch.cat([streams["image"], streams["text"]], dim=1)
         else:
-            # Transformer blocks. When the model has cross-attention layers
-            # (CrossAttentionConfig + nonzero cadence), a CrossAttentionBlock
-            # fires after text block index i iff (i+1) % _ca_cadence == 0.
-            # _ca_cadence == 0 (text-only / Joint-Decoder) makes the inner
-            # branch dead, so the JD path stays bit-equal to today's.
             ca_iter = iter(self.cross_attention_layers.values()) if self._ca_cadence else None
             for i, layer in enumerate(self.layers.values()):
                 cache = kv_caches[i] if kv_caches is not None else None
@@ -591,14 +508,11 @@ class Transformer(nn.Module):
                         if image_features.dtype != h.dtype:
                             image_features = image_features.to(h.dtype)
                         h = ca(h, image_features, image_mask)
-            # Final norm
             h = self.norm(h)
 
-        # Optional slice before the output head (training-only kwarg)
         if output_slice is not None:
             h = h[:, output_slice, :]
 
-        # Output projection
         if self.output_head is not None:
             h = self.output_head(h)
 

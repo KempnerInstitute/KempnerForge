@@ -18,7 +18,7 @@ from kempnerforge.model.moe import _HAS_GROUPED_MM, MoEMLP, build_moe
 
 pytestmark = pytest.mark.skipif(not _HAS_GROUPED_MM, reason="torch._grouped_mm not available")
 
-DTYPE = torch.bfloat16  # bf16 takes the grouped path
+DTYPE = torch.bfloat16
 DIM, HIDDEN, NUM_EXPERTS, TOP_K = 64, 128, 4, 2
 
 
@@ -60,7 +60,7 @@ def _ep(moe, x, weights, indices, gradient_scale=False):
         weights,
         indices,
         moe,
-        None,  # type: ignore[arg-type]  # no process group behind the identity all-to-all
+        None,  # type: ignore[arg-type]
         local_expert_start=0,
         num_local_experts=NUM_EXPERTS,
         ep_world_size=1,
@@ -114,7 +114,7 @@ class TestSingleRankDispatch:
         """``MoEMLP.forward`` routes through EP once ``ep_world_size > 1``."""
         moe = _moe(False).eval()
         reference = copy.deepcopy(moe)
-        moe.ep_world_size = 2  # every expert is still local, so rank 1 gets nothing
+        moe.ep_world_size = 2
         moe.num_local_experts = NUM_EXPERTS
         moe.local_expert_start = 0
 

@@ -84,6 +84,8 @@ Architecture hyperparameters and MoE knobs.
 | `moe_gradient_scale` | `bool` | `False` | per-expert gradient normalization |
 | `moe_bias_schedule` | `str` | `"constant"` | `"constant"`, `"cosine_decay"`, `"linear_warmup"` |
 | `moe_packed_experts` | `bool` | `False` | pack expert weights into one tensor per projection |
+| `moe_expert_ffn_multiplier` | `float` | `1.0` | expert FFN hidden width relative to dense (`0.5` → fine-grained) |
+| `moe_router_z_loss_weight` | `float` | `0.0` | router-logit z-loss coefficient (`0` = off) |
 
 Computed properties: `is_moe`, `head_dim`, `computed_ffn_hidden_dim`,
 `num_params_estimate`.
@@ -101,8 +103,9 @@ Training-loop hyperparameters.
 | `grad_accum_steps` | `int` | `1` | microbatches per optimizer step |
 | `grad_clip_norm` | `float` | `1.0` | `clip_grad_norm_` cap |
 | `seed` | `int` | `42` | torch/numpy/python RNG seed |
+| `data_seed` | `int \| None` | `None` | RNG seed for data and batch order; `None` → falls back to `seed` |
 | `compile_model` | `bool` | `True` | wrap the model with `torch.compile` |
-| `mixed_precision` | `"bf16" \| "fp16" \| "fp32" \| "fp8"` | `"bf16"` | master-weight dtype; `"fp8"` uses bf16 masters with fp8 compute |
+| `mixed_precision` | `"bf16" \| "fp32" \| "fp8"` | `"bf16"` | master-weight dtype; `"fp8"` uses bf16 masters with fp8 compute; `"fp16"` is rejected (no loss scaling) |
 | `activation_checkpointing` | `"none" \| "full" \| "selective"` | `"none"` | AC policy |
 | `loss_fn` | `str` | `"cross_entropy"` | `loss` registry key (or `"chunked_cross_entropy"`) |
 | `z_loss_weight` | `float` | `0.0` | logit-magnitude regularizer (PaLM uses `1e-4`) |
@@ -129,6 +132,9 @@ are shared (AdamW/Lion) or optimizer-specific.
 | `muon_momentum` | `float` | `0.95` | Muon momentum coefficient |
 | `muon_ns_steps` | `int` | `5` | Newton–Schulz iterations for Muon |
 | `muon_adam_lr` | `float \| None` | `None` | LR for 1-D params in Muon's AdamW fallback; `None` → same as `lr` |
+| `muon_nesterov` | `bool` | `False` | Orthogonalize the Nesterov look-ahead instead of the momentum buffer |
+| `muon_adjust_lr` | `"original" \| "match_rms_adamw" \| "spectral_unclamped"` | `"original"` | Factor on each orthogonalized update |
+| `muon_orthogonalize` | `"local" \| "exact"` | `"local"` | Newton–Schulz on each rank's shard, or on the full matrix |
 | `schedule_free_warmup_steps` | `int` | `0` | internal warmup for schedule-free |
 
 ## `[scheduler]` — `SchedulerConfig`
@@ -164,6 +170,9 @@ Single dataset, HuggingFace source, or mixture; optional phase schedule.
 | `hf_dataset_config` | `str \| None` | `None` | HF dataset config (e.g. `"wikitext-2-raw-v1"`) |
 | `hf_dataset_split` | `str` | `"train"` | HF split |
 | `hf_dataset_text_field` | `str` | `"text"` | field to tokenize |
+| `hf_dataset_image_field` | `str` | `"image"` | VLM only: image column |
+| `hf_dataset_prompt_field` | `str` | `""` | VLM only: prompt column (`""` = no prompt mask) |
+| `hf_image_size` | `int` | `224` | VLM only: target square image size |
 | `hf_streaming` | `bool` | `False` | use `IterableDataset` for large corpora |
 | `pack_sequences` | `bool` | `False` | document-aware packing with cross-doc isolation (feeds `doc_ids` to attention) |
 | `datasets` | `list[DatasetSource]` | `[]` | multi-dataset mixture (overrides `dataset_path`/`hf_dataset_name` when non-empty) |
@@ -226,7 +235,7 @@ Parallelism dimensions and NCCL settings.
 | `tp` | `int` | `1` | tensor parallel |
 | `pp` | `int` | `1` | pipeline parallel |
 | `pp_schedule` | `"1f1b" \| "gpipe" \| "interleaved_1f1b"` | `"1f1b"` | pipeline schedule |
-| `cp` | `int` | `1` | context parallel (stub; PyTorch 2.11 ring attention) |
+| `cp` | `int` | `1` | context parallel; reserved, not implemented, must be `1` (`cp > 1` is rejected at load) |
 | `ep` | `int` | `1` | expert parallel (MoE only) |
 | `nccl_timeout_sec` | `int` | `1800` | NCCL collective timeout |
 | `backend` | `str` | `"cpu:gloo,cuda:nccl"` | `torch.distributed` backend mapping |
@@ -249,6 +258,7 @@ DCP-based checkpointing.
 | `load_path` | `str \| None` | `None` | explicit resume path (overrides `latest` symlink) |
 | `export_dtype` | `"float32" \| "bfloat16"` | `"bfloat16"` | dtype for HF exports via `scripts/convert_checkpoint.py` |
 | `exclude_from_loading` | `list[str]` | `[]` | state keys to skip when warm-starting from `load_path` — `"model"` and/or `"optimizer"`; ignored on a resume, which always restores full state |
+| `ignore_freeze_mismatch` | `bool` | `False` | load a checkpoint whose VLM freeze metadata disagrees with the configured freeze specs, downgrading the error to a warning |
 
 ### `[checkpoint.dyn_ckpt_window]` — `DynamicCheckpointWindow`
 
@@ -300,7 +310,8 @@ of the user's module.
 
 ## `[metrics]` — `MetricsConfig`
 
-Logging cadence and backend toggles.
+Logging cadence and backend toggles. The backends are independent, so any combination can be
+enabled in one run config.
 [`kempnerforge/config/metrics.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/config/metrics.py).
 
 | Field | Type | Default | Purpose |
@@ -313,12 +324,18 @@ Logging cadence and backend toggles.
 | `wandb_run_id` | `str` | `""` | restored from checkpoint on resume; empty = new run |
 | `tensorboard_dir` | `str` | `"tb_logs"` | TB log directory |
 | `enable_mlflow` | `bool` | `False` | turn on MLflow backend (Databricks or local) |
-| `mlflow_tracking_uri` | `str` | `"databricks"` | tracking URI; backend disables if `databricks` is set without creds |
+| `mlflow_tracking_uri` | `str \| None` | `None` | tracking URI; `None` → `$MLFLOW_TRACKING_URI`, else `"databricks"`; `databricks://<profile>` selects a `~/.databrickscfg` profile |
 | `mlflow_experiment` | `str \| None` | `None` | absolute workspace path on Databricks; `None` → `$MLFLOW_EXPERIMENT`/auto |
 | `mlflow_run_name` | `str \| None` | `None` | `None` → auto-generated |
+| `mlflow_description` | `str \| None` | `None` | run description (Markdown, the `mlflow.note.content` tag), set on a new run |
+| `mlflow_tags` | `dict[str, str]` | `{}` | extra run tags, set on a new run after the automatic ones; keys and values must be non-empty strings |
 | `mlflow_run_id` | `str` | `""` | restored from checkpoint on resume; empty = new run |
 | `mlflow_log_system_metrics` | `bool` | `True` | sample CPU/GPU/memory on a background thread |
 | `mlflow_system_metrics_interval` | `float` | `10.0` | seconds between system-metric samples |
+| `mlflow_register_checkpoints` | `bool` | `False` | register each committed checkpoint as an MLflow external model on the background worker; `metadata.json` records its `model_name` at save and its `model_id` once registered; requires `enable_mlflow` |
+
+Credentials never go in config. The auth routes, the URI and experiment resolution, and the
+bounds on tracking calls are on the [MLflow backend](../metrics-and-profiling/mlflow.md) page.
 
 ## `[profiling]` — `ProfilingConfig`
 

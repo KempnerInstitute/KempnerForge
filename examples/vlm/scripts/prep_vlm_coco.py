@@ -83,16 +83,11 @@ def _build_split(caption_json: str, image_root: str, num_samples: int, split_lab
             if not img_path.exists():
                 skipped["missing"] += 1
                 continue
-            # Karpathy train rows: caption is str. Val/test rows: caption is
-            # a 5-element list. Normalize so the column is always str and
-            # surface all references separately for multi-ref eval.
             raw_caption = row["caption"]
             if isinstance(raw_caption, list):
                 references = [str(c) for c in raw_caption]
             else:
                 references = [str(raw_caption)]
-            # Val/test JSONs omit image_id; fall back to the image filename
-            # stem (e.g. COCO_val2014_000000391895), which is unique per image.
             image_id = row.get("image_id")
             if image_id is None:
                 image_id = Path(img_rel).stem
@@ -218,9 +213,6 @@ def main() -> None:
     else:
         ds = _build_split(args.caption_json, args.image_root, args.num_samples, args.split)
         ds.save_to_disk(args.out)
-        # save_to_disk writes a bare Dataset (not a DatasetDict). HuggingFaceVLMDataset
-        # accepts both via its load_from_disk path; for a bare Dataset it uses the
-        # loaded object directly, and the data.hf_dataset_split TOML field is ignored.
         print(f"Saved {len(ds):,} samples to {args.out}")
 
 

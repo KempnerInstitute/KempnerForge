@@ -92,20 +92,17 @@ class Attention(nn.Module):
         self.n_heads = n_heads
         self.n_kv_heads = n_kv_heads
         self.head_dim = head_dim or (dim // n_heads)
-        self.n_rep = n_heads // n_kv_heads  # GQA repetition factor
+        self.n_rep = n_heads // n_kv_heads
         self.sdpa_backend = sdpa_backend
 
-        # Projections
         self.q_proj = nn.Linear(dim, n_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(dim, n_kv_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(dim, n_kv_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(n_heads * self.head_dim, dim, bias=False)
 
-        # Per-head QK normalization (Gemma, DeepSeek-V3)
         self.q_norm = RMSNorm(self.head_dim, eps=norm_eps) if qk_norm else None
         self.k_norm = RMSNorm(self.head_dim, eps=norm_eps) if qk_norm else None
 
-        # Attention weight capture (analysis only — not for training)
         self.capture_attention_weights = False
         self.last_attention_weights: torch.Tensor | None = None
 
@@ -172,58 +169,34 @@ class Attention(nn.Module):
 
         batch, seq_len, _ = x.shape
 
-        # Project to Q, K, V
-        # Use -1 for head count so the view works under tensor parallelism
-        # (ColwiseParallel shards the output features, reducing the local head count)
         q = self.q_proj(x).view(batch, seq_len, -1, self.head_dim)
         k = self.k_proj(x).view(batch, seq_len, -1, self.head_dim)
         v = self.v_proj(x).view(batch, seq_len, -1, self.head_dim)
 
-        # QK-Norm: normalize Q and K per-head before RoPE (stabilizes attention logits)
         if self.q_norm is not None:
             q = self.q_norm(q)
             k = self.k_norm(k)  # type: ignore[reportOptionalCall]
 
-        # Transpose to (batch, heads, seq_len, head_dim) for SDPA
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
-        # Apply RoPE to Q and K
         q = apply_rope(q, rope_cos, rope_sin)
         k = apply_rope(k, rope_cos, rope_sin)
 
-        # Update KV cache (after RoPE, before GQA expansion)
         if kv_cache is not None:
             k, v = kv_cache.update(k, v)
 
-        # Expand KV heads for GQA: (batch, n_kv_heads, seq, dim) → (batch, n_heads, seq, dim).
-        # FlexAttention expands internally via enable_gqa, so the flex path skips
-        # materializing the repeated heads entirely.
         if self.n_rep > 1 and block_mask is None:
             k = k.repeat_interleave(self.n_rep, dim=1)
             v = v.repeat_interleave(self.n_rep, dim=1)
 
-        # Attention masking strategy:
-        # 1. Packed sequences (doc_ids provided): block-diagonal causal mask that
-        #    isolates documents from each other within a packed sequence, widened
-        #    by attention_group_ids to bidirectional spans inside a document.
-        # 2. Standard causal: needed for training and prefill (Q seq == K seq).
-        # 3. Single-token decode (seq_len=1 with KV cache): no mask needed — the
-        #    query attends to all cached positions (is_causal=True would incorrectly
-        #    restrict attention to only the first key position).
         if self.capture_attention_weights:
-            # Manual attention for weight extraction (analysis only, not for training)
             out, attn_weights = self._attention_with_weights(
                 q, k, v, seq_len, doc_ids, kv_cache, key_padding_mask, attention_group_ids
             )
             self.last_attention_weights = attn_weights.detach().cpu()
         elif block_mask is not None:
-            # Packed sequences via FlexAttention. The BlockMask already encodes
-            # the whole predicate (causal-or-group AND same-document), so
-            # doc_ids and attention_group_ids carry no extra information here.
-            # key_padding_mask is deliberately not folded in: that path
-            # (VLM video) stays on the dense SDPA mask below.
             assert kv_cache is None and key_padding_mask is None and attention_group_ids is None, (
                 "block_mask does not compose with kv_cache decode, key_padding_mask, or "
                 "attention_group_ids; those cases use the dense SDPA mask."
@@ -237,43 +210,20 @@ class Attention(nn.Module):
                 enable_gqa=self.n_rep > 1,
             )
         elif doc_ids is not None or key_padding_mask is not None or attention_group_ids is not None:
-            # An explicit attn_mask is not a FlashAttention-2 shape, so SDPA falls
-            # back to the mem-efficient/math kernel here. The image-prefix video
-            # arches (Joint-Decoder/MoMa here, MoT in mot.py) always pass a
-            # key_padding_mask (all-True when unpadded), so their self-attention
-            # always takes this branch -- losing FA2 and materializing a (B, 1, S, S)
-            # mask even for fully-decoded clips. (Cross-Attention sets no
-            # key_padding_mask on this text self-attention -- it masks padded image
-            # K/V in the cross-attention blocks instead -- so it keeps FA2 here.)
-            # Deliberate: always-masking is torch.compile / DP-friendly (one graph,
-            # no host sync). Recovering FA2 for unpadded batches (or moving to
-            # FlexAttention) is a follow-up.
-            #
-            # Asserts no kv_cache: neither doc_ids (packed training) nor
-            # key_padding_mask (VLM video) co-occurs with decode today, and this
-            # branch's full-sequence causal mask would mis-handle a cached
-            # (seq_len=1) decode rather than attend to all cached positions.
             assert kv_cache is None, (
                 "doc_ids / key_padding_mask / attention_group_ids are not supported with "
                 "kv_cache decode (would build an incorrect causal mask)."
             )
             seq_len_kv = k.shape[2]
-            # Explicit bool mask: causal OR same nonnegative group
-            # (attention_group_ids), AND same-document (doc_ids), AND valid
-            # keys (key_padding_mask, e.g. dropping padded video frames' tokens).
             causal = torch.ones(seq_len, seq_len_kv, dtype=torch.bool, device=q.device).tril()
             attn_mask = causal.unsqueeze(0).unsqueeze(0)  # (1, 1, S, S_kv)
             if attention_group_ids is not None:
                 attn_mask = attn_mask | same_group_mask(attention_group_ids)  # (B,1,S,S)
             if doc_ids is not None:
-                doc_mask = (doc_ids.unsqueeze(2) == doc_ids.unsqueeze(1)).unsqueeze(1)  # (B,1,S,S)
+                doc_mask = (doc_ids.unsqueeze(2) == doc_ids.unsqueeze(1)).unsqueeze(1)
                 attn_mask = attn_mask & doc_mask
             if key_padding_mask is not None:
                 attn_mask = attn_mask & key_padding_mask.view(batch, 1, 1, seq_len_kv)
-            # NaN guard: a query row with no reachable valid key (e.g. the leading
-            # positions of an all-padded / undecodable clip) would softmax over all
-            # -inf -> NaN. Unmask such rows; their outputs are discarded (trimmed by
-            # output_slice, or the clip's labels are all -100).
             attn_mask = attn_mask | ~attn_mask.any(dim=-1, keepdim=True)
             with self._sdpa_context():
                 out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
@@ -282,7 +232,6 @@ class Attention(nn.Module):
             with self._sdpa_context():
                 out = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
 
-        # Reshape back: (batch, n_heads, seq_len, head_dim) → (batch, seq_len, n_heads * head_dim)
         out = out.transpose(1, 2).contiguous().view(batch, seq_len, -1)
 
         return self.o_proj(out)
@@ -322,7 +271,7 @@ class Attention(nn.Module):
                 valid = valid & (doc_ids.unsqueeze(2) == doc_ids.unsqueeze(1)).unsqueeze(1)
             if key_padding_mask is not None:
                 valid = valid & key_padding_mask.view(q.shape[0], 1, 1, seq_len_kv)
-            valid = valid | ~valid.any(dim=-1, keepdim=True)  # NaN guard (see forward)
+            valid = valid | ~valid.any(dim=-1, keepdim=True)
             attn = attn.masked_fill(~valid, float("-inf"))
         elif kv_cache is None or seq_len > 1:
             causal = torch.ones(seq_len, seq_len_kv, dtype=torch.bool, device=q.device).triu(

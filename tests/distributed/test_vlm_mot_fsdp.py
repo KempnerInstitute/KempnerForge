@@ -124,9 +124,7 @@ class TestBuildAndForward:
         mesh = distributed_env
         wrapper = _build(_tiny_mot_cfg(), mesh)
         real = wrapper._orig_mod if hasattr(wrapper, "_orig_mod") else wrapper
-        # MoT extends the residual stream with num_image_tokens.
         assert real.num_image_tokens == 8
-        # Layers are MoTBlocks.
         assert all(isinstance(layer, MoTBlock) for layer in real.transformer.layers.values())
 
         pixels, ids, labels = _dummy_batch(wrapper)
@@ -137,8 +135,6 @@ class TestBuildAndForward:
     def test_fsdp_sharded_grads_flow(self, distributed_env):
         mesh = distributed_env
         wrapper = _build(_tiny_mot_cfg(), mesh)
-        # Re-init per-modality residual projections so backward exercises
-        # Q/K/V/gate/up grads (zero-init blocks gradient via the chain rule).
         with torch.no_grad():
             for layer in wrapper.transformer.layers.values():
                 for m in layer.modalities:
@@ -199,17 +195,13 @@ class TestFreezeStageUnderFsdp:
         gradient flow on the per-modality main stack. Mandatory merge gate.
         """
         mesh = distributed_env
-        cfg = _tiny_mot_cfg(freeze=[FreezeSpec("mot", True)])  # main stack frozen
+        cfg = _tiny_mot_cfg(freeze=[FreezeSpec("mot", True)])
         wrapper = _build(cfg, mesh)
-        # Re-init residual projections so the wrapper isn't identity (otherwise
-        # the unfreeze test would be uninteresting — grads would be 0 even when
-        # requires_grad=True).
         with torch.no_grad():
             for layer in wrapper.transformer.layers.values():
                 for m in layer.modalities:
                     torch.nn.init.normal_(layer.attn.o_proj[m].weight, std=0.01)
                     torch.nn.init.normal_(layer.mlp[m].down_proj.weight, std=0.01)
-        # Step 0: confirm mot stack frozen -> no grads.
         pixels, ids, labels = _dummy_batch(wrapper)
         logits, labels_out = wrapper(pixels, ids, labels)
         loss = cross_entropy_loss(logits, labels_out)
@@ -217,7 +209,6 @@ class TestFreezeStageUnderFsdp:
         for n, p in wrapper.named_parameters():
             if n.startswith("transformer.layers."):
                 assert p.grad is None, f"frozen {n} got a grad"
-        # Now unfreeze the main stack (simulating a FreezeStage transition).
         apply_freeze_specs(
             wrapper,
             [FreezeSpec("mot", False)],
@@ -229,10 +220,6 @@ class TestFreezeStageUnderFsdp:
         logits, labels_out = wrapper(pixels, ids, labels)
         loss = cross_entropy_loss(logits, labels_out)
         loss.backward()
-        # Post-unfreeze: at least one per-modality projection per layer has a
-        # grad. (Some Q/K/V projections may have zero grads at the instant
-        # we sample if the upstream o_proj.weight happens to be zero in some
-        # head, but at least one of the four projections must be non-None.)
         for n, p in wrapper.named_parameters():
             if n.startswith("transformer.layers.") and p.requires_grad:
                 assert p.grad is not None, (
@@ -275,8 +262,6 @@ class TestWarmStartUnderFsdp:
         mesh = distributed_env
         rank = dist.get_rank()
 
-        # Build a JD model with the same backbone shape, unwrap the FSDP
-        # state on rank 0 via state_dict, broadcast a CPU dict to all ranks.
         jd_cfg = (
             ModelConfig(
                 dim=64,
@@ -292,8 +277,6 @@ class TestWarmStartUnderFsdp:
         )
         jd_wrapper = _build(jd_cfg, mesh, param_dtype=torch.float32)
         jd_state_full = inner_transformer(jd_wrapper).state_dict()
-        # Materialize to CPU on every rank (FSDP returns DTensors); .full_tensor()
-        # gathers the unsharded data.
         jd_state_cpu: dict[str, torch.Tensor] = {}
         for k, v in jd_state_full.items():
             t = v.full_tensor() if hasattr(v, "full_tensor") else v
@@ -302,15 +285,13 @@ class TestWarmStartUnderFsdp:
         ckpt_path = str(Path(shared_tmp_dir) / "jd.pt")
         if rank == 0:
             torch.save(jd_state_cpu, ckpt_path)
-        dist.barrier()  # rank 1 must wait for rank 0's torch.save to complete
+        dist.barrier()
 
-        # Build a MoT model under FSDP and run the warm-start helper.
         mot_cfg = _tiny_mot_cfg(num_image_tokens=8, n_layers=2)
         mot_wrapper = _build(mot_cfg, mesh, param_dtype=torch.float32)
         source = torch.load(ckpt_path, map_location="cpu", weights_only=True)
         mot_warm_start_from_text_stack(inner_transformer(mot_wrapper), source)  # type: ignore[arg-type]
 
-        # Per-modality copies equal source dense weights (gather first).
         mot_t = inner_transformer(mot_wrapper)
         for i in range(mot_cfg[0].n_layers):
             for m in mot_t.layers[str(i)].modalities:  # type: ignore[union-attr]
@@ -329,16 +310,12 @@ class TestMoEWithMoT:
         from kempnerforge.model.moe import MoEMLP
 
         torch.manual_seed(42 + dist.get_rank())
-        # _tiny_mot_cfg returns (ModelConfig, VisionEncoderConfig, AdapterConfig, MoTConfig);
-        # destructure to mutate the ModelConfig in place before passing the tuple to _build.
         mc, vc, ac, lc = _tiny_mot_cfg(moe=True, n_layers=4, num_image_tokens=4)
-        # Bump the dim/ffn so MoE is meaningful.
         mc.dim = 128
         mc.n_heads = 4
         mc.n_kv_heads = 4
         mc.ffn_hidden_dim = 256
         wrapper = _build((mc, vc, ac, lc), distributed_env, param_dtype=torch.float32)
-        # 4 layers, frequency=2 -> layers 1, 3 have MoE per modality.
         moe_blocks = sum(
             1
             for layer in wrapper.transformer.layers.values()
@@ -383,8 +360,6 @@ class TestCheckpointRoundtrip:
         wrapper = _build(cfg, mesh)
         opt = build_optimizer(wrapper, OptimizerConfig(lr=1e-3, fused=False))
 
-        # shared_tmp_dir lives on the shared filesystem so DCP shards
-        # written by rank 0 are visible to rank 1 under multi-node srun.
         path_str = shared_tmp_dir
         rank = dist.get_rank()
 
@@ -408,7 +383,6 @@ class TestCheckpointRoundtrip:
         mgr2 = CheckpointManager(ckpt_cfg, wrapper2, opt2)
         step, _, _ = mgr2.load(path=str(path_str) + "/step_1", vlm_freeze_expected=freeze)
         assert step == 1
-        # Per-modality state-dict keys survived round-trip.
         per_modality_keys = [
             n for n, _ in wrapper2.named_parameters() if "attn.q_proj." in n or "mot_norms" in n
         ]

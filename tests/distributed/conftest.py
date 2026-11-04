@@ -19,10 +19,6 @@ import torch.distributed as dist
 from kempnerforge.config.schema import DistributedConfig
 from kempnerforge.distributed.setup import destroy_distributed, init_distributed
 
-# Tests that use shared_tmp_dir write under <repo>/.test_tmp/ instead of /tmp
-# so multi-node srun runs see the same directory on every rank. /tmp is
-# node-local and breaks DCP save/load across nodes when each rank writes its
-# shard to its own /tmp.
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _TEST_TMP = _PROJECT_ROOT / ".test_tmp"
 

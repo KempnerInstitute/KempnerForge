@@ -104,6 +104,9 @@ name = "muon"
 lr = 0.02
 muon_momentum = 0.95
 muon_ns_steps = 5
+muon_nesterov = false
+muon_adjust_lr = "original"
+muon_orthogonalize = "local"
 # muon_adam_lr omitted -> use same LR as Muon for 1D params
 weight_decay = 0.1
 betas = [0.9, 0.95]                     # used by internal AdamW for 1D params
@@ -123,10 +126,20 @@ How it decides which path each parameter takes
 
 DTensor / FSDP2 notes:
 
-- Muon's orthogonalization runs on the **local shard**, not the full
-  weight. It calls `_get_local_tensor(p)` to unwrap DTensors before
-  Newton-Schulz. Empirically fine in practice; not mathematically
-  identical to full-matrix orthogonalization.
+- `muon_orthogonalize` sets where Newton-Schulz runs on a sharded weight.
+  `"local"` (default) orthogonalizes each rank's shard on its own, after
+  `_get_local_tensor(p)` unwraps the DTensor, and takes the update scale
+  from the shard's shape. That's cheap, but its direction isn't the
+  full-matrix result and changes with the shard count, and so can its RMS
+  (see the update scale below). `"exact"` gathers each row-sharded matrix
+  onto one rank of its shard group with an all-to-all, orthogonalizes the
+  full matrix there and scatters the result back, and takes the scale from
+  the full matrix's shape. The update is then bitwise what one process
+  would compute, and each matrix's work runs once, spread across the group.
+  Other sharded layouts, such as tensor parallel, are all-gathered. The
+  cost is two all-to-alls per group of matrices per step. A resume keeps
+  the mode the checkpoint was saved with, and a checkpoint saved before
+  the option existed resumes with `"local"`.
 - Momentum buffers match the parameter dtype (`torch.zeros_like(p.grad)`),
   so DCP serializes them correctly on resume.
 - The internal AdamW's parameters are not in Muon's `param_groups`, so
@@ -136,6 +149,31 @@ DTensor / FSDP2 notes:
 - `muon_adam_lr` unset (default) makes the internal AdamW use the same
   LR as Muon. Pass a smaller value (e.g. `muon_adam_lr = 1e-4`) if you
   want 1D params on a gentler schedule.
+
+Momentum and update scale:
+
+- `muon_nesterov = true` orthogonalizes the Nesterov look-ahead `g + μ·buf`
+  instead of the momentum buffer `buf` -- the default of Keller Jordan's
+  reference implementation and `torch.optim.Muon`.
+- `muon_adjust_lr` sets the factor on each orthogonalized `rows × cols` update:
+  `"original"` (default) `sqrt(max(1, rows/cols))`; `"match_rms_adamw"`
+  `0.2·sqrt(max(rows, cols))`, which gives every matrix an AdamW-like update RMS
+  so AdamW's `lr` and `weight_decay` carry over; `"spectral_unclamped"`
+  `sqrt(rows/cols)`, Bernstein's spectral scale without the clamp at 1. The
+  first two are also `torch.optim.Muon`'s `adjust_lr_fn` names; torch accepts
+  `"spectral_unclamped"` only from 2.14 on.
+- `rows × cols` is the matrix Newton-Schulz ran on: each rank's shard under
+  `muon_orthogonalize = "local"`, the full weight under `"exact"`, which gives
+  the unsharded update in every mode. Under `"local"` the update's RMS
+  therefore depends on the sharding: whether the weight is split by rows or
+  by columns, into how many shards, and the momentum's rank. For example,
+  tensor parallelism's row-wise layers (`o_proj`, `down_proj`) split the
+  weight by columns, and over `N` such shards `"original"` raises a full-rank
+  momentum's update RMS by about `sqrt(N)`. Use `"exact"` when the update's
+  RMS has to match the unsharded run.
+- A resume keeps the `muon_nesterov` and `muon_adjust_lr` the checkpoint was
+  saved with, and a checkpoint saved before the options existed resumes with
+  `false` and `"original"`.
 
 Newton-Schulz coefficients (hard-coded): `a = 3.4445, b = -4.7750, c =
 2.0315`, Frobenius-normalized input — standard values from the Muon
