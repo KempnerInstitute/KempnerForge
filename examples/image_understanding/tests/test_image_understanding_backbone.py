@@ -45,9 +45,14 @@ def test_backbone_matches_the_source(config: JobConfig) -> None:
         "vocab_size": model.vocab_size,
         "rms_norm_eps": model.norm_eps,
         "rope_theta": model.rope_theta,
-        "tie_word_embeddings": model.tie_embeddings,
         "hidden_act": str(model.activation),
-    } == SOURCE
+    } == {k: v for k, v in SOURCE.items() if k != "tie_word_embeddings"}
+
+
+def test_the_output_head_is_untied_from_the_tied_source(config: JobConfig) -> None:
+    """The converter fills the untied head from the source's embedding."""
+    assert SOURCE["tie_word_embeddings"] is True
+    assert config.model.tie_embeddings is False
 
 
 def test_attention_is_wider_than_the_model(config: JobConfig) -> None:

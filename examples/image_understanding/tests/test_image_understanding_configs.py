@@ -106,7 +106,7 @@ def test_stage1_trains_the_vision_side_only() -> None:
     assert config.vlm is not None
     assert [(s.module, s.frozen) for s in config.vlm.freeze] == [("transformer", True)]
     assert config.checkpoint.load_path == "path-to-init-checkpoint"
-    assert config.checkpoint.exclude_from_loading == ["optimizer"]
+    assert config.checkpoint.exclude_from_loading == ["optimizer", "train_state"]
 
 
 def test_stage2_trains_everything_from_a_stage1_checkpoint() -> None:
@@ -114,7 +114,7 @@ def test_stage2_trains_everything_from_a_stage1_checkpoint() -> None:
     assert config.vlm is not None
     assert config.vlm.freeze == []
     assert config.checkpoint.load_path == "path-to-stage1-checkpoint"
-    assert config.checkpoint.exclude_from_loading == ["optimizer"]
+    assert config.checkpoint.exclude_from_loading == ["optimizer", "train_state"]
 
 
 @pytest.mark.parametrize(("stage", "precision"), [(1, "fp32"), (2, "bf16")])

@@ -1413,6 +1413,51 @@ class TestSaveCheckpointRegistration:
         ]
 
 
+class TestWeightsOnlyWarmStart:
+    def _saved(self, tmp_path, monkeypatch, freeze):
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        sched = torch.optim.lr_scheduler.StepLR(mgr.checkpointed_optimizers[0], step_size=1)
+        sched.step()
+        sched.step()
+        mgr.save(step=9, tokens_seen=900, scheduler=sched, extra={"vlm_freeze": freeze})
+        return tmp_path / "step_9"
+
+    def test_train_state_is_skipped(self, tmp_path, monkeypatch):
+        from unittest.mock import MagicMock
+
+        ckpt_dir = self._saved(tmp_path, monkeypatch, _freeze_meta(("vision_encoder", True)))
+        assert (ckpt_dir / "train_state.pt").exists()
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        sched = torch.optim.lr_scheduler.StepLR(mgr.checkpointed_optimizers[0], step_size=1)
+        loader = MagicMock(spec=["load_state_dict"])
+        step, tokens, extra = mgr.load(
+            path=str(ckpt_dir),
+            scheduler=sched,
+            dataloader=loader,
+            exclude_keys=["optimizer", "train_state"],
+        )
+        assert (step, tokens, extra) == (0, 0, {})
+        assert sched.last_epoch == 0
+        loader.load_state_dict.assert_not_called()
+        assert mgr._pending_dataloader_state is None
+
+    def test_freeze_comparison_is_skipped(self, tmp_path, monkeypatch):
+        ckpt_dir = self._saved(tmp_path, monkeypatch, _freeze_meta(("vision_encoder", True)))
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        step, _, _ = mgr.load(
+            path=str(ckpt_dir),
+            exclude_keys=["train_state"],
+            vlm_freeze_expected=_freeze_meta(("vision_encoder", False)),
+        )
+        assert step == 0
+
+    def test_without_the_key_the_train_state_is_restored(self, tmp_path, monkeypatch):
+        ckpt_dir = self._saved(tmp_path, monkeypatch, _freeze_meta(("vision_encoder", True)))
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        step, tokens, _ = mgr.load(path=str(ckpt_dir), exclude_keys=["optimizer"])
+        assert (step, tokens) == (9, 900)
+
+
 class TestLoadVLMFreezeCompare:
     def test_match_passes(self, tmp_path, monkeypatch):
         mgr = _make_mock_mgr(tmp_path, monkeypatch)

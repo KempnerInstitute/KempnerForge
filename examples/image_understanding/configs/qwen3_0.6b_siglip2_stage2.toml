@@ -3,8 +3,9 @@
 # instruction mixture, warm-started from a stage-1 checkpoint.
 #
 # Same geometry as stage 1 (one 512 px view, 256 visual + 256 text tokens).
-# The recipe's tiling, document packing, chat-template rendering and
-# answer-only loss are not in core yet; see the README's roadmap.
+# The recipe's tiling, document packing and chat-template rendering with the
+# loss on the assistant turns only are not in core yet (core masks one prompt
+# field per row via data.hf_dataset_prompt_field); see the README's roadmap.
 #
 # Target: 16 GPUs, global batch 512, 90k steps.
 #
@@ -26,7 +27,7 @@ norm_eps = 1e-6
 activation = "silu"
 qk_norm = true
 rope_theta = 1000000.0
-tie_embeddings = true
+tie_embeddings = false
 max_seq_len = 512
 
 [vision_encoder]
@@ -82,7 +83,7 @@ dp_shard = -1
 [checkpoint]
 dir = "path-to-output-dir"
 load_path = "path-to-stage1-checkpoint"
-exclude_from_loading = ["optimizer"]
+exclude_from_loading = ["optimizer", "train_state"]
 interval = 5000
 keep_last_n = 2
 async_mode = "async"

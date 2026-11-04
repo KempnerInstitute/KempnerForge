@@ -4,7 +4,8 @@
 #
 # Warm-started from the checkpoint examples/vlm/scripts/convert_hf_backbone.py
 # writes for this config (pretrained backbone and vision encoder, fresh
-# connector).
+# connector, and an output head that starts as a copy of the tied source's
+# embedding and trains on its own).
 #
 # Token budget: 512 px / 16 px patches = 32x32 = 1024 patch tokens, pooled
 # 2x2 to 256 visual tokens, plus max_text_len = 256 text tokens = 512.
@@ -29,7 +30,7 @@ norm_eps = 1e-6
 activation = "silu"
 qk_norm = true
 rope_theta = 1000000.0
-tie_embeddings = true
+tie_embeddings = false
 max_seq_len = 512
 
 [vision_encoder]
@@ -85,7 +86,7 @@ dp_shard = -1
 [checkpoint]
 dir = "path-to-output-dir"
 load_path = "path-to-init-checkpoint"
-exclude_from_loading = ["optimizer"]
+exclude_from_loading = ["optimizer", "train_state"]
 interval = 5000
 keep_last_n = 2
 async_mode = "async"

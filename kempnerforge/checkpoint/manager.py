@@ -768,7 +768,12 @@ class CheckpointManager:
                 or the ``latest`` symlink.
             scheduler: LR scheduler to restore.
             dataloader: Stateful dataloader to restore.
-            exclude_keys: DCP state keys to skip (e.g., ["optimizer"] for fine-tuning).
+            exclude_keys: State to skip: the DCP keys ``"model"`` and
+                ``"optimizer"`` (e.g. ``["optimizer"]`` for fine-tuning), and
+                ``"train_state"`` for a weights-only warm start that ignores
+                ``train_state.pt`` (step, token count, scheduler, dataloader
+                position, RNG) and the saved freeze metadata, so the new run
+                starts at step 0 with its own schedule, data order and freeze.
             vlm_freeze_expected: Canonical freeze metadata (output of
                 ``canonical_freeze_meta``) for the current run's VLMConfig.
                 When both the saved metadata and this argument are set,
@@ -795,8 +800,9 @@ class CheckpointManager:
             ckpt_dir = self._resolve_dcp_load_dir(ckpt_dir, path)
 
         logger.info(f"Loading checkpoint: {ckpt_dir}")
+        load_train_state = exclude_keys is None or "train_state" not in exclude_keys
 
-        if vlm_freeze_expected is not None:
+        if vlm_freeze_expected is not None and load_train_state:
             metadata_path = ckpt_dir / _METADATA_FILE
             if metadata_path.exists():
                 try:
@@ -901,7 +907,12 @@ class CheckpointManager:
         else:
             train_state_exists = train_state_path.exists()
 
-        if train_state_exists:
+        if train_state_exists and not load_train_state:
+            logger.info(
+                f"Weights-only warm start from {ckpt_dir}: its step, schedule, data position "
+                "and RNG are not restored"
+            )
+        if train_state_exists and load_train_state:
             train_state = (
                 _load_train_state(train_state_path)
                 if self._rank == 0 or not dist.is_initialized()
