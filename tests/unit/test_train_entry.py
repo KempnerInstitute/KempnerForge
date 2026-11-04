@@ -1115,6 +1115,34 @@ class TestNanSkippedStep:
         assert (tmp_path / "step_4" / ".metadata").is_file()
         assert (tmp_path / "latest").resolve() == (tmp_path / "step_4").resolve()
 
+    def test_weights_are_checked_only_for_a_shutdown_on_a_skipped_step(self, monkeypatch):
+        """The check is a collective pass over every weight, so no other step runs it."""
+        import kempnerforge.training.loop as loop
+
+        checks: list[int] = []
+
+        def counting_check(model: nn.Module, device: torch.device) -> bool:
+            checks.append(1)
+            return True
+
+        monkeypatch.setattr(loop, "params_are_finite", counting_check)
+
+        def run(shutdown_after: int | None) -> tuple[list[int], int]:
+            checks.clear()
+            ckpt = FakeCheckpointManager()
+            session = make_session(
+                make_config(max_steps=4),
+                checkpointer=ckpt,
+                step_fn=_nan_on({1}),
+                shutdown_handler=FakeShutdownHandler(after_steps=shutdown_after),
+            )
+            run_training_loop(session)
+            return ckpt.saved_steps, len(checks)
+
+        assert run(None) == ([4], 0)
+        assert run(3) == ([3], 0)
+        assert run(2) == ([2], 1)
+
 
 def _stub_entry(monkeypatch, model: nn.Module) -> FakeCheckpointManager:
     """Replace every phase run_training builds so the orchestration runs on CPU."""
