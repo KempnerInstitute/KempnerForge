@@ -38,8 +38,6 @@ logger = get_logger(__name__)
 LossFn = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
 
 
-# Seconds to wait on a worker after SIGKILL before giving up on it. SIGKILL
-# cannot be caught, so this only covers the kernel reaping the process.
 _WORKER_KILL_TIMEOUT_S = 5.0
 
 
@@ -103,17 +101,10 @@ class BatchStream:
         loader = self.pipeline.dataloader
         if loader is None:
             return
-        # StatefulDataLoader wraps a torch DataLoader; a plain loader is itself.
         inner = getattr(loader, "_dataloader", loader)
         iterator = getattr(inner, "_iterator", None)
         if iterator is not None and hasattr(iterator, "_shutdown_workers"):
             iterator._shutdown_workers()
-            # Backstop. The sentinel drain above is the clean path, but these
-            # workers ignore SIGTERM by design, so `terminate()` cannot reap one
-            # that failed to take the sentinel -- only SIGKILL, which cannot be
-            # ignored. Without this, a single stuck worker blocks interpreter
-            # exit forever, which is the failure this shield would otherwise
-            # reintroduce by removing the usual way out.
             for worker in getattr(iterator, "_workers", ()):
                 if worker.is_alive():
                     worker.kill()
@@ -129,10 +120,6 @@ class BatchStream:
             return next(self._iter)
         except StopIteration:
             pass
-        # Epoch boundary: take a fresh iterator. A second StopIteration means
-        # this rank's shard is empty, which would otherwise escape as a bare
-        # StopIteration and leave the other ranks blocked in the next
-        # collective until the process-group timeout.
         self._iter = iter(self.dataloader)
         self._source = self.dataloader
         try:
@@ -197,11 +184,6 @@ class TrainingSession:
         return self._batch_stream
 
 
-# ---------------------------------------------------------------------------
-# Step bodies
-# ---------------------------------------------------------------------------
-
-
 def clip_grads(model: torch.nn.Module, max_norm: float, pp_group: Any = None) -> float:
     grad_norm = clip_grad_norm_(model, max_norm, pp_group=pp_group)
     return grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
@@ -229,11 +211,9 @@ def pipeline_step(session: TrainingSession, step: int) -> StepResult:
     model = session.model
     batches = session.batches
     pipeline = session.pipeline
-    if pipeline is None:  # select_step_fn only picks this body when pp > 1
+    if pipeline is None:
         raise RuntimeError("pipeline_step requires TrainingSession.pipeline")
 
-    # Collect microbatches into a full batch for the schedule.
-    # schedule.step() splits along dim 0 into n_microbatches.
     input_ids_list, labels_list, doc_ids_list = [], [], []
     for _ in range(tc.grad_accum_steps):
         if batches.has_data:
@@ -252,16 +232,8 @@ def pipeline_step(session: TrainingSession, step: int) -> StepResult:
 
     full_input = torch.cat(input_ids_list, dim=0)
     full_labels = torch.cat(labels_list, dim=0)
-    # Packed runs pass doc_ids as a schedule *kwarg*. Positional args reach only
-    # stage 0, but kwargs are handed to every stage, and both are split into
-    # micro-batches the same way -- so alignment with the tokens is automatic and
-    # doc_ids never becomes an activation the backward pass tries to grade.
     pp_kwargs = {"doc_ids": torch.cat(doc_ids_list, dim=0)} if doc_ids_list else {}
 
-    # The schedule handles forward/backward for all microbatches.
-    # First stage needs input; last stage needs target for loss.
-    # schedule.step() returns model output; losses are collected via the
-    # losses= output parameter (list populated by the schedule).
     is_first = pipeline.rank == 0
     is_last = pipeline.rank == pipeline.size - 1
     pp_losses: list[torch.Tensor] = []
@@ -273,7 +245,6 @@ def pipeline_step(session: TrainingSession, step: int) -> StepResult:
     else:
         pipeline.schedule.step(**pp_kwargs)
 
-    # Loss is only meaningful on the last stage
     if is_last and pp_losses:
         avg_loss = sum(loss.item() for loss in pp_losses) / len(pp_losses)
     else:
@@ -308,7 +279,6 @@ def vlm_step(session: TrainingSession, step: int) -> StepResult:
         pixel_values = batch["pixel_values"].to(device)
         input_ids = batch["input_ids"].to(device)
         labels = batch["labels"].to(device)
-        # Video batches carry a per-frame validity mask; image batches do not.
         frame_mask = batch["frame_mask"].to(device) if "frame_mask" in batch else None
 
         with maybe_no_sync(model, micro_step, tc.grad_accum_steps):
@@ -365,7 +335,6 @@ def text_step(session: TrainingSession, step: int) -> StepResult:
             logits = model(input_ids, doc_ids=doc_ids)
             loss = session.loss_fn(logits, labels)
 
-            # Per-dataset metrics (before backward, while logits are fresh)
             if mixture_dataset is not None and "dataset_idx" in batch:
                 ds_idx = batch["dataset_idx"]
                 with torch.no_grad():
@@ -409,11 +378,6 @@ def select_step_fn(config: JobConfig) -> StepFn:
     return text_step
 
 
-# ---------------------------------------------------------------------------
-# The loop
-# ---------------------------------------------------------------------------
-
-
 def checkpoint_extra(config: JobConfig, step: int, phases: PhaseState) -> dict:
     """Metadata saved alongside every checkpoint so a resume is exact.
 
@@ -426,7 +390,7 @@ def checkpoint_extra(config: JobConfig, step: int, phases: PhaseState) -> dict:
     if config.metrics.mlflow_run_id:
         extra["mlflow_run_id"] = config.metrics.mlflow_run_id
     if config.is_vlm:
-        assert config.vlm is not None  # narrowed by is_vlm
+        assert config.vlm is not None
         extra["vlm_freeze"] = freeze_meta_at_step(step, config.vlm)
     return extra
 
@@ -448,11 +412,6 @@ def _log_periodic_metrics(session: TrainingSession, result: StepResult, step: in
             moe_metrics["moe/expert_balance"] = (all_counts.min() / all_counts.max()).item()
         tracker.log_eval(moe_metrics, step)
 
-    # VLM per-step text-token count (excludes image prefix, -100 pad, and
-    # masked prompt tokens). Logged separately from tokens_in_step which
-    # still reports sequence positions processed. The counter is DP-local
-    # on each rank, so all-reduce it to the global text-token count
-    # before logging.
     if config.is_vlm:
         if result.text_tokens is None:
             raise RuntimeError(
@@ -541,10 +500,6 @@ def run_training_loop(
     if prof is not None:
         prof.start()
 
-    # Capture the initial weights (step 0) on fresh start when the
-    # dyn_ckpt_window covers step 0 -- the per-step save gate only runs
-    # after a training step completes, so without this the random init
-    # is never persisted. Skipped on resume (step > 0).
     if step == 0 and config.checkpoint.is_dynamic_milestone(0):
         ckpt_mgr.save(
             step=0,
@@ -556,19 +511,15 @@ def run_training_loop(
         hooks.on_checkpoint_save(0, config.checkpoint.dir)
 
     completed_normally = False
-    # Only read when completed_normally, i.e. after at least one full
-    # iteration has assigned it.
     ckpt_extra: dict = {}
 
     try:
         while step < tc.max_steps:
-            # Refresh data iterator at start / epoch boundary
             session.batches.ensure_started()
 
             tracker.start_step()
             result = session.step_fn(session, step)
 
-            # NaN check
             if not session.nan_detector.check_loss(result.loss, step):
                 optimizer.zero_grad()
                 if session.nan_detector.should_rollback:
@@ -577,11 +528,9 @@ def run_training_loop(
                 step += 1
                 continue
 
-            # Optimizer step
             optimizer.step()
             scheduler.step()
 
-            # Phase LR scaling (applied after scheduler computes base LR)
             if phases.lr_scale != 1.0:
                 for pg in optimizer.param_groups:
                     pg["lr"] *= phases.lr_scale
@@ -594,12 +543,9 @@ def run_training_loop(
 
             _apply_freeze_stages(session, step)
 
-            # Phase transition check — a fired phase forces a data iterator
-            # refresh so the new sampler weights take effect.
             if advance_phases(phases, data, step):
                 session.batches.reset()
 
-            # Metrics (report LR after phase scaling)
             current_lr = optimizer.param_groups[0]["lr"]
             step_metrics = tracker.end_step(
                 step=step,
@@ -624,7 +570,6 @@ def run_training_loop(
             if step_metrics is not None:
                 _log_periodic_metrics(session, result, step)
 
-            # Periodic NCCL health check
             if (
                 tc.nccl_health_check_interval > 0
                 and step % tc.nccl_health_check_interval == 0
@@ -633,7 +578,6 @@ def run_training_loop(
                 logger.error(f"NCCL health check failed at step {step} — stopping")
                 break
 
-            # Eval
             if (
                 eval_config.enabled
                 and session.eval_dataloader is not None
@@ -654,11 +598,9 @@ def run_training_loop(
                 tracker.log_eval(eval_metrics, step)
                 hooks.on_eval_end(eval_metrics, step)
 
-            # Advance profiler schedule
             if prof is not None:
                 prof.step()
 
-            # Checkpoint
             ckpt_extra = checkpoint_extra(config, step, phases)
             saved_this_step = config.checkpoint.should_save(step)
             if saved_this_step:
@@ -671,7 +613,6 @@ def run_training_loop(
                 )
                 hooks.on_checkpoint_save(step, config.checkpoint.dir)
 
-            # Graceful shutdown
             if session.shutdown_handler.should_shutdown():
                 if saved_this_step:
                     logger.warning(
@@ -693,23 +634,14 @@ def run_training_loop(
                 session.shutdown_handler.finish()
                 break
 
-            # Clean-completion marker for the unconditional final save after the
-            # loop. Only reached when training completes without any errors, e.g.,
-            # no NaN/NCCL/shutdown breaks. If a run encounters a NaN, the last step
-            # is intentionally *not* saved because the actual model state would be
-            # `max_steps - 1`, not `max_steps`.
             if step >= tc.max_steps:
                 completed_normally = True
 
     finally:
-        # Only rank-local work belongs here. A collective on the exception path
-        # would rendezvous against ranks still in the loop, turning a
-        # rank-local crash into an all-rank hang until the NCCL watchdog fires.
         if prof is not None:
             prof.stop()
             if runtime.rank == 0:
                 print_profiler_summary(prof, trace_dir=config.profiling.trace_dir)
-        # Dataloader workers ignore SIGTERM, so nothing else will reap them.
         session.batches.close()
 
     if completed_normally and not config.checkpoint.should_save(step):
@@ -722,10 +654,6 @@ def run_training_loop(
         )
         hooks.on_checkpoint_save(step, config.checkpoint.dir)
 
-    # Flush any pending async checkpoint before tearing down process group.
-    # `wait()` ends in a barrier, so it stays on the normal path; an
-    # interrupted save is already guarded by the DCP completion marker and
-    # the deferred `latest` commit.
     ckpt_mgr.wait()
 
     logger.info(f"Training complete: {step} steps, {tokens_seen:,} tokens")

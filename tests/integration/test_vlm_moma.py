@@ -118,18 +118,12 @@ class TestBuildAndForward:
         cfg = _tiny_moma_configs()
         wrapper = _build(cfg)
         assert isinstance(wrapper, VLMWrapper)
-        # MoMa uses the JD/MoT image-prefix residual layout.
         assert wrapper.num_image_tokens == 8
-        # All layers are MoMaBlocks.
         assert all(isinstance(layer, MoMaBlock) for layer in wrapper.transformer.layers.values())
 
         pixels, input_ids, labels = _dummy_batch(wrapper)
         logits, _ = wrapper(pixels, input_ids, labels)
-        # output_slice trims the 8 image positions; logits cover text_len positions.
         assert logits.shape == (2, 16, cfg[0].vocab_size)
-        # Backward — depth-scaled init on o_proj / down_proj leaves nonzero
-        # values (unlike MoT's identity-at-construction), so gradients flow
-        # without per-modality re-init.
         loss = logits.float().sum()
         loss.backward()
         adapter_grads = [
@@ -154,16 +148,11 @@ class TestBuildAndForward:
         wrapper = _build(cfg)
         trainable = {name for name, p in wrapper.named_parameters() if p.requires_grad}
         frozen = {name for name, p in wrapper.named_parameters() if not p.requires_grad}
-        # All transformer.layers params are frozen.
         for n in frozen:
             if n.startswith("transformer."):
                 assert n.startswith("transformer.layers."), n
-        # transformer.norm (final norm) is trainable for MoMa (unlike MoT, which
-        # replaces it with mot_norms and freezes self.norm).
         assert "transformer.norm.weight" in trainable
-        # Adapter is trainable.
         assert any(n.startswith("adapter") for n in trainable)
-        # Sanity: at least one MoE gate is frozen.
         assert any("mlp.experts" in n and "router.gate" in n for n in frozen)
 
     def test_image_features_dtype_propagation(self):
@@ -216,7 +205,6 @@ class TestModalityDispatch:
         with torch.no_grad():
             logits_full, _ = wrapper(pixels, input_ids)
 
-        # Zero every text expert's down_proj across all layers.
         with torch.no_grad():
             for layer in wrapper.transformer.layers.values():
                 for expert in layer.mlp.experts["text"].experts:
@@ -224,9 +212,6 @@ class TestModalityDispatch:
         with torch.no_grad():
             logits_text_off, _ = wrapper(pixels, input_ids)
 
-        # All logits are over the text-only tail (output_slice trims image
-        # prefix), so the entire output is a text view — different text
-        # experts -> different output.
         assert not torch.allclose(logits_full, logits_text_off)
 
     def test_image_experts_only_affect_image_positions(self):
@@ -301,17 +286,14 @@ class TestFreezeStageHook:
             p for n, p in wrapper.named_parameters() if n.startswith("transformer.layers.")
         ]
 
-        # Step 0: layers trainable.
         for p in layer_params:
             assert p.requires_grad
 
-        # Step 3: layers frozen.
         specs = effective_freeze(3, cfg[3].freeze, cfg[3].freeze_schedule)  # type: ignore[union-attr]
         apply_freeze_specs(wrapper, specs, cfg[3].module_patterns)  # type: ignore[union-attr]
         for p in layer_params:
             assert not p.requires_grad
 
-        # Step 7: layers trainable again.
         specs = effective_freeze(7, cfg[3].freeze, cfg[3].freeze_schedule)  # type: ignore[union-attr]
         apply_freeze_specs(wrapper, specs, cfg[3].module_patterns)  # type: ignore[union-attr]
         for p in layer_params:

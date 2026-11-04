@@ -31,9 +31,6 @@ from PIL import Image
 
 lmms_eval = pytest.importorskip("lmms_eval")
 if getattr(lmms_eval, "__file__", None) is None:
-    # The unit conftest injects a fake lmms_eval (a bare module with no __file__);
-    # these DCP-roundtrip tests need the real package, so skip rather than bind the
-    # fake (mirrors test_lmms_eval_contract.py).
     pytest.skip("fake lmms_eval is active; skipping real-package tests", allow_module_level=True)
 
 from lmms_adapter import KempnerForgeVLM  # noqa: E402
@@ -60,15 +57,11 @@ class _MockTokenizer:
 def test_dcp_roundtrip_generate_until(tmp_path, tiny_vlm_configs, monkeypatch):
     mc, vc, ac, lc = tiny_vlm_configs
 
-    # Build a tiny VLM and save it as a DCP checkpoint (single process).
     torch.manual_seed(0)
     model = build_vlm_wrapper(mc, vc, ac, lc).eval()
     ckpt_dir = tmp_path / "step_0"
     dcp.save({"model": model.state_dict()}, checkpoint_id=str(ckpt_dir))
 
-    # A matching JobConfig the loader will rebuild from. Patch _load_config to
-    # return it (config TOML parsing is covered by the config tests) and patch
-    # the tokenizer builder to avoid an HF download.
     job_config = JobConfig(
         model=mc, vision_encoder=vc, adapter=ac, vlm=lc, data=DataConfig(tokenizer_path="mock")
     )
@@ -79,8 +72,6 @@ def test_dcp_roundtrip_generate_until(tmp_path, tiny_vlm_configs, monkeypatch):
         config="ignored", checkpoint=str(ckpt_dir), device="cpu", dtype="float32", batch_size=2
     )
 
-    # Two synthetic single-image requests with different prompt lengths, decoded
-    # as one right-padded batch (batch_size=2), mirroring the chat 6-tuple.
     img = Image.new("RGB", (8, 8), color=(120, 120, 120))
 
     def doc_to_messages(doc):
@@ -112,7 +103,7 @@ def test_dcp_roundtrip_generate_until(tmp_path, tiny_vlm_configs, monkeypatch):
     outputs = vlm.generate_until(instances)
     assert isinstance(outputs, list) and len(outputs) == 2
     assert all(isinstance(o, str) for o in outputs)
-    assert all(len(o.split()) == 3 for o in outputs)  # greedy emits exactly max_new_tokens
+    assert all(len(o.split()) == 3 for o in outputs)
 
 
 def test_dcp_roundtrip_video_generate_until(tmp_path, tiny_video_configs, monkeypatch):
@@ -138,7 +129,6 @@ def test_dcp_roundtrip_video_generate_until(tmp_path, tiny_video_configs, monkey
     )
     monkeypatch.setattr("lmms_adapter._load_config", lambda _path: job_config)
     monkeypatch.setattr("lmms_adapter.build_tokenizer", lambda _path: _MockTokenizer())
-    # Stub video decode so the test needs no av / no real video file.
     frames = [Image.new("RGB", (8, 8), color=(120, 120, 120)) for _ in range(2)]
     monkeypatch.setattr("lmms_adapter.decode_video_frames", lambda path, **kw: frames)
 
@@ -179,7 +169,7 @@ def test_dcp_roundtrip_video_generate_until(tmp_path, tiny_video_configs, monkey
     outputs = vlm.generate_until(instances)
     assert isinstance(outputs, list) and len(outputs) == 2
     assert all(isinstance(o, str) for o in outputs)
-    assert all(len(o.split()) == 3 for o in outputs)  # greedy emits exactly max_new_tokens
+    assert all(len(o.split()) == 3 for o in outputs)
 
 
 @pytest.mark.skipif(
@@ -195,7 +185,7 @@ def test_real_task_via_simple_evaluate():
 
     results = simple_evaluate(
         model=KempnerForgeVLM(config=config, checkpoint=checkpoint),
-        model_args=f"config={config},checkpoint={checkpoint}",  # record-only
+        model_args=f"config={config},checkpoint={checkpoint}",
         tasks=[task],
         limit=2,
     )

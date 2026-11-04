@@ -7,10 +7,6 @@ import torch
 from kempnerforge.config.job import JobConfig
 from kempnerforge.training.hooks import HookRunner, StepContext, TrainingHook
 
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
-
 
 def _make_ctx(step: int = 1, loss: float = 1.0) -> StepContext:
     model = torch.nn.Linear(4, 4)
@@ -24,11 +20,6 @@ def _make_ctx(step: int = 1, loss: float = 1.0) -> StepContext:
         model=model,
         optimizer=optimizer,
     )
-
-
-# ---------------------------------------------------------------------------
-# HookRunner dispatch
-# ---------------------------------------------------------------------------
 
 
 class TestHookRunner:
@@ -74,11 +65,6 @@ class TestHookRunner:
         assert runner.hooks == []
 
 
-# ---------------------------------------------------------------------------
-# StepContext
-# ---------------------------------------------------------------------------
-
-
 class TestStepContext:
     def test_ctx_fields(self):
         ctx = _make_ctx(step=42, loss=2.5)
@@ -94,11 +80,6 @@ class TestStepContext:
         ctx = _make_ctx()
         params = list(ctx.model.parameters())
         assert len(params) > 0
-
-
-# ---------------------------------------------------------------------------
-# TrainingHook base class
-# ---------------------------------------------------------------------------
 
 
 class TestTrainingHook:
@@ -123,11 +104,6 @@ class TestTrainingHook:
         runner.on_step_end(_make_ctx())
         runner.on_eval_end({}, step=1)
         assert call_log == ["step"]
-
-
-# ---------------------------------------------------------------------------
-# All event types fire
-# ---------------------------------------------------------------------------
 
 
 class TestAllEvents:

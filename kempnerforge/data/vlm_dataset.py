@@ -32,8 +32,6 @@ from torch.utils.data import Dataset
 
 logger = logging.getLogger(__name__)
 
-# SigLIP-style normalization defaults; pass explicit mean/std if your
-# vision encoder was trained with CLIP normalization.
 DEFAULT_IMAGE_MEAN = (0.5, 0.5, 0.5)
 DEFAULT_IMAGE_STD = (0.5, 0.5, 0.5)
 
@@ -64,8 +62,8 @@ def pil_to_tensor(
     img = img.convert("RGB").resize((image_size, image_size), Image.Resampling.BILINEAR)
     import numpy as np
 
-    arr = np.asarray(img, dtype=np.float32) / 255.0  # (H, W, 3)
-    t = torch.from_numpy(arr).permute(2, 0, 1).contiguous()  # (3, H, W)
+    arr = np.asarray(img, dtype=np.float32) / 255.0
+    t = torch.from_numpy(arr).permute(2, 0, 1).contiguous()
     mean_t = torch.tensor(mean, dtype=t.dtype).view(3, 1, 1)
     std_t = torch.tensor(std, dtype=t.dtype).view(3, 1, 1)
     return (t - mean_t) / std_t
@@ -158,9 +156,6 @@ def _tokenize_and_mask(
         full_ids = list(tokenizer(text, add_special_tokens=False)["input_ids"])
         prompt_len = 0
 
-    # Append EOS so the last caption token is trained to predict a stop token
-    # (captions use add_special_tokens=False, so none is added otherwise);
-    # reserve its slot within max_text_len. Skip when the tokenizer has no EOS.
     eos_id = tokenizer.eos_token_id
     if eos_id is not None:
         full_ids = full_ids[: max_text_len - 1] + [eos_id]
@@ -174,9 +169,6 @@ def _tokenize_and_mask(
     if n > 0:
         ids_tensor = torch.tensor(full_ids, dtype=torch.long)
         input_ids[:n] = ids_tensor
-        # Next-token targets: position i predicts token i+1; the last real token
-        # has no successor, and positions that would predict a prompt token stay
-        # masked so only response tokens are supervised.
         labels[: n - 1] = ids_tensor[1:]
         if prompt_len > 1:
             labels[: prompt_len - 1] = -100
@@ -223,16 +215,9 @@ class HuggingFaceVLMDataset(Dataset):
         from datasets import Dataset as HFDataset
         from datasets import load_dataset, load_from_disk
 
-        # When dataset_name points at an existing directory on disk (absolute
-        # or relative path), prefer load_from_disk. Otherwise treat it as an
-        # HF Hub id. This keeps the TOML contract unchanged while letting
-        # users preprocess a dataset once and load it without network access.
         is_local = os.path.isdir(dataset_name)
         if is_local:
             loaded = load_from_disk(dataset_name)
-            # load_from_disk returns a Dataset if the dir holds a single
-            # split, or a DatasetDict of splits; select by split name in
-            # the latter case.
             ds = loaded[split] if not isinstance(loaded, HFDataset) else loaded
         else:
             ds = load_dataset(dataset_name, dataset_config, split=split)

@@ -17,10 +17,6 @@ from kempnerforge.distributed.pipeline_parallel import (
     compute_layer_assignment,
 )
 
-# ---------------------------------------------------------------------------
-# Layer assignment
-# ---------------------------------------------------------------------------
-
 
 class TestComputeLayerAssignment:
     def test_even_split(self):
@@ -28,7 +24,6 @@ class TestComputeLayerAssignment:
         assert result == [(0, 8), (8, 16), (16, 24), (24, 32)]
 
     def test_uneven_split(self):
-        # 10 layers / 3 stages → 4, 3, 3 (earlier stages get extra)
         result = compute_layer_assignment(10, 3)
         assert result == [(0, 4), (4, 7), (7, 10)]
 
@@ -59,11 +54,6 @@ class TestComputeLayerAssignment:
                 for start, end in assignments:
                     all_layers.extend(range(start, end))
                 assert all_layers == list(range(n_layers))
-
-
-# ---------------------------------------------------------------------------
-# PipelineStageModule
-# ---------------------------------------------------------------------------
 
 
 @pytest.fixture
@@ -110,21 +100,18 @@ class TestPipelineStageModule:
         module = PipelineStageModule(small_config, stage_id=0, num_stages=2, layer_range=(0, 4))
         tokens = torch.randint(0, 256, (2, 16))
         out = module(tokens)
-        # Not last stage → hidden states
         assert out.shape == (2, 16, 64)
 
     def test_last_stage_forward_shape(self, small_config):
         module = PipelineStageModule(small_config, stage_id=1, num_stages=2, layer_range=(4, 8))
         hidden = torch.randn(2, 16, 64)
         out = module(hidden)
-        # Last stage → logits
         assert out.shape == (2, 16, 256)
 
     def test_single_stage_forward_shape(self, small_config):
         module = PipelineStageModule(small_config, stage_id=0, num_stages=1, layer_range=(0, 8))
         tokens = torch.randint(0, 256, (2, 16))
         out = module(tokens)
-        # Only stage → logits
         assert out.shape == (2, 16, 256)
 
     def test_chained_forward_matches_shapes(self, small_config):
@@ -149,11 +136,6 @@ class TestPipelineStageModule:
         stage = PipelineStageModule(small_config, stage_id=0, num_stages=2, layer_range=(0, 4))
         stage_params = sum(p.numel() for p in stage.parameters())
         assert stage_params < full_params
-
-
-# ---------------------------------------------------------------------------
-# build_stage_module
-# ---------------------------------------------------------------------------
 
 
 class TestBuildStageModule:
@@ -185,11 +167,6 @@ class TestBuildStageModule:
         assert all_keys == [str(i) for i in range(8)]
 
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-
-
 class TestPipelineScheduleConfig:
     def test_default_schedule(self):
         from kempnerforge.config.schema import DistributedConfig
@@ -201,11 +178,6 @@ class TestPipelineScheduleConfig:
         assert PipelineSchedule.schedule_1f1b == "1f1b"
         assert PipelineSchedule.gpipe == "gpipe"
         assert PipelineSchedule.interleaved_1f1b == "interleaved_1f1b"
-
-
-# ---------------------------------------------------------------------------
-# Sequence packing across stages
-# ---------------------------------------------------------------------------
 
 
 class TestStageModuleDocIds:

@@ -9,22 +9,16 @@ from kempnerforge.config.schema import DataConfig, DatasetSource
 from kempnerforge.data.dataset import MixtureDataset
 from kempnerforge.data.sampler import MixtureSampler
 
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
-
 
 @pytest.fixture
 def two_mmap_dirs(tmp_path):
     """Create two temp directories with .npy token files of different sizes."""
     dir_a = tmp_path / "dataset_a"
     dir_a.mkdir()
-    # 160 tokens → 10 samples at seq_len=16
     np.save(dir_a / "shard.npy", np.arange(160, dtype=np.uint16))
 
     dir_b = tmp_path / "dataset_b"
     dir_b.mkdir()
-    # 320 tokens → 20 samples at seq_len=16
     np.save(dir_b / "shard.npy", np.arange(320, dtype=np.uint16))
 
     return dir_a, dir_b
@@ -34,11 +28,6 @@ def _make_mmap_dataset(data_dir, seq_len=16):
     from kempnerforge.data.dataset import MemoryMappedDataset
 
     return MemoryMappedDataset(str(data_dir), seq_len=seq_len)
-
-
-# ---------------------------------------------------------------------------
-# DatasetSource config
-# ---------------------------------------------------------------------------
 
 
 class TestDatasetSource:
@@ -88,11 +77,6 @@ class TestDataConfigMixing:
         )
         assert len(config.datasets) == 2
         assert config.datasets[0].weight == 0.7
-
-
-# ---------------------------------------------------------------------------
-# TOML loading
-# ---------------------------------------------------------------------------
 
 
 class TestMixingTomlLoading:
@@ -154,11 +138,6 @@ typo_field = "oops"
             load_config(str(toml_path), cli_args=[])
 
 
-# ---------------------------------------------------------------------------
-# MixtureDataset
-# ---------------------------------------------------------------------------
-
-
 class TestMixtureDataset:
     def test_len_is_sum(self, two_mmap_dirs):
         dir_a, dir_b = two_mmap_dirs
@@ -189,7 +168,6 @@ class TestMixtureDataset:
         ds_a = _make_mmap_dataset(dir_a)
         ds_b = _make_mmap_dataset(dir_b)
         mix = MixtureDataset([ds_a, ds_b], ["a", "b"])
-        # Index into second dataset
         sample = mix[len(ds_a)]
         assert sample["dataset_idx"] == 1
 
@@ -236,15 +214,10 @@ class TestMixtureDataset:
             MixtureDataset([ds_a], ["a", "b"])
 
 
-# ---------------------------------------------------------------------------
-# MixtureSampler
-# ---------------------------------------------------------------------------
-
-
 class TestMixtureSampler:
     def test_total_samples_matches_datasets(self):
         """Total samples = sum of per-rank available across datasets."""
-        cumulative = [0, 100, 300]  # ds0=100, ds1=200
+        cumulative = [0, 100, 300]
         sampler = MixtureSampler(
             cumulative, weights=[1.0, 1.0], num_replicas=1, rank=0, shuffle=False
         )
@@ -252,14 +225,12 @@ class TestMixtureSampler:
 
     def test_weight_proportionality(self):
         """Higher weight → more samples from that dataset."""
-        cumulative = [0, 1000, 2000]  # ds0=1000, ds1=1000
+        cumulative = [0, 1000, 2000]
         sampler = MixtureSampler(
             cumulative, weights=[0.8, 0.2], num_replicas=1, rank=0, shuffle=False
         )
         indices = list(sampler)
-        # Count samples from each dataset
         ds0_count = sum(1 for i in indices if i < 1000)
-        # ds0 should get ~80% of samples
         ratio = ds0_count / len(indices)
         assert 0.7 < ratio < 0.9
 
@@ -272,7 +243,6 @@ class TestMixtureSampler:
                 cumulative, weights=[1.0], num_replicas=4, rank=rank, shuffle=False
             )
             all_indices.extend(list(sampler))
-        # No duplicates
         assert len(all_indices) == len(set(all_indices))
 
     def test_distributed_covers_data(self):
@@ -284,7 +254,6 @@ class TestMixtureSampler:
                 cumulative, weights=[1.0], num_replicas=4, rank=rank, shuffle=False
             )
             all_indices.update(list(sampler))
-        # drop_last: 100 // 4 = 25 per rank → 100 covered
         assert len(all_indices) == 100
 
     def test_deterministic(self):
@@ -327,20 +296,13 @@ class TestMixtureSampler:
 
     def test_oversampling_with_high_weight(self):
         """Small dataset with high weight should be oversampled (repeats)."""
-        # ds0 has 10 samples, ds1 has 990. Weight ds0 at 90%.
         cumulative = [0, 10, 1000]
         sampler = MixtureSampler(
             cumulative, weights=[0.9, 0.1], num_replicas=1, rank=0, shuffle=False
         )
         indices = list(sampler)
         ds0_indices = [i for i in indices if i < 10]
-        # ds0 should have ~900 samples (oversampled from 10 unique)
-        assert len(ds0_indices) > 100  # Well over the 10 unique samples
-
-
-# ---------------------------------------------------------------------------
-# Temperature scaling
-# ---------------------------------------------------------------------------
+        assert len(ds0_indices) > 100
 
 
 class TestTemperatureScaling:
@@ -367,7 +329,6 @@ class TestTemperatureScaling:
     def test_high_temperature_more_uniform(self):
         """High temperature should make distribution more uniform."""
         cumulative = [0, 500, 1000]
-        # With T=1, 0.9/0.1 → ds0 gets 90%
         s_hot = MixtureSampler(
             cumulative,
             weights=[0.9, 0.1],
@@ -379,7 +340,6 @@ class TestTemperatureScaling:
         indices = list(s_hot)
         ds0_count = sum(1 for i in indices if i < 500)
         ratio = ds0_count / len(indices)
-        # With high temperature, ratio should be closer to 0.5 than 0.9
         assert 0.4 < ratio < 0.75
 
     def test_low_temperature_more_peaked(self):
@@ -396,13 +356,7 @@ class TestTemperatureScaling:
         indices = list(s_cold)
         ds0_count = sum(1 for i in indices if i < 500)
         ratio = ds0_count / len(indices)
-        # Low temp concentrates on ds0: ratio should be very high
         assert ratio > 0.9
-
-
-# ---------------------------------------------------------------------------
-# Integration with MixtureDataset
-# ---------------------------------------------------------------------------
 
 
 class TestMixtureSamplerWithDataset:
@@ -434,17 +388,10 @@ class TestMixtureSamplerWithDataset:
         ds_b = _make_mmap_dataset(dir_b)
         mix = MixtureDataset([ds_a, ds_b], ["a", "b"])
 
-        # All indices in ds_a range → dataset_idx=0
         for i in range(len(ds_a)):
             assert mix[i]["dataset_idx"] == 0
-        # All indices in ds_b range → dataset_idx=1
         for i in range(len(ds_a), len(mix)):
             assert mix[i]["dataset_idx"] == 1
-
-
-# ---------------------------------------------------------------------------
-# Zero-weight validation
-# ---------------------------------------------------------------------------
 
 
 class TestMixtureSamplerZeroWeights:
@@ -525,7 +472,7 @@ class TestMixtureSamplerZeroWeights:
             num_replicas=1,
             rank=0,
         )
-        sampler.update_weights([0.0, 1.0])  # must not raise
+        sampler.update_weights([0.0, 1.0])
         assert sampler._probs == [0.0, 1.0]
 
     def test_update_weights_rejects_negative(self):

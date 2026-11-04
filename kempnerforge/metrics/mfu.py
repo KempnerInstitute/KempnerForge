@@ -20,16 +20,12 @@ from kempnerforge.config.schema import ModelConfig
 
 logger = logging.getLogger(__name__)
 
-# Peak bf16 TFLOPS for common GPU types (per GPU)
-# Source: NVIDIA specs (dense tensor core throughput)
 _GPU_PEAK_TFLOPS: dict[str, float] = {
-    # H-series
     "H200": 989.0,
     "H100": 989.0,
     "H100 SXM": 989.0,
     "H100 PCIe": 756.0,
     "H800": 989.0,
-    # A-series
     "A100": 312.0,
     "A100 SXM": 312.0,
     "A100 PCIe": 312.0,
@@ -37,7 +33,6 @@ _GPU_PEAK_TFLOPS: dict[str, float] = {
     "A100-SXM4-40GB": 312.0,
     "A100-PCIE-80GB": 312.0,
     "A100-PCIE-40GB": 312.0,
-    # Consumer / other
     "A10G": 125.0,
     "L40S": 362.0,
     "RTX 4090": 330.0,
@@ -58,23 +53,19 @@ def get_gpu_peak_tflops(device: int = 0) -> float:
         Peak bf16 TFLOPS for this GPU.
     """
     if not torch.cuda.is_available():
-        return 1.0  # dummy for CPU-only
+        return 1.0
 
     name = torch.cuda.get_device_name(device)
 
-    # Try exact and substring matches
     for gpu_name, tflops in _GPU_PEAK_TFLOPS.items():
         if gpu_name in name:
             logger.info(f"Detected GPU: {name} → {tflops} bf16 TFLOPS")
             return tflops
 
-    # Fallback: estimate from compute capability
     major, minor = torch.cuda.get_device_capability(device)
     if major >= 9:
-        # Hopper-class
         tflops = 989.0
     elif major >= 8:
-        # Ampere-class
         tflops = 312.0
     else:
         tflops = 100.0
@@ -116,11 +107,11 @@ def _dense_flops_per_token(config: ModelConfig, seq_len: int) -> int:
     head_dim = config.head_dim
     attn_dim = config.n_heads * head_dim
     attn_params = (
-        config.dim * attn_dim  # Q
-        + 2 * config.dim * (config.n_kv_heads * head_dim)  # type: ignore[reportOptionalOperand]  # K+V
-        + attn_dim * config.dim  # O
+        config.dim * attn_dim
+        + 2 * config.dim * (config.n_kv_heads * head_dim)  # type: ignore[reportOptionalOperand]
+        + attn_dim * config.dim
     )
-    mlp_params = 3 * config.dim * config.computed_ffn_hidden_dim  # SwiGLU
+    mlp_params = 3 * config.dim * config.computed_ffn_hidden_dim
     per_layer = attn_params + mlp_params
     output_params = config.vocab_size * config.dim
     active_params = config.n_layers * per_layer + output_params

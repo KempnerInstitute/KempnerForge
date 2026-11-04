@@ -51,7 +51,6 @@ def _load_model(config, device, dtype):
             print(f"Error: checkpoint path does not exist: {ckpt_path}", file=sys.stderr)
             sys.exit(1)
 
-        # DCP handles single-process loading without dist init
         state_dict = {"model": model.state_dict()}
         dcp.load(state_dict, checkpoint_id=str(ckpt_path))
         model.load_state_dict(state_dict["model"])
@@ -77,7 +76,6 @@ def _generate_and_print(model, tokenizer, prompt, args):
         eos_token_id=tokenizer.eos_token_id,
     )
 
-    # Decode only the generated portion
     generated_ids = output_ids[0, input_ids.shape[1] :]
     generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
 
@@ -105,20 +103,16 @@ def main() -> None:
 
     args, config_overrides = parser.parse_known_args()
 
-    # Load config with CLI overrides
     config = load_config(args.config, cli_args=config_overrides)
 
-    # Resolve device
     if args.device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     else:
         device = torch.device(args.device)
     dtype = getattr(torch, args.dtype)
 
-    # Build and load model
     model = _load_model(config, device, dtype)
 
-    # Build tokenizer
     if not config.data.tokenizer_path:
         print("Error: --data.tokenizer_path is required for generation", file=sys.stderr)
         sys.exit(1)
