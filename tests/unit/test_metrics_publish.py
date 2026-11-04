@@ -26,7 +26,7 @@ from kempnerforge.metrics.publish import (
 )
 
 URI = "tracking-uri-placeholder"
-MISSING = object()  # drop the key from the synthetic sidecar
+MISSING = object()
 
 
 def _drop_missing(mapping: dict[str, Any]) -> dict[str, Any]:
@@ -37,7 +37,7 @@ def _drop_missing(mapping: dict[str, Any]) -> dict[str, Any]:
 def _no_databricks_auth_env(monkeypatch):
     """Start without Databricks auth variables; whatever the publisher exports is undone."""
     for name in ("DATABRICKS_CONFIG_PROFILE", "DATABRICKS_TOKEN", "DATABRICKS_API_TOKEN"):
-        monkeypatch.setenv(name, "")  # registers the restore even when the variable was unset
+        monkeypatch.setenv(name, "")
         monkeypatch.delenv(name)
 
 
@@ -92,6 +92,7 @@ _MODEL_CALLS = (
     "get_run",
     "search_logged_models",
     "create_logged_model",
+    "get_logged_model",
     "log_model_artifacts",
     "finalize_logged_model",
 )
@@ -136,7 +137,7 @@ class _FakeMlflow(types.ModuleType):
 
             def log_batch(self, run_id, metrics=(), params=(), tags=(), synchronous=None):
                 fake.events.append("log_batch")
-                for m in metrics:  # mlflow: model_id=metric.model_id or get_active_model_id()
+                for m in metrics:
                     if getattr(m, "model_id", None) is None:
                         m.model_id = fake.active_model_id
                 if reject is not None:
@@ -175,11 +176,6 @@ def _install_mlflow(monkeypatch: pytest.MonkeyPatch, **kwargs: Any) -> _FakeMlfl
     monkeypatch.setitem(sys.modules, "mlflow", fake)
     monkeypatch.setitem(sys.modules, "mlflow.entities", fake.entities_module)
     return fake
-
-
-# ---------------------------------------------------------------------------
-# Reading the sidecar
-# ---------------------------------------------------------------------------
 
 
 class TestReadMlflowTarget:
@@ -229,14 +225,14 @@ class TestReadMlflowTarget:
         ckpt = _sidecar(tmp_path, tracking=[_entry(tracking_uri="databricks://prof-a")])
         read_mlflow_target(ckpt)
         assert os.environ["DATABRICKS_CONFIG_PROFILE"] == "operator"
-        assert os.environ["DATABRICKS_TOKEN"] == "alias-token"  # auth preparation ran
+        assert os.environ["DATABRICKS_TOKEN"] == "alias-token"
 
     @pytest.mark.parametrize("uri", ["databricks://", "databricks://scope:prefix"])
     def test_non_profile_uris_select_nothing(self, tmp_path, monkeypatch, uri):
         monkeypatch.setenv("DATABRICKS_API_TOKEN", "alias-token")
         read_mlflow_target(_sidecar(tmp_path, tracking=[_entry(tracking_uri=uri)]))
         assert "DATABRICKS_CONFIG_PROFILE" not in os.environ
-        assert os.environ["DATABRICKS_TOKEN"] == "alias-token"  # auth preparation ran
+        assert os.environ["DATABRICKS_TOKEN"] == "alias-token"
 
     @pytest.mark.parametrize(
         ("uri", "profile"),
@@ -279,7 +275,7 @@ class TestReadMlflowTarget:
         monkeypatch.setenv("DATABRICKS_API_TOKEN", "alias-token")
         read_mlflow_target(_sidecar(tmp_path, tracking=[_entry(tracking_uri="databricks://p")]))
         assert os.environ["DATABRICKS_TOKEN"] == "primary"
-        assert os.environ["DATABRICKS_CONFIG_PROFILE"] == "p"  # auth preparation ran
+        assert os.environ["DATABRICKS_CONFIG_PROFILE"] == "p"
 
     def test_auth_is_prepared_only_for_databricks_uris(self, tmp_path, monkeypatch):
         monkeypatch.setenv("DATABRICKS_API_TOKEN", "alias-token")
@@ -461,11 +457,6 @@ class TestSidecarRefusals:
         assert marker not in str(err.value)
 
 
-# ---------------------------------------------------------------------------
-# Publishing
-# ---------------------------------------------------------------------------
-
-
 class TestPublishMetrics:
     def test_appends_prefixed_metrics_at_the_sidecar_step(self, tmp_path, monkeypatch):
         fake = _install_mlflow(monkeypatch)
@@ -543,7 +534,7 @@ class TestPublishMetrics:
         ckpt = _sidecar(tmp_path, tracking=[_entry(model_id=None)])
         with pytest.raises(PublishRefused, match="m-ambient"):
             publish_metrics(ckpt, {"a": 1.0})
-        assert fake.events == []  # refused before any client was built
+        assert fake.events == []
 
     def test_ambient_active_model_is_overridden_by_the_sidecar_model_id(
         self, tmp_path, monkeypatch
@@ -610,7 +601,7 @@ class TestPublishMetrics:
         def _publish(ckpt: Path, prefix: str) -> None:
             try:
                 publish_metrics(ckpt, {"acc": 1.0}, prefix=prefix)
-            except BaseException as e:  # BrokenBarrierError if the calls never overlapped
+            except BaseException as e:
                 failures.append(e)
 
         threads = [
@@ -775,11 +766,6 @@ class TestRefusalsPrecedeThePublish:
         with pytest.raises(PublishRefused, match="no 'tracking' block"):
             publish_metrics(_sidecar(tmp_path, tracking=MISSING), {"acc": 1.0})
         assert fake.events == []
-
-
-# ---------------------------------------------------------------------------
-# Command line
-# ---------------------------------------------------------------------------
 
 
 def _metrics_file(tmp_path: Path, body: Any = None, raw: str | None = None) -> Path:

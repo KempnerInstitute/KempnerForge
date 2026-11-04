@@ -9,16 +9,12 @@ import torch
 from kempnerforge.data.dataset import MemoryMappedDataset
 from kempnerforge.data.sampler import DistributedSampler
 
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
-
 
 @pytest.fixture
 def mmap_data_dir(tmp_path):
     """Create temporary .npy files with fake token data."""
     seq_len = 16
-    tokens_per_file = 160  # 10 samples of seq_len=16 each
+    tokens_per_file = 160
 
     for i in range(3):
         tokens = np.arange(i * tokens_per_file, (i + 1) * tokens_per_file, dtype=np.uint16)
@@ -44,16 +40,10 @@ def simple_dataset():
     return ListDataset(100)
 
 
-# ---------------------------------------------------------------------------
-# MemoryMappedDataset
-# ---------------------------------------------------------------------------
-
-
 class TestMemoryMappedDataset:
     def test_len(self, mmap_data_dir):
         data_dir, seq_len = mmap_data_dir
         ds = MemoryMappedDataset(str(data_dir), seq_len=seq_len)
-        # 3 files × 160 tokens each / 16 seq_len = 30 samples
         assert len(ds) == 30
 
     def test_getitem_shape(self, mmap_data_dir):
@@ -68,8 +58,6 @@ class TestMemoryMappedDataset:
         data_dir, seq_len = mmap_data_dir
         ds = MemoryMappedDataset(str(data_dir), seq_len=seq_len)
         sample = ds[0]
-        # First file: tokens 0..159, first sample: tokens 0..15
-        # input_ids = [0,1,...,14], labels = [1,2,...,15]
         assert sample["input_ids"][0].item() == 0
         assert sample["labels"][0].item() == 1
         assert (sample["labels"][:-1] == sample["input_ids"][1:]).all()
@@ -78,9 +66,8 @@ class TestMemoryMappedDataset:
         """Samples near file boundaries should work correctly."""
         data_dir, seq_len = mmap_data_dir
         ds = MemoryMappedDataset(str(data_dir), seq_len=seq_len)
-        # Sample 10 is the first sample in the second file
         sample = ds[10]
-        assert sample["input_ids"][0].item() == 160  # second file starts at 160
+        assert sample["input_ids"][0].item() == 160
 
     def test_index_out_of_range(self, mmap_data_dir):
         data_dir, seq_len = mmap_data_dir
@@ -112,21 +99,16 @@ class TestMemoryMappedDataset:
 
         ds8 = MemoryMappedDataset(str(tmp_path), seq_len=8)
         ds32 = MemoryMappedDataset(str(tmp_path), seq_len=32)
-        assert len(ds8) == 32  # 256 / 8
-        assert len(ds32) == 8  # 256 / 32
+        assert len(ds8) == 32
+        assert len(ds32) == 8
 
     def test_partial_sequence_dropped(self, tmp_path):
         """Tokens that don't fill a full seq_len are discarded."""
-        tokens = np.arange(100, dtype=np.uint16)  # 100 tokens, seq_len=16 → 6 full + 4 leftover
+        tokens = np.arange(100, dtype=np.uint16)
         np.save(tmp_path / "data.npy", tokens)
 
         ds = MemoryMappedDataset(str(tmp_path), seq_len=16)
-        assert len(ds) == 6  # 100 // 16 = 6, 4 tokens discarded
-
-
-# ---------------------------------------------------------------------------
-# DistributedSampler
-# ---------------------------------------------------------------------------
+        assert len(ds) == 6
 
 
 class TestDistributedSampler:
@@ -144,7 +126,6 @@ class TestDistributedSampler:
             )
             all_indices.append(list(sampler))
 
-        # No overlap
         flat = [idx for rank_indices in all_indices for idx in rank_indices]
         assert len(flat) == len(set(flat))
 
@@ -162,7 +143,6 @@ class TestDistributedSampler:
             )
             all_indices.update(list(sampler))
 
-        # Should cover all original indices
         assert all_indices == set(range(len(simple_dataset)))
 
     def test_equal_partition_sizes(self, simple_dataset):
@@ -179,7 +159,7 @@ class TestDistributedSampler:
             )
             sizes.add(len(list(sampler)))
 
-        assert len(sizes) == 1  # all same size
+        assert len(sizes) == 1
 
     def test_deterministic_shuffle(self, simple_dataset):
         """Same seed + epoch → same permutation."""
@@ -226,10 +206,8 @@ class TestDistributedSampler:
             drop_last=True,
         )
 
-        # Full iteration
         full = list(s)
 
-        # Skip first 10
         s.set_skip(10)
         skipped = list(s)
         assert skipped == full[10:]
@@ -260,7 +238,6 @@ class TestDistributedSampler:
 
     def test_drop_last_vs_pad(self, simple_dataset):
         """drop_last=True discards, drop_last=False pads."""
-        # 100 samples, 3 replicas → drop_last: 33 each (99 used), pad: 34 each
         s_drop = DistributedSampler(
             simple_dataset,
             num_replicas=3,
@@ -277,11 +254,6 @@ class TestDistributedSampler:
         )
         assert len(list(s_drop)) == 33
         assert len(list(s_pad)) == 34
-
-
-# ---------------------------------------------------------------------------
-# StatefulDataLoader
-# ---------------------------------------------------------------------------
 
 
 class TestStatefulDataLoader:
@@ -307,7 +279,6 @@ class TestStatefulDataLoader:
         config = DataConfig(num_workers=0, pin_memory=False)
         loader = StatefulDataLoader(ds, batch_size=4, config=config)
 
-        # Iterate a few batches
         it = iter(loader)
         next(it)
         next(it)
@@ -325,14 +296,8 @@ class TestStatefulDataLoader:
         config = DataConfig(num_workers=0, pin_memory=False)
         loader = StatefulDataLoader(ds, batch_size=4, config=config)
 
-        # Exhaust one epoch
         list(loader)
         assert loader._epoch == 1
-
-
-# ---------------------------------------------------------------------------
-# StreamingHuggingFaceDataset
-# ---------------------------------------------------------------------------
 
 
 class TestHuggingFaceDataset:
@@ -364,8 +329,6 @@ class TestHuggingFaceDataset:
         return ds
 
     def test_len(self):
-        # "abcdefghij" = 10 tokens + EOS = 11, chunk_size = 5 (seq_len 4 + 1)
-        # 11 / 5 = 2 full chunks
         ds = self._make_dataset(seq_len=4, documents=[{"text": "abcdefghij"}])
         assert len(ds) == 2
 
@@ -379,16 +342,12 @@ class TestHuggingFaceDataset:
         """Labels should be inputs shifted by 1."""
         ds = self._make_dataset(seq_len=4, documents=[{"text": "abcde"}])
         sample = ds[0]
-        # tokens = [97,98,99,100,101] + eos=0. chunk = [97,98,99,100,101]
-        # input = [97,98,99,100], labels = [98,99,100,101]
         assert sample["input_ids"][0].item() == ord("a")
         assert sample["labels"][0].item() == ord("b")
         assert (sample["labels"][:-1] == sample["input_ids"][1:]).all()
 
     def test_sequence_packing(self):
         """Short docs should be concatenated with EOS separators."""
-        # "ab" → [97,98,0], "cd" → [99,100,0], "ef" → [101,102,0] → 9 tokens
-        # seq_len=4 → chunk_size=5 → 1 full chunk from 9 tokens
         docs = [{"text": "ab"}, {"text": "cd"}, {"text": "ef"}]
         ds = self._make_dataset(seq_len=4, documents=docs)
         assert len(ds) == 1
@@ -399,8 +358,7 @@ class TestHuggingFaceDataset:
             seq_len=4,
             documents=[{"text": ""}, {"text": "abcdefghij"}],
         )
-        # Empty doc is skipped in _pack_sequences (tokens empty → continue)
-        assert len(ds) == 2  # same as single 10-char doc
+        assert len(ds) == 2
 
     def test_state_dict_round_trip(self):
         ds = self._make_dataset(seq_len=4, documents=[{"text": "abcdefghij"}])
@@ -416,11 +374,6 @@ class TestHuggingFaceDataset:
         ds2.load_state_dict(state)
         assert ds2._epoch == 3
         assert ds2._sample_idx == 5
-
-
-# ---------------------------------------------------------------------------
-# StreamingHuggingFaceDataset
-# ---------------------------------------------------------------------------
 
 
 class TestStreamingHuggingFaceDataset:
@@ -443,7 +396,6 @@ class TestStreamingHuggingFaceDataset:
             seed=seed,
         )
 
-        # Mock tokenizer: each character → its ordinal (simple 1-to-1 mapping)
         mock_tokenizer = MagicMock()
         mock_tokenizer.eos_token_id = 0
         mock_tokenizer.encode = lambda text, **kwargs: [ord(c) for c in text]
@@ -460,7 +412,7 @@ class TestStreamingHuggingFaceDataset:
                 self._docs = docs
 
             def shuffle(self, seed=0, buffer_size=1000):
-                return self  # Don't shuffle for deterministic tests
+                return self
 
             def __iter__(self):
                 return iter(self._docs)
@@ -469,9 +421,7 @@ class TestStreamingHuggingFaceDataset:
 
     def test_basic_iteration(self):
         ds = self._make_mock_dataset(seq_len=4)
-        # Each char encodes to one token. "abcde" = 5 tokens + 1 EOS = 6 tokens
-        # chunk_size = seq_len + 1 = 5, so one full chunk from 6 tokens
-        docs = [{"text": "abcdefghij"}]  # 10 tokens + 1 EOS = 11 → 2 chunks of 5
+        docs = [{"text": "abcdefghij"}]
         self._patch_stream(ds, docs)
 
         samples = list(ds)
@@ -482,9 +432,7 @@ class TestStreamingHuggingFaceDataset:
     def test_sequence_packing(self):
         """Multiple short docs should be packed into sequences."""
         ds = self._make_mock_dataset(seq_len=8)
-        # chunk_size = 9. "abc" = 3 tokens + EOS = 4. Need 3 docs for one chunk.
         docs = [{"text": "abc"}, {"text": "def"}, {"text": "ghi"}]
-        # 3+1 + 3+1 + 3+1 = 12 tokens → 1 chunk of 9, 3 leftover
         self._patch_stream(ds, docs)
 
         samples = list(ds)
@@ -500,7 +448,6 @@ class TestStreamingHuggingFaceDataset:
             self._patch_stream(ds, docs)
             results[rank] = list(ds)
 
-        # Both ranks should produce sequences
         assert len(results[0]) > 0
         assert len(results[1]) > 0
 
@@ -510,14 +457,13 @@ class TestStreamingHuggingFaceDataset:
         self._patch_stream(ds, docs)
 
         samples = list(ds)
-        assert len(samples) > 0  # Empty doc should be skipped
+        assert len(samples) > 0
 
     def test_state_dict_round_trip(self):
         ds = self._make_mock_dataset(seq_len=4)
-        docs = [{"text": "abcdefghij" * 5}]  # 50 tokens → plenty of chunks
+        docs = [{"text": "abcdefghij" * 5}]
         self._patch_stream(ds, docs)
 
-        # Consume some samples
         it = iter(ds)
         next(it)
         next(it)

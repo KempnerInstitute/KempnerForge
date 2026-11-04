@@ -21,11 +21,6 @@ from kempnerforge.model.moe import MoEMLP
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Differentiable all-to-all
-# ---------------------------------------------------------------------------
-
-
 class _AllToAll(torch.autograd.Function):
     """Differentiable wrapper around ``dist.all_to_all_single``.
 
@@ -41,8 +36,6 @@ class _AllToAll(torch.autograd.Function):
         input_split_sizes: list[int],
         group: dist.ProcessGroup,
     ) -> torch.Tensor:
-        # Save for backward: reverse the all-to-all direction
-        # backward receives what forward sent, sends what forward received
         ctx.bwd_output_splits = input_split_sizes
         ctx.bwd_input_splits = output_split_sizes
         ctx.group = group
@@ -98,11 +91,6 @@ class _ScaleGrad(torch.autograd.Function):
         return grad_output * ctx.scale, None
 
 
-# ---------------------------------------------------------------------------
-# EP dispatch / combine
-# ---------------------------------------------------------------------------
-
-
 def ep_dispatch_and_compute(
     x: torch.Tensor,
     weights: torch.Tensor,
@@ -145,40 +133,30 @@ def ep_dispatch_and_compute(
     num_tokens, top_k = indices.shape
     dim = x.shape[-1]
 
-    # --- 1. Build per-token, per-expert-selection dispatch info ---
-    # Expand tokens: each (token, k) pair becomes one dispatch entry
-    flat_indices = indices.reshape(-1)  # (num_tokens * top_k,)
-    flat_weights = weights.reshape(-1)  # (num_tokens * top_k,)
-    # Token id for each entry
+    flat_indices = indices.reshape(-1)
+    flat_weights = weights.reshape(-1)
     token_ids = torch.arange(num_tokens, device=x.device).unsqueeze(1).expand(-1, top_k).reshape(-1)
 
-    # Which EP rank owns each expert
-    target_rank = flat_indices // num_local_experts  # (num_tokens * top_k,)
+    target_rank = flat_indices // num_local_experts
 
-    # --- 2. Sort entries by target rank (stable sort preserves order within rank) ---
     sort_indices = torch.argsort(target_rank, stable=True)
     sorted_token_ids = token_ids[sort_indices]
     sorted_flat_indices = flat_indices[sort_indices]
     sorted_flat_weights = flat_weights[sort_indices]
 
-    # Gather token features in send order
-    x_sorted = x[sorted_token_ids]  # (num_tokens * top_k, dim)
+    x_sorted = x[sorted_token_ids]
 
-    # Count how many entries go to each rank
     sorted_target_rank = target_rank[sort_indices]
     send_counts = torch.bincount(sorted_target_rank, minlength=ep_world_size)
     send_counts_list = send_counts.tolist()
 
-    # --- 3. Exchange counts so each rank knows what it will receive ---
     recv_counts = torch.zeros_like(send_counts)
     dist.all_to_all_single(recv_counts, send_counts, group=ep_group)
     recv_counts_list = recv_counts.tolist()
 
-    # --- 4. All-to-all: send tokens to expert-owning ranks ---
     received_tokens = _all_to_all(x_sorted, recv_counts_list, send_counts_list, ep_group)
     received_tokens = _ScaleGrad.apply(received_tokens, float(ep_world_size))
 
-    # Also exchange expert indices (as float for autograd compatibility, detached)
     sorted_expert_ids_float = sorted_flat_indices.float().unsqueeze(-1)
     received_expert_ids = torch.empty(
         sum(recv_counts_list), 1, dtype=torch.float32, device=x.device
@@ -192,8 +170,6 @@ def ep_dispatch_and_compute(
     )
     received_expert_ids = received_expert_ids.squeeze(-1).long()
 
-    # --- 5. Local expert computation ---
-    # Sort received tokens by expert for grouped GEMM.
     from kempnerforge.model.moe import (
         _GROUPED_MM_DTYPES,
         _HAS_GROUPED_MM,
@@ -207,7 +183,6 @@ def ep_dispatch_and_compute(
         sorted_recv = received_tokens[sort_by_expert]
         sorted_ids = received_expert_ids[sort_by_expert]
 
-        # Map global expert IDs to local indices for bincount.
         local_ids = sorted_ids - local_expert_start
         tokens_per_expert = torch.bincount(local_ids, minlength=num_local_experts)
 
@@ -227,15 +202,10 @@ def ep_dispatch_and_compute(
                 moe.experts,
             )
 
-        # Unsort back to received order.
         unsort_by_expert = torch.argsort(sort_by_expert)
         local_output = local_output_sorted[unsort_by_expert]
 
         if sorted_recv.shape[0] == 0:
-            # No token reached this rank, so the grouped GEMM short-circuited and the
-            # local expert params are not in the graph. Add a zero contribution so their
-            # AccumulateGrad hooks fire and FSDP2's reduce-scatter completes. (With any
-            # token present every expert's weight enters the GEMM, empty groups included.)
             params = (
                 [moe.up_w, moe.down_w] + ([moe.gate_w] if moe._is_swiglu else [])
                 if moe.packed_experts
@@ -254,8 +224,6 @@ def ep_dispatch_and_compute(
                 local_output[mask] = moe._apply_packed_expert(received_tokens[mask], i)
                 any_computed = True
 
-            # If no local expert ran, packed params never entered the graph.
-            # Add zero contribution so FSDP2 reduce-scatter fires.
             if not any_computed:
                 _zero = moe.up_w.sum() * 0 + moe.down_w.sum() * 0
                 if moe._is_swiglu:
@@ -271,14 +239,10 @@ def ep_dispatch_and_compute(
                     continue
                 local_output[mask] = moe.experts[i](received_tokens[mask])
 
-            # FSDP2 requires every parameter's AccumulateGrad hook to fire during
-            # backward for reduce-scatter to complete.
             if unused_expert_params:
                 _zero = sum(p.sum() for p in unused_expert_params) * 0
                 local_output = local_output + _zero
 
-    # Per-expert gradient scaling: normalize by utilization ratio so
-    # high-traffic experts don't dominate learning (DeepSeek-V3 Sec 3.2).
     if gradient_scale and received_tokens.requires_grad:
         total_recv = sum(recv_counts_list)
         if total_recv > 0:
@@ -290,28 +254,15 @@ def ep_dispatch_and_compute(
                 local_output.dtype
             )
 
-    # Keep dispatch all-to-all in the autograd graph. When all local experts
-    # are unused, local_output has no gradient path to received_tokens, so
-    # the dispatch _AllToAll.backward never fires on this rank. Since NCCL
-    # matches all-to-all ops by position in the communicator, the missing
-    # backward causes a misalignment with the peer EP rank → deadlock.
-    # Adding a zero-valued contribution preserves the graph edge without
-    # changing any gradient values.
     local_output = local_output + received_tokens.sum() * 0
     local_output = _ScaleGrad.apply(local_output, 1.0 / ep_world_size)
 
-    # --- 6. All-to-all: return processed tokens to originating ranks ---
-    # Reverse the all-to-all (swap send/recv counts)
     returned_tokens = _all_to_all(local_output, send_counts_list, recv_counts_list, ep_group)
 
-    # --- 7. Unsort and weighted combine ---
-    # returned_tokens is in the same order as x_sorted (sorted by target rank)
-    # Unsort back to original (token_id, k) order
     unsort_indices = torch.argsort(sort_indices)
     returned_unsorted = returned_tokens[unsort_indices]
     weights_unsorted = sorted_flat_weights[unsort_indices]
 
-    # Weighted sum per token
     returned_unsorted = returned_unsorted * weights_unsorted.unsqueeze(-1)
     output = torch.zeros(num_tokens, dim, dtype=x.dtype, device=x.device)
     output.scatter_add_(
@@ -323,11 +274,6 @@ def ep_dispatch_and_compute(
     )
 
     return output
-
-
-# ---------------------------------------------------------------------------
-# Apply EP to model
-# ---------------------------------------------------------------------------
 
 
 def apply_expert_parallel(model: torch.nn.Module, device_mesh: DeviceMesh | None) -> None:
@@ -368,9 +314,6 @@ def apply_expert_parallel(model: torch.nn.Module, device_mesh: DeviceMesh | None
         end = start + experts_per_rank
 
         if module.packed_experts:
-            # Packed path: slice the stacked weight tensors along the expert dim.
-            # Replace the Parameter (can't resize in-place) with the sliced view.
-            # The unpacked ModuleList is already absent in packed mode.
             module.up_w = torch.nn.Parameter(module.up_w.data[start:end].clone().contiguous())
             module.down_w = torch.nn.Parameter(module.down_w.data[start:end].clone().contiguous())
             if module._is_swiglu:
@@ -378,11 +321,9 @@ def apply_expert_parallel(model: torch.nn.Module, device_mesh: DeviceMesh | None
                     module.gate_w.data[start:end].clone().contiguous()
                 )
         else:
-            # Unpacked path: prune the ModuleList to the local experts only.
             local_experts = torch.nn.ModuleList([module.experts[i] for i in range(start, end)])
             module.experts = local_experts
 
-        # Store EP metadata
         module.ep_world_size = ep_size
         module.ep_group = ep_group  # type: ignore[reportAttributeAccessIssue]
         module.local_expert_start = start

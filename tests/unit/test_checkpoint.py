@@ -11,6 +11,7 @@ import shutil
 import stat
 import sys
 import threading
+from concurrent.futures import Future
 from pathlib import Path
 
 import numpy as np
@@ -36,30 +37,22 @@ from kempnerforge.config.schema import (
 from kempnerforge.model.transformer import Transformer
 from kempnerforge.training.optimizer import build_optimizer
 
-# ---------------------------------------------------------------------------
-# RNG state capture/restore
-# ---------------------------------------------------------------------------
-
 
 class TestRNGState:
     def test_round_trip(self):
         """RNG state save/restore should produce identical sequences."""
-        # Set a known state
         torch.manual_seed(42)
         random.seed(42)
         np.random.seed(42)
 
         state = get_rng_state()
 
-        # Generate some random numbers
         a_torch = torch.randn(5)
         a_python = random.random()
         a_numpy = np.random.randn(5)
 
-        # Restore state
         set_rng_state(state)
 
-        # Should get the exact same numbers
         b_torch = torch.randn(5)
         b_python = random.random()
         b_numpy = np.random.randn(5)
@@ -73,11 +66,6 @@ class TestRNGState:
         assert "python" in state
         assert "numpy" in state
         assert "torch_cpu" in state
-
-
-# ---------------------------------------------------------------------------
-# Training state assembly
-# ---------------------------------------------------------------------------
 
 
 class TestBuildTrainState:
@@ -96,7 +84,7 @@ class TestBuildTrainState:
 
         state = build_train_state(step=5, tokens_seen=0, scheduler=sched)
         assert "scheduler" in state
-        assert state["scheduler"]["_step_count"] == 6  # 5 steps + initial
+        assert state["scheduler"]["_step_count"] == 6
 
     def test_with_extra(self):
         state = build_train_state(step=0, tokens_seen=0, extra={"best_loss": 2.5})
@@ -117,7 +105,6 @@ class TestRestoreTrainState:
         assert extra == {}
 
     def test_restores_scheduler(self):
-        # Build a scheduler, step it, save its state
         opt = torch.optim.SGD([torch.zeros(1, requires_grad=True)], lr=0.1)
         sched = torch.optim.lr_scheduler.StepLR(opt, step_size=10, gamma=0.5)
         for _ in range(15):
@@ -127,12 +114,10 @@ class TestRestoreTrainState:
 
         state = {"step": 15, "tokens_seen": 0, "scheduler": saved_state}
 
-        # Create fresh scheduler and restore
         opt2 = torch.optim.SGD([torch.zeros(1, requires_grad=True)], lr=0.1)
         sched2 = torch.optim.lr_scheduler.StepLR(opt2, step_size=10, gamma=0.5)
         restore_train_state(state, scheduler=sched2)
 
-        # Scheduler internal state should match
         assert sched2.state_dict()["last_epoch"] == saved_state["last_epoch"]
         assert sched2.state_dict()["_last_lr"] == saved_state["_last_lr"]
 
@@ -140,14 +125,11 @@ class TestRestoreTrainState:
         torch.manual_seed(0)
         state = build_train_state(step=0, tokens_seen=0)
 
-        # Advance RNG
         _ = torch.randn(100)
 
-        # Restore should put us back
         restore_train_state(state)
         a = torch.randn(5)
 
-        # Restore again and verify same output
         restore_train_state(state)
         b = torch.randn(5)
 
@@ -168,11 +150,6 @@ class TestRestoreTrainState:
         assert extra["wandb_run_id"] == "abc123"
 
 
-# ---------------------------------------------------------------------------
-# Checkpoint retention
-# ---------------------------------------------------------------------------
-
-
 class TestCheckpointRetention:
     def test_cleanup_old_checkpoints(self, tmp_path):
         """Retention policy should keep only the last N checkpoints."""
@@ -183,7 +160,6 @@ class TestCheckpointRetention:
         opt = torch.optim.SGD(model.parameters(), lr=0.1)
         mgr = CheckpointManager(config, model, opt)
 
-        # Manually create checkpoint dirs
         for i in [10, 20, 30, 40]:
             (tmp_path / f"step_{i}").mkdir()
 
@@ -232,7 +208,6 @@ class TestCheckpointRetention:
         mgr._cleanup()
 
         remaining = sorted(int(d.name.split("_")[1]) for d in tmp_path.iterdir() if d.is_dir())
-        # All dynamic milestones kept; only the last keep_last_n=2 interval ckpts kept.
         assert remaining == [0, 1, 2, 4, 256, 512, 2000, 3000]
 
     def test_cleanup_retries_a_checkpoint_it_could_not_remove(self, tmp_path, monkeypatch):
@@ -263,11 +238,6 @@ class TestCheckpointRetention:
         assert sorted(d.name for d in tmp_path.iterdir() if d.is_dir()) == ["step_20", "step_30"]
 
 
-# ---------------------------------------------------------------------------
-# AsyncCheckpointer
-# ---------------------------------------------------------------------------
-
-
 class TestAsyncCheckpointer:
     def test_default_mode_is_disabled(self):
         ckpt = AsyncCheckpointer()
@@ -279,7 +249,7 @@ class TestAsyncCheckpointer:
 
     def test_wait_with_no_pending_is_noop(self):
         ckpt = AsyncCheckpointer()
-        ckpt.wait()  # Should not raise
+        ckpt.wait()
 
     def test_disabled_mode_calls_dcp_save(self, monkeypatch, tmp_path):
         from unittest.mock import MagicMock
@@ -326,13 +296,7 @@ class TestAsyncCheckpointer:
         ckpt = AsyncCheckpointer(mode=AsyncCheckpointMode.async_)
         ckpt.save({"model": {}}, checkpoint_id=str(tmp_path / "step_1"))
         ckpt.save({"model": {}}, checkpoint_id=str(tmp_path / "step_2"))
-        # First future should have been waited on before second save
         mock_future1.result.assert_called_once()
-
-
-# ---------------------------------------------------------------------------
-# Dataloader state persistence (two-phase apply)
-# ---------------------------------------------------------------------------
 
 
 def _mock_dcp_load(monkeypatch):
@@ -399,7 +363,7 @@ class TestDataloaderStatePersistence:
         mgr = _make_mock_mgr(tmp_path, monkeypatch)
         mgr._pending_dataloader_state = {"epoch": 1}
 
-        class PlainLoader:  # no load_state_dict method
+        class PlainLoader:
             pass
 
         mgr.apply_dataloader_state(PlainLoader())
@@ -501,25 +465,16 @@ class TestDataloaderStatePersistence:
         saver = RecorderLoader({"epoch": 7, "batches_yielded": 333})
         mgr.save(step=5, tokens_seen=128, dataloader=saver)
 
-        # Simulate a fresh process: build a new manager and load without loader.
         mgr2 = _make_mock_mgr(tmp_path, monkeypatch)
         step, tokens, _ = mgr2.load(path=str(tmp_path / "step_5"))
         assert step == 5
         assert tokens == 128
         assert mgr2._pending_dataloader_state == {"epoch": 7, "batches_yielded": 333}
 
-        # Build loader after load() and apply the stashed state.
         restorer = RecorderLoader({"epoch": 0, "batches_yielded": 0})
         mgr2.apply_dataloader_state(restorer)
         assert captured["restored"] == {"epoch": 7, "batches_yielded": 333}
         assert mgr2._pending_dataloader_state is None
-
-
-# ---------------------------------------------------------------------------
-# VLM freeze metadata: save side, load side, and the cross-arch intersection.
-# Mirrors tests/integration/test_vlm_checkpoint.py but runs without CUDA so
-# the unit-tests-only CI coverage job exercises this code path.
-# ---------------------------------------------------------------------------
 
 
 def _freeze_meta(*pairs):
@@ -573,7 +528,6 @@ class TestIntersectFreezeMetaByModule:
             {"module": "c", "frozen": False},
         ]
         s, e = _intersect_freeze_meta_by_module(saved, expected)
-        # Order from input is preserved (it was canonical going in).
         assert [m["module"] for m in s] == ["a", "c"]
         assert [m["module"] for m in e] == ["a", "c"]
 
@@ -592,7 +546,6 @@ class TestPeekSavedStep:
         mgr = _make_mock_mgr(tmp_path, monkeypatch)
         ckpt_dir = tmp_path / "step_3"
         ckpt_dir.mkdir()
-        # No metadata.json in this dir.
         assert mgr.peek_saved_step(path=str(ckpt_dir)) is None
 
     def test_returns_none_when_metadata_unreadable(self, tmp_path, monkeypatch):
@@ -601,11 +554,9 @@ class TestPeekSavedStep:
         mgr = _make_mock_mgr(tmp_path, monkeypatch)
         ckpt_dir = tmp_path / "step_3"
         ckpt_dir.mkdir()
-        # Write malformed JSON; peek should swallow the decode error.
         (ckpt_dir / "metadata.json").write_text("{ not valid json")
         assert mgr.peek_saved_step(path=str(ckpt_dir)) is None
 
-        # Sanity: a valid metadata works.
         (ckpt_dir / "metadata.json").write_text(json.dumps({"step": 7}))
         assert mgr.peek_saved_step(path=str(ckpt_dir)) == 7
 
@@ -645,7 +596,7 @@ class TestSaveVLMFreezeMetadata:
         import json
 
         mgr = _make_mock_mgr(tmp_path, monkeypatch)
-        mgr.save(step=1)  # no extra
+        mgr.save(step=1)
         meta = json.loads((tmp_path / "step_1" / "metadata.json").read_text())
         assert "vlm_freeze" not in meta
 
@@ -697,8 +648,8 @@ class TestSaveTrackingSidecar:
 
     def test_key_is_omitted_when_nothing_is_live(self, tmp_path, monkeypatch):
         mgr = _make_mock_mgr(tmp_path, monkeypatch)
-        mgr.save(step=1)  # no source attached
-        mgr.set_tracking_source(list)  # attached, but no backend has a run
+        mgr.save(step=1)
+        mgr.set_tracking_source(list)
         mgr.save(step=2)
         for step in (1, 2):
             text = (tmp_path / f"step_{step}" / "metadata.json").read_text()
@@ -726,7 +677,7 @@ class TestSaveTrackingSidecar:
         mgr = _make_mock_mgr(tmp_path, monkeypatch)
         live: list[dict[str, str]] = []
         mgr.set_tracking_source(lambda: list(live))
-        mgr.save(step=1)  # before the first log of the process: no run yet
+        mgr.save(step=1)
         live.append(self.MLFLOW)
         mgr.save(step=2)
         live.append(self.TENSORBOARD)
@@ -744,7 +695,7 @@ class TestSaveTrackingSidecar:
             return [self.MLFLOW]
 
         mgr.set_tracking_source(source)
-        mgr._rank = 1  # the rank that does not write metadata.json
+        mgr._rank = 1
         mgr.save(step=1)
         assert asked == []
         assert not (tmp_path / "step_1" / "metadata.json").exists()
@@ -841,7 +792,7 @@ class TestSaveTrackingSidecar:
 
         mgr = _make_mock_mgr(tmp_path, monkeypatch)
         mgr.set_tracking_source(source)
-        monkeypatch.setattr(logging, "raiseExceptions", False)  # a logging error is not raised
+        monkeypatch.setattr(logging, "raiseExceptions", False)
         target = logging.getLogger("kempnerforge.checkpoint.manager")
         handler = logging.StreamHandler(io.StringIO())
         target.addHandler(handler)
@@ -856,7 +807,7 @@ class TestSaveTrackingSidecar:
         mgr = _make_mock_mgr(tmp_path, monkeypatch)
         with pytest.raises(TypeError, match="callable or None, got list"):
             mgr.set_tracking_source([self.MLFLOW])  # type: ignore[arg-type]
-        mgr.save(step=1)  # nothing was attached
+        mgr.save(step=1)
         assert "tracking" not in self._sidecar(tmp_path, 1)
 
     def test_train_state_is_untouched(self, tmp_path, monkeypatch):
@@ -931,11 +882,11 @@ class TestSaveTrackingSidecar:
 
         model2, opt2 = build()
         loader = CheckpointManager(config, model2, opt2)
-        loader.set_tracking_source(lambda: [self.MLFLOW])  # a resumed run records again
+        loader.set_tracking_source(lambda: [self.MLFLOW])
         assert loader.peek_saved_step() == 3
         step, tokens_seen, restored = loader.load()
         assert (step, tokens_seen) == (3, 96)
-        assert restored == extra  # the run ids still resume from the torch state
+        assert restored == extra
         for saved, loaded in zip(model.parameters(), model2.parameters(), strict=True):
             assert torch.equal(saved, loaded)
             assert torch.equal(opt.state[saved]["exp_avg"], opt2.state[loaded]["exp_avg"])
@@ -1528,7 +1479,7 @@ class TestLoadVLMFreezeCompare:
         """Older / non-VLM checkpoints have no ``vlm_freeze`` in metadata; a
         VLM run loads them without raising."""
         mgr = _make_mock_mgr(tmp_path, monkeypatch)
-        mgr.save(step=1)  # no extra
+        mgr.save(step=1)
         mgr2 = _make_mock_mgr(tmp_path, monkeypatch)
         step, _, _ = mgr2.load(
             path=str(tmp_path / "step_1"),
@@ -1607,11 +1558,6 @@ class TestLoadVLMFreezeCompare:
         assert "future_arch" in str(exc_info.value)
 
 
-# ---------------------------------------------------------------------------
-# Async-checkpoint `latest` safety (regression for the symlink-before-flush bug)
-# ---------------------------------------------------------------------------
-
-
 class TestAsyncLatestSymlinkSafety:
     """`latest` must never resolve to a checkpoint whose DCP shards are not
     durable, and auto-resume must fall back off an interrupted async flush.
@@ -1668,19 +1614,16 @@ class TestAsyncLatestSymlinkSafety:
         mgr = self._mgr(tmp_path, AsyncCheckpointMode.async_pinned)
         self._install_async_mock(mgr, monkeypatch)
 
-        # First async save: flush in flight, latest must NOT point at step_10.
         mgr.save(step=10)
         assert self._latest_target(tmp_path) is None, (
             "latest advanced before the async flush was durable"
         )
 
-        # Second save awaits step_10's flush -> step_10 now durable + committed.
         mgr.save(step=20)
         tgt = self._latest_target(tmp_path)
         assert tgt == (tmp_path / "step_10").resolve()
         assert (tgt / ".metadata").exists()
 
-        # Final drain (training loop calls wait() after the loop) commits step_20.
         mgr.wait()
         tgt = self._latest_target(tmp_path)
         assert tgt == (tmp_path / "step_20").resolve()
@@ -1692,7 +1635,6 @@ class TestAsyncLatestSymlinkSafety:
         for s in (5, 10, 15, 20, 25):
             mgr.save(step=s)
             tgt = self._latest_target(tmp_path)
-            # Invariant: if latest exists it MUST be a durable checkpoint.
             if tgt is not None:
                 assert (tgt / ".metadata").exists(), (
                     f"latest -> {tgt} but DCP .metadata missing (cycle step {s})"
@@ -1704,7 +1646,6 @@ class TestAsyncLatestSymlinkSafety:
 
     def test_sync_mode_commits_latest_immediately(self, tmp_path, monkeypatch):
         mgr = self._mgr(tmp_path, AsyncCheckpointMode.disabled)
-        # Sync dcp.save is blocking; emulate it writing .metadata before return.
         from kempnerforge.checkpoint.manager import _DCP_METADATA_FILE
 
         def _save(state_dict, checkpoint_id, process_group=None):
@@ -1738,11 +1679,6 @@ class TestAsyncLatestSymlinkSafety:
         mgr = self._mgr(tmp_path, AsyncCheckpointMode.async_pinned)
         _mock_dcp_load(monkeypatch)
 
-        # Attach a handler directly to the manager logger. caplog captures
-        # through a root handler and relies on propagation, which the full
-        # suite's global logging setup can disable (flaky in CI, passes in
-        # isolation). A direct handler is isolation-proof (same pattern as
-        # test_checkpoint_security.py).
         records: list[logging.LogRecord] = []
 
         class _Capture(logging.Handler):
@@ -1847,8 +1783,6 @@ class TestAsyncLatestSymlinkSafety:
         mgr = self._mgr(tmp_path, AsyncCheckpointMode.async_pinned)
         _mock_dcp_load(monkeypatch)
 
-        # DCP fully excluded (fine-tune style): durability is irrelevant, the
-        # incomplete `latest` target itself must still be honored.
         step, tokens, _ = mgr.load(exclude_keys=["model", "optimizer"])
         assert step == 20
         assert tokens == 2000
@@ -1859,45 +1793,46 @@ class TestAsyncLatestSymlinkSafety:
         dirs = {s: self._build_ckpt(tmp_path, s, complete=True) for s in (1, 2, 3, 4, 5)}
 
         latest = Path(tmp_path) / "latest"
-        latest.symlink_to(dirs[3].name)  # latest -> step_3
-        mgr._pending_finalize = (5, dirs[5])  # step_5 async flush in flight
+        latest.symlink_to(dirs[3].name)
+        mgr._pending_finalize = (5, dirs[5])
 
         mgr._cleanup()
 
         assert dirs[3].exists(), "cleanup deleted the live `latest` target"
         assert dirs[5].exists(), "cleanup deleted the in-flight pending checkpoint"
-        # keep_last_n=1 still prunes the genuinely-stale ones.
         assert not dirs[1].exists()
         assert not dirs[2].exists()
 
-    # --- coverage for the distributed barrier + resolution edge paths ---
+    @staticmethod
+    def _record_agreements(monkeypatch) -> list[object]:
+        """Run the manager's status agreement as a one-rank all-reduce, recording each one."""
+        groups: list[object] = []
+        monkeypatch.setattr("kempnerforge.checkpoint.manager.dist.is_initialized", lambda: True)
+        monkeypatch.setattr("kempnerforge.checkpoint.manager.dist.get_rank", lambda group=None: 0)
+        monkeypatch.setattr(
+            "kempnerforge.checkpoint.manager.dist.get_world_size", lambda group=None: 1
+        )
+        monkeypatch.setattr(
+            "kempnerforge.checkpoint.manager.dist.all_reduce",
+            lambda flags, group=None: groups.append(group),
+        )
+        return groups
 
-    def test_save_runs_barrier_when_distributed(self, tmp_path, monkeypatch):
+    def test_save_agrees_when_distributed(self, tmp_path, monkeypatch):
         from unittest.mock import MagicMock
 
         mgr = self._mgr(tmp_path, AsyncCheckpointMode.disabled)
         monkeypatch.setattr(mgr._async_ckpt, "save", MagicMock())
-        barriers = []
-        monkeypatch.setattr("kempnerforge.checkpoint.manager.dist.is_initialized", lambda: True)
-        monkeypatch.setattr(
-            "kempnerforge.checkpoint.manager.dist.barrier",
-            lambda *a, **k: barriers.append(True),
-        )
+        agreements = self._record_agreements(monkeypatch)
         mgr.save(step=1)
-        assert barriers, "save() did not barrier when distributed is initialized"
+        assert agreements, "save() did not agree with the other ranks when distributed"
 
-    def test_wait_and_flush_drain_and_barrier_when_distributed(self, tmp_path, monkeypatch):
+    def test_wait_and_flush_drain_and_agree_when_distributed(self, tmp_path, monkeypatch):
         mgr = self._mgr(tmp_path, AsyncCheckpointMode.async_pinned)
-        barriers = []
-        monkeypatch.setattr("kempnerforge.checkpoint.manager.dist.is_initialized", lambda: True)
-        monkeypatch.setattr(
-            "kempnerforge.checkpoint.manager.dist.barrier",
-            lambda *a, **k: barriers.append(True),
-        )
-        # No pending finalize: drain is a no-op, barrier still runs.
+        agreements = self._record_agreements(monkeypatch)
         mgr.wait()
         mgr.flush_pending_save()
-        assert len(barriers) == 2
+        assert len(agreements) == 2
 
     def test_newest_complete_none_when_base_dir_missing(self, tmp_path):
         mgr = self._mgr(tmp_path / "does_not_exist", AsyncCheckpointMode.async_pinned)
@@ -1912,14 +1847,150 @@ class TestAsyncLatestSymlinkSafety:
     def test_resolve_dcp_load_dir_returns_resolved_when_no_fallback(self, tmp_path):
         mgr = self._mgr(tmp_path, AsyncCheckpointMode.async_pinned)
         incomplete = self._build_ckpt(tmp_path, 5, complete=False)
-        # No complete checkpoint anywhere -> fallback is None -> resolved
-        # is returned unchanged (caller then surfaces the real load error).
         assert mgr._resolve_dcp_load_dir(incomplete, None) == incomplete
 
 
-# ---------------------------------------------------------------------------
-# Dedicated sync-barrier group (async-save / barrier deadlock fix)
-# ---------------------------------------------------------------------------
+def _no_space(*args: object, **kwargs: object) -> None:
+    raise OSError(28, "No space left on device")
+
+
+class TestAFailedSaveCommitsNothing:
+    """A part of a save that raises reaches the caller, and that save is never committed."""
+
+    @staticmethod
+    def _mgr(tmp_path, mode):
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        model = torch.nn.Linear(4, 4)
+        opt = torch.optim.SGD(model.parameters(), lr=0.1)
+        return CheckpointManager(CheckpointConfig(dir=str(tmp_path), async_mode=mode), model, opt)
+
+    @staticmethod
+    def _flushes(monkeypatch, failure: BaseException | None = None) -> list[str]:
+        """Make each ``dcp.async_save`` a flush that has ended, failed with ``failure`` if given.
+
+        Returns the checkpoint ids the saves were dispatched to.
+        """
+        dispatched: list[str] = []
+
+        def async_save(state_dict, checkpoint_id, process_group=None):
+            dispatched.append(checkpoint_id)
+            flush: Future[None] = Future()
+            if failure is None:
+                flush.set_result(None)
+            else:
+                flush.set_exception(failure)
+            return flush
+
+        monkeypatch.setattr("kempnerforge.checkpoint.async_save.dcp.async_save", async_save)
+        return dispatched
+
+    def test_a_failed_shard_write_skips_the_train_state(self, tmp_path, monkeypatch):
+        mgr = self._mgr(tmp_path, AsyncCheckpointMode.disabled)
+        monkeypatch.setattr(mgr._async_ckpt, "save", _no_space)
+        with pytest.raises(OSError, match="No space left"):
+            mgr.save(step=1)
+        assert not (tmp_path / "step_1" / "train_state.pt").exists()
+        assert not (tmp_path / "latest").exists()
+
+    def test_a_dcp_failure_is_reported_to_the_other_ranks(self, tmp_path, monkeypatch):
+        """DCP's ``CheckpointException``, a ``BaseException``, still reaches the agreement."""
+        failure = dcp.CheckpointException("write failed", {})
+
+        def write(*args, **kwargs):
+            raise failure
+
+        mgr = self._mgr(tmp_path, AsyncCheckpointMode.disabled)
+        monkeypatch.setattr(mgr._async_ckpt, "save", write)
+        reported: list[list[int]] = []
+        monkeypatch.setattr("kempnerforge.checkpoint.manager.dist.is_initialized", lambda: True)
+        monkeypatch.setattr("kempnerforge.checkpoint.manager.dist.get_rank", lambda group=None: 0)
+        monkeypatch.setattr(
+            "kempnerforge.checkpoint.manager.dist.get_world_size", lambda group=None: 1
+        )
+        monkeypatch.setattr(
+            "kempnerforge.checkpoint.manager.dist.all_reduce",
+            lambda flags, group=None: reported.append(flags.tolist()),
+        )
+        with pytest.raises(dcp.CheckpointException) as raised:
+            mgr.save(step=1)
+        assert raised.value is failure
+        assert reported == [[1]]
+
+    @pytest.mark.parametrize(
+        "mode", [AsyncCheckpointMode.disabled, AsyncCheckpointMode.async_], ids=str
+    )
+    def test_a_failed_metadata_write_commits_nothing(self, tmp_path, monkeypatch, mode):
+        mgr = self._mgr(tmp_path, mode)
+        monkeypatch.setattr(mgr._async_ckpt, "save", lambda *a, **k: None)
+        monkeypatch.setattr(mgr._async_ckpt, "wait", lambda: None)
+        monkeypatch.setattr("kempnerforge.checkpoint.manager._replace_file", _no_space)
+        with pytest.raises(OSError, match="No space left"):
+            mgr.save(step=1)
+        mgr.wait()
+        assert not (tmp_path / "latest").exists()
+
+    def test_a_failed_commit_raises(self, tmp_path, monkeypatch):
+        mgr = self._mgr(tmp_path, AsyncCheckpointMode.disabled)
+        monkeypatch.setattr(mgr._async_ckpt, "save", lambda *a, **k: None)
+        monkeypatch.setattr(mgr, "_commit_latest", _no_space)
+        with pytest.raises(OSError, match="No space left"):
+            mgr.save(step=1)
+
+    @pytest.mark.parametrize("drain", ["wait", "flush_pending_save"])
+    def test_a_failed_flush_raises_and_commits_nothing(self, tmp_path, monkeypatch, drain):
+        mgr = self._mgr(tmp_path, AsyncCheckpointMode.async_)
+        monkeypatch.setattr(mgr._async_ckpt, "save", lambda *a, **k: None)
+        mgr.save(step=1)
+        monkeypatch.setattr(mgr._async_ckpt, "wait", _no_space)
+        with pytest.raises(OSError, match="No space left"):
+            getattr(mgr, drain)()
+        assert mgr._pending_finalize is None
+        assert not (tmp_path / "latest").exists()
+
+    def test_a_flush_that_failed_before_the_next_save_commits_nothing(self, tmp_path, monkeypatch):
+        mgr = self._mgr(tmp_path, AsyncCheckpointMode.async_)
+        dispatched = self._flushes(monkeypatch, OSError(28, "No space left on device"))
+        mgr.save(step=1)
+        with pytest.raises(OSError, match="No space left"):
+            mgr.save(step=2)
+        assert dispatched == [str(tmp_path / "step_1")]
+        assert mgr._pending_finalize is None
+        assert not (tmp_path / "latest").exists()
+        assert not (tmp_path / "step_2" / "train_state.pt").exists()
+
+    def test_a_save_that_fails_to_dispatch_still_commits_the_one_before(
+        self, tmp_path, monkeypatch
+    ):
+        """Staging step 2 fails after step 1's flush ended: only step 2 is dropped."""
+        mgr = self._mgr(tmp_path, AsyncCheckpointMode.async_)
+        self._flushes(monkeypatch)
+        mgr.save(step=1)
+        monkeypatch.setattr("kempnerforge.checkpoint.async_save.dcp.async_save", _no_space)
+        with pytest.raises(OSError, match="No space left"):
+            mgr.save(step=2)
+        assert (tmp_path / "latest").resolve() == (tmp_path / "step_1").resolve()
+        assert not (tmp_path / "step_2" / "train_state.pt").exists()
+        mgr.wait()
+        assert (tmp_path / "latest").resolve() == (tmp_path / "step_1").resolve()
+
+    @pytest.mark.parametrize(
+        "mode", [AsyncCheckpointMode.disabled, AsyncCheckpointMode.async_], ids=str
+    )
+    def test_a_pruning_error_once_latest_moved_fails_nothing(self, tmp_path, monkeypatch, mode):
+        """A checkpoint is committed once ``latest`` names it; pruning after that only warns."""
+        mgr = self._mgr(tmp_path, mode)
+        monkeypatch.setattr(mgr._async_ckpt, "save", lambda *a, **k: None)
+        monkeypatch.setattr(mgr, "_cleanup", _no_space)
+        warned: list[str] = []
+        monkeypatch.setattr(
+            "kempnerforge.checkpoint.manager.logger.warning",
+            lambda message, *args: warned.append(str(message)),
+        )
+        mgr.save(step=1)
+        mgr.wait()
+        assert (tmp_path / "latest").resolve() == (tmp_path / "step_1").resolve()
+        assert any("No space left" in message for message in warned), warned
 
 
 class TestSyncBarrierGroup:
@@ -1942,9 +2013,11 @@ class TestSyncBarrierGroup:
         mgr = self._mgr(tmp_path)
         assert mgr._sync_group is None
 
-    def test_sync_barrier_noop_when_not_distributed(self, tmp_path):
-        # Must not raise when distributed is not initialized.
-        self._mgr(tmp_path)._sync_barrier()
+    def test_agree_without_a_process_group_raises_only_its_own_error(self, tmp_path):
+        mgr = self._mgr(tmp_path)
+        mgr._agree(None)
+        with pytest.raises(OSError, match="No space left"):
+            mgr._agree(OSError(28, "No space left on device"))
 
     def test_init_creates_dedicated_gloo_group(self, tmp_path, monkeypatch):
         import kempnerforge.checkpoint.manager as mgr_mod
@@ -1963,27 +2036,41 @@ class TestSyncBarrierGroup:
         assert calls["backend"] == "gloo"
         assert mgr._sync_group == "SENTINEL_GLOO_GROUP"
 
-    def test_sync_barrier_uses_dedicated_group_not_default(self, tmp_path, monkeypatch):
+    @staticmethod
+    def _four_ranks(monkeypatch, failing_elsewhere: list[int]) -> list[object]:
+        """Make this rank 0 of 4, with ``failing_elsewhere`` reporting a failure in the all-reduce.
+
+        Returns the groups the all-reduce was issued on.
+        """
         import kempnerforge.checkpoint.manager as mgr_mod
 
-        barrier_calls = []
+        groups: list[object] = []
+
+        def all_reduce(flags, group=None):
+            groups.append(group)
+            flags[failing_elsewhere] = 1
 
         monkeypatch.setattr(mgr_mod.dist, "is_initialized", lambda: True)
         monkeypatch.setattr(mgr_mod.dist, "new_group", lambda backend=None: "GLOO_PG")
-        monkeypatch.setattr(mgr_mod.dist, "get_rank", lambda: 0)
-        monkeypatch.setattr(mgr_mod.dist, "barrier", lambda group=None: barrier_calls.append(group))
+        monkeypatch.setattr(mgr_mod.dist, "get_rank", lambda group=None: 0)
+        monkeypatch.setattr(mgr_mod.dist, "get_world_size", lambda group=None: 4)
+        monkeypatch.setattr(mgr_mod.dist, "all_reduce", all_reduce)
+        return groups
 
-        mgr = self._mgr(tmp_path)
-        mgr._sync_barrier()
+    def test_agree_uses_dedicated_group_not_default(self, tmp_path, monkeypatch):
+        groups = self._four_ranks(monkeypatch, [])
+        self._mgr(tmp_path)._agree(None)
+        assert groups == ["GLOO_PG"]
 
-        # The barrier must target the dedicated gloo group, never the
-        # default group (group=None) that DCP's async thread uses.
-        assert barrier_calls == ["GLOO_PG"]
+    def test_agree_raises_on_every_rank_when_others_failed(self, tmp_path, monkeypatch):
+        self._four_ranks(monkeypatch, [1, 3])
+        with pytest.raises(RuntimeError, match=r"Checkpoint save failed on ranks \[1, 3\]"):
+            self._mgr(tmp_path)._agree(None)
 
-
-# ---------------------------------------------------------------------------
-# CheckpointManager.load -- moment restore + exclude_keys branches
-# ---------------------------------------------------------------------------
+    def test_agree_reraises_this_ranks_own_error(self, tmp_path, monkeypatch):
+        self._four_ranks(monkeypatch, [2])
+        with pytest.raises(OSError, match="No space left"):
+            self._mgr(tmp_path)._agree(OSError(28, "No space left on device"))
 
 
 class TestCheckpointManagerLoad:
@@ -2282,7 +2369,6 @@ class TestResumeWithUnsteppedParameters:
         from kempnerforge.checkpoint.manager import _never_stepped_record
 
         optim_state = {
-            # "b" carries the empty state a resumed never-stepped parameter has.
             "state": {"a.weight": {"step": 1}, "b": {}},
             "param_groups": [{"params": ["a.weight", "b"]}, {"params": ["c.bias"]}],
         }
@@ -2293,11 +2379,9 @@ class TestResumeWithUnsteppedParameters:
     def test_only_recorded_parameters_count_as_never_stepped(self):
         from kempnerforge.checkpoint.manager import _params_recorded_never_stepped
 
-        # "absent" has neither state nor a record, so it is not taken as never
-        # stepped and its load fails on the missing state.
         fqns = {"a.weight", "absent", "proj.weight", "proj.weight_scale"}
         saved_keys = [
-            "model.proj.weight",  # a model entry, not optimizer state
+            "model.proj.weight",
             "optimizer.param_groups.0.lr",
             "optimizer.state.a.weight.nested.moment",
             "optimizer.state.proj.weight_scale.step",
@@ -2411,8 +2495,6 @@ class TestResumeWithUnsteppedParameters:
             "model": get_model_state_dict(model),
             "optimizer": get_optimizer_state_dict(model, optimizer),
         }
-        # A state of plain counters held no tensors, so older writers kept the
-        # whole optimizer as a single entry instead of one key per state value.
         monkeypatch.setattr(_version, "_derived_version", "2_3")
         dcp.save(saved, checkpoint_id=str(tmp_path / "step_1"))
         monkeypatch.undo()
@@ -2994,11 +3076,6 @@ class TestCheckpointEveryOptimizer:
         _assert_same_state_dict(ref_opt.state_dict(), opt2.state_dict())
         for (n, ref), p in zip(reference.named_parameters(), model2.parameters(), strict=True):
             assert torch.equal(ref, p), f"{n} differs from the uninterrupted run"
-
-
-# ---------------------------------------------------------------------------
-# Resume with a different component build (config `plugins` changed)
-# ---------------------------------------------------------------------------
 
 
 class TestComponentSwapOnResume:

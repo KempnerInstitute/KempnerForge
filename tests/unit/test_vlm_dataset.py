@@ -2,18 +2,23 @@
 
 from __future__ import annotations
 
+import itertools
+import logging
 import random
+import re
 
 import pytest
 import torch
 from PIL import Image
 
+from kempnerforge.data import vlm_dataset
 from kempnerforge.data.vlm_dataset import (
     DEFAULT_IMAGE_MEAN,
     DEFAULT_IMAGE_STD,
     HuggingFaceVLMDataset,
     VLMCollator,
     _tokenize_and_mask,
+    check_prompt_fits,
     frames_to_clip_tensor,
     pil_to_tensor,
 )
@@ -21,11 +26,6 @@ from kempnerforge.data.vlm_dataset import (
 
 def _make_image(size: int = 64, color: int = 128) -> Image.Image:
     return Image.new("RGB", (size, size), color=(color, color, color))
-
-
-# ---------------------------------------------------------------------------
-# pil_to_tensor
-# ---------------------------------------------------------------------------
 
 
 class TestPILToTensor:
@@ -48,19 +48,13 @@ class TestPILToTensor:
     def test_normalization(self):
         """Input with pixels at 127.5 (0.5 after /255) should normalize
         to ~0 under mean=0.5, std=0.5."""
-        img = Image.new("RGB", (16, 16), color=(128, 128, 128))  # ~0.502
+        img = Image.new("RGB", (16, 16), color=(128, 128, 128))
         t = pil_to_tensor(img, 16, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD)
-        # (0.502 - 0.5) / 0.5 ~= 0.004
         assert abs(float(t.mean())) < 0.02
 
     def test_non_pil_raises(self):
         with pytest.raises(TypeError, match="Expected a PIL.Image"):
             pil_to_tensor(torch.randn(3, 16, 16), 16, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD)
-
-
-# ---------------------------------------------------------------------------
-# _tokenize_and_mask
-# ---------------------------------------------------------------------------
 
 
 class _MockTokenizer:
@@ -95,26 +89,23 @@ class TestTokenizeAndMask:
         ids, labels = _tokenize_and_mask(tok, "abc", max_text_len=8, prompt=None)
         assert ids.shape == (8,)
         assert labels.shape == (8,)
-        assert ids[:4].tolist() == [1, 2, 3, 28]  # caption + appended EOS
-        assert ids[4].item() == 0  # pad
-        assert labels[:4].tolist() == [2, 3, 28, -100]  # next-token; "c" predicts EOS
-        assert labels[4].item() == -100  # pad masked
+        assert ids[:4].tolist() == [1, 2, 3, 28]
+        assert ids[4].item() == 0
+        assert labels[:4].tolist() == [2, 3, 28, -100]
+        assert labels[4].item() == -100
 
     def test_prompt_masks_labels(self):
         tok = _MockTokenizer()
         ids, labels = _tokenize_and_mask(tok, text="xyz", max_text_len=8, prompt="ab")
-        # Prompt "ab" (2 tokens) + target "xyz" (3) + appended EOS (28).
         assert ids[:6].tolist() == [1, 2, 24, 25, 26, 28]
-        # Next-token: the last prompt token predicts the first target (24), the
-        # last caption token predicts EOS; earlier prompt-predicting positions masked.
         assert labels[0].item() == -100
         assert labels[1:5].tolist() == [24, 25, 26, 28]
-        assert labels[5].item() == -100  # EOS has no successor
+        assert labels[5].item() == -100
 
     def test_truncation(self):
         tok = _MockTokenizer()
         ids, labels = _tokenize_and_mask(tok, text="abcdefghij", max_text_len=4, prompt=None)
-        assert ids.tolist() == [1, 2, 3, 28]  # caption truncated to fit the appended EOS
+        assert ids.tolist() == [1, 2, 3, 28]
         assert labels.tolist() == [2, 3, 28, -100]
 
     def test_single_token_caption_supervises_eos(self):
@@ -122,8 +113,8 @@ class TestTokenizeAndMask:
         EOS), so it is never an all--100 row."""
         tok = _MockTokenizer()
         ids, labels = _tokenize_and_mask(tok, "a", max_text_len=8, prompt=None)
-        assert ids[:2].tolist() == [1, 28]  # "a" + EOS
-        assert labels[0].item() == 28  # predict EOS (learn to stop)
+        assert ids[:2].tolist() == [1, 28]
+        assert labels[0].item() == 28
         assert (labels[1:] == -100).all()
 
     def test_empty_caption_all_masked(self):
@@ -138,8 +129,8 @@ class TestTokenizeAndMask:
         tok = _MockTokenizer()
         tok.eos_token_id = None
         ids, labels = _tokenize_and_mask(tok, "abcde", max_text_len=4, prompt=None)
-        assert ids.tolist() == [1, 2, 3, 4]  # no EOS slot reserved; kept full 4 tokens
-        assert labels.tolist() == [2, 3, 4, -100]  # next-token; last real token unsupervised
+        assert ids.tolist() == [1, 2, 3, 4]
+        assert labels.tolist() == [2, 3, 4, -100]
 
     def test_prompt_mask_with_bpe_tokenizer(self):
         """Regression: BPE (gpt2) and SentencePiece tokenizers are not
@@ -163,12 +154,8 @@ class TestTokenizeAndMask:
 
         ids, labels = _tokenize_and_mask(tok, text, max_text_len=32, prompt=prompt)
 
-        # input_ids exactly matches the independent-concat form.
         assert ids[:n].tolist() == expected_ids
-        # Positions predicting a prompt token are -100 (the last prompt token
-        # predicts the first target, so it stays supervised).
         assert (labels[: len(prompt_ids) - 1] == -100).all()
-        # Target labels are the independently-tokenized text ids, byte-for-byte.
         assert labels[len(prompt_ids) - 1 : n - 1].tolist() == text_ids
 
     def test_prompt_mask_under_bpe_merge_keeps_target_intact(self):
@@ -188,11 +175,8 @@ class TestTokenizeAndMask:
 
         ids, labels = _tokenize_and_mask(tok, text, max_text_len=16, prompt=prompt)
 
-        # We store the split form on input_ids (not the joined BPE form).
         split_total = len(prompt_ids) + len(text_ids)
         assert ids[:split_total].tolist() == prompt_ids + text_ids
-        # Target is exactly tokenize(text) — a regression would show up
-        # here as a drift in the label ids (not just their length).
         assert (
             labels[len(prompt_ids) - 1 : len(prompt_ids) - 1 + len(text_ids)].tolist() == text_ids
         )
@@ -210,9 +194,9 @@ def _expected_next_token_labels(ids: list[int], prompt_len: int, max_text_len: i
     for t in range(max_text_len):
         nxt = t + 1
         if nxt >= len(ids):
-            continue  # no successor token to predict
+            continue
         if nxt <= prompt_len - 1:
-            continue  # successor is a prompt token: given, not supervised
+            continue
         labels[t] = ids[nxt]
     return labels
 
@@ -224,22 +208,21 @@ class TestNextTokenLabelContract:
     @pytest.mark.parametrize(
         ("text", "prompt", "max_text_len"),
         [
-            ("abc", None, 8),  # ordinary caption, room to spare
-            ("abc", "ab", 8),  # prompted caption
-            ("abcdefg", None, 8),  # caption exactly max_text_len - 1 tokens
-            ("abcdefgh", None, 8),  # caption exactly max_text_len tokens
-            ("abcdefghijkl", None, 8),  # caption longer than the budget
-            ("abcdefgh", "qrs", 8),  # prompt + overlong caption
-            ("a", None, 8),  # single-token caption
-            ("", None, 8),  # empty caption
-            ("abc", "", 8),  # empty prompt string
-            ("ab", "a", 8),  # prompt_len == 1
-            ("a", None, 2),  # minimum legal max_text_len
-            # prompt at and beyond the budget: prompt_len is measured before
-            # truncation, so these pin that it still lines up with the boundary.
-            ("xyz", "aaaaaaa", 8),  # prompt fills max_text_len - 1
-            ("xyz", "aaaaaaaa", 8),  # prompt fills max_text_len
-            ("xyz", "aaaaaaaaaaaa", 8),  # prompt longer than max_text_len
+            ("abc", None, 8),
+            ("abc", "ab", 8),
+            ("abcdefg", None, 8),
+            ("abcdefgh", None, 8),
+            ("abcdefghijkl", None, 8),
+            ("abcdefgh", "qrs", 8),
+            ("a", None, 8),
+            ("", None, 8),
+            ("abc", "", 8),
+            ("ab", "a", 8),
+            ("a", None, 2),
+            ("xyz", "aaaaaa", 8),
+            ("xyz", "aaaaaaa", 8),
+            ("xyz", "aaaaaaaa", 8),
+            ("xyz", "aaaaaaaaaaaa", 8),
         ],
     )
     @pytest.mark.parametrize("with_eos", [True, False])
@@ -249,26 +232,23 @@ class TestNextTokenLabelContract:
             tok.eos_token_id = None
         ids, labels = _tokenize_and_mask(tok, text, max_text_len, prompt)
 
-        # --- input_ids properties (stated, not copied from the implementation)
         real = list(tok(text)["input_ids"])
         prompt_ids = list(tok(prompt)["input_ids"]) if prompt is not None else []
-        # With an EOS one slot is reserved for it; without, the full budget is text.
         budget = max_text_len - 1 if with_eos else max_text_len
         kept = (prompt_ids + real)[:budget]
         n = len(kept) + (1 if with_eos else 0)
         assert ids.shape == (max_text_len,)
         assert ids[: len(kept)].tolist() == kept
         if with_eos:
-            # EOS always lands in input_ids: truncation reserves its slot, so it
-            # can never be the token that falls off the end.
             assert ids[len(kept)].item() == tok.eos_token_id
-        assert (ids[n:] == 0).all()  # pad
+        assert (ids[n:] == 0).all()
 
-        # --- labels match the derived contract exactly
         prompt_len = min(len(prompt_ids), n)
-        assert labels.tolist() == _expected_next_token_labels(
-            ids[:n].tolist(), prompt_len, max_text_len
-        )
+        expected = _expected_next_token_labels(ids[:n].tolist(), prompt_len, max_text_len)
+        caption_slots = max_text_len - len(prompt_ids) - (1 if with_eos else 0)
+        if prompt is not None and caption_slots < 1:
+            expected = [-100] * max_text_len
+        assert labels.tolist() == expected
 
     def test_prompt_mask_boundary_both_directions(self):
         """The two indices either side of the prompt boundary, pinned.
@@ -281,16 +261,13 @@ class TestNextTokenLabelContract:
         """
         tok = _MockTokenizer()
         prompt, text = "abcd", "xyz"
-        prompt_len = len(tok(prompt)["input_ids"])  # 4
+        prompt_len = len(tok(prompt)["input_ids"])
         ids, labels = _tokenize_and_mask(tok, text, max_text_len=16, prompt=prompt)
 
         first_caption_id = tok(text)["input_ids"][0]
         assert ids[prompt_len].item() == first_caption_id
-        # Supervised: predicts the first caption token.
         assert labels[prompt_len - 1].item() == first_caption_id
-        # Masked: would predict the last prompt token.
         assert labels[prompt_len - 2].item() == -100
-        # And every earlier position is masked too (none leak).
         assert (labels[: prompt_len - 1] == -100).all()
 
     def test_eos_is_a_supervised_target(self):
@@ -308,18 +285,17 @@ class TestNextTokenLabelContract:
         ids, labels = _tokenize_and_mask(tok, "abcdefghij", max_text_len=5, prompt=None)
         assert ids[-1].item() == tok.eos_token_id
         assert labels[-2].item() == tok.eos_token_id
-        assert labels[-1].item() == -100  # EOS has no successor
+        assert labels[-1].item() == -100
 
-    def test_prompt_filling_the_budget_is_in_range(self):
-        """A prompt that leaves no room for a caption must not raise or produce a
-        negative-index slice. It degrades to a row with nothing (or only EOS)
-        supervised; rejecting such a prompt up front is a separate concern and is
-        not validated here."""
+    def test_prompt_filling_the_budget_masks_every_label(self):
+        """A prompt that leaves no room for a caption token neither raises nor
+        produces a negative-index slice: the sample keeps its static shapes and
+        every label is masked, so it adds no loss instead of training on EOS alone."""
         tok = _MockTokenizer()
         for prompt_chars in (7, 8, 12):
-            _, labels = _tokenize_and_mask(tok, "xyz", max_text_len=8, prompt="a" * prompt_chars)
-            assert labels.shape == (8,)
-            assert (labels == -100).all() or (labels != -100).sum() == 1
+            ids, labels = _tokenize_and_mask(tok, "xyz", max_text_len=8, prompt="a" * prompt_chars)
+            assert ids.shape == labels.shape == (8,)
+            assert (labels == -100).all()
 
     def test_labels_are_identical_across_ranks(self, monkeypatch):
         """Every DP rank must build byte-identical labels for a given index.
@@ -352,9 +328,238 @@ class TestNextTokenLabelContract:
         assert labels0 == labels1
 
 
-# ---------------------------------------------------------------------------
-# VLMCollator
-# ---------------------------------------------------------------------------
+class _CountingTokenizer(_MockTokenizer):
+    """``_MockTokenizer`` that records every text it tokenizes."""
+
+    def __init__(self, eos_token_id: int | None = 28) -> None:
+        self.eos_token_id = eos_token_id
+        self.texts: list[str] = []
+
+    def __call__(self, text: str, add_special_tokens: bool = False):
+        self.texts.append(text)
+        return super().__call__(text, add_special_tokens)
+
+
+class _RecordingHandler(logging.Handler):
+    """Keeps every record that passes its filters."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+
+def _prompted_dataset(
+    tmp_path,
+    monkeypatch,
+    prompts: list,
+    tokenizer: _MockTokenizer | None = None,
+    prompt_dtype: str | None = None,
+) -> HuggingFaceVLMDataset:
+    """A real ``HuggingFaceVLMDataset`` whose rows pair caption ``"xyz"`` with ``prompts``.
+
+    The prompt column is cast to ``Value(prompt_dtype)`` when ``prompt_dtype`` is given.
+    """
+    from datasets import Dataset, Value
+
+    rows = Dataset.from_dict(
+        {
+            "image": [_make_image(32, 50 + i) for i in range(len(prompts))],
+            "caption": ["xyz"] * len(prompts),
+            "prompt": prompts,
+        }
+    )
+    if prompt_dtype is not None:
+        rows = rows.cast_column("prompt", Value(prompt_dtype))
+    rows.save_to_disk(str(tmp_path / "prompted"))
+    tok = tokenizer if tokenizer is not None else _MockTokenizer()
+    monkeypatch.setattr(vlm_dataset, "build_tokenizer", lambda path: tok)
+    return HuggingFaceVLMDataset(
+        dataset_name=str(tmp_path / "prompted"),
+        split="train",
+        image_field="image",
+        text_field="caption",
+        tokenizer_path="unused",
+        max_text_len=8,
+        prompt_field="prompt",
+        image_size=16,
+    )
+
+
+class TestPromptRoom:
+    """A prompt must leave room in ``max_text_len`` for one caption token, which the
+    last prompt token predicts, plus the EOS that caption token predicts when the
+    tokenizer defines one. With ``max_text_len = 8`` the longest prompt that fits is
+    6 tokens with an EOS and 7 without."""
+
+    @pytest.mark.parametrize(
+        ("eos_token_id", "prompt_tokens", "supervised"),
+        [(28, 6, [24, 28]), (None, 7, [24])],
+    )
+    def test_longest_fitting_prompt_supervises_a_caption_token(
+        self, eos_token_id, prompt_tokens, supervised
+    ):
+        tok = _MockTokenizer()
+        tok.eos_token_id = eos_token_id
+        prompt = "a" * prompt_tokens
+        _, labels = _tokenize_and_mask(tok, "xyz", max_text_len=8, prompt=prompt)
+        assert labels[labels != -100].tolist() == supervised
+        check_prompt_fits(tok, prompt, max_text_len=8)
+
+    @pytest.mark.parametrize(("eos_token_id", "prompt_tokens"), [(28, 7), (None, 8)])
+    def test_one_more_prompt_token_masks_the_sample_and_fails_the_check(
+        self, eos_token_id, prompt_tokens
+    ):
+        tok = _MockTokenizer()
+        tok.eos_token_id = eos_token_id
+        prompt = "a" * prompt_tokens
+        ids, labels = _tokenize_and_mask(tok, "xyz", max_text_len=8, prompt=prompt)
+        assert ids.shape == (8,)
+        assert (labels == -100).all()
+        with pytest.raises(
+            ValueError,
+            match=rf"prompt is {prompt_tokens} tokens.*needs max_text_len >= 9.*vlm\.max_text_len",
+        ):
+            check_prompt_fits(tok, prompt, max_text_len=8)
+
+    def test_truncating_a_long_caption_is_not_masked(self, monkeypatch, caplog):
+        monkeypatch.setattr(logging.getLogger("kempnerforge"), "propagate", True)
+        tok = _MockTokenizer()
+        with caplog.at_level(logging.WARNING, logger="kempnerforge.data.vlm_dataset"):
+            _, labels = _tokenize_and_mask(tok, "xyzxyzxyz", max_text_len=8, prompt="ab")
+        assert labels[labels != -100].tolist() == [24, 25, 26, 24, 25, 28]
+        assert caplog.records == []
+
+    def test_masked_samples_are_logged_at_powers_of_two(self, monkeypatch, caplog):
+        monkeypatch.setattr(vlm_dataset, "_samples_masked_for_prompt", itertools.count(1))
+        monkeypatch.setattr(logging.getLogger("kempnerforge"), "propagate", True)
+        tok = _MockTokenizer()
+        with caplog.at_level(logging.WARNING, logger="kempnerforge.data.vlm_dataset"):
+            for _ in range(5):
+                _tokenize_and_mask(tok, "xyz", max_text_len=8, prompt="a" * 7)
+        messages = [r.getMessage() for r in caplog.records]
+        assert [re.search(r"\((\d+) such samples", m).group(1) for m in messages] == [
+            "1",
+            "2",
+            "4",
+        ]
+        assert all("needs max_text_len >= 9" in m and "max_text_len=8" in m for m in messages)
+
+    def test_masked_sample_warning_passes_the_rank_zero_filter_on_every_rank(self, monkeypatch):
+        """KF's log handler drops records from every rank but 0, and a masked sample is
+        seen only by the rank that reads it, so its warning is marked for every rank."""
+        from kempnerforge.metrics.logger import _RankFilter
+
+        monkeypatch.setattr(vlm_dataset, "_samples_masked_for_prompt", itertools.count(1))
+        monkeypatch.setenv("RANK", "3")
+        handler = _RecordingHandler()
+        handler.addFilter(_RankFilter(rank=0))
+        dataset_logger = logging.getLogger("kempnerforge.data.vlm_dataset")
+        monkeypatch.setattr(dataset_logger, "handlers", [handler])
+        monkeypatch.setattr(dataset_logger, "propagate", False)
+        _tokenize_and_mask(_MockTokenizer(), "xyz", max_text_len=8, prompt="a" * 7)
+        dataset_logger.warning("an unmarked record")
+        assert [r.getMessage() for r in handler.records] == [
+            "A prompt needs max_text_len >= 9 to leave room for a caption token, but "
+            "max_text_len=8: masked every label of that sample so it adds no loss "
+            "(1 such samples so far in this process, logged at powers of two)"
+        ]
+
+    def test_per_sample_prompts_are_masked_row_by_row(self, tmp_path, monkeypatch):
+        """A column with a prompt that fits is admitted, and a row whose prompt leaves
+        no room is masked when it is read; the rows around it are unaffected."""
+        ds = _prompted_dataset(tmp_path, monkeypatch, ["ab", "a" * 7, "a" * 6])
+        supervised = [ds[i]["labels"][ds[i]["labels"] != -100].tolist() for i in range(3)]
+        assert supervised == [[24, 25, 26, 28], [], [24, 28]]
+        assert ds[1]["input_ids"].shape == (8,)
+
+
+class TestPromptColumnRoom:
+    """Building the dataset rejects a prompt column in which no row leaves room for a
+    caption token, since every sample would add no loss. It reads the column only up
+    to the first row that trains on something, so the bound is the per-sample one
+    and the rows after it are left to the per-sample masking."""
+
+    @pytest.mark.parametrize(("eos_token_id", "prompt_tokens"), [(28, 7), (None, 8)])
+    def test_a_column_with_no_prompt_that_fits_is_rejected(
+        self, tmp_path, monkeypatch, eos_token_id, prompt_tokens
+    ):
+        prompts = ["a" * (prompt_tokens + 3), "a" * prompt_tokens, "a" * (prompt_tokens + 1)]
+        tok = _CountingTokenizer(eos_token_id)
+        with pytest.raises(
+            ValueError,
+            match=(
+                rf"No prompt in column 'prompt' leaves room in max_text_len=8 .* the shortest "
+                rf"is {prompt_tokens} tokens \(needs max_text_len >= 9\); raise vlm\.max_text_len"
+            ),
+        ):
+            _prompted_dataset(tmp_path, monkeypatch, prompts, tok)
+        assert tok.texts == prompts
+
+    @pytest.mark.parametrize(("eos_token_id", "prompt_tokens"), [(28, 6), (None, 7)])
+    def test_the_last_row_fitting_admits_the_column(
+        self, tmp_path, monkeypatch, eos_token_id, prompt_tokens
+    ):
+        overlong = "a" * (prompt_tokens + 1)
+        tok = _CountingTokenizer(eos_token_id)
+        prompts = [overlong, overlong, "a" * prompt_tokens]
+        ds = _prompted_dataset(tmp_path, monkeypatch, prompts, tok)
+        assert tok.texts == prompts
+        assert [bool((ds[i]["labels"] != -100).any()) for i in range(3)] == [False, False, True]
+
+    def test_a_row_without_a_prompt_admits_the_column(self, tmp_path, monkeypatch):
+        ds = _prompted_dataset(tmp_path, monkeypatch, ["a" * 7, None, "a" * 9])
+        assert [bool((ds[i]["labels"] != -100).any()) for i in range(3)] == [False, True, False]
+
+    def test_the_column_is_read_only_up_to_the_first_row_that_fits(self, tmp_path, monkeypatch):
+        tok = _CountingTokenizer()
+        _prompted_dataset(tmp_path, monkeypatch, ["a" * 7, "ab", "a" * 9, "a" * 12], tok)
+        assert tok.texts == ["a" * 7, "ab"]
+
+    def test_an_empty_dataset_is_not_rejected(self, tmp_path, monkeypatch):
+        assert len(_prompted_dataset(tmp_path, monkeypatch, [])) == 0
+
+
+class TestPromptColumnType:
+    """Building the dataset rejects a prompt column whose type admits a value that is
+    neither a string nor missing, whatever its rows hold, so every rank fails while
+    building it instead of the rank that reads such a value failing mid-run while its
+    peers wait in a collective."""
+
+    @pytest.mark.parametrize(
+        "prompts",
+        [[None, ["ab"], None, None], [["ab"]], [None, 3], [None, b"ab"], [None, {"text": "ab"}]],
+        ids=["list-after-a-missing-row", "list", "int", "bytes", "struct"],
+    )
+    def test_a_column_of_another_type_is_rejected_before_any_row_is_read(
+        self, tmp_path, monkeypatch, prompts
+    ):
+        from datasets import Dataset
+
+        feature = Dataset.from_dict({"prompt": prompts}).features["prompt"]
+        tok = _CountingTokenizer()
+        with pytest.raises(
+            TypeError,
+            match=rf"'prompt' must be a string column.*'null' when no row has a prompt.*got "
+            rf"{re.escape(str(feature))}$",
+        ):
+            _prompted_dataset(tmp_path, monkeypatch, prompts, tok)
+        assert tok.texts == []
+
+    @pytest.mark.parametrize(
+        ("prompts", "dtype"),
+        [(["ab", None], "string"), (["ab", None], "large_string"), ([None, None], "null")],
+    )
+    def test_a_string_column_or_one_with_no_prompt_is_admitted(
+        self, tmp_path, monkeypatch, prompts, dtype
+    ):
+        ds = _prompted_dataset(tmp_path, monkeypatch, prompts, prompt_dtype=dtype)
+        assert ds._ds.features["prompt"].dtype == dtype
+        for i, prompt in enumerate(prompts):
+            _, labels = _tokenize_and_mask(_MockTokenizer(), "xyz", max_text_len=8, prompt=prompt)
+            assert torch.equal(ds[i]["labels"], labels)
 
 
 class TestVLMCollator:
@@ -403,11 +608,6 @@ class TestVLMCollator:
             VLMCollator(pad_id=0, max_text_len=0)
 
 
-# ---------------------------------------------------------------------------
-# HuggingFaceVLMDataset (in-memory, no network)
-# ---------------------------------------------------------------------------
-
-
 @pytest.fixture
 def tiny_hf_dataset(tmp_path):
     """Build a synthetic HF dataset in memory using datasets.Dataset.from_dict.
@@ -433,7 +633,6 @@ class TestHuggingFaceVLMDataset:
     def test_getitem_shapes(self, tiny_hf_dataset):
         from datasets import load_from_disk
 
-        # Bypass load_dataset by injecting the preloaded dataset.
         class _Wrapper(HuggingFaceVLMDataset):
             def __init__(self, ds, tokenizer_path, max_text_len):
                 from transformers import AutoTokenizer
@@ -493,7 +692,6 @@ class TestHuggingFaceVLMDataset:
             max_text_len=4,
         )
         assert len(ds) == 1
-        # Confirm we got the validation split, not train.
         assert "river" in ds._ds[0]["caption"]  # type: ignore[attr-defined]
 
     def test_init_via_load_dataset_branch(self, monkeypatch, tiny_hf_dataset):
@@ -515,13 +713,12 @@ class TestHuggingFaceVLMDataset:
             return prebuilt
 
         monkeypatch.setattr(mod, "load_dataset", fake_load_dataset, raising=False)
-        # Patch the import target that __init__ pulls in lazily.
         import datasets
 
         monkeypatch.setattr(datasets, "load_dataset", fake_load_dataset)
 
         ds = HuggingFaceVLMDataset(
-            dataset_name="some/hub-id",  # not a directory -> load_dataset path
+            dataset_name="some/hub-id",
             split="train",
             image_field="image",
             text_field="caption",
@@ -537,7 +734,6 @@ class TestHuggingFaceVLMDataset:
         import datasets
         from datasets import IterableDataset
 
-        # Build a tiny IterableDataset and have load_dataset hand it back.
         def gen():
             yield {"image": _make_image(32, 50), "caption": "hi."}
 
@@ -556,9 +752,6 @@ class TestHuggingFaceVLMDataset:
 
     def test_getitem_rejects_non_string_text(self, tiny_hf_dataset):
         """Schema guard: text field must be a string at __getitem__ time."""
-        # tiny_hf_dataset fixture is parameter-bound (forces creation) but we
-        # do not need to load it here; the schema-guard check uses a fresh
-        # in-memory dataset with a non-string column.
         del tiny_hf_dataset
         from datasets import Dataset
 
@@ -585,6 +778,20 @@ class TestHuggingFaceVLMDataset:
         wrapper = _Wrapper(mixed, tokenizer_path="gpt2", max_text_len=4)
         with pytest.raises(TypeError, match="must be str"):
             _ = wrapper[0]
+
+    def test_getitem_rejects_a_non_string_prompt(self, tmp_path, monkeypatch):
+        """A prompt value that is not a string is rejected, not dropped as no prompt."""
+        ds = _prompted_dataset(tmp_path, monkeypatch, ["ab"])
+        row = {"image": _make_image(32), "caption": "xyz", "prompt": ["ab"]}
+        monkeypatch.setattr(ds, "_ds", [row])
+        with pytest.raises(TypeError, match="'prompt' must be str or None, got list"):
+            _ = ds[0]
+
+    def test_missing_prompt_trains_as_an_unprompted_caption(self, tmp_path, monkeypatch):
+        """``None`` is how a string column stores a missing value: that row has no prompt."""
+        ds = _prompted_dataset(tmp_path, monkeypatch, ["ab", None])
+        _, unprompted = _tokenize_and_mask(_MockTokenizer(), "xyz", max_text_len=8, prompt=None)
+        assert torch.equal(ds[1]["labels"], unprompted)
 
     def test_collator_wired_through_stateful_dataloader(self, tiny_hf_dataset):
         """VLMCollator reaches the batch when passed via collate_fn.
@@ -648,7 +855,7 @@ class TestFramesToClipTensor:
         pv, mask = frames_to_clip_tensor(frames, max_frames=5, frame_size=16)
         assert pv.shape == (5, 3, 16, 16)
         assert mask.tolist() == [True, True, False, False, False]
-        assert torch.count_nonzero(pv[2:]) == 0  # padded frames are zero
+        assert torch.count_nonzero(pv[2:]) == 0
 
     def test_single_image_is_one_frame_clip(self):
         pv, mask = frames_to_clip_tensor([_make_image(20)], max_frames=3, frame_size=16)
