@@ -43,11 +43,6 @@ def _build_adamw(
     )
 
 
-# ---------------------------------------------------------------------------
-# Lion optimizer
-# ---------------------------------------------------------------------------
-
-
 class Lion(torch.optim.Optimizer):
     """Lion optimizer (Chen et al., 2023): Evolved Sign Momentum.
 
@@ -101,18 +96,13 @@ class Lion(torch.optim.Optimizer):
 
                 m = state["exp_avg"]
 
-                # Update direction: sign of interpolated momentum + gradient
-                # .mul() (not in-place) creates a temporary — m is unchanged
                 update = (m.mul(beta1) + grad.mul(1 - beta1)).sign_()
 
-                # Decoupled weight decay
                 if wd > 0:
                     p.data.mul_(1 - lr * wd)
 
-                # Apply update
                 p.data.add_(update, alpha=-lr)
 
-                # Update momentum buffer
                 m.mul_(beta2).add_(grad, alpha=1 - beta2)
 
         return loss
@@ -128,11 +118,6 @@ def _build_lion(
         lr=config.lr,
         betas=config.betas,
     )
-
-
-# ---------------------------------------------------------------------------
-# Schedule-Free AdamW
-# ---------------------------------------------------------------------------
 
 
 class ScheduleFreeAdamW(torch.optim.Optimizer):
@@ -196,7 +181,6 @@ class ScheduleFreeAdamW(torch.optim.Optimizer):
             eps = group["eps"]
             wd = group["weight_decay"]
 
-            # Weight for Polyak averaging (accounts for variable LR during warmup)
             weight = lr * (1 - beta1)
 
             for p in group["params"]:
@@ -214,37 +198,24 @@ class ScheduleFreeAdamW(torch.optim.Optimizer):
                 z = state["z"]
                 v = state["v"]
 
-                # Second moment update
                 v.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
 
-                # Bias-corrected denominator
                 bc2 = 1 - beta2**k
                 denom = (v / bc2).sqrt().add_(eps)
 
-                # Update z (the iterate)
                 z.addcdiv_(grad, denom, value=-lr)
 
-                # Decoupled weight decay on z
                 if wd > 0:
                     z.mul_(1 - lr * wd)
 
-                # Polyak average coefficient
                 state["weight_sum"] += weight
                 ck = weight / state["weight_sum"]
 
-                # Update p.data via interpolation:
-                # x_new = (1 - ck) * x_old + ck * z
-                # y_new = (1 - beta1) * z + beta1 * x_new
-                # We don't store x explicitly — derive it from current y and z:
-                # x_old = (y_old - (1 - beta1) * z_old) / beta1
-                # But z changed, so we need a different approach.
-                # Store x explicitly for correctness:
                 if "x" not in state:
                     state["x"] = z.clone()
                 else:
                     state["x"].lerp_(z, ck)
 
-                # Set params to interpolated point for next gradient computation
                 p.data.copy_(z).lerp_(state["x"], beta1)
 
         return loss
@@ -287,11 +258,6 @@ def _build_schedule_free_adamw(
     )
 
 
-# ---------------------------------------------------------------------------
-# Muon optimizer
-# ---------------------------------------------------------------------------
-
-
 def _newton_schulz(G: torch.Tensor, steps: int = 5) -> torch.Tensor:
     """Approximate orthogonal projection via Newton-Schulz iteration.
 
@@ -311,7 +277,6 @@ def _newton_schulz(G: torch.Tensor, steps: int = 5) -> torch.Tensor:
     assert G.ndim == 2
     a, b, c = 3.4445, -4.7750, 2.0315
 
-    # Frobenius normalization (matches reference Muon; sufficient for NS convergence)
     X = G / (G.norm() + 1e-7)
 
     for _ in range(steps):
@@ -416,7 +381,6 @@ class Muon(torch.optim.Optimizer):
         self._initial_lr = lr
         self._initial_adam_lr = adam_lr
 
-        # Create internal AdamW for 1D params
         self._adam = (
             torch.optim.AdamW(
                 adam_params,
@@ -499,14 +463,8 @@ class Muon(torch.optim.Optimizer):
             params = [p for p in group["params"] if p.grad is not None]
             inputs = []
             for p in params:
-                # Work on local tensors to avoid DTensor/Tensor mixing.
-                # FSDP2 wraps params as DTensors; operating on the local
-                # shard directly sidesteps distributed tensor dispatch.
                 g_local = _get_local_tensor(p.grad)
 
-                # Momentum buffer: stored matching p.grad's type (DTensor if
-                # FSDP2) so DCP can save/restore it correctly. We operate on
-                # the local shard for the actual computation.
                 state = self.state[p]
                 if "momentum_buffer" not in state:
                     state["momentum_buffer"] = torch.zeros_like(p.grad)
@@ -531,15 +489,11 @@ class Muon(torch.optim.Optimizer):
                     m, n = ortho.shape
                 update.mul_(_muon_update_scale(adjust_lr, m, n))
 
-                # Decoupled weight decay
                 if wd > 0:
                     p_local.mul_(1 - lr * wd)
 
                 p_local.add_(update, alpha=-lr)
 
-        # Step the internal AdamW for 1D params.
-        # Scale Adam LR proportionally to Muon's current LR so the scheduler's
-        # warmup/decay applies to both — the scheduler only sees Muon's param_groups.
         if self._adam is not None:
             if self._initial_lr > 0:
                 scale = self.param_groups[0]["lr"] / self._initial_lr
@@ -559,7 +513,6 @@ def _is_muon_eligible(param: torch.Tensor) -> bool:
     """
     if param.ndim < 2:
         return False
-    # Aspect ratio check: max/min > 10 means too rectangular for NS
     m, n = param.shape[0], param.view(param.shape[0], -1).shape[1]
     return max(m, n) / max(min(m, n), 1) <= 10
 
@@ -569,7 +522,6 @@ def _build_muon(
     param_groups: list[dict],
     config: OptimizerConfig,
 ) -> torch.optim.Optimizer:
-    # Split: 2D params with reasonable aspect ratio get Muon, rest gets AdamW
     muon_groups = []
     adam_groups = []
 
@@ -607,11 +559,6 @@ def _build_muon(
         adjust_lr=config.muon_adjust_lr,
         orthogonalize=config.muon_orthogonalize,
     )
-
-
-# ---------------------------------------------------------------------------
-# Optimizer construction
-# ---------------------------------------------------------------------------
 
 
 def _should_decay(name: str, param: torch.nn.Parameter) -> bool:
@@ -653,7 +600,6 @@ def build_optimizer(
         {"params": no_decay_params, "weight_decay": 0.0},
     ]
 
-    # Log parameter counts
     n_decay = sum(p.numel() for p in decay_params)
     n_no_decay = sum(p.numel() for p in no_decay_params)
     logger.info(

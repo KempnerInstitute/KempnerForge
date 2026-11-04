@@ -19,13 +19,12 @@ import re
 import statistics as st
 from pathlib import Path
 
-# [step N] loss=.. | lr=.. | grad_norm=.. | tok/s=.. | mfu=..% | mem=../..GB | step_time=..s
 STEP_RE = re.compile(
     r"\[step (\d+)\] loss=([\d.]+).*?tok/s=([\d,]+).*?mfu=([\d.]+)%.*?"
     r"mem=([\d.]+)/([\d.]+)GB.*?step_time=([\d.]+)s"
 )
 
-GPU_PEAK_BF16 = 989.5e12  # H200 SXM dense bf16 peak, FLOP/s per GPU
+GPU_PEAK_BF16 = 989.5e12
 N_GPU = 360
 SEQ_LEN = 4096
 BATCH_PER_GPU = 8

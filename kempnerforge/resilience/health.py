@@ -18,11 +18,6 @@ import torch.distributed as dist
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# NaN / Inf detection
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class NaNState:
     """Tracks NaN/Inf occurrences across training steps."""
@@ -83,8 +78,6 @@ class NaNDetector:
         """
         local_nan = not _is_finite(loss)
 
-        # Sync NaN flag across all ranks to prevent desync.
-        # One tiny all-reduce (4 bytes) — negligible vs gradient sync.
         if dist.is_initialized():
             nan_flag = torch.tensor([1.0 if local_nan else 0.0], device="cuda")
             dist.all_reduce(nan_flag)
@@ -98,7 +91,6 @@ class NaNDetector:
             self.state.last_good_step = step
             return True
 
-        # NaN detected (on this rank or another)
         self.state.consecutive_nans += 1
         self.state.total_nans += 1
         if len(self.state.nan_steps) < self.max_history:
@@ -157,11 +149,6 @@ class NaNDetector:
         self.state = NaNState()
 
 
-# ---------------------------------------------------------------------------
-# GPU health
-# ---------------------------------------------------------------------------
-
-
 def check_gpu_health(device: int = 0) -> dict[str, bool | str]:
     """Run basic GPU health checks.
 
@@ -186,18 +173,15 @@ def check_gpu_health(device: int = 0) -> dict[str, bool | str]:
         return result
 
     try:
-        # Check device is accessible
         torch.cuda.set_device(device)
         result["device_accessible"] = True
 
-        # Test computation
         x = torch.ones(16, device=f"cuda:{device}")
         y = x + x
         assert y.sum().item() == 32.0
         result["compute_ok"] = True
         del x, y
 
-        # Test memory allocation (1MB)
         buf = torch.empty(256 * 1024, dtype=torch.float32, device=f"cuda:{device}")
         del buf
         result["memory_ok"] = True
@@ -226,14 +210,11 @@ def check_nccl_health(timeout_sec: float = 10.0) -> bool:
         True on success, False on timeout, error, or world-size mismatch.
     """
     if not dist.is_initialized():
-        return True  # No distributed, nothing to check
+        return True
 
     try:
         tensor = torch.ones(1, device="cuda")
         work = dist.all_reduce(tensor, async_op=True)
-        # In current PyTorch Work.wait(timeout=...) raises RuntimeError on
-        # timeout; older/alternate backends may return False instead. Handle
-        # both so the timeout is honored regardless of version.
         try:
             done = work.wait(timeout=timedelta(seconds=timeout_sec))  # type: ignore[reportOptionalMemberAccess]
         except RuntimeError as e:
@@ -248,11 +229,6 @@ def check_nccl_health(timeout_sec: float = 10.0) -> bool:
     except RuntimeError as e:
         logger.error(f"NCCL health check failed: {e}")
         return False
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 
 def _is_finite(value: float) -> bool:

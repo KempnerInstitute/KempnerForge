@@ -15,7 +15,6 @@ CONFIG = (
     Path(__file__).resolve().parents[1] / "configs" / "vlm_qwen3_0.6b_joint_decoder_webvid.toml"
 )
 
-# From the source model's config.json; the conversion refuses any disagreement.
 SOURCE = {
     "hidden_size": 1024,
     "num_hidden_layers": 28,
@@ -29,7 +28,7 @@ SOURCE = {
     "tie_word_embeddings": True,
     "hidden_act": "silu",
 }
-PATCH = 14  # the vision encoder's patch size at 224 px
+PATCH = 14
 
 
 @pytest.fixture(scope="module")
@@ -119,8 +118,6 @@ def test_paths_are_placeholders_and_wandb_is_off(config: JobConfig) -> None:
     assert config.video.data_root == "path-to-webvid-10m"
     assert config.checkpoint.dir == "path-to-output-dir"
     assert config.checkpoint.load_path == "path-to-init-checkpoint"
-    # Left at its default, every run would write its events into the same
-    # relative directory, mixing a shakedown's with the real run's.
     assert config.metrics.tensorboard_dir == "path-to-tensorboard-dir"
     assert config.metrics.enable_wandb is False
     raw = tomllib.loads(CONFIG.read_text())

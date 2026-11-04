@@ -29,7 +29,6 @@ def _coerce_value(field_type: Any, value: Any) -> Any:
     """Coerce a raw TOML/CLI value to the expected field type."""
     origin = get_origin(field_type)
 
-    # Handle Union types: int | None (UnionType) and Optional[int] (typing.Union)
     if origin is types.UnionType or origin is Union:
         args = get_args(field_type)
         non_none = [a for a in args if a is not type(None)]
@@ -39,26 +38,20 @@ def _coerce_value(field_type: Any, value: Any) -> Any:
             return _coerce_value(non_none[0], value)
         return value
 
-    # Handle Literal["float32", "bfloat16"] — accept value as-is
     if origin is Literal:
         allowed = get_args(field_type)
         if value not in allowed:
             raise ValueError(f"Value {value!r} not in allowed Literal values: {allowed}")
         return value
 
-    # Handle Enum
     if isinstance(field_type, type) and issubclass(field_type, Enum):
         if isinstance(value, field_type):
             return value
         return field_type(value)
 
-    # Handle tuple (e.g., betas: tuple[float, float], or
-    # tuple[FreezeSpec, ...] for variadic dataclass tuples).
     if origin is tuple:
         if isinstance(value, (list, tuple)):
             args = get_args(field_type)
-            # Variadic tuple[X, ...]: args == (X, Ellipsis). Recursively
-            # convert dict elements to X when X is a dataclass.
             if (
                 len(args) == 2
                 and args[1] is Ellipsis
@@ -70,7 +63,6 @@ def _coerce_value(field_type: Any, value: Any) -> Any:
                     _instantiate_from_dict(dc_type, item) if isinstance(item, dict) else item
                     for item in value
                 )
-            # Fixed-length tuple[A, B, C]: per-position conversion.
             if all(isinstance(a, type) and is_dataclass(a) for a in args) and len(args) == len(
                 value
             ):
@@ -81,14 +73,10 @@ def _coerce_value(field_type: Any, value: Any) -> Any:
             return tuple(value)
         return value
 
-    # Handle list
     if origin is list:
         if isinstance(value, list):
             args = get_args(field_type)
             if args and isinstance(args[0], type) and is_dataclass(args[0]):
-                # list[SomeDataclass] — convert each dict element to a dataclass
-                # instance. Use _instantiate_from_dict so __post_init__ sees
-                # all required fields rather than the empty-default instance.
                 dc_type = args[0]
                 return [
                     _instantiate_from_dict(dc_type, item) if isinstance(item, dict) else item
@@ -97,7 +85,6 @@ def _coerce_value(field_type: Any, value: Any) -> Any:
             return value
         return [value]
 
-    # Primitive coercion
     if isinstance(field_type, type):
         if field_type is bool:
             if isinstance(value, str):
@@ -111,7 +98,6 @@ def _coerce_value(field_type: Any, value: Any) -> Any:
     return value
 
 
-# Cache resolved type hints per dataclass type to avoid repeated evaluation.
 _type_hints_cache: dict[type, dict[str, Any]] = {}
 
 
@@ -183,9 +169,6 @@ def _resolve_vlm_subclass(data: dict[str, Any]) -> type:
     Mirrors ``VLMConfig.for_arch`` error semantics so error type is
     independent of construction site (loader vs programmatic).
     """
-    # Late import: registry/_RESERVED_ARCHS live with VLMConfig; pulling
-    # them in at module scope would create a redundant pin on the
-    # config layout for callers that never touch VLM.
     from kempnerforge.config.vlm import _RESERVED_ARCHS  # noqa: PLC0415
 
     arch = data.get("arch", "joint_decoder")
@@ -216,7 +199,6 @@ def _apply_dict_to_dataclass(dc: Any, data: dict[str, Any]) -> Any:
     type_hints = _get_type_hints(dc_type)
     field_names = {f.name for f in fields(dc)}
 
-    # Reject unknown keys (catches typos like 'dimm' or 'modell')
     unknown = set(data.keys()) - field_names
     if unknown:
         raise ValueError(
@@ -232,10 +214,6 @@ def _apply_dict_to_dataclass(dc: Any, data: dict[str, Any]) -> Any:
             if is_dataclass(current_val) and isinstance(raw, dict):
                 kwargs[f.name] = _apply_dict_to_dataclass(current_val, raw)
             elif current_val is None and isinstance(raw, dict):
-                # Optional nested dataclass (e.g. `vlm: VLMConfig | None`).
-                # Default is None; a TOML table overrides it. Instantiate
-                # directly from the dict so nested __post_init__ validators
-                # see all required fields at construction time.
                 inner = _dataclass_type_from_hint(type_hints[f.name])
                 if inner is not None:
                     kwargs[f.name] = _instantiate_from_dict(inner, raw)
@@ -263,21 +241,17 @@ def _parse_cli_overrides(args: list[str]) -> dict[str, Any]:
         if not arg.startswith("--"):
             continue
         if "=" not in arg:
-            # Boolean flag: --train.compile_model means True
             key = arg[2:]
             value_str = "true"
         else:
             key, value_str = arg[2:].split("=", 1)
 
-        # Parse the value
         value: Any
-        # Try to parse as Python literal (handles ints, floats, bools, lists)
         try:
             value = ast.literal_eval(value_str)
         except (ValueError, SyntaxError):
-            value = value_str  # Keep as string
+            value = value_str
 
-        # Build nested dict from dotted key
         parts = key.split(".")
         d = overrides
         for part in parts[:-1]:
@@ -353,19 +327,13 @@ def load_config(
         cli_args = sys.argv[1:]
     overrides = _parse_cli_overrides(cli_args)
 
-    # Plugins are imported before either layer is overlaid: sub-config
-    # __post_init__ validators resolve names against the registry at
-    # construction time, so a plugin's components must already be registered.
-    # A CLI list replaces the TOML one, mirroring the overlay.
     plugins = overrides.get("plugins", toml_data.get("plugins"))
     if plugins is not None:
         _import_plugins(plugins)
 
-    # Layer 1: TOML file
     if config_path is not None:
         config = _apply_dict_to_dataclass(config, toml_data)
 
-    # Layer 2: CLI overrides
     if overrides:
         config = _apply_dict_to_dataclass(config, overrides)
 
