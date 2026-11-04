@@ -97,6 +97,9 @@ def dcp_to_hf(
     """Convert a DCP checkpoint to HuggingFace safetensors format.
 
     Handles both standard and pipeline-parallel checkpoints (pp0/, pp1/, ...).
+    A tensor that still shares storage with one already written after the cast,
+    such as a tied output head at float32, is written as a copy, since
+    safetensors refuses tensors that share memory.
 
     Args:
         dcp_dir: Path to DCP checkpoint directory (e.g., checkpoints/step_10000).
@@ -123,9 +126,13 @@ def dcp_to_hf(
         model.load_state_dict(state_dict["model"])
 
     hf_state = {}
+    seen_storage: set[int] = set()
     for kf_key, tensor in model.state_dict().items():
         hf_key = _kf_to_hf_key(kf_key)
-        hf_state[hf_key] = tensor.to(dtype)
+        cast = tensor.to(dtype)
+        ptr = cast.untyped_storage().data_ptr()
+        hf_state[hf_key] = cast.clone() if ptr in seen_storage else cast
+        seen_storage.add(ptr)
 
     hf_path = Path(hf_dir)
     hf_path.mkdir(parents=True, exist_ok=True)
