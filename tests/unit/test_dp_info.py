@@ -84,15 +84,33 @@ def _init(rank: int, world: int, port: int) -> None:
 
 
 def _check_layouts(rank: int, world: int, port: int, layouts: list) -> None:
-    """Build each ``(names, sizes, expected)`` mesh and compare this rank's DP info."""
+    """Build each ``(names, sizes, expected)`` mesh and compare this rank's DP info.
+
+    Every mesh is checked even after one fails, and the failure names each mesh
+    whose DP info was wrong or whose ``get_dp_info`` raised.
+    """
     _init(rank, world, port)
     try:
+        wrong = []
         for names, sizes, expected in layouts:
             mesh = init_device_mesh("cpu", sizes, mesh_dim_names=names)
-            got = get_dp_info(mesh)
-            assert got == expected[rank], f"mesh {names} of {sizes}, rank {rank}: {got}"
+            try:
+                got = get_dp_info(mesh)
+            except Exception as e:
+                got = f"{type(e).__name__}: {e}"
+            if got != expected[rank]:
+                wrong.append(f"mesh {names} of {sizes}: {got}, expected {expected[rank]}")
+        assert not wrong, f"rank {rank}:\n" + "\n".join(wrong)
     finally:
         dist.destroy_process_group()
+
+
+def _by_world(layouts: dict) -> dict[int, list]:
+    """The ``(names, sizes, expected)`` layouts by world size, for one spawn per size."""
+    groups: dict[int, list] = {}
+    for layout in layouts.values():
+        groups.setdefault(len(layout[2]), []).append(layout)
+    return groups
 
 
 def _check_data_partition(rank: int, world: int, port: int, data_dir: str) -> None:
@@ -178,22 +196,22 @@ def _check_hsdp_step(rank: int, world: int, port: int) -> None:
 
 
 class TestGetDpInfoOnRealMeshes:
-    @pytest.mark.parametrize("layout", list(HSDP_LAYOUTS))
-    def test_hsdp_meshes_give_one_dp_rank_per_data_shard(self, layout):
+    @pytest.mark.parametrize("world", sorted(_by_world(HSDP_LAYOUTS)))
+    def test_hsdp_meshes_give_one_dp_rank_per_data_shard(self, world):
         """Under HSDP every (dp_replicate, dp_shard) pair reads its own data.
 
         The DP rank is the row-major index of the pair, so on a mesh of DP dims
         alone it equals the global rank. Ranks that differ only in ``pp``,
         ``tp`` or ``ep`` share it, and the DP size is dp_replicate x dp_shard.
         """
-        world = len(HSDP_LAYOUTS[layout][2])
-        mp.spawn(_check_layouts, args=(world, _free_port(), [HSDP_LAYOUTS[layout]]), nprocs=world)
+        layouts = _by_world(HSDP_LAYOUTS)[world]
+        mp.spawn(_check_layouts, args=(world, _free_port(), layouts), nprocs=world)
 
-    @pytest.mark.parametrize("layout", list(OTHER_LAYOUTS))
-    def test_meshes_without_hsdp_keep_their_dp_ranks(self, layout):
+    @pytest.mark.parametrize("world", sorted(_by_world(OTHER_LAYOUTS)))
+    def test_meshes_without_hsdp_keep_their_dp_ranks(self, world):
         """One DP dim, or none under pure PP, gives the same DP info as before HSDP."""
-        world = len(OTHER_LAYOUTS[layout][2])
-        mp.spawn(_check_layouts, args=(world, _free_port(), [OTHER_LAYOUTS[layout]]), nprocs=world)
+        layouts = _by_world(OTHER_LAYOUTS)[world]
+        mp.spawn(_check_layouts, args=(world, _free_port(), layouts), nprocs=world)
 
 
 class TestDataPipelineOnHsdp:
