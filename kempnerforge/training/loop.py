@@ -24,7 +24,7 @@ from kempnerforge.metrics.logger import get_logger
 from kempnerforge.metrics.tracker import MetricsTracker
 from kempnerforge.model.vlm import inner_transformer
 from kempnerforge.profiling.profiler import print_profiler_summary
-from kempnerforge.resilience.health import NaNDetector, check_nccl_health
+from kempnerforge.resilience.health import NaNDetector, check_nccl_health, params_are_finite
 from kempnerforge.resilience.signal_handler import ShutdownHandler
 from kempnerforge.training.data_pipeline import DataPipeline, PhaseState, advance_phases
 from kempnerforge.training.eval import run_eval
@@ -488,13 +488,22 @@ def _apply_step_transitions(session: TrainingSession, step: int) -> None:
 
 
 def _shutdown_if_requested(
-    session: TrainingSession, step: int, tokens_seen: int, *, saved_this_step: bool
+    session: TrainingSession,
+    step: int,
+    tokens_seen: int,
+    *,
+    saved_this_step: bool,
+    nan_skipped: bool = False,
 ) -> bool:
     """Write the emergency checkpoint and finish when a shutdown is pending.
 
     Returns True when the loop must stop. With ``saved_this_step``, the
     scheduled save of ``step`` is the emergency checkpoint, so it is drained
-    with ``wait()`` rather than written twice.
+    with ``wait()`` rather than written twice. A ``nan_skipped`` step is
+    saved only if every rank's parameters are finite: after a bad update (a
+    finite loss with non-finite gradients) they are not, and their
+    checkpoint would become ``latest`` and count toward ``keep_last_n``,
+    which can prune the last good one.
     """
     if not session.shutdown_handler.should_shutdown():
         return False
@@ -505,6 +514,12 @@ def _shutdown_if_requested(
             "its scheduled checkpoint is the emergency checkpoint"
         )
         ckpt_mgr.wait()
+    elif nan_skipped and not params_are_finite(session.model, session.runtime.device):
+        logger.error(
+            f"Shutdown requested at step {step}, skipped for a NaN/Inf loss, but the "
+            "parameters are not finite: saving no emergency checkpoint, so these weights "
+            "neither become `latest` nor count toward `checkpoint.keep_last_n`"
+        )
     else:
         logger.warning(f"Shutdown requested at step {step} — saving emergency checkpoint")
         ckpt_mgr.save(
@@ -584,7 +599,9 @@ def run_training_loop(
                 _advance_lr_schedule(session)
                 step += 1
                 _apply_step_transitions(session, step)
-                if _shutdown_if_requested(session, step, tokens_seen, saved_this_step=False):
+                if _shutdown_if_requested(
+                    session, step, tokens_seen, saved_this_step=False, nan_skipped=True
+                ):
                     break
                 continue
 
