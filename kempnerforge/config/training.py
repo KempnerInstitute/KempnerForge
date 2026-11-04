@@ -71,7 +71,8 @@ class TrainConfig:
     def param_dtype(self) -> torch.dtype:
         """Resolve mixed_precision to the compute dtype, also the master weight dtype by default.
 
-        FP8 uses bf16 master weights -- FP8 is a compute mode, not a storage dtype.
+        FP8 resolves to bf16 -- FP8 is a compute mode, not a storage dtype. The storage
+        dtype is :attr:`master_dtype`, which is fp32 with ``fp32_master_weights``.
         A config switched to ``"fp16"`` after construction skips ``__post_init__``,
         so ``"fp16"`` raises the same ``ValueError`` here.
         """
