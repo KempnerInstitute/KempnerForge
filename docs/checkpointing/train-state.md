@@ -43,10 +43,13 @@ Entry points, both in
 
 ```python
 # manager.py, inside save()
+per_rank = self._gather_rank_states(dataloader)
+
 if self._rank == 0:
     train_state = build_train_state(
         step=step, tokens_seen=tokens_seen,
         scheduler=scheduler, dataloader=dataloader, extra=extra,
+        per_rank=per_rank,
     )
     torch.save(train_state, ckpt_dir / "train_state.pt")
 ```

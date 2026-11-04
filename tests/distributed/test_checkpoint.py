@@ -741,15 +741,25 @@ class TestPerRankState:
 
         The checkpoint is saved as dp x 2 (rank -> rank // 2) and resumed as
         2 x dp (rank -> rank % half), so with 4 ranks only ranks 0 and 3 keep
-        their own coordinates.
+        their own coordinates. Both layouts are a pure function of the rank,
+        so the test skips itself on any world size where they coincide on
+        every rank and there is no layout change left to refuse. That needs an
+        even world size of at least 4: an odd one puts dp_rank out of range,
+        and at 2 ranks both layouts are (0, 1) everywhere.
         """
         from kempnerforge.config.schema import OptimizerConfig
 
         rank = dist.get_rank()
         world = dist.get_world_size()
         if world % 2:
-            pytest.skip("needs an even world size")
+            pytest.skip(f"needs an even world size of at least 4, got {world}")
         half = world // 2
+        if not any((r // 2, half) != (r % half, half) for r in range(world)):
+            pytest.skip(
+                f"needs an even world size of at least 4: at world_size={world} the saved "
+                f"and current data-parallel layouts are identical on every rank, so there "
+                f"is no layout change to refuse"
+            )
 
         torch.manual_seed(42)
         model = Transformer(SMALL_CONFIG).cuda()
