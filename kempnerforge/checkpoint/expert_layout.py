@@ -71,6 +71,35 @@ def _rows_after_ep(placements: Sequence[Placement], ep: int, name: str) -> tuple
     return tuple(result)
 
 
+def _check_placement(view: DTensor, tensor: torch.Tensor, moe: MoEMLP, name: str) -> None:
+    """Refuse ``view`` unless DCP would save its rows where ``tensor``'s rows belong.
+
+    This rank's rows of all ``num_experts`` start at ``local_expert_start``, then
+    wherever FSDP's own shard of the rank's block starts. An empty shard has no
+    position, so only its size is checked. Older torch versions lay out a strided
+    shard otherwise, and the check stops such a save before it writes anything.
+
+    Raises:
+        ValueError: DCP would save the view's rows at another size or offset.
+    """
+    local = view.to_local()
+    chunk = view.__create_chunk_list__()[0]
+    own = (
+        tuple(tensor.__create_chunk_list__()[0].offsets)
+        if isinstance(tensor, DTensor)
+        else (0,) * local.dim()
+    )
+    expected = (moe.local_expert_start + own[0], *own[1:])
+    misplaced = local.numel() > 0 and tuple(chunk.offsets) != expected
+    if tuple(chunk.sizes) != tuple(local.shape) or misplaced:
+        raise ValueError(
+            f"{name}: DCP would save this rank's {tuple(local.shape)} rows as "
+            f"{tuple(chunk.sizes)} at offset {tuple(chunk.offsets)} among all "
+            f"{moe.num_experts} experts, but they belong at {expected}; this torch lays "
+            "out the view's strided shard other than FSDP2 does, so the save is refused"
+        )
+
+
 def _contiguous_strides(shape: torch.Size) -> tuple[int, ...]:
     """The strides of a contiguous tensor of ``shape``."""
     strides = [1] * len(shape)
@@ -310,12 +339,7 @@ class ExpertLayout:
             shape=global_shape,
             stride=_contiguous_strides(global_shape),
         )
-        chunk = view.__create_chunk_list__()[0]
-        if tuple(chunk.sizes) != tuple(local.shape):
-            raise ValueError(
-                f"{name} places this rank's {tuple(local.shape)} rows as "
-                f"{tuple(chunk.sizes)} among all {moe.num_experts} experts"
-            )
+        _check_placement(view, tensor, moe, name)
         self._originals[id(view)] = (view, tensor)
         return view
 
