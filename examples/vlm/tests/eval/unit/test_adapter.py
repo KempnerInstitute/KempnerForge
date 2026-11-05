@@ -10,6 +10,7 @@ real checkpoint, no network. Real-package fidelity is pinned by the gated contra
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
 
 import pytest
 import torch
@@ -672,6 +673,18 @@ class TestLoadWeights:
             _load_weights(job, str(missing), torch.device("cpu"), torch.float32)
 
 
+@pytest.fixture
+def restore_matmul_precision() -> Iterator[None]:
+    """Restore torch's fp32 matmul precision, both the legacy value and the per-backend ones."""
+    backends = (torch.backends.cuda.matmul, torch.backends.mkldnn.matmul)
+    legacy = torch.get_float32_matmul_precision()
+    saved = [backend.fp32_precision for backend in backends]
+    yield
+    torch.set_float32_matmul_precision(legacy)
+    for backend, value in zip(backends, saved, strict=True):
+        backend.fp32_precision = value
+
+
 class TestInitGuards:
     @pytest.mark.parametrize("arch", NON_GENERATIVE_ARCHES)
     def test_non_generative_fails_fast_before_load(self, monkeypatch, tiny_vlm_configs, arch):
@@ -727,6 +740,23 @@ class TestInitGuards:
         _patch_loaders(monkeypatch, _vlm_job_config(tiny_vlm_configs), tiny_vlm_wrapper)
         vlm = KempnerForgeVLM(config="x", checkpoint="y", device="cpu", dtype="float16")
         assert vlm._dtype == torch.float16
+
+    @pytest.mark.usefixtures("restore_matmul_precision")
+    @pytest.mark.parametrize(("tf32", "expected"), [(True, "high"), (False, "highest")])
+    def test_tf32_follows_the_checkpoint_config(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tiny_vlm_configs: tuple,
+        tiny_vlm_wrapper: torch.nn.Module,
+        tf32: bool,
+        expected: str,
+    ) -> None:
+        job = _vlm_job_config(tiny_vlm_configs)
+        job.train.tf32 = tf32
+        _patch_loaders(monkeypatch, job, tiny_vlm_wrapper)
+        torch.set_float32_matmul_precision("highest")
+        KempnerForgeVLM(config="x", checkpoint="y", device="cpu", dtype="float32")
+        assert torch.get_float32_matmul_precision() == expected
 
 
 class TestBuildModel:

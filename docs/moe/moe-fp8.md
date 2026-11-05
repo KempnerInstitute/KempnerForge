@@ -61,11 +61,12 @@ Two reasons:
 
 ## Why the shared expert is excluded
 
-Same reason as routed experts. The shared expert is a `SwiGLUMLP` (or
-`StandardMLP`) with identical weight shapes to a routed expert — it
-runs through the same grouped-GEMM path when that path is active (on
-the dense forward side it's a plain `Linear` call, but convention
-keeps it FP8-excluded for consistency).
+By convention, not because of the grouped GEMM. The shared expert is a
+`SwiGLUMLP` (or `StandardMLP`) whose hidden width is
+`moe_shared_experts` times a routed expert's, and it never takes the
+grouped-GEMM path: `MoEMLP.forward` calls it as a plain module, so its
+projections are ordinary `Linear` calls. The filter matches it by name
+and keeps it FP8-excluded for consistency with the routed experts.
 
 In practice the shared expert runs on every token (not dispatched),
 so it *could* use `Float8Linear`. The decision to exclude it is
@@ -88,16 +89,20 @@ Everything not caught by the three filter rules:
 | RMSNorm | no | not `Linear` |
 
 With `moe_frequency = 2` (alternating dense / MoE layers), the dense
-layers' MLPs get FP8 and the MoE layers' MLPs don't — which is fine,
-because the MoE layers' compute is dominated by grouped GEMM on the
-expert weights anyway.
+layers' MLPs get FP8 and the MoE layers' MLPs don't. That leaves both
+the routed experts' grouped GEMM and the shared expert in bf16: with
+`moe_shared_experts = N`, the shared expert does `N` expert-widths of
+work per token beside the `moe_top_k` routed ones, so at
+`N = moe_top_k` it is half of the MoE layers' MLP FLOPs.
 
 ## Memory and throughput
 
 Excluding expert Linears means FP8 gives smaller gains for MoE than
 for dense training. A 4B-active MoE where half the FLOPs are in
-grouped-GEMM experts sees FP8 speedup only on the remaining half
-(attention + shared expert + output head + dense-layer MLPs).
+grouped-GEMM experts sees FP8 speedup at most on the remaining half,
+and there only on attention, the output head and dense-layer MLPs:
+the shared expert is part of that half but is excluded too, so it
+stays bf16.
 
 For the 7B dense Llama reference (see
 [Benchmarks § MFU scaling](../reference/benchmarks.md#mfu-scaling-dense)),
