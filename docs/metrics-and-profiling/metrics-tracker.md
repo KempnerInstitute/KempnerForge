@@ -92,8 +92,14 @@ from every data point, even ones that aren't logged.
 ## Log interval
 
 ```python
-if step % self.metrics_config.log_interval == 0 or step == 1:
-    self._log_step(step, metrics)
+# kempnerforge/metrics/tracker.py: end_step, after the smoothing
+if step % self.metrics_config.log_interval != 0 and step != 1:
+    return None
+
+mem_stats = get_memory_stats()   # read on logging steps only
+...
+self._log_step(step, metrics)
+return metrics
 ```
 
 Default `log_interval = 10`. Step 1 is always logged (useful sanity check
@@ -109,8 +115,13 @@ starts at `step = 1`.
 The part from `[step 1000]` on is produced by
 `format_metrics(step, {...})` from
 [`kempnerforge/metrics/logger.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/metrics/logger.py).
-Numbers use `_format_number`: int gets k/M/B suffix, float gets scientific
-notation below 0.01 or above 1e6, otherwise 4 decimals.
+The tracker formats each value of the step line itself: `loss` to 4
+decimals, `lr` in scientific notation, `grad_norm` to 3 decimals,
+`tok/s` with thousands separators, `mfu` as a percentage, `mem` as peak
+over total GB and `step_time` in seconds. `format_metrics` applies
+`_format_number` only to numbers, such as the eval metrics `log_eval`
+passes: int gets k/M/B suffix, float gets scientific notation below 0.01
+or above 1e6, otherwise 4 decimals.
 
 The same logger writes every other `logger.info` in the framework, and
 each line starts with the local time to the millisecond
