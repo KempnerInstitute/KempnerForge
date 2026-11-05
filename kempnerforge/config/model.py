@@ -18,6 +18,12 @@ class Activation(StrEnum):
     relu = "relu"
 
 
+CORE_MLP_KEY_ACTIVATIONS: dict[str, Activation] = {
+    "swiglu": Activation.silu,
+    "standard_gelu": Activation.gelu,
+    "standard_relu": Activation.relu,
+}
+
 FLEX_BLOCK_SIZE = 128
 
 FLEX_MIN_HEAD_DIM = 16
@@ -25,7 +31,12 @@ FLEX_MIN_HEAD_DIM = 16
 
 @dataclass
 class ModelConfig:
-    """Architecture hyperparameters for a transformer model."""
+    """Architecture hyperparameters for a transformer model.
+
+    ``activation`` is an ``Activation`` member, or the name of an MLP a plugin registered
+    under ``mlp``. Core's own ``mlp`` keys (``CORE_MLP_KEY_ACTIVATIONS``) are rejected in
+    favor of the activation that selects each.
+    """
 
     dim: int = 4096
     n_layers: int = 32
@@ -96,6 +107,12 @@ class ModelConfig:
         if self.n_heads % self.n_kv_heads != 0:
             raise ValueError(
                 f"n_heads ({self.n_heads}) must be divisible by n_kv_heads ({self.n_kv_heads})"
+            )
+        if self.activation in CORE_MLP_KEY_ACTIVATIONS:
+            selects = CORE_MLP_KEY_ACTIVATIONS[self.activation].value
+            raise ValueError(
+                f"activation={self.activation!r} is the mlp registry key that "
+                f"activation={selects!r} selects; set activation={selects!r} instead"
             )
 
         if self.sdpa_backend not in ("auto", "flash", "efficient", "cudnn", "math"):

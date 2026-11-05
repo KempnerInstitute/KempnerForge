@@ -20,7 +20,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Literal, Union, get_args, get_origin, get_type_hints
 
-from kempnerforge.config.model import Activation, NormType
+from kempnerforge.config.model import CORE_MLP_KEY_ACTIVATIONS, Activation, NormType
 from kempnerforge.config.registry import registry
 from kempnerforge.config.scheduler import SchedulerType
 from kempnerforge.config.schema import JobConfig
@@ -39,7 +39,9 @@ def _coerce_registry_enum(enum_type: type[Enum], category: str, value: Any) -> A
     These enums select a registry builder, so a name a plugin registered is valid
     though the enum does not list it, and it stays a plain ``str``. ``Activation``
     reads ``mlp``: ``build_mlp`` maps the built-in activations to ``mlp`` keys and
-    looks any other name up there directly.
+    looks any other name up there directly. Core's own ``mlp`` keys pass through
+    whatever was imported, so ``ModelConfig`` rejects each with the activation
+    that selects it, and they are left out of the names the error lists.
 
     Raises:
         ValueError: ``value`` is neither a member nor a registered name; the
@@ -48,7 +50,10 @@ def _coerce_registry_enum(enum_type: type[Enum], category: str, value: Any) -> A
     try:
         return enum_type(value)
     except ValueError:
-        registered = registry.list(category)
+        core_keys = frozenset(CORE_MLP_KEY_ACTIVATIONS) if enum_type is Activation else frozenset()
+        if isinstance(value, str) and value in core_keys:
+            return value
+        registered = [name for name in registry.list(category) if name not in core_keys]
         if isinstance(value, str) and value in registered:
             return value
         members = [member.value for member in enum_type]
