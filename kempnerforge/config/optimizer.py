@@ -25,6 +25,7 @@ class OptimizerConfig:
     muon_nesterov: bool = False
     muon_adjust_lr: str = "original"
     muon_orthogonalize: str = "local"
+    muon_router: bool = False
     schedule_free_warmup_steps: int = 0
     weight_decay_scope: str = "exclude_norms_and_biases"
 
