@@ -314,6 +314,18 @@ class TestDeviceMemoryMonitor:
         monitor = DeviceMemoryMonitor(snapshot_dir=str(tmp_path))
         assert monitor.capture_snapshot(step=1) is None
 
+    def test_snapshot_without_a_device_names_the_current_one(self, monkeypatch, tmp_path):
+        """By default the snapshot syncs the current device and is named after its index."""
+        _FakeCudaMemory(monkeypatch)
+        synced: list[int | None] = []
+        monkeypatch.setattr(torch.cuda, "synchronize", synced.append)
+        monkeypatch.setattr(torch.cuda.memory, "_record_memory_history", lambda *a, **k: None)
+        monkeypatch.setattr(torch.cuda.memory, "_snapshot", lambda: {"segments": []})
+        path = DeviceMemoryMonitor(snapshot_dir=str(tmp_path)).capture_snapshot(step=7)
+        assert path == str(tmp_path / "snapshot_step_7_device_3.pickle")
+        assert Path(path).is_file()
+        assert synced == [3]
+
 
 class TestMemoryHelpers:
     def test_get_memory_stats_cpu_only(self, monkeypatch):
