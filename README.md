@@ -166,8 +166,6 @@ Configs set `[vlm]` with `arch` and a freeze list (`FreezeSpec`), and `[vision_e
 
 To compute the vision encoder in its own dtype, independent of `train.mixed_precision`, set `[vision_encoder] mixed_precision = "bf16"` or `"fp32"`; it holds for image and video runs alike, on any number of GPUs. The encoder's parameters, gradients and optimizer state keep the dtype it was loaded in, and its floating-point buffers take the set one. Under FSDP2 a trainable encoder gets its own `MixedPrecisionPolicy`; an encoder FSDP2 does not wrap (frozen, or on one GPU) runs each forward on copies of its parameters cast to that dtype, with its inputs cast too. Unset, a trainable encoder under FSDP2 computes in `param_dtype` and an unwrapped one in its loaded dtype.
 
-The two-stage image-understanding recipe (Joint-Decoder, SigLIP2 + Qwen3-0.6B; issues #262 and #428) has its own image-only example in [`examples/image_understanding/`](examples/image_understanding/), with its entry point and a roadmap of the features still to port; the stage presets follow once those land.
-
 **Adding a new VLM arch.** The discriminated-union dispatch is registry-driven, so a new arch is four small additions, with no edits to existing call sites unless it cannot run tensor or expert parallelism (see the `JobConfig.validate` note below):
 
 1. Add a `VLMConfig` subclass in `kempnerforge/config/vlm.py` decorated with `@registry.register_vlm_config("<arch_name>")`. Override `residual_stream_image_tokens()` if the arch's residual stream is not text-only-plus-prefix.
