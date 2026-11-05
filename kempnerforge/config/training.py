@@ -42,6 +42,7 @@ class TrainConfig:
     data_seed: int | None = None
     compile_model: bool = True
     mixed_precision: Literal["bf16", "fp16", "fp32", "fp8"] = "bf16"
+    tf32: bool = False
     activation_checkpointing: ActivationCheckpointing = ActivationCheckpointing.none
     loss_fn: str = "cross_entropy"
     z_loss_weight: float = 0.0

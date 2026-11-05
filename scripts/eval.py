@@ -41,6 +41,7 @@ from kempnerforge.distributed.utils import get_dp_info
 from kempnerforge.metrics.logger import get_logger
 from kempnerforge.resilience.elastic import resolve_resume_path
 from kempnerforge.training import build_loss_fn, run_eval
+from kempnerforge.training.runtime import apply_matmul_precision
 
 logger = get_logger(__name__)
 
@@ -61,6 +62,7 @@ def main() -> None:
 
     device_mesh = init_distributed(config.distributed, seed=config.train.seed)
     config.validate(world_size)
+    apply_matmul_precision(config.train)
 
     tc = config.train
     mp_policy = default_mp_policy(tc.param_dtype)

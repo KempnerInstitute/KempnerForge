@@ -106,6 +106,7 @@ Training-loop hyperparameters.
 | `data_seed` | `int \| None` | `None` | RNG seed for data and batch order; `None` → falls back to `seed` |
 | `compile_model` | `bool` | `True` | wrap the model with `torch.compile` |
 | `mixed_precision` | `"bf16" \| "fp32" \| "fp8"` | `"bf16"` | master-weight dtype; `"fp8"` uses bf16 masters with fp8 compute; `"fp16"` is rejected (no loss scaling) |
+| `tf32` | `bool` | `False` | run fp32 matmuls (a frozen fp32 vision encoder, `mixed_precision = "fp32"`) on TF32 tensor cores via `torch.set_float32_matmul_precision("high")`, applied at startup by training and `scripts/eval.py`; this also covers the matmuls that run in fp32 on purpose in a bf16 run, so Muon's Newton–Schulz step moves to TF32 (still more precise than the bf16 that `torch.optim.Muon` uses); `False` leaves torch's setting as it is |
 | `activation_checkpointing` | `"none" \| "full" \| "selective"` | `"none"` | AC policy |
 | `loss_fn` | `str` | `"cross_entropy"` | `loss` registry key (or `"chunked_cross_entropy"`) |
 | `z_loss_weight` | `float` | `0.0` | logit-magnitude regularizer (PaLM uses `1e-4`) |
@@ -236,7 +237,7 @@ Parallelism dimensions and NCCL settings.
 | Field | Type | Default | Purpose |
 |-------|------|---------|---------|
 | `dp_shard` | `int` | `-1` | FSDP shard degree; `-1` → auto (use remaining GPUs) |
-| `dp_replicate` | `int` | `1` | DDP-style replication over FSDP groups |
+| `dp_replicate` | `int` | `1` | replicates the `dp_shard` groups (HSDP), and every rank in `dp_replicate × dp_shard` reads its own data; with no `dp_shard` dimension (it resolves to 1, no TP or EP), FSDP2 shards over `dp_replicate` instead |
 | `tp` | `int` | `1` | tensor parallel |
 | `pp` | `int` | `1` | pipeline parallel |
 | `pp_schedule` | `"1f1b" \| "gpipe" \| "interleaved_1f1b"` | `"1f1b"` | pipeline schedule |
@@ -261,7 +262,7 @@ DCP-based checkpointing.
 | `async_mode` | `"disabled" \| "async" \| "async_with_pinned_mem"` | `"disabled"` | DCP async-save mode |
 | `keep_last_n` | `int` | `3` | retain the most recent N checkpoints (`<= 0` keeps all); steps saved by `dyn_ckpt_window` are always kept |
 | `load_path` | `str \| None` | `None` | explicit resume path (overrides `latest` symlink) |
-| `export_dtype` | `"float32" \| "bfloat16"` | `"bfloat16"` | dtype for HF exports via `scripts/convert_checkpoint.py` |
+| `export_dtype` | `"float32" \| "bfloat16"` | `"bfloat16"` | dtype for HF exports via `scripts/convert_checkpoint.py dcp-to-hf` when its `--dtype` flag is not given; the flag wins and also takes `float16` (see [HuggingFace conversion](../checkpointing/hf-conversion.md#dtypes)) |
 | `exclude_from_loading` | `list[str]` | `[]` | state keys to skip when warm-starting from `load_path` — `"model"` and/or `"optimizer"`; ignored on a resume, which always restores full state |
 | `ignore_freeze_mismatch` | `bool` | `False` | load a checkpoint whose VLM freeze metadata disagrees with the configured freeze specs, downgrading the error to a warning |
 
