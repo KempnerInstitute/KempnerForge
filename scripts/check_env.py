@@ -19,9 +19,9 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import configparser
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -317,17 +317,48 @@ def check_wandb(check_credentials: bool = False) -> CheckResult:
 
 
 _MLFLOW_AUTH_ROUTES = (
-    "routes: (1) env DATABRICKS_HOST + DATABRICKS_TOKEN; (2) a ~/.databrickscfg profile, picked "
-    "by a databricks://<profile> $MLFLOW_TRACKING_URI or $DATABRICKS_CONFIG_PROFILE, else "
-    "DEFAULT; (3) SDK OAuth, which a preflight cannot verify offline"
+    "routes: (1) env DATABRICKS_HOST + DATABRICKS_TOKEN; (2) a profile in $DATABRICKS_CONFIG_FILE, "
+    "else ~/.databrickscfg, picked by a databricks://<profile> $MLFLOW_TRACKING_URI or "
+    "$DATABRICKS_CONFIG_PROFILE, else the SDK default profile ([__settings__] default_profile, "
+    "else DEFAULT) and read only when no credential variable is set; (3) SDK OAuth, which a "
+    "preflight cannot verify offline"
 )
-_PROFILE_HEADER = re.compile(r"\s*\[(?P<name>.+)\]")
+_SETTINGS_SECTION = "__settings__"
+
+_DATABRICKS_CREDENTIAL_VAR_AUTH: dict[str, str] = {
+    "DATABRICKS_TOKEN": "pat",
+    "DATABRICKS_API_TOKEN": "pat",
+    "DATABRICKS_USERNAME": "basic",
+    "DATABRICKS_PASSWORD": "basic",
+    "DATABRICKS_CLIENT_ID": "oauth",
+    "DATABRICKS_CLIENT_SECRET": "oauth",
+    "DATABRICKS_OIDC_TOKEN_ENV": "env-oidc",
+    "DATABRICKS_OIDC_TOKEN_FILEPATH": "file-oidc",
+    "DATABRICKS_OIDC_TOKEN_FILE": "file-oidc",
+    "DATABRICKS_GOOGLE_SERVICE_ACCOUNT": "google",
+    "GOOGLE_CREDENTIALS": "google",
+    "DATABRICKS_AZURE_RESOURCE_ID": "azure",
+    "ARM_USE_MSI": "azure",
+    "ARM_CLIENT_ID": "azure",
+    "ARM_CLIENT_SECRET": "azure",
+    "ARM_TENANT_ID": "azure",
+    "DATABRICKS_METADATA_SERVICE_URL": "metadata-service",
+}
+
+_DATABRICKS_ENV_AUTH: dict[str, tuple[str, tuple[tuple[str, ...], ...]]] = {
+    "pat": ("token", (("DATABRICKS_TOKEN", "DATABRICKS_API_TOKEN"),)),
+    "basic": ("username and password", (("DATABRICKS_USERNAME",), ("DATABRICKS_PASSWORD",))),
+    "oauth-m2m": (
+        "client id and secret",
+        (("DATABRICKS_CLIENT_ID",), ("DATABRICKS_CLIENT_SECRET",)),
+    ),
+}
 
 
-def _databricks_profile() -> str:
-    """The ~/.databrickscfg profile MLflow reads, in priority order.
+def _selected_databricks_profile() -> str | None:
+    """The Databricks profile explicitly selected, or None when none is.
 
-    A databricks://<profile> $MLFLOW_TRACKING_URI, then $DATABRICKS_CONFIG_PROFILE, then DEFAULT.
+    A databricks://<profile> $MLFLOW_TRACKING_URI, then $DATABRICKS_CONFIG_PROFILE.
     """
     try:
         uri = urlparse(os.environ.get("MLFLOW_TRACKING_URI", ""))
@@ -335,54 +366,181 @@ def _databricks_profile() -> str:
         uri = urlparse("")
     if uri.scheme == "databricks" and uri.netloc and not {":", "@"} & set(uri.netloc):
         return uri.netloc
-    return os.environ.get("DATABRICKS_CONFIG_PROFILE") or "DEFAULT"
+    return os.environ.get("DATABRICKS_CONFIG_PROFILE") or None
 
 
-def _profile_problem(profile: str) -> str | None:
-    """Why ~/.databrickscfg has no ``[profile]`` section, or None when it has one.
+def _databricks_config_file() -> str:
+    """The profile file the SDK reads, as written and as a message names it.
 
-    Only section headers are matched; keys and values (the tokens) are never parsed or kept.
+    $DATABRICKS_CONFIG_FILE when it is set and not empty, else ~/.databrickscfg.
+    """
+    return os.environ.get("DATABRICKS_CONFIG_FILE") or "~/.databrickscfg"
+
+
+@dataclass(frozen=True)
+class _ProfileFile:
+    """What a Databricks profile file offers the SDK.
+
+    Attributes:
+        profiles: The profile names it offers.
+        default_profile: The profile the SDK falls back to when none is selected: the stripped
+            ``[__settings__] default_profile``, else DEFAULT.
+        default_from_settings: The fallback is the ``[__settings__] default_profile``, a value
+            from the file, which no message may quote.
+        problem: Why the file offers no profile, or None.
+        missing: The file does not exist, so the SDK reads nothing from it.
+    """
+
+    profiles: frozenset[str]
+    default_profile: str
+    default_from_settings: bool
+    problem: str | None
+    missing: bool = False
+
+
+def _read_databricks_config(name: str) -> _ProfileFile:
+    """Read the Databricks profile file ``name`` the way the SDK reads it.
+
+    A path ``Path.exists()`` rejects, as the SDK tests it, is reported missing; a broken or
+    looping symlink and a path through a regular file are among them. The file is parsed with
+    ConfigParser in the encoding ``ConfigParser.read`` uses, so continuation lines, a repeated
+    ``[DEFAULT]`` and files the SDK rejects resolve as they do in the SDK. ``[DEFAULT]`` is a
+    profile only when it carries keys, ``[__settings__]`` never is one, and ``default_profile``
+    is stripped before it is resolved. A problem quotes no text from the file: an OS error
+    opening or reading it is named by its description, any other failure by its exception class.
     """
     try:
-        with (Path.home() / ".databrickscfg").open(encoding="utf-8", errors="replace") as f:
-            for line in f:
-                header = _PROFILE_HEADER.match(line)
-                if header and header["name"] == profile:
-                    return None
-    except FileNotFoundError:
-        return "~/.databrickscfg not found"
+        path = Path(name).expanduser()
+        exists = path.exists()
+    except (OSError, RuntimeError) as e:
+        return _ProfileFile(
+            frozenset(), "DEFAULT", False, f"{name} cannot be resolved ({type(e).__name__})"
+        )
+    if not exists:
+        return _ProfileFile(frozenset(), "DEFAULT", False, f"{name} not found", missing=True)
+    parser = configparser.ConfigParser()
+    try:
+        with path.open(encoding="utf-8" if sys.flags.utf8_mode else "locale") as f:
+            parser.read_file(f)
     except OSError as e:
-        return f"~/.databrickscfg unreadable: {e.strerror or type(e).__name__}"
-    return f"~/.databrickscfg has no [{profile}] section"
+        return _ProfileFile(
+            frozenset(), "DEFAULT", False, f"{name} unreadable: {e.strerror or type(e).__name__}"
+        )
+    except (configparser.Error, UnicodeDecodeError) as e:
+        return _ProfileFile(
+            frozenset(), "DEFAULT", False, f"{name} is malformed ({type(e).__name__})"
+        )
+    profiles = {section for section in parser.sections() if section != _SETTINGS_SECTION}
+    if parser.defaults():
+        profiles.add("DEFAULT")
+    parser.remove_option(parser.default_section, "default_profile")
+    default = parser.get(_SETTINGS_SECTION, "default_profile", raw=True, fallback="").strip()
+    return _ProfileFile(frozenset(profiles), default or "DEFAULT", bool(default), None)
+
+
+def _databricks_env_credentials() -> tuple[str, ...]:
+    """The Databricks credential variables the environment carries.
+
+    Any one of them makes the SDK skip the profile file when no profile is selected.
+    """
+    names = ("DATABRICKS_HOST", *_DATABRICKS_CREDENTIAL_VAR_AUTH)
+    return tuple(name for name in names if os.environ.get(name))
+
+
+def _databricks_env_auth() -> tuple[str | None, str]:
+    """What the SDK authenticates with from the environment alone, else None and why not.
+
+    Only the SDK strategies whose requirements are all environment variables are settled here
+    (pat, basic and oauth-m2m); a CLI login, a metadata service and cloud credentials need state
+    a preflight cannot see. Credentials from more than one auth family are the SDK's own error
+    unless $DATABRICKS_AUTH_TYPE picks one.
+    """
+    if not os.environ.get("DATABRICKS_HOST"):
+        return None, "DATABRICKS_HOST not set"
+    complete = {
+        auth_type: label
+        for auth_type, (label, groups) in _DATABRICKS_ENV_AUTH.items()
+        if all(any(os.environ.get(name) for name in group) for group in groups)
+    }
+    if pinned := os.environ.get("DATABRICKS_AUTH_TYPE"):
+        if label := complete.get(pinned):
+            return label, ""
+        return None, f"$DATABRICKS_AUTH_TYPE={pinned} is not completed by the variables set"
+    families = {
+        family for name, family in _DATABRICKS_CREDENTIAL_VAR_AUTH.items() if os.environ.get(name)
+    }
+    if len(families) > 1:
+        return None, (
+            f"credentials for more than one auth method are set ({', '.join(sorted(families))}), "
+            "which the SDK rejects unless $DATABRICKS_AUTH_TYPE picks one"
+        )
+    if not complete:
+        return None, "none of a token, a username and password, or a client id and secret is set"
+    return next(iter(complete.values())), ""
 
 
 def check_mlflow(check_credentials: bool = False) -> CheckResult:
-    """Check Databricks credentials for MLflow: the env pair, else a ~/.databrickscfg profile.
+    """Check the Databricks auth route for MLflow, resolved the way the SDK resolves it.
 
-    SDK OAuth cannot be verified offline, so with neither found the result is a WARN naming all
-    three routes. ``check_credentials`` validates the route found through the SDK.
+    The profile file is the one $DATABRICKS_CONFIG_FILE names, else ~/.databrickscfg. With a
+    profile selected by a databricks://<profile> $MLFLOW_TRACKING_URI or
+    $DATABRICKS_CONFIG_PROFILE, the profile route applies and environment variables only fill in
+    or override what it leaves; when the file does not exist the SDK reads nothing from it, so
+    the environment route applies instead. With none selected, any Databricks credential
+    variable makes the SDK skip the file, so the environment route applies; otherwise the file's
+    default profile does. A route no offline evidence settles, SDK OAuth among them, is a WARN
+    naming all three routes rather than a pass.
+
+    ``check_credentials`` validates the resolved route through the SDK, naming a profile only
+    when one is selected. It first exports DATABRICKS_TOKEN from DATABRICKS_API_TOKEN as the
+    backend does, so the probe authenticates the way the run will. It is also the only way to
+    settle an environment route no offline evidence settles, so it runs even then.
     """
-    host = os.environ.get("DATABRICKS_HOST")
-    token = os.environ.get("DATABRICKS_TOKEN") or os.environ.get("DATABRICKS_API_TOKEN")
-    profile = None
-    if host and token:
-        found = "DATABRICKS_HOST + token set"
+    selected = _selected_databricks_profile()
+    config_name = _databricks_config_file()
+    env_credentials = () if selected else _databricks_env_credentials()
+    config = None if env_credentials else _read_databricks_config(config_name)
+    if config is None or (selected and config.missing):
+        if config is None:
+            skipped = f"{', '.join(env_credentials)} set, so {config_name} is not read"
+            found_prefix = ""
+        else:
+            skipped = f"{config_name} not found, so profile {selected} is not read"
+            found_prefix = f"{skipped}; "
+        auth, reason = _databricks_env_auth()
+        unsettled = f"{skipped}, and the environment route is incomplete ({reason})"
+        if auth is None and not check_credentials:
+            return CheckResult("mlflow", WARN, f"{unsettled}; {_MLFLOW_AUTH_ROUTES}")
+        found = unsettled if auth is None else f"{found_prefix}DATABRICKS_HOST + {auth} set"
     else:
-        profile = _databricks_profile()
-        if problem := _profile_problem(profile):
+        profile = selected or config.default_profile
+        quotable = selected is not None or not config.default_from_settings
+        problem = config.problem
+        if profile == _SETTINGS_SECTION:
+            problem = f"[{_SETTINGS_SECTION}] is a reserved section name and cannot be a profile"
+        elif problem is None and profile not in config.profiles:
+            if quotable:
+                problem = f"{config_name} has no [{profile}] section"
+            else:
+                problem = f"the [__settings__] default_profile names no section of {config_name}"
+        if problem:
             return CheckResult(
                 "mlflow",
                 WARN,
                 f"no Databricks credentials found ({problem}); {_MLFLOW_AUTH_ROUTES}",
             )
-        found = f"profile {profile} found in ~/.databrickscfg"
+        found = (
+            f"profile {profile} found in {config_name}"
+            if quotable
+            else f"profile named by [__settings__] default_profile found in {config_name}"
+        )
     if check_credentials:
         if not os.environ.get("DATABRICKS_TOKEN") and os.environ.get("DATABRICKS_API_TOKEN"):
             os.environ["DATABRICKS_TOKEN"] = os.environ["DATABRICKS_API_TOKEN"]
         try:
             from databricks.sdk import WorkspaceClient  # type: ignore
 
-            client = WorkspaceClient(profile=profile) if profile else WorkspaceClient()
+            client = WorkspaceClient(profile=selected) if selected else WorkspaceClient()
             user = client.current_user.me().user_name
         except Exception as e:
             return CheckResult("mlflow", WARN, f"{found} but SDK probe failed ({type(e).__name__})")
