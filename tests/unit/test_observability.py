@@ -101,6 +101,17 @@ class TestMetricsTracker:
         assert "loss" in tracker._smoothed
         assert "tokens_per_sec" in tracker._smoothed
 
+    def test_smoothing_takes_the_steps_between_logs(self):
+        """The EMA sees every step, so the logged ``smoothed/loss`` includes unlogged step 3."""
+        tracker = self._make_tracker(log_interval=2)
+        backend = _FakeBackend()
+        tracker._backends.append(backend)
+        for step, loss in enumerate([1.0, 2.0, 3.0, 4.0], start=1):
+            tracker.start_step()
+            tracker.end_step(step=step, loss=loss, grad_norm=1.0, lr=3e-4, tokens_in_step=1024)
+        logged = [(step, m["smoothed/loss"]) for m, step in backend.log_calls]
+        assert logged == [(1, 1.0), (2, pytest.approx(1.1)), (4, pytest.approx(1.561))]
+
     def test_end_step_reads_memory_once_per_logged_step(self, monkeypatch):
         """A logged step reads each counter once, from the current device; other steps read none."""
         tracker = self._make_tracker(log_interval=2)
