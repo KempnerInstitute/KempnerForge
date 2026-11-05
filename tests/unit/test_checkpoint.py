@@ -1453,7 +1453,7 @@ class TestWeightsOnlyWarmStart:
     def test_without_a_dataloader_no_state_is_stashed(self, tmp_path, monkeypatch):
         ckpt_dir = self._saved(tmp_path, monkeypatch, _freeze_meta(("vision_encoder", True)))
         mgr = _make_mock_mgr(tmp_path, monkeypatch)
-        step, _, _ = mgr.load(path=str(ckpt_dir), exclude_keys=["train_state"])
+        step, _, _ = mgr.load(path=str(ckpt_dir), exclude_keys=["optimizer", "train_state"])
         assert step == 0
         assert mgr._pending_dataloader_state is None
 
@@ -1462,10 +1462,19 @@ class TestWeightsOnlyWarmStart:
         mgr = _make_mock_mgr(tmp_path, monkeypatch)
         step, _, _ = mgr.load(
             path=str(ckpt_dir),
-            exclude_keys=["train_state"],
+            exclude_keys=["optimizer", "train_state"],
             vlm_freeze_expected=_freeze_meta(("vision_encoder", False)),
         )
         assert step == 0
+
+    @pytest.mark.parametrize(
+        "keys", [["train_state"], ["model", "train_state"], ["model", "optimizer", "train_state"]]
+    )
+    def test_train_state_outside_the_pair_is_refused(self, tmp_path, monkeypatch, keys):
+        ckpt_dir = self._saved(tmp_path, monkeypatch, _freeze_meta(("vision_encoder", True)))
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        with pytest.raises(ValueError, match="must be \\['optimizer', 'train_state'\\]"):
+            mgr.load(path=str(ckpt_dir), exclude_keys=keys)
 
     def test_without_the_key_the_train_state_is_restored(self, tmp_path, monkeypatch):
         ckpt_dir = self._saved(tmp_path, monkeypatch, _freeze_meta(("vision_encoder", True)))

@@ -1788,7 +1788,7 @@ class TestRestoreCheckpoint:
         assert mgr.load_kwargs["vlm_freeze_expected"] == freeze_meta_at_step(0, config.vlm)
         assert mgr.load_kwargs["exclude_keys"] == ["model"]
 
-    def test_mot_warm_start_fires_at_step_zero_but_not_on_a_weights_only_start(
+    def test_mot_warm_start_runs_only_when_no_checkpoint_supplied_the_model(
         self, monkeypatch, tmp_path
     ):
         import kempnerforge.training.entry as entry
@@ -1811,18 +1811,28 @@ class TestRestoreCheckpoint:
                 max_text_len=32, mot_warm_start_from_text=True, mot_warm_start_path="/x.pt"
             ),
         )
-        entry.restore_checkpoint(config, TinyTextModel(), None, FakeResumeManager(step=0))
-        assert copied == [{"w": 1}]
-
-        copied.clear()
-        entry.restore_checkpoint(config, TinyTextModel(), None, FakeResumeManager(step=4))
-        assert copied == []
+        for step in (0, 4):
+            entry.restore_checkpoint(config, TinyTextModel(), None, FakeResumeManager(step=step))
+            assert copied == [], f"a resume at step {step} supplied the model"
 
         monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: None)
         config.checkpoint.load_path = str(tmp_path / "stage1")
         config.checkpoint.exclude_from_loading = ["optimizer", "train_state"]
         entry.restore_checkpoint(config, TinyTextModel(), None, FakeResumeManager(step=0))
         assert copied == []
+
+        config.checkpoint.exclude_from_loading = ["model"]
+        entry.restore_checkpoint(config, TinyTextModel(), None, FakeResumeManager(step=0))
+        assert copied == [{"w": 1}]
+
+        copied.clear()
+        config.checkpoint.load_path = None
+        config.checkpoint.exclude_from_loading = []
+        assert entry.restore_checkpoint(config, TinyTextModel(), None, FakeResumeManager()) == (
+            0,
+            0,
+        )
+        assert copied == [{"w": 1}]
 
 
 class FakeDataset:

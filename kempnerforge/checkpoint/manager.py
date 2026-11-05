@@ -819,11 +819,13 @@ class CheckpointManager:
             scheduler: LR scheduler to restore.
             dataloader: Stateful dataloader to restore.
             exclude_keys: State to skip: the DCP keys ``"model"`` and
-                ``"optimizer"`` (e.g. ``["optimizer"]`` for fine-tuning), and
-                ``"train_state"`` for a weights-only warm start that ignores
-                ``train_state.pt`` (step, token count, scheduler, dataloader
-                position, RNG) and the saved freeze metadata, so the new run
-                starts at step 0 with its own schedule, data order and freeze.
+                ``"optimizer"`` (e.g. ``["optimizer"]`` for fine-tuning), or
+                ``["optimizer", "train_state"]`` for a weights-only warm start
+                that loads the model alone and ignores ``train_state.pt`` (step,
+                token count, scheduler, dataloader position, RNG) and the saved
+                freeze metadata, so the new run starts at step 0 with its own
+                schedule, data order and freeze. ``"train_state"`` in any other
+                combination raises ``ValueError``.
             vlm_freeze_expected: Canonical freeze metadata (output of
                 ``canonical_freeze_meta``) for the current run's VLMConfig.
                 When both the saved metadata and this argument are set,
@@ -851,6 +853,11 @@ class CheckpointManager:
 
         logger.info(f"Loading checkpoint: {ckpt_dir}")
         load_train_state = exclude_keys is None or "train_state" not in exclude_keys
+        if not load_train_state and set(exclude_keys or ()) != {"optimizer", "train_state"}:
+            raise ValueError(
+                "exclude_keys with 'train_state' must be ['optimizer', 'train_state']: a "
+                f"weights-only warm start loads the model alone (got {exclude_keys!r})"
+            )
 
         if vlm_freeze_expected is not None and load_train_state:
             metadata_path = ckpt_dir / _METADATA_FILE

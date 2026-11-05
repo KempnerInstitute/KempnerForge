@@ -112,9 +112,13 @@ exclude_from_loading = ["optimizer", "train_state"]
 ```
 
 The new run then begins at step 0 with its own warmup, data order and
-freeze specs, and only the model weights come from the checkpoint. Exclude
-`"optimizer"` with it: `"train_state"` alone keeps the saved moments and
-step counters while the schedule restarts from warmup.
+freeze specs, and only the model weights come from the checkpoint.
+`"train_state"` is accepted only in that pair: with the optimizer kept, a
+restarted warmup would apply the saved moments and step counters, and a
+changed freeze would fail inside the optimizer load instead of at the
+freeze check; with the model excluded too, nothing would load. A MoT run
+with `mot_warm_start_from_text` keeps the loaded weights: the text warm
+start runs only when no checkpoint supplied the model.
 
 ## Symlink updates
 
