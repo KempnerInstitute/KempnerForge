@@ -1429,7 +1429,10 @@
     },
     "scripts/generate.py": {
       "purpose": "Text generation — load model, sample from prompts, interactive REPL",
-      "entry": "main()"
+      "entry": "main()",
+      "tested_by": [
+        "tests/unit/test_ep_checkpoint.py::TestUnfixedCheckpoint"
+      ]
     },
     "scripts/convert_checkpoint.py": {
       "purpose": "KempnerForge <-> HuggingFace checkpoint conversion",
@@ -1665,23 +1668,26 @@
         "classes": [
           "TestCheckpointHoldsEveryExpert(12)",
           "TestSecondMeshOfOneLayout(1)",
-          "TestDriftedCopies(1)",
+          "TestDriftedCopies(2)",
+          "TestPlacementCheck(1)",
+          "TestFailureOnOneRank(1)",
           "TestResumeAtTheSameLayout(11)",
           "TestLoadAtAnotherEP(18)",
-          "TestUnfixedCheckpoint(6)",
+          "TestUnfixedCheckpoint(8)",
           "TestExportFromAnEPCheckpoint(3)",
           "TestWithoutEP(2)"
         ],
-        "count": 54
+        "count": 59
       },
       "tests/unit/test_expert_layout.py": {
         "classes": [
           "TestMoELayers(2)",
           "TestUnpackedNames(6)",
           "TestPackedWithoutMesh(1)",
+          "TestOlderTorch(1)",
           "TestCheckSavedExperts(6)"
         ],
-        "count": 15
+        "count": 16
       },
       "tests/unit/test_fp8.py": {
         "classes": [
