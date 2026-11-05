@@ -219,8 +219,9 @@ gradient magnitudes and should be validated against a baseline run
 before flipping on.
 
 `avg_tokens` is the average load over all `num_experts` experts, as in
-`MoEMLP._local_forward`. A local expert receives a copy of its tokens
-from each EP rank, so in those units the average is
+`MoEMLP._local_forward`, and as there the scale applies in training
+mode only, whether or not gradients are on. A local expert receives a
+copy of its tokens from each EP rank, so in those units the average is
 `num_tokens · top_k / num_local_experts`, and EP leaves the scale, and
 with it the forward pass, unchanged.
 
