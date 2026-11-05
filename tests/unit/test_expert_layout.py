@@ -1,0 +1,141 @@
+"""The expert layout's names, param groups and checks, in one process without a mesh.
+
+An unpacked layer is marked as rank 1 of two EP ranks by hand: it keeps experts 2 and 3
+of four, as ``apply_expert_parallel`` leaves them, renumbered 0 and 1. Packed tensors and
+whole checkpoints are checked over gloo in ``tests/unit/test_ep_checkpoint.py``.
+"""
+
+from __future__ import annotations
+
+import pytest
+import torch
+from torch.distributed.checkpoint.state_dict import get_model_state_dict
+
+from kempnerforge.checkpoint.expert_layout import (
+    ExpertLayout,
+    expert_layout,
+    moe_layers,
+)
+from kempnerforge.config.model import ModelConfig
+from kempnerforge.config.schema import ActivationCheckpointing
+from kempnerforge.distributed.parallel import apply_ac
+from kempnerforge.model.moe import MoEMLP, build_moe
+from kempnerforge.model.transformer import Transformer
+
+LAYER = "layers.0.mlp"
+PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
+
+
+def _rank_one_of_two(packed: bool = False) -> MoEMLP:
+    """A four-expert layer holding experts 2 and 3 as EP rank 1 of 2 does."""
+    moe = build_moe(dim=8, hidden_dim=16, num_experts=4, top_k=2, packed_experts=packed)
+    if not packed:
+        moe.experts = torch.nn.ModuleList(list(moe.experts)[2:])
+    moe.ep_world_size = 2
+    moe.local_expert_start = 2
+    moe.num_local_experts = 2
+    return moe
+
+
+def _names(experts: list[int]) -> list[str]:
+    return [f"{LAYER}.experts.{i}.{p}.weight" for i in experts for p in PROJECTIONS]
+
+
+def _state(moe: MoEMLP) -> dict:
+    """A state dict as rank 1 gives it: its experts under local names 0 and 1."""
+    model = {f"{LAYER}.router.gate.weight": torch.zeros(1)}
+    model.update({f"{LAYER}.{name}": p for name, p in moe.named_parameters() if "experts" in name})
+    names = [f"{LAYER}.router.gate.weight", *_names([0, 1])]
+    return {
+        "model": model,
+        "optimizer": {
+            "state": {name: {"exp_avg": torch.zeros(1)} for name in names},
+            "param_groups": [{"params": names, "lr": 0.1}],
+        },
+        "optimizer_never_stepped": {_names([1])[0]: torch.zeros((), dtype=torch.bool)},
+    }
+
+
+class TestMoELayers:
+    def test_names_match_the_state_dict_under_ac_and_compile(self):
+        """The layer names leave out the AC and compile wrappers, as the state dict does."""
+        config = ModelConfig(
+            dim=16, n_layers=2, n_heads=2, vocab_size=32, num_experts=4, moe_top_k=2
+        )
+        model = Transformer(config)
+        apply_ac(model, ActivationCheckpointing.full)
+        prefixes = {key.rpartition(".mlp.")[0] + ".mlp" for key in get_model_state_dict(model)}
+        for wrapped in (model, torch.compile(model)):
+            names = [name for name, _ in moe_layers(wrapped)]
+            assert names == ["layers.0.mlp", "layers.1.mlp"]
+            assert set(names) <= prefixes
+
+    def test_no_layout_without_expert_parallelism(self):
+        """With ``ep = 1`` nothing is translated, so the checkpoint keeps its names."""
+        config = ModelConfig(dim=16, n_layers=1, n_heads=2, vocab_size=32, num_experts=4)
+        assert expert_layout(Transformer(config)) is None
+
+
+class TestUnpackedNames:
+    def test_experts_take_their_global_index(self):
+        """Local experts 0 and 1 of rank 1 are saved as experts 2 and 3."""
+        moe = _rank_one_of_two()
+        state = ExpertLayout([(LAYER, moe)]).to_global(_state(moe))
+        expected = {f"{LAYER}.router.gate.weight", *_names([2, 3])}
+        assert set(state["model"]) == expected
+        assert set(state["optimizer"]["state"]) == expected
+        assert set(state["optimizer_never_stepped"]) == {_names([3])[0]}
+
+    def test_tensors_are_the_rank_own(self):
+        """Each global name holds the tensor of the local expert it names."""
+        moe = _rank_one_of_two()
+        local = _state(moe)
+        state = ExpertLayout([(LAYER, moe)]).to_global(local)
+        for name, tensor in zip(_names([2, 3]), _names([0, 1]), strict=True):
+            assert state["model"][name] is local["model"][tensor]
+
+    def test_param_groups_list_every_rank_experts(self):
+        """Each rank lists all four experts in global order, as one process does."""
+        moe = _rank_one_of_two()
+        state = ExpertLayout([(LAYER, moe)]).to_global(_state(moe))
+        expected = [f"{LAYER}.router.gate.weight", *_names([0, 1, 2, 3])]
+        assert state["optimizer"]["param_groups"][0]["params"] == expected
+
+    def test_to_local_restores_rank_names_and_keeps_loaded_settings(self):
+        """After a load, names and param lists are the rank's again; group settings are loaded."""
+        moe = _rank_one_of_two()
+        local = _state(moe)
+        layout = ExpertLayout([(LAYER, moe)])
+        loaded = layout.to_global(local)
+        loaded["optimizer"]["param_groups"][0]["lr"] = 0.5
+        restored = layout.to_local(loaded)
+        assert set(restored["model"]) == set(local["model"])
+        assert set(restored["optimizer"]["state"]) == set(local["optimizer"]["state"])
+        assert restored["optimizer"]["param_groups"] == [
+            {"params": local["optimizer"]["param_groups"][0]["params"], "lr": 0.5}
+        ]
+
+    def test_input_is_left_as_it_is(self):
+        """The translation returns new dicts, so the optimizer's own state is never renamed."""
+        moe = _rank_one_of_two()
+        local = _state(moe)
+        names = list(local["optimizer"]["state"])
+        ExpertLayout([(LAYER, moe)]).to_global(local)
+        assert list(local["optimizer"]["state"]) == names
+
+    def test_missing_expert_weights_refuse_the_save(self):
+        """A model state without the layer's experts would save no expert of this rank."""
+        moe = _rank_one_of_two()
+        state = _state(moe)
+        del state["model"][_names([1])[2]]
+        with pytest.raises(ValueError, match="no entry for 1 expert weights"):
+            ExpertLayout([(LAYER, moe)]).to_global(state)
+
+
+class TestPackedWithoutMesh:
+    def test_layer_without_ep_mesh_is_refused(self):
+        """A packed layer split by hand records no EP mesh to place its rows by."""
+        moe = _rank_one_of_two(packed=True)
+        state = {"model": {f"{LAYER}.{name}": p for name, p in moe.named_parameters()}}
+        with pytest.raises(ValueError, match="records no ep_mesh"):
+            ExpertLayout([(LAYER, moe)]).to_global(state)
