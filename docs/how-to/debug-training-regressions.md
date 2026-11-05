@@ -70,21 +70,26 @@ OOMs.
 **What the codebase does:** `MetricsTracker` calls
 `get_memory_stats()` on every logging step and logs `gpu/allocated_gb`,
 `gpu/peak_gb`, `gpu/reserved_gb`, `gpu/mem_utilization` to WandB /
-TensorBoard. Start there — plot `peak_gb` over step count.
-`peak_gb` is the run's high-water mark, so it never falls: each rise is
-a new high.
+TensorBoard. Start there, and plot `gpu/allocated_gb` over step count:
+it is the memory held by live tensors when the step is logged, after
+the step's activations are freed, so anything a step leaves behind
+adds to it. Don't hunt a leak in `gpu/peak_gb`: it is the run's
+high-water mark, so it never falls, and a leak stays hidden in it until
+it climbs past the run's earlier maximum.
 
 ```
-[step   50] gpu/peak_gb=78.4 | ...
-[step  100] gpu/peak_gb=78.4 | ...
-[step  500] gpu/peak_gb=78.4 | ...
-[step 1000] gpu/peak_gb=78.6 | ...     ← +200 MB
-[step 2000] gpu/peak_gb=79.1 | ...     ← +500 MB over another 1k steps
+[step   50] gpu/allocated_gb=41.2 | ...
+[step  100] gpu/allocated_gb=41.2 | ...
+[step  500] gpu/allocated_gb=41.2 | ...
+[step 1000] gpu/allocated_gb=41.4 | ...     ← +200 MB
+[step 2000] gpu/allocated_gb=41.9 | ...     ← +500 MB over another 1k steps
 ```
 
-A flat curve is healthy; a staircase is a leak, and a steady slope is
-fragmentation. For the staircase pattern, a snapshot is the fastest
-way to identify the source:
+A flat curve is healthy; one that climbs, in a staircase or a steady
+slope, is a leak. Fragmentation does not show in `allocated_gb`: watch
+the gap between `reserved_gb` and `allocated_gb` for it (see
+[Fragmentation vs genuine leaks](#fragmentation-vs-genuine-leaks)).
+For a leak, a snapshot is the fastest way to identify the source:
 
 ```python
 # In your training script, before `trainer.train()` or equivalent:
@@ -246,7 +251,7 @@ A debugging session usually follows this sequence:
 Symptom
    │
    ├─ Loss NaN      → train/grad_norm + last-good checkpoint → restart lower LR
-   ├─ OOM           → peak_gb trace → snapshot → memory_viz
+   ├─ OOM           → allocated_gb trace → snapshot → memory_viz
    ├─ Rank hang     → NCCL liveness + NCCL_TIMEOUT → inspect rank-specific code
    ├─ Slowdown      → step_time_sec → torch.profiler → kernel summary
    └─ Bad eval      → re-run eval on baseline → audit data / LR / tokenizer
