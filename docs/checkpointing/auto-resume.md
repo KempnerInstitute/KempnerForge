@@ -11,7 +11,7 @@ again" just works, as long as a checkpoint directory exists.
 
 ```python
 # kempnerforge/resilience/elastic.py (abridged — logging calls elided)
-def resolve_resume_path(checkpoint_dir: str) -> Path | None:
+def resolve_resume_path(checkpoint_dir: str, num_stages: int | None = None) -> Path | None:
     base = Path(checkpoint_dir)
     if not base.exists():
         return None
@@ -23,16 +23,22 @@ def resolve_resume_path(checkpoint_dir: str) -> Path | None:
         if resolved.exists():
             return resolved
 
-    # 2. highest-numbered step_N directory
+    # 2. newest step_N directory whose DCP shards are durable
     step_dirs = sorted(
         (d for d in base.iterdir()
          if d.is_dir() and d.name.startswith("step_") and d.name.split("_")[1].isdigit()),
         key=lambda d: int(d.name.split("_")[1]),
+        reverse=True,
     )
-    if step_dirs:
-        return step_dirs[-1]
+    short_of_stages = None
+    for path in step_dirs:
+        if _dcp_durable(path, num_stages):
+            return path
+        if _dcp_durable(path):  # every stage directory present is complete
+            short_of_stages = short_of_stages or path
 
-    return None
+    # 3. no step has every stage: keep the old choice (logged as an error)
+    return short_of_stages
 ```
 
 Two fallbacks:
@@ -40,10 +46,18 @@ Two fallbacks:
 1. **`latest` symlink** — the canonical pointer, updated atomically
    after every successful save (see [Symlink updates](#symlink-updates)
    below). Used in all healthy cases.
-2. **Highest `step_N` directory** — a safety net. If the symlink
+2. **Newest durable `step_N` directory** — a safety net. If the symlink
    is missing (disk corruption, manual `rm`, never created because
-   no save has completed), the resolver scans for the highest-numbered
-   `step_N` directory and uses that.
+   no save has completed), the resolver scans the `step_N` directories
+   from the newest and takes the first whose DCP `.metadata` exists. Under
+   pipeline parallelism that means every stage's `pp{k}/.metadata`, for
+   `pp0` through `pp{n-1}` where `n` is `distributed.pp`, so a step that
+   one stage never started saving is skipped instead of resumed with that
+   stage loading an older step. When no step has every stage, the
+   newest one whose stage directories are complete is resumed as before,
+   after an error log, instead of the run starting over. The stage layout
+   records no degree, so a checkpoint saved with another `distributed.pp`
+   looks the same; resume needs the degree it was saved with.
 
 If neither path finds anything, the function returns `None` and
 training starts from step 0.
@@ -54,7 +68,8 @@ training starts from step 0.
 `CheckpointManager`:
 
 ```python
-resume_path = resolve_resume_path(config.checkpoint.dir)
+num_stages = config.distributed.pp if config.distributed.pp > 1 else None
+resume_path = resolve_resume_path(config.checkpoint.dir, num_stages)
 step, tokens_seen = 0, 0
 if resume_path or config.checkpoint.load_path:
     step, tokens_seen, ckpt_extra_loaded = ckpt_mgr.load(
@@ -128,17 +143,14 @@ moved, so an error while pruning fails no rank (see
 
 After updating the symlink, `CheckpointManager._cleanup()` keeps the
 `config.checkpoint.keep_last_n` highest-numbered `step_*` directories
-and removes the older ones, except two kinds it never removes:
+and removes the older ones, except three kinds it never removes:
 
 - the checkpoint `latest` points at;
+- the directory the last `save()` writes into, so an async save keeps it
+  while its flush runs, even when newer `step_*` directories are
+  present, as after the manual rewind below;
 - every `dyn_ckpt_window` milestone, so the dense early checkpoints
   survive a finite `keep_last_n`.
-
-Nothing else is protected. An async save's directory survives while its
-flush runs only because it is normally the newest. When newer `step_*`
-directories are present, as after the manual rewind below, retention
-can delete it mid-save: the save fails, or the checkpoint is left
-without its shards.
 
 Default `keep_last_n = 3`. Set `keep_last_n = 0`, or any value `<= 0`,
 to keep every checkpoint: cleanup then removes nothing.
@@ -191,9 +203,7 @@ ln -s step_5000 latest
 
 Move the abandoned `step_*` directories newer than step 5000 out of
 `checkpoints/` as well. Retention counts them among the newest, so they
-take the `keep_last_n` places of the rerun's own checkpoints, and with
-an async `async_mode` it can delete a directory a new save is still
-writing.
+take the `keep_last_n` places of the rerun's own checkpoints.
 
 Or override explicitly:
 

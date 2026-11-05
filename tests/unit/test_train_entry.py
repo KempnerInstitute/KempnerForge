@@ -34,6 +34,7 @@ from kempnerforge.training.data_pipeline import (
 from kempnerforge.training.hooks import HookRunner, TrainingHook
 from kempnerforge.training.loop import (
     BatchStream,
+    StepFn,
     TrainingSession,
     checkpoint_extra,
     pipeline_step,
@@ -117,6 +118,7 @@ class RecordingHook(TrainingHook):
         self.begins = 0
         self.ends: list[tuple[int, int]] = []
         self.steps: list[int] = []
+        self.lrs: list[float] = []
         self.saves: list[int] = []
 
     def on_train_begin(self, config: JobConfig) -> None:
@@ -124,6 +126,7 @@ class RecordingHook(TrainingHook):
 
     def on_step_end(self, ctx) -> None:
         self.steps.append(ctx.step)
+        self.lrs.append(ctx.lr)
 
     def on_checkpoint_save(self, step: int, path: str) -> None:
         self.saves.append(step)
@@ -205,6 +208,35 @@ def _make_tracker(config: JobConfig):
     from kempnerforge.metrics.tracker import MetricsTracker
 
     return MetricsTracker(config, num_gpus=1)
+
+
+def _nan_on(steps: set[int], step_fn: StepFn = text_step) -> StepFn:
+    """Wrap a step body so the iterations that start at ``steps`` report a NaN loss."""
+
+    def nan_step(session: TrainingSession, step: int):
+        result = step_fn(session, step)
+        return dataclasses.replace(result, loss=float("nan")) if step in steps else result
+
+    return nan_step
+
+
+def _bad_update_on(bad_step: int, step_fn: StepFn = text_step) -> StepFn:
+    """Wrap a step body so the iteration that starts at ``bad_step`` makes a bad update.
+
+    The step's loss and the gradient norm it reports stay finite, so the NaN check
+    lets it through, but its gradients turn NaN after the norm is taken, so the
+    optimizer writes NaN into the weights and every later loss is NaN.
+    """
+
+    def bad_update(session: TrainingSession, step: int):
+        result = step_fn(session, step)
+        if step == bad_step:
+            for p in session.model.parameters():
+                if p.grad is not None:
+                    p.grad.fill_(float("nan"))
+        return result
+
+    return bad_update
 
 
 class TestBatchStream:
@@ -407,6 +439,64 @@ class TestTextStep:
         session = make_session(config, data=DataPipeline(dataloader=batches))
         result = session.step_fn(session, 0)
         assert result.loss > 0
+
+
+class TestAutocastFallback:
+    """``TrainingSession.autocast_dtype`` puts the step body's forward under ``torch.autocast``."""
+
+    @pytest.mark.parametrize(
+        ("autocast_dtype", "expected"), [(None, torch.float32), (torch.bfloat16, torch.bfloat16)]
+    )
+    def test_text_step_forward(
+        self, autocast_dtype: torch.dtype | None, expected: torch.dtype
+    ) -> None:
+        session = make_session(make_config(), autocast_dtype=autocast_dtype)
+        seen: list[torch.dtype] = []
+        session.model.out.register_forward_hook(lambda _m, _i, out: seen.append(out.dtype))
+        session.step_fn(session, 0)
+        assert seen == [expected]
+        for p in session.model.parameters():
+            assert p.dtype == torch.float32
+            assert p.grad is not None and p.grad.dtype == torch.float32
+
+    def test_vlm_step_forward(self) -> None:
+        model = TinyVlmModel()
+        batch = {
+            "pixel_values": torch.zeros(2, 3, 4, 4),
+            "input_ids": torch.zeros(2, 4, dtype=torch.long),
+            "labels": torch.zeros(2, 4, dtype=torch.long),
+        }
+        session = make_session(
+            make_config(),
+            model=model,
+            data=DataPipeline(dataloader=[batch]),
+            step_fn=vlm_step,
+            autocast_dtype=torch.bfloat16,
+        )
+        seen: list[torch.dtype] = []
+        model.proj.register_forward_hook(lambda _m, _i, out: seen.append(out.dtype))
+        session.step_fn(session, 0)
+        assert seen == [torch.bfloat16]
+
+    def test_pipeline_schedule_runs_under_autocast(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        enabled: list[bool] = []
+
+        class Schedule(FakeSchedule):
+            def step(self, *args: Any, **kwargs: Any) -> None:
+                enabled.append(torch.is_autocast_enabled("cpu"))
+                super().step(*args, **kwargs)
+
+        session, _ = TestPipelineStep()._session(monkeypatch, rank=0, size=2, sched=Schedule())
+        session.autocast_dtype = torch.bfloat16
+        session.step_fn(session, 0)
+        assert enabled == [True]
+
+    def test_context(self) -> None:
+        with make_session(make_config(), autocast_dtype=torch.bfloat16).autocast():
+            assert torch.is_autocast_enabled("cpu")
+            assert torch.get_autocast_dtype("cpu") == torch.bfloat16
+        with make_session(make_config()).autocast():
+            assert not torch.is_autocast_enabled("cpu")
 
 
 class TestVlmTextTokenGuard:
@@ -779,6 +869,359 @@ class TestRunTrainingLoop:
         session = make_session(config, phases=PhaseState(lr_scale=0.5))
         run_training_loop(session)
         assert session.optimizer.param_groups[0]["lr"] == pytest.approx(0.025)
+
+
+class TestNanSkippedStep:
+    """A step skipped for a non-finite loss still crosses the step boundary.
+
+    It skips the optimizer update, but the LR schedule, the step-keyed
+    transitions and the shutdown check move with the step counter as on a
+    finite step.
+    """
+
+    def test_lr_schedule_stays_on_the_step_counter(self):
+        config = make_config(max_steps=6)
+        hook = RecordingHook()
+        session = make_session(config, step_fn=_nan_on({1, 3}), hooks=HookRunner([hook]))
+        session.scheduler = torch.optim.lr_scheduler.LambdaLR(
+            session.optimizer, lambda s: 1.0 / (1 + s)
+        )
+        step, _ = run_training_loop(session)
+        assert step == 6
+        assert session.scheduler.last_epoch == 6
+        assert hook.steps == [1, 3, 5, 6]
+        assert hook.lrs == pytest.approx([0.05 / (1 + s) for s in hook.steps])
+
+    def test_nan_stop_leaves_the_schedule_on_the_returned_step(self):
+        config = make_config(max_steps=10)
+        session = make_session(
+            config,
+            step_fn=_nan_on(set(range(10))),
+            nan_detector=NaNDetector(action="warn", max_consecutive=3),
+        )
+        step, _ = run_training_loop(session)
+        assert step == 2
+        assert session.scheduler.last_epoch == 2
+
+    def test_skipped_step_adds_no_tokens(self):
+        """``tokens_seen`` counts the two steps that updated the model, not the skipped one."""
+        config = make_config(max_steps=3)
+        step, tokens_seen = run_training_loop(make_session(config, step_fn=_nan_on({1})))
+        assert step == 3
+        assert tokens_seen == 2 * config.train.batch_size * config.train.seq_len
+
+    def test_skipped_step_runs_no_eval_nccl_check_profiler_step_or_metrics(self, monkeypatch):
+        """Step 2 is due for eval and the NCCL check but is skipped, so only step 1's work runs."""
+        import kempnerforge.training.loop as loop
+        from kempnerforge.config.eval import EvalConfig
+
+        calls: list[str] = []
+        monkeypatch.setattr(loop, "run_eval", lambda *a, **k: calls.append("eval") or {})
+        monkeypatch.setattr(loop, "check_nccl_health", lambda: calls.append("nccl") or True)
+
+        class RecordingProfiler:
+            def start(self) -> None:
+                pass
+
+            def stop(self) -> None:
+                pass
+
+            def step(self) -> None:
+                calls.append("profiler")
+
+        config = make_config(max_steps=2)
+        config.eval = EvalConfig(enabled=True, interval=2, steps=1, dataset_path="/x")
+        config.train.nccl_health_check_interval = 2
+        session = make_session(
+            config,
+            step_fn=_nan_on({1}),
+            eval_dataloader=["BATCH"],
+            profiler=RecordingProfiler(),
+            runtime=dataclasses.replace(_runtime(), rank=1),
+        )
+        logged: list[int] = []
+        end_step = session.tracker.end_step
+        monkeypatch.setattr(
+            session.tracker, "end_step", lambda **kw: logged.append(kw["step"]) or end_step(**kw)
+        )
+        run_training_loop(session)
+        assert calls == ["profiler"]
+        assert logged == [1]
+
+    def test_skipped_last_step_makes_no_final_save(self):
+        """A run whose last step is skipped is not a clean finish, so it writes no final save."""
+        config = make_config(max_steps=3)
+        config.checkpoint.interval = 100
+        ckpt = FakeCheckpointManager()
+        step, _ = run_training_loop(make_session(config, checkpointer=ckpt, step_fn=_nan_on({2})))
+        assert step == 3
+        assert ckpt.saves == []
+
+    def test_phase_lr_scale_applies_to_the_next_steps_lr(self):
+        config = make_config(max_steps=1)
+        session = make_session(config, phases=PhaseState(lr_scale=0.5), step_fn=_nan_on({0}))
+        run_training_loop(session)
+        assert session.optimizer.param_groups[0]["lr"] == pytest.approx(0.025)
+
+    def _phase_session(self, phase: TrainingPhase, **overrides: Any) -> TrainingSession:
+        """A two-step mixture run with one data phase; ``overrides`` go to ``make_session``."""
+        data = _mixture_pipeline()
+        data.dataloader = [
+            {
+                "input_ids": torch.zeros(2, 4, dtype=torch.long),
+                "labels": torch.zeros(2, 4, dtype=torch.long),
+            }
+        ]
+        config = make_config(max_steps=2)
+        config.data = DataConfig(phases=[phase])
+        phases = build_phase_state(config, data, step=0)
+        return make_session(config, data=data, phases=phases, **overrides)
+
+    def test_phase_due_on_a_skipped_step_fires_on_it(self, monkeypatch):
+        """Step 2 is reached by a NaN step and is the last one, so only that step can fire it."""
+        session = self._phase_session(
+            TrainingPhase(start_step=2, dataset_weights={"a": 5.0}, lr_scale=0.5),
+            step_fn=_nan_on({1}),
+        )
+        resets: list[int] = []
+        reset = session.batches.reset
+        monkeypatch.setattr(session.batches, "reset", lambda: resets.append(1) or reset())
+        run_training_loop(session)
+        assert session.phases.next_idx == 1
+        assert session.phases.lr_scale == 0.5
+        assert session.data.mixture_sampler.calls == [([5.0, 3.0], 1.0)]
+        assert resets == [1]
+
+    def test_a_phase_reached_by_a_skipped_step_scales_the_lr_from_the_same_update(self):
+        """The phase's ``lr_scale`` first applies to step 3's update, as in an all-finite run."""
+
+        def lr_at_each_step(nan_steps: set[int]) -> list[float]:
+            lrs: list[float] = []
+            body = _nan_on(nan_steps)
+
+            def step_fn(session: TrainingSession, step: int):
+                lrs.append(session.optimizer.param_groups[0]["lr"])
+                return body(session, step)
+
+            session = self._phase_session(
+                TrainingPhase(start_step=2, dataset_weights={"a": 5.0}, lr_scale=0.5),
+                step_fn=step_fn,
+            )
+            session.config.train.max_steps = 4
+            run_training_loop(session)
+            return lrs
+
+        finite = lr_at_each_step(set())
+        assert finite == pytest.approx([0.05, 0.05, 0.05, 0.025])
+        assert lr_at_each_step({1}) == finite
+
+    def test_shutdown_is_acted_on_at_the_skipped_step(self):
+        """A pending shutdown is acted on at the first NaN step, not after the NaN run."""
+        config = make_config(max_steps=10)
+        ckpt = FakeCheckpointManager()
+        handler = FakeShutdownHandler(after_steps=1)
+        session = make_session(
+            config,
+            loss_fn=lambda logits, labels: logits.sum() * float("nan"),
+            nan_detector=NaNDetector(action="warn", max_consecutive=3),
+            checkpointer=ckpt,
+            shutdown_handler=handler,
+        )
+        step, _ = run_training_loop(session)
+        assert step == 1
+        assert handler.checks == 1
+        assert ckpt.saved_steps == [1]
+        assert handler.finished is True
+        assert ckpt.waits == 1
+
+    def test_shutdown_on_a_skipped_scheduled_step_saves_it_once(self, monkeypatch):
+        """The schedule skips a NaN step's save, so the emergency save is its only one."""
+        config = make_config(max_steps=10)
+        config.checkpoint.interval = 2
+        ckpt = FakeCheckpointManager()
+        handler = FakeShutdownHandler(after_steps=2)
+        session = make_session(
+            config, checkpointer=ckpt, shutdown_handler=handler, step_fn=_nan_on({1})
+        )
+        epochs: list[int] = []
+        real_save = ckpt.save
+
+        def save(step: int, **kwargs: Any) -> None:
+            epochs.append(kwargs["scheduler"].last_epoch)
+            real_save(step, **kwargs)
+
+        monkeypatch.setattr(ckpt, "save", save)
+        step, tokens_seen = run_training_loop(session)
+        assert step == 2
+        assert ckpt.saves == [(2, tokens_seen, {})]
+        assert ckpt.waits == 1
+        assert epochs == [2]
+        assert handler.finished is True
+
+    def test_nan_stop_is_not_saved_even_with_a_shutdown_pending(self):
+        """The NaN that trips the stop ends the run before the shutdown check: no save."""
+        config = make_config(max_steps=10)
+        ckpt = FakeCheckpointManager()
+        handler = FakeShutdownHandler(after_steps=2)
+        session = make_session(
+            config,
+            loss_fn=lambda logits, labels: logits.sum() * float("nan"),
+            nan_detector=NaNDetector(action="warn", max_consecutive=2),
+            checkpointer=ckpt,
+            shutdown_handler=handler,
+        )
+        step, _ = run_training_loop(session)
+        assert step == 1
+        assert handler.checks == 1
+        assert ckpt.saves == []
+        assert handler.finished is False
+
+    def test_emergency_checkpoint_records_the_phase_the_skipped_step_entered(self, monkeypatch):
+        """It also saves the dataloader, so the resume continues from the same data position."""
+        ckpt = FakeCheckpointManager()
+        session = self._phase_session(
+            TrainingPhase(start_step=2, dataset_weights={"a": 5.0}),
+            checkpointer=ckpt,
+            shutdown_handler=FakeShutdownHandler(after_steps=2),
+            step_fn=_nan_on({1}),
+        )
+        loaders: list = []
+        real_save = ckpt.save
+
+        def save(step: int, **kwargs: Any) -> None:
+            loaders.append(kwargs.get("dataloader"))
+            real_save(step, **kwargs)
+
+        monkeypatch.setattr(ckpt, "save", save)
+        step, tokens_seen = run_training_loop(session)
+        assert step == 2
+        assert ckpt.saves == [(2, tokens_seen, {"phase_idx": 1})]
+        assert loaders == [session.data.dataloader]
+        assert loaders[0] is not None
+
+    def test_resume_from_its_emergency_checkpoint_matches_an_uninterrupted_run(self, tmp_path):
+        """The real manager carries the skipped step's weights, schedule and RNG across."""
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        def run(ckpt_dir, shutdown_after=None, resume=False):
+            config = make_config(max_steps=5)
+            config.checkpoint.dir = str(ckpt_dir)
+            config.checkpoint.interval = 100
+            model = TinyTextModel()
+            optimizer = torch.optim.AdamW(model.parameters(), lr=0.05)
+            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda s: 1.0 / (1 + s))
+            session = make_session(
+                config,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                step_fn=_nan_on({1}),
+                shutdown_handler=FakeShutdownHandler(after_steps=shutdown_after),
+            )
+            session.checkpointer = CheckpointManager(config.checkpoint, model, optimizer)
+            step, tokens_seen = 0, 0
+            if resume:
+                step, tokens_seen, _ = session.checkpointer.load(scheduler=scheduler)
+            return session, run_training_loop(session, step=step, tokens_seen=tokens_seen)
+
+        torch.manual_seed(0)
+        full, full_end = run(tmp_path / "full")
+        torch.manual_seed(0)
+        _, stop_end = run(tmp_path / "split", shutdown_after=2)
+        torch.manual_seed(1)
+        resumed, resumed_end = run(tmp_path / "split", resume=True)
+        assert stop_end[0] == 2
+        assert resumed_end == full_end
+        assert resumed.scheduler.last_epoch == full.scheduler.last_epoch == 5
+        params = zip(full.model.parameters(), resumed.model.parameters(), strict=True)
+        assert all(torch.equal(p, q) for p, q in params)
+
+    def _keep_last_one(
+        self, ckpt_dir, step_fn: StepFn, mode: str = "disabled"
+    ) -> tuple[int, FakeShutdownHandler]:
+        """Save every 2 steps with ``keep_last_n=1`` through the real manager; shut down at 4."""
+        from kempnerforge.checkpoint.manager import CheckpointManager
+        from kempnerforge.config.checkpoint import AsyncCheckpointMode
+
+        config = make_config(max_steps=10)
+        config.checkpoint.dir = str(ckpt_dir)
+        config.checkpoint.interval = 2
+        config.checkpoint.keep_last_n = 1
+        config.checkpoint.async_mode = AsyncCheckpointMode(mode)
+        handler = FakeShutdownHandler(after_steps=4)
+        session = make_session(config, step_fn=step_fn, shutdown_handler=handler)
+        session.checkpointer = CheckpointManager(
+            config.checkpoint, session.model, session.optimizer
+        )
+        step, _ = run_training_loop(session)
+        return step, handler
+
+    @pytest.mark.parametrize("mode", ["disabled", "async", "async_with_pinned_mem"])
+    def test_shutdown_after_a_bad_update_keeps_the_last_good_checkpoint(
+        self, monkeypatch, caplog, tmp_path, mode
+    ):
+        """The update into step 3 writes NaN weights, so skipped step 4's shutdown saves nothing.
+
+        Saved, those weights would become ``latest`` and, with ``keep_last_n=1``,
+        prune step 2, so a resume would load NaN weights.
+        """
+        import logging
+
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        monkeypatch.setattr(logging.getLogger("kempnerforge"), "propagate", True)
+        with caplog.at_level(logging.ERROR, logger="kempnerforge"):
+            step, handler = self._keep_last_one(tmp_path, _bad_update_on(2), mode)
+        assert step == 4
+        assert handler.finished is True
+        assert sorted(d.name for d in tmp_path.glob("step_*")) == ["step_2"]
+        assert (tmp_path / "latest").resolve() == (tmp_path / "step_2").resolve()
+        errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        assert any("parameters are not finite" in m for m in errors)
+        config = make_config()
+        config.checkpoint.dir = str(tmp_path)
+        resumed = TinyTextModel()
+        mgr = CheckpointManager(
+            config.checkpoint, resumed, torch.optim.SGD(resumed.parameters(), lr=0.05)
+        )
+        assert mgr.load()[0] == 2
+        assert all(torch.isfinite(p).all() for p in resumed.parameters())
+
+    def test_shutdown_on_a_skipped_step_with_finite_weights_still_saves_it(self, tmp_path):
+        """A NaN loss alone leaves the weights finite, so skipped step 4 is saved as ``latest``."""
+        step, handler = self._keep_last_one(tmp_path, _nan_on({3}))
+        assert step == 4
+        assert handler.finished is True
+        assert (tmp_path / "step_4" / ".metadata").is_file()
+        assert (tmp_path / "latest").resolve() == (tmp_path / "step_4").resolve()
+
+    def test_weights_are_checked_only_for_a_shutdown_on_a_skipped_step(self, monkeypatch):
+        """The check is a collective pass over every weight, so no other step runs it."""
+        import kempnerforge.training.loop as loop
+
+        checks: list[int] = []
+
+        def counting_check(model: nn.Module, device: torch.device) -> bool:
+            checks.append(1)
+            return True
+
+        monkeypatch.setattr(loop, "params_are_finite", counting_check)
+
+        def run(shutdown_after: int | None) -> tuple[list[int], int]:
+            checks.clear()
+            ckpt = FakeCheckpointManager()
+            session = make_session(
+                make_config(max_steps=4),
+                checkpointer=ckpt,
+                step_fn=_nan_on({1}),
+                shutdown_handler=FakeShutdownHandler(after_steps=shutdown_after),
+            )
+            run_training_loop(session)
+            return ckpt.saved_steps, len(checks)
+
+        assert run(None) == ([4], 0)
+        assert run(3) == ([3], 0)
+        assert run(2) == ([2], 1)
 
 
 def _stub_entry(monkeypatch, model: nn.Module) -> FakeCheckpointManager:
@@ -1445,6 +1888,32 @@ class TestBuildModel:
         assert stage.inited is True
         assert stage.emptied_to is not None
 
+    @pytest.mark.parametrize(
+        ("fp32_master_weights", "dtype"), [(False, torch.bfloat16), (True, torch.float32)]
+    )
+    def test_parameters_are_stored_in_the_master_dtype(
+        self, fp32_master_weights: bool, dtype: torch.dtype
+    ) -> None:
+        import kempnerforge.training.entry as entry
+
+        config = make_config(fp32_master_weights=fp32_master_weights)
+        model, _ = entry.build_model(config, _runtime(), lambda a, b: a)
+        assert {p.dtype for p in model.parameters()} == {dtype}
+
+    @pytest.mark.parametrize("dims", [("pp", "dp_shard"), ("pp", "tp")])
+    @pytest.mark.parametrize(
+        ("fp32_master_weights", "dtype"), [(False, torch.bfloat16), (True, torch.float32)]
+    )
+    def test_pp_stage_is_stored_in_the_master_dtype(
+        self, monkeypatch, dims: tuple[str, str], fp32_master_weights: bool, dtype: torch.dtype
+    ) -> None:
+        stage, calls = FakeStageModule(), {}
+        entry = _stub_pp(monkeypatch, stage, calls)
+        config = make_config(fp32_master_weights=fp32_master_weights)
+        config.distributed.pp = 2
+        entry.build_model(config, _pp_runtime(FakeMesh(dims)), "LOSS")
+        assert {p.dtype for p in stage.parameters()} == {dtype}
+
     def test_pp_without_a_mesh_raises_rather_than_asserting(self, monkeypatch):
         stage, calls = FakeStageModule(), {}
         entry = _stub_pp(monkeypatch, stage, calls)
@@ -1487,10 +1956,25 @@ def _vlm_config(**vlm_kw) -> JobConfig:
 
 
 class TestRestoreCheckpoint:
+    @pytest.mark.parametrize(("pp", "expected"), [(1, None), (2, 2), (4, 4)])
+    def test_resolution_gets_the_pipeline_degree(self, monkeypatch, pp, expected):
+        """The step_N scan needs the stage count to see a stage that never saved."""
+        import kempnerforge.training.entry as entry
+
+        seen: list = []
+        monkeypatch.setattr(
+            entry, "resolve_resume_path", lambda _d, num_stages=None: seen.append(num_stages)
+        )
+        config = make_config()
+        config.distributed.pp = pp
+        mgr = FakeResumeManager(step=0, tokens=0)
+        assert entry.restore_checkpoint(config, TinyTextModel(), None, mgr) == (0, 0)
+        assert seen == [expected]
+
     def test_no_checkpoint_and_no_load_path_starts_from_scratch(self, monkeypatch):
         import kempnerforge.training.entry as entry
 
-        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d: None)
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: None)
         mgr = FakeResumeManager()
         assert entry.restore_checkpoint(make_config(), TinyTextModel(), None, mgr) == (0, 0)
         assert mgr.load_kwargs == {}
@@ -1498,7 +1982,7 @@ class TestRestoreCheckpoint:
     def test_resume_returns_the_managers_step_and_tokens(self, monkeypatch, tmp_path):
         import kempnerforge.training.entry as entry
 
-        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d: tmp_path / "step_7")
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: tmp_path / "step_7")
         mgr = FakeResumeManager(step=7, tokens=999)
         assert entry.restore_checkpoint(make_config(), TinyTextModel(), "SCHED", mgr) == (7, 999)
         assert mgr.load_kwargs["scheduler"] == "SCHED"
@@ -1507,7 +1991,7 @@ class TestRestoreCheckpoint:
     def test_load_path_alone_triggers_a_resume(self, monkeypatch):
         import kempnerforge.training.entry as entry
 
-        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d: None)
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: None)
         config = make_config()
         config.checkpoint.load_path = "/somewhere/step_3"
         mgr = FakeResumeManager(step=3, tokens=30)
@@ -1517,7 +2001,7 @@ class TestRestoreCheckpoint:
     def test_metrics_run_ids_are_restored_onto_the_config(self, monkeypatch, tmp_path):
         import kempnerforge.training.entry as entry
 
-        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d: tmp_path / "s")
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: tmp_path / "s")
         config = make_config()
         mgr = FakeResumeManager(extra={"wandb_run_id": "W1", "mlflow_run_id": "M1"})
         entry.restore_checkpoint(config, TinyTextModel(), None, mgr)
@@ -1527,7 +2011,7 @@ class TestRestoreCheckpoint:
     def test_absent_run_ids_do_not_clobber_existing_ones(self, monkeypatch, tmp_path):
         import kempnerforge.training.entry as entry
 
-        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d: tmp_path / "s")
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: tmp_path / "s")
         config = make_config()
         config.metrics.wandb_run_id = "KEEP"
         entry.restore_checkpoint(config, TinyTextModel(), None, FakeResumeManager(extra={}))
@@ -1537,7 +2021,7 @@ class TestRestoreCheckpoint:
         import kempnerforge.training.entry as entry
         from kempnerforge.training.freeze import freeze_meta_at_step
 
-        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d: tmp_path / "s")
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: tmp_path / "s")
         config = _vlm_config()
         mgr = FakeResumeManager(saved_step=11)
         entry.restore_checkpoint(config, TinyTextModel(), None, mgr)
@@ -1548,7 +2032,7 @@ class TestRestoreCheckpoint:
         import kempnerforge.training.entry as entry
         from kempnerforge.config.vlm import FreezeSpec, FreezeStage
 
-        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d: tmp_path / "s")
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: tmp_path / "s")
         applied: list = []
         monkeypatch.setattr(
             entry, "apply_freeze_specs", lambda m, specs, pat: applied.append(list(specs))
@@ -1581,7 +2065,7 @@ class TestRestoreCheckpoint:
         import kempnerforge.training.entry as entry
 
         resume = tmp_path / "step_7" if resume_found else None
-        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d: resume)
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: resume)
         config = make_config()
         config.checkpoint.load_path = load_path
         config.checkpoint.exclude_from_loading = exclude
@@ -1595,7 +2079,7 @@ class TestRestoreCheckpoint:
         load the optimizer, or momentum silently resets mid-run."""
         import kempnerforge.training.entry as entry
 
-        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d: tmp_path / "step_7")
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: tmp_path / "step_7")
         config = make_config()
         config.checkpoint.load_path = "/somewhere/converted"
         config.checkpoint.exclude_from_loading = ["optimizer"]
@@ -1607,12 +2091,32 @@ class TestRestoreCheckpoint:
     def test_exclude_alone_does_not_trigger_a_load(self, monkeypatch):
         import kempnerforge.training.entry as entry
 
-        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d: None)
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: None)
         config = make_config()
         config.checkpoint.exclude_from_loading = ["optimizer"]
         mgr = FakeResumeManager()
         assert entry.restore_checkpoint(config, TinyTextModel(), None, mgr) == (0, 0)
         assert mgr.load_kwargs == {}
+
+    def test_rank_zero_resolves_with_the_pipeline_degree(self, monkeypatch, tmp_path):
+        """The distributed resolution also gets the stage count."""
+        import kempnerforge.training.entry as entry
+
+        seen: list = []
+        chosen = tmp_path / "step_7"
+
+        def resolve(_d, num_stages=None):
+            seen.append(num_stages)
+            return chosen
+
+        monkeypatch.setattr(entry, "resolve_resume_path", resolve)
+        monkeypatch.setattr(entry.dist, "is_initialized", lambda: True)
+        monkeypatch.setattr(entry.dist, "get_rank", lambda: 0)
+        monkeypatch.setattr(entry.dist, "broadcast_object_list", lambda lst, src=0: None)
+        config = make_config()
+        config.distributed.pp = 2
+        entry.restore_checkpoint(config, TinyTextModel(), None, FakeResumeManager())
+        assert seen == [2]
 
     @pytest.mark.parametrize("rank", [0, 1])
     def test_only_rank_zero_resolves_the_resume_path(self, monkeypatch, tmp_path, rank):
@@ -1628,7 +2132,9 @@ class TestRestoreCheckpoint:
 
         looked: list = []
         chosen = tmp_path / "step_7"
-        monkeypatch.setattr(entry, "resolve_resume_path", lambda d: looked.append(d) or chosen)
+        monkeypatch.setattr(
+            entry, "resolve_resume_path", lambda d, _n=None: looked.append(d) or chosen
+        )
         monkeypatch.setattr(entry.dist, "is_initialized", lambda: True)
         monkeypatch.setattr(entry.dist, "get_rank", lambda: rank)
         monkeypatch.setattr(
@@ -1648,7 +2154,7 @@ class TestRestoreCheckpoint:
         import kempnerforge.training.entry as entry
         from kempnerforge.training.freeze import freeze_meta_at_step
 
-        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d: None)
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: None)
         config = _vlm_config()
         config.checkpoint.load_path = "/somewhere/converted"
         config.checkpoint.exclude_from_loading = ["model"]
@@ -1664,7 +2170,7 @@ class TestRestoreCheckpoint:
         from kempnerforge.config.vision import VisionEncoderConfig
         from kempnerforge.config.vlm import MoTConfig
 
-        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d: tmp_path / "s")
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: tmp_path / "s")
         monkeypatch.setattr(torch, "load", lambda *a, **k: {"model": {"w": 1}})
         copied: list = []
         monkeypatch.setattr(
@@ -2443,6 +2949,42 @@ class TestFreezeStageFence:
         order: list = []
         run_training_loop(self._vlm_session(monkeypatch, start_step=99, order=order))
         assert order == []
+
+    def test_stage_due_on_the_last_finite_step_fires_on_it(self, monkeypatch):
+        """Step 2 is the last step, so the stage applies only if it runs after the step counts."""
+        order: list = []
+        session = self._vlm_session(monkeypatch, start_step=2, order=order)
+        session.config.train.max_steps = 2
+        run_training_loop(session)
+        assert order == ["flush", "freeze"]
+
+    def test_stage_reached_by_a_nan_skipped_step_fires_on_it(self, monkeypatch):
+        """Step 2 is reached by a NaN step and is the last one, so only that step can apply it."""
+        order: list = []
+        session = self._vlm_session(monkeypatch, start_step=2, order=order)
+        session.config.train.max_steps = 2
+        session.step_fn = _nan_on({1}, vlm_step)
+        run_training_loop(session)
+        assert order == ["flush", "freeze"]
+
+    def test_emergency_checkpoint_on_that_step_is_written_after_the_flip(self, monkeypatch):
+        """Its saved freeze metadata then describes the model it was written from."""
+        from kempnerforge.training.freeze import freeze_meta_at_step
+
+        order: list = []
+        session = self._vlm_session(monkeypatch, start_step=2, order=order)
+        session.step_fn = _nan_on({1}, vlm_step)
+        session.shutdown_handler = FakeShutdownHandler(after_steps=2)
+        saved: list = []
+
+        def save(step: int, **kwargs: Any) -> None:
+            order.append("save")
+            saved.append((step, kwargs["extra"]))
+
+        monkeypatch.setattr(session.checkpointer, "save", save)
+        run_training_loop(session)
+        assert order == ["flush", "freeze", "save"]
+        assert saved == [(2, {"vlm_freeze": freeze_meta_at_step(2, session.config.vlm)})]
 
 
 class TestBatchStreamGuard:
