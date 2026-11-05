@@ -31,6 +31,13 @@ def _register_from(module: str, source: str, reg: Registry) -> None:
     exec(compile(source, f"<{module}>", "exec"), {"__name__": module, "reg": reg})
 
 
+def _module(module: str, source: str, **names: object) -> dict[str, object]:
+    """Run ``source`` as the body of a module named ``module``; return its namespace."""
+    namespace: dict[str, object] = {"__name__": module, **names}
+    exec(compile(source, f"<{module}>", "exec"), namespace)
+    return namespace
+
+
 @pytest.fixture
 def write_plugin(tmp_path, monkeypatch):
     """Write importable plugin modules, or a package's ``__init__`` with ``package=True``;
@@ -98,6 +105,62 @@ class TestDuplicateRegistration:
         _register_from("kf_owner_second", "reg.register('mlp', 'dup', abs)\n", reg)
         assert reg.get("norm", "dup") is len
         assert reg.get("mlp", "dup") is abs
+
+
+class TestDefiningModule:
+    """A function or class defined outside the registering module is named with its module."""
+
+    def test_a_shared_helper_names_each_plugins_function(self):
+        reg = Registry()
+        helper = "def register_all(builders):\n    for name, fn in builders.items():\n"
+        helper += "        reg.register('loss', name, fn)\n"
+        register_all = _module("kf_helper", helper, reg=reg)["register_all"]
+        plugin = "def build():\n    pass\n\n\nregister_all({'dup': build})\n"
+        _module("kf_user_a", plugin, register_all=register_all)
+        with pytest.raises(
+            ValueError,
+            match=r"^loss/dup is already registered by kf_helper \(for kf_user_a\.build\); "
+            r"kf_helper \(for kf_user_b\.build\) tried to register it again$",
+        ):
+            _module("kf_user_b", plugin, register_all=register_all)
+
+    def test_an_init_subclass_hook_names_each_plugins_class(self):
+        reg = Registry()
+        hook = "class Base:\n    def __init_subclass__(cls, name, **kwargs):\n"
+        hook += "        super().__init_subclass__(**kwargs)\n"
+        hook += "        reg.register('loss', name, cls)\n"
+        base = _module("kf_hook_base", hook, reg=reg)["Base"]
+        _module("kf_hook_a", "class A(Base, name='dup'):\n    pass\n", Base=base)
+        with pytest.raises(
+            ValueError,
+            match=r"^loss/dup is already registered by kf_hook_base \(for kf_hook_a\.A\); "
+            r"kf_hook_base \(for kf_hook_b\.B\) tried to register it again$",
+        ):
+            _module("kf_hook_b", "class B(Base, name='dup'):\n    pass\n", Base=base)
+
+    def test_a_reexported_function_names_where_it_is_defined(self):
+        reg = Registry()
+        _register_from(
+            "kf_owner_reexport", "import json\n\nreg.register('mlp', 'dup', json.dumps)\n", reg
+        )
+        with pytest.raises(
+            ValueError,
+            match=r"^mlp/dup is already registered by kf_owner_reexport \(for json\.dumps\); "
+            r"kf_owner_other tried to register it again$",
+        ):
+            _register_from("kf_owner_other", "reg.register('mlp', 'dup', len)\n", reg)
+
+    def test_an_object_that_is_not_a_function_or_class_adds_no_module(self):
+        """A partial reports ``functools`` as its module, which says nothing about the plugin."""
+        reg = Registry()
+        source = "import functools\n\nreg.register('loss', 'dup', functools.partial(len))\n"
+        _register_from("kf_partial_a", source, reg)
+        with pytest.raises(
+            ValueError,
+            match="^loss/dup is already registered by kf_partial_a; "
+            "kf_partial_b tried to register it again$",
+        ):
+            _register_from("kf_partial_b", source, reg)
 
 
 class TestPluginCollisions:
