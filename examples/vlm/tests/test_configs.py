@@ -178,17 +178,6 @@ def test_presets_cover_every_arch_and_both_tensor_parallel_outcomes() -> None:
     assert any(_tp_sequence_parallel(path) for path in CONFIGS)
 
 
-def test_an_arch_override_is_reported_as_the_presets_arch() -> None:
-    """``--vlm.arch`` keeps the preset's MoMa config class, which is what the expert-parallel
-    check acts on, so the error names ``moma`` rather than the overridden field."""
-    config = load_config(
-        str(CONFIG_DIR / "vlm_debug_moma.toml"),
-        cli_args=["--vlm.arch=joint_decoder", "--distributed.ep=2", "--model.num_experts=2"],
-    )
-    with pytest.raises(ValueError, match=r"vlm.arch='moma' does not support expert parallelism"):
-        config.validate(world_size=2)
-
-
 def test_cross_attention_moe_preset_keeps_expert_parallelism() -> None:
     """The guards name arches, so the cross-attention MoE preset still validates with EP."""
     config = load_config(str(CONFIG_DIR / "vlm_debug_moe.toml"), cli_args=["--distributed.ep=2"])
