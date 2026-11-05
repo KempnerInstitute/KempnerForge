@@ -225,7 +225,7 @@ def _check_vlm_arch_override(current: VLMConfig, arch: Any) -> None:
     if target is not type(current):
         raise ValueError(
             f"vlm.arch={arch!r} cannot be applied as an override: the [vlm] section was "
-            f"built as {type(current).__name__} (arch {type(current).arch!r}), and an "
+            f"built as {type(current).__name__} (arch {type(current).declared_arch()!r}), and an "
             f'override keeps that class. Set arch = "{arch}" in the TOML\'s [vlm] '
             "section instead."
         )

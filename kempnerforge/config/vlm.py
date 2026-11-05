@@ -34,7 +34,7 @@ Each arch gets its own ``VLMConfig`` subclass, registered via
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import MISSING, dataclass, field, fields
 from typing import Any
 
 from kempnerforge.config.registry import registry
@@ -109,10 +109,11 @@ class VLMConfig:
         registered = tuple(registry.list_vlm_configs())
         if self.arch not in registered:
             raise ValueError(f"Unknown vlm.arch: {self.arch!r}. Registered: {sorted(registered)}.")
-        if self.arch != type(self).arch:
+        declared = type(self).declared_arch()
+        if self.arch != declared:
             raise ValueError(
                 f"vlm.arch={self.arch!r} does not match {type(self).__name__}.arch "
-                f"({type(self).arch!r}). Each arch has its own config class, so build it "
+                f"({declared!r}). Each arch has its own config class, so build it "
                 "with VLMConfig.for_arch(arch, ...); a registered subclass must default "
                 "arch to the name it is registered under."
             )
@@ -154,6 +155,27 @@ class VLMConfig:
         overrides it to ``False`` (see ``MoMaConfig``).
         """
         return True
+
+    @classmethod
+    def declared_arch(cls) -> str:
+        """The ``arch`` default this class declares, which its configs must carry.
+
+        Read from the dataclass field, not the class attribute: that is a slot
+        descriptor on a ``slots=True`` subclass, and the base's default when a
+        subclass sets ``arch`` with a ``default_factory``.
+
+        Raises:
+            TypeError: the class declares ``arch`` without a default.
+        """
+        arch = next(f for f in fields(cls) if f.name == "arch")
+        if arch.default_factory is not MISSING:
+            return arch.default_factory()
+        if arch.default is MISSING:
+            raise TypeError(
+                f"{cls.__name__} declares arch without a default; default it to the name "
+                "the class is registered under"
+            )
+        return arch.default
 
     @classmethod
     def for_arch(cls, arch: str, **kwargs: Any) -> VLMConfig:
