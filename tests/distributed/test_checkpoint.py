@@ -5,6 +5,7 @@ Run with: torchrun --nproc_per_node=4 -m pytest tests/distributed/test_checkpoin
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
 import time
@@ -617,3 +618,92 @@ class TestAsyncSaveBarrierNoDeadlock:
             assert latest.exists()
             assert latest.resolve().name == "step_40"
         dist.barrier()
+
+
+class TestWeightDecayScopeAcrossStages:
+    """The scope check runs on every rank or on none, whichever stages hold optimizer state.
+
+    Under PP each stage saves into its own ``pp{k}`` directory through its own process group,
+    so one stage's part of a checkpoint can hold optimizer state while another's holds none.
+    """
+
+    DEFAULT, ALL = "exclude_norms_and_biases", "all"
+
+    @staticmethod
+    def _stage_run(directory, scope, seed, stepped=()):
+        """Build this rank's stage (rank % 2) of a two-stage run; ``stepped`` stages take a step."""
+        from kempnerforge.config.schema import OptimizerConfig
+
+        world = dist.get_world_size()
+        group, _ = dist.new_subgroups_by_enumeration(
+            [list(range(0, world, 2)), list(range(1, world, 2))]
+        )
+        stage = dist.get_rank() % 2
+        torch.manual_seed(seed + stage)
+        model = Transformer(SMALL_CONFIG).cuda()
+        opt = build_optimizer(
+            model, OptimizerConfig(lr=1e-3, fused=False, weight_decay_scope=scope)
+        )
+        if stage in stepped:
+            gen = torch.Generator(device="cuda").manual_seed(stage)
+            model(torch.randint(0, 512, (2, 32), device="cuda", generator=gen)).sum().backward()
+            opt.step()
+            opt.zero_grad()
+        manager = CheckpointManager(
+            CheckpointConfig(dir=directory),
+            model,
+            opt,
+            process_group=group,
+            pp_rank=stage,
+            weight_decay_scope=scope,
+        )
+        return model, opt, manager
+
+    @pytest.mark.parametrize("stepped", [(0,), ()], ids=["one-stage-holds", "none-holds"])
+    def test_every_rank_takes_the_same_path(self, distributed_env, shared_tmp_dir, stepped):
+        """A stage holding no optimizer state still refuses when another stage holds some."""
+        saved, _, manager = self._stage_run(shared_tmp_dir, self.DEFAULT, 0, stepped)
+        manager.save(step=1)
+        saved_params = [p.detach().clone() for p in saved.parameters()]
+
+        model, _, other_scope = self._stage_run(shared_tmp_dir, self.ALL, 100)
+        before = [p.detach().clone() for p in model.parameters()]
+        outcome = (
+            pytest.raises(ValueError, match="but this run uses 'all'")
+            if stepped
+            else contextlib.nullcontext()
+        )
+        with outcome:
+            other_scope.load()
+        for e, p in zip(before if stepped else saved_params, model.parameters(), strict=True):
+            assert torch.equal(e, p)
+        assert not any(o.state for o in other_scope.checkpointed_optimizers)
+
+        _, opt, same_scope = self._stage_run(shared_tmp_dir, self.DEFAULT, 100)
+        assert same_scope.load()[0] == 1
+        assert bool(opt.state) == (dist.get_rank() % 2 in stepped)
+
+    def test_a_rank_that_cannot_read_its_index_fails_every_rank(
+        self, distributed_env, shared_tmp_dir
+    ):
+        """The rank that failed raises its error and every other rank names it; none waits."""
+        _, _, manager = self._stage_run(shared_tmp_dir, self.DEFAULT, 0, stepped=(0, 1))
+        manager.save(step=1)
+        _, _, resumed = self._stage_run(shared_tmp_dir, self.DEFAULT, 100)
+
+        last = dist.get_world_size() - 1
+        read = mgr_mod.dcp.FileSystemReader.read_metadata
+        failing = dist.get_rank() == last
+
+        def read_metadata(reader):
+            if failing:
+                raise OSError("index unreadable")
+            return read(reader)
+
+        expected = OSError if failing else RuntimeError
+        reason = "index unreadable" if failing else rf"on ranks \[{last}\]"
+        with (
+            patch.object(mgr_mod.dcp.FileSystemReader, "read_metadata", read_metadata),
+            pytest.raises(expected, match=reason),
+        ):
+            resumed.load()

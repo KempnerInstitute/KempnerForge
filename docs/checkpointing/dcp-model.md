@@ -256,7 +256,8 @@ and an absent state cannot be told apart from one that went missing, so
 a never-stepped parameter in one of those still fails the load. Start
 from it with `[checkpoint].load_path` and
 `exclude_from_loading = ["optimizer"]`, which restores the weights and
-begins with a fresh optimizer.
+begins with a fresh optimizer (add `"train_state"` to also start the step,
+schedule and data order fresh).
 
 The template also holds every param-group key the optimizer has now,
 and DCP requires each one. An optimizer whose param groups gained a key
