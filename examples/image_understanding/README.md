@@ -4,8 +4,7 @@ The image-understanding recipe on the core `Transformer`: a **Joint-Decoder**
 VLM with a **SigLIP2** image encoder (`google/siglip2-so400m-patch16-512`), an
 **avgpool** connector and a **Qwen3-0.6B** backbone, trained in two stages
 (captioning on a frozen backbone, then an instruction mixture with everything
-training), as specified by #262 and #428. Everything here is entry points,
-readers and their tests; `kempnerforge/` never imports it, so this directory
+training). Everything here is entry points, readers and their tests; `kempnerforge/` never imports it, so this directory
 can be deleted without touching the core.
 
 [`examples/vlm/`](../vlm/) stays the general VLM example: the four arches,
@@ -38,9 +37,9 @@ uv run torchrun --nproc_per_node=4 examples/image_understanding/train.py \
 ```
 
 The recipe's stage presets are not here yet. They need the roadmap below first
-(the typed stage contract of #262 fixes their fields, and the readers, packing,
-tiling and per-module learning rates fix their values), so they arrive with
-those changes rather than as placeholders that would be rewritten by each one.
+(the typed stage contract fixes their fields, and the readers, packing, tiling
+and per-module learning rates fix their values), so they arrive with those
+changes rather than as placeholders that would be rewritten by each one.
 Until then, write a config the way the [VLM example](../vlm/README.md) does,
 with `vlm.arch = "joint_decoder"`, `vision_encoder.type = "siglip2"` and
 `adapter.type = "avgpool"`. The geometry is the recipe's: a 512 px view is
@@ -86,21 +85,21 @@ step and schedule.
 
 ## Roadmap
 
-What the recipe still needs, and where it is tracked. Each lands as its own
-change in this directory (or in core where the issue says so).
+What the recipe still needs. Each lands as its own change in this directory,
+or in core where it belongs:
 
-| Feature | Tracked in |
-| --- | --- |
-| Training sources (COCO, VQAv2, TextVQA, DocVQA, ChartQA, PixMo, FineVision, DataComp), chat-template rendering with the loss on the assistant turns only, the mixture loader | [#428](https://github.com/KempnerInstitute/KempnerForge/issues/428) |
-| Typed stage contract and pinned source manifest, which fix the stage presets | [#262](https://github.com/KempnerInstitute/KempnerForge/issues/262) |
-| Packing image-text documents into one sequence | [#432](https://github.com/KempnerInstitute/KempnerForge/issues/432) |
-| Text-only documents in image-text batches | [#433](https://github.com/KempnerInstitute/KempnerForge/issues/433) |
-| Documents with several images | [#434](https://github.com/KempnerInstitute/KempnerForge/issues/434) |
-| Tiling into a global view and a 3 × 3 grid of crops (stage 2) | [#435](https://github.com/KempnerInstitute/KempnerForge/issues/435) |
-| Per-module learning rates and schedules | [#439](https://github.com/KempnerInstitute/KempnerForge/issues/439) |
-| Vision-encoder precision separate from the backbone's | [#438](https://github.com/KempnerInstitute/KempnerForge/issues/438) |
-| Evaluation parity: chat-template prompts, image attention, the recipe's scorers | [#443](https://github.com/KempnerInstitute/KempnerForge/issues/443) |
-| Run-comparison metrics: documents seen, token counts, MFU with the encoder | [#444](https://github.com/KempnerInstitute/KempnerForge/issues/444) |
+- Training sources (COCO, VQAv2, TextVQA, DocVQA, ChartQA, PixMo, FineVision,
+  DataComp), chat-template rendering with the loss on the assistant turns only,
+  and the mixture loader
+- Typed stage contract and pinned source manifest, which fix the stage presets
+- Packing image-text documents into one sequence
+- Text-only documents in image-text batches
+- Documents with several images
+- Tiling into a global view and a 3 × 3 grid of crops (stage 2)
+- Per-module learning rates and schedules
+- Vision-encoder precision separate from the backbone's
+- Evaluation parity: chat-template prompts, image attention, the recipe's scorers
+- Run-comparison metrics: documents seen, token counts, MFU with the encoder
 
 ## Tests
 
