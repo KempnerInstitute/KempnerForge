@@ -184,6 +184,18 @@ through the row without restarting per document, and the views of an image
 attend causally, until #282 and #283 land. A `[video]` run and the other arches
 do not pack.
 
+## Mix in text-only documents
+
+Image-text mixes often carry documents without an image, such as FineVision's
+`text_*` subsets. With `data.hf_allow_text_only = true`, a row whose image
+column is `None` or an empty list is a text-only document. Without packing it
+takes a blank image and a `frame_mask` entry of `False`, so its image tokens
+are hidden from attention; with packing it is just its text, and a micro-batch
+of nothing but text carries no images. Either way the vision encoder and
+adapter run on every rank, on a blank image when there is nothing else, because
+their FSDP2 collectives need every rank to take part. Without the flag such a
+row raises.
+
 ## Start from a pretrained backbone
 
 `scripts/convert_hf_backbone.py` writes a complete VLM checkpoint for a config:

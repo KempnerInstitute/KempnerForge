@@ -576,6 +576,27 @@ class TestVLMCollator:
             "labels": labels,
         }
 
+    def test_a_text_only_sample_gets_a_blank_image_and_a_frame_mask(self):
+        collator = VLMCollator(pad_id=0, max_text_len=20)
+        text_only = self._sample(3)
+        text_only["pixel_values"] = torch.zeros(0, 3, 32, 32)
+        batch = collator([self._sample(5), text_only])
+        assert batch["pixel_values"].shape == (2, 3, 32, 32)
+        assert torch.equal(batch["pixel_values"][1], torch.zeros(3, 32, 32))
+        assert batch["frame_mask"].tolist() == [[True], [False]]
+        assert batch["input_ids"][1, :3].tolist() == [1, 2, 3]
+
+    def test_an_all_image_batch_carries_no_frame_mask(self):
+        collator = VLMCollator(pad_id=0, max_text_len=20)
+        assert "frame_mask" not in collator([self._sample(5), self._sample(6)])
+
+    def test_several_images_per_sample_are_rejected(self):
+        collator = VLMCollator(pad_id=0, max_text_len=20)
+        sample = self._sample(3)
+        sample["pixel_values"] = torch.randn(2, 3, 32, 32)
+        with pytest.raises(ValueError, match="one image per document"):
+            collator([sample])
+
     def test_fixed_length_not_batch_max(self):
         collator = VLMCollator(pad_id=0, max_text_len=20)
         batch = collator([self._sample(5), self._sample(10), self._sample(7)])
@@ -647,6 +668,7 @@ class TestHuggingFaceVLMDataset:
                 self._image_mean = DEFAULT_IMAGE_MEAN
                 self._image_std = DEFAULT_IMAGE_STD
                 self._max_text_len = max_text_len
+                self._allow_text_only = False
                 self._tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
 
         ds = load_from_disk(tiny_hf_dataset)
@@ -773,6 +795,7 @@ class TestHuggingFaceVLMDataset:
                 self._image_mean = DEFAULT_IMAGE_MEAN
                 self._image_std = DEFAULT_IMAGE_STD
                 self._max_text_len = max_text_len
+                self._allow_text_only = False
                 self._tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
 
         mixed = Dataset.from_dict(
@@ -825,6 +848,7 @@ class TestHuggingFaceVLMDataset:
                 self._image_mean = DEFAULT_IMAGE_MEAN
                 self._image_std = DEFAULT_IMAGE_STD
                 self._max_text_len = max_text_len
+                self._allow_text_only = False
                 self._tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
 
         ds = load_from_disk(tiny_hf_dataset)
@@ -843,6 +867,40 @@ class TestHuggingFaceVLMDataset:
         assert batch["input_ids"].shape == (2, 12)
         assert batch["labels"].shape == (2, 12)
         assert batch["pixel_values"].shape == (2, 3, 16, 16)
+
+
+class TestTextOnlyRows:
+    class _Wrapper(HuggingFaceVLMDataset):
+        def __init__(self, rows, allow_text_only):
+            self._ds = rows
+            self._image_field = "image"
+            self._text_field = "caption"
+            self._prompt_field = None
+            self._image_size = 16
+            self._image_mean = DEFAULT_IMAGE_MEAN
+            self._image_std = DEFAULT_IMAGE_STD
+            self._max_text_len = 8
+            self._allow_text_only = allow_text_only
+            from transformers import AutoTokenizer
+
+            self._tokenizer = AutoTokenizer.from_pretrained("gpt2")
+
+    @pytest.mark.parametrize("missing", [None, []])
+    def test_a_row_without_an_image_is_text_only_when_allowed(self, missing):
+        ds = self._Wrapper([{"image": missing, "caption": "a b c"}], allow_text_only=True)
+        item = ds[0]
+        assert item["pixel_values"].shape == (0, 3, 16, 16)
+        assert item["input_ids"].shape == (8,)
+        assert 0 < int(item["text_len"]) <= 8
+
+    def test_a_row_with_an_image_is_unchanged(self):
+        ds = self._Wrapper([{"image": _make_image(8), "caption": "a b"}], allow_text_only=True)
+        assert ds[0]["pixel_values"].shape == (3, 16, 16)
+
+    def test_a_row_without_an_image_raises_by_default(self):
+        ds = self._Wrapper([{"image": None, "caption": "a b"}], allow_text_only=False)
+        with pytest.raises(ValueError, match="hf_allow_text_only"):
+            ds[0]
 
 
 class TestFramesToClipTensor:
@@ -965,6 +1023,26 @@ class TestPackVLMSamples:
             pack_vlm_samples([], seq_len=8, tokens_per_image=2, pad_id=0)
         with pytest.raises(ValueError, match="must be positive"):
             pack_vlm_samples([_doc(2, 1)], seq_len=8, tokens_per_image=0, pad_id=0)
+
+    def test_a_text_only_document_takes_no_image_slots(self):
+        batch = pack_vlm_samples(
+            [_doc(3, 10, views=0), _doc(4, 20)], seq_len=12, tokens_per_image=2, pad_id=0
+        )
+        assert batch["input_ids"][0].tolist() == [10, 11, 12, 0, 0, 20, 21, 22, 23, 0, 0, 0]
+        assert batch["doc_ids"][0].tolist() == [0, 0, 0, 1, 1, 1, 1, 1, 1, 2, 2, 2]
+        assert batch["image_rows"].tolist() == [0]
+        assert batch["image_starts"].tolist() == [3]
+        assert batch["pixel_values"].shape == (1, 3, 4, 4)
+
+    def test_a_batch_of_text_only_documents_carries_no_images(self):
+        batch = pack_vlm_samples(
+            [_doc(3, 10, views=0), _doc(4, 20, views=0)], seq_len=8, tokens_per_image=2, pad_id=0
+        )
+        assert batch["pixel_values"].shape == (0, 3, 4, 4)
+        assert batch["image_rows"].shape == (0,)
+        assert batch["image_starts"].shape == (0,)
+        assert batch["image_rows"].dtype == torch.long
+        assert batch["input_ids"][0].tolist() == [10, 11, 12, 20, 21, 22, 23, 0]
 
     def test_collator_packs_the_batch(self):
         collator = PackedVLMCollator(pad_id=7, seq_len=12, tokens_per_image=2)
