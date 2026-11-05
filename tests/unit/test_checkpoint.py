@@ -934,6 +934,27 @@ class _HeldLock:
         self._lock.release()
 
 
+@pytest.fixture
+def pruned_dirs(monkeypatch) -> list[Path]:
+    """The directories ``_cleanup`` passes to ``shutil.rmtree``, each removed best effort.
+
+    On NFS, removing a directory a moment after writing into it can fail with
+    ``ENOTEMPTY`` (an ``.nfsXXXX`` entry keeps it non-empty), so a test asserts on
+    this list rather than on what the filesystem still holds.
+    """
+    from kempnerforge.checkpoint import manager as mgr_mod
+
+    rmtree = mgr_mod.shutil.rmtree
+    removed: list[Path] = []
+
+    def record(path, *args, **kwargs):
+        removed.append(Path(path))
+        rmtree(path, ignore_errors=True)
+
+    monkeypatch.setattr(mgr_mod.shutil, "rmtree", record)
+    return removed
+
+
 class TestSaveCheckpointRegistration:
     """A registrar adds fields to a save's ``tracking`` records, and registers it on commit."""
 
