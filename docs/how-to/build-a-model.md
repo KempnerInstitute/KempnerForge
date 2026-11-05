@@ -167,10 +167,12 @@ def _build_my_mlp(dim: int, hidden_dim: int) -> MyCustomMLP:
 registry.register("mlp", "my_mlp", _build_my_mlp)
 ```
 
-Import it before training starts (in `scripts/train.py` or a plugin
-module), then:
+List the module in the config's `plugins` key, so `load_config` imports
+it before it reads `[model]`, then:
 
 ```toml
+plugins = ["my_project.mlp_variants"]
+
 [model]
 activation = "my_mlp"   # matches the registry key
 ```
@@ -180,10 +182,11 @@ other string is looked up directly in the `"mlp"` category, so your
 key just works.
 
 ```{note}
-The registry is a global singleton; `registry.get("mlp", "my_mlp")`
-raises `ValueError` if the module containing the `register()` call
-wasn't imported. Import it at the top of `scripts/train.py` or in your
-package's `__init__.py`.
+The registry is a global singleton. If the module containing the
+`register()` call wasn't imported before `load_config`, the loader
+rejects `activation = "my_mlp"` with a `ValueError` that lists the
+registered `mlp` names. List the module in `plugins`, or import it at
+the top of your entry point before it calls `load_config`.
 ```
 
 ## What's *not* registered
