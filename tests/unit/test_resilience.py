@@ -881,6 +881,21 @@ class TestResumePathResolution:
         assert result is not None
         assert result.name == "step_10"
 
+    def test_the_stage_fallback_skips_a_save_without_its_train_state(self, tmp_path):
+        """A step short of a stage that also lost ``train_state.pt`` is not resumed either.
+
+        With no step holding every stage, the fallback still applies the train state check, so
+        it starts over rather than pick a save the load refuses, and takes an older step that
+        lacks only a stage when there is one.
+        """
+        _saved_step_dir(tmp_path, 20, optimizer=True, train_state=False, pp_stages=1)
+        assert resolve_resume_path(str(tmp_path), num_stages=2) is None
+
+        _saved_step_dir(tmp_path, 10, optimizer=True, train_state=True, pp_stages=1)
+        result = resolve_resume_path(str(tmp_path), num_stages=2)
+        assert result is not None
+        assert result.name == "step_10"
+
     def test_none_when_every_save_lacks_its_train_state(self, tmp_path, caplog, monkeypatch):
         """The first save of a run cut short: start from step 0, and say so at ERROR."""
         import logging
