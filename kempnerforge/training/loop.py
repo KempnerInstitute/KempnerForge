@@ -462,10 +462,12 @@ def _advance_lr_schedule(session: TrainingSession) -> None:
 def _apply_freeze_stages(session: TrainingSession, step: int) -> None:
     """FreezeStage hook: apply any stage whose start_step matches this boundary.
 
-    AdamW + set_to_none=True default skips frozen params entirely (no SGD
-    step, no weight decay), so mutating requires_grad mid-training is a
-    clean no-op for newly-frozen params and re-enables gradient flow for
-    newly-unfrozen ones.
+    The optimizer holds every parameter that some step of the run trains,
+    since it is built under ``trainable_for_the_run``, and every registered
+    optimizer skips a parameter whose gradient is None (no update, no weight
+    decay). So mutating requires_grad mid-training stops the updates of
+    newly-frozen params and starts those of newly-unfrozen ones, including a
+    module the build froze.
 
     Async-save fence: drain any in-flight save FIRST so that its
     metadata.json — which records the pre-transition spec — lands before we

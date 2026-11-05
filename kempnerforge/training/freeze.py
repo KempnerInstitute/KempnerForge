@@ -23,12 +23,18 @@ metadata for the compare), and at the training-loop hook site
 
 ``freeze_meta_at_step`` composes the last two into the single expression
 both the save and the resume path use.
+
+``trainable_during_run`` names every parameter that trains at some step of
+a run, and ``trainable_for_the_run`` makes those parameters trainable while
+the optimizer is built and a checkpoint's optimizer state is loaded, so a
+module that a stage unfreezes is in the optimizer from the start.
 """
 
 from __future__ import annotations
 
+import contextlib
 import fnmatch
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 
 import torch.nn as nn
 
@@ -151,3 +157,66 @@ def freeze_meta_at_step(step: int, config: VLMConfig) -> list[dict[str, object]]
     return canonical_freeze_meta(
         effective_freeze(step, config.freeze, config.freeze_schedule, valid_modules)
     )
+
+
+def _apply_to_names(
+    requires_grad: dict[str, bool],
+    specs: Iterable[FreezeSpec],
+    pattern_map: Mapping[str, list[str]],
+) -> None:
+    """Set ``requires_grad`` by parameter name, as ``apply_freeze_specs`` sets it on a model."""
+    for spec in specs:
+        patterns = pattern_map.get(spec.module, [spec.module])
+        for name in requires_grad:
+            if any(fnmatch.fnmatch(name, pat) for pat in patterns):
+                requires_grad[name] = not spec.frozen
+
+
+def trainable_during_run(model: nn.Module, config: VLMConfig) -> set[str]:
+    """Return the names of the parameters of ``model`` that train at some step of a run.
+
+    Works on the names alone and leaves ``model`` as it is. The build applies
+    ``config.freeze`` to each parameter's current ``requires_grad``. From there each
+    ``FreezeStage`` applies its specs at its ``start_step``, and a resume applies
+    ``effective_freeze`` at the resumed step. A parameter that requires grad after any
+    of these is in the result.
+    """
+    patterns = config.module_patterns
+    built = {name: param.requires_grad for name, param in model.named_parameters()}
+    _apply_to_names(built, config.freeze, patterns)
+    trainable = {name for name, on in built.items() if on}
+    running = dict(built)
+    for stage in sorted(config.freeze_schedule, key=lambda s: s.start_step):
+        _apply_to_names(running, stage.specs, patterns)
+        resumed = dict(built)
+        _apply_to_names(
+            resumed,
+            effective_freeze(stage.start_step, config.freeze, config.freeze_schedule),
+            patterns,
+        )
+        trainable.update(name for name, on in running.items() if on)
+        trainable.update(name for name, on in resumed.items() if on)
+    return trainable
+
+
+@contextlib.contextmanager
+def trainable_for_the_run(model: nn.Module, config: VLMConfig) -> Iterator[None]:
+    """Make every parameter that trains at some step of the run require grad, then restore.
+
+    Building the optimizer inside this context puts a parameter that a ``FreezeStage``
+    unfreezes later in its param groups from the start, and loading a checkpoint inside it
+    gives that parameter a place in the optimizer's load template. Every registered
+    optimizer skips a parameter whose gradient is None, so it stays untouched until a
+    stage unfreezes it. A model compiled with ``torch.compile`` is read through the module
+    it wraps.
+    """
+    inner = getattr(model, "_orig_mod", model)
+    names = trainable_during_run(inner, config)
+    flipped = [p for name, p in inner.named_parameters() if name in names and not p.requires_grad]
+    for param in flipped:
+        param.requires_grad_(True)
+    try:
+        yield
+    finally:
+        for param in flipped:
+            param.requires_grad_(False)

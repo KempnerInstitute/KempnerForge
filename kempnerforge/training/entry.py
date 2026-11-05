@@ -46,6 +46,7 @@ from kempnerforge.training.freeze import (
     apply_freeze_specs,
     effective_freeze,
     freeze_meta_at_step,
+    trainable_for_the_run,
 )
 from kempnerforge.training.hooks import HookRunner
 from kempnerforge.training.loop import (
@@ -194,6 +195,15 @@ def build_checkpoint_manager(
     )
 
 
+def _trainable_for_the_run(
+    model: torch.nn.Module, config: JobConfig
+) -> contextlib.AbstractContextManager[None]:
+    """``trainable_for_the_run`` for a VLM with a freeze schedule; a no-op context otherwise."""
+    if config.vlm is None or not config.vlm.freeze_schedule:
+        return contextlib.nullcontext()
+    return trainable_for_the_run(model, config.vlm)
+
+
 def restore_checkpoint(
     config: JobConfig,
     model: torch.nn.Module,
@@ -290,7 +300,8 @@ def run_training(
                 f"forward passes run under torch.autocast({amp_dtype})"
             )
 
-        optimizer = build_optimizer(model, config.optimizer)
+        with _trainable_for_the_run(model, config):
+            optimizer = build_optimizer(model, config.optimizer)
         scheduler = build_scheduler(optimizer, config.scheduler, max_steps=config.train.max_steps)
 
         ckpt_mgr = build_checkpoint_manager(config, runtime, model, optimizer, pipeline)

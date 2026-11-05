@@ -66,7 +66,9 @@ class FreezeStage:
     Used for staged training recipes where the trainable subset
     changes across training phases. The list of stages on
     ``VLMConfig`` is expected to be in strictly monotonic
-    ``start_step`` order.
+    ``start_step`` order. A stage can unfreeze a module that
+    ``VLMConfig.freeze`` froze at build: the optimizer holds the module
+    from the start.
     """
 
     start_step: int
@@ -94,7 +96,8 @@ class VLMConfig:
     - ``max_text_len`` fixed text padding length used by ``VLMCollator``.
       Enforces rank-consistent batches under FSDP2.
     - ``freeze`` static freeze specs applied once at build time.
-    - ``freeze_schedule`` step-boundary freeze transitions.
+    - ``freeze_schedule`` step-boundary freeze transitions; a stage may
+      unfreeze a module the build froze (see ``FreezeStage``).
     - ``module_patterns`` map of module alias (``"transformer"``,
       ``"vision_encoder"``, ``"adapter"``, plus arch-specific additions)
       to fnmatch pattern list.

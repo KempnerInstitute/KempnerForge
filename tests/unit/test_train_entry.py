@@ -1250,6 +1250,31 @@ def _stub_entry(monkeypatch, model: nn.Module) -> FakeCheckpointManager:
 
 
 class TestRunTraining:
+    def test_the_optimizer_is_built_with_the_modules_a_stage_unfreezes(self, monkeypatch):
+        """The build froze the head and a stage unfreezes it, so run_training builds the
+        optimizer while the head requires grad, then leaves it frozen for the first step."""
+        import kempnerforge.training.entry as entry
+        from kempnerforge.training.freeze import apply_freeze_specs
+        from kempnerforge.training.loop import StepResult
+
+        config = _head_config(max_steps=1)
+        assert config.vlm is not None
+        model = TinyVlmModel()
+        apply_freeze_specs(model, config.vlm.freeze, config.vlm.module_patterns)
+        _stub_entry(monkeypatch, model)
+        seen: list = []
+
+        def build_optimizer(m, _config):
+            seen.append([p.requires_grad for p in m.proj.parameters()])
+            return torch.optim.SGD([p for p in m.parameters() if p.requires_grad], lr=0.05)
+
+        monkeypatch.setattr(entry, "build_optimizer", build_optimizer)
+        entry.run_training(
+            config, step_fn=lambda _s, _i: StepResult(loss=1.0, grad_norm=0.5, text_tokens=8)
+        )
+        assert seen == [[True, True]]
+        assert not any(p.requires_grad for p in model.proj.parameters())
+
     def test_defaults_to_the_registry_selected_step_body(self, monkeypatch):
         from kempnerforge.training.entry import run_training
 
@@ -2907,6 +2932,74 @@ class TestLoopPeriodicWork:
         run_training_loop(session)
         assert data.mixture_sampler.calls  # type: ignore[union-attr]
         assert phases.lr_scale == 0.5
+
+
+def _head_config(max_steps: int) -> JobConfig:
+    """A VLM config whose build freezes ``TinyVlmModel.proj``; a stage at step 2 unfreezes it."""
+    from kempnerforge.config.vlm import DEFAULT_MODULE_PATTERNS, FreezeSpec, FreezeStage
+
+    config = _vlm_config(
+        freeze=[FreezeSpec("head")],
+        freeze_schedule=(FreezeStage(start_step=2, specs=(FreezeSpec("head", False),)),),
+        module_patterns={**DEFAULT_MODULE_PATTERNS, "head": ["proj.*"]},
+    )
+    config.train.max_steps = max_steps
+    config.train.batch_size, config.train.seq_len = 2, 4
+    config.checkpoint.interval = 1000
+    config.optimizer.fused = False
+    return config
+
+
+def _built_with_a_frozen_head(config: JobConfig) -> tuple[TinyVlmModel, torch.optim.Optimizer]:
+    """Build the model, freeze it as the build does and build the optimizer as run_training does."""
+    import kempnerforge.training.entry as entry
+    from kempnerforge.training.freeze import apply_freeze_specs
+    from kempnerforge.training.optimizer import build_optimizer
+
+    assert config.vlm is not None
+    torch.manual_seed(0)
+    model = TinyVlmModel()
+    apply_freeze_specs(model, config.vlm.freeze, config.vlm.module_patterns)
+    with entry._trainable_for_the_run(model, config):
+        optimizer = build_optimizer(model, config.optimizer)
+    return model, optimizer
+
+
+_VLM_BATCH = {
+    "pixel_values": torch.zeros(2, 3, 4, 4),
+    "input_ids": torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]]),
+    "labels": torch.tensor([[2, 3, 4, 5], [6, 7, 8, 9]]),
+}
+
+
+class TestUnfreezeAtAStage:
+    """A module the build froze trains once a FreezeStage unfreezes it."""
+
+    def _run(self, max_steps: int) -> tuple[TinyVlmModel, list]:
+        config = _head_config(max_steps)
+        model, optimizer = _built_with_a_frozen_head(config)
+        initial = [p.detach().clone() for p in model.proj.parameters()]
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _s: 1.0)
+        session = make_session(
+            config,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            data=DataPipeline(dataloader=[_VLM_BATCH]),
+        )
+        session.step_fn = vlm_step
+        run_training_loop(session)
+        return model, initial
+
+    def test_the_module_is_untouched_until_the_stage(self):
+        model, initial = self._run(max_steps=2)
+        assert all(p.requires_grad for p in model.proj.parameters())
+        assert all(torch.equal(p, i) for p, i in zip(model.proj.parameters(), initial, strict=True))
+
+    def test_the_module_trains_after_the_stage(self):
+        model, initial = self._run(max_steps=3)
+        pairs = zip(model.proj.parameters(), initial, strict=True)
+        assert all(not torch.equal(p, i) for p, i in pairs)
 
 
 class TestFreezeStageFence:
