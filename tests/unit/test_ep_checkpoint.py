@@ -24,6 +24,7 @@ import torch.nn.functional as F
 from safetensors.torch import load_file
 from torch.distributed.checkpoint import FileSystemReader
 from torch.distributed.checkpoint.format_utils import dcp_to_torch_save
+from torch.distributed.checkpoint.state_dict import get_model_state_dict
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor import DTensor
@@ -438,3 +439,18 @@ class TestExportFromAnEPCheckpoint:
             else config.num_experts * 3
         )
         assert _mismatches({k: exported[f"model.{k}"] for k in experts}, experts) == []
+
+
+class TestWithoutEP:
+    @pytest.mark.parametrize("overrides", [{}, PACKED], ids=["unpacked", "packed"])
+    def test_checkpoint_keeps_the_model_names_and_loads(self, overrides, tmp_path):
+        """With ``ep = 1`` the save writes the model's own names, as before, and loads back."""
+        config = _config(overrides)
+        model, optimizer = _build(None, config, seed=0)
+        _train(model, optimizer, None)
+        reference = _gathered(model, optimizer, None)
+        CheckpointManager(CheckpointConfig(dir=str(tmp_path / "ckpt")), model, optimizer).save(STEP)
+        index = FileSystemReader(str(_step_dir(tmp_path))).read_metadata().state_dict_metadata
+        names = {f"model.{name}" for name in get_model_state_dict(model)}
+        assert {key for key in index if key.startswith("model.")} == names
+        assert _mismatches(_load_one_process(config, _step_dir(tmp_path)), reference) == []
