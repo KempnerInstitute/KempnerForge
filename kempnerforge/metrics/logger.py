@@ -41,6 +41,8 @@ class _RankFormatter(logging.Formatter):
     """Formatter that starts each line with the local time, rank and level, in optional color.
 
     The time is ``YYYY-MM-DD HH:MM:SS.mmm``; with color, it is dimmed along with the rank.
+    A record's traceback and stack, when it carries them, follow on the next lines, as the
+    standard formatter prints them.
     """
 
     def __init__(self, use_color: bool = True) -> None:
@@ -66,7 +68,14 @@ class _RankFormatter(logging.Formatter):
         else:
             prefix = f"{stamp} [rank {rank}] {level:<8}"
 
-        return f"{prefix} {record.getMessage()}"
+        text = f"{prefix} {record.getMessage()}"
+        if record.exc_info and not record.exc_text:
+            record.exc_text = self.formatException(record.exc_info)
+        if record.exc_text:
+            text = f"{text}\n{record.exc_text}"
+        if record.stack_info:
+            text = f"{text}\n{self.formatStack(record.stack_info)}"
+        return text
 
 
 class _RankFilter(logging.Filter):
