@@ -20,10 +20,18 @@ dcp_state = {
     "optimizer":               optim_state,
     "optimizer_never_stepped": _never_stepped_record(optim_state),
 }
+dcp_state, _ = self._present_experts(dcp_state)
 self._async_ckpt.save(
     dcp_state, checkpoint_id=str(dcp_dir), process_group=self._process_group
 )
 ```
+
+`_present_experts` returns the state as it is unless a layer splits its
+experts with expert parallelism. Then it places each rank's experts,
+and their optimizer state, among all of the layer's experts, so the
+checkpoint holds every expert; `load` does the same before DCP and
+undoes it after. See
+[Expert parallelism § Checkpoints](../distributed/expert-parallelism.md#checkpoints).
 
 `checkpointed_optimizers` is the optimizer plus any inner optimizers it
 hands parameters to — see [Inner optimizers](#inner-optimizers).
