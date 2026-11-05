@@ -1227,7 +1227,7 @@
             "is_pending"
           ],
           "methods": [
-            "save(state_dict, checkpoint_id, process_group)",
+            "save(state_dict, checkpoint_id, process_group, planner)",
             "wait()"
           ]
         }
@@ -1665,13 +1665,14 @@
         "classes": [
           "TestCheckpointHoldsEveryExpert(12)",
           "TestSecondMeshOfOneLayout(1)",
+          "TestDriftedCopies(1)",
           "TestResumeAtTheSameLayout(11)",
           "TestLoadAtAnotherEP(18)",
           "TestUnfixedCheckpoint(6)",
           "TestExportFromAnEPCheckpoint(3)",
           "TestWithoutEP(2)"
         ],
-        "count": 53
+        "count": 54
       },
       "tests/unit/test_expert_layout.py": {
         "classes": [
