@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 _DCP_METADATA_FILE = ".metadata"
 
 
-def _dcp_durable(ckpt_dir: Path) -> bool:
+def _dcp_durable(ckpt_dir: Path, num_stages: int | None = None) -> bool:
     """Whether ``ckpt_dir`` holds a complete set of DCP shards.
 
     Accepts both layouts: a flat directory, and the per-stage ``pp{k}/``
@@ -32,13 +32,24 @@ def _dcp_durable(ckpt_dir: Path) -> bool:
     ``dcp.load`` on the stages that have no ``.metadata``, or resumes them from
     different steps. An empty stage list is not durable either -- ``all()`` is
     vacuously true on it, and a directory with no stage at all holds nothing.
+
+    A stage that died before its save started leaves no ``pp{k}/`` directory at
+    all, so only ``num_stages``, the run's pipeline degree, can tell that it is
+    missing: with it, ``pp0`` through ``pp{num_stages - 1}`` must also be there.
+    Without it, only the stage directories that exist are checked. The stage
+    layout records no degree of its own, so a checkpoint saved with fewer stages
+    than ``num_stages`` looks the same as one whose later stages never saved.
     """
     if (ckpt_dir / _DCP_METADATA_FILE).exists():
         return True
     if not ckpt_dir.is_dir():
         return False
     stages = [d for d in ckpt_dir.iterdir() if d.is_dir() and d.name.startswith("pp")]
-    return bool(stages) and all((d / _DCP_METADATA_FILE).exists() for d in stages)
+    if not stages or not all((d / _DCP_METADATA_FILE).exists() for d in stages):
+        return False
+    if num_stages is not None and num_stages > 1:
+        return all((ckpt_dir / f"pp{k}" / _DCP_METADATA_FILE).exists() for k in range(num_stages))
+    return True
 
 
 @dataclass
@@ -95,7 +106,7 @@ def is_slurm_requeue() -> bool:
     return int(os.environ.get("SLURM_RESTART_COUNT", "0")) > 0
 
 
-def resolve_resume_path(checkpoint_dir: str) -> Path | None:
+def resolve_resume_path(checkpoint_dir: str, num_stages: int | None = None) -> Path | None:
     """Find the latest checkpoint for auto-resume.
 
     Checks:
@@ -111,6 +122,14 @@ def resolve_resume_path(checkpoint_dir: str) -> Path | None:
 
     Args:
         checkpoint_dir: Base checkpoint directory.
+        num_stages: The run's pipeline degree. With it, a ``step_N`` in the
+            per-stage layout counts only when ``pp0`` through ``pp{num_stages - 1}``
+            all hold ``.metadata``, including stages that never created their
+            directory; see ``_dcp_durable``. When no step has every stage, the
+            newest one whose stage directories are complete is returned as
+            before, after an error log, rather than the run starting over: a
+            checkpoint saved with another pipeline degree looks the same, and
+            resume does not support changing the degree.
 
     Returns:
         Path to the latest usable checkpoint, or None if none found.
@@ -136,14 +155,31 @@ def resolve_resume_path(checkpoint_dir: str) -> Path | None:
         reverse=True,
     )
 
+    short_of_stages: Path | None = None
     for path in step_dirs:
-        if _dcp_durable(path):
+        if _dcp_durable(path, num_stages):
             logger.info(f"Auto-resume: found checkpoint at {path}")
             return path
+        if _dcp_durable(path):
+            short_of_stages = short_of_stages or path
+            logger.warning(
+                f"Auto-resume: skipping {path}: its stage directories are complete, but "
+                f"this run has {num_stages} pipeline stages and not all of them are there"
+            )
+            continue
         logger.warning(
             f"Auto-resume: skipping {path} — no DCP .metadata, so the save that "
             f"produced it did not complete"
         )
+
+    if short_of_stages is not None:
+        logger.error(
+            f"Auto-resume: no checkpoint under {base} has all {num_stages} pipeline stages; "
+            f"resuming {short_of_stages}, the newest whose stage directories are complete. "
+            f"Either a stage stopped before saving, or the checkpoint was saved with another "
+            f"pipeline degree, which resume does not support"
+        )
+        return short_of_stages
 
     if step_dirs:
         logger.error(

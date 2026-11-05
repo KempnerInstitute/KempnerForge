@@ -384,6 +384,57 @@ class TestPipelineCheckpointSaveAndResume:
         )
 
 
+def _check_resume_skips_a_step_one_stage_never_saved(
+    rank: int, world: int, port: int, root: str
+) -> None:
+    """Both stages save step 5; only stage 0 writes step 10; latest is gone (#468)."""
+    dist.init_process_group(
+        "gloo", rank=rank, world_size=world, init_method=f"tcp://127.0.0.1:{port}"
+    )
+    try:
+        groups = [dist.new_group([r], backend="gloo") for r in range(world)]
+        model = torch.nn.Linear(1, 1, bias=False)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
+        model.weight.grad = torch.ones_like(model.weight)
+        optimizer.step()
+        config = JobConfig(checkpoint=CheckpointConfig(dir=root))
+        config.distributed.pp = world
+        manager = manager_module.CheckpointManager(
+            config.checkpoint, model, optimizer, process_group=groups[rank], pp_rank=rank
+        )
+        with torch.no_grad():
+            model.weight.fill_(5)
+        manager.save(5, tokens_seen=50)
+        if rank == 0:
+            step_10 = Path(root) / "step_10"
+            with torch.no_grad():
+                model.weight.fill_(10)
+            dcp.save(
+                {"model": model.state_dict()},
+                checkpoint_id=str(step_10 / "pp0"),
+                process_group=groups[0],
+            )
+            manager._write_train_state(step_10, 10, 100, None, None, None)
+            (Path(root) / "latest").unlink()
+        dist.barrier()
+        with torch.no_grad():
+            model.weight.fill_(-1)
+        assert restore_checkpoint(config, model, None, manager) == (5, 50)
+        assert model.weight.item() == 5.0
+    finally:
+        dist.destroy_process_group()
+
+
+class TestResumeScanNeedsEveryStage:
+    def test_every_stage_resumes_from_the_newest_step_they_all_saved(self, tmp_path):
+        """Without latest, a step one stage never wrote is skipped, not split across stages."""
+        mp.spawn(
+            _check_resume_skips_a_step_one_stage_never_saved,
+            args=(2, _free_port(), str(tmp_path / "ckpt")),
+            nprocs=2,
+        )
+
+
 class TestLatestWaitsForEveryStage:
     @pytest.mark.parametrize(
         "async_mode", [AsyncCheckpointMode.disabled, AsyncCheckpointMode.async_], ids=str
