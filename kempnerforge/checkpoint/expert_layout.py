@@ -103,7 +103,7 @@ class ExpertLayout:
         self._local_names: dict[str, str] = {}
         self._originals: dict[int, tuple[DTensor, torch.Tensor]] = {}
         self._group_params: list[list[str]] = []
-        self._meshes: dict[tuple[int, tuple[str, ...]], DeviceMesh] = {}
+        self._meshes: dict[tuple[int, tuple[str, ...]], tuple[DeviceMesh, DeviceMesh]] = {}
 
     def to_global(self, state: Mapping[str, Any]) -> dict[str, Any]:
         """``state`` with each rank's experts placed among all of the layer's experts.
@@ -320,23 +320,31 @@ class ExpertLayout:
         return view
 
     def _mesh_with_ep(self, ep_mesh: DeviceMesh, mesh: DeviceMesh, name: str) -> DeviceMesh:
-        """The mesh of ``mesh``'s dimensions, which shard a rank's rows, followed by ``ep``."""
+        """The mesh of ``mesh``'s dimensions, which shard a rank's rows, followed by ``ep``.
+
+        ``mesh`` must be those dimensions of the mesh that ``ep_mesh`` comes from. It is
+        compared as ``DeviceMesh`` compares meshes, by ranks, layout and names, since a
+        DTensor can hold an equal mesh that is another object: DTensor and FSDP2 reuse the
+        meshes of earlier, equal layouts.
+        """
         root = ep_mesh._get_root_mesh()
-        dims = mesh.mesh_dim_names
-        key = (id(root), dims or ())
-        if key in self._meshes:
-            return self._meshes[key]
+        dims = mesh.mesh_dim_names or ()
         try:
-            if dims is None or "ep" in dims or mesh._get_root_mesh() is not root:
-                raise ValueError("it is not a mesh of other dimensions of the same root mesh")
-            self._meshes[key] = root[(*dims, "ep")]
+            if not dims or "ep" in dims:
+                raise ValueError("it has no dimension other than ep")
+            key = (id(root), dims)
+            if key not in self._meshes:
+                self._meshes[key] = (root[dims], root[(*dims, "ep")])
+            rows, joined = self._meshes[key]
+            if rows != mesh:
+                raise ValueError(f"those dimensions of {root} are {rows}")
         except (KeyError, ValueError) as e:
             raise ValueError(
                 f"{name} is sharded over {mesh}, which cannot be joined with the EP mesh "
                 f"{ep_mesh} that its experts are split over ({e}), so its rows cannot be "
                 "placed among all the experts"
             ) from e
-        return self._meshes[key]
+        return joined
 
     def _original(self, item: Any) -> Any:
         """The tensor that ``item`` views if ``to_global`` made it; else ``item``."""
