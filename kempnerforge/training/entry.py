@@ -181,6 +181,7 @@ def build_checkpoint_manager(
         optimizer,
         process_group=ckpt_pg,
         pp_rank=ckpt_pp_rank,
+        weight_decay_scope=config.optimizer.weight_decay_scope,
     )
 
 
@@ -196,14 +197,17 @@ def restore_checkpoint(
     resume from. Also restores the metrics run ids, runs the MoT warm-start
     hook, and re-applies the effective freeze at the resumed step.
     """
+    num_stages = config.distributed.pp if config.distributed.pp > 1 else None
     if dist.is_initialized():
         chosen = [
-            str(resolve_resume_path(config.checkpoint.dir) or "") if dist.get_rank() == 0 else ""
+            str(resolve_resume_path(config.checkpoint.dir, num_stages) or "")
+            if dist.get_rank() == 0
+            else ""
         ]
         dist.broadcast_object_list(chosen, src=0)
         resume_path = Path(chosen[0]) if chosen[0] else None
     else:
-        resume_path = resolve_resume_path(config.checkpoint.dir)
+        resume_path = resolve_resume_path(config.checkpoint.dir, num_stages)
     if not resume_path and not config.checkpoint.load_path:
         return 0, 0
 
@@ -228,7 +232,13 @@ def restore_checkpoint(
     if ckpt_extra_loaded.get("mlflow_run_id"):
         config.metrics.mlflow_run_id = ckpt_extra_loaded["mlflow_run_id"]
 
-    if isinstance(vlm_cfg, MoTConfig) and vlm_cfg.mot_warm_start_from_text and step == 0:
+    weights_only = warm_start_exclude is not None and "train_state" in warm_start_exclude
+    if (
+        isinstance(vlm_cfg, MoTConfig)
+        and vlm_cfg.mot_warm_start_from_text
+        and step == 0
+        and not weights_only
+    ):
         source = torch.load(vlm_cfg.mot_warm_start_path, map_location="cpu", weights_only=True)
         if isinstance(source, dict) and "model" in source:
             source = source["model"]

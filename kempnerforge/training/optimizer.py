@@ -8,8 +8,9 @@ Builds optimizers with per-parameter-group settings:
   - Schedule-Free AdamW: eliminates LR schedule by averaging iterates
 
 All optimizers:
-  - Weight decay applied to matrix weights only
-  - Bias and norm parameters excluded from weight decay
+  - Weight decay follows optimizer.weight_decay_scope: by default every parameter
+    with ndim > 1 and no "bias" in its name is decayed, and "all" decays every
+    parameter
   - Fused kernel when available (PyTorch 2.x, AdamW only)
 """
 
@@ -561,11 +562,25 @@ def _build_muon(
     )
 
 
-def _should_decay(name: str, param: torch.nn.Parameter) -> bool:
+def _should_decay(name: str, param: torch.nn.Parameter, scope: str) -> bool:
     """Decide whether a parameter should receive weight decay.
 
-    Excluded: 1D parameters (biases, norm scales/shifts), embedding weights.
+    Args:
+        name: Fully qualified parameter name.
+        param: The parameter itself.
+        scope: ``"exclude_norms_and_biases"`` keeps decay off every parameter of
+            rank 1 or 0 (norm scales and shifts, and scalars) and any parameter
+            whose name contains ``"bias"``. Everything else is decayed, which
+            includes the token embedding, the output head and any parameter of
+            higher rank such as packed expert weights or a convolution kernel.
+            ``"all"`` decays every parameter, which is what ``torch.optim.AdamW``
+            does by default.
+
+    Returns:
+        True when the parameter belongs in the weight-decay group.
     """
+    if scope == "all":
+        return True
     if param.ndim <= 1:
         return False
     return "bias" not in name
@@ -590,7 +605,7 @@ def build_optimizer(
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        if _should_decay(name, param):
+        if _should_decay(name, param, config.weight_decay_scope):
             decay_params.append(param)
         else:
             no_decay_params.append(param)

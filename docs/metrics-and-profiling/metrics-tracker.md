@@ -139,6 +139,8 @@ if mc.enable_wandb:
 if mc.enable_tensorboard:
     self._backends.append(TensorBoardBackend(mc))
 if mc.enable_mlflow:
+    from kempnerforge.metrics.mlflow.backend import MLflowBackend
+
     self._backends.append(MLflowBackend(mc, job_config=config))
 ```
 
@@ -239,6 +241,11 @@ Override rank filtering with `get_logger(__name__, rank_zero_only=False)`
 when you genuinely want every rank to log — e.g. for distributed-init
 debugging. Once the root logger is configured it's cached, so this flag
 only takes effect on the very first call.
+
+A single record can pass the filter instead: log it with
+`extra={"every_rank": True}` and every rank emits it. Use this for an event
+that only the logging rank sees, such as a problem with a sample that rank
+read.
 
 ## See also
 
