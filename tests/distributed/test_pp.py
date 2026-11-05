@@ -366,7 +366,7 @@ class TestPipelineParallelEquivalence:
         stage_module.zero_grad()
         metrics = run_eval(
             stage_module,
-            batches,  # type: ignore[arg-type]
+            batches,
             loss_fn,
             device,
             2 * N_MICROBATCHES,

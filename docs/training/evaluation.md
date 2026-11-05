@@ -98,11 +98,12 @@ what the metrics tracker expects.
 Under PP the eval dataloader drops a partial last batch, which the stages
 could not take. The sampler splits the eval set evenly across data-parallel
 ranks and drops the remainder, so each rank needs at least one full batch;
-with none, `run_eval` raises `ValueError`. The schedule's gradient reduction
-still runs in `eval()` and divides any gradients left on the stage by the
-microbatch count. The loop calls `run_eval` after `optimizer.zero_grad()`, so
-there are none, as long as an `on_step_end` hook, which runs in between,
-leaves them cleared too.
+with none, building the eval dataloader raises `ValueError` before training
+starts. When `eval_steps` asks for more batches than the loader holds, eval
+starts the loader over. The schedule's gradient reduction still runs after
+each `eval()` call, which with FSDP2 reshards the stage; `run_eval` turns the
+schedule's gradient scaling off for those calls, so gradients left on the
+stage keep their values.
 
 ## In-loop evaluation
 

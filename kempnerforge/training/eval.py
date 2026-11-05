@@ -61,8 +61,8 @@ def run_eval(
         eval_steps: Number of eval batches to process.
         pp_schedule: Pipeline parallel schedule (None for non-PP). It is the training
             schedule, run forward-only through its ``eval()``. Its gradient reduction still
-            runs and divides any gradients left on the stage by the microbatch count, so
-            call this with the gradients cleared, as the training loop does.
+            runs after each call, with its gradient scaling off, so gradients left on the
+            stage keep their values.
         pp_rank: This rank's PP stage index.
         pp_size: Total number of PP stages.
         pp_group: Process group for PP loss broadcast.
@@ -92,18 +92,23 @@ def run_eval(
         pp_losses: list[torch.Tensor] = []
         batches = _cycle(eval_dataloader)
 
-        for _ in range(eval_steps // n_microbatches):
-            group = [next(batches) for _ in range(n_microbatches)]
-            full_input = torch.cat([b["input_ids"].to(device) for b in group], dim=0)
-            full_labels = torch.cat([b["labels"].to(device) for b in group], dim=0)
-            call_losses: list[torch.Tensor] = []
-            if is_first:
-                pp_schedule.eval(full_input, target=full_labels, losses=call_losses)
-            elif is_last:
-                pp_schedule.eval(target=full_labels, losses=call_losses)
-            else:
-                pp_schedule.eval()
-            pp_losses.extend(call_losses)
+        scale_grads = pp_schedule.scale_grads
+        pp_schedule.scale_grads = False
+        try:
+            for _ in range(eval_steps // n_microbatches):
+                group = [next(batches) for _ in range(n_microbatches)]
+                full_input = torch.cat([b["input_ids"].to(device) for b in group], dim=0)
+                full_labels = torch.cat([b["labels"].to(device) for b in group], dim=0)
+                call_losses: list[torch.Tensor] = []
+                if is_first:
+                    pp_schedule.eval(full_input, target=full_labels, losses=call_losses)
+                elif is_last:
+                    pp_schedule.eval(target=full_labels, losses=call_losses)
+                else:
+                    pp_schedule.eval()
+                pp_losses.extend(call_losses)
+        finally:
+            pp_schedule.scale_grads = scale_grads
 
         if is_last and pp_losses:
             avg_loss = sum(loss.item() for loss in pp_losses) / len(pp_losses)

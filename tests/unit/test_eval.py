@@ -147,9 +147,14 @@ def _free_port() -> int:
         return sock.getsockname()[1]
 
 
-def _check_two_stage_eval(rank: int, world: int, port: int, schedule_name: str) -> None:
-    """A training step, eval through the same two-stage schedule against the whole model,
-    then another training step, as the training loop runs them."""
+def _check_pipeline_eval(
+    rank: int, world: int, port: int, schedule_name: str, keep_grads: bool
+) -> None:
+    """A training step, eval through the same schedule against the whole model, then
+    another training step, as the training loop runs them. Eval asks for more batches
+    than the loader holds, so it starts the loader over. With ``keep_grads`` the training
+    gradients stay on the stage through eval; otherwise they are cleared first, as the
+    loop does."""
     import torch.distributed as dist
     import torch.nn.functional as F
     from torch.distributed.device_mesh import init_device_mesh
@@ -165,13 +170,15 @@ def _check_two_stage_eval(rank: int, world: int, port: int, schedule_name: str) 
     def loss_fn(out: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         return F.cross_entropy(out.flatten(0, 1).float(), target.flatten())
 
-    n_micro, micro_batch, seq = 2, 2, 16
+    n_micro, micro_batch, seq = max(2, world), 2, 16
     dist.init_process_group(
         "gloo", rank=rank, world_size=world, init_method=f"tcp://127.0.0.1:{port}"
     )
     try:
         mesh = init_device_mesh("cpu", (world,), mesh_dim_names=("pp",))
-        config = ModelConfig(dim=32, n_layers=2, n_heads=2, vocab_size=VOCAB_SIZE, max_seq_len=seq)
+        config = ModelConfig(
+            dim=32, n_layers=world, n_heads=2, vocab_size=VOCAB_SIZE, max_seq_len=seq
+        )
         torch.manual_seed(0)
         reference = Transformer(config)
         stage_module = build_stage_module(config, pp_rank=rank, pp_size=world)
@@ -204,30 +211,42 @@ def _check_two_stage_eval(rank: int, world: int, port: int, schedule_name: str) 
         def train_step() -> None:
             if rank == 0:
                 schedule.step(tokens, target=labels, losses=[])
-            else:
+            elif rank == world - 1:
                 schedule.step(target=labels, losses=[])
+            else:
+                schedule.step()
 
         train_step()
-        stage_module.zero_grad()
+        if keep_grads:
+            kept = [p.grad.clone() for p in stage_module.parameters()]
+        else:
+            stage_module.zero_grad()
+        eval_steps = 3 * n_micro
         metrics = run_eval(
             stage_module,
-            batches,  # type: ignore[arg-type]
+            batches,
             loss_fn,
             torch.device("cpu"),
-            2 * n_micro,
+            eval_steps,
             pp_schedule=schedule,
             pp_rank=rank,
             pp_size=world,
             pp_group=mesh["pp"].get_group(),
             pp_n_microbatches=n_micro,
         )
+        seen = [batches[i % len(batches)] for i in range(eval_steps)]
         with torch.no_grad():
             expected = sum(
-                loss_fn(reference(b["input_ids"]), b["labels"]).item() for b in batches
-            ) / len(batches)
+                loss_fn(reference(b["input_ids"]), b["labels"]).item() for b in seen
+            ) / len(seen)
         assert math.isclose(metrics["eval/loss"], expected, rel_tol=1e-5), (metrics, expected)
-        assert all(p.grad is None for p in stage_module.parameters())
+        if keep_grads:
+            params = list(stage_module.parameters())
+            assert all(torch.equal(p.grad, g) for p, g in zip(params, kept, strict=True))
+        else:
+            assert all(p.grad is None for p in stage_module.parameters())
         assert stage_module.training
+        assert schedule.scale_grads is True
 
         train_step()
         assert all(p.grad is not None for p in stage_module.parameters())
@@ -235,9 +254,12 @@ def _check_two_stage_eval(rank: int, world: int, port: int, schedule_name: str) 
         dist.destroy_process_group()
 
 
-def _check_two_stage_fsdp_eval(rank: int, world: int, port: int, schedule_name: str) -> None:
+def _check_two_stage_fsdp_eval(
+    rank: int, world: int, port: int, schedule_name: str, keep_grads: bool
+) -> None:
     """PP 2 x FSDP2 dp_shard 2: a training step, eval, then a step whose gradients match the
-    whole model's, so eval between steps leaves the sharded state and gradients alone."""
+    whole model's, so eval between steps leaves the sharded state and gradients alone. With
+    ``keep_grads`` the sharded training gradients stay on the stage through eval."""
     import torch.distributed as dist
     import torch.nn.functional as F
     from torch.distributed.device_mesh import init_device_mesh
@@ -303,10 +325,13 @@ def _check_two_stage_fsdp_eval(rank: int, world: int, port: int, schedule_name: 
                 schedule.step(target=labels[rows], losses=[])
 
         train_step()
-        stage_module.zero_grad()
+        if keep_grads:
+            kept = [p.grad.to_local().clone() for p in stage_module.parameters()]
+        else:
+            stage_module.zero_grad()
         metrics = run_eval(
             stage_module,
-            batches,  # type: ignore[arg-type]
+            batches,
             loss_fn,
             torch.device("cpu"),
             2 * n_micro,
@@ -321,13 +346,18 @@ def _check_two_stage_fsdp_eval(rank: int, world: int, port: int, schedule_name: 
                 loss_fn(reference(b["input_ids"]), b["labels"]).item() for b in batches
             ) / len(batches)
         assert math.isclose(metrics["eval/loss"], expected, rel_tol=1e-5), (metrics, expected)
-        assert all(p.grad is None for p in stage_module.parameters())
+        if keep_grads:
+            params = list(stage_module.parameters())
+            assert all(torch.equal(p.grad.to_local(), g) for p, g in zip(params, kept, strict=True))
+            stage_module.zero_grad()
+        else:
+            assert all(p.grad is None for p in stage_module.parameters())
 
         train_step()
         loss_fn(reference(tokens), labels).backward()
         for name, p in stage_module.named_parameters():
             torch.testing.assert_close(
-                p.grad.full_tensor(),  # type: ignore[union-attr]
+                p.grad.full_tensor(),
                 reference.get_parameter(name).grad,
                 rtol=2e-4,
                 atol=2e-5,
@@ -339,6 +369,8 @@ def _check_two_stage_fsdp_eval(rank: int, world: int, port: int, schedule_name: 
 class _NoBatchSchedule:
     """A pipeline schedule that must not be reached."""
 
+    scale_grads = True
+
     def step(self, *args, **kwargs):
         raise AssertionError("step() called")
 
@@ -347,24 +379,39 @@ class _NoBatchSchedule:
 
 
 class TestRunEvalPipeline:
+    @pytest.mark.parametrize("n_stages", [2, 3])
     @pytest.mark.parametrize("schedule_name", ["1f1b", "gpipe"])
-    def test_two_stage_eval_matches_the_whole_model_and_training_continues(self, schedule_name):
+    def test_eval_matches_the_whole_model_and_training_continues(self, schedule_name, n_stages):
         """Under no_grad, run_eval drives the training schedule through eval(): torch refuses
-        step() there for a schedule with a loss function. The batches go through the
-        schedule two at a time, the training microbatch shape, eval computes no gradients,
-        and the schedule trains again afterward."""
+        step() there for a schedule with a loss function. On the first, middle and last
+        stages the batches go through the schedule a training step's microbatches at a time;
+        eval starts the loader over when it runs out, computes no gradients, and the
+        schedule trains again afterward."""
         import torch.multiprocessing as mp
 
-        mp.spawn(_check_two_stage_eval, args=(2, _free_port(), schedule_name), nprocs=2)
+        args = (n_stages, _free_port(), schedule_name, False)
+        mp.spawn(_check_pipeline_eval, args=args, nprocs=n_stages)
 
     @pytest.mark.parametrize("schedule_name", ["1f1b", "gpipe"])
-    def test_eval_between_fsdp2_sharded_steps_keeps_the_training_gradients(self, schedule_name):
-        """With FSDP2 inside each stage, the schedule's gradient reduction still runs in
-        eval(); with the gradients cleared it changes nothing, and the next step's sharded
-        gradients equal the whole model's."""
+    def test_eval_leaves_the_gradients_on_the_stage_unchanged(self, schedule_name):
+        """The schedule's gradient reduction runs after each eval() call; with its scaling
+        off, gradients left on the stage keep their values over all three calls."""
         import torch.multiprocessing as mp
 
-        mp.spawn(_check_two_stage_fsdp_eval, args=(4, _free_port(), schedule_name), nprocs=4)
+        mp.spawn(_check_pipeline_eval, args=(2, _free_port(), schedule_name, True), nprocs=2)
+
+    @pytest.mark.parametrize("keep_grads", [False, True])
+    @pytest.mark.parametrize("schedule_name", ["1f1b", "gpipe"])
+    def test_eval_between_fsdp2_sharded_steps_keeps_the_training_gradients(
+        self, schedule_name, keep_grads
+    ):
+        """With FSDP2 inside each stage, the schedule's gradient reduction still runs in
+        eval(): sharded gradients left on the stage keep their values, and after clearing
+        them the next step's sharded gradients equal the whole model's."""
+        import torch.multiprocessing as mp
+
+        args = (4, _free_port(), schedule_name, keep_grads)
+        mp.spawn(_check_two_stage_fsdp_eval, args=args, nprocs=4)
 
     def test_eval_steps_must_fill_whole_schedule_calls(self):
         with pytest.raises(ValueError, match="multiple of the pipeline schedule's 2 microbatches"):
@@ -384,6 +431,7 @@ class TestRunEvalPipeline:
         empty = DataLoader(
             TensorDataset(torch.zeros(1, SEQ_LEN, dtype=torch.long)), batch_size=4, drop_last=True
         )
+        schedule = _NoBatchSchedule()
         with pytest.raises(ValueError, match="yields no batch"):
             run_eval(
                 _TinyLM(),
@@ -391,8 +439,9 @@ class TestRunEvalPipeline:
                 _loss_fn,
                 torch.device("cpu"),
                 eval_steps=2,
-                pp_schedule=_NoBatchSchedule(),
+                pp_schedule=schedule,
                 pp_rank=0,
                 pp_size=2,
                 pp_n_microbatches=2,
             )
+        assert schedule.scale_grads is True
