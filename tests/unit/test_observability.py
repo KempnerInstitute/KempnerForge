@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import glob
+import io
 import json
 import logging
 import os
@@ -801,6 +802,18 @@ def utc_minus_8():
         time.tzset()
 
 
+def _plain_rank_logger(monkeypatch, name: str) -> tuple[logging.Logger, io.StringIO]:
+    """A rank-0 logger whose only output is a plain ``_RankFormatter`` writing to the stream."""
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(_RankFormatter(use_color=False))
+    logger = logging.getLogger(name)
+    monkeypatch.setattr(logger, "handlers", [handler])
+    monkeypatch.setattr(logger, "propagate", False)
+    monkeypatch.setenv("RANK", "0")
+    return logger, stream
+
+
 class TestRankLogger:
     def test_get_logger_returns_logger(self):
         logger = get_logger("test_module")
@@ -898,6 +911,20 @@ class TestRankLogger:
         c = log_mod._COLORS
         dimmed = f"{c['dim']}2023-11-14 14:13:20.250 [rank 0]{c['reset']}"
         assert output == f"{dimmed} {c['green']}INFO    {c['reset']} hello"
+
+    def test_rank_formatter_prints_the_traceback_of_a_logged_exception(self, monkeypatch):
+        """``logger.exception`` prints the traceback below its line, as logging.Formatter does."""
+        logger, stream = _plain_rank_logger(monkeypatch, "test_rank_formatter_exception")
+        try:
+            raise ValueError("bad batch")
+        except ValueError:
+            logger.exception("step failed")
+            traceback = logging.Formatter().formatException(sys.exc_info())
+        line, rest = stream.getvalue().split("\n", 1)
+        assert line.endswith(" [rank 0] ERROR    step failed")
+        assert rest == f"{traceback}\n"
+        assert traceback.startswith("Traceback (most recent call last):")
+        assert traceback.endswith("ValueError: bad batch")
 
     def test_configure_root_no_rank_filter(self, monkeypatch):
         """When rank_zero_only=False, _configure_root attaches no _RankFilter.
