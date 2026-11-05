@@ -51,6 +51,15 @@ keeps it as a plain string; a name that is neither raises a
 registration has to run before `load_config`, which is what the
 `plugins` key below is for.
 
+`model.activation` has two limits. Core's own `mlp` keys (`swiglu`,
+`standard_gelu`, `standard_relu`) are rejected, with a pointer to the
+activation that selects each (`silu`, `gelu`, `relu`), whatever was
+imported first. And a plugin's MLP is rejected when `num_experts > 0`:
+MoE experts, MoT's included, compute core's SwiGLU or standard MLP from
+the expert weights rather than calling the expert module. MoMa's
+experts call each expert module, so a plugin's MLP runs there as
+written.
+
 ## Consumers
 
 Where each category is looked up in the codebase:
