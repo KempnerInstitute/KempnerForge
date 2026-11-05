@@ -128,11 +128,11 @@ class TestExpertParallelParams:
     """``expert_parallel_params`` finds the routed experts and the one EP group."""
 
     @staticmethod
-    def _model(groups: list[object]) -> torch.nn.Sequential:
+    def _model(groups: list[object], packed: bool = False, **kwargs) -> torch.nn.Sequential:
         """MoE layers marked as split over two EP ranks, each with the given group."""
         layers = []
         for group in groups:
-            moe = _moe(packed=False)
+            moe = _moe(packed, **kwargs)
             moe.ep_world_size = 2
             moe.ep_group = group
             layers.append(moe)
@@ -145,6 +145,20 @@ class TestExpertParallelParams:
         experts = [p for layer in model for p in layer.experts.parameters()]
         assert found is group
         assert [id(p) for p in params] == [id(p) for p in experts]
+
+    @pytest.mark.parametrize(
+        ("activation", "names"),
+        [("silu", ("up_w", "down_w", "gate_w")), ("gelu", ("up_w", "down_w"))],
+        ids=["swiglu", "gelu"],
+    )
+    def test_packed_layers_return_their_weights(self, activation, names):
+        """Packed layers give their up and down weights, and their gate under SwiGLU only."""
+        group = object()
+        model = self._model([group, group], packed=True, activation=activation)
+        params, found = expert_parallel_params(model)
+        weights = [getattr(layer, name) for layer in model for name in names]
+        assert found is group
+        assert [id(p) for p in params] == [id(p) for p in weights]
 
     def test_layers_with_different_groups_are_rejected(self):
         """One norm all-reduce covers one group, so a second group must not pass silently."""
