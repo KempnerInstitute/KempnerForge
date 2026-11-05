@@ -162,6 +162,10 @@ does three things:
    the task list
 3. Prints results and optionally writes JSON via `--output`
 
+The conversion writes bfloat16, and lm-eval loads every model, a
+pre-converted `--hf-model` too, with `dtype=bfloat16`, so the harness
+evaluates in bfloat16 whatever `checkpoint.export_dtype` says.
+
 ### Flags
 
 | Flag | Default | Purpose |
