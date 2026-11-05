@@ -35,6 +35,7 @@ from kempnerforge.metrics.logger import (
 )
 from kempnerforge.metrics.memory import (
     DeviceMemoryMonitor,
+    format_memory_stats,
     get_memory_stats,
     get_memory_utilization,
     reset_peak_memory,
@@ -144,7 +145,7 @@ class TestMetricsTracker:
         ]
         assert published == [(0.5, 6.0, 0.075), (0.5, 6.0, 0.075)]
         assert ["mem=6.0/80GB" in line for line in lines] == [True, True]
-        assert fake.resets == 0
+        assert fake.resets == []
 
     def test_close_without_backends(self):
         tracker = self._make_tracker()
@@ -267,15 +268,15 @@ _GIB = 1024**3
 class _FakeCudaMemory:
     """CUDA memory counters on a CPU host, for a process whose current device is cuda:3.
 
-    Like torch, each counter resolves ``device=None`` to the current device; ``reads`` records
-    the device every read resolved to.
+    Like torch, each counter resolves ``device=None`` to the current device; ``reads`` and
+    ``resets`` record the device every read and every peak reset resolved to.
     """
 
     def __init__(self, monkeypatch) -> None:
         self.allocated = 0
         self.peak = 0
         self.reads: list[int] = []
-        self.resets = 0
+        self.resets: list[int] = []
         cuda = torch.cuda
         monkeypatch.setattr(cuda, "is_available", lambda: True)
         monkeypatch.setattr(cuda, "current_device", lambda: 3)
@@ -294,7 +295,7 @@ class _FakeCudaMemory:
         return value
 
     def _reset(self, device: int | None = None) -> None:
-        self.resets += 1
+        self.resets.append(torch.cuda.current_device() if device is None else device)
         self.peak = self.allocated
 
     def allocate(self, nbytes: int) -> None:
@@ -410,6 +411,21 @@ class TestMemoryHelpers:
         fake.reads.clear()
         get_memory_stats(device=1)
         assert fake.reads == [1, 1, 1, 1]
+
+    @pytest.mark.parametrize(("device", "resolved"), [(None, 3), (0, 0), (1, 1)])
+    def test_every_memory_helper_reads_the_device_asked_for(self, monkeypatch, device, resolved):
+        """Each helper reads the current device by default and an explicit index, 0 included."""
+        fake = _FakeCudaMemory(monkeypatch)
+        fake.allocate(8 * _GIB)
+        on = {} if device is None else {"device": device}
+        assert get_memory_stats(**on)["peak_gb"] == 8.0
+        assert get_memory_utilization(**on) == 0.1
+        assert format_memory_stats(**on) == (
+            "GPU mem: 8.0GB allocated, 8.0GB peak, 8.0GB reserved / 80.0GB total (10%)"
+        )
+        reset_peak_memory(**on)
+        assert set(fake.reads) == {resolved}
+        assert fake.resets == [resolved]
 
 
 class TestWandBBackend:
