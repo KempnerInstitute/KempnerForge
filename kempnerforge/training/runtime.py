@@ -9,6 +9,7 @@ import torch
 from torch.distributed.device_mesh import DeviceMesh
 
 from kempnerforge.config.job import JobConfig
+from kempnerforge.config.training import TrainConfig
 from kempnerforge.distributed.setup import get_world_info, init_distributed
 from kempnerforge.metrics.logger import get_logger
 from kempnerforge.resilience.elastic import log_job_info
@@ -48,6 +49,13 @@ def pp_group(runtime: RuntimeContext) -> Any:
     return mesh["pp"].get_group()
 
 
+def apply_matmul_precision(train: TrainConfig) -> None:
+    """Run fp32 matmuls on TF32 tensor cores when ``train.tf32`` is set; otherwise do nothing."""
+    if train.tf32:
+        torch.set_float32_matmul_precision("high")
+        logger.info("train.tf32: fp32 matmuls run on TF32 tensor cores")
+
+
 def setup_distributed(config: JobConfig) -> RuntimeContext:
     """Initialize the process group + device mesh, then validate the config against it."""
     rank, local_rank, world_size = get_world_info()
@@ -55,6 +63,7 @@ def setup_distributed(config: JobConfig) -> RuntimeContext:
 
     device_mesh = init_distributed(config.distributed, seed=config.train.seed)
     config.validate(world_size)
+    apply_matmul_precision(config.train)
 
     log_job_info()
     logger.info(f"Training config: {config}")
