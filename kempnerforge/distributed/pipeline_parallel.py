@@ -33,7 +33,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from kempnerforge.config.schema import ModelConfig
 from kempnerforge.model.embedding import OutputHead, TokenEmbedding
 from kempnerforge.model.init import init_weights
-from kempnerforge.model.masking import build_doc_causal_block_mask
+from kempnerforge.model.masking import build_attention_mask
 from kempnerforge.model.norm import build_norm
 from kempnerforge.model.position import precompute_rope_frequencies
 from kempnerforge.model.transformer import TransformerBlock
@@ -203,12 +203,28 @@ class PipelineStageModule(nn.Module):
                 hands it to every stage directly. It must not travel between
                 stages as an activation -- ``PipelineStage`` calls
                 ``requires_grad_(True)`` on every received buffer without
-                checking dtype, which an integer tensor cannot satisfy.
+                checking dtype, which an integer tensor cannot satisfy. Each
+                stage builds its own document mask from these ids, once per
+                forward: a ``BlockMask`` is not a tensor and could not be
+                transmitted either. Document isolation is the only visibility
+                rule a stage applies; it takes no visibility group ids and no
+                key padding mask.
 
         Returns:
             For last stage: logits of shape (batch, seq_len, vocab_size).
             For other stages: hidden states of shape (batch, seq_len, dim).
+
+        Raises:
+            ValueError: If ``doc_ids`` is not shaped ``(batch, seq_len)``.
         """
+        attn_mask = build_attention_mask(
+            backend=self.config.attention_backend,
+            batch=x.shape[0],
+            seq_len=x.shape[1],
+            device=x.device,
+            doc_ids=doc_ids,
+        )
+
         if self.is_first and self.token_embedding is not None:
             x = self.token_embedding(x)
 
@@ -219,14 +235,8 @@ class PipelineStageModule(nn.Module):
         cos = self._rope_cos[:seq_len]  # type: ignore[reportOptionalSubscript]
         sin = self._rope_sin[:seq_len]  # type: ignore[reportOptionalSubscript]
 
-        block_mask = None
-        layer_doc_ids = doc_ids
-        if doc_ids is not None and self.config.attention_backend == "flex":
-            block_mask = build_doc_causal_block_mask(doc_ids, x.device)
-            layer_doc_ids = None
-
         for layer in self.layers.values():
-            x = layer(x, cos, sin, doc_ids=layer_doc_ids, block_mask=block_mask)
+            x = layer(x, cos, sin, attn_mask=attn_mask)
 
         if self.is_last:
             x = self.norm(x)  # type: ignore[reportOptionalCall]
