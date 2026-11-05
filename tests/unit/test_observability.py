@@ -371,9 +371,9 @@ class TestDeviceMemoryMonitor:
         monkeypatch.setattr(torch.cuda.memory, "_record_memory_history", lambda *a, **k: None)
         monkeypatch.setattr(torch.cuda.memory, "_snapshot", lambda: {"segments": []})
         monitor = DeviceMemoryMonitor(device=device, snapshot_dir=str(tmp_path))
-        path = monitor.capture_snapshot(step=7)
-        assert path == str(tmp_path / f"snapshot_step_7_device_{resolved}.pickle")
-        assert Path(path).is_file()
+        expected = tmp_path / f"snapshot_step_7_device_{resolved}.pickle"
+        assert monitor.capture_snapshot(step=7) == str(expected)
+        assert expected.is_file()
         assert synced == [resolved]
 
 
