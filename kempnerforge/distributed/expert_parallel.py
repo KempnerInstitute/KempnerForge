@@ -104,9 +104,9 @@ def ep_dispatch_and_compute(
 ) -> torch.Tensor:
     """All-to-all dispatch, local expert compute, all-to-all combine.
 
-    In the backward pass the local experts get the mean of the EP ranks' gradients,
-    one process's when the ranks hold the same batch, and ``x`` and ``weights`` get
-    the same gradients as without EP.
+    When the EP ranks hold the same batch, as they do in training, the backward pass
+    gives the local experts the mean of the ranks' gradients, which is one process's,
+    and gives ``x`` and ``weights`` the same gradients as without EP.
 
     Args:
         x: (num_tokens, dim) flattened token representations.
