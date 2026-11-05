@@ -302,8 +302,8 @@ def _check_gradient_scale(rank, world, port, names, sizes, overrides) -> None:
 def _check_gradient_scale_modes(rank, world, port, names, sizes, overrides) -> None:
     """``moe_gradient_scale`` follows the training mode, as in one process.
 
-    Training mode scales the expert outputs under ``torch.no_grad()`` too, and eval
-    mode does not scale them with gradients on, so the logits match in both.
+    Training mode scales the expert outputs with or without gradients and eval mode
+    never does, so the logits match in all four combinations.
     """
     _init(rank, world, port)
     try:
@@ -313,7 +313,7 @@ def _check_gradient_scale_modes(rank, world, port, names, sizes, overrides) -> N
         rows = torch.randint(
             0, reference.config.vocab_size, (dp_size, ROWS, SEQ), generator=generator
         )[dp_rank]
-        for training, grad_enabled in ((True, False), (False, True)):
+        for training, grad_enabled in ((True, True), (True, False), (False, True), (False, False)):
             model.train(training)
             reference.train(training)
             with torch.set_grad_enabled(grad_enabled):
@@ -325,7 +325,9 @@ def _check_gradient_scale_modes(rank, world, port, names, sizes, overrides) -> N
                 expected,
                 rtol=1e-5,
                 atol=1e-5 * scale,
-                msg=lambda m, training=training: f"training={training}: {m}",
+                msg=lambda m, training=training, grad_enabled=grad_enabled: (
+                    f"training={training}, grad_enabled={grad_enabled}: {m}"
+                ),
             )
     finally:
         dist.destroy_process_group()
@@ -349,7 +351,7 @@ class TestExpertParallelGradients:
         _spawn(_check_gradient_scale, ("dp_shard", "ep"), sizes, {"moe_gradient_scale": True})
 
     def test_gradient_scale_follows_training_mode(self):
-        """Training under ``torch.no_grad()`` and eval with gradients on match one process."""
+        """Training and eval, each with and without gradients, match one process."""
         _spawn(
             _check_gradient_scale_modes, ("dp_shard", "ep"), (1, 2), {"moe_gradient_scale": True}
         )
