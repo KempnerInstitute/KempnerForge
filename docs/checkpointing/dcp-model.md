@@ -224,12 +224,22 @@ dcp_state = {
     "model":     get_model_state_dict(self.model),
     "optimizer": get_optimizer_state_dict(self.model, self.checkpointed_optimizers),
 }
+dcp_state, layout = self._present_experts(dcp_state, dcp_dir, saved_keys)
 dcp.load(dcp_state, checkpoint_id=str(dcp_dir), process_group=self._process_group)
+if layout is not None:
+    dcp_state = layout.to_local(dcp_state)
 set_model_state_dict(self.model, dcp_state["model"])
 set_optimizer_state_dict(
     self.model, self.checkpointed_optimizers, optim_state_dict=dcp_state["optimizer"]
 )
 ```
+
+Under expert parallelism `_present_experts` places each rank's experts
+among all of them before `dcp.load`, as on save, and `layout.to_local`
+gives the setters this rank's names and tensors back. For any model with
+MoE layers it first refuses a checkpoint that holds fewer experts than
+the model. See
+[Expert parallelism § Checkpoints](../distributed/expert-parallelism.md#checkpoints).
 
 A Muon checkpoint saved before the inner AdamW was checkpointed is the
 one exception: the load passes Muon alone — see
