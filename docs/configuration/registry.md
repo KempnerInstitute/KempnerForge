@@ -17,8 +17,11 @@ model = registry.get("mlp", "my_mlp")(dim=4096, hidden_dim=11008)
 
 `register(category, name, obj)` fails fast on duplicate names, with a
 `ValueError` naming the module that registered the name and the module
-registering it again; `get` raises `KeyError` with an "Available: […]"
-hint when a name is missing; `list(category)` returns registered names.
+registering it again, each with the module that defines the registered
+function or class when that is another one (a shared helper or an
+`__init_subclass__` hook registers for every plugin that uses it);
+`get` raises `KeyError` with an "Available: […]" hint when a name is
+missing; `list(category)` returns registered names.
 
 ## The seven categories
 
