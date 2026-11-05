@@ -169,7 +169,7 @@ After the microbatch loop:
 ```python
 grad_norm = clip_grad_norm_(model, tc.grad_clip_norm)
 
-if not nan_detector.check_loss(avg_loss, step):
+if not nan_detector.check_loss(avg_loss, step, grad_norm=grad_norm):
     optimizer.zero_grad()
     if nan_detector.should_rollback:
         break
@@ -192,7 +192,8 @@ optimizer.zero_grad()
 `clip_grad_norm_` wraps PyTorch's utility so it works with FSDP2 sharded
 parameters. Under pipeline parallelism `pipeline_step` also passes the PP
 group, so the norm covers every stage rather than this rank's own. The NaN
-detector returns `False` on NaN/Inf loss, and the loop zeroes the grads.
+detector returns `False` on a NaN/Inf loss or gradient norm, and the loop
+zeroes the grads.
 After `max_consecutive` NaN steps in a row the detector sets
 `should_rollback` and the loop stops; rolling back to an earlier
 checkpoint is manual (see
@@ -262,7 +263,7 @@ In order:
   step (section 7) runs this check too; the checkpoint above never
   saves such a step, so it writes its own emergency checkpoint, but
   only if an all-reduced check finds every rank's parameters finite.
-  After a bad update (a finite loss with non-finite gradients) they
+  After a bad update (an optimizer step that passed the NaN check) they
   are not, and the shutdown logs an ERROR and saves nothing (see
   [NaN detection § A shutdown after a bad update](../resilience/nan-detection.md#a-shutdown-after-a-bad-update)).
 
