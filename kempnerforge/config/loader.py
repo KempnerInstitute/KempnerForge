@@ -215,13 +215,33 @@ def _resolve_vlm_subclass(data: dict[str, Any]) -> type:
         ) from e
 
 
+def _check_vlm_arch_override(current: VLMConfig, arch: Any) -> None:
+    """Reject an ``arch`` override whose registered config class is not ``current``'s.
+
+    Applying a dict keeps the class the ``[vlm]`` section was built with, so such
+    an override would build one arch's blocks behind another arch's strategy.
+    """
+    target = _resolve_vlm_subclass({"arch": arch})
+    if target is not type(current):
+        raise ValueError(
+            f"vlm.arch={arch!r} cannot be applied as an override: the [vlm] section was "
+            f"built as {type(current).__name__} (arch {type(current).arch!r}), and an "
+            f'override keeps that class. Set arch = "{arch}" in the TOML\'s [vlm] '
+            "section instead."
+        )
+
+
 def _apply_dict_to_dataclass(dc: Any, data: dict[str, Any]) -> Any:
     """Recursively apply a dict to a dataclass, creating a new instance.
 
-    Raises ValueError on unknown keys to catch typos early.
+    Raises ValueError on unknown keys to catch typos early, and on an ``arch``
+    for a ``VLMConfig`` that needs a different config class than ``dc``'s.
     """
     if not is_dataclass(dc):
         return dc
+
+    if isinstance(dc, VLMConfig) and "arch" in data:
+        _check_vlm_arch_override(dc, data["arch"])
 
     dc_type = type(dc)
     type_hints = _get_type_hints(dc_type)
