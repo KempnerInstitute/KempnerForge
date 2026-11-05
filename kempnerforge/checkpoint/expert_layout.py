@@ -71,6 +71,23 @@ def _rows_after_ep(placements: Sequence[Placement], ep: int, name: str) -> tuple
     return tuple(result)
 
 
+def _root_mesh(mesh: DeviceMesh) -> DeviceMesh:
+    """The mesh that ``mesh`` was sliced from.
+
+    Raises:
+        ValueError: This torch's ``DeviceMesh`` has no ``_get_root_mesh``, which arrived
+            in torch 2.10 and which a packed expert-parallel checkpoint needs.
+    """
+    get_root = getattr(mesh, "_get_root_mesh", None)
+    if get_root is None:
+        raise ValueError(
+            "Checkpoints of packed expert-parallel layers need torch 2.10 or newer: torch "
+            f"{torch.__version__} has no DeviceMesh._get_root_mesh, which joins the EP mesh "
+            "with the FSDP mesh that places each rank's rows"
+        )
+    return get_root()
+
+
 def _check_placement(view: DTensor, tensor: torch.Tensor, moe: MoEMLP, name: str) -> None:
     """Refuse ``view`` unless DCP would save its rows where ``tensor``'s rows belong.
 
@@ -351,7 +368,7 @@ class ExpertLayout:
         DTensor can hold an equal mesh that is another object: DTensor and FSDP2 reuse the
         meshes of earlier, equal layouts.
         """
-        root = ep_mesh._get_root_mesh()
+        root = _root_mesh(ep_mesh)
         dims = mesh.mesh_dim_names or ()
         try:
             if not dims or "ep" in dims:
