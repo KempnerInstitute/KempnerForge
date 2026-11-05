@@ -604,16 +604,33 @@ class TestResume:
         assert scheduler.last_epoch == 0
 
     def test_leaving_out_the_optimizer_still_guards_the_scheduler(self, tmp_path):
-        """The scheduler's per-group base rates belong to the saved groups too."""
+        """The scheduler's per-group base rates belong to the saved groups too, so the load
+        stops before restoring anything from ``train_state.pt``."""
         self._save(tmp_path, {"head": 2.0})
         _, scheduler, manager = self._resume(tmp_path, {})
+        rng = torch.get_rng_state()
         with pytest.raises(ValueError, match="but this run uses"):
             manager.load(scheduler=scheduler, exclude_keys=["optimizer"])
+        assert scheduler.last_epoch == 0
+        assert torch.equal(torch.get_rng_state(), rng)
         model, _, manager = self._resume(tmp_path, {})
         before = [p.detach().clone() for p in model.parameters()]
         step, _, _ = manager.load(exclude_keys=["optimizer"])
         assert step == 3
         assert any(not torch.equal(b, p) for b, p in zip(before, model.parameters(), strict=True))
+
+    @pytest.mark.parametrize("train_state", ["without_scheduler", "absent"])
+    def test_no_scheduler_state_to_restore_goes_ahead(self, tmp_path, train_state):
+        """Without the optimizer, a load that restores no scheduler state is not checked."""
+        model, optimizer, scheduler = self._build("adamw", {"head": 2.0}, seed=0)
+        self._train(model, optimizer, scheduler, 3)
+        self._manager(tmp_path, model, optimizer, {"head": 2.0}).save(step=3)
+        if train_state == "absent":
+            (tmp_path / "step_3" / "train_state.pt").unlink()
+        _, scheduler, manager = self._resume(tmp_path, {})
+        step, _, _ = manager.load(scheduler=scheduler, exclude_keys=["optimizer"])
+        assert step == (3 if train_state == "without_scheduler" else 0)
+        assert scheduler.last_epoch == 0
 
     def test_optimizer_state_without_train_state_is_still_checked(self, tmp_path):
         (self._save(tmp_path, {"head": 2.0}) / "train_state.pt").unlink()
@@ -661,34 +678,56 @@ class TestResume:
             manager.load(scheduler=scheduler)
 
     @staticmethod
-    def _as_rank(monkeypatch, manager, rank, sent=None):
-        """Run ``manager`` as ``rank`` of two; ``sent`` is what rank 0's broadcast delivers."""
+    def _as_rank(monkeypatch, manager, rank, sent=()):
+        """Run ``manager`` as ``rank`` of two, the other rank adding nothing to the all-reduce.
+
+        ``sent`` lists what rank 0's broadcasts deliver to any other rank, in order. Returns the
+        collectives issued, in order.
+        """
         import kempnerforge.checkpoint.manager as mgr_mod
 
         calls: list[tuple] = []
+        delivered = iter(sent)
+
+        def all_reduce(flags, group=None):
+            calls.append(("all_reduce", group, flags.tolist()))
 
         def broadcast_object_list(objects, src):
             calls.append(("broadcast", src, list(objects)))
             if rank != 0:
-                objects[0] = sent
+                objects[0] = next(delivered)
+
+        monkeypatch.setattr(mgr_mod.dist, "is_initialized", lambda: True)
+        monkeypatch.setattr(mgr_mod.dist, "get_rank", lambda group=None: rank)
+        monkeypatch.setattr(mgr_mod.dist, "get_world_size", lambda group=None: 2)
+        monkeypatch.setattr(mgr_mod.dist, "all_reduce", all_reduce)
+        monkeypatch.setattr(mgr_mod.dist, "broadcast_object_list", broadcast_object_list)
+        manager._rank = rank
+        manager._sync_group = "GLOO_GROUP"
+        return calls
+
+    @staticmethod
+    def _stop_at_the_model_load(monkeypatch):
+        """Make the load stop, with ``_ReachedTheModel``, once it starts loading the model."""
+        import kempnerforge.checkpoint.manager as mgr_mod
 
         def reached(_model):
             raise _ReachedTheModel
 
-        monkeypatch.setattr(mgr_mod.dist, "is_initialized", lambda: True)
-        monkeypatch.setattr(mgr_mod.dist, "broadcast_object_list", broadcast_object_list)
         monkeypatch.setattr(mgr_mod, "get_model_state_dict", reached)
-        manager._rank = rank
-        return calls
 
     def test_rank_zero_reads_the_record_and_broadcasts_it(self, tmp_path, monkeypatch):
         self._save(tmp_path, {"head": 2.0})
         _, scheduler, manager = self._resume(tmp_path, {"head": 2.0})
         calls = self._as_rank(monkeypatch, manager, 0)
+        self._stop_at_the_model_load(monkeypatch)
         with pytest.raises(_ReachedTheModel):
-            manager.load(scheduler=scheduler, exclude_keys=["optimizer"])
+            manager.load(scheduler=scheduler)
         record = ({"head": 2.0}, {"head": ["output_head.*"]})
-        assert calls == [("broadcast", 0, [(record, None)])]
+        assert calls == [
+            ("all_reduce", "GLOO_GROUP", [[0, 0], [1, 0]]),
+            ("broadcast", 0, [(record, None)]),
+        ]
 
     def test_other_ranks_refuse_what_rank_zero_sent(self, tmp_path, monkeypatch):
         """A rank other than 0 never reads the record and raises on the one it receives."""
@@ -696,12 +735,12 @@ class TestResume:
         (tmp_path / "step_3" / "metadata.json").unlink()
         _, scheduler, manager = self._resume(tmp_path, {})
         record = ({"head": 2.0}, {"head": ["output_head.*"]})
-        self._as_rank(monkeypatch, manager, 1, sent=(record, None))
+        self._as_rank(monkeypatch, manager, 1, sent=[(record, None)])
         with pytest.raises(ValueError, match=r"lr_multipliers=\{'head': 2.0\}, but this run uses"):
-            manager.load(scheduler=scheduler, exclude_keys=["optimizer"])
-        self._as_rank(monkeypatch, manager, 1, sent=(None, "rank 0 could not read it"))
+            manager.load(scheduler=scheduler)
+        self._as_rank(monkeypatch, manager, 1, sent=[(None, "rank 0 could not read it")])
         with pytest.raises(ValueError, match="rank 0 could not read it"):
-            manager.load(scheduler=scheduler, exclude_keys=["optimizer"])
+            manager.load(scheduler=scheduler)
 
     def test_a_failure_on_rank_zero_is_broadcast(self, tmp_path, monkeypatch):
         self._save(tmp_path, {"head": 2.0})
@@ -713,5 +752,21 @@ class TestResume:
         monkeypatch.setattr("kempnerforge.checkpoint.manager._read_lr_multipliers", fail)
         calls = self._as_rank(monkeypatch, manager, 0)
         with pytest.raises(ValueError, match="Cannot check the lr_multipliers.*disk gone"):
-            manager.load(scheduler=scheduler, exclude_keys=["optimizer"])
-        assert calls == [("broadcast", 0, [(None, "OSError: disk gone")])]
+            manager.load(scheduler=scheduler)
+        assert calls[-1] == ("broadcast", 0, [(None, "OSError: disk gone")])
+
+    def test_every_rank_checks_the_scheduler_state_rank_zero_sent(self, tmp_path, monkeypatch):
+        """Each rank decides from the train state rank 0 broadcast, so all check or none do."""
+        step_dir = self._save(tmp_path, {"head": 2.0})
+        train_state = torch.load(step_dir / "train_state.pt", weights_only=False)
+        record = ({"head": 2.0}, {"head": ["output_head.*"]})
+        _, scheduler, manager = self._resume(tmp_path, {})
+        calls = self._as_rank(monkeypatch, manager, 1, sent=[True, train_state, (record, None)])
+        with pytest.raises(ValueError, match="but this run uses"):
+            manager.load(scheduler=scheduler, exclude_keys=["model", "optimizer"])
+        assert len(calls) == 3
+        assert scheduler.last_epoch == 0
+        without_scheduler = {k: v for k, v in train_state.items() if k != "scheduler"}
+        calls = self._as_rank(monkeypatch, manager, 1, sent=[True, without_scheduler])
+        assert manager.load(scheduler=scheduler, exclude_keys=["model", "optimizer"])[0] == 3
+        assert len(calls) == 2

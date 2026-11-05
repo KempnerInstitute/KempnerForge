@@ -1200,7 +1200,7 @@
             "load(path, scheduler, dataloader, exclude_keys, vlm_freeze_expected)",
             "_read_saved_keys(ckpt_dir, dcp_dir) (this rank's DCP keys; checks the scope only when an all-reduce on the gloo group finds optimizer state on some rank)",
             "_check_weight_decay_scope(ckpt_dir) (rank 0 reads the saved scope and broadcasts it; every rank refuses a mismatch)",
-            "_check_lr_multipliers(ckpt_dir, only_with_train_state) (rank 0 reads the saved lr_multipliers and their module patterns and broadcasts them; every rank refuses a mismatch when optimizer or scheduler state would load)",
+            "_check_lr_multipliers(ckpt_dir) (rank 0 reads the saved lr_multipliers and their module patterns and broadcasts them; every rank refuses a mismatch; load() calls it before loading optimizer state on any rank and before restoring a scheduler from train_state.pt)",
             "apply_dataloader_state(dataloader)",
             "_resolve_load_path(path)",
             "_cleanup()"

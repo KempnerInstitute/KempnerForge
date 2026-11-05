@@ -82,12 +82,13 @@ vision_encoder = 0.03     # 6e-6
 
 The multipliers and the patterns of their modules decide the param groups and their rates,
 which the saved optimizer state and the scheduler state are laid out for. The training entry
-records non-empty multipliers in every checkpoint's `metadata.json`, with those patterns,
-and a load that restores optimizer state on any rank, or scheduler state from
-`train_state.pt`, stops on every rank, before loading anything, when the checkpoint was
-saved with other multipliers or patterns. A checkpoint that records none was saved without
-any. Code that builds its own `CheckpointManager` gets the same record and check by passing
-`lr_multipliers` and `module_patterns`, and calls
+records non-empty multipliers in every checkpoint's `metadata.json`, with those patterns.
+A load of a checkpoint saved with other multipliers or patterns stops on every rank when it
+restores the checkpoint's optimizer state on any rank, before loading anything, or the
+scheduler state in its `train_state.pt`, before restoring anything from that file. A load
+that restores neither, such as one of the weights alone, goes ahead. A checkpoint that
+records none was saved without any. Code that builds its own `CheckpointManager` gets the
+same record and check by passing `lr_multipliers` and `module_patterns`, and calls
 `build_optimizer(model, config, module_patterns=...)` to resolve the module names.
 
 ## `adamw`

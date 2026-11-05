@@ -447,10 +447,11 @@ class CheckpointManager:
             scope with a fresh optimizer. A checkpoint that does not record a scope counts as
             ``"exclude_norms_and_biases"``.
         lr_multipliers: The run's ``optimizer.lr_multipliers``. When set, every save records
-            a non-empty one in ``metadata.json``, with the patterns of its modules, and a load
-            raises ``ValueError`` on every rank, before anything is loaded, when the checkpoint
-            was saved with other multipliers or patterns and the load restores its optimizer
-            state on any rank, or its ``train_state.pt`` into a scheduler. A checkpoint that
+            a non-empty one in ``metadata.json``, with the patterns of its modules. A load of a
+            checkpoint saved with other multipliers or patterns raises ``ValueError`` on every
+            rank when it restores the checkpoint's optimizer state on any rank, before anything
+            is loaded, or the scheduler state in its ``train_state.pt``, before anything from
+            that file is restored. A load that restores neither goes ahead. A checkpoint that
             records none counts as saved without multipliers.
         module_patterns: Module name to fnmatch patterns, such as ``VLMConfig.module_patterns``.
             Required for every module ``lr_multipliers`` lists.
@@ -961,8 +962,6 @@ class CheckpointManager:
         load_model = exclude_keys is None or "model" not in exclude_keys
         load_optim = exclude_keys is None or "optimizer" not in exclude_keys
 
-        if self._lr_multipliers is not None and scheduler is not None:
-            self._check_lr_multipliers(ckpt_dir, only_with_train_state=True)
         saved_keys = self._read_saved_keys(ckpt_dir, dcp_dir) if load_optim else {}
         fresh_optimizer = load_optim and not _holds_optimizer(saved_keys)
         if fresh_optimizer:
@@ -1029,6 +1028,12 @@ class CheckpointManager:
                 train_state = object_list[0]
 
             assert train_state is not None, "train_state broadcast failed"
+            if (
+                self._lr_multipliers is not None
+                and scheduler is not None
+                and "scheduler" in train_state
+            ):
+                self._check_lr_multipliers(ckpt_dir)
             if dataloader is None and "dataloader" in train_state:
                 self._pending_dataloader_state = train_state["dataloader"]
             step, tokens_seen, extra = restore_train_state(
@@ -1140,15 +1145,14 @@ class CheckpointManager:
                 f"a checkpoint there in place of load_path, optimizer state included."
             )
 
-    def _check_lr_multipliers(self, ckpt_dir: Path, *, only_with_train_state: bool = False) -> None:
+    def _check_lr_multipliers(self, ckpt_dir: Path) -> None:
         """Refuse a checkpoint saved with LR multipliers, or patterns of their modules, other
         than this manager's.
 
         The multipliers and the patterns decide the optimizer's param groups and their learning
         rates, which the saved optimizer state and the scheduler state in ``train_state.pt``
-        are laid out for. With ``only_with_train_state``, a checkpoint without
-        ``train_state.pt`` passes. Every rank calls this or none does: rank 0 reads the record
-        and broadcasts it, or whatever stopped it reading, so every rank raises or proceeds
+        are laid out for. Every rank calls this or none does: rank 0 reads the record and
+        broadcasts it, or whatever stopped it reading, so every rank raises or proceeds
         together.
 
         Raises:
@@ -1159,8 +1163,7 @@ class CheckpointManager:
         outcome = [(None, None)]
         if self._rank == 0 or not dist.is_initialized():
             try:
-                if not only_with_train_state or (ckpt_dir / _TRAIN_STATE_FILE).exists():
-                    outcome[0] = (_read_lr_multipliers(ckpt_dir), None)
+                outcome[0] = (_read_lr_multipliers(ckpt_dir), None)
             except ValueError as e:
                 outcome[0] = (None, str(e))
             except Exception as e:
@@ -1168,10 +1171,8 @@ class CheckpointManager:
         if dist.is_initialized():
             dist.broadcast_object_list(outcome, src=0)
         saved, error = outcome[0]
-        if error is not None:
-            raise ValueError(f"Cannot check the lr_multipliers of {ckpt_dir}: {error}")
         if saved is None:
-            return
+            raise ValueError(f"Cannot check the lr_multipliers of {ckpt_dir}: {error}")
         multipliers, patterns = saved
         if multipliers != self._lr_multipliers:
             change = (

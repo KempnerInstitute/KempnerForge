@@ -343,10 +343,8 @@ class Muon(torch.optim.Optimizer):
     the ratio of Muon's first group's current rate to that group's base rate.
 
     Args:
-        muon_params: Parameter groups for Muon (2D+ weights). A group's own
-            ``lr`` overrides ``lr``.
-        adam_params: Parameter groups for AdamW fallback (1D params). A
-            group's own ``lr`` overrides ``adam_lr``.
+        muon_params: Parameter groups for Muon (2D+ weights).
+        adam_params: Parameter groups for AdamW fallback (1D params).
         lr: Learning rate for Muon (2D weights).
         momentum: Momentum coefficient (default 0.95).
         weight_decay: Decoupled weight decay.
