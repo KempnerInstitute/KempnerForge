@@ -10,7 +10,7 @@ Entry points:
 
 - [`apply_expert_parallel(model, device_mesh)`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/distributed/expert_parallel.py)
   — prunes each `MoEMLP` to the local expert slice and stores EP
-  metadata (`ep_group`, `ep_world_size`, `local_expert_start`,
+  metadata (`ep_group`, `ep_mesh`, `ep_world_size`, `local_expert_start`,
   `num_local_experts`).
 - `ep_dispatch_and_compute(x, weights, indices, moe, ...)` — runs
   inside `MoEMLP.forward()` when `ep_world_size > 1` and implements the
@@ -99,6 +99,7 @@ for module in model.modules():
         module.experts = ModuleList([module.experts[i] for i in range(start, end)])
     module.ep_world_size = ep_size
     module.ep_group = ep_group
+    module.ep_mesh = ep_mesh
     module.local_expert_start = start
     module.num_local_experts = num_experts // ep_size
 ```
@@ -108,6 +109,46 @@ full router weights so it can make the routing decision locally
 before dispatch. The shared experts (`moe.shared_expert`, one MLP
 `moe_shared_experts` times the expert width) are also kept whole on
 every EP rank.
+
+## Checkpoints
+
+After the apply step every EP rank numbers its unpacked experts from 0
+and holds its own rows of each packed weight, so each rank's state dict
+names and shapes its experts as if they were the layer's only ones.
+DCP writes one copy of each name and offset, so saving those state
+dicts as they are would keep one rank's experts in place of all of
+them ([#202](https://github.com/KempnerInstitute/KempnerForge/issues/202)).
+`CheckpointManager` instead saves and loads through
+[`ExpertLayout`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/checkpoint/expert_layout.py),
+which places each rank's experts among all `num_experts`:
+
+- **Unpacked experts** take their global index. With 8 experts and
+  `ep=2`, rank 1's `experts.0` is saved as `experts.4`, with its
+  optimizer state. Each optimizer param group lists every rank's
+  experts, so the saved list is the same whichever rank writes it.
+- **Packed weights** (`up_w`, `down_w`, `gate_w`) and their optimizer
+  state are presented as a DTensor of all `num_experts` rows over the
+  FSDP mesh and `ep`: `ep` splits the rows, and FSDP shards each EP
+  rank's block of them. That is how FSDP2 lays out a parameter that
+  tensor parallelism shards on the same dimension, with FSDP's
+  `Shard(0)` becoming `_StridedShard(0, split_factor=ep)`.
+
+The presented tensors are views of each rank's own, so a save copies,
+gathers and sends nothing more than DCP writes, and each rank writes
+its own experts. The checkpoint is the one an `ep=1` run writes, with
+the same names and one tensor of `num_experts` rows per packed weight,
+so DCP reshards it like any other parameter: it loads at any `ep` that
+divides `num_experts`, under FSDP, HSDP or TP, and
+[`dcp-to-hf`](../checkpointing/hf-conversion.md) exports every expert.
+An `ep=1` checkpoint loads into an EP run the same way, each rank
+taking its own experts.
+
+A checkpoint saved with `ep>1` before this layout holds
+`num_experts / ep` experts per layer, one rank's, under every rank's
+names; the other experts' weights were never written. A load and
+`dcp-to-hf` both refuse it with an error that says how many experts it
+holds, instead of giving every rank one rank's experts or failing on a
+missing key.
 
 ## Composition with other parallelisms
 
