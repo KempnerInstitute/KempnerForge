@@ -1,9 +1,10 @@
 """Expert-parallel gradients, norms and clipping against one process, on CPU over gloo.
 
 Ranks that differ only in ``ep`` or ``tp`` share a DP rank and read the same rows. Each
-case builds the model with ``build_parallel_model``, runs a step on its DP rank's rows,
-and compares it with one process that runs every DP rank's rows through the unsharded
-model, loaded with the weights gathered from the parallel one.
+case builds the model with ``build_parallel_model`` and loads the unsharded model with
+the weights gathered from it. Most cases run a step on each DP rank's rows and compare it
+with one process that runs every DP rank's rows; the gradient-scale mode case compares
+forward passes on the same rows.
 """
 
 from __future__ import annotations
