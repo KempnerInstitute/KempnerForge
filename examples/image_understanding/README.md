@@ -4,8 +4,8 @@ The image-understanding recipe on the core `Transformer`: a **Joint-Decoder**
 VLM with a **SigLIP2** image encoder (`google/siglip2-so400m-patch16-512`), an
 **avgpool** connector and a **Qwen3-0.6B** backbone, trained in two stages
 (captioning on a frozen backbone, then an instruction mixture with everything
-training). Everything here is entry points, readers and their tests; `kempnerforge/` never imports it, so this directory
-can be deleted without touching the core.
+training). Everything here is entry points and their tests; `kempnerforge/`
+never imports it, so this directory can be deleted without touching the core.
 
 [`examples/vlm/`](../vlm/) stays the general VLM example: the four arches,
 video, and its evaluation CLI. This example is image-only and fixed to one
