@@ -68,11 +68,12 @@ Two fallbacks:
    `pp{k}/.metadata`, for `pp0` through `pp{n-1}` where `n` is
    `distributed.pp`, so a step that one stage never started saving is
    skipped instead of resumed with that stage loading an older step.
-   When no step has every stage, the newest one whose stage directories
-   are complete is resumed as before, after an error log, instead of the
-   run starting over. The stage layout records no degree, so a checkpoint
-   saved with another `distributed.pp` looks the same; resume needs the
-   degree it was saved with.
+   When no step has every stage, the newest one that is otherwise
+   complete (neither of the two kinds skipped above) is resumed as
+   before, after an error log, instead of the run starting over. The
+   stage layout records no degree, so a checkpoint saved with another
+   `distributed.pp` looks the same; resume needs the degree it was
+   saved with.
 
 If neither path finds anything, the function returns `None` and
 training starts from step 0, or from `checkpoint.load_path` when one is
