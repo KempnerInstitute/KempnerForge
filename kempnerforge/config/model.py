@@ -35,7 +35,8 @@ class ModelConfig:
 
     ``activation`` is an ``Activation`` member, or the name of an MLP a plugin registered
     under ``mlp``. Core's own ``mlp`` keys (``CORE_MLP_KEY_ACTIVATIONS``) are rejected in
-    favor of the activation that selects each.
+    favor of the activation that selects each, and a plugin's MLP is rejected with
+    ``num_experts > 0``: the MoE expert kernels compute core's SwiGLU or standard MLP.
     """
 
     dim: int = 4096
@@ -113,6 +114,13 @@ class ModelConfig:
             raise ValueError(
                 f"activation={self.activation!r} is the mlp registry key that "
                 f"activation={selects!r} selects; set activation={selects!r} instead"
+            )
+        if self.num_experts > 0 and self.activation not in Activation:
+            raise ValueError(
+                f"activation={self.activation!r} selects a plugin-registered MLP, which MoE "
+                f"experts do not support (num_experts={self.num_experts}): the expert kernels "
+                "compute core's SwiGLU or standard MLP from the expert weights. Use 'silu', "
+                "'gelu' or 'relu' with MoE, or set num_experts = 0"
             )
 
         if self.sdpa_backend not in ("auto", "flash", "efficient", "cudnn", "math"):
