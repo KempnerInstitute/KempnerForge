@@ -934,28 +934,49 @@ class _HeldLock:
         self._lock.release()
 
 
+class _PrunedDirs(list):
+    """Directories passed to ``shutil.rmtree``, in order; ``refused`` holds those NFS kept."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.refused: list[Path] = []
+
+    def still_present(self) -> list[Path]:
+        """The directories that exist although their removal went through."""
+        return [d for d in self if d not in self.refused and d.exists()]
+
+
 @pytest.fixture
-def pruned_dirs(tmp_path, monkeypatch) -> list[Path]:
-    """The directories under ``tmp_path`` passed to ``shutil.rmtree``, each removed best effort.
+def pruned_dirs(tmp_path, monkeypatch) -> _PrunedDirs:
+    """The directories under ``tmp_path`` passed to ``shutil.rmtree``, in order.
 
     ``tmp_path`` is the manager's base directory in the tests that use this; other paths
     go to ``shutil.rmtree`` unchanged. On NFS, removing a directory a moment after writing
-    into it can fail with ``ENOTEMPTY`` (an ``.nfsXXXX`` entry keeps it non-empty), so a
-    test asserts on this list rather than on what the filesystem still holds.
+    into it can fail with ``ENOTEMPTY`` or ``EBUSY`` (an ``.nfsXXXX`` entry keeps it
+    non-empty), so such a failure is noted in ``refused`` instead of raised, and a test
+    asserts on this list rather than on what the filesystem still holds. Any other error
+    is raised as usual.
     """
+    import errno
+
     from kempnerforge.checkpoint import manager as mgr_mod
 
     rmtree = mgr_mod.shutil.rmtree
-    removed: list[Path] = []
+    pruned = _PrunedDirs()
 
     def record(path, *args, **kwargs):
         if not Path(path).is_relative_to(tmp_path):
             return rmtree(path, *args, **kwargs)
-        removed.append(Path(path))
-        rmtree(path, ignore_errors=True)
+        pruned.append(Path(path))
+        try:
+            rmtree(path, *args, **kwargs)
+        except OSError as e:
+            if e.errno not in (errno.ENOTEMPTY, errno.EBUSY):
+                raise
+            pruned.refused.append(Path(path))
 
     monkeypatch.setattr(mgr_mod.shutil, "rmtree", record)
-    return removed
+    return pruned
 
 
 class TestSaveCheckpointRegistration:
