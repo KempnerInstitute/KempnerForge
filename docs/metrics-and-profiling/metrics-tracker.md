@@ -99,17 +99,22 @@ starts at `step = 1`.
 ## Stdout format
 
 ```
-[step 1000] loss=2.3400 | lr=3.00e-04 | grad_norm=1.250 | tok/s=125,000 | mfu=52.3% | mem=71.2/80GB | step_time=1.25s
+2026-11-04 14:03:12.345 [rank 0] INFO     [step 1000] loss=2.3400 | lr=3.00e-04 | grad_norm=1.250 | tok/s=125,000 | mfu=52.3% | mem=71.2/80GB | step_time=1.25s
 ```
 
-Produced by `format_metrics(step, {...})` from
+The part from `[step 1000]` on is produced by
+`format_metrics(step, {...})` from
 [`kempnerforge/metrics/logger.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/metrics/logger.py).
 Numbers use `_format_number`: int gets k/M/B suffix, float gets scientific
 notation below 0.01 or above 1e6, otherwise 4 decimals.
 
-The same logger writes every other `logger.info` in the framework — with
-a `[rank N] LEVEL   ` prefix and ANSI color if `stdout.isatty()` and
-`NO_COLOR` isn't set (see [`_RankFormatter`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/metrics/logger.py)).
+The same logger writes every other `logger.info` in the framework, and
+each line starts with the local time to the millisecond
+(`YYYY-MM-DD HH:MM:SS.mmm`), `[rank N]` and the level. With ANSI color,
+used if `stdout.isatty()` and `NO_COLOR` isn't set, the time and rank
+are dimmed and the level is colored. A record logged with
+`logger.exception(...)` or `stack_info=True` prints its traceback or
+stack on the lines below it (see [`_RankFormatter`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/metrics/logger.py)).
 
 ## Backend dispatch
 
@@ -234,8 +239,8 @@ logger.info("starting distributed init")
 
 Returns a `logging.Logger` named `kempnerforge.<name>`. On first call,
 configures the root `kempnerforge` logger with a `_RankFormatter` (adds
-`[rank N]` + colored level) and a `_RankFilter` (drops records from
-non-zero ranks by default).
+the local time, `[rank N]` and the colored level, and prints any traceback)
+and a `_RankFilter` (drops records from non-zero ranks by default).
 
 Override rank filtering with `get_logger(__name__, rank_zero_only=False)`
 when you genuinely want every rank to log — e.g. for distributed-init
