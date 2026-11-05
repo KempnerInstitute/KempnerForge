@@ -55,6 +55,11 @@ uv run torchrun --nproc_per_node=4 scripts/train.py configs/train/debug.toml \
   --checkpoint.dir=/tmp/kf_quickstart/step4
 ```
 
+Raw `.bin` shards carry no dtype. KempnerForge takes it from the
+`metadata.yaml` that tatm writes beside them, or from
+`--data.token_dtype=uint16` / `uint32`; see
+[Prepare tokenized data](../how-to/prepare-tokenized-data.md).
+
 Or stream from HuggingFace:
 
 ```bash

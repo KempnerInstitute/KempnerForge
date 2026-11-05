@@ -17,30 +17,30 @@ logger = logging.getLogger(__name__)
 
 
 def get_dp_info(device_mesh: DeviceMesh | None) -> tuple[int, int]:
-    """Get (dp_rank, dp_size) from the device mesh, accounting for PP/TP.
+    """Get (dp_rank, dp_size) from the device mesh, accounting for PP/TP/EP.
 
-    Handles all DeviceMesh configurations: HSDP (dp_replicate + dp_shard),
-    pure FSDP (dp_shard only), replicate-only, or no mesh (single GPU).
+    Only ``dp_replicate`` and ``dp_shard`` split the data, so ranks that differ
+    only in ``pp``, ``ep`` or ``tp`` share a DP rank. Under HSDP the DP rank is
+    the row-major index of the rank's ``(dp_replicate, dp_shard)`` coordinates
+    and the DP size is their product; no process group is created.
 
     Args:
         device_mesh: Full DeviceMesh, or None for single-GPU.
 
     Returns:
-        Tuple of (dp_rank, dp_world_size).
+        Tuple of (dp_rank, dp_world_size); ``(0, 1)`` when there is no mesh or
+        the mesh has no DP dimension.
     """
     if device_mesh is None:
         return 0, 1
     dim_names = device_mesh.mesh_dim_names
-    if "dp_shard" in dim_names and "dp_replicate" in dim_names:  # type: ignore[reportOperatorIssue]
-        dp_mesh = device_mesh["dp_replicate", "dp_shard"]
-        return dp_mesh.get_local_rank(), dp_mesh.size()
-    elif "dp_shard" in dim_names:  # type: ignore[reportOperatorIssue]
-        dp_mesh = device_mesh["dp_shard"]
-        return dp_mesh.get_local_rank(), dp_mesh.size()
-    elif "dp_replicate" in dim_names:  # type: ignore[reportOperatorIssue]
-        dp_mesh = device_mesh["dp_replicate"]
-        return dp_mesh.get_local_rank(), dp_mesh.size()
-    return 0, 1
+    dp_rank, dp_size = 0, 1
+    for name in ("dp_replicate", "dp_shard"):
+        if name in dim_names:  # type: ignore[reportOperatorIssue]
+            size = device_mesh[name].size()
+            dp_rank = dp_rank * size + device_mesh.get_local_rank(name)
+            dp_size *= size
+    return dp_rank, dp_size
 
 
 def clip_grad_norm_(

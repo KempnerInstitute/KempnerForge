@@ -38,6 +38,45 @@ frame of a clip. It applies to the training build
 (`build_parallel_model`); `build_vlm_wrapper` builds an unsharded model
 and leaves every dtype to its caller.
 
+## HSDP
+
+Both wraps use `get_dp_mesh(device_mesh)`. With `dp_replicate > 1` and
+a `dp_shard` dimension, that is the 2D mesh
+`mesh["dp_replicate", "dp_shard"]`, and `fully_shard` runs hybrid
+sharding (HSDP):
+
+- Without TP or EP, each parameter is a DTensor placed
+  `(Replicate(), Shard(0))`: sharded
+  across the ranks of a `dp_shard` group, which together hold one full
+  copy of the model, and replicated across the `dp_shard` groups, so the
+  ranks of a `dp_replicate` group hold the same shard. On a 2 × 4 mesh,
+  ranks 0 to 3 hold one copy and ranks 4 to 7 another, and ranks 0 and
+  4 hold the same shard.
+- In backward, gradients are reduce-scattered within each `dp_shard`
+  group, then all-reduced within each `dp_replicate` group, between the
+  ranks that hold the same shard, and averaged over all
+  `dp_replicate × dp_shard` ranks.
+- Each of those ranks reads its own data: `get_dp_info` gives
+  `dp_size = dp_replicate × dp_shard` (see
+  [Device mesh § Extracting sub-meshes](device-mesh.md#extracting-sub-meshes)).
+- DCP writes each shard once, not once per group, and an HSDP
+  checkpoint loads under a different `dp_replicate` and `dp_shard` split
+  (see [Resharding](../checkpointing/resharding.md)).
+
+When `dp_shard` resolves to 1, `init_distributed` still keeps a size-1
+`dp_shard` if `tp > 1` or `ep > 1`, so `dp_replicate > 1` with TP or EP
+takes this path too, with one-rank `dp_shard` groups: the ranks of a
+`dp_replicate` group hold the same parameters, and their gradients are
+all-reduced over that group.
+A parameter TP has sharded keeps its `tp` placement as a third entry,
+for example `(Replicate(), Shard(0), Shard(1))`, so each rank holds its
+TP slice rather than a full copy.
+When `dp_shard` resolves to more than 1, the mesh has a `dp_shard`
+dimension of that size: `dp_replicate=2` with `tp=2` on 8 GPUs builds a
+`(dp_replicate, dp_shard, tp) = (2, 2, 2)` mesh, whose `dp_shard`
+groups have two ranks.
+No shipped config sets `dp_replicate > 1`.
+
 ## Mixed precision policy
 
 ```python

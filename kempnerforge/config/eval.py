@@ -4,16 +4,23 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from kempnerforge.config.data import check_token_dtype
+
 
 @dataclass
 class EvalConfig:
-    """Evaluation pipeline settings (disabled by default)."""
+    """Evaluation pipeline settings (disabled by default).
+
+    ``token_dtype`` is the integer type of the raw ``.bin`` eval shards, as
+    ``DataConfig.token_dtype`` is for the training shards.
+    """
 
     enabled: bool = False
     interval: int = 1000
     steps: int = 50
     dataset_path: str = ""
     file_pattern: str = "*.npy"
+    token_dtype: str = ""
     hf_dataset_name: str | None = None
     hf_dataset_config: str | None = None
     hf_dataset_split: str = "validation"
@@ -23,3 +30,4 @@ class EvalConfig:
             raise ValueError("eval interval must be positive")
         if self.steps <= 0:
             raise ValueError("eval steps must be positive")
+        check_token_dtype(self.token_dtype, "eval.token_dtype")
