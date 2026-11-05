@@ -105,18 +105,20 @@ for module in model.modules():
 
 The router (`moe.router`) is **not** sharded — every rank keeps the
 full router weights so it can make the routing decision locally
-before dispatch. Shared experts (`moe.shared_expert`) are also kept
-on every rank.
+before dispatch. The shared experts (`moe.shared_expert`, one MLP
+`moe_shared_experts` times the expert width) are also kept whole on
+every EP rank.
 
 ## Composition with other parallelisms
 
 EP runs after TP and before FSDP2 — see
 [Parallelism order](../architecture/parallelism-order.md).
 
-- **EP + TP**: TP shards the non-MoE Linears (attention q/k/v/o and
-  shared-expert gate/up/down) along the `tp` mesh dim. EP shards the
-  routed experts along `ep`. Dense TP layers are untouched by
-  `apply_expert_parallel`.
+- **EP + TP**: TP shards attention q/k/v/o, and the MLPs of dense
+  layers, along the `tp` mesh dim. EP shards the routed experts along
+  `ep`. The TP plan leaves an MoE layer's whole `mlp` alone, so its
+  router and shared expert stay replicated on every TP rank. Dense TP
+  layers are untouched by `apply_expert_parallel`.
 - **EP + FSDP2**: FSDP2 wraps the MoE layer's `attention` and `mlp`
   **separately** (per-sub-module wrapping) rather than the whole
   block — see [FSDP2 § EP-MoE](fsdp2.md#ep-moe-per-sub-module-wrapping).
@@ -127,6 +129,13 @@ EP runs after TP and before FSDP2 — see
   (`torch._grouped_mm`) doesn't go through `Float8Linear.forward`, so
   FP8 applied there is ineffective and adds surprise failures.
   See [FP8 § Exclusion rules](fp8.md#exclusion-rules).
+- **EP + VLM**: `JobConfig.validate` rejects `ep > 1` for
+  `vlm.arch = "mot"`, whose blocks the per-sub-module wrap above cannot
+  take (it expects `layer.attention` and `layer.mlp`, and `MoTBlock` has
+  `attn` and per-modality experts), and for `vlm.arch = "moma"`, whose
+  per-modality expert groups are not `MoEMLP`s, so `apply_expert_parallel`
+  would leave every expert on every rank. See
+  [Validation rules § Expert parallel](../configuration/validation-rules.md#expert-parallel).
 
 ## Config
 
