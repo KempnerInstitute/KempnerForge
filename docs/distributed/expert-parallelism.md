@@ -165,6 +165,12 @@ names; the other experts' weights were never written. A load and
 holds, instead of giving every rank one rank's experts or failing on a
 missing key.
 
+Do not resume an EP checkpoint saved this way with an older
+KempnerForge at `ep>1`: it loads an unpacked checkpoint without error
+but gives every EP rank the first rank's experts, and it fails on a
+packed one. An older version loads such a checkpoint correctly at
+`ep=1`.
+
 ## Composition with other parallelisms
 
 EP runs after TP and before FSDP2 — see
