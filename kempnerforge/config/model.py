@@ -87,6 +87,12 @@ class ModelConfig:
                 f"dim ({self.dim}) must be divisible by n_heads ({self.n_heads}) "
                 "unless head_dim_override is set"
             )
+        if self.head_dim_override == 0 and (self.dim // self.n_heads) % 2:
+            raise ValueError(
+                f"dim ({self.dim}) // n_heads ({self.n_heads}) gives an odd head_dim "
+                f"({self.dim // self.n_heads}), and rotary embeddings need an even one; "
+                "change dim or n_heads, or set an even head_dim_override"
+            )
         if self.n_heads % self.n_kv_heads != 0:
             raise ValueError(
                 f"n_heads ({self.n_heads}) must be divisible by n_kv_heads ({self.n_kv_heads})"
