@@ -272,6 +272,12 @@ class TestTrainConfig:
         with pytest.raises(ValueError, match="'fp16' is not supported: .*no loss scaling"):
             _ = config.param_dtype
 
+    def test_tf32_defaults_off(self) -> None:
+        assert TrainConfig().tf32 is False
+
+    def test_tf32_from_cli(self) -> None:
+        assert load_config(cli_args=["--train.tf32=true"]).train.tf32 is True
+
     def test_fp32_cross_entropy_defaults_off(self) -> None:
         assert TrainConfig().fp32_cross_entropy is False
 
@@ -520,6 +526,46 @@ class TestDataConfig:
     def test_rejects_zero_prefetch(self):
         with pytest.raises(ValueError, match="prefetch_factor must be >= 1"):
             DataConfig(prefetch_factor=0)
+
+    def test_token_dtype_defaults_to_empty(self):
+        assert DataConfig().token_dtype == ""
+
+    @pytest.mark.parametrize("dtype", ["uint16", "uint32"])
+    def test_token_dtype_accepts_uint16_and_uint32(self, dtype):
+        assert DataConfig(token_dtype=dtype).token_dtype == dtype
+
+    @pytest.mark.parametrize("dtype", ["int32", "uint8", "u2", "UINT16"])
+    def test_token_dtype_rejects_anything_else(self, dtype):
+        with pytest.raises(ValueError, match="data.token_dtype must be 'uint16' or 'uint32'"):
+            DataConfig(token_dtype=dtype)
+
+    def test_token_dtypes_load_from_toml_and_cli(self, tmp_path):
+        toml = tmp_path / "data.toml"
+        toml.write_text(
+            '[data]\ntoken_dtype = "uint16"\n\n'
+            '[[data.datasets]]\npath = "/d/a"\ntoken_dtype = "uint32"\n\n'
+            '[eval]\ntoken_dtype = "uint16"\n'
+        )
+        config = load_config(str(toml), cli_args=["--eval.token_dtype=uint32"])
+        assert config.data.token_dtype == "uint16"
+        assert config.data.datasets[0].token_dtype == "uint32"
+        assert config.eval.token_dtype == "uint32"
+
+    def test_invalid_token_dtype_override_fails_at_load(self):
+        with pytest.raises(ValueError, match="data.token_dtype must be 'uint16' or 'uint32'"):
+            load_config(cli_args=["--data.token_dtype=int32"])
+
+    @pytest.mark.parametrize("value", ["0", "False", "None"])
+    def test_falsy_non_string_override_fails_at_load(self, value):
+        """The loader keeps ``0``, ``False`` and ``None`` as non-strings, so they fail too."""
+        with pytest.raises(ValueError, match="data.token_dtype must be 'uint16' or 'uint32'"):
+            load_config(cli_args=[f"--data.token_dtype={value}"])
+
+    def test_falsy_toml_value_fails_at_load(self, tmp_path):
+        toml = tmp_path / "data.toml"
+        toml.write_text("[data]\ntoken_dtype = false\n")
+        with pytest.raises(ValueError, match="data.token_dtype must be 'uint16' or 'uint32'"):
+            load_config(str(toml))
 
 
 class TestMetricsConfig:
@@ -1635,6 +1681,13 @@ class TestEvalConfig:
     def test_rejects_zero_steps(self):
         with pytest.raises(ValueError, match="eval steps must be positive"):
             EvalConfig(steps=0)
+
+    def test_token_dtype_defaults_to_empty(self):
+        assert EvalConfig().token_dtype == ""
+
+    def test_token_dtype_rejects_anything_else(self):
+        with pytest.raises(ValueError, match="eval.token_dtype must be 'uint16' or 'uint32'"):
+            EvalConfig(token_dtype="int64")
 
     def test_validation_requires_data_source(self):
         config = JobConfig()
