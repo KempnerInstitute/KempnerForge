@@ -1,9 +1,10 @@
 # Image-understanding example
 
-The multimodal project's image-understanding recipe on the core `Transformer`:
-a **Joint-Decoder** VLM with a **SigLIP2** image encoder
-(`google/siglip2-so400m-patch16-512`), an **avgpool** connector and a
-**Qwen3-0.6B** backbone, trained in two stages. Everything here is
+The image-understanding recipe on the core `Transformer`: a **Joint-Decoder**
+VLM with a **SigLIP2** image encoder (`google/siglip2-so400m-patch16-512`), an
+**avgpool** connector and a **Qwen3-0.6B** backbone, trained in two stages
+(captioning on a frozen backbone, then an instruction mixture with everything
+training), as specified by #262 and #428. Everything here is
 configuration, entry points and their tests; `kempnerforge/` never imports it,
 so this directory can be deleted without touching the core.
 
@@ -40,9 +41,12 @@ pooled 2 × 2 to 256 visual tokens, plus `max_text_len = 256` text tokens, so
 (stage 1) and 512 (stage 2) on 16 GPUs; on fewer GPUs raise
 `train.grad_accum_steps` to keep it.
 
-Paths in these configs are placeholders (`dir = "path-to-output-dir"`) and the
-dataset is a 30-image COCO stand-in, so a fresh clone validates.
-Point them at your own data and output directories, or override on the CLI.
+Paths in these configs are placeholders (`dir = "path-to-output-dir"`), and
+`data.hf_dataset_name` names `sayakpaul/coco-30-val-2014`, 30,000 COCO
+image-caption pairs (about 4.9 GB on first download), as a stand-in for the
+recipe's sources until its readers land. A fresh clone validates the configs
+without downloading anything. Point them at your own data and output
+directories, or override on the CLI.
 
 ## Run it
 
@@ -81,9 +85,12 @@ the image, the unit the other PixMo sources use.
 ## Start from the pretrained backbone
 
 Stage 1 warm-starts from a checkpoint that holds the pretrained Qwen3-0.6B
-backbone and the pretrained SigLIP2 encoder, with a fresh connector. Build it
-once with the converter the VLM example ships; it reads the stage-1 config, so
-the written checkpoint matches this example's model exactly:
+backbone and the pretrained SigLIP2 encoder, with a fresh connector. The
+presets untie the output head (`tie_embeddings = false`); the converter starts
+it as a copy of the tied source's embedding, so it trains separately from
+stage 1 on. Build the checkpoint once with the converter the VLM example
+ships; it reads the stage-1 config, so the written checkpoint matches this
+example's model exactly:
 
 ```bash
 uv run python examples/vlm/scripts/convert_hf_backbone.py \
@@ -92,9 +99,12 @@ uv run python examples/vlm/scripts/convert_hf_backbone.py \
     --out /your/init/checkpoint
 ```
 
-Then pass it as `--checkpoint.load_path`. The config's
-`exclude_from_loading = ["optimizer"]` makes the load weights-only. Stage 2
-loads a stage-1 checkpoint the same way.
+Then pass it as `--checkpoint.load_path`. The presets set
+`exclude_from_loading = ["optimizer", "train_state"]`, so only the weights
+load: the step, LR schedule, data position and RNG start fresh, and the stage's
+own freeze specs apply. Stage 2 loads a stage-1 checkpoint directory the same
+way, so its 6,000-step warmup starts from step 0 rather than resuming stage 1's
+step and schedule.
 
 ## Roadmap
 
@@ -103,7 +113,7 @@ change in this directory (or in core where the issue says so).
 
 | Feature | Tracked in |
 | --- | --- |
-| Training sources (COCO, VQAv2, TextVQA, DocVQA, ChartQA, PixMo, FineVision, DataComp), chat-template rendering, answer-only loss, the mixture loader | [#428](https://github.com/KempnerInstitute/KempnerForge/issues/428) |
+| Training sources (COCO, VQAv2, TextVQA, DocVQA, ChartQA, PixMo, FineVision, DataComp), chat-template rendering with the loss on the assistant turns only, the mixture loader | [#428](https://github.com/KempnerInstitute/KempnerForge/issues/428) |
 | Typed stage contract and pinned source manifest | [#262](https://github.com/KempnerInstitute/KempnerForge/issues/262) |
 | Packing image-text documents into one sequence | [#432](https://github.com/KempnerInstitute/KempnerForge/issues/432) |
 | Text-only documents in image-text batches | [#433](https://github.com/KempnerInstitute/KempnerForge/issues/433) |
@@ -111,12 +121,11 @@ change in this directory (or in core where the issue says so).
 | Tiling into a global view and a 3 × 3 grid of crops (stage 2) | [#435](https://github.com/KempnerInstitute/KempnerForge/issues/435) |
 | Per-module learning rates and schedules | [#439](https://github.com/KempnerInstitute/KempnerForge/issues/439) |
 | Vision-encoder precision separate from the backbone's | [#438](https://github.com/KempnerInstitute/KempnerForge/issues/438) |
-| Untied output head from the tied Qwen3 checkpoint | [#441](https://github.com/KempnerInstitute/KempnerForge/issues/441) |
 | Evaluation parity: chat-template prompts, image attention, the recipe's scorers | [#443](https://github.com/KempnerInstitute/KempnerForge/issues/443) |
 | Run-comparison metrics: documents seen, token counts, MFU with the encoder | [#444](https://github.com/KempnerInstitute/KempnerForge/issues/444) |
 
 Until those land, the stage presets train on one 512 px view per image with a
-single learning rate, the plain caption loss and the tied output head.
+single learning rate and the plain caption loss.
 
 ## Tests
 

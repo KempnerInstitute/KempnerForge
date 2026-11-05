@@ -170,17 +170,17 @@ exclude_from_loading = ["optimizer"]
 ```
 
 The script writes nothing when the config disagrees with the source's
-`config.json` (shapes, RoPE base, norm eps, embedding tying, activation), when
-the source declares parameters the transformer has no place for, when a weight
-has no counterpart or the wrong shape, or when `--out` is non-empty or inside
-the source. A sharded source is read through its `model.safetensors.index.json`
-and refused when the files on disk do not match it. The normalisation epsilon is
-checked against the norms the built model actually runs, not only against the
-config field, so a backbone whose attention norms normalise with a different
-epsilon than the source is refused rather than converted. The source's
-`model_type` must be one the script supports (`SUPPORTED_MODEL_TYPES`).
-`--seed` (default `[train].seed`) seeds every freshly initialised weight, so a
-rerun writes identical weights.
+`config.json` (shapes, RoPE base, norm eps, activation), when the config ties
+its output head and the source does not, when the source declares parameters
+the transformer has no place for, when a weight has no counterpart or the wrong
+shape, or when `--out` is non-empty or inside the source. A sharded source is
+read through its `model.safetensors.index.json` and refused when the files on
+disk do not match it. The normalisation epsilon is checked against the norms
+the built model actually runs, not only against the config field, so a backbone
+whose attention norms normalise with a different epsilon than the source is
+refused rather than converted. The source's `model_type` must be one the script
+supports (`SUPPORTED_MODEL_TYPES`). `--seed` (default `[train].seed`) seeds
+every freshly initialised weight, so a rerun writes identical weights.
 
 ## Evaluation
 
@@ -267,14 +267,14 @@ When the checkpoint's `metadata.json` records an MLflow run (its `tracking` bloc
 `eval.py` appends the scores to that run after scoring, next to the training curves.
 Each score becomes the metric `eval/<task>_<metric>` at the checkpoint's step
 (`_<filter>` follows when lmms-eval reports a filter other than `none`), through
-`kempnerforge.metrics.publish`. A summary table (one row per task and metric, with the
+`kempnerforge.metrics.mlflow.publish`. A summary table (one row per task and metric, with the
 standard error and sample count) and `scores.json` are uploaded to the same run under
 `eval/step_<N>/<UTC timestamp>/`, one directory per evaluation, so repeated or concurrent
 evaluations never overwrite each other. No run is started, ended or edited.
 
-Publishing is on by default and `--no-publish` turns it off. It needs the `mlflow` and
-`eval` dependency groups (`uv sync --group mlflow --group eval`, plus `video` for video
-tasks) and credentials for the run's tracking server, by any of the routes in
+Publishing is on by default and `--no-publish` turns it off. It needs the `eval` dependency
+group (`uv sync --group eval`, plus `video` for video tasks; the MLflow client installs with
+KempnerForge) and credentials for the run's tracking server, by any of the routes in
 [MLflow backend § Authentication](../../docs/metrics-and-profiling/mlflow.md#authentication).
 Publishing authenticates the way training does, so a route that trains also publishes, except
 `user:token@` credentials in the tracking URI, which checkpoints never record.
@@ -290,7 +290,7 @@ of the uploaded directory, and no later evaluation replaces it. If that location
 writable the file goes to the system temporary directory, and if no file can be written
 nothing is published and the scores are printed in the log. A refusal (a checkpoint
 without a `tracking` block, say), a broken or missing dependency, or a server failure is
-logged as a warning together with the `python -m kempnerforge.metrics.publish` command that
+logged as a warning together with the `python -m kempnerforge.metrics.mlflow.publish` command that
 publishes the metrics later; that command sends the metrics only, not the table or
 `scores.json`. A `--limit` run publishes like any other, so pass `--no-publish` for smoke
 tests.

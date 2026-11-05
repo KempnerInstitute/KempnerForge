@@ -30,7 +30,7 @@ the distributed mechanics (all-to-all, expert parallelism) live under
 | `moe_top_k` | `2` | Number of experts each token routes to |
 | `moe_router` | `"softmax_topk"` | Router type (see [Routers](routers.md)) |
 | `moe_frequency` | `1` | Every Nth layer is MoE; others are dense |
-| `moe_shared_experts` | `0` | Dense expert applied to every token on top of routed |
+| `moe_shared_experts` | `0` | Number of experts applied to every token on top of routed, built as one MLP that many times the expert width (see [Routers § Shared experts](routers.md#shared-experts)) |
 | `moe_capacity_factor` | `0.0` | `>0` caps tokens per expert (see [Capacity and dispatch](capacity-and-dispatch.md)) |
 | `moe_aux_loss_weight` | `0.01` | Coefficient on `aux_loss` added to main loss |
 | `moe_packed_experts` | `false` | Packed weight tensors instead of `ModuleList` |
@@ -57,10 +57,12 @@ this section.
 - **MoE + TP on experts**: not supported. Expert weights stay replicated
   across the TP group.
 - **MoE + PP**: not supported — the config validator raises in
-  `JobConfig.__post_init__`.
+  `JobConfig.validate`.
 - **MoE + EP**: supported. `num_experts` must be divisible by
-  `ep_world_size`. See
-  [Expert parallelism](../distributed/expert-parallelism.md).
+  `ep_world_size`, and VLMs with `vlm.arch = "mot"` or `"moma"` are
+  rejected (see
+  [Validation rules § Expert parallel](../configuration/validation-rules.md#expert-parallel)).
+  See [Expert parallelism](../distributed/expert-parallelism.md).
 - **MoE + FP8**: supported with exclusions. Experts, shared expert, and
   router gate stay bf16 — [MoE + FP8](moe-fp8.md).
 

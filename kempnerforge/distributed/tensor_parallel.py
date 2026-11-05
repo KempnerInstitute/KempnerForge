@@ -23,7 +23,8 @@ scattering, inflating the global sequence dimension. The first block's
 SequenceParallel norm naturally handles the Replicate → Shard(1) transition.
 
 SequenceParallel is disabled when tie_embeddings=True (ColwiseParallel on
-the output head imposes incompatible sharding on the shared weight).
+the output head imposes incompatible sharding on the shared weight) and for
+MoE models; ``ModelConfig.tp_sequence_parallel`` holds the condition.
 
 Pipeline parallel stages use basic TP (no SequenceParallel) to avoid
 DTensors at PP stage boundaries.
@@ -106,7 +107,8 @@ def apply_tensor_parallel(
 
     PP stages use basic TP without SequenceParallel to avoid DTensors at
     stage boundaries. SequenceParallel is also disabled when weights are
-    tied.
+    tied or the model is MoE, as ``ModelConfig.tp_sequence_parallel`` says;
+    a config without that property gets the same tie and MoE rule.
 
     Args:
         model: Transformer or PipelineStageModule to parallelize.
@@ -117,10 +119,13 @@ def apply_tensor_parallel(
         logger.warning("No 'tp' dimension in DeviceMesh — skipping tensor parallelism")
         return
 
-    tie = getattr(getattr(model, "config", None), "tie_embeddings", False)
+    config = getattr(model, "config", None)
+    tie = getattr(config, "tie_embeddings", False)
     is_pp_stage = hasattr(model, "stage_id")
-    is_moe = getattr(getattr(model, "config", None), "is_moe", False)
-    seq_parallel = not is_pp_stage and not tie and not is_moe
+    is_moe = getattr(config, "is_moe", False)
+    seq_parallel = not is_pp_stage and getattr(
+        config, "tp_sequence_parallel", not tie and not is_moe
+    )
 
     if seq_parallel and getattr(model, "token_embedding", None) is not None:
         from torch.distributed.tensor import DTensor
