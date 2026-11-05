@@ -25,7 +25,7 @@ from typing import Any, Protocol, TypeGuard, cast
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
-from torch.distributed.checkpoint import DefaultLoadPlanner
+from torch.distributed.checkpoint import DefaultLoadPlanner, DefaultSavePlanner
 from torch.distributed.checkpoint.metadata import STATE_DICT_TYPE, Metadata
 from torch.distributed.checkpoint.state_dict import (
     get_model_state_dict,
@@ -707,6 +707,13 @@ class CheckpointManager:
     ) -> None:
         """Save a checkpoint at the given step.
 
+        Under expert parallelism each EP rank holds a copy of every weight outside the
+        routed experts, and the copies can drift apart on GPU (#482). DCP writes each
+        chunk that several ranks hold from one of them, by default the one with the least
+        to write so far, which could join chunks of different copies into one tensor. An
+        EP save writes each such chunk from its lowest rank instead, so the checkpoint
+        holds one EP rank's copy whole.
+
         Args:
             step: Current training step.
             tokens_seen: Total tokens processed.
@@ -726,12 +733,15 @@ class CheckpointManager:
             optim_state = get_optimizer_state_dict(self.model, self.checkpointed_optimizers)
             dcp_state["optimizer"] = optim_state
             dcp_state[_NEVER_STEPPED_KEY] = _never_stepped_record(optim_state)
-        dcp_state, _ = self._present_experts(dcp_state)
+        dcp_state, layout = self._present_experts(dcp_state)
+        save = self._async_ckpt.save
+        if layout is not None:
+            save = partial(save, planner=DefaultSavePlanner(dedup_save_to_lowest_rank=True))
         flush_error = _attempt(self._async_ckpt.wait)
         error = flush_error
         if flush_error is None:
             error = _attempt(
-                self._async_ckpt.save,
+                save,
                 dcp_state,
                 checkpoint_id=str(dcp_dir),
                 process_group=self._process_group,
