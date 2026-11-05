@@ -216,6 +216,32 @@ def _save(rank, world, port, names, sizes, overrides, root, async_mode) -> None:
         dist.destroy_process_group()
 
 
+def _load(rank, world, port, names, sizes, overrides, step_dir, out) -> None:
+    """Load ``step_dir`` at this layout; rank 0 writes what every rank's model then holds."""
+    _init(rank, world, port)
+    try:
+        mesh = init_device_mesh("cpu", sizes, mesh_dim_names=names)
+        model, optimizer = _build(mesh, _config(overrides), seed=1)
+        CheckpointManager(CheckpointConfig(dir=str(Path(out).parent)), model, optimizer).load(
+            path=step_dir
+        )
+        loaded = _gathered(model, optimizer, mesh)
+        if rank == 0:
+            torch.save(loaded, out)
+    finally:
+        dist.destroy_process_group()
+
+
+def _load_one_process(
+    config: ModelConfig, step_dir: Path, exclude: list[str] | None = None
+) -> dict[str, torch.Tensor]:
+    """Load ``step_dir`` into an unsharded model with ``ep = 1``; return what it then holds."""
+    model, optimizer = _build(None, config, seed=1)
+    manager = CheckpointManager(CheckpointConfig(dir=str(step_dir.parent)), model, optimizer)
+    manager.load(path=str(step_dir), exclude_keys=exclude)
+    return _gathered(model, optimizer, None)
+
+
 def _saved(step_dir: Path, scratch: Path) -> dict[str, torch.Tensor]:
     """Every weight and AdamW moment the checkpoint at ``step_dir`` holds, under its names."""
     dcp_to_torch_save(step_dir, scratch / "saved.pt")
@@ -294,3 +320,44 @@ class TestResumeAtTheSameLayout:
         root = saved_layout(layout)
         reference = torch.load(root / "reference.pt")
         assert _mismatches(torch.load(root / "resumed.pt"), reference) == []
+
+
+class TestLoadAtAnotherEP:
+    @pytest.mark.parametrize("layout", list(LAYOUTS))
+    def test_ep1_loads_every_expert(self, saved_layout, layout):
+        """One process without EP loads every expert and its moments from an EP checkpoint."""
+        root = saved_layout(layout)
+        config = _config(LAYOUTS[layout][2])
+        reference = torch.load(root / "reference.pt")
+        assert _mismatches(_load_one_process(config, _step_dir(root)), reference) == []
+
+    @pytest.mark.parametrize(
+        ("saved_as", "target"),
+        [
+            pytest.param("dp_shard2_ep2", EP4, id="dp_shard2_ep2_to_ep4"),
+            pytest.param("dp_shard2_ep2_packed", EP4, id="dp_shard2_ep2_packed_to_ep4"),
+            pytest.param("ep4_packed_gelu", DP_SHARD2_EP2, id="ep4_packed_gelu_to_dp_shard2_ep2"),
+            pytest.param("dp_shard2_ep2_packed", HSDP_EP2, id="dp_shard2_ep2_packed_to_hsdp_ep2"),
+            pytest.param("ep2_tp2", DP_SHARD2_EP2, id="ep2_tp2_to_dp_shard2_ep2"),
+        ],
+    )
+    def test_another_layout_loads_every_rank_its_experts(
+        self, saved_layout, saved_as, target, tmp_path
+    ):
+        """A checkpoint saved at one ``ep`` and FSDP layout loads at another."""
+        root = saved_layout(saved_as)
+        out = tmp_path / "loaded.pt"
+        _spawn(_load, *target, LAYOUTS[saved_as][2], str(_step_dir(root)), str(out))
+        assert _mismatches(torch.load(out), torch.load(root / "reference.pt")) == []
+
+    @pytest.mark.parametrize("overrides", [{}, PACKED], ids=["unpacked", "packed"])
+    def test_ep_ranks_load_their_experts_from_an_ep1_checkpoint(self, overrides, tmp_path):
+        """A checkpoint one process saved gives each EP rank its own slice of the experts."""
+        config = _config(overrides)
+        model, optimizer = _build(None, config, seed=0)
+        _train(model, optimizer, None)
+        reference = _gathered(model, optimizer, None)
+        CheckpointManager(CheckpointConfig(dir=str(tmp_path / "ckpt")), model, optimizer).save(STEP)
+        out = tmp_path / "loaded.pt"
+        _spawn(_load, *DP_SHARD2_EP2, overrides, str(_step_dir(tmp_path)), str(out))
+        assert _mismatches(torch.load(out), reference) == []
