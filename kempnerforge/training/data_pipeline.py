@@ -338,6 +338,10 @@ def build_eval_dataloader(config: JobConfig, runtime: RuntimeContext) -> Any | N
 
     VLM + eval is out of scope on this branch: ``run_eval`` calls
     ``model(input_ids)``, which does not match ``VLMWrapper.forward``.
+
+    Raises:
+        ValueError: Under pipeline parallelism, the eval set gives a data-parallel
+            rank less than one full batch.
     """
     tc = config.train
     eval_config = config.eval
@@ -402,12 +406,19 @@ def build_eval_dataloader(config: JobConfig, runtime: RuntimeContext) -> Any | N
         shuffle=False,
         seed=tc.seed,
     )
-    return TorchDataLoader(
+    loader = TorchDataLoader(
         eval_dataset,
         batch_size=tc.batch_size,
         sampler=eval_sampler,
         drop_last=config.distributed.pp > 1,
     )
+    if config.distributed.pp > 1 and len(loader) == 0:
+        raise ValueError(
+            f"The eval set gives each data-parallel rank {len(eval_sampler)} samples, fewer "
+            f"than train.batch_size ({tc.batch_size}); pipeline-parallel eval drops a partial "
+            f"batch, so each rank needs at least one full batch."
+        )
+    return loader
 
 
 class _EvalTensorDataset(torch.utils.data.Dataset):
