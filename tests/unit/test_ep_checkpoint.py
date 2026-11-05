@@ -32,12 +32,13 @@ from torch.distributed.tensor import DTensor
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 
 from convert_checkpoint import dcp_to_hf
+from generate import _load_model
 
 import kempnerforge.checkpoint.expert_layout as expert_layout_module
 import kempnerforge.checkpoint.manager as manager_module
 from kempnerforge.checkpoint.manager import CheckpointManager
 from kempnerforge.config.model import ModelConfig
-from kempnerforge.config.schema import AsyncCheckpointMode, CheckpointConfig
+from kempnerforge.config.schema import AsyncCheckpointMode, CheckpointConfig, JobConfig
 from kempnerforge.distributed.parallel import build_parallel_model
 
 SEQ = 16
@@ -583,6 +584,17 @@ class TestUnfixedCheckpoint:
             ValueError, match=rf"holds 2 of the 4 experts of 2 MoE layers .*{holds}.*ep=2"
         ):
             _load_one_process(config, _step_dir(root), exclude=["optimizer"])
+
+    @pytest.mark.parametrize("layout", ["dp_shard2_ep2", "dp_shard2_ep2_packed"])
+    def test_generate_is_refused(self, saved_layout, layout):
+        """The generation script refuses it with the same error, before DCP reads it."""
+        root = saved_layout(layout, unfixed=True)
+        config = JobConfig(
+            model=_config(LAYOUTS[layout][2]),
+            checkpoint=CheckpointConfig(load_path=str(_step_dir(root))),
+        )
+        with pytest.raises(ValueError, match="holds 2 of the 4 experts"):
+            _load_model(config, torch.device("cpu"), torch.float32)
 
     @pytest.mark.parametrize("layout", ["dp_shard2_ep2", "dp_shard2_ep2_packed"])
     def test_dcp_to_hf_is_refused(self, saved_layout, layout, tmp_path):
