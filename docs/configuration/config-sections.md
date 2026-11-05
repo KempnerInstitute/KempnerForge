@@ -57,9 +57,9 @@ Architecture hyperparameters and MoE knobs.
 | `vocab_size` | `int` | `32000` | embedding table size |
 | `ffn_dim_multiplier` | `float` | `1.0` | scales Llama-style `4·dim·(2/3)` hidden width |
 | `ffn_hidden_dim` | `int \| None` | `None` | hard-override the computed FFN width |
-| `norm_type` | `"rmsnorm" \| "layernorm"` | `"rmsnorm"` | registry key for norm builder |
+| `norm_type` | `"rmsnorm" \| "layernorm"` or a registered `norm` name | `"rmsnorm"` | registry key for norm builder |
 | `norm_eps` | `float` | `1e-5` | norm epsilon |
-| `activation` | `"silu" \| "gelu" \| "relu"` | `"silu"` | MLP activation (`silu` → SwiGLU) |
+| `activation` | `"silu" \| "gelu" \| "relu"` or a registered `mlp` name | `"silu"` | MLP activation (`silu` → SwiGLU); an `mlp` name selects that builder |
 | `max_seq_len` | `int` | `2048` | RoPE table length; `train.seq_len` must be ≤ this |
 | `rope_theta` | `float` | `10000.0` | RoPE frequency base |
 | `tie_embeddings` | `bool` | `False` | share embedding and output-head weight |
@@ -146,7 +146,7 @@ LR schedule shape and warmup.
 
 | Field | Type | Default | Purpose |
 |-------|------|---------|---------|
-| `name` | `"cosine" \| "linear" \| "wsd" \| "constant" \| "rex" \| "none"` | `"cosine"` | `scheduler` registry key |
+| `name` | `"cosine" \| "linear" \| "wsd" \| "constant" \| "rex" \| "none"` or a registered `scheduler` name | `"cosine"` | `scheduler` registry key |
 | `warmup_steps` | `int` | `2000` | linear warmup length |
 | `warmup_start_factor` | `float` | `0.0` | LR factor the warmup starts from (torch `LinearLR` `start_factor`) |
 | `decay_steps` | `int \| None` | `None` | `None` → decay over remaining steps |
