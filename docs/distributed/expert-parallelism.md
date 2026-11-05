@@ -160,8 +160,9 @@ layouts.
 
 A checkpoint saved with `ep>1` before this layout holds
 `num_experts / ep` experts per layer, one rank's, under every rank's
-names; the other experts' weights were never written. A load and
-`dcp-to-hf` both refuse it with an error that says how many experts it
+names; the other experts' weights were never written. A load,
+`dcp-to-hf`, `scripts/generate.py` and the lmms-eval adapter in
+`examples/vlm` refuse it with an error that says how many experts it
 holds, instead of giving every rank one rank's experts or failing on a
 missing key.
 
