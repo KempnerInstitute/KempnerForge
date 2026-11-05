@@ -722,6 +722,20 @@ class TestJobConfig:
         config = JobConfig(distributed=DistributedConfig(pp=2, dp_shard=1))
         config.validate(world_size=2)
 
+    def test_pp_eval_steps_must_be_a_multiple_of_grad_accum_steps(self):
+        def job(pp: int, steps: int, enabled: bool = True) -> JobConfig:
+            return JobConfig(
+                distributed=DistributedConfig(pp=pp, dp_shard=1),
+                train=TrainConfig(grad_accum_steps=2),
+                eval=EvalConfig(enabled=enabled, steps=steps, dataset_path="/data"),
+            )
+
+        with pytest.raises(ValueError, match=r"eval.steps \(3\) must be a multiple"):
+            job(2, 3).validate(world_size=2)
+        job(2, 4).validate(world_size=2)
+        job(1, 3).validate(world_size=1)
+        job(2, 3, enabled=False).validate(world_size=2)
+
     def test_flex_rejects_seq_len_below_block_size_at_construction(self):
         """Decidable from the config alone, so it fires in __post_init__."""
         with pytest.raises(ValueError, match="requires train.seq_len >= 128"):
