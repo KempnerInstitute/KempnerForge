@@ -82,6 +82,18 @@ class TestEPApply:
                 assert layer.mlp.local_expert_start == ep_rank * experts_per_rank
                 assert layer.mlp.ep_group is not None
 
+    def test_apply_records_the_ep_mesh(self, ep_only_mesh):
+        """The EP mesh, which a checkpoint places each rank's experts by, is recorded."""
+        model = Transformer(EP_CONFIG).cuda()
+        apply_expert_parallel(model, ep_only_mesh)
+
+        for layer in model.layers.values():
+            if isinstance(layer.mlp, MoEMLP):
+                ep_mesh = layer.mlp.ep_mesh
+                assert ep_mesh is not None
+                assert ep_mesh.mesh_dim_names == ("ep",)
+                assert ep_mesh.get_group() is layer.mlp.ep_group
+
     def test_apply_noop_without_ep_dim(self):
         """Should be a no-op when mesh has no EP dimension."""
         world_size = dist.get_world_size()
