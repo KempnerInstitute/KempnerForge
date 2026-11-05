@@ -9,6 +9,8 @@ from typing import TYPE_CHECKING, Literal
 if TYPE_CHECKING:
     import torch
 
+FP32_CROSS_ENTROPY_LOSSES = ("cross_entropy", "chunked_cross_entropy")
+
 _FP16_UNSUPPORTED = (
     "train.mixed_precision='fp16' is not supported: it would train in pure fp16 "
     "with no loss scaling, so small gradients underflow to zero. Use 'bf16', or "
@@ -41,10 +43,12 @@ class TrainConfig:
     compile_model: bool = True
     mixed_precision: Literal["bf16", "fp16", "fp32", "fp8"] = "bf16"
     fp32_master_weights: bool = False
+    tf32: bool = False
     activation_checkpointing: ActivationCheckpointing = ActivationCheckpointing.none
     loss_fn: str = "cross_entropy"
     z_loss_weight: float = 0.0
     ce_chunk_size: int = 0
+    fp32_cross_entropy: bool = False
     shutdown_timeout_sec: float = 600.0
     nccl_health_check_interval: int = 0
 
@@ -65,6 +69,11 @@ class TrainConfig:
             raise ValueError(
                 "train.fp32_master_weights has no effect with mixed_precision='fp32': the "
                 "weights are already fp32. Use it with 'bf16' or 'fp8', or turn it off."
+            )
+        if self.fp32_cross_entropy and self.loss_fn not in FP32_CROSS_ENTROPY_LOSSES:
+            raise ValueError(
+                f"train.fp32_cross_entropy applies to {', '.join(FP32_CROSS_ENTROPY_LOSSES)}, "
+                f"not loss_fn={self.loss_fn!r}"
             )
 
     @property

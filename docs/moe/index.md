@@ -30,7 +30,7 @@ the distributed mechanics (all-to-all, expert parallelism) live under
 | `moe_top_k` | `2` | Number of experts each token routes to |
 | `moe_router` | `"softmax_topk"` | Router type (see [Routers](routers.md)) |
 | `moe_frequency` | `1` | Every Nth layer is MoE; others are dense |
-| `moe_shared_experts` | `0` | Dense expert applied to every token on top of routed |
+| `moe_shared_experts` | `0` | Number of experts applied to every token on top of routed, built as one MLP that many times the expert width (see [Routers § Shared experts](routers.md#shared-experts)) |
 | `moe_capacity_factor` | `0.0` | `>0` caps tokens per expert (see [Capacity and dispatch](capacity-and-dispatch.md)) |
 | `moe_aux_loss_weight` | `0.01` | Coefficient on `aux_loss` added to main loss |
 | `moe_packed_experts` | `false` | Packed weight tensors instead of `ModuleList` |

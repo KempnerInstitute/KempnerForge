@@ -120,14 +120,16 @@ Pulled from the filter in
 
 - **Converted** — attention (`q/k/v/o_proj`), dense MLP
   (`gate/up/down_proj`), final `output_head.proj`.
-- **Excluded** — MoE experts (`experts.*`, `shared_expert.*`) because
-  they use `torch._grouped_mm` and bypass `Float8Linear.forward`;
-  the MoE router because its output dim is small and not compute-bound;
-  embeddings and norms because they aren't `nn.Linear`.
+- **Excluded** — routed MoE experts (`experts.*`) because they use
+  `torch._grouped_mm` and bypass `Float8Linear.forward`; the shared
+  expert (`shared_expert.*`), a plain `Linear` call, by convention to
+  match them; the MoE router because its output dim is small and not
+  compute-bound; embeddings and norms because they aren't `nn.Linear`.
 
-For an MoE model this means attention is FP8, dense-block MLPs are FP8,
-but the expert blocks run in bf16 — typically fine, because attention
-and shared experts dominate FLOPs.
+For an MoE model this means attention, dense-block MLPs and the output
+head are FP8, but the routed and shared experts run in bf16, so FP8
+speeds up only the FLOPs outside the experts (see
+[MoE FP8](../moe/moe-fp8.md)).
 
 ## Accuracy tradeoff
 

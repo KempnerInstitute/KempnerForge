@@ -531,7 +531,7 @@ def run_training_loop(
             tracker.start_step()
             result = session.step_fn(session, step)
 
-            if not session.nan_detector.check_loss(result.loss, step):
+            if not session.nan_detector.check_loss(result.loss, step, grad_norm=result.grad_norm):
                 optimizer.zero_grad()
                 if session.nan_detector.should_rollback:
                     logger.error("Too many consecutive NaNs — stopping")
