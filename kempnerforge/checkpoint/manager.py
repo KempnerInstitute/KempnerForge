@@ -518,14 +518,14 @@ class CheckpointManager:
         if self._pp_rank is not None:
             self._agree(error)
 
-    def _agree(self, error: BaseException | None) -> None:
+    def _agree(self, error: BaseException | None, what: str = "Checkpoint save") -> None:
         """Barrier on the manager's dedicated gloo group that raises on every rank if any failed.
 
-        Every rank passes the error its own part of the save raised, or ``None``.
+        Every rank passes the error its own part of the operation raised, or ``None``.
         A rank with an error re-raises it; when any rank has one, every other rank
-        raises a ``RuntimeError`` naming the ranks that failed, so no rank is left
-        waiting in a later collective for a rank that has raised. The group is not
-        the default process group that DCP's async-save background thread issues
+        raises a ``RuntimeError`` naming ``what`` and the ranks that failed, so no rank
+        is left waiting in a later collective for a rank that has raised. The group is
+        not the default process group that DCP's async-save background thread issues
         collectives on. Without an initialized process group, ``error`` is raised
         if set.
         """
@@ -538,7 +538,7 @@ class CheckpointManager:
         if error is not None:
             raise error
         if failed:
-            raise RuntimeError(f"Checkpoint save failed on ranks {failed}")
+            raise RuntimeError(f"{what} failed on ranks {failed}")
 
     def _present_experts(
         self,
@@ -568,7 +568,8 @@ class CheckpointManager:
             return layout.to_global(dcp_state) if layout is not None else dcp_state
 
         presented: list[dict[str, Any]] = []
-        self._agree(_attempt(lambda: presented.append(present())))
+        what = "Checkpoint save" if load_from is None else "Checkpoint load"
+        self._agree(_attempt(lambda: presented.append(present())), what)
         return presented[0], layout
 
     def set_tracking_source(self, source: TrackingSource | None) -> None:
