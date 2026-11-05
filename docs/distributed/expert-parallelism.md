@@ -150,7 +150,13 @@ and DCP writes each chunk that several ranks hold from one of them, by
 default the one with the least to write so far, which could join
 chunks of different copies into one tensor. An EP save writes each
 such chunk from its lowest rank instead, so the checkpoint holds EP
-rank 0's copy whole, and a resume gives every EP rank that copy.
+rank 0's copy whole, and a resume gives every EP rank that copy. The
+lowest rank also writes every other chunk that several ranks share:
+under HSDP (`dp_replicate > 1`) replica 0 writes all of them, and
+under TP, which leaves the MoE layers whole, `tp` rank 0 writes every
+routed expert. The bytes written are the same as with DCP's default,
+but fewer ranks write them, so a save can take longer on those
+layouts.
 
 A checkpoint saved with `ep>1` before this layout holds
 `num_experts / ep` experts per layer, one rank's, under every rank's
