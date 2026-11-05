@@ -60,6 +60,14 @@ class TestCheckpointRoundtrip:
             assert pg1["lr"] == pg2["lr"]
             assert pg1["weight_decay"] == pg2["weight_decay"]
 
+        for (name, p1), (_, p2) in zip(
+            model.named_parameters(), model2.named_parameters(), strict=True
+        ):
+            saved, loaded = opt.state[p1], opt2.state[p2]
+            for key in ("step", "exp_avg", "exp_avg_sq"):
+                assert key in loaded, f"{key} of {name} was not loaded"
+                assert torch.equal(saved[key], loaded[key]), f"{key} of {name} differs"
+
     def test_train_state_roundtrip(self):
         """build_train_state → restore_train_state round-trip."""
         sched_config = SchedulerConfig(warmup_steps=5, name="cosine")
