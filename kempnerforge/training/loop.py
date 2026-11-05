@@ -10,6 +10,7 @@ than another branch inside the loop.
 
 from __future__ import annotations
 
+import contextlib
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -175,6 +176,7 @@ class TrainingSession:
     pipeline: PipelineBundle | None = None
     eval_dataloader: Any | None = None
     profiler: Any | None = None
+    autocast_dtype: torch.dtype | None = None
     _batch_stream: BatchStream | None = field(default=None, init=False, repr=False)
 
     @property
@@ -183,6 +185,12 @@ class TrainingSession:
         if self._batch_stream is None or self._batch_stream.pipeline is not self.data:
             self._batch_stream = BatchStream(self.data)
         return self._batch_stream
+
+    def autocast(self) -> contextlib.AbstractContextManager:
+        """``torch.autocast`` to ``autocast_dtype``, or a no-op when it is None."""
+        if self.autocast_dtype is None:
+            return contextlib.nullcontext()
+        return torch.autocast(device_type=self.runtime.device.type, dtype=self.autocast_dtype)
 
 
 def clip_grads(model: torch.nn.Module, max_norm: float, pp_group: Any = None) -> float:
@@ -239,12 +247,13 @@ def pipeline_step(session: TrainingSession, step: int) -> StepResult:
     is_last = pipeline.rank == pipeline.size - 1
     pp_losses: list[torch.Tensor] = []
 
-    if is_first:
-        pipeline.schedule.step(full_input, target=full_labels, losses=pp_losses, **pp_kwargs)
-    elif is_last:
-        pipeline.schedule.step(target=full_labels, losses=pp_losses, **pp_kwargs)
-    else:
-        pipeline.schedule.step(**pp_kwargs)
+    with session.autocast():
+        if is_first:
+            pipeline.schedule.step(full_input, target=full_labels, losses=pp_losses, **pp_kwargs)
+        elif is_last:
+            pipeline.schedule.step(target=full_labels, losses=pp_losses, **pp_kwargs)
+        else:
+            pipeline.schedule.step(**pp_kwargs)
 
     if is_last and pp_losses:
         avg_loss = sum(loss.item() for loss in pp_losses) / len(pp_losses)
@@ -285,8 +294,9 @@ def vlm_step(session: TrainingSession, step: int) -> StepResult:
         with maybe_no_sync(model, micro_step, tc.grad_accum_steps):
             if mc.is_moe:
                 inner_transformer(model).set_moe_step(step, tc.max_steps)  # type: ignore[attr-defined]
-            logits, labels_out = model(pixel_values, input_ids, labels, frame_mask=frame_mask)
-            loss = session.loss_fn(logits, labels_out)
+            with session.autocast():
+                logits, labels_out = model(pixel_values, input_ids, labels, frame_mask=frame_mask)
+                loss = session.loss_fn(logits, labels_out)
 
             total_text_tokens += int((labels_out != -100).sum().item())
 
@@ -333,8 +343,9 @@ def text_step(session: TrainingSession, step: int) -> StepResult:
         with maybe_no_sync(model, micro_step, tc.grad_accum_steps):
             if mc.is_moe:
                 inner_transformer(model).set_moe_step(step, tc.max_steps)  # type: ignore[attr-defined]
-            logits = model(input_ids, doc_ids=doc_ids)
-            loss = session.loss_fn(logits, labels)
+            with session.autocast():
+                logits = model(input_ids, doc_ids=doc_ids)
+                loss = session.loss_fn(logits, labels)
 
             if mixture_dataset is not None and "dataset_idx" in batch:
                 ds_idx = batch["dataset_idx"]
@@ -589,17 +600,18 @@ def run_training_loop(
                 and step % eval_config.interval == 0
             ):
                 pipeline = session.pipeline
-                eval_metrics = run_eval(
-                    model,
-                    session.eval_dataloader,
-                    session.loss_fn,
-                    runtime.device,
-                    eval_config.steps,
-                    pp_schedule=pipeline.schedule if pipeline is not None else None,
-                    pp_rank=pipeline.rank if pipeline is not None else None,
-                    pp_size=pipeline.size if pipeline is not None else None,
-                    pp_group=pp_group(runtime) if pipeline is not None else None,
-                )
+                with session.autocast():
+                    eval_metrics = run_eval(
+                        model,
+                        session.eval_dataloader,
+                        session.loss_fn,
+                        runtime.device,
+                        eval_config.steps,
+                        pp_schedule=pipeline.schedule if pipeline is not None else None,
+                        pp_rank=pipeline.rank if pipeline is not None else None,
+                        pp_size=pipeline.size if pipeline is not None else None,
+                        pp_group=pp_group(runtime) if pipeline is not None else None,
+                    )
                 tracker.log_eval(eval_metrics, step)
                 hooks.on_eval_end(eval_metrics, step)
 
