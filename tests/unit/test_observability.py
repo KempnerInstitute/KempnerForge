@@ -101,6 +101,18 @@ class TestMetricsTracker:
         assert "loss" in tracker._smoothed
         assert "tokens_per_sec" in tracker._smoothed
 
+    def test_end_step_reads_memory_once_per_logged_step(self, monkeypatch):
+        """A logged step reads each counter once, from the current device; other steps read none."""
+        tracker = self._make_tracker(log_interval=2)
+        fake = _FakeCudaMemory(monkeypatch)
+        reads = []
+        for step in range(1, 5):
+            fake.reads.clear()
+            tracker.start_step()
+            tracker.end_step(step=step, loss=2.0, grad_norm=1.0, lr=3e-4, tokens_in_step=1024)
+            reads.append(list(fake.reads))
+        assert reads == [[3, 3, 3, 3], [3, 3, 3, 3], [], [3, 3, 3, 3]]
+
     def test_close_without_backends(self):
         tracker = self._make_tracker()
         tracker.close()
