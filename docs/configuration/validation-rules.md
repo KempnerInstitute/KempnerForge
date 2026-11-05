@@ -37,8 +37,9 @@ File:
   `standard_gelu`, `standard_relu`); the error names the activation
   that selects it (`silu`, `gelu`, `relu`).
 - With `num_experts > 0`, `activation` is `silu`, `gelu` or `relu`: a
-  plugin's registered MLP is rejected, since MoE experts compute core's
-  SwiGLU or standard MLP from their weights.
+  plugin's registered MLP is rejected, since the MoE expert kernels
+  (grouped GEMM, packed experts) compute core's SwiGLU or standard MLP
+  from the expert weights.
 - `sdpa_backend ∈ {"auto", "flash", "efficient", "cudnn", "math"}`.
 - `attention_backend ∈ {"sdpa", "flex"}`.
 - `attention_backend = "flex"` requires `dim // n_heads ≥ 16` (below that the
