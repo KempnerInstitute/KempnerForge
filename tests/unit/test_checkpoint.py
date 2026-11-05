@@ -935,12 +935,13 @@ class _HeldLock:
 
 
 @pytest.fixture
-def pruned_dirs(monkeypatch) -> list[Path]:
-    """The directories ``_cleanup`` passes to ``shutil.rmtree``, each removed best effort.
+def pruned_dirs(tmp_path, monkeypatch) -> list[Path]:
+    """The directories under ``tmp_path`` passed to ``shutil.rmtree``, each removed best effort.
 
-    On NFS, removing a directory a moment after writing into it can fail with
-    ``ENOTEMPTY`` (an ``.nfsXXXX`` entry keeps it non-empty), so a test asserts on
-    this list rather than on what the filesystem still holds.
+    ``tmp_path`` is the manager's base directory in the tests that use this; other paths
+    go to ``shutil.rmtree`` unchanged. On NFS, removing a directory a moment after writing
+    into it can fail with ``ENOTEMPTY`` (an ``.nfsXXXX`` entry keeps it non-empty), so a
+    test asserts on this list rather than on what the filesystem still holds.
     """
     from kempnerforge.checkpoint import manager as mgr_mod
 
@@ -948,6 +949,8 @@ def pruned_dirs(monkeypatch) -> list[Path]:
     removed: list[Path] = []
 
     def record(path, *args, **kwargs):
+        if not Path(path).is_relative_to(tmp_path):
+            return rmtree(path, *args, **kwargs)
         removed.append(Path(path))
         rmtree(path, ignore_errors=True)
 
