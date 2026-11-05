@@ -143,6 +143,15 @@ TP, and [`dcp-to-hf`](../checkpointing/hf-conversion.md) exports every
 expert. An `ep=1` checkpoint loads into an EP run the same way, each
 rank taking its own experts.
 
+Every EP rank also holds a copy of each weight outside the routed
+experts. The copies can drift apart on GPU
+([#482](https://github.com/KempnerInstitute/KempnerForge/issues/482)),
+and DCP writes each chunk that several ranks hold from one of them, by
+default the one with the least to write so far, which could join
+chunks of different copies into one tensor. An EP save writes each
+such chunk from its lowest rank instead, so the checkpoint holds EP
+rank 0's copy whole, and a resume gives every EP rank that copy.
+
 A checkpoint saved with `ep>1` before this layout holds
 `num_experts / ep` experts per layer, one rank's, under every rank's
 names; the other experts' weights were never written. A load and
