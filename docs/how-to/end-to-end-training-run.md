@@ -124,11 +124,13 @@ Relaunch the same command:
 uv run torchrun --nproc_per_node=4 scripts/train.py configs/train/hf_wikitext.toml
 ```
 
-[`CheckpointManager`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/checkpoint/manager.py)
+Auto-resume
+([`resolve_resume_path`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/resilience/elastic.py))
 follows the `checkpoints/hf_wikitext/latest` symlink (updated on
-every save) and falls back to the highest `step_N` directory if the
-symlink is missing. Training picks up at the next step with model,
-optimizer, scheduler, dataloader, and RNG state restored.
+every save) and falls back to the newest `step_N` directory whose save
+completed if the symlink is missing; `CheckpointManager` then loads
+it. Training picks up at the next step with model, optimizer,
+scheduler, dataloader, and RNG state restored.
 
 The dataloader resumes from the exact sample via
 `StatefulDataLoader.load_state_dict` + `DistributedSampler.set_skip`
