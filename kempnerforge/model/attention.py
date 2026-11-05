@@ -9,19 +9,16 @@ GQA is the general case:
 from __future__ import annotations
 
 import contextlib
-from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
+from torch.nn.attention.flex_attention import BlockMask
 
 from kempnerforge.model.masking import flex_attention_fn
 from kempnerforge.model.norm import RMSNorm
 from kempnerforge.model.position import apply_rope
-
-if TYPE_CHECKING:
-    from torch.nn.attention.flex_attention import BlockMask
 
 _SDPA_BACKENDS = {
     "flash": SDPBackend.FLASH_ATTENTION,
@@ -123,36 +120,37 @@ class Attention(nn.Module):
         rope_sin: torch.Tensor,
         *,
         kv_cache: KVCache | None = None,
-        doc_ids: torch.Tensor | None = None,
-        key_padding_mask: torch.Tensor | None = None,
-        block_mask: BlockMask | None = None,
+        attn_mask: torch.Tensor | BlockMask | None = None,
     ) -> torch.Tensor:
         """Forward pass.
+
+        Attention consumes a mask; it never derives one. Every visibility rule
+        (document isolation, bidirectional groups, key validity, and their
+        combination) is expressed by ``kempnerforge.model.masking``, which
+        builds this one object once per forward and shares it across layers.
 
         Args:
             x: Input tensor of shape (batch, seq_len, dim).
             rope_cos: RoPE cosine frequencies, shape (seq_len, head_dim // 2).
             rope_sin: RoPE sine frequencies, shape (seq_len, head_dim // 2).
-            kv_cache: Optional KV cache for incremental generation.
-            doc_ids: Optional per-token document IDs for packed sequences,
-                shape (batch, seq_len). When provided, constructs a block-diagonal
-                causal mask so tokens only attend within their document.
-            key_padding_mask: Optional per-key validity mask, shape
-                (batch, seq_len); ``True`` = attend, ``False`` = drop (e.g. the
-                visual tokens of padded video frames). Combined with the causal
-                (and doc) mask; fully-masked query rows are unmasked to keep
-                softmax finite.
-            block_mask: Optional FlexAttention ``BlockMask`` encoding the same
-                block-diagonal causal mask ``doc_ids`` would build, but sparse:
-                fully-masked blocks are skipped by the kernel instead of
-                computed. Built once per forward by ``Transformer.forward``
-                when ``attention_backend="flex"``. Mutually exclusive with
-                ``doc_ids``, ``key_padding_mask``, and ``kv_cache``.
+            kv_cache: Optional KV cache for incremental generation. Mutually
+                exclusive with ``attn_mask``: a cache grows the key axis every
+                step, so the mask would have to be rebuilt each step rather
+                than shared, and a decode step needs no mask at all.
+            attn_mask: The mask from
+                ``kempnerforge.model.masking.build_attention_mask``: a
+                FlexAttention ``BlockMask``, a dense bool tensor broadcastable
+                to (batch, n_heads, seq_len, seq_len) where ``True`` = attend,
+                or ``None`` for plain causal attention.
 
         Returns:
             Output tensor of shape (batch, seq_len, dim).
+
+        Raises:
+            NotImplementedError: If ``capture_attention_weights`` is set and
+                ``attn_mask`` is a ``BlockMask``.
         """
-        if block_mask is not None and self.capture_attention_weights:
+        if isinstance(attn_mask, BlockMask) and self.capture_attention_weights:
             raise NotImplementedError(
                 "capture_attention_weights requires attention_backend='sdpa'. "
                 "FlexAttention fuses the mask into the kernel and never materializes "
@@ -179,42 +177,31 @@ class Attention(nn.Module):
         if kv_cache is not None:
             k, v = kv_cache.update(k, v)
 
-        if self.n_rep > 1 and block_mask is None:
+        if self.n_rep > 1 and not isinstance(attn_mask, BlockMask):
             k = k.repeat_interleave(self.n_rep, dim=1)
             v = v.repeat_interleave(self.n_rep, dim=1)
 
-        if self.capture_attention_weights:
-            out, attn_weights = self._attention_with_weights(
-                q, k, v, seq_len, doc_ids, kv_cache, key_padding_mask
-            )
-            self.last_attention_weights = attn_weights.detach().cpu()
-        elif block_mask is not None:
-            assert kv_cache is None and key_padding_mask is None, (
-                "block_mask does not compose with kv_cache decode or key_padding_mask; "
-                "those cases use the dense SDPA mask."
+        if isinstance(attn_mask, BlockMask):
+            assert kv_cache is None, (
+                "a BlockMask does not compose with kv_cache decode; a decode step "
+                "re-derives its own mask as the key axis grows."
             )
             out = flex_attention_fn(q.is_cuda)(
                 q,
                 k,
                 v,
-                block_mask=block_mask,
+                block_mask=attn_mask,
                 scale=self.head_dim**-0.5,
                 enable_gqa=self.n_rep > 1,
             )
-        elif doc_ids is not None or key_padding_mask is not None:
+        elif self.capture_attention_weights:
+            out, attn_weights = self._attention_with_weights(q, k, v, seq_len, attn_mask, kv_cache)
+            self.last_attention_weights = attn_weights.detach().cpu()
+        elif attn_mask is not None:
             assert kv_cache is None, (
-                "doc_ids / key_padding_mask are not supported with kv_cache decode "
-                "(would build an incorrect causal mask)."
+                "a dense attn_mask does not compose with kv_cache decode; it is square "
+                "over the residual stream, while a cache grows the key axis every step."
             )
-            seq_len_kv = k.shape[2]
-            causal = torch.ones(seq_len, seq_len_kv, dtype=torch.bool, device=q.device).tril()
-            attn_mask = causal.unsqueeze(0).unsqueeze(0)
-            if doc_ids is not None:
-                doc_mask = (doc_ids.unsqueeze(2) == doc_ids.unsqueeze(1)).unsqueeze(1)
-                attn_mask = attn_mask & doc_mask
-            if key_padding_mask is not None:
-                attn_mask = attn_mask & key_padding_mask.view(batch, 1, 1, seq_len_kv)
-            attn_mask = attn_mask | ~attn_mask.any(dim=-1, keepdim=True)
             with self._sdpa_context():
                 out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         else:
@@ -232,15 +219,24 @@ class Attention(nn.Module):
         k: torch.Tensor,
         v: torch.Tensor,
         seq_len: int,
-        doc_ids: torch.Tensor | None,
+        attn_mask: torch.Tensor | None,
         kv_cache: KVCache | None,
-        key_padding_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute attention output and weights manually (for analysis).
 
         SDPA does not return attention weights, so this path computes
         softmax(QK^T / sqrt(d)) explicitly. Only use for interpretability —
         it is slower and uses more memory than the fused SDPA path.
+
+        Args:
+            q: Queries, shape (batch, n_heads, seq_len, head_dim).
+            k: Keys, shape (batch, n_heads, seq_k, head_dim).
+            v: Values, shape (batch, n_heads, seq_k, head_dim).
+            seq_len: Query length.
+            attn_mask: Dense bool mask where ``True`` = attend, or ``None`` for
+                plain causal attention.
+            kv_cache: The cache in use, which with ``seq_len == 1`` means a
+                decode step whose query attends to every cached position.
 
         Returns:
             Tuple of (output, attention_weights).
@@ -250,18 +246,10 @@ class Attention(nn.Module):
         scale = self.head_dim**-0.5
         attn = torch.matmul(q, k.transpose(-2, -1)) * scale
 
-        seq_len_kv = k.shape[2]
-        if doc_ids is not None or key_padding_mask is not None:
-            causal = torch.ones(seq_len, seq_len_kv, dtype=torch.bool, device=q.device).tril()
-            valid = causal.unsqueeze(0).unsqueeze(0)
-            if doc_ids is not None:
-                valid = valid & (doc_ids.unsqueeze(2) == doc_ids.unsqueeze(1)).unsqueeze(1)
-            if key_padding_mask is not None:
-                valid = valid & key_padding_mask.view(q.shape[0], 1, 1, seq_len_kv)
-            valid = valid | ~valid.any(dim=-1, keepdim=True)
-            attn = attn.masked_fill(~valid, float("-inf"))
+        if attn_mask is not None:
+            attn = attn.masked_fill(~attn_mask, float("-inf"))
         elif kv_cache is None or seq_len > 1:
-            causal = torch.ones(seq_len, seq_len_kv, dtype=torch.bool, device=q.device).triu(
+            causal = torch.ones(seq_len, k.shape[2], dtype=torch.bool, device=q.device).triu(
                 diagonal=1
             )
             attn = attn.masked_fill(causal.unsqueeze(0).unsqueeze(0), float("-inf"))
