@@ -23,7 +23,7 @@ from kempnerforge.model.attention import Attention, KVCache
 from kempnerforge.model.cross_attention import CrossAttentionBlock
 from kempnerforge.model.embedding import OutputHead, TokenEmbedding
 from kempnerforge.model.init import init_weights
-from kempnerforge.model.masking import build_doc_causal_block_mask
+from kempnerforge.model.masking import build_attention_mask
 from kempnerforge.model.mlp import build_mlp
 from kempnerforge.model.modality import ModalityContext
 from kempnerforge.model.moe import MoEMLP, build_moe
@@ -89,18 +89,28 @@ class TransformerBlock(nn.Module):
         rope_sin: torch.Tensor,
         *,
         kv_cache: KVCache | None = None,
-        doc_ids: torch.Tensor | None = None,
-        key_padding_mask: torch.Tensor | None = None,
-        block_mask: BlockMask | None = None,
+        attn_mask: torch.Tensor | BlockMask | None = None,
     ) -> torch.Tensor:
+        """Run attention and the MLP over the residual stream.
+
+        Args:
+            x: Residual stream, shape ``(batch, seq_len, dim)``.
+            rope_cos: RoPE cosine frequencies for this block's positions.
+            rope_sin: RoPE sine frequencies for this block's positions.
+            kv_cache: Optional KV cache for incremental generation.
+            attn_mask: The one mask from
+                ``kempnerforge.model.masking.build_attention_mask``, built once
+                per forward and shared by every block.
+
+        Returns:
+            The updated residual stream, shape ``(batch, seq_len, dim)``.
+        """
         x = x + self.attention(
             self.attention_norm(x),
             rope_cos,
             rope_sin,
             kv_cache=kv_cache,
-            doc_ids=doc_ids,
-            key_padding_mask=key_padding_mask,
-            block_mask=block_mask,
+            attn_mask=attn_mask,
         )
         x = x + self.mlp(self.mlp_norm(x))
         return x
@@ -310,6 +320,37 @@ class Transformer(nn.Module):
                 }
         return counts
 
+    def _validate_modality_ids(
+        self, modality_ids: torch.Tensor | None, residual_shape: tuple[int, int]
+    ) -> None:
+        """Check the per-token modality tag the MoMa and MoT paths route on.
+
+        A no-op for every other arch. Runs before the attention mask is built,
+        so an arch missing its tags says so instead of failing later on an
+        unrelated input.
+
+        Args:
+            modality_ids: The tag from the ``ModalityContext``, or ``None``.
+            residual_shape: ``(batch, seq_len)`` of the residual stream.
+
+        Raises:
+            ValueError: If the arch routes on ``modality_ids`` and it is absent
+                or does not cover the residual stream.
+        """
+        arch = "MoMa" if self._moma_modalities else "MoT" if self._mot_modalities else ""
+        if not arch:
+            return
+        if modality_ids is None:
+            raise ValueError(
+                f"{arch} model requires modality.modality_ids (got None). Build the "
+                f"ModalityContext via {arch}Strategy or set modality_ids explicitly."
+            )
+        if tuple(modality_ids.shape) != residual_shape:
+            raise ValueError(
+                f"modality.modality_ids shape {tuple(modality_ids.shape)} does not "
+                f"match residual shape {residual_shape}"
+            )
+
     def forward(
         self,
         tokens: torch.Tensor | None = None,
@@ -318,6 +359,7 @@ class Transformer(nn.Module):
         kv_caches: list[KVCache] | None = None,
         doc_ids: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
+        attention_group_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Forward pass.
 
@@ -339,11 +381,12 @@ class Transformer(nn.Module):
                 the current cache fill level. Cross-arg invariant:
                 ``kv_caches`` forbids ``modality.prefix_embeds``,
                 ``modality.output_slice``, ``modality.image_features``,
-                and ``modality.modality_ids``
-                (all training-only).
+                ``modality.modality_ids``, ``modality.key_padding_mask``,
+                ``doc_ids`` and ``attention_group_ids`` (all training-only).
             doc_ids: Optional per-token document IDs for packed sequences,
-                shape ``(batch, seq_len)``. Enables block-diagonal causal
-                attention that isolates documents within packed sequences.
+                shape ``(batch, seq_len)`` over the residual stream. Enables
+                block-diagonal causal attention that isolates documents within
+                packed sequences.
             position_ids: Optional explicit per-token RoPE positions, shape
                 ``(batch, seq_len)`` matching the residual reaching attention
                 (including any ``modality.prefix_embeds``), dtype int64,
@@ -355,6 +398,17 @@ class Transformer(nn.Module):
                 generation derives positions from the cache fill level);
                 unsupported for MoT, which derives per-modality positions
                 internally.
+            attention_group_ids: Optional per-token visibility group ids over
+                the residual stream, shape ``(batch, seq_len)``, int64;
+                negative means no group. Tokens sharing a nonnegative id see
+                each other bidirectionally (e.g. prefix-LM spans):
+                ``visible(q, k) = same_document AND (k <= q OR
+                same_nonnegative_group)``. Without ``doc_ids`` the row is one
+                document. ``None`` leaves attention unchanged; all-negative ids
+                give the same visibility as ``None`` but still build a mask, so
+                ``None`` is the unmasked fast path. On MoT, ``doc_ids`` and
+                group ids need ``vlm.mot_modalities`` in residual order,
+                ``("image", "text")``.
 
         Returns:
             Logits tensor of shape ``(batch, out_seq_len, vocab_size)``
@@ -397,6 +451,20 @@ class Transformer(nn.Module):
                 raise ValueError(
                     "modality.modality_ids is training-only; cannot be combined with kv_caches"
                 )
+            if key_padding_mask is not None:
+                raise ValueError(
+                    "modality.key_padding_mask is training-only; cannot be combined with kv_caches"
+                )
+            if doc_ids is not None:
+                raise ValueError("doc_ids is training-only; cannot be combined with kv_caches")
+            if attention_group_ids is not None:
+                raise ValueError(
+                    "attention_group_ids is training-only; cannot be combined with kv_caches"
+                )
+        text = tokens if tokens is not None else inputs_embeds
+        assert text is not None
+        batch = text.shape[0]
+        seq_len = text.shape[1] + (prefix_embeds.shape[1] if prefix_embeds is not None else 0)
         if position_ids is not None:
             if kv_caches is not None:
                 raise ValueError(
@@ -416,15 +484,10 @@ class Transformer(nn.Module):
                 raise ValueError(
                     f"position_ids must have shape (batch, seq_len), got {position_ids.ndim} dims"
                 )
-            text = tokens if tokens is not None else inputs_embeds
-            assert text is not None
-            batch, text_len = text.shape[:2]
-            n_prefix = prefix_embeds.shape[1] if prefix_embeds is not None else 0
-            residual_shape = (batch, n_prefix + text_len)
-            if tuple(position_ids.shape) != residual_shape:
+            if tuple(position_ids.shape) != (batch, seq_len):
                 raise ValueError(
                     f"position_ids shape {tuple(position_ids.shape)} does not match the "
-                    f"residual shape {residual_shape} reaching attention"
+                    f"residual shape {(batch, seq_len)} reaching attention"
                 )
             if self._rope_cos is None:
                 raise ValueError(
@@ -441,6 +504,28 @@ class Transformer(nn.Module):
             raise ValueError(
                 f"modality.modality_ids.dtype must be torch.long, got {modality_ids.dtype}"
             )
+        if attention_group_ids is not None and attention_group_ids.dtype != torch.long:
+            raise ValueError(
+                f"attention_group_ids.dtype must be torch.long, got {attention_group_ids.dtype}"
+            )
+        mot_order = self._mot_modalities
+        has_ids = doc_ids is not None or attention_group_ids is not None
+        if has_ids and mot_order and mot_order != ("image", "text"):
+            raise ValueError(
+                "doc_ids and attention_group_ids need vlm.mot_modalities = ('image', 'text'), "
+                f"the residual order, got {mot_order!r}: MoT attends over its streams in that "
+                "order, so a mask over the residual would not line up with it."
+            )
+        self._validate_modality_ids(modality_ids, (batch, seq_len))
+        attn_mask = build_attention_mask(
+            backend=self.config.attention_backend,
+            batch=batch,
+            seq_len=seq_len,
+            device=text.device,
+            doc_ids=doc_ids,
+            group_ids=attention_group_ids,
+            key_padding_mask=key_padding_mask,
+        )
 
         h = (
             self.token_embedding(tokens)  # type: ignore[reportOptionalCall]
@@ -453,8 +538,6 @@ class Transformer(nn.Module):
             if prefix_embeds.dtype != h.dtype:
                 prefix_embeds = prefix_embeds.to(h.dtype)
             h = torch.cat([prefix_embeds, h], dim=1)
-
-        seq_len = h.shape[1]
 
         start_pos = kv_caches[0].seq_len if kv_caches is not None else 0
 
@@ -469,48 +552,19 @@ class Transformer(nn.Module):
             cos = self._rope_cos[start_pos : start_pos + seq_len]  # type: ignore[reportOptionalSubscript]
             sin = self._rope_sin[start_pos : start_pos + seq_len]  # type: ignore[reportOptionalSubscript]
 
-        block_mask = None
-        if (
-            doc_ids is not None
-            and key_padding_mask is None
-            and self.config.attention_backend == "flex"
-        ):
-            if doc_ids.shape[1] != seq_len:
-                raise ValueError(
-                    f"doc_ids length ({doc_ids.shape[1]}) does not match the sequence "
-                    f"length reaching attention ({seq_len}). Sequence packing is not "
-                    "supported for arches that prepend image tokens to the residual stream."
-                )
-            block_mask = build_doc_causal_block_mask(doc_ids, h.device)
-            doc_ids = None
-
         if self._moma_modalities:
-            if modality_ids is None:
-                raise ValueError(
-                    "MoMa model requires modality.modality_ids (got None). Build the "
-                    "ModalityContext via MoMaStrategy or set modality_ids explicitly."
-                )
-            if modality_ids.shape != h.shape[:2]:
-                raise ValueError(
-                    f"modality.modality_ids shape {tuple(modality_ids.shape)} does not "
-                    f"match residual shape {tuple(h.shape[:2])}"
-                )
+            assert modality_ids is not None
             for layer in self.layers.values():
                 h = layer(
-                    h, cos, sin, modality_ids, doc_ids=doc_ids, key_padding_mask=key_padding_mask
+                    h,
+                    cos,
+                    sin,
+                    modality_ids,
+                    attn_mask=attn_mask,
+                    key_padding_mask=key_padding_mask,
                 )
             h = self.norm(h)
         elif self._mot_modalities:
-            if modality_ids is None:
-                raise ValueError(
-                    "MoT model requires modality.modality_ids (got None). Build the "
-                    "ModalityContext via MoTStrategy or set modality_ids explicitly."
-                )
-            if modality_ids.shape != h.shape[:2]:
-                raise ValueError(
-                    f"modality.modality_ids shape {tuple(modality_ids.shape)} does not "
-                    f"match residual shape {tuple(h.shape[:2])}"
-                )
             n_image = self._mot_n_image
             t_image = n_image
             t_text = h.shape[1] - n_image
@@ -523,22 +577,14 @@ class Transformer(nn.Module):
                 "text": (cos[:t_text], sin[:t_text]),
             }
             for layer in self.layers.values():
-                streams = layer(streams, rope, key_padding_mask=key_padding_mask)
+                streams = layer(streams, rope, attn_mask=attn_mask)
             streams = {m: self.mot_norms[m](streams[m]) for m in self._mot_modalities}
             h = torch.cat([streams["image"], streams["text"]], dim=1)
         else:
             ca_iter = iter(self.cross_attention_layers.values()) if self._ca_cadence else None
             for i, layer in enumerate(self.layers.values()):
                 cache = kv_caches[i] if kv_caches is not None else None
-                h = layer(
-                    h,
-                    cos,
-                    sin,
-                    kv_cache=cache,
-                    doc_ids=doc_ids,
-                    key_padding_mask=key_padding_mask,
-                    block_mask=block_mask,
-                )
+                h = layer(h, cos, sin, kv_cache=cache, attn_mask=attn_mask)
                 if ca_iter is not None and (i + 1) % self._ca_cadence == 0:
                     ca = next(ca_iter, None)
                     if ca is not None:

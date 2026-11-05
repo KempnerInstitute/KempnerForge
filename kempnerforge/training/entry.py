@@ -197,14 +197,17 @@ def restore_checkpoint(
     resume from. Also restores the metrics run ids, runs the MoT warm-start
     hook, and re-applies the effective freeze at the resumed step.
     """
+    num_stages = config.distributed.pp if config.distributed.pp > 1 else None
     if dist.is_initialized():
         chosen = [
-            str(resolve_resume_path(config.checkpoint.dir) or "") if dist.get_rank() == 0 else ""
+            str(resolve_resume_path(config.checkpoint.dir, num_stages) or "")
+            if dist.get_rank() == 0
+            else ""
         ]
         dist.broadcast_object_list(chosen, src=0)
         resume_path = Path(chosen[0]) if chosen[0] else None
     else:
-        resume_path = resolve_resume_path(config.checkpoint.dir)
+        resume_path = resolve_resume_path(config.checkpoint.dir, num_stages)
     if not resume_path and not config.checkpoint.load_path:
         return 0, 0
 
