@@ -15,6 +15,7 @@ from torch.distributed.checkpoint.state_dict import get_model_state_dict
 
 from kempnerforge.checkpoint.expert_layout import (
     ExpertLayout,
+    _root_mesh,
     check_saved_experts,
     expert_layout,
     moe_layers,
@@ -142,6 +143,13 @@ class TestPackedWithoutMesh:
         state = {"model": {f"{LAYER}.{name}": p for name, p in moe.named_parameters()}}
         with pytest.raises(ValueError, match="records no ep_mesh"):
             ExpertLayout([(LAYER, moe)]).to_global(state)
+
+
+class TestOlderTorch:
+    def test_a_mesh_without_a_root_lookup_names_the_torch_it_needs(self):
+        """Before torch 2.10 ``DeviceMesh`` has no ``_get_root_mesh``, and the error says so."""
+        with pytest.raises(ValueError, match="need torch 2.10 or newer"):
+            _root_mesh(SimpleNamespace())
 
 
 def _index(experts: int = 4, packed_rows: int | None = None, layers: int = 2) -> dict:
