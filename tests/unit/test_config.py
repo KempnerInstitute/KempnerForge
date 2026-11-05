@@ -823,7 +823,7 @@ class TestVLMParallelismSupport:
 
     def test_errors_name_the_arch_of_the_config_class(self):
         """The checks act on the config's class, and the arch field can name another arch
-        after a ``--vlm.arch`` override, so the error names the class's arch."""
+        after an assignment to it, so the error names the class's arch."""
         job = _vlm_job("moma", ep=2)
         assert job.vlm is not None
         job.vlm.arch = "joint_decoder"
