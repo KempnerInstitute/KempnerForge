@@ -2521,7 +2521,8 @@ class TestResumeWithUnsteppedParameters:
             manager2.load(path=str(tmp_path / "step_1"))
 
     def test_an_opaque_optimizer_entry_keeps_its_loaded_state(self, tmp_path, monkeypatch):
-        """A checkpoint that stores the optimizer as one entry loads it whole."""
+        """A checkpoint that stores the optimizer as one entry loads it whole, without the
+        check of the parameters it must hold."""
         from torch.distributed.checkpoint import FileSystemReader, _version
         from torch.distributed.checkpoint.state_dict import (
             get_model_state_dict,
@@ -2550,7 +2551,7 @@ class TestResumeWithUnsteppedParameters:
 
         model2, optimizer2 = build(1)
         manager2 = CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model2, optimizer2)
-        manager2.load(path=str(tmp_path / "step_1"))
+        manager2.load(path=str(tmp_path / "step_1"), require_held=["unused.weight"])
         assert [optimizer2.state[p] for p in model2.parameters()] == [{"step": 2}] * 4
 
     def test_a_resumed_run_saves_and_resumes_again(self, tmp_path):
@@ -2568,6 +2569,57 @@ class TestResumeWithUnsteppedParameters:
         assert manager3.load() == (2, 0, {})
         self._step(model, optimizer, 2)
         self._assert_same_run(model, optimizer, model3, optimizer3)
+
+
+class TestRequireHeld:
+    """``load(require_held=...)`` refuses a save whose optimizer did not hold those parameters."""
+
+    _build = staticmethod(TestResumeWithUnsteppedParameters._build)
+    _step = staticmethod(TestResumeWithUnsteppedParameters._step)
+
+    def test_a_parameter_the_saved_optimizer_left_out_is_refused(self, tmp_path):
+        model, optimizer, manager = self._build(0, tmp_path, freeze_unused=True)
+        self._step(model, optimizer, 1)
+        manager.save(step=1)
+
+        _, optimizer2, manager2 = self._build(1, tmp_path)
+        with pytest.raises(
+            RuntimeError,
+            match=re.escape(
+                "holds neither optimizer state nor a never-stepped record for 2 parameters "
+                "that a freeze stage unfreezes: ['unused.bias', 'unused.weight']"
+            ),
+        ):
+            manager2.load(
+                path=str(tmp_path / "step_1"), require_held=["unused.weight", "unused.bias"]
+            )
+        manager2.load(
+            path=str(tmp_path / "step_1"),
+            exclude_keys=["optimizer"],
+            require_held=["unused.weight", "unused.bias"],
+        )
+        assert not optimizer2.state
+
+    def test_a_never_stepped_record_covers_a_parameter(self, tmp_path):
+        model, optimizer, manager = self._build(0, tmp_path)
+        self._step(model, optimizer, 1)
+        manager.save(step=1)
+
+        model2, optimizer2, manager2 = self._build(1, tmp_path)
+        manager2.load(path=str(tmp_path / "step_1"), require_held=["unused.weight", "unused.bias"])
+        assert not any(optimizer2.state.get(p) for p in model2.unused.parameters())
+        assert all(optimizer2.state.get(p) for p in model2.used.parameters())
+
+    def test_names_are_compared_without_the_activation_checkpoint_prefix(self, tmp_path):
+        model, optimizer, manager = self._build(0, tmp_path)
+        self._step(model, optimizer, 1)
+        manager.save(step=1)
+
+        _, _, manager2 = self._build(1, tmp_path)
+        manager2.load(
+            path=str(tmp_path / "step_1"),
+            require_held=["unused._checkpoint_wrapped_module.weight"],
+        )
 
 
 class TestMuonResume:

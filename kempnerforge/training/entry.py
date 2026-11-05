@@ -197,10 +197,11 @@ def build_checkpoint_manager(
 
 def _trainable_for_the_run(
     model: torch.nn.Module, config: JobConfig
-) -> contextlib.AbstractContextManager[None]:
-    """``trainable_for_the_run`` for a VLM with a freeze schedule; a no-op context otherwise."""
+) -> contextlib.AbstractContextManager[list[str]]:
+    """``trainable_for_the_run`` for a VLM with a freeze schedule; otherwise a context that
+    changes nothing and yields no names."""
     if config.vlm is None or not config.vlm.freeze_schedule:
-        return contextlib.nullcontext()
+        return contextlib.nullcontext([])
     return trainable_for_the_run(model, config.vlm)
 
 
@@ -217,7 +218,8 @@ def restore_checkpoint(
     hook, and re-applies the effective freeze at the resumed step. The load
     runs with every parameter that trains at some step of the run marked
     trainable, so a module that a freeze stage unfreezes gets its saved
-    optimizer state back, or none when it had not trained yet.
+    optimizer state back, or none when it had not trained yet; a checkpoint
+    whose optimizer did not hold such a module is refused.
     """
     num_stages = config.distributed.pp if config.distributed.pp > 1 else None
     if dist.is_initialized():
@@ -243,12 +245,13 @@ def restore_checkpoint(
     warm_start_exclude = (
         (config.checkpoint.exclude_from_loading or None) if resume_path is None else None
     )
-    with _trainable_for_the_run(model, config):
+    with _trainable_for_the_run(model, config) as unfrozen_later:
         step, tokens_seen, ckpt_extra_loaded = ckpt_mgr.load(
             path=str(resume_path) if resume_path else None,
             scheduler=scheduler,
             exclude_keys=warm_start_exclude,
             vlm_freeze_expected=vlm_freeze_expected,
+            require_held=unfrozen_later,
         )
     if ckpt_extra_loaded.get("wandb_run_id"):
         config.metrics.wandb_run_id = ckpt_extra_loaded["wandb_run_id"]

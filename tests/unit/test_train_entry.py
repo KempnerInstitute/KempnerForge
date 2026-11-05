@@ -3062,6 +3062,43 @@ class TestResumePastAnUnfreezeStage:
                 assert not resumed_optimizer.state.get(loaded)
 
 
+class TestResumeACheckpointThatLeftTheModuleOut:
+    def test_the_resume_refuses_its_optimizer_state_and_names_the_module(
+        self, monkeypatch, tmp_path
+    ):
+        """A run saved before modules a stage unfreezes were kept in the optimizer built its
+        optimizer without the head the build froze. Resuming it refuses that optimizer state,
+        names the head, and leaves the head frozen."""
+        import kempnerforge.training.entry as entry
+        from kempnerforge.checkpoint.manager import CheckpointManager
+        from kempnerforge.training.freeze import apply_freeze_specs
+        from kempnerforge.training.optimizer import build_optimizer
+
+        config = _head_config(max_steps=4)
+        config.checkpoint.dir = str(tmp_path / "ckpt")
+        assert config.vlm is not None
+        torch.manual_seed(0)
+        model = TinyVlmModel()
+        apply_freeze_specs(model, config.vlm.freeze, config.vlm.module_patterns)
+        optimizer = build_optimizer(model, config.optimizer)
+        logits, labels = model(None, _VLM_BATCH["input_ids"], _VLM_BATCH["labels"])
+        torch.nn.functional.cross_entropy(logits.reshape(-1, VOCAB), labels.reshape(-1)).backward()
+        optimizer.step()
+        CheckpointManager(config.checkpoint, model, optimizer).save(
+            step=1, extra=checkpoint_extra(config, 1, PhaseState())
+        )
+
+        resumed, resumed_optimizer = _built_with_a_frozen_head(config)
+        saved = Path(config.checkpoint.dir) / "step_1"
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: saved)
+        manager = CheckpointManager(config.checkpoint, resumed, resumed_optimizer)
+        with pytest.raises(
+            RuntimeError, match=r"freeze stage unfreezes: \['proj.bias', 'proj.weight'\]"
+        ):
+            entry.restore_checkpoint(config, resumed, None, manager)
+        assert not any(p.requires_grad for p in resumed.proj.parameters())
+
+
 class TestFreezeStageFence:
     """The stage hook must drain an in-flight save before flipping requires_grad.
 

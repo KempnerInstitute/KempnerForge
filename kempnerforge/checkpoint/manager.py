@@ -25,6 +25,7 @@ from typing import Any, Protocol, TypeGuard, cast
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import _CHECKPOINT_PREFIX
 from torch.distributed.checkpoint import DefaultLoadPlanner
 from torch.distributed.checkpoint.metadata import STATE_DICT_TYPE, Metadata
 from torch.distributed.checkpoint.state_dict import (
@@ -278,6 +279,42 @@ def _restore_never_stepped(
             f"the saved optimizer did not hold: {unheld[:8]}"
         )
     optim_state["state"].update({fqn: {} for fqn in never_stepped})
+
+
+def _check_saved_optimizer_holds(
+    fqns: Iterable[str], saved_keys: Iterable[str], where: Path
+) -> None:
+    """Fail if the saved optimizer did not hold one of ``fqns``.
+
+    A save covers a parameter its optimizer held with the parameter's state, or with a
+    never-stepped record when it had none. A checkpoint that stores the optimizer as one
+    opaque entry is not checked. Names are compared as DCP writes them, without the
+    activation-checkpoint wrapper's prefix.
+    """
+    keys = list(saved_keys)
+    if "optimizer" in keys:
+        return
+    needed = {fqn.replace(_CHECKPOINT_PREFIX, "") for fqn in fqns}
+    covered: set[str] = set()
+    for key in keys:
+        if key.startswith(_NEVER_STEPPED_PREFIX):
+            covered.add(key.removeprefix(_NEVER_STEPPED_PREFIX))
+        elif key.startswith(_OPTIM_STATE_PREFIX):
+            fqn = key.removeprefix(_OPTIM_STATE_PREFIX)
+            while fqn and fqn not in needed:
+                fqn = fqn.rpartition(".")[0]
+            covered.add(fqn)
+    missing = sorted(needed - covered)
+    if missing:
+        raise RuntimeError(
+            f"{where} holds neither optimizer state nor a never-stepped record for "
+            f"{len(missing)} parameters that a freeze stage unfreezes: {missing[:8]}. The "
+            "saved optimizer did not hold them: the checkpoint predates keeping a module "
+            "that a freeze stage unfreezes in the optimizer from the build. To continue from "
+            "these weights with a fresh optimizer, set checkpoint.load_path to this "
+            'checkpoint and checkpoint.exclude_from_loading = ["optimizer"], with a '
+            "checkpoint.dir that holds no checkpoint yet."
+        )
 
 
 def _check_saved_state_matches(
@@ -842,6 +879,7 @@ class CheckpointManager:
         dataloader: Any | None = None,
         exclude_keys: list[str] | None = None,
         vlm_freeze_expected: list[dict[str, Any]] | None = None,
+        require_held: Iterable[str] = (),
     ) -> tuple[int, int, dict[str, Any]]:
         """Load a checkpoint and restore all state.
 
@@ -857,6 +895,10 @@ class CheckpointManager:
                 a mismatch raises ``ValueError`` unless the checkpoint
                 config has ``ignore_freeze_mismatch=True``, in which case
                 the load proceeds with a warning.
+            require_held: Names of parameters the saved optimizer must have held,
+                the ones a freeze stage unfreezes after the build froze them.
+                When the optimizer state is loaded, one with neither saved
+                state nor a never-stepped record raises ``RuntimeError``.
 
         Returns:
             Tuple of (step, tokens_seen, extra) where extra contains any
@@ -930,6 +972,8 @@ class CheckpointManager:
         fresh_optimizer = load_optim and not _holds_optimizer(saved_keys)
         if fresh_optimizer:
             load_optim = False
+        if load_optim:
+            _check_saved_optimizer_holds(require_held, saved_keys, dcp_dir)
 
         dcp_state: dict[str, Any] = {}
         optimizers = self._optimizers_saved_in(dcp_dir, saved_keys) if load_optim else []

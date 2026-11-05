@@ -200,7 +200,7 @@ def trainable_during_run(model: nn.Module, config: VLMConfig) -> set[str]:
 
 
 @contextlib.contextmanager
-def trainable_for_the_run(model: nn.Module, config: VLMConfig) -> Iterator[None]:
+def trainable_for_the_run(model: nn.Module, config: VLMConfig) -> Iterator[list[str]]:
     """Make every parameter that trains at some step of the run require grad, then restore.
 
     Building the optimizer inside this context puts a parameter that a ``FreezeStage``
@@ -208,15 +208,17 @@ def trainable_for_the_run(model: nn.Module, config: VLMConfig) -> Iterator[None]
     gives that parameter a place in the optimizer's load template. Every registered
     optimizer skips a parameter whose gradient is None, so it stays untouched until a
     stage unfreezes it. A model compiled with ``torch.compile`` is read through the module
-    it wraps.
+    it wraps. Yields the names of the parameters it made require grad.
     """
     inner = getattr(model, "_orig_mod", model)
     names = trainable_during_run(inner, config)
-    flipped = [p for name, p in inner.named_parameters() if name in names and not p.requires_grad]
-    for param in flipped:
+    flipped = [
+        (name, p) for name, p in inner.named_parameters() if name in names and not p.requires_grad
+    ]
+    for _, param in flipped:
         param.requires_grad_(True)
     try:
-        yield
+        yield [name for name, _ in flipped]
     finally:
-        for param in flipped:
+        for _, param in flipped:
             param.requires_grad_(False)
