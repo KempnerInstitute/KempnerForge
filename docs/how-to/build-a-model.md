@@ -182,9 +182,10 @@ other string is looked up directly in the `"mlp"` category, so your
 key just works in dense layers. Two limits apply:
 
 - **Not inside MoE experts.** With `num_experts > 0` the config is
-  rejected: MoE experts (MoT's included) compute core's SwiGLU or
-  standard MLP from the expert weights instead of calling your module.
-  MoMa's experts do call it, so a MoMa run can use it.
+  rejected: the MoE expert kernels (grouped GEMM, packed experts and
+  expert parallelism; MoT's MoE layers included) compute core's SwiGLU
+  or standard MLP from the expert weights instead of calling your
+  module. MoMa's experts do call it, so a MoMa run can use it.
 - **Not core's own keys.** `activation = "swiglu"`, `"standard_gelu"`
   or `"standard_relu"` is rejected; use `silu`, `gelu` or `relu`,
   which select those MLPs.
