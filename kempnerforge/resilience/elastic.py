@@ -194,8 +194,8 @@ def resolve_resume_path(
 
     if short_of_stages is not None:
         logger.error(
-            f"Auto-resume: no checkpoint under {base} has all {num_stages} pipeline stages; "
-            f"resuming {short_of_stages}, the newest whose stage directories are complete. "
+            f"Auto-resume: no complete checkpoint under {base} has all {num_stages} pipeline "
+            f"stages; resuming {short_of_stages}, the newest that is otherwise complete. "
             f"Either a stage stopped before saving, or the checkpoint was saved with another "
             f"pipeline degree, which resume does not support"
         )
