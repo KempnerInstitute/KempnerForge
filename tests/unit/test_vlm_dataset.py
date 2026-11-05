@@ -922,9 +922,11 @@ class TestMultiImageRows:
         assert self._Wrapper(rows)[0]["pixel_values"].shape == (3, 16, 16)
         assert self._Wrapper(rows, max_images=3)[0]["pixel_values"].shape == (3, 16, 16)
 
-    def test_a_longer_list_keeps_the_first_images_and_warns(self, caplog):
+    def test_a_longer_list_keeps_the_first_images_and_warns(self, monkeypatch, caplog):
+        monkeypatch.setattr(vlm_dataset, "_documents_over_image_cap", itertools.count(1))
+        monkeypatch.setattr(logging.getLogger("kempnerforge"), "propagate", True)
         rows = [{"image": [_make_image(8, c) for c in (0, 128, 255)], "caption": "a b"}]
-        with caplog.at_level(logging.WARNING, logger=vlm_dataset.__name__):
+        with caplog.at_level(logging.WARNING, logger="kempnerforge.data.vlm_dataset"):
             pixels = self._Wrapper(rows, max_images=2)[0]["pixel_values"]
         assert pixels.shape == (2, 3, 16, 16)
         assert pixels[0].mean() < pixels[1].mean() < 0.5
