@@ -178,6 +178,39 @@ def test_presets_cover_every_arch_and_both_tensor_parallel_outcomes() -> None:
     assert any(_tp_sequence_parallel(path) for path in CONFIGS)
 
 
+VLM_PRESETS = [path for path in CONFIGS if _arch(path) is not None]
+PRESET_ARCHS = sorted({_arch(path) for path in VLM_PRESETS})
+
+ARCH_OVERRIDES = [
+    pytest.param(path, arch, id=f"{path.name}-{arch}")
+    for path in VLM_PRESETS
+    for arch in PRESET_ARCHS
+    if arch != _arch(path)
+]
+
+
+@pytest.mark.parametrize(("path", "arch"), ARCH_OVERRIDES)
+def test_an_arch_override_that_needs_another_config_class_is_rejected(
+    path: Path, arch: str
+) -> None:
+    """``--vlm.arch`` cannot change the config class the preset's ``[vlm]`` section built, so the
+    preset fails to load and says to set ``arch`` in the TOML, instead of building one arch's
+    blocks behind another arch's strategy."""
+    match = (
+        rf"vlm.arch='{arch}' cannot be applied as an override.*Set arch = \"{arch}\" in the TOML"
+    )
+    with pytest.raises(ValueError, match=match):
+        load_config(str(path), cli_args=[f"--vlm.arch={arch}"])
+
+
+@pytest.mark.parametrize("path", VLM_PRESETS, ids=lambda path: path.name)
+def test_an_arch_override_to_the_presets_own_arch_loads(path: Path) -> None:
+    arch = _arch(path)
+    config = load_config(str(path), cli_args=[f"--vlm.arch={arch}"])
+    assert config.vlm is not None
+    assert config.vlm.arch == type(config.vlm).arch == arch
+
+
 def test_cross_attention_moe_preset_keeps_expert_parallelism() -> None:
     """The guards name arches, so the cross-attention MoE preset still validates with EP."""
     config = load_config(str(CONFIG_DIR / "vlm_debug_moe.toml"), cli_args=["--distributed.ep=2"])
