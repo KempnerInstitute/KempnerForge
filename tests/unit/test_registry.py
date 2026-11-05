@@ -77,11 +77,11 @@ class TestDuplicateRegistration:
             _register_from("kf_owner_second", source, reg)
 
     def test_owner_is_the_registering_module_not_the_objects_module(self):
-        """``os.path.join`` lives in ``posixpath``; the module that registered it owns it."""
+        """``json.dumps`` lives in ``json``; the module that registered it owns it."""
         reg = Registry()
-        source = "import os\n\nreg.register('mlp', 'dup', os.path.join)\n"
+        source = "import json\n\nreg.register('mlp', 'dup', json.dumps)\n"
         _register_from("kf_owner_reexport", source, reg)
-        with pytest.raises(ValueError, match="already registered by kf_owner_reexport;"):
+        with pytest.raises(ValueError, match=r"already registered by kf_owner_reexport\b"):
             _register_from("kf_owner_other", "reg.register('mlp', 'dup', len)\n", reg)
 
     def test_a_rejected_registration_changes_neither_the_entry_nor_its_owner(self):
