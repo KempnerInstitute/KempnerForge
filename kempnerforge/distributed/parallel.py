@@ -97,20 +97,29 @@ def is_fsdp_wrapped(model: torch.nn.Module) -> bool:
 
 
 def refresh_fsdp_dtypes(model: torch.nn.Module, params: Iterable[torch.Tensor]) -> None:
-    """Make FSDP2 recompute the reduction dtypes of the units that hold ``params``.
+    """Make FSDP2 recompute the reduction dtypes of the units that manage ``params``.
 
     FSDP2 takes a unit's original and reduce dtypes from its parameters that require grad
     when the unit first runs. A unit frozen then gets neither, so after a freeze stage
     unfreezes it, its gradients are reduce-scattered in the compute dtype, and assigning
     them to parameters stored in another dtype fails. ``unshard`` recomputes them from the
-    current ``requires_grad``; the unit is resharded right after. Collective: every rank
-    calls this with the same parameters.
+    current ``requires_grad``; the unit is resharded right after. A unit counts only for the
+    parameters it manages itself, not those of the units nested in it. Collective: every
+    rank calls this with the same parameters.
     """
     changed = {id(p) for p in params}
     if not changed:
         return
     for module in model.modules():
-        if isinstance(module, FSDPModule) and any(id(p) in changed for p in module.parameters()):
+        if not isinstance(module, FSDPModule):
+            continue
+        nested = {
+            id(p)
+            for sub in module.modules()
+            if sub is not module and isinstance(sub, FSDPModule)
+            for p in sub.parameters()
+        }
+        if any(id(p) in changed and id(p) not in nested for p in module.parameters()):
             module.unshard()
             module.reshard()
 
@@ -356,9 +365,9 @@ def _apply_fsdp_vlm(
       - Transformer root (embedding + final norm + output head): own unit.
       - Adapter: own unit (small, but keeps grad-sync scheduling symmetric).
       - Vision encoder: wrapped unless no step of the run trains it. An
-        encoder frozen for the whole run stays as a full replica in eval
-        mode; replication is fine because requires_grad=False means no
-        grad-reduce participation. One that a freeze stage unfreezes is
+        encoder frozen for the whole run stays a full replica, put in eval
+        mode at build; replication is fine because requires_grad=False
+        means no grad-reduce participation. One that a freeze stage unfreezes is
         wrapped from the start, while still frozen, so that its gradients
         are reduced across the data-parallel ranks once it trains.
       - The ``VLMWrapper`` itself is not wrapped (no direct parameters).
