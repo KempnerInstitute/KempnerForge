@@ -10,7 +10,15 @@ from pathlib import Path
 import pytest
 
 from kempnerforge.config.loader import load_config
-from kempnerforge.config.registry import registry
+from kempnerforge.config.registry import Registry, registry
+from kempnerforge.config.schema import (
+    AdapterConfig,
+    DistributedConfig,
+    JobConfig,
+    ModelConfig,
+    TrainConfig,
+    VisionEncoderConfig,
+)
 from kempnerforge.config.vlm import VLMConfig
 
 ARCHS = ("joint_decoder", "cross_attention", "mot", "moma")
@@ -144,3 +152,76 @@ class TestArchMatchesClass:
             r"\('joint_decoder'\).*must default arch to the name it is registered under",
         ):
             load_config(_vlm_toml(tmp_path, 'arch = "kf416_unset_arch"'), cli_args=[])
+
+
+def _declare(reg: Registry, name: str, style: str) -> type[VLMConfig]:
+    """Register a ``VLMConfig`` subclass that defaults ``arch`` to ``name``, declared with
+    ``slots=True`` or with a ``default_factory``."""
+    if style == "slots":
+
+        @reg.register_vlm_config(name)
+        @dataclasses.dataclass(slots=True)
+        class SlotsConfig(VLMConfig):
+            arch: str = name
+
+        return SlotsConfig
+
+    @reg.register_vlm_config(name)
+    @dataclasses.dataclass
+    class FactoryConfig(VLMConfig):
+        arch: str = dataclasses.field(default_factory=lambda: name)
+
+    return FactoryConfig
+
+
+class TestDeclaredArch:
+    """A class's arch is its ``arch`` field's default, however the class declares it."""
+
+    def test_the_in_tree_classes_declare_their_arch(self):
+        assert VLMConfig.declared_arch() == "joint_decoder"
+        for arch in ARCHS:
+            assert type(VLMConfig.for_arch(arch)).declared_arch() == arch
+
+    @pytest.mark.parametrize("style", ["slots", "default_factory"])
+    def test_a_subclass_that_defaults_arch_to_its_name_builds(
+        self, tmp_path, isolated_registry, style
+    ):
+        name = f"kf416_{style}"
+        cls = _declare(isolated_registry, name, style)
+        assert cls.declared_arch() == name
+        config = VLMConfig.for_arch(name)
+        assert (type(config), config.arch) == (cls, name)
+        loaded = load_config(_vlm_toml(tmp_path, f'arch = "{name}"'), cli_args=[])
+        assert loaded.vlm is not None
+        assert (type(loaded.vlm), loaded.vlm.arch) == (cls, name)
+        with pytest.raises(
+            ValueError,
+            match=rf"vlm.arch='joint_decoder' does not match {cls.__name__}.arch \('{name}'\)",
+        ):
+            dataclasses.replace(config, arch="joint_decoder")
+
+    def test_a_subclass_without_an_arch_default_raises_type_error(self, isolated_registry):
+        """A bare ``arch: str`` inherits the base default; ``field()`` with none removes it."""
+
+        @isolated_registry.register_vlm_config("kf416_no_default")
+        @dataclasses.dataclass
+        class NoDefaultConfig(VLMConfig):
+            arch: str = dataclasses.field()
+
+        with pytest.raises(TypeError, match="NoDefaultConfig declares arch without a default"):
+            NoDefaultConfig(arch="kf416_no_default")
+
+    def test_parallelism_errors_name_a_slots_class_by_its_arch(self, isolated_registry):
+        cls = _declare(isolated_registry, "kf416_slots_job", "slots")
+        job = JobConfig(
+            model=ModelConfig(dim=64, n_layers=2, n_heads=4, vocab_size=256, max_seq_len=128),
+            train=TrainConfig(seq_len=64),
+            distributed=DistributedConfig(dp_shard=1, tp=2),
+            vision_encoder=VisionEncoderConfig(type="random", num_tokens=8),
+            adapter=AdapterConfig(),
+            vlm=cls(max_text_len=32),
+        )
+        with pytest.raises(
+            ValueError, match=r"vlm.arch='kf416_slots_job' does not support tensor parallelism"
+        ):
+            job.validate(world_size=2)
