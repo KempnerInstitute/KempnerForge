@@ -90,6 +90,7 @@ the dataclass type hint and coerces:
 | `list[DatasetSource]` | `[{"path": …}]` | `[DatasetSource(path=…)]` (recursive) |
 | `Literal["bf16", "fp16", "fp32", "fp8"]` | anything else | `ValueError` |
 | `StrEnum` (`NormType`, `SchedulerType`, …) | `"rmsnorm"` | `NormType.rmsnorm` |
+| `SchedulerType`, `NormType`, `Activation` | a registered name | the name, as a `str` |
 | `X \| None` (Optional) | `None` → `None`; else coerce to `X` |
 
 `Literal` fields reject unknown strings at coercion time — a typo like
@@ -97,6 +98,17 @@ the dataclass type hint and coerces:
 training starts. `"fp16"` passes this check on purpose and is then
 rejected by `TrainConfig.__post_init__`, whose error explains that
 fp16 would train with no loss scaling.
+
+Three enums select a registry builder, so they also accept a name
+registered in their category: `scheduler.name` (`SchedulerType`,
+category `scheduler`), `model.norm_type` (`NormType`, `norm`) and
+`model.activation` (`Activation`, `mlp`). A plugin module in `plugins`
+registers its names before the overrides apply, so
+`--scheduler.name=my_sched` selects a scheduler it registered. A name
+that is neither a member nor registered raises a `ValueError` that
+lists both. The other enums (`train.activation_checkpointing`,
+`distributed.pp_schedule`, `checkpoint.async_mode`) accept only their
+members.
 
 ## Unknown keys
 
