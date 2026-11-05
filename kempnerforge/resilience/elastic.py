@@ -134,7 +134,7 @@ def resolve_resume_path(
             per-stage layout counts only when ``pp0`` through ``pp{num_stages - 1}``
             all hold ``.metadata``, including stages that never created their
             directory; see ``_dcp_durable``. When no step has every stage, the
-            newest one whose stage directories are complete is returned as
+            newest one that is otherwise complete is returned as
             before, after an error log, rather than the run starting over: a
             checkpoint saved with another pipeline degree looks the same, and
             resume does not support changing the degree.
