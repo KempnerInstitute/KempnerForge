@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import re
 import socket
+import sys
 from datetime import timedelta
 from pathlib import Path
 
@@ -26,6 +27,11 @@ from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor import DTensor
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
+
+from convert_checkpoint import dcp_to_hf
+
+import kempnerforge.checkpoint.manager as manager_module
 from kempnerforge.checkpoint.manager import CheckpointManager
 from kempnerforge.config.model import ModelConfig
 from kempnerforge.config.schema import AsyncCheckpointMode, CheckpointConfig
@@ -189,13 +195,16 @@ def _mismatches(got: dict[str, torch.Tensor], expected: dict[str, torch.Tensor])
     return wrong
 
 
-def _save(rank, world, port, names, sizes, overrides, root, async_mode) -> None:
+def _save(rank, world, port, names, sizes, overrides, root, async_mode, unfixed) -> None:
     """Train one step and save; then load into a model built from another seed, at the same layout.
 
-    Rank 0 writes the reference and what the load gave.
+    Rank 0 writes the reference and what the load gave. With ``unfixed`` the save leaves
+    the experts as each rank holds them, as before the fix.
     """
     _init(rank, world, port)
     try:
+        if unfixed:
+            manager_module.expert_layout = lambda model: None
         mesh = init_device_mesh("cpu", sizes, mesh_dim_names=names)
         config = _config(overrides)
         model, optimizer = _build(mesh, config, seed=0)
@@ -207,6 +216,8 @@ def _save(rank, world, port, names, sizes, overrides, root, async_mode) -> None:
         manager.wait()
         if rank == 0:
             torch.save(reference, Path(root) / "reference.pt")
+        if unfixed:
+            return
         resumed, resumed_optimizer = _build(mesh, config, seed=1)
         CheckpointManager(ckpt, resumed, resumed_optimizer).load()
         loaded = _gathered(resumed, resumed_optimizer, mesh)
@@ -228,6 +239,21 @@ def _load(rank, world, port, names, sizes, overrides, step_dir, out) -> None:
         loaded = _gathered(model, optimizer, mesh)
         if rank == 0:
             torch.save(loaded, out)
+    finally:
+        dist.destroy_process_group()
+
+
+def _refuse(rank, world, port, names, sizes, overrides, step_dir) -> None:
+    """Every rank refuses to load ``step_dir`` at this layout, naming what it holds."""
+    _init(rank, world, port)
+    try:
+        mesh = init_device_mesh("cpu", sizes, mesh_dim_names=names)
+        model, optimizer = _build(mesh, _config(overrides), seed=1)
+        manager = CheckpointManager(
+            CheckpointConfig(dir=str(Path(step_dir).parent)), model, optimizer
+        )
+        with pytest.raises(ValueError, match="holds 2 of the 4 experts"):
+            manager.load(path=step_dir)
     finally:
         dist.destroy_process_group()
 
@@ -269,14 +295,14 @@ def _held_experts(step_dir: Path, config: ModelConfig) -> dict[str, list[int]]:
 @pytest.fixture(scope="module")
 def saved_layout(tmp_path_factory):
     """Save each layout once, with its same-layout load; the tests read the files."""
-    roots: dict[tuple[str, str], Path] = {}
+    roots: dict[tuple[str, str, bool], Path] = {}
 
-    def run(layout: str, async_mode: str = "disabled") -> Path:
-        key = (layout, async_mode)
+    def run(layout: str, async_mode: str = "disabled", unfixed: bool = False) -> Path:
+        key = (layout, async_mode, unfixed)
         if key not in roots:
             root = tmp_path_factory.mktemp(layout)
             names, sizes, overrides = LAYOUTS[layout]
-            _spawn(_save, names, sizes, overrides, str(root), async_mode)
+            _spawn(_save, names, sizes, overrides, str(root), async_mode, unfixed)
             roots[key] = root
         return roots[key]
 
@@ -361,3 +387,35 @@ class TestLoadAtAnotherEP:
         out = tmp_path / "loaded.pt"
         _spawn(_load, *DP_SHARD2_EP2, overrides, str(_step_dir(tmp_path)), str(out))
         assert _mismatches(torch.load(out), reference) == []
+
+
+class TestUnfixedCheckpoint:
+    """A checkpoint saved as before the fix holds one EP rank's experts under every rank's names."""
+
+    @pytest.mark.parametrize("layout", ["dp_shard2_ep2", "dp_shard2_ep2_packed"])
+    def test_load_at_the_same_ep_is_refused(self, saved_layout, layout):
+        """Every rank refuses it, rather than load one rank's experts on all of them."""
+        root = saved_layout(layout, unfixed=True)
+        assert _held_experts(_step_dir(root), _config(LAYOUTS[layout][2])) == {
+            f"model.layers.{layer}.mlp": [0, 1] for layer in range(2)
+        }
+        names, sizes, overrides = LAYOUTS[layout]
+        _spawn(_refuse, names, sizes, overrides, str(_step_dir(root)))
+
+    @pytest.mark.parametrize("layout", ["dp_shard2_ep2", "dp_shard2_ep2_packed"])
+    def test_load_without_ep_is_refused_with_what_it_holds(self, saved_layout, layout):
+        """The error names the experts the checkpoint holds and the ``ep`` that saved them."""
+        root = saved_layout(layout, unfixed=True)
+        config = _config(LAYOUTS[layout][2])
+        holds = "layers.0.mlp.up_w has 2 rows" if config.moe_packed_experts else "experts 0-1"
+        with pytest.raises(
+            ValueError, match=rf"holds 2 of the 4 experts of 2 MoE layers .*{holds}.*ep=2"
+        ):
+            _load_one_process(config, _step_dir(root), exclude=["optimizer"])
+
+    @pytest.mark.parametrize("layout", ["dp_shard2_ep2", "dp_shard2_ep2_packed"])
+    def test_dcp_to_hf_is_refused(self, saved_layout, layout, tmp_path):
+        """The export refuses it too, since the other experts' weights were never written."""
+        root = saved_layout(layout, unfixed=True)
+        with pytest.raises(ValueError, match="holds 2 of the 4 experts"):
+            dcp_to_hf(str(_step_dir(root)), str(tmp_path / "hf"), _config(LAYOUTS[layout][2]))
