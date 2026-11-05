@@ -245,6 +245,32 @@ def _load(rank, world, port, names, sizes, overrides, step_dir, out) -> None:
         dist.destroy_process_group()
 
 
+def _save_on_two_meshes(rank, world, port, names, sizes, overrides, root) -> None:
+    """Save and resume twice at one layout, each time on a new mesh.
+
+    DTensor and FSDP2 give the second model's tensors meshes of the first, which are equal
+    to the second's but are other objects. Rank 0 writes each save's reference and what its
+    load gave.
+    """
+    _init(rank, world, port)
+    try:
+        for run in range(2):
+            mesh = init_device_mesh("cpu", sizes, mesh_dim_names=names)
+            config = _config(overrides)
+            model, optimizer = _build(mesh, config, seed=run)
+            _train(model, optimizer, mesh)
+            reference = _gathered(model, optimizer, mesh)
+            ckpt = CheckpointConfig(dir=str(Path(root) / f"ckpt{run}"))
+            CheckpointManager(ckpt, model, optimizer).save(STEP)
+            resumed, resumed_optimizer = _build(mesh, config, seed=run + 2)
+            CheckpointManager(ckpt, resumed, resumed_optimizer).load()
+            loaded = _gathered(resumed, resumed_optimizer, mesh)
+            if rank == 0:
+                torch.save((reference, loaded), Path(root) / f"run{run}.pt")
+    finally:
+        dist.destroy_process_group()
+
+
 def _refuse(rank, world, port, names, sizes, overrides, step_dir) -> None:
     """Every rank refuses to load ``step_dir`` at this layout, naming what it holds."""
     _init(rank, world, port)
@@ -339,6 +365,24 @@ class TestCheckpointHoldsEveryExpert:
         reference = torch.load(root / "reference.pt")
         saved = _saved(_step_dir(root), tmp_path)
         assert _mismatches({k: saved[k] for k in reference if k in saved}, reference) == []
+
+
+class TestSecondMeshOfOneLayout:
+    def test_a_second_mesh_saves_and_resumes_every_expert(self, tmp_path):
+        """A process that builds a second, equal mesh still saves and resumes every expert."""
+        names, sizes, overrides = LAYOUTS["dp_shard2_ep2_packed"]
+        _spawn(_save_on_two_meshes, names, sizes, overrides, str(tmp_path))
+        config = _config(overrides)
+        experts = list(range(config.num_experts))
+        for run in range(2):
+            step_dir = tmp_path / f"ckpt{run}" / f"step_{STEP}"
+            reference, loaded = torch.load(tmp_path / f"run{run}.pt")
+            assert _held_experts(step_dir, config) == {
+                f"model.layers.{layer}.mlp": experts for layer in range(config.n_layers)
+            }
+            saved = _saved(step_dir, tmp_path)
+            assert _mismatches({k: saved[k] for k in reference if k in saved}, reference) == []
+            assert _mismatches(loaded, reference) == []
 
 
 class TestResumeAtTheSameLayout:
