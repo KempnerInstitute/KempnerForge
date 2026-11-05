@@ -55,10 +55,11 @@ registration has to run before `load_config`, which is what the
 `standard_gelu`, `standard_relu`) are rejected, with a pointer to the
 activation that selects each (`silu`, `gelu`, `relu`), whatever was
 imported first. And a plugin's MLP is rejected when `num_experts > 0`:
-MoE experts, MoT's included, compute core's SwiGLU or standard MLP from
-the expert weights rather than calling the expert module. MoMa's
-experts call each expert module, so a plugin's MLP runs there as
-written.
+the MoE expert kernels (grouped GEMM, packed experts, and expert
+parallelism, which uses both), MoT's included, compute core's SwiGLU or
+standard MLP from the expert weights rather than calling the expert
+module. MoMa's experts call each expert module, so a plugin's MLP runs
+there as written.
 
 ## Consumers
 
