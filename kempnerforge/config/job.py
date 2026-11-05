@@ -29,7 +29,7 @@ def _arch_of(vlm: VLMConfig) -> str:
     it, which ``__post_init__`` does not see; the loader rejects a ``--vlm.arch``
     override that would need another class.
     """
-    return type(vlm).arch
+    return type(vlm).declared_arch()
 
 
 @dataclass
