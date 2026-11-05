@@ -62,18 +62,6 @@ def test_an_unknown_arch_lists_only_the_registered_arches(tmp_path, build):
     assert "Reserved" not in message
 
 
-@pytest.fixture
-def isolated_registry():
-    """The global registry, put back as it was after the test."""
-    stores = {category: dict(store) for category, store in registry._stores.items()}
-    owners = {category: dict(names) for category, names in registry._owners.items()}
-    yield registry
-    registry._stores.clear()
-    registry._stores.update(stores)
-    registry._owners.clear()
-    registry._owners.update(owners)
-
-
 class TestArchOverride:
     """``--vlm.arch`` cannot change the config class the TOML's ``[vlm]`` section built."""
 
