@@ -428,18 +428,19 @@ def check_saved_experts(model: torch.nn.Module, saved: Mapping[str, Any], where:
     layer, moe, held = short[0]
     total = moe.num_experts
     holds = (
-        f"{layer}.up_w has {held} rows"
+        f"{layer}.up_w has {held} {'row' if held == 1 else 'rows'}"
         if moe.packed_experts
         else f"{layer} holds experts 0-{held - 1}"
         if held > 1
         else f"{layer} holds expert 0"
     )
-    saved_with = f" with ep={total // held}" if total % held == 0 else ""
+    layers = "MoE layer" if len(short) == 1 else "MoE layers"
+    saved_with = f"ep={total // held}" if total % held == 0 else "expert parallelism"
     raise ValueError(
-        f"{where} holds {held} of the {total} experts of {len(short)} MoE layers ({holds}), "
+        f"{where} holds {held} of the {total} experts of {len(short)} {layers} ({holds}), "
         "so it cannot restore this model's experts. That is what a checkpoint saved with "
-        f"expert parallelism{saved_with} holds when it predates issue #202's fix: every EP "
-        "rank saved its experts under the same names and the checkpoint kept one rank's, so "
-        "the other experts' weights were never written. Load a checkpoint saved with ep=1 "
-        "or after the fix, or start a new run."
+        f"{saved_with} holds when it predates issue #202's fix: every EP rank saved its "
+        "experts under the same names and the checkpoint kept one rank's, so the other "
+        "experts' weights were never written. Load a checkpoint saved with ep=1 or after "
+        "the fix, or start a new run."
     )

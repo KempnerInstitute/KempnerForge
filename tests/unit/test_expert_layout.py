@@ -194,10 +194,12 @@ class TestCheckSavedExperts:
         message = str(error.value)
         assert message.startswith("ckpt/step_4 holds 2 of the 4 experts of 2 MoE layers")
         assert "(layers.0.mlp holds experts 0-1)" in message
-        assert "saved with expert parallelism with ep=2" in message
+        assert "saved with ep=2 holds" in message
 
     def test_packed_checkpoint_of_one_rank_is_refused(self):
-        with pytest.raises(ValueError, match=r"\(layers\.0\.mlp\.up_w has 1 rows\).*ep=4"):
+        with pytest.raises(
+            ValueError, match=r"\(layers\.0\.mlp\.up_w has 1 row\).*saved with ep=4"
+        ):
             check_saved_experts(_model(packed=True), _index(packed_rows=1), "ckpt")
 
     def test_one_expert_is_named_alone(self):
