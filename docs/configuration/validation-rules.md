@@ -73,6 +73,7 @@ File:
 
 - `lr > 0`.
 - `weight_decay ≥ 0`.
+- `weight_decay_scope ∈ {"exclude_norms_and_biases", "all"}`.
 - `betas[0], betas[1] ∈ [0, 1)`.
 - `muon_momentum ∈ (0, 1)`.
 - `muon_ns_steps > 0`.
