@@ -61,6 +61,7 @@ from lmms_eval.protocol import ChatMessages
 from lmms_eval.utils import Collator
 from tqdm import tqdm
 
+from kempnerforge.checkpoint.expert_layout import check_saved_experts
 from kempnerforge.config.job import JobConfig
 from kempnerforge.config.loader import load_config
 from kempnerforge.config.video import VideoConfig
@@ -172,7 +173,8 @@ def _load_weights(
 
     Accepts either a run directory or a specific checkpoint directory (see
     ``resolve_checkpoint``). DCP reshards on load, so checkpoints saved under
-    FSDP/PP load into the full model.
+    FSDP/PP load into the full model. A checkpoint whose MoE layers hold fewer experts
+    than the model is refused (see ``check_saved_experts``).
     """
     ckpt_path = resolve_checkpoint(checkpoint)
     if not ckpt_path.exists():
@@ -182,6 +184,8 @@ def _load_weights(
     model = _build_model(config, device, dtype)
     model.eval()
 
+    saved = dcp.FileSystemReader(str(ckpt_path)).read_metadata().state_dict_metadata
+    check_saved_experts(model, saved, ckpt_path)
     state_dict = {"model": model.state_dict()}
     dcp.load(state_dict, checkpoint_id=str(ckpt_path))
     model.load_state_dict(state_dict["model"])
