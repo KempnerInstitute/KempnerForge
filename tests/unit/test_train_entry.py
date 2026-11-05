@@ -222,8 +222,9 @@ def _nan_on(steps: set[int], step_fn: StepFn = text_step) -> StepFn:
 def _bad_update_on(bad_step: int, step_fn: StepFn = text_step) -> StepFn:
     """Wrap a step body so the iteration that starts at ``bad_step`` makes a bad update.
 
-    Its loss stays finite but its gradients turn NaN, so the optimizer writes NaN
-    into the weights and every later loss is NaN.
+    The step's loss and the gradient norm it reports stay finite, so the NaN check
+    lets it through, but its gradients turn NaN after the norm is taken, so the
+    optimizer writes NaN into the weights and every later loss is NaN.
     """
 
     def bad_update(session: TrainingSession, step: int):
