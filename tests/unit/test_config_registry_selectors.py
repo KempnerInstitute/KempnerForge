@@ -25,6 +25,7 @@ from kempnerforge.config.registry import registry
 from kempnerforge.config.scheduler import SchedulerType
 from kempnerforge.config.training import ActivationCheckpointing
 from kempnerforge.model.mlp import _ACTIVATION_TO_MLP
+from kempnerforge.model.moma import ExpertChoiceMoE
 from kempnerforge.model.transformer import Transformer
 from kempnerforge.training.scheduler import build_scheduler
 
@@ -264,3 +265,63 @@ class TestCoreMlpKeys:
             load_config(cli_args=["--model.activation=kf250_unknown"])
         listed = str(excinfo.value).split("Registered 'mlp' names: ")[1]
         assert not any(key in listed for key, _ in CORE_MLP_KEYS)
+
+
+class TestPluginMlpInMoE:
+    """MoE experts compute core's SwiGLU or standard MLP from their weights, so a plugin's MLP
+    is rejected with ``num_experts > 0``. MoMa's experts run each expert module as it is."""
+
+    @pytest.mark.parametrize("route", ["toml", "cli"])
+    def test_rejected_with_moe(self, tmp_path, write_plugin, route):
+        module = write_plugin(f"kf250_moe_{route}")
+        model = {**TINY_MODEL, "activation": f"{module}_mlp", "num_experts": 2, "moe_top_k": 1}
+        with pytest.raises(ValueError) as excinfo:
+            _load(tmp_path, route, module, {"model": model})
+        assert str(excinfo.value).startswith(
+            f"activation='{module}_mlp' selects a plugin-registered MLP, which MoE experts "
+            "do not support (num_experts=2)"
+        )
+
+    def test_rejected_with_moe_when_the_config_is_built_directly(self):
+        with pytest.raises(ValueError, match="^activation='kf250_direct' selects a plugin"):
+            ModelConfig(**TINY_MODEL, activation="kf250_direct", num_experts=2, moe_top_k=1)
+
+    def test_rejected_for_mot_with_moe(self, write_plugin):
+        """MoT builds an MoE layer per modality when ``num_experts > 0``."""
+        module = write_plugin("kf250_mot")
+        args = [f'--plugins=["{module}"]', f"--model.activation={module}_mlp"]
+        args += ["--model.num_experts=2", "--vlm.arch=mot", "--vision_encoder.type=random"]
+        with pytest.raises(ValueError, match="which MoE experts do not support"):
+            load_config(cli_args=args)
+
+    def test_moma_experts_run_a_plugin_mlp_as_it_is(self, write_plugin):
+        """MoMa keeps ``num_experts = 0``, and each of its expert-choice experts calls its own
+        module, so a plugin MLP loads and computes its own forward, in fp32 and bf16."""
+        module = write_plugin("kf250_moma")
+        args = [f'--plugins=["{module}"]', f"--model.activation={module}_mlp"]
+        config = load_config(cli_args=[*args, "--vlm.arch=moma", "--vision_encoder.type=random"])
+        assert (config.model.activation, type(config.vlm).__name__) == (
+            f"{module}_mlp",
+            "MoMaConfig",
+        )
+        torch.manual_seed(0)
+        for dtype in (torch.float32, torch.bfloat16):
+            moe = ExpertChoiceMoE(
+                dim=64,
+                hidden_dim=128,
+                num_experts=2,
+                capacity_factor=0.5,
+                activation=f"{module}_mlp",
+                gumbel_noise=False,
+            )
+            moe = moe.to(dtype).eval()
+            x = torch.randn(16, 64, dtype=dtype)
+            with torch.no_grad():
+                got = moe(x)
+                scores, indices = moe.router(x)
+                expected = torch.zeros_like(x)
+                for e, expert in enumerate(moe.experts):
+                    out = expert(x.index_select(0, indices[e]))
+                    expected = expected.index_add(0, indices[e], scores[e].unsqueeze(-1) * out)
+            assert type(moe.experts[0]).__name__ == "KfMLP"
+            torch.testing.assert_close(got, expected)
