@@ -86,8 +86,8 @@ class VLMConfig:
     Field summary (full per-field docs are picked up from autodoc):
 
     - ``arch`` VLM architecture discriminator. Subclasses set this via
-      field default; direct construction with an arch name not backed by
-      a registered subclass raises.
+      field default; construction raises when it names an arch that is
+      not registered, or one other than the class's own default.
     - ``max_text_len`` fixed text padding length used by ``VLMCollator``.
       Enforces rank-consistent batches under FSDP2.
     - ``freeze`` static freeze specs applied once at build time.
@@ -109,6 +109,13 @@ class VLMConfig:
         registered = tuple(registry.list_vlm_configs())
         if self.arch not in registered:
             raise ValueError(f"Unknown vlm.arch: {self.arch!r}. Registered: {sorted(registered)}.")
+        if self.arch != type(self).arch:
+            raise ValueError(
+                f"vlm.arch={self.arch!r} does not match {type(self).__name__}.arch "
+                f"({type(self).arch!r}). Each arch has its own config class, so build it "
+                "with VLMConfig.for_arch(arch, ...); a registered subclass must default "
+                "arch to the name it is registered under."
+            )
         if self.max_text_len < 2:
             raise ValueError("vlm.max_text_len must be >= 2 (a caption token plus its target)")
         if self.freeze_schedule:
