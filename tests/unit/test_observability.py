@@ -216,6 +216,48 @@ class TestStepMetrics:
         assert m.mem_utilization == 0.0
 
 
+_GIB = 1024**3
+
+
+class _FakeCudaMemory:
+    """CUDA memory counters on a CPU host, for a process whose current device is cuda:3.
+
+    Like torch, each counter resolves ``device=None`` to the current device; ``reads`` records
+    the device every read resolved to.
+    """
+
+    def __init__(self, monkeypatch) -> None:
+        self.allocated = 0
+        self.peak = 0
+        self.reads: list[int] = []
+        self.resets = 0
+        cuda = torch.cuda
+        monkeypatch.setattr(cuda, "is_available", lambda: True)
+        monkeypatch.setattr(cuda, "current_device", lambda: 3)
+        monkeypatch.setattr(cuda, "memory_allocated", lambda d=None: self._read(d, self.allocated))
+        monkeypatch.setattr(cuda, "max_memory_allocated", lambda d=None: self._read(d, self.peak))
+        monkeypatch.setattr(cuda, "memory_reserved", lambda d=None: self._read(d, self.peak))
+        monkeypatch.setattr(
+            cuda,
+            "get_device_properties",
+            lambda d=None: types.SimpleNamespace(total_memory=self._read(d, 80 * _GIB)),
+        )
+        monkeypatch.setattr(cuda, "reset_peak_memory_stats", self._reset)
+
+    def _read(self, device: int | None, value: int) -> int:
+        self.reads.append(torch.cuda.current_device() if device is None else device)
+        return value
+
+    def _reset(self, device: int | None = None) -> None:
+        self.resets += 1
+        self.peak = self.allocated
+
+    def allocate(self, nbytes: int) -> None:
+        """Hold ``nbytes`` from now on, raising the peak if that is a new high."""
+        self.allocated = nbytes
+        self.peak = max(self.peak, nbytes)
+
+
 class TestDeviceMemoryMonitor:
     def test_report_returns_stats(self):
         monitor = DeviceMemoryMonitor()
@@ -296,6 +338,21 @@ class TestMemoryHelpers:
         """Without CUDA, reset_peak_memory is a no-op (must not raise)."""
         monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
         reset_peak_memory(device=0)
+
+    def test_get_memory_stats_reads_the_current_device(self, monkeypatch):
+        """Without a device, every counter is read from the current device, not from device 0."""
+        fake = _FakeCudaMemory(monkeypatch)
+        fake.allocate(2 * _GIB)
+        assert get_memory_stats() == {
+            "allocated_gb": 2.0,
+            "peak_gb": 2.0,
+            "reserved_gb": 2.0,
+            "total_gb": 80.0,
+        }
+        assert fake.reads == [3, 3, 3, 3]
+        fake.reads.clear()
+        get_memory_stats(device=1)
+        assert fake.reads == [1, 1, 1, 1]
 
 
 class TestWandBBackend:
