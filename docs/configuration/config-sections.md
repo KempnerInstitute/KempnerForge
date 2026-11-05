@@ -88,7 +88,7 @@ Architecture hyperparameters and MoE knobs.
 | `moe_router_z_loss_weight` | `float` | `0.0` | router-logit z-loss coefficient (`0` = off) |
 
 Computed properties: `is_moe`, `head_dim`, `computed_ffn_hidden_dim`,
-`num_params_estimate`.
+`computed_expert_ffn_hidden_dim`, `num_params_estimate`.
 
 ## `[train]` — `TrainConfig`
 
