@@ -2,7 +2,8 @@
 
 ``scheduler.name``, ``model.norm_type`` and ``model.activation`` are typed as enums but
 select registry builders, so the loader also accepts a name registered in their
-category. The other config enums stay closed.
+category. The other config enums stay closed. ``model.activation`` rejects core's own
+``mlp`` keys, and a plugin's MLP when the model has MoE experts.
 """
 
 from __future__ import annotations
