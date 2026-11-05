@@ -386,3 +386,55 @@ class TestPipelineParallelEquivalence:
 
         train_step()
         assert all(p.grad is not None for p in stage_module.parameters()), f"rank {rank}"
+
+    def test_fp32_master_weights_step_under_autocast(self) -> None:
+        """A pp-only mesh has no FSDP2 wrap, so fp32 master weights train under autocast."""
+        from kempnerforge.config.schema import DistributedConfig, JobConfig, TrainConfig
+        from kempnerforge.distributed.parallel import autocast_dtype
+        from kempnerforge.distributed.setup import init_distributed
+        from kempnerforge.training.entry import build_model
+        from kempnerforge.training.loss import build_loss_fn
+        from kempnerforge.training.runtime import RuntimeContext
+
+        rank = int(os.environ["RANK"])
+        world = int(os.environ["WORLD_SIZE"])
+        device = torch.device(f"cuda:{rank}")
+        torch.cuda.set_device(device)
+        mesh = init_distributed(DistributedConfig(dp_shard=1, tp=1, pp=world), seed=42)
+        config = JobConfig(
+            model=CONFIG,
+            train=TrainConfig(
+                batch_size=BATCH // N_MICROBATCHES,
+                seq_len=SEQ,
+                grad_accum_steps=N_MICROBATCHES,
+                compile_model=False,
+                fp32_master_weights=True,
+            ),
+            distributed=DistributedConfig(dp_shard=1, tp=1, pp=world),
+        )
+        runtime = RuntimeContext(
+            rank=rank, local_rank=rank, world_size=world, device=device, device_mesh=mesh
+        )
+        model, pipeline = build_model(config, runtime, build_loss_fn(config.train))
+        assert pipeline is not None
+        assert all(p.dtype == torch.float32 for p in model.parameters())
+        amp_dtype = autocast_dtype(model, torch.float32, torch.bfloat16)
+        assert amp_dtype == torch.bfloat16
+
+        gen = torch.Generator().manual_seed(7)
+        tokens = torch.randint(0, CONFIG.vocab_size, (BATCH, SEQ), generator=gen).to(device)
+        labels = torch.randint(0, CONFIG.vocab_size, (BATCH, SEQ), generator=gen).to(device)
+        losses: list[torch.Tensor] = []
+        with torch.autocast(device_type="cuda", dtype=amp_dtype):
+            if rank == 0:
+                pipeline.schedule.step(tokens, target=labels, losses=losses)
+            elif rank == world - 1:
+                pipeline.schedule.step(target=labels, losses=losses)
+            else:
+                pipeline.schedule.step()
+
+        grads = [p.grad for p in model.parameters() if p.grad is not None]
+        assert grads, f"rank {rank}: backward produced no gradients"
+        assert all(g.dtype == torch.float32 and torch.isfinite(g).all() for g in grads)
+        if rank == world - 1:
+            assert losses and all(torch.isfinite(loss) for loss in losses), f"losses: {losses}"

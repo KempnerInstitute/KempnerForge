@@ -409,6 +409,64 @@ class TestTextStep:
         assert result.loss > 0
 
 
+class TestAutocastFallback:
+    """``TrainingSession.autocast_dtype`` puts the step body's forward under ``torch.autocast``."""
+
+    @pytest.mark.parametrize(
+        ("autocast_dtype", "expected"), [(None, torch.float32), (torch.bfloat16, torch.bfloat16)]
+    )
+    def test_text_step_forward(
+        self, autocast_dtype: torch.dtype | None, expected: torch.dtype
+    ) -> None:
+        session = make_session(make_config(), autocast_dtype=autocast_dtype)
+        seen: list[torch.dtype] = []
+        session.model.out.register_forward_hook(lambda _m, _i, out: seen.append(out.dtype))
+        session.step_fn(session, 0)
+        assert seen == [expected]
+        for p in session.model.parameters():
+            assert p.dtype == torch.float32
+            assert p.grad is not None and p.grad.dtype == torch.float32
+
+    def test_vlm_step_forward(self) -> None:
+        model = TinyVlmModel()
+        batch = {
+            "pixel_values": torch.zeros(2, 3, 4, 4),
+            "input_ids": torch.zeros(2, 4, dtype=torch.long),
+            "labels": torch.zeros(2, 4, dtype=torch.long),
+        }
+        session = make_session(
+            make_config(),
+            model=model,
+            data=DataPipeline(dataloader=[batch]),
+            step_fn=vlm_step,
+            autocast_dtype=torch.bfloat16,
+        )
+        seen: list[torch.dtype] = []
+        model.proj.register_forward_hook(lambda _m, _i, out: seen.append(out.dtype))
+        session.step_fn(session, 0)
+        assert seen == [torch.bfloat16]
+
+    def test_pipeline_schedule_runs_under_autocast(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        enabled: list[bool] = []
+
+        class Schedule(FakeSchedule):
+            def step(self, *args: Any, **kwargs: Any) -> None:
+                enabled.append(torch.is_autocast_enabled("cpu"))
+                super().step(*args, **kwargs)
+
+        session, _ = TestPipelineStep()._session(monkeypatch, rank=0, size=2, sched=Schedule())
+        session.autocast_dtype = torch.bfloat16
+        session.step_fn(session, 0)
+        assert enabled == [True]
+
+    def test_context(self) -> None:
+        with make_session(make_config(), autocast_dtype=torch.bfloat16).autocast():
+            assert torch.is_autocast_enabled("cpu")
+            assert torch.get_autocast_dtype("cpu") == torch.bfloat16
+        with make_session(make_config()).autocast():
+            assert not torch.is_autocast_enabled("cpu")
+
+
 class TestVlmTextTokenGuard:
     def test_missing_count_is_loud(self, tiny_vlm_configs):
         from kempnerforge.training.loop import StepResult, _log_periodic_metrics
@@ -1464,6 +1522,32 @@ class TestBuildModel:
         assert stage.inited is True
         assert stage.emptied_to is not None
 
+    @pytest.mark.parametrize(
+        ("fp32_master_weights", "dtype"), [(False, torch.bfloat16), (True, torch.float32)]
+    )
+    def test_parameters_are_stored_in_the_master_dtype(
+        self, fp32_master_weights: bool, dtype: torch.dtype
+    ) -> None:
+        import kempnerforge.training.entry as entry
+
+        config = make_config(fp32_master_weights=fp32_master_weights)
+        model, _ = entry.build_model(config, _runtime(), lambda a, b: a)
+        assert {p.dtype for p in model.parameters()} == {dtype}
+
+    @pytest.mark.parametrize("dims", [("pp", "dp_shard"), ("pp", "tp")])
+    @pytest.mark.parametrize(
+        ("fp32_master_weights", "dtype"), [(False, torch.bfloat16), (True, torch.float32)]
+    )
+    def test_pp_stage_is_stored_in_the_master_dtype(
+        self, monkeypatch, dims: tuple[str, str], fp32_master_weights: bool, dtype: torch.dtype
+    ) -> None:
+        stage, calls = FakeStageModule(), {}
+        entry = _stub_pp(monkeypatch, stage, calls)
+        config = make_config(fp32_master_weights=fp32_master_weights)
+        config.distributed.pp = 2
+        entry.build_model(config, _pp_runtime(FakeMesh(dims)), "LOSS")
+        assert {p.dtype for p in stage.parameters()} == {dtype}
+
     def test_pp_without_a_mesh_raises_rather_than_asserting(self, monkeypatch):
         stage, calls = FakeStageModule(), {}
         entry = _stub_pp(monkeypatch, stage, calls)
@@ -1506,10 +1590,25 @@ def _vlm_config(**vlm_kw) -> JobConfig:
 
 
 class TestRestoreCheckpoint:
+    @pytest.mark.parametrize(("pp", "expected"), [(1, None), (2, 2), (4, 4)])
+    def test_resolution_gets_the_pipeline_degree(self, monkeypatch, pp, expected):
+        """The step_N scan needs the stage count to see a stage that never saved."""
+        import kempnerforge.training.entry as entry
+
+        seen: list = []
+        monkeypatch.setattr(
+            entry, "resolve_resume_path", lambda _d, num_stages=None: seen.append(num_stages)
+        )
+        config = make_config()
+        config.distributed.pp = pp
+        mgr = FakeResumeManager(step=0, tokens=0)
+        assert entry.restore_checkpoint(config, TinyTextModel(), None, mgr) == (0, 0)
+        assert seen == [expected]
+
     def test_no_checkpoint_and_no_load_path_starts_from_scratch(self, monkeypatch):
         import kempnerforge.training.entry as entry
 
-        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d: None)
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: None)
         mgr = FakeResumeManager()
         assert entry.restore_checkpoint(make_config(), TinyTextModel(), None, mgr) == (0, 0)
         assert mgr.load_kwargs == {}
@@ -1517,7 +1616,7 @@ class TestRestoreCheckpoint:
     def test_resume_returns_the_managers_step_and_tokens(self, monkeypatch, tmp_path):
         import kempnerforge.training.entry as entry
 
-        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d: tmp_path / "step_7")
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: tmp_path / "step_7")
         mgr = FakeResumeManager(step=7, tokens=999)
         assert entry.restore_checkpoint(make_config(), TinyTextModel(), "SCHED", mgr) == (7, 999)
         assert mgr.load_kwargs["scheduler"] == "SCHED"
@@ -1526,7 +1625,7 @@ class TestRestoreCheckpoint:
     def test_load_path_alone_triggers_a_resume(self, monkeypatch):
         import kempnerforge.training.entry as entry
 
-        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d: None)
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: None)
         config = make_config()
         config.checkpoint.load_path = "/somewhere/step_3"
         mgr = FakeResumeManager(step=3, tokens=30)
@@ -1536,7 +1635,7 @@ class TestRestoreCheckpoint:
     def test_metrics_run_ids_are_restored_onto_the_config(self, monkeypatch, tmp_path):
         import kempnerforge.training.entry as entry
 
-        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d: tmp_path / "s")
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: tmp_path / "s")
         config = make_config()
         mgr = FakeResumeManager(extra={"wandb_run_id": "W1", "mlflow_run_id": "M1"})
         entry.restore_checkpoint(config, TinyTextModel(), None, mgr)
@@ -1546,7 +1645,7 @@ class TestRestoreCheckpoint:
     def test_absent_run_ids_do_not_clobber_existing_ones(self, monkeypatch, tmp_path):
         import kempnerforge.training.entry as entry
 
-        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d: tmp_path / "s")
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: tmp_path / "s")
         config = make_config()
         config.metrics.wandb_run_id = "KEEP"
         entry.restore_checkpoint(config, TinyTextModel(), None, FakeResumeManager(extra={}))
@@ -1556,7 +1655,7 @@ class TestRestoreCheckpoint:
         import kempnerforge.training.entry as entry
         from kempnerforge.training.freeze import freeze_meta_at_step
 
-        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d: tmp_path / "s")
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: tmp_path / "s")
         config = _vlm_config()
         mgr = FakeResumeManager(saved_step=11)
         entry.restore_checkpoint(config, TinyTextModel(), None, mgr)
@@ -1567,7 +1666,7 @@ class TestRestoreCheckpoint:
         import kempnerforge.training.entry as entry
         from kempnerforge.config.vlm import FreezeSpec, FreezeStage
 
-        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d: tmp_path / "s")
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: tmp_path / "s")
         applied: list = []
         monkeypatch.setattr(
             entry, "apply_freeze_specs", lambda m, specs, pat: applied.append(list(specs))
@@ -1600,7 +1699,7 @@ class TestRestoreCheckpoint:
         import kempnerforge.training.entry as entry
 
         resume = tmp_path / "step_7" if resume_found else None
-        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d: resume)
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: resume)
         config = make_config()
         config.checkpoint.load_path = load_path
         config.checkpoint.exclude_from_loading = exclude
@@ -1614,7 +1713,7 @@ class TestRestoreCheckpoint:
         load the optimizer, or momentum silently resets mid-run."""
         import kempnerforge.training.entry as entry
 
-        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d: tmp_path / "step_7")
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: tmp_path / "step_7")
         config = make_config()
         config.checkpoint.load_path = "/somewhere/converted"
         config.checkpoint.exclude_from_loading = ["optimizer"]
@@ -1626,12 +1725,32 @@ class TestRestoreCheckpoint:
     def test_exclude_alone_does_not_trigger_a_load(self, monkeypatch):
         import kempnerforge.training.entry as entry
 
-        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d: None)
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: None)
         config = make_config()
         config.checkpoint.exclude_from_loading = ["optimizer"]
         mgr = FakeResumeManager()
         assert entry.restore_checkpoint(config, TinyTextModel(), None, mgr) == (0, 0)
         assert mgr.load_kwargs == {}
+
+    def test_rank_zero_resolves_with_the_pipeline_degree(self, monkeypatch, tmp_path):
+        """The distributed resolution also gets the stage count."""
+        import kempnerforge.training.entry as entry
+
+        seen: list = []
+        chosen = tmp_path / "step_7"
+
+        def resolve(_d, num_stages=None):
+            seen.append(num_stages)
+            return chosen
+
+        monkeypatch.setattr(entry, "resolve_resume_path", resolve)
+        monkeypatch.setattr(entry.dist, "is_initialized", lambda: True)
+        monkeypatch.setattr(entry.dist, "get_rank", lambda: 0)
+        monkeypatch.setattr(entry.dist, "broadcast_object_list", lambda lst, src=0: None)
+        config = make_config()
+        config.distributed.pp = 2
+        entry.restore_checkpoint(config, TinyTextModel(), None, FakeResumeManager())
+        assert seen == [2]
 
     @pytest.mark.parametrize("rank", [0, 1])
     def test_only_rank_zero_resolves_the_resume_path(self, monkeypatch, tmp_path, rank):
@@ -1647,7 +1766,9 @@ class TestRestoreCheckpoint:
 
         looked: list = []
         chosen = tmp_path / "step_7"
-        monkeypatch.setattr(entry, "resolve_resume_path", lambda d: looked.append(d) or chosen)
+        monkeypatch.setattr(
+            entry, "resolve_resume_path", lambda d, _n=None: looked.append(d) or chosen
+        )
         monkeypatch.setattr(entry.dist, "is_initialized", lambda: True)
         monkeypatch.setattr(entry.dist, "get_rank", lambda: rank)
         monkeypatch.setattr(
@@ -1667,7 +1788,7 @@ class TestRestoreCheckpoint:
         import kempnerforge.training.entry as entry
         from kempnerforge.training.freeze import freeze_meta_at_step
 
-        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d: None)
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: None)
         config = _vlm_config()
         config.checkpoint.load_path = "/somewhere/converted"
         config.checkpoint.exclude_from_loading = ["model"]
@@ -1683,7 +1804,7 @@ class TestRestoreCheckpoint:
         from kempnerforge.config.vision import VisionEncoderConfig
         from kempnerforge.config.vlm import MoTConfig
 
-        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d: tmp_path / "s")
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: tmp_path / "s")
         monkeypatch.setattr(torch, "load", lambda *a, **k: {"model": {"w": 1}})
         copied: list = []
         monkeypatch.setattr(
