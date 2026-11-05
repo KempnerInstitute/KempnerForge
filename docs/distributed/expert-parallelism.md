@@ -134,14 +134,14 @@ which places each rank's experts among all `num_experts`:
   `Shard(0)` becoming `_StridedShard(0, split_factor=ep)`.
 
 The presented tensors are views of each rank's own, so a save copies,
-gathers and sends nothing more than DCP writes, and each rank writes
-its own experts. The checkpoint is the one an `ep=1` run writes, with
-the same names and one tensor of `num_experts` rows per packed weight,
-so DCP reshards it like any other parameter: it loads at any `ep` that
-divides `num_experts`, under FSDP, HSDP or TP, and
-[`dcp-to-hf`](../checkpointing/hf-conversion.md) exports every expert.
-An `ep=1` checkpoint loads into an EP run the same way, each rank
-taking its own experts.
+gathers and sends nothing more than DCP writes, and each expert is
+written once, by a rank that holds it. The checkpoint is the one an
+`ep=1` run writes, with the same names and one tensor of `num_experts`
+rows per packed weight, so DCP reshards it like any other parameter:
+it loads at any `ep` that divides `num_experts`, under FSDP, HSDP or
+TP, and [`dcp-to-hf`](../checkpointing/hf-conversion.md) exports every
+expert. An `ep=1` checkpoint loads into an EP run the same way, each
+rank taking its own experts.
 
 A checkpoint saved with `ep>1` before this layout holds
 `num_experts / ep` experts per layer, one rank's, under every rank's
