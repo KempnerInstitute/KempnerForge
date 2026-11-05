@@ -35,6 +35,21 @@ def _registering_module() -> str:
     return frame.f_globals.get("__name__", _UNKNOWN_MODULE)
 
 
+def _registration_site(obj: Any) -> str:
+    """The registering module, plus where ``obj`` is defined when that is another module.
+
+    A shared helper or an ``__init_subclass__`` hook is the registering module for
+    every plugin that goes through it, so the module that defines a registered
+    function or class tells those plugins apart.
+    """
+    module = _registering_module()
+    if inspect.isfunction(obj) or inspect.isclass(obj):
+        defined_in = getattr(obj, "__module__", None)
+        if defined_in and defined_in != module:
+            return f"{module} (for {defined_in}.{obj.__qualname__})"
+    return module
+
+
 class Registry:
     """Central registry for named components."""
 
@@ -50,21 +65,22 @@ class Registry:
     def register(self, category: str, name: str, obj: Any) -> Any:
         """Register an object under category/name.
 
-        Records the registering module, the first caller outside this module, so
+        Records the registering module, the first caller outside this module, and
+        for a function or class defined in another module that module too, so
         that registering the name again raises a ``ValueError`` naming both the
-        module that owns it and the module trying again.
+        registration that owns it and the one trying again.
         """
         store = self._get_store(category)
         owners = self._owners.setdefault(category, {})
-        module = _registering_module()
+        site = _registration_site(obj)
         if name in store:
             owner = owners.get(name)
             by = f" by {owner}" if owner is not None else ""
             raise ValueError(
-                f"{category}/{name} is already registered{by}; {module} tried to register it again"
+                f"{category}/{name} is already registered{by}; {site} tried to register it again"
             )
         store[name] = obj
-        owners[name] = module
+        owners[name] = site
         return obj
 
     def get(self, category: str, name: str) -> Any:
