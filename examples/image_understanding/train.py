@@ -7,12 +7,10 @@ The VLM step body still lives in core, so ``run_training`` selects it from
 
 Usage:
     # Multi-GPU (single node, via torchrun)
-    uv run torchrun --nproc_per_node=4 examples/image_understanding/train.py \
-        examples/image_understanding/configs/qwen3_0.6b_siglip2_stage1.toml
+    uv run torchrun --nproc_per_node=4 examples/image_understanding/train.py <config.toml>
 
     # With overrides
-    uv run torchrun --nproc_per_node=4 examples/image_understanding/train.py \
-        examples/image_understanding/configs/qwen3_0.6b_siglip2_stage1.toml \
+    uv run torchrun --nproc_per_node=4 examples/image_understanding/train.py <config.toml> \
         --train.grad_accum_steps=4
 """
 
