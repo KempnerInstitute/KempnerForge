@@ -44,6 +44,27 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(skip_smoke)
 
 
+@pytest.fixture(autouse=True)
+def _no_inductor_precompiled_headers():
+    """Compile inductor's C++ without precompiled headers, and restore the setting after.
+
+    Precompiling preprocesses a header in a temporary directory under ``TMPDIR``. On NFS,
+    removing that directory can fail with ``OSError: [Errno 39] Directory not empty``,
+    which fails the ``torch.compile`` call.
+    """
+    from torch._inductor import config as inductor_config
+
+    if not hasattr(inductor_config, "cpp_cache_precompile_headers"):
+        yield
+        return
+    saved = inductor_config.cpp_cache_precompile_headers
+    inductor_config.cpp_cache_precompile_headers = False
+    try:
+        yield
+    finally:
+        inductor_config.cpp_cache_precompile_headers = saved
+
+
 TINY_MODEL_CONFIG = ModelConfig(dim=64, n_layers=2, n_heads=2, vocab_size=256, max_seq_len=64)
 
 SMALL_MODEL_CONFIG = ModelConfig(dim=128, n_layers=4, n_heads=4, vocab_size=512, max_seq_len=128)
