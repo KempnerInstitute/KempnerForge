@@ -16,6 +16,7 @@ from kempnerforge.data.vlm_dataset import (
     DEFAULT_IMAGE_MEAN,
     DEFAULT_IMAGE_STD,
     HuggingFaceVLMDataset,
+    MultiImageVLMCollator,
     PackedVLMCollator,
     VLMCollator,
     _tokenize_and_mask,
@@ -669,6 +670,7 @@ class TestHuggingFaceVLMDataset:
                 self._image_std = DEFAULT_IMAGE_STD
                 self._max_text_len = max_text_len
                 self._allow_text_only = False
+                self._max_images = 1
                 self._tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
 
         ds = load_from_disk(tiny_hf_dataset)
@@ -796,6 +798,7 @@ class TestHuggingFaceVLMDataset:
                 self._image_std = DEFAULT_IMAGE_STD
                 self._max_text_len = max_text_len
                 self._allow_text_only = False
+                self._max_images = 1
                 self._tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
 
         mixed = Dataset.from_dict(
@@ -849,6 +852,7 @@ class TestHuggingFaceVLMDataset:
                 self._image_std = DEFAULT_IMAGE_STD
                 self._max_text_len = max_text_len
                 self._allow_text_only = False
+                self._max_images = 1
                 self._tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
 
         ds = load_from_disk(tiny_hf_dataset)
@@ -871,7 +875,7 @@ class TestHuggingFaceVLMDataset:
 
 class TestTextOnlyRows:
     class _Wrapper(HuggingFaceVLMDataset):
-        def __init__(self, rows, allow_text_only):
+        def __init__(self, rows, allow_text_only=False, max_images=1):
             self._ds = rows
             self._image_field = "image"
             self._text_field = "caption"
@@ -881,6 +885,7 @@ class TestTextOnlyRows:
             self._image_std = DEFAULT_IMAGE_STD
             self._max_text_len = 8
             self._allow_text_only = allow_text_only
+            self._max_images = max_images
             from transformers import AutoTokenizer
 
             self._tokenizer = AutoTokenizer.from_pretrained("gpt2")
@@ -901,6 +906,63 @@ class TestTextOnlyRows:
         ds = self._Wrapper([{"image": None, "caption": "a b"}], allow_text_only=False)
         with pytest.raises(ValueError, match="hf_allow_text_only"):
             ds[0]
+
+
+class TestMultiImageRows:
+    _Wrapper = TestTextOnlyRows._Wrapper
+
+    def test_a_list_of_images_stacks_in_order(self):
+        rows = [{"image": [_make_image(8, 0), _make_image(8, 255)], "caption": "a b"}]
+        pixels = self._Wrapper(rows, max_images=2)[0]["pixel_values"]
+        assert pixels.shape == (2, 3, 16, 16)
+        assert pixels[0].mean() < pixels[1].mean()
+
+    def test_a_list_of_one_image_is_a_single_image(self):
+        rows = [{"image": [_make_image(8)], "caption": "a b"}]
+        assert self._Wrapper(rows)[0]["pixel_values"].shape == (3, 16, 16)
+        assert self._Wrapper(rows, max_images=3)[0]["pixel_values"].shape == (3, 16, 16)
+
+    def test_a_longer_list_keeps_the_first_images_and_warns(self, caplog):
+        rows = [{"image": [_make_image(8, c) for c in (0, 128, 255)], "caption": "a b"}]
+        with caplog.at_level(logging.WARNING, logger=vlm_dataset.__name__):
+            pixels = self._Wrapper(rows, max_images=2)[0]["pixel_values"]
+        assert pixels.shape == (2, 3, 16, 16)
+        assert pixels[0].mean() < pixels[1].mean() < 0.5
+        assert "kept its first 2" in caplog.text
+
+    def test_no_cap_takes_them_all(self):
+        rows = [{"image": [_make_image(8) for _ in range(4)], "caption": "a b"}]
+        assert self._Wrapper(rows, max_images=0)[0]["pixel_values"].shape == (4, 3, 16, 16)
+
+    def test_several_images_raise_at_the_default_cap(self):
+        rows = [{"image": [_make_image(8), _make_image(8)], "caption": "a b"}]
+        with pytest.raises(ValueError, match="hf_max_images"):
+            self._Wrapper(rows)[0]
+
+
+class TestMultiImageVLMCollator:
+    def test_one_document_per_fixed_row(self):
+        collator = MultiImageVLMCollator(pad_id=0, max_text_len=8, tokens_per_image=2, max_images=2)
+        assert collator.row_len == 12
+        batch = collator([_doc(3, 10, views=2), _doc(4, 20), _doc(2, 30, views=0)])
+        assert batch["input_ids"].shape == (3, 12)
+        assert batch["pixel_values"].shape == (3, 3, 4, 4)
+        assert batch["image_rows"].tolist() == [0, 0, 1]
+        assert batch["image_starts"].tolist() == [0, 2, 0]
+        assert batch["input_ids"][0, 4:7].tolist() == [10, 11, 12]
+        assert batch["input_ids"][1, 2:6].tolist() == [20, 21, 22, 23]
+        assert batch["input_ids"][2, :2].tolist() == [30, 31]
+        assert batch["doc_ids"][2].tolist() == [0, 0] + [1] * 10
+        assert "frame_mask" not in batch
+
+    def test_bad_sizes_and_empty_batches_raise(self):
+        with pytest.raises(ValueError, match="must be positive"):
+            MultiImageVLMCollator(pad_id=0, max_text_len=8, tokens_per_image=2, max_images=0)
+        collator = MultiImageVLMCollator(pad_id=0, max_text_len=8, tokens_per_image=2, max_images=2)
+        with pytest.raises(ValueError, match="empty batch"):
+            collator([])
+        with pytest.raises(ValueError, match="does not fit a row"):
+            collator([_doc(3, 10, views=5)])
 
 
 class TestFramesToClipTensor:
@@ -1043,6 +1105,14 @@ class TestPackVLMSamples:
         assert batch["image_starts"].shape == (0,)
         assert batch["image_rows"].dtype == torch.long
         assert batch["input_ids"][0].tolist() == [10, 11, 12, 20, 21, 22, 23, 0]
+
+    def test_max_docs_per_row_keeps_documents_apart(self):
+        batch = pack_vlm_samples(
+            [_doc(3, 10), _doc(4, 20)], seq_len=12, tokens_per_image=2, pad_id=0, max_docs_per_row=1
+        )
+        assert batch["input_ids"].shape == (2, 12)
+        assert batch["image_rows"].tolist() == [0, 1]
+        assert batch["doc_ids"][0].tolist() == [0] * 5 + [1] * 7
 
     def test_collator_packs_the_batch(self):
         collator = PackedVLMCollator(pad_id=7, seq_len=12, tokens_per_image=2)

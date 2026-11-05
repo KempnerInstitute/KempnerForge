@@ -98,8 +98,7 @@ class JobConfig:
             if self.vision_encoder.num_tokens > 0:
                 assert self.adapter is not None
                 per_frame = self.adapter.output_num_tokens(self.vision_encoder.num_tokens)
-                frames = self.video.max_frames if self.video is not None else 1
-                visual_tokens = frames * per_frame
+                visual_tokens = self.images_per_document * per_frame
                 residual_image_tokens = self.vlm.residual_stream_image_tokens(visual_tokens)
                 required = residual_image_tokens + self.vlm.max_text_len
                 if self.model.max_seq_len < required:
@@ -121,6 +120,21 @@ class JobConfig:
                 )
             if self.video is not None:
                 raise ValueError("data.hf_allow_text_only applies to image datasets, not [video]")
+        if self.data.hf_max_images != 1:
+            if self.vlm is None or self.video is not None:
+                raise ValueError(
+                    "data.hf_max_images applies to VLM image runs, not text runs or [video]"
+                )
+            if self.vlm.arch != "joint_decoder":
+                raise ValueError(
+                    "data.hf_max_images != 1 requires vlm.arch='joint_decoder' (got "
+                    f"{self.vlm.arch!r}); only its inline route places several images per document"
+                )
+            if self.data.hf_max_images == 0 and not self.data.pack_sequences:
+                raise ValueError(
+                    "data.hf_max_images = 0 (no cap) needs data.pack_sequences, which bounds a "
+                    "document by train.seq_len; set a cap for fixed rows"
+                )
         if self.data.pack_sequences and self.vlm is not None:
             if self.video is not None:
                 raise ValueError("data.pack_sequences is not supported with [video]")
@@ -136,6 +150,13 @@ class JobConfig:
                 f"attention_backend='flex' requires train.seq_len >= {FLEX_BLOCK_SIZE}, "
                 f"got {self.train.seq_len}. Use attention_backend='sdpa' for shorter sequences."
             )
+
+    @property
+    def images_per_document(self) -> int:
+        """Encoder inputs in one sample's residual budget: a clip's frames, else the image cap."""
+        if self.video is not None:
+            return self.video.max_frames
+        return max(self.data.hf_max_images, 1)
 
     @property
     def is_vlm(self) -> bool:
@@ -269,8 +290,7 @@ class JobConfig:
             if self.vision_encoder.num_tokens > 0:
                 assert self.adapter is not None
                 per_frame = self.adapter.output_num_tokens(self.vision_encoder.num_tokens)
-                frames = self.video.max_frames if self.video is not None else 1
-                visual_tokens = frames * per_frame
+                visual_tokens = self.images_per_document * per_frame
                 residual_image_tokens = self.vlm.residual_stream_image_tokens(visual_tokens)
                 required = residual_image_tokens + self.vlm.max_text_len
                 if self.train.seq_len < required:

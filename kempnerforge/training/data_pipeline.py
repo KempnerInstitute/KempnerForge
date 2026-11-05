@@ -94,8 +94,8 @@ def _resolve_pad_id(tokenizer_path: str) -> int:
     return int(resolve_pad_id(build_tokenizer(tokenizer_path)))
 
 
-def _packed_tokens_per_image(config: JobConfig) -> int:
-    """Tokens one image occupies in a packed row: the adapter's output for the encoder's count.
+def _tokens_per_image(config: JobConfig, setting: str) -> int:
+    """Tokens one image occupies in a laid-out row: the adapter's output for the encoder's count.
 
     Raises:
         ValueError: ``vision_encoder.num_tokens`` is unset, so the count is only
@@ -104,9 +104,9 @@ def _packed_tokens_per_image(config: JobConfig) -> int:
     assert config.vision_encoder is not None and config.adapter is not None
     if config.vision_encoder.num_tokens <= 0:
         raise ValueError(
-            "data.pack_sequences on a VLM run needs the per-image token count when the "
-            "data pipeline is built; set vision_encoder.num_tokens to the encoder's token "
-            "count (the model build logs it)"
+            f"{setting} on a VLM run needs the per-image token count when the data pipeline "
+            "is built; set vision_encoder.num_tokens to the encoder's token count (the model "
+            "build logs it)"
         )
     return config.adapter.output_num_tokens(config.vision_encoder.num_tokens)
 
@@ -135,6 +135,7 @@ def _build_vlm_pipeline(config: JobConfig, dp_rank: int, dp_size: int) -> DataPi
 
         from kempnerforge.data.vlm_dataset import (
             HuggingFaceVLMDataset,
+            MultiImageVLMCollator,
             PackedVLMCollator,
             VLMCollator,
         )
@@ -150,10 +151,11 @@ def _build_vlm_pipeline(config: JobConfig, dp_rank: int, dp_size: int) -> DataPi
             image_size=config.data.hf_image_size,
             dataset_config=config.data.hf_dataset_config,
             allow_text_only=config.data.hf_allow_text_only,
+            max_images=config.data.hf_max_images,
         )
         pad_id = _resolve_pad_id(config.data.tokenizer_path)
         if config.data.pack_sequences:
-            tokens_per_image = _packed_tokens_per_image(config)
+            tokens_per_image = _tokens_per_image(config, "data.pack_sequences")
             collator = PackedVLMCollator(
                 pad_id=pad_id, seq_len=tc.seq_len, tokens_per_image=tokens_per_image
             )
@@ -161,6 +163,19 @@ def _build_vlm_pipeline(config: JobConfig, dp_rank: int, dp_size: int) -> DataPi
                 f"VLM dataset: {len(dataset):,} samples from {config.data.hf_dataset_name}, "
                 f"packed {tokens_per_image} image tokens + text per document into rows of "
                 f"{tc.seq_len}"
+            )
+        elif config.data.hf_max_images != 1:
+            tokens_per_image = _tokens_per_image(config, "data.hf_max_images")
+            collator = MultiImageVLMCollator(
+                pad_id=pad_id,
+                max_text_len=vlm_cfg.max_text_len,
+                tokens_per_image=tokens_per_image,
+                max_images=config.data.hf_max_images,
+            )
+            logger.info(
+                f"VLM dataset: {len(dataset):,} samples from {config.data.hf_dataset_name}, "
+                f"up to {config.data.hf_max_images} images x {tokens_per_image} tokens per "
+                f"document in rows of {collator.row_len}"
             )
         else:
             collator = VLMCollator(pad_id=pad_id, max_text_len=vlm_cfg.max_text_len)

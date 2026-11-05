@@ -197,6 +197,21 @@ adapter run on every rank, on a blank image when there is nothing else, because
 their FSDP2 collectives need every rank to take part. Without the flag such a
 row raises.
 
+## Documents with several images
+
+An image column that holds a list of images is a multi-image document.
+`data.hf_max_images = n` (`n >= 2`) accepts up to `n` of them per document, in
+list order, and keeps the first `n` of a longer list with a warning; the
+default of `1` raises on a list of more than one. The images' tokens go before
+the document's text, each image in its own block, which is the layout packing
+uses. With `data.pack_sequences = true` such documents pack like any other;
+without it `MultiImageVLMCollator` lays each document out in its own row of
+`n` images' tokens plus `vlm.max_text_len`, so rows keep one shape across
+micro-batches and ranks. Both need `vlm.arch = "joint_decoder"` and
+`vision_encoder.num_tokens`, and the row has to fit `train.seq_len` and
+`model.max_seq_len`. `hf_max_images = 0` sets no cap and is only allowed with
+packing, where a document is bounded by the row length instead.
+
 ## Start from a pretrained backbone
 
 `scripts/convert_hf_backbone.py` writes a complete VLM checkpoint for a config:
