@@ -60,7 +60,8 @@ What this does:
   steps AdamW with a cosine schedule, and checkpoints to
   `checkpoints/hf_wikitext/step_N` every 100 steps.
 
-Expected output (first few lines):
+Expected output: after the startup messages, a metrics line for step 1
+and then one every 10 steps (`metrics.log_interval`), such as:
 
 ```
 2026-11-04 14:03:12.345 [rank 0] INFO     [step 10] loss=10.4200 | lr=6.00e-05 | grad_norm=1.842 | tok/s=8,420 | mfu=2.1% | mem=9.6/80GB | step_time=1.95s
@@ -89,8 +90,10 @@ uv run torchrun --nproc_per_node=4 scripts/train.py configs/train/hf_wikitext.to
 tokens/sec (assumes 4× H100, bf16, Wikitext streaming fast enough to
 not bottleneck).
 
-Watch the log: every rank reports per-step metrics, but only rank 0
-writes checkpoints. By default, data appears in `checkpoints/hf_wikitext/`
+Watch the log: only rank 0 prints, so the metrics lines are rank 0's,
+and their `tok/s` counts the tokens of all 4 GPUs. Every rank writes its
+own shard of each checkpoint, and rank 0 also writes `train_state.pt`
+and `metadata.json`. By default, data appears in `checkpoints/hf_wikitext/`
 under the current working directory.
 
 ## 5. Kill and auto-resume
