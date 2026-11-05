@@ -125,9 +125,8 @@ copies by different coefficients, and nothing reduces them over `ep`
 afterwards, so they drift apart. On GPU the copies drift apart even
 with one coefficient, with or without clipping, and nothing re-syncs
 them yet ([#482](https://github.com/KempnerInstitute/KempnerForge/issues/482)).
-Every EP rank must make the call,
-since the sum is a collective. How the expert gradients themselves are
-averaged over the group is in
+Every EP rank must make the call, since the sum is a collective. How
+the expert gradients themselves are averaged over the group is in
 [Expert parallelism § Gradients and clipping](../distributed/expert-parallelism.md#gradients-and-clipping).
 
 ### `foreach` parameter
