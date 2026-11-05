@@ -113,6 +113,28 @@ class TestMetricsTracker:
             reads.append(list(fake.reads))
         assert reads == [[3, 3, 3, 3], [3, 3, 3, 3], [], [3, 3, 3, 3]]
 
+    def test_peak_memory_is_the_high_water_mark_of_the_run(self, monkeypatch):
+        """A step-1 spike stays in ``gpu/peak_gb`` and ``mem=`` after use drops; none resets it."""
+        tracker = self._make_tracker(log_interval=1)
+        backend = _FakeBackend()
+        tracker._backends.append(backend)
+        lines: list[str] = []
+        monkeypatch.setattr(tracker_mod.logger, "info", lines.append)
+        monkeypatch.setattr(log_mod, "_supports_color", lambda: False)
+        fake = _FakeCudaMemory(monkeypatch)
+        for step, spike in [(1, 6 * _GIB), (2, _GIB // 2)]:
+            tracker.start_step()
+            fake.allocate(spike)
+            fake.allocate(_GIB // 2)
+            tracker.end_step(step=step, loss=2.0, grad_norm=1.0, lr=3e-4, tokens_in_step=1024)
+        published = [
+            (m["gpu/allocated_gb"], m["gpu/peak_gb"], m["gpu/mem_utilization"])
+            for m, _ in backend.log_calls
+        ]
+        assert published == [(0.5, 6.0, 0.075), (0.5, 6.0, 0.075)]
+        assert ["mem=6.0/80GB" in line for line in lines] == [True, True]
+        assert fake.resets == 0
+
     def test_close_without_backends(self):
         tracker = self._make_tracker()
         tracker.close()
