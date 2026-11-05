@@ -1,6 +1,6 @@
 """MLflow publishing of the VLM eval harness: synthetic sidecars, fake mlflow and pandas.
 
-``kempnerforge.metrics.publish`` is the real one; only ``mlflow`` and ``pandas`` are fakes
+``kempnerforge.metrics.mlflow.publish`` is the real one; only ``mlflow`` and ``pandas`` are fakes
 (``_fake_mlflow``), so the tests need neither package.
 """
 
@@ -25,8 +25,8 @@ import pytest
 from eval_publish import collect_scores, preflight, publish_results, scores_path_for
 from lmms_adapter import resolve_checkpoint
 
-from kempnerforge.metrics.publish import PublishRefused, read_mlflow_target
-from kempnerforge.metrics.publish import main as publish_cli
+from kempnerforge.metrics.mlflow.publish import PublishRefused, read_mlflow_target
+from kempnerforge.metrics.mlflow.publish import main as publish_cli
 
 from ._fake_mlflow import break_import, install_mlflow, install_pandas, uninstall
 from .test_adapter import _patch_loaders, _vlm_job_config
@@ -141,8 +141,8 @@ def _raiser(error: Exception):
 
 def _hint(caplog) -> list[str]:
     """The arguments of the re-publish command the log offers."""
-    (line,) = [m for m in caplog.messages if "python -m kempnerforge.metrics.publish" in m]
-    words = shlex.split(line.split("python -m kempnerforge.metrics.publish ")[1])
+    (line,) = [m for m in caplog.messages if "python -m kempnerforge.metrics.mlflow.publish" in m]
+    words = shlex.split(line.split("python -m kempnerforge.metrics.mlflow.publish ")[1])
     assert words[1] == "--metrics"
     return words
 
@@ -521,7 +521,8 @@ class TestPublishResults:
         assert publish_results(_checkpoint(tmp_path), _results(), None) is False
 
         assert "Refused: mlflow could not be imported" in _warnings(caplog)
-        assert "uv sync --group mlflow" in _warnings(caplog)
+        assert "the environment is incomplete, run: uv sync" in _warnings(caplog)
+        assert "--group mlflow" not in _warnings(caplog)
         assert _hint(caplog)
 
     def test_an_unwritable_location_falls_back_to_a_temporary_file(
@@ -650,14 +651,15 @@ class TestPreflight:
         assert "pass --no-publish to silence this" in text
         assert "--limit" not in text
 
-    def test_missing_packages_are_named_with_their_dependency_group(
+    def test_missing_packages_are_named_with_how_to_install_them(
         self, tmp_path, monkeypatch, caplog
     ):
         uninstall(monkeypatch, "mlflow")
         uninstall(monkeypatch, "pandas")
         preflight(_checkpoint(tmp_path), None)
         text = _warnings(caplog)
-        assert "uv sync --group mlflow" in text and "uv sync --group eval" in text
+        assert "the environment is incomplete, run: uv sync --group eval" in text
+        assert "uv sync --group eval" in text and "--group mlflow" not in text
 
     def test_a_dependency_that_breaks_when_imported_is_a_warning_not_an_abort(
         self, tmp_path, monkeypatch, caplog

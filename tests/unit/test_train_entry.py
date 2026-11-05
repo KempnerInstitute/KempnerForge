@@ -9,7 +9,9 @@ dispatch, and the data-pipeline builder.
 from __future__ import annotations
 
 import dataclasses
+import json
 from collections.abc import Iterator
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -602,6 +604,24 @@ class TestRunTrainingLoop:
         assert ckpt.saves == []
         assert ckpt.waits == 1
 
+    def test_a_finite_loss_with_nan_gradients_skips_the_step(self):
+        """NaN gradients under a finite loss never reach the optimizer."""
+
+        def loss_fn(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+            logits.register_hook(lambda grad: torch.full_like(grad, float("nan")))
+            return logits.float().mean()
+
+        config = make_config(max_steps=10)
+        session = make_session(
+            config, loss_fn=loss_fn, nan_detector=NaNDetector(action="warn", max_consecutive=3)
+        )
+        before = [p.detach().clone() for p in session.model.parameters()]
+        step, _ = run_training_loop(session)
+        assert step == 2
+        assert session.nan_detector.state.total_nans == 3
+        for old, new in zip(before, session.model.parameters(), strict=True):
+            assert torch.equal(old, new)
+
     def test_shutdown_writes_an_emergency_checkpoint_and_finishes(self):
         config = make_config(max_steps=10)
         config.checkpoint.interval = 100
@@ -982,6 +1002,19 @@ class TestBuildPhaseHelpers:
         assert mgr._process_group is None
         assert mgr._pp_rank is None
 
+    def test_checkpoint_manager_records_the_weight_decay_scope(self, tmp_path):
+        from kempnerforge.training.entry import build_checkpoint_manager
+
+        config = make_config()
+        config.checkpoint.dir = str(tmp_path / "ckpt")
+        config.optimizer.weight_decay_scope = "all"
+        model = TinyTextModel()
+        build_checkpoint_manager(
+            config, _runtime(), model, torch.optim.SGD(model.parameters(), lr=0.1), None
+        ).save(step=0)
+        meta = json.loads((tmp_path / "ckpt" / "step_0" / "metadata.json").read_text())
+        assert meta["weight_decay_scope"] == "all"
+
     def test_restore_checkpoint_starts_from_scratch(self, tmp_path):
         from kempnerforge.training.entry import build_checkpoint_manager, restore_checkpoint
 
@@ -991,6 +1024,78 @@ class TestBuildPhaseHelpers:
         optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
         mgr = build_checkpoint_manager(config, _runtime(), model, optimizer, None)
         assert restore_checkpoint(config, model, None, mgr) == (0, 0)
+
+
+class TestWeightDecayScopeWarmStart:
+    """Starting a run under either ``weight_decay_scope`` from a checkpoint in ``load_path``."""
+
+    @staticmethod
+    def _run(checkpoint_dir, scope, seed):
+        from kempnerforge.model.transformer import Transformer
+        from kempnerforge.training.entry import build_checkpoint_manager
+        from kempnerforge.training.optimizer import build_optimizer
+
+        config = make_config()
+        config.checkpoint.dir = str(checkpoint_dir)
+        config.optimizer.weight_decay_scope = scope
+        config.optimizer.fused = False
+        torch.manual_seed(seed)
+        model = Transformer(config.model)
+        optimizer = build_optimizer(model, config.optimizer)
+        manager = build_checkpoint_manager(config, _runtime(), model, optimizer, None)
+        return config, model, optimizer, manager
+
+    @pytest.mark.parametrize("scope", ["exclude_norms_and_biases", "all"])
+    def test_a_converted_checkpoint_warm_starts_under_either_scope(
+        self, tmp_path, monkeypatch, scope
+    ):
+        """hf-to-dcp writes only the model, no ``metadata.json``; it loads, the optimizer fresh."""
+        from kempnerforge.model.transformer import Transformer
+        from kempnerforge.training.entry import restore_checkpoint
+
+        monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2] / "scripts"))
+        from convert_checkpoint import _kf_to_hf_key, hf_to_dcp
+
+        model_config = make_config().model
+        torch.manual_seed(0)
+        source = Transformer(model_config)
+        hf_dir = tmp_path / "hf"
+        hf_dir.mkdir()
+        hf_state = {_kf_to_hf_key(k): v for k, v in source.state_dict().items()}
+        torch.save(hf_state, hf_dir / "pytorch_model.bin")
+        hf_to_dcp(str(hf_dir), str(tmp_path / "pretrained"), model_config)
+        assert not (tmp_path / "pretrained" / "metadata.json").exists()
+
+        config, model, optimizer, manager = self._run(tmp_path / "run", scope, seed=1)
+        config.checkpoint.load_path = str(tmp_path / "pretrained")
+        assert restore_checkpoint(config, model, None, manager) == (0, 0)
+        for a, b in zip(source.parameters(), model.parameters(), strict=True):
+            assert torch.equal(a, b), "the converted weights were not loaded"
+        assert not optimizer.state
+
+    def test_the_refusal_names_a_warm_start_that_works(self, tmp_path):
+        """The error's way out needs a ``checkpoint.dir`` with nothing to resume, and says so."""
+        from kempnerforge.training.entry import restore_checkpoint
+
+        _, model, optimizer, manager = self._run(tmp_path / "saved", "exclude_norms_and_biases", 0)
+        model(torch.randint(0, VOCAB, (2, 4))).sum().backward()
+        optimizer.step()
+        manager.save(step=1)
+
+        config, model, _, manager = self._run(tmp_path / "saved", "all", seed=1)
+        with pytest.raises(ValueError, match="a checkpoint.dir that holds no checkpoint"):
+            restore_checkpoint(config, model, None, manager)
+
+        config.checkpoint.load_path = str(tmp_path / "saved" / "step_1")
+        config.checkpoint.exclude_from_loading = ["optimizer"]
+        with pytest.raises(ValueError, match="but this run uses 'all'"):
+            restore_checkpoint(config, model, None, manager)
+
+        config, model, optimizer, manager = self._run(tmp_path / "new", "all", seed=1)
+        config.checkpoint.load_path = str(tmp_path / "saved" / "step_1")
+        config.checkpoint.exclude_from_loading = ["optimizer"]
+        assert restore_checkpoint(config, model, None, manager) == (1, 0)
+        assert not optimizer.state
 
 
 class TestBuildDataPipeline:

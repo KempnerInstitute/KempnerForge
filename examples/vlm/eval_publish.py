@@ -1,7 +1,7 @@
 """Publish a checkpoint's lmms-eval scores to the MLflow run it was trained under.
 
 ``eval.py`` calls this after scoring. The run comes from the checkpoint's ``metadata.json``
-and each score is appended through ``kempnerforge.metrics.publish`` as
+and each score is appended through ``kempnerforge.metrics.mlflow.publish`` as
 ``eval/<task>_<metric>`` at the checkpoint's step (``_<filter>`` follows when lmms-eval
 reports a filter other than ``none``). A summary table and ``scores.json`` go to the same
 run under ``eval/step_<N>/<UTC timestamp>/``: one directory per evaluation, so repeated or
@@ -30,7 +30,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from kempnerforge.metrics.publish import (
+from kempnerforge.metrics.mlflow.publish import (
     MlflowTarget,
     PublishRefused,
     publish_metrics,
@@ -42,7 +42,10 @@ logger = logging.getLogger(__name__)
 _TABLE_COLUMNS = ["step", "benchmark", "metric", "filter", "score", "stderr", "n_samples", "name"]
 _NAME_SEPARATORS = re.compile(r"[^A-Za-z0-9.-]+")
 _URL = re.compile(r"\b([a-zA-Z][a-zA-Z0-9+.-]*://)[^\s'\"<>]+")
-_DEPENDENCY_GROUPS = {"mlflow": "mlflow", "pandas": "eval"}
+_INSTALL_HINTS = {
+    "mlflow": "the environment is incomplete, run: uv sync --group eval",
+    "pandas": "install it with: uv sync --group eval",
+}
 
 
 @dataclass(frozen=True)
@@ -167,14 +170,13 @@ def _failure(error: Exception) -> str:
 
 
 def _import(module: str) -> Any:
-    """``module``, or an ImportError naming its dependency group: a broken install can raise
+    """``module``, or an ImportError saying how to install it: a broken install can raise
     errors that are not ImportErrors (a binary incompatibility is a ValueError)."""
     try:
         return importlib.import_module(module)
     except Exception as e:
         raise ImportError(
-            f"{module} could not be imported ({_failure(e)}); "
-            f"install it with: uv sync --group {_DEPENDENCY_GROUPS[module]}"
+            f"{module} could not be imported ({_failure(e)}); {_INSTALL_HINTS[module]}"
         ) from e
 
 
@@ -188,7 +190,7 @@ def preflight(checkpoint: Path, limit: int | float | None) -> None:
         problems.append(str(e))
     except Exception as e:
         problems.append(f"the checkpoint's metadata.json could not be read ({_failure(e)})")
-    for module in _DEPENDENCY_GROUPS:
+    for module in _INSTALL_HINTS:
         try:
             _import(module)
         except ImportError as e:
@@ -233,7 +235,7 @@ def _save(path: Path, mapping: Mapping[str, float]) -> Path | None:
 
 def _republish_command(checkpoint: Path, saved: Path) -> str:
     ckpt, scores = shlex.quote(str(checkpoint)), shlex.quote(str(saved))
-    return f"python -m kempnerforge.metrics.publish {ckpt} --metrics {scores}"
+    return f"python -m kempnerforge.metrics.mlflow.publish {ckpt} --metrics {scores}"
 
 
 def _not_published(why: str, checkpoint: Path, saved: Path) -> None:

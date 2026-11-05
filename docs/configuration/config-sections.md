@@ -111,6 +111,7 @@ Training-loop hyperparameters.
 | `loss_fn` | `str` | `"cross_entropy"` | `loss` registry key (or `"chunked_cross_entropy"`) |
 | `z_loss_weight` | `float` | `0.0` | logit-magnitude regularizer (PaLM uses `1e-4`) |
 | `ce_chunk_size` | `int` | `0` | chunk size for `chunked_cross_entropy` (`0` → auto 4096) |
+| `fp32_cross_entropy` | `bool` | `False` | compute `cross_entropy` / `chunked_cross_entropy` and their gradient in fp32 from bf16 logits, without an fp32 copy of the logits; rejected for any other `loss_fn` — see [Losses § fp32 cross-entropy](../training/losses.md#fp32-cross-entropy) |
 | `shutdown_timeout_sec` | `float` | `600.0` | graceful shutdown timeout before forced exit |
 | `nccl_health_check_interval` | `int` | `0` | NCCL liveness all-reduce every N steps (`0` = disabled) |
 
@@ -126,7 +127,7 @@ are shared (AdamW/Lion) or optimizer-specific.
 |-------|------|---------|---------|
 | `name` | `str` | `"adamw"` | one of `adamw`, `lion`, `muon`, `schedule_free_adamw` |
 | `lr` | `float` | `3e-4` | peak learning rate |
-| `weight_decay` | `float` | `0.1` | L2 on 2-D params |
+| `weight_decay` | `float` | `0.1` | decoupled weight decay, applied to the group `weight_decay_scope` selects |
 | `betas` | `tuple[float, float]` | `(0.9, 0.95)` | AdamW / Lion momenta |
 | `eps` | `float` | `1e-8` | numerical safety (AdamW) |
 | `fused` | `bool` | `True` | use fused AdamW when available |
@@ -137,6 +138,7 @@ are shared (AdamW/Lion) or optimizer-specific.
 | `muon_adjust_lr` | `"original" \| "match_rms_adamw" \| "spectral_unclamped"` | `"original"` | Factor on each orthogonalized update |
 | `muon_orthogonalize` | `"local" \| "exact"` | `"local"` | Newton–Schulz on each rank's shard, or on the full matrix |
 | `schedule_free_warmup_steps` | `int` | `0` | internal warmup for schedule-free |
+| `weight_decay_scope` | `"exclude_norms_and_biases" \| "all"` | `"exclude_norms_and_biases"` | which parameters are decayed; `"all"` decays every parameter, as `torch.optim.AdamW` does by default. A resume that restores optimizer state saved under the other scope is refused |
 
 ## `[scheduler]` — `SchedulerConfig`
 
