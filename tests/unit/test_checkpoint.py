@@ -1836,7 +1836,7 @@ class TestAsyncLatestSymlinkSafety:
         assert tokens == 2000
 
     def test_cleanup_never_deletes_latest_or_in_flight(self, tmp_path, pruned_dirs):
-        """Step 6 is the newest, so only their protection keeps steps 3 and 5."""
+        """Step 6 is newest, so only the latest and in-flight protections keep steps 3 and 5."""
         mgr = self._mgr(tmp_path, AsyncCheckpointMode.async_pinned)
         mgr.config.keep_last_n = 1
         dirs = {s: self._build_ckpt(tmp_path, s, complete=True) for s in (1, 2, 3, 4, 5, 6)}
