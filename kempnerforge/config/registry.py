@@ -18,8 +18,21 @@ Usage:
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Callable
 from typing import Any
+
+_UNKNOWN_MODULE = "an unknown module"
+
+
+def _registering_module() -> str:
+    """Name of the module calling into the registry: the first frame outside this module."""
+    frame = inspect.currentframe()
+    while frame is not None and frame.f_globals.get("__name__") == __name__:
+        frame = frame.f_back
+    if frame is None:
+        return _UNKNOWN_MODULE
+    return frame.f_globals.get("__name__", _UNKNOWN_MODULE)
 
 
 class Registry:
@@ -27,6 +40,7 @@ class Registry:
 
     def __init__(self) -> None:
         self._stores: dict[str, dict[str, Any]] = {}
+        self._owners: dict[str, dict[str, str]] = {}
 
     def _get_store(self, category: str) -> dict[str, Any]:
         if category not in self._stores:
@@ -34,11 +48,23 @@ class Registry:
         return self._stores[category]
 
     def register(self, category: str, name: str, obj: Any) -> Any:
-        """Register an object under category/name."""
+        """Register an object under category/name.
+
+        Records the registering module, the first caller outside this module, so
+        that registering the name again raises a ``ValueError`` naming both the
+        module that owns it and the module trying again.
+        """
         store = self._get_store(category)
+        owners = self._owners.setdefault(category, {})
+        module = _registering_module()
         if name in store:
-            raise ValueError(f"{category}/{name} is already registered")
+            owner = owners.get(name)
+            by = f" by {owner}" if owner is not None else ""
+            raise ValueError(
+                f"{category}/{name} is already registered{by}; {module} tried to register it again"
+            )
         store[name] = obj
+        owners[name] = module
         return obj
 
     def get(self, category: str, name: str) -> Any:
