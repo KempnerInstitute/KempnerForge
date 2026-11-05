@@ -8,7 +8,10 @@ category. The other config enums stay closed.
 from __future__ import annotations
 
 import importlib
+import os
+import subprocess
 import sys
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -17,11 +20,15 @@ import torch
 from kempnerforge.config.checkpoint import AsyncCheckpointMode
 from kempnerforge.config.distributed import PipelineSchedule
 from kempnerforge.config.loader import load_config
-from kempnerforge.config.model import Activation, NormType
+from kempnerforge.config.model import CORE_MLP_KEY_ACTIVATIONS, Activation, ModelConfig, NormType
+from kempnerforge.config.registry import registry
 from kempnerforge.config.scheduler import SchedulerType
 from kempnerforge.config.training import ActivationCheckpointing
+from kempnerforge.model.mlp import _ACTIVATION_TO_MLP
 from kempnerforge.model.transformer import Transformer
 from kempnerforge.training.scheduler import build_scheduler
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 PLUGIN = """\
 import torch
@@ -195,3 +202,65 @@ def test_a_closed_enum_rejects_names_registered_for_the_open_ones(write_plugin, 
     for name in (f"{module}_sched", f"{module}_norm", f"{module}_mlp"):
         with pytest.raises(ValueError, match=f"^'{name}' is not a valid {enum_type.__name__}$"):
             load_config(cli_args=[f'--plugins=["{module}"]', f"--{key}={name}"])
+
+
+CORE_MLP_KEYS = [("swiglu", "silu"), ("standard_gelu", "gelu"), ("standard_relu", "relu")]
+
+
+def _core_key_message(key: str, activation: str) -> str:
+    return (
+        f"activation={key!r} is the mlp registry key that activation={activation!r} selects; "
+        f"set activation={activation!r} instead"
+    )
+
+
+class TestCoreMlpKeys:
+    """Core's own ``mlp`` keys are rejected as ``model.activation``, with the activation that
+    selects each, whatever was imported before the config loads."""
+
+    def test_they_are_the_keys_the_activations_select(self):
+        selected = {key: Activation(activation) for activation, key in _ACTIVATION_TO_MLP.items()}
+        assert selected == CORE_MLP_KEY_ACTIVATIONS
+
+    @pytest.mark.parametrize(("key", "activation"), CORE_MLP_KEYS)
+    def test_rejected_at_load_with_the_model_imported(self, key, activation):
+        assert key in registry.list("mlp")
+        with pytest.raises(ValueError) as excinfo:
+            load_config(cli_args=[f"--model.activation={key}"])
+        assert str(excinfo.value) == _core_key_message(key, activation)
+
+    def test_rejected_the_same_way_with_only_the_loader_imported(self):
+        """A fresh interpreter, where no core module has registered the keys yet."""
+        code = (
+            "import sys\n"
+            "from kempnerforge.config.loader import load_config\n"
+            "from kempnerforge.config.registry import registry\n"
+            "assert registry.list('mlp') == []\n"
+            "for key in sys.argv[1:]:\n"
+            "    try:\n"
+            "        load_config(cli_args=[f'--model.activation={key}'])\n"
+            "    except ValueError as e:\n"
+            "        print(e)\n"
+        )
+        keys = [key for key, _ in CORE_MLP_KEYS]
+        result = subprocess.run(
+            [sys.executable, "-c", code, *keys],
+            env={**os.environ, "PYTHONPATH": str(REPO_ROOT)},
+            capture_output=True,
+            text=True,
+            timeout=150,
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.splitlines() == [_core_key_message(*pair) for pair in CORE_MLP_KEYS]
+
+    @pytest.mark.parametrize(("key", "activation"), CORE_MLP_KEYS)
+    def test_rejected_when_the_config_is_built_directly(self, key, activation):
+        with pytest.raises(ValueError) as excinfo:
+            ModelConfig(activation=key)
+        assert str(excinfo.value) == _core_key_message(key, activation)
+
+    def test_left_out_of_the_names_an_unknown_activation_lists(self):
+        with pytest.raises(ValueError) as excinfo:
+            load_config(cli_args=["--model.activation=kf250_unknown"])
+        listed = str(excinfo.value).split("Registered 'mlp' names: ")[1]
+        assert not any(key in listed for key, _ in CORE_MLP_KEYS)
