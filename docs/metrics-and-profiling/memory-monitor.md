@@ -4,9 +4,9 @@ Two layers in
 [`kempnerforge/metrics/memory.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/metrics/memory.py):
 
 - **Functional helpers** — `get_memory_stats`, `get_memory_utilization`,
-  `format_memory_stats`, `reset_peak_memory`. These are used by the
-  [metrics tracker](metrics-tracker.md) every step to populate
-  `StepMetrics.peak_gb` / `mem_utilization`.
+  `format_memory_stats`, `reset_peak_memory`. The
+  [metrics tracker](metrics-tracker.md) calls `get_memory_stats` once on
+  every logging step to fill the `StepMetrics` memory fields.
 - **`DeviceMemoryMonitor`** — opt-in per-interval tracker that adds
   peak-reset semantics and an optional snapshot export for OOM debugging.
 
@@ -18,17 +18,22 @@ from kempnerforge.metrics import (
     format_memory_stats, reset_peak_memory,
 )
 
-stats = get_memory_stats(device=0)
+stats = get_memory_stats()
 # {"allocated_gb": 12.3, "peak_gb": 14.8,
 #  "reserved_gb": 16.0, "total_gb": 80.0}
 
-utilization = get_memory_utilization(device=0)   # peak_gb / total_gb
+utilization = get_memory_utilization()   # peak_gb / total_gb
 
-print(format_memory_stats(device=0))
+print(format_memory_stats())
 # "GPU mem: 12.3GB allocated, 14.8GB peak, 16.0GB reserved / 80.0GB total (19%)"
 
-reset_peak_memory(device=0)   # torch.cuda.reset_peak_memory_stats
+reset_peak_memory()   # torch.cuda.reset_peak_memory_stats
 ```
+
+Each helper reads one device. The default, `device=None`, is the current
+CUDA device (`torch.cuda.current_device()`), which `init_distributed`
+sets to the rank's own GPU; pass an index, such as `device=1`, to read
+another.
 
 Four quantities, all in GB:
 
@@ -51,7 +56,7 @@ window-scoped peak tracking:
 from kempnerforge.metrics import DeviceMemoryMonitor
 
 mon = DeviceMemoryMonitor(
-    device=0,
+    device=None,               # the current CUDA device (default)
     snapshot_step=100,         # None to disable
     snapshot_dir="memory_snapshots",
 )
@@ -76,15 +81,22 @@ and you can't see that step 200 spiked higher than step 100.
 
 ## Why `MetricsTracker` doesn't reset peak
 
-`MetricsTracker.end_step` reads `get_memory_stats` every step but
-**does not reset peak memory**. The `peak_gb` field in `StepMetrics`
-therefore reports the all-time peak since the process started, not the
-per-step peak. This matches what most people want in a training log:
-"what's my worst-case memory footprint."
+`MetricsTracker.end_step` reads `get_memory_stats` once on each logging
+step, from the current device, and **does not reset peak memory**.
+`StepMetrics.peak_gb`, the `gpu/peak_gb` series and the `mem=` column of
+the step log are therefore the high-water mark of the run: the most
+memory allocated at any point since the process started, not the peak
+of that step or of that logging interval. The value never goes down, so
+a single spike, such as one in the first step, shows for the rest of the
+run. `gpu/mem_utilization` is that peak over `total_gb`. This matches
+what most people want in a training log: "what's my worst-case memory
+footprint."
 
-If you want per-step peak instead, add a `DeviceMemoryMonitor.report()`
-call alongside the tracker — the `reset_peak_memory()` it issues is
-global, so subsequent tracker reads reflect only the new interval.
+If you want a per-interval peak instead, call
+`DeviceMemoryMonitor.report()` alongside the tracker. The
+`reset_peak_memory()` it issues applies to the whole device, so from
+then on the tracker's `peak_gb` covers only the time since the last
+report.
 
 ## Memory snapshot export
 
