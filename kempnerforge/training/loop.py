@@ -500,10 +500,11 @@ def _shutdown_if_requested(
     Returns True when the loop must stop. With ``saved_this_step``, the
     scheduled save of ``step`` is the emergency checkpoint, so it is drained
     with ``wait()`` rather than written twice. A ``nan_skipped`` step is
-    saved only if every rank's parameters are finite: after a bad update (a
-    finite loss with non-finite gradients) they are not, and their
-    checkpoint would become ``latest`` and count toward ``keep_last_n``,
-    which can prune the last good one.
+    saved only if every rank's parameters are finite: after a bad update
+    (an optimizer step that left non-finite weights although its loss and
+    gradient norm were finite) they are not, and their checkpoint would
+    become ``latest`` and count toward ``keep_last_n``, which can prune the
+    last good one.
     """
     if not session.shutdown_handler.should_shutdown():
         return False
