@@ -180,13 +180,16 @@ def trainable_during_run(model: nn.Module, config: VLMConfig) -> set[str]:
     Works on the names alone and leaves ``model`` as it is. The build applies
     ``config.freeze`` to each parameter's current ``requires_grad``. From there each
     ``FreezeStage`` applies its specs at its ``start_step``, and a resume applies
-    ``effective_freeze`` at the resumed step. A parameter that requires grad after any
-    of these is in the result.
+    ``effective_freeze`` at the resumed step, before the first stage as well as after
+    each. A parameter that requires grad after any of these is in the result.
     """
     patterns = config.module_patterns
     built = {name: param.requires_grad for name, param in model.named_parameters()}
     _apply_to_names(built, config.freeze, patterns)
     trainable = {name for name, on in built.items() if on}
+    resumed_before_stages = dict(built)
+    _apply_to_names(resumed_before_stages, effective_freeze(0, config.freeze, []), patterns)
+    trainable.update(name for name, on in resumed_before_stages.items() if on)
     running = dict(built)
     for stage in sorted(config.freeze_schedule, key=lambda s: s.start_step):
         _apply_to_names(running, stage.specs, patterns)

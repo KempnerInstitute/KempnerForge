@@ -287,6 +287,22 @@ class TestTrainableDuringRun:
         )
         assert trainable_during_run(model, config) == _ALL - {"vision_encoder.0.bias"}
 
+    def test_a_parameter_that_only_a_resume_before_the_first_stage_trains_counts(self, model):
+        """The build applies the repeated encoder spec last, so the bias stays frozen;
+        effective_freeze keeps the encoder key where it first appeared, so a resume before the
+        stage unfreezes the bias."""
+        patterns = {**DEFAULT_MODULE_PATTERNS, "encoder_bias": ["vision_encoder.0.bias"]}
+        config = VLMConfig(
+            freeze=[
+                FreezeSpec("vision_encoder"),
+                FreezeSpec("encoder_bias", False),
+                FreezeSpec("vision_encoder"),
+            ],
+            freeze_schedule=[FreezeStage(5, (FreezeSpec("encoder_bias"),))],
+            module_patterns=patterns,
+        )
+        assert trainable_during_run(model, config) == _ALL - {"vision_encoder.0.weight"}
+
     def test_a_parameter_built_without_grad_and_never_unfrozen_stays_out(self, model):
         model.adapter.bias.requires_grad_(False)
         assert trainable_during_run(model, VLMConfig(freeze=[])) == _ALL - {"adapter.bias"}
