@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import pytest
 import torch
@@ -63,6 +65,24 @@ def _no_inductor_precompiled_headers():
         yield
     finally:
         inductor_config.cpp_cache_precompile_headers = saved
+
+
+@pytest.fixture(autouse=True)
+def _wandb_disabled():
+    """Run W&B disabled, so no test starts a live run, and restore ``WANDB_MODE`` after.
+
+    In disabled mode ``wandb.init`` still returns a run object, without a network call or
+    a local run directory.
+    """
+    saved = os.environ.get("WANDB_MODE")
+    os.environ["WANDB_MODE"] = "disabled"
+    try:
+        yield
+    finally:
+        if saved is None:
+            os.environ.pop("WANDB_MODE", None)
+        else:
+            os.environ["WANDB_MODE"] = saved
 
 
 TINY_MODEL_CONFIG = ModelConfig(dim=64, n_layers=2, n_heads=2, vocab_size=256, max_seq_len=64)
