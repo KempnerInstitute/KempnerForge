@@ -33,6 +33,12 @@ File:
   built rather than at model build; set an even `head_dim_override` to
   keep that `dim` and `n_heads`.
 - `n_heads % n_kv_heads == 0` (GQA replication factor is integral).
+- `activation` is not one of core's `mlp` keys (`swiglu`,
+  `standard_gelu`, `standard_relu`); the error names the activation
+  that selects it (`silu`, `gelu`, `relu`).
+- With `num_experts > 0`, `activation` is `silu`, `gelu` or `relu`: a
+  plugin's registered MLP is rejected, since MoE experts compute core's
+  SwiGLU or standard MLP from their weights.
 - `sdpa_backend ∈ {"auto", "flash", "efficient", "cudnn", "math"}`.
 - `attention_backend ∈ {"sdpa", "flex"}`.
 - `attention_backend = "flex"` requires `dim // n_heads ≥ 16` (below that the
