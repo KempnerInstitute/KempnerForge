@@ -272,11 +272,11 @@ def _save_on_two_meshes(rank, world, port, names, sizes, overrides, root) -> Non
         dist.destroy_process_group()
 
 
-def _save_drifted(rank, world, port, names, sizes, overrides, root) -> None:
+def _save_drifted(rank, world, port, names, sizes, overrides, root, async_mode) -> None:
     """Shift EP rank 1's copy of every weight outside the routed experts, then save.
 
     The EP copies then differ, as they drift apart on GPU (#482). Rank 0, which is EP rank
-    0, writes its copy.
+    0, writes its copy. The save runs in ``async_mode`` and is waited for.
     """
     _init(rank, world, port)
     try:
@@ -289,8 +289,10 @@ def _save_drifted(rank, world, port, names, sizes, overrides, root) -> None:
                 if not _is_expert(name):
                     (p.to_local() if isinstance(p, DTensor) else p).add_(shift)
         copy = _gathered(model, optimizer, mesh)
-        ckpt = CheckpointConfig(dir=str(Path(root) / "ckpt"))
-        CheckpointManager(ckpt, model, optimizer).save(STEP)
+        ckpt = CheckpointConfig(dir=str(Path(root) / "ckpt"), async_mode=async_mode)
+        manager = CheckpointManager(ckpt, model, optimizer)
+        manager.save(STEP)
+        manager.wait()
         if rank == 0:
             torch.save(copy, Path(root) / "reference.pt")
     finally:
@@ -480,10 +482,14 @@ class TestSecondMeshOfOneLayout:
 
 
 class TestDriftedCopies:
-    def test_the_checkpoint_holds_one_ep_rank_copy_whole(self, tmp_path):
-        """Every weight outside the routed experts is EP rank 0's copy, not a mix of copies."""
+    @pytest.mark.parametrize("async_mode", ["disabled", AsyncCheckpointMode.async_.value])
+    def test_the_checkpoint_holds_one_ep_rank_copy_whole(self, tmp_path, async_mode):
+        """Every weight outside the routed experts is EP rank 0's copy, not a mix of copies.
+
+        The async save takes the same planner, so it holds the same copy.
+        """
         names, sizes, overrides = LAYOUTS["dp_shard2_ep2"]
-        _spawn(_save_drifted, names, sizes, overrides, str(tmp_path))
+        _spawn(_save_drifted, names, sizes, overrides, str(tmp_path), async_mode)
         reference = torch.load(tmp_path / "reference.pt")
         saved = _saved(_step_dir(tmp_path), tmp_path)
         assert _mismatches({k: saved[k] for k in reference if k in saved}, reference) == []
