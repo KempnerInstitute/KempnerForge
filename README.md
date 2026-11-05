@@ -166,7 +166,7 @@ Configs set `[vlm]` with `arch` and a freeze list (`FreezeSpec`), and `[vision_e
 
 **Adding a new VLM arch.** The discriminated-union dispatch is registry-driven, so a new arch is three small additions, with no edits to existing call sites unless it cannot run tensor or expert parallelism (see the `JobConfig.validate` note below):
 
-1. Add a `VLMConfig` subclass in `kempnerforge/config/vlm.py` decorated with `@registry.register_vlm_config("<arch_name>")`. Override `residual_stream_image_tokens()` if the arch's residual stream is not text-only-plus-prefix.
+1. Add a `VLMConfig` subclass in `kempnerforge/config/vlm.py` decorated with `@registry.register_vlm_config("<arch_name>")`, with `arch: str = "<arch_name>"` as its field default: a config whose `arch` is not its class's is rejected. Override `residual_stream_image_tokens()` if the arch's residual stream is not text-only-plus-prefix.
 2. Add a `ModalityStrategy` class (in `kempnerforge/model/vlm.py` for in-tree arches, or any module imported at startup) decorated with `@registry.register_modality_strategy("<arch_name>")`. Implement `prepare(wrapper, pixel_values, input_ids) -> ModalityContext` and `num_image_tokens(wrapper) -> int`.
 3. If the arch needs new modules (e.g. `CrossAttentionBlock` for Cross-Attention), add them under `kempnerforge/model/` and wire them into `Transformer.__init__` behind an `isinstance(config.vlm, MyConfig)` guard so non-arch builds stay zero-cost.
 
