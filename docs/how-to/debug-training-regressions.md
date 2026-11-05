@@ -68,9 +68,11 @@ If you see one, that's the real signal; the NaN is a consequence.
 OOMs.
 
 **What the codebase does:** `MetricsTracker` calls
-`get_memory_stats()` every step and logs `gpu/allocated_gb`,
+`get_memory_stats()` on every logging step and logs `gpu/allocated_gb`,
 `gpu/peak_gb`, `gpu/reserved_gb`, `gpu/mem_utilization` to WandB /
 TensorBoard. Start there — plot `peak_gb` over step count.
+`peak_gb` is the run's high-water mark, so it never falls: each rise is
+a new high.
 
 ```
 [step   50] gpu/peak_gb=78.4 | ...
