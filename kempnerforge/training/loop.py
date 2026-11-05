@@ -416,7 +416,7 @@ def _log_periodic_metrics(session: TrainingSession, result: StepResult, step: in
 
     module_lrs = module_learning_rates(session.optimizer)
     if module_lrs:
-        tracker.log_eval({f"train/lr/{module}": lr for module, lr in module_lrs.items()}, step)
+        tracker.log_eval(module_lrs, step)
 
     if mc.is_moe:
         inner = inner_transformer(model)

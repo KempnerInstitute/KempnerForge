@@ -432,19 +432,28 @@ class Muon(torch.optim.Optimizer):
         return (self._adam,) if self._adam is not None else ()
 
     def state_dict(self) -> dict:
-        """Include internal AdamW state in the plain ``state_dict()``."""
+        """Include internal AdamW state in the plain ``state_dict()``, and the base rates the
+        fallback follows Muon's schedule from when a param group has a rate of its own."""
         sd = super().state_dict()
         if self._adam is not None:
             sd["_adam_state"] = self._adam.state_dict()
         sd["_initial_lr"] = self._initial_lr
         sd["_initial_adam_lr"] = self._initial_adam_lr
+        if self._lead_group_lr is not None or any(lr is not None for lr in self._adam_group_lrs):
+            sd["_lead_group_lr"] = self._lead_group_lr
+            sd["_adam_group_lrs"] = list(self._adam_group_lrs)
         return sd
 
     def load_state_dict(self, state_dict: dict) -> None:
-        """Restore internal AdamW state from checkpoint."""
+        """Restore internal AdamW state from checkpoint.
+
+        A state without the fallback's base rates keeps this optimizer's own.
+        """
         adam_state = state_dict.pop("_adam_state", None)
         self._initial_lr = state_dict.pop("_initial_lr", self._initial_lr)
         self._initial_adam_lr = state_dict.pop("_initial_adam_lr", self._initial_adam_lr)
+        self._lead_group_lr = state_dict.pop("_lead_group_lr", self._lead_group_lr)
+        self._adam_group_lrs = list(state_dict.pop("_adam_group_lrs", self._adam_group_lrs))
         super().load_state_dict(state_dict)
         if adam_state is not None and self._adam is not None:
             self._adam.load_state_dict(adam_state)
@@ -688,6 +697,8 @@ def _split_by_module(
     module's multiplier and names the module under ``"module"``. Parameters outside every
     listed module stay in the original groups. The groups come out in a fixed order, the
     original ones first and then each module's by module name, and empty groups are dropped.
+    A listed module with no trainable parameter gets no group, and a warning says its
+    multiplier has no effect.
     """
     owners = _module_owners(model, config.lr_multipliers, module_patterns)
     split = [
@@ -706,7 +717,13 @@ def _split_by_module(
             for group in param_groups
         ]
         n_params = sum(p.numel() for group in groups for p in group["params"])
-        logger.info(f"Optimizer module {module}: {n_params:,} trainable params at lr {lr:.3g}")
+        if n_params:
+            logger.info(f"Optimizer module {module}: {n_params:,} trainable params at lr {lr:.3g}")
+        else:
+            logger.warning(
+                f"optimizer.lr_multipliers lists {module!r}, which has no trainable parameters "
+                "when the optimizer is built, so its multiplier has no effect"
+            )
         split.extend(groups)
     return [group for group in split if group["params"]]
 
@@ -714,14 +731,20 @@ def _split_by_module(
 def module_learning_rates(optimizer: torch.optim.Optimizer) -> dict[str, float]:
     """Return the rate each module ``build_optimizer`` gave its own groups steps at next.
 
-    Keyed by module name. Under Muon, ``<module>`` is the rate of the module's orthogonalized
-    matrices and ``<module>/adamw`` that of its AdamW fallback, each present when the module
-    has such parameters. Empty when ``optimizer.lr_multipliers`` was empty.
+    Keyed by the metric it is logged as, ``lr/<module>``. Under Muon that is the rate of the
+    module's orthogonalized matrices, and ``lr_adamw/<module>`` is that of its AdamW fallback,
+    each present when the module has such parameters. No key nests under another metric's
+    name, which a file-based tracking store cannot hold. Empty when ``optimizer.lr_multipliers``
+    was empty.
     """
-    rates = {group["module"]: group["lr"] for group in optimizer.param_groups if "module" in group}
+    rates = {
+        f"lr/{group['module']}": group["lr"]
+        for group in optimizer.param_groups
+        if "module" in group
+    }
     if isinstance(optimizer, Muon) and optimizer._adam is not None:
         fallback = zip(optimizer._adam.param_groups, optimizer._fallback_lrs(), strict=True)
-        rates.update({f"{g['module']}/adamw": lr for g, lr in fallback if "module" in g})
+        rates.update({f"lr_adamw/{g['module']}": lr for g, lr in fallback if "module" in g})
     return rates
 
 

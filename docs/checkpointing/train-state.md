@@ -25,6 +25,7 @@ Entry points, both in
         "torch_cuda": torch.cuda.get_rng_state(),   # if CUDA available
     },
     "scheduler":   scheduler.state_dict(),            # present if scheduler passed
+    "scheduler_group_modules": [None, "adapter", ...],  # if a param group names a module
     "dataloader":  dataloader.state_dict(),           # present if dataloader passed
     # ... plus whatever was in the `extra` dict
 }
@@ -75,6 +76,17 @@ For `LambdaLR` (the base of every registered scheduler — cosine,
 linear, wsd, rex, constant) the dict contains the step count and
 base LR, which together determine the next LR value. Restoring it
 gets you back the same LR schedule from that step.
+
+The base LR is kept per param group, in the order of the optimizer's
+groups. When a group names a module under `"module"`, as
+`build_optimizer` names the groups of
+[`optimizer.lr_multipliers`](../training/optimizers.md#per-module-learning-rates),
+`scheduler_group_modules` records the module of every group, None for
+one outside the listed modules. A load into groups laid out otherwise,
+because other parameters are trainable or the weight-decay scope
+changed, gives each group the saved entries of its module's groups,
+and a group of a module the state holds no group of keeps its own.
+Without a recorded module on either side, the state loads as saved.
 
 Pure `phase.lr_scale` overlays live in the training loop and are
 recomputed from the current phase, so they don't need to be saved.
@@ -127,8 +139,8 @@ ckpt_mgr.save(step=step, tokens_seen=tokens_seen, scheduler=scheduler,
 ```
 
 On load, `restore_train_state` strips out the "standard" keys
-(`step`, `tokens_seen`, `rng`, `scheduler`, `dataloader`) and returns
-the rest as the third tuple element:
+(`step`, `tokens_seen`, `rng`, `scheduler`, `scheduler_group_modules`,
+`dataloader`) and returns the rest as the third tuple element:
 
 ```python
 step, tokens_seen, extra = ckpt_mgr.load(path=..., scheduler=scheduler)

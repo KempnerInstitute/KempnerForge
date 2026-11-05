@@ -52,7 +52,8 @@ no checkpoint. Training auto-resumes from a checkpoint in `checkpoint.dir` in pl
 `optimizer.lr_multipliers` gives modules of a VLM their own learning rate. Its keys are
 module names of `vlm.module_patterns` (`transformer`, `vision_encoder`, `adapter`, plus an
 arch's own, such as `cross_attention`), and each listed module trains at `optimizer.lr`
-times its multiplier:
+times its multiplier. The default `vlm.freeze` keeps the vision encoder frozen, so this
+example also trains it:
 
 ```toml
 [optimizer]
@@ -60,11 +61,16 @@ lr = 2e-4
 
 [optimizer.lr_multipliers]
 vision_encoder = 0.03     # 6e-6
+adapter = 5.0             # 1e-3
+
+[vlm]
+freeze = []
 ```
 
 - Each listed module gets its own decay and no-decay groups, after the groups of the
   parameters no listed module holds, which keep `optimizer.lr`. Groups with no parameters
-  are left out, so a module frozen when the optimizer is built gets none.
+  are left out, so a module frozen when the optimizer is built gets none, and the build
+  warns that its multiplier has no effect.
 - The one `[scheduler]` scales every group's own peak by the same factor, so every module
   follows the same warmup and decay shape, each from its own peak (and to its own floor,
   `min_lr_ratio` times that peak).
@@ -74,22 +80,42 @@ vision_encoder = 0.03     # 6e-6
   `transformer` and `cross_attention`, are refused when the config is built, or else when
   the optimizer is built and two listed modules match one parameter: list one of them, or
   add a module to `vlm.module_patterns` that names just the parameters you mean.
-- Each listed module's rate is logged as `train/lr/<module>` on the metrics interval, the
-  rate its param groups step at next. Under `muon` that is the rate of its orthogonalized
-  matrices, and the rate of its AdamW fallback is logged as `train/lr/<module>/adamw`.
-  `train/lr` stays the rate of the first param group, which holds parameters outside the
-  listed modules when there are any.
+- Each listed module's rate is logged as `lr/<module>` on the metrics interval, the rate its
+  param groups step at next. Under `muon` that is the rate of its orthogonalized matrices,
+  and the rate of its AdamW fallback is logged as `lr_adamw/<module>`. `train/lr` stays the
+  rate of the first param group, which holds parameters outside the listed modules when
+  there are any. No name nests under another, as `train/lr/<module>` would under `train/lr`,
+  which a file-based MLflow store cannot keep.
 
 The multipliers and the patterns of their modules decide the param groups and their rates,
 which the saved optimizer state and the scheduler state are laid out for. The training entry
-records non-empty multipliers in every checkpoint's `metadata.json`, with those patterns.
-A load of a checkpoint saved with other multipliers or patterns stops on every rank when it
+records non-empty multipliers in every checkpoint's `metadata.json`, with those patterns. A
+load of a checkpoint saved with other multipliers or patterns stops on every rank when it
 restores the checkpoint's optimizer state on any rank, before loading anything, or the
-scheduler state in its `train_state.pt`, before restoring anything from that file. A load
-that restores neither, such as one of the weights alone, goes ahead. A checkpoint that
-records none was saved without any. Code that builds its own `CheckpointManager` gets the
-same record and check by passing `lr_multipliers` and `module_patterns`, and calls
-`build_optimizer(model, config, module_patterns=...)` to resolve the module names.
+scheduler state in its `train_state.pt`, before restoring anything from that file. A
+checkpoint that records none was saved without any, so a run without multipliers loads only
+checkpoints saved without them. From a training checkpoint, that leaves:
+
+- A resume, or a `checkpoint.load_path` warm start with or without the optimizer, under the
+  same multipliers and patterns.
+- A warm start without the optimizer, `checkpoint.exclude_from_loading = ["optimizer"]`, under
+  the same multipliers and patterns whose param groups differ from the saved ones: other
+  parameters are trainable, as in a stage that unfreezes the language model or freezes
+  another module, or `weight_decay_scope` changed. `train_state.pt` records the module of
+  each group the scheduler state belongs to, so each group resumes at its module's saved
+  rate, and a group of a module the checkpoint holds no group of starts at its configured
+  rate. A load that also restores the optimizer state into groups laid out otherwise goes
+  ahead only while every group finds its saved settings at its own position; otherwise it
+  stops before loading anything and names this warm start.
+- Not a stage that changes the multipliers or their patterns. Every resume and warm start
+  restores `train_state.pt`, scheduler state included, since `checkpoint.exclude_from_loading`
+  takes only `"model"` and `"optimizer"`. Such a stage needs a warm start from the weights
+  alone, which `exclude_from_loading` does not offer.
+
+Code that builds its own `CheckpointManager` gets the same record and check by passing
+`lr_multipliers` and `module_patterns`, and calls `build_optimizer(model, config,
+module_patterns=...)` to resolve the module names. Its `load` goes ahead under any
+multipliers when it restores neither the optimizer state nor a scheduler state.
 
 ## `adamw`
 

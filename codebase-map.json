@@ -735,7 +735,7 @@
       },
       "functions": [
         "build_optimizer(model, config, module_patterns=None) -> Optimizer",
-        "module_learning_rates(optimizer) -> dict[str, float]",
+        "module_learning_rates(optimizer) -> dict[str, float] (keyed lr/<module>, lr_adamw/<module>)",
         "_split_by_module(model, param_groups, config, module_patterns) -> list[dict]",
         "_newton_schulz(G, steps) -> Tensor",
         "_muon_matrices(model, *, routers) -> set[Tensor]",
@@ -929,6 +929,7 @@
       "tested_by": [
         "tests/unit/test_train_entry.py::TestRunTraining",
         "tests/unit/test_train_entry.py::TestBuildPhaseHelpers",
+        "tests/unit/test_train_entry.py::TestStageChangeWarmStart",
         "tests/e2e/test_training_e2e.py",
         "tests/smoke/test_smoke.py"
       ]
@@ -1180,13 +1181,16 @@
       "functions": [
         "get_rng_state() -> dict",
         "set_rng_state(state)",
-        "build_train_state(step, tokens_seen, scheduler, dataloader, extra) -> dict",
-        "restore_train_state(state, scheduler, dataloader) -> (step, tokens_seen)"
+        "build_train_state(step, tokens_seen, scheduler, dataloader, extra) -> dict (records scheduler_group_modules when a param group names a module)",
+        "restore_train_state(state, scheduler, dataloader) -> (step, tokens_seen)",
+        "_scheduler_state_for(scheduler, saved, saved_modules) -> dict (lays a LambdaLR state out by module for other param groups)"
       ],
       "tested_by": [
         "tests/unit/test_checkpoint.py::TestRNGState",
         "tests/unit/test_checkpoint.py::TestBuildTrainState",
-        "tests/unit/test_checkpoint.py::TestRestoreTrainState"
+        "tests/unit/test_checkpoint.py::TestRestoreTrainState",
+        "tests/unit/test_lr_multipliers.py::TestSchedulerStateLayout",
+        "tests/unit/test_lr_multipliers.py::TestLayoutChange"
       ]
     },
     "kempnerforge/checkpoint/manager.py": {

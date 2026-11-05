@@ -6,7 +6,9 @@ its own, under the one learning-rate schedule. With nothing listed, nothing chan
 
 from __future__ import annotations
 
+import copy
 import json
+import logging
 import math
 import re
 
@@ -15,6 +17,7 @@ import torch
 from torch import nn
 
 from kempnerforge.checkpoint.manager import CheckpointManager
+from kempnerforge.checkpoint.state import build_train_state, restore_train_state
 from kempnerforge.config.checkpoint import CheckpointConfig
 from kempnerforge.config.job import JobConfig
 from kempnerforge.config.loader import load_config
@@ -250,7 +253,10 @@ class TestGroups:
                 ["vision_encoder.0.bias", "vision_encoder.1.bias", "vision_encoder.1.weight"],
             ),
         ]
-        assert module_learning_rates(optimizer) == {"adapter": 0.02, "vision_encoder": 0.005}
+        assert module_learning_rates(optimizer) == {
+            "lr/adapter": 0.02,
+            "lr/vision_encoder": 0.005,
+        }
 
     @pytest.mark.parametrize("name", REGISTERED_OPTIMIZERS)
     def test_every_optimizer_steps_each_module_at_its_rate(self, name):
@@ -293,9 +299,23 @@ class TestGroups:
         model.vision_encoder.requires_grad_(False)
         config = OptimizerConfig(lr=0.01, lr_multipliers={"vision_encoder": 0.5, "adapter": 2.0})
         optimizer = build_optimizer(model, config, module_patterns=VLM_PATTERNS)
-        assert module_learning_rates(optimizer) == {"adapter": 0.02}
+        assert module_learning_rates(optimizer) == {"lr/adapter": 0.02}
         held = {id(p) for g in optimizer.param_groups for p in g["params"]}
         assert not any(id(p) in held for p in model.vision_encoder.parameters())
+
+    def test_a_listed_module_with_nothing_to_train_warns(self, caplog, monkeypatch):
+        """Its multiplier changes no rate, as with the vision encoder the default freeze keeps."""
+        monkeypatch.setattr(logging.getLogger("kempnerforge"), "propagate", True)
+        model = _vlm_like()
+        model.vision_encoder.requires_grad_(False)
+        config = OptimizerConfig(lr=0.01, lr_multipliers={"vision_encoder": 0.5, "adapter": 2.0})
+        with caplog.at_level(logging.INFO, logger="kempnerforge.training.optimizer"):
+            build_optimizer(model, config, module_patterns=VLM_PATTERNS)
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert warnings == [
+            "optimizer.lr_multipliers lists 'vision_encoder', which has no trainable parameters "
+            "when the optimizer is built, so its multiplier has no effect"
+        ]
 
     def test_a_compiled_model_matches_the_names_it_wraps(self):
         model = _vlm_like()
@@ -355,7 +375,7 @@ class TestGroups:
             build_optimizer(model, config, module_patterns=patterns)
         only = OptimizerConfig(lr_multipliers={"cross_attention": 2.0})
         optimizer = build_optimizer(model, only, module_patterns=patterns)
-        assert module_learning_rates(optimizer) == {"cross_attention": pytest.approx(6e-4)}
+        assert module_learning_rates(optimizer) == {"lr/cross_attention": pytest.approx(6e-4)}
 
 
 class TestSchedule:
@@ -446,10 +466,10 @@ class TestMuonFallback:
         for group in optimizer.param_groups:
             group["lr"] *= 0.25
         assert module_learning_rates(optimizer) == {
-            "adapter": pytest.approx(0.01),
-            "adapter/adamw": pytest.approx(1.5e-4),
-            "vision_encoder": pytest.approx(0.0025),
-            "vision_encoder/adamw": pytest.approx(3.75e-5),
+            "lr/adapter": pytest.approx(0.01),
+            "lr_adamw/adapter": pytest.approx(1.5e-4),
+            "lr/vision_encoder": pytest.approx(0.0025),
+            "lr_adamw/vision_encoder": pytest.approx(3.75e-5),
         }
         _forward(model).backward()
         optimizer.step()
@@ -458,6 +478,36 @@ class TestMuonFallback:
             "adapter": pytest.approx(1.5e-4),
             "vision_encoder": pytest.approx(3.75e-5),
         }
+
+    def test_a_state_dict_round_trip_keeps_the_fallback_base_rates(self):
+        """A Muon built under other rates takes the saved fallback rates, as it does ``lr``."""
+        multipliers = {"vision_encoder": 0.5, "adapter": 2.0}
+        model = _vlm_like()
+        optimizer = self._muon(model, lr_multipliers=multipliers)
+        _forward(model).backward()
+        optimizer.step()
+        state = optimizer.state_dict()
+        assert state["_adam_group_lrs"] == [None, pytest.approx(6e-4), pytest.approx(1.5e-4)]
+        other = build_optimizer(
+            _vlm_like(),
+            OptimizerConfig(name="muon", lr=0.04, muon_adam_lr=1e-3, lr_multipliers=multipliers),
+            module_patterns=VLM_PATTERNS,
+        )
+        other.load_state_dict(copy.deepcopy(state))
+        assert isinstance(other, Muon)
+        assert other._fallback_lrs() == optimizer._fallback_lrs()
+
+    def test_a_state_dict_without_the_fallback_rates_keeps_its_own(self):
+        """The default path saves no new key, and a state saved without them still loads."""
+        multipliers = {"vision_encoder": 0.5, "adapter": 2.0}
+        default = self._muon(_vlm_like()).state_dict()
+        assert not {"_lead_group_lr", "_adam_group_lrs"} & set(default)
+        optimizer = self._muon(_vlm_like(), lr_multipliers=multipliers)
+        rates = optimizer._fallback_lrs()
+        state = optimizer.state_dict()
+        del state["_lead_group_lr"], state["_adam_group_lrs"]
+        optimizer.load_state_dict(state)
+        assert optimizer._fallback_lrs() == rates
 
     def test_a_module_on_the_fallback_alone_is_logged(self):
         """A module with no matrix for Muon still reports its rate, through its fallback."""
@@ -468,7 +518,7 @@ class TestMuonFallback:
         )
         optimizer = build_optimizer(model, config, module_patterns=patterns)
         assert not any(g.get("module") == "norms" for g in optimizer.param_groups)
-        assert module_learning_rates(optimizer) == {"norms/adamw": pytest.approx(1.5e-4)}
+        assert module_learning_rates(optimizer) == {"lr_adamw/norms": pytest.approx(1.5e-4)}
 
 
 MODEL_CONFIG = ModelConfig(dim=64, n_layers=2, n_heads=2, vocab_size=256, max_seq_len=64)
@@ -770,3 +820,258 @@ class TestResume:
         calls = self._as_rank(monkeypatch, manager, 1, sent=[True, without_scheduler])
         assert manager.load(scheduler=scheduler, exclude_keys=["model", "optimizer"])[0] == 3
         assert len(calls) == 2
+
+
+class TestLayoutChange:
+    """A load that restores the scheduler into param groups laid out otherwise.
+
+    Which groups a run with ``optimizer.lr_multipliers`` has depends on the trainable
+    parameters and on ``weight_decay_scope``, since groups with no parameters are left out.
+    Each group resumes at its own module's rate whatever the two layouts are.
+    """
+
+    MULTIPLIERS = {"vision_encoder": 0.1, "adapter": 5.0}
+    LR = 1e-3
+    ADAM_LR = 4e-4
+    DEFAULT_SCOPE = "exclude_norms_and_biases"
+    SCENARIOS = {
+        "unfrozen": (({"transformer"}, DEFAULT_SCOPE), (set(), DEFAULT_SCOPE)),
+        "scope": ((set(), "all"), (set(), DEFAULT_SCOPE)),
+        "swapped": (({"transformer"}, DEFAULT_SCOPE), ({"vision_encoder"}, DEFAULT_SCOPE)),
+        "frozen": ((set(), DEFAULT_SCOPE), ({"vision_encoder"}, DEFAULT_SCOPE)),
+    }
+
+    @classmethod
+    def _build(cls, name, frozen, scope):
+        model = _vlm_like()
+        for module in frozen:
+            getattr(model, module).requires_grad_(False)
+        config = OptimizerConfig(
+            name=name,
+            lr=cls.LR,
+            muon_adam_lr=cls.ADAM_LR,
+            fused=False,
+            weight_decay_scope=scope,
+            lr_multipliers=cls.MULTIPLIERS,
+        )
+        optimizer = build_optimizer(model, config, module_patterns=VLM_PATTERNS)
+        schedule = SchedulerConfig(warmup_steps=2, min_lr_ratio=0.1)
+        return model, optimizer, build_scheduler(optimizer, schedule, max_steps=20)
+
+    @staticmethod
+    def _train(model, optimizer, scheduler, steps):
+        for _ in range(steps):
+            _forward(model).backward()
+            optimizer.step()
+            optimizer.zero_grad()
+            scheduler.step()
+
+    @classmethod
+    def _manager(cls, tmp_path, model, optimizer):
+        return CheckpointManager(
+            CheckpointConfig(dir=str(tmp_path)),
+            model,
+            optimizer,
+            lr_multipliers=cls.MULTIPLIERS,
+            module_patterns=VLM_PATTERNS,
+        )
+
+    @staticmethod
+    def _group_layout(optimizer):
+        optimizers = (optimizer, *getattr(optimizer, "inner_optimizers", ()))
+        return [[(g.get("module"), g["weight_decay"]) for g in o.param_groups] for o in optimizers]
+
+    def _assert_module_rates(self, optimizer, scheduler):
+        """Every group, a Muon fallback's included, steps next at its module's scheduled rate."""
+        factor = scheduler.lr_lambdas[0](scheduler.last_epoch)
+
+        def expected(groups, base):
+            return [base * self.MULTIPLIERS.get(g.get("module"), 1.0) * factor for g in groups]
+
+        groups = optimizer.param_groups
+        assert [g["lr"] for g in groups] == pytest.approx(expected(groups, self.LR), rel=1e-12)
+        if isinstance(optimizer, Muon):
+            assert optimizer._adam is not None
+            fallback = optimizer._adam.param_groups
+            assert optimizer._fallback_lrs() == pytest.approx(
+                expected(fallback, self.ADAM_LR), rel=1e-12
+            )
+
+    @pytest.mark.parametrize("scenario", sorted(SCENARIOS))
+    @pytest.mark.parametrize("name", RESUMABLE_OPTIMIZERS)
+    def test_a_warm_start_resumes_each_group_at_its_module_rate(self, tmp_path, name, scenario):
+        saved, resumed = self.SCENARIOS[scenario]
+        model, optimizer, scheduler = self._build(name, *saved)
+        self._train(model, optimizer, scheduler, 4)
+        self._manager(tmp_path, model, optimizer).save(step=4, scheduler=scheduler)
+        saved_layout = self._group_layout(optimizer)
+
+        model, optimizer, scheduler = self._build(name, *resumed)
+        assert self._group_layout(optimizer) != saved_layout
+        step, _, _ = self._manager(tmp_path, model, optimizer).load(
+            scheduler=scheduler, exclude_keys=["optimizer"]
+        )
+        assert (step, scheduler.last_epoch) == (4, 4)
+        self._train(model, optimizer, scheduler, 1)
+        self._assert_module_rates(optimizer, scheduler)
+
+    @pytest.mark.parametrize("name", ["adamw", "lion"])
+    def test_a_resume_with_a_module_frozen_keeps_the_others_state(self, tmp_path, name):
+        """The optimizer state of the groups still trained loads; their rates stay their own."""
+        model, optimizer, scheduler = self._build(name, set(), self.DEFAULT_SCOPE)
+        self._train(model, optimizer, scheduler, 4)
+        self._manager(tmp_path, model, optimizer).save(step=4, scheduler=scheduler)
+        adapter_state = {k: v.clone() for k, v in optimizer.state[model.adapter.weight].items()}
+
+        model, optimizer, scheduler = self._build(name, {"vision_encoder"}, self.DEFAULT_SCOPE)
+        assert self._manager(tmp_path, model, optimizer).load(scheduler=scheduler)[0] == 4
+        for key, value in adapter_state.items():
+            assert torch.equal(optimizer.state[model.adapter.weight][key], value)
+        self._train(model, optimizer, scheduler, 1)
+        self._assert_module_rates(optimizer, scheduler)
+
+    @pytest.mark.parametrize(
+        ("name", "frozen"), [("muon", "vision_encoder"), ("adamw", "transformer")]
+    )
+    def test_a_resume_whose_groups_moved_is_refused_before_loading(self, tmp_path, name, frozen):
+        """A saved group's settings sit at its position, so a moved group cannot find its own."""
+        model, optimizer, scheduler = self._build(name, set(), self.DEFAULT_SCOPE)
+        self._train(model, optimizer, scheduler, 4)
+        self._manager(tmp_path, model, optimizer).save(step=4, scheduler=scheduler)
+
+        model, optimizer, scheduler = self._build(name, {frozen}, self.DEFAULT_SCOPE)
+        before = [p.detach().clone() for p in model.parameters()]
+        torch.rand(1)
+        rng = torch.get_rng_state()
+        with pytest.raises(RuntimeError, match="laid out otherwise than at the save"):
+            self._manager(tmp_path, model, optimizer).load(scheduler=scheduler)
+        assert all(torch.equal(b, p) for b, p in zip(before, model.parameters(), strict=True))
+        assert torch.equal(torch.get_rng_state(), rng)
+        assert scheduler.last_epoch == 0
+        step, _, _ = self._manager(tmp_path, model, optimizer).load(
+            scheduler=scheduler, exclude_keys=["optimizer"]
+        )
+        assert step == 4
+        self._train(model, optimizer, scheduler, 1)
+        self._assert_module_rates(optimizer, scheduler)
+
+    def test_the_same_layout_resumes_the_saved_scheduler_state_as_it_is(self, tmp_path):
+        model, optimizer, scheduler = self._build("adamw", {"transformer"}, self.DEFAULT_SCOPE)
+        self._train(model, optimizer, scheduler, 4)
+        self._manager(tmp_path, model, optimizer).save(step=4, scheduler=scheduler)
+        model2, optimizer2, scheduler2 = self._build("adamw", {"transformer"}, self.DEFAULT_SCOPE)
+        self._manager(tmp_path, model2, optimizer2).load(scheduler=scheduler2)
+        assert scheduler2.state_dict() == scheduler.state_dict()
+
+
+class TestSchedulerStateLayout:
+    """The train state records each scheduled group's module and restores by it."""
+
+    @staticmethod
+    def _optimizer(groups):
+        """An optimizer whose param groups are given as ``(module, lr)`` pairs."""
+        param_groups = []
+        for module, lr in groups:
+            group = {"params": [nn.Parameter(torch.zeros(1))], "lr": lr}
+            if module is not None:
+                group["module"] = module
+            param_groups.append(group)
+        return torch.optim.SGD(param_groups, lr=1.0)
+
+    def _scheduler(self, groups):
+        optimizer = self._optimizer(groups)
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: 1.0 / (step + 1))
+
+    def test_groups_without_a_module_record_nothing(self):
+        scheduler = self._scheduler([(None, 0.1), (None, 0.1)])
+        state = build_train_state(step=1, tokens_seen=0, scheduler=scheduler)
+        assert set(state) == {"step", "tokens_seen", "rng", "scheduler"}
+
+    def test_the_record_lists_every_group_and_is_no_extra(self):
+        state = build_train_state(
+            step=1, tokens_seen=0, scheduler=self._scheduler([(None, 0.1), ("a", 0.2)])
+        )
+        assert state["scheduler_group_modules"] == [None, "a"]
+        extra = restore_train_state(state, scheduler=self._scheduler([(None, 0.1), ("a", 0.2)]))[2]
+        assert extra == {}
+
+    def test_a_state_saved_without_a_record_counts_its_groups_as_moduleless(self):
+        """A checkpoint from before groups named modules lays out onto named groups."""
+        saved = self._scheduler([(None, 0.3), (None, 0.3)])
+        saved.step()
+        saved.step()
+        state = build_train_state(step=2, tokens_seen=0, scheduler=saved)
+        assert "scheduler_group_modules" not in state
+        resumed = self._scheduler([(None, 0.1), ("a", 0.2), ("a", 0.2)])
+        restore_train_state(state, scheduler=resumed)
+        assert resumed.base_lrs == [0.3, 0.2, 0.2]
+        assert resumed.last_epoch == 2
+        assert resumed._last_lr == pytest.approx([0.1, 0.2, 0.2])
+
+    @pytest.mark.parametrize(
+        "record",
+        [["a"], ("a", None), [None, 3], [None, "a", "a"]],
+        ids=["short", "tuple", "not-a-name", "long"],
+    )
+    def test_a_record_that_does_not_fit_the_state_restores_nothing(self, record):
+        state = build_train_state(
+            step=2, tokens_seen=0, scheduler=self._scheduler([(None, 0.1), ("a", 0.2)])
+        )
+        state["scheduler_group_modules"] = record
+        torch.rand(1)
+        rng = torch.get_rng_state()
+        resumed = self._scheduler([("a", 0.2)])
+        with pytest.raises(ValueError, match="one entry per param group"):
+            restore_train_state(state, scheduler=resumed)
+        assert torch.equal(torch.get_rng_state(), rng)
+        assert resumed.last_epoch == 0
+
+    def test_one_module_saved_at_two_rates_is_refused(self):
+        state = build_train_state(
+            step=0, tokens_seen=0, scheduler=self._scheduler([("a", 0.1), ("a", 0.2)])
+        )
+        with pytest.raises(ValueError, match=r"base rates 0.1 and 0.2"):
+            restore_train_state(state, scheduler=self._scheduler([("a", 0.1)]))
+
+    def test_only_a_lambda_lr_state_is_laid_out_for_other_groups(self):
+        def step_lr(groups):
+            return torch.optim.lr_scheduler.StepLR(self._optimizer(groups), step_size=1)
+
+        saved = step_lr([(None, 0.1), ("a", 0.2)])
+        state = build_train_state(step=0, tokens_seen=0, scheduler=saved)
+        same = step_lr([(None, 0.1), ("a", 0.2)])
+        restore_train_state(state, scheduler=same)
+        assert same.state_dict() == saved.state_dict()
+        with pytest.raises(ValueError, match="only the state of a LambdaLR"):
+            restore_train_state(state, scheduler=step_lr([("a", 0.2)]))
+
+    class _Stateful:
+        """A scheduler with no optimizer, which saves ``state`` and keeps what it loads."""
+
+        def __init__(self, state):
+            self.state = state
+            self.loaded = None
+
+        def state_dict(self):
+            return dict(self.state)
+
+        def load_state_dict(self, state):
+            self.loaded = state
+
+    def test_a_state_without_base_rates_loads_as_it_is(self):
+        state = build_train_state(step=0, tokens_seen=0, scheduler=self._Stateful({"count": 3}))
+        assert set(state) == {"step", "tokens_seen", "rng", "scheduler"}
+        state["scheduler_group_modules"] = ["a"]
+        restored = self._Stateful({})
+        restore_train_state(state, scheduler=restored)
+        assert restored.loaded == {"count": 3}
+
+    def test_a_scheduler_without_an_optimizer_takes_only_a_moduleless_state(self):
+        saved = {"base_lrs": [0.1], "count": 3}
+        state = build_train_state(step=0, tokens_seen=0, scheduler=self._Stateful(saved))
+        restored = self._Stateful({})
+        restore_train_state(state, scheduler=restored)
+        assert restored.loaded == saved
+        state["scheduler_group_modules"] = ["a"]
+        with pytest.raises(ValueError, match="only the state of a LambdaLR"):
+            restore_train_state(state, scheduler=self._Stateful({}))

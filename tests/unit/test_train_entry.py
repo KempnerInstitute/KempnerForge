@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import math
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -2814,15 +2815,15 @@ class TestMoEMetrics:
 
 
 class TestModuleLearningRateMetrics:
-    """Each module of ``optimizer.lr_multipliers`` logs its rate as ``train/lr/<module>``."""
+    """Each module of ``optimizer.lr_multipliers`` logs its rate as ``lr/<module>``."""
 
     @staticmethod
-    def _session(**multipliers):
+    def _session(name="adamw", **multipliers):
         from kempnerforge.config.optimizer import OptimizerConfig
         from kempnerforge.training.optimizer import build_optimizer
 
         model = TinyTextModel()
-        config = OptimizerConfig(lr=0.05, fused=False, lr_multipliers=multipliers)
+        config = OptimizerConfig(name=name, lr=0.05, fused=False, lr_multipliers=multipliers)
         optimizer = build_optimizer(model, config, module_patterns={"out": ["out.*"]})
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda s: 1.0 / (s + 1))
         session = make_session(
@@ -2832,14 +2833,30 @@ class TestModuleLearningRateMetrics:
         session.tracker.log_eval = lambda m, s: logged.append((m, s))  # type: ignore[method-assign]
         return session, logged
 
+    @staticmethod
+    def _logged_names(name="adamw", **multipliers) -> set[str]:
+        """Every metric name the loop sends a logging backend in a two-step run."""
+        session, _ = TestModuleLearningRateMetrics._session(name, **multipliers)
+        session.tracker = _make_tracker(session.config)
+        session.tracker.metrics_config.log_interval = 1
+        names: set[str] = set()
+
+        class Recorder:
+            def log(self, metrics, step):
+                names.update(metrics)
+
+        session.tracker._backends.append(Recorder())
+        run_training_loop(session)
+        return names
+
     def test_the_loop_logs_each_module_rate_after_the_schedule_steps(self):
         session, logged = self._session(out=2.0)
         session.tracker.metrics_config.log_interval = 1
         run_training_loop(session)
-        rates = [(m, s) for m, s in logged if any(k.startswith("train/lr/") for k in m)]
+        rates = [(m, s) for m, s in logged if any(k.startswith("lr/") for k in m)]
         assert rates == [
-            ({"train/lr/out": pytest.approx(0.1 / 2)}, 1),
-            ({"train/lr/out": pytest.approx(0.1 / 3)}, 2),
+            ({"lr/out": pytest.approx(0.1 / 2)}, 1),
+            ({"lr/out": pytest.approx(0.1 / 3)}, 2),
         ]
 
     def test_no_module_logs_no_rate(self):
@@ -2847,6 +2864,129 @@ class TestModuleLearningRateMetrics:
         session.tracker.metrics_config.log_interval = 1
         run_training_loop(session)
         assert logged == []
+
+    def test_no_logged_name_nests_under_another(self):
+        """A file-based store keeps each name as a path, so ``a/b`` cannot sit beside ``a``."""
+        names = self._logged_names("muon", out=2.0)
+        assert {"train/lr", "lr/out", "lr_adamw/out"} <= names
+        assert not [(a, b) for a in names for b in names if b.startswith(f"{a}/")]
+
+    def test_a_file_store_keeps_every_name(self, tmp_path, monkeypatch):
+        mlflow = pytest.importorskip("mlflow")
+        from mlflow.entities import Metric
+
+        names = sorted(self._logged_names("muon", out=2.0))
+        monkeypatch.setenv("MLFLOW_ALLOW_FILE_STORE", "true")
+        client = mlflow.MlflowClient(tracking_uri=(tmp_path / "mlruns").as_uri())
+        run = client.create_run(client.create_experiment("names"))
+        client.log_batch(run.info.run_id, metrics=[Metric(n, 1.0, 0, 1) for n in names])
+        history = client.get_run(run.info.run_id).data.metrics
+        assert sorted(history) == names
+
+
+class TestStageChangeWarmStart:
+    """A second stage warm-starts from the first without its optimizer, with other groups.
+
+    Both stages list the same ``optimizer.lr_multipliers``; the frozen module or the
+    weight-decay scope changes, and with it the param groups the scheduler state belongs to.
+    """
+
+    class _Model(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.vision_encoder = nn.Linear(DIM, DIM)
+            self.adapter = nn.Linear(DIM, DIM)
+            self.transformer = nn.Linear(DIM, DIM)
+
+    @staticmethod
+    def _step(session, _step):
+        from kempnerforge.training.loop import StepResult
+
+        model = session.model
+        loss = model.transformer(model.adapter(model.vision_encoder(torch.ones(2, DIM))))
+        loss = loss.square().mean()
+        loss.backward()
+        return StepResult(loss=loss.item(), grad_norm=0.0, text_tokens=1)
+
+    @classmethod
+    def _stage(cls, monkeypatch, frozen, scope, max_steps, **checkpoint):
+        """Run one stage through ``run_training`` and return the rates logged at each step."""
+        import kempnerforge.training.entry as entry
+        from kempnerforge.config.vlm import FreezeSpec
+        from kempnerforge.metrics.tracker import MetricsTracker
+        from kempnerforge.training.freeze import apply_freeze_specs
+
+        config = _vlm_config(freeze=[FreezeSpec(frozen, True)])
+        config.train.max_steps = max_steps
+        config.optimizer.lr = 2e-4
+        config.optimizer.fused = False
+        config.optimizer.weight_decay_scope = scope
+        config.optimizer.lr_multipliers = {"vision_encoder": 0.03, "adapter": 5.0}
+        config.scheduler.warmup_steps = 5
+        config.scheduler.decay_steps = 55
+        config.scheduler.min_lr_ratio = 0.1
+        config.checkpoint = CheckpointConfig(interval=1000, **checkpoint)
+        config.metrics.log_interval = 1
+        torch.manual_seed(0)
+        model = cls._Model()
+        assert config.vlm is not None
+        apply_freeze_specs(model, config.vlm.freeze, config.vlm.module_patterns)
+        monkeypatch.setattr(entry, "setup_distributed", lambda _config: _runtime())
+        monkeypatch.setattr(entry, "ShutdownHandler", lambda **_kw: FakeShutdownHandler())
+        monkeypatch.setattr(entry, "build_model", lambda *_a, **_k: (model, None))
+        monkeypatch.setattr(entry, "build_profiler", lambda *_a, **_k: None)
+        monkeypatch.setattr(entry, "build_data_pipeline", lambda *_a, **_k: DataPipeline())
+        monkeypatch.setattr(entry, "build_eval_dataloader", lambda *_a, **_k: None)
+        monkeypatch.setattr(entry, "destroy_distributed", lambda: None)
+        rates: dict[int, dict[str, float]] = {}
+        end_step = MetricsTracker.end_step
+
+        def record_end_step(self, **kwargs):
+            rates.setdefault(kwargs["step"], {})["train/lr"] = kwargs["lr"]
+            return end_step(self, **kwargs)
+
+        def record_log_eval(self, metrics, step):
+            rates.setdefault(step, {}).update(
+                {name: rate for name, rate in metrics.items() if name.startswith("lr")}
+            )
+
+        monkeypatch.setattr(MetricsTracker, "end_step", record_end_step)
+        monkeypatch.setattr(MetricsTracker, "log_eval", record_log_eval)
+        entry.run_training(config, step_fn=cls._step)
+        return rates
+
+    @staticmethod
+    def _factor(step: int) -> float:
+        return 0.1 + 0.45 * (1 + math.cos(math.pi * (step - 5) / 55))
+
+    @pytest.mark.parametrize(
+        ("first", "second"),
+        [
+            (
+                ("transformer", "exclude_norms_and_biases"),
+                ("vision_encoder", "exclude_norms_and_biases"),
+            ),
+            (("vision_encoder", "all"), ("vision_encoder", "exclude_norms_and_biases")),
+        ],
+        ids=["frozen-module-swapped", "scope-changed"],
+    )
+    def test_each_group_continues_at_its_module_rate(self, tmp_path, monkeypatch, first, second):
+        first_rates = self._stage(monkeypatch, *first, 10, dir=str(tmp_path / "first"))
+        assert first_rates[10]["lr/adapter"] == pytest.approx(1e-3 * self._factor(10))
+        rates = self._stage(
+            monkeypatch,
+            *second,
+            12,
+            dir=str(tmp_path / "second"),
+            load_path=str(tmp_path / "first" / "step_10"),
+            exclude_from_loading=["optimizer"],
+        )
+        assert sorted(rates) == [11, 12]
+        for step in (11, 12):
+            assert rates[step] == {
+                "train/lr": pytest.approx(2e-4 * self._factor(step), rel=1e-6),
+                "lr/adapter": pytest.approx(1e-3 * self._factor(step), rel=1e-6),
+            }
 
 
 class TestPerDatasetMetrics:

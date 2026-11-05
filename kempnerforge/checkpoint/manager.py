@@ -17,7 +17,7 @@ import shutil
 import stat
 import threading
 import uuid
-from collections.abc import Callable, Container, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Container, Iterable, Mapping, Sequence
 from functools import partial
 from pathlib import Path
 from typing import Any, Protocol, TypeGuard, cast
@@ -353,6 +353,39 @@ def _check_saved_state_matches(
             "checkpoint.load_path to this checkpoint and checkpoint.exclude_from_loading = "
             '["optimizer"], with a checkpoint.dir that holds no checkpoint yet.'
         )
+
+
+def _check_saved_param_groups(
+    optim_state: dict[str, Any], saved_keys: Collection[str], where: Path
+) -> None:
+    """Fail if the checkpoint lacks a setting of a param group this run's optimizers hold.
+
+    A checkpoint keeps each param group's settings under the group's position among its
+    optimizers' groups. When the groups are laid out otherwise than at the save, as under
+    ``optimizer.lr_multipliers`` when other parameters are trainable, a position can hold a
+    group of another optimizer, or one without the module this run's group names, and the
+    load would otherwise stop on the first setting it does not find. Checked only when this
+    run's groups or the saved ones name a module, the only groups whose layout varies.
+    """
+    names_module = any(
+        key.startswith(_OPTIM_PARAM_GROUPS_PREFIX) and key.endswith(".module") for key in saved_keys
+    )
+    if not names_module and not any("module" in group for group in optim_state["param_groups"]):
+        return
+    for index, group in enumerate(optim_state["param_groups"]):
+        missing = sorted(
+            key for key in group if f"{_OPTIM_PARAM_GROUPS_PREFIX}{index}.{key}" not in saved_keys
+        )
+        if missing:
+            raise RuntimeError(
+                f"{where} has no {missing} in optimizer param group {index}, which this run's "
+                "group there holds: the param groups are laid out otherwise than at the save, as "
+                "when other parameters are trainable under optimizer.lr_multipliers, or their "
+                "settings changed. Resume with the parameters trained at the save, or continue "
+                "from these weights with a fresh optimizer: set checkpoint.load_path to this "
+                "checkpoint and checkpoint.exclude_from_loading = "
+                '["optimizer"], with a checkpoint.dir that holds no checkpoint yet.'
+            )
 
 
 def _load_train_state(path: Path) -> dict[str, Any]:
@@ -1012,6 +1045,7 @@ class CheckpointManager:
                     f"resuming with {filled}"
                 )
             _check_saved_state_matches(dcp_state["optimizer"], saved_keys, dcp_dir)
+            _check_saved_param_groups(dcp_state["optimizer"], saved_keys, dcp_dir)
 
         if dcp_state:
             planner = _NeverSteppedStatePlanner()
