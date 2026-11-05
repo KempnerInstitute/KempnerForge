@@ -76,8 +76,9 @@ for step in range(max_steps):
    *that interval*, not all-time.
 
 The interval-reset is the reason to prefer this over
-`get_memory_stats`: with the bare helper, `peak_gb` grows monotonically
-and you can't see that step 200 spiked higher than step 100.
+`get_memory_stats`: with the bare helper, `peak_gb` never goes down, so
+once step 100 has spiked, a smaller spike at step 200 does not show at
+all.
 
 ## Why `MetricsTracker` doesn't reset peak
 
@@ -106,7 +107,8 @@ for offline analysis:
 ```python
 # kempnerforge/metrics/memory.py — capture_snapshot
 torch.cuda.memory._record_memory_history()
-torch.cuda.synchronize(self.device)
+device = torch.cuda.current_device() if self.device is None else self.device
+torch.cuda.synchronize(device)
 snapshot = torch.cuda.memory._snapshot()
 torch.cuda.memory._record_memory_history(enabled=None)
 
@@ -148,7 +150,7 @@ Workflow:
 ```bash
 # 1. Run with snapshot enabled
 uv run python scripts/train.py configs/train/debug.toml
-# [step 100] Memory snapshot saved: memory_snapshots/snapshot_step_100_device_0.pickle
+# 2026-11-04 14:03:12.345 [rank 0] INFO     Memory snapshot saved: memory_snapshots/snapshot_step_100_device_0.pickle
 
 # 2. Open https://pytorch.org/memory_viz
 # 3. Drag-drop the .pickle file into the page
@@ -160,7 +162,7 @@ anywhere.
 ## See also
 
 - [Metrics tracker](metrics-tracker.md) — consumer of `get_memory_stats`
-  for the per-step `gpu/*` metrics.
+  for the `gpu/*` metrics of each logging step.
 - [Profiler](profiler.md) — the complementary `torch.profiler` path; it
   records `profile_memory=True` events inside the trace for Perfetto
   inspection.
