@@ -1,6 +1,12 @@
-"""Integration test: checkpoint save → load → verify identical state.
+"""Integration test: training state round-trips in one process, with a real model.
 
-Tests the full checkpoint pipeline with a real model (non-distributed).
+The model and optimizer state dicts go through plain ``torch.save`` and
+``torch.load``, and the train-state and RNG helpers of
+``kempnerforge.checkpoint.state`` round-trip in memory. Nothing here uses
+``CheckpointManager`` or DCP: ``tests/unit/test_checkpoint.py`` tests the manager
+(``TestCheckpointManagerLoad`` saves and loads through DCP, including the optimizer
+moments), and ``tests/distributed/test_checkpoint.py::TestCheckpointRoundTrip`` tests
+it under FSDP2.
 """
 
 from __future__ import annotations
@@ -21,7 +27,7 @@ CONFIG = ModelConfig(dim=64, n_layers=2, n_heads=2, vocab_size=256, max_seq_len=
 
 class TestCheckpointRoundtrip:
     def test_model_state_roundtrip(self, tmp_path):
-        """Model state dict save/load produces identical weights."""
+        """A model state dict reloaded through ``torch.save`` gives identical weights."""
         model = Transformer(CONFIG).to(DEVICE)
 
         state = model.state_dict()
@@ -37,7 +43,10 @@ class TestCheckpointRoundtrip:
             assert torch.equal(p1, p2), f"Mismatch in {n1}"
 
     def test_optimizer_state_roundtrip(self, tmp_path):
-        """Optimizer state dict save/load preserves momentum buffers."""
+        """An AdamW state dict reloaded through ``torch.save`` keeps each parameter's state.
+
+        Its ``step``, ``exp_avg`` and ``exp_avg_sq`` must come back bit for bit.
+        """
         model = Transformer(CONFIG).to(DEVICE)
         opt = build_optimizer(model, OptimizerConfig(lr=1e-3, fused=False))
 
@@ -107,8 +116,8 @@ class TestCheckpointRoundtrip:
         assert torch.equal(vals1, vals2)
 
     def test_full_training_resume(self, tmp_path):
-        """Train N steps → save → train M more steps.
-        Compare against uninterrupted N+M steps."""
+        """Train N steps, save the model and optimizer with ``torch.save``, reload them
+        and train M more steps. Compare against uninterrupted N+M steps."""
         torch.manual_seed(42)
         model = Transformer(CONFIG).to(DEVICE)
         opt = build_optimizer(model, OptimizerConfig(lr=1e-3, fused=False))
