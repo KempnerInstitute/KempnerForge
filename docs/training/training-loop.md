@@ -74,7 +74,7 @@ After the step body (either branch):
 
 ```python
 grad_norm = clip_grad_norm_(model, tc.grad_clip_norm)
-if not nan_detector.check_loss(avg_loss, step):
+if not nan_detector.check_loss(avg_loss, step, grad_norm=grad_norm):
     optimizer.zero_grad()
     if nan_detector.should_rollback:
         break
@@ -94,11 +94,15 @@ see [Gradient utilities](gradient-utilities.md).
 Under PP, `pipeline_step` passes `pp_group=`, so the norm is summed over
 the stages and every stage scales by the same coefficient (see
 [Gradient utilities § Under pipeline parallelism](gradient-utilities.md#under-pipeline-parallelism)).
-`NaNDetector.check_loss` returns `False` on NaN / Inf, and the loop
-zeroes the grads. The detector escalates to `should_rollback` after
-`max_consecutive` bad steps in a row (`NaNDetector(max_consecutive=10)`
-in `kempnerforge/training/entry.py`; see
+`NaNDetector.check_loss` returns `False` when the loss or the gradient norm is
+NaN / Inf on any rank; the loop then zeroes the gradients and skips the step.
+The detector escalates to `should_rollback` after `max_consecutive` bad steps
+in a row (`NaNDetector(max_consecutive=10)` in
+`kempnerforge/training/entry.py`; see
 [NaN detection](../resilience/nan-detection.md)).
+The gradient norm is checked because a finite loss can come with
+non-finite gradients: a micro-batch whose labels are all `-100` has an exact
+zero cross-entropy loss whatever its activations.
 
 A skipped step still counts as a step. It drops the optimizer update,
 the token count, metrics, hooks and every periodic tick below except the

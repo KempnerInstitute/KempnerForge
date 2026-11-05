@@ -1,7 +1,7 @@
 # NaN detection
 
 [`NaNDetector`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/resilience/health.py)
-watches for NaN / Inf in the loss every step. When it fires, the
+watches for NaN / Inf in the loss and the gradient norm every step. When it fires, the
 training loop zeros gradients, skips the optimizer step, and increments
 a consecutive-NaN counter. The skipped step still counts as a step (see
 [What a skipped step still does](#what-a-skipped-step-still-does)). If
@@ -15,7 +15,7 @@ back to an earlier checkpoint.
 nan_detector = NaNDetector(action="warn", max_consecutive=10)
 ...
 # Inside the training loop, after backward:
-if not nan_detector.check_loss(avg_loss, step):
+if not nan_detector.check_loss(result.loss, step, grad_norm=result.grad_norm):
     optimizer.zero_grad()
     if nan_detector.should_rollback:
         logger.error("Too many consecutive NaNs — stopping")
@@ -36,9 +36,14 @@ Two things to note:
   `training/entry.py`** — not exposed as TOML config. If you want
   `"skip"` or `"raise"` behavior, edit the script or construct the
   detector yourself.
-- **`check_gradients` is *not* called by the training loop.** Gradient
-  NaNs typically manifest as loss NaNs on the next step anyway; skip it
-  unless you're specifically debugging a gradient-explosion case.
+- **The gradient norm is checked with the loss.** A finite loss can come with
+  non-finite gradients: a micro-batch whose labels are all `-100` has an exact
+  zero cross-entropy loss whatever its activations, and without the norm check
+  its NaN gradients would reach `optimizer.step()`. The norm can differ between
+  ranks (under expert parallelism it covers the shared parameters and only the
+  rank's experts), so it goes into the same all-reduced flag as the loss.
+- **`check_gradients` is *not* called by the training loop.** It returns a
+  rank-local verdict; the gradient norm check above covers non-finite gradients.
 
 ## What a skipped step still does
 
@@ -141,7 +146,9 @@ on the next step.
 
 ```python
 # kempnerforge/resilience/health.py — check_loss
-local_nan = not _is_finite(loss)
+bad_loss = not _is_finite(loss)
+bad_grad_norm = grad_norm is not None and not _is_finite(grad_norm)
+local_nan = bad_loss or bad_grad_norm
 if dist.is_initialized():
     nan_flag = torch.tensor([1.0 if local_nan else 0.0], device="cuda")
     dist.all_reduce(nan_flag)

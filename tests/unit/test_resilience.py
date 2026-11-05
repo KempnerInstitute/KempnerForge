@@ -216,6 +216,85 @@ class TestNaNDetector:
             det.check_loss(float("nan"), step=i)
         assert len(det.state.nan_steps) == 2
 
+    def test_nan_grad_norm_with_a_finite_loss_returns_false(self):
+        det = NaNDetector(action="warn")
+        assert det.check_loss(0.0, step=1, grad_norm=float("nan")) is False
+        assert det.state.consecutive_nans == 1
+        assert det.state.nan_steps == [1]
+
+    def test_inf_grad_norm_returns_false(self):
+        det = NaNDetector(action="warn")
+        assert det.check_loss(1.5, step=1, grad_norm=float("inf")) is False
+
+    def test_finite_grad_norm_returns_true(self):
+        det = NaNDetector(action="warn")
+        assert det.check_loss(1.5, step=1, grad_norm=0.7) is True
+        assert det.state.last_good_loss == 1.5
+
+    def test_bad_grad_norms_count_toward_rollback(self):
+        det = NaNDetector(action="warn", max_consecutive=2)
+        det.check_loss(1.0, step=1, grad_norm=float("nan"))
+        det.check_loss(1.0, step=2, grad_norm=float("nan"))
+        assert det.should_rollback
+
+    def test_bad_grad_norm_raises_with_action_raise(self):
+        det = NaNDetector(action="raise")
+        import pytest
+
+        with pytest.raises(RuntimeError, match="NaN/Inf gradient norm at step 1"):
+            det.check_loss(1.0, step=1, grad_norm=float("nan"))
+
+    @staticmethod
+    def _fake_world(monkeypatch, remote_bad: bool) -> list[float]:
+        """Run check_loss as one rank of a world whose other rank is bad or not.
+
+        The flag tensor is made on the CPU instead of CUDA, and all_reduce adds the
+        other rank's flag; returns the local flag seen by each all_reduce call.
+        """
+        import kempnerforge.resilience.health as health
+
+        class _CpuTorch:
+            def __getattr__(self, name):
+                return getattr(torch, name)
+
+            @staticmethod
+            def tensor(data, device=None, **kwargs):
+                return torch.tensor(data, **kwargs)
+
+        seen: list[float] = []
+
+        def all_reduce(flag, *args, **kwargs):
+            seen.append(flag.item())
+            flag.add_(1.0 if remote_bad else 0.0)
+
+        monkeypatch.setattr(health, "torch", _CpuTorch())
+        monkeypatch.setattr(health.dist, "is_initialized", lambda: True)
+        monkeypatch.setattr(health.dist, "all_reduce", all_reduce)
+        return seen
+
+    def test_a_bad_grad_norm_on_another_rank_fails_the_check_here(self, monkeypatch):
+        seen = self._fake_world(monkeypatch, remote_bad=True)
+        det = NaNDetector(action="warn")
+        assert det.check_loss(0.0, step=1, grad_norm=1.0) is False
+        assert det.state.consecutive_nans == 1
+        assert seen == [0.0]
+
+    def test_a_bad_local_grad_norm_still_reduces_once(self, monkeypatch):
+        seen = self._fake_world(monkeypatch, remote_bad=False)
+        det = NaNDetector(action="warn")
+        assert det.check_loss(0.0, step=1, grad_norm=float("nan")) is False
+        assert det.check_loss(0.0, step=2, grad_norm=1.0) is True
+        assert seen == [1.0, 0.0]
+
+    def test_raise_comes_after_the_reduction(self, monkeypatch):
+        import pytest
+
+        seen = self._fake_world(monkeypatch, remote_bad=False)
+        det = NaNDetector(action="raise")
+        with pytest.raises(RuntimeError, match="NaN/Inf gradient norm at step 1"):
+            det.check_loss(1.0, step=1, grad_norm=float("inf"))
+        assert seen == [1.0]
+
     def test_last_good_loss_tracked(self):
         det = NaNDetector(action="warn")
         det.check_loss(3.0, step=1)
