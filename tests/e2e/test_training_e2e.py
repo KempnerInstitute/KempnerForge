@@ -779,7 +779,7 @@ def _assert_losses_close(reference: str, resumed: str, steps: range) -> None:
     worst = max(gaps, key=gaps.__getitem__)
     assert gaps[worst] <= _EP_RESUME_TOLERANCE, (
         f"step {worst}: resumed loss {res_losses[worst]} against {ref_losses[worst]} "
-        "uninterrupted -- the resume did not give each EP rank its own experts"
+        "uninterrupted; the resume did not give each EP rank its own experts"
     )
 
 
@@ -824,15 +824,21 @@ def test_moe_ep_resume_matches_uninterrupted(tmp_path, packed):
 
 
 @pytest.mark.e2e
-@requires_gpus(4)
-@pytest.mark.parametrize(("ep", "nproc"), [(1, 1), (4, 4)], ids=["ep1", "ep4"])
+@pytest.mark.parametrize(
+    ("ep", "nproc"),
+    [
+        pytest.param(1, 1, id="ep1", marks=requires_gpus(2)),
+        pytest.param(4, 4, id="ep4", marks=requires_gpus(4)),
+    ],
+)
 def test_moe_ep_checkpoint_resumes_at_another_ep(tmp_path, ep, nproc):
-    """An ep=2 checkpoint resumes at another ``ep`` with every expert's weights.
+    """An ep=2 checkpoint resumes at another ``ep`` with every expert's weights and moments.
 
-    Every run has one DP rank, so each reads the same batches. The first step after the
-    resume runs the saved weights on the batch the ep=2 run took, so its loss matches.
+    Every run has one DP rank, so each reads the same batches. The steps after the resume
+    run the saved weights and AdamW moments on the batches the ep=2 run took, so their
+    losses match it within the tolerance.
     """
-    common = _ep_moe_args(tmp_path, "--train.max_steps=21")
+    common = _ep_moe_args(tmp_path, "--train.max_steps=25")
     straight = _run_training(
         common
         + [
@@ -843,7 +849,7 @@ def test_moe_ep_checkpoint_resumes_at_another_ep(tmp_path, ep, nproc):
         nproc=2,
         timeout=300,
     )
-    _assert_training_complete(straight, expected_steps=21)
+    _assert_training_complete(straight, expected_steps=25)
     resumed = _run_training(
         common
         + [
@@ -855,10 +861,10 @@ def test_moe_ep_checkpoint_resumes_at_another_ep(tmp_path, ep, nproc):
         nproc=nproc,
         timeout=300,
     )
-    _assert_training_complete(resumed, expected_steps=21)
+    _assert_training_complete(resumed, expected_steps=25)
     output = resumed.stdout + resumed.stderr
     assert "step=20" in output, "did not resume from step 20"
-    _assert_losses_close(straight.stdout + straight.stderr, output, range(21, 22))
+    _assert_losses_close(straight.stdout + straight.stderr, output, range(21, 26))
 
 
 _SIGMOID_MOE_OVERRIDES = [
