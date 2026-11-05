@@ -33,6 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 
 from convert_checkpoint import dcp_to_hf
 
+import kempnerforge.checkpoint.expert_layout as expert_layout_module
 import kempnerforge.checkpoint.manager as manager_module
 from kempnerforge.checkpoint.manager import CheckpointManager
 from kempnerforge.config.model import ModelConfig
@@ -296,6 +297,32 @@ def _save_drifted(rank, world, port, names, sizes, overrides, root) -> None:
         dist.destroy_process_group()
 
 
+def _save_misplaced(rank, world, port, names, sizes, overrides, root) -> None:
+    """Save with FSDP's placements left as they are, which put the rows dp-major.
+
+    That is the right size at the wrong offset, as older torch versions can lay out the
+    strided shard. Ranks whose rows would land elsewhere refuse the save, and the others
+    raise with them.
+    """
+    _init(rank, world, port)
+    try:
+        expert_layout_module._rows_after_ep = lambda placements, ep, name: tuple(placements)
+        mesh = init_device_mesh("cpu", sizes, mesh_dim_names=names)
+        model, optimizer = _build(mesh, _config(overrides), seed=0)
+        _train(model, optimizer, mesh)
+        manager = CheckpointManager(
+            CheckpointConfig(dir=str(Path(root) / "ckpt")), model, optimizer
+        )
+        if mesh.get_local_rank("dp_shard") != mesh.get_local_rank("ep"):
+            expected = pytest.raises(ValueError, match="but they belong at")
+        else:
+            expected = pytest.raises(RuntimeError, match="failed on ranks")
+        with expected:
+            manager.save(STEP)
+    finally:
+        dist.destroy_process_group()
+
+
 def _refuse(rank, world, port, names, sizes, overrides, step_dir) -> None:
     """Every rank refuses to load ``step_dir`` at this layout, naming what it holds."""
     _init(rank, world, port)
@@ -418,6 +445,14 @@ class TestDriftedCopies:
         reference = torch.load(tmp_path / "reference.pt")
         saved = _saved(_step_dir(tmp_path), tmp_path)
         assert _mismatches({k: saved[k] for k in reference if k in saved}, reference) == []
+
+
+class TestPlacementCheck:
+    def test_rows_saved_out_of_place_refuse_the_save(self, tmp_path):
+        """A view whose rows DCP would save at the wrong offset is refused on every rank."""
+        names, sizes, overrides = LAYOUTS["dp_shard2_ep2_packed"]
+        _spawn(_save_misplaced, names, sizes, overrides, str(tmp_path))
+        assert not (_step_dir(tmp_path) / ".metadata").exists()
 
 
 class TestResumeAtTheSameLayout:
