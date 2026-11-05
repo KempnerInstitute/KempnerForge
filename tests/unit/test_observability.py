@@ -1038,6 +1038,23 @@ class TestRankLogger:
         assert stack.startswith("Stack (most recent call last):\n")
         assert "in test_rank_formatter_prints_the_stack_of_a_record\n" in stack
 
+    def test_rank_formatter_adds_no_blank_line_after_a_trailing_newline(self):
+        """After a message ending in a newline, traceback then stack follow as logging.Formatter."""
+        try:
+            raise ValueError("bad batch")
+        except ValueError:
+            exc_info = sys.exc_info()
+        stack = "Stack (most recent call last):\n  frame"
+        record = logging.LogRecord(
+            "test", logging.ERROR, "", 0, "step failed\n", (), exc_info, sinfo=stack
+        )
+        with patch.dict(os.environ, {"RANK": "0"}):
+            output = _RankFormatter(use_color=False).format(record)
+        rest = output.split(" [rank 0] ERROR    ", 1)[1]
+        assert rest == logging.Formatter().format(record)
+        assert rest.startswith("step failed\nTraceback (most recent call last):\n")
+        assert rest.endswith(f"ValueError: bad batch\n{stack}")
+
     def test_configure_root_no_rank_filter(self, monkeypatch):
         """When rank_zero_only=False, _configure_root attaches no _RankFilter.
 
