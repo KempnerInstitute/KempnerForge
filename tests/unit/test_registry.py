@@ -1,4 +1,5 @@
-"""Tests for the registry's duplicate-registration error, which names both modules."""
+"""Tests for the registry's duplicate-registration error, which names the modules involved,
+and for the loader's sys.path hint when a plugin module fails to import."""
 
 from __future__ import annotations
 
