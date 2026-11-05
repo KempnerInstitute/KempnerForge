@@ -1808,7 +1808,7 @@ class TestAsyncLatestSymlinkSafety:
         assert step == 20
         assert tokens == 2000
 
-    def test_cleanup_never_deletes_latest_or_in_flight(self, tmp_path, monkeypatch):
+    def test_cleanup_never_deletes_latest_or_in_flight(self, tmp_path, pruned_dirs):
         mgr = self._mgr(tmp_path, AsyncCheckpointMode.async_pinned)
         mgr.config.keep_last_n = 1
         dirs = {s: self._build_ckpt(tmp_path, s, complete=True) for s in (1, 2, 3, 4, 5)}
@@ -1821,8 +1821,7 @@ class TestAsyncLatestSymlinkSafety:
 
         assert dirs[3].exists(), "cleanup deleted the live `latest` target"
         assert dirs[5].exists(), "cleanup deleted the in-flight pending checkpoint"
-        assert not dirs[1].exists()
-        assert not dirs[2].exists()
+        assert pruned_dirs == [dirs[1], dirs[2], dirs[4]]
 
     @staticmethod
     def _record_agreements(monkeypatch) -> list[object]:
