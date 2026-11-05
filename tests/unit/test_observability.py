@@ -360,17 +360,21 @@ class TestDeviceMemoryMonitor:
         monitor = DeviceMemoryMonitor(snapshot_dir=str(tmp_path))
         assert monitor.capture_snapshot(step=1) is None
 
-    def test_snapshot_without_a_device_names_the_current_one(self, monkeypatch, tmp_path):
-        """By default the snapshot syncs the current device and is named after its index."""
+    @pytest.mark.parametrize(("device", "resolved"), [(None, 3), (0, 0)])
+    def test_snapshot_syncs_and_names_the_device_it_reads(
+        self, monkeypatch, tmp_path, device, resolved
+    ):
+        """By default the snapshot uses the current device; an explicit index, 0 included, wins."""
         _FakeCudaMemory(monkeypatch)
         synced: list[int | None] = []
         monkeypatch.setattr(torch.cuda, "synchronize", synced.append)
         monkeypatch.setattr(torch.cuda.memory, "_record_memory_history", lambda *a, **k: None)
         monkeypatch.setattr(torch.cuda.memory, "_snapshot", lambda: {"segments": []})
-        path = DeviceMemoryMonitor(snapshot_dir=str(tmp_path)).capture_snapshot(step=7)
-        assert path == str(tmp_path / "snapshot_step_7_device_3.pickle")
+        monitor = DeviceMemoryMonitor(device=device, snapshot_dir=str(tmp_path))
+        path = monitor.capture_snapshot(step=7)
+        assert path == str(tmp_path / f"snapshot_step_7_device_{resolved}.pickle")
         assert Path(path).is_file()
-        assert synced == [3]
+        assert synced == [resolved]
 
 
 class TestMemoryHelpers:
