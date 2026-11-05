@@ -179,7 +179,15 @@ activation = "my_mlp"   # matches the registry key
 
 The activation-name → MLP-key mapping covers `silu`/`gelu`/`relu`; any
 other string is looked up directly in the `"mlp"` category, so your
-key just works.
+key just works in dense layers. Two limits apply:
+
+- **Not inside MoE experts.** With `num_experts > 0` the config is
+  rejected: MoE experts (MoT's included) compute core's SwiGLU or
+  standard MLP from the expert weights instead of calling your module.
+  MoMa's experts do call it, so a MoMa run can use it.
+- **Not core's own keys.** `activation = "swiglu"`, `"standard_gelu"`
+  or `"standard_relu"` is rejected; use `silu`, `gelu` or `relu`,
+  which select those MLPs.
 
 ```{note}
 The registry is a global singleton. If the module containing the
