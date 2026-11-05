@@ -15,9 +15,10 @@ registry.register("mlp", "my_mlp", builder_fn)
 model = registry.get("mlp", "my_mlp")(dim=4096, hidden_dim=11008)
 ```
 
-`register(category, name, obj)` fails fast on duplicate names; `get`
-raises `KeyError` with an "Available: […]" hint when a name is missing;
-`list(category)` returns registered names.
+`register(category, name, obj)` fails fast on duplicate names, with a
+`ValueError` naming the module that registered the name and the module
+registering it again; `get` raises `KeyError` with an "Available: […]"
+hint when a name is missing; `list(category)` returns registered names.
 
 ## The seven categories
 
@@ -127,6 +128,12 @@ the repo root on `sys.path`; anything outside the repo must be installed
 or on `PYTHONPATH`. A missing or failing module raises a
 `ValueError` naming it, and `--plugins=["pkg.mod"]` overrides the TOML
 list like any other field.
+
+A plugin that registers a name another module already registered fails
+the same way, and the error names both modules. Some categories are
+filled only when core first imports the module that registers them, so
+a plugin imported earlier takes the name, and the error is raised at
+that later import instead, still naming the plugin as the owner.
 
 Four rules for plugin authors, all from the distributed contract:
 
