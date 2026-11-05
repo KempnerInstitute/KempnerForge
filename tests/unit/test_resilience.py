@@ -10,6 +10,7 @@ import torch
 
 from kempnerforge.resilience.elastic import (
     SLURMInfo,
+    _dcp_durable,
     get_slurm_info,
     is_slurm_job,
     is_slurm_requeue,
@@ -729,6 +730,67 @@ class TestResumePathResolution:
         result = resolve_resume_path(str(tmp_path))
         assert result is not None
         assert result.name == "step_10"
+
+    def test_skips_a_pipeline_parallel_dir_missing_a_stage(self, tmp_path):
+        """A stage that died before its save started leaves no pp{k}/ at all.
+
+        Given the run's stage count, the scan sees that pp1 is missing and
+        resumes every stage from the newest step they all saved.
+        """
+        _durable_step_dir(tmp_path, 10, pp_stages=2)
+        _durable_step_dir(tmp_path, 20, pp_stages=1)
+
+        result = resolve_resume_path(str(tmp_path), num_stages=2)
+        assert result is not None
+        assert result.name == "step_10"
+
+    def test_a_missing_stage_makes_the_step_not_durable(self, tmp_path):
+        complete = _durable_step_dir(tmp_path, 10, pp_stages=2)
+        partial = _durable_step_dir(tmp_path, 20, pp_stages=1)
+
+        assert _dcp_durable(complete, num_stages=2)
+        assert not _dcp_durable(partial, num_stages=2)
+
+    def test_a_flat_checkpoint_stays_durable_with_a_stage_count(self, tmp_path):
+        flat = _durable_step_dir(tmp_path, 10)
+
+        assert _dcp_durable(flat, num_stages=2)
+        assert _dcp_durable(flat, num_stages=None)
+
+    def test_an_extra_incomplete_stage_is_still_rejected(self, tmp_path):
+        partial = _durable_step_dir(tmp_path, 20, pp_stages=2)
+        (partial / "pp2").mkdir()
+
+        assert not _dcp_durable(partial, num_stages=2)
+
+    def test_a_missing_interior_stage_is_caught(self, tmp_path):
+        partial = _durable_step_dir(tmp_path, 20, pp_stages=4)
+        for f in (partial / "pp1").iterdir():
+            f.unlink()
+        (partial / "pp1").rmdir()
+
+        assert not _dcp_durable(partial, num_stages=4)
+
+    def test_with_no_step_holding_every_stage_the_old_choice_is_kept(
+        self, tmp_path, caplog, monkeypatch
+    ):
+        """A checkpoint saved with fewer stages fails to load instead of starting over.
+
+        The stage layout records no degree, so it looks like a save whose later
+        stages never ran. With nothing better to resume, the scan returns it as
+        it did before, and the load fails on the missing stages.
+        """
+        import logging
+
+        self._let_caplog_see_kempnerforge(monkeypatch)
+        _durable_step_dir(tmp_path, 5, pp_stages=2)
+        _durable_step_dir(tmp_path, 10, pp_stages=2)
+
+        with caplog.at_level(logging.WARNING, logger="kempnerforge"):
+            result = resolve_resume_path(str(tmp_path), num_stages=4)
+        assert result is not None
+        assert result.name == "step_10"
+        assert "another pipeline degree" in caplog.text
 
     @staticmethod
     def _let_caplog_see_kempnerforge(monkeypatch):

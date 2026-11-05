@@ -63,7 +63,8 @@ Linear forward path).
 ### 3 · Float8 before AC and FSDP
 
 `apply_float8` replaces `nn.Linear` with `Float8Linear` (torchao,
-TENSORWISE recipe — E4M3 forward, E5M2 backward, bf16 master weights).
+TENSORWISE recipe — E4M3 forward, E5M2 backward, master weights left
+in their dtype: bf16, or fp32 with `fp32_master_weights`).
 Order matters on both sides:
 
 - **After TP / EP** — Float8 needs to see the post-TP modules so the
