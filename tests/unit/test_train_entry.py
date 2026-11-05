@@ -3002,6 +3002,57 @@ class TestUnfreezeAtAStage:
         assert all(not torch.equal(p, i) for p, i in pairs)
 
 
+
+class TestResumePastAnUnfreezeStage:
+    """A resume keeps a module that a stage unfreezes in the optimizer, with its saved state."""
+
+    @pytest.mark.parametrize("saved_step", [1, 3])
+    def test_the_resumed_optimizer_holds_the_module_and_its_state(
+        self, monkeypatch, tmp_path, saved_step
+    ):
+        """The stage after step 2 unfreezes the head the build froze. Saved at step 3, the head
+        resumes trainable with the AdamW moments it was saved with; saved at step 1, it resumes
+        frozen, held by the optimizer with no state."""
+        import kempnerforge.training.entry as entry
+        from kempnerforge.checkpoint.manager import CheckpointManager
+        from kempnerforge.training.freeze import apply_freeze_specs
+
+        config = _head_config(max_steps=4)
+        config.checkpoint.dir = str(tmp_path / "ckpt")
+        assert config.vlm is not None
+        model, optimizer = _built_with_a_frozen_head(config)
+        loss_fn = torch.nn.functional.cross_entropy
+        for step in range(1, saved_step + 1):
+            logits, labels = model(None, _VLM_BATCH["input_ids"], _VLM_BATCH["labels"])
+            loss_fn(logits.reshape(-1, VOCAB), labels.reshape(-1)).backward()
+            optimizer.step()
+            optimizer.zero_grad()
+            if step == 2:
+                stage = config.vlm.freeze_schedule[0]
+                apply_freeze_specs(model, stage.specs, config.vlm.module_patterns)
+        CheckpointManager(config.checkpoint, model, optimizer).save(
+            step=saved_step, extra=checkpoint_extra(config, saved_step, PhaseState())
+        )
+
+        resumed, resumed_optimizer = _built_with_a_frozen_head(config)
+        saved = Path(config.checkpoint.dir) / f"step_{saved_step}"
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: saved)
+        manager = CheckpointManager(config.checkpoint, resumed, resumed_optimizer)
+        assert entry.restore_checkpoint(config, resumed, None, manager) == (saved_step, 0)
+
+        held = {id(p) for group in resumed_optimizer.param_groups for p in group["params"]}
+        for param, loaded in zip(model.proj.parameters(), resumed.proj.parameters(), strict=True):
+            assert id(loaded) in held
+            assert torch.equal(param, loaded)
+            assert loaded.requires_grad is (saved_step > 2)
+            if saved_step > 2:
+                for key in ("exp_avg", "exp_avg_sq"):
+                    saved_state = optimizer.state[param][key]
+                    assert torch.equal(resumed_optimizer.state[loaded][key], saved_state)
+            else:
+                assert not resumed_optimizer.state.get(loaded)
+
+
 class TestFreezeStageFence:
     """The stage hook must drain an in-flight save before flipping requires_grad.
 

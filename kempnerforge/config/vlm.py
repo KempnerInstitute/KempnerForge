@@ -68,7 +68,8 @@ class FreezeStage:
     ``VLMConfig`` is expected to be in strictly monotonic
     ``start_step`` order. A stage can unfreeze a module that
     ``VLMConfig.freeze`` froze at build: the optimizer holds the module
-    from the start.
+    from the start, and a resume past the stage restores the module's
+    optimizer state.
     """
 
     start_step: int
