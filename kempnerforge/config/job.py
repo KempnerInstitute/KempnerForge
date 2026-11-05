@@ -11,7 +11,7 @@ from kempnerforge.config.distributed import DistributedConfig
 from kempnerforge.config.eval import EvalConfig
 from kempnerforge.config.metrics import MetricsConfig
 from kempnerforge.config.model import FLEX_BLOCK_SIZE, ModelConfig
-from kempnerforge.config.optimizer import OptimizerConfig
+from kempnerforge.config.optimizer import OptimizerConfig, overlapping_modules
 from kempnerforge.config.profiling import ProfilingConfig
 from kempnerforge.config.scheduler import SchedulerConfig
 from kempnerforge.config.training import TrainConfig
@@ -126,6 +126,14 @@ class JobConfig:
                 raise ValueError(
                     f"optimizer.lr_multipliers names unknown modules {unknown}; the modules of "
                     f"vlm.module_patterns are {sorted(self.vlm.module_patterns)}"
+                )
+            overlap = overlapping_modules(self.optimizer.lr_multipliers, self.vlm.module_patterns)
+            if overlap is not None:
+                first, second, a, b = overlap
+                raise ValueError(
+                    f"optimizer.lr_multipliers lists {first!r} and {second!r}, whose "
+                    f"vlm.module_patterns overlap ({a!r} and {b!r}); list one of them, or add "
+                    "a module to vlm.module_patterns that names only the parameters meant"
                 )
 
         if self.model.attention_backend == "flex" and self.train.seq_len < FLEX_BLOCK_SIZE:

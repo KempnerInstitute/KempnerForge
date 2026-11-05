@@ -17,7 +17,7 @@ import shutil
 import stat
 import threading
 import uuid
-from collections.abc import Callable, Container, Iterable, Mapping
+from collections.abc import Callable, Container, Iterable, Mapping, Sequence
 from functools import partial
 from pathlib import Path
 from typing import Any, Protocol, TypeGuard, cast
@@ -227,18 +227,35 @@ def _read_weight_decay_scope(ckpt_dir: Path) -> str:
     return scope
 
 
-def _read_lr_multipliers(ckpt_dir: Path) -> dict[str, float]:
-    """Return the ``lr_multipliers`` recorded in a checkpoint's ``metadata.json``.
-
-    A checkpoint with no ``metadata.json``, or one without the field, was saved without any.
+def _canonical_patterns(record: object) -> dict[str, list[str]]:
+    """Return a ``{module: patterns}`` record with each module's patterns sorted and unique.
 
     Raises:
-        ValueError: ``metadata.json`` exists but is not a readable JSON object, or the field
-            does not map module names to positive finite numbers.
+        ValueError: ``record`` does not map module names to lists of strings.
+    """
+    if not isinstance(record, dict) or not all(
+        isinstance(module, str)
+        and isinstance(patterns, list)
+        and all(isinstance(pattern, str) for pattern in patterns)
+        for module, patterns in record.items()
+    ):
+        raise ValueError(f"expected module names mapped to lists of patterns, got {record!r}")
+    return {module: sorted(set(patterns)) for module, patterns in record.items()}
+
+
+def _read_lr_multipliers(ckpt_dir: Path) -> tuple[dict[str, float], dict[str, list[str]]]:
+    """Return the ``lr_multipliers`` and ``lr_module_patterns`` a checkpoint's ``metadata.json``
+    records.
+
+    A checkpoint with no ``metadata.json``, or one without the fields, was saved without any.
+
+    Raises:
+        ValueError: ``metadata.json`` exists but is not a readable JSON object, or a field does
+            not hold a valid record.
     """
     metadata_path = ckpt_dir / _METADATA_FILE
     if not metadata_path.exists():
-        return {}
+        return {}, {}
     try:
         meta = json.loads(metadata_path.read_text())
     except (OSError, ValueError) as e:
@@ -246,9 +263,11 @@ def _read_lr_multipliers(ckpt_dir: Path) -> dict[str, float]:
     if not isinstance(meta, dict):
         raise ValueError(f"{metadata_path} does not hold a JSON object")
     try:
-        return checked_lr_multipliers(meta.get("lr_multipliers", {}))
+        multipliers = checked_lr_multipliers(meta.get("lr_multipliers", {}))
+        patterns = _canonical_patterns(meta.get("lr_module_patterns", {}))
     except ValueError as e:
-        raise ValueError(f"{metadata_path} records an invalid lr_multipliers: {e}") from e
+        raise ValueError(f"{metadata_path} records an invalid LR multipliers record: {e}") from e
+    return multipliers, patterns
 
 
 def _reset_to_fresh(optimizer: torch.optim.Optimizer) -> None:
@@ -428,11 +447,13 @@ class CheckpointManager:
             scope with a fresh optimizer. A checkpoint that does not record a scope counts as
             ``"exclude_norms_and_biases"``.
         lr_multipliers: The run's ``optimizer.lr_multipliers``. When set, every save records
-            a non-empty one in ``metadata.json``, and a load raises ``ValueError`` on every
-            rank, before anything is loaded, when the checkpoint was saved with other
-            multipliers and the load restores its optimizer state on any rank, or its
-            ``train_state.pt`` into a scheduler. A checkpoint that records none counts as
-            saved without multipliers.
+            a non-empty one in ``metadata.json``, with the patterns of its modules, and a load
+            raises ``ValueError`` on every rank, before anything is loaded, when the checkpoint
+            was saved with other multipliers or patterns and the load restores its optimizer
+            state on any rank, or its ``train_state.pt`` into a scheduler. A checkpoint that
+            records none counts as saved without multipliers.
+        module_patterns: Module name to fnmatch patterns, such as ``VLMConfig.module_patterns``.
+            Required for every module ``lr_multipliers`` lists.
     """
 
     def __init__(
@@ -444,6 +465,7 @@ class CheckpointManager:
         pp_rank: int | None = None,
         weight_decay_scope: str | None = None,
         lr_multipliers: Mapping[str, float] | None = None,
+        module_patterns: Mapping[str, Sequence[str]] | None = None,
     ) -> None:
         self.config = config
         self.model = model
@@ -459,6 +481,12 @@ class CheckpointManager:
         self._pp_rank = pp_rank
         self._weight_decay_scope = weight_decay_scope
         self._lr_multipliers = None if lr_multipliers is None else dict(lr_multipliers)
+        listed = sorted(self._lr_multipliers or ())
+        patterns = module_patterns or {}
+        missing = [module for module in listed if module not in patterns]
+        if missing:
+            raise ValueError(f"lr_multipliers needs module_patterns for {missing}")
+        self._lr_module_patterns = {module: sorted(set(patterns[module])) for module in listed}
         self._pending_dataloader_state: dict[str, Any] | None = None
         self._pending_finalize: tuple[int, Path] | None = None
         self._tracking_source: TrackingSource | None = None
@@ -621,8 +649,8 @@ class CheckpointManager:
 
     def _sidecar_text(self, meta: dict[str, Any]) -> str:
         """``meta`` as JSON, plus the run's ``weight_decay_scope`` when the manager has one, its
-        ``lr_multipliers`` when it has a non-empty one, and the live tracking runs when the
-        source can supply them.
+        ``lr_multipliers`` and their ``lr_module_patterns`` when it has a non-empty one, and the
+        live tracking runs when the source can supply them.
 
         Everything that depends on the source sits inside one guard: it runs on rank 0 alone,
         so a raise here would strand the other ranks. A bad source costs the ``tracking`` key.
@@ -630,7 +658,11 @@ class CheckpointManager:
         if self._weight_decay_scope is not None:
             meta = {**meta, "weight_decay_scope": self._weight_decay_scope}
         if self._lr_multipliers:
-            meta = {**meta, "lr_multipliers": dict(sorted(self._lr_multipliers.items()))}
+            meta = {
+                **meta,
+                "lr_multipliers": dict(sorted(self._lr_multipliers.items())),
+                "lr_module_patterns": dict(sorted(self._lr_module_patterns.items())),
+            }
         if self._tracking_source is not None:
             try:
                 tracking = self._tracking_source()
@@ -1107,19 +1139,22 @@ class CheckpointManager:
             )
 
     def _check_lr_multipliers(self, ckpt_dir: Path, *, only_with_train_state: bool = False) -> None:
-        """Refuse a checkpoint saved with LR multipliers other than this manager's.
+        """Refuse a checkpoint saved with LR multipliers, or patterns of their modules, other
+        than this manager's.
 
-        The multipliers decide the optimizer's param groups and their learning rates, which
-        the saved optimizer state and the scheduler state in ``train_state.pt`` are laid out
-        for. With ``only_with_train_state``, a checkpoint without ``train_state.pt`` passes.
-        Every rank calls this or none does: rank 0 reads the record and broadcasts it, or
-        whatever stopped it reading, so every rank raises or proceeds together.
+        The multipliers and the patterns decide the optimizer's param groups and their learning
+        rates, which the saved optimizer state and the scheduler state in ``train_state.pt``
+        are laid out for. With ``only_with_train_state``, a checkpoint without
+        ``train_state.pt`` passes. Every rank calls this or none does: rank 0 reads the record
+        and broadcasts it, or whatever stopped it reading, so every rank raises or proceeds
+        together.
 
         Raises:
-            ValueError: The checkpoint's multipliers differ from this manager's, or its
-                ``metadata.json`` does not hold a valid record.
+            ValueError: The checkpoint's multipliers or patterns differ from this manager's, or
+                its ``metadata.json`` does not hold a valid record.
         """
-        outcome: list[tuple[dict[str, float] | None, str | None]] = [(None, None)]
+        outcome: list[tuple[tuple[dict[str, float], dict[str, list[str]]] | None, str | None]]
+        outcome = [(None, None)]
         if self._rank == 0 or not dist.is_initialized():
             try:
                 if not only_with_train_state or (ckpt_dir / _TRAIN_STATE_FILE).exists():
@@ -1133,14 +1168,26 @@ class CheckpointManager:
         saved, error = outcome[0]
         if error is not None:
             raise ValueError(f"Cannot check the lr_multipliers of {ckpt_dir}: {error}")
-        if saved is not None and saved != self._lr_multipliers:
-            raise ValueError(
-                f"{ckpt_dir} was saved with optimizer.lr_multipliers={saved}, but this run uses "
-                f"{self._lr_multipliers}. The multipliers decide the optimizer's param groups "
-                f"and their learning rates, and the checkpoint's optimizer and scheduler state "
-                f"belong to the groups it was saved with. Resume with "
-                f"optimizer.lr_multipliers={saved}."
+        if saved is None:
+            return
+        multipliers, patterns = saved
+        if multipliers != self._lr_multipliers:
+            change = (
+                f"optimizer.lr_multipliers={multipliers}, but this run uses {self._lr_multipliers}"
             )
+        elif patterns != self._lr_module_patterns:
+            change = (
+                f"the module patterns {patterns} for its optimizer.lr_multipliers, but this run "
+                f"has {self._lr_module_patterns}"
+            )
+        else:
+            return
+        raise ValueError(
+            f"{ckpt_dir} was saved with {change}. The multipliers and the patterns of their "
+            f"modules decide the optimizer's param groups and their learning rates, and the "
+            f"checkpoint's optimizer and scheduler state belong to the groups it was saved with. "
+            f"Resume with the saved values."
+        )
 
     def apply_dataloader_state(self, dataloader: Any) -> None:
         """Apply any dataloader state stashed during load().

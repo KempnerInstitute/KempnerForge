@@ -91,7 +91,11 @@
         "OptimizerConfig": {
           "purpose": "Optimizer settings (name, lr, betas, weight_decay, muon params, schedule_free_warmup_steps, weight_decay_scope, lr_multipliers per vlm.module_patterns module)"
         }
-      }
+      },
+      "functions": [
+        "checked_lr_multipliers(multipliers) -> dict[str, float]",
+        "overlapping_modules(modules, module_patterns) -> (first, second, pattern, pattern) | None"
+      ]
     },
     "kempnerforge/config/scheduler.py": {
       "enums": [
@@ -1196,7 +1200,7 @@
             "load(path, scheduler, dataloader, exclude_keys, vlm_freeze_expected)",
             "_read_saved_keys(ckpt_dir, dcp_dir) (this rank's DCP keys; checks the scope only when an all-reduce on the gloo group finds optimizer state on some rank)",
             "_check_weight_decay_scope(ckpt_dir) (rank 0 reads the saved scope and broadcasts it; every rank refuses a mismatch)",
-            "_check_lr_multipliers(ckpt_dir, only_with_train_state) (rank 0 reads the saved lr_multipliers and broadcasts them; every rank refuses a mismatch when optimizer or scheduler state would load)",
+            "_check_lr_multipliers(ckpt_dir, only_with_train_state) (rank 0 reads the saved lr_multipliers and their module patterns and broadcasts them; every rank refuses a mismatch when optimizer or scheduler state would load)",
             "apply_dataloader_state(dataloader)",
             "_resolve_load_path(path)",
             "_cleanup()"
@@ -1207,7 +1211,7 @@
         "_load_train_state(path) -> dict (ownership-gated torch.load with weights_only=False)",
         "_intersect_freeze_meta_by_module(saved, expected) -> (saved_filt, expected_filt) (cross-arch drop-zero-match rule)",
         "_read_weight_decay_scope(ckpt_dir) -> str (scope recorded in metadata.json; none recorded means exclude_norms_and_biases)",
-        "_read_lr_multipliers(ckpt_dir) -> dict[str, float] (lr_multipliers recorded in metadata.json; none recorded means {})"
+        "_read_lr_multipliers(ckpt_dir) -> (multipliers, patterns) (lr_multipliers and lr_module_patterns recorded in metadata.json; none recorded means empty)"
       ],
       "tested_by": [
         "tests/unit/test_checkpoint.py::TestWeightDecayScopeOnResume",

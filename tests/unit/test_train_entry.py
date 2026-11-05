@@ -1049,6 +1049,7 @@ class TestBuildPhaseHelpers:
         ).save(step=0)
         meta = json.loads((tmp_path / "ckpt" / "step_0" / "metadata.json").read_text())
         assert meta["lr_multipliers"] == {"adapter": 2.0}
+        assert meta["lr_module_patterns"] == {"adapter": ["adapter", "adapter.*"]}
 
     def test_restore_checkpoint_starts_from_scratch(self, tmp_path):
         from kempnerforge.training.entry import build_checkpoint_manager, restore_checkpoint

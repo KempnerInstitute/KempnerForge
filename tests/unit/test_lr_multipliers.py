@@ -121,6 +121,47 @@ class TestConfig:
                 optimizer=OptimizerConfig(lr_multipliers={"adaptor": 2.0}),
             )
 
+    @pytest.mark.parametrize(
+        ("arch", "inner"),
+        [("cross_attention", "cross_attention"), ("mot", "mot"), ("moma", "moma")],
+    )
+    def test_nested_aliases_are_refused_when_the_config_is_built(
+        self, tiny_vlm_configs, arch, inner
+    ):
+        """An arch's own alias lies inside ``transformer``, which the config can tell alone."""
+        mc, vision, adapter, _ = tiny_vlm_configs
+        with pytest.raises(ValueError, match=rf"lists '{inner}' and 'transformer', whose"):
+            JobConfig(
+                model=mc,
+                vision_encoder=vision,
+                adapter=adapter,
+                vlm=VLMConfig.for_arch(arch, max_text_len=32),
+                optimizer=OptimizerConfig(lr_multipliers={"transformer": 0.5, inner: 2.0}),
+            )
+
+    def test_two_aliases_with_one_pattern_are_refused(self, tiny_vlm_configs):
+        mc, vision, adapter, vlm = tiny_vlm_configs
+        vlm.module_patterns["connector"] = ["adapter.*"]
+        with pytest.raises(ValueError, match="lists 'adapter' and 'connector', whose"):
+            JobConfig(
+                model=mc,
+                vision_encoder=vision,
+                adapter=adapter,
+                vlm=vlm,
+                optimizer=OptimizerConfig(lr_multipliers={"adapter": 2.0, "connector": 2.0}),
+            )
+
+    def test_disjoint_aliases_pass(self, tiny_vlm_configs):
+        mc, vision, adapter, vlm = tiny_vlm_configs
+        config = JobConfig(
+            model=mc,
+            vision_encoder=vision,
+            adapter=adapter,
+            vlm=vlm,
+            optimizer=OptimizerConfig(lr_multipliers={"adapter": 2.0, "vision_encoder": 0.1}),
+        )
+        assert config.optimizer.lr_multipliers == {"adapter": 2.0, "vision_encoder": 0.1}
+
     def test_the_toml_table_and_a_cli_override_load(self, tmp_path):
         toml = tmp_path / "vlm.toml"
         toml.write_text(
@@ -393,9 +434,41 @@ class TestMuonFallback:
         optimizer = Muon([{"params": [weight]}], [{"params": [bias]}], lr=0.0, adam_lr=0.1)
         weight.grad = torch.ones_like(weight)
         bias.grad = torch.ones_like(bias)
+        assert module_learning_rates(optimizer) == {}
         optimizer.step()
         assert optimizer._adam is not None
         assert optimizer._adam.param_groups[0]["lr"] == 0.1
+
+    def test_each_module_logs_the_rate_its_fallback_steps_at_next(self):
+        """A module's AdamW fallback groups are logged too, at the rate of the coming step."""
+        model = _vlm_like()
+        optimizer = self._muon(model, lr_multipliers={"vision_encoder": 0.5, "adapter": 2.0})
+        for group in optimizer.param_groups:
+            group["lr"] *= 0.25
+        assert module_learning_rates(optimizer) == {
+            "adapter": pytest.approx(0.01),
+            "adapter/adamw": pytest.approx(1.5e-4),
+            "vision_encoder": pytest.approx(0.0025),
+            "vision_encoder/adamw": pytest.approx(3.75e-5),
+        }
+        _forward(model).backward()
+        optimizer.step()
+        fallback = {g["module"]: g["lr"] for g in optimizer._adam.param_groups if "module" in g}
+        assert fallback == {
+            "adapter": pytest.approx(1.5e-4),
+            "vision_encoder": pytest.approx(3.75e-5),
+        }
+
+    def test_a_module_on_the_fallback_alone_is_logged(self):
+        """A module with no matrix for Muon still reports its rate, through its fallback."""
+        model = _vlm_like()
+        patterns = {**VLM_PATTERNS, "norms": ["transformer.1.*"]}
+        config = OptimizerConfig(
+            name="muon", lr=0.02, muon_adam_lr=3e-4, lr_multipliers={"norms": 0.5}
+        )
+        optimizer = build_optimizer(model, config, module_patterns=patterns)
+        assert not any(g.get("module") == "norms" for g in optimizer.param_groups)
+        assert module_learning_rates(optimizer) == {"norms/adamw": pytest.approx(1.5e-4)}
 
 
 MODEL_CONFIG = ModelConfig(dim=64, n_layers=2, n_heads=2, vocab_size=256, max_seq_len=64)
@@ -410,11 +483,11 @@ class TestResume:
     """A load that restores optimizer or scheduler state refuses other multipliers."""
 
     @staticmethod
-    def _build(name, multipliers, seed):
+    def _build(name, multipliers, seed, patterns=PATTERNS):
         torch.manual_seed(seed)
         model = Transformer(MODEL_CONFIG)
         config = OptimizerConfig(name=name, lr=1e-3, fused=False, lr_multipliers=multipliers)
-        optimizer = build_optimizer(model, config, module_patterns=PATTERNS)
+        optimizer = build_optimizer(model, config, module_patterns=patterns)
         scheduler = build_scheduler(optimizer, SchedulerConfig(warmup_steps=2), max_steps=20)
         return model, optimizer, scheduler
 
@@ -430,12 +503,13 @@ class TestResume:
             optimizer.zero_grad()
 
     @staticmethod
-    def _manager(tmp_path, model, optimizer, multipliers, **kwargs):
+    def _manager(tmp_path, model, optimizer, multipliers, patterns=PATTERNS, **kwargs):
         return CheckpointManager(
             CheckpointConfig(dir=str(tmp_path)),
             model,
             optimizer,
             lr_multipliers=multipliers,
+            module_patterns=patterns,
             **kwargs,
         )
 
@@ -445,9 +519,10 @@ class TestResume:
         self._manager(tmp_path, model, optimizer, multipliers).save(step=steps, scheduler=scheduler)
         return tmp_path / f"step_{steps}"
 
-    def _resume(self, tmp_path, multipliers, name="adamw", **kwargs):
-        model, optimizer, scheduler = self._build(name, multipliers, seed=1)
-        return model, scheduler, self._manager(tmp_path, model, optimizer, multipliers, **kwargs)
+    def _resume(self, tmp_path, multipliers, name="adamw", patterns=PATTERNS, **kwargs):
+        model, optimizer, scheduler = self._build(name, multipliers, seed=1, patterns=patterns)
+        manager = self._manager(tmp_path, model, optimizer, multipliers, patterns, **kwargs)
+        return model, scheduler, manager
 
     def test_the_save_records_the_multipliers_by_name(self, tmp_path):
         step_dir = self._save(tmp_path, {"layer0": 0.5, "head": 2.0})
@@ -476,6 +551,31 @@ class TestResume:
         self._train(model2, optimizer2, scheduler2, 2)
         for a, b in zip(model.parameters(), model2.parameters(), strict=True):
             assert torch.equal(a, b), "the resumed run diverged from the uninterrupted one"
+
+    def test_other_patterns_for_the_same_multipliers_are_refused(self, tmp_path):
+        """Swapping two modules' patterns regroups the parameters under the same multipliers."""
+        multipliers = {"head": 2.0, "layer0": 0.5}
+        self._save(tmp_path, multipliers)
+        swapped = {**PATTERNS, "head": PATTERNS["layer0"], "layer0": PATTERNS["head"]}
+        model, scheduler, manager = self._resume(tmp_path, multipliers, patterns=swapped)
+        before = [p.detach().clone() for p in model.parameters()]
+        with pytest.raises(ValueError, match="saved with the module patterns"):
+            manager.load(scheduler=scheduler)
+        for b, p in zip(before, model.parameters(), strict=True):
+            assert torch.equal(b, p), "a refused load changed the model"
+        assert scheduler.last_epoch == 0
+
+    def test_the_save_records_the_patterns_of_the_listed_modules(self, tmp_path):
+        step_dir = self._save(tmp_path, {"head": 2.0})
+        meta = json.loads((step_dir / "metadata.json").read_text())
+        assert meta["lr_module_patterns"] == {"head": ["output_head.*"]}
+
+    def test_listed_modules_need_their_patterns(self, tmp_path):
+        model, optimizer, _ = self._build("adamw", {}, seed=0)
+        with pytest.raises(ValueError, match=r"module_patterns for \['head'\]"):
+            CheckpointManager(
+                CheckpointConfig(dir=str(tmp_path)), model, optimizer, lr_multipliers={"head": 2.0}
+            )
 
     @pytest.mark.parametrize(
         ("saved", "resumed"),
@@ -548,10 +648,11 @@ class TestResume:
         [
             (b"{not json", "cannot read"),
             (b"[]", "does not hold a JSON object"),
-            (b'{"step": 3, "lr_multipliers": {"head": -1}}', "records an invalid lr_multipliers"),
+            (b'{"step": 3, "lr_multipliers": {"head": -1}}', "records an invalid LR multipliers"),
+            (b'{"step": 3, "lr_module_patterns": {"head": "x"}}', "lists of patterns"),
             (b"[" * 100_000 + b"]" * 100_000, "RecursionError"),
         ],
-        ids=["bad-json", "list", "negative", "too-deep"],
+        ids=["bad-json", "list", "negative", "patterns", "too-deep"],
     )
     def test_an_invalid_record_is_refused(self, tmp_path, content, match):
         (self._save(tmp_path, {"head": 2.0}) / "metadata.json").write_bytes(content)
@@ -586,14 +687,16 @@ class TestResume:
         calls = self._as_rank(monkeypatch, manager, 0)
         with pytest.raises(_ReachedTheModel):
             manager.load(scheduler=scheduler, exclude_keys=["optimizer"])
-        assert calls == [("broadcast", 0, [({"head": 2.0}, None)])]
+        record = ({"head": 2.0}, {"head": ["output_head.*"]})
+        assert calls == [("broadcast", 0, [(record, None)])]
 
     def test_other_ranks_refuse_what_rank_zero_sent(self, tmp_path, monkeypatch):
         """A rank other than 0 never reads the record and raises on the one it receives."""
         self._save(tmp_path, {"head": 2.0})
         (tmp_path / "step_3" / "metadata.json").unlink()
         _, scheduler, manager = self._resume(tmp_path, {})
-        self._as_rank(monkeypatch, manager, 1, sent=({"head": 2.0}, None))
+        record = ({"head": 2.0}, {"head": ["output_head.*"]})
+        self._as_rank(monkeypatch, manager, 1, sent=(record, None))
         with pytest.raises(ValueError, match=r"lr_multipliers=\{'head': 2.0\}, but this run uses"):
             manager.load(scheduler=scheduler, exclude_keys=["optimizer"])
         self._as_rank(monkeypatch, manager, 1, sent=(None, "rank 0 could not read it"))

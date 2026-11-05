@@ -508,16 +508,23 @@ class Muon(torch.optim.Optimizer):
                 p_local.add_(update, alpha=-lr)
 
         if self._adam is not None:
-            lead_lr = self._initial_lr if self._lead_group_lr is None else self._lead_group_lr
-            if lead_lr > 0:
-                scale = self.param_groups[0]["lr"] / lead_lr
-                for group, base_lr in zip(
-                    self._adam.param_groups, self._adam_group_lrs, strict=True
-                ):
-                    group["lr"] = (self._initial_adam_lr if base_lr is None else base_lr) * scale
+            for group, lr in zip(self._adam.param_groups, self._fallback_lrs(), strict=True):
+                group["lr"] = lr
             self._adam.step()
 
         return loss
+
+    def _fallback_lrs(self) -> list[float]:
+        """The rate each AdamW fallback group steps at, from Muon's current schedule."""
+        assert self._adam is not None
+        lead_lr = self._initial_lr if self._lead_group_lr is None else self._lead_group_lr
+        if lead_lr <= 0:
+            return [group["lr"] for group in self._adam.param_groups]
+        scale = self.param_groups[0]["lr"] / lead_lr
+        return [
+            (self._initial_adam_lr if base_lr is None else base_lr) * scale
+            for base_lr in self._adam_group_lrs
+        ]
 
 
 def _is_muon_eligible(param: torch.Tensor) -> bool:
@@ -689,12 +696,17 @@ def _split_by_module(
 
 
 def module_learning_rates(optimizer: torch.optim.Optimizer) -> dict[str, float]:
-    """Return the current learning rate of each module ``build_optimizer`` gave its own groups.
+    """Return the rate each module ``build_optimizer`` gave its own groups steps at next.
 
-    Read from ``optimizer.param_groups``, so under Muon it is the rate of the module's
-    orthogonalized matrices. Empty when ``optimizer.lr_multipliers`` was empty.
+    Keyed by module name. Under Muon, ``<module>`` is the rate of the module's orthogonalized
+    matrices and ``<module>/adamw`` that of its AdamW fallback, each present when the module
+    has such parameters. Empty when ``optimizer.lr_multipliers`` was empty.
     """
-    return {group["module"]: group["lr"] for group in optimizer.param_groups if "module" in group}
+    rates = {group["module"]: group["lr"] for group in optimizer.param_groups if "module" in group}
+    if isinstance(optimizer, Muon) and optimizer._adam is not None:
+        fallback = zip(optimizer._adam.param_groups, optimizer._fallback_lrs(), strict=True)
+        rates.update({f"{g['module']}/adamw": lr for g, lr in fallback if "module" in g})
+    return rates
 
 
 def build_optimizer(

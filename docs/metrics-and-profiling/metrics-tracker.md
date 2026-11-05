@@ -164,7 +164,7 @@ learning rates, MoE and per-dataset breakdowns:
 
 ```python
 # training/loop.py
-tracker.log_eval(lr_metrics, step)      # train/lr/<module>, with optimizer.lr_multipliers
+tracker.log_eval(lr_metrics, step)      # train/lr/<module>[/adamw], with optimizer.lr_multipliers
 tracker.log_eval(moe_metrics, step)     # moe/aux_loss, moe/expert_balance
 tracker.log_eval(ds_metrics, step)      # per-source loss
 tracker.log_eval(eval_metrics, step)    # eval loss

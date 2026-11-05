@@ -183,6 +183,7 @@ def build_checkpoint_manager(
         pp_rank=ckpt_pp_rank,
         weight_decay_scope=config.optimizer.weight_decay_scope,
         lr_multipliers=config.optimizer.lr_multipliers,
+        module_patterns=config.vlm.module_patterns if config.vlm is not None else None,
     )
 
 
