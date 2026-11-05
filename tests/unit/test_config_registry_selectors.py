@@ -153,6 +153,21 @@ def test_an_unregistered_name_is_rejected_with_the_valid_names(
     assert f"'{module}{suffix}'" in message.split("Registered")[1]
 
 
+@pytest.mark.parametrize(("section", "field", "enum_type", "category", "suffix"), SELECTORS)
+def test_a_name_registered_in_another_category_is_rejected(
+    write_plugin, section, field, enum_type, category, suffix
+):
+    """Only the field's own category counts, so the plugin's two other names are rejected."""
+    module = write_plugin("kf250_other")
+    for other in sorted({"_sched", "_norm", "_mlp"} - {suffix}):
+        name = f"{module}{other}"
+        with pytest.raises(
+            ValueError,
+            match=f"^'{name}' is neither in {enum_type.__name__} nor registered under '{category}'",
+        ):
+            load_config(cli_args=[f'--plugins=["{module}"]', f"--{section}.{field}={name}"])
+
+
 @pytest.mark.parametrize(
     ("section", "field", "enum_type"),
     [
