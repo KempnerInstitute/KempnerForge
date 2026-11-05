@@ -21,6 +21,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn.functional as F
+from safetensors.torch import load_file
 from torch.distributed.checkpoint import FileSystemReader
 from torch.distributed.checkpoint.format_utils import dcp_to_torch_save
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
@@ -419,3 +420,21 @@ class TestUnfixedCheckpoint:
         root = saved_layout(layout, unfixed=True)
         with pytest.raises(ValueError, match="holds 2 of the 4 experts"):
             dcp_to_hf(str(_step_dir(root)), str(tmp_path / "hf"), _config(LAYOUTS[layout][2]))
+
+
+class TestExportFromAnEPCheckpoint:
+    @pytest.mark.parametrize("layout", ["dp_shard2_ep2", "dp_shard2_ep2_packed", "ep4_packed_gelu"])
+    def test_dcp_to_hf_exports_every_expert(self, saved_layout, layout, tmp_path):
+        """Every expert of every layer reaches the export with its rank's weights."""
+        root = saved_layout(layout)
+        config = _config(LAYOUTS[layout][2])
+        dcp_to_hf(str(_step_dir(root)), str(tmp_path / "hf"), config, dtype=torch.float32)
+        exported = load_file(tmp_path / "hf" / "model.safetensors")
+        reference = torch.load(root / "reference.pt")
+        experts = {k: v for k, v in reference.items() if _is_expert(k) and not k.endswith(MOMENTS)}
+        assert len(experts) == config.n_layers * (
+            len(PACKED_EXPERT) - (config.activation == "gelu")
+            if config.moe_packed_experts
+            else config.num_experts * 3
+        )
+        assert _mismatches({k: exported[f"model.{k}"] for k in experts}, experts) == []
