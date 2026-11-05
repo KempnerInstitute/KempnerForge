@@ -202,6 +202,10 @@ therefore sums the routed experts' squared norms over the EP group and
 averages the copies', and every EP rank clips by the whole model's norm
 with the same coefficient; see
 [Gradient utilities § Under expert parallelism](../training/gradient-utilities.md#under-expert-parallelism).
+That removes one cause of drift, not every cause: on GPU the copies
+still drift apart over training, with or without clipping, and nothing
+re-syncs them across the EP group yet
+([#482](https://github.com/KempnerInstitute/KempnerForge/issues/482)).
 
 ## Gradient scaling (optional)
 
