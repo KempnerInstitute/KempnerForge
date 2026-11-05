@@ -1171,10 +1171,11 @@
     "kempnerforge/distributed/utils.py": {
       "functions": [
         "get_dp_info(device_mesh) -> (dp_rank, dp_size)",
-        "clip_grad_norm_(model, max_norm, foreach) -> Tensor"
+        "clip_grad_norm_(model, max_norm, foreach, pp_group) -> Tensor"
       ],
       "tested_by": [
-        "tests/unit/test_distributed.py::TestClipGradNorm"
+        "tests/unit/test_distributed.py::TestClipGradNorm",
+        "tests/unit/test_ep_gradients.py::TestClipUnderExpertParallelism"
       ]
     },
     "kempnerforge/checkpoint/state.py": {
