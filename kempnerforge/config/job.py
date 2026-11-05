@@ -25,8 +25,9 @@ _HF_VISION_ENCODER_TYPES = frozenset({"siglip2", "clip"})
 def _arch_of(vlm: VLMConfig) -> str:
     """The arch of ``vlm``'s class, which is what the parallelism checks act on.
 
-    The instance's ``arch`` field can name another arch, for example after a
-    ``--vlm.arch`` override, which keeps the class the TOML section built.
+    The instance's ``arch`` field can name another arch after an assignment to
+    it, which ``__post_init__`` does not see; the loader rejects a ``--vlm.arch``
+    override that would need another class.
     """
     return type(vlm).arch
 
