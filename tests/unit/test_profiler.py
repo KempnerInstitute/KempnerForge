@@ -17,10 +17,12 @@ class TestProfilerTraceFiles:
         prof = build_profiler(config, rank=3)
         assert prof is not None
         prof.start()
-        for _ in range(2):
-            torch.ones(8, 8) @ torch.ones(8, 8)
-            prof.step()
-        prof.stop()
+        try:
+            for _ in range(2):
+                _ = torch.ones(8, 8) @ torch.ones(8, 8)
+                prof.step()
+        finally:
+            prof.stop()
         names = [path.name for path in tmp_path.iterdir()]
         assert len(names) == 1
         assert re.fullmatch(r"rank00003\.\d+\.pt\.trace\.json", names[0])
