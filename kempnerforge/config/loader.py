@@ -276,17 +276,23 @@ def _import_plugins(raw: Any) -> None:
     """Import config-declared modules for their registry side effects.
 
     ``import_module`` is idempotent, so repeated ``load_config`` calls in one
-    process never re-run a module body.
+    process never re-run a module body. A module that fails to import raises a
+    ``ValueError`` naming it; only an ``ImportError`` adds the ``sys.path`` hint,
+    since any other failure means the module was found.
     """
     for name in _plugin_module_names(raw):
         try:
             importlib.import_module(name)
         except Exception as e:
+            hint = (
+                " Plugin modules must be on sys.path (the launch directory is not): add "
+                "their directory to PYTHONPATH, or install them."
+                if isinstance(e, ImportError)
+                else ""
+            )
             raise ValueError(
                 f"Failed to import plugin module {name!r} from config key 'plugins': "
-                f"{type(e).__name__}: {e}. Plugin modules must be on sys.path (the "
-                "launch directory is not) — add their directory to PYTHONPATH, or "
-                "install them."
+                f"{type(e).__name__}: {e}.{hint}"
             ) from e
 
 
