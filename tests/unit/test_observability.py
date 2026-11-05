@@ -888,6 +888,17 @@ class TestRankLogger:
         output = fmt.format(record)
         assert "\x1b[" in output
 
+    def test_rank_formatter_dims_the_time_with_the_rank(self, monkeypatch, utc_minus_8):
+        """With color on, the time and the rank share one dim span ahead of the colored level."""
+        monkeypatch.setattr(log_mod, "_supports_color", lambda: True)
+        monkeypatch.setenv("RANK", "0")
+        record = logging.LogRecord("test", logging.INFO, "", 0, "hello", (), None)
+        record.created, record.msecs = 1_700_000_000.25, 250.0
+        output = _RankFormatter(use_color=True).format(record)
+        c = log_mod._COLORS
+        dimmed = f"{c['dim']}2023-11-14 14:13:20.250 [rank 0]{c['reset']}"
+        assert output == f"{dimmed} {c['green']}INFO    {c['reset']} hello"
+
     def test_configure_root_no_rank_filter(self, monkeypatch):
         """When rank_zero_only=False, _configure_root attaches no _RankFilter.
 
