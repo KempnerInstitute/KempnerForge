@@ -4,6 +4,7 @@ Provides a simple logging setup that:
 
 - Only emits from rank 0 by default (avoids duplicate log lines), except a
   record logged with ``extra={"every_rank": True}``, which every rank emits
+- Starts every line with the local time, to the millisecond, and the rank
 - Supports color-coded output for key metrics
 - Integrates with Python's standard logging module
 """
@@ -37,7 +38,10 @@ def _supports_color() -> bool:
 
 
 class _RankFormatter(logging.Formatter):
-    """Formatter that includes rank info and optional color."""
+    """Formatter that starts each line with the local time, rank and level, in optional color.
+
+    The time is ``YYYY-MM-DD HH:MM:SS.mmm``; with color, it is dimmed along with the rank.
+    """
 
     def __init__(self, use_color: bool = True) -> None:
         self.use_color = use_color and _supports_color()
@@ -46,6 +50,7 @@ class _RankFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         rank = os.environ.get("RANK", "0")
         level = record.levelname
+        stamp = f"{self.formatTime(record, '%Y-%m-%d %H:%M:%S')}.{int(record.msecs):03d}"
 
         if self.use_color:
             c = _COLORS
@@ -57,9 +62,9 @@ class _RankFormatter(logging.Formatter):
                 "CRITICAL": c["bold"] + c["red"],
             }
             color = level_colors.get(level, "")
-            prefix = f"{c['dim']}[rank {rank}]{c['reset']} {color}{level:<8}{c['reset']}"
+            prefix = f"{c['dim']}{stamp} [rank {rank}]{c['reset']} {color}{level:<8}{c['reset']}"
         else:
-            prefix = f"[rank {rank}] {level:<8}"
+            prefix = f"{stamp} [rank {rank}] {level:<8}"
 
         return f"{prefix} {record.getMessage()}"
 
