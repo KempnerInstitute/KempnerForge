@@ -7,12 +7,15 @@ whole checkpoints are checked over gloo in ``tests/unit/test_ep_checkpoint.py``.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from torch.distributed.checkpoint.state_dict import get_model_state_dict
 
 from kempnerforge.checkpoint.expert_layout import (
     ExpertLayout,
+    check_saved_experts,
     expert_layout,
     moe_layers,
 )
@@ -139,3 +142,61 @@ class TestPackedWithoutMesh:
         state = {"model": {f"{LAYER}.{name}": p for name, p in moe.named_parameters()}}
         with pytest.raises(ValueError, match="records no ep_mesh"):
             ExpertLayout([(LAYER, moe)]).to_global(state)
+
+
+def _index(experts: int = 4, packed_rows: int | None = None, layers: int = 2) -> dict:
+    """A DCP index of an unpacked or packed checkpoint holding ``experts`` or ``packed_rows``."""
+    index: dict = {"model.norm.weight": SimpleNamespace(size=torch.Size([16]))}
+    for layer in range(layers):
+        if packed_rows is not None:
+            index[f"model.layers.{layer}.mlp.up_w"] = SimpleNamespace(
+                size=torch.Size([packed_rows, 16, 32])
+            )
+            continue
+        for expert in range(experts):
+            for p in PROJECTIONS:
+                key = f"model.layers.{layer}.mlp.experts.{expert}.{p}.weight"
+                index[key] = SimpleNamespace(size=torch.Size([32, 16]))
+    return index
+
+
+def _model(packed: bool = False, num_experts: int = 4) -> Transformer:
+    config = ModelConfig(
+        dim=16,
+        n_layers=2,
+        n_heads=2,
+        vocab_size=32,
+        num_experts=num_experts,
+        moe_top_k=1,
+        moe_packed_experts=packed,
+    )
+    return Transformer(config)
+
+
+class TestCheckSavedExperts:
+    @pytest.mark.parametrize("packed", [False, True], ids=["unpacked", "packed"])
+    def test_a_checkpoint_of_every_expert_passes(self, packed):
+        index = _index(packed_rows=4) if packed else _index()
+        check_saved_experts(_model(packed), index, "ckpt")
+
+    def test_unpacked_checkpoint_of_one_rank_is_refused(self):
+        """It names the experts held, how many layers, and the ``ep`` that saves that."""
+        with pytest.raises(ValueError) as error:
+            check_saved_experts(_model(), _index(experts=2), "ckpt/step_4")
+        message = str(error.value)
+        assert message.startswith("ckpt/step_4 holds 2 of the 4 experts of 2 MoE layers")
+        assert "(layers.0.mlp holds experts 0-1)" in message
+        assert "saved with expert parallelism with ep=2" in message
+
+    def test_packed_checkpoint_of_one_rank_is_refused(self):
+        with pytest.raises(ValueError, match=r"\(layers\.0\.mlp\.up_w has 1 rows\).*ep=4"):
+            check_saved_experts(_model(packed=True), _index(packed_rows=1), "ckpt")
+
+    def test_one_expert_is_named_alone(self):
+        with pytest.raises(ValueError, match=r"\(layers\.0\.mlp holds expert 0\)"):
+            check_saved_experts(_model(), _index(experts=1), "ckpt")
+
+    def test_layers_the_checkpoint_does_not_hold_are_left_to_the_load(self):
+        """A checkpoint without the layer's experts, such as a dense one, is not refused here."""
+        check_saved_experts(_model(), _index(experts=0), "ckpt")
+        check_saved_experts(_model(packed=True), _index(), "ckpt")
