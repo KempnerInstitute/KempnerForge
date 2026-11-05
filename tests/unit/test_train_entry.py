@@ -9,6 +9,9 @@ dispatch, and the data-pipeline builder.
 from __future__ import annotations
 
 import dataclasses
+import json
+from collections.abc import Iterator
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -601,6 +604,24 @@ class TestRunTrainingLoop:
         assert ckpt.saves == []
         assert ckpt.waits == 1
 
+    def test_a_finite_loss_with_nan_gradients_skips_the_step(self):
+        """NaN gradients under a finite loss never reach the optimizer."""
+
+        def loss_fn(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+            logits.register_hook(lambda grad: torch.full_like(grad, float("nan")))
+            return logits.float().mean()
+
+        config = make_config(max_steps=10)
+        session = make_session(
+            config, loss_fn=loss_fn, nan_detector=NaNDetector(action="warn", max_consecutive=3)
+        )
+        before = [p.detach().clone() for p in session.model.parameters()]
+        step, _ = run_training_loop(session)
+        assert step == 2
+        assert session.nan_detector.state.total_nans == 3
+        for old, new in zip(before, session.model.parameters(), strict=True):
+            assert torch.equal(old, new)
+
     def test_shutdown_writes_an_emergency_checkpoint_and_finishes(self):
         config = make_config(max_steps=10)
         config.checkpoint.interval = 100
@@ -981,6 +1002,19 @@ class TestBuildPhaseHelpers:
         assert mgr._process_group is None
         assert mgr._pp_rank is None
 
+    def test_checkpoint_manager_records_the_weight_decay_scope(self, tmp_path):
+        from kempnerforge.training.entry import build_checkpoint_manager
+
+        config = make_config()
+        config.checkpoint.dir = str(tmp_path / "ckpt")
+        config.optimizer.weight_decay_scope = "all"
+        model = TinyTextModel()
+        build_checkpoint_manager(
+            config, _runtime(), model, torch.optim.SGD(model.parameters(), lr=0.1), None
+        ).save(step=0)
+        meta = json.loads((tmp_path / "ckpt" / "step_0" / "metadata.json").read_text())
+        assert meta["weight_decay_scope"] == "all"
+
     def test_restore_checkpoint_starts_from_scratch(self, tmp_path):
         from kempnerforge.training.entry import build_checkpoint_manager, restore_checkpoint
 
@@ -990,6 +1024,78 @@ class TestBuildPhaseHelpers:
         optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
         mgr = build_checkpoint_manager(config, _runtime(), model, optimizer, None)
         assert restore_checkpoint(config, model, None, mgr) == (0, 0)
+
+
+class TestWeightDecayScopeWarmStart:
+    """Starting a run under either ``weight_decay_scope`` from a checkpoint in ``load_path``."""
+
+    @staticmethod
+    def _run(checkpoint_dir, scope, seed):
+        from kempnerforge.model.transformer import Transformer
+        from kempnerforge.training.entry import build_checkpoint_manager
+        from kempnerforge.training.optimizer import build_optimizer
+
+        config = make_config()
+        config.checkpoint.dir = str(checkpoint_dir)
+        config.optimizer.weight_decay_scope = scope
+        config.optimizer.fused = False
+        torch.manual_seed(seed)
+        model = Transformer(config.model)
+        optimizer = build_optimizer(model, config.optimizer)
+        manager = build_checkpoint_manager(config, _runtime(), model, optimizer, None)
+        return config, model, optimizer, manager
+
+    @pytest.mark.parametrize("scope", ["exclude_norms_and_biases", "all"])
+    def test_a_converted_checkpoint_warm_starts_under_either_scope(
+        self, tmp_path, monkeypatch, scope
+    ):
+        """hf-to-dcp writes only the model, no ``metadata.json``; it loads, the optimizer fresh."""
+        from kempnerforge.model.transformer import Transformer
+        from kempnerforge.training.entry import restore_checkpoint
+
+        monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2] / "scripts"))
+        from convert_checkpoint import _kf_to_hf_key, hf_to_dcp
+
+        model_config = make_config().model
+        torch.manual_seed(0)
+        source = Transformer(model_config)
+        hf_dir = tmp_path / "hf"
+        hf_dir.mkdir()
+        hf_state = {_kf_to_hf_key(k): v for k, v in source.state_dict().items()}
+        torch.save(hf_state, hf_dir / "pytorch_model.bin")
+        hf_to_dcp(str(hf_dir), str(tmp_path / "pretrained"), model_config)
+        assert not (tmp_path / "pretrained" / "metadata.json").exists()
+
+        config, model, optimizer, manager = self._run(tmp_path / "run", scope, seed=1)
+        config.checkpoint.load_path = str(tmp_path / "pretrained")
+        assert restore_checkpoint(config, model, None, manager) == (0, 0)
+        for a, b in zip(source.parameters(), model.parameters(), strict=True):
+            assert torch.equal(a, b), "the converted weights were not loaded"
+        assert not optimizer.state
+
+    def test_the_refusal_names_a_warm_start_that_works(self, tmp_path):
+        """The error's way out needs a ``checkpoint.dir`` with nothing to resume, and says so."""
+        from kempnerforge.training.entry import restore_checkpoint
+
+        _, model, optimizer, manager = self._run(tmp_path / "saved", "exclude_norms_and_biases", 0)
+        model(torch.randint(0, VOCAB, (2, 4))).sum().backward()
+        optimizer.step()
+        manager.save(step=1)
+
+        config, model, _, manager = self._run(tmp_path / "saved", "all", seed=1)
+        with pytest.raises(ValueError, match="a checkpoint.dir that holds no checkpoint"):
+            restore_checkpoint(config, model, None, manager)
+
+        config.checkpoint.load_path = str(tmp_path / "saved" / "step_1")
+        config.checkpoint.exclude_from_loading = ["optimizer"]
+        with pytest.raises(ValueError, match="but this run uses 'all'"):
+            restore_checkpoint(config, model, None, manager)
+
+        config, model, optimizer, manager = self._run(tmp_path / "new", "all", seed=1)
+        config.checkpoint.load_path = str(tmp_path / "saved" / "step_1")
+        config.checkpoint.exclude_from_loading = ["optimizer"]
+        assert restore_checkpoint(config, model, None, manager) == (1, 0)
+        assert not optimizer.state
 
 
 class TestBuildDataPipeline:
@@ -1020,6 +1126,101 @@ class TestBuildDataPipeline:
         assert data.mixture_dataset is not None
         assert data.mixture_sampler is not None
         assert data.mixture_weights == {"a": 1.0, "b": 3.0}
+
+
+class TestTokenDtypeReachesTheDatasets:
+    """``data.token_dtype``, a source's own ``token_dtype`` and ``eval.token_dtype``
+    decide how the raw ``.bin`` shards behind each dataset are read."""
+
+    SAMPLE = 17
+
+    def _shard(self, directory, dtype: str, start: int, *, metadata: bool = False):
+        """Write four samples of tokens as a raw .bin shard; return them sample by sample."""
+        import numpy as np
+
+        directory.mkdir()
+        tokens = np.arange(start, start + 4 * self.SAMPLE, dtype=dtype)
+        tokens.tofile(directory / "shard_000.bin")
+        if metadata:
+            (directory / "metadata.yaml").write_text(f"tokenized_info:\n  dtype: {dtype}\n")
+        return [tokens[i : i + self.SAMPLE].tolist() for i in range(0, tokens.size, self.SAMPLE)]
+
+    @staticmethod
+    def _tokens(sample) -> list[int]:
+        return torch.cat([sample["input_ids"], sample["labels"][-1:]]).tolist()
+
+    def test_data_token_dtype_reads_the_single_dataset(self, tmp_path):
+        expected = self._shard(tmp_path / "web", "uint16", 0)
+        config = make_config(seq_len=self.SAMPLE - 1)
+        config.data = DataConfig(
+            dataset_path=str(tmp_path / "web"),
+            file_pattern="*.bin",
+            token_dtype="uint16",
+            num_workers=0,
+        )
+        data = build_data_pipeline(config, _runtime())
+        assert data.dataloader is not None
+        dataset = data.dataloader.dataset
+        assert [self._tokens(dataset[i]) for i in range(len(dataset))] == expected
+
+    def test_each_mixture_source_resolves_its_own_dtype(self, tmp_path):
+        """One source records its dtype, one sets it, one inherits data.token_dtype."""
+        from kempnerforge.config.data import DatasetSource
+
+        recorded = self._shard(tmp_path / "web", "uint16", 0, metadata=True)
+        own = self._shard(tmp_path / "code", "uint32", 70_000)
+        inherited = self._shard(tmp_path / "books", "uint16", 500)
+        config = make_config(seq_len=self.SAMPLE - 1)
+        config.data = DataConfig(
+            datasets=[
+                DatasetSource(name="web", path=str(tmp_path / "web")),
+                DatasetSource(name="code", path=str(tmp_path / "code"), token_dtype="uint32"),
+                DatasetSource(name="books", path=str(tmp_path / "books")),
+            ],
+            file_pattern="*.bin",
+            token_dtype="uint16",
+            num_workers=0,
+        )
+        data = build_data_pipeline(config, _runtime())
+        mixture = data.mixture_dataset
+        assert mixture is not None
+        bounds = mixture.cumulative_sizes
+        got = {
+            name: [self._tokens(mixture[i]) for i in range(bounds[k], bounds[k + 1])]
+            for k, name in enumerate(mixture.dataset_names)
+        }
+        assert got == {"web": recorded, "code": own, "books": inherited}
+
+    def test_data_token_dtype_must_agree_with_a_source_metadata(self, tmp_path):
+        from kempnerforge.config.data import DatasetSource
+
+        self._shard(tmp_path / "web", "uint16", 0, metadata=True)
+        config = make_config(seq_len=self.SAMPLE - 1)
+        config.data = DataConfig(
+            datasets=[DatasetSource(name="web", path=str(tmp_path / "web"))],
+            file_pattern="*.bin",
+            token_dtype="uint32",
+            num_workers=0,
+        )
+        with pytest.raises(ValueError, match="records tokenized_info.dtype 'uint16'"):
+            build_data_pipeline(config, _runtime())
+
+    def test_eval_token_dtype_reads_the_eval_dataset(self, tmp_path):
+        from kempnerforge.config.eval import EvalConfig
+        from kempnerforge.training.data_pipeline import build_eval_dataloader
+
+        expected = self._shard(tmp_path / "heldout", "uint16", 300)
+        config = make_config(seq_len=self.SAMPLE - 1)
+        config.eval = EvalConfig(
+            enabled=True,
+            dataset_path=str(tmp_path / "heldout"),
+            file_pattern="*.bin",
+            token_dtype="uint16",
+        )
+        loader = build_eval_dataloader(config, _runtime())
+        assert loader is not None
+        dataset = loader.dataset
+        assert [self._tokens(dataset[i]) for i in range(len(dataset))] == expected
 
 
 class TestBuildEvalDataloader:
@@ -1286,10 +1487,25 @@ def _vlm_config(**vlm_kw) -> JobConfig:
 
 
 class TestRestoreCheckpoint:
+    @pytest.mark.parametrize(("pp", "expected"), [(1, None), (2, 2), (4, 4)])
+    def test_resolution_gets_the_pipeline_degree(self, monkeypatch, pp, expected):
+        """The step_N scan needs the stage count to see a stage that never saved."""
+        import kempnerforge.training.entry as entry
+
+        seen: list = []
+        monkeypatch.setattr(
+            entry, "resolve_resume_path", lambda _d, num_stages=None: seen.append(num_stages)
+        )
+        config = make_config()
+        config.distributed.pp = pp
+        mgr = FakeResumeManager(step=0, tokens=0)
+        assert entry.restore_checkpoint(config, TinyTextModel(), None, mgr) == (0, 0)
+        assert seen == [expected]
+
     def test_no_checkpoint_and_no_load_path_starts_from_scratch(self, monkeypatch):
         import kempnerforge.training.entry as entry
 
-        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d: None)
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: None)
         mgr = FakeResumeManager()
         assert entry.restore_checkpoint(make_config(), TinyTextModel(), None, mgr) == (0, 0)
         assert mgr.load_kwargs == {}
@@ -1297,7 +1513,7 @@ class TestRestoreCheckpoint:
     def test_resume_returns_the_managers_step_and_tokens(self, monkeypatch, tmp_path):
         import kempnerforge.training.entry as entry
 
-        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d: tmp_path / "step_7")
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: tmp_path / "step_7")
         mgr = FakeResumeManager(step=7, tokens=999)
         assert entry.restore_checkpoint(make_config(), TinyTextModel(), "SCHED", mgr) == (7, 999)
         assert mgr.load_kwargs["scheduler"] == "SCHED"
@@ -1306,7 +1522,7 @@ class TestRestoreCheckpoint:
     def test_load_path_alone_triggers_a_resume(self, monkeypatch):
         import kempnerforge.training.entry as entry
 
-        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d: None)
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: None)
         config = make_config()
         config.checkpoint.load_path = "/somewhere/step_3"
         mgr = FakeResumeManager(step=3, tokens=30)
@@ -1316,7 +1532,7 @@ class TestRestoreCheckpoint:
     def test_metrics_run_ids_are_restored_onto_the_config(self, monkeypatch, tmp_path):
         import kempnerforge.training.entry as entry
 
-        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d: tmp_path / "s")
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: tmp_path / "s")
         config = make_config()
         mgr = FakeResumeManager(extra={"wandb_run_id": "W1", "mlflow_run_id": "M1"})
         entry.restore_checkpoint(config, TinyTextModel(), None, mgr)
@@ -1326,7 +1542,7 @@ class TestRestoreCheckpoint:
     def test_absent_run_ids_do_not_clobber_existing_ones(self, monkeypatch, tmp_path):
         import kempnerforge.training.entry as entry
 
-        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d: tmp_path / "s")
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: tmp_path / "s")
         config = make_config()
         config.metrics.wandb_run_id = "KEEP"
         entry.restore_checkpoint(config, TinyTextModel(), None, FakeResumeManager(extra={}))
@@ -1336,7 +1552,7 @@ class TestRestoreCheckpoint:
         import kempnerforge.training.entry as entry
         from kempnerforge.training.freeze import freeze_meta_at_step
 
-        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d: tmp_path / "s")
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: tmp_path / "s")
         config = _vlm_config()
         mgr = FakeResumeManager(saved_step=11)
         entry.restore_checkpoint(config, TinyTextModel(), None, mgr)
@@ -1347,7 +1563,7 @@ class TestRestoreCheckpoint:
         import kempnerforge.training.entry as entry
         from kempnerforge.config.vlm import FreezeSpec, FreezeStage
 
-        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d: tmp_path / "s")
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: tmp_path / "s")
         applied: list = []
         monkeypatch.setattr(
             entry, "apply_freeze_specs", lambda m, specs, pat: applied.append(list(specs))
@@ -1380,7 +1596,7 @@ class TestRestoreCheckpoint:
         import kempnerforge.training.entry as entry
 
         resume = tmp_path / "step_7" if resume_found else None
-        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d: resume)
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: resume)
         config = make_config()
         config.checkpoint.load_path = load_path
         config.checkpoint.exclude_from_loading = exclude
@@ -1394,7 +1610,7 @@ class TestRestoreCheckpoint:
         load the optimizer, or momentum silently resets mid-run."""
         import kempnerforge.training.entry as entry
 
-        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d: tmp_path / "step_7")
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: tmp_path / "step_7")
         config = make_config()
         config.checkpoint.load_path = "/somewhere/converted"
         config.checkpoint.exclude_from_loading = ["optimizer"]
@@ -1406,12 +1622,32 @@ class TestRestoreCheckpoint:
     def test_exclude_alone_does_not_trigger_a_load(self, monkeypatch):
         import kempnerforge.training.entry as entry
 
-        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d: None)
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: None)
         config = make_config()
         config.checkpoint.exclude_from_loading = ["optimizer"]
         mgr = FakeResumeManager()
         assert entry.restore_checkpoint(config, TinyTextModel(), None, mgr) == (0, 0)
         assert mgr.load_kwargs == {}
+
+    def test_rank_zero_resolves_with_the_pipeline_degree(self, monkeypatch, tmp_path):
+        """The distributed resolution also gets the stage count."""
+        import kempnerforge.training.entry as entry
+
+        seen: list = []
+        chosen = tmp_path / "step_7"
+
+        def resolve(_d, num_stages=None):
+            seen.append(num_stages)
+            return chosen
+
+        monkeypatch.setattr(entry, "resolve_resume_path", resolve)
+        monkeypatch.setattr(entry.dist, "is_initialized", lambda: True)
+        monkeypatch.setattr(entry.dist, "get_rank", lambda: 0)
+        monkeypatch.setattr(entry.dist, "broadcast_object_list", lambda lst, src=0: None)
+        config = make_config()
+        config.distributed.pp = 2
+        entry.restore_checkpoint(config, TinyTextModel(), None, FakeResumeManager())
+        assert seen == [2]
 
     @pytest.mark.parametrize("rank", [0, 1])
     def test_only_rank_zero_resolves_the_resume_path(self, monkeypatch, tmp_path, rank):
@@ -1427,7 +1663,9 @@ class TestRestoreCheckpoint:
 
         looked: list = []
         chosen = tmp_path / "step_7"
-        monkeypatch.setattr(entry, "resolve_resume_path", lambda d: looked.append(d) or chosen)
+        monkeypatch.setattr(
+            entry, "resolve_resume_path", lambda d, _n=None: looked.append(d) or chosen
+        )
         monkeypatch.setattr(entry.dist, "is_initialized", lambda: True)
         monkeypatch.setattr(entry.dist, "get_rank", lambda: rank)
         monkeypatch.setattr(
@@ -1447,7 +1685,7 @@ class TestRestoreCheckpoint:
         import kempnerforge.training.entry as entry
         from kempnerforge.training.freeze import freeze_meta_at_step
 
-        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d: None)
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: None)
         config = _vlm_config()
         config.checkpoint.load_path = "/somewhere/converted"
         config.checkpoint.exclude_from_loading = ["model"]
@@ -1463,7 +1701,7 @@ class TestRestoreCheckpoint:
         from kempnerforge.config.vision import VisionEncoderConfig
         from kempnerforge.config.vlm import MoTConfig
 
-        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d: tmp_path / "s")
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: tmp_path / "s")
         monkeypatch.setattr(torch, "load", lambda *a, **k: {"model": {"w": 1}})
         copied: list = []
         monkeypatch.setattr(
@@ -1926,6 +2164,18 @@ class TestVlmStep:
             session.step_fn(session, 0)
 
 
+@pytest.fixture
+def restore_matmul_precision() -> Iterator[None]:
+    """Restore torch's fp32 matmul precision, both the legacy value and the per-backend ones."""
+    backends = (torch.backends.cuda.matmul, torch.backends.mkldnn.matmul)
+    legacy = torch.get_float32_matmul_precision()
+    saved = [backend.fp32_precision for backend in backends]
+    yield
+    torch.set_float32_matmul_precision(legacy)
+    for backend, value in zip(backends, saved, strict=True):
+        backend.fp32_precision = value
+
+
 class TestSetupDistributed:
     def test_builds_the_context_and_validates_against_world_size(self, monkeypatch):
         import kempnerforge.training.runtime as rt
@@ -1956,6 +2206,28 @@ class TestSetupDistributed:
         config.train.seed = 4242
         rt.setup_distributed(config)
         assert seen["seed"] == 4242
+
+    @pytest.mark.usefixtures("restore_matmul_precision")
+    @pytest.mark.parametrize(("tf32", "expected"), [(True, "high"), (False, "highest")])
+    def test_tf32_sets_the_matmul_precision(
+        self, monkeypatch: pytest.MonkeyPatch, tf32: bool, expected: str
+    ) -> None:
+        import kempnerforge.training.runtime as rt
+
+        monkeypatch.setattr(rt, "get_world_info", lambda: (0, 0, 1))
+        monkeypatch.setattr(rt, "init_distributed", lambda cfg, seed: None)
+        monkeypatch.setattr(rt, "log_job_info", lambda: None)
+        torch.set_float32_matmul_precision("highest")
+        rt.setup_distributed(make_config(tf32=tf32))
+        assert torch.get_float32_matmul_precision() == expected
+
+    @pytest.mark.usefixtures("restore_matmul_precision")
+    def test_tf32_off_leaves_an_existing_setting_alone(self) -> None:
+        from kempnerforge.training.runtime import apply_matmul_precision
+
+        torch.set_float32_matmul_precision("medium")
+        apply_matmul_precision(TrainConfig())
+        assert torch.get_float32_matmul_precision() == "medium"
 
 
 class TestPpGroup:

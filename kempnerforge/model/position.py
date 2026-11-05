@@ -46,8 +46,10 @@ def apply_rope(
 
     Args:
         x: Input tensor of shape (..., seq_len, head_dim).
-        cos: Cosine frequencies, shape (seq_len, head_dim // 2).
-        sin: Sine frequencies, shape (seq_len, head_dim // 2).
+        cos: Cosine frequencies, shape (seq_len, head_dim // 2) shared across
+            batch rows, or (batch, seq_len, head_dim // 2) per-row (gathered
+            from explicit position ids).
+        sin: Sine frequencies, same shape as ``cos``.
 
     Returns:
         Tensor with RoPE applied, same shape and dtype as input.
@@ -56,7 +58,15 @@ def apply_rope(
     x1, x2 = x[..., :d], x[..., d:]
 
     ndim = x.ndim
-    shape = [1] * (ndim - 2) + list(cos.shape)
+    if cos.ndim == 2:
+        shape = [1] * (ndim - 2) + list(cos.shape)
+    elif cos.ndim == 3:
+        shape = [cos.shape[0]] + [1] * (ndim - 3) + list(cos.shape[1:])
+    else:
+        raise ValueError(
+            "cos/sin must have shape (seq_len, head_dim // 2) or "
+            f"(batch, seq_len, head_dim // 2), got {cos.ndim} dims"
+        )
     cos = cos.view(*shape).to(x.dtype)
     sin = sin.view(*shape).to(x.dtype)
 
