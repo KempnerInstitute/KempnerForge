@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import sys
+import time
 import types
 from contextlib import closing
 from pathlib import Path
@@ -789,6 +790,17 @@ class TestTensorBoardBackend:
         assert backend._writer is False
 
 
+@pytest.fixture
+def utc_minus_8():
+    """Make local time UTC-8, with no daylight saving, for one test."""
+    try:
+        with patch.dict(os.environ, {"TZ": "PST8"}):
+            time.tzset()
+            yield
+    finally:
+        time.tzset()
+
+
 class TestRankLogger:
     def test_get_logger_returns_logger(self):
         logger = get_logger("test_module")
@@ -836,6 +848,14 @@ class TestRankLogger:
         assert "[rank 5]" in output
         assert "INFO" in output
         assert "hello world" in output
+
+    def test_rank_formatter_starts_with_the_local_time(self, utc_minus_8):
+        """A line starts with the record's local time to the millisecond, then rank and level."""
+        record = logging.LogRecord("test", logging.INFO, "", 0, "hello world", (), None)
+        record.created, record.msecs = 1_700_000_000.007, 7.0
+        with patch.dict(os.environ, {"RANK": "5"}):
+            output = _RankFormatter(use_color=False).format(record)
+        assert output == "2023-11-14 14:13:20.007 [rank 5] INFO     hello world"
 
     def test_supports_color_no_color_env(self, monkeypatch):
         """NO_COLOR=1 disables color output regardless of TTY status."""
