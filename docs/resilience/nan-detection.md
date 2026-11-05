@@ -91,9 +91,11 @@ Two edge cases:
 
 ### A shutdown after a bad update
 
-A run of NaN steps can start with a bad update: a step whose loss is
-finite but whose gradients are not, so the optimizer writes NaN / Inf
-into the weights and every loss after it is NaN. The steps that follow
+A run of NaN steps can start with a bad update: an optimizer step that
+writes NaN / Inf into the weights although its loss and gradient norm
+were finite, so the NaN check let it through, and every loss after it
+is NaN. Non-finite gradients never get that far: they make the gradient
+norm non-finite, and the check skips that step. The steps that follow
 are skipped, but the weights they leave are not finite, and an
 emergency checkpoint of one of them would become `latest` and count
 toward `checkpoint.keep_last_n`. With `keep_last_n = 1` it would prune
@@ -114,7 +116,7 @@ save, that checkpoint becomes `latest` and counts toward
 checkpoint saved before the NaN run (see
 [Rollback recommendation](#rollback-recommendation)).
 
-The bad update's own step has a finite loss, so a shutdown or a
+The bad update's own step passed the NaN check, so a shutdown or a
 scheduled save on that step is not checked and writes the weights it
 produced.
 
