@@ -181,8 +181,9 @@ seq_len = 2048             # row length; batch_size documents per micro-batch
 
 `attention_backend = "flex"` makes the packed mask block-sparse. Positions run
 through the row without restarting per document, and the views of an image
-attend causally, until #282 and #283 land. A `[video]` run and the other arches
-do not pack.
+attend causally; per-document positions and bidirectional image attention are
+follow-ups on the core's explicit position ids and attention groups. A
+`[video]` run and the other arches do not pack.
 
 ## Mix in text-only documents
 
