@@ -36,7 +36,17 @@ The `mlp` case is the only one that isn't a direct string match:
 `build_mlp` in
 [`kempnerforge/model/mlp.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/model/mlp.py)
 maps `activation="silu"` → `swiglu`, `"gelu"` → `standard_gelu`,
-`"relu"` → `standard_relu` before calling `registry.get("mlp", …)`.
+`"relu"` → `standard_relu` before calling `registry.get("mlp", …)`,
+and looks any other `activation` up as an `mlp` key directly.
+
+`scheduler.name`, `model.norm_type` and `model.activation` are typed as
+enums (`SchedulerType`, `NormType`, `Activation`), and a built-in name
+loads as the enum member. The loader also accepts any other name
+registered in the field's category (`scheduler`, `norm`, `mlp`) and
+keeps it as a plain string; a name that is neither raises a
+`ValueError` listing the members and the registered names. The
+registration has to run before `load_config`, which is what the
+`plugins` key below is for.
 
 ## Consumers
 
@@ -117,9 +127,10 @@ dataset_type = "my_corpus"   # registered by the module above
 
 That ordering is the point: the `__post_init__` validators that resolve
 a name against the registry (`video.dataset_type`, `adapter.type`,
-`vision_encoder.type`, …) run during the overlay, so a later import
-would be too late. It keeps experiments standalone: a run registers
-its own components without any core module importing them.
+`vision_encoder.type`, …) and the loader's check of `scheduler.name`,
+`model.norm_type` and `model.activation` run during the overlay, so a
+later import would be too late. It keeps experiments standalone: a run
+registers its own components without any core module importing them.
 
 Modules have to be on `sys.path`. The launch directory is *not* — a
 module that sits next to the run needs `PYTHONPATH=<its dir>`. A module
