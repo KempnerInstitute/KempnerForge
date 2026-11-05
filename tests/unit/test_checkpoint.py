@@ -1179,7 +1179,9 @@ class TestSaveCheckpointRegistration:
         assert registrar.registered == []
         assert not (tmp_path / "latest").exists()
 
-    def test_a_registrar_that_raises_costs_only_the_registration(self, tmp_path, monkeypatch):
+    def test_a_registrar_that_raises_costs_only_the_registration(
+        self, tmp_path, monkeypatch, pruned_dirs
+    ):
         warnings = self._log(monkeypatch, "warning")
         mgr = _make_mock_mgr(tmp_path, monkeypatch)
         mgr.config.keep_last_n = 1
@@ -1188,7 +1190,7 @@ class TestSaveCheckpointRegistration:
         mgr.save(step=1, tokens_seen=8)
         mgr.save(step=2, tokens_seen=16)
         assert (tmp_path / "latest").resolve() == (tmp_path / "step_2").resolve()
-        assert not (tmp_path / "step_1").exists()
+        assert pruned_dirs == [tmp_path / "step_1"]
         assert self._sidecar(tmp_path, 2)["tracking"] == [self.MLFLOW]
         assert len(warnings) == 2 and "step_2" in warnings[1] and "no server" in warnings[1]
 
