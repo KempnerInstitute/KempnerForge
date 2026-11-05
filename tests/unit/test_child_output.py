@@ -12,11 +12,12 @@ CHILD_ERROR = (
 
 
 class TestTracebackOrTail:
-    def test_starts_at_the_first_traceback_however_long_the_teardown_after_it(self):
+    def test_keeps_tail_characters_before_the_first_traceback_and_all_after_it(self):
+        logs = "[step 1] loss=5.5\n" * 200
         teardown = "torch.distributed.elastic teardown\n" * 200
-        output = "[step 1] loss=5.5\n" * 50 + CHILD_ERROR + CHILD_ERROR + teardown
+        output = logs + CHILD_ERROR + CHILD_ERROR + teardown
         excerpt = traceback_or_tail(output, 2000)
-        assert excerpt == CHILD_ERROR + CHILD_ERROR + teardown
+        assert excerpt == logs[-2000:] + CHILD_ERROR + CHILD_ERROR + teardown
         assert "the child's root cause" not in output[-2000:]
 
     def test_falls_back_to_the_tail_without_a_traceback(self):
