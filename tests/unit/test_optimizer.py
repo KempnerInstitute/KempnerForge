@@ -2,18 +2,55 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from typing import Any
+
 import pytest
 import torch
 import torch.nn as nn
+from torch.overrides import TorchFunctionMode
 
-from kempnerforge.config.schema import OptimizerConfig
+from kempnerforge.config.schema import ModelConfig, OptimizerConfig
+from kempnerforge.model.moma import ExpertChoiceMoE
+from kempnerforge.model.transformer import Transformer
 from kempnerforge.training.optimizer import (
     Muon,
-    _is_muon_eligible,
     _muon_update_scale,
     _newton_schulz,
     build_optimizer,
 )
+
+
+def _split(optimizer: Muon) -> tuple[set[torch.Tensor], set[torch.Tensor]]:
+    """The parameters Muon orthogonalizes and the ones its inner AdamW updates."""
+    muon = {p for group in optimizer.param_groups for p in group["params"]}
+    adam = {
+        p
+        for inner in optimizer.inner_optimizers
+        for group in inner.param_groups
+        for p in group["params"]
+    }
+    return muon, adam
+
+
+class _OutputShapes(TorchFunctionMode):
+    """Records the shape of every tensor a torch function returns."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.shapes: set[tuple[int, ...]] = set()
+
+    def __torch_function__(
+        self,
+        func: Callable[..., Any],
+        types: tuple[type, ...],
+        args: tuple[Any, ...] = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> Any:
+        out = func(*args, **(kwargs or {}))
+        if isinstance(out, torch.Tensor):
+            self.shapes.add(tuple(out.shape))
+        return out
 
 
 class TestNewtonSchulz:
@@ -43,6 +80,24 @@ class TestNewtonSchulz:
         U2 = _newton_schulz(G, steps=5)
         torch.testing.assert_close(U1, U2)
 
+    def test_tall_matrix_matches_iterating_on_it(self):
+        """A tall matrix gets what iterating on it untransposed gives."""
+        torch.manual_seed(0)
+        G = torch.randn(48, 16, dtype=torch.float64)
+        X = G / (G.norm() + 1e-7)
+        for _ in range(5):
+            A = X @ X.T
+            X = 3.4445 * X + (-4.7750 * A + 2.0315 * A @ A) @ X
+        torch.testing.assert_close(_newton_schulz(G, steps=5), X)
+
+    def test_tall_matrix_forms_nothing_rows_by_rows(self):
+        """A tall matrix iterates on its transpose, so its Gram matrix is cols x cols."""
+        with _OutputShapes() as recorded:
+            U = _newton_schulz(torch.randn(64, 8), steps=5)
+        assert U.shape == (64, 8)
+        assert (8, 8) in recorded.shapes
+        assert (64, 64) not in recorded.shapes
+
 
 class TestMuon:
     @pytest.mark.parametrize(
@@ -65,6 +120,16 @@ class TestMuon:
         optimizer.step()
         expected = -0.1 * _muon_update_scale(adjust_lr, rows, cols) * _newton_schulz(weight.grad)
         torch.testing.assert_close(weight.data, expected)
+
+    def test_steps_a_4d_weight_whose_matrix_is_tall(self):
+        """A 4-D weight flattening to a tall matrix steps by NS of that matrix, in its own shape."""
+        torch.manual_seed(0)
+        weight = nn.Parameter(torch.zeros(64, 3, 2, 2))
+        weight.grad = torch.randn(64, 3, 2, 2)
+        Muon([{"params": [weight]}], [{"params": []}], lr=0.1).step()
+        matrix = weight.grad.view(64, 12)
+        expected = -0.1 * _muon_update_scale("original", 64, 12) * _newton_schulz(matrix)
+        torch.testing.assert_close(weight.data.view(64, 12), expected)
 
     def test_nesterov_orthogonalizes_the_lookahead(self):
         """With nesterov, Newton-Schulz sees grad + momentum * buffer."""
@@ -170,24 +235,9 @@ class TestMuon:
         assert isinstance(optimizer, Muon)
         assert optimizer._adam is not None
 
-        muon_params = [p for g in optimizer.param_groups for p in g["params"]]
-        for p in muon_params:
-            assert _is_muon_eligible(p), "Muon should only get NS-eligible params"
-
-    def test_rectangular_params_use_adam(self):
-        """Highly rectangular params (embeddings) should use AdamW, not Muon."""
-        model = nn.Sequential(
-            nn.Embedding(32000, 64),
-            nn.Linear(64, 64),
-        )
-        config = OptimizerConfig(name="muon", lr=0.01)
-        optimizer = build_optimizer(model, config)
-
-        muon_params = [p for g in optimizer.param_groups for p in g["params"]]
-        adam_params = [p for g in optimizer._adam.param_groups for p in g["params"]]
-
-        assert any(p.shape == (32000, 64) for p in adam_params)
-        assert any(p.shape == (64, 64) for p in muon_params)
+        muon, adam = _split(optimizer)
+        assert muon == {model[0].weight, model[2].weight}
+        assert adam == {model[0].bias, model[2].bias}
 
     def test_produces_finite_updates(self):
         """All parameters should remain finite after Muon steps."""
@@ -330,9 +380,8 @@ class TestMuon:
         """Params routed to the inner AdamW must be zeroed too.
 
         Only Muon's half is registered with the base class, so the inherited
-        zero_grad leaves everything delegated to _adam accumulating. The shape
-        matters: at an aspect ratio under 10 the embedding stays on Muon's side
-        and this passes even when the delegation is missing.
+        zero_grad leaves everything delegated to _adam accumulating. The
+        embedding is not an nn.Linear, so it is delegated and would be missed.
         """
         torch.manual_seed(0)
         model = nn.Sequential(
@@ -472,6 +521,76 @@ class TestMuon:
         optimizer.load_state_dict(saved)
         assert optimizer.param_groups[0]["nesterov"] is False
         assert optimizer.param_groups[0]["adjust_lr"] == "original"
+
+
+class TestMuonRouting:
+    """Muon takes the hidden ``nn.Linear`` weights; its inner AdamW takes the rest."""
+
+    @staticmethod
+    def _model(**overrides: Any) -> Transformer:
+        config = {"dim": 64, "n_layers": 1, "n_heads": 2, "vocab_size": 128, "max_seq_len": 16}
+        return Transformer(ModelConfig(**(config | overrides)))
+
+    @pytest.mark.parametrize("tie_embeddings", [False, True])
+    @pytest.mark.parametrize("vocab_size", [128, 4096])
+    def test_embedding_and_head_use_adam_at_any_vocab(self, vocab_size, tie_embeddings):
+        """A vocab within or beyond 10x the width leaves the embedding and head to AdamW."""
+        model = self._model(vocab_size=vocab_size, tie_embeddings=tie_embeddings)
+        assert model.token_embedding is not None and model.output_head is not None
+        head = model.output_head.proj.weight
+        hidden = {m.weight for m in model.modules() if isinstance(m, nn.Linear)} - {head}
+        muon, adam = _split(build_optimizer(model, OptimizerConfig(name="muon")))
+        assert muon == hidden
+        assert adam == set(model.parameters()) - hidden
+        assert {model.token_embedding.embedding.weight, head} <= adam
+
+    def test_vision_input_layers_use_adam(self):
+        """A patch-embedding conv and a position table go to AdamW at shapes NS could take."""
+        tower = nn.ModuleDict(
+            {
+                "patch_embedding": nn.Conv2d(3, 48, kernel_size=4, stride=4),
+                "position_embedding": nn.Embedding(16, 48),
+                "fc": nn.Linear(48, 48),
+            }
+        )
+        muon, adam = _split(build_optimizer(tower, OptimizerConfig(name="muon")))
+        assert muon == {tower["fc"].weight}
+        assert {tower["patch_embedding"].weight, tower["position_embedding"].weight} <= adam
+
+    def test_narrow_and_tall_linear_weights_use_muon(self):
+        """A Linear weight goes to Muon however rectangular it is."""
+        model = nn.Sequential(nn.Linear(256, 8), nn.Linear(8, 256))
+        muon, _ = _split(build_optimizer(model, OptimizerConfig(name="muon")))
+        assert muon == {model[0].weight, model[1].weight}
+
+    @pytest.mark.parametrize("muon_router", [None, False, True])
+    def test_moe_router_gate_follows_muon_router(self, muon_router):
+        """The router gate goes to Muon only with muon_router; the experts go to Muon always."""
+        model = self._model(num_experts=4, moe_top_k=2, moe_router="sigmoid_topk")
+        moe = model.layers["0"].mlp
+        options = {} if muon_router is None else {"muon_router": muon_router}
+        muon, adam = _split(build_optimizer(model, OptimizerConfig(name="muon", **options)))
+        on_muon = bool(muon_router)
+        assert (moe.router.gate.weight in muon) is on_muon
+        assert (moe.router.gate.weight in adam) is not on_muon
+        assert moe.router.expert_bias in adam
+        assert {expert.up_proj.weight for expert in moe.experts} <= muon
+
+    @pytest.mark.parametrize("muon_router", [False, True])
+    def test_moma_router_gate_follows_muon_router(self, muon_router):
+        """MoMa's expert-choice router gate follows muon_router too."""
+        moe = ExpertChoiceMoE(dim=32, hidden_dim=64, num_experts=4, capacity_factor=1.0)
+        config = OptimizerConfig(name="muon", muon_router=muon_router)
+        muon, adam = _split(build_optimizer(moe, config))
+        assert (moe.router.gate.weight in muon) is muon_router
+        assert (moe.router.gate.weight in adam) is not muon_router
+
+    def test_packed_experts_use_adam(self):
+        """Packed 3-D expert weights go to AdamW."""
+        model = self._model(num_experts=4, moe_top_k=2, moe_packed_experts=True)
+        moe = model.layers["0"].mlp
+        _, adam = _split(build_optimizer(model, OptimizerConfig(name="muon")))
+        assert {moe.up_w, moe.down_w, moe.gate_w} <= adam
 
 
 class TestAdamW:

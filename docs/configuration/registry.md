@@ -64,11 +64,14 @@ module-import time. Both routes land in the same `_stores` dict.
 from kempnerforge.config.registry import registry
 
 @registry.register_optimizer("my_adam")
-def build_my_adam(params, config):
-    return MyAdam(params, lr=config.lr, betas=config.betas)
+def build_my_adam(param_groups, config, model):
+    return MyAdam(param_groups, lr=config.lr, betas=config.betas)
 ```
 
-Configs then pick it up via `[optimizer] name = "my_adam"`.
+Configs then pick it up via `[optimizer] name = "my_adam"`. `build_optimizer`
+passes every optimizer builder the decay/no-decay `param_groups`, the
+`OptimizerConfig` and the model, so a builder can route parameters by the
+module that owns them.
 
 ### With `register(...)`
 
@@ -171,7 +174,7 @@ signature, and your builder has to match it." Existing examples:
 | Category | Expected signature |
 |----------|--------------------|
 | `model` | `fn(config: ModelConfig) → nn.Module` |
-| `optimizer` | `fn(params, config: OptimizerConfig) → torch.optim.Optimizer` |
+| `optimizer` | `fn(param_groups, config: OptimizerConfig, model: nn.Module) → torch.optim.Optimizer` |
 | `scheduler` | `fn(optimizer, config: SchedulerConfig, max_steps: int) → LRScheduler` |
 | `loss` | `fn(logits, labels, …) → Tensor` (see existing `cross_entropy` for the exact kwargs) |
 | `norm` | `fn(dim: int, eps: float) → nn.Module` |

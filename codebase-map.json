@@ -738,7 +738,7 @@
         "module_learning_rates(optimizer) -> dict[str, float]",
         "_split_by_module(model, param_groups, config, module_patterns) -> list[dict]",
         "_newton_schulz(G, steps) -> Tensor",
-        "_is_muon_eligible(param) -> bool",
+        "_muon_matrices(model, *, routers) -> set[Tensor]",
         "_should_decay(name, param, scope) -> bool"
       ],
       "registry": [
@@ -753,6 +753,7 @@
         "tests/unit/test_lr_multipliers.py::TestMuonFallback",
         "tests/unit/test_optimizer.py::TestNewtonSchulz",
         "tests/unit/test_optimizer.py::TestMuon",
+        "tests/unit/test_optimizer.py::TestMuonRouting",
         "tests/unit/test_optimizer.py::TestAdamW",
         "tests/unit/test_additional_optimizers.py::TestLion",
         "tests/unit/test_additional_optimizers.py::TestScheduleFreeAdamW"
@@ -1615,11 +1616,12 @@
       },
       "tests/unit/test_optimizer.py": {
         "classes": [
-          "TestNewtonSchulz(3)",
-          "TestMuon(11)",
+          "TestNewtonSchulz(5)",
+          "TestMuon(29)",
+          "TestMuonRouting(6)",
           "TestAdamW(2)"
         ],
-        "count": 16
+        "count": 42
       },
       "tests/unit/test_eval.py": {
         "classes": [
