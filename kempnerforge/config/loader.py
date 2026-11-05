@@ -20,9 +20,44 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Literal, Union, get_args, get_origin, get_type_hints
 
+from kempnerforge.config.model import Activation, NormType
 from kempnerforge.config.registry import registry
+from kempnerforge.config.scheduler import SchedulerType
 from kempnerforge.config.schema import JobConfig
 from kempnerforge.config.vlm import VLMConfig
+
+_REGISTRY_ENUMS: dict[type[Enum], str] = {
+    SchedulerType: "scheduler",
+    NormType: "norm",
+    Activation: "mlp",
+}
+
+
+def _coerce_registry_enum(enum_type: type[Enum], category: str, value: Any) -> Any:
+    """Coerce ``value`` to an ``enum_type`` member, or keep a name ``category`` registers.
+
+    These enums select a registry builder, so a name a plugin registered is valid
+    though the enum does not list it, and it stays a plain ``str``. ``Activation``
+    reads ``mlp``: ``build_mlp`` maps the built-in activations to ``mlp`` keys and
+    looks any other name up there directly.
+
+    Raises:
+        ValueError: ``value`` is neither a member nor a registered name; the
+            message lists both.
+    """
+    try:
+        return enum_type(value)
+    except ValueError:
+        registered = registry.list(category)
+        if isinstance(value, str) and value in registered:
+            return value
+        members = [member.value for member in enum_type]
+        raise ValueError(
+            f"{value!r} is neither in {enum_type.__name__} nor registered under "
+            f"{category!r}. {enum_type.__name__} members: {members}. Registered "
+            f"{category!r} names: {sorted(registered)}. Modules listed in 'plugins' "
+            "register their names before this check."
+        ) from None
 
 
 def _coerce_value(field_type: Any, value: Any) -> Any:
@@ -47,6 +82,8 @@ def _coerce_value(field_type: Any, value: Any) -> Any:
     if isinstance(field_type, type) and issubclass(field_type, Enum):
         if isinstance(value, field_type):
             return value
+        if field_type in _REGISTRY_ENUMS:
+            return _coerce_registry_enum(field_type, _REGISTRY_ENUMS[field_type], value)
         return field_type(value)
 
     if origin is tuple:
