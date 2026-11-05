@@ -17,7 +17,7 @@ import shutil
 import stat
 import threading
 import uuid
-from collections.abc import Callable, Container, Iterable
+from collections.abc import Callable, Container, Iterable, Mapping
 from functools import partial
 from pathlib import Path
 from typing import Any, Protocol, TypeGuard, cast
@@ -35,7 +35,12 @@ from torch.distributed.checkpoint.state_dict import (
 )
 
 from kempnerforge.checkpoint.async_save import AsyncCheckpointer
-from kempnerforge.checkpoint.expert_layout import ExpertLayout, expert_layout
+from kempnerforge.checkpoint.expert_layout import (
+    ExpertLayout,
+    check_saved_experts,
+    expert_layout,
+    moe_layers,
+)
 from kempnerforge.checkpoint.state import build_train_state, restore_train_state
 from kempnerforge.config.optimizer import WEIGHT_DECAY_SCOPES
 from kempnerforge.config.schema import AsyncCheckpointMode, CheckpointConfig
@@ -536,20 +541,34 @@ class CheckpointManager:
             raise RuntimeError(f"Checkpoint save failed on ranks {failed}")
 
     def _present_experts(
-        self, dcp_state: dict[str, Any]
+        self,
+        dcp_state: dict[str, Any],
+        load_from: Path | None = None,
+        saved_keys: Mapping[str, Any] | None = None,
     ) -> tuple[dict[str, Any], ExpertLayout | None]:
         """``dcp_state`` as the checkpoint holds it, and the layout that translated it.
 
         Under expert parallelism each rank's experts are placed among all of them (see
-        ``ExpertLayout``); otherwise ``dcp_state`` comes back with ``None``. Every rank
-        must call this: they agree on the outcome before DCP's collectives, so a rank that
-        fails raises on every rank.
+        ``ExpertLayout``); otherwise ``dcp_state`` comes back with ``None``. Before a load
+        from ``load_from``, a checkpoint whose MoE layers hold fewer experts than the
+        model's is refused (see ``check_saved_experts``), reading its DCP index unless
+        ``saved_keys`` holds it. Every rank must call this: they agree on the outcome
+        before DCP's collectives, so a rank that fails raises on every rank.
         """
         layout = expert_layout(self.model)
-        if layout is None:
+        check = load_from is not None and any(True for _ in moe_layers(self.model))
+        if layout is None and not check:
             return dcp_state, None
+
+        def present() -> dict[str, Any]:
+            if check:
+                assert load_from is not None
+                saved = saved_keys or _dcp_keys(load_from)
+                check_saved_experts(self.model, saved, load_from)
+            return layout.to_global(dcp_state) if layout is not None else dcp_state
+
         presented: list[dict[str, Any]] = []
-        self._agree(_attempt(lambda: presented.append(layout.to_global(dcp_state))))
+        self._agree(_attempt(lambda: presented.append(present())))
         return presented[0], layout
 
     def set_tracking_source(self, source: TrackingSource | None) -> None:
@@ -930,7 +949,7 @@ class CheckpointManager:
                 )
 
         if dcp_state:
-            dcp_state, layout = self._present_experts(dcp_state)
+            dcp_state, layout = self._present_experts(dcp_state, dcp_dir, saved_keys)
             planner = _NeverSteppedStatePlanner()
             dcp.load(
                 dcp_state,

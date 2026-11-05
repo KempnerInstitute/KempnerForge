@@ -12,6 +12,9 @@ a DTensor over ``ep`` and the FSDP mesh whose rows cover every expert. A checkpo
 holds every expert in the layout an ``ep = 1`` run saves, so DCP loads it at any ``ep``.
 The translated tensors share storage with the rank's own, so nothing is copied or
 gathered, and a load into them loads the model and optimizer.
+
+``check_saved_experts`` refuses a checkpoint that holds fewer experts than the model, as
+one saved with ``ep > 1`` before this layout existed does.
 """
 
 from __future__ import annotations
@@ -339,3 +342,55 @@ class ExpertLayout:
         """The tensor that ``item`` views if ``to_global`` made it; else ``item``."""
         made = self._originals.get(id(item))
         return made[1] if made is not None and made[0] is item else item
+
+
+def _held_experts(saved: Mapping[str, Any], layer: str, moe: MoEMLP) -> int | None:
+    """How many experts of ``layer`` the DCP index ``saved`` holds; None if it holds none."""
+    if moe.packed_experts:
+        size = getattr(saved.get(f"model.{layer}.up_w"), "size", None)
+        return int(size[0]) if size else None
+    head = f"model.{layer}.experts."
+    indices = {key[len(head) :].partition(".")[0] for key in saved if key.startswith(head)}
+    held = {index for index in indices if index.isdigit()}
+    return len(held) if held else None
+
+
+def check_saved_experts(model: torch.nn.Module, saved: Mapping[str, Any], where: object) -> None:
+    """Refuse a checkpoint whose MoE layers hold fewer experts than ``model``'s.
+
+    ``saved`` is the checkpoint's DCP index, its ``state_dict_metadata``. A checkpoint
+    saved with ``ep > 1`` before the experts had a global identity holds
+    ``num_experts / ep`` experts of each layer: every EP rank wrote its own under the same
+    names, and the checkpoint kept one rank's. Loading it at the same ``ep`` would give
+    every rank that rank's experts, and at another ``ep`` it fails on the experts it
+    lacks, so it is refused here with what it holds. A layer the checkpoint holds no
+    expert of is left to the load.
+
+    Raises:
+        ValueError: A layer of ``model`` has more experts than the checkpoint holds for it.
+    """
+    short = [
+        (layer, moe, held)
+        for layer, moe in moe_layers(model)
+        if (held := _held_experts(saved, layer, moe)) is not None and held < moe.num_experts
+    ]
+    if not short:
+        return
+    layer, moe, held = short[0]
+    total = moe.num_experts
+    holds = (
+        f"{layer}.up_w has {held} rows"
+        if moe.packed_experts
+        else f"{layer} holds experts 0-{held - 1}"
+        if held > 1
+        else f"{layer} holds expert 0"
+    )
+    saved_with = f" with ep={total // held}" if total % held == 0 else ""
+    raise ValueError(
+        f"{where} holds {held} of the {total} experts of {len(short)} MoE layers ({holds}), "
+        "so it cannot restore this model's experts. That is what a checkpoint saved with "
+        f"expert parallelism{saved_with} holds when it predates issue #202's fix: every EP "
+        "rank saved its experts under the same names and the checkpoint kept one rank's, so "
+        "the other experts' weights were never written. Load a checkpoint saved with ep=1 "
+        "or after the fix, or start a new run."
+    )
