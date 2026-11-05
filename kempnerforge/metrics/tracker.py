@@ -119,7 +119,8 @@ class MetricsTracker:
         Args:
             step: Current training step number.
             loss: Loss value for this step.
-            grad_norm: Gradient norm (after clipping).
+            grad_norm: Total gradient norm before clipping (what ``clip_grad_norm_``
+                returns); under pipeline parallelism, the whole model's norm.
             lr: Current learning rate.
             tokens_in_step: Total tokens processed in this step (across all GPUs).
 
