@@ -153,6 +153,16 @@ class JobConfig:
                 "Set eval.dataset_path or eval.hf_dataset_name."
             )
 
+        if self.train.fp32_master_weights and self.model.is_moe:
+            resolved = self.distributed.resolve(world_size)
+            if max(resolved.dp_replicate, resolved.dp_shard, resolved.tp, resolved.ep) == 1:
+                raise ValueError(
+                    "train.fp32_master_weights with an MoE model needs a mesh FSDP2 wraps "
+                    "(more than one GPU): without one the forward runs under torch.autocast, "
+                    "the expert inputs stay fp32 and the experts lose grouped GEMM. Turn "
+                    "fp32_master_weights off or train on more than one GPU."
+                )
+
         if self.model.is_moe and self.train.compile_model:
             import logging
 

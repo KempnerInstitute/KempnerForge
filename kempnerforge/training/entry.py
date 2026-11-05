@@ -8,6 +8,7 @@ phase — without editing the shared script.
 
 from __future__ import annotations
 
+import contextlib
 from pathlib import Path
 from typing import cast
 
@@ -21,6 +22,7 @@ from kempnerforge.distributed.parallel import (
     apply_ac,
     apply_float8,
     apply_fsdp2,
+    autocast_dtype,
     build_parallel_model,
     default_mp_policy,
 )
@@ -86,7 +88,7 @@ def build_model(
             frames_per_clip=(config.video.max_frames if config.video is not None else 1),
             ac_mode=tc.activation_checkpointing,
             mp_policy=mp_policy,
-            param_dtype=tc.param_dtype,
+            param_dtype=tc.master_dtype,
             compile_model=tc.compile_model,
             fp8=tc.is_fp8,
         )
@@ -116,12 +118,12 @@ def build_model(
         apply_fsdp2(stage_mod, device_mesh, mp_policy=mp_policy)
         stage_mod.to_empty(device=device)
         stage_mod.init_weights_and_freqs()
-        stage_mod.to(dtype=tc.param_dtype)
+        stage_mod.to(dtype=tc.master_dtype)
     else:
         stage_mod = cast(
             "Transformer",
             build_stage_module(config.model, pp_rank, pp_size).to(
-                device=device, dtype=tc.param_dtype
+                device=device, dtype=tc.master_dtype
             ),
         )
         if tc.is_fp8:
@@ -137,14 +139,21 @@ def build_model(
     n_params = sum(p.numel() for p in model.parameters())
     logger.info(f"Model (PP stage {pp_rank}/{pp_size}): {n_params:,} parameters")
 
-    pp_stage = build_pipeline_stage(
-        model,  # type: ignore[arg-type]
-        device_mesh,
-        device,
-        batch_size=tc.batch_size,
-        seq_len=tc.seq_len,
-        param_dtype=tc.param_dtype,
+    amp_dtype = autocast_dtype(stage_mod, tc.master_dtype, tc.param_dtype)
+    shape_inference_ctx = (
+        torch.autocast(device_type=device.type, dtype=amp_dtype)
+        if amp_dtype is not None
+        else contextlib.nullcontext()
     )
+    with shape_inference_ctx:
+        pp_stage = build_pipeline_stage(
+            model,  # type: ignore[arg-type]
+            device_mesh,
+            device,
+            batch_size=tc.batch_size,
+            seq_len=tc.seq_len,
+            param_dtype=tc.param_dtype if amp_dtype is None else tc.master_dtype,
+        )
     pp_schedule = build_pipeline_schedule(
         stage=pp_stage,
         n_microbatches=tc.grad_accum_steps,
@@ -260,7 +269,9 @@ def run_training(
 
     ``step_fn`` and ``hooks`` let an experiment own the step body or register
     hooks without copying the build phases. Both default to what
-    ``scripts/train.py`` uses.
+    ``scripts/train.py`` uses. A custom ``step_fn`` must run its forward and
+    loss under ``session.autocast()``, which casts fp32 master weights to the
+    compute dtype when no FSDP2 wrap does (one GPU, a pp-only mesh).
     """
     runtime = setup_distributed(config)
     tracker: MetricsTracker | None = None
@@ -272,6 +283,12 @@ def run_training(
 
         loss_fn = build_loss_fn(config.train)
         model, pipeline = build_model(config, runtime, loss_fn)
+        amp_dtype = autocast_dtype(model, config.train.master_dtype, config.train.param_dtype)
+        if amp_dtype is not None:
+            logger.info(
+                f"No FSDP2 wrap casts the {config.train.master_dtype} master weights: "
+                f"forward passes run under torch.autocast({amp_dtype})"
+            )
 
         optimizer = build_optimizer(model, config.optimizer)
         scheduler = build_scheduler(optimizer, config.scheduler, max_steps=config.train.max_steps)
@@ -311,6 +328,7 @@ def run_training(
             pipeline=pipeline,
             eval_dataloader=eval_dataloader,
             profiler=prof,
+            autocast_dtype=amp_dtype,
         )
 
         run_training_loop(session, step=step, tokens_seen=tokens_seen)
