@@ -33,21 +33,24 @@ def _register_from(module: str, source: str, reg: Registry) -> None:
 
 @pytest.fixture
 def write_plugin(tmp_path, monkeypatch):
-    """Write importable plugin modules; put the registry and ``sys.modules`` back afterward."""
+    """Write importable plugin modules, or a package's ``__init__`` with ``package=True``;
+    put the registry and ``sys.modules`` back afterward."""
     stores = {category: dict(store) for category, store in registry._stores.items()}
     owners = {category: dict(names) for category, names in registry._owners.items()}
     written: list[str] = []
     monkeypatch.syspath_prepend(str(tmp_path))
 
-    def write(module: str, source: str) -> str:
-        (tmp_path / f"{module}.py").write_text(source)
+    def write(module: str, source: str, package: bool = False) -> str:
+        path = tmp_path / module / "__init__.py" if package else tmp_path / f"{module}.py"
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(source)
         importlib.invalidate_caches()
         written.append(module)
         return module
 
     yield write
-    for module in written:
-        sys.modules.pop(module, None)
+    for module in [name for name in sys.modules if name.split(".")[0] in written]:
+        del sys.modules[module]
     registry._stores.clear()
     registry._stores.update(stores)
     registry._owners.clear()
@@ -144,3 +147,20 @@ class TestPluginImportHint:
         with pytest.raises(ValueError, match="kf176_raises.*RuntimeError: kaboom") as excinfo:
             load_config(cli_args=['--plugins=["kf176_raises"]'])
         assert "sys.path" not in str(excinfo.value)
+
+    def test_a_missing_dependency_of_a_found_plugin_gets_no_sys_path_hint(self, write_plugin):
+        write_plugin("kf176_needs_dep", "import kf176_missing_dependency\n")
+        with pytest.raises(
+            ValueError, match="No module named 'kf176_missing_dependency'"
+        ) as excinfo:
+            load_config(cli_args=['--plugins=["kf176_needs_dep"]'])
+        assert "sys.path" not in str(excinfo.value)
+
+    def test_a_missing_package_above_the_plugin_keeps_the_sys_path_hint(self):
+        with pytest.raises(ValueError, match=r"No module named 'kf176_absent_pkg'\..*sys\.path"):
+            load_config(cli_args=['--plugins=["kf176_absent_pkg.sub.mod"]'])
+
+    def test_a_missing_module_in_a_found_package_keeps_the_sys_path_hint(self, write_plugin):
+        write_plugin("kf176_pkg", "", package=True)
+        with pytest.raises(ValueError, match=r"No module named 'kf176_pkg\.absent'\..*sys\.path"):
+            load_config(cli_args=['--plugins=["kf176_pkg.absent"]'])
