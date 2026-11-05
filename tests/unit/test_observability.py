@@ -926,6 +926,15 @@ class TestRankLogger:
         assert traceback.startswith("Traceback (most recent call last):")
         assert traceback.endswith("ValueError: bad batch")
 
+    def test_rank_formatter_prints_the_stack_of_a_record(self, monkeypatch):
+        """``stack_info=True`` prints the caller's stack below the line."""
+        logger, stream = _plain_rank_logger(monkeypatch, "test_rank_formatter_stack")
+        logger.warning("slow step", stack_info=True)
+        line, stack = stream.getvalue().split("\n", 1)
+        assert line.endswith(" [rank 0] WARNING  slow step")
+        assert stack.startswith("Stack (most recent call last):\n")
+        assert "in test_rank_formatter_prints_the_stack_of_a_record\n" in stack
+
     def test_configure_root_no_rank_filter(self, monkeypatch):
         """When rank_zero_only=False, _configure_root attaches no _RankFilter.
 
