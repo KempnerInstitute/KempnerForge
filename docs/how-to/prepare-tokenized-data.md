@@ -196,6 +196,24 @@ attention. Useful when document lengths are much smaller than
 `seq_len`; otherwise the default (one document per sample, truncated
 or padded) is fine.
 
+**Pair it with `model.attention_backend = "flex"` at long sequence
+lengths.** The default `"sdpa"` backend builds a dense `(B, 1, S, S)` mask
+in every layer, which is not a FlashAttention-2 shape, so packing costs
+throughput instead of saving it — at `seq_len = 8192` the dense path runs
+at 124k tok/s against 236k unpacked, while flex reaches 300k. On one GPU
+the two are near parity below about 1k; on 4 GPUs under FSDP, flex is
+5-10% slower from 512 to 2048. Flex is rejected outright under 128.
+See [Model § Attention backend](../architecture/model.md) for the full
+table.
+
+One caveat worth knowing before turning packing on: **eval has no
+document mask.** Eval windows hold several concatenated documents too,
+but `run_eval` never passes `doc_ids` to the model, so evaluation runs
+plain causal attention across document boundaries even when training is
+packed, whichever eval dataset is configured. Eval loss is
+therefore computed under slightly different masking than training loss.
+Pre-existing, and worth remembering when comparing the two curves.
+
 ## Resumption
 
 Both paths work with
