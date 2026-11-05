@@ -917,6 +917,17 @@ def _plain_rank_logger(monkeypatch, name: str) -> tuple[logging.Logger, io.Strin
     return logger, stream
 
 
+class _RecordingHandler(logging.Handler):
+    """Keeps every record it is handed, unformatted."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+
 class TestRankLogger:
     def test_get_logger_returns_logger(self):
         logger = get_logger("test_module")
@@ -1030,11 +1041,15 @@ class TestRankLogger:
         assert traceback.endswith("ValueError: bad batch")
 
     def test_rank_formatter_prints_the_stack_of_a_record(self, monkeypatch):
-        """``stack_info=True`` prints the caller's stack below the line."""
+        """``stack_info=True`` prints the caller's stack below the line, exactly once."""
         logger, stream = _plain_rank_logger(monkeypatch, "test_rank_formatter_stack")
+        recorder = _RecordingHandler()
+        logger.addHandler(recorder)
         logger.warning("slow step", stack_info=True)
+        (record,) = recorder.records
         line, stack = stream.getvalue().split("\n", 1)
         assert line.endswith(" [rank 0] WARNING  slow step")
+        assert stack == f"{record.stack_info}\n"
         assert stack.startswith("Stack (most recent call last):\n")
         assert "in test_rank_formatter_prints_the_stack_of_a_record\n" in stack
 
