@@ -3001,6 +3001,15 @@ class TestUnfreezeAtAStage:
         pairs = zip(model.proj.parameters(), initial, strict=True)
         assert all(not torch.equal(p, i) for p, i in pairs)
 
+    def test_the_stage_refreshes_the_fsdp_dtypes_of_what_it_unfroze(self, monkeypatch):
+        import kempnerforge.training.loop as loop
+
+        refreshed: list = []
+        monkeypatch.setattr(loop, "refresh_fsdp_dtypes", lambda m, params: refreshed.append(params))
+        model, _ = self._run(max_steps=2)
+        assert [[id(p) for p in params] for params in refreshed] == [
+            [id(p) for p in model.proj.parameters()]
+        ]
 
 
 class TestResumePastAnUnfreezeStage:

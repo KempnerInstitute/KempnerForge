@@ -1,4 +1,4 @@
-"""Unit tests for VLMWrapper, inner_transformer, _is_encoder_frozen.
+"""Unit tests for VLMWrapper and inner_transformer.
 
 Adapter unit tests moved to ``tests/unit/test_adapter.py`` when ``Adapter``
 was renamed to ``MLP2LayerAdapter`` and promoted to a registered component.
@@ -18,7 +18,6 @@ from kempnerforge.config.registry import registry
 from kempnerforge.config.vision import VisionEncoderConfig
 from kempnerforge.config.vlm import (
     CrossAttentionConfig,
-    FreezeSpec,
     JointDecoderConfig,
     MoMaConfig,
     MoTConfig,
@@ -31,7 +30,6 @@ from kempnerforge.model.vlm import (
     JointDecoderStrategy,
     MoTStrategy,
     VLMWrapper,
-    _is_encoder_frozen,
     build_modality_strategy,
     build_vlm_wrapper,
     inner_transformer,
@@ -193,30 +191,6 @@ class TestBuildVLMWrapperErrors:
         wrapper = build_vlm_wrapper(mc, vc, ac, lc)
         assert isinstance(wrapper, VLMWrapper)
         assert wrapper.num_image_tokens == 0
-
-
-class TestIsEncoderFrozen:
-    def test_all_frozen(self):
-        specs = [FreezeSpec("vision_encoder", True)]
-        assert _is_encoder_frozen(specs) is True
-
-    def test_partial_unfrozen(self):
-        specs = [
-            FreezeSpec("vision_encoder", True),
-            FreezeSpec("vision_encoder.layers.11", False),
-        ]
-        assert _is_encoder_frozen(specs) is False
-
-    def test_no_relevant_specs(self):
-        specs = [FreezeSpec("adapter", True)]
-        assert _is_encoder_frozen(specs) is False
-
-    def test_empty_specs(self):
-        assert _is_encoder_frozen([]) is False
-
-    def test_nested_key_counts(self):
-        specs = [FreezeSpec("vision_encoder.layers.0", True)]
-        assert _is_encoder_frozen(specs) is True
 
 
 def _ca_configs(

@@ -20,6 +20,7 @@ import torch.distributed as dist
 
 from kempnerforge.checkpoint.manager import CheckpointManager
 from kempnerforge.config.job import JobConfig
+from kempnerforge.distributed.parallel import refresh_fsdp_dtypes
 from kempnerforge.distributed.utils import clip_grad_norm_
 from kempnerforge.metrics.logger import get_logger
 from kempnerforge.metrics.tracker import MetricsTracker
@@ -467,7 +468,9 @@ def _apply_freeze_stages(session: TrainingSession, step: int) -> None:
     optimizer skips a parameter whose gradient is None (no update, no weight
     decay). So mutating requires_grad mid-training stops the updates of
     newly-frozen params and starts those of newly-unfrozen ones, including a
-    module the build froze.
+    module the build froze. The FSDP2 units holding newly-unfrozen params
+    recompute their reduction dtypes (``refresh_fsdp_dtypes``), which a unit
+    frozen at its first forward does not have.
 
     Async-save fence: drain any in-flight save FIRST so that its
     metadata.json — which records the pre-transition spec — lands before we
@@ -482,9 +485,12 @@ def _apply_freeze_stages(session: TrainingSession, step: int) -> None:
     if not pending_stages:
         return
     session.checkpointer.flush_pending_save()
+    frozen = {id(p) for p in session.model.parameters() if not p.requires_grad}
     for stage in pending_stages:
         flipped = apply_freeze_specs(session.model, stage.specs, vlm_cfg.module_patterns)
         logger.info(f"FreezeStage at step={step}: applied {flipped}")
+    unfrozen = [p for p in session.model.parameters() if p.requires_grad and id(p) in frozen]
+    refresh_fsdp_dtypes(session.model, unfrozen)
 
 
 def _apply_step_transitions(session: TrainingSession, step: int) -> None:
