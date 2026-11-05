@@ -1,0 +1,146 @@
+"""Tests for the registry's duplicate-registration error, which names both modules."""
+
+from __future__ import annotations
+
+import importlib
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+import kempnerforge.training.scheduler  # noqa: F401
+from kempnerforge.config.loader import load_config
+from kempnerforge.config.registry import Registry, registry
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+COSINE_PLUGIN = """\
+from kempnerforge.config.registry import registry
+
+
+@registry.register_scheduler("cosine")
+def build(optimizer, config, max_steps):
+    raise NotImplementedError
+"""
+
+
+def _register_from(module: str, source: str, reg: Registry) -> None:
+    """Run ``source`` as the body of a module named ``module``, with ``reg`` in scope."""
+    exec(compile(source, f"<{module}>", "exec"), {"__name__": module, "reg": reg})
+
+
+@pytest.fixture
+def write_plugin(tmp_path, monkeypatch):
+    """Write importable plugin modules; put the registry and ``sys.modules`` back afterward."""
+    stores = {category: dict(store) for category, store in registry._stores.items()}
+    owners = {category: dict(names) for category, names in registry._owners.items()}
+    written: list[str] = []
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    def write(module: str, source: str) -> str:
+        (tmp_path / f"{module}.py").write_text(source)
+        importlib.invalidate_caches()
+        written.append(module)
+        return module
+
+    yield write
+    for module in written:
+        sys.modules.pop(module, None)
+    registry._stores.clear()
+    registry._stores.update(stores)
+    registry._owners.clear()
+    registry._owners.update(owners)
+
+
+REGISTRATIONS = {
+    "register": "reg.register('scheduler', 'dup', len)\n",
+    "decorator": "@reg.register_scheduler('dup')\ndef build(optimizer, config, steps):\n    pass\n",
+    "inside-a-function": "def setup():\n    reg.register('scheduler', 'dup', len)\n\n\nsetup()\n",
+}
+
+
+class TestDuplicateRegistration:
+    @pytest.mark.parametrize("source", REGISTRATIONS.values(), ids=REGISTRATIONS.keys())
+    def test_error_names_the_owner_and_the_module_registering_again(self, source):
+        reg = Registry()
+        _register_from("kf_owner_first", source, reg)
+        with pytest.raises(
+            ValueError,
+            match="^scheduler/dup is already registered by kf_owner_first; "
+            "kf_owner_second tried to register it again$",
+        ):
+            _register_from("kf_owner_second", source, reg)
+
+    def test_owner_is_the_registering_module_not_the_objects_module(self):
+        """``os.path.join`` lives in ``posixpath``; the module that registered it owns it."""
+        reg = Registry()
+        source = "import os\n\nreg.register('mlp', 'dup', os.path.join)\n"
+        _register_from("kf_owner_reexport", source, reg)
+        with pytest.raises(ValueError, match="already registered by kf_owner_reexport;"):
+            _register_from("kf_owner_other", "reg.register('mlp', 'dup', len)\n", reg)
+
+    def test_a_rejected_registration_changes_neither_the_entry_nor_its_owner(self):
+        reg = Registry()
+        _register_from("kf_owner_first", "reg.register('loss', 'dup', len)\n", reg)
+        for module in ("kf_owner_second", "kf_owner_third"):
+            with pytest.raises(ValueError, match=f"by kf_owner_first; {module} tried"):
+                _register_from(module, "reg.register('loss', 'dup', abs)\n", reg)
+        assert reg.get("loss", "dup") is len
+
+    def test_the_same_name_in_another_category_is_not_a_duplicate(self):
+        reg = Registry()
+        _register_from("kf_owner_first", "reg.register('norm', 'dup', len)\n", reg)
+        _register_from("kf_owner_second", "reg.register('mlp', 'dup', abs)\n", reg)
+        assert reg.get("norm", "dup") is len
+        assert reg.get("mlp", "dup") is abs
+
+
+class TestPluginCollisions:
+    def test_plugin_claiming_a_core_name_is_named_with_the_core_module(self, write_plugin):
+        """Core registered ``cosine`` first, so importing the plugin fails, naming both."""
+        write_plugin("kf176_core_first", COSINE_PLUGIN)
+        with pytest.raises(ValueError) as excinfo:
+            load_config(cli_args=['--plugins=["kf176_core_first"]'])
+        message = str(excinfo.value)
+        assert message.startswith(
+            "Failed to import plugin module 'kf176_core_first' from config key 'plugins': "
+            "ValueError: scheduler/cosine is already registered by "
+            "kempnerforge.training.scheduler; kf176_core_first tried to register it again"
+        )
+        assert "sys.path" not in message
+
+    def test_core_registering_after_the_plugin_names_the_plugin(self, tmp_path):
+        """With only the loader imported the scheduler category is still empty, so the
+        plugin takes ``cosine`` and the collision fires when core's module registers it.
+        Runs in a fresh interpreter, since this one imported core already."""
+        (tmp_path / "kf176_plugin_first.py").write_text(COSINE_PLUGIN)
+        code = (
+            "from kempnerforge.config.loader import load_config\n"
+            "load_config(cli_args=['--plugins=[\"kf176_plugin_first\"]'])\n"
+            "print('plugin imported')\n"
+            "import kempnerforge.training.scheduler\n"
+        )
+        env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(REPO_ROOT), str(tmp_path)])}
+        result = subprocess.run(
+            [sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=150
+        )
+        assert result.returncode != 0
+        assert result.stdout == "plugin imported\n"
+        assert (
+            "ValueError: scheduler/cosine is already registered by kf176_plugin_first; "
+            "kempnerforge.training.scheduler tried to register it again"
+        ) in result.stderr
+
+
+class TestPluginImportHint:
+    def test_a_missing_plugin_keeps_the_sys_path_hint(self):
+        with pytest.raises(ValueError, match=r"kf176_absent.*ModuleNotFoundError.*sys\.path"):
+            load_config(cli_args=['--plugins=["kf176_absent"]'])
+
+    def test_a_plugin_that_raises_gets_no_sys_path_hint(self, write_plugin):
+        write_plugin("kf176_raises", "raise RuntimeError('kaboom')\n")
+        with pytest.raises(ValueError, match="kf176_raises.*RuntimeError: kaboom") as excinfo:
+            load_config(cli_args=['--plugins=["kf176_raises"]'])
+        assert "sys.path" not in str(excinfo.value)
