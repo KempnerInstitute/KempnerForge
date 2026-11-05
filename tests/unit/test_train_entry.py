@@ -1096,6 +1096,8 @@ class TestWeightDecayScopeWarmStart:
         config.checkpoint.exclude_from_loading = ["optimizer"]
         assert restore_checkpoint(config, model, None, manager) == (1, 0)
         assert not optimizer.state
+        config.checkpoint.exclude_from_loading = ["optimizer", "train_state"]
+        assert restore_checkpoint(config, model, None, manager) == (0, 0)
 
 
 class TestBuildDataPipeline:
@@ -1702,7 +1704,9 @@ class TestRestoreCheckpoint:
         assert mgr.load_kwargs["vlm_freeze_expected"] == freeze_meta_at_step(0, config.vlm)
         assert mgr.load_kwargs["exclude_keys"] == ["model"]
 
-    def test_mot_warm_start_fires_only_at_step_zero(self, monkeypatch, tmp_path):
+    def test_mot_warm_start_fires_at_step_zero_but_not_on_a_weights_only_start(
+        self, monkeypatch, tmp_path
+    ):
         import kempnerforge.training.entry as entry
         from kempnerforge.config.adapter import AdapterConfig
         from kempnerforge.config.vision import VisionEncoderConfig
@@ -1728,6 +1732,12 @@ class TestRestoreCheckpoint:
 
         copied.clear()
         entry.restore_checkpoint(config, TinyTextModel(), None, FakeResumeManager(step=4))
+        assert copied == []
+
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: None)
+        config.checkpoint.load_path = str(tmp_path / "stage1")
+        config.checkpoint.exclude_from_loading = ["optimizer", "train_state"]
+        entry.restore_checkpoint(config, TinyTextModel(), None, FakeResumeManager(step=0))
         assert copied == []
 
 

@@ -232,7 +232,13 @@ def restore_checkpoint(
     if ckpt_extra_loaded.get("mlflow_run_id"):
         config.metrics.mlflow_run_id = ckpt_extra_loaded["mlflow_run_id"]
 
-    if isinstance(vlm_cfg, MoTConfig) and vlm_cfg.mot_warm_start_from_text and step == 0:
+    weights_only = warm_start_exclude is not None and "train_state" in warm_start_exclude
+    if (
+        isinstance(vlm_cfg, MoTConfig)
+        and vlm_cfg.mot_warm_start_from_text
+        and step == 0
+        and not weights_only
+    ):
         source = torch.load(vlm_cfg.mot_warm_start_path, map_location="cpu", weights_only=True)
         if isinstance(source, dict) and "model" in source:
             source = source["model"]

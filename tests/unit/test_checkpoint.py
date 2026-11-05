@@ -1415,11 +1415,20 @@ class TestSaveCheckpointRegistration:
 
 class TestWeightsOnlyWarmStart:
     def _saved(self, tmp_path, monkeypatch, freeze):
+        from types import SimpleNamespace
+
         mgr = _make_mock_mgr(tmp_path, monkeypatch)
         sched = torch.optim.lr_scheduler.StepLR(mgr.checkpointed_optimizers[0], step_size=1)
         sched.step()
         sched.step()
-        mgr.save(step=9, tokens_seen=900, scheduler=sched, extra={"vlm_freeze": freeze})
+        loader = SimpleNamespace(state_dict=lambda: {"epoch": 3})
+        mgr.save(
+            step=9,
+            tokens_seen=900,
+            scheduler=sched,
+            dataloader=loader,
+            extra={"vlm_freeze": freeze},
+        )
         return tmp_path / "step_9"
 
     def test_train_state_is_skipped(self, tmp_path, monkeypatch):
@@ -1441,6 +1450,13 @@ class TestWeightsOnlyWarmStart:
         loader.load_state_dict.assert_not_called()
         assert mgr._pending_dataloader_state is None
 
+    def test_without_a_dataloader_no_state_is_stashed(self, tmp_path, monkeypatch):
+        ckpt_dir = self._saved(tmp_path, monkeypatch, _freeze_meta(("vision_encoder", True)))
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        step, _, _ = mgr.load(path=str(ckpt_dir), exclude_keys=["train_state"])
+        assert step == 0
+        assert mgr._pending_dataloader_state is None
+
     def test_freeze_comparison_is_skipped(self, tmp_path, monkeypatch):
         ckpt_dir = self._saved(tmp_path, monkeypatch, _freeze_meta(("vision_encoder", True)))
         mgr = _make_mock_mgr(tmp_path, monkeypatch)
@@ -1456,6 +1472,7 @@ class TestWeightsOnlyWarmStart:
         mgr = _make_mock_mgr(tmp_path, monkeypatch)
         step, tokens, _ = mgr.load(path=str(ckpt_dir), exclude_keys=["optimizer"])
         assert (step, tokens) == (9, 900)
+        assert mgr._pending_dataloader_state == {"epoch": 3}
 
 
 class TestLoadVLMFreezeCompare:

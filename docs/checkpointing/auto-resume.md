@@ -112,7 +112,9 @@ exclude_from_loading = ["optimizer", "train_state"]
 ```
 
 The new run then begins at step 0 with its own warmup, data order and
-freeze specs, and only the model weights come from the checkpoint.
+freeze specs, and only the model weights come from the checkpoint. Exclude
+`"optimizer"` with it: `"train_state"` alone keeps the saved moments and
+step counters while the schedule restarts from warmup.
 
 ## Symlink updates
 

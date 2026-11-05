@@ -954,9 +954,10 @@ class CheckpointManager:
         if train_state_exists and not load_train_state:
             logger.info(
                 f"Weights-only warm start from {ckpt_dir}: its step, schedule, data position "
-                "and RNG are not restored"
+                "and RNG are not restored, and its freeze metadata is not compared"
             )
-        if train_state_exists and load_train_state:
+            step, tokens_seen, extra = 0, 0, {}
+        elif train_state_exists:
             train_state = (
                 _load_train_state(train_state_path)
                 if self._rank == 0 or not dist.is_initialized()
@@ -1070,7 +1071,8 @@ class CheckpointManager:
                 f"param groups, so the saved optimizer state cannot be loaded into this run's "
                 f"groups. Resume with weight_decay_scope={saved!r}, or start a new run from "
                 f"the checkpoint without its optimizer state: checkpoint.load_path="
-                f'{str(ckpt_dir)!r} with checkpoint.exclude_from_loading=["optimizer"] and '
+                f'{str(ckpt_dir)!r} with checkpoint.exclude_from_loading=["optimizer", '
+                f'"train_state"] and '
                 f"a checkpoint.dir that holds no checkpoint, since training auto-resumes from "
                 f"a checkpoint there in place of load_path, optimizer state included."
             )
