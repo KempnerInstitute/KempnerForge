@@ -119,7 +119,7 @@ def ep_dispatch_and_compute(
         num_local_experts: Number of experts on this rank.
         ep_world_size: Number of ranks in the EP group.
         gradient_scale: When ``moe`` is in training mode, scale each local expert's
-            output by the average expert load over its own load, as
+            output by the average load over all experts divided by its own load, as
             ``MoEMLP._local_forward`` does.
 
     Returns:
