@@ -18,7 +18,6 @@ from kempnerforge.config.checkpoint import AsyncCheckpointMode
 from kempnerforge.config.distributed import PipelineSchedule
 from kempnerforge.config.loader import load_config
 from kempnerforge.config.model import Activation, NormType
-from kempnerforge.config.registry import registry
 from kempnerforge.config.scheduler import SchedulerType
 from kempnerforge.config.training import ActivationCheckpointing
 from kempnerforge.model.transformer import Transformer
@@ -71,11 +70,9 @@ SELECTORS = [
 
 
 @pytest.fixture
-def write_plugin(tmp_path, monkeypatch):
+def write_plugin(tmp_path, monkeypatch, isolated_registry):
     """Write a plugin registering ``<module>_sched``, ``<module>_norm`` and ``<module>_mlp``;
-    put the registry and ``sys.modules`` back afterward."""
-    stores = {category: dict(store) for category, store in registry._stores.items()}
-    owners = {category: dict(names) for category, names in registry._owners.items()}
+    its ``sys.modules`` entry, and the registry entries it adds, go afterward."""
     written: list[str] = []
     monkeypatch.syspath_prepend(str(tmp_path))
 
@@ -88,10 +85,6 @@ def write_plugin(tmp_path, monkeypatch):
     yield write
     for module in written:
         sys.modules.pop(module, None)
-    registry._stores.clear()
-    registry._stores.update(stores)
-    registry._owners.clear()
-    registry._owners.update(owners)
 
 
 def _load(tmp_path, route: str, module: str, sections: dict[str, dict[str, Any]]):

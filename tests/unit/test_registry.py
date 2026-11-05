@@ -12,7 +12,7 @@ import pytest
 
 import kempnerforge.training.scheduler  # noqa: F401
 from kempnerforge.config.loader import load_config
-from kempnerforge.config.registry import Registry, registry
+from kempnerforge.config.registry import Registry
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -39,11 +39,9 @@ def _module(module: str, source: str, **names: object) -> dict[str, object]:
 
 
 @pytest.fixture
-def write_plugin(tmp_path, monkeypatch):
+def write_plugin(tmp_path, monkeypatch, isolated_registry):
     """Write importable plugin modules, or a package's ``__init__`` with ``package=True``;
-    put the registry and ``sys.modules`` back afterward."""
-    stores = {category: dict(store) for category, store in registry._stores.items()}
-    owners = {category: dict(names) for category, names in registry._owners.items()}
+    their ``sys.modules`` entries, and the registry entries they add, go afterward."""
     written: list[str] = []
     monkeypatch.syspath_prepend(str(tmp_path))
 
@@ -58,10 +56,6 @@ def write_plugin(tmp_path, monkeypatch):
     yield write
     for module in [name for name in sys.modules if name.split(".")[0] in written]:
         del sys.modules[module]
-    registry._stores.clear()
-    registry._stores.update(stores)
-    registry._owners.clear()
-    registry._owners.update(owners)
 
 
 REGISTRATIONS = {
