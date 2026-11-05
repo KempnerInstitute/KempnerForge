@@ -72,10 +72,15 @@ class _RankFormatter(logging.Formatter):
         if record.exc_info and not record.exc_text:
             record.exc_text = self.formatException(record.exc_info)
         if record.exc_text:
-            text = f"{text}\n{record.exc_text}"
+            text = _on_its_own_line(text, record.exc_text)
         if record.stack_info:
-            text = f"{text}\n{self.formatStack(record.stack_info)}"
+            text = _on_its_own_line(text, self.formatStack(record.stack_info))
         return text
+
+
+def _on_its_own_line(text: str, block: str) -> str:
+    """``block`` after ``text``, with a line break between them unless ``text`` ends in one."""
+    return text + block if text.endswith("\n") else f"{text}\n{block}"
 
 
 class _RankFilter(logging.Filter):
