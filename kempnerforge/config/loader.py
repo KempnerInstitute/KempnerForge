@@ -320,13 +320,22 @@ def _plugin_module_names(raw: Any) -> list[str]:
     return names
 
 
+def _plugin_not_found(error: Exception, name: str) -> bool:
+    """Whether ``error`` says the plugin module ``name``, or a package above it, was not found."""
+    if not isinstance(error, ModuleNotFoundError) or error.name is None:
+        return False
+    parts = name.split(".")
+    return error.name in {".".join(parts[: i + 1]) for i in range(len(parts))}
+
+
 def _import_plugins(raw: Any) -> None:
     """Import config-declared modules for their registry side effects.
 
     ``import_module`` is idempotent, so repeated ``load_config`` calls in one
     process never re-run a module body. A module that fails to import raises a
-    ``ValueError`` naming it; only an ``ImportError`` adds the ``sys.path`` hint,
-    since any other failure means the module was found.
+    ``ValueError`` naming it. The ``sys.path`` hint is added only when the module
+    itself, or a package above it, was not found; any other failure, a missing
+    dependency of the module included, means the module was found.
     """
     for name in _plugin_module_names(raw):
         try:
@@ -335,7 +344,7 @@ def _import_plugins(raw: Any) -> None:
             hint = (
                 " Plugin modules must be on sys.path (the launch directory is not): add "
                 "their directory to PYTHONPATH, or install them."
-                if isinstance(e, ImportError)
+                if _plugin_not_found(e, name)
                 else ""
             )
             raise ValueError(
