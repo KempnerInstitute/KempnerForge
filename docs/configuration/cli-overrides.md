@@ -108,7 +108,10 @@ registers its names before the overrides apply, so
 that is neither a member nor registered raises a `ValueError` that
 lists both. The other enums (`train.activation_checkpointing`,
 `distributed.pp_schedule`, `checkpoint.async_mode`) accept only their
-members.
+members. `model.activation` also rejects core's own `mlp` keys
+(`swiglu`, `standard_gelu`, `standard_relu`) in favor of `silu`, `gelu`
+and `relu`, and rejects a plugin's MLP when `num_experts > 0`, since MoE
+experts compute core's MLPs from their weights.
 
 ## Unknown keys
 
