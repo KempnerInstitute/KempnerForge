@@ -124,6 +124,12 @@ ValueError: Unknown config keys in ModelConfig: ['dimm'].
 Valid keys: ['activation', 'dim', ...]
 ```
 
+`--vlm.arch` is the one field an override cannot always change. Each
+arch has its own `[vlm]` config class, picked when the TOML's `[vlm]`
+section is built, and an override keeps that class; so when the TOML
+has a `[vlm]` section, `--vlm.arch` naming another arch is rejected with
+a `ValueError` that says to set `arch` in the TOML instead.
+
 ## Inspecting the final config
 
 Print the resolved config before the training loop begins by adding
