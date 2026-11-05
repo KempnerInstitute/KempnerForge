@@ -23,7 +23,7 @@ You will see one metrics line every 5 steps (controlled by
 `metrics.log_interval`):
 
 ```
-2026-11-04 14:03:12.345 [rank 0] INFO     [step 10] loss=9.1800 | lr=3.00e-04 | grad_norm=1.340 | tok/s=42,000 | mfu=18.2% | mem=2.1/80GB | step_time=0.15s
+2026-11-04 14:03:12.345 [rank 0] INFO     [step 10] loss=9.1800 | lr=3.00e-04 | grad_norm=1.340 | tok/s=13,653 | mfu=0.1% | mem=2.1/80GB | step_time=0.15s
 ```
 
 Like every line the framework logs, it starts with the local time (to the
