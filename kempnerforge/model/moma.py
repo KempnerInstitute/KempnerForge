@@ -42,6 +42,7 @@ to a follow-up PR.
 from __future__ import annotations
 
 import math
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
@@ -50,6 +51,9 @@ from kempnerforge.config.schema import ModelConfig
 from kempnerforge.model.attention import Attention
 from kempnerforge.model.mlp import build_mlp
 from kempnerforge.model.norm import build_norm
+
+if TYPE_CHECKING:
+    from torch.nn.attention.flex_attention import BlockMask
 
 
 def _gumbel_like(x: torch.Tensor) -> torch.Tensor:
@@ -422,16 +426,27 @@ class MoMaBlock(nn.Module):
         rope_sin: torch.Tensor,
         modality_ids: torch.Tensor,
         *,
-        doc_ids: torch.Tensor | None = None,
+        attn_mask: torch.Tensor | BlockMask | None = None,
         key_padding_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        x = x + self.attention(
-            self.attention_norm(x),
-            rope_cos,
-            rope_sin,
-            doc_ids=doc_ids,
-            key_padding_mask=key_padding_mask,
-        )
+        """Run shared attention and the per-modality MoE FFN.
+
+        Args:
+            x: Residual stream, shape ``(batch, seq_len, dim)``.
+            rope_cos: RoPE cosine frequencies for this block's positions.
+            rope_sin: RoPE sine frequencies for this block's positions.
+            modality_ids: Per-token modality tag, shape ``(batch, seq_len)``.
+            attn_mask: The one mask from
+                ``kempnerforge.model.masking.build_attention_mask``, built once
+                per forward and shared by every block.
+            key_padding_mask: Optional ``(batch, seq_len)`` bool; ``False``
+                positions are dropped from expert-choice routing. Attention
+                takes key validity through ``attn_mask`` instead.
+
+        Returns:
+            The updated residual stream, shape ``(batch, seq_len, dim)``.
+        """
+        x = x + self.attention(self.attention_norm(x), rope_cos, rope_sin, attn_mask=attn_mask)
         x = x + self.mlp(
             self.mlp_norm(x), modality_ids=modality_ids, key_padding_mask=key_padding_mask
         )
