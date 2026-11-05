@@ -121,10 +121,11 @@ def ep_dispatch_and_compute(
         local_expert_start: First global expert index on this rank.
         num_local_experts: Number of experts on this rank.
         ep_world_size: Number of ranks in the EP group.
-        gradient_scale: Scale each local expert's output by the average expert
-            load over its own load, as ``MoEMLP._local_forward`` does. The EP ranks
-            hold the same tokens, so a local expert receives ``ep_world_size``
-            copies of its load, and the average over all experts in those units is
+        gradient_scale: When ``moe`` is in training mode, scale each local expert's
+            output by the average expert load over its own load, as
+            ``MoEMLP._local_forward`` does. The EP ranks hold the same tokens, so a
+            local expert receives ``ep_world_size`` copies of its load, and the
+            average over all experts in those units is
             ``num_tokens * top_k / num_local_experts``.
 
     Returns:
@@ -243,7 +244,7 @@ def ep_dispatch_and_compute(
                 _zero = sum(p.sum() for p in unused_expert_params) * 0
                 local_output = local_output + _zero
 
-    if gradient_scale and received_tokens.requires_grad:
+    if gradient_scale and moe.training:
         total_recv = sum(recv_counts_list)
         if total_recv > 0:
             local_ids = received_expert_ids - local_expert_start
