@@ -47,6 +47,46 @@ no checkpoint. Training auto-resumes from a checkpoint in `checkpoint.dir` in pl
 | `"exclude_norms_and_biases"` (default) | the grouping above |
 | `"all"` | every parameter goes in the decay group, as `torch.optim.AdamW` does by default |
 
+## Per-module learning rates
+
+`optimizer.lr_multipliers` gives modules of a VLM their own learning rate. Its keys are
+module names of `vlm.module_patterns` (`transformer`, `vision_encoder`, `adapter`, plus an
+arch's own, such as `cross_attention`), and each listed module trains at `optimizer.lr`
+times its multiplier:
+
+```toml
+[optimizer]
+lr = 2e-4
+
+[optimizer.lr_multipliers]
+vision_encoder = 0.03     # 6e-6
+```
+
+- Each listed module gets its own decay and no-decay groups, after the groups of the
+  parameters no listed module holds, which keep `optimizer.lr`. Groups with no parameters
+  are left out, so a module frozen when the optimizer is built gets none.
+- The one `[scheduler]` scales every group's own peak by the same factor, so every module
+  follows the same warmup and decay shape, each from its own peak (and to its own floor,
+  `min_lr_ratio` times that peak).
+- Under `muon`, a module's AdamW-fallback parameters also take the multiplier, applied to
+  `muon_adam_lr`.
+- A parameter may belong to only one listed module. Patterns that overlap, such as
+  `transformer` and `cross_attention`, fail the build: list one of them, or add a module to
+  `vlm.module_patterns` that names just the parameters you mean.
+- Each listed module's rate is logged as `train/lr/<module>` on the metrics interval, read
+  from its param groups. Under `muon` that is the rate of its orthogonalized matrices, so a
+  module with none of them is not logged. `train/lr` stays the rate of the first param
+  group, which holds parameters outside the listed modules when there are any.
+
+The multipliers decide the param groups and their rates, which the saved optimizer state
+and the scheduler state are laid out for. The training entry records non-empty multipliers
+in every checkpoint's `metadata.json`, and a load that restores optimizer state on any rank,
+or scheduler state from `train_state.pt`, stops on every rank, before loading anything,
+when the checkpoint was saved with other multipliers. A checkpoint that records none was
+saved without any. Code that builds its own `CheckpointManager` gets the same record and
+check by passing `lr_multipliers`, and calls
+`build_optimizer(model, config, module_patterns=...)` to resolve the module names.
+
 ## `adamw`
 
 ```toml

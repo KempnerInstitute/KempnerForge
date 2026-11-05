@@ -5,7 +5,10 @@ Six schedulers are registered in
 `cosine`, `linear`, `wsd`, `constant`, `rex`, `none`. All return a
 `torch.optim.lr_scheduler.LambdaLR` — a single callable that multiplies
 the optimizer's base LR by a schedule-dependent factor at each
-`scheduler.step()`.
+`scheduler.step()`. The factor applies to each param group's own base LR,
+so the modules that
+[`optimizer.lr_multipliers`](optimizers.md#per-module-learning-rates) gives
+their own peak share one shape.
 
 ## Shared warmup
 

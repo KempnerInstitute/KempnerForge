@@ -790,7 +790,7 @@ def _stub_entry(monkeypatch, model: nn.Module) -> FakeCheckpointManager:
     monkeypatch.setattr(entry, "ShutdownHandler", lambda **_kw: FakeShutdownHandler())
     monkeypatch.setattr(entry, "build_model", lambda *_a, **_k: (model, None))
     monkeypatch.setattr(
-        entry, "build_optimizer", lambda m, _c: torch.optim.SGD(m.parameters(), lr=0.05)
+        entry, "build_optimizer", lambda m, _c, **_k: torch.optim.SGD(m.parameters(), lr=0.05)
     )
     monkeypatch.setattr(
         entry,
@@ -988,6 +988,28 @@ class TestRunTraining:
         tokens = 2 * config.train.batch_size * config.train.seq_len
         assert hook.ends == [(2, tokens)]
 
+    @pytest.mark.parametrize("vlm", [False, True], ids=["text", "vlm"])
+    def test_the_optimizer_gets_the_vlm_module_patterns(self, monkeypatch, vlm):
+        import kempnerforge.training.entry as entry
+
+        class _Built(Exception):
+            pass
+
+        seen: dict = {}
+
+        def build_optimizer(_model, _config, module_patterns=None):
+            seen["module_patterns"] = module_patterns
+            raise _Built
+
+        _stub_entry(monkeypatch, TinyTextModel())
+        monkeypatch.setattr(entry, "build_optimizer", build_optimizer)
+        config = _vlm_config() if vlm else make_config()
+        with pytest.raises(_Built):
+            entry.run_training(config)
+        expected = config.vlm.module_patterns if config.vlm is not None else None
+        assert seen["module_patterns"] == expected
+        assert (expected is not None) is vlm
+
 
 class TestBuildPhaseHelpers:
     def test_checkpoint_manager_has_no_pp_scoping_without_pipeline(self, tmp_path):
@@ -1014,6 +1036,19 @@ class TestBuildPhaseHelpers:
         ).save(step=0)
         meta = json.loads((tmp_path / "ckpt" / "step_0" / "metadata.json").read_text())
         assert meta["weight_decay_scope"] == "all"
+
+    def test_checkpoint_manager_records_the_lr_multipliers(self, tmp_path):
+        from kempnerforge.training.entry import build_checkpoint_manager
+
+        config = _vlm_config()
+        config.checkpoint.dir = str(tmp_path / "ckpt")
+        config.optimizer.lr_multipliers = {"adapter": 2.0}
+        model = TinyTextModel()
+        build_checkpoint_manager(
+            config, _runtime(), model, torch.optim.SGD(model.parameters(), lr=0.1), None
+        ).save(step=0)
+        meta = json.loads((tmp_path / "ckpt" / "step_0" / "metadata.json").read_text())
+        assert meta["lr_multipliers"] == {"adapter": 2.0}
 
     def test_restore_checkpoint_starts_from_scratch(self, tmp_path):
         from kempnerforge.training.entry import build_checkpoint_manager, restore_checkpoint
@@ -2306,6 +2341,42 @@ class TestMoEMetrics:
         logged = self._run_one_step(TinyMoEModel(counts={}), _moe_config(max_steps=1))
         moe = [m for m, _ in logged if "moe/aux_loss" in m][0]
         assert "moe/expert_balance" not in moe
+
+
+class TestModuleLearningRateMetrics:
+    """Each module of ``optimizer.lr_multipliers`` logs its rate as ``train/lr/<module>``."""
+
+    @staticmethod
+    def _session(**multipliers):
+        from kempnerforge.config.optimizer import OptimizerConfig
+        from kempnerforge.training.optimizer import build_optimizer
+
+        model = TinyTextModel()
+        config = OptimizerConfig(lr=0.05, fused=False, lr_multipliers=multipliers)
+        optimizer = build_optimizer(model, config, module_patterns={"out": ["out.*"]})
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda s: 1.0 / (s + 1))
+        session = make_session(
+            make_config(max_steps=2), model=model, optimizer=optimizer, scheduler=scheduler
+        )
+        logged: list = []
+        session.tracker.log_eval = lambda m, s: logged.append((m, s))  # type: ignore[method-assign]
+        return session, logged
+
+    def test_the_loop_logs_each_module_rate_after_the_schedule_steps(self):
+        session, logged = self._session(out=2.0)
+        session.tracker.metrics_config.log_interval = 1
+        run_training_loop(session)
+        rates = [(m, s) for m, s in logged if any(k.startswith("train/lr/") for k in m)]
+        assert rates == [
+            ({"train/lr/out": pytest.approx(0.1 / 2)}, 1),
+            ({"train/lr/out": pytest.approx(0.1 / 3)}, 2),
+        ]
+
+    def test_no_module_logs_no_rate(self):
+        session, logged = self._session()
+        session.tracker.metrics_config.log_interval = 1
+        run_training_loop(session)
+        assert logged == []
 
 
 class TestPerDatasetMetrics:

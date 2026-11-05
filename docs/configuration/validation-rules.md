@@ -80,6 +80,10 @@ File:
 - `muon_adjust_lr ∈ {"original", "match_rms_adamw", "spectral_unclamped"}`.
 - `muon_orthogonalize ∈ {"local", "exact"}`.
 - `schedule_free_warmup_steps ≥ 0`.
+- `lr_multipliers` maps non-empty module names to finite numbers `> 0`. A non-empty one
+  needs a `[vlm]` section whose `module_patterns` names every listed module; this is
+  checked when `JobConfig` is built. When the optimizer is built, a listed module that
+  matches no parameter, and a parameter in two listed modules, raise `ValueError`.
 
 ### `SchedulerConfig`
 

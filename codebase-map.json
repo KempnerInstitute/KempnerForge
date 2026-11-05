@@ -89,7 +89,7 @@
     "kempnerforge/config/optimizer.py": {
       "classes": {
         "OptimizerConfig": {
-          "purpose": "Optimizer settings (name, lr, betas, weight_decay, muon params, schedule_free_warmup_steps)"
+          "purpose": "Optimizer settings (name, lr, betas, weight_decay, muon params, schedule_free_warmup_steps, weight_decay_scope, lr_multipliers per vlm.module_patterns module)"
         }
       }
     },
@@ -730,7 +730,9 @@
         }
       },
       "functions": [
-        "build_optimizer(model, config) -> Optimizer",
+        "build_optimizer(model, config, module_patterns=None) -> Optimizer",
+        "module_learning_rates(optimizer) -> dict[str, float]",
+        "_split_by_module(model, param_groups, config, module_patterns) -> list[dict]",
         "_newton_schulz(G, steps) -> Tensor",
         "_is_muon_eligible(param) -> bool",
         "_should_decay(name, param, scope) -> bool"
@@ -743,6 +745,8 @@
       ],
       "tested_by": [
         "tests/unit/test_training.py::TestBuildOptimizer",
+        "tests/unit/test_lr_multipliers.py::TestGroups",
+        "tests/unit/test_lr_multipliers.py::TestMuonFallback",
         "tests/unit/test_optimizer.py::TestNewtonSchulz",
         "tests/unit/test_optimizer.py::TestMuon",
         "tests/unit/test_optimizer.py::TestAdamW",
@@ -1192,6 +1196,7 @@
             "load(path, scheduler, dataloader, exclude_keys, vlm_freeze_expected)",
             "_read_saved_keys(ckpt_dir, dcp_dir) (this rank's DCP keys; checks the scope only when an all-reduce on the gloo group finds optimizer state on some rank)",
             "_check_weight_decay_scope(ckpt_dir) (rank 0 reads the saved scope and broadcasts it; every rank refuses a mismatch)",
+            "_check_lr_multipliers(ckpt_dir, only_with_train_state) (rank 0 reads the saved lr_multipliers and broadcasts them; every rank refuses a mismatch when optimizer or scheduler state would load)",
             "apply_dataloader_state(dataloader)",
             "_resolve_load_path(path)",
             "_cleanup()"
@@ -1201,10 +1206,12 @@
       "functions": [
         "_load_train_state(path) -> dict (ownership-gated torch.load with weights_only=False)",
         "_intersect_freeze_meta_by_module(saved, expected) -> (saved_filt, expected_filt) (cross-arch drop-zero-match rule)",
-        "_read_weight_decay_scope(ckpt_dir) -> str (scope recorded in metadata.json; none recorded means exclude_norms_and_biases)"
+        "_read_weight_decay_scope(ckpt_dir) -> str (scope recorded in metadata.json; none recorded means exclude_norms_and_biases)",
+        "_read_lr_multipliers(ckpt_dir) -> dict[str, float] (lr_multipliers recorded in metadata.json; none recorded means {})"
       ],
       "tested_by": [
         "tests/unit/test_checkpoint.py::TestWeightDecayScopeOnResume",
+        "tests/unit/test_lr_multipliers.py::TestResume",
         "tests/unit/test_checkpoint.py::TestCheckpointRetention",
         "tests/unit/test_checkpoint.py::TestFlushPendingSave",
         "tests/unit/test_checkpoint.py::TestPeekSavedStep",
