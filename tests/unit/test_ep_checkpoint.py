@@ -443,7 +443,7 @@ class TestCheckpointHoldsEveryExpert:
     def test_every_expert_is_saved_once(self, saved_layout, layout, tmp_path):
         """The index holds every expert of every layer, each equal to its rank's weights.
 
-        AdamW's moments are checked with the weights, so a resume restores each rank's
+        AdamW's moments are checked with the weights, so the checkpoint holds each rank's
         optimizer state as well.
         """
         root = saved_layout(layout)
