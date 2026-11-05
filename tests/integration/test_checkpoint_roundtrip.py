@@ -45,7 +45,9 @@ class TestCheckpointRoundtrip:
     def test_optimizer_state_roundtrip(self, tmp_path):
         """An AdamW state dict reloaded through ``torch.save`` keeps each parameter's state.
 
-        Its ``step``, ``exp_avg`` and ``exp_avg_sq`` must come back bit for bit.
+        Its ``step``, ``exp_avg`` and ``exp_avg_sq`` must come back bit for bit. They are
+        compared on the CPU: AdamW keeps ``step`` there unless it is fused or capturable,
+        while the reloaded ``step`` lands on ``DEVICE``.
         """
         model = Transformer(CONFIG).to(DEVICE)
         opt = build_optimizer(model, OptimizerConfig(lr=1e-3, fused=False))
@@ -75,7 +77,7 @@ class TestCheckpointRoundtrip:
             saved, loaded = opt.state[p1], opt2.state[p2]
             for key in ("step", "exp_avg", "exp_avg_sq"):
                 assert key in loaded, f"{key} of {name} was not loaded"
-                assert torch.equal(saved[key], loaded[key]), f"{key} of {name} differs"
+                assert torch.equal(saved[key].cpu(), loaded[key].cpu()), f"{key} of {name} differs"
 
     def test_train_state_roundtrip(self):
         """build_train_state → restore_train_state round-trip."""
