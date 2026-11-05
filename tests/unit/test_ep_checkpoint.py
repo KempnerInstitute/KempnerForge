@@ -190,7 +190,10 @@ def _mismatches(got: dict[str, torch.Tensor], expected: dict[str, torch.Tensor])
 
 
 def _save(rank, world, port, names, sizes, overrides, root, async_mode) -> None:
-    """Train one step and save; rank 0 writes the reference."""
+    """Train one step and save; then load into a model built from another seed, at the same layout.
+
+    Rank 0 writes the reference and what the load gave.
+    """
     _init(rank, world, port)
     try:
         mesh = init_device_mesh("cpu", sizes, mesh_dim_names=names)
@@ -204,6 +207,11 @@ def _save(rank, world, port, names, sizes, overrides, root, async_mode) -> None:
         manager.wait()
         if rank == 0:
             torch.save(reference, Path(root) / "reference.pt")
+        resumed, resumed_optimizer = _build(mesh, config, seed=1)
+        CheckpointManager(ckpt, resumed, resumed_optimizer).load()
+        loaded = _gathered(resumed, resumed_optimizer, mesh)
+        if rank == 0:
+            torch.save(loaded, Path(root) / "resumed.pt")
     finally:
         dist.destroy_process_group()
 
@@ -234,7 +242,7 @@ def _held_experts(step_dir: Path, config: ModelConfig) -> dict[str, list[int]]:
 
 @pytest.fixture(scope="module")
 def saved_layout(tmp_path_factory):
-    """Save each layout once; the tests read what it saved."""
+    """Save each layout once, with its same-layout load; the tests read the files."""
     roots: dict[tuple[str, str], Path] = {}
 
     def run(layout: str, async_mode: str = "disabled") -> Path:
@@ -277,3 +285,12 @@ class TestCheckpointHoldsEveryExpert:
         reference = torch.load(root / "reference.pt")
         saved = _saved(_step_dir(root), tmp_path)
         assert _mismatches({k: saved[k] for k in reference if k in saved}, reference) == []
+
+
+class TestResumeAtTheSameLayout:
+    @pytest.mark.parametrize("layout", list(LAYOUTS))
+    def test_each_rank_resumes_its_own_experts(self, saved_layout, layout):
+        """A model built from another seed holds every rank's saved weights and moments."""
+        root = saved_layout(layout)
+        reference = torch.load(root / "reference.pt")
+        assert _mismatches(torch.load(root / "resumed.pt"), reference) == []
