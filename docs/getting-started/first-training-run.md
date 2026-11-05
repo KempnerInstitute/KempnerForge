@@ -37,7 +37,7 @@ millisecond), the rank that wrote it and the log level. The metrics follow:
 | `grad_norm` | L2 norm of gradients before clipping (returned by `clip_grad_norm_`). Clipping to `train.grad_clip_norm` (default 1.0) is applied in-place before the optimizer step. |
 | `tok/s` | Tokens per second throughput, this step. |
 | `mfu` | Model FLOPs Utilization — achieved FLOPs / theoretical peak for the GPU. |
-| `mem` | Peak GPU memory this step / total GPU memory. |
+| `mem` | Peak GPU memory / total GPU memory, on rank 0's GPU. The peak is the most allocated at any point since the process started, not in this step: a high-water mark that never goes down (see [Memory monitor](../metrics-and-profiling/memory-monitor.md#why-metricstracker-doesnt-reset-peak)). |
 | `step_time` | Wall-clock time spent on this step, in seconds. |
 
 Synthetic data means loss starts near `log(vocab_size) ≈ 10.4` and falls
