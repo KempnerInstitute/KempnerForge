@@ -52,13 +52,15 @@ def freeze_params(
     Only parameters whose current state differs from the target are flipped,
     so calling this twice with the same arguments is idempotent. Returns the
     number of elements (``param.numel()`` summed) that were actually flipped.
+    A model compiled with ``torch.compile`` is matched through the module it
+    wraps, whose parameter names carry no ``_orig_mod`` prefix.
     """
     pats = list(patterns)
     if not pats:
         return 0
     target_requires_grad = not frozen
     n = 0
-    for name, param in model.named_parameters():
+    for name, param in getattr(model, "_orig_mod", model).named_parameters():
         if (
             any(fnmatch.fnmatch(name, pat) for pat in pats)
             and param.requires_grad != target_requires_grad

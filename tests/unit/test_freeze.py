@@ -296,6 +296,14 @@ class TestTrainableDuringRun:
         assert all(p.requires_grad for p in model.parameters())
 
 
+def test_apply_freeze_specs_reaches_the_module_a_compiled_model_wraps(model):
+    compiled = torch.compile(model, backend="eager")
+    flipped = apply_freeze_specs(compiled, [FreezeSpec("vision_encoder")], DEFAULT_MODULE_PATTERNS)
+    assert flipped == {"vision_encoder": 72}
+    frozen = {name for name, p in model.named_parameters() if not p.requires_grad}
+    assert frozen == _ENCODER
+
+
 class _Compiled(nn.Module):
     """Wraps a module under ``_orig_mod``, as ``torch.compile`` does."""
 
