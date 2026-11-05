@@ -425,7 +425,7 @@ class TestCheckpointConfig:
             ["optimizer", "train_state"],
         ],
     )
-    def test_exclude_from_loading_accepts_the_two_state_keys(self, keys):
+    def test_exclude_from_loading_accepts_the_state_keys(self, keys):
         assert CheckpointConfig(exclude_from_loading=keys).exclude_from_loading == keys
 
     @pytest.mark.parametrize(
