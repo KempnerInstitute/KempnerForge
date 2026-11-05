@@ -59,7 +59,7 @@ Architecture hyperparameters and MoE knobs.
 | `ffn_hidden_dim` | `int \| None` | `None` | hard-override the computed FFN width |
 | `norm_type` | `"rmsnorm" \| "layernorm"` or a registered `norm` name | `"rmsnorm"` | registry key for norm builder |
 | `norm_eps` | `float` | `1e-5` | norm epsilon |
-| `activation` | `"silu" \| "gelu" \| "relu"` or a registered `mlp` name | `"silu"` | MLP activation (`silu` → SwiGLU); an `mlp` name selects that builder |
+| `activation` | `"silu" \| "gelu" \| "relu"` or a plugin's registered `mlp` name | `"silu"` | MLP activation (`silu` → SwiGLU); a plugin's `mlp` name selects that builder, but not with `num_experts > 0`; core's `swiglu`, `standard_gelu` and `standard_relu` are rejected in favor of `silu`, `gelu` and `relu` |
 | `max_seq_len` | `int` | `2048` | RoPE table length; `train.seq_len` must be ≤ this |
 | `rope_theta` | `float` | `10000.0` | RoPE frequency base |
 | `tie_embeddings` | `bool` | `False` | share embedding and output-head weight |
