@@ -203,24 +203,15 @@ def _resolve_vlm_subclass(data: dict[str, Any]) -> type:
     """Resolve a TOML ``[vlm]`` table to the right ``VLMConfig`` subclass
     via the registered-arch lookup.
 
-    Mirrors ``VLMConfig.for_arch`` error semantics so error type is
-    independent of construction site (loader vs programmatic).
+    An unregistered arch raises the same ``ValueError`` as
+    ``VLMConfig.for_arch``, whichever site constructs the config.
     """
-    from kempnerforge.config.vlm import _RESERVED_ARCHS  # noqa: PLC0415
-
     arch = data.get("arch", "joint_decoder")
-    if arch in _RESERVED_ARCHS:
-        raise NotImplementedError(
-            f"vlm.arch={arch!r} is reserved; not yet implemented. "
-            f"Reserved: {sorted(_RESERVED_ARCHS)}."
-        )
     try:
         return registry.get_vlm_config(arch)
     except KeyError as e:
         raise ValueError(
-            f"Unknown vlm.arch: {arch!r}. "
-            f"Registered: {sorted(registry.list_vlm_configs())}. "
-            f"Reserved (not yet implemented): {sorted(_RESERVED_ARCHS)}."
+            f"Unknown vlm.arch: {arch!r}. Registered: {sorted(registry.list_vlm_configs())}."
         ) from e
 
 
