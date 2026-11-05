@@ -104,12 +104,9 @@ def ep_dispatch_and_compute(
 ) -> torch.Tensor:
     """All-to-all dispatch, local expert compute, all-to-all combine.
 
-    The local experts receive the tokens of every rank in the EP group, so their
-    weight gradients sum the gradients of ``ep_world_size`` ranks' losses, while
-    FSDP2 averages over the DP mesh alone. The gradient entering the local expert
-    compute is divided by ``ep_world_size`` and the gradient it passes back to the
-    tokens is multiplied by it: the routed-expert gradients become the mean over the
-    EP group, as if the experts were not split, and every other gradient is unchanged.
+    In the backward pass the local experts get the mean of the EP ranks' gradients,
+    one process's when the ranks hold the same batch, and ``x`` and ``weights`` get
+    the same gradients as without EP.
 
     Args:
         x: (num_tokens, dim) flattened token representations.
@@ -123,10 +120,7 @@ def ep_dispatch_and_compute(
         ep_world_size: Number of ranks in the EP group.
         gradient_scale: When ``moe`` is in training mode, scale each local expert's
             output by the average expert load over its own load, as
-            ``MoEMLP._local_forward`` does. The EP ranks hold the same tokens, so a
-            local expert receives ``ep_world_size`` copies of its load, and the
-            average over all experts in those units is
-            ``num_tokens * top_k / num_local_experts``.
+            ``MoEMLP._local_forward`` does.
 
     Returns:
         output: (num_tokens, dim) weighted combination of expert outputs.
