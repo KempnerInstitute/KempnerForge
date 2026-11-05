@@ -323,6 +323,48 @@ def _save_misplaced(rank, world, port, names, sizes, overrides, root) -> None:
         dist.destroy_process_group()
 
 
+def _fail_on_rank_one(rank, world, port, names, sizes, overrides, root) -> None:
+    """Fail only rank 1's part of a save, then of a load, before DCP runs.
+
+    Rank 1 raises its own error. Every other rank raises too, naming the operation and
+    rank 1, rather than wait in DCP's collectives for a rank that has left.
+    """
+    _init(rank, world, port)
+    try:
+        mesh = init_device_mesh("cpu", sizes, mesh_dim_names=names)
+        model, optimizer = _build(mesh, _config(overrides), seed=0)
+        _train(model, optimizer, mesh)
+        manager = CheckpointManager(
+            CheckpointConfig(dir=str(Path(root) / "ckpt")), model, optimizer
+        )
+
+        def fail(*args, **kwargs):
+            raise ValueError("rank 1 alone fails")
+
+        for what, target, attribute in (
+            ("save", expert_layout_module.ExpertLayout, "to_global"),
+            ("load", manager_module, "check_saved_experts"),
+        ):
+            original = getattr(target, attribute)
+            if rank == 1:
+                setattr(target, attribute, fail)
+                expected = pytest.raises(ValueError, match="rank 1 alone fails")
+            else:
+                expected = pytest.raises(
+                    RuntimeError, match=rf"Checkpoint {what} failed on ranks \[1\]"
+                )
+            with expected:
+                if what == "save":
+                    manager.save(STEP)
+                else:
+                    manager.load(path=str(_step_dir(Path(root))))
+            setattr(target, attribute, original)
+            if what == "save":
+                manager.save(STEP)
+    finally:
+        dist.destroy_process_group()
+
+
 def _refuse(rank, world, port, names, sizes, overrides, step_dir) -> None:
     """Every rank refuses to load ``step_dir`` at this layout, naming what it holds."""
     _init(rank, world, port)
@@ -453,6 +495,13 @@ class TestPlacementCheck:
         names, sizes, overrides = LAYOUTS["dp_shard2_ep2_packed"]
         _spawn(_save_misplaced, names, sizes, overrides, str(tmp_path))
         assert not (_step_dir(tmp_path) / ".metadata").exists()
+
+
+class TestFailureOnOneRank:
+    def test_every_rank_raises_and_names_the_operation(self, tmp_path):
+        """One rank's failure before DCP raises on every rank, in a save and in a load."""
+        names, sizes, overrides = LAYOUTS["ep2_packed"]
+        _spawn(_fail_on_rank_one, names, sizes, overrides, str(tmp_path))
 
 
 class TestResumeAtTheSameLayout:
