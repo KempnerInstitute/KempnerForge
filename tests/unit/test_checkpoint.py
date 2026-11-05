@@ -1215,6 +1215,7 @@ class TestSaveCheckpointRegistration:
         mgr.save(step=2, tokens_seen=16)
         assert (tmp_path / "latest").resolve() == (tmp_path / "step_2").resolve()
         assert pruned_dirs == [tmp_path / "step_1"]
+        assert pruned_dirs.still_present() == []
         assert self._sidecar(tmp_path, 2)["tracking"] == [self.MLFLOW]
         assert len(warnings) == 2 and "step_2" in warnings[1] and "no server" in warnings[1]
 
@@ -1849,6 +1850,7 @@ class TestAsyncLatestSymlinkSafety:
         assert dirs[3].exists(), "cleanup deleted the live `latest` target"
         assert dirs[5].exists(), "cleanup deleted the in-flight pending checkpoint"
         assert pruned_dirs == [dirs[1], dirs[2], dirs[4]]
+        assert pruned_dirs.still_present() == []
 
     @staticmethod
     def _record_agreements(monkeypatch) -> list[object]:
