@@ -256,6 +256,9 @@ def apply_expert_parallel(model: torch.nn.Module, device_mesh: DeviceMesh | None
       - Prunes ``experts`` to the local subset for this EP rank
       - Stores EP metadata (group, mesh, world_size, local expert range)
 
+    The EP mesh lets a checkpoint place each rank's experts among all of them
+    (see ``kempnerforge.checkpoint.expert_layout``).
+
     Must be called AFTER tensor parallelism and BEFORE FSDP2.
 
     No-op when ``ep`` is not in the mesh or has size 1.

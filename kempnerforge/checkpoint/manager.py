@@ -35,6 +35,7 @@ from torch.distributed.checkpoint.state_dict import (
 )
 
 from kempnerforge.checkpoint.async_save import AsyncCheckpointer
+from kempnerforge.checkpoint.expert_layout import ExpertLayout, expert_layout
 from kempnerforge.checkpoint.state import build_train_state, restore_train_state
 from kempnerforge.config.optimizer import WEIGHT_DECAY_SCOPES
 from kempnerforge.config.schema import AsyncCheckpointMode, CheckpointConfig
@@ -534,6 +535,23 @@ class CheckpointManager:
         if failed:
             raise RuntimeError(f"Checkpoint save failed on ranks {failed}")
 
+    def _present_experts(
+        self, dcp_state: dict[str, Any]
+    ) -> tuple[dict[str, Any], ExpertLayout | None]:
+        """``dcp_state`` as the checkpoint holds it, and the layout that translated it.
+
+        Under expert parallelism each rank's experts are placed among all of them (see
+        ``ExpertLayout``); otherwise ``dcp_state`` comes back with ``None``. Every rank
+        must call this: they agree on the outcome before DCP's collectives, so a rank that
+        fails raises on every rank.
+        """
+        layout = expert_layout(self.model)
+        if layout is None:
+            return dcp_state, None
+        presented: list[dict[str, Any]] = []
+        self._agree(_attempt(lambda: presented.append(layout.to_global(dcp_state))))
+        return presented[0], layout
+
     def set_tracking_source(self, source: TrackingSource | None) -> None:
         """Record the logging runs ``source`` reports in every later ``metadata.json``.
 
@@ -689,6 +707,7 @@ class CheckpointManager:
             optim_state = get_optimizer_state_dict(self.model, self.checkpointed_optimizers)
             dcp_state["optimizer"] = optim_state
             dcp_state[_NEVER_STEPPED_KEY] = _never_stepped_record(optim_state)
+        dcp_state, _ = self._present_experts(dcp_state)
         flush_error = _attempt(self._async_ckpt.wait)
         error = flush_error
         if flush_error is None:
@@ -911,6 +930,7 @@ class CheckpointManager:
                 )
 
         if dcp_state:
+            dcp_state, layout = self._present_experts(dcp_state)
             planner = _NeverSteppedStatePlanner()
             dcp.load(
                 dcp_state,
@@ -922,6 +942,8 @@ class CheckpointManager:
             if load_optim:
                 optim_state = cast("dict[str, Any]", dcp_state["optimizer"])
                 _restore_never_stepped(optim_state, planner.never_stepped, dcp_dir)
+            if layout is not None:
+                dcp_state = layout.to_local(dcp_state)
             if load_model:
                 set_model_state_dict(self.model, dcp_state["model"])
             if load_optim:
