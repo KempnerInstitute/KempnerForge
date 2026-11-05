@@ -823,6 +823,44 @@ def test_moe_ep_resume_matches_uninterrupted(tmp_path, packed):
     _assert_losses_close(straight.stdout + straight.stderr, output, range(21, 41))
 
 
+@pytest.mark.e2e
+@requires_gpus(4)
+@pytest.mark.parametrize(("ep", "nproc"), [(1, 1), (4, 4)], ids=["ep1", "ep4"])
+def test_moe_ep_checkpoint_resumes_at_another_ep(tmp_path, ep, nproc):
+    """An ep=2 checkpoint resumes at another ``ep`` with every expert's weights.
+
+    Every run has one DP rank, so each reads the same batches. The first step after the
+    resume runs the saved weights on the batch the ep=2 run took, so its loss matches.
+    """
+    common = _ep_moe_args(tmp_path, "--train.max_steps=21")
+    straight = _run_training(
+        common
+        + [
+            "--distributed.ep=2",
+            f"--checkpoint.dir={tmp_path}/straight",
+            "--checkpoint.interval=20",
+        ],
+        nproc=2,
+        timeout=300,
+    )
+    _assert_training_complete(straight, expected_steps=21)
+    resumed = _run_training(
+        common
+        + [
+            f"--distributed.ep={ep}",
+            f"--checkpoint.dir={tmp_path}/resumed",
+            "--checkpoint.interval=1000",
+            f"--checkpoint.load_path={tmp_path}/straight/step_20",
+        ],
+        nproc=nproc,
+        timeout=300,
+    )
+    _assert_training_complete(resumed, expected_steps=21)
+    output = resumed.stdout + resumed.stderr
+    assert "step=20" in output, "did not resume from step 20"
+    _assert_losses_close(straight.stdout + straight.stderr, output, range(21, 22))
+
+
 _SIGMOID_MOE_OVERRIDES = [
     "--model.moe_router=sigmoid_topk",
     "--model.moe_sequence_aux_loss_weight=0.01",
