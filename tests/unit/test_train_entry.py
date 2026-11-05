@@ -1503,6 +1503,32 @@ class TestBuildModel:
         assert stage.inited is True
         assert stage.emptied_to is not None
 
+    @pytest.mark.parametrize(
+        ("fp32_master_weights", "dtype"), [(False, torch.bfloat16), (True, torch.float32)]
+    )
+    def test_parameters_are_stored_in_the_master_dtype(
+        self, fp32_master_weights: bool, dtype: torch.dtype
+    ) -> None:
+        import kempnerforge.training.entry as entry
+
+        config = make_config(fp32_master_weights=fp32_master_weights)
+        model, _ = entry.build_model(config, _runtime(), lambda a, b: a)
+        assert {p.dtype for p in model.parameters()} == {dtype}
+
+    @pytest.mark.parametrize("dims", [("pp", "dp_shard"), ("pp", "tp")])
+    @pytest.mark.parametrize(
+        ("fp32_master_weights", "dtype"), [(False, torch.bfloat16), (True, torch.float32)]
+    )
+    def test_pp_stage_is_stored_in_the_master_dtype(
+        self, monkeypatch, dims: tuple[str, str], fp32_master_weights: bool, dtype: torch.dtype
+    ) -> None:
+        stage, calls = FakeStageModule(), {}
+        entry = _stub_pp(monkeypatch, stage, calls)
+        config = make_config(fp32_master_weights=fp32_master_weights)
+        config.distributed.pp = 2
+        entry.build_model(config, _pp_runtime(FakeMesh(dims)), "LOSS")
+        assert {p.dtype for p in stage.parameters()} == {dtype}
+
     def test_pp_without_a_mesh_raises_rather_than_asserting(self, monkeypatch):
         stage, calls = FakeStageModule(), {}
         entry = _stub_pp(monkeypatch, stage, calls)

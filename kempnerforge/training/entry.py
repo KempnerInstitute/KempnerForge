@@ -269,7 +269,9 @@ def run_training(
 
     ``step_fn`` and ``hooks`` let an experiment own the step body or register
     hooks without copying the build phases. Both default to what
-    ``scripts/train.py`` uses.
+    ``scripts/train.py`` uses. A custom ``step_fn`` must run its forward and
+    loss under ``session.autocast()``, which casts fp32 master weights to the
+    compute dtype when no FSDP2 wrap does (one GPU, a pp-only mesh).
     """
     runtime = setup_distributed(config)
     tracker: MetricsTracker | None = None

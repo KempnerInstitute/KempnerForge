@@ -2,8 +2,8 @@
 
 FP8 training converts `nn.Linear` modules to `torchao.float8.Float8Linear`,
 which runs E4M3 forward / E5M2 backward matmuls with dynamic
-tensorwise scaling. Master weights stay in bf16 — FP8 is a compute
-mode, not a storage dtype.
+tensorwise scaling. FP8 is a compute mode, not a storage dtype: master
+weights stay in bf16, or fp32 with `train.fp32_master_weights = true`.
 
 Entry point:
 [`apply_float8(model, enable_fsdp_float8_all_gather=True)`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/distributed/parallel.py)
@@ -135,7 +135,7 @@ tensor (torchao handles the interop).
 _DTYPE_MAP = {
     "bf16": torch.bfloat16,
     "fp32": torch.float32,
-    "fp8":  torch.bfloat16,  # FP8 compute with bf16 master weights
+    "fp8":  torch.bfloat16,  # FP8 compute; bf16 masters unless fp32_master_weights
 }
 ```
 
@@ -143,7 +143,8 @@ _DTYPE_MAP = {
 
 ```toml
 [train]
-mixed_precision = "fp8"           # bf16 master weights, E4M3/E5M2 matmul
+mixed_precision = "fp8"           # E4M3/E5M2 matmul, bf16 master weights
+fp32_master_weights = false      # true keeps the master weights in fp32
 ```
 
 That's the entire surface. The recipe is always `TENSORWISE`
@@ -171,7 +172,7 @@ tp = 1
 
 With 16× H200 and TP off, `enable_fsdp_float8_all_gather=True` is the
 full FP8 path — FSDP2 all-gathers ride FP8, matmuls run on Hopper
-tensor cores, master weights stay bf16. Benchmark in
+tensor cores, master weights stay bf16 (fp32 with `fp32_master_weights`). Benchmark in
 [Benchmarks § MFU scaling](../reference/benchmarks.md#mfu-scaling-dense).
 
 ## Accuracy notes

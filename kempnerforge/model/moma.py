@@ -233,7 +233,7 @@ class ExpertChoiceMoE(nn.Module):
             x_e = x.index_select(0, token_idx)
             out_e = self.experts[e](x_e)
             weighted = token_scores.unsqueeze(-1) * out_e
-            out = out.index_add(0, token_idx, weighted)
+            out = out.index_add(0, token_idx, weighted.to(out.dtype))
         return out
 
 
