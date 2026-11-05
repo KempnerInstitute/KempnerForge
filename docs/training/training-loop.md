@@ -74,7 +74,7 @@ After the step body (either branch):
 
 ```python
 grad_norm = clip_grad_norm_(model, tc.grad_clip_norm)
-if not nan_detector.check_loss(avg_loss, step):
+if not nan_detector.check_loss(avg_loss, step, grad_norm=grad_norm):
     optimizer.zero_grad()
     if nan_detector.should_rollback:
         break
@@ -90,10 +90,13 @@ the stages and every stage scales by the same coefficient (see
 Under EP it reads the EP group from the model, so the norm covers every
 rank's experts (see
 [Gradient utilities § Under expert parallelism](gradient-utilities.md#under-expert-parallelism)).
-`NaNDetector.check_loss` returns `False` on NaN / Inf, zeroes grads,
-and escalates to `should_rollback` after
-`nan_consecutive_max` bad steps (see
-[Resilience](../resilience/index.md)).
+`NaNDetector.check_loss` returns `False` when the loss or the gradient norm is
+NaN / Inf on any rank; the loop then zeroes the gradients and skips the step,
+and the detector escalates to `should_rollback` after `max_consecutive` bad
+steps (see [Resilience](../resilience/index.md)).
+The gradient norm is checked because a finite loss can come with
+non-finite gradients: a micro-batch whose labels are all `-100` has an exact
+zero cross-entropy loss whatever its activations.
 
 ## Optimizer and scheduler step
 
