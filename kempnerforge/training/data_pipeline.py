@@ -402,7 +402,12 @@ def build_eval_dataloader(config: JobConfig, runtime: RuntimeContext) -> Any | N
         shuffle=False,
         seed=tc.seed,
     )
-    return TorchDataLoader(eval_dataset, batch_size=tc.batch_size, sampler=eval_sampler)
+    return TorchDataLoader(
+        eval_dataset,
+        batch_size=tc.batch_size,
+        sampler=eval_sampler,
+        drop_last=config.distributed.pp > 1,
+    )
 
 
 class _EvalTensorDataset(torch.utils.data.Dataset):

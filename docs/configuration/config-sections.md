@@ -218,7 +218,7 @@ In-loop evaluation. Disabled by default.
 |-------|------|---------|---------|
 | `enabled` | `bool` | `False` | gate in-loop eval |
 | `interval` | `int` | `1000` | eval every N training steps |
-| `steps` | `int` | `50` | eval batches per evaluation |
+| `steps` | `int` | `50` | eval batches per evaluation; under pipeline parallelism a multiple of `train.grad_accum_steps` |
 | `dataset_path` | `str` | `""` | pre-tokenized eval shards |
 | `file_pattern` | `str` | `"*.npy"` | glob inside `dataset_path` |
 | `token_dtype` | `str` | `""` | dtype of raw `.bin` eval shards, `"uint16"` or `"uint32"`; `""` takes it from the `metadata.yaml` beside them, never from `data.token_dtype` |

@@ -1244,6 +1244,25 @@ class TestBuildEvalDataloader:
         )
         assert build_eval_dataloader(config, _runtime()) is None
 
+    def test_pipeline_parallel_drops_a_partial_last_batch(self, mmap_data_dir):
+        """Pipeline stages are built for one microbatch shape, so a short last batch
+        cannot go through them; without PP the last batch is kept."""
+        from kempnerforge.config.distributed import DistributedConfig
+        from kempnerforge.config.eval import EvalConfig
+        from kempnerforge.training.data_pipeline import build_eval_dataloader
+
+        for pp, drops in ((1, False), (2, True)):
+            config = dataclasses.replace(
+                make_config(batch_size=3),
+                eval=EvalConfig(enabled=True, dataset_path=mmap_data_dir),
+                distributed=DistributedConfig(pp=pp, dp_shard=1),
+            )
+            loader = build_eval_dataloader(config, _runtime())
+            assert loader is not None
+            assert loader.drop_last is drops
+            sizes = {len(batch["input_ids"]) for batch in loader}
+            assert sizes == ({3} if drops else {3, len(loader.dataset) % 3})
+
 
 class TestDpSizeReachesTokenAccounting:
     """`get_dp_info` -> DataPipeline.dp_size -> tokens_in_step.
