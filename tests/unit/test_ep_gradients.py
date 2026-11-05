@@ -142,17 +142,10 @@ def _loss(model: torch.nn.Module, rows: torch.Tensor, config: ModelConfig) -> to
     return add_moe_losses(loss, model, config)
 
 
-def _step(
-    names: tuple[str, ...],
-    sizes: tuple[int, ...],
-    overrides: dict,
-    micro_steps: int = 1,
-) -> _Step:
-    """One step on this DP rank's rows, and one process's step on every DP rank's rows.
-
-    The reference averages per-batch losses, as DP does, since the auxiliary loss of a
-    concatenated batch is not the mean of its parts'.
-    """
+def _build(
+    names: tuple[str, ...], sizes: tuple[int, ...], overrides: dict
+) -> tuple[torch.nn.Module, Transformer, DeviceMesh]:
+    """The parallel model, the unsharded one loaded with its weights, and the mesh."""
     mesh = init_device_mesh("cpu", sizes, mesh_dim_names=names)
     config = ModelConfig(
         dim=64,
@@ -171,7 +164,22 @@ def _step(
     )
     reference = Transformer(config)
     reference.load_state_dict(_unsharded(model, mesh, config.num_experts, grads=False))
+    return model, reference, mesh
 
+
+def _step(
+    names: tuple[str, ...],
+    sizes: tuple[int, ...],
+    overrides: dict,
+    micro_steps: int = 1,
+) -> _Step:
+    """One step on this DP rank's rows, and one process's step on every DP rank's rows.
+
+    The reference averages per-batch losses, as DP does, since the auxiliary loss of a
+    concatenated batch is not the mean of its parts'.
+    """
+    model, reference, mesh = _build(names, sizes, overrides)
+    config = reference.config
     dp_rank, dp_size = _dp(mesh)
     generator = torch.Generator().manual_seed(7)
     batches = torch.randint(
@@ -286,6 +294,38 @@ def _check_gradient_scale(rank, world, port, names, sizes, overrides) -> None:
         dist.destroy_process_group()
 
 
+def _check_gradient_scale_modes(rank, world, port, names, sizes, overrides) -> None:
+    """``moe_gradient_scale`` follows the training mode, as in one process.
+
+    Training mode scales the expert outputs under ``torch.no_grad()`` too, and eval
+    mode does not scale them with gradients on, so the logits match in both.
+    """
+    _init(rank, world, port)
+    try:
+        model, reference, mesh = _build(names, sizes, overrides)
+        dp_rank, dp_size = _dp(mesh)
+        generator = torch.Generator().manual_seed(7)
+        rows = torch.randint(
+            0, reference.config.vocab_size, (dp_size, ROWS, SEQ), generator=generator
+        )[dp_rank]
+        for training, grad_enabled in ((True, False), (False, True)):
+            model.train(training)
+            reference.train(training)
+            with torch.set_grad_enabled(grad_enabled):
+                logits = model(rows)
+                expected = reference(rows)
+            scale = float(expected.abs().max())
+            torch.testing.assert_close(
+                logits,
+                expected,
+                rtol=1e-5,
+                atol=1e-5 * scale,
+                msg=lambda m, training=training: f"training={training}: {m}",
+            )
+    finally:
+        dist.destroy_process_group()
+
+
 class TestExpertParallelGradients:
     @pytest.mark.parametrize("layout", list(LAYOUTS))
     def test_expert_gradients_match_one_process(self, layout):
@@ -302,6 +342,12 @@ class TestExpertParallelGradients:
     def test_gradient_scale_matches_one_process(self, sizes):
         """``moe_gradient_scale`` averages the load over all experts, as without EP."""
         _spawn(_check_gradient_scale, ("dp_shard", "ep"), sizes, {"moe_gradient_scale": True})
+
+    def test_gradient_scale_follows_training_mode(self):
+        """Training under ``torch.no_grad()`` and eval with gradients on match one process."""
+        _spawn(
+            _check_gradient_scale_modes, ("dp_shard", "ep"), (1, 2), {"moe_gradient_scale": True}
+        )
 
 
 class TestClipUnderExpertParallelism:
