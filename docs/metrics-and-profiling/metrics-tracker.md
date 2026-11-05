@@ -31,19 +31,23 @@ resumed run ids into the config.
 
 ## Per-step flow
 
-`end_step` runs five things in order:
+`end_step` runs four things in order:
 
-1. **Timing** — `step_time = perf_counter() - _step_start`; derives
+1. **Timing**: `step_time = perf_counter() - _step_start`; derives
    `tokens_per_sec = tokens_in_step / step_time`.
-2. **MFU** — calls `compute_mfu(model_config, tokens_per_sec, num_gpus,
+2. **MFU**: calls `compute_mfu(model_config, tokens_per_sec, num_gpus,
    gpu_peak_tflops, seq_len)`. See [MFU](mfu.md).
-3. **Memory stats** — `get_memory_stats()` + `get_memory_utilization()`,
-   captured every step from device 0.
-4. **EMA smoothing** — updates four smoothed keys (`loss`,
+3. **EMA smoothing**: updates four smoothed keys (`loss`,
    `tokens_per_sec`, `mfu`, `step_time`) with `alpha=0.1`.
-5. **Log if due** — if `step % log_interval == 0` or `step == 1`, dispatch
-   to stdout + all backends and return a `StepMetrics`. Otherwise return
-   `None`.
+4. **Log if due**: if `step % log_interval == 0` or `step == 1`, read GPU
+   memory once with `get_memory_stats()`, from the current device, then
+   dispatch to stdout + all backends and return a `StepMetrics`.
+   Otherwise return `None` without reading memory.
+
+The tracker never resets the CUDA peak counter, so `peak_gb` (logged as
+`gpu/peak_gb` and `mem=`) is the high-water mark of the run, and
+`mem_utilization` is that peak over `total_gb` (see
+[Memory monitor](memory-monitor.md#why-metricstracker-doesnt-reset-peak)).
 
 ## `StepMetrics`
 
