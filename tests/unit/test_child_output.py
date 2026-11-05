@@ -34,6 +34,10 @@ class TestTracebackOrTail:
         assert excerpt.endswith(TORCHRUN_ERROR + failures)
         assert last_words not in output[-2000:]
 
+    def test_keeps_a_traceback_that_opens_the_output(self):
+        output = CHILD_ERROR + "torch.distributed.elastic teardown\n" * 200
+        assert traceback_or_tail(output, 2000) == output
+
     def test_falls_back_to_the_tail_without_a_traceback(self):
         output = "".join(f"[step {i}] loss=5.5\n" for i in range(500))
         assert traceback_or_tail(output, 300) == output[-300:]
