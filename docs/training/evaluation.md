@@ -17,6 +17,7 @@ steps = 50                              # batches per evaluation
 # Pre-tokenized data:
 dataset_path = "/path/to/tokenized/eval"
 file_pattern = "*.npy"
+token_dtype = ""                        # .bin shards: "uint16" or "uint32"; "" reads metadata.yaml
 
 # Or HuggingFace streaming:
 hf_dataset_name = "wikitext"
@@ -25,7 +26,11 @@ hf_dataset_split = "validation"
 ```
 
 Validation runs in `__post_init__`: `interval` and `steps` must be
-positive. The `dataset_path` / `hf_dataset_name` choice is made by the
+positive, and `token_dtype` must be empty, `"uint16"` or `"uint32"`.
+`token_dtype` does not fall back to `data.token_dtype`, so `.bin` eval
+shards without a `metadata.yaml` need it set here; otherwise they are
+undeclared (see [Memory-mapped dataset](../data/memory-mapped.md)). The
+`dataset_path` / `hf_dataset_name` choice is made by the
 loader — if both are set, pre-tokenized takes precedence.
 
 ## `run_eval`

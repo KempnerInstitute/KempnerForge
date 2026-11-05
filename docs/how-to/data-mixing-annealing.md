@@ -52,6 +52,7 @@ Each `[[data.datasets]]` block is a
 | `hf_name` | HuggingFace dataset ID (alternative to `path`). |
 | `hf_config` | HF dataset config (e.g. `"wikitext-103-raw-v1"`). |
 | `weight` | Relative sampling weight (must be positive). Normalized internally. |
+| `token_dtype` | Dtype of the raw `.bin` shards under `path`, `"uint16"` or `"uint32"`. Empty uses `data.token_dtype`; either must agree with a `metadata.yaml` beside the shards (see [Memory-mapped dataset](../data/memory-mapped.md)). |
 
 At least one of `path` / `hf_name` must be set per source, enforced by
 `DataConfig.__post_init__`.

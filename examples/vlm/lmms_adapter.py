@@ -78,6 +78,7 @@ from kempnerforge.metrics.logger import get_logger
 from kempnerforge.model.generate import sample
 from kempnerforge.model.vlm import VLMWrapper, build_vlm_wrapper
 from kempnerforge.resilience.elastic import resolve_resume_path
+from kempnerforge.training.runtime import apply_matmul_precision
 
 logger = get_logger(__name__)
 
@@ -515,6 +516,7 @@ class KempnerForgeVLM(lmms):
             raise ValueError(f"max_new_tokens must be >= 1, got {self._default_max_new_tokens}")
         self._config = _load_config(config)
         assert self._config.vlm is not None
+        apply_matmul_precision(self._config.train)
         self._dtype = self._config.train.param_dtype if dtype is None else _resolve_dtype(dtype)
         self._arch = self._config.vlm.arch
         _check_generative(self._config.vlm)
