@@ -97,12 +97,16 @@ def dcp_to_hf(
     """Convert a DCP checkpoint to HuggingFace safetensors format.
 
     Handles both standard and pipeline-parallel checkpoints (pp0/, pp1/, ...).
+    A tensor that still shares storage with one already written after the cast,
+    such as a tied output head at float32, is written as a copy, since
+    safetensors refuses tensors that share memory.
 
     Args:
         dcp_dir: Path to DCP checkpoint directory (e.g., checkpoints/step_10000).
         hf_dir: Output directory for HuggingFace model files.
         model_config: Model configuration for building the model skeleton.
-        dtype: Export dtype (default: bfloat16).
+        dtype: Export dtype (default: bfloat16), recorded as ``torch_dtype`` in
+            the written ``config.json``.
     """
     dcp_path = Path(dcp_dir)
     logger.info(f"Loading DCP checkpoint from {dcp_dir}")
@@ -122,9 +126,13 @@ def dcp_to_hf(
         model.load_state_dict(state_dict["model"])
 
     hf_state = {}
+    seen_storage: set[int] = set()
     for kf_key, tensor in model.state_dict().items():
         hf_key = _kf_to_hf_key(kf_key)
-        hf_state[hf_key] = tensor.to(dtype)
+        cast = tensor.to(dtype)
+        ptr = cast.untyped_storage().data_ptr()
+        hf_state[hf_key] = cast.clone() if ptr in seen_storage else cast
+        seen_storage.add(ptr)
 
     hf_path = Path(hf_dir)
     hf_path.mkdir(parents=True, exist_ok=True)
@@ -138,7 +146,7 @@ def dcp_to_hf(
         torch.save(hf_state, hf_path / "pytorch_model.bin")
         logger.info(f"Saved HuggingFace checkpoint (torch): {hf_path}")
 
-    hf_config = _build_hf_config(model_config)
+    hf_config = _build_hf_config(model_config, dtype)
     (hf_path / "config.json").write_text(json.dumps(hf_config, indent=2))
     logger.info(f"Wrote config.json with {len(hf_state)} tensors")
 
@@ -224,8 +232,12 @@ def _load_hf_hub(model_id: str) -> dict[str, torch.Tensor]:
     return hf_model.state_dict()
 
 
-def _build_hf_config(config: ModelConfig) -> dict:
-    """Build a HuggingFace-compatible config.json from ModelConfig."""
+def _build_hf_config(config: ModelConfig, dtype: torch.dtype = torch.bfloat16) -> dict:
+    """Build a HuggingFace-compatible config.json from ModelConfig.
+
+    ``torch_dtype`` names ``dtype``, the dtype the weights are written in, so
+    ``from_pretrained(..., dtype="auto")`` loads them at that precision.
+    """
     if config.dim % config.n_heads != 0:
         raise ValueError(
             f"Cannot export dim ({config.dim}) not divisible by n_heads ({config.n_heads}): "
@@ -243,7 +255,7 @@ def _build_hf_config(config: ModelConfig) -> dict:
         "rope_theta": config.rope_theta,
         "rms_norm_eps": config.norm_eps,
         "tie_word_embeddings": config.tie_embeddings,
-        "torch_dtype": "bfloat16",
+        "torch_dtype": str(dtype).removeprefix("torch."),
     }
 
     if config.is_moe:
@@ -271,8 +283,10 @@ def main() -> None:
     p_export.add_argument("--config", required=True, help="TOML config file")
     p_export.add_argument(
         "--dtype",
-        default="bfloat16",
+        default=None,
         choices=["float32", "bfloat16", "float16"],
+        help="Export dtype; overrides checkpoint.export_dtype from --config "
+        "(default: that field, which is bfloat16 unless the TOML sets it)",
     )
 
     p_import = subparsers.add_parser("hf-to-dcp", help="Import HuggingFace weights to DCP")
@@ -290,11 +304,16 @@ def main() -> None:
     }
 
     if args.command == "dcp-to-hf":
+        if args.dtype is not None:
+            export_dtype, source = args.dtype, "--dtype"
+        else:
+            export_dtype, source = config.checkpoint.export_dtype, "checkpoint.export_dtype"
+        logger.info(f"Export dtype: {export_dtype} (from {source})")
         dcp_to_hf(
             dcp_dir=args.dcp_dir,
             hf_dir=args.hf_dir,
             model_config=config.model,
-            dtype=dtype_map[args.dtype],
+            dtype=dtype_map[export_dtype],
         )
     elif args.command == "hf-to-dcp":
         hf_to_dcp(

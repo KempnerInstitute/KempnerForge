@@ -52,6 +52,7 @@ File:
   - `moe_frequency > 0`
   - `moe_sequence_aux_loss_weight ≥ 0`
   - `moe_bias_schedule ∈ {"constant", "cosine_decay", "linear_warmup"}`
+  - `moe_shared_experts ≥ 0`
 
 ### `TrainConfig`
 
@@ -72,6 +73,7 @@ File:
 
 - `lr > 0`.
 - `weight_decay ≥ 0`.
+- `weight_decay_scope ∈ {"exclude_norms_and_biases", "all"}`.
 - `betas[0], betas[1] ∈ [0, 1)`.
 - `muon_momentum ∈ (0, 1)`.
 - `muon_ns_steps > 0`.
@@ -100,6 +102,7 @@ File:
 - `num_workers ≥ 0`.
 - `prefetch_factor ≥ 1`.
 - `mix_temperature > 0`.
+- `token_dtype ∈ {"", "uint16", "uint32"}`.
 - Every `DatasetSource` in `datasets` has `path` or `hf_name` set.
 - If `phases` is non-empty, `phases[*].start_step` is strictly
   monotonically increasing (and unique).
@@ -109,6 +112,7 @@ File:
 `DatasetSource`:
 
 - `weight > 0`.
+- `token_dtype ∈ {"", "uint16", "uint32"}`.
 
 `TrainingPhase`:
 
@@ -123,9 +127,14 @@ File:
 
 - `interval > 0`.
 - `steps > 0`.
+- `token_dtype ∈ {"", "uint16", "uint32"}`.
 
 (Data-source presence is enforced by `JobConfig.validate`, not here —
 a disabled eval is still a valid `EvalConfig`.)
+
+The `.bin` dtype itself is resolved, checked against `metadata.yaml`
+and against each shard's size when the dataset is built, not at config
+load; see [Memory-mapped dataset](../data/memory-mapped.md).
 
 ### `DistributedConfig`
 

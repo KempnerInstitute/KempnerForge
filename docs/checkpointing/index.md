@@ -29,8 +29,10 @@ contains two kinds of state:
 ## `metadata.json`
 
 Written by rank 0 beside `train_state.pt`, and readable with a plain `json.load` (no torch).
-It holds `step` and `tokens_seen` (VLM runs add `vlm_freeze`). When a logging backend has a
-live run at save time it also holds a `tracking` list, one entry per backend:
+It holds `step` and `tokens_seen`, plus the run's `optimizer.weight_decay_scope` as
+`weight_decay_scope` when the checkpoint manager was built with it, as the training entry does
+(VLM runs add `vlm_freeze`). When a logging backend has a live run at save time it also holds a
+`tracking` list, one entry per backend:
 
 ```json
 {
@@ -70,7 +72,7 @@ live run at save time it also holds a `tracking` list, one entry per backend:
   remain, so drop the `tracking` key before sharing a checkpoint outside your team.
 - The key is additive. Older checkpoints lack it, nothing on the resume path reads it, and run
   ids still resume from `train_state.pt`. Offline tools read it:
-  [`kempnerforge.metrics.publish`](../metrics-and-profiling/mlflow.md#publishing-eval-results)
+  [`kempnerforge.metrics.mlflow.publish`](../metrics-and-profiling/mlflow.md#publishing-eval-results)
   appends eval metrics to the MLflow run its `mlflow` entry names.
 
 ## Key modules
