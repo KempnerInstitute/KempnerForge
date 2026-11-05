@@ -64,15 +64,15 @@ Expected output: after the startup messages, a metrics line for step 1
 and then one every 10 steps (`metrics.log_interval`), such as:
 
 ```
-2026-11-04 14:03:12.345 [rank 0] INFO     [step 10] loss=10.4200 | lr=6.00e-05 | grad_norm=1.842 | tok/s=8,420 | mfu=2.1% | mem=9.6/80GB | step_time=1.95s
-2026-11-04 14:03:31.630 [rank 0] INFO     [step 20] loss=9.8400 | lr=1.20e-04 | grad_norm=1.103 | tok/s=8,510 | mfu=2.1% | mem=9.6/80GB | step_time=1.93s
+2026-11-04 14:03:12.345 [rank 0] INFO     [step 10] loss=10.4200 | lr=6.00e-05 | grad_norm=1.842 | tok/s=8,420 | mfu=0.3% | mem=9.6/80GB | step_time=1.95s
+2026-11-04 14:03:31.630 [rank 0] INFO     [step 20] loss=9.8400 | lr=1.20e-04 | grad_norm=1.103 | tok/s=8,510 | mfu=0.3% | mem=9.6/80GB | step_time=1.93s
 ...
 ```
 
 Let it run ~50 steps (loss should drop below 10), then `Ctrl+C`.
 
 ```{note}
-MFU is low (~2%) because this is a 40M-param model on a single H100
+MFU is low (~0.3%) because this is a 40M-param model on a single H100
 — most of the runtime is framework + data loading, not matmul. MFU
 becomes meaningful at 7B+ scale. See
 [Scaling guide](scaling-guide.md).
