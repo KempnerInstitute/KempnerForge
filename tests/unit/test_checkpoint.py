@@ -211,8 +211,9 @@ class TestCheckpointRetention:
         assert remaining == [0, 1, 2, 4, 256, 512, 2000, 3000]
 
     def test_cleanup_retries_a_checkpoint_it_could_not_remove(self, tmp_path, monkeypatch):
-        """A removal that keeps failing is tried five times with 0.75 s of waits, logged instead
-        of raised, and retried by the next cleanup."""
+        """A removal that keeps failing is tried five times with 0.75 s of waits, each try
+        under the sidecar lock and no wait under it, logged instead of raised, and retried by
+        the next cleanup."""
         import errno
 
         from kempnerforge.checkpoint import manager as mgr_mod
@@ -221,28 +222,86 @@ class TestCheckpointRetention:
         model = torch.nn.Linear(4, 4)
         opt = torch.optim.SGD(model.parameters(), lr=0.1)
         mgr = CheckpointManager(CheckpointConfig(dir=str(tmp_path), keep_last_n=2), model, opt)
+        lock = _HeldLock()
+        mgr._sidecar_lock = lock
         for i in [10, 20, 30]:
             (tmp_path / f"step_{i}").mkdir()
-        attempts: list[str] = []
+        attempts: list[tuple[str, bool]] = []
 
         def busy(path, *args, **kwargs):
-            attempts.append(Path(path).name)
+            attempts.append((Path(path).name, lock.held))
             raise OSError(errno.ENOTEMPTY, "Directory not empty", str(path))
 
-        slept: list[float] = []
+        slept: list[tuple[float, bool]] = []
         warnings: list[str] = []
         monkeypatch.setattr(mgr_mod.shutil, "rmtree", busy)
-        monkeypatch.setattr(mgr_mod.time, "sleep", slept.append)
+        monkeypatch.setattr(mgr_mod.time, "sleep", lambda s: slept.append((s, lock.held)))
         monkeypatch.setattr(mgr_mod.logger, "warning", warnings.append)
         mgr._cleanup()
         assert (tmp_path / "step_10").is_dir()
-        assert attempts == ["step_10"] * 5
-        assert slept == [0.05, 0.1, 0.2, 0.4]
+        assert attempts == [("step_10", True)] * 5
+        assert slept == [(0.05, False), (0.1, False), (0.2, False), (0.4, False)]
         assert len(warnings) == 1 and "step_10" in warnings[0], warnings
 
         monkeypatch.undo()
         mgr._cleanup()
         assert sorted(d.name for d in tmp_path.iterdir() if d.is_dir()) == ["step_20", "step_30"]
+
+    @pytest.mark.parametrize(
+        ("failures", "attempts", "left"),
+        [
+            pytest.param(
+                {"step_10": 9, "step_20": 9, "step_30": 9},
+                ["step_10"] * 5 + ["step_20", "step_30"],
+                ["step_10", "step_20", "step_30"],
+                id="the_first_outlasts_the_waits",
+            ),
+            pytest.param(
+                {"step_10": 1, "step_20": 9, "step_30": 9},
+                ["step_10"] * 2 + ["step_20"] * 4 + ["step_30"],
+                ["step_20", "step_30"],
+                id="the_first_needs_one_retry",
+            ),
+        ],
+    )
+    def test_a_cleanup_waits_at_most_0_75_s_in_all(
+        self, tmp_path, monkeypatch, failures, attempts, left
+    ):
+        """The removals of one cleanup share the 0.05, 0.1, 0.2 and 0.4 s waits; one that
+        fails once they are spent is logged and left for the next cleanup."""
+        import errno
+
+        from kempnerforge.checkpoint import manager as mgr_mod
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        model = torch.nn.Linear(4, 4)
+        opt = torch.optim.SGD(model.parameters(), lr=0.1)
+        mgr = CheckpointManager(CheckpointConfig(dir=str(tmp_path), keep_last_n=1), model, opt)
+        for i in [10, 20, 30, 40]:
+            (tmp_path / f"step_{i}").mkdir()
+        rmtree = mgr_mod.shutil.rmtree
+        remaining = dict(failures)
+        tried: list[str] = []
+
+        def flaky(path, *args, **kwargs):
+            name = Path(path).name
+            tried.append(name)
+            if remaining.get(name, 0):
+                remaining[name] -= 1
+                raise OSError(errno.ENOTEMPTY, "Directory not empty", str(path))
+            return rmtree(path, *args, **kwargs)
+
+        slept: list[float] = []
+        warnings: list[str] = []
+        monkeypatch.setattr(mgr_mod.shutil, "rmtree", flaky)
+        monkeypatch.setattr(mgr_mod.time, "sleep", slept.append)
+        monkeypatch.setattr(mgr_mod.logger, "warning", warnings.append)
+        mgr._cleanup()
+        assert tried == attempts
+        assert slept == [0.05, 0.1, 0.2, 0.4]
+        assert len(warnings) == len(left)
+        remaining_dirs = sorted(d.name for d in tmp_path.iterdir() if d.is_dir())
+        assert remaining_dirs == [*left, "step_40"]
 
     def test_cleanup_retries_a_directory_nfs_briefly_keeps_non_empty(self, tmp_path, monkeypatch):
         """The errors NFS gives while it still holds a just-deleted file pass on a retry; each

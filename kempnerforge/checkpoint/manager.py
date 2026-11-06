@@ -19,7 +19,7 @@ import stat
 import threading
 import time
 import uuid
-from collections.abc import Callable, Container, Iterable
+from collections.abc import Callable, Container, Iterable, Iterator
 from functools import partial
 from pathlib import Path
 from typing import Any, Protocol, TypeGuard, cast
@@ -396,20 +396,21 @@ def _replace_file(path: Path, text: str) -> None:
         raise
 
 
-def _remove_tree(path: Path, lock: threading.Lock) -> None:
+def _remove_tree(path: Path, lock: threading.Lock, delays: Iterator[float]) -> None:
     """Remove the directory ``path``, retrying while NFS briefly keeps it non-empty.
 
-    Makes up to five attempts with 0.75 s of waits between them in all. ``ENOTEMPTY``,
-    ``EBUSY`` and ``ENOENT`` are retried while ``path`` exists.
+    ``ENOTEMPTY``, ``EBUSY`` and ``ENOENT`` are retried while ``path`` exists, each retry
+    after waiting the next of ``delays``.
 
     Args:
         path: The directory to remove.
         lock: Held for each attempt and released during the waits.
+        delays: The waits left, in seconds, which removals can share.
 
     Raises:
-        OSError: Any other error, or a retried one that outlasts the attempts.
+        OSError: Any other error, or a retried one once ``delays`` is spent.
     """
-    for delay in _REMOVE_RETRY_DELAYS:
+    while True:
         try:
             with lock:
                 shutil.rmtree(path)
@@ -417,9 +418,10 @@ def _remove_tree(path: Path, lock: threading.Lock) -> None:
         except OSError as e:
             if e.errno not in _TRANSIENT_REMOVE_ERRNOS or not path.exists():
                 raise
-        time.sleep(delay)
-    with lock:
-        shutil.rmtree(path)
+            delay = next(delays, None)
+            if delay is None:
+                raise
+            time.sleep(delay)
 
 
 _URI_USERINFO = re.compile(r"(?<=://)[^/?#\s]+@")
@@ -1248,8 +1250,10 @@ class CheckpointManager:
         that is not among the newest, as after a rewind, from being deleted
         while it is written.
 
-        A directory that NFS briefly keeps non-empty is retried; one that still
-        cannot be removed is logged and left for the next cleanup.
+        A directory that NFS briefly keeps non-empty is retried after 0.05, 0.1,
+        0.2 and 0.4 s, waits that all the removals of one cleanup share, so a
+        cleanup waits at most 0.75 s. One that still cannot be removed is logged
+        and left for the next cleanup.
         """
         keep = self.config.keep_last_n
         if keep <= 0:
@@ -1274,11 +1278,12 @@ class CheckpointManager:
                 protected.add(d.resolve())
 
         to_remove = ckpt_dirs[:-keep] if len(ckpt_dirs) > keep else []
+        delays = iter(_REMOVE_RETRY_DELAYS)
         for d in to_remove:
             if d.resolve() in protected:
                 continue
             try:
-                _remove_tree(d, self._sidecar_lock)
+                _remove_tree(d, self._sidecar_lock, delays)
             except OSError as e:
                 logger.warning(
                     f"Could not remove old checkpoint {d} ({e}); the next cleanup retries it"
