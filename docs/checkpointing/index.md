@@ -31,7 +31,8 @@ contains two kinds of state:
 Written by rank 0 beside `train_state.pt`, and readable with a plain `json.load` (no torch).
 It holds `step` and `tokens_seen`, plus the run's `optimizer.weight_decay_scope` as
 `weight_decay_scope` when the checkpoint manager was built with it, as the training entry does
-(VLM runs add `vlm_freeze`). When a logging backend has a live run at save time it also holds a
+(VLM runs add `vlm_freeze`, and `lr_multipliers` with the `lr_module_patterns` of its
+modules when `optimizer.lr_multipliers` lists any). When a logging backend has a live run at save time it also holds a
 `tracking` list, one entry per backend:
 
 ```json

@@ -2,11 +2,58 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import fnmatch
+import math
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass, field
 
 WEIGHT_DECAY_SCOPES = ("exclude_norms_and_biases", "all")
 MUON_ADJUST_LR_MODES = ("original", "match_rms_adamw", "spectral_unclamped")
 MUON_ORTHOGONALIZE_MODES = ("local", "exact")
+
+
+def checked_lr_multipliers(multipliers: object) -> dict[str, float]:
+    """Return ``multipliers`` as a ``{module: multiplier}`` dict of floats.
+
+    Raises:
+        ValueError: ``multipliers`` is not a dict, a key is not a non-empty string, or a
+            value is not a positive finite number.
+    """
+    if not isinstance(multipliers, dict):
+        raise ValueError(f"lr_multipliers must map module names to numbers, got {multipliers!r}")
+    checked: dict[str, float] = {}
+    for module, multiplier in multipliers.items():
+        if not isinstance(module, str) or not module:
+            raise ValueError(f"lr_multipliers keys must be module names, got {module!r}")
+        if (
+            isinstance(multiplier, bool)
+            or not isinstance(multiplier, int | float)
+            or not 0 < multiplier < math.inf
+        ):
+            raise ValueError(
+                f"lr_multipliers[{module!r}] must be a positive finite number, got {multiplier!r}"
+            )
+        checked[module] = float(multiplier)
+    return checked
+
+
+def overlapping_modules(
+    modules: Iterable[str], module_patterns: Mapping[str, Sequence[str]]
+) -> tuple[str, str, str, str] | None:
+    """Return two of ``modules`` whose patterns overlap, and a pattern of each, or None.
+
+    Two patterns overlap when one, read as a parameter name, matches the other: that is how
+    a module inside another is written (``transformer.layers.*`` in ``transformer.*``). Every
+    module must be a key of ``module_patterns``.
+    """
+    listed = sorted(modules)
+    for i, first in enumerate(listed):
+        for second in listed[i + 1 :]:
+            for a in module_patterns[first]:
+                for b in module_patterns[second]:
+                    if fnmatch.fnmatch(a, b) or fnmatch.fnmatch(b, a):
+                        return first, second, a, b
+    return None
 
 
 @dataclass
@@ -28,6 +75,7 @@ class OptimizerConfig:
     muon_router: bool = False
     schedule_free_warmup_steps: int = 0
     weight_decay_scope: str = "exclude_norms_and_biases"
+    lr_multipliers: dict[str, float] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.lr <= 0:
@@ -56,3 +104,10 @@ class OptimizerConfig:
             )
         if self.schedule_free_warmup_steps < 0:
             raise ValueError("schedule_free_warmup_steps must be non-negative")
+        self.lr_multipliers = checked_lr_multipliers(self.lr_multipliers)
+        nested = sorted(module for module in self.lr_multipliers if "/" in module)
+        if nested:
+            raise ValueError(
+                f"lr_multipliers names modules {nested} with '/', which would log one module's "
+                "lr/<module> under another's; name the modules of vlm.module_patterns without it"
+            )

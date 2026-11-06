@@ -17,7 +17,7 @@ import shutil
 import stat
 import threading
 import uuid
-from collections.abc import Callable, Container, Iterable
+from collections.abc import Callable, Collection, Container, Iterable, Mapping, Sequence
 from functools import partial
 from pathlib import Path
 from typing import Any, Protocol, TypeGuard, cast
@@ -36,7 +36,7 @@ from torch.distributed.checkpoint.state_dict import (
 
 from kempnerforge.checkpoint.async_save import AsyncCheckpointer
 from kempnerforge.checkpoint.state import build_train_state, restore_train_state
-from kempnerforge.config.optimizer import WEIGHT_DECAY_SCOPES
+from kempnerforge.config.optimizer import WEIGHT_DECAY_SCOPES, checked_lr_multipliers
 from kempnerforge.config.schema import AsyncCheckpointMode, CheckpointConfig
 
 logger = logging.getLogger(__name__)
@@ -227,6 +227,49 @@ def _read_weight_decay_scope(ckpt_dir: Path) -> str:
     return scope
 
 
+def _canonical_patterns(record: object) -> dict[str, list[str]]:
+    """Return a ``{module: patterns}`` record with each module's patterns sorted and unique.
+
+    Raises:
+        ValueError: ``record`` does not map module names to lists of strings.
+    """
+    if not isinstance(record, dict) or not all(
+        isinstance(module, str)
+        and isinstance(patterns, list)
+        and all(isinstance(pattern, str) for pattern in patterns)
+        for module, patterns in record.items()
+    ):
+        raise ValueError(f"expected module names mapped to lists of patterns, got {record!r}")
+    return {module: sorted(set(patterns)) for module, patterns in record.items()}
+
+
+def _read_lr_multipliers(ckpt_dir: Path) -> tuple[dict[str, float], dict[str, list[str]]]:
+    """Return the ``lr_multipliers`` and ``lr_module_patterns`` a checkpoint's ``metadata.json``
+    records.
+
+    A checkpoint with no ``metadata.json``, or one without the fields, was saved without any.
+
+    Raises:
+        ValueError: ``metadata.json`` exists but is not a readable JSON object, or a field does
+            not hold a valid record.
+    """
+    metadata_path = ckpt_dir / _METADATA_FILE
+    if not metadata_path.exists():
+        return {}, {}
+    try:
+        meta = json.loads(metadata_path.read_text())
+    except (OSError, ValueError) as e:
+        raise ValueError(f"cannot read {metadata_path}: {e}") from e
+    if not isinstance(meta, dict):
+        raise ValueError(f"{metadata_path} does not hold a JSON object")
+    try:
+        multipliers = checked_lr_multipliers(meta.get("lr_multipliers", {}))
+        patterns = _canonical_patterns(meta.get("lr_module_patterns", {}))
+    except ValueError as e:
+        raise ValueError(f"{metadata_path} records an invalid LR multipliers record: {e}") from e
+    return multipliers, patterns
+
+
 def _reset_to_fresh(optimizer: torch.optim.Optimizer) -> None:
     """Return ``optimizer`` to its freshly built state, keeping its param groups."""
     optimizer.load_state_dict({"state": {}, "param_groups": optimizer.state_dict()["param_groups"]})
@@ -310,6 +353,60 @@ def _check_saved_state_matches(
             "checkpoint.load_path to this checkpoint and checkpoint.exclude_from_loading = "
             '["optimizer"], with a checkpoint.dir that holds no checkpoint yet.'
         )
+
+
+def _check_saved_param_groups(
+    optim_state: dict[str, Any], saved_keys: Collection[str], where: Path, groups_vary: bool
+) -> None:
+    """Fail unless the checkpoint holds the param groups this run's optimizers hold.
+
+    A checkpoint keeps each param group's settings under the group's position among its
+    optimizers' groups, and the load maps a loaded group to this run's by the parameters it
+    lists. When the groups are laid out otherwise than at the save, as under
+    ``optimizer.lr_multipliers`` when other parameters are trainable, a position can hold
+    another group, and a group can come back without settings. Checked when ``groups_vary``,
+    as it is for a run with ``optimizer.lr_multipliers``, or when this run's groups or the
+    saved ones name a module: the checkpoint must hold as many groups, each with every
+    setting of this run's group there, and each naming a module exactly where this run's
+    group does.
+    """
+    groups = optim_state["param_groups"]
+    names_module = any(
+        key.startswith(_OPTIM_PARAM_GROUPS_PREFIX) and key.endswith(".module") for key in saved_keys
+    )
+    if not (groups_vary or names_module or any("module" in group for group in groups)):
+        return
+    saved_count = _saved_optimizer_param_groups(saved_keys)
+    if saved_count != len(groups):
+        found = f"holds {saved_count} optimizer param groups, and this run {len(groups)}"
+    else:
+        for index, group in enumerate(groups):
+            prefix = f"{_OPTIM_PARAM_GROUPS_PREFIX}{index}."
+            missing = sorted(key for key in group if f"{prefix}{key}" not in saved_keys)
+            if missing:
+                found = f"has no {missing} in optimizer param group {index}, which this run's has"
+                break
+            if "module" not in group and f"{prefix}module" in saved_keys:
+                found = f"names a module in optimizer param group {index}, and this run's does not"
+                break
+        else:
+            return
+    raise RuntimeError(
+        f"{where} {found}: the param groups are laid out otherwise than at the save, as when "
+        "other parameters are trainable under optimizer.lr_multipliers, or their settings "
+        "changed. Resume with the parameters trained at the save, or continue from these "
+        "weights with a fresh optimizer: set checkpoint.load_path to this checkpoint and "
+        'checkpoint.exclude_from_loading = ["optimizer"], with a checkpoint.dir that holds '
+        "no checkpoint yet."
+    )
+
+
+def _check_saved_optimizer(
+    optim_state: dict[str, Any], saved_keys: Collection[str], where: Path, groups_vary: bool
+) -> None:
+    """Run the checks the checkpoint's optimizer state must pass before anything loads."""
+    _check_saved_state_matches(optim_state, saved_keys, where)
+    _check_saved_param_groups(optim_state, saved_keys, where, groups_vary)
 
 
 def _load_train_state(path: Path) -> dict[str, Any]:
@@ -435,6 +532,19 @@ class CheckpointManager:
             state, such as a converted one or one saved before the first step, loads under any
             scope with a fresh optimizer. A checkpoint that does not record a scope counts as
             ``"exclude_norms_and_biases"``.
+        lr_multipliers: The run's ``optimizer.lr_multipliers``. When set, every save records
+            a non-empty one in ``metadata.json``, with the patterns of its modules. A load of a
+            checkpoint saved with other multipliers or patterns raises ``ValueError`` on every
+            rank when it restores the checkpoint's optimizer state on any rank, before anything
+            is loaded, or the scheduler state in its ``train_state.pt``, before anything from
+            that file is restored. A load that restores neither goes ahead. A checkpoint that
+            records none counts as saved without multipliers. With multipliers set, a load that
+            restores optimizer state into param groups laid out otherwise than at the save
+            raises on every rank before anything is loaded. A restored scheduler state carries
+            the saved schedule on in every group, a group of a module the checkpoint holds no
+            group of at the saved peak times its multiplier (see ``restore_train_state``).
+        module_patterns: Module name to fnmatch patterns, such as ``VLMConfig.module_patterns``.
+            Required for every module ``lr_multipliers`` lists.
     """
 
     def __init__(
@@ -445,6 +555,8 @@ class CheckpointManager:
         process_group=None,
         pp_rank: int | None = None,
         weight_decay_scope: str | None = None,
+        lr_multipliers: Mapping[str, float] | None = None,
+        module_patterns: Mapping[str, Sequence[str]] | None = None,
     ) -> None:
         self.config = config
         self.model = model
@@ -459,6 +571,13 @@ class CheckpointManager:
         self._process_group = process_group
         self._pp_rank = pp_rank
         self._weight_decay_scope = weight_decay_scope
+        self._lr_multipliers = None if lr_multipliers is None else dict(lr_multipliers)
+        listed = sorted(self._lr_multipliers or ())
+        patterns = module_patterns or {}
+        missing = [module for module in listed if module not in patterns]
+        if missing:
+            raise ValueError(f"lr_multipliers needs module_patterns for {missing}")
+        self._lr_module_patterns = {module: sorted(set(patterns[module])) for module in listed}
         self._pending_dataloader_state: dict[str, Any] | None = None
         self._pending_finalize: tuple[int, Path] | None = None
         self._inflight_dir: Path | None = None
@@ -545,11 +664,11 @@ class CheckpointManager:
         if self._pp_rank is not None:
             self._agree(error)
 
-    def _agree(self, error: BaseException | None) -> None:
+    def _agree(self, error: BaseException | None, action: str = "save") -> None:
         """Barrier on the manager's dedicated gloo group that raises on every rank if any failed.
 
-        Every rank passes the error its own part of the save raised, or ``None``.
-        A rank with an error re-raises it; when any rank has one, every other rank
+        Every rank passes the error its own part of the ``action``, a save or a load, raised,
+        or ``None``. A rank with an error re-raises it; when any rank has one, every other rank
         raises a ``RuntimeError`` naming the ranks that failed, so no rank is left
         waiting in a later collective for a rank that has raised. The group is not
         the default process group that DCP's async-save background thread issues
@@ -565,7 +684,7 @@ class CheckpointManager:
         if error is not None:
             raise error
         if failed:
-            raise RuntimeError(f"Checkpoint save failed on ranks {failed}")
+            raise RuntimeError(f"Checkpoint {action} failed on ranks {failed}")
 
     def set_tracking_source(self, source: TrackingSource | None) -> None:
         """Record the logging runs ``source`` reports in every later ``metadata.json``.
@@ -621,14 +740,21 @@ class CheckpointManager:
         return merged
 
     def _sidecar_text(self, meta: dict[str, Any]) -> str:
-        """``meta`` as JSON, plus the run's ``weight_decay_scope`` when the manager has one and
-        the live tracking runs when the source can supply them.
+        """``meta`` as JSON, plus the run's ``weight_decay_scope`` when the manager has one, its
+        ``lr_multipliers`` and their ``lr_module_patterns`` when it has a non-empty one, and the
+        live tracking runs when the source can supply them.
 
         Everything that depends on the source sits inside one guard: it runs on rank 0 alone,
         so a raise here would strand the other ranks. A bad source costs the ``tracking`` key.
         """
         if self._weight_decay_scope is not None:
             meta = {**meta, "weight_decay_scope": self._weight_decay_scope}
+        if self._lr_multipliers:
+            meta = {
+                **meta,
+                "lr_multipliers": dict(sorted(self._lr_multipliers.items())),
+                "lr_module_patterns": dict(sorted(self._lr_module_patterns.items())),
+            }
         if self._tracking_source is not None:
             try:
                 tracking = self._tracking_source()
@@ -935,6 +1061,7 @@ class CheckpointManager:
         optimizers = self._optimizers_saved_in(dcp_dir, saved_keys) if load_optim else []
         if load_model:
             dcp_state["model"] = get_model_state_dict(self.model)
+        check_error: BaseException | None = None
         if load_optim:
             dcp_state["optimizer"] = get_optimizer_state_dict(self.model, optimizers)
             filled = _drop_legacy_group_keys(dcp_state["optimizer"], optimizers, saved_keys)
@@ -943,7 +1070,17 @@ class CheckpointManager:
                     f"{dcp_dir} is missing optimizer param-group keys {sorted(filled)}; "
                     f"resuming with {filled}"
                 )
-            _check_saved_state_matches(dcp_state["optimizer"], saved_keys, dcp_dir)
+            check_error = _attempt(
+                _check_saved_optimizer,
+                dcp_state["optimizer"],
+                saved_keys,
+                dcp_dir,
+                bool(self._lr_multipliers),
+            )
+        if self._lr_multipliers:
+            self._agree(check_error, action="load")
+        elif check_error is not None:
+            raise check_error
 
         if dcp_state:
             planner = _NeverSteppedStatePlanner()
@@ -993,12 +1130,19 @@ class CheckpointManager:
                 train_state = object_list[0]
 
             assert train_state is not None, "train_state broadcast failed"
+            if (
+                self._lr_multipliers is not None
+                and scheduler is not None
+                and "scheduler" in train_state
+            ):
+                self._check_lr_multipliers(ckpt_dir)
             if dataloader is None and "dataloader" in train_state:
                 self._pending_dataloader_state = train_state["dataloader"]
             step, tokens_seen, extra = restore_train_state(
                 train_state,
                 scheduler=scheduler,
                 dataloader=dataloader,
+                lr_multipliers=self._lr_multipliers,
             )
             logger.info(f"Resumed from step {step}, {tokens_seen:,} tokens seen")
         else:
@@ -1017,17 +1161,19 @@ class CheckpointManager:
     def _read_saved_keys(self, ckpt_dir: Path, dcp_dir: Path) -> dict[str, Any]:
         """Return the keys this rank's DCP index lists: ``dcp_dir``, its part of ``ckpt_dir``.
 
-        With a weight-decay scope every rank must call this. One all-reduce on the manager's
-        gloo group, which every rank enters even when its own read failed, tells every rank
-        whether any rank's index holds optimizer state; under PP each stage has its own index.
-        If one does, every rank checks the scope before this returns; otherwise none does.
+        With a weight-decay scope or LR multipliers every rank must call this. One all-reduce
+        on the manager's gloo group, which every rank enters even when its own read failed,
+        tells every rank whether any rank's index holds optimizer state; under PP each stage
+        has its own index. If one does, every rank checks the scope and the multipliers before
+        this returns; otherwise none does.
 
         Raises:
-            ValueError: The checkpoint fails the scope check (see ``_check_weight_decay_scope``).
+            ValueError: The checkpoint fails the scope check (see ``_check_weight_decay_scope``)
+                or the multipliers check (see ``_check_lr_multipliers``).
             RuntimeError: Another rank could not read its DCP index.
             Exception: Whatever this rank's read of its DCP index raised.
         """
-        if self._weight_decay_scope is None:
+        if self._weight_decay_scope is None and self._lr_multipliers is None:
             return _dcp_keys(dcp_dir)
         keys: dict[str, Any] = {}
         error: Exception | None = None
@@ -1036,7 +1182,10 @@ class CheckpointManager:
         except Exception as e:
             error = e
         if self._optimizer_saved_on_any_rank(error, _holds_optimizer(keys)):
-            self._check_weight_decay_scope(ckpt_dir)
+            if self._weight_decay_scope is not None:
+                self._check_weight_decay_scope(ckpt_dir)
+            if self._lr_multipliers is not None:
+                self._check_lr_multipliers(ckpt_dir)
         return keys
 
     def _optimizer_saved_on_any_rank(self, error: Exception | None, holds: bool) -> bool:
@@ -1098,6 +1247,53 @@ class CheckpointManager:
                 f"a checkpoint.dir that holds no checkpoint, since training auto-resumes from "
                 f"a checkpoint there in place of load_path, optimizer state included."
             )
+
+    def _check_lr_multipliers(self, ckpt_dir: Path) -> None:
+        """Refuse a checkpoint saved with LR multipliers, or patterns of their modules, other
+        than this manager's.
+
+        The multipliers and the patterns decide the optimizer's param groups and their learning
+        rates, which the saved optimizer state and the scheduler state in ``train_state.pt``
+        are laid out for. Every rank calls this or none does: rank 0 reads the record and
+        broadcasts it, or whatever stopped it reading, so every rank raises or proceeds
+        together.
+
+        Raises:
+            ValueError: The checkpoint's multipliers or patterns differ from this manager's, or
+                its ``metadata.json`` does not hold a valid record.
+        """
+        outcome: list[tuple[tuple[dict[str, float], dict[str, list[str]]] | None, str | None]]
+        outcome = [(None, None)]
+        if self._rank == 0 or not dist.is_initialized():
+            try:
+                outcome[0] = (_read_lr_multipliers(ckpt_dir), None)
+            except ValueError as e:
+                outcome[0] = (None, str(e))
+            except Exception as e:
+                outcome[0] = (None, f"{type(e).__name__}: {e}")
+        if dist.is_initialized():
+            dist.broadcast_object_list(outcome, src=0)
+        saved, error = outcome[0]
+        if saved is None:
+            raise ValueError(f"Cannot check the lr_multipliers of {ckpt_dir}: {error}")
+        multipliers, patterns = saved
+        if multipliers != self._lr_multipliers:
+            change = (
+                f"optimizer.lr_multipliers={multipliers}, but this run uses {self._lr_multipliers}"
+            )
+        elif patterns != self._lr_module_patterns:
+            change = (
+                f"the module patterns {patterns} for its optimizer.lr_multipliers, but this run "
+                f"has {self._lr_module_patterns}"
+            )
+        else:
+            return
+        raise ValueError(
+            f"{ckpt_dir} was saved with {change}. The multipliers and the patterns of their "
+            f"modules decide the optimizer's param groups and their learning rates, and the "
+            f"checkpoint's optimizer and scheduler state belong to the groups it was saved with. "
+            f"Resume with the saved values."
+        )
 
     def apply_dataloader_state(self, dataloader: Any) -> None:
         """Apply any dataloader state stashed during load().

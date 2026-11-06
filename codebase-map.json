@@ -89,9 +89,13 @@
     "kempnerforge/config/optimizer.py": {
       "classes": {
         "OptimizerConfig": {
-          "purpose": "Optimizer settings (name, lr, betas, weight_decay, muon params, schedule_free_warmup_steps)"
+          "purpose": "Optimizer settings (name, lr, betas, weight_decay, muon params, schedule_free_warmup_steps, weight_decay_scope, lr_multipliers per vlm.module_patterns module)"
         }
-      }
+      },
+      "functions": [
+        "checked_lr_multipliers(multipliers) -> dict[str, float]",
+        "overlapping_modules(modules, module_patterns) -> (first, second, pattern, pattern) | None"
+      ]
     },
     "kempnerforge/config/scheduler.py": {
       "enums": [
@@ -730,7 +734,9 @@
         }
       },
       "functions": [
-        "build_optimizer(model, config) -> Optimizer",
+        "build_optimizer(model, config, module_patterns=None) -> Optimizer",
+        "module_learning_rates(optimizer) -> dict[str, float] (keyed lr/<module>, lr_adamw/<module>)",
+        "_split_by_module(model, param_groups, config, module_patterns) -> list[dict]",
         "_newton_schulz(G, steps) -> Tensor",
         "_muon_matrices(model, *, routers) -> set[Tensor]",
         "_should_decay(name, param, scope) -> bool"
@@ -743,6 +749,8 @@
       ],
       "tested_by": [
         "tests/unit/test_training.py::TestBuildOptimizer",
+        "tests/unit/test_lr_multipliers.py::TestGroups",
+        "tests/unit/test_lr_multipliers.py::TestMuonFallback",
         "tests/unit/test_optimizer.py::TestNewtonSchulz",
         "tests/unit/test_optimizer.py::TestMuon",
         "tests/unit/test_optimizer.py::TestMuonRouting",
@@ -921,6 +929,7 @@
       "tested_by": [
         "tests/unit/test_train_entry.py::TestRunTraining",
         "tests/unit/test_train_entry.py::TestBuildPhaseHelpers",
+        "tests/unit/test_train_entry.py::TestStageChangeWarmStart",
         "tests/e2e/test_training_e2e.py",
         "tests/smoke/test_smoke.py"
       ]
@@ -1172,13 +1181,16 @@
       "functions": [
         "get_rng_state() -> dict",
         "set_rng_state(state)",
-        "build_train_state(step, tokens_seen, scheduler, dataloader, extra) -> dict",
-        "restore_train_state(state, scheduler, dataloader) -> (step, tokens_seen)"
+        "build_train_state(step, tokens_seen, scheduler, dataloader, extra) -> dict (records scheduler_group_modules when a param group names a module)",
+        "restore_train_state(state, scheduler, dataloader, lr_multipliers) -> (step, tokens_seen)",
+        "_scheduler_state_for(scheduler, saved, saved_modules, lr_multipliers) -> dict (lays a LambdaLR state out by module for other param groups; a module with no saved group runs at the saved peak times its multiplier)"
       ],
       "tested_by": [
         "tests/unit/test_checkpoint.py::TestRNGState",
         "tests/unit/test_checkpoint.py::TestBuildTrainState",
-        "tests/unit/test_checkpoint.py::TestRestoreTrainState"
+        "tests/unit/test_checkpoint.py::TestRestoreTrainState",
+        "tests/unit/test_lr_multipliers.py::TestSchedulerStateLayout",
+        "tests/unit/test_lr_multipliers.py::TestLayoutChange"
       ]
     },
     "kempnerforge/checkpoint/manager.py": {
@@ -1193,6 +1205,7 @@
             "load(path, scheduler, dataloader, exclude_keys, vlm_freeze_expected)",
             "_read_saved_keys(ckpt_dir, dcp_dir) (this rank's DCP keys; checks the scope only when an all-reduce on the gloo group finds optimizer state on some rank)",
             "_check_weight_decay_scope(ckpt_dir) (rank 0 reads the saved scope and broadcasts it; every rank refuses a mismatch)",
+            "_check_lr_multipliers(ckpt_dir) (rank 0 reads the saved lr_multipliers and their module patterns and broadcasts them; every rank refuses a mismatch; load() calls it before loading optimizer state on any rank and before restoring a scheduler from train_state.pt)",
             "apply_dataloader_state(dataloader)",
             "_resolve_load_path(path)",
             "_cleanup()"
@@ -1202,10 +1215,12 @@
       "functions": [
         "_load_train_state(path) -> dict (ownership-gated torch.load with weights_only=False)",
         "_intersect_freeze_meta_by_module(saved, expected) -> (saved_filt, expected_filt) (cross-arch drop-zero-match rule)",
-        "_read_weight_decay_scope(ckpt_dir) -> str (scope recorded in metadata.json; none recorded means exclude_norms_and_biases)"
+        "_read_weight_decay_scope(ckpt_dir) -> str (scope recorded in metadata.json; none recorded means exclude_norms_and_biases)",
+        "_read_lr_multipliers(ckpt_dir) -> (multipliers, patterns) (lr_multipliers and lr_module_patterns recorded in metadata.json; none recorded means empty)"
       ],
       "tested_by": [
         "tests/unit/test_checkpoint.py::TestWeightDecayScopeOnResume",
+        "tests/unit/test_lr_multipliers.py::TestResume",
         "tests/unit/test_checkpoint.py::TestCheckpointRetention",
         "tests/unit/test_checkpoint.py::TestFlushPendingSave",
         "tests/unit/test_checkpoint.py::TestPeekSavedStep",

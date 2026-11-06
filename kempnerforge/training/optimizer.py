@@ -12,13 +12,17 @@ All optimizers:
   - Weight decay follows optimizer.weight_decay_scope: by default every parameter
     with ndim > 1 and no "bias" in its name is decayed, and "all" decays every
     parameter
+  - optimizer.lr_multipliers gives each listed module its own groups, at lr
+    times the module's multiplier
   - Fused kernel when available (PyTorch 2.x, AdamW only)
 """
 
 from __future__ import annotations
 
+import fnmatch
 import functools
 import logging
+from collections.abc import Iterable, Mapping, Sequence
 from typing import Any, ClassVar
 
 import torch
@@ -345,6 +349,10 @@ class Muon(torch.optim.Optimizer):
     orthogonalizing the full weight matrix. This is the standard approach
     for distributed Muon and works well in practice.
 
+    The AdamW fallback follows Muon's schedule: each step sets every AdamW
+    group's rate to its base rate, its own ``lr`` or else ``adam_lr``, times
+    the ratio of Muon's first group's current rate to that group's base rate.
+
     Args:
         muon_params: Parameter groups for Muon (the hidden ``nn.Linear`` weights).
         adam_params: Parameter groups for AdamW fallback (every other parameter).
@@ -392,6 +400,8 @@ class Muon(torch.optim.Optimizer):
         adam_lr = adam_lr if adam_lr is not None else lr
         self._initial_lr = lr
         self._initial_adam_lr = adam_lr
+        self._lead_group_lr: float | None = muon_params[0].get("lr") if muon_params else None
+        self._adam_group_lrs: list[float | None] = [group.get("lr") for group in adam_params]
 
         self._adam = (
             torch.optim.AdamW(
@@ -422,19 +432,28 @@ class Muon(torch.optim.Optimizer):
         return (self._adam,) if self._adam is not None else ()
 
     def state_dict(self) -> dict:
-        """Include internal AdamW state in the plain ``state_dict()``."""
+        """Include internal AdamW state in the plain ``state_dict()``, and the base rates the
+        fallback follows Muon's schedule from when a param group has a rate of its own."""
         sd = super().state_dict()
         if self._adam is not None:
             sd["_adam_state"] = self._adam.state_dict()
         sd["_initial_lr"] = self._initial_lr
         sd["_initial_adam_lr"] = self._initial_adam_lr
+        if self._lead_group_lr is not None or any(lr is not None for lr in self._adam_group_lrs):
+            sd["_lead_group_lr"] = self._lead_group_lr
+            sd["_adam_group_lrs"] = list(self._adam_group_lrs)
         return sd
 
     def load_state_dict(self, state_dict: dict) -> None:
-        """Restore internal AdamW state from checkpoint."""
+        """Restore internal AdamW state from checkpoint.
+
+        A state without the fallback's base rates keeps this optimizer's own.
+        """
         adam_state = state_dict.pop("_adam_state", None)
         self._initial_lr = state_dict.pop("_initial_lr", self._initial_lr)
         self._initial_adam_lr = state_dict.pop("_initial_adam_lr", self._initial_adam_lr)
+        self._lead_group_lr = state_dict.pop("_lead_group_lr", self._lead_group_lr)
+        self._adam_group_lrs = list(state_dict.pop("_adam_group_lrs", self._adam_group_lrs))
         super().load_state_dict(state_dict)
         if adam_state is not None and self._adam is not None:
             self._adam.load_state_dict(adam_state)
@@ -507,13 +526,23 @@ class Muon(torch.optim.Optimizer):
                 p_local.add_(update, alpha=-lr)
 
         if self._adam is not None:
-            if self._initial_lr > 0:
-                scale = self.param_groups[0]["lr"] / self._initial_lr
-                for group in self._adam.param_groups:
-                    group["lr"] = self._initial_adam_lr * scale
+            for group, lr in zip(self._adam.param_groups, self._fallback_lrs(), strict=True):
+                group["lr"] = lr
             self._adam.step()
 
         return loss
+
+    def _fallback_lrs(self) -> list[float]:
+        """The rate each AdamW fallback group steps at, from Muon's current schedule."""
+        assert self._adam is not None
+        lead_lr = self._initial_lr if self._lead_group_lr is None else self._lead_group_lr
+        if lead_lr <= 0:
+            return [group["lr"] for group in self._adam.param_groups]
+        scale = self.param_groups[0]["lr"] / lead_lr
+        return [
+            (self._initial_adam_lr if base_lr is None else base_lr) * scale
+            for base_lr in self._adam_group_lrs
+        ]
 
 
 def _muon_matrices(model: torch.nn.Module, *, routers: bool) -> set[torch.Tensor]:
@@ -560,6 +589,11 @@ def _build_muon(
     if not adam_groups:
         adam_groups = [{"params": [], "weight_decay": 0.0}]
 
+    adam_lr_ratio = 1.0 if config.muon_adam_lr is None else config.muon_adam_lr / config.lr
+    for group in adam_groups:
+        if "lr" in group:
+            group["lr"] *= adam_lr_ratio
+
     n_muon = sum(p.numel() for g in muon_groups for p in g["params"])
     n_adam = sum(p.numel() for g in adam_groups for p in g["params"])
     logger.info(f"Muon: {n_muon:,} params (NS-orthogonalized), {n_adam:,} params (AdamW fallback)")
@@ -604,18 +638,139 @@ def _should_decay(name: str, param: torch.nn.Parameter, scope: str) -> bool:
     return "bias" not in name
 
 
+def _module_owners(
+    model: torch.nn.Module,
+    modules: Iterable[str],
+    module_patterns: Mapping[str, Sequence[str]] | None,
+) -> dict[torch.Tensor, str]:
+    """Map every parameter of ``model`` that one of ``modules`` matches to that module.
+
+    Names are matched as the module that ``torch.compile`` wrapped, if any, names them.
+
+    Raises:
+        ValueError: ``module_patterns`` is missing or lacks one of ``modules``, one of
+            ``modules`` matches no parameter, or a parameter matches two of them.
+    """
+    modules = sorted(modules)
+    if module_patterns is None:
+        raise ValueError(
+            "optimizer.lr_multipliers names modules, so build_optimizer needs module_patterns"
+        )
+    unknown = [module for module in modules if module not in module_patterns]
+    if unknown:
+        raise ValueError(
+            f"optimizer.lr_multipliers names unknown modules {unknown}; the modules of "
+            f"module_patterns are {sorted(module_patterns)}"
+        )
+    owners: dict[torch.Tensor, str] = {}
+    for name, param in getattr(model, "_orig_mod", model).named_parameters():
+        matched = [
+            module
+            for module in modules
+            if any(fnmatch.fnmatch(name, pattern) for pattern in module_patterns[module])
+        ]
+        if len(matched) > 1:
+            raise ValueError(
+                f"Parameter {name!r} is in more than one module of optimizer.lr_multipliers: "
+                f"{matched}. List modules whose patterns share no parameter."
+            )
+        if matched:
+            owners[param] = matched[0]
+    unmatched = sorted(set(modules) - set(owners.values()))
+    if unmatched:
+        raise ValueError(
+            f"optimizer.lr_multipliers names modules {unmatched} whose module_patterns match "
+            "no parameter of the model"
+        )
+    return owners
+
+
+def _split_by_module(
+    model: torch.nn.Module,
+    param_groups: list[dict],
+    config: OptimizerConfig,
+    module_patterns: Mapping[str, Sequence[str]] | None,
+) -> list[dict]:
+    """Give each module of ``config.lr_multipliers`` its own copy of every group.
+
+    A module's copy holds the module's parameters, sets ``"lr"`` to ``config.lr`` times the
+    module's multiplier and names the module under ``"module"``. Parameters outside every
+    listed module stay in the original groups. The groups come out in a fixed order, the
+    original ones first and then each module's by module name, and empty groups are dropped.
+    A listed module with no trainable parameter gets no group, and a warning says its
+    multiplier has no effect.
+    """
+    owners = _module_owners(model, config.lr_multipliers, module_patterns)
+    split = [
+        {**group, "params": [p for p in group["params"] if p not in owners]}
+        for group in param_groups
+    ]
+    for module in sorted(config.lr_multipliers):
+        lr = config.lr * config.lr_multipliers[module]
+        groups = [
+            {
+                **group,
+                "params": [p for p in group["params"] if owners.get(p) == module],
+                "lr": lr,
+                "module": module,
+            }
+            for group in param_groups
+        ]
+        n_params = sum(p.numel() for group in groups for p in group["params"])
+        if n_params:
+            logger.info(f"Optimizer module {module}: {n_params:,} trainable params at lr {lr:.3g}")
+        else:
+            logger.warning(
+                f"optimizer.lr_multipliers lists {module!r}, which has no trainable parameters "
+                "when the optimizer is built, so its multiplier has no effect"
+            )
+        split.extend(groups)
+    return [group for group in split if group["params"]]
+
+
+def module_learning_rates(optimizer: torch.optim.Optimizer) -> dict[str, float]:
+    """Return the rate each module ``build_optimizer`` gave its own groups steps at next.
+
+    Keyed by the metric it is logged as, ``lr/<module>``. Under Muon that is the rate of the
+    module's orthogonalized matrices, and ``lr_adamw/<module>`` is that of its AdamW fallback,
+    each present when the module has such parameters. No key nests under another metric's
+    name, which a file-based tracking store cannot hold. Empty when ``optimizer.lr_multipliers``
+    was empty.
+    """
+    rates = {
+        f"lr/{group['module']}": group["lr"]
+        for group in optimizer.param_groups
+        if "module" in group
+    }
+    if isinstance(optimizer, Muon) and optimizer._adam is not None:
+        fallback = zip(optimizer._adam.param_groups, optimizer._fallback_lrs(), strict=True)
+        rates.update({f"lr_adamw/{g['module']}": lr for g, lr in fallback if "module" in g})
+    return rates
+
+
 def build_optimizer(
     model: torch.nn.Module,
     config: OptimizerConfig,
+    module_patterns: Mapping[str, Sequence[str]] | None = None,
 ) -> torch.optim.Optimizer:
     """Construct an optimizer with per-parameter-group weight decay settings.
+
+    With ``config.lr_multipliers`` set, each listed module's parameters get their own
+    groups at ``config.lr`` times the module's multiplier, named by ``"module"``; the
+    scheduler then scales every group's own rate by the same factor.
 
     Args:
         model: Model whose parameters to optimize.
         config: Optimizer configuration.
+        module_patterns: Module name to the fnmatch patterns of its parameter names, such
+            as ``VLMConfig.module_patterns``. Required when ``config.lr_multipliers`` is set.
 
     Returns:
         Configured optimizer instance.
+
+    Raises:
+        ValueError: ``config.lr_multipliers`` names a module ``module_patterns`` lacks or
+            one that matches no parameter, or two of its modules share a parameter.
     """
     decay_params = []
     no_decay_params = []
@@ -632,6 +787,8 @@ def build_optimizer(
         {"params": decay_params, "weight_decay": config.weight_decay},
         {"params": no_decay_params, "weight_decay": 0.0},
     ]
+    if config.lr_multipliers:
+        param_groups = _split_by_module(model, param_groups, config, module_patterns)
 
     n_decay = sum(p.numel() for p in decay_params)
     n_no_decay = sum(p.numel() for p in no_decay_params)
