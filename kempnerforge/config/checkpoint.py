@@ -76,10 +76,19 @@ class CheckpointConfig:
         if self.interval <= 0:
             raise ValueError("interval must be positive")
         if not isinstance(self.exclude_from_loading, list) or any(
-            k not in ("model", "optimizer") for k in self.exclude_from_loading
+            k not in ("model", "optimizer", "train_state") for k in self.exclude_from_loading
         ):
             raise ValueError(
-                "exclude_from_loading accepts only 'model' and/or 'optimizer' "
+                "exclude_from_loading accepts only 'model', 'optimizer' and/or 'train_state' "
+                f"(got {self.exclude_from_loading!r})"
+            )
+        if "train_state" in self.exclude_from_loading and set(self.exclude_from_loading) != {
+            "optimizer",
+            "train_state",
+        }:
+            raise ValueError(
+                "exclude_from_loading with 'train_state' must be ['optimizer', 'train_state']: "
+                "a weights-only warm start loads the model alone "
                 f"(got {self.exclude_from_loading!r})"
             )
 

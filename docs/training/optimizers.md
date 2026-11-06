@@ -36,7 +36,8 @@ optimizer. A checkpoint that does not record a scope was written under
 `"exclude_norms_and_biases"`, the only grouping that existed before the scope was
 recorded. To change the scope, start a new run from the checkpoint without its
 optimizer state: set `checkpoint.load_path` to it and
-`checkpoint.exclude_from_loading = ["optimizer"]`, with a `checkpoint.dir` that holds
+`checkpoint.exclude_from_loading = ["optimizer", "train_state"]`, with a
+`checkpoint.dir` that holds
 no checkpoint. Training auto-resumes from a checkpoint in `checkpoint.dir` in place of
 `load_path`, optimizer state included (see
 [Auto-resume](../checkpointing/auto-resume.md)). Code that builds its own

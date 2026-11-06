@@ -850,7 +850,14 @@ class CheckpointManager:
                 or the ``latest`` symlink.
             scheduler: LR scheduler to restore.
             dataloader: Stateful dataloader to restore.
-            exclude_keys: DCP state keys to skip (e.g., ["optimizer"] for fine-tuning).
+            exclude_keys: State to skip: the DCP keys ``"model"`` and
+                ``"optimizer"`` (e.g. ``["optimizer"]`` for fine-tuning), or
+                ``["optimizer", "train_state"]`` for a weights-only warm start
+                that loads the model alone and ignores ``train_state.pt`` (step,
+                token count, scheduler, dataloader position, RNG) and the saved
+                freeze metadata, so the new run starts at step 0 with its own
+                schedule, data order and freeze. ``"train_state"`` in any other
+                combination raises ``ValueError``.
             vlm_freeze_expected: Canonical freeze metadata (output of
                 ``canonical_freeze_meta``) for the current run's VLMConfig.
                 When both the saved metadata and this argument are set,
@@ -877,8 +884,14 @@ class CheckpointManager:
             ckpt_dir = self._resolve_dcp_load_dir(ckpt_dir, path)
 
         logger.info(f"Loading checkpoint: {ckpt_dir}")
+        load_train_state = exclude_keys is None or "train_state" not in exclude_keys
+        if not load_train_state and set(exclude_keys or ()) != {"optimizer", "train_state"}:
+            raise ValueError(
+                "exclude_keys with 'train_state' must be ['optimizer', 'train_state']: a "
+                f"weights-only warm start loads the model alone (got {exclude_keys!r})"
+            )
 
-        if vlm_freeze_expected is not None:
+        if vlm_freeze_expected is not None and load_train_state:
             metadata_path = ckpt_dir / _METADATA_FILE
             if metadata_path.exists():
                 try:
@@ -980,7 +993,13 @@ class CheckpointManager:
         else:
             train_state_exists = train_state_path.exists()
 
-        if train_state_exists:
+        if train_state_exists and not load_train_state:
+            logger.info(
+                f"Weights-only warm start from {ckpt_dir}: its step, schedule, data position "
+                "and RNG are not restored, and its freeze metadata is not compared"
+            )
+            step, tokens_seen, extra = 0, 0, {}
+        elif train_state_exists:
             train_state = (
                 _load_train_state(train_state_path)
                 if self._rank == 0 or not dist.is_initialized()
@@ -1094,7 +1113,8 @@ class CheckpointManager:
                 f"param groups, so the saved optimizer state cannot be loaded into this run's "
                 f"groups. Resume with weight_decay_scope={saved!r}, or start a new run from "
                 f"the checkpoint without its optimizer state: checkpoint.load_path="
-                f'{str(ckpt_dir)!r} with checkpoint.exclude_from_loading=["optimizer"] and '
+                f'{str(ckpt_dir)!r} with checkpoint.exclude_from_loading=["optimizer", '
+                f'"train_state"] and '
                 f"a checkpoint.dir that holds no checkpoint, since training auto-resumes from "
                 f"a checkpoint there in place of load_path, optimizer state included."
             )

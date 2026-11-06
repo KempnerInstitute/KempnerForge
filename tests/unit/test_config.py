@@ -438,9 +438,27 @@ class TestCheckpointConfig:
         with pytest.raises(ValueError, match="interval must be positive"):
             CheckpointConfig(interval=0)
 
-    @pytest.mark.parametrize("keys", [[], ["model"], ["optimizer"], ["model", "optimizer"]])
-    def test_exclude_from_loading_accepts_the_two_state_keys(self, keys):
+    @pytest.mark.parametrize(
+        "keys",
+        [
+            [],
+            ["model"],
+            ["optimizer"],
+            ["model", "optimizer"],
+            ["optimizer", "train_state"],
+            ["train_state", "optimizer"],
+        ],
+    )
+    def test_exclude_from_loading_accepts_the_state_keys(self, keys):
         assert CheckpointConfig(exclude_from_loading=keys).exclude_from_loading == keys
+
+    @pytest.mark.parametrize(
+        "keys",
+        [["train_state"], ["model", "train_state"], ["model", "optimizer", "train_state"]],
+    )
+    def test_train_state_is_rejected_outside_the_weights_only_pair(self, keys):
+        with pytest.raises(ValueError, match="must be \\['optimizer', 'train_state'\\]"):
+            CheckpointConfig(exclude_from_loading=keys)
 
     @pytest.mark.parametrize(
         "keys",
