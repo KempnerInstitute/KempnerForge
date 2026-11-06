@@ -798,7 +798,7 @@ def plugin_norm():
     name = "adapter_pre_norm_test_plugin"
     registry.register("norm", name, _PluginNorm)
     yield name
-    registry._get_store("norm").pop(name)
+    registry.unregister("norm", name)
 
 
 class TestAdapterConfigPreNorm:
@@ -1003,8 +1003,7 @@ def plugin_adapter():
 
     yield register
     for name in names:
-        registry._get_store("adapter").pop(name, None)
-        registry._get_store("adapter_accepts").pop(name, None)
+        registry.unregister("adapter", name)
 
 
 class TestAdapterAccepts:

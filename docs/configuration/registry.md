@@ -17,7 +17,9 @@ model = registry.get("mlp", "my_mlp")(dim=4096, hidden_dim=11008)
 
 `register(category, name, obj)` fails fast on duplicate names; `get`
 raises `KeyError` with an "Available: […]" hint when a name is missing;
-`list(category)` returns registered names.
+`list(category)` returns registered names; `unregister(category, name)`
+removes an entry and returns it, raising the same `KeyError` when the name
+is missing (an adapter's `accepts` declaration goes with it).
 
 ## The seven categories
 

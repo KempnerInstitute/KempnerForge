@@ -51,6 +51,21 @@ class Registry:
             raise KeyError(f"Unknown {category}: '{name}'. Available: {available}")
         return store[name]
 
+    def unregister(self, category: str, name: str) -> Any:
+        """Remove the object under category/name and return it.
+
+        Removing an adapter also removes the ``accepts`` declaration it
+        registered with, so a later adapter under that name starts without one.
+
+        Raises:
+            KeyError: Nothing is registered under category/name.
+        """
+        obj = self.get(category, name)
+        del self._get_store(category)[name]
+        if category == "adapter":
+            self._get_store("adapter_accepts").pop(name, None)
+        return obj
+
     def list(self, category: str) -> list[str]:
         """List all registered names in a category."""
         return list(self._get_store(category).keys())
