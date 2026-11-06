@@ -280,6 +280,38 @@ def _restore_never_stepped(
     optim_state["state"].update({fqn: {} for fqn in never_stepped})
 
 
+def _check_saved_state_matches(
+    optim_state: dict[str, Any], saved_keys: Iterable[str], where: Path
+) -> None:
+    """Fail if a parameter was saved with another optimizer's state than the one it now has."""
+    kept = {fqn: set(state) for fqn, state in optim_state["state"].items()}
+    saved: dict[str, set[str]] = {}
+    for key in saved_keys:
+        if not key.startswith(_OPTIM_STATE_PREFIX):
+            continue
+        name = key.removeprefix(_OPTIM_STATE_PREFIX)
+        fqn = name
+        while fqn and fqn not in kept:
+            fqn = fqn.rpartition(".")[0]
+        if fqn:
+            saved.setdefault(fqn, set()).add(name.removeprefix(f"{fqn}.").split(".", 1)[0])
+    moved = sorted(
+        fqn for fqn, entries in saved.items() if entries - kept[fqn] and kept[fqn] - entries
+    )
+    if moved:
+        first = moved[0]
+        raise RuntimeError(
+            f"{where} holds another optimizer's state for {len(moved)} parameters: "
+            f"{moved[:8]}. {first} was saved with "
+            f"{sorted(saved[first])} and is now kept with {sorted(kept[first])}: its optimizer "
+            "changed since the save, e.g. optimizer.name or optimizer.muon_router changed, "
+            "or Muon used to orthogonalize it before it routed parameters by module. "
+            "To continue from these weights with a fresh optimizer, set "
+            "checkpoint.load_path to this checkpoint and checkpoint.exclude_from_loading = "
+            '["optimizer"], with a checkpoint.dir that holds no checkpoint yet.'
+        )
+
+
 def _load_train_state(path: Path) -> dict[str, Any]:
     """Load ``train_state.pt`` under an explicit trust boundary.
 
@@ -924,6 +956,7 @@ class CheckpointManager:
                     f"{dcp_dir} is missing optimizer param-group keys {sorted(filled)}; "
                     f"resuming with {filled}"
                 )
+            _check_saved_state_matches(dcp_state["optimizer"], saved_keys, dcp_dir)
 
         if dcp_state:
             planner = _NeverSteppedStatePlanner()

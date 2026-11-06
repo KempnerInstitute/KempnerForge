@@ -40,6 +40,7 @@ loader — if both are set, pre-tokenized takes precedence.
 def run_eval(
     model, eval_dataloader, loss_fn, device, eval_steps,
     *, pp_schedule=None, pp_rank=None, pp_size=None, pp_group=None,
+    pp_n_microbatches=None,
 ) -> dict[str, float]:
 ```
 
@@ -76,11 +77,15 @@ repeat already-seen batches.
 
 ### PP path (`pp_schedule` provided)
 
-Mirrors the [PP training step](training-loop.md#pp-step-pipeline_step):
-collects `eval_steps` batches into full tensors, feeds through
-`pp_schedule.step(..., losses=pp_losses)`, averages the per-microbatch
-losses on the last stage, then broadcasts a single scalar across the
-PP group:
+Mirrors the [PP training step](training-loop.md#pp-step-pipeline_step),
+forward only. `pp_schedule` is the training schedule, built with the loss
+function, so it has a backward pass, and torch refuses its `step()` under
+`no_grad`. Eval goes through `pp_schedule.eval(...)` instead, which turns
+the backward off for that call. The batches go `pp_n_microbatches` at a
+time (the loop passes `train.grad_accum_steps`), so every microbatch has
+the shape the stages were built for; `eval_steps` must be a multiple of
+it. The last stage averages the per-microbatch losses of all calls, then
+broadcasts a single scalar across the PP group:
 
 ```python
 loss_tensor = torch.tensor([avg_loss], device=device)
@@ -89,6 +94,16 @@ dist.broadcast(loss_tensor, group_src=pp_size - 1, group=pp_group)
 
 All PP stages see the same `avg_loss` after the broadcast, which is
 what the metrics tracker expects.
+
+Under PP the eval dataloader drops a partial last batch, which the stages
+could not take. The sampler splits the eval set evenly across data-parallel
+ranks and drops the remainder, so each rank needs at least one full batch;
+with none, building the eval dataloader raises `ValueError` before training
+starts. When `eval_steps` asks for more batches than the loader holds, eval
+starts the loader over. The schedule's gradient reduction still runs after
+each `eval()` call, which with FSDP2 reshards the stage; `run_eval` turns the
+schedule's gradient scaling off for those calls, so gradients left on the
+stage keep their values.
 
 ## In-loop evaluation
 
@@ -100,7 +115,7 @@ if eval_config.enabled and eval_dataloader is not None \
     eval_metrics = run_eval(
         model, eval_dataloader, loss_fn, device, eval_config.steps,
         pp_schedule=pp_schedule, pp_rank=pp_rank, pp_size=pp_size,
-        pp_group=pp_group,
+        pp_group=pp_group, pp_n_microbatches=grad_accum_steps,
     )
     tracker.log_eval(eval_metrics, step)
     hook_runner.on_eval_end(eval_metrics, step)

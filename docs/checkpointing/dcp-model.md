@@ -85,12 +85,12 @@ metadata. Those go in `train_state.pt` alongside —
 
 `get_optimizer_state_dict` keeps only an optimizer's own `state` and
 `param_groups`; any other key its `state_dict()` returns is dropped.
-Muon hands the parameters Newton-Schulz cannot take — norms and
-biases, plus the embedding and output head whenever
-`vocab_size / dim > 10` — to an inner `torch.optim.AdamW` that its own
-`param_groups` do not list, so passing Muon alone would leave that
-AdamW's moments out of the checkpoint and restart them from zero on
-every resume.
+Muon hands every parameter but the hidden `nn.Linear` weights — the
+embedding and output head, conv kernels, packed expert weights, MoE
+router gates unless `optimizer.muon_router` is set, norms and biases —
+to an inner `torch.optim.AdamW` that its own `param_groups` do not list, so
+passing Muon alone would leave that AdamW's moments out of the
+checkpoint and restart them from zero on every resume.
 
 `Muon.inner_optimizers` names the inner AdamW, and the manager's
 `checkpointed_optimizers` — `[optimizer, *optimizer.inner_optimizers]` —
@@ -258,6 +258,23 @@ from it with `[checkpoint].load_path` and
 `exclude_from_loading = ["optimizer"]`, which restores the weights and
 begins with a fresh optimizer (`["optimizer", "train_state"]` also starts the
 step, schedule and data order fresh).
+
+A parameter whose optimizer changed since the save holds another
+optimizer's state. An embedding or output head that Muon
+orthogonalized before it routed parameters by module has a saved
+`momentum_buffer` where its AdamW now keeps `exp_avg`, `exp_avg_sq` and
+`step`. The same holds for any other parameter that change moved, such
+as a vision tower's position table or an MQA key projection, for a
+router gate when `optimizer.muon_router` changes, and for every
+parameter when `optimizer.name` changes. The load compares the template's state
+entries with the checkpoint's metadata before reading anything and fails
+naming those parameters, instead of leaving `dcp.load` to stop at the
+first missing key. Continuing from the weights takes the same warm start,
+from a `checkpoint.dir` that holds no checkpoint yet. The comparison
+covers only the optimizers the load restores, so a Muon checkpoint saved
+before the inner AdamW was checkpointed is not checked: a parameter that
+moved to the inner AdamW starts fresh, and one that moved to Muon still
+fails inside `dcp.load`.
 
 The template also holds every param-group key the optimizer has now,
 and DCP requires each one. An optimizer whose param groups gained a key

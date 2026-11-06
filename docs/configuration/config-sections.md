@@ -135,10 +135,11 @@ are shared (AdamW/Lion) or optimizer-specific.
 | `fused` | `bool` | `True` | use fused AdamW when available |
 | `muon_momentum` | `float` | `0.95` | Muon momentum coefficient |
 | `muon_ns_steps` | `int` | `5` | Newton–Schulz iterations for Muon |
-| `muon_adam_lr` | `float \| None` | `None` | LR for 1-D params in Muon's AdamW fallback; `None` → same as `lr` |
+| `muon_adam_lr` | `float \| None` | `None` | LR for the parameters Muon leaves to its AdamW fallback; `None` → same as `lr` |
 | `muon_nesterov` | `bool` | `False` | Orthogonalize the Nesterov look-ahead instead of the momentum buffer |
 | `muon_adjust_lr` | `"original" \| "match_rms_adamw" \| "spectral_unclamped"` | `"original"` | Factor on each orthogonalized update |
 | `muon_orthogonalize` | `"local" \| "exact"` | `"local"` | Newton–Schulz on each rank's shard, or on the full matrix |
+| `muon_router` | `bool` | `False` | Orthogonalize MoE router gates with Muon instead of its AdamW fallback |
 | `schedule_free_warmup_steps` | `int` | `0` | internal warmup for schedule-free |
 | `weight_decay_scope` | `"exclude_norms_and_biases" \| "all"` | `"exclude_norms_and_biases"` | which parameters are decayed; `"all"` decays every parameter, as `torch.optim.AdamW` does by default. A resume that restores optimizer state saved under the other scope is refused |
 
@@ -220,7 +221,7 @@ In-loop evaluation. Disabled by default.
 |-------|------|---------|---------|
 | `enabled` | `bool` | `False` | gate in-loop eval |
 | `interval` | `int` | `1000` | eval every N training steps |
-| `steps` | `int` | `50` | eval batches per evaluation |
+| `steps` | `int` | `50` | eval batches per evaluation; under pipeline parallelism a multiple of `train.grad_accum_steps` |
 | `dataset_path` | `str` | `""` | pre-tokenized eval shards |
 | `file_pattern` | `str` | `"*.npy"` | glob inside `dataset_path` |
 | `token_dtype` | `str` | `""` | dtype of raw `.bin` eval shards, `"uint16"` or `"uint32"`; `""` takes it from the `metadata.yaml` beside them, never from `data.token_dtype` |

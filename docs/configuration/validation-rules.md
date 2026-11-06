@@ -227,6 +227,15 @@ stages, so they can't be tied.
 eval.enabled && !eval.dataset_path && !eval.hf_dataset_name  →  ValueError
 ```
 
+### Eval steps under pipeline parallelism
+
+```
+eval.enabled && distributed.pp > 1 && eval.steps % train.grad_accum_steps != 0  →  ValueError
+```
+
+Eval runs its batches through the training schedule, `grad_accum_steps` at a
+time, so each eval microbatch has the shape the stages were built for.
+
 ### VLM architectures under tensor parallelism
 
 Checked first when `distributed.tp > 1`, ahead of head divisibility, so the
