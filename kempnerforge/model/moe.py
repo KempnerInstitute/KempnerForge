@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
@@ -11,6 +12,9 @@ import torch.nn.functional as F
 import kempnerforge.model.router  # noqa: F401
 from kempnerforge.config.registry import registry
 from kempnerforge.model.mlp import build_mlp
+
+if TYPE_CHECKING:
+    from torch.distributed.device_mesh import DeviceMesh
 
 _HAS_GROUPED_MM = hasattr(torch, "_grouped_mm")
 
@@ -182,6 +186,7 @@ class MoEMLP(nn.Module):
 
         self.ep_world_size: int = 1
         self.ep_group = None
+        self.ep_mesh: DeviceMesh | None = None
         self.local_expert_start: int = 0
         self.num_local_experts: int = len(experts)
 

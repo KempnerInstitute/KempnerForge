@@ -1193,6 +1193,7 @@
             "load(path, scheduler, dataloader, exclude_keys, vlm_freeze_expected)",
             "_read_saved_keys(ckpt_dir, dcp_dir) (this rank's DCP keys; checks the scope only when an all-reduce on the gloo group finds optimizer state on some rank)",
             "_check_weight_decay_scope(ckpt_dir) (rank 0 reads the saved scope and broadcasts it; every rank refuses a mismatch)",
+            "_present_experts(dcp_state, load_from, saved_keys) (EP experts placed among all of them before DCP; a load refuses a checkpoint of fewer experts than the model; the ranks agree before DCP)",
             "apply_dataloader_state(dataloader)",
             "_resolve_load_path(path)",
             "_cleanup()"
@@ -1214,6 +1215,7 @@
         "tests/unit/test_checkpoint.py::TestIntersectFreezeMetaByModule",
         "tests/unit/test_checkpoint_security.py::TestLoadTrainStateOwnershipGate",
         "tests/unit/test_checkpoint_security.py::TestManagerLoadRejectsForeignCheckpoint",
+        "tests/unit/test_ep_checkpoint.py",
         "tests/integration/test_checkpoint_roundtrip.py::TestCheckpointRoundtrip",
         "tests/distributed/test_checkpoint.py"
       ]
@@ -1226,13 +1228,34 @@
             "is_pending"
           ],
           "methods": [
-            "save(state_dict, checkpoint_id, process_group)",
+            "save(state_dict, checkpoint_id, process_group, planner)",
             "wait()"
           ]
         }
       },
       "tested_by": [
         "tests/unit/test_checkpoint.py::TestAsyncCheckpointer"
+      ]
+    },
+    "kempnerforge/checkpoint/expert_layout.py": {
+      "classes": {
+        "ExpertLayout": {
+          "purpose": "Translates a DCP state dict between one EP rank's experts and all of them: unpacked experts under their global index, packed weights as views over the FSDP mesh and ep holding every expert's rows, with optimizer state and param-group lists to match",
+          "methods": [
+            "to_global(state) -> dict",
+            "to_local(state) -> dict"
+          ]
+        }
+      },
+      "functions": [
+        "moe_layers(model) -> Iterator[(state-dict name, MoEMLP)]",
+        "expert_layout(model) -> ExpertLayout | None (None without expert parallelism)",
+        "check_saved_experts(model, saved, where) (refuses a checkpoint holding fewer experts than the model, as one saved with ep > 1 before #202 does)"
+      ],
+      "tested_by": [
+        "tests/unit/test_expert_layout.py",
+        "tests/unit/test_ep_checkpoint.py",
+        "tests/distributed/test_ep.py::TestEPCheckpoint"
       ]
     },
     "kempnerforge/metrics/tracker.py": {
@@ -1407,7 +1430,10 @@
     },
     "scripts/generate.py": {
       "purpose": "Text generation — load model, sample from prompts, interactive REPL",
-      "entry": "main()"
+      "entry": "main()",
+      "tested_by": [
+        "tests/unit/test_ep_checkpoint.py::TestUnfixedCheckpoint"
+      ]
     },
     "scripts/convert_checkpoint.py": {
       "purpose": "KempnerForge <-> HuggingFace checkpoint conversion",
@@ -1417,7 +1443,8 @@
         "_build_hf_config()"
       ],
       "tested_by": [
-        "tests/unit/test_convert_checkpoint.py"
+        "tests/unit/test_convert_checkpoint.py",
+        "tests/unit/test_ep_checkpoint.py::TestExportFromAnEPCheckpoint"
       ]
     },
     "scripts/prepare_data.py": {
@@ -1638,6 +1665,31 @@
           "TestMoERoundTrip(1)"
         ],
         "count": 29
+      },
+      "tests/unit/test_ep_checkpoint.py": {
+        "classes": [
+          "TestCheckpointHoldsEveryExpert(12)",
+          "TestSecondMeshOfOneLayout(1)",
+          "TestDriftedCopies(2)",
+          "TestPlacementCheck(1)",
+          "TestFailureOnOneRank(1)",
+          "TestResumeAtTheSameLayout(11)",
+          "TestLoadAtAnotherEP(18)",
+          "TestUnfixedCheckpoint(8)",
+          "TestExportFromAnEPCheckpoint(3)",
+          "TestWithoutEP(2)"
+        ],
+        "count": 59
+      },
+      "tests/unit/test_expert_layout.py": {
+        "classes": [
+          "TestMoELayers(2)",
+          "TestUnpackedNames(6)",
+          "TestPackedWithoutMesh(1)",
+          "TestOlderTorch(1)",
+          "TestCheckSavedExperts(6)"
+        ],
+        "count": 16
       },
       "tests/unit/test_fp8.py": {
         "classes": [
@@ -1929,7 +1981,7 @@
         "note": "MoE with FSDP/TP"
       },
       "tests/distributed/test_ep.py": {
-        "note": "Expert parallelism"
+        "note": "Expert parallelism, and an EP checkpoint round trip on four GPUs"
       },
       "tests/distributed/test_optimizer_distributed.py": {
         "note": "Lion, Schedule-Free AdamW, optimizer-scheduler compat under FSDP2"

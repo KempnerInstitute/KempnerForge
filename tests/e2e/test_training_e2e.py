@@ -750,6 +750,123 @@ def test_moe_checkpoint_resume(tmp_path):
     assert "step=10" in output, "MoE did not resume from step 10"
 
 
+_EP_RESUME_TOLERANCE = 0.05
+
+
+def _ep_moe_args(tmp_path, *overrides: str) -> list[str]:
+    """``debug_moe.toml`` on the learnable shard, logging every step's loss."""
+    return [
+        DEBUG_MOE_CONFIG,
+        "--metrics.log_interval=1",
+        "--train.seed=1234",
+        "--model.vocab_size=256",
+        f"--data.dataset_path={_make_learnable_shard(tmp_path)}",
+        "--data.file_pattern=*.npy",
+        *overrides,
+    ]
+
+
+def _assert_losses_close(reference: str, resumed: str, steps: range) -> None:
+    """The resumed run logs every step in ``steps`` within the tolerance of the reference."""
+    ref_losses = _parse_losses_by_step(reference)
+    res_losses = _parse_losses_by_step(resumed)
+    gaps = {
+        step: abs(float(res_losses[step]) - float(ref_losses[step]))
+        for step in steps
+        if step in ref_losses and step in res_losses
+    }
+    assert sorted(gaps) == list(steps), f"steps logged by both runs: {sorted(gaps)}"
+    worst = max(gaps, key=gaps.__getitem__)
+    assert gaps[worst] <= _EP_RESUME_TOLERANCE, (
+        f"step {worst}: resumed loss {res_losses[worst]} against {ref_losses[worst]} "
+        "uninterrupted; the resume did not give each EP rank its own experts"
+    )
+
+
+@pytest.mark.e2e
+@requires_gpus(4)
+@pytest.mark.parametrize("packed", ["false", "true"], ids=["unpacked", "packed"])
+def test_moe_ep_resume_matches_uninterrupted(tmp_path, packed):
+    """An ep=2 run resumed from its own step-20 checkpoint goes on as the run did.
+
+    The resume has the run's schedule, data and RNG, so with each EP rank's experts back
+    the losses match up to GPU nondeterminism: EP runs are not bit-reproducible, and a
+    checkpoint keeps one of the EP copies of the other weights, which drift apart (#482).
+    One rank's experts on every rank lands far outside the tolerance.
+    """
+    common = _ep_moe_args(
+        tmp_path,
+        "--distributed.ep=2",
+        "--distributed.dp_shard=2",
+        f"--model.moe_packed_experts={packed}",
+        "--train.max_steps=40",
+    )
+    straight = _run_training(
+        common + [f"--checkpoint.dir={tmp_path}/straight", "--checkpoint.interval=20"],
+        nproc=4,
+        timeout=300,
+    )
+    _assert_training_complete(straight, expected_steps=40)
+    resumed = _run_training(
+        common
+        + [
+            f"--checkpoint.dir={tmp_path}/resumed",
+            "--checkpoint.interval=1000",
+            f"--checkpoint.load_path={tmp_path}/straight/step_20",
+        ],
+        nproc=4,
+        timeout=300,
+    )
+    _assert_training_complete(resumed, expected_steps=40)
+    output = resumed.stdout + resumed.stderr
+    assert "step=20" in output, "did not resume from step 20"
+    _assert_losses_close(straight.stdout + straight.stderr, output, range(21, 41))
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize(
+    ("ep", "nproc"),
+    [
+        pytest.param(1, 1, id="ep1", marks=requires_gpus(2)),
+        pytest.param(4, 4, id="ep4", marks=requires_gpus(4)),
+    ],
+)
+def test_moe_ep_checkpoint_resumes_at_another_ep(tmp_path, ep, nproc):
+    """An ep=2 checkpoint resumes at another ``ep`` with every expert's weights and moments.
+
+    Every run has one DP rank, so each reads the same batches. The steps after the resume
+    run the saved weights and AdamW moments on the batches the ep=2 run took, so their
+    losses match it within the tolerance.
+    """
+    common = _ep_moe_args(tmp_path, "--train.max_steps=25")
+    straight = _run_training(
+        common
+        + [
+            "--distributed.ep=2",
+            f"--checkpoint.dir={tmp_path}/straight",
+            "--checkpoint.interval=20",
+        ],
+        nproc=2,
+        timeout=300,
+    )
+    _assert_training_complete(straight, expected_steps=25)
+    resumed = _run_training(
+        common
+        + [
+            f"--distributed.ep={ep}",
+            f"--checkpoint.dir={tmp_path}/resumed",
+            "--checkpoint.interval=1000",
+            f"--checkpoint.load_path={tmp_path}/straight/step_20",
+        ],
+        nproc=nproc,
+        timeout=300,
+    )
+    _assert_training_complete(resumed, expected_steps=25)
+    output = resumed.stdout + resumed.stderr
+    assert "step=20" in output, "did not resume from step 20"
+    _assert_losses_close(straight.stdout + straight.stderr, output, range(21, 26))
+
+
 _SIGMOID_MOE_OVERRIDES = [
     "--model.moe_router=sigmoid_topk",
     "--model.moe_sequence_aux_loss_weight=0.01",

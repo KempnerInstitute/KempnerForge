@@ -157,6 +157,13 @@ MoE-specific:
 | `layers.{i}.mlp.shared_expert.*` | `model.layers.{i}.mlp.shared_experts.*` (plural in HF) |
 | `layers.{i}.mlp.experts.{j}.*` | `model.layers.{i}.mlp.experts.{j}.*` (identical) |
 
+A checkpoint saved with expert parallelism holds every expert under its
+global index, as one saved without it does (see
+[Expert parallelism § Checkpoints](../distributed/expert-parallelism.md#checkpoints)),
+so `dcp-to-hf` exports all `num_experts` of each layer. An EP checkpoint
+saved before that layout holds one EP rank's experts of each layer, and
+`dcp-to-hf` refuses it with an error that says how many it holds.
+
 The mapping logic is in `_kf_to_hf_key` and `_hf_to_kf_key` in
 `convert_checkpoint.py` — order-sensitive string replacements (e.g.
 `.attention_norm.` handled before `.attention.` to avoid partial

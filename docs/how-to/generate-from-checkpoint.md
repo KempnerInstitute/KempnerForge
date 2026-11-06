@@ -75,6 +75,8 @@ without initializing a process group:
 
 ```python
 # scripts/generate.py
+saved = dcp.FileSystemReader(str(ckpt_path)).read_metadata().state_dict_metadata
+check_saved_experts(model, saved, ckpt_path)
 state_dict = {"model": model.state_dict()}
 dcp.load(state_dict, checkpoint_id=str(ckpt_path))
 model.load_state_dict(state_dict["model"])
@@ -86,6 +88,12 @@ side, loading the full unsharded model onto one device. For a 70B
 model that means ~140 GB of bf16 parameters — run on a node with
 enough memory, or use FSDP via a multi-GPU loader (not covered by
 `scripts/generate.py`).
+
+The check before the load refuses a checkpoint whose MoE layers hold
+fewer experts than the model, as an `ep>1` checkpoint saved before the
+fix for [#202](https://github.com/KempnerInstitute/KempnerForge/issues/202)
+does; see
+[Expert parallelism § Checkpoints](../distributed/expert-parallelism.md#checkpoints).
 
 ## The `generate()` function
 
