@@ -81,6 +81,52 @@ Pass a custom `MixedPrecisionPolicy` as the `mp_policy` kwarg if you
 need a different combination — most of the time the default is what
 you want.
 
+### fp32 master weights
+
+By default the model itself is cast to `param_dtype`, so with
+`mixed_precision = "bf16"` the sharded parameters, their gradients and
+the optimizer state (Muon's momentum included) are all bf16, and the
+`param_dtype` cast above has nothing to do. At small learning rates
+many bf16 weight updates round to nothing.
+
+```toml
+[train]
+mixed_precision = "bf16"
+fp32_master_weights = true
+```
+
+keeps the model in fp32 (`TrainConfig.master_dtype`). FSDP2 casts each
+parameter shard to `param_dtype` before the all-gather, so compute and
+all-gather traffic stay bf16 and the forward matches a bf16 copy of the
+weights bit for bit. Gradients are reduce-scattered in fp32 and stay
+fp32 on the shards, and the optimizer steps fp32 parameters with fp32
+state. Parameter, gradient and optimizer-state memory double. A
+checkpoint saved in either mode loads into the other: DCP copies each
+saved tensor into the live one, casting it.
+
+FSDP2 is what does the cast, and there is no FSDP2 wrap on a single GPU
+or on a mesh with only a `pp` dimension. There, the training and
+in-loop eval forward passes run under `torch.autocast(param_dtype)`
+instead (`TrainingSession.autocast()`), which casts per op: matmuls
+and attention run in bf16 while the residual stream and norms stay
+fp32, and a frozen vision encoder's matmuls run in bf16 too. Those numerics
+differ slightly from the FSDP2 path, and the pipeline then passes fp32
+activations between stages. `scripts/eval.py` builds its model in
+`param_dtype` either way.
+
+Limits of the autocast path:
+
+- On a pp-only mesh the whole `schedule.step()` runs under autocast,
+  backward included, because the schedule interleaves the two. PyTorch
+  recommends leaving autocast before backward. It trains (one
+  training-step test covers it), but its numerics and memory have not
+  been compared with the FSDP2 path.
+- An MoE model is rejected on a single GPU: its expert inputs would
+  stay fp32, which turns off grouped GEMM.
+
+`fp32_master_weights` with `mixed_precision = "fp32"` is rejected, since
+the weights are already fp32.
+
 ## `reshard_after_forward`
 
 ```python
@@ -174,7 +220,7 @@ apply_ac(model, mode)
 apply_fsdp2(model, mesh, mp_policy)
 model.to_empty(device=device)               # materialize on GPU
 model.init_weights_and_freqs()              # init RoPE + weights
-model.to(dtype=param_dtype)                 # cast to bf16
+model.to(dtype=param_dtype)                 # bf16, or fp32 with fp32_master_weights
 ```
 
 The meta-device init is required when TP is active: parameters must

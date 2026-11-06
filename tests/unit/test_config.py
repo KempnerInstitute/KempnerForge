@@ -272,6 +272,30 @@ class TestTrainConfig:
         with pytest.raises(ValueError, match="'fp16' is not supported: .*no loss scaling"):
             _ = config.param_dtype
 
+    def test_fp32_master_weights_default_off(self) -> None:
+        t = TrainConfig()
+        assert t.fp32_master_weights is False
+        assert t.master_dtype == t.param_dtype == torch.bfloat16
+
+    @pytest.mark.parametrize(
+        ("mixed_precision", "compute"),
+        [("bf16", torch.bfloat16), ("fp8", torch.bfloat16)],
+    )
+    def test_fp32_master_weights_keep_the_compute_dtype(
+        self, mixed_precision: str, compute: torch.dtype
+    ) -> None:
+        t = TrainConfig(mixed_precision=mixed_precision, fp32_master_weights=True)
+        assert t.param_dtype == compute
+        assert t.master_dtype == torch.float32
+
+    def test_fp32_master_weights_rejected_with_fp32(self) -> None:
+        with pytest.raises(ValueError, match="no effect with mixed_precision='fp32'"):
+            TrainConfig(mixed_precision="fp32", fp32_master_weights=True)
+
+    def test_fp32_master_weights_from_cli(self) -> None:
+        config = load_config(cli_args=["--train.fp32_master_weights=true"])
+        assert config.train.master_dtype == torch.float32
+
     def test_tf32_defaults_off(self) -> None:
         assert TrainConfig().tf32 is False
 
@@ -421,12 +445,20 @@ class TestCheckpointConfig:
             ["model"],
             ["optimizer"],
             ["model", "optimizer"],
-            ["train_state"],
             ["optimizer", "train_state"],
+            ["train_state", "optimizer"],
         ],
     )
     def test_exclude_from_loading_accepts_the_state_keys(self, keys):
         assert CheckpointConfig(exclude_from_loading=keys).exclude_from_loading == keys
+
+    @pytest.mark.parametrize(
+        "keys",
+        [["train_state"], ["model", "train_state"], ["model", "optimizer", "train_state"]],
+    )
+    def test_train_state_is_rejected_outside_the_weights_only_pair(self, keys):
+        with pytest.raises(ValueError, match="must be \\['optimizer', 'train_state'\\]"):
+            CheckpointConfig(exclude_from_loading=keys)
 
     @pytest.mark.parametrize(
         "keys",
@@ -653,6 +685,21 @@ class TestJobConfig:
         )
         config.validate(world_size=1)
 
+    def test_validate_moe_fp32_master_weights_on_one_gpu_rejected(self) -> None:
+        config = JobConfig(
+            model=ModelConfig(num_experts=8, moe_top_k=2),
+            train=TrainConfig(fp32_master_weights=True),
+        )
+        with pytest.raises(ValueError, match="fp32_master_weights with an MoE model"):
+            config.validate(world_size=1)
+
+    def test_validate_moe_fp32_master_weights_under_fsdp2_passes(self) -> None:
+        config = JobConfig(
+            model=ModelConfig(num_experts=8, moe_top_k=2),
+            train=TrainConfig(fp32_master_weights=True),
+        )
+        config.validate(world_size=2)
+
     def test_validate_dense_with_pp_passes(self):
         config = JobConfig(
             model=ModelConfig(tie_embeddings=False),
@@ -692,6 +739,20 @@ class TestJobConfig:
     def test_pp_without_packing_passes(self):
         config = JobConfig(distributed=DistributedConfig(pp=2, dp_shard=1))
         config.validate(world_size=2)
+
+    def test_pp_eval_steps_must_be_a_multiple_of_grad_accum_steps(self):
+        def job(pp: int, steps: int, enabled: bool = True) -> JobConfig:
+            return JobConfig(
+                distributed=DistributedConfig(pp=pp, dp_shard=1),
+                train=TrainConfig(grad_accum_steps=2),
+                eval=EvalConfig(enabled=enabled, steps=steps, dataset_path="/data"),
+            )
+
+        with pytest.raises(ValueError, match=r"eval.steps \(3\) must be a multiple"):
+            job(2, 3).validate(world_size=2)
+        job(2, 4).validate(world_size=2)
+        job(1, 3).validate(world_size=1)
+        job(2, 3, enabled=False).validate(world_size=2)
 
     def test_flex_rejects_seq_len_below_block_size_at_construction(self):
         """Decidable from the config alone, so it fires in __post_init__."""
