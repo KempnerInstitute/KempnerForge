@@ -90,7 +90,13 @@ class AdapterConfig:
         declared = registry.get_adapter_accepts(self.type)
         if declared is None:
             return
-        used = frozenset(declared(self) if callable(declared) else declared)
+        named = declared(self) if callable(declared) else declared
+        if isinstance(named, str):
+            raise TypeError(
+                f"accepts for adapter {self.type!r} must return a collection of field names, "
+                f"not the string {named!r}"
+            )
+        used = frozenset(named)
         known = {f.name for f in fields(self)}
         unknown = sorted(used - known)
         if unknown:

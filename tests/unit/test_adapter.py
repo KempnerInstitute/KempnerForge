@@ -1037,6 +1037,16 @@ class TestAdapterAccepts:
             registry.register_adapter("adapter_accepts_test_str", accepts="pool_window")
         assert "adapter_accepts_test_str" not in registry.list_adapters()
 
+    def test_a_callable_returning_a_string_is_rejected(self, plugin_adapter):
+        """A bare string would be read letter by letter as field names."""
+        name, _ = plugin_adapter(accepts=lambda cfg: "pool_window")
+        with pytest.raises(
+            TypeError,
+            match=rf"accepts for adapter '{name}' must return a collection of field names, "
+            r"not the string 'pool_window'",
+        ):
+            AdapterConfig(type=name)
+
     def test_a_declared_collection_is_enforced(self, plugin_adapter):
         name, seen = plugin_adapter(accepts=("pool_window",))
         build_adapter(AdapterConfig(type=name, pool_window=3), in_dim=8, out_dim=4)

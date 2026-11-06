@@ -106,7 +106,8 @@ def build_my_pool(in_dim, out_dim, pool_window=2, **_):
 ```
 
 When the fields in use depend on other fields, `accepts` is a callable that
-takes the `AdapterConfig` and returns them. The built-in `avgpool` works this
+takes the `AdapterConfig` and returns them as a collection of names, never a
+bare string (that fails when the config loads). The built-in `avgpool` works this
 way: it uses `activation` and `pre_norm` only once `hidden_dim > 0` builds its
 MLP head.
 

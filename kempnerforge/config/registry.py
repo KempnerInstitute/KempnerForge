@@ -192,10 +192,11 @@ class Registry:
             name: Registry key, selected by ``adapter.type``.
             accepts: The ``AdapterConfig`` fields the builder uses: a
                 collection of field names, or a callable that maps an
-                ``AdapterConfig`` to them when the set depends on other
-                fields. ``AdapterConfig`` rejects any other field set away
-                from its default. ``None`` declares nothing, and every field
-                is accepted.
+                ``AdapterConfig`` to such a collection when the set depends
+                on other fields (a callable that returns a string makes
+                ``AdapterConfig`` raise ``TypeError``). ``AdapterConfig``
+                rejects any other field set away from its default. ``None``
+                declares nothing, and every field is accepted.
 
         Raises:
             TypeError: ``accepts`` is a string rather than a collection of
