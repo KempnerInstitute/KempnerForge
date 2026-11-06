@@ -42,8 +42,6 @@ from kempnerforge.config.registry import registry
 if TYPE_CHECKING:
     import torch
 
-_MIXED_PRECISIONS = ("bf16", "fp32")
-
 
 @dataclass
 class VisionEncoderConfig:
@@ -71,14 +69,9 @@ class VisionEncoderConfig:
             raise ValueError(
                 f"vision_encoder.num_tokens must be non-negative (got {self.num_tokens})"
             )
-        if self.mixed_precision is not None and self.mixed_precision not in _MIXED_PRECISIONS:
-            raise ValueError(
-                f"vision_encoder.mixed_precision must be one of {list(_MIXED_PRECISIONS)} "
-                f"or unset (got {self.mixed_precision!r})"
-            )
 
     @property
-    def param_dtype(self) -> torch.dtype | None:
+    def compute_dtype(self) -> torch.dtype | None:
         """The dtype the encoder computes in, or ``None`` when ``mixed_precision`` is unset."""
         if self.mixed_precision is None:
             return None

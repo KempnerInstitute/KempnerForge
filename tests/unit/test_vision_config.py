@@ -69,21 +69,13 @@ class TestVisionEncoderMixedPrecision:
     def test_unset_by_default(self):
         cfg = VisionEncoderConfig()
         assert cfg.mixed_precision is None
-        assert cfg.param_dtype is None
+        assert cfg.compute_dtype is None
 
     @pytest.mark.parametrize(
         ("precision", "dtype"), [("bf16", torch.bfloat16), ("fp32", torch.float32)]
     )
     def test_resolves_to_the_compute_dtype(self, precision, dtype):
-        assert VisionEncoderConfig(mixed_precision=precision).param_dtype == dtype
-
-    @pytest.mark.parametrize("precision", ["fp16", "fp8", "float32", ""])
-    def test_other_values_raise_naming_the_valid_ones(self, precision):
-        with pytest.raises(
-            ValueError,
-            match=r"vision_encoder.mixed_precision must be one of \['bf16', 'fp32'\] or unset",
-        ):
-            VisionEncoderConfig(mixed_precision=precision)
+        assert VisionEncoderConfig(mixed_precision=precision).compute_dtype == dtype
 
     def test_loads_from_toml_and_cli(self, tmp_path):
         toml = tmp_path / "vlm.toml"
@@ -98,14 +90,15 @@ class TestVisionEncoderMixedPrecision:
 
         override = load_config(str(toml), cli_args=["--vision_encoder.mixed_precision=bf16"])
         assert override.vision_encoder is not None
-        assert override.vision_encoder.param_dtype == torch.bfloat16
+        assert override.vision_encoder.compute_dtype == torch.bfloat16
 
         unset = load_config(str(toml), cli_args=["--vision_encoder.mixed_precision=None"])
         assert unset.vision_encoder is not None
         assert unset.vision_encoder.mixed_precision is None
 
-    def test_toml_rejects_other_values(self, tmp_path):
+    @pytest.mark.parametrize("precision", ["fp16", "fp8", "float32", ""])
+    def test_toml_rejects_other_values(self, tmp_path, precision):
         toml = tmp_path / "vlm.toml"
-        toml.write_text('[vision_encoder]\ntype = "random"\nmixed_precision = "fp16"\n')
+        toml.write_text(f'[vision_encoder]\ntype = "random"\nmixed_precision = "{precision}"\n')
         with pytest.raises(ValueError, match=r"not in allowed Literal values: \('bf16', 'fp32'\)"):
             load_config(str(toml), cli_args=[])
