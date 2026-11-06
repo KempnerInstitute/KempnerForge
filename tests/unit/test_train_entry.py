@@ -2592,6 +2592,13 @@ class TinyVlmModel(nn.Module):
         return self.proj(self.embed(input_ids)), labels
 
 
+class TracedOnceVlmModel(TinyVlmModel):
+    """``TinyVlmModel`` without the frame-mask record, so a compiled forward is traced once."""
+
+    def forward(self, pixel_values, input_ids, labels, frame_mask=None):
+        return self.proj(self.embed(input_ids)), labels
+
+
 class TestVlmStep:
     def _batch(self, with_mask=False):
         b = {
@@ -2961,10 +2968,10 @@ def _built_with_a_frozen_head(
 
     assert config.vlm is not None
     torch.manual_seed(0)
-    model: Any = TinyVlmModel()
+    model: Any = TracedOnceVlmModel() if compiled else TinyVlmModel()
     apply_freeze_specs(model, config.vlm.freeze, config.vlm.module_patterns)
     if compiled:
-        model = torch.compile(model, backend="eager")
+        model = torch.compile(model, backend="aot_eager")
     with entry._trainable_for_the_run(model, config):
         optimizer = build_optimizer(model, config.optimizer)
     return model, optimizer
@@ -3032,7 +3039,7 @@ class TestResumePastAnUnfreezeStage:
         frozen, held by the optimizer with no state."""
         import kempnerforge.training.entry as entry
         from kempnerforge.checkpoint.manager import CheckpointManager
-        from kempnerforge.training.freeze import apply_freeze_specs
+        from kempnerforge.training.loop import _apply_stage_specs
 
         config = _head_config(max_steps=4)
         config.checkpoint.dir = str(tmp_path / "ckpt")
@@ -3046,7 +3053,7 @@ class TestResumePastAnUnfreezeStage:
             optimizer.zero_grad()
             if step == 2:
                 stage = config.vlm.freeze_schedule[0]
-                apply_freeze_specs(model, stage.specs, config.vlm.module_patterns)
+                _apply_stage_specs(model, stage.specs, config.vlm.module_patterns)
         CheckpointManager(config.checkpoint, model, optimizer).save(
             step=saved_step, extra=checkpoint_extra(config, saved_step, PhaseState())
         )
