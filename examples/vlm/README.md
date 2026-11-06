@@ -147,56 +147,6 @@ uv run torchrun --nproc_per_node=4 examples/vlm/train.py \
 `scripts/prep_vlm_coco.py` writes a COCO-Karpathy `save_to_disk` directory for
 `data.hf_dataset_name` to point at.
 
-## Pack documents
-
-By default every row holds one document: its image tokens, then its text
-right-padded to `vlm.max_text_len`. With `data.pack_sequences = true` on a
-`joint_decoder` run, `PackedVLMCollator` packs the `train.batch_size` documents
-of each micro-batch first-fit into rows of `train.seq_len` instead. Each
-document is its image's token slots followed by its real text, `doc_ids` keeps
-attention inside a document, and the wrapper writes each image's tokens over
-its slots (`ModalityContext.inline_embeds`). The number of rows follows the
-documents' lengths, so it varies between micro-batches.
-
-```toml
-[vision_encoder]
-type = "siglip2"
-path = "google/siglip2-so400m-patch16-512"
-num_tokens = 1024          # the packer needs the count before the encoder is built
-
-[adapter]
-type = "avgpool"
-pool_window = 2            # 256 tokens per image in the row
-
-[vlm]
-arch = "joint_decoder"
-max_text_len = 256         # per-document text cap
-
-[data]
-pack_sequences = true
-
-[train]
-seq_len = 2048             # row length; batch_size documents per micro-batch
-```
-
-`attention_backend = "flex"` makes the packed mask block-sparse. Positions run
-through the row without restarting per document, and the views of an image
-attend causally; per-document positions and bidirectional image attention are
-follow-ups on the core's explicit position ids and attention groups. A
-`[video]` run and the other arches do not pack.
-
-## Mix in text-only documents
-
-Image-text mixes often carry documents without an image, such as FineVision's
-`text_*` subsets. With `data.hf_allow_text_only = true`, a row whose image
-column is `None` or an empty list is a text-only document. Without packing it
-takes a blank image and a `frame_mask` entry of `False`, so its image tokens
-are hidden from attention; with packing it is just its text, and a micro-batch
-of nothing but text carries no images. Either way the vision encoder and
-adapter run on every rank, on a blank image when there is nothing else, because
-their FSDP2 collectives need every rank to take part. Without the flag such a
-row raises.
-
 ## Start from a pretrained backbone
 
 `scripts/convert_hf_backbone.py` writes a complete VLM checkpoint for a config:
