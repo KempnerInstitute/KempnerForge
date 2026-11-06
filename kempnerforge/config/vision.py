@@ -69,6 +69,11 @@ class VisionEncoderConfig:
             raise ValueError(
                 f"vision_encoder.num_tokens must be non-negative (got {self.num_tokens})"
             )
+        if self.mixed_precision not in (None, "bf16", "fp32"):
+            raise ValueError(
+                "vision_encoder.mixed_precision must be one of ['bf16', 'fp32'] "
+                f"or unset (got {self.mixed_precision!r})"
+            )
 
     @property
     def compute_dtype(self) -> torch.dtype | None:
