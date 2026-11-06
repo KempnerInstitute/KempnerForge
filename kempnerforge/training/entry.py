@@ -215,11 +215,9 @@ def restore_checkpoint(
 
     Returns ``(step, tokens_seen)`` — ``(0, 0)`` when there is nothing to
     resume from. Also restores the metrics run ids, runs the MoT warm-start
-    hook, and re-applies the effective freeze at the resumed step. The load
-    runs with every parameter that trains at some step of the run marked
-    trainable, so a module that a freeze stage unfreezes gets its saved
-    optimizer state back, or none when it had not trained yet; a checkpoint
-    whose optimizer did not hold such a module is refused.
+    hook, and re-applies the effective freeze at the resumed step. A module
+    that a freeze stage unfreezes gets its saved optimizer state back, or
+    empty state when the saved optimizer had none for it.
     """
     num_stages = config.distributed.pp if config.distributed.pp > 1 else None
     if dist.is_initialized():
@@ -251,7 +249,7 @@ def restore_checkpoint(
             scheduler=scheduler,
             exclude_keys=warm_start_exclude,
             vlm_freeze_expected=vlm_freeze_expected,
-            require_held=unfrozen_later,
+            fresh_if_unheld=unfrozen_later,
         )
     if ckpt_extra_loaded.get("wandb_run_id"):
         config.metrics.wandb_run_id = ckpt_extra_loaded["wandb_run_id"]

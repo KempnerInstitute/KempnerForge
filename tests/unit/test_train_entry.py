@@ -3078,40 +3078,88 @@ class TestResumePastAnUnfreezeStage:
 
 
 class TestResumeACheckpointThatLeftTheModuleOut:
-    def test_the_resume_refuses_its_optimizer_state_and_names_the_module(
-        self, monkeypatch, tmp_path
+    """A checkpoint whose optimizer did not hold the module a stage unfreezes resumes that
+    module with empty optimizer state and every other parameter with its saved state."""
+
+    @pytest.mark.parametrize(
+        ("saved_by", "saved_step"),
+        [("main", 1), ("main", 3), ("a_run_without_the_stage", 1)],
+    )
+    def test_the_module_resumes_without_state_and_trains_from_its_stage(
+        self, monkeypatch, tmp_path, saved_by, saved_step
     ):
-        """A run saved before modules a stage unfreezes were kept in the optimizer built its
-        optimizer without the head the build froze. Resuming it refuses that optimizer state,
-        names the head, and leaves the head frozen."""
+        """main built its optimizer without the head the build froze, and so does a run with
+        no stage that unfreezes it. Resumed into a run whose stage after step 2 unfreezes the
+        head, the head is held with no state, the other parameters keep their saved moments,
+        and the head trains from its stage on. The run without the stage is read through
+        checkpoint.load_path into an empty checkpoint.dir."""
         import kempnerforge.training.entry as entry
         from kempnerforge.checkpoint.manager import CheckpointManager
         from kempnerforge.training.freeze import apply_freeze_specs
+        from kempnerforge.training.loop import _apply_stage_specs
         from kempnerforge.training.optimizer import build_optimizer
 
         config = _head_config(max_steps=4)
         config.checkpoint.dir = str(tmp_path / "ckpt")
         assert config.vlm is not None
-        torch.manual_seed(0)
-        model = TinyVlmModel()
-        apply_freeze_specs(model, config.vlm.freeze, config.vlm.module_patterns)
-        optimizer = build_optimizer(model, config.optimizer)
-        logits, labels = model(None, _VLM_BATCH["input_ids"], _VLM_BATCH["labels"])
-        torch.nn.functional.cross_entropy(logits.reshape(-1, VOCAB), labels.reshape(-1)).backward()
-        optimizer.step()
-        CheckpointManager(config.checkpoint, model, optimizer).save(
-            step=1, extra=checkpoint_extra(config, 1, PhaseState())
+        stage = config.vlm.freeze_schedule[0]
+        saving_config = _head_config(max_steps=4)
+        saving_config.checkpoint.dir = config.checkpoint.dir
+        assert saving_config.vlm is not None
+        if saved_by == "main":
+            torch.manual_seed(0)
+            model = TinyVlmModel()
+            apply_freeze_specs(model, config.vlm.freeze, config.vlm.module_patterns)
+            optimizer = build_optimizer(model, config.optimizer)
+        else:
+            saving_config.vlm.freeze_schedule = ()
+            model, optimizer = _built_with_a_frozen_head(saving_config)
+
+        def train_step(m: Any, opt: torch.optim.Optimizer) -> None:
+            logits, labels = m(None, _VLM_BATCH["input_ids"], _VLM_BATCH["labels"])
+            torch.nn.functional.cross_entropy(
+                logits.reshape(-1, VOCAB), labels.reshape(-1)
+            ).backward()
+            opt.step()
+            opt.zero_grad()
+
+        for step in range(1, saved_step + 1):
+            train_step(model, optimizer)
+            if step == 2:
+                _apply_stage_specs(model, stage.specs, config.vlm.module_patterns)
+        assert not any(optimizer.state.get(p) for p in model.proj.parameters())
+        CheckpointManager(saving_config.checkpoint, model, optimizer).save(
+            step=saved_step, extra=checkpoint_extra(saving_config, saved_step, PhaseState())
         )
 
+        saved = Path(config.checkpoint.dir) / f"step_{saved_step}"
+        if saved_by == "main":
+            monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: saved)
+        else:
+            config.checkpoint.dir = str(tmp_path / "fresh")
+            config.checkpoint.load_path = str(saved)
         resumed, resumed_optimizer = _built_with_a_frozen_head(config)
-        saved = Path(config.checkpoint.dir) / "step_1"
-        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: saved)
         manager = CheckpointManager(config.checkpoint, resumed, resumed_optimizer)
-        with pytest.raises(
-            RuntimeError, match=r"freeze stage unfreezes: \['proj.bias', 'proj.weight'\]"
-        ):
-            entry.restore_checkpoint(config, resumed, None, manager)
-        assert not any(p.requires_grad for p in resumed.proj.parameters())
+        assert entry.restore_checkpoint(config, resumed, None, manager) == (saved_step, 0)
+
+        held = {id(p) for group in resumed_optimizer.param_groups for p in group["params"]}
+        for p in resumed.proj.parameters():
+            assert id(p) in held and p.requires_grad is (saved_step > 2)
+            assert not resumed_optimizer.state.get(p)
+        pairs = zip(model.named_parameters(), resumed.parameters(), strict=True)
+        for (name, param), loaded in pairs:
+            assert torch.equal(param, loaded), name
+            for key, value in optimizer.state.get(param, {}).items():
+                assert torch.equal(resumed_optimizer.state[loaded][key], value), f"{name}.{key}"
+
+        initial = [p.detach().clone() for p in resumed.proj.parameters()]
+        for step in range(saved_step + 1, 4):
+            train_step(resumed, resumed_optimizer)
+            if step == 2:
+                _apply_stage_specs(resumed, stage.specs, config.vlm.module_patterns)
+        train_step(resumed, resumed_optimizer)
+        after = zip(resumed.proj.parameters(), initial, strict=True)
+        assert all(not torch.equal(p, i) for p, i in after)
 
 
 class TestFreezeStageFence:
