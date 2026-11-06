@@ -14,6 +14,8 @@ examples/image_understanding/
 ├── README.md
 ├── train.py              # training entry point
 ├── image_text/           # image-text dataset readers and chat renderer (below)
+├── scripts/
+│   └── convert_finevision_to_arrow.py  # FineVision parquet -> memory-mappable Arrow
 └── tests/
     ├── test_image_understanding_entry.py   # the entry point loads a config and hands it off
     └── image_text/       # reader and renderer tests (CPU)
@@ -53,10 +55,23 @@ samples `VLMCollator` batches.
   answer per turn from a seed and the row index, so a resume draws the same answers.
 - `pixmo.py`: PixMo captions, CapQA, pointing, counting and point-explanations;
   `points.py` writes the point answers.
+- `finevision.py`: FineVision subsets from their memory-mappable Arrow copy.
 
 Every sample carries one image, resized square to `image_size`, with no tiling or
 packing. PixMo-Count stores its points in pixels; they are converted to percent of
-the image, the unit the other PixMo sources use.
+the image, the unit the other PixMo sources use. `FineVisionArrow` keeps only the
+rows with one image (`max_images`, which `None` lifts), using the per-row image
+counts `index.npz` stores; an index written without them takes the counts from
+`num_images`.
+
+Convert FineVision once:
+
+```bash
+uv run python examples/image_understanding/scripts/convert_finevision_to_arrow.py convert \
+    --src path-to-FineVision --dst path-to-FineVision-arrow --procs 8
+uv run python examples/image_understanding/scripts/convert_finevision_to_arrow.py index \
+    --src path-to-FineVision --dst path-to-FineVision-arrow
+```
 
 ## Start from the pretrained backbone
 
