@@ -1896,6 +1896,18 @@ class TestBuildModel:
         entry.build_model(config, _runtime(), lambda a, b: a)
         assert seen["frames_per_clip"] == 6
 
+    def test_non_pp_sizes_the_model_for_the_tiled_views(self, monkeypatch):
+        """A 2 × 2 grid without the whole image is four views per sample."""
+        import kempnerforge.training.entry as entry
+
+        seen: dict = {}
+        monkeypatch.setattr(
+            entry, "build_parallel_model", lambda *a, **k: seen.update(k) or "MODEL"
+        )
+        config = _vlm_config(tile_grid=2, tile_global=False)
+        entry.build_model(config, _runtime(), lambda a, b: a)
+        assert seen["frames_per_clip"] == 4
+
     def test_pp_builds_a_bundle_from_the_mesh(self, monkeypatch):
         stage, calls = FakeStageModule(), {}
         entry = _stub_pp(monkeypatch, stage, calls)
@@ -2350,8 +2362,8 @@ class TestEosResolution:
 
 
 class TestVlmSourceBuilders:
-    def _vlm_data_config(self, video=False) -> JobConfig:
-        config = _vlm_config()
+    def _vlm_data_config(self, video=False, **vlm_kw) -> JobConfig:
+        config = _vlm_config(**vlm_kw)
         config.data = DataConfig(hf_dataset_name="coco", tokenizer_path="tok", num_workers=0)
         if video:
             from kempnerforge.config.video import VideoConfig
@@ -2365,7 +2377,9 @@ class TestVlmSourceBuilders:
 
         monkeypatch.setattr(vlmd, "build_tokenizer", lambda p: "TOK")
         monkeypatch.setattr(vlmd, "resolve_pad_id", lambda tok: 7)
-        monkeypatch.setattr(vlmd, "HuggingFaceVLMDataset", lambda **k: FakeDataset(**k))
+        monkeypatch.setattr(
+            vlmd, "HuggingFaceVLMDataset", lambda **k: FakeDataset(**seen.setdefault("dataset", k))
+        )
         monkeypatch.setattr(vlmd, "VLMCollator", lambda **k: seen.setdefault("image_collator", k))
         monkeypatch.setattr(vid, "build_video_dataset", lambda *a: FakeDataset())
         monkeypatch.setattr(vid, "VideoCollator", lambda **k: seen.setdefault("video_collator", k))
@@ -2378,6 +2392,14 @@ class TestVlmSourceBuilders:
         assert data.dataloader == "stateful_OBJ"
         assert seen["image_collator"]["pad_id"] == 7
         assert "video_collator" not in seen
+
+    def test_image_path_hands_the_tiling_to_the_dataset(self, monkeypatch):
+        seen: dict = {}
+        dp = _stub_loaders(monkeypatch, seen)
+        self._stub_vlm_modules(monkeypatch, seen)
+        dp.build_data_pipeline(self._vlm_data_config(tile_grid=2, tile_global=False), _runtime())
+        assert seen["dataset"]["tile_grid"] == 2
+        assert seen["dataset"]["tile_global"] is False
 
     def test_video_path_uses_the_video_collator(self, monkeypatch):
         seen: dict = {}

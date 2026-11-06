@@ -791,6 +791,19 @@ class TestJobConfig:
                 vlm=VLMConfig(max_text_len=64, tile_grid=3),
             )
 
+    def test_tiling_is_refused_alongside_a_video_section(self):
+        from kempnerforge.config.video import VideoConfig
+
+        with pytest.raises(ValueError, match="leave vlm.tile_grid at 0"):
+            JobConfig(
+                model=ModelConfig(max_seq_len=1024),
+                vision_encoder=VisionEncoderConfig(type="random", num_tokens=16),
+                adapter=AdapterConfig(),
+                vlm=VLMConfig(max_text_len=64, tile_grid=2),
+                video=VideoConfig(max_frames=2, min_frames=1, frame_size=16),
+                train=TrainConfig(seq_len=512),
+            ).validate(world_size=1)
+
     def test_views_per_sample_is_one_for_text_and_untiled_runs(self):
         assert JobConfig().views_per_sample == 1
         config = JobConfig(
