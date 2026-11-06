@@ -13,8 +13,10 @@ never imports it, so this directory can be deleted without touching the core.
 examples/image_understanding/
 ├── README.md
 ├── train.py              # training entry point
+├── image_text/           # image-text dataset readers and chat renderer (below)
 └── tests/
-    └── test_image_understanding_entry.py   # the entry point loads a config and hands it off
+    ├── test_image_understanding_entry.py   # the entry point loads a config and hands it off
+    └── image_text/       # reader and renderer tests (CPU)
 ```
 
 ## Run it
@@ -37,6 +39,21 @@ with `vlm.arch = "joint_decoder"`, `vision_encoder.type = "siglip2"` and
 `adapter.type = "avgpool"`. The geometry is the recipe's: a 512 px view is
 32 × 32 = 1024 patch tokens, pooled 2 × 2 to 256 visual tokens, plus
 `max_text_len = 256` text tokens, so `max_seq_len = 512`.
+
+## Image-text datasets
+
+`image_text/` reads the recipe's image-text sources and renders them into the
+samples `VLMCollator` batches.
+
+- `testbed.py`: COCO Karpathy captions, VQAv2 (LAVIS layout), TextVQA, DocVQA and
+  ChartQA (human and augmented).
+- `render.py`: `ChatRenderer` applies the tokenizer's chat template (prompt then
+  answer for single-turn rows, the full template for conversations) and trains only
+  the assistant replies when `answer_only`. `RenderedDataset` draws one reference
+  answer per turn from a seed and the row index, so a resume draws the same answers.
+
+Every sample carries one image, resized square to `image_size`, with no tiling or
+packing.
 
 ## Start from the pretrained backbone
 
@@ -81,7 +98,8 @@ or in core where it belongs:
 ## Tests
 
 The tests live outside the repo's `tests/` tree (the main suite's
-`testpaths`), so run them by path. They need no GPU, network or download:
+`testpaths`), so run them by path. They need no GPU; the renderer tests download
+the `Qwen/Qwen3-0.6B` tokenizer once:
 
 ```bash
 uv run pytest examples/image_understanding/tests
