@@ -88,9 +88,13 @@ class TestImageTextRows:
         rows = ImageTextRows(tmp_path, ["x.png"], ["Q"], [["A"]])
         assert rows[0].images[0].mode == "RGB"
 
-    def test_rows_without_answers_are_refused(self, tmp_path: Path) -> None:
-        with pytest.raises(ValueError, match="row 1 has no answers"):
-            ImageTextRows(tmp_path, ["a", "b"], ["Q", "Q"], [["A"], []])
+    def test_empty_answers_and_answerless_rows_are_dropped(
+        self, tmp_path: Path, write_image: Callable
+    ) -> None:
+        write_image("c.png")
+        rows = ImageTextRows(tmp_path, ["a", "b", "c.png"], ["Q", "Q", "Q3"], [[], [""], ["", "C"]])
+        assert len(rows) == 1
+        assert (rows[0].turns[0].user, rows[0].turns[0].answers) == ("Q3", ("C",))
 
     def test_column_length_mismatch_is_refused(self, tmp_path: Path) -> None:
         with pytest.raises(ValueError, match="column lengths differ"):

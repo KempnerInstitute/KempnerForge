@@ -18,7 +18,10 @@ from .document import Document, Turn
 
 
 class ImageTextRows(Dataset):
-    """Single-image, single-turn rows held in an Arrow table; images are read on access."""
+    """Single-image, single-turn rows held in an Arrow table; images are read on access.
+
+    Empty answers are dropped, and with them any row left without an answer.
+    """
 
     def __init__(
         self,
@@ -32,11 +35,16 @@ class ImageTextRows(Dataset):
                 f"column lengths differ: {len(images)} images, {len(users)} users, "
                 f"{len(answers)} answer lists"
             )
-        empty = next((i for i, row in enumerate(answers) if not row), None)
-        if empty is not None:
-            raise ValueError(f"row {empty} has no answers")
+        usable = [[answer for answer in row if answer] for row in answers]
+        kept = [i for i, row in enumerate(usable) if row]
         self.image_root = Path(image_root)
-        self._rows = pa.table({"image": images, "user": users, "answers": answers})
+        self._rows = pa.table(
+            {
+                "image": [images[i] for i in kept],
+                "user": [users[i] for i in kept],
+                "answers": [usable[i] for i in kept],
+            }
+        )
 
     def __len__(self) -> int:
         return self._rows.num_rows
