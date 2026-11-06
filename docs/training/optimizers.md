@@ -106,12 +106,15 @@ checkpoints saved without them. From a training checkpoint, that leaves:
   rate, and a group of a module the checkpoint holds no group of, such as the language
   model's in a stage that unfreezes it, at the saved peak times its multiplier. A load that
   also restores the optimizer state into groups laid out otherwise stops on every rank before
-  loading anything. When the groups differ in number, in the settings they hold, or in which
-  of them belong to a listed module, the error names this warm start.
+  loading anything. When the checkpoint holds another number of groups, lacks a setting of
+  one of this run's groups, or has a group of a listed module where this run's group belongs
+  to none or the reverse, the error names this warm start.
 - Not a new peak rate. Every resume and warm start restores the scheduler state in
   `train_state.pt`, and the saved schedule carries on, its peak included: the scheduler's
   param groups run from the `optimizer.lr` of the save times each one's multiplier, whatever
-  `optimizer.lr` the new stage sets, and the load logs the peak of each module's groups.
+  `optimizer.lr` the new stage sets. When a group names a module, the load logs the peak of
+  each module's groups, and warns when they differ from the rates the optimizer was built
+  with, as when `optimizer.lr` changed since the save.
 - Not a stage that changes the multipliers or their patterns. Every resume and warm start
   restores `train_state.pt`, scheduler state included, since `checkpoint.exclude_from_loading`
   takes only `"model"` and `"optimizer"`. Such a stage, like one with a new `optimizer.lr`

@@ -94,7 +94,8 @@ as saved, unless the number of groups changed: a `LambdaLR` state is
 then laid out the same way, its groups all of no module. Either way
 the saved base LRs win over the ones the optimizer was built with, so
 a changed `optimizer.lr` takes no effect; a load whose groups name a
-module logs the peak of each module's groups.
+module logs the peak of each module's groups, and warns when they
+differ from the ones the optimizer was built with.
 
 Pure `phase.lr_scale` overlays live in the training loop and are
 recomputed from the current phase, so they don't need to be saved.

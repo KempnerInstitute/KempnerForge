@@ -66,6 +66,15 @@ def _rates(model: nn.Module, optimizer: torch.optim.Optimizer) -> dict[str, floa
     return rates
 
 
+def _restore_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """The warnings the train-state restore logged."""
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno >= logging.WARNING and r.name == "kempnerforge.checkpoint.state"
+    ]
+
+
 def _layout(model: nn.Module, optimizer: torch.optim.Optimizer) -> list[tuple]:
     names = {id(p): n for n, p in model.named_parameters()}
     return [
@@ -1052,6 +1061,15 @@ class TestLayoutChange:
             "Restored scheduler state; each module's param groups run the restored schedule "
             f"from peak lr { ({None: self.LR, 'adapter': self.LR * 5.0}) }"
         ) in caplog.messages
+        built = {None: self.LR / 10, "adapter": self.LR / 10 * 5.0}
+        warnings = _restore_warnings(caplog)
+        assert warnings == [
+            f"The restored schedule runs the param groups from peak lr "
+            f"{ ({None: self.LR, 'adapter': self.LR * 5.0}) }, while the optimizer was built at "
+            f"{built}: a load that restores train_state.pt continues the saved schedule, its "
+            "peak included, so a changed optimizer.lr does not apply. A stage with a new "
+            "optimizer.lr needs a warm start from the weights alone."
+        ]
 
     @pytest.mark.parametrize(
         ("name", "saved", "resumed"),
@@ -1229,9 +1247,40 @@ class TestSchedulerStateLayout:
             "Restored scheduler state; each module's param groups run the restored schedule "
             "from peak lr {None: 0.1, 'a': 0.2}"
         ) in caplog.messages
+        assert not _restore_warnings(caplog)
+
+    def test_a_restored_peak_other_than_the_built_one_warns(self, caplog, monkeypatch):
+        monkeypatch.setattr(logging.getLogger("kempnerforge"), "propagate", True)
+        state = build_train_state(
+            step=0, tokens_seen=0, scheduler=self._scheduler([(None, 0.1), ("a", 0.5)])
+        )
+        resumed = self._scheduler([(None, 0.01), ("a", 0.05)])
+        with caplog.at_level(logging.INFO, logger="kempnerforge.checkpoint.state"):
+            restore_train_state(state, scheduler=resumed, lr_multipliers={"a": 5.0})
+        assert resumed.base_lrs == [0.1, 0.5]
+        warnings = _restore_warnings(caplog)
+        assert len(warnings) == 1
+        assert warnings[0].startswith(
+            "The restored schedule runs the param groups from peak lr {None: 0.1, 'a': 0.5}, "
+            "while the optimizer was built at {None: 0.01, 'a': 0.05}"
+        )
+
+    def test_a_derived_peak_off_by_rounding_does_not_warn(self, caplog, monkeypatch):
+        """Its peak comes from a saved group's rate divided by that group's multiplier, which
+        can differ from the built rate in the last bit when ``optimizer.lr`` did not change."""
+        monkeypatch.setattr(logging.getLogger("kempnerforge"), "propagate", True)
+        state = build_train_state(step=0, tokens_seen=0, scheduler=self._scheduler([("a", 0.3)]))
+        resumed = self._scheduler([(None, 0.1), ("a", 0.3)])
+        with caplog.at_level(logging.INFO, logger="kempnerforge.checkpoint.state"):
+            restore_train_state(state, scheduler=resumed, lr_multipliers={"a": 3.0})
+        assert resumed.base_lrs[0] != 0.1
+        assert resumed.base_lrs == pytest.approx([0.1, 0.3], rel=1e-15)
+        assert not _restore_warnings(caplog)
 
     @pytest.mark.parametrize("kind", ["lambda", "step"])
     def test_without_a_module_the_restore_logs_as_before(self, caplog, monkeypatch, kind):
+        """No group names a module: the restored base rates win silently, as on main, even
+        when they differ from the built ones."""
         monkeypatch.setattr(logging.getLogger("kempnerforge"), "propagate", True)
 
         def build(groups):
@@ -1240,10 +1289,13 @@ class TestSchedulerStateLayout:
             return torch.optim.lr_scheduler.StepLR(self._optimizer(groups), step_size=1)
 
         state = build_train_state(step=0, tokens_seen=0, scheduler=build([(None, 0.1)]))
+        resumed = build([(None, 0.01)])
         with caplog.at_level(logging.INFO, logger="kempnerforge.checkpoint.state"):
-            restore_train_state(state, scheduler=build([(None, 0.1)]))
+            restore_train_state(state, scheduler=resumed)
+        assert resumed.base_lrs == [0.1]
         assert "Restored scheduler state" in caplog.messages
         assert not any("peak lr" in message for message in caplog.messages)
+        assert not _restore_warnings(caplog)
 
     @pytest.mark.parametrize(
         "record",

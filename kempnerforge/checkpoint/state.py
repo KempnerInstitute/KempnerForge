@@ -9,6 +9,7 @@ RNG state capture ensures exact reproducibility on resume.
 from __future__ import annotations
 
 import logging
+import math
 import random
 from collections.abc import Mapping, Sequence
 from typing import Any
@@ -21,6 +22,7 @@ logger = logging.getLogger(__name__)
 _GROUP_MODULES_KEY = "scheduler_group_modules"
 _PER_GROUP_KEYS = ("base_lrs", "_last_lr", "lr_lambdas")
 _PER_GROUP_RATE_KEYS = ("base_lrs", "_last_lr")
+_SAME_RATE_REL_TOL = 1e-9
 
 
 def get_rng_state() -> dict[str, Any]:
@@ -273,7 +275,8 @@ def restore_train_state(
             ``build_train_state``): each group of a module the checkpoint holds resumes at that
             module's rates, and any other at the saved peak times its multiplier. Nothing is
             restored when that fails. When a group names a module, the peak rate of each
-            module's groups is logged.
+            module's groups is logged, with a warning when one differs from the rate the
+            optimizer was built with, as when ``optimizer.lr`` changed since the save.
         dataloader: Stateful dataloader to restore.
         lr_multipliers: The ``optimizer.lr_multipliers`` the scheduler's groups were built
             with, which must be those of the save. Needed only for a group of a module the
@@ -299,6 +302,7 @@ def restore_train_state(
         logger.info("Restored RNG states")
 
     if scheduler is not None and scheduler_state is not None:
+        built = _module_peaks(scheduler)
         scheduler.load_state_dict(scheduler_state)
         peaks = _module_peaks(scheduler)
         if peaks:
@@ -306,6 +310,17 @@ def restore_train_state(
                 f"Restored scheduler state; each module's param groups run the restored "
                 f"schedule from peak lr {peaks}"
             )
+            if any(
+                not math.isclose(peak, built.get(module, peak), rel_tol=_SAME_RATE_REL_TOL)
+                for module, peak in peaks.items()
+            ):
+                logger.warning(
+                    f"The restored schedule runs the param groups from peak lr {peaks}, while "
+                    f"the optimizer was built at {built}: a load that restores train_state.pt "
+                    f"continues the saved schedule, its peak included, so a changed "
+                    f"optimizer.lr does not apply. A stage with a new optimizer.lr needs a warm "
+                    f"start from the weights alone."
+                )
         else:
             logger.info("Restored scheduler state")
 
