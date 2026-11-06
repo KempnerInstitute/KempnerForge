@@ -433,6 +433,48 @@ class TestTransformerForward:
         assert not torch.allclose(grouped[1][:, 0], grouped[0][:, 0])
 
     @pytest.mark.parametrize("backend", ["sdpa", "flex"])
+    def test_group_ids_from_the_context_match_the_argument(self, backend):
+        tokens = self._tokens(seed=3)
+        model = self._model(backend)
+        with torch.no_grad():
+            argument = model(tokens, doc_ids=PACK_DOCS, attention_group_ids=PACK_GROUPS)
+            context = model(
+                tokens, doc_ids=PACK_DOCS, modality=ModalityContext(attention_group_ids=PACK_GROUPS)
+            )
+            causal = model(tokens, doc_ids=PACK_DOCS)
+        torch.testing.assert_close(context, argument, rtol=0, atol=0)
+        assert not torch.allclose(context, causal)
+
+    def test_group_ids_in_the_context_cover_the_prefix(self):
+        """A prefix strategy's groups span prefix and text; a text-length tensor is refused."""
+        model = self._model("sdpa")
+        tokens = self._tokens(seq=8)
+        prefix = torch.randn(1, 4, 64)
+        groups = torch.full((1, 12), -1, dtype=torch.long)
+        groups[:, :4] = 0
+        with torch.no_grad():
+            plain = model(tokens, modality=ModalityContext(prefix_embeds=prefix))
+            grouped = model(
+                tokens, modality=ModalityContext(prefix_embeds=prefix, attention_group_ids=groups)
+            )
+        assert plain.shape == grouped.shape == (1, 12, 64)
+        with pytest.raises(ValueError, match="does not match the residual"):
+            model(
+                tokens,
+                modality=ModalityContext(prefix_embeds=prefix, attention_group_ids=groups[:, :8]),
+            )
+
+    def test_argument_and_context_together_raise(self):
+        model = self._model("sdpa")
+        tokens = self._tokens()
+        with pytest.raises(ValueError, match="attention_group_ids was passed to Transformer"):
+            model(
+                tokens,
+                attention_group_ids=PACK_GROUPS,
+                modality=ModalityContext(attention_group_ids=PACK_GROUPS),
+            )
+
+    @pytest.mark.parametrize("backend", ["sdpa", "flex"])
     def test_later_group_stays_invisible_to_earlier_tokens(self, backend):
         """Moving q4 (group 1) reaches q3 (same group) and q5 (causal), not q0..q2."""
         tokens = self._tokens(seed=4)

@@ -397,7 +397,10 @@ class Transformer(nn.Module):
                 before. Cannot be combined with ``kv_caches`` (cached
                 generation derives positions from the cache fill level);
                 unsupported for MoT, which derives per-modality positions
-                internally.
+                internally. A ``ModalityContext`` may carry the same tensor
+                as ``modality.position_ids`` instead, which is how a strategy
+                chooses the positions of the residual it lays out; passing
+                both raises.
             attention_group_ids: Optional per-token visibility group ids over
                 the residual stream, shape ``(batch, seq_len)``, int64;
                 negative means no group. Tokens sharing a nonnegative id see
@@ -408,7 +411,8 @@ class Transformer(nn.Module):
                 give the same visibility as ``None`` but still build a mask, so
                 ``None`` is the unmasked fast path. On MoT, ``doc_ids`` and
                 group ids need ``vlm.mot_modalities`` in residual order,
-                ``("image", "text")``.
+                ``("image", "text")``. May likewise come from
+                ``modality.attention_group_ids``, not both.
 
         Returns:
             Logits tensor of shape ``(batch, out_seq_len, vocab_size)``
@@ -424,6 +428,10 @@ class Transformer(nn.Module):
         image_mask = modality.image_mask if modality is not None else None
         modality_ids = modality.modality_ids if modality is not None else None
         key_padding_mask = modality.key_padding_mask if modality is not None else None
+        position_ids = _argument_or_context("position_ids", position_ids, modality)
+        attention_group_ids = _argument_or_context(
+            "attention_group_ids", attention_group_ids, modality
+        )
 
         if (tokens is None) == (inputs_embeds is None):
             raise ValueError(
@@ -609,5 +617,17 @@ class Transformer(nn.Module):
 
 
 @registry.register_model("transformer")
+def _argument_or_context(
+    name: str, argument: torch.Tensor | None, modality: ModalityContext | None
+) -> torch.Tensor | None:
+    """The forward argument ``name`` or the ``ModalityContext`` field of that name, never both."""
+    from_context = getattr(modality, name) if modality is not None else None
+    if argument is not None and from_context is not None:
+        raise ValueError(
+            f"{name} was passed to Transformer.forward and set on modality.{name}; give one"
+        )
+    return argument if argument is not None else from_context
+
+
 def _build_transformer(model_config: ModelConfig) -> Transformer:
     return Transformer(model_config)

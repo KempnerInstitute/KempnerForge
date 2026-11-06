@@ -180,6 +180,45 @@ class TestTransformerPositionIds:
         assert inspect.signature(Transformer.forward).parameters["position_ids"].default is None
 
 
+class TestPositionIdsFromTheContext:
+    def test_context_positions_match_the_argument(self):
+        model = _tiny_model()
+        tokens = torch.randint(0, _VOCAB, (2, 10), device=DEVICE)
+        gen = torch.Generator().manual_seed(1)
+        position_ids = torch.randint(0, _MAX_SEQ_LEN, (2, 10), generator=gen).to(DEVICE)
+        with torch.no_grad():
+            argument = model(tokens, position_ids=position_ids)
+            context = model(tokens, modality=ModalityContext(position_ids=position_ids))
+            default = model(tokens)
+        assert torch.equal(argument, context)
+        assert not torch.equal(default, context)
+
+    def test_context_positions_cover_the_prefix(self):
+        """A strategy's positions span the residual, prefix included, and are checked so."""
+        model = _tiny_model()
+        tokens = torch.randint(0, _VOCAB, (1, 6), device=DEVICE)
+        prefix = torch.randn(1, 4, _DIM, device=DEVICE)
+        positions = torch.arange(10, device=DEVICE).unsqueeze(0)
+        with torch.no_grad():
+            default = model(tokens, modality=ModalityContext(prefix_embeds=prefix))
+            explicit = model(
+                tokens, modality=ModalityContext(prefix_embeds=prefix, position_ids=positions)
+            )
+        assert torch.equal(default, explicit)
+        with pytest.raises(ValueError, match="does not match the residual"):
+            model(
+                tokens,
+                modality=ModalityContext(prefix_embeds=prefix, position_ids=positions[:, :6]),
+            )
+
+    def test_argument_and_context_together_raise(self):
+        model = _tiny_model()
+        tokens = torch.randint(0, _VOCAB, (1, 5), device=DEVICE)
+        positions = torch.arange(5, device=DEVICE).unsqueeze(0)
+        with pytest.raises(ValueError, match="position_ids was passed to Transformer.forward"):
+            model(tokens, position_ids=positions, modality=ModalityContext(position_ids=positions))
+
+
 class TestTransformerPositionIdsValidation:
     def _tokens(self, batch: int = 2, seq: int = 6) -> torch.Tensor:
         return torch.randint(0, _VOCAB, (batch, seq), device=DEVICE)
@@ -295,6 +334,23 @@ class TestTransformerPositionIdsValidation:
         position_ids = torch.arange(4, device=DEVICE).unsqueeze(0)
         with pytest.raises(ValueError, match="cannot be combined with kv_caches"):
             model(tokens, kv_caches=caches, position_ids=position_ids)
+
+    def test_rejects_kv_caches_combination_from_the_context(self):
+        model = _tiny_model(n_layers=1)
+        caches = [
+            KVCache(
+                batch_size=1,
+                max_seq_len=_MAX_SEQ_LEN,
+                n_kv_heads=_N_HEADS,
+                head_dim=_HEAD_DIM,
+                dtype=torch.float32,
+                device=DEVICE,
+            )
+        ]
+        tokens = self._tokens(batch=1, seq=4)
+        modality = ModalityContext(position_ids=torch.arange(4, device=DEVICE).unsqueeze(0))
+        with pytest.raises(ValueError, match="cannot be combined with kv_caches"):
+            model(tokens, kv_caches=caches, modality=modality)
 
     def test_rejects_mot_models(self):
         from kempnerforge.config.vlm import MoTConfig
