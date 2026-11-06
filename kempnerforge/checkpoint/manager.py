@@ -280,6 +280,38 @@ def _restore_never_stepped(
     optim_state["state"].update({fqn: {} for fqn in never_stepped})
 
 
+def _check_saved_state_matches(
+    optim_state: dict[str, Any], saved_keys: Iterable[str], where: Path
+) -> None:
+    """Fail if a parameter was saved with another optimizer's state than the one it now has."""
+    kept = {fqn: set(state) for fqn, state in optim_state["state"].items()}
+    saved: dict[str, set[str]] = {}
+    for key in saved_keys:
+        if not key.startswith(_OPTIM_STATE_PREFIX):
+            continue
+        name = key.removeprefix(_OPTIM_STATE_PREFIX)
+        fqn = name
+        while fqn and fqn not in kept:
+            fqn = fqn.rpartition(".")[0]
+        if fqn:
+            saved.setdefault(fqn, set()).add(name.removeprefix(f"{fqn}.").split(".", 1)[0])
+    moved = sorted(
+        fqn for fqn, entries in saved.items() if entries - kept[fqn] and kept[fqn] - entries
+    )
+    if moved:
+        first = moved[0]
+        raise RuntimeError(
+            f"{where} holds another optimizer's state for {len(moved)} parameters: "
+            f"{moved[:8]}. {first} was saved with "
+            f"{sorted(saved[first])} and is now kept with {sorted(kept[first])}: its optimizer "
+            "changed since the save, e.g. optimizer.name or optimizer.muon_router changed, "
+            "or Muon used to orthogonalize it before it routed parameters by module. "
+            "To continue from these weights with a fresh optimizer, set "
+            "checkpoint.load_path to this checkpoint and checkpoint.exclude_from_loading = "
+            '["optimizer"], with a checkpoint.dir that holds no checkpoint yet.'
+        )
+
+
 def _load_train_state(path: Path) -> dict[str, Any]:
     """Load ``train_state.pt`` under an explicit trust boundary.
 
@@ -819,11 +851,13 @@ class CheckpointManager:
             scheduler: LR scheduler to restore.
             dataloader: Stateful dataloader to restore.
             exclude_keys: State to skip: the DCP keys ``"model"`` and
-                ``"optimizer"`` (e.g. ``["optimizer"]`` for fine-tuning), and
-                ``"train_state"`` for a weights-only warm start that ignores
-                ``train_state.pt`` (step, token count, scheduler, dataloader
-                position, RNG) and the saved freeze metadata, so the new run
-                starts at step 0 with its own schedule, data order and freeze.
+                ``"optimizer"`` (e.g. ``["optimizer"]`` for fine-tuning), or
+                ``["optimizer", "train_state"]`` for a weights-only warm start
+                that loads the model alone and ignores ``train_state.pt`` (step,
+                token count, scheduler, dataloader position, RNG) and the saved
+                freeze metadata, so the new run starts at step 0 with its own
+                schedule, data order and freeze. ``"train_state"`` in any other
+                combination raises ``ValueError``.
             vlm_freeze_expected: Canonical freeze metadata (output of
                 ``canonical_freeze_meta``) for the current run's VLMConfig.
                 When both the saved metadata and this argument are set,
@@ -851,6 +885,11 @@ class CheckpointManager:
 
         logger.info(f"Loading checkpoint: {ckpt_dir}")
         load_train_state = exclude_keys is None or "train_state" not in exclude_keys
+        if not load_train_state and set(exclude_keys or ()) != {"optimizer", "train_state"}:
+            raise ValueError(
+                "exclude_keys with 'train_state' must be ['optimizer', 'train_state']: a "
+                f"weights-only warm start loads the model alone (got {exclude_keys!r})"
+            )
 
         if vlm_freeze_expected is not None and load_train_state:
             metadata_path = ckpt_dir / _METADATA_FILE
@@ -917,6 +956,7 @@ class CheckpointManager:
                     f"{dcp_dir} is missing optimizer param-group keys {sorted(filled)}; "
                     f"resuming with {filled}"
                 )
+            _check_saved_state_matches(dcp_state["optimizer"], saved_keys, dcp_dir)
 
         if dcp_state:
             planner = _NeverSteppedStatePlanner()
