@@ -14,11 +14,18 @@ class UnreadableImageError(Exception):
 
 
 def decode_rgb(source: str | Path | bytes) -> Image.Image:
-    """Decode an image file or byte string as RGB."""
+    """Decode an image file or byte string as RGB.
+
+    Data that does not decode raises ``UnreadableImageError``; a file the system
+    cannot open (missing, unreadable) raises its own ``OSError``, which carries an
+    errno where a decoding failure does not.
+    """
     try:
         with Image.open(io.BytesIO(source) if isinstance(source, bytes) else source) as image:
             return image.convert("RGB")
     except Exception as exc:
+        if isinstance(exc, OSError) and exc.errno is not None:
+            raise
         what = f"{len(source)} bytes" if isinstance(source, bytes) else str(source)
         raise UnreadableImageError(f"{what}: {type(exc).__name__}: {exc}") from exc
 
