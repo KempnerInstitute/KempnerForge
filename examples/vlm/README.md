@@ -147,28 +147,6 @@ uv run torchrun --nproc_per_node=4 examples/vlm/train.py \
 `scripts/prep_vlm_coco.py` writes a COCO-Karpathy `save_to_disk` directory for
 `data.hf_dataset_name` to point at.
 
-## Tile images
-
-By default every image is one `hf_image_size` view. `vlm.tile_grid = n` encodes
-it as `n × n` crops instead, each `hf_image_size` px, cut from the image resized
-to `n × hf_image_size` square, preceded by the whole image at `hf_image_size`
-unless `vlm.tile_global = false`:
-
-```toml
-[vlm]
-arch = "joint_decoder"
-max_text_len = 256
-tile_grid = 3          # 9 crops in raster order
-tile_global = true     # plus the whole image first: 10 views
-```
-
-The views travel like a clip's frames (`pixel_values` is `(B, views, 3, H, W)`),
-so the sequence budget is `views × tokens per view + max_text_len`, and the
-config and build checks enforce it. `tile_image` in
-`kempnerforge/data/vlm_dataset.py` is the preprocessor; the evaluation adapter
-calls it on each request's image, so evaluation tiles exactly as training did.
-Tiling applies to the image path only; a `[video]` run rejects it.
-
 ## Start from a pretrained backbone
 
 `scripts/convert_hf_backbone.py` writes a complete VLM checkpoint for a config:
