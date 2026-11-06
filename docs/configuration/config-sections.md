@@ -181,6 +181,7 @@ Single dataset, HuggingFace source, or mixture; optional phase schedule.
 | `hf_dataset_prompt_field` | `str` | `""` | VLM only: prompt column (`""` = no prompt mask) |
 | `hf_image_size` | `int` | `224` | VLM only: target square image size |
 | `hf_allow_text_only` | `bool` | `False` | VLM only: accept rows whose image column is `None` or empty as text-only documents; the vision encoder still runs on every rank |
+| `hf_max_images` | `int` | `1` | VLM only: images a document may hold. `1` takes one image per row (a list of one is fine) and raises on more; `n ≥ 2` accepts lists, keeps the first `n` of a longer one, and without packing lays each document out in a fixed row of `n` images' tokens plus `vlm.max_text_len` (Joint-Decoder only, needs `vision_encoder.num_tokens`); `0` is no cap and needs `pack_sequences` |
 | `hf_streaming` | `bool` | `False` | use `IterableDataset` for large corpora |
 | `pack_sequences` | `bool` | `False` | document-aware packing with cross-doc isolation (feeds `doc_ids` to attention); on a Joint-Decoder VLM run, packs `train.batch_size` image-text documents per micro-batch into rows of `train.seq_len`, each document's image tokens before its text (needs `vision_encoder.num_tokens`) |
 | `datasets` | `list[DatasetSource]` | `[]` | multi-dataset mixture (overrides `dataset_path`/`hf_dataset_name` when non-empty) |

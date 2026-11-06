@@ -4,8 +4,9 @@
 produces the ``VLMSample`` contract:
 
 - ``pixel_values``: ``(3, H, W)`` float tensor, resized to ``image_size``
-  and normalized with the provided mean/std; ``(0, 3, H, W)`` for a row
-  without an image when ``allow_text_only`` is set.
+  and normalized with the provided mean/std; ``(K, 3, H, W)`` for a row whose
+  image field holds ``K >= 2`` images when ``max_images`` allows them, and
+  ``(0, 3, H, W)`` for a row without an image when ``allow_text_only`` is set.
 - ``input_ids``: ``(T,)`` int64 tensor, right-padded to ``max_text_len``.
 - ``labels``: ``(T,)`` int64 next-token targets (``labels[i]`` = input
   token ``i+1``), right-padded to ``max_text_len``; pad, trailing, and
@@ -23,11 +24,15 @@ vision encoder still runs on every rank. The collator also emits
 multi-image extension and is unused by the Joint-Decoder wrapper today.
 
 ``PackedVLMCollator`` packs several documents into each row instead
-(``pack_vlm_samples``): a document is its image's placeholder slots followed
+(``pack_vlm_samples``): a document is its images' placeholder slots followed
 by its real text, rows are filled first-fit to ``seq_len``, and the batch
 carries ``doc_ids`` plus the image placement the Joint-Decoder wrapper uses
 to write each image's tokens over its slots. A text-only document is just
 its text; a batch of nothing but text carries an empty image tensor.
+
+``MultiImageVLMCollator`` uses the same layout without packing: one document
+per row of ``max_images * tokens_per_image + max_text_len`` positions, so
+documents with different image counts share a batch of fixed shape.
 
 The HF ``datasets`` and ``transformers`` packages are imported lazily
 so this module is safe to import without them (e.g. in unit tests that
@@ -46,6 +51,7 @@ from torch.utils.data import Dataset
 logger = logging.getLogger(__name__)
 
 _samples_masked_for_prompt = itertools.count(1)
+_documents_over_image_cap = itertools.count(1)
 
 DEFAULT_IMAGE_MEAN = (0.5, 0.5, 0.5)
 DEFAULT_IMAGE_STD = (0.5, 0.5, 0.5)
@@ -254,9 +260,27 @@ def _warn_sample_masked_for_prompt(min_text_len: int, max_text_len: int) -> None
         )
 
 
-def _is_missing_image(value: Any) -> bool:
-    """True for a row without an image: ``None`` or an empty list of images."""
-    return value is None or (isinstance(value, list | tuple) and len(value) == 0)
+def _images_of(value: Any) -> list[Any]:
+    """The images an image field holds: none for ``None``, the list as is, else the one image."""
+    if value is None:
+        return []
+    if isinstance(value, list | tuple):
+        return list(value)
+    return [value]
+
+
+def _warn_images_over_cap(count: int, cap: int) -> None:
+    dropped = next(_documents_over_image_cap)
+    if dropped & (dropped - 1) == 0:
+        logger.warning(
+            "A document holds %d images but data.hf_max_images=%d: kept its first %d "
+            "(%d such documents so far in this process, logged at powers of two)",
+            count,
+            cap,
+            cap,
+            dropped,
+            extra={"every_rank": True},
+        )
 
 
 def _tokenize_and_mask(
@@ -359,6 +383,10 @@ class HuggingFaceVLMDataset(Dataset):
         allow_text_only: Accept rows whose image field is ``None`` or an
             empty list and return them with an empty ``(0, 3, H, W)``
             ``pixel_values``. Off, such a row raises ``ValueError``.
+        max_images: Images a row may hold. ``1`` (default) takes a single
+            image, or a list of one, and raises on more. ``n >= 2`` returns a
+            row of ``K >= 2`` images as ``(K, 3, H, W)`` and keeps the first
+            ``n`` of a longer list, with a warning. ``0`` sets no cap.
     """
 
     def __init__(
@@ -375,6 +403,7 @@ class HuggingFaceVLMDataset(Dataset):
         image_std: tuple[float, float, float] = DEFAULT_IMAGE_STD,
         dataset_config: str | None = None,
         allow_text_only: bool = False,
+        max_images: int = 1,
     ) -> None:
         import os
 
@@ -403,6 +432,7 @@ class HuggingFaceVLMDataset(Dataset):
         self._image_std = image_std
         self._max_text_len = max_text_len
         self._allow_text_only = allow_text_only
+        self._max_images = max_images
         self._tokenizer = build_tokenizer(tokenizer_path)
         if prompt_field is not None:
             _check_prompt_column_is_string(ds, prompt_field)
@@ -417,8 +447,8 @@ class HuggingFaceVLMDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         row = self._ds[idx]
-        image = row[self._image_field]
-        if _is_missing_image(image):
+        images = _images_of(row[self._image_field])
+        if not images:
             if not self._allow_text_only:
                 raise ValueError(
                     f"row {idx} has no image in field {self._image_field!r}; set "
@@ -426,7 +456,19 @@ class HuggingFaceVLMDataset(Dataset):
                 )
             pixels = torch.zeros(0, 3, self._image_size, self._image_size)
         else:
-            pixels = pil_to_tensor(image, self._image_size, self._image_mean, self._image_std)
+            if len(images) > 1 and self._max_images == 1:
+                raise ValueError(
+                    f"row {idx} has {len(images)} images in field {self._image_field!r}; set "
+                    "data.hf_max_images to accept documents with several images"
+                )
+            if 1 < self._max_images < len(images):
+                _warn_images_over_cap(len(images), self._max_images)
+                images = images[: self._max_images]
+            tensors = [
+                pil_to_tensor(img, self._image_size, self._image_mean, self._image_std)
+                for img in images
+            ]
+            pixels = tensors[0] if len(tensors) == 1 else torch.stack(tensors, dim=0)
         text_val = row[self._text_field]
         if not isinstance(text_val, str):
             raise TypeError(
@@ -487,7 +529,8 @@ class VLMCollator:
             else:
                 raise ValueError(
                     f"VLMCollator takes one image per document, got pixel_values of shape "
-                    f"{tuple(p.shape)}"
+                    f"{tuple(p.shape)}; data.hf_max_images selects the collator that places "
+                    "several images per document"
                 )
         pixels = torch.stack(images, dim=0)
         input_ids = torch.full((B, self.max_text_len), self.pad_id, dtype=torch.long)
@@ -516,8 +559,9 @@ def pack_vlm_samples(
     seq_len: int,
     tokens_per_image: int,
     pad_id: int,
+    max_docs_per_row: int = 0,
 ) -> dict[str, torch.Tensor]:
-    """Pack image-text samples into rows of ``seq_len``, each document's image before its text.
+    """Pack image-text samples into rows of ``seq_len``, each document's images before its text.
 
     A sample is one document: ``pixel_values`` ``(3, H, W)`` or ``(V, 3, H, W)``
     (``V`` views, each an encoder input; ``V = 0`` for a text-only document),
@@ -525,7 +569,8 @@ def pack_vlm_samples(
     real (all of them when the key is absent). Its footprint is ``V *
     tokens_per_image`` placeholder slots followed by ``text_len`` tokens.
     Documents go first-fit into rows in order: into the first open row with
-    room, else a new row. A row's tail is padding that forms its own document.
+    room (and, when ``max_docs_per_row`` is positive, fewer documents than
+    that), else a new row. A row's tail is padding that forms its own document.
 
     Returns:
         ``pixel_values`` ``(N, 3, H, W)``, every image or view across the batch in
@@ -563,7 +608,15 @@ def pack_vlm_samples(
                 f"a document of {views.shape[0]} image(s) x {tokens_per_image} tokens + "
                 f"{text_len} text tokens does not fit a row of seq_len={seq_len}"
             )
-        row_index = next((i for i, r in enumerate(rows) if r["fill"] + footprint <= seq_len), None)
+        row_index = next(
+            (
+                i
+                for i, r in enumerate(rows)
+                if r["fill"] + footprint <= seq_len
+                and (max_docs_per_row <= 0 or r["docs"] < max_docs_per_row)
+            ),
+            None,
+        )
         if row_index is None:
             row_index = len(rows)
             rows.append(
@@ -601,6 +654,37 @@ def pack_vlm_samples(
         "image_starts": torch.tensor(image_starts, dtype=torch.long),
         "image_tokens": torch.tensor(tokens_per_image, dtype=torch.long),
     }
+
+
+class MultiImageVLMCollator:
+    """One document per row in the ``pack_vlm_samples`` layout, for documents with several images.
+
+    Every row is ``max_images * tokens_per_image + max_text_len`` positions: a
+    document's images' slots, its real text, and a padding tail that forms its
+    own document. The batch carries the same placement keys as a packed batch,
+    so the Joint-Decoder wrapper takes its inline route.
+    """
+
+    def __init__(
+        self, pad_id: int, max_text_len: int, tokens_per_image: int, max_images: int
+    ) -> None:
+        if max_text_len <= 0 or tokens_per_image <= 0 or max_images <= 0:
+            raise ValueError("max_text_len, tokens_per_image and max_images must be positive")
+        self.pad_id = pad_id
+        self.tokens_per_image = tokens_per_image
+        self.max_images = max_images
+        self.row_len = max_images * tokens_per_image + max_text_len
+
+    def __call__(self, samples: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
+        if not samples:
+            raise ValueError("MultiImageVLMCollator received an empty batch")
+        return pack_vlm_samples(
+            samples,
+            seq_len=self.row_len,
+            tokens_per_image=self.tokens_per_image,
+            pad_id=self.pad_id,
+            max_docs_per_row=1,
+        )
 
 
 class PackedVLMCollator:

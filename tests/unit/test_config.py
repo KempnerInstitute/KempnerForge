@@ -787,6 +787,52 @@ class TestJobConfig:
                 **kwargs,
             )
 
+    def test_several_images_per_document_rules(self):
+        kwargs = dict(
+            model=ModelConfig(max_seq_len=1024),
+            vision_encoder=VisionEncoderConfig(type="random", num_tokens=16),
+            adapter=AdapterConfig(),
+        )
+        JobConfig(vlm=VLMConfig(max_text_len=64), data=DataConfig(hf_max_images=2), **kwargs)
+        JobConfig(
+            vlm=VLMConfig(max_text_len=64),
+            data=DataConfig(hf_max_images=0, pack_sequences=True),
+            **kwargs,
+        )
+        with pytest.raises(ValueError, match="not text runs or"):
+            JobConfig(data=DataConfig(hf_max_images=2))
+        with pytest.raises(ValueError, match="requires vlm.arch='joint_decoder'"):
+            JobConfig(
+                vlm=VLMConfig.for_arch("cross_attention", max_text_len=64),
+                data=DataConfig(hf_max_images=2),
+                **kwargs,
+            )
+        with pytest.raises(ValueError, match="needs data.pack_sequences"):
+            JobConfig(vlm=VLMConfig(max_text_len=64), data=DataConfig(hf_max_images=0), **kwargs)
+        with pytest.raises(ValueError, match="hf_max_images must be >= 0"):
+            DataConfig(hf_max_images=-1)
+
+    def test_the_image_cap_counts_against_the_context(self):
+        """Three images of 16 tokens plus 64 text tokens is 112, over a context of 100."""
+        kwargs = dict(
+            vision_encoder=VisionEncoderConfig(type="random", num_tokens=16),
+            adapter=AdapterConfig(),
+            vlm=VLMConfig(max_text_len=64),
+        )
+        JobConfig(model=ModelConfig(max_seq_len=100), data=DataConfig(hf_max_images=2), **kwargs)
+        with pytest.raises(ValueError, match="max_seq_len.*insufficient for VLM"):
+            JobConfig(
+                model=ModelConfig(max_seq_len=100), data=DataConfig(hf_max_images=3), **kwargs
+            )
+        config = JobConfig(
+            model=ModelConfig(max_seq_len=128),
+            data=DataConfig(hf_max_images=3),
+            train=TrainConfig(seq_len=100),
+            **kwargs,
+        )
+        with pytest.raises(ValueError, match="train.seq_len.*insufficient for VLM"):
+            config.validate(world_size=1)
+
     def test_vlm_packing_requires_joint_decoder_and_no_video(self):
         kwargs = dict(
             model=ModelConfig(max_seq_len=1024),
