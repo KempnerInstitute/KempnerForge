@@ -180,6 +180,7 @@ Single dataset, HuggingFace source, or mixture; optional phase schedule.
 | `hf_dataset_image_field` | `str` | `"image"` | VLM only: image column |
 | `hf_dataset_prompt_field` | `str` | `""` | VLM only: prompt column (`""` = no prompt mask) |
 | `hf_image_size` | `int` | `224` | VLM only: target square image size |
+| `hf_allow_text_only` | `bool` | `False` | VLM only: accept rows whose image column is `None` or empty as text-only documents; the vision encoder still runs on every rank |
 | `hf_streaming` | `bool` | `False` | use `IterableDataset` for large corpora |
 | `pack_sequences` | `bool` | `False` | document-aware packing with cross-doc isolation (feeds `doc_ids` to attention); on a Joint-Decoder VLM run, packs `train.batch_size` image-text documents per micro-batch into rows of `train.seq_len`, each document's image tokens before its text (needs `vision_encoder.num_tokens`) |
 | `datasets` | `list[DatasetSource]` | `[]` | multi-dataset mixture (overrides `dataset_path`/`hf_dataset_name` when non-empty) |

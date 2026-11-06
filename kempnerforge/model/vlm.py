@@ -78,6 +78,32 @@ class ModalityStrategy(Protocol):
     def num_image_tokens(self, wrapper: VLMWrapper) -> int: ...
 
 
+def _encode_and_adapt(wrapper: VLMWrapper, images: torch.Tensor) -> torch.Tensor:
+    """Run the vision encoder and adapter over ``(N, 3, H, W)``, casting at their boundary."""
+    feats = wrapper.vision_encoder(images)
+    adapter_dtype = next(wrapper.adapter.parameters()).dtype
+    if feats.dtype != adapter_dtype:
+        feats = feats.to(adapter_dtype)
+    return wrapper.adapter(feats)
+
+
+def _text_only_context(
+    wrapper: VLMWrapper, pixel_values: torch.Tensor, input_ids: torch.Tensor
+) -> ModalityContext:
+    """Keep the encoder and adapter in the forward and backward of a batch with no images.
+
+    Their FSDP2 all-gathers and reduce-scatters are collectives over every
+    rank, so a rank whose batch is all text runs them on one blank image and
+    writes nothing: the result enters the graph as an empty ``(0, dim)``
+    inline embedding with zero weight.
+    """
+    blank = pixel_values.new_zeros((1, *pixel_values.shape[1:]))
+    embeds = _encode_and_adapt(wrapper, blank)
+    anchor = (embeds.sum() * 0).expand(0, embeds.shape[-1])
+    empty = torch.zeros(0, dtype=torch.long, device=input_ids.device)
+    return ModalityContext(inline_embeds=anchor, inline_rows=empty, inline_positions=empty)
+
+
 def _inline_image_context(
     wrapper: VLMWrapper,
     pixel_values: torch.Tensor,
@@ -92,7 +118,8 @@ def _inline_image_context(
     ``image_rows[n]`` and ``image_starts[n]`` give the row and first position
     of image ``n``'s ``tokens_per_image`` placeholder slots in ``input_ids``.
     ``image_tokens`` is the slot count the packer laid out; the adapter's
-    output must match it or the slots would be filled wrong.
+    output must match it or the slots would be filled wrong. ``N = 0`` is a
+    batch of text-only documents (``_text_only_context``).
     """
     if pixel_values.dim() != 4:
         raise ValueError(
@@ -103,11 +130,9 @@ def _inline_image_context(
             f"image_rows and image_starts must be ({pixel_values.shape[0]},), got "
             f"{tuple(image_rows.shape)} and {tuple(image_starts.shape)}"
         )
-    feats = wrapper.vision_encoder(pixel_values)
-    adapter_dtype = next(wrapper.adapter.parameters()).dtype
-    if feats.dtype != adapter_dtype:
-        feats = feats.to(adapter_dtype)
-    embeds = wrapper.adapter(feats)
+    if pixel_values.shape[0] == 0:
+        return _text_only_context(wrapper, pixel_values, input_ids)
+    embeds = _encode_and_adapt(wrapper, pixel_values)
     n, k, dim = embeds.shape
     if image_tokens is not None and k != image_tokens:
         raise ValueError(
@@ -160,11 +185,7 @@ def _project_visual_features(wrapper: VLMWrapper, pixel_values: torch.Tensor) ->
         encoder_input = pixel_values.reshape(b * f, *pixel_values.shape[2:])
     else:
         encoder_input = pixel_values
-    feats = wrapper.vision_encoder(encoder_input)
-    adapter_dtype = next(wrapper.adapter.parameters()).dtype
-    if feats.dtype != adapter_dtype:
-        feats = feats.to(adapter_dtype)
-    embeds = wrapper.adapter(feats)
+    embeds = _encode_and_adapt(wrapper, encoder_input)
     if is_video:
         embeds = embeds.reshape(b, f * embeds.shape[1], embeds.shape[2])
     return embeds
@@ -226,7 +247,11 @@ class JointDecoderStrategy:
     A packed batch (``image_rows`` given) takes the inline route instead:
     the flat images are encoded and each one's tokens are written over its
     placeholder slots inside its row, so logits cover the whole row and
-    ``doc_ids`` isolates the documents.
+    ``doc_ids`` isolates the documents. A text-only sample on the prefix
+    route arrives with a blank image and a ``frame_mask`` of ``False`` that
+    hides its prefix; a packed batch of text-only documents arrives with no
+    images at all, and the encoder runs on a blank one so its collectives
+    stay in step across ranks.
     """
 
     def prepare(

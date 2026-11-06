@@ -24,7 +24,7 @@ from kempnerforge.config.vlm import (
     MoTConfig,
     VLMConfig,
 )
-from kempnerforge.data.vlm_dataset import pack_vlm_samples
+from kempnerforge.data.vlm_dataset import VLMCollator, pack_vlm_samples
 from kempnerforge.model.modality import ModalityContext
 from kempnerforge.model.transformer import Transformer
 from kempnerforge.model.vlm import (
@@ -323,13 +323,18 @@ class TestModalityStrategies:
         assert ca_wrapper.num_image_tokens == 0
 
 
-def _packed_doc(text_len: int, seed: int) -> dict[str, torch.Tensor]:
+def _packed_doc(text_len: int, seed: int, images: int = 1) -> dict[str, torch.Tensor]:
     gen = torch.Generator().manual_seed(seed)
     ids = torch.randint(0, 256, (text_len,), generator=gen)
     labels = torch.full((text_len,), -100, dtype=torch.long)
     labels[:-1] = ids[1:]
+    pixels = (
+        torch.randn(3, 16, 16, generator=gen)
+        if images == 1
+        else torch.randn(images, 3, 16, 16, generator=gen)
+    )
     return {
-        "pixel_values": torch.randn(3, 16, 16, generator=gen),
+        "pixel_values": pixels,
         "input_ids": ids,
         "labels": labels,
         "text_len": torch.tensor(text_len),
@@ -388,6 +393,43 @@ class TestPackedForward:
         assert torch.allclose(a[0, 14:32], b[0, 14:32], atol=1e-5)
         assert not torch.allclose(a[0, :14], b[0, :14])
 
+    def test_text_only_documents_match_the_plain_transformer(self):
+        """With no images the rows are ordinary packed text, so the backbone alone decides."""
+        wrapper = _build_tiny_wrapper(num_image_tokens=8).eval()
+        docs = [_packed_doc(10, 1, images=0), _packed_doc(12, 2, images=0)]
+        batch = pack_vlm_samples(docs, seq_len=32, tokens_per_image=8, pad_id=0)
+        assert batch["pixel_values"].shape == (0, 3, 16, 16)
+        with torch.no_grad():
+            packed, _ = self._forward(wrapper, batch)
+            plain = wrapper.transformer(tokens=batch["input_ids"], doc_ids=batch["doc_ids"])
+        assert torch.allclose(packed, plain, atol=1e-5)
+
+    def test_a_text_only_batch_keeps_the_encoder_and_adapter_in_the_graph(self):
+        """Their parameters get (zero) gradients, so FSDP2's collectives run on every rank."""
+        wrapper = _build_tiny_wrapper(num_image_tokens=8)
+        batch = pack_vlm_samples(
+            [_packed_doc(10, 3, images=0)], seq_len=32, tokens_per_image=8, pad_id=0
+        )
+        logits, _ = self._forward(wrapper, batch)
+        logits.sum().backward()
+        adapter_grads = [p.grad for p in wrapper.adapter.parameters()]
+        assert all(g is not None for g in adapter_grads)
+        assert all(torch.count_nonzero(g) == 0 for g in adapter_grads)
+        assert all(p.grad is not None for p in wrapper.transformer.token_embedding.parameters())
+
+    def test_text_and_image_documents_share_a_batch(self):
+        wrapper = _build_tiny_wrapper(num_image_tokens=8).eval()
+        text_doc = _packed_doc(10, 4, images=0)
+        image_doc = _packed_doc(12, 5)
+        batch = pack_vlm_samples([image_doc, text_doc], seq_len=40, tokens_per_image=8, pad_id=0)
+        assert batch["pixel_values"].shape == (1, 3, 16, 16)
+        with torch.no_grad():
+            packed, _ = self._forward(wrapper, batch)
+            alone, _ = self._forward(
+                wrapper, pack_vlm_samples([text_doc], seq_len=40, tokens_per_image=8, pad_id=0)
+            )
+        assert torch.allclose(packed[0, 20:30], alone[0, :10], atol=1e-5)
+
     def test_backward_reaches_encoder_adapter_and_backbone(self):
         wrapper = _build_tiny_wrapper(num_image_tokens=8)
         batch = pack_vlm_samples([_packed_doc(10, 8)], seq_len=32, tokens_per_image=8, pad_id=0)
@@ -428,6 +470,31 @@ class TestPackedForward:
                 image_rows=batch["image_rows"],
                 image_starts=batch["image_starts"],
             )
+
+
+class TestTextOnlyPrefixRows:
+    """On the prefix route a text-only sample's blank image is hidden by ``frame_mask``."""
+
+    def test_the_text_logits_ignore_the_blank_image(self):
+        torch.manual_seed(0)
+        wrapper = _build_tiny_wrapper(num_image_tokens=8).eval()
+        collator = VLMCollator(pad_id=0, max_text_len=12)
+        text_only = {
+            "pixel_values": torch.zeros(0, 3, 16, 16),
+            "input_ids": torch.arange(1, 13),
+            "labels": torch.arange(2, 14),
+        }
+        batch = collator([text_only])
+        noise = batch["pixel_values"] + torch.randn(1, 3, 16, 16)
+        with torch.no_grad():
+            blank, _ = wrapper(
+                batch["pixel_values"], batch["input_ids"], frame_mask=batch["frame_mask"]
+            )
+            noisy, _ = wrapper(noise, batch["input_ids"], frame_mask=batch["frame_mask"])
+            seen, _ = wrapper(noise, batch["input_ids"])
+        assert torch.equal(blank, noisy)
+        assert not torch.equal(blank, seen)
+        assert torch.isfinite(blank).all()
 
 
 class TestVLMWrapperDispatch:

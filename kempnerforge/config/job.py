@@ -114,6 +114,13 @@ class JobConfig:
                 "[video] is set but [vlm] is missing; video training runs through "
                 "the VLM wrapper, so a [vlm] section (and [vision_encoder]) is required."
             )
+        if self.data.hf_allow_text_only:
+            if self.vlm is None:
+                raise ValueError(
+                    "data.hf_allow_text_only applies to VLM image runs; add a [vlm] section"
+                )
+            if self.video is not None:
+                raise ValueError("data.hf_allow_text_only applies to image datasets, not [video]")
         if self.data.pack_sequences and self.vlm is not None:
             if self.video is not None:
                 raise ValueError("data.pack_sequences is not supported with [video]")
