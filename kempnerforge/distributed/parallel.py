@@ -97,15 +97,15 @@ def is_fsdp_wrapped(model: torch.nn.Module) -> bool:
 
 
 def refresh_fsdp_dtypes(model: torch.nn.Module, params: Iterable[torch.Tensor]) -> None:
-    """Make FSDP2 recompute the reduction dtypes of the units that manage ``params``.
+    """Recompute the reduction dtypes of the FSDP2 units that manage ``params``.
 
-    FSDP2 takes a unit's original and reduce dtypes from its parameters that require grad
-    when the unit first runs. A unit frozen then gets neither, so after a freeze stage
-    unfreezes it, its gradients are reduce-scattered in the compute dtype, and assigning
-    them to parameters stored in another dtype fails. ``unshard`` recomputes them from the
-    current ``requires_grad``; the unit is resharded right after. A unit counts only for the
-    parameters it manages itself, not those of the units nested in it. Collective: every
-    rank calls this with the same parameters.
+    Call it after unfreezing parameters of an FSDP2-wrapped model. Each unit that manages
+    one of ``params`` itself, not through a nested unit, is unsharded and resharded. Every
+    rank calls it with the same parameters.
+
+    Args:
+        model: The model, wrapped with FSDP2 or not.
+        params: The parameters whose ``requires_grad`` was turned on.
     """
     changed = {id(p) for p in params}
     if not changed:
@@ -368,8 +368,7 @@ def _apply_fsdp_vlm(
         encoder frozen for the whole run stays a full replica, put in eval
         mode at build; replication is fine because requires_grad=False
         means no grad-reduce participation. One that a freeze stage unfreezes is
-        wrapped from the start, while still frozen, so that its gradients
-        are reduced across the data-parallel ranks once it trains.
+        wrapped from the start.
       - The ``VLMWrapper`` itself is not wrapped (no direct parameters).
     """
     if not has_dp_mesh(device_mesh):
@@ -436,8 +435,8 @@ def _build_vlm(
          ``num_tokens`` is known from the encoder.
       4. TP / EP / Float8 / AC are applied to the transformer only.
       5. FSDP2 is applied component-by-component (transformer blocks,
-         transformer root, adapter, and vision encoder iff some step of
-         the run, after the build freeze or a freeze stage, trains it).
+         transformer root, adapter, and vision encoder unless no step of
+         the run trains it).
       6. Meta subtrees are materialized (transformer / adapter), the
          vision encoder is moved to ``device``, and the transformer and
          adapter are cast to ``param_dtype``. The vision encoder stays in

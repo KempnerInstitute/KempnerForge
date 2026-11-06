@@ -67,10 +67,8 @@ class FreezeStage:
     changes across training phases. The list of stages on
     ``VLMConfig`` is expected to be in strictly monotonic
     ``start_step`` order. A stage can unfreeze a module that
-    ``VLMConfig.freeze`` froze at build: the optimizer holds the module
-    from the start, a vision encoder that a stage unfreezes is FSDP2
-    wrapped from the start, and a resume past the stage restores the
-    module's optimizer state.
+    ``VLMConfig.freeze`` froze at build; the module then trains from that
+    stage on, also after a resume.
     """
 
     start_step: int

@@ -53,7 +53,7 @@ def freeze_params(
     so calling this twice with the same arguments is idempotent. Returns the
     number of elements (``param.numel()`` summed) that were actually flipped.
     A model compiled with ``torch.compile`` is matched through the module it
-    wraps, whose parameter names carry no ``_orig_mod`` prefix.
+    wraps.
     """
     pats = list(patterns)
     if not pats:
@@ -177,11 +177,15 @@ def _apply_to_names(
 def trainable_during_run(model: nn.Module, config: VLMConfig) -> set[str]:
     """Return the names of the parameters of ``model`` that train at some step of a run.
 
-    Works on the names alone and leaves ``model`` as it is. The build applies
-    ``config.freeze`` to each parameter's current ``requires_grad``. From there each
-    ``FreezeStage`` applies its specs at its ``start_step``, and a resume applies
-    ``effective_freeze`` at the resumed step, before the first stage as well as after
-    each. A parameter that requires grad after any of these is in the result.
+    Covers the build freeze, each ``FreezeStage`` from its ``start_step``, and the freeze a
+    resume applies at any step. ``model`` is not changed.
+
+    Args:
+        model: The model, with each parameter's ``requires_grad`` as built.
+        config: The run's VLM config.
+
+    Returns:
+        The names of the parameters that require grad at some step of the run.
     """
     patterns = config.module_patterns
     built = {name: param.requires_grad for name, param in model.named_parameters()}
@@ -208,12 +212,15 @@ def trainable_during_run(model: nn.Module, config: VLMConfig) -> set[str]:
 def trainable_for_the_run(model: nn.Module, config: VLMConfig) -> Iterator[list[str]]:
     """Make every parameter that trains at some step of the run require grad, then restore.
 
-    Building the optimizer inside this context puts a parameter that a ``FreezeStage``
-    unfreezes later in its param groups from the start, and loading a checkpoint inside it
-    gives that parameter a place in the optimizer's load template. Every registered
-    optimizer skips a parameter whose gradient is None, so it stays untouched until a
-    stage unfreezes it. A model compiled with ``torch.compile`` is read through the module
-    it wraps. Yields the names of the parameters it made require grad.
+    Build the optimizer, and load a checkpoint, inside this context so that a parameter a
+    ``FreezeStage`` unfreezes later is in the optimizer from the start.
+
+    Args:
+        model: The model, compiled with ``torch.compile`` or not.
+        config: The run's VLM config.
+
+    Yields:
+        The names of the parameters it made require grad.
     """
     inner = getattr(model, "_orig_mod", model)
     names = trainable_during_run(inner, config)
