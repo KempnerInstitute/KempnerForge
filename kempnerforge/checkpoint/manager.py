@@ -367,7 +367,8 @@ def _check_saved_param_groups(
     another group, and a group can come back without settings. Checked when ``groups_vary``,
     as it is for a run with ``optimizer.lr_multipliers``, or when this run's groups or the
     saved ones name a module: the checkpoint must hold as many groups, each with every
-    setting of this run's group there.
+    setting of this run's group there, and each naming a module exactly where this run's
+    group does.
     """
     groups = optim_state["param_groups"]
     names_module = any(
@@ -384,6 +385,9 @@ def _check_saved_param_groups(
             missing = sorted(key for key in group if f"{prefix}{key}" not in saved_keys)
             if missing:
                 found = f"has no {missing} in optimizer param group {index}, which this run's has"
+                break
+            if "module" not in group and f"{prefix}module" in saved_keys:
+                found = f"names a module in optimizer param group {index}, and this run's does not"
                 break
         else:
             return
@@ -536,7 +540,9 @@ class CheckpointManager:
             that file is restored. A load that restores neither goes ahead. A checkpoint that
             records none counts as saved without multipliers. With multipliers set, a load that
             restores optimizer state into param groups laid out otherwise than at the save
-            raises on every rank before anything is loaded.
+            raises on every rank before anything is loaded. A restored scheduler state carries
+            the saved schedule on in every group, a group of a module the checkpoint holds no
+            group of at the saved peak times its multiplier (see ``restore_train_state``).
         module_patterns: Module name to fnmatch patterns, such as ``VLMConfig.module_patterns``.
             Required for every module ``lr_multipliers`` lists.
     """
@@ -1136,6 +1142,7 @@ class CheckpointManager:
                 train_state,
                 scheduler=scheduler,
                 dataloader=dataloader,
+                lr_multipliers=self._lr_multipliers,
             )
             logger.info(f"Resumed from step {step}, {tokens_seen:,} tokens seen")
         else:

@@ -103,13 +103,21 @@ checkpoints saved without them. From a training checkpoint, that leaves:
   parameters are trainable, as in a stage that unfreezes the language model or freezes
   another module, or `weight_decay_scope` changed. `train_state.pt` records the module of
   each group the scheduler state belongs to, so each group resumes at its module's saved
-  rate, and a group of a module the checkpoint holds no group of starts at its configured
-  rate. A load that also restores the optimizer state into groups laid out otherwise stops
-  on every rank before loading anything, and names this warm start.
+  rate, and a group of a module the checkpoint holds no group of, such as the language
+  model's in a stage that unfreezes it, at the saved peak times its multiplier. A load that
+  also restores the optimizer state into groups laid out otherwise stops on every rank before
+  loading anything. When the groups differ in number, in the settings they hold, or in which
+  of them belong to a listed module, the error names this warm start.
+- Not a new peak rate. Every resume and warm start restores the scheduler state in
+  `train_state.pt`, and the saved schedule carries on, its peak included: the scheduler's
+  param groups run from the `optimizer.lr` of the save times each one's multiplier, whatever
+  `optimizer.lr` the new stage sets, and the load logs the peak of each module's groups.
 - Not a stage that changes the multipliers or their patterns. Every resume and warm start
   restores `train_state.pt`, scheduler state included, since `checkpoint.exclude_from_loading`
-  takes only `"model"` and `"optimizer"`. Such a stage needs a warm start from the weights
-  alone, which `exclude_from_loading` does not offer.
+  takes only `"model"` and `"optimizer"`. Such a stage, like one with a new `optimizer.lr`
+  as a finetune after an alignment stage often has, needs a warm start from the weights
+  alone, which `exclude_from_loading` does not offer
+  ([#442](https://github.com/KempnerInstitute/KempnerForge/issues/442)).
 
 Code that builds its own `CheckpointManager` gets the same record and check by passing
 `lr_multipliers` and `module_patterns`, and calls `build_optimizer(model, config,

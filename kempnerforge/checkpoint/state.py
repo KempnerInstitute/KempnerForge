@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import random
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 import numpy as np
@@ -19,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 _GROUP_MODULES_KEY = "scheduler_group_modules"
 _PER_GROUP_KEYS = ("base_lrs", "_last_lr", "lr_lambdas")
+_PER_GROUP_RATE_KEYS = ("base_lrs", "_last_lr")
 
 
 def get_rng_state() -> dict[str, Any]:
@@ -58,8 +60,59 @@ def _group_modules(scheduler: Any) -> list[str | None] | None:
     return [group.get("module") for group in param_groups]
 
 
+def _multiplier(module: str | None, lr_multipliers: Mapping[str, float] | None) -> float:
+    """Return the multiplier of ``module``'s param groups, 1 for a group that names none.
+
+    Raises:
+        ValueError: ``lr_multipliers`` does not list ``module``.
+    """
+    if module is None:
+        return 1.0
+    if lr_multipliers is None or module not in lr_multipliers:
+        raise ValueError(
+            f"The checkpoint's scheduler state is laid out by module for other param groups, "
+            f"which needs the multiplier of {module!r}, but lr_multipliers={lr_multipliers}"
+        )
+    return lr_multipliers[module]
+
+
+def _layout_sources(
+    saved_modules: Sequence[str | None],
+    current: Sequence[str | None],
+    first: dict[str | None, int],
+    lr_multipliers: Mapping[str, float] | None,
+) -> list[tuple[int, tuple[float, float] | None]]:
+    """Return, for each current param group, the saved group whose entries it takes and the
+    multipliers its rates are scaled from and to.
+
+    A group of a module with saved groups takes the first of them as it is. Any other takes
+    the first saved group, its rates divided by that group's multiplier and multiplied by its
+    own, so it runs at the saved peak times its multiplier.
+
+    Raises:
+        ValueError: The state holds no saved group, or ``lr_multipliers`` lacks a module the
+            scaling needs.
+    """
+    sources: list[tuple[int, tuple[float, float] | None]] = []
+    for module in current:
+        if module in first:
+            sources.append((first[module], None))
+            continue
+        if not saved_modules:
+            raise ValueError(
+                f"The checkpoint's scheduler state holds no param group to lay out for this "
+                f"run's groups of {current}"
+            )
+        scale = (_multiplier(saved_modules[0], lr_multipliers), _multiplier(module, lr_multipliers))
+        sources.append((0, scale))
+    return sources
+
+
 def _scheduler_state_for(
-    scheduler: Any, saved: dict[str, Any], saved_modules: object
+    scheduler: Any,
+    saved: dict[str, Any],
+    saved_modules: object,
+    lr_multipliers: Mapping[str, float] | None = None,
 ) -> dict[str, Any]:
     """Return the scheduler state ``saved`` laid out for the param groups ``scheduler`` holds.
 
@@ -69,17 +122,22 @@ def _scheduler_state_for(
     Which groups ``build_optimizer`` makes for ``optimizer.lr_multipliers`` depends on which
     parameters are trainable and on ``optimizer.weight_decay_scope``, since it leaves out
     groups with no parameters, while every group of one module has that module's rate. So
-    when the saved groups' modules differ from the current ones, in name or in number, each
-    current group takes the entries of the first saved group of its module, groups that name
-    no module matching each other, and a group whose module has no saved group keeps its own.
-    Otherwise ``saved`` is returned as it is, and so it is when the state lists no base rates,
-    or when no group names a module and ``scheduler`` is not a ``LambdaLR``, which keeps the
-    positional load such a scheduler always had.
+    when the saved groups' modules differ from the current ones, in name or in number, the
+    saved schedule carries on in every group, as it does when they match: each current group
+    takes the entries of the first saved group of its module, groups that name no module
+    matching each other, and a group whose module has no saved group takes those of the first
+    saved group, its rates scaled from that group's multiplier in ``lr_multipliers`` to its
+    own, so it runs at the saved peak times its multiplier; a group that names no module has a
+    multiplier of 1. Otherwise ``saved`` is returned as it is, and so it is when the state
+    lists no base rates, or when no group names a module and ``scheduler`` is not a
+    ``LambdaLR``, which keeps the positional load such a scheduler always had.
 
     Raises:
         ValueError: ``saved_modules`` does not name one module per saved group; the groups
             differ and ``scheduler`` is not a ``LambdaLR``, whose per-group entries this lays
-            out; or the saved groups of one module have different base rates.
+            out; the saved groups of one module have different base rates; or a group's module
+            has no saved group and the state holds none, or ``lr_multipliers`` lacks the
+            multiplier the scaling needs.
     """
     current = _group_modules(scheduler)
     base_lrs = saved.get("base_lrs")
@@ -119,7 +177,7 @@ def _scheduler_state_for(
                 f"rates {base_lrs[lead]} and {base_lrs[index]}, so it cannot be laid out for "
                 f"this run's groups of {current}"
             )
-    fresh = scheduler.state_dict()
+    sources = _layout_sources(saved_modules, current, first, lr_multipliers)
     logger.info(
         f"Laying out the scheduler state saved for param groups of {saved_modules} for this "
         f"run's groups of {current} by module"
@@ -128,12 +186,30 @@ def _scheduler_state_for(
         **saved,
         **{
             key: [
-                values[first[module]] if module in first else fresh[key][index]
-                for index, module in enumerate(current)
+                values[index]
+                if scale is None or key not in _PER_GROUP_RATE_KEYS
+                else values[index] / scale[0] * scale[1]
+                for index, scale in sources
             ]
             for key, values in entries.items()
         },
     }
+
+
+def _module_peaks(scheduler: Any) -> dict[str | None, Any]:
+    """Return the base rate of each module's first param group, when a group names a module."""
+    modules = _group_modules(scheduler) or []
+    base_lrs = getattr(scheduler, "base_lrs", None)
+    if (
+        not isinstance(base_lrs, list)
+        or len(base_lrs) != len(modules)
+        or all(module is None for module in modules)
+    ):
+        return {}
+    peaks: dict[str | None, Any] = {}
+    for module, base_lr in zip(modules, base_lrs, strict=True):
+        peaks.setdefault(module, base_lr)
+    return peaks
 
 
 def build_train_state(
@@ -185,16 +261,23 @@ def restore_train_state(
     state: dict[str, Any],
     scheduler: Any | None = None,
     dataloader: Any | None = None,
+    lr_multipliers: Mapping[str, float] | None = None,
 ) -> tuple[int, int, dict[str, Any]]:
     """Restore the non-distributed portion of the training state.
 
     Args:
         state: Training state dict (from build_train_state).
-        scheduler: LR scheduler to restore. Its state is laid out by module for param groups
-            other than those it was saved with (see ``build_train_state``), so each group of a
-            module the checkpoint holds resumes at that module's rates and any other keeps its
-            own; nothing is restored when that fails.
+        scheduler: LR scheduler to restore. The saved schedule carries on in every param
+            group, peak included, whatever the rates the optimizer was built with. Its state is
+            laid out by module for groups other than those it was saved with (see
+            ``build_train_state``): each group of a module the checkpoint holds resumes at that
+            module's rates, and any other at the saved peak times its multiplier. Nothing is
+            restored when that fails. When a group names a module, the peak rate of each
+            module's groups is logged.
         dataloader: Stateful dataloader to restore.
+        lr_multipliers: The ``optimizer.lr_multipliers`` the scheduler's groups were built
+            with, which must be those of the save. Needed only for a group of a module the
+            checkpoint holds no group of.
 
     Returns:
         Tuple of (step, tokens_seen, extra) where extra contains any
@@ -208,7 +291,7 @@ def restore_train_state(
     scheduler_state = None
     if scheduler is not None and "scheduler" in state:
         scheduler_state = _scheduler_state_for(
-            scheduler, state["scheduler"], state.get(_GROUP_MODULES_KEY)
+            scheduler, state["scheduler"], state.get(_GROUP_MODULES_KEY), lr_multipliers
         )
 
     if "rng" in state:
@@ -217,7 +300,14 @@ def restore_train_state(
 
     if scheduler is not None and scheduler_state is not None:
         scheduler.load_state_dict(scheduler_state)
-        logger.info("Restored scheduler state")
+        peaks = _module_peaks(scheduler)
+        if peaks:
+            logger.info(
+                f"Restored scheduler state; each module's param groups run the restored "
+                f"schedule from peak lr {peaks}"
+            )
+        else:
+            logger.info("Restored scheduler state")
 
     if dataloader is not None and "dataloader" in state and hasattr(dataloader, "load_state_dict"):
         dataloader.load_state_dict(state["dataloader"])

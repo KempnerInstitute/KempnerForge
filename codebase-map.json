@@ -1182,8 +1182,8 @@
         "get_rng_state() -> dict",
         "set_rng_state(state)",
         "build_train_state(step, tokens_seen, scheduler, dataloader, extra) -> dict (records scheduler_group_modules when a param group names a module)",
-        "restore_train_state(state, scheduler, dataloader) -> (step, tokens_seen)",
-        "_scheduler_state_for(scheduler, saved, saved_modules) -> dict (lays a LambdaLR state out by module for other param groups)"
+        "restore_train_state(state, scheduler, dataloader, lr_multipliers) -> (step, tokens_seen)",
+        "_scheduler_state_for(scheduler, saved, saved_modules, lr_multipliers) -> dict (lays a LambdaLR state out by module for other param groups; a module with no saved group runs at the saved peak times its multiplier)"
       ],
       "tested_by": [
         "tests/unit/test_checkpoint.py::TestRNGState",

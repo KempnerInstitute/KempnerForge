@@ -84,11 +84,17 @@ groups. When a group names a module under `"module"`, as
 `scheduler_group_modules` records the module of every group, None for
 one outside the listed modules. A load into groups laid out otherwise,
 because other parameters are trainable or the weight-decay scope
-changed, gives each group the saved entries of its module's groups,
-and a group of a module the state holds no group of keeps its own.
-Without a recorded module on either side, the state loads as saved,
-unless the number of groups changed: a `LambdaLR` state is then laid
-out the same way, its groups all of no module.
+changed, carries the saved schedule on in every group, as a load into
+the same groups does: each group gets the saved entries of its
+module's groups, and a group of a module the state holds no group of
+gets those of the first saved group, its rates scaled from that
+group's multiplier to its own, so it runs at the saved peak times its
+multiplier. Without a recorded module on either side, the state loads
+as saved, unless the number of groups changed: a `LambdaLR` state is
+then laid out the same way, its groups all of no module. Either way
+the saved base LRs win over the ones the optimizer was built with, so
+a changed `optimizer.lr` takes no effect; a load whose groups name a
+module logs the peak of each module's groups.
 
 Pure `phase.lr_scale` overlays live in the training loop and are
 recomputed from the current phase, so they don't need to be saved.

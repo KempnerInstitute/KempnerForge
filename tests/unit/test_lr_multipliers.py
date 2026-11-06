@@ -910,14 +910,14 @@ class TestLayoutChange:
     }
 
     @classmethod
-    def _build(cls, name, frozen, scope, multipliers=None):
+    def _build(cls, name, frozen, scope, multipliers=None, lr=LR, adam_lr=ADAM_LR):
         model = _vlm_like()
         for module in frozen:
             getattr(model, module).requires_grad_(False)
         config = OptimizerConfig(
             name=name,
-            lr=cls.LR,
-            muon_adam_lr=cls.ADAM_LR,
+            lr=lr,
+            muon_adam_lr=adam_lr,
             fused=False,
             weight_decay_scope=scope,
             lr_multipliers=cls.MULTIPLIERS if multipliers is None else multipliers,
@@ -949,20 +949,21 @@ class TestLayoutChange:
         optimizers = (optimizer, *getattr(optimizer, "inner_optimizers", ()))
         return [[(g.get("module"), g["weight_decay"]) for g in o.param_groups] for o in optimizers]
 
-    def _assert_module_rates(self, optimizer, scheduler):
-        """Every group, a Muon fallback's included, steps next at its module's scheduled rate."""
+    def _assert_module_rates(self, optimizer, scheduler, lr=LR, adam_lr=ADAM_LR):
+        """Every group, a Muon fallback's included, steps next at its module's scheduled rate
+        from the peak ``lr``, ``adam_lr`` for the fallback."""
         factor = scheduler.lr_lambdas[0](scheduler.last_epoch)
 
         def expected(groups, base):
             return [base * self.MULTIPLIERS.get(g.get("module"), 1.0) * factor for g in groups]
 
         groups = optimizer.param_groups
-        assert [g["lr"] for g in groups] == pytest.approx(expected(groups, self.LR), rel=1e-12)
+        assert [g["lr"] for g in groups] == pytest.approx(expected(groups, lr), rel=1e-12)
         if isinstance(optimizer, Muon):
             assert optimizer._adam is not None
             fallback = optimizer._adam.param_groups
             assert optimizer._fallback_lrs() == pytest.approx(
-                expected(fallback, self.ADAM_LR), rel=1e-12
+                expected(fallback, adam_lr), rel=1e-12
             )
 
     @pytest.mark.parametrize("scenario", sorted(SCENARIOS))
@@ -1003,6 +1004,55 @@ class TestLayoutChange:
         self._train(model, optimizer, scheduler, 1)
         self._assert_module_rates(optimizer, scheduler)
 
+    LR_CHANGES = {
+        "same-layout": ({"transformer", "vision_encoder"}, {"transformer", "vision_encoder"}),
+        "unfrozen": ({"transformer", "vision_encoder"}, {"vision_encoder"}),
+        "no-module-held": ({"transformer", "vision_encoder"}, {"adapter", "vision_encoder"}),
+    }
+
+    @pytest.mark.parametrize("change", sorted(LR_CHANGES))
+    @pytest.mark.parametrize("name", RESUMABLE_OPTIMIZERS)
+    def test_a_warm_start_with_another_lr_keeps_the_saved_peak_in_every_group(
+        self, tmp_path, name, change
+    ):
+        """The restored schedule wins over ``optimizer.lr``, its peak included, whatever the
+        layout: a group of a module the checkpoint holds no group of runs at the saved peak
+        times its multiplier, so the multipliers keep their ratio."""
+        saved, resumed = self.LR_CHANGES[change]
+        model, optimizer, scheduler = self._build(name, saved, self.DEFAULT_SCOPE, adam_lr=None)
+        self._train(model, optimizer, scheduler, 4)
+        self._manager(tmp_path, model, optimizer).save(step=4, scheduler=scheduler)
+
+        model, optimizer, scheduler = self._build(
+            name, resumed, self.DEFAULT_SCOPE, lr=self.LR / 10, adam_lr=None
+        )
+        step, _, _ = self._manager(tmp_path, model, optimizer).load(
+            scheduler=scheduler, exclude_keys=["optimizer"]
+        )
+        assert (step, scheduler.last_epoch) == (4, 4)
+        for _ in range(3):
+            self._train(model, optimizer, scheduler, 1)
+            self._assert_module_rates(optimizer, scheduler, adam_lr=self.LR)
+
+    def test_the_load_logs_the_peak_each_module_resumes_at(self, tmp_path, caplog, monkeypatch):
+        monkeypatch.setattr(logging.getLogger("kempnerforge"), "propagate", True)
+        model, optimizer, scheduler = self._build("adamw", {"transformer", "vision_encoder"}, "all")
+        self._train(model, optimizer, scheduler, 4)
+        self._manager(tmp_path, model, optimizer).save(step=4, scheduler=scheduler)
+
+        model, optimizer, scheduler = self._build(
+            "adamw", {"vision_encoder"}, "all", lr=self.LR / 10
+        )
+        with caplog.at_level(logging.INFO, logger="kempnerforge.checkpoint.state"):
+            self._manager(tmp_path, model, optimizer).load(
+                scheduler=scheduler, exclude_keys=["optimizer"]
+            )
+        assert scheduler.base_lrs == [self.LR, self.LR * 5.0]
+        assert (
+            "Restored scheduler state; each module's param groups run the restored schedule "
+            f"from peak lr { ({None: self.LR, 'adapter': self.LR * 5.0}) }"
+        ) in caplog.messages
+
     @pytest.mark.parametrize(
         ("name", "saved", "resumed"),
         [
@@ -1010,8 +1060,17 @@ class TestLayoutChange:
             ("lion", set(), {"adapter"}),
             ("muon", set(), {"vision_encoder"}),
             ("adamw", {"vision_encoder"}, {"transformer"}),
+            ("adamw", {"transformer"}, {"vision_encoder"}),
+            ("lion", {"transformer"}, {"vision_encoder"}),
         ],
-        ids=["last-module-frozen", "middle-module-frozen", "muon", "as-many-groups"],
+        ids=[
+            "last-module-frozen",
+            "middle-module-frozen",
+            "muon",
+            "as-many-groups-named-now",
+            "as-many-groups-named-at-save",
+            "as-many-groups-named-at-save-lion",
+        ],
     )
     def test_a_resume_into_other_groups_is_refused_before_loading(
         self, tmp_path, name, saved, resumed
@@ -1112,10 +1171,79 @@ class TestSchedulerStateLayout:
         state = build_train_state(step=2, tokens_seen=0, scheduler=saved)
         assert "scheduler_group_modules" not in state
         resumed = self._scheduler([(None, 0.1), ("a", 0.2), ("a", 0.2)])
-        restore_train_state(state, scheduler=resumed)
-        assert resumed.base_lrs == [0.3, 0.2, 0.2]
+        restore_train_state(state, scheduler=resumed, lr_multipliers={"a": 2.0})
+        assert resumed.base_lrs == [0.3, 0.6, 0.6]
         assert resumed.last_epoch == 2
         assert resumed._last_lr == pytest.approx([0.1, 0.2, 0.2])
+
+    def test_a_group_of_a_module_with_no_saved_group_takes_the_saved_peak(self):
+        """Its rates are the first saved group's, divided by that group's multiplier and
+        multiplied by its own, so the multipliers keep their ratio under the saved peak."""
+        saved = self._scheduler([("a", 0.5), ("a", 0.5)])
+        saved.step()
+        saved.step()
+        state = build_train_state(step=2, tokens_seen=0, scheduler=saved)
+        resumed = self._scheduler([(None, 0.01), ("b", 0.03), ("a", 0.05)])
+        restore_train_state(state, scheduler=resumed, lr_multipliers={"a": 5.0, "b": 3.0})
+        assert resumed.base_lrs == pytest.approx([0.1, 0.3, 0.5], rel=1e-15)
+        assert resumed._last_lr == pytest.approx([0.1 / 3, 0.3 / 3, 0.5 / 3], rel=1e-15)
+        resumed.optimizer.step()
+        resumed.step()
+        assert [g["lr"] for g in resumed.optimizer.param_groups] == pytest.approx(
+            [0.1 / 4, 0.3 / 4, 0.5 / 4], rel=1e-15
+        )
+
+    def test_a_saved_peak_unchanged_gives_a_new_group_its_built_rate_exactly(self):
+        state = build_train_state(step=0, tokens_seen=0, scheduler=self._scheduler([(None, 0.1)]))
+        resumed = self._scheduler([(None, 0.1), ("b", 0.1 * 3.0)])
+        restore_train_state(state, scheduler=resumed, lr_multipliers={"b": 3.0})
+        assert resumed.base_lrs == [0.1, 0.1 * 3.0]
+
+    @pytest.mark.parametrize("multipliers", [None, {"b": 3.0}], ids=["none", "without-a"])
+    def test_a_layout_that_needs_a_missing_multiplier_restores_nothing(self, multipliers):
+        state = build_train_state(step=2, tokens_seen=0, scheduler=self._scheduler([("a", 0.5)]))
+        torch.rand(1)
+        rng = torch.get_rng_state()
+        resumed = self._scheduler([(None, 0.1), ("b", 0.3)])
+        with pytest.raises(ValueError, match="needs the multiplier of 'a'"):
+            restore_train_state(state, scheduler=resumed, lr_multipliers=multipliers)
+        assert torch.equal(torch.get_rng_state(), rng)
+        assert resumed.last_epoch == 0
+
+    def test_a_state_of_no_group_cannot_be_laid_out(self):
+        saved = self._scheduler([(None, 0.1)]).state_dict()
+        saved.update(base_lrs=[], _last_lr=[], lr_lambdas=[])
+        state = {"step": 2, "scheduler": saved, "scheduler_group_modules": []}
+        with pytest.raises(ValueError, match="holds no param group to lay out"):
+            restore_train_state(state, scheduler=self._scheduler([("a", 0.1)]), lr_multipliers={})
+
+    def test_the_restore_logs_the_peak_of_each_module(self, caplog, monkeypatch):
+        monkeypatch.setattr(logging.getLogger("kempnerforge"), "propagate", True)
+        state = build_train_state(
+            step=0, tokens_seen=0, scheduler=self._scheduler([(None, 0.1), ("a", 0.2), ("a", 0.2)])
+        )
+        resumed = self._scheduler([(None, 0.1), ("a", 0.2), ("a", 0.2)])
+        with caplog.at_level(logging.INFO, logger="kempnerforge.checkpoint.state"):
+            restore_train_state(state, scheduler=resumed)
+        assert (
+            "Restored scheduler state; each module's param groups run the restored schedule "
+            "from peak lr {None: 0.1, 'a': 0.2}"
+        ) in caplog.messages
+
+    @pytest.mark.parametrize("kind", ["lambda", "step"])
+    def test_without_a_module_the_restore_logs_as_before(self, caplog, monkeypatch, kind):
+        monkeypatch.setattr(logging.getLogger("kempnerforge"), "propagate", True)
+
+        def build(groups):
+            if kind == "lambda":
+                return self._scheduler(groups)
+            return torch.optim.lr_scheduler.StepLR(self._optimizer(groups), step_size=1)
+
+        state = build_train_state(step=0, tokens_seen=0, scheduler=build([(None, 0.1)]))
+        with caplog.at_level(logging.INFO, logger="kempnerforge.checkpoint.state"):
+            restore_train_state(state, scheduler=build([(None, 0.1)]))
+        assert "Restored scheduler state" in caplog.messages
+        assert not any("peak lr" in message for message in caplog.messages)
 
     @pytest.mark.parametrize(
         "record",
