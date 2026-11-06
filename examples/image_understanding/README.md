@@ -44,6 +44,11 @@ with `vlm.arch = "joint_decoder"`, `vision_encoder.type = "siglip2"` and
 32 × 32 = 1024 patch tokens, pooled 2 × 2 to 256 visual tokens, plus
 `max_text_len = 256` text tokens, so `max_seq_len = 512`.
 
+The recipe computes SigLIP2 in fp32 in stage 1 and in bf16 in stage 2, while
+the backbone computes in bf16. Set that with `[vision_encoder] mixed_precision`
+(`"fp32"` or `"bf16"`): the encoder's weights and optimizer state stay in the
+fp32 it loads in, on any number of GPUs.
+
 ## Start from the pretrained backbone
 
 Stage 1 warm-starts from a checkpoint that holds the pretrained Qwen3-0.6B
@@ -80,7 +85,6 @@ or in core where it belongs:
 - Documents with several images
 - Tiling into a global view and a 3 × 3 grid of crops (stage 2)
 - Per-module learning rates and schedules
-- Vision-encoder precision separate from the backbone's
 - Evaluation parity: chat-template prompts, image attention, the recipe's scorers
 - Run-comparison metrics: documents seen, token counts, MFU with the encoder
 
