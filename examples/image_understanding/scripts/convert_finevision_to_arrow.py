@@ -5,7 +5,9 @@
 one record batch per row group so rows keep their order, plus a ``<name>.meta.npz``
 sidecar (rows per batch, per-row keep flag, image count and ratings). Each file is
 claimed with an exclusive ``.claim`` file first, so any number of ``convert``
-processes can share the work and a rerun skips finished files. ``index`` merges a
+processes can share the work and a rerun skips finished files; a claim older than
+``--stale-claim-hours`` is taken over, so each process writes through temp files
+named for it and releases only a claim it still holds. ``index`` merges a
 fully converted subset's sidecars into ``<subset>/index.npz``; for a sidecar
 without image counts it reads them from the Arrow file.
 
@@ -66,10 +68,10 @@ def image_counts(batch: pa.RecordBatch) -> np.ndarray:
     return lengths.to_numpy(zero_copy_only=False).astype(np.int16)
 
 
-def convert_file(src_file: Path, dst_file: Path) -> int:
-    """Write ``src_file`` as Arrow IPC and its sidecar; return the bytes written."""
+def convert_file(src_file: Path, dst_file: Path, tag: str = "") -> int:
+    """Write ``src_file`` as Arrow IPC and its sidecar through temp files named by ``tag``."""
     parquet = pq.ParquetFile(src_file)
-    tmp = dst_file.with_name(dst_file.name + ".tmp")
+    tmp = dst_file.with_name(f"{dst_file.name}.{tag}.tmp")
     batch_rows: list[int] = []
     keep: list[bool] = []
     images: list[np.ndarray] = []
@@ -77,7 +79,7 @@ def convert_file(src_file: Path, dst_file: Path) -> int:
     with pa.OSFile(str(tmp), "wb") as sink, pa.ipc.new_file(sink, parquet.schema_arrow) as writer:
         for group in range(parquet.num_row_groups):
             table = parquet.read_row_group(group).combine_chunks()
-            batches = table.to_batches()
+            batches = table.to_batches() or [pa.RecordBatch.from_pylist([], schema=table.schema)]
             if len(batches) != 1:
                 raise RuntimeError(f"{src_file} row group {group} became {len(batches)} batches")
             writer.write_batch(batches[0])
@@ -100,7 +102,7 @@ def convert_file(src_file: Path, dst_file: Path) -> int:
         if reader.get_batch(group).num_rows != rows:
             raise RuntimeError(f"{tmp} batch {group} does not hold {rows} rows")
     os.replace(tmp, dst_file)
-    meta_tmp = dst_file.with_name(dst_file.stem + ".meta.tmp.npz")
+    meta_tmp = dst_file.with_name(f"{dst_file.stem}.meta.{tag}.tmp.npz")
     np.savez(
         meta_tmp,
         batch_rows=np.asarray(batch_rows, dtype=np.int64),
@@ -112,9 +114,20 @@ def convert_file(src_file: Path, dst_file: Path) -> int:
     return dst_file.stat().st_size
 
 
+def _release_claim(claim: Path, tag: str) -> None:
+    """Remove ``claim`` when the line it holds is still this process's."""
+    try:
+        mine = claim.read_text().startswith(f"{tag} ")
+    except FileNotFoundError:
+        return
+    if mine:
+        claim.unlink(missing_ok=True)
+
+
 def _convert_job(job: tuple[Path, Path, float]) -> int:
     src_file, dst_file, stale_seconds = job
     claim = dst_file.with_name(dst_file.name + ".claim")
+    tag = f"{socket.gethostname()}-{os.getpid()}"
     if meta_path(dst_file).exists():
         return 0
     try:
@@ -126,12 +139,12 @@ def _convert_job(job: tuple[Path, Path, float]) -> int:
         fd = os.open(claim, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
     except FileExistsError:
         return 0
-    os.write(fd, f"{socket.gethostname()} {os.getpid()} {time.time():.0f}\n".encode())
+    os.write(fd, f"{tag} {time.time():.0f}\n".encode())
     os.close(fd)
     try:
-        return convert_file(src_file, dst_file)
+        return convert_file(src_file, dst_file, tag)
     finally:
-        claim.unlink()
+        _release_claim(claim, tag)
 
 
 def convert(args: argparse.Namespace) -> None:
