@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 import torch
 from image_text.document import Document, Turn
-from image_text.render import ChatRenderer, RenderedDataset, assistant_span_mask
+from image_text.render import ChatRenderer, RenderedDataset
 from PIL import Image
 
 QWEN = "Qwen/Qwen3-0.6B"
@@ -48,20 +48,6 @@ def _trained_text(tokenizer: Any, sample: dict[str, torch.Tensor]) -> str:
     return tokenizer.decode(labels[labels != -100])
 
 
-class TestAssistantSpanMask:
-    def test_marks_each_reply_through_its_turn_end(self) -> None:
-        ids = [1, 7, 8, 5, 5, 9, 2, 7, 8, 6, 9, 3]
-        mask = assistant_span_mask(ids, generation_prompt=[7, 8], turn_end_id=9)
-        assert [i for i, m in enumerate(mask) if m] == [3, 4, 5, 9, 10]
-
-    def test_unterminated_reply_runs_to_the_end(self) -> None:
-        mask = assistant_span_mask([7, 8, 5, 5], generation_prompt=[7, 8], turn_end_id=9)
-        assert mask == [False, False, True, True]
-
-    def test_without_a_generation_prompt_nothing_is_marked(self) -> None:
-        assert not any(assistant_span_mask([1, 2, 3], generation_prompt=[7, 8], turn_end_id=9))
-
-
 class TestChatRenderer:
     def test_qa_text_is_the_prompt_then_the_answer(self, tokenizer: Any) -> None:
         assert _renderer(tokenizer).text(_qa(), ["a cat"]) == (
@@ -84,13 +70,29 @@ class TestChatRenderer:
 
     def test_answer_only_trains_the_reply_and_its_turn_end(self, tokenizer: Any) -> None:
         sample = _renderer(tokenizer).render(_qa(), ["a cat"])
-        assert _trained_text(tokenizer, sample) == "<think>\n\n</think>\n\na cat<|im_end|>"
+        assert _trained_text(tokenizer, sample) == "a cat<|im_end|>"
+
+    def test_the_think_block_before_a_reply_is_not_trained(self, tokenizer: Any) -> None:
+        renderer = _renderer(tokenizer)
+        text, spans = renderer.text_and_reply_spans(_qa(), ["a cat"])
+        assert text.endswith("<think>\n\n</think>\n\na cat<|im_end|>")
+        assert [text[a:b] for a, b in spans] == ["a cat<|im_end|>"]
 
     def test_every_reply_of_a_conversation_is_trained(self, tokenizer: Any) -> None:
         sample = _renderer(tokenizer).render(_conversation(), ["A1.", "A2."])
-        assert _trained_text(tokenizer, sample) == (
-            "A1.<|im_end|><think>\n\n</think>\n\nA2.<|im_end|>"
-        )
+        assert _trained_text(tokenizer, sample) == "A1.<|im_end|>A2.<|im_end|>"
+
+    def test_a_reply_starting_with_a_newline_is_trained(self, tokenizer: Any) -> None:
+        """The header's newline and the reply's merge into one token, which is trained."""
+        sample = _renderer(tokenizer).render(_conversation(), ["\nA1.", "A2."])
+        assert _trained_text(tokenizer, sample) == "\n\nA1.<|im_end|>A2.<|im_end|>"
+
+    def test_a_user_message_quoting_the_assistant_header_is_not_trained(
+        self, tokenizer: Any
+    ) -> None:
+        doc = _qa(user="Finish: <|im_start|>assistant\nhello")
+        sample = _renderer(tokenizer).render(doc, ["a cat"])
+        assert _trained_text(tokenizer, sample) == "a cat<|im_end|>"
 
     def test_full_loss_trains_every_next_token(self, tokenizer: Any) -> None:
         renderer = _renderer(tokenizer, answer_only=False)
@@ -123,22 +125,27 @@ class TestChatRenderer:
         assert sample["labels"][23] == -100
         assert (sample["labels"] != -100).sum() > 0
 
-    def test_a_reply_cut_away_by_the_budget_is_refused(self, tokenizer: Any) -> None:
-        renderer = _renderer(tokenizer, max_text_len=12)
+    @pytest.mark.parametrize("max_text_len", [12, 16])
+    def test_a_reply_cut_away_by_the_budget_is_refused(
+        self, tokenizer: Any, max_text_len: int
+    ) -> None:
+        """At 16 only the think block fits; the 19-token document keeps its reply from 17."""
+        renderer = _renderer(tokenizer, max_text_len=max_text_len)
         with pytest.raises(ValueError, match="trains no tokens"):
             renderer.render(_qa(), ["a cat"])
-        assert _renderer(tokenizer, max_text_len=12, answer_only=False).render(_qa(), ["a cat"])
+        assert _renderer(tokenizer, max_text_len=max_text_len, answer_only=False).render(
+            _qa(), ["a cat"]
+        )
 
-    def test_turn_end_must_be_one_token(self, tokenizer: Any) -> None:
-        with pytest.raises(ValueError, match="single token"):
-            _renderer(tokenizer, turn_end="</s>")
+    def test_the_first_reply_token_within_the_budget_is_trained(self, tokenizer: Any) -> None:
+        sample = _renderer(tokenizer, max_text_len=17).render(_qa(), ["a cat"])
+        assert _trained_text(tokenizer, sample) == "a"
 
-    def test_an_empty_qa_answer_trains_only_the_empty_think_block(self, tokenizer: Any) -> None:
-        renderer = _renderer(tokenizer)
-        text = renderer.text(_qa(), [""])
-        assert text.endswith("<|im_start|>assistant\n<think>\n\n</think>\n\n")
-        sample = renderer.render(_qa(), [""])
-        assert _trained_text(tokenizer, sample) == "<think>\n\n</think>\n\n"
+    @pytest.mark.parametrize("kind", ["qa", "conversation"])
+    def test_an_empty_reply_is_refused(self, tokenizer: Any, kind: str) -> None:
+        doc, answers = (_qa(), [""]) if kind == "qa" else (_conversation(), ["A1.", ""])
+        with pytest.raises(ValueError, match="empty reply"):
+            _renderer(tokenizer).render(doc, answers)
 
     def test_pixel_values_are_square_and_normalized(self, tokenizer: Any) -> None:
         pixels = _renderer(tokenizer).render(_qa(), ["a cat"])["pixel_values"]

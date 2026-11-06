@@ -27,26 +27,7 @@ class DocumentSource(Protocol):
     def __getitem__(self, index: int) -> Document: ...
 
 
-def assistant_span_mask(
-    ids: Sequence[int], generation_prompt: Sequence[int], turn_end_id: int
-) -> list[bool]:
-    """Mark every token after an assistant generation prompt, through its turn-end token."""
-    mask = [False] * len(ids)
-    prompt = list(generation_prompt)
-    span = len(prompt)
-    i = 0
-    while i <= len(ids) - span:
-        if list(ids[i : i + span]) != prompt:
-            i += 1
-            continue
-        j = i + span
-        while j < len(ids):
-            mask[j] = True
-            if ids[j] == turn_end_id:
-                break
-            j += 1
-        i = j + 1
-    return mask
+Span = tuple[int, int]
 
 
 class ChatRenderer:
@@ -54,9 +35,11 @@ class ChatRenderer:
 
     The sample holds ``pixel_values``, ``input_ids`` padded to ``max_text_len``, and
     next-token ``labels`` (``labels[i]`` is token ``i + 1``) that are ``-100`` on
-    padding and, when ``answer_only``, outside the assistant replies. A document
-    whose replies ``max_text_len`` cuts away entirely is refused, since it would
-    train nothing.
+    padding and, when ``answer_only``, outside the replies and their turn ends. The
+    replies are located by character span in the templated text, so what the template
+    writes before a reply (an empty think block, for instance) is never trained. A
+    reply that is empty or that ``max_text_len`` cuts away entirely is refused, since
+    it would train nothing.
     """
 
     def __init__(
@@ -74,6 +57,8 @@ class ChatRenderer:
     ) -> None:
         if max_text_len < 2:
             raise ValueError(f"max_text_len must be at least 2, got {max_text_len}")
+        if not getattr(tokenizer, "is_fast", False):
+            raise ValueError("ChatRenderer needs a fast tokenizer to map replies to tokens")
         self.tokenizer = tokenizer
         self.max_text_len = max_text_len
         self.image_size = image_size
@@ -83,12 +68,13 @@ class ChatRenderer:
         self.image_mean = image_mean
         self.image_std = image_std
         self.pad_id = resolve_pad_id(tokenizer)
-        self._generation_prompt = tokenizer(f"{turn_start}assistant\n", add_special_tokens=False)[
-            "input_ids"
-        ]
-        self._turn_end_id = tokenizer.convert_tokens_to_ids(turn_end)
-        if tokenizer(turn_end, add_special_tokens=False)["input_ids"] != [self._turn_end_id]:
-            raise ValueError(f"turn_end {turn_end!r} is not a single token of the tokenizer")
+        self._header = f"{turn_start}assistant\n"
+        prompt = self._template([{"role": "user", "content": ""}], generation_prompt=True)
+        if self._header not in prompt:
+            raise ValueError(
+                f"the generation prompt {prompt!r} does not end a {self._header!r} turn"
+            )
+        self._reply_prefix = prompt[prompt.rindex(self._header) + len(self._header) :]
 
     def _template(self, messages: list[dict[str, str]], *, generation_prompt: bool) -> str:
         return self.tokenizer.apply_chat_template(
@@ -100,19 +86,45 @@ class ChatRenderer:
 
     def text(self, document: Document, answers: Sequence[str]) -> str:
         """Chat-templated text of ``document`` with ``answers[i]`` replying to turn ``i``."""
+        return self.text_and_reply_spans(document, answers)[0]
+
+    def text_and_reply_spans(
+        self, document: Document, answers: Sequence[str]
+    ) -> tuple[str, list[Span]]:
+        """The templated text and the character span of each reply with its turn end."""
         if len(answers) != len(document.turns):
             raise ValueError(f"{len(document.turns)} turns but {len(answers)} answers")
         placeholders = self.image_placeholder * len(document.images)
         if document.kind == "qa":
             user = f"{placeholders} {document.turns[0].user}"
             prompt = self._template([{"role": "user", "content": user}], generation_prompt=True)
-            return prompt + answers[0] + self.turn_end if answers[0] else prompt
+            reply = answers[0] + self.turn_end
+            return prompt + reply, [(len(prompt), len(prompt) + len(reply))]
         messages = []
         for i, (turn, answer) in enumerate(zip(document.turns, answers, strict=True)):
             user = f"{placeholders} {turn.user}" if i == 0 else turn.user
             messages.append({"role": "user", "content": user})
             messages.append({"role": "assistant", "content": answer})
-        return self._template(messages, generation_prompt=False)
+        text = self._template(messages, generation_prompt=False)
+        spans: list[Span] = []
+        cursor = 0
+        for answer in answers:
+            start = self._find_reply(text, answer + self.turn_end, cursor)
+            cursor = start + len(answer) + len(self.turn_end)
+            spans.append((start, cursor))
+        return text, spans
+
+    def _find_reply(self, text: str, reply: str, cursor: int) -> int:
+        """Where ``reply`` starts an assistant turn of ``text`` at or after ``cursor``."""
+        at = text.find(self._header, cursor)
+        while at >= 0:
+            start = at + len(self._header)
+            if text.startswith(self._reply_prefix, start):
+                start += len(self._reply_prefix)
+            if text.startswith(reply, start):
+                return start
+            at = text.find(self._header, at + 1)
+        raise ValueError(f"the chat template did not render {reply!r} as an assistant turn")
 
     def token_ids(self, document: Document, answers: Sequence[str]) -> list[int]:
         """Token ids of :meth:`text`, before truncation."""
@@ -124,10 +136,17 @@ class ChatRenderer:
             raise ValueError(
                 f"only single-image documents render to a sample, got {len(document.images)} images"
             )
-        full = self.token_ids(document, answers)
+        if not all(answers):
+            raise ValueError("an empty reply trains nothing")
+        text, spans = self.text_and_reply_spans(document, answers)
+        encoded = self.tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
+        full = encoded["input_ids"]
         ids = full[: self.max_text_len]
         if self.answer_only:
-            trained = assistant_span_mask(ids, self._generation_prompt, self._turn_end_id)
+            trained = [
+                any(s < end and e > start for start, end in spans)
+                for s, e in encoded["offset_mapping"][: len(ids)]
+            ]
         else:
             trained = [True] * len(ids)
         if not any(trained[1:]):
