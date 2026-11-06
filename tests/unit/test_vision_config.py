@@ -97,8 +97,12 @@ class TestVisionEncoderMixedPrecision:
         assert unset.vision_encoder.mixed_precision is None
 
     @pytest.mark.parametrize("precision", ["fp16", "fp8", "float32", ""])
-    def test_toml_rejects_other_values(self, tmp_path, precision):
+    def test_direct_construction_rejects_other_values(self, precision):
+        with pytest.raises(ValueError, match="vision_encoder.mixed_precision must be one of"):
+            VisionEncoderConfig(mixed_precision=precision)
+
+    def test_toml_rejects_other_values(self, tmp_path):
         toml = tmp_path / "vlm.toml"
-        toml.write_text(f'[vision_encoder]\ntype = "random"\nmixed_precision = "{precision}"\n')
-        with pytest.raises(ValueError, match=r"not in allowed Literal values: \('bf16', 'fp32'\)"):
+        toml.write_text('[vision_encoder]\ntype = "random"\nmixed_precision = "fp16"\n')
+        with pytest.raises(ValueError):
             load_config(str(toml), cli_args=[])
