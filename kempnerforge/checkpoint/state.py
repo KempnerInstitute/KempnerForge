@@ -72,8 +72,9 @@ def _scheduler_state_for(
     when the saved groups' modules differ from the current ones, in name or in number, each
     current group takes the entries of the first saved group of its module, groups that name
     no module matching each other, and a group whose module has no saved group keeps its own.
-    Otherwise, or when ``scheduler`` has no optimizer and nothing records a module, or the
-    state lists no base rates, ``saved`` is returned as it is.
+    Otherwise ``saved`` is returned as it is, and so it is when the state lists no base rates,
+    or when no group names a module and ``scheduler`` is not a ``LambdaLR``, which keeps the
+    positional load such a scheduler always had.
 
     Raises:
         ValueError: ``saved_modules`` does not name one module per saved group; the groups
@@ -82,7 +83,9 @@ def _scheduler_state_for(
     """
     current = _group_modules(scheduler)
     base_lrs = saved.get("base_lrs")
-    if not isinstance(base_lrs, list) or (saved_modules is None and current is None):
+    names_module = saved_modules is not None or any(m is not None for m in current or ())
+    is_lambda = isinstance(scheduler, torch.optim.lr_scheduler.LambdaLR)
+    if not isinstance(base_lrs, list) or not (names_module or is_lambda):
         return saved
     if saved_modules is None:
         saved_modules = [None] * len(base_lrs)
@@ -101,7 +104,7 @@ def _scheduler_state_for(
         )
     if saved_modules == current:
         return saved
-    if current is None or not isinstance(scheduler, torch.optim.lr_scheduler.LambdaLR):
+    if current is None or not is_lambda:
         raise ValueError(
             f"The checkpoint's scheduler state belongs to param groups of the modules "
             f"{saved_modules}, but this run's groups are of {current}, and only the state of a "

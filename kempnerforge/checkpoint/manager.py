@@ -356,7 +356,7 @@ def _check_saved_state_matches(
 
 
 def _check_saved_param_groups(
-    optim_state: dict[str, Any], saved_keys: Collection[str], where: Path
+    optim_state: dict[str, Any], saved_keys: Collection[str], where: Path, groups_vary: bool
 ) -> None:
     """Fail unless the checkpoint holds the param groups this run's optimizers hold.
 
@@ -364,15 +364,16 @@ def _check_saved_param_groups(
     optimizers' groups, and the load maps a loaded group to this run's by the parameters it
     lists. When the groups are laid out otherwise than at the save, as under
     ``optimizer.lr_multipliers`` when other parameters are trainable, a position can hold
-    another group, and a group can come back without settings. Checked only when this run's
-    groups or the saved ones name a module, the only groups whose layout varies: the
-    checkpoint must hold as many groups, each with every setting of this run's group there.
+    another group, and a group can come back without settings. Checked when ``groups_vary``,
+    as it is for a run with ``optimizer.lr_multipliers``, or when this run's groups or the
+    saved ones name a module: the checkpoint must hold as many groups, each with every
+    setting of this run's group there.
     """
     groups = optim_state["param_groups"]
     names_module = any(
         key.startswith(_OPTIM_PARAM_GROUPS_PREFIX) and key.endswith(".module") for key in saved_keys
     )
-    if not names_module and not any("module" in group for group in groups):
+    if not (groups_vary or names_module or any("module" in group for group in groups)):
         return
     saved_count = _saved_optimizer_param_groups(saved_keys)
     if saved_count != len(groups):
@@ -397,11 +398,11 @@ def _check_saved_param_groups(
 
 
 def _check_saved_optimizer(
-    optim_state: dict[str, Any], saved_keys: Collection[str], where: Path
+    optim_state: dict[str, Any], saved_keys: Collection[str], where: Path, groups_vary: bool
 ) -> None:
     """Run the checks the checkpoint's optimizer state must pass before anything loads."""
     _check_saved_state_matches(optim_state, saved_keys, where)
-    _check_saved_param_groups(optim_state, saved_keys, where)
+    _check_saved_param_groups(optim_state, saved_keys, where, groups_vary)
 
 
 def _load_train_state(path: Path) -> dict[str, Any]:
@@ -1064,7 +1065,11 @@ class CheckpointManager:
                     f"resuming with {filled}"
                 )
             check_error = _attempt(
-                _check_saved_optimizer, dcp_state["optimizer"], saved_keys, dcp_dir
+                _check_saved_optimizer,
+                dcp_state["optimizer"],
+                saved_keys,
+                dcp_dir,
+                bool(self._lr_multipliers),
             )
         if self._lr_multipliers:
             self._agree(check_error, action="load")

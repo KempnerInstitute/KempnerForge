@@ -94,7 +94,6 @@ class TestConfig:
             (0.5, "must map module names to numbers"),
             ({1: 0.5}, "keys must be module names"),
             ({"": 0.5}, "keys must be module names"),
-            ({"a/b": 0.5}, "keys must be module names without '/'"),
             ({"adapter": True}, r"lr_multipliers\['adapter'\] must be a positive finite"),
             ({"adapter": "2"}, r"lr_multipliers\['adapter'\] must be a positive finite"),
             ({"adapter": 0}, r"lr_multipliers\['adapter'\] must be a positive finite"),
@@ -106,7 +105,6 @@ class TestConfig:
             "not-a-dict",
             "int-key",
             "empty-key",
-            "slash",
             "bool",
             "str",
             "zero",
@@ -120,6 +118,12 @@ class TestConfig:
             OptimizerConfig(lr_multipliers=value)
         with pytest.raises(ValueError, match=match):
             checked_lr_multipliers(value)
+
+    def test_a_module_name_with_a_slash_is_refused_by_the_config(self):
+        """Its ``lr/<module>`` would nest under another module's; a saved record keeps any name."""
+        with pytest.raises(ValueError, match=r"names modules \['a/b'\] with '/'"):
+            OptimizerConfig(lr_multipliers={"a": 1.0, "a/b": 2.0})
+        assert checked_lr_multipliers({"a/b": 2.0}) == {"a/b": 2.0}
 
     def test_a_run_without_vlm_cannot_list_modules(self):
         with pytest.raises(ValueError, match="needs a \\[vlm\\] section"):
@@ -722,6 +726,17 @@ class TestResume:
         with pytest.raises(ValueError, match=r"saved with optimizer.lr_multipliers=\{\}"):
             manager.load(scheduler=scheduler)
 
+    def test_a_record_of_a_module_name_with_a_slash_is_read(self, tmp_path):
+        """A record keeps any module name, so the load refuses it for its multipliers."""
+        step_dir = self._save(tmp_path, {"head": 2.0})
+        meta = json.loads((step_dir / "metadata.json").read_text())
+        meta["lr_multipliers"] = {"a/b": 2.0}
+        meta["lr_module_patterns"] = {"a/b": ["output_head.*"]}
+        (step_dir / "metadata.json").write_text(json.dumps(meta))
+        _, scheduler, manager = self._resume(tmp_path, {"head": 2.0})
+        with pytest.raises(ValueError, match=r"saved with optimizer.lr_multipliers=\{'a/b': 2.0\}"):
+            manager.load(scheduler=scheduler)
+
     @pytest.mark.parametrize(
         ("content", "match"),
         [
@@ -1022,6 +1037,33 @@ class TestLayoutChange:
         self._train(model, optimizer, scheduler, 1)
         self._assert_module_rates(optimizer, scheduler)
 
+    @pytest.mark.parametrize("name", ["adamw", "lion"])
+    def test_a_resume_into_fewer_groups_of_no_module_is_refused(self, tmp_path, name):
+        """With every listed module frozen no group names a module, and freezing every decayed
+        weight still drops a group the checkpoint holds."""
+        multipliers = {"vision_encoder": 0.1}
+        frozen = {"vision_encoder"}
+        model, optimizer, scheduler = self._build(name, frozen, self.DEFAULT_SCOPE, multipliers)
+        self._train(model, optimizer, scheduler, 4)
+        self._manager(tmp_path, model, optimizer, multipliers).save(step=4, scheduler=scheduler)
+
+        model = _vlm_like()
+        model.vision_encoder.requires_grad_(False)
+        model.transformer[0].weight.requires_grad_(False)
+        model.adapter.weight.requires_grad_(False)
+        config = OptimizerConfig(name=name, lr=self.LR, fused=False, lr_multipliers=multipliers)
+        optimizer = build_optimizer(model, config, module_patterns=VLM_PATTERNS)
+        schedule = SchedulerConfig(warmup_steps=2, min_lr_ratio=0.1)
+        scheduler = build_scheduler(optimizer, schedule, max_steps=20)
+        assert [g.get("module") for g in optimizer.param_groups] == [None]
+        manager = self._manager(tmp_path, model, optimizer, multipliers)
+        with pytest.raises(RuntimeError, match="holds 2 optimizer param groups, and this run 1"):
+            manager.load(scheduler=scheduler)
+        assert scheduler.last_epoch == 0
+        assert manager.load(scheduler=scheduler, exclude_keys=["optimizer"])[0] == 4
+        self._train(model, optimizer, scheduler, 1)
+        self._assert_module_rates(optimizer, scheduler)
+
     def test_the_same_layout_resumes_the_saved_scheduler_state_as_it_is(self, tmp_path):
         model, optimizer, scheduler = self._build("adamw", {"transformer"}, self.DEFAULT_SCOPE)
         self._train(model, optimizer, scheduler, 4)
@@ -1099,6 +1141,15 @@ class TestSchedulerStateLayout:
         )
         with pytest.raises(ValueError, match=r"base rates 0.1 and 0.2"):
             restore_train_state(state, scheduler=self._scheduler([("a", 0.1)]))
+
+    def test_a_scheduler_of_another_kind_without_modules_loads_as_saved(self):
+        """Only a ``LambdaLR`` is laid out when no group names a module, so another keeps the
+        positional load it always had, whatever the number of groups."""
+        saved = torch.optim.lr_scheduler.StepLR(self._optimizer([(None, 0.1), (None, 0.1)]), 1)
+        state = build_train_state(step=0, tokens_seen=0, scheduler=saved)
+        resumed = torch.optim.lr_scheduler.StepLR(self._optimizer([(None, 0.1)]), 1)
+        restore_train_state(state, scheduler=resumed)
+        assert resumed.base_lrs == [0.1, 0.1]
 
     def test_only_a_lambda_lr_state_is_laid_out_for_other_groups(self):
         def step_lr(groups):

@@ -16,18 +16,15 @@ def checked_lr_multipliers(multipliers: object) -> dict[str, float]:
     """Return ``multipliers`` as a ``{module: multiplier}`` dict of floats.
 
     Raises:
-        ValueError: ``multipliers`` is not a dict, a key is not a non-empty string without
-            ``/``, which would nest one module's metric name under another's, or a value is
-            not a positive finite number.
+        ValueError: ``multipliers`` is not a dict, a key is not a non-empty string, or a
+            value is not a positive finite number.
     """
     if not isinstance(multipliers, dict):
         raise ValueError(f"lr_multipliers must map module names to numbers, got {multipliers!r}")
     checked: dict[str, float] = {}
     for module, multiplier in multipliers.items():
-        if not isinstance(module, str) or not module or "/" in module:
-            raise ValueError(
-                f"lr_multipliers keys must be module names without '/', got {module!r}"
-            )
+        if not isinstance(module, str) or not module:
+            raise ValueError(f"lr_multipliers keys must be module names, got {module!r}")
         if (
             isinstance(multiplier, bool)
             or not isinstance(multiplier, int | float)
@@ -108,3 +105,9 @@ class OptimizerConfig:
         if self.schedule_free_warmup_steps < 0:
             raise ValueError("schedule_free_warmup_steps must be non-negative")
         self.lr_multipliers = checked_lr_multipliers(self.lr_multipliers)
+        nested = sorted(module for module in self.lr_multipliers if "/" in module)
+        if nested:
+            raise ValueError(
+                f"lr_multipliers names modules {nested} with '/', which would log one module's "
+                "lr/<module> under another's; name the modules of vlm.module_patterns without it"
+            )

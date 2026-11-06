@@ -86,7 +86,9 @@ one outside the listed modules. A load into groups laid out otherwise,
 because other parameters are trainable or the weight-decay scope
 changed, gives each group the saved entries of its module's groups,
 and a group of a module the state holds no group of keeps its own.
-Without a recorded module on either side, the state loads as saved.
+Without a recorded module on either side, the state loads as saved,
+unless the number of groups changed: a `LambdaLR` state is then laid
+out the same way, its groups all of no module.
 
 Pure `phase.lr_scale` overlays live in the training loop and are
 recomputed from the current phase, so they don't need to be saved.
