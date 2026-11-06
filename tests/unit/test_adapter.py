@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import functools
 import inspect
 import math
 import re
@@ -1031,6 +1032,39 @@ def _positional_only_width_builder(hidden_dim=None, /, in_dim=8, out_dim=4, pool
     return AvgPoolAdapter(in_dim, out_dim, pool_window=pool_window, hidden_dim=hidden_dim)
 
 
+def _builder_naming_every_field(
+    in_dim,
+    out_dim,
+    hidden_dim=None,
+    activation="gelu",
+    pre_norm=None,
+    pool_window=2,
+    pool_heads=16,
+    norm_eps=1e-5,
+):
+    return MLP2LayerAdapter(
+        in_dim,
+        out_dim,
+        hidden_dim=hidden_dim,
+        activation=activation,
+        pre_norm=pre_norm,
+        norm_eps=norm_eps,
+    )
+
+
+def _reads_width_from_kwargs(builder):
+    @functools.wraps(builder)
+    def wrapper(in_dim, out_dim, **kwargs):
+        return MLP2LayerAdapter(in_dim, out_dim, hidden_dim=kwargs["hidden_dim"])
+
+    return wrapper
+
+
+@_reads_width_from_kwargs
+def _wrapped_linear_builder(in_dim, out_dim, **_):
+    return LinearAdapter(in_dim=in_dim, out_dim=out_dim)
+
+
 @pytest.fixture
 def plugin_adapter():
     """Register throwaway adapters, removed after the test.
@@ -1100,6 +1134,27 @@ class TestAdapterAccepts:
             r"settings it uses pool_window\.",
         ):
             AdapterConfig(type=name, hidden_dim=8)
+
+    def test_a_builder_without_var_keyword_uses_every_field_it_names(self, plugin_adapter):
+        name, _ = plugin_adapter(builder=_builder_naming_every_field)
+        settings = {
+            "hidden_dim": 8,
+            "activation": "silu",
+            "pre_norm": "rmsnorm",
+            "pool_window": 3,
+            "pool_heads": 8,
+        }
+        adapter = build_adapter(AdapterConfig(type=name, **settings), 16, 4, norm_eps=1e-3)
+        assert (adapter.proj1.out_features, adapter.ln_q.eps) == (8, 1e-3)
+        assert isinstance(adapter.act, torch.nn.SiLU)
+
+    def test_a_wrapper_is_read_by_its_own_signature(self, plugin_adapter):
+        """``functools.wraps`` copies the wrapped builder's ``**_`` signature onto
+        a wrapper that reads fields from its own ``**kwargs``, so the wrapper's
+        signature decides: it is not checked, and the field reaches it."""
+        name, _ = plugin_adapter(builder=_wrapped_linear_builder)
+        adapter = build_adapter(AdapterConfig(type=name, hidden_dim=8), in_dim=16, out_dim=4)
+        assert adapter.proj1.out_features == 8
 
     def test_a_declaration_overrides_the_signature(self, plugin_adapter):
         name, _ = plugin_adapter(accepts=("pool_window",), builder=_pool_builder)

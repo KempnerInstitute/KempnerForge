@@ -179,9 +179,11 @@ def _keyword_fields(
     """The ``field_names`` that ``builder`` takes as parameters passable by keyword.
 
     ``None`` when the builder's ``**`` parameter has a name other than ``_``,
-    since the builder may then read any field from it.
+    since the builder may then read any field from it. The builder's own
+    signature counts, not one ``functools.wraps`` copied onto it from a
+    function it wraps: the wrapper is what receives the fields.
     """
-    parameters = inspect.signature(builder).parameters.values()
+    parameters = inspect.signature(builder, follow_wrapped=False).parameters.values()
     if any(p.kind is inspect.Parameter.VAR_KEYWORD and p.name != "_" for p in parameters):
         return None
     return frozenset(

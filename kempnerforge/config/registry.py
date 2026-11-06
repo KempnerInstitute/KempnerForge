@@ -196,10 +196,12 @@ class Registry:
                 on other fields (a callable that returns a string makes
                 ``AdapterConfig`` raise ``TypeError``). ``AdapterConfig``
                 rejects any other field set away from its default. ``None``
-                leaves the set to the builder's signature: the fields it
-                takes as parameters passable by keyword, when its ``**``
-                parameter is named ``_`` or it has none. A builder with any
-                other ``**`` parameter and no ``accepts`` accepts every field.
+                leaves the set to the builder's own signature (a
+                ``functools.wraps`` wrapper counts as the wrapper): the
+                fields it takes as parameters passable by keyword, when its
+                ``**`` parameter is named ``_`` or it has none. A builder
+                with any other ``**`` parameter and no ``accepts`` accepts
+                every field.
 
         Raises:
             TypeError: ``accepts`` is a string rather than a collection of

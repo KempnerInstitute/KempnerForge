@@ -376,8 +376,9 @@ defaults.
 
 A field outside the selected adapter's "Used by" entries must keep its
 default, or the config fails to load with an error naming the field and the
-adapter type. The column follows each adapter's builder parameters, and a
-plugin adapter's builder sets its own (see
+adapter type. The column follows each adapter's builder parameters, which
+`avgpool` narrows by `hidden_dim` with the `accepts` it registers; a plugin
+adapter's come from its own builder (see
 [Registry](registry.md#adapters-declare-the-fields-they-use)).
 
 An `avgpool` connector with a 2×2 window and an RMSNorm + MLP head as wide as

@@ -108,7 +108,10 @@ def build_my_pool(in_dim, out_dim, pool_window=2, **_):
 `my_pool` uses `pool_window`, so `type = "my_pool"` with `pool_heads = 8`
 fails to load. A parameter counts when it is named after an `AdapterConfig`
 field and can be passed by keyword; a positional-only one never receives the
-field. A builder with no `**` parameter at all is read the same way.
+field. A builder with no `**` parameter at all is read the same way. The
+builder's own signature counts: a wrapper made with `functools.wraps` is read
+as the wrapper, not as the function it wraps, since the wrapper is what
+receives the fields.
 
 Pass `accepts` to `register_adapter` when the signature does not tell the
 whole story. When the fields in use depend on other fields, `accepts` is a
