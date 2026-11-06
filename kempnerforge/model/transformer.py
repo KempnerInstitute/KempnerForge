@@ -394,10 +394,11 @@ class Transformer(nn.Module):
                 positions can e.g. restart at zero at each document of a
                 packed sequence. ``None`` (default) assigns contiguous
                 positions starting at the KV-cache fill level, exactly as
-                before. Cannot be combined with ``kv_caches`` (cached
-                generation derives positions from the cache fill level);
-                unsupported for MoT, which derives per-modality positions
-                internally. A ``ModalityContext`` may carry the same tensor
+                before. With ``kv_caches`` the tensor covers the tokens of
+                this forward alone, the ones being appended, so a caller
+                that positions its own tokens does so at prefill and at
+                every decode step alike. Unsupported for MoT, which derives
+                per-modality positions internally. A ``ModalityContext`` may carry the same tensor
                 as ``modality.position_ids`` instead, which is how a strategy
                 chooses the positions of the residual it lays out; passing
                 both raises.
@@ -416,8 +417,9 @@ class Transformer(nn.Module):
                 instead carry the rotation itself as ``modality.rope_cos``
                 and ``modality.rope_sin``, ``(batch, seq_len, head_dim // 2)``
                 over the residual, for position schemes that are not one
-                integer per token; they exclude ``position_ids``, ``kv_caches``
-                and MoT like ``position_ids`` does.
+                integer per token; they exclude ``position_ids``, cover the
+                appended tokens under ``kv_caches`` as ``position_ids`` does,
+                and are unsupported for MoT.
 
         Returns:
             Logits tensor of shape ``(batch, out_seq_len, vocab_size)``
@@ -481,11 +483,6 @@ class Transformer(nn.Module):
         batch = text.shape[0]
         seq_len = text.shape[1] + (prefix_embeds.shape[1] if prefix_embeds is not None else 0)
         if position_ids is not None:
-            if kv_caches is not None:
-                raise ValueError(
-                    "position_ids cannot be combined with kv_caches; cached generation "
-                    "derives positions from the cache fill level"
-                )
             if self._mot_modalities:
                 raise ValueError(
                     "position_ids is not supported for MoT models, which derive "
@@ -519,11 +516,6 @@ class Transformer(nn.Module):
             assert rope_sin is not None
             if position_ids is not None:
                 raise ValueError("modality.rope_cos/rope_sin cannot be combined with position_ids")
-            if kv_caches is not None:
-                raise ValueError(
-                    "modality.rope_cos/rope_sin cannot be combined with kv_caches; cached "
-                    "generation derives positions from the cache fill level"
-                )
             if self._mot_modalities:
                 raise ValueError(
                     "modality.rope_cos/rope_sin is not supported for MoT models, which derive "

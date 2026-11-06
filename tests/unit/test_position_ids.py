@@ -219,6 +219,79 @@ class TestPositionIdsFromTheContext:
             model(tokens, position_ids=positions, modality=ModalityContext(position_ids=positions))
 
 
+def _caches(model: Transformer, batch: int = 1) -> list[KVCache]:
+    return [
+        KVCache(
+            batch_size=batch,
+            max_seq_len=_MAX_SEQ_LEN,
+            n_kv_heads=_N_HEADS,
+            head_dim=_HEAD_DIM,
+            dtype=torch.float32,
+            device=DEVICE,
+        )
+        for _ in range(len(model.layers))
+    ]
+
+
+class TestPositionIdsWithKVCache:
+    """Caller positions apply to the appended tokens, so cached decoding matches a full forward."""
+
+    @staticmethod
+    def _positions() -> torch.Tensor:
+        return torch.tensor([[0, 0, 0, 1, 1, 1, 2, 2]], device=DEVICE)
+
+    def test_prefill_then_decode_matches_the_full_forward(self):
+        model = _tiny_model()
+        tokens = torch.randint(0, _VOCAB, (1, 8), device=DEVICE)
+        positions = self._positions()
+        caches = _caches(model)
+        with torch.no_grad():
+            full = model(tokens, position_ids=positions)
+            prefill = model(tokens[:, :5], kv_caches=caches, position_ids=positions[:, :5])
+            steps = [
+                model(tokens[:, i : i + 1], kv_caches=caches, position_ids=positions[:, i : i + 1])
+                for i in range(5, 8)
+            ]
+        cached = torch.cat([prefill, *steps], dim=1)
+        assert caches[0].seq_len == 8
+        torch.testing.assert_close(cached, full, rtol=1e-5, atol=1e-5)
+
+    def test_context_positions_decode_the_same_way(self):
+        model = _tiny_model()
+        tokens = torch.randint(0, _VOCAB, (1, 8), device=DEVICE)
+        positions = self._positions()
+        caches = _caches(model)
+        with torch.no_grad():
+            full = model(tokens, modality=ModalityContext(position_ids=positions))
+            prefill = model(
+                tokens[:, :5],
+                kv_caches=caches,
+                modality=ModalityContext(position_ids=positions[:, :5]),
+            )
+            steps = [
+                model(
+                    tokens[:, i : i + 1],
+                    kv_caches=caches,
+                    modality=ModalityContext(position_ids=positions[:, i : i + 1]),
+                )
+                for i in range(5, 8)
+            ]
+        torch.testing.assert_close(torch.cat([prefill, *steps], dim=1), full, rtol=1e-5, atol=1e-5)
+
+    def test_decode_step_positions_are_checked_against_the_step(self):
+        model = _tiny_model()
+        tokens = torch.randint(0, _VOCAB, (1, 4), device=DEVICE)
+        caches = _caches(model)
+        with torch.no_grad():
+            model(
+                tokens[:, :3], kv_caches=caches, position_ids=torch.arange(3, device=DEVICE)[None]
+            )
+        with pytest.raises(ValueError, match="does not match the residual"):
+            model(
+                tokens[:, 3:], kv_caches=caches, position_ids=torch.arange(4, device=DEVICE)[None]
+            )
+
+
 class TestRopeFromTheContext:
     """A strategy may hand the transformer the rotation itself, built from the same table."""
 
@@ -307,22 +380,25 @@ class TestRopeFromTheContext:
         with pytest.raises(ValueError, match="cannot be combined with position_ids"):
             model(tokens, position_ids=torch.arange(5, device=DEVICE).unsqueeze(0), modality=ctx)
 
-    def test_rejects_kv_caches(self):
-        model = _tiny_model(n_layers=1)
-        caches = [
-            KVCache(
-                batch_size=1,
-                max_seq_len=_MAX_SEQ_LEN,
-                n_kv_heads=_N_HEADS,
-                head_dim=_HEAD_DIM,
-                dtype=torch.float32,
-                device=DEVICE,
+    def test_prefill_then_decode_matches_the_full_forward(self):
+        model = _tiny_model()
+        tokens = torch.randint(0, _VOCAB, (1, 8), device=DEVICE)
+        positions = torch.tensor([[0, 0, 0, 1, 1, 1, 2, 2]], device=DEVICE)
+        caches = _caches(model)
+        with torch.no_grad():
+            full = model(tokens, modality=self._rotation(model, positions))
+            prefill = model(
+                tokens[:, :5], kv_caches=caches, modality=self._rotation(model, positions[:, :5])
             )
-        ]
-        tokens = torch.randint(0, _VOCAB, (1, 4), device=DEVICE)
-        ctx = self._rotation(model, torch.arange(4, device=DEVICE).unsqueeze(0))
-        with pytest.raises(ValueError, match="cannot be combined with kv_caches"):
-            model(tokens, kv_caches=caches, modality=ctx)
+            steps = [
+                model(
+                    tokens[:, i : i + 1],
+                    kv_caches=caches,
+                    modality=self._rotation(model, positions[:, i : i + 1]),
+                )
+                for i in range(5, 8)
+            ]
+        torch.testing.assert_close(torch.cat([prefill, *steps], dim=1), full, rtol=1e-5, atol=1e-5)
 
     def test_rejects_mot_models(self):
         from kempnerforge.config.vlm import MoTConfig
@@ -443,40 +519,6 @@ class TestTransformerPositionIdsValidation:
             explicit = model(modality=modality, position_ids=contiguous)
             default = model(modality=modality)
         assert torch.equal(default, explicit)
-
-    def test_rejects_kv_caches_combination(self):
-        model = _tiny_model(n_layers=1)
-        caches = [
-            KVCache(
-                batch_size=1,
-                max_seq_len=_MAX_SEQ_LEN,
-                n_kv_heads=_N_HEADS,
-                head_dim=_HEAD_DIM,
-                dtype=torch.float32,
-                device=DEVICE,
-            )
-        ]
-        tokens = self._tokens(batch=1, seq=4)
-        position_ids = torch.arange(4, device=DEVICE).unsqueeze(0)
-        with pytest.raises(ValueError, match="cannot be combined with kv_caches"):
-            model(tokens, kv_caches=caches, position_ids=position_ids)
-
-    def test_rejects_kv_caches_combination_from_the_context(self):
-        model = _tiny_model(n_layers=1)
-        caches = [
-            KVCache(
-                batch_size=1,
-                max_seq_len=_MAX_SEQ_LEN,
-                n_kv_heads=_N_HEADS,
-                head_dim=_HEAD_DIM,
-                dtype=torch.float32,
-                device=DEVICE,
-            )
-        ]
-        tokens = self._tokens(batch=1, seq=4)
-        modality = ModalityContext(position_ids=torch.arange(4, device=DEVICE).unsqueeze(0))
-        with pytest.raises(ValueError, match="cannot be combined with kv_caches"):
-            model(tokens, kv_caches=caches, modality=modality)
 
     def test_rejects_mot_models(self):
         from kempnerforge.config.vlm import MoTConfig
