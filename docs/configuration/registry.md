@@ -91,25 +91,31 @@ Configs then pick it up via `[model] norm_type = "my_norm"`.
 
 ### Adapters declare the fields they use
 
-`register_adapter` takes an optional `accepts`: the `AdapterConfig` fields
-the builder uses. `AdapterConfig` then rejects any other field set away from
-its default, so a config cannot ask for a setting the adapter would drop.
-`build_adapter` still passes every field, plus `norm_eps`, so the builder
-takes the ones it uses and swallows the rest with `**_`:
+`build_adapter` passes an adapter builder every `AdapterConfig` field but
+`type`, plus `norm_eps`. The builder names the fields it uses as parameters
+and swallows the rest with `**_`, and that signature is its declaration:
+`AdapterConfig` rejects any other field set away from its default, so a
+config cannot ask for a setting the adapter would drop.
 
 ```python
 from kempnerforge.config.registry import registry
 
-@registry.register_adapter("my_pool", accepts=("pool_window",))
+@registry.register_adapter("my_pool")
 def build_my_pool(in_dim, out_dim, pool_window=2, **_):
     return MyPool(in_dim, out_dim, pool_window)
 ```
 
-When the fields in use depend on other fields, `accepts` is a callable that
-takes the `AdapterConfig` and returns them as a collection of names, never a
-bare string (that fails when the config loads). The built-in `avgpool` works this
-way: it uses `activation` and `pre_norm` only once `hidden_dim > 0` builds its
-MLP head.
+`my_pool` uses `pool_window`, so `type = "my_pool"` with `pool_heads = 8`
+fails to load. A parameter counts when it is named after an `AdapterConfig`
+field and can be passed by keyword; a positional-only one never receives the
+field. A builder with no `**` parameter at all is read the same way.
+
+Pass `accepts` to `register_adapter` when the signature does not tell the
+whole story. When the fields in use depend on other fields, `accepts` is a
+callable that takes the `AdapterConfig` and returns them as a collection of
+names, never a bare string (that fails when the config loads). The built-in
+`avgpool` works this way: it uses `activation` and `pre_norm` only once
+`hidden_dim > 0` builds its MLP head.
 
 ```python
 def _my_head_accepts(config):
@@ -122,9 +128,12 @@ def build_my_head(in_dim, out_dim, hidden_dim=None, activation="gelu", **_):
     return MyHead(in_dim, out_dim, hidden_dim, activation)
 ```
 
-An adapter registered without `accepts` accepts every field, and its builder
-receives them all. A declaration that names a field `AdapterConfig` does not
-have fails when the config loads.
+`accepts` can also be a plain collection of field names, such as
+`accepts=("pool_window",)`. A builder whose `**` parameter has any other name
+(`**kwargs`) may read fields from it, so its signature says nothing: without
+`accepts` that adapter accepts every field, and its builder receives them
+all. A declaration that names a field `AdapterConfig` does not have fails
+when the config loads.
 
 ### Making sure the module runs
 

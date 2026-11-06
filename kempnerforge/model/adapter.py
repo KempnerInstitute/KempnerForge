@@ -20,8 +20,10 @@ Two families:
 Every adapter is a ``VisionAdapter`` exposing ``output_num_tokens(n_in)`` so the
 build path can size the residual stream (and MoT's positional split) without a
 dry-run forward. Adapters register themselves under the ``adapter`` registry
-category and declare the ``AdapterConfig`` fields they use (``accepts``), so a
-setting the selected adapter would ignore fails at config time.
+category. The ``AdapterConfig`` fields a builder names as parameters are the
+ones it uses (``avgpool``, whose set depends on ``hidden_dim``, declares them
+with ``accepts``), so a setting the selected adapter would ignore fails at
+config time.
 """
 
 from __future__ import annotations
@@ -365,7 +367,7 @@ class AttentionalPoolAdapter(VisionAdapter):
         return self.out_proj(pooled)
 
 
-@registry.register_adapter("mlp_2layer", accepts=("hidden_dim", "activation", "pre_norm"))
+@registry.register_adapter("mlp_2layer")
 def _build_mlp_2layer(
     in_dim: int,
     out_dim: int,
@@ -385,7 +387,7 @@ def _build_mlp_2layer(
     )
 
 
-@registry.register_adapter("linear", accepts=())
+@registry.register_adapter("linear")
 def _build_linear(
     in_dim: int,
     out_dim: int,
@@ -422,7 +424,7 @@ def _build_avgpool(
     )
 
 
-@registry.register_adapter("attentional_pool", accepts=("pool_window", "pool_heads"))
+@registry.register_adapter("attentional_pool")
 def _build_attentional_pool(
     in_dim: int,
     out_dim: int,

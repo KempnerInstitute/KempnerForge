@@ -982,22 +982,43 @@ class TestAvgPoolNormMLPHead:
 
 
 _BUILTIN_ADAPTERS = ("mlp_2layer", "linear", "avgpool", "attentional_pool")
+_CONFIG_FIELDS = frozenset(f.name for f in dataclasses.fields(AdapterConfig)) - {"type"}
+
+
+def _keyword_fields(builder) -> set[str]:
+    """The config fields ``builder`` takes as parameters it can be passed by keyword."""
+    keyword_kinds = (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+    params = inspect.signature(builder).parameters.values()
+    return {p.name for p in params if p.kind in keyword_kinds} & _CONFIG_FIELDS
+
+
+def _pool_builder(in_dim, out_dim, pool_window=2, *, pool_heads=16, **_):
+    return AttentionalPoolAdapter(in_dim, out_dim, pool_window=pool_window, pool_heads=pool_heads)
+
+
+def _positional_only_width_builder(hidden_dim=None, /, in_dim=8, out_dim=4, pool_window=2, **_):
+    return AvgPoolAdapter(in_dim, out_dim, pool_window=pool_window, hidden_dim=hidden_dim)
 
 
 @pytest.fixture
 def plugin_adapter():
-    """Register throwaway adapters that record their kwargs, removed after the test."""
+    """Register throwaway adapters, removed after the test.
+
+    ``register(accepts=None, builder=None)`` returns ``(name, seen)``. Without a
+    ``builder`` the adapter's builder reads ``**kwargs`` and records them in
+    ``seen``.
+    """
     names: list[str] = []
 
-    def register(accepts=None):
+    def register(accepts=None, builder=None):
         name = f"adapter_accepts_test_{len(names)}"
         seen: dict = {}
 
-        @registry.register_adapter(name, accepts=accepts)
-        def _build(in_dim, out_dim, **kwargs):
+        def _record(in_dim, out_dim, **kwargs):
             seen.update(kwargs)
             return LinearAdapter(in_dim=in_dim, out_dim=out_dim)
 
+        registry.register_adapter(name, accepts=accepts)(builder or _record)
         names.append(name)
         return name, seen
 
@@ -1007,30 +1028,54 @@ def plugin_adapter():
 
 
 class TestAdapterAccepts:
-    @pytest.mark.parametrize("name", _BUILTIN_ADAPTERS)
-    def test_every_builtin_adapter_declares_its_fields(self, name):
-        assert registry.get_adapter_accepts(name) is not None
+    def test_only_avgpool_declares_its_fields(self):
+        """The other built-ins are checked from their builder signatures; the
+        fields avgpool uses depend on ``hidden_dim``, so it declares them."""
+        assert callable(registry.get_adapter_accepts("avgpool"))
+        for name in ("mlp_2layer", "linear", "attentional_pool"):
+            assert registry.get_adapter_accepts(name) is None, name
 
-    @pytest.mark.parametrize(
-        ("name", "fields"),
-        [
-            ("mlp_2layer", {}),
-            ("linear", {}),
-            ("avgpool", {}),
-            ("avgpool", {"hidden_dim": 8}),
-            ("attentional_pool", {}),
-        ],
-        ids=["mlp_2layer", "linear", "avgpool", "avgpool-mlp-head", "attentional_pool"],
-    )
-    def test_declared_fields_are_builder_parameters(self, name, fields):
-        """A declared field reaches a named builder parameter, never only ``**_``."""
-        declared = registry.get_adapter_accepts(name)
-        cfg = AdapterConfig(type=name, **fields)
-        used = declared(cfg) if callable(declared) else declared
-        params = inspect.signature(registry.get_adapter(name)).parameters
-        for field in used:
-            assert field in params, field
-            assert params[field].kind is inspect.Parameter.POSITIONAL_OR_KEYWORD, field
+    @pytest.mark.parametrize("hidden_dim", [0, 8])
+    def test_avgpool_declares_its_builder_parameters(self, hidden_dim):
+        """With the MLP head on, avgpool uses every field its builder takes; with
+        it off, all of them but the head's ``activation`` and ``pre_norm``."""
+        declared = registry.get_adapter_accepts("avgpool")
+        assert callable(declared)
+        used = set(declared(AdapterConfig(type="avgpool", hidden_dim=hidden_dim)))
+        named = _keyword_fields(registry.get_adapter("avgpool"))
+        assert used == (named if hidden_dim else named - {"activation", "pre_norm"})
+
+    def test_a_builder_ending_in_underscore_kwargs_is_checked_from_its_signature(
+        self, plugin_adapter
+    ):
+        """Positional-or-keyword and keyword-only parameters both count."""
+        name, _ = plugin_adapter(builder=_pool_builder)
+        cfg = AdapterConfig(type=name, pool_window=3, pool_heads=8)
+        assert build_adapter(cfg, in_dim=16, out_dim=4).pool_heads == 8
+        with pytest.raises(
+            ValueError,
+            match=rf"adapter\.type = '{name}' does not use adapter\.hidden_dim = 8; with these "
+            r"settings it uses pool_heads, pool_window\.",
+        ):
+            AdapterConfig(type=name, hidden_dim=8)
+
+    def test_a_positional_only_parameter_does_not_count(self, plugin_adapter):
+        """A keyword argument cannot reach a positional-only parameter, so
+        ``build_adapter`` would hand the field to ``**_``."""
+        name, _ = plugin_adapter(builder=_positional_only_width_builder)
+        with pytest.raises(
+            ValueError,
+            match=rf"adapter\.type = '{name}' does not use adapter\.hidden_dim = 8; with these "
+            r"settings it uses pool_window\.",
+        ):
+            AdapterConfig(type=name, hidden_dim=8)
+
+    def test_a_declaration_overrides_the_signature(self, plugin_adapter):
+        name, _ = plugin_adapter(accepts=("pool_window",), builder=_pool_builder)
+        with pytest.raises(
+            ValueError, match=rf"adapter\.type = '{name}' does not use adapter\.pool_heads = 8"
+        ):
+            AdapterConfig(type=name, pool_heads=8)
 
     def test_a_string_declaration_is_rejected(self):
         with pytest.raises(TypeError, match="collection of field names"):
@@ -1066,9 +1111,9 @@ class TestAdapterAccepts:
         ):
             AdapterConfig(type=name, activation="silu")
 
-    def test_an_undeclared_adapter_accepts_every_field(self, plugin_adapter):
-        """Declaring nothing keeps the behavior from before declarations: no field
-        is rejected and the builder receives every field."""
+    def test_a_builder_reading_named_kwargs_accepts_every_field(self, plugin_adapter):
+        """A builder whose ``**`` parameter is not ``_`` may read any field from
+        it, so without a declaration no field is rejected and it receives them all."""
         name, seen = plugin_adapter()
         settings = {
             "hidden_dim": 8,
@@ -1088,33 +1133,45 @@ class TestAdapterAccepts:
             AdapterConfig(type=name)
 
 
-_UNUSED_SETTINGS = [
-    ("linear", {}, "hidden_dim", 8),
-    ("linear", {}, "activation", "silu"),
-    ("linear", {}, "pre_norm", "rmsnorm"),
-    ("linear", {}, "pool_window", 3),
-    ("linear", {}, "pool_heads", 8),
-    ("mlp_2layer", {}, "pool_window", 3),
-    ("mlp_2layer", {}, "pool_heads", 8),
-    ("avgpool", {}, "activation", "silu"),
-    ("avgpool", {}, "pre_norm", "rmsnorm"),
-    ("avgpool", {}, "pool_heads", 8),
-    ("avgpool", {"hidden_dim": 8}, "pool_heads", 8),
-    ("attentional_pool", {}, "hidden_dim", 8),
-    ("attentional_pool", {}, "activation", "silu"),
-    ("attentional_pool", {}, "pre_norm", "rmsnorm"),
+_BUILTIN_USES = [
+    ("mlp_2layer", {}, {"hidden_dim", "activation", "pre_norm"}),
+    ("linear", {}, set()),
+    ("avgpool", {}, {"pool_window", "hidden_dim"}),
+    ("avgpool", {"hidden_dim": 8}, {"pool_window", "hidden_dim", "activation", "pre_norm"}),
+    ("attentional_pool", {}, {"pool_window", "pool_heads"}),
 ]
+_NON_DEFAULT = {
+    "hidden_dim": 16,
+    "activation": "silu",
+    "pre_norm": "rmsnorm",
+    "pool_window": 3,
+    "pool_heads": 8,
+}
 
 
 class TestAdapterConfigRejectsUnusedFields:
-    @pytest.mark.parametrize(("adapter_type", "base", "field", "value"), _UNUSED_SETTINGS)
-    def test_a_field_the_adapter_does_not_use_is_rejected(self, adapter_type, base, field, value):
+    @pytest.mark.parametrize("field", sorted(_NON_DEFAULT))
+    @pytest.mark.parametrize(
+        ("adapter_type", "base", "uses"),
+        _BUILTIN_USES,
+        ids=["mlp_2layer", "linear", "avgpool", "avgpool-mlp-head", "attentional_pool"],
+    )
+    def test_builtin_adapters_use_exactly_the_documented_fields(
+        self, adapter_type, base, uses, field
+    ):
+        """Each built-in takes the fields the docs list for it and rejects any
+        other field set away from its default."""
+        value = _NON_DEFAULT[field]
+        settings = {**base, field: value}
+        if field in uses:
+            assert getattr(AdapterConfig(type=adapter_type, **settings), field) == value
+            return
         with pytest.raises(
             ValueError,
             match=rf"adapter\.type = '{adapter_type}' does not use "
             rf"adapter\.{field} = {re.escape(repr(value))}",
         ):
-            AdapterConfig(type=adapter_type, **base, **{field: value})
+            AdapterConfig(type=adapter_type, **settings)
 
     @pytest.mark.parametrize("adapter_type", _BUILTIN_ADAPTERS)
     def test_fields_at_their_defaults_never_raise(self, adapter_type):

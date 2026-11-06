@@ -11,10 +11,17 @@ In TOML, ``[adapter]`` is a top-level section parallel to ``[model]``,
 
 from __future__ import annotations
 
+import inspect
+from collections.abc import Callable
 from dataclasses import dataclass, fields
 from typing import Any
 
 from kempnerforge.config.registry import registry
+
+_KEYWORD_PARAMETER_KINDS = (
+    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+    inspect.Parameter.KEYWORD_ONLY,
+)
 
 
 @dataclass
@@ -45,9 +52,11 @@ class AdapterConfig:
 
     A field the selected adapter does not use must keep its default, or
     construction raises ``ValueError`` naming the field and the adapter type.
-    Each adapter declares the fields it uses when it registers (``accepts`` in
-    ``registry.register_adapter``); one that declares nothing accepts every
-    field.
+    The fields an adapter uses are the ones its builder takes as parameters
+    that can be passed by keyword, when the builder's ``**`` parameter is
+    named ``_`` or it has none. ``accepts`` in ``registry.register_adapter``
+    overrides that, and an adapter whose builder reads any other ``**``
+    parameter and declares nothing accepts every field.
     """
 
     type: str = "mlp_2layer"
@@ -86,10 +95,11 @@ class AdapterConfig:
             raise ValueError(f"adapter.pool_heads must be positive (got {self.pool_heads})")
         self._reject_unused_fields()
 
-    def _reject_unused_fields(self) -> None:
+    def _fields_in_use(self) -> frozenset[str] | None:
+        known = frozenset(f.name for f in fields(self))
         declared = registry.get_adapter_accepts(self.type)
         if declared is None:
-            return
+            return _keyword_fields(registry.get_adapter(self.type), known - {"type"})
         named = declared(self) if callable(declared) else declared
         if isinstance(named, str):
             raise TypeError(
@@ -97,13 +107,18 @@ class AdapterConfig:
                 f"not the string {named!r}"
             )
         used = frozenset(named)
-        known = {f.name for f in fields(self)}
         unknown = sorted(used - known)
         if unknown:
             raise ValueError(
                 f"adapter.type = {self.type!r} declares fields AdapterConfig does not have: "
                 f"{unknown}. AdapterConfig fields: {sorted(known)}."
             )
+        return used
+
+    def _reject_unused_fields(self) -> None:
+        used = self._fields_in_use()
+        if used is None:
+            return
         unused = [
             f
             for f in fields(self)
@@ -125,7 +140,8 @@ class AdapterConfig:
         default (``out_dim`` wide for ``MLP2LayerAdapter``, no MLP head for
         ``AvgPoolAdapter``). Every field is passed; a builder takes the ones
         it uses and swallows the rest via ``**_``, which construction has
-        checked are at their defaults when the adapter declares its fields.
+        checked are at their defaults unless the adapter accepts every field
+        (see the class docstring).
         """
         return {
             "hidden_dim": self.hidden_dim or None,
@@ -155,3 +171,19 @@ class AdapterConfig:
         from kempnerforge.model.adapter import POOLING_ADAPTER_TYPES  # noqa: PLC0415
 
         return POOLING_ADAPTER_TYPES
+
+
+def _keyword_fields(
+    builder: Callable[..., Any], field_names: frozenset[str]
+) -> frozenset[str] | None:
+    """The ``field_names`` that ``builder`` takes as parameters passable by keyword.
+
+    ``None`` when the builder's ``**`` parameter has a name other than ``_``,
+    since the builder may then read any field from it.
+    """
+    parameters = inspect.signature(builder).parameters.values()
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD and p.name != "_" for p in parameters):
+        return None
+    return frozenset(
+        p.name for p in parameters if p.kind in _KEYWORD_PARAMETER_KINDS and p.name in field_names
+    )
