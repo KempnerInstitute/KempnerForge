@@ -244,6 +244,26 @@ def test_fp16_mixed_precision_rejected_at_launch(tmp_path: Path) -> None:
 
 @pytest.mark.e2e
 @requires_gpus(4)
+def test_config_error_stops_a_4gpu_run_before_the_device_mesh(tmp_path: Path) -> None:
+    """A rule only JobConfig.validate enforces fails before init_distributed builds the mesh."""
+    result = _run_training(
+        [
+            DEBUG_CONFIG,
+            "--train.max_steps=10",
+            "--train.seq_len=4096",
+            f"--checkpoint.dir={tmp_path}/ckpt",
+        ],
+        nproc=4,
+    )
+    output = result.stdout + result.stderr
+    assert result.returncode != 0, f"the run was not rejected:\n{output[-2000:]}"
+    message = "ValueError: train.seq_len (4096) exceeds model.max_seq_len (512)"
+    assert message in output, output[-2000:]
+    assert "DeviceMesh:" not in output, output[-2000:]
+
+
+@pytest.mark.e2e
+@requires_gpus(4)
 def test_synthetic_data_pipeline(synthetic_data_dir, tmp_path):
     """4 GPU FSDP with synthetic .npy data — tests full data pipeline."""
     result = _run_training(

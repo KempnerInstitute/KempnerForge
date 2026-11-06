@@ -9,8 +9,8 @@ Validation runs in two passes:
    launchers
    ([`training/runtime.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/training/runtime.py),
    [`scripts/eval.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/scripts/eval.py))
-   once `world_size` is known. Checks rules that cross section
-   boundaries.
+   once `world_size` is known, before the process group starts. Checks
+   rules that cross section boundaries.
 
 All invalid cases raise `ValueError` with a message naming the fields
 involved, unless noted otherwise.
