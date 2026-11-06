@@ -28,13 +28,17 @@ The encoder's unit takes the language model's policy by default. With
 that dtype while its parameters, gradients and optimizer state keep the
 dtype it was loaded in. An encoder FSDP2 does not wrap (frozen, or a
 run without a `dp_shard` or `dp_replicate` dimension, such as one GPU)
-gets the same from forward hooks: each forward runs on copies of its
-parameters cast to that dtype, with its floating-point inputs cast too,
-and autograd returns the gradients to the parameters in their own
-dtype. Either way its floating-point buffers are cast to the set dtype,
-so one GPU and many store, update and compute the encoder alike. Image
-and video runs build the same encoder, so the setting covers every
-frame of a clip. It applies to the training build
+gets the same from a wrapper around its forward: each forward runs on
+copies of its parameters cast to that dtype, with its floating-point
+inputs cast too and autocast off, and autograd returns the gradients to
+the parameters in their own dtype. Under `torch.compile` the wrapper
+runs at a graph break and the encoder's forward compiles as its own
+graph, so the [fp32 master weights](#fp32-master-weights) autocast
+reaches neither its forward nor its backward. Either way its
+floating-point buffers are cast to the set dtype, and a checkpoint
+stores them in it, so one GPU and many store, update and compute the
+encoder alike. Image and video runs build the same encoder, so the
+setting covers every frame of a clip. It applies to the training build
 (`build_parallel_model`); `build_vlm_wrapper` builds an unsharded model
 and leaves every dtype to its caller.
 
@@ -127,7 +131,9 @@ or on a mesh with only a `pp` dimension. There, the training and
 in-loop eval forward passes run under `torch.autocast(param_dtype)`
 instead (`TrainingSession.autocast()`), which casts per op: matmuls
 and attention run in bf16 while the residual stream and norms stay
-fp32, and a frozen vision encoder's matmuls run in bf16 too. Those numerics
+fp32, and a vision encoder's matmuls run in bf16 too unless
+`[vision_encoder] mixed_precision` sets its dtype, which keeps the
+encoder out of the autocast. Those numerics
 differ slightly from the FSDP2 path, and the pipeline then passes fp32
 activations between stages. `scripts/eval.py` builds its model in
 `param_dtype` either way.
