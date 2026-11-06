@@ -115,12 +115,23 @@ class TestChatRenderer:
         assert (sample["labels"][n - 1 :] == -100).all()
 
     def test_long_documents_keep_their_head(self, tokenizer: Any) -> None:
-        renderer = _renderer(tokenizer, max_text_len=16)
+        renderer = _renderer(tokenizer, max_text_len=24)
         long_answer = " ".join(["word"] * 40)
         ids = renderer.token_ids(_qa(), [long_answer])
         sample = renderer.render(_qa(), [long_answer])
-        assert sample["input_ids"].tolist() == ids[:16]
-        assert sample["labels"][15] == -100
+        assert sample["input_ids"].tolist() == ids[:24]
+        assert sample["labels"][23] == -100
+        assert (sample["labels"] != -100).sum() > 0
+
+    def test_a_reply_cut_away_by_the_budget_is_refused(self, tokenizer: Any) -> None:
+        renderer = _renderer(tokenizer, max_text_len=12)
+        with pytest.raises(ValueError, match="trains no tokens"):
+            renderer.render(_qa(), ["a cat"])
+        assert _renderer(tokenizer, max_text_len=12, answer_only=False).render(_qa(), ["a cat"])
+
+    def test_turn_end_must_be_one_token(self, tokenizer: Any) -> None:
+        with pytest.raises(ValueError, match="single token"):
+            _renderer(tokenizer, turn_end="</s>")
 
     def test_an_empty_qa_answer_trains_only_the_empty_think_block(self, tokenizer: Any) -> None:
         renderer = _renderer(tokenizer)
