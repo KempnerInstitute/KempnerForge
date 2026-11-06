@@ -211,9 +211,11 @@ class TestCheckpointRetention:
         assert remaining == [0, 1, 2, 4, 256, 512, 2000, 3000]
 
     def test_cleanup_retries_a_checkpoint_it_could_not_remove(self, tmp_path, monkeypatch):
-        """A removal that keeps failing is tried five times with 0.75 s of waits, each try
-        under the sidecar lock and no wait under it, logged instead of raised, and retried by
-        the next cleanup."""
+        """A removal that keeps failing is logged, and the next cleanup retries it.
+
+        It is tried five times with 0.75 s of waits, each try under the sidecar lock and no
+        wait under it.
+        """
         import errno
 
         from kempnerforge.checkpoint import manager as mgr_mod
@@ -267,8 +269,10 @@ class TestCheckpointRetention:
     def test_a_cleanup_waits_at_most_0_75_s_in_all(
         self, tmp_path, monkeypatch, failures, attempts, left
     ):
-        """The removals of one cleanup share the 0.05, 0.1, 0.2 and 0.4 s waits; one that
-        fails once they are spent is logged and left for the next cleanup."""
+        """The removals of one cleanup share the 0.05, 0.1, 0.2 and 0.4 s waits.
+
+        One that fails once they are spent is logged and left for the next cleanup.
+        """
         import errno
 
         from kempnerforge.checkpoint import manager as mgr_mod
@@ -304,8 +308,10 @@ class TestCheckpointRetention:
         assert remaining_dirs == [*left, "step_40"]
 
     def test_cleanup_retries_a_directory_nfs_briefly_keeps_non_empty(self, tmp_path, monkeypatch):
-        """The errors NFS gives while it still holds a just-deleted file pass on a retry; each
-        attempt holds the sidecar lock and the waits do not."""
+        """The errors NFS gives while it still holds a just-deleted file pass on a retry.
+
+        Each attempt holds the sidecar lock and the waits do not.
+        """
         import errno
 
         from kempnerforge.checkpoint import manager as mgr_mod
@@ -1488,8 +1494,10 @@ class TestSaveCheckpointRegistration:
         assert len(warnings) == 1 and reason in warnings[0]
 
     def test_sidecar_writes_amends_and_removals_hold_the_sidecar_lock(self, tmp_path, monkeypatch):
-        """Every sidecar write, amend and removal attempt holds the sidecar lock. A removal
-        that NFS makes the cleanup retry is recorded once per lock state."""
+        """Every sidecar write, amend and removal attempt holds the sidecar lock.
+
+        A removal that NFS makes the cleanup retry is recorded once per lock state.
+        """
         from kempnerforge.checkpoint import manager as mgr_mod
 
         mgr = _make_mock_mgr(tmp_path, monkeypatch)

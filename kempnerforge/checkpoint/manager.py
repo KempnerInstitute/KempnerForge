@@ -408,7 +408,8 @@ def _remove_tree(path: Path, lock: threading.Lock, delays: Iterator[float]) -> N
         delays: The waits left, in seconds, which removals can share.
 
     Raises:
-        OSError: Any other error, or a retried one once ``delays`` is spent.
+        OSError: Any other error, or a retried one once ``path`` is gone or
+            ``delays`` is spent.
     """
     while True:
         try:
@@ -1252,8 +1253,8 @@ class CheckpointManager:
 
         A directory that NFS briefly keeps non-empty is retried after 0.05, 0.1,
         0.2 and 0.4 s, waits that all the removals of one cleanup share, so a
-        cleanup waits at most 0.75 s. One that still cannot be removed is logged
-        and left for the next cleanup.
+        cleanup requests at most 0.75 s of retry sleep. One that still cannot be
+        removed is logged and left for the next cleanup.
         """
         keep = self.config.keep_last_n
         if keep <= 0:
