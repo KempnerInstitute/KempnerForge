@@ -18,8 +18,10 @@ Usage:
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from typing import Any
+
+AdapterAccepts = Collection[str] | Callable[[Any], Collection[str]]
 
 
 class Registry:
@@ -163,23 +165,47 @@ class Registry:
     def list_modality_strategies(self) -> list[str]:
         return self.list("modality_strategy")
 
-    def register_adapter(self, name: str) -> Callable:
+    def register_adapter(self, name: str, accepts: AdapterAccepts | None = None) -> Callable:
         """Decorator to register an adapter builder.
 
         Adapters project image features (``(B, N, feature_dim)``) into the
         LLM embedding space (``(B, N, model.dim)``). Builders take
         ``(in_dim, out_dim, **kwargs)`` and return an ``nn.Module`` with the
         expected forward shape.
+
+        Args:
+            name: Registry key, selected by ``adapter.type``.
+            accepts: The ``AdapterConfig`` fields the builder uses: a
+                collection of field names, or a callable that maps an
+                ``AdapterConfig`` to them when the set depends on other
+                fields. ``AdapterConfig`` rejects any other field set away
+                from its default. ``None`` declares nothing, and every field
+                is accepted.
+
+        Raises:
+            TypeError: ``accepts`` is a string rather than a collection of
+                field names.
         """
+        if isinstance(accepts, str):
+            raise TypeError(
+                f"accepts for adapter {name!r} must be a collection of field names or a "
+                f"callable, not the string {accepts!r}"
+            )
 
         def decorator(fn: Callable) -> Callable:
             self.register("adapter", name, fn)
+            if accepts is not None:
+                self.register("adapter_accepts", name, accepts)
             return fn
 
         return decorator
 
     def get_adapter(self, name: str) -> Callable:
         return self.get("adapter", name)
+
+    def get_adapter_accepts(self, name: str) -> AdapterAccepts | None:
+        """The ``accepts`` declaration adapter ``name`` registered, or ``None``."""
+        return self._get_store("adapter_accepts").get(name)
 
     def list_adapters(self) -> list[str]:
         return self.list("adapter")

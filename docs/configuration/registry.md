@@ -87,6 +87,42 @@ registry.register("norm", "my_norm", _build_my_norm)
 
 Configs then pick it up via `[model] norm_type = "my_norm"`.
 
+### Adapters declare the fields they use
+
+`register_adapter` takes an optional `accepts`: the `AdapterConfig` fields
+the builder uses. `AdapterConfig` then rejects any other field set away from
+its default, so a config cannot ask for a setting the adapter would drop.
+`build_adapter` still passes every field, plus `norm_eps`, so the builder
+takes the ones it uses and swallows the rest with `**_`:
+
+```python
+from kempnerforge.config.registry import registry
+
+@registry.register_adapter("my_pool", accepts=("pool_window",))
+def build_my_pool(in_dim, out_dim, pool_window=2, **_):
+    return MyPool(in_dim, out_dim, pool_window)
+```
+
+When the fields in use depend on other fields, `accepts` is a callable that
+takes the `AdapterConfig` and returns them. The built-in `avgpool` works this
+way: it uses `activation` and `pre_norm` only once `hidden_dim > 0` builds its
+MLP head.
+
+```python
+def _my_head_accepts(config):
+    if config.hidden_dim > 0:
+        return ("hidden_dim", "activation")
+    return ("hidden_dim",)
+
+@registry.register_adapter("my_head", accepts=_my_head_accepts)
+def build_my_head(in_dim, out_dim, hidden_dim=None, activation="gelu", **_):
+    return MyHead(in_dim, out_dim, hidden_dim, activation)
+```
+
+An adapter registered without `accepts` accepts every field, and its builder
+receives them all. A declaration that names a field `AdapterConfig` does not
+have fails when the config loads.
+
 ### Making sure the module runs
 
 Registration happens at import. If nothing imports the module that
@@ -180,6 +216,7 @@ signature, and your builder has to match it." Existing examples:
 | `norm` | `fn(dim: int, eps: float) → nn.Module` |
 | `router` | `fn(dim, num_experts, top_k, **kwargs) → nn.Module` |
 | `mlp` | `fn(dim: int, hidden_dim: int) → nn.Module` |
+| `adapter` | `fn(in_dim: int, out_dim: int, norm_eps: float, **fields) → VisionAdapter`, where `fields` is `AdapterConfig.extra_kwargs()`, every field but `type` |
 
 Check the closest existing builder (e.g.
 [`_build_swiglu`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/model/mlp.py))

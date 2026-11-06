@@ -358,6 +358,39 @@ bounds on tracking calls are on the [MLflow backend](../metrics-and-profiling/ml
 | `end_step` | `int` | `8` | last step recorded (must be `>` `start_step`) |
 | `trace_dir` | `str` | `"profiler_traces"` | output directory for Chrome/Perfetto traces |
 
+## `[adapter]`: `AdapterConfig`
+
+The VLM connector that maps vision-encoder features into the transformer's
+embedding space. A run that sets `[vlm]` without `[adapter]` gets these
+defaults.
+[`kempnerforge/config/adapter.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/config/adapter.py).
+
+| Field | Type | Default | Used by | Purpose |
+|-------|------|---------|---------|---------|
+| `type` | `str` | `"mlp_2layer"` | all | adapter registry key: `mlp_2layer` and `linear` keep the token count, `avgpool` and `attentional_pool` pool it |
+| `hidden_dim` | `int` | `0` | `mlp_2layer`, `avgpool` | MLP hidden width. `mlp_2layer`: `0` means `out_dim`. `avgpool`: a positive width makes the head after the pool a 2-layer MLP, normed first when `pre_norm` is set; `0` keeps the single `Linear` |
+| `activation` | `str` | `"gelu"` | `mlp_2layer`; `avgpool` with `hidden_dim > 0` | `"gelu"`, `"silu"` or `"relu"` between the two MLP projections |
+| `pre_norm` | `str` | `""` | `mlp_2layer`; `avgpool` with `hidden_dim > 0` | norm-registry key for a norm ahead of the MLP, over the vision features (`mlp_2layer`) or the pooled features (`avgpool`); `""` builds none |
+| `pool_window` | `int` | `2` | `avgpool`, `attentional_pool` | pooling window side, e.g. `2` for 2×2 |
+| `pool_heads` | `int` | `16` | `attentional_pool` | attention heads; must divide the vision feature dim |
+
+A field outside the selected adapter's "Used by" entries must keep its
+default, or the config fails to load with an error naming the field and the
+adapter type. The column is what each adapter declares when it registers; a
+plugin adapter declares its own (see
+[Registry](registry.md#adapters-declare-the-fields-they-use)).
+
+An `avgpool` connector with a 2×2 window and an RMSNorm + MLP head as wide as
+its input (here a 1152-wide encoder):
+
+```toml
+[adapter]
+type = "avgpool"
+pool_window = 2
+hidden_dim = 1152
+pre_norm = "rmsnorm"
+```
+
 ## Where to read next
 
 - [CLI overrides](cli-overrides.md) — reshape any of these fields from

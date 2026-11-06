@@ -10,7 +10,8 @@ Two families:
   ``mlp_2layer`` (default, the canonical LLaVA-family 2-layer MLP) and
   ``linear`` (single ``nn.Linear``, an ablation baseline).
 - **Pooling adapters** reduce the token count by pooling the square patch grid
-  before projecting: ``avgpool`` (window-average, the cheapest reducer) and
+  before projecting: ``avgpool`` (window-average, the cheapest reducer, then a
+  single ``Linear`` or a 2-layer MLP head with an optional norm) and
   ``attentional_pool`` (Molmo2-style per-window multi-head attention with the
   window mean as query). Pooling is what makes many-frame video fit the
   sequence budget: a 27×27 SigLIP grid (729 tokens) pools to 81 tokens at a
@@ -19,13 +20,14 @@ Two families:
 Every adapter is a ``VisionAdapter`` exposing ``output_num_tokens(n_in)`` so the
 build path can size the residual stream (and MoT's positional split) without a
 dry-run forward. Adapters register themselves under the ``adapter`` registry
-category.
+category and declare the ``AdapterConfig`` fields they use (``accepts``), so a
+setting the selected adapter would ignore fails at config time.
 """
 
 from __future__ import annotations
 
 import math
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
@@ -33,6 +35,9 @@ import torch.nn.functional as F
 
 from kempnerforge.config.registry import registry
 from kempnerforge.model.norm import build_norm
+
+if TYPE_CHECKING:
+    from kempnerforge.config.adapter import AdapterConfig
 
 _ADAPTER_ACTIVATIONS: dict[str, type[nn.Module]] = {
     "gelu": nn.GELU,
@@ -202,23 +207,53 @@ class AvgPoolAdapter(VisionAdapter):
     ``(B, N, in_dim)`` patch tokens (``N == grid**2``) are averaged over
     ``window × window`` spatial windows (ceil edges; partial edge windows
     average only the real patches they cover), giving ``(B, M, in_dim)`` with
-    ``M == ceil(grid/window)**2``, then a ``Linear`` maps ``in_dim -> out_dim``.
+    ``M == ceil(grid/window)**2``, then the head ``proj`` maps
+    ``in_dim -> out_dim``.
+
+    The head is a single ``Linear`` unless ``hidden_dim`` is positive, which
+    makes it an ``MLP2LayerAdapter`` over the pooled features:
+    ``[pre_norm ->] Linear(in_dim, hidden_dim) -> activation ->
+    Linear(hidden_dim, out_dim)``, normed first when ``pre_norm`` names a
+    norm (built with ``norm_eps``). ``activation``, ``pre_norm`` and
+    ``norm_eps`` configure only that MLP head.
 
     The cheapest token-count reducer (LLaVA-NeXT / sibling-repo style). ``window``
     is overridable per ``forward`` call so one connector can pool images (e.g.
     2×2) and video frames (3×3) with the same projection weights.
     """
 
-    def __init__(self, in_dim: int, out_dim: int, pool_window: int = 2) -> None:
+    def __init__(
+        self,
+        in_dim: int,
+        out_dim: int,
+        pool_window: int = 2,
+        hidden_dim: int | None = None,
+        activation: str = "gelu",
+        pre_norm: str | None = None,
+        norm_eps: float = 1e-5,
+    ) -> None:
         super().__init__()
         if in_dim <= 0 or out_dim <= 0:
             raise ValueError("AvgPoolAdapter in_dim and out_dim must be positive")
         if pool_window <= 0:
             raise ValueError(f"AvgPoolAdapter pool_window must be positive (got {pool_window})")
+        if hidden_dim is not None and hidden_dim < 0:
+            raise ValueError(f"AvgPoolAdapter hidden_dim must be non-negative (got {hidden_dim})")
         self.in_dim = in_dim
         self.out_dim = out_dim
         self.pool_window = pool_window
-        self.proj = nn.Linear(in_dim, out_dim, bias=True)
+        self.proj = (
+            MLP2LayerAdapter(
+                in_dim,
+                out_dim,
+                hidden_dim=hidden_dim,
+                activation=activation,
+                pre_norm=pre_norm,
+                norm_eps=norm_eps,
+            )
+            if hidden_dim
+            else nn.Linear(in_dim, out_dim, bias=True)
+        )
 
     def reset_parameters(self) -> None:
         self.proj.reset_parameters()
@@ -330,7 +365,7 @@ class AttentionalPoolAdapter(VisionAdapter):
         return self.out_proj(pooled)
 
 
-@registry.register_adapter("mlp_2layer")
+@registry.register_adapter("mlp_2layer", accepts=("hidden_dim", "activation", "pre_norm"))
 def _build_mlp_2layer(
     in_dim: int,
     out_dim: int,
@@ -350,7 +385,7 @@ def _build_mlp_2layer(
     )
 
 
-@registry.register_adapter("linear")
+@registry.register_adapter("linear", accepts=())
 def _build_linear(
     in_dim: int,
     out_dim: int,
@@ -359,17 +394,35 @@ def _build_linear(
     return LinearAdapter(in_dim=in_dim, out_dim=out_dim)
 
 
-@registry.register_adapter("avgpool")
+def _avgpool_accepts(config: AdapterConfig) -> tuple[str, ...]:
+    if config.hidden_dim > 0:
+        return ("pool_window", "hidden_dim", "activation", "pre_norm")
+    return ("pool_window", "hidden_dim")
+
+
+@registry.register_adapter("avgpool", accepts=_avgpool_accepts)
 def _build_avgpool(
     in_dim: int,
     out_dim: int,
     pool_window: int = 2,
+    hidden_dim: int | None = None,
+    activation: str = "gelu",
+    pre_norm: str | None = None,
+    norm_eps: float = 1e-5,
     **_: Any,
 ) -> VisionAdapter:
-    return AvgPoolAdapter(in_dim=in_dim, out_dim=out_dim, pool_window=pool_window)
+    return AvgPoolAdapter(
+        in_dim=in_dim,
+        out_dim=out_dim,
+        pool_window=pool_window,
+        hidden_dim=hidden_dim,
+        activation=activation,
+        pre_norm=pre_norm,
+        norm_eps=norm_eps,
+    )
 
 
-@registry.register_adapter("attentional_pool")
+@registry.register_adapter("attentional_pool", accepts=("pool_window", "pool_heads"))
 def _build_attentional_pool(
     in_dim: int,
     out_dim: int,

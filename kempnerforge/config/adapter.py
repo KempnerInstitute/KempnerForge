@@ -11,7 +11,7 @@ In TOML, ``[adapter]`` is a top-level section parallel to ``[model]``,
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import Any
 
 from kempnerforge.config.registry import registry
@@ -25,17 +25,29 @@ class AdapterConfig:
         type: Registry key for the adapter builder. Projection adapters
             ``"mlp_2layer"`` (default) / ``"linear"`` keep the token count;
             pooling adapters ``"avgpool"`` / ``"attentional_pool"`` reduce it.
-        hidden_dim: Hidden width for ``mlp_2layer``. ``0`` means "match
-            ``out_dim``"; ignored by the other types.
+        hidden_dim: Hidden width of a 2-layer MLP. For ``mlp_2layer``, ``0``
+            means "match ``out_dim``". For ``avgpool``, a positive value
+            replaces the single ``Linear`` after the pool with a 2-layer MLP
+            head (``[pre_norm ->] Linear(in_dim, hidden_dim) -> activation ->
+            Linear(hidden_dim, out_dim)``), and ``0`` keeps the ``Linear``.
         activation: Activation between the two MLP projections. One of
-            ``"gelu"`` (default), ``"silu"``, ``"relu"``. ``mlp_2layer`` only.
+            ``"gelu"`` (default), ``"silu"``, ``"relu"``. Used by
+            ``mlp_2layer``, and by ``avgpool`` when ``hidden_dim > 0``.
         pre_norm: Norm-registry key (``"rmsnorm"`` / ``"layernorm"``) for a norm
-            over the vision features ahead of ``mlp_2layer``'s first projection
-            (exposed as ``ln_q``); ``""`` (default) builds none. ``mlp_2layer`` only.
+            ahead of the MLP's first projection (exposed as ``ln_q``); ``""``
+            (default) builds none. Used by ``mlp_2layer`` over the vision
+            features, and by ``avgpool`` over the pooled features when
+            ``hidden_dim > 0``.
         pool_window: Pooling kernel side for the pooling adapters (e.g. ``2``
-            for image 2×2, ``3`` for video 3×3); ignored by projection adapters.
+            for image 2×2, ``3`` for video 3×3).
         pool_heads: Number of attention heads for ``attentional_pool``; must
-            divide the vision feature dim. Ignored by the other types.
+            divide the vision feature dim.
+
+    A field the selected adapter does not use must keep its default, or
+    construction raises ``ValueError`` naming the field and the adapter type.
+    Each adapter declares the fields it uses when it registers (``accepts`` in
+    ``registry.register_adapter``); one that declares nothing accepts every
+    field.
     """
 
     type: str = "mlp_2layer"
@@ -72,13 +84,42 @@ class AdapterConfig:
             raise ValueError(f"adapter.pool_window must be positive (got {self.pool_window})")
         if self.pool_heads <= 0:
             raise ValueError(f"adapter.pool_heads must be positive (got {self.pool_heads})")
+        self._reject_unused_fields()
+
+    def _reject_unused_fields(self) -> None:
+        declared = registry.get_adapter_accepts(self.type)
+        if declared is None:
+            return
+        used = frozenset(declared(self) if callable(declared) else declared)
+        known = {f.name for f in fields(self)}
+        unknown = sorted(used - known)
+        if unknown:
+            raise ValueError(
+                f"adapter.type = {self.type!r} declares fields AdapterConfig does not have: "
+                f"{unknown}. AdapterConfig fields: {sorted(known)}."
+            )
+        unused = [
+            f
+            for f in fields(self)
+            if f.name != "type" and f.name not in used and getattr(self, f.name) != f.default
+        ]
+        if unused:
+            settings = ", ".join(f"adapter.{f.name} = {getattr(self, f.name)!r}" for f in unused)
+            defaults = ", ".join(f"{f.name} = {f.default!r}" for f in unused)
+            uses = ", ".join(sorted(used)) or "no adapter fields"
+            raise ValueError(
+                f"adapter.type = {self.type!r} does not use {settings}; with these settings "
+                f"it uses {uses}. Leave unused fields at their defaults ({defaults})."
+            )
 
     def extra_kwargs(self) -> dict[str, Any]:
         """Builder kwargs beyond ``in_dim`` / ``out_dim``.
 
-        ``hidden_dim=0`` is mapped to ``None`` so the adapter falls back to
-        its own default (e.g., ``out_dim`` for ``MLP2LayerAdapter``). Pooling
-        kwargs are always passed; projection builders swallow them via ``**_``.
+        ``hidden_dim=0`` maps to ``None``, which each adapter reads as its own
+        default (``out_dim`` wide for ``MLP2LayerAdapter``, no MLP head for
+        ``AvgPoolAdapter``). Every field is passed; a builder takes the ones
+        it uses and swallows the rest via ``**_``, which construction has
+        checked are at their defaults when the adapter declares its fields.
         """
         return {
             "hidden_dim": self.hidden_dim or None,
