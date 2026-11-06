@@ -8,6 +8,7 @@ phase — without editing the shared script.
 
 from __future__ import annotations
 
+import contextlib
 from pathlib import Path
 from typing import cast
 
@@ -16,11 +17,12 @@ import torch.distributed as dist
 
 from kempnerforge.checkpoint.manager import CheckpointManager
 from kempnerforge.config.job import JobConfig
-from kempnerforge.config.vlm import MoTConfig
+from kempnerforge.config.vlm import MoTConfig, VLMConfig
 from kempnerforge.distributed.parallel import (
     apply_ac,
     apply_float8,
     apply_fsdp2,
+    autocast_dtype,
     build_parallel_model,
     default_mp_policy,
 )
@@ -86,7 +88,7 @@ def build_model(
             frames_per_clip=(config.video.max_frames if config.video is not None else 1),
             ac_mode=tc.activation_checkpointing,
             mp_policy=mp_policy,
-            param_dtype=tc.param_dtype,
+            param_dtype=tc.master_dtype,
             compile_model=tc.compile_model,
             fp8=tc.is_fp8,
         )
@@ -116,12 +118,12 @@ def build_model(
         apply_fsdp2(stage_mod, device_mesh, mp_policy=mp_policy)
         stage_mod.to_empty(device=device)
         stage_mod.init_weights_and_freqs()
-        stage_mod.to(dtype=tc.param_dtype)
+        stage_mod.to(dtype=tc.master_dtype)
     else:
         stage_mod = cast(
             "Transformer",
             build_stage_module(config.model, pp_rank, pp_size).to(
-                device=device, dtype=tc.param_dtype
+                device=device, dtype=tc.master_dtype
             ),
         )
         if tc.is_fp8:
@@ -137,14 +139,21 @@ def build_model(
     n_params = sum(p.numel() for p in model.parameters())
     logger.info(f"Model (PP stage {pp_rank}/{pp_size}): {n_params:,} parameters")
 
-    pp_stage = build_pipeline_stage(
-        model,  # type: ignore[arg-type]
-        device_mesh,
-        device,
-        batch_size=tc.batch_size,
-        seq_len=tc.seq_len,
-        param_dtype=tc.param_dtype,
+    amp_dtype = autocast_dtype(stage_mod, tc.master_dtype, tc.param_dtype)
+    shape_inference_ctx = (
+        torch.autocast(device_type=device.type, dtype=amp_dtype)
+        if amp_dtype is not None
+        else contextlib.nullcontext()
     )
+    with shape_inference_ctx:
+        pp_stage = build_pipeline_stage(
+            model,  # type: ignore[arg-type]
+            device_mesh,
+            device,
+            batch_size=tc.batch_size,
+            seq_len=tc.seq_len,
+            param_dtype=tc.param_dtype if amp_dtype is None else tc.master_dtype,
+        )
     pp_schedule = build_pipeline_schedule(
         stage=pp_stage,
         n_microbatches=tc.grad_accum_steps,
@@ -185,6 +194,17 @@ def build_checkpoint_manager(
     )
 
 
+def _mot_text_warm_start(vlm_cfg: VLMConfig | None, model: torch.nn.Module) -> None:
+    """Copy the dense block weights of ``mot_warm_start_path`` into a MoT model."""
+    if not isinstance(vlm_cfg, MoTConfig) or not vlm_cfg.mot_warm_start_from_text:
+        return
+    source = torch.load(vlm_cfg.mot_warm_start_path, map_location="cpu", weights_only=True)
+    if isinstance(source, dict) and "model" in source:
+        source = source["model"]
+    mot_warm_start_from_text_stack(inner_transformer(model), source)
+    logger.info(f"MoT warm-start: copied dense block weights from {vlm_cfg.mot_warm_start_path}")
+
+
 def restore_checkpoint(
     config: JobConfig,
     model: torch.nn.Module,
@@ -194,8 +214,9 @@ def restore_checkpoint(
     """Auto-resume from ``latest`` (or ``checkpoint.load_path``).
 
     Returns ``(step, tokens_seen)`` — ``(0, 0)`` when there is nothing to
-    resume from. Also restores the metrics run ids, runs the MoT warm-start
-    hook, and re-applies the effective freeze at the resumed step.
+    resume from. Also restores the metrics run ids, runs the MoT text warm
+    start when no checkpoint supplied the model weights, and re-applies the
+    effective freeze at the resumed step.
     """
     num_stages = config.distributed.pp if config.distributed.pp > 1 else None
     if dist.is_initialized():
@@ -208,10 +229,11 @@ def restore_checkpoint(
         resume_path = Path(chosen[0]) if chosen[0] else None
     else:
         resume_path = resolve_resume_path(config.checkpoint.dir, num_stages)
+    vlm_cfg = config.vlm
     if not resume_path and not config.checkpoint.load_path:
+        _mot_text_warm_start(vlm_cfg, model)
         return 0, 0
 
-    vlm_cfg = config.vlm
     vlm_freeze_expected = None
     if config.is_vlm:
         assert vlm_cfg is not None
@@ -232,20 +254,8 @@ def restore_checkpoint(
     if ckpt_extra_loaded.get("mlflow_run_id"):
         config.metrics.mlflow_run_id = ckpt_extra_loaded["mlflow_run_id"]
 
-    weights_only = warm_start_exclude is not None and "train_state" in warm_start_exclude
-    if (
-        isinstance(vlm_cfg, MoTConfig)
-        and vlm_cfg.mot_warm_start_from_text
-        and step == 0
-        and not weights_only
-    ):
-        source = torch.load(vlm_cfg.mot_warm_start_path, map_location="cpu", weights_only=True)
-        if isinstance(source, dict) and "model" in source:
-            source = source["model"]
-        mot_warm_start_from_text_stack(inner_transformer(model), source)
-        logger.info(
-            f"MoT warm-start: copied dense block weights from {vlm_cfg.mot_warm_start_path}"
-        )
+    if warm_start_exclude is not None and "model" in warm_start_exclude:
+        _mot_text_warm_start(vlm_cfg, model)
 
     if vlm_cfg is not None and vlm_cfg.freeze_schedule:
         valid_modules = set(vlm_cfg.module_patterns.keys())
@@ -266,7 +276,9 @@ def run_training(
 
     ``step_fn`` and ``hooks`` let an experiment own the step body or register
     hooks without copying the build phases. Both default to what
-    ``scripts/train.py`` uses.
+    ``scripts/train.py`` uses. A custom ``step_fn`` must run its forward and
+    loss under ``session.autocast()``, which casts fp32 master weights to the
+    compute dtype when no FSDP2 wrap does (one GPU, a pp-only mesh).
     """
     runtime = setup_distributed(config)
     tracker: MetricsTracker | None = None
@@ -278,6 +290,12 @@ def run_training(
 
         loss_fn = build_loss_fn(config.train)
         model, pipeline = build_model(config, runtime, loss_fn)
+        amp_dtype = autocast_dtype(model, config.train.master_dtype, config.train.param_dtype)
+        if amp_dtype is not None:
+            logger.info(
+                f"No FSDP2 wrap casts the {config.train.master_dtype} master weights: "
+                f"forward passes run under torch.autocast({amp_dtype})"
+            )
 
         optimizer = build_optimizer(model, config.optimizer)
         scheduler = build_scheduler(optimizer, config.scheduler, max_steps=config.train.max_steps)
@@ -317,6 +335,7 @@ def run_training(
             pipeline=pipeline,
             eval_dataloader=eval_dataloader,
             profiler=prof,
+            autocast_dtype=amp_dtype,
         )
 
         run_training_loop(session, step=step, tokens_seen=tokens_seen)

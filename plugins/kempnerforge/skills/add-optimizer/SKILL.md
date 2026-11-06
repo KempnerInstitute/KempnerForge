@@ -20,9 +20,9 @@ Registered optimizers: adamw, lion, schedule_free_adamw, muon
 Registry: kempnerforge/config/registry.py (registry.register_optimizer("<name>"))
 Optimizer builders live in: kempnerforge/training/optimizer.py
 Top-level builder: kempnerforge/training/optimizer.py::build_optimizer(model, config) — creates decay/no-decay param groups, looks up builder from registry, calls it
-Builder signature: fn(param_groups: list[dict], config: OptimizerConfig) -> torch.optim.Optimizer
+Builder signature: fn(param_groups: list[dict], config: OptimizerConfig, model: torch.nn.Module) -> torch.optim.Optimizer
 Config dataclass: kempnerforge/config/optimizer.py::OptimizerConfig
-Existing fields: name, lr, weight_decay, betas, eps, fused, muon_momentum, muon_ns_steps, muon_adam_lr, schedule_free_warmup_steps
+Existing fields: name, lr, weight_decay, betas, eps, fused, muon_momentum, muon_ns_steps, muon_adam_lr, muon_nesterov, muon_adjust_lr, muon_orthogonalize, muon_router, schedule_free_warmup_steps
 Existing tests: tests/unit/test_optimizer.py, tests/unit/test_additional_optimizers.py
 <!-- context-end -->
 
@@ -57,6 +57,7 @@ Assume preflight has passed.
         def _build_my_opt(
             param_groups: list[dict],
             config: OptimizerConfig,
+            model: torch.nn.Module,
         ) -> torch.optim.Optimizer:
             return MyOpt(
                 param_groups,
@@ -64,7 +65,7 @@ Assume preflight has passed.
                 ...,
             )
 
-    The builder MUST accept `param_groups` (a list of dicts built by `build_optimizer`) rather than a flat `model.parameters()`, because `build_optimizer` pre-splits decay and no-decay groups.
+    The builder MUST accept `param_groups` (a list of dicts built by `build_optimizer`) rather than a flat `model.parameters()`, because `build_optimizer` pre-splits decay and no-decay groups. It also gets the model, for a builder that routes parameters by the module that owns them; ignore it otherwise.
 
 3. Add optimizer-specific fields to `OptimizerConfig` in `kempnerforge/config/optimizer.py` if needed. Validate them in `__post_init__`. Keep defaults backward-compatible so existing configs do not break.
 
@@ -85,7 +86,7 @@ Assume preflight has passed.
 - Smoke test with the new optimizer: `uv run python scripts/train.py configs/train/debug.toml --data.dataset_path=<path> --optimizer.name=my_opt --train.max_steps=20`. Loss must decrease.
 
 ## Gotchas
-- `build_optimizer` passes a `param_groups` list, not a parameter generator. The builder signature must be `(param_groups, config)`.
+- `build_optimizer` passes a `param_groups` list, not a parameter generator. The builder signature must be `(param_groups, config, model)`.
 - `fused=True` paths require CUDA tensors. Guard with `config.fused and torch.cuda.is_available()` when passing `fused=` to a torch optimizer.
 - Schedule-free optimizers should be paired with `scheduler.name="none"`. Adding a scheduler on top of one that manages its own warmup inside `step()` will double-count.
 - Do not add the optimizer to `__init__.py` re-exports. Discovery is via the registry only — re-exports create a second source of truth that drifts.

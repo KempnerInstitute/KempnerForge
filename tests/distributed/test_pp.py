@@ -308,3 +308,133 @@ class TestPipelineParallelEquivalence:
         if rank == world - 1:
             assert losses, "last stage recorded no loss"
             assert all(torch.isfinite(loss) for loss in losses), f"non-finite loss: {losses}"
+
+    def test_in_loop_eval_matches_single_gpu_and_training_continues(self):
+        """run_eval drives the training schedule, built with a loss function, under
+        no_grad, which torch allows only through eval(). Between two training steps,
+        as in the loop, the eval batches go through it N_MICROBATCHES at a time, the
+        shape the stages were built for, and eval computes no gradients."""
+        import torch.nn.functional as F
+
+        from kempnerforge.config.schema import DistributedConfig
+        from kempnerforge.distributed.pipeline_parallel import (
+            build_pipeline_schedule,
+            build_pipeline_stage,
+        )
+        from kempnerforge.distributed.setup import init_distributed
+        from kempnerforge.training.eval import run_eval
+
+        rank = int(os.environ["RANK"])
+        world = int(os.environ["WORLD_SIZE"])
+        device = torch.device(f"cuda:{rank}")
+        torch.cuda.set_device(device)
+        mesh = init_distributed(DistributedConfig(dp_shard=1, tp=1, pp=world), seed=42)
+
+        def loss_fn(out: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+            return F.cross_entropy(out.flatten(0, 1).float(), target.flatten())
+
+        stage_module, reference = self._stage_and_reference(device)
+        stage_module.train()
+        micro = BATCH // N_MICROBATCHES
+        stage = build_pipeline_stage(
+            stage_module, mesh, device, batch_size=micro, seq_len=SEQ, param_dtype=torch.float32
+        )
+        schedule = build_pipeline_schedule(
+            stage, n_microbatches=N_MICROBATCHES, loss_fn=loss_fn, schedule="1f1b"
+        )
+
+        gen = torch.Generator().manual_seed(7)
+        batches = [
+            {
+                "input_ids": torch.randint(0, CONFIG.vocab_size, (micro, SEQ), generator=gen),
+                "labels": torch.randint(0, CONFIG.vocab_size, (micro, SEQ), generator=gen),
+            }
+            for _ in range(2 * N_MICROBATCHES)
+        ]
+        tokens = torch.cat([b["input_ids"] for b in batches[:N_MICROBATCHES]]).to(device)
+        labels = torch.cat([b["labels"] for b in batches[:N_MICROBATCHES]]).to(device)
+
+        def train_step() -> None:
+            if rank == 0:
+                schedule.step(tokens, target=labels, losses=[])
+            elif rank == world - 1:
+                schedule.step(target=labels, losses=[])
+            else:
+                schedule.step()
+
+        train_step()
+        stage_module.zero_grad()
+        metrics = run_eval(
+            stage_module,
+            batches,
+            loss_fn,
+            device,
+            2 * N_MICROBATCHES,
+            pp_schedule=schedule,
+            pp_rank=rank,
+            pp_size=world,
+            pp_group=mesh["pp"].get_group(),
+            pp_n_microbatches=N_MICROBATCHES,
+        )
+        with torch.no_grad():
+            expected = sum(
+                loss_fn(reference(b["input_ids"].to(device)), b["labels"].to(device)).item()
+                for b in batches
+            ) / len(batches)
+        assert abs(metrics["eval/loss"] - expected) <= 1e-5 * abs(expected), (metrics, expected)
+        assert all(p.grad is None for p in stage_module.parameters())
+
+        train_step()
+        assert all(p.grad is not None for p in stage_module.parameters()), f"rank {rank}"
+
+    def test_fp32_master_weights_step_under_autocast(self) -> None:
+        """A pp-only mesh has no FSDP2 wrap, so fp32 master weights train under autocast."""
+        from kempnerforge.config.schema import DistributedConfig, JobConfig, TrainConfig
+        from kempnerforge.distributed.parallel import autocast_dtype
+        from kempnerforge.distributed.setup import init_distributed
+        from kempnerforge.training.entry import build_model
+        from kempnerforge.training.loss import build_loss_fn
+        from kempnerforge.training.runtime import RuntimeContext
+
+        rank = int(os.environ["RANK"])
+        world = int(os.environ["WORLD_SIZE"])
+        device = torch.device(f"cuda:{rank}")
+        torch.cuda.set_device(device)
+        mesh = init_distributed(DistributedConfig(dp_shard=1, tp=1, pp=world), seed=42)
+        config = JobConfig(
+            model=CONFIG,
+            train=TrainConfig(
+                batch_size=BATCH // N_MICROBATCHES,
+                seq_len=SEQ,
+                grad_accum_steps=N_MICROBATCHES,
+                compile_model=False,
+                fp32_master_weights=True,
+            ),
+            distributed=DistributedConfig(dp_shard=1, tp=1, pp=world),
+        )
+        runtime = RuntimeContext(
+            rank=rank, local_rank=rank, world_size=world, device=device, device_mesh=mesh
+        )
+        model, pipeline = build_model(config, runtime, build_loss_fn(config.train))
+        assert pipeline is not None
+        assert all(p.dtype == torch.float32 for p in model.parameters())
+        amp_dtype = autocast_dtype(model, torch.float32, torch.bfloat16)
+        assert amp_dtype == torch.bfloat16
+
+        gen = torch.Generator().manual_seed(7)
+        tokens = torch.randint(0, CONFIG.vocab_size, (BATCH, SEQ), generator=gen).to(device)
+        labels = torch.randint(0, CONFIG.vocab_size, (BATCH, SEQ), generator=gen).to(device)
+        losses: list[torch.Tensor] = []
+        with torch.autocast(device_type="cuda", dtype=amp_dtype):
+            if rank == 0:
+                pipeline.schedule.step(tokens, target=labels, losses=losses)
+            elif rank == world - 1:
+                pipeline.schedule.step(target=labels, losses=losses)
+            else:
+                pipeline.schedule.step()
+
+        grads = [p.grad for p in model.parameters() if p.grad is not None]
+        assert grads, f"rank {rank}: backward produced no gradients"
+        assert all(g.dtype == torch.float32 and torch.isfinite(g).all() for g in grads)
+        if rank == world - 1:
+            assert losses and all(torch.isfinite(loss) for loss in losses), f"losses: {losses}"

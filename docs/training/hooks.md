@@ -26,7 +26,8 @@ runner costs one branch per call site.
 
 ## `StepContext`
 
-Passed to `on_step_end`, every step:
+Passed to `on_step_end`, every step that updates the model (a step
+skipped for a NaN / Inf loss fires no hooks):
 
 ```python
 @dataclass
@@ -64,7 +65,7 @@ pre-`zero_grad` hook), not reading `p.grad` in `on_step_end`.
 | Event | Fires at | What you get |
 |-------|----------|--------------|
 | `on_train_begin(config)` | Once, after setup, before the loop | Full `JobConfig` |
-| `on_step_end(ctx)` | Every training step, after metrics | `StepContext` |
+| `on_step_end(ctx)` | Every training step that updates the model, after metrics; not a NaN-skipped step | `StepContext` |
 | `on_eval_end(metrics, step)` | After every eval round | `{"eval/loss": ..., "eval/perplexity": ...}` |
 | `on_checkpoint_save(step, path)` | After a DCP checkpoint is written | `path` is `config.checkpoint.dir` |
 | `on_train_end(step, tokens_seen)` | Once, after the loop exits (normal or shutdown) | Final counters |

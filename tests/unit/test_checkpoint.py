@@ -35,7 +35,7 @@ from kempnerforge.config.schema import (
     OptimizerConfig,
 )
 from kempnerforge.model.transformer import Transformer
-from kempnerforge.training.optimizer import _should_decay, build_optimizer
+from kempnerforge.training.optimizer import Muon, _should_decay, build_optimizer
 
 
 class TestRNGState:
@@ -1453,7 +1453,7 @@ class TestWeightsOnlyWarmStart:
     def test_without_a_dataloader_no_state_is_stashed(self, tmp_path, monkeypatch):
         ckpt_dir = self._saved(tmp_path, monkeypatch, _freeze_meta(("vision_encoder", True)))
         mgr = _make_mock_mgr(tmp_path, monkeypatch)
-        step, _, _ = mgr.load(path=str(ckpt_dir), exclude_keys=["train_state"])
+        step, _, _ = mgr.load(path=str(ckpt_dir), exclude_keys=["optimizer", "train_state"])
         assert step == 0
         assert mgr._pending_dataloader_state is None
 
@@ -1462,10 +1462,19 @@ class TestWeightsOnlyWarmStart:
         mgr = _make_mock_mgr(tmp_path, monkeypatch)
         step, _, _ = mgr.load(
             path=str(ckpt_dir),
-            exclude_keys=["train_state"],
+            exclude_keys=["optimizer", "train_state"],
             vlm_freeze_expected=_freeze_meta(("vision_encoder", False)),
         )
         assert step == 0
+
+    @pytest.mark.parametrize(
+        "keys", [["train_state"], ["model", "train_state"], ["model", "optimizer", "train_state"]]
+    )
+    def test_train_state_outside_the_pair_is_refused(self, tmp_path, monkeypatch, keys):
+        ckpt_dir = self._saved(tmp_path, monkeypatch, _freeze_meta(("vision_encoder", True)))
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        with pytest.raises(ValueError, match="must be \\['optimizer', 'train_state'\\]"):
+            mgr.load(path=str(ckpt_dir), exclude_keys=keys)
 
     def test_without_the_key_the_train_state_is_restored(self, tmp_path, monkeypatch):
         ckpt_dir = self._saved(tmp_path, monkeypatch, _freeze_meta(("vision_encoder", True)))
@@ -2778,6 +2787,54 @@ class TestMuonResume:
         dcp.load(state, checkpoint_id=str(tmp_path / "step_3"))
         set_optimizer_state_dict(model2, opt2, optim_state_dict=state["optimizer"])
         self._assert_same_state(opt, opt2, "Muon")
+
+    @staticmethod
+    def _save_stepped(model, opt, ckpt_dir):
+        """Step ``opt`` once on random gradients and save it."""
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        for p in model.parameters():
+            p.grad = torch.randn_like(p)
+        opt.step()
+        CheckpointManager(CheckpointConfig(dir=str(ckpt_dir)), model, opt).save(step=1)
+
+    def test_checkpoint_from_the_shape_split_fails_naming_what_moved(self, tmp_path):
+        """A checkpoint with the embedding and head on Muon fails to resume, naming both."""
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        config = ModelConfig(dim=64, n_layers=1, n_heads=2, vocab_size=256, max_seq_len=64)
+        model = Transformer(config).to(self.DEVICE)
+        matrices = [p for p in model.parameters() if p.ndim == 2]
+        rest = [p for p in model.parameters() if p.ndim != 2]
+        old = Muon([{"params": matrices}], [{"params": rest, "weight_decay": 0.0}], lr=1e-3)
+        self._save_stepped(model, old, tmp_path)
+
+        model2 = Transformer(config).to(self.DEVICE)
+        opt2 = build_optimizer(model2, OptimizerConfig(name="muon", lr=1e-3, fused=False))
+        manager = CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model2, opt2)
+        moved = "2 parameters: ['output_head.proj.weight', 'token_embedding.embedding.weight']"
+        with pytest.raises(RuntimeError, match=re.escape(moved)) as raised:
+            manager.load()
+        assert "exclude_from_loading" in str(raised.value)
+
+    def test_resume_with_muon_router_flipped_fails_naming_the_gate(self, tmp_path):
+        """Flipping muon_router across a resume fails, naming the router gate."""
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        config = ModelConfig(
+            dim=64, n_layers=1, n_heads=2, vocab_size=256, max_seq_len=64, num_experts=4
+        )
+        model = Transformer(config).to(self.DEVICE)
+        opt = build_optimizer(model, OptimizerConfig(name="muon", lr=1e-3, fused=False))
+        self._save_stepped(model, opt, tmp_path)
+
+        model2 = Transformer(config).to(self.DEVICE)
+        options = OptimizerConfig(name="muon", lr=1e-3, fused=False, muon_router=True)
+        manager = CheckpointManager(
+            CheckpointConfig(dir=str(tmp_path)), model2, build_optimizer(model2, options)
+        )
+        with pytest.raises(RuntimeError, match=re.escape("['layers.0.mlp.router.gate.weight']")):
+            manager.load()
 
     def test_checkpoint_saved_before_orthogonalize_resumes_as_local(self, tmp_path):
         """A checkpoint saved before ``orthogonalize`` existed resumes with "local" and matches."""
