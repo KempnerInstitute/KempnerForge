@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import importlib.util
 import io
+import os
 import pickle
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pyarrow as pa
@@ -53,6 +56,13 @@ def _run(*args: str) -> None:
     subprocess.run([sys.executable, str(SCRIPT), *args], check=True, capture_output=True)
 
 
+def _converter() -> Any:
+    spec = importlib.util.spec_from_file_location("convert_finevision_to_arrow", SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 @pytest.fixture
 def subset(tmp_path: Path) -> Path:
     src, dst = tmp_path / "parquet", tmp_path / "arrow"
@@ -92,15 +102,61 @@ class TestConversion:
         _run("index", "--src", str(root / "parquet"), "--dst", str(root / "arrow"))
         assert np.load(subset / "index.npz")["num_images"].tolist() == [1, 2, 1, 1, 1]
 
+    def test_an_empty_row_group_keeps_its_batch(self, tmp_path: Path) -> None:
+        src, dst = tmp_path / "parquet", tmp_path / "arrow"
+        _write_parquet(
+            src / "demo" / "train-00000-of-00001.parquet",
+            [[_row(1, [("Q0", "A0")], 5)], [], [_row(1, [("Q1", "A1")], 5)]],
+        )
+        assert pq.ParquetFile(src / "demo" / "train-00000-of-00001.parquet").num_row_groups == 3
+        _run("convert", "--src", str(src), "--dst", str(dst))
+        _run("index", "--src", str(src), "--dst", str(dst))
+        index = np.load(dst / "demo" / "index.npz")
+        assert index["file_batches"].tolist() == [3]
+        assert index["batch_rows"].tolist() == [1, 0, 1]
+        reader = FineVisionArrow(dst / "demo")
+        assert [reader[i].turns[0].user for i in range(len(reader))] == ["Q0", "Q1"]
+
+    def test_a_stale_claim_is_taken_over_and_a_live_one_respected(self, tmp_path: Path) -> None:
+        src, dst = tmp_path / "parquet", tmp_path / "arrow"
+        parquet = src / "demo" / "train-00000-of-00001.parquet"
+        _write_parquet(parquet, [[_row(1, [("Q0", "A0")], 5)]])
+        (dst / "demo").mkdir(parents=True)
+        arrow = dst / "demo" / "train-00000-of-00001.arrow"
+        claim = arrow.with_name(arrow.name + ".claim")
+        claim.write_text("otherhost-1 0\n")
+        converter = _converter()
+        assert converter._convert_job((parquet, arrow, 3600.0)) == 0
+        assert not arrow.exists() and claim.read_text() == "otherhost-1 0\n"
+        os.utime(claim, (0, 0))
+        assert converter._convert_job((parquet, arrow, 3600.0)) > 0
+        assert arrow.exists() and not claim.exists()
+        assert not list((dst / "demo").glob("*.tmp*"))
+
+    def test_only_the_holder_releases_a_claim(self, tmp_path: Path) -> None:
+        converter = _converter()
+        claim = tmp_path / "x.arrow.claim"
+        claim.write_text("otherhost-1 0\n")
+        converter._release_claim(claim, "thishost-2")
+        assert claim.exists()
+        converter._release_claim(claim, "otherhost-1")
+        assert not claim.exists()
+        converter._release_claim(claim, "otherhost-1")
+
 
 class TestFineVisionArrow:
     def test_reads_kept_rows_across_files_and_batches(self, subset: Path) -> None:
-        reader = FineVisionArrow(subset)
+        reader = FineVisionArrow(subset, max_images=None)
         assert len(reader) == 4
         assert [reader[i].turns[0].user for i in range(4)] == ["Q0", "Q1", "Q3", "Q4"]
 
+    def test_single_image_rows_by_default(self, subset: Path) -> None:
+        reader = FineVisionArrow(subset)
+        assert [reader[i].turns[0].user for i in range(len(reader))] == ["Q0", "Q3", "Q4"]
+        assert all(len(reader[i].images) == 1 for i in range(len(reader)))
+
     def test_documents_are_conversations(self, subset: Path) -> None:
-        doc = FineVisionArrow(subset)[2]
+        doc = FineVisionArrow(subset)[1]
         assert doc.kind == "conversation"
         assert [(t.user, t.answers) for t in doc.turns] == [("Q3", ("A3",)), ("Q3b", ("A3b",))]
         assert doc.images[0].size == (7, 3)
@@ -122,25 +178,26 @@ class TestFineVisionArrow:
             FineVisionArrow(subset, max_images=1)
 
     def test_ratings_filter_drops_missing_and_low_scores(self, subset: Path) -> None:
-        reader = FineVisionArrow(subset, min_ratings={"relevance_min": 3})
+        reader = FineVisionArrow(subset, max_images=None, min_ratings={"relevance_min": 3})
         assert [reader[i].turns[0].user for i in range(len(reader))] == ["Q0", "Q1"]
 
     def test_unknown_rating_is_refused(self, subset: Path) -> None:
         with pytest.raises(ValueError, match="unknown rating"):
             FineVisionArrow(subset, min_ratings={"beauty_min": 3})
 
-    def test_text_only_reads_no_images(self, subset: Path) -> None:
-        assert FineVisionArrow(subset, text_only=True)[0].images == ()
+    def test_text_only_reads_no_images_and_takes_every_row(self, subset: Path) -> None:
+        reader = FineVisionArrow(subset, text_only=True)
+        assert len(reader) == 4 and reader[1].images == ()
 
     def test_survives_pickling(self, subset: Path) -> None:
-        reader = FineVisionArrow(subset)
+        reader = FineVisionArrow(subset, max_images=None)
         reader[0]
         clone = pickle.loads(pickle.dumps(reader))
         assert not clone._readers
         assert clone[3].turns[0].user == "Q4"
 
     def test_open_files_are_capped(self, subset: Path) -> None:
-        reader = FineVisionArrow(subset, max_open_files=1)
+        reader = FineVisionArrow(subset, max_images=None, max_open_files=1)
         reader[0]
         reader[3]
         assert list(reader._readers) == [1]

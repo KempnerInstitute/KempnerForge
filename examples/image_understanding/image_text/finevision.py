@@ -2,8 +2,9 @@
 
 ``scripts/convert_finevision_to_arrow.py`` writes each parquet file of a subset as
 an Arrow IPC file with one record batch per row group, plus ``index.npz``: the
-file list, record batches per file, rows per batch, a per-row keep flag and the
-rating columns. Rows are numbered across the subset in that file and batch order.
+file list, record batches per file, rows per batch, a per-row keep flag, per-row
+image counts and the rating columns. Rows are numbered across the subset in that
+file and batch order.
 """
 
 from __future__ import annotations
@@ -36,16 +37,17 @@ class FineVisionArrow(Dataset):
     """The kept conversations of one FineVision subset.
 
     Rows pass when their keep flag is set, every ``min_ratings`` column meets its
-    threshold (a missing rating, stored as ``-1``, fails), and, with ``max_images``,
-    the row has between 1 and ``max_images`` images. ``num_images`` overrides the
-    per-row image counts stored in ``index.npz``.
+    threshold (a missing rating, stored as ``-1``, fails), and the row has between
+    1 and ``max_images`` images, which ``None`` lifts; a ``text_only`` reader takes
+    no image filter. ``num_images`` overrides the per-row image counts stored in
+    ``index.npz``.
     """
 
     def __init__(
         self,
         subset_dir: str | Path,
         *,
-        max_images: int | None = None,
+        max_images: int | None = 1,
         num_images: np.ndarray | None = None,
         min_ratings: dict[str, int] | None = None,
         text_only: bool = False,
@@ -71,7 +73,7 @@ class FineVisionArrow(Dataset):
             if name not in RATING_COLUMNS:
                 raise ValueError(f"unknown rating {name!r}; expected one of {RATING_COLUMNS}")
             keep &= index[name] >= threshold
-        if max_images is not None:
+        if max_images is not None and not text_only:
             counts = num_images if num_images is not None else index.get("num_images")
             if counts is None:
                 raise ValueError(

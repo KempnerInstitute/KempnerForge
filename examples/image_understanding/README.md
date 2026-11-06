@@ -59,9 +59,10 @@ samples `VLMCollator` batches.
 
 Every sample carries one image, resized square to `image_size`, with no tiling or
 packing. PixMo-Count stores its points in pixels; they are converted to percent of
-the image, the unit the other PixMo sources use. `FineVisionArrow(max_images=1)`
-keeps only the rows with one image, using the per-row image counts `index.npz`
-stores; an index written without them takes the counts from `num_images`.
+the image, the unit the other PixMo sources use. `FineVisionArrow` keeps only the
+rows with one image (`max_images`, which `None` lifts), using the per-row image
+counts `index.npz` stores; an index written without them takes the counts from
+`num_images`.
 
 Convert FineVision once:
 
