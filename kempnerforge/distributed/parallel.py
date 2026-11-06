@@ -551,7 +551,7 @@ def _build_vlm(
     apply_ac(transformer, ac_mode)
 
     encoder_frozen = _is_encoder_frozen(vlm_config.freeze)
-    encoder_dtype = vision_config.param_dtype
+    encoder_dtype = vision_config.compute_dtype
     if device_mesh is not None:
         _apply_fsdp_vlm(
             wrapper,
