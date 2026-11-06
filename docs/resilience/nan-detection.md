@@ -39,9 +39,9 @@ Two things to note:
 - **The gradient norm is checked with the loss.** A finite loss can come with
   non-finite gradients: a micro-batch whose labels are all `-100` has an exact
   zero cross-entropy loss whatever its activations, and without the norm check
-  its NaN gradients would reach `optimizer.step()`. The norm can differ between
-  ranks (under expert parallelism it covers the shared parameters and only the
-  rank's experts), so it goes into the same all-reduced flag as the loss.
+  its NaN gradients would reach `optimizer.step()`. The norm goes into the same
+  all-reduced flag as the loss, so every rank skips the step together even when
+  a non-finite gradient reaches only some ranks' norms.
 - **`check_gradients` is *not* called by the training loop.** It returns a
   rank-local verdict; the gradient norm check above covers non-finite gradients.
 

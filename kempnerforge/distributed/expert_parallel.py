@@ -78,6 +78,19 @@ def _all_to_all(
     return _AllToAll.apply(x, output_split_sizes, input_split_sizes, group)
 
 
+class _ScaleGrad(torch.autograd.Function):
+    """Identity in the forward pass; multiplies the gradient by ``scale`` in the backward."""
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, scale: float) -> torch.Tensor:
+        ctx.scale = scale
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        return grad_output * ctx.scale, None
+
+
 def ep_dispatch_and_compute(
     x: torch.Tensor,
     weights: torch.Tensor,
@@ -91,6 +104,10 @@ def ep_dispatch_and_compute(
 ) -> torch.Tensor:
     """All-to-all dispatch, local expert compute, all-to-all combine.
 
+    When the EP ranks hold the same batch, as they do in training, the backward pass
+    gives the local experts the mean of the ranks' gradients, which is one process's,
+    and gives ``x`` and ``weights`` the same gradients as without EP.
+
     Args:
         x: (num_tokens, dim) flattened token representations.
         weights: (num_tokens, top_k) routing weights.
@@ -101,6 +118,9 @@ def ep_dispatch_and_compute(
         local_expert_start: First global expert index on this rank.
         num_local_experts: Number of experts on this rank.
         ep_world_size: Number of ranks in the EP group.
+        gradient_scale: When ``moe`` is in training mode, scale each local expert's
+            output by the average load over all experts divided by its own load, as
+            ``MoEMLP._local_forward`` does.
 
     Returns:
         output: (num_tokens, dim) weighted combination of expert outputs.
@@ -130,6 +150,7 @@ def ep_dispatch_and_compute(
     recv_counts_list = recv_counts.tolist()
 
     received_tokens = _all_to_all(x_sorted, recv_counts_list, send_counts_list, ep_group)
+    received_tokens = _ScaleGrad.apply(received_tokens, float(ep_world_size))
 
     sorted_expert_ids_float = sorted_flat_indices.float().unsqueeze(-1)
     received_expert_ids = torch.empty(
@@ -217,18 +238,19 @@ def ep_dispatch_and_compute(
                 _zero = sum(p.sum() for p in unused_expert_params) * 0
                 local_output = local_output + _zero
 
-    if gradient_scale and received_tokens.requires_grad:
+    if gradient_scale and moe.training:
         total_recv = sum(recv_counts_list)
         if total_recv > 0:
             local_ids = received_expert_ids - local_expert_start
             tpe = torch.bincount(local_ids, minlength=num_local_experts)
-            avg_tokens = total_recv / max(num_local_experts, 1)
+            avg_tokens = num_tokens * top_k / max(num_local_experts, 1)
             scale = (avg_tokens / tpe.clamp(min=1).double()).float()
             local_output = (local_output.float() * scale[local_ids].unsqueeze(-1)).to(
                 local_output.dtype
             )
 
     local_output = local_output + received_tokens.sum() * 0
+    local_output = _ScaleGrad.apply(local_output, 1.0 / ep_world_size)
 
     returned_tokens = _all_to_all(local_output, send_counts_list, recv_counts_list, ep_group)
 
@@ -307,3 +329,35 @@ def apply_expert_parallel(model: torch.nn.Module, device_mesh: DeviceMesh | None
     logger.info(
         f"Applied expert parallelism: ep_size={ep_size}, ep_rank={ep_rank}, layers={applied}"
     )
+
+
+def expert_parallel_params(
+    model: torch.nn.Module,
+) -> tuple[list[torch.nn.Parameter], dist.ProcessGroup | None]:
+    """The routed-expert parameters that EP splits across ranks, and the EP group.
+
+    Each EP rank holds its own slice of these and a copy of every other parameter.
+    Returns ``([], None)`` when no ``MoEMLP`` has ``ep_world_size > 1``.
+
+    Raises:
+        ValueError: Two ``MoEMLP`` layers record different EP groups, so no single
+            group covers every routed expert.
+    """
+    params: list[torch.nn.Parameter] = []
+    group: dist.ProcessGroup | None = None
+    for module in model.modules():
+        if not isinstance(module, MoEMLP) or module.ep_world_size <= 1:
+            continue
+        if group is not None and module.ep_group is not group:
+            raise ValueError(
+                "MoE layers record different expert-parallel groups, so no single group "
+                "covers every routed expert; apply_expert_parallel gives all layers one group"
+            )
+        group = module.ep_group
+        if module.packed_experts:
+            params += [module.up_w, module.down_w]
+            if module._is_swiglu:
+                params.append(module.gate_w)
+        else:
+            params += module.experts.parameters()
+    return params, group
