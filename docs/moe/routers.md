@@ -146,18 +146,18 @@ with the same `N`. A negative `N` is rejected at config load and by
 `build_moe`.
 
 Under [Muon](../training/optimizers.md#muon) the fused MLP is one
-matrix per projection. With `muon_orthogonalize = "exact"`, or without
+matrix per projection, and it stays on Muon for every `N`: Muon routes
+by module, not by shape. With `muon_orthogonalize = "exact"`, or without
 sharding, it is orthogonalized as a whole rather than as `N` expert
 matrices; under the default `"local"`, each rank orthogonalizes its
 own FSDP2 row shard and takes the update scale from the shard's shape.
-Once its aspect ratio passes 10, Muon hands it to its AdamW fallback.
-On `configs/model/moe_small.toml` that happens from `N = 3`, where
-`gate_proj` and `up_proj` are 21504 × 2048 and `down_proj` is
-2048 × 21504. Below that, the default `muon_adjust_lr = "original"`
-scales an update by `sqrt(max(1, rows / cols))`, which offsets the
-smaller entries of the taller orthogonalized matrix, so the per-entry
-update stays near one expert's. `down_proj` is wider, so its factor
-is 1, and its per-entry update is about `1/sqrt(N)` of one expert's.
+The default `muon_adjust_lr = "original"` scales an update by
+`sqrt(max(1, rows / cols))`, which offsets the smaller entries of the
+taller orthogonalized matrix, so the per-entry update stays near one
+expert's. `down_proj` is wider, so its factor is 1, and its per-entry
+update is about `1/sqrt(N)` of one expert's. On
+`configs/model/moe_small.toml` with `N = 3`, `gate_proj` and `up_proj`
+are 21504 × 2048 and `down_proj` is 2048 × 21504.
 
 DeepSeek's original motivation: the shared expert absorbs the
 "universal" capacity so routed experts can specialize. In practice,

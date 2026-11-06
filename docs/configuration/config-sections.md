@@ -105,7 +105,8 @@ Training-loop hyperparameters.
 | `seed` | `int` | `42` | torch/numpy/python RNG seed |
 | `data_seed` | `int \| None` | `None` | RNG seed for data and batch order; `None` → falls back to `seed` |
 | `compile_model` | `bool` | `True` | wrap the model with `torch.compile` |
-| `mixed_precision` | `"bf16" \| "fp32" \| "fp8"` | `"bf16"` | master-weight dtype; `"fp8"` uses bf16 masters with fp8 compute; `"fp16"` is rejected (no loss scaling) |
+| `mixed_precision` | `"bf16" \| "fp32" \| "fp8"` | `"bf16"` | compute dtype, and the master-weight dtype unless `fp32_master_weights` is set; `"fp8"` computes in fp8, with bf16 masters unless `fp32_master_weights` is set; `"fp16"` is rejected (no loss scaling) |
+| `fp32_master_weights` | `bool` | `False` | keep parameters, gradients and optimizer state in fp32 and compute in `param_dtype` through FSDP2's mixed precision; without an FSDP2 wrap (1 GPU, a pp-only mesh) the forward runs under `torch.autocast`; rejected with `mixed_precision = "fp32"`, and for MoE on a single GPU — see [FSDP2 § fp32 master weights](../distributed/fsdp2.md#fp32-master-weights) |
 | `tf32` | `bool` | `False` | run fp32 matmuls (a frozen fp32 vision encoder, `mixed_precision = "fp32"`) on TF32 tensor cores via `torch.set_float32_matmul_precision("high")`, applied at startup by training and `scripts/eval.py`; this also covers the matmuls that run in fp32 on purpose in a bf16 run, so Muon's Newton–Schulz step moves to TF32 (still more precise than the bf16 that `torch.optim.Muon` uses); `False` leaves torch's setting as it is |
 | `activation_checkpointing` | `"none" \| "full" \| "selective"` | `"none"` | AC policy |
 | `loss_fn` | `str` | `"cross_entropy"` | `loss` registry key (or `"chunked_cross_entropy"`) |
@@ -115,7 +116,8 @@ Training-loop hyperparameters.
 | `shutdown_timeout_sec` | `float` | `600.0` | graceful shutdown timeout before forced exit |
 | `nccl_health_check_interval` | `int` | `0` | NCCL liveness all-reduce every N steps (`0` = disabled) |
 
-Computed properties: `param_dtype`, `is_fp8`.
+Computed properties: `param_dtype` (compute dtype), `master_dtype` (storage dtype: fp32 with
+`fp32_master_weights`, otherwise `param_dtype`), `is_fp8`.
 
 ## `[optimizer]` — `OptimizerConfig`
 
@@ -133,10 +135,11 @@ are shared (AdamW/Lion) or optimizer-specific.
 | `fused` | `bool` | `True` | use fused AdamW when available |
 | `muon_momentum` | `float` | `0.95` | Muon momentum coefficient |
 | `muon_ns_steps` | `int` | `5` | Newton–Schulz iterations for Muon |
-| `muon_adam_lr` | `float \| None` | `None` | LR for 1-D params in Muon's AdamW fallback; `None` → same as `lr` |
+| `muon_adam_lr` | `float \| None` | `None` | LR for the parameters Muon leaves to its AdamW fallback; `None` → same as `lr` |
 | `muon_nesterov` | `bool` | `False` | Orthogonalize the Nesterov look-ahead instead of the momentum buffer |
 | `muon_adjust_lr` | `"original" \| "match_rms_adamw" \| "spectral_unclamped"` | `"original"` | Factor on each orthogonalized update |
 | `muon_orthogonalize` | `"local" \| "exact"` | `"local"` | Newton–Schulz on each rank's shard, or on the full matrix |
+| `muon_router` | `bool` | `False` | Orthogonalize MoE router gates with Muon instead of its AdamW fallback |
 | `schedule_free_warmup_steps` | `int` | `0` | internal warmup for schedule-free |
 | `weight_decay_scope` | `"exclude_norms_and_biases" \| "all"` | `"exclude_norms_and_biases"` | which parameters are decayed; `"all"` decays every parameter, as `torch.optim.AdamW` does by default. A resume that restores optimizer state saved under the other scope is refused |
 
@@ -220,7 +223,7 @@ In-loop evaluation. Disabled by default.
 |-------|------|---------|---------|
 | `enabled` | `bool` | `False` | gate in-loop eval |
 | `interval` | `int` | `1000` | eval every N training steps |
-| `steps` | `int` | `50` | eval batches per evaluation |
+| `steps` | `int` | `50` | eval batches per evaluation; under pipeline parallelism a multiple of `train.grad_accum_steps` |
 | `dataset_path` | `str` | `""` | pre-tokenized eval shards |
 | `file_pattern` | `str` | `"*.npy"` | glob inside `dataset_path` |
 | `token_dtype` | `str` | `""` | dtype of raw `.bin` eval shards, `"uint16"` or `"uint32"`; `""` takes it from the `metadata.yaml` beside them, never from `data.token_dtype` |
