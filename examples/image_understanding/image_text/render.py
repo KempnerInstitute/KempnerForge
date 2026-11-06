@@ -54,7 +54,9 @@ class ChatRenderer:
 
     The sample holds ``pixel_values``, ``input_ids`` padded to ``max_text_len``, and
     next-token ``labels`` (``labels[i]`` is token ``i + 1``) that are ``-100`` on
-    padding and, when ``answer_only``, outside the assistant replies.
+    padding and, when ``answer_only``, outside the assistant replies. A document
+    whose replies ``max_text_len`` cuts away entirely is refused, since it would
+    train nothing.
     """
 
     def __init__(
@@ -85,6 +87,8 @@ class ChatRenderer:
             "input_ids"
         ]
         self._turn_end_id = tokenizer.convert_tokens_to_ids(turn_end)
+        if tokenizer(turn_end, add_special_tokens=False)["input_ids"] != [self._turn_end_id]:
+            raise ValueError(f"turn_end {turn_end!r} is not a single token of the tokenizer")
 
     def _template(self, messages: list[dict[str, str]], *, generation_prompt: bool) -> str:
         return self.tokenizer.apply_chat_template(
@@ -120,11 +124,17 @@ class ChatRenderer:
             raise ValueError(
                 f"only single-image documents render to a sample, got {len(document.images)} images"
             )
-        ids = self.token_ids(document, answers)[: self.max_text_len]
+        full = self.token_ids(document, answers)
+        ids = full[: self.max_text_len]
         if self.answer_only:
             trained = assistant_span_mask(ids, self._generation_prompt, self._turn_end_id)
         else:
             trained = [True] * len(ids)
+        if not any(trained[1:]):
+            raise ValueError(
+                f"the document trains no tokens: its replies fall past "
+                f"max_text_len={self.max_text_len} ({len(full)} tokens in all)"
+            )
         n = len(ids)
         input_ids = torch.full((self.max_text_len,), self.pad_id, dtype=torch.long)
         labels = torch.full((self.max_text_len,), -100, dtype=torch.long)
