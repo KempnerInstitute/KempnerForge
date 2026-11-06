@@ -703,6 +703,7 @@ def run_training_loop(
                         pp_rank=pipeline.rank if pipeline is not None else None,
                         pp_size=pipeline.size if pipeline is not None else None,
                         pp_group=pp_group(runtime) if pipeline is not None else None,
+                        pp_n_microbatches=tc.grad_accum_steps if pipeline is not None else None,
                     )
                 tracker.log_eval(eval_metrics, step)
                 hooks.on_eval_end(eval_metrics, step)

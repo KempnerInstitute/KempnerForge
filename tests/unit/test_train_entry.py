@@ -1712,6 +1712,48 @@ class TestBuildEvalDataloader:
         )
         assert build_eval_dataloader(config, _runtime()) is None
 
+    def test_pipeline_parallel_drops_a_partial_last_batch(self, mmap_data_dir):
+        """Pipeline stages are built for one microbatch shape, so a short last batch
+        cannot go through them; without PP the last batch is kept."""
+        from kempnerforge.config.distributed import DistributedConfig
+        from kempnerforge.config.eval import EvalConfig
+        from kempnerforge.training.data_pipeline import build_eval_dataloader
+
+        for pp, drops in ((1, False), (2, True)):
+            config = dataclasses.replace(
+                make_config(batch_size=3),
+                eval=EvalConfig(enabled=True, dataset_path=mmap_data_dir),
+                distributed=DistributedConfig(pp=pp, dp_shard=1),
+            )
+            loader = build_eval_dataloader(config, _runtime())
+            assert loader is not None
+            assert loader.drop_last is drops
+            sizes = {len(batch["input_ids"]) for batch in loader}
+            assert sizes == ({3} if drops else {3, len(loader.dataset) % 3})
+
+    def test_pipeline_parallel_rejects_an_eval_set_without_a_full_batch(self, mmap_data_dir):
+        """Under PP a rank with less than one full batch would have nothing to evaluate, so
+        the builder fails before training starts rather than at the first eval; without PP
+        the partial batch is kept."""
+        from kempnerforge.config.distributed import DistributedConfig
+        from kempnerforge.config.eval import EvalConfig
+        from kempnerforge.training.data_pipeline import build_eval_dataloader
+
+        def config_for(pp: int, batch_size: int) -> JobConfig:
+            return dataclasses.replace(
+                make_config(batch_size=batch_size),
+                eval=EvalConfig(enabled=True, dataset_path=mmap_data_dir),
+                distributed=DistributedConfig(pp=pp, dp_shard=1),
+            )
+
+        n_samples = len(build_eval_dataloader(config_for(1, 1), _runtime()).dataset)
+        batch_size = n_samples + 1
+        loader = build_eval_dataloader(config_for(1, batch_size), _runtime())
+        assert [len(batch["input_ids"]) for batch in loader] == [n_samples]
+        match = rf"{n_samples} samples, fewer than train\.batch_size \({batch_size}\)"
+        with pytest.raises(ValueError, match=match):
+            build_eval_dataloader(config_for(2, batch_size), _runtime())
+
 
 class TestDpSizeReachesTokenAccounting:
     """`get_dp_info` -> DataPipeline.dp_size -> tokens_in_step.
