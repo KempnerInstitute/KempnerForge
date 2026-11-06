@@ -137,9 +137,10 @@ class MLP2LayerAdapter(VisionAdapter):
     """2-layer MLP from image-feature dim to LLM embedding dim.
 
     Architecture: ``[pre_norm ->] Linear(in_dim, hidden) -> activation ->
-    Linear(hidden, out_dim)``. ``hidden_dim=None`` defaults to ``out_dim``;
-    ``pre_norm`` (a norm-registry key) adds ``ln_q`` (built with ``norm_eps``)
-    over the vision features and ``None`` builds none. Keeps the token count.
+    Linear(hidden, out_dim)``. ``hidden_dim`` ``None`` or ``0`` defaults to
+    ``out_dim``, and a negative one raises ``ValueError``; ``pre_norm`` (a
+    norm-registry key) adds ``ln_q`` (built with ``norm_eps``) over the vision
+    features and ``None`` builds none. Keeps the token count.
 
     ``reset_parameters`` is provided so callers that materialize adapters
     from meta can re-initialize weights with the standard defaults.
@@ -161,7 +162,9 @@ class MLP2LayerAdapter(VisionAdapter):
             raise ValueError(
                 f"Unknown adapter activation: {activation!r}. Options: {list(_ADAPTER_ACTIVATIONS)}"
             )
-        hidden = hidden_dim if hidden_dim and hidden_dim > 0 else out_dim
+        if hidden_dim is not None and hidden_dim < 0:
+            raise ValueError(f"MLP2LayerAdapter hidden_dim must be non-negative (got {hidden_dim})")
+        hidden = hidden_dim or out_dim
         self.ln_q = build_norm(pre_norm, in_dim, eps=norm_eps) if pre_norm else None
         self.proj1 = nn.Linear(in_dim, hidden, bias=True)
         self.act = _ADAPTER_ACTIVATIONS[activation]()
@@ -217,7 +220,9 @@ class AvgPoolAdapter(VisionAdapter):
     ``[pre_norm ->] Linear(in_dim, hidden_dim) -> activation ->
     Linear(hidden_dim, out_dim)``, normed first when ``pre_norm`` names a
     norm (built with ``norm_eps``). ``activation``, ``pre_norm`` and
-    ``norm_eps`` configure only that MLP head.
+    ``norm_eps`` configure only that MLP head, so ``activation`` or
+    ``pre_norm`` set away from its default without a positive ``hidden_dim``
+    raises ``ValueError``, as does a negative ``hidden_dim``.
 
     The cheapest token-count reducer (LLaVA-NeXT / sibling-repo style). ``window``
     is overridable per ``forward`` call so one connector can pool images (e.g.
@@ -239,8 +244,16 @@ class AvgPoolAdapter(VisionAdapter):
             raise ValueError("AvgPoolAdapter in_dim and out_dim must be positive")
         if pool_window <= 0:
             raise ValueError(f"AvgPoolAdapter pool_window must be positive (got {pool_window})")
-        if hidden_dim is not None and hidden_dim < 0:
-            raise ValueError(f"AvgPoolAdapter hidden_dim must be non-negative (got {hidden_dim})")
+        head_settings = []
+        if activation != "gelu":
+            head_settings.append(f"activation={activation!r}")
+        if pre_norm:
+            head_settings.append(f"pre_norm={pre_norm!r}")
+        if head_settings and (hidden_dim is None or hidden_dim <= 0):
+            raise ValueError(
+                f"AvgPoolAdapter got {', '.join(head_settings)} with hidden_dim={hidden_dim}: "
+                "activation and pre_norm configure the MLP head, which needs a positive hidden_dim"
+            )
         self.in_dim = in_dim
         self.out_dim = out_dim
         self.pool_window = pool_window

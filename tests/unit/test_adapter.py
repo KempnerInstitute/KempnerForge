@@ -125,6 +125,12 @@ class TestMLP2LayerAdapter:
         with pytest.raises(ValueError, match="must be positive"):
             MLP2LayerAdapter(in_dim=0, out_dim=8)
 
+    def test_rejects_negative_hidden_dim(self):
+        with pytest.raises(
+            ValueError, match=r"MLP2LayerAdapter hidden_dim must be non-negative \(got -4\)"
+        ):
+            MLP2LayerAdapter(in_dim=32, out_dim=16, hidden_dim=-4)
+
     def test_backward_grads_flow(self):
         adapter = MLP2LayerAdapter(in_dim=32, out_dim=16).to(DEVICE)
         x = torch.randn(1, 4, 32, device=DEVICE, requires_grad=True)
@@ -965,6 +971,31 @@ class TestAvgPoolNormMLPHead:
     def test_rejects_negative_hidden_dim(self):
         with pytest.raises(ValueError, match="hidden_dim must be non-negative"):
             AvgPoolAdapter(in_dim=8, out_dim=4, hidden_dim=-1)
+
+    @pytest.mark.parametrize(
+        ("settings", "hidden_dim"),
+        [
+            ({"pre_norm": "rmsnorm"}, None),
+            ({"activation": "silu"}, 0),
+            ({"activation": "relu", "pre_norm": "layernorm"}, -4),
+        ],
+        ids=["pre_norm", "activation", "both-negative-width"],
+    )
+    def test_head_settings_need_a_positive_hidden_dim(self, settings, hidden_dim):
+        """activation and pre_norm configure the MLP head, so they are rejected
+        rather than dropped when hidden_dim leaves the head off."""
+        named = ", ".join(f"{key}={value!r}" for key, value in settings.items())
+        with pytest.raises(
+            ValueError,
+            match=rf"AvgPoolAdapter got {re.escape(named)} with hidden_dim={hidden_dim}: "
+            r"activation and pre_norm configure the MLP head, which needs a positive hidden_dim",
+        ):
+            AvgPoolAdapter(in_dim=32, out_dim=16, hidden_dim=hidden_dim, **settings)
+
+    @pytest.mark.parametrize("pre_norm", [None, ""])
+    def test_head_settings_at_their_defaults_keep_the_linear(self, pre_norm):
+        adapter = AvgPoolAdapter(in_dim=32, out_dim=16, activation="gelu", pre_norm=pre_norm)
+        assert type(adapter.proj) is torch.nn.Linear
 
     def test_config_builds_the_head(self):
         cfg = AdapterConfig(
