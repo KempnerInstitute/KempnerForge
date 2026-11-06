@@ -475,7 +475,9 @@ def _apply_stage_specs(
     recompute their reduction dtypes (``refresh_fsdp_dtypes``), which a unit
     frozen at its first forward does not have, and a compiled model recompiles
     at its next forward (``torch.compiler.reset``), since a graph compiled
-    while a parameter was frozen computes no gradient for it. Returns the
+    while a parameter was frozen computes no gradient for it. The reset clears
+    every compiled function in the process, so other compiled helpers, such as
+    the loss or attention masks, recompile at their next use too. Returns the
     counts ``apply_freeze_specs`` returns.
     """
     frozen = {id(p) for p in model.parameters() if not p.requires_grad}
