@@ -145,6 +145,29 @@ class TestPointingAndCounting:
             "Counting the bird, I count 2.",
         )
 
+    def test_counting_keeps_every_point_unless_capped(
+        self, tmp_path: Path, write_image: Callable
+    ) -> None:
+        write_image("pixmo_images/aa", size=(100, 100))
+        ann = _write_jsonl(
+            tmp_path / "count.jsonl",
+            [
+                {
+                    "image": "pixmo_images/aa",
+                    "label": "dot",
+                    "count": 40,
+                    "points": {"x": list(range(40)), "y": list(range(40))},
+                }
+            ],
+        )
+        answer = pixmo_counting(ann, tmp_path, multi_label=False, coordinates="pixels")[0]
+        assert 'x40="39.0"' in answer.turns[0].answers[0]
+        capped = pixmo_counting(
+            ann, tmp_path, multi_label=False, coordinates="pixels", max_points=30
+        )[0]
+        assert 'x30="29.0"' in capped.turns[0].answers[0]
+        assert 'x31="' not in capped.turns[0].answers[0]
+
     def test_missing_count_reads_as_zero(self, tmp_path: Path, write_image: Callable) -> None:
         write_image("pixmo_images/hh")
         ann = _write_jsonl(
@@ -190,10 +213,21 @@ class TestUnreadableImages:
     def test_gives_up_after_max_attempts(self, tmp_path: Path) -> None:
         for name in ("s1", "s2", "s3"):
             _write_stub(tmp_path, f"pixmo_images/{name}")
-        reader = pixmo_captions(self._captions(tmp_path, ["s1", "s2", "s3"]), tmp_path, prompt="P")
-        reader.max_attempts = 3
+        ann = self._captions(tmp_path, ["s1", "s2", "s3"])
+        reader = pixmo_captions(ann, tmp_path, prompt="P", max_attempts=3)
         with pytest.raises(RuntimeError, match="3 consecutive rows"):
             reader[0]
+
+    def test_every_reader_takes_max_attempts(self, tmp_path: Path) -> None:
+        ann = _write_jsonl(tmp_path / "empty.jsonl", [])
+        readers = [
+            pixmo_captions(ann, tmp_path, prompt="P", max_attempts=2),
+            pixmo_cap_qa(ann, tmp_path, max_attempts=2),
+            pixmo_point_explanations(ann, tmp_path, max_attempts=2),
+            pixmo_pointing(ann, tmp_path, max_attempts=2),
+            pixmo_counting(ann, tmp_path, multi_label=False, coordinates="pixels", max_attempts=2),
+        ]
+        assert [reader.max_attempts for reader in readers] == [2] * 5
 
     def test_rows_need_an_image_column(self, tmp_path: Path) -> None:
         with pytest.raises(ValueError, match="'image' column"):
