@@ -82,6 +82,15 @@ class CheckpointConfig:
                 "exclude_from_loading accepts only 'model', 'optimizer' and/or 'train_state' "
                 f"(got {self.exclude_from_loading!r})"
             )
+        if "train_state" in self.exclude_from_loading and set(self.exclude_from_loading) != {
+            "optimizer",
+            "train_state",
+        }:
+            raise ValueError(
+                "exclude_from_loading with 'train_state' must be ['optimizer', 'train_state']: "
+                "a weights-only warm start loads the model alone "
+                f"(got {self.exclude_from_loading!r})"
+            )
 
     def should_save(self, step: int) -> bool:
         """Whether to write a checkpoint at ``step``.

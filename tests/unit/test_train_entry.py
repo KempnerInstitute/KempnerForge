@@ -409,6 +409,64 @@ class TestTextStep:
         assert result.loss > 0
 
 
+class TestAutocastFallback:
+    """``TrainingSession.autocast_dtype`` puts the step body's forward under ``torch.autocast``."""
+
+    @pytest.mark.parametrize(
+        ("autocast_dtype", "expected"), [(None, torch.float32), (torch.bfloat16, torch.bfloat16)]
+    )
+    def test_text_step_forward(
+        self, autocast_dtype: torch.dtype | None, expected: torch.dtype
+    ) -> None:
+        session = make_session(make_config(), autocast_dtype=autocast_dtype)
+        seen: list[torch.dtype] = []
+        session.model.out.register_forward_hook(lambda _m, _i, out: seen.append(out.dtype))
+        session.step_fn(session, 0)
+        assert seen == [expected]
+        for p in session.model.parameters():
+            assert p.dtype == torch.float32
+            assert p.grad is not None and p.grad.dtype == torch.float32
+
+    def test_vlm_step_forward(self) -> None:
+        model = TinyVlmModel()
+        batch = {
+            "pixel_values": torch.zeros(2, 3, 4, 4),
+            "input_ids": torch.zeros(2, 4, dtype=torch.long),
+            "labels": torch.zeros(2, 4, dtype=torch.long),
+        }
+        session = make_session(
+            make_config(),
+            model=model,
+            data=DataPipeline(dataloader=[batch]),
+            step_fn=vlm_step,
+            autocast_dtype=torch.bfloat16,
+        )
+        seen: list[torch.dtype] = []
+        model.proj.register_forward_hook(lambda _m, _i, out: seen.append(out.dtype))
+        session.step_fn(session, 0)
+        assert seen == [torch.bfloat16]
+
+    def test_pipeline_schedule_runs_under_autocast(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        enabled: list[bool] = []
+
+        class Schedule(FakeSchedule):
+            def step(self, *args: Any, **kwargs: Any) -> None:
+                enabled.append(torch.is_autocast_enabled("cpu"))
+                super().step(*args, **kwargs)
+
+        session, _ = TestPipelineStep()._session(monkeypatch, rank=0, size=2, sched=Schedule())
+        session.autocast_dtype = torch.bfloat16
+        session.step_fn(session, 0)
+        assert enabled == [True]
+
+    def test_context(self) -> None:
+        with make_session(make_config(), autocast_dtype=torch.bfloat16).autocast():
+            assert torch.is_autocast_enabled("cpu")
+            assert torch.get_autocast_dtype("cpu") == torch.bfloat16
+        with make_session(make_config()).autocast():
+            assert not torch.is_autocast_enabled("cpu")
+
+
 class TestVlmTextTokenGuard:
     def test_missing_count_is_loud(self, tiny_vlm_configs):
         from kempnerforge.training.loop import StepResult, _log_periodic_metrics
@@ -1447,6 +1505,32 @@ class TestBuildModel:
         assert stage.inited is True
         assert stage.emptied_to is not None
 
+    @pytest.mark.parametrize(
+        ("fp32_master_weights", "dtype"), [(False, torch.bfloat16), (True, torch.float32)]
+    )
+    def test_parameters_are_stored_in_the_master_dtype(
+        self, fp32_master_weights: bool, dtype: torch.dtype
+    ) -> None:
+        import kempnerforge.training.entry as entry
+
+        config = make_config(fp32_master_weights=fp32_master_weights)
+        model, _ = entry.build_model(config, _runtime(), lambda a, b: a)
+        assert {p.dtype for p in model.parameters()} == {dtype}
+
+    @pytest.mark.parametrize("dims", [("pp", "dp_shard"), ("pp", "tp")])
+    @pytest.mark.parametrize(
+        ("fp32_master_weights", "dtype"), [(False, torch.bfloat16), (True, torch.float32)]
+    )
+    def test_pp_stage_is_stored_in_the_master_dtype(
+        self, monkeypatch, dims: tuple[str, str], fp32_master_weights: bool, dtype: torch.dtype
+    ) -> None:
+        stage, calls = FakeStageModule(), {}
+        entry = _stub_pp(monkeypatch, stage, calls)
+        config = make_config(fp32_master_weights=fp32_master_weights)
+        config.distributed.pp = 2
+        entry.build_model(config, _pp_runtime(FakeMesh(dims)), "LOSS")
+        assert {p.dtype for p in stage.parameters()} == {dtype}
+
     def test_pp_without_a_mesh_raises_rather_than_asserting(self, monkeypatch):
         stage, calls = FakeStageModule(), {}
         entry = _stub_pp(monkeypatch, stage, calls)
@@ -1704,7 +1788,7 @@ class TestRestoreCheckpoint:
         assert mgr.load_kwargs["vlm_freeze_expected"] == freeze_meta_at_step(0, config.vlm)
         assert mgr.load_kwargs["exclude_keys"] == ["model"]
 
-    def test_mot_warm_start_fires_at_step_zero_but_not_on_a_weights_only_start(
+    def test_mot_warm_start_runs_only_when_no_checkpoint_supplied_the_model(
         self, monkeypatch, tmp_path
     ):
         import kempnerforge.training.entry as entry
@@ -1727,18 +1811,28 @@ class TestRestoreCheckpoint:
                 max_text_len=32, mot_warm_start_from_text=True, mot_warm_start_path="/x.pt"
             ),
         )
-        entry.restore_checkpoint(config, TinyTextModel(), None, FakeResumeManager(step=0))
-        assert copied == [{"w": 1}]
-
-        copied.clear()
-        entry.restore_checkpoint(config, TinyTextModel(), None, FakeResumeManager(step=4))
-        assert copied == []
+        for step in (0, 4):
+            entry.restore_checkpoint(config, TinyTextModel(), None, FakeResumeManager(step=step))
+            assert copied == [], f"a resume at step {step} supplied the model"
 
         monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: None)
         config.checkpoint.load_path = str(tmp_path / "stage1")
         config.checkpoint.exclude_from_loading = ["optimizer", "train_state"]
         entry.restore_checkpoint(config, TinyTextModel(), None, FakeResumeManager(step=0))
         assert copied == []
+
+        config.checkpoint.exclude_from_loading = ["model"]
+        entry.restore_checkpoint(config, TinyTextModel(), None, FakeResumeManager(step=0))
+        assert copied == [{"w": 1}]
+
+        copied.clear()
+        config.checkpoint.load_path = None
+        config.checkpoint.exclude_from_loading = []
+        assert entry.restore_checkpoint(config, TinyTextModel(), None, FakeResumeManager()) == (
+            0,
+            0,
+        )
+        assert copied == [{"w": 1}]
 
 
 class FakeDataset:

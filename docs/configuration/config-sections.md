@@ -105,7 +105,8 @@ Training-loop hyperparameters.
 | `seed` | `int` | `42` | torch/numpy/python RNG seed |
 | `data_seed` | `int \| None` | `None` | RNG seed for data and batch order; `None` → falls back to `seed` |
 | `compile_model` | `bool` | `True` | wrap the model with `torch.compile` |
-| `mixed_precision` | `"bf16" \| "fp32" \| "fp8"` | `"bf16"` | master-weight dtype; `"fp8"` uses bf16 masters with fp8 compute; `"fp16"` is rejected (no loss scaling) |
+| `mixed_precision` | `"bf16" \| "fp32" \| "fp8"` | `"bf16"` | compute dtype, and the master-weight dtype unless `fp32_master_weights` is set; `"fp8"` computes in fp8, with bf16 masters unless `fp32_master_weights` is set; `"fp16"` is rejected (no loss scaling) |
+| `fp32_master_weights` | `bool` | `False` | keep parameters, gradients and optimizer state in fp32 and compute in `param_dtype` through FSDP2's mixed precision; without an FSDP2 wrap (1 GPU, a pp-only mesh) the forward runs under `torch.autocast`; rejected with `mixed_precision = "fp32"`, and for MoE on a single GPU — see [FSDP2 § fp32 master weights](../distributed/fsdp2.md#fp32-master-weights) |
 | `tf32` | `bool` | `False` | run fp32 matmuls (a frozen fp32 vision encoder, `mixed_precision = "fp32"`) on TF32 tensor cores via `torch.set_float32_matmul_precision("high")`, applied at startup by training and `scripts/eval.py`; this also covers the matmuls that run in fp32 on purpose in a bf16 run, so Muon's Newton–Schulz step moves to TF32 (still more precise than the bf16 that `torch.optim.Muon` uses); `False` leaves torch's setting as it is |
 | `activation_checkpointing` | `"none" \| "full" \| "selective"` | `"none"` | AC policy |
 | `loss_fn` | `str` | `"cross_entropy"` | `loss` registry key (or `"chunked_cross_entropy"`) |
@@ -115,7 +116,8 @@ Training-loop hyperparameters.
 | `shutdown_timeout_sec` | `float` | `600.0` | graceful shutdown timeout before forced exit |
 | `nccl_health_check_interval` | `int` | `0` | NCCL liveness all-reduce every N steps (`0` = disabled) |
 
-Computed properties: `param_dtype`, `is_fp8`.
+Computed properties: `param_dtype` (compute dtype), `master_dtype` (storage dtype: fp32 with
+`fp32_master_weights`, otherwise `param_dtype`), `is_fp8`.
 
 ## `[optimizer]` — `OptimizerConfig`
 
@@ -263,7 +265,7 @@ DCP-based checkpointing.
 | `keep_last_n` | `int` | `3` | retain the most recent N checkpoints (`<= 0` keeps all); steps saved by `dyn_ckpt_window` are always kept |
 | `load_path` | `str \| None` | `None` | explicit resume path (overrides `latest` symlink) |
 | `export_dtype` | `"float32" \| "bfloat16"` | `"bfloat16"` | dtype for HF exports via `scripts/convert_checkpoint.py dcp-to-hf` when its `--dtype` flag is not given; the flag wins and also takes `float16` (see [HuggingFace conversion](../checkpointing/hf-conversion.md#dtypes)) |
-| `exclude_from_loading` | `list[str]` | `[]` | state to skip when warm-starting from `load_path`: `"model"`, `"optimizer"` and/or `"train_state"` (the step, scheduler, dataloader position and RNG in `train_state.pt`, plus the saved freeze comparison, so a new stage starts fresh from the weights); ignored on a resume, which always restores full state |
+| `exclude_from_loading` | `list[str]` | `[]` | state to skip when warm-starting from `load_path`: `"model"` and/or `"optimizer"`, or exactly `["optimizer", "train_state"]` for a weights-only warm start that loads the model alone and skips `train_state.pt` (step, scheduler, dataloader position, RNG) and the saved freeze comparison, so a new stage starts fresh from the weights; ignored on a resume, which always restores full state |
 | `ignore_freeze_mismatch` | `bool` | `False` | load a checkpoint whose VLM freeze metadata disagrees with the configured freeze specs, downgrading the error to a warning |
 
 ### `[checkpoint.dyn_ckpt_window]` — `DynamicCheckpointWindow`
