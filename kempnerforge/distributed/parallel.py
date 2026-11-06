@@ -369,7 +369,7 @@ def _apply_fsdp_vlm(
         fully_shard(
             wrapper.vision_encoder,
             mesh=dp_mesh,
-            mp_policy=encoder_mp_policy or policy,
+            mp_policy=encoder_mp_policy if encoder_mp_policy is not None else policy,
             reshard_after_forward=reshard_after_forward,
         )
     logger.info(
@@ -378,62 +378,76 @@ def _apply_fsdp_vlm(
     )
 
 
-def _cast_floating_inputs(
-    dtype: torch.dtype, module: torch.nn.Module, args: tuple, kwargs: dict
-) -> tuple[tuple, dict]:
-    """Forward pre-hook that casts floating-point tensor arguments to ``dtype``."""
-
-    def cast(value):
-        if isinstance(value, torch.Tensor) and value.is_floating_point():
-            return value.to(dtype)
-        return value
-
-    return tuple(cast(a) for a in args), {k: cast(v) for k, v in kwargs.items()}
+def _cast_floating(value: object, dtype: torch.dtype) -> object:
+    """``value`` cast to ``dtype`` if it is a floating-point tensor, else ``value`` unchanged."""
+    if isinstance(value, torch.Tensor) and value.is_floating_point():
+        return value.to(dtype)
+    return value
 
 
-class _ComputeDtypeHooks:
-    """Forward hooks that run a module in ``dtype`` while its parameters keep their dtype.
+class _ComputeInDtype:
+    """A module's forward that computes in ``dtype`` while its parameters keep their dtype.
 
-    ``pre_forward`` puts a cast copy in place of each floating-point parameter of
-    another dtype, one copy per parameter however many names it has, and casts the
-    floating-point inputs. ``post_forward`` puts the parameters back, also when the
-    forward raises. Autograd returns each copy's gradient to its parameter in the
-    parameter's dtype, so gradients and optimizer state keep the stored dtype, as
-    with an FSDP2 ``MixedPrecisionPolicy`` whose ``param_dtype`` is ``dtype``.
+    Installed as the module's ``forward``. Each call puts a ``dtype`` copy in place of
+    every floating-point parameter of another dtype, one copy per parameter however many
+    names it has, casts the floating-point arguments, and runs the module's own forward
+    with autocast off on ``device_type``, so a surrounding ``torch.autocast`` does not
+    change the dtype it computes in. The parameters go back when the call returns or
+    raises. A nested call finds the copies in place and casts no parameter. Autograd
+    returns each copy's gradient to its parameter in the parameter's dtype, as with an
+    FSDP2 ``MixedPrecisionPolicy`` whose ``param_dtype`` is ``dtype``.
+
+    Under ``torch.compile`` the call itself runs eagerly, at a graph break, and the
+    module's forward compiles as its own graph, entered with autocast off. A compiled
+    graph's backward is traced under the autocast its forward was entered with, so this
+    keeps the backward in ``dtype`` too.
     """
 
-    def __init__(self, dtype: torch.dtype) -> None:
+    def __init__(self, module: torch.nn.Module, dtype: torch.dtype, device_type: str) -> None:
+        self._module = module
+        self._forward = module.forward
         self.dtype = dtype
-        self._stored: list[tuple[torch.nn.Module, str, torch.nn.Parameter]] = []
+        self.device_type = device_type
 
-    def pre_forward(self, module: torch.nn.Module, args: tuple, kwargs: dict) -> tuple[tuple, dict]:
-        copies: dict[int, torch.Tensor] = {}
-        for owner in module.modules():
-            for name, param in list(owner._parameters.items()):
-                if param is None or not param.is_floating_point() or param.dtype == self.dtype:
-                    continue
-                if id(param) not in copies:
-                    copies[id(param)] = param.to(self.dtype)
-                self._stored.append((owner, name, param))
-                owner._parameters[name] = copies[id(param)]  # type: ignore[assignment]
-        return _cast_floating_inputs(self.dtype, module, args, kwargs)
+    def __call__(self, *args: object, **kwargs: object) -> object:
+        return _run_eagerly(self, *args, **kwargs)
 
-    def post_forward(self, module: torch.nn.Module, args: tuple, output: object) -> None:
-        while self._stored:
-            owner, name, param = self._stored.pop()
-            owner._parameters[name] = param
+    def _run(self, *args: object, **kwargs: object) -> object:
+        swapped: list[tuple[torch.nn.Module, str, torch.nn.Parameter]] = []
+        try:
+            copies: dict[int, torch.Tensor] = {}
+            for owner in self._module.modules():
+                for name, param in list(owner._parameters.items()):
+                    if param is None or not param.is_floating_point() or param.dtype == self.dtype:
+                        continue
+                    if id(param) not in copies:
+                        copies[id(param)] = param.to(self.dtype)
+                    swapped.append((owner, name, param))
+                    owner._parameters[name] = copies[id(param)]  # type: ignore[assignment]
+            with torch.autocast(self.device_type, enabled=False):
+                return self._forward(
+                    *(_cast_floating(a, self.dtype) for a in args),
+                    **{k: _cast_floating(v, self.dtype) for k, v in kwargs.items()},
+                )
+        finally:
+            for owner, name, param in reversed(swapped):
+                owner._parameters[name] = param
+
+
+_run_eagerly = torch.compiler.disable(_ComputeInDtype._run, recursive=False)
 
 
 def _set_encoder_precision(
-    encoder: torch.nn.Module, dtype: torch.dtype, *, fsdp_wrapped: bool
+    encoder: torch.nn.Module, dtype: torch.dtype, *, fsdp_wrapped: bool, device_type: str
 ) -> None:
     """Make the vision encoder compute in ``dtype`` while its parameters keep their dtype.
 
     Its floating-point buffers are cast to ``dtype``, every registered name as
-    ``Module.to`` does. A wrapped encoder's policy casts its parameters and inputs
-    for each forward; an unwrapped one gets ``_ComputeDtypeHooks``, which does the
-    same. Either way its parameters, gradients and optimizer state keep the dtype
-    the encoder was loaded in.
+    ``Module.to`` does, so they are also saved in it. A wrapped encoder's policy casts
+    its parameters and inputs for each forward. An unwrapped one gets
+    ``_ComputeInDtype`` as its ``forward``, which does the same and keeps the forward
+    out of any ``torch.autocast`` on ``device_type``. Either way its parameters,
+    gradients and optimizer state keep the dtype the encoder was loaded in.
     """
     for module in encoder.modules():
         for name, buffer in module.named_buffers(recurse=False, remove_duplicate=False):
@@ -441,9 +455,7 @@ def _set_encoder_precision(
                 setattr(module, name, buffer.to(dtype))
     if fsdp_wrapped:
         return
-    hooks = _ComputeDtypeHooks(dtype)
-    encoder.register_forward_pre_hook(hooks.pre_forward, with_kwargs=True)
-    encoder.register_forward_hook(hooks.post_forward, always_call=True)
+    encoder.forward = _ComputeInDtype(encoder, dtype, device_type)
 
 
 def _build_vlm(
@@ -565,6 +577,7 @@ def _build_vlm(
             encoder,
             encoder_dtype,
             fsdp_wrapped=isinstance(wrapper.vision_encoder, FSDPModule),
+            device_type=device.type,
         )
     transformer.to(dtype=param_dtype)
     adapter.to(dtype=param_dtype)
