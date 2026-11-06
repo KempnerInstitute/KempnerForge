@@ -85,7 +85,7 @@ def build_model(
             vision_config=config.vision_encoder,
             adapter_config=config.adapter,
             vlm_config=config.vlm,
-            frames_per_clip=(config.video.max_frames if config.video is not None else 1),
+            frames_per_clip=config.views_per_sample,
             ac_mode=tc.activation_checkpointing,
             mp_policy=mp_policy,
             param_dtype=tc.master_dtype,

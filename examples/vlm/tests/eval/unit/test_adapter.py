@@ -43,6 +43,7 @@ from kempnerforge.data.vlm_dataset import (
     DEFAULT_IMAGE_MEAN,
     DEFAULT_IMAGE_STD,
     pil_to_tensor,
+    tile_image,
 )
 from kempnerforge.model.vlm import VLMWrapper, build_vlm_wrapper
 
@@ -278,6 +279,19 @@ class TestFramesToPixelValues:
         assert from_path.shape == (1, 3, 16, 16)
         assert torch.allclose(from_path, from_pil)
 
+    def test_tiling_matches_the_training_preprocessor(self):
+        img = Image.new("RGB", (40, 24), color=(200, 30, 10))
+        pv = _frames_to_pixel_values(
+            [img], image_size=16, device=DEVICE, dtype=torch.float32, tile_grid=2
+        )
+        assert pv.shape == (1, 5, 3, 16, 16)
+        expected = tile_image(img, 16, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD, grid=2)
+        assert torch.equal(pv[0], expected)
+        crops = _frames_to_pixel_values(
+            [img], image_size=16, device=DEVICE, dtype=torch.float32, tile_grid=2, tile_global=False
+        )
+        assert crops.shape == (1, 4, 3, 16, 16)
+
 
 class TestToPil:
     def test_passthrough_pil(self):
@@ -317,6 +331,49 @@ def test_video_checkpoint_accepts_str_image_path(
         metadata={"task": "t", "doc_id": "d0", "repeats": 1},
     )
     out = vlm.generate_until([inst])
+    assert len(out) == 1 and len(out[0].split()) == 3
+
+
+def test_tiled_checkpoint_tiles_the_request_image(tmp_path, monkeypatch, tiny_vlm_configs):
+    """generate_until cuts each image into the views the checkpoint was trained on."""
+    import lmms_adapter
+    from lmms_adapter import _build_model
+
+    mc, vc, ac, lc = tiny_vlm_configs
+    job = JobConfig(
+        model=mc,
+        vision_encoder=vc,
+        adapter=ac,
+        vlm=VLMConfig(max_text_len=lc.max_text_len, tile_grid=2, tile_global=False),
+        data=DataConfig(tokenizer_path="mock"),
+    )
+    model = _build_model(job, torch.device("cpu"), torch.float32).eval()
+    _patch_loaders(monkeypatch, job, model)
+    seen: dict = {}
+    untouched = lmms_adapter._frames_to_pixel_values
+
+    def recording(frames, *args, **kwargs):
+        seen.update(kwargs)
+        return untouched(frames, *args, **kwargs)
+
+    monkeypatch.setattr("lmms_adapter._frames_to_pixel_values", recording)
+    vlm = KempnerForgeVLM(config="x", checkpoint="y", device="cpu", dtype="float32")
+    path = tmp_path / "frame.png"
+    _img(16).save(path)
+
+    def doc_to_messages(doc):
+        del doc
+        return [{"role": "user", "content": [_text("describe"), _image(str(path))]}]
+
+    vlm.task_dict = {"t": {"test": {"d0": {}}}}
+    inst = Instance(
+        request_type="generate_until",
+        arguments=("ctx", doc_to_messages, {"max_new_tokens": 3}, "d0", "t", "test"),
+        idx=0,
+        metadata={"task": "t", "doc_id": "d0", "repeats": 1},
+    )
+    out = vlm.generate_until([inst])
+    assert seen == {"tile_grid": 2, "tile_global": False}
     assert len(out) == 1 and len(out[0].split()) == 3
 
 
@@ -756,6 +813,19 @@ class TestBuildModel:
         job = _vlm_job_config(tiny_vlm_configs)
         model = _build_model(job, torch.device("cpu"), torch.float32)
         assert model.frames_per_clip == 1
+
+    def test_tiled_image_config_builds_for_its_views(self, tiny_vlm_configs):
+        mc, vc, ac, lc = tiny_vlm_configs
+        job = JobConfig(
+            model=mc,
+            vision_encoder=vc,
+            adapter=ac,
+            vlm=VLMConfig(max_text_len=8, tile_grid=2),
+            data=DataConfig(tokenizer_path="mock"),
+        )
+        model = _build_model(job, torch.device("cpu"), torch.float32)
+        assert model.frames_per_clip == job.views_per_sample == 5
+        assert model.num_image_tokens == 40
 
 
 class TestGenerateUntil:

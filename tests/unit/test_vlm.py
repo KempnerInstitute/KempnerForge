@@ -9,6 +9,7 @@ from __future__ import annotations
 import pytest
 import torch
 import torch.distributed.checkpoint as dcp
+from PIL import Image
 from torch.distributed.checkpoint.api import CheckpointException
 from torch.distributed.checkpoint.state_dict import get_model_state_dict, set_model_state_dict
 
@@ -23,6 +24,12 @@ from kempnerforge.config.vlm import (
     MoMaConfig,
     MoTConfig,
     VLMConfig,
+)
+from kempnerforge.data.vlm_dataset import (
+    DEFAULT_IMAGE_MEAN,
+    DEFAULT_IMAGE_STD,
+    VLMCollator,
+    tile_image,
 )
 from kempnerforge.model.modality import ModalityContext
 from kempnerforge.model.transformer import Transformer
@@ -516,6 +523,27 @@ def _video_wrapper(vlm_cfg, frames: int = 4, *, ffn_hidden_dim: int | None = Non
     return build_vlm_wrapper(mc, vc, ac, vlm_cfg, frames_per_clip=frames)
 
 
+class TestTiledViews:
+    def test_tiled_views_ride_the_frame_axis(self):
+        """A 2 × 2 grid plus the whole image is 5 views of 4 pooled tokens each."""
+        vlm_cfg = JointDecoderConfig(max_text_len=8, tile_grid=2)
+        wrapper = _video_wrapper(vlm_cfg, frames=vlm_cfg.views_per_image)
+        assert wrapper.num_image_tokens == 20
+        img = Image.new("RGB", (40, 24), color=(10, 20, 30))
+        views = tile_image(img, 16, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD, grid=2)
+        ids = torch.randint(0, 256, (8,))
+        samples = [{"pixel_values": views, "input_ids": ids, "labels": ids} for _ in range(2)]
+        batch = VLMCollator(pad_id=0, max_text_len=8)(samples)
+        assert batch["pixel_values"].shape == (2, 5, 3, 16, 16)
+        logits, _ = wrapper(batch["pixel_values"], batch["input_ids"], batch["labels"])
+        assert logits.shape == (2, 8, 256)
+
+    def test_view_count_mismatch_raises(self):
+        wrapper = _video_wrapper(JointDecoderConfig(max_text_len=8, tile_grid=2), frames=5)
+        with pytest.raises(ValueError, match="frames-per-clip mismatch"):
+            wrapper(torch.randn(1, 4, 3, 16, 16), torch.randint(0, 256, (1, 8)))
+
+
 class TestVideoForward:
     def test_num_image_tokens_is_frames_times_per_frame(self):
         wrapper = _video_wrapper(JointDecoderConfig(max_text_len=8), frames=4)
@@ -829,7 +857,7 @@ class TestVLMDecoupledHeadDim:
         found = [
             (n, m.head_dim)
             for n, m in w.named_modules()
-            if isinstance(m, (Attention, MoTAttention, CrossAttention))
+            if isinstance(m, Attention | MoTAttention | CrossAttention)
         ]
         assert found, f"{arch}: no attention modules found"
         assert all(hd == 32 for _, hd in found), found

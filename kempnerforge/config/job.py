@@ -98,7 +98,7 @@ class JobConfig:
             if self.vision_encoder.num_tokens > 0:
                 assert self.adapter is not None
                 per_frame = self.adapter.output_num_tokens(self.vision_encoder.num_tokens)
-                frames = self.video.max_frames if self.video is not None else 1
+                frames = self.views_per_sample
                 visual_tokens = frames * per_frame
                 residual_image_tokens = self.vlm.residual_stream_image_tokens(visual_tokens)
                 required = residual_image_tokens + self.vlm.max_text_len
@@ -113,6 +113,11 @@ class JobConfig:
             raise ValueError(
                 "[video] is set but [vlm] is missing; video training runs through "
                 "the VLM wrapper, so a [vlm] section (and [vision_encoder]) is required."
+            )
+        if self.video is not None and self.vlm is not None and self.vlm.tile_grid:
+            raise ValueError(
+                "vlm.tile_grid tiles the image path, but [video] is set; a video run "
+                "samples frames instead, so leave vlm.tile_grid at 0"
             )
 
         if self.model.attention_backend == "flex" and self.train.seq_len < FLEX_BLOCK_SIZE:
@@ -130,6 +135,15 @@ class JobConfig:
     def is_video(self) -> bool:
         """Whether this job trains on a video dataset (a VLM sub-mode)."""
         return self.video is not None
+
+    @property
+    def views_per_sample(self) -> int:
+        """Images the encoder sees per sample: a clip's frames, a tiled image's views, or one."""
+        if self.video is not None:
+            return self.video.max_frames
+        if self.vlm is not None:
+            return self.vlm.views_per_image
+        return 1
 
     def validate(self, world_size: int = 1) -> None:
         """Run cross-config validations that depend on the world size."""
@@ -273,7 +287,7 @@ class JobConfig:
             if self.vision_encoder.num_tokens > 0:
                 assert self.adapter is not None
                 per_frame = self.adapter.output_num_tokens(self.vision_encoder.num_tokens)
-                frames = self.video.max_frames if self.video is not None else 1
+                frames = self.views_per_sample
                 visual_tokens = frames * per_frame
                 residual_image_tokens = self.vlm.residual_stream_image_tokens(visual_tokens)
                 required = residual_image_tokens + self.vlm.max_text_len
