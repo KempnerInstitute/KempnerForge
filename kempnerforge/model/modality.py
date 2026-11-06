@@ -19,6 +19,18 @@ needs:
   projections + global self-attention.
 - Pipeline-parallel middle stages fill ``inputs_embeds`` (pre-embedded
   hidden state passed across stage boundaries).
+- A strategy that chooses the RoPE positions or the attention visibility
+  of the residual it lays out (an image's tokens seeing each other, crops
+  of one image sharing positions) fills ``position_ids`` and
+  ``attention_group_ids``. ``Transformer.forward`` reads them as its
+  arguments of the same names, which may not be passed alongside.
+- A strategy whose positions are not one integer per token (a 2-D or
+  multi-axis RoPE over image crops) fills ``rope_cos`` and ``rope_sin``
+  instead: the rotation itself, ``(batch, seq_len, head_dim // 2)``, which
+  the transformer applies in place of its own table. The strategy builds
+  them from ``precompute_rope_frequencies`` with the model's ``head_dim``
+  and ``rope_theta``, so the same code positions every forward, training
+  and inference alike.
 
 Cross-arg invariants involving ``kv_caches`` (a ``Transformer.forward``
 argument, not a ``ModalityContext`` field) are enforced at the top of
@@ -49,6 +61,13 @@ class ModalityContext:
     - ``key_padding_mask`` requires ``prefix_embeds`` or ``inputs_embeds``
       to be set (it is a key-validity mask over the residual sequence; the
       Cross-Attention arch masks image K/V via ``image_mask`` instead).
+    - ``position_ids`` and ``attention_group_ids`` are ``(batch, seq_len)``
+      int64 over the residual stream, with the meaning of the
+      ``Transformer.forward`` arguments of those names; the dtype and rank
+      are checked here, the shape against the residual in ``forward``.
+    - ``rope_cos`` and ``rope_sin`` come together, as floating
+      ``(batch, seq_len, head_dim // 2)`` tensors of one shape, and exclude
+      ``position_ids``; ``forward`` checks the shape against the residual.
 
     ``output_slice`` composes with the ``tokens`` path AND with the
     ``inputs_embeds`` path; it is not constrained intra-context. The
@@ -63,6 +82,10 @@ class ModalityContext:
     image_mask: torch.Tensor | None = None
     modality_ids: torch.Tensor | None = None
     key_padding_mask: torch.Tensor | None = None
+    position_ids: torch.Tensor | None = None
+    attention_group_ids: torch.Tensor | None = None
+    rope_cos: torch.Tensor | None = None
+    rope_sin: torch.Tensor | None = None
 
     def __post_init__(self) -> None:
         residual_routes = sum(
@@ -92,4 +115,45 @@ class ModalityContext:
             raise ValueError(
                 "ModalityContext: key_padding_mask requires prefix_embeds OR inputs_embeds "
                 "to be set (it masks the residual sequence; Cross-Attention uses image_mask)"
+            )
+        for name, ids in (
+            ("position_ids", self.position_ids),
+            ("attention_group_ids", self.attention_group_ids),
+        ):
+            if ids is None:
+                continue
+            if ids.dtype != torch.long:
+                raise ValueError(
+                    f"ModalityContext: {name}.dtype must be torch.int64, got {ids.dtype}"
+                )
+            if ids.dim() != 2:
+                raise ValueError(
+                    f"ModalityContext: {name} must be (batch, seq_len), got {tuple(ids.shape)}"
+                )
+        self._check_rope()
+
+    def _check_rope(self) -> None:
+        if (self.rope_cos is None) != (self.rope_sin is None):
+            raise ValueError("ModalityContext: rope_cos and rope_sin must be given together")
+        if self.rope_cos is None or self.rope_sin is None:
+            return
+        if self.position_ids is not None:
+            raise ValueError(
+                "ModalityContext: rope_cos/rope_sin and position_ids both choose the "
+                "rotation; set one"
+            )
+        for name, table in (("rope_cos", self.rope_cos), ("rope_sin", self.rope_sin)):
+            if not table.is_floating_point():
+                raise ValueError(
+                    f"ModalityContext: {name} must be floating point, got {table.dtype}"
+                )
+            if table.dim() != 3:
+                raise ValueError(
+                    f"ModalityContext: {name} must be (batch, seq_len, head_dim // 2), got "
+                    f"{tuple(table.shape)}"
+                )
+        if self.rope_cos.shape != self.rope_sin.shape:
+            raise ValueError(
+                f"ModalityContext: rope_cos {tuple(self.rope_cos.shape)} and rope_sin "
+                f"{tuple(self.rope_sin.shape)} differ in shape"
             )
