@@ -31,6 +31,16 @@ class TestDecodeRgb:
         with pytest.raises(UnreadableImageError, match="4 bytes"):
             decode_rgb(b"\x00\x01\x02\x03")
 
+    def test_truncated_data_is_unreadable(self) -> None:
+        buffer = io.BytesIO()
+        Image.new("RGB", (64, 64), (1, 2, 3)).save(buffer, format="PNG")
+        with pytest.raises(UnreadableImageError):
+            decode_rgb(buffer.getvalue()[: len(buffer.getvalue()) // 2])
+
+    def test_a_missing_file_raises_its_own_error(self, tmp_path: Path) -> None:
+        with pytest.raises(FileNotFoundError):
+            decode_rgb(tmp_path / "absent.png")
+
 
 class TestFirstReadable:
     def _read(self, unreadable: set[int]) -> Callable[[int], int]:

@@ -24,6 +24,7 @@ from .points import format_point_answer, pixels_to_percent
 logger = get_logger(__name__)
 
 MAX_POINTS = 30
+MAX_ATTEMPTS = 16
 
 
 def _jsonl(path: str | Path) -> Iterator[dict[str, Any]]:
@@ -44,7 +45,10 @@ class PixmoRows(Dataset):
     """
 
     def __init__(
-        self, image_root: str | Path, columns: dict[str, list[Any]], max_attempts: int = 16
+        self,
+        image_root: str | Path,
+        columns: dict[str, list[Any]],
+        max_attempts: int = MAX_ATTEMPTS,
     ) -> None:
         if "image" not in columns:
             raise ValueError("PixMo rows need an 'image' column")
@@ -80,8 +84,14 @@ class PixmoRows(Dataset):
 class PixmoCaptions(PixmoRows):
     """Dense captions, asked with a fixed prompt."""
 
-    def __init__(self, image_root: str | Path, columns: dict[str, list[Any]], prompt: str) -> None:
-        super().__init__(image_root, columns)
+    def __init__(
+        self,
+        image_root: str | Path,
+        columns: dict[str, list[Any]],
+        prompt: str,
+        max_attempts: int = MAX_ATTEMPTS,
+    ) -> None:
+        super().__init__(image_root, columns, max_attempts)
         self.prompt = prompt
 
     def document(self, row: dict[str, Any], image: Image.Image) -> Document:
@@ -103,9 +113,13 @@ class PixmoPointing(PixmoRows):
     """Pointing questions answered with point tags, or a not-present sentence."""
 
     def __init__(
-        self, image_root: str | Path, columns: dict[str, list[Any]], max_points: int = MAX_POINTS
+        self,
+        image_root: str | Path,
+        columns: dict[str, list[Any]],
+        max_points: int = MAX_POINTS,
+        max_attempts: int = MAX_ATTEMPTS,
     ) -> None:
-        super().__init__(image_root, columns)
+        super().__init__(image_root, columns, max_attempts)
         self.max_points = max_points
 
     def document(self, row: dict[str, Any], image: Image.Image) -> Document:
@@ -123,7 +137,8 @@ class PixmoCounting(PixmoRows):
     """Counting questions answered by pointing, then counting.
 
     ``coordinates`` names the unit the points are stored in; pixel points are
-    converted to percent of the decoded image's size.
+    converted to percent of the decoded image's size. Every point is kept unless
+    ``max_points`` caps them, so the points agree with the stated count.
     """
 
     def __init__(
@@ -131,11 +146,12 @@ class PixmoCounting(PixmoRows):
         image_root: str | Path,
         columns: dict[str, list[Any]],
         coordinates: Literal["percent", "pixels"],
-        max_points: int = MAX_POINTS,
+        max_points: int | None = None,
+        max_attempts: int = MAX_ATTEMPTS,
     ) -> None:
         if coordinates not in ("percent", "pixels"):
             raise ValueError(f"coordinates must be 'percent' or 'pixels', got {coordinates!r}")
-        super().__init__(image_root, columns)
+        super().__init__(image_root, columns, max_attempts)
         self.coordinates = coordinates
         self.max_points = max_points
 
@@ -155,18 +171,23 @@ class PixmoCounting(PixmoRows):
 
 
 def pixmo_captions(
-    annotation_file: str | Path, image_root: str | Path, prompt: str
+    annotation_file: str | Path,
+    image_root: str | Path,
+    prompt: str,
+    max_attempts: int = MAX_ATTEMPTS,
 ) -> PixmoCaptions:
     """PixMo-Cap dense captions."""
     images, captions = [], []
     for row in _jsonl(annotation_file):
         images.append(row["image"])
         captions.append(row["caption"])
-    return PixmoCaptions(image_root, {"image": images, "caption": captions}, prompt)
+    return PixmoCaptions(image_root, {"image": images, "caption": captions}, prompt, max_attempts)
 
 
 def _conversations(
-    image_root: str | Path, rows: Iterator[tuple[str, list[tuple[Any, Any]]]]
+    image_root: str | Path,
+    rows: Iterator[tuple[str, list[tuple[Any, Any]]]],
+    max_attempts: int,
 ) -> PixmoConversations:
     images, users, assistants = [], [], []
     for image, pairs in rows:
@@ -176,11 +197,13 @@ def _conversations(
             users.append([u for u, _ in kept])
             assistants.append([a for _, a in kept])
     return PixmoConversations(
-        image_root, {"image": images, "users": users, "assistants": assistants}
+        image_root, {"image": images, "users": users, "assistants": assistants}, max_attempts
     )
 
 
-def pixmo_cap_qa(annotation_file: str | Path, image_root: str | Path) -> PixmoConversations:
+def pixmo_cap_qa(
+    annotation_file: str | Path, image_root: str | Path, max_attempts: int = MAX_ATTEMPTS
+) -> PixmoConversations:
     """PixMo-CapQA, whose ``messages[i]`` ends with turn ``i``'s question and answer."""
     return _conversations(
         image_root,
@@ -195,11 +218,12 @@ def pixmo_cap_qa(annotation_file: str | Path, image_root: str | Path) -> PixmoCo
             )
             for row in _jsonl(annotation_file)
         ),
+        max_attempts,
     )
 
 
 def pixmo_point_explanations(
-    annotation_file: str | Path, image_root: str | Path
+    annotation_file: str | Path, image_root: str | Path, max_attempts: int = MAX_ATTEMPTS
 ) -> PixmoConversations:
     """PixMo point-explanations, answers with point tags already inline."""
     return _conversations(
@@ -211,11 +235,15 @@ def pixmo_point_explanations(
             )
             for row in _jsonl(annotation_file)
         ),
+        max_attempts,
     )
 
 
 def pixmo_pointing(
-    annotation_file: str | Path, image_root: str | Path, max_points: int = MAX_POINTS
+    annotation_file: str | Path,
+    image_root: str | Path,
+    max_points: int = MAX_POINTS,
+    max_attempts: int = MAX_ATTEMPTS,
 ) -> PixmoPointing:
     """PixMo-Points pointing, one example per labelled object kind."""
     columns: dict[str, list[Any]] = {"image": [], "label": [], "xs": [], "ys": []}
@@ -225,7 +253,7 @@ def pixmo_pointing(
             columns["label"].append(label)
             columns["xs"].append([float(p["x"]) for p in points])
             columns["ys"].append([float(p["y"]) for p in points])
-    return PixmoPointing(image_root, columns, max_points)
+    return PixmoPointing(image_root, columns, max_points, max_attempts)
 
 
 def pixmo_counting(
@@ -234,9 +262,10 @@ def pixmo_counting(
     *,
     multi_label: bool,
     coordinates: Literal["percent", "pixels"],
-    max_points: int = MAX_POINTS,
+    max_points: int | None = None,
+    max_attempts: int = MAX_ATTEMPTS,
 ) -> PixmoCounting:
-    """PixMo counting.
+    """PixMo counting, keeping every point of a row unless ``max_points`` caps them.
 
     ``multi_label`` rows hold parallel ``label``, ``count`` and ``points`` lists
     (PixMo-Points counting); otherwise a row is one label whose ``points`` are an
@@ -267,4 +296,4 @@ def pixmo_counting(
             columns["count"].append(count)
             columns["xs"].append(xs)
             columns["ys"].append(ys)
-    return PixmoCounting(image_root, columns, coordinates, max_points)
+    return PixmoCounting(image_root, columns, coordinates, max_points, max_attempts)
