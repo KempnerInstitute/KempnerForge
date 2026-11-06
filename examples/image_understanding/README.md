@@ -7,12 +7,6 @@ VLM with a **SigLIP2** image encoder (`google/siglip2-so400m-patch16-512`), an
 training). Everything here is entry points and their tests; `kempnerforge/`
 never imports it, so this directory can be deleted without touching the core.
 
-[`examples/vlm/`](../vlm/) stays the general VLM example: the four arches,
-video, and its evaluation CLI. This example is image-only and fixed to one
-architecture, so the recipe's remaining features (its datasets and chat
-rendering, packing, tiling, per-module learning rates, evaluation parity) land
-here without widening that example.
-
 ## Layout
 
 ```
