@@ -119,8 +119,9 @@ uv run torchrun --nproc_per_node=2 <train-script> <video-config>.toml \
 ```
 
 To switch arch, change `[vlm].arch` in the config — everything else (frame
-sampling, connector, dataset) is identical. (`arch` is resolved at config-load
-time, so it is set in the TOML, not via a `--vlm.arch=` CLI override.)
+sampling, connector, dataset) is identical. (`arch` picks the `[vlm]` config
+class when the TOML loads, so it is set in the TOML: a `--vlm.arch=` CLI
+override to another arch is rejected with an error saying so.)
 
 ## Constraints and follow-ups
 

@@ -15,9 +15,13 @@ registry.register("mlp", "my_mlp", builder_fn)
 model = registry.get("mlp", "my_mlp")(dim=4096, hidden_dim=11008)
 ```
 
-`register(category, name, obj)` fails fast on duplicate names; `get`
-raises `KeyError` with an "Available: […]" hint when a name is missing;
-`list(category)` returns registered names.
+`register(category, name, obj)` fails fast on duplicate names, with a
+`ValueError` naming the module that registered the name and the module
+registering it again, each with the module that defines the registered
+function or class when that is another one (a shared helper or an
+`__init_subclass__` hook registers for every plugin that uses it);
+`get` raises `KeyError` with an "Available: […]" hint when a name is
+missing; `list(category)` returns registered names.
 
 ## The seven categories
 
@@ -35,7 +39,27 @@ The `mlp` case is the only one that isn't a direct string match:
 `build_mlp` in
 [`kempnerforge/model/mlp.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/model/mlp.py)
 maps `activation="silu"` → `swiglu`, `"gelu"` → `standard_gelu`,
-`"relu"` → `standard_relu` before calling `registry.get("mlp", …)`.
+`"relu"` → `standard_relu` before calling `registry.get("mlp", …)`,
+and looks any other `activation` up as an `mlp` key directly.
+
+`scheduler.name`, `model.norm_type` and `model.activation` are typed as
+enums (`SchedulerType`, `NormType`, `Activation`), and a built-in name
+loads as the enum member. The loader also accepts any other name
+registered in the field's category (`scheduler`, `norm`, `mlp`) and
+keeps it as a plain string; a name that is neither raises a
+`ValueError` listing the members and the registered names. The
+registration has to run before `load_config`, which is what the
+`plugins` key below is for.
+
+`model.activation` has two limits. Core's own `mlp` keys (`swiglu`,
+`standard_gelu`, `standard_relu`) are rejected, with a pointer to the
+activation that selects each (`silu`, `gelu`, `relu`), whatever was
+imported first. And a plugin's MLP is rejected when `num_experts > 0`:
+the MoE expert kernels (grouped GEMM, packed experts, and expert
+parallelism, which uses both), MoT's included, compute core's SwiGLU or
+standard MLP from the expert weights rather than calling the expert
+module. MoMa's experts call each expert module, so a plugin's MLP runs
+there as written.
 
 ## Consumers
 
@@ -119,9 +143,10 @@ dataset_type = "my_corpus"   # registered by the module above
 
 That ordering is the point: the `__post_init__` validators that resolve
 a name against the registry (`video.dataset_type`, `adapter.type`,
-`vision_encoder.type`, …) run during the overlay, so a later import
-would be too late. It keeps experiments standalone: a run registers
-its own components without any core module importing them.
+`vision_encoder.type`, …) and the loader's check of `scheduler.name`,
+`model.norm_type` and `model.activation` run during the overlay, so a
+later import would be too late. It keeps experiments standalone: a run
+registers its own components without any core module importing them.
 
 Modules have to be on `sys.path`. The launch directory is *not* — a
 module that sits next to the run needs `PYTHONPATH=<its dir>`. A module
@@ -130,6 +155,12 @@ the repo root on `sys.path`; anything outside the repo must be installed
 or on `PYTHONPATH`. A missing or failing module raises a
 `ValueError` naming it, and `--plugins=["pkg.mod"]` overrides the TOML
 list like any other field.
+
+A plugin that registers a name another module already registered fails
+the same way, and the error names both modules. Some categories are
+filled only when core first imports the module that registers them, so
+a plugin imported earlier takes the name, and the error is raised at
+that later import instead, still naming the plugin as the owner.
 
 Four rules for plugin authors, all from the distributed contract:
 

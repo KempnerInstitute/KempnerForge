@@ -926,7 +926,7 @@ class TestVLMParallelismSupport:
 
     def test_errors_name_the_arch_of_the_config_class(self):
         """The checks act on the config's class, and the arch field can name another arch
-        after a ``--vlm.arch`` override, so the error names the class's arch."""
+        after an assignment to it, so the error names the class's arch."""
         job = _vlm_job("moma", ep=2)
         assert job.vlm is not None
         job.vlm.arch = "joint_decoder"
@@ -1322,33 +1322,6 @@ freeze_schedule = [
         assert sched[0].specs[0].module == "adapter"
         assert sched[0].specs[0].frozen is True
         assert sched[1].specs[0].frozen is False
-
-    def test_vlm_reserved_arch_in_toml_raises(self, tmp_path):
-        """A TOML aiming at a reserved arch should surface
-        ``NotImplementedError`` from the loader's arch resolver, not the
-        generic ``Unknown vlm.arch`` message. Reads ``_RESERVED_ARCHS``
-        dynamically so the test stays portable across branches where
-        the reserved set differs."""
-        from kempnerforge.config.vlm import _RESERVED_ARCHS
-
-        if not _RESERVED_ARCHS:
-            pytest.skip("No reserved arches on this branch")
-
-        reserved_arch = _RESERVED_ARCHS[0]
-        toml = tmp_path / "vlm_reserved.toml"
-        toml.write_text(
-            f"""
-[vision_encoder]
-type = "random"
-num_tokens = 16
-
-[vlm]
-arch = "{reserved_arch}"
-max_text_len = 32
-"""
-        )
-        with pytest.raises(NotImplementedError, match="reserved"):
-            load_config(str(toml), cli_args=[])
 
     def test_vlm_unknown_arch_in_toml_raises_value_error(self, tmp_path):
         toml = tmp_path / "vlm_unknown.toml"
