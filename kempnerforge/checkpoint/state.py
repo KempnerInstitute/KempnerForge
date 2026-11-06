@@ -65,13 +65,14 @@ def _scheduler_state_for(
 
     A scheduler state lists some entries per param group, such as its base rate, in the order
     of the groups it was saved with, and ``saved_modules`` names the module of each of those
-    groups (None for a state saved when no group named one). Which groups ``build_optimizer``
-    makes for ``optimizer.lr_multipliers`` depends on which parameters are trainable and on
-    ``optimizer.weight_decay_scope``, since it leaves out groups with no parameters, while
-    every group of one module has that module's rate. So when either side names a module and
-    the saved groups' modules differ from the current ones, each current group takes the
-    entries of the first saved group of its module, groups that name no module matching each
-    other, and a group whose module has no saved group keeps its own. Otherwise, or when the
+    groups; without it, as in a state saved when no group named one, no saved group has one.
+    Which groups ``build_optimizer`` makes for ``optimizer.lr_multipliers`` depends on which
+    parameters are trainable and on ``optimizer.weight_decay_scope``, since it leaves out
+    groups with no parameters, while every group of one module has that module's rate. So
+    when the saved groups' modules differ from the current ones, in name or in number, each
+    current group takes the entries of the first saved group of its module, groups that name
+    no module matching each other, and a group whose module has no saved group keeps its own.
+    Otherwise, or when ``scheduler`` has no optimizer and nothing records a module, or the
     state lists no base rates, ``saved`` is returned as it is.
 
     Raises:
@@ -81,9 +82,7 @@ def _scheduler_state_for(
     """
     current = _group_modules(scheduler)
     base_lrs = saved.get("base_lrs")
-    if not isinstance(base_lrs, list) or (
-        saved_modules is None and not any(module is not None for module in current or ())
-    ):
+    if not isinstance(base_lrs, list) or (saved_modules is None and current is None):
         return saved
     if saved_modules is None:
         saved_modules = [None] * len(base_lrs)

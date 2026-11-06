@@ -104,9 +104,8 @@ checkpoints saved without them. From a training checkpoint, that leaves:
   another module, or `weight_decay_scope` changed. `train_state.pt` records the module of
   each group the scheduler state belongs to, so each group resumes at its module's saved
   rate, and a group of a module the checkpoint holds no group of starts at its configured
-  rate. A load that also restores the optimizer state into groups laid out otherwise goes
-  ahead only while every group finds its saved settings at its own position; otherwise it
-  stops before loading anything and names this warm start.
+  rate. A load that also restores the optimizer state into groups laid out otherwise stops
+  on every rank before loading anything, and names this warm start.
 - Not a stage that changes the multipliers or their patterns. Every resume and warm start
   restores `train_state.pt`, scheduler state included, since `checkpoint.exclude_from_loading`
   takes only `"model"` and `"optimizer"`. Such a stage needs a warm start from the weights

@@ -94,6 +94,7 @@ class TestConfig:
             (0.5, "must map module names to numbers"),
             ({1: 0.5}, "keys must be module names"),
             ({"": 0.5}, "keys must be module names"),
+            ({"a/b": 0.5}, "keys must be module names without '/'"),
             ({"adapter": True}, r"lr_multipliers\['adapter'\] must be a positive finite"),
             ({"adapter": "2"}, r"lr_multipliers\['adapter'\] must be a positive finite"),
             ({"adapter": 0}, r"lr_multipliers\['adapter'\] must be a positive finite"),
@@ -101,7 +102,18 @@ class TestConfig:
             ({"adapter": math.nan}, r"lr_multipliers\['adapter'\] must be a positive finite"),
             ({"adapter": math.inf}, r"lr_multipliers\['adapter'\] must be a positive finite"),
         ],
-        ids=["not-a-dict", "int-key", "empty-key", "bool", "str", "zero", "negative", "nan", "inf"],
+        ids=[
+            "not-a-dict",
+            "int-key",
+            "empty-key",
+            "slash",
+            "bool",
+            "str",
+            "zero",
+            "negative",
+            "nan",
+            "inf",
+        ],
     )
     def test_invalid_multipliers_are_refused(self, value, match):
         with pytest.raises(ValueError, match=match):
@@ -805,6 +817,47 @@ class TestResume:
             manager.load(scheduler=scheduler)
         assert calls[-1] == ("broadcast", 0, [(None, "OSError: disk gone")])
 
+    def test_a_refusal_on_another_rank_stops_this_one_before_loading(self, tmp_path, monkeypatch):
+        """With multipliers, the ranks agree on the optimizer checks before any rank loads."""
+        import kempnerforge.checkpoint.manager as mgr_mod
+
+        self._save(tmp_path, {"head": 2.0})
+        model, scheduler, manager = self._resume(tmp_path, {"head": 2.0})
+        record = ({"head": 2.0}, {"head": ["output_head.*"]})
+        calls = self._as_rank(monkeypatch, manager, 1, sent=[(record, None)])
+
+        def all_reduce(flags, group=None):
+            calls.append(("all_reduce", group, flags.tolist()))
+            if flags.dim() == 1:
+                flags[0] = 1
+
+        monkeypatch.setattr(mgr_mod.dist, "all_reduce", all_reduce)
+        before = [p.detach().clone() for p in model.parameters()]
+        with pytest.raises(RuntimeError, match=r"Checkpoint load failed on ranks \[0\]"):
+            manager.load(scheduler=scheduler)
+        assert calls[-1] == ("all_reduce", "GLOO_GROUP", [0, 0])
+        assert all(torch.equal(b, p) for b, p in zip(before, model.parameters(), strict=True))
+        assert scheduler.last_epoch == 0
+
+    @pytest.mark.parametrize("multipliers", [{}, {"head": 2.0}], ids=["none", "listed"])
+    def test_only_a_run_with_multipliers_agrees_on_the_optimizer_checks(
+        self, tmp_path, monkeypatch, multipliers
+    ):
+        import kempnerforge.checkpoint.manager as mgr_mod
+
+        self._save(tmp_path, multipliers)
+        _, scheduler, manager = self._resume(tmp_path, multipliers)
+        calls = self._as_rank(monkeypatch, manager, 0)
+
+        def reached(*_args, **_kwargs):
+            raise _ReachedTheModel
+
+        monkeypatch.setattr(mgr_mod.dcp, "load", reached)
+        with pytest.raises(_ReachedTheModel):
+            manager.load(scheduler=scheduler)
+        agreed = [c for c in calls if c[0] == "all_reduce" and c[2] == [0, 0]]
+        assert agreed == ([("all_reduce", "GLOO_GROUP", [0, 0])] if multipliers else [])
+
     def test_every_rank_checks_the_scheduler_state_rank_zero_sent(self, tmp_path, monkeypatch):
         """Each rank decides from the train state rank 0 broadcast, so all check or none do."""
         step_dir = self._save(tmp_path, {"head": 2.0})
@@ -842,7 +895,7 @@ class TestLayoutChange:
     }
 
     @classmethod
-    def _build(cls, name, frozen, scope):
+    def _build(cls, name, frozen, scope, multipliers=None):
         model = _vlm_like()
         for module in frozen:
             getattr(model, module).requires_grad_(False)
@@ -852,7 +905,7 @@ class TestLayoutChange:
             muon_adam_lr=cls.ADAM_LR,
             fused=False,
             weight_decay_scope=scope,
-            lr_multipliers=cls.MULTIPLIERS,
+            lr_multipliers=cls.MULTIPLIERS if multipliers is None else multipliers,
         )
         optimizer = build_optimizer(model, config, module_patterns=VLM_PATTERNS)
         schedule = SchedulerConfig(warmup_steps=2, min_lr_ratio=0.1)
@@ -867,12 +920,12 @@ class TestLayoutChange:
             scheduler.step()
 
     @classmethod
-    def _manager(cls, tmp_path, model, optimizer):
+    def _manager(cls, tmp_path, model, optimizer, multipliers=None):
         return CheckpointManager(
             CheckpointConfig(dir=str(tmp_path)),
             model,
             optimizer,
-            lr_multipliers=cls.MULTIPLIERS,
+            lr_multipliers=cls.MULTIPLIERS if multipliers is None else multipliers,
             module_patterns=VLM_PATTERNS,
         )
 
@@ -915,31 +968,45 @@ class TestLayoutChange:
         self._train(model, optimizer, scheduler, 1)
         self._assert_module_rates(optimizer, scheduler)
 
-    @pytest.mark.parametrize("name", ["adamw", "lion"])
-    def test_a_resume_with_a_module_frozen_keeps_the_others_state(self, tmp_path, name):
-        """The optimizer state of the groups still trained loads; their rates stay their own."""
-        model, optimizer, scheduler = self._build(name, set(), self.DEFAULT_SCOPE)
+    @pytest.mark.parametrize("name", RESUMABLE_OPTIMIZERS)
+    def test_groups_of_no_module_that_change_in_number_resume_at_their_rate(self, tmp_path, name):
+        """With every listed module frozen no group names a module, and the scope sets how
+        many groups hold the rest."""
+        multipliers = {"vision_encoder": 0.1}
+        frozen = {"vision_encoder"}
+        model, optimizer, scheduler = self._build(name, frozen, "all", multipliers)
         self._train(model, optimizer, scheduler, 4)
-        self._manager(tmp_path, model, optimizer).save(step=4, scheduler=scheduler)
-        adapter_state = {k: v.clone() for k, v in optimizer.state[model.adapter.weight].items()}
+        self._manager(tmp_path, model, optimizer, multipliers).save(step=4, scheduler=scheduler)
+        saved_layout = self._group_layout(optimizer)
 
-        model, optimizer, scheduler = self._build(name, {"vision_encoder"}, self.DEFAULT_SCOPE)
-        assert self._manager(tmp_path, model, optimizer).load(scheduler=scheduler)[0] == 4
-        for key, value in adapter_state.items():
-            assert torch.equal(optimizer.state[model.adapter.weight][key], value)
+        model, optimizer, scheduler = self._build(name, frozen, self.DEFAULT_SCOPE, multipliers)
+        assert self._group_layout(optimizer) != saved_layout
+        step, _, _ = self._manager(tmp_path, model, optimizer, multipliers).load(
+            scheduler=scheduler, exclude_keys=["optimizer"]
+        )
+        assert step == 4
         self._train(model, optimizer, scheduler, 1)
         self._assert_module_rates(optimizer, scheduler)
 
     @pytest.mark.parametrize(
-        ("name", "frozen"), [("muon", "vision_encoder"), ("adamw", "transformer")]
+        ("name", "saved", "resumed"),
+        [
+            ("adamw", set(), {"vision_encoder"}),
+            ("lion", set(), {"adapter"}),
+            ("muon", set(), {"vision_encoder"}),
+            ("adamw", {"vision_encoder"}, {"transformer"}),
+        ],
+        ids=["last-module-frozen", "middle-module-frozen", "muon", "as-many-groups"],
     )
-    def test_a_resume_whose_groups_moved_is_refused_before_loading(self, tmp_path, name, frozen):
-        """A saved group's settings sit at its position, so a moved group cannot find its own."""
-        model, optimizer, scheduler = self._build(name, set(), self.DEFAULT_SCOPE)
+    def test_a_resume_into_other_groups_is_refused_before_loading(
+        self, tmp_path, name, saved, resumed
+    ):
+        """Saved settings sit at their group's position, so other groups cannot take them."""
+        model, optimizer, scheduler = self._build(name, saved, self.DEFAULT_SCOPE)
         self._train(model, optimizer, scheduler, 4)
         self._manager(tmp_path, model, optimizer).save(step=4, scheduler=scheduler)
 
-        model, optimizer, scheduler = self._build(name, {frozen}, self.DEFAULT_SCOPE)
+        model, optimizer, scheduler = self._build(name, resumed, self.DEFAULT_SCOPE)
         before = [p.detach().clone() for p in model.parameters()]
         torch.rand(1)
         rng = torch.get_rng_state()

@@ -358,34 +358,50 @@ def _check_saved_state_matches(
 def _check_saved_param_groups(
     optim_state: dict[str, Any], saved_keys: Collection[str], where: Path
 ) -> None:
-    """Fail if the checkpoint lacks a setting of a param group this run's optimizers hold.
+    """Fail unless the checkpoint holds the param groups this run's optimizers hold.
 
     A checkpoint keeps each param group's settings under the group's position among its
-    optimizers' groups. When the groups are laid out otherwise than at the save, as under
-    ``optimizer.lr_multipliers`` when other parameters are trainable, a position can hold a
-    group of another optimizer, or one without the module this run's group names, and the
-    load would otherwise stop on the first setting it does not find. Checked only when this
-    run's groups or the saved ones name a module, the only groups whose layout varies.
+    optimizers' groups, and the load maps a loaded group to this run's by the parameters it
+    lists. When the groups are laid out otherwise than at the save, as under
+    ``optimizer.lr_multipliers`` when other parameters are trainable, a position can hold
+    another group, and a group can come back without settings. Checked only when this run's
+    groups or the saved ones name a module, the only groups whose layout varies: the
+    checkpoint must hold as many groups, each with every setting of this run's group there.
     """
+    groups = optim_state["param_groups"]
     names_module = any(
         key.startswith(_OPTIM_PARAM_GROUPS_PREFIX) and key.endswith(".module") for key in saved_keys
     )
-    if not names_module and not any("module" in group for group in optim_state["param_groups"]):
+    if not names_module and not any("module" in group for group in groups):
         return
-    for index, group in enumerate(optim_state["param_groups"]):
-        missing = sorted(
-            key for key in group if f"{_OPTIM_PARAM_GROUPS_PREFIX}{index}.{key}" not in saved_keys
-        )
-        if missing:
-            raise RuntimeError(
-                f"{where} has no {missing} in optimizer param group {index}, which this run's "
-                "group there holds: the param groups are laid out otherwise than at the save, as "
-                "when other parameters are trainable under optimizer.lr_multipliers, or their "
-                "settings changed. Resume with the parameters trained at the save, or continue "
-                "from these weights with a fresh optimizer: set checkpoint.load_path to this "
-                "checkpoint and checkpoint.exclude_from_loading = "
-                '["optimizer"], with a checkpoint.dir that holds no checkpoint yet.'
-            )
+    saved_count = _saved_optimizer_param_groups(saved_keys)
+    if saved_count != len(groups):
+        found = f"holds {saved_count} optimizer param groups, and this run {len(groups)}"
+    else:
+        for index, group in enumerate(groups):
+            prefix = f"{_OPTIM_PARAM_GROUPS_PREFIX}{index}."
+            missing = sorted(key for key in group if f"{prefix}{key}" not in saved_keys)
+            if missing:
+                found = f"has no {missing} in optimizer param group {index}, which this run's has"
+                break
+        else:
+            return
+    raise RuntimeError(
+        f"{where} {found}: the param groups are laid out otherwise than at the save, as when "
+        "other parameters are trainable under optimizer.lr_multipliers, or their settings "
+        "changed. Resume with the parameters trained at the save, or continue from these "
+        "weights with a fresh optimizer: set checkpoint.load_path to this checkpoint and "
+        'checkpoint.exclude_from_loading = ["optimizer"], with a checkpoint.dir that holds '
+        "no checkpoint yet."
+    )
+
+
+def _check_saved_optimizer(
+    optim_state: dict[str, Any], saved_keys: Collection[str], where: Path
+) -> None:
+    """Run the checks the checkpoint's optimizer state must pass before anything loads."""
+    _check_saved_state_matches(optim_state, saved_keys, where)
+    _check_saved_param_groups(optim_state, saved_keys, where)
 
 
 def _load_train_state(path: Path) -> dict[str, Any]:
@@ -517,7 +533,9 @@ class CheckpointManager:
             rank when it restores the checkpoint's optimizer state on any rank, before anything
             is loaded, or the scheduler state in its ``train_state.pt``, before anything from
             that file is restored. A load that restores neither goes ahead. A checkpoint that
-            records none counts as saved without multipliers.
+            records none counts as saved without multipliers. With multipliers set, a load that
+            restores optimizer state into param groups laid out otherwise than at the save
+            raises on every rank before anything is loaded.
         module_patterns: Module name to fnmatch patterns, such as ``VLMConfig.module_patterns``.
             Required for every module ``lr_multipliers`` lists.
     """
@@ -639,11 +657,11 @@ class CheckpointManager:
         if self._pp_rank is not None:
             self._agree(error)
 
-    def _agree(self, error: BaseException | None) -> None:
+    def _agree(self, error: BaseException | None, action: str = "save") -> None:
         """Barrier on the manager's dedicated gloo group that raises on every rank if any failed.
 
-        Every rank passes the error its own part of the save raised, or ``None``.
-        A rank with an error re-raises it; when any rank has one, every other rank
+        Every rank passes the error its own part of the ``action``, a save or a load, raised,
+        or ``None``. A rank with an error re-raises it; when any rank has one, every other rank
         raises a ``RuntimeError`` naming the ranks that failed, so no rank is left
         waiting in a later collective for a rank that has raised. The group is not
         the default process group that DCP's async-save background thread issues
@@ -659,7 +677,7 @@ class CheckpointManager:
         if error is not None:
             raise error
         if failed:
-            raise RuntimeError(f"Checkpoint save failed on ranks {failed}")
+            raise RuntimeError(f"Checkpoint {action} failed on ranks {failed}")
 
     def set_tracking_source(self, source: TrackingSource | None) -> None:
         """Record the logging runs ``source`` reports in every later ``metadata.json``.
@@ -1036,6 +1054,7 @@ class CheckpointManager:
         optimizers = self._optimizers_saved_in(dcp_dir, saved_keys) if load_optim else []
         if load_model:
             dcp_state["model"] = get_model_state_dict(self.model)
+        check_error: BaseException | None = None
         if load_optim:
             dcp_state["optimizer"] = get_optimizer_state_dict(self.model, optimizers)
             filled = _drop_legacy_group_keys(dcp_state["optimizer"], optimizers, saved_keys)
@@ -1044,8 +1063,13 @@ class CheckpointManager:
                     f"{dcp_dir} is missing optimizer param-group keys {sorted(filled)}; "
                     f"resuming with {filled}"
                 )
-            _check_saved_state_matches(dcp_state["optimizer"], saved_keys, dcp_dir)
-            _check_saved_param_groups(dcp_state["optimizer"], saved_keys, dcp_dir)
+            check_error = _attempt(
+                _check_saved_optimizer, dcp_state["optimizer"], saved_keys, dcp_dir
+            )
+        if self._lr_multipliers:
+            self._agree(check_error, action="load")
+        elif check_error is not None:
+            raise check_error
 
         if dcp_state:
             planner = _NeverSteppedStatePlanner()
