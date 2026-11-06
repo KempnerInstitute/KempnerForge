@@ -18,13 +18,28 @@ Field summary:
   image. ``0`` means "infer at build time". When ``> 0`` it is cross-
   checked against ``model.max_seq_len`` at config time inside
   ``JobConfig.__post_init__``.
+- ``mixed_precision`` is the dtype the encoder computes in (``"bf16"`` or
+  ``"fp32"``), independent of ``train.mixed_precision``, for image and video
+  runs alike. Its parameters, gradients and optimizer state keep the dtype
+  the encoder was loaded in, on any number of GPUs, and its floating-point
+  buffers take the set dtype. Unset, the encoder keeps the default: an
+  FSDP2-wrapped encoder computes in the language model's dtype, and an
+  unwrapped one in its loaded dtype. It applies to the training build
+  (``build_parallel_model``); ``build_vlm_wrapper`` leaves every dtype to
+  its caller.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, Literal
 
 from kempnerforge.config.registry import registry
+
+if TYPE_CHECKING:
+    import torch
+
+_MIXED_PRECISIONS = ("bf16", "fp32")
 
 
 @dataclass
@@ -35,6 +50,7 @@ class VisionEncoderConfig:
     path: str = ""
     feature_dim: int = 0
     num_tokens: int = 0
+    mixed_precision: Literal["bf16", "fp32"] | None = None
 
     def __post_init__(self) -> None:
         import kempnerforge.model.vision  # noqa: F401, PLC0415
@@ -52,3 +68,17 @@ class VisionEncoderConfig:
             raise ValueError(
                 f"vision_encoder.num_tokens must be non-negative (got {self.num_tokens})"
             )
+        if self.mixed_precision is not None and self.mixed_precision not in _MIXED_PRECISIONS:
+            raise ValueError(
+                f"vision_encoder.mixed_precision must be one of {list(_MIXED_PRECISIONS)} "
+                f"or unset (got {self.mixed_precision!r})"
+            )
+
+    @property
+    def param_dtype(self) -> torch.dtype | None:
+        """The dtype the encoder computes in, or ``None`` when ``mixed_precision`` is unset."""
+        if self.mixed_precision is None:
+            return None
+        import torch
+
+        return {"bf16": torch.bfloat16, "fp32": torch.float32}[self.mixed_precision]

@@ -20,6 +20,24 @@ Two levels:
 Both wraps share the same `MixedPrecisionPolicy` and
 `reshard_after_forward` setting.
 
+A VLM is wrapped component by component: the blocks, the transformer
+root, the adapter, and the vision encoder unless it is fully frozen.
+The encoder's unit takes the language model's policy by default. With
+`[vision_encoder] mixed_precision = "bf16"` or `"fp32"` it gets
+`default_mp_policy` of that dtype instead, so the encoder computes in
+that dtype while its parameters, gradients and optimizer state keep the
+dtype it was loaded in. An encoder FSDP2 does not wrap (frozen, or a
+run without a `dp_shard` or `dp_replicate` dimension, such as one GPU)
+gets the same from forward hooks: each forward runs on copies of its
+parameters cast to that dtype, with its floating-point inputs cast too,
+and autograd returns the gradients to the parameters in their own
+dtype. Either way its floating-point buffers are cast to the set dtype,
+so one GPU and many store, update and compute the encoder alike. Image
+and video runs build the same encoder, so the setting covers every
+frame of a clip. It applies to the training build
+(`build_parallel_model`); `build_vlm_wrapper` builds an unsharded model
+and leaves every dtype to its caller.
+
 ## HSDP
 
 Both wraps use `get_dp_mesh(device_mesh)`. With `dp_replicate > 1` and
