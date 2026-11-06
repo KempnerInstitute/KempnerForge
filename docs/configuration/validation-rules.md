@@ -212,8 +212,13 @@ File:
 
   A plugin adapter whose builder reads a `**kwargs` and registers no
   `accepts` accepts every field.
-  The check runs as the TOML and CLI overrides land, so a setting the
-  adapter would drop stops the run before `init_distributed`.
+  The check runs once the TOML is applied and again once the CLI overrides
+  land, so a setting the adapter would drop stops the run before
+  `init_distributed`. The first run sees the TOML alone, so its adapter
+  fields must fit its own `type`, and a type switched on the command line
+  needs the fields it does not use reset there too
+  (`--adapter.hidden_dim=0 --adapter.pre_norm=`); see
+  [Config sections](config-sections.md#adapter-adapterconfig).
 
 ## Cross-section rules — `JobConfig.validate(world_size)`
 

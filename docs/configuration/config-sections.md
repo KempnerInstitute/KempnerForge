@@ -391,6 +391,32 @@ hidden_dim = 1152
 pre_norm = "rmsnorm"
 ```
 
+`hidden_dim` picks the `avgpool` head, and the head fixes the adapter's
+checkpoint keys. `hidden_dim = 0` builds the single `Linear`, saved as
+`adapter.proj.weight` and `adapter.proj.bias`. A positive `hidden_dim` builds
+the MLP head, saved as `adapter.proj.proj1.*` and `adapter.proj.proj2.*`, plus
+`adapter.proj.ln_q.*` when `pre_norm` is set. A checkpoint loads only into
+the head it was saved with: the other head fails the load with `Missing key
+in checkpoint state_dict` naming one of its parameters. To resume a
+checkpoint saved with the single `Linear`, set `hidden_dim = 0` and leave
+`activation` and `pre_norm` at their defaults.
+
+A command-line override sets a value and never restores a default, so
+switching `adapter.type` on the command line keeps every other field the TOML
+sets. Reset the ones the new type does not use in the same command; an empty
+value sets the empty string. For a TOML with `type = "mlp_2layer"`,
+`hidden_dim = 2048` and `pre_norm = "rmsnorm"`:
+
+```bash
+--adapter.type=attentional_pool --adapter.hidden_dim=0 --adapter.pre_norm=
+```
+
+The TOML is checked on its own before the overrides apply, so its fields must
+fit its own `type`. A TOML with `type = "attentional_pool"` and
+`hidden_dim = 1152` fails to load even with `--adapter.type=avgpool`: set the
+type and its fields in the same layer, both in the TOML or both on the
+command line.
+
 ## Where to read next
 
 - [CLI overrides](cli-overrides.md) — reshape any of these fields from

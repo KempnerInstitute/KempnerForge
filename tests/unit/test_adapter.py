@@ -1255,6 +1255,27 @@ class TestAdapterConfigRejectsUnusedFields:
         assert cfg.adapter is not None
         assert (cfg.adapter.hidden_dim, cfg.adapter.pre_norm) == (24, "rmsnorm")
 
+    def test_a_cli_type_switch_resets_the_toml_fields_the_new_type_does_not_use(self, tmp_path):
+        """An override sets a value and never restores a default, so the switch
+        fails until the same command resets those fields; an empty value sets
+        the empty string."""
+        path = tmp_path / "adapter.toml"
+        path.write_text('[adapter]\ntype = "mlp_2layer"\nhidden_dim = 2048\npre_norm = "rmsnorm"\n')
+        switch = ["--adapter.type=attentional_pool"]
+        with pytest.raises(
+            ValueError,
+            match=r"adapter\.type = 'attentional_pool' does not use adapter\.hidden_dim = 2048, "
+            r"adapter\.pre_norm = 'rmsnorm'",
+        ):
+            load_config(path, cli_args=switch)
+        cfg = load_config(path, cli_args=[*switch, "--adapter.hidden_dim=0", "--adapter.pre_norm="])
+        assert cfg.adapter is not None
+        assert (cfg.adapter.type, cfg.adapter.hidden_dim, cfg.adapter.pre_norm) == (
+            "attentional_pool",
+            0,
+            "",
+        )
+
     def test_a_cli_override_of_an_unused_field_is_rejected(self, tmp_path):
         path = tmp_path / "adapter.toml"
         path.write_text('[adapter]\ntype = "mlp_2layer"\n')
