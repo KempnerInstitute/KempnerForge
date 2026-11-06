@@ -638,7 +638,6 @@ class Transformer(nn.Module):
         return h
 
 
-@registry.register_model("transformer")
 def _argument_or_context(
     name: str, argument: torch.Tensor | None, modality: ModalityContext | None
 ) -> torch.Tensor | None:
@@ -651,5 +650,6 @@ def _argument_or_context(
     return argument if argument is not None else from_context
 
 
+@registry.register_model("transformer")
 def _build_transformer(model_config: ModelConfig) -> Transformer:
     return Transformer(model_config)
