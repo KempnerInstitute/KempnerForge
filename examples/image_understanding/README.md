@@ -76,6 +76,18 @@ attend causally; per-document positions and bidirectional image attention are
 follow-ups on the core's explicit position ids and attention groups. A
 `[video]` run and the other arches do not pack.
 
+## Mix in text-only documents
+
+Image-text mixes often carry documents without an image, such as FineVision's
+`text_*` subsets. With `data.hf_allow_text_only = true`, a row whose image
+column is `None` or an empty list is a text-only document. Without packing it
+takes a blank image and a `frame_mask` entry of `False`, so its image tokens
+are hidden from attention; with packing it is just its text, and a micro-batch
+of nothing but text carries no images. Either way the vision encoder and
+adapter run on every rank, on a blank image when there is nothing else, because
+their FSDP2 collectives need every rank to take part. Without the flag such a
+row raises.
+
 ## Start from the pretrained backbone
 
 Stage 1 warm-starts from a checkpoint that holds the pretrained Qwen3-0.6B
@@ -107,7 +119,6 @@ or in core where it belongs:
   and the mixture loader
 - Typed stage contract and pinned source manifest, which fix the stage presets
 - Starting stage 2 from stage 1's weights alone, with a fresh step and schedule
-- Text-only documents in image-text batches
 - Documents with several images
 - Tiling into a global view and a 3 × 3 grid of crops (stage 2)
 - Per-module learning rates and schedules
