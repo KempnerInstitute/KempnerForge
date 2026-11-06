@@ -38,6 +38,44 @@ with `vlm.arch = "joint_decoder"`, `vision_encoder.type = "siglip2"` and
 32 × 32 = 1024 patch tokens, pooled 2 × 2 to 256 visual tokens, plus
 `max_text_len = 256` text tokens, so `max_seq_len = 512`.
 
+## Pack documents
+
+By default every row holds one document: its image tokens, then its text
+right-padded to `vlm.max_text_len`. With `data.pack_sequences = true` on a
+`joint_decoder` run, `PackedVLMCollator` packs the `train.batch_size` documents
+of each micro-batch first-fit into rows of `train.seq_len` instead. Each
+document is its image's token slots followed by its real text, `doc_ids` keeps
+attention inside a document, and the wrapper writes each image's tokens over
+its slots (`ModalityContext.inline_embeds`). The number of rows follows the
+documents' lengths, so it varies between micro-batches.
+
+```toml
+[vision_encoder]
+type = "siglip2"
+path = "google/siglip2-so400m-patch16-512"
+num_tokens = 1024          # the packer needs the count before the encoder is built
+
+[adapter]
+type = "avgpool"
+pool_window = 2            # 256 tokens per image in the row
+
+[vlm]
+arch = "joint_decoder"
+max_text_len = 256         # per-document text cap
+
+[data]
+pack_sequences = true
+
+[train]
+seq_len = 2048             # row length; batch_size documents per micro-batch
+```
+
+`attention_backend = "flex"` makes the packed mask block-sparse. Positions run
+through the row without restarting per document, and the views of an image
+attend causally; per-document positions and bidirectional image attention are
+follow-ups on the core's explicit position ids and attention groups. A
+`[video]` run and the other arches do not pack.
+
 ## Start from the pretrained backbone
 
 Stage 1 warm-starts from a checkpoint that holds the pretrained Qwen3-0.6B
@@ -69,7 +107,6 @@ or in core where it belongs:
   and the mixture loader
 - Typed stage contract and pinned source manifest, which fix the stage presets
 - Starting stage 2 from stage 1's weights alone, with a fresh step and schedule
-- Packing image-text documents into one sequence
 - Text-only documents in image-text batches
 - Documents with several images
 - Tiling into a global view and a 3 × 3 grid of crops (stage 2)

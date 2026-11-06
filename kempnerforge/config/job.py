@@ -114,6 +114,15 @@ class JobConfig:
                 "[video] is set but [vlm] is missing; video training runs through "
                 "the VLM wrapper, so a [vlm] section (and [vision_encoder]) is required."
             )
+        if self.data.pack_sequences and self.vlm is not None:
+            if self.video is not None:
+                raise ValueError("data.pack_sequences is not supported with [video]")
+            if self.vlm.arch != "joint_decoder":
+                raise ValueError(
+                    "data.pack_sequences on a VLM run requires vlm.arch='joint_decoder' "
+                    f"(got {self.vlm.arch!r}); the other arches place image tokens as a "
+                    "prefix only"
+                )
 
         if self.model.attention_backend == "flex" and self.train.seq_len < FLEX_BLOCK_SIZE:
             raise ValueError(

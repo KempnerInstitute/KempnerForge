@@ -94,6 +94,23 @@ def _resolve_pad_id(tokenizer_path: str) -> int:
     return int(resolve_pad_id(build_tokenizer(tokenizer_path)))
 
 
+def _packed_tokens_per_image(config: JobConfig) -> int:
+    """Tokens one image occupies in a packed row: the adapter's output for the encoder's count.
+
+    Raises:
+        ValueError: ``vision_encoder.num_tokens`` is unset, so the count is only
+            known once the encoder is built, after the data pipeline.
+    """
+    assert config.vision_encoder is not None and config.adapter is not None
+    if config.vision_encoder.num_tokens <= 0:
+        raise ValueError(
+            "data.pack_sequences on a VLM run needs the per-image token count when the "
+            "data pipeline is built; set vision_encoder.num_tokens to the encoder's token "
+            "count (the model build logs it)"
+        )
+    return config.adapter.output_num_tokens(config.vision_encoder.num_tokens)
+
+
 def _build_vlm_pipeline(config: JobConfig, dp_rank: int, dp_size: int) -> DataPipeline:
     """Image (Joint-Decoder) or video VLM loader, selected by ``config.is_video``."""
     tc = config.train
@@ -116,7 +133,11 @@ def _build_vlm_pipeline(config: JobConfig, dp_rank: int, dp_size: int) -> DataPi
         if not config.data.hf_dataset_name or not config.data.tokenizer_path:
             raise ValueError("VLM training requires data.hf_dataset_name and data.tokenizer_path")
 
-        from kempnerforge.data.vlm_dataset import HuggingFaceVLMDataset, VLMCollator
+        from kempnerforge.data.vlm_dataset import (
+            HuggingFaceVLMDataset,
+            PackedVLMCollator,
+            VLMCollator,
+        )
 
         dataset = HuggingFaceVLMDataset(
             dataset_name=config.data.hf_dataset_name,
@@ -129,11 +150,20 @@ def _build_vlm_pipeline(config: JobConfig, dp_rank: int, dp_size: int) -> DataPi
             image_size=config.data.hf_image_size,
             dataset_config=config.data.hf_dataset_config,
         )
-        collator = VLMCollator(
-            pad_id=_resolve_pad_id(config.data.tokenizer_path),
-            max_text_len=vlm_cfg.max_text_len,
-        )
-        logger.info(f"VLM dataset: {len(dataset):,} samples from {config.data.hf_dataset_name}")
+        pad_id = _resolve_pad_id(config.data.tokenizer_path)
+        if config.data.pack_sequences:
+            tokens_per_image = _packed_tokens_per_image(config)
+            collator = PackedVLMCollator(
+                pad_id=pad_id, seq_len=tc.seq_len, tokens_per_image=tokens_per_image
+            )
+            logger.info(
+                f"VLM dataset: {len(dataset):,} samples from {config.data.hf_dataset_name}, "
+                f"packed {tokens_per_image} image tokens + text per document into rows of "
+                f"{tc.seq_len}"
+            )
+        else:
+            collator = VLMCollator(pad_id=pad_id, max_text_len=vlm_cfg.max_text_len)
+            logger.info(f"VLM dataset: {len(dataset):,} samples from {config.data.hf_dataset_name}")
 
     sampler = DistributedSampler(
         dataset,

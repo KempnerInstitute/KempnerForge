@@ -24,6 +24,7 @@ from kempnerforge.config.vlm import (
     MoTConfig,
     VLMConfig,
 )
+from kempnerforge.data.vlm_dataset import pack_vlm_samples
 from kempnerforge.model.modality import ModalityContext
 from kempnerforge.model.transformer import Transformer
 from kempnerforge.model.vlm import (
@@ -320,6 +321,113 @@ class TestModalityStrategies:
         ca_wrapper = _build_ca_tiny_wrapper(num_image_tokens=12)
         assert jd_wrapper.num_image_tokens == 12
         assert ca_wrapper.num_image_tokens == 0
+
+
+def _packed_doc(text_len: int, seed: int) -> dict[str, torch.Tensor]:
+    gen = torch.Generator().manual_seed(seed)
+    ids = torch.randint(0, 256, (text_len,), generator=gen)
+    labels = torch.full((text_len,), -100, dtype=torch.long)
+    labels[:-1] = ids[1:]
+    return {
+        "pixel_values": torch.randn(3, 16, 16, generator=gen),
+        "input_ids": ids,
+        "labels": labels,
+        "text_len": torch.tensor(text_len),
+    }
+
+
+class TestPackedForward:
+    def _forward(self, wrapper, batch):
+        return wrapper(
+            batch["pixel_values"],
+            batch["input_ids"],
+            batch["labels"],
+            doc_ids=batch["doc_ids"],
+            image_rows=batch["image_rows"],
+            image_starts=batch["image_starts"],
+            image_tokens=int(batch["image_tokens"]),
+        )
+
+    def test_logits_cover_the_packed_rows(self):
+        wrapper = _build_tiny_wrapper(num_image_tokens=8)
+        docs = [_packed_doc(10, 1), _packed_doc(12, 2), _packed_doc(20, 3)]
+        batch = pack_vlm_samples(docs, seq_len=40, tokens_per_image=8, pad_id=0)
+        assert batch["input_ids"].shape == (2, 40)
+        logits, labels = self._forward(wrapper, batch)
+        assert logits.shape == (2, 40, 256)
+        assert torch.equal(labels, batch["labels"])
+        assert torch.isfinite(logits).all()
+
+    def test_a_packed_document_matches_the_prefix_path(self):
+        """One document per row gives the text the same logits as the prefix route."""
+        wrapper = _build_tiny_wrapper(num_image_tokens=8).eval()
+        doc = _packed_doc(12, 4)
+        batch = pack_vlm_samples([doc], seq_len=32, tokens_per_image=8, pad_id=0)
+        with torch.no_grad():
+            packed, _ = self._forward(wrapper, batch)
+            prefix, _ = wrapper(doc["pixel_values"].unsqueeze(0), doc["input_ids"].unsqueeze(0))
+        assert torch.allclose(packed[0, 8:20], prefix[0], atol=1e-5)
+
+    def test_documents_do_not_see_each_other(self):
+        """Changing the first document leaves the second document's logits unchanged."""
+        wrapper = _build_tiny_wrapper(num_image_tokens=8).eval()
+        second = _packed_doc(10, 6)
+        with torch.no_grad():
+            a, _ = self._forward(
+                wrapper,
+                pack_vlm_samples(
+                    [_packed_doc(6, 5), second], seq_len=40, tokens_per_image=8, pad_id=0
+                ),
+            )
+            b, _ = self._forward(
+                wrapper,
+                pack_vlm_samples(
+                    [_packed_doc(6, 7), second], seq_len=40, tokens_per_image=8, pad_id=0
+                ),
+            )
+        assert torch.allclose(a[0, 14:32], b[0, 14:32], atol=1e-5)
+        assert not torch.allclose(a[0, :14], b[0, :14])
+
+    def test_backward_reaches_encoder_adapter_and_backbone(self):
+        wrapper = _build_tiny_wrapper(num_image_tokens=8)
+        batch = pack_vlm_samples([_packed_doc(10, 8)], seq_len=32, tokens_per_image=8, pad_id=0)
+        logits, _ = self._forward(wrapper, batch)
+        logits.sum().backward()
+        assert next(wrapper.adapter.parameters()).grad is not None
+        assert all(p.grad is not None for p in wrapper.transformer.token_embedding.parameters())
+
+    def test_wrong_token_count_raises(self):
+        wrapper = _build_tiny_wrapper(num_image_tokens=8)
+        batch = pack_vlm_samples([_packed_doc(10, 9)], seq_len=32, tokens_per_image=4, pad_id=0)
+        with pytest.raises(ValueError, match="laid out 4 tokens per image but the adapter"):
+            self._forward(wrapper, batch)
+
+    def test_placement_needs_both_tensors_and_no_frame_mask(self):
+        wrapper = _build_tiny_wrapper(num_image_tokens=8)
+        batch = pack_vlm_samples([_packed_doc(10, 9)], seq_len=32, tokens_per_image=8, pad_id=0)
+        with pytest.raises(ValueError, match="given together"):
+            wrapper(batch["pixel_values"], batch["input_ids"], image_rows=batch["image_rows"])
+        with pytest.raises(ValueError, match="no frame_mask"):
+            wrapper(
+                batch["pixel_values"],
+                batch["input_ids"],
+                frame_mask=torch.ones(1, 1, dtype=torch.bool),
+                image_rows=batch["image_rows"],
+                image_starts=batch["image_starts"],
+            )
+
+    @pytest.mark.parametrize("arch", ["cross_attention", "mot", "moma"])
+    def test_other_arches_reject_packed_batches(self, arch):
+        strategy = build_modality_strategy(VLMConfig.for_arch(arch))
+        batch = pack_vlm_samples([_packed_doc(10, 9)], seq_len=32, tokens_per_image=8, pad_id=0)
+        with pytest.raises(NotImplementedError, match="joint_decoder"):
+            strategy.prepare(
+                _build_tiny_wrapper(),
+                batch["pixel_values"],
+                batch["input_ids"],
+                image_rows=batch["image_rows"],
+                image_starts=batch["image_starts"],
+            )
 
 
 class TestVLMWrapperDispatch:
@@ -810,7 +918,7 @@ class TestVLMDecoupledHeadDim:
         found = [
             (n, m.head_dim)
             for n, m in w.named_modules()
-            if isinstance(m, (Attention, MoTAttention, CrossAttention))
+            if isinstance(m, Attention | MoTAttention | CrossAttention)
         ]
         assert found, f"{arch}: no attention modules found"
         assert all(hd == 32 for _, hd in found), found

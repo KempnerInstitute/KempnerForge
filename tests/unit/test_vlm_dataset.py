@@ -16,10 +16,12 @@ from kempnerforge.data.vlm_dataset import (
     DEFAULT_IMAGE_MEAN,
     DEFAULT_IMAGE_STD,
     HuggingFaceVLMDataset,
+    PackedVLMCollator,
     VLMCollator,
     _tokenize_and_mask,
     check_prompt_fits,
     frames_to_clip_tensor,
+    pack_vlm_samples,
     pil_to_tensor,
 )
 
@@ -654,6 +656,10 @@ class TestHuggingFaceVLMDataset:
         assert item["input_ids"].shape == (16,)
         assert item["labels"].shape == (16,)
         assert item["input_ids"].dtype == torch.long
+        text_len = int(item["text_len"])
+        assert 0 < text_len <= 16
+        assert item["labels"][text_len - 1].item() == -100
+        assert (item["labels"][: text_len - 1] == item["input_ids"][1:text_len]).all()
 
     def test_init_load_from_disk_single_split(self, tiny_hf_dataset):
         """Real ``__init__`` on a dataset saved by ``save_to_disk`` (single
@@ -877,3 +883,93 @@ class TestFramesToClipTensor:
         pv, mask = frames_to_clip_tensor(frames, max_frames=3, frame_size=16)
         assert pv.shape == (3, 3, 16, 16)
         assert mask.all()
+
+
+def _doc(text_len: int, first: int, views: int = 1, padded_to: int = 8) -> dict[str, torch.Tensor]:
+    """A document of ``text_len`` real tokens ``first, first+1, ...`` padded to ``padded_to``."""
+    ids = torch.zeros(padded_to, dtype=torch.long)
+    ids[:text_len] = torch.arange(first, first + text_len)
+    labels = torch.full((padded_to,), -100, dtype=torch.long)
+    labels[: text_len - 1] = ids[1:text_len]
+    pixels = (
+        torch.full((3, 4, 4), float(first))
+        if views == 1
+        else torch.full((views, 3, 4, 4), float(first))
+    )
+    return {
+        "pixel_values": pixels,
+        "input_ids": ids,
+        "labels": labels,
+        "text_len": torch.tensor(text_len),
+    }
+
+
+class TestPackVLMSamples:
+    def test_first_fit_layout(self):
+        """Footprints 5, 6 and 7 with seq_len 12: the first two share a row, the third opens one."""
+        batch = pack_vlm_samples(
+            [_doc(3, 10), _doc(4, 20), _doc(5, 30)], seq_len=12, tokens_per_image=2, pad_id=0
+        )
+        assert batch["input_ids"].shape == (2, 12)
+        assert batch["input_ids"][0].tolist() == [0, 0, 10, 11, 12, 0, 0, 20, 21, 22, 23, 0]
+        assert batch["labels"][0].tolist() == [
+            -100,
+            -100,
+            11,
+            12,
+            -100,
+            -100,
+            -100,
+            21,
+            22,
+            23,
+            -100,
+            -100,
+        ]
+        assert batch["doc_ids"][0].tolist() == [0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 2]
+        assert batch["input_ids"][1].tolist() == [0, 0, 30, 31, 32, 33, 34, 0, 0, 0, 0, 0]
+        assert batch["doc_ids"][1].tolist() == [0] * 7 + [1] * 5
+        assert batch["image_rows"].tolist() == [0, 0, 1]
+        assert batch["image_starts"].tolist() == [0, 5, 0]
+        assert batch["pixel_values"].shape == (3, 3, 4, 4)
+        assert batch["pixel_values"][:, 0, 0, 0].tolist() == [10.0, 20.0, 30.0]
+        assert int(batch["image_tokens"]) == 2
+
+    def test_a_later_document_fills_an_earlier_row(self):
+        batch = pack_vlm_samples(
+            [_doc(6, 10), _doc(6, 20), _doc(2, 30)], seq_len=12, tokens_per_image=2, pad_id=0
+        )
+        assert batch["input_ids"].shape == (2, 12)
+        assert batch["image_rows"].tolist() == [0, 1, 0]
+        assert batch["image_starts"].tolist() == [0, 0, 8]
+        assert batch["doc_ids"][0].tolist() == [0] * 8 + [1] * 4
+
+    def test_views_take_consecutive_slots(self):
+        batch = pack_vlm_samples([_doc(2, 10, views=3)], seq_len=12, tokens_per_image=2, pad_id=0)
+        assert batch["pixel_values"].shape == (3, 3, 4, 4)
+        assert batch["image_starts"].tolist() == [0, 2, 4]
+        assert batch["input_ids"][0, 6:8].tolist() == [10, 11]
+
+    def test_without_text_len_every_position_is_real(self):
+        doc = _doc(3, 10)
+        del doc["text_len"]
+        batch = pack_vlm_samples([doc], seq_len=12, tokens_per_image=2, pad_id=0)
+        assert batch["doc_ids"][0].tolist() == [0] * 10 + [1] * 2
+
+    def test_oversize_document_raises(self):
+        with pytest.raises(ValueError, match="does not fit a row"):
+            pack_vlm_samples([_doc(8, 10)], seq_len=9, tokens_per_image=2, pad_id=0)
+
+    def test_empty_and_bad_sizes_raise(self):
+        with pytest.raises(ValueError, match="no samples"):
+            pack_vlm_samples([], seq_len=8, tokens_per_image=2, pad_id=0)
+        with pytest.raises(ValueError, match="must be positive"):
+            pack_vlm_samples([_doc(2, 1)], seq_len=8, tokens_per_image=0, pad_id=0)
+
+    def test_collator_packs_the_batch(self):
+        collator = PackedVLMCollator(pad_id=7, seq_len=12, tokens_per_image=2)
+        batch = collator([_doc(3, 10), _doc(4, 20)])
+        assert batch["input_ids"].shape == (1, 12)
+        assert batch["input_ids"][0, 11].item() == 7
+        with pytest.raises(ValueError, match="empty batch"):
+            collator([])

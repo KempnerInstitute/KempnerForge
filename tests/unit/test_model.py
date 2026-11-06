@@ -594,7 +594,7 @@ def _norms(model: torch.nn.Module) -> dict[str, torch.nn.Module]:
     return {
         name: module
         for name, module in model.named_modules()
-        if isinstance(module, (RMSNorm, torch.nn.LayerNorm))
+        if isinstance(module, RMSNorm | torch.nn.LayerNorm)
     }
 
 
@@ -1443,3 +1443,72 @@ class TestHeadDimDefaultsUnchanged:
         with torch.no_grad():
             second = again(tokens)
         assert torch.equal(first, second)
+
+
+class TestInlineEmbeds:
+    def _inline(self, model, tokens, rows, positions, embeds):
+        return model(
+            tokens,
+            modality=ModalityContext(
+                inline_embeds=embeds, inline_rows=rows, inline_positions=positions
+            ),
+        )
+
+    def test_matches_embeddings_written_by_hand(self):
+        """The inline route equals embedding the tokens and overwriting the slots."""
+        model = Transformer(_KWARG_CONFIG).to(DEVICE).eval()
+        tokens = torch.randint(0, 256, (2, 16), device=DEVICE)
+        rows = torch.tensor([0, 0, 1, 1, 1], device=DEVICE)
+        positions = torch.tensor([3, 4, 0, 1, 2], device=DEVICE)
+        embeds = torch.randn(5, 128, device=DEVICE)
+        with torch.no_grad():
+            by_hand = model.token_embedding(tokens).clone()
+            by_hand[rows, positions] = embeds
+            expected = model(modality=ModalityContext(inputs_embeds=by_hand))
+            out = self._inline(model, tokens, rows, positions, embeds)
+        assert torch.equal(out, expected)
+
+    def test_gradients_reach_the_inline_embeds_and_the_embedding(self):
+        model = Transformer(_KWARG_CONFIG).to(DEVICE)
+        tokens = torch.randint(0, 256, (1, 8), device=DEVICE)
+        embeds = torch.randn(3, 128, device=DEVICE, requires_grad=True)
+        rows = torch.zeros(3, dtype=torch.long, device=DEVICE)
+        positions = torch.tensor([1, 2, 3], device=DEVICE)
+        self._inline(model, tokens, rows, positions, embeds).sum().backward()
+        assert embeds.grad is not None and torch.isfinite(embeds.grad).all()
+        assert all(p.grad is not None for p in model.token_embedding.parameters())
+
+    def test_index_out_of_range_raises(self):
+        model = Transformer(_KWARG_CONFIG).to(DEVICE)
+        tokens = torch.randint(0, 256, (1, 8), device=DEVICE)
+        embeds = torch.randn(1, 128, device=DEVICE)
+        with pytest.raises(ValueError, match="inline_positions must index the sequence"):
+            self._inline(model, tokens, torch.tensor([0]), torch.tensor([8]), embeds)
+        with pytest.raises(ValueError, match="inline_rows must index the batch"):
+            self._inline(model, tokens, torch.tensor([1]), torch.tensor([0]), embeds)
+
+    def test_width_mismatch_raises(self):
+        model = Transformer(_KWARG_CONFIG).to(DEVICE)
+        tokens = torch.randint(0, 256, (1, 8), device=DEVICE)
+        with pytest.raises(ValueError, match="inline_embeds width"):
+            self._inline(model, tokens, torch.tensor([0]), torch.tensor([0]), torch.randn(1, 64))
+
+    def test_context_requires_both_indices(self):
+        embeds = torch.randn(2, 128)
+        with pytest.raises(ValueError, match="requires both inline_rows and inline_positions"):
+            ModalityContext(inline_embeds=embeds, inline_rows=torch.zeros(2, dtype=torch.long))
+        with pytest.raises(ValueError, match="require inline_embeds"):
+            ModalityContext(inline_rows=torch.zeros(2, dtype=torch.long))
+        with pytest.raises(ValueError, match="inline_positions must be \\(2,\\)"):
+            ModalityContext(
+                inline_embeds=embeds,
+                inline_rows=torch.zeros(2, dtype=torch.long),
+                inline_positions=torch.zeros(3, dtype=torch.long),
+            )
+        with pytest.raises(ValueError, match="at most one of"):
+            ModalityContext(
+                inline_embeds=embeds,
+                inline_rows=torch.zeros(2, dtype=torch.long),
+                inline_positions=torch.zeros(2, dtype=torch.long),
+                prefix_embeds=torch.randn(1, 2, 128),
+            )

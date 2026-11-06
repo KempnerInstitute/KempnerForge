@@ -69,9 +69,68 @@ class ModalityStrategy(Protocol):
         pixel_values: torch.Tensor,
         input_ids: torch.Tensor,
         frame_mask: torch.Tensor | None = None,
+        *,
+        image_rows: torch.Tensor | None = None,
+        image_starts: torch.Tensor | None = None,
+        image_tokens: int | None = None,
     ) -> ModalityContext: ...
 
     def num_image_tokens(self, wrapper: VLMWrapper) -> int: ...
+
+
+def _inline_image_context(
+    wrapper: VLMWrapper,
+    pixel_values: torch.Tensor,
+    input_ids: torch.Tensor,
+    image_rows: torch.Tensor,
+    image_starts: torch.Tensor,
+    image_tokens: int | None,
+) -> ModalityContext:
+    """Encode a packed batch's flat images and place each one's tokens inside its row.
+
+    ``pixel_values`` is ``(N, 3, H, W)``, one entry per image (or view);
+    ``image_rows[n]`` and ``image_starts[n]`` give the row and first position
+    of image ``n``'s ``tokens_per_image`` placeholder slots in ``input_ids``.
+    ``image_tokens`` is the slot count the packer laid out; the adapter's
+    output must match it or the slots would be filled wrong.
+    """
+    if pixel_values.dim() != 4:
+        raise ValueError(
+            f"a packed batch's pixel_values must be (N, 3, H, W), got {tuple(pixel_values.shape)}"
+        )
+    if image_rows.shape != image_starts.shape or image_rows.shape != (pixel_values.shape[0],):
+        raise ValueError(
+            f"image_rows and image_starts must be ({pixel_values.shape[0]},), got "
+            f"{tuple(image_rows.shape)} and {tuple(image_starts.shape)}"
+        )
+    feats = wrapper.vision_encoder(pixel_values)
+    adapter_dtype = next(wrapper.adapter.parameters()).dtype
+    if feats.dtype != adapter_dtype:
+        feats = feats.to(adapter_dtype)
+    embeds = wrapper.adapter(feats)
+    n, k, dim = embeds.shape
+    if image_tokens is not None and k != image_tokens:
+        raise ValueError(
+            f"the packer laid out {image_tokens} tokens per image but the adapter produces "
+            f"{k}; set the packer's tokens_per_image to the adapter's output count"
+        )
+    offsets = torch.arange(k, device=input_ids.device)
+    positions = (image_starts.to(input_ids.device).unsqueeze(1) + offsets).reshape(-1)
+    rows = image_rows.to(input_ids.device).repeat_interleave(k)
+    if positions.numel() and int(positions.max()) >= input_ids.shape[1]:
+        raise ValueError(f"an image's {k} tokens run past the row length ({input_ids.shape[1]})")
+    return ModalityContext(
+        inline_embeds=embeds.reshape(n * k, dim),
+        inline_rows=rows,
+        inline_positions=positions,
+    )
+
+
+def _reject_packed(arch: str, image_rows: torch.Tensor | None) -> None:
+    if image_rows is not None:
+        raise NotImplementedError(
+            f"packed batches (image_rows) are supported by arch='joint_decoder' only, not {arch!r}"
+        )
 
 
 def _project_visual_features(wrapper: VLMWrapper, pixel_values: torch.Tensor) -> torch.Tensor:
@@ -163,15 +222,29 @@ class JointDecoderStrategy:
     output_slice)``. The transformer runs over the concatenated
     ``(image, text)`` sequence and ``output_slice`` trims the image
     positions before the LM head.
+
+    A packed batch (``image_rows`` given) takes the inline route instead:
+    the flat images are encoded and each one's tokens are written over its
+    placeholder slots inside its row, so logits cover the whole row and
+    ``doc_ids`` isolates the documents.
     """
 
     def prepare(
         self,
         wrapper: VLMWrapper,
         pixel_values: torch.Tensor,
-        input_ids: torch.Tensor,  # noqa: ARG002
+        input_ids: torch.Tensor,
         frame_mask: torch.Tensor | None = None,
+        *,
+        image_rows: torch.Tensor | None = None,
+        image_starts: torch.Tensor | None = None,
+        image_tokens: int | None = None,
     ) -> ModalityContext:
+        if image_rows is not None:
+            assert image_starts is not None
+            return _inline_image_context(
+                wrapper, pixel_values, input_ids, image_rows, image_starts, image_tokens
+            )
         img_embeds = _project_visual_features(wrapper, pixel_values)
         n = img_embeds.shape[1]
         return ModalityContext(
@@ -205,7 +278,12 @@ class CrossAttentionStrategy:
         pixel_values: torch.Tensor,
         input_ids: torch.Tensor,  # noqa: ARG002
         frame_mask: torch.Tensor | None = None,
+        *,
+        image_rows: torch.Tensor | None = None,
+        image_starts: torch.Tensor | None = None,  # noqa: ARG002
+        image_tokens: int | None = None,  # noqa: ARG002
     ) -> ModalityContext:
+        _reject_packed("cross_attention", image_rows)
         img_embeds = _project_visual_features(wrapper, pixel_values)
         return ModalityContext(
             image_features=img_embeds,
@@ -242,7 +320,12 @@ class MoTStrategy:
         pixel_values: torch.Tensor,
         input_ids: torch.Tensor,
         frame_mask: torch.Tensor | None = None,
+        *,
+        image_rows: torch.Tensor | None = None,
+        image_starts: torch.Tensor | None = None,  # noqa: ARG002
+        image_tokens: int | None = None,  # noqa: ARG002
     ) -> ModalityContext:
+        _reject_packed(type(self).__name__.removesuffix("Strategy").lower(), image_rows)
         img_embeds = _project_visual_features(wrapper, pixel_values)
         n = img_embeds.shape[1]
         b, t_text = input_ids.shape
@@ -288,7 +371,12 @@ class MoMaStrategy:
         pixel_values: torch.Tensor,
         input_ids: torch.Tensor,
         frame_mask: torch.Tensor | None = None,
+        *,
+        image_rows: torch.Tensor | None = None,
+        image_starts: torch.Tensor | None = None,  # noqa: ARG002
+        image_tokens: int | None = None,  # noqa: ARG002
     ) -> ModalityContext:
+        _reject_packed(type(self).__name__.removesuffix("Strategy").lower(), image_rows)
         img_embeds = _project_visual_features(wrapper, pixel_values)
         n = img_embeds.shape[1]
         b, t_text = input_ids.shape
@@ -325,6 +413,11 @@ class VLMWrapper(nn.Module):
     and the wrapper's submodules; ``Transformer.forward`` consumes the
     context. ``num_image_tokens`` is arch-aware and delegates to the
     strategy.
+
+    A packed batch (``pack_vlm_samples``) passes ``doc_ids`` plus the image
+    placement ``image_rows``, ``image_starts`` and ``image_tokens``; the
+    strategy then places each image inside its row and the logits cover the
+    whole row.
     """
 
     def __init__(
@@ -352,9 +445,26 @@ class VLMWrapper(nn.Module):
         input_ids: torch.Tensor,
         labels: torch.Tensor | None = None,
         frame_mask: torch.Tensor | None = None,
+        *,
+        doc_ids: torch.Tensor | None = None,
+        image_rows: torch.Tensor | None = None,
+        image_starts: torch.Tensor | None = None,
+        image_tokens: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        modality = self.strategy.prepare(self, pixel_values, input_ids, frame_mask=frame_mask)
-        logits = self.transformer(tokens=input_ids, modality=modality)
+        if (image_rows is None) != (image_starts is None):
+            raise ValueError("image_rows and image_starts must be given together")
+        if image_rows is not None and frame_mask is not None:
+            raise ValueError("a packed batch carries no frame_mask")
+        modality = self.strategy.prepare(
+            self,
+            pixel_values,
+            input_ids,
+            frame_mask=frame_mask,
+            image_rows=image_rows,
+            image_starts=image_starts,
+            image_tokens=image_tokens,
+        )
+        logits = self.transformer(tokens=input_ids, modality=modality, doc_ids=doc_ids)
         return logits, labels
 
 

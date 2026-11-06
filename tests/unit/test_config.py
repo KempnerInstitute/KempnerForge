@@ -767,6 +767,17 @@ class TestJobConfig:
         with pytest.raises(ValueError, match="train.seq_len.*insufficient for VLM"):
             config.validate(world_size=1)
 
+    def test_vlm_packing_requires_joint_decoder_and_no_video(self):
+        kwargs = dict(
+            model=ModelConfig(max_seq_len=1024),
+            vision_encoder=VisionEncoderConfig(type="random", num_tokens=16),
+            adapter=AdapterConfig(),
+            data=DataConfig(pack_sequences=True),
+        )
+        JobConfig(vlm=VLMConfig(max_text_len=64), **kwargs)
+        with pytest.raises(ValueError, match="requires vlm.arch='joint_decoder'"):
+            JobConfig(vlm=VLMConfig.for_arch("cross_attention", max_text_len=64), **kwargs)
+
     def test_validate_vlm_pp_rejected(self):
         config = JobConfig(
             model=ModelConfig(max_seq_len=1024),
