@@ -219,6 +219,132 @@ class TestPositionIdsFromTheContext:
             model(tokens, position_ids=positions, modality=ModalityContext(position_ids=positions))
 
 
+class TestRopeFromTheContext:
+    """A strategy may hand the transformer the rotation itself, built from the same table."""
+
+    @staticmethod
+    def _rotation(model: Transformer, positions: torch.Tensor) -> ModalityContext:
+        cos, sin = precompute_rope_frequencies(
+            head_dim=_HEAD_DIM, max_seq_len=_MAX_SEQ_LEN, theta=model.config.rope_theta
+        )
+        cos, sin = cos.to(DEVICE), sin.to(DEVICE)
+        return ModalityContext(rope_cos=cos[positions], rope_sin=sin[positions])
+
+    def test_arange_rotation_matches_the_default(self):
+        model = _tiny_model()
+        tokens = torch.randint(0, _VOCAB, (2, 10), device=DEVICE)
+        positions = torch.arange(10, device=DEVICE).expand(2, -1)
+        with torch.no_grad():
+            default = model(tokens)
+            given = model(tokens, modality=self._rotation(model, positions))
+        torch.testing.assert_close(given, default, rtol=0, atol=0)
+
+    def test_gathered_rotation_matches_position_ids(self):
+        model = _tiny_model()
+        tokens = torch.randint(0, _VOCAB, (2, 10), device=DEVICE)
+        gen = torch.Generator().manual_seed(2)
+        positions = torch.randint(0, _MAX_SEQ_LEN, (2, 10), generator=gen).to(DEVICE)
+        with torch.no_grad():
+            by_ids = model(tokens, position_ids=positions)
+            by_rotation = model(tokens, modality=self._rotation(model, positions))
+        torch.testing.assert_close(by_rotation, by_ids, rtol=0, atol=0)
+
+    def test_a_two_axis_rotation_differs_from_any_one_axis(self):
+        """Pair sections rotated by different axes are a rotation no position id can give."""
+        model = _tiny_model()
+        tokens = torch.randint(0, _VOCAB, (1, 6), device=DEVICE)
+        cos, sin = precompute_rope_frequencies(
+            head_dim=_HEAD_DIM, max_seq_len=_MAX_SEQ_LEN, theta=model.config.rope_theta
+        )
+        rows = torch.tensor([0, 0, 0, 1, 1, 1])
+        cols = torch.tensor([0, 1, 2, 0, 1, 2])
+        half = _HEAD_DIM // 4
+        two_axis_cos = torch.cat([cos[rows, :half], cos[cols, half:]], dim=-1).unsqueeze(0)
+        two_axis_sin = torch.cat([sin[rows, :half], sin[cols, half:]], dim=-1).unsqueeze(0)
+        modality = ModalityContext(
+            rope_cos=two_axis_cos.to(DEVICE), rope_sin=two_axis_sin.to(DEVICE)
+        )
+        with torch.no_grad():
+            two_axis = model(tokens, modality=modality)
+            one_axis = [model(tokens, position_ids=p.unsqueeze(0).to(DEVICE)) for p in (rows, cols)]
+        assert two_axis.shape == (1, 6, _VOCAB)
+        assert all(not torch.allclose(two_axis, o) for o in one_axis)
+
+    def test_rotation_covers_the_prefix_and_is_checked(self):
+        model = _tiny_model()
+        tokens = torch.randint(0, _VOCAB, (1, 6), device=DEVICE)
+        prefix = torch.randn(1, 4, _DIM, device=DEVICE)
+        ctx = self._rotation(model, torch.arange(10, device=DEVICE).unsqueeze(0))
+        with torch.no_grad():
+            default = model(tokens, modality=ModalityContext(prefix_embeds=prefix))
+            given = model(
+                tokens,
+                modality=ModalityContext(
+                    prefix_embeds=prefix, rope_cos=ctx.rope_cos, rope_sin=ctx.rope_sin
+                ),
+            )
+        torch.testing.assert_close(given, default, rtol=0, atol=0)
+        short = self._rotation(model, torch.arange(6, device=DEVICE).unsqueeze(0))
+        with pytest.raises(ValueError, match="does not match the residual rotation shape"):
+            model(
+                tokens,
+                modality=ModalityContext(
+                    prefix_embeds=prefix, rope_cos=short.rope_cos, rope_sin=short.rope_sin
+                ),
+            )
+
+    def test_gradient_flows_through_a_given_rotation(self):
+        model = _tiny_model()
+        tokens = torch.randint(0, _VOCAB, (1, 5), device=DEVICE)
+        ctx = self._rotation(model, torch.arange(5, device=DEVICE).unsqueeze(0))
+        model(tokens, modality=ctx).sum().backward()
+        assert all(p.grad is not None for p in model.parameters() if p.requires_grad)
+
+    def test_rejects_position_ids_alongside(self):
+        model = _tiny_model()
+        tokens = torch.randint(0, _VOCAB, (1, 5), device=DEVICE)
+        ctx = self._rotation(model, torch.arange(5, device=DEVICE).unsqueeze(0))
+        with pytest.raises(ValueError, match="cannot be combined with position_ids"):
+            model(tokens, position_ids=torch.arange(5, device=DEVICE).unsqueeze(0), modality=ctx)
+
+    def test_rejects_kv_caches(self):
+        model = _tiny_model(n_layers=1)
+        caches = [
+            KVCache(
+                batch_size=1,
+                max_seq_len=_MAX_SEQ_LEN,
+                n_kv_heads=_N_HEADS,
+                head_dim=_HEAD_DIM,
+                dtype=torch.float32,
+                device=DEVICE,
+            )
+        ]
+        tokens = torch.randint(0, _VOCAB, (1, 4), device=DEVICE)
+        ctx = self._rotation(model, torch.arange(4, device=DEVICE).unsqueeze(0))
+        with pytest.raises(ValueError, match="cannot be combined with kv_caches"):
+            model(tokens, kv_caches=caches, modality=ctx)
+
+    def test_rejects_mot_models(self):
+        from kempnerforge.config.vlm import MoTConfig
+
+        config = ModelConfig(
+            dim=_DIM,
+            n_layers=1,
+            n_heads=_N_HEADS,
+            n_kv_heads=_N_HEADS,
+            vocab_size=_VOCAB,
+            max_seq_len=_MAX_SEQ_LEN,
+            ffn_hidden_dim=128,
+        )
+        model = Transformer(config, vlm_config=MoTConfig(max_text_len=8), num_image_tokens=4).to(
+            DEVICE
+        )
+        tokens = torch.randint(0, _VOCAB, (1, 8), device=DEVICE)
+        ctx = self._rotation(model, torch.arange(8, device=DEVICE).unsqueeze(0))
+        with pytest.raises(ValueError, match="not supported for MoT"):
+            model(tokens, modality=ctx)
+
+
 class TestTransformerPositionIdsValidation:
     def _tokens(self, batch: int = 2, seq: int = 6) -> torch.Tensor:
         return torch.randint(0, _VOCAB, (batch, seq), device=DEVICE)

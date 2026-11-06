@@ -412,7 +412,12 @@ class Transformer(nn.Module):
                 ``None`` is the unmasked fast path. On MoT, ``doc_ids`` and
                 group ids need ``vlm.mot_modalities`` in residual order,
                 ``("image", "text")``. May likewise come from
-                ``modality.attention_group_ids``, not both.
+                ``modality.attention_group_ids``, not both. A context may
+                instead carry the rotation itself as ``modality.rope_cos``
+                and ``modality.rope_sin``, ``(batch, seq_len, head_dim // 2)``
+                over the residual, for position schemes that are not one
+                integer per token; they exclude ``position_ids``, ``kv_caches``
+                and MoT like ``position_ids`` does.
 
         Returns:
             Logits tensor of shape ``(batch, out_seq_len, vocab_size)``
@@ -429,6 +434,8 @@ class Transformer(nn.Module):
         modality_ids = modality.modality_ids if modality is not None else None
         key_padding_mask = modality.key_padding_mask if modality is not None else None
         position_ids = _argument_or_context("position_ids", position_ids, modality)
+        rope_cos = modality.rope_cos if modality is not None else None
+        rope_sin = modality.rope_sin if modality is not None else None
         attention_group_ids = _argument_or_context(
             "attention_group_ids", attention_group_ids, modality
         )
@@ -508,6 +515,26 @@ class Transformer(nn.Module):
                     f"table range, model.max_seq_len); got min {int(position_ids.min())}, "
                     f"max {int(position_ids.max())}"
                 )
+        if rope_cos is not None:
+            assert rope_sin is not None
+            if position_ids is not None:
+                raise ValueError("modality.rope_cos/rope_sin cannot be combined with position_ids")
+            if kv_caches is not None:
+                raise ValueError(
+                    "modality.rope_cos/rope_sin cannot be combined with kv_caches; cached "
+                    "generation derives positions from the cache fill level"
+                )
+            if self._mot_modalities:
+                raise ValueError(
+                    "modality.rope_cos/rope_sin is not supported for MoT models, which derive "
+                    "per-modality positions internally"
+                )
+            expected = (batch, seq_len, self.config.head_dim // 2)
+            if tuple(rope_cos.shape) != expected:
+                raise ValueError(
+                    f"modality.rope_cos shape {tuple(rope_cos.shape)} does not match the "
+                    f"residual rotation shape {expected} (batch, seq_len, head_dim // 2)"
+                )
         if modality_ids is not None and modality_ids.dtype != torch.long:
             raise ValueError(
                 f"modality.modality_ids.dtype must be torch.long, got {modality_ids.dtype}"
@@ -552,7 +579,10 @@ class Transformer(nn.Module):
         if self._rope_cos.device != h.device:  # type: ignore[reportOptionalMemberAccess]
             self._rope_cos = self._rope_cos.to(h.device)  # type: ignore[reportOptionalMemberAccess]
             self._rope_sin = self._rope_sin.to(h.device)  # type: ignore[reportOptionalMemberAccess]
-        if position_ids is not None:
+        if rope_cos is not None:
+            assert rope_sin is not None
+            cos, sin = rope_cos.to(h.device), rope_sin.to(h.device)
+        elif position_ids is not None:
             position_ids = position_ids.to(h.device)
             cos = self._rope_cos[position_ids]  # type: ignore[reportOptionalSubscript]
             sin = self._rope_sin[position_ids]  # type: ignore[reportOptionalSubscript]

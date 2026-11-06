@@ -143,6 +143,34 @@ class TestModalityIdsInvariants:
         with pytest.raises(ValueError, match=f"{name} must be \\(batch, seq_len\\)"):
             ModalityContext(**{name: torch.zeros(4, dtype=torch.long)})
 
+    def test_rope_tables_ride_along(self):
+        ctx = ModalityContext(rope_cos=torch.zeros(1, 6, 8), rope_sin=torch.zeros(1, 6, 8))
+        assert ctx.rope_cos is not None and ctx.rope_sin is not None
+
+    def test_rope_tables_come_together(self):
+        with pytest.raises(ValueError, match="given together"):
+            ModalityContext(rope_cos=torch.zeros(1, 6, 8))
+
+    def test_rope_tables_exclude_position_ids(self):
+        with pytest.raises(ValueError, match="both choose the rotation"):
+            ModalityContext(
+                rope_cos=torch.zeros(1, 6, 8),
+                rope_sin=torch.zeros(1, 6, 8),
+                position_ids=torch.arange(6).unsqueeze(0),
+            )
+
+    def test_rope_tables_must_be_floating_three_dimensional_and_alike(self):
+        with pytest.raises(ValueError, match="rope_cos must be floating point"):
+            ModalityContext(
+                rope_cos=torch.zeros(1, 6, 8, dtype=torch.long), rope_sin=torch.zeros(1, 6, 8)
+            )
+        with pytest.raises(
+            ValueError, match="rope_sin must be \\(batch, seq_len, head_dim // 2\\)"
+        ):
+            ModalityContext(rope_cos=torch.zeros(1, 6, 8), rope_sin=torch.zeros(6, 8))
+        with pytest.raises(ValueError, match="differ in shape"):
+            ModalityContext(rope_cos=torch.zeros(1, 6, 8), rope_sin=torch.zeros(1, 5, 8))
+
     def test_modality_ids_alone_raises(self):
         """Bare modality_ids (no prefix/inputs_embeds) is meaningless."""
         with pytest.raises(ValueError, match="modality_ids requires"):
