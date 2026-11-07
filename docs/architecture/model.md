@@ -54,7 +54,10 @@ version.
 
 During generation, `Transformer.forward` slices `cos`/`sin` starting at
 `kv_caches[0].seq_len` so incremental tokens get the correct absolute
-positions.
+positions. A caller may instead give the positions of the tokens being
+appended (`position_ids`, by argument or on the `ModalityContext`) or the
+rotation itself (`modality.rope_cos`/`rope_sin`, built from the same
+tables), at prefill and at every decode step alike.
 
 ## Attention
 
@@ -105,6 +108,10 @@ before RoPE. Stabilizes attention logits at scale (Gemma, DeepSeek-V3).
    query attends to all cached positions. `is_causal=True` here would
    incorrectly restrict attention to only the first key. Mask inputs are
    refused together with a KV cache.
+4. **Several tokens appended to a non-empty cache**: a lower-right causal
+   mask from `appended_causal_mask`, so each appended token sees every cached
+   key and the appended keys up to itself. SDPA's `is_causal=True` aligns its
+   triangle to the top left and would hide the cached keys.
 
 A fourth, slower path fires only when `capture_attention_weights=True`:
 `_attention_with_weights` computes `softmax(Q·Kᵀ / √d)` manually so

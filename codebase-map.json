@@ -296,7 +296,7 @@
     "kempnerforge/model/modality.py": {
       "classes": {
         "ModalityContext": {
-          "purpose": "Frozen dataclass bundling all modality-injection inputs flowing into Transformer.forward (inputs_embeds, prefix_embeds, output_slice, image_features, image_mask, modality_ids). Intra-context invariants enforced in __post_init__; cross-arg invariants vs kv_caches enforced at the top of Transformer.forward",
+          "purpose": "Frozen dataclass bundling all modality-injection inputs flowing into Transformer.forward (inputs_embeds, prefix_embeds, output_slice, image_features, image_mask, modality_ids, key_padding_mask, position_ids, attention_group_ids, rope_cos, rope_sin). Intra-context invariants enforced in __post_init__; cross-arg invariants vs kv_caches enforced at the top of Transformer.forward",
           "methods": [
             "__post_init__()"
           ]

@@ -375,10 +375,20 @@ class Transformer(nn.Module):
             modality: Optional ``ModalityContext`` bundling pre-embedded
                 inputs, prefix embeds, output slicing, image features,
                 and modality routing tags for VLM arches. ``None`` is the
-                pure text-only forward.
+                pure text-only forward. It may also carry ``position_ids``
+                and ``attention_group_ids`` (see those arguments) or the
+                rotation itself as ``rope_cos`` and ``rope_sin``,
+                ``(batch, seq_len, head_dim // 2)`` over the residual, for
+                position schemes that are not one integer per token; the
+                rotation excludes ``position_ids``, covers the appended
+                tokens under ``kv_caches`` as ``position_ids`` does, is
+                applied without the model's own tables, and is unsupported
+                for MoT.
             kv_caches: Optional list of KVCache (one per layer) for
-                generation. When provided, RoPE positions are offset by
-                the current cache fill level. Cross-arg invariant:
+                generation. The tokens of this forward are appended after
+                the cached ones; without caller positions or a rotation
+                their RoPE positions continue from the cache fill level.
+                Cross-arg invariant:
                 ``kv_caches`` forbids ``modality.prefix_embeds``,
                 ``modality.output_slice``, ``modality.image_features``,
                 ``modality.modality_ids``, ``modality.key_padding_mask``,
@@ -413,13 +423,7 @@ class Transformer(nn.Module):
                 ``None`` is the unmasked fast path. On MoT, ``doc_ids`` and
                 group ids need ``vlm.mot_modalities`` in residual order,
                 ``("image", "text")``. May likewise come from
-                ``modality.attention_group_ids``, not both. A context may
-                instead carry the rotation itself as ``modality.rope_cos``
-                and ``modality.rope_sin``, ``(batch, seq_len, head_dim // 2)``
-                over the residual, for position schemes that are not one
-                integer per token; they exclude ``position_ids``, cover the
-                appended tokens under ``kv_caches`` as ``position_ids`` does,
-                and are unsupported for MoT.
+                ``modality.attention_group_ids``, not both.
 
         Returns:
             Logits tensor of shape ``(batch, out_seq_len, vocab_size)``
@@ -568,19 +572,24 @@ class Transformer(nn.Module):
 
         start_pos = kv_caches[0].seq_len if kv_caches is not None else 0
 
-        if self._rope_cos.device != h.device:  # type: ignore[reportOptionalMemberAccess]
-            self._rope_cos = self._rope_cos.to(h.device)  # type: ignore[reportOptionalMemberAccess]
-            self._rope_sin = self._rope_sin.to(h.device)  # type: ignore[reportOptionalMemberAccess]
         if rope_cos is not None:
             assert rope_sin is not None
             cos, sin = rope_cos.to(h.device), rope_sin.to(h.device)
-        elif position_ids is not None:
-            position_ids = position_ids.to(h.device)
-            cos = self._rope_cos[position_ids]  # type: ignore[reportOptionalSubscript]
-            sin = self._rope_sin[position_ids]  # type: ignore[reportOptionalSubscript]
         else:
-            cos = self._rope_cos[start_pos : start_pos + seq_len]  # type: ignore[reportOptionalSubscript]
-            sin = self._rope_sin[start_pos : start_pos + seq_len]  # type: ignore[reportOptionalSubscript]
+            if self._rope_cos is None or self._rope_sin is None:
+                raise ValueError(
+                    "RoPE tables not initialized; call init_weights_and_freqs() after to_empty()"
+                )
+            if self._rope_cos.device != h.device:
+                self._rope_cos = self._rope_cos.to(h.device)
+                self._rope_sin = self._rope_sin.to(h.device)
+            if position_ids is not None:
+                position_ids = position_ids.to(h.device)
+                cos = self._rope_cos[position_ids]
+                sin = self._rope_sin[position_ids]
+            else:
+                cos = self._rope_cos[start_pos : start_pos + seq_len]
+                sin = self._rope_sin[start_pos : start_pos + seq_len]
 
         if self._moma_modalities:
             assert modality_ids is not None

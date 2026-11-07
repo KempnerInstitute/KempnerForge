@@ -29,7 +29,7 @@ _VOCAB = 97
 _MAX_SEQ_LEN = 32
 
 
-def _tiny_model(n_layers: int = 2, seed: int = 0) -> Transformer:
+def _tiny_model(n_layers: int = 2, seed: int = 0, **config_kw) -> Transformer:
     torch.manual_seed(seed)
     config = ModelConfig(
         dim=_DIM,
@@ -37,6 +37,7 @@ def _tiny_model(n_layers: int = 2, seed: int = 0) -> Transformer:
         n_heads=_N_HEADS,
         vocab_size=_VOCAB,
         max_seq_len=_MAX_SEQ_LEN,
+        **config_kw,
     )
     return Transformer(config).to(DEVICE).eval()
 
@@ -181,15 +182,22 @@ class TestTransformerPositionIds:
 
 
 class TestPositionIdsFromTheContext:
-    def test_context_positions_match_the_argument(self):
-        model = _tiny_model()
+    @pytest.mark.parametrize("backend", ["sdpa", "flex"])
+    def test_context_positions_match_the_argument(self, backend):
+        """With a group mask too, so the flex backend builds its BlockMask."""
+        model = _tiny_model(attention_backend=backend)
         tokens = torch.randint(0, _VOCAB, (2, 10), device=DEVICE)
         gen = torch.Generator().manual_seed(1)
         position_ids = torch.randint(0, _MAX_SEQ_LEN, (2, 10), generator=gen).to(DEVICE)
+        groups = torch.full((2, 10), -1, device=DEVICE)
+        groups[:, :4] = 0
         with torch.no_grad():
-            argument = model(tokens, position_ids=position_ids)
-            context = model(tokens, modality=ModalityContext(position_ids=position_ids))
-            default = model(tokens)
+            argument = model(tokens, position_ids=position_ids, attention_group_ids=groups)
+            context = model(
+                tokens,
+                modality=ModalityContext(position_ids=position_ids, attention_group_ids=groups),
+            )
+            default = model(tokens, attention_group_ids=groups)
         assert torch.equal(argument, context)
         assert not torch.equal(default, context)
 
@@ -277,6 +285,39 @@ class TestPositionIdsWithKVCache:
                 for i in range(5, 8)
             ]
         torch.testing.assert_close(torch.cat([prefill, *steps], dim=1), full, rtol=1e-5, atol=1e-5)
+
+    @pytest.mark.parametrize("route", ["default", "argument", "context", "rotation"])
+    @pytest.mark.parametrize("capture", [False, True], ids=["sdpa", "weights"])
+    def test_appending_several_tokens_matches_the_full_forward(self, route, capture):
+        """Tokens appended to a non-empty cache see every cached key, on both attention paths."""
+        model = _tiny_model()
+        for layer in model.layers.values():
+            layer.attention.capture_attention_weights = capture
+        tokens = torch.randint(0, _VOCAB, (2, 16), device=DEVICE)
+        positions = torch.arange(16, device=DEVICE).repeat(2, 1)
+        if route != "default":
+            positions = torch.tensor([[0, 0, 1, 2, 3, 3, 4, 5, 6, 6, 7, 8, 9, 9, 10, 11]] * 2).to(
+                DEVICE
+            )
+
+        def kwargs(sl: slice) -> dict:
+            if route == "default":
+                return {}
+            if route == "argument":
+                return {"position_ids": positions[:, sl]}
+            if route == "context":
+                return {"modality": ModalityContext(position_ids=positions[:, sl])}
+            return {"modality": TestRopeFromTheContext._rotation(model, positions[:, sl])}
+
+        caches = _caches(model, batch=2)
+        with torch.no_grad():
+            full = model(tokens, **kwargs(slice(None)))
+            prefill = model(tokens[:, :10], kv_caches=caches, **kwargs(slice(0, 10)))
+            appended = model(tokens[:, 10:], kv_caches=caches, **kwargs(slice(10, 16)))
+        assert caches[0].seq_len == 16
+        torch.testing.assert_close(
+            torch.cat([prefill, appended], dim=1), full, rtol=1e-5, atol=1e-5
+        )
 
     def test_decode_step_positions_are_checked_against_the_step(self):
         model = _tiny_model()
@@ -370,8 +411,22 @@ class TestRopeFromTheContext:
         model = _tiny_model()
         tokens = torch.randint(0, _VOCAB, (1, 5), device=DEVICE)
         ctx = self._rotation(model, torch.arange(5, device=DEVICE).unsqueeze(0))
+        ctx.rope_cos.requires_grad_(True)  # type: ignore[union-attr]
+        ctx.rope_sin.requires_grad_(True)  # type: ignore[union-attr]
         model(tokens, modality=ctx).sum().backward()
-        assert all(p.grad is not None for p in model.parameters() if p.requires_grad)
+        assert ctx.rope_cos.grad is not None and ctx.rope_cos.grad.abs().sum() > 0  # type: ignore[union-attr]
+        assert ctx.rope_sin.grad is not None and ctx.rope_sin.grad.abs().sum() > 0  # type: ignore[union-attr]
+
+    def test_a_rotation_needs_no_rope_tables(self):
+        """A model whose tables were never built still applies a given rotation."""
+        model = _tiny_model()
+        model._rope_cos = model._rope_sin = None
+        tokens = torch.randint(0, _VOCAB, (1, 5), device=DEVICE)
+        ctx = self._rotation(model, torch.arange(5, device=DEVICE).unsqueeze(0))
+        with torch.no_grad():
+            model(tokens, modality=ctx)
+        with pytest.raises(ValueError, match="RoPE tables not initialized"):
+            model(tokens)
 
     def test_rejects_position_ids_alongside(self):
         model = _tiny_model()
