@@ -455,13 +455,14 @@ def build_phase_state(config: JobConfig, data: DataPipeline, step: int) -> Phase
     )
 
     mixture, sampler = data.mixture_dataset, data.mixture_sampler
-    if step > 0 and phases and mixture is not None and sampler is not None:
+    if phases and mixture is not None and sampler is not None:
         for i, phase in enumerate(phases):
             if step >= phase.start_step:
                 _apply_phase(phase, state, mixture, sampler)
                 state.next_idx = i + 1
         if state.next_idx > 0:
-            logger.info(f"Resumed into phase {state.next_idx - 1}, lr_scale={state.lr_scale}")
+            action = "Resumed into" if step > 0 else "Starting in"
+            logger.info(f"{action} phase {state.next_idx - 1}, lr_scale={state.lr_scale}")
 
     return state
 

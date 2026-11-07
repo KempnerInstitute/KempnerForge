@@ -593,6 +593,19 @@ class TestPhaseState:
         assert state.lr_scale == 0.5
         assert data.mixture_sampler.calls[-1][0] == [9.0, 3.0]  # type: ignore[union-attr]
 
+    def test_start_phase_applies_at_step_zero(self):
+        config = make_config()
+        config.data = DataConfig(
+            phases=[TrainingPhase(start_step=0, dataset_weights={"a": 9.0}, lr_scale=0.5)]
+        )
+        data = _mixture_pipeline()
+
+        state = build_phase_state(config, data, step=0)
+
+        assert state.next_idx == 1
+        assert state.lr_scale == 0.5
+        assert data.mixture_sampler.calls[-1][0] == [9.0, 3.0]  # type: ignore[union-attr]
+
 
 class TestAdvancePhases:
     def test_noop_without_a_mixture(self):
@@ -870,6 +883,31 @@ class TestRunTrainingLoop:
         run_training_loop(session)
         assert session.optimizer.param_groups[0]["lr"] == pytest.approx(0.025)
 
+    def test_start_phase_scales_the_initial_lr_and_sampler(self):
+        data = _mixture_pipeline()
+        config = make_config(max_steps=1)
+        config.data = DataConfig(
+            phases=[TrainingPhase(start_step=0, dataset_weights={"a": 9.0}, lr_scale=0.5)]
+        )
+        phases = build_phase_state(config, data, step=0)
+
+        seen_lrs: list[float] = []
+
+        def record_lr(session: TrainingSession, step: int):
+            seen_lrs.append(session.optimizer.param_groups[0]["lr"])
+            return text_step(session, step)
+
+        session = make_session(
+            config,
+            data=data,
+            phases=phases,
+            step_fn=record_lr,
+        )
+
+        run_training_loop(session)
+        assert seen_lrs[0] == pytest.approx(0.025)
+        assert session.optimizer.param_groups[0]["lr"] == pytest.approx(0.025)
+
 
 class TestNanSkippedStep:
     """A step skipped for a non-finite loss still crosses the step boundary.
@@ -993,7 +1031,7 @@ class TestNanSkippedStep:
         assert resets == [1]
 
     def test_a_phase_reached_by_a_skipped_step_scales_the_lr_from_the_same_update(self):
-        """The phase's ``lr_scale`` first applies to step 3's update, as in an all-finite run."""
+        """The phase's ``lr_scale`` applies to the step that starts at ``start_step``."""
 
         def lr_at_each_step(nan_steps: set[int]) -> list[float]:
             lrs: list[float] = []
@@ -1012,7 +1050,7 @@ class TestNanSkippedStep:
             return lrs
 
         finite = lr_at_each_step(set())
-        assert finite == pytest.approx([0.05, 0.05, 0.05, 0.025])
+        assert finite == pytest.approx([0.05, 0.05, 0.025, 0.025])
         assert lr_at_each_step({1}) == finite
 
     def test_shutdown_is_acted_on_at_the_skipped_step(self):

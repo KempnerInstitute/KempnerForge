@@ -451,7 +451,9 @@ def _advance_lr_schedule(session: TrainingSession) -> None:
     """Step the scheduler, then scale the new LR by the active phase's ``lr_scale``.
 
     Runs once per step, a step skipped for a non-finite loss included, so
-    the schedule stays aligned with the step counter.
+    the schedule stays aligned with the step counter. Callers apply phase
+    transitions first so the step that starts at ``start_step`` uses the new
+    scale.
     """
     session.scheduler.step()
     if session.phases.lr_scale != 1.0:
@@ -593,6 +595,10 @@ def run_training_loop(
         )
         hooks.on_checkpoint_save(0, config.checkpoint.dir)
 
+    if step == 0 and phases.lr_scale != 1.0:
+        for param_group in optimizer.param_groups:
+            param_group["lr"] *= phases.lr_scale
+
     completed_normally = False
     ckpt_extra: dict = {}
 
@@ -608,9 +614,9 @@ def run_training_loop(
                 if session.nan_detector.should_rollback:
                     logger.error("Too many consecutive NaNs — stopping")
                     break
-                _advance_lr_schedule(session)
                 step += 1
                 _apply_step_transitions(session, step)
+                _advance_lr_schedule(session)
                 if _shutdown_if_requested(
                     session, step, tokens_seen, saved_this_step=False, nan_skipped=True
                 ):
@@ -618,7 +624,6 @@ def run_training_loop(
                 continue
 
             optimizer.step()
-            _advance_lr_schedule(session)
 
             optimizer.zero_grad()
 
@@ -627,6 +632,7 @@ def run_training_loop(
             tokens_seen += tokens_in_step
 
             _apply_step_transitions(session, step)
+            _advance_lr_schedule(session)
 
             current_lr = optimizer.param_groups[0]["lr"]
             step_metrics = tracker.end_step(
