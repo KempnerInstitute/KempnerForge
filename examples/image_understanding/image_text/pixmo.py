@@ -1,13 +1,14 @@
 """Readers for the PixMo annotations, whose images share one pool named by URL hash.
 
-About a fifth of that pool are saved HTTP error pages rather than images, so a
-read whose image does not decode moves on to the next row.
+A few images of the pool do not decode (truncated files, or ones over PIL's
+decompression-bomb limit), so a read whose image does not decode moves on to the
+next image.
 """
 
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Any, Literal
 
@@ -19,12 +20,13 @@ from kempnerforge.metrics.logger import get_logger
 
 from .decode import UnreadableImageError, decode_rgb, first_readable
 from .document import Document, Turn
-from .points import format_point_answer, pixels_to_percent
+from .points import check_max_points, format_point_answer, pixels_to_percent
 
 logger = get_logger(__name__)
 
 MAX_POINTS = 30
 MAX_ATTEMPTS = 16
+POINT_PLACEHOLDER = "<|POINT|>"
 
 
 def _jsonl(path: str | Path) -> Iterator[dict[str, Any]]:
@@ -41,7 +43,9 @@ def _is_text(value: Any) -> bool:
 class PixmoRows(Dataset):
     """Annotation rows over the PixMo image pool, skipping rows whose image does not decode.
 
-    A read tries ``index`` and then the rows after it, ``max_attempts`` rows in all.
+    A read tries ``index`` and then the rows after it, ``max_attempts`` images in
+    all: the rows that follow a failed one with the same image are passed over
+    without counting as attempts.
     """
 
     def __init__(
@@ -75,10 +79,23 @@ class PixmoRows(Dataset):
             logger.warning(f"skipping row {index}: {error}; later skips are counted, not logged")
         self.skipped += 1
 
+    def _image(self, index: int) -> str:
+        return self._rows["image"][index].as_py()
+
+    def _next_image(self, index: int) -> int:
+        """The first row after ``index`` whose image differs from its own."""
+        image = self._image(index)
+        for step in range(1, len(self)):
+            if self._image((index + step) % len(self)) != image:
+                return index + step
+        return index + 1
+
     def __getitem__(self, index: int) -> Document:
         if not 0 <= index < len(self):
             raise IndexError(f"index {index} is out of range for {len(self)} rows")
-        return first_readable(index, len(self), self.max_attempts, self._read, self._skip)
+        return first_readable(
+            index, len(self), self.max_attempts, self._read, self._skip, self._next_image
+        )
 
 
 class PixmoCaptions(PixmoRows):
@@ -120,7 +137,7 @@ class PixmoPointing(PixmoRows):
         max_attempts: int = MAX_ATTEMPTS,
     ) -> None:
         super().__init__(image_root, columns, max_attempts)
-        self.max_points = max_points
+        self.max_points = check_max_points(max_points)
 
     def document(self, row: dict[str, Any], image: Image.Image) -> Document:
         label = row["label"]
@@ -138,7 +155,11 @@ class PixmoCounting(PixmoRows):
 
     ``coordinates`` names the unit the points are stored in; pixel points are
     converted to percent of the decoded image's size. Every point is kept unless
-    ``max_points`` caps them, so the points agree with the stated count.
+    ``max_points`` caps them, so the points agree with the stated count; a cap
+    keeps the first points and still states the full count. The answer lists the
+    points before the count, so when it outruns the renderer's text budget (at
+    256 tokens, past about 13 points) the count is cut away and only the leading
+    points train; ``max_points`` bounds the answer so the count fits.
     """
 
     def __init__(
@@ -153,7 +174,7 @@ class PixmoCounting(PixmoRows):
             raise ValueError(f"coordinates must be 'percent' or 'pixels', got {coordinates!r}")
         super().__init__(image_root, columns, max_attempts)
         self.coordinates = coordinates
-        self.max_points = max_points
+        self.max_points = check_max_points(max_points)
 
     def document(self, row: dict[str, Any], image: Image.Image) -> Document:
         label = row["label"]
@@ -222,19 +243,61 @@ def pixmo_cap_qa(
     )
 
 
+def _in_percent(points: list[tuple[float, float]]) -> bool:
+    return all(0.0 <= x <= 100.0 and 0.0 <= y <= 100.0 for x, y in points)
+
+
+def explanation_answer(
+    parsed: str,
+    points: Sequence[Sequence[Sequence[float]]],
+    inline_text: Sequence[str],
+    alt_text: Sequence[str],
+) -> str | None:
+    """The reply with each placeholder of ``parsed`` rendered as a point tag.
+
+    The placeholders pair with ``points`` (a list of ``(x, y)`` per placeholder),
+    ``inline_text`` (the tag's text) and ``alt_text`` (its ``alt``), the way
+    Molmo rebuilds these answers. A reply whose counts disagree or whose points
+    leave the image is ``None``.
+    """
+    parts = parsed.split(POINT_PLACEHOLDER)
+    if not len(parts) - 1 == len(points) == len(inline_text) == len(alt_text):
+        return None
+    tags = []
+    for group, text, alt in zip(points, inline_text, alt_text, strict=True):
+        group_points = [(float(x), float(y)) for x, y in group]
+        if not group_points or not _in_percent(group_points):
+            return None
+        tags.append(format_point_answer(group_points, text, absent_text="", alt=alt))
+    return "".join(part + tag for part, tag in zip(parts, tags + [""], strict=True))
+
+
 def pixmo_point_explanations(
     annotation_file: str | Path, image_root: str | Path, max_attempts: int = MAX_ATTEMPTS
 ) -> PixmoConversations:
-    """PixMo point-explanations, answers with point tags already inline."""
+    """PixMo point-explanations, replies rebuilt from the parsed response and its points.
+
+    The raw ``response`` writes some multi-point tags in a second syntax, so the
+    replies are rebuilt from ``parsed_response`` with the pointing syntax;
+    turns whose points are malformed or outside the image are dropped.
+    """
+
+    def turns(row: dict[str, Any]) -> list[tuple[Any, Any]]:
+        fields = (
+            row.get("question") or [],
+            row.get("parsed_response") or [],
+            row.get("points") or [],
+            row.get("inline_text") or [],
+            row.get("alt_text") or [],
+        )
+        return [
+            (user, explanation_answer(parsed, pts, inline, alt))
+            for user, parsed, pts, inline, alt in zip(*fields, strict=False)
+        ]
+
     return _conversations(
         image_root,
-        (
-            (
-                row["image"],
-                list(zip(row.get("question") or [], row.get("response") or [], strict=False)),
-            )
-            for row in _jsonl(annotation_file)
-        ),
+        ((row["image"], turns(row)) for row in _jsonl(annotation_file)),
         max_attempts,
     )
 
@@ -261,16 +324,17 @@ def pixmo_counting(
     image_root: str | Path,
     *,
     multi_label: bool,
-    coordinates: Literal["percent", "pixels"],
     max_points: int | None = None,
     max_attempts: int = MAX_ATTEMPTS,
 ) -> PixmoCounting:
     """PixMo counting, keeping every point of a row unless ``max_points`` caps them.
 
     ``multi_label`` rows hold parallel ``label``, ``count`` and ``points`` lists
-    (PixMo-Points counting); otherwise a row is one label whose ``points`` are an
-    ``{"x": [...], "y": [...]}`` mapping (PixMo-Count).
+    in percent (PixMo-Points counting); otherwise a row is one label whose
+    ``points`` are an ``{"x": [...], "y": [...]}`` mapping in pixels (PixMo-Count),
+    converted to percent of the decoded image.
     """
+    coordinates: Literal["percent", "pixels"] = "percent" if multi_label else "pixels"
     columns: dict[str, list[Any]] = {"image": [], "label": [], "count": [], "xs": [], "ys": []}
     for row in _jsonl(annotation_file):
         if multi_label:

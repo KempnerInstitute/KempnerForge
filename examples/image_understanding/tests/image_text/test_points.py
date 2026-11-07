@@ -29,6 +29,16 @@ class TestFormatPointAnswer:
         answer = format_point_answer([(1, 1), (2, 2), (3, 3)], "x", absent_text="", max_points=2)
         assert 'x2="2.0"' in answer and "x3" not in answer
 
+    @pytest.mark.parametrize("max_points", [0, -1])
+    def test_a_cap_below_one_point_is_refused(self, max_points: int) -> None:
+        with pytest.raises(ValueError, match="at least 1"):
+            format_point_answer([(1, 1)], "x", absent_text="", max_points=max_points)
+
+    def test_alt_text_is_separate_from_the_label(self) -> None:
+        assert format_point_answer([(1, 1)], "5 clouds", absent_text="", alt="Clouds") == (
+            '<point x="1.0" y="1.0" alt="Clouds">5 clouds</point>'
+        )
+
     def test_label_is_escaped(self) -> None:
         answer = format_point_answer([(1, 1)], 'a "b" & <c>', absent_text="")
         assert 'alt="a &quot;b&quot; &amp; &lt;c&gt;"' in answer
