@@ -10,23 +10,32 @@ def _coordinate(value: float) -> str:
     return f"{min(100.0, max(0.0, value)):.1f}"
 
 
+def check_max_points(max_points: int | None) -> int | None:
+    """``max_points`` as given, refusing a cap below one point."""
+    if max_points is not None and max_points < 1:
+        raise ValueError(f"max_points must be at least 1, got {max_points}")
+    return max_points
+
+
 def format_point_answer(
     points: Sequence[tuple[float, float]],
     label: str,
     *,
     absent_text: str,
     max_points: int | None = None,
+    alt: str | None = None,
 ) -> str:
     """Render percent ``(x, y)`` points for ``label`` as a ``<point>`` or ``<points>`` tag.
 
     No points give ``absent_text``. Coordinates are clamped to ``[0, 100]`` with
-    one decimal, and at most ``max_points`` of them are kept.
+    one decimal, and at most ``max_points`` of them are kept. The tag's ``alt``
+    attribute is ``alt`` when given, else ``label``.
     """
     if not points:
         return absent_text
-    if max_points is not None:
+    if check_max_points(max_points) is not None:
         points = points[:max_points]
-    label_attr = escape(label, {'"': "&quot;"})
+    label_attr = escape(label if alt is None else alt, {'"': "&quot;"})
     label_text = escape(label)
     if len(points) == 1:
         x, y = points[0]

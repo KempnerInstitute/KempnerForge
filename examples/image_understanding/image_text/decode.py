@@ -6,7 +6,9 @@ import io
 from collections.abc import Callable
 from pathlib import Path
 
-from PIL import Image
+from PIL import Image, ImageOps
+
+DECODE_ERRORS = (OSError, ValueError, SyntaxError, Image.DecompressionBombError)
 
 
 class UnreadableImageError(Exception):
@@ -14,16 +16,17 @@ class UnreadableImageError(Exception):
 
 
 def decode_rgb(source: str | Path | bytes) -> Image.Image:
-    """Decode an image file or byte string as RGB.
+    """Decode an image file or byte string as RGB, turned upright by its EXIF orientation.
 
     Data that does not decode raises ``UnreadableImageError``; a file the system
     cannot open (missing, unreadable) raises its own ``OSError``, which carries an
-    errno where a decoding failure does not.
+    errno where a decoding failure does not. Any other error propagates.
     """
     try:
         with Image.open(io.BytesIO(source) if isinstance(source, bytes) else source) as image:
-            return image.convert("RGB")
-    except Exception as exc:
+            upright = ImageOps.exif_transpose(image)
+            return upright.convert("RGB")  # type: ignore[union-attr]
+    except DECODE_ERRORS as exc:
         if isinstance(exc, OSError) and exc.errno is not None:
             raise
         what = f"{len(source)} bytes" if isinstance(source, bytes) else str(source)
@@ -36,16 +39,19 @@ def first_readable[T](
     max_attempts: int,
     read: Callable[[int], T],
     on_skip: Callable[[int, UnreadableImageError], None],
+    next_row: Callable[[int], int] | None = None,
 ) -> T:
-    """``read(index)``, moving on to the following rows while their image does not decode.
+    """``read(index)``, moving on past rows whose image does not decode.
 
-    Rows wrap around at ``length``; after ``max_attempts`` unreadable rows in a row
-    it raises ``RuntimeError``.
+    After an unreadable row the next one tried is ``next_row(row)`` (by default
+    the following row), wrapping around at ``length``; after ``max_attempts``
+    unreadable rows in a row it raises ``RuntimeError``.
     """
-    for attempt in range(max_attempts):
-        row = (index + attempt) % length
+    row = index
+    for _ in range(max_attempts):
         try:
             return read(row)
         except UnreadableImageError as exc:
             on_skip(row, exc)
+            row = (next_row(row) if next_row is not None else row + 1) % length
     raise RuntimeError(f"{max_attempts} consecutive rows from index {index} have no readable image")

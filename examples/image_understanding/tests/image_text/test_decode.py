@@ -10,6 +10,8 @@ import pytest
 from image_text.decode import UnreadableImageError, decode_rgb, first_readable
 from PIL import Image
 
+EXIF_ORIENTATION = 0x0112
+
 
 class TestDecodeRgb:
     def test_decodes_a_file(self, write_image: Callable) -> None:
@@ -41,6 +43,21 @@ class TestDecodeRgb:
         with pytest.raises(FileNotFoundError):
             decode_rgb(tmp_path / "absent.png")
 
+    def test_other_errors_propagate(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def out_of_memory(*args, **kwargs):
+            raise MemoryError
+
+        monkeypatch.setattr(Image, "open", out_of_memory)
+        with pytest.raises(MemoryError):
+            decode_rgb(b"\x00")
+
+    def test_exif_orientation_turns_the_image_upright(self, tmp_path: Path) -> None:
+        exif = Image.Exif()
+        exif[EXIF_ORIENTATION] = 6
+        path = tmp_path / "rotated.jpg"
+        Image.new("RGB", (8, 4)).save(path, exif=exif)
+        assert decode_rgb(path).size == (4, 8)
+
 
 class TestFirstReadable:
     def _read(self, unreadable: set[int]) -> Callable[[int], int]:
@@ -69,3 +86,10 @@ class TestFirstReadable:
 
         with pytest.raises(KeyError):
             first_readable(0, 5, 3, read, lambda *_: None)
+
+    def test_next_row_chooses_where_to_continue(self) -> None:
+        skipped: list[int] = []
+        row = first_readable(
+            0, 5, 2, self._read({0, 1, 2}), lambda i, _: skipped.append(i), lambda i: i + 3
+        )
+        assert row == 3 and skipped == [0]
