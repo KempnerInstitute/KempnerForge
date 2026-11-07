@@ -25,6 +25,7 @@ from typing import Any, Protocol, TypeGuard, cast
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import _CHECKPOINT_PREFIX
 from torch.distributed.checkpoint import DefaultLoadPlanner
 from torch.distributed.checkpoint.metadata import STATE_DICT_TYPE, Metadata
 from torch.distributed.checkpoint.state_dict import (
@@ -233,17 +234,20 @@ def _reset_to_fresh(optimizer: torch.optim.Optimizer) -> None:
 
 
 class _NeverSteppedStatePlanner(DefaultLoadPlanner):
-    """Load planner that leaves out the optimizer state the save recorded as absent.
+    """Load planner that leaves out the optimizer state a checkpoint does not hold.
 
-    A fresh optimizer's template has state for every trainable parameter, but a
-    checkpoint has none for parameters that had not received a gradient when it
-    was saved. Those are dropped from the load and kept in ``never_stepped`` for
-    the caller to confirm against the saved ``param_groups``; every other key
-    stays required, including one whose state is missing without a record.
+    Drops from the load the parameters the save recorded as never stepped, kept in
+    ``never_stepped`` for the caller to confirm against the saved ``param_groups``, and the
+    parameters in ``left_out``. Every other key stays required, including one whose state
+    is missing without a record.
+
+    Args:
+        left_out: Names of parameters the saved optimizer did not hold.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, left_out: Iterable[str] = ()) -> None:
         super().__init__()
+        self.left_out = frozenset(left_out)
         self.never_stepped: set[str] = set()
 
     def set_up_planner(
@@ -256,7 +260,7 @@ class _NeverSteppedStatePlanner(DefaultLoadPlanner):
         if optim_state is not None and metadata is not None:
             fqns = set(optim_state["state"])
             self.never_stepped = _params_recorded_never_stepped(fqns, metadata.state_dict_metadata)
-            for fqn in self.never_stepped:
+            for fqn in self.never_stepped | (self.left_out & fqns):
                 del optim_state["state"][fqn]
         super().set_up_planner(state_dict, metadata, is_coordinator)
 
@@ -278,6 +282,87 @@ def _restore_never_stepped(
             f"the saved optimizer did not hold: {unheld[:8]}"
         )
     optim_state["state"].update({fqn: {} for fqn in never_stepped})
+
+
+def _params_the_save_left_out(fqns: Iterable[str], saved_keys: Iterable[str]) -> set[str]:
+    """Return the names in ``fqns`` that a checkpoint's optimizer did not hold.
+
+    Names are compared without the activation-checkpoint wrapper's prefix, as DCP writes
+    them. A checkpoint that stores the optimizer as one opaque entry leaves none out.
+
+    Args:
+        fqns: Parameter names of the uncompiled model, with or without the
+            activation-checkpoint wrapper's prefix.
+        saved_keys: The keys the checkpoint's DCP index lists.
+
+    Returns:
+        The names, without the wrapper's prefix, that have neither saved optimizer state
+        nor a never-stepped record.
+    """
+    keys = list(saved_keys)
+    if "optimizer" in keys:
+        return set()
+    needed = {fqn.replace(_CHECKPOINT_PREFIX, "") for fqn in fqns}
+    covered: set[str] = set()
+    for key in keys:
+        if key.startswith(_NEVER_STEPPED_PREFIX):
+            covered.add(key.removeprefix(_NEVER_STEPPED_PREFIX))
+        elif key.startswith(_OPTIM_STATE_PREFIX):
+            fqn = key.removeprefix(_OPTIM_STATE_PREFIX)
+            while fqn and fqn not in needed:
+                fqn = fqn.rpartition(".")[0]
+            covered.add(fqn)
+    return needed - covered
+
+
+def _restore_left_out(
+    optim_state: dict[str, Any],
+    template_groups: list[list[str]],
+    left_out: set[str],
+    where: Path,
+) -> None:
+    """Give the parameters the saved optimizer did not hold empty state in a saved group.
+
+    Each joins the saved group that holds another parameter of its group in the optimizer
+    being loaded or, when no saved group does and the saved optimizer has as many groups,
+    the saved group in its group's place if that group is empty, and takes that group's
+    saved hyperparameters.
+
+    Args:
+        optim_state: The loaded optimizer state; its ``param_groups`` list the saved names.
+        template_groups: The parameter names of each group of the optimizer being loaded.
+        left_out: The names with neither saved state nor a never-stepped record.
+        where: The checkpoint directory, named in the errors.
+
+    Raises:
+        RuntimeError: The saved groups list one of ``left_out``, so the saved optimizer held
+            it and its state is missing, or no saved group fits a group of ``left_out``.
+    """
+    saved_groups = optim_state["param_groups"]
+    listed = {name for group in saved_groups for name in group["params"]}
+    held_without_state = sorted(left_out & listed)
+    if held_without_state:
+        raise RuntimeError(
+            f"Missing optimizer state in {where} for {len(held_without_state)} parameters "
+            f"the saved optimizer held: {held_without_state[:8]}"
+        )
+    same_layout = len(saved_groups) == len(template_groups)
+    for index, names in enumerate(template_groups):
+        missing = [name for name in names if name in left_out]
+        if not missing:
+            continue
+        others = set(names) - left_out
+        group = next((g for g in saved_groups if others & set(g["params"])), None)
+        if group is None and same_layout and not saved_groups[index]["params"]:
+            group = saved_groups[index]
+        if group is None:
+            raise RuntimeError(
+                f"{where} has no param group for {len(missing)} parameters its optimizer did "
+                f"not hold: {missing[:8]}. No saved group holds another parameter of their "
+                "group or stands empty in its place."
+            )
+        group["params"] = [*group["params"], *missing]
+    optim_state["state"].update({name: {} for name in left_out})
 
 
 def _check_saved_state_matches(
@@ -842,6 +927,7 @@ class CheckpointManager:
         dataloader: Any | None = None,
         exclude_keys: list[str] | None = None,
         vlm_freeze_expected: list[dict[str, Any]] | None = None,
+        fresh_if_unheld: Iterable[str] = (),
     ) -> tuple[int, int, dict[str, Any]]:
         """Load a checkpoint and restore all state.
 
@@ -857,10 +943,21 @@ class CheckpointManager:
                 a mismatch raises ``ValueError`` unless the checkpoint
                 config has ``ignore_freeze_mismatch=True``, in which case
                 the load proceeds with a warning.
+            fresh_if_unheld: Names of parameters the saved optimizer may not hold,
+                the ones a freeze stage unfreezes after the build froze them. One
+                with neither saved state nor a never-stepped record resumes with
+                empty optimizer state, in the saved group of its group's other
+                parameters or, when the saved optimizer has as many groups, in the
+                empty saved group in its group's place.
 
         Returns:
             Tuple of (step, tokens_seen, extra) where extra contains any
             additional keys saved via ``build_train_state(extra=...)``.
+
+        Raises:
+            RuntimeError: A name in ``fresh_if_unheld`` with neither saved state
+                nor a never-stepped record is listed in the saved param groups,
+                or no saved param group fits it.
         """
         ckpt_dir = self._resolve_load_path(path)
         if ckpt_dir is None:
@@ -932,6 +1029,8 @@ class CheckpointManager:
             load_optim = False
 
         dcp_state: dict[str, Any] = {}
+        left_out: set[str] = set()
+        template_groups: list[list[str]] = []
         optimizers = self._optimizers_saved_in(dcp_dir, saved_keys) if load_optim else []
         if load_model:
             dcp_state["model"] = get_model_state_dict(self.model)
@@ -944,9 +1043,14 @@ class CheckpointManager:
                     f"resuming with {filled}"
                 )
             _check_saved_state_matches(dcp_state["optimizer"], saved_keys, dcp_dir)
+            template = cast("dict[str, Any]", dcp_state["optimizer"])
+            left_out = _params_the_save_left_out(fresh_if_unheld, saved_keys) & set(
+                template["state"]
+            )
+            template_groups = [list(group["params"]) for group in template["param_groups"]]
 
         if dcp_state:
-            planner = _NeverSteppedStatePlanner()
+            planner = _NeverSteppedStatePlanner(left_out)
             dcp.load(
                 dcp_state,
                 checkpoint_id=str(dcp_dir),
@@ -957,6 +1061,7 @@ class CheckpointManager:
             if load_optim:
                 optim_state = cast("dict[str, Any]", dcp_state["optimizer"])
                 _restore_never_stepped(optim_state, planner.never_stepped, dcp_dir)
+                _restore_left_out(optim_state, template_groups, left_out, dcp_dir)
             if load_model:
                 set_model_state_dict(self.model, dcp_state["model"])
             if load_optim:
@@ -967,6 +1072,11 @@ class CheckpointManager:
                 logger.info(
                     f"{len(planner.never_stepped)} parameters the saved optimizer held were never "
                     f"stepped and resume without state: {sorted(planner.never_stepped)[:8]}"
+                )
+            if left_out:
+                logger.info(
+                    f"{len(left_out)} parameters that a freeze stage unfreezes were not in the "
+                    f"saved optimizer and resume without state: {sorted(left_out)[:8]}"
                 )
         if fresh_optimizer:
             for optimizer in self.checkpointed_optimizers:

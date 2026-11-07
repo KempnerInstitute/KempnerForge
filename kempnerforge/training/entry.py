@@ -46,6 +46,7 @@ from kempnerforge.training.freeze import (
     apply_freeze_specs,
     effective_freeze,
     freeze_meta_at_step,
+    trainable_for_the_run,
 )
 from kempnerforge.training.hooks import HookRunner
 from kempnerforge.training.loop import (
@@ -194,6 +195,16 @@ def build_checkpoint_manager(
     )
 
 
+def _trainable_for_the_run(
+    model: torch.nn.Module, config: JobConfig
+) -> contextlib.AbstractContextManager[list[str]]:
+    """``trainable_for_the_run`` for a VLM with a freeze schedule; otherwise a context that
+    changes nothing and yields no names."""
+    if config.vlm is None or not config.vlm.freeze_schedule:
+        return contextlib.nullcontext([])
+    return trainable_for_the_run(model, config.vlm)
+
+
 def restore_checkpoint(
     config: JobConfig,
     model: torch.nn.Module,
@@ -204,7 +215,9 @@ def restore_checkpoint(
 
     Returns ``(step, tokens_seen)`` — ``(0, 0)`` when there is nothing to
     resume from. Also restores the metrics run ids, runs the MoT warm-start
-    hook, and re-applies the effective freeze at the resumed step.
+    hook, and re-applies the effective freeze at the resumed step. A module
+    that a freeze stage unfreezes gets its saved optimizer state back, or
+    empty state when the saved optimizer had none for it.
     """
     num_stages = config.distributed.pp if config.distributed.pp > 1 else None
     if dist.is_initialized():
@@ -230,12 +243,14 @@ def restore_checkpoint(
     warm_start_exclude = (
         (config.checkpoint.exclude_from_loading or None) if resume_path is None else None
     )
-    step, tokens_seen, ckpt_extra_loaded = ckpt_mgr.load(
-        path=str(resume_path) if resume_path else None,
-        scheduler=scheduler,
-        exclude_keys=warm_start_exclude,
-        vlm_freeze_expected=vlm_freeze_expected,
-    )
+    with _trainable_for_the_run(model, config) as unfrozen_later:
+        step, tokens_seen, ckpt_extra_loaded = ckpt_mgr.load(
+            path=str(resume_path) if resume_path else None,
+            scheduler=scheduler,
+            exclude_keys=warm_start_exclude,
+            vlm_freeze_expected=vlm_freeze_expected,
+            fresh_if_unheld=unfrozen_later,
+        )
     if ckpt_extra_loaded.get("wandb_run_id"):
         config.metrics.wandb_run_id = ckpt_extra_loaded["wandb_run_id"]
     if ckpt_extra_loaded.get("mlflow_run_id"):
@@ -290,7 +305,8 @@ def run_training(
                 f"forward passes run under torch.autocast({amp_dtype})"
             )
 
-        optimizer = build_optimizer(model, config.optimizer)
+        with _trainable_for_the_run(model, config):
+            optimizer = build_optimizer(model, config.optimizer)
         scheduler = build_scheduler(optimizer, config.scheduler, max_steps=config.train.max_steps)
 
         ckpt_mgr = build_checkpoint_manager(config, runtime, model, optimizer, pipeline)

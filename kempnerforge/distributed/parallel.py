@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+from collections.abc import Iterable
 from functools import partial
 from typing import TYPE_CHECKING
 
@@ -93,6 +94,34 @@ def default_mp_policy(param_dtype: torch.dtype = torch.bfloat16) -> MixedPrecisi
 def is_fsdp_wrapped(model: torch.nn.Module) -> bool:
     """Whether ``fully_shard`` was applied to ``model`` or any of its submodules."""
     return any(isinstance(m, FSDPModule) for m in model.modules())
+
+
+def refresh_fsdp_dtypes(model: torch.nn.Module, params: Iterable[torch.Tensor]) -> None:
+    """Recompute the reduction dtypes of the FSDP2 units that manage ``params``.
+
+    Call it after unfreezing parameters of an FSDP2-wrapped model. Each unit that manages
+    one of ``params`` itself, not through a nested unit, is unsharded and resharded. Every
+    rank calls it with the same parameters.
+
+    Args:
+        model: The model, wrapped with FSDP2 or not.
+        params: The parameters whose ``requires_grad`` was turned on.
+    """
+    changed = {id(p) for p in params}
+    if not changed:
+        return
+    for module in model.modules():
+        if not isinstance(module, FSDPModule):
+            continue
+        nested = {
+            id(p)
+            for sub in module.modules()
+            if sub is not module and isinstance(sub, FSDPModule)
+            for p in sub.parameters()
+        }
+        if any(id(p) in changed and id(p) not in nested for p in module.parameters()):
+            module.unshard()
+            module.reshard()
 
 
 def autocast_dtype(
@@ -335,9 +364,11 @@ def _apply_fsdp_vlm(
         and VLM+MoE cannot deadlock).
       - Transformer root (embedding + final norm + output head): own unit.
       - Adapter: own unit (small, but keeps grad-sync scheduling symmetric).
-      - Vision encoder: wrapped only when not fully frozen. A frozen encoder
-        stays as a full replica in eval mode; replication is fine because
-        requires_grad=False means no grad-reduce participation.
+      - Vision encoder: wrapped unless no step of the run trains it. An
+        encoder frozen for the whole run stays a full replica, put in eval
+        mode at build; replication is fine because requires_grad=False
+        means no grad-reduce participation. One that a freeze stage unfreezes is
+        wrapped from the start.
       - The ``VLMWrapper`` itself is not wrapped (no direct parameters).
     """
     if not has_dp_mesh(device_mesh):
@@ -404,24 +435,21 @@ def _build_vlm(
          ``num_tokens`` is known from the encoder.
       4. TP / EP / Float8 / AC are applied to the transformer only.
       5. FSDP2 is applied component-by-component (transformer blocks,
-         transformer root, adapter, and vision encoder iff not frozen).
+         transformer root, adapter, and vision encoder unless no step of
+         the run trains it).
       6. Meta subtrees are materialized (transformer / adapter), the
          vision encoder is moved to ``device``, and the transformer and
          adapter are cast to ``param_dtype``. The vision encoder stays in
          its HF dtype (D16) to avoid ViT LayerNorm numerical drift.
-      7. Freeze specs are applied via ``apply_freeze_specs`` and a fully
-         frozen encoder is switched to ``eval()``.
+      7. Freeze specs are applied via ``apply_freeze_specs`` and an encoder
+         frozen for the whole run is switched to ``eval()``.
     """
     from kempnerforge.distributed.expert_parallel import apply_expert_parallel
     from kempnerforge.distributed.tensor_parallel import apply_tensor_parallel
     from kempnerforge.model.adapter import build_adapter
     from kempnerforge.model.transformer import Transformer
-    from kempnerforge.model.vlm import (
-        VLMWrapper,
-        _is_encoder_frozen,
-        build_modality_strategy,
-    )
-    from kempnerforge.training.freeze import apply_freeze_specs
+    from kempnerforge.model.vlm import VLMWrapper, build_modality_strategy
+    from kempnerforge.training.freeze import apply_freeze_specs, trainable_during_run
 
     assert vlm_config is not None, "_build_vlm requires vlm_config to be set"
     assert vision_config is not None, "_build_vlm requires vision_config to be set"
@@ -464,7 +492,9 @@ def _build_vlm(
         apply_float8(transformer)
     apply_ac(transformer, ac_mode)
 
-    encoder_frozen = _is_encoder_frozen(vlm_config.freeze)
+    encoder_frozen = not any(
+        name.startswith("vision_encoder.") for name in trainable_during_run(wrapper, vlm_config)
+    )
     if device_mesh is not None:
         _apply_fsdp_vlm(wrapper, device_mesh, mp_policy, encoder_frozen=encoder_frozen)
 

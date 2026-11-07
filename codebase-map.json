@@ -421,7 +421,6 @@
       "functions": [
         "_project_image_features(wrapper, pixel_values) -> Tensor",
         "build_modality_strategy(vlm) -> ModalityStrategy",
-        "_is_encoder_frozen(specs) -> bool",
         "build_vlm_wrapper(model_config) -> VLMWrapper",
         "inner_transformer(model) -> nn.Module"
       ],
@@ -434,7 +433,6 @@
         "tests/unit/test_vlm.py::TestAdapter",
         "tests/unit/test_vlm.py::TestVLMWrapper",
         "tests/unit/test_vlm.py::TestInnerTransformer",
-        "tests/unit/test_vlm.py::TestIsEncoderFrozen",
         "tests/unit/test_vlm.py::TestModalityStrategies",
         "tests/unit/test_vlm.py::TestVLMWrapperDispatch",
         "tests/integration/test_vlm_train_step.py",
@@ -790,13 +788,17 @@
         "apply_freeze_specs(model, specs, module_patterns) -> dict",
         "canonical_freeze_meta(specs) -> list[dict]",
         "effective_freeze(step, base_specs, schedule, valid_modules) -> list[FreezeSpec]",
-        "freeze_meta_at_step(step, config) -> list[dict]"
+        "freeze_meta_at_step(step, config) -> list[dict]",
+        "trainable_during_run(model, config) -> set[str] (names of the parameters that train at some step: after the build freeze, each FreezeStage, or a resume)",
+        "trainable_for_the_run(model, config) -> Iterator[list[str]] (context manager: those parameters require grad while the optimizer is built or a checkpoint loaded)"
       ],
       "tested_by": [
         "tests/unit/test_freeze.py::TestFreezeParams",
         "tests/unit/test_freeze.py::TestApplyFreezeSpecs",
         "tests/unit/test_freeze.py::TestCanonicalFreezeMeta",
         "tests/unit/test_freeze.py::TestEffectiveFreeze",
+        "tests/unit/test_freeze.py::TestTrainableDuringRun",
+        "tests/unit/test_freeze.py::TestTrainableForTheRun",
         "tests/integration/test_vlm_cross_attn.py::TestFreezeStageHook",
         "tests/integration/test_vlm_mot.py::TestFreezeStageHook",
         "tests/distributed/test_vlm_cross_attn_fsdp.py::TestFreezeStageUnderFsdp",
@@ -900,13 +902,16 @@
         "text_step(session, step) -> StepResult",
         "vlm_step(session, step) -> StepResult",
         "pipeline_step(session, step) -> StepResult",
-        "checkpoint_extra(config, step, phases) -> dict"
+        "checkpoint_extra(config, step, phases) -> dict",
+        "_apply_stage_specs(model, specs, pattern_map) -> dict (one FreezeStage: refreshes the FSDP2 dtypes of what it unfreezes and resets a compiled model when it unfreezes parameters)"
       ],
       "tested_by": [
         "tests/unit/test_train_entry.py::TestRunTrainingLoop",
         "tests/unit/test_train_entry.py::TestBatchStream",
         "tests/unit/test_train_entry.py::TestSelectStepFn",
         "tests/unit/test_train_entry.py::TestCheckpointExtra",
+        "tests/unit/test_train_entry.py::TestUnfreezeAtAStage",
+        "tests/integration/test_freeze_schedule_compile.py",
         "tests/e2e/test_training_e2e.py"
       ]
     },
@@ -916,11 +921,14 @@
         "run_training(config, step_fn=None, hooks=None)",
         "build_model(config, runtime, loss_fn) -> tuple[Module, PipelineBundle | None]",
         "build_checkpoint_manager(config, runtime, model, optimizer, pipeline) -> CheckpointManager",
-        "restore_checkpoint(config, model, scheduler, ckpt_mgr) -> tuple[int, int]"
+        "restore_checkpoint(config, model, scheduler, ckpt_mgr) -> tuple[int, int]",
+        "_trainable_for_the_run(model, config) (trainable_for_the_run for a VLM with a freeze schedule, else a context that changes nothing)"
       ],
       "tested_by": [
         "tests/unit/test_train_entry.py::TestRunTraining",
         "tests/unit/test_train_entry.py::TestBuildPhaseHelpers",
+        "tests/unit/test_train_entry.py::TestResumePastAnUnfreezeStage",
+        "tests/unit/test_train_entry.py::TestResumeACheckpointThatLeftTheModuleOut",
         "tests/e2e/test_training_e2e.py",
         "tests/smoke/test_smoke.py"
       ]
@@ -1086,12 +1094,13 @@
         "apply_ac(model, mode)",
         "apply_float8(model, enable_fsdp_float8_all_gather)",
         "apply_fsdp2(model, device_mesh, mp_policy, reshard_after_forward) (text-only path; shares _fsdp_wrap_transformer_blocks with VLM)",
-        "_apply_fsdp_vlm(wrapper, device_mesh, mp_policy, reshard_after_forward) (VLM-aware FSDP: inner Transformer per-block + adapter + optional encoder wrap based on freeze)",
+        "_apply_fsdp_vlm(wrapper, device_mesh, mp_policy, reshard_after_forward) (VLM-aware FSDP: inner Transformer per-block + adapter + encoder wrap unless no step of the run trains it)",
         "_fsdp_wrap_transformer_blocks(transformer, dp_mesh, policy, reshard_after_forward) (EP-MoE-aware per-block FSDP wrap; iterates transformer.layers and transformer.cross_attention_layers)",
         "_has_ep_moe(module) -> bool",
         "has_dp_mesh(device_mesh) -> bool",
         "get_dp_mesh(device_mesh) -> DeviceMesh",
-        "default_mp_policy(param_dtype) -> MixedPrecisionPolicy"
+        "default_mp_policy(param_dtype) -> MixedPrecisionPolicy",
+        "refresh_fsdp_dtypes(model, params) (recomputes the reduction dtypes of the FSDP2 units that manage params; collective)"
       ],
       "tested_by": [
         "tests/distributed/test_fsdp.py::TestFSDP2",
@@ -1101,7 +1110,9 @@
         "tests/unit/test_distributed.py::TestDefaultMpPolicy",
         "tests/unit/test_distributed.py::TestApplyFsdpVLMGuards",
         "tests/unit/test_distributed.py::TestBuildParallelModelVLM",
-        "tests/unit/test_distributed.py::TestFsdpWrapTransformerBlocksHelper"
+        "tests/unit/test_distributed.py::TestFsdpWrapTransformerBlocksHelper",
+        "tests/unit/test_unfreeze_fsdp.py",
+        "tests/distributed/test_freeze_schedule_fsdp.py"
       ]
     },
     "kempnerforge/distributed/tensor_parallel.py": {
@@ -1190,7 +1201,7 @@
             "wait()",
             "flush_pending_save()",
             "peek_saved_step(path)",
-            "load(path, scheduler, dataloader, exclude_keys, vlm_freeze_expected)",
+            "load(path, scheduler, dataloader, exclude_keys, vlm_freeze_expected, fresh_if_unheld)",
             "_read_saved_keys(ckpt_dir, dcp_dir) (this rank's DCP keys; checks the scope only when an all-reduce on the gloo group finds optimizer state on some rank)",
             "_check_weight_decay_scope(ckpt_dir) (rank 0 reads the saved scope and broadcasts it; every rank refuses a mismatch)",
             "apply_dataloader_state(dataloader)",
@@ -1202,7 +1213,9 @@
       "functions": [
         "_load_train_state(path) -> dict (ownership-gated torch.load with weights_only=False)",
         "_intersect_freeze_meta_by_module(saved, expected) -> (saved_filt, expected_filt) (cross-arch drop-zero-match rule)",
-        "_read_weight_decay_scope(ckpt_dir) -> str (scope recorded in metadata.json; none recorded means exclude_norms_and_biases)"
+        "_read_weight_decay_scope(ckpt_dir) -> str (scope recorded in metadata.json; none recorded means exclude_norms_and_biases)",
+        "_params_the_save_left_out(fqns, saved_keys) -> set[str] (named parameters with neither saved optimizer state nor a never-stepped record)",
+        "_restore_left_out(optim_state, template_groups, left_out, where) (empty state for them, in the saved group of their group's other parameters or an empty saved group in its place; refuses a name the saved groups list)"
       ],
       "tested_by": [
         "tests/unit/test_checkpoint.py::TestWeightDecayScopeOnResume",
@@ -1212,6 +1225,7 @@
         "tests/unit/test_checkpoint.py::TestSaveVLMFreezeMetadata",
         "tests/unit/test_checkpoint.py::TestLoadVLMFreezeCompare",
         "tests/unit/test_checkpoint.py::TestIntersectFreezeMetaByModule",
+        "tests/unit/test_checkpoint.py::TestFreshIfUnheld",
         "tests/unit/test_checkpoint_security.py::TestLoadTrainStateOwnershipGate",
         "tests/unit/test_checkpoint_security.py::TestManagerLoadRejectsForeignCheckpoint",
         "tests/integration/test_checkpoint_roundtrip.py::TestCheckpointRoundtrip",
@@ -1506,10 +1520,10 @@
           "TestGetWorldInfo(5)",
           "TestDefaultMpPolicy(2)",
           "TestApplyFsdpVLMGuards(2)",
-          "TestBuildParallelModelVLM(6)",
+          "TestBuildParallelModelVLM(5)",
           "TestFsdpWrapTransformerBlocksHelper(1)"
         ],
-        "count": 35
+        "count": 34
       },
       "tests/unit/test_resilience.py": {
         "classes": [
@@ -1533,9 +1547,10 @@
           "TestPeekSavedStep(5)",
           "TestFlushPendingSave(1)",
           "TestSaveVLMFreezeMetadata(3)",
-          "TestLoadVLMFreezeCompare(9)"
+          "TestLoadVLMFreezeCompare(9)",
+          "TestFreshIfUnheld(9)"
         ],
-        "count": 51
+        "count": 60
       },
       "tests/unit/test_observability.py": {
         "classes": [
@@ -1742,12 +1757,11 @@
           "TestAdapter(8)",
           "TestVLMWrapper(7)",
           "TestInnerTransformer(5)",
-          "TestIsEncoderFrozen(5)",
           "TestModalityStrategies(5)",
           "TestVLMWrapperDispatch(11)",
           "TestBuildVLMWrapperErrors(1)"
         ],
-        "count": 42
+        "count": 37
       },
       "tests/unit/test_vlm_config.py": {
         "classes": [
@@ -1791,9 +1805,19 @@
           "TestFreezeParams(6)",
           "TestApplyFreezeSpecs(3)",
           "TestCanonicalFreezeMeta(4)",
-          "TestEffectiveFreeze(7)"
+          "TestEffectiveFreeze(7)",
+          "TestTrainableDuringRun(9)",
+          "TestTrainableForTheRun(4)"
         ],
-        "count": 20
+        "note": "Also module-level functions: a module the build froze trains once a stage unfreezes it, under each registered optimizer (4), and apply_freeze_specs reaches the module a compiled model wraps (1)",
+        "count": 38
+      },
+      "tests/unit/test_unfreeze_fsdp.py": {
+        "classes": [
+          "TestUnfreezeUnderFSDP2(2)",
+          "TestEncoderMode(3)"
+        ],
+        "count": 5
       },
       "tests/unit/test_check_env.py": {
         "classes": [
@@ -1852,6 +1876,10 @@
         ],
         "count": 5
       },
+      "tests/integration/test_freeze_schedule_compile.py": {
+        "note": "Module-level pytest function on one GPU: a module a freeze stage unfreezes trains after the stage in a model compiled with inductor, with compile_model on and off",
+        "count": 2
+      },
       "tests/integration/test_data_resumption.py": {
         "classes": [
           "TestDataResumption(4)"
@@ -1908,6 +1936,11 @@
           "TestFSDP2(4)",
           "TestActivationCheckpointing(2)",
           "TestGetDpMesh(1)"
+        ]
+      },
+      "tests/distributed/test_freeze_schedule_fsdp.py": {
+        "classes": [
+          "TestFreezeScheduleUnderFSDP2(3)"
         ]
       },
       "tests/distributed/test_resilience.py": {

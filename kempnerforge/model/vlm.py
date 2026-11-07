@@ -36,7 +36,6 @@ relying on attribute fallthrough on ``VLMWrapper``.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
 from typing import Protocol
 
 import torch
@@ -46,7 +45,7 @@ from kempnerforge.config.adapter import AdapterConfig
 from kempnerforge.config.registry import registry
 from kempnerforge.config.schema import ModelConfig
 from kempnerforge.config.vision import VisionEncoderConfig
-from kempnerforge.config.vlm import FreezeSpec, VLMConfig
+from kempnerforge.config.vlm import VLMConfig
 from kempnerforge.model.adapter import VisionAdapter, build_adapter
 from kempnerforge.model.modality import ModalityContext
 from kempnerforge.model.transformer import Transformer
@@ -371,22 +370,6 @@ def inner_transformer(model: nn.Module) -> nn.Module:
     if hasattr(model, "_orig_mod"):
         model = model._orig_mod  # type: ignore[attr-defined]
     return model.transformer if isinstance(model, VLMWrapper) else model
-
-
-def _is_encoder_frozen(specs: Iterable[FreezeSpec]) -> bool:
-    """True iff every freeze spec targeting the vision encoder is ``frozen=True``.
-
-    Partial unfreezes (e.g. ``FreezeSpec("vision_encoder.layers.11", False)``)
-    leave the encoder partly trainable and return False, so ``build_vlm``
-    keeps the encoder in ``.train()`` mode and does not replicate it as a
-    cheap full copy under FSDP2.
-    """
-    relevant = [
-        s for s in specs if s.module == "vision_encoder" or s.module.startswith("vision_encoder.")
-    ]
-    if not relevant:
-        return False
-    return all(s.frozen for s in relevant)
 
 
 def build_vlm_wrapper(

@@ -2521,7 +2521,8 @@ class TestResumeWithUnsteppedParameters:
             manager2.load(path=str(tmp_path / "step_1"))
 
     def test_an_opaque_optimizer_entry_keeps_its_loaded_state(self, tmp_path, monkeypatch):
-        """A checkpoint that stores the optimizer as one entry loads it whole."""
+        """A checkpoint that stores the optimizer as one entry loads it whole, and no named
+        parameter counts as left out of it."""
         from torch.distributed.checkpoint import FileSystemReader, _version
         from torch.distributed.checkpoint.state_dict import (
             get_model_state_dict,
@@ -2550,7 +2551,7 @@ class TestResumeWithUnsteppedParameters:
 
         model2, optimizer2 = build(1)
         manager2 = CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model2, optimizer2)
-        manager2.load(path=str(tmp_path / "step_1"))
+        manager2.load(path=str(tmp_path / "step_1"), fresh_if_unheld=["unused.weight"])
         assert [optimizer2.state[p] for p in model2.parameters()] == [{"step": 2}] * 4
 
     def test_a_resumed_run_saves_and_resumes_again(self, tmp_path):
@@ -2568,6 +2569,183 @@ class TestResumeWithUnsteppedParameters:
         assert manager3.load() == (2, 0, {})
         self._step(model, optimizer, 2)
         self._assert_same_run(model, optimizer, model3, optimizer3)
+
+
+class TestFreshIfUnheld:
+    """``load(fresh_if_unheld=...)`` resumes the named parameters a saved optimizer did not
+    hold with empty state, and every other parameter with its saved state."""
+
+    _build = staticmethod(TestResumeWithUnsteppedParameters._build)
+    _step = staticmethod(TestResumeWithUnsteppedParameters._step)
+    _assert_same_run = staticmethod(TestResumeWithUnsteppedParameters._assert_same_run)
+    UNUSED = ("unused.weight", "unused.bias")
+
+    def test_a_module_the_saved_optimizer_left_out_resumes_without_state(self, tmp_path):
+        model, optimizer, manager = self._build(0, tmp_path, freeze_unused=True)
+        self._step(model, optimizer, 1)
+        manager.save(step=1)
+
+        model2, optimizer2, manager2 = self._build(1, tmp_path)
+        loaded = manager2.load(path=str(tmp_path / "step_1"), fresh_if_unheld=self.UNUSED)
+        assert loaded == (1, 0, {})
+        self._assert_same_run(model, optimizer, model2, optimizer2)
+        assert [len(g["params"]) for g in optimizer2.param_groups] == [4]
+        assert optimizer2.param_groups[0]["lr"] == 1e-2
+
+        self._step(model2, optimizer2, 2, both=True)
+        steps = {name: optimizer2.state[p]["step"].item() for name, p in model2.named_parameters()}
+        assert steps == {"used.weight": 2, "used.bias": 2, "unused.weight": 1, "unused.bias": 1}
+
+    def test_a_left_out_parameter_that_is_not_named_still_fails(self, tmp_path):
+        from torch.distributed.checkpoint.api import CheckpointException
+
+        model, optimizer, manager = self._build(0, tmp_path, freeze_unused=True)
+        self._step(model, optimizer, 1)
+        manager.save(step=1)
+
+        _, _, manager2 = self._build(1, tmp_path)
+        missing = r"Missing key in checkpoint state_dict: optimizer\.state\.unused\.bias\."
+        with pytest.raises(CheckpointException, match=missing):
+            manager2.load(path=str(tmp_path / "step_1"), fresh_if_unheld=["unused.weight"])
+
+    def test_a_never_stepped_record_keeps_its_parameter_out_of_the_left_out(self, tmp_path):
+        model, optimizer, manager = self._build(0, tmp_path)
+        self._step(model, optimizer, 1)
+        manager.save(step=1)
+
+        model2, optimizer2, manager2 = self._build(1, tmp_path)
+        manager2.load(path=str(tmp_path / "step_1"), fresh_if_unheld=self.UNUSED)
+        self._assert_same_run(model, optimizer, model2, optimizer2)
+
+    def test_names_are_compared_without_the_activation_checkpoint_prefix(self, tmp_path):
+        model, optimizer, manager = self._build(0, tmp_path, freeze_unused=True)
+        self._step(model, optimizer, 1)
+        manager.save(step=1)
+
+        model2, optimizer2, manager2 = self._build(1, tmp_path)
+        manager2.load(
+            path=str(tmp_path / "step_1"),
+            fresh_if_unheld=[
+                "unused._checkpoint_wrapped_module.weight",
+                "unused._checkpoint_wrapped_module.bias",
+            ],
+        )
+        self._assert_same_run(model, optimizer, model2, optimizer2)
+
+    @staticmethod
+    def _grouped(seed, tmp_path, groups_of, lrs):
+        """A model with ``unused`` frozen unless a group holds it, and an AdamW whose groups
+        ``groups_of`` picks from the model, each with the lr in ``lrs``."""
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        torch.manual_seed(seed)
+        model = _UsedAndUnused()
+        groups = [
+            {"params": params, "lr": lr} for params, lr in zip(groups_of(model), lrs, strict=True)
+        ]
+        held = {id(p) for group in groups for p in group["params"]}
+        model.unused.requires_grad_(any(id(p) in held for p in model.unused.parameters()))
+        optimizer = torch.optim.AdamW(groups)
+        manager = CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model, optimizer)
+        return model, optimizer, manager
+
+    def test_left_out_parameters_join_the_empty_saved_group_in_their_groups_place(self, tmp_path):
+        """With no saved peer, they take the saved settings of the empty group in their place."""
+        model, optimizer, manager = self._grouped(
+            0, tmp_path, lambda m: [list(m.used.parameters()), []], [5e-3, 2e-3]
+        )
+        self._step(model, optimizer, 1)
+        manager.save(step=1)
+
+        model2, optimizer2, manager2 = self._grouped(
+            1,
+            tmp_path,
+            lambda m: [list(m.used.parameters()), list(m.unused.parameters())],
+            [1e-2, 1e-2],
+        )
+        manager2.load(path=str(tmp_path / "step_1"), fresh_if_unheld=self.UNUSED)
+        assert [g["lr"] for g in optimizer2.param_groups] == [5e-3, 2e-3]
+        assert [len(g["params"]) for g in optimizer2.param_groups] == [2, 2]
+        assert not any(optimizer2.state.get(p) for p in model2.unused.parameters())
+        self._step(model2, optimizer2, 2, both=True)
+        assert all(optimizer2.state[p]["step"].item() == 1 for p in model2.unused.parameters())
+
+    def test_a_group_no_saved_group_fits_is_refused(self, tmp_path):
+        """The saved group in their group's place holds other parameters, so no saved group
+        gives the left-out parameters their settings."""
+        model, optimizer, manager = self._grouped(
+            0, tmp_path, lambda m: [[m.used.weight], [m.used.bias]], [1e-2, 1e-2]
+        )
+        self._step(model, optimizer, 1)
+        manager.save(step=1)
+
+        _, _, manager2 = self._grouped(
+            1,
+            tmp_path,
+            lambda m: [list(m.used.parameters()), list(m.unused.parameters())],
+            [1e-2, 1e-2],
+        )
+        with pytest.raises(
+            RuntimeError,
+            match=re.escape(
+                "has no param group for 2 parameters its optimizer did not hold: "
+                "['unused.weight', 'unused.bias']"
+            ),
+        ):
+            manager2.load(path=str(tmp_path / "step_1"), fresh_if_unheld=self.UNUSED)
+
+    @pytest.mark.parametrize(
+        "mutate",
+        [
+            pytest.param(
+                lambda state: state["optimizer"]["state"].pop("unused.weight"),
+                id="whole_state_missing",
+            ),
+            pytest.param(
+                lambda state: state["optimizer"]["state"].update(
+                    renamed=state["optimizer"]["state"].pop("unused.weight")
+                ),
+                id="state_key_renamed",
+            ),
+        ],
+    )
+    def test_a_parameter_the_saved_optimizer_held_without_state_still_fails(self, tmp_path, mutate):
+        """The saved groups list it, so its state went missing; naming it does not let it
+        resume without state."""
+        from torch.distributed.checkpoint.state_dict import (
+            get_model_state_dict,
+            get_optimizer_state_dict,
+        )
+
+        model, optimizer, _ = self._build(0, tmp_path)
+        self._step(model, optimizer, 1, both=True)
+        saved = {
+            "model": get_model_state_dict(model),
+            "optimizer": get_optimizer_state_dict(model, optimizer),
+        }
+        mutate(saved)
+        dcp.save(saved, checkpoint_id=str(tmp_path / "step_1"))
+
+        _, _, manager2 = self._build(1, tmp_path)
+        with pytest.raises(
+            RuntimeError,
+            match=re.escape("for 1 parameters the saved optimizer held: ['unused.weight']"),
+        ):
+            manager2.load(path=str(tmp_path / "step_1"), fresh_if_unheld=["unused.weight"])
+
+    def test_never_stepped_and_left_out_parameters_resume_together(self, tmp_path):
+        """``extra`` was held but never stepped, ``unused`` was left out: both resume without
+        state, ``used`` with its saved state."""
+        model, optimizer, manager = self._build(
+            0, tmp_path, model_cls=_WithExtra, freeze_unused=True
+        )
+        self._step(model, optimizer, 1)
+        manager.save(step=1)
+
+        model2, optimizer2, manager2 = self._build(1, tmp_path, model_cls=_WithExtra)
+        manager2.load(path=str(tmp_path / "step_1"), fresh_if_unheld=self.UNUSED)
+        self._assert_same_run(model, optimizer, model2, optimizer2)
+        assert [len(g["params"]) for g in optimizer2.param_groups] == [6]
 
 
 class TestMuonResume:
