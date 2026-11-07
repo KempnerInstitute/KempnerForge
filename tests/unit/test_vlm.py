@@ -448,6 +448,25 @@ class TestPoolingConnector:
         logits, _ = wrapper(pixels, input_ids, labels)
         assert logits.shape == (2, 16, 256)
 
+    def test_avgpool_norm_mlp_head_keeps_the_pooled_count(self):
+        """The head changes the projection, not the token count, and its norm
+        takes the model's norm_eps."""
+        mc = ModelConfig(
+            dim=64, n_layers=2, n_heads=4, vocab_size=256, max_seq_len=64, norm_eps=1e-6
+        )
+        vc = VisionEncoderConfig(type="random", feature_dim=96, num_tokens=16)
+        ac = AdapterConfig(type="avgpool", pool_window=2, hidden_dim=96, pre_norm="rmsnorm")
+        wrapper = build_vlm_wrapper(mc, vc, ac, JointDecoderConfig(max_text_len=32))
+        assert wrapper.num_image_tokens == 4
+        assert wrapper.adapter.proj.ln_q.eps == 1e-6
+        assert "adapter.proj.ln_q.weight" in wrapper.state_dict()
+        wrapper = wrapper.to(DEVICE).eval()
+        pixels = torch.randn(2, 3, 16, 16, device=DEVICE)
+        input_ids = torch.randint(0, 256, (2, 20), device=DEVICE)
+        with torch.no_grad():
+            logits, _ = wrapper(pixels, input_ids)
+        assert logits.shape == (2, 20, 256)
+
     def test_projection_adapter_keeps_token_count(self):
         """Regression: a non-pooling adapter must leave num_image_tokens ==
         encoder.num_tokens (the image path stays bit-for-bit unchanged)."""
