@@ -163,6 +163,21 @@ class TestPackedWithoutMesh:
         ):
             _rows_after_ep((_StridedShard(0, split_factor=2),), 2, f"{LAYER}.up_w")
 
+    def test_an_optimizer_state_of_another_shape_is_refused(self):
+        """A packed weight's optimizer state is spread like the weight, so it needs its shape."""
+        moe = _rank_one_of_two(packed=True)
+        name = f"{LAYER}.up_w"
+        optimizer = {
+            "state": {name: {"step": torch.tensor(1.0), "exp_avg": torch.zeros(3)}},
+            "param_groups": [{"params": [name], "lr": 0.1}],
+        }
+        with pytest.raises(
+            ValueError,
+            match=r"^the optimizer state 'exp_avg' of layers\.0\.mlp\.up_w has shape \(3,\), "
+            r"not \(4, 8, 16\)",
+        ):
+            ExpertLayout([(LAYER, moe)]).to_global({"optimizer": optimizer})
+
 
 class TestOlderTorch:
     def test_a_mesh_without_a_root_lookup_names_the_torch_it_needs(self):
