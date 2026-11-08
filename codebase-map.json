@@ -1682,12 +1682,12 @@
       "tests/unit/test_expert_layout.py": {
         "classes": [
           "TestMoELayers(2)",
-          "TestUnpackedNames(6)",
-          "TestPackedWithoutMesh(1)",
+          "TestUnpackedNames(7)",
+          "TestPackedWithoutMesh(3)",
           "TestOlderTorch(1)",
           "TestCheckSavedExperts(6)"
         ],
-        "count": 16
+        "count": 19
       },
       "tests/unit/test_fp8.py": {
         "classes": [
