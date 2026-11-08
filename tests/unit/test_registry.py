@@ -9,6 +9,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -177,6 +178,23 @@ class TestUnknownRegisteringModule:
         assert str(excinfo.value) == (
             "loss/dup is already registered by an unknown module (for kf_frameless_a.build); "
             "an unknown module (for kf_frameless_b.build) tried to register it again"
+        )
+
+    def test_a_stack_of_only_registry_frames_names_an_unknown_module(self, monkeypatch):
+        """The walk passes over the registry's own frames; when the stack holds nothing else
+        it runs out of frames, and the registering module is unknown."""
+        registry_globals = {"__name__": Registry.__module__}
+        outer = SimpleNamespace(f_globals=registry_globals, f_back=None)
+        inner = SimpleNamespace(f_globals=registry_globals, f_back=outer)
+        reg = Registry()
+        with monkeypatch.context() as patch:
+            patch.setattr(inspect, "currentframe", lambda: inner)
+            reg.register("loss", "dup", len)
+            with pytest.raises(ValueError) as excinfo:
+                reg.register("loss", "dup", abs)
+        assert str(excinfo.value) == (
+            "loss/dup is already registered by an unknown module; "
+            "an unknown module tried to register it again"
         )
 
 
