@@ -135,6 +135,16 @@ class TestUnpackedNames:
         with pytest.raises(ValueError, match="no entry for 1 expert weights"):
             ExpertLayout([(LAYER, moe)]).to_global(state)
 
+    def test_a_local_index_past_the_rank_experts_is_refused(self):
+        """Rank 1 has no local expert 2, whose global index 4 is past the layer's four experts."""
+        moe = _rank_one_of_two()
+        state = _state(moe)
+        state["model"][_names([2])[0]] = torch.zeros(1)
+        with pytest.raises(
+            ValueError, match=r"names local expert 2, but layers\.0\.mlp holds 2 experts on this"
+        ):
+            ExpertLayout([(LAYER, moe)]).to_global(state)
+
 
 class TestPackedWithoutMesh:
     def test_layer_without_ep_mesh_is_refused(self):
