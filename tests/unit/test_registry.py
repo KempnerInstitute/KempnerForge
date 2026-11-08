@@ -4,6 +4,7 @@ and for the loader's sys.path hint when a plugin module fails to import."""
 from __future__ import annotations
 
 import importlib
+import inspect
 import os
 import subprocess
 import sys
@@ -156,6 +157,27 @@ class TestDefiningModule:
             "kf_partial_b tried to register it again$",
         ):
             _register_from("kf_partial_b", source, reg)
+
+
+class TestUnknownRegisteringModule:
+    """With no frame outside the registry to name, the error names an unknown module."""
+
+    def test_without_frame_support_the_defining_module_tells_them_apart(self, monkeypatch):
+        """Where ``inspect.currentframe`` returns None, as on a Python without stack frames,
+        the registering module is unknown, and the module defining each function tells
+        the two registrations apart."""
+        reg = Registry()
+        first = _module("kf_frameless_a", "def build():\n    pass\n")["build"]
+        second = _module("kf_frameless_b", "def build():\n    pass\n")["build"]
+        with monkeypatch.context() as patch:
+            patch.setattr(inspect, "currentframe", lambda: None)
+            reg.register("loss", "dup", first)
+            with pytest.raises(ValueError) as excinfo:
+                reg.register("loss", "dup", second)
+        assert str(excinfo.value) == (
+            "loss/dup is already registered by an unknown module (for kf_frameless_a.build); "
+            "an unknown module (for kf_frameless_b.build) tried to register it again"
+        )
 
 
 class TestPluginCollisions:
