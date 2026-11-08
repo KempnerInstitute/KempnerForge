@@ -12,10 +12,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 from torch.distributed.checkpoint.state_dict import get_model_state_dict
+from torch.distributed.tensor.placement_types import _StridedShard
 
 from kempnerforge.checkpoint.expert_layout import (
     ExpertLayout,
     _root_mesh,
+    _rows_after_ep,
     check_saved_experts,
     expert_layout,
     moe_layers,
@@ -153,6 +155,13 @@ class TestPackedWithoutMesh:
         state = {"model": {f"{LAYER}.{name}": p for name, p in moe.named_parameters()}}
         with pytest.raises(ValueError, match="records no ep_mesh"):
             ExpertLayout([(LAYER, moe)]).to_global(state)
+
+    def test_rows_already_strided_are_refused(self):
+        """Rows FSDP2 already strides, as it does rows that TP shards, are not strided again."""
+        with pytest.raises(
+            ValueError, match=r"^layers\.0\.mlp\.up_w is already strided over its rows"
+        ):
+            _rows_after_ep((_StridedShard(0, split_factor=2),), 2, f"{LAYER}.up_w")
 
 
 class TestOlderTorch:
