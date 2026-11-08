@@ -65,6 +65,7 @@ File:
   - `moe_frequency > 0`
   - `moe_sequence_aux_loss_weight ≥ 0`
   - `moe_bias_schedule ∈ {"constant", "cosine_decay", "linear_warmup"}`
+  - `moe_shared_experts ≥ 0`
 
 ### `TrainConfig`
 
@@ -114,6 +115,7 @@ File:
 - `num_workers ≥ 0`.
 - `prefetch_factor ≥ 1`.
 - `mix_temperature > 0`.
+- `token_dtype ∈ {"", "uint16", "uint32"}`.
 - Every `DatasetSource` in `datasets` has `path` or `hf_name` set.
 - If `phases` is non-empty, `phases[*].start_step` is strictly
   monotonically increasing (and unique).
@@ -123,6 +125,7 @@ File:
 `DatasetSource`:
 
 - `weight > 0`.
+- `token_dtype ∈ {"", "uint16", "uint32"}`.
 
 `TrainingPhase`:
 
@@ -137,9 +140,14 @@ File:
 
 - `interval > 0`.
 - `steps > 0`.
+- `token_dtype ∈ {"", "uint16", "uint32"}`.
 
 (Data-source presence is enforced by `JobConfig.validate`, not here —
 a disabled eval is still a valid `EvalConfig`.)
+
+The `.bin` dtype itself is resolved, checked against `metadata.yaml`
+and against each shard's size when the dataset is built, not at config
+load; see [Memory-mapped dataset](../data/memory-mapped.md).
 
 ### `DistributedConfig`
 
@@ -191,6 +199,40 @@ File:
 
 - `end_step > start_step`.
 
+### `AdapterConfig`
+
+File:
+[`kempnerforge/config/adapter.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/config/adapter.py).
+
+- `type` must name a registered adapter; the error lists them.
+- `hidden_dim >= 0`.
+- `activation ∈ {"gelu", "silu", "relu"}`.
+- `pre_norm` is `""` or a registered norm; the error lists them.
+- `pool_window > 0` and `pool_heads > 0`.
+- Every other field must be one the selected adapter uses, or stay at its
+  default. The fields an adapter uses come from its builder's parameters, or
+  from the `accepts` it registers with (see
+  [Registry](registry.md#adapters-declare-the-fields-they-use)), so the check
+  needs no list of types; the error names each unused field, its value, the
+  adapter type, and the fields that type uses:
+
+  | `type` | Uses |
+  |--------|------|
+  | `mlp_2layer` | `hidden_dim`, `activation`, `pre_norm` |
+  | `linear` | none |
+  | `avgpool` | `pool_window`, `hidden_dim`; `activation` and `pre_norm` once `hidden_dim > 0` |
+  | `attentional_pool` | `pool_window`, `pool_heads` |
+
+  A plugin adapter whose builder reads a `**kwargs` and registers no
+  `accepts` accepts every field.
+  The check runs once the TOML is applied and again once the CLI overrides
+  land, so a setting the adapter would drop stops the run before
+  `init_distributed`. The first run sees the TOML alone, so its adapter
+  fields must fit its own `type`, and a type switched on the command line
+  needs the fields it does not use reset there too
+  (for example `--adapter.hidden_dim=0 --adapter.pre_norm=`); see
+  [Config sections](config-sections.md#adapter-adapterconfig).
+
 ## Cross-section rules — `JobConfig.validate(world_size)`
 
 File:
@@ -231,6 +273,15 @@ stages, so they can't be tied.
 ```
 eval.enabled && !eval.dataset_path && !eval.hf_dataset_name  →  ValueError
 ```
+
+### Eval steps under pipeline parallelism
+
+```
+eval.enabled && distributed.pp > 1 && eval.steps % train.grad_accum_steps != 0  →  ValueError
+```
+
+Eval runs its batches through the training schedule, `grad_accum_steps` at a
+time, so each eval microbatch has the shape the stages were built for.
 
 ### VLM architectures under tensor parallelism
 

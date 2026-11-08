@@ -35,6 +35,7 @@ Each flag must begin with `--`. Parsing splits once on `=`:
 | `--train.compile_model=true` | `bool(True)` (via coercion — see below) |
 | `--optimizer.betas=[0.9,0.95]` | `list → tuple(0.9, 0.95)` (coerced to tuple by field type) |
 | `--checkpoint.load_path=/scratch/ckpt` | `str("/scratch/ckpt")` (literal_eval fails, keep as string) |
+| `--adapter.pre_norm=` | `str("")` (literal_eval fails on an empty value, keep as string) |
 | `--data.anneal_weights={"c4":0.7,"books":0.3}` | `dict` (parsed into `DataConfig.anneal_weights`) |
 
 Quote any value the shell would otherwise eat:

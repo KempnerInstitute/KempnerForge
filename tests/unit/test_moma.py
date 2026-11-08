@@ -390,6 +390,21 @@ class TestExpertChoiceMoE:
         zero_rows = (y.abs().sum(dim=-1) == 0).sum().item()
         assert zero_rows >= 8
 
+    @pytest.mark.parametrize("training", [True, False])
+    @pytest.mark.parametrize("gumbel_noise", [True, False])
+    def test_fp32_weights_under_bf16_autocast(self, training: bool, gumbel_noise: bool) -> None:
+        """fp32 weights under bf16 autocast, the fp32 master weights fallback on one GPU."""
+        torch.manual_seed(0)
+        moe = ExpertChoiceMoE(
+            dim=16, hidden_dim=32, num_experts=4, capacity_factor=0.5, gumbel_noise=gumbel_noise
+        )
+        moe.train(training)
+        x = torch.randn(8, 16)
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            y = moe(x)
+        assert y.dtype == torch.float32
+        assert torch.isfinite(y).all()
+
     def test_expert_counts_property(self):
         moe = ExpertChoiceMoE(dim=16, hidden_dim=32, num_experts=4, capacity_factor=0.5)
         moe.eval()

@@ -280,6 +280,38 @@ def _restore_never_stepped(
     optim_state["state"].update({fqn: {} for fqn in never_stepped})
 
 
+def _check_saved_state_matches(
+    optim_state: dict[str, Any], saved_keys: Iterable[str], where: Path
+) -> None:
+    """Fail if a parameter was saved with another optimizer's state than the one it now has."""
+    kept = {fqn: set(state) for fqn, state in optim_state["state"].items()}
+    saved: dict[str, set[str]] = {}
+    for key in saved_keys:
+        if not key.startswith(_OPTIM_STATE_PREFIX):
+            continue
+        name = key.removeprefix(_OPTIM_STATE_PREFIX)
+        fqn = name
+        while fqn and fqn not in kept:
+            fqn = fqn.rpartition(".")[0]
+        if fqn:
+            saved.setdefault(fqn, set()).add(name.removeprefix(f"{fqn}.").split(".", 1)[0])
+    moved = sorted(
+        fqn for fqn, entries in saved.items() if entries - kept[fqn] and kept[fqn] - entries
+    )
+    if moved:
+        first = moved[0]
+        raise RuntimeError(
+            f"{where} holds another optimizer's state for {len(moved)} parameters: "
+            f"{moved[:8]}. {first} was saved with "
+            f"{sorted(saved[first])} and is now kept with {sorted(kept[first])}: its optimizer "
+            "changed since the save, e.g. optimizer.name or optimizer.muon_router changed, "
+            "or Muon used to orthogonalize it before it routed parameters by module. "
+            "To continue from these weights with a fresh optimizer, set "
+            "checkpoint.load_path to this checkpoint and checkpoint.exclude_from_loading = "
+            '["optimizer"], with a checkpoint.dir that holds no checkpoint yet.'
+        )
+
+
 def _load_train_state(path: Path) -> dict[str, Any]:
     """Load ``train_state.pt`` under an explicit trust boundary.
 
@@ -429,6 +461,7 @@ class CheckpointManager:
         self._weight_decay_scope = weight_decay_scope
         self._pending_dataloader_state: dict[str, Any] | None = None
         self._pending_finalize: tuple[int, Path] | None = None
+        self._inflight_dir: Path | None = None
         self._tracking_source: TrackingSource | None = None
         self._registrar: CheckpointRegistrar | None = None
         self._sidecar_lock = threading.Lock()
@@ -680,6 +713,7 @@ class CheckpointManager:
         ckpt_dir = self._checkpoint_dir(step)
 
         ckpt_dir.mkdir(parents=True, exist_ok=True)
+        self._inflight_dir = ckpt_dir
 
         dcp_dir = ckpt_dir / f"pp{self._pp_rank}" if self._pp_rank is not None else ckpt_dir
         dcp_dir.mkdir(parents=True, exist_ok=True)
@@ -909,6 +943,7 @@ class CheckpointManager:
                     f"{dcp_dir} is missing optimizer param-group keys {sorted(filled)}; "
                     f"resuming with {filled}"
                 )
+            _check_saved_state_matches(dcp_state["optimizer"], saved_keys, dcp_dir)
 
         if dcp_state:
             planner = _NeverSteppedStatePlanner()
@@ -1172,12 +1207,16 @@ class CheckpointManager:
     def _cleanup(self) -> None:
         """Remove old checkpoints beyond the retention limit.
 
-        Never removed regardless of retention: the current ``latest`` target
-        and the in-flight async checkpoint (``_pending_finalize``) — pruning
-        either would let a crash strand resume with no loadable checkpoint —
-        and any dynamic-window milestone (``CheckpointConfig.is_dynamic_milestone``),
-        so the dense early-dynamics checkpoints survive even with a finite
-        ``keep_last_n``.
+        Never removed regardless of retention: the current ``latest`` target,
+        the directory the last ``save()`` writes into (``_inflight_dir``), whose
+        async flush may still be running, a deferred async checkpoint
+        (``_pending_finalize``), and any dynamic-window milestone
+        (``CheckpointConfig.is_dynamic_milestone``), so the dense early-dynamics
+        checkpoints survive even with a finite ``keep_last_n``. A save drains
+        ``_pending_finalize``, which runs this cleanup, only after its own
+        flush is dispatched, so ``_inflight_dir`` is what keeps a checkpoint
+        that is not among the newest, as after a rewind, from being deleted
+        while it is written.
         """
         keep = self.config.keep_last_n
         if keep <= 0:
@@ -1194,6 +1233,8 @@ class CheckpointManager:
             protected.add(latest.resolve())
         if self._pending_finalize is not None:
             protected.add(self._pending_finalize[1].resolve())
+        if self._inflight_dir is not None:
+            protected.add(self._inflight_dir.resolve())
 
         for d in ckpt_dirs:
             if self.config.is_dynamic_milestone(int(d.name.split("_")[1])):

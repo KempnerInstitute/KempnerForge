@@ -22,7 +22,7 @@ from functools import partial
 from typing import TYPE_CHECKING
 
 import torch
-from torch.distributed._composable.fsdp import MixedPrecisionPolicy, fully_shard
+from torch.distributed._composable.fsdp import FSDPModule, MixedPrecisionPolicy, fully_shard
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     CheckpointImpl,
     apply_activation_checkpointing,
@@ -90,6 +90,20 @@ def default_mp_policy(param_dtype: torch.dtype = torch.bfloat16) -> MixedPrecisi
     )
 
 
+def is_fsdp_wrapped(model: torch.nn.Module) -> bool:
+    """Whether ``fully_shard`` was applied to ``model`` or any of its submodules."""
+    return any(isinstance(m, FSDPModule) for m in model.modules())
+
+
+def autocast_dtype(
+    model: torch.nn.Module, master_dtype: torch.dtype, compute_dtype: torch.dtype
+) -> torch.dtype | None:
+    """``compute_dtype`` if no FSDP2 wrap casts ``master_dtype`` parameters to it, else None."""
+    if master_dtype == compute_dtype or is_fsdp_wrapped(model):
+        return None
+    return compute_dtype
+
+
 def apply_ac(model: Transformer, mode: ActivationCheckpointing) -> None:
     """Apply activation checkpointing to the model.
 
@@ -129,13 +143,14 @@ def apply_float8(model: Transformer, enable_fsdp_float8_all_gather: bool = True)
     """Apply Float8 training (torchao) to the model.
 
     Converts nn.Linear modules to Float8Linear for E4M3 forward / E5M2 backward
-    with dynamic tensorwise scaling. Master weights remain in bf16.
+    with dynamic tensorwise scaling. Master weights keep their dtype (bf16, or fp32).
 
     Must be called AFTER apply_tensor_parallel / apply_expert_parallel
     and BEFORE apply_ac / apply_fsdp2.
 
-    MoE expert modules (experts and shared_expert) are excluded because they use
-    grouped GEMM (torch._grouped_mm) which bypasses Float8Linear.forward().
+    Routed MoE experts are excluded because they use grouped GEMM
+    (torch._grouped_mm), which bypasses Float8Linear.forward(). The shared expert
+    is a plain Linear call; the same name filter excludes it, by convention.
 
     Args:
         model: Transformer model.
@@ -161,7 +176,8 @@ def apply_float8(model: Transformer, enable_fsdp_float8_all_gather: bool = True)
         """Skip modules that shouldn't use Float8.
 
         Excluded:
-        - Expert Linears: use grouped GEMM (torch._grouped_mm), not Linear.forward()
+        - Routed expert Linears: use grouped GEMM (torch._grouped_mm), not Linear.forward()
+        - Shared expert: a plain Linear call, excluded with the routed experts by convention
         - Router gate: small output dim (num_experts) often not divisible by 16,
           which torch._scaled_mm requires. Also not compute-bound.
         """

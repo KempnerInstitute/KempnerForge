@@ -169,6 +169,7 @@ def _build_mixture_pipeline(
                 file_pattern=config.data.file_pattern,
                 pack_sequences=config.data.pack_sequences,
                 eos_token_id=eos_token_id,
+                token_dtype=src.token_dtype or config.data.token_dtype,
             )
         elif src.hf_name:
             if not config.data.tokenizer_path:
@@ -228,6 +229,7 @@ def _build_mmap_pipeline(
         file_pattern=config.data.file_pattern,
         pack_sequences=config.data.pack_sequences,
         eos_token_id=eos_token_id,
+        token_dtype=config.data.token_dtype,
     )
     sampler = DistributedSampler(
         dataset,
@@ -336,6 +338,10 @@ def build_eval_dataloader(config: JobConfig, runtime: RuntimeContext) -> Any | N
 
     VLM + eval is out of scope on this branch: ``run_eval`` calls
     ``model(input_ids)``, which does not match ``VLMWrapper.forward``.
+
+    Raises:
+        ValueError: Under pipeline parallelism, the eval set gives a data-parallel
+            rank less than one full batch.
     """
     tc = config.train
     eval_config = config.eval
@@ -357,6 +363,7 @@ def build_eval_dataloader(config: JobConfig, runtime: RuntimeContext) -> Any | N
             data_dir=eval_config.dataset_path,
             seq_len=tc.seq_len + 1,
             file_pattern=eval_config.file_pattern,
+            token_dtype=eval_config.token_dtype,
         )
         logger.info(f"Eval dataset: {len(eval_dataset):,} samples from {eval_config.dataset_path}")
     elif eval_config.hf_dataset_name:
@@ -399,7 +406,19 @@ def build_eval_dataloader(config: JobConfig, runtime: RuntimeContext) -> Any | N
         shuffle=False,
         seed=tc.seed,
     )
-    return TorchDataLoader(eval_dataset, batch_size=tc.batch_size, sampler=eval_sampler)
+    loader = TorchDataLoader(
+        eval_dataset,
+        batch_size=tc.batch_size,
+        sampler=eval_sampler,
+        drop_last=config.distributed.pp > 1,
+    )
+    if config.distributed.pp > 1 and len(loader) == 0:
+        raise ValueError(
+            f"The eval set gives each data-parallel rank {len(eval_sampler)} samples, fewer "
+            f"than train.batch_size ({tc.batch_size}); pipeline-parallel eval drops a partial "
+            f"batch, so each rank needs at least one full batch."
+        )
+    return loader
 
 
 class _EvalTensorDataset(torch.utils.data.Dataset):

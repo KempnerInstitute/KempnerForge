@@ -88,7 +88,7 @@ Architecture hyperparameters and MoE knobs.
 | `moe_router_z_loss_weight` | `float` | `0.0` | router-logit z-loss coefficient (`0` = off) |
 
 Computed properties: `is_moe`, `head_dim`, `computed_ffn_hidden_dim`,
-`num_params_estimate`.
+`computed_expert_ffn_hidden_dim`, `num_params_estimate`.
 
 ## `[train]` — `TrainConfig`
 
@@ -105,7 +105,9 @@ Training-loop hyperparameters.
 | `seed` | `int` | `42` | torch/numpy/python RNG seed |
 | `data_seed` | `int \| None` | `None` | RNG seed for data and batch order; `None` → falls back to `seed` |
 | `compile_model` | `bool` | `True` | wrap the model with `torch.compile` |
-| `mixed_precision` | `"bf16" \| "fp32" \| "fp8"` | `"bf16"` | master-weight dtype; `"fp8"` uses bf16 masters with fp8 compute; `"fp16"` is rejected (no loss scaling) |
+| `mixed_precision` | `"bf16" \| "fp32" \| "fp8"` | `"bf16"` | compute dtype, and the master-weight dtype unless `fp32_master_weights` is set; `"fp8"` computes in fp8, with bf16 masters unless `fp32_master_weights` is set; `"fp16"` is rejected (no loss scaling) |
+| `fp32_master_weights` | `bool` | `False` | keep parameters, gradients and optimizer state in fp32 and compute in `param_dtype` through FSDP2's mixed precision; without an FSDP2 wrap (1 GPU, a pp-only mesh) the forward runs under `torch.autocast`; rejected with `mixed_precision = "fp32"`, and for MoE on a single GPU — see [FSDP2 § fp32 master weights](../distributed/fsdp2.md#fp32-master-weights) |
+| `tf32` | `bool` | `False` | run fp32 matmuls (a frozen fp32 vision encoder, `mixed_precision = "fp32"`) on TF32 tensor cores via `torch.set_float32_matmul_precision("high")`, applied at startup by training and `scripts/eval.py`; this also covers the matmuls that run in fp32 on purpose in a bf16 run, so Muon's Newton–Schulz step moves to TF32 (still more precise than the bf16 that `torch.optim.Muon` uses); `False` leaves torch's setting as it is |
 | `activation_checkpointing` | `"none" \| "full" \| "selective"` | `"none"` | AC policy |
 | `loss_fn` | `str` | `"cross_entropy"` | `loss` registry key (or `"chunked_cross_entropy"`) |
 | `z_loss_weight` | `float` | `0.0` | logit-magnitude regularizer (PaLM uses `1e-4`) |
@@ -114,7 +116,8 @@ Training-loop hyperparameters.
 | `shutdown_timeout_sec` | `float` | `600.0` | graceful shutdown timeout before forced exit |
 | `nccl_health_check_interval` | `int` | `0` | NCCL liveness all-reduce every N steps (`0` = disabled) |
 
-Computed properties: `param_dtype`, `is_fp8`.
+Computed properties: `param_dtype` (compute dtype), `master_dtype` (storage dtype: fp32 with
+`fp32_master_weights`, otherwise `param_dtype`), `is_fp8`.
 
 ## `[optimizer]` — `OptimizerConfig`
 
@@ -132,10 +135,11 @@ are shared (AdamW/Lion) or optimizer-specific.
 | `fused` | `bool` | `True` | use fused AdamW when available |
 | `muon_momentum` | `float` | `0.95` | Muon momentum coefficient |
 | `muon_ns_steps` | `int` | `5` | Newton–Schulz iterations for Muon |
-| `muon_adam_lr` | `float \| None` | `None` | LR for 1-D params in Muon's AdamW fallback; `None` → same as `lr` |
+| `muon_adam_lr` | `float \| None` | `None` | LR for the parameters Muon leaves to its AdamW fallback; `None` → same as `lr` |
 | `muon_nesterov` | `bool` | `False` | Orthogonalize the Nesterov look-ahead instead of the momentum buffer |
 | `muon_adjust_lr` | `"original" \| "match_rms_adamw" \| "spectral_unclamped"` | `"original"` | Factor on each orthogonalized update |
 | `muon_orthogonalize` | `"local" \| "exact"` | `"local"` | Newton–Schulz on each rank's shard, or on the full matrix |
+| `muon_router` | `bool` | `False` | Orthogonalize MoE router gates with Muon instead of its AdamW fallback |
 | `schedule_free_warmup_steps` | `int` | `0` | internal warmup for schedule-free |
 | `weight_decay_scope` | `"exclude_norms_and_biases" \| "all"` | `"exclude_norms_and_biases"` | which parameters are decayed; `"all"` decays every parameter, as `torch.optim.AdamW` does by default. A resume that restores optimizer state saved under the other scope is refused |
 
@@ -163,7 +167,8 @@ Single dataset, HuggingFace source, or mixture; optional phase schedule.
 | Field | Type | Default | Purpose |
 |-------|------|---------|---------|
 | `dataset_path` | `str` | `""` | directory of pre-tokenized shards |
-| `file_pattern` | `str` | `"*.npy"` | glob inside `dataset_path` |
+| `file_pattern` | `str` | `"*.npy"` | glob inside `dataset_path`; each match is read by its own suffix, `.bin` or `.npy` |
+| `token_dtype` | `str` | `""` | dtype of raw `.bin` shards, `"uint16"` or `"uint32"`; `""` takes `tokenized_info.dtype` from the `metadata.yaml` beside them (see [Memory-mapped dataset](../data/memory-mapped.md)) |
 | `tokenizer_path` | `str` | `""` | path or HF id for the tokenizer |
 | `num_workers` | `int` | `4` | DataLoader workers |
 | `pin_memory` | `bool` | `True` | DataLoader pin memory |
@@ -192,6 +197,7 @@ Single dataset, HuggingFace source, or mixture; optional phase schedule.
 | `name` | `str` | `""` | name for per-dataset metrics (auto-derived if empty) |
 | `hf_name` | `str` | `""` | HF dataset id |
 | `hf_config` | `str` | `""` | HF dataset config |
+| `token_dtype` | `str` | `""` | dtype of this source's `.bin` shards; `""` uses `data.token_dtype` |
 
 Either `path` or `hf_name` must be set per source.
 
@@ -215,9 +221,10 @@ In-loop evaluation. Disabled by default.
 |-------|------|---------|---------|
 | `enabled` | `bool` | `False` | gate in-loop eval |
 | `interval` | `int` | `1000` | eval every N training steps |
-| `steps` | `int` | `50` | eval batches per evaluation |
+| `steps` | `int` | `50` | eval batches per evaluation; under pipeline parallelism a multiple of `train.grad_accum_steps` |
 | `dataset_path` | `str` | `""` | pre-tokenized eval shards |
 | `file_pattern` | `str` | `"*.npy"` | glob inside `dataset_path` |
+| `token_dtype` | `str` | `""` | dtype of raw `.bin` eval shards, `"uint16"` or `"uint32"`; `""` takes it from the `metadata.yaml` beside them, never from `data.token_dtype` |
 | `hf_dataset_name` | `str \| None` | `None` | HF dataset id |
 | `hf_dataset_config` | `str \| None` | `None` | HF dataset config |
 | `hf_dataset_split` | `str` | `"validation"` | HF split |
@@ -233,7 +240,7 @@ Parallelism dimensions and NCCL settings.
 | Field | Type | Default | Purpose |
 |-------|------|---------|---------|
 | `dp_shard` | `int` | `-1` | FSDP shard degree; `-1` → auto (use remaining GPUs) |
-| `dp_replicate` | `int` | `1` | DDP-style replication over FSDP groups |
+| `dp_replicate` | `int` | `1` | replicates the `dp_shard` groups (HSDP), and every rank in `dp_replicate × dp_shard` reads its own data; with no `dp_shard` dimension (it resolves to 1, no TP or EP), FSDP2 shards over `dp_replicate` instead |
 | `tp` | `int` | `1` | tensor parallel |
 | `pp` | `int` | `1` | pipeline parallel |
 | `pp_schedule` | `"1f1b" \| "gpipe" \| "interleaved_1f1b"` | `"1f1b"` | pipeline schedule |
@@ -258,7 +265,7 @@ DCP-based checkpointing.
 | `async_mode` | `"disabled" \| "async" \| "async_with_pinned_mem"` | `"disabled"` | DCP async-save mode |
 | `keep_last_n` | `int` | `3` | retain the most recent N checkpoints (`<= 0` keeps all); steps saved by `dyn_ckpt_window` are always kept |
 | `load_path` | `str \| None` | `None` | explicit resume path (overrides `latest` symlink) |
-| `export_dtype` | `"float32" \| "bfloat16"` | `"bfloat16"` | dtype for HF exports via `scripts/convert_checkpoint.py` |
+| `export_dtype` | `"float32" \| "bfloat16"` | `"bfloat16"` | dtype for HF exports via `scripts/convert_checkpoint.py dcp-to-hf` when its `--dtype` flag is not given; the flag wins and also takes `float16` (see [HuggingFace conversion](../checkpointing/hf-conversion.md#dtypes)) |
 | `exclude_from_loading` | `list[str]` | `[]` | state keys to skip when warm-starting from `load_path` — `"model"` and/or `"optimizer"`; ignored on a resume, which always restores full state |
 | `ignore_freeze_mismatch` | `bool` | `False` | load a checkpoint whose VLM freeze metadata disagrees with the configured freeze specs, downgrading the error to a warning |
 
@@ -350,6 +357,66 @@ bounds on tracking calls are on the [MLflow backend](../metrics-and-profiling/ml
 | `start_step` | `int` | `5` | first step recorded |
 | `end_step` | `int` | `8` | last step recorded (must be `>` `start_step`) |
 | `trace_dir` | `str` | `"profiler_traces"` | output directory for Chrome/Perfetto traces |
+
+## `[adapter]`: `AdapterConfig`
+
+The VLM connector that maps vision-encoder features into the transformer's
+embedding space. A run that sets `[vlm]` without `[adapter]` gets these
+defaults.
+[`kempnerforge/config/adapter.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/config/adapter.py).
+
+| Field | Type | Default | Used by | Purpose |
+|-------|------|---------|---------|---------|
+| `type` | `str` | `"mlp_2layer"` | all | adapter registry key: `mlp_2layer` and `linear` keep the token count, `avgpool` and `attentional_pool` pool it |
+| `hidden_dim` | `int` | `0` | `mlp_2layer`, `avgpool` | MLP hidden width. `mlp_2layer`: `0` means `out_dim`. `avgpool`: a positive width makes the head after the pool a 2-layer MLP, normed first when `pre_norm` is set; `0` keeps the single `Linear` |
+| `activation` | `str` | `"gelu"` | `mlp_2layer`; `avgpool` with `hidden_dim > 0` | `"gelu"`, `"silu"` or `"relu"` between the two MLP projections |
+| `pre_norm` | `str` | `""` | `mlp_2layer`; `avgpool` with `hidden_dim > 0` | norm-registry key for a norm ahead of the MLP, over the vision features (`mlp_2layer`) or the pooled features (`avgpool`); `""` builds none |
+| `pool_window` | `int` | `2` | `avgpool`, `attentional_pool` | pooling window side, e.g. `2` for 2×2 |
+| `pool_heads` | `int` | `16` | `attentional_pool` | attention heads; must divide the vision feature dim |
+
+A field outside the selected adapter's "Used by" entries must keep its
+default, or the config fails to load with an error naming the field and the
+adapter type. The column follows each adapter's builder parameters, which
+`avgpool` narrows by `hidden_dim` with the `accepts` it registers; a plugin
+adapter's come from its own builder (see
+[Registry](registry.md#adapters-declare-the-fields-they-use)).
+
+An `avgpool` connector with a 2×2 window and an RMSNorm + MLP head as wide as
+its input (here a 1152-wide encoder):
+
+```toml
+[adapter]
+type = "avgpool"
+pool_window = 2
+hidden_dim = 1152
+pre_norm = "rmsnorm"
+```
+
+`hidden_dim` picks the `avgpool` head, and the head fixes the adapter's
+checkpoint keys. `hidden_dim = 0` builds the single `Linear`, saved as
+`adapter.proj.weight` and `adapter.proj.bias`. A positive `hidden_dim` builds
+the MLP head, saved as `adapter.proj.proj1.*` and `adapter.proj.proj2.*`, plus
+`adapter.proj.ln_q.*` when `pre_norm` is set. A checkpoint loads only into
+the head it was saved with: the other head fails the load with `Missing key
+in checkpoint state_dict` naming one of its parameters. To resume a
+checkpoint saved with the single `Linear`, set `hidden_dim = 0` and leave
+`activation` and `pre_norm` at their defaults.
+
+A command-line override sets a value and never restores a default, so
+switching `adapter.type` on the command line keeps every other field the TOML
+sets. Reset the ones the new type does not use in the same command; an empty
+value sets the empty string. For a TOML with `type = "mlp_2layer"`,
+`hidden_dim = 2048` and `pre_norm = "rmsnorm"`:
+
+```bash
+--adapter.type=attentional_pool --adapter.hidden_dim=0 --adapter.pre_norm=
+```
+
+The TOML is checked on its own before the overrides apply, so its fields must
+fit its own `type`. A TOML with `type = "attentional_pool"` and
+`hidden_dim = 1152` fails to load even with `--adapter.type=avgpool`: set the
+type and its fields in the same layer, both in the TOML or both on the
+command line.
 
 ## Where to read next
 
