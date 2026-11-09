@@ -46,13 +46,14 @@ with `vlm.arch = "joint_decoder"`, `vision_encoder.type = "siglip2"` and
 samples `VLMCollator` batches.
 
 - `testbed.py`: COCO Karpathy captions, VQAv2 (LAVIS layout), TextVQA, DocVQA and
-  ChartQA (human and augmented).
+  ChartQA (human and augmented); a row whose image does not decode is passed over.
 - `render.py`: `ChatRenderer` applies the tokenizer's chat template (prompt then
   answer for single-turn rows, the full template for conversations) and trains only
   the assistant replies when `answer_only`. `RenderedDataset` draws one reference
   answer per turn from a seed and the row index, so a resume draws the same answers,
   and passes over a document the renderer refuses (an empty reply, or one the text
-  budget cuts away), up to `max_attempts` in a row; `skipped` counts them.
+  budget cuts away), up to `max_attempts` in a row; `skipped` counts them per
+  process, so a loader worker's skips are its own.
 
 Every sample carries one image, resized square to `image_size`, with no tiling or
 packing.
