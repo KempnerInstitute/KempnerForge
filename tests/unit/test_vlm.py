@@ -24,7 +24,7 @@ from kempnerforge.config.vlm import (
     MoTConfig,
     VLMConfig,
 )
-from kempnerforge.data.vlm_dataset import MultiImageVLMCollator, VLMCollator, pack_vlm_samples
+from kempnerforge.data.vlm_dataset import PackedVLMCollator, VLMCollator, pack_vlm_samples
 from kempnerforge.model.modality import ModalityContext
 from kempnerforge.model.transformer import Transformer
 from kempnerforge.model.vlm import (
@@ -407,7 +407,9 @@ class TestPackedForward:
         """With no images the rows are ordinary packed text, so the backbone alone decides."""
         wrapper = _build_tiny_wrapper(num_image_tokens=8).eval()
         docs = [_packed_doc(10, 1, images=0), _packed_doc(12, 2, images=0)]
-        batch = pack_vlm_samples(docs, seq_len=32, tokens_per_image=8, pad_id=0)
+        batch = pack_vlm_samples(
+            docs, seq_len=32, tokens_per_image=8, pad_id=0, allow_text_only=True
+        )
         assert batch["pixel_values"].shape == (0, 3, 16, 16)
         with torch.no_grad():
             packed, _ = self._forward(wrapper, batch)
@@ -417,7 +419,11 @@ class TestPackedForward:
     @staticmethod
     def _text_only_batch(tokens_per_image: int = 8):
         return pack_vlm_samples(
-            [_packed_doc(10, 3, images=0)], seq_len=32, tokens_per_image=tokens_per_image, pad_id=0
+            [_packed_doc(10, 3, images=0)],
+            seq_len=32,
+            tokens_per_image=tokens_per_image,
+            pad_id=0,
+            allow_text_only=True,
         )
 
     def test_a_text_only_batch_runs_a_blank_image_through_the_encoder_and_adapter(self):
@@ -444,7 +450,9 @@ class TestPackedForward:
         wrapper = _build_tiny_wrapper(num_image_tokens=8).eval()
         text_doc = _packed_doc(10, 4, images=0)
         image_doc = _packed_doc(12, 5)
-        batch = pack_vlm_samples([image_doc, text_doc], seq_len=40, tokens_per_image=8, pad_id=0)
+        batch = pack_vlm_samples(
+            [image_doc, text_doc], seq_len=40, tokens_per_image=8, pad_id=0, allow_text_only=True
+        )
         assert batch["pixel_values"].shape == (1, 3, 16, 16)
         with torch.no_grad():
             packed, _ = self._forward(wrapper, batch)
@@ -517,7 +525,10 @@ class TestPackedForward:
 class TestMultiImageDocuments:
     @staticmethod
     def _collate(docs):
-        return MultiImageVLMCollator(pad_id=0, seq_len=28, tokens_per_image=8)(docs)
+        collator = PackedVLMCollator(
+            pad_id=0, seq_len=28, tokens_per_image=8, max_docs_per_row=1, allow_text_only=True
+        )
+        return collator(docs)
 
     def _forward(self, wrapper, batch):
         return wrapper(

@@ -104,7 +104,7 @@ def _build_model(config: JobConfig, device: torch.device, dtype: torch.dtype) ->
     assert config.vlm is not None, "internal: _build_model requires a VLM config"
     assert config.vision_encoder is not None, "internal: VLM config requires a vision encoder"
     assert config.adapter is not None, "internal: VLM config materializes a default adapter"
-    frames_per_clip = config.images_per_document
+    frames_per_clip = config.video.max_frames if config.video is not None else 1
     model = build_vlm_wrapper(
         config.model,
         config.vision_encoder,

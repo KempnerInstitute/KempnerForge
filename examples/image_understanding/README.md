@@ -87,9 +87,10 @@ masked image document rather than plain text. With packing it is just its
 text, and a micro-batch of nothing but text carries no images; the vision
 encoder and adapter then run on one blank image whose output carries no weight,
 so FSDP2's collectives still see every rank, and under `train.compile_model`
-such a micro-batch is a second compiled graph. With the flag every unpacked
-batch carries a `frame_mask`, so the prefix route's attention always takes an
-explicit mask rather than the unmasked causal fast path. The flag needs an
+such a micro-batch is a second compiled graph. When the loaded dataset holds
+text-only rows, every unpacked batch carries a `frame_mask`, so the prefix
+route's attention takes an explicit mask rather than the unmasked causal fast
+path for that run, and never flips between the two. The flag needs an
 image-prefix arch or packing, not `cross_attention`, whose image K/V cannot
 hide a blank image. Without the flag a dataset with such a row is rejected when
 it is loaded.
@@ -103,13 +104,13 @@ loaded it counts the rows that trims in one warning. At the default of `1` a
 dataset with a list of more than one is rejected when it is loaded. The
 images' tokens go before the document's text, each image in its own block,
 which is the layout packing uses. With `data.pack_sequences = true` such
-documents pack like any other; without it `MultiImageVLMCollator` lays each
-document out in its own row of `train.seq_len`, so rows keep one shape across
+documents pack like any other; without it the same packer lays each document
+out in its own row of `train.seq_len`, so rows keep one shape across
 micro-batches and ranks. Both need `vlm.arch = "joint_decoder"`, and `n`
 images' tokens plus `vlm.max_text_len` have to fit `train.seq_len` and
 `model.max_seq_len`. The config checks that when `vision_encoder.num_tokens` is
-set; with a probed encoder the model build checks `model.max_seq_len`, and a
-document that does not fit `train.seq_len` is rejected by the collator.
+set; with a probed encoder the data pipeline checks it against the built
+model's token count before training starts.
 
 ## Start from the pretrained backbone
 

@@ -124,3 +124,48 @@ def test_packed_flex_compile_tracks_varying_rows_and_images() -> None:
             )
     finally:
         torch._dynamo.reset()
+
+
+@pytest.mark.gpu
+def test_a_compiled_text_only_batch_keeps_the_visual_parameters_in_the_graph() -> None:
+    """An all-text packed batch still gives the encoder and adapter zero, not missing, gradients."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+
+    torch._dynamo.reset()
+    torch.manual_seed(0)
+    dense = _model("sdpa")
+    sparse = _model("flex")
+    sparse.load_state_dict(dense.state_dict())
+    sparse.vision_encoder.forward = torch._dynamo.disable(sparse.vision_encoder.forward)
+    compiled = torch.compile(sparse)
+    ids = torch.arange(1, _TEXT_LEN + 1, dtype=torch.long)
+    labels = torch.full_like(ids, -100)
+    labels[:-1] = ids[1:]
+    doc = {
+        "pixel_values": torch.zeros(0, 3, 4, 4),
+        "input_ids": ids,
+        "labels": labels,
+        "text_len": torch.tensor(_TEXT_LEN),
+    }
+    batch = pack_vlm_samples(
+        [doc, doc], seq_len=_SEQ_LEN, tokens_per_image=_IMAGE_TOKENS, pad_id=0, allow_text_only=True
+    )
+    assert batch["pixel_values"].shape[0] == 0
+    batch = {name: tensor.to("cuda") for name, tensor in batch.items()}
+    image_tokens = int(batch.pop("image_tokens"))
+    _mark_rows_dynamic(*batch.values())
+    reference, _ = dense(**batch, image_tokens=image_tokens)
+    actual, _ = compiled(**batch, image_tokens=image_tokens)
+    torch.testing.assert_close(actual, reference, rtol=2e-5, atol=2e-5)
+    actual.float().sum().backward()
+    visual = [
+        (name, parameter)
+        for module in (sparse.vision_encoder, sparse.adapter)
+        for name, parameter in module.named_parameters()
+        if parameter.requires_grad
+    ]
+    assert visual
+    for name, parameter in visual:
+        assert parameter.grad is not None, name
+        assert torch.count_nonzero(parameter.grad) == 0, name

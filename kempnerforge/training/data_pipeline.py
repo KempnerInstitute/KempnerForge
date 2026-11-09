@@ -130,7 +130,6 @@ def _build_vlm_pipeline(
 
         from kempnerforge.data.vlm_dataset import (
             HuggingFaceVLMDataset,
-            MultiImageVLMCollator,
             PackedVLMCollator,
             VLMCollator,
         )
@@ -152,7 +151,10 @@ def _build_vlm_pipeline(
         if config.data.pack_sequences:
             tokens_per_image = _row_tokens_per_image(tokens_per_image, "data.pack_sequences")
             collator = PackedVLMCollator(
-                pad_id=pad_id, seq_len=tc.seq_len, tokens_per_image=tokens_per_image
+                pad_id=pad_id,
+                seq_len=tc.seq_len,
+                tokens_per_image=tokens_per_image,
+                allow_text_only=dataset.has_text_only_rows,
             )
             logger.info(
                 f"VLM dataset: {len(dataset):,} samples from {config.data.hf_dataset_name}, "
@@ -161,8 +163,19 @@ def _build_vlm_pipeline(
             )
         elif config.data.hf_max_images != 1:
             tokens_per_image = _row_tokens_per_image(tokens_per_image, "data.hf_max_images")
-            collator = MultiImageVLMCollator(
-                pad_id=pad_id, seq_len=tc.seq_len, tokens_per_image=tokens_per_image
+            footprint = config.data.hf_max_images * tokens_per_image + vlm_cfg.max_text_len
+            if footprint > tc.seq_len:
+                raise ValueError(
+                    f"data.hf_max_images={config.data.hf_max_images} images x {tokens_per_image} "
+                    f"tokens + vlm.max_text_len={vlm_cfg.max_text_len} is {footprint} positions, "
+                    f"over train.seq_len={tc.seq_len}; a document could not fit its row"
+                )
+            collator = PackedVLMCollator(
+                pad_id=pad_id,
+                seq_len=tc.seq_len,
+                tokens_per_image=tokens_per_image,
+                max_docs_per_row=1,
+                allow_text_only=dataset.has_text_only_rows,
             )
             logger.info(
                 f"VLM dataset: {len(dataset):,} samples from {config.data.hf_dataset_name}, "
@@ -173,7 +186,7 @@ def _build_vlm_pipeline(
             collator = VLMCollator(
                 pad_id=pad_id,
                 max_text_len=vlm_cfg.max_text_len,
-                allow_text_only=config.data.hf_allow_text_only,
+                allow_text_only=dataset.has_text_only_rows,
             )
             logger.info(f"VLM dataset: {len(dataset):,} samples from {config.data.hf_dataset_name}")
 

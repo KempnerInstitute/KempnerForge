@@ -85,7 +85,7 @@ def build_model(
             vision_config=config.vision_encoder,
             adapter_config=config.adapter,
             vlm_config=config.vlm,
-            frames_per_clip=config.images_per_document,
+            frames_per_clip=config.video.max_frames if config.video is not None else 1,
             ac_mode=tc.activation_checkpointing,
             mp_policy=mp_policy,
             param_dtype=tc.master_dtype,
@@ -303,8 +303,7 @@ def run_training(
 
         prof = build_profiler(config.profiling, rank=runtime.rank)
 
-        laid_out = config.data.pack_sequences or config.data.hf_max_images != 1
-        tokens_per_image = packed_tokens_per_image(model) if config.is_vlm and laid_out else None
+        tokens_per_image = packed_tokens_per_image(model) if config.is_vlm else None
         data = build_data_pipeline(config, runtime, tokens_per_image=tokens_per_image)
         if data.dataloader is not None:
             ckpt_mgr.apply_dataloader_state(data.dataloader)

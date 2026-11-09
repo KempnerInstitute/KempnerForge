@@ -16,7 +16,6 @@ from kempnerforge.data.vlm_dataset import (
     DEFAULT_IMAGE_MEAN,
     DEFAULT_IMAGE_STD,
     HuggingFaceVLMDataset,
-    MultiImageVLMCollator,
     PackedVLMCollator,
     VLMCollator,
     _tokenize_and_mask,
@@ -636,17 +635,20 @@ class TestVLMCollator:
         collator = VLMCollator(pad_id=0, max_text_len=20, allow_text_only=True)
         tiled, text_only = self._sample(3), self._sample(4)
         tiled["pixel_values"] = torch.randn(2, 3, 32, 32)
-        text_only["pixel_values"] = torch.zeros(0, 3, 32, 32)
+        text_only["pixel_values"] = torch.zeros(0, 2, 3, 32, 32)
         batch = collator([tiled, text_only])
         assert batch["pixel_values"].shape == (2, 2, 3, 32, 32)
         assert torch.count_nonzero(batch["pixel_values"][1]) == 0
         assert batch["frame_mask"].tolist() == [[True, True], [False, False]]
+        only_text = collator([text_only, text_only])
+        assert only_text["pixel_values"].shape == (2, 2, 3, 32, 32)
+        assert only_text["frame_mask"].shape == (2, 2)
 
     def test_samples_with_different_image_shapes_are_rejected(self):
         collator = VLMCollator(pad_id=0, max_text_len=20)
         tiled = self._sample(3)
         tiled["pixel_values"] = torch.randn(2, 3, 32, 32)
-        with pytest.raises(ValueError, match="share one shape"):
+        with pytest.raises(ValueError, match="share one image shape"):
             collator([self._sample(5), tiled])
 
     def test_fixed_length_not_batch_max(self):
@@ -913,8 +915,17 @@ class TestTextOnlyRows:
         with pytest.raises(ValueError, match="2 of 4 rows have no image.*hf_allow_text_only"):
             HuggingFaceVLMDataset(path, max_text_len=8, **kwargs)
         ds = HuggingFaceVLMDataset(path, max_text_len=8, allow_text_only=True, **kwargs)
+        assert ds.has_text_only_rows
         assert ds[1]["pixel_values"].shape == (0, 3, 224, 224)
         assert ds[0]["pixel_values"].shape == (3, 224, 224)
+
+    def test_a_dataset_whose_rows_all_have_images_reports_no_text_only_rows(self, tmp_path):
+        path = _mixed_image_dataset(tmp_path, [_make_image(8), [_make_image(8)]])
+        kwargs = dict(
+            split="train", image_field="image", text_field="caption", tokenizer_path="gpt2"
+        )
+        ds = HuggingFaceVLMDataset(path, max_text_len=8, allow_text_only=True, **kwargs)
+        assert not ds.has_text_only_rows
 
     def test_a_dataset_with_several_images_in_a_row_is_rejected_when_loaded(self, tmp_path):
         path = _mixed_image_dataset(tmp_path, [[_make_image(8)] * 2, [_make_image(8)]])
@@ -931,8 +942,9 @@ class TestTextOnlyRows:
 
         singles = Dataset.from_dict({"image": [_make_image(8), None, _make_image(8)]})
         assert vlm_dataset._images_per_row(singles, "image").tolist() == [1, 0, 1]
-        lists = Dataset.from_dict({"image": [[_make_image(8)] * 2, [], None, [_make_image(8)]]})
-        assert vlm_dataset._images_per_row(lists, "image").tolist() == [2, 0, 0, 1]
+        one = _make_image(8)
+        lists = Dataset.from_dict({"image": [[one] * 2, [], None, [one], [None], [one, None]]})
+        assert vlm_dataset._images_per_row(lists, "image").tolist() == [2, 0, 0, 1, 0, 1]
 
 
 class TestMultiImageRows:
@@ -980,9 +992,11 @@ class TestMultiImageRows:
         assert "hf_max_images" not in caplog.text
 
 
-class TestMultiImageVLMCollator:
+class TestOneDocumentPerRow:
     def test_one_document_per_fixed_row(self):
-        collator = MultiImageVLMCollator(pad_id=0, seq_len=12, tokens_per_image=2)
+        collator = PackedVLMCollator(
+            pad_id=0, seq_len=12, tokens_per_image=2, max_docs_per_row=1, allow_text_only=True
+        )
         batch = collator([_doc(3, 10, views=2), _doc(4, 20), _doc(2, 30, views=0)])
         assert batch["input_ids"].shape == (3, 12)
         assert batch["pixel_values"].shape == (3, 3, 4, 4)
@@ -995,7 +1009,7 @@ class TestMultiImageVLMCollator:
         assert "frame_mask" not in batch
 
     def test_empty_batches_and_oversized_documents_raise(self):
-        collator = MultiImageVLMCollator(pad_id=0, seq_len=12, tokens_per_image=2)
+        collator = PackedVLMCollator(pad_id=0, seq_len=12, tokens_per_image=2, max_docs_per_row=1)
         with pytest.raises(ValueError, match="no samples"):
             collator([])
         with pytest.raises(ValueError, match="does not fit a row"):
@@ -1127,7 +1141,11 @@ class TestPackVLMSamples:
 
     def test_a_text_only_document_takes_no_image_slots(self):
         batch = pack_vlm_samples(
-            [_doc(3, 10, views=0), _doc(4, 20)], seq_len=12, tokens_per_image=2, pad_id=0
+            [_doc(3, 10, views=0), _doc(4, 20)],
+            seq_len=12,
+            tokens_per_image=2,
+            pad_id=0,
+            allow_text_only=True,
         )
         assert batch["input_ids"][0].tolist() == [10, 11, 12, 0, 0, 20, 21, 22, 23, 0, 0, 0]
         assert batch["doc_ids"][0].tolist() == [0, 0, 0, 1, 1, 1, 1, 1, 1, 2, 2, 2]
@@ -1137,7 +1155,11 @@ class TestPackVLMSamples:
 
     def test_a_batch_of_text_only_documents_carries_no_images(self):
         batch = pack_vlm_samples(
-            [_doc(3, 10, views=0), _doc(4, 20, views=0)], seq_len=8, tokens_per_image=2, pad_id=0
+            [_doc(3, 10, views=0), _doc(4, 20, views=0)],
+            seq_len=8,
+            tokens_per_image=2,
+            pad_id=0,
+            allow_text_only=True,
         )
         assert batch["pixel_values"].shape == (0, 3, 4, 4)
         assert batch["image_rows"].shape == (0,)
@@ -1160,3 +1182,13 @@ class TestPackVLMSamples:
         assert batch["input_ids"][0, 11].item() == 7
         with pytest.raises(ValueError, match="no samples"):
             collator([])
+
+    def test_a_text_only_document_needs_the_flag(self):
+        doc = _doc(3, 10, views=0)
+        with pytest.raises(ValueError, match="hf_allow_text_only"):
+            pack_vlm_samples([doc], seq_len=12, tokens_per_image=2, pad_id=0)
+        collator = PackedVLMCollator(pad_id=0, seq_len=12, tokens_per_image=2)
+        with pytest.raises(ValueError, match="hf_allow_text_only"):
+            collator([doc])
+        packed = PackedVLMCollator(pad_id=0, seq_len=12, tokens_per_image=2, allow_text_only=True)
+        assert packed([doc])["pixel_values"].shape == (0, 3, 4, 4)
