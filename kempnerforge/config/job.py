@@ -153,6 +153,16 @@ class JobConfig:
                 "Set eval.dataset_path or eval.hf_dataset_name."
             )
 
+        if (
+            self.eval.enabled
+            and self.distributed.pp > 1
+            and self.eval.steps % self.train.grad_accum_steps
+        ):
+            raise ValueError(
+                f"eval.steps ({self.eval.steps}) must be a multiple of train.grad_accum_steps "
+                f"({self.train.grad_accum_steps}) under pipeline parallelism: eval runs its "
+                f"batches through the training schedule, grad_accum_steps at a time."
+            )
         if self.train.fp32_master_weights and self.model.is_moe:
             resolved = self.distributed.resolve(world_size)
             if max(resolved.dp_replicate, resolved.dp_shard, resolved.tp, resolved.ep) == 1:

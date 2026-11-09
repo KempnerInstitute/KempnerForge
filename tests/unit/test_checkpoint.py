@@ -35,7 +35,7 @@ from kempnerforge.config.schema import (
     OptimizerConfig,
 )
 from kempnerforge.model.transformer import Transformer
-from kempnerforge.training.optimizer import _should_decay, build_optimizer
+from kempnerforge.training.optimizer import Muon, _should_decay, build_optimizer
 
 
 class TestRNGState:
@@ -934,6 +934,51 @@ class _HeldLock:
         self._lock.release()
 
 
+class _PrunedDirs(list):
+    """Directories passed to ``shutil.rmtree``, in order; ``refused`` holds those NFS kept."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.refused: list[Path] = []
+
+    def still_present(self) -> list[Path]:
+        """The directories that exist although their removal went through."""
+        return [d for d in self if d not in self.refused and d.exists()]
+
+
+@pytest.fixture
+def pruned_dirs(tmp_path, monkeypatch) -> _PrunedDirs:
+    """The directories under ``tmp_path`` passed to ``shutil.rmtree``, in order.
+
+    ``tmp_path`` is the manager's base directory in the tests that use this; other paths
+    go to ``shutil.rmtree`` unchanged. On NFS, removing a directory a moment after writing
+    into it can fail with ``ENOTEMPTY`` or ``EBUSY`` (an ``.nfsXXXX`` entry keeps it
+    non-empty), so such a failure is noted in ``refused`` instead of raised, and a test
+    asserts on this list rather than on what the filesystem still holds. Any other error
+    is raised as usual.
+    """
+    import errno
+
+    from kempnerforge.checkpoint import manager as mgr_mod
+
+    rmtree = mgr_mod.shutil.rmtree
+    pruned = _PrunedDirs()
+
+    def record(path, *args, **kwargs):
+        if not Path(path).is_relative_to(tmp_path):
+            return rmtree(path, *args, **kwargs)
+        pruned.append(Path(path))
+        try:
+            rmtree(path, *args, **kwargs)
+        except OSError as e:
+            if e.errno not in (errno.ENOTEMPTY, errno.EBUSY):
+                raise
+            pruned.refused.append(Path(path))
+
+    monkeypatch.setattr(mgr_mod.shutil, "rmtree", record)
+    return pruned
+
+
 class TestSaveCheckpointRegistration:
     """A registrar adds fields to a save's ``tracking`` records, and registers it on commit."""
 
@@ -1158,7 +1203,9 @@ class TestSaveCheckpointRegistration:
         assert registrar.registered == []
         assert not (tmp_path / "latest").exists()
 
-    def test_a_registrar_that_raises_costs_only_the_registration(self, tmp_path, monkeypatch):
+    def test_a_registrar_that_raises_costs_only_the_registration(
+        self, tmp_path, monkeypatch, pruned_dirs
+    ):
         warnings = self._log(monkeypatch, "warning")
         mgr = _make_mock_mgr(tmp_path, monkeypatch)
         mgr.config.keep_last_n = 1
@@ -1167,7 +1214,8 @@ class TestSaveCheckpointRegistration:
         mgr.save(step=1, tokens_seen=8)
         mgr.save(step=2, tokens_seen=16)
         assert (tmp_path / "latest").resolve() == (tmp_path / "step_2").resolve()
-        assert not (tmp_path / "step_1").exists()
+        assert pruned_dirs == [tmp_path / "step_1"]
+        assert pruned_dirs.still_present() == []
         assert self._sidecar(tmp_path, 2)["tracking"] == [self.MLFLOW]
         assert len(warnings) == 2 and "step_2" in warnings[1] and "no server" in warnings[1]
 
@@ -1787,10 +1835,11 @@ class TestAsyncLatestSymlinkSafety:
         assert step == 20
         assert tokens == 2000
 
-    def test_cleanup_never_deletes_latest_or_in_flight(self, tmp_path, monkeypatch):
+    def test_cleanup_never_deletes_latest_or_in_flight(self, tmp_path, pruned_dirs):
+        """Step 6 is newest, so only the latest and in-flight protections keep steps 3 and 5."""
         mgr = self._mgr(tmp_path, AsyncCheckpointMode.async_pinned)
         mgr.config.keep_last_n = 1
-        dirs = {s: self._build_ckpt(tmp_path, s, complete=True) for s in (1, 2, 3, 4, 5)}
+        dirs = {s: self._build_ckpt(tmp_path, s, complete=True) for s in (1, 2, 3, 4, 5, 6)}
 
         latest = Path(tmp_path) / "latest"
         latest.symlink_to(dirs[3].name)
@@ -1800,8 +1849,8 @@ class TestAsyncLatestSymlinkSafety:
 
         assert dirs[3].exists(), "cleanup deleted the live `latest` target"
         assert dirs[5].exists(), "cleanup deleted the in-flight pending checkpoint"
-        assert not dirs[1].exists()
-        assert not dirs[2].exists()
+        assert pruned_dirs == [dirs[1], dirs[2], dirs[4]]
+        assert pruned_dirs.still_present() == []
 
     @pytest.mark.parametrize("pp_rank", [None, 0], ids=["no_pp", "pp_stage_0"])
     @pytest.mark.parametrize(
@@ -2722,6 +2771,54 @@ class TestMuonResume:
         dcp.load(state, checkpoint_id=str(tmp_path / "step_3"))
         set_optimizer_state_dict(model2, opt2, optim_state_dict=state["optimizer"])
         self._assert_same_state(opt, opt2, "Muon")
+
+    @staticmethod
+    def _save_stepped(model, opt, ckpt_dir):
+        """Step ``opt`` once on random gradients and save it."""
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        for p in model.parameters():
+            p.grad = torch.randn_like(p)
+        opt.step()
+        CheckpointManager(CheckpointConfig(dir=str(ckpt_dir)), model, opt).save(step=1)
+
+    def test_checkpoint_from_the_shape_split_fails_naming_what_moved(self, tmp_path):
+        """A checkpoint with the embedding and head on Muon fails to resume, naming both."""
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        config = ModelConfig(dim=64, n_layers=1, n_heads=2, vocab_size=256, max_seq_len=64)
+        model = Transformer(config).to(self.DEVICE)
+        matrices = [p for p in model.parameters() if p.ndim == 2]
+        rest = [p for p in model.parameters() if p.ndim != 2]
+        old = Muon([{"params": matrices}], [{"params": rest, "weight_decay": 0.0}], lr=1e-3)
+        self._save_stepped(model, old, tmp_path)
+
+        model2 = Transformer(config).to(self.DEVICE)
+        opt2 = build_optimizer(model2, OptimizerConfig(name="muon", lr=1e-3, fused=False))
+        manager = CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model2, opt2)
+        moved = "2 parameters: ['output_head.proj.weight', 'token_embedding.embedding.weight']"
+        with pytest.raises(RuntimeError, match=re.escape(moved)) as raised:
+            manager.load()
+        assert "exclude_from_loading" in str(raised.value)
+
+    def test_resume_with_muon_router_flipped_fails_naming_the_gate(self, tmp_path):
+        """Flipping muon_router across a resume fails, naming the router gate."""
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        config = ModelConfig(
+            dim=64, n_layers=1, n_heads=2, vocab_size=256, max_seq_len=64, num_experts=4
+        )
+        model = Transformer(config).to(self.DEVICE)
+        opt = build_optimizer(model, OptimizerConfig(name="muon", lr=1e-3, fused=False))
+        self._save_stepped(model, opt, tmp_path)
+
+        model2 = Transformer(config).to(self.DEVICE)
+        options = OptimizerConfig(name="muon", lr=1e-3, fused=False, muon_router=True)
+        manager = CheckpointManager(
+            CheckpointConfig(dir=str(tmp_path)), model2, build_optimizer(model2, options)
+        )
+        with pytest.raises(RuntimeError, match=re.escape("['layers.0.mlp.router.gate.weight']")):
+            manager.load()
 
     def test_checkpoint_saved_before_orthogonalize_resumes_as_local(self, tmp_path):
         """A checkpoint saved before ``orthogonalize`` existed resumes with "local" and matches."""
