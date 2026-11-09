@@ -447,13 +447,25 @@ class Muon(torch.optim.Optimizer):
     def load_state_dict(self, state_dict: dict) -> None:
         """Restore internal AdamW state from checkpoint.
 
-        A state without the fallback's base rates keeps this optimizer's own.
+        A state without the fallback's base rates keeps this optimizer's own, and so does one
+        whose rates do not number one per AdamW fallback group, with a warning.
         """
         adam_state = state_dict.pop("_adam_state", None)
         self._initial_lr = state_dict.pop("_initial_lr", self._initial_lr)
         self._initial_adam_lr = state_dict.pop("_initial_adam_lr", self._initial_adam_lr)
-        self._lead_group_lr = state_dict.pop("_lead_group_lr", self._lead_group_lr)
-        self._adam_group_lrs = list(state_dict.pop("_adam_group_lrs", self._adam_group_lrs))
+        lead_group_lr = state_dict.pop("_lead_group_lr", self._lead_group_lr)
+        adam_group_lrs = state_dict.pop("_adam_group_lrs", self._adam_group_lrs)
+        if isinstance(adam_group_lrs, list | tuple) and len(adam_group_lrs) == len(
+            self._adam_group_lrs
+        ):
+            self._lead_group_lr = lead_group_lr
+            self._adam_group_lrs = list(adam_group_lrs)
+        else:
+            logger.warning(
+                f"The Muon state gives the AdamW fallback the base rates {adam_group_lrs!r}, not "
+                f"one per fallback param group ({len(self._adam_group_lrs)}); keeping this "
+                f"optimizer's own, {self._adam_group_lrs}"
+            )
         super().load_state_dict(state_dict)
         if adam_state is not None and self._adam is not None:
             self._adam.load_state_dict(adam_state)

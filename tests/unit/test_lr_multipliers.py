@@ -535,6 +535,35 @@ class TestMuonFallback:
         optimizer.load_state_dict(state)
         assert optimizer._fallback_lrs() == rates
 
+    @pytest.mark.parametrize(
+        "rates",
+        [[None, 6e-4], [None, 6e-4, 1.5e-4, 1e-3], 6e-4],
+        ids=["fewer", "more", "not-a-list"],
+    )
+    def test_fallback_rates_that_do_not_fit_its_groups_are_not_taken(
+        self, caplog, monkeypatch, rates
+    ):
+        """A state from a Muon whose fallback had other groups keeps this one's rates, the
+        rate of Muon's lead group included, so its next step still runs."""
+        monkeypatch.setattr(logging.getLogger("kempnerforge"), "propagate", True)
+        model = _vlm_like()
+        optimizer = self._muon(model, lr_multipliers={"vision_encoder": 0.5, "adapter": 2.0})
+        own = optimizer._fallback_lrs()
+        state = optimizer.state_dict()
+        state["_adam_group_lrs"] = rates
+        state["_lead_group_lr"] = 1.0
+        with caplog.at_level(logging.WARNING, logger="kempnerforge.training.optimizer"):
+            optimizer.load_state_dict(state)
+        assert optimizer._fallback_lrs() == own
+        assert [m for m in caplog.messages if "fallback the base rates" in m] == [
+            f"The Muon state gives the AdamW fallback the base rates {rates!r}, not one per "
+            f"fallback param group (3); keeping this optimizer's own, {optimizer._adam_group_lrs}"
+        ]
+        _forward(model).backward()
+        optimizer.step()
+        assert optimizer._adam is not None
+        assert [g["lr"] for g in optimizer._adam.param_groups] == own
+
     def test_a_module_on_the_fallback_alone_is_logged(self):
         """A module with no matrix for Muon still reports its rate, through its fallback."""
         model = _vlm_like()
