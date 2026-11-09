@@ -11,7 +11,8 @@ than another branch inside the loop.
 from __future__ import annotations
 
 import contextlib
-from collections.abc import Callable
+import time
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -406,6 +407,20 @@ def checkpoint_extra(config: JobConfig, step: int, phases: PhaseState) -> dict:
     return extra
 
 
+@contextlib.contextmanager
+def _logged_time(tracker: MetricsTracker, key: str, step: int) -> Iterator[None]:
+    """Log the time the block takes as the metric ``key`` of ``step``.
+
+    The loop wraps every checkpoint save in it as ``checkpoint/save_sec`` (for an
+    async save, the wait for the previous upload, the staging and the dispatch; the
+    upload itself runs in the background) and every drain of an async save as
+    ``checkpoint/wait_sec``. Nothing is logged when the block raises.
+    """
+    start = time.perf_counter()
+    yield
+    tracker.log_eval({key: time.perf_counter() - start}, step)
+
+
 def _log_periodic_metrics(session: TrainingSession, result: StepResult, step: int) -> None:
     """MoE / VLM-text-token / per-dataset series, on the main metrics interval."""
     config = session.config
@@ -479,7 +494,8 @@ def _apply_freeze_stages(session: TrainingSession, step: int) -> None:
     pending_stages = [s for s in vlm_cfg.freeze_schedule if s.start_step == step]
     if not pending_stages:
         return
-    session.checkpointer.flush_pending_save()
+    with _logged_time(session.tracker, "checkpoint/wait_sec", step):
+        session.checkpointer.flush_pending_save()
     for stage in pending_stages:
         flipped = apply_freeze_specs(session.model, stage.specs, vlm_cfg.module_patterns)
         logger.info(f"FreezeStage at step={step}: applied {flipped}")
@@ -525,7 +541,8 @@ def _shutdown_if_requested(
             f"Shutdown requested at step {step}; "
             "its scheduled checkpoint is the emergency checkpoint"
         )
-        ckpt_mgr.wait()
+        with _logged_time(session.tracker, "checkpoint/wait_sec", step):
+            ckpt_mgr.wait()
     elif nan_skipped and not params_are_finite(session.model, session.runtime.device):
         logger.error(
             f"Shutdown requested at step {step}, skipped for a NaN/Inf loss, but the "
@@ -534,13 +551,14 @@ def _shutdown_if_requested(
         )
     else:
         logger.warning(f"Shutdown requested at step {step} — saving emergency checkpoint")
-        ckpt_mgr.save(
-            step=step,
-            tokens_seen=tokens_seen,
-            scheduler=session.scheduler,
-            dataloader=session.data.dataloader,
-            extra=checkpoint_extra(session.config, step, session.phases),
-        )
+        with _logged_time(session.tracker, "checkpoint/save_sec", step):
+            ckpt_mgr.save(
+                step=step,
+                tokens_seen=tokens_seen,
+                scheduler=session.scheduler,
+                dataloader=session.data.dataloader,
+                extra=checkpoint_extra(session.config, step, session.phases),
+            )
     session.shutdown_handler.finish()
     return True
 
@@ -584,13 +602,14 @@ def run_training_loop(
         prof.start()
 
     if step == 0 and config.checkpoint.is_dynamic_milestone(0):
-        ckpt_mgr.save(
-            step=0,
-            tokens_seen=0,
-            scheduler=scheduler,
-            dataloader=data.dataloader,
-            extra=checkpoint_extra(config, 0, phases),
-        )
+        with _logged_time(tracker, "checkpoint/save_sec", 0):
+            ckpt_mgr.save(
+                step=0,
+                tokens_seen=0,
+                scheduler=scheduler,
+                dataloader=data.dataloader,
+                extra=checkpoint_extra(config, 0, phases),
+            )
         hooks.on_checkpoint_save(0, config.checkpoint.dir)
 
     completed_normally = False
@@ -688,13 +707,14 @@ def run_training_loop(
             ckpt_extra = checkpoint_extra(config, step, phases)
             saved_this_step = config.checkpoint.should_save(step)
             if saved_this_step:
-                ckpt_mgr.save(
-                    step=step,
-                    tokens_seen=tokens_seen,
-                    scheduler=scheduler,
-                    dataloader=data.dataloader,
-                    extra=ckpt_extra,
-                )
+                with _logged_time(tracker, "checkpoint/save_sec", step):
+                    ckpt_mgr.save(
+                        step=step,
+                        tokens_seen=tokens_seen,
+                        scheduler=scheduler,
+                        dataloader=data.dataloader,
+                        extra=ckpt_extra,
+                    )
                 hooks.on_checkpoint_save(step, config.checkpoint.dir)
 
             if _shutdown_if_requested(session, step, tokens_seen, saved_this_step=saved_this_step):
@@ -711,16 +731,18 @@ def run_training_loop(
         session.batches.close()
 
     if completed_normally and not config.checkpoint.should_save(step):
-        ckpt_mgr.save(
-            step=step,
-            tokens_seen=tokens_seen,
-            scheduler=scheduler,
-            dataloader=data.dataloader,
-            extra=ckpt_extra,
-        )
+        with _logged_time(tracker, "checkpoint/save_sec", step):
+            ckpt_mgr.save(
+                step=step,
+                tokens_seen=tokens_seen,
+                scheduler=scheduler,
+                dataloader=data.dataloader,
+                extra=ckpt_extra,
+            )
         hooks.on_checkpoint_save(step, config.checkpoint.dir)
 
-    ckpt_mgr.wait()
+    with _logged_time(tracker, "checkpoint/wait_sec", step):
+        ckpt_mgr.wait()
 
     logger.info(f"Training complete: {step} steps, {tokens_seen:,} tokens")
     hooks.on_train_end(step, tokens_seen)

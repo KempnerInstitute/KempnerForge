@@ -1383,6 +1383,9 @@ class TestRunTraining:
             def end_step(self, **_kw):
                 return None
 
+            def log_eval(self, *_a) -> None:
+                pass
+
             def tracking_entries(self) -> list:
                 return live
 
@@ -1423,6 +1426,9 @@ class TestRunTraining:
 
             def end_step(self, **_kw):
                 return None
+
+            def log_eval(self, *_a) -> None:
+                pass
 
             def tracking_entries(self) -> list:
                 return []
@@ -3338,6 +3344,91 @@ class TestLoopPeriodicWork:
         assert phases.lr_scale == 0.5
 
 
+class TestCheckpointTiming:
+    """Every save the loop makes logs ``checkpoint/save_sec`` and every drain of an
+    async save logs ``checkpoint/wait_sec``; neither is part of ``step_time``."""
+
+    @staticmethod
+    def _session(monkeypatch, config, **overrides):
+        import time
+
+        clock = [0.0]
+        monkeypatch.setattr(time, "perf_counter", lambda: clock[0])
+        ckpt = FakeCheckpointManager()
+        save, wait = ckpt.save, ckpt.wait
+
+        def slow_save(*args: Any, **kwargs: Any) -> None:
+            clock[0] += 7.0
+            save(*args, **kwargs)
+
+        def slow_wait() -> None:
+            clock[0] += 2.0
+            wait()
+
+        monkeypatch.setattr(ckpt, "save", slow_save)
+        monkeypatch.setattr(ckpt, "wait", slow_wait)
+        session = make_session(config, checkpointer=ckpt, **overrides)
+        logged: list[tuple[int, dict]] = []
+        monkeypatch.setattr(session.tracker, "log_eval", lambda m, s: logged.append((s, dict(m))))
+        return session, logged
+
+    @staticmethod
+    def _times(logged: list[tuple[int, dict]], key: str) -> list[tuple[int, float]]:
+        return [(step, metrics[key]) for step, metrics in logged if key in metrics]
+
+    def test_scheduled_and_final_saves_and_the_final_wait(self, monkeypatch):
+        config = make_config(max_steps=3)
+        config.checkpoint.interval = 2
+        session, logged = self._session(monkeypatch, config)
+        run_training_loop(session)
+        assert self._times(logged, "checkpoint/save_sec") == [(2, 7.0), (3, 7.0)]
+        assert self._times(logged, "checkpoint/wait_sec") == [(3, 2.0)]
+
+    def test_the_startup_save(self, monkeypatch):
+        config = make_config(max_steps=1)
+        config.checkpoint.interval = 100
+        config.checkpoint.dyn_ckpt_window = DynamicCheckpointWindow(start=0, stop=8)
+        session, logged = self._session(monkeypatch, config)
+        run_training_loop(session)
+        assert self._times(logged, "checkpoint/save_sec")[0] == (0, 7.0)
+
+    def test_an_emergency_save(self, monkeypatch):
+        config = make_config(max_steps=5)
+        config.checkpoint.interval = 100
+        session, logged = self._session(
+            monkeypatch, config, shutdown_handler=FakeShutdownHandler(after_steps=1)
+        )
+        run_training_loop(session)
+        assert self._times(logged, "checkpoint/save_sec") == [(1, 7.0)]
+
+    def test_an_emergency_checkpoint_already_saved_logs_its_wait(self, monkeypatch):
+        config = make_config(max_steps=5)
+        config.checkpoint.interval = 1
+        session, logged = self._session(
+            monkeypatch, config, shutdown_handler=FakeShutdownHandler(after_steps=1)
+        )
+        run_training_loop(session)
+        assert self._times(logged, "checkpoint/save_sec") == [(1, 7.0)]
+        assert self._times(logged, "checkpoint/wait_sec")[0] == (1, 2.0)
+
+    def test_save_time_is_left_out_of_step_time(self, monkeypatch):
+        config = make_config(max_steps=2)
+        config.checkpoint.interval = 1
+        session, _ = self._session(monkeypatch, config)
+        session.tracker.metrics_config.log_interval = 1
+        step_times: list[float] = []
+        end_step = session.tracker.end_step
+
+        def record(**kwargs: Any):
+            metrics = end_step(**kwargs)
+            step_times.append(metrics.step_time_sec)
+            return metrics
+
+        monkeypatch.setattr(session.tracker, "end_step", record)
+        run_training_loop(session)
+        assert step_times == [0.0, 0.0]
+
+
 class TestFreezeStageFence:
     """The stage hook must drain an in-flight save before flipping requires_grad.
 
@@ -3373,6 +3464,15 @@ class TestFreezeStageFence:
         order: list = []
         run_training_loop(self._vlm_session(monkeypatch, start_step=2, order=order))
         assert order == ["flush", "freeze"]
+
+    def test_stage_logs_its_flush_as_checkpoint_wait_time(self, monkeypatch):
+        order: list = []
+        session = self._vlm_session(monkeypatch, start_step=2, order=order)
+        logged: list = []
+        monkeypatch.setattr(session.tracker, "log_eval", lambda m, s: logged.append((s, dict(m))))
+        run_training_loop(session)
+        waits = [step for step, metrics in logged if "checkpoint/wait_sec" in metrics]
+        assert waits[0] == 2
 
     def test_no_stage_at_this_step_does_not_flush(self, monkeypatch):
         order: list = []
