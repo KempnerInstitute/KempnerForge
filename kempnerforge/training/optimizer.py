@@ -134,6 +134,11 @@ class ScheduleFreeAdamW(torch.optim.Optimizer):
     and a running average ``x``.  Parameters are set to the interpolated
     point ``y = (1 - beta1) * z + beta1 * x`` for gradient computation.
 
+    Each parameter's ``step`` counts the steps it had a gradient in, and its warmup,
+    second-moment bias correction and average all run on that count, so a parameter
+    whose first gradient comes late starts as a fresh one does. The count is optimizer
+    state, which ``get_optimizer_state_dict`` keeps, so a checkpoint resumes it.
+
     Use with ``scheduler.name = "none"`` — no LR schedule is needed.
 
     Args:
@@ -157,18 +162,21 @@ class ScheduleFreeAdamW(torch.optim.Optimizer):
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
         super().__init__(params, defaults)
         self.warmup_steps = warmup_steps
-        self._k = 0
-
-    def state_dict(self) -> dict:
-        sd = super().state_dict()
-        sd["_k"] = self._k
-        sd["_warmup_steps"] = self.warmup_steps
-        return sd
 
     def load_state_dict(self, state_dict: dict) -> None:
-        self._k = state_dict.pop("_k", 0)
+        """Load ``state_dict``, also one saved before each parameter kept its own ``step``.
+
+        Such a state carries one optimizer-wide count as ``_k``, which every parameter with
+        state resumes from, and its warmup as ``_warmup_steps``.
+        """
+        state_dict = dict(state_dict)
+        legacy_k = state_dict.pop("_k", None)
         self.warmup_steps = state_dict.pop("_warmup_steps", self.warmup_steps)
         super().load_state_dict(state_dict)
+        if legacy_k is not None:
+            for state in self.state.values():
+                if state and "step" not in state:
+                    state["step"] = torch.tensor(float(legacy_k))
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -177,18 +185,10 @@ class ScheduleFreeAdamW(torch.optim.Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
-        self._k += 1
-        k = self._k
-
-        warmup = min(1.0, k / max(self.warmup_steps, 1)) if self.warmup_steps > 0 else 1.0
-
         for group in self.param_groups:
-            lr = group["lr"] * warmup
             beta1, beta2 = group["betas"]
             eps = group["eps"]
             wd = group["weight_decay"]
-
-            weight = lr * (1 - beta1)
 
             for p in group["params"]:
                 if p.grad is None:
@@ -198,9 +198,16 @@ class ScheduleFreeAdamW(torch.optim.Optimizer):
                 state = self.state[p]
 
                 if len(state) == 0:
+                    state["step"] = torch.tensor(0.0)
                     state["z"] = p.data.clone()
                     state["v"] = torch.zeros_like(p.data)
                     state["weight_sum"] = 0.0
+
+                state["step"] += 1
+                k = state["step"].item()
+                warmup = min(1.0, k / self.warmup_steps) if self.warmup_steps > 0 else 1.0
+                lr = group["lr"] * warmup
+                weight = lr * (1 - beta1)
 
                 z = state["z"]
                 v = state["v"]

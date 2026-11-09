@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -312,7 +313,7 @@ class TestScheduleFreeAdamW:
             assert torch.isfinite(p).all()
 
     def test_state_dict_roundtrip(self):
-        """state_dict should preserve z, v, x, step counter, and warmup_steps."""
+        """state_dict holds z, v, x and each parameter's step, and only state and groups."""
         torch.manual_seed(42)
         model = _make_model()
         config = OptimizerConfig(
@@ -327,19 +328,12 @@ class TestScheduleFreeAdamW:
             optimizer.step()
 
         sd = optimizer.state_dict()
-        assert "_k" in sd
-        assert sd["_k"] == 5
-        assert "_warmup_steps" in sd
-        assert sd["_warmup_steps"] == 100
+        assert set(sd) == {"state", "param_groups"}
+        assert {state["step"].item() for state in sd["state"].values()} == {5.0}
 
         model2 = _make_model()
-        config2 = OptimizerConfig(
-            name="schedule_free_adamw", lr=0.01, schedule_free_warmup_steps=100
-        )
-        optimizer2 = build_optimizer(model2, config2)
+        optimizer2 = build_optimizer(model2, config)
         optimizer2.load_state_dict(sd)
-
-        assert optimizer2._k == 5
         assert optimizer2.warmup_steps == 100
 
         for p1, p2 in zip(
@@ -347,9 +341,52 @@ class TestScheduleFreeAdamW:
             [p for g in optimizer2.param_groups for p in g["params"]],
             strict=True,
         ):
-            if p1 in optimizer.state and "z" in optimizer.state[p1]:
-                for key in ("z", "v"):
-                    torch.testing.assert_close(optimizer.state[p1][key], optimizer2.state[p2][key])
+            for key in ("step", "z", "v", "x"):
+                torch.testing.assert_close(optimizer.state[p1][key], optimizer2.state[p2][key])
+
+    def test_a_state_saved_with_one_step_count_loads(self):
+        """A state from before each parameter kept its step resumes every parameter from ``_k``."""
+        torch.manual_seed(0)
+        model = nn.Linear(8, 8)
+        optimizer = ScheduleFreeAdamW(model.parameters(), lr=0.01)
+        for _ in range(3):
+            model(torch.randn(2, 8)).sum().backward()
+            optimizer.step()
+            optimizer.zero_grad()
+        sd = optimizer.state_dict()
+        for state in sd["state"].values():
+            del state["step"]
+        sd["_k"], sd["_warmup_steps"] = 3, 7
+
+        optimizer2 = ScheduleFreeAdamW(nn.Linear(8, 8).parameters(), lr=0.01)
+        optimizer2.load_state_dict(sd)
+        assert {state["step"].item() for state in optimizer2.state.values()} == {3.0}
+        assert optimizer2.warmup_steps == 7
+
+    @pytest.mark.parametrize("warmup_steps", [0, 10])
+    @pytest.mark.parametrize("betas", [(0.9, 0.95), (0.9, 0.999)])
+    def test_a_late_parameter_takes_a_fresh_first_update(self, betas, warmup_steps):
+        """A parameter whose first gradient comes after 100 steps moves as it would on step 1."""
+
+        def first_update(frozen_steps):
+            torch.manual_seed(0)
+            model = nn.ModuleDict(
+                {"a": nn.Linear(16, 16, bias=False), "b": nn.Linear(16, 16, bias=False)}
+            )
+            optimizer = ScheduleFreeAdamW(
+                model.parameters(), lr=1e-3, betas=betas, warmup_steps=warmup_steps
+            )
+            g = torch.Generator().manual_seed(1)
+            ga, gb = torch.randn(16, 16, generator=g), torch.randn(16, 16, generator=g)
+            for _ in range(frozen_steps):
+                model["a"].weight.grad = ga.clone()
+                optimizer.step()
+            before = model["b"].weight.detach().clone()
+            model["a"].weight.grad, model["b"].weight.grad = ga.clone(), gb.clone()
+            optimizer.step()
+            return model["b"].weight.detach() - before
+
+        assert torch.equal(first_update(100), first_update(0))
 
     def test_weight_decay(self):
         torch.manual_seed(42)
