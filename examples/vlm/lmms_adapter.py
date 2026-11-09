@@ -537,12 +537,13 @@ class KempnerForgeVLM(lmms):
 
         self._is_video = self._config.is_video
         self._frames_per_clip = self._config.views_per_sample
-        self._tile_grid = self._config.vlm.tile_grid
-        self._tile_global = self._config.vlm.tile_global
+        self._tile_grid, self._tile_global = 0, True
         if self._config.video is not None:
             self._frame_size = self._config.video.frame_size
         else:
             self._frame_size = self._config.data.hf_image_size
+            self._tile_grid = self._config.vlm.tile_grid
+            self._tile_global = self._config.vlm.tile_global
 
         self._model = _load_weights(self._config, checkpoint, self._device, self._dtype)
         self._tokenizer = build_tokenizer(self._config.data.tokenizer_path)

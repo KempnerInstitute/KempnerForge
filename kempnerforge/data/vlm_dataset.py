@@ -103,7 +103,6 @@ def tile_image(
     if tile_grid < 2:
         raise ValueError(f"tile_grid must be >= 2 (an n × n grid of crops), got {tile_grid}")
     _require_pil(img)
-    img = img.convert("RGB")
     views = []
     if tile_global:
         views.append(pil_to_tensor(img, image_size, mean, std).unsqueeze(0))
