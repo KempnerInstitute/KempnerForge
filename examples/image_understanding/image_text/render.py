@@ -17,10 +17,10 @@ from kempnerforge.data.vlm_dataset import (
 )
 
 from .document import Document
-from .skip import MAX_ATTEMPTS, SkipLog, check_max_attempts, first_usable
+from .skip import MAX_ATTEMPTS, SkipLog, UnusableRowError, check_max_attempts, first_usable
 
 
-class UnrenderableDocumentError(ValueError):
+class UnrenderableDocumentError(UnusableRowError, ValueError):
     """A document the renderer refuses: it would train nothing, or its replies cannot be located."""
 
 
@@ -226,11 +226,4 @@ class RenderedDataset(Dataset):
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
         if not 0 <= index < len(self):
             raise IndexError(f"index {index} is out of range for {len(self)} documents")
-        return first_usable(
-            index,
-            len(self),
-            self.max_attempts,
-            self._render,
-            self._skips,
-            UnrenderableDocumentError,
-        )
+        return first_usable(index, len(self), self.max_attempts, self._render, self._skips)
