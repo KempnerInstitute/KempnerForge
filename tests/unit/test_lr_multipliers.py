@@ -813,6 +813,7 @@ class TestResume:
         assert calls == [
             ("all_reduce", "GLOO_GROUP", [[0, 0], [1, 0]]),
             ("broadcast", 0, [(record, None)]),
+            ("broadcast", 0, [True]),
         ]
 
     def test_other_ranks_refuse_what_rank_zero_sent(self, tmp_path, monkeypatch):
@@ -848,7 +849,7 @@ class TestResume:
         self._save(tmp_path, {"head": 2.0})
         model, scheduler, manager = self._resume(tmp_path, {"head": 2.0})
         record = ({"head": 2.0}, {"head": ["output_head.*"]})
-        calls = self._as_rank(monkeypatch, manager, 1, sent=[(record, None)])
+        calls = self._as_rank(monkeypatch, manager, 1, sent=[(record, None), True])
 
         def all_reduce(flags, group=None):
             calls.append(("all_reduce", group, flags.tolist()))
