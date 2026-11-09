@@ -911,6 +911,9 @@ class CheckpointManager:
             FileNotFoundError: No checkpoint resolves although one was named, or the
                 checkpoint holds optimizer state that this load restores but has no
                 ``train_state.pt``. Raised before any state is loaded.
+            ValueError: ``exclude_keys`` is not a list of distinct DCP keys, or names
+                ``"train_state"`` outside ``["optimizer", "train_state"]``. Raised
+                before the path is resolved.
         """
         if exclude_keys is not None:
             validate_exclude_keys(exclude_keys, "exclude_keys")
