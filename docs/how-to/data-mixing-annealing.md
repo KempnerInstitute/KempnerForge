@@ -78,12 +78,16 @@ per-dataset metrics.
 ### Per-dataset metrics
 
 When the mixture is active and the metrics interval fires,
-The training loop emits two series per dataset name:
+the training loop emits two series per dataset name, each over every
+data-parallel rank and every micro-step of the logged step:
 
-- `loss/{name}` — mean loss of samples from that dataset in the
-  accumulation window.
-- `data/{name}/tokens` — running token count consumed from that
-  dataset.
+- `loss/{name}`: cross-entropy of that dataset's labeled tokens,
+  weighted by token (no z-loss or MoE auxiliary terms).
+- `data/{name}/tokens`: positions drawn from that dataset in the
+  logged step. It is a per-step count, not a running total.
+
+A dataset no rank drew from in the logged step has neither series at
+that step.
 
 Plot these in WandB / TensorBoard to see whether a dataset is
 contributing normally or drifting. A rising `loss/code` while
@@ -207,15 +211,15 @@ uv run python scripts/train.py configs/train/your_mix.toml \
     --train.max_steps=100 --metrics.log_interval=1
 ```
 
-Inspect the `data/{name}/tokens` counters after 100 steps. The ratios
-should roughly match your target probabilities.
+Sum each `data/{name}/tokens` series over the 100 logged steps. The
+shares should roughly match your target probabilities:
 
 ```
-data/web/tokens        ≈ (web_prob)  × total_tokens
-data/code/tokens       ≈ (code_prob) × total_tokens
+sum(data/web/tokens)   ≈ (web_prob)  × sum over names of sum(data/{name}/tokens)
+sum(data/code/tokens)  ≈ (code_prob) × sum over names of sum(data/{name}/tokens)
 ```
 
-If the numbers are off by much more than one batch's worth of tokens,
+If the shares are off by much more than one batch's worth of tokens,
 double-check:
 
 - `name` values in `[[data.datasets]]` vs any `phase.dataset_weights`
@@ -228,7 +232,7 @@ double-check:
 
 For a phase transition specifically, watch the log for the
 `"Phase transition at step N: phase=K, lr_scale=S"` line — it fires
-exactly once per transition, and the `data/{name}/tokens` slopes
+exactly once per transition, and the `data/{name}/tokens` levels
 should visibly change immediately after.
 
 ## See also

@@ -41,6 +41,9 @@ The stdout backend renders one compact line per call:
 2026-11-04 14:03:12.345 [rank 0] INFO     [step 500] eval/loss=3.8200 | eval/perplexity=45.6000
 ```
 
+Each data-parallel rank evaluates `steps` batches of its own share of
+the eval set, and `eval/loss` is the mean over those ranks.
+
 The eval dataloader is a plain `DataLoader` with a `DistributedSampler`
 (not `StatefulDataLoader`). It's deterministic because it doesn't
 shuffle, and it's allowed to reset on epoch boundary — eval iteration

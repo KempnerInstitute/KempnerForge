@@ -41,6 +41,10 @@ class StepContext:
     optimizer: torch.optim.Optimizer
 ```
 
+`loss` is the step's loss averaged over the data-parallel ranks, the
+same value on every rank, and `lr` is the learning rate the step's
+update used (with the default warmup, `0` at step 1).
+
 `model` and `optimizer` are the live references — you can read
 parameter values and optimizer state. **Gradients have already been
 zeroed by the time `on_step_end` fires.** The loop order is:
