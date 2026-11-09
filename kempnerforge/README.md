@@ -1,14 +1,14 @@
 <p align="center">
-  <img src="docs/assets/logo.png" alt="KempnerForge" width="240"/>
+  <img src="../docs/assets/logo.png" alt="KempnerForge" width="240"/>
 </p>
 
 <p align="center">
   <a href="https://github.com/KempnerInstitute/KempnerForge/actions/workflows/ci.yml"><img src="https://github.com/KempnerInstitute/KempnerForge/actions/workflows/ci.yml/badge.svg" alt="CI"/></a>
   <a href="https://github.com/KempnerInstitute/KempnerForge/actions/workflows/docs.yml"><img src="https://github.com/KempnerInstitute/KempnerForge/actions/workflows/docs.yml/badge.svg" alt="Docs"/></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"/></a>
+  <a href="../LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"/></a>
   <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.12+-blue.svg" alt="Python 3.12+"/></a>
   <a href="https://pytorch.org/"><img src="https://img.shields.io/badge/pytorch-2.4+-ee4c2c.svg" alt="PyTorch 2.4+"/></a>
-  <a href="docs/claude-ready.md"><img src="https://img.shields.io/badge/agent--ready-v0.1-4c8eda.svg" alt="Agent-ready v0.1"/></a>
+  <a href="../docs/claude-ready.md"><img src="https://img.shields.io/badge/agent--ready-v0.1-4c8eda.svg" alt="Agent-ready v0.1"/></a>
 </p>
 
 PyTorch-native framework for fault-tolerant distributed training of foundation models on AI clusters.
@@ -98,7 +98,7 @@ flowchart TB
     end
 ```
 
-Parallelism application order is enforced. Wrong order causes silent correctness bugs. See [`docs/architecture/parallelism-order.md`](docs/architecture/parallelism-order.md) for the rationale.
+Parallelism application order is enforced. Wrong order causes silent correctness bugs. See [`docs/architecture/parallelism-order.md`](../docs/architecture/parallelism-order.md) for the rationale.
 
 ## Measured performance
 
@@ -113,7 +113,7 @@ Llama-3 architecture on NVIDIA H200 (141 GB), bf16 + full activation checkpointi
 | 32 | 8 | 13B | TP=4 + FSDP=8 | 32.7% | 104,309 |
 | 32 | 8 | 70B | TP=4 + FSDP=8 | 25.4% | 17,657 |
 
-Full 14-configuration sweep: [`benchmarks/mfu_scaling/`](benchmarks/mfu_scaling/). MoE expert parallelism results: [`benchmarks/moe_expert_parallel/`](benchmarks/moe_expert_parallel/).
+Full 14-configuration sweep: [`benchmarks/mfu_scaling/`](../benchmarks/mfu_scaling/). MoE expert parallelism results: [`benchmarks/moe_expert_parallel/`](../benchmarks/moe_expert_parallel/).
 
 ## Quick start
 
@@ -134,8 +134,8 @@ sbatch scripts/slurm/singlenode.sh configs/train/7b.toml
 ```
 
 Further reading:
-- [`docs/getting-started/quickstart.md`](docs/getting-started/quickstart.md): 5-minute walkthrough (install → debug → multi-GPU → custom data → optimizer swap → MoE → hooks)
-- [`docs/how-to/end-to-end-training-run.md`](docs/how-to/end-to-end-training-run.md): tokenize → config → 1 GPU → 4 GPUs → resume → generate
+- [`docs/getting-started/quickstart.md`](../docs/getting-started/quickstart.md): 5-minute walkthrough (install → debug → multi-GPU → custom data → optimizer swap → MoE → hooks)
+- [`docs/how-to/end-to-end-training-run.md`](../docs/how-to/end-to-end-training-run.md): tokenize → config → 1 GPU → 4 GPUs → resume → generate
 
 ## Agent-ready
 
@@ -153,18 +153,18 @@ First-run flow, from a fresh clone (use the absolute path to your checkout; rela
 
 The `marketplace list` step is a sanity check: `kempnerforge` should appear under "Configured marketplaces". If it doesn't, the add silently failed; re-check the absolute path.
 
-v0.1 ships these skills: `install-and-verify`, `cluster-config`, `smoke-test`, `slurm-launch`, `explain-architecture`, `add-optimizer`, `component-gaps`. Full catalog, install details, and how skills stay in sync with the code: [`docs/claude-ready.md`](docs/claude-ready.md).
+v0.1 ships these skills: `install-and-verify`, `cluster-config`, `smoke-test`, `slurm-launch`, `explain-architecture`, `add-optimizer`, `component-gaps`. Full catalog, install details, and how skills stay in sync with the code: [`docs/claude-ready.md`](../docs/claude-ready.md).
 
 ## Documentation
 
-The [documentation site](docs/index.md) is the canonical reference. Key entry points:
+The [documentation site](../docs/index.md) is the canonical reference. Key entry points:
 
-- [Getting started](docs/getting-started/index.md): install, quickstart, first run
-- [Architecture](docs/architecture/index.md): model forward pass, parallelism order, data flow
-- [How-to guides](docs/how-to/index.md): end-to-end workflows, scaling, debugging, FP8, MoE experiments, interpretability
-- [Configuration](docs/configuration/index.md): config sections, CLI overrides, validation rules, registry
-- **Subsystems**: [training](docs/training/index.md) · [distributed](docs/distributed/index.md) · [MoE](docs/moe/index.md) · [data](docs/data/index.md) · [checkpointing](docs/checkpointing/index.md) · [metrics & profiling](docs/metrics-and-profiling/index.md) · [resilience](docs/resilience/index.md)
-- [Reference](docs/reference/index.md): available configs, parallelism recipes, benchmarks, environment variables
+- [Getting started](../docs/getting-started/index.md): install, quickstart, first run
+- [Architecture](../docs/architecture/index.md): model forward pass, parallelism order, data flow
+- [How-to guides](../docs/how-to/index.md): end-to-end workflows, scaling, debugging, FP8, MoE experiments, interpretability
+- [Configuration](../docs/configuration/index.md): config sections, CLI overrides, validation rules, registry
+- **Subsystems**: [training](../docs/training/index.md) · [distributed](../docs/distributed/index.md) · [MoE](../docs/moe/index.md) · [data](../docs/data/index.md) · [checkpointing](../docs/checkpointing/index.md) · [metrics & profiling](../docs/metrics-and-profiling/index.md) · [resilience](../docs/resilience/index.md)
+- [Reference](../docs/reference/index.md): available configs, parallelism recipes, benchmarks, environment variables
 
 ## MoE engineering roadmap
 
@@ -212,8 +212,8 @@ tests/         # unit, integration, distributed, and end-to-end tests
 
 ## Contributing
 
-See [`docs/contributing.md`](docs/contributing.md) for the editor loop, build commands, and style conventions.
+See [`docs/contributing.md`](../docs/contributing.md) for the editor loop, build commands, and style conventions.
 
 ## License
 
-MIT. See [`LICENSE`](LICENSE).
+MIT. See [`LICENSE`](../LICENSE).
