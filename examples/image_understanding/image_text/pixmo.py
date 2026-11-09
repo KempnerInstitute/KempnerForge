@@ -15,16 +15,12 @@ from typing import Any
 import pyarrow as pa
 from torch.utils.data import Dataset
 
-from kempnerforge.metrics.logger import get_logger
-
-from .decode import Decoded, UnreadableImageError, decode_upright, first_readable
+from .decode import Decoded, UnreadableImageError, decode_upright
 from .document import Document, Turn
 from .points import check_max_points, format_point_answer
-
-logger = get_logger(__name__)
+from .skip import MAX_ATTEMPTS, SkipLog, check_max_attempts, first_usable
 
 MAX_POINTS = 30
-MAX_ATTEMPTS = 16
 POINT_PLACEHOLDER = "<|POINT|>"
 
 
@@ -64,12 +60,14 @@ class PixmoRows(Dataset):
     ) -> None:
         if "image" not in columns:
             raise ValueError("PixMo rows need an 'image' column")
-        if max_attempts < 1:
-            raise ValueError(f"max_attempts must be positive, got {max_attempts}")
         self.image_root = Path(image_root)
-        self.max_attempts = max_attempts
-        self.skipped = 0
+        self.max_attempts = check_max_attempts(max_attempts)
+        self._skips = SkipLog()
         self._rows = pa.table(columns)
+
+    @property
+    def skipped(self) -> int:
+        return self._skips.count
 
     def __len__(self) -> int:
         return self._rows.num_rows
@@ -81,11 +79,6 @@ class PixmoRows(Dataset):
     def _read(self, index: int) -> Document:
         row = self._rows.slice(index, 1).to_pylist()[0]
         return self.document(row, decode_upright(self.image_root / row["image"]))
-
-    def _skip(self, index: int, error: UnreadableImageError) -> None:
-        if not self.skipped:
-            logger.warning(f"skipping row {index}: {error}; later skips are counted, not logged")
-        self.skipped += 1
 
     def _image(self, index: int) -> str:
         return self._rows["image"][index].as_py()
@@ -101,8 +94,14 @@ class PixmoRows(Dataset):
     def __getitem__(self, index: int) -> Document:
         if not 0 <= index < len(self):
             raise IndexError(f"index {index} is out of range for {len(self)} rows")
-        return first_readable(
-            index, len(self), self.max_attempts, self._read, self._skip, self._next_image
+        return first_usable(
+            index,
+            len(self),
+            self.max_attempts,
+            self._read,
+            self._skips,
+            UnreadableImageError,
+            self._next_image,
         )
 
 
