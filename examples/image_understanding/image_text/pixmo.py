@@ -8,24 +8,24 @@ next image.
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 import pyarrow as pa
 from torch.utils.data import Dataset
 
-from .decode import Decoded, decode_upright
+from .decode import Decoded, UnreadableImageError, decode_upright
 from .document import Document, Turn
 from .points import check_max_points, format_point_answer
-from .skip import MAX_ATTEMPTS, SkipLog, check_max_attempts, first_usable
+from .skip import MAX_ATTEMPTS, SkipLog, UnusableRowError, check_max_attempts, first_usable
 
 MAX_POINTS = 30
 POINT_PLACEHOLDER = "<|POINT|>"
 
 
 def _jsonl(path: str | Path) -> Iterator[dict[str, Any]]:
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         for line in f:
             if line.strip():
                 yield json.loads(line)
@@ -44,12 +44,12 @@ def _parallel(row: dict[str, Any], *keys: str) -> Iterator[tuple[Any, ...]]:
 
 
 class PixmoRows(Dataset):
-    """Annotation rows over the PixMo image pool, skipping rows whose image does not decode.
+    """Annotation rows over the PixMo image pool, skipping rows that cannot be used.
 
-    A read tries ``index`` and then the rows after it, ``max_attempts`` images in
-    all: the rows that follow a failed one with the same image are passed over
-    without counting as attempts, and a read whose rows all share the failed
-    image gives up at once.
+    A read tries ``index`` and then the rows after it, ``max_attempts`` rows in
+    all. When an image does not decode, the rows that follow with the same image
+    are passed over without counting as attempts, and a read whose rows all share
+    the failed image gives up at once.
     """
 
     def __init__(
@@ -83,8 +83,10 @@ class PixmoRows(Dataset):
     def _image(self, index: int) -> str:
         return self._rows["image"][index].as_py()
 
-    def _next_image(self, index: int) -> int:
-        """The first row after ``index`` whose image differs from its own."""
+    def _next_image(self, index: int, error: UnusableRowError) -> int:
+        """The row after ``index``; when its image does not decode, past the rows sharing it."""
+        if not isinstance(error, UnreadableImageError):
+            return index + 1
         image = self._image(index)
         for step in range(1, len(self)):
             if self._image((index + step) % len(self)) != image:
@@ -160,7 +162,8 @@ class PixmoCounting(PixmoRows):
     """Counting questions answered by pointing, then counting.
 
     ``pixels`` says the points are stored in pixels of the file's pixel grid; they
-    are converted to percent of the upright image. A row without a count states
+    are converted to percent of the upright image, and a row with a point outside
+    that grid is passed over. A row without a count states
     the number of its points. Every point is kept unless
     ``max_points`` caps them, so the points agree with the stated count; a cap
     keeps the first points and still states the full count. The answer lists the
@@ -187,6 +190,11 @@ class PixmoCounting(PixmoRows):
         points = list(zip(row["xs"], row["ys"], strict=True))
         count = row["count"] if row["count"] is not None else len(points)
         if self.pixels:
+            width, height = decoded.stored_size
+            if not all(0 <= x <= width and 0 <= y <= height for x, y in points):
+                raise UnusableRowError(
+                    f"{row['image']}: a point lies outside its {width}x{height} pixel grid"
+                )
             points = decoded.percent(points)
         if points:
             tag = format_point_answer(points, label, absent_text="", max_points=self.max_points)
@@ -203,11 +211,12 @@ def pixmo_captions(
     prompt: str,
     max_attempts: int = MAX_ATTEMPTS,
 ) -> PixmoCaptions:
-    """PixMo-Cap dense captions."""
+    """PixMo-Cap dense captions; a row without a caption is dropped."""
     images, captions = [], []
     for row in _jsonl(annotation_file):
-        images.append(row["image"])
-        captions.append(row["caption"])
+        if _is_text(row.get("caption")):
+            images.append(row["image"])
+            captions.append(row["caption"])
     return PixmoCaptions(image_root, {"image": images, "caption": captions}, prompt, max_attempts)
 
 
@@ -231,7 +240,10 @@ def _conversations(
 def pixmo_cap_qa(
     annotation_file: str | Path, image_root: str | Path, max_attempts: int = MAX_ATTEMPTS
 ) -> PixmoConversations:
-    """PixMo-CapQA, whose ``messages[i]`` ends with turn ``i``'s question and answer."""
+    """PixMo-CapQA, whose ``messages[i]`` alternates questions and answers, ending with turn ``i``.
+
+    An element that is not a list of pairs is dropped.
+    """
     return _conversations(
         image_root,
         (
@@ -240,7 +252,7 @@ def pixmo_cap_qa(
                 [
                     (element[-2], element[-1])
                     for element in row.get("messages") or []
-                    if isinstance(element, list) and len(element) >= 2
+                    if isinstance(element, list) and len(element) >= 2 and len(element) % 2 == 0
                 ],
             )
             for row in _jsonl(annotation_file)
@@ -253,26 +265,39 @@ def _in_percent(points: list[tuple[float, float]]) -> bool:
     return all(0.0 <= x <= 100.0 and 0.0 <= y <= 100.0 for x, y in points)
 
 
-def explanation_answer(
-    parsed: str,
-    points: Sequence[Sequence[Sequence[float]]],
-    inline_text: Sequence[str],
-    alt_text: Sequence[str],
-) -> str | None:
+def _pairs(group: Any) -> list[tuple[float, float]] | None:
+    """``group`` as ``(x, y)`` floats, or ``None`` when it is not a list of pairs."""
+    if not isinstance(group, list) or not all(
+        isinstance(point, list) and len(point) == 2 for point in group
+    ):
+        return None
+    try:
+        return [(float(x), float(y)) for x, y in group]
+    except (TypeError, ValueError):
+        return None
+
+
+def explanation_answer(parsed: Any, points: Any, inline_text: Any, alt_text: Any) -> str | None:
     """The reply with each placeholder of ``parsed`` rendered as a point tag.
 
     The placeholders pair with ``points`` (a list of ``(x, y)`` per placeholder),
     ``inline_text`` (the tag's text) and ``alt_text`` (its ``alt``), the way
-    Molmo rebuilds these answers. A reply whose counts disagree or whose points
-    leave the image is ``None``.
+    Molmo rebuilds these answers. A reply whose fields are missing or malformed,
+    whose counts disagree or whose points leave the image is ``None``.
     """
+    if not isinstance(parsed, str) or not all(
+        isinstance(value, list) for value in (points, inline_text, alt_text)
+    ):
+        return None
     parts = parsed.split(POINT_PLACEHOLDER)
     if not len(parts) - 1 == len(points) == len(inline_text) == len(alt_text):
         return None
     tags = []
     for group, text, alt in zip(points, inline_text, alt_text, strict=True):
-        group_points = [(float(x), float(y)) for x, y in group]
+        group_points = _pairs(group)
         if not group_points or not _in_percent(group_points):
+            return None
+        if not isinstance(text, str) or not isinstance(alt, str):
             return None
         tags.append(format_point_answer(group_points, text, absent_text="", alt=alt))
     return "".join(part + tag for part, tag in zip(parts, tags + [""], strict=True))
