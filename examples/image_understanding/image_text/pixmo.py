@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 from collections.abc import Iterator, Sequence
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 import pyarrow as pa
 from PIL import Image
@@ -153,8 +153,8 @@ class PixmoPointing(PixmoRows):
 class PixmoCounting(PixmoRows):
     """Counting questions answered by pointing, then counting.
 
-    ``coordinates`` names the unit the points are stored in; pixel points are
-    converted to percent of the decoded image's size. Every point is kept unless
+    ``pixels`` says the points are stored in pixels and converts them to percent
+    of the decoded image's size. Every point is kept unless
     ``max_points`` caps them, so the points agree with the stated count; a cap
     keeps the first points and still states the full count. The answer lists the
     points before the count, so when it outruns the renderer's text budget (at
@@ -166,21 +166,20 @@ class PixmoCounting(PixmoRows):
         self,
         image_root: str | Path,
         columns: dict[str, list[Any]],
-        coordinates: Literal["percent", "pixels"],
+        *,
+        pixels: bool,
         max_points: int | None = None,
         max_attempts: int = MAX_ATTEMPTS,
     ) -> None:
-        if coordinates not in ("percent", "pixels"):
-            raise ValueError(f"coordinates must be 'percent' or 'pixels', got {coordinates!r}")
         super().__init__(image_root, columns, max_attempts)
-        self.coordinates = coordinates
+        self.pixels = pixels
         self.max_points = check_max_points(max_points)
 
     def document(self, row: dict[str, Any], image: Image.Image) -> Document:
         label = row["label"]
         count = row["count"] or 0
         points = list(zip(row["xs"], row["ys"], strict=True))
-        if self.coordinates == "pixels":
+        if self.pixels:
             points = pixels_to_percent(points, *image.size)
         if points:
             tag = format_point_answer(points, label, absent_text="", max_points=self.max_points)
@@ -334,7 +333,6 @@ def pixmo_counting(
     ``points`` are an ``{"x": [...], "y": [...]}`` mapping in pixels (PixMo-Count),
     converted to percent of the decoded image.
     """
-    coordinates: Literal["percent", "pixels"] = "percent" if multi_label else "pixels"
     columns: dict[str, list[Any]] = {"image": [], "label": [], "count": [], "xs": [], "ys": []}
     for row in _jsonl(annotation_file):
         if multi_label:
@@ -360,4 +358,6 @@ def pixmo_counting(
             columns["count"].append(count)
             columns["xs"].append(xs)
             columns["ys"].append(ys)
-    return PixmoCounting(image_root, columns, coordinates, max_points, max_attempts)
+    return PixmoCounting(
+        image_root, columns, pixels=not multi_label, max_points=max_points, max_attempts=max_attempts
+    )
