@@ -196,6 +196,53 @@ class TestShutdownHandler:
         handler.reinstall()
         assert signal.getsignal(signal.SIGUSR1) is before
 
+    def test_reinstall_does_nothing_off_the_main_thread(self):
+        """A training loop run on another thread must not raise at its first step."""
+        handler = ShutdownHandler(timeout_sec=0)
+        handler.register()
+        errors: list[BaseException] = []
+
+        def reinstall() -> None:
+            try:
+                handler.reinstall()
+            except BaseException as e:
+                errors.append(e)
+
+        try:
+            thread = threading.Thread(target=reinstall)
+            thread.start()
+            thread.join()
+            assert errors == []
+            assert signal.getsignal(signal.SIGUSR1) == handler._handle_signal
+        finally:
+            handler.unregister()
+
+    def test_request_arms_the_forced_exit_timer_without_a_signal(self):
+        """A rank stopped by another rank's signal is bounded by a timer of its own."""
+        handler = ShutdownHandler(timeout_sec=300)
+        try:
+            handler.request()
+            timer = handler._timer
+            handler.request()
+            assert handler.should_shutdown()
+            assert handler.signal_received is None
+            assert timer is not None
+            assert handler._timer is timer
+        finally:
+            handler.cancel_watchdog()
+
+    def test_finish_logs_completion_only_after_a_shutdown(self, caplog, monkeypatch):
+        import logging
+
+        monkeypatch.setattr(logging.getLogger("kempnerforge"), "propagate", True)
+        with caplog.at_level(logging.INFO, logger="kempnerforge"):
+            ShutdownHandler(timeout_sec=0).finish()
+            stopped = ShutdownHandler(timeout_sec=0)
+            stopped.request()
+            stopped.finish()
+        done = [r for r in caplog.records if r.getMessage() == "Graceful shutdown complete"]
+        assert len(done) == 1
+
 
 class TestNaNDetector:
     def test_finite_loss_returns_true(self):

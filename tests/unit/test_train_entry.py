@@ -101,10 +101,14 @@ class FakeShutdownHandler:
         self.checks = 0
         self.reinstalls = 0
         self.registered = False
+        self.requested = False
         self.finished = False
 
     def register(self) -> None:
         self.registered = True
+
+    def request(self) -> None:
+        self.requested = True
 
     def reinstall(self) -> None:
         self.reinstalls += 1

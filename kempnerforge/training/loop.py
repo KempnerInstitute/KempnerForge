@@ -514,9 +514,11 @@ def _shutdown_if_requested(
     LLVM does on its first in-process compile, after which SIGUSR1 does
     nothing). The ranks then agree over ``session.control_group`` whether any
     of them was signaled, so they all stop or all go on, whichever ranks the
-    signal reached and whenever. The handler is left armed: its forced-exit
-    timer still bounds the flush that ``run_training_loop`` ends with and the
-    caller's teardown, and the caller calls ``finish()`` after both.
+    signal reached and whenever. A rank that learns of the shutdown only from
+    the vote calls ``request()``, so every rank that stops has its forced-exit
+    timer armed. The handler is left armed: the timer still bounds the flush
+    that ``run_training_loop`` ends with and the caller's teardown, and the
+    caller calls ``finish()`` after both.
 
     Returns True when the loop must stop. With ``saved_this_step``, the
     scheduled save of ``step`` is the emergency checkpoint, so it is drained
@@ -532,6 +534,7 @@ def _shutdown_if_requested(
     if not any_rank(requested_here, session.control_group):
         return False
     if not requested_here:
+        session.shutdown_handler.request()
         logger.warning(f"Shutdown requested on another rank at step {step}")
     ckpt_mgr = session.checkpointer
     if saved_this_step:

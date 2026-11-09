@@ -12,6 +12,8 @@ health module's ``torch`` for one that makes it on the CPU, as the
 from __future__ import annotations
 
 import dataclasses
+import os
+import signal
 import socket
 import time
 from datetime import timedelta
@@ -63,6 +65,19 @@ def _check_any_rank(rank: int, port: int, flags: tuple[bool, ...]) -> None:
         dist.destroy_process_group()
 
 
+def _signal_on(signaled_step: int):
+    """A text step body that sends its process SIGUSR1 in step ``signaled_step``."""
+    from kempnerforge.training.loop import text_step
+
+    def step_fn(session, step):
+        result = text_step(session, step)
+        if step == signaled_step:
+            os.kill(os.getpid(), signal.SIGUSR1)
+        return result
+
+    return step_fn
+
+
 def _run_loop(rank: int, port: int, case: str, root: str, out_dir: str) -> None:
     """Run the loop on one rank and write how it ended, then wait for the other rank."""
     _init(rank, port)
@@ -86,6 +101,13 @@ def _run_loop(rank: int, port: int, case: str, root: str, out_dir: str) -> None:
         overrides: dict = {"shutdown_handler": FakeShutdownHandler(2 if signaled else None)}
         if case == "nan" and rank == 0:
             overrides["step_fn"] = _nan_on({1})
+        if case == "timer":
+            from kempnerforge.resilience.signal_handler import ShutdownHandler
+
+            overrides["shutdown_handler"] = ShutdownHandler(timeout_sec=300)
+            overrides["shutdown_handler"].register()
+            if rank == 1:
+                overrides["step_fn"] = _signal_on(1)
         session = make_session(config, **overrides)
         session.runtime = dataclasses.replace(
             session.runtime, rank=rank, local_rank=rank, world_size=WORLD
@@ -101,6 +123,9 @@ def _run_loop(rank: int, port: int, case: str, root: str, out_dir: str) -> None:
         ckpt = session.checkpointer
         saves = ckpt.saved_steps if isinstance(ckpt, FakeCheckpointManager) else None
         outcome = f"step={step} saves={saves} nans={session.nan_detector.state.total_nans}"
+        if case == "timer":
+            outcome += f" armed={session.shutdown_handler._timer is not None}"
+            session.shutdown_handler.finish()
     except BaseException as e:
         outcome = f"{type(e).__name__}: {e}"
     Path(out_dir, f"rank{rank}").write_text(outcome)
@@ -151,6 +176,11 @@ class TestLoopStopsOnEveryRank:
     def test_a_shutdown_seen_on_one_rank_stops_every_rank_at_that_step(self, tmp_path):
         outcomes = _outcomes(tmp_path, "shutdown")
         assert outcomes == {r: "step=2 saves=[2] nans=0" for r in range(WORLD)}
+
+    def test_a_rank_the_vote_stops_arms_its_forced_exit_timer(self, tmp_path):
+        """Only rank 1 gets SIGUSR1; rank 0 stops on the vote and is bounded by its own timer."""
+        outcomes = _outcomes(tmp_path, "timer")
+        assert outcomes == {r: "step=2 saves=[2] nans=0 armed=True" for r in range(WORLD)}
 
     def test_every_rank_writes_the_emergency_checkpoint(self, tmp_path):
         """The real manager: one DCP save over both ranks, committed as ``latest``."""

@@ -85,7 +85,7 @@ class ShutdownHandler:
 
     @property
     def shutdown_requested(self) -> bool:
-        """Whether a shutdown signal has been received."""
+        """Whether a shutdown was requested, by a signal or by ``request()``."""
         return self._shutdown_requested
 
     @property
@@ -100,6 +100,16 @@ class ShutdownHandler:
         """
         return self._shutdown_requested
 
+    def request(self) -> None:
+        """Request a shutdown without a signal, as when another rank received one.
+
+        Sets the flag and starts the forced-exit timer as a signal does, so a
+        rank that stops because another rank was signaled is bounded by its own
+        timer too. Calling it again changes nothing.
+        """
+        self._shutdown_requested = True
+        self._start_timer()
+
     def register(self) -> None:
         """Register signal handlers for SIGTERM and SIGUSR1.
 
@@ -111,13 +121,16 @@ class ShutdownHandler:
         logger.info("Shutdown handler registered (SIGTERM, SIGUSR1)")
 
     def reinstall(self) -> None:
-        """Install the handlers again; a no-op unless registered.
+        """Install the handlers again; a no-op unless registered, or off the main thread.
 
         Native code can replace a handler below Python, where
         ``signal.getsignal`` cannot see it: the LLVM inside Triton does on its
-        first in-process compile, after which SIGUSR1 does nothing. Must be
-        called from the main thread.
+        first in-process compile, after which SIGUSR1 does nothing. Only the
+        main thread can install a handler, so on any other thread, such as a
+        training loop run off the main thread, this does nothing.
         """
+        if threading.current_thread() is not threading.main_thread():
+            return
         for sig in self._original_handlers:
             signal.signal(sig, self._handle_signal)
 
@@ -140,7 +153,8 @@ class ShutdownHandler:
         """
         self.unregister()
         self.cancel_watchdog()
-        logger.info("Graceful shutdown complete")
+        if self._shutdown_requested:
+            logger.info("Graceful shutdown complete")
 
     def _handle_signal(self, signum: int, frame: FrameType | None) -> None:
         """Signal handler — sets the shutdown flag and starts the timeout."""
@@ -148,7 +162,10 @@ class ShutdownHandler:
         self._shutdown_requested = True
         self._signal_received = sig
         logger.warning(f"Received {sig.name} — requesting graceful shutdown")
+        self._start_timer()
 
+    def _start_timer(self) -> None:
+        """Start the forced-exit timer, once, unless the timeout is 0."""
         if self._timeout_sec > 0 and self._timer is None:
             self._timer = threading.Timer(self._timeout_sec, self._force_exit)
             self._timer.daemon = True
