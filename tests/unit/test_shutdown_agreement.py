@@ -1,4 +1,7 @@
-"""Every rank takes the same branch at the training loop's stop decisions (#307).
+"""Every rank takes the same branch where the training loop's ranks could split.
+
+A shutdown or a failed NCCL check seen on one rank stops every rank (#307), and a
+NaN loss on one rank skips the step on every rank (#375).
 
 Two gloo ranks run the real ``run_training_loop`` and only one of them sees the
 event. ``NaNDetector.check_loss`` makes its flag on CUDA, so each rank swaps the
@@ -70,6 +73,7 @@ def _run_loop(rank: int, port: int, case: str, root: str, out_dir: str) -> None:
         from tests.unit.test_train_entry import (
             FakeCheckpointManager,
             FakeShutdownHandler,
+            _nan_on,
             make_config,
             make_session,
         )
@@ -79,9 +83,10 @@ def _run_loop(rank: int, port: int, case: str, root: str, out_dir: str) -> None:
         config.checkpoint.dir = root
         config.checkpoint.interval = 100
         signaled = rank == 1 and case in ("shutdown", "shutdown-dcp")
-        session = make_session(
-            config, shutdown_handler=FakeShutdownHandler(2 if signaled else None)
-        )
+        overrides: dict = {"shutdown_handler": FakeShutdownHandler(2 if signaled else None)}
+        if case == "nan" and rank == 0:
+            overrides["step_fn"] = _nan_on({1})
+        session = make_session(config, **overrides)
         session.runtime = dataclasses.replace(
             session.runtime, rank=rank, local_rank=rank, world_size=WORLD
         )
@@ -158,3 +163,8 @@ class TestLoopStopsOnEveryRank:
     def test_an_unhealthy_rank_stops_every_rank(self, tmp_path):
         outcomes = _outcomes(tmp_path, "health")
         assert outcomes == {r: "step=2 saves=[] nans=0" for r in range(WORLD)}
+
+    def test_a_nan_on_one_rank_skips_the_step_on_every_rank(self, tmp_path):
+        """Rank 0's NaN loss makes both ranks skip step 1, and both still finish (#375)."""
+        outcomes = _outcomes(tmp_path, "nan")
+        assert outcomes == {r: "step=6 saves=[6] nans=1" for r in range(WORLD)}
