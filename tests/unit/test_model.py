@@ -9,7 +9,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn.functional as F
-from torch.nn.attention import SDPBackend
 from torch.nn.attention.flex_attention import create_block_mask
 
 from kempnerforge.config.schema import ModelConfig
@@ -175,32 +174,14 @@ class TestAttention:
     def test_sdpa_backend_defaults_to_auto(self):
         attn = Attention(dim=128, n_heads=4, n_kv_heads=4)
         assert attn.sdpa_backend == "auto"
-        assert attn._sdpa_backends() == attn._sdpa_backends(appended=True) == []
 
     def test_sdpa_backend_stored_on_module(self):
         attn = Attention(dim=128, n_heads=4, n_kv_heads=4, sdpa_backend="math")
         assert attn.sdpa_backend == "math"
 
-    @pytest.mark.parametrize("backend", ["flash", "cudnn"])
-    def test_appended_tokens_fall_back_from_maskless_kernels(self, backend):
-        attn = Attention(dim=128, n_heads=4, n_kv_heads=4, sdpa_backend=backend)
-        pinned = attn._sdpa_backends()
-        assert len(pinned) == 1
-        appended = attn._sdpa_backends(appended=True)
-        assert appended[0] == pinned[0]
-        assert SDPBackend.EFFICIENT_ATTENTION in appended
-        assert SDPBackend.MATH in appended
-        with attn._sdpa_context(appended=True), attn._sdpa_context():
-            pass
-
-    @pytest.mark.parametrize("backend", ["efficient", "math"])
-    def test_mask_capable_kernels_stay_pinned_for_appended_tokens(self, backend):
-        attn = Attention(dim=128, n_heads=4, n_kv_heads=4, sdpa_backend=backend)
-        assert attn._sdpa_backends(appended=True) == attn._sdpa_backends()
-        assert len(attn._sdpa_backends()) == 1
-
     @pytest.mark.parametrize("capture", [False, True])
-    def test_a_visibility_mask_is_refused_with_a_non_empty_cache(self, capture):
+    @pytest.mark.parametrize("past", [0, 4])
+    def test_a_visibility_mask_is_refused_before_writing_the_cache(self, capture, past):
         attn = Attention(dim=64, n_heads=4, n_kv_heads=2)
         attn.capture_attention_weights = capture
         cos, sin = precompute_rope_frequencies(16, 16)
@@ -213,20 +194,25 @@ class TestAttention:
             device=torch.device("cpu"),
         )
         with torch.no_grad():
-            attn(torch.randn(1, 4, 64), cos[:4], sin[:4], kv_cache=cache)
+            if past:
+                attn(torch.randn(1, past, 64), cos[:past], sin[:past], kv_cache=cache)
             x = torch.randn(1, 3, 64)
             square = torch.ones(1, 1, 3, 3, dtype=torch.bool)
             whole = torch.ones(7, 7, dtype=torch.bool)
             for wrong in (square, whole):
-                with pytest.raises(ValueError, match="does not compose with a non-empty kv_cache"):
-                    attn(x, cos[4:7], sin[4:7], kv_cache=cache, attn_mask=wrong)
-                assert cache.seq_len == 4
-            if capture:
-                return
+                with pytest.raises(ValueError, match="cannot be combined with kv_cache"):
+                    attn(
+                        x,
+                        cos[past : past + 3],
+                        sin[past : past + 3],
+                        kv_cache=cache,
+                        attn_mask=wrong,
+                    )
+                assert cache.seq_len == past
             block = create_block_mask(lambda b, h, q, kv: q >= kv, 1, 1, 3, 3, device="cpu")
-            with pytest.raises(ValueError, match="BlockMask does not compose with kv_cache"):
-                attn(x, cos[4:7], sin[4:7], kv_cache=cache, attn_mask=block)
-            assert cache.seq_len == 4
+            with pytest.raises(ValueError, match="cannot be combined with kv_cache"):
+                attn(x, cos[past : past + 3], sin[past : past + 3], kv_cache=cache, attn_mask=block)
+            assert cache.seq_len == past
 
     @pytest.mark.parametrize("capture", [False, True])
     def test_a_layer_on_its_own_appends_tokens_under_a_pinned_kernel(self, capture):

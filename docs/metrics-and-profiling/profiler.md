@@ -52,7 +52,7 @@ periodic snapshots, either run multiple configs or instantiate
 profile(
     activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
     schedule=...,
-    on_trace_ready=tensorboard_trace_handler(str(trace_dir)),
+    on_trace_ready=tensorboard_trace_handler(str(trace_dir), worker_name=f"rank{rank:05d}"),
     record_shapes=True,
     profile_memory=True,
     with_stack=False,
@@ -96,20 +96,24 @@ Three conditionals because profiling is entirely optional — `build_profiler`
 returns `None` when `enable=False`, and the rest of the loop no-ops.
 
 **All ranks profile**, but only rank 0 prints the summary. Each rank
-writes its own trace file to `trace_dir`, which is fine — trace
-filenames include host + PID so they don't collide.
+writes its own trace file to `trace_dir`, named after its global rank,
+so the files sort by rank and don't collide.
 
 ## Trace output
 
 `tensorboard_trace_handler` writes one `.pt.trace.json` per rank per
-scheduled trace to `trace_dir/`:
+scheduled trace to `trace_dir/`. Each name is the rank, zero padded to
+five digits, then the export time in nanoseconds:
 
 ```
 profiler_traces/
-├── node01_12345.1714838500.pt.trace.json
-├── node01_12346.1714838501.pt.trace.json
+├── rank00000.1793840829866155268.pt.trace.json
+├── rank00001.1793840829871022514.pt.trace.json
 └── ...
 ```
+
+To open one rank's trace, pick it by number: rank 3 writes
+`rank00003.*.pt.trace.json`.
 
 View with:
 

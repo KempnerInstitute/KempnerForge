@@ -14,6 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
+from torch.nn.attention.bias import causal_lower_right
 from torch.nn.attention.flex_attention import BlockMask
 
 from kempnerforge.model.masking import flex_attention_fn
@@ -26,7 +27,6 @@ _SDPA_BACKENDS = {
     "cudnn": SDPBackend.CUDNN_ATTENTION,
     "math": SDPBackend.MATH,
 }
-_MASK_FALLBACK_BACKENDS = frozenset({"flash", "cudnn"})
 
 
 class KVCache:
@@ -73,11 +73,6 @@ class KVCache:
         return self.k[:, :, :end], self.v[:, :, :end]
 
 
-def appended_causal_mask(seq_len: int, past: int, device: torch.device) -> torch.Tensor:
-    """Visibility of ``seq_len`` queries appended after ``past`` cached keys; ``True`` attends."""
-    return torch.ones(seq_len, past + seq_len, dtype=torch.bool, device=device).tril(diagonal=past)
-
-
 class Attention(nn.Module):
     """Grouped-Query Attention with RoPE and SDPA."""
 
@@ -109,35 +104,15 @@ class Attention(nn.Module):
         self.capture_attention_weights = False
         self.last_attention_weights: torch.Tensor | None = None
 
-    def _sdpa_backends(self, *, appended: bool = False) -> list[SDPBackend]:
-        """Return the SDPA backends enabled for one call; empty under ``sdpa_backend="auto"``.
-
-        The flash and cudnn kernels reject a dense mask. ``appended=True`` is
-        the decode-time call that attends several appended tokens to a
-        non-empty cache through a lower-right mask; it keeps the pinned kernel
-        first and also enables the efficient and math kernels, in that priority
-        order, which the dispatcher falls back to for that call instead of
-        raising. A packed training batch keeps the pinned kernel alone and
-        fails loudly as before, so a job never runs on a slower kernel
-        unannounced.
-        """
-        if self.sdpa_backend == "auto":
-            return []
-        backends = [_SDPA_BACKENDS[self.sdpa_backend]]
-        if appended and self.sdpa_backend in _MASK_FALLBACK_BACKENDS:
-            backends += [SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
-        return backends
-
-    def _sdpa_context(self, *, appended: bool = False):
+    def _sdpa_context(self):
         """Return a context manager that forces a specific SDPA backend.
 
         When sdpa_backend="auto", returns a no-op and lets PyTorch's
-        heuristics select the backend. See ``_sdpa_backends`` for ``appended``.
+        heuristics select the backend.
         """
-        backends = self._sdpa_backends(appended=appended)
-        if not backends:
+        if self.sdpa_backend == "auto":
             return contextlib.nullcontext()
-        return sdpa_kernel(backends, set_priority=len(backends) > 1)
+        return sdpa_kernel(_SDPA_BACKENDS[self.sdpa_backend])
 
     def forward(
         self,
@@ -150,44 +125,45 @@ class Attention(nn.Module):
     ) -> torch.Tensor:
         """Forward pass.
 
-        Attention consumes a mask; it never derives a visibility rule.
-        Document isolation, bidirectional groups, key validity and their
-        combination are expressed by ``kempnerforge.model.masking``, which
-        builds this one object once per forward and shares it across layers.
-        The causal structure itself is attention's own: ``is_causal`` for a
-        plain forward, and its lower-right form when several tokens are
-        appended to a non-empty cache, which the transformer builds once per
-        forward and every layer receives as ``attn_mask``.
+        Attention consumes the visibility mask; it never derives one. Every
+        visibility rule (document isolation, bidirectional groups, key
+        validity, and their combination) is expressed by
+        ``kempnerforge.model.masking``, which builds this one object once per
+        forward and shares it across layers. Without a mask, attention is
+        causal, aligned to the end of the key axis when tokens are appended to
+        a filled ``kv_cache``.
 
         Args:
             x: Input tensor of shape (batch, seq_len, dim).
             rope_cos: RoPE cosine frequencies, shape (seq_len, head_dim // 2) shared
                 across the batch or (batch, seq_len, head_dim // 2) per row.
             rope_sin: RoPE sine frequencies, same shape as ``rope_cos``.
-            kv_cache: Optional KV cache for incremental generation. The
-                tokens of this forward are appended after the cached ones and
-                see every cached key plus themselves causally. A visibility
-                mask from ``build_attention_mask`` does not compose with a
-                cache: it is square over the residual, while the key axis
-                grows every step.
+            kv_cache: Optional KV cache for incremental generation. The tokens
+                of this forward are appended to it, and each attends to every
+                cached key and to the appended keys up to its own position.
+                Mutually exclusive with ``attn_mask``: a cache grows the key
+                axis every step, so the mask would have to be rebuilt each
+                step rather than shared, and a decode step needs no mask at
+                all.
             attn_mask: The mask from
                 ``kempnerforge.model.masking.build_attention_mask``: a
                 FlexAttention ``BlockMask``, a dense bool tensor broadcastable
                 to (batch, n_heads, seq_len, seq_len) where ``True`` = attend,
-                or ``None`` for plain causal attention. With a cache it is the
-                lower-right causal mask ``Transformer.forward`` builds once
-                from ``appended_causal_mask`` when several tokens are appended
-                to a non-empty cache, (seq_len, past + seq_len); a layer
-                called on its own without it derives the same mask before
-                the cache is written.
+                or ``None`` for plain causal attention.
 
         Returns:
             Output tensor of shape (batch, seq_len, dim).
 
         Raises:
+            ValueError: If ``attn_mask`` is combined with ``kv_cache``.
             NotImplementedError: If ``capture_attention_weights`` is set and
                 ``attn_mask`` is a ``BlockMask``.
         """
+        if kv_cache is not None and attn_mask is not None:
+            raise ValueError(
+                "attn_mask (dense or BlockMask) cannot be combined with kv_cache; "
+                "visibility masks are training-only"
+            )
         if isinstance(attn_mask, BlockMask) and self.capture_attention_weights:
             raise NotImplementedError(
                 "capture_attention_weights requires attention_backend='sdpa'. "
@@ -212,25 +188,6 @@ class Attention(nn.Module):
         q = apply_rope(q, rope_cos, rope_sin)
         k = apply_rope(k, rope_cos, rope_sin)
 
-        past = kv_cache.seq_len if kv_cache is not None else 0
-        if isinstance(attn_mask, BlockMask) and kv_cache is not None:
-            raise ValueError(
-                "a BlockMask does not compose with kv_cache decode; a decode step re-derives "
-                "its own mask as the key axis grows"
-            )
-        if (
-            isinstance(attn_mask, torch.Tensor)
-            and kv_cache is not None
-            and tuple(attn_mask.shape[-2:]) != (seq_len, past + seq_len)
-        ):
-            raise ValueError(
-                f"attn_mask covers {tuple(attn_mask.shape[-2:])} (queries, keys) but this "
-                f"forward appends {seq_len} queries to a cache holding {past} keys; a "
-                "visibility mask is square over the residual and does not compose with a "
-                "non-empty kv_cache"
-            )
-        if attn_mask is None and past > 0 and seq_len > 1:
-            attn_mask = appended_causal_mask(seq_len, past, q.device)
         if kv_cache is not None:
             k, v = kv_cache.update(k, v)
 
@@ -248,17 +205,20 @@ class Attention(nn.Module):
                 enable_gqa=self.n_rep > 1,
             )
         elif self.capture_attention_weights:
-            out, attn_weights = self._attention_with_weights(q, k, v, attn_mask)
+            out, attn_weights = self._attention_with_weights(q, k, v, seq_len, attn_mask, kv_cache)
             self.last_attention_weights = attn_weights.detach().cpu()
         elif attn_mask is not None:
-            with self._sdpa_context(appended=past > 0):
+            with self._sdpa_context():
                 out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
-        elif past == 0:
+        elif seq_len > 1 and k.shape[2] > seq_len:
             with self._sdpa_context():
-                out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+                out = F.scaled_dot_product_attention(
+                    q, k, v, attn_mask=causal_lower_right(seq_len, k.shape[2])
+                )
         else:
+            is_causal = kv_cache is None or seq_len > 1
             with self._sdpa_context():
-                out = F.scaled_dot_product_attention(q, k, v)
+                out = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
 
         out = out.transpose(1, 2).contiguous().view(batch, seq_len, -1)
 
@@ -269,7 +229,9 @@ class Attention(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
+        seq_len: int,
         attn_mask: torch.Tensor | None,
+        kv_cache: KVCache | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute attention output and weights manually (for analysis).
 
@@ -281,9 +243,12 @@ class Attention(nn.Module):
             q: Queries, shape (batch, n_heads, seq_len, head_dim).
             k: Keys, shape (batch, n_heads, seq_k, head_dim).
             v: Values, shape (batch, n_heads, seq_k, head_dim).
-            attn_mask: Dense bool mask where ``True`` = attend, or ``None``:
-                causal attention when the keys are the queries, and attention
-                to every key for a single query appended to a cache.
+            seq_len: Query length.
+            attn_mask: Dense bool mask where ``True`` = attend, or ``None`` for
+                plain causal attention.
+            kv_cache: The cache in use. Every query attends to the keys cached
+                before this forward and to the new keys up to its own position,
+                so a ``seq_len == 1`` decode step attends to every cached key.
 
         Returns:
             Tuple of (output, attention_weights).
@@ -295,9 +260,11 @@ class Attention(nn.Module):
 
         if attn_mask is not None:
             attn = attn.masked_fill(~attn_mask, float("-inf"))
-        elif q.shape[2] > 1:
-            visible = appended_causal_mask(q.shape[2], 0, q.device)
-            attn = attn.masked_fill(~visible, float("-inf"))
+        elif kv_cache is None or seq_len > 1:
+            causal = torch.ones(seq_len, k.shape[2], dtype=torch.bool, device=q.device).triu(
+                diagonal=1 + k.shape[2] - seq_len
+            )
+            attn = attn.masked_fill(causal.unsqueeze(0).unsqueeze(0), float("-inf"))
 
         attn_weights = F.softmax(attn, dim=-1)
         out = torch.matmul(attn_weights, v)

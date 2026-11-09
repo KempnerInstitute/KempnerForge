@@ -19,7 +19,7 @@ import torch.nn as nn
 from kempnerforge.config.registry import registry
 from kempnerforge.config.schema import ModelConfig
 from kempnerforge.config.vlm import CrossAttentionConfig, MoMaConfig, MoTConfig, VLMConfig
-from kempnerforge.model.attention import Attention, KVCache, appended_causal_mask
+from kempnerforge.model.attention import Attention, KVCache
 from kempnerforge.model.cross_attention import CrossAttentionBlock
 from kempnerforge.model.embedding import OutputHead, TokenEmbedding
 from kempnerforge.model.init import init_weights
@@ -574,9 +574,6 @@ class Transformer(nn.Module):
             h = torch.cat([prefix_embeds, h], dim=1)
 
         start_pos = kv_caches[0].seq_len if kv_caches is not None else 0
-        if kv_caches is not None and start_pos > 0 and seq_len > 1:
-            attn_mask = appended_causal_mask(seq_len, start_pos, h.device)
-
         if rope_cos is not None:
             assert rope_sin is not None
             cos, sin = rope_cos.to(h.device), rope_sin.to(h.device)
