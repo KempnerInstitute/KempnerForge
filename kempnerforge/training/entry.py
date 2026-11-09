@@ -200,9 +200,26 @@ def _mot_text_warm_start(vlm_cfg: VLMConfig | None, model: torch.nn.Module) -> N
     """Copy the dense block weights of ``mot_warm_start_path`` into a MoT model."""
     if not isinstance(vlm_cfg, MoTConfig) or not vlm_cfg.mot_warm_start_from_text:
         return
-    source = torch.load(vlm_cfg.mot_warm_start_path, map_location="cpu", weights_only=True)
-    if isinstance(source, dict) and "model" in source:
-        source = source["model"]
+    source = {}
+    error = None
+    try:
+        source = torch.load(vlm_cfg.mot_warm_start_path, map_location="cpu", weights_only=True)
+        if isinstance(source, dict) and "model" in source:
+            source = source["model"]
+    except Exception as exc:
+        error = exc
+    # Every rank must finish reading before any rank enters the DTensor copy's collectives.
+    errors: list[str | None] = []
+    if dist.is_initialized():
+        errors = [None] * dist.get_world_size()
+        dist.all_gather_object(errors, str(error) if error is not None else None)
+    if error is not None:
+        raise error
+    failed = [rank for rank, message in enumerate(errors) if message is not None]
+    if failed:
+        raise RuntimeError(
+            f"MoT warm-start: could not read {vlm_cfg.mot_warm_start_path} on ranks {failed}"
+        )
     mot_warm_start_from_text_stack(inner_transformer(model), source)
     logger.info(f"MoT warm-start: copied dense block weights from {vlm_cfg.mot_warm_start_path}")
 

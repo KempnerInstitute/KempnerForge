@@ -2249,8 +2249,9 @@ class TestRestoreCheckpoint:
         assert mgr.load_kwargs["vlm_freeze_expected"] is None
         assert mgr.load_kwargs["exclude_keys"] == ["optimizer", "train_state"]
 
+    @pytest.mark.parametrize("wrapped", [False, True], ids=["plain_state_dict", "model_wrapper"])
     def test_mot_warm_start_runs_only_when_no_checkpoint_supplied_the_model(
-        self, monkeypatch, tmp_path
+        self, monkeypatch, tmp_path, wrapped
     ):
         import kempnerforge.training.entry as entry
         from kempnerforge.config.adapter import AdapterConfig
@@ -2258,7 +2259,8 @@ class TestRestoreCheckpoint:
         from kempnerforge.config.vlm import MoTConfig
 
         monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: tmp_path / "s")
-        monkeypatch.setattr(torch, "load", lambda *a, **k: {"model": {"w": 1}})
+        source = {"w": 1}
+        monkeypatch.setattr(torch, "load", lambda *a, **k: {"model": source} if wrapped else source)
         copied: list = []
         monkeypatch.setattr(
             entry, "mot_warm_start_from_text_stack", lambda m, src: copied.append(src)

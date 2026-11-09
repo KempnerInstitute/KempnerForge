@@ -486,6 +486,19 @@ class TestCheckpointConfig:
         with pytest.raises(ValueError, match="exclude_from_loading"):
             load_config(str(toml), cli_args=[])
 
+    @pytest.mark.parametrize("keys", [[["optimizer", "train_state"]], [{"optimizer": True}]])
+    def test_exclude_from_loading_rejects_unhashable_elements(self, keys):
+        with pytest.raises(
+            ValueError, match="accepts only 'model', 'optimizer' and/or 'train_state'"
+        ):
+            CheckpointConfig(exclude_from_loading=keys)
+
+    def test_nested_exclude_from_loading_is_validated_from_toml(self, tmp_path):
+        toml = tmp_path / "ckpt.toml"
+        toml.write_text('[checkpoint]\nexclude_from_loading = [["optimizer", "train_state"]]\n')
+        with pytest.raises(ValueError, match="accepts only"):
+            load_config(str(toml), cli_args=[])
+
     def test_dyn_ckpt_window_defaults_to_none(self):
         assert CheckpointConfig().dyn_ckpt_window is None
 

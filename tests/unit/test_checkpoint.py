@@ -1527,6 +1527,11 @@ class TestWeightsOnlyWarmStart:
         with pytest.raises(ValueError, match="must be \\['optimizer', 'train_state'\\]"):
             mgr.load(path=str(tmp_path / "absent"), exclude_keys=keys)
 
+    def test_nested_exclude_is_refused_before_loading(self, tmp_path, monkeypatch):
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        with pytest.raises(ValueError, match="accepts only"):
+            mgr.load(path=str(tmp_path / "absent"), exclude_keys=[["optimizer", "train_state"]])
+
     def test_without_the_key_the_train_state_is_restored(self, tmp_path, monkeypatch):
         ckpt_dir = self._saved(tmp_path, monkeypatch, _freeze_meta(("vision_encoder", True)))
         mgr = _make_mock_mgr(tmp_path, monkeypatch)

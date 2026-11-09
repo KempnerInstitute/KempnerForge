@@ -70,12 +70,12 @@ def validate_exclude_keys(keys: object, name: str) -> None:
     """Check an exclude list: a list of distinct DCP keys, ``"train_state"`` only in the pair."""
     if not isinstance(keys, list):
         raise ValueError(f"{name} must be a list (got {keys!r})")
-    if len(set(keys)) != len(keys):
-        raise ValueError(f"{name} repeats a key (got {keys!r})")
     if any(k not in ("model", "optimizer", "train_state") for k in keys):
         raise ValueError(
             f"{name} accepts only 'model', 'optimizer' and/or 'train_state' (got {keys!r})"
         )
+    if len(set(keys)) != len(keys):
+        raise ValueError(f"{name} repeats a key (got {keys!r})")
     if "train_state" in keys and set(keys) != WEIGHTS_ONLY_EXCLUDE:
         raise ValueError(
             f"{name} with 'train_state' must be ['optimizer', 'train_state']: a weights-only "
