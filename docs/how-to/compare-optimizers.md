@@ -163,16 +163,17 @@ Internal LR warmup is controlled by `schedule_free_warmup_steps`
 (default 0 = no warmup). Use a few hundred to stabilize early training.
 
 **Memory.** Three state tensors per parameter (`z`, `v` = second
-moment, `x` = Polyak average) + the `weight_sum` scalar — larger
-footprint than AdamW's two.
+moment, `x` = Polyak average) + the `weight_sum` and `step` scalars, a
+larger footprint than AdamW's two.
 
-**Eval quirk.** Best downstream numbers come from evaluating the
-Polyak-averaged `x` rather than the training point `y`. The class
-exposes `eval_params()` and `train_params()` to swap the parameters
-in place, but the training loop does **not** call them automatically.
-If you run `scripts/eval.py` on a schedule-free checkpoint, you're
-evaluating `y` unless you patch in those calls — usually close, but
-not optimal.
+**Eval point.** Best downstream numbers come from evaluating the
+Polyak-averaged `x` rather than the training point `y` the gradients
+are taken at, and that is what both eval paths see. The training loop
+swaps `x` in around `run_eval` with `eval_params()` and back to `y`
+with `train_params()`, bit for bit, and a checkpoint's model entry
+holds `x`, so `scripts/eval.py` on a schedule-free checkpoint evaluates
+`x` too. A checkpoint written before checkpoints held `x` has `y` in
+its model entry.
 
 ## Running a fair comparison
 

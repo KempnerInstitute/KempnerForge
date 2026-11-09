@@ -121,6 +121,13 @@ if eval_config.enabled and eval_dataloader is not None \
     hook_runner.on_eval_end(eval_metrics, step)
 ```
 
+The call runs inside `evaluation_point(optimizer)` from
+`kempnerforge.training.optimizer`. An optimizer that evaluates at
+another point than it trains at, as `schedule_free_adamw` does, has
+`eval_params()` and `train_params()`: eval then sees its averaged
+weights `x`, and training continues from the training point `y`, bit
+for bit. Every other optimizer evaluates the live weights.
+
 Cadence tuning:
 
 - `interval = 1000` with `steps = 50` means eval runs ~50 batches
@@ -143,7 +150,9 @@ Cadence tuning:
 4. Creates a dummy `torch.optim.SGD(lr=0.0)` — unused, but required by
    `CheckpointManager.load()`'s signature.
 5. Loads the checkpoint with `exclude_keys=["optimizer"]` so the
-   dummy SGD state isn't overwritten.
+   dummy SGD state isn't overwritten. A `schedule_free_adamw`
+   checkpoint's model entry holds the averaged weights `x`, so this
+   evaluates `x`; one written before checkpoints held `x` has `y`.
 6. Builds the eval dataloader (pre-tokenized or HF-streaming).
 7. Calls `run_eval` and prints the results + a JSON line for
    programmatic consumption.

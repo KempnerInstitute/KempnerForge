@@ -711,11 +711,10 @@
           ]
         },
         "ScheduleFreeAdamW": {
-          "purpose": "Schedule-Free AdamW (Defazio & Mishchenko 2024), eliminates LR schedule via iterate averaging",
+          "purpose": "Schedule-Free AdamW (Defazio & Mishchenko 2024), eliminates LR schedule via iterate averaging; each parameter's step count lives in its optimizer state",
           "methods": [
             "step(closure)",
-            "state_dict()",
-            "load_state_dict(state_dict)",
+            "load_state_dict(state_dict) (maps a legacy optimizer-wide _k onto each parameter's step)",
             "eval_params()",
             "train_params()"
           ]
@@ -731,6 +730,7 @@
       },
       "functions": [
         "build_optimizer(model, config) -> Optimizer",
+        "evaluation_point(optimizer) -> context manager (eval_params() inside, train_params() after)",
         "_newton_schulz(G, steps) -> Tensor",
         "_muon_matrices(model, *, routers) -> set[Tensor]",
         "_should_decay(name, param, scope) -> bool"
@@ -1216,6 +1216,8 @@
         "tests/unit/test_checkpoint_security.py::TestLoadTrainStateOwnershipGate",
         "tests/unit/test_checkpoint_security.py::TestManagerLoadRejectsForeignCheckpoint",
         "tests/unit/test_checkpoint.py::TestCheckpointManagerLoad",
+        "tests/unit/test_checkpoint.py::TestScheduleFreeCheckpoint",
+        "tests/unit/test_schedule_free_fsdp.py::TestScheduleFreeUnderFsdp2",
         "tests/distributed/test_checkpoint.py"
       ]
     },
@@ -1696,11 +1698,11 @@
       "tests/unit/test_additional_optimizers.py": {
         "classes": [
           "TestLion(10)",
-          "TestScheduleFreeAdamW(9)",
+          "TestScheduleFreeAdamW(17)",
           "TestNoneScheduler(3)",
           "TestOptimizerConfig(3)"
         ],
-        "count": 25
+        "count": 33
       },
       "tests/unit/test_scheduler_extensions.py": {
         "classes": [
