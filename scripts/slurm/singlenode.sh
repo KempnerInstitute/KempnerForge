@@ -46,7 +46,8 @@ uv run torchrun \
     --nproc_per_node="${NGPUS}" \
     scripts/train.py "${CONFIG}" ${OVERRIDES} &
 launcher=$!
-trap 'kill -TERM "${launcher}" 2>/dev/null || true' TERM USR1
+forwarded=0
+trap '[ "$forwarded" = 1 ] || { forwarded=1; kill -TERM "${launcher}" 2>/dev/null || true; }' TERM USR1
 while true; do
     rc=0
     wait "${launcher}" || rc=$?
