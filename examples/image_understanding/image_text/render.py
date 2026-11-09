@@ -178,13 +178,15 @@ class ChatRenderer:
         encoded = self.tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
         full = encoded["input_ids"]
         cut = len(full) > self.max_text_len
-        ids = full[: self.max_text_len - 1] + [self._end_id] if cut else full
+        kept = full[: self.max_text_len - 1] if cut else full
+        ends_already = cut and kept[-1] == self._end_id
+        ids = kept if ends_already or not cut else kept + [self._end_id]
         if self.answer_only:
             trained = [
                 any(s < end and e > start for start, end in spans)
-                for s, e in encoded["offset_mapping"][: self.max_text_len - cut]
+                for s, e in encoded["offset_mapping"][: len(kept)]
             ]
-            if cut:
+            if len(ids) > len(kept):
                 trained.append(trained[-1])
         else:
             trained = [True] * len(ids)
@@ -238,10 +240,25 @@ class RenderedDataset(Dataset):
     def __len__(self) -> int:
         return len(self.reader)
 
-    def _render(self, index: int) -> dict[str, torch.Tensor]:
-        return self.renderer(self.reader[index], random.Random(f"{self.seed}:{index}"))
-
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
         if not 0 <= index < len(self):
             raise IndexError(f"index {index} is out of range for {len(self)} documents")
-        return first_usable(index, len(self), self.max_attempts, self._render, self._skips)
+        next_index = index + 1
+
+        def render(row: int) -> dict[str, torch.Tensor]:
+            nonlocal next_index
+            read_with_index = getattr(self.reader, "read_with_index", None)
+            actual, document = (
+                read_with_index(row) if read_with_index is not None else (row, self.reader[row])
+            )
+            next_index = actual + 1
+            return self.renderer(document, random.Random(f"{self.seed}:{row}"))
+
+        return first_usable(
+            index,
+            len(self),
+            self.max_attempts,
+            render,
+            self._skips,
+            lambda row, error: next_index,
+        )

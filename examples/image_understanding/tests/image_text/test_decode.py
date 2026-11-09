@@ -58,15 +58,18 @@ class TestDecodeRgb:
         Image.new("RGB", (8, 4)).save(path, exif=exif)
         assert decode_rgb(path).size == (4, 8)
 
+    @pytest.mark.parametrize("image_format", ["PNG", "TIFF"])
     @pytest.mark.parametrize("orientation", range(1, 9))
-    def test_stored_pixels_follow_the_orientation(self, tmp_path: Path, orientation: int) -> None:
+    def test_stored_pixels_follow_the_orientation(
+        self, tmp_path: Path, orientation: int, image_format: str
+    ) -> None:
         """A point on the stored grid lands on the same pixel of the upright image."""
         image = Image.new("RGB", (8, 4))
         image.putpixel((6, 1), (255, 255, 255))
         exif = Image.Exif()
         exif[EXIF_ORIENTATION] = orientation
         path = tmp_path / "marked.png"
-        image.save(path, exif=exif)
+        image.save(path, format=image_format, exif=exif)
         decoded = decode_upright(path)
         assert (decoded.orientation, decoded.stored_size) == (orientation, (8, 4))
         ((px, py),) = decoded.percent([(6.5, 1.5)])

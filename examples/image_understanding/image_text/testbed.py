@@ -23,8 +23,9 @@ class ImageTextRows(Dataset):
 
     The table is shared with forked loader workers without the per-row copies that
     touching Python objects would cause. Blank answers are dropped, and with them
-    any row left without an answer, and answers lose surrounding whitespace, which
-    would otherwise be trained. Images are decoded upright; a row whose image
+    any row left without an answer or without a user message; answers lose their
+    surrounding whitespace, which would otherwise be trained. Images are decoded
+    upright; a row whose image
     does not decode is passed over for the next one, up to ``max_attempts`` in a
     row, and ``skipped`` counts them. A missing image file is an error.
     """
@@ -43,7 +44,7 @@ class ImageTextRows(Dataset):
                 f"{len(answers)} answer lists"
             )
         usable = [[answer.strip() for answer in row if is_text(answer)] for row in answers]
-        kept = [i for i, row in enumerate(usable) if row]
+        kept = [i for i, row in enumerate(usable) if row and is_text(users[i])]
         self.image_root = Path(image_root)
         self.max_attempts = check_max_attempts(max_attempts)
         self._skips = SkipLog()
@@ -67,10 +68,20 @@ class ImageTextRows(Dataset):
         image = decode_rgb(self.image_root / row["image"])
         return Document(images=(image,), turns=(Turn(row["user"], tuple(row["answers"])),))
 
-    def __getitem__(self, index: int) -> Document:
+    def read_with_index(self, index: int) -> tuple[int, Document]:
+        """The actual row index and document after passing over unusable rows."""
         if not 0 <= index < len(self):
             raise IndexError(f"index {index} is out of range for {len(self)} rows")
-        return first_usable(index, len(self), self.max_attempts, self._read, self._skips)
+        return first_usable(
+            index,
+            len(self),
+            self.max_attempts,
+            lambda row: (row, self._read(row)),
+            self._skips,
+        )
+
+    def __getitem__(self, index: int) -> Document:
+        return self.read_with_index(index)[1]
 
 
 def _load_json(path: str | Path) -> Any:

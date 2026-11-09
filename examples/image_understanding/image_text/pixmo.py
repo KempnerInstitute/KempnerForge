@@ -34,7 +34,7 @@ def _jsonl(path: str | Path) -> Iterator[dict[str, Any]]:
 
 def _parallel(row: dict[str, Any], *keys: str) -> Iterator[tuple[Any, ...]]:
     """The row's ``keys`` zipped, refusing values that are not lists of one length."""
-    lists = [row.get(key) or [] for key in keys]
+    lists = [row.get(key, []) for key in keys]
     if not all(isinstance(values, list) for values in lists):
         raise ValueError(f"row for {row['image']}: {', '.join(keys)} must be lists")
     if len({len(values) for values in lists}) > 1:
@@ -92,17 +92,21 @@ class PixmoRows(Dataset):
                 return index + step
         raise RuntimeError(f"every row has the image {image}, which does not decode")
 
-    def __getitem__(self, index: int) -> Document:
+    def read_with_index(self, index: int) -> tuple[int, Document]:
+        """The actual row index and document after passing over unusable rows."""
         if not 0 <= index < len(self):
             raise IndexError(f"index {index} is out of range for {len(self)} rows")
         return first_usable(
             index,
             len(self),
             self.max_attempts,
-            self._read,
+            lambda row: (row, self._read(row)),
             self._skips,
             self._next_image,
         )
+
+    def __getitem__(self, index: int) -> Document:
+        return self.read_with_index(index)[1]
 
 
 class PixmoCaptions(PixmoRows):
@@ -168,7 +172,8 @@ class PixmoCounting(PixmoRows):
     keeps the first points and still states the full count. The answer lists the
     points before the count, so when it outruns the renderer's text budget (at
     256 tokens, past about 13 points) the count is cut away and only the leading
-    points train; ``max_points`` bounds the answer so the count fits.
+    points train. ``max_points`` retains the count only when the cap is small
+    enough for the label and the renderer's text budget.
     """
 
     def __init__(
@@ -187,7 +192,7 @@ class PixmoCounting(PixmoRows):
     def document(self, row: dict[str, Any], decoded: Decoded) -> Document:
         label = row["label"]
         points = list(zip(row["xs"], row["ys"], strict=True))
-        count = row["count"] if row["count"] is not None else len(points)
+        count = row.get("count") if row.get("count") is not None else len(points)
         if self.pixels:
             width, height = decoded.stored_size
             if not all(0 <= x <= width and 0 <= y <= height for x, y in points):
@@ -247,7 +252,7 @@ def pixmo_cap_qa(
 ) -> PixmoConversations:
     """PixMo-CapQA, whose ``messages[i]`` alternates questions and answers, ending with turn ``i``.
 
-    An element that is not a list of pairs is dropped.
+    A malformed message ends the conversation, keeping only the preceding turns.
     """
     return _conversations(
         image_root,
@@ -256,8 +261,9 @@ def pixmo_cap_qa(
                 row["image"],
                 [
                     (element[-2], element[-1])
-                    for element in row.get("messages") or []
                     if isinstance(element, list) and len(element) >= 2 and len(element) % 2 == 0
+                    else (None, None)
+                    for element in row.get("messages") or []
                 ],
             )
             for row in _jsonl(annotation_file)
@@ -376,14 +382,13 @@ def pixmo_counting(
             ]
         else:
             pts = row["points"]
-            if len(pts["x"]) != len(pts["y"]):
-                raise ValueError(f"row for {row['image']}: x and y differ in length")
+            coordinates = list(_parallel({**pts, "image": row["image"]}, "x", "y"))
             entries = [
                 (
                     row["label"],
-                    row["count"],
-                    [float(x) for x in pts["x"]],
-                    [float(y) for y in pts["y"]],
+                    row.get("count"),
+                    [float(x) for x, _ in coordinates],
+                    [float(y) for _, y in coordinates],
                 )
             ]
         for label, count, xs, ys in entries:
