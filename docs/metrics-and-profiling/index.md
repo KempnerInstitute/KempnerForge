@@ -43,8 +43,9 @@ smoothed/mfu           smoothed/step_time
 Plus eval metrics (via `tracker.log_eval`): eval loss, MoE aux loss and
 router stats, per-dataset losses and token counts for mixtures, and the
 time each checkpoint save and async drain took (`checkpoint/save_sec`,
-`checkpoint/wait_sec`). The losses and token counts cover every
-data-parallel rank, not rank 0 alone.
+`checkpoint/wait_sec`). The eval loss and the per-dataset losses and
+token counts cover every data-parallel rank, not rank 0 alone; the MoE
+series are still rank 0's own values.
 
 ## Config
 

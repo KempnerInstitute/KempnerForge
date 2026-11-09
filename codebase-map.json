@@ -1198,6 +1198,7 @@
           "purpose": "DCP-based distributed checkpoint save/load/cleanup manager. Cross-arch VLM freeze-metadata validation, rank-0-authoritative train_state existence broadcast (NFS/Lustre stat() race), ownership-gated train_state.pt load",
           "methods": [
             "save(step, tokens_seen, scheduler, dataloader, extra)",
+            "has_pending_save (property: an async save to drain or a latest commit to make)",
             "wait()",
             "flush_pending_save()",
             "peek_saved_step(path)",
@@ -1219,6 +1220,7 @@
         "tests/unit/test_checkpoint.py::TestWeightDecayScopeOnResume",
         "tests/unit/test_checkpoint.py::TestCheckpointRetention",
         "tests/unit/test_checkpoint.py::TestFlushPendingSave",
+        "tests/unit/test_checkpoint.py::TestHasPendingSave",
         "tests/unit/test_checkpoint.py::TestPeekSavedStep",
         "tests/unit/test_checkpoint.py::TestSaveVLMFreezeMetadata",
         "tests/unit/test_checkpoint.py::TestLoadVLMFreezeCompare",
@@ -1304,7 +1306,8 @@
         "compute_mfu(tokens_per_sec, config, seq_len, gpu_peak_tflops) -> float"
       ],
       "tested_by": [
-        "tests/unit/test_performance.py::TestMFU"
+        "tests/unit/test_performance.py::TestMFU",
+        "tests/unit/test_performance.py::TestEstimatesCountTheBuiltMLP"
       ]
     },
     "kempnerforge/profiling/profiler.py": {
