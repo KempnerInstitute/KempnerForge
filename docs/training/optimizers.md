@@ -76,10 +76,14 @@ freeze = []
   `min_lr_ratio` times that peak).
 - Under `muon`, a module's AdamW-fallback parameters also take the multiplier, applied to
   `muon_adam_lr`.
-- A parameter may belong to only one listed module. When two listed modules match one
-  parameter, as `transformer` and `cross_attention` do, the optimizer build refuses them:
-  list one of them, or add a module to `vlm.module_patterns` that names just the parameters
-  you mean.
+- Listed modules may nest. A parameter that several listed modules match belongs to the one
+  matching the fewest parameters, when each of the others matches all of those and more:
+  under `vlm.arch = "cross_attention"`, `transformer = 0.1` with `cross_attention = 1.0`
+  trains the cross-attention layers at `lr` and the rest of the transformer at a tenth of
+  it. Two listed modules that match the same parameters, or parameters that partly overlap
+  (such as `*.weight` and `transformer.*`), are refused when the optimizer is built.
+  Ownership is decided over every parameter, frozen or not, so it does not change between
+  freeze stages, and the build logs each module's parameters and the module it sits in.
 - Each listed module's rate is logged as `lr/<module>` on the metrics interval, the rate its
   param groups step at next. Under `muon` that is the rate of its orthogonalized matrices,
   and the rate of its AdamW fallback is logged as `lr_adamw/<module>`. `train/lr` stays the

@@ -654,14 +654,24 @@ def _module_owners(
     model: torch.nn.Module,
     modules: Iterable[str],
     module_patterns: Mapping[str, Sequence[str]] | None,
-) -> dict[torch.Tensor, str]:
-    """Map every parameter of ``model`` that one of ``modules`` matches to that module.
+) -> tuple[dict[torch.Tensor, str], dict[str, list[str]]]:
+    """Map every parameter of ``model`` that one of ``modules`` matches to the module owning it.
 
-    Names are matched as the module that ``torch.compile`` wrapped, if any, names them.
+    Ownership is decided over every parameter's name, frozen or not, so it does not change
+    between freeze stages; names are matched as the module that ``torch.compile`` wrapped, if
+    any, names them. A parameter that one module matches belongs to it. One that several
+    match belongs to the one matching the fewest parameters, whose matches every other of
+    them strictly contains, so a module nested in another, such as ``cross_attention`` in
+    ``transformer``, keeps its own parameters.
+
+    Returns:
+        The owner of each matched parameter, and for each module the modules that strictly
+        contain its parameters, the closest first.
 
     Raises:
         ValueError: ``module_patterns`` is missing or lacks one of ``modules``, one of
-            ``modules`` matches no parameter, or a parameter matches two of them.
+            ``modules`` matches no parameter, or two of them match the same parameters or
+            parameters that partly overlap.
     """
     modules = sorted(modules)
     if module_patterns is None:
@@ -674,27 +684,47 @@ def _module_owners(
             f"optimizer.lr_multipliers names unknown modules {unknown}; the modules of "
             f"module_patterns are {sorted(module_patterns)}"
         )
-    owners: dict[torch.Tensor, str] = {}
-    for name, param in getattr(model, "_orig_mod", model).named_parameters():
-        matched = [
-            module
-            for module in modules
+    named = list(getattr(model, "_orig_mod", model).named_parameters())
+    matched = {
+        module: {
+            name
+            for name, _ in named
             if any(fnmatch.fnmatch(name, pattern) for pattern in module_patterns[module])
-        ]
-        if len(matched) > 1:
-            raise ValueError(
-                f"Parameter {name!r} is in more than one module of optimizer.lr_multipliers: "
-                f"{matched}. List modules whose patterns share no parameter."
-            )
-        if matched:
-            owners[param] = matched[0]
-    unmatched = sorted(set(modules) - set(owners.values()))
+        }
+        for module in modules
+    }
+    unmatched = [module for module in modules if not matched[module]]
     if unmatched:
         raise ValueError(
             f"optimizer.lr_multipliers names modules {unmatched} whose module_patterns match "
             "no parameter of the model"
         )
-    return owners
+    for index, first in enumerate(modules):
+        for second in modules[index + 1 :]:
+            ours, theirs = matched[first], matched[second]
+            shared = ours & theirs
+            if shared and not (ours < theirs or theirs < ours):
+                kind = "the same parameters" if ours == theirs else "parameters that partly overlap"
+                raise ValueError(
+                    f"optimizer.lr_multipliers lists {first!r} and {second!r}, whose "
+                    f"module_patterns match {kind}, such as {sorted(shared)[:3]}. A parameter "
+                    "that two listed modules match belongs to the one whose parameters the "
+                    "other's strictly contain, so list one of them, or add a module to "
+                    "vlm.module_patterns that names only the parameters meant."
+                )
+    enclosing = {
+        module: sorted(
+            (other for other in modules if matched[module] < matched[other]),
+            key=lambda other: len(matched[other]),
+        )
+        for module in modules
+    }
+    owners: dict[torch.Tensor, str] = {}
+    for name, param in named:
+        candidates = [module for module in modules if name in matched[module]]
+        if candidates:
+            owners[param] = min(candidates, key=lambda module: len(matched[module]))
+    return owners, enclosing
 
 
 def _split_by_module(
@@ -705,14 +735,17 @@ def _split_by_module(
 ) -> list[dict]:
     """Give each module of ``config.lr_multipliers`` its own copy of every group.
 
-    A module's copy holds the module's parameters, sets ``"lr"`` to ``config.lr`` times the
-    module's multiplier and names the module under ``"module"``. Parameters outside every
-    listed module stay in the original groups. The groups come out in a fixed order, the
-    original ones first and then each module's by module name, and empty groups are dropped.
-    A listed module with no trainable parameter gets no group, and a warning says its
-    multiplier has no effect.
+    A module's copy holds the parameters it owns (see ``_module_owners``), sets ``"lr"`` to
+    ``config.lr`` times the module's multiplier and names the module under ``"module"``.
+    Parameters outside every listed module stay in the original groups. The groups come out
+    in a fixed order, the original ones first and then each module's by module name, and
+    empty groups are dropped. A listed module with no trainable parameter gets no group, and
+    a warning says its multiplier has no effect.
     """
-    owners = _module_owners(model, config.lr_multipliers, module_patterns)
+    owners, enclosing = _module_owners(model, config.lr_multipliers, module_patterns)
+    owned: dict[str, int] = {}
+    for param, module in owners.items():
+        owned[module] = owned.get(module, 0) + param.numel()
     split = [
         {**group, "params": [p for p in group["params"] if p not in owners]}
         for group in param_groups
@@ -730,7 +763,11 @@ def _split_by_module(
         ]
         n_params = sum(p.numel() for group in groups for p in group["params"])
         if n_params:
-            logger.info(f"Optimizer module {module}: {n_params:,} trainable params at lr {lr:.3g}")
+            inside = f", inside {', '.join(enclosing[module])}" if enclosing[module] else ""
+            logger.info(
+                f"Optimizer module {module}: owns {owned.get(module, 0):,} params, "
+                f"{n_params:,} trainable, at lr {lr:.3g}{inside}"
+            )
         else:
             logger.warning(
                 f"optimizer.lr_multipliers lists {module!r}, which has no trainable parameters "
@@ -769,7 +806,8 @@ def build_optimizer(
 
     With ``config.lr_multipliers`` set, each listed module's parameters get their own
     groups at ``config.lr`` times the module's multiplier, named by ``"module"``; the
-    scheduler then scales every group's own rate by the same factor.
+    scheduler then scales every group's own rate by the same factor. A module nested in
+    another listed one keeps its own parameters.
 
     Args:
         model: Model whose parameters to optimize.
@@ -782,7 +820,8 @@ def build_optimizer(
 
     Raises:
         ValueError: ``config.lr_multipliers`` names a module ``module_patterns`` lacks or
-            one that matches no parameter, or two of its modules share a parameter.
+            one that matches no parameter, or two of its modules match the same parameters
+            or parameters that partly overlap.
     """
     decay_params = []
     no_decay_params = []

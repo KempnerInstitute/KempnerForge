@@ -353,12 +353,99 @@ class TestGroups:
         with pytest.raises(ValueError, match=r"modules \['head'\] whose module_patterns match no"):
             build_optimizer(_vlm_like(), config, module_patterns=patterns)
 
-    def test_a_parameter_in_two_listed_modules_is_refused(self):
-        config = OptimizerConfig(lr_multipliers={"transformer": 0.5, "first": 2.0})
-        patterns = {**VLM_PATTERNS, "first": ["transformer.0.*"]}
-        with pytest.raises(
-            ValueError, match=r"'transformer.0.weight' is in more than one module.*'first'"
-        ):
+    NESTED = {
+        **VLM_PATTERNS,
+        "outer": ["transformer.*"],
+        "middle": ["transformer.0.*", "transformer.1.weight"],
+        "inner": ["transformer.0.weight"],
+    }
+
+    def _owners(self, model, optimizer):
+        """The module each parameter's group names, None for one of no listed module."""
+        names = {id(p): n for n, p in model.named_parameters()}
+        return {names[id(p)]: g.get("module") for g in optimizer.param_groups for p in g["params"]}
+
+    def test_a_module_nested_in_another_keeps_its_own_parameters(self, caplog, monkeypatch):
+        """A parameter two listed modules match goes to the one whose parameters the other's
+        strictly contain, and the build log says that module sits inside the other."""
+        monkeypatch.setattr(logging.getLogger("kempnerforge"), "propagate", True)
+        model = _vlm_like()
+        config = OptimizerConfig(lr=0.01, lr_multipliers={"transformer": 0.5, "inner": 2.0})
+        with caplog.at_level(logging.INFO, logger="kempnerforge.training.optimizer"):
+            optimizer = build_optimizer(model, config, module_patterns=self.NESTED)
+        rates = _rates(model, optimizer)
+        assert rates["transformer.0.weight"] == pytest.approx(0.02)
+        assert {
+            n: r
+            for n, r in rates.items()
+            if n.startswith("transformer.") and n != ("transformer.0.weight")
+        } == {
+            "transformer.0.bias": pytest.approx(0.005),
+            "transformer.1.weight": pytest.approx(0.005),
+            "transformer.1.bias": pytest.approx(0.005),
+        }
+        assert rates["adapter.weight"] == 0.01
+        assert [m for m in caplog.messages if m.startswith("Optimizer module")] == [
+            "Optimizer module inner: owns 64 params, 64 trainable, at lr 0.02, inside transformer",
+            "Optimizer module transformer: owns 24 params, 24 trainable, at lr 0.005",
+        ]
+
+    def test_a_three_level_nest_resolves_to_the_innermost(self, caplog, monkeypatch):
+        monkeypatch.setattr(logging.getLogger("kempnerforge"), "propagate", True)
+        model = _vlm_like()
+        multipliers = {"outer": 0.5, "middle": 2.0, "inner": 4.0}
+        config = OptimizerConfig(lr=0.01, lr_multipliers=multipliers)
+        with caplog.at_level(logging.INFO, logger="kempnerforge.training.optimizer"):
+            optimizer = build_optimizer(model, config, module_patterns=self.NESTED)
+        owners = self._owners(model, optimizer)
+        assert {n: m for n, m in owners.items() if n.startswith("transformer.")} == {
+            "transformer.0.weight": "inner",
+            "transformer.0.bias": "middle",
+            "transformer.1.weight": "middle",
+            "transformer.1.bias": "outer",
+        }
+        inner = [m for m in caplog.messages if m.startswith("Optimizer module inner")]
+        assert inner == [
+            "Optimizer module inner: owns 64 params, 64 trainable, at lr 0.04, inside middle, outer"
+        ]
+
+    def test_ownership_does_not_depend_on_what_is_frozen(self):
+        """With the rest of ``transformer`` frozen, both modules match the same trainable
+        parameters, but ownership is decided over every parameter, so it stands."""
+        model = _vlm_like()
+        model.transformer[1].requires_grad_(False)
+        config = OptimizerConfig(lr=0.01, lr_multipliers={"transformer": 0.5, "inner": 2.0})
+        patterns = {**self.NESTED, "inner": ["transformer.0.*"]}
+        optimizer = build_optimizer(model, config, module_patterns=patterns)
+        owners = self._owners(model, optimizer)
+        assert {n: m for n, m in owners.items() if n.startswith("transformer.")} == {
+            "transformer.0.weight": "inner",
+            "transformer.0.bias": "inner",
+        }
+        assert module_learning_rates(optimizer) == {"lr/inner": pytest.approx(0.02)}
+
+    @pytest.mark.parametrize(
+        ("patterns", "listed", "match"),
+        [
+            (
+                {**VLM_PATTERNS, "weights": ["*.weight"]},
+                {"transformer": 0.5, "weights": 2.0},
+                r"lists 'transformer' and 'weights', whose module_patterns match parameters that "
+                r"partly overlap, such as \['transformer.0.weight', 'transformer.1.weight'\]",
+            ),
+            (
+                {**VLM_PATTERNS, "connector": ["adapter.*"]},
+                {"adapter": 2.0, "connector": 3.0},
+                r"lists 'adapter' and 'connector', whose module_patterns match the same "
+                r"parameters, such as \['adapter.bias', 'adapter.weight'\]",
+            ),
+        ],
+        ids=["partial-overlap", "identical"],
+    )
+    def test_modules_that_neither_nest_nor_part_are_refused(self, patterns, listed, match):
+        """No module's parameters contain the other's, so neither owns the shared ones."""
+        config = OptimizerConfig(lr_multipliers=listed)
+        with pytest.raises(ValueError, match=match):
             build_optimizer(_vlm_like(), config, module_patterns=patterns)
 
     def test_a_vlm_wrapper_splits_by_its_module_patterns(self, tiny_vlm_configs):
@@ -377,18 +464,60 @@ class TestGroups:
         assert rates == {"adapter": pytest.approx(1e-2), "transformer": pytest.approx(5e-4)}
         assert optimizer.param_groups[0]["module"] == "adapter"
 
-    def test_overlapping_aliases_of_one_arch_are_refused(self):
-        """``cross_attention`` lies inside ``transformer``, so listing both is ambiguous."""
-        patterns = VLMConfig.for_arch("cross_attention").module_patterns
-        model = nn.Module()
-        model.transformer = nn.Module()
-        model.transformer.cross_attention_layers = nn.Linear(4, 4)
-        config = OptimizerConfig(lr_multipliers={"transformer": 0.5, "cross_attention": 2.0})
-        with pytest.raises(ValueError, match="in more than one module"):
-            build_optimizer(model, config, module_patterns=patterns)
-        only = OptimizerConfig(lr_multipliers={"cross_attention": 2.0})
-        optimizer = build_optimizer(model, only, module_patterns=patterns)
-        assert module_learning_rates(optimizer) == {"lr/cross_attention": pytest.approx(6e-4)}
+    def test_an_arch_alias_inside_transformer_takes_its_own_rate(self, tmp_path):
+        """Through the config loader and the VLM wrapper: under ``vlm.arch = "cross_attention"``
+        the cross-attention layers train at their own rate, and the rest of ``transformer`` at
+        its."""
+        from kempnerforge.model.vlm import build_vlm_wrapper
+
+        toml = tmp_path / "ca.toml"
+        toml.write_text(
+            """
+[model]
+dim = 64
+n_layers = 2
+n_heads = 4
+n_kv_heads = 4
+vocab_size = 256
+max_seq_len = 96
+
+[train]
+seq_len = 96
+
+[vision_encoder]
+type = "random"
+num_tokens = 16
+
+[vlm]
+arch = "cross_attention"
+max_text_len = 64
+cross_attention_every_n_layers = 1
+
+[optimizer]
+lr = 0.01
+
+[optimizer.lr_multipliers]
+transformer = 0.1
+cross_attention = 1.0
+"""
+        )
+        config = load_config(str(toml), cli_args=[])
+        assert config.vlm is not None and config.vision_encoder is not None
+        assert config.adapter is not None
+        wrapper = build_vlm_wrapper(config.model, config.vision_encoder, config.adapter, config.vlm)
+        optimizer = build_optimizer(
+            wrapper, config.optimizer, module_patterns=config.vlm.module_patterns
+        )
+        rates = _rates(wrapper, optimizer)
+        cross = {n for n in rates if n.startswith("transformer.cross_attention_layers.")}
+        rest = {n for n in rates if n.startswith("transformer.")} - cross
+        assert cross and rest
+        assert all(rates[n] == pytest.approx(0.01) for n in cross)
+        assert all(rates[n] == pytest.approx(0.001) for n in rest)
+        assert module_learning_rates(optimizer) == {
+            "lr/cross_attention": pytest.approx(0.01),
+            "lr/transformer": pytest.approx(0.001),
+        }
 
 
 class TestSchedule:
@@ -1337,6 +1466,46 @@ class TestLayoutChange:
             assert torch.equal(p, p2)
             if p in optimizer.state:
                 assert torch.equal(optimizer2.state[p2]["exp_avg"], optimizer.state[p]["exp_avg"])
+
+    def test_the_records_describe_the_ownership_of_nested_modules(self, tmp_path):
+        """The saved multipliers, patterns and group modules pin down which module owns each
+        parameter, so the same ones resume into the same groups and other patterns are
+        refused."""
+        multipliers = {"transformer": 0.5, "inner": 2.0}
+        nested = {**VLM_PATTERNS, "inner": ["transformer.0.*"]}
+
+        def build(patterns):
+            model = _vlm_like()
+            config = OptimizerConfig(lr=self.LR, fused=False, lr_multipliers=multipliers)
+            optimizer = build_optimizer(model, config, module_patterns=patterns)
+            schedule = SchedulerConfig(warmup_steps=2, min_lr_ratio=0.1)
+            return model, optimizer, build_scheduler(optimizer, schedule, max_steps=20)
+
+        def manager(model, optimizer, patterns):
+            return CheckpointManager(
+                CheckpointConfig(dir=str(tmp_path)),
+                model,
+                optimizer,
+                lr_multipliers=multipliers,
+                module_patterns=patterns,
+            )
+
+        model, optimizer, scheduler = build(nested)
+        self._train(model, optimizer, scheduler, 3)
+        manager(model, optimizer, nested).save(step=3, scheduler=scheduler)
+        meta = json.loads((tmp_path / "step_3" / "metadata.json").read_text())
+        assert meta["lr_group_modules"] == [None, None, "inner", "inner", "transformer"]
+        assert meta["lr_module_patterns"] == {
+            "inner": ["transformer.0.*"],
+            "transformer": ["transformer", "transformer.*"],
+        }
+        model2, optimizer2, scheduler2 = build(nested)
+        assert manager(model2, optimizer2, nested).load(scheduler=scheduler2)[0] == 3
+        assert _layout(model2, optimizer2) == _layout(model, optimizer)
+        moved = {**nested, "inner": ["transformer.1.*"]}
+        model3, optimizer3, scheduler3 = build(moved)
+        with pytest.raises(ValueError, match="saved with the module patterns"):
+            manager(model3, optimizer3, moved).load(scheduler=scheduler3)
 
     def test_a_save_under_pipeline_parallelism_records_no_group_modules(self, tmp_path):
         """Rank 0 holds one stage's groups, so the record would not describe the others'."""

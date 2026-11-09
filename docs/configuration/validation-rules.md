@@ -83,8 +83,11 @@ File:
 - `lr_multipliers` maps non-empty module names without `/` to finite numbers `> 0`. A non-empty one
   needs a `[vlm]` section whose `module_patterns` names every listed module; this is checked
   when `JobConfig` is built. When the optimizer is built, a listed module that matches no
-  parameter, and a parameter in two listed modules, raise `ValueError`: which parameters two
-  modules share depends on the model's parameter names, so only the build can tell.
+  parameter raises `ValueError`, and so do two listed modules that match the same parameters
+  or parameters that partly overlap; a module whose parameters another's strictly contain
+  keeps them (see [Optimizers](../training/optimizers.md#per-module-learning-rates)). Which
+  parameters the modules share depends on the model's parameter names, so only the build
+  can tell.
 
 ### `SchedulerConfig`
 

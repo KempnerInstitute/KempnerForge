@@ -736,6 +736,7 @@
         "build_optimizer(model, config, module_patterns=None) -> Optimizer",
         "module_learning_rates(optimizer) -> dict[str, float] (keyed lr/<module>, lr_adamw/<module>)",
         "_split_by_module(model, param_groups, config, module_patterns) -> list[dict]",
+        "_module_owners(model, modules, module_patterns) -> (owners, enclosing) (over every parameter name; a parameter several listed modules match goes to the one whose matches the others strictly contain; identical or partly overlapping matches are refused)",
         "_newton_schulz(G, steps) -> Tensor",
         "_muon_matrices(model, *, routers) -> set[Tensor]",
         "_should_decay(name, param, scope) -> bool"
