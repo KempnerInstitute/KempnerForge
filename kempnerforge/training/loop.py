@@ -141,11 +141,16 @@ class StepResult:
 
     The per-dataset fields stay empty for step bodies that don't produce
     them; ``text_tokens`` stays None, which a VLM run treats as an error
-    rather than logging a zero.
+    rather than logging a zero. ``tokens`` is the number of positions the
+    model ran on this rank over every micro-step, padding included, and
+    ``seq_len`` the length of each of those rows; with ``tokens`` None the
+    loop counts ``train.batch_size * train.seq_len`` per micro-step.
     """
 
     loss: float
     grad_norm: float
+    tokens: int | None = None
+    seq_len: int | None = None
     text_tokens: int | None = None
     dataset_token_counts: dict[str, int] = field(default_factory=dict)
     dataset_loss_sums: dict[str, float] = field(default_factory=dict)
@@ -265,11 +270,20 @@ def pipeline_step(session: TrainingSession, step: int) -> StepResult:
 
     loss_tensor = torch.tensor([avg_loss], device=device)
     dist.broadcast(loss_tensor, group_src=pipeline.size - 1, group=group)
-    return StepResult(loss=loss_tensor.item(), grad_norm=grad_norm_val)
+    return StepResult(
+        loss=loss_tensor.item(),
+        grad_norm=grad_norm_val,
+        tokens=full_input.numel(),
+        seq_len=full_input.shape[1],
+    )
 
 
 def vlm_step(session: TrainingSession, step: int) -> StepResult:
-    """VLM step (no PP): pixel_values + input_ids forward, with a text-token count."""
+    """VLM step (no PP): pixel_values + input_ids forward, with a text-token count.
+
+    Each row the decoder runs holds the model's ``num_image_tokens`` image
+    positions (zero when they do not enter the residual stream) and the text.
+    """
     config = session.config
     tc, mc = config.train, config.model
     device = session.runtime.device
@@ -278,6 +292,9 @@ def vlm_step(session: TrainingSession, step: int) -> StepResult:
 
     total_loss = 0.0
     total_text_tokens = 0
+    total_tokens = 0
+    seq_len = 0
+    image_positions = getattr(getattr(model, "_orig_mod", model), "num_image_tokens", 0)
 
     for micro_step in range(tc.grad_accum_steps):
         if not batches.has_data:
@@ -290,6 +307,8 @@ def vlm_step(session: TrainingSession, step: int) -> StepResult:
         input_ids = batch["input_ids"].to(device)
         labels = batch["labels"].to(device)
         frame_mask = batch["frame_mask"].to(device) if "frame_mask" in batch else None
+        seq_len = input_ids.shape[1] + image_positions
+        total_tokens += input_ids.shape[0] * seq_len
 
         with maybe_no_sync(model, micro_step, tc.grad_accum_steps):
             if mc.is_moe:
@@ -310,6 +329,8 @@ def vlm_step(session: TrainingSession, step: int) -> StepResult:
     return StepResult(
         loss=total_loss / tc.grad_accum_steps,
         grad_norm=clip_grads(model, tc.grad_clip_norm),
+        tokens=total_tokens,
+        seq_len=seq_len,
         text_tokens=total_text_tokens,
     )
 
@@ -324,6 +345,8 @@ def text_step(session: TrainingSession, step: int) -> StepResult:
     mixture_dataset = session.data.mixture_dataset
 
     total_loss = 0.0
+    total_tokens = 0
+    seq_len = 0
     ds_token_counts: dict[str, int] = {}
     ds_loss_sums: dict[str, float] = {}
     ds_loss_counts: dict[str, int] = {}
@@ -339,6 +362,8 @@ def text_step(session: TrainingSession, step: int) -> StepResult:
             input_ids = torch.randint(0, mc.vocab_size, (tc.batch_size, tc.seq_len), device=device)
             labels = torch.randint(0, mc.vocab_size, (tc.batch_size, tc.seq_len), device=device)
             doc_ids = None
+        seq_len = input_ids.shape[1]
+        total_tokens += input_ids.numel()
 
         with maybe_no_sync(model, micro_step, tc.grad_accum_steps):
             if mc.is_moe:
@@ -375,6 +400,8 @@ def text_step(session: TrainingSession, step: int) -> StepResult:
     return StepResult(
         loss=total_loss / tc.grad_accum_steps,
         grad_norm=clip_grads(model, tc.grad_clip_norm),
+        tokens=total_tokens,
+        seq_len=seq_len,
         dataset_token_counts=ds_token_counts,
         dataset_loss_sums=ds_loss_sums,
         dataset_loss_counts=ds_loss_counts,
@@ -643,7 +670,10 @@ def run_training_loop(
             optimizer.zero_grad()
 
             step += 1
-            tokens_in_step = tc.batch_size * tc.seq_len * tc.grad_accum_steps * data.dp_size
+            local_tokens = result.tokens
+            if local_tokens is None:
+                local_tokens = tc.batch_size * tc.seq_len * tc.grad_accum_steps
+            tokens_in_step = local_tokens * data.dp_size
             tokens_seen += tokens_in_step
 
             _apply_step_transitions(session, step)
@@ -654,6 +684,7 @@ def run_training_loop(
                 grad_norm=result.grad_norm,
                 lr=applied_lr,
                 tokens_in_step=tokens_in_step,
+                seq_len=result.seq_len,
             )
 
             hooks.on_step_end(

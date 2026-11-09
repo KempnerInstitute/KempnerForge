@@ -1804,6 +1804,82 @@ class TestDpSizeReachesTokenAccounting:
         assert DataPipeline().dp_size == 1
 
 
+class TestTokensCountTheBatch:
+    """tokens_in_step counts the positions the model ran, not ``train.seq_len`` per row.
+
+    A VLM row holds the image positions in the residual stream plus the text padded
+    to ``vlm.max_text_len``, which can be shorter than ``train.seq_len``.
+    """
+
+    @staticmethod
+    def _end_steps(monkeypatch, session) -> list[dict]:
+        calls: list[dict] = []
+        end_step = session.tracker.end_step
+        monkeypatch.setattr(
+            session.tracker, "end_step", lambda **k: (calls.append(k), end_step(**k))[1]
+        )
+        return calls
+
+    @staticmethod
+    def _vlm_session(grad_accum_steps: int = 1, dp_size: int = 1):
+        batch = {
+            "pixel_values": torch.zeros(2, 3, 4, 4),
+            "input_ids": torch.zeros(2, 4, dtype=torch.long),
+            "labels": torch.zeros(2, 4, dtype=torch.long),
+        }
+        model = TinyVlmModel()
+        model.num_image_tokens = 8
+        return make_session(
+            make_config(max_steps=1, seq_len=64, grad_accum_steps=grad_accum_steps),
+            model=model,
+            optimizer=torch.optim.SGD(model.parameters(), lr=0.0),
+            data=DataPipeline(dataloader=[batch], dp_size=dp_size),
+            step_fn=vlm_step,
+        )
+
+    def test_vlm_counts_the_image_and_text_positions(self, monkeypatch):
+        session = self._vlm_session(grad_accum_steps=2, dp_size=3)
+        calls = self._end_steps(monkeypatch, session)
+        _, tokens_seen = run_training_loop(session)
+        assert calls[0]["tokens_in_step"] == 2 * 2 * (8 + 4) * 3
+        assert tokens_seen == 2 * 2 * (8 + 4) * 3
+
+    def test_vlm_hands_the_tracker_the_row_length(self, monkeypatch):
+        session = self._vlm_session()
+        calls = self._end_steps(monkeypatch, session)
+        run_training_loop(session)
+        assert calls[0]["seq_len"] == 8 + 4
+
+    def test_text_counts_the_rows_it_ran(self, monkeypatch):
+        batch = {
+            "input_ids": torch.zeros(2, 3, dtype=torch.long),
+            "labels": torch.zeros(2, 3, dtype=torch.long),
+        }
+        session = make_session(
+            make_config(max_steps=1, seq_len=4),
+            data=DataPipeline(dataloader=[batch], dp_size=2),
+        )
+        calls = self._end_steps(monkeypatch, session)
+        run_training_loop(session)
+        assert calls[0]["tokens_in_step"] == 2 * 3 * 2
+        assert calls[0]["seq_len"] == 3
+
+    def test_a_step_body_without_a_count_falls_back_to_the_config(self, monkeypatch):
+        from kempnerforge.training.loop import StepResult
+
+        config = make_config(max_steps=1, grad_accum_steps=2)
+        session = make_session(
+            config,
+            data=DataPipeline(dp_size=4),
+            step_fn=lambda _s, _i: StepResult(loss=1.0, grad_norm=0.5),
+        )
+        calls = self._end_steps(monkeypatch, session)
+        run_training_loop(session)
+        tc = config.train
+        assert calls[0]["tokens_in_step"] == tc.batch_size * tc.seq_len * 2 * 4
+        assert calls[0]["seq_len"] is None
+
+
 class TestPhaseTemperatureReachesSampler:
     """`config.data.mix_temperature` -> PhaseState.temperature -> update_weights.
 
