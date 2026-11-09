@@ -11,7 +11,7 @@
 #SBATCH --time=7-00:00:00
 #SBATCH --output=logs/%j_%x.out
 #SBATCH --error=logs/%j_%x.err
-#SBATCH --signal=B:SIGTERM@120
+#SBATCH --signal=SIGTERM@120
 #SBATCH --requeue
 
 set -euo pipefail
