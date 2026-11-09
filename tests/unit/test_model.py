@@ -10,6 +10,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 from torch.nn.attention import SDPBackend
+from torch.nn.attention.flex_attention import create_block_mask
 
 from kempnerforge.config.schema import ModelConfig
 from kempnerforge.distributed.pipeline_parallel import PipelineStageModule
@@ -220,6 +221,12 @@ class TestAttention:
                 with pytest.raises(ValueError, match="does not compose with a non-empty kv_cache"):
                     attn(x, cos[4:7], sin[4:7], kv_cache=cache, attn_mask=wrong)
                 assert cache.seq_len == 4
+            if capture:
+                return
+            block = create_block_mask(lambda b, h, q, kv: q >= kv, 1, 1, 3, 3, device="cpu")
+            with pytest.raises(ValueError, match="BlockMask does not compose with kv_cache"):
+                attn(x, cos[4:7], sin[4:7], kv_cache=cache, attn_mask=block)
+            assert cache.seq_len == 4
 
     @pytest.mark.parametrize("capture", [False, True])
     def test_a_layer_on_its_own_appends_tokens_under_a_pinned_kernel(self, capture):

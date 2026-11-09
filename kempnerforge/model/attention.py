@@ -134,12 +134,10 @@ class Attention(nn.Module):
         When sdpa_backend="auto", returns a no-op and lets PyTorch's
         heuristics select the backend. See ``_sdpa_backends`` for ``appended``.
         """
-        if self.sdpa_backend == "auto":
-            return contextlib.nullcontext()
         backends = self._sdpa_backends(appended=appended)
-        if len(backends) == 1:
-            return sdpa_kernel(backends)
-        return sdpa_kernel(backends, set_priority=True)
+        if not backends:
+            return contextlib.nullcontext()
+        return sdpa_kernel(backends, set_priority=len(backends) > 1)
 
     def forward(
         self,
@@ -215,6 +213,11 @@ class Attention(nn.Module):
         k = apply_rope(k, rope_cos, rope_sin)
 
         past = kv_cache.seq_len if kv_cache is not None else 0
+        if isinstance(attn_mask, BlockMask) and kv_cache is not None:
+            raise ValueError(
+                "a BlockMask does not compose with kv_cache decode; a decode step re-derives "
+                "its own mask as the key axis grows"
+            )
         if (
             isinstance(attn_mask, torch.Tensor)
             and past > 0
@@ -236,10 +239,6 @@ class Attention(nn.Module):
             v = v.repeat_interleave(self.n_rep, dim=1)
 
         if isinstance(attn_mask, BlockMask):
-            assert kv_cache is None, (
-                "a BlockMask does not compose with kv_cache decode; a decode step "
-                "re-derives its own mask as the key axis grows."
-            )
             out = flex_attention_fn(q.is_cuda)(
                 q,
                 k,
@@ -297,7 +296,7 @@ class Attention(nn.Module):
         if attn_mask is not None:
             attn = attn.masked_fill(~attn_mask, float("-inf"))
         elif q.shape[2] > 1:
-            visible = torch.ones(attn.shape[-2:], dtype=torch.bool, device=q.device).tril()
+            visible = appended_causal_mask(q.shape[2], 0, q.device)
             attn = attn.masked_fill(~visible, float("-inf"))
 
         attn_weights = F.softmax(attn, dim=-1)
