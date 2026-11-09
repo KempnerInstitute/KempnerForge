@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import multiprocessing
 from collections.abc import Callable
+from typing import Any
 
 from kempnerforge.metrics.logger import get_logger
 
@@ -23,18 +25,36 @@ def check_max_attempts(max_attempts: int) -> int:
 
 
 class SkipLog:
-    """Counts the rows a reader passed over, logging the first."""
+    """Counts the rows a reader passed over, logging the first in each process.
 
-    def __init__(self, what: str = "row") -> None:
+    The count lives in shared memory, so loader workers forked from the process
+    that built the reader add to the count that process reads; a copy sent to
+    another process by pickling starts from the count it carried.
+    """
+
+    def __init__(self, what: str = "row", count: int = 0) -> None:
         self.what = what
-        self.count = 0
+        self._count = multiprocessing.Value("q", count)
+        self._logged = False
+
+    @property
+    def count(self) -> int:
+        return self._count.value
 
     def __call__(self, index: int, error: Exception) -> None:
-        if not self.count:
+        if not self._logged:
             logger.warning(
                 f"skipping {self.what} {index}: {error}; later skips are counted, not logged"
             )
-        self.count += 1
+            self._logged = True
+        with self._count.get_lock():
+            self._count.value += 1
+
+    def __getstate__(self) -> dict[str, Any]:
+        return {"what": self.what, "count": self.count}
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.__init__(state["what"], state["count"])
 
 
 def first_usable[T](

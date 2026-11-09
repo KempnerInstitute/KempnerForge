@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import pickle
+
 import pytest
 from image_text import skip
 from image_text.skip import SkipLog, UnusableRowError, check_max_attempts, first_usable
+from torch.utils.data import DataLoader, Dataset
 
 
 class Unusable(UnusableRowError):
@@ -63,6 +66,35 @@ class TestSkipLog:
         skips(4, Unusable("bad"))
         assert skips.count == 2
         assert len(warnings) == 1 and warnings[0].startswith("skipping document 3: bad")
+
+    def test_the_count_survives_pickling(self) -> None:
+        skips = SkipLog()
+        skips(0, Unusable("bad"))
+        copy = pickle.loads(pickle.dumps(skips))
+        copy(1, Unusable("bad"))
+        assert (skips.count, copy.count) == (1, 2)
+
+    def test_forked_loader_workers_add_to_the_count(self) -> None:
+        rows = _Rows()
+        loader = DataLoader(rows, batch_size=None, num_workers=2, multiprocessing_context="fork")
+        assert sorted(int(x) for x in loader) == [0, 0, 2, 2]
+        assert rows.skips.count == 2
+
+
+class _Rows(Dataset):
+    def __init__(self) -> None:
+        self.skips = SkipLog()
+
+    def __len__(self) -> int:
+        return 4
+
+    def _read(self, i: int) -> int:
+        if i % 2:
+            raise Unusable(i)
+        return i
+
+    def __getitem__(self, i: int) -> int:
+        return first_usable(i, 4, 2, self._read, self.skips)
 
 
 @pytest.mark.parametrize("max_attempts", [0, -1])

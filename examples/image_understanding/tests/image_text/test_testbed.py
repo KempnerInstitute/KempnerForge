@@ -93,7 +93,7 @@ class TestImageTextRows:
     ) -> None:
         write_image("c.png")
         rows = ImageTextRows(
-            tmp_path, ["a", "b", "c.png"], ["Q", "Q", "Q3"], [[], [" \n"], ["", "C"]]
+            tmp_path, ["a", "b", "c.png"], ["Q", "Q", "Q3"], [[], [" \n"], ["", " C\n"]]
         )
         assert len(rows) == 1
         assert (rows[0].turns[0].user, rows[0].turns[0].answers) == ("Q3", ("C",))
