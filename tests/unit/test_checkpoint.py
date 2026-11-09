@@ -3167,6 +3167,124 @@ class TestMuonResume:
         assert groups == {("local", False, "original")}
         self._assert_same_state(opt, opt2, "Muon")
 
+    LEFT_OUT = ("token_embedding.embedding.weight", "output_head.proj.weight")
+
+    def _build_without_the_embeddings(self, seed):
+        """A model whose token embedding and output head do not train, and its Muon."""
+        torch.manual_seed(seed)
+        model = Transformer(self.MODEL_CONFIG).to(self.DEVICE)
+        for name, param in model.named_parameters():
+            param.requires_grad_(name not in self.LEFT_OUT)
+        return model, build_optimizer(model, OptimizerConfig(name="muon", lr=1e-3, fused=False))
+
+    def test_a_checkpoint_without_the_inner_group_of_an_unfrozen_module_resumes(self, tmp_path):
+        """A checkpoint whose inner AdamW kept no group for left-out parameters resumes.
+
+        The save left out the embedding and head, so the checkpoint holds one group fewer.
+        They resume in their group as built, without state, and every other parameter with
+        its saved state.
+        """
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        model, opt = self._build_without_the_embeddings(seed=0)
+        self._train(model, opt, self._batches(2))
+        CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model, opt).save(step=2)
+        assert [len(g["params"]) for g in opt._adam.param_groups] == [5]
+
+        model2, opt2 = self._build(seed=1)
+        built = [
+            {k: v for k, v in g.items() if k not in ("params", "lr")}
+            for g in opt2._adam.param_groups
+        ]
+        CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model2, opt2).load(
+            path=str(tmp_path / "step_2"), fresh_if_unheld=self.LEFT_OUT
+        )
+        self._assert_same_state(opt, opt2, "Muon")
+        self._assert_same_state(opt._adam, opt2._adam, "inner AdamW")
+        assert [len(g["params"]) for g in opt2._adam.param_groups] == [2, 5]
+        kept = {k: v for k, v in opt2._adam.param_groups[0].items() if k not in ("params", "lr")}
+        assert kept == built[0]
+        left_out = dict(model2.named_parameters())
+        assert not any(opt2._adam.state.get(left_out[name]) for name in self.LEFT_OUT)
+
+        before = {name: left_out[name].detach().clone() for name in self.LEFT_OUT}
+        self._train(model2, opt2, self._batches(1))
+        assert [g["lr"] for g in opt2._adam.param_groups] == [1e-3, 1e-3]
+        for name in self.LEFT_OUT:
+            assert opt2._adam.state[left_out[name]]["step"].item() == 1
+            assert not torch.equal(before[name], left_out[name]), f"{name} did not train"
+
+    def test_a_checkpoint_with_fewer_groups_for_other_parameters_names_the_way_out(self, tmp_path):
+        """A group mismatch the left-out names do not explain names the way out.
+
+        The missing group holds parameters the load was not told to resume fresh, so the
+        groups cannot be matched; the error says how to continue from the weights.
+        """
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        model, opt = self._build_without_the_embeddings(seed=0)
+        self._train(model, opt, self._batches(2))
+        CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model, opt).save(step=2)
+
+        model2, opt2 = self._build(seed=1)
+        manager2 = CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model2, opt2)
+        way_out = (
+            r'holds 2 optimizer param groups and the optimizer being loaded has 3.*\["optimizer"\]'
+        )
+        with pytest.raises(RuntimeError, match=way_out):
+            manager2.load(path=str(tmp_path / "step_2"))
+
+    def test_a_checkpoint_that_lists_left_out_names_without_their_state_still_fails(self, tmp_path):
+        """Fewer saved groups do not excuse missing state for names a saved group lists.
+
+        The saved inner groups are merged into one that still lists the embedding and head,
+        whose state is gone, so the save held them and their state went missing.
+        """
+        from torch.distributed.checkpoint.state_dict import (
+            get_model_state_dict,
+            get_optimizer_state_dict,
+        )
+
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        model, opt = self._build(seed=0)
+        self._train(model, opt, self._batches(2))
+        optim_state = get_optimizer_state_dict(model, [opt, opt._adam])
+        muon_group, embeddings, norms = optim_state["param_groups"]
+        optim_state["param_groups"] = [
+            muon_group,
+            {**norms, "params": [*embeddings["params"], *norms["params"]]},
+        ]
+        for name in self.LEFT_OUT:
+            del optim_state["state"][name]
+        step_dir = tmp_path / "step_2"
+        dcp.save(
+            {"model": get_model_state_dict(model), "optimizer": optim_state},
+            checkpoint_id=str(step_dir),
+        )
+        torch.save(build_train_state(step=2, tokens_seen=0), step_dir / "train_state.pt")
+
+        model2, opt2 = self._build(seed=1)
+        manager2 = CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model2, opt2)
+        held = re.escape(f"for 2 parameters the saved optimizer held: {sorted(self.LEFT_OUT)}")
+        with pytest.raises(RuntimeError, match=held):
+            manager2.load(path=str(step_dir), fresh_if_unheld=self.LEFT_OUT)
+
+    def test_a_group_of_the_scheduled_optimizer_is_never_taken(self, tmp_path):
+        """Its LR scheduler restores one rate per saved group, so such a group is refused."""
+        from kempnerforge.checkpoint.manager import _take_groups_the_save_lacks
+
+        outer, inner = object(), object()
+        state = {"param_groups": [{"params": ["a"]}, {"params": ["b"]}]}
+        with pytest.raises(RuntimeError, match="cannot be matched"):
+            _take_groups_the_save_lacks(state, [outer, inner], outer, {"a"}, 1, tmp_path)
+
+        owners = [outer, inner]
+        taken = _take_groups_the_save_lacks(state, owners, outer, {"b"}, 1, tmp_path)
+        assert taken == [(1, {"params": ["b"]})]
+        assert state["param_groups"] == [{"params": ["a"]}]
+        assert owners == [outer]
+
 
 REGISTERED_OPTIMIZERS = sorted(registry.list("optimizer"))
 RESUMABLE_OPTIMIZERS = [

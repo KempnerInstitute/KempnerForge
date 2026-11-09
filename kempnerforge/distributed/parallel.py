@@ -369,8 +369,9 @@ def _apply_fsdp_vlm(
         ``encoder_mp_policy`` when given and the shared policy otherwise.
         An encoder frozen for the whole run stays a full replica, put in eval
         mode at build; replication is fine because requires_grad=False
-        means no grad-reduce participation. One that a freeze stage unfreezes is
-        wrapped from the start.
+        means no grad-reduce participation. One with parameters that a freeze
+        stage unfreezes is wrapped from the start; one without parameters
+        follows the build freeze.
       - The ``VLMWrapper`` itself is not wrapped (no direct parameters).
     """
     if not has_dp_mesh(device_mesh):
@@ -528,7 +529,7 @@ def _build_vlm(
          numerical drift; with ``vision_config.mixed_precision`` set,
          ``_set_encoder_precision`` makes it compute in that dtype.
       7. Freeze specs are applied via ``apply_freeze_specs`` and an encoder
-         frozen for the whole run is switched to ``eval()``.
+         treated as frozen in step 5 is switched to ``eval()``.
     """
     from kempnerforge.distributed.expert_parallel import apply_expert_parallel
     from kempnerforge.distributed.tensor_parallel import apply_tensor_parallel
