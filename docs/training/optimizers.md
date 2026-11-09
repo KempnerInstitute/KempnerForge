@@ -118,15 +118,22 @@ Gotchas:
   `optimizer.train_params()` after, which restores `y` bit for bit. A
   checkpoint's model entry holds `x` as well, so `scripts/eval.py`,
   `scripts/convert_checkpoint.py`, `scripts/generate.py` and a warm start
-  with `checkpoint.exclude_from_loading = ["optimizer"]` all read `x`,
-  and a resume loads `z` and `x` and rebuilds `y` exactly. Wrap any other
-  evaluation in `evaluation_point(optimizer)` from
-  `kempnerforge.training.optimizer`.
+  with `checkpoint.exclude_from_loading = ["optimizer"]` all read `x`.
+  A resume loads `z` and `x` and rebuilds `y` from them: exactly when the
+  parameter dtype is unchanged, and from the cast `z` and `x` in the new
+  dtype when it changed. Wrap any other evaluation in
+  `evaluation_point(optimizer, model)` from
+  `kempnerforge.training.optimizer`. Pass the model: an FSDP2 unit that
+  does not reshard after its forward stays gathered after the eval
+  forward, holding `x`, and `evaluation_point` reshards every unit around
+  the swap so the next training forward gathers `y`.
 - **Per-parameter step counts**: each parameter keeps its own `step` in
   the optimizer state, and its warmup, second-moment bias correction and
-  average all count from its first gradient. A module that a freeze stage
-  unfreezes late, or an expert that gets no tokens at first, starts the
-  way a fresh parameter does. The counts are saved with the rest of the
+  average all count from its first gradient, so a parameter whose `grad`
+  stays `None` for its first steps starts the way a fresh parameter does.
+  A zero gradient still counts as a step: an MoE expert that gets no
+  tokens receives zeros on the grouped-GEMM path and with packed experts,
+  so its count advances anyway. The counts are saved with the rest of the
   optimizer state, so a resume continues them.
 - **Older checkpoints**: a checkpoint written before the step counts were
   saved holds none, so its run cannot continue exactly, and its model

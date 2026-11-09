@@ -57,9 +57,10 @@ What's in each:
 - **optimizer state** — AdamW's `exp_avg`, `exp_avg_sq`,
   `step` counters; Lion's `exp_avg`; Muon's `momentum_buffer`s plus
   its inner AdamW's moments; Schedule-Free AdamW's `z`, `v`, `x`,
-  `weight_sum` and each parameter's `step`. All per-parameter tensors live on the
-  same device and parallelism shape as the parameter, so DCP saves
-  them symmetrically.
+  `weight_sum` and each parameter's `step`. All per-parameter state
+  tensors except the scalar `step` counts (and Schedule-Free's float
+  `weight_sum`) live on the same device and parallelism shape as the
+  parameter, so DCP saves them symmetrically.
 - **never-stepped record** — one entry per parameter the optimizer
   holds without any state, i.e. one that had not yet received a
   gradient. An optimizer creates per-parameter state lazily, so there
@@ -237,8 +238,11 @@ values; the setters then write them back into the live model and
 optimizer. An optimizer with a `train_params()` method, as
 `ScheduleFreeAdamW` has, is then put back at its training point: the
 model entry held the averaged weights `x`, and `train_params()` rebuilds
-`y = (1 - beta1) * z + beta1 * x` from the loaded `z` and `x`, the exact
-point the run was at.
+`y = (1 - beta1) * z + beta1 * x` from the loaded `z` and `x`: exactly
+the point the run was at when the parameter dtype is unchanged, and
+recomputed from the cast `z` and `x` in the new dtype when it changed.
+Excluding `model` does not keep the live weights of such an optimizer:
+restoring `z` and `x` restores `y`.
 
 > **Why the DCP-aware helpers, not `optimizer.state_dict()`?** On
 > resume the optimizer is freshly built, so `optimizer.state_dict()`

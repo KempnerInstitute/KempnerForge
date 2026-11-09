@@ -730,7 +730,7 @@
       },
       "functions": [
         "build_optimizer(model, config) -> Optimizer",
-        "evaluation_point(optimizer) -> context manager (eval_params() inside, train_params() after)",
+        "evaluation_point(optimizer, model=None) -> context manager (eval_params() inside, train_params() after; reshards the model's FSDP2 units around the swap)",
         "_newton_schulz(G, steps) -> Tensor",
         "_muon_matrices(model, *, routers) -> set[Tensor]",
         "_should_decay(name, param, scope) -> bool"
@@ -903,6 +903,7 @@
         "checkpoint_extra(config, step, phases) -> dict"
       ],
       "tested_by": [
+        "tests/unit/test_train_entry.py::TestLoopPeriodicWork",
         "tests/unit/test_train_entry.py::TestRunTrainingLoop",
         "tests/unit/test_train_entry.py::TestBatchStream",
         "tests/unit/test_train_entry.py::TestSelectStepFn",
@@ -1698,11 +1699,11 @@
       "tests/unit/test_additional_optimizers.py": {
         "classes": [
           "TestLion(10)",
-          "TestScheduleFreeAdamW(17)",
+          "TestScheduleFreeAdamW(20)",
           "TestNoneScheduler(3)",
           "TestOptimizerConfig(3)"
         ],
-        "count": 33
+        "count": 36
       },
       "tests/unit/test_scheduler_extensions.py": {
         "classes": [
