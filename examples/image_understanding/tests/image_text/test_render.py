@@ -8,17 +8,8 @@ from typing import Any
 import pytest
 import torch
 from image_text.document import Document, Turn
-from image_text.render import ChatRenderer, RenderedDataset
+from image_text.render import ChatRenderer, RenderedDataset, UnrenderableDocumentError
 from PIL import Image
-
-QWEN = "Qwen/Qwen3-0.6B"
-
-
-@pytest.fixture(scope="module")
-def tokenizer() -> Any:
-    from transformers import AutoTokenizer
-
-    return AutoTokenizer.from_pretrained(QWEN)
 
 
 def _image(size: tuple[int, int] = (12, 9)) -> Image.Image:
@@ -51,13 +42,13 @@ def _trained_text(tokenizer: Any, sample: dict[str, torch.Tensor]) -> str:
 class TestChatRenderer:
     def test_qa_text_is_the_prompt_then_the_answer(self, tokenizer: Any) -> None:
         assert _renderer(tokenizer).text(_qa(), ["a cat"]) == (
-            "<|im_start|>user\n What is shown?<|im_end|>\n"
+            "<|im_start|>user\nWhat is shown?<|im_end|>\n"
             "<|im_start|>assistant\n<think>\n\n</think>\n\na cat<|im_end|>"
         )
 
     def test_conversation_text_is_the_full_chat_template(self, tokenizer: Any) -> None:
         assert _renderer(tokenizer).text(_conversation(), ["A1.", "A2."]) == (
-            "<|im_start|>user\n Q1?<|im_end|>\n<|im_start|>assistant\nA1.<|im_end|>\n"
+            "<|im_start|>user\nQ1?<|im_end|>\n<|im_start|>assistant\nA1.<|im_end|>\n"
             "<|im_start|>user\nQ2?<|im_end|>\n"
             "<|im_start|>assistant\n<think>\n\n</think>\n\nA2.<|im_end|>\n"
         )
@@ -82,10 +73,21 @@ class TestChatRenderer:
         sample = _renderer(tokenizer).render(_conversation(), ["A1.", "A2."])
         assert _trained_text(tokenizer, sample) == "A1.<|im_end|>A2.<|im_end|>"
 
-    def test_a_reply_starting_with_a_newline_is_trained(self, tokenizer: Any) -> None:
-        """The header's newline and the reply's merge into one token, which is trained."""
-        sample = _renderer(tokenizer).render(_conversation(), ["\nA1.", "A2."])
-        assert _trained_text(tokenizer, sample) == "\n\nA1.<|im_end|>A2.<|im_end|>"
+    @pytest.mark.parametrize("answers", [["\nA1.", "A2."], ["A1.", "\n\nA2."]])
+    def test_leading_newlines_of_a_reply_are_dropped(
+        self, tokenizer: Any, answers: list[str]
+    ) -> None:
+        """The template drops them from the last reply, so every reply is treated alike."""
+        sample = _renderer(tokenizer).render(_conversation(), answers)
+        assert _trained_text(tokenizer, sample) == "A1.<|im_end|>A2.<|im_end|>"
+
+    def test_a_reply_the_template_rewrites_is_refused(self, tokenizer: Any) -> None:
+        with pytest.raises(UnrenderableDocumentError, match="did not render"):
+            _renderer(tokenizer).render(_conversation(), ["A1.", "x</think>y"])
+
+    def test_turn_end_must_end_the_template_turns(self, tokenizer: Any) -> None:
+        with pytest.raises(ValueError, match="turn_end"):
+            _renderer(tokenizer, turn_end="<|endoftext|>")
 
     def test_a_user_message_quoting_the_assistant_header_is_not_trained(
         self, tokenizer: Any
@@ -131,7 +133,7 @@ class TestChatRenderer:
     ) -> None:
         """At 16 only the think block fits; the 19-token document keeps its reply from 17."""
         renderer = _renderer(tokenizer, max_text_len=max_text_len)
-        with pytest.raises(ValueError, match="trains no tokens"):
+        with pytest.raises(UnrenderableDocumentError, match="trains no tokens"):
             renderer.render(_qa(), ["a cat"])
         assert _renderer(tokenizer, max_text_len=max_text_len, answer_only=False).render(
             _qa(), ["a cat"]
@@ -143,8 +145,8 @@ class TestChatRenderer:
 
     @pytest.mark.parametrize("kind", ["qa", "conversation"])
     def test_an_empty_reply_is_refused(self, tokenizer: Any, kind: str) -> None:
-        doc, answers = (_qa(), [""]) if kind == "qa" else (_conversation(), ["A1.", ""])
-        with pytest.raises(ValueError, match="empty reply"):
+        doc, answers = (_qa(), ["\n"]) if kind == "qa" else (_conversation(), ["A1.", ""])
+        with pytest.raises(UnrenderableDocumentError, match="empty reply"):
             _renderer(tokenizer).render(doc, answers)
 
     def test_pixel_values_are_square_and_normalized(self, tokenizer: Any) -> None:
@@ -186,6 +188,17 @@ class TestRenderedDataset:
 
     def test_length_follows_the_reader(self, tokenizer: Any) -> None:
         assert len(RenderedDataset([_qa()] * 5, _renderer(tokenizer))) == 5
+
+    def test_a_refused_document_is_passed_over(self, tokenizer: Any) -> None:
+        """A reply the budget cuts away steps to the next document; its index is counted."""
+        docs = [_qa(user=" ".join(["word"] * 40)), _qa()]
+        dataset = RenderedDataset(docs, _renderer(tokenizer, max_text_len=24))
+        assert _trained_text(tokenizer, dataset[0]) == "a cat<|im_end|>"
+        assert dataset.skipped == 1
+        with pytest.raises(RuntimeError, match="1 consecutive"):
+            RenderedDataset(docs[:1], _renderer(tokenizer, max_text_len=24), max_attempts=1)[0]
+        with pytest.raises(IndexError):
+            dataset[2]
 
 
 class TestDocument:

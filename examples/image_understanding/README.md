@@ -50,7 +50,9 @@ samples `VLMCollator` batches.
 - `render.py`: `ChatRenderer` applies the tokenizer's chat template (prompt then
   answer for single-turn rows, the full template for conversations) and trains only
   the assistant replies when `answer_only`. `RenderedDataset` draws one reference
-  answer per turn from a seed and the row index, so a resume draws the same answers.
+  answer per turn from a seed and the row index, so a resume draws the same answers,
+  and passes over a document the renderer refuses (an empty reply, or one the text
+  budget cuts away), up to `max_attempts` in a row; `skipped` counts them.
 - `pixmo.py`: PixMo captions, CapQA, pointing, counting and point-explanations;
   `points.py` writes the point answers.
 
