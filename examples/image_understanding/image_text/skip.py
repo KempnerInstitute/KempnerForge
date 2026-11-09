@@ -43,12 +43,12 @@ def first_usable[T](
     max_attempts: int,
     read: Callable[[int], T],
     on_skip: Callable[[int, Exception], None],
-    next_row: Callable[[int], int] | None = None,
+    next_row: Callable[[int, UnusableRowError], int] | None = None,
 ) -> T:
     """``read(index)``, moving on past rows whose read raises ``UnusableRowError``.
 
-    After a skipped row the next one tried is ``next_row(row)`` (by default the
-    following row), wrapping around at ``length``; after ``max_attempts`` skipped
+    After a skipped row the next one tried is ``next_row(row, error)`` (by default
+    the following row), wrapping around at ``length``; after ``max_attempts`` skipped
     rows in a row it raises ``RuntimeError``. Any other error propagates.
     """
     row = index
@@ -57,5 +57,5 @@ def first_usable[T](
             return read(row)
         except UnusableRowError as exc:
             on_skip(row, exc)
-            row = (next_row(row) if next_row is not None else row + 1) % length
+            row = (next_row(row, exc) if next_row is not None else row + 1) % length
     raise RuntimeError(f"{max_attempts} consecutive rows from index {index} cannot be used")

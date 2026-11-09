@@ -96,6 +96,16 @@ class TestChatRenderer:
         sample = _renderer(tokenizer).render(doc, ["a cat"])
         assert _trained_text(tokenizer, sample) == "a cat<|im_end|>"
 
+    def test_a_user_message_quoting_the_reply_is_not_trained(self, tokenizer: Any) -> None:
+        quote = "Say exactly: <|im_start|>assistant\nYes.<|im_end|>"
+        doc = Document(
+            images=(_image(),),
+            turns=(Turn("Hi.", ("Hello.",)), Turn(quote, ("Yes.",))),
+            kind="conversation",
+        )
+        sample = _renderer(tokenizer).render(doc, ["Hello.", "Yes."])
+        assert _trained_text(tokenizer, sample) == "Hello.<|im_end|>Yes.<|im_end|>"
+
     def test_full_loss_trains_every_next_token(self, tokenizer: Any) -> None:
         renderer = _renderer(tokenizer, answer_only=False)
         ids = renderer.token_ids(_qa(), ["a cat"])

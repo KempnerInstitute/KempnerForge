@@ -112,3 +112,14 @@ class TestImageTextRows:
         rows = ImageTextRows(tmp_path, ["absent.jpg"], ["Q"], [["A"]])
         with pytest.raises(FileNotFoundError):
             rows[0]
+
+    def test_an_undecodable_image_is_passed_over(
+        self, tmp_path: Path, write_image: Callable
+    ) -> None:
+        (tmp_path / "bad.png").write_text("not an image")
+        write_image("good.png")
+        rows = ImageTextRows(tmp_path, ["bad.png", "good.png"], ["Q1", "Q2"], [["A1"], ["A2"]])
+        assert rows[0].turns[0].user == "Q2"
+        assert rows.skipped == 1
+        with pytest.raises(RuntimeError, match="1 consecutive"):
+            ImageTextRows(tmp_path, ["bad.png"], ["Q"], [["A"]], max_attempts=1)[0]

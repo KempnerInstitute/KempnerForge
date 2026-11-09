@@ -61,8 +61,8 @@ def decode_upright(source: str | Path | bytes) -> Decoded:
         with Image.open(io.BytesIO(source) if isinstance(source, bytes) else source) as image:
             orientation = image.getexif().get(EXIF_ORIENTATION, 1)
             stored_size = image.size
-            upright = ImageOps.exif_transpose(image)
-            return Decoded(upright.convert("RGB"), orientation, stored_size)  # type: ignore[union-attr]
+            ImageOps.exif_transpose(image, in_place=True)
+            return Decoded(image.convert("RGB"), orientation, stored_size)
     except DECODE_ERRORS as exc:
         if isinstance(exc, OSError) and exc.errno is not None:
             raise

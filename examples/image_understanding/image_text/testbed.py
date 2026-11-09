@@ -11,10 +11,11 @@ from pathlib import Path
 from typing import Any
 
 import pyarrow as pa
-from PIL import Image
 from torch.utils.data import Dataset
 
+from .decode import decode_rgb
 from .document import Document, Turn
+from .skip import MAX_ATTEMPTS, SkipLog, check_max_attempts, first_usable
 
 
 class ImageTextRows(Dataset):
@@ -22,7 +23,9 @@ class ImageTextRows(Dataset):
 
     The table is shared with forked loader workers without the per-row copies that
     touching Python objects would cause. Blank answers are dropped, and with them
-    any row left without an answer.
+    any row left without an answer. Images are decoded upright; a row whose image
+    does not decode is passed over for the next one, up to ``max_attempts`` in a
+    row, and ``skipped`` counts them. A missing image file is an error.
     """
 
     def __init__(
@@ -31,6 +34,7 @@ class ImageTextRows(Dataset):
         images: list[str],
         users: list[str],
         answers: list[list[str]],
+        max_attempts: int = MAX_ATTEMPTS,
     ) -> None:
         if not len(images) == len(users) == len(answers):
             raise ValueError(
@@ -40,6 +44,8 @@ class ImageTextRows(Dataset):
         usable = [[answer for answer in row if answer.strip()] for row in answers]
         kept = [i for i, row in enumerate(usable) if row]
         self.image_root = Path(image_root)
+        self.max_attempts = check_max_attempts(max_attempts)
+        self._skips = SkipLog()
         self._rows = pa.table(
             {
                 "image": [images[i] for i in kept],
@@ -48,16 +54,22 @@ class ImageTextRows(Dataset):
             }
         )
 
+    @property
+    def skipped(self) -> int:
+        return self._skips.count
+
     def __len__(self) -> int:
         return self._rows.num_rows
+
+    def _read(self, index: int) -> Document:
+        row = self._rows.slice(index, 1).to_pylist()[0]
+        image = decode_rgb(self.image_root / row["image"])
+        return Document(images=(image,), turns=(Turn(row["user"], tuple(row["answers"])),))
 
     def __getitem__(self, index: int) -> Document:
         if not 0 <= index < len(self):
             raise IndexError(f"index {index} is out of range for {len(self)} rows")
-        row = self._rows.slice(index, 1).to_pylist()[0]
-        with Image.open(self.image_root / row["image"]) as image:
-            rgb = image.convert("RGB")
-        return Document(images=(rgb,), turns=(Turn(row["user"], tuple(row["answers"])),))
+        return first_usable(index, len(self), self.max_attempts, self._read, self._skips)
 
 
 def _load_json(path: str | Path) -> Any:

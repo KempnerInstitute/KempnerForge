@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 from image_text.document import Document, Turn
@@ -46,11 +47,19 @@ class TestCaptionsAndConversations:
         assert doc.turns[0].user == "Describe."
         assert doc.turns[0].answers == ("A long caption.",)
 
+    def test_rows_without_a_caption_are_dropped(self, tmp_path: Path) -> None:
+        ann = _write_jsonl(
+            tmp_path / "cap.jsonl",
+            [{"image": "a", "caption": None}, {"image": "b", "caption": " \n"}, {"image": "c"}],
+        )
+        assert len(pixmo_captions(ann, tmp_path, prompt="P")) == 0
+
     def test_cap_qa_takes_the_last_pair_of_each_message(
         self, tmp_path: Path, write_image: Callable
     ) -> None:
         write_image("pixmo_images/bb")
         messages = [["Q1", "A1"], ["Q1", "A1", "Q2", "A2"], ["Q3", ""], "junk", ["only"]]
+        messages.append(["Q1", "A1", "Q4"])
         ann = _write_jsonl(
             tmp_path / "capqa.jsonl", [{"image": "pixmo_images/bb", "messages": messages}]
         )
@@ -123,6 +132,24 @@ class TestCaptionsAndConversations:
         assert explanation_answer("A <|POINT|>.", [[]], ["x"], ["y"]) is None
         assert explanation_answer("Plain.", [], [], []) == "Plain."
 
+    @pytest.mark.parametrize(
+        "fields",
+        [
+            (None, [[[1.0, 1.0]]], ["x"], ["y"]),
+            ("A <|POINT|>.", None, ["x"], ["y"]),
+            ("A <|POINT|>.", [None], ["x"], ["y"]),
+            ("A <|POINT|>.", [[[1.0]]], ["x"], ["y"]),
+            ("A <|POINT|>.", [[[1.0, 2.0, 3.0]]], ["x"], ["y"]),
+            ("A <|POINT|>.", [[["a", 1.0]]], ["x"], ["y"]),
+            ("A <|POINT|>.", [[[1.0, 1.0]]], [None], ["y"]),
+            ("A <|POINT|>.", [[[1.0, 1.0]]], ["x"], None),
+        ],
+    )
+    def test_explanation_turns_with_missing_or_malformed_fields_are_dropped(
+        self, fields: tuple[Any, ...]
+    ) -> None:
+        assert explanation_answer(*fields) is None
+
 
 class TestPointingAndCounting:
     def test_pointing_unrolls_one_example_per_label(
@@ -188,6 +215,23 @@ class TestPointingAndCounting:
             '<points x1="50.0" y1="25.0" x2="100.0" y2="100.0" alt="bird">bird</points>\n'
             "Counting the bird, I count 2.",
         )
+
+    def test_pixel_points_outside_the_grid_pass_the_row_over(
+        self, tmp_path: Path, write_image: Callable
+    ) -> None:
+        write_image("pixmo_images/gg", size=(400, 200))
+        rows = [
+            {"image": "pixmo_images/gg", "label": "bird", "count": 1, "points": pts}
+            for pts in [
+                {"x": [401.0], "y": [10.0]},
+                {"x": [10.0], "y": [-1.0]},
+                {"x": [400.0], "y": [200.0]},
+            ]
+        ]
+        ann = _write_jsonl(tmp_path / "count.jsonl", rows)
+        reader = pixmo_counting(ann, tmp_path, multi_label=False)
+        assert reader[0].turns[0].answers[0].startswith('<point x="100.0" y="100.0"')
+        assert reader.skipped == 2
 
     def test_pixel_points_turn_with_a_rotated_image(self, tmp_path: Path) -> None:
         """PixMo-Count pixels name the stored grid, so they move with the EXIF rotation."""
@@ -275,11 +319,10 @@ class TestPointingAndCounting:
         with pytest.raises(ValueError, match="at least 1"):
             pixmo_pointing(ann, tmp_path, max_points=max_points)
 
-    def test_a_long_counting_answer_trains_its_points_before_the_count(self) -> None:
+    def test_a_long_counting_answer_trains_its_points_before_the_count(
+        self, tokenizer: Any
+    ) -> None:
         """At a small budget the count is cut away; a cap on the points keeps it."""
-        from transformers import AutoTokenizer
-
-        tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
         points = [(float(i), float(i)) for i in range(40)]
         image = Image.new("RGB", (10, 10))
 

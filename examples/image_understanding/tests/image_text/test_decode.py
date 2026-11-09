@@ -1,4 +1,4 @@
-"""Tests for image decoding and reading past unreadable rows."""
+"""Tests for image decoding."""
 
 from __future__ import annotations
 
