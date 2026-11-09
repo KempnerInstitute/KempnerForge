@@ -41,6 +41,7 @@ import itertools
 import logging
 from typing import Any
 
+import numpy as np
 import torch
 from torch.utils.data import Dataset
 
@@ -260,20 +261,21 @@ def _is_missing_image(value: Any) -> bool:
     return value is None or (isinstance(value, list | tuple) and len(value) == 0)
 
 
-def _images_per_row(rows: Any, image_field: str) -> Any:
+def _images_per_row(rows: Any, image_field: str) -> np.ndarray:
     """How many images each row's image field holds, read off the Arrow column without decoding.
 
-    Returns a ``pyarrow`` integer array over the dataset's rows: a list
-    column's lengths (``0`` for an empty or missing list), else ``1`` for a
-    present value and ``0`` for a missing one.
+    Returns an integer array over the dataset's rows: a list column's lengths
+    (``0`` for an empty or missing list), else ``1`` for a present value and
+    ``0`` for a missing one.
     """
     import pyarrow as pa
-    import pyarrow.compute as pc
 
     column = rows.select_columns([image_field]).with_format("arrow")[:].column(image_field)
     if pa.types.is_list(column.type) or pa.types.is_large_list(column.type):
-        return pc.fill_null(pc.list_value_length(column), 0)
-    return pc.cast(pc.is_valid(column), pa.int32())
+        counts = column.combine_chunks().value_lengths().fill_null(0)
+    else:
+        counts = column.is_valid()
+    return counts.to_numpy(zero_copy_only=False).astype(np.int64)
 
 
 def _check_every_row_has_an_image(rows: Any, image_field: str) -> None:
@@ -283,9 +285,7 @@ def _check_every_row_has_an_image(rows: Any, image_field: str) -> None:
         ValueError: Some rows hold no image; the message counts them and names
             the setting that trains them as text-only documents.
     """
-    import pyarrow.compute as pc
-
-    missing = pc.sum(pc.cast(pc.equal(_images_per_row(rows, image_field), 0), "int64")).as_py()
+    missing = int((_images_per_row(rows, image_field) == 0).sum())
     if missing:
         raise ValueError(
             f"{missing:,} of {len(rows):,} rows have no image in field {image_field!r}; set "

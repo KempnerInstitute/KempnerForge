@@ -901,9 +901,9 @@ class TestTextOnlyRows:
         from datasets import Dataset
 
         singles = Dataset.from_dict({"image": [_make_image(8), None, _make_image(8)]})
-        assert vlm_dataset._images_per_row(singles, "image").to_pylist() == [1, 0, 1]
+        assert vlm_dataset._images_per_row(singles, "image").tolist() == [1, 0, 1]
         lists = Dataset.from_dict({"image": [[_make_image(8)] * 2, [], None, [_make_image(8)]]})
-        assert vlm_dataset._images_per_row(lists, "image").to_pylist() == [2, 0, 0, 1]
+        assert vlm_dataset._images_per_row(lists, "image").tolist() == [2, 0, 0, 1]
 
 
 class TestFramesToClipTensor:
