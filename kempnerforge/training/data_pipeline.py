@@ -94,6 +94,16 @@ def _resolve_pad_id(tokenizer_path: str) -> int:
     return int(resolve_pad_id(build_tokenizer(tokenizer_path)))
 
 
+def _row_tokens_per_image(tokens_per_image: int | None, setting: str) -> int:
+    """The built model's tokens per image, which laying out image slots in rows needs."""
+    if tokens_per_image is None:
+        raise ValueError(
+            f"{setting} on a VLM run needs the built model's tokens per image; pass the "
+            "wrapper's packed_tokens_per_image(model) as tokens_per_image"
+        )
+    return tokens_per_image
+
+
 def _build_vlm_pipeline(
     config: JobConfig, dp_rank: int, dp_size: int, tokens_per_image: int | None
 ) -> DataPipeline:
@@ -139,14 +149,8 @@ def _build_vlm_pipeline(
             max_images=config.data.hf_max_images,
         )
         pad_id = _resolve_pad_id(config.data.tokenizer_path)
-        laid_out = config.data.pack_sequences or config.data.hf_max_images != 1
-        if tokens_per_image is None and laid_out:
-            setting = "data.pack_sequences" if config.data.pack_sequences else "data.hf_max_images"
-            raise ValueError(
-                f"{setting} on a VLM run needs the built model's tokens per image; pass the "
-                "wrapper's packed_tokens_per_image(model) as tokens_per_image"
-            )
         if config.data.pack_sequences:
+            tokens_per_image = _row_tokens_per_image(tokens_per_image, "data.pack_sequences")
             collator = PackedVLMCollator(
                 pad_id=pad_id, seq_len=tc.seq_len, tokens_per_image=tokens_per_image
             )
@@ -156,6 +160,7 @@ def _build_vlm_pipeline(
                 f"{tc.seq_len}"
             )
         elif config.data.hf_max_images != 1:
+            tokens_per_image = _row_tokens_per_image(tokens_per_image, "data.hf_max_images")
             collator = MultiImageVLMCollator(
                 pad_id=pad_id, seq_len=tc.seq_len, tokens_per_image=tokens_per_image
             )
