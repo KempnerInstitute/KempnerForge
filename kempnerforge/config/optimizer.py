@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import fnmatch
 import math
-from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 
 WEIGHT_DECAY_SCOPES = ("exclude_norms_and_biases", "all")
@@ -35,25 +33,6 @@ def checked_lr_multipliers(multipliers: object) -> dict[str, float]:
             )
         checked[module] = float(multiplier)
     return checked
-
-
-def overlapping_modules(
-    modules: Iterable[str], module_patterns: Mapping[str, Sequence[str]]
-) -> tuple[str, str, str, str] | None:
-    """Return two of ``modules`` whose patterns overlap, and a pattern of each, or None.
-
-    Two patterns overlap when one, read as a parameter name, matches the other: that is how
-    a module inside another is written (``transformer.layers.*`` in ``transformer.*``). Every
-    module must be a key of ``module_patterns``.
-    """
-    listed = sorted(modules)
-    for i, first in enumerate(listed):
-        for second in listed[i + 1 :]:
-            for a in module_patterns[first]:
-                for b in module_patterns[second]:
-                    if fnmatch.fnmatch(a, b) or fnmatch.fnmatch(b, a):
-                        return first, second, a, b
-    return None
 
 
 @dataclass

@@ -76,10 +76,10 @@ freeze = []
   `min_lr_ratio` times that peak).
 - Under `muon`, a module's AdamW-fallback parameters also take the multiplier, applied to
   `muon_adam_lr`.
-- A parameter may belong to only one listed module. Modules whose patterns overlap, such as
-  `transformer` and `cross_attention`, are refused when the config is built, or else when
-  the optimizer is built and two listed modules match one parameter: list one of them, or
-  add a module to `vlm.module_patterns` that names just the parameters you mean.
+- A parameter may belong to only one listed module. When two listed modules match one
+  parameter, as `transformer` and `cross_attention` do, the optimizer build refuses them:
+  list one of them, or add a module to `vlm.module_patterns` that names just the parameters
+  you mean.
 - Each listed module's rate is logged as `lr/<module>` on the metrics interval, the rate its
   param groups step at next. Under `muon` that is the rate of its orthogonalized matrices,
   and the rate of its AdamW fallback is logged as `lr_adamw/<module>`. `train/lr` stays the

@@ -93,8 +93,7 @@
         }
       },
       "functions": [
-        "checked_lr_multipliers(multipliers) -> dict[str, float]",
-        "overlapping_modules(modules, module_patterns) -> (first, second, pattern, pattern) | None"
+        "checked_lr_multipliers(multipliers) -> dict[str, float]"
       ]
     },
     "kempnerforge/config/scheduler.py": {

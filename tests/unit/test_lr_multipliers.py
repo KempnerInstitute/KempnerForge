@@ -150,35 +150,22 @@ class TestConfig:
                 optimizer=OptimizerConfig(lr_multipliers={"adaptor": 2.0}),
             )
 
-    @pytest.mark.parametrize(
-        ("arch", "inner"),
-        [("cross_attention", "cross_attention"), ("mot", "mot"), ("moma", "moma")],
-    )
-    def test_nested_aliases_are_refused_when_the_config_is_built(
-        self, tiny_vlm_configs, arch, inner
+    @pytest.mark.parametrize("arch", ["cross_attention", "mot", "moma"])
+    def test_the_config_leaves_aliases_that_share_parameters_to_the_build(
+        self, tiny_vlm_configs, arch
     ):
-        """An arch's own alias lies inside ``transformer``, which the config can tell alone."""
+        """Which parameters two modules share depends on the model's parameter names, which
+        only the optimizer build has; the pattern strings alone cannot tell."""
         mc, vision, adapter, _ = tiny_vlm_configs
-        with pytest.raises(ValueError, match=rf"lists '{inner}' and 'transformer', whose"):
-            JobConfig(
-                model=mc,
-                vision_encoder=vision,
-                adapter=adapter,
-                vlm=VLMConfig.for_arch(arch, max_text_len=32),
-                optimizer=OptimizerConfig(lr_multipliers={"transformer": 0.5, inner: 2.0}),
-            )
-
-    def test_two_aliases_with_one_pattern_are_refused(self, tiny_vlm_configs):
-        mc, vision, adapter, vlm = tiny_vlm_configs
-        vlm.module_patterns["connector"] = ["adapter.*"]
-        with pytest.raises(ValueError, match="lists 'adapter' and 'connector', whose"):
-            JobConfig(
-                model=mc,
-                vision_encoder=vision,
-                adapter=adapter,
-                vlm=vlm,
-                optimizer=OptimizerConfig(lr_multipliers={"adapter": 2.0, "connector": 2.0}),
-            )
+        multipliers = {"transformer": 0.5, arch: 2.0}
+        config = JobConfig(
+            model=mc,
+            vision_encoder=vision,
+            adapter=adapter,
+            vlm=VLMConfig.for_arch(arch, max_text_len=32),
+            optimizer=OptimizerConfig(lr_multipliers=multipliers),
+        )
+        assert config.optimizer.lr_multipliers == multipliers
 
     def test_disjoint_aliases_pass(self, tiny_vlm_configs):
         mc, vision, adapter, vlm = tiny_vlm_configs
