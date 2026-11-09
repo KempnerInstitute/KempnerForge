@@ -426,8 +426,11 @@ class StreamingHuggingFaceDataset(torch.utils.data.IterableDataset):
     For very large datasets that don't fit in memory. Streams documents,
     tokenizes on the fly, and packs into fixed-length sequences.
 
-    Handles distributed training by sharding the document stream across ranks
-    (each rank processes every world_size-th document).
+    Handles distributed training by splitting the shuffled stream across
+    data-parallel ranks with ``datasets.distributed.split_dataset_by_node``:
+    when the source's shard count divides by ``world_size`` each rank reads
+    only its own shards, and otherwise each rank keeps every
+    ``world_size``-th document of the shared order.
 
     Use directly with ``torch.utils.data.DataLoader`` (no sampler needed —
     IterableDataset handles its own distribution).
@@ -493,8 +496,13 @@ class StreamingHuggingFaceDataset(torch.utils.data.IterableDataset):
             self._eos_id = self._tokenizer.eos_token_id or 0
 
     def _load_stream(self):
-        """Load a shuffled HuggingFace streaming dataset."""
+        """Load this rank's part of the shuffled HuggingFace stream.
+
+        Every rank shuffles with the same seed before the split, so the ranks
+        divide one shared order between them.
+        """
         from datasets import load_dataset
+        from datasets.distributed import split_dataset_by_node
 
         ds = load_dataset(
             self.dataset_name,
@@ -503,6 +511,8 @@ class StreamingHuggingFaceDataset(torch.utils.data.IterableDataset):
             streaming=True,
         )
         ds = ds.shuffle(seed=self.seed + self._epoch, buffer_size=self.shuffle_buffer_size)  # type: ignore[reportCallIssue]
+        if self.world_size > 1:
+            ds = split_dataset_by_node(ds, rank=self.rank, world_size=self.world_size)
         return ds
 
     def __iter__(self):
@@ -512,30 +522,22 @@ class StreamingHuggingFaceDataset(torch.utils.data.IterableDataset):
 
         stream = self._load_stream()
 
-        doc_idx = 0
         rank_docs = 0
 
         for example in stream:
-            if doc_idx % self.world_size != self.rank:
-                doc_idx += 1
-                continue
-
             if rank_docs < self._skip_rank_docs:
                 rank_docs += 1
-                doc_idx += 1
                 continue
 
             text = example[self.text_field]
             tokens = self._tokenizer.encode(text, add_special_tokens=False)  # type: ignore[reportOptionalMemberAccess]
             if not tokens:
                 rank_docs += 1
-                doc_idx += 1
                 continue
 
             buffer.extend(tokens)
             buffer.append(self._eos_id)  # type: ignore[reportArgumentType]
             rank_docs += 1
-            doc_idx += 1
             self._rank_docs_consumed = rank_docs
 
             while len(buffer) >= chunk_size:
