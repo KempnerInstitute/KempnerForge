@@ -114,7 +114,9 @@ before RoPE. Stabilizes attention logits at scale (Gemma, DeepSeek-V3).
    `Transformer.forward` from the cache fill level and passed to every block
    as `attn_mask`, so each appended token sees every cached key and the
    appended keys up to itself. SDPA's `is_causal=True` aligns its triangle to
-   the top left and would hide the cached keys.
+   the top left and would hide the cached keys. This mask is dense, so a
+   model configured with `attention_backend="flex"` takes the SDPA path for
+   that step, as it does for every cached forward.
 
 A fifth, slower path fires only when `capture_attention_weights=True`:
 `_attention_with_weights` computes `softmax(Q·Kᵀ / √d)` manually so

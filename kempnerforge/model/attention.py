@@ -220,7 +220,7 @@ class Attention(nn.Module):
             )
         if (
             isinstance(attn_mask, torch.Tensor)
-            and past > 0
+            and kv_cache is not None
             and tuple(attn_mask.shape[-2:]) != (seq_len, past + seq_len)
         ):
             raise ValueError(
