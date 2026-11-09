@@ -81,13 +81,11 @@ class TestChatRenderer:
         sample = _renderer(tokenizer).render(_conversation(), answers)
         assert _trained_text(tokenizer, sample) == "A1.<|im_end|>A2.<|im_end|>"
 
-    def test_a_reply_the_template_rewrites_is_refused(self, tokenizer: Any) -> None:
-        with pytest.raises(UnrenderableDocumentError, match="did not render"):
-            _renderer(tokenizer).render(_conversation(), ["A1.", "x</think>y"])
-
     def test_turn_end_must_end_the_template_turns(self, tokenizer: Any) -> None:
         with pytest.raises(ValueError, match="turn_end"):
             _renderer(tokenizer, turn_end="<|endoftext|>")
+        with pytest.raises(ValueError, match="one token"):
+            _renderer(tokenizer, turn_end="<|im_end|>\n")
 
     def test_a_user_message_quoting_the_assistant_header_is_not_trained(
         self, tokenizer: Any
@@ -133,15 +131,16 @@ class TestChatRenderer:
         long_answer = " ".join(["word"] * 40)
         ids = renderer.token_ids(_qa(), [long_answer])
         sample = renderer.render(_qa(), [long_answer])
-        assert sample["input_ids"].tolist() == ids[:24]
-        assert sample["labels"][23] == -100
-        assert (sample["labels"] != -100).sum() > 0
+        end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+        assert sample["input_ids"].tolist() == ids[:23] + [end_id]
+        assert sample["labels"][22] == end_id and sample["labels"][23] == -100
+        assert _trained_text(tokenizer, sample).endswith("word<|im_end|>")
 
     @pytest.mark.parametrize("max_text_len", [12, 16])
     def test_a_reply_cut_away_by_the_budget_is_refused(
         self, tokenizer: Any, max_text_len: int
     ) -> None:
-        """At 16 only the think block fits; the 19-token document keeps its reply from 17."""
+        """At 16 only the think block fits; the 19-token document keeps its reply from 18."""
         renderer = _renderer(tokenizer, max_text_len=max_text_len)
         with pytest.raises(UnrenderableDocumentError, match="trains no tokens"):
             renderer.render(_qa(), ["a cat"])
@@ -150,13 +149,24 @@ class TestChatRenderer:
         )
 
     def test_the_first_reply_token_within_the_budget_is_trained(self, tokenizer: Any) -> None:
-        sample = _renderer(tokenizer, max_text_len=17).render(_qa(), ["a cat"])
-        assert _trained_text(tokenizer, sample) == "a"
+        sample = _renderer(tokenizer, max_text_len=18).render(_qa(), ["a cat"])
+        assert _trained_text(tokenizer, sample) == "a<|im_end|>"
+        with pytest.raises(UnrenderableDocumentError, match="trains no tokens"):
+            _renderer(tokenizer, max_text_len=17).render(_qa(), ["a cat"])
 
     @pytest.mark.parametrize("kind", ["qa", "conversation"])
     def test_an_empty_reply_is_refused(self, tokenizer: Any, kind: str) -> None:
-        doc, answers = (_qa(), ["\n"]) if kind == "qa" else (_conversation(), ["A1.", ""])
+        doc, answers = (_qa(), ["\n"]) if kind == "qa" else (_conversation(), ["A1.", " \t"])
         with pytest.raises(UnrenderableDocumentError, match="empty reply"):
+            _renderer(tokenizer).render(doc, answers)
+
+    @pytest.mark.parametrize("reply", ["x</think>y", "<think>x", "a<|im_end|>b", "<|im_start|>"])
+    @pytest.mark.parametrize("kind", ["qa", "conversation"])
+    def test_a_reply_carrying_template_text_is_refused(
+        self, tokenizer: Any, kind: str, reply: str
+    ) -> None:
+        doc, answers = (_qa(), [reply]) if kind == "qa" else (_conversation(), ["A1.", reply])
+        with pytest.raises(UnrenderableDocumentError, match="template text"):
             _renderer(tokenizer).render(doc, answers)
 
     def test_pixel_values_are_square_and_normalized(self, tokenizer: Any) -> None:
@@ -205,6 +215,11 @@ class TestRenderedDataset:
         dataset = RenderedDataset(docs, _renderer(tokenizer, max_text_len=24))
         assert _trained_text(tokenizer, dataset[0]) == "a cat<|im_end|>"
         assert dataset.skipped == 1
+
+        class Reader(list):
+            skipped = 5
+
+        assert RenderedDataset(Reader(docs), _renderer(tokenizer)).skipped == 5
         with pytest.raises(RuntimeError, match="1 consecutive"):
             RenderedDataset(docs[:1], _renderer(tokenizer, max_text_len=24), max_attempts=1)[0]
         with pytest.raises(IndexError):

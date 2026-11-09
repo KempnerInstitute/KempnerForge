@@ -67,6 +67,14 @@ class TestCaptionsAndConversations:
         assert doc.kind == "conversation"
         assert [(t.user, t.answers) for t in doc.turns] == [("Q1", ("A1",)), ("Q2", ("A2",))]
 
+    def test_a_conversation_stops_at_its_first_bad_turn(self, tmp_path: Path) -> None:
+        messages = [["Q1", "A1"], ["Q1", "A1", "Q2", ""], ["Q1", "A1", "Q2", "", "Q3", "A3"]]
+        ann = _write_jsonl(
+            tmp_path / "capqa.jsonl", [{"image": "pixmo_images/bb", "messages": messages}]
+        )
+        reader = pixmo_cap_qa(ann, tmp_path)
+        assert reader._rows.column("users").to_pylist() == [["Q1"]]
+
     def test_rows_without_turns_are_dropped(self, tmp_path: Path) -> None:
         ann = _write_jsonl(
             tmp_path / "capqa.jsonl",
@@ -107,6 +115,14 @@ class TestCaptionsAndConversations:
             "2 clouds</points> there.",
         )
         assert doc.turns[2].answers == ("Because.",)
+
+    def test_a_scalar_where_a_list_is_expected_is_refused(self, tmp_path: Path) -> None:
+        ann = _write_jsonl(
+            tmp_path / "points.jsonl",
+            [{"image": "pixmo_images/dd", "label": "cat", "points": [{"x": 1, "y": 1}] * 3}],
+        )
+        with pytest.raises(ValueError, match="must be lists"):
+            pixmo_pointing(ann, tmp_path)
 
     def test_explanation_lists_of_different_lengths_are_refused(self, tmp_path: Path) -> None:
         ann = _write_jsonl(

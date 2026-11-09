@@ -54,8 +54,9 @@ samples `VLMCollator` batches.
   the assistant replies when `answer_only`. `RenderedDataset` draws one reference
   answer per turn from a seed and the row index, so a resume draws the same answers,
   and passes over a document the renderer refuses (an empty reply, or one the text
-  budget cuts away), up to `max_attempts` in a row; `skipped` counts them per
-  process, so a loader worker's skips are its own.
+  budget cuts away), up to `max_attempts` in a row; `skipped` counts them with
+  the reader's skips, per rank, and loader workers forked from the training
+  process add to its count.
 - `pixmo.py`: PixMo captions, CapQA, pointing, counting and point-explanations;
   `points.py` writes the point answers.
 - `finevision.py`: FineVision subsets from their memory-mappable Arrow copy.
