@@ -511,7 +511,7 @@ class TestTiledViews:
         wrapper = _video_wrapper(vlm_cfg, frames=vlm_cfg.views_per_image)
         assert wrapper.num_image_tokens == 20
         img = Image.new("RGB", (40, 24), color=(10, 20, 30))
-        views = tile_image(img, 16, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD, grid=2)
+        views = tile_image(img, 16, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD, tile_grid=2)
         ids = torch.randint(0, 256, (8,))
         samples = [{"pixel_values": views, "input_ids": ids, "labels": ids} for _ in range(2)]
         batch = VLMCollator(pad_id=0, max_text_len=8)(samples)
