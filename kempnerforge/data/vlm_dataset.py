@@ -46,6 +46,7 @@ import itertools
 import logging
 from typing import Any
 
+import numpy as np
 import torch
 from torch.utils.data import Dataset
 
@@ -269,23 +270,26 @@ def _images_of(value: Any) -> list[Any]:
     return [value]
 
 
-def _images_per_row(rows: Any, image_field: str) -> Any:
+def _images_per_row(rows: Any, image_field: str) -> np.ndarray:
     """How many images each row's image field holds, read off the Arrow column without decoding.
 
-    Returns a ``pyarrow`` integer array over the dataset's rows: a list
-    column's lengths (``0`` for an empty or missing list), else ``1`` for a
-    present value and ``0`` for a missing one.
+    Returns an integer array over the dataset's rows: a list column's lengths
+    (``0`` for an empty or missing list), else ``1`` for a present value and
+    ``0`` for a missing one.
     """
     import pyarrow as pa
-    import pyarrow.compute as pc
 
     column = rows.select_columns([image_field]).with_format("arrow")[:].column(image_field)
     if pa.types.is_list(column.type) or pa.types.is_large_list(column.type):
-        return pc.fill_null(pc.list_value_length(column), 0)
-    return pc.cast(pc.is_valid(column), pa.int32())
+        counts = column.combine_chunks().value_lengths().fill_null(0)
+    else:
+        counts = column.is_valid()
+    return counts.to_numpy(zero_copy_only=False).astype(np.int64)
 
 
-def _check_image_counts(rows: Any, image_field: str, allow_text_only: bool, max_images: int) -> None:
+def _check_image_counts(
+    rows: Any, image_field: str, allow_text_only: bool, max_images: int
+) -> None:
     """Check every row's image count against the dataset's settings before training.
 
     Raises:
@@ -294,20 +298,14 @@ def _check_image_counts(rows: Any, image_field: str, allow_text_only: bool, max_
             them and names the setting that admits them. Over a cap of two or
             more, rows holding more images are kept and counted in a warning.
     """
-    import pyarrow.compute as pc
-
     counts = _images_per_row(rows, image_field)
-
-    def rows_where(mask: Any) -> int:
-        return pc.sum(pc.cast(mask, "int64")).as_py() or 0
-
-    missing = rows_where(pc.equal(counts, 0))
+    missing = int((counts == 0).sum())
     if missing and not allow_text_only:
         raise ValueError(
             f"{missing:,} of {len(rows):,} rows have no image in field {image_field!r}; set "
             "data.hf_allow_text_only = true to train them as text-only documents"
         )
-    over = rows_where(pc.greater(counts, max_images))
+    over = int((counts > max_images).sum())
     if over and max_images == 1:
         raise ValueError(
             f"{over:,} of {len(rows):,} rows hold several images in field {image_field!r}; set "
