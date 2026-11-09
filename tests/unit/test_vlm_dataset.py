@@ -920,7 +920,7 @@ class TestTextOnlyRows:
         assert ds[0]["pixel_values"].shape == (3, 224, 224)
 
     def test_a_dataset_whose_rows_all_have_images_reports_no_text_only_rows(self, tmp_path):
-        path = _mixed_image_dataset(tmp_path, [_make_image(8), [_make_image(8)]])
+        path = _mixed_image_dataset(tmp_path, [[_make_image(8)], [_make_image(8)]])
         kwargs = dict(
             split="train", image_field="image", text_field="caption", tokenizer_path="gpt2"
         )
@@ -938,12 +938,15 @@ class TestTextOnlyRows:
             HuggingFaceVLMDataset(path, max_text_len=8, allow_text_only=True, **kwargs)
 
     def test_images_per_row_counts_lists_and_single_images(self):
-        from datasets import Dataset
+        from datasets import Dataset, Features, Image, Sequence
 
         singles = Dataset.from_dict({"image": [_make_image(8), None, _make_image(8)]})
         assert vlm_dataset._images_per_row(singles, "image").tolist() == [1, 0, 1]
         one = _make_image(8)
-        lists = Dataset.from_dict({"image": [[one] * 2, [], None, [one], [None], [one, None]]})
+        lists = Dataset.from_dict(
+            {"image": [[one] * 2, [], None, [one], [None], [one, None]]},
+            features=Features({"image": Sequence(Image())}),
+        )
         assert vlm_dataset._images_per_row(lists, "image").tolist() == [2, 0, 0, 1, 0, 1]
 
 
