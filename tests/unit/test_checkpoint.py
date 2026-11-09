@@ -3706,8 +3706,8 @@ class TestWeightDecayScopeOnResume:
         """Run ``manager`` as ``rank`` of two, with what the other rank reports scripted.
 
         ``holding`` and ``failing`` list the other ranks whose DCP index holds optimizer state
-        or could not be read; ``sent`` is what rank 0's scope broadcast delivers to any other
-        rank. Returns the collectives issued, in order.
+        or could not be read; ``sent`` is what rank 0's broadcasts deliver to any other rank.
+        Returns the collectives issued, in order.
         """
         import kempnerforge.checkpoint.manager as mgr_mod
 
@@ -3757,8 +3757,9 @@ class TestWeightDecayScopeOnResume:
 
         Each rank reports through one all-reduce on the manager's gloo group whether its DCP
         index holds optimizer state, so a rank whose own part holds none still refuses a
-        scope mismatch when another rank's part holds some. The scope check broadcasts a
-        ``(scope, error)`` tuple, which tells it apart from the train-state check's broadcast.
+        scope mismatch when another rank's part holds some. Rank 0 broadcasts its read of
+        ``metadata.json`` as a ``(record, error)`` tuple, which tells it apart from the
+        train-state check's broadcast.
         """
         self._save(tmp_path, "adamw", DEFAULT_SCOPE, steps=3 if holds_here else 0)
         _, _, manager = self._resume(tmp_path, "adamw", ALL_SCOPE)
@@ -3767,7 +3768,7 @@ class TestWeightDecayScopeOnResume:
             manager,
             rank,
             holding=[1 - rank] if holds_elsewhere else [],
-            sent=(DEFAULT_SCOPE, None),
+            sent=({"weight_decay_scope": DEFAULT_SCOPE}, None),
         )
         self._stop_at_the_model_load(monkeypatch)
         if holds_here or holds_elsewhere:
@@ -3789,7 +3790,7 @@ class TestWeightDecayScopeOnResume:
         step_dir = self._save(tmp_path, "adamw", DEFAULT_SCOPE)
         (step_dir / ".metadata").unlink()
         _, _, manager = self._resume(tmp_path, "adamw", DEFAULT_SCOPE)
-        calls = self._as_rank(monkeypatch, manager, 1, sent=(DEFAULT_SCOPE, None))
+        calls = self._as_rank(monkeypatch, manager, 1)
         with pytest.raises(FileNotFoundError):
             manager.load(path=str(step_dir))
         assert calls == [("all_reduce", "GLOO_GROUP", [[0, 1], [0, 0]])]
@@ -3820,15 +3821,16 @@ class TestWeightDecayScopeOnResume:
         assert step == 3
 
     def test_rank_zero_broadcasts_what_it_reads(self, tmp_path, monkeypatch):
-        """Once the ranks agree that optimizer state is restored, rank 0 sends the saved scope."""
-        self._save(tmp_path, "adamw", ALL_SCOPE)
+        """Once the ranks agree that optimizer state is restored, rank 0 sends what it read."""
+        step_dir = self._save(tmp_path, "adamw", ALL_SCOPE)
+        meta = json.loads((step_dir / "metadata.json").read_text())
         _, _, manager = self._resume(tmp_path, "adamw", DEFAULT_SCOPE)
         calls = self._as_rank(monkeypatch, manager, 0)
         with pytest.raises(ValueError, match="but this run uses"):
             manager.load()
         assert calls == [
             ("all_reduce", "GLOO_GROUP", [[0, 0], [1, 0]]),
-            ("broadcast", 0, [(ALL_SCOPE, None)]),
+            ("broadcast", 0, [(meta, None)]),
         ]
 
     def test_other_ranks_act_on_what_rank_zero_sends(self, tmp_path, monkeypatch):
@@ -3836,7 +3838,7 @@ class TestWeightDecayScopeOnResume:
         step_dir = self._save(tmp_path, "adamw", DEFAULT_SCOPE)
         (step_dir / "metadata.json").write_text("{not json")
         _, _, manager = self._resume(tmp_path, "adamw", DEFAULT_SCOPE)
-        self._as_rank(monkeypatch, manager, 1, sent=(ALL_SCOPE, None))
+        self._as_rank(monkeypatch, manager, 1, sent=({"weight_decay_scope": ALL_SCOPE}, None))
         with pytest.raises(ValueError, match="weight_decay_scope='all', but this run uses"):
             manager.load()
 
@@ -3851,7 +3853,7 @@ class TestWeightDecayScopeOnResume:
         def fail(_ckpt_dir):
             raise error
 
-        monkeypatch.setattr("kempnerforge.checkpoint.manager._read_weight_decay_scope", fail)
+        monkeypatch.setattr("kempnerforge.checkpoint.manager._read_metadata", fail)
         calls = self._as_rank(monkeypatch, manager, 0)
         with pytest.raises(ValueError, match="Cannot check the weight_decay_scope"):
             manager.load()

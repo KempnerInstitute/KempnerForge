@@ -1204,9 +1204,10 @@
             "flush_pending_save()",
             "peek_saved_step(path)",
             "load(path, scheduler, dataloader, exclude_keys, vlm_freeze_expected)",
-            "_read_saved_keys(ckpt_dir, dcp_dir) (this rank's DCP keys; checks the scope only when an all-reduce on the gloo group finds optimizer state on some rank)",
-            "_check_weight_decay_scope(ckpt_dir) (rank 0 reads the saved scope and broadcasts it; every rank refuses a mismatch)",
-            "_check_lr_multipliers(ckpt_dir) (rank 0 reads the saved lr_multipliers and their module patterns and broadcasts them; every rank refuses a mismatch; load() calls it before loading optimizer state on any rank and before restoring a scheduler from train_state.pt)",
+            "_read_saved_keys(dcp_dir) -> (keys, restored_on_any_rank) (this rank's DCP keys; with a scope or multipliers an all-reduce on the gloo group tells every rank whether any rank's index holds optimizer state)",
+            "_broadcast_metadata(ckpt_dir) -> (meta, error) (rank 0 reads metadata.json once per load and broadcasts the object or why it could not; the scope and multipliers checks both decide from it)",
+            "_check_weight_decay_scope(metadata, ckpt_dir) (every rank refuses a mismatch or an unreadable record)",
+            "_check_lr_multipliers(metadata, ckpt_dir) (every rank refuses other multipliers or patterns or an unreadable record; runs once per load, before loading optimizer state on any rank or before restoring a scheduler from train_state.pt)",
             "apply_dataloader_state(dataloader)",
             "_resolve_load_path(path)",
             "_cleanup()"
@@ -1216,8 +1217,10 @@
       "functions": [
         "_load_train_state(path) -> dict (ownership-gated torch.load with weights_only=False)",
         "_intersect_freeze_meta_by_module(saved, expected) -> (saved_filt, expected_filt) (cross-arch drop-zero-match rule)",
-        "_read_weight_decay_scope(ckpt_dir) -> str (scope recorded in metadata.json; none recorded means exclude_norms_and_biases)",
-        "_read_lr_multipliers(ckpt_dir) -> (multipliers, patterns) (lr_multipliers and lr_module_patterns recorded in metadata.json; none recorded means empty)"
+        "_read_metadata(ckpt_dir) -> dict (the JSON object metadata.json holds; empty when there is none)",
+        "_recorded_weight_decay_scope(meta, metadata_path) -> str (none recorded means exclude_norms_and_biases)",
+        "_recorded_lr_multipliers(meta, metadata_path) -> dict (none recorded means empty)",
+        "_recorded_lr_module_patterns(meta, metadata_path) -> dict (lr_module_patterns; none recorded means empty)"
       ],
       "tested_by": [
         "tests/unit/test_checkpoint.py::TestWeightDecayScopeOnResume",

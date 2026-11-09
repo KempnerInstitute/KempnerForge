@@ -52,6 +52,7 @@ _OPTIM_PREFIX = "optimizer."
 _UNRECORDED_WEIGHT_DECAY_SCOPE = "exclude_norms_and_biases"
 TrackingSource = Callable[[], list[dict[str, str]]]
 CheckpointRecord = Callable[[str, dict[str, str]], None]
+_MetadataOutcome = tuple[dict[str, Any] | None, str | None]
 
 
 class CheckpointRegistrar(Protocol):
@@ -235,26 +236,33 @@ def _dcp_keys(dcp_dir: Path) -> dict[str, Any]:
     return dcp.FileSystemReader(str(dcp_dir)).read_metadata().state_dict_metadata
 
 
-def _read_weight_decay_scope(ckpt_dir: Path) -> str:
-    """Return the weight-decay scope recorded in a checkpoint's ``metadata.json``.
-
-    A checkpoint with no ``metadata.json``, or one without the field, was written under
-    ``"exclude_norms_and_biases"``, the only grouping that existed before the scope was
-    recorded.
+def _read_metadata(ckpt_dir: Path) -> dict[str, Any]:
+    """Return the JSON object a checkpoint's ``metadata.json`` holds, empty when it has none.
 
     Raises:
-        ValueError: ``metadata.json`` exists but is not a readable JSON object, or it
-            records a scope outside ``WEIGHT_DECAY_SCOPES``.
+        ValueError: ``metadata.json`` exists but cannot be read, or does not hold a JSON object.
     """
     metadata_path = ckpt_dir / _METADATA_FILE
     if not metadata_path.exists():
-        return _UNRECORDED_WEIGHT_DECAY_SCOPE
+        return {}
     try:
         meta = json.loads(metadata_path.read_text())
     except (OSError, ValueError) as e:
         raise ValueError(f"cannot read {metadata_path}: {e}") from e
     if not isinstance(meta, dict):
         raise ValueError(f"{metadata_path} does not hold a JSON object")
+    return meta
+
+
+def _recorded_weight_decay_scope(meta: Mapping[str, Any], metadata_path: Path) -> str:
+    """Return the weight-decay scope a checkpoint's metadata ``meta`` records.
+
+    A checkpoint whose metadata lacks the field was written under ``"exclude_norms_and_biases"``,
+    the only grouping that existed before the scope was recorded.
+
+    Raises:
+        ValueError: ``meta`` records a scope outside ``WEIGHT_DECAY_SCOPES``.
+    """
     scope = meta.get("weight_decay_scope", _UNRECORDED_WEIGHT_DECAY_SCOPE)
     if scope not in WEIGHT_DECAY_SCOPES:
         raise ValueError(
@@ -280,31 +288,54 @@ def _canonical_patterns(record: object) -> dict[str, list[str]]:
     return {module: sorted(set(patterns)) for module, patterns in record.items()}
 
 
-def _read_lr_multipliers(ckpt_dir: Path) -> tuple[dict[str, float], dict[str, list[str]]]:
-    """Return the ``lr_multipliers`` and ``lr_module_patterns`` a checkpoint's ``metadata.json``
-    records.
+def _recorded_lr_multipliers(meta: Mapping[str, Any], metadata_path: Path) -> dict[str, float]:
+    """Return the ``lr_multipliers`` a checkpoint's metadata ``meta`` records.
 
-    A checkpoint with no ``metadata.json``, or one without the fields, was saved without any.
+    A checkpoint whose metadata lacks the field was saved without any.
 
     Raises:
-        ValueError: ``metadata.json`` exists but is not a readable JSON object, or a field does
-            not hold a valid record.
+        ValueError: The field does not hold a valid record.
     """
-    metadata_path = ckpt_dir / _METADATA_FILE
-    if not metadata_path.exists():
-        return {}, {}
     try:
-        meta = json.loads(metadata_path.read_text())
-    except (OSError, ValueError) as e:
-        raise ValueError(f"cannot read {metadata_path}: {e}") from e
-    if not isinstance(meta, dict):
-        raise ValueError(f"{metadata_path} does not hold a JSON object")
-    try:
-        multipliers = checked_lr_multipliers(meta.get("lr_multipliers", {}))
-        patterns = _canonical_patterns(meta.get("lr_module_patterns", {}))
+        return checked_lr_multipliers(meta.get("lr_multipliers", {}))
     except ValueError as e:
         raise ValueError(f"{metadata_path} records an invalid LR multipliers record: {e}") from e
-    return multipliers, patterns
+
+
+def _recorded_lr_module_patterns(
+    meta: Mapping[str, Any], metadata_path: Path
+) -> dict[str, list[str]]:
+    """Return the ``lr_module_patterns`` a checkpoint's metadata ``meta`` records.
+
+    They map each module of its ``lr_multipliers`` to its patterns; a checkpoint whose metadata
+    lacks the field recorded none.
+
+    Raises:
+        ValueError: The field does not hold a valid record.
+    """
+    try:
+        return _canonical_patterns(meta.get("lr_module_patterns", {}))
+    except ValueError as e:
+        raise ValueError(f"{metadata_path} records an invalid LR multipliers record: {e}") from e
+
+
+def _lr_record(
+    metadata: _MetadataOutcome, ckpt_dir: Path
+) -> tuple[dict[str, float], dict[str, list[str]]]:
+    """Return the ``lr_multipliers`` and ``lr_module_patterns`` of rank 0's read of a
+    checkpoint's ``metadata.json``.
+
+    Raises:
+        ValueError: Rank 0 could not read ``metadata.json``, or a field is not a valid record.
+    """
+    meta, error = metadata
+    if meta is None:
+        raise ValueError(error)
+    metadata_path = ckpt_dir / _METADATA_FILE
+    return (
+        _recorded_lr_multipliers(meta, metadata_path),
+        _recorded_lr_module_patterns(meta, metadata_path),
+    )
 
 
 def _reset_to_fresh(optimizer: torch.optim.Optimizer) -> None:
@@ -1103,7 +1134,18 @@ class CheckpointManager:
         optimizer_requested = exclude_keys is None or "optimizer" not in exclude_keys
         load_optim = optimizer_requested
 
-        saved_keys = self._read_saved_keys(ckpt_dir, dcp_dir) if load_optim else {}
+        saved_keys, restored_on_any_rank = (
+            self._read_saved_keys(dcp_dir) if load_optim else ({}, False)
+        )
+        metadata: _MetadataOutcome | None = None
+        if restored_on_any_rank and (
+            self._weight_decay_scope is not None or self._lr_multipliers is not None
+        ):
+            metadata = self._broadcast_metadata(ckpt_dir)
+            if self._weight_decay_scope is not None:
+                self._check_weight_decay_scope(metadata, ckpt_dir)
+            if self._lr_multipliers is not None:
+                self._check_lr_multipliers(metadata, ckpt_dir)
         fresh_optimizer = load_optim and not _holds_optimizer(saved_keys)
         if fresh_optimizer:
             load_optim = False
@@ -1190,10 +1232,11 @@ class CheckpointManager:
             assert train_state is not None, "train_state broadcast failed"
             if (
                 self._lr_multipliers is not None
+                and metadata is None
                 and scheduler is not None
                 and "scheduler" in train_state
             ):
-                self._check_lr_multipliers(ckpt_dir)
+                self._check_lr_multipliers(self._broadcast_metadata(ckpt_dir), ckpt_dir)
             if dataloader is None and "dataloader" in train_state:
                 self._pending_dataloader_state = train_state["dataloader"]
             step, tokens_seen, extra = restore_train_state(
@@ -1233,35 +1276,30 @@ class CheckpointManager:
         dist.broadcast_object_list(exists_flag, src=0)
         return bool(exists_flag[0])
 
-    def _read_saved_keys(self, ckpt_dir: Path, dcp_dir: Path) -> dict[str, Any]:
-        """Return the keys this rank's DCP index lists: ``dcp_dir``, its part of ``ckpt_dir``.
+    def _read_saved_keys(self, dcp_dir: Path) -> tuple[dict[str, Any], bool]:
+        """Return the keys this rank's DCP index in ``dcp_dir`` lists, and whether any rank's
+        index holds optimizer state.
 
         With a weight-decay scope or LR multipliers every rank must call this. One all-reduce
         on the manager's gloo group, which every rank enters even when its own read failed,
-        tells every rank whether any rank's index holds optimizer state; under PP each stage
-        has its own index. If one does, every rank checks the scope and the multipliers before
-        this returns; otherwise none does.
+        then tells every rank whether any rank's index holds optimizer state, so every rank
+        gets the same answer; under PP each stage has its own index. Without either, no
+        collective is issued and the answer is this rank's own.
 
         Raises:
-            ValueError: The checkpoint fails the scope check (see ``_check_weight_decay_scope``)
-                or the multipliers check (see ``_check_lr_multipliers``).
             RuntimeError: Another rank could not read its DCP index.
             Exception: Whatever this rank's read of its DCP index raised.
         """
         if self._weight_decay_scope is None and self._lr_multipliers is None:
-            return _dcp_keys(dcp_dir)
+            keys = _dcp_keys(dcp_dir)
+            return keys, _holds_optimizer(keys)
         keys: dict[str, Any] = {}
         error: Exception | None = None
         try:
             keys = _dcp_keys(dcp_dir)
         except Exception as e:
             error = e
-        if self._optimizer_saved_on_any_rank(error, _holds_optimizer(keys)):
-            if self._weight_decay_scope is not None:
-                self._check_weight_decay_scope(ckpt_dir)
-            if self._lr_multipliers is not None:
-                self._check_lr_multipliers(ckpt_dir)
-        return keys
+        return keys, self._optimizer_saved_on_any_rank(error, _holds_optimizer(keys))
 
     def _optimizer_saved_on_any_rank(self, error: Exception | None, holds: bool) -> bool:
         """Return whether any rank's DCP index holds optimizer state, the same on every rank.
@@ -1287,28 +1325,43 @@ class CheckpointManager:
             raise RuntimeError(f"Could not read the DCP index of the checkpoint on ranks {failed}")
         return bool(flags[1].any())
 
-    def _check_weight_decay_scope(self, ckpt_dir: Path) -> None:
-        """Refuse a checkpoint saved under a weight-decay scope other than this manager's.
+    def _broadcast_metadata(self, ckpt_dir: Path) -> _MetadataOutcome:
+        """Return rank 0's read of the checkpoint's ``metadata.json`` on every rank: the JSON
+        object it holds, or why rank 0 could not read one.
 
-        Every rank calls this or none does. Rank 0 reads the checkpoint's scope and broadcasts
-        it, or whatever stopped it reading, so every rank raises or proceeds together and none
-        is left waiting on the broadcast.
-
-        Raises:
-            ValueError: The checkpoint's scope differs from this manager's, or its
-                ``metadata.json`` does not hold a valid scope record.
+        Every rank calls this or none does. Rank 0 alone reads the file and broadcasts the
+        outcome once, so every check of a load decides from the same record on every rank and
+        none is left waiting on the broadcast.
         """
-        outcome: list[tuple[str | None, str | None]] = [(None, None)]
+        outcome: list[_MetadataOutcome] = [(None, None)]
         if self._rank == 0 or not dist.is_initialized():
             try:
-                outcome[0] = (_read_weight_decay_scope(ckpt_dir), None)
+                outcome[0] = (_read_metadata(ckpt_dir), None)
             except ValueError as e:
                 outcome[0] = (None, str(e))
             except Exception as e:
                 outcome[0] = (None, f"{type(e).__name__}: {e}")
         if dist.is_initialized():
             dist.broadcast_object_list(outcome, src=0)
-        saved, error = outcome[0]
+        return outcome[0]
+
+    def _check_weight_decay_scope(self, metadata: _MetadataOutcome, ckpt_dir: Path) -> None:
+        """Refuse a checkpoint saved under a weight-decay scope other than this manager's.
+
+        ``metadata`` is what ``_broadcast_metadata`` returned on every rank, so every rank
+        raises or proceeds together.
+
+        Raises:
+            ValueError: The checkpoint's scope differs from this manager's, or its
+                ``metadata.json`` does not hold a valid scope record.
+        """
+        meta, error = metadata
+        saved: str | None = None
+        if meta is not None:
+            try:
+                saved = _recorded_weight_decay_scope(meta, ckpt_dir / _METADATA_FILE)
+            except ValueError as e:
+                error = str(e)
         if error is not None:
             raise ValueError(f"Cannot check the weight_decay_scope of {ckpt_dir}: {error}")
         if saved != self._weight_decay_scope:
@@ -1323,35 +1376,23 @@ class CheckpointManager:
                 f"a checkpoint there in place of load_path, optimizer state included."
             )
 
-    def _check_lr_multipliers(self, ckpt_dir: Path) -> None:
+    def _check_lr_multipliers(self, metadata: _MetadataOutcome, ckpt_dir: Path) -> None:
         """Refuse a checkpoint saved with LR multipliers, or patterns of their modules, other
         than this manager's.
 
         The multipliers and the patterns decide the optimizer's param groups and their learning
         rates, which the saved optimizer state and the scheduler state in ``train_state.pt``
-        are laid out for. Every rank calls this or none does: rank 0 reads the record and
-        broadcasts it, or whatever stopped it reading, so every rank raises or proceeds
-        together.
+        are laid out for. ``metadata`` is what ``_broadcast_metadata`` returned on every rank,
+        so every rank raises or proceeds together.
 
         Raises:
             ValueError: The checkpoint's multipliers or patterns differ from this manager's, or
                 its ``metadata.json`` does not hold a valid record.
         """
-        outcome: list[tuple[tuple[dict[str, float], dict[str, list[str]]] | None, str | None]]
-        outcome = [(None, None)]
-        if self._rank == 0 or not dist.is_initialized():
-            try:
-                outcome[0] = (_read_lr_multipliers(ckpt_dir), None)
-            except ValueError as e:
-                outcome[0] = (None, str(e))
-            except Exception as e:
-                outcome[0] = (None, f"{type(e).__name__}: {e}")
-        if dist.is_initialized():
-            dist.broadcast_object_list(outcome, src=0)
-        saved, error = outcome[0]
-        if saved is None:
-            raise ValueError(f"Cannot check the lr_multipliers of {ckpt_dir}: {error}")
-        multipliers, patterns = saved
+        try:
+            multipliers, patterns = _lr_record(metadata, ckpt_dir)
+        except ValueError as e:
+            raise ValueError(f"Cannot check the lr_multipliers of {ckpt_dir}: {e}") from e
         if multipliers != self._lr_multipliers:
             change = (
                 f"optimizer.lr_multipliers={multipliers}, but this run uses {self._lr_multipliers}"
