@@ -37,12 +37,11 @@ Key mechanics:
   disables FSDP2's reduce-scatter on all but the last microbatch. One
   collective fires per optimizer step instead of `grad_accum_steps`.
 - **Per-dataset metrics** — if the dataloader is a `MixtureDataset`,
-  every step counts the positions drawn from each source, and on a step
-  that will be logged each source's cross-entropy is summed over its
-  labeled tokens inside the `no_sync` block while logits are still
-  alive, `ce_chunk_size` tokens at a time. Both return on the
-  `StepResult` by source index and are summed over the data-parallel
-  ranks when logged.
+  a step that will be logged counts the positions drawn from each source
+  and sums each source's cross-entropy over its labeled tokens inside
+  the `no_sync` block while logits are still alive, in fp32,
+  `ce_chunk_size` tokens at a time. Both return on the `StepResult` by
+  source index and are summed over the data-parallel ranks when logged.
 - **Loss scaling** — `loss / grad_accum_steps` keeps the effective
   learning rate invariant to the accumulation factor.
 
@@ -172,9 +171,11 @@ hook_runner.on_step_end(StepContext(
 
 `loss` is the mean of the step's loss over the data-parallel ranks, the
 loss whose gradient the update applied, on every rank. `lr` is the LR
-the update used. `tokens_in_step` counts the positions the model ran
-on this rank, `result.tokens`, times the data-parallel size; a VLM step
-counts the image positions in the residual stream as well as the text.
+the update used (for `schedule_free_adamw`, the rate before the warmup
+the optimizer applies inside `step()`). `tokens_in_step` counts the
+positions the model ran on this rank, `result.tokens`, times the
+data-parallel size; a VLM step counts the image positions in the
+residual stream as well as the text.
 
 `StepContext` freezes the full step state for hooks that need to read
 gradients or parameter values before the next iteration. See
@@ -212,9 +213,10 @@ None of this periodic work is inside the step's `step_time`, so `tok/s`
 and MFU leave it out. Each checkpoint save (startup, scheduled,
 emergency or final) logs the time the loop waited for it as
 `checkpoint/save_sec`, and each drain of an async save (the final
-`wait()`, the wait when a shutdown finds its step already saved, a
-freeze stage's flush) logs `checkpoint/wait_sec`. A freeze stage's
-flush runs inside its step, so it is also in that step's `step_time`.
+`wait()` when a save is still pending, the wait when a shutdown finds
+its step already saved, a freeze stage's flush) logs
+`checkpoint/wait_sec`. A freeze stage's flush runs inside its step, so
+it is also in that step's `step_time`.
 
 ## Entry-point setup
 

@@ -33,7 +33,7 @@ millisecond), the rank that wrote it and the log level. The metrics follow:
 |-------|------------|
 | `step` | Optimizer step count. Matches checkpoint filenames. |
 | `loss` | Training cross-entropy for this step, averaged over the data-parallel ranks. |
-| `lr` | Learning rate this step's update used: `0` at step 1, then ramping up for 10 steps before the cosine decay. |
+| `lr` | Learning rate this step's update used: `0` at step 1, then ramping up for 10 steps before the cosine decay. For `schedule_free_adamw`, the optimizer applies its own warmup (`schedule_free_warmup_steps`) inside `step()`, so `lr` shows the rate before that warmup. |
 | `grad_norm` | L2 norm of gradients before clipping (returned by `clip_grad_norm_`). Clipping to `train.grad_clip_norm` (default 1.0) is applied in-place before the optimizer step. |
 | `tok/s` | Tokens the model ran this step, on all GPUs, over `step_time`. |
 | `mfu` | Model FLOPs Utilization — achieved FLOPs / theoretical peak for the GPU. |

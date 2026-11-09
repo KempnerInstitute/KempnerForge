@@ -38,7 +38,9 @@ Step `k` of training runs at the factor of step `k - 1`: the loop calls
 of `0`, step 1 updates nothing (its LR is zero, though Adam's moments
 still take in its gradient), and the peak LR is first applied on step
 `warmup_steps + 1`. `train/lr` and `StepContext.lr` report the LR each
-step applied, so step 1 logs `0`.
+step applied, so step 1 logs `0`. For `schedule_free_adamw`, the
+optimizer applies its own warmup (`schedule_free_warmup_steps`) inside
+`step()`, so `train/lr` shows the rate before that warmup.
 
 So all the fields below describe the **decay** phase, after warmup
 completes.

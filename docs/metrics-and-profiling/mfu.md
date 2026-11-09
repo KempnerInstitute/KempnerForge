@@ -38,8 +38,9 @@ active_params = n_layers * per_layer + output_params
 `mlp_matrices` is `ModelConfig.mlp_matrices`: 3 for `activation = "silu"`,
 which builds SwiGLU (gate, up and down projections), and 2 for `"gelu"` and
 `"relu"`, which build the standard MLP (up and down). An MLP a plugin
-registered under another name is counted as 3. `num_params_estimate`
-counts MLPs the same way.
+registers under another name is counted as gated, 3 matrices, whatever it
+builds, so the estimate is exact for the built-in activations only.
+`num_params_estimate` counts MLPs the same way.
 
 Three things this does and doesn't count:
 

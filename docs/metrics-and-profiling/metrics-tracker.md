@@ -50,10 +50,13 @@ resumed run ids into the config.
 
 The loop hands `end_step` the step's loss averaged over the data-parallel
 ranks, the same value on every rank, and the learning rate the step's
-update used, read before `optimizer.step()`. `tokens_in_step` counts the
-positions the model ran (all micro-steps, padding included, times the
-data-parallel size), and `seq_len` is the length of those rows; a VLM
-row holds the image positions in the residual stream as well as the text.
+update used, read before `optimizer.step()` (for `schedule_free_adamw`,
+the rate before the warmup the optimizer applies inside `step()`; see
+[Schedulers](../training/schedulers.md#shared-warmup)). `tokens_in_step`
+counts the positions the model ran (all micro-steps, padding included,
+times the data-parallel size), and `seq_len` is the length of those rows;
+a VLM row holds the image positions in the residual stream as well as the
+text.
 
 The tracker never resets the CUDA peak counter, so `peak_gb` (logged as
 `gpu/peak_gb` and `mem=`) is the high-water mark of the run, and
@@ -210,9 +213,9 @@ data-parallel ranks as the training loss, so rank 0's backends log values
 for the whole job. `checkpoint/save_sec` is the time each save held the
 loop (for an async save, the wait for the previous upload, the staging and
 the dispatch); `checkpoint/wait_sec` is the time spent draining an async
-save: at the end of the run, when a shutdown finds this step already saved,
-and when a freeze stage flushes. Neither is in `step_time`, except a freeze
-stage's flush, which runs inside its step.
+save: at the end of the run when a save is still pending, when a shutdown
+finds this step already saved, and when a freeze stage flushes. Neither is
+in `step_time`, except a freeze stage's flush, which runs inside its step.
 
 Each call logs with the same `step`, so a single training step can
 produce several side-by-side rows in WandB / TensorBoard.
