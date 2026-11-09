@@ -3055,21 +3055,35 @@ def restore_matmul_precision() -> Iterator[None]:
 
 
 class TestSetupDistributed:
-    def test_builds_the_context_and_validates_against_world_size(self, monkeypatch):
+    def test_validates_against_world_size_then_builds_the_context(self, monkeypatch):
         import kempnerforge.training.runtime as rt
 
-        validated: list = []
+        calls: list = []
         monkeypatch.setattr(rt, "get_world_info", lambda: (3, 1, 8))
-        monkeypatch.setattr(rt, "init_distributed", lambda cfg, seed: "MESH")
+        monkeypatch.setattr(
+            rt, "init_distributed", lambda cfg, seed: calls.append("init") or "MESH"
+        )
         monkeypatch.setattr(rt, "log_job_info", lambda: None)
         config = make_config()
-        monkeypatch.setattr(type(config), "validate", lambda self, ws: validated.append(ws))
+        monkeypatch.setattr(type(config), "validate", lambda self, ws: calls.append(ws))
 
         ctx = rt.setup_distributed(config)
 
         assert (ctx.rank, ctx.local_rank, ctx.world_size) == (3, 1, 8)
         assert ctx.device_mesh == "MESH"
-        assert validated == [8]
+        assert calls == [8, "init"]
+
+    def test_a_config_error_stops_before_the_process_group(self, monkeypatch):
+        import kempnerforge.training.runtime as rt
+
+        inits: list = []
+        monkeypatch.setattr(rt, "get_world_info", lambda: (0, 0, 4))
+        monkeypatch.setattr(rt, "init_distributed", lambda cfg, seed: inits.append(seed))
+        monkeypatch.setattr(rt, "log_job_info", lambda: None)
+
+        with pytest.raises(ValueError, match=r"train\.seq_len \(128\) exceeds model\.max_seq_len"):
+            rt.setup_distributed(make_config(seq_len=128))
+        assert inits == []
 
     def test_seed_is_threaded_into_init(self, monkeypatch):
         import kempnerforge.training.runtime as rt
@@ -3106,6 +3120,23 @@ class TestSetupDistributed:
         torch.set_float32_matmul_precision("medium")
         apply_matmul_precision(TrainConfig())
         assert torch.get_float32_matmul_precision() == "medium"
+
+
+class TestEvalScriptSetup:
+    def test_a_config_error_stops_before_the_process_group(self, monkeypatch):
+        root = Path(__file__).resolve().parents[2]
+        monkeypatch.syspath_prepend(str(root / "scripts"))
+        import eval as eval_script
+
+        inits: list = []
+        monkeypatch.setattr(eval_script, "get_world_info", lambda: (0, 0, 4))
+        monkeypatch.setattr(eval_script, "init_distributed", lambda cfg, seed: inits.append(seed))
+        debug = str(root / "configs" / "train" / "debug.toml")
+        monkeypatch.setattr("sys.argv", ["eval.py", debug, "--train.seq_len=1024"])
+
+        with pytest.raises(ValueError, match=r"train\.seq_len \(1024\) exceeds model\.max_seq_len"):
+            eval_script.main()
+        assert inits == []
 
 
 class TestPpGroup:

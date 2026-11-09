@@ -179,12 +179,18 @@ and removes the older ones, except three kinds it never removes:
 Default `keep_last_n = 3`. Set `keep_last_n = 0`, or any value `<= 0`,
 to keep every checkpoint: cleanup then removes nothing.
 
-A checkpoint it cannot remove is logged as a warning and left for the
-next cleanup to retry; on NFS a file closed a moment earlier can leave
-a `.nfs*` placeholder that makes the removal fail. Any other error
-while pruning is logged the same way: cleanup runs after `latest` has
-moved, so the checkpoint is already committed and the save still
-succeeds on every rank.
+On NFS, a file deleted a moment after it was written can stay behind as
+a `.nfs*` placeholder until the client lets go of it, so removing its
+directory fails for a short while. Cleanup retries such a removal after
+0.05, 0.1, 0.2 and 0.4 s. All the removals of one cleanup share these
+waits, so a cleanup requests at most 0.75 s of retry sleep.
+
+A checkpoint it still cannot remove is logged as a warning and left for
+the next cleanup to retry, so on a server that keeps the placeholder
+longer, old checkpoints can remain, also after the last cleanup of a run.
+Any other error while removing a checkpoint is logged the same way:
+cleanup runs after `latest` has moved, so the checkpoint is already
+committed and the save still succeeds on every rank.
 
 ## Edge cases
 
