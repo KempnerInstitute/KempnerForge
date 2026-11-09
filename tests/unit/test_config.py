@@ -809,6 +809,19 @@ class TestJobConfig:
         with pytest.raises(ValueError, match="requires vlm.arch='joint_decoder'"):
             JobConfig(vlm=VLMConfig.for_arch("cross_attention", max_text_len=64), **kwargs)
 
+    def test_vlm_packing_is_refused_alongside_a_video_section(self):
+        from kempnerforge.config.video import VideoConfig
+
+        with pytest.raises(ValueError, match=r"not supported with \[video\]"):
+            JobConfig(
+                model=ModelConfig(max_seq_len=1024),
+                vision_encoder=VisionEncoderConfig(type="random", num_tokens=16),
+                adapter=AdapterConfig(),
+                vlm=VLMConfig(max_text_len=64),
+                data=DataConfig(pack_sequences=True),
+                video=VideoConfig(max_frames=2, min_frames=1, frame_size=16),
+            )
+
     def test_validate_vlm_pp_rejected(self):
         config = JobConfig(
             model=ModelConfig(max_seq_len=1024),

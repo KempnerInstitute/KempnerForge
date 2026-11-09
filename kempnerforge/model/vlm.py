@@ -41,7 +41,6 @@ from typing import Protocol
 
 import torch
 import torch.nn as nn
-from torch.distributed._composable.fsdp import FSDPModule
 
 from kempnerforge.config.adapter import AdapterConfig
 from kempnerforge.config.registry import registry
@@ -79,22 +78,13 @@ class ModalityStrategy(Protocol):
     def num_image_tokens(self, wrapper: VLMWrapper) -> int: ...
 
 
-def _adapt(wrapper: VLMWrapper, feats: torch.Tensor) -> torch.Tensor:
-    """Run the adapter over encoder features, casting at their boundary."""
+def _encode_and_adapt(wrapper: VLMWrapper, images: torch.Tensor) -> torch.Tensor:
+    """Run the vision encoder and adapter over ``(N, 3, H, W)``, casting at their boundary."""
+    feats = wrapper.vision_encoder(images)
     adapter_dtype = next(wrapper.adapter.parameters()).dtype
     if feats.dtype != adapter_dtype:
         feats = feats.to(adapter_dtype)
     return wrapper.adapter(feats)
-
-
-def _encode_and_adapt(wrapper: VLMWrapper, images: torch.Tensor) -> torch.Tensor:
-    """Run the vision encoder and adapter over ``(N, 3, H, W)``."""
-    return _adapt(wrapper, wrapper.vision_encoder(images))
-
-
-def _is_sharded(module: nn.Module) -> bool:
-    """Whether FSDP2 wraps ``module`` or a submodule, so its forward runs collectives."""
-    return any(isinstance(m, FSDPModule) for m in module.modules())
 
 
 def _check_image_tokens(k: int, image_tokens: int | None) -> None:
@@ -111,26 +101,16 @@ def _text_only_context(
     input_ids: torch.Tensor,
     image_tokens: int | None,
 ) -> ModalityContext:
-    """The inline context of a batch with no images, keeping sharded modules in step.
+    """The inline context of a batch with no images, keeping every rank's collectives in step.
 
-    FSDP2's all-gathers and reduce-scatters are collectives over every rank,
-    so a sharded encoder or adapter runs here on one blank image and writes
+    FSDP2's all-gathers and reduce-scatters run on every rank, so the encoder
+    and adapter see one blank image here whatever their wrapping, and write
     nothing: the result enters the graph as an empty ``(0, dim)`` inline
-    embedding with zero weight. A frozen, replicated encoder is skipped and
-    the adapter sees zero features; with nothing sharded the batch is plain
-    packed text.
+    embedding with zero weight, so their parameters get zero gradients rather
+    than none.
     """
-    encoder = wrapper.vision_encoder
-    encoder_sharded = _is_sharded(encoder)
-    if not encoder_sharded and not _is_sharded(wrapper.adapter):
-        _check_image_tokens(wrapper.adapter.output_num_tokens(encoder.num_tokens), image_tokens)
-        return ModalityContext()
     blank = pixel_values.new_zeros((1, *pixel_values.shape[1:]))
-    if encoder_sharded:
-        feats = encoder(blank)
-    else:
-        feats = blank.new_zeros((1, encoder.num_tokens, encoder.feature_dim))
-    embeds = _adapt(wrapper, feats)
+    embeds = _encode_and_adapt(wrapper, blank)
     _check_image_tokens(embeds.shape[1], image_tokens)
     anchor = (embeds.sum() * 0).expand(0, embeds.shape[-1])
     empty = torch.zeros(0, dtype=torch.long, device=input_ids.device)
@@ -171,8 +151,6 @@ def _inline_image_context(
     offsets = torch.arange(k, device=input_ids.device)
     positions = (image_starts.to(input_ids.device).unsqueeze(1) + offsets).reshape(-1)
     rows = image_rows.to(input_ids.device).repeat_interleave(k)
-    if positions.numel() and int(positions.max()) >= input_ids.shape[1]:
-        raise ValueError(f"an image's {k} tokens run past the row length ({input_ids.shape[1]})")
     return ModalityContext(
         inline_embeds=embeds.reshape(n * k, dim),
         inline_rows=rows,
@@ -379,7 +357,7 @@ class MoTStrategy:
         image_starts: torch.Tensor | None = None,  # noqa: ARG002
         image_tokens: int | None = None,  # noqa: ARG002
     ) -> ModalityContext:
-        _reject_packed(type(self).__name__.removesuffix("Strategy").lower(), image_rows)
+        _reject_packed("mot", image_rows)
         img_embeds = _project_visual_features(wrapper, pixel_values)
         n = img_embeds.shape[1]
         b, t_text = input_ids.shape
@@ -430,7 +408,7 @@ class MoMaStrategy:
         image_starts: torch.Tensor | None = None,  # noqa: ARG002
         image_tokens: int | None = None,  # noqa: ARG002
     ) -> ModalityContext:
-        _reject_packed(type(self).__name__.removesuffix("Strategy").lower(), image_rows)
+        _reject_packed("moma", image_rows)
         img_embeds = _project_visual_features(wrapper, pixel_values)
         n = img_embeds.shape[1]
         b, t_text = input_ids.shape
@@ -468,10 +446,10 @@ class VLMWrapper(nn.Module):
     context. ``num_image_tokens`` is arch-aware and delegates to the
     strategy.
 
-    A packed batch (``pack_vlm_samples``) passes ``doc_ids`` plus the image
-    placement ``image_rows``, ``image_starts`` and ``image_tokens``; the
-    strategy then places each image inside its row and the logits cover the
-    whole row.
+    A packed batch (``pack_vlm_samples``) passes ``doc_ids``, per-document
+    ``position_ids`` and the image placement ``image_rows``, ``image_starts``
+    and ``image_tokens``; the strategy then places each image inside its row
+    and the logits cover the whole row.
     """
 
     def __init__(
@@ -501,6 +479,7 @@ class VLMWrapper(nn.Module):
         frame_mask: torch.Tensor | None = None,
         *,
         doc_ids: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
         image_rows: torch.Tensor | None = None,
         image_starts: torch.Tensor | None = None,
         image_tokens: int | None = None,
@@ -518,7 +497,9 @@ class VLMWrapper(nn.Module):
             image_starts=image_starts,
             image_tokens=image_tokens,
         )
-        logits = self.transformer(tokens=input_ids, modality=modality, doc_ids=doc_ids)
+        logits = self.transformer(
+            tokens=input_ids, modality=modality, doc_ids=doc_ids, position_ids=position_ids
+        )
         return logits, labels
 
 
@@ -535,6 +516,15 @@ def inner_transformer(model: nn.Module) -> nn.Module:
     if hasattr(model, "_orig_mod"):
         model = model._orig_mod  # type: ignore[attr-defined]
     return model.transformer if isinstance(model, VLMWrapper) else model
+
+
+def packed_tokens_per_image(model: nn.Module) -> int:
+    """Tokens one image (or view) occupies in a packed row, read off the built ``VLMWrapper``."""
+    if hasattr(model, "_orig_mod"):
+        model = model._orig_mod  # type: ignore[attr-defined]
+    if not isinstance(model, VLMWrapper):
+        raise TypeError(f"packed_tokens_per_image needs a VLMWrapper, got {type(model).__name__}")
+    return model.num_image_tokens // model.frames_per_clip
 
 
 def _is_encoder_frozen(specs: Iterable[FreezeSpec]) -> bool:

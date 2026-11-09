@@ -94,24 +94,9 @@ def _resolve_pad_id(tokenizer_path: str) -> int:
     return int(resolve_pad_id(build_tokenizer(tokenizer_path)))
 
 
-def _packed_tokens_per_image(config: JobConfig) -> int:
-    """Tokens one image occupies in a packed row: the adapter's output for the encoder's count.
-
-    Raises:
-        ValueError: ``vision_encoder.num_tokens`` is unset, so the count is only
-            known once the encoder is built, after the data pipeline.
-    """
-    assert config.vision_encoder is not None and config.adapter is not None
-    if config.vision_encoder.num_tokens <= 0:
-        raise ValueError(
-            "data.pack_sequences on a VLM run needs the per-image token count when the "
-            "data pipeline is built; set vision_encoder.num_tokens to the encoder's token "
-            "count (the model build logs it)"
-        )
-    return config.adapter.output_num_tokens(config.vision_encoder.num_tokens)
-
-
-def _build_vlm_pipeline(config: JobConfig, dp_rank: int, dp_size: int) -> DataPipeline:
+def _build_vlm_pipeline(
+    config: JobConfig, dp_rank: int, dp_size: int, tokens_per_image: int | None
+) -> DataPipeline:
     """Image (Joint-Decoder) or video VLM loader, selected by ``config.is_video``."""
     tc = config.train
     vlm_cfg = config.vlm
@@ -153,7 +138,11 @@ def _build_vlm_pipeline(config: JobConfig, dp_rank: int, dp_size: int) -> DataPi
         )
         pad_id = _resolve_pad_id(config.data.tokenizer_path)
         if config.data.pack_sequences:
-            tokens_per_image = _packed_tokens_per_image(config)
+            if tokens_per_image is None:
+                raise ValueError(
+                    "data.pack_sequences on a VLM run needs the built model's tokens per image; "
+                    "pass the wrapper's packed_tokens_per_image(model) as tokens_per_image"
+                )
             collator = PackedVLMCollator(
                 pad_id=pad_id, seq_len=tc.seq_len, tokens_per_image=tokens_per_image
             )
@@ -348,17 +337,21 @@ def _build_hf_pipeline(config: JobConfig, dp_rank: int, dp_size: int) -> DataPip
     return DataPipeline(dataloader=dataloader, dp_rank=dp_rank, dp_size=dp_size)
 
 
-def build_data_pipeline(config: JobConfig, runtime: RuntimeContext) -> DataPipeline:
+def build_data_pipeline(
+    config: JobConfig, runtime: RuntimeContext, *, tokens_per_image: int | None = None
+) -> DataPipeline:
     """Build the training data pipeline for whichever ``[data]`` source is set.
 
     Returns an empty pipeline when no source is configured — the text and PP
-    step bodies then run on random tokens.
+    step bodies then run on random tokens. ``tokens_per_image`` is the slots one
+    image takes in a packed VLM row, read off the built wrapper
+    (``packed_tokens_per_image``).
     """
     eos_token_id = _resolve_eos_token_id(config)
     dp_rank, dp_size = get_dp_info(runtime.device_mesh)
 
     if config.is_vlm:
-        return _build_vlm_pipeline(config, dp_rank, dp_size)
+        return _build_vlm_pipeline(config, dp_rank, dp_size, tokens_per_image)
     if config.data.datasets:
         return _build_mixture_pipeline(config, dp_rank, dp_size, eos_token_id)
     if config.data.dataset_path:

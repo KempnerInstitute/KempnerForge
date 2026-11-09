@@ -1762,6 +1762,49 @@ class TestDpSizeReachesTokenAccounting:
         per_step = config.train.batch_size * config.train.seq_len * config.train.grad_accum_steps
         assert tokens_seen == 2 * per_step * 8
 
+    def test_packed_counts_do_not_count_tensor_parallel_replicas(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import kempnerforge.training.loop as loop
+
+        session = make_session(
+            make_config(),
+            data=DataPipeline(dp_size=2),
+            runtime=dataclasses.replace(_runtime(), world_size=8),
+        )
+        reductions: list[Any] = []
+
+        def reduce_counts(count: torch.Tensor, op: Any) -> None:
+            assert count.item() == 7
+            reductions.append(op)
+            count.fill_(4 * (7 + 11))
+
+        monkeypatch.setattr(loop.dist, "is_initialized", lambda: True)
+        monkeypatch.setattr(loop.dist, "all_reduce", reduce_counts)
+        result = loop.StepResult(loss=1.0, grad_norm=0.5, tokens=7)
+        assert loop._tokens_in_step(session, result) == 18
+        assert reductions == [loop.dist.ReduceOp.SUM]
+
+    def test_packed_counts_reach_tokens_seen_without_another_accumulation_factor(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import kempnerforge.training.loop as loop
+
+        monkeypatch.setattr(loop.dist, "is_initialized", lambda: False)
+        counts = iter((17, 23))
+
+        def step_fn(_session: TrainingSession, _step: int) -> loop.StepResult:
+            return loop.StepResult(loss=1.0, grad_norm=0.5, tokens=next(counts))
+
+        session = make_session(
+            make_config(max_steps=2, grad_accum_steps=3),
+            data=DataPipeline(dp_size=4),
+            step_fn=step_fn,
+        )
+        step, tokens_seen = run_training_loop(session)
+        assert (step, tokens_seen) == (2, (17 + 23) * 4)
+        assert session.checkpointer.saves[-1][1] == tokens_seen
+
     def test_default_dp_size_is_one_not_zero(self):
         assert DataPipeline().dp_size == 1
 
@@ -2379,6 +2422,26 @@ class TestVlmSourceBuilders:
         assert seen["image_collator"]["pad_id"] == 7
         assert "video_collator" not in seen
 
+    def test_packed_image_path_takes_the_model_token_count(self, monkeypatch):
+        import kempnerforge.data.vlm_dataset as vlmd
+
+        seen: dict = {}
+        dp = _stub_loaders(monkeypatch, seen)
+        self._stub_vlm_modules(monkeypatch, seen)
+        monkeypatch.setattr(vlmd, "PackedVLMCollator", lambda **k: seen.setdefault("packed", k))
+        config = self._vlm_data_config()
+        config.data.pack_sequences = True
+        data = dp.build_data_pipeline(config, _runtime(), tokens_per_image=12)
+        assert data.dataloader == "stateful_OBJ"
+        assert seen["packed"] == {
+            "pad_id": 7,
+            "seq_len": config.train.seq_len,
+            "tokens_per_image": 12,
+        }
+        assert "image_collator" not in seen
+        with pytest.raises(ValueError, match="built model's tokens per image"):
+            dp.build_data_pipeline(config, _runtime())
+
     def test_video_path_uses_the_video_collator(self, monkeypatch):
         seen: dict = {}
         dp = _stub_loaders(monkeypatch, seen)
@@ -2651,13 +2714,45 @@ class TestVlmStep:
         batch["doc_ids"] = torch.zeros(2, 4, dtype=torch.long)
         batch["image_rows"] = torch.tensor([0, 1])
         batch["image_starts"] = torch.tensor([0, 0])
+        batch["position_ids"] = torch.zeros(2, 4, dtype=torch.long)
         batch["image_tokens"] = torch.tensor(2)
         session, model = self._session([batch])
         session.step_fn(session, 0)
         packed = model.seen_packed[0]
-        assert set(packed) == {"doc_ids", "image_rows", "image_starts", "image_tokens"}
+        assert set(packed) == {
+            "doc_ids",
+            "position_ids",
+            "image_rows",
+            "image_starts",
+            "image_tokens",
+        }
         assert packed["image_tokens"] == 2
         assert packed["doc_ids"].shape == (2, 4)
+
+    def test_reports_tokens_only_for_packed_batches(self):
+        session, _ = self._session([self._batch()])
+        assert session.step_fn(session, 0).tokens is None
+        batch = self._batch()
+        batch["doc_ids"] = torch.zeros(2, 4, dtype=torch.long)
+        session, _ = self._session([batch])
+        assert session.step_fn(session, 0).tokens == 8
+
+    def test_packed_rows_are_marked_dynamic_for_compile(self, monkeypatch):
+        import torch._dynamo
+
+        marked: list = []
+        monkeypatch.setattr(torch._dynamo, "maybe_mark_dynamic", lambda t, d: marked.append(d))
+        batch = self._batch()
+        batch["doc_ids"] = torch.zeros(2, 4, dtype=torch.long)
+        batch["image_rows"] = torch.tensor([0, 1])
+        batch["image_starts"] = torch.tensor([0, 0])
+        batch["image_tokens"] = torch.tensor(2)
+        session, _ = self._session([batch])
+        session.step_fn(session, 0)
+        assert marked == []
+        session.config.train.compile_model = True
+        session.step_fn(session, 0)
+        assert marked == [0] * 6
 
     def test_unpacked_batches_pass_no_packed_keys(self):
         session, model = self._session([self._batch()])

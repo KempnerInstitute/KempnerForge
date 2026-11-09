@@ -25,7 +25,6 @@ from kempnerforge.config.vlm import (
     VLMConfig,
 )
 from kempnerforge.data.vlm_dataset import VLMCollator, pack_vlm_samples
-from kempnerforge.model import vlm as vlm_module
 from kempnerforge.model.modality import ModalityContext
 from kempnerforge.model.transformer import Transformer
 from kempnerforge.model.vlm import (
@@ -37,6 +36,7 @@ from kempnerforge.model.vlm import (
     build_modality_strategy,
     build_vlm_wrapper,
     inner_transformer,
+    packed_tokens_per_image,
 )
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -349,6 +349,7 @@ class TestPackedForward:
             batch["input_ids"],
             batch["labels"],
             doc_ids=batch["doc_ids"],
+            position_ids=batch["position_ids"],
             image_rows=batch["image_rows"],
             image_starts=batch["image_starts"],
             image_tokens=int(batch["image_tokens"]),
@@ -365,14 +366,22 @@ class TestPackedForward:
         assert torch.isfinite(logits).all()
 
     def test_a_packed_document_matches_the_prefix_path(self):
-        """One document per row gives the text the same logits as the prefix route."""
+        """A document's text gets the prefix route's logits wherever first-fit placed it."""
         wrapper = _build_tiny_wrapper(num_image_tokens=8).eval()
         doc = _packed_doc(12, 4)
-        batch = pack_vlm_samples([doc], seq_len=32, tokens_per_image=8, pad_id=0)
         with torch.no_grad():
-            packed, _ = self._forward(wrapper, batch)
             prefix, _ = wrapper(doc["pixel_values"].unsqueeze(0), doc["input_ids"].unsqueeze(0))
-        assert torch.allclose(packed[0, 8:20], prefix[0], atol=1e-5)
+            alone, _ = self._forward(
+                wrapper, pack_vlm_samples([doc], seq_len=32, tokens_per_image=8, pad_id=0)
+            )
+            after_another, _ = self._forward(
+                wrapper,
+                pack_vlm_samples(
+                    [_packed_doc(6, 5), doc], seq_len=48, tokens_per_image=8, pad_id=0
+                ),
+            )
+        assert torch.allclose(alone[0, 8:20], prefix[0], atol=1e-5)
+        assert torch.allclose(after_another[0, 22:34], prefix[0], atol=1e-5)
 
     def test_documents_do_not_see_each_other(self):
         """Changing the first document leaves the second document's logits unchanged."""
@@ -411,43 +420,22 @@ class TestPackedForward:
             [_packed_doc(10, 3, images=0)], seq_len=32, tokens_per_image=tokens_per_image, pad_id=0
         )
 
-    def test_a_text_only_batch_keeps_sharded_modules_in_the_graph(self, monkeypatch):
-        """Their parameters get (zero) gradients, so FSDP2's collectives run on every rank."""
-        monkeypatch.setattr(vlm_module, "_is_sharded", lambda module: True)
+    def test_a_text_only_batch_runs_a_blank_image_through_the_encoder_and_adapter(self):
+        """Their parameters get zero gradients, so FSDP2's collectives run on every rank."""
         wrapper = _build_tiny_wrapper(num_image_tokens=8)
         logits, _ = self._forward(wrapper, self._text_only_batch())
         logits.sum().backward()
-        adapter_grads = [p.grad for p in wrapper.adapter.parameters()]
-        assert all(g is not None for g in adapter_grads)
-        assert all(torch.count_nonzero(g) == 0 for g in adapter_grads)
+        visual = [
+            p
+            for module in (wrapper.vision_encoder, wrapper.adapter)
+            for p in module.parameters()
+            if p.requires_grad
+        ]
+        assert visual
+        assert all(p.grad is not None and torch.count_nonzero(p.grad) == 0 for p in visual)
         assert all(p.grad is not None for p in wrapper.transformer.token_embedding.parameters())
 
-    def test_a_replicated_encoder_is_skipped_and_a_sharded_adapter_still_runs(self, monkeypatch):
-        wrapper = _build_tiny_wrapper(num_image_tokens=8)
-        monkeypatch.setattr(vlm_module, "_is_sharded", lambda module: module is wrapper.adapter)
-        calls: list[int] = []
-        encoder_forward = wrapper.vision_encoder.forward
-        monkeypatch.setattr(
-            wrapper.vision_encoder,
-            "forward",
-            lambda *a, **k: calls.append(1) or encoder_forward(*a, **k),
-        )
-        logits, _ = self._forward(wrapper, self._text_only_batch())
-        logits.sum().backward()
-        assert calls == []
-        assert all(p.grad is not None for p in wrapper.adapter.parameters())
-
-    def test_with_nothing_sharded_a_text_only_batch_skips_the_encoder_and_adapter(self):
-        wrapper = _build_tiny_wrapper(num_image_tokens=8)
-        logits, _ = self._forward(wrapper, self._text_only_batch())
-        logits.sum().backward()
-        assert all(p.grad is None for p in wrapper.adapter.parameters())
-        assert all(p.grad is None for p in wrapper.vision_encoder.parameters())
-        assert all(p.grad is not None for p in wrapper.transformer.token_embedding.parameters())
-
-    @pytest.mark.parametrize("sharded", [False, True])
-    def test_a_text_only_batch_still_checks_the_image_token_count(self, monkeypatch, sharded):
-        monkeypatch.setattr(vlm_module, "_is_sharded", lambda module: sharded)
+    def test_a_text_only_batch_still_checks_the_image_token_count(self):
         wrapper = _build_tiny_wrapper(num_image_tokens=8)
         with pytest.raises(ValueError, match="emits 8 tokens per image but .* image_tokens=4"):
             self._forward(wrapper, self._text_only_batch(tokens_per_image=4))
@@ -493,6 +481,25 @@ class TestPackedForward:
                 image_starts=batch["image_starts"],
             )
 
+    def test_packed_pixels_require_a_flat_image_batch(self) -> None:
+        wrapper = _build_tiny_wrapper(num_image_tokens=8)
+        batch = pack_vlm_samples([_packed_doc(10, 9)], seq_len=32, tokens_per_image=8, pad_id=0)
+        batch["pixel_values"] = batch["pixel_values"].unsqueeze(0)
+        with pytest.raises(ValueError, match=r"pixel_values must be \(N, 3, H, W\)"):
+            self._forward(wrapper, batch)
+
+    @pytest.mark.parametrize("mismatch", ["starts_length", "placement_rank"])
+    def test_packed_placement_matches_the_image_batch(self, mismatch: str) -> None:
+        wrapper = _build_tiny_wrapper(num_image_tokens=8)
+        batch = pack_vlm_samples([_packed_doc(10, 9)], seq_len=32, tokens_per_image=8, pad_id=0)
+        if mismatch == "starts_length":
+            batch["image_starts"] = torch.zeros(2, dtype=torch.long)
+        else:
+            batch["image_rows"] = batch["image_rows"].unsqueeze(0)
+            batch["image_starts"] = batch["image_starts"].unsqueeze(0)
+        with pytest.raises(ValueError, match=r"image_rows and image_starts must be \(1,\)"):
+            self._forward(wrapper, batch)
+
     @pytest.mark.parametrize("arch", ["cross_attention", "mot", "moma"])
     def test_other_arches_reject_packed_batches(self, arch):
         strategy = build_modality_strategy(VLMConfig.for_arch(arch))
@@ -530,6 +537,17 @@ class TestTextOnlyPrefixRows:
         assert torch.equal(blank, noisy)
         assert not torch.equal(blank, seen)
         assert torch.isfinite(blank).all()
+
+
+class TestPackedTokensPerImage:
+    def test_reads_the_adapter_output_off_the_wrapper(self):
+        wrapper = _build_tiny_wrapper(num_image_tokens=8)
+        assert packed_tokens_per_image(wrapper) == 8
+        assert packed_tokens_per_image(torch.compile(wrapper)) == 8
+
+    def test_rejects_a_bare_module(self):
+        with pytest.raises(TypeError, match="needs a VLMWrapper"):
+            packed_tokens_per_image(torch.nn.Linear(2, 2))
 
 
 class TestVLMWrapperDispatch:

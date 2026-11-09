@@ -26,9 +26,10 @@ multi-image extension and is unused by the Joint-Decoder wrapper today.
 ``PackedVLMCollator`` packs several documents into each row instead
 (``pack_vlm_samples``): a document is its image's placeholder slots followed
 by its real text, rows are filled first-fit to ``seq_len``, and the batch
-carries ``doc_ids`` plus the image placement the Joint-Decoder wrapper uses
-to write each image's tokens over its slots. A text-only document is just
-its text; a batch of nothing but text carries an empty image tensor.
+carries ``doc_ids``, per-document ``position_ids`` and the image placement the
+Joint-Decoder wrapper uses to write each image's tokens over its slots. A
+text-only document is just its text; a batch of nothing but text carries an
+empty image tensor.
 
 The HF ``datasets`` and ``transformers`` packages are imported lazily
 so this module is safe to import without them (e.g. in unit tests that
@@ -272,39 +273,36 @@ def _images_per_row(rows: Any, image_field: str) -> np.ndarray:
 
     column = rows.select_columns([image_field]).with_format("arrow")[:].column(image_field)
     if pa.types.is_list(column.type) or pa.types.is_large_list(column.type):
-        counts = column.combine_chunks().value_lengths().fill_null(0)
+        chunks = [chunk.value_lengths().fill_null(0) for chunk in column.chunks]
     else:
-        counts = column.is_valid()
-    return counts.to_numpy(zero_copy_only=False).astype(np.int64)
+        chunks = [chunk.is_valid() for chunk in column.chunks]
+    counts = [chunk.to_numpy(zero_copy_only=False).astype(np.int64) for chunk in chunks]
+    return np.concatenate(counts) if counts else np.zeros(0, dtype=np.int64)
 
 
-def _check_every_row_has_an_image(rows: Any, image_field: str) -> None:
-    """Reject a dataset with rows whose image field is missing or an empty list.
+def _check_image_counts(rows: Any, image_field: str, allow_text_only: bool) -> None:
+    """Check every row's image count before training: none unless allowed, never several.
 
     Raises:
-        ValueError: Some rows hold no image; the message counts them and names
-            the setting that trains them as text-only documents.
+        ValueError: Some rows hold no image and ``allow_text_only`` is off, or
+            some hold several; the message counts them.
     """
-    missing = int((_images_per_row(rows, image_field) == 0).sum())
-    if missing:
+    counts = _images_per_row(rows, image_field)
+    missing = int((counts == 0).sum())
+    if missing and not allow_text_only:
         raise ValueError(
             f"{missing:,} of {len(rows):,} rows have no image in field {image_field!r}; set "
             "data.hf_allow_text_only = true to train them as text-only documents"
         )
+    several = int((counts > 1).sum())
+    if several:
+        raise ValueError(
+            f"{several:,} of {len(rows):,} rows hold several images in field {image_field!r}; "
+            "a document takes one image"
+        )
 
 
 def _tokenize_and_mask(
-    tokenizer: Any,
-    text: str,
-    max_text_len: int,
-    prompt: str | None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """``_tokenize_and_mask_with_len`` without the token count."""
-    input_ids, labels, _ = _tokenize_and_mask_with_len(tokenizer, text, max_text_len, prompt)
-    return input_ids, labels
-
-
-def _tokenize_and_mask_with_len(
     tokenizer: Any,
     text: str,
     max_text_len: int,
@@ -439,8 +437,7 @@ class HuggingFaceVLMDataset(Dataset):
         self._max_text_len = max_text_len
         self._allow_text_only = allow_text_only
         self._tokenizer = build_tokenizer(tokenizer_path)
-        if not allow_text_only:
-            _check_every_row_has_an_image(ds, image_field)
+        _check_image_counts(ds, image_field, allow_text_only)
         if prompt_field is not None:
             _check_prompt_column_is_string(ds, prompt_field)
             _check_prompt_column_has_room(ds, prompt_field, self._tokenizer, max_text_len)
@@ -455,6 +452,8 @@ class HuggingFaceVLMDataset(Dataset):
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         row = self._ds[idx]
         image = row[self._image_field]
+        if isinstance(image, list | tuple) and len(image) == 1:
+            image = image[0]
         if _is_missing_image(image):
             if not self._allow_text_only:
                 raise ValueError(
@@ -472,7 +471,7 @@ class HuggingFaceVLMDataset(Dataset):
         prompt = None
         if self._prompt_field is not None:
             prompt = _prompt_or_none(row[self._prompt_field], self._prompt_field)
-        input_ids, labels, text_len = _tokenize_and_mask_with_len(
+        input_ids, labels, text_len = _tokenize_and_mask(
             self._tokenizer, text_val, self._max_text_len, prompt
         )
         return {
@@ -487,17 +486,18 @@ class VLMCollator:
     """Stack VLM samples into a fixed-length batch.
 
     Output keys:
-      - ``pixel_values``: ``(B, 3, H, W)``; a text-only sample (an empty
-        ``(0, 3, H, W)``) contributes a blank image.
+      - ``pixel_values``: ``(B, 3, H, W)``, or ``(B, V, 3, H, W)`` when every
+        sample brings ``V`` views of its image; a text-only sample (an empty
+        ``(0, 3, H, W)``) contributes a blank image of the batch's shape.
       - ``input_ids``: ``(B, max_text_len)`` int64.
       - ``labels``: ``(B, max_text_len)`` int64 with ``-100`` on pad.
       - ``image_positions``: ``(B,)`` long tensor. Reserved slot for
         multi-image extensions; currently all zeros (single image per
         example placed at sequence position 0).
-      - ``frame_mask``: ``(B, 1)`` bool, with ``allow_text_only``; ``False``
+      - ``frame_mask``: ``(B, V)`` bool, with ``allow_text_only``; ``False``
         hides a text-only sample's image tokens. Emitted on every batch, so
         the attention mask's shape and kernel stay the same from batch to
-        batch.
+        batch, at the price of the unmasked causal fast path.
 
     Padding is always to ``max_text_len``, never batch-max, so ranks
     always see identical tensor shapes under FSDP2.
@@ -514,27 +514,30 @@ class VLMCollator:
         if not samples:
             raise ValueError("VLMCollator received an empty batch")
         B = len(samples)
+        real = [s["pixel_values"] for s in samples if s["pixel_values"].shape[0] > 0]
+        shape = tuple(real[0].shape) if real else tuple(samples[0]["pixel_values"].shape[1:])
         images: list[torch.Tensor] = []
         has_image: list[bool] = []
         for s in samples:
             p = s["pixel_values"]
-            if p.dim() == 4 and p.shape[0] == 0:
+            if p.shape[0] == 0:
                 if not self.allow_text_only:
                     raise ValueError(
                         "VLMCollator got a text-only sample; set data.hf_allow_text_only = true "
                         "to train on text-only rows"
                     )
-                images.append(torch.zeros(p.shape[1:], dtype=p.dtype))
+                images.append(torch.zeros(shape, dtype=p.dtype))
                 has_image.append(False)
-            elif p.dim() == 3:
+            elif tuple(p.shape) != shape:
+                raise ValueError(
+                    f"VLMCollator needs every sample's pixel_values to share one shape, got "
+                    f"{shape} and {tuple(p.shape)}"
+                )
+            else:
                 images.append(p)
                 has_image.append(True)
-            else:
-                raise ValueError(
-                    f"VLMCollator takes one image per document, got pixel_values of shape "
-                    f"{tuple(p.shape)}"
-                )
         pixels = torch.stack(images, dim=0)
+        views = shape[0] if len(shape) == 4 else 1
         input_ids = torch.full((B, self.max_text_len), self.pad_id, dtype=torch.long)
         labels = torch.full((B, self.max_text_len), -100, dtype=torch.long)
         for i, s in enumerate(samples):
@@ -551,7 +554,8 @@ class VLMCollator:
             "image_positions": image_positions,
         }
         if self.allow_text_only:
-            batch["frame_mask"] = torch.tensor(has_image, dtype=torch.bool).unsqueeze(1)
+            mask = torch.tensor(has_image, dtype=torch.bool).unsqueeze(1)
+            batch["frame_mask"] = mask.expand(B, views).clone()
         return batch
 
 
@@ -577,10 +581,12 @@ def pack_vlm_samples(
         document order (``N = 0`` when every document is text); ``input_ids``,
         ``labels`` and ``doc_ids`` ``(rows, seq_len)``, with ``pad_id`` and
         ``-100`` on the image slots and the padding tail, and ``doc_ids``
-        numbering a row's documents from ``0`` with the tail one past the last;
-        ``image_rows`` and ``image_starts`` ``(N,)``, the row and first slot of
-        each image; ``image_tokens``, 0-d, the ``tokens_per_image`` the slots
-        were laid out with.
+        numbering a row's documents from ``0`` with
+        the tail one past the last; ``position_ids`` ``(rows, seq_len)``, each
+        document's positions (and the tail's) restarting at ``0``;
+        ``image_rows`` and ``image_starts`` ``(N,)``,
+        the row and first slot of each image; ``image_tokens``, 0-d, the
+        ``tokens_per_image`` the slots were laid out with.
 
     Raises:
         ValueError: ``samples`` is empty, a document's footprint exceeds
@@ -618,6 +624,7 @@ def pack_vlm_samples(
                     "input_ids": torch.full((seq_len,), pad_id, dtype=torch.long),
                     "labels": torch.full((seq_len,), -100, dtype=torch.long),
                     "doc_ids": torch.zeros(seq_len, dtype=torch.long),
+                    "position_ids": torch.zeros(seq_len, dtype=torch.long),
                 }
             )
         row = rows[row_index]
@@ -630,10 +637,12 @@ def pack_vlm_samples(
         row["input_ids"][cursor : cursor + text_len] = sample["input_ids"][:text_len]
         row["labels"][cursor : cursor + text_len] = sample["labels"][:text_len]
         row["doc_ids"][row["fill"] : cursor + text_len] = row["docs"]
+        row["position_ids"][row["fill"] : cursor + text_len] = torch.arange(footprint)
         row["fill"] = cursor + text_len
         row["docs"] += 1
     for row in rows:
         row["doc_ids"][row["fill"] :] = row["docs"]
+        row["position_ids"][row["fill"] :] = torch.arange(seq_len - row["fill"])
     pixel_values = (
         torch.stack(images, dim=0) if images else torch.zeros((0, *image_shape), dtype=image_dtype)
     )
@@ -642,6 +651,7 @@ def pack_vlm_samples(
         "input_ids": torch.stack([r["input_ids"] for r in rows]),
         "labels": torch.stack([r["labels"] for r in rows]),
         "doc_ids": torch.stack([r["doc_ids"] for r in rows]),
+        "position_ids": torch.stack([r["position_ids"] for r in rows]),
         "image_rows": torch.tensor(image_rows, dtype=torch.long),
         "image_starts": torch.tensor(image_starts, dtype=torch.long),
         "image_tokens": torch.tensor(tokens_per_image, dtype=torch.long),
@@ -657,15 +667,11 @@ class PackedVLMCollator:
     """
 
     def __init__(self, pad_id: int, seq_len: int, tokens_per_image: int) -> None:
-        if seq_len <= 0 or tokens_per_image <= 0:
-            raise ValueError("seq_len and tokens_per_image must be positive")
         self.pad_id = pad_id
         self.seq_len = seq_len
         self.tokens_per_image = tokens_per_image
 
     def __call__(self, samples: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
-        if not samples:
-            raise ValueError("PackedVLMCollator received an empty batch")
         return pack_vlm_samples(
             samples,
             seq_len=self.seq_len,

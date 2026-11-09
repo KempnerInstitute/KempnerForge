@@ -46,14 +46,15 @@ right-padded to `vlm.max_text_len`. With `data.pack_sequences = true` on a
 of each micro-batch first-fit into rows of `train.seq_len` instead. Each
 document is its image's token slots followed by its real text, `doc_ids` keeps
 attention inside a document, and the wrapper writes each image's tokens over
-its slots (`ModalityContext.inline_embeds`). The number of rows follows the
-documents' lengths, so it varies between micro-batches.
+its slots (`ModalityContext.inline_embeds`). Each document's positions
+restart at 0, so a document sees the positions it would on the unpacked path.
+The number of rows follows the documents' lengths, so it varies between
+micro-batches.
 
 ```toml
 [vision_encoder]
 type = "siglip2"
 path = "google/siglip2-so400m-patch16-512"
-num_tokens = 1024          # the packer needs the count before the encoder is built
 
 [adapter]
 type = "avgpool"
@@ -70,11 +71,9 @@ pack_sequences = true
 seq_len = 2048             # row length; batch_size documents per micro-batch
 ```
 
-`attention_backend = "flex"` makes the packed mask block-sparse. Positions run
-through the row without restarting per document, and the views of an image
-attend causally; per-document positions and bidirectional image attention are
-follow-ups on the core's explicit position ids and attention groups. A
-`[video]` run and the other arches do not pack.
+`attention_backend = "flex"` makes the packed mask block-sparse. The views of
+an image attend causally; bidirectional image attention is a follow-up on the
+core's attention groups. A `[video]` run and the other arches do not pack.
 
 ## Mix in text-only documents
 
@@ -85,12 +84,15 @@ takes a blank image and a `frame_mask` entry of `False`, so its image tokens
 are hidden from attention; the document still occupies the image positions,
 so its text sits after them in the row and in the position encoding, as a
 masked image document rather than plain text. With packing it is just its
-text, and a micro-batch of nothing but text carries no images. On every rank
-a sharded vision encoder or adapter still runs, on a blank image when there is
-nothing else, because its FSDP2 collectives need every rank to take part; a
-frozen encoder is skipped. The flag needs an image-prefix arch or packing, not
-`cross_attention`, whose image K/V cannot hide a blank image. Without the flag
-a dataset with such a row is rejected when it is loaded.
+text, and a micro-batch of nothing but text carries no images; the vision
+encoder and adapter then run on one blank image whose output carries no weight,
+so FSDP2's collectives still see every rank, and under `train.compile_model`
+such a micro-batch is a second compiled graph. With the flag every unpacked
+batch carries a `frame_mask`, so the prefix route's attention always takes an
+explicit mask rather than the unmasked causal fast path. The flag needs an
+image-prefix arch or packing, not `cross_attention`, whose image K/V cannot
+hide a blank image. Without the flag a dataset with such a row is rejected when
+it is loaded.
 
 ## Start from the pretrained backbone
 
