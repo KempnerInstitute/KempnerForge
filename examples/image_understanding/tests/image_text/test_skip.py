@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import pytest
 from image_text import skip
-from image_text.skip import SkipLog, check_max_attempts, first_usable
+from image_text.skip import SkipLog, UnusableRowError, check_max_attempts, first_usable
 
 
-class Unusable(Exception):
+class Unusable(UnusableRowError):
     pass
 
 
@@ -24,22 +24,22 @@ class TestFirstUsable:
     def test_returns_the_first_usable_row(self) -> None:
         skips: list[int] = []
         read = _reader({0, 1})
-        assert first_usable(0, 4, 3, read, lambda i, _: skips.append(i), Unusable) == "row 2"
+        assert first_usable(0, 4, 3, read, lambda i, _: skips.append(i)) == "row 2"
         assert skips == [0, 1]
 
     def test_wraps_around(self) -> None:
-        assert first_usable(3, 4, 2, _reader({3}), lambda *_: None, Unusable) == "row 0"
+        assert first_usable(3, 4, 2, _reader({3}), lambda *_: None) == "row 0"
 
     def test_raises_after_max_attempts(self) -> None:
         with pytest.raises(RuntimeError, match="2 consecutive rows from index 1"):
-            first_usable(1, 4, 2, _reader({1, 2}), lambda *_: None, Unusable)
+            first_usable(1, 4, 2, _reader({1, 2}), lambda *_: None)
 
     def test_other_errors_propagate(self) -> None:
         def read(i: int) -> str:
             raise KeyError(i)
 
         with pytest.raises(KeyError):
-            first_usable(0, 4, 2, read, lambda *_: None, Unusable)
+            first_usable(0, 4, 2, read, lambda *_: None)
 
     def test_next_row_chooses_where_to_continue(self) -> None:
         tried: list[int] = []
@@ -50,9 +50,7 @@ class TestFirstUsable:
                 raise Unusable(i)
             return "ok"
 
-        assert (
-            first_usable(0, 4, 2, read, lambda *_: None, Unusable, next_row=lambda i: i + 3) == "ok"
-        )
+        assert first_usable(0, 4, 2, read, lambda *_: None, next_row=lambda i: i + 3) == "ok"
         assert tried == [0, 3]
 
 

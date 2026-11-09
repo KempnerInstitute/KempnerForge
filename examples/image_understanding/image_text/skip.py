@@ -11,6 +11,10 @@ logger = get_logger(__name__)
 MAX_ATTEMPTS = 16
 
 
+class UnusableRowError(Exception):
+    """A row a reader cannot turn into a usable document."""
+
+
 def check_max_attempts(max_attempts: int) -> int:
     """``max_attempts``, refused unless positive."""
     if max_attempts < 1:
@@ -39,10 +43,9 @@ def first_usable[T](
     max_attempts: int,
     read: Callable[[int], T],
     on_skip: Callable[[int, Exception], None],
-    skip: type[Exception] | tuple[type[Exception], ...],
     next_row: Callable[[int], int] | None = None,
 ) -> T:
-    """``read(index)``, moving on past rows whose read raises ``skip``.
+    """``read(index)``, moving on past rows whose read raises ``UnusableRowError``.
 
     After a skipped row the next one tried is ``next_row(row)`` (by default the
     following row), wrapping around at ``length``; after ``max_attempts`` skipped
@@ -52,7 +55,7 @@ def first_usable[T](
     for _ in range(max_attempts):
         try:
             return read(row)
-        except skip as exc:
+        except UnusableRowError as exc:
             on_skip(row, exc)
             row = (next_row(row) if next_row is not None else row + 1) % length
     raise RuntimeError(f"{max_attempts} consecutive rows from index {index} cannot be used")
