@@ -62,8 +62,10 @@ turning tiling on. `tile_image` in `kempnerforge/data/vlm_dataset.py` is the
 preprocessor at training and at evaluation, so an evaluation tiles exactly as
 training did. The crops come from the image resized to a square canvas, so a
 wide or tall image is stretched the way its single view already is; a grid
-that follows the aspect ratio is not implemented. Tiling applies to the image
-path only; a `[video]` run rejects it.
+that follows the aspect ratio is not implemented. An image smaller than the
+`n × hf_image_size` canvas is upsampled onto it, so its crops cost tokens
+without adding detail; tiling pays off on sources larger than the canvas.
+Tiling applies to the image path only; a `[video]` run rejects it.
 
 ## Start from the pretrained backbone
 

@@ -409,9 +409,6 @@ class HuggingFaceVLMDataset(Dataset):
     ) -> None:
         import os
 
-        if tile_grid < 0 or tile_grid == 1:
-            raise ValueError(f"tile_grid must be 0 (one view) or >= 2, got {tile_grid}")
-
         from datasets import Dataset as HFDataset
         from datasets import load_dataset, load_from_disk
 

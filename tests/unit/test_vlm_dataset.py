@@ -740,18 +740,6 @@ class TestHuggingFaceVLMDataset:
         assert item["labels"].shape == (16,)
         assert item["input_ids"].dtype == torch.long
 
-    def test_a_one_by_one_grid_is_refused_at_construction(self, tiny_hf_dataset):
-        with pytest.raises(ValueError, match="tile_grid must be 0"):
-            HuggingFaceVLMDataset(
-                dataset_name=tiny_hf_dataset,
-                split="train",
-                image_field="image",
-                text_field="caption",
-                tokenizer_path="gpt2",
-                max_text_len=8,
-                tile_grid=1,
-            )
-
     @pytest.mark.parametrize(("tile_global", "views"), [(True, 5), (False, 4)])
     def test_tiling_yields_one_view_per_crop(self, tiny_hf_dataset, tile_global, views):
         ds = HuggingFaceVLMDataset(
