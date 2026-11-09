@@ -31,19 +31,23 @@ resumed run ids into the config.
 
 ## Per-step flow
 
-`end_step` runs five things in order:
+`end_step` runs four things in order:
 
-1. **Timing** — `step_time = perf_counter() - _step_start`; derives
+1. **Timing**: `step_time = perf_counter() - _step_start`; derives
    `tokens_per_sec = tokens_in_step / step_time`.
-2. **MFU** — calls `compute_mfu(model_config, tokens_per_sec, num_gpus,
+2. **MFU**: calls `compute_mfu(model_config, tokens_per_sec, num_gpus,
    gpu_peak_tflops, seq_len)`. See [MFU](mfu.md).
-3. **Memory stats** — `get_memory_stats()` + `get_memory_utilization()`,
-   captured every step from device 0.
-4. **EMA smoothing** — updates four smoothed keys (`loss`,
+3. **EMA smoothing**: updates four smoothed keys (`loss`,
    `tokens_per_sec`, `mfu`, `step_time`) with `alpha=0.1`.
-5. **Log if due** — if `step % log_interval == 0` or `step == 1`, dispatch
-   to stdout + all backends and return a `StepMetrics`. Otherwise return
-   `None`.
+4. **Log if due**: if `step % log_interval == 0` or `step == 1`, read GPU
+   memory once with `get_memory_stats()`, from the current device, then
+   dispatch to stdout + all backends and return a `StepMetrics`.
+   Otherwise return `None` without reading memory.
+
+The tracker never resets the CUDA peak counter, so `peak_gb` (logged as
+`gpu/peak_gb` and `mem=`) is the high-water mark of the run, and
+`mem_utilization` is that peak over `total_gb` (see
+[Memory monitor](memory-monitor.md#why-metricstracker-doesnt-reset-peak)).
 
 ## `StepMetrics`
 
@@ -88,8 +92,14 @@ from every data point, even ones that aren't logged.
 ## Log interval
 
 ```python
-if step % self.metrics_config.log_interval == 0 or step == 1:
-    self._log_step(step, metrics)
+# kempnerforge/metrics/tracker.py: end_step, after the smoothing
+if step % self.metrics_config.log_interval != 0 and step != 1:
+    return None
+
+mem_stats = get_memory_stats()   # read on logging steps only
+...
+self._log_step(step, metrics)
+return metrics
 ```
 
 Default `log_interval = 10`. Step 1 is always logged (useful sanity check
@@ -99,17 +109,27 @@ starts at `step = 1`.
 ## Stdout format
 
 ```
-[step 1000] loss=2.3400 | lr=3.00e-04 | grad_norm=1.250 | tok/s=125,000 | mfu=52.3% | mem=71.2/80GB | step_time=1.25s
+2026-11-04 14:03:12.345 [rank 0] INFO     [step 1000] loss=2.3400 | lr=3.00e-04 | grad_norm=1.250 | tok/s=125,000 | mfu=52.3% | mem=71.2/80GB | step_time=1.25s
 ```
 
-Produced by `format_metrics(step, {...})` from
+The part from `[step 1000]` on is produced by
+`format_metrics(step, {...})` from
 [`kempnerforge/metrics/logger.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/metrics/logger.py).
-Numbers use `_format_number`: int gets k/M/B suffix, float gets scientific
-notation below 0.01 or above 1e6, otherwise 4 decimals.
+The tracker formats each value of the step line itself: `loss` to 4
+decimals, `lr` in scientific notation, `grad_norm` to 3 decimals,
+`tok/s` with thousands separators, `mfu` as a percentage, `mem` as peak
+over total GB and `step_time` in seconds. `format_metrics` applies
+`_format_number` only to numbers, such as the eval metrics `log_eval`
+passes: int gets k/M/B suffix, float gets scientific notation below 0.01
+or above 1e6, otherwise 4 decimals.
 
-The same logger writes every other `logger.info` in the framework — with
-a `[rank N] LEVEL   ` prefix and ANSI color if `stdout.isatty()` and
-`NO_COLOR` isn't set (see [`_RankFormatter`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/metrics/logger.py)).
+The same logger writes every other `logger.info` in the framework, and
+each line starts with the local time to the millisecond
+(`YYYY-MM-DD HH:MM:SS.mmm`), `[rank N]` and the level. With ANSI color,
+used if `stdout.isatty()` and `NO_COLOR` isn't set, the time and rank
+are dimmed and the level is colored. A record logged with
+`logger.exception(...)` or `stack_info=True` prints its traceback or
+stack on the lines below it (see [`_RankFormatter`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/metrics/logger.py)).
 
 ## Backend dispatch
 
@@ -234,8 +254,8 @@ logger.info("starting distributed init")
 
 Returns a `logging.Logger` named `kempnerforge.<name>`. On first call,
 configures the root `kempnerforge` logger with a `_RankFormatter` (adds
-`[rank N]` + colored level) and a `_RankFilter` (drops records from
-non-zero ranks by default).
+the local time, `[rank N]` and the colored level, and prints any traceback)
+and a `_RankFilter` (drops records from non-zero ranks by default).
 
 Override rank filtering with `get_logger(__name__, rank_zero_only=False)`
 when you genuinely want every rank to log — e.g. for distributed-init
