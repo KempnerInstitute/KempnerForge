@@ -253,3 +253,37 @@ def test_warm_start_from_a_map_style_checkpoint_starts_the_stream_fresh(
         manager.apply_dataloader_state(stream)
     assert "starts at its first sample" in caplog.text and "streams its data" in caplog.text
     assert torch.equal(next(iter(stream))["input_ids"], next(iter(_loader(config)))["input_ids"])
+
+
+def test_a_checkpoint_without_a_stream_position_warns_that_the_stream_restarts(
+    corpus, tmp_path, caplog, monkeypatch
+):
+    """A streaming checkpoint saved before positions were recorded holds none.
+
+    Its resume starts the stream at the first document and says so; a run that
+    restored no checkpoint says nothing. The ``kempnerforge`` logger stops
+    propagation once configured, so the test lets records reach ``caplog``.
+    """
+    from kempnerforge.checkpoint.manager import CheckpointManager
+    from kempnerforge.training.entry import restore_checkpoint
+
+    monkeypatch.setattr(logging.getLogger("kempnerforge"), "propagate", True)
+    config = _config(corpus)
+    config.checkpoint = CheckpointConfig(dir=str(tmp_path / "ckpt"))
+    model = torch.nn.Linear(2, 2)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    CheckpointManager(config.checkpoint, model, optimizer).save(step=3, dataloader=None)
+
+    with caplog.at_level(logging.WARNING, logger="kempnerforge.checkpoint.manager"):
+        CheckpointManager(config.checkpoint, model, optimizer).apply_dataloader_state(
+            _loader(config)
+        )
+    assert "holds no data position" not in caplog.text
+
+    manager = CheckpointManager(config.checkpoint, model, optimizer)
+    assert restore_checkpoint(config, model, None, manager)[0] == 3
+    stream = _loader(config)
+    with caplog.at_level(logging.WARNING, logger="kempnerforge.checkpoint.manager"):
+        manager.apply_dataloader_state(stream)
+    assert "holds no data position, so the stream restarts at its first document" in caplog.text
+    assert torch.equal(next(iter(stream))["input_ids"], next(iter(_loader(config)))["input_ids"])

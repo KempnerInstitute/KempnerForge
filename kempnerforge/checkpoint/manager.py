@@ -38,7 +38,7 @@ from kempnerforge.checkpoint.async_save import AsyncCheckpointer
 from kempnerforge.checkpoint.state import build_train_state, restore_train_state
 from kempnerforge.config.optimizer import WEIGHT_DECAY_SCOPES
 from kempnerforge.config.schema import AsyncCheckpointMode, CheckpointConfig
-from kempnerforge.data.dataloader import DataPositionError
+from kempnerforge.data.dataloader import DataPositionError, StreamingDataLoader
 
 logger = logging.getLogger(__name__)
 
@@ -499,6 +499,7 @@ class CheckpointManager:
         self._weight_decay_scope = weight_decay_scope
         self._pending_dataloader_state: dict[str, Any] | None = None
         self._pending_dataloader_warm_start = False
+        self._pending_dataloader_missing = False
         self._pending_finalize: tuple[int, Path] | None = None
         self._inflight_dir: Path | None = None
         self._tracking_source: TrackingSource | None = None
@@ -1051,6 +1052,9 @@ class CheckpointManager:
             if dataloader is None and "dataloader" in train_state:
                 self._pending_dataloader_state = train_state["dataloader"]
                 self._pending_dataloader_warm_start = warm_start
+            self._pending_dataloader_missing = (
+                dataloader is None and "dataloader" not in train_state
+            )
             step, tokens_seen, extra = restore_train_state(
                 train_state,
                 scheduler=scheduler,
@@ -1183,9 +1187,20 @@ class CheckpointManager:
         ``load_state_dict`` (e.g., a plain torch DataLoader). A position the
         loader cannot carry over raises ``DataPositionError`` on a resume; after
         a ``warm_start`` load the data starts at its first sample instead, with
-        a warning that names the reason.
+        a warning that names the reason. A restored checkpoint that holds no
+        data position, such as a streaming checkpoint saved before streaming
+        positions were recorded, leaves a stateful loader at its first sample,
+        with a warning.
         """
+        missing, self._pending_dataloader_missing = self._pending_dataloader_missing, False
         if self._pending_dataloader_state is None:
+            if missing and dataloader is not None and hasattr(dataloader, "load_state_dict"):
+                start = (
+                    "the stream restarts at its first document"
+                    if isinstance(dataloader, StreamingDataLoader)
+                    else "the data starts at its first sample"
+                )
+                logger.warning(f"The restored checkpoint holds no data position, so {start}")
             return
         state, self._pending_dataloader_state = self._pending_dataloader_state, None
         if dataloader is None or not hasattr(dataloader, "load_state_dict"):
