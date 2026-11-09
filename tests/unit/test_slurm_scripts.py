@@ -51,6 +51,12 @@ def test_singlenode_signals_the_batch_shell_and_traps_it():
     assert 'trap \'kill -TERM "${launcher}"' in text
 
 
+@pytest.mark.parametrize("path", sorted(SLURM.glob("*.sh")), ids=lambda p: p.name)
+def test_no_script_exports_nccl_timeout(path):
+    """Neither NCCL nor PyTorch reads NCCL_TIMEOUT; nccl_timeout_sec is the bound."""
+    assert "NCCL_TIMEOUT" not in path.read_text()
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="needs bash and POSIX signals")
 @pytest.mark.parametrize("signals", [["SIGTERM"], ["SIGUSR1"], ["SIGTERM", "SIGTERM"]])
 def test_singlenode_forwards_the_batch_signal_and_waits(tmp_path, signals):

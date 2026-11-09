@@ -36,8 +36,6 @@ export NCCL_IB_GID_INDEX=3
 
 export GLOO_SOCKET_IFNAME="${IB_IFNAME}"
 
-export NCCL_TIMEOUT=1800
-
 mkdir -p logs
 
 echo "=== KempnerForge Multi-Node Training ==="
