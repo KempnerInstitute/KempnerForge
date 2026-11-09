@@ -1029,6 +1029,14 @@ class CheckpointManager:
             FileNotFoundError: No checkpoint resolves although one was named, or the
                 checkpoint holds optimizer state that this load restores but has no
                 ``train_state.pt``. Raised before any state is loaded.
+            ValueError: The checkpoint was saved under another weight-decay scope, LR
+                multipliers or patterns of their modules (see ``__init__``).
+            RuntimeError: The saved optimizer state does not fit this run's optimizers.
+
+        A load that restores optimizer state refuses it on every rank together, before any
+        state is loaded: each rank checks its own part of the checkpoint, and one all-reduce
+        on the manager's gloo group, which every rank enters, has the other ranks raise a
+        ``RuntimeError`` naming the ranks that refused.
         """
         ckpt_dir = self._resolve_load_path(path)
         if ckpt_dir is None:
@@ -1092,7 +1100,8 @@ class CheckpointManager:
         dcp_dir = ckpt_dir / f"pp{self._pp_rank}" if self._pp_rank is not None else ckpt_dir
 
         load_model = exclude_keys is None or "model" not in exclude_keys
-        load_optim = exclude_keys is None or "optimizer" not in exclude_keys
+        optimizer_requested = exclude_keys is None or "optimizer" not in exclude_keys
+        load_optim = optimizer_requested
 
         saved_keys = self._read_saved_keys(ckpt_dir, dcp_dir) if load_optim else {}
         fresh_optimizer = load_optim and not _holds_optimizer(saved_keys)
@@ -1101,8 +1110,18 @@ class CheckpointManager:
 
         train_state_path = ckpt_dir / _TRAIN_STATE_FILE
         train_state_exists = self._train_state_exists(train_state_path)
+
+        dcp_state: dict[str, Any] = {}
+        optimizers = (
+            self._optimizers_saved_in(dcp_dir, saved_keys)
+            if load_optim and train_state_exists
+            else []
+        )
+        if load_model:
+            dcp_state["model"] = get_model_state_dict(self.model)
+        check_error: BaseException | None = None
         if load_optim and not train_state_exists:
-            raise FileNotFoundError(
+            check_error = FileNotFoundError(
                 f"Cannot resume {ckpt_dir}: it holds optimizer state but no {_TRAIN_STATE_FILE}, "
                 f"so loading it would continue its weights and optimizer moments from step 0 and "
                 f"restart the LR schedule and the data stream. Its save stopped before writing "
@@ -1111,13 +1130,7 @@ class CheckpointManager:
                 f"step_N to resume from it, or at this checkpoint with "
                 f'checkpoint.exclude_from_loading = ["optimizer"] to start from its weights alone.'
             )
-
-        dcp_state: dict[str, Any] = {}
-        optimizers = self._optimizers_saved_in(dcp_dir, saved_keys) if load_optim else []
-        if load_model:
-            dcp_state["model"] = get_model_state_dict(self.model)
-        check_error: BaseException | None = None
-        if load_optim:
+        elif load_optim:
             dcp_state["optimizer"] = get_optimizer_state_dict(self.model, optimizers)
             filled = _drop_legacy_group_keys(dcp_state["optimizer"], optimizers, saved_keys)
             if filled:
@@ -1132,10 +1145,8 @@ class CheckpointManager:
                 dcp_dir,
                 bool(self._lr_multipliers),
             )
-        if self._lr_multipliers:
+        if optimizer_requested:
             self._agree(check_error, action="load")
-        elif check_error is not None:
-            raise check_error
 
         if dcp_state:
             planner = _NeverSteppedStatePlanner()

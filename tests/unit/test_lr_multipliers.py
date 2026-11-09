@@ -843,7 +843,7 @@ class TestResume:
         assert calls[-1] == ("broadcast", 0, [(None, "OSError: disk gone")])
 
     def test_a_refusal_on_another_rank_stops_this_one_before_loading(self, tmp_path, monkeypatch):
-        """With multipliers, the ranks agree on the optimizer checks before any rank loads."""
+        """The ranks agree on the optimizer checks before any rank loads."""
         import kempnerforge.checkpoint.manager as mgr_mod
 
         self._save(tmp_path, {"head": 2.0})
@@ -864,14 +864,20 @@ class TestResume:
         assert all(torch.equal(b, p) for b, p in zip(before, model.parameters(), strict=True))
         assert scheduler.last_epoch == 0
 
-    @pytest.mark.parametrize("multipliers", [{}, {"head": 2.0}], ids=["none", "listed"])
-    def test_only_a_run_with_multipliers_agrees_on_the_optimizer_checks(
-        self, tmp_path, monkeypatch, multipliers
+    @pytest.mark.parametrize(
+        "multipliers", [{}, {"head": 2.0}, None], ids=["none", "listed", "unset"]
+    )
+    @pytest.mark.parametrize("exclude", [[], ["optimizer"]], ids=["optimizer", "no-optimizer"])
+    def test_every_load_of_optimizer_state_agrees_on_the_checks(
+        self, tmp_path, monkeypatch, multipliers, exclude
     ):
+        """A rank's checks pass or fail on its own part of the checkpoint, so whether the ranks
+        agree on them depends only on the request, which every rank shares."""
         import kempnerforge.checkpoint.manager as mgr_mod
 
-        self._save(tmp_path, multipliers)
-        _, scheduler, manager = self._resume(tmp_path, multipliers)
+        self._save(tmp_path, multipliers or {})
+        model, optimizer, scheduler = self._build("adamw", multipliers or {}, seed=1)
+        manager = self._manager(tmp_path, model, optimizer, multipliers)
         calls = self._as_rank(monkeypatch, manager, 0)
 
         def reached(*_args, **_kwargs):
@@ -879,9 +885,9 @@ class TestResume:
 
         monkeypatch.setattr(mgr_mod.dcp, "load", reached)
         with pytest.raises(_ReachedTheModel):
-            manager.load(scheduler=scheduler)
+            manager.load(scheduler=scheduler, exclude_keys=exclude)
         agreed = [c for c in calls if c[0] == "all_reduce" and c[2] == [0, 0]]
-        assert agreed == ([("all_reduce", "GLOO_GROUP", [0, 0])] if multipliers else [])
+        assert agreed == ([] if exclude else [("all_reduce", "GLOO_GROUP", [0, 0])])
 
     def test_every_rank_checks_the_scheduler_state_rank_zero_sent(self, tmp_path, monkeypatch):
         """Each rank decides from the train state rank 0 broadcast, so all check or none do."""

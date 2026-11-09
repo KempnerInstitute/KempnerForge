@@ -3337,6 +3337,75 @@ class TestResumeWithoutTrainStateAcrossRanks:
         mp.spawn(_load_with_a_stale_view, args=(2, _free_port(), str(tmp_path), stale), nprocs=2)
 
 
+def _refuse_on_one_stage(
+    rank: int, world: int, port: int, ckpt_dir: str, refusing: int, scope: str | None
+) -> None:
+    """Save one pipeline stage per rank, then load with stage ``refusing`` under SGD."""
+    from datetime import timedelta
+
+    import torch.distributed as dist
+
+    from kempnerforge.checkpoint.manager import CheckpointManager
+
+    dist.init_process_group(
+        "gloo",
+        rank=rank,
+        world_size=world,
+        init_method=f"tcp://127.0.0.1:{port}",
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        stages = [dist.new_group([r]) for r in range(world)]
+
+        def manager(optimizer_name: str) -> tuple[torch.nn.Module, CheckpointManager]:
+            torch.manual_seed(rank)
+            model = torch.nn.Linear(4, 4)
+            optimizer = (
+                torch.optim.SGD(model.parameters(), lr=0.1, momentum=0.9)
+                if optimizer_name == "sgd"
+                else torch.optim.AdamW(model.parameters(), lr=1e-3)
+            )
+            model(torch.ones(2, 4)).sum().backward()
+            optimizer.step()
+            optimizer.zero_grad()
+            config = CheckpointConfig(dir=ckpt_dir)
+            return model, CheckpointManager(
+                config,
+                model,
+                optimizer,
+                process_group=stages[rank],
+                pp_rank=rank,
+                weight_decay_scope=scope,
+            )
+
+        manager("adamw")[1].save(step=3)
+        model, loader = manager("sgd" if rank == refusing else "adamw")
+        before = model.weight.detach().clone()
+        expected = (
+            "holds another optimizer's state"
+            if rank == refusing
+            else rf"Checkpoint load failed on ranks \[{refusing}\]"
+        )
+        with pytest.raises(RuntimeError, match=expected):
+            loader.load()
+        assert torch.equal(model.weight, before), "a refused load changed the model"
+    finally:
+        dist.destroy_process_group()
+
+
+class TestOptimizerChecksAcrossStages:
+    """Under pipeline parallelism each stage checks its own optimizer state, so they agree."""
+
+    @pytest.mark.parametrize("scope", [None, "exclude_norms_and_biases"], ids=["plain", "scope"])
+    @pytest.mark.parametrize("refusing", [0, 1], ids=["stage_0_refuses", "stage_1_refuses"])
+    def test_every_rank_refuses_when_one_stage_does(self, tmp_path, refusing, scope):
+        """No rank goes on to load while another has refused, whatever the manager records."""
+        import torch.multiprocessing as mp
+
+        args = (2, _free_port(), str(tmp_path), refusing, scope)
+        mp.spawn(_refuse_on_one_stage, args=args, nprocs=2)
+
+
 def _assert_same_state_dict(expected, actual, where="state_dict"):
     """Assert two optimizer ``state_dict()``s hold the same values, tensors bit for bit."""
     if isinstance(expected, torch.Tensor):

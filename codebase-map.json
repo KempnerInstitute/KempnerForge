@@ -1221,6 +1221,7 @@
       ],
       "tested_by": [
         "tests/unit/test_checkpoint.py::TestWeightDecayScopeOnResume",
+        "tests/unit/test_checkpoint.py::TestOptimizerChecksAcrossStages",
         "tests/unit/test_lr_multipliers.py::TestResume",
         "tests/unit/test_checkpoint.py::TestCheckpointRetention",
         "tests/unit/test_checkpoint.py::TestFlushPendingSave",
