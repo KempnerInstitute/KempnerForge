@@ -1762,6 +1762,49 @@ class TestDpSizeReachesTokenAccounting:
         per_step = config.train.batch_size * config.train.seq_len * config.train.grad_accum_steps
         assert tokens_seen == 2 * per_step * 8
 
+    def test_packed_counts_do_not_count_tensor_parallel_replicas(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import kempnerforge.training.loop as loop
+
+        session = make_session(
+            make_config(),
+            data=DataPipeline(dp_size=2),
+            runtime=dataclasses.replace(_runtime(), world_size=8),
+        )
+        reductions: list[Any] = []
+
+        def reduce_counts(count: torch.Tensor, op: Any) -> None:
+            assert count.item() == 7
+            reductions.append(op)
+            count.fill_(4 * (7 + 11))
+
+        monkeypatch.setattr(loop.dist, "is_initialized", lambda: True)
+        monkeypatch.setattr(loop.dist, "all_reduce", reduce_counts)
+        result = loop.StepResult(loss=1.0, grad_norm=0.5, tokens=7)
+        assert loop._tokens_in_step(session, result) == 18
+        assert reductions == [loop.dist.ReduceOp.SUM]
+
+    def test_packed_counts_reach_tokens_seen_without_another_accumulation_factor(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import kempnerforge.training.loop as loop
+
+        monkeypatch.setattr(loop.dist, "is_initialized", lambda: False)
+        counts = iter((17, 23))
+
+        def step_fn(_session: TrainingSession, _step: int) -> loop.StepResult:
+            return loop.StepResult(loss=1.0, grad_norm=0.5, tokens=next(counts))
+
+        session = make_session(
+            make_config(max_steps=2, grad_accum_steps=3),
+            data=DataPipeline(dp_size=4),
+            step_fn=step_fn,
+        )
+        step, tokens_seen = run_training_loop(session)
+        assert (step, tokens_seen) == (2, (17 + 23) * 4)
+        assert session.checkpointer.saves[-1][1] == tokens_seen
+
     def test_default_dp_size_is_one_not_zero(self):
         assert DataPipeline().dp_size == 1
 

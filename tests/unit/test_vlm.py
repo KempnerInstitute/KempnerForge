@@ -426,6 +426,25 @@ class TestPackedForward:
                 image_starts=batch["image_starts"],
             )
 
+    def test_packed_pixels_require_a_flat_image_batch(self) -> None:
+        wrapper = _build_tiny_wrapper(num_image_tokens=8)
+        batch = pack_vlm_samples([_packed_doc(10, 9)], seq_len=32, tokens_per_image=8, pad_id=0)
+        batch["pixel_values"] = batch["pixel_values"].unsqueeze(0)
+        with pytest.raises(ValueError, match=r"pixel_values must be \(N, 3, H, W\)"):
+            self._forward(wrapper, batch)
+
+    @pytest.mark.parametrize("mismatch", ["starts_length", "placement_rank"])
+    def test_packed_placement_matches_the_image_batch(self, mismatch: str) -> None:
+        wrapper = _build_tiny_wrapper(num_image_tokens=8)
+        batch = pack_vlm_samples([_packed_doc(10, 9)], seq_len=32, tokens_per_image=8, pad_id=0)
+        if mismatch == "starts_length":
+            batch["image_starts"] = torch.zeros(2, dtype=torch.long)
+        else:
+            batch["image_rows"] = batch["image_rows"].unsqueeze(0)
+            batch["image_starts"] = batch["image_starts"].unsqueeze(0)
+        with pytest.raises(ValueError, match=r"image_rows and image_starts must be \(1,\)"):
+            self._forward(wrapper, batch)
+
     @pytest.mark.parametrize("arch", ["cross_attention", "mot", "moma"])
     def test_other_arches_reject_packed_batches(self, arch):
         strategy = build_modality_strategy(VLMConfig.for_arch(arch))

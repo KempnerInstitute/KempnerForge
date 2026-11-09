@@ -1503,3 +1503,55 @@ class TestInlineEmbeds:
                 inline_positions=torch.zeros(2, dtype=torch.long),
                 prefix_embeds=torch.randn(1, 2, 128),
             )
+
+    def test_inline_embeddings_reject_kv_caches(self) -> None:
+        from kempnerforge.model.attention import KVCache
+
+        model = Transformer(_KWARG_CONFIG).to(DEVICE)
+        caches = [
+            KVCache(
+                batch_size=1,
+                max_seq_len=32,
+                n_kv_heads=4,
+                head_dim=32,
+                dtype=torch.float32,
+                device=DEVICE,
+            )
+            for _ in range(_KWARG_CONFIG.n_layers)
+        ]
+        modality = ModalityContext(
+            inline_embeds=torch.randn(2, 128, device=DEVICE),
+            inline_rows=torch.zeros(2, dtype=torch.long, device=DEVICE),
+            inline_positions=torch.arange(2, device=DEVICE),
+        )
+        tokens = torch.randint(0, 256, (1, 4), device=DEVICE)
+        with pytest.raises(ValueError, match="modality.inline_embeds is training-only"):
+            model(tokens, modality=modality, kv_caches=caches)
+
+    def test_inline_embeddings_require_a_matrix(self) -> None:
+        with pytest.raises(ValueError, match=r"inline_embeds must be \(M, dim\)"):
+            ModalityContext(
+                inline_embeds=torch.randn(2, 1, 128),
+                inline_rows=torch.zeros(2, dtype=torch.long),
+                inline_positions=torch.arange(2),
+            )
+
+    @pytest.mark.parametrize("name", ["inline_rows", "inline_positions"])
+    def test_inline_indices_require_int64(self, name: str) -> None:
+        indices = {
+            "inline_rows": torch.zeros(2, dtype=torch.long),
+            "inline_positions": torch.arange(2),
+        }
+        indices[name] = indices[name].to(torch.int32)
+        with pytest.raises(ValueError, match=rf"{name}\.dtype must be torch.long"):
+            ModalityContext(inline_embeds=torch.randn(2, 128), **indices)
+
+    def test_inline_embeddings_accept_key_padding_mask(self) -> None:
+        mask = torch.ones(1, 4, dtype=torch.bool)
+        context = ModalityContext(
+            inline_embeds=torch.randn(2, 128),
+            inline_rows=torch.zeros(2, dtype=torch.long),
+            inline_positions=torch.arange(2),
+            key_padding_mask=mask,
+        )
+        assert context.key_padding_mask is mask
