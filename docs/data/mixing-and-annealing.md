@@ -234,6 +234,10 @@ Exposed names come from `DatasetSource.name` (auto-derived from
   skip-ahead — `StatefulDataLoader` calls `set_skip()` on it, which
   the sampler honors, but mid-epoch exact reproducibility across
   weight changes is not guaranteed.
+- A mixture's resume position counts this rank's samples, so it resumes
+  only on the data-parallel size that saved it; another size raises
+  `DataPositionError` (see
+  [Stateful dataloader § Resuming on another data-parallel size](stateful-dataloader.md#resuming-on-another-data-parallel-size)).
 - All sub-datasets share the same global `tokenizer_path` and
   `pack_sequences` setting. Multiple tokenizers in one run is not
   supported.

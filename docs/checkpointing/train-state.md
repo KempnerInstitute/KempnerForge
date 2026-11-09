@@ -83,9 +83,10 @@ See [Training § Schedulers](../training/schedulers.md).
 
 ## Dataloader state
 
-`StatefulDataLoader` exposes `state_dict()` / `load_state_dict()`, and the
-training loop passes `dataloader=` at every save site, so `build_train_state`
-records the loader position under the `dataloader` key:
+`StatefulDataLoader` and, on the streaming path, `StreamingDataLoader` expose
+`state_dict()` / `load_state_dict()`, and the training loop passes
+`dataloader=` at every save site, so `build_train_state` records the loader
+position under the `dataloader` key:
 
 ```python
 # training/loop.py::run_training_loop
@@ -98,12 +99,18 @@ ckpt_mgr.save(
 )
 ```
 
-A checkpoint taken mid-epoch carries e.g.
-`{'epoch': 7, 'batches_yielded': 14, 'sampler': {...}}`. On resume
-`StatefulDataLoader.__iter__` re-applies the skip, so training continues at the
-same sample boundary rather than restarting the epoch. Plain
-`torch.utils.data.DataLoader` (the streaming and eval paths) has no
-`state_dict`, so it is skipped and those loaders do restart.
+A checkpoint taken mid-epoch on 64 data-parallel ranks carries e.g.
+`{'epoch': 7, 'batch_size': 4, 'global_position': 3584, 'batches_yielded': 14, 'sampler': {...}}`.
+`global_position` counts the samples of the epoch's order that all ranks
+consumed, so on resume `StatefulDataLoader.__iter__` continues at the same
+sample rather than restarting the epoch, on this or another data-parallel
+size and batch size. A mixture saves this rank's `samples_consumed` instead
+and resumes on the saved data-parallel size only (see
+[Stateful dataloader](../data/stateful-dataloader.md#resuming-on-another-data-parallel-size)).
+The streaming loader saves how many batches training took and replays its
+stream to that point. The eval loader is a plain `torch.utils.data.DataLoader`
+with no `state_dict`; it is skipped, and it reads the full eval set at every
+evaluation anyway.
 
 ## The `extra` dict
 

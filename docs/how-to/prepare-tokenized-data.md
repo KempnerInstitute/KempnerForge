@@ -203,14 +203,17 @@ Both paths work with
 different mechanisms:
 
 - **Pre-tokenized (Path A)**: wrapped in `StatefulDataLoader`, which
-  saves and restores the sampler's position via
-  `DistributedSampler.set_skip()`. A job that preempts at step 3,500
-  picks up at sample `3500 × batch_size × world_size` without replay.
-- **HF streaming (Path B)**: wrapped in a plain `DataLoader`;
-  `StreamingHuggingFaceDataset` tracks its own position and exposes
-  `load_state_dict` / `state_dict`, which the training loop drives
-  directly. Same guarantee — no replay, no skip — via a different
-  code path.
+  saves the position in the epoch's sample order and restores it with
+  `DistributedSampler.set_position()`. A job that preempts at step 3,500
+  of its first epoch picks up at sample
+  `3500 × grad_accum_steps × batch_size × data-parallel size` without
+  replay, also when it resumes on a different number of GPUs.
+- **HF streaming (Path B)**: wrapped in `StreamingDataLoader`, which
+  saves how many batches training took and on resume replays the stream
+  to that point. The same guarantee, no sample repeated and none
+  skipped, at the cost of reading the consumed part of the stream again;
+  the data-parallel size, batch size and `num_workers` must stay the
+  same.
 
 ## See also
 

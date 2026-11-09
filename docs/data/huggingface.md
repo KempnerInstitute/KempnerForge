@@ -61,10 +61,13 @@ tokenizer_path = "meta-llama/Llama-3-8B"
 Stream mode is an `IterableDataset`:
 
 - No `__len__`, no sampler (the dataset is its own iterator).
-- `build_data_pipeline` wraps it in a plain `torch.utils.data.DataLoader`,
-  not `StatefulDataLoader`.
-- Distributed sharding happens inside the iterator:
-  `if doc_idx % world_size != rank: continue`. Each rank takes every
+- `build_data_pipeline` wraps it in `StreamingDataLoader`, a
+  `torch.utils.data.DataLoader` that saves and replays its position
+  (see [Resumption in streaming mode](#resumption-in-streaming-mode)).
+- The stream is split across data-parallel ranks after the shuffle, with
+  `datasets.distributed.split_dataset_by_node`. When the source's shard
+  count divides by the data-parallel size, each rank reads only its own
+  shards; otherwise every rank reads the stream and keeps every
   `world_size`-th document.
 
 Buffered shuffling is applied at the HF level:
@@ -87,14 +90,25 @@ processes fork after HF has already spawned its own threads.
 
 ### Resumption in streaming mode
 
-State is `{"epoch", "rank_docs_consumed"}`. On resume,
-`load_state_dict` sets `_skip_rank_docs = rank_docs_consumed`; the
-next `__iter__` fast-forwards past that many documents on this rank
-before yielding anything.
+`StreamingDataLoader` saves `{"epoch", "batches_yielded", "stream"}`:
+how many batches training took in the current pass, and the settings
+that decide the stream's order (source, data-parallel size, seed and
+shuffle buffer, `seq_len`, tokenizer, `pack_sequences`, batch size and
+`num_workers`). On resume it rebuilds the pass and discards that many
+batches before yielding, so training continues at the exact next sample:
+the shuffle, the split across ranks and DataLoader workers, and the
+packing are deterministic. The replay reads and tokenizes the consumed
+part of the pass again, so a resume deep into a large pass takes time;
+the log says how many batches it replays.
 
-Note: this only works if the same number of DP ranks is used at
-save and load time. Change the rank count and each rank's document
-stream looks different.
+A resume with one of those settings changed raises `DataPositionError`
+naming the change, because the same count would land on different
+samples, so a streaming run keeps its data-parallel size, batch size and
+`num_workers` across resumes. Hugging Face's own
+`IterableDataset.state_dict()` is not used: it drops the examples in the
+shuffle buffer on resume. See
+[Stateful dataloader § Streaming loader](stateful-dataloader.md#streaming-loader)
+for how the ranks share the saved count.
 
 ## Packing and document boundaries
 
