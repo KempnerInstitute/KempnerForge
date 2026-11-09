@@ -15,7 +15,7 @@ from typing import Any
 import pyarrow as pa
 from torch.utils.data import Dataset
 
-from .decode import Decoded, UnreadableImageError, decode_upright
+from .decode import Decoded, decode_upright
 from .document import Document, Turn
 from .points import check_max_points, format_point_answer
 from .skip import MAX_ATTEMPTS, SkipLog, check_max_attempts, first_usable
@@ -100,7 +100,6 @@ class PixmoRows(Dataset):
             self.max_attempts,
             self._read,
             self._skips,
-            UnreadableImageError,
             self._next_image,
         )
 
