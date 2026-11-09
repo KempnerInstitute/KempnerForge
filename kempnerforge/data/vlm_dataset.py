@@ -300,11 +300,12 @@ def _check_image_counts(rows: Any, image_field: str, allow_text_only: bool, max_
 
     Returns the number of rows without an image.
 
+    Rows holding more than ``max_images`` images are kept, each with its
+    first ``max_images``, and counted in one warning.
+
     Raises:
-        ValueError: Some rows hold no image and ``allow_text_only`` is off, or
-            some hold several and ``max_images`` is ``1``; the message counts
-            them and names the setting that admits them. Over a cap of two or
-            more, rows holding more images are kept and counted in a warning.
+        ValueError: Some rows hold no image and ``allow_text_only`` is off; the
+            message counts them and names the setting that admits them.
     """
     counts = _images_per_row(rows, image_field)
     missing = int((counts == 0).sum())
@@ -314,11 +315,6 @@ def _check_image_counts(rows: Any, image_field: str, allow_text_only: bool, max_
             "data.hf_allow_text_only = true to train them as text-only documents"
         )
     over = int((counts > max_images).sum())
-    if over and max_images == 1:
-        raise ValueError(
-            f"{over:,} of {len(rows):,} rows hold several images in field {image_field!r}; set "
-            "data.hf_max_images to accept documents with several images"
-        )
     if over:
         logger.warning(
             "%s of %s rows hold more than data.hf_max_images=%d images in field %r; each keeps "
@@ -499,17 +495,11 @@ class HuggingFaceVLMDataset(Dataset):
                 )
             pixels = torch.zeros(0, 3, self._image_size, self._image_size)
         else:
-            if len(images) > 1 and self._max_images == 1:
-                raise ValueError(
-                    f"row {idx} has {len(images)} images in field {self._image_field!r}; set "
-                    "data.hf_max_images to accept documents with several images"
-                )
-            images = images[: self._max_images]
             tensors = [
                 pil_to_tensor(img, self._image_size, self._image_mean, self._image_std)
-                for img in images
+                for img in images[: self._max_images]
             ]
-            pixels = tensors[0] if len(tensors) == 1 else torch.stack(tensors, dim=0)
+            pixels = tensors[0] if self._max_images == 1 else torch.stack(tensors, dim=0)
         text_val = row[self._text_field]
         if not isinstance(text_val, str):
             raise TypeError(
@@ -671,11 +661,10 @@ def pack_vlm_samples(
                 f"a document of {views.shape[0]} image(s) x {tokens_per_image} tokens + "
                 f"{text_len} text tokens does not fit a row of seq_len={seq_len}"
             )
-        open_rows = () if max_docs_per_row == 1 else enumerate(rows)
         row_index = next(
             (
                 i
-                for i, r in open_rows
+                for i, r in enumerate(rows)
                 if r["fill"] + footprint <= seq_len
                 and (max_docs_per_row <= 0 or r["docs"] < max_docs_per_row)
             ),

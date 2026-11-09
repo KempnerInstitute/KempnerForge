@@ -818,6 +818,14 @@ class TestJobConfig:
                 data=DataConfig(hf_max_images=2),
                 **kwargs,
             )
+        with pytest.raises(ValueError, match="requires vlm.arch='joint_decoder'"):
+            JobConfig(
+                model=ModelConfig(max_seq_len=64),
+                vision_encoder=VisionEncoderConfig(type="random", num_tokens=16),
+                adapter=AdapterConfig(),
+                vlm=VLMConfig.for_arch("mot", max_text_len=64),
+                data=DataConfig(hf_max_images=4),
+            )
         for cap in (0, -1):
             with pytest.raises(ValueError, match="hf_max_images must be >= 1"):
                 DataConfig(hf_max_images=cap)

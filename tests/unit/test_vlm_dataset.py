@@ -927,15 +927,18 @@ class TestTextOnlyRows:
         ds = HuggingFaceVLMDataset(path, max_text_len=8, allow_text_only=True, **kwargs)
         assert not ds.has_text_only_rows
 
-    def test_a_dataset_with_several_images_in_a_row_is_rejected_when_loaded(self, tmp_path):
+    def test_a_row_with_several_images_keeps_its_first_at_the_default_cap(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        monkeypatch.setattr(logging.getLogger("kempnerforge"), "propagate", True)
         path = _mixed_image_dataset(tmp_path, [[_make_image(8)] * 2, [_make_image(8)]])
         kwargs = dict(
             split="train", image_field="image", text_field="caption", tokenizer_path="gpt2"
         )
-        with pytest.raises(ValueError, match="1 of 2 rows hold several images"):
-            HuggingFaceVLMDataset(path, max_text_len=8, **kwargs)
-        with pytest.raises(ValueError, match="1 of 2 rows hold several images"):
-            HuggingFaceVLMDataset(path, max_text_len=8, allow_text_only=True, **kwargs)
+        with caplog.at_level(logging.WARNING, logger="kempnerforge.data.vlm_dataset"):
+            ds = HuggingFaceVLMDataset(path, max_text_len=8, allow_text_only=True, **kwargs)
+        assert "1 of 2 rows hold more than data.hf_max_images=1" in caplog.text
+        assert ds[0]["pixel_values"].shape == (3, 224, 224)
 
     def test_images_per_row_counts_lists_and_single_images(self):
         from datasets import Dataset, Features, Image, Sequence
@@ -957,10 +960,11 @@ class TestMultiImageRows:
         assert pixels.shape == (2, 3, 16, 16)
         assert pixels[0].mean() < pixels[1].mean()
 
-    def test_a_list_of_one_image_is_a_single_image(self):
+    def test_the_cap_fixes_the_sample_rank(self):
+        """One image is ``(3, H, W)`` at the default cap and ``(1, 3, H, W)`` above it."""
         rows = [{"image": [_make_image(8)], "caption": "a b"}]
         assert _dataset_over(rows)[0]["pixel_values"].shape == (3, 16, 16)
-        assert _dataset_over(rows, max_images=3)[0]["pixel_values"].shape == (3, 16, 16)
+        assert _dataset_over(rows, max_images=3)[0]["pixel_values"].shape == (1, 3, 16, 16)
 
     def test_a_longer_list_keeps_the_first_images(self):
         rows = [{"image": [_make_image(8, c) for c in (0, 128, 255)], "caption": "a b"}]
@@ -968,10 +972,11 @@ class TestMultiImageRows:
         assert pixels.shape == (2, 3, 16, 16)
         assert pixels[0].mean() < pixels[1].mean() < 0.5
 
-    def test_several_images_raise_at_the_default_cap(self):
-        rows = [{"image": [_make_image(8), _make_image(8)], "caption": "a b"}]
-        with pytest.raises(ValueError, match="hf_max_images"):
-            _dataset_over(rows)[0]
+    def test_several_images_keep_the_first_at_the_default_cap(self):
+        rows = [{"image": [_make_image(8, 0), _make_image(8, 255)], "caption": "a b"}]
+        pixels = _dataset_over(rows)[0]["pixel_values"]
+        assert pixels.shape == (3, 16, 16)
+        assert pixels.mean() < 0
 
     def test_rows_over_the_cap_are_counted_once_when_the_dataset_is_loaded(
         self, tmp_path, monkeypatch, caplog
@@ -983,8 +988,10 @@ class TestMultiImageRows:
         kwargs = dict(
             split="train", image_field="image", text_field="caption", tokenizer_path="gpt2"
         )
-        with pytest.raises(ValueError, match="2 of 3 rows hold several images.*hf_max_images"):
+        with caplog.at_level(logging.WARNING, logger="kempnerforge.data.vlm_dataset"):
             HuggingFaceVLMDataset(path, max_text_len=8, **kwargs)
+        assert "2 of 3 rows hold more than data.hf_max_images=1" in caplog.text
+        caplog.clear()
         with caplog.at_level(logging.WARNING, logger="kempnerforge.data.vlm_dataset"):
             ds = HuggingFaceVLMDataset(path, max_text_len=8, max_images=2, **kwargs)
         assert "2 of 3 rows hold more than data.hf_max_images=2" in caplog.text
@@ -1177,6 +1184,13 @@ class TestPackVLMSamples:
         assert batch["input_ids"].shape == (2, 12)
         assert batch["image_rows"].tolist() == [0, 1]
         assert batch["doc_ids"][0].tolist() == [0] * 5 + [1] * 7
+
+    def test_max_docs_per_row_caps_a_row_at_the_count(self):
+        docs = [_doc(2, 10), _doc(2, 20), _doc(2, 30)]
+        batch = pack_vlm_samples(docs, seq_len=12, tokens_per_image=2, pad_id=0, max_docs_per_row=2)
+        assert batch["input_ids"].shape == (2, 12)
+        assert batch["image_rows"].tolist() == [0, 0, 1]
+        assert batch["doc_ids"][0].tolist() == [0] * 4 + [1] * 4 + [2] * 4
 
     def test_collator_packs_the_batch(self):
         collator = PackedVLMCollator(pad_id=7, seq_len=12, tokens_per_image=2)

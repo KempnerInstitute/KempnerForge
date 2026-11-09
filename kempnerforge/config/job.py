@@ -70,6 +70,17 @@ class JobConfig:
         if not isinstance(self.plugins, list) or not all(isinstance(p, str) for p in self.plugins):
             raise ValueError(f"plugins must be a list of module paths (got {self.plugins!r})")
 
+        if self.data.hf_max_images != 1:
+            if self.vlm is None or self.video is not None:
+                raise ValueError(
+                    "data.hf_max_images applies to VLM image runs, not text runs or [video]"
+                )
+            if self.vlm.arch != "joint_decoder":
+                raise ValueError(
+                    "data.hf_max_images != 1 requires vlm.arch='joint_decoder' (got "
+                    f"{self.vlm.arch!r}); only its inline route places several images per document"
+                )
+
         if self.vlm is not None:
             if self.vision_encoder is None:
                 raise ValueError(
@@ -125,16 +136,6 @@ class JobConfig:
                     "data.hf_allow_text_only is not supported with vlm.arch='cross_attention': "
                     "its image K/V has no way to hide a document's blank image, so the text "
                     "would attend to it; use an image-prefix arch or packing"
-                )
-        if self.data.hf_max_images != 1:
-            if self.vlm is None or self.video is not None:
-                raise ValueError(
-                    "data.hf_max_images applies to VLM image runs, not text runs or [video]"
-                )
-            if self.vlm.arch != "joint_decoder":
-                raise ValueError(
-                    "data.hf_max_images != 1 requires vlm.arch='joint_decoder' (got "
-                    f"{self.vlm.arch!r}); only its inline route places several images per document"
                 )
         if self.data.pack_sequences and self.vlm is not None:
             if self.video is not None:

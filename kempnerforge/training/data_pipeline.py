@@ -148,21 +148,9 @@ def _build_vlm_pipeline(
             max_images=config.data.hf_max_images,
         )
         pad_id = _resolve_pad_id(config.data.tokenizer_path)
-        if config.data.pack_sequences:
-            tokens_per_image = _row_tokens_per_image(tokens_per_image, "data.pack_sequences")
-            collator = PackedVLMCollator(
-                pad_id=pad_id,
-                seq_len=tc.seq_len,
-                tokens_per_image=tokens_per_image,
-                allow_text_only=dataset.has_text_only_rows,
-            )
-            logger.info(
-                f"VLM dataset: {len(dataset):,} samples from {config.data.hf_dataset_name}, "
-                f"packed {tokens_per_image} image tokens + text per document into rows of "
-                f"{tc.seq_len}"
-            )
-        elif config.data.hf_max_images != 1:
-            tokens_per_image = _row_tokens_per_image(tokens_per_image, "data.hf_max_images")
+        if config.data.pack_sequences or config.data.hf_max_images != 1:
+            setting = "data.pack_sequences" if config.data.pack_sequences else "data.hf_max_images"
+            tokens_per_image = _row_tokens_per_image(tokens_per_image, setting)
             footprint = config.data.hf_max_images * tokens_per_image + vlm_cfg.max_text_len
             if footprint > tc.seq_len:
                 raise ValueError(
@@ -174,13 +162,14 @@ def _build_vlm_pipeline(
                 pad_id=pad_id,
                 seq_len=tc.seq_len,
                 tokens_per_image=tokens_per_image,
-                max_docs_per_row=1,
+                max_docs_per_row=0 if config.data.pack_sequences else 1,
                 allow_text_only=dataset.has_text_only_rows,
             )
+            layout = "packed" if config.data.pack_sequences else "one per row"
             logger.info(
                 f"VLM dataset: {len(dataset):,} samples from {config.data.hf_dataset_name}, "
-                f"up to {config.data.hf_max_images} images x {tokens_per_image} tokens per "
-                f"document in rows of {tc.seq_len}"
+                f"up to {config.data.hf_max_images} images x {tokens_per_image} tokens + text "
+                f"per document, {layout} in rows of {tc.seq_len}"
             )
         else:
             collator = VLMCollator(

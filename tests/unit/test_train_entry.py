@@ -2492,12 +2492,14 @@ class TestVlmSourceBuilders:
         with pytest.raises(ValueError, match="data.hf_max_images on a VLM run needs the built"):
             dp.build_data_pipeline(config, _runtime())
 
-    def test_fixed_rows_must_fit_the_image_cap_and_the_text(self, monkeypatch):
+    @pytest.mark.parametrize("pack", [False, True])
+    def test_laid_out_rows_must_fit_the_image_cap_and_the_text(self, monkeypatch, pack):
         seen: dict = {}
         dp = _stub_loaders(monkeypatch, seen)
         self._stub_vlm_modules(monkeypatch, seen)
         config = self._vlm_data_config()
         config.data.hf_max_images = 3
+        config.data.pack_sequences = pack
         too_many = (config.train.seq_len - config.vlm.max_text_len) // 3 + 1
         with pytest.raises(ValueError, match="over train.seq_len"):
             dp.build_data_pipeline(config, _runtime(), tokens_per_image=too_many)
@@ -2517,6 +2519,7 @@ class TestVlmSourceBuilders:
             "pad_id": 7,
             "seq_len": config.train.seq_len,
             "tokens_per_image": 12,
+            "max_docs_per_row": 0,
             "allow_text_only": False,
         }
         assert "image_collator" not in seen
