@@ -10,12 +10,13 @@ from typing import NamedTuple
 from PIL import Image, ImageOps
 
 from .points import pixels_to_percent
+from .skip import UnusableRowError
 
 DECODE_ERRORS = (OSError, ValueError, SyntaxError, Image.DecompressionBombError)
 EXIF_ORIENTATION = 0x0112
 
 
-class UnreadableImageError(Exception):
+class UnreadableImageError(UnusableRowError):
     """An image file or byte string that does not decode."""
 
 
