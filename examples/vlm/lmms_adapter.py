@@ -313,14 +313,15 @@ def _frames_to_pixel_values(
     tile_grid: int = 0,
     tile_global: bool = True,
 ) -> torch.Tensor:
-    """Convert an ordered list of frames to a ``(num_frames, 3, H, W)`` tensor.
+    """Convert an image request's frames to a ``(num_frames, 3, H, W)`` tensor.
 
-    Reuses the training-time ``pil_to_tensor`` (resize + SigLIP-style
-    normalize) as the single source of truth. v1 passes a single image (a
-    length-1 list); the list shape is the seam for future video (ordered
-    frames). Each frame may be a ``PIL.Image`` or a path string (see ``_to_pil``).
-    With ``tile_grid`` each frame is cut into views by the training-time
-    ``image_to_views`` and the tensor is ``(num_frames, views, 3, H, W)``.
+    Reuses the training-time ``image_to_views`` (resize + SigLIP-style
+    normalize, tiled into views when ``tile_grid`` is set) as the single source
+    of truth. The image path passes exactly one image, so the leading axis is
+    the request's batch slot and ``generate_until`` concatenates requests along
+    it; video requests go through ``frames_to_clip_tensor`` instead. Each frame
+    may be a ``PIL.Image`` or a path string (see ``_to_pil``). With ``tile_grid``
+    the tensor is ``(num_frames, views, 3, H, W)``.
     """
     tensors = [
         image_to_views(
@@ -550,7 +551,8 @@ class KempnerForgeVLM(lmms):
         self._max_seq_len = self._config.model.max_seq_len
         logger.info(
             f"KempnerForgeVLM ready: arch={self._arch}, video={self._is_video}, "
-            f"frames_per_clip={self._frames_per_clip}, device={self._device}, "
+            f"frames_per_clip={self._frames_per_clip}, tile_grid={self._tile_grid}, "
+            f"tile_global={self._tile_global}, device={self._device}, "
             f"dtype={self._dtype}, max_seq_len={self._max_seq_len}"
         )
 
