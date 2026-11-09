@@ -17,8 +17,10 @@ All optimizers:
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import logging
+from collections.abc import Iterator
 from typing import Any, ClassVar
 
 import torch
@@ -242,20 +244,43 @@ class ScheduleFreeAdamW(torch.optim.Optimizer):
         """
         for group in self.param_groups:
             for p in group["params"]:
-                if p in self.state and "x" in self.state[p]:
-                    p.data.copy_(self.state[p]["x"])
+                state = self.state.get(p)
+                if state and "x" in state:
+                    p.data.copy_(state["x"])
 
     def train_params(self) -> None:
-        """Restore parameters to the training point (interpolated y).
+        """Restore parameters to the training point (interpolated y), bit for bit.
 
-        Call after :meth:`eval_params` to resume training.
+        Call after :meth:`eval_params` to resume training. A parameter without state
+        stays as it is, and no state is created for it.
         """
         for group in self.param_groups:
             beta1 = group["betas"][0]
             for p in group["params"]:
-                state = self.state[p]
-                if "z" in state and "x" in state:
+                state = self.state.get(p)
+                if state and "z" in state and "x" in state:
                     p.data.copy_(state["z"]).lerp_(state["x"], beta1)
+
+
+@contextlib.contextmanager
+def evaluation_point(optimizer: torch.optim.Optimizer) -> Iterator[None]:
+    """Hold the parameters at ``optimizer``'s evaluation point inside the block.
+
+    An optimizer that evaluates at another point than it trains at, as
+    :class:`ScheduleFreeAdamW` does, has ``eval_params`` and ``train_params``: the block
+    runs between them, and the parameters leave it at the training point again, bit for
+    bit. Any other optimizer leaves them as they are.
+    """
+    to_eval = getattr(optimizer, "eval_params", None)
+    to_train = getattr(optimizer, "train_params", None)
+    if to_eval is None or to_train is None:
+        yield
+        return
+    to_eval()
+    try:
+        yield
+    finally:
+        to_train()
 
 
 @registry.register_optimizer("schedule_free_adamw")

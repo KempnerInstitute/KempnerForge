@@ -11,6 +11,7 @@ from kempnerforge.training.optimizer import (
     Lion,
     ScheduleFreeAdamW,
     build_optimizer,
+    evaluation_point,
 )
 from kempnerforge.training.scheduler import build_scheduler
 
@@ -411,6 +412,53 @@ class TestScheduleFreeAdamW:
             return model["b"].weight.detach() - before
 
         assert torch.equal(first_update(100), first_update(0))
+
+    def test_evaluation_point_swaps_in_x_and_restores_y_bit_for_bit(self):
+        """Inside ``evaluation_point`` the weights are x; after it they are y again, exactly."""
+        torch.manual_seed(0)
+        model = _make_model()
+        optimizer = ScheduleFreeAdamW(model.parameters(), lr=0.01)
+        for _ in range(5):
+            model(torch.randn(4, 32)).sum().backward()
+            optimizer.step()
+            optimizer.zero_grad()
+        y = [p.detach().clone() for p in model.parameters()]
+        with evaluation_point(optimizer):
+            inside = [p.detach().clone() for p in model.parameters()]
+        params = list(model.parameters())
+        assert all(
+            torch.equal(i, optimizer.state[p]["x"]) for i, p in zip(inside, params, strict=True)
+        )
+        assert not all(torch.equal(i, b) for i, b in zip(inside, y, strict=True))
+        assert all(torch.equal(b, p) for b, p in zip(y, params, strict=True))
+
+    def test_evaluation_point_gives_no_state_to_a_fresh_optimizer(self):
+        """The swap creates no optimizer state, so a step-0 save still writes no optimizer."""
+        model = _make_model()
+        optimizer = ScheduleFreeAdamW(model.parameters(), lr=0.01)
+        with evaluation_point(optimizer):
+            pass
+        assert not optimizer.state
+
+    def test_train_params_gives_no_state_to_a_fresh_optimizer(self):
+        """``train_params`` before the first step adds no empty state entries.
+
+        An empty entry makes ``optimizer.state`` truthy, so a step-0 save would write the
+        optimizer and DCP's load template would skip the step that builds every entry.
+        """
+        model = _make_model()
+        optimizer = ScheduleFreeAdamW(model.parameters(), lr=0.01)
+        optimizer.eval_params()
+        optimizer.train_params()
+        assert not optimizer.state
+
+    def test_evaluation_point_leaves_other_optimizers_alone(self):
+        model = _make_model()
+        optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
+        before = [p.detach().clone() for p in model.parameters()]
+        with evaluation_point(optimizer):
+            pass
+        assert all(torch.equal(b, p) for b, p in zip(before, model.parameters(), strict=True))
 
     def test_weight_decay(self):
         torch.manual_seed(42)

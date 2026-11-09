@@ -32,6 +32,7 @@ from kempnerforge.training.eval import run_eval
 from kempnerforge.training.freeze import apply_freeze_specs, freeze_meta_at_step
 from kempnerforge.training.grad import maybe_no_sync
 from kempnerforge.training.hooks import HookRunner, StepContext
+from kempnerforge.training.optimizer import evaluation_point
 from kempnerforge.training.runtime import PipelineBundle, RuntimeContext, pp_group
 
 logger = get_logger(__name__)
@@ -666,7 +667,7 @@ def run_training_loop(
                 and step % eval_config.interval == 0
             ):
                 pipeline = session.pipeline
-                with session.autocast():
+                with session.autocast(), evaluation_point(optimizer):
                     eval_metrics = run_eval(
                         model,
                         session.eval_dataloader,
