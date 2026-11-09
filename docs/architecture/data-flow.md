@@ -248,7 +248,8 @@ MoE runs additionally log `moe/aux_loss` and `moe/expert_balance`
 In order:
 
 - **NCCL health** (every `tc.nccl_health_check_interval` steps) — fires
-  a small all-reduce; if it fails on any rank, every rank breaks the loop.
+  a small all-reduce; if it fails on any rank, every rank leaves the loop
+  without saving, and the loop raises once the last async save is drained.
 - **Eval** (every `eval_config.interval` steps) — runs `run_eval` on the
   eval dataloader, logs metrics, fires `on_eval_end` hooks.
 - **Profiler** — `prof.step()` advances the `torch.profiler` schedule.
@@ -258,9 +259,10 @@ In order:
   updates the `latest` symlink.
 - **Graceful shutdown** — if SIGTERM/SIGUSR1 fired,
   whichever rank it reached (the ranks vote over a gloo group of their
-  own), every rank writes `ckpt_mgr.save(step)` as the emergency
-  checkpoint, then exits; a step the checkpoint above already saved is
-  not saved again, and the loop waits for that save. A NaN-skipped
+  own, and a rank the vote stops arms its own forced-exit timer), every
+  rank writes `ckpt_mgr.save(step)` as the emergency checkpoint, then
+  exits; a step the checkpoint above already saved is not saved again,
+  and the loop waits for that save. A NaN-skipped
   step (section 7) runs this check too; the checkpoint above never
   saves such a step, so it writes its own emergency checkpoint, but
   only if an all-reduced check finds every rank's parameters finite.

@@ -49,6 +49,8 @@ session.shutdown_handler.reinstall()
 requested_here = session.shutdown_handler.should_shutdown()
 if not any_rank(requested_here, session.control_group):
     return False
+if not requested_here:
+    session.shutdown_handler.request()
 if saved_this_step:
     ckpt_mgr.wait()
 elif nan_skipped and not params_are_finite(session.model, session.runtime.device):
@@ -61,14 +63,17 @@ return True
 
 `register()` installs handlers for `SIGTERM` and `SIGUSR1`, and
 `reinstall()` installs them again at every step (see `SIGUSR1` below).
-The loop never calls `finish()`: `run_training` calls it once the loop
-has flushed the emergency checkpoint with `ckpt_mgr.wait()` and the
-process group is destroyed. Until then a second signal only sets the
-flag again, and the forced-exit timer still bounds a stalled write or
-teardown. `finish()` restores the previous signal handlers and cancels
-the timer; `unregister()` and `cancel_watchdog()` do one each. A
-shutdown on a step the checkpoint schedule already saved reuses that
-save as the emergency checkpoint instead of writing the step twice.
+A rank that learns of the shutdown only from the vote calls
+`request()`, which sets its flag and starts its forced-exit timer as a
+signal would. The loop never calls `finish()`: `run_training` calls it
+once the loop has flushed the emergency checkpoint with
+`ckpt_mgr.wait()` and the process group is destroyed. Until then a
+second signal only sets the flag again, and the forced-exit timer stays
+armed (see Forced-exit timer below). `finish()` restores the previous
+signal handlers and cancels the timer; `unregister()` and
+`cancel_watchdog()` do one each. A shutdown on a step the checkpoint
+schedule already saved reuses that save as the emergency checkpoint
+instead of writing the step twice.
 
 A step skipped for a NaN / Inf loss runs the same check, so a signal
 that arrives during a run of NaN steps is acted on at the next one
@@ -118,7 +123,8 @@ safely, `ckpt_mgr.wait()` can flush the async writer, and the process
 group can be destroyed cleanly.
 
 `session.control_group` is a gloo group that `run_training_loop` makes
-when it starts, so every rank must call the loop. It is not the default
+when it starts, unless the caller passed one in, and destroys when it
+ends, so every rank must call the loop. It is not the default
 process group: DCP's async save issues gloo collectives on that group
 from a background thread, and a main-thread all-reduce there could run
 in a different order on different ranks. On a gloo group of its own,
@@ -147,18 +153,19 @@ skips C++ destructors, kills the process immediately. That's intentional:
 at this point graceful didn't work, and leaving a zombie holding GPU
 memory would block the requeue.
 
-The timer stays armed until `run_training` calls `finish()`, after the
-emergency checkpoint is flushed and the process group is destroyed, so
-it bounds a hung flush or teardown too. Only a rank that received a
-signal arms it. If the shutdown hangs, a rank that stopped because
-another rank was signaled goes down with the job when that rank's timer
-fires: the SLURM scripts launch with `srun --kill-on-bad-exit=1`, and
-`torchrun` stops the other workers when one fails.
+Every rank that stops arms its timer: a signaled rank when the signal
+arrives, and a rank that learned of the shutdown from the vote when it
+calls `request()`. The timer stays armed until `run_training` calls
+`finish()`, after the emergency checkpoint is flushed and the process
+group is destroyed, so, when it is shorter than the time SLURM allows,
+it bounds a hung flush or teardown too.
 
 `timeout_sec` comes from `train.shutdown_timeout_sec` (default 600s = 10
 min). Set to 0 to disable the timer entirely — not recommended under
 SLURM because you then rely on SLURM's own kill-timeout, which may
-leave GPU state half-freed.
+leave GPU state half-freed. Under the shipped SLURM scripts the 600 s
+default fires only after SLURM's SIGKILL; set it below the signal lead
+if you want the timer to bound a hung save.
 
 ## SLURM side
 
@@ -176,11 +183,12 @@ Two directives:
   the allocation's `srun` child and bash (and therefore our Python)
   might miss it.
 
-  `srun` then forwards the signal to each task's Python process. The
-  120-second lead time must exceed `shutdown_timeout_sec` plus the time
-  for the in-flight step + checkpoint to finish — 600s default is safe
-  for most configs; reduce to ~90s if your checkpoints save quickly and
-  you want to maximize step time.
+  How the signal reaches the ranks depends on the launch script. The
+  emergency save, its flush and the teardown must finish before SLURM's
+  SIGKILL. The forced-exit timer only helps if it fires first, so
+  `shutdown_timeout_sec` must be shorter than the lead. The 600 s
+  default is not, so under these scripts SLURM's kill always comes
+  first. Deriving the timeout from the lead is not done yet.
 
 - **`--requeue`** — if the job is preempted, SLURM re-submits it. The
   new run reads
@@ -191,12 +199,15 @@ Two directives:
 ## The full preemption timeline
 
 ```
-  T-120s: SLURM sends SIGTERM to batch shell → srun → all Python ranks
+  T-120s: SIGTERM reaches the ranks, the way the launch script arranges
   T-120s: ShutdownHandler sets _shutdown_requested = True
-          ShutdownHandler starts 600s forced-exit timer (T+480s)
+          ShutdownHandler starts the forced-exit timer, due
+          shutdown_timeout_sec later; with the 600s default that is
+          after the SIGKILL at T-0, so it never fires
   T-120s: Training loop in mid-step — completes the step
    T-??s: Ranks vote on should_shutdown() → all save the emergency
-          checkpoint at the same step
+          checkpoint at the same step; a rank the vote stopped
+          starts its own forced-exit timer with request()
           ckpt_mgr.wait() flushes async writer to disk
    T-??s: Process group destroyed; shutdown_handler.finish() restores
           the handlers and cancels the forced-exit timer
@@ -225,26 +236,30 @@ step is long.
 
 Native code can replace the handlers below Python, where
 `signal.getsignal` still reports KempnerForge's. The LLVM inside Triton
-does on its first in-process compile (with `train.compile_model` or
+does when it compiles a kernel in the training process that Triton's
+cache does not already hold (with `train.compile_model` or
 FlexAttention), after which a `SIGUSR1` does nothing; a `SIGTERM` still
 gets through, because LLVM's handler hands it back. The loop therefore
 reinstalls the handlers at every step, in `_shutdown_if_requested`, so
-only a `SIGUSR1` that arrives between that first compile and the end of
-its step is lost.
+only a `SIGUSR1` that arrives between such a compile and the end of its
+step is lost. Only the main thread can install a handler, so a loop run
+on another thread skips the reinstall.
 
 ## Troubleshooting
 
 **"Received SIGTERM" logged but no emergency checkpoint saved.** Usually
-means `shutdown_timeout_sec` was too short: the forced-exit timer fired
-while the async checkpoint was still writing. Increase the timeout. If
-an ERROR says the parameters are not finite, the signal arrived during a
-run of NaN steps whose weights a bad update had already ruined, and the
-loop skipped the save on purpose; `latest` still names the last
-checkpoint saved.
+means SLURM killed the ranks before the save and its flush finished
+(the signal lead plus KillWait). With `shutdown_timeout_sec` below
+that, the forced exit can also end a slow flush; the log then shows
+`Graceful shutdown timed out`. If an ERROR says the parameters are not
+finite, the signal arrived during a run of NaN steps whose weights a
+bad update had already ruined, and the loop skipped the save on
+purpose; `latest` still names the last checkpoint saved.
 
-**`SIGUSR1` sent but nothing logged.** If it arrived during the first
-step of a compiled run, Triton's LLVM handler may have swallowed it
-before the loop reinstalled its own (see `SIGUSR1` above). Send it
+**`SIGUSR1` sent but nothing logged.** If it arrived during a step in
+which Triton compiled a kernel in the training process, usually the
+first step of a compiled run, Triton's LLVM handler may have swallowed
+it before the loop reinstalled its own (see `SIGUSR1` above). Send it
 again.
 
 **Process hangs after "Shutdown requested".** Check for an in-flight

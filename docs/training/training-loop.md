@@ -176,19 +176,22 @@ After the step body, before advancing:
 
 | Tick | Trigger | What it does |
 |------|---------|--------------|
-| NCCL health | `step % tc.nccl_health_check_interval == 0` | Small all-reduce; every rank breaks if it failed on any rank |
+| NCCL health | `step % tc.nccl_health_check_interval == 0` | Small all-reduce; if it failed on any rank, every rank stops without saving and the loop raises `RuntimeError` |
 | Eval | `step % eval_config.interval == 0` | [`run_eval`](evaluation.md), `on_eval_end` hook |
 | Profiler | every step | `prof.step()` advances the schedule |
 | Checkpoint | `checkpoint.should_save(step)`: `dyn_ckpt_window` milestones inside the window, every `checkpoint.interval` steps outside it | `ckpt_mgr.save(step)`, `on_checkpoint_save` hook |
 | Shutdown | SIGTERM / SIGUSR1 pending on any rank | `ckpt_mgr.save(step)`, or `ckpt_mgr.wait()` when the checkpoint tick just saved this step; then break |
 
-The two stop rows are votes. Each rank's own verdict, a pending signal
-or a failed probe, goes into one all-reduce over `session.control_group`,
-a gloo group the loop makes when it starts, so every rank stops at the
-same step or none does (see
-[SLURM preemption](../resilience/slurm-preemption.md)). The loop leaves
+The two stop rows are votes. Each row all-reduces the ranks' own
+verdicts, a failed probe or a pending signal, over
+`session.control_group`, a gloo group the loop makes when it starts, so
+every rank stops at the same step or none does (see
+[SLURM preemption](../resilience/slurm-preemption.md)). A rank the
+shutdown vote stops arms its own forced-exit timer, and the loop leaves
 the shutdown handler armed; `run_training` calls `finish()` only after
-the final flush and the teardown.
+the final flush and the teardown. An NCCL stop saves nothing and fails
+the run: once the last async save is drained, the loop raises
+`RuntimeError` on every rank.
 
 A step skipped for a NaN / Inf loss runs only the shutdown row, through
 the same `_shutdown_if_requested` helper. The checkpoint tick does not
@@ -239,9 +242,12 @@ prof.stop()
 if completed_normally and not config.checkpoint.should_save(step):
     ckpt_mgr.save(step, ...)           # final checkpoint; `latest` committed after wait
 ckpt_mgr.wait()                        # drain last async save
+if nccl_failed_at is not None:
+    raise RuntimeError(...)            # an NCCL stop fails the run
 hook_runner.on_train_end(step, tokens_seen)
 tracker.close()
 destroy_distributed()
+shutdown_handler.finish()              # restore the handlers, cancel the timer
 ```
 
 On a clean finish, an unconditional checkpoint is written at `max_steps`
