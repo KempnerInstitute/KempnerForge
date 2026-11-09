@@ -457,15 +457,18 @@ class VLMWrapper(nn.Module):
             raise ValueError("image_rows, image_starts and image_tokens must be given together")
         if image_rows is not None and frame_mask is not None:
             raise ValueError("a packed batch carries no frame_mask")
-        modality = self.strategy.prepare(
-            self,
-            pixel_values,
-            input_ids,
-            frame_mask=frame_mask,
-            image_rows=image_rows,
-            image_starts=image_starts,
-            image_tokens=image_tokens,
-        )
+        if image_rows is None:
+            modality = self.strategy.prepare(self, pixel_values, input_ids, frame_mask=frame_mask)
+        else:
+            modality = self.strategy.prepare(
+                self,
+                pixel_values,
+                input_ids,
+                frame_mask=frame_mask,
+                image_rows=image_rows,
+                image_starts=image_starts,
+                image_tokens=image_tokens,
+            )
         logits = self.transformer(
             tokens=input_ids, modality=modality, doc_ids=doc_ids, position_ids=position_ids
         )

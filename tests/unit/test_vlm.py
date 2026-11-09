@@ -453,6 +453,24 @@ class TestPackedForward:
         with pytest.raises(ValueError, match=r"image_rows and image_starts must be \(1,\)"):
             self._forward(wrapper, batch)
 
+    def test_an_unpacked_forward_keeps_the_old_prepare_signature(self):
+        wrapper = _build_tiny_wrapper(num_image_tokens=8)
+        seen: dict = {}
+
+        class OldStrategy:
+            def prepare(self, w, pixel_values, input_ids, frame_mask=None):
+                seen["called"] = True
+                return JointDecoderStrategy().prepare(
+                    w, pixel_values, input_ids, frame_mask=frame_mask
+                )
+
+            def num_image_tokens(self, w):
+                return 8
+
+        wrapper.strategy = OldStrategy()
+        logits, _ = wrapper(torch.randn(1, 3, 16, 16), torch.randint(0, 256, (1, 12)))
+        assert seen["called"] and logits.shape == (1, 12, 256)
+
     @pytest.mark.parametrize("arch", ["cross_attention", "mot", "moma"])
     def test_other_arches_reject_packed_batches(self, arch):
         strategy = build_modality_strategy(VLMConfig.for_arch(arch))

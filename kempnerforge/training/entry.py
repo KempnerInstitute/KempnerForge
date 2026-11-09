@@ -30,6 +30,7 @@ from kempnerforge.distributed.setup import destroy_distributed
 from kempnerforge.distributed.tensor_parallel import apply_tensor_parallel
 from kempnerforge.metrics.logger import get_logger
 from kempnerforge.metrics.tracker import MetricsTracker
+from kempnerforge.model.masking import use_dynamic_flex_shapes
 from kempnerforge.model.mot import mot_warm_start_from_text_stack
 from kempnerforge.model.transformer import Transformer
 from kempnerforge.model.vlm import inner_transformer, packed_tokens_per_image
@@ -282,6 +283,7 @@ def run_training(
         nan_detector = NaNDetector(action="warn", max_consecutive=10)
 
         loss_fn = build_loss_fn(config.train)
+        use_dynamic_flex_shapes(config.is_vlm and config.data.pack_sequences)
         model, pipeline = build_model(config, runtime, loss_fn)
         amp_dtype = autocast_dtype(model, config.train.master_dtype, config.train.param_dtype)
         if amp_dtype is not None:

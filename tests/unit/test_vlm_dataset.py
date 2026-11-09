@@ -980,6 +980,12 @@ class TestPackVLMSamples:
         with pytest.raises(ValueError, match="no samples"):
             collator([])
 
+    def test_text_len_outside_the_ids_raises(self):
+        doc = _doc(3, 10)
+        doc["text_len"] = torch.tensor(40)
+        with pytest.raises(ValueError, match="text_len \\(40\\) must lie within"):
+            pack_vlm_samples([doc], seq_len=64, tokens_per_image=2, pad_id=0)
+
     def test_a_document_without_an_image_raises(self):
         doc = _doc(3, 10)
         doc["pixel_values"] = torch.zeros(0, 3, 4, 4)

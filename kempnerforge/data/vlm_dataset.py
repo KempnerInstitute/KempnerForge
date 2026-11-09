@@ -503,7 +503,10 @@ def pack_vlm_samples(
             views = views.unsqueeze(0)
         if views.shape[0] == 0:
             raise ValueError("pack_vlm_samples: every document needs at least one image")
-        text_len = int(sample["text_len"]) if "text_len" in sample else sample["input_ids"].shape[0]
+        n_ids = sample["input_ids"].shape[0]
+        text_len = int(sample["text_len"]) if "text_len" in sample else n_ids
+        if not 0 <= text_len <= n_ids:
+            raise ValueError(f"text_len ({text_len}) must lie within the {n_ids} input_ids")
         footprint = views.shape[0] * tokens_per_image + text_len
         if footprint > seq_len:
             raise ValueError(

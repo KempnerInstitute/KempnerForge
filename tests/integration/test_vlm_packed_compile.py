@@ -12,6 +12,7 @@ from kempnerforge.config.model import FLEX_BLOCK_SIZE, ModelConfig
 from kempnerforge.config.vision import VisionEncoderConfig
 from kempnerforge.config.vlm import VLMConfig
 from kempnerforge.data.vlm_dataset import pack_vlm_samples
+from kempnerforge.model.masking import use_dynamic_flex_shapes
 from kempnerforge.model.vlm import VLMWrapper, build_vlm_wrapper
 from kempnerforge.training.loop import _mark_rows_dynamic
 
@@ -78,6 +79,7 @@ def test_packed_flex_compile_tracks_varying_rows_and_images() -> None:
 
     torch._dynamo.reset()
     counters.clear()
+    use_dynamic_flex_shapes(True)
     torch.manual_seed(0)
     dense = _model("sdpa")
     sparse = _model("flex")
@@ -123,4 +125,5 @@ def test_packed_flex_compile_tracks_varying_rows_and_images() -> None:
                 f"{after_warmup} -> {counters['stats']['unique_graphs']} graphs"
             )
     finally:
+        use_dynamic_flex_shapes(False)
         torch._dynamo.reset()
