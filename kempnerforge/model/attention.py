@@ -134,7 +134,10 @@ class Attention(nn.Module):
         """
         if self.sdpa_backend == "auto":
             return contextlib.nullcontext()
-        return sdpa_kernel(self._sdpa_backends(appended=appended), set_priority=True)
+        backends = self._sdpa_backends(appended=appended)
+        if len(backends) == 1:
+            return sdpa_kernel(backends)
+        return sdpa_kernel(backends, set_priority=True)
 
     def forward(
         self,
@@ -216,11 +219,16 @@ class Attention(nn.Module):
             k = k.repeat_interleave(self.n_rep, dim=1)
             v = v.repeat_interleave(self.n_rep, dim=1)
 
-        if attn_mask is not None and past > 0 and attn_mask.shape[-1] != k.shape[2]:
+        if (
+            isinstance(attn_mask, torch.Tensor)
+            and past > 0
+            and tuple(attn_mask.shape[-2:]) != (seq_len, k.shape[2])
+        ):
             raise ValueError(
-                f"attn_mask spans {attn_mask.shape[-1]} keys but the cache holds "
-                f"{k.shape[2]}; a visibility mask is square over the residual and does "
-                "not compose with a non-empty kv_cache"
+                f"attn_mask covers {tuple(attn_mask.shape[-2:])} (queries, keys) but this "
+                f"forward appends {seq_len} queries to a cache holding {k.shape[2]} keys; a "
+                "visibility mask is square over the residual and does not compose with a "
+                "non-empty kv_cache"
             )
 
         if isinstance(attn_mask, BlockMask):

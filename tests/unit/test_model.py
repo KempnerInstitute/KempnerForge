@@ -210,9 +210,12 @@ class TestAttention:
         )
         with torch.no_grad():
             attn(torch.randn(1, 4, 64), cos[:4], sin[:4], kv_cache=cache)
+            x = torch.randn(1, 3, 64)
             square = torch.ones(1, 1, 3, 3, dtype=torch.bool)
-            with pytest.raises(ValueError, match="does not compose with a non-empty kv_cache"):
-                attn(torch.randn(1, 3, 64), cos[4:7], sin[4:7], kv_cache=cache, attn_mask=square)
+            whole = torch.ones(7, 7, dtype=torch.bool)
+            for wrong in (square, whole):
+                with pytest.raises(ValueError, match="does not compose with a non-empty kv_cache"):
+                    attn(x, cos[4:7], sin[4:7], kv_cache=cache, attn_mask=wrong)
 
     @pytest.mark.parametrize("capture", [False, True])
     def test_a_layer_on_its_own_appends_tokens_under_a_pinned_kernel(self, capture):
