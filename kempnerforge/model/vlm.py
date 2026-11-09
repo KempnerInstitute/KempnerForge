@@ -452,8 +452,9 @@ class VLMWrapper(nn.Module):
         image_starts: torch.Tensor | None = None,
         image_tokens: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        if (image_rows is None) != (image_starts is None):
-            raise ValueError("image_rows and image_starts must be given together")
+        placement = (image_rows is None, image_starts is None, image_tokens is None)
+        if any(placement) and not all(placement):
+            raise ValueError("image_rows, image_starts and image_tokens must be given together")
         if image_rows is not None and frame_mask is not None:
             raise ValueError("a packed batch carries no frame_mask")
         modality = self.strategy.prepare(

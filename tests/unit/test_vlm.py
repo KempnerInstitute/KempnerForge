@@ -417,6 +417,13 @@ class TestPackedForward:
         batch = pack_vlm_samples([_packed_doc(10, 9)], seq_len=32, tokens_per_image=8, pad_id=0)
         with pytest.raises(ValueError, match="given together"):
             wrapper(batch["pixel_values"], batch["input_ids"], image_rows=batch["image_rows"])
+        with pytest.raises(ValueError, match="given together"):
+            wrapper(
+                batch["pixel_values"],
+                batch["input_ids"],
+                image_rows=batch["image_rows"],
+                image_starts=batch["image_starts"],
+            )
         with pytest.raises(ValueError, match="no frame_mask"):
             wrapper(
                 batch["pixel_values"],
@@ -424,6 +431,7 @@ class TestPackedForward:
                 frame_mask=torch.ones(1, 1, dtype=torch.bool),
                 image_rows=batch["image_rows"],
                 image_starts=batch["image_starts"],
+                image_tokens=8,
             )
 
     def test_packed_pixels_require_a_flat_image_batch(self) -> None:

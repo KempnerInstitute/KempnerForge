@@ -2441,6 +2441,8 @@ class TestVlmSourceBuilders:
         assert "image_collator" not in seen
         with pytest.raises(ValueError, match="built model's tokens per image"):
             dp.build_data_pipeline(config, _runtime())
+        with pytest.raises(ValueError, match="cannot hold one packed document"):
+            dp.build_data_pipeline(config, _runtime(), tokens_per_image=config.train.seq_len)
 
     def test_video_path_uses_the_video_collator(self, monkeypatch):
         seen: dict = {}
