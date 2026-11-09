@@ -934,6 +934,51 @@ class _HeldLock:
         self._lock.release()
 
 
+class _PrunedDirs(list):
+    """Directories passed to ``shutil.rmtree``, in order; ``refused`` holds those NFS kept."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.refused: list[Path] = []
+
+    def still_present(self) -> list[Path]:
+        """The directories that exist although their removal went through."""
+        return [d for d in self if d not in self.refused and d.exists()]
+
+
+@pytest.fixture
+def pruned_dirs(tmp_path, monkeypatch) -> _PrunedDirs:
+    """The directories under ``tmp_path`` passed to ``shutil.rmtree``, in order.
+
+    ``tmp_path`` is the manager's base directory in the tests that use this; other paths
+    go to ``shutil.rmtree`` unchanged. On NFS, removing a directory a moment after writing
+    into it can fail with ``ENOTEMPTY`` or ``EBUSY`` (an ``.nfsXXXX`` entry keeps it
+    non-empty), so such a failure is noted in ``refused`` instead of raised, and a test
+    asserts on this list rather than on what the filesystem still holds. Any other error
+    is raised as usual.
+    """
+    import errno
+
+    from kempnerforge.checkpoint import manager as mgr_mod
+
+    rmtree = mgr_mod.shutil.rmtree
+    pruned = _PrunedDirs()
+
+    def record(path, *args, **kwargs):
+        if not Path(path).is_relative_to(tmp_path):
+            return rmtree(path, *args, **kwargs)
+        pruned.append(Path(path))
+        try:
+            rmtree(path, *args, **kwargs)
+        except OSError as e:
+            if e.errno not in (errno.ENOTEMPTY, errno.EBUSY):
+                raise
+            pruned.refused.append(Path(path))
+
+    monkeypatch.setattr(mgr_mod.shutil, "rmtree", record)
+    return pruned
+
+
 class TestSaveCheckpointRegistration:
     """A registrar adds fields to a save's ``tracking`` records, and registers it on commit."""
 
@@ -1158,7 +1203,9 @@ class TestSaveCheckpointRegistration:
         assert registrar.registered == []
         assert not (tmp_path / "latest").exists()
 
-    def test_a_registrar_that_raises_costs_only_the_registration(self, tmp_path, monkeypatch):
+    def test_a_registrar_that_raises_costs_only_the_registration(
+        self, tmp_path, monkeypatch, pruned_dirs
+    ):
         warnings = self._log(monkeypatch, "warning")
         mgr = _make_mock_mgr(tmp_path, monkeypatch)
         mgr.config.keep_last_n = 1
@@ -1167,7 +1214,8 @@ class TestSaveCheckpointRegistration:
         mgr.save(step=1, tokens_seen=8)
         mgr.save(step=2, tokens_seen=16)
         assert (tmp_path / "latest").resolve() == (tmp_path / "step_2").resolve()
-        assert not (tmp_path / "step_1").exists()
+        assert pruned_dirs == [tmp_path / "step_1"]
+        assert pruned_dirs.still_present() == []
         assert self._sidecar(tmp_path, 2)["tracking"] == [self.MLFLOW]
         assert len(warnings) == 2 and "step_2" in warnings[1] and "no server" in warnings[1]
 
@@ -1858,10 +1906,11 @@ class TestAsyncLatestSymlinkSafety:
         assert step == 20
         assert tokens == 2000
 
-    def test_cleanup_never_deletes_latest_or_in_flight(self, tmp_path, monkeypatch):
+    def test_cleanup_never_deletes_latest_or_in_flight(self, tmp_path, pruned_dirs):
+        """Step 6 is newest, so only the latest and in-flight protections keep steps 3 and 5."""
         mgr = self._mgr(tmp_path, AsyncCheckpointMode.async_pinned)
         mgr.config.keep_last_n = 1
-        dirs = {s: self._build_ckpt(tmp_path, s, complete=True) for s in (1, 2, 3, 4, 5)}
+        dirs = {s: self._build_ckpt(tmp_path, s, complete=True) for s in (1, 2, 3, 4, 5, 6)}
 
         latest = Path(tmp_path) / "latest"
         latest.symlink_to(dirs[3].name)
@@ -1871,8 +1920,8 @@ class TestAsyncLatestSymlinkSafety:
 
         assert dirs[3].exists(), "cleanup deleted the live `latest` target"
         assert dirs[5].exists(), "cleanup deleted the in-flight pending checkpoint"
-        assert not dirs[1].exists()
-        assert not dirs[2].exists()
+        assert pruned_dirs == [dirs[1], dirs[2], dirs[4]]
+        assert pruned_dirs.still_present() == []
 
     @pytest.mark.parametrize("pp_rank", [None, 0], ids=["no_pp", "pp_stage_0"])
     @pytest.mark.parametrize(

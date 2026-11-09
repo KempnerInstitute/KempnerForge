@@ -1698,6 +1698,36 @@ class TestRegistry:
         assert reg.get("model", "x") == "model_x"
         assert reg.get("optimizer", "x") == "opt_x"
 
+    def test_unregister_removes_the_entry_and_returns_it(self):
+        reg = Registry()
+        reg.register("model", "a", "model_a")
+        reg.register("model", "b", "model_b")
+        assert reg.unregister("model", "a") == "model_a"
+        assert reg.list("model") == ["b"]
+        reg.register("model", "a", "model_a2")
+        assert reg.get("model", "a") == "model_a2"
+
+    def test_unregister_unknown_raises(self):
+        reg = Registry()
+        reg.register("model", "a", None)
+        with pytest.raises(KeyError, match=r"Unknown model: 'b'\. Available: \['a'\]"):
+            reg.unregister("model", "b")
+
+    def test_unregister_adapter_drops_its_accepts(self):
+        """The adapter and its ``accepts`` declaration leave together, so a later
+        adapter under the same name does not inherit the old declaration."""
+        reg = Registry()
+
+        def build(in_dim, out_dim, **_):
+            return None
+
+        reg.register_adapter("a", accepts=("pool_window",))(build)
+        assert reg.unregister("adapter", "a") is build
+        assert reg.list_adapters() == []
+        assert reg.get_adapter_accepts("a") is None
+        reg.register_adapter("a")(build)
+        assert reg.get_adapter_accepts("a") is None
+
     def test_builtin_optimizer_registered(self):
         from kempnerforge.config.registry import registry
         from kempnerforge.training import optimizer as _  # noqa: F401
