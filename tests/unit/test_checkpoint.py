@@ -456,6 +456,12 @@ def _mock_dcp_load(monkeypatch):
     monkeypatch.setattr("kempnerforge.checkpoint.manager.dcp.load", MagicMock())
 
 
+def _listing(directory: Path) -> list[str]:
+    """The names in ``directory``, without the ``.nfs*`` entries an NFS client keeps for a
+    replaced or removed file that is still open, until its last reference closes."""
+    return sorted(p.name for p in directory.iterdir() if not p.name.startswith(".nfs"))
+
+
 def _make_mock_mgr(tmp_path, monkeypatch, *, ignore_freeze_mismatch=False):
     """Build a CheckpointManager with DCP calls mocked out (no distributed)."""
     from unittest.mock import MagicMock
@@ -1400,7 +1406,12 @@ class TestSaveCheckpointRegistration:
         assert (tmp_path / "latest").resolve() == (tmp_path / "step_1").resolve()
         assert len(warnings) == 1 and "<unprintable Unprintable>" in warnings[0]
 
-    def test_record_amends_one_record_atomically_through_a_temp_file(self, tmp_path, monkeypatch):
+    @pytest.mark.parametrize("nfs_held", [False, True], ids=["local", "nfs-held"])
+    def test_record_amends_one_record_atomically_through_a_temp_file(
+        self, tmp_path, monkeypatch, nfs_held
+    ):
+        """With ``nfs-held`` the replace keeps the old sidecar under a ``.nfs`` name, as an NFS
+        client does while that file is still open; the listing leaves that entry out."""
         _, registrar = self._registered(tmp_path, monkeypatch, {"mlflow": {"model_name": "m"}})
         sidecar = tmp_path / "step_1" / "metadata.json"
         sidecar.chmod(0o640)
@@ -1409,6 +1420,8 @@ class TestSaveCheckpointRegistration:
 
         def spy(src, dst):
             replaced.append((Path(src), Path(dst), Path(src).read_text()))
+            if nfs_held:
+                os.link(dst, Path(dst).with_name(".nfs000000000000000100000001"))
             replace(src, dst)
 
         monkeypatch.setattr(os, "replace", spy)
@@ -1422,7 +1435,7 @@ class TestSaveCheckpointRegistration:
         }
         assert sidecar.read_text() == text == json.dumps(expected, indent=2)
         assert stat.S_IMODE(sidecar.stat().st_mode) == 0o640
-        assert sorted(p.name for p in sidecar.parent.iterdir()) == [
+        assert _listing(sidecar.parent) == [
             "metadata.json",
             "train_state.pt",
         ]
@@ -1462,7 +1475,7 @@ class TestSaveCheckpointRegistration:
         warnings = self._log(monkeypatch, "warning")
         registrar.records[0]("mlflow", {"model_id": "m-1"})
         assert sidecar.read_bytes() == before
-        assert sorted(p.name for p in sidecar.parent.iterdir()) == [
+        assert _listing(sidecar.parent) == [
             "metadata.json",
             "train_state.pt",
         ]
@@ -1483,7 +1496,7 @@ class TestSaveCheckpointRegistration:
         with pytest.raises(OSError, match="disk full"):
             mgr.save(step=1, tokens_seen=16)
         assert sidecar.read_bytes() == before
-        assert sorted(p.name for p in sidecar.parent.iterdir()) == [
+        assert _listing(sidecar.parent) == [
             "metadata.json",
             "train_state.pt",
         ]
