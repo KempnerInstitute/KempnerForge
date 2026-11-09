@@ -421,6 +421,7 @@
       "functions": [
         "_project_image_features(wrapper, pixel_values) -> Tensor",
         "build_modality_strategy(vlm) -> ModalityStrategy",
+        "_is_encoder_frozen(specs) -> bool",
         "build_vlm_wrapper(model_config) -> VLMWrapper",
         "inner_transformer(model) -> nn.Module"
       ],
@@ -433,6 +434,7 @@
         "tests/unit/test_vlm.py::TestAdapter",
         "tests/unit/test_vlm.py::TestVLMWrapper",
         "tests/unit/test_vlm.py::TestInnerTransformer",
+        "tests/unit/test_vlm.py::TestIsEncoderFrozen",
         "tests/unit/test_vlm.py::TestModalityStrategies",
         "tests/unit/test_vlm.py::TestVLMWrapperDispatch",
         "tests/integration/test_vlm_train_step.py",
@@ -1189,7 +1191,8 @@
       "tested_by": [
         "tests/unit/test_checkpoint.py::TestRNGState",
         "tests/unit/test_checkpoint.py::TestBuildTrainState",
-        "tests/unit/test_checkpoint.py::TestRestoreTrainState"
+        "tests/unit/test_checkpoint.py::TestRestoreTrainState",
+        "tests/integration/test_checkpoint_roundtrip.py::TestCheckpointRoundtrip"
       ]
     },
     "kempnerforge/checkpoint/manager.py": {
@@ -1228,7 +1231,7 @@
         "tests/unit/test_checkpoint.py::TestFreshIfUnheld",
         "tests/unit/test_checkpoint_security.py::TestLoadTrainStateOwnershipGate",
         "tests/unit/test_checkpoint_security.py::TestManagerLoadRejectsForeignCheckpoint",
-        "tests/integration/test_checkpoint_roundtrip.py::TestCheckpointRoundtrip",
+        "tests/unit/test_checkpoint.py::TestCheckpointManagerLoad",
         "tests/distributed/test_checkpoint.py"
       ]
     },
@@ -1520,10 +1523,10 @@
           "TestGetWorldInfo(5)",
           "TestDefaultMpPolicy(2)",
           "TestApplyFsdpVLMGuards(2)",
-          "TestBuildParallelModelVLM(5)",
+          "TestBuildParallelModelVLM(6)",
           "TestFsdpWrapTransformerBlocksHelper(1)"
         ],
-        "count": 34
+        "count": 35
       },
       "tests/unit/test_resilience.py": {
         "classes": [
@@ -1757,11 +1760,12 @@
           "TestAdapter(8)",
           "TestVLMWrapper(7)",
           "TestInnerTransformer(5)",
+          "TestIsEncoderFrozen(5)",
           "TestModalityStrategies(5)",
           "TestVLMWrapperDispatch(11)",
           "TestBuildVLMWrapperErrors(1)"
         ],
-        "count": 37
+        "count": 42
       },
       "tests/unit/test_vlm_config.py": {
         "classes": [

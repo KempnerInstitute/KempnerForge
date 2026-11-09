@@ -472,6 +472,39 @@ class TestBuildParallelModelVLM:
         assert model.vision_encoder.training is False
         assert all(not p.requires_grad for p in model.vision_encoder.parameters())
 
+    def test_partially_unfrozen_encoder_stays_in_train_mode(self):
+        from kempnerforge.config.adapter import AdapterConfig
+        from kempnerforge.config.vision import VisionEncoderConfig
+        from kempnerforge.config.vlm import FreezeSpec, VLMConfig
+        from kempnerforge.distributed.parallel import build_parallel_model
+
+        mc = ModelConfig(
+            dim=64,
+            n_layers=2,
+            n_heads=4,
+            n_kv_heads=4,
+            vocab_size=256,
+            max_seq_len=64,
+        )
+        vc = VisionEncoderConfig(type="random", feature_dim=96, num_tokens=8)
+        ac = AdapterConfig()
+        lc = VLMConfig(
+            max_text_len=32,
+            freeze=[
+                FreezeSpec("vision_encoder", True),
+                FreezeSpec("vision_encoder._anchor", False),
+            ],
+        )
+        model = build_parallel_model(
+            mc,
+            torch.device("cpu"),
+            device_mesh=None,
+            vision_config=vc,
+            adapter_config=ac,
+            vlm_config=lc,
+        )
+        assert model.vision_encoder.training is True
+
     def test_dispatch_falls_through_for_non_vlm(self):
         """Sanity: omitting vlm_config builds a plain Transformer."""
         from kempnerforge.distributed.parallel import build_parallel_model

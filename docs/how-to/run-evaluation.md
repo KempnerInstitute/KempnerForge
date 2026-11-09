@@ -38,7 +38,7 @@ data, and logs `eval/loss` and `eval/perplexity` through
 The stdout backend renders one compact line per call:
 
 ```
-[step 500] eval/loss=3.8200 | eval/perplexity=45.6000
+2026-11-04 14:03:12.345 [rank 0] INFO     [step 500] eval/loss=3.8200 | eval/perplexity=45.6000
 ```
 
 The eval dataloader is a plain `DataLoader` with a `DistributedSampler`
