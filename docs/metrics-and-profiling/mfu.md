@@ -29,11 +29,17 @@ attn_params = (
     + 2 * dim * (n_kv_heads * head_dim) # K + V
     + (n_heads * head_dim) * dim       # O
 )
-mlp_params = 3 * dim * computed_ffn_hidden_dim   # SwiGLU (up, gate, down)
+mlp_params = mlp_matrices * dim * computed_ffn_hidden_dim
 per_layer = attn_params + mlp_params
 output_params = vocab_size * dim
 active_params = n_layers * per_layer + output_params
 ```
+
+`mlp_matrices` is `ModelConfig.mlp_matrices`: 3 for `activation = "silu"`,
+which builds SwiGLU (gate, up and down projections), and 2 for `"gelu"` and
+`"relu"`, which build the standard MLP (up and down). An MLP a plugin
+registered under another name is counted as 3. `num_params_estimate`
+counts MLPs the same way.
 
 Three things this does and doesn't count:
 
@@ -59,8 +65,8 @@ FLOPs. So `12*L*D*S` stays correct.
 
 ```python
 # kempnerforge/metrics/mfu.py — _moe_flops_per_token
-mlp_params        = 3 * dim * computed_ffn_hidden_dim
-expert_mlp_params = 3 * dim * computed_expert_ffn_hidden_dim
+mlp_params        = mlp_matrices * dim * computed_ffn_hidden_dim
+expert_mlp_params = mlp_matrices * dim * computed_expert_ffn_hidden_dim
 
 n_moe_layers = sum(1 for i in range(n_layers) if (i + 1) % moe_frequency == 0)
 n_dense_layers = n_layers - n_moe_layers

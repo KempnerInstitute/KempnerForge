@@ -64,8 +64,8 @@ Expected output: after the startup messages, a metrics line for step 1
 and then one every 10 steps (`metrics.log_interval`), such as:
 
 ```
-2026-11-04 14:03:12.345 [rank 0] INFO     [step 10] loss=10.4200 | lr=6.00e-05 | grad_norm=1.842 | tok/s=8,420 | mfu=0.3% | mem=9.6/80GB | step_time=1.95s
-2026-11-04 14:03:31.630 [rank 0] INFO     [step 20] loss=9.8400 | lr=1.20e-04 | grad_norm=1.103 | tok/s=8,510 | mfu=0.3% | mem=9.6/80GB | step_time=1.93s
+2026-11-04 14:03:12.345 [rank 0] INFO     [step 10] loss=10.4200 | lr=5.40e-05 | grad_norm=1.842 | tok/s=8,420 | mfu=0.3% | mem=9.6/80GB | step_time=1.95s
+2026-11-04 14:03:31.630 [rank 0] INFO     [step 20] loss=9.8400 | lr=1.14e-04 | grad_norm=1.103 | tok/s=8,510 | mfu=0.3% | mem=9.6/80GB | step_time=1.93s
 ...
 ```
 
