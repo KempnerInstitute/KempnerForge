@@ -452,6 +452,41 @@ class TestScheduleFreeAdamW:
         optimizer.train_params()
         assert not optimizer.state
 
+    def test_evaluation_point_restores_y_when_the_block_raises(self):
+        torch.manual_seed(0)
+        model = nn.Linear(8, 8)
+        optimizer = ScheduleFreeAdamW(model.parameters(), lr=0.01)
+        for _ in range(3):
+            model(torch.randn(2, 8)).sum().backward()
+            optimizer.step()
+            optimizer.zero_grad()
+        y = [p.detach().clone() for p in model.parameters()]
+        with pytest.raises(RuntimeError), evaluation_point(optimizer):
+            raise RuntimeError("eval failed")
+        assert all(torch.equal(a, p) for a, p in zip(y, model.parameters(), strict=True))
+
+    def test_evaluation_point_restores_y_when_the_swap_in_fails_partway(self):
+        """A swap that raises after moving some parameters to x leaves every one at y."""
+        torch.manual_seed(0)
+        model = _make_model()
+        optimizer = ScheduleFreeAdamW(model.parameters(), lr=0.01)
+        for _ in range(3):
+            model(torch.randn(4, 32)).sum().backward()
+            optimizer.step()
+            optimizer.zero_grad()
+        params = list(model.parameters())
+        y = [p.detach().clone() for p in params]
+
+        def swap_half_then_fail():
+            for p in params[: len(params) // 2]:
+                p.data.copy_(optimizer.state[p]["x"])
+            raise RuntimeError("swap failed")
+
+        optimizer.eval_params = swap_half_then_fail
+        with pytest.raises(RuntimeError, match="swap failed"), evaluation_point(optimizer):
+            pass
+        assert all(torch.equal(a, p) for a, p in zip(y, params, strict=True))
+
     def test_evaluation_point_leaves_other_optimizers_alone(self):
         model = _make_model()
         optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)

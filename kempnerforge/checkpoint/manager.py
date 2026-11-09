@@ -271,17 +271,21 @@ def _evaluation_point(optimizer: torch.optim.Optimizer) -> Iterator[None]:
 
     An optimizer that evaluates at another point than it trains at, as schedule-free AdamW
     does, has ``eval_params`` and ``train_params``: the block runs between them, and the
-    parameters leave it at the training point again, bit for bit. Any other optimizer
-    leaves them as they are. ``kempnerforge.training.optimizer.evaluation_point`` does the
-    same for the training loop; importing it here would close an import cycle.
+    parameters leave it at the training point again, bit for bit, also when the swap or
+    the block raises. Any other optimizer leaves them as they are.
+
+    ``kempnerforge.training.optimizer.evaluation_point`` does the same for the training
+    loop; importing it here would close an import cycle. This one takes no model: no
+    forward runs in a save, and FSDP2's state-dict hooks reshard every unit before the
+    state is read.
     """
     to_eval = getattr(optimizer, "eval_params", None)
     to_train = getattr(optimizer, "train_params", None)
     if to_eval is None or to_train is None:
         yield
         return
-    to_eval()
     try:
+        to_eval()
         yield
     finally:
         to_train()
@@ -785,7 +789,13 @@ class CheckpointManager:
         An optimizer that evaluates at another point than it trains at, as schedule-free
         AdamW does, has the model saved at its evaluation point, the averaged weights ``x``,
         so every reader of the model entry alone gets them; the parameters are back at the
-        training point when this returns, and ``load`` rebuilds that point exactly.
+        training point when this returns, and ``load`` rebuilds that point. The swap back
+        runs as soon as ``AsyncCheckpointer.save`` returns, which is safe only because the
+        state is staged by then: ``dcp.async_save`` without a stager uses torch's
+        ``DefaultStager(StagingOptions(False, False, False, False))``, which copies every
+        tensor into new CPU storage before it returns. An asynchronous stager would let
+        the write read the parameters after the swap back, so adding one means moving the
+        swap back after staging completes.
 
         Args:
             step: Current training step.

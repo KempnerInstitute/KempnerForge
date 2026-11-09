@@ -3294,10 +3294,9 @@ class TestLoopPeriodicWork:
         for at_eval, x in seen:
             assert all(torch.equal(a, b) for a, b in zip(at_eval, x, strict=True))
 
-        monkeypatch.setattr(loop, "run_eval", lambda *a, **k: {})
         plain, plain_opt = build()
         run_training_loop(
-            make_session(config, model=plain, optimizer=plain_opt, eval_dataloader=["BATCH"])
+            make_session(config, model=plain, optimizer=plain_opt, eval_dataloader=None)
         )
         for a, b in zip(model.parameters(), plain.parameters(), strict=True):
             assert torch.equal(a, b), "evaluating at x changed the training run"

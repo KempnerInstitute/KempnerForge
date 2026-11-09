@@ -24,6 +24,7 @@ from collections.abc import Iterator
 from typing import Any, ClassVar
 
 import torch
+from torch.distributed._composable.fsdp import FSDPModule
 
 from kempnerforge.config.optimizer import MUON_ADJUST_LR_MODES, MUON_ORTHOGONALIZE_MODES
 from kempnerforge.config.registry import registry
@@ -262,25 +263,46 @@ class ScheduleFreeAdamW(torch.optim.Optimizer):
                     p.data.copy_(state["z"]).lerp_(state["x"], beta1)
 
 
+def _reshard(model: torch.nn.Module | None) -> None:
+    """Reshard every FSDP2 unit in ``model``, so its next forward gathers the shards anew."""
+    if model is None:
+        return
+    for module in model.modules():
+        if isinstance(module, FSDPModule):
+            module.reshard()
+
+
 @contextlib.contextmanager
-def evaluation_point(optimizer: torch.optim.Optimizer) -> Iterator[None]:
+def evaluation_point(
+    optimizer: torch.optim.Optimizer, model: torch.nn.Module | None = None
+) -> Iterator[None]:
     """Hold the parameters at ``optimizer``'s evaluation point inside the block.
 
     An optimizer that evaluates at another point than it trains at, as
     :class:`ScheduleFreeAdamW` does, has ``eval_params`` and ``train_params``: the block
     runs between them, and the parameters leave it at the training point again, bit for
-    bit. Any other optimizer leaves them as they are.
+    bit, also when the swap or the block raises. Any other optimizer leaves them as they
+    are.
+
+    The swap writes the sharded parameters. An FSDP2 unit that does not reshard after its
+    forward (``reshard_after_forward`` False or an int, or the root under the default
+    None) stays gathered after a forward in the block, holding ``x``, and the next
+    training forward would reuse it. So pass ``model`` whenever the block runs a forward:
+    every FSDP2 unit in it is resharded before the swap in and after the swap back, and
+    each forward gathers the point it should see. Resharding a resharded unit does nothing.
     """
     to_eval = getattr(optimizer, "eval_params", None)
     to_train = getattr(optimizer, "train_params", None)
     if to_eval is None or to_train is None:
         yield
         return
-    to_eval()
+    _reshard(model)
     try:
+        to_eval()
         yield
     finally:
         to_train()
+        _reshard(model)
 
 
 @registry.register_optimizer("schedule_free_adamw")

@@ -3469,6 +3469,44 @@ class TestScheduleFreeCheckpoint:
         CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model2, opt2).load()
         assert all(torch.equal(a, p) for a, p in zip(y, model2.parameters(), strict=True))
 
+    def test_a_save_that_fails_inside_the_swap_leaves_the_run_at_y(self, tmp_path, monkeypatch):
+        """An error while the parameters hold x still puts every one back at y."""
+        from kempnerforge.checkpoint import manager as mgr_mod
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        model, opt = self._build(0)
+        self._train(model, opt, 4)
+        _, y = self._points(model, opt)
+
+        def fail(*args, **kwargs):
+            raise RuntimeError("state dict failed")
+
+        monkeypatch.setattr(mgr_mod, "get_optimizer_state_dict", fail)
+        manager = CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model, opt)
+        with pytest.raises(RuntimeError, match="state dict failed"):
+            manager.save(step=4)
+        assert all(torch.equal(a, p) for a, p in zip(y, model.parameters(), strict=True))
+
+    def test_a_save_whose_swap_in_fails_partway_leaves_the_run_at_y(self, tmp_path):
+        """A swap to x that raises after moving some parameters leaves every one at y."""
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        model, opt = self._build(0)
+        self._train(model, opt, 4)
+        _, y = self._points(model, opt)
+        params = list(model.parameters())
+
+        def swap_half_then_fail():
+            for p in params[: len(params) // 2]:
+                p.data.copy_(opt.state[p]["x"])
+            raise RuntimeError("swap failed")
+
+        opt.eval_params = swap_half_then_fail
+        manager = CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model, opt)
+        with pytest.raises(RuntimeError, match="swap failed"):
+            manager.save(step=4)
+        assert all(torch.equal(a, p) for a, p in zip(y, params, strict=True))
+
     def test_a_checkpoint_from_before_the_per_parameter_step_is_refused(self, tmp_path):
         """A checkpoint saved without each parameter's ``step`` cannot continue the run."""
         from kempnerforge.checkpoint.manager import CheckpointManager

@@ -667,7 +667,7 @@ def run_training_loop(
                 and step % eval_config.interval == 0
             ):
                 pipeline = session.pipeline
-                with session.autocast(), evaluation_point(optimizer):
+                with session.autocast(), evaluation_point(optimizer, model):
                     eval_metrics = run_eval(
                         model,
                         session.eval_dataloader,
