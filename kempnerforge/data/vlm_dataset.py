@@ -283,14 +283,19 @@ def _images_per_row(rows: Any, image_field: str) -> np.ndarray:
     column = rows.select_columns([image_field]).with_format("arrow")[:].column(image_field)
     counts = [np.zeros(0, dtype=np.int64)]
     for chunk in column.chunks:
+        valid = chunk.is_valid().to_numpy(zero_copy_only=False)
         if pa.types.is_list(chunk.type) or pa.types.is_large_list(chunk.type):
             present = chunk.values.is_valid().to_numpy(zero_copy_only=False)
             offsets = chunk.offsets.to_numpy()
             running = np.concatenate([[0], np.cumsum(present, dtype=np.int64)])
-            count = running[offsets[1:]] - running[offsets[:-1]]
-            count[~chunk.is_valid().to_numpy(zero_copy_only=False)] = 0
+            count = (running[offsets[1:]] - running[offsets[:-1]]) * valid
+        elif pa.types.is_fixed_size_list(chunk.type):
+            size = chunk.type.list_size
+            values = chunk.values.slice(chunk.offset * size, len(chunk) * size)
+            present = values.is_valid().to_numpy(zero_copy_only=False).reshape(len(chunk), size)
+            count = present.sum(axis=1, dtype=np.int64) * valid
         else:
-            count = chunk.is_valid().to_numpy(zero_copy_only=False).astype(np.int64)
+            count = valid.astype(np.int64)
         counts.append(count)
     return np.concatenate(counts)
 
