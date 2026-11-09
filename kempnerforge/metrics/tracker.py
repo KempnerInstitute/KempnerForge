@@ -102,6 +102,10 @@ class MetricsTracker:
         """Mark the beginning of a training step."""
         self._step_start = time.perf_counter()
 
+    def is_log_step(self, step: int) -> bool:
+        """Whether ``end_step`` logs ``step``: step 1 and every ``log_interval`` steps."""
+        return step % self.metrics_config.log_interval == 0 or step == 1
+
     def end_step(
         self,
         step: int,
@@ -146,7 +150,7 @@ class MetricsTracker:
         self._update_smoothed("mfu", mfu)
         self._update_smoothed("step_time", step_time)
 
-        if step % self.metrics_config.log_interval != 0 and step != 1:
+        if not self.is_log_step(step):
             return None
 
         mem_stats = get_memory_stats()

@@ -16,6 +16,7 @@ from typing import Any
 
 import pytest
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from kempnerforge.config.checkpoint import CheckpointConfig, DynamicCheckpointWindow
@@ -425,7 +426,8 @@ class TestTextStep:
         result = session.step_fn(session, 0)
         assert result.loss > 0
         assert result.grad_norm > 0
-        assert result.dataset_loss_sums == {}
+        assert result.dataset_tokens is None
+        assert result.dataset_losses is None
         assert all(p.grad is not None for p in session.model.parameters())
 
     def test_reads_from_the_dataloader_when_present(self):
@@ -3306,9 +3308,9 @@ class TestPerDatasetMetrics:
     def test_step_reports_per_dataset_losses_and_tokens(self):
         session, _ = self._mixture_session()
         result = session.step_fn(session, 0)
-        assert set(result.dataset_loss_sums) == {"a", "b"}
-        assert result.dataset_loss_counts == {"a": 1, "b": 1}
-        assert result.dataset_token_counts == {"a": 2 * 4, "b": 2 * 4}
+        assert result.dataset_tokens.tolist() == [2 * 4, 2 * 4]
+        assert result.dataset_losses.shape == (2, 2)
+        assert result.dataset_losses[1].tolist() == [2 * 4, 2 * 4]
 
     def test_loop_logs_the_mean_and_the_token_totals(self):
         session, logged = self._mixture_session()
@@ -3318,7 +3320,7 @@ class TestPerDatasetMetrics:
         assert ds["data/a/tokens"] == 8.0
 
     def test_a_source_absent_from_the_batch_is_omitted(self):
-        session, _ = self._mixture_session()
+        session, logged = self._mixture_session()
         session.batches.pipeline.dataloader = [
             {
                 "input_ids": torch.zeros(4, 4, dtype=torch.long),
@@ -3326,8 +3328,89 @@ class TestPerDatasetMetrics:
                 "dataset_idx": torch.tensor([0, 0, 0, 0]),
             }
         ]
-        result = session.step_fn(session, 0)
-        assert set(result.dataset_loss_sums) == {"a"}
+        run_training_loop(session)
+        ds = [m for m in logged if any(k.startswith("loss/") for k in m)][0]
+        assert set(ds) == {"loss/a", "data/a/tokens"}
+
+    @staticmethod
+    def _random_batch(sources: list[int], seed: int) -> dict[str, torch.Tensor]:
+        generator = torch.Generator().manual_seed(seed)
+        return {
+            "input_ids": torch.randint(0, VOCAB, (4, 4), generator=generator),
+            "labels": torch.randint(0, VOCAB, (4, 4), generator=generator),
+            "dataset_idx": torch.tensor(sources),
+        }
+
+    def _logits_and_metrics(self, monkeypatch, batches, **train):
+        """Run one step over ``batches``; return each micro-step's logits and the metrics."""
+        torch.manual_seed(0)
+        data = _mixture_pipeline()
+        data.dataloader = batches
+        config = make_config(max_steps=1, batch_size=4, grad_accum_steps=len(batches), **train)
+        session = make_session(config, data=data, phases=PhaseState())
+        logits: list[torch.Tensor] = []
+        session.model.out.register_forward_hook(lambda _m, _i, out: logits.append(out.detach()))
+        logged: list[dict] = []
+        monkeypatch.setattr(session.tracker, "log_eval", lambda m, s: logged.append(dict(m)))
+        run_training_loop(session)
+        return logits, [m for m in logged if any(k.startswith("loss/") for k in m)][0]
+
+    def test_the_loss_is_weighted_by_token_over_the_micro_steps(self, monkeypatch):
+        """One row of ``a`` in the first micro-step and three in the second weigh 1:3."""
+        batches = [self._random_batch([0, 1, 1, 1], 1), self._random_batch([0, 0, 0, 1], 2)]
+        logits, ds = self._logits_and_metrics(monkeypatch, batches)
+        total = count = 0.0
+        for out, batch in zip(logits, batches, strict=True):
+            rows = batch["dataset_idx"] == 0
+            labels = batch["labels"][rows].reshape(-1)
+            total += F.cross_entropy(out[rows].reshape(-1, VOCAB), labels, reduction="sum").item()
+            count += labels.numel()
+        assert ds["loss/a"] == pytest.approx(total / count, rel=1e-6)
+        assert ds["data/a/tokens"] == (1 + 3) * 4
+
+    def test_a_step_that_is_not_logged_runs_no_source_cross_entropy(self, monkeypatch):
+        """``text_step`` gets the steps done so far, so step 4 is logged step 5, not logged."""
+        session, _ = self._mixture_session()
+        calls: list[int] = []
+        cross_entropy = F.cross_entropy
+        monkeypatch.setattr(
+            F, "cross_entropy", lambda *a, **k: calls.append(1) or cross_entropy(*a, **k)
+        )
+        result = session.step_fn(session, 4)
+        assert len(calls) == 1
+        assert result.dataset_losses is None
+        assert result.dataset_tokens.tolist() == [2 * 4, 2 * 4]
+
+    def test_the_loss_leaves_out_the_z_loss_of_the_training_loss(self, monkeypatch):
+        from kempnerforge.training.loss import z_loss
+
+        batch = self._random_batch([0, 0, 1, 1], 3)
+        torch.manual_seed(0)
+        data = _mixture_pipeline()
+        data.dataloader = [batch]
+        session = make_session(
+            make_config(max_steps=1, batch_size=4), data=data, phases=PhaseState()
+        )
+        base = session.loss_fn
+        session.loss_fn = lambda logits, labels: base(logits, labels) + z_loss(logits, 1.0)
+        logits: list[torch.Tensor] = []
+        session.model.out.register_forward_hook(lambda _m, _i, out: logits.append(out.detach()))
+        logged: list[dict] = []
+        monkeypatch.setattr(session.tracker, "log_eval", lambda m, s: logged.append(dict(m)))
+        run_training_loop(session)
+        rows = batch["dataset_idx"] == 0
+        plain = F.cross_entropy(
+            logits[0][rows].reshape(-1, VOCAB), batch["labels"][rows].reshape(-1)
+        )
+        ds = [m for m in logged if "loss/a" in m][0]
+        assert ds["loss/a"] == pytest.approx(plain.item(), rel=1e-6)
+
+    def test_chunking_does_not_change_the_loss(self, monkeypatch):
+        batches = [self._random_batch([0, 1, 0, 1], 4)]
+        _, small = self._logits_and_metrics(monkeypatch, batches, ce_chunk_size=3)
+        _, whole = self._logits_and_metrics(monkeypatch, batches, ce_chunk_size=1000)
+        assert small["loss/a"] == pytest.approx(whole["loss/a"], rel=1e-6)
+        assert small["loss/b"] == pytest.approx(whole["loss/b"], rel=1e-6)
 
 
 class TestLoopPeriodicWork:

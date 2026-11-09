@@ -323,6 +323,57 @@ def _check_loop_reduces_losses(rank: int, world: int, port: int) -> None:
         dist.destroy_process_group()
 
 
+def _check_source_metrics(rank: int, world: int, port: int) -> None:
+    """Each rank draws a different mix of two sources; every rank logs the global split."""
+    from kempnerforge.training.data_pipeline import PhaseState
+    from kempnerforge.training.loop import run_training_loop
+    from tests.unit.test_train_entry import VOCAB, _mixture_pipeline, make_config, make_session
+
+    _init(rank, world, port)
+    try:
+        mesh = init_device_mesh("cpu", (world,), mesh_dim_names=("dp_shard",))
+        generator = torch.Generator().manual_seed(20 + rank)
+        sources = [torch.tensor([0, 1, 1, 1]), torch.tensor([0, 0, 0, 1])][rank]
+        batch = {
+            "input_ids": torch.randint(0, VOCAB, (4, 4), generator=generator),
+            "labels": torch.randint(0, VOCAB, (4, 4), generator=generator),
+            "dataset_idx": sources,
+        }
+        data = _mixture_pipeline()
+        data.dataloader = [batch]
+        torch.manual_seed(0)
+        session = make_session(
+            make_config(max_steps=1, batch_size=4),
+            runtime=RuntimeContext(
+                rank=rank,
+                local_rank=rank,
+                world_size=world,
+                device=torch.device("cpu"),
+                device_mesh=mesh,
+            ),
+            data=data,
+            phases=PhaseState(),
+            nan_detector=_AllFinite(),
+        )
+        with torch.no_grad():
+            logits = session.model(batch["input_ids"])
+        rows = sources == 0
+        own = F.cross_entropy(
+            logits[rows].reshape(-1, VOCAB), batch["labels"][rows].reshape(-1), reduction="sum"
+        ).item()
+        logged: dict = {}
+        session.tracker.log_eval = lambda m, s: logged.update(m)
+        run_training_loop(session)
+
+        everyone: list = [None] * world
+        dist.all_gather_object(everyone, (own, int(rows.sum()) * 4))
+        expected = sum(e[0] for e in everyone) / sum(e[1] for e in everyone)
+        assert logged["loss/a"] == pytest.approx(expected, rel=1e-6), (rank, logged, everyone)
+        assert (logged["data/a/tokens"], logged["data/b/tokens"]) == (16.0, 16.0), (rank, logged)
+    finally:
+        dist.destroy_process_group()
+
+
 def _check_text_tokens(rank: int, world: int, port: int) -> None:
     """Two ranks that share one DP rank, as TP peers do, count their batch once."""
     from kempnerforge.config.schema import AdapterConfig, VisionEncoderConfig, VLMConfig
@@ -390,6 +441,11 @@ class TestLoggedMetricsOverDataParallel:
         """The tracker, the hooks and eval see the mean over the DP ranks, not each
         rank's own loss, so rank 0's backends log the whole job's loss."""
         mp.spawn(_check_loop_reduces_losses, args=(2, _free_port()), nprocs=2)
+
+    def test_per_source_metrics_cover_every_dp_rank(self):
+        """``loss/<name>`` is token-weighted over every rank's rows of that source and
+        ``data/<name>/tokens`` sums every rank's, on every rank."""
+        mp.spawn(_check_source_metrics, args=(2, _free_port()), nprocs=2)
 
     def test_vlm_text_tokens_count_each_dp_rank_once(self):
         """The text-token count is summed over the DP ranks, not every rank of the world."""

@@ -18,6 +18,7 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 
 from kempnerforge.checkpoint.manager import CheckpointManager
 from kempnerforge.config.job import JobConfig
@@ -144,12 +145,16 @@ class BatchStream:
 class StepResult:
     """What one training step reports back to the loop.
 
-    The per-dataset fields stay empty for step bodies that don't produce
+    The per-dataset fields stay None for step bodies that don't produce
     them; ``text_tokens`` stays None, which a VLM run treats as an error
-    rather than logging a zero. ``tokens`` is the number of positions the
-    model ran on this rank over every micro-step, padding included, and
-    ``seq_len`` the length of each of those rows; with ``tokens`` None the
-    loop counts ``train.batch_size * train.seq_len`` per micro-step.
+    rather than logging a zero. With a data mixture, ``dataset_tokens`` holds
+    the positions this rank drew from each source, by source index, and on a
+    step the tracker will log, ``dataset_losses`` holds each source's summed
+    cross-entropy (row 0) and labeled-token count (row 1). ``tokens`` is the
+    number of positions the model ran on this rank over every micro-step,
+    padding included, and ``seq_len`` the length of each of those rows; with
+    ``tokens`` None the loop counts ``train.batch_size * train.seq_len`` per
+    micro-step.
     """
 
     loss: float
@@ -157,9 +162,8 @@ class StepResult:
     tokens: int | None = None
     seq_len: int | None = None
     text_tokens: int | None = None
-    dataset_token_counts: dict[str, int] = field(default_factory=dict)
-    dataset_loss_sums: dict[str, float] = field(default_factory=dict)
-    dataset_loss_counts: dict[str, int] = field(default_factory=dict)
+    dataset_tokens: torch.Tensor | None = None
+    dataset_losses: torch.Tensor | None = None
 
 
 StepFn = Callable[["TrainingSession", int], StepResult]
@@ -352,21 +356,54 @@ def vlm_step(session: TrainingSession, step: int) -> StepResult:
     )
 
 
+def _source_cross_entropy(
+    logits: torch.Tensor, labels: torch.Tensor, sources: torch.Tensor, n_sources: int, chunk: int
+) -> torch.Tensor:
+    """Each source's summed cross-entropy and labeled-token count, as a ``(2, n_sources)`` tensor.
+
+    ``sources`` holds the source index of each row. The cross-entropy runs ``chunk``
+    tokens at a time, so it copies no source's logits and holds the log-softmax of one
+    chunk at most. A token labeled -100 counts in neither row.
+    """
+    flat_logits = logits.reshape(-1, logits.shape[-1])
+    flat_labels = labels.reshape(-1)
+    token_sources = sources.repeat_interleave(labels.shape[-1])
+    out = torch.zeros(2, n_sources, dtype=torch.float64, device=logits.device)
+    for start in range(0, flat_labels.numel(), chunk):
+        chunk_labels = flat_labels[start : start + chunk]
+        losses = F.cross_entropy(
+            flat_logits[start : start + chunk], chunk_labels, ignore_index=-100, reduction="none"
+        )
+        chunk_sources = token_sources[start : start + chunk]
+        out[0].index_add_(0, chunk_sources, losses.double())
+        out[1].index_add_(0, chunk_sources, (chunk_labels != -100).double())
+    return out
+
+
 def text_step(session: TrainingSession, step: int) -> StepResult:
-    """Standard step (no PP, text-only), with optional per-dataset mixture metrics."""
+    """Standard step (no PP, text-only), with optional per-dataset mixture metrics.
+
+    Each source's loss is computed only on a step the tracker will log, which is
+    ``step + 1``: ``step`` counts the steps done before this one. It is the plain
+    cross-entropy of the source's labeled tokens, without the z-loss or MoE terms
+    the training loss may add.
+    """
     config = session.config
     tc, mc = config.train, config.model
     device = session.runtime.device
     model = session.model
     batches = session.batches
     mixture_dataset = session.data.mixture_dataset
+    n_sources = len(mixture_dataset.dataset_names) if mixture_dataset is not None else 0
 
     total_loss = 0.0
     total_tokens = 0
     seq_len = 0
-    ds_token_counts: dict[str, int] = {}
-    ds_loss_sums: dict[str, float] = {}
-    ds_loss_counts: dict[str, int] = {}
+    ds_tokens = torch.zeros(n_sources, dtype=torch.long) if n_sources else None
+    ds_losses = None
+    if n_sources and session.tracker.is_log_step(step + 1):
+        ds_losses = torch.zeros(2, n_sources, dtype=torch.float64, device=device)
+    ce_chunk = tc.ce_chunk_size if tc.ce_chunk_size > 0 else 4096
 
     for micro_step in range(tc.grad_accum_steps):
         batch: dict[str, torch.Tensor] = {}
@@ -389,23 +426,14 @@ def text_step(session: TrainingSession, step: int) -> StepResult:
                 logits = model(input_ids, doc_ids=doc_ids)
                 loss = session.loss_fn(logits, labels)
 
-            if mixture_dataset is not None and "dataset_idx" in batch:
-                ds_idx = batch["dataset_idx"]
-                with torch.no_grad():
-                    for i, name in enumerate(mixture_dataset.dataset_names):
-                        mask = ds_idx == i
-                        count = int(mask.sum().item())
-                        if count > 0:
-                            ds_token_counts[name] = (
-                                ds_token_counts.get(name, 0) + count * tc.seq_len
-                            )
-                            ds_l = torch.nn.functional.cross_entropy(
-                                logits[mask].reshape(-1, logits.size(-1)),
-                                labels[mask].reshape(-1),
-                                ignore_index=-100,
-                            ).item()
-                            ds_loss_sums[name] = ds_loss_sums.get(name, 0) + ds_l
-                            ds_loss_counts[name] = ds_loss_counts.get(name, 0) + 1
+            if ds_tokens is not None and "dataset_idx" in batch:
+                sources = batch["dataset_idx"]
+                ds_tokens += torch.bincount(sources, minlength=n_sources) * seq_len
+                if ds_losses is not None:
+                    with torch.no_grad():
+                        ds_losses += _source_cross_entropy(
+                            logits, labels, sources.to(device), n_sources, ce_chunk
+                        )
 
             if mc.is_moe:
                 loss = add_moe_losses(loss, model, mc)
@@ -419,9 +447,8 @@ def text_step(session: TrainingSession, step: int) -> StepResult:
         grad_norm=clip_grads(model, tc.grad_clip_norm),
         tokens=total_tokens,
         seq_len=seq_len,
-        dataset_token_counts=ds_token_counts,
-        dataset_loss_sums=ds_loss_sums,
-        dataset_loss_counts=ds_loss_counts,
+        dataset_tokens=ds_tokens,
+        dataset_losses=ds_losses,
     )
 
 
@@ -492,15 +519,35 @@ def _log_periodic_metrics(session: TrainingSession, result: StepResult, step: in
         global_text_tokens = int(dp_all_reduce_(t, session.dp_groups).item())
         tracker.log_eval({"data/text_tokens_trained": float(global_text_tokens)}, step)
 
-    if session.data.mixture_dataset is not None and result.dataset_loss_sums:
-        ds_metrics: dict[str, float] = {}
-        for name in result.dataset_loss_sums:
-            ds_metrics[f"loss/{name}"] = (
-                result.dataset_loss_sums[name] / result.dataset_loss_counts[name]
-            )
-        for name, count in result.dataset_token_counts.items():
-            ds_metrics[f"data/{name}/tokens"] = float(count)
-        tracker.log_eval(ds_metrics, step)
+    mixture = session.data.mixture_dataset
+    if mixture is not None and result.dataset_tokens is not None:
+        _log_dataset_metrics(session, result, mixture.dataset_names, step)
+
+
+def _log_dataset_metrics(
+    session: TrainingSession, result: StepResult, names: list[str], step: int
+) -> None:
+    """``loss/<name>`` and ``data/<name>/tokens`` for each source, over every DP rank.
+
+    The loss is the cross-entropy of the source's labeled tokens, weighted by token, and
+    the tokens are the positions drawn from the source in this step. A source no rank
+    drew from in this step is left out.
+    """
+    assert result.dataset_tokens is not None
+    stats = torch.zeros(3, len(names), dtype=torch.float64, device=session.runtime.device)
+    stats[0] = result.dataset_tokens.to(stats.device)
+    if result.dataset_losses is not None:
+        stats[1:] = result.dataset_losses
+    dp_all_reduce_(stats, session.dp_groups)
+    ds_metrics: dict[str, float] = {}
+    for i, name in enumerate(names):
+        tokens, loss_sum, labeled = stats[:, i].tolist()
+        if labeled > 0:
+            ds_metrics[f"loss/{name}"] = loss_sum / labeled
+        if tokens > 0:
+            ds_metrics[f"data/{name}/tokens"] = tokens
+    if ds_metrics:
+        session.tracker.log_eval(ds_metrics, step)
 
 
 def _advance_lr_schedule(session: TrainingSession) -> None:
