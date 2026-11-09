@@ -870,6 +870,38 @@ class TestRunTrainingLoop:
         run_training_loop(session)
         assert session.optimizer.param_groups[0]["lr"] == pytest.approx(0.025)
 
+    def test_metrics_and_hooks_get_the_lr_the_step_applied(self, monkeypatch):
+        """Step k runs at the scheduler's factor for k - 1, which ``train/lr`` and
+        ``StepContext.lr`` report, not the rate the next step will use."""
+        model = TinyTextModel()
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda s: min(1.0, s / 10))
+        applied: list[float] = []
+
+        def step_fn(session: TrainingSession, step: int):
+            applied.append(session.optimizer.param_groups[0]["lr"])
+            return text_step(session, step)
+
+        hook = RecordingHook()
+        session = make_session(
+            make_config(max_steps=3),
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            step_fn=step_fn,
+            hooks=HookRunner([hook]),
+        )
+        session.tracker.metrics_config.log_interval = 1
+        logged: list[float] = []
+        log_step = session.tracker._log_step
+        monkeypatch.setattr(
+            session.tracker, "_log_step", lambda s, m: (logged.append(m.lr), log_step(s, m))[1]
+        )
+        run_training_loop(session)
+        assert applied == pytest.approx([0.0, 0.005, 0.01])
+        assert hook.lrs == pytest.approx(applied)
+        assert logged == pytest.approx(applied)
+
 
 class TestNanSkippedStep:
     """A step skipped for a non-finite loss still crosses the step boundary.
@@ -890,7 +922,7 @@ class TestNanSkippedStep:
         assert step == 6
         assert session.scheduler.last_epoch == 6
         assert hook.steps == [1, 3, 5, 6]
-        assert hook.lrs == pytest.approx([0.05 / (1 + s) for s in hook.steps])
+        assert hook.lrs == pytest.approx([0.05 / s for s in hook.steps])
 
     def test_nan_stop_leaves_the_schedule_on_the_returned_step(self):
         config = make_config(max_steps=10)

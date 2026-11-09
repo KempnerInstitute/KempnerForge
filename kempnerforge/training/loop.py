@@ -617,6 +617,7 @@ def run_training_loop(
                     break
                 continue
 
+            applied_lr = optimizer.param_groups[0]["lr"]
             optimizer.step()
             _advance_lr_schedule(session)
 
@@ -628,12 +629,11 @@ def run_training_loop(
 
             _apply_step_transitions(session, step)
 
-            current_lr = optimizer.param_groups[0]["lr"]
             step_metrics = tracker.end_step(
                 step=step,
                 loss=result.loss,
                 grad_norm=result.grad_norm,
-                lr=current_lr,
+                lr=applied_lr,
                 tokens_in_step=tokens_in_step,
             )
 
@@ -642,7 +642,7 @@ def run_training_loop(
                     step=step,
                     loss=result.loss,
                     grad_norm=result.grad_norm,
-                    lr=current_lr,
+                    lr=applied_lr,
                     tokens_seen=tokens_seen,
                     model=model,
                     optimizer=optimizer,
