@@ -27,17 +27,6 @@ from kempnerforge.training.optimizer import build_optimizer
 
 CONFIG = ModelConfig(dim=64, n_layers=2, n_heads=4, vocab_size=128, max_seq_len=32)
 OPTIMIZERS = sorted(registry.list("optimizer"))
-RESUMABLE_OPTIMIZERS = [
-    pytest.param(
-        name,
-        marks=pytest.mark.xfail(
-            raises=ZeroDivisionError, strict=True, reason="#236: schedule_free_adamw cannot resume"
-        ),
-    )
-    if name == "schedule_free_adamw"
-    else name
-    for name in OPTIMIZERS
-]
 
 
 def _free_port() -> int:
@@ -138,7 +127,7 @@ class TestAutocastDtype:
 class TestCheckpointAcrossMasterDtypes:
     """A checkpoint saved with one master dtype loads into the other, cast by DCP."""
 
-    @pytest.mark.parametrize("name", RESUMABLE_OPTIMIZERS)
+    @pytest.mark.parametrize("name", OPTIMIZERS)
     @pytest.mark.parametrize(
         ("saved", "loaded"),
         [(torch.bfloat16, torch.float32), (torch.float32, torch.bfloat16)],

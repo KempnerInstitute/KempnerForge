@@ -31,17 +31,6 @@ pytestmark = pytest.mark.skipif(
 
 SMALL_CONFIG = ModelConfig(dim=128, n_layers=2, n_heads=2, vocab_size=512, max_seq_len=64)
 REGISTERED_OPTIMIZERS = sorted(registry.list("optimizer"))
-RESUMABLE_OPTIMIZERS = [
-    pytest.param(
-        name,
-        marks=pytest.mark.xfail(
-            raises=ZeroDivisionError, strict=True, reason="#236: schedule_free_adamw cannot resume"
-        ),
-    )
-    if name == "schedule_free_adamw"
-    else name
-    for name in REGISTERED_OPTIMIZERS
-]
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _TEST_TMP = _PROJECT_ROOT / ".test_tmp"
@@ -324,7 +313,7 @@ class TestCheckpointRoundTrip:
             assert torch.equal(ref, a), "saving at step 0 changed the run"
             assert torch.equal(ref, b), "resuming from the step-0 checkpoint changed the run"
 
-    @pytest.mark.parametrize("name", RESUMABLE_OPTIMIZERS)
+    @pytest.mark.parametrize("name", REGISTERED_OPTIMIZERS)
     def test_resume_restores_the_optimizer_exactly(self, distributed_env, shared_tmp_dir, name):
         """FSDP2 resume restores the optimizer state bit for bit and continues the run exactly."""
         from torch.distributed.tensor import DTensor

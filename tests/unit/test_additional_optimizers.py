@@ -363,6 +363,30 @@ class TestScheduleFreeAdamW:
         assert {state["step"].item() for state in optimizer2.state.values()} == {3.0}
         assert optimizer2.warmup_steps == 7
 
+    def test_reading_a_fresh_optimizer_through_dcp_leaves_the_model_alone(self):
+        """``get_optimizer_state_dict`` gives a fresh optimizer a zero-lr step; it must not fail."""
+        from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
+
+        torch.manual_seed(0)
+        model = _make_model()
+        before = [p.detach().clone() for p in model.parameters()]
+        optimizer = build_optimizer(model, OptimizerConfig(name="schedule_free_adamw", lr=0.01))
+        state = get_optimizer_state_dict(model, optimizer)
+        assert state["state"], "the template should hold every parameter's state"
+        for b, p in zip(before, model.parameters(), strict=True):
+            assert torch.equal(b, p)
+
+    def test_a_zero_lr_step_is_a_no_op(self):
+        """A step at lr 0, as under a warmup that starts at 0, leaves the weights unchanged."""
+        torch.manual_seed(0)
+        model = _make_model()
+        before = [p.detach().clone() for p in model.parameters()]
+        optimizer = ScheduleFreeAdamW(model.parameters(), lr=0.0)
+        model(torch.randn(4, 32)).sum().backward()
+        optimizer.step()
+        for b, p in zip(before, model.parameters(), strict=True):
+            assert torch.equal(b, p)
+
     @pytest.mark.parametrize("warmup_steps", [0, 10])
     @pytest.mark.parametrize("betas", [(0.9, 0.95), (0.9, 0.999)])
     def test_a_late_parameter_takes_a_fresh_first_update(self, betas, warmup_steps):

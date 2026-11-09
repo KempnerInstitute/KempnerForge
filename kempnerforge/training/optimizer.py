@@ -223,7 +223,7 @@ class ScheduleFreeAdamW(torch.optim.Optimizer):
                     z.mul_(1 - lr * wd)
 
                 state["weight_sum"] += weight
-                ck = weight / state["weight_sum"]
+                ck = weight / state["weight_sum"] if state["weight_sum"] > 0 else 0.0
 
                 if "x" not in state:
                     state["x"] = z.clone()

@@ -2990,17 +2990,6 @@ class TestMuonResume:
 
 
 REGISTERED_OPTIMIZERS = sorted(registry.list("optimizer"))
-RESUMABLE_OPTIMIZERS = [
-    pytest.param(
-        name,
-        marks=pytest.mark.xfail(
-            raises=ZeroDivisionError, strict=True, reason="#236: schedule_free_adamw cannot resume"
-        ),
-    )
-    if name == "schedule_free_adamw"
-    else name
-    for name in REGISTERED_OPTIMIZERS
-]
 
 
 class TestSaveBeforeFirstStep:
@@ -3397,7 +3386,7 @@ class TestCheckpointEveryOptimizer:
         for (n, ref), p in zip(reference.named_parameters(), model.parameters(), strict=True):
             assert torch.equal(ref, p), f"{n} differs from the run that never saved"
 
-    @pytest.mark.parametrize("name", RESUMABLE_OPTIMIZERS)
+    @pytest.mark.parametrize("name", REGISTERED_OPTIMIZERS)
     def test_resume_restores_the_optimizer_exactly(self, tmp_path, name):
         """A resume restores the saved optimizer state bit for bit and continues the run exactly."""
         from kempnerforge.checkpoint.manager import CheckpointManager
@@ -3531,7 +3520,7 @@ class TestWeightDecayScopeOnResume:
         assert not any(o.state for o in manager.checkpointed_optimizers)
 
     @pytest.mark.parametrize("scope", [DEFAULT_SCOPE, ALL_SCOPE])
-    @pytest.mark.parametrize("name", RESUMABLE_OPTIMIZERS)
+    @pytest.mark.parametrize("name", REGISTERED_OPTIMIZERS)
     def test_the_same_scope_resumes_exactly(self, tmp_path, name, scope):
         """A resume under the saved scope restores all optimizer state and continues exactly."""
         model, opt = self._build(name, scope, seed=0)
