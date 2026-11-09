@@ -31,7 +31,7 @@ Interactive script: scripts/slurm/interactive.sh (salloc wrapper for debugging)
 Requeue-aware template: scripts/slurm/7b_requeue.sh (SIGTERM@120, --requeue, auto-resume via latest symlink)
 Example: scripts/slurm/13b_validation.sh (large-model multi-node config reference)
 Config fields consumed: [slurm].{account, partition, qos, default_time, default_nodes, default_gpus_per_node}
-Env vars set by scripts: MASTER_ADDR, MASTER_PORT, NCCL_SOCKET_IFNAME, GLOO_SOCKET_IFNAME, NCCL_IB_*, NCCL_TIMEOUT
+Env vars set by scripts: MASTER_ADDR, MASTER_PORT, NCCL_SOCKET_IFNAME, GLOO_SOCKET_IFNAME, NCCL_IB_*
 <!-- context-end -->
 
 ## Procedure

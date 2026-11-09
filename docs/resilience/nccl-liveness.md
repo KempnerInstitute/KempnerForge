@@ -57,30 +57,30 @@ wall-clock, adds one extra all-reduce to that step. Setting it to 1
 would sync every step — not useful because the gradient all-reduce in
 the same step would already have failed.
 
-## The timeout gotcha
-
-The function signature advertises a timeout:
+## Timeouts
 
 ```python
 def check_nccl_health(timeout_sec: float = 10.0) -> bool:
 ```
 
-But `timeout_sec` is **not used** in the current implementation — the
-function calls `dist.all_reduce` without a timeout and just catches
-`RuntimeError`. If the collective hangs, the `try/except` won't trip;
-the process blocks inside the C++ call.
+The probe issues its all-reduce with `async_op=True` and waits with
+`work.wait(timeout=timedelta(seconds=timeout_sec))`, so a peer that never
+joins makes it return `False` after `timeout_sec` instead of blocking. The
+abandoned all-reduce is not cancelled.
 
-In practice hangs are covered by two other layers:
+Every other collective is bounded by the process-group timeout,
+`distributed.nccl_timeout_sec` (default 1800 seconds; many shipped configs
+set 600 or 1200), which `init_distributed()` passes to
+`dist.init_process_group`. `init_distributed()` also sets
+`TORCH_NCCL_ASYNC_ERROR_HANDLING=1` when it is unset (and warns if you set
+it to `0`), so a collective that runs past the timeout aborts the
+communicator and stops the process instead of hanging. For faster
+failure detection, lower `distributed.nccl_timeout_sec`. An
+`NCCL_TIMEOUT` environment variable changes nothing: neither NCCL nor
+PyTorch reads it.
 
-- `NCCL_TIMEOUT` (set in `scripts/slurm/7b_requeue.sh` to 1800 = 30min)
-  aborts the collective at the NCCL level and raises a `RuntimeError`,
-  which `check_nccl_health` does catch.
-- `ShutdownHandler`'s forced-exit timer kills the process if graceful
-  shutdown stalls — see [SLURM preemption](slurm-preemption.md).
-
-But a stuck all-reduce can still eat 30 min of wall-clock before the
-NCCL-level timeout fires. If you need faster failure detection, lower
-`NCCL_TIMEOUT` at the env level.
+`ShutdownHandler`'s forced-exit timer also stops a graceful shutdown that
+stalls; see [SLURM preemption](slurm-preemption.md).
 
 ## When it fires
 

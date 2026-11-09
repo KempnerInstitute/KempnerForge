@@ -97,13 +97,17 @@ NCCL_SOCKET_IFNAME=ib0      # OOB bootstrap + socket transport
 NCCL_IB_DISABLE=0           # enable IB verbs transport
 NCCL_NET_GDR_LEVEL=2        # GPU-direct RDMA
 NCCL_IB_GID_INDEX=3         # H100/H200 fabric config
-NCCL_TIMEOUT=1800           # 30 minutes — raise for slow collectives
 GLOO_SOCKET_IFNAME=ib0
 ```
 
 `NCCL_IB_GID_INDEX=3` is specific to the RoCE/IB fabric on Kempner
 H100/H200 nodes. On other clusters this may need to be 0 or 1 — check
 with your admins or `ibv_devinfo`.
+
+A hung collective is bounded by the process-group timeout,
+`distributed.nccl_timeout_sec` (default 1800 seconds), not by an
+environment variable: neither NCCL nor PyTorch reads `NCCL_TIMEOUT`.
+Set it in the config or with `--distributed.nccl_timeout_sec=<seconds>`.
 
 ## Interactive / existing allocation: `interactive.sh`
 

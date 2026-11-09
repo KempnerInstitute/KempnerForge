@@ -52,9 +52,10 @@ interface (`ls /sys/class/net | grep '^ib'`) and populates defaults:
 | `NCCL_NET_GDR_LEVEL` | `2` | GPUDirect RDMA level — enables GPU→NIC DMA |
 
 All four use `setdefault`, so anything you export before launch wins.
-The launch scripts also set `NCCL_IB_GID_INDEX=3` and
-`NCCL_TIMEOUT=1800`; those are shell-level conventions, not read
-anywhere in the Python code.
+The launch scripts also set `NCCL_IB_GID_INDEX=3`, which NCCL reads and
+the Python code does not. There is no `NCCL_TIMEOUT` setting: neither NCCL
+nor PyTorch reads that variable, and the collective timeout is
+`distributed.nccl_timeout_sec`.
 
 ## SLURM metadata (resilience)
 
