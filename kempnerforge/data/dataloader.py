@@ -5,6 +5,7 @@ Wraps PyTorch DataLoader with:
   - Stateful iteration tracking for checkpoint/resume
   - Integration with DistributedSampler for rank-partitioned data
   - A resume position that survives a change of data-parallel size or batch size
+  - A streaming loader that resumes by replaying its stream to the saved position
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 from kempnerforge.config.schema import DataConfig
+from kempnerforge.data.dataset import StreamingHuggingFaceDataset
 from kempnerforge.data.sampler import DistributedSampler, MixtureSampler
 from kempnerforge.resilience.signal_handler import ignore_shutdown_signals_in_worker
 
@@ -166,8 +168,14 @@ class StatefulDataLoader:
         Raises:
             DataPositionError: The data-parallel size changed and the saved
                 position is per rank (a mixture, or a checkpoint that predates
-                the saved batch size).
+                the saved batch size), or the state is a streaming position.
         """
+        if "stream" in state:
+            raise DataPositionError(
+                "The checkpoint holds a streaming data position, but this run reads a "
+                "map-style dataset (data.hf_streaming changed), so it has no sample to "
+                "resume at."
+            )
         sampler_state = state.get("sampler", {})
         replicas = self.sampler.num_replicas
         saved_replicas = sampler_state.get("num_replicas", replicas)
@@ -224,3 +232,131 @@ class StatefulDataLoader:
             )
 
         logger.info(f"Resumed DataLoader: epoch={self._epoch}, position={self._start}")
+
+
+class StreamingDataLoader:
+    """DataLoader over a ``StreamingHuggingFaceDataset`` that resumes by replaying.
+
+    A stream has no index to seek to, so the position is the number of batches
+    training took this epoch. A resume rebuilds the epoch's stream and discards
+    that many batches before yielding, which lands on the exact next sample
+    because the shuffle, the split across ranks and workers, and the packing are
+    deterministic. ``load_state_dict`` refuses a position saved under anything
+    that changes the stream: the dataset's ``stream_identity``, the batch size or
+    the worker count. The replay rereads and retokenizes the part of the epoch
+    already trained on, so a resume deep into an epoch takes time.
+
+    Args:
+        dataset: The streaming dataset.
+        batch_size: Per-device micro-batch size.
+        config: Data pipeline configuration.
+    """
+
+    def __init__(
+        self,
+        dataset: StreamingHuggingFaceDataset,
+        batch_size: int,
+        config: DataConfig | None = None,
+    ) -> None:
+        config = config or DataConfig()
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self._num_workers = config.num_workers
+        self._dataloader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            num_workers=config.num_workers,
+            pin_memory=config.pin_memory,
+            prefetch_factor=config.prefetch_factor if config.num_workers > 0 else None,
+            persistent_workers=config.num_workers > 0,
+            worker_init_fn=ignore_shutdown_signals_in_worker,
+        )
+        self._epoch = 0
+        self._batches_yielded = 0
+        self._iterator = None
+
+    def _identity(self) -> dict:
+        return {
+            **self.dataset.stream_identity(),
+            "batch_size": self.batch_size,
+            "num_workers": self._num_workers,
+        }
+
+    def __iter__(self):
+        self.dataset.set_epoch(self._epoch)
+        self._iterator = iter(self._dataloader)
+        if self._batches_yielded:
+            self._replay()
+        return self
+
+    def _replay(self) -> None:
+        """Discard the batches this epoch already gave training."""
+        logger.info(
+            f"Replaying {self._batches_yielded} batches of epoch {self._epoch} to restore "
+            f"the stream position"
+        )
+        assert self._iterator is not None
+        for replayed in range(self._batches_yielded):
+            try:
+                next(self._iterator)
+            except StopIteration:
+                logger.warning(
+                    f"The stream ended after {replayed} of {self._batches_yielded} replayed "
+                    f"batches; starting epoch {self._epoch + 1}"
+                )
+                self._epoch += 1
+                self._batches_yielded = 0
+                self.dataset.set_epoch(self._epoch)
+                self._iterator = iter(self._dataloader)
+                return
+
+    def __next__(self) -> dict[str, torch.Tensor]:
+        if self._iterator is None:
+            raise StopIteration
+        try:
+            batch = next(self._iterator)
+        except StopIteration:
+            self._epoch += 1
+            self._batches_yielded = 0
+            self._iterator = None
+            raise
+        self._batches_yielded += 1
+        return batch
+
+    def state_dict(self) -> dict:
+        """Return checkpoint state: ``epoch``, ``batches_yielded`` and the ``stream`` it counts."""
+        return {
+            "epoch": self._epoch,
+            "batches_yielded": self._batches_yielded,
+            "stream": self._identity(),
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        """Restore the position; the next ``iter()`` replays the stream to it.
+
+        Raises:
+            DataPositionError: The state is a map-style position, or something
+                that changes the stream differs from when it was saved.
+        """
+        saved = state.get("stream")
+        if saved is None:
+            raise DataPositionError(
+                "The checkpoint holds a map-style data position, but this run streams its "
+                "data (data.hf_streaming changed), so the position cannot be replayed."
+            )
+        current = self._identity()
+        changed = sorted(k for k in set(saved) | set(current) if saved.get(k) != current.get(k))
+        if changed:
+            detail = "; ".join(
+                f"{k}: saved {saved.get(k)!r}, now {current.get(k)!r}" for k in changed
+            )
+            raise DataPositionError(
+                f"Cannot replay the stream to its saved position because the stream "
+                f"changed ({detail}). Resume with the saved values."
+            )
+        self._epoch = state.get("epoch", 0)
+        self._batches_yielded = state.get("batches_yielded", 0)
+        logger.info(
+            f"Resumed streaming DataLoader: epoch={self._epoch}, replaying "
+            f"{self._batches_yielded} batches on the next iteration"
+        )

@@ -432,8 +432,8 @@ class StreamingHuggingFaceDataset(torch.utils.data.IterableDataset):
     only its own shards, and otherwise each rank keeps every
     ``world_size``-th document of the shared order.
 
-    Use directly with ``torch.utils.data.DataLoader`` (no sampler needed —
-    IterableDataset handles its own distribution).
+    Training wraps it in ``StreamingDataLoader``, which needs no sampler and
+    restores the position on resume by replaying the stream.
 
     Args:
         dataset_name: HuggingFace dataset name (e.g., "allenai/c4").
@@ -494,6 +494,27 @@ class StreamingHuggingFaceDataset(torch.utils.data.IterableDataset):
 
             self._tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_path)
             self._eos_id = self._tokenizer.eos_token_id or 0
+
+    def set_epoch(self, epoch: int) -> None:
+        """Set the epoch whose shuffle the next pass reads."""
+        self._epoch = epoch
+
+    def stream_identity(self) -> dict:
+        """The settings that decide the order of this rank's stream.
+
+        A position counted in batches replays to the same samples only while
+        these, the batch size and the loader's worker count stay the same. The
+        rank is not included: every rank replays its own stream by the same count.
+        """
+        return {
+            "source": [self.dataset_name, self.dataset_config, self.split, self.text_field],
+            "data_parallel_size": self.world_size,
+            "seed": self.seed,
+            "shuffle_buffer_size": self.shuffle_buffer_size,
+            "seq_len": self.seq_len,
+            "tokenizer": self.tokenizer_path,
+            "pack_sequences": self._packing_enabled,
+        }
 
     def _load_stream(self):
         """Load this rank's part of the shuffled HuggingFace stream.

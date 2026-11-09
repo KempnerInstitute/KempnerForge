@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader as TorchDataLoader
 
 from kempnerforge.config.data import TrainingPhase
 from kempnerforge.config.job import JobConfig
-from kempnerforge.data.dataloader import StatefulDataLoader
+from kempnerforge.data.dataloader import StatefulDataLoader, StreamingDataLoader
 from kempnerforge.data.dataset import (
     HuggingFaceDataset,
     MemoryMappedDataset,
@@ -27,7 +27,6 @@ from kempnerforge.data.dataset import (
 from kempnerforge.data.sampler import DistributedSampler, MixtureSampler
 from kempnerforge.distributed.utils import get_dp_info
 from kempnerforge.metrics.logger import get_logger
-from kempnerforge.resilience.signal_handler import ignore_shutdown_signals_in_worker
 from kempnerforge.training.eval import should_build_eval_dataloader
 from kempnerforge.training.runtime import RuntimeContext
 
@@ -270,15 +269,7 @@ def _build_hf_pipeline(config: JobConfig, dp_rank: int, dp_size: int) -> DataPip
             seed=tc.effective_data_seed,
             pack_sequences=config.data.pack_sequences,
         )
-        dataloader: Any = TorchDataLoader(
-            dataset,
-            batch_size=tc.batch_size,
-            num_workers=config.data.num_workers,
-            pin_memory=config.data.pin_memory,
-            prefetch_factor=(config.data.prefetch_factor if config.data.num_workers > 0 else None),
-            persistent_workers=config.data.num_workers > 0,
-            worker_init_fn=ignore_shutdown_signals_in_worker,
-        )
+        dataloader: Any = StreamingDataLoader(dataset, batch_size=tc.batch_size, config=config.data)
         logger.info(
             f"Dataset: streaming from {config.data.hf_dataset_name} "
             f"({config.data.hf_dataset_split}), rank={dp_rank}/{dp_size}"
