@@ -2379,7 +2379,9 @@ class TestVlmSourceBuilders:
         monkeypatch.setattr(vlmd, "build_tokenizer", lambda p: "TOK")
         monkeypatch.setattr(vlmd, "resolve_pad_id", lambda tok: 7)
         monkeypatch.setattr(
-            vlmd, "HuggingFaceVLMDataset", lambda **k: seen.setdefault("dataset", k) and FakeDataset()
+            vlmd,
+            "HuggingFaceVLMDataset",
+            lambda **k: seen.setdefault("dataset", k) and FakeDataset(),
         )
         monkeypatch.setattr(vlmd, "VLMCollator", lambda **k: seen.setdefault("image_collator", k))
         monkeypatch.setattr(

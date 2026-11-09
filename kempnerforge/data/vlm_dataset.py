@@ -286,7 +286,7 @@ def _images_per_row(rows: Any, image_field: str) -> Any:
 
 
 def _check_image_counts(rows: Any, image_field: str, allow_text_only: bool, max_images: int) -> None:
-    """Check every row's image count against the dataset's settings before training starts.
+    """Check every row's image count against the dataset's settings before training.
 
     Raises:
         ValueError: Some rows hold no image and ``allow_text_only`` is off, or

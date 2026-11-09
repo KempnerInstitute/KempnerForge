@@ -154,7 +154,7 @@ class JobConfig:
 
     @property
     def images_per_document(self) -> int:
-        """Encoder inputs one sample may hold, sizing the image budget: a clip's frames or the image cap."""
+        """Encoder inputs one sample may hold: a clip's frames, else the image cap."""
         if self.video is not None:
             return self.video.max_frames
         return self.data.hf_max_images
