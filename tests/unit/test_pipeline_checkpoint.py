@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import math
-import socket
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
@@ -31,17 +30,11 @@ from kempnerforge.distributed.tensor_parallel import apply_tensor_parallel
 from kempnerforge.model.transformer import Transformer
 from kempnerforge.training.entry import build_checkpoint_manager, restore_checkpoint
 from kempnerforge.training.runtime import PipelineBundle, RuntimeContext
+from tests.gloo_ranks import gloo_group, held_store, spawn
 
 MODEL = ModelConfig(dim=32, n_layers=4, n_heads=4, vocab_size=64, max_seq_len=16)
 STEP = 3
 TOKENS = 96
-
-
-def _free_port() -> int:
-    """An unused local TCP port for the gloo rendezvous."""
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
 
 
 def _stage_members(rank: int, shape: tuple[int, ...], names: tuple[str, ...]) -> list[int]:
@@ -128,10 +121,7 @@ def _check_save_and_resume(
     async_mode: AsyncCheckpointMode,
 ) -> None:
     """Save every stage through ``build_checkpoint_manager``, then resume a fresh model from it."""
-    dist.init_process_group(
-        "gloo", rank=rank, world_size=world, init_method=f"tcp://127.0.0.1:{port}"
-    )
-    try:
+    with gloo_group(rank, world, port):
         mesh = init_device_mesh("cpu", shape, mesh_dim_names=names)
         pp_size = mesh["pp"].size()
         config, runtime, pipeline = _job(rank, world, mesh, ckpt_dir, async_mode)
@@ -163,8 +153,6 @@ def _check_save_and_resume(
         assert restore_checkpoint(config, resumed, None, resume_manager) == (STEP, TOKENS)
         _assert_same(resumed.state_dict(), saved.state_dict())
         _assert_same(resumed_optimizer.state_dict()["state"], saved_optimizer.state_dict()["state"])
-    finally:
-        dist.destroy_process_group()
 
 
 class _LateWrite:
@@ -207,10 +195,7 @@ def _check_latest_waits_for_every_stage(
     rank: int, world: int, port: int, ckpt_dir: str, async_mode: AsyncCheckpointMode
 ) -> None:
     """The last stage writes late; rank 0 commits ``latest`` only once every stage has saved."""
-    dist.init_process_group(
-        "gloo", rank=rank, world_size=world, init_method=f"tcp://127.0.0.1:{port}"
-    )
-    try:
+    with gloo_group(rank, world, port):
         mesh = init_device_mesh("cpu", (world,), mesh_dim_names=("pp",))
         config, runtime, pipeline = _job(rank, world, mesh, ckpt_dir, async_mode)
         stage = _stage(mesh, seed=0)
@@ -236,8 +221,6 @@ def _check_latest_waits_for_every_stage(
             expected = {STEP: [f"pp{k}" for k in range(world)]}
             assert complete_at_commit == expected, f"stages saved at commit: {complete_at_commit}"
             assert (Path(ckpt_dir) / "latest").resolve().name == f"step_{STEP}"
-    finally:
-        dist.destroy_process_group()
 
 
 def _no_space_left(*args: Any, **kwargs: Any) -> Any:
@@ -284,10 +267,7 @@ def _check_a_failed_save(
 
     With ``saved_first``, step 1 is saved before the part starts failing.
     """
-    dist.init_process_group(
-        "gloo", rank=rank, world_size=world, init_method=f"tcp://127.0.0.1:{port}"
-    )
-    try:
+    with gloo_group(rank, world, port):
         mesh = init_device_mesh("cpu", shape, mesh_dim_names=names)
         config, runtime, pipeline = _job(rank, world, mesh, ckpt_dir, async_mode)
         stage = _stage(mesh, seed=0)
@@ -304,8 +284,6 @@ def _check_a_failed_save(
         except BaseException as e:
             outcome = f"{type(e).__name__}: {e}"
         Path(out_dir, f"rank{rank}").write_text(outcome)
-    finally:
-        dist.destroy_process_group()
 
 
 def _outcomes(
@@ -323,29 +301,30 @@ def _outcomes(
     world = math.prod(shape)
     out_dir = tmp_path / "outcomes"
     out_dir.mkdir()
-    context = mp.spawn(
-        _check_a_failed_save,
-        args=(
-            world,
-            _free_port(),
-            shape,
-            names,
-            str(tmp_path / "ckpt"),
-            async_mode,
-            failing,
-            saved_first,
-            str(out_dir),
-        ),
-        nprocs=world,
-        join=False,
-    )
-    deadline = time.monotonic() + 45
-    while not context.join(timeout=1):
-        if time.monotonic() > deadline:
-            for process in context.processes:
-                process.terminate()
-            waiting = sorted(set(range(world)) - {int(p.name[4:]) for p in out_dir.iterdir()})
-            pytest.fail(f"ranks {waiting} still in save() or wait() after the {failing} failed")
+    with held_store() as port:
+        context = mp.spawn(
+            _check_a_failed_save,
+            args=(
+                world,
+                port,
+                shape,
+                names,
+                str(tmp_path / "ckpt"),
+                async_mode,
+                failing,
+                saved_first,
+                str(out_dir),
+            ),
+            nprocs=world,
+            join=False,
+        )
+        deadline = time.monotonic() + 45
+        while not context.join(timeout=1):
+            if time.monotonic() > deadline:
+                for process in context.processes:
+                    process.terminate()
+                waiting = sorted(set(range(world)) - {int(p.name[4:]) for p in out_dir.iterdir()})
+                pytest.fail(f"ranks {waiting} still in save() or wait() after the {failing} failed")
     outcomes = {int(p.name[4:]): p.read_text() for p in out_dir.iterdir()}
     assert sorted(outcomes) == list(range(world))
     return outcomes
@@ -377,21 +356,14 @@ class TestPipelineCheckpointSaveAndResume:
     def test_every_stage_writes_a_checkpoint_that_resumes(self, tmp_path, shape, names, async_mode):
         """Each ``pp{k}`` directory gets its own ``.metadata`` and restores its stage exactly."""
         world = math.prod(shape)
-        mp.spawn(
-            _check_save_and_resume,
-            args=(world, _free_port(), shape, names, str(tmp_path / "ckpt"), async_mode),
-            nprocs=world,
-        )
+        spawn(_check_save_and_resume, world, shape, names, str(tmp_path / "ckpt"), async_mode)
 
 
 def _check_resume_skips_a_step_one_stage_never_saved(
     rank: int, world: int, port: int, root: str
 ) -> None:
     """Both stages save step 5; only stage 0 writes step 10; latest is gone (#468)."""
-    dist.init_process_group(
-        "gloo", rank=rank, world_size=world, init_method=f"tcp://127.0.0.1:{port}"
-    )
-    try:
+    with gloo_group(rank, world, port):
         groups = [dist.new_group([r], backend="gloo") for r in range(world)]
         model = torch.nn.Linear(1, 1, bias=False)
         optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
@@ -421,18 +393,12 @@ def _check_resume_skips_a_step_one_stage_never_saved(
             model.weight.fill_(-1)
         assert restore_checkpoint(config, model, None, manager) == (5, 50)
         assert model.weight.item() == 5.0
-    finally:
-        dist.destroy_process_group()
 
 
 class TestResumeScanNeedsEveryStage:
     def test_every_stage_resumes_from_the_newest_step_they_all_saved(self, tmp_path):
         """Without latest, a step one stage never wrote is skipped, not split across stages."""
-        mp.spawn(
-            _check_resume_skips_a_step_one_stage_never_saved,
-            args=(2, _free_port(), str(tmp_path / "ckpt")),
-            nprocs=2,
-        )
+        spawn(_check_resume_skips_a_step_one_stage_never_saved, 2, str(tmp_path / "ckpt"))
 
 
 class TestLatestWaitsForEveryStage:
@@ -441,11 +407,7 @@ class TestLatestWaitsForEveryStage:
     )
     def test_latest_names_a_step_only_after_every_stage_saved_it(self, tmp_path, async_mode):
         """Committing (and pruning) on rank 0 waits for the slowest stage's ``.metadata``."""
-        mp.spawn(
-            _check_latest_waits_for_every_stage,
-            args=(2, _free_port(), str(tmp_path / "ckpt"), async_mode),
-            nprocs=2,
-        )
+        spawn(_check_latest_waits_for_every_stage, 2, str(tmp_path / "ckpt"), async_mode)
 
 
 class TestAFailedSaveFailsEveryRank:

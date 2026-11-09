@@ -36,6 +36,7 @@ from kempnerforge.config.schema import (
 )
 from kempnerforge.model.transformer import Transformer
 from kempnerforge.training.optimizer import Muon, _should_decay, build_optimizer
+from tests.gloo_ranks import gloo_group, spawn
 
 
 class TestRNGState:
@@ -3427,32 +3428,14 @@ class TestResumeWithoutTrainState:
         assert not missing_train_state(path)
 
 
-def _free_port() -> int:
-    """An unused local TCP port for a gloo rendezvous."""
-    import socket
-
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
 def _load_with_a_stale_view(rank: int, world: int, port: int, ckpt_dir: str, stale: int) -> None:
     """Save on every rank, then load while rank ``stale`` cannot see ``train_state.pt``."""
     from datetime import timedelta
     from unittest.mock import patch
 
-    import torch.distributed as dist
-
     from kempnerforge.checkpoint.manager import CheckpointManager
 
-    dist.init_process_group(
-        "gloo",
-        rank=rank,
-        world_size=world,
-        init_method=f"tcp://127.0.0.1:{port}",
-        timeout=timedelta(seconds=30),
-    )
-    try:
+    with gloo_group(rank, world, port, timeout=timedelta(seconds=30)):
         torch.manual_seed(0)
         model = torch.nn.Linear(4, 4)
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
@@ -3472,8 +3455,6 @@ def _load_with_a_stale_view(rank: int, world: int, port: int, ckpt_dir: str, sta
                     manager.load()
             else:
                 assert manager.load() == (3, 30, {})
-    finally:
-        dist.destroy_process_group()
 
 
 class TestResumeWithoutTrainStateAcrossRanks:
@@ -3482,9 +3463,7 @@ class TestResumeWithoutTrainStateAcrossRanks:
     @pytest.mark.parametrize("stale", [0, 1], ids=["rank_0_sees_none", "rank_1_sees_none"])
     def test_every_rank_follows_rank_zero(self, tmp_path, stale):
         """No rank raises alone and leaves the others waiting in a collective."""
-        import torch.multiprocessing as mp
-
-        mp.spawn(_load_with_a_stale_view, args=(2, _free_port(), str(tmp_path), stale), nprocs=2)
+        spawn(_load_with_a_stale_view, 2, str(tmp_path), stale)
 
 
 def _assert_same_state_dict(expected, actual, where="state_dict"):
