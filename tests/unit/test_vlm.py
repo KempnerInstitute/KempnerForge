@@ -457,7 +457,10 @@ class TestPackedForward:
         with torch.no_grad():
             packed, _ = self._forward(wrapper, batch)
             alone, _ = self._forward(
-                wrapper, pack_vlm_samples([text_doc], seq_len=40, tokens_per_image=8, pad_id=0)
+                wrapper,
+                pack_vlm_samples(
+                    [text_doc], seq_len=40, tokens_per_image=8, pad_id=0, allow_text_only=True
+                ),
             )
         assert torch.allclose(packed[0, 20:30], alone[0, :10], atol=1e-5)
 
