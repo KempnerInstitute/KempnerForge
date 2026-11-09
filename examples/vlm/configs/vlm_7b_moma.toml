@@ -32,7 +32,8 @@
 # Usage:
 #   uv run torchrun --nproc_per_node=4 examples/vlm/train.py examples/vlm/configs/vlm_7b_moma.toml
 #
-# Default points at a 30-sample COCO val substitute (sayakpaul/coco-30-val-2014)
+# Default points at sayakpaul/coco-30-val-2014: 30,000 image-caption pairs
+# sampled from the COCO 2014 val split, about 4.9 GB to download on first use,
 # so a fresh clone runs without external setup. For real training override:
 #   --data.hf_dataset_name=/path/to/local/hf_dataset \
 #   --data.hf_dataset_text_field=caption
