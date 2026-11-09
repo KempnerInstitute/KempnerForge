@@ -71,9 +71,8 @@ from kempnerforge.data.vlm_dataset import (
     DEFAULT_IMAGE_STD,
     build_tokenizer,
     frames_to_clip_tensor,
-    pil_to_tensor,
+    image_to_views,
     resolve_pad_id,
-    tile_image,
 )
 from kempnerforge.metrics.logger import get_logger
 from kempnerforge.model.generate import sample
@@ -321,25 +320,19 @@ def _frames_to_pixel_values(
     length-1 list); the list shape is the seam for future video (ordered
     frames). Each frame may be a ``PIL.Image`` or a path string (see ``_to_pil``).
     With ``tile_grid`` each frame is cut into views by the training-time
-    ``tile_image`` and the tensor is ``(num_frames, views, 3, H, W)``.
+    ``image_to_views`` and the tensor is ``(num_frames, views, 3, H, W)``.
     """
-    if tile_grid:
-        tensors = [
-            tile_image(
-                _to_pil(frame),
-                image_size,
-                DEFAULT_IMAGE_MEAN,
-                DEFAULT_IMAGE_STD,
-                grid=tile_grid,
-                include_global=tile_global,
-            )
-            for frame in frames
-        ]
-    else:
-        tensors = [
-            pil_to_tensor(_to_pil(frame), image_size, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD)
-            for frame in frames
-        ]
+    tensors = [
+        image_to_views(
+            _to_pil(frame),
+            image_size,
+            DEFAULT_IMAGE_MEAN,
+            DEFAULT_IMAGE_STD,
+            tile_grid=tile_grid,
+            tile_global=tile_global,
+        )
+        for frame in frames
+    ]
     return torch.stack(tensors, dim=0).to(device=device, dtype=dtype)
 
 

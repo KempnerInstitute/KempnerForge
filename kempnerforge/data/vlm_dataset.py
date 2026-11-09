@@ -100,22 +100,31 @@ def tile_image(
     Public for the same reason as ``pil_to_tensor``: an evaluation adapter must
     tile a request's image exactly as training did.
     """
-    from PIL import Image
-
-    if grid < 1:
-        raise ValueError(f"grid must be >= 1, got {grid}")
+    if grid < 2:
+        raise ValueError(f"grid must be >= 2 (an n × n grid of crops), got {grid}")
     _require_pil(img)
     views = []
     if include_global:
-        views.append(pil_to_tensor(img, image_size, mean, std))
-    canvas_size = grid * image_size
-    canvas = img.convert("RGB").resize((canvas_size, canvas_size), Image.Resampling.BILINEAR)
-    for row in range(grid):
-        for col in range(grid):
-            left, top = col * image_size, row * image_size
-            crop = canvas.crop((left, top, left + image_size, top + image_size))
-            views.append(pil_to_tensor(crop, image_size, mean, std))
-    return torch.stack(views, dim=0)
+        views.append(pil_to_tensor(img, image_size, mean, std).unsqueeze(0))
+    canvas = pil_to_tensor(img, grid * image_size, mean, std)
+    crops = canvas.reshape(3, grid, image_size, grid, image_size).permute(1, 3, 0, 2, 4)
+    views.append(crops.reshape(grid * grid, 3, image_size, image_size))
+    return torch.cat(views, dim=0)
+
+
+def image_to_views(
+    img: Any,
+    image_size: int,
+    mean: tuple[float, float, float],
+    std: tuple[float, float, float],
+    *,
+    tile_grid: int = 0,
+    tile_global: bool = True,
+) -> torch.Tensor:
+    """One ``(3, H, W)`` view, or the ``(V, 3, H, W)`` views of ``tile_image`` when tiling."""
+    if tile_grid:
+        return tile_image(img, image_size, mean, std, grid=tile_grid, include_global=tile_global)
+    return pil_to_tensor(img, image_size, mean, std)
 
 
 def frames_to_clip_tensor(
@@ -438,19 +447,14 @@ class HuggingFaceVLMDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         row = self._ds[idx]
-        if self._tile_grid:
-            pixels = tile_image(
-                row[self._image_field],
-                self._image_size,
-                self._image_mean,
-                self._image_std,
-                grid=self._tile_grid,
-                include_global=self._tile_global,
-            )
-        else:
-            pixels = pil_to_tensor(
-                row[self._image_field], self._image_size, self._image_mean, self._image_std
-            )
+        pixels = image_to_views(
+            row[self._image_field],
+            self._image_size,
+            self._image_mean,
+            self._image_std,
+            tile_grid=self._tile_grid,
+            tile_global=self._tile_global,
+        )
         text_val = row[self._text_field]
         if not isinstance(text_val, str):
             raise TypeError(

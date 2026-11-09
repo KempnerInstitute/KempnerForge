@@ -20,6 +20,7 @@ from kempnerforge.data.vlm_dataset import (
     _tokenize_and_mask,
     check_prompt_fits,
     frames_to_clip_tensor,
+    image_to_views,
     pil_to_tensor,
     tile_image,
 )
@@ -108,9 +109,22 @@ class TestTileImage:
         with pytest.raises(TypeError, match="Expected a PIL.Image"):
             tile_image(torch.randn(3, 16, 16), 16, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD, grid=2)
 
-    def test_grid_below_one_raises(self):
-        with pytest.raises(ValueError, match="grid must be >= 1"):
-            tile_image(_make_image(), 16, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD, grid=0)
+    @pytest.mark.parametrize("grid", [0, 1])
+    def test_grid_below_two_raises(self, grid):
+        with pytest.raises(ValueError, match="grid must be >= 2"):
+            tile_image(_make_image(), 16, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD, grid=grid)
+
+    def test_image_to_views_selects_by_grid(self):
+        img = _quadrant_image(64)
+        one = image_to_views(img, 16, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD)
+        assert torch.equal(one, pil_to_tensor(img, 16, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD))
+        tiled = image_to_views(
+            img, 16, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD, tile_grid=2, tile_global=False
+        )
+        crops = tile_image(
+            img, 16, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD, grid=2, include_global=False
+        )
+        assert torch.equal(tiled, crops)
 
 
 class _MockTokenizer:

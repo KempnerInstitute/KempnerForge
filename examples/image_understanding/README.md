@@ -55,10 +55,15 @@ tile_global = true     # plus the whole image first: 10 views
 
 The views travel like a clip's frames (`pixel_values` is `(B, views, 3, H, W)`),
 so the sequence budget is `views × tokens per view + max_text_len`, and the
-config and build checks enforce it. `tile_image` in
-`kempnerforge/data/vlm_dataset.py` is the preprocessor at training and at
-evaluation, so an evaluation tiles exactly as training did.
-Tiling applies to the image path only; a `[video]` run rejects it.
+config and build checks enforce it. With this example's 256 tokens per view
+and `max_text_len = 256`, the 10 views above need `model.max_seq_len` and
+`train.seq_len` of at least 2816, so raise both from the presets' 512 before
+turning tiling on. `tile_image` in `kempnerforge/data/vlm_dataset.py` is the
+preprocessor at training and at evaluation, so an evaluation tiles exactly as
+training did. The crops come from the image resized to a square canvas, so a
+wide or tall image is stretched the way its single view already is; a grid
+that follows the aspect ratio is not implemented. Tiling applies to the image
+path only; a `[video]` run rejects it.
 
 ## Start from the pretrained backbone
 

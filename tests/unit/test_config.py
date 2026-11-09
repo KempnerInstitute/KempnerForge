@@ -782,6 +782,18 @@ class TestJobConfig:
         config.train.seq_len = 224
         config.validate(world_size=1)
 
+    def test_the_video_tiling_refusal_precedes_the_budget_check(self):
+        from kempnerforge.config.video import VideoConfig
+
+        with pytest.raises(ValueError, match="leave vlm.tile_grid at 0"):
+            JobConfig(
+                model=ModelConfig(max_seq_len=64),
+                vision_encoder=VisionEncoderConfig(type="random", num_tokens=16),
+                adapter=AdapterConfig(),
+                vlm=VLMConfig(max_text_len=64, tile_grid=3),
+                video=VideoConfig(max_frames=8, min_frames=1, frame_size=16),
+            )
+
     def test_tiled_views_must_fit_max_seq_len_at_construction(self):
         with pytest.raises(ValueError, match=r"residual_image_tokens \(160\)"):
             JobConfig(

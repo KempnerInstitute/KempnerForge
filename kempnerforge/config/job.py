@@ -70,6 +70,17 @@ class JobConfig:
         if not isinstance(self.plugins, list) or not all(isinstance(p, str) for p in self.plugins):
             raise ValueError(f"plugins must be a list of module paths (got {self.plugins!r})")
 
+        if self.video is not None and self.vlm is None:
+            raise ValueError(
+                "[video] is set but [vlm] is missing; video training runs through "
+                "the VLM wrapper, so a [vlm] section (and [vision_encoder]) is required."
+            )
+        if self.video is not None and self.vlm is not None and self.vlm.tile_grid:
+            raise ValueError(
+                "vlm.tile_grid tiles the image path, but [video] is set; a video run "
+                "samples frames instead, so leave vlm.tile_grid at 0"
+            )
+
         if self.vlm is not None:
             if self.vision_encoder is None:
                 raise ValueError(
@@ -108,17 +119,6 @@ class JobConfig:
                         f"residual_image_tokens ({residual_image_tokens}) + "
                         f"vlm.max_text_len ({self.vlm.max_text_len}) = {required}"
                     )
-
-        if self.video is not None and self.vlm is None:
-            raise ValueError(
-                "[video] is set but [vlm] is missing; video training runs through "
-                "the VLM wrapper, so a [vlm] section (and [vision_encoder]) is required."
-            )
-        if self.video is not None and self.vlm is not None and self.vlm.tile_grid:
-            raise ValueError(
-                "vlm.tile_grid tiles the image path, but [video] is set; a video run "
-                "samples frames instead, so leave vlm.tile_grid at 0"
-            )
 
         if self.model.attention_backend == "flex" and self.train.seq_len < FLEX_BLOCK_SIZE:
             raise ValueError(
