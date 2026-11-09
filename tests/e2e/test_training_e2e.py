@@ -21,7 +21,6 @@ from __future__ import annotations
 import os
 import re
 import signal
-import socket
 import subprocess
 import sys
 import time
@@ -38,13 +37,6 @@ TRAIN_SCRIPT = str(PROJECT_ROOT / "scripts" / "train.py")
 DEBUG_CONFIG = str(PROJECT_ROOT / "configs" / "train" / "debug.toml")
 DEBUG_MOE_CONFIG = str(PROJECT_ROOT / "configs" / "train" / "debug_moe.toml")
 BENCH_CONFIG = str(PROJECT_ROOT / "configs" / "train" / "7b.toml")
-
-
-def _find_free_port() -> int:
-    """Find a free TCP port by binding to port 0 and letting the OS assign one."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("", 0))
-        return s.getsockname()[1]
 
 
 def _run_training(
@@ -67,13 +59,12 @@ def _run_training(
         env.update(env_extra)
 
     if nproc > 1:
-        port = _find_free_port()
         cmd = [
             sys.executable,
             "-m",
             "torch.distributed.run",
+            "--standalone",
             f"--nproc_per_node={nproc}",
-            f"--master_port={port}",
             TRAIN_SCRIPT,
             *args,
         ]

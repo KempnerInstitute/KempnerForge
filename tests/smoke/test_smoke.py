@@ -26,7 +26,6 @@ import json
 import os
 import re
 import shutil
-import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -52,12 +51,6 @@ def _next_port() -> int:
     return _port_counter
 
 
-def _find_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("", 0))
-        return s.getsockname()[1]
-
-
 def _run_torchrun(
     script: str,
     args: list[str],
@@ -68,13 +61,12 @@ def _run_torchrun(
     env = os.environ.copy()
 
     if nproc > 1:
-        port = _find_free_port()
         cmd = [
             sys.executable,
             "-m",
             "torch.distributed.run",
+            "--standalone",
             f"--nproc_per_node={nproc}",
-            f"--master_port={port}",
             script,
             *args,
         ]
