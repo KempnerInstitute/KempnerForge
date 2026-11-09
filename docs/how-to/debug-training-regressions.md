@@ -158,12 +158,14 @@ See
 The check catches **partial-participation bugs**. The probe itself waits
 at most `timeout_sec` (10 seconds) and returns `False` on a timeout, but a
 rank that is genuinely dead usually stalls the step's own collectives
-before the probe runs. Those are bounded by the process-group timeout,
-`distributed.nccl_timeout_sec` (default 1800 seconds); lower it to fail
-faster:
+before the probe runs. Those wait out their process group's timeout:
+`distributed.nccl_timeout_sec` (default 1800 seconds) on the default
+group, which plain FSDP uses, and PyTorch's 30-minute default on the
+groups `init_device_mesh` creates for the other mesh dimensions. To fail
+faster on the default group, lower it:
 
 ```bash
---distributed.nccl_timeout_sec=600
+sbatch scripts/slurm/multinode.sh configs/train/7b.toml --distributed.nccl_timeout_sec=600
 ```
 
 ### When it fires

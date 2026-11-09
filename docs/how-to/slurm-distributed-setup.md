@@ -104,10 +104,12 @@ GLOO_SOCKET_IFNAME=ib0
 H100/H200 nodes. On other clusters this may need to be 0 or 1 — check
 with your admins or `ibv_devinfo`.
 
-A hung collective is bounded by the process-group timeout,
-`distributed.nccl_timeout_sec` (default 1800 seconds), not by an
-environment variable: neither NCCL nor PyTorch reads `NCCL_TIMEOUT`.
-Set it in the config or with `--distributed.nccl_timeout_sec=<seconds>`.
+No environment variable bounds a hung collective: neither NCCL nor
+PyTorch reads `NCCL_TIMEOUT`. `distributed.nccl_timeout_sec` (default
+1800 seconds) is the timeout of the default process group, which plain
+FSDP uses; the groups `init_device_mesh` creates for TP, PP, EP, HSDP and
+other extra mesh dimensions keep PyTorch's 30-minute default. Set it in
+the config or with `--distributed.nccl_timeout_sec=<seconds>`.
 
 ## Interactive / existing allocation: `interactive.sh`
 
@@ -136,7 +138,7 @@ the short version:
   job step, that is, to every `srun`-launched rank, 120 to 180 seconds
   before the time limit. The batch shell is not signaled. `singlenode.sh`
   has no job step, so it keeps `--signal=B:SIGTERM@120` (batch shell only)
-  and forwards the signal to `torchrun` from a `trap`; see
+  and forwards one `SIGTERM` to `uv run torchrun` from a `trap`; see
   [Resilience § SLURM preemption](../resilience/slurm-preemption.md#slurm-side).
 - The training loop's
   [`ShutdownHandler`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/resilience/signal_handler.py)
@@ -147,8 +149,9 @@ the short version:
   `checkpoint.dir` and resumes at the exact step / sample.
 
 The 120-second window is a design parameter: the step in flight and the
-emergency checkpoint must finish within it, or SLURM kills the ranks at
-the time limit (`SIGTERM`, then `SIGKILL` after `KillWait`). Async DCP
+emergency checkpoint must finish within it. At the time limit the ranks
+get `SIGTERM` again and may be killed at once rather than after
+`KillWait`, so plan for the save to finish before the limit. Async DCP
 save times depend on model size, FSDP degree, and filesystem, so measure
 them on your cluster with `checkpoint.async_mode = "async"` and a test run
 before trusting the default for 70B+. If your save consistently overruns,
