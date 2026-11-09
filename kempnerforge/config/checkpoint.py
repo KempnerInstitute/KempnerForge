@@ -58,6 +58,22 @@ def _power2_strategy(window: DynamicCheckpointWindow, step: int) -> bool:
     return offset == 0 or (offset & (offset - 1)) == 0
 
 
+WEIGHTS_ONLY_EXCLUDE = frozenset({"optimizer", "train_state"})
+
+
+def validate_exclude_keys(keys: list[str], name: str) -> None:
+    """Check an exclude list: DCP keys only, and ``"train_state"`` only in the weights-only pair."""
+    if any(k not in ("model", "optimizer", "train_state") for k in keys):
+        raise ValueError(
+            f"{name} accepts only 'model', 'optimizer' and/or 'train_state' (got {keys!r})"
+        )
+    if "train_state" in keys and set(keys) != WEIGHTS_ONLY_EXCLUDE:
+        raise ValueError(
+            f"{name} with 'train_state' must be ['optimizer', 'train_state']: a weights-only "
+            f"warm start loads the model alone (got {keys!r})"
+        )
+
+
 @dataclass
 class CheckpointConfig:
     """Checkpointing settings."""
@@ -75,22 +91,11 @@ class CheckpointConfig:
     def __post_init__(self) -> None:
         if self.interval <= 0:
             raise ValueError("interval must be positive")
-        if not isinstance(self.exclude_from_loading, list) or any(
-            k not in ("model", "optimizer", "train_state") for k in self.exclude_from_loading
-        ):
+        if not isinstance(self.exclude_from_loading, list):
             raise ValueError(
-                "exclude_from_loading accepts only 'model', 'optimizer' and/or 'train_state' "
-                f"(got {self.exclude_from_loading!r})"
+                f"exclude_from_loading must be a list (got {self.exclude_from_loading!r})"
             )
-        if "train_state" in self.exclude_from_loading and set(self.exclude_from_loading) != {
-            "optimizer",
-            "train_state",
-        }:
-            raise ValueError(
-                "exclude_from_loading with 'train_state' must be ['optimizer', 'train_state']: "
-                "a weights-only warm start loads the model alone "
-                f"(got {self.exclude_from_loading!r})"
-            )
+        validate_exclude_keys(self.exclude_from_loading, "exclude_from_loading")
 
     def should_save(self, step: int) -> bool:
         """Whether to write a checkpoint at ``step``.

@@ -2215,6 +2215,19 @@ class TestRestoreCheckpoint:
         assert mgr.load_kwargs["vlm_freeze_expected"] == freeze_meta_at_step(0, config.vlm)
         assert mgr.load_kwargs["exclude_keys"] == ["model"]
 
+    def test_weights_only_warm_start_skips_the_freeze_probe(self, monkeypatch):
+        import kempnerforge.training.entry as entry
+
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: None)
+        config = _vlm_config()
+        config.checkpoint.load_path = "/runs/stage1/step_50000"
+        config.checkpoint.exclude_from_loading = ["optimizer", "train_state"]
+        mgr = FakeResumeManager(step=0, tokens=0, saved_step=50000)
+        entry.restore_checkpoint(config, TinyTextModel(), None, mgr)
+        assert mgr.peeked == []
+        assert mgr.load_kwargs["vlm_freeze_expected"] is None
+        assert mgr.load_kwargs["exclude_keys"] == ["optimizer", "train_state"]
+
     def test_mot_warm_start_runs_only_when_no_checkpoint_supplied_the_model(
         self, monkeypatch, tmp_path
     ):

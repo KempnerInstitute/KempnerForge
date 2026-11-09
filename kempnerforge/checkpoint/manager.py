@@ -36,6 +36,7 @@ from torch.distributed.checkpoint.state_dict import (
 
 from kempnerforge.checkpoint.async_save import AsyncCheckpointer
 from kempnerforge.checkpoint.state import build_train_state, restore_train_state
+from kempnerforge.config.checkpoint import validate_exclude_keys
 from kempnerforge.config.optimizer import WEIGHT_DECAY_SCOPES
 from kempnerforge.config.schema import AsyncCheckpointMode, CheckpointConfig
 
@@ -869,6 +870,8 @@ class CheckpointManager:
             Tuple of (step, tokens_seen, extra) where extra contains any
             additional keys saved via ``build_train_state(extra=...)``.
         """
+        if exclude_keys is not None:
+            validate_exclude_keys(exclude_keys, "exclude_keys")
         ckpt_dir = self._resolve_load_path(path)
         if ckpt_dir is None:
             requested = path if path is not None else self.config.load_path
@@ -885,11 +888,6 @@ class CheckpointManager:
 
         logger.info(f"Loading checkpoint: {ckpt_dir}")
         load_train_state = exclude_keys is None or "train_state" not in exclude_keys
-        if not load_train_state and set(exclude_keys or ()) != {"optimizer", "train_state"}:
-            raise ValueError(
-                "exclude_keys with 'train_state' must be ['optimizer', 'train_state']: a "
-                f"weights-only warm start loads the model alone (got {exclude_keys!r})"
-            )
 
         if vlm_freeze_expected is not None and load_train_state:
             metadata_path = ckpt_dir / _METADATA_FILE
@@ -986,20 +984,13 @@ class CheckpointManager:
                 _reset_to_fresh(optimizer)
 
         train_state_path = ckpt_dir / _TRAIN_STATE_FILE
-        if dist.is_initialized():
-            exists_flag = [train_state_path.exists() if self._rank == 0 else False]
-            dist.broadcast_object_list(exists_flag, src=0)
-            train_state_exists = bool(exists_flag[0])
-        else:
-            train_state_exists = train_state_path.exists()
-
-        if train_state_exists and not load_train_state:
+        if not load_train_state:
             logger.info(
                 f"Weights-only warm start from {ckpt_dir}: its step, schedule, data position "
                 "and RNG are not restored, and its freeze metadata is not compared"
             )
             step, tokens_seen, extra = 0, 0, {}
-        elif train_state_exists:
+        elif self._train_state_exists(train_state_path):
             train_state = (
                 _load_train_state(train_state_path)
                 if self._rank == 0 or not dist.is_initialized()
@@ -1111,13 +1102,21 @@ class CheckpointManager:
                 f"{ckpt_dir} was saved with optimizer.weight_decay_scope={saved!r}, but this "
                 f"run uses {self._weight_decay_scope!r}. The scope decides the optimizer's "
                 f"param groups, so the saved optimizer state cannot be loaded into this run's "
-                f"groups. Resume with weight_decay_scope={saved!r}, or start a new run from "
-                f"the checkpoint without its optimizer state: checkpoint.load_path="
-                f'{str(ckpt_dir)!r} with checkpoint.exclude_from_loading=["optimizer", '
-                f'"train_state"] and '
-                f"a checkpoint.dir that holds no checkpoint, since training auto-resumes from "
-                f"a checkpoint there in place of load_path, optimizer state included."
+                f"groups. Resume with weight_decay_scope={saved!r}, or continue from the "
+                f"checkpoint with a fresh optimizer: checkpoint.load_path={str(ckpt_dir)!r} "
+                f'with checkpoint.exclude_from_loading=["optimizer"] (add "train_state" to '
+                f"also restart the step, schedule and data position) and a checkpoint.dir "
+                f"that holds no checkpoint, since training auto-resumes from a checkpoint "
+                f"there in place of load_path, optimizer state included."
             )
+
+    def _train_state_exists(self, train_state_path: Path) -> bool:
+        """Whether rank 0 sees ``train_state.pt``, agreed on every rank."""
+        if not dist.is_initialized():
+            return train_state_path.exists()
+        exists_flag = [train_state_path.exists() if self._rank == 0 else False]
+        dist.broadcast_object_list(exists_flag, src=0)
+        return bool(exists_flag[0])
 
     def apply_dataloader_state(self, dataloader: Any) -> None:
         """Apply any dataloader state stashed during load().

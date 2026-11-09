@@ -118,7 +118,11 @@ restarted warmup would apply the saved moments and step counters, and a
 changed freeze would fail inside the optimizer load instead of at the
 freeze check; with the model excluded too, nothing would load. A MoT run
 with `mot_warm_start_from_text` keeps the loaded weights: the text warm
-start runs only when no checkpoint supplied the model.
+start runs only when no checkpoint supplied the model, that is on a run
+with nothing to resume from or a warm start that excludes `"model"`, and
+never on a resume. A weights-only warm start also skips the
+`metadata.json` probe for the freeze check, since the new run's own
+freeze applies.
 
 ## Symlink updates
 

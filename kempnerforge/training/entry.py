@@ -234,15 +234,16 @@ def restore_checkpoint(
         _mot_text_warm_start(vlm_cfg, model)
         return 0, 0
 
+    warm_start_exclude = (
+        (config.checkpoint.exclude_from_loading or None) if resume_path is None else None
+    )
+    weights_only = warm_start_exclude is not None and "train_state" in warm_start_exclude
     vlm_freeze_expected = None
-    if config.is_vlm:
+    if config.is_vlm and not weights_only:
         assert vlm_cfg is not None
         probe_step = ckpt_mgr.peek_saved_step(str(resume_path) if resume_path else None) or 0
         vlm_freeze_expected = freeze_meta_at_step(probe_step, vlm_cfg)
 
-    warm_start_exclude = (
-        (config.checkpoint.exclude_from_loading or None) if resume_path is None else None
-    )
     step, tokens_seen, ckpt_extra_loaded = ckpt_mgr.load(
         path=str(resume_path) if resume_path else None,
         scheduler=scheduler,
