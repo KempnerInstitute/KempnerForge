@@ -509,12 +509,14 @@ def _shutdown_if_requested(
 ) -> bool:
     """Write the emergency checkpoint when a shutdown is pending on any rank.
 
-    Every rank must call this at the same step. The ranks first agree over
-    ``session.control_group`` whether any of them was signaled, so they all
-    stop or all go on, whichever ranks the signal reached and whenever. The
-    handler is left armed: its forced-exit timer still bounds the flush that
-    ``run_training_loop`` ends with and the caller's teardown, and the caller
-    calls ``finish()`` after both.
+    Every rank must call this at the same step. It first reinstalls the
+    signal handlers, which native code can replace below Python (Triton's
+    LLVM does on its first in-process compile, after which SIGUSR1 does
+    nothing). The ranks then agree over ``session.control_group`` whether any
+    of them was signaled, so they all stop or all go on, whichever ranks the
+    signal reached and whenever. The handler is left armed: its forced-exit
+    timer still bounds the flush that ``run_training_loop`` ends with and the
+    caller's teardown, and the caller calls ``finish()`` after both.
 
     Returns True when the loop must stop. With ``saved_this_step``, the
     scheduled save of ``step`` is the emergency checkpoint, so it is drained
@@ -525,6 +527,7 @@ def _shutdown_if_requested(
     become ``latest`` and count toward ``keep_last_n``, which can prune the
     last good one.
     """
+    session.shutdown_handler.reinstall()
     requested_here = session.shutdown_handler.should_shutdown()
     if not any_rank(requested_here, session.control_group):
         return False

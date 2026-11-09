@@ -99,11 +99,15 @@ class FakeShutdownHandler:
     def __init__(self, after_steps: int | None = None) -> None:
         self.after_steps = after_steps
         self.checks = 0
+        self.reinstalls = 0
         self.registered = False
         self.finished = False
 
     def register(self) -> None:
         self.registered = True
+
+    def reinstall(self) -> None:
+        self.reinstalls += 1
 
     def should_shutdown(self) -> bool:
         self.checks += 1
@@ -816,6 +820,14 @@ class TestRunTrainingLoop:
         assert saved == [2]
         assert (tmp_path / "latest").resolve() == (tmp_path / "step_2").resolve()
         assert (tmp_path / "step_2" / ".metadata").is_file()
+
+    def test_the_signal_handlers_are_reinstalled_at_every_step(self):
+        """A compile can replace them below Python (#448); a skipped step reinstalls too."""
+        config = make_config(max_steps=4)
+        handler = FakeShutdownHandler()
+        session = make_session(config, shutdown_handler=handler, step_fn=_nan_on({1}))
+        run_training_loop(session)
+        assert handler.reinstalls == 4
 
     def test_hooks_fire_for_every_step_and_save(self):
         config = make_config(max_steps=4)

@@ -166,6 +166,36 @@ class TestShutdownHandler:
         finally:
             handler.finish()
 
+    def test_reinstall_restores_a_handler_replaced_below_python(self):
+        """Native code can swap the C handler while ``signal.getsignal`` names ours (#448)."""
+        import ctypes
+
+        libc = ctypes.CDLL(None)
+        libc.signal.restype = ctypes.c_void_p
+        libc.signal.argtypes = [ctypes.c_int, ctypes.c_void_p]
+        handler = ShutdownHandler(timeout_sec=0)
+        handler.register()
+        try:
+            libc.signal(signal.SIGUSR1, 1)
+            assert signal.getsignal(signal.SIGUSR1) == handler._handle_signal
+            os.kill(os.getpid(), signal.SIGUSR1)
+            assert not handler.should_shutdown()
+            handler.reinstall()
+            os.kill(os.getpid(), signal.SIGUSR1)
+            assert handler.should_shutdown()
+        finally:
+            handler.unregister()
+
+    def test_reinstall_is_a_noop_unless_registered(self):
+        before = signal.getsignal(signal.SIGUSR1)
+        handler = ShutdownHandler(timeout_sec=0)
+        handler.reinstall()
+        assert signal.getsignal(signal.SIGUSR1) is before
+        handler.register()
+        handler.finish()
+        handler.reinstall()
+        assert signal.getsignal(signal.SIGUSR1) is before
+
 
 class TestNaNDetector:
     def test_finite_loss_returns_true(self):

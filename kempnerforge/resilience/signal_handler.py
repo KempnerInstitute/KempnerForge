@@ -64,6 +64,7 @@ class ShutdownHandler:
 
         for step in range(max_steps):
             train_step()
+            handler.reinstall()
             if handler.should_shutdown():
                 save_checkpoint()
                 break
@@ -108,6 +109,17 @@ class ShutdownHandler:
             self._original_handlers[sig] = signal.getsignal(sig)
             signal.signal(sig, self._handle_signal)
         logger.info("Shutdown handler registered (SIGTERM, SIGUSR1)")
+
+    def reinstall(self) -> None:
+        """Install the handlers again; a no-op unless registered.
+
+        Native code can replace a handler below Python, where
+        ``signal.getsignal`` cannot see it: the LLVM inside Triton does on its
+        first in-process compile, after which SIGUSR1 does nothing. Must be
+        called from the main thread.
+        """
+        for sig in self._original_handlers:
+            signal.signal(sig, self._handle_signal)
 
     def unregister(self) -> None:
         """Restore the original signal handlers; the forced-exit timer stays armed."""
