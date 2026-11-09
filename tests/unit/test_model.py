@@ -195,8 +195,10 @@ class TestAttention:
         assert attn._sdpa_backends(appended=True) == attn._sdpa_backends()
         assert len(attn._sdpa_backends()) == 1
 
-    def test_a_visibility_mask_is_refused_with_a_non_empty_cache(self):
+    @pytest.mark.parametrize("capture", [False, True])
+    def test_a_visibility_mask_is_refused_with_a_non_empty_cache(self, capture):
         attn = Attention(dim=64, n_heads=4, n_kv_heads=2)
+        attn.capture_attention_weights = capture
         cos, sin = precompute_rope_frequencies(16, 16)
         cache = KVCache(
             batch_size=1,

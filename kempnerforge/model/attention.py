@@ -117,9 +117,9 @@ class Attention(nn.Module):
         non-empty cache through a lower-right mask; it keeps the pinned kernel
         first and also enables the efficient and math kernels, in that priority
         order, which the dispatcher falls back to for that call instead of
-        raising. A packed
-        training batch keeps the pinned kernel alone and fails loudly as
-        before, so a job never runs on a slower kernel unannounced.
+        raising. A packed training batch keeps the pinned kernel alone and
+        fails loudly as before, so a job never runs on a slower kernel
+        unannounced.
         """
         backends = [_SDPA_BACKENDS[self.sdpa_backend]]
         if appended and self.sdpa_backend in _MASK_FALLBACK_BACKENDS:
@@ -216,6 +216,13 @@ class Attention(nn.Module):
             k = k.repeat_interleave(self.n_rep, dim=1)
             v = v.repeat_interleave(self.n_rep, dim=1)
 
+        if attn_mask is not None and past > 0 and attn_mask.shape[-1] != k.shape[2]:
+            raise ValueError(
+                f"attn_mask spans {attn_mask.shape[-1]} keys but the cache holds "
+                f"{k.shape[2]}; a visibility mask is square over the residual and does "
+                "not compose with a non-empty kv_cache"
+            )
+
         if isinstance(attn_mask, BlockMask):
             assert kv_cache is None, (
                 "a BlockMask does not compose with kv_cache decode; a decode step "
@@ -230,15 +237,9 @@ class Attention(nn.Module):
                 enable_gqa=self.n_rep > 1,
             )
         elif self.capture_attention_weights:
-            out, attn_weights = self._attention_with_weights(q, k, v, seq_len, attn_mask)
+            out, attn_weights = self._attention_with_weights(q, k, v, past, attn_mask)
             self.last_attention_weights = attn_weights.detach().cpu()
         elif attn_mask is not None:
-            if past > 0 and attn_mask.shape[-1] != k.shape[2]:
-                raise ValueError(
-                    f"attn_mask spans {attn_mask.shape[-1]} keys but the cache holds "
-                    f"{k.shape[2]}; a visibility mask is square over the residual and does "
-                    "not compose with a non-empty kv_cache"
-                )
             with self._sdpa_context(appended=past > 0):
                 out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         else:
@@ -262,7 +263,7 @@ class Attention(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        seq_len: int,
+        past: int,
         attn_mask: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute attention output and weights manually (for analysis).
@@ -275,7 +276,7 @@ class Attention(nn.Module):
             q: Queries, shape (batch, n_heads, seq_len, head_dim).
             k: Keys, shape (batch, n_heads, seq_k, head_dim).
             v: Values, shape (batch, n_heads, seq_k, head_dim).
-            seq_len: Query length.
+            past: Number of cached keys the queries are appended after.
             attn_mask: Dense bool mask where ``True`` = attend, or ``None`` for
                 causal attention over the keys, cached ones included.
 
@@ -289,8 +290,8 @@ class Attention(nn.Module):
 
         if attn_mask is not None:
             attn = attn.masked_fill(~attn_mask, float("-inf"))
-        elif seq_len > 1:
-            visible = appended_causal_mask(seq_len, k.shape[2] - seq_len, q.device)
+        elif q.shape[2] > 1:
+            visible = appended_causal_mask(q.shape[2], past, q.device)
             attn = attn.masked_fill(~visible, float("-inf"))
 
         attn_weights = F.softmax(attn, dim=-1)

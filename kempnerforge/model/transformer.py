@@ -514,8 +514,8 @@ class Transformer(nn.Module):
                 raise ValueError(
                     "RoPE tables not initialized; call init_weights_and_freqs() after to_empty()"
                 )
-            n_positions = self._rope_cos.shape[0]
-            if bool((position_ids < 0).any()) or bool((position_ids >= n_positions).any()):
+            n_positions = self.config.max_seq_len
+            if bool(((position_ids < 0) | (position_ids >= n_positions)).any()):
                 raise ValueError(
                     f"position_ids must be in [0, {n_positions}) (the precomputed RoPE "
                     f"table range, model.max_seq_len); got min {int(position_ids.min())}, "
