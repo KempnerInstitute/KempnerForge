@@ -20,7 +20,7 @@ import torch.distributed as dist
 
 from kempnerforge.checkpoint.manager import CheckpointManager
 from kempnerforge.config.job import JobConfig
-from kempnerforge.distributed.utils import clip_grad_norm_
+from kempnerforge.distributed.utils import any_rank, clip_grad_norm_, new_control_group
 from kempnerforge.metrics.logger import get_logger
 from kempnerforge.metrics.tracker import MetricsTracker
 from kempnerforge.model.vlm import inner_transformer
@@ -176,6 +176,7 @@ class TrainingSession:
     eval_dataloader: Any | None = None
     profiler: Any | None = None
     autocast_dtype: torch.dtype | None = None
+    control_group: Any | None = field(default=None, repr=False)
     _batch_stream: BatchStream | None = field(default=None, init=False, repr=False)
 
     @property
@@ -506,7 +507,11 @@ def _shutdown_if_requested(
     saved_this_step: bool,
     nan_skipped: bool = False,
 ) -> bool:
-    """Write the emergency checkpoint and finish when a shutdown is pending.
+    """Write the emergency checkpoint and finish when a shutdown is pending on any rank.
+
+    Every rank must call this at the same step. The ranks first agree over
+    ``session.control_group`` whether any of them was signaled, so they all
+    stop or all go on, whichever ranks the signal reached and whenever.
 
     Returns True when the loop must stop. With ``saved_this_step``, the
     scheduled save of ``step`` is the emergency checkpoint, so it is drained
@@ -517,8 +522,11 @@ def _shutdown_if_requested(
     become ``latest`` and count toward ``keep_last_n``, which can prune the
     last good one.
     """
-    if not session.shutdown_handler.should_shutdown():
+    requested_here = session.shutdown_handler.should_shutdown()
+    if not any_rank(requested_here, session.control_group):
         return False
+    if not requested_here:
+        logger.warning(f"Shutdown requested on another rank at step {step}")
     ckpt_mgr = session.checkpointer
     if saved_this_step:
         logger.warning(
@@ -554,6 +562,9 @@ def run_training_loop(
     checkpoint before returning so the caller can tear down the process
     group safely. ``session.data`` is read once and must stay fixed for the
     duration; only its ``dataloader`` may be swapped mid-run.
+
+    Every rank must call it: the shutdown and NCCL-health stops are agreed
+    over ``session.control_group``, which the loop makes when it is ``None``.
     """
     config = session.config
     tc = config.train
@@ -576,6 +587,9 @@ def run_training_loop(
     )
     if phases.phases:
         logger.info(f"Phase scheduling: {len(phases.phases)} phase(s) configured")
+
+    if session.control_group is None:
+        session.control_group = new_control_group(config.distributed.nccl_timeout_sec)
 
     model.train()
     hooks.on_train_begin(config)
@@ -655,7 +669,7 @@ def run_training_loop(
             if (
                 tc.nccl_health_check_interval > 0
                 and step % tc.nccl_health_check_interval == 0
-                and not check_nccl_health()
+                and any_rank(not check_nccl_health(), session.control_group)
             ):
                 logger.error(f"NCCL health check failed at step {step} — stopping")
                 break

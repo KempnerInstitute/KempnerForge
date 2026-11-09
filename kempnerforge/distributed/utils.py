@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
+from datetime import timedelta
+from typing import cast
 
 import torch
 import torch.distributed as dist
@@ -136,3 +138,45 @@ def _scale_(grads: list[torch.Tensor], max_norm: float, total_norm: torch.Tensor
     for g in grads:
         g.mul_(clip_coef_clamped)
     return total_norm
+
+
+def new_control_group(timeout_sec: float) -> dist.ProcessGroup | None:
+    """A gloo group over every rank, for the decisions every rank must take together.
+
+    ``dcp.async_save`` issues gloo collectives on the default group from a
+    background thread, so a main-thread CPU collective on that group can run
+    in a different order on different ranks. A group of its own avoids that,
+    and still reduces when NCCL is wedged. Every rank must call this.
+
+    Args:
+        timeout_sec: Timeout of the group's collectives.
+
+    Returns:
+        The group, or ``None`` when ``torch.distributed`` is not initialized.
+    """
+    if not dist.is_initialized():
+        return None
+    return cast(
+        "dist.ProcessGroup",
+        dist.new_group(backend="gloo", timeout=timedelta(seconds=timeout_sec)),
+    )
+
+
+def any_rank(flag: bool, group: dist.ProcessGroup | None) -> bool:
+    """Whether ``flag`` is True on any rank of ``group``.
+
+    One MAX all-reduce of a CPU tensor, so ``group`` needs a CPU backend, and
+    every rank of it must call.
+
+    Args:
+        flag: This rank's flag.
+        group: The group to reduce over, or ``None`` for this rank alone.
+
+    Returns:
+        ``flag`` reduced over ``group``, or ``flag`` itself when ``group`` is ``None``.
+    """
+    if group is None:
+        return flag
+    t = torch.tensor([int(flag)], dtype=torch.int32)
+    dist.all_reduce(t, op=dist.ReduceOp.MAX, group=group)
+    return bool(t.item())
