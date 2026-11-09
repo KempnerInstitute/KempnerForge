@@ -511,8 +511,9 @@ uv run pytest tests/unit/test_model.py::TestRMSNorm::test_output_shape -v
 # Debug training run
 uv run python scripts/train.py configs/train/debug.toml
 
-# Multi-GPU training
-uv run torchrun --nproc_per_node=4 scripts/train.py configs/train/7b.toml
+# Multi-GPU training (its own checkpoint dir, so it does not resume the debug run)
+uv run torchrun --nproc_per_node=4 scripts/train.py configs/train/debug.toml \
+    --checkpoint.dir=checkpoints/debug_4gpu
 ```
 
 ## Common Pitfalls

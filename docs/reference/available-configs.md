@@ -65,10 +65,13 @@ HuggingFace.
   produces data-dependent shapes that break `torch.compile`'s graph —
   [`JobConfig.validate(world_size)`](../configuration/validation-rules.md)
   logs a warning (not an error) if you combine them.
-- **Paths in these configs** (`dataset_path = "/path/to/..."`) are
-  placeholders — replace them with a real tokenized shard directory
-  before running. The `hf_wikitext.toml` config is the only one that
-  runs end-to-end without path edits (it streams from the HF Hub).
+- **`dataset_path = "/path/to/tokenized/dataset"`**, in 13 of the 17
+  training configs, is a placeholder: point it at a real tokenized
+  shard directory, in the config or with `--data.dataset_path=…`,
+  before running. The other four run without path edits: `debug.toml`,
+  `debug_moe.toml` and `moe_24gpu.toml` set no data source and train
+  on synthetic tokens, and `hf_wikitext.toml` streams Wikitext-103 from
+  the HF Hub.
 - **Short `max_steps`** (20–100) in the multi-node configs is a
   benchmark-sizing default, not a training budget. Override with
   `--train.max_steps=…` for real runs.

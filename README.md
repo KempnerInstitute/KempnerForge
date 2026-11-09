@@ -16,7 +16,7 @@ PyTorch-native framework for fault-tolerant distributed training of foundation m
 
 ## AI / NeuroAI use cases
 
-- **Scaling law experiments**: train the same architecture from 125M to 70B by swapping a TOML config. FSDP, tensor, expert, and pipeline parallelism are automatic.
+- **Scaling law experiments**: train the same architecture at different sizes by changing `dim`, `n_layers` and the head counts in a TOML config; the training presets in `configs/train/` range from a 20M-parameter debug model to 70B. FSDP, tensor, expert, and pipeline parallelism are set in the same config.
 - **Mechanistic interpretability**: activation extraction hooks at any layer with CPU offload; attention weight capture exposes raw QK^T matrices.
 - **Sparse architecture research**: switch between dense and MoE by setting `num_experts` (0 for dense, >0 for MoE). Softmax top-k or DeepSeek-V3 sigmoid routing, shared experts, fine-grained experts, configurable MoE frequency.
 - **Optimizer and scheduler comparison**: 4 optimizers (AdamW, Muon, Lion, Schedule-Free AdamW) × 6 LR schedulers, composable via config. Data annealing phases for curriculum learning.
@@ -117,11 +117,15 @@ uv sync
 uv run python scripts/train.py configs/train/debug.toml
 
 # Multi-GPU (4 GPUs, FSDP)
-uv run torchrun --nproc_per_node=4 scripts/train.py configs/train/7b.toml
+uv run torchrun --nproc_per_node=4 scripts/train.py configs/train/debug.toml \
+    --checkpoint.dir=checkpoints/debug_4gpu
 
-# SLURM (single node)
-sbatch scripts/slurm/singlenode.sh configs/train/7b.toml
+# SLURM (single node, 4 GPUs): use your cluster's partition and account
+sbatch --partition=<partition> --account=<account> scripts/slurm/singlenode.sh \
+    configs/train/debug.toml --checkpoint.dir=checkpoints/debug_slurm
 ```
+
+`debug.toml` trains a 20M-parameter model on synthetic tokens, so these commands need no dataset, but they do need CUDA GPUs: one for the debug run, four for the other two. A run resumes from the latest checkpoint in its `checkpoint.dir`, so each command writes to its own. Most other configs in `configs/train/` set `dataset_path = "/path/to/tokenized/dataset"`, a placeholder: pass `--data.dataset_path=<your shards>` or edit the config before running them (see [available configs](docs/reference/available-configs.md)). The sbatch scripts in `scripts/slurm/` carry placeholder `--partition` and `--account` values in their `#SBATCH` headers; the `sbatch` flags above override them, or you can edit the headers.
 
 Further reading:
 - [`docs/getting-started/quickstart.md`](docs/getting-started/quickstart.md): 5-minute walkthrough (install → debug → multi-GPU → custom data → optimizer swap → MoE → hooks)
@@ -218,7 +222,7 @@ Core MoE, Expert Parallelism, DeepSeekMoE, grouped GEMM, FSDP2 compatibility, an
 | Multi-token prediction (MTP) | Planned | 10-15% sample efficiency |
 | Large-scale EP (hierarchical all-to-all, 256+ experts) | Planned | 1000+ GPU scale |
 
-> Dense pipeline parallelism works. MoE + PP is rejected at config validation time because MoE data-dependent routing is incompatible with static pipeline stage splitting. Use FSDP, TP, or EP for MoE models.
+> Pipeline parallelism runs dense models with the 1F1B or GPipe schedule; 4-GPU end-to-end tests train and resume PP=4, PP=2 with FSDP=2, and PP=2 with TP=2; tied embeddings, VLMs and MoE are rejected with PP at config validation time. MoE data-dependent routing is incompatible with static pipeline stage splitting, so use FSDP, TP, or EP for MoE models.
 
 ## Project structure
 
