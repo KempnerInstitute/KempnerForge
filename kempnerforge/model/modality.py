@@ -31,7 +31,9 @@ needs:
   transformer applies in place of its own table. The strategy builds
   them from ``precompute_rope_frequencies`` with the model's ``head_dim``
   and ``rope_theta``, so the same code positions every forward, training
-  and inference alike.
+  and inference alike. ``forward`` moves the rotation tensors to the
+  residual's device for each call; build them on that device to avoid
+  repeated host-to-device transfers.
 
 Cross-arg invariants involving ``kv_caches`` (a ``Transformer.forward``
 argument, not a ``ModalityContext`` field) are enforced at the top of
