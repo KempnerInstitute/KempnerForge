@@ -211,8 +211,8 @@ ckpt_mgr.save(step=step, tokens_seen=tokens_seen, scheduler=scheduler,
 ```
 
 On load, `restore_train_state` strips out the "standard" keys
-(`step`, `tokens_seen`, `rng`, `scheduler`, `dataloader`) and returns
-the rest as the third tuple element:
+(`step`, `tokens_seen`, `rng`, `scheduler`, `dataloader`, `per_rank`)
+and returns the rest as the third tuple element:
 
 ```python
 step, tokens_seen, extra = ckpt_mgr.load(path=..., scheduler=scheduler)

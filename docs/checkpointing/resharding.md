@@ -128,8 +128,8 @@ ignore_rank_state_mismatch = true
 
 or pass `--checkpoint.ignore_rank_state_mismatch=true` on the command
 line. Every rank then discards the saved per-rank dataloader and RNG
-state, logs a warning saying so, and resumes from the rest of the
-checkpoint:
+state (rank 0 logs a warning saying so) and resumes from the rest of
+the checkpoint:
 
 | State | With the flag set |
 |-------|-------------------|
