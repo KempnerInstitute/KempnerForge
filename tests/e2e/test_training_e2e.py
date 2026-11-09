@@ -694,7 +694,9 @@ def _signal_and_wait(
 ) -> str:
     """Start ``cmd``, send ``sig`` to ``pid_of(proc)`` after step 5, and return the log.
 
-    The run leads its own session, so whatever is left of it is killed at the end.
+    At the end the launcher and every process below it are killed: ``torchrun``
+    starts each rank in a session of its own, so killing the launcher's
+    process group would leave the ranks of a hung run on their GPUs.
     """
     with log.open("w") as out:
         proc = subprocess.Popen(
@@ -712,8 +714,9 @@ def _signal_and_wait(
         with contextlib.suppress(subprocess.TimeoutExpired):
             returncode = proc.wait(timeout=120)
     finally:
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(proc.pid, signal.SIGKILL)
+        for pid in [*_descendants(proc.pid), proc.pid]:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
         proc.wait()
     output = log.read_text()
     excerpt = traceback_or_tail(output, 2000)
@@ -757,12 +760,19 @@ def test_sigusr1_to_one_rank_stops_every_rank(tmp_path):
 @pytest.mark.e2e
 @requires_gpus(1)
 def test_sigusr1_after_a_compile_writes_the_emergency_checkpoint(tmp_path):
-    """The first in-process Triton compile replaces the handlers below Python (#448)."""
+    """An in-process Triton compile replaces the handlers below Python (#448).
+
+    Empty Triton and Inductor caches and one compile thread make the run compile
+    its kernels in its own process, where LLVM installs its handlers.
+    """
     ckpt_dir = tmp_path / "ckpt"
     env = os.environ.copy()
     env.setdefault("WORLD_SIZE", "1")
     env.setdefault("RANK", "0")
     env.setdefault("LOCAL_RANK", "0")
+    env["TRITON_CACHE_DIR"] = str(tmp_path / "triton-cache")
+    env["TORCHINDUCTOR_CACHE_DIR"] = str(tmp_path / "inductor-cache")
+    env["TORCHINDUCTOR_COMPILE_THREADS"] = "1"
     cmd = [
         sys.executable,
         TRAIN_SCRIPT,
