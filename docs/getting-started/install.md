@@ -38,8 +38,8 @@ The `.venv` is project-local. Every command in the docs runs through
 Run the same checks CI runs on every PR:
 
 ```bash
-uv run ruff check kempnerforge/ tests/ scripts/
-uv run ruff format --check kempnerforge/ tests/ scripts/
+uv run ruff check .
+uv run ruff format --check .
 uv run pyright kempnerforge/
 uv run pytest tests/unit/ -v --timeout=60
 ```

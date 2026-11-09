@@ -51,11 +51,11 @@ On non-CUDA hosts, append `--no-sources` to every `uv` command below.
 
 3. Lint:
 
-       uv run ruff check kempnerforge/ tests/ scripts/
+       uv run ruff check .
 
 4. Format check:
 
-       uv run ruff format --check kempnerforge/ tests/ scripts/
+       uv run ruff format --check .
 
 5. Type check:
 

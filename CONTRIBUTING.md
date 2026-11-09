@@ -30,8 +30,8 @@ Run all three checks that CI will run on your PR:
 
 ```bash
 # Lint + format + type check
-uv run ruff check kempnerforge/ tests/ scripts/
-uv run ruff format --check kempnerforge/ tests/ scripts/
+uv run ruff check .
+uv run ruff format --check .
 uv run pyright kempnerforge/
 
 # Unit tests (no GPU needed)
@@ -115,10 +115,10 @@ Write your code. Write tests. Then run the pre-push checklist:
 
 ```bash
 # 1. Format (auto-fix)
-uv run ruff format kempnerforge/ tests/ scripts/
+uv run ruff format .
 
 # 2. Lint (auto-fix what it can)
-uv run ruff check --fix kempnerforge/ tests/ scripts/
+uv run ruff check --fix .
 
 # 3. Type check
 uv run pyright kempnerforge/
@@ -185,10 +185,10 @@ Include `Closes #N` to auto-close the issue on merge.
 
 ```bash
 # Auto-fix lint issues
-uv run ruff check --fix kempnerforge/ tests/ scripts/
+uv run ruff check --fix .
 
 # Auto-format
-uv run ruff format kempnerforge/ tests/ scripts/
+uv run ruff format .
 
 # Type check (must be zero errors)
 uv run pyright kempnerforge/
@@ -205,7 +205,7 @@ CI runs on every push to `main` and every PR. All jobs must pass before merge.
 | `gpu-tests` | `pytest tests/integration/` | Manual dispatch |
 | `<example>-tests` | `examples/<example>/tests` in one pytest session, manual-only tiers excluded | Pushes/PRs touching `examples/<example>/` |
 
-The most common CI failure is `ruff format --check`. Run `uv run ruff format --check kempnerforge/ tests/ scripts/` locally before pushing.
+The most common CI failure is `ruff format --check`. Run `uv run ruff format --check .` locally before pushing.
 
 ## Testing
 
@@ -497,8 +497,8 @@ Always use `uv` — never pip, conda, or venv. PyTorch is pinned to the CUDA 12.
 uv sync
 
 # Pre-push checklist (run all before every push)
-uv run ruff format kempnerforge/ tests/ scripts/
-uv run ruff check kempnerforge/ tests/ scripts/
+uv run ruff format .
+uv run ruff check .
 uv run pyright kempnerforge/
 uv run pytest tests/unit/ -v --timeout=60
 
