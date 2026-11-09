@@ -14,6 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
+from torch.nn.attention.bias import causal_lower_right
 from torch.nn.attention.flex_attention import BlockMask
 
 from kempnerforge.model.masking import flex_attention_fn
@@ -124,19 +125,25 @@ class Attention(nn.Module):
     ) -> torch.Tensor:
         """Forward pass.
 
-        Attention consumes a mask; it never derives one. Every visibility rule
-        (document isolation, bidirectional groups, key validity, and their
-        combination) is expressed by ``kempnerforge.model.masking``, which
-        builds this one object once per forward and shares it across layers.
+        Attention consumes the visibility mask; it never derives one. Every
+        visibility rule (document isolation, bidirectional groups, key
+        validity, and their combination) is expressed by
+        ``kempnerforge.model.masking``, which builds this one object once per
+        forward and shares it across layers. Without a mask, attention is
+        causal, aligned to the end of the key axis when tokens are appended to
+        a filled ``kv_cache``.
 
         Args:
             x: Input tensor of shape (batch, seq_len, dim).
             rope_cos: RoPE cosine frequencies, shape (seq_len, head_dim // 2).
             rope_sin: RoPE sine frequencies, shape (seq_len, head_dim // 2).
-            kv_cache: Optional KV cache for incremental generation. Mutually
-                exclusive with ``attn_mask``: a cache grows the key axis every
-                step, so the mask would have to be rebuilt each step rather
-                than shared, and a decode step needs no mask at all.
+            kv_cache: Optional KV cache for incremental generation. The tokens
+                of this forward are appended to it, and each attends to every
+                cached key and to the appended keys up to its own position.
+                Mutually exclusive with ``attn_mask``: a cache grows the key
+                axis every step, so the mask would have to be rebuilt each
+                step rather than shared, and a decode step needs no mask at
+                all.
             attn_mask: The mask from
                 ``kempnerforge.model.masking.build_attention_mask``: a
                 FlexAttention ``BlockMask``, a dense bool tensor broadcastable
@@ -204,6 +211,11 @@ class Attention(nn.Module):
             )
             with self._sdpa_context():
                 out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        elif seq_len > 1 and k.shape[2] > seq_len:
+            with self._sdpa_context():
+                out = F.scaled_dot_product_attention(
+                    q, k, v, attn_mask=causal_lower_right(seq_len, k.shape[2])
+                )
         else:
             is_causal = kv_cache is None or seq_len > 1
             with self._sdpa_context():
@@ -235,8 +247,9 @@ class Attention(nn.Module):
             seq_len: Query length.
             attn_mask: Dense bool mask where ``True`` = attend, or ``None`` for
                 plain causal attention.
-            kv_cache: The cache in use, which with ``seq_len == 1`` means a
-                decode step whose query attends to every cached position.
+            kv_cache: The cache in use. Every query attends to the keys cached
+                before this forward and to the new keys up to its own position,
+                so a ``seq_len == 1`` decode step attends to every cached key.
 
         Returns:
             Tuple of (output, attention_weights).
@@ -250,7 +263,7 @@ class Attention(nn.Module):
             attn = attn.masked_fill(~attn_mask, float("-inf"))
         elif kv_cache is None or seq_len > 1:
             causal = torch.ones(seq_len, k.shape[2], dtype=torch.bool, device=q.device).triu(
-                diagonal=1
+                diagonal=1 + k.shape[2] - seq_len
             )
             attn = attn.masked_fill(causal.unsqueeze(0).unsqueeze(0), float("-inf"))
 
