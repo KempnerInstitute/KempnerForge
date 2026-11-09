@@ -9,7 +9,6 @@ import random
 import re
 import shutil
 import stat
-import sys
 import threading
 from concurrent.futures import Future
 from pathlib import Path
@@ -866,11 +865,10 @@ class TestSaveTrackingSidecar:
             def items(self):
                 raise RuntimeError("no items")
 
-        def deeply_nested():
-            nested: list = []
-            for _ in range(sys.getrecursionlimit()):
-                nested = [nested]
-            return [{"backend": "custom", "deep": nested}]
+        def circular():
+            loop: list = []
+            loop.append(loop)
+            return [{"backend": "custom", "deep": loop}]
 
         def raises():
             raise RuntimeError("no run object")
@@ -883,10 +881,12 @@ class TestSaveTrackingSidecar:
             ),
             "truth-value": (lambda: BadBool([{"backend": "custom"}]), "no truth value"),
             "items": (lambda: [BadItems(backend="custom")], "no items"),
-            "nested": (deeply_nested, "recursion"),
+            "circular": (circular, "Circular reference"),
         }
 
-    @pytest.mark.parametrize("failure", ["raises", "unwritable", "truth-value", "items", "nested"])
+    @pytest.mark.parametrize(
+        "failure", ["raises", "unwritable", "truth-value", "items", "circular"]
+    )
     def test_failing_source_costs_the_key_not_the_save(self, tmp_path, monkeypatch, failure):
         from kempnerforge.checkpoint import manager as mgr_mod
 
