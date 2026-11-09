@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 from pathlib import Path
 
 import pytest
@@ -25,6 +26,7 @@ from kempnerforge.training.loop import BatchStream
 from kempnerforge.training.runtime import RuntimeContext
 
 SHARDS, DOCS_PER_SHARD = 4, 50
+ALL_SHARDS = tuple(range(SHARDS))
 
 
 @pytest.fixture(scope="module")
@@ -185,7 +187,6 @@ def test_checkpoint_restores_the_stream_position(corpus, tmp_path):
         {"shuffle_buffer_size": 5},
         {"pack_sequences": True},
         {"tokenizer_path": "another-tokenizer"},
-        {"dataset_config": "another-config"},
     ],
     ids=[
         "num_workers",
@@ -196,7 +197,6 @@ def test_checkpoint_restores_the_stream_position(corpus, tmp_path):
         "shuffle_buffer_size",
         "pack_sequences",
         "tokenizer",
-        "source",
     ],
 )
 def test_a_changed_stream_is_refused(corpus, change):
@@ -317,3 +317,96 @@ def test_a_checkpoint_without_a_stream_position_warns_that_the_stream_restarts(
         manager.apply_dataloader_state(stream)
     assert "holds no data position, so the stream restarts at its first document" in caplog.text
     assert torch.equal(next(iter(stream))["input_ids"], next(iter(_loader(config)))["input_ids"])
+
+
+def _copy(corpus, directory: Path, shards=ALL_SHARDS) -> tuple[Path, Path]:
+    """Copy some of the corpus shards into ``directory``; same tokenizer."""
+    data, tokenizer = corpus
+    directory.mkdir(parents=True)
+    for shard in shards:
+        shutil.copy(data / f"shard_{shard}.jsonl", directory)
+    return directory, tokenizer
+
+
+def test_an_added_data_file_is_refused(corpus, tmp_path):
+    """A new shard changes every rank's stream, so the saved count no longer applies."""
+    copied = _copy(corpus, tmp_path / "data")
+    loader = _stream_loader(copied)
+    next(iter(loader))
+    state = loader.state_dict()
+    shutil.copy(copied[0] / "shard_0.jsonl", copied[0] / "shard_9.jsonl")
+    with pytest.raises(DataPositionError, match="source data files differ"):
+        _stream_loader(copied).load_state_dict(state)
+
+
+def test_the_same_files_in_another_directory_are_accepted(corpus, tmp_path):
+    """Moving the data, say off scratch storage, keeps the stream and its position."""
+    first = _copy(corpus, tmp_path / "scratch")
+    loader = _stream_loader(first)
+    iterator = iter(loader)
+    for _ in range(5):
+        next(iterator)
+    state = loader.state_dict()
+    expected = next(iterator)["input_ids"]
+    moved = _copy(corpus, tmp_path / "lab" / "data")
+    resumed = _stream_loader(moved)
+    resumed.load_state_dict(state)
+    assert torch.equal(next(iter(resumed))["input_ids"], expected)
+
+
+def test_a_later_pass_on_several_ranks_warns(corpus, caplog, monkeypatch):
+    """Past the first pass, rank 0's count may not fit the other ranks; say so.
+
+    The ``kempnerforge`` logger stops propagation once configured, so the test lets
+    records reach ``caplog``.
+    """
+    monkeypatch.setattr(logging.getLogger("kempnerforge"), "propagate", True)
+    state = _stream_loader(corpus, world_size=2).state_dict()
+    with caplog.at_level(logging.WARNING, logger="kempnerforge.data.dataloader"):
+        _stream_loader(corpus, world_size=2).load_state_dict(state)
+        assert "holds one rank's position" not in caplog.text
+        _stream_loader(corpus, world_size=2).load_state_dict({**state, "epoch": 1})
+    assert "pass 1 on 2 data-parallel ranks" in caplog.text
+    assert "holds one rank's position" in caplog.text
+
+
+def test_restarting_a_pass_midway_with_workers_reads_the_same_epoch(corpus, tmp_path):
+    """A pass restarted after one worker finished its part still reads this epoch.
+
+    With 3 shards and 2 workers, worker 1 reads one shard and finishes early; its
+    persistent copy of the dataset then moves to the next epoch.
+    """
+    if not _worker_sockets_fit():
+        pytest.skip("the temp directory path is too long for DataLoader worker sockets")
+    uneven = _copy(corpus, tmp_path / "three", shards=(0, 1, 2))
+    reference = _stream_loader(uneven, num_workers=2)
+    restarted = _stream_loader(uneven, num_workers=2)
+    try:
+        expected = [batch["input_ids"] for batch in reference]
+        iterator = iter(restarted)
+        for _ in range(len(expected) - 2):
+            next(iterator)
+        got = next(iter(restarted))["input_ids"]
+    finally:
+        _close(reference)
+        _close(restarted)
+    assert torch.equal(got, expected[-2])
+
+
+def test_the_replay_logs_its_progress(corpus, caplog, monkeypatch):
+    """The replay reports how far it got, at what rate and how long is left.
+
+    The ``kempnerforge`` logger stops propagation once configured, so the test lets
+    records reach ``caplog``.
+    """
+    monkeypatch.setattr(logging.getLogger("kempnerforge"), "propagate", True)
+    loader = _stream_loader(corpus)
+    iterator = iter(loader)
+    for _ in range(10):
+        next(iterator)
+    resumed = _stream_loader(corpus)
+    resumed.load_state_dict(loader.state_dict())
+    with caplog.at_level(logging.INFO, logger="kempnerforge.data.dataloader"):
+        next(iter(resumed))
+    assert "Replaying 10 batches (160 tokens)" in caplog.text
+    assert "Replayed 10 of 10 batches" in caplog.text and "tokens/s" in caplog.text

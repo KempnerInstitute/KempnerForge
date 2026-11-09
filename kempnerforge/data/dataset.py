@@ -15,6 +15,7 @@ from __future__ import annotations
 import bisect
 import contextlib
 import logging
+import os
 from pathlib import Path
 
 import numpy as np
@@ -481,6 +482,7 @@ class StreamingHuggingFaceDataset(torch.utils.data.IterableDataset):
         self._epoch = 0
         self._rank_docs_consumed = 0
         self._skip_rank_docs = 0
+        self._source_identity: dict | None = None
 
         logger.info(
             f"StreamingHuggingFaceDataset: {dataset_name} ({split}), "
@@ -505,9 +507,11 @@ class StreamingHuggingFaceDataset(torch.utils.data.IterableDataset):
         A position counted in batches replays to the same samples only while
         these, the batch size and the loader's worker count stay the same. The
         rank is not included: every rank replays its own stream by the same count.
+        ``source`` describes the data rather than where it is stored: see
+        ``_source``.
         """
         return {
-            "source": [self.dataset_name, self.dataset_config, self.split, self.text_field],
+            "source": self._source(),
             "data_parallel_size": self.world_size,
             "seed": self.seed,
             "shuffle_buffer_size": self.shuffle_buffer_size,
@@ -515,6 +519,46 @@ class StreamingHuggingFaceDataset(torch.utils.data.IterableDataset):
             "tokenizer": self.tokenizer_path,
             "pack_sequences": self._packing_enabled,
         }
+
+    def _source(self) -> dict:
+        """What the stream reads, worked out once per process.
+
+        Local data is described by the data files ``datasets`` resolves for the
+        split, by name relative to the data directory and by size, so the same
+        files moved to another directory describe the same source, while an added,
+        removed, renamed or resized file does not. A Hub dataset is described by
+        its name and config as given, so a new revision of it with the same shard
+        count goes unnoticed. Both also record the split, the text field and the
+        shard count. File contents are not read: a file rewritten at the same size
+        goes unnoticed too.
+        """
+        if self._source_identity is None:
+            from datasets import IterableDataset, load_dataset, load_dataset_builder
+
+            stream = load_dataset(
+                self.dataset_name, self.dataset_config, split=self.split, streaming=True
+            )
+            source: dict = {
+                "config": self.dataset_config,
+                "split": self.split,
+                "text_field": self.text_field,
+                "n_shards": stream.n_shards if isinstance(stream, IterableDataset) else None,
+            }
+            root = Path(self.dataset_name)
+            if root.is_dir():
+                data_files = load_dataset_builder(
+                    self.dataset_name, self.dataset_config
+                ).config.data_files
+                files = data_files[self.split] if data_files else []
+                base = root.resolve()
+                source["files"] = sorted(
+                    (os.path.relpath(Path(f).resolve(), base), Path(f).stat().st_size)
+                    for f in files
+                )
+            else:
+                source["name"] = self.dataset_name
+            self._source_identity = source
+        return self._source_identity
 
     def _load_stream(self):
         """Load this rank's part of the shuffled HuggingFace stream.

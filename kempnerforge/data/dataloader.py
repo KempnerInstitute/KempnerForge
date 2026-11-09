@@ -11,7 +11,9 @@ Wraps PyTorch DataLoader with:
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Callable
+from typing import Any
 
 import torch
 from torch.utils.data import DataLoader, Dataset
@@ -32,6 +34,25 @@ class DataPositionError(ValueError):
     data-parallel size. The saved state and the loader settings are the same on
     every rank, so every rank raises it together.
     """
+
+
+def _stream_change(key: str, saved: Any, now: Any) -> str:
+    """One changed stream setting, with the data file list reduced to its count."""
+    if key != "source" or not isinstance(saved, dict) or not isinstance(now, dict):
+        return f"{key}: saved {saved!r}, now {now!r}"
+    parts = []
+    for part in sorted(set(saved) | set(now)):
+        before, after = saved.get(part), now.get(part)
+        if before == after:
+            continue
+        if part == "files":
+            parts.append(
+                f"data files differ ({len(before or [])} saved, {len(after or [])} now, "
+                f"compared by name and size)"
+            )
+        else:
+            parts.append(f"{part}: saved {before!r}, now {after!r}")
+    return "source " + ", ".join(parts)
 
 
 class StatefulDataLoader:
@@ -241,10 +262,22 @@ class StreamingDataLoader:
     training took this epoch. A resume rebuilds the epoch's stream and discards
     that many batches before yielding, which lands on the exact next sample
     because the shuffle, the split across ranks and workers, and the packing are
-    deterministic. ``load_state_dict`` refuses a position saved under anything
-    that changes the stream: the dataset's ``stream_identity``, the batch size or
-    the worker count. The replay rereads and retokenizes the part of the epoch
-    already trained on, so a resume deep into an epoch takes time.
+    deterministic. The replay rereads and retokenizes the part of the epoch
+    already trained on, so a resume deep into an epoch takes time; it logs its
+    progress.
+
+    ``load_state_dict`` refuses a position saved under different values of what
+    it checks: the dataset's ``stream_identity`` (the data files by name and size,
+    or the Hub name and config, with the shard count; the data-parallel size, the
+    seed, the shuffle buffer, ``seq_len``, the tokenizer as named and
+    ``pack_sequences``), the batch size and the worker count. It does not see a
+    file rewritten at the same size, a new revision of a Hub dataset with the same
+    shard count, or a new version of ``datasets`` or of the tokenizer files; any
+    of those can shift the replay.
+
+    A checkpoint holds one rank's position, and every rank replays its own stream
+    by it. That is exact while every rank started its current pass on the same
+    step, so in practice until the first rank finishes a pass.
 
     Args:
         dataset: The streaming dataset.
@@ -262,15 +295,15 @@ class StreamingDataLoader:
         self.dataset = dataset
         self.batch_size = batch_size
         self._num_workers = config.num_workers
-        self._dataloader = DataLoader(
-            dataset,
-            batch_size=batch_size,
-            num_workers=config.num_workers,
-            pin_memory=config.pin_memory,
-            prefetch_factor=config.prefetch_factor if config.num_workers > 0 else None,
-            persistent_workers=config.num_workers > 0,
-            worker_init_fn=ignore_shutdown_signals_in_worker,
-        )
+        self._loader_kwargs: dict[str, Any] = {
+            "batch_size": batch_size,
+            "num_workers": config.num_workers,
+            "pin_memory": config.pin_memory,
+            "prefetch_factor": config.prefetch_factor if config.num_workers > 0 else None,
+            "persistent_workers": config.num_workers > 0,
+            "worker_init_fn": ignore_shutdown_signals_in_worker,
+        }
+        self._dataloader = DataLoader(dataset, **self._loader_kwargs)
         self._epoch = 0
         self._batches_yielded = 0
         self._iterator = None
@@ -283,32 +316,61 @@ class StreamingDataLoader:
         }
 
     def __iter__(self):
+        if self._iterator is not None and self._num_workers > 0:
+            self._restart_workers()
         self.dataset.set_epoch(self._epoch)
         self._iterator = iter(self._dataloader)
         if self._batches_yielded:
             self._replay()
         return self
 
+    def _restart_workers(self) -> None:
+        """Replace the persistent workers before a pass restarts midway.
+
+        A worker keeps its own copy of the dataset, and one that already finished
+        its part of the pass has moved that copy to the next epoch, so it would
+        read the next epoch's shuffle. New workers copy the dataset at this epoch.
+        """
+        running = getattr(self._dataloader, "_iterator", None)
+        if running is not None and hasattr(running, "_shutdown_workers"):
+            running._shutdown_workers()
+            for worker in getattr(running, "_workers", ()):
+                if worker.is_alive():
+                    worker.kill()
+                    worker.join(timeout=10)
+        self._dataloader = DataLoader(self.dataset, **self._loader_kwargs)
+
     def _replay(self) -> None:
-        """Discard the batches this epoch already gave training."""
+        """Discard the batches this epoch already gave training, logging progress."""
+        total = self._batches_yielded
+        tokens_per_batch = self.batch_size * self.dataset.seq_len
         logger.info(
-            f"Replaying {self._batches_yielded} batches of epoch {self._epoch} to restore "
-            f"the stream position"
+            f"Replaying {total} batches ({total * tokens_per_batch:,} tokens) of epoch "
+            f"{self._epoch} to restore the stream position"
         )
         assert self._iterator is not None
-        for replayed in range(self._batches_yielded):
+        every = max(1, total // 10)
+        started = time.monotonic()
+        for replayed in range(1, total + 1):
             try:
                 next(self._iterator)
             except StopIteration:
                 logger.warning(
-                    f"The stream ended after {replayed} of {self._batches_yielded} replayed "
-                    f"batches; starting epoch {self._epoch + 1}"
+                    f"The stream ended after {replayed - 1} of {total} replayed batches; "
+                    f"starting epoch {self._epoch + 1}"
                 )
                 self._epoch += 1
                 self._batches_yielded = 0
                 self.dataset.set_epoch(self._epoch)
                 self._iterator = iter(self._dataloader)
                 return
+            if replayed % every == 0:
+                rate = replayed / max(time.monotonic() - started, 1e-9)
+                logger.info(
+                    f"Replayed {replayed} of {total} batches, "
+                    f"{rate * tokens_per_batch / 1e6:.2f}M tokens/s, about "
+                    f"{(total - replayed) / rate:.0f} s left"
+                )
 
     def __next__(self) -> dict[str, torch.Tensor]:
         if self._iterator is None:
@@ -347,15 +409,22 @@ class StreamingDataLoader:
         current = self._identity()
         changed = sorted(k for k in set(saved) | set(current) if saved.get(k) != current.get(k))
         if changed:
-            detail = "; ".join(
-                f"{k}: saved {saved.get(k)!r}, now {current.get(k)!r}" for k in changed
-            )
+            detail = "; ".join(_stream_change(k, saved.get(k), current.get(k)) for k in changed)
             raise DataPositionError(
                 f"Cannot replay the stream to its saved position because the stream "
                 f"changed ({detail}). Resume with the saved values."
             )
         self._epoch = state.get("epoch", 0)
         self._batches_yielded = state.get("batches_yielded", 0)
+        if self._epoch > 0 and self.dataset.world_size > 1:
+            logger.warning(
+                f"Resuming the stream in pass {self._epoch} on {self.dataset.world_size} "
+                f"data-parallel ranks: the checkpoint holds one rank's position, which is "
+                f"right for every rank only while all ranks started this pass on the same "
+                f"step. Ranks whose parts of the stream differ in length start later passes "
+                f"on different steps, so a rank may skip or repeat up to that difference "
+                f"until checkpoints hold each rank's own loader state"
+            )
         logger.info(
             f"Resumed streaming DataLoader: epoch={self._epoch}, replaying "
             f"{self._batches_yielded} batches on the next iteration"
