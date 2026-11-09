@@ -200,7 +200,9 @@ class ModelConfig:
 
         Three for ``silu``, which builds SwiGLU (gate, up and down projections), and two
         for ``gelu`` and ``relu``, which build the standard MLP (up and down). An MLP a
-        plugin registered under another name is counted as three.
+        plugin registers under another name is counted as gated, three matrices, whatever
+        it builds, so the estimates that use this are exact for the built-in activations
+        only.
         """
         return 2 if self.activation in (Activation.gelu, Activation.relu) else 3
 

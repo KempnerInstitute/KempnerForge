@@ -84,8 +84,7 @@ def dp_all_reduce_(tensor: torch.Tensor, groups: Sequence[dist.ProcessGroup]) ->
 def dp_mean(value: float, groups: Sequence[dist.ProcessGroup], device: torch.device) -> float:
     """Mean of ``value`` over the DP ranks that ``groups`` span; ``value`` itself when empty.
 
-    The sum is taken in float64, so the mean of equal values is exact. Every rank in
-    ``groups`` must call this.
+    The sum is taken in float64. Every rank in ``groups`` must call this.
     """
     if not groups:
         return value

@@ -73,6 +73,7 @@ class FakeCheckpointManager:
         self.flushes = 0
         self.tracking_source = None
         self.checkpoint_registrar = None
+        self.has_pending_save = False
 
     def save(self, step, tokens_seen=0, scheduler=None, dataloader=None, extra=None) -> None:
         self.saves.append((step, tokens_seen, dict(extra or {})))
@@ -85,9 +86,11 @@ class FakeCheckpointManager:
 
     def wait(self) -> None:
         self.waits += 1
+        self.has_pending_save = False
 
     def flush_pending_save(self) -> None:
         self.flushes += 1
+        self.has_pending_save = False
 
     @property
     def saved_steps(self) -> list[int]:
@@ -420,6 +423,13 @@ class TestSelectStepFn:
 
 
 class TestTextStep:
+    def test_step_result_keeps_its_positional_fields(self):
+        """The fields added for the token counts come last, after the existing ones."""
+        from kempnerforge.training.loop import StepResult
+
+        result = StepResult(1.0, 0.5, 7)
+        assert (result.text_tokens, result.tokens, result.seq_len) == (7, None, None)
+
     def test_synthetic_batches_produce_gradients(self):
         config = make_config(grad_accum_steps=2)
         session = make_session(config)
@@ -3368,8 +3378,9 @@ class TestPerDatasetMetrics:
         assert ds["loss/a"] == pytest.approx(total / count, rel=1e-6)
         assert ds["data/a/tokens"] == (1 + 3) * 4
 
-    def test_a_step_that_is_not_logged_runs_no_source_cross_entropy(self, monkeypatch):
-        """``text_step`` gets the steps done so far, so step 4 is logged step 5, not logged."""
+    def test_a_step_that_is_not_logged_counts_no_source(self, monkeypatch):
+        """``text_step`` gets the steps done so far, so step 4 is logged step 5, not logged:
+        it runs no source cross-entropy and counts no source tokens."""
         session, _ = self._mixture_session()
         calls: list[int] = []
         cross_entropy = F.cross_entropy
@@ -3379,7 +3390,24 @@ class TestPerDatasetMetrics:
         result = session.step_fn(session, 4)
         assert len(calls) == 1
         assert result.dataset_losses is None
-        assert result.dataset_tokens.tolist() == [2 * 4, 2 * 4]
+        assert result.dataset_tokens is None
+
+    def test_bf16_logits_give_an_fp32_source_loss(self):
+        """Per-token losses are taken in fp32, so bf16 logits do not round them to bf16."""
+        from kempnerforge.training.loop import _source_cross_entropy
+
+        generator = torch.Generator().manual_seed(0)
+        logits = (4 * torch.randn(8, 512, 256, generator=generator)).to(torch.bfloat16)
+        labels = torch.randint(0, 256, (8, 512), generator=generator)
+        sources = torch.tensor([0, 1, 0, 1, 0, 1, 0, 1])
+        sums = _source_cross_entropy(logits, labels, sources, 2, chunk=1000)
+        for source in (0, 1):
+            rows = sources == source
+            exact = F.cross_entropy(
+                logits[rows].double().reshape(-1, 256), labels[rows].reshape(-1)
+            ).item()
+            assert sums[1, source] == rows.sum() * 512
+            assert (sums[0, source] / sums[1, source]).item() == pytest.approx(exact, rel=1e-6)
 
     def test_the_loss_leaves_out_the_z_loss_of_the_training_loss(self, monkeypatch):
         from kempnerforge.training.loss import z_loss
@@ -3508,7 +3536,8 @@ class TestCheckpointTiming:
     async save logs ``checkpoint/wait_sec``; neither is part of ``step_time``."""
 
     @staticmethod
-    def _session(monkeypatch, config, **overrides):
+    def _session(monkeypatch, config, *, async_saves: bool = True, **overrides):
+        """A session whose saves take 7 s and drains 2 s; an async save stays pending."""
         import time
 
         clock = [0.0]
@@ -3519,6 +3548,7 @@ class TestCheckpointTiming:
         def slow_save(*args: Any, **kwargs: Any) -> None:
             clock[0] += 7.0
             save(*args, **kwargs)
+            ckpt.has_pending_save = async_saves
 
         def slow_wait() -> None:
             clock[0] += 2.0
@@ -3560,7 +3590,8 @@ class TestCheckpointTiming:
         run_training_loop(session)
         assert self._times(logged, "checkpoint/save_sec") == [(1, 7.0)]
 
-    def test_an_emergency_checkpoint_already_saved_logs_its_wait(self, monkeypatch):
+    def test_an_emergency_checkpoint_already_saved_logs_one_wait(self, monkeypatch):
+        """The shutdown drains the step's save; the final wait has nothing left to log."""
         config = make_config(max_steps=5)
         config.checkpoint.interval = 1
         session, logged = self._session(
@@ -3568,7 +3599,18 @@ class TestCheckpointTiming:
         )
         run_training_loop(session)
         assert self._times(logged, "checkpoint/save_sec") == [(1, 7.0)]
-        assert self._times(logged, "checkpoint/wait_sec")[0] == (1, 2.0)
+        assert self._times(logged, "checkpoint/wait_sec") == [(1, 2.0)]
+
+    def test_a_run_with_nothing_pending_logs_no_final_wait(self, monkeypatch):
+        """Synchronous saves leave nothing to drain, so the run's end logs no wait."""
+        config = make_config(max_steps=3)
+        config.checkpoint.interval = 2
+        session, logged = self._session(monkeypatch, config, async_saves=False)
+        run_training_loop(session)
+        ckpt: FakeCheckpointManager = session.checkpointer  # type: ignore[assignment]
+        assert self._times(logged, "checkpoint/save_sec") == [(2, 7.0), (3, 7.0)]
+        assert self._times(logged, "checkpoint/wait_sec") == []
+        assert ckpt.waits == 1
 
     def test_save_time_is_left_out_of_step_time(self, monkeypatch):
         config = make_config(max_steps=2)

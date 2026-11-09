@@ -147,9 +147,9 @@ class StepResult:
 
     The per-dataset fields stay None for step bodies that don't produce
     them; ``text_tokens`` stays None, which a VLM run treats as an error
-    rather than logging a zero. With a data mixture, ``dataset_tokens`` holds
-    the positions this rank drew from each source, by source index, and on a
-    step the tracker will log, ``dataset_losses`` holds each source's summed
+    rather than logging a zero. With a data mixture, on a step the tracker
+    will log, ``dataset_tokens`` holds the positions this rank drew from each
+    source, by source index, and ``dataset_losses`` each source's summed
     cross-entropy (row 0) and labeled-token count (row 1). ``tokens`` is the
     number of positions the model ran on this rank over every micro-step,
     padding included, and ``seq_len`` the length of each of those rows; with
@@ -159,11 +159,11 @@ class StepResult:
 
     loss: float
     grad_norm: float
-    tokens: int | None = None
-    seq_len: int | None = None
     text_tokens: int | None = None
     dataset_tokens: torch.Tensor | None = None
     dataset_losses: torch.Tensor | None = None
+    tokens: int | None = None
+    seq_len: int | None = None
 
 
 StepFn = Callable[["TrainingSession", int], StepResult]
@@ -361,9 +361,9 @@ def _source_cross_entropy(
 ) -> torch.Tensor:
     """Each source's summed cross-entropy and labeled-token count, as a ``(2, n_sources)`` tensor.
 
-    ``sources`` holds the source index of each row. The cross-entropy runs ``chunk``
-    tokens at a time, so it copies no source's logits and holds the log-softmax of one
-    chunk at most. A token labeled -100 counts in neither row.
+    ``sources`` holds the source index of each row. The cross-entropy runs in fp32,
+    ``chunk`` tokens at a time, so it copies no source's logits and holds one chunk's
+    fp32 logits and log-softmax at most. A token labeled -100 counts in neither row.
     """
     flat_logits = logits.reshape(-1, logits.shape[-1])
     flat_labels = labels.reshape(-1)
@@ -372,7 +372,10 @@ def _source_cross_entropy(
     for start in range(0, flat_labels.numel(), chunk):
         chunk_labels = flat_labels[start : start + chunk]
         losses = F.cross_entropy(
-            flat_logits[start : start + chunk], chunk_labels, ignore_index=-100, reduction="none"
+            flat_logits[start : start + chunk].float(),
+            chunk_labels,
+            ignore_index=-100,
+            reduction="none",
         )
         chunk_sources = token_sources[start : start + chunk]
         out[0].index_add_(0, chunk_sources, losses.double())
@@ -383,10 +386,10 @@ def _source_cross_entropy(
 def text_step(session: TrainingSession, step: int) -> StepResult:
     """Standard step (no PP, text-only), with optional per-dataset mixture metrics.
 
-    Each source's loss is computed only on a step the tracker will log, which is
-    ``step + 1``: ``step`` counts the steps done before this one. It is the plain
-    cross-entropy of the source's labeled tokens, without the z-loss or MoE terms
-    the training loss may add.
+    Each source's tokens and loss are counted only on a step the tracker will log,
+    which is ``step + 1``: ``step`` counts the steps done before this one. The loss is
+    the plain cross-entropy of the source's labeled tokens, without the z-loss or MoE
+    terms the training loss may add.
     """
     config = session.config
     tc, mc = config.train, config.model
@@ -399,9 +402,9 @@ def text_step(session: TrainingSession, step: int) -> StepResult:
     total_loss = 0.0
     total_tokens = 0
     seq_len = 0
-    ds_tokens = torch.zeros(n_sources, dtype=torch.long) if n_sources else None
-    ds_losses = None
+    ds_tokens = ds_losses = None
     if n_sources and session.tracker.is_log_step(step + 1):
+        ds_tokens = torch.zeros(n_sources, dtype=torch.long)
         ds_losses = torch.zeros(2, n_sources, dtype=torch.float64, device=device)
     ce_chunk = tc.ce_chunk_size if tc.ce_chunk_size > 0 else 4096
 
@@ -426,14 +429,13 @@ def text_step(session: TrainingSession, step: int) -> StepResult:
                 logits = model(input_ids, doc_ids=doc_ids)
                 loss = session.loss_fn(logits, labels)
 
-            if ds_tokens is not None and "dataset_idx" in batch:
+            if ds_tokens is not None and ds_losses is not None and "dataset_idx" in batch:
                 sources = batch["dataset_idx"]
                 ds_tokens += torch.bincount(sources, minlength=n_sources) * seq_len
-                if ds_losses is not None:
-                    with torch.no_grad():
-                        ds_losses += _source_cross_entropy(
-                            logits, labels, sources.to(device), n_sources, ce_chunk
-                        )
+                with torch.no_grad():
+                    ds_losses += _source_cross_entropy(
+                        logits, labels, sources.to(device), n_sources, ce_chunk
+                    )
 
             if mc.is_moe:
                 loss = add_moe_losses(loss, model, mc)
@@ -485,7 +487,9 @@ def _logged_time(tracker: MetricsTracker, key: str, step: int) -> Iterator[None]
     The loop wraps every checkpoint save in it as ``checkpoint/save_sec`` (for an
     async save, the wait for the previous upload, the staging and the dispatch; the
     upload itself runs in the background) and every drain of an async save as
-    ``checkpoint/wait_sec``. Nothing is logged when the block raises.
+    ``checkpoint/wait_sec``; the drain at the end of the run is timed only when a save
+    is pending, so it adds no second, empty wait to a step already drained. Nothing
+    is logged when the block raises.
     """
     start = time.perf_counter()
     yield
@@ -538,10 +542,9 @@ def _log_dataset_metrics(
     stats[0] = result.dataset_tokens.to(stats.device)
     if result.dataset_losses is not None:
         stats[1:] = result.dataset_losses
-    dp_all_reduce_(stats, session.dp_groups)
+    totals = dp_all_reduce_(stats, session.dp_groups).tolist()
     ds_metrics: dict[str, float] = {}
-    for i, name in enumerate(names):
-        tokens, loss_sum, labeled = stats[:, i].tolist()
+    for name, tokens, loss_sum, labeled in zip(names, *totals, strict=True):
         if labeled > 0:
             ds_metrics[f"loss/{name}"] = loss_sum / labeled
         if tokens > 0:
@@ -835,7 +838,10 @@ def run_training_loop(
             )
         hooks.on_checkpoint_save(step, config.checkpoint.dir)
 
-    with _logged_time(tracker, "checkpoint/wait_sec", step):
+    if ckpt_mgr.has_pending_save:
+        with _logged_time(tracker, "checkpoint/wait_sec", step):
+            ckpt_mgr.wait()
+    else:
         ckpt_mgr.wait()
 
     logger.info(f"Training complete: {step} steps, {tokens_seen:,} tokens")
