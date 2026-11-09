@@ -109,21 +109,31 @@ class Attention(nn.Module):
         self.capture_attention_weights = False
         self.last_attention_weights: torch.Tensor | None = None
 
-    def _sdpa_context(self, *, masked: bool = False):
+    def _sdpa_backends(self, *, appended: bool = False) -> list[SDPBackend]:
+        """Return the SDPA backends enabled for one call under a pinned ``sdpa_backend``.
+
+        The flash and cudnn kernels reject a dense mask. ``appended=True`` is
+        the decode-time call that attends several appended tokens to a
+        non-empty cache through a lower-right mask; it keeps the pinned kernel
+        first and also enables the efficient and math kernels, which the
+        dispatcher falls back to for that call instead of raising. A packed
+        training batch keeps the pinned kernel alone and fails loudly as
+        before, so a job never runs on a slower kernel unannounced.
+        """
+        backends = [_SDPA_BACKENDS[self.sdpa_backend]]
+        if appended and self.sdpa_backend in _MASK_FALLBACK_BACKENDS:
+            backends += [SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
+        return backends
+
+    def _sdpa_context(self, *, appended: bool = False):
         """Return a context manager that forces a specific SDPA backend.
 
         When sdpa_backend="auto", returns a no-op and lets PyTorch's
-        heuristics select the backend. A dense ``attn_mask`` is rejected by
-        the flash and cudnn kernels, so ``masked=True`` keeps those choices
-        but also enables the mask-capable efficient and math kernels, which
-        the dispatcher falls back to for that call instead of raising.
+        heuristics select the backend. See ``_sdpa_backends`` for ``appended``.
         """
         if self.sdpa_backend == "auto":
             return contextlib.nullcontext()
-        backends = [_SDPA_BACKENDS[self.sdpa_backend]]
-        if masked and self.sdpa_backend in _MASK_FALLBACK_BACKENDS:
-            backends += [SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
-        return sdpa_kernel(backends)
+        return sdpa_kernel(self._sdpa_backends(appended=appended))
 
     def forward(
         self,
@@ -136,10 +146,14 @@ class Attention(nn.Module):
     ) -> torch.Tensor:
         """Forward pass.
 
-        Attention consumes a mask; it never derives one. Every visibility rule
-        (document isolation, bidirectional groups, key validity, and their
-        combination) is expressed by ``kempnerforge.model.masking``, which
+        Attention consumes a mask; it never derives a visibility rule.
+        Document isolation, bidirectional groups, key validity and their
+        combination are expressed by ``kempnerforge.model.masking``, which
         builds this one object once per forward and shares it across layers.
+        The causal structure itself is attention's own: ``is_causal`` for a
+        plain forward, and its lower-right form when several tokens are
+        appended to a non-empty cache, a small bool tensor per layer that
+        depends on the cache length and so is not shared.
 
         Args:
             x: Input tensor of shape (batch, seq_len, dim).
@@ -188,6 +202,7 @@ class Attention(nn.Module):
         q = apply_rope(q, rope_cos, rope_sin)
         k = apply_rope(k, rope_cos, rope_sin)
 
+        past = kv_cache.seq_len if kv_cache is not None else 0
         if kv_cache is not None:
             k, v = kv_cache.update(k, v)
 
@@ -216,10 +231,9 @@ class Attention(nn.Module):
                 "a dense attn_mask does not compose with kv_cache decode; it is square "
                 "over the residual stream, while a cache grows the key axis every step."
             )
-            with self._sdpa_context(masked=True):
+            with self._sdpa_context():
                 out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         else:
-            past = k.shape[2] - seq_len
             if past == 0:
                 with self._sdpa_context():
                     out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
@@ -228,7 +242,7 @@ class Attention(nn.Module):
                     out = F.scaled_dot_product_attention(q, k, v)
             else:
                 visible = appended_causal_mask(seq_len, past, q.device)
-                with self._sdpa_context(masked=True):
+                with self._sdpa_context(appended=True):
                     out = F.scaled_dot_product_attention(q, k, v, attn_mask=visible)
 
         out = out.transpose(1, 2).contiguous().view(batch, seq_len, -1)

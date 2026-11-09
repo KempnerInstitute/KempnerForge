@@ -107,7 +107,8 @@ before RoPE. Stabilizes attention logits at scale (Gemma, DeepSeek-V3).
 3. **Single-token decode** (`seq_len == 1` with a KV cache): no mask, so the
    query attends to all cached positions. `is_causal=True` here would
    incorrectly restrict attention to only the first key. Mask inputs are
-   refused together with a KV cache.
+   refused together with a KV cache, whether passed as arguments or carried
+   on the `ModalityContext`.
 4. **Several tokens appended to a non-empty cache**: a lower-right causal
    mask from `appended_causal_mask`, so each appended token sees every cached
    key and the appended keys up to itself. SDPA's `is_causal=True` aligns its
@@ -137,10 +138,11 @@ silent-incorrectness risk. Keep them module-level.
 
 `sdpa_backend` (default `"auto"`) selects flash / mem-efficient / cudnn /
 math via a context manager. `"auto"` lets PyTorch pick. The flash and cudnn
-kernels reject a dense `attn_mask`, so a call that carries one (packed
-training batches, or several tokens appended to a non-empty KV cache) also
-enables the mem-efficient and math kernels and lets the dispatcher fall back
-to them for that call rather than raise.
+kernels reject a dense `attn_mask`. The decode-time call that appends several
+tokens to a non-empty KV cache carries one, so that call also enables the
+mem-efficient and math kernels and lets the dispatcher fall back for it
+rather than raise; a packed training batch keeps the pinned kernel alone and
+fails loudly, as before.
 
 ## MLP
 

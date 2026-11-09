@@ -392,7 +392,8 @@ class Transformer(nn.Module):
                 ``kv_caches`` forbids ``modality.prefix_embeds``,
                 ``modality.output_slice``, ``modality.image_features``,
                 ``modality.modality_ids``, ``modality.key_padding_mask``,
-                ``doc_ids`` and ``attention_group_ids`` (all training-only).
+                ``doc_ids`` and ``attention_group_ids``, by argument or as
+                ``modality.attention_group_ids`` (all training-only).
             doc_ids: Optional per-token document IDs for packed sequences,
                 shape ``(batch, seq_len)`` over the residual stream. Enables
                 block-diagonal causal attention that isolates documents within
@@ -480,7 +481,8 @@ class Transformer(nn.Module):
                 raise ValueError("doc_ids is training-only; cannot be combined with kv_caches")
             if attention_group_ids is not None:
                 raise ValueError(
-                    "attention_group_ids is training-only; cannot be combined with kv_caches"
+                    "attention_group_ids (the argument or modality.attention_group_ids) is "
+                    "training-only; cannot be combined with kv_caches"
                 )
         text = tokens if tokens is not None else inputs_embeds
         assert text is not None

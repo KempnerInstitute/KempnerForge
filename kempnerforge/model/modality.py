@@ -157,3 +157,13 @@ class ModalityContext:
                 f"ModalityContext: rope_cos {tuple(self.rope_cos.shape)} and rope_sin "
                 f"{tuple(self.rope_sin.shape)} differ in shape"
             )
+        if self.rope_cos.dtype != self.rope_sin.dtype:
+            raise ValueError(
+                f"ModalityContext: rope_cos {self.rope_cos.dtype} and rope_sin "
+                f"{self.rope_sin.dtype} differ in dtype"
+            )
+        if self.rope_cos.device != self.rope_sin.device:
+            raise ValueError(
+                f"ModalityContext: rope_cos {self.rope_cos.device} and rope_sin "
+                f"{self.rope_sin.device} differ in device"
+            )

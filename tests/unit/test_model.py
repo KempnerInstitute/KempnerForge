@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend
 
 from kempnerforge.config.schema import ModelConfig
 from kempnerforge.distributed.pipeline_parallel import PipelineStageModule
@@ -177,6 +178,22 @@ class TestAttention:
     def test_sdpa_backend_stored_on_module(self):
         attn = Attention(dim=128, n_heads=4, n_kv_heads=4, sdpa_backend="math")
         assert attn.sdpa_backend == "math"
+
+    @pytest.mark.parametrize("backend", ["flash", "cudnn"])
+    def test_appended_tokens_fall_back_from_maskless_kernels(self, backend):
+        attn = Attention(dim=128, n_heads=4, n_kv_heads=4, sdpa_backend=backend)
+        pinned = attn._sdpa_backends()
+        assert len(pinned) == 1
+        appended = attn._sdpa_backends(appended=True)
+        assert appended[0] == pinned[0]
+        assert SDPBackend.EFFICIENT_ATTENTION in appended
+        assert SDPBackend.MATH in appended
+
+    @pytest.mark.parametrize("backend", ["efficient", "math"])
+    def test_mask_capable_kernels_stay_pinned_for_appended_tokens(self, backend):
+        attn = Attention(dim=128, n_heads=4, n_kv_heads=4, sdpa_backend=backend)
+        assert attn._sdpa_backends(appended=True) == attn._sdpa_backends()
+        assert len(attn._sdpa_backends()) == 1
 
 
 class TestMLP:
