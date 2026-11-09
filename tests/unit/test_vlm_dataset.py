@@ -932,7 +932,10 @@ class TestMultiImageRows:
         with pytest.raises(ValueError, match="hf_max_images"):
             _dataset_over(rows)[0]
 
-    def test_rows_over_the_cap_are_counted_once_when_the_dataset_is_loaded(self, tmp_path, caplog):
+    def test_rows_over_the_cap_are_counted_once_when_the_dataset_is_loaded(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        monkeypatch.setattr(logging.getLogger("kempnerforge"), "propagate", True)
         path = _mixed_image_dataset(
             tmp_path, [[_make_image(8)] * 3, [_make_image(8)], [_make_image(8)] * 4]
         )

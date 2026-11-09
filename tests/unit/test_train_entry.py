@@ -2415,9 +2415,19 @@ class TestVlmSourceBuilders:
         config.data.hf_max_images = 2
         config.vision_encoder.num_tokens = 16
         dp.build_data_pipeline(config, _runtime())
-        assert seen["image_collator"]["allow_text_only"] is True
         assert seen["dataset"]["allow_text_only"] is True
         assert seen["dataset"]["max_images"] == 2
+        assert "multi_image_collator" in seen and "image_collator" not in seen
+
+    def test_image_path_passes_the_text_only_flag_to_the_collator(self, monkeypatch):
+        seen: dict = {}
+        dp = _stub_loaders(monkeypatch, seen)
+        self._stub_vlm_modules(monkeypatch, seen)
+        config = self._vlm_data_config()
+        config.data.hf_allow_text_only = True
+        dp.build_data_pipeline(config, _runtime())
+        assert seen["image_collator"]["allow_text_only"] is True
+        assert seen["dataset"]["allow_text_only"] is True
 
     def test_packing_uses_the_packed_collator_sized_by_the_encoder(self, monkeypatch):
         seen: dict = {}
