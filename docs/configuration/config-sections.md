@@ -265,7 +265,7 @@ DCP-based checkpointing.
 | `dyn_ckpt_window` | `DynamicCheckpointWindow \| None` | `None` | optional dense save phase — see [`[checkpoint.dyn_ckpt_window]`](#checkpointdyn_ckpt_window--dynamiccheckpointwindow) |
 | `async_mode` | `"disabled" \| "async" \| "async_with_pinned_mem"` | `"disabled"` | DCP async-save mode |
 | `keep_last_n` | `int` | `3` | retain the most recent N checkpoints (`<= 0` keeps all); steps saved by `dyn_ckpt_window` are always kept |
-| `load_path` | `str \| None` | `None` | explicit resume path (overrides `latest` symlink) |
+| `load_path` | `str \| None` | `None` | checkpoint for training to start from while `dir` holds none (a warm start); once `dir` has a checkpoint, auto-resume loads that instead and rank 0 warns that `load_path` is not used, unless it names that checkpoint. `scripts/eval.py` and `scripts/generate.py` load `load_path` first |
 | `export_dtype` | `"float32" \| "bfloat16"` | `"bfloat16"` | dtype for HF exports via `scripts/convert_checkpoint.py dcp-to-hf` when its `--dtype` flag is not given; the flag wins and also takes `float16` (see [HuggingFace conversion](../checkpointing/hf-conversion.md#dtypes)) |
 | `exclude_from_loading` | `list[str]` | `[]` | state keys to skip when warm-starting from `load_path` — `"model"` and/or `"optimizer"`; ignored on a resume, which always restores full state |
 | `ignore_freeze_mismatch` | `bool` | `False` | load a checkpoint whose VLM freeze metadata disagrees with the configured freeze specs, downgrading the error to a warning |
@@ -358,6 +358,66 @@ bounds on tracking calls are on the [MLflow backend](../metrics-and-profiling/ml
 | `start_step` | `int` | `5` | first step recorded |
 | `end_step` | `int` | `8` | last step recorded (must be `>` `start_step`) |
 | `trace_dir` | `str` | `"profiler_traces"` | output directory for Chrome/Perfetto traces |
+
+## `[adapter]`: `AdapterConfig`
+
+The VLM connector that maps vision-encoder features into the transformer's
+embedding space. A run that sets `[vlm]` without `[adapter]` gets these
+defaults.
+[`kempnerforge/config/adapter.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/config/adapter.py).
+
+| Field | Type | Default | Used by | Purpose |
+|-------|------|---------|---------|---------|
+| `type` | `str` | `"mlp_2layer"` | all | adapter registry key: `mlp_2layer` and `linear` keep the token count, `avgpool` and `attentional_pool` pool it |
+| `hidden_dim` | `int` | `0` | `mlp_2layer`, `avgpool` | MLP hidden width. `mlp_2layer`: `0` means `out_dim`. `avgpool`: a positive width makes the head after the pool a 2-layer MLP, normed first when `pre_norm` is set; `0` keeps the single `Linear` |
+| `activation` | `str` | `"gelu"` | `mlp_2layer`; `avgpool` with `hidden_dim > 0` | `"gelu"`, `"silu"` or `"relu"` between the two MLP projections |
+| `pre_norm` | `str` | `""` | `mlp_2layer`; `avgpool` with `hidden_dim > 0` | norm-registry key for a norm ahead of the MLP, over the vision features (`mlp_2layer`) or the pooled features (`avgpool`); `""` builds none |
+| `pool_window` | `int` | `2` | `avgpool`, `attentional_pool` | pooling window side, e.g. `2` for 2×2 |
+| `pool_heads` | `int` | `16` | `attentional_pool` | attention heads; must divide the vision feature dim |
+
+A field outside the selected adapter's "Used by" entries must keep its
+default, or the config fails to load with an error naming the field and the
+adapter type. The column follows each adapter's builder parameters, which
+`avgpool` narrows by `hidden_dim` with the `accepts` it registers; a plugin
+adapter's come from its own builder (see
+[Registry](registry.md#adapters-declare-the-fields-they-use)).
+
+An `avgpool` connector with a 2×2 window and an RMSNorm + MLP head as wide as
+its input (here a 1152-wide encoder):
+
+```toml
+[adapter]
+type = "avgpool"
+pool_window = 2
+hidden_dim = 1152
+pre_norm = "rmsnorm"
+```
+
+`hidden_dim` picks the `avgpool` head, and the head fixes the adapter's
+checkpoint keys. `hidden_dim = 0` builds the single `Linear`, saved as
+`adapter.proj.weight` and `adapter.proj.bias`. A positive `hidden_dim` builds
+the MLP head, saved as `adapter.proj.proj1.*` and `adapter.proj.proj2.*`, plus
+`adapter.proj.ln_q.*` when `pre_norm` is set. A checkpoint loads only into
+the head it was saved with: the other head fails the load with `Missing key
+in checkpoint state_dict` naming one of its parameters. To resume a
+checkpoint saved with the single `Linear`, set `hidden_dim = 0` and leave
+`activation` and `pre_norm` at their defaults.
+
+A command-line override sets a value and never restores a default, so
+switching `adapter.type` on the command line keeps every other field the TOML
+sets. Reset the ones the new type does not use in the same command; an empty
+value sets the empty string. For a TOML with `type = "mlp_2layer"`,
+`hidden_dim = 2048` and `pre_norm = "rmsnorm"`:
+
+```bash
+--adapter.type=attentional_pool --adapter.hidden_dim=0 --adapter.pre_norm=
+```
+
+The TOML is checked on its own before the overrides apply, so its fields must
+fit its own `type`. A TOML with `type = "attentional_pool"` and
+`hidden_dim = 1152` fails to load even with `--adapter.type=avgpool`: set the
+type and its fields in the same layer, both in the TOML or both on the
+command line.
 
 ## Where to read next
 

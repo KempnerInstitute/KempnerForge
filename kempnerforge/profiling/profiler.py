@@ -28,7 +28,8 @@ def build_profiler(
 
     Args:
         config: Profiling configuration.
-        rank: Current rank (for output directory naming).
+        rank: Global rank of this process. Its trace files are named after it, zero
+            padded to five digits: ``rank00003.<time_ns>.pt.trace.json`` for rank 3.
 
     Returns:
         A torch.profiler.profile context manager, or None.
@@ -50,7 +51,7 @@ def build_profiler(
             active=active_steps,
             repeat=1,
         ),
-        on_trace_ready=tensorboard_trace_handler(str(trace_dir)),
+        on_trace_ready=tensorboard_trace_handler(str(trace_dir), worker_name=f"rank{rank:05d}"),
         record_shapes=True,
         profile_memory=True,
         with_stack=False,

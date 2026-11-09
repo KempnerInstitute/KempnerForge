@@ -23,8 +23,11 @@ You will see one metrics line every 5 steps (controlled by
 `metrics.log_interval`):
 
 ```
-[step 10] loss=9.1800 | lr=3.00e-04 | grad_norm=1.340 | tok/s=42,000 | mfu=18.2% | mem=2.1/80GB | step_time=0.15s
+2026-11-04 14:03:12.345 [rank 0] INFO     [step 10] loss=9.1800 | lr=3.00e-04 | grad_norm=1.340 | tok/s=13,653 | mfu=0.1% | mem=2.1/80GB | step_time=0.15s
 ```
+
+Like every line the framework logs, it starts with the local time (to the
+millisecond), the rank that wrote it and the log level. The metrics follow:
 
 | Field | What it is |
 |-------|------------|
@@ -34,7 +37,7 @@ You will see one metrics line every 5 steps (controlled by
 | `grad_norm` | L2 norm of gradients before clipping (returned by `clip_grad_norm_`). Clipping to `train.grad_clip_norm` (default 1.0) is applied in-place before the optimizer step. |
 | `tok/s` | Tokens per second throughput, this step. |
 | `mfu` | Model FLOPs Utilization — achieved FLOPs / theoretical peak for the GPU. |
-| `mem` | Peak GPU memory this step / total GPU memory. |
+| `mem` | Peak GPU memory / total GPU memory, on rank 0's GPU. The peak is the most allocated at any point since the process started, not in this step: a high-water mark that never goes down (see [Memory monitor](../metrics-and-profiling/memory-monitor.md#why-metricstracker-doesnt-reset-peak)). |
 | `step_time` | Wall-clock time spent on this step, in seconds. |
 
 Synthetic data means loss starts near `log(vocab_size) ≈ 10.4` and falls
@@ -76,12 +79,18 @@ uv run python scripts/train.py configs/train/debug.toml \
 needed — auto-resume is the default when `checkpoint.dir` contains a valid
 checkpoint.
 
-To explicitly point at a different checkpoint:
+To start a new run from a different checkpoint, give it its own
+checkpoint directory:
 
 ```bash
 uv run python scripts/train.py configs/train/debug.toml \
+  --checkpoint.dir=/tmp/kf_from_step_50 \
   --checkpoint.load_path=/tmp/kf_first_run/step_50
 ```
+
+`load_path` is used only while `checkpoint.dir` holds no checkpoint. With
+`--checkpoint.dir=/tmp/kf_first_run` the run would resume from `latest`
+instead, and warn that `load_path` is not used.
 
 ## Change something and re-run
 

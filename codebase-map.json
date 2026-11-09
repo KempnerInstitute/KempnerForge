@@ -1190,7 +1190,8 @@
         "tests/unit/test_checkpoint.py::TestBuildTrainState",
         "tests/unit/test_checkpoint.py::TestRestoreTrainState",
         "tests/unit/test_lr_multipliers.py::TestSchedulerStateLayout",
-        "tests/unit/test_lr_multipliers.py::TestLayoutChange"
+        "tests/unit/test_lr_multipliers.py::TestLayoutChange",
+        "tests/integration/test_checkpoint_roundtrip.py::TestCheckpointRoundtrip"
       ]
     },
     "kempnerforge/checkpoint/manager.py": {
@@ -1229,7 +1230,7 @@
         "tests/unit/test_checkpoint.py::TestIntersectFreezeMetaByModule",
         "tests/unit/test_checkpoint_security.py::TestLoadTrainStateOwnershipGate",
         "tests/unit/test_checkpoint_security.py::TestManagerLoadRejectsForeignCheckpoint",
-        "tests/integration/test_checkpoint_roundtrip.py::TestCheckpointRoundtrip",
+        "tests/unit/test_checkpoint.py::TestCheckpointManagerLoad",
         "tests/distributed/test_checkpoint.py"
       ]
     },
