@@ -82,26 +82,31 @@ Image-text mixes often carry documents without an image, such as FineVision's
 `text_*` subsets. With `data.hf_allow_text_only = true`, a row whose image
 column is `None` or an empty list is a text-only document. Without packing it
 takes a blank image and a `frame_mask` entry of `False`, so its image tokens
-are hidden from attention; with packing it is just its text, and a micro-batch
-of nothing but text carries no images. Either way the vision encoder and
-adapter run on every rank, on a blank image when there is nothing else, because
-their FSDP2 collectives need every rank to take part. Without the flag such a
-row raises.
+are hidden from attention; the document still occupies the image positions,
+so its text sits after them in the row and in the position encoding, as a
+masked image document rather than plain text. With packing it is just its
+text, and a micro-batch of nothing but text carries no images. On every rank
+a sharded vision encoder or adapter still runs, on a blank image when there is
+nothing else, because its FSDP2 collectives need every rank to take part; a
+frozen encoder is skipped. The flag needs an image-prefix arch or packing, not
+`cross_attention`, whose image K/V cannot hide a blank image. Without the flag
+a dataset with such a row is rejected when it is loaded.
 
 ## Documents with several images
 
 An image column that holds a list of images is a multi-image document.
 `data.hf_max_images = n` (`n >= 2`) accepts up to `n` of them per document, in
-list order, and keeps the first `n` of a longer list with a warning; the
-default of `1` raises on a list of more than one. The images' tokens go before
-the document's text, each image in its own block, which is the layout packing
-uses. With `data.pack_sequences = true` such documents pack like any other;
-without it `MultiImageVLMCollator` lays each document out in its own row of
-`n` images' tokens plus `vlm.max_text_len`, so rows keep one shape across
-micro-batches and ranks. Both need `vlm.arch = "joint_decoder"` and
-`vision_encoder.num_tokens`, and the row has to fit `train.seq_len` and
-`model.max_seq_len`. `hf_max_images = 0` sets no cap and is only allowed with
-packing, where a document is bounded by the row length instead.
+list order, and keeps the first `n` of a longer list; when the dataset is
+loaded it counts the rows that trims in one warning. At the default of `1` a
+dataset with a list of more than one is rejected when it is loaded. The
+images' tokens go before the document's text, each image in its own block,
+which is the layout packing uses. With `data.pack_sequences = true` such
+documents pack like any other; without it `MultiImageVLMCollator` lays each
+document out in its own row of `n` images' tokens plus `vlm.max_text_len`, so
+rows keep one shape across micro-batches and ranks. Both need
+`vlm.arch = "joint_decoder"` and `vision_encoder.num_tokens`, and `n` images'
+tokens plus `vlm.max_text_len` have to fit `train.seq_len` and
+`model.max_seq_len`, which the config checks, so every document fits its row.
 
 ## Start from the pretrained backbone
 

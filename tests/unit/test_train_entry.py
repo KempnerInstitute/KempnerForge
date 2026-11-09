@@ -12,6 +12,7 @@ import dataclasses
 import json
 from collections.abc import Iterator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -1896,6 +1897,18 @@ class TestBuildModel:
         entry.build_model(config, _runtime(), lambda a, b: a)
         assert seen["frames_per_clip"] == 6
 
+    def test_non_pp_sizes_the_image_budget_by_the_image_cap(self, monkeypatch):
+        import kempnerforge.training.entry as entry
+
+        seen: dict = {}
+        monkeypatch.setattr(
+            entry, "build_parallel_model", lambda *a, **k: seen.update(k) or "MODEL"
+        )
+        config = _vlm_config()
+        config.data = DataConfig(hf_max_images=3, num_workers=0)
+        entry.build_model(config, _runtime(), lambda a, b: a)
+        assert seen["frames_per_clip"] == 3
+
     def test_pp_builds_a_bundle_from_the_mesh(self, monkeypatch):
         stage, calls = FakeStageModule(), {}
         entry = _stub_pp(monkeypatch, stage, calls)
@@ -2365,8 +2378,18 @@ class TestVlmSourceBuilders:
 
         monkeypatch.setattr(vlmd, "build_tokenizer", lambda p: "TOK")
         monkeypatch.setattr(vlmd, "resolve_pad_id", lambda tok: 7)
-        monkeypatch.setattr(vlmd, "HuggingFaceVLMDataset", lambda **k: FakeDataset(**k))
+        monkeypatch.setattr(
+            vlmd, "HuggingFaceVLMDataset", lambda **k: seen.setdefault("dataset", k) and FakeDataset()
+        )
         monkeypatch.setattr(vlmd, "VLMCollator", lambda **k: seen.setdefault("image_collator", k))
+        monkeypatch.setattr(
+            vlmd, "PackedVLMCollator", lambda **k: seen.setdefault("packed_collator", k)
+        )
+        monkeypatch.setattr(
+            vlmd,
+            "MultiImageVLMCollator",
+            lambda **k: seen.setdefault("multi_image_collator", k) and SimpleNamespace(seq_len=0),
+        )
         monkeypatch.setattr(vid, "build_video_dataset", lambda *a: FakeDataset())
         monkeypatch.setattr(vid, "VideoCollator", lambda **k: seen.setdefault("video_collator", k))
 
@@ -2378,6 +2401,66 @@ class TestVlmSourceBuilders:
         assert data.dataloader == "stateful_OBJ"
         assert seen["image_collator"]["pad_id"] == 7
         assert "video_collator" not in seen
+
+    def test_image_path_passes_the_text_only_and_image_cap_settings_to_the_dataset(
+        self, monkeypatch
+    ):
+        seen: dict = {}
+        dp = _stub_loaders(monkeypatch, seen)
+        self._stub_vlm_modules(monkeypatch, seen)
+        config = self._vlm_data_config()
+        config.data.hf_allow_text_only = True
+        config.data.hf_max_images = 2
+        config.vision_encoder.num_tokens = 16
+        dp.build_data_pipeline(config, _runtime())
+        assert seen["image_collator"]["allow_text_only"] is True
+        assert seen["dataset"]["allow_text_only"] is True
+        assert seen["dataset"]["max_images"] == 2
+
+    def test_packing_uses_the_packed_collator_sized_by_the_encoder(self, monkeypatch):
+        seen: dict = {}
+        dp = _stub_loaders(monkeypatch, seen)
+        self._stub_vlm_modules(monkeypatch, seen)
+        config = self._vlm_data_config()
+        config.data.pack_sequences = True
+        config.vision_encoder.num_tokens = 16
+        dp.build_data_pipeline(config, _runtime())
+        assert seen["packed_collator"] == {
+            "pad_id": 7,
+            "seq_len": config.train.seq_len,
+            "tokens_per_image": 16,
+        }
+        assert "image_collator" not in seen and "multi_image_collator" not in seen
+
+    def test_an_image_cap_above_one_without_packing_uses_fixed_rows(self, monkeypatch):
+        seen: dict = {}
+        dp = _stub_loaders(monkeypatch, seen)
+        self._stub_vlm_modules(monkeypatch, seen)
+        config = self._vlm_data_config()
+        config.data.hf_max_images = 3
+        config.vision_encoder.num_tokens = 16
+        dp.build_data_pipeline(config, _runtime())
+        assert seen["multi_image_collator"] == {
+            "pad_id": 7,
+            "max_text_len": config.vlm.max_text_len,
+            "tokens_per_image": 16,
+            "max_images": 3,
+        }
+        assert "image_collator" not in seen and "packed_collator" not in seen
+
+    @pytest.mark.parametrize(
+        "field, setting",
+        [("pack_sequences", "data.pack_sequences"), ("hf_max_images", "data.hf_max_images")],
+    )
+    def test_a_probed_encoder_cannot_size_the_rows(self, monkeypatch, field, setting):
+        seen: dict = {}
+        dp = _stub_loaders(monkeypatch, seen)
+        self._stub_vlm_modules(monkeypatch, seen)
+        config = self._vlm_data_config()
+        setattr(config.data, field, True if field == "pack_sequences" else 2)
+        config.vision_encoder.num_tokens = 0
+        with pytest.raises(ValueError, match=f"{setting} on a VLM run needs the per-image"):
+            dp.build_data_pipeline(config, _runtime())
 
     def test_video_path_uses_the_video_collator(self, monkeypatch):
         seen: dict = {}

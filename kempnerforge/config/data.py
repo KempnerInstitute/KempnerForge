@@ -101,8 +101,8 @@ class DataConfig:
             raise ValueError("num_workers must be non-negative")
         if self.prefetch_factor < 1:
             raise ValueError("prefetch_factor must be >= 1")
-        if self.hf_max_images < 0:
-            raise ValueError("hf_max_images must be >= 0 (0 = no cap)")
+        if self.hf_max_images < 1:
+            raise ValueError("hf_max_images must be >= 1")
         if self.mix_temperature <= 0:
             raise ValueError("mix_temperature must be positive")
         check_token_dtype(self.token_dtype, "data.token_dtype")

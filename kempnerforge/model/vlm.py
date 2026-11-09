@@ -41,6 +41,7 @@ from typing import Protocol
 
 import torch
 import torch.nn as nn
+from torch.distributed._composable.fsdp import FSDPModule
 
 from kempnerforge.config.adapter import AdapterConfig
 from kempnerforge.config.registry import registry
@@ -78,27 +79,59 @@ class ModalityStrategy(Protocol):
     def num_image_tokens(self, wrapper: VLMWrapper) -> int: ...
 
 
-def _encode_and_adapt(wrapper: VLMWrapper, images: torch.Tensor) -> torch.Tensor:
-    """Run the vision encoder and adapter over ``(N, 3, H, W)``, casting at their boundary."""
-    feats = wrapper.vision_encoder(images)
+def _adapt(wrapper: VLMWrapper, feats: torch.Tensor) -> torch.Tensor:
+    """Run the adapter over encoder features, casting at their boundary."""
     adapter_dtype = next(wrapper.adapter.parameters()).dtype
     if feats.dtype != adapter_dtype:
         feats = feats.to(adapter_dtype)
     return wrapper.adapter(feats)
 
 
-def _text_only_context(
-    wrapper: VLMWrapper, pixel_values: torch.Tensor, input_ids: torch.Tensor
-) -> ModalityContext:
-    """Keep the encoder and adapter in the forward and backward of a batch with no images.
+def _encode_and_adapt(wrapper: VLMWrapper, images: torch.Tensor) -> torch.Tensor:
+    """Run the vision encoder and adapter over ``(N, 3, H, W)``."""
+    return _adapt(wrapper, wrapper.vision_encoder(images))
 
-    Their FSDP2 all-gathers and reduce-scatters are collectives over every
-    rank, so a rank whose batch is all text runs them on one blank image and
-    writes nothing: the result enters the graph as an empty ``(0, dim)``
-    inline embedding with zero weight.
+
+def _is_sharded(module: nn.Module) -> bool:
+    """Whether FSDP2 wraps ``module`` or a submodule, so its forward runs collectives."""
+    return any(isinstance(m, FSDPModule) for m in module.modules())
+
+
+def _check_image_tokens(k: int, image_tokens: int | None) -> None:
+    if image_tokens is not None and k != image_tokens:
+        raise ValueError(
+            f"the adapter emits {k} tokens per image but the batch was packed with "
+            f"image_tokens={image_tokens}; set vision_encoder.num_tokens to match the encoder"
+        )
+
+
+def _text_only_context(
+    wrapper: VLMWrapper,
+    pixel_values: torch.Tensor,
+    input_ids: torch.Tensor,
+    image_tokens: int | None,
+) -> ModalityContext:
+    """The inline context of a batch with no images, keeping sharded modules in step.
+
+    FSDP2's all-gathers and reduce-scatters are collectives over every rank,
+    so a sharded encoder or adapter runs here on one blank image and writes
+    nothing: the result enters the graph as an empty ``(0, dim)`` inline
+    embedding with zero weight. A frozen, replicated encoder is skipped and
+    the adapter sees zero features; with nothing sharded the batch is plain
+    packed text.
     """
+    encoder = wrapper.vision_encoder
+    encoder_sharded = _is_sharded(encoder)
+    if not encoder_sharded and not _is_sharded(wrapper.adapter):
+        _check_image_tokens(wrapper.adapter.output_num_tokens(encoder.num_tokens), image_tokens)
+        return ModalityContext()
     blank = pixel_values.new_zeros((1, *pixel_values.shape[1:]))
-    embeds = _encode_and_adapt(wrapper, blank)
+    if encoder_sharded:
+        feats = encoder(blank)
+    else:
+        feats = blank.new_zeros((1, encoder.num_tokens, encoder.feature_dim))
+    embeds = _adapt(wrapper, feats)
+    _check_image_tokens(embeds.shape[1], image_tokens)
     anchor = (embeds.sum() * 0).expand(0, embeds.shape[-1])
     empty = torch.zeros(0, dtype=torch.long, device=input_ids.device)
     return ModalityContext(inline_embeds=anchor, inline_rows=empty, inline_positions=empty)
@@ -131,14 +164,10 @@ def _inline_image_context(
             f"{tuple(image_rows.shape)} and {tuple(image_starts.shape)}"
         )
     if pixel_values.shape[0] == 0:
-        return _text_only_context(wrapper, pixel_values, input_ids)
+        return _text_only_context(wrapper, pixel_values, input_ids, image_tokens)
     embeds = _encode_and_adapt(wrapper, pixel_values)
     n, k, dim = embeds.shape
-    if image_tokens is not None and k != image_tokens:
-        raise ValueError(
-            f"the packer laid out {image_tokens} tokens per image but the adapter produces "
-            f"{k}; set the packer's tokens_per_image to the adapter's output count"
-        )
+    _check_image_tokens(k, image_tokens)
     offsets = torch.arange(k, device=input_ids.device)
     positions = (image_starts.to(input_ids.device).unsqueeze(1) + offsets).reshape(-1)
     rows = image_rows.to(input_ids.device).repeat_interleave(k)

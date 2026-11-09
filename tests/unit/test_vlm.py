@@ -25,6 +25,7 @@ from kempnerforge.config.vlm import (
     VLMConfig,
 )
 from kempnerforge.data.vlm_dataset import MultiImageVLMCollator, VLMCollator, pack_vlm_samples
+from kempnerforge.model import vlm as vlm_module
 from kempnerforge.model.modality import ModalityContext
 from kempnerforge.model.transformer import Transformer
 from kempnerforge.model.vlm import (
@@ -404,18 +405,52 @@ class TestPackedForward:
             plain = wrapper.transformer(tokens=batch["input_ids"], doc_ids=batch["doc_ids"])
         assert torch.allclose(packed, plain, atol=1e-5)
 
-    def test_a_text_only_batch_keeps_the_encoder_and_adapter_in_the_graph(self):
-        """Their parameters get (zero) gradients, so FSDP2's collectives run on every rank."""
-        wrapper = _build_tiny_wrapper(num_image_tokens=8)
-        batch = pack_vlm_samples(
-            [_packed_doc(10, 3, images=0)], seq_len=32, tokens_per_image=8, pad_id=0
+    @staticmethod
+    def _text_only_batch(tokens_per_image: int = 8):
+        return pack_vlm_samples(
+            [_packed_doc(10, 3, images=0)], seq_len=32, tokens_per_image=tokens_per_image, pad_id=0
         )
-        logits, _ = self._forward(wrapper, batch)
+
+    def test_a_text_only_batch_keeps_sharded_modules_in_the_graph(self, monkeypatch):
+        """Their parameters get (zero) gradients, so FSDP2's collectives run on every rank."""
+        monkeypatch.setattr(vlm_module, "_is_sharded", lambda module: True)
+        wrapper = _build_tiny_wrapper(num_image_tokens=8)
+        logits, _ = self._forward(wrapper, self._text_only_batch())
         logits.sum().backward()
         adapter_grads = [p.grad for p in wrapper.adapter.parameters()]
         assert all(g is not None for g in adapter_grads)
         assert all(torch.count_nonzero(g) == 0 for g in adapter_grads)
         assert all(p.grad is not None for p in wrapper.transformer.token_embedding.parameters())
+
+    def test_a_replicated_encoder_is_skipped_and_a_sharded_adapter_still_runs(self, monkeypatch):
+        wrapper = _build_tiny_wrapper(num_image_tokens=8)
+        monkeypatch.setattr(vlm_module, "_is_sharded", lambda module: module is wrapper.adapter)
+        calls: list[int] = []
+        encoder_forward = wrapper.vision_encoder.forward
+        monkeypatch.setattr(
+            wrapper.vision_encoder,
+            "forward",
+            lambda *a, **k: calls.append(1) or encoder_forward(*a, **k),
+        )
+        logits, _ = self._forward(wrapper, self._text_only_batch())
+        logits.sum().backward()
+        assert calls == []
+        assert all(p.grad is not None for p in wrapper.adapter.parameters())
+
+    def test_with_nothing_sharded_a_text_only_batch_skips_the_encoder_and_adapter(self):
+        wrapper = _build_tiny_wrapper(num_image_tokens=8)
+        logits, _ = self._forward(wrapper, self._text_only_batch())
+        logits.sum().backward()
+        assert all(p.grad is None for p in wrapper.adapter.parameters())
+        assert all(p.grad is None for p in wrapper.vision_encoder.parameters())
+        assert all(p.grad is not None for p in wrapper.transformer.token_embedding.parameters())
+
+    @pytest.mark.parametrize("sharded", [False, True])
+    def test_a_text_only_batch_still_checks_the_image_token_count(self, monkeypatch, sharded):
+        monkeypatch.setattr(vlm_module, "_is_sharded", lambda module: sharded)
+        wrapper = _build_tiny_wrapper(num_image_tokens=8)
+        with pytest.raises(ValueError, match="emits 8 tokens per image but .* image_tokens=4"):
+            self._forward(wrapper, self._text_only_batch(tokens_per_image=4))
 
     def test_text_and_image_documents_share_a_batch(self):
         wrapper = _build_tiny_wrapper(num_image_tokens=8).eval()
@@ -441,7 +476,7 @@ class TestPackedForward:
     def test_wrong_token_count_raises(self):
         wrapper = _build_tiny_wrapper(num_image_tokens=8)
         batch = pack_vlm_samples([_packed_doc(10, 9)], seq_len=32, tokens_per_image=4, pad_id=0)
-        with pytest.raises(ValueError, match="laid out 4 tokens per image but the adapter"):
+        with pytest.raises(ValueError, match="emits 8 tokens per image but .* image_tokens=4"):
             self._forward(wrapper, batch)
 
     def test_placement_needs_both_tensors_and_no_frame_mask(self):
@@ -537,7 +572,7 @@ class TestTextOnlyPrefixRows:
     def test_the_text_logits_ignore_the_blank_image(self):
         torch.manual_seed(0)
         wrapper = _build_tiny_wrapper(num_image_tokens=8).eval()
-        collator = VLMCollator(pad_id=0, max_text_len=12)
+        collator = VLMCollator(pad_id=0, max_text_len=12, allow_text_only=True)
         text_only = {
             "pixel_values": torch.zeros(0, 3, 16, 16),
             "input_ids": torch.arange(1, 13),

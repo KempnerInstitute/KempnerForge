@@ -120,6 +120,12 @@ class JobConfig:
                 )
             if self.video is not None:
                 raise ValueError("data.hf_allow_text_only applies to image datasets, not [video]")
+            if self.vlm.arch == "cross_attention":
+                raise ValueError(
+                    "data.hf_allow_text_only is not supported with vlm.arch='cross_attention': "
+                    "its image K/V has no way to hide a document's blank image, so the text "
+                    "would attend to it; use an image-prefix arch or packing"
+                )
         if self.data.hf_max_images != 1:
             if self.vlm is None or self.video is not None:
                 raise ValueError(
@@ -129,11 +135,6 @@ class JobConfig:
                 raise ValueError(
                     "data.hf_max_images != 1 requires vlm.arch='joint_decoder' (got "
                     f"{self.vlm.arch!r}); only its inline route places several images per document"
-                )
-            if self.data.hf_max_images == 0 and not self.data.pack_sequences:
-                raise ValueError(
-                    "data.hf_max_images = 0 (no cap) needs data.pack_sequences, which bounds a "
-                    "document by train.seq_len; set a cap for fixed rows"
                 )
         if self.data.pack_sequences and self.vlm is not None:
             if self.video is not None:
@@ -153,10 +154,10 @@ class JobConfig:
 
     @property
     def images_per_document(self) -> int:
-        """Encoder inputs in one sample's residual budget: a clip's frames, else the image cap."""
+        """Encoder inputs one sample may hold, sizing the image budget: a clip's frames or the image cap."""
         if self.video is not None:
             return self.video.max_frames
-        return max(self.data.hf_max_images, 1)
+        return self.data.hf_max_images
 
     @property
     def is_vlm(self) -> bool:

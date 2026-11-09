@@ -786,6 +786,17 @@ class TestJobConfig:
                 video=VideoConfig(data_root="/x"),
                 **kwargs,
             )
+        with pytest.raises(ValueError, match="not supported with vlm.arch='cross_attention'"):
+            JobConfig(
+                vlm=VLMConfig.for_arch("cross_attention", max_text_len=64),
+                data=DataConfig(hf_allow_text_only=True),
+                **kwargs,
+            )
+        JobConfig(
+            vlm=VLMConfig.for_arch("mot", max_text_len=64),
+            data=DataConfig(hf_allow_text_only=True),
+            **kwargs,
+        )
 
     def test_several_images_per_document_rules(self):
         kwargs = dict(
@@ -796,7 +807,7 @@ class TestJobConfig:
         JobConfig(vlm=VLMConfig(max_text_len=64), data=DataConfig(hf_max_images=2), **kwargs)
         JobConfig(
             vlm=VLMConfig(max_text_len=64),
-            data=DataConfig(hf_max_images=0, pack_sequences=True),
+            data=DataConfig(hf_max_images=3, pack_sequences=True),
             **kwargs,
         )
         with pytest.raises(ValueError, match="not text runs or"):
@@ -807,10 +818,9 @@ class TestJobConfig:
                 data=DataConfig(hf_max_images=2),
                 **kwargs,
             )
-        with pytest.raises(ValueError, match="needs data.pack_sequences"):
-            JobConfig(vlm=VLMConfig(max_text_len=64), data=DataConfig(hf_max_images=0), **kwargs)
-        with pytest.raises(ValueError, match="hf_max_images must be >= 0"):
-            DataConfig(hf_max_images=-1)
+        for cap in (0, -1):
+            with pytest.raises(ValueError, match="hf_max_images must be >= 1"):
+                DataConfig(hf_max_images=cap)
 
     def test_the_image_cap_counts_against_the_context(self):
         """Three images of 16 tokens plus 64 text tokens is 112, over a context of 100."""
