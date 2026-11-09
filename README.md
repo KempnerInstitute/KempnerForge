@@ -17,7 +17,7 @@ PyTorch-native framework for fault-tolerant distributed training of foundation m
 ## AI / NeuroAI use cases
 
 - **Scaling law experiments**: train the same architecture at different sizes by changing `dim`, `n_layers` and the head counts in a TOML config; the training presets in `configs/train/` range from a 20M-parameter debug model to 70B. FSDP, tensor, expert, and pipeline parallelism are set in the same config.
-- **Mechanistic interpretability**: activation extraction hooks at any layer with CPU offload; attention weight capture exposes raw QK^T matrices.
+- **Mechanistic interpretability**: activation extraction hooks at any layer with CPU offload; attention weight capture records each head's softmax(QK^T/√d) matrix.
 - **Sparse architecture research**: switch between dense and MoE by setting `num_experts` (0 for dense, >0 for MoE). Softmax top-k or DeepSeek-V3 sigmoid routing, shared experts, fine-grained experts, configurable MoE frequency.
 - **Optimizer and scheduler comparison**: 4 optimizers (AdamW, Muon, Lion, Schedule-Free AdamW) × 6 LR schedulers, composable via config. Data annealing phases for curriculum learning.
 - **Long-running jobs on shared clusters**: SLURM preemption handling, async DCP checkpointing, auto-resume, NaN detection, GPU/NCCL health monitoring.

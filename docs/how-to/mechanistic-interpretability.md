@@ -165,6 +165,38 @@ assert all(store.get(n) is not None for n in store.layer_names), \
     "Some layer's forward returns a non-tensor — wrap it or target a child module."
 ```
 
+## Attention weights
+
+`ActivationStore` sees module outputs, and SDPA never returns its
+attention weights. Each
+[`Attention`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/model/attention.py)
+module computes them itself when its `capture_attention_weights` flag
+is set: it runs an eager `softmax(Q·Kᵀ / √d)` path instead of SDPA and
+keeps the weights of its last forward, on CPU, in
+`last_attention_weights`, shaped `(batch, n_heads, seq_q, seq_k)`.
+There is no config field for it; set the flag on each layer you want:
+
+```python
+for layer in model.layers.values():
+    layer.attention.capture_attention_weights = True
+
+with torch.no_grad():
+    model(input_ids)
+
+weights = {
+    name: layer.attention.last_attention_weights
+    for name, layer in model.layers.items()
+}
+```
+
+The eager path is slower than SDPA and holds every head's `seq × seq`
+matrix, so turn it on for analysis, not for training. It applies the
+same masks as SDPA, packed documents included. With
+`model.attention_backend = "flex"`, a forward that builds a
+FlexAttention block mask (packed documents or attention groups) raises
+`NotImplementedError`, because the fused kernel never forms the weight
+matrix.
+
 ## Performance and memory
 
 Activation extraction is expensive. A 7B model at `seq_len=4096`,
@@ -229,10 +261,9 @@ common next steps:
 **Output only.** The hook uses `register_forward_hook`, which captures
 a module's *output*. You cannot:
 
-- Capture attention weights (they're internal to SDPA; not exposed as
-  a module output). You'd need to rewrite
-  [`Attention.forward`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/model/attention.py)
-  to return them, or swap SDPA for an eager implementation.
+- Capture attention weights through `ActivationStore`: they are
+  internal to SDPA, not a module output. Set the attention module's own
+  flag instead; see [Attention weights](#attention-weights).
 - Capture gradients or activations during the backward pass — no
   `register_full_backward_hook` wrapper is provided. If you need
   gradient-based analysis (integrated gradients, attribution methods),
