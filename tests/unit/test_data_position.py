@@ -303,6 +303,34 @@ def test_warm_start_carries_a_global_position_over(tmp_path):
     assert [order[i] for i in next(iter(loader)).tolist()] == [161, 163, 165, 167]
 
 
+@pytest.mark.parametrize("warm_start", [True, False], ids=["warm_start", "resume"])
+def test_a_loader_passed_to_load_follows_the_same_rule(tmp_path, caplog, monkeypatch, warm_start):
+    """``load(dataloader=...)`` restores the position at once, under the same rule.
+
+    A position that cannot carry over starts the data fresh with a warning on a warm
+    start and raises on a resume, as it does through ``apply_dataloader_state``.
+    """
+    from kempnerforge.checkpoint.manager import CheckpointManager
+    from kempnerforge.config.checkpoint import CheckpointConfig
+
+    monkeypatch.setattr(logging.getLogger("kempnerforge"), "propagate", True)
+    _save_loader_state(tmp_path / "saved", _legacy_state(1, 100))
+    model = torch.nn.Linear(2, 2)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    manager = CheckpointManager(CheckpointConfig(dir=str(tmp_path / "new_run")), model, optimizer)
+    path = str(tmp_path / "saved" / "step_3")
+    loader = _loader(_Indices(4_096), 2, 0, 4)
+    if not warm_start:
+        with pytest.raises(DataPositionError, match="predates the saved batch size"):
+            manager.load(path=path, dataloader=loader)
+        return
+    with caplog.at_level(logging.WARNING, logger="kempnerforge.checkpoint.manager"):
+        assert manager.load(path=path, dataloader=loader, warm_start=True)[0] == 3
+    assert "starts at its first sample" in caplog.text
+    fresh = _loader(_Indices(4_096), 2, 0, 4)
+    assert next(iter(loader)).tolist() == next(iter(fresh)).tolist()
+
+
 def test_auto_resume_refuses_a_position_that_cannot_carry_over(tmp_path):
     _save_loader_state(tmp_path / "saved", _legacy_state(1, 100))
     manager = _restore(tmp_path, warm_start=False)

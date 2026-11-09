@@ -900,9 +900,10 @@ class CheckpointManager:
                 the load proceeds with a warning.
             warm_start: True when this load starts a new run from another
                 run's checkpoint (``checkpoint.load_path``) rather than
-                resuming this one. A data position that ``apply_dataloader_state``
-                cannot carry over to this run's loader then starts the data at
-                its first sample with a warning, instead of raising.
+                resuming this one. A data position that cannot carry over to
+                this run's loader, passed here as ``dataloader`` or later to
+                ``apply_dataloader_state``, then starts the data at its first
+                sample with a warning, instead of raising ``DataPositionError``.
 
         Returns:
             Tuple of (step, tokens_seen, extra) where extra contains any
@@ -1052,9 +1053,12 @@ class CheckpointManager:
             if dataloader is None and "dataloader" in train_state:
                 self._pending_dataloader_state = train_state["dataloader"]
                 self._pending_dataloader_warm_start = warm_start
-            self._pending_dataloader_missing = (
-                dataloader is None and "dataloader" not in train_state
-            )
+            self._pending_dataloader_missing = "dataloader" not in train_state
+            if dataloader is not None:
+                if "dataloader" in train_state:
+                    self._pending_dataloader_state = train_state.pop("dataloader")
+                    self._pending_dataloader_warm_start = warm_start
+                self.apply_dataloader_state(dataloader)
             step, tokens_seen, extra = restore_train_state(
                 train_state,
                 scheduler=scheduler,
