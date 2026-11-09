@@ -174,6 +174,7 @@ class TestAttention:
     def test_sdpa_backend_defaults_to_auto(self):
         attn = Attention(dim=128, n_heads=4, n_kv_heads=4)
         assert attn.sdpa_backend == "auto"
+        assert attn._sdpa_backends() == attn._sdpa_backends(appended=True) == []
 
     def test_sdpa_backend_stored_on_module(self):
         attn = Attention(dim=128, n_heads=4, n_kv_heads=4, sdpa_backend="math")
@@ -216,6 +217,7 @@ class TestAttention:
             for wrong in (square, whole):
                 with pytest.raises(ValueError, match="does not compose with a non-empty kv_cache"):
                     attn(x, cos[4:7], sin[4:7], kv_cache=cache, attn_mask=wrong)
+                assert cache.seq_len == 4
 
     @pytest.mark.parametrize("capture", [False, True])
     def test_a_layer_on_its_own_appends_tokens_under_a_pinned_kernel(self, capture):

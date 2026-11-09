@@ -110,7 +110,7 @@ class Attention(nn.Module):
         self.last_attention_weights: torch.Tensor | None = None
 
     def _sdpa_backends(self, *, appended: bool = False) -> list[SDPBackend]:
-        """Return the SDPA backends enabled for one call under a pinned ``sdpa_backend``.
+        """Return the SDPA backends enabled for one call; empty under ``sdpa_backend="auto"``.
 
         The flash and cudnn kernels reject a dense mask. ``appended=True`` is
         the decode-time call that attends several appended tokens to a
@@ -121,6 +121,8 @@ class Attention(nn.Module):
         fails loudly as before, so a job never runs on a slower kernel
         unannounced.
         """
+        if self.sdpa_backend == "auto":
+            return []
         backends = [_SDPA_BACKENDS[self.sdpa_backend]]
         if appended and self.sdpa_backend in _MASK_FALLBACK_BACKENDS:
             backends += [SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
@@ -178,7 +180,8 @@ class Attention(nn.Module):
                 lower-right causal mask ``Transformer.forward`` builds once
                 from ``appended_causal_mask`` when several tokens are appended
                 to a non-empty cache, (seq_len, past + seq_len); a layer
-                called on its own without it derives the same mask.
+                called on its own without it derives the same mask before
+                the cache is written.
 
         Returns:
             Output tensor of shape (batch, seq_len, dim).
@@ -212,24 +215,25 @@ class Attention(nn.Module):
         k = apply_rope(k, rope_cos, rope_sin)
 
         past = kv_cache.seq_len if kv_cache is not None else 0
+        if (
+            isinstance(attn_mask, torch.Tensor)
+            and past > 0
+            and tuple(attn_mask.shape[-2:]) != (seq_len, past + seq_len)
+        ):
+            raise ValueError(
+                f"attn_mask covers {tuple(attn_mask.shape[-2:])} (queries, keys) but this "
+                f"forward appends {seq_len} queries to a cache holding {past} keys; a "
+                "visibility mask is square over the residual and does not compose with a "
+                "non-empty kv_cache"
+            )
+        if attn_mask is None and past > 0 and seq_len > 1:
+            attn_mask = appended_causal_mask(seq_len, past, q.device)
         if kv_cache is not None:
             k, v = kv_cache.update(k, v)
 
         if self.n_rep > 1 and not isinstance(attn_mask, BlockMask):
             k = k.repeat_interleave(self.n_rep, dim=1)
             v = v.repeat_interleave(self.n_rep, dim=1)
-
-        if (
-            isinstance(attn_mask, torch.Tensor)
-            and past > 0
-            and tuple(attn_mask.shape[-2:]) != (seq_len, k.shape[2])
-        ):
-            raise ValueError(
-                f"attn_mask covers {tuple(attn_mask.shape[-2:])} (queries, keys) but this "
-                f"forward appends {seq_len} queries to a cache holding {k.shape[2]} keys; a "
-                "visibility mask is square over the residual and does not compose with a "
-                "non-empty kv_cache"
-            )
 
         if isinstance(attn_mask, BlockMask):
             assert kv_cache is None, (
@@ -245,22 +249,17 @@ class Attention(nn.Module):
                 enable_gqa=self.n_rep > 1,
             )
         elif self.capture_attention_weights:
-            out, attn_weights = self._attention_with_weights(q, k, v, past, attn_mask)
+            out, attn_weights = self._attention_with_weights(q, k, v, attn_mask)
             self.last_attention_weights = attn_weights.detach().cpu()
         elif attn_mask is not None:
             with self._sdpa_context(appended=past > 0):
                 out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        elif past == 0:
+            with self._sdpa_context():
+                out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         else:
-            if past == 0:
-                with self._sdpa_context():
-                    out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-            elif seq_len == 1:
-                with self._sdpa_context():
-                    out = F.scaled_dot_product_attention(q, k, v)
-            else:
-                visible = appended_causal_mask(seq_len, past, q.device)
-                with self._sdpa_context(appended=True):
-                    out = F.scaled_dot_product_attention(q, k, v, attn_mask=visible)
+            with self._sdpa_context():
+                out = F.scaled_dot_product_attention(q, k, v)
 
         out = out.transpose(1, 2).contiguous().view(batch, seq_len, -1)
 
@@ -271,7 +270,6 @@ class Attention(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        past: int,
         attn_mask: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute attention output and weights manually (for analysis).
@@ -284,9 +282,9 @@ class Attention(nn.Module):
             q: Queries, shape (batch, n_heads, seq_len, head_dim).
             k: Keys, shape (batch, n_heads, seq_k, head_dim).
             v: Values, shape (batch, n_heads, seq_k, head_dim).
-            past: Number of cached keys the queries are appended after.
-            attn_mask: Dense bool mask where ``True`` = attend, or ``None`` for
-                causal attention over the keys, cached ones included.
+            attn_mask: Dense bool mask where ``True`` = attend, or ``None``:
+                causal attention when the keys are the queries, and attention
+                to every key for a single query appended to a cache.
 
         Returns:
             Tuple of (output, attention_weights).
@@ -299,7 +297,7 @@ class Attention(nn.Module):
         if attn_mask is not None:
             attn = attn.masked_fill(~attn_mask, float("-inf"))
         elif q.shape[2] > 1:
-            visible = appended_causal_mask(q.shape[2], past, q.device)
+            visible = torch.ones(attn.shape[-2:], dtype=torch.bool, device=q.device).tril()
             attn = attn.masked_fill(~visible, float("-inf"))
 
         attn_weights = F.softmax(attn, dim=-1)
