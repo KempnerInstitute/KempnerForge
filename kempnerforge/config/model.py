@@ -195,22 +195,33 @@ class ModelConfig:
         return max(16, 16 * round(raw / 16))
 
     @property
+    def mlp_matrices(self) -> int:
+        """Weight matrices in each MLP the model builds, dense layers and experts alike.
+
+        Three for ``silu``, which builds SwiGLU (gate, up and down projections), and two
+        for ``gelu`` and ``relu``, which build the standard MLP (up and down). An MLP a
+        plugin registered under another name is counted as three.
+        """
+        return 2 if self.activation in (Activation.gelu, Activation.relu) else 3
+
+    @property
     def num_params_estimate(self) -> int:
         """Rough total parameter count estimate (excluding embedding if tied).
 
-        For MoE models, counts all expert parameters (total, not active).
+        For MoE models, counts all expert parameters (total, not active). Each MLP
+        counts ``mlp_matrices`` weight matrices.
         """
         d = self.dim
         h = self.computed_ffn_hidden_dim
         n_kv = self.n_kv_heads
         head_d = self.head_dim
         attn = d * (self.n_heads * head_d) + 2 * d * (n_kv * head_d) + (self.n_heads * head_d) * d  # type: ignore[reportOptionalOperand]
-        mlp = d * h + d * h + h * d
+        mlp = self.mlp_matrices * d * h
         norm = 2 * d
 
         if self.is_moe:
             he = self.computed_expert_ffn_hidden_dim
-            expert_mlp = d * he + d * he + he * d
+            expert_mlp = self.mlp_matrices * d * he
             n_moe = sum(1 for i in range(self.n_layers) if (i + 1) % self.moe_frequency == 0)
             n_dense = self.n_layers - n_moe
             router = d * self.num_experts

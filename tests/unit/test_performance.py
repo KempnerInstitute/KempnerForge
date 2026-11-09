@@ -195,6 +195,46 @@ class TestMFUMoEExperts:
         )
 
 
+class TestEstimatesCountTheBuiltMLP:
+    """Both estimates count the MLP matrices the model builds: three for SwiGLU
+    (``silu``) and two for the standard MLP (``gelu``, ``relu``), in dense layers
+    and in routed and shared experts alike."""
+
+    @staticmethod
+    def _config(activation: str, moe: bool) -> ModelConfig:
+        experts = {"num_experts": 4, "moe_top_k": 2, "moe_shared_experts": 1} if moe else {}
+        return ModelConfig(
+            dim=64,
+            n_layers=2,
+            n_heads=4,
+            vocab_size=256,
+            max_seq_len=64,
+            activation=activation,
+            **experts,
+        )
+
+    @pytest.mark.parametrize("moe", [False, True])
+    @pytest.mark.parametrize("activation,matrices", [("silu", 3), ("gelu", 2), ("relu", 2)])
+    def test_mlp_matrices_follow_the_activation(self, activation, matrices, moe):
+        assert self._config(activation, moe).mlp_matrices == matrices
+
+    @pytest.mark.parametrize("moe", [False, True])
+    @pytest.mark.parametrize("activation", ["silu", "gelu", "relu"])
+    def test_num_params_estimate_matches_the_built_model(self, activation, moe):
+        config = self._config(activation, moe)
+        model = Transformer(config)
+        assert sum(p.numel() for p in model.parameters()) == config.num_params_estimate
+
+    @pytest.mark.parametrize("moe", [False, True])
+    @pytest.mark.parametrize("activation", ["silu", "gelu", "relu"])
+    def test_flops_match_the_built_model(self, activation, moe):
+        config = self._config(activation, moe)
+        model = Transformer(config)
+        assert estimate_model_flops_per_token(config, seq_len=64) == _built_flops_per_token(
+            model, 64
+        )
+
+
 class TestMFUDecoupledHeadDim:
     """The attention term scales with the attention width ``n_heads * head_dim``,
     which equals ``dim`` only while the head width is inferred."""

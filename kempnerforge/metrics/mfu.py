@@ -90,6 +90,7 @@ def estimate_model_flops_per_token(config: ModelConfig, seq_len: int | None = No
     The 12*L*D*S attention term does not discount GQA — FlashAttention expands
     GQA internally, so the hardware performs full attention compute.
     Router FLOPS (dim × num_experts) are intentionally omitted — negligible.
+    Each MLP, dense or expert, counts ``config.mlp_matrices`` weight matrices.
 
     Args:
         config: Model configuration.
@@ -113,7 +114,7 @@ def _dense_flops_per_token(config: ModelConfig, seq_len: int) -> int:
         + 2 * config.dim * (config.n_kv_heads * head_dim)  # type: ignore[reportOptionalOperand]
         + attn_dim * config.dim
     )
-    mlp_params = 3 * config.dim * config.computed_ffn_hidden_dim
+    mlp_params = config.mlp_matrices * config.dim * config.computed_ffn_hidden_dim
     per_layer = attn_params + mlp_params
     output_params = config.vocab_size * config.dim
     active_params = config.n_layers * per_layer + output_params
@@ -128,8 +129,8 @@ def _moe_flops_per_token(config: ModelConfig, seq_len: int) -> int:
         + 2 * config.dim * (config.n_kv_heads * head_dim)  # type: ignore[reportOptionalOperand]
         + attn_dim * config.dim
     )
-    mlp_params = 3 * config.dim * config.computed_ffn_hidden_dim
-    expert_mlp_params = 3 * config.dim * config.computed_expert_ffn_hidden_dim
+    mlp_params = config.mlp_matrices * config.dim * config.computed_ffn_hidden_dim
+    expert_mlp_params = config.mlp_matrices * config.dim * config.computed_expert_ffn_hidden_dim
 
     n_moe_layers = sum(1 for i in range(config.n_layers) if (i + 1) % config.moe_frequency == 0)
     n_dense_layers = config.n_layers - n_moe_layers
