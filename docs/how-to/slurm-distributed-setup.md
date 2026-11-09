@@ -68,7 +68,7 @@ codebase:
 #SBATCH --nodes=2
 #SBATCH --ntasks-per-node=4      # ← must match gpus-per-node
 #SBATCH --gpus-per-node=4
-#SBATCH --signal=B:SIGTERM@120   # SLURM sends SIGTERM 120s before time-limit
+#SBATCH --signal=SIGTERM@120     # SIGTERM to the srun ranks before the time limit
 #SBATCH --requeue                # auto-resubmit on preemption
 ```
 
@@ -128,23 +128,29 @@ The full mechanics live in
 [Resilience § SLURM preemption](../resilience/slurm-preemption.md);
 the short version:
 
-- `#SBATCH --signal=B:SIGTERM@120` tells SLURM: "send SIGTERM 120
-  seconds before the wallclock time limit, to rank 0 (`B:` = batch
-  script process)."
+- `#SBATCH --signal=SIGTERM@120` tells SLURM to send `SIGTERM` to every
+  job step, that is, to every `srun`-launched rank, 120 to 180 seconds
+  before the time limit. The batch shell is not signaled. `singlenode.sh`
+  has no job step, so it keeps `--signal=B:SIGTERM@120` (batch shell only)
+  and forwards the signal to `torchrun` from a `trap`; see
+  [Resilience § SLURM preemption](../resilience/slurm-preemption.md#slurm-side).
 - The training loop's
   [`ShutdownHandler`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/resilience/signal_handler.py)
   catches SIGTERM, flips `should_shutdown()` to `True`, and the step
   loop writes an emergency DCP checkpoint before exiting cleanly.
-- `#SBATCH --requeue` puts the job back in the queue. When it starts
+- `#SBATCH --requeue` puts a preempted job back in the queue. When it starts
   again, `CheckpointManager` follows the `latest` symlink in
   `checkpoint.dir` and resumes at the exact step / sample.
 
-The 120-second window is a design parameter: emergency checkpoints
-must finish within it or the job is SIGKILL'd. Async DCP save times
-depend on model size, FSDP degree, and filesystem — measure on your
-cluster with `checkpoint.async_mode = "async"` and a test run before
-trusting the default for 70B+. If your save consistently overruns,
-raise `#SBATCH --signal=B:SIGTERM@<seconds>` accordingly.
+The 120-second window is a design parameter: the step in flight and the
+emergency checkpoint must finish within it, or SLURM kills the ranks at
+the time limit (`SIGTERM`, then `SIGKILL` after `KillWait`). Async DCP
+save times depend on model size, FSDP degree, and filesystem, so measure
+them on your cluster with `checkpoint.async_mode = "async"` and a test run
+before trusting the default for 70B+. If your save consistently overruns,
+raise `#SBATCH --signal=SIGTERM@<seconds>` accordingly. Under
+`singlenode.sh`, `torchrun` gives its workers 30 seconds after the signal,
+whatever the lead.
 
 ## Auto-resume in practice
 
@@ -165,8 +171,9 @@ Restart cnt:  2
 
 If you see rising restart counts but training never crosses step
 `eval_interval`, something is preempting the job faster than it can
-checkpoint — raise the `#SBATCH --signal` window or drop
-`checkpoint.interval`.
+checkpoint. Lower `checkpoint.interval`: a preempted job gets no
+`--signal` lead on a partition without a preemption grace time, so the
+periodic checkpoints are what it resumes from.
 
 ## Checking the launch worked
 
