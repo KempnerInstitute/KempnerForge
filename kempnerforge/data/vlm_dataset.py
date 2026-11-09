@@ -295,9 +295,7 @@ def _images_per_row(rows: Any, image_field: str) -> np.ndarray:
     return np.concatenate(counts)
 
 
-def _check_image_counts(
-    rows: Any, image_field: str, allow_text_only: bool, max_images: int
-) -> int:
+def _check_image_counts(rows: Any, image_field: str, allow_text_only: bool, max_images: int) -> int:
     """Check every row's image count against the dataset's settings before training.
 
     Returns the number of rows without an image.
