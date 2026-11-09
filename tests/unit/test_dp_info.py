@@ -323,17 +323,27 @@ def _check_loop_reduces_losses(rank: int, world: int, port: int) -> None:
         dist.destroy_process_group()
 
 
-def _check_source_metrics(rank: int, world: int, port: int) -> None:
-    """Each rank draws a different mix of two sources; every rank logs the global split."""
+MESHES_OF_TWO = {
+    "dp_shard2": (("dp_shard",), (2,)),
+    "dp_shard1_tp2": (("dp_shard", "tp"), (1, 2)),
+}
+
+
+def _check_source_metrics(rank: int, world: int, port: int, names: tuple, sizes: tuple) -> None:
+    """Each DP rank draws its own mix of two sources; every rank logs the split over them.
+
+    Ranks that share a DP rank, as TP peers do, hold the same batch and count it once.
+    """
     from kempnerforge.training.data_pipeline import PhaseState
     from kempnerforge.training.loop import run_training_loop
     from tests.unit.test_train_entry import VOCAB, _mixture_pipeline, make_config, make_session
 
     _init(rank, world, port)
     try:
-        mesh = init_device_mesh("cpu", (world,), mesh_dim_names=("dp_shard",))
-        generator = torch.Generator().manual_seed(20 + rank)
-        sources = [torch.tensor([0, 1, 1, 1]), torch.tensor([0, 0, 0, 1])][rank]
+        mesh = init_device_mesh("cpu", sizes, mesh_dim_names=names)
+        dp_rank, _ = get_dp_info(mesh)
+        generator = torch.Generator().manual_seed(20 + dp_rank)
+        sources = [torch.tensor([0, 1, 1, 1]), torch.tensor([0, 0, 0, 1])][dp_rank]
         batch = {
             "input_ids": torch.randint(0, VOCAB, (4, 4), generator=generator),
             "labels": torch.randint(0, VOCAB, (4, 4), generator=generator),
@@ -366,23 +376,31 @@ def _check_source_metrics(rank: int, world: int, port: int) -> None:
         run_training_loop(session)
 
         everyone: list = [None] * world
-        dist.all_gather_object(everyone, (own, int(rows.sum()) * 4))
-        expected = sum(e[0] for e in everyone) / sum(e[1] for e in everyone)
-        assert logged["loss/a"] == pytest.approx(expected, rel=1e-6), (rank, logged, everyone)
-        assert (logged["data/a/tokens"], logged["data/b/tokens"]) == (16.0, 16.0), (rank, logged)
+        dist.all_gather_object(everyone, (dp_rank, own, int(rows.sum()) * 4))
+        per_dp_rank = {e[0]: e[1:] for e in everyone}
+        loss_sum = sum(loss for loss, _ in per_dp_rank.values())
+        a_tokens = sum(tokens for _, tokens in per_dp_rank.values())
+        b_tokens = 16 * len(per_dp_rank) - a_tokens
+        assert logged["loss/a"] == pytest.approx(loss_sum / a_tokens, rel=1e-6), (rank, logged)
+        assert (logged["data/a/tokens"], logged["data/b/tokens"]) == (a_tokens, b_tokens), (
+            rank,
+            logged,
+        )
     finally:
         dist.destroy_process_group()
 
 
-def _check_text_tokens(rank: int, world: int, port: int) -> None:
-    """Two ranks that share one DP rank, as TP peers do, count their batch once."""
+def _check_text_tokens(rank: int, world: int, port: int, names: tuple, sizes: tuple) -> None:
+    """Each rank trains 10 text tokens: two DP ranks log 20, while two ranks that share one
+    DP rank, as TP peers do, hold the same batch and log it once."""
     from kempnerforge.config.schema import AdapterConfig, VisionEncoderConfig, VLMConfig
     from kempnerforge.training.loop import StepResult, _log_periodic_metrics
     from tests.unit.test_train_entry import make_config, make_session
 
     _init(rank, world, port)
     try:
-        mesh = init_device_mesh("cpu", (1, world), mesh_dim_names=("dp_shard", "tp"))
+        mesh = init_device_mesh("cpu", sizes, mesh_dim_names=names)
+        _, dp_size = get_dp_info(mesh)
         config = JobConfig(
             model=ModelConfig(dim=64, n_layers=2, n_heads=4, vocab_size=256, max_seq_len=64),
             train=TrainConfig(batch_size=1, seq_len=64, max_steps=1),
@@ -402,7 +420,7 @@ def _check_text_tokens(rank: int, world: int, port: int) -> None:
         logged: dict = {}
         session.tracker.log_eval = lambda m, s: logged.update(m)
         _log_periodic_metrics(session, StepResult(loss=1.0, grad_norm=0.1, text_tokens=10), 1)
-        assert logged["data/text_tokens_trained"] == 10.0, (rank, logged)
+        assert logged["data/text_tokens_trained"] == 10.0 * dp_size, (rank, logged)
     finally:
         dist.destroy_process_group()
 
@@ -442,14 +460,18 @@ class TestLoggedMetricsOverDataParallel:
         rank's own loss, so rank 0's backends log the whole job's loss."""
         mp.spawn(_check_loop_reduces_losses, args=(2, _free_port()), nprocs=2)
 
-    def test_per_source_metrics_cover_every_dp_rank(self):
-        """``loss/<name>`` is token-weighted over every rank's rows of that source and
-        ``data/<name>/tokens`` sums every rank's, on every rank."""
-        mp.spawn(_check_source_metrics, args=(2, _free_port()), nprocs=2)
+    @pytest.mark.parametrize("mesh", sorted(MESHES_OF_TWO))
+    def test_per_source_metrics_cover_every_dp_rank(self, mesh):
+        """``loss/<name>`` is token-weighted over every DP rank's rows of that source and
+        ``data/<name>/tokens`` sums every DP rank's, on every rank, counting TP peers once."""
+        names, sizes = MESHES_OF_TWO[mesh]
+        mp.spawn(_check_source_metrics, args=(2, _free_port(), names, sizes), nprocs=2)
 
-    def test_vlm_text_tokens_count_each_dp_rank_once(self):
+    @pytest.mark.parametrize("mesh", sorted(MESHES_OF_TWO))
+    def test_vlm_text_tokens_count_each_dp_rank_once(self, mesh):
         """The text-token count is summed over the DP ranks, not every rank of the world."""
-        mp.spawn(_check_text_tokens, args=(2, _free_port()), nprocs=2)
+        names, sizes = MESHES_OF_TWO[mesh]
+        mp.spawn(_check_text_tokens, args=(2, _free_port(), names, sizes), nprocs=2)
 
 
 class TestDataPipelineOnHsdp:

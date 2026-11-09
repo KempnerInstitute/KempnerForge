@@ -198,11 +198,16 @@ class TestMFUMoEExperts:
 class TestEstimatesCountTheBuiltMLP:
     """Both estimates count the MLP matrices the model builds: three for SwiGLU
     (``silu``) and two for the standard MLP (``gelu``, ``relu``), in dense layers
-    and in routed and shared experts alike."""
+    and in routed and shared experts alike. The MoE model alternates dense and MoE
+    layers, so its dense layers are counted too."""
 
     @staticmethod
     def _config(activation: str, moe: bool) -> ModelConfig:
-        experts = {"num_experts": 4, "moe_top_k": 2, "moe_shared_experts": 1} if moe else {}
+        experts = (
+            {"num_experts": 4, "moe_top_k": 2, "moe_shared_experts": 1, "moe_frequency": 2}
+            if moe
+            else {}
+        )
         return ModelConfig(
             dim=64,
             n_layers=2,

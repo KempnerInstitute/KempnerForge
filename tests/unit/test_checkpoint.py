@@ -581,6 +581,41 @@ class TestFlushPendingSave:
         wait_mock.assert_called_once()
 
 
+class TestHasPendingSave:
+    """``has_pending_save`` tells the training loop whether its final ``wait()`` drains
+    anything, so it times only a drain that happens."""
+
+    @staticmethod
+    def _mgr(tmp_path, mode):
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        model = torch.nn.Linear(4, 4)
+        opt = torch.optim.SGD(model.parameters(), lr=0.1)
+        return CheckpointManager(CheckpointConfig(dir=str(tmp_path), async_mode=mode), model, opt)
+
+    def test_an_async_save_is_pending_until_wait(self, tmp_path, monkeypatch):
+        from unittest.mock import MagicMock
+
+        monkeypatch.setattr(
+            "kempnerforge.checkpoint.async_save.dcp.async_save", MagicMock(return_value=MagicMock())
+        )
+        mgr = self._mgr(tmp_path, AsyncCheckpointMode.async_)
+        assert not mgr.has_pending_save
+        mgr.save(step=1)
+        assert mgr.has_pending_save
+        mgr.wait()
+        assert not mgr.has_pending_save
+        assert (tmp_path / "latest").resolve() == (tmp_path / "step_1").resolve()
+
+    def test_a_synchronous_save_leaves_nothing_pending(self, tmp_path, monkeypatch):
+        from unittest.mock import MagicMock
+
+        monkeypatch.setattr("kempnerforge.checkpoint.async_save.dcp.save", MagicMock())
+        mgr = self._mgr(tmp_path, AsyncCheckpointMode.disabled)
+        mgr.save(step=1)
+        assert not mgr.has_pending_save
+
+
 class TestSaveVLMFreezeMetadata:
     def test_save_writes_vlm_freeze_to_metadata(self, tmp_path, monkeypatch):
         import json

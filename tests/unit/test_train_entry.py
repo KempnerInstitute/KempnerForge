@@ -3344,10 +3344,13 @@ class TestPerDatasetMetrics:
 
     @staticmethod
     def _random_batch(sources: list[int], seed: int) -> dict[str, torch.Tensor]:
+        """Four rows of four tokens from ``sources``; row 0's first label is -100."""
         generator = torch.Generator().manual_seed(seed)
+        labels = torch.randint(0, VOCAB, (4, 4), generator=generator)
+        labels[0, 0] = -100
         return {
             "input_ids": torch.randint(0, VOCAB, (4, 4), generator=generator),
-            "labels": torch.randint(0, VOCAB, (4, 4), generator=generator),
+            "labels": labels,
             "dataset_idx": torch.tensor(sources),
         }
 
@@ -3366,17 +3369,29 @@ class TestPerDatasetMetrics:
         return logits, [m for m in logged if any(k.startswith("loss/") for k in m)][0]
 
     def test_the_loss_is_weighted_by_token_over_the_micro_steps(self, monkeypatch):
-        """One row of ``a`` in the first micro-step and three in the second weigh 1:3."""
+        """One row of ``a`` in the first micro-step and three in the second weigh by their
+        labeled tokens; a -100 label counts toward the positions but not the loss."""
         batches = [self._random_batch([0, 1, 1, 1], 1), self._random_batch([0, 0, 0, 1], 2)]
         logits, ds = self._logits_and_metrics(monkeypatch, batches)
         total = count = 0.0
         for out, batch in zip(logits, batches, strict=True):
             rows = batch["dataset_idx"] == 0
             labels = batch["labels"][rows].reshape(-1)
-            total += F.cross_entropy(out[rows].reshape(-1, VOCAB), labels, reduction="sum").item()
-            count += labels.numel()
+            total += F.cross_entropy(
+                out[rows].reshape(-1, VOCAB), labels, ignore_index=-100, reduction="sum"
+            ).item()
+            count += int((labels != -100).sum())
+        assert count == (1 + 3) * 4 - 2
         assert ds["loss/a"] == pytest.approx(total / count, rel=1e-6)
         assert ds["data/a/tokens"] == (1 + 3) * 4
+
+    def test_the_step_before_a_logged_one_counts_its_sources(self):
+        """``text_step`` gets the steps done so far, so step 9 is logged step 10, which the
+        default ``log_interval`` of 10 logs: it counts both the tokens and the loss."""
+        session, _ = self._mixture_session()
+        result = session.step_fn(session, 9)
+        assert result.dataset_tokens is not None
+        assert result.dataset_losses is not None
 
     def test_a_step_that_is_not_logged_counts_no_source(self, monkeypatch):
         """``text_step`` gets the steps done so far, so step 4 is logged step 5, not logged:
@@ -3533,7 +3548,8 @@ class TestLoopPeriodicWork:
 
 class TestCheckpointTiming:
     """Every save the loop makes logs ``checkpoint/save_sec`` and every drain of an
-    async save logs ``checkpoint/wait_sec``; neither is part of ``step_time``."""
+    async save logs ``checkpoint/wait_sec``; neither is part of ``step_time``, except a
+    freeze stage's flush, which runs inside its step."""
 
     @staticmethod
     def _session(monkeypatch, config, *, async_saves: bool = True, **overrides):
@@ -3607,7 +3623,8 @@ class TestCheckpointTiming:
         config.checkpoint.interval = 2
         session, logged = self._session(monkeypatch, config, async_saves=False)
         run_training_loop(session)
-        ckpt: FakeCheckpointManager = session.checkpointer  # type: ignore[assignment]
+        ckpt = session.checkpointer
+        assert isinstance(ckpt, FakeCheckpointManager)
         assert self._times(logged, "checkpoint/save_sec") == [(2, 7.0), (3, 7.0)]
         assert self._times(logged, "checkpoint/wait_sec") == []
         assert ckpt.waits == 1
