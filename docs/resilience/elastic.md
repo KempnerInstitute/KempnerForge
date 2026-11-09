@@ -1,7 +1,9 @@
-# SLURM elastic helpers
+# SLURM job helpers
 
 [`kempnerforge/resilience/elastic.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/resilience/elastic.py)
-is a small pile of SLURM-environment helpers. Most of these are
+is a small pile of SLURM-environment helpers. Despite the file name, it
+does not do elastic training: there is no rendezvous and no change of
+membership while a job runs. Most of the helpers are
 read-only introspection — they pull variables out of the environment
 and return typed data. The one with teeth is `resolve_resume_path`,
 documented on its own page; this page covers the rest.
@@ -106,9 +108,10 @@ else:
     scheduler_state = "fresh"
 ```
 
-In practice you don't need this — `setup_distributed` handles warmup
-restoration via the scheduler's own `state_dict`. The branch is useful
-for one-off behaviors (e.g. "only print config diff on first run").
+In practice you don't need this for the LR schedule: `restore_checkpoint`
+loads the scheduler's own `state_dict` from the checkpoint, warmup
+included. The branch is useful for one-off behaviors (e.g. "only print
+config diff on first run").
 
 ### Array job sharding
 

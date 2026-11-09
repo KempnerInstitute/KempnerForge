@@ -1,7 +1,9 @@
-"""Elastic training and SLURM integration helpers.
+"""SLURM job and auto-resume helpers.
 
-Provides utilities for training jobs that may be preempted, requeued,
-or restarted with a different number of nodes:
+Despite the module name, nothing here is elastic training: there is no
+rendezvous and no change of membership while a job runs. The helpers read
+the SLURM job's environment and find the checkpoint a restarted run
+resumes from:
 
 - SLURM job info detection
 - Requeue detection
