@@ -55,7 +55,10 @@ reassemble the stage boundaries. You have one of two paths:
    flatten the per-stage shards into a single HF state dict, then
    `hf-to-dcp` to re-emit a single-stage DCP checkpoint. This works
    because the HF conversion reads every `pp{i}/` subdirectory and
-   merges them.
+   merges them. The round trip keeps the weights only: the result has
+   no optimizer state and no `train_state.pt`, so a run that loads it
+   starts at step 0 with a fresh optimizer, LR schedule and data
+   position.
 2. **Keep the same `pp` on resume.** Auto-resume never changes the
    parallelism shape, so a straight restart always works.
 
