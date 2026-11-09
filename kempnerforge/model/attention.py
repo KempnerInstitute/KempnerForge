@@ -115,8 +115,9 @@ class Attention(nn.Module):
         The flash and cudnn kernels reject a dense mask. ``appended=True`` is
         the decode-time call that attends several appended tokens to a
         non-empty cache through a lower-right mask; it keeps the pinned kernel
-        first and also enables the efficient and math kernels, which the
-        dispatcher falls back to for that call instead of raising. A packed
+        first and also enables the efficient and math kernels, in that priority
+        order, which the dispatcher falls back to for that call instead of
+        raising. A packed
         training batch keeps the pinned kernel alone and fails loudly as
         before, so a job never runs on a slower kernel unannounced.
         """
@@ -133,7 +134,7 @@ class Attention(nn.Module):
         """
         if self.sdpa_backend == "auto":
             return contextlib.nullcontext()
-        return sdpa_kernel(self._sdpa_backends(appended=appended))
+        return sdpa_kernel(self._sdpa_backends(appended=appended), set_priority=True)
 
     def forward(
         self,
@@ -232,6 +233,12 @@ class Attention(nn.Module):
             out, attn_weights = self._attention_with_weights(q, k, v, seq_len, attn_mask)
             self.last_attention_weights = attn_weights.detach().cpu()
         elif attn_mask is not None:
+            if past > 0 and attn_mask.shape[-1] != k.shape[2]:
+                raise ValueError(
+                    f"attn_mask spans {attn_mask.shape[-1]} keys but the cache holds "
+                    f"{k.shape[2]}; a visibility mask is square over the residual and does "
+                    "not compose with a non-empty kv_cache"
+                )
             with self._sdpa_context(appended=past > 0):
                 out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         else:

@@ -195,6 +195,23 @@ class TestAttention:
         assert attn._sdpa_backends(appended=True) == attn._sdpa_backends()
         assert len(attn._sdpa_backends()) == 1
 
+    def test_a_visibility_mask_is_refused_with_a_non_empty_cache(self):
+        attn = Attention(dim=64, n_heads=4, n_kv_heads=2)
+        cos, sin = precompute_rope_frequencies(16, 16)
+        cache = KVCache(
+            batch_size=1,
+            max_seq_len=16,
+            n_kv_heads=2,
+            head_dim=16,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+        )
+        with torch.no_grad():
+            attn(torch.randn(1, 4, 64), cos[:4], sin[:4], kv_cache=cache)
+            square = torch.ones(1, 1, 3, 3, dtype=torch.bool)
+            with pytest.raises(ValueError, match="does not compose with a non-empty kv_cache"):
+                attn(torch.randn(1, 3, 64), cos[4:7], sin[4:7], kv_cache=cache, attn_mask=square)
+
     @pytest.mark.parametrize("capture", [False, True])
     def test_a_layer_on_its_own_appends_tokens_under_a_pinned_kernel(self, capture):
         """Without a mask from the transformer, a layer derives the lower-right one itself."""
