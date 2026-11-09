@@ -21,7 +21,12 @@ import torch.distributed as dist
 
 from kempnerforge.checkpoint.manager import CheckpointManager
 from kempnerforge.config.job import JobConfig
-from kempnerforge.distributed.utils import clip_grad_norm_
+from kempnerforge.distributed.utils import (
+    clip_grad_norm_,
+    data_parallel_groups,
+    dp_all_reduce_,
+    dp_mean,
+)
 from kempnerforge.metrics.logger import get_logger
 from kempnerforge.metrics.tracker import MetricsTracker
 from kempnerforge.model.vlm import inner_transformer
@@ -183,6 +188,7 @@ class TrainingSession:
     profiler: Any | None = None
     autocast_dtype: torch.dtype | None = None
     _batch_stream: BatchStream | None = field(default=None, init=False, repr=False)
+    _dp_groups: tuple | None = field(default=None, init=False, repr=False)
 
     @property
     def batches(self) -> BatchStream:
@@ -190,6 +196,17 @@ class TrainingSession:
         if self._batch_stream is None or self._batch_stream.pipeline is not self.data:
             self._batch_stream = BatchStream(self.data)
         return self._batch_stream
+
+    @property
+    def dp_groups(self) -> tuple:
+        """``data_parallel_groups`` of the runtime's mesh, taken from it once.
+
+        The logged losses and token counts are reduced over these groups, so every
+        rank logs and hands its hooks the same values for the whole job.
+        """
+        if self._dp_groups is None:
+            self._dp_groups = data_parallel_groups(self.runtime.device_mesh)
+        return self._dp_groups
 
     def autocast(self) -> contextlib.AbstractContextManager:
         """``torch.autocast`` to ``autocast_dtype``, or a no-op when it is None."""
@@ -471,11 +488,8 @@ def _log_periodic_metrics(session: TrainingSession, result: StepResult, step: in
                 "VLM run: the step body reported no text-token count, so "
                 "data/text_tokens_trained would be logged as zero"
             )
-        global_text_tokens = result.text_tokens
-        if dist.is_initialized():
-            t = torch.tensor([result.text_tokens], device=session.runtime.device, dtype=torch.long)
-            dist.all_reduce(t, op=dist.ReduceOp.SUM)
-            global_text_tokens = int(t.item())
+        t = torch.tensor([result.text_tokens], device=session.runtime.device, dtype=torch.long)
+        global_text_tokens = int(dp_all_reduce_(t, session.dp_groups).item())
         tracker.log_eval({"data/text_tokens_trained": float(global_text_tokens)}, step)
 
     if session.data.mixture_dataset is not None and result.dataset_loss_sums:
@@ -678,9 +692,10 @@ def run_training_loop(
 
             _apply_step_transitions(session, step)
 
+            loss = dp_mean(result.loss, session.dp_groups, runtime.device)
             step_metrics = tracker.end_step(
                 step=step,
-                loss=result.loss,
+                loss=loss,
                 grad_norm=result.grad_norm,
                 lr=applied_lr,
                 tokens_in_step=tokens_in_step,
@@ -690,7 +705,7 @@ def run_training_loop(
             hooks.on_step_end(
                 StepContext(
                     step=step,
-                    loss=result.loss,
+                    loss=loss,
                     grad_norm=result.grad_norm,
                     lr=applied_lr,
                     tokens_seen=tokens_seen,
@@ -728,6 +743,7 @@ def run_training_loop(
                         pp_size=pipeline.size if pipeline is not None else None,
                         pp_group=pp_group(runtime) if pipeline is not None else None,
                         pp_n_microbatches=tc.grad_accum_steps if pipeline is not None else None,
+                        dp_groups=session.dp_groups,
                     )
                 tracker.log_eval(eval_metrics, step)
                 hooks.on_eval_end(eval_metrics, step)

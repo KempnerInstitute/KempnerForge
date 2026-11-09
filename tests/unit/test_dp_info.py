@@ -1,6 +1,7 @@
 """Data-parallel rank and size on real DeviceMeshes, on CPU over gloo.
 
-Also the data loaders and an HSDP training step that use them. Each mesh has the
+Also the data loaders and an HSDP training step that use them, and the reduction of
+the logged losses and token counts over the data-parallel ranks. Each mesh has the
 dimension names and order ``init_distributed`` builds: ``pp``, ``dp_replicate``,
 ``dp_shard``, ``ep``, ``tp``, with a size-1 ``dp_shard`` inserted when ``tp`` or
 ``ep`` is active.
@@ -25,9 +26,19 @@ from kempnerforge.config.job import JobConfig
 from kempnerforge.config.model import ModelConfig
 from kempnerforge.config.training import TrainConfig
 from kempnerforge.distributed.parallel import apply_fsdp2
-from kempnerforge.distributed.utils import clip_grad_norm_, get_dp_info
+from kempnerforge.distributed.utils import (
+    clip_grad_norm_,
+    data_parallel_groups,
+    dp_all_reduce_,
+    dp_mean,
+    get_dp_info,
+)
 from kempnerforge.model.transformer import Transformer
-from kempnerforge.training.data_pipeline import build_data_pipeline, build_eval_dataloader
+from kempnerforge.training.data_pipeline import (
+    DataPipeline,
+    build_data_pipeline,
+    build_eval_dataloader,
+)
 from kempnerforge.training.runtime import RuntimeContext
 
 HSDP_LAYOUTS = {
@@ -195,6 +206,156 @@ def _check_hsdp_step(rank: int, world: int, port: int) -> None:
         dist.destroy_process_group()
 
 
+DP_PEERS = [
+    (("dp_replicate", "dp_shard"), (2, 2), [[0, 1, 2, 3]] * 4),
+    (("dp_shard", "tp"), (2, 2), [[0, 2], [1, 3], [0, 2], [1, 3]]),
+    (("pp", "dp_shard"), (2, 2), [[0, 1], [0, 1], [2, 3], [2, 3]]),
+    (("pp", "dp_replicate", "dp_shard"), (2, 1, 2), [[0, 1], [0, 1], [2, 3], [2, 3]]),
+    (("dp_replicate", "dp_shard", "tp"), (2, 1, 2), [[0, 2], [1, 3], [0, 2], [1, 3]]),
+    (("dp_shard", "ep", "tp"), (1, 2, 2), [[0], [1], [2], [3]]),
+]
+
+
+def _check_dp_reduction(rank: int, world: int, port: int) -> None:
+    """Sum and average over each mesh's DP groups; only the rank's DP peers take part."""
+    _init(rank, world, port)
+    try:
+        wrong = []
+        for names, sizes, peers in DP_PEERS:
+            mesh = init_device_mesh("cpu", sizes, mesh_dim_names=names)
+            groups = data_parallel_groups(mesh)
+            total = dp_all_reduce_(torch.tensor([10.0**rank]), groups).item()
+            mean = dp_mean(float(rank), groups, torch.device("cpu"))
+            mine = peers[rank]
+            expected = (sum(10.0**r for r in mine), sum(mine) / len(mine))
+            if (total, mean) != expected:
+                wrong.append(f"mesh {names} of {sizes}: {(total, mean)}, expected {expected}")
+        assert not wrong, f"rank {rank}:\n" + "\n".join(wrong)
+    finally:
+        dist.destroy_process_group()
+
+
+class _AllFinite:
+    """Stands in for NaNDetector, whose agreement all-reduce allocates on CUDA."""
+
+    should_rollback = False
+
+    def check_loss(self, loss: float, step: int, grad_norm: float | None = None) -> bool:
+        return True
+
+
+def _check_loop_reduces_losses(rank: int, world: int, port: int) -> None:
+    """Each rank trains and evaluates on its own data; every rank logs the DP mean."""
+    from kempnerforge.training.hooks import HookRunner, TrainingHook
+    from kempnerforge.training.loop import run_training_loop, text_step
+    from tests.unit.test_train_entry import VOCAB, make_config, make_session
+
+    _init(rank, world, port)
+    try:
+        mesh = init_device_mesh("cpu", (world,), mesh_dim_names=("dp_shard",))
+        generator = torch.Generator().manual_seed(10 + rank)
+
+        def batch(rows: int) -> dict[str, torch.Tensor]:
+            return {
+                "input_ids": torch.randint(0, VOCAB, (rows, 4), generator=generator),
+                "labels": torch.randint(0, VOCAB, (rows, 4), generator=generator),
+            }
+
+        train_batch, eval_batches = batch(4), [batch(2), batch(2)]
+        local_losses: list[float] = []
+
+        def step_fn(session, step):
+            result = text_step(session, step)
+            local_losses.append(result.loss)
+            return result
+
+        class Record(TrainingHook):
+            def __init__(self) -> None:
+                self.losses: list[float] = []
+                self.local_evals: list[float] = []
+                self.evals: list[float] = []
+
+            def on_step_end(self, ctx) -> None:
+                self.losses.append(ctx.loss)
+                with torch.no_grad():
+                    losses = [
+                        session.loss_fn(ctx.model(b["input_ids"]), b["labels"]).item()
+                        for b in eval_batches
+                    ]
+                self.local_evals.append(sum(losses) / len(losses))
+
+            def on_eval_end(self, metrics, step) -> None:
+                self.evals.append(metrics["eval/loss"])
+
+        config = make_config(max_steps=2, batch_size=4)
+        config.eval = EvalConfig(enabled=True, interval=1, steps=2, dataset_path="/unused")
+        hook = Record()
+        torch.manual_seed(0)
+        session = make_session(
+            config,
+            runtime=RuntimeContext(
+                rank=rank,
+                local_rank=rank,
+                world_size=world,
+                device=torch.device("cpu"),
+                device_mesh=mesh,
+            ),
+            data=DataPipeline(dataloader=[train_batch], dp_rank=rank, dp_size=world),
+            step_fn=step_fn,
+            hooks=HookRunner([hook]),
+            nan_detector=_AllFinite(),
+            eval_dataloader=eval_batches,
+        )
+        session.tracker.metrics_config.log_interval = 1
+        published: list[float] = []
+        log_step = session.tracker._log_step
+        session.tracker._log_step = lambda s, m: (published.append(m.loss), log_step(s, m))[1]
+        run_training_loop(session)
+
+        everyone: list = [None] * world
+        dist.all_gather_object(everyone, (local_losses, hook.local_evals))
+        train_means = [sum(e[0][i] for e in everyone) / world for i in range(2)]
+        eval_means = [sum(e[1][i] for e in everyone) / world for i in range(2)]
+        assert published == pytest.approx(train_means, rel=1e-12), (rank, published, everyone)
+        assert hook.losses == pytest.approx(train_means, rel=1e-12), (rank, hook.losses)
+        assert hook.evals == pytest.approx(eval_means, rel=1e-6), (rank, hook.evals, everyone)
+    finally:
+        dist.destroy_process_group()
+
+
+def _check_text_tokens(rank: int, world: int, port: int) -> None:
+    """Two ranks that share one DP rank, as TP peers do, count their batch once."""
+    from kempnerforge.config.schema import AdapterConfig, VisionEncoderConfig, VLMConfig
+    from kempnerforge.training.loop import StepResult, _log_periodic_metrics
+    from tests.unit.test_train_entry import make_config, make_session
+
+    _init(rank, world, port)
+    try:
+        mesh = init_device_mesh("cpu", (1, world), mesh_dim_names=("dp_shard", "tp"))
+        config = JobConfig(
+            model=ModelConfig(dim=64, n_layers=2, n_heads=4, vocab_size=256, max_seq_len=64),
+            train=TrainConfig(batch_size=1, seq_len=64, max_steps=1),
+            vision_encoder=VisionEncoderConfig(type="random", feature_dim=96, num_tokens=8),
+            adapter=AdapterConfig(),
+            vlm=VLMConfig(max_text_len=32),
+        )
+        runtime = RuntimeContext(
+            rank=rank,
+            local_rank=rank,
+            world_size=world,
+            device=torch.device("cpu"),
+            device_mesh=mesh,
+        )
+        session = make_session(make_config(), runtime=runtime)
+        session.config = config
+        logged: dict = {}
+        session.tracker.log_eval = lambda m, s: logged.update(m)
+        _log_periodic_metrics(session, StepResult(loss=1.0, grad_norm=0.1, text_tokens=10), 1)
+        assert logged["data/text_tokens_trained"] == 10.0, (rank, logged)
+    finally:
+        dist.destroy_process_group()
+
+
 class TestGetDpInfoOnRealMeshes:
     @pytest.mark.parametrize("world", sorted(_by_world(HSDP_LAYOUTS)))
     def test_hsdp_meshes_give_one_dp_rank_per_data_shard(self, world):
@@ -212,6 +373,27 @@ class TestGetDpInfoOnRealMeshes:
         """One DP dim, or none under pure PP, gives the same DP info as before HSDP."""
         layouts = _by_world(OTHER_LAYOUTS)[world]
         mp.spawn(_check_layouts, args=(world, _free_port(), layouts), nprocs=world)
+
+
+class TestDataParallelReduction:
+    def test_sums_and_averages_over_the_dp_peers_only(self):
+        """The sum runs over ``dp_shard``, then ``dp_replicate``, on the mesh's own groups.
+
+        Ranks that differ only in ``pp``, ``ep`` or ``tp`` read the same data, so they
+        are not summed, and with one DP rank nothing is.
+        """
+        mp.spawn(_check_dp_reduction, args=(4, _free_port()), nprocs=4)
+
+
+class TestLoggedMetricsOverDataParallel:
+    def test_train_and_eval_loss_are_dp_means_on_every_rank(self):
+        """The tracker, the hooks and eval see the mean over the DP ranks, not each
+        rank's own loss, so rank 0's backends log the whole job's loss."""
+        mp.spawn(_check_loop_reduces_losses, args=(2, _free_port()), nprocs=2)
+
+    def test_vlm_text_tokens_count_each_dp_rank_once(self):
+        """The text-token count is summed over the DP ranks, not every rank of the world."""
+        mp.spawn(_check_text_tokens, args=(2, _free_port()), nprocs=2)
 
 
 class TestDataPipelineOnHsdp:

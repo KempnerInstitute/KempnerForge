@@ -7,7 +7,9 @@ FSDP2 and multi-dimensional parallelism.
 from __future__ import annotations
 
 import logging
+import math
 from collections import defaultdict
+from collections.abc import Sequence
 
 import torch
 import torch.distributed as dist
@@ -41,6 +43,55 @@ def get_dp_info(device_mesh: DeviceMesh | None) -> tuple[int, int]:
             dp_rank = dp_rank * size + device_mesh.get_local_rank(name)
             dp_size *= size
     return dp_rank, dp_size
+
+
+def data_parallel_groups(device_mesh: DeviceMesh | None) -> tuple[dist.ProcessGroup, ...]:
+    """The process groups whose sums, taken in turn, total a value over the DP ranks.
+
+    One group for each of ``dp_shard`` and ``dp_replicate`` with more than one rank,
+    taken from the mesh, so none is created. Ranks that differ only in ``pp``, ``ep``
+    or ``tp`` share a DP rank, hold the same data, and are in none of them. Empty
+    without a mesh or with one DP rank.
+
+    Args:
+        device_mesh: Full DeviceMesh, or None for single-GPU.
+
+    Returns:
+        The groups, for ``dp_all_reduce_`` and ``dp_mean``.
+    """
+    if device_mesh is None:
+        return ()
+    names = device_mesh.mesh_dim_names or ()
+    groups = []
+    for name in ("dp_shard", "dp_replicate"):
+        if name in names:
+            submesh = device_mesh[name]
+            if submesh.size() > 1:
+                groups.append(submesh.get_group())
+    return tuple(groups)
+
+
+def dp_all_reduce_(tensor: torch.Tensor, groups: Sequence[dist.ProcessGroup]) -> torch.Tensor:
+    """Sum ``tensor`` in place over the DP ranks that ``groups`` span, and return it.
+
+    ``groups`` comes from ``data_parallel_groups``; every rank in them must call this.
+    """
+    for group in groups:
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=group)
+    return tensor
+
+
+def dp_mean(value: float, groups: Sequence[dist.ProcessGroup], device: torch.device) -> float:
+    """Mean of ``value`` over the DP ranks that ``groups`` span; ``value`` itself when empty.
+
+    The sum is taken in float64, so the mean of equal values is exact. Every rank in
+    ``groups`` must call this.
+    """
+    if not groups:
+        return value
+    total = torch.tensor([value], dtype=torch.float64, device=device)
+    dp_size = math.prod(dist.get_world_size(group) for group in groups)
+    return dp_all_reduce_(total, groups).item() / dp_size
 
 
 def clip_grad_norm_(

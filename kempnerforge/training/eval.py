@@ -14,6 +14,8 @@ from datetime import timedelta
 import torch
 import torch.distributed as dist
 
+from kempnerforge.distributed.utils import dp_mean
+
 logger = logging.getLogger(__name__)
 
 _EVAL_BROADCAST_TIMEOUT_SEC = 300.0
@@ -50,6 +52,7 @@ def run_eval(
     pp_size: int | None = None,
     pp_group=None,
     pp_n_microbatches: int | None = None,
+    dp_groups: tuple = (),
 ) -> dict[str, float]:
     """Run evaluation and return metrics.
 
@@ -70,9 +73,12 @@ def run_eval(
             through it this many at a time, so each microbatch has the shape the
             stages were built for; ``eval_steps`` must be a multiple of it. None
             sends all ``eval_steps`` batches in one call.
+        dp_groups: ``data_parallel_groups`` of the job's mesh. Each data-parallel rank
+            evaluates ``eval_steps`` batches of its own share of the eval set, and the
+            loss is the mean over those ranks. Empty reports this rank's batches alone.
 
     Returns:
-        Dict with "eval/loss" and "eval/perplexity".
+        Dict with "eval/loss" and "eval/perplexity", the exponential of that loss.
 
     Raises:
         ValueError: Under PP, ``eval_steps`` is not a multiple of
@@ -156,6 +162,7 @@ def run_eval(
 
         avg_loss = total_loss / eval_steps
 
+    avg_loss = dp_mean(avg_loss, dp_groups, device)
     model.train()
     return {"eval/loss": avg_loss, "eval/perplexity": math.exp(min(avg_loss, 20.0))}
 
