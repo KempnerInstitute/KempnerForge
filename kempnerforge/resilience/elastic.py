@@ -106,19 +106,27 @@ def is_slurm_requeue() -> bool:
     return int(os.environ.get("SLURM_RESTART_COUNT", "0")) > 0
 
 
-def resolve_resume_path(checkpoint_dir: str, num_stages: int | None = None) -> Path | None:
+def resolve_resume_path(
+    checkpoint_dir: str, num_stages: int | None = None, *, require_train_state: bool = True
+) -> Path | None:
     """Find the latest checkpoint for auto-resume.
 
     Checks:
       1. ``{checkpoint_dir}/latest`` symlink
-      2. Most recent ``step_N`` directory *whose DCP shards are durable*
+      2. Most recent ``step_N`` directory *whose save completed*
 
-    ``CheckpointManager`` only ever points ``latest`` at a durable checkpoint,
-    so (1) needs no further test. The ``step_N`` fallback has no such guarantee:
+    ``CheckpointManager`` only ever points ``latest`` at a complete checkpoint,
+    so (1) needs no further test; one that lost files since is returned as is,
+    and the load reports it. The ``step_N`` fallback has no such guarantee:
     an interrupted save leaves a directory that exists but holds no ``.metadata``,
-    and resuming into it fails in ``dcp.load`` with "metadata is None". Skipping
-    incomplete directories turns an unrecoverable run into one that resumes from
-    the last durable checkpoint, whatever left the partial directory behind.
+    and resuming into it fails in ``dcp.load`` with "metadata is None". A save
+    that stopped after its DCP shards and before ``train_state.pt`` leaves
+    optimizer state without the step, LR schedule and data position that go with
+    it, which ``CheckpointManager.load`` refuses. Skipping both kinds turns an
+    unrecoverable run into one that resumes from the last complete checkpoint,
+    whatever left the partial directory behind. When ``step_N`` directories
+    exist but none is complete, a run that meant to resume starts over, so that
+    is logged at ERROR.
 
     Args:
         checkpoint_dir: Base checkpoint directory.
@@ -126,10 +134,13 @@ def resolve_resume_path(checkpoint_dir: str, num_stages: int | None = None) -> P
             per-stage layout counts only when ``pp0`` through ``pp{num_stages - 1}``
             all hold ``.metadata``, including stages that never created their
             directory; see ``_dcp_durable``. When no step has every stage, the
-            newest one whose stage directories are complete is returned as
+            newest one that is otherwise complete is returned as
             before, after an error log, rather than the run starting over: a
             checkpoint saved with another pipeline degree looks the same, and
             resume does not support changing the degree.
+        require_train_state: Skip a ``step_N`` whose shards hold optimizer state but
+            that has no ``train_state.pt``. A caller that loads the weights alone, which
+            such a checkpoint still holds in full, passes False to keep the newest one.
 
     Returns:
         Path to the latest usable checkpoint, or None if none found.
@@ -145,6 +156,8 @@ def resolve_resume_path(checkpoint_dir: str, num_stages: int | None = None) -> P
             logger.info(f"Auto-resume: found latest checkpoint at {resolved}")
             return resolved
 
+    from kempnerforge.checkpoint.manager import missing_train_state
+
     step_dirs = sorted(
         (
             d
@@ -157,6 +170,13 @@ def resolve_resume_path(checkpoint_dir: str, num_stages: int | None = None) -> P
 
     short_of_stages: Path | None = None
     for path in step_dirs:
+        if require_train_state and _dcp_durable(path) and missing_train_state(path):
+            logger.warning(
+                f"Auto-resume: skipping {path}: it holds optimizer state but no "
+                f"train_state.pt, so the save that produced it did not complete or the "
+                f"file was lost"
+            )
+            continue
         if _dcp_durable(path, num_stages):
             logger.info(f"Auto-resume: found checkpoint at {path}")
             return path
@@ -174,8 +194,8 @@ def resolve_resume_path(checkpoint_dir: str, num_stages: int | None = None) -> P
 
     if short_of_stages is not None:
         logger.error(
-            f"Auto-resume: no checkpoint under {base} has all {num_stages} pipeline stages; "
-            f"resuming {short_of_stages}, the newest whose stage directories are complete. "
+            f"Auto-resume: no complete checkpoint under {base} has all {num_stages} pipeline "
+            f"stages; resuming {short_of_stages}, the newest that is otherwise complete. "
             f"Either a stage stopped before saving, or the checkpoint was saved with another "
             f"pipeline degree, which resume does not support"
         )
@@ -184,8 +204,9 @@ def resolve_resume_path(checkpoint_dir: str, num_stages: int | None = None) -> P
     if step_dirs:
         logger.error(
             f"Auto-resume: {len(step_dirs)} checkpoint directories under "
-            f"{base} and none has durable DCP state; starting from step 0. "
-            f"Every saved step would have to be re-trained."
+            f"{base} and none holds a complete save; starting from step 0, or from "
+            f"checkpoint.load_path if one is set. Every saved step would have to be "
+            f"re-trained."
         )
     return None
 

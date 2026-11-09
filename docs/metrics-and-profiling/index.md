@@ -17,7 +17,7 @@ loss smoothing, GPU memory, kernel traces. Two modules:
 | `TensorBoardBackend` | local event files | `metrics.enable_tensorboard = true` |
 | `MLflowBackend` | Databricks / MLflow server | `metrics.enable_mlflow = true` |
 | `compute_mfu` | per-step MFU | always-on (part of `MetricsTracker`) |
-| `get_memory_stats` | per-step GPU memory | always-on |
+| `get_memory_stats` | GPU memory, read on each logging step | always-on (part of `MetricsTracker`) |
 | `DeviceMemoryMonitor` | interval-scoped peak tracking + snapshots | opt-in, instantiate manually |
 | `build_profiler` | `torch.profiler` trace | `profiling.enable = true` |
 | `CUDATimer` | region-scoped GPU timing | opt-in, instantiate manually |

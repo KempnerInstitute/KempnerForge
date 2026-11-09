@@ -154,10 +154,10 @@ def _project_visual_features(wrapper: VLMWrapper, pixel_values: torch.Tensor) ->
     effective_frames = pixel_values.shape[1] if is_video else 1
     if effective_frames != wrapper.frames_per_clip:
         raise ValueError(
-            f"frames-per-clip mismatch: received {effective_frames} frame(s) "
+            f"frames-per-clip mismatch: received {effective_frames} frame(s) or view(s) "
             f"(pixel_values.dim()={pixel_values.dim()}) but the wrapper was built with "
-            f"frames_per_clip={wrapper.frames_per_clip}. Pass a clip with exactly "
-            "frames_per_clip frames (or rebuild the wrapper for this frame count)."
+            f"frames_per_clip={wrapper.frames_per_clip}, a clip's frames or a tiled image's "
+            "views. Pass exactly that many per sample, or rebuild the wrapper for this count."
         )
     if is_video:
         b, f = pixel_values.shape[0], pixel_values.shape[1]
