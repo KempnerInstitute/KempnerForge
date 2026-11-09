@@ -46,8 +46,11 @@ class ChatRenderer:
     (an empty think block, for instance) is never trained and a user message that
     quotes a reply is not mistaken for it.
     Leading newlines of a reply are dropped, as the template drops them. A reply that
-    is empty or that ``max_text_len`` cuts away entirely is refused with
-    ``UnrenderableDocumentError``, since it would train nothing.
+    is blank, that carries template text (``turn_start``, ``turn_end`` or a think
+    tag) or that ``max_text_len`` cuts away entirely is refused with
+    ``UnrenderableDocumentError``. A document longer than ``max_text_len`` keeps its
+    head and ends with ``turn_end``, as the core dataset ends a cut sample with EOS,
+    so a cut reply still trains to stop.
     """
 
     def __init__(
@@ -76,6 +79,11 @@ class ChatRenderer:
         self.image_mean = image_mean
         self.image_std = image_std
         self.pad_id = resolve_pad_id(tokenizer)
+        self._marks = (turn_start, turn_end, "<think>", "</think>")
+        end_ids = tokenizer(turn_end, add_special_tokens=False)["input_ids"]
+        if len(end_ids) != 1:
+            raise ValueError(f"turn_end {turn_end!r} must be one token, got {len(end_ids)}")
+        self._end_id = end_ids[0]
         self._header = f"{turn_start}assistant\n"
         prompt = self._template([{"role": "user", "content": ""}], generation_prompt=True)
         if self._header not in prompt:
@@ -106,8 +114,10 @@ class ChatRenderer:
         if len(answers) != len(document.turns):
             raise ValueError(f"{len(document.turns)} turns but {len(answers)} answers")
         replies = [answer.lstrip("\n") for answer in answers]
-        if not all(replies):
+        if not all(reply.strip() for reply in replies):
             raise UnrenderableDocumentError("an empty reply trains nothing")
+        if any(mark in reply for reply in replies for mark in self._marks):
+            raise UnrenderableDocumentError("a reply carries template text")
         return replies
 
     def text_and_reply_spans(
@@ -167,12 +177,15 @@ class ChatRenderer:
         text, spans = self.text_and_reply_spans(document, answers)
         encoded = self.tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
         full = encoded["input_ids"]
-        ids = full[: self.max_text_len]
+        cut = len(full) > self.max_text_len
+        ids = full[: self.max_text_len - 1] + [self._end_id] if cut else full
         if self.answer_only:
             trained = [
                 any(s < end and e > start for start, end in spans)
-                for s, e in encoded["offset_mapping"][: len(ids)]
+                for s, e in encoded["offset_mapping"][: self.max_text_len - cut]
             ]
+            if cut:
+                trained.append(trained[-1])
         else:
             trained = [True] * len(ids)
         if not any(trained[1:]):
@@ -200,8 +213,9 @@ class RenderedDataset(Dataset):
     """Renders a reader's documents, drawing replies from a generator seeded by seed and index.
 
     A document the renderer refuses is passed over for the next one, up to
-    ``max_attempts`` in a row; ``skipped`` counts them in the process that read
-    them (a loader worker's skips are its own), and the first is logged.
+    ``max_attempts`` in a row. ``skipped`` counts them with the rows the reader
+    passed over, per rank: loader workers forked from the training process add to
+    its count, and the first skip in each process is logged.
     """
 
     def __init__(
@@ -219,7 +233,7 @@ class RenderedDataset(Dataset):
 
     @property
     def skipped(self) -> int:
-        return self._skips.count
+        return self._skips.count + getattr(self.reader, "skipped", 0)
 
     def __len__(self) -> int:
         return len(self.reader)

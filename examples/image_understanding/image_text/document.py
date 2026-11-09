@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 from PIL import Image
 
 DocumentKind = Literal["qa", "conversation"]
+
+
+def is_text(value: Any) -> bool:
+    """Whether ``value`` is a string with something other than whitespace."""
+    return isinstance(value, str) and bool(value.strip())
 
 
 @dataclass(frozen=True)

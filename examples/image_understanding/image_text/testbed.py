@@ -14,7 +14,7 @@ import pyarrow as pa
 from PIL import Image
 from torch.utils.data import Dataset
 
-from .document import Document, Turn
+from .document import Document, Turn, is_text
 from .skip import MAX_ATTEMPTS, SkipLog, UnusableRowError, check_max_attempts, first_usable
 
 DECODE_ERRORS = (OSError, ValueError, SyntaxError, Image.DecompressionBombError)
@@ -40,7 +40,8 @@ class ImageTextRows(Dataset):
 
     The table is shared with forked loader workers without the per-row copies that
     touching Python objects would cause. Blank answers are dropped, and with them
-    any row left without an answer. A row whose image does not decode is passed
+    any row left without an answer, and answers lose surrounding whitespace, which
+    would otherwise be trained. A row whose image does not decode is passed
     over for the next one, up to ``max_attempts`` in a row; ``skipped`` counts
     them. A missing image file is an error.
     """
@@ -58,7 +59,7 @@ class ImageTextRows(Dataset):
                 f"column lengths differ: {len(images)} images, {len(users)} users, "
                 f"{len(answers)} answer lists"
             )
-        usable = [[answer for answer in row if answer.strip()] for row in answers]
+        usable = [[answer.strip() for answer in row if is_text(answer)] for row in answers]
         kept = [i for i, row in enumerate(usable) if row]
         self.image_root = Path(image_root)
         self.max_attempts = check_max_attempts(max_attempts)
