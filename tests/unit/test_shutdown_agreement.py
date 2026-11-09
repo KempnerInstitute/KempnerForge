@@ -1,7 +1,9 @@
 """Every rank takes the same branch where the training loop's ranks could split.
 
-A shutdown or a failed NCCL check seen on one rank stops every rank (#307), and a
-NaN loss on one rank skips the step on every rank (#375).
+A shutdown or a failed NCCL check seen on one rank stops every rank (#307), a rank
+that the vote stops arms its own forced-exit timer, the loop destroys only the
+control group it made, and a NaN loss on one rank skips the step on every rank
+(#375).
 
 Two gloo ranks run the real ``run_training_loop`` and only one of them sees the
 event. ``NaNDetector.check_loss`` makes its flag on CUDA, so each rank swaps the
@@ -78,6 +80,20 @@ def _signal_on(signaled_step: int):
     return step_fn
 
 
+def _group_lifetime(loop, session) -> str:
+    """Run the loop with no control group, then with the caller's own, and report on both."""
+    from kempnerforge.distributed.utils import any_rank, new_control_group
+
+    groups = dist.distributed_c10d._world.pg_map
+    before = len(groups)
+    loop.run_training_loop(session)
+    made = f"left={len(groups) - before} cleared={session.control_group is None}"
+    mine = new_control_group(PG_TIMEOUT_S)
+    session.control_group = mine
+    loop.run_training_loop(session)
+    return f"{made} kept={session.control_group is mine} works={any_rank(True, mine)}"
+
+
 def _run_loop(rank: int, port: int, case: str, root: str, out_dir: str) -> None:
     """Run the loop on one rank and write how it ended, then wait for the other rank."""
     _init(rank, port)
@@ -119,10 +135,13 @@ def _run_loop(rank: int, port: int, case: str, root: str, out_dir: str) -> None:
         if case == "health":
             config.train.nccl_health_check_interval = 2
             loop.check_nccl_health = lambda: rank != 1
-        step, _ = loop.run_training_loop(session)
-        ckpt = session.checkpointer
-        saves = ckpt.saved_steps if isinstance(ckpt, FakeCheckpointManager) else None
-        outcome = f"step={step} saves={saves} nans={session.nan_detector.state.total_nans}"
+        if case == "groups":
+            outcome = _group_lifetime(loop, session)
+        else:
+            step, _ = loop.run_training_loop(session)
+            ckpt = session.checkpointer
+            saves = ckpt.saved_steps if isinstance(ckpt, FakeCheckpointManager) else None
+            outcome = f"step={step} saves={saves} nans={session.nan_detector.state.total_nans}"
         if case == "timer":
             outcome += f" armed={session.shutdown_handler._timer is not None}"
             session.shutdown_handler.finish()
@@ -190,9 +209,19 @@ class TestLoopStopsOnEveryRank:
         assert (ckpt / "latest").resolve() == (ckpt / "step_2").resolve()
         assert (ckpt / "step_2" / ".metadata").is_file()
 
-    def test_an_unhealthy_rank_stops_every_rank(self, tmp_path):
+    def test_an_unhealthy_rank_stops_and_fails_every_rank(self, tmp_path):
+        """Every rank leaves the loop at the same step, saves nothing and raises."""
         outcomes = _outcomes(tmp_path, "health")
-        assert outcomes == {r: "step=2 saves=[] nans=0" for r in range(WORLD)}
+        failed = (
+            "RuntimeError: NCCL health check failed at step 2 on at least one rank; "
+            "every rank stopped without a final save"
+        )
+        assert outcomes == {r: failed for r in range(WORLD)}
+
+    def test_the_loop_destroys_only_the_control_group_it_made(self, tmp_path):
+        """A loop-made group is gone after the loop; a group the caller passed in still works."""
+        outcomes = _outcomes(tmp_path, "groups")
+        assert outcomes == {r: "left=0 cleared=True kept=True works=True" for r in range(WORLD)}
 
     def test_a_nan_on_one_rank_skips_the_step_on_every_rank(self, tmp_path):
         """Rank 0's NaN loss makes both ranks skip step 1, and both still finish (#375)."""

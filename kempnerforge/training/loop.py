@@ -572,9 +572,12 @@ def run_training_loop(
     duration; only its ``dataloader`` may be swapped mid-run.
 
     Every rank must call it: the shutdown and NCCL-health stops are agreed
-    over ``session.control_group``, which the loop makes when it is ``None``.
-    It never calls ``shutdown_handler.finish()``; the handler's owner does,
-    once teardown is done.
+    over ``session.control_group``. When that is ``None`` the loop makes the
+    group, and destroys it when it returns or raises. It never calls
+    ``shutdown_handler.finish()``; the handler's owner does, once teardown is
+    done. After an NCCL-health stop it saves nothing, drains any pending async
+    save and raises ``RuntimeError`` on every rank, so the job fails rather
+    than ending as if it completed.
     """
     config = session.config
     tc = config.train
@@ -598,9 +601,6 @@ def run_training_loop(
     if phases.phases:
         logger.info(f"Phase scheduling: {len(phases.phases)} phase(s) configured")
 
-    if session.control_group is None:
-        session.control_group = new_control_group(config.distributed.nccl_timeout_sec)
-
     model.train()
     hooks.on_train_begin(config)
 
@@ -619,6 +619,10 @@ def run_training_loop(
 
     completed_normally = False
     ckpt_extra: dict = {}
+    nccl_failed_at: int | None = None
+    owns_control_group = session.control_group is None
+    if owns_control_group:
+        session.control_group = new_control_group(config.distributed.nccl_timeout_sec)
 
     try:
         while step < tc.max_steps:
@@ -682,6 +686,7 @@ def run_training_loop(
                 and any_rank(not check_nccl_health(), session.control_group)
             ):
                 logger.error(f"NCCL health check failed at step {step} — stopping")
+                nccl_failed_at = step
                 break
 
             if (
@@ -733,6 +738,9 @@ def run_training_loop(
             if runtime.rank == 0:
                 print_profiler_summary(prof, trace_dir=config.profiling.trace_dir)
         session.batches.close()
+        if owns_control_group and session.control_group is not None:
+            dist.destroy_process_group(session.control_group)
+            session.control_group = None
 
     if completed_normally and not config.checkpoint.should_save(step):
         ckpt_mgr.save(
@@ -745,6 +753,11 @@ def run_training_loop(
         hooks.on_checkpoint_save(step, config.checkpoint.dir)
 
     ckpt_mgr.wait()
+    if nccl_failed_at is not None:
+        raise RuntimeError(
+            f"NCCL health check failed at step {nccl_failed_at} on at least one rank; "
+            "every rank stopped without a final save"
+        )
 
     logger.info(f"Training complete: {step} steps, {tokens_seen:,} tokens")
     hooks.on_train_end(step, tokens_seen)

@@ -3268,17 +3268,20 @@ class TestPerDatasetMetrics:
 
 
 class TestLoopPeriodicWork:
-    def test_nccl_failure_stops_the_run_without_a_final_save(self, monkeypatch):
+    def test_nccl_failure_fails_the_run_without_a_final_save(self, monkeypatch):
+        """The pending save is drained, then the run raises so the job does not end as done."""
         import kempnerforge.training.loop as loop
 
         monkeypatch.setattr(loop, "check_nccl_health", lambda: False)
         config = make_config(max_steps=6)
         config.train.nccl_health_check_interval = 1
         session = make_session(config)
-        step, _ = run_training_loop(session)
-        ckpt: FakeCheckpointManager = session.checkpointer  # type: ignore[assignment]
-        assert step == 1
+        with pytest.raises(RuntimeError, match="NCCL health check failed at step 1"):
+            run_training_loop(session)
+        ckpt = session.checkpointer
+        assert isinstance(ckpt, FakeCheckpointManager)
         assert ckpt.saves == []
+        assert ckpt.waits == 1
 
     def test_healthy_nccl_does_not_stop_the_run(self, monkeypatch):
         import kempnerforge.training.loop as loop
