@@ -2279,6 +2279,8 @@ class TestRestoreCheckpoint:
 
 
 class FakeDataset:
+    has_text_only_rows = False
+
     def __init__(self, n=8, **kw) -> None:
         self.n = n
         self.kwargs = kw
@@ -2437,6 +2439,7 @@ class TestVlmSourceBuilders:
             "pad_id": 7,
             "seq_len": config.train.seq_len,
             "tokens_per_image": 12,
+            "allow_text_only": False,
         }
         assert "image_collator" not in seen
         with pytest.raises(ValueError, match="built model's tokens per image"):

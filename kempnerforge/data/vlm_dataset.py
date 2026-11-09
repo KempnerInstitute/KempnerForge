@@ -265,23 +265,31 @@ def _is_missing_image(value: Any) -> bool:
 def _images_per_row(rows: Any, image_field: str) -> np.ndarray:
     """How many images each row's image field holds, read off the Arrow column without decoding.
 
-    Returns an integer array over the dataset's rows: a list column's lengths
-    (``0`` for an empty or missing list), else ``1`` for a present value and
-    ``0`` for a missing one.
+    Returns an integer array over the dataset's rows: a list column's count of
+    present entries (``0`` for an empty or missing list), else ``1`` for a
+    present value and ``0`` for a missing one.
     """
     import pyarrow as pa
 
     column = rows.select_columns([image_field]).with_format("arrow")[:].column(image_field)
-    if pa.types.is_list(column.type) or pa.types.is_large_list(column.type):
-        chunks = [chunk.value_lengths().fill_null(0) for chunk in column.chunks]
-    else:
-        chunks = [chunk.is_valid() for chunk in column.chunks]
-    counts = [chunk.to_numpy(zero_copy_only=False).astype(np.int64) for chunk in chunks]
-    return np.concatenate(counts) if counts else np.zeros(0, dtype=np.int64)
+    counts = [np.zeros(0, dtype=np.int64)]
+    for chunk in column.chunks:
+        if pa.types.is_list(chunk.type) or pa.types.is_large_list(chunk.type):
+            present = chunk.values.is_valid().to_numpy(zero_copy_only=False)
+            offsets = chunk.offsets.to_numpy()
+            running = np.concatenate([[0], np.cumsum(present, dtype=np.int64)])
+            count = running[offsets[1:]] - running[offsets[:-1]]
+            count[~chunk.is_valid().to_numpy(zero_copy_only=False)] = 0
+        else:
+            count = chunk.is_valid().to_numpy(zero_copy_only=False).astype(np.int64)
+        counts.append(count)
+    return np.concatenate(counts)
 
 
-def _check_image_counts(rows: Any, image_field: str, allow_text_only: bool) -> None:
+def _check_image_counts(rows: Any, image_field: str, allow_text_only: bool) -> int:
     """Check every row's image count before training: none unless allowed, never several.
+
+    Returns the number of rows without an image.
 
     Raises:
         ValueError: Some rows hold no image and ``allow_text_only`` is off, or
@@ -300,6 +308,7 @@ def _check_image_counts(rows: Any, image_field: str, allow_text_only: bool) -> N
             f"{several:,} of {len(rows):,} rows hold several images in field {image_field!r}; "
             "a document takes one image"
         )
+    return missing
 
 
 def _tokenize_and_mask(
@@ -437,7 +446,7 @@ class HuggingFaceVLMDataset(Dataset):
         self._max_text_len = max_text_len
         self._allow_text_only = allow_text_only
         self._tokenizer = build_tokenizer(tokenizer_path)
-        _check_image_counts(ds, image_field, allow_text_only)
+        self.has_text_only_rows = _check_image_counts(ds, image_field, allow_text_only) > 0
         if prompt_field is not None:
             _check_prompt_column_is_string(ds, prompt_field)
             _check_prompt_column_has_room(ds, prompt_field, self._tokenizer, max_text_len)
@@ -487,8 +496,10 @@ class VLMCollator:
 
     Output keys:
       - ``pixel_values``: ``(B, 3, H, W)``, or ``(B, V, 3, H, W)`` when every
-        sample brings ``V`` views of its image; a text-only sample (an empty
-        ``(0, 3, H, W)``) contributes a blank image of the batch's shape.
+        sample brings ``V`` views of its image; a text-only sample is an empty
+        tensor of its image shape (``(0, 3, H, W)`` or ``(0, V, 3, H, W)``) and
+        contributes a blank image of that shape, so the batch's shape never
+        depends on which samples have images.
       - ``input_ids``: ``(B, max_text_len)`` int64.
       - ``labels``: ``(B, max_text_len)`` int64 with ``-100`` on pad.
       - ``image_positions``: ``(B,)`` long tensor. Reserved slot for
@@ -514,8 +525,6 @@ class VLMCollator:
         if not samples:
             raise ValueError("VLMCollator received an empty batch")
         B = len(samples)
-        real = [s["pixel_values"] for s in samples if s["pixel_values"].shape[0] > 0]
-        shape = tuple(real[0].shape) if real else tuple(samples[0]["pixel_values"].shape[1:])
         images: list[torch.Tensor] = []
         has_image: list[bool] = []
         for s in samples:
@@ -526,16 +535,17 @@ class VLMCollator:
                         "VLMCollator got a text-only sample; set data.hf_allow_text_only = true "
                         "to train on text-only rows"
                     )
-                images.append(torch.zeros(shape, dtype=p.dtype))
+                images.append(torch.zeros(p.shape[1:], dtype=p.dtype))
                 has_image.append(False)
-            elif tuple(p.shape) != shape:
-                raise ValueError(
-                    f"VLMCollator needs every sample's pixel_values to share one shape, got "
-                    f"{shape} and {tuple(p.shape)}"
-                )
             else:
                 images.append(p)
                 has_image.append(True)
+        shape = tuple(images[0].shape)
+        if any(tuple(image.shape) != shape for image in images):
+            raise ValueError(
+                "VLMCollator needs every sample's pixel_values to share one image shape, got "
+                f"{sorted({tuple(image.shape) for image in images})}"
+            )
         pixels = torch.stack(images, dim=0)
         views = shape[0] if len(shape) == 4 else 1
         input_ids = torch.full((B, self.max_text_len), self.pad_id, dtype=torch.long)
@@ -565,6 +575,7 @@ def pack_vlm_samples(
     seq_len: int,
     tokens_per_image: int,
     pad_id: int,
+    allow_text_only: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Pack image-text samples into rows of ``seq_len``, each document's image before its text.
 
@@ -589,8 +600,9 @@ def pack_vlm_samples(
         ``tokens_per_image`` the slots were laid out with.
 
     Raises:
-        ValueError: ``samples`` is empty, a document's footprint exceeds
-            ``seq_len``, or ``seq_len`` or ``tokens_per_image`` is not positive.
+        ValueError: ``samples`` is empty, a document has no image while
+            ``allow_text_only`` is off or a footprint over ``seq_len``, or
+            ``seq_len`` or ``tokens_per_image`` is not positive.
     """
     if seq_len <= 0 or tokens_per_image <= 0:
         raise ValueError("seq_len and tokens_per_image must be positive")
@@ -606,6 +618,11 @@ def pack_vlm_samples(
         views = sample["pixel_values"]
         if views.dim() == 3:
             views = views.unsqueeze(0)
+        if views.shape[0] == 0 and not allow_text_only:
+            raise ValueError(
+                "pack_vlm_samples got a text-only document; set data.hf_allow_text_only = true "
+                "to train on text-only rows"
+            )
         image_shape, image_dtype = tuple(views.shape[1:]), views.dtype
         text_len = int(sample["text_len"]) if "text_len" in sample else sample["input_ids"].shape[0]
         footprint = views.shape[0] * tokens_per_image + text_len
@@ -663,13 +680,17 @@ class PackedVLMCollator:
 
     The number of rows follows the documents' footprints, so it varies from
     batch to batch; ``train.batch_size`` is the number of documents per
-    micro-batch, not the number of rows.
+    micro-batch, not the number of rows. A text-only document packs as its
+    text alone with ``allow_text_only``, and is rejected without it.
     """
 
-    def __init__(self, pad_id: int, seq_len: int, tokens_per_image: int) -> None:
+    def __init__(
+        self, pad_id: int, seq_len: int, tokens_per_image: int, allow_text_only: bool = False
+    ) -> None:
         self.pad_id = pad_id
         self.seq_len = seq_len
         self.tokens_per_image = tokens_per_image
+        self.allow_text_only = allow_text_only
 
     def __call__(self, samples: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
         return pack_vlm_samples(
@@ -677,4 +698,5 @@ class PackedVLMCollator:
             seq_len=self.seq_len,
             tokens_per_image=self.tokens_per_image,
             pad_id=self.pad_id,
+            allow_text_only=self.allow_text_only,
         )
