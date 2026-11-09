@@ -413,7 +413,7 @@ def convert(hf_dir: str, config_path: str, out: str, seed: int | None = None) ->
         config.vision_encoder,
         config.adapter,
         config.vlm,
-        frames_per_clip=config.video.max_frames if config.video is not None else 1,
+        frames_per_clip=config.images_per_document,
     )
     check_norm_eps(wrapper.transformer, hf_config["rms_norm_eps"])
 

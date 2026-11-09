@@ -31,8 +31,8 @@ from typing import Any
 import torch
 from torch.nn.attention.flex_attention import BlockMask, create_block_mask, flex_attention
 
-_FLEX_COMPILED = torch.compile(flex_attention, dynamic=False)
-_CREATE_BLOCK_MASK_COMPILED = torch.compile(create_block_mask, dynamic=False)
+_FLEX_COMPILED = torch.compile(flex_attention)
+_CREATE_BLOCK_MASK_COMPILED = torch.compile(create_block_mask)
 
 
 def flex_attention_fn(compiled: bool) -> Callable[..., Any]:
