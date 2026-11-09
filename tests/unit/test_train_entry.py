@@ -1819,17 +1819,21 @@ class FakeSubMesh:
 class FakeMesh:
     """Enough DeviceMesh surface for the build phases to run on CPU.
 
-    Every slice reports ``coords`` as its (local rank, size).
+    ``coords`` maps a dimension name to its (local rank, size); any other
+    dimension or slice reports (0, 1).
     """
 
-    def __init__(self, dims=("pp", "dp_shard"), coords=(0, 1)) -> None:
+    def __init__(self, dims=("pp", "dp_shard"), coords=None) -> None:
         self.mesh_dim_names = dims
-        self.coords = coords
+        self.coords = coords or {}
         self.sliced: list = []
 
     def __getitem__(self, key):
         self.sliced.append(key)
-        return FakeSubMesh(key, self.coords)
+        return FakeSubMesh(key, self.coords.get(key, (0, 1)))
+
+    def get_local_rank(self, name) -> int:
+        return self.coords.get(name, (0, 1))[0]
 
 
 class FakeStageModule(nn.Module):
@@ -1990,11 +1994,14 @@ class TestBuildCheckpointManager:
         single = build_checkpoint_manager(config, _runtime(), model, opt, None)
         assert single._dp_info == (0, 1)
 
-        mesh = FakeMesh(("dp_replicate", "dp_shard", "tp"), coords=(5, 8))
+        mesh = FakeMesh(
+            ("dp_replicate", "dp_shard", "tp"),
+            coords={"dp_replicate": (1, 2), "dp_shard": (3, 4), "tp": (1, 2)},
+        )
         runtime = dataclasses.replace(_runtime(), device_mesh=mesh)
         mgr = build_checkpoint_manager(config, runtime, model, opt, None)
-        assert mgr._dp_info == (5, 8)
-        assert ("dp_replicate", "dp_shard") in mesh.sliced
+        assert mgr._dp_info == (7, 8)
+        assert {"dp_replicate", "dp_shard"} <= set(mesh.sliced)
         data = build_data_pipeline(config, runtime)
         assert (data.dp_rank, data.dp_size) == mgr._dp_info
 
