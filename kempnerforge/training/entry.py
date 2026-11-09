@@ -17,6 +17,7 @@ import torch
 import torch.distributed as dist
 
 from kempnerforge.checkpoint.manager import CheckpointManager
+from kempnerforge.config.checkpoint import is_weights_only
 from kempnerforge.config.job import JobConfig
 from kempnerforge.config.vlm import MoTConfig, VLMConfig
 from kempnerforge.distributed.parallel import (
@@ -251,8 +252,8 @@ def restore_checkpoint(
 
     Returns ``(step, tokens_seen)`` — ``(0, 0)`` when there is nothing to
     resume from. Also restores the metrics run ids, runs the MoT text warm
-    start when no checkpoint supplied the model weights, and re-applies the
-    effective freeze at the resumed step.
+    start when no checkpoint supplied the model weights and the run starts at
+    step 0, and re-applies the effective freeze at the resumed step.
 
     A checkpoint in ``checkpoint.dir`` takes precedence over ``checkpoint.load_path``, so a
     requeued warm start resumes rather than starting over; rank 0 then warns that
@@ -286,7 +287,7 @@ def restore_checkpoint(
     warm_start_exclude = (
         (config.checkpoint.exclude_from_loading or None) if resume_path is None else None
     )
-    weights_only = warm_start_exclude is not None and "train_state" in warm_start_exclude
+    weights_only = is_weights_only(warm_start_exclude)
     vlm_freeze_expected = None
     if config.is_vlm and not weights_only:
         assert vlm_cfg is not None
@@ -304,7 +305,7 @@ def restore_checkpoint(
     if ckpt_extra_loaded.get("mlflow_run_id"):
         config.metrics.mlflow_run_id = ckpt_extra_loaded["mlflow_run_id"]
 
-    if warm_start_exclude is not None and "model" in warm_start_exclude:
+    if step == 0 and warm_start_exclude is not None and "model" in warm_start_exclude:
         _mot_text_warm_start(vlm_cfg, model)
 
     if vlm_cfg is not None and vlm_cfg.freeze_schedule:

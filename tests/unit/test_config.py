@@ -461,6 +461,17 @@ class TestCheckpointConfig:
             CheckpointConfig(exclude_from_loading=keys)
 
     @pytest.mark.parametrize(
+        "keys", [["optimizer", "optimizer"], ["optimizer", "train_state", "train_state"]]
+    )
+    def test_exclude_from_loading_rejects_a_repeated_key(self, keys):
+        with pytest.raises(ValueError, match="repeats a key"):
+            CheckpointConfig(exclude_from_loading=keys)
+
+    def test_exclude_from_loading_rejects_a_bare_string(self):
+        with pytest.raises(ValueError, match="must be a list"):
+            CheckpointConfig(exclude_from_loading="optimizer")  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize(
         "keys",
         [["lm_head"], ["Optimizer"], ["optimizer", "scheduler"], "optimizer", ["model", 3]],
     )

@@ -36,7 +36,7 @@ from torch.distributed.checkpoint.state_dict import (
 
 from kempnerforge.checkpoint.async_save import AsyncCheckpointer
 from kempnerforge.checkpoint.state import build_train_state, restore_train_state
-from kempnerforge.config.checkpoint import validate_exclude_keys
+from kempnerforge.config.checkpoint import is_weights_only, validate_exclude_keys
 from kempnerforge.config.optimizer import WEIGHT_DECAY_SCOPES
 from kempnerforge.config.schema import AsyncCheckpointMode, CheckpointConfig
 
@@ -929,7 +929,12 @@ class CheckpointManager:
             ckpt_dir = self._resolve_dcp_load_dir(ckpt_dir, path)
 
         logger.info(f"Loading checkpoint: {ckpt_dir}")
-        load_train_state = exclude_keys is None or "train_state" not in exclude_keys
+        load_train_state = not is_weights_only(exclude_keys)
+        if not load_train_state and vlm_freeze_expected is not None:
+            logger.warning(
+                f"vlm_freeze_expected is not compared with {ckpt_dir}: a weights-only warm start "
+                "applies the new run's freeze"
+            )
 
         if vlm_freeze_expected is not None and load_train_state:
             metadata_path = ckpt_dir / _METADATA_FILE

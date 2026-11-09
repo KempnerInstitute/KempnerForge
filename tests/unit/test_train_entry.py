@@ -2285,6 +2285,8 @@ class TestRestoreCheckpoint:
         config.checkpoint.exclude_from_loading = ["model"]
         entry.restore_checkpoint(config, TinyTextModel(), None, FakeResumeManager(step=0))
         assert copied == [{"w": 1}]
+        entry.restore_checkpoint(config, TinyTextModel(), None, FakeResumeManager(step=4))
+        assert copied == [{"w": 1}], "a step-4 train state came with the excluded model"
 
         copied.clear()
         config.checkpoint.load_path = None

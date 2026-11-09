@@ -61,8 +61,17 @@ def _power2_strategy(window: DynamicCheckpointWindow, step: int) -> bool:
 WEIGHTS_ONLY_EXCLUDE = frozenset({"optimizer", "train_state"})
 
 
-def validate_exclude_keys(keys: list[str], name: str) -> None:
-    """Check an exclude list: DCP keys only, and ``"train_state"`` only in the weights-only pair."""
+def is_weights_only(keys: list[str] | None) -> bool:
+    """Whether an exclude list asks for the weights-only warm start."""
+    return keys is not None and set(keys) == WEIGHTS_ONLY_EXCLUDE
+
+
+def validate_exclude_keys(keys: object, name: str) -> None:
+    """Check an exclude list: a list of distinct DCP keys, ``"train_state"`` only in the pair."""
+    if not isinstance(keys, list):
+        raise ValueError(f"{name} must be a list (got {keys!r})")
+    if len(set(keys)) != len(keys):
+        raise ValueError(f"{name} repeats a key (got {keys!r})")
     if any(k not in ("model", "optimizer", "train_state") for k in keys):
         raise ValueError(
             f"{name} accepts only 'model', 'optimizer' and/or 'train_state' (got {keys!r})"
@@ -91,10 +100,6 @@ class CheckpointConfig:
     def __post_init__(self) -> None:
         if self.interval <= 0:
             raise ValueError("interval must be positive")
-        if not isinstance(self.exclude_from_loading, list):
-            raise ValueError(
-                f"exclude_from_loading must be a list (got {self.exclude_from_loading!r})"
-            )
         validate_exclude_keys(self.exclude_from_loading, "exclude_from_loading")
 
     def should_save(self, step: int) -> bool:
