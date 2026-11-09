@@ -176,9 +176,9 @@ wraps DCP's `save` / `async_save` behind a mode flag:
 
 | Config | Behavior | Use |
 |--------|----------|-----|
-| `async_mode = "disabled"` | `dcp.save()` — blocking | Simple, debugging, small models |
-| `async_mode = "async"` | `dcp.async_save()` — snapshots to CPU, writes in background | Default for production |
-| `async_mode = "async_with_pinned_mem"` | Async with pinned-memory staging (faster GPU→CPU copy) | Very large models where GPU→CPU throughput bottlenecks the snapshot |
+| `async_mode = "disabled"` (the default) | `dcp.save()`, blocking | Simple, debugging, small models |
+| `async_mode = "async"` | `dcp.async_save()`: snapshots to CPU, writes in the background | Runs where the save stall matters |
+| `async_mode = "async_with_pinned_mem"` | The same `dcp.async_save()` call as `"async"`; no pinned-memory staging is implemented | Nothing beyond `"async"` today |
 
 Every `save()` call first does `self.wait()` — the previous async
 save must fully complete before starting a new one. This avoids

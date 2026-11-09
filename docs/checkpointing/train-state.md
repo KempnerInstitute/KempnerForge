@@ -205,8 +205,9 @@ data position and RNG state start fresh.
   `train_state.pt` on startup.
 - [Training § Schedulers](../training/schedulers.md) — what's in
   `scheduler.state_dict()`.
-- [Data § Stateful dataloader](../data/index.md) —
-  why the current train.py doesn't pass the dataloader.
+- [Data § Stateful dataloader](../data/stateful-dataloader.md): the
+  loader state the training loop saves at every checkpoint and restores
+  on resume.
 - [Metrics § WandB resume](../metrics-and-profiling/index.md) — how
   `wandb_run_id` in `extra` enables resumed W&B runs.
 - [MLflow backend](../metrics-and-profiling/mlflow.md): how
