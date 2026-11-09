@@ -32,8 +32,9 @@ Written by rank 0 beside `train_state.pt`, and readable with a plain `json.load`
 It holds `step` and `tokens_seen`, plus the run's `optimizer.weight_decay_scope` as
 `weight_decay_scope` when the checkpoint manager was built with it, as the training entry does
 (VLM runs add `vlm_freeze`, and `lr_multipliers` with the `lr_module_patterns` of its
-modules when `optimizer.lr_multipliers` lists any). A load reads it on rank 0, once, for the
-checks of those records. When a logging backend has a live run at save time it also holds a
+modules and the module of each optimizer param group, `lr_group_modules`, when
+`optimizer.lr_multipliers` lists any). A load reads it on rank 0, once, for the checks of
+those records. When a logging backend has a live run at save time it also holds a
 `tracking` list, one entry per backend:
 
 ```json

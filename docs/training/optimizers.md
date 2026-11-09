@@ -89,16 +89,16 @@ freeze = []
 
 The multipliers and the patterns of their modules decide the param groups and their rates,
 which the saved optimizer state and the scheduler state are laid out for. The training entry
-records non-empty multipliers in every checkpoint's `metadata.json`, with those patterns. A
-load of a checkpoint saved with other multipliers or patterns stops on every rank when it
-restores the checkpoint's optimizer state on any rank, before loading anything, or the
-scheduler state in its `train_state.pt`, before restoring anything from that file. A
-checkpoint that records none was saved without any, so a run without multipliers loads only
-checkpoints saved without them. A `metadata.json` that cannot be read, or holds an invalid
-record, stops a run with multipliers the same way; a run without them loads the checkpoint as
-one saved without them, with a warning. Rank 0 reads the file once per load and sends what
-it read to every rank, so the ranks stop or go on together. From a training checkpoint, that
-leaves:
+records non-empty multipliers in every checkpoint's `metadata.json`, with those patterns and
+the module of each optimizer param group. A load of a checkpoint saved with other multipliers
+or patterns stops on every rank when it restores the checkpoint's optimizer state on any
+rank, before loading anything, or the scheduler state in its `train_state.pt`, before
+restoring anything from that file. A checkpoint that records none was saved without any, so
+a run without multipliers loads only checkpoints saved without them. A `metadata.json` that
+cannot be read, or holds an invalid record, stops a run with multipliers the same way; a run
+without them loads the checkpoint as one saved without them, with a warning. Rank 0 reads
+the file once per load and sends what it read to every rank, so the ranks stop or go on
+together. From a training checkpoint, that leaves:
 
 - A resume, or a `checkpoint.load_path` warm start with or without the optimizer, under the
   same multipliers and patterns.
@@ -111,8 +111,10 @@ leaves:
   model's in a stage that unfreezes it, at the saved peak times its multiplier. A load that
   also restores the optimizer state into groups laid out otherwise stops on every rank before
   loading anything. When the checkpoint holds another number of groups, lacks a setting of
-  one of this run's groups, or has a group of a listed module where this run's group belongs
-  to none or the reverse, the error names this warm start.
+  one of this run's groups, or has a group of another module at a position (a listed module
+  where this run's group belongs to none or the reverse, or another listed module, as when
+  one stage trains the adapter and the next the vision encoder in its place), the error
+  names the position and the warm start.
 - Not a new peak rate. Every resume and warm start restores the scheduler state in
   `train_state.pt`, and the saved schedule carries on, its peak included: the scheduler's
   param groups run from the `optimizer.lr` of the save times each one's multiplier, whatever

@@ -754,9 +754,11 @@ class TestResume:
             (b"[]", "does not hold a JSON object"),
             (b'{"step": 3, "lr_multipliers": {"head": -1}}', "records an invalid LR multipliers"),
             (b'{"step": 3, "lr_module_patterns": {"head": "x"}}', "lists of patterns"),
+            (b'{"step": 3, "lr_group_modules": "head"}', "a module name or null per"),
+            (b'{"step": 3, "lr_group_modules": [null, 2]}', "a module name or null per"),
             (b"[" * 100_000 + b"]" * 100_000, "RecursionError"),
         ],
-        ids=["bad-json", "list", "negative", "patterns", "deep"],
+        ids=["bad-json", "list", "negative", "patterns", "group-modules", "group-module", "deep"],
     )
     @pytest.mark.parametrize("exclude", [[], ["optimizer"]], ids=["resume", "warm-start"])
     def test_an_invalid_record_is_refused(self, tmp_path, content, match, exclude):
@@ -1243,6 +1245,98 @@ class TestLayoutChange:
         model2, optimizer2, scheduler2 = self._build("adamw", {"transformer"}, self.DEFAULT_SCOPE)
         self._manager(tmp_path, model2, optimizer2).load(scheduler=scheduler2)
         assert scheduler2.state_dict() == scheduler.state_dict()
+
+    @pytest.mark.parametrize(
+        ("name", "modules"),
+        [
+            ("adamw", [None, None, "adapter", "adapter"]),
+            ("muon", [None, "adapter", None, "adapter"]),
+        ],
+    )
+    def test_the_save_records_the_module_of_each_group(self, tmp_path, name, modules):
+        """In the order the checkpoint keeps the groups, a Muon's AdamW fallback after its own."""
+        model, optimizer, scheduler = self._build(name, {"vision_encoder"}, self.DEFAULT_SCOPE)
+        self._train(model, optimizer, scheduler, 1)
+        self._manager(tmp_path, model, optimizer).save(step=1, scheduler=scheduler)
+        meta = json.loads((tmp_path / "step_1" / "metadata.json").read_text())
+        assert meta["lr_group_modules"] == modules
+
+    @pytest.mark.parametrize(("name", "index"), [("adamw", 2), ("lion", 2), ("muon", 1)])
+    def test_a_resume_into_groups_of_other_modules_is_refused_before_loading(
+        self, tmp_path, name, index
+    ):
+        """As many groups with the same settings, but another module's at a position: the
+        module each saved group recorded names the change before anything loads."""
+        model, optimizer, scheduler = self._build(name, {"vision_encoder"}, self.DEFAULT_SCOPE)
+        self._train(model, optimizer, scheduler, 4)
+        self._manager(tmp_path, model, optimizer).save(step=4, scheduler=scheduler)
+
+        model, optimizer, scheduler = self._build(name, {"adapter"}, self.DEFAULT_SCOPE)
+        manager = self._manager(tmp_path, model, optimizer)
+        before = [p.detach().clone() for p in model.parameters()]
+        torch.rand(1)
+        rng = torch.get_rng_state()
+        change = (
+            f"has optimizer param group {index} of module 'adapter', where this run's group "
+            f"{index} is of module 'vision_encoder'"
+        )
+        with pytest.raises(RuntimeError, match=re.escape(change)):
+            manager.load(scheduler=scheduler)
+        assert all(torch.equal(b, p) for b, p in zip(before, model.parameters(), strict=True))
+        assert torch.equal(torch.get_rng_state(), rng)
+        assert scheduler.last_epoch == 0
+
+    def test_a_group_record_of_another_length_is_refused(self, tmp_path):
+        model, optimizer, scheduler = self._build("adamw", {"vision_encoder"}, self.DEFAULT_SCOPE)
+        self._train(model, optimizer, scheduler, 4)
+        self._manager(tmp_path, model, optimizer).save(step=4, scheduler=scheduler)
+        path = tmp_path / "step_4" / "metadata.json"
+        meta = json.loads(path.read_text())
+        meta["lr_group_modules"] = meta["lr_group_modules"][:-1]
+        path.write_text(json.dumps(meta))
+        model, optimizer, scheduler = self._build("adamw", {"vision_encoder"}, self.DEFAULT_SCOPE)
+        manager = self._manager(tmp_path, model, optimizer)
+        with pytest.raises(
+            RuntimeError, match="records 3 optimizer param groups, and this run has"
+        ):
+            manager.load(scheduler=scheduler)
+
+    def test_a_checkpoint_without_the_group_record_resumes_by_its_keys(self, tmp_path):
+        """A save that recorded no group modules still resumes into the same groups."""
+        model, optimizer, scheduler = self._build("adamw", {"vision_encoder"}, self.DEFAULT_SCOPE)
+        self._train(model, optimizer, scheduler, 4)
+        self._manager(tmp_path, model, optimizer).save(step=4, scheduler=scheduler)
+        path = tmp_path / "step_4" / "metadata.json"
+        meta = json.loads(path.read_text())
+        del meta["lr_group_modules"]
+        path.write_text(json.dumps(meta))
+        model2, optimizer2, scheduler2 = self._build(
+            "adamw", {"vision_encoder"}, self.DEFAULT_SCOPE
+        )
+        assert self._manager(tmp_path, model2, optimizer2).load(scheduler=scheduler2)[0] == 4
+        assert [(g.get("module"), g["lr"]) for g in optimizer2.param_groups] == [
+            (g.get("module"), g["lr"]) for g in optimizer.param_groups
+        ]
+        for p, p2 in zip(model.parameters(), model2.parameters(), strict=True):
+            assert torch.equal(p, p2)
+            if p in optimizer.state:
+                assert torch.equal(optimizer2.state[p2]["exp_avg"], optimizer.state[p]["exp_avg"])
+
+    def test_a_save_under_pipeline_parallelism_records_no_group_modules(self, tmp_path):
+        """Rank 0 holds one stage's groups, so the record would not describe the others'."""
+        model, optimizer, scheduler = self._build("adamw", set(), self.DEFAULT_SCOPE)
+        self._train(model, optimizer, scheduler, 1)
+        CheckpointManager(
+            CheckpointConfig(dir=str(tmp_path)),
+            model,
+            optimizer,
+            pp_rank=0,
+            lr_multipliers=self.MULTIPLIERS,
+            module_patterns=VLM_PATTERNS,
+        ).save(step=1, scheduler=scheduler)
+        meta = json.loads((tmp_path / "step_1" / "metadata.json").read_text())
+        assert meta["lr_multipliers"] == self.MULTIPLIERS
+        assert "lr_group_modules" not in meta
 
 
 class TestSchedulerStateLayout:

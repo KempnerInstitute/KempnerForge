@@ -1205,9 +1205,9 @@
             "peek_saved_step(path)",
             "load(path, scheduler, dataloader, exclude_keys, vlm_freeze_expected)",
             "_read_saved_keys(dcp_dir) -> (keys, restored_on_any_rank) (this rank's DCP keys; with a scope or multipliers an all-reduce on the gloo group tells every rank whether any rank's index holds optimizer state)",
-            "_broadcast_metadata(ckpt_dir) -> (meta, error) (rank 0 reads metadata.json once per load and broadcasts the object or why it could not; the scope and multipliers checks both decide from it)",
+            "_broadcast_metadata(ckpt_dir) -> (meta, error) (rank 0 reads metadata.json once per load and broadcasts the object or why it could not; the scope, multipliers and group-layout checks all decide from it)",
             "_check_weight_decay_scope(metadata, ckpt_dir) (every rank refuses a mismatch or an unreadable record)",
-            "_check_lr_multipliers(metadata, ckpt_dir) (every rank refuses other multipliers or patterns; a run without multipliers loads past an unreadable record with a warning; runs once per load, before loading optimizer state on any rank or before restoring a scheduler from train_state.pt)",
+            "_check_lr_multipliers(metadata, ckpt_dir) -> saved group modules | None (every rank refuses other multipliers or patterns; a run without multipliers loads past an unreadable record with a warning; runs once per load, before loading optimizer state on any rank or before restoring a scheduler from train_state.pt)",
             "apply_dataloader_state(dataloader)",
             "_resolve_load_path(path)",
             "_cleanup()"
@@ -1220,12 +1220,14 @@
         "_read_metadata(ckpt_dir) -> dict (the JSON object metadata.json holds; empty when there is none)",
         "_recorded_weight_decay_scope(meta, metadata_path) -> str (none recorded means exclude_norms_and_biases)",
         "_recorded_lr_multipliers(meta, metadata_path) -> dict (none recorded means empty)",
-        "_recorded_lr_module_patterns(meta, metadata_path) -> dict (lr_module_patterns; none recorded means empty)"
+        "_recorded_lr_layout(meta, metadata_path) -> (patterns, group_modules) (lr_module_patterns, and lr_group_modules: the module of each optimizer param group, recorded without PP)",
+        "_check_saved_param_groups(optim_state, saved_keys, where, groups_vary, saved_modules) (refuses another group count, a missing setting, a module key where this run has none, or another module at a position per the recorded lr_group_modules)"
       ],
       "tested_by": [
         "tests/unit/test_checkpoint.py::TestWeightDecayScopeOnResume",
         "tests/unit/test_checkpoint.py::TestOptimizerChecksAcrossStages",
         "tests/unit/test_lr_multipliers.py::TestResume",
+        "tests/unit/test_lr_multipliers.py::TestLayoutChange",
         "tests/unit/test_checkpoint.py::TestCheckpointRetention",
         "tests/unit/test_checkpoint.py::TestFlushPendingSave",
         "tests/unit/test_checkpoint.py::TestPeekSavedStep",
