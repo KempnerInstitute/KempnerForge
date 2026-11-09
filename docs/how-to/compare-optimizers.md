@@ -25,12 +25,17 @@ lr = 0.003
 All four go through
 [`build_optimizer`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/training/optimizer.py),
 which splits parameters into two groups before handing them to the
-chosen builder:
+chosen builder.
+
+Under the default `optimizer.weight_decay_scope`:
 
 - **Decay group** — 2D+ parameters without `"bias"` in the name get
   `weight_decay = config.weight_decay`.
 - **No-decay group** — 1D parameters (norm scales, biases) and any
   parameter whose name contains `"bias"` get `weight_decay = 0.0`.
+
+With `weight_decay_scope = "all"` every parameter joins the decay group
+and the no-decay group is empty.
 
 So `weight_decay` and `lr` mean the same thing across optimizers;
 `betas` is shared by AdamW, Lion (interpretation differs), Muon's
@@ -79,11 +84,11 @@ optimizers read it.
 ```toml
 [optimizer]
 name = "muon"
-lr = 0.003            # for 2D matrices (Newton-Schulz orthogonalized)
+lr = 0.003            # for the matrices Muon orthogonalizes
 weight_decay = 0.1
 muon_momentum = 0.95
 muon_ns_steps = 5
-muon_adam_lr = 3e-4   # Optional: LR for 1D params. Default = same as `lr`.
+muon_adam_lr = 3e-4   # Optional: LR for the AdamW fallback group. Default = same as `lr`.
 ```
 
 Muon orthogonalizes the 2D momentum update via a 5-step Newton-Schulz
@@ -93,15 +98,17 @@ much larger than an AdamW LR on the same model.
 [`configs/train/7b_16gpu_muon.toml`](https://github.com/KempnerInstitute/KempnerForge/blob/main/configs/train/7b_16gpu_muon.toml)
 uses `lr = 0.003` as a working reference.
 
-**Split under the hood.** `build_optimizer` routes each parameter
-based on [`_is_muon_eligible`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/training/optimizer.py):
+**Split under the hood.** Muon's builder routes each parameter by the
+module that owns it, with
+[`_muon_matrices`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/training/optimizer.py):
 
-- **Muon group**: 2D+ parameters with a reasonable aspect ratio
-  (`max(m, n) / min(m, n) <= 10`). Transformer blocks' weight matrices
-  qualify.
-- **AdamW fallback group**: 1D params (biases, norm scales) and
-  highly-rectangular matrices (embeddings, output heads — where
-  `X @ X^T` would be `vocab_size × vocab_size`).
+- **Muon group**: the weight of every `nn.Linear` except the output
+  head and, unless `muon_router = true`, the MoE router gates, whatever
+  its shape: the attention, MLP and unpacked expert projections.
+- **AdamW fallback group**: the token embedding and output head, any
+  other `nn.Embedding` or conv kernel, MoE router gates (unless
+  `muon_router = true`), packed expert weights, and 1D params (biases,
+  norm scales).
 
 The builder logs the two counts. For `7b_16gpu_muon.toml`:
 
@@ -110,14 +117,14 @@ Muon: 6,979,321,856 params (NS-orthogonalized), 1,050,939,392 params (AdamW fall
 ```
 
 Nearly all of the AdamW share is the embedding and the output head,
-128256 × 4096 each: the head is untied by default (`tie_embeddings = false`)
-and just as rectangular, so both fall back.
+128256 × 4096 each: the head is untied by default (`tie_embeddings = false`),
+so both are there.
 
 **LR coupling.** Muon's scheduler sees only the Muon param groups.
 Before every Muon `step()`, the internal AdamW LR is rescaled by
 `muon_current_lr / muon_initial_lr` so both groups follow the same
 warmup/decay curve. If you set `muon_adam_lr`, it's the *initial* LR
-for the 1D group, then tracks the Muon schedule shape.
+for the AdamW fallback group, then tracks the Muon schedule shape.
 
 **FSDP2 interaction.** Newton-Schulz runs on each rank's local shard
 of the weight matrix rather than the fully gathered matrix — an

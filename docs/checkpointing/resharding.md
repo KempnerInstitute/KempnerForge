@@ -35,7 +35,7 @@ either error or silently leave the tensor uninitialized (it warns).
 | Across save/load | Works | Caveat |
 |------------------|:-----:|--------|
 | `dp_shard` | yes | Any factor of the parameter shape |
-| `dp_replicate` | yes | Just adds replication on the load side |
+| `dp_replicate` | yes | With a `dp_shard` dimension it changes how many ranks hold each shard; without one, FSDP2 shards over it, so it reshards like `dp_shard` |
 | `tp` | yes | Heads must still divide evenly |
 | `ep` | yes | `num_experts` still must divide evenly |
 | World size | yes | Pure rebalance across fewer/more ranks |
@@ -62,7 +62,10 @@ reassemble the stage boundaries. You have one of two paths:
    flatten the per-stage shards into a single HF state dict, then
    `hf-to-dcp` to re-emit a single-stage DCP checkpoint. This works
    because the HF conversion reads every `pp{i}/` subdirectory and
-   merges them.
+   merges them. The round trip keeps the weights only: the result has
+   no optimizer state and no `train_state.pt`, so a run that loads it
+   starts at step 0 with a fresh optimizer, LR schedule and data
+   position.
 2. **Keep the same `pp` on resume.** Auto-resume never changes the
    parallelism shape, so a straight restart always works.
 

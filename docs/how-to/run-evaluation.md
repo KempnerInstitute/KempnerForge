@@ -24,6 +24,7 @@ interval             = 500          # steps between evals
 steps                = 50           # batches per eval
 dataset_path         = "/data/eval_set"
 file_pattern         = "*.bin"
+token_dtype          = "uint32"     # .bin dtype; "" reads metadata.yaml, not data.token_dtype
 # OR — HuggingFace eval data:
 # hf_dataset_name    = "wikitext"
 # hf_dataset_config  = "wikitext-103-raw-v1"
@@ -37,7 +38,7 @@ data, and logs `eval/loss` and `eval/perplexity` through
 The stdout backend renders one compact line per call:
 
 ```
-[step 500] eval/loss=3.8200 | eval/perplexity=45.6000
+2026-11-04 14:03:12.345 [rank 0] INFO     [step 500] eval/loss=3.8200 | eval/perplexity=45.6000
 ```
 
 The eval dataloader is a plain `DataLoader` with a `DistributedSampler`
@@ -60,10 +61,11 @@ perplexity.
 ### PP integration
 
 `run_eval` auto-detects pipeline parallelism via its `pp_schedule`
-argument. On PP stages, eval runs through the same
-`schedule.step(input, target, losses)` machinery as training; the
-last stage broadcasts the loss back to rank 0 so logging stays
-consistent.
+argument. On PP stages, eval runs through the training schedule's
+`eval(input, target, losses)`, forward only, `train.grad_accum_steps`
+batches at a time, so `eval.steps` must be a multiple of
+`train.grad_accum_steps`; the last stage broadcasts the loss back to
+rank 0 so logging stays consistent.
 
 ## Path 2: standalone eval on a checkpoint
 
@@ -161,6 +163,10 @@ does three things:
 2. Calls `lm_eval.simple_evaluate(model="hf", model_args=...)` with
    the task list
 3. Prints results and optionally writes JSON via `--output`
+
+The conversion writes bfloat16, and lm-eval loads every model, a
+pre-converted `--hf-model` too, with `dtype=bfloat16`, so the harness
+evaluates in bfloat16 whatever `checkpoint.export_dtype` says.
 
 ### Flags
 

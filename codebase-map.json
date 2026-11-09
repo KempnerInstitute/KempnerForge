@@ -732,8 +732,8 @@
       "functions": [
         "build_optimizer(model, config) -> Optimizer",
         "_newton_schulz(G, steps) -> Tensor",
-        "_is_muon_eligible(param) -> bool",
-        "_should_decay(name, param) -> bool"
+        "_muon_matrices(model, *, routers) -> set[Tensor]",
+        "_should_decay(name, param, scope) -> bool"
       ],
       "registry": [
         "@registry.register_optimizer('adamw')",
@@ -745,6 +745,7 @@
         "tests/unit/test_training.py::TestBuildOptimizer",
         "tests/unit/test_optimizer.py::TestNewtonSchulz",
         "tests/unit/test_optimizer.py::TestMuon",
+        "tests/unit/test_optimizer.py::TestMuonRouting",
         "tests/unit/test_optimizer.py::TestAdamW",
         "tests/unit/test_additional_optimizers.py::TestLion",
         "tests/unit/test_additional_optimizers.py::TestScheduleFreeAdamW"
@@ -1177,7 +1178,8 @@
       "tested_by": [
         "tests/unit/test_checkpoint.py::TestRNGState",
         "tests/unit/test_checkpoint.py::TestBuildTrainState",
-        "tests/unit/test_checkpoint.py::TestRestoreTrainState"
+        "tests/unit/test_checkpoint.py::TestRestoreTrainState",
+        "tests/integration/test_checkpoint_roundtrip.py::TestCheckpointRoundtrip"
       ]
     },
     "kempnerforge/checkpoint/manager.py": {
@@ -1190,6 +1192,8 @@
             "flush_pending_save()",
             "peek_saved_step(path)",
             "load(path, scheduler, dataloader, exclude_keys, vlm_freeze_expected)",
+            "_read_saved_keys(ckpt_dir, dcp_dir) (this rank's DCP keys; checks the scope only when an all-reduce on the gloo group finds optimizer state on some rank)",
+            "_check_weight_decay_scope(ckpt_dir) (rank 0 reads the saved scope and broadcasts it; every rank refuses a mismatch)",
             "apply_dataloader_state(dataloader)",
             "_resolve_load_path(path)",
             "_cleanup()"
@@ -1198,9 +1202,11 @@
       },
       "functions": [
         "_load_train_state(path) -> dict (ownership-gated torch.load with weights_only=False)",
-        "_intersect_freeze_meta_by_module(saved, expected) -> (saved_filt, expected_filt) (cross-arch drop-zero-match rule)"
+        "_intersect_freeze_meta_by_module(saved, expected) -> (saved_filt, expected_filt) (cross-arch drop-zero-match rule)",
+        "_read_weight_decay_scope(ckpt_dir) -> str (scope recorded in metadata.json; none recorded means exclude_norms_and_biases)"
       ],
       "tested_by": [
+        "tests/unit/test_checkpoint.py::TestWeightDecayScopeOnResume",
         "tests/unit/test_checkpoint.py::TestCheckpointRetention",
         "tests/unit/test_checkpoint.py::TestFlushPendingSave",
         "tests/unit/test_checkpoint.py::TestPeekSavedStep",
@@ -1209,7 +1215,7 @@
         "tests/unit/test_checkpoint.py::TestIntersectFreezeMetaByModule",
         "tests/unit/test_checkpoint_security.py::TestLoadTrainStateOwnershipGate",
         "tests/unit/test_checkpoint_security.py::TestManagerLoadRejectsForeignCheckpoint",
-        "tests/integration/test_checkpoint_roundtrip.py::TestCheckpointRoundtrip",
+        "tests/unit/test_checkpoint.py::TestCheckpointManagerLoad",
         "tests/distributed/test_checkpoint.py"
       ]
     },
@@ -1417,7 +1423,7 @@
     },
     "scripts/prepare_data.py": {
       "purpose": "Validate pre-tokenized datasets (.bin/.npy) for MemoryMappedDataset",
-      "entry": "validate(data_path)"
+      "entry": "validate(data_path, token_dtype)"
     },
     "scripts/eval_harness.py": {
       "purpose": "Run lm-eval-harness benchmarks on KempnerForge checkpoints (converts DCP to HF format)",
@@ -1600,11 +1606,12 @@
       },
       "tests/unit/test_optimizer.py": {
         "classes": [
-          "TestNewtonSchulz(3)",
-          "TestMuon(11)",
+          "TestNewtonSchulz(5)",
+          "TestMuon(29)",
+          "TestMuonRouting(6)",
           "TestAdamW(2)"
         ],
-        "count": 16
+        "count": 42
       },
       "tests/unit/test_eval.py": {
         "classes": [

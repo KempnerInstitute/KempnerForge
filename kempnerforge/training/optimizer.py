@@ -3,13 +3,15 @@
 Builds optimizers with per-parameter-group settings:
   - AdamW: standard Adam with decoupled weight decay
   - Muon: momentum with orthogonalized updates via Newton-Schulz iteration.
-    Applies Muon to 2D+ weight matrices, AdamW to 1D params (biases, norms).
+    Applies Muon to hidden nn.Linear weights, AdamW to the rest (embeddings,
+    output head, norms, biases).
   - Lion: sign-based momentum update (half the optimizer memory of AdamW)
   - Schedule-Free AdamW: eliminates LR schedule by averaging iterates
 
 All optimizers:
-  - Weight decay applied to matrix weights only
-  - Bias and norm parameters excluded from weight decay
+  - Weight decay follows optimizer.weight_decay_scope: by default every parameter
+    with ndim > 1 and no "bias" in its name is decayed, and "all" decays every
+    parameter
   - Fused kernel when available (PyTorch 2.x, AdamW only)
 """
 
@@ -24,6 +26,9 @@ import torch
 from kempnerforge.config.optimizer import MUON_ADJUST_LR_MODES, MUON_ORTHOGONALIZE_MODES
 from kempnerforge.config.registry import registry
 from kempnerforge.config.schema import OptimizerConfig
+from kempnerforge.model.embedding import OutputHead
+from kempnerforge.model.moe import MoEMLP
+from kempnerforge.model.moma import ExpertChoiceMoE
 from kempnerforge.training.orthogonalize import orthogonalize_exact
 
 logger = logging.getLogger(__name__)
@@ -33,6 +38,7 @@ logger = logging.getLogger(__name__)
 def _build_adamw(
     param_groups: list[dict],
     config: OptimizerConfig,
+    model: torch.nn.Module,
 ) -> torch.optim.Optimizer:
     return torch.optim.AdamW(
         param_groups,
@@ -112,6 +118,7 @@ class Lion(torch.optim.Optimizer):
 def _build_lion(
     param_groups: list[dict],
     config: OptimizerConfig,
+    model: torch.nn.Module,
 ) -> torch.optim.Optimizer:
     return Lion(
         param_groups,
@@ -248,6 +255,7 @@ class ScheduleFreeAdamW(torch.optim.Optimizer):
 def _build_schedule_free_adamw(
     param_groups: list[dict],
     config: OptimizerConfig,
+    model: torch.nn.Module,
 ) -> torch.optim.Optimizer:
     return ScheduleFreeAdamW(
         param_groups,
@@ -273,18 +281,22 @@ def _newton_schulz(G: torch.Tensor, steps: int = 5) -> torch.Tensor:
     convergence in 5 steps from a spectrally-normalized starting point.
 
     Cost: ~15 FLOPs per parameter per step — negligible vs forward/backward.
+    A tall G is iterated as G^T, so ``A`` is min(rows, cols) square.
     """
     assert G.ndim == 2
     a, b, c = 3.4445, -4.7750, 2.0315
 
     X = G / (G.norm() + 1e-7)
+    tall = X.shape[0] > X.shape[1]
+    if tall:
+        X = X.T
 
     for _ in range(steps):
         A = X @ X.T
         B = b * A + c * A @ A
         X = a * X + B @ X
 
-    return X
+    return X.T if tall else X
 
 
 def _orthogonalize_matrix(matrix: torch.Tensor, steps: int) -> torch.Tensor:
@@ -325,8 +337,8 @@ class Muon(torch.optim.Optimizer):
     update direction via Newton-Schulz iteration. This keeps update
     directions independent of parameter scale.
 
-    For 1D parameters (biases, norms, embeddings): uses standard AdamW,
-    since orthogonalization requires 2D matrices.
+    For the rest (embeddings, the output head, norms, biases): uses
+    standard AdamW.
 
     FSDP2 note: Newton-Schulz operates on each rank's local shard
     independently — an approximation, not mathematically equivalent to
@@ -334,15 +346,15 @@ class Muon(torch.optim.Optimizer):
     for distributed Muon and works well in practice.
 
     Args:
-        muon_params: Parameter groups for Muon (2D+ weights).
-        adam_params: Parameter groups for AdamW fallback (1D params).
-        lr: Learning rate for Muon (2D weights).
+        muon_params: Parameter groups for Muon (the hidden ``nn.Linear`` weights).
+        adam_params: Parameter groups for AdamW fallback (every other parameter).
+        lr: Learning rate for Muon.
         momentum: Momentum coefficient (default 0.95).
         weight_decay: Decoupled weight decay.
         adam_betas: Betas for the AdamW fallback.
         adam_eps: Epsilon for the AdamW fallback.
         ns_steps: Newton-Schulz iteration steps (default 5).
-        adam_lr: Learning rate for AdamW fallback (1D params). None = same as lr.
+        adam_lr: Learning rate for AdamW fallback. None = same as lr.
         nesterov: Feed Newton-Schulz the Nesterov look-ahead instead of the momentum buffer.
         adjust_lr: Update scale: "original" sqrt(max(1, rows/cols)), "match_rms_adamw"
             0.2 * sqrt(max(rows, cols)), or "spectral_unclamped" sqrt(rows/cols).
@@ -504,24 +516,31 @@ class Muon(torch.optim.Optimizer):
         return loss
 
 
-def _is_muon_eligible(param: torch.Tensor) -> bool:
-    """Check if a parameter should use Muon (Newton-Schulz orthogonalization).
+def _muon_matrices(model: torch.nn.Module, *, routers: bool) -> set[torch.Tensor]:
+    """Return the ``nn.Linear`` weights Muon orthogonalizes.
 
-    Muon is applied to 2D weight matrices with reasonable aspect ratios.
-    Highly rectangular matrices (embeddings, output heads) are too expensive
-    for Newton-Schulz (X@X^T becomes vocab_size x vocab_size) and get AdamW.
+    The output head's go to AdamW, and so do the MoE routers' unless ``routers``.
     """
-    if param.ndim < 2:
-        return False
-    m, n = param.shape[0], param.view(param.shape[0], -1).shape[1]
-    return max(m, n) / max(min(m, n), 1) <= 10
+    adamw: set[torch.Tensor] = set()
+    for module in model.modules():
+        if isinstance(module, OutputHead):
+            adamw.update(module.parameters())
+        elif not routers and isinstance(module, MoEMLP | ExpertChoiceMoE):
+            adamw.update(module.router.parameters())
+    return {
+        module.weight
+        for module in model.modules()
+        if isinstance(module, torch.nn.Linear) and module.weight not in adamw
+    }
 
 
 @registry.register_optimizer("muon")
 def _build_muon(
     param_groups: list[dict],
     config: OptimizerConfig,
+    model: torch.nn.Module,
 ) -> torch.optim.Optimizer:
+    on_muon = _muon_matrices(model, routers=config.muon_router)
     muon_groups = []
     adam_groups = []
 
@@ -529,7 +548,7 @@ def _build_muon(
         muon_params = []
         adam_params = []
         for p in group["params"]:
-            if _is_muon_eligible(p):
+            if p in on_muon:
                 muon_params.append(p)
             else:
                 adam_params.append(p)
@@ -561,11 +580,25 @@ def _build_muon(
     )
 
 
-def _should_decay(name: str, param: torch.nn.Parameter) -> bool:
+def _should_decay(name: str, param: torch.nn.Parameter, scope: str) -> bool:
     """Decide whether a parameter should receive weight decay.
 
-    Excluded: 1D parameters (biases, norm scales/shifts), embedding weights.
+    Args:
+        name: Fully qualified parameter name.
+        param: The parameter itself.
+        scope: ``"exclude_norms_and_biases"`` keeps decay off every parameter of
+            rank 1 or 0 (norm scales and shifts, and scalars) and any parameter
+            whose name contains ``"bias"``. Everything else is decayed, which
+            includes the token embedding, the output head and any parameter of
+            higher rank such as packed expert weights or a convolution kernel.
+            ``"all"`` decays every parameter, which is what ``torch.optim.AdamW``
+            does by default.
+
+    Returns:
+        True when the parameter belongs in the weight-decay group.
     """
+    if scope == "all":
+        return True
     if param.ndim <= 1:
         return False
     return "bias" not in name
@@ -590,7 +623,7 @@ def build_optimizer(
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        if _should_decay(name, param):
+        if _should_decay(name, param, config.weight_decay_scope):
             decay_params.append(param)
         else:
             no_decay_params.append(param)
@@ -607,4 +640,4 @@ def build_optimizer(
     )
 
     builder = registry.get_optimizer(config.name)
-    return builder(param_groups, config)
+    return builder(param_groups, config, model)

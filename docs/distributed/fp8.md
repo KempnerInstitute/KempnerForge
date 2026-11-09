@@ -2,8 +2,8 @@
 
 FP8 training converts `nn.Linear` modules to `torchao.float8.Float8Linear`,
 which runs E4M3 forward / E5M2 backward matmuls with dynamic
-tensorwise scaling. Master weights stay in bf16 — FP8 is a compute
-mode, not a storage dtype.
+tensorwise scaling. FP8 is a compute mode, not a storage dtype: master
+weights stay in bf16, or fp32 with `train.fp32_master_weights = true`.
 
 Entry point:
 [`apply_float8(model, enable_fsdp_float8_all_gather=True)`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/distributed/parallel.py)
@@ -31,18 +31,24 @@ So the converted set is:
 | Dense MLP `gate_proj`, `up_proj`, `down_proj` | yes | Standard `Linear` call path |
 | Final `output_head.proj` | yes | Standard `Linear` call path |
 | MoE `experts.*.{gate,up,down}_proj` | **no** | Bypass — uses `torch._grouped_mm` |
-| `shared_expert.*` | **no** | Same expert GEMM codepath |
+| `shared_expert.*` | **no** | By convention, to match the routed experts (a plain `Linear` call path) |
 | `router.gate` | **no** | Small output dim, not compute-bound |
 | `token_embedding` | no | Not a `Linear` — `nn.Embedding` |
 | Norms (RMSNorm) | no | Not a `Linear` |
 
 ## Exclusion rules
 
-**`"experts"` / `"shared_expert"` in fqn**: the MoE forward uses
+**`"experts"` in fqn**: the routed experts' forward uses
 `torch._grouped_mm` (grouped GEMM over stacked expert weights) when
 available. That call bypasses `Float8Linear.forward`, so wrapping
 the expert Linears does nothing useful and would surprise debugging.
 See [Expert parallelism § Local compute](expert-parallelism.md#dispatch--combine-flow).
+
+**`"shared_expert"` in fqn**: the shared expert never takes the
+grouped-GEMM path; `MoEMLP.forward` calls it as a plain module, so its
+projections are ordinary `Linear` calls. It is excluded by convention,
+to match the routed experts (see
+[MoE FP8 § Why the shared expert is excluded](../moe/moe-fp8.md#why-the-shared-expert-is-excluded)).
 
 **`"router"` in fqn**: the router gate's output dim is
 `num_experts`, typically 8-64. `torch._scaled_mm` (used inside
@@ -109,7 +115,8 @@ The confusing part of FP8 training is that parameters are still
 stored in bf16 — FP8 quantization happens at the matmul boundary:
 
 - Parameter storage: `bfloat16` (matches `mixed_precision: "bf16"`
-  master weights).
+  master weights), or `float32` with `fp32_master_weights = true`
+  (see [FSDP2 § fp32 master weights](fsdp2.md#fp32-master-weights)).
 - Forward matmul: quantize to `E4M3` → `torch._scaled_mm` →
   dequantize output.
 - Backward matmul: quantize to `E5M2` → `torch._scaled_mm` →
@@ -128,7 +135,7 @@ tensor (torchao handles the interop).
 _DTYPE_MAP = {
     "bf16": torch.bfloat16,
     "fp32": torch.float32,
-    "fp8":  torch.bfloat16,  # FP8 compute with bf16 master weights
+    "fp8":  torch.bfloat16,  # FP8 compute; bf16 masters unless fp32_master_weights
 }
 ```
 
@@ -136,7 +143,8 @@ _DTYPE_MAP = {
 
 ```toml
 [train]
-mixed_precision = "fp8"           # bf16 master weights, E4M3/E5M2 matmul
+mixed_precision = "fp8"           # E4M3/E5M2 matmul, bf16 master weights
+fp32_master_weights = false      # true keeps the master weights in fp32
 ```
 
 That's the entire surface. The recipe is always `TENSORWISE`
@@ -164,7 +172,7 @@ tp = 1
 
 With 16× H200 and TP off, `enable_fsdp_float8_all_gather=True` is the
 full FP8 path — FSDP2 all-gathers ride FP8, matmuls run on Hopper
-tensor cores, master weights stay bf16. Benchmark in
+tensor cores, master weights stay bf16 (fp32 with `fp32_master_weights`). Benchmark in
 [Benchmarks § MFU scaling](../reference/benchmarks.md#mfu-scaling-dense).
 
 ## Accuracy notes

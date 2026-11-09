@@ -44,9 +44,20 @@ you from optimizing into garbage. The usual flow:
 
 1. Grep the log for the first NaN step → get `N`.
 2. Identify the last clean checkpoint at `step_M` where `M < N`.
-3. Restart with `--checkpoint.load_path=checkpoints/<run>/step_M` and
-   a lower LR or a reduced spike-prone feature (e.g., turn off FP8 if
-   you were testing it).
+3. Restart with a new `--checkpoint.dir` and
+   `--checkpoint.load_path=checkpoints/<run>/step_M`, and a reduced
+   spike-prone feature (e.g., turn off FP8 if you were testing it). A
+   lower `--optimizer.lr` does not take effect here, because the
+   restore brings back the saved base LR. A longer
+   `--scheduler.warmup_steps` does, but it lowers the LR right after
+   `step_M` only when `M / warmup_steps` falls below the old schedule's
+   factor at step `M`, and can raise it otherwise, even when it extends
+   past `step_M` (see
+   [NaN detection § Rollback recommendation](../resilience/nan-detection.md#rollback-recommendation)).
+   Keeping the old `--checkpoint.dir` resumes its newest
+   checkpoint instead, since `load_path` is not used while
+   `checkpoint.dir` holds a checkpoint (rank 0 logs a warning naming
+   both paths).
 
 ### Configuration caveat
 
@@ -68,21 +79,28 @@ If you see one, that's the real signal; the NaN is a consequence.
 OOMs.
 
 **What the codebase does:** `MetricsTracker` calls
-`get_memory_stats()` every step and logs `gpu/allocated_gb`,
+`get_memory_stats()` on every logging step and logs `gpu/allocated_gb`,
 `gpu/peak_gb`, `gpu/reserved_gb`, `gpu/mem_utilization` to WandB /
-TensorBoard. Start there — plot `peak_gb` over step count.
+TensorBoard. Start there, and plot `gpu/allocated_gb` over step count:
+it is the memory held by live tensors when the step is logged, after
+the step's activations are freed, so anything a step leaves behind
+adds to it. Don't hunt a leak in `gpu/peak_gb`: it is the run's
+high-water mark, so it never falls, and a leak stays hidden in it until
+it climbs past the run's earlier maximum.
 
 ```
-[step   50] gpu/peak_gb=78.4 | ...
-[step  100] gpu/peak_gb=78.4 | ...
-[step  500] gpu/peak_gb=78.4 | ...
-[step 1000] gpu/peak_gb=78.6 | ...     ← +200 MB
-[step 2000] gpu/peak_gb=79.1 | ...     ← +500 MB over another 1k steps
+[step   50] gpu/allocated_gb=41.2 | ...
+[step  100] gpu/allocated_gb=41.2 | ...
+[step  500] gpu/allocated_gb=41.2 | ...
+[step 1000] gpu/allocated_gb=41.4 | ...     ← +200 MB
+[step 2000] gpu/allocated_gb=41.9 | ...     ← +500 MB over another 1k steps
 ```
 
-A flat curve is healthy; a staircase is a leak, and a steady slope is
-fragmentation. For the staircase pattern, a snapshot is the fastest
-way to identify the source:
+A flat curve is healthy; one that climbs, in a staircase or a steady
+slope, is a leak. Fragmentation does not show in `allocated_gb`: watch
+the gap between `reserved_gb` and `allocated_gb` for it (see
+[Fragmentation vs genuine leaks](#fragmentation-vs-genuine-leaks)).
+For a leak, a snapshot is the fastest way to identify the source:
 
 ```python
 # In your training script, before `trainer.train()` or equivalent:
@@ -244,7 +262,7 @@ A debugging session usually follows this sequence:
 Symptom
    │
    ├─ Loss NaN      → train/grad_norm + last-good checkpoint → restart lower LR
-   ├─ OOM           → peak_gb trace → snapshot → memory_viz
+   ├─ OOM           → allocated_gb trace → snapshot → memory_viz
    ├─ Rank hang     → NCCL liveness + NCCL_TIMEOUT → inspect rank-specific code
    ├─ Slowdown      → step_time_sec → torch.profiler → kernel summary
    └─ Bad eval      → re-run eval on baseline → audit data / LR / tokenizer

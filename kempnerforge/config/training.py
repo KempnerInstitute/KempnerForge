@@ -9,6 +9,8 @@ from typing import TYPE_CHECKING, Literal
 if TYPE_CHECKING:
     import torch
 
+FP32_CROSS_ENTROPY_LOSSES = ("cross_entropy", "chunked_cross_entropy")
+
 _FP16_UNSUPPORTED = (
     "train.mixed_precision='fp16' is not supported: it would train in pure fp16 "
     "with no loss scaling, so small gradients underflow to zero. Use 'bf16', or "
@@ -40,10 +42,13 @@ class TrainConfig:
     data_seed: int | None = None
     compile_model: bool = True
     mixed_precision: Literal["bf16", "fp16", "fp32", "fp8"] = "bf16"
+    fp32_master_weights: bool = False
+    tf32: bool = False
     activation_checkpointing: ActivationCheckpointing = ActivationCheckpointing.none
     loss_fn: str = "cross_entropy"
     z_loss_weight: float = 0.0
     ce_chunk_size: int = 0
+    fp32_cross_entropy: bool = False
     shutdown_timeout_sec: float = 600.0
     nccl_health_check_interval: int = 0
 
@@ -60,12 +65,23 @@ class TrainConfig:
             raise ValueError("grad_clip_norm must be positive")
         if self.mixed_precision == "fp16":
             raise ValueError(_FP16_UNSUPPORTED)
+        if self.fp32_master_weights and self.mixed_precision == "fp32":
+            raise ValueError(
+                "train.fp32_master_weights has no effect with mixed_precision='fp32': the "
+                "weights are already fp32. Use it with 'bf16' or 'fp8', or turn it off."
+            )
+        if self.fp32_cross_entropy and self.loss_fn not in FP32_CROSS_ENTROPY_LOSSES:
+            raise ValueError(
+                f"train.fp32_cross_entropy applies to {', '.join(FP32_CROSS_ENTROPY_LOSSES)}, "
+                f"not loss_fn={self.loss_fn!r}"
+            )
 
     @property
     def param_dtype(self) -> torch.dtype:
-        """Resolve mixed_precision to the master weight dtype.
+        """Resolve mixed_precision to the compute dtype, also the master weight dtype by default.
 
-        FP8 uses bf16 master weights -- FP8 is a compute mode, not a storage dtype.
+        FP8 resolves to bf16 -- FP8 is a compute mode, not a storage dtype. The storage
+        dtype is :attr:`master_dtype`, which is fp32 with ``fp32_master_weights``.
         A config switched to ``"fp16"`` after construction skips ``__post_init__``,
         so ``"fp16"`` raises the same ``ValueError`` here.
         """
@@ -79,6 +95,13 @@ class TrainConfig:
             "fp8": torch.bfloat16,
         }
         return _DTYPE_MAP[self.mixed_precision]
+
+    @property
+    def master_dtype(self) -> torch.dtype:
+        """Dtype the parameters, their gradients and the optimizer state are kept in."""
+        import torch
+
+        return torch.float32 if self.fp32_master_weights else self.param_dtype
 
     @property
     def is_fp8(self) -> bool:

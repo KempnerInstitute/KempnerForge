@@ -172,6 +172,10 @@ class TestModelConfig:
         with pytest.raises(ValueError, match="moe_frequency must be positive"):
             ModelConfig(num_experts=8, moe_frequency=0)
 
+    def test_moe_rejects_negative_shared_experts(self):
+        with pytest.raises(ValueError, match="moe_shared_experts must be >= 0, got -1"):
+            ModelConfig(num_experts=8, moe_shared_experts=-1)
+
     def test_moe_param_estimate(self):
         dense = ModelConfig(dim=256, n_layers=2, n_heads=4, vocab_size=1000)
         moe = ModelConfig(
@@ -267,6 +271,43 @@ class TestTrainConfig:
         config.mixed_precision = "fp16"
         with pytest.raises(ValueError, match="'fp16' is not supported: .*no loss scaling"):
             _ = config.param_dtype
+
+    def test_fp32_master_weights_default_off(self) -> None:
+        t = TrainConfig()
+        assert t.fp32_master_weights is False
+        assert t.master_dtype == t.param_dtype == torch.bfloat16
+
+    @pytest.mark.parametrize(
+        ("mixed_precision", "compute"),
+        [("bf16", torch.bfloat16), ("fp8", torch.bfloat16)],
+    )
+    def test_fp32_master_weights_keep_the_compute_dtype(
+        self, mixed_precision: str, compute: torch.dtype
+    ) -> None:
+        t = TrainConfig(mixed_precision=mixed_precision, fp32_master_weights=True)
+        assert t.param_dtype == compute
+        assert t.master_dtype == torch.float32
+
+    def test_fp32_master_weights_rejected_with_fp32(self) -> None:
+        with pytest.raises(ValueError, match="no effect with mixed_precision='fp32'"):
+            TrainConfig(mixed_precision="fp32", fp32_master_weights=True)
+
+    def test_fp32_master_weights_from_cli(self) -> None:
+        config = load_config(cli_args=["--train.fp32_master_weights=true"])
+        assert config.train.master_dtype == torch.float32
+
+    def test_tf32_defaults_off(self) -> None:
+        assert TrainConfig().tf32 is False
+
+    def test_tf32_from_cli(self) -> None:
+        assert load_config(cli_args=["--train.tf32=true"]).train.tf32 is True
+
+    def test_fp32_cross_entropy_defaults_off(self) -> None:
+        assert TrainConfig().fp32_cross_entropy is False
+
+    def test_fp32_cross_entropy_from_cli(self) -> None:
+        config = load_config(cli_args=["--train.fp32_cross_entropy=true"])
+        assert config.train.fp32_cross_entropy is True
 
     def test_data_seed_defaults_to_none(self):
         assert TrainConfig().data_seed is None
@@ -510,6 +551,46 @@ class TestDataConfig:
         with pytest.raises(ValueError, match="prefetch_factor must be >= 1"):
             DataConfig(prefetch_factor=0)
 
+    def test_token_dtype_defaults_to_empty(self):
+        assert DataConfig().token_dtype == ""
+
+    @pytest.mark.parametrize("dtype", ["uint16", "uint32"])
+    def test_token_dtype_accepts_uint16_and_uint32(self, dtype):
+        assert DataConfig(token_dtype=dtype).token_dtype == dtype
+
+    @pytest.mark.parametrize("dtype", ["int32", "uint8", "u2", "UINT16"])
+    def test_token_dtype_rejects_anything_else(self, dtype):
+        with pytest.raises(ValueError, match="data.token_dtype must be 'uint16' or 'uint32'"):
+            DataConfig(token_dtype=dtype)
+
+    def test_token_dtypes_load_from_toml_and_cli(self, tmp_path):
+        toml = tmp_path / "data.toml"
+        toml.write_text(
+            '[data]\ntoken_dtype = "uint16"\n\n'
+            '[[data.datasets]]\npath = "/d/a"\ntoken_dtype = "uint32"\n\n'
+            '[eval]\ntoken_dtype = "uint16"\n'
+        )
+        config = load_config(str(toml), cli_args=["--eval.token_dtype=uint32"])
+        assert config.data.token_dtype == "uint16"
+        assert config.data.datasets[0].token_dtype == "uint32"
+        assert config.eval.token_dtype == "uint32"
+
+    def test_invalid_token_dtype_override_fails_at_load(self):
+        with pytest.raises(ValueError, match="data.token_dtype must be 'uint16' or 'uint32'"):
+            load_config(cli_args=["--data.token_dtype=int32"])
+
+    @pytest.mark.parametrize("value", ["0", "False", "None"])
+    def test_falsy_non_string_override_fails_at_load(self, value):
+        """The loader keeps ``0``, ``False`` and ``None`` as non-strings, so they fail too."""
+        with pytest.raises(ValueError, match="data.token_dtype must be 'uint16' or 'uint32'"):
+            load_config(cli_args=[f"--data.token_dtype={value}"])
+
+    def test_falsy_toml_value_fails_at_load(self, tmp_path):
+        toml = tmp_path / "data.toml"
+        toml.write_text("[data]\ntoken_dtype = false\n")
+        with pytest.raises(ValueError, match="data.token_dtype must be 'uint16' or 'uint32'"):
+            load_config(str(toml))
+
 
 class TestMetricsConfig:
     def test_rejects_zero_log_interval(self):
@@ -586,6 +667,21 @@ class TestJobConfig:
         )
         config.validate(world_size=1)
 
+    def test_validate_moe_fp32_master_weights_on_one_gpu_rejected(self) -> None:
+        config = JobConfig(
+            model=ModelConfig(num_experts=8, moe_top_k=2),
+            train=TrainConfig(fp32_master_weights=True),
+        )
+        with pytest.raises(ValueError, match="fp32_master_weights with an MoE model"):
+            config.validate(world_size=1)
+
+    def test_validate_moe_fp32_master_weights_under_fsdp2_passes(self) -> None:
+        config = JobConfig(
+            model=ModelConfig(num_experts=8, moe_top_k=2),
+            train=TrainConfig(fp32_master_weights=True),
+        )
+        config.validate(world_size=2)
+
     def test_validate_dense_with_pp_passes(self):
         config = JobConfig(
             model=ModelConfig(tie_embeddings=False),
@@ -625,6 +721,20 @@ class TestJobConfig:
     def test_pp_without_packing_passes(self):
         config = JobConfig(distributed=DistributedConfig(pp=2, dp_shard=1))
         config.validate(world_size=2)
+
+    def test_pp_eval_steps_must_be_a_multiple_of_grad_accum_steps(self):
+        def job(pp: int, steps: int, enabled: bool = True) -> JobConfig:
+            return JobConfig(
+                distributed=DistributedConfig(pp=pp, dp_shard=1),
+                train=TrainConfig(grad_accum_steps=2),
+                eval=EvalConfig(enabled=enabled, steps=steps, dataset_path="/data"),
+            )
+
+        with pytest.raises(ValueError, match=r"eval.steps \(3\) must be a multiple"):
+            job(2, 3).validate(world_size=2)
+        job(2, 4).validate(world_size=2)
+        job(1, 3).validate(world_size=1)
+        job(2, 3, enabled=False).validate(world_size=2)
 
     def test_flex_rejects_seq_len_below_block_size_at_construction(self):
         """Decidable from the config alone, so it fires in __post_init__."""
@@ -1570,6 +1680,36 @@ class TestRegistry:
         assert reg.get("model", "x") == "model_x"
         assert reg.get("optimizer", "x") == "opt_x"
 
+    def test_unregister_removes_the_entry_and_returns_it(self):
+        reg = Registry()
+        reg.register("model", "a", "model_a")
+        reg.register("model", "b", "model_b")
+        assert reg.unregister("model", "a") == "model_a"
+        assert reg.list("model") == ["b"]
+        reg.register("model", "a", "model_a2")
+        assert reg.get("model", "a") == "model_a2"
+
+    def test_unregister_unknown_raises(self):
+        reg = Registry()
+        reg.register("model", "a", None)
+        with pytest.raises(KeyError, match=r"Unknown model: 'b'\. Available: \['a'\]"):
+            reg.unregister("model", "b")
+
+    def test_unregister_adapter_drops_its_accepts(self):
+        """The adapter and its ``accepts`` declaration leave together, so a later
+        adapter under the same name does not inherit the old declaration."""
+        reg = Registry()
+
+        def build(in_dim, out_dim, **_):
+            return None
+
+        reg.register_adapter("a", accepts=("pool_window",))(build)
+        assert reg.unregister("adapter", "a") is build
+        assert reg.list_adapters() == []
+        assert reg.get_adapter_accepts("a") is None
+        reg.register_adapter("a")(build)
+        assert reg.get_adapter_accepts("a") is None
+
     def test_builtin_optimizer_registered(self):
         from kempnerforge.config.registry import registry
         from kempnerforge.training import optimizer as _  # noqa: F401
@@ -1624,6 +1764,13 @@ class TestEvalConfig:
     def test_rejects_zero_steps(self):
         with pytest.raises(ValueError, match="eval steps must be positive"):
             EvalConfig(steps=0)
+
+    def test_token_dtype_defaults_to_empty(self):
+        assert EvalConfig().token_dtype == ""
+
+    def test_token_dtype_rejects_anything_else(self):
+        with pytest.raises(ValueError, match="eval.token_dtype must be 'uint16' or 'uint32'"):
+            EvalConfig(token_dtype="int64")
 
     def test_validation_requires_data_source(self):
         config = JobConfig()

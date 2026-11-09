@@ -1,7 +1,7 @@
 """GPU health monitoring and NaN detection.
 
 Provides utilities for detecting common failures during training:
-  - NaN/Inf in loss or gradients
+  - NaN/Inf in loss, gradients or parameters
   - GPU availability and basic health
   - NCCL liveness via lightweight collectives
 """
@@ -14,6 +14,7 @@ from datetime import timedelta
 
 import torch
 import torch.distributed as dist
+from torch.distributed.tensor import DTensor
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +38,7 @@ class NaNDetector:
       - ``"skip"``: Skip the optimizer step (zero gradients).
       - ``"raise"``: Raise a ``RuntimeError``.
 
-    If consecutive NaN count exceeds ``max_consecutive``, the detector
+    Once the consecutive NaN count reaches ``max_consecutive``, the detector
     signals that a checkpoint rollback is recommended.
 
     Args:
@@ -59,24 +60,35 @@ class NaNDetector:
         self.max_history = max_history
         self.state = NaNState()
 
-    def check_loss(self, loss: float, step: int) -> bool:
-        """Check a loss value for NaN/Inf.
+    def check_loss(self, loss: float, step: int, grad_norm: float | None = None) -> bool:
+        """Check a step's loss, and its gradient norm when given, for NaN/Inf.
 
         When running distributed, all-reduces a NaN flag so ALL ranks agree
         on whether to skip. Prevents rank desync where one rank sees NaN and
         skips its optimizer step while others proceed normally.
 
+        A finite loss does not guarantee finite gradients: a micro-batch whose
+        labels are all masked has an exact zero cross-entropy loss whatever its
+        activations, so the caller passes the gradient norm as well. Each rank's
+        norm goes into the same reduced flag, since the norms can differ between
+        ranks (under expert parallelism each covers the shared parameters and
+        only that rank's experts).
+
         Args:
             loss: The scalar loss value to check.
             step: Current training step.
+            grad_norm: The step's gradient norm, or ``None`` to check the loss alone.
 
         Returns:
-            True if the loss is valid (finite) on ALL ranks, False if any rank has NaN/Inf.
+            True if the loss and the gradient norm are finite on ALL ranks, False
+            if any rank has NaN/Inf in either.
 
         Raises:
             RuntimeError: If action is "raise" and NaN is detected.
         """
-        local_nan = not _is_finite(loss)
+        bad_loss = not _is_finite(loss)
+        bad_grad_norm = grad_norm is not None and not _is_finite(grad_norm)
+        local_nan = bad_loss or bad_grad_norm
 
         if dist.is_initialized():
             nan_flag = torch.tensor([1.0 if local_nan else 0.0], device="cuda")
@@ -98,7 +110,7 @@ class NaNDetector:
 
         if local_nan:
             msg = (
-                f"NaN/Inf loss at step {step} "
+                f"NaN/Inf {'loss' if bad_loss else 'gradient norm'} at step {step} "
                 f"(consecutive={self.state.consecutive_nans}, "
                 f"total={self.state.total_nans}, "
                 f"last_good_loss={self.state.last_good_loss:.4f} "
@@ -147,6 +159,32 @@ class NaNDetector:
     def reset(self) -> None:
         """Reset NaN tracking state (e.g., after a rollback)."""
         self.state = NaNState()
+
+
+def params_are_finite(model: torch.nn.Module, device: torch.device | str) -> bool:
+    """Check that no rank holds a NaN/Inf parameter of ``model``.
+
+    Each rank checks the parameters it holds (the local shard of a
+    ``DTensor``). When running distributed, one all-reduce of a flag over
+    the default process group gives every rank the same answer, so this is
+    a collective that every rank must call.
+
+    Args:
+        model: The model, or this rank's pipeline stage of it.
+        device: Device for the all-reduced flag; it must suit the default
+            process group's backend (CUDA under NCCL).
+
+    Returns:
+        True if every parameter is finite on every rank.
+    """
+    with torch.no_grad():
+        nonfinite = torch.zeros(1, device=device)
+        for p in model.parameters():
+            local = p.to_local() if isinstance(p, DTensor) else p
+            nonfinite += (~torch.isfinite(local).all()).to(device)
+    if dist.is_initialized():
+        dist.all_reduce(nonfinite)
+    return nonfinite.item() == 0
 
 
 def check_gpu_health(device: int = 0) -> dict[str, bool | str]:

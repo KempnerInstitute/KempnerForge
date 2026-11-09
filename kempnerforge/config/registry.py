@@ -18,8 +18,10 @@ Usage:
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from typing import Any
+
+AdapterAccepts = Collection[str] | Callable[[Any], Collection[str]]
 
 
 class Registry:
@@ -48,6 +50,21 @@ class Registry:
             available = list(store.keys())
             raise KeyError(f"Unknown {category}: '{name}'. Available: {available}")
         return store[name]
+
+    def unregister(self, category: str, name: str) -> Any:
+        """Remove the object under category/name and return it.
+
+        Removing an adapter also removes the ``accepts`` declaration it
+        registered with, so a later adapter under that name starts without one.
+
+        Raises:
+            KeyError: Nothing is registered under category/name.
+        """
+        obj = self.get(category, name)
+        del self._get_store(category)[name]
+        if category == "adapter":
+            self._get_store("adapter_accepts").pop(name, None)
+        return obj
 
     def list(self, category: str) -> list[str]:
         """List all registered names in a category."""
@@ -163,23 +180,53 @@ class Registry:
     def list_modality_strategies(self) -> list[str]:
         return self.list("modality_strategy")
 
-    def register_adapter(self, name: str) -> Callable:
+    def register_adapter(self, name: str, accepts: AdapterAccepts | None = None) -> Callable:
         """Decorator to register an adapter builder.
 
         Adapters project image features (``(B, N, feature_dim)``) into the
         LLM embedding space (``(B, N, model.dim)``). Builders take
         ``(in_dim, out_dim, **kwargs)`` and return an ``nn.Module`` with the
         expected forward shape.
+
+        Args:
+            name: Registry key, selected by ``adapter.type``.
+            accepts: The ``AdapterConfig`` fields the builder uses: a
+                collection of field names, or a callable that maps an
+                ``AdapterConfig`` to such a collection when the set depends
+                on other fields (a callable that returns a string makes
+                ``AdapterConfig`` raise ``TypeError``). ``AdapterConfig``
+                rejects any other field set away from its default. ``None``
+                leaves the set to the builder's own signature (a
+                ``functools.wraps`` wrapper counts as the wrapper): the
+                fields it takes as parameters passable by keyword, when its
+                ``**`` parameter is named ``_`` or it has none. A builder
+                with any other ``**`` parameter and no ``accepts`` accepts
+                every field.
+
+        Raises:
+            TypeError: ``accepts`` is a string rather than a collection of
+                field names.
         """
+        if isinstance(accepts, str):
+            raise TypeError(
+                f"accepts for adapter {name!r} must be a collection of field names or a "
+                f"callable, not the string {accepts!r}"
+            )
 
         def decorator(fn: Callable) -> Callable:
             self.register("adapter", name, fn)
+            if accepts is not None:
+                self.register("adapter_accepts", name, accepts)
             return fn
 
         return decorator
 
     def get_adapter(self, name: str) -> Callable:
         return self.get("adapter", name)
+
+    def get_adapter_accepts(self, name: str) -> AdapterAccepts | None:
+        """The ``accepts`` declaration adapter ``name`` registered, or ``None``."""
+        return self._get_store("adapter_accepts").get(name)
 
     def list_adapters(self) -> list[str]:
         return self.list("adapter")

@@ -78,6 +78,7 @@ from kempnerforge.metrics.logger import get_logger
 from kempnerforge.model.generate import sample
 from kempnerforge.model.vlm import VLMWrapper, build_vlm_wrapper
 from kempnerforge.resilience.elastic import resolve_resume_path
+from kempnerforge.training.runtime import apply_matmul_precision
 
 logger = get_logger(__name__)
 
@@ -158,10 +159,12 @@ def resolve_checkpoint(checkpoint: str) -> Path:
     """The concrete checkpoint directory ``checkpoint`` names.
 
     A run directory resolves to its ``latest``/highest ``step_N`` via
-    ``resolve_resume_path``; a specific checkpoint directory is used as-is. Symlinks are
-    followed, so a ``latest`` link that moves later cannot change the directory.
+    ``resolve_resume_path``; a specific checkpoint directory is used as-is. Only the weights
+    are loaded, so the scan keeps a ``step_N`` that lacks only ``train_state.pt``. Symlinks
+    are followed, so a ``latest`` link that moves later cannot change the directory.
     """
-    return (resolve_resume_path(checkpoint) or Path(checkpoint)).resolve()
+    resumed = resolve_resume_path(checkpoint, require_train_state=False)
+    return (resumed or Path(checkpoint)).resolve()
 
 
 def _load_weights(
@@ -515,6 +518,7 @@ class KempnerForgeVLM(lmms):
             raise ValueError(f"max_new_tokens must be >= 1, got {self._default_max_new_tokens}")
         self._config = _load_config(config)
         assert self._config.vlm is not None
+        apply_matmul_precision(self._config.train)
         self._dtype = self._config.train.param_dtype if dtype is None else _resolve_dtype(dtype)
         self._arch = self._config.vlm.arch
         _check_generative(self._config.vlm)

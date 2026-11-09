@@ -37,8 +37,8 @@ mixed_precision = "fp8"
 That's the whole surface. `build_model` picks it up via
 [`TrainConfig.is_fp8`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/config/training.py),
 `build_parallel_model` calls `apply_float8(model)` after TP/EP and
-before AC/FSDP2, and FSDP2 picks bf16 master weights (FP8 is a
-compute dtype only). No per-layer knobs.
+before AC/FSDP2, and the master weights stay bf16, or fp32 with
+`fp32_master_weights = true` (FP8 is a compute dtype only). No per-layer knobs.
 
 ### Reference config
 
@@ -120,14 +120,16 @@ Pulled from the filter in
 
 - **Converted** — attention (`q/k/v/o_proj`), dense MLP
   (`gate/up/down_proj`), final `output_head.proj`.
-- **Excluded** — MoE experts (`experts.*`, `shared_expert.*`) because
-  they use `torch._grouped_mm` and bypass `Float8Linear.forward`;
-  the MoE router because its output dim is small and not compute-bound;
-  embeddings and norms because they aren't `nn.Linear`.
+- **Excluded** — routed MoE experts (`experts.*`) because they use
+  `torch._grouped_mm` and bypass `Float8Linear.forward`; the shared
+  expert (`shared_expert.*`), a plain `Linear` call, by convention to
+  match them; the MoE router because its output dim is small and not
+  compute-bound; embeddings and norms because they aren't `nn.Linear`.
 
-For an MoE model this means attention is FP8, dense-block MLPs are FP8,
-but the expert blocks run in bf16 — typically fine, because attention
-and shared experts dominate FLOPs.
+For an MoE model this means attention, dense-block MLPs and the output
+head are FP8, but the routed and shared experts run in bf16, so FP8
+speeds up only the FLOPs outside the experts (see
+[MoE FP8](../moe/moe-fp8.md)).
 
 ## Accuracy tradeoff
 
