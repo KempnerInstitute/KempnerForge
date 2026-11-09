@@ -50,7 +50,7 @@ class TestFirstUsable:
                 raise Unusable(i)
             return "ok"
 
-        assert first_usable(0, 4, 2, read, lambda *_: None, next_row=lambda i: i + 3) == "ok"
+        assert first_usable(0, 4, 2, read, lambda *_: None, next_row=lambda i, _: i + 3) == "ok"
         assert tried == [0, 3]
 
 

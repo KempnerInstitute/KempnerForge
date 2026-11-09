@@ -41,8 +41,10 @@ class ChatRenderer:
     The sample holds ``pixel_values``, ``input_ids`` padded to ``max_text_len``, and
     next-token ``labels`` (``labels[i]`` is token ``i + 1``) that are ``-100`` on
     padding and, when ``answer_only``, outside the replies and their turn ends. The
-    replies are located by character span in the templated text, so what the template
-    writes before a reply (an empty think block, for instance) is never trained.
+    replies are located by character span in the templated text, each where the
+    template of the turns before it ends, so what the template writes before a reply
+    (an empty think block, for instance) is never trained and a user message that
+    quotes a reply is not mistaken for it.
     Leading newlines of a reply are dropped, as the template drops them. A reply that
     is empty or that ``max_text_len`` cuts away entirely is refused with
     ``UnrenderableDocumentError``, since it would train nothing.
@@ -130,23 +132,24 @@ class ChatRenderer:
             messages.append({"role": "assistant", "content": answer})
         text = self._template(messages, generation_prompt=False)
         spans: list[Span] = []
-        cursor = 0
-        for answer in answers:
-            start = self._find_reply(text, answer + self.turn_end, cursor)
-            cursor = start + len(answer) + len(self.turn_end)
-            spans.append((start, cursor))
+        for i, answer in enumerate(answers):
+            prefix = self._template(messages[: 2 * i + 1], generation_prompt=False)
+            if not text.startswith(prefix):
+                raise UnrenderableDocumentError(
+                    f"the chat template does not render turn {i} after the turns before it"
+                )
+            start = self._reply_start(text, len(prefix), answer + self.turn_end)
+            spans.append((start, start + len(answer) + len(self.turn_end)))
         return text, spans
 
-    def _find_reply(self, text: str, reply: str, cursor: int) -> int:
-        """Where ``reply`` starts an assistant turn of ``text`` at or after ``cursor``."""
-        at = text.find(self._header, cursor)
-        while at >= 0:
-            start = at + len(self._header)
-            if text.startswith(self._reply_prefix, start):
-                start += len(self._reply_prefix)
-            if text.startswith(reply, start):
-                return start
-            at = text.find(self._header, at + 1)
+    def _reply_start(self, text: str, at: int, reply: str) -> int:
+        """Where ``reply`` starts in the assistant turn ``text`` opens at ``at``."""
+        if text.startswith(self._header, at):
+            at += len(self._header)
+            if text.startswith(self._reply_prefix, at):
+                at += len(self._reply_prefix)
+            if text.startswith(reply, at):
+                return at
         raise UnrenderableDocumentError(
             f"the chat template did not render {reply!r} as an assistant turn"
         )
@@ -197,7 +200,8 @@ class RenderedDataset(Dataset):
     """Renders a reader's documents, drawing replies from a generator seeded by seed and index.
 
     A document the renderer refuses is passed over for the next one, up to
-    ``max_attempts`` in a row; ``skipped`` counts them, the first is logged.
+    ``max_attempts`` in a row; ``skipped`` counts them in the process that read
+    them (a loader worker's skips are its own), and the first is logged.
     """
 
     def __init__(
