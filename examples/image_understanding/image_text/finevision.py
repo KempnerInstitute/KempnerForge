@@ -18,12 +18,9 @@ import numpy as np
 import pyarrow as pa
 from torch.utils.data import Dataset
 
-from kempnerforge.metrics.logger import get_logger
-
-from .decode import UnreadableImageError, decode_rgb, first_readable
+from .decode import decode_rgb
 from .document import Document, Turn
-
-logger = get_logger(__name__)
+from .skip import MAX_ATTEMPTS, SkipLog, UnusableRowError, check_max_attempts, first_usable
 
 RATING_COLUMNS = (
     "relevance_min",
@@ -33,14 +30,21 @@ RATING_COLUMNS = (
 )
 
 
+def _is_text(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
 class FineVisionArrow(Dataset):
     """The kept conversations of one FineVision subset.
 
     Rows pass when their keep flag is set, every ``min_ratings`` column meets its
     threshold (a missing rating, stored as ``-1``, fails), and the row has between
     1 and ``max_images`` images, which ``None`` lifts; a ``text_only`` reader takes
-    no image filter. ``num_images`` overrides the per-row image counts stored in
-    ``index.npz``.
+    no image filter and its documents carry no image, for a renderer that accepts
+    them. ``num_images`` overrides the per-row image counts stored in ``index.npz``.
+    Turns missing their user message or their reply are dropped; a row left
+    without a turn, or whose image does not decode, is passed over for the next
+    row, up to ``max_attempts`` in a row, and ``skipped`` counts them.
     """
 
     def __init__(
@@ -51,14 +55,16 @@ class FineVisionArrow(Dataset):
         num_images: np.ndarray | None = None,
         min_ratings: dict[str, int] | None = None,
         text_only: bool = False,
-        max_attempts: int = 16,
+        max_attempts: int = MAX_ATTEMPTS,
         max_open_files: int = 4096,
     ) -> None:
+        if max_open_files < 1:
+            raise ValueError(f"max_open_files must be positive, got {max_open_files}")
         self.subset_dir = Path(subset_dir)
         self.text_only = text_only
-        self.max_attempts = max_attempts
+        self.max_attempts = check_max_attempts(max_attempts)
         self.max_open_files = max_open_files
-        self.skipped = 0
+        self._skips = SkipLog()
         index = np.load(self.subset_dir / "index.npz")
         self.files = [str(name) for name in index["files"]]
         batch_rows = index["batch_rows"]
@@ -85,6 +91,10 @@ class FineVisionArrow(Dataset):
             keep &= (counts >= 1) & (counts <= max_images)
         self.rows = np.flatnonzero(keep).astype(np.int64)
         self._readers: OrderedDict[int, Any] = OrderedDict()
+
+    @property
+    def skipped(self) -> int:
+        return self._skips.count
 
     def __getstate__(self) -> dict[str, Any]:
         state = self.__dict__.copy()
@@ -119,15 +129,16 @@ class FineVisionArrow(Dataset):
         images = (
             () if self.text_only else tuple(decode_rgb(item["bytes"]) for item in row["images"])
         )
-        turns = tuple(Turn(t["user"], (t["assistant"],)) for t in row["texts"])
+        turns = tuple(
+            Turn(t["user"], (t["assistant"],))
+            for t in row["texts"] or []
+            if _is_text(t.get("user")) and _is_text(t.get("assistant"))
+        )
+        if not turns:
+            raise UnusableRowError("no turn has both a user message and a reply")
         return Document(images=images, turns=turns, kind="conversation")
-
-    def _skip(self, index: int, error: UnreadableImageError) -> None:
-        if not self.skipped:
-            logger.warning(f"skipping row {index}: {error}; later skips are counted, not logged")
-        self.skipped += 1
 
     def __getitem__(self, index: int) -> Document:
         if not 0 <= index < len(self):
             raise IndexError(f"index {index} is out of range for {len(self)} rows")
-        return first_readable(index, len(self), self.max_attempts, self._read, self._skip)
+        return first_usable(index, len(self), self.max_attempts, self._read, self._skips)

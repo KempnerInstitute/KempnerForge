@@ -56,6 +56,12 @@ def _run(*args: str) -> None:
     subprocess.run([sys.executable, str(SCRIPT), *args], check=True, capture_output=True)
 
 
+def _run_failing(*args: str) -> str:
+    done = subprocess.run([sys.executable, str(SCRIPT), *args], capture_output=True, text=True)
+    assert done.returncode != 0
+    return done.stderr
+
+
 def _converter() -> Any:
     spec = importlib.util.spec_from_file_location("convert_finevision_to_arrow", SCRIPT)
     module = importlib.util.module_from_spec(spec)
@@ -70,12 +76,17 @@ def subset(tmp_path: Path) -> Path:
         src / "demo" / "train-00000-of-00002.parquet",
         [
             [_row(1, [("Q0", "A0")], 5), _row(2, [("Q1", "A1")], 5)],
-            [_row(1, [("Q2", "A2"), ("Q2b", "")], 5)],
+            [_row(1, [("Q2", ""), ("Q2b", " ")], 5)],
         ],
     )
     _write_parquet(
         src / "demo" / "train-00001-of-00002.parquet",
-        [[_row(1, [("Q3", "A3"), ("Q3b", "A3b")], None, width=7), _row(1, [("Q4", "A4")], 2)]],
+        [
+            [
+                _row(1, [("Q3", "A3"), ("Q3b", "A3b"), ("Q3c", "")], None, width=7),
+                _row(1, [("Q4", "A4")], 2),
+            ]
+        ],
     )
     _run("convert", "--src", str(src), "--dst", str(dst), "--procs", "1")
     _run("index", "--src", str(src), "--dst", str(dst), "--procs", "1")
@@ -132,6 +143,58 @@ class TestConversion:
         assert converter._convert_job((parquet, arrow, 3600.0)) > 0
         assert arrow.exists() and not claim.exists()
         assert not list((dst / "demo").glob("*.tmp*"))
+
+    def test_keep_flags_need_one_complete_turn(self) -> None:
+        texts = pa.array(
+            [
+                [{"user": "Q", "assistant": "A"}],
+                [{"user": "Q", "assistant": ""}, {"user": " ", "assistant": "A"}],
+                [{"user": "Q", "assistant": None}, {"user": "Q2", "assistant": "A2"}],
+                [],
+                None,
+            ],
+            type=SCHEMA.field("texts").type,
+        )
+        assert _converter().keep_flags(texts).tolist() == [True, False, True, False, False]
+        assert _converter().keep_flags(texts.slice(2, 2)).tolist() == [True, False]
+
+    def test_image_counts_without_an_images_column(self) -> None:
+        converter = _converter()
+        batch = pa.RecordBatch.from_pydict({"texts": [[], []]})
+        assert converter.image_counts(batch).tolist() == [0, 0]
+        nulls = pa.RecordBatch.from_pydict({"images": pa.array([None, None], type=pa.null())})
+        assert converter.image_counts(nulls).tolist() == [0, 0]
+
+    def test_a_failed_file_is_reported_and_leaves_nothing_behind(self, tmp_path: Path) -> None:
+        src, dst = tmp_path / "parquet", tmp_path / "arrow"
+        _write_parquet(
+            src / "demo" / "train-00000-of-00002.parquet", [[_row(1, [("Q0", "A0")], 5)]]
+        )
+        (src / "demo" / "train-00001-of-00002.parquet").write_bytes(b"not parquet")
+        stderr = _run_failing("convert", "--src", str(src), "--dst", str(dst))
+        assert "train-00001-of-00002.parquet" in stderr and "1 files failed" in stderr
+        assert (dst / "demo" / "train-00000-of-00002.meta.npz").exists()
+        assert sorted(p.name for p in (dst / "demo").iterdir()) == [
+            "train-00000-of-00002.arrow",
+            "train-00000-of-00002.meta.npz",
+        ]
+
+    def test_the_claim_is_touched_after_every_row_group(self, tmp_path: Path) -> None:
+        src, dst = tmp_path / "parquet", tmp_path / "arrow"
+        parquet = src / "demo" / "train-00000-of-00001.parquet"
+        _write_parquet(parquet, [[_row(1, [("Q0", "A0")], 5)], [_row(1, [("Q1", "A1")], 5)]])
+        (dst / "demo").mkdir(parents=True)
+        beats: list[int] = []
+        arrow = dst / "demo" / "train-00000-of-00001.arrow"
+        _converter().convert_file(parquet, arrow, "t", heartbeat=lambda: beats.append(1))
+        assert len(beats) == 2
+
+    def test_index_refuses_a_source_that_changed(self, subset: Path) -> None:
+        root = subset.parents[1]
+        with open(root / "parquet" / "demo" / "train-00001-of-00002.parquet", "ab") as f:
+            f.write(b"\0")
+        stderr = _run_failing("index", "--src", str(root / "parquet"), "--dst", str(root / "arrow"))
+        assert "not fully converted" in stderr
 
     def test_only_the_holder_releases_a_claim(self, tmp_path: Path) -> None:
         converter = _converter()
@@ -201,6 +264,21 @@ class TestFineVisionArrow:
         reader[0]
         reader[3]
         assert list(reader._readers) == [1]
+
+    @pytest.mark.parametrize("option", ["max_attempts", "max_open_files"])
+    def test_limits_must_be_positive(self, subset: Path, option: str) -> None:
+        with pytest.raises(ValueError, match="positive"):
+            FineVisionArrow(subset, **{option: 0})
+
+    def test_a_row_without_a_complete_turn_is_passed_over(self, subset: Path) -> None:
+        """An index that kept such a row (an older keep rule) still reads past it."""
+        arrays = dict(np.load(subset / "index.npz"))
+        arrays["keep"][:] = True
+        np.savez(subset / "index.npz", **arrays)
+        reader = FineVisionArrow(subset, max_images=None)
+        assert len(reader) == 5
+        assert reader[2].turns[0].user == "Q3"
+        assert reader.skipped == 1
 
     def test_an_undecodable_image_steps_to_the_next_row(self, tmp_path: Path) -> None:
         src, dst = tmp_path / "parquet", tmp_path / "arrow"

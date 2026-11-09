@@ -3,13 +3,17 @@
 
 ``convert`` writes each ``<subset>/train-*.parquet`` as ``<subset>/<name>.arrow``,
 one record batch per row group so rows keep their order, plus a ``<name>.meta.npz``
-sidecar (rows per batch, per-row keep flag, image count and ratings). Each file is
-claimed with an exclusive ``.claim`` file first, so any number of ``convert``
-processes can share the work and a rerun skips finished files; a claim older than
+sidecar (rows per batch, per-row keep flag, image count, ratings and the size of
+the source file). Each file is claimed with an exclusive ``.claim`` file first, so
+any number of ``convert`` processes can share the work and a rerun skips finished
+files; a claim is touched after every row group, and one older than
 ``--stale-claim-hours`` is taken over, so each process writes through temp files
-named for it and releases only a claim it still holds. ``index`` merges a
-fully converted subset's sidecars into ``<subset>/index.npz``; for a sidecar
-without image counts it reads them from the Arrow file.
+named for it and releases only a claim it still holds. A file that fails to
+convert leaves no temp files, the other files go on, and the failures are listed
+at the end with a non-zero exit. ``index`` merges a fully converted subset's
+sidecars into ``<subset>/index.npz``, refusing a subset whose source files changed
+size since their conversion; for a sidecar without image counts it reads them
+from the Arrow file.
 
     uv run python examples/image_understanding/scripts/convert_finevision_to_arrow.py convert \\
         --src /path/to/FineVision --dst /path/to/FineVision-arrow --procs 8
@@ -25,11 +29,13 @@ import random
 import socket
 import sys
 import time
+from collections.abc import Callable
 from multiprocessing import Pool
 from pathlib import Path
 
 import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 RATING_COLUMNS = (
@@ -58,22 +64,53 @@ def meta_path(arrow_file: Path) -> Path:
     return arrow_file.with_name(arrow_file.stem + ".meta.npz")
 
 
-def keep_row(turns: list[dict] | None) -> bool:
-    """A conversation is kept when it has turns and its last answer is non-empty."""
-    return bool(turns) and bool(turns[-1].get("assistant"))
+def keep_flags(texts: pa.Array) -> np.ndarray:
+    """Which conversations hold a turn with both a user message and a reply."""
+    offsets = texts.offsets.to_numpy()
+    offsets = offsets - offsets[0]
+    turns = texts.flatten()
+
+    def present(name: str) -> np.ndarray:
+        text = pc.fill_null(turns.field(name).cast(pa.string()), "")
+        length = pc.utf8_length(pc.utf8_trim_whitespace(text))
+        return pc.greater(length, 0).to_numpy(zero_copy_only=False)
+
+    complete = np.concatenate([[0], np.cumsum(present("user") & present("assistant"))])
+    return complete[offsets[1:]] > complete[offsets[:-1]]
 
 
 def image_counts(batch: pa.RecordBatch) -> np.ndarray:
+    """How many images each row holds; a batch without an images column holds none."""
+    names = batch.schema.names
+    if "images" not in names or pa.types.is_null(batch.schema.field("images").type):
+        return np.zeros(batch.num_rows, dtype=np.int16)
     lengths = batch.column("images").value_lengths().fill_null(0)
     return lengths.to_numpy(zero_copy_only=False).astype(np.int16)
 
 
-def convert_file(src_file: Path, dst_file: Path, tag: str = "") -> int:
-    """Write ``src_file`` as Arrow IPC and its sidecar through temp files named by ``tag``."""
-    parquet = pq.ParquetFile(src_file)
+def convert_file(
+    src_file: Path, dst_file: Path, tag: str = "", heartbeat: Callable[[], None] | None = None
+) -> int:
+    """Write ``src_file`` as Arrow IPC and its sidecar through temp files named by ``tag``.
+
+    ``heartbeat`` is called after every row group. A failure removes the temp files.
+    """
     tmp = dst_file.with_name(f"{dst_file.name}.{tag}.tmp")
+    meta_tmp = dst_file.with_name(f"{dst_file.stem}.meta.{tag}.tmp.npz")
+    try:
+        return _convert_file(src_file, dst_file, tmp, meta_tmp, heartbeat)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        meta_tmp.unlink(missing_ok=True)
+        raise
+
+
+def _convert_file(
+    src_file: Path, dst_file: Path, tmp: Path, meta_tmp: Path, heartbeat: Callable[[], None] | None
+) -> int:
+    parquet = pq.ParquetFile(src_file)
     batch_rows: list[int] = []
-    keep: list[bool] = []
+    keep: list[np.ndarray] = []
     images: list[np.ndarray] = []
     ratings: dict[str, list[int]] = {name: [] for name in RATING_COLUMNS}
     with pa.OSFile(str(tmp), "wb") as sink, pa.ipc.new_file(sink, parquet.schema_arrow) as writer:
@@ -84,7 +121,7 @@ def convert_file(src_file: Path, dst_file: Path, tag: str = "") -> int:
                 raise RuntimeError(f"{src_file} row group {group} became {len(batches)} batches")
             writer.write_batch(batches[0])
             batch_rows.append(table.num_rows)
-            keep.extend(keep_row(turns) for turns in table.column("texts").to_pylist())
+            keep.append(keep_flags(batches[0].column("texts")))
             images.append(image_counts(batches[0]))
             for name in RATING_COLUMNS:
                 values = (
@@ -93,6 +130,8 @@ def convert_file(src_file: Path, dst_file: Path, tag: str = "") -> int:
                     else [None] * table.num_rows
                 )
                 ratings[name].extend(-1 if v is None else v for v in values)
+            if heartbeat is not None:
+                heartbeat()
     reader = pa.ipc.open_file(pa.memory_map(str(tmp), "r"))
     if reader.num_record_batches != parquet.num_row_groups:
         raise RuntimeError(f"{tmp} holds {reader.num_record_batches} batches")
@@ -102,12 +141,12 @@ def convert_file(src_file: Path, dst_file: Path, tag: str = "") -> int:
         if reader.get_batch(group).num_rows != rows:
             raise RuntimeError(f"{tmp} batch {group} does not hold {rows} rows")
     os.replace(tmp, dst_file)
-    meta_tmp = dst_file.with_name(f"{dst_file.stem}.meta.{tag}.tmp.npz")
     np.savez(
         meta_tmp,
         batch_rows=np.asarray(batch_rows, dtype=np.int64),
-        keep=np.asarray(keep, dtype=bool),
+        keep=np.concatenate(keep) if keep else np.zeros(0, dtype=bool),
         num_images=np.concatenate(images) if images else np.zeros(0, dtype=np.int16),
+        source_size=np.int64(src_file.stat().st_size),
         **{name: np.asarray(values, dtype=np.int16) for name, values in ratings.items()},
     )
     os.replace(meta_tmp, meta_path(dst_file))
@@ -124,7 +163,8 @@ def _release_claim(claim: Path, tag: str) -> None:
         claim.unlink(missing_ok=True)
 
 
-def _convert_job(job: tuple[Path, Path, float]) -> int:
+def _convert_job(job: tuple[Path, Path, float]) -> int | str:
+    """The bytes written for one file, 0 when it is done or claimed, or the failure."""
     src_file, dst_file, stale_seconds = job
     claim = dst_file.with_name(dst_file.name + ".claim")
     tag = f"{socket.gethostname()}-{os.getpid()}"
@@ -142,7 +182,9 @@ def _convert_job(job: tuple[Path, Path, float]) -> int:
     os.write(fd, f"{tag} {time.time():.0f}\n".encode())
     os.close(fd)
     try:
-        return convert_file(src_file, dst_file, tag)
+        return convert_file(src_file, dst_file, tag, heartbeat=lambda: os.utime(claim))
+    except Exception as exc:
+        return f"{src_file}: {type(exc).__name__}: {exc}"
     finally:
         _release_claim(claim, tag)
 
@@ -157,15 +199,22 @@ def convert(args: argparse.Namespace) -> None:
         ]
     random.Random(f"{socket.gethostname()}-{os.getpid()}").shuffle(jobs)
     start, total, done = time.time(), 0, 0
+    failures: list[str] = []
     with Pool(args.procs) as pool:
-        for written in pool.imap_unordered(_convert_job, jobs):
-            if written:
+        for result in pool.imap_unordered(_convert_job, jobs):
+            if isinstance(result, str):
+                failures.append(result)
+            elif result:
                 done += 1
-                total += written
+                total += result
                 if done % 20 == 0:
                     rate = total / (time.time() - start) / 2**20
                     print(f"{done} files, {total / 2**30:.0f} GiB, {rate:.0f} MiB/s", flush=True)
     print(f"converted {done} files, {total / 2**30:.1f} GiB in {time.time() - start:.0f} s")
+    for failure in failures:
+        print(failure, file=sys.stderr)
+    if failures:
+        sys.exit(f"{len(failures)} files failed to convert")
 
 
 def _file_image_counts(arrow_file: Path) -> np.ndarray:
@@ -182,6 +231,16 @@ def _subset_index(job: tuple[Path, Path, str]) -> str:
     if missing:
         return f"{subset}: {len(missing)} of {len(arrows)} files not converted yet"
     metas = [dict(np.load(meta_path(a))) for a in arrows]
+    changed = [
+        source
+        for source, meta in zip(sources, metas, strict=True)
+        if "source_size" in meta and int(meta["source_size"]) != source.stat().st_size
+    ]
+    if changed:
+        return (
+            f"{subset}: {len(changed)} files changed size since their conversion; "
+            "remove their .meta.npz and convert again"
+        )
     for meta, arrow in zip(metas, arrows, strict=True):
         if "num_images" not in meta:
             meta["num_images"] = _file_image_counts(arrow)
@@ -193,7 +252,6 @@ def _subset_index(job: tuple[Path, Path, str]) -> str:
         batch_rows=np.concatenate([m["batch_rows"] for m in metas]),
         keep=np.concatenate([m["keep"] for m in metas]),
         num_images=np.concatenate([m["num_images"] for m in metas]),
-        source_sizes=np.asarray([f.stat().st_size for f in sources], dtype=np.int64),
         **{name: np.concatenate([m[name] for m in metas]) for name in RATING_COLUMNS},
     )
     os.replace(tmp, dst / subset / "index.npz")
