@@ -486,6 +486,8 @@ class Transformer(nn.Module):
         assert text is not None
         batch = text.shape[0]
         seq_len = text.shape[1] + (prefix_embeds.shape[1] if prefix_embeds is not None else 0)
+        if rope_cos is not None and position_ids is not None:
+            raise ValueError("modality.rope_cos/rope_sin cannot be combined with position_ids")
         if position_ids is not None:
             if self._mot_modalities:
                 raise ValueError(
@@ -518,8 +520,6 @@ class Transformer(nn.Module):
                 )
         if rope_cos is not None:
             assert rope_sin is not None
-            if position_ids is not None:
-                raise ValueError("modality.rope_cos/rope_sin cannot be combined with position_ids")
             if self._mot_modalities:
                 raise ValueError(
                     "modality.rope_cos/rope_sin is not supported for MoT models, which derive "

@@ -265,13 +265,13 @@
         "TransformerBlock": {
           "purpose": "Single pre-norm transformer block (attention + MLP with residuals). Used on text-only / Joint-Decoder / Cross-Attention paths",
           "methods": [
-            "forward(x, rope_cos, rope_sin, *, kv_cache, doc_ids)"
+            "forward(x, rope_cos, rope_sin, *, kv_cache, attn_mask)"
           ]
         },
         "Transformer": {
           "purpose": "Full decoder-only transformer (embed -> blocks -> norm -> head). Branches on isinstance(config.vlm, MoTConfig) to build MoTBlocks + per-modality mot_norms + per-modality forward path; on isinstance(config.vlm, CrossAttentionConfig) to interleave CrossAttentionBlocks at cadence; otherwise the JD / text-only path. Forward accepts a `modality: ModalityContext` kwarg with cross-arg invariants vs kv_caches",
           "methods": [
-            "forward(tokens, *, modality, kv_caches, doc_ids)",
+            "forward(tokens, *, modality, kv_caches, doc_ids, position_ids, attention_group_ids)",
             "init_weights_and_freqs()",
             "get_moe_aux_loss()",
             "get_expert_counts()",
@@ -456,8 +456,8 @@
         "Attention": {
           "purpose": "Grouped-Query Attention with RoPE, SDPA, optional QK-norm, doc_ids masking, attention weight capture",
           "methods": [
-            "forward(x, rope_cos, rope_sin, *, kv_cache, doc_ids)",
-            "_attention_with_weights(q, k, v, seq_len, doc_ids, kv_cache)"
+            "forward(x, rope_cos, rope_sin, *, kv_cache, attn_mask)",
+            "_attention_with_weights(q, k, v, seq_len, attn_mask)"
           ],
           "properties": [
             "capture_attention_weights",
@@ -470,6 +470,9 @@
         "tests/unit/test_generate.py::TestKVCache",
         "tests/unit/test_packing.py::TestPackedAttentionMask",
         "tests/unit/test_hooks.py::TestAttentionWeightCapture"
+      ],
+      "functions": [
+        "appended_causal_mask(seq_len, past, device) -> Tensor  # lower-right causal mask for queries appended after cached keys"
       ]
     },
     "kempnerforge/model/masking.py": {

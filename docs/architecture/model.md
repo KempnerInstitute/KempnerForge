@@ -94,7 +94,7 @@ After Q/K/V are computed, KV heads are expanded to `n_heads` via
 When `qk_norm=True`, per-head `RMSNorm(head_dim, eps=norm_eps)` is applied to Q and K
 before RoPE. Stabilizes attention logits at scale (Gemma, DeepSeek-V3).
 
-### Three attention paths
+### Four attention paths
 
 1. **Masked** (packed `doc_ids`, visibility groups or a key padding mask passed
    to the model): `kempnerforge.model.masking.build_attention_mask` combines
@@ -113,7 +113,7 @@ before RoPE. Stabilizes attention logits at scale (Gemma, DeepSeek-V3).
    key and the appended keys up to itself. SDPA's `is_causal=True` aligns its
    triangle to the top left and would hide the cached keys.
 
-A fourth, slower path fires only when `capture_attention_weights=True`:
+A fifth, slower path fires only when `capture_attention_weights=True`:
 `_attention_with_weights` computes `softmax(Q·Kᵀ / √d)` manually so
 attention weights can be extracted for interpretability. Don't enable it
 for training runs.
@@ -136,7 +136,11 @@ silent-incorrectness risk. Keep them module-level.
 ### SDPA backend
 
 `sdpa_backend` (default `"auto"`) selects flash / mem-efficient / cudnn /
-math via a context manager. `"auto"` lets PyTorch pick.
+math via a context manager. `"auto"` lets PyTorch pick. The flash and cudnn
+kernels reject a dense `attn_mask`, so a call that carries one (packed
+training batches, or several tokens appended to a non-empty KV cache) also
+enables the mem-efficient and math kernels and lets the dispatcher fall back
+to them for that call rather than raise.
 
 ## MLP
 
