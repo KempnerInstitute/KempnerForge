@@ -11,9 +11,9 @@ files; a claim is touched after every row group, and one older than
 named for it and releases only a claim it still holds. A file that fails to
 convert leaves no temp files, the other files go on, and the failures are listed
 at the end with a non-zero exit. ``index`` merges a fully converted subset's
-sidecars into ``<subset>/index.npz``, refusing a subset whose source files changed
-size since their conversion; for a sidecar without image counts it reads them
-from the Arrow file.
+sidecars into ``<subset>/index.npz``, refusing a subset with a file not converted
+or whose source changed size since its conversion; for a sidecar without image
+counts it reads them from the Arrow file.
 
     uv run python examples/image_understanding/scripts/convert_finevision_to_arrow.py convert \\
         --src /path/to/FineVision --dst /path/to/FineVision-arrow --procs 8
@@ -112,7 +112,7 @@ def _convert_file(
     batch_rows: list[int] = []
     keep: list[np.ndarray] = []
     images: list[np.ndarray] = []
-    ratings: dict[str, list[int]] = {name: [] for name in RATING_COLUMNS}
+    ratings: dict[str, list[np.ndarray]] = {name: [] for name in RATING_COLUMNS}
     with pa.OSFile(str(tmp), "wb") as sink, pa.ipc.new_file(sink, parquet.schema_arrow) as writer:
         for group in range(parquet.num_row_groups):
             table = parquet.read_row_group(group).combine_chunks()
@@ -124,12 +124,11 @@ def _convert_file(
             keep.append(keep_flags(batches[0].column("texts")))
             images.append(image_counts(batches[0]))
             for name in RATING_COLUMNS:
-                values = (
-                    table.column(name).to_pylist()
-                    if name in table.column_names
-                    else [None] * table.num_rows
-                )
-                ratings[name].extend(-1 if v is None else v for v in values)
+                if name in table.column_names:
+                    column = pc.fill_null(table.column(name), -1).to_numpy()
+                    ratings[name].append(column.astype(np.int16))
+                else:
+                    ratings[name].append(np.full(table.num_rows, -1, dtype=np.int16))
             if heartbeat is not None:
                 heartbeat()
     reader = pa.ipc.open_file(pa.memory_map(str(tmp), "r"))
@@ -147,7 +146,10 @@ def _convert_file(
         keep=np.concatenate(keep) if keep else np.zeros(0, dtype=bool),
         num_images=np.concatenate(images) if images else np.zeros(0, dtype=np.int16),
         source_size=np.int64(src_file.stat().st_size),
-        **{name: np.asarray(values, dtype=np.int16) for name, values in ratings.items()},
+        **{
+            name: np.concatenate(values) if values else np.zeros(0, dtype=np.int16)
+            for name, values in ratings.items()
+        },
     )
     os.replace(meta_tmp, meta_path(dst_file))
     return dst_file.stat().st_size
@@ -164,15 +166,20 @@ def _release_claim(claim: Path, tag: str) -> None:
 
 
 def _convert_job(job: tuple[Path, Path, float]) -> int | str:
-    """The bytes written for one file, 0 when it is done or claimed, or the failure."""
+    """The bytes written for one file, 0 when it is done or claimed, or the failure.
+
+    A stale claim is taken over by renaming it, which only one process can do.
+    """
     src_file, dst_file, stale_seconds = job
     claim = dst_file.with_name(dst_file.name + ".claim")
     tag = f"{socket.gethostname()}-{os.getpid()}"
-    if meta_path(dst_file).exists():
+    if meta_path(dst_file).exists() and dst_file.exists():
         return 0
+    stale = claim.with_name(f"{claim.name}.stale-{tag}")
     try:
         if time.time() - claim.stat().st_mtime > stale_seconds:
-            claim.unlink()
+            os.rename(claim, stale)
+            stale.unlink()
     except FileNotFoundError:
         pass
     try:
@@ -191,15 +198,16 @@ def _convert_job(job: tuple[Path, Path, float]) -> int | str:
 
 def convert(args: argparse.Namespace) -> None:
     jobs = []
+    failures: list[str] = []
     for subset in args.subsets or subsets(args.src):
+        files = source_files(args.src, subset)
+        if not files:
+            failures.append(f"{subset}: no train-*.parquet files under {args.src / subset}")
+            continue
         (args.dst / subset).mkdir(parents=True, exist_ok=True)
-        jobs += [
-            (f, arrow_path(args.dst, f), args.stale_claim_hours * 3600)
-            for f in source_files(args.src, subset)
-        ]
+        jobs += [(f, arrow_path(args.dst, f), args.stale_claim_hours * 3600) for f in files]
     random.Random(f"{socket.gethostname()}-{os.getpid()}").shuffle(jobs)
     start, total, done = time.time(), 0, 0
-    failures: list[str] = []
     with Pool(args.procs) as pool:
         for result in pool.imap_unordered(_convert_job, jobs):
             if isinstance(result, str):
@@ -226,8 +234,10 @@ def _file_image_counts(arrow_file: Path) -> np.ndarray:
 def _subset_index(job: tuple[Path, Path, str]) -> str:
     src, dst, subset = job
     sources = source_files(src, subset)
+    if not sources:
+        return f"{subset}: no train-*.parquet files under {src / subset}"
     arrows = [arrow_path(dst, f) for f in sources]
-    missing = [a for a in arrows if not meta_path(a).exists()]
+    missing = [a for a in arrows if not (a.exists() and meta_path(a).exists())]
     if missing:
         return f"{subset}: {len(missing)} of {len(arrows)} files not converted yet"
     metas = [dict(np.load(meta_path(a))) for a in arrows]
@@ -265,9 +275,9 @@ def index(args: argparse.Namespace) -> None:
             p for p in pool.imap(_subset_index, [(args.src, args.dst, s) for s in chosen]) if p
         ]
     for problem in problems:
-        print(problem)
+        print(problem, file=sys.stderr)
     if problems:
-        sys.exit(f"{len(problems)} subsets are not fully converted; no index written for them")
+        sys.exit(f"{len(problems)} subsets could not be indexed")
     print(f"wrote index.npz for {len(chosen)} subsets")
 
 

@@ -16,6 +16,7 @@ from typing import Any
 
 import numpy as np
 import pyarrow as pa
+from PIL import Image
 from torch.utils.data import Dataset
 
 from .decode import decode_rgb
@@ -34,17 +35,25 @@ def _is_text(value: Any) -> bool:
     return isinstance(value, str) and bool(value.strip())
 
 
+def _decode(item: dict[str, Any] | None) -> Image.Image:
+    if item is None or item.get("bytes") is None:
+        raise UnusableRowError("an image holds no bytes")
+    return decode_rgb(item["bytes"])
+
+
 class FineVisionArrow(Dataset):
     """The kept conversations of one FineVision subset.
 
     Rows pass when their keep flag is set, every ``min_ratings`` column meets its
     threshold (a missing rating, stored as ``-1``, fails), and the row has between
-    1 and ``max_images`` images, which ``None`` lifts; a ``text_only`` reader takes
-    no image filter and its documents carry no image, for a renderer that accepts
-    them. ``num_images`` overrides the per-row image counts stored in ``index.npz``.
-    Turns missing their user message or their reply are dropped; a row left
-    without a turn, or whose image does not decode, is passed over for the next
-    row, up to ``max_attempts`` in a row, and ``skipped`` counts them.
+    1 and ``max_images`` images; ``None`` lifts the limit, for a renderer that
+    accepts documents with several images, and a ``text_only`` reader takes no
+    image filter and its documents carry no image, for a renderer that accepts
+    those. ``num_images`` overrides the per-row image counts stored in
+    ``index.npz``. Turns missing their user message or their reply are dropped; a
+    row left without a turn, or whose image does not decode or holds no bytes, is
+    passed over for the next row, up to ``max_attempts`` in a row, and ``skipped``
+    counts them. At most ``max_open_files`` Arrow files stay mapped per process.
     """
 
     def __init__(
@@ -56,7 +65,7 @@ class FineVisionArrow(Dataset):
         min_ratings: dict[str, int] | None = None,
         text_only: bool = False,
         max_attempts: int = MAX_ATTEMPTS,
-        max_open_files: int = 4096,
+        max_open_files: int = 256,
     ) -> None:
         if max_open_files < 1:
             raise ValueError(f"max_open_files must be positive, got {max_open_files}")
@@ -65,7 +74,8 @@ class FineVisionArrow(Dataset):
         self.max_attempts = check_max_attempts(max_attempts)
         self.max_open_files = max_open_files
         self._skips = SkipLog()
-        index = np.load(self.subset_dir / "index.npz")
+        with np.load(self.subset_dir / "index.npz") as loaded:
+            index = dict(loaded)
         self.files = [str(name) for name in index["files"]]
         batch_rows = index["batch_rows"]
         self._batch_starts = np.concatenate([[0], np.cumsum(batch_rows)[:-1]]).tolist()
@@ -126,13 +136,11 @@ class FineVisionArrow(Dataset):
 
     def _read(self, index: int) -> Document:
         row = self.row(index)
-        images = (
-            () if self.text_only else tuple(decode_rgb(item["bytes"]) for item in row["images"])
-        )
+        images = () if self.text_only else tuple(map(_decode, row["images"] or []))
         turns = tuple(
             Turn(t["user"], (t["assistant"],))
             for t in row["texts"] or []
-            if _is_text(t.get("user")) and _is_text(t.get("assistant"))
+            if t is not None and _is_text(t.get("user")) and _is_text(t.get("assistant"))
         )
         if not turns:
             raise UnusableRowError("no turn has both a user message and a reply")

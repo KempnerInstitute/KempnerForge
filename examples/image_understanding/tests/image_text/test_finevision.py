@@ -141,8 +141,10 @@ class TestConversion:
         assert not arrow.exists() and claim.read_text() == "otherhost-1 0\n"
         os.utime(claim, (0, 0))
         assert converter._convert_job((parquet, arrow, 3600.0)) > 0
-        assert arrow.exists() and not claim.exists()
-        assert not list((dst / "demo").glob("*.tmp*"))
+        assert sorted(p.name for p in (dst / "demo").iterdir()) == [
+            "train-00000-of-00001.arrow",
+            "train-00000-of-00001.meta.npz",
+        ]
 
     def test_keep_flags_need_one_complete_turn(self) -> None:
         texts = pa.array(
@@ -194,7 +196,23 @@ class TestConversion:
         with open(root / "parquet" / "demo" / "train-00001-of-00002.parquet", "ab") as f:
             f.write(b"\0")
         stderr = _run_failing("index", "--src", str(root / "parquet"), "--dst", str(root / "arrow"))
-        assert "not fully converted" in stderr
+        assert "changed size" in stderr
+
+    def test_a_missing_arrow_file_is_converted_again(self, subset: Path) -> None:
+        root = subset.parents[1]
+        src, dst = str(root / "parquet"), str(root / "arrow")
+        (subset / "train-00001-of-00002.arrow").unlink()
+        assert "not converted yet" in _run_failing("index", "--src", src, "--dst", dst)
+        _run("convert", "--src", src, "--dst", dst, "--procs", "1")
+        assert (subset / "train-00001-of-00002.arrow").exists()
+        _run("index", "--src", src, "--dst", dst, "--procs", "1")
+
+    @pytest.mark.parametrize("command", ["convert", "index"])
+    def test_a_subset_without_parquet_files_is_reported(self, tmp_path: Path, command: str) -> None:
+        (tmp_path / "parquet" / "typo").mkdir(parents=True)
+        src, dst = str(tmp_path / "parquet"), str(tmp_path / "arrow")
+        stderr = _run_failing(command, "--src", src, "--dst", dst, "--subsets", "typo")
+        assert "typo: no train-*.parquet files" in stderr
 
     def test_only_the_holder_releases_a_claim(self, tmp_path: Path) -> None:
         converter = _converter()
@@ -279,6 +297,25 @@ class TestFineVisionArrow:
         assert len(reader) == 5
         assert reader[2].turns[0].user == "Q3"
         assert reader.skipped == 1
+
+    def test_null_images_and_turns_are_tolerated(self, tmp_path: Path) -> None:
+        src, dst = tmp_path / "parquet", tmp_path / "arrow"
+        no_images = _row(0, [("Q0", "A0")], 5)
+        no_images["images"] = None
+        no_bytes = _row(1, [("Q1", "A1")], 5)
+        no_bytes["images"][0]["bytes"] = None
+        null_turn = _row(1, [("Q2", "A2")], 5)
+        null_turn["texts"] = [None, *null_turn["texts"]]
+        _write_parquet(
+            src / "demo" / "train-00000-of-00001.parquet", [[no_images, no_bytes, null_turn]]
+        )
+        _run("convert", "--src", str(src), "--dst", str(dst))
+        _run("index", "--src", str(src), "--dst", str(dst))
+        reader = FineVisionArrow(dst / "demo", max_images=None)
+        assert len(reader) == 3
+        assert reader[0].images == () and reader[0].turns[0].user == "Q0"
+        assert reader[1].turns[0].user == "Q2" and reader.skipped == 1
+        assert FineVisionArrow(dst / "demo").rows.tolist() == [1, 2]
 
     def test_an_undecodable_image_steps_to_the_next_row(self, tmp_path: Path) -> None:
         src, dst = tmp_path / "parquet", tmp_path / "arrow"

@@ -73,7 +73,8 @@ like one whose image does not decode.
 
 Convert FineVision once; any number of `convert` processes can share the work,
 a file that fails to convert is listed at the end without stopping the others,
-and `index` refuses a subset whose parquet files changed since their conversion:
+and `index` refuses a subset with a file missing or whose parquet file changed
+size since its conversion:
 
 ```bash
 uv run python examples/image_understanding/scripts/convert_finevision_to_arrow.py convert \
