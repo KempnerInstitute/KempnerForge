@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import copy
+
 import pytest
 import torch
 import torch.nn as nn
@@ -363,6 +365,30 @@ class TestScheduleFreeAdamW:
         optimizer2.load_state_dict(sd)
         assert {state["step"].item() for state in optimizer2.state.values()} == {3.0}
         assert optimizer2.warmup_steps == 7
+
+    def test_the_step_count_is_float32_under_any_default_dtype(self):
+        """Under a bf16 default dtype a bf16 count would stop at 256; the count stays exact."""
+        previous = torch.get_default_dtype()
+        torch.set_default_dtype(torch.bfloat16)
+        try:
+            torch.manual_seed(0)
+            model = nn.Linear(4, 4)
+            optimizer = ScheduleFreeAdamW(model.parameters(), lr=1e-3, warmup_steps=1000)
+            for _ in range(300):
+                model(torch.randn(2, 4)).sum().backward()
+                optimizer.step()
+                optimizer.zero_grad()
+            counts = [state["step"].clone() for state in optimizer.state.values()]
+            legacy = copy.deepcopy(optimizer.state_dict())
+            for state in legacy["state"].values():
+                del state["step"]
+            legacy["_k"] = 300
+            optimizer2 = ScheduleFreeAdamW(nn.Linear(4, 4).parameters(), lr=1e-3)
+            optimizer2.load_state_dict(legacy)
+        finally:
+            torch.set_default_dtype(previous)
+        counts += [state["step"] for state in optimizer2.state.values()]
+        assert all(c.dtype == torch.float32 and c.item() == 300 for c in counts), counts
 
     def test_reading_a_fresh_optimizer_through_dcp_leaves_the_model_alone(self):
         """``get_optimizer_state_dict`` gives a fresh optimizer a zero-lr step; it must not fail."""

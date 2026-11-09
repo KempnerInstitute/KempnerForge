@@ -179,7 +179,7 @@ class ScheduleFreeAdamW(torch.optim.Optimizer):
         if legacy_k is not None:
             for state in self.state.values():
                 if state and "step" not in state:
-                    state["step"] = torch.tensor(float(legacy_k))
+                    state["step"] = torch.tensor(float(legacy_k), dtype=torch.float32)
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -201,7 +201,7 @@ class ScheduleFreeAdamW(torch.optim.Optimizer):
                 state = self.state[p]
 
                 if len(state) == 0:
-                    state["step"] = torch.tensor(0.0)
+                    state["step"] = torch.tensor(0.0, dtype=torch.float32)
                     state["z"] = p.data.clone()
                     state["v"] = torch.zeros_like(p.data)
                     state["weight_sum"] = 0.0
