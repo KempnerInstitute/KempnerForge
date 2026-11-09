@@ -320,7 +320,13 @@ def _restore_never_stepped(
 def _check_saved_state_matches(
     optim_state: dict[str, Any], saved_keys: Iterable[str], where: Path
 ) -> None:
-    """Fail if a parameter was saved with another optimizer's state than the one it now has."""
+    """Fail if a parameter's saved optimizer state is not the state its optimizer now keeps.
+
+    The save holds either another optimizer's state, or only part of this one's, as a
+    ``schedule_free_adamw`` checkpoint written before each parameter kept its own ``step``
+    does. Either way the run cannot continue exactly, so the load stops before DCP reads
+    anything and says how to continue from the weights alone.
+    """
     kept = {fqn: set(state) for fqn, state in optim_state["state"].items()}
     saved: dict[str, set[str]] = {}
     for key in saved_keys:
@@ -346,6 +352,19 @@ def _check_saved_state_matches(
             "To continue from these weights with a fresh optimizer, set "
             "checkpoint.load_path to this checkpoint and checkpoint.exclude_from_loading = "
             '["optimizer"], with a checkpoint.dir that holds no checkpoint yet.'
+        )
+    short = sorted(fqn for fqn, entries in saved.items() if kept[fqn] - entries)
+    if short:
+        first = short[0]
+        raise RuntimeError(
+            f"{where} holds partial optimizer state for {len(short)} parameters: "
+            f"{short[:8]}. {first} was saved without {sorted(kept[first] - saved[first])}, "
+            "which its optimizer now keeps: an earlier version of the optimizer saved it, "
+            "e.g. schedule_free_adamw before each parameter kept its own step count, so "
+            "the run cannot continue exactly. To continue from these weights with a fresh "
+            "optimizer, set checkpoint.load_path to this checkpoint and "
+            'checkpoint.exclude_from_loading = ["optimizer"], with a checkpoint.dir that '
+            "holds no checkpoint yet."
         )
 
 
