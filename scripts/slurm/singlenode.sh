@@ -44,4 +44,12 @@ echo "============================"
 uv run torchrun \
     --standalone \
     --nproc_per_node="${NGPUS}" \
-    scripts/train.py "${CONFIG}" ${OVERRIDES}
+    scripts/train.py "${CONFIG}" ${OVERRIDES} &
+launcher=$!
+trap 'kill -TERM "${launcher}" 2>/dev/null || true' TERM USR1
+while true; do
+    rc=0
+    wait "${launcher}" || rc=$?
+    kill -0 "${launcher}" 2>/dev/null || break
+done
+exit "${rc}"
