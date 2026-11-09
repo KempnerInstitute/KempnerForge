@@ -94,8 +94,11 @@ load of a checkpoint saved with other multipliers or patterns stops on every ran
 restores the checkpoint's optimizer state on any rank, before loading anything, or the
 scheduler state in its `train_state.pt`, before restoring anything from that file. A
 checkpoint that records none was saved without any, so a run without multipliers loads only
-checkpoints saved without them. Rank 0 reads the file once per load and sends what it read
-to every rank, so the ranks stop or go on together. From a training checkpoint, that leaves:
+checkpoints saved without them. A `metadata.json` that cannot be read, or holds an invalid
+record, stops a run with multipliers the same way; a run without them loads the checkpoint as
+one saved without them, with a warning. Rank 0 reads the file once per load and sends what
+it read to every rank, so the ranks stop or go on together. From a training checkpoint, that
+leaves:
 
 - A resume, or a `checkpoint.load_path` warm start with or without the optimizer, under the
   same multipliers and patterns.

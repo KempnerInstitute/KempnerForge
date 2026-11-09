@@ -756,13 +756,73 @@ class TestResume:
             (b'{"step": 3, "lr_module_patterns": {"head": "x"}}', "lists of patterns"),
             (b"[" * 100_000 + b"]" * 100_000, "RecursionError"),
         ],
-        ids=["bad-json", "list", "negative", "patterns", "too-deep"],
+        ids=["bad-json", "list", "negative", "patterns", "deep"],
     )
-    def test_an_invalid_record_is_refused(self, tmp_path, content, match):
+    @pytest.mark.parametrize("exclude", [[], ["optimizer"]], ids=["resume", "warm-start"])
+    def test_an_invalid_record_is_refused(self, tmp_path, content, match, exclude):
+        """A run with multipliers cannot tell that the checkpoint's match without the record."""
         (self._save(tmp_path, {"head": 2.0}) / "metadata.json").write_bytes(content)
         _, scheduler, manager = self._resume(tmp_path, {"head": 2.0})
         with pytest.raises(ValueError, match=f"Cannot check the lr_multipliers.*{match}"):
-            manager.load(scheduler=scheduler)
+            manager.load(scheduler=scheduler, exclude_keys=exclude)
+        assert scheduler.last_epoch == 0
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            b"{",
+            b"[]",
+            b'{"step": 3, "lr_multipliers": null}',
+            b'{"step": 3, "lr_multipliers": {"head": -1}}',
+        ],
+        ids=["truncated", "list", "null", "negative"],
+    )
+    def test_a_run_without_multipliers_loads_past_an_unreadable_record(
+        self, tmp_path, caplog, monkeypatch, content
+    ):
+        """It cannot have been saved with multipliers this run lacks, as far as the load can
+        tell, so the load goes ahead with a warning instead of refusing a plain warm start."""
+        monkeypatch.setattr(logging.getLogger("kempnerforge"), "propagate", True)
+        (self._save(tmp_path, {}) / "metadata.json").write_bytes(content)
+        model, scheduler, manager = self._resume(tmp_path, {})
+        before = [p.detach().clone() for p in model.parameters()]
+        with caplog.at_level(logging.WARNING, logger="kempnerforge.checkpoint.manager"):
+            step, _, _ = manager.load(scheduler=scheduler, exclude_keys=["optimizer"])
+        assert (step, scheduler.last_epoch) == (3, 3)
+        assert any(not torch.equal(b, p) for b, p in zip(before, model.parameters(), strict=True))
+        assert [m for m in caplog.messages if "lr_multipliers record" in m] == [
+            f"Cannot read the lr_multipliers record of {tmp_path / 'step_3'} "
+            f"({self._unreadable(tmp_path / 'step_3', content)}); this run has no "
+            "lr_multipliers, so it loads the checkpoint as one saved without them"
+        ]
+
+    @staticmethod
+    def _unreadable(step_dir, content):
+        """What the multipliers check reports about a ``metadata.json`` holding ``content``."""
+        path = step_dir / "metadata.json"
+        if content == b"[]":
+            return f"{path} does not hold a JSON object"
+        try:
+            meta = json.loads(content)
+        except ValueError as e:
+            return f"cannot read {path}: {e}"
+        try:
+            checked_lr_multipliers(meta["lr_multipliers"])
+        except ValueError as e:
+            return f"{path} records an invalid LR multipliers record: {e}"
+        raise AssertionError(content)
+
+    def test_a_run_without_multipliers_refuses_a_record_of_some(self, tmp_path):
+        """Only the multipliers decide, so a record of some refuses the load even when the rest
+        of it cannot be read."""
+        step_dir = self._save(tmp_path, {"head": 2.0})
+        meta = json.loads((step_dir / "metadata.json").read_text())
+        meta["lr_module_patterns"] = "x"
+        (step_dir / "metadata.json").write_text(json.dumps(meta))
+        _, scheduler, manager = self._resume(tmp_path, {})
+        with pytest.raises(ValueError, match=r"lr_multipliers=\{'head': 2.0\}, but this run uses"):
+            manager.load(scheduler=scheduler, exclude_keys=["optimizer"])
+        assert scheduler.last_epoch == 0
 
     @pytest.mark.parametrize("scope", [None, "exclude_norms_and_biases"], ids=["no-scope", "scope"])
     def test_a_resume_reads_the_record_once(self, tmp_path, monkeypatch, scope):

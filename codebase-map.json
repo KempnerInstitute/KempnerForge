@@ -1207,7 +1207,7 @@
             "_read_saved_keys(dcp_dir) -> (keys, restored_on_any_rank) (this rank's DCP keys; with a scope or multipliers an all-reduce on the gloo group tells every rank whether any rank's index holds optimizer state)",
             "_broadcast_metadata(ckpt_dir) -> (meta, error) (rank 0 reads metadata.json once per load and broadcasts the object or why it could not; the scope and multipliers checks both decide from it)",
             "_check_weight_decay_scope(metadata, ckpt_dir) (every rank refuses a mismatch or an unreadable record)",
-            "_check_lr_multipliers(metadata, ckpt_dir) (every rank refuses other multipliers or patterns or an unreadable record; runs once per load, before loading optimizer state on any rank or before restoring a scheduler from train_state.pt)",
+            "_check_lr_multipliers(metadata, ckpt_dir) (every rank refuses other multipliers or patterns; a run without multipliers loads past an unreadable record with a warning; runs once per load, before loading optimizer state on any rank or before restoring a scheduler from train_state.pt)",
             "apply_dataloader_state(dataloader)",
             "_resolve_load_path(path)",
             "_cleanup()"

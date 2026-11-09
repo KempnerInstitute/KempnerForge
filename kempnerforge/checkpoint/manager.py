@@ -320,22 +320,25 @@ def _recorded_lr_module_patterns(
 
 
 def _lr_record(
-    metadata: _MetadataOutcome, ckpt_dir: Path
+    metadata: _MetadataOutcome, ckpt_dir: Path, layout: bool
 ) -> tuple[dict[str, float], dict[str, list[str]]]:
-    """Return the ``lr_multipliers`` and ``lr_module_patterns`` of rank 0's read of a
-    checkpoint's ``metadata.json``.
+    """Return the LR multipliers record of rank 0's read of a checkpoint's ``metadata.json``.
+
+    That is its ``lr_multipliers`` and, with ``layout``, its ``lr_module_patterns``; without
+    ``layout`` they come back empty, unread.
 
     Raises:
-        ValueError: Rank 0 could not read ``metadata.json``, or a field is not a valid record.
+        ValueError: Rank 0 could not read ``metadata.json``, or a field read is not a valid
+            record.
     """
     meta, error = metadata
     if meta is None:
         raise ValueError(error)
     metadata_path = ckpt_dir / _METADATA_FILE
-    return (
-        _recorded_lr_multipliers(meta, metadata_path),
-        _recorded_lr_module_patterns(meta, metadata_path),
-    )
+    multipliers = _recorded_lr_multipliers(meta, metadata_path)
+    if not layout:
+        return multipliers, {}
+    return multipliers, _recorded_lr_module_patterns(meta, metadata_path)
 
 
 def _reset_to_fresh(optimizer: torch.optim.Optimizer) -> None:
@@ -606,7 +609,10 @@ class CheckpointManager:
             rank when it restores the checkpoint's optimizer state on any rank, before anything
             is loaded, or the scheduler state in its ``train_state.pt``, before anything from
             that file is restored. A load that restores neither goes ahead. A checkpoint that
-            records none counts as saved without multipliers. With multipliers set, a load that
+            records none counts as saved without multipliers. One whose ``metadata.json``
+            cannot be read, or holds an invalid record, is refused the same way when
+            multipliers are set; without them it loads as one saved without multipliers, with
+            a warning, and only a record of some is refused. With multipliers set, a load that
             restores optimizer state into param groups laid out otherwise than at the save
             raises on every rank before anything is loaded. A restored scheduler state carries
             the saved schedule on in every group, a group of a module the checkpoint holds no
@@ -1383,16 +1389,28 @@ class CheckpointManager:
         The multipliers and the patterns decide the optimizer's param groups and their learning
         rates, which the saved optimizer state and the scheduler state in ``train_state.pt``
         are laid out for. ``metadata`` is what ``_broadcast_metadata`` returned on every rank,
-        so every rank raises or proceeds together.
+        so every rank raises or proceeds together. A manager with multipliers refuses a
+        ``metadata.json`` that cannot be read or holds an invalid record; one without refuses
+        only a record of multipliers, and loads past any other with a warning, as from a
+        checkpoint saved without them.
 
         Raises:
-            ValueError: The checkpoint's multipliers or patterns differ from this manager's, or
-                its ``metadata.json`` does not hold a valid record.
+            ValueError: The checkpoint's multipliers or patterns differ from this manager's, or,
+                for a manager with multipliers, its ``metadata.json`` does not hold a valid
+                record.
         """
         try:
-            multipliers, patterns = _lr_record(metadata, ckpt_dir)
+            multipliers, patterns = _lr_record(
+                metadata, ckpt_dir, layout=bool(self._lr_multipliers)
+            )
         except ValueError as e:
-            raise ValueError(f"Cannot check the lr_multipliers of {ckpt_dir}: {e}") from e
+            if self._lr_multipliers:
+                raise ValueError(f"Cannot check the lr_multipliers of {ckpt_dir}: {e}") from e
+            logger.warning(
+                f"Cannot read the lr_multipliers record of {ckpt_dir} ({e}); this run has no "
+                f"lr_multipliers, so it loads the checkpoint as one saved without them"
+            )
+            return
         if multipliers != self._lr_multipliers:
             change = (
                 f"optimizer.lr_multipliers={multipliers}, but this run uses {self._lr_multipliers}"
