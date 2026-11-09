@@ -9,6 +9,7 @@ must be one prefix of it, with no sample skipped and none read twice.
 from __future__ import annotations
 
 import json
+import logging
 import socket
 from pathlib import Path
 
@@ -203,6 +204,104 @@ def test_legacy_state_on_the_same_data_parallel_size_resumes_as_before():
     loader.load_state_dict(_legacy_state(2, 10))
     rank_order = list(_loader(dataset, 2, 1, 1).sampler)
     assert next(iter(loader)).tolist() == rank_order[40:44]
+
+
+def _save_loader_state(directory: Path, loader_state: dict) -> None:
+    """Write a step-3 checkpoint into ``directory`` whose train state holds ``loader_state``."""
+    from kempnerforge.checkpoint.manager import CheckpointManager
+    from kempnerforge.config.checkpoint import CheckpointConfig
+
+    class _Saved:
+        def state_dict(self) -> dict:
+            return loader_state
+
+    model = torch.nn.Linear(2, 2)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    CheckpointManager(CheckpointConfig(dir=str(directory)), model, optimizer).save(
+        step=3, dataloader=_Saved()
+    )
+
+
+def _restore(tmp_path: Path, *, warm_start: bool):
+    """Restore from ``tmp_path / "saved"`` the way the training entry does.
+
+    An auto-resume finds the checkpoint in ``checkpoint.dir``; a warm start names
+    it in ``checkpoint.load_path`` from a new, empty ``checkpoint.dir``.
+    """
+    from kempnerforge.checkpoint.manager import CheckpointManager
+    from kempnerforge.config.checkpoint import CheckpointConfig
+    from kempnerforge.config.job import JobConfig
+    from kempnerforge.training.entry import restore_checkpoint
+
+    saved = tmp_path / "saved"
+    if warm_start:
+        checkpoint = CheckpointConfig(
+            dir=str(tmp_path / "new_run"),
+            load_path=str(saved / "step_3"),
+            exclude_from_loading=["optimizer"],
+        )
+    else:
+        checkpoint = CheckpointConfig(dir=str(saved))
+    config = JobConfig(checkpoint=checkpoint)
+    model = torch.nn.Linear(2, 2)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    manager = CheckpointManager(config.checkpoint, model, optimizer)
+    assert restore_checkpoint(config, model, None, manager)[0] == 3
+    return manager
+
+
+def _mixture_state(replicas: int) -> dict:
+    loader = _mixture(replicas, 0, 4)
+    iterator = iter(loader)
+    for _ in range(10):
+        next(iterator)
+    return loader.state_dict()
+
+
+@pytest.mark.parametrize(
+    ("saved_state", "resumed_loader", "reason"),
+    [
+        (lambda: _legacy_state(1, 100), lambda: _loader(_Indices(4_096), 2, 0, 4), "predates"),
+        (lambda: _mixture_state(4), lambda: _mixture(2, 0, 4), "draws each rank's samples"),
+    ],
+    ids=["legacy_checkpoint", "mixture"],
+)
+def test_warm_start_starts_the_data_fresh_when_the_position_cannot_carry_over(
+    tmp_path, caplog, monkeypatch, saved_state, resumed_loader, reason
+):
+    """A ``load_path`` warm start on another data-parallel size warns instead of refusing.
+
+    The ``kempnerforge`` logger stops propagation once configured, so the test lets
+    records reach ``caplog``.
+    """
+    monkeypatch.setattr(logging.getLogger("kempnerforge"), "propagate", True)
+    _save_loader_state(tmp_path / "saved", saved_state())
+    manager = _restore(tmp_path, warm_start=True)
+    loader = resumed_loader()
+    with caplog.at_level(logging.WARNING, logger="kempnerforge.checkpoint.manager"):
+        manager.apply_dataloader_state(loader)
+    assert "starts at its first sample" in caplog.text and reason in caplog.text
+    fresh = resumed_loader()
+    assert next(iter(loader)).tolist() == next(iter(fresh)).tolist()
+
+
+def test_warm_start_carries_a_global_position_over(tmp_path):
+    """A position that carries over to another data-parallel size does so on a warm start too."""
+    dataset = _Indices(4_096)
+    _, state = _run(dataset, 4, 4, steps=10)
+    _save_loader_state(tmp_path / "saved", state)
+    manager = _restore(tmp_path, warm_start=True)
+    loader = _loader(dataset, 2, 1, 4)
+    manager.apply_dataloader_state(loader)
+    order = _order(len(dataset))
+    assert [order[i] for i in next(iter(loader)).tolist()] == [161, 163, 165, 167]
+
+
+def test_auto_resume_refuses_a_position_that_cannot_carry_over(tmp_path):
+    _save_loader_state(tmp_path / "saved", _legacy_state(1, 100))
+    manager = _restore(tmp_path, warm_start=False)
+    with pytest.raises(DataPositionError, match="predates the saved batch size"):
+        manager.apply_dataloader_state(_loader(_Indices(4_096), 2, 0, 4))
 
 
 def _free_port() -> int:

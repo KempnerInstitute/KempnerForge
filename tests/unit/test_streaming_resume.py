@@ -213,3 +213,43 @@ def test_a_replay_past_the_end_of_the_stream_starts_the_next_epoch(corpus, caplo
     assert "starting epoch 1" in caplog.text
     assert torch.equal(got, expected)
     assert loader.state_dict()["epoch"] == 1
+
+
+def test_warm_start_from_a_map_style_checkpoint_starts_the_stream_fresh(
+    corpus, tmp_path, caplog, monkeypatch
+):
+    """A ``load_path`` warm start into a streaming run warns instead of refusing.
+
+    The ``kempnerforge`` logger stops propagation once configured, so the test lets
+    records reach ``caplog``.
+    """
+    from kempnerforge.checkpoint.manager import CheckpointManager
+    from kempnerforge.training.entry import restore_checkpoint
+
+    monkeypatch.setattr(logging.getLogger("kempnerforge"), "propagate", True)
+    dataset = torch.utils.data.TensorDataset(torch.arange(64))
+    mapped = StatefulDataLoader(
+        dataset,
+        batch_size=4,
+        sampler=DistributedSampler(dataset, num_replicas=1, rank=0),
+        config=DataConfig(num_workers=0, pin_memory=False),
+    )
+    next(iter(mapped))
+    model = torch.nn.Linear(2, 2)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    saved = CheckpointConfig(dir=str(tmp_path / "saved"))
+    CheckpointManager(saved, model, optimizer).save(step=3, dataloader=mapped)
+
+    config = _config(corpus)
+    config.checkpoint = CheckpointConfig(
+        dir=str(tmp_path / "new_run"),
+        load_path=str(tmp_path / "saved" / "step_3"),
+        exclude_from_loading=["optimizer"],
+    )
+    manager = CheckpointManager(config.checkpoint, model, optimizer)
+    assert restore_checkpoint(config, model, None, manager)[0] == 3
+    stream = _loader(config)
+    with caplog.at_level(logging.WARNING, logger="kempnerforge.checkpoint.manager"):
+        manager.apply_dataloader_state(stream)
+    assert "starts at its first sample" in caplog.text and "streams its data" in caplog.text
+    assert torch.equal(next(iter(stream))["input_ids"], next(iter(_loader(config)))["input_ids"])

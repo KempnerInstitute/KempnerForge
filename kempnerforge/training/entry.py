@@ -282,6 +282,7 @@ def restore_checkpoint(
     step, tokens_seen, ckpt_extra_loaded = ckpt_mgr.load(
         path=str(resume_path) if resume_path else None,
         scheduler=scheduler,
+        warm_start=resume_path is None,
         exclude_keys=warm_start_exclude,
         vlm_freeze_expected=vlm_freeze_expected,
     )
