@@ -168,6 +168,10 @@ class TestModalityIdsInvariants:
             ValueError, match="rope_sin must be \\(batch, seq_len, head_dim // 2\\)"
         ):
             ModalityContext(rope_cos=torch.zeros(1, 6, 8), rope_sin=torch.zeros(6, 8))
+        with pytest.raises(ValueError, match="differ in device"):
+            ModalityContext(
+                rope_cos=torch.zeros(1, 6, 8), rope_sin=torch.zeros(1, 6, 8, device="meta")
+            )
         with pytest.raises(ValueError, match="differ in dtype"):
             ModalityContext(
                 rope_cos=torch.zeros(1, 6, 8), rope_sin=torch.zeros(1, 6, 8, dtype=torch.float16)

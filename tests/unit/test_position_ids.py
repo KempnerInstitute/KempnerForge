@@ -407,15 +407,24 @@ class TestRopeFromTheContext:
                 ),
             )
 
+    def test_a_rotation_shared_by_every_row_matches_the_default(self):
+        model = _tiny_model()
+        tokens = torch.randint(0, _VOCAB, (2, 10), device=DEVICE)
+        ctx = self._rotation(model, torch.arange(10, device=DEVICE).unsqueeze(0))
+        assert ctx.rope_cos is not None and ctx.rope_cos.shape[0] == 1
+        with torch.no_grad():
+            torch.testing.assert_close(model(tokens, modality=ctx), model(tokens))
+
     def test_gradient_flows_through_a_given_rotation(self):
         model = _tiny_model()
         tokens = torch.randint(0, _VOCAB, (1, 5), device=DEVICE)
         ctx = self._rotation(model, torch.arange(5, device=DEVICE).unsqueeze(0))
-        ctx.rope_cos.requires_grad_(True)  # type: ignore[union-attr]
-        ctx.rope_sin.requires_grad_(True)  # type: ignore[union-attr]
+        assert ctx.rope_cos is not None and ctx.rope_sin is not None
+        cos = ctx.rope_cos.requires_grad_(True)
+        sin = ctx.rope_sin.requires_grad_(True)
         model(tokens, modality=ctx).sum().backward()
-        assert ctx.rope_cos.grad is not None and ctx.rope_cos.grad.abs().sum() > 0  # type: ignore[union-attr]
-        assert ctx.rope_sin.grad is not None and ctx.rope_sin.grad.abs().sum() > 0  # type: ignore[union-attr]
+        assert cos.grad is not None and cos.grad.abs().sum() > 0
+        assert sin.grad is not None and sin.grad.abs().sum() > 0
 
     def test_a_rotation_needs_no_rope_tables(self):
         """A model whose tables were never built still applies a given rotation."""

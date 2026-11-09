@@ -152,24 +152,29 @@ class Attention(nn.Module):
         builds this one object once per forward and shares it across layers.
         The causal structure itself is attention's own: ``is_causal`` for a
         plain forward, and its lower-right form when several tokens are
-        appended to a non-empty cache, a small bool tensor per layer that
-        depends on the cache length and so is not shared.
+        appended to a non-empty cache, which the transformer builds once per
+        forward and every layer receives as ``attn_mask``.
 
         Args:
             x: Input tensor of shape (batch, seq_len, dim).
             rope_cos: RoPE cosine frequencies, shape (seq_len, head_dim // 2) shared
                 across the batch or (batch, seq_len, head_dim // 2) per row.
             rope_sin: RoPE sine frequencies, same shape as ``rope_cos``.
-            kv_cache: Optional KV cache for incremental generation. Mutually
-                exclusive with ``attn_mask``: a cache grows the key axis every
-                step, so the mask would have to be rebuilt each step rather
-                than shared. The tokens of this forward are appended after the
-                cached ones and see every cached key plus themselves causally.
+            kv_cache: Optional KV cache for incremental generation. The
+                tokens of this forward are appended after the cached ones and
+                see every cached key plus themselves causally. A visibility
+                mask from ``build_attention_mask`` does not compose with a
+                cache: it is square over the residual, while the key axis
+                grows every step.
             attn_mask: The mask from
                 ``kempnerforge.model.masking.build_attention_mask``: a
                 FlexAttention ``BlockMask``, a dense bool tensor broadcastable
                 to (batch, n_heads, seq_len, seq_len) where ``True`` = attend,
-                or ``None`` for plain causal attention.
+                or ``None`` for plain causal attention. With a cache it is the
+                lower-right causal mask ``Transformer.forward`` builds once
+                from ``appended_causal_mask`` when several tokens are appended
+                to a non-empty cache, (seq_len, past + seq_len); a layer
+                called on its own without it derives the same mask.
 
         Returns:
             Output tensor of shape (batch, seq_len, dim).
@@ -227,11 +232,7 @@ class Attention(nn.Module):
             out, attn_weights = self._attention_with_weights(q, k, v, seq_len, attn_mask)
             self.last_attention_weights = attn_weights.detach().cpu()
         elif attn_mask is not None:
-            assert kv_cache is None, (
-                "a dense attn_mask does not compose with kv_cache decode; it is square "
-                "over the residual stream, while a cache grows the key axis every step."
-            )
-            with self._sdpa_context():
+            with self._sdpa_context(appended=past > 0):
                 out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         else:
             if past == 0:

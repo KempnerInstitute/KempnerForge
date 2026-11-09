@@ -110,9 +110,11 @@ before RoPE. Stabilizes attention logits at scale (Gemma, DeepSeek-V3).
    refused together with a KV cache, whether passed as arguments or carried
    on the `ModalityContext`.
 4. **Several tokens appended to a non-empty cache**: a lower-right causal
-   mask from `appended_causal_mask`, so each appended token sees every cached
-   key and the appended keys up to itself. SDPA's `is_causal=True` aligns its
-   triangle to the top left and would hide the cached keys.
+   mask from `appended_causal_mask`, built once per forward by
+   `Transformer.forward` from the cache fill level and passed to every block
+   as `attn_mask`, so each appended token sees every cached key and the
+   appended keys up to itself. SDPA's `is_causal=True` aligns its triangle to
+   the top left and would hide the cached keys.
 
 A fifth, slower path fires only when `capture_attention_weights=True`:
 `_attention_with_weights` computes `softmax(Q·Kᵀ / √d)` manually so

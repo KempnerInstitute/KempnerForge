@@ -457,6 +457,8 @@
           "purpose": "Grouped-Query Attention with RoPE, SDPA, optional QK-norm, doc_ids masking, attention weight capture",
           "methods": [
             "forward(x, rope_cos, rope_sin, *, kv_cache, attn_mask)",
+            "_sdpa_backends(*, appended)",
+            "_sdpa_context(*, appended)",
             "_attention_with_weights(q, k, v, seq_len, attn_mask)"
           ],
           "properties": [

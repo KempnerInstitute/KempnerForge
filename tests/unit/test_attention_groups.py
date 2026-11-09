@@ -662,8 +662,21 @@ class TestValidation:
         model = self._model()
         calls = self._spy_embedding(model)
         tokens = torch.randint(0, 64, (1, 8))
-        with pytest.raises(ValueError, match="training-only"):
-            model(tokens, kv_caches=caches, attention_group_ids=torch.zeros(1, 8, dtype=torch.long))
+        groups = torch.zeros(1, 8, dtype=torch.long)
+        with pytest.raises(ValueError, match="attention_group_ids .* training-only"):
+            model(tokens, kv_caches=caches, attention_group_ids=groups)
+        with pytest.raises(ValueError, match="modality.attention_group_ids"):
+            model(tokens, kv_caches=caches, modality=ModalityContext(attention_group_ids=groups))
+        with pytest.raises(ValueError, match="doc_ids is training-only"):
+            model(tokens, kv_caches=caches, doc_ids=groups)
+        with pytest.raises(ValueError, match="key_padding_mask is training-only"):
+            model(
+                kv_caches=caches,
+                modality=ModalityContext(
+                    inputs_embeds=torch.zeros(1, 8, 32),
+                    key_padding_mask=torch.ones(1, 8, dtype=torch.bool),
+                ),
+            )
         assert calls == []
 
     @pytest.mark.parametrize(

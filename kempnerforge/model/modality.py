@@ -26,8 +26,9 @@ needs:
   arguments of the same names, which may not be passed alongside.
 - A strategy whose positions are not one integer per token (a 2-D or
   multi-axis RoPE over image crops) fills ``rope_cos`` and ``rope_sin``
-  instead: the rotation itself, ``(batch, seq_len, head_dim // 2)``, which
-  the transformer applies in place of its own table. The strategy builds
+  instead: the rotation itself, ``(batch, seq_len, head_dim // 2)`` or
+  ``(1, seq_len, head_dim // 2)`` shared by every row, which the
+  transformer applies in place of its own table. The strategy builds
   them from ``precompute_rope_frequencies`` with the model's ``head_dim``
   and ``rope_theta``, so the same code positions every forward, training
   and inference alike.
@@ -66,8 +67,9 @@ class ModalityContext:
       ``Transformer.forward`` arguments of those names; the dtype and rank
       are checked here, the shape against the residual in ``forward``.
     - ``rope_cos`` and ``rope_sin`` come together, as floating
-      ``(batch, seq_len, head_dim // 2)`` tensors of one shape, and exclude
-      ``position_ids``; ``forward`` checks the shape against the residual.
+      ``(batch or 1, seq_len, head_dim // 2)`` tensors of one shape, dtype
+      and device, and exclude ``position_ids``; ``forward`` checks the shape
+      against the residual.
 
     ``output_slice`` composes with the ``tokens`` path AND with the
     ``inputs_embeds`` path; it is not constrained intra-context. The

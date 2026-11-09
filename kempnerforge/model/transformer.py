@@ -19,7 +19,7 @@ import torch.nn as nn
 from kempnerforge.config.registry import registry
 from kempnerforge.config.schema import ModelConfig
 from kempnerforge.config.vlm import CrossAttentionConfig, MoMaConfig, MoTConfig, VLMConfig
-from kempnerforge.model.attention import Attention, KVCache
+from kempnerforge.model.attention import Attention, KVCache, appended_causal_mask
 from kempnerforge.model.cross_attention import CrossAttentionBlock
 from kempnerforge.model.embedding import OutputHead, TokenEmbedding
 from kempnerforge.model.init import init_weights
@@ -378,7 +378,8 @@ class Transformer(nn.Module):
                 pure text-only forward. It may also carry ``position_ids``
                 and ``attention_group_ids`` (see those arguments) or the
                 rotation itself as ``rope_cos`` and ``rope_sin``,
-                ``(batch, seq_len, head_dim // 2)`` over the residual, for
+                ``(batch, seq_len, head_dim // 2)`` over the residual, or
+                ``(1, seq_len, head_dim // 2)`` shared by every row, for
                 position schemes that are not one integer per token; the
                 rotation excludes ``position_ids``, covers the appended
                 tokens under ``kv_caches`` as ``position_ids`` does, is
@@ -528,10 +529,10 @@ class Transformer(nn.Module):
                     "per-modality positions internally"
                 )
             expected = (batch, seq_len, self.config.head_dim // 2)
-            if tuple(rope_cos.shape) != expected:
+            if tuple(rope_cos.shape[1:]) != expected[1:] or rope_cos.shape[0] not in (1, batch):
                 raise ValueError(
                     f"modality.rope_cos shape {tuple(rope_cos.shape)} does not match the "
-                    f"residual rotation shape {expected} (batch, seq_len, head_dim // 2)"
+                    f"residual rotation shape {expected} (batch or 1, seq_len, head_dim // 2)"
                 )
         if modality_ids is not None and modality_ids.dtype != torch.long:
             raise ValueError(
@@ -573,6 +574,8 @@ class Transformer(nn.Module):
             h = torch.cat([prefix_embeds, h], dim=1)
 
         start_pos = kv_caches[0].seq_len if kv_caches is not None else 0
+        if kv_caches is not None and start_pos > 0 and seq_len > 1:
+            attn_mask = appended_causal_mask(seq_len, start_pos, h.device)
 
         if rope_cos is not None:
             assert rope_sin is not None
