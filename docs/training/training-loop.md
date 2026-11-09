@@ -176,11 +176,19 @@ After the step body, before advancing:
 
 | Tick | Trigger | What it does |
 |------|---------|--------------|
-| NCCL health | `step % tc.nccl_health_check_interval == 0` | Small all-reduce; break on failure |
+| NCCL health | `step % tc.nccl_health_check_interval == 0` | Small all-reduce; every rank breaks if it failed on any rank |
 | Eval | `step % eval_config.interval == 0` | [`run_eval`](evaluation.md), `on_eval_end` hook |
 | Profiler | every step | `prof.step()` advances the schedule |
 | Checkpoint | `checkpoint.should_save(step)`: `dyn_ckpt_window` milestones inside the window, every `checkpoint.interval` steps outside it | `ckpt_mgr.save(step)`, `on_checkpoint_save` hook |
-| Shutdown | SIGTERM / SIGUSR1 pending | `ckpt_mgr.save(step)`, or `ckpt_mgr.wait()` when the checkpoint tick just saved this step; then `finish()`, break |
+| Shutdown | SIGTERM / SIGUSR1 pending on any rank | `ckpt_mgr.save(step)`, or `ckpt_mgr.wait()` when the checkpoint tick just saved this step; then break |
+
+The two stop rows are votes. Each rank's own verdict, a pending signal
+or a failed probe, goes into one all-reduce over `session.control_group`,
+a gloo group the loop makes when it starts, so every rank stops at the
+same step or none does (see
+[SLURM preemption](../resilience/slurm-preemption.md)). The loop leaves
+the shutdown handler armed; `run_training` calls `finish()` only after
+the final flush and the teardown.
 
 A step skipped for a NaN / Inf loss runs only the shutdown row, through
 the same `_shutdown_if_requested` helper. The checkpoint tick does not
