@@ -359,5 +359,9 @@ def pixmo_counting(
             columns["xs"].append(xs)
             columns["ys"].append(ys)
     return PixmoCounting(
-        image_root, columns, pixels=not multi_label, max_points=max_points, max_attempts=max_attempts
+        image_root,
+        columns,
+        pixels=not multi_label,
+        max_points=max_points,
+        max_attempts=max_attempts,
     )
