@@ -2479,6 +2479,7 @@ class TestVlmSourceBuilders:
         self._stub_vlm_modules(monkeypatch, seen)
         config = self._vlm_data_config()
         config.data.hf_max_images = 3
+        config.train.seq_len = 128
         dp.build_data_pipeline(config, _runtime(), tokens_per_image=16)
         assert seen["packed_collator"] == {
             "pad_id": 7,
