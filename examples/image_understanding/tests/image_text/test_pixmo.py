@@ -99,6 +99,23 @@ class TestCaptionsAndConversations:
         )
         assert doc.turns[2].answers == ("Because.",)
 
+    def test_explanation_lists_of_different_lengths_are_refused(self, tmp_path: Path) -> None:
+        ann = _write_jsonl(
+            tmp_path / "expl.jsonl",
+            [
+                {
+                    "image": "pixmo_images/dd",
+                    "question": ["Where?", "Why?"],
+                    "parsed_response": ["Here."],
+                    "points": [[]],
+                    "inline_text": [[]],
+                    "alt_text": [[]],
+                }
+            ],
+        )
+        with pytest.raises(ValueError, match="differ in length"):
+            pixmo_point_explanations(ann, tmp_path)
+
     def test_explanation_turns_with_bad_points_are_dropped(self) -> None:
         assert explanation_answer("A <|POINT|>.", [[[430.0, 12.5]]], ["x"], ["y"]) is None
         assert explanation_answer("A <|POINT|>.", [[[-0.2, 81.6]]], ["x"], ["y"]) is None
@@ -172,6 +189,62 @@ class TestPointingAndCounting:
             "Counting the bird, I count 2.",
         )
 
+    def test_pixel_points_turn_with_a_rotated_image(self, tmp_path: Path) -> None:
+        """PixMo-Count pixels name the stored grid, so they move with the EXIF rotation."""
+        exif = Image.Exif()
+        exif[0x0112] = 6
+        path = tmp_path / "pixmo_images/rot"
+        path.parent.mkdir(parents=True)
+        Image.new("RGB", (8, 4)).save(path, format="PNG", exif=exif)
+        ann = _write_jsonl(
+            tmp_path / "count.jsonl",
+            [
+                {
+                    "image": "pixmo_images/rot",
+                    "label": "x",
+                    "count": 1,
+                    "points": {"x": [4.0], "y": [0.0]},
+                }
+            ],
+        )
+        doc = pixmo_counting(ann, tmp_path, multi_label=False)[0]
+        assert doc.images[0].size == (4, 8)
+        assert doc.turns[0].answers[0].startswith('<point x="100.0" y="50.0"')
+
+    def test_lists_of_different_lengths_are_refused(self, tmp_path: Path) -> None:
+        pointing = _write_jsonl(
+            tmp_path / "pointing.jsonl",
+            [{"image": "pixmo_images/aa", "label": ["cat", "dog"], "points": [[]]}],
+        )
+        with pytest.raises(ValueError, match="label, points differ in length"):
+            pixmo_pointing(pointing, tmp_path)
+        counting = _write_jsonl(
+            tmp_path / "points_counting.jsonl",
+            [
+                {
+                    "image": "pixmo_images/aa",
+                    "label": ["cat", "dog"],
+                    "count": [1],
+                    "points": [[], []],
+                }
+            ],
+        )
+        with pytest.raises(ValueError, match="label, count, points differ in length"):
+            pixmo_counting(counting, tmp_path, multi_label=True)
+        count = _write_jsonl(
+            tmp_path / "count.jsonl",
+            [
+                {
+                    "image": "pixmo_images/aa",
+                    "label": "cat",
+                    "count": 2,
+                    "points": {"x": [1, 2], "y": [1]},
+                }
+            ],
+        )
+        with pytest.raises(ValueError, match="x and y differ in length"):
+            pixmo_counting(count, tmp_path, multi_label=False)
+
     def test_counting_keeps_every_point_unless_capped(
         self, tmp_path: Path, write_image: Callable
     ) -> None:
@@ -230,8 +303,10 @@ class TestPointingAndCounting:
         capped = trained(answer(3))
         assert capped.endswith("Counting the dot, I count 40.<|im_end|>")
 
-    def test_missing_count_reads_as_zero(self, tmp_path: Path, write_image: Callable) -> None:
-        write_image("pixmo_images/hh")
+    def test_a_missing_count_states_the_number_of_points(
+        self, tmp_path: Path, write_image: Callable
+    ) -> None:
+        write_image("pixmo_images/hh", size=(10, 10))
         ann = _write_jsonl(
             tmp_path / "count.jsonl",
             [
@@ -240,11 +315,18 @@ class TestPointingAndCounting:
                     "label": "ant",
                     "count": None,
                     "points": {"x": [], "y": []},
-                }
+                },
+                {
+                    "image": "pixmo_images/hh",
+                    "label": "bee",
+                    "count": None,
+                    "points": {"x": [1, 2], "y": [1, 2]},
+                },
             ],
         )
-        doc = pixmo_counting(ann, tmp_path, multi_label=False)[0]
-        assert doc.turns[0].answers == ("I count 0 ant in the image.",)
+        reader = pixmo_counting(ann, tmp_path, multi_label=False)
+        assert reader[0].turns[0].answers == ("I count 0 ant in the image.",)
+        assert reader[1].turns[0].answers[0].endswith("Counting the bee, I count 2.")
 
 
 class TestUnreadableImages:
@@ -274,6 +356,13 @@ class TestUnreadableImages:
         reader = pixmo_captions(ann, tmp_path, prompt="P", max_attempts=3)
         with pytest.raises(RuntimeError, match="3 consecutive rows"):
             reader[0]
+
+    def test_rows_sharing_one_unreadable_image_give_up_at_once(self, tmp_path: Path) -> None:
+        _write_stub(tmp_path, "pixmo_images/s1")
+        reader = pixmo_captions(self._captions(tmp_path, ["s1", "s1", "s1"]), tmp_path, prompt="P")
+        with pytest.raises(RuntimeError, match="every row has the image"):
+            reader[1]
+        assert reader.skipped == 1
 
     def test_every_reader_takes_max_attempts(self, tmp_path: Path) -> None:
         ann = _write_jsonl(tmp_path / "empty.jsonl", [])

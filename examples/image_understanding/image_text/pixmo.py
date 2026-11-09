@@ -13,14 +13,13 @@ from pathlib import Path
 from typing import Any
 
 import pyarrow as pa
-from PIL import Image
 from torch.utils.data import Dataset
 
 from kempnerforge.metrics.logger import get_logger
 
-from .decode import UnreadableImageError, decode_rgb, first_readable
+from .decode import Decoded, UnreadableImageError, decode_upright, first_readable
 from .document import Document, Turn
-from .points import check_max_points, format_point_answer, pixels_to_percent
+from .points import check_max_points, format_point_answer
 
 logger = get_logger(__name__)
 
@@ -40,12 +39,21 @@ def _is_text(value: Any) -> bool:
     return isinstance(value, str) and bool(value.strip())
 
 
+def _parallel(row: dict[str, Any], *keys: str) -> Iterator[tuple[Any, ...]]:
+    """The row's ``keys`` zipped, refusing lists of different lengths."""
+    lists = [row.get(key) or [] for key in keys]
+    if len({len(values) for values in lists}) > 1:
+        raise ValueError(f"row for {row['image']}: {', '.join(keys)} differ in length")
+    return zip(*lists, strict=True)
+
+
 class PixmoRows(Dataset):
     """Annotation rows over the PixMo image pool, skipping rows whose image does not decode.
 
     A read tries ``index`` and then the rows after it, ``max_attempts`` images in
     all: the rows that follow a failed one with the same image are passed over
-    without counting as attempts.
+    without counting as attempts, and a read whose rows all share the failed
+    image gives up at once.
     """
 
     def __init__(
@@ -66,13 +74,13 @@ class PixmoRows(Dataset):
     def __len__(self) -> int:
         return self._rows.num_rows
 
-    def document(self, row: dict[str, Any], image: Image.Image) -> Document:
+    def document(self, row: dict[str, Any], decoded: Decoded) -> Document:
         """The document for one row and its decoded image."""
         raise NotImplementedError
 
     def _read(self, index: int) -> Document:
         row = self._rows.slice(index, 1).to_pylist()[0]
-        return self.document(row, decode_rgb(self.image_root / row["image"]))
+        return self.document(row, decode_upright(self.image_root / row["image"]))
 
     def _skip(self, index: int, error: UnreadableImageError) -> None:
         if not self.skipped:
@@ -88,7 +96,7 @@ class PixmoRows(Dataset):
         for step in range(1, len(self)):
             if self._image((index + step) % len(self)) != image:
                 return index + step
-        return index + 1
+        raise RuntimeError(f"every row has the image {image}, which does not decode")
 
     def __getitem__(self, index: int) -> Document:
         if not 0 <= index < len(self):
@@ -111,19 +119,19 @@ class PixmoCaptions(PixmoRows):
         super().__init__(image_root, columns, max_attempts)
         self.prompt = prompt
 
-    def document(self, row: dict[str, Any], image: Image.Image) -> Document:
-        return Document(images=(image,), turns=(Turn(self.prompt, (row["caption"],)),))
+    def document(self, row: dict[str, Any], decoded: Decoded) -> Document:
+        return Document(images=(decoded.image,), turns=(Turn(self.prompt, (row["caption"],)),))
 
 
 class PixmoConversations(PixmoRows):
     """Multi-turn conversations about one image."""
 
-    def document(self, row: dict[str, Any], image: Image.Image) -> Document:
+    def document(self, row: dict[str, Any], decoded: Decoded) -> Document:
         turns = tuple(
             Turn(user, (assistant,))
             for user, assistant in zip(row["users"], row["assistants"], strict=True)
         )
-        return Document(images=(image,), turns=turns, kind="conversation")
+        return Document(images=(decoded.image,), turns=turns, kind="conversation")
 
 
 class PixmoPointing(PixmoRows):
@@ -139,7 +147,7 @@ class PixmoPointing(PixmoRows):
         super().__init__(image_root, columns, max_attempts)
         self.max_points = check_max_points(max_points)
 
-    def document(self, row: dict[str, Any], image: Image.Image) -> Document:
+    def document(self, row: dict[str, Any], decoded: Decoded) -> Document:
         label = row["label"]
         answer = format_point_answer(
             list(zip(row["xs"], row["ys"], strict=True)),
@@ -147,14 +155,15 @@ class PixmoPointing(PixmoRows):
             absent_text=f"There are no {label} in the image.",
             max_points=self.max_points,
         )
-        return Document(images=(image,), turns=(Turn(f"Point to the {label}.", (answer,)),))
+        return Document(images=(decoded.image,), turns=(Turn(f"Point to the {label}.", (answer,)),))
 
 
 class PixmoCounting(PixmoRows):
     """Counting questions answered by pointing, then counting.
 
-    ``pixels`` says the points are stored in pixels and converts them to percent
-    of the decoded image's size. Every point is kept unless
+    ``pixels`` says the points are stored in pixels of the file's pixel grid; they
+    are converted to percent of the upright image. A row without a count states
+    the number of its points. Every point is kept unless
     ``max_points`` caps them, so the points agree with the stated count; a cap
     keeps the first points and still states the full count. The answer lists the
     points before the count, so when it outruns the renderer's text budget (at
@@ -175,19 +184,19 @@ class PixmoCounting(PixmoRows):
         self.pixels = pixels
         self.max_points = check_max_points(max_points)
 
-    def document(self, row: dict[str, Any], image: Image.Image) -> Document:
+    def document(self, row: dict[str, Any], decoded: Decoded) -> Document:
         label = row["label"]
-        count = row["count"] or 0
         points = list(zip(row["xs"], row["ys"], strict=True))
+        count = row["count"] if row["count"] is not None else len(points)
         if self.pixels:
-            points = pixels_to_percent(points, *image.size)
+            points = decoded.percent(points)
         if points:
             tag = format_point_answer(points, label, absent_text="", max_points=self.max_points)
             answer = f"{tag}\nCounting the {label}, I count {count}."
         else:
             answer = f"I count {count} {label} in the image."
         user = f"How many {label} are in the image?"
-        return Document(images=(image,), turns=(Turn(user, (answer,)),))
+        return Document(images=(decoded.image,), turns=(Turn(user, (answer,)),))
 
 
 def pixmo_captions(
@@ -282,16 +291,11 @@ def pixmo_point_explanations(
     """
 
     def turns(row: dict[str, Any]) -> list[tuple[Any, Any]]:
-        fields = (
-            row.get("question") or [],
-            row.get("parsed_response") or [],
-            row.get("points") or [],
-            row.get("inline_text") or [],
-            row.get("alt_text") or [],
-        )
         return [
             (user, explanation_answer(parsed, pts, inline, alt))
-            for user, parsed, pts, inline, alt in zip(*fields, strict=False)
+            for user, parsed, pts, inline, alt in _parallel(
+                row, "question", "parsed_response", "points", "inline_text", "alt_text"
+            )
         ]
 
     return _conversations(
@@ -310,7 +314,7 @@ def pixmo_pointing(
     """PixMo-Points pointing, one example per labelled object kind."""
     columns: dict[str, list[Any]] = {"image": [], "label": [], "xs": [], "ys": []}
     for row in _jsonl(annotation_file):
-        for label, points in zip(row["label"], row["points"], strict=False):
+        for label, points in _parallel(row, "label", "points"):
             columns["image"].append(row["image"])
             columns["label"].append(label)
             columns["xs"].append([float(p["x"]) for p in points])
@@ -331,19 +335,20 @@ def pixmo_counting(
     ``multi_label`` rows hold parallel ``label``, ``count`` and ``points`` lists
     in percent (PixMo-Points counting); otherwise a row is one label whose
     ``points`` are an ``{"x": [...], "y": [...]}`` mapping in pixels (PixMo-Count),
-    converted to percent of the decoded image.
+    converted to percent of the upright image. Lists of different lengths are
+    refused.
     """
     columns: dict[str, list[Any]] = {"image": [], "label": [], "count": [], "xs": [], "ys": []}
     for row in _jsonl(annotation_file):
         if multi_label:
             entries = [
                 (label, count, [float(p["x"]) for p in pts], [float(p["y"]) for p in pts])
-                for label, count, pts in zip(
-                    row["label"], row["count"], row["points"], strict=False
-                )
+                for label, count, pts in _parallel(row, "label", "count", "points")
             ]
         else:
             pts = row["points"]
+            if len(pts["x"]) != len(pts["y"]):
+                raise ValueError(f"row for {row['image']}: x and y differ in length")
             entries = [
                 (
                     row["label"],

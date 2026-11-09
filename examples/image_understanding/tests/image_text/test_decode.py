@@ -7,7 +7,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 import pytest
-from image_text.decode import UnreadableImageError, decode_rgb, first_readable
+from image_text.decode import UnreadableImageError, decode_rgb, decode_upright, first_readable
 from PIL import Image
 
 EXIF_ORIENTATION = 0x0112
@@ -57,6 +57,25 @@ class TestDecodeRgb:
         path = tmp_path / "rotated.jpg"
         Image.new("RGB", (8, 4)).save(path, exif=exif)
         assert decode_rgb(path).size == (4, 8)
+
+    @pytest.mark.parametrize("orientation", range(1, 9))
+    def test_stored_pixels_follow_the_orientation(self, tmp_path: Path, orientation: int) -> None:
+        """A point on the stored grid lands on the same pixel of the upright image."""
+        image = Image.new("RGB", (8, 4))
+        image.putpixel((6, 1), (255, 255, 255))
+        exif = Image.Exif()
+        exif[EXIF_ORIENTATION] = orientation
+        path = tmp_path / "marked.png"
+        image.save(path, exif=exif)
+        decoded = decode_upright(path)
+        assert (decoded.orientation, decoded.stored_size) == (orientation, (8, 4))
+        ((px, py),) = decoded.percent([(6.5, 1.5)])
+        width, height = decoded.image.size
+        assert decoded.image.getpixel((int(px / 100 * width), int(py / 100 * height))) == (
+            255,
+            255,
+            255,
+        )
 
 
 class TestFirstReadable:
