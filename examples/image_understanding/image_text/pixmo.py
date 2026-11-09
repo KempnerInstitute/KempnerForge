@@ -7,6 +7,7 @@ next image.
 
 from __future__ import annotations
 
+import itertools
 import json
 from collections.abc import Iterator
 from pathlib import Path
@@ -16,7 +17,7 @@ import pyarrow as pa
 from torch.utils.data import Dataset
 
 from .decode import Decoded, UnreadableImageError, decode_upright
-from .document import Document, Turn
+from .document import Document, Turn, is_text
 from .points import check_max_points, format_point_answer
 from .skip import MAX_ATTEMPTS, SkipLog, UnusableRowError, check_max_attempts, first_usable
 
@@ -31,13 +32,11 @@ def _jsonl(path: str | Path) -> Iterator[dict[str, Any]]:
                 yield json.loads(line)
 
 
-def _is_text(value: Any) -> bool:
-    return isinstance(value, str) and bool(value.strip())
-
-
 def _parallel(row: dict[str, Any], *keys: str) -> Iterator[tuple[Any, ...]]:
-    """The row's ``keys`` zipped, refusing lists of different lengths."""
+    """The row's ``keys`` zipped, refusing values that are not lists of one length."""
     lists = [row.get(key) or [] for key in keys]
+    if not all(isinstance(values, list) for values in lists):
+        raise ValueError(f"row for {row['image']}: {', '.join(keys)} must be lists")
     if len({len(values) for values in lists}) > 1:
         raise ValueError(f"row for {row['image']}: {', '.join(keys)} differ in length")
     return zip(*lists, strict=True)
@@ -214,7 +213,7 @@ def pixmo_captions(
     """PixMo-Cap dense captions; a row without a caption is dropped."""
     images, captions = [], []
     for row in _jsonl(annotation_file):
-        if _is_text(row.get("caption")):
+        if is_text(row.get("caption")):
             images.append(row["image"])
             captions.append(row["caption"])
     return PixmoCaptions(image_root, {"image": images, "caption": captions}, prompt, max_attempts)
@@ -225,9 +224,15 @@ def _conversations(
     rows: Iterator[tuple[str, list[tuple[Any, Any]]]],
     max_attempts: int,
 ) -> PixmoConversations:
+    """Conversations from ``(image, [(user, assistant), ...])`` rows.
+
+    A conversation keeps its turns up to the first one missing its user message
+    or its reply, since later turns may refer to it; a row left without a turn is
+    dropped.
+    """
     images, users, assistants = [], [], []
     for image, pairs in rows:
-        kept = [(u, a) for u, a in pairs if _is_text(u) and _is_text(a)]
+        kept = list(itertools.takewhile(lambda pair: is_text(pair[0]) and is_text(pair[1]), pairs))
         if kept:
             images.append(image)
             users.append([u for u, _ in kept])
@@ -309,8 +314,9 @@ def pixmo_point_explanations(
     """PixMo point-explanations, replies rebuilt from the parsed response and its points.
 
     The raw ``response`` writes some multi-point tags in a second syntax, so the
-    replies are rebuilt from ``parsed_response`` with the pointing syntax;
-    turns whose points are malformed or outside the image are dropped.
+    replies are rebuilt from ``parsed_response`` with the pointing syntax; a
+    turn whose fields are malformed or whose points leave the image ends the
+    conversation there.
     """
 
     def turns(row: dict[str, Any]) -> list[tuple[Any, Any]]:
