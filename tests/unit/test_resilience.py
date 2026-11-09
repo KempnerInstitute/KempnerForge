@@ -544,10 +544,13 @@ class TestSLURM:
         handler.setLevel(logging.DEBUG)
         logger = logging.getLogger("kempnerforge.resilience.elastic")
         logger.addHandler(handler)
+        old_level = logger.level
+        logger.setLevel(logging.INFO)
         try:
             log_job_info()
             assert "Not running under SLURM" in buf.getvalue()
         finally:
+            logger.setLevel(old_level)
             logger.removeHandler(handler)
             if old is not None:
                 os.environ["SLURM_JOB_ID"] = old
@@ -574,6 +577,8 @@ class TestSLURM:
         handler.setLevel(logging.DEBUG)
         logger = logging.getLogger("kempnerforge.resilience.elastic")
         logger.addHandler(handler)
+        old_level = logger.level
+        logger.setLevel(logging.INFO)
         try:
             log_job_info()
             output = buf.getvalue()
@@ -581,6 +586,7 @@ class TestSLURM:
             assert "test_run" in output
             assert "gpu_test" in output
         finally:
+            logger.setLevel(old_level)
             logger.removeHandler(handler)
             for k in env:
                 if saved[k] is not None:
@@ -606,10 +612,13 @@ class TestSLURM:
         handler.setLevel(logging.DEBUG)
         logger = logging.getLogger("kempnerforge.resilience.elastic")
         logger.addHandler(handler)
+        old_level = logger.level
+        logger.setLevel(logging.INFO)
         try:
             log_job_info()
             assert "requeued" in buf.getvalue().lower()
         finally:
+            logger.setLevel(old_level)
             logger.removeHandler(handler)
             for k in env:
                 if saved[k] is not None:
