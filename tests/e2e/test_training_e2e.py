@@ -18,6 +18,7 @@ Each test verifies:
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import signal
@@ -25,6 +26,7 @@ import socket
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -641,6 +643,142 @@ def test_sigterm_triggers_emergency_checkpoint(tmp_path):
     assert "Checkpoint committed" in output, (
         f"Emergency checkpoint was not saved:\n{traceback_or_tail(output, 2000)}"
     )
+
+
+def _descendants(pid: int) -> list[int]:
+    """Every process below ``pid``, read from ``/proc``."""
+    found: list[int] = []
+    for task in Path(f"/proc/{pid}/task").glob("*"):
+        try:
+            children = (task / "children").read_text().split()
+        except OSError:
+            continue
+        for child in map(int, children):
+            found += [child, *_descendants(child)]
+    return found
+
+
+def _rank_pid(launcher: subprocess.Popen, local_rank: int) -> int:
+    """The PID of the training process ``torch.distributed.run`` started for ``local_rank``."""
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline:
+        for pid in _descendants(launcher.pid):
+            try:
+                environ = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+            except OSError:
+                continue
+            if f"LOCAL_RANK={local_rank}".encode() in environ:
+                return pid
+        time.sleep(0.5)
+    raise AssertionError(f"no process with LOCAL_RANK={local_rank} below {launcher.pid}")
+
+
+def _wait_for_log(log: Path, text: str, proc: subprocess.Popen, timeout: float) -> None:
+    """Wait until ``text`` is in ``log``; fail if ``proc`` exits first or time runs out."""
+    deadline = time.monotonic() + timeout
+    while text not in log.read_text():
+        if proc.poll() is not None or time.monotonic() > deadline:
+            pytest.fail(
+                f"{text!r} not logged (exit code {proc.poll()}):\n"
+                f"{traceback_or_tail(log.read_text(), 2000)}"
+            )
+        time.sleep(1)
+
+
+def _signal_and_wait(
+    cmd: list[str],
+    log: Path,
+    pid_of: Callable[[subprocess.Popen], int],
+    sig: signal.Signals,
+    env: dict[str, str],
+) -> str:
+    """Start ``cmd``, send ``sig`` to ``pid_of(proc)`` after step 5, and return the log.
+
+    The run leads its own session, so whatever is left of it is killed at the end.
+    """
+    with log.open("w") as out:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=out,
+            stderr=subprocess.STDOUT,
+            env=env,
+            cwd=str(PROJECT_ROOT),
+            start_new_session=True,
+        )
+    returncode: int | None = None
+    try:
+        _wait_for_log(log, "[step 5]", proc, timeout=900)
+        os.kill(pid_of(proc), sig)
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            returncode = proc.wait(timeout=120)
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait()
+    output = log.read_text()
+    excerpt = traceback_or_tail(output, 2000)
+    assert returncode is not None, f"training still running 120s after {sig.name}:\n{excerpt}"
+    assert returncode == 0, f"training failed (exit {returncode}):\n{excerpt}"
+    return output
+
+
+@pytest.mark.e2e
+@requires_gpus(2)
+def test_sigusr1_to_one_rank_stops_every_rank(tmp_path):
+    """Only local rank 1 gets SIGUSR1; both ranks stop at one step and save it (#307)."""
+    ckpt_dir = tmp_path / "ckpt"
+    cmd = [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--nproc_per_node=2",
+        f"--master_port={_find_free_port()}",
+        TRAIN_SCRIPT,
+        DEBUG_CONFIG,
+        "--train.max_steps=100000",
+        "--metrics.log_interval=1",
+        f"--checkpoint.dir={ckpt_dir}",
+        "--checkpoint.interval=100000",
+    ]
+    output = _signal_and_wait(
+        cmd,
+        tmp_path / "train.log",
+        lambda launcher: _rank_pid(launcher, local_rank=1),
+        signal.SIGUSR1,
+        os.environ.copy(),
+    )
+    excerpt = traceback_or_tail(output, 2000)
+    assert "Shutdown requested on another rank" in output, f"rank 0 did not stop:\n{excerpt}"
+    assert "Checkpoint committed" in output, f"no emergency checkpoint:\n{excerpt}"
+    shards = sorted(p.name for p in (ckpt_dir / "latest").resolve().glob("*.distcp"))
+    assert shards == ["__0_0.distcp", "__1_0.distcp"], shards
+
+
+@pytest.mark.e2e
+@requires_gpus(1)
+def test_sigusr1_after_a_compile_writes_the_emergency_checkpoint(tmp_path):
+    """The first in-process Triton compile replaces the handlers below Python (#448)."""
+    ckpt_dir = tmp_path / "ckpt"
+    env = os.environ.copy()
+    env.setdefault("WORLD_SIZE", "1")
+    env.setdefault("RANK", "0")
+    env.setdefault("LOCAL_RANK", "0")
+    cmd = [
+        sys.executable,
+        TRAIN_SCRIPT,
+        DEBUG_CONFIG,
+        "--train.max_steps=100000",
+        "--train.compile_model=true",
+        "--metrics.log_interval=1",
+        f"--checkpoint.dir={ckpt_dir}",
+        "--checkpoint.interval=100000",
+    ]
+    output = _signal_and_wait(
+        cmd, tmp_path / "train.log", lambda proc: proc.pid, signal.SIGUSR1, env
+    )
+    excerpt = traceback_or_tail(output, 2000)
+    assert "Received SIGUSR1" in output, f"SIGUSR1 never reached the handler:\n{excerpt}"
+    assert "Checkpoint committed" in output, f"no emergency checkpoint:\n{excerpt}"
 
 
 @pytest.mark.e2e
