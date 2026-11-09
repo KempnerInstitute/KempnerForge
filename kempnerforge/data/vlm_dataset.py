@@ -85,14 +85,14 @@ def tile_image(
     mean: tuple[float, float, float],
     std: tuple[float, float, float],
     *,
-    grid: int,
-    include_global: bool = True,
+    tile_grid: int,
+    tile_global: bool = True,
 ) -> torch.Tensor:
-    """Cut an image into views: the whole image, then a ``grid`` × ``grid`` raster of crops.
+    """Cut an image into views: the whole image, then an ``n × n`` raster of crops.
 
     The whole image, resized to ``image_size`` square exactly as ``pil_to_tensor``
-    does, comes first when ``include_global``. The crops are cut from the image
-    resized to ``grid * image_size`` square, so each is ``image_size`` px and
+    does, comes first when ``tile_global``. The crops are cut from the image
+    resized to ``tile_grid * image_size`` square, so each is ``image_size`` px and
     together they cover that canvas exactly; they follow in raster order (left
     to right, then top to bottom). Returns ``(views, 3, image_size,
     image_size)``, every view normalized like ``pil_to_tensor``.
@@ -100,15 +100,18 @@ def tile_image(
     Public for the same reason as ``pil_to_tensor``: an evaluation adapter must
     tile a request's image exactly as training did.
     """
-    if grid < 2:
-        raise ValueError(f"grid must be >= 2 (an n × n grid of crops), got {grid}")
+    if tile_grid < 2:
+        raise ValueError(f"tile_grid must be >= 2 (an n × n grid of crops), got {tile_grid}")
     _require_pil(img)
+    img = img.convert("RGB")
     views = []
-    if include_global:
+    if tile_global:
         views.append(pil_to_tensor(img, image_size, mean, std).unsqueeze(0))
-    canvas = pil_to_tensor(img, grid * image_size, mean, std)
-    crops = canvas.reshape(3, grid, image_size, grid, image_size).permute(1, 3, 0, 2, 4)
-    views.append(crops.reshape(grid * grid, 3, image_size, image_size))
+    canvas = pil_to_tensor(img, tile_grid * image_size, mean, std)
+    crops = canvas.reshape(3, tile_grid, image_size, tile_grid, image_size)
+    views.append(
+        crops.permute(1, 3, 0, 2, 4).reshape(tile_grid * tile_grid, 3, image_size, image_size)
+    )
     return torch.cat(views, dim=0)
 
 
@@ -123,7 +126,7 @@ def image_to_views(
 ) -> torch.Tensor:
     """One ``(3, H, W)`` view, or the ``(V, 3, H, W)`` views of ``tile_image`` when tiling."""
     if tile_grid:
-        return tile_image(img, image_size, mean, std, grid=tile_grid, include_global=tile_global)
+        return tile_image(img, image_size, mean, std, tile_grid=tile_grid, tile_global=tile_global)
     return pil_to_tensor(img, image_size, mean, std)
 
 
@@ -406,6 +409,9 @@ class HuggingFaceVLMDataset(Dataset):
         tile_global: bool = True,
     ) -> None:
         import os
+
+        if tile_grid < 0 or tile_grid == 1:
+            raise ValueError(f"tile_grid must be 0 (one view) or >= 2, got {tile_grid}")
 
         from datasets import Dataset as HFDataset
         from datasets import load_dataset, load_from_disk

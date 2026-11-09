@@ -285,7 +285,7 @@ class TestFramesToPixelValues:
             [img], image_size=16, device=DEVICE, dtype=torch.float32, tile_grid=2
         )
         assert pv.shape == (1, 5, 3, 16, 16)
-        expected = tile_image(img, 16, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD, grid=2)
+        expected = tile_image(img, 16, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD, tile_grid=2)
         assert torch.equal(pv[0], expected)
         crops = _frames_to_pixel_values(
             [img], image_size=16, device=DEVICE, dtype=torch.float32, tile_grid=2, tile_global=False
