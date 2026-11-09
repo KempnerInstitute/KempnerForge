@@ -5,11 +5,22 @@ from __future__ import annotations
 import sys
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+QWEN = "Qwen/Qwen3-0.6B"
+
+
+@pytest.fixture(scope="session")
+def tokenizer() -> Any:
+    """The Qwen3 tokenizer, loaded once for every renderer test."""
+    from transformers import AutoTokenizer
+
+    return AutoTokenizer.from_pretrained(QWEN)
 
 
 @pytest.fixture

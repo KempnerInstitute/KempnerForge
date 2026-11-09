@@ -20,7 +20,9 @@ from .document import Document, Turn
 class ImageTextRows(Dataset):
     """Single-image, single-turn rows held in an Arrow table; images are read on access.
 
-    Empty answers are dropped, and with them any row left without an answer.
+    The table is shared with forked loader workers without the per-row copies that
+    touching Python objects would cause. Blank answers are dropped, and with them
+    any row left without an answer.
     """
 
     def __init__(
@@ -35,7 +37,7 @@ class ImageTextRows(Dataset):
                 f"column lengths differ: {len(images)} images, {len(users)} users, "
                 f"{len(answers)} answer lists"
             )
-        usable = [[answer for answer in row if answer] for row in answers]
+        usable = [[answer for answer in row if answer.strip()] for row in answers]
         kept = [i for i, row in enumerate(usable) if row]
         self.image_root = Path(image_root)
         self._rows = pa.table(
@@ -64,7 +66,8 @@ def _load_json(path: str | Path) -> Any:
 
 
 def _answers(value: Any) -> list[str]:
-    return [str(v) for v in value] if isinstance(value, list) else [str(value)]
+    values = value if isinstance(value, list) else [value]
+    return [str(v) for v in values if v is not None]
 
 
 def coco_captions(
