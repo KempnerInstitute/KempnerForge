@@ -141,6 +141,31 @@ class TestShutdownHandler:
                 timer.cancel()
             handler.finish()
 
+    def test_unregister_leaves_the_forced_exit_timer_armed(self):
+        """Restoring the handlers does not retire the watchdog (#313)."""
+        original = signal.getsignal(signal.SIGTERM)
+        handler = ShutdownHandler(timeout_sec=300)
+        handler.register()
+        os.kill(os.getpid(), signal.SIGTERM)
+        try:
+            handler.unregister()
+            assert signal.getsignal(signal.SIGTERM) is original
+            assert handler._timer is not None
+        finally:
+            handler.cancel_watchdog()
+        assert handler._timer is None
+
+    def test_cancel_watchdog_leaves_the_handlers_installed(self):
+        handler = ShutdownHandler(timeout_sec=300)
+        handler.register()
+        os.kill(os.getpid(), signal.SIGTERM)
+        try:
+            handler.cancel_watchdog()
+            assert handler._timer is None
+            assert signal.getsignal(signal.SIGTERM) == handler._handle_signal
+        finally:
+            handler.finish()
+
 
 class TestNaNDetector:
     def test_finite_loss_returns_true(self):

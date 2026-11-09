@@ -66,8 +66,9 @@ class ShutdownHandler:
             train_step()
             if handler.should_shutdown():
                 save_checkpoint()
-                handler.finish()
                 break
+        wait_for_checkpoint()
+        handler.finish()
 
     Args:
         timeout_sec: Maximum seconds allowed for graceful shutdown before
@@ -109,19 +110,24 @@ class ShutdownHandler:
         logger.info("Shutdown handler registered (SIGTERM, SIGUSR1)")
 
     def unregister(self) -> None:
-        """Restore original signal handlers."""
+        """Restore the original signal handlers; the forced-exit timer stays armed."""
         for sig, handler in self._original_handlers.items():
             signal.signal(sig, handler)
         self._original_handlers.clear()
+
+    def cancel_watchdog(self) -> None:
+        """Cancel the forced-exit timer, leaving the signal handlers installed."""
         self._cancel_timer()
 
     def finish(self) -> None:
-        """Call after graceful shutdown is complete.
+        """Call once the emergency checkpoint is durable and teardown is done.
 
-        Cancels the forced-exit timer and restores signal handlers.
+        Restores the signal handlers and cancels the forced-exit timer, so it
+        must come after the last step that a second signal or a hang could cut
+        short: the checkpoint flush, and tearing down the process group.
         """
-        self._cancel_timer()
         self.unregister()
+        self.cancel_watchdog()
         logger.info("Graceful shutdown complete")
 
     def _handle_signal(self, signum: int, frame: FrameType | None) -> None:

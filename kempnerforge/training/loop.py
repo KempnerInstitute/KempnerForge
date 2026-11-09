@@ -507,11 +507,14 @@ def _shutdown_if_requested(
     saved_this_step: bool,
     nan_skipped: bool = False,
 ) -> bool:
-    """Write the emergency checkpoint and finish when a shutdown is pending on any rank.
+    """Write the emergency checkpoint when a shutdown is pending on any rank.
 
     Every rank must call this at the same step. The ranks first agree over
     ``session.control_group`` whether any of them was signaled, so they all
-    stop or all go on, whichever ranks the signal reached and whenever.
+    stop or all go on, whichever ranks the signal reached and whenever. The
+    handler is left armed: its forced-exit timer still bounds the flush that
+    ``run_training_loop`` ends with and the caller's teardown, and the caller
+    calls ``finish()`` after both.
 
     Returns True when the loop must stop. With ``saved_this_step``, the
     scheduled save of ``step`` is the emergency checkpoint, so it is drained
@@ -549,7 +552,6 @@ def _shutdown_if_requested(
             dataloader=session.data.dataloader,
             extra=checkpoint_extra(session.config, step, session.phases),
         )
-    session.shutdown_handler.finish()
     return True
 
 
@@ -565,6 +567,8 @@ def run_training_loop(
 
     Every rank must call it: the shutdown and NCCL-health stops are agreed
     over ``session.control_group``, which the loop makes when it is ``None``.
+    It never calls ``shutdown_handler.finish()``; the handler's owner does,
+    once teardown is done.
     """
     config = session.config
     tc = config.train
