@@ -30,6 +30,31 @@ def _make_image(size: int = 64, color: int = 128) -> Image.Image:
     return Image.new("RGB", (size, size), color=(color, color, color))
 
 
+def _dataset_over(
+    rows,
+    *,
+    image_size: int = 16,
+    max_text_len: int = 8,
+    allow_text_only: bool = False,
+    tokenizer_path: str = "gpt2",
+) -> HuggingFaceVLMDataset:
+    """A ``HuggingFaceVLMDataset`` over in-memory ``rows``, skipping ``__init__``'s loading."""
+    from transformers import AutoTokenizer
+
+    ds = HuggingFaceVLMDataset.__new__(HuggingFaceVLMDataset)
+    ds._ds = rows
+    ds._image_field = "image"
+    ds._text_field = "caption"
+    ds._prompt_field = None
+    ds._image_size = image_size
+    ds._image_mean = DEFAULT_IMAGE_MEAN
+    ds._image_std = DEFAULT_IMAGE_STD
+    ds._max_text_len = max_text_len
+    ds._allow_text_only = allow_text_only
+    ds._tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+    return ds
+
+
 class TestPILToTensor:
     def test_shape_and_dtype(self):
         img = _make_image(48)
@@ -577,7 +602,7 @@ class TestVLMCollator:
         }
 
     def test_a_text_only_sample_gets_a_blank_image_and_a_frame_mask(self):
-        collator = VLMCollator(pad_id=0, max_text_len=20)
+        collator = VLMCollator(pad_id=0, max_text_len=20, allow_text_only=True)
         text_only = self._sample(3)
         text_only["pixel_values"] = torch.zeros(0, 3, 32, 32)
         batch = collator([self._sample(5), text_only])
@@ -586,9 +611,19 @@ class TestVLMCollator:
         assert batch["frame_mask"].tolist() == [[True], [False]]
         assert batch["input_ids"][1, :3].tolist() == [1, 2, 3]
 
-    def test_an_all_image_batch_carries_no_frame_mask(self):
+    def test_the_frame_mask_is_emitted_on_every_batch_when_text_only_rows_are_allowed(self):
+        """So the attention mask's shape, and the kernel it selects, never flip between batches."""
+        collator = VLMCollator(pad_id=0, max_text_len=20, allow_text_only=True)
+        batch = collator([self._sample(5), self._sample(6)])
+        assert batch["frame_mask"].tolist() == [[True], [True]]
+
+    def test_without_the_flag_there_is_no_frame_mask_and_a_text_only_sample_raises(self):
         collator = VLMCollator(pad_id=0, max_text_len=20)
         assert "frame_mask" not in collator([self._sample(5), self._sample(6)])
+        text_only = self._sample(3)
+        text_only["pixel_values"] = torch.zeros(0, 3, 32, 32)
+        with pytest.raises(ValueError, match="hf_allow_text_only"):
+            collator([text_only])
 
     def test_several_images_per_sample_are_rejected(self):
         collator = VLMCollator(pad_id=0, max_text_len=20)
@@ -656,23 +691,8 @@ class TestHuggingFaceVLMDataset:
     def test_getitem_shapes(self, tiny_hf_dataset):
         from datasets import load_from_disk
 
-        class _Wrapper(HuggingFaceVLMDataset):
-            def __init__(self, ds, tokenizer_path, max_text_len):
-                from transformers import AutoTokenizer
-
-                self._ds = ds
-                self._image_field = "image"
-                self._text_field = "caption"
-                self._prompt_field = None
-                self._image_size = 32
-                self._image_mean = DEFAULT_IMAGE_MEAN
-                self._image_std = DEFAULT_IMAGE_STD
-                self._max_text_len = max_text_len
-                self._allow_text_only = False
-                self._tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-
         ds = load_from_disk(tiny_hf_dataset)
-        wrapper = _Wrapper(ds, tokenizer_path="gpt2", max_text_len=16)
+        wrapper = _dataset_over(ds, image_size=32, max_text_len=16)
         item = wrapper[0]
         assert item["pixel_values"].shape == (3, 32, 32)
         assert item["input_ids"].shape == (16,)
@@ -783,28 +803,13 @@ class TestHuggingFaceVLMDataset:
         del tiny_hf_dataset
         from datasets import Dataset
 
-        class _Wrapper(HuggingFaceVLMDataset):
-            def __init__(self, ds, tokenizer_path, max_text_len):
-                from transformers import AutoTokenizer
-
-                self._ds = ds
-                self._image_field = "image"
-                self._text_field = "caption"
-                self._prompt_field = None
-                self._image_size = 32
-                self._image_mean = DEFAULT_IMAGE_MEAN
-                self._image_std = DEFAULT_IMAGE_STD
-                self._max_text_len = max_text_len
-                self._allow_text_only = False
-                self._tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-
         mixed = Dataset.from_dict(
             {
                 "image": [_make_image(32, 100)],
                 "caption": [{"not": "a string"}],  # type: ignore[list-item]
             }
         )
-        wrapper = _Wrapper(mixed, tokenizer_path="gpt2", max_text_len=4)
+        wrapper = _dataset_over(mixed, image_size=32, max_text_len=4)
         with pytest.raises(TypeError, match="must be str"):
             _ = wrapper[0]
 
@@ -836,23 +841,8 @@ class TestHuggingFaceVLMDataset:
         from kempnerforge.data.sampler import DistributedSampler
         from kempnerforge.data.vlm_dataset import VLMCollator
 
-        class _Wrapper(HuggingFaceVLMDataset):
-            def __init__(self, ds, tokenizer_path, max_text_len):
-                from transformers import AutoTokenizer
-
-                self._ds = ds
-                self._image_field = "image"
-                self._text_field = "caption"
-                self._prompt_field = None
-                self._image_size = 16
-                self._image_mean = DEFAULT_IMAGE_MEAN
-                self._image_std = DEFAULT_IMAGE_STD
-                self._max_text_len = max_text_len
-                self._allow_text_only = False
-                self._tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-
         ds = load_from_disk(tiny_hf_dataset)
-        wrapper = _Wrapper(ds, tokenizer_path="gpt2", max_text_len=12)
+        wrapper = _dataset_over(ds, image_size=16, max_text_len=12)
         collator = VLMCollator(pad_id=0, max_text_len=12)
         loader = StatefulDataLoader(
             wrapper,
@@ -869,38 +859,51 @@ class TestHuggingFaceVLMDataset:
         assert batch["pixel_values"].shape == (2, 3, 16, 16)
 
 
+def _mixed_image_dataset(tmp_path, images):
+    from datasets import Dataset
+
+    ds = Dataset.from_dict({"image": images, "caption": ["a b"] * len(images)})
+    out = tmp_path / "mixed_ds"
+    ds.save_to_disk(str(out))
+    return str(out)
+
+
 class TestTextOnlyRows:
-    class _Wrapper(HuggingFaceVLMDataset):
-        def __init__(self, rows, allow_text_only):
-            self._ds = rows
-            self._image_field = "image"
-            self._text_field = "caption"
-            self._prompt_field = None
-            self._image_size = 16
-            self._image_mean = DEFAULT_IMAGE_MEAN
-            self._image_std = DEFAULT_IMAGE_STD
-            self._max_text_len = 8
-            self._allow_text_only = allow_text_only
-            from transformers import AutoTokenizer
-
-            self._tokenizer = AutoTokenizer.from_pretrained("gpt2")
-
     @pytest.mark.parametrize("missing", [None, []])
     def test_a_row_without_an_image_is_text_only_when_allowed(self, missing):
-        ds = self._Wrapper([{"image": missing, "caption": "a b c"}], allow_text_only=True)
+        ds = _dataset_over([{"image": missing, "caption": "a b c"}], allow_text_only=True)
         item = ds[0]
         assert item["pixel_values"].shape == (0, 3, 16, 16)
         assert item["input_ids"].shape == (8,)
         assert 0 < int(item["text_len"]) <= 8
 
     def test_a_row_with_an_image_is_unchanged(self):
-        ds = self._Wrapper([{"image": _make_image(8), "caption": "a b"}], allow_text_only=True)
+        ds = _dataset_over([{"image": _make_image(8), "caption": "a b"}], allow_text_only=True)
         assert ds[0]["pixel_values"].shape == (3, 16, 16)
 
     def test_a_row_without_an_image_raises_by_default(self):
-        ds = self._Wrapper([{"image": None, "caption": "a b"}], allow_text_only=False)
+        ds = _dataset_over([{"image": None, "caption": "a b"}], allow_text_only=False)
         with pytest.raises(ValueError, match="hf_allow_text_only"):
             ds[0]
+
+    def test_a_dataset_with_an_imageless_row_is_rejected_when_loaded(self, tmp_path):
+        path = _mixed_image_dataset(tmp_path, [_make_image(8), None, _make_image(8), None])
+        kwargs = dict(
+            split="train", image_field="image", text_field="caption", tokenizer_path="gpt2"
+        )
+        with pytest.raises(ValueError, match="2 of 4 rows have no image.*hf_allow_text_only"):
+            HuggingFaceVLMDataset(path, max_text_len=8, **kwargs)
+        ds = HuggingFaceVLMDataset(path, max_text_len=8, allow_text_only=True, **kwargs)
+        assert ds[1]["pixel_values"].shape == (0, 3, 224, 224)
+        assert ds[0]["pixel_values"].shape == (3, 224, 224)
+
+    def test_images_per_row_counts_lists_and_single_images(self):
+        from datasets import Dataset
+
+        singles = Dataset.from_dict({"image": [_make_image(8), None, _make_image(8)]})
+        assert vlm_dataset._images_per_row(singles, "image").to_pylist() == [1, 0, 1]
+        lists = Dataset.from_dict({"image": [[_make_image(8)] * 2, [], None, [_make_image(8)]]})
+        assert vlm_dataset._images_per_row(lists, "image").to_pylist() == [2, 0, 0, 1]
 
 
 class TestFramesToClipTensor:

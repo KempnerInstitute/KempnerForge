@@ -82,11 +82,15 @@ Image-text mixes often carry documents without an image, such as FineVision's
 `text_*` subsets. With `data.hf_allow_text_only = true`, a row whose image
 column is `None` or an empty list is a text-only document. Without packing it
 takes a blank image and a `frame_mask` entry of `False`, so its image tokens
-are hidden from attention; with packing it is just its text, and a micro-batch
-of nothing but text carries no images. Either way the vision encoder and
-adapter run on every rank, on a blank image when there is nothing else, because
-their FSDP2 collectives need every rank to take part. Without the flag such a
-row raises.
+are hidden from attention; the document still occupies the image positions,
+so its text sits after them in the row and in the position encoding, as a
+masked image document rather than plain text. With packing it is just its
+text, and a micro-batch of nothing but text carries no images. On every rank
+a sharded vision encoder or adapter still runs, on a blank image when there is
+nothing else, because its FSDP2 collectives need every rank to take part; a
+frozen encoder is skipped. The flag needs an image-prefix arch or packing, not
+`cross_attention`, whose image K/V cannot hide a blank image. Without the flag
+a dataset with such a row is rejected when it is loaded.
 
 ## Start from the pretrained backbone
 

@@ -163,7 +163,11 @@ def _build_vlm_pipeline(config: JobConfig, dp_rank: int, dp_size: int) -> DataPi
                 f"{tc.seq_len}"
             )
         else:
-            collator = VLMCollator(pad_id=pad_id, max_text_len=vlm_cfg.max_text_len)
+            collator = VLMCollator(
+                pad_id=pad_id,
+                max_text_len=vlm_cfg.max_text_len,
+                allow_text_only=config.data.hf_allow_text_only,
+            )
             logger.info(f"VLM dataset: {len(dataset):,} samples from {config.data.hf_dataset_name}")
 
     sampler = DistributedSampler(

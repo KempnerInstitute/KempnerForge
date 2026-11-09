@@ -16,9 +16,10 @@ produces the ``VLMSample`` contract:
 ``VLMCollator`` stacks a list of samples into a batch. All batches are
 padded to the same fixed ``max_text_len`` regardless of batch content so
 different ranks see identical tensor shapes (no NCCL desync under
-FSDP2). A text-only sample gets a blank image and a ``frame_mask`` entry
-of ``False``, which hides its image tokens from attention while the
-vision encoder still runs on every rank. The collator also emits
+FSDP2). With ``allow_text_only`` every batch carries a ``frame_mask``; a
+text-only sample gets a blank image and a ``False`` entry, which hides its
+image tokens from attention while the vision encoder still runs on every
+rank. The collator also emits
 ``image_positions: (B,)`` zeros; this slot is reserved for a future
 multi-image extension and is unused by the Joint-Decoder wrapper today.
 
@@ -259,6 +260,39 @@ def _is_missing_image(value: Any) -> bool:
     return value is None or (isinstance(value, list | tuple) and len(value) == 0)
 
 
+def _images_per_row(rows: Any, image_field: str) -> Any:
+    """How many images each row's image field holds, read off the Arrow column without decoding.
+
+    Returns a ``pyarrow`` integer array over the dataset's rows: a list
+    column's lengths (``0`` for an empty or missing list), else ``1`` for a
+    present value and ``0`` for a missing one.
+    """
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    column = rows.select_columns([image_field]).with_format("arrow")[:].column(image_field)
+    if pa.types.is_list(column.type) or pa.types.is_large_list(column.type):
+        return pc.fill_null(pc.list_value_length(column), 0)
+    return pc.cast(pc.is_valid(column), pa.int32())
+
+
+def _check_every_row_has_an_image(rows: Any, image_field: str) -> None:
+    """Reject a dataset with rows whose image field is missing or an empty list.
+
+    Raises:
+        ValueError: Some rows hold no image; the message counts them and names
+            the setting that trains them as text-only documents.
+    """
+    import pyarrow.compute as pc
+
+    missing = pc.sum(pc.cast(pc.equal(_images_per_row(rows, image_field), 0), "int64")).as_py()
+    if missing:
+        raise ValueError(
+            f"{missing:,} of {len(rows):,} rows have no image in field {image_field!r}; set "
+            "data.hf_allow_text_only = true to train them as text-only documents"
+        )
+
+
 def _tokenize_and_mask(
     tokenizer: Any,
     text: str,
@@ -358,7 +392,8 @@ class HuggingFaceVLMDataset(Dataset):
         dataset_config: HF dataset config name, if required.
         allow_text_only: Accept rows whose image field is ``None`` or an
             empty list and return them with an empty ``(0, 3, H, W)``
-            ``pixel_values``. Off, such a row raises ``ValueError``.
+            ``pixel_values``. Off, a dataset with such a row is rejected
+            here, before training starts.
     """
 
     def __init__(
@@ -404,6 +439,8 @@ class HuggingFaceVLMDataset(Dataset):
         self._max_text_len = max_text_len
         self._allow_text_only = allow_text_only
         self._tokenizer = build_tokenizer(tokenizer_path)
+        if not allow_text_only:
+            _check_every_row_has_an_image(ds, image_field)
         if prompt_field is not None:
             _check_prompt_column_is_string(ds, prompt_field)
             _check_prompt_column_has_room(ds, prompt_field, self._tokenizer, max_text_len)
@@ -457,18 +494,21 @@ class VLMCollator:
       - ``image_positions``: ``(B,)`` long tensor. Reserved slot for
         multi-image extensions; currently all zeros (single image per
         example placed at sequence position 0).
-      - ``frame_mask``: ``(B, 1)`` bool, only when the batch holds a
-        text-only sample; ``False`` hides that sample's image tokens.
+      - ``frame_mask``: ``(B, 1)`` bool, with ``allow_text_only``; ``False``
+        hides a text-only sample's image tokens. Emitted on every batch, so
+        the attention mask's shape and kernel stay the same from batch to
+        batch.
 
     Padding is always to ``max_text_len``, never batch-max, so ranks
     always see identical tensor shapes under FSDP2.
     """
 
-    def __init__(self, pad_id: int, max_text_len: int) -> None:
+    def __init__(self, pad_id: int, max_text_len: int, allow_text_only: bool = False) -> None:
         if max_text_len <= 0:
             raise ValueError("max_text_len must be positive")
         self.pad_id = pad_id
         self.max_text_len = max_text_len
+        self.allow_text_only = allow_text_only
 
     def __call__(self, samples: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
         if not samples:
@@ -479,6 +519,11 @@ class VLMCollator:
         for s in samples:
             p = s["pixel_values"]
             if p.dim() == 4 and p.shape[0] == 0:
+                if not self.allow_text_only:
+                    raise ValueError(
+                        "VLMCollator got a text-only sample; set data.hf_allow_text_only = true "
+                        "to train on text-only rows"
+                    )
                 images.append(torch.zeros(p.shape[1:], dtype=p.dtype))
                 has_image.append(False)
             elif p.dim() == 3:
@@ -505,7 +550,7 @@ class VLMCollator:
             "labels": labels,
             "image_positions": image_positions,
         }
-        if not all(has_image):
+        if self.allow_text_only:
             batch["frame_mask"] = torch.tensor(has_image, dtype=torch.bool).unsqueeze(1)
         return batch
 

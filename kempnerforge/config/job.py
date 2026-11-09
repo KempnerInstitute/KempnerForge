@@ -121,6 +121,12 @@ class JobConfig:
                 )
             if self.video is not None:
                 raise ValueError("data.hf_allow_text_only applies to image datasets, not [video]")
+            if self.vlm.arch == "cross_attention":
+                raise ValueError(
+                    "data.hf_allow_text_only is not supported with vlm.arch='cross_attention': "
+                    "its image K/V has no way to hide a document's blank image, so the text "
+                    "would attend to it; use an image-prefix arch or packing"
+                )
         if self.data.pack_sequences and self.vlm is not None:
             if self.video is not None:
                 raise ValueError("data.pack_sequences is not supported with [video]")

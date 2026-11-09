@@ -786,6 +786,17 @@ class TestJobConfig:
                 video=VideoConfig(data_root="/x"),
                 **kwargs,
             )
+        with pytest.raises(ValueError, match="not supported with vlm.arch='cross_attention'"):
+            JobConfig(
+                vlm=VLMConfig.for_arch("cross_attention", max_text_len=64),
+                data=DataConfig(hf_allow_text_only=True),
+                **kwargs,
+            )
+        JobConfig(
+            vlm=VLMConfig.for_arch("mot", max_text_len=64),
+            data=DataConfig(hf_allow_text_only=True),
+            **kwargs,
+        )
 
     def test_vlm_packing_requires_joint_decoder_and_no_video(self):
         kwargs = dict(
