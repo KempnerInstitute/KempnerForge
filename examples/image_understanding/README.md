@@ -68,9 +68,10 @@ points before the count, so a row with many points outruns `max_text_len` and
 trains only the leading points; `max_points` bounds the answer so the count
 fits. `FineVisionArrow` keeps only the rows with one image (`max_images`, which
 `None` lifts), using the per-row image counts `index.npz` stores; an index
-written without them takes the counts from `num_images`. Turns missing their
-user message or reply are dropped, and a row left without a turn is passed over
-like one whose image does not decode.
+written without them takes the counts from `num_images`, and `text_only` keeps
+the rows without images. A conversation keeps its turns up to the first one
+missing its user message or reply, so a row whose first turn is incomplete is
+not kept.
 
 Convert FineVision once; any number of `convert` processes can share the work,
 a file that fails to convert is listed at the end without stopping the others,

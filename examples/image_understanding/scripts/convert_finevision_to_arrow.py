@@ -65,18 +65,25 @@ def meta_path(arrow_file: Path) -> Path:
 
 
 def keep_flags(texts: pa.Array) -> np.ndarray:
-    """Which conversations hold a turn with both a user message and a reply."""
+    """Which conversations open with a turn holding both a user message and a reply.
+
+    The reader keeps a conversation up to its first incomplete turn, so a row
+    without a complete first turn has nothing to train.
+    """
     offsets = texts.offsets.to_numpy()
-    offsets = offsets - offsets[0]
-    turns = texts.flatten()
+    turns = texts.values
 
     def present(name: str) -> np.ndarray:
         text = pc.fill_null(turns.field(name).cast(pa.string()), "")
         length = pc.utf8_length(pc.utf8_trim_whitespace(text))
         return pc.greater(length, 0).to_numpy(zero_copy_only=False)
 
-    complete = np.concatenate([[0], np.cumsum(present("user") & present("assistant"))])
-    return complete[offsets[1:]] > complete[offsets[:-1]]
+    complete = np.concatenate([present("user") & present("assistant"), [False]])
+    starts, ends = offsets[:-1], offsets[1:]
+    flags = (ends > starts) & complete[np.minimum(starts, len(complete) - 1)]
+    if texts.null_count:
+        flags &= ~texts.is_null().to_numpy(zero_copy_only=False)
+    return flags
 
 
 def image_counts(batch: pa.RecordBatch) -> np.ndarray:
@@ -155,20 +162,39 @@ def _convert_file(
     return dst_file.stat().st_size
 
 
-def _release_claim(claim: Path, tag: str) -> None:
-    """Remove ``claim`` when the line it holds is still this process's."""
+class ClaimLostError(Exception):
+    """Another process took this file over."""
+
+
+def _touch_claim(claim: Path, tag: str) -> None:
+    """Refresh ``claim``, or raise ``ClaimLostError`` when it is gone or another's."""
     try:
-        mine = claim.read_text().startswith(f"{tag} ")
+        if not claim.read_text().startswith(f"{tag} "):
+            raise ClaimLostError(f"{claim} is held by another process")
+        os.utime(claim)
+    except FileNotFoundError:
+        raise ClaimLostError(f"{claim} was taken over") from None
+
+
+def _release_claim(claim: Path, tag: str) -> None:
+    """Remove ``claim`` when it is still this process's, by renaming it aside first."""
+    held = claim.with_name(f"{claim.name}.releasing-{tag}")
+    try:
+        os.rename(claim, held)
     except FileNotFoundError:
         return
-    if mine:
-        claim.unlink(missing_ok=True)
+    if held.read_text().startswith(f"{tag} "):
+        held.unlink()
+    else:
+        os.rename(held, claim)
 
 
 def _convert_job(job: tuple[Path, Path, float]) -> int | str:
     """The bytes written for one file, 0 when it is done or claimed, or the failure.
 
-    A stale claim is taken over by renaming it, which only one process can do.
+    A stale claim is taken over by renaming it, which only one process can do; a
+    process whose claim was taken over stops at its next row group and leaves the
+    file to the taker.
     """
     src_file, dst_file, stale_seconds = job
     claim = dst_file.with_name(dst_file.name + ".claim")
@@ -189,7 +215,9 @@ def _convert_job(job: tuple[Path, Path, float]) -> int | str:
     os.write(fd, f"{tag} {time.time():.0f}\n".encode())
     os.close(fd)
     try:
-        return convert_file(src_file, dst_file, tag, heartbeat=lambda: os.utime(claim))
+        return convert_file(src_file, dst_file, tag, heartbeat=lambda: _touch_claim(claim, tag))
+    except ClaimLostError:
+        return 0
     except Exception as exc:
         return f"{src_file}: {type(exc).__name__}: {exc}"
     finally:

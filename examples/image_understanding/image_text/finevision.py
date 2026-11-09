@@ -10,6 +10,7 @@ file and batch order.
 from __future__ import annotations
 
 import bisect
+import itertools
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any
@@ -20,7 +21,7 @@ from PIL import Image
 from torch.utils.data import Dataset
 
 from .decode import decode_rgb
-from .document import Document, Turn
+from .document import Document, Turn, is_text
 from .skip import MAX_ATTEMPTS, SkipLog, UnusableRowError, check_max_attempts, first_usable
 
 RATING_COLUMNS = (
@@ -31,8 +32,8 @@ RATING_COLUMNS = (
 )
 
 
-def _is_text(value: Any) -> bool:
-    return isinstance(value, str) and bool(value.strip())
+def _complete(turn: dict[str, Any] | None) -> bool:
+    return turn is not None and is_text(turn.get("user")) and is_text(turn.get("assistant"))
 
 
 def _decode(item: dict[str, Any] | None) -> Image.Image:
@@ -46,12 +47,13 @@ class FineVisionArrow(Dataset):
 
     Rows pass when their keep flag is set, every ``min_ratings`` column meets its
     threshold (a missing rating, stored as ``-1``, fails), and the row has between
-    1 and ``max_images`` images; ``None`` lifts the limit, for a renderer that
-    accepts documents with several images, and a ``text_only`` reader takes no
-    image filter and its documents carry no image, for a renderer that accepts
-    those. ``num_images`` overrides the per-row image counts stored in
-    ``index.npz``. Turns missing their user message or their reply are dropped; a
-    row left without a turn, or whose image does not decode or holds no bytes, is
+    1 and ``max_images`` images; ``None`` lifts the upper limit, for a renderer that
+    accepts documents with several images. A ``text_only`` reader keeps the rows
+    without images instead, and its documents carry none, for a renderer that
+    accepts those. ``num_images`` overrides the per-row image counts stored in
+    ``index.npz``. A conversation keeps its turns up to the first one missing its
+    user message or its reply, since later turns may refer to it; a row whose
+    first turn is incomplete, or whose image does not decode or holds no bytes, is
     passed over for the next row, up to ``max_attempts`` in a row, and ``skipped``
     counts them. At most ``max_open_files`` Arrow files stay mapped per process.
     """
@@ -69,6 +71,8 @@ class FineVisionArrow(Dataset):
     ) -> None:
         if max_open_files < 1:
             raise ValueError(f"max_open_files must be positive, got {max_open_files}")
+        if max_images is not None and max_images < 1:
+            raise ValueError(f"max_images must be positive or None, got {max_images}")
         self.subset_dir = Path(subset_dir)
         self.text_only = text_only
         self.max_attempts = check_max_attempts(max_attempts)
@@ -88,18 +92,29 @@ class FineVisionArrow(Dataset):
         for name, threshold in (min_ratings or {}).items():
             if name not in RATING_COLUMNS:
                 raise ValueError(f"unknown rating {name!r}; expected one of {RATING_COLUMNS}")
+            if name not in index:
+                raise ValueError(f"{self.subset_dir / 'index.npz'} has no {name}; rebuild it")
             keep &= index[name] >= threshold
-        if max_images is not None and not text_only:
-            counts = num_images if num_images is not None else index.get("num_images")
-            if counts is None:
-                raise ValueError(
-                    f"{self.subset_dir / 'index.npz'} has no num_images; pass num_images "
-                    "or rebuild the index with scripts/convert_finevision_to_arrow.py"
-                )
-            if len(counts) != len(keep):
-                raise ValueError(f"num_images has {len(counts)} rows, the index {len(keep)}")
-            keep &= (counts >= 1) & (counts <= max_images)
+        counts = num_images if num_images is not None else index.get("num_images")
+        if counts is None:
+            raise ValueError(
+                f"{self.subset_dir / 'index.npz'} has no num_images; pass num_images "
+                "or rebuild the index with scripts/convert_finevision_to_arrow.py"
+            )
+        if len(counts) != len(keep):
+            raise ValueError(f"num_images has {len(counts)} rows, the index {len(keep)}")
+        if text_only:
+            keep &= counts == 0
+        else:
+            keep &= counts >= 1
+            if max_images is not None:
+                keep &= counts <= max_images
         self.rows = np.flatnonzero(keep).astype(np.int64)
+        if not len(self.rows):
+            raise ValueError(
+                f"no row of {self.subset_dir} passes the filters"
+                + ("" if text_only else "; a subset without images needs text_only")
+            )
         self._readers: OrderedDict[int, Any] = OrderedDict()
 
     @property
@@ -132,18 +147,18 @@ class FineVisionArrow(Dataset):
         offset = global_row - self._batch_starts[position]
         record = self._reader(file).get_batch(batch).slice(offset, 1)
         columns = ["texts", "source"] if self.text_only else ["images", "texts", "source"]
-        return {name: record.column(name)[0].as_py() for name in columns}
+        present = [name for name in columns if name in record.schema.names]
+        return {name: record.column(name)[0].as_py() for name in present}
 
     def _read(self, index: int) -> Document:
         row = self.row(index)
-        images = () if self.text_only else tuple(map(_decode, row["images"] or []))
         turns = tuple(
             Turn(t["user"], (t["assistant"],))
-            for t in row["texts"] or []
-            if t is not None and _is_text(t.get("user")) and _is_text(t.get("assistant"))
+            for t in itertools.takewhile(_complete, row["texts"] or [])
         )
         if not turns:
-            raise UnusableRowError("no turn has both a user message and a reply")
+            raise UnusableRowError("the first turn lacks its user message or its reply")
+        images = () if self.text_only else tuple(map(_decode, row.get("images") or []))
         return Document(images=images, turns=turns, kind="conversation")
 
     def __getitem__(self, index: int) -> Document:

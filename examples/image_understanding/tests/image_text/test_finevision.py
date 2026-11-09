@@ -45,15 +45,16 @@ def _row(n_images: int, turns: list[tuple[str, str]], rating: int | None, width:
     }
 
 
-def _write_parquet(path: Path, groups: list[list[dict]]) -> None:
+def _write_parquet(path: Path, groups: list[list[dict]], schema: pa.Schema = SCHEMA) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with pq.ParquetWriter(path, SCHEMA) as writer:
+    with pq.ParquetWriter(path, schema) as writer:
         for rows in groups:
-            writer.write_table(pa.Table.from_pylist(rows, schema=SCHEMA))
+            writer.write_table(pa.Table.from_pylist(rows, schema=schema))
 
 
 def _run(*args: str) -> None:
-    subprocess.run([sys.executable, str(SCRIPT), *args], check=True, capture_output=True)
+    done = subprocess.run([sys.executable, str(SCRIPT), *args], capture_output=True, text=True)
+    assert done.returncode == 0, done.stderr
 
 
 def _run_failing(*args: str) -> str:
@@ -157,8 +158,18 @@ class TestConversion:
             ],
             type=SCHEMA.field("texts").type,
         )
-        assert _converter().keep_flags(texts).tolist() == [True, False, True, False, False]
-        assert _converter().keep_flags(texts.slice(2, 2)).tolist() == [True, False]
+        assert _converter().keep_flags(texts).tolist() == [True, False, False, False, False]
+        assert _converter().keep_flags(texts.slice(0, 2)).tolist() == [True, False]
+        assert _converter().keep_flags(texts.slice(3, 2)).tolist() == [False, False]
+
+    def test_keep_flags_skip_the_values_under_a_null_slot(self) -> None:
+        values = pa.array(
+            [{"user": "Q", "assistant": "A"}] * 3, type=SCHEMA.field("texts").type.value_type
+        )
+        texts = pa.ListArray.from_arrays(
+            pa.array([0, 1, 3, 3], type=pa.int32()), values, mask=pa.array([False, True, False])
+        )
+        assert _converter().keep_flags(texts).tolist() == [True, False, False]
 
     def test_image_counts_without_an_images_column(self) -> None:
         converter = _converter()
@@ -214,6 +225,17 @@ class TestConversion:
         stderr = _run_failing(command, "--src", src, "--dst", dst, "--subsets", "typo")
         assert "typo: no train-*.parquet files" in stderr
 
+    def test_a_claim_taken_over_stops_its_holder(self, tmp_path: Path) -> None:
+        converter = _converter()
+        claim = tmp_path / "x.arrow.claim"
+        with pytest.raises(converter.ClaimLostError, match="taken over"):
+            converter._touch_claim(claim, "host-1")
+        claim.write_text("host-2 0\n")
+        with pytest.raises(converter.ClaimLostError, match="another"):
+            converter._touch_claim(claim, "host-1")
+        converter._touch_claim(claim, "host-2")
+        assert claim.stat().st_mtime > 0
+
     def test_only_the_holder_releases_a_claim(self, tmp_path: Path) -> None:
         converter = _converter()
         claim = tmp_path / "x.arrow.claim"
@@ -266,9 +288,30 @@ class TestFineVisionArrow:
         with pytest.raises(ValueError, match="unknown rating"):
             FineVisionArrow(subset, min_ratings={"beauty_min": 3})
 
-    def test_text_only_reads_no_images_and_takes_every_row(self, subset: Path) -> None:
-        reader = FineVisionArrow(subset, text_only=True)
-        assert len(reader) == 4 and reader[1].images == ()
+    def test_text_only_reads_a_subset_without_an_images_column(self, tmp_path: Path) -> None:
+        src, dst = tmp_path / "parquet", tmp_path / "arrow"
+        schema = pa.schema([f for f in SCHEMA if f.name != "images"])
+        rows = [_row(0, [("Q0", "A0")], 5), _row(0, [("Q1", "A1")], 5)]
+        for row in rows:
+            del row["images"]
+        _write_parquet(src / "text_demo" / "train-00000-of-00001.parquet", [rows], schema)
+        _run("convert", "--src", str(src), "--dst", str(dst))
+        _run("index", "--src", str(src), "--dst", str(dst))
+        reader = FineVisionArrow(dst / "text_demo", text_only=True)
+        assert len(reader) == 2 and reader[1].images == () and reader[1].turns[0].user == "Q1"
+        with pytest.raises(ValueError, match="needs text_only"):
+            FineVisionArrow(dst / "text_demo")
+
+    def test_text_only_keeps_only_the_rows_without_images(self, subset: Path) -> None:
+        with pytest.raises(ValueError, match="no row"):
+            FineVisionArrow(subset, text_only=True)
+
+    def test_a_rating_missing_from_the_index_is_refused(self, subset: Path) -> None:
+        arrays = dict(np.load(subset / "index.npz"))
+        del arrays["formatting_min"]
+        np.savez(subset / "index.npz", **arrays)
+        with pytest.raises(ValueError, match="has no formatting_min"):
+            FineVisionArrow(subset, min_ratings={"formatting_min": 1})
 
     def test_survives_pickling(self, subset: Path) -> None:
         reader = FineVisionArrow(subset, max_images=None)
@@ -283,7 +326,7 @@ class TestFineVisionArrow:
         reader[3]
         assert list(reader._readers) == [1]
 
-    @pytest.mark.parametrize("option", ["max_attempts", "max_open_files"])
+    @pytest.mark.parametrize("option", ["max_attempts", "max_open_files", "max_images"])
     def test_limits_must_be_positive(self, subset: Path, option: str) -> None:
         with pytest.raises(ValueError, match="positive"):
             FineVisionArrow(subset, **{option: 0})
@@ -305,17 +348,17 @@ class TestFineVisionArrow:
         no_bytes = _row(1, [("Q1", "A1")], 5)
         no_bytes["images"][0]["bytes"] = None
         null_turn = _row(1, [("Q2", "A2")], 5)
-        null_turn["texts"] = [None, *null_turn["texts"]]
+        null_turn["texts"] = [*null_turn["texts"], None]
         _write_parquet(
             src / "demo" / "train-00000-of-00001.parquet", [[no_images, no_bytes, null_turn]]
         )
         _run("convert", "--src", str(src), "--dst", str(dst))
         _run("index", "--src", str(src), "--dst", str(dst))
         reader = FineVisionArrow(dst / "demo", max_images=None)
-        assert len(reader) == 3
-        assert reader[0].images == () and reader[0].turns[0].user == "Q0"
-        assert reader[1].turns[0].user == "Q2" and reader.skipped == 1
-        assert FineVisionArrow(dst / "demo").rows.tolist() == [1, 2]
+        assert reader.rows.tolist() == [1, 2]
+        assert reader[0].turns[0].user == "Q2" and reader.skipped == 1
+        text = FineVisionArrow(dst / "demo", text_only=True)
+        assert text.rows.tolist() == [0] and text[0].images == ()
 
     def test_an_undecodable_image_steps_to_the_next_row(self, tmp_path: Path) -> None:
         src, dst = tmp_path / "parquet", tmp_path / "arrow"
