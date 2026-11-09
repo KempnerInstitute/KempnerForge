@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sized
 from typing import Any
 
 import torch
@@ -155,16 +155,21 @@ class StatefulDataLoader:
     def state_dict(self) -> dict:
         """Return checkpoint state.
 
-        Keys: ``epoch``, ``batch_size``, ``sampler``, the position, and
-        ``batches_yielded`` (this rank's batches this epoch, read by older
-        versions). The position is ``global_position``, the samples all ranks
-        consumed this epoch, for a ``DistributedSampler``, and
-        ``samples_consumed``, this rank's samples, for any other sampler.
+        Keys: ``epoch``, ``batch_size``, ``dataset_length``, ``sampler`` (which
+        holds the shuffle seed), the position, and ``batches_yielded``. The
+        position is ``global_position``, the samples all ranks consumed this
+        epoch, for a ``DistributedSampler``, and ``samples_consumed``, this rank's
+        samples, for any other sampler. ``batches_yielded`` is the position in
+        whole batches of this loader's size, for versions that predate the
+        position: the batches this rank took this epoch in a run that never
+        changed size, and the position divided by the global batch, rounded down,
+        after a resize.
         """
         consumed = self._consumed()
         state: dict = {
             "epoch": self._epoch,
             "batch_size": self.batch_size,
+            "dataset_length": len(self.dataset) if isinstance(self.dataset, Sized) else None,
             "sampler": self.sampler.state_dict(),
         }
         if isinstance(self.sampler, DistributedSampler):
@@ -181,15 +186,17 @@ class StatefulDataLoader:
         A ``global_position`` resumes exactly on any data-parallel size and batch
         size. A per-rank position resumes exactly on the data-parallel size that
         saved it, at any batch size. A checkpoint that predates the saved batch
-        size counts batches, so it resumes as before, on the saved data-parallel
-        size only. A position with no full batch left in its epoch starts the
-        next epoch. ``__iter__`` applies the position, so a later ``iter()`` in
-        the same epoch stays aligned.
+        size counts batches, so it resumes as before, only on the saved
+        data-parallel size and exact only at the saved batch size, which it does
+        not record. A position with no full batch left in its epoch starts the
+        next epoch. A changed shuffle seed or dataset length is logged, since the
+        position counts samples of the saved order. ``__iter__`` applies the
+        position, so a later ``iter()`` in the same epoch stays aligned.
 
         Raises:
             DataPositionError: The data-parallel size changed and the saved
-                position is per rank (a mixture, or a checkpoint that predates
-                the saved batch size), or the state is a streaming position.
+                position is per rank (a mixture's, or one that predates the saved
+                batch size), or the state is a streaming position.
         """
         if "stream" in state:
             raise DataPositionError(
@@ -209,23 +216,15 @@ class StatefulDataLoader:
             per_rank = state.get("samples_consumed")
             if per_rank is None:
                 per_rank = state.get("batches_yielded", 0) * self.batch_size
+                if per_rank and saved_batch is None:
+                    logger.warning(
+                        f"This checkpoint predates the saved batch size, so its data position "
+                        f"assumes the batch size is unchanged ({self.batch_size}); with "
+                        f"another batch size at the save, samples are skipped or repeated"
+                    )
             start = per_rank * replicas if global_order else per_rank
         else:
-            if global_order:
-                why = (
-                    "the checkpoint predates the saved batch size, so the global position it "
-                    "reached is unknown; a checkpoint saved after resuming there records it"
-                )
-            else:
-                why = (
-                    "a mixture draws each rank's samples separately, so a position on one "
-                    "data-parallel size has no counterpart on another"
-                )
-            raise DataPositionError(
-                f"Cannot resume the data position saved on data-parallel size "
-                f"{saved_replicas} on data-parallel size {replicas}: {why}. Resume on "
-                f"{saved_replicas} data-parallel ranks."
-            )
+            raise DataPositionError(self._refusal(state, saved_replicas, global_order))
 
         self._epoch = epoch
         self.sampler.load_state_dict(sampler_state)
@@ -251,8 +250,58 @@ class StatefulDataLoader:
                 f"{self._start} on data-parallel size {replicas} with batch size "
                 f"{self.batch_size}"
             )
+        self._warn_if_reordered(state, sampler_state)
 
         logger.info(f"Resumed DataLoader: epoch={self._epoch}, position={self._start}")
+
+    def _refusal(self, state: dict, saved_replicas: int, global_order: bool) -> str:
+        """Why a position saved on ``saved_replicas`` ranks cannot resume here, and the way out."""
+        replicas = self.sampler.num_replicas
+        ranks = "rank" if saved_replicas == 1 else "ranks"
+        if not global_order:
+            why = (
+                "a mixture draws each rank's samples separately, so a position on one "
+                "data-parallel size has no counterpart on another"
+            )
+            remedy = f"Resume on {saved_replicas} data-parallel {ranks}."
+        elif "samples_consumed" in state:
+            why = (
+                "it counts one rank's samples of a mixture, which have no counterpart on "
+                "another data-parallel size"
+            )
+            remedy = f"Resume on {saved_replicas} data-parallel {ranks}."
+        else:
+            why = (
+                "the checkpoint predates the saved batch size, so the global position it "
+                "reached is unknown"
+            )
+            remedy = (
+                f"Resume on {saved_replicas} data-parallel {ranks} with the batch size it was "
+                f"saved with; a checkpoint saved from there records the position and resumes "
+                f"on any size."
+            )
+        return (
+            f"Cannot resume the data position saved on data-parallel size {saved_replicas} "
+            f"on data-parallel size {replicas}: {why}. {remedy}"
+        )
+
+    def _warn_if_reordered(self, state: dict, sampler_state: dict) -> None:
+        """Log a shuffle seed or dataset length that differs from the checkpoint's."""
+        saved_seed = sampler_state.get("seed")
+        if saved_seed is not None and saved_seed != self.sampler.seed:
+            logger.warning(
+                f"The data seed is {self.sampler.seed} but the checkpoint was saved with "
+                f"{saved_seed}: the position counts samples of the saved order, so samples "
+                f"are skipped or repeated"
+            )
+        saved_length = state.get("dataset_length")
+        length = len(self.dataset) if isinstance(self.dataset, Sized) else None
+        if saved_length is not None and length is not None and saved_length != length:
+            logger.warning(
+                f"The dataset holds {length} samples but the checkpoint was saved with "
+                f"{saved_length}: the position counts samples of the saved order, so samples "
+                f"are skipped or repeated"
+            )
 
 
 class StreamingDataLoader:

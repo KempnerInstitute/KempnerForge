@@ -155,6 +155,7 @@ def test_state_records_the_batch_size_and_the_global_position():
     dataset = _Indices(4_096)
     _, state = _run(dataset, 2, 4, steps=10)
     assert state["batch_size"] == 4
+    assert state["dataset_length"] == 4_096
     assert state["global_position"] == 2 * 4 * 10
     assert state["batches_yielded"] == 10
     assert state["sampler"]["num_replicas"] == 2
@@ -198,10 +199,62 @@ def _legacy_state(replicas: int, batches: int) -> dict:
     }
 
 
-def test_legacy_state_on_another_data_parallel_size_is_refused():
+@pytest.mark.parametrize(
+    ("saved", "remedy"),
+    [(16, "Resume on 16 data-parallel ranks with"), (1, "Resume on 1 data-parallel rank with")],
+)
+def test_legacy_state_on_another_data_parallel_size_is_refused(saved, remedy):
     loader = _loader(_Indices(65_536), 64, 0, 4)
-    with pytest.raises(DataPositionError, match="predates the saved batch size"):
-        loader.load_state_dict(_legacy_state(16, 100))
+    with pytest.raises(DataPositionError, match="predates the saved batch size") as refused:
+        loader.load_state_dict(_legacy_state(saved, 100))
+    assert remedy in str(refused.value)
+
+
+def test_a_mixture_position_in_a_single_dataset_run_names_the_mixture():
+    """A mixture's per-rank count, loaded into a run without a mixture, says what it is."""
+    with pytest.raises(DataPositionError, match="one rank's samples of a mixture"):
+        _loader(_Indices(1_000), 2, 0, 4).load_state_dict(_mixture_state(4))
+
+
+def _warnings(caplog, monkeypatch, action) -> str:
+    """Run ``action`` and return the warnings it logged.
+
+    The ``kempnerforge`` logger stops propagation once configured, so this lets
+    records reach ``caplog``.
+    """
+    monkeypatch.setattr(logging.getLogger("kempnerforge"), "propagate", True)
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="kempnerforge.data.dataloader"):
+        action()
+    return caplog.text
+
+
+def test_a_changed_seed_or_dataset_length_warns(caplog, monkeypatch):
+    """The position counts samples of the saved order; another seed or dataset reorders it."""
+    _, state = _run(_Indices(4_096), 2, 4, steps=10)
+    same = _warnings(
+        caplog, monkeypatch, lambda: _loader(_Indices(4_096), 2, 0, 4).load_state_dict(state)
+    )
+    assert "data seed" not in same and "samples but the checkpoint" not in same
+
+    other_seed = DistributedSampler(_Indices(4_096), num_replicas=2, rank=0, seed=SEED + 1)
+    loader = StatefulDataLoader(_Indices(4_096), batch_size=4, sampler=other_seed, config=_CONFIG)
+    assert "The data seed is 43 but the checkpoint was saved with 42" in _warnings(
+        caplog, monkeypatch, lambda: loader.load_state_dict(state)
+    )
+    assert "holds 5000 samples but the checkpoint was saved with 4096" in _warnings(
+        caplog, monkeypatch, lambda: _loader(_Indices(5_000), 2, 0, 4).load_state_dict(state)
+    )
+
+
+def test_a_pre_change_position_assumes_the_batch_size_is_unchanged(caplog, monkeypatch):
+    """An old checkpoint records no batch size, so its count is read at this run's size."""
+    logged = _warnings(
+        caplog,
+        monkeypatch,
+        lambda: _loader(_Indices(4_096), 2, 1, 8).load_state_dict(_legacy_state(2, 10)),
+    )
+    assert "assumes the batch size is unchanged (8)" in logged
 
 
 def test_legacy_state_on_the_same_data_parallel_size_resumes_as_before():
