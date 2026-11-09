@@ -67,11 +67,17 @@ max_text_len = 256         # per-document text cap
 [data]
 pack_sequences = true
 
+[model]
+max_seq_len = 2048         # the RoPE table must cover a full row
+
 [train]
 seq_len = 2048             # row length; batch_size documents per micro-batch
 ```
 
-`attention_backend = "flex"` makes the packed mask block-sparse. The views of
+`attention_backend = "flex"` makes the packed mask block-sparse. Under
+`compile_model`, a micro-batch that packs into a single row compiles its own
+graph (a size of 1 cannot be made dynamic), so size `train.batch_size` for at
+least two rows. The views of
 an image attend causally; bidirectional image attention is a follow-up on the
 core's attention groups. A `[video]` run and the other arches do not pack.
 

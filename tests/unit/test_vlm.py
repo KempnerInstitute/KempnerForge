@@ -433,6 +433,15 @@ class TestPackedForward:
                 image_starts=batch["image_starts"],
                 image_tokens=8,
             )
+        with pytest.raises(ValueError, match="needs doc_ids and position_ids"):
+            wrapper(
+                batch["pixel_values"],
+                batch["input_ids"],
+                doc_ids=batch["doc_ids"],
+                image_rows=batch["image_rows"],
+                image_starts=batch["image_starts"],
+                image_tokens=8,
+            )
 
     def test_packed_pixels_require_a_flat_image_batch(self) -> None:
         wrapper = _build_tiny_wrapper(num_image_tokens=8)
