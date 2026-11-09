@@ -6,7 +6,8 @@ A rank leaves the group only once every rank has finished its part: gloo's conne
 asymmetric, so a rank that left early could close a connection another rank has not yet picked
 up (pytorch/pytorch#199026). The ranks wait for each other on the store, not with a collective,
 so the wait cannot interleave with collectives a rank's own threads still run on the group, such
-as an async checkpoint save's.
+as an async checkpoint save's. ``run_to_outcomes`` times one part of the ranks' work from the
+moment every rank has entered it, so start-up and exit never count against that part.
 """
 
 from __future__ import annotations
@@ -17,8 +18,10 @@ import time
 from collections.abc import Callable, Iterator, Sequence
 from datetime import timedelta
 from multiprocessing.process import BaseProcess
+from pathlib import Path
 from typing import Any
 
+import pytest
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
@@ -86,3 +89,75 @@ def gloo_group(
         store.wait([f"finished/{r}" for r in range(world)])
     finally:
         dist.destroy_process_group()
+
+
+def mark(out_dir: str | Path, rank: int) -> None:
+    """Record that ``rank`` has entered the part of its work that ``run_to_outcomes`` times."""
+    Path(out_dir, "reached", f"rank{rank}").touch()
+
+
+def write_outcome(out_dir: str | Path, rank: int, outcome: str) -> None:
+    """Record how the timed part ended on ``rank``."""
+    Path(out_dir, "outcome", f"rank{rank}").write_text(outcome)
+
+
+def _ranks(directory: Path) -> set[int]:
+    """The ranks that left a ``rank{N}`` file in ``directory``."""
+    return {int(p.name[4:]) for p in directory.iterdir() if p.name.startswith("rank")}
+
+
+def run_to_outcomes(
+    fn: Callable[..., Any],
+    world: int,
+    args: tuple,
+    out_dir: Path,
+    *,
+    part: str,
+    part_s: float,
+    start_s: float = 240.0,
+    exit_s: float = 60.0,
+) -> dict[int, str]:
+    """Run ``fn(rank, world, port, *args, out_dir)`` on ``world`` ranks; return each outcome.
+
+    Each rank calls ``mark`` when it enters the timed part and ``write_outcome`` when it leaves
+    it. ``part_s`` starts once every rank has entered, so start-up never counts against it, and
+    a rank still inside then fails the test as still in ``part``. The ranks get ``start_s`` from
+    the spawn to enter, and ``exit_s`` to exit once every outcome is written, each failing with
+    its own message. The ranks are stopped before the test fails, and when the wait is
+    interrupted.
+    """
+    for sub in ("reached", "outcome"):
+        (out_dir / sub).mkdir(parents=True)
+    everyone = set(range(world))
+    with held_store() as port:
+        context = mp.spawn(fn, args=(world, port, *args, str(out_dir)), nprocs=world, join=False)
+        try:
+            phase, deadline = "start", time.monotonic() + start_s
+            while not context.join(timeout=0.5):
+                reached, done = _ranks(out_dir / "reached"), _ranks(out_dir / "outcome")
+                if phase == "start" and reached == everyone:
+                    phase, deadline = "part", time.monotonic() + part_s
+                if phase == "part" and done == everyone:
+                    phase, deadline = "exit", time.monotonic() + exit_s
+                if time.monotonic() < deadline:
+                    continue
+                if phase == "start":
+                    late = sorted(everyone - reached)
+                    pytest.fail(
+                        f"ranks {late} did not reach {part} within {start_s:.0f}s of the spawn"
+                    )
+                if phase == "part":
+                    inside = sorted(everyone - done)
+                    pytest.fail(
+                        f"ranks {inside} still in {part} {part_s:.0f}s after every rank entered it"
+                    )
+                alive = [rank for rank, p in enumerate(context.processes) if p.is_alive()]
+                pytest.fail(
+                    f"ranks {alive} wrote their outcome but did not exit within {exit_s:.0f}s"
+                )
+        except BaseException:
+            _stop(context.processes)
+            raise
+    done = _ranks(out_dir / "outcome")
+    assert done == everyone, f"ranks {sorted(everyone - done)} exited without an outcome"
+    return {rank: Path(out_dir, "outcome", f"rank{rank}").read_text() for rank in range(world)}

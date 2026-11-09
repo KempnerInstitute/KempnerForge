@@ -12,7 +12,6 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
-import torch.multiprocessing as mp
 from torch.distributed.checkpoint.filesystem import FileSystemWriter
 from torch.distributed.checkpoint.staging import DefaultStager
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
@@ -30,7 +29,7 @@ from kempnerforge.distributed.tensor_parallel import apply_tensor_parallel
 from kempnerforge.model.transformer import Transformer
 from kempnerforge.training.entry import build_checkpoint_manager, restore_checkpoint
 from kempnerforge.training.runtime import PipelineBundle, RuntimeContext
-from tests.gloo_ranks import gloo_group, held_store, spawn
+from tests.gloo_ranks import gloo_group, mark, run_to_outcomes, spawn, write_outcome
 
 MODEL = ModelConfig(dim=32, n_layers=4, n_heads=4, vocab_size=64, max_seq_len=16)
 STEP = 3
@@ -277,13 +276,14 @@ def _check_a_failed_save(
         if saved_first:
             manager.save(1, tokens_seen=TOKENS)
         _fail_part(rank, world, failing)
+        mark(out_dir, rank)
         try:
             manager.save(STEP, tokens_seen=TOKENS)
             manager.wait()
             outcome = "returned"
         except BaseException as e:
             outcome = f"{type(e).__name__}: {e}"
-        Path(out_dir, f"rank{rank}").write_text(outcome)
+        write_outcome(out_dir, rank, outcome)
 
 
 def _outcomes(
@@ -296,38 +296,14 @@ def _outcomes(
 ) -> dict[int, str]:
     """How ``save`` and ``wait`` ended on each rank of ``_check_a_failed_save``, by rank.
 
-    Fails the test when a rank is still in ``save()`` or ``wait()`` 45 seconds in.
+    Fails the test when a rank is still in ``save()`` or ``wait()`` 45 seconds after every rank
+    entered the save; start-up and exit do not count against that.
     """
-    world = math.prod(shape)
-    out_dir = tmp_path / "outcomes"
-    out_dir.mkdir()
-    with held_store() as port:
-        context = mp.spawn(
-            _check_a_failed_save,
-            args=(
-                world,
-                port,
-                shape,
-                names,
-                str(tmp_path / "ckpt"),
-                async_mode,
-                failing,
-                saved_first,
-                str(out_dir),
-            ),
-            nprocs=world,
-            join=False,
-        )
-        deadline = time.monotonic() + 45
-        while not context.join(timeout=1):
-            if time.monotonic() > deadline:
-                for process in context.processes:
-                    process.terminate()
-                waiting = sorted(set(range(world)) - {int(p.name[4:]) for p in out_dir.iterdir()})
-                pytest.fail(f"ranks {waiting} still in save() or wait() after the {failing} failed")
-    outcomes = {int(p.name[4:]): p.read_text() for p in out_dir.iterdir()}
-    assert sorted(outcomes) == list(range(world))
-    return outcomes
+    args = (shape, names, str(tmp_path / "ckpt"), async_mode, failing, saved_first)
+    part = f"save() or wait() with the {failing} failing"
+    return run_to_outcomes(
+        _check_a_failed_save, math.prod(shape), args, tmp_path / "outcomes", part=part, part_s=45
+    )
 
 
 def _assert_every_rank_raised(outcomes: dict[int, str], failed: list[int]) -> None:

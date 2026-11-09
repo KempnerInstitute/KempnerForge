@@ -260,7 +260,7 @@ class TestMyFeature:
 - Every config field with constraints needs both a default-value test and a rejection test.
 - Use `pytest.raises(ValueError, match="...")` with a match pattern for validation tests.
 
-**Multi-process tests** run real collectives on CPU ranks over gloo. Use `tests/gloo_ranks.py`: `spawn(fn, world, *args)` starts `fn(rank, world, port, *args)` on every rank, and the rank does its work inside `with gloo_group(rank, world, port):`. The test process holds the rendezvous port open until the ranks finish, and a rank leaves the group only once every rank has finished its block. Never pick a free port and release it for the ranks to bind later: another process can take it in between.
+**Multi-process tests** run real collectives on CPU ranks over gloo. Use `tests/gloo_ranks.py`: `spawn(fn, world, *args)` starts `fn(rank, world, port, *args)` on every rank, and the rank does its work inside `with gloo_group(rank, world, port):`. The test process holds the rendezvous port open until the ranks finish, and a rank leaves the group only once every rank has finished its block. Never pick a free port and release it for the ranks to bind later: another process can take it in between. To time one part of the ranks' work, such as a save, without counting their start-up and exit, use `run_to_outcomes`.
 
 ### Running Specific Tests
 
