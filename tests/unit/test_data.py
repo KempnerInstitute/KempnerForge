@@ -489,10 +489,16 @@ class TestStreamingHuggingFaceDataset:
         assert not parts[0] & parts[1], "a document went to both ranks"
         assert parts[0] | parts[1] == set(range(n_shards * 5))
 
-    def test_each_rank_reads_only_its_shards(self):
-        """With a shard count that divides by the ranks, a rank reads its own shards alone."""
-        reads = [self._read_as_rank(rank, 2, 4)[0] for rank in range(2)]
-        assert reads == [10, 10]
+    @pytest.mark.parametrize(
+        ("n_shards", "reads"), [(4, [10, 10]), (3, [15, 15])], ids=["divisible", "fallback"]
+    )
+    def test_each_rank_reads_only_its_shards(self, n_shards, reads):
+        """A rank reads its own shards alone when the shard count divides by the ranks.
+
+        Otherwise ``split_dataset_by_node`` falls back to every rank reading the whole
+        stream and keeping every ``world_size``-th document.
+        """
+        assert [self._read_as_rank(rank, 2, n_shards)[0] for rank in range(2)] == reads
 
     def test_empty_docs_skipped(self):
         ds = self._make_mock_dataset(seq_len=4)

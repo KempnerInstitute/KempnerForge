@@ -1,9 +1,10 @@
 """The data position a resume restores, across data-parallel size and batch size changes.
 
 Ranks are simulated with explicit ``num_replicas`` and ``rank``; the gloo tests run a
-real process group through ``CheckpointManager``. Every check compares the samples
+real process group through ``CheckpointManager``. The resize tests compare the samples
 consumed before and after a resume against the epoch's global order: together they
-must be one prefix of it, with no sample skipped and none read twice.
+must be one prefix of it, with no sample skipped and none read twice. The mixture,
+legacy, state and warm-start tests check refusals and what a resume restores.
 """
 
 from __future__ import annotations
@@ -124,14 +125,19 @@ def test_resume_in_a_later_epoch_follows_that_epochs_order():
 
 
 def test_uneven_resume_keeps_ranks_in_step_to_the_epoch_end():
-    """Three ranks resuming at sample 1600 all end the epoch on the same step."""
+    """Three ranks resuming at sample 1600 all end the epoch on the same step.
+
+    Rank 0 has 132 samples left after the position and ranks 1 and 2 have 133.
+    With batch 7 that would be 18 batches against 19, so only the equal count
+    ``samples_after`` gives every rank keeps them in step.
+    """
     dataset = _Indices(2_000)
     _, state = _run(dataset, 4, 4, steps=100)
-    loaders = [_loader(dataset, 3, r, 5) for r in range(3)]
+    loaders = [_loader(dataset, 3, r, 7) for r in range(3)]
     for loader in loaders:
         loader.load_state_dict(state)
     batches = [sum(1 for _ in loader) for loader in loaders]
-    assert len(set(batches)) == 1, f"ranks end the epoch on different steps: {batches}"
+    assert batches == [18, 18, 18], f"ranks end the epoch on different steps: {batches}"
     assert {loader.state_dict()["epoch"] for loader in loaders} == {1}
 
 

@@ -92,11 +92,11 @@ def _worker_sockets_fit() -> bool:
     return len(multiprocessing.util.get_temp_dir()) + len("/listener-12345678") <= 107
 
 
-def _stream_loader(corpus, *, world_size=1, num_workers=0, batch_size=2, seq_len=8):
+def _stream_loader(corpus, *, num_workers=0, batch_size=2, **dataset_kwargs):
+    """A loader over the corpus; ``dataset_kwargs`` override the dataset's arguments."""
     data, tokenizer = corpus
-    dataset = StreamingHuggingFaceDataset(
-        str(data), "train", "text", seq_len, str(tokenizer), world_size=world_size
-    )
+    kwargs = {"seq_len": 8, "tokenizer_path": str(tokenizer), **dataset_kwargs}
+    dataset = StreamingHuggingFaceDataset(str(data), "train", "text", **kwargs)
     config = DataConfig(num_workers=num_workers, pin_memory=False)
     return StreamingDataLoader(dataset, batch_size=batch_size, config=config)
 
@@ -124,22 +124,32 @@ def test_resume_continues_the_stream(corpus, num_workers):
         assert torch.equal(want, have)
 
 
-def test_resume_in_a_later_epoch_follows_that_epochs_shuffle(corpus):
-    config = _config(corpus)
-    loader = _loader(config)
-    first_epoch = [batch["input_ids"] for batch in loader]
-    iterator = iter(loader)
-    for _ in range(4):
-        next(iterator)
-    state = loader.state_dict()
-    expected = next(iterator)["input_ids"]
-    assert state["epoch"] == 1
+@pytest.mark.parametrize("num_workers", [0, 2])
+def test_resume_in_a_later_epoch_follows_that_epochs_shuffle(corpus, num_workers):
+    """A resume in epoch 1 replays epoch 1's shuffle, also with persistent workers.
 
-    resumed = _loader(config)
-    resumed.load_state_dict(state)
-    got = next(iter(resumed))["input_ids"]
+    Persistent workers keep their own copy of the dataset, so they reach epoch 1 by
+    counting their own passes rather than through ``set_epoch``.
+    """
+    if num_workers and not _worker_sockets_fit():
+        pytest.skip("the temp directory path is too long for DataLoader worker sockets")
+    config = _config(corpus, num_workers)
+    loader, resumed = _loader(config), _loader(config)
+    try:
+        first_epoch = [batch["input_ids"] for batch in loader]
+        iterator = iter(loader)
+        for _ in range(4):
+            next(iterator)
+        state = loader.state_dict()
+        expected = next(iterator)["input_ids"]
+        resumed.load_state_dict(state)
+        got = next(iter(resumed))["input_ids"]
+    finally:
+        _close(loader)
+        _close(resumed)
+    assert state["epoch"] == 1
     assert torch.equal(got, expected)
-    assert not torch.equal(got, first_epoch[4]), "epoch 1 should be shuffled anew"
+    assert not torch.equal(expected, first_epoch[4]), "epoch 1 should be shuffled anew"
 
 
 def test_checkpoint_restores_the_stream_position(corpus, tmp_path):
@@ -166,8 +176,28 @@ def test_checkpoint_restores_the_stream_position(corpus, tmp_path):
 
 @pytest.mark.parametrize(
     "change",
-    [{"num_workers": 2}, {"batch_size": 4}, {"seq_len": 16}, {"world_size": 2}],
-    ids=["num_workers", "batch_size", "seq_len", "data_parallel_size"],
+    [
+        {"num_workers": 2},
+        {"batch_size": 4},
+        {"seq_len": 16},
+        {"world_size": 2},
+        {"seed": 7},
+        {"shuffle_buffer_size": 5},
+        {"pack_sequences": True},
+        {"tokenizer_path": "another-tokenizer"},
+        {"dataset_config": "another-config"},
+    ],
+    ids=[
+        "num_workers",
+        "batch_size",
+        "seq_len",
+        "data_parallel_size",
+        "seed",
+        "shuffle_buffer_size",
+        "pack_sequences",
+        "tokenizer",
+        "source",
+    ],
 )
 def test_a_changed_stream_is_refused(corpus, change):
     """Replaying a count of batches is exact only on the stream that counted them."""
