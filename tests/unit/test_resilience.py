@@ -189,10 +189,11 @@ class TestShutdownHandler:
                 timer.cancel()
             handler.finish()
 
-    def test_unregister_leaves_the_forced_exit_timer_armed(self):
+    def test_unregister_leaves_the_forced_exit_timer_armed(self, monkeypatch):
         """Restoring the handlers does not retire the watchdog (#313)."""
         original = signal.getsignal(signal.SIGTERM)
         handler = ShutdownHandler(timeout_sec=300)
+        monkeypatch.setattr(handler, "_force_exit", lambda: None)
         handler.register()
         os.kill(os.getpid(), signal.SIGTERM)
         try:
@@ -203,8 +204,9 @@ class TestShutdownHandler:
             handler.cancel_watchdog()
         assert handler._timer is None
 
-    def test_cancel_watchdog_leaves_the_handlers_installed(self):
+    def test_cancel_watchdog_leaves_the_handlers_installed(self, monkeypatch):
         handler = ShutdownHandler(timeout_sec=300)
+        monkeypatch.setattr(handler, "_force_exit", lambda: None)
         handler.register()
         os.kill(os.getpid(), signal.SIGTERM)
         try:
@@ -288,9 +290,10 @@ class TestShutdownHandler:
         finally:
             handler.unregister()
 
-    def test_request_arms_the_forced_exit_timer_without_a_signal(self):
+    def test_request_arms_the_forced_exit_timer_without_a_signal(self, monkeypatch):
         """A rank stopped by another rank's signal is bounded by a timer of its own."""
         handler = ShutdownHandler(timeout_sec=300)
+        monkeypatch.setattr(handler, "_force_exit", lambda: None)
         try:
             handler.request()
             timer = handler._timer

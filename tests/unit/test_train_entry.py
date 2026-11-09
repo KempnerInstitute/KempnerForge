@@ -1366,8 +1366,8 @@ class TestRunTraining:
         assert ckpt.saved_steps == [2]
         assert events == ["wait", "destroy", "finish"]
 
-    def test_a_failed_run_leaves_the_forced_exit_timer_armed(self, monkeypatch):
-        """On the exception path nothing retires the handler, so the timer bounds the exit."""
+    def test_a_failed_run_does_not_finish_the_shutdown_handler(self, monkeypatch):
+        """On the exception path nothing calls ``finish()``; a real timer bounds the exit."""
         import kempnerforge.training.entry as entry
         from kempnerforge.training.entry import run_training
 

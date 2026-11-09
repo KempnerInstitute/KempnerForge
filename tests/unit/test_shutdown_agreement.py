@@ -28,7 +28,10 @@ import torch.multiprocessing as mp
 
 WORLD = 2
 PG_TIMEOUT_S = 30
-DEADLINE_S = 90
+DEADLINE_S = 45
+VOTE_TIMEOUT_S = 10
+SAVE_ROUNDS = 10
+VOTES_PER_SAVE = 100
 
 
 def _free_port() -> int:
@@ -46,13 +49,13 @@ class _CpuTorch:
         return torch.tensor(data, **kwargs)
 
 
-def _init(rank: int, port: int) -> None:
+def _init(rank: int, port: int, timeout_s: float = PG_TIMEOUT_S) -> None:
     dist.init_process_group(
         "gloo",
         rank=rank,
         world_size=WORLD,
         init_method=f"tcp://127.0.0.1:{port}",
-        timeout=timedelta(seconds=PG_TIMEOUT_S),
+        timeout=timedelta(seconds=timeout_s),
     )
 
 
@@ -65,6 +68,38 @@ def _check_any_rank(rank: int, port: int, flags: tuple[bool, ...]) -> None:
         assert any_rank(flags[rank], group) is any(flags)
     finally:
         dist.destroy_process_group()
+
+
+def _vote_beside_async_saves(rank: int, port: int, case: str, root: str, out_dir: str) -> None:
+    """Cast votes on the control group while each of a run of async saves is in flight.
+
+    ``dcp.async_save`` runs gloo collectives on the default group from a background
+    thread; votes cast on that same group deadlock within a few saves. Both groups
+    time out after ``VOTE_TIMEOUT_S``, so a vote on the wrong group fails fast.
+    """
+    import torch.distributed.checkpoint as dcp
+
+    from kempnerforge.distributed.utils import any_rank, new_control_group
+
+    _init(rank, port, VOTE_TIMEOUT_S)
+    try:
+        group = new_control_group(VOTE_TIMEOUT_S)
+        state = {f"w{k}": torch.full((256, 256), float(k)) for k in range(64)}
+        wrong = 0
+        for i in range(SAVE_ROUNDS):
+            future = dcp.async_save(state, checkpoint_id=f"{root}/save_{i}")
+            last = i == SAVE_ROUNDS - 1
+            for _ in range(VOTES_PER_SAVE):
+                wrong += any_rank(rank == 1 and last, group) is not last
+            future.result()
+        outcome = f"rounds={SAVE_ROUNDS} wrong={wrong}"
+    except BaseException as e:
+        outcome = f"{type(e).__name__}: {e}"
+    Path(out_dir, f"rank{rank}").write_text(outcome)
+    deadline = time.monotonic() + DEADLINE_S
+    while len(list(Path(out_dir).iterdir())) < WORLD and time.monotonic() < deadline:
+        time.sleep(0.2)
+    dist.destroy_process_group()
 
 
 def _signal_on(signaled_step: int):
@@ -113,6 +148,7 @@ def _run_loop(rank: int, port: int, case: str, root: str, out_dir: str) -> None:
         config = make_config(max_steps=6)
         config.checkpoint.dir = root
         config.checkpoint.interval = 100
+        config.distributed.nccl_timeout_sec = PG_TIMEOUT_S
         signaled = rank == 1 and case in ("shutdown", "shutdown-dcp")
         overrides: dict = {"shutdown_handler": FakeShutdownHandler(2 if signaled else None)}
         if case == "nan" and rank == 0:
@@ -154,12 +190,12 @@ def _run_loop(rank: int, port: int, case: str, root: str, out_dir: str) -> None:
     dist.destroy_process_group()
 
 
-def _outcomes(tmp_path: Path, case: str) -> dict[int, str]:
-    """How the loop ended on each rank; fails the test when a rank is still running."""
+def _outcomes(tmp_path: Path, case: str, target=_run_loop) -> dict[int, str]:
+    """How ``target`` ended on each rank; fails the test when a rank is still running."""
     out_dir = tmp_path / "outcomes"
     out_dir.mkdir()
     context = mp.spawn(
-        _run_loop,
+        target,
         args=(_free_port(), case, str(tmp_path / "ckpt"), str(out_dir)),
         nprocs=WORLD,
         join=False,
@@ -189,6 +225,11 @@ class TestAnyRank:
     @pytest.mark.parametrize("flags", [(False, False), (False, True), (True, True)], ids=str)
     def test_every_rank_gets_the_same_answer(self, flags):
         mp.spawn(_check_any_rank, args=(_free_port(), flags), nprocs=WORLD)
+
+    def test_votes_stay_right_while_async_saves_run(self, tmp_path):
+        """The control group is not the default group that ``dcp.async_save`` also uses."""
+        outcomes = _outcomes(tmp_path, "votes", target=_vote_beside_async_saves)
+        assert outcomes == {r: f"rounds={SAVE_ROUNDS} wrong=0" for r in range(WORLD)}
 
 
 class TestLoopStopsOnEveryRank:
