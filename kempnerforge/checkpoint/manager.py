@@ -841,12 +841,15 @@ class CheckpointManager:
         single-copy ``rng``/``dataloader`` keys (always rank 0's) with this
         rank's own entry, selected by global rank. With an envelope it gathers
         the current data-parallel layout (a collective), so every rank must
-        call it. A topology or schema mismatch refuses the load unless
-        ``checkpoint.ignore_rank_state_mismatch`` downgrades it to a warning
-        that discards the saved loader/RNG state. The envelope check reads
-        only state every rank shares, so all ranks restore, refuse, or discard
-        together. A legacy checkpoint (no envelope) keeps its old behavior:
-        rank 0's single copy restores on every rank.
+        call it. ``load()`` calls it right after the train-state broadcast,
+        which every rank must reach, and whether to gather depends on the
+        broadcast state alone, so no rank waits in the gather for one that
+        failed earlier in ``load()``. A topology or schema mismatch refuses
+        the load unless ``checkpoint.ignore_rank_state_mismatch`` downgrades
+        it to a warning that discards the saved loader/RNG state. The envelope
+        check reads only state every rank shares, so all ranks restore,
+        refuse, or discard together. A legacy checkpoint (no envelope) keeps
+        its old behavior: rank 0's single copy restores on every rank.
         """
         envelope = train_state.get(PER_RANK_KEY)
         if envelope is None:

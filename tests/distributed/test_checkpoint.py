@@ -862,6 +862,135 @@ class TestPerRankState:
         assert resumed.restored == {"cursor": 100 + rank}
         dist.barrier()
 
+    @pytest.mark.timeout(120, method="thread")
+    def test_a_rank_that_fails_an_earlier_load_agreement_never_gathers_the_layout(
+        self, distributed_env, shared_tmp_dir
+    ):
+        """The layout gather comes after the load's other agreements on the manager's gloo
+        group. When the last rank cannot read its DCP index, the index agreement fails every
+        rank before any rank gathers the layout, and the group stays in step: the next exact
+        resume on the same managers restores each rank's own state."""
+        rank = dist.get_rank()
+        world = dist.get_world_size()
+        model, opt = self._stepped_model(distributed_env)
+        cfg = CheckpointConfig(dir=shared_tmp_dir)
+        mgr = CheckpointManager(
+            cfg,
+            model,
+            opt,
+            dp_info=(rank, world),
+            weight_decay_scope="exclude_norms_and_biases",
+        )
+        mgr.save(step=5, dataloader=_CursorLoader(cursor=100 + rank))
+        path = str(Path(shared_tmp_dir) / "step_5")
+
+        last = world - 1
+        read = mgr_mod.dcp.FileSystemReader.read_metadata
+
+        def read_metadata(reader):
+            if rank == last:
+                raise OSError("index unreadable")
+            return read(reader)
+
+        layout_gathers: list[int] = []
+        gather_layout = CheckpointManager._gather_dp_layout
+
+        def counting_gather(manager):
+            layout_gathers.append(rank)
+            return gather_layout(manager)
+
+        expected = OSError if rank == last else RuntimeError
+        reason = "index unreadable" if rank == last else rf"on ranks \[{last}\]"
+        with (
+            patch.object(mgr_mod.dcp.FileSystemReader, "read_metadata", read_metadata),
+            patch.object(CheckpointManager, "_gather_dp_layout", counting_gather),
+            pytest.raises(expected, match=reason),
+        ):
+            mgr.load(path=path, dataloader=_CursorLoader(cursor=-1), exact_resume=True)
+        assert layout_gathers == []
+
+        resumed = _CursorLoader(cursor=-1)
+        step, _, _ = mgr.load(path=path, dataloader=resumed, exact_resume=True)
+        assert step == 5
+        assert resumed.restored == {"cursor": 100 + rank}
+        dist.barrier()
+
+    def test_each_pipeline_stage_resumes_its_own_rng(self, distributed_env, shared_tmp_dir):
+        """Pipeline stages seed ``seed + pp_rank``, so each stage draws its own random streams,
+        shared by its data-parallel replicas. A resume restores each stage's own streams; a
+        load that is not a resume restores stage 0's on every stage, as before."""
+        from kempnerforge.config.schema import OptimizerConfig
+
+        rank = dist.get_rank()
+        world = dist.get_world_size()
+        if world % 2:
+            pytest.skip(f"needs an even world size for two stages, got {world}")
+        group, _ = dist.new_subgroups_by_enumeration(
+            [list(range(0, world, 2)), list(range(1, world, 2))]
+        )
+        stage = rank % 2
+        model = Transformer(SMALL_CONFIG).cuda()
+        opt = build_optimizer(model, OptimizerConfig(lr=1e-3, fused=False))
+        mgr = CheckpointManager(
+            CheckpointConfig(dir=shared_tmp_dir),
+            model,
+            opt,
+            process_group=group,
+            pp_rank=stage,
+            dp_info=(rank // 2, world // 2),
+        )
+
+        self._seed_all(1000 + stage)
+        mgr.save(step=3)
+        expected = self._draw()
+        draws: list = [None] * world
+        dist.all_gather_object(draws, expected)
+        assert draws[0] != draws[1], "the two stages drew the same streams"
+        path = str(Path(shared_tmp_dir) / "step_3")
+
+        self._seed_all(7)
+        assert mgr.load(path=path, exact_resume=True)[0] == 3
+        assert self._draw() == expected, f"stage {stage} did not resume its own RNG streams"
+
+        self._seed_all(7)
+        assert mgr.load(path=path)[0] == 3
+        assert self._draw() == draws[0], f"stage {stage} did not restore stage 0's copy"
+        dist.barrier()
+
+    def test_hsdp_records_the_partition_each_rank_reads(self, distributed_env, shared_tmp_dir):
+        """Under HSDP a rank reads the partition at the row-major index of its
+        ``(dp_replicate, dp_shard)`` coordinates. The envelope records the partition
+        ``get_dp_info`` gives the data pipeline, and each rank resumes its own state."""
+        from torch.distributed.device_mesh import init_device_mesh
+
+        from kempnerforge.distributed.utils import get_dp_info
+
+        rank = dist.get_rank()
+        world = dist.get_world_size()
+        if world != 4:
+            pytest.skip(f"needs 4 ranks for a 2 x 2 HSDP mesh, got {world}")
+        mesh = init_device_mesh("cuda", (2, 2), mesh_dim_names=("dp_replicate", "dp_shard"))
+        model, opt = self._stepped_model(mesh)
+        mgr = CheckpointManager(
+            CheckpointConfig(dir=shared_tmp_dir), model, opt, dp_info=get_dp_info(mesh)
+        )
+
+        self._seed_all(1000 + rank)
+        mgr.save(step=5, dataloader=_CursorLoader(cursor=100 + rank))
+        expected = self._draw()
+        saved = torch.load(Path(shared_tmp_dir) / "step_5" / "train_state.pt", weights_only=False)
+        assert saved["per_rank"]["data_parallel"] == {r: (r, 4) for r in range(4)}
+
+        self._seed_all(7)
+        loader = _CursorLoader(cursor=-1)
+        step, _, _ = mgr.load(
+            path=str(Path(shared_tmp_dir) / "step_5"), dataloader=loader, exact_resume=True
+        )
+        assert step == 5
+        assert loader.restored == {"cursor": 100 + rank}
+        assert self._draw() == expected, f"rank {rank} did not resume its own RNG streams"
+        dist.barrier()
+
 
 class TestWeightDecayScopeAcrossStages:
     """The scope check runs on every rank or on none, whichever stages hold optimizer state.
