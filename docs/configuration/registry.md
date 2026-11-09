@@ -17,7 +17,9 @@ model = registry.get("mlp", "my_mlp")(dim=4096, hidden_dim=11008)
 
 `register(category, name, obj)` fails fast on duplicate names; `get`
 raises `KeyError` with an "Available: […]" hint when a name is missing;
-`list(category)` returns registered names.
+`list(category)` returns registered names; `unregister(category, name)`
+removes an entry and returns it, raising the same `KeyError` when the name
+is missing (an adapter's `accepts` declaration goes with it).
 
 ## The seven categories
 
@@ -64,11 +66,14 @@ module-import time. Both routes land in the same `_stores` dict.
 from kempnerforge.config.registry import registry
 
 @registry.register_optimizer("my_adam")
-def build_my_adam(params, config):
-    return MyAdam(params, lr=config.lr, betas=config.betas)
+def build_my_adam(param_groups, config, model):
+    return MyAdam(param_groups, lr=config.lr, betas=config.betas)
 ```
 
-Configs then pick it up via `[optimizer] name = "my_adam"`.
+Configs then pick it up via `[optimizer] name = "my_adam"`. `build_optimizer`
+passes every optimizer builder the decay/no-decay `param_groups`, the
+`OptimizerConfig` and the model, so a builder can route parameters by the
+module that owns them.
 
 ### With `register(...)`
 
@@ -83,6 +88,55 @@ registry.register("norm", "my_norm", _build_my_norm)
 ```
 
 Configs then pick it up via `[model] norm_type = "my_norm"`.
+
+### Adapters declare the fields they use
+
+`build_adapter` passes an adapter builder every `AdapterConfig` field but
+`type`, plus `norm_eps`. The builder names the fields it uses as parameters
+and swallows the rest with `**_`, and that signature is its declaration:
+`AdapterConfig` rejects any other field set away from its default, so a
+config cannot ask for a setting the adapter would drop.
+
+```python
+from kempnerforge.config.registry import registry
+
+@registry.register_adapter("my_pool")
+def build_my_pool(in_dim, out_dim, pool_window=2, **_):
+    return MyPool(in_dim, out_dim, pool_window)
+```
+
+`my_pool` uses `pool_window`, so `type = "my_pool"` with `pool_heads = 8`
+fails to load. A parameter counts when it is named after an `AdapterConfig`
+field and can be passed by keyword; a positional-only one never receives the
+field. A builder with no `**` parameter at all is read the same way. The
+builder's own signature counts: a wrapper made with `functools.wraps` is read
+as the wrapper, not as the function it wraps, since the wrapper is what
+receives the fields.
+
+Pass `accepts` to `register_adapter` when the signature does not tell the
+whole story. When the fields in use depend on other fields, `accepts` is a
+callable that takes the `AdapterConfig` and returns them as a collection of
+names, never a bare string (that fails when the config loads). The built-in
+`avgpool` works this way: it uses `activation` and `pre_norm` only once
+`hidden_dim > 0` builds its MLP head.
+
+```python
+def _my_head_accepts(config):
+    if config.hidden_dim > 0:
+        return ("hidden_dim", "activation")
+    return ("hidden_dim",)
+
+@registry.register_adapter("my_head", accepts=_my_head_accepts)
+def build_my_head(in_dim, out_dim, hidden_dim=None, activation="gelu", **_):
+    return MyHead(in_dim, out_dim, hidden_dim, activation)
+```
+
+`accepts` can also be a plain collection of field names, such as
+`accepts=("pool_window",)`. A builder whose `**` parameter has any other name
+(`**kwargs`) may read fields from it, so its signature says nothing: without
+`accepts` that adapter accepts every field, and its builder receives them
+all. A declaration that names a field `AdapterConfig` does not have fails
+when the config loads.
 
 ### Making sure the module runs
 
@@ -171,12 +225,13 @@ signature, and your builder has to match it." Existing examples:
 | Category | Expected signature |
 |----------|--------------------|
 | `model` | `fn(config: ModelConfig) → nn.Module` |
-| `optimizer` | `fn(params, config: OptimizerConfig) → torch.optim.Optimizer` |
+| `optimizer` | `fn(param_groups, config: OptimizerConfig, model: nn.Module) → torch.optim.Optimizer` |
 | `scheduler` | `fn(optimizer, config: SchedulerConfig, max_steps: int) → LRScheduler` |
 | `loss` | `fn(logits, labels, …) → Tensor` (see existing `cross_entropy` for the exact kwargs) |
 | `norm` | `fn(dim: int, eps: float) → nn.Module` |
 | `router` | `fn(dim, num_experts, top_k, **kwargs) → nn.Module` |
 | `mlp` | `fn(dim: int, hidden_dim: int) → nn.Module` |
+| `adapter` | `fn(in_dim: int, out_dim: int, norm_eps: float, **fields) → VisionAdapter`, where `fields` is `AdapterConfig.extra_kwargs()`, every field but `type` |
 
 Check the closest existing builder (e.g.
 [`_build_swiglu`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/model/mlp.py))

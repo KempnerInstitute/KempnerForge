@@ -4,9 +4,15 @@ from __future__ import annotations
 
 import os
 import signal
+import socket
 import threading
 
+import pytest
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import Shard, distribute_tensor
 
 from kempnerforge.resilience.elastic import (
     SLURMInfo,
@@ -20,11 +26,36 @@ from kempnerforge.resilience.elastic import (
 from kempnerforge.resilience.health import (
     NaNDetector,
     check_gpu_health,
+    params_are_finite,
 )
 from kempnerforge.resilience.signal_handler import (
     ShutdownHandler,
     ignore_shutdown_signals_in_worker,
 )
+
+
+def _free_port() -> int:
+    """An unused local TCP port for the gloo rendezvous."""
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _check_ranks_agree(rank: int, world: int, port: int, nan_rank: int | None) -> None:
+    """Only ``nan_rank`` holds a NaN, in its shard of a row-sharded weight."""
+    dist.init_process_group(
+        "gloo", rank=rank, world_size=world, init_method=f"tcp://127.0.0.1:{port}"
+    )
+    try:
+        mesh = init_device_mesh("cpu", (world,), mesh_dim_names=("dp_shard",))
+        weight = torch.zeros(2 * world, 3)
+        if nan_rank is not None:
+            weight[2 * nan_rank] = float("nan")
+        model = torch.nn.Linear(3, 2 * world)
+        model.weight = torch.nn.Parameter(distribute_tensor(weight, mesh, [Shard(0)]))
+        assert params_are_finite(model, "cpu") is (nan_rank is None)
+    finally:
+        dist.destroy_process_group()
 
 
 class TestShutdownHandler:
@@ -315,6 +346,24 @@ class TestNaNDetector:
             det.check_gradients(model, step=1)
 
 
+class TestParamsAreFinite:
+    def test_finite_parameters_pass(self):
+        model = torch.nn.Sequential(torch.nn.Linear(4, 4), torch.nn.Linear(4, 2))
+        assert params_are_finite(model, "cpu") is True
+
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+    def test_one_non_finite_value_in_any_parameter_fails(self, bad):
+        model = torch.nn.Sequential(torch.nn.Linear(4, 4), torch.nn.Linear(4, 2))
+        with torch.no_grad():
+            model[1].bias[1] = bad
+        assert params_are_finite(model, "cpu") is False
+
+    @pytest.mark.parametrize("nan_rank", [None, 1], ids=["finite", "nan-on-rank-1"])
+    def test_every_rank_gets_the_same_answer(self, nan_rank):
+        """Rank 0's own shard is finite, so only the all-reduce can fail its check."""
+        mp.spawn(_check_ranks_agree, args=(2, _free_port(), nan_rank), nprocs=2)
+
+
 class TestGPUHealth:
     def test_check_gpu_health_keys(self):
         health = check_gpu_health()
@@ -495,10 +544,13 @@ class TestSLURM:
         handler.setLevel(logging.DEBUG)
         logger = logging.getLogger("kempnerforge.resilience.elastic")
         logger.addHandler(handler)
+        old_level = logger.level
+        logger.setLevel(logging.INFO)
         try:
             log_job_info()
             assert "Not running under SLURM" in buf.getvalue()
         finally:
+            logger.setLevel(old_level)
             logger.removeHandler(handler)
             if old is not None:
                 os.environ["SLURM_JOB_ID"] = old
@@ -525,6 +577,8 @@ class TestSLURM:
         handler.setLevel(logging.DEBUG)
         logger = logging.getLogger("kempnerforge.resilience.elastic")
         logger.addHandler(handler)
+        old_level = logger.level
+        logger.setLevel(logging.INFO)
         try:
             log_job_info()
             output = buf.getvalue()
@@ -532,6 +586,7 @@ class TestSLURM:
             assert "test_run" in output
             assert "gpu_test" in output
         finally:
+            logger.setLevel(old_level)
             logger.removeHandler(handler)
             for k in env:
                 if saved[k] is not None:
@@ -557,10 +612,13 @@ class TestSLURM:
         handler.setLevel(logging.DEBUG)
         logger = logging.getLogger("kempnerforge.resilience.elastic")
         logger.addHandler(handler)
+        old_level = logger.level
+        logger.setLevel(logging.INFO)
         try:
             log_job_info()
             assert "requeued" in buf.getvalue().lower()
         finally:
+            logger.setLevel(old_level)
             logger.removeHandler(handler)
             for k in env:
                 if saved[k] is not None:
@@ -584,6 +642,21 @@ def _durable_step_dir(base, step: int, pp_stages: int = 0):
             (stage / ".metadata").write_text("")
     else:
         (d / ".metadata").write_text("")
+    return d
+
+
+def _saved_step_dir(base, step: int, *, optimizer: bool, train_state: bool, pp_stages: int = 0):
+    """Write a ``step_N`` with DCP, with or without optimizer state and ``train_state.pt``."""
+    import torch.distributed.checkpoint as dcp
+
+    d = base / f"step_{step}"
+    state = {"model": {"w": torch.zeros(2)}}
+    if optimizer:
+        state["optimizer"] = {"state": {"w": {"exp_avg": torch.zeros(2)}}}
+    for stage in [d / f"pp{k}" for k in range(pp_stages)] or [d]:
+        dcp.save(state, checkpoint_id=str(stage))
+    if train_state:
+        torch.save({"step": step, "tokens_seen": 0}, d / "train_state.pt")
     return d
 
 
@@ -826,6 +899,110 @@ class TestResumePathResolution:
         result = resolve_resume_path(str(tmp_path))
         assert result is not None
         assert result.name == "step_10"
+
+    def test_skips_a_save_that_stopped_before_its_train_state(self, tmp_path, caplog, monkeypatch):
+        """DCP shards with optimizer state and no ``train_state.pt`` are a save cut short.
+
+        A synchronous save writes the shards, then ``train_state.pt``. Cut short in between,
+        the first save of a run leaves no ``latest``, and resuming the directory would continue
+        its weights and optimizer moments from step 0.
+        """
+        import logging
+
+        self._let_caplog_see_kempnerforge(monkeypatch)
+        _saved_step_dir(tmp_path, 10, optimizer=True, train_state=True)
+        stopped = _saved_step_dir(tmp_path, 20, optimizer=True, train_state=False)
+
+        with caplog.at_level(logging.WARNING):
+            result = resolve_resume_path(str(tmp_path))
+
+        assert result is not None
+        assert result.name == "step_10"
+        skipped = f"skipping {stopped}: it holds optimizer state but no train_state.pt"
+        assert any(skipped in r.getMessage() for r in caplog.records), caplog.text
+
+    def test_keeps_a_weights_only_checkpoint_without_train_state(self, tmp_path):
+        """A checkpoint without optimizer state, like an ``hf-to-dcp`` import, needs none."""
+        _saved_step_dir(tmp_path, 10, optimizer=True, train_state=True)
+        _saved_step_dir(tmp_path, 20, optimizer=False, train_state=False)
+
+        result = resolve_resume_path(str(tmp_path))
+        assert result is not None
+        assert result.name == "step_20"
+
+    def test_skips_a_pipeline_parallel_save_without_its_train_state(self, tmp_path):
+        """Every ``pp{k}`` stage holds optimizer state, and the shared train state is missing."""
+        _saved_step_dir(tmp_path, 10, optimizer=True, train_state=True, pp_stages=2)
+        _saved_step_dir(tmp_path, 20, optimizer=True, train_state=False, pp_stages=2)
+
+        result = resolve_resume_path(str(tmp_path))
+        assert result is not None
+        assert result.name == "step_10"
+
+    def test_the_stage_fallback_skips_a_save_without_its_train_state(self, tmp_path):
+        """A step short of a stage that also lost ``train_state.pt`` is not resumed either.
+
+        With no step holding every stage, the fallback still applies the train state check, so
+        it starts over rather than pick a save the load refuses, and takes an older step that
+        lacks only a stage when there is one.
+        """
+        _saved_step_dir(tmp_path, 20, optimizer=True, train_state=False, pp_stages=1)
+        assert resolve_resume_path(str(tmp_path), num_stages=2) is None
+
+        _saved_step_dir(tmp_path, 10, optimizer=True, train_state=True, pp_stages=1)
+        result = resolve_resume_path(str(tmp_path), num_stages=2)
+        assert result is not None
+        assert result.name == "step_10"
+
+    def test_none_when_every_save_lacks_its_train_state(self, tmp_path, caplog, monkeypatch):
+        """The first save of a run cut short: start from step 0, and say so at ERROR."""
+        import logging
+
+        self._let_caplog_see_kempnerforge(monkeypatch)
+        _saved_step_dir(tmp_path, 20, optimizer=True, train_state=False)
+
+        with caplog.at_level(logging.ERROR):
+            assert resolve_resume_path(str(tmp_path)) is None
+
+        errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+        assert errors, "no ERROR record for a resume that found no complete save"
+        assert "none holds a complete save; starting from step 0" in errors[0]
+
+    def test_latest_is_followed_even_without_its_train_state(self, tmp_path):
+        """``latest`` names a committed checkpoint; if it lost the file, the load refuses it."""
+        _saved_step_dir(tmp_path, 10, optimizer=True, train_state=True)
+        _saved_step_dir(tmp_path, 20, optimizer=True, train_state=False)
+        (tmp_path / "latest").symlink_to("step_20")
+
+        result = resolve_resume_path(str(tmp_path))
+        assert result is not None
+        assert result.name == "step_20"
+
+    def test_unreadable_dcp_metadata_is_left_for_the_load(self, tmp_path, caplog, monkeypatch):
+        """An empty ``.metadata`` does not count as optimizer state; the load reports it."""
+        import logging
+
+        self._let_caplog_see_kempnerforge(monkeypatch)
+        _saved_step_dir(tmp_path, 10, optimizer=True, train_state=True)
+        damaged = _durable_step_dir(tmp_path, 20)
+
+        with caplog.at_level(logging.WARNING):
+            result = resolve_resume_path(str(tmp_path))
+
+        assert result is not None
+        assert result.name == "step_20"
+        unread = f"Could not read {damaged / '.metadata'} to tell whether it holds optimizer state"
+        assert any(unread in r.getMessage() for r in caplog.records), caplog.text
+
+    def test_a_weights_only_caller_keeps_a_save_without_its_train_state(self, tmp_path):
+        """Evaluation loads the weights alone, so the newest save with durable shards serves it."""
+        _saved_step_dir(tmp_path, 10, optimizer=True, train_state=True)
+        _saved_step_dir(tmp_path, 20, optimizer=True, train_state=False)
+        (tmp_path / "step_30").mkdir()
+
+        result = resolve_resume_path(str(tmp_path), require_train_state=False)
+        assert result is not None
+        assert result.name == "step_20"
 
 
 class TestWorkerSignalShielding:

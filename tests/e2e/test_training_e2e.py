@@ -30,6 +30,7 @@ from pathlib import Path
 import pytest
 
 from kempnerforge.training.optimizer import registry
+from tests.child_output import traceback_or_tail
 from tests.e2e.conftest import requires_gpus
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -95,11 +96,15 @@ def _run_training(
 def _assert_training_complete(result: subprocess.CompletedProcess, expected_steps: int) -> None:
     """Assert training finished successfully with the expected step count."""
     output = result.stdout + result.stderr
-    assert result.returncode == 0, f"Training failed (exit {result.returncode}):\n{output[-2000:]}"
-    assert "Training complete" in output, f"Training did not complete:\n{output[-2000:]}"
+    assert result.returncode == 0, (
+        f"Training failed (exit {result.returncode}):\n{traceback_or_tail(output, 2000)}"
+    )
+    assert "Training complete" in output, (
+        f"Training did not complete:\n{traceback_or_tail(output, 2000)}"
+    )
 
     match = re.search(r"Training complete: (\d+) steps", output)
-    assert match, f"Could not parse step count from output:\n{output[-2000:]}"
+    assert match, f"Could not parse step count from output:\n{traceback_or_tail(output, 2000)}"
     assert int(match.group(1)) == expected_steps, (
         f"Expected {expected_steps} steps, got {match.group(1)}"
     )
@@ -237,8 +242,9 @@ def test_fp16_mixed_precision_rejected_at_launch(tmp_path: Path) -> None:
         nproc=1,
     )
     output = result.stdout + result.stderr
-    assert result.returncode != 0, f"fp16 run was not rejected:\n{output[-2000:]}"
-    assert "ValueError: train.mixed_precision='fp16' is not supported" in output, output[-2000:]
+    excerpt = traceback_or_tail(output, 2000)
+    assert result.returncode != 0, f"fp16 run was not rejected:\n{excerpt}"
+    assert "ValueError: train.mixed_precision='fp16' is not supported" in output, excerpt
     assert "Training complete" not in output
 
 
@@ -629,9 +635,11 @@ def test_sigterm_triggers_emergency_checkpoint(tmp_path):
         pytest.fail("Process did not exit within 30s after SIGTERM")
 
     output = stdout + stderr
-    assert "Shutdown requested" in output, f"Signal handler did not trigger:\n{output[-2000:]}"
+    assert "Shutdown requested" in output, (
+        f"Signal handler did not trigger:\n{traceback_or_tail(output, 2000)}"
+    )
     assert "Checkpoint committed" in output, (
-        f"Emergency checkpoint was not saved:\n{output[-2000:]}"
+        f"Emergency checkpoint was not saved:\n{traceback_or_tail(output, 2000)}"
     )
 
 
@@ -656,8 +664,10 @@ def test_final_checkpoint_on_clean_completion(tmp_path):
     output = result.stdout + result.stderr
     final = ckpt_dir / "step_10"
     latest = ckpt_dir / "latest"
-    assert final.is_dir(), f"final checkpoint step_10 was not written:\n{output[-2000:]}"
-    assert latest.exists(), f"`latest` pointer is missing:\n{output[-2000:]}"
+    assert final.is_dir(), (
+        f"final checkpoint step_10 was not written:\n{traceback_or_tail(output, 2000)}"
+    )
+    assert latest.exists(), f"`latest` pointer is missing:\n{traceback_or_tail(output, 2000)}"
     assert latest.resolve().name == "step_10", (
         f"`latest` should resolve to step_10, got {latest.resolve().name!r}"
     )

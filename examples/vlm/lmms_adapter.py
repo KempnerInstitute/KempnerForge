@@ -160,10 +160,12 @@ def resolve_checkpoint(checkpoint: str) -> Path:
     """The concrete checkpoint directory ``checkpoint`` names.
 
     A run directory resolves to its ``latest``/highest ``step_N`` via
-    ``resolve_resume_path``; a specific checkpoint directory is used as-is. Symlinks are
-    followed, so a ``latest`` link that moves later cannot change the directory.
+    ``resolve_resume_path``; a specific checkpoint directory is used as-is. Only the weights
+    are loaded, so the scan keeps a ``step_N`` that lacks only ``train_state.pt``. Symlinks
+    are followed, so a ``latest`` link that moves later cannot change the directory.
     """
-    return (resolve_resume_path(checkpoint) or Path(checkpoint)).resolve()
+    resumed = resolve_resume_path(checkpoint, require_train_state=False)
+    return (resumed or Path(checkpoint)).resolve()
 
 
 def _load_weights(

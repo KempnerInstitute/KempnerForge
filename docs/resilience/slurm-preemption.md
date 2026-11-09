@@ -14,27 +14,36 @@ Two pieces:
 
 ## `ShutdownHandler`
 
-Wired into the training loop at two points:
+Registered in `run_training`, and checked by `_shutdown_if_requested`
+at the end of every step, finite or skipped:
 
 ```python
 # training/entry.py::run_training
 shutdown_handler = ShutdownHandler(timeout_sec=config.train.shutdown_timeout_sec)
 shutdown_handler.register()
 ...
-while step < tc.max_steps:
-    # ... train step, log ...
-    saved_this_step = config.checkpoint.should_save(step)
-    if saved_this_step:
-        ckpt_mgr.save(step=step, ...)
-    if shutdown_handler.should_shutdown():
-        if saved_this_step:
-            ckpt_mgr.wait()
-        else:
-            logger.warning(f"Shutdown requested at step {step} — saving emergency checkpoint")
-            ckpt_mgr.save(step=step, tokens_seen=tokens_seen,
-                          scheduler=scheduler, extra=ckpt_extra)
-        shutdown_handler.finish()
-        break
+# training/loop.py::run_training_loop, on a step skipped for a NaN / Inf loss
+if _shutdown_if_requested(
+    session, step, tokens_seen, saved_this_step=False, nan_skipped=True
+):
+    break
+...
+# training/loop.py::run_training_loop, after a finite step's scheduled save
+if _shutdown_if_requested(session, step, tokens_seen, saved_this_step=saved_this_step):
+    break
+
+# training/loop.py::_shutdown_if_requested
+if not session.shutdown_handler.should_shutdown():
+    return False
+if saved_this_step:
+    ckpt_mgr.wait()
+elif nan_skipped and not params_are_finite(session.model, session.runtime.device):
+    logger.error(...)
+else:
+    ckpt_mgr.save(step=step, tokens_seen=tokens_seen, scheduler=session.scheduler,
+                  dataloader=session.data.dataloader, extra=...)
+session.shutdown_handler.finish()
+return True
 ```
 
 `register()` installs handlers for `SIGTERM` and `SIGUSR1`. `finish()`
@@ -43,6 +52,22 @@ A shutdown on a step the checkpoint schedule already saved reuses that
 save as the emergency checkpoint instead of writing the step twice, and
 waits for it before `finish()`, so the forced-exit timer still bounds a
 stalled write.
+
+A step skipped for a NaN / Inf loss runs the same check, so a signal
+that arrives during a run of NaN steps is acted on at the next one
+rather than after the run. The schedule never saves a skipped step, so
+its shutdown writes the emergency checkpoint itself, and the checkpoint
+resumes on the same LR schedule and data position, with two exceptions
+listed in [NaN detection](nan-detection.md#what-a-skipped-step-still-does).
+It writes one only if every rank's weights are finite: when a bad update
+(an optimizer step that passed the NaN check) has already put NaN into
+the weights, the loop logs an ERROR, saves nothing and stops, so
+`latest` still names the last checkpoint saved. That checkpoint holds
+NaN weights only if the bad update's own step saved one: that step
+passed the NaN check, so its save was not checked (see
+[NaN detection § A shutdown after a bad update](nan-detection.md#a-shutdown-after-a-bad-update)).
+The NaN that reaches `max_consecutive` is different: the loop stops on
+it before the check and saves nothing.
 
 ### Why cooperative, not `sys.exit`
 
@@ -61,10 +86,10 @@ process can inherit stale state (shared memory, port bindings) or hit a
 torch.distributed deadlock because peers think the group is still
 active.
 
-The training loop polls `should_shutdown()` after every step, at which
-point no collective is in flight. A checkpoint can be written safely,
-`ckpt_mgr.wait()` can flush the async writer, and the process group can
-be destroyed cleanly.
+The training loop polls `should_shutdown()` after every step, a
+NaN-skipped one included, at which point no collective is in flight.
+A checkpoint can be written safely, `ckpt_mgr.wait()` can flush the
+async writer, and the process group can be destroyed cleanly.
 
 ### Forced-exit timer
 
@@ -158,17 +183,24 @@ step is long.
 
 **"Received SIGTERM" logged but no emergency checkpoint saved.** Usually
 means `shutdown_timeout_sec` was too short: the forced-exit timer fired
-while the async checkpoint was still writing. Increase the timeout.
+while the async checkpoint was still writing. Increase the timeout. If
+an ERROR says the parameters are not finite, the signal arrived during a
+run of NaN steps whose weights a bad update had already ruined, and the
+loop skipped the save on purpose; `latest` still names the last
+checkpoint saved.
 
 **Process hangs after "Shutdown requested".** Check for an in-flight
 NCCL collective that can't complete (peer already killed).
 `check_nccl_health()` from [NCCL liveness](nccl-liveness.md) is useful
 for detecting this proactively.
 
-**Checkpoint exists but resume starts from step 0.** Inspect
-`checkpoint/latest` — the symlink may be stale if a previous save
-crashed mid-write. See [Auto-resume](../checkpointing/auto-resume.md)
-for the resolution order.
+**Checkpoint exists but resume starts from step 0.** Look for
+`Auto-resume: skipping` warnings in the log. Without a `latest`
+symlink, the resolver skips every `step_N` whose save did not complete
+(no DCP `.metadata`, or optimizer state without `train_state.pt`), and
+when none completed it starts from step 0, or from
+`checkpoint.load_path` if one is set, with an ERROR. See
+[Auto-resume](../checkpointing/auto-resume.md) for the resolution order.
 
 ## See also
 

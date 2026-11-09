@@ -732,7 +732,7 @@
       "functions": [
         "build_optimizer(model, config) -> Optimizer",
         "_newton_schulz(G, steps) -> Tensor",
-        "_is_muon_eligible(param) -> bool",
+        "_muon_matrices(model, *, routers) -> set[Tensor]",
         "_should_decay(name, param, scope) -> bool"
       ],
       "registry": [
@@ -745,6 +745,7 @@
         "tests/unit/test_training.py::TestBuildOptimizer",
         "tests/unit/test_optimizer.py::TestNewtonSchulz",
         "tests/unit/test_optimizer.py::TestMuon",
+        "tests/unit/test_optimizer.py::TestMuonRouting",
         "tests/unit/test_optimizer.py::TestAdamW",
         "tests/unit/test_additional_optimizers.py::TestLion",
         "tests/unit/test_additional_optimizers.py::TestScheduleFreeAdamW"
@@ -1177,7 +1178,8 @@
       "tested_by": [
         "tests/unit/test_checkpoint.py::TestRNGState",
         "tests/unit/test_checkpoint.py::TestBuildTrainState",
-        "tests/unit/test_checkpoint.py::TestRestoreTrainState"
+        "tests/unit/test_checkpoint.py::TestRestoreTrainState",
+        "tests/integration/test_checkpoint_roundtrip.py::TestCheckpointRoundtrip"
       ]
     },
     "kempnerforge/checkpoint/manager.py": {
@@ -1215,7 +1217,7 @@
         "tests/unit/test_checkpoint_security.py::TestLoadTrainStateOwnershipGate",
         "tests/unit/test_checkpoint_security.py::TestManagerLoadRejectsForeignCheckpoint",
         "tests/unit/test_ep_checkpoint.py",
-        "tests/integration/test_checkpoint_roundtrip.py::TestCheckpointRoundtrip",
+        "tests/unit/test_checkpoint.py::TestCheckpointManagerLoad",
         "tests/distributed/test_checkpoint.py"
       ]
     },
@@ -1631,11 +1633,12 @@
       },
       "tests/unit/test_optimizer.py": {
         "classes": [
-          "TestNewtonSchulz(3)",
-          "TestMuon(11)",
+          "TestNewtonSchulz(5)",
+          "TestMuon(29)",
+          "TestMuonRouting(6)",
           "TestAdamW(2)"
         ],
-        "count": 16
+        "count": 42
       },
       "tests/unit/test_eval.py": {
         "classes": [

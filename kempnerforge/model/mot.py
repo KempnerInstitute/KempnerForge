@@ -24,8 +24,10 @@ from typing import cast
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.attention.flex_attention import BlockMask
 
 from kempnerforge.config.schema import ModelConfig
+from kempnerforge.model.masking import flex_attention_fn
 from kempnerforge.model.mlp import build_mlp
 from kempnerforge.model.moe import MoEMLP, build_moe
 from kempnerforge.model.norm import RMSNorm, build_norm
@@ -50,10 +52,11 @@ class MoTAttention(nn.Module):
     operator's contribution to the residual stream is zero at
     construction (warm-start identity).
 
-    Causal mask: a single ``is_causal=True`` over the concatenated
-    sequence. With image-then-text concatenation order this matches
-    Chameleon-style autoregressive multimodal: image attends causally
-    among image; text attends to all earlier image and earlier text.
+    Mask: the one mask from ``kempnerforge.model.masking.build_attention_mask``
+    over the concatenated sequence, or a single ``is_causal=True`` when there
+    is none. With image-then-text concatenation order the causal mask matches
+    Chameleon-style autoregressive multimodal: image attends causally among
+    image; text attends to all earlier image and earlier text.
     """
 
     def __init__(
@@ -112,9 +115,10 @@ class MoTAttention(nn.Module):
         streams: dict[str, torch.Tensor],
         rope: dict[str, tuple[torch.Tensor, torch.Tensor]],
         is_causal: bool = True,
-        key_padding_mask: torch.Tensor | None = None,
+        *,
+        attn_mask: torch.Tensor | BlockMask | None = None,
     ) -> dict[str, torch.Tensor]:
-        """Run per-modality projections, global SDPA, per-modality output.
+        """Run per-modality projections, global attention, per-modality output.
 
         Args:
             streams: per-modality input. Keys must equal the
@@ -126,11 +130,13 @@ class MoTAttention(nn.Module):
                 within that modality's axis.
             is_causal: passed through to
                 ``F.scaled_dot_product_attention`` (used only when
-                ``key_padding_mask`` is None).
-            key_padding_mask: Optional ``(B, S)`` bool over the concatenated
-                ``[image | text]`` sequence; ``True`` = attend. When given,
-                builds an explicit causal-AND-valid mask (dropping padded video
-                frames' visual tokens) instead of the ``is_causal`` fast path.
+                ``attn_mask`` is None).
+            attn_mask: The mask from
+                ``kempnerforge.model.masking.build_attention_mask`` over the
+                sequence concatenated in construction-time modality order: a
+                FlexAttention ``BlockMask``, a dense bool tensor broadcastable
+                to (batch, n_heads, seq, seq) where ``True`` = attend, or
+                ``None`` for the ``is_causal`` path.
 
         Returns:
             per-modality output of shape ``(batch, seq_m, dim)``.
@@ -176,16 +182,20 @@ class MoTAttention(nn.Module):
         k = torch.cat(ks, dim=2)
         v = torch.cat(vs, dim=2)
 
-        if self.n_rep > 1:
+        if self.n_rep > 1 and not isinstance(attn_mask, BlockMask):
             k = k.repeat_interleave(self.n_rep, dim=1)
             v = v.repeat_interleave(self.n_rep, dim=1)
 
-        if key_padding_mask is not None:
-            total_seq = q.shape[2]
-            causal = torch.ones(total_seq, total_seq, dtype=torch.bool, device=q.device).tril()
-            kv = key_padding_mask.view(batch, 1, 1, total_seq)
-            attn_mask = causal.unsqueeze(0).unsqueeze(0) & kv
-            attn_mask = attn_mask | ~attn_mask.any(dim=-1, keepdim=True)
+        if isinstance(attn_mask, BlockMask):
+            out = flex_attention_fn(q.is_cuda)(
+                q,
+                k,
+                v,
+                block_mask=attn_mask,
+                scale=self.head_dim**-0.5,
+                enable_gqa=self.n_rep > 1,
+            )
+        elif attn_mask is not None:
             out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         else:
             out = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
@@ -304,15 +314,28 @@ class MoTBlock(nn.Module):
         self,
         streams: dict[str, torch.Tensor],
         rope: dict[str, tuple[torch.Tensor, torch.Tensor]],
-        key_padding_mask: torch.Tensor | None = None,
+        *,
+        attn_mask: torch.Tensor | BlockMask | None = None,
     ) -> dict[str, torch.Tensor]:
+        """Run per-modality norms, the global MoT attention and per-modality FFNs.
+
+        Args:
+            streams: Per-modality residual streams, each ``(batch, seq_m, dim)``.
+            rope: Per-modality ``(cos, sin)`` RoPE tables.
+            attn_mask: The one mask from
+                ``kempnerforge.model.masking.build_attention_mask``, built once
+                per forward and shared by every block.
+
+        Returns:
+            The updated per-modality streams, each ``(batch, seq_m, dim)``.
+        """
         if set(streams.keys()) != set(self.modalities):
             raise ValueError(
                 f"MoTBlock.forward: streams keys {sorted(streams.keys())} "
                 f"do not match construction-time modalities {sorted(self.modalities)}"
             )
         normed_attn = {m: self.attn_norm[m](streams[m]) for m in self.modalities}
-        attn_out = self.attn(normed_attn, rope, is_causal=True, key_padding_mask=key_padding_mask)
+        attn_out = self.attn(normed_attn, rope, is_causal=True, attn_mask=attn_mask)
         post_attn = {m: streams[m] + attn_out[m] for m in self.modalities}
         normed_mlp = {m: self.mlp_norm[m](post_attn[m]) for m in self.modalities}
         mlp_out = {m: self.mlp[m](normed_mlp[m]) for m in self.modalities}

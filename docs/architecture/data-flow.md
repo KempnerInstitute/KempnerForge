@@ -24,7 +24,8 @@ for micro_step in range(grad_accum_steps):       ── maybe_no_sync sets
     └─ (loss / grad_accum_steps).backward()       ── gradient accumulation
 
 grad_norm = clip_grad_norm_(model, grad_clip_norm)
-if NaN: zero_grad, skip, maybe stop
+if NaN: zero_grad, maybe stop, skip the update; still run scheduler.step(),
+        freeze stages / phases and the shutdown check
 optimizer.step() ; scheduler.step() ; optimizer.zero_grad()
 
 tracker.end_step(step, loss, grad_norm, lr, tokens_in_step)
@@ -50,8 +51,9 @@ initializes the collaborators:
   preemption.
 - **`NaNDetector`** from
   [`kempnerforge.resilience.health`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/resilience/health.py)
-  — tracks consecutive NaN steps; `action="warn"` by default, escalates
-  to rollback after `max_consecutive=10`.
+  — tracks consecutive NaN steps; `action="warn"` by default. After
+  `max_consecutive=10` in a row it sets `should_rollback` and the loop
+  stops; rolling back is manual.
 - **Loss function** from the registry (`"cross_entropy"` or
   `"chunked_cross_entropy"`).
 - **Model** via `build_parallel_model` — applies the full parallelism
@@ -62,10 +64,10 @@ initializes the collaborators:
   — owns DCP async save/load, latest-symlink, step_N directories.
 - **`resolve_resume_path(config.checkpoint.dir)`** from
   [`kempnerforge.resilience.elastic`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/resilience/elastic.py)
-  — follows the `latest` symlink or picks the highest `step_N`. If
-  non-`None`, `ckpt_mgr.load(resume_path)` restores model, optimizer,
-  scheduler, dataloader position, and RNG state before the loop
-  starts.
+  — follows the `latest` symlink or picks the newest `step_N` whose
+  save completed. If non-`None`, `ckpt_mgr.load(resume_path)` restores
+  model, optimizer, scheduler, dataloader position, and RNG state
+  before the loop starts.
 - **`MetricsTracker`** from
   [`kempnerforge.metrics.tracker`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/metrics/tracker.py)
   — per-step metrics + EMA smoothing + WandB / TensorBoard backends.
@@ -167,8 +169,18 @@ After the microbatch loop:
 ```python
 grad_norm = clip_grad_norm_(model, tc.grad_clip_norm)
 
-if not nan_detector.check_loss(avg_loss, step):
-    optimizer.zero_grad(); step += 1; continue   # skip this step
+if not nan_detector.check_loss(avg_loss, step, grad_norm=grad_norm):
+    optimizer.zero_grad()
+    if nan_detector.should_rollback:
+        break
+    _advance_lr_schedule(session)            # scheduler.step() + phase LR scaling
+    step += 1
+    _apply_step_transitions(session, step)   # freeze stages, then phases (section 9)
+    if _shutdown_if_requested(               # saves only finite weights (section 11)
+        session, step, tokens_seen, saved_this_step=False, nan_skipped=True
+    ):
+        break
+    continue                                 # no update, token count, metrics or hooks
 
 optimizer.step()
 scheduler.step()
@@ -180,9 +192,19 @@ optimizer.zero_grad()
 `clip_grad_norm_` wraps PyTorch's utility so it works with FSDP2 sharded
 parameters. Under pipeline parallelism `pipeline_step` also passes the PP
 group, so the norm covers every stage rather than this rank's own. The NaN
-detector returns `False` on NaN/Inf loss, zeroes
-the grads, and (after `max_consecutive`) signals a rollback to the
-previous checkpoint.
+detector returns `False` on a NaN/Inf loss or gradient norm, and the loop
+zeroes the grads.
+After `max_consecutive` NaN steps in a row the detector sets
+`should_rollback` and the loop stops; rolling back to an earlier
+checkpoint is manual (see
+[NaN detection](../resilience/nan-detection.md#rollback-recommendation)).
+
+A skipped step still counts as a step (section 8): it advances the LR
+schedule, applies the freeze stages and the phases (section 9) due at
+the new step, and runs the shutdown check (section 11), so all three
+stay on the step counter. It skips the update, the token count
+(section 8), metrics and hooks (section 10), and the rest of the
+periodic work in section 11.
 
 Phase LR scaling applies *after* the scheduler — it multiplies the base
 LR that `scheduler.step()` just computed.
@@ -237,7 +259,13 @@ In order:
 - **Graceful shutdown** — if SIGTERM/SIGUSR1 fired,
   `ckpt_mgr.save(step)` as the emergency checkpoint, then exit; a step
   the checkpoint above already saved is not saved again, and the loop
-  waits for that save before it finishes the shutdown.
+  waits for that save before it finishes the shutdown. A NaN-skipped
+  step (section 7) runs this check too; the checkpoint above never
+  saves such a step, so it writes its own emergency checkpoint, but
+  only if an all-reduced check finds every rank's parameters finite.
+  After a bad update (an optimizer step that passed the NaN check) they
+  are not, and the shutdown logs an ERROR and saves nothing (see
+  [NaN detection § A shutdown after a bad update](../resilience/nan-detection.md#a-shutdown-after-a-bad-update)).
 
 ## Shutdown
 

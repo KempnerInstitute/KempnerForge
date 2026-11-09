@@ -93,16 +93,18 @@ before RoPE. Stabilizes attention logits at scale (Gemma, DeepSeek-V3).
 
 ### Three attention paths
 
-1. **Packed sequences** (`doc_ids` passed in): a block-diagonal causal
-   mask isolates documents within one packed sequence. Built from
-   `doc_ids.unsqueeze(2) == doc_ids.unsqueeze(1)` intersected with the
-   causal triangle, then passed to
-   `F.scaled_dot_product_attention(..., attn_mask=...)`.
-2. **Standard causal** (training and prefill, no `doc_ids`): SDPA with
+1. **Masked** (packed `doc_ids`, visibility groups or a key padding mask passed
+   to the model): `kempnerforge.model.masking.build_attention_mask` combines
+   document isolation, bidirectional visibility groups and key validity into one
+   mask, built once per forward at the Transformer or pipeline-stage boundary in
+   the form the configured backend consumes (a dense boolean mask for SDPA, a
+   `BlockMask` for flex). Every block receives it as `attn_mask`.
+2. **Standard causal** (training and prefill, no mask inputs): SDPA with
    `is_causal=True`.
-3. **Single-token decode** (`seq_len == 1` with a KV cache): no mask —
-   the query attends to all cached positions. `is_causal=True` here
-   would incorrectly restrict attention to only the first key.
+3. **Single-token decode** (`seq_len == 1` with a KV cache): no mask, so the
+   query attends to all cached positions. `is_causal=True` here would
+   incorrectly restrict attention to only the first key. Mask inputs are
+   refused together with a KV cache.
 
 A fourth, slower path fires only when `capture_attention_weights=True`:
 `_attention_with_weights` computes `softmax(Q·Kᵀ / √d)` manually so
@@ -184,7 +186,7 @@ One block's `forward` is five lines:
 
 ```python
 x = x + self.attention(self.attention_norm(x), rope_cos, rope_sin,
-                       kv_cache=kv_cache, doc_ids=doc_ids)
+                       kv_cache=kv_cache, attn_mask=attn_mask)
 x = x + self.mlp(self.mlp_norm(x))
 return x
 ```
@@ -203,6 +205,17 @@ Pre-norm + residual, both for attention and for MLP. No
 - `output_head` (optional)
 - `_rope_cos`, `_rope_sin` — precomputed frequency tables stored as plain
   attributes (not buffers) so `model.to(bf16)` doesn't cast them to bf16
+
+The embedding and the head are constructor knobs, not config fields:
+`Transformer(config, include_token_embedding=False)` or
+`include_output_head=False` builds the model without that module, so the
+attribute is `None` and its state-dict keys never exist. Without the
+embedding, pass pre-embedded inputs through
+`ModalityContext(inputs_embeds=...)` (`tokens` raises); without the head,
+`forward` returns the final hidden states. `tie_embeddings=True` with
+either module omitted raises `ValueError`. So does `generate()`, and tensor
+parallelism is not supported for such a model (`apply_tensor_parallel`
+raises).
 
 Extra helpers on `Transformer`:
 

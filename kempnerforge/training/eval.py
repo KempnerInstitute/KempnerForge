@@ -49,6 +49,7 @@ def run_eval(
     pp_rank: int | None = None,
     pp_size: int | None = None,
     pp_group=None,
+    pp_n_microbatches: int | None = None,
 ) -> dict[str, float]:
     """Run evaluation and return metrics.
 
@@ -58,41 +59,56 @@ def run_eval(
         loss_fn: Loss function (logits, labels) -> scalar tensor.
         device: Device to move batches to.
         eval_steps: Number of eval batches to process.
-        pp_schedule: Pipeline parallel schedule (None for non-PP).
+        pp_schedule: Pipeline parallel schedule (None for non-PP). It is the training
+            schedule, run forward-only through its ``eval()``. Its gradient reduction still
+            runs after each call, with its gradient scaling off, so gradients left on the
+            stage keep their values.
         pp_rank: This rank's PP stage index.
         pp_size: Total number of PP stages.
         pp_group: Process group for PP loss broadcast.
+        pp_n_microbatches: Microbatches per call of ``pp_schedule``. The batches go
+            through it this many at a time, so each microbatch has the shape the
+            stages were built for; ``eval_steps`` must be a multiple of it. None
+            sends all ``eval_steps`` batches in one call.
 
     Returns:
         Dict with "eval/loss" and "eval/perplexity".
+
+    Raises:
+        ValueError: Under PP, ``eval_steps`` is not a multiple of
+            ``pp_n_microbatches``, or ``eval_dataloader`` yields no batch.
     """
     model.eval()
 
     if pp_schedule is not None:
-        input_ids_list, labels_list = [], []
-        eval_iter = iter(eval_dataloader)
-        for _ in range(eval_steps):
-            try:
-                batch = next(eval_iter)
-            except StopIteration:
-                eval_iter = iter(eval_dataloader)
-                batch = next(eval_iter)
-            input_ids_list.append(batch["input_ids"].to(device))
-            labels_list.append(batch["labels"].to(device))
-
-        full_input = torch.cat(input_ids_list, dim=0)
-        full_labels = torch.cat(labels_list, dim=0)
-
+        n_microbatches = pp_n_microbatches or eval_steps
+        if eval_steps % n_microbatches:
+            raise ValueError(
+                f"eval_steps ({eval_steps}) must be a multiple of the pipeline schedule's "
+                f"{n_microbatches} microbatches"
+            )
         is_first = pp_rank == 0
         is_last = pp_rank == pp_size - 1  # type: ignore[reportOptionalOperand]
         pp_losses: list[torch.Tensor] = []
+        batches = _cycle(eval_dataloader)
 
-        if is_first:
-            pp_schedule.step(full_input, target=full_labels, losses=pp_losses)
-        elif is_last:
-            pp_schedule.step(target=full_labels, losses=pp_losses)
-        else:
-            pp_schedule.step()
+        scale_grads = pp_schedule.scale_grads
+        pp_schedule.scale_grads = False
+        try:
+            for _ in range(eval_steps // n_microbatches):
+                group = [next(batches) for _ in range(n_microbatches)]
+                full_input = torch.cat([b["input_ids"].to(device) for b in group], dim=0)
+                full_labels = torch.cat([b["labels"].to(device) for b in group], dim=0)
+                call_losses: list[torch.Tensor] = []
+                if is_first:
+                    pp_schedule.eval(full_input, target=full_labels, losses=call_losses)
+                elif is_last:
+                    pp_schedule.eval(target=full_labels, losses=call_losses)
+                else:
+                    pp_schedule.eval()
+                pp_losses.extend(call_losses)
+        finally:
+            pp_schedule.scale_grads = scale_grads
 
         if is_last and pp_losses:
             avg_loss = sum(loss.item() for loss in pp_losses) / len(pp_losses)
@@ -142,3 +158,19 @@ def run_eval(
 
     model.train()
     return {"eval/loss": avg_loss, "eval/perplexity": math.exp(min(avg_loss, 20.0))}
+
+
+def _cycle(dataloader):
+    """Yield the batches of ``dataloader`` over and over, restarting it at each end.
+
+    Raises:
+        ValueError: ``dataloader`` yields no batch, as a ``drop_last`` loader over
+            fewer samples than one batch does.
+    """
+    while True:
+        empty = True
+        for batch in dataloader:
+            empty = False
+            yield batch
+        if empty:
+            raise ValueError("The eval dataloader yields no batch")

@@ -8,6 +8,8 @@ phase — without editing the shared script.
 
 from __future__ import annotations
 
+import contextlib
+import os
 from pathlib import Path
 from typing import cast
 
@@ -21,6 +23,7 @@ from kempnerforge.distributed.parallel import (
     apply_ac,
     apply_float8,
     apply_fsdp2,
+    autocast_dtype,
     build_parallel_model,
     default_mp_policy,
 )
@@ -86,7 +89,7 @@ def build_model(
             frames_per_clip=(config.video.max_frames if config.video is not None else 1),
             ac_mode=tc.activation_checkpointing,
             mp_policy=mp_policy,
-            param_dtype=tc.param_dtype,
+            param_dtype=tc.master_dtype,
             compile_model=tc.compile_model,
             fp8=tc.is_fp8,
         )
@@ -116,12 +119,12 @@ def build_model(
         apply_fsdp2(stage_mod, device_mesh, mp_policy=mp_policy)
         stage_mod.to_empty(device=device)
         stage_mod.init_weights_and_freqs()
-        stage_mod.to(dtype=tc.param_dtype)
+        stage_mod.to(dtype=tc.master_dtype)
     else:
         stage_mod = cast(
             "Transformer",
             build_stage_module(config.model, pp_rank, pp_size).to(
-                device=device, dtype=tc.param_dtype
+                device=device, dtype=tc.master_dtype
             ),
         )
         if tc.is_fp8:
@@ -137,14 +140,21 @@ def build_model(
     n_params = sum(p.numel() for p in model.parameters())
     logger.info(f"Model (PP stage {pp_rank}/{pp_size}): {n_params:,} parameters")
 
-    pp_stage = build_pipeline_stage(
-        model,  # type: ignore[arg-type]
-        device_mesh,
-        device,
-        batch_size=tc.batch_size,
-        seq_len=tc.seq_len,
-        param_dtype=tc.param_dtype,
+    amp_dtype = autocast_dtype(stage_mod, tc.master_dtype, tc.param_dtype)
+    shape_inference_ctx = (
+        torch.autocast(device_type=device.type, dtype=amp_dtype)
+        if amp_dtype is not None
+        else contextlib.nullcontext()
     )
+    with shape_inference_ctx:
+        pp_stage = build_pipeline_stage(
+            model,  # type: ignore[arg-type]
+            device_mesh,
+            device,
+            batch_size=tc.batch_size,
+            seq_len=tc.seq_len,
+            param_dtype=tc.param_dtype if amp_dtype is None else tc.master_dtype,
+        )
     pp_schedule = build_pipeline_schedule(
         stage=pp_stage,
         n_microbatches=tc.grad_accum_steps,
@@ -185,6 +195,41 @@ def build_checkpoint_manager(
     )
 
 
+def _unused_load_path_message(config: JobConfig, resume_path: Path) -> str:
+    """The warning that a resume from ``checkpoint.dir`` wins over ``checkpoint.load_path``."""
+    ckpt = config.checkpoint
+    message = (
+        f"checkpoint.load_path={ckpt.load_path} is not used: checkpoint.dir={ckpt.dir} already "
+        f"has a checkpoint, and resuming {resume_path} takes precedence so that a requeued run "
+        f"continues where it stopped."
+    )
+    if ckpt.exclude_from_loading:
+        message += (
+            f" checkpoint.exclude_from_loading={ckpt.exclude_from_loading} is not applied "
+            f"either: a resume restores full state."
+        )
+    return message + (
+        " To start from load_path instead, for example to roll back to an earlier step, "
+        "set checkpoint.dir to a new, empty directory."
+    )
+
+
+def _load_path_is_the_resume(config: JobConfig, resume_path: Path) -> bool:
+    """Whether ``checkpoint.load_path`` names the resumed checkpoint and excludes nothing.
+
+    The resume then loads what ``load_path`` asks for, so nothing in it goes unused. Both paths
+    go through ``os.path.realpath``, so a relative path or one through ``latest`` compares by
+    its target, and through ``str`` first: the config loader keeps a bare-number ``load_path``
+    such as ``--checkpoint.load_path=5000`` as an int. Unlike ``Path.resolve``,
+    ``os.path.realpath`` does not raise on a symlink loop: only rank 0 runs this, and a raise
+    here would leave the other ranks waiting in the load's broadcast.
+    """
+    ckpt = config.checkpoint
+    if not ckpt.load_path or ckpt.exclude_from_loading:
+        return False
+    return os.path.realpath(str(ckpt.load_path)) == os.path.realpath(str(resume_path))
+
+
 def restore_checkpoint(
     config: JobConfig,
     model: torch.nn.Module,
@@ -196,6 +241,11 @@ def restore_checkpoint(
     Returns ``(step, tokens_seen)`` — ``(0, 0)`` when there is nothing to
     resume from. Also restores the metrics run ids, runs the MoT warm-start
     hook, and re-applies the effective freeze at the resumed step.
+
+    A checkpoint in ``checkpoint.dir`` takes precedence over ``checkpoint.load_path``, so a
+    requeued warm start resumes rather than starting over; rank 0 then warns that
+    ``load_path`` is not used, naming both paths, unless ``load_path`` names the resumed
+    checkpoint and excludes nothing.
     """
     num_stages = config.distributed.pp if config.distributed.pp > 1 else None
     if dist.is_initialized():
@@ -210,6 +260,14 @@ def restore_checkpoint(
         resume_path = resolve_resume_path(config.checkpoint.dir, num_stages)
     if not resume_path and not config.checkpoint.load_path:
         return 0, 0
+    rank_zero = not dist.is_initialized() or dist.get_rank() == 0
+    if (
+        resume_path
+        and config.checkpoint.load_path
+        and rank_zero
+        and not _load_path_is_the_resume(config, resume_path)
+    ):
+        logger.warning(_unused_load_path_message(config, resume_path))
 
     vlm_cfg = config.vlm
     vlm_freeze_expected = None
@@ -260,7 +318,9 @@ def run_training(
 
     ``step_fn`` and ``hooks`` let an experiment own the step body or register
     hooks without copying the build phases. Both default to what
-    ``scripts/train.py`` uses.
+    ``scripts/train.py`` uses. A custom ``step_fn`` must run its forward and
+    loss under ``session.autocast()``, which casts fp32 master weights to the
+    compute dtype when no FSDP2 wrap does (one GPU, a pp-only mesh).
     """
     runtime = setup_distributed(config)
     tracker: MetricsTracker | None = None
@@ -272,6 +332,12 @@ def run_training(
 
         loss_fn = build_loss_fn(config.train)
         model, pipeline = build_model(config, runtime, loss_fn)
+        amp_dtype = autocast_dtype(model, config.train.master_dtype, config.train.param_dtype)
+        if amp_dtype is not None:
+            logger.info(
+                f"No FSDP2 wrap casts the {config.train.master_dtype} master weights: "
+                f"forward passes run under torch.autocast({amp_dtype})"
+            )
 
         optimizer = build_optimizer(model, config.optimizer)
         scheduler = build_scheduler(optimizer, config.scheduler, max_steps=config.train.max_steps)
@@ -311,6 +377,7 @@ def run_training(
             pipeline=pipeline,
             eval_dataloader=eval_dataloader,
             profiler=prof,
+            autocast_dtype=amp_dtype,
         )
 
         run_training_loop(session, step=step, tokens_seen=tokens_seen)

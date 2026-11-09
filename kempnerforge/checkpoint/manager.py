@@ -199,6 +199,43 @@ def _holds_optimizer(saved_keys: Iterable[str]) -> bool:
     return any(key == "optimizer" or key.startswith(_OPTIM_PREFIX) for key in saved_keys)
 
 
+def missing_train_state(ckpt_dir: Path) -> bool:
+    """Whether checkpoint ``ckpt_dir`` holds optimizer state but no ``train_state.pt``.
+
+    ``save()`` writes ``train_state.pt`` with the DCP shards (after them in a synchronous save,
+    while an async save's shards still flush), so such a checkpoint is a save that stopped
+    before both were written, or one that lost the file, and ``load()`` refuses to
+    resume it. A checkpoint without optimizer state, such as an ``hf-to-dcp`` import, needs no
+    ``train_state.pt``. The DCP ``.metadata`` of ``ckpt_dir``, or of each ``pp{k}`` stage, is
+    read only when the file is absent. One that cannot be read is logged and counted as holding
+    no optimizer state, which leaves the load to report it.
+    """
+    if (ckpt_dir / _TRAIN_STATE_FILE).exists():
+        return False
+    if (ckpt_dir / _DCP_METADATA_FILE).exists():
+        dcp_dirs = [ckpt_dir]
+    elif ckpt_dir.is_dir():
+        dcp_dirs = sorted(
+            d
+            for d in ckpt_dir.iterdir()
+            if d.is_dir() and d.name.startswith("pp") and (d / _DCP_METADATA_FILE).exists()
+        )
+    else:
+        return False
+    for dcp_dir in dcp_dirs:
+        try:
+            saved_keys = dcp.FileSystemReader(str(dcp_dir)).read_metadata().state_dict_metadata
+        except Exception as e:
+            logger.warning(
+                f"Could not read {dcp_dir / _DCP_METADATA_FILE} to tell whether it holds "
+                f"optimizer state: {e}"
+            )
+            continue
+        if _holds_optimizer(saved_keys):
+            return True
+    return False
+
+
 def _dcp_keys(dcp_dir: Path) -> dict[str, Any]:
     """Return the keys the DCP index in ``dcp_dir`` lists, each with its storage metadata."""
     return dcp.FileSystemReader(str(dcp_dir)).read_metadata().state_dict_metadata
@@ -284,6 +321,38 @@ def _restore_never_stepped(
             f"the saved optimizer did not hold: {unheld[:8]}"
         )
     optim_state["state"].update({fqn: {} for fqn in never_stepped})
+
+
+def _check_saved_state_matches(
+    optim_state: dict[str, Any], saved_keys: Iterable[str], where: Path
+) -> None:
+    """Fail if a parameter was saved with another optimizer's state than the one it now has."""
+    kept = {fqn: set(state) for fqn, state in optim_state["state"].items()}
+    saved: dict[str, set[str]] = {}
+    for key in saved_keys:
+        if not key.startswith(_OPTIM_STATE_PREFIX):
+            continue
+        name = key.removeprefix(_OPTIM_STATE_PREFIX)
+        fqn = name
+        while fqn and fqn not in kept:
+            fqn = fqn.rpartition(".")[0]
+        if fqn:
+            saved.setdefault(fqn, set()).add(name.removeprefix(f"{fqn}.").split(".", 1)[0])
+    moved = sorted(
+        fqn for fqn, entries in saved.items() if entries - kept[fqn] and kept[fqn] - entries
+    )
+    if moved:
+        first = moved[0]
+        raise RuntimeError(
+            f"{where} holds another optimizer's state for {len(moved)} parameters: "
+            f"{moved[:8]}. {first} was saved with "
+            f"{sorted(saved[first])} and is now kept with {sorted(kept[first])}: its optimizer "
+            "changed since the save, e.g. optimizer.name or optimizer.muon_router changed, "
+            "or Muon used to orthogonalize it before it routed parameters by module. "
+            "To continue from these weights with a fresh optimizer, set "
+            "checkpoint.load_path to this checkpoint and checkpoint.exclude_from_loading = "
+            '["optimizer"], with a checkpoint.dir that holds no checkpoint yet.'
+        )
 
 
 def _load_train_state(path: Path) -> dict[str, Any]:
@@ -435,6 +504,7 @@ class CheckpointManager:
         self._weight_decay_scope = weight_decay_scope
         self._pending_dataloader_state: dict[str, Any] | None = None
         self._pending_finalize: tuple[int, Path] | None = None
+        self._inflight_dir: Path | None = None
         self._tracking_source: TrackingSource | None = None
         self._registrar: CheckpointRegistrar | None = None
         self._sidecar_lock = threading.Lock()
@@ -725,6 +795,7 @@ class CheckpointManager:
         ckpt_dir = self._checkpoint_dir(step)
 
         ckpt_dir.mkdir(parents=True, exist_ok=True)
+        self._inflight_dir = ckpt_dir
 
         dcp_dir = ckpt_dir / f"pp{self._pp_rank}" if self._pp_rank is not None else ckpt_dir
         dcp_dir.mkdir(parents=True, exist_ok=True)
@@ -876,6 +947,11 @@ class CheckpointManager:
         Returns:
             Tuple of (step, tokens_seen, extra) where extra contains any
             additional keys saved via ``build_train_state(extra=...)``.
+
+        Raises:
+            FileNotFoundError: No checkpoint resolves although one was named, or the
+                checkpoint holds optimizer state that this load restores but has no
+                ``train_state.pt``. Raised before any state is loaded.
         """
         ckpt_dir = self._resolve_load_path(path)
         if ckpt_dir is None:
@@ -946,6 +1022,19 @@ class CheckpointManager:
         if fresh_optimizer:
             load_optim = False
 
+        train_state_path = ckpt_dir / _TRAIN_STATE_FILE
+        train_state_exists = self._train_state_exists(train_state_path)
+        if load_optim and not train_state_exists:
+            raise FileNotFoundError(
+                f"Cannot resume {ckpt_dir}: it holds optimizer state but no {_TRAIN_STATE_FILE}, "
+                f"so loading it would continue its weights and optimizer moments from step 0 and "
+                f"restart the LR schedule and the data stream. Its save stopped before writing "
+                f"{_TRAIN_STATE_FILE}, or the file was lost. Restore the file, or set a new "
+                f"checkpoint.dir with checkpoint.load_path pointing at an earlier complete "
+                f"step_N to resume from it, or at this checkpoint with "
+                f'checkpoint.exclude_from_loading = ["optimizer"] to start from its weights alone.'
+            )
+
         dcp_state: dict[str, Any] = {}
         optimizers = self._optimizers_saved_in(dcp_dir, saved_keys) if load_optim else []
         if load_model:
@@ -958,6 +1047,7 @@ class CheckpointManager:
                     f"{dcp_dir} is missing optimizer param-group keys {sorted(filled)}; "
                     f"resuming with {filled}"
                 )
+            _check_saved_state_matches(dcp_state["optimizer"], saved_keys, dcp_dir)
 
         if dcp_state:
             dcp_state, layout = self._present_experts(dcp_state, dcp_dir, saved_keys)
@@ -989,14 +1079,6 @@ class CheckpointManager:
             for optimizer in self.checkpointed_optimizers:
                 _reset_to_fresh(optimizer)
 
-        train_state_path = ckpt_dir / _TRAIN_STATE_FILE
-        if dist.is_initialized():
-            exists_flag = [train_state_path.exists() if self._rank == 0 else False]
-            dist.broadcast_object_list(exists_flag, src=0)
-            train_state_exists = bool(exists_flag[0])
-        else:
-            train_state_exists = train_state_path.exists()
-
         if train_state_exists:
             train_state = (
                 _load_train_state(train_state_path)
@@ -1020,6 +1102,10 @@ class CheckpointManager:
             logger.info(f"Resumed from step {step}, {tokens_seen:,} tokens seen")
         else:
             step, tokens_seen, extra = 0, 0, {}
+            logger.info(
+                f"{ckpt_dir} has no {_TRAIN_STATE_FILE}; the step counter, token count, LR "
+                f"schedule, data position and RNG state start fresh at step 0"
+            )
 
         if fresh_optimizer and step > 0:
             logger.warning(
@@ -1030,6 +1116,19 @@ class CheckpointManager:
         elif fresh_optimizer:
             logger.info(f"{dcp_dir} holds no optimizer state; the optimizer starts fresh")
         return step, tokens_seen, extra
+
+    def _train_state_exists(self, path: Path) -> bool:
+        """Whether ``path`` exists, as rank 0 sees it, on every rank.
+
+        On NFS/Lustre independent stat() calls can disagree briefly across ranks. Ranks that
+        disagree take different branches of ``load()``: some raise or skip the train state while
+        the others wait in its broadcast and hang. Rank 0 checks, and its answer is broadcast.
+        """
+        if not dist.is_initialized():
+            return path.exists()
+        exists_flag = [path.exists() if self._rank == 0 else False]
+        dist.broadcast_object_list(exists_flag, src=0)
+        return bool(exists_flag[0])
 
     def _read_saved_keys(self, ckpt_dir: Path, dcp_dir: Path) -> dict[str, Any]:
         """Return the keys this rank's DCP index lists: ``dcp_dir``, its part of ``ckpt_dir``.
@@ -1224,12 +1323,16 @@ class CheckpointManager:
     def _cleanup(self) -> None:
         """Remove old checkpoints beyond the retention limit.
 
-        Never removed regardless of retention: the current ``latest`` target
-        and the in-flight async checkpoint (``_pending_finalize``) — pruning
-        either would let a crash strand resume with no loadable checkpoint —
-        and any dynamic-window milestone (``CheckpointConfig.is_dynamic_milestone``),
-        so the dense early-dynamics checkpoints survive even with a finite
-        ``keep_last_n``.
+        Never removed regardless of retention: the current ``latest`` target,
+        the directory the last ``save()`` writes into (``_inflight_dir``), whose
+        async flush may still be running, a deferred async checkpoint
+        (``_pending_finalize``), and any dynamic-window milestone
+        (``CheckpointConfig.is_dynamic_milestone``), so the dense early-dynamics
+        checkpoints survive even with a finite ``keep_last_n``. A save drains
+        ``_pending_finalize``, which runs this cleanup, only after its own
+        flush is dispatched, so ``_inflight_dir`` is what keeps a checkpoint
+        that is not among the newest, as after a rewind, from being deleted
+        while it is written.
         """
         keep = self.config.keep_last_n
         if keep <= 0:
@@ -1246,6 +1349,8 @@ class CheckpointManager:
             protected.add(latest.resolve())
         if self._pending_finalize is not None:
             protected.add(self._pending_finalize[1].resolve())
+        if self._inflight_dir is not None:
+            protected.add(self._inflight_dir.resolve())
 
         for d in ckpt_dirs:
             if self.config.is_dynamic_milestone(int(d.name.split("_")[1])):
