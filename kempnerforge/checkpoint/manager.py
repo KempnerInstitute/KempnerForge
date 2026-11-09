@@ -194,6 +194,43 @@ def _holds_optimizer(saved_keys: Iterable[str]) -> bool:
     return any(key == "optimizer" or key.startswith(_OPTIM_PREFIX) for key in saved_keys)
 
 
+def missing_train_state(ckpt_dir: Path) -> bool:
+    """Whether checkpoint ``ckpt_dir`` holds optimizer state but no ``train_state.pt``.
+
+    ``save()`` writes ``train_state.pt`` with the DCP shards (after them in a synchronous save,
+    while an async save's shards still flush), so such a checkpoint is a save that stopped
+    before both were written, or one that lost the file, and ``load()`` refuses to
+    resume it. A checkpoint without optimizer state, such as an ``hf-to-dcp`` import, needs no
+    ``train_state.pt``. The DCP ``.metadata`` of ``ckpt_dir``, or of each ``pp{k}`` stage, is
+    read only when the file is absent. One that cannot be read is logged and counted as holding
+    no optimizer state, which leaves the load to report it.
+    """
+    if (ckpt_dir / _TRAIN_STATE_FILE).exists():
+        return False
+    if (ckpt_dir / _DCP_METADATA_FILE).exists():
+        dcp_dirs = [ckpt_dir]
+    elif ckpt_dir.is_dir():
+        dcp_dirs = sorted(
+            d
+            for d in ckpt_dir.iterdir()
+            if d.is_dir() and d.name.startswith("pp") and (d / _DCP_METADATA_FILE).exists()
+        )
+    else:
+        return False
+    for dcp_dir in dcp_dirs:
+        try:
+            saved_keys = dcp.FileSystemReader(str(dcp_dir)).read_metadata().state_dict_metadata
+        except Exception as e:
+            logger.warning(
+                f"Could not read {dcp_dir / _DCP_METADATA_FILE} to tell whether it holds "
+                f"optimizer state: {e}"
+            )
+            continue
+        if _holds_optimizer(saved_keys):
+            return True
+    return False
+
+
 def _dcp_keys(dcp_dir: Path) -> dict[str, Any]:
     """Return the keys the DCP index in ``dcp_dir`` lists, each with its storage metadata."""
     return dcp.FileSystemReader(str(dcp_dir)).read_metadata().state_dict_metadata
@@ -869,6 +906,11 @@ class CheckpointManager:
         Returns:
             Tuple of (step, tokens_seen, extra) where extra contains any
             additional keys saved via ``build_train_state(extra=...)``.
+
+        Raises:
+            FileNotFoundError: No checkpoint resolves although one was named, or the
+                checkpoint holds optimizer state that this load restores but has no
+                ``train_state.pt``. Raised before any state is loaded.
         """
         if exclude_keys is not None:
             validate_exclude_keys(exclude_keys, "exclude_keys")
@@ -942,6 +984,19 @@ class CheckpointManager:
         if fresh_optimizer:
             load_optim = False
 
+        train_state_path = ckpt_dir / _TRAIN_STATE_FILE
+        train_state_exists = load_train_state and self._train_state_exists(train_state_path)
+        if load_optim and not train_state_exists:
+            raise FileNotFoundError(
+                f"Cannot resume {ckpt_dir}: it holds optimizer state but no {_TRAIN_STATE_FILE}, "
+                f"so loading it would continue its weights and optimizer moments from step 0 and "
+                f"restart the LR schedule and the data stream. Its save stopped before writing "
+                f"{_TRAIN_STATE_FILE}, or the file was lost. Restore the file, or set a new "
+                f"checkpoint.dir with checkpoint.load_path pointing at an earlier complete "
+                f"step_N to resume from it, or at this checkpoint with "
+                f'checkpoint.exclude_from_loading = ["optimizer"] to start from its weights alone.'
+            )
+
         dcp_state: dict[str, Any] = {}
         optimizers = self._optimizers_saved_in(dcp_dir, saved_keys) if load_optim else []
         if load_model:
@@ -983,14 +1038,13 @@ class CheckpointManager:
             for optimizer in self.checkpointed_optimizers:
                 _reset_to_fresh(optimizer)
 
-        train_state_path = ckpt_dir / _TRAIN_STATE_FILE
         if not load_train_state:
             logger.info(
                 f"Weights-only warm start from {ckpt_dir}: its step, schedule, data position "
                 "and RNG are not restored, and its freeze metadata is not compared"
             )
             step, tokens_seen, extra = 0, 0, {}
-        elif self._train_state_exists(train_state_path):
+        elif train_state_exists:
             train_state = (
                 _load_train_state(train_state_path)
                 if self._rank == 0 or not dist.is_initialized()
@@ -1013,6 +1067,10 @@ class CheckpointManager:
             logger.info(f"Resumed from step {step}, {tokens_seen:,} tokens seen")
         else:
             step, tokens_seen, extra = 0, 0, {}
+            logger.info(
+                f"{ckpt_dir} has no {_TRAIN_STATE_FILE}; the step counter, token count, LR "
+                f"schedule, data position and RNG state start fresh at step 0"
+            )
 
         if fresh_optimizer and step > 0:
             logger.warning(
@@ -1023,6 +1081,19 @@ class CheckpointManager:
         elif fresh_optimizer:
             logger.info(f"{dcp_dir} holds no optimizer state; the optimizer starts fresh")
         return step, tokens_seen, extra
+
+    def _train_state_exists(self, path: Path) -> bool:
+        """Whether ``path`` exists, as rank 0 sees it, on every rank.
+
+        On NFS/Lustre independent stat() calls can disagree briefly across ranks. Ranks that
+        disagree take different branches of ``load()``: some raise or skip the train state while
+        the others wait in its broadcast and hang. Rank 0 checks, and its answer is broadcast.
+        """
+        if not dist.is_initialized():
+            return path.exists()
+        exists_flag = [path.exists() if self._rank == 0 else False]
+        dist.broadcast_object_list(exists_flag, src=0)
+        return bool(exists_flag[0])
 
     def _read_saved_keys(self, ckpt_dir: Path, dcp_dir: Path) -> dict[str, Any]:
         """Return the keys this rank's DCP index lists: ``dcp_dir``, its part of ``ckpt_dir``.
@@ -1109,14 +1180,6 @@ class CheckpointManager:
                 f"that holds no checkpoint, since training auto-resumes from a checkpoint "
                 f"there in place of load_path, optimizer state included."
             )
-
-    def _train_state_exists(self, train_state_path: Path) -> bool:
-        """Whether rank 0 sees ``train_state.pt``, agreed on every rank."""
-        if not dist.is_initialized():
-            return train_state_path.exists()
-        exists_flag = [train_state_path.exists() if self._rank == 0 else False]
-        dist.broadcast_object_list(exists_flag, src=0)
-        return bool(exists_flag[0])
 
     def apply_dataloader_state(self, dataloader: Any) -> None:
         """Apply any dataloader state stashed during load().
