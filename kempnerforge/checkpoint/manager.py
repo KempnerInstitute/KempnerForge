@@ -9,6 +9,7 @@ separately as a torch file and broadcast from rank 0 on load.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -17,7 +18,7 @@ import shutil
 import stat
 import threading
 import uuid
-from collections.abc import Callable, Container, Iterable
+from collections.abc import Callable, Container, Iterable, Iterator
 from functools import partial
 from pathlib import Path
 from typing import Any, Protocol, TypeGuard, cast
@@ -262,6 +263,28 @@ def _read_weight_decay_scope(ckpt_dir: Path) -> str:
             f"{WEIGHT_DECAY_SCOPES}"
         )
     return scope
+
+
+@contextlib.contextmanager
+def _evaluation_point(optimizer: torch.optim.Optimizer) -> Iterator[None]:
+    """Hold the parameters at ``optimizer``'s evaluation point inside the block.
+
+    An optimizer that evaluates at another point than it trains at, as schedule-free AdamW
+    does, has ``eval_params`` and ``train_params``: the block runs between them, and the
+    parameters leave it at the training point again, bit for bit. Any other optimizer
+    leaves them as they are. ``kempnerforge.training.optimizer.evaluation_point`` does the
+    same for the training loop; importing it here would close an import cycle.
+    """
+    to_eval = getattr(optimizer, "eval_params", None)
+    to_train = getattr(optimizer, "train_params", None)
+    if to_eval is None or to_train is None:
+        yield
+        return
+    to_eval()
+    try:
+        yield
+    finally:
+        to_train()
 
 
 def _reset_to_fresh(optimizer: torch.optim.Optimizer) -> None:
@@ -759,6 +782,11 @@ class CheckpointManager:
     ) -> None:
         """Save a checkpoint at the given step.
 
+        An optimizer that evaluates at another point than it trains at, as schedule-free
+        AdamW does, has the model saved at its evaluation point, the averaged weights ``x``,
+        so every reader of the model entry alone gets them; the parameters are back at the
+        training point when this returns, and ``load`` rebuilds that point exactly.
+
         Args:
             step: Current training step.
             tokens_seen: Total tokens processed.
@@ -774,20 +802,21 @@ class CheckpointManager:
         dcp_dir = ckpt_dir / f"pp{self._pp_rank}" if self._pp_rank is not None else ckpt_dir
         dcp_dir.mkdir(parents=True, exist_ok=True)
 
-        dcp_state: dict[str, Any] = {"model": get_model_state_dict(self.model)}
-        if any(optimizer.state for optimizer in self.checkpointed_optimizers):
-            optim_state = get_optimizer_state_dict(self.model, self.checkpointed_optimizers)
-            dcp_state["optimizer"] = optim_state
-            dcp_state[_NEVER_STEPPED_KEY] = _never_stepped_record(optim_state)
-        flush_error = _attempt(self._async_ckpt.wait)
-        error = flush_error
-        if flush_error is None:
-            error = _attempt(
-                self._async_ckpt.save,
-                dcp_state,
-                checkpoint_id=str(dcp_dir),
-                process_group=self._process_group,
-            )
+        with _evaluation_point(self.optimizer):
+            dcp_state: dict[str, Any] = {"model": get_model_state_dict(self.model)}
+            if any(optimizer.state for optimizer in self.checkpointed_optimizers):
+                optim_state = get_optimizer_state_dict(self.model, self.checkpointed_optimizers)
+                dcp_state["optimizer"] = optim_state
+                dcp_state[_NEVER_STEPPED_KEY] = _never_stepped_record(optim_state)
+            flush_error = _attempt(self._async_ckpt.wait)
+            error = flush_error
+            if flush_error is None:
+                error = _attempt(
+                    self._async_ckpt.save,
+                    dcp_state,
+                    checkpoint_id=str(dcp_dir),
+                    process_group=self._process_group,
+                )
 
         sync_mode = self.config.async_mode == AsyncCheckpointMode.disabled
 
@@ -900,6 +929,9 @@ class CheckpointManager:
         vlm_freeze_expected: list[dict[str, Any]] | None = None,
     ) -> tuple[int, int, dict[str, Any]]:
         """Load a checkpoint and restore all state.
+
+        A load that restores optimizer state then calls the optimizer's ``train_params``, if
+        it has one, so a schedule-free run resumes at the training point it was saved at.
 
         Args:
             path: Checkpoint path. If None, loads from ``config.load_path``
@@ -1037,6 +1069,9 @@ class CheckpointManager:
                 set_optimizer_state_dict(
                     self.model, optimizers, optim_state_dict=dcp_state["optimizer"]
                 )
+                to_train = getattr(self.optimizer, "train_params", None)
+                if to_train is not None:
+                    to_train()
             if planner.never_stepped:
                 logger.info(
                     f"{len(planner.never_stepped)} parameters the saved optimizer held were never "

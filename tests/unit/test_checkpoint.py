@@ -3427,6 +3427,48 @@ class TestScheduleFreeCheckpoint:
             opt.step()
             opt.zero_grad()
 
+    @staticmethod
+    def _points(model, opt):
+        y = [p.detach().clone() for p in model.parameters()]
+        x = [opt.state[p]["x"].clone() for p in model.parameters()]
+        assert not all(torch.equal(a, b) for a, b in zip(x, y, strict=True)), "fixture: x == y"
+        return x, y
+
+    @pytest.mark.parametrize("mode", [AsyncCheckpointMode.disabled, AsyncCheckpointMode.async_])
+    def test_the_model_entry_is_x_and_the_run_stays_at_y(self, tmp_path, mode):
+        """``save`` writes x as the model and returns with the parameters at y, bit for bit."""
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        model, opt = self._build(0)
+        self._train(model, opt, 4)
+        x, y = self._points(model, opt)
+        config = CheckpointConfig(dir=str(tmp_path), async_mode=mode)
+        manager = CheckpointManager(config, model, opt)
+        manager.save(step=4)
+        assert all(torch.equal(a, p) for a, p in zip(y, model.parameters(), strict=True))
+        manager.wait()
+
+        torch.manual_seed(5)
+        fresh = Transformer(self.MODEL_CONFIG)
+        dummy = torch.optim.SGD(fresh.parameters(), lr=0.0)
+        CheckpointManager(CheckpointConfig(dir=str(tmp_path)), fresh, dummy).load(
+            exclude_keys=["optimizer"]
+        )
+        assert all(torch.equal(a, p) for a, p in zip(x, fresh.parameters(), strict=True))
+
+    def test_a_resume_puts_the_parameters_back_at_y(self, tmp_path):
+        """Loading the optimizer rebuilds y from z and x, the exact point the run trained at."""
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        model, opt = self._build(0)
+        self._train(model, opt, 4)
+        _, y = self._points(model, opt)
+        CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model, opt).save(step=4)
+
+        model2, opt2 = self._build(1)
+        CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model2, opt2).load()
+        assert all(torch.equal(a, p) for a, p in zip(y, model2.parameters(), strict=True))
+
     def test_a_checkpoint_from_before_the_per_parameter_step_is_refused(self, tmp_path):
         """A checkpoint saved without each parameter's ``step`` cannot continue the run."""
         from kempnerforge.checkpoint.manager import CheckpointManager
