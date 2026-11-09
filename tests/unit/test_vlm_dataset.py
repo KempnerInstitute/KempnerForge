@@ -946,11 +946,11 @@ class TestTextOnlyRows:
             features=Features({"image": Sequence(Image())}),
         )
         assert vlm_dataset._images_per_row(lists, "image").tolist() == [2, 0, 0, 1, 0, 1]
-        pairs = Dataset.from_dict(
-            {"image": [[one, one], [one, None], None]},
-            features=Features({"image": Sequence(Image(), length=2)}),
-        )
-        assert vlm_dataset._images_per_row(pairs, "image").tolist() == [2, 1, 0]
+        import pyarrow as pa
+
+        pairs = pa.array([[1, 2], [1, None], None], pa.list_(pa.int64(), 2))
+        fixed = Dataset(pa.table({"image": pairs}))
+        assert vlm_dataset._images_per_row(fixed, "image").tolist() == [2, 1, 0]
 
 
 class TestFramesToClipTensor:
