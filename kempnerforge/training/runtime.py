@@ -57,12 +57,12 @@ def apply_matmul_precision(train: TrainConfig) -> None:
 
 
 def setup_distributed(config: JobConfig) -> RuntimeContext:
-    """Initialize the process group + device mesh, then validate the config against it."""
+    """Validate the config for the world size, then initialize the process group + device mesh."""
     rank, local_rank, world_size = get_world_info()
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
 
-    device_mesh = init_distributed(config.distributed, seed=config.train.seed)
     config.validate(world_size)
+    device_mesh = init_distributed(config.distributed, seed=config.train.seed)
     apply_matmul_precision(config.train)
 
     log_job_info()
