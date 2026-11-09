@@ -486,8 +486,8 @@ def pack_vlm_samples(
         ``tokens_per_image`` the slots were laid out with.
 
     Raises:
-        ValueError: ``samples`` is empty, a document's footprint exceeds
-            ``seq_len``, or ``seq_len`` or ``tokens_per_image`` is not positive.
+        ValueError: ``samples`` is empty, a document has no image or a footprint
+            over ``seq_len``, or ``seq_len`` or ``tokens_per_image`` is not positive.
     """
     if seq_len <= 0 or tokens_per_image <= 0:
         raise ValueError("seq_len and tokens_per_image must be positive")
@@ -501,6 +501,8 @@ def pack_vlm_samples(
         views = sample["pixel_values"]
         if views.dim() == 3:
             views = views.unsqueeze(0)
+        if views.shape[0] == 0:
+            raise ValueError("pack_vlm_samples: every document needs at least one image")
         text_len = int(sample["text_len"]) if "text_len" in sample else sample["input_ids"].shape[0]
         footprint = views.shape[0] * tokens_per_image + text_len
         if footprint > seq_len:
@@ -558,15 +560,11 @@ class PackedVLMCollator:
     """
 
     def __init__(self, pad_id: int, seq_len: int, tokens_per_image: int) -> None:
-        if seq_len <= 0 or tokens_per_image <= 0:
-            raise ValueError("seq_len and tokens_per_image must be positive")
         self.pad_id = pad_id
         self.seq_len = seq_len
         self.tokens_per_image = tokens_per_image
 
     def __call__(self, samples: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
-        if not samples:
-            raise ValueError("PackedVLMCollator received an empty batch")
         return pack_vlm_samples(
             samples,
             seq_len=self.seq_len,

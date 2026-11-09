@@ -2686,9 +2686,13 @@ class TestVlmStep:
         assert packed["image_tokens"] == 2
         assert packed["doc_ids"].shape == (2, 4)
 
-    def test_reports_the_rows_it_ran(self):
+    def test_reports_tokens_only_for_packed_batches(self):
         session, _ = self._session([self._batch()])
-        assert session.step_fn(session, 0).rows == 2
+        assert session.step_fn(session, 0).tokens is None
+        batch = self._batch()
+        batch["doc_ids"] = torch.zeros(2, 4, dtype=torch.long)
+        session, _ = self._session([batch])
+        assert session.step_fn(session, 0).tokens == 8
 
     def test_packed_rows_are_marked_dynamic_for_compile(self, monkeypatch):
         import torch._dynamo

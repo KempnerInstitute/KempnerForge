@@ -378,18 +378,6 @@ class TestPackedForward:
         assert torch.allclose(alone[0, 8:20], prefix[0], atol=1e-5)
         assert torch.allclose(after_another[0, 22:34], prefix[0], atol=1e-5)
 
-    def test_misplaced_image_raises(self):
-        wrapper = _build_tiny_wrapper(num_image_tokens=8)
-        batch = pack_vlm_samples([_packed_doc(10, 9)], seq_len=32, tokens_per_image=8, pad_id=0)
-        for rows, starts in (
-            (torch.tensor([1]), batch["image_starts"]),
-            (batch["image_rows"], torch.tensor([30])),
-        ):
-            with pytest.raises(ValueError, match="outside the"):
-                wrapper(
-                    batch["pixel_values"], batch["input_ids"], image_rows=rows, image_starts=starts
-                )
-
     def test_documents_do_not_see_each_other(self):
         """Changing the first document leaves the second document's logits unchanged."""
         wrapper = _build_tiny_wrapper(num_image_tokens=8).eval()

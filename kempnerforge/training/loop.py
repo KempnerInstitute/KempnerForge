@@ -140,14 +140,15 @@ class StepResult:
 
     The per-dataset fields stay empty for step bodies that don't produce
     them; ``text_tokens`` stays None, which a VLM run treats as an error
-    rather than logging a zero. ``rows`` is the token rows the step ran, which
-    a packed VLM batch varies; None means ``train.batch_size`` per micro-step.
+    rather than logging a zero. ``tokens`` is what this rank ran when the
+    batch decides it (packed VLM rows); None means ``batch_size × seq_len``
+    per micro-step.
     """
 
     loss: float
     grad_norm: float
     text_tokens: int | None = None
-    rows: int | None = None
+    tokens: int | None = None
     dataset_token_counts: dict[str, int] = field(default_factory=dict)
     dataset_loss_sums: dict[str, float] = field(default_factory=dict)
     dataset_loss_counts: dict[str, int] = field(default_factory=dict)
@@ -274,8 +275,8 @@ def vlm_step(session: TrainingSession, step: int) -> StepResult:
 
     A packed batch also carries ``doc_ids``, ``position_ids`` and the image
     placement (``image_rows``, ``image_starts``, ``image_tokens``), passed
-    through to the wrapper; its leading dims are marked dynamic for
-    ``torch.compile`` because the row and image counts vary per batch.
+    through to the wrapper. Its row count varies, so the step reports the
+    tokens it ran and marks the leading dims dynamic for ``torch.compile``.
     """
     config = session.config
     tc, mc = config.train, config.model
@@ -285,7 +286,7 @@ def vlm_step(session: TrainingSession, step: int) -> StepResult:
 
     total_loss = 0.0
     total_text_tokens = 0
-    total_rows = 0
+    packed_tokens: int | None = None
 
     for micro_step in range(tc.grad_accum_steps):
         if not batches.has_data:
@@ -298,7 +299,6 @@ def vlm_step(session: TrainingSession, step: int) -> StepResult:
         input_ids = batch["input_ids"].to(device)
         labels = batch["labels"].to(device)
         frame_mask = batch["frame_mask"].to(device) if "frame_mask" in batch else None
-        total_rows += input_ids.shape[0]
         packed: dict[str, Any] = {
             key: batch[key].to(device)
             for key in ("doc_ids", "position_ids", "image_rows", "image_starts")
@@ -306,8 +306,10 @@ def vlm_step(session: TrainingSession, step: int) -> StepResult:
         }
         if "image_tokens" in batch:
             packed["image_tokens"] = int(batch["image_tokens"])
-        if packed and tc.compile_model:
-            _mark_rows_dynamic(pixel_values, input_ids, labels, *packed.values())
+        if packed:
+            packed_tokens = (packed_tokens or 0) + input_ids.numel()
+            if tc.compile_model:
+                _mark_rows_dynamic(pixel_values, input_ids, labels, *packed.values())
 
         with maybe_no_sync(model, micro_step, tc.grad_accum_steps):
             if mc.is_moe:
@@ -331,7 +333,7 @@ def vlm_step(session: TrainingSession, step: int) -> StepResult:
         loss=total_loss / tc.grad_accum_steps,
         grad_norm=clip_grads(model, tc.grad_clip_norm),
         text_tokens=total_text_tokens,
-        rows=total_rows,
+        tokens=packed_tokens,
     )
 
 
@@ -344,16 +346,21 @@ def _mark_rows_dynamic(*tensors: Any) -> None:
             maybe_mark_dynamic(tensor, 0)
 
 
+def _sum_over_data_ranks(session: TrainingSession, value: int) -> int:
+    """Sum a per-rank count over the data-parallel ranks; tp and pp peers hold the same batch."""
+    if not dist.is_initialized():
+        return value * session.data.dp_size
+    t = torch.tensor([value], device=session.runtime.device, dtype=torch.long)
+    dist.all_reduce(t, op=dist.ReduceOp.SUM)
+    return int(t.item()) * session.data.dp_size // session.runtime.world_size
+
+
 def _tokens_in_step(session: TrainingSession, result: StepResult) -> int:
-    """Tokens the step ran across all ranks: the reported rows, else the configured batch."""
+    """Tokens the step ran across the data-parallel ranks, from the step's count or the config."""
     tc = session.config.train
-    if result.rows is None:
+    if result.tokens is None:
         return tc.batch_size * tc.seq_len * tc.grad_accum_steps * session.data.dp_size
-    if dist.is_initialized():
-        t = torch.tensor([result.rows], device=session.runtime.device, dtype=torch.long)
-        dist.all_reduce(t, op=dist.ReduceOp.SUM)
-        return int(t.item()) * tc.seq_len
-    return result.rows * tc.seq_len * session.data.dp_size
+    return _sum_over_data_ranks(session, result.tokens)
 
 
 def text_step(session: TrainingSession, step: int) -> StepResult:
@@ -472,11 +479,7 @@ def _log_periodic_metrics(session: TrainingSession, result: StepResult, step: in
                 "VLM run: the step body reported no text-token count, so "
                 "data/text_tokens_trained would be logged as zero"
             )
-        global_text_tokens = result.text_tokens
-        if dist.is_initialized():
-            t = torch.tensor([result.text_tokens], device=session.runtime.device, dtype=torch.long)
-            dist.all_reduce(t, op=dist.ReduceOp.SUM)
-            global_text_tokens = int(t.item())
+        global_text_tokens = _sum_over_data_ranks(session, result.text_tokens)
         tracker.log_eval({"data/text_tokens_trained": float(global_text_tokens)}, step)
 
     if session.data.mixture_dataset is not None and result.dataset_loss_sums:

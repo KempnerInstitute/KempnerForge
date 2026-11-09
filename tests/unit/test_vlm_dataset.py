@@ -977,5 +977,11 @@ class TestPackVLMSamples:
         batch = collator([_doc(3, 10), _doc(4, 20)])
         assert batch["input_ids"].shape == (1, 12)
         assert batch["input_ids"][0, 11].item() == 7
-        with pytest.raises(ValueError, match="empty batch"):
+        with pytest.raises(ValueError, match="no samples"):
             collator([])
+
+    def test_a_document_without_an_image_raises(self):
+        doc = _doc(3, 10)
+        doc["pixel_values"] = torch.zeros(0, 3, 4, 4)
+        with pytest.raises(ValueError, match="at least one image"):
+            pack_vlm_samples([doc], seq_len=12, tokens_per_image=2, pad_id=0)

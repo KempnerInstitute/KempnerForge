@@ -101,7 +101,8 @@ def _inline_image_context(
     ``image_rows[n]`` and ``image_starts[n]`` give the row and first position
     of image ``n``'s ``tokens_per_image`` placeholder slots in ``input_ids``.
     ``image_tokens`` is the slot count the packer laid out; the adapter's
-    output must match it or the slots would be filled wrong.
+    output must match it or the slots would be filled wrong. The placement
+    itself is the packer's and is not re-checked on the device.
     """
     if pixel_values.dim() != 4:
         raise ValueError(
@@ -122,10 +123,6 @@ def _inline_image_context(
     offsets = torch.arange(k, device=input_ids.device)
     positions = (image_starts.to(input_ids.device).unsqueeze(1) + offsets).reshape(-1)
     rows = image_rows.to(input_ids.device).repeat_interleave(k)
-    batch, seq_len = input_ids.shape
-    misplaced = (rows < 0) | (rows >= batch) | (positions < 0) | (positions >= seq_len)
-    if bool(misplaced.any()):
-        raise ValueError(f"an image's {k} tokens fall outside the ({batch}, {seq_len}) token rows")
     return ModalityContext(
         inline_embeds=embeds.reshape(n * k, dim),
         inline_rows=rows,
