@@ -249,7 +249,7 @@ not in KempnerForge today.
 
 ## Minimal production recipe
 
-A reasonable starting point for a 4B-total / 1.8B-active MoE on
+A reasonable starting point for a 9.2B-total / 2.9B-active MoE on
 32 H200 GPUs:
 
 ```toml

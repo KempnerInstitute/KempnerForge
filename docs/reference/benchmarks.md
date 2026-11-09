@@ -195,7 +195,7 @@ Driver:
 
 32-GPU MoE: 8 nodes × 4 H200. Mesh `(dp_shard=4, ep=2, tp=4)`.
 Architecture: `dim=2048`, 24 layers, 8 experts top-2, `moe_frequency=1`.
-~4B total params, ~1.8B active per token.
+~9.2B total params, ~2.9B active per token.
 
 ### Per-sub-module FSDP wrapping fix
 
@@ -218,8 +218,8 @@ optimum after the fix.
 
 ### Why MFU is 1.5%
 
-MFU of 1.5% is correct for this model at this scale, not a bug. ~1.8B
-active parameters on 32 × H200 means ~56M active params per GPU —
+MFU of 1.5% is correct for this model at this scale, not a bug. ~2.9B
+active parameters on 32 × H200 means ~90M active params per GPU —
 each H200 is designed for billions. Communication overhead (EP
 all-to-all, FSDP all-gather/reduce-scatter, TP collectives) dwarfs
 compute. For comparison, a dense 13B model hits 32.7% MFU on the same

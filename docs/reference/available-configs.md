@@ -33,9 +33,9 @@ for DCP ↔ HuggingFace conversion.
 | File | Purpose | Model | GPUs | Parallelism | MoE |
 |------|---------|-------|-----:|-------------|-----|
 | [`debug_moe.toml`](https://github.com/KempnerInstitute/KempnerForge/blob/main/configs/train/debug_moe.toml) | Tiny MoE smoke test | 256-dim, 4-layer | 1+ | FSDP (`dp_shard=-1`) | 4 experts, top-2, `moe_frequency=2` |
-| [`moe_8gpu_stress.toml`](https://github.com/KempnerInstitute/KempnerForge/blob/main/configs/train/moe_8gpu_stress.toml) | Saturate 2 nodes with MoE | ~4B total / 1.8B active | 8 | TP=4 × FSDP=2 | 8 experts, top-2, `moe_frequency=1` |
-| [`moe_24gpu.toml`](https://github.com/KempnerInstitute/KempnerForge/blob/main/configs/train/moe_24gpu.toml) | 24-GPU MoE stress test | ~7B total / 1.8B active | 24 | TP=4 × FSDP=6 | 8 experts, top-2, `grad_accum=32` for full saturation |
-| [`moe_ep_32gpu.toml`](https://github.com/KempnerInstitute/KempnerForge/blob/main/configs/train/moe_ep_32gpu.toml) | MoE + Expert Parallel | ~4B total / 1.8B active | 32 | TP=4 × EP=2 × FSDP=4 | 8 experts, top-2, all-to-all across IB |
+| [`moe_8gpu_stress.toml`](https://github.com/KempnerInstitute/KempnerForge/blob/main/configs/train/moe_8gpu_stress.toml) | Saturate 2 nodes with MoE | ~9.2B total / ~2.9B active | 8 | TP=4 × FSDP=2 | 8 experts, top-2, `moe_frequency=1` |
+| [`moe_24gpu.toml`](https://github.com/KempnerInstitute/KempnerForge/blob/main/configs/train/moe_24gpu.toml) | 24-GPU MoE stress test | ~9.2B total / ~2.9B active | 24 | TP=4 × FSDP=6 | 8 experts, top-2, `grad_accum=32` for full saturation |
+| [`moe_ep_32gpu.toml`](https://github.com/KempnerInstitute/KempnerForge/blob/main/configs/train/moe_ep_32gpu.toml) | MoE + Expert Parallel | ~9.2B total / ~2.9B active | 32 | TP=4 × EP=2 × FSDP=4 | 8 experts, top-2, all-to-all across IB |
 
 See the [MoE Expert Parallel benchmark](benchmarks.md#moe-expert-parallelism)
 for the numbers the last config produced.
