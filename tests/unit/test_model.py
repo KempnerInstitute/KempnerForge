@@ -1478,15 +1478,6 @@ class TestInlineEmbeds:
         assert embeds.grad is not None and torch.isfinite(embeds.grad).all()
         assert all(p.grad is not None for p in model.token_embedding.parameters())
 
-    def test_index_out_of_range_raises(self):
-        model = Transformer(_KWARG_CONFIG).to(DEVICE)
-        tokens = torch.randint(0, 256, (1, 8), device=DEVICE)
-        embeds = torch.randn(1, 128, device=DEVICE)
-        with pytest.raises(ValueError, match="inline_positions must index the sequence"):
-            self._inline(model, tokens, torch.tensor([0]), torch.tensor([8]), embeds)
-        with pytest.raises(ValueError, match="inline_rows must index the batch"):
-            self._inline(model, tokens, torch.tensor([1]), torch.tensor([0]), embeds)
-
     def test_width_mismatch_raises(self):
         model = Transformer(_KWARG_CONFIG).to(DEVICE)
         tokens = torch.randint(0, 256, (1, 8), device=DEVICE)

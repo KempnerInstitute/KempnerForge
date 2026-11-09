@@ -22,8 +22,8 @@ the Joint-Decoder wrapper today.
 ``PackedVLMCollator`` packs several documents into each row instead
 (``pack_vlm_samples``): a document is its image's placeholder slots followed
 by its real text, rows are filled first-fit to ``seq_len``, and the batch
-carries ``doc_ids`` plus the image placement the Joint-Decoder wrapper uses
-to write each image's tokens over its slots.
+carries ``doc_ids``, per-document ``position_ids`` and the image placement the
+Joint-Decoder wrapper uses to write each image's tokens over its slots.
 
 The HF ``datasets`` and ``transformers`` packages are imported lazily
 so this module is safe to import without them (e.g. in unit tests that
@@ -255,17 +255,6 @@ def _tokenize_and_mask(
     text: str,
     max_text_len: int,
     prompt: str | None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """``_tokenize_and_mask_with_len`` without the token count."""
-    input_ids, labels, _ = _tokenize_and_mask_with_len(tokenizer, text, max_text_len, prompt)
-    return input_ids, labels
-
-
-def _tokenize_and_mask_with_len(
-    tokenizer: Any,
-    text: str,
-    max_text_len: int,
-    prompt: str | None,
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
     """Tokenize into right-padded input_ids + next-token labels, plus the real token count.
 
@@ -414,7 +403,7 @@ class HuggingFaceVLMDataset(Dataset):
         prompt = None
         if self._prompt_field is not None:
             prompt = _prompt_or_none(row[self._prompt_field], self._prompt_field)
-        input_ids, labels, text_len = _tokenize_and_mask_with_len(
+        input_ids, labels, text_len = _tokenize_and_mask(
             self._tokenizer, text_val, self._max_text_len, prompt
         )
         return {
@@ -490,7 +479,9 @@ def pack_vlm_samples(
         document order; ``input_ids``, ``labels`` and ``doc_ids`` ``(rows,
         seq_len)``, with ``pad_id`` and ``-100`` on the image slots and the
         padding tail, and ``doc_ids`` numbering a row's documents from ``0`` with
-        the tail one past the last; ``image_rows`` and ``image_starts`` ``(N,)``,
+        the tail one past the last; ``position_ids`` ``(rows, seq_len)``, each
+        document's positions (and the tail's) restarting at ``0``;
+        ``image_rows`` and ``image_starts`` ``(N,)``,
         the row and first slot of each image; ``image_tokens``, 0-d, the
         ``tokens_per_image`` the slots were laid out with.
 
@@ -527,6 +518,7 @@ def pack_vlm_samples(
                     "input_ids": torch.full((seq_len,), pad_id, dtype=torch.long),
                     "labels": torch.full((seq_len,), -100, dtype=torch.long),
                     "doc_ids": torch.zeros(seq_len, dtype=torch.long),
+                    "position_ids": torch.zeros(seq_len, dtype=torch.long),
                 }
             )
         row = rows[row_index]
@@ -539,15 +531,18 @@ def pack_vlm_samples(
         row["input_ids"][cursor : cursor + text_len] = sample["input_ids"][:text_len]
         row["labels"][cursor : cursor + text_len] = sample["labels"][:text_len]
         row["doc_ids"][row["fill"] : cursor + text_len] = row["docs"]
+        row["position_ids"][row["fill"] : cursor + text_len] = torch.arange(footprint)
         row["fill"] = cursor + text_len
         row["docs"] += 1
     for row in rows:
         row["doc_ids"][row["fill"] :] = row["docs"]
+        row["position_ids"][row["fill"] :] = torch.arange(seq_len - row["fill"])
     return {
         "pixel_values": torch.stack(images, dim=0),
         "input_ids": torch.stack([r["input_ids"] for r in rows]),
         "labels": torch.stack([r["labels"] for r in rows]),
         "doc_ids": torch.stack([r["doc_ids"] for r in rows]),
+        "position_ids": torch.stack([r["position_ids"] for r in rows]),
         "image_rows": torch.tensor(image_rows, dtype=torch.long),
         "image_starts": torch.tensor(image_starts, dtype=torch.long),
         "image_tokens": torch.tensor(tokens_per_image, dtype=torch.long),

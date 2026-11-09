@@ -36,6 +36,7 @@ from kempnerforge.model.vlm import (
     build_modality_strategy,
     build_vlm_wrapper,
     inner_transformer,
+    packed_tokens_per_image,
 )
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -343,6 +344,7 @@ class TestPackedForward:
             batch["input_ids"],
             batch["labels"],
             doc_ids=batch["doc_ids"],
+            position_ids=batch["position_ids"],
             image_rows=batch["image_rows"],
             image_starts=batch["image_starts"],
             image_tokens=int(batch["image_tokens"]),
@@ -359,14 +361,34 @@ class TestPackedForward:
         assert torch.isfinite(logits).all()
 
     def test_a_packed_document_matches_the_prefix_path(self):
-        """One document per row gives the text the same logits as the prefix route."""
+        """A document's text gets the prefix route's logits wherever first-fit placed it."""
         wrapper = _build_tiny_wrapper(num_image_tokens=8).eval()
         doc = _packed_doc(12, 4)
-        batch = pack_vlm_samples([doc], seq_len=32, tokens_per_image=8, pad_id=0)
         with torch.no_grad():
-            packed, _ = self._forward(wrapper, batch)
             prefix, _ = wrapper(doc["pixel_values"].unsqueeze(0), doc["input_ids"].unsqueeze(0))
-        assert torch.allclose(packed[0, 8:20], prefix[0], atol=1e-5)
+            alone, _ = self._forward(
+                wrapper, pack_vlm_samples([doc], seq_len=32, tokens_per_image=8, pad_id=0)
+            )
+            after_another, _ = self._forward(
+                wrapper,
+                pack_vlm_samples(
+                    [_packed_doc(6, 5), doc], seq_len=48, tokens_per_image=8, pad_id=0
+                ),
+            )
+        assert torch.allclose(alone[0, 8:20], prefix[0], atol=1e-5)
+        assert torch.allclose(after_another[0, 22:34], prefix[0], atol=1e-5)
+
+    def test_misplaced_image_raises(self):
+        wrapper = _build_tiny_wrapper(num_image_tokens=8)
+        batch = pack_vlm_samples([_packed_doc(10, 9)], seq_len=32, tokens_per_image=8, pad_id=0)
+        for rows, starts in (
+            (torch.tensor([1]), batch["image_starts"]),
+            (batch["image_rows"], torch.tensor([30])),
+        ):
+            with pytest.raises(ValueError, match="outside the"):
+                wrapper(
+                    batch["pixel_values"], batch["input_ids"], image_rows=rows, image_starts=starts
+                )
 
     def test_documents_do_not_see_each_other(self):
         """Changing the first document leaves the second document's logits unchanged."""
@@ -428,6 +450,17 @@ class TestPackedForward:
                 image_rows=batch["image_rows"],
                 image_starts=batch["image_starts"],
             )
+
+
+class TestPackedTokensPerImage:
+    def test_reads_the_adapter_output_off_the_wrapper(self):
+        wrapper = _build_tiny_wrapper(num_image_tokens=8)
+        assert packed_tokens_per_image(wrapper) == 8
+        assert packed_tokens_per_image(torch.compile(wrapper)) == 8
+
+    def test_rejects_a_bare_module(self):
+        with pytest.raises(TypeError, match="needs a VLMWrapper"):
+            packed_tokens_per_image(torch.nn.Linear(2, 2))
 
 
 class TestVLMWrapperDispatch:

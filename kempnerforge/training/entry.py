@@ -32,7 +32,7 @@ from kempnerforge.metrics.logger import get_logger
 from kempnerforge.metrics.tracker import MetricsTracker
 from kempnerforge.model.mot import mot_warm_start_from_text_stack
 from kempnerforge.model.transformer import Transformer
-from kempnerforge.model.vlm import inner_transformer
+from kempnerforge.model.vlm import inner_transformer, packed_tokens_per_image
 from kempnerforge.profiling.profiler import build_profiler
 from kempnerforge.resilience.elastic import resolve_resume_path
 from kempnerforge.resilience.health import NaNDetector
@@ -303,7 +303,10 @@ def run_training(
 
         prof = build_profiler(config.profiling, rank=runtime.rank)
 
-        data = build_data_pipeline(config, runtime)
+        tokens_per_image = (
+            packed_tokens_per_image(model) if config.is_vlm and config.data.pack_sequences else None
+        )
+        data = build_data_pipeline(config, runtime, tokens_per_image=tokens_per_image)
         if data.dataloader is not None:
             ckpt_mgr.apply_dataloader_state(data.dataloader)
 

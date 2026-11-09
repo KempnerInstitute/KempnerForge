@@ -46,14 +46,15 @@ right-padded to `vlm.max_text_len`. With `data.pack_sequences = true` on a
 of each micro-batch first-fit into rows of `train.seq_len` instead. Each
 document is its image's token slots followed by its real text, `doc_ids` keeps
 attention inside a document, and the wrapper writes each image's tokens over
-its slots (`ModalityContext.inline_embeds`). The number of rows follows the
-documents' lengths, so it varies between micro-batches.
+its slots (`ModalityContext.inline_embeds`). Each document's positions
+restart at 0, so a document sees the positions it would on the unpacked path.
+The number of rows follows the documents' lengths, so it varies between
+micro-batches.
 
 ```toml
 [vision_encoder]
 type = "siglip2"
 path = "google/siglip2-so400m-patch16-512"
-num_tokens = 1024          # the packer needs the count before the encoder is built
 
 [adapter]
 type = "avgpool"
@@ -70,11 +71,9 @@ pack_sequences = true
 seq_len = 2048             # row length; batch_size documents per micro-batch
 ```
 
-`attention_backend = "flex"` makes the packed mask block-sparse. Positions run
-through the row without restarting per document, and the views of an image
-attend causally; per-document positions and bidirectional image attention are
-follow-ups on the core's explicit position ids and attention groups. A
-`[video]` run and the other arches do not pack.
+`attention_backend = "flex"` makes the packed mask block-sparse. The views of
+an image attend causally; bidirectional image attention is a follow-up on the
+core's attention groups. A `[video]` run and the other arches do not pack.
 
 ## Start from the pretrained backbone
 

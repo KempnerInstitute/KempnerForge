@@ -140,12 +140,14 @@ class StepResult:
 
     The per-dataset fields stay empty for step bodies that don't produce
     them; ``text_tokens`` stays None, which a VLM run treats as an error
-    rather than logging a zero.
+    rather than logging a zero. ``rows`` is the token rows the step ran, which
+    a packed VLM batch varies; None means ``train.batch_size`` per micro-step.
     """
 
     loss: float
     grad_norm: float
     text_tokens: int | None = None
+    rows: int | None = None
     dataset_token_counts: dict[str, int] = field(default_factory=dict)
     dataset_loss_sums: dict[str, float] = field(default_factory=dict)
     dataset_loss_counts: dict[str, int] = field(default_factory=dict)
@@ -270,9 +272,10 @@ def pipeline_step(session: TrainingSession, step: int) -> StepResult:
 def vlm_step(session: TrainingSession, step: int) -> StepResult:
     """VLM step (no PP): pixel_values + input_ids forward, with a text-token count.
 
-    A packed batch also carries ``doc_ids`` and the image placement
-    (``image_rows``, ``image_starts``, ``image_tokens``), passed through to
-    the wrapper.
+    A packed batch also carries ``doc_ids``, ``position_ids`` and the image
+    placement (``image_rows``, ``image_starts``, ``image_tokens``), passed
+    through to the wrapper; its leading dims are marked dynamic for
+    ``torch.compile`` because the row and image counts vary per batch.
     """
     config = session.config
     tc, mc = config.train, config.model
@@ -282,6 +285,7 @@ def vlm_step(session: TrainingSession, step: int) -> StepResult:
 
     total_loss = 0.0
     total_text_tokens = 0
+    total_rows = 0
 
     for micro_step in range(tc.grad_accum_steps):
         if not batches.has_data:
@@ -294,13 +298,16 @@ def vlm_step(session: TrainingSession, step: int) -> StepResult:
         input_ids = batch["input_ids"].to(device)
         labels = batch["labels"].to(device)
         frame_mask = batch["frame_mask"].to(device) if "frame_mask" in batch else None
+        total_rows += input_ids.shape[0]
         packed: dict[str, Any] = {
             key: batch[key].to(device)
-            for key in ("doc_ids", "image_rows", "image_starts")
+            for key in ("doc_ids", "position_ids", "image_rows", "image_starts")
             if key in batch
         }
         if "image_tokens" in batch:
             packed["image_tokens"] = int(batch["image_tokens"])
+        if packed and tc.compile_model:
+            _mark_rows_dynamic(pixel_values, input_ids, labels, *packed.values())
 
         with maybe_no_sync(model, micro_step, tc.grad_accum_steps):
             if mc.is_moe:
@@ -324,7 +331,29 @@ def vlm_step(session: TrainingSession, step: int) -> StepResult:
         loss=total_loss / tc.grad_accum_steps,
         grad_norm=clip_grads(model, tc.grad_clip_norm),
         text_tokens=total_text_tokens,
+        rows=total_rows,
     )
+
+
+def _mark_rows_dynamic(*tensors: Any) -> None:
+    """Mark each tensor's leading dim dynamic so a new packed row count does not recompile."""
+    from torch._dynamo import maybe_mark_dynamic
+
+    for tensor in tensors:
+        if isinstance(tensor, torch.Tensor):
+            maybe_mark_dynamic(tensor, 0)
+
+
+def _tokens_in_step(session: TrainingSession, result: StepResult) -> int:
+    """Tokens the step ran across all ranks: the reported rows, else the configured batch."""
+    tc = session.config.train
+    if result.rows is None:
+        return tc.batch_size * tc.seq_len * tc.grad_accum_steps * session.data.dp_size
+    if dist.is_initialized():
+        t = torch.tensor([result.rows], device=session.runtime.device, dtype=torch.long)
+        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+        return int(t.item()) * tc.seq_len
+    return result.rows * tc.seq_len * session.data.dp_size
 
 
 def text_step(session: TrainingSession, step: int) -> StepResult:
@@ -637,7 +666,7 @@ def run_training_loop(
             optimizer.zero_grad()
 
             step += 1
-            tokens_in_step = tc.batch_size * tc.seq_len * tc.grad_accum_steps * data.dp_size
+            tokens_in_step = _tokens_in_step(session, result)
             tokens_seen += tokens_in_step
 
             _apply_step_transitions(session, step)

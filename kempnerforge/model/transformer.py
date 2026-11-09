@@ -120,8 +120,8 @@ def _write_inline_embeds(h: torch.Tensor, modality: ModalityContext) -> torch.Te
     """Write ``modality.inline_embeds`` over ``h`` at ``(inline_rows, inline_positions)``.
 
     Out of place, so gradients reach both the token embedding and the inline
-    embeddings. Raises ``ValueError`` when an index falls outside ``h`` or the
-    embedding width differs.
+    embeddings. Raises ``ValueError`` when the embedding width differs from the
+    model dim; the caller checks the indices.
     """
     embeds, rows, positions = (
         modality.inline_embeds,
@@ -129,16 +129,10 @@ def _write_inline_embeds(h: torch.Tensor, modality: ModalityContext) -> torch.Te
         modality.inline_positions,
     )
     assert embeds is not None and rows is not None and positions is not None
-    batch, seq_len, dim = h.shape
+    dim = h.shape[-1]
     if embeds.shape[1] != dim:
         raise ValueError(
             f"modality.inline_embeds width ({embeds.shape[1]}) does not match the model dim ({dim})"
-        )
-    if rows.numel() and (int(rows.min()) < 0 or int(rows.max()) >= batch):
-        raise ValueError(f"modality.inline_rows must index the batch of {batch} rows")
-    if positions.numel() and (int(positions.min()) < 0 or int(positions.max()) >= seq_len):
-        raise ValueError(
-            f"modality.inline_positions must index the sequence of {seq_len} positions"
         )
     return h.index_put((rows, positions), embeds.to(h.dtype))
 
