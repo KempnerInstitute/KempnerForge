@@ -81,10 +81,12 @@ if self._skip > 0:
 ```
 
 `set_skip(k)` tells the sampler "drop the first `k` samples from
-this epoch's index list". `StatefulDataLoader` computes
-`k = batches_yielded * batch_size` on resume and passes it in. The
-reset after application is important: on the *next* epoch, no skip
-is applied, and iteration starts from index 0.
+this epoch's index list". On resume `StatefulDataLoader` passes a
+`MixtureSampler` this rank's consumed sample count this way; with a
+`DistributedSampler` it calls `set_position` instead (see
+[Resume position](#resume-position)). The reset after application is
+important: on the *next* epoch, no skip is applied, and iteration
+starts from index 0.
 
 ### Resume position
 
@@ -159,8 +161,10 @@ Both samplers return the same keys:
 are local to this process and are re-derived from the current world
 size, not transplanted from the save; `StatefulDataLoader` compares the
 saved `num_replicas` with the current one to decide whether a per-rank
-position still applies. `seed` is already in `TrainConfig` and doesn't
-change across resume.
+position still applies. `seed` comes from `TrainConfig`;
+`StatefulDataLoader` logs a warning when the saved seed or the dataset
+length differs from the run's, since its position counts samples of the
+saved order.
 
 ## Eval sampler
 

@@ -110,8 +110,10 @@ Three data positions cannot carry over to another data-parallel size, and
 the resume stops with an error that names both sizes: a weighted mixture
 (`data.datasets`), a streamed dataset (`data.hf_streaming`), and a
 checkpoint saved before the loader recorded its batch size. Resume those
-on the saved data-parallel size; for the last, the checkpoints saved after
-that resume carry over to any size.
+on the saved data-parallel size, the last one also with its saved batch
+size; the checkpoints saved after that resume carry over to any size. A
+`checkpoint.load_path` warm start from such a checkpoint does not stop: it
+starts the data at its first sample, with a warning.
 
 The one thing that changes: effective batch size — 4× the DP ranks
 means 4× the batch per step. Adjust `grad_accum_steps` downward if

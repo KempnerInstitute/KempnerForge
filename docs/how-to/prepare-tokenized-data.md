@@ -121,9 +121,10 @@ tokenizer_path        = "gpt2"
 
 With `hf_streaming = true`,
 [`StreamingHuggingFaceDataset`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/data/dataset.py)
-downloads and tokenizes on the fly during iteration. Each rank
-processes every `world_size`-th document, so no coordination is
-needed for distributed runs.
+downloads and tokenizes on the fly during iteration. The stream is
+split across data-parallel ranks with `split_dataset_by_node`: a rank
+reads only its own shards when the shard count divides by the
+data-parallel size, and otherwise keeps every `world_size`-th document.
 
 The tokenizer path is loaded through
 `transformers.AutoTokenizer.from_pretrained`, so it can be a
@@ -210,10 +211,12 @@ different mechanisms:
   replay, also when it resumes on a different number of GPUs.
 - **HF streaming (Path B)**: wrapped in `StreamingDataLoader`, which
   saves how many batches training took and on resume replays the stream
-  to that point. The same guarantee, no sample repeated and none
-  skipped, at the cost of reading the consumed part of the stream again;
-  the data-parallel size, batch size and `num_workers` must stay the
-  same.
+  to that point. That is exact on one data-parallel rank, and on several
+  until the first rank finishes a pass over its part of the stream; after
+  that, a resume can skip or repeat data on some ranks (see
+  [Stateful dataloader § Streaming loader](../data/stateful-dataloader.md#streaming-loader)).
+  The replay reads the consumed part of the stream again, and the
+  data-parallel size, batch size and `num_workers` must stay the same.
 
 ## See also
 

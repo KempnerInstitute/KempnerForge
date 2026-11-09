@@ -71,10 +71,11 @@ initializes the collaborators:
 - **`MetricsTracker`** from
   [`kempnerforge.metrics.tracker`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/metrics/tracker.py)
   — per-step metrics + EMA smoothing + WandB / TensorBoard backends.
-- **Data pipeline** — `MemoryMappedDataset` or `MixtureDataset` or an
-  HF streaming / eager dataset (config dispatches), wrapped by
-  `DistributedSampler` or `MixtureSampler` and then by
-  `StatefulDataLoader` from
+- **Data pipeline**: `MemoryMappedDataset`, `MixtureDataset` or an
+  eager HF dataset (config dispatches), wrapped by `DistributedSampler`
+  or `MixtureSampler` and then by `StatefulDataLoader`; or an HF
+  streaming dataset, wrapped by `StreamingDataLoader` with no sampler.
+  Both loaders are in
   [`kempnerforge.data`](https://github.com/KempnerInstitute/KempnerForge/tree/main/kempnerforge/data).
 - **Eval dataloader and `torch.profiler`** (optional).
 - **Phase schedule** (optional) — for curriculum training, rebalances

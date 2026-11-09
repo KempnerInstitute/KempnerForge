@@ -61,14 +61,16 @@ tokenizer_path = "meta-llama/Llama-3-8B"
 Stream mode is an `IterableDataset`:
 
 - No `__len__`, no sampler (the dataset is its own iterator).
-- `build_data_pipeline` wraps it in `StreamingDataLoader`, a
-  `torch.utils.data.DataLoader` that saves and replays its position
+- `build_data_pipeline` wraps it in `StreamingDataLoader`, which wraps
+  a `torch.utils.data.DataLoader` and saves and replays its position
   (see [Resumption in streaming mode](#resumption-in-streaming-mode)).
 - The stream is split across data-parallel ranks after the shuffle, with
   `datasets.distributed.split_dataset_by_node`. When the source's shard
   count divides by the data-parallel size, each rank reads only its own
   shards; otherwise every rank reads the stream and keeps every
-  `world_size`-th document.
+  `world_size`-th document. With uneven shards, a rank with less text
+  finishes its pass and reads its data again while the others are still
+  in their first pass.
 
 Buffered shuffling is applied at the HF level:
 
@@ -91,24 +93,30 @@ processes fork after HF has already spawned its own threads.
 ### Resumption in streaming mode
 
 `StreamingDataLoader` saves `{"epoch", "batches_yielded", "stream"}`:
-how many batches training took in the current pass, and the settings
-that decide the stream's order (source, data-parallel size, seed and
+how many batches training took in the current pass, and what decides the
+stream's order (the source's data files by name and size, or its Hub
+name and config, with its shard count; the data-parallel size, seed and
 shuffle buffer, `seq_len`, tokenizer, `pack_sequences`, batch size and
 `num_workers`). On resume it rebuilds the pass and discards that many
 batches before yielding, so training continues at the exact next sample:
 the shuffle, the split across ranks and DataLoader workers, and the
 packing are deterministic. The replay reads and tokenizes the consumed
-part of the pass again, so a resume deep into a large pass takes time;
-the log says how many batches it replays.
+part of the pass again, about `k × batch_size × seq_len / rate` for a
+resume at batch `k`, and logs its progress; from the Hub it downloads
+that part again.
 
 A resume with one of those settings changed raises `DataPositionError`
 naming the change, because the same count would land on different
 samples, so a streaming run keeps its data-parallel size, batch size and
-`num_workers` across resumes. Hugging Face's own
+`num_workers` across resumes. Moving the same files to another directory
+is fine; a new version of the dataset or of `datasets` can shift the
+replay unnoticed. A `checkpoint.load_path` warm start starts the stream at
+its first document instead of raising. Hugging Face's own
 `IterableDataset.state_dict()` is not used: it drops the examples in the
-shuffle buffer on resume. See
+shuffle buffer on resume. On several ranks the checkpoint holds rank 0's
+count, which is exact until the first rank finishes a pass. See
 [Stateful dataloader § Streaming loader](stateful-dataloader.md#streaming-loader)
-for how the ranks share the saved count.
+for the replay cost and for how the ranks share the saved count.
 
 ## Packing and document boundaries
 
@@ -137,9 +145,9 @@ cluster filesystems (Lustre, VAST) where parallel opens crash.
 
 - Eager mode re-tokenizes on every process start; no tokenized cache
   beyond the HF `~/.cache/huggingface/` layer.
-- Streaming mode with shuffling + resumption isn't bit-exact: after
-  resume the same rank will see a different *shuffled order* because
-  buffered shuffle state isn't captured.
+- Streaming resumes by replaying: it reads and tokenizes the consumed
+  part of the pass again, and needs the saved data-parallel size, batch
+  size, `num_workers` and stream settings.
 - Neither class supports on-disk tokenization caching. If you want
   that, pre-tokenize with `tatm` and switch to
   [Memory-mapped](memory-mapped.md).

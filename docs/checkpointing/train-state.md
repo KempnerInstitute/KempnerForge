@@ -100,7 +100,7 @@ ckpt_mgr.save(
 ```
 
 A checkpoint taken mid-epoch on 64 data-parallel ranks carries e.g.
-`{'epoch': 7, 'batch_size': 4, 'global_position': 3584, 'batches_yielded': 14, 'sampler': {...}}`.
+`{'epoch': 7, 'batch_size': 4, 'dataset_length': 1000000, 'global_position': 3584, 'batches_yielded': 14, 'sampler': {...}}`.
 `global_position` counts the samples of the epoch's order that all ranks
 consumed, so on resume `StatefulDataLoader.__iter__` continues at the same
 sample rather than restarting the epoch, on this or another data-parallel

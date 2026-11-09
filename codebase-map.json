@@ -948,9 +948,12 @@
           ]
         },
         "StreamingHuggingFaceDataset": {
-          "purpose": "Streaming HuggingFace IterableDataset for large corpora",
+          "purpose": "Streaming HuggingFace IterableDataset for large corpora, split across data-parallel ranks with split_dataset_by_node",
           "methods": [
             "__iter__()",
+            "set_epoch(epoch)",
+            "stream_identity()",
+            "_source()",
             "state_dict()",
             "load_state_dict(state)",
             "_ensure_tokenizer()",
@@ -978,6 +981,7 @@
         "tests/unit/test_data.py::TestMemoryMappedDataset",
         "tests/unit/test_data.py::TestHuggingFaceDataset",
         "tests/unit/test_data.py::TestStreamingHuggingFaceDataset",
+        "tests/unit/test_streaming_resume.py",
         "tests/unit/test_packing.py::TestComputePackedOutput",
         "tests/unit/test_packing.py::TestMemoryMappedDatasetPacking",
         "tests/unit/test_packing.py::TestHuggingFaceDatasetPacking",
@@ -986,19 +990,39 @@
     },
     "kempnerforge/data/dataloader.py": {
       "classes": {
+        "DataPositionError": {
+          "purpose": "ValueError for a saved data position this loader cannot resume from; every rank raises it together"
+        },
         "StatefulDataLoader": {
-          "purpose": "DataLoader wrapper with checkpoint/resume state tracking",
+          "purpose": "DataLoader wrapper with checkpoint/resume state tracking; with a DistributedSampler the position is global, so it resumes on another data-parallel size or batch size",
           "methods": [
             "__iter__()",
             "__next__()",
             "__len__()",
+            "_consumed()",
+            "state_dict()",
+            "load_state_dict(state)",
+            "_refusal(state, saved_replicas, global_order)",
+            "_warn_if_reordered(state, sampler_state)"
+          ]
+        },
+        "StreamingDataLoader": {
+          "purpose": "DataLoader over a StreamingHuggingFaceDataset that resumes by replaying the saved batch count, logging progress; refuses a stream whose source files, shard count or settings changed, and starts fresh workers when a pass restarts midway",
+          "methods": [
+            "__iter__()",
+            "_restart_workers()",
+            "_replay()",
+            "__next__()",
+            "_identity()",
             "state_dict()",
             "load_state_dict(state)"
           ]
         }
       },
       "tested_by": [
-        "tests/unit/test_data.py::TestStatefulDataLoader"
+        "tests/unit/test_data.py::TestStatefulDataLoader",
+        "tests/unit/test_data_position.py",
+        "tests/unit/test_streaming_resume.py"
       ]
     },
     "kempnerforge/data/sampler.py": {
@@ -1008,6 +1032,8 @@
           "methods": [
             "set_epoch(epoch)",
             "set_skip(skip)",
+            "set_position(position)",
+            "samples_after(position)",
             "__iter__()",
             "__len__()",
             "state_dict()",
@@ -1029,6 +1055,7 @@
       },
       "tested_by": [
         "tests/unit/test_data.py::TestDistributedSampler",
+        "tests/unit/test_data_position.py",
         "tests/unit/test_mixing.py::TestMixtureSampler",
         "tests/unit/test_mixing.py::TestTemperatureScaling",
         "tests/unit/test_mixing.py::TestMixtureSamplerWithDataset",
@@ -1191,7 +1218,7 @@
             "wait()",
             "flush_pending_save()",
             "peek_saved_step(path)",
-            "load(path, scheduler, dataloader, exclude_keys, vlm_freeze_expected)",
+            "load(path, scheduler, dataloader, exclude_keys, vlm_freeze_expected, warm_start)",
             "_read_saved_keys(ckpt_dir, dcp_dir) (this rank's DCP keys; checks the scope only when an all-reduce on the gloo group finds optimizer state on some rank)",
             "_check_weight_decay_scope(ckpt_dir) (rank 0 reads the saved scope and broadcasts it; every rank refuses a mismatch)",
             "apply_dataloader_state(dataloader)",
@@ -1494,9 +1521,9 @@
           "TestDistributedSampler(8)",
           "TestStatefulDataLoader(3)",
           "TestHuggingFaceDataset(6)",
-          "TestStreamingHuggingFaceDataset(6)"
+          "TestStreamingHuggingFaceDataset(7)"
         ],
-        "count": 32
+        "count": 33
       },
       "tests/unit/test_distributed.py": {
         "classes": [
@@ -1837,6 +1864,14 @@
       "tests/unit/test_distributed_seed.py": {
         "note": "Module-level pytest functions: _set_seed seeds python/numpy/torch.cpu/torch.cuda; varies with pp_rank; consistent across dp ranks; covers checkpoint surface",
         "count": 4
+      },
+      "tests/unit/test_data_position.py": {
+        "note": "Module-level pytest functions (no Test* classes): the data position across data-parallel and batch size changes, the in-step clamp, mixture and legacy refusals, seed and dataset-length warnings, load_path warm starts through restore_checkpoint and load(dataloader=...), gloo CheckpointManager resume on another world size",
+        "count": 18
+      },
+      "tests/unit/test_streaming_resume.py": {
+        "note": "Module-level pytest functions (no Test* classes): streaming replay resume (0 and 2 workers), later epoch with workers, CheckpointManager round trip, changed-stream and source-file checks, map/stream refusals, replay past the end, warm start and missing-position warnings, later-pass warning, mid-pass restart with workers, replay progress",
+        "count": 13
       }
     },
     "integration": {
