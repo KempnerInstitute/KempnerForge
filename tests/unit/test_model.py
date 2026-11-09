@@ -189,6 +189,8 @@ class TestAttention:
         assert appended[0] == pinned[0]
         assert SDPBackend.EFFICIENT_ATTENTION in appended
         assert SDPBackend.MATH in appended
+        with attn._sdpa_context(appended=True), attn._sdpa_context():
+            pass
 
     @pytest.mark.parametrize("backend", ["efficient", "math"])
     def test_mask_capable_kernels_stay_pinned_for_appended_tokens(self, backend):
