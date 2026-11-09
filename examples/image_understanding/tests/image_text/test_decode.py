@@ -7,7 +7,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 import pytest
-from image_text.decode import UnreadableImageError, decode_rgb, decode_upright, first_readable
+from image_text.decode import UnreadableImageError, decode_rgb, decode_upright
 from PIL import Image
 
 EXIF_ORIENTATION = 0x0112
@@ -76,39 +76,3 @@ class TestDecodeRgb:
             255,
             255,
         )
-
-
-class TestFirstReadable:
-    def _read(self, unreadable: set[int]) -> Callable[[int], int]:
-        def read(row: int) -> int:
-            if row in unreadable:
-                raise UnreadableImageError(f"row {row}")
-            return row
-
-        return read
-
-    def test_returns_the_first_readable_row(self) -> None:
-        skipped: list[int] = []
-        row = first_readable(1, 5, 4, self._read({1, 2}), lambda i, _: skipped.append(i))
-        assert row == 3 and skipped == [1, 2]
-
-    def test_wraps_around(self) -> None:
-        assert first_readable(4, 5, 3, self._read({4}), lambda *_: None) == 0
-
-    def test_raises_after_max_attempts(self) -> None:
-        with pytest.raises(RuntimeError, match="2 consecutive rows from index 0"):
-            first_readable(0, 5, 2, self._read({0, 1}), lambda *_: None)
-
-    def test_other_errors_propagate(self) -> None:
-        def read(row: int) -> int:
-            raise KeyError("bug")
-
-        with pytest.raises(KeyError):
-            first_readable(0, 5, 3, read, lambda *_: None)
-
-    def test_next_row_chooses_where_to_continue(self) -> None:
-        skipped: list[int] = []
-        row = first_readable(
-            0, 5, 2, self._read({0, 1, 2}), lambda i, _: skipped.append(i), lambda i: i + 3
-        )
-        assert row == 3 and skipped == [0]

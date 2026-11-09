@@ -1,9 +1,9 @@
-"""Image decoding, and reading past rows whose image does not decode."""
+"""Image decoding."""
 
 from __future__ import annotations
 
 import io
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from pathlib import Path
 from typing import NamedTuple
 
@@ -72,27 +72,3 @@ def decode_upright(source: str | Path | bytes) -> Decoded:
 def decode_rgb(source: str | Path | bytes) -> Image.Image:
     """The upright RGB image of ``decode_upright``."""
     return decode_upright(source).image
-
-
-def first_readable[T](
-    index: int,
-    length: int,
-    max_attempts: int,
-    read: Callable[[int], T],
-    on_skip: Callable[[int, UnreadableImageError], None],
-    next_row: Callable[[int], int] | None = None,
-) -> T:
-    """``read(index)``, moving on past rows whose image does not decode.
-
-    After an unreadable row the next one tried is ``next_row(row)`` (by default
-    the following row), wrapping around at ``length``; after ``max_attempts``
-    unreadable rows in a row it raises ``RuntimeError``.
-    """
-    row = index
-    for _ in range(max_attempts):
-        try:
-            return read(row)
-        except UnreadableImageError as exc:
-            on_skip(row, exc)
-            row = (next_row(row) if next_row is not None else row + 1) % length
-    raise RuntimeError(f"{max_attempts} consecutive rows from index {index} have no readable image")
