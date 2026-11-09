@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import pickle
 import re
 import shutil
 import stat
@@ -766,23 +767,54 @@ class CheckpointManager:
                 "Could not record the %s fields in %s: %s", backend, path, _error_text(e)
             )
 
-    def _gather_rank_states(self, dataloader: Any | None) -> dict[str, Any]:
+    def _gather_rank_states(
+        self, dataloader: Any | None
+    ) -> tuple[dict[str, Any] | None, BaseException | None]:
         """Collect every rank's own loader/RNG payload into a versioned envelope.
 
-        Collective (all ranks call it at the same point in ``save()``). Uses
-        the dedicated gloo group so the gather cannot interleave with DCP
-        collectives an in-flight async flush is issuing on the default group
-        from its background thread. Entries are keyed by each payload's own
-        global rank rather than by gather position, so the envelope is correct
-        under any group ordering. Each rank's ``dp_info`` rides along to
+        Collective: every rank calls it once per ``save()``, whatever its own part of
+        the save has raised so far. Uses the dedicated gloo group so the gather cannot
+        interleave with DCP collectives an in-flight async flush is issuing on the
+        default group from its background thread. Each rank captures and serializes
+        its payload before the gather, and a rank whose capture raises enters the
+        gather with no payload, so no rank is left waiting in it. Entries are keyed by
+        each payload's own global rank rather than by gather position, so the envelope
+        is correct under any group ordering. Each rank's ``dp_info`` rides along to
         record the data-parallel layout.
+
+        Returns:
+            The envelope and ``None``; or ``None`` and the error this rank reports:
+            what its own capture raised, a ``RuntimeError`` naming the ranks whose
+            capture failed, or what building the envelope raised, which every rank
+            meets alike since it builds from the same gathered payloads.
         """
-        mine = (self._rank, self._dp_info, capture_rank_state(dataloader))
+        payload: bytes | None = None
+        capture_error: Exception | None = None
+        try:
+            payload = pickle.dumps(capture_rank_state(dataloader))
+        except Exception as e:
+            capture_error = e
+        mine = (self._rank, self._dp_info, payload)
         gathered: list[Any] = [mine]
         if dist.is_initialized():
             gathered = [None] * self._world_size
             dist.all_gather_object(gathered, mine, group=self._sync_group)
-        entries = {int(rank): state for rank, _, state in gathered}
+        if capture_error is not None:
+            return None, capture_error
+        failed = sorted(int(rank) for rank, _, data in gathered if data is None)
+        if failed:
+            return None, RuntimeError(
+                f"Checkpoint save failed on ranks {failed}: they could not capture their "
+                f"dataloader/RNG state"
+            )
+        try:
+            return self._build_envelope(gathered), None
+        except Exception as e:
+            return None, e
+
+    def _build_envelope(self, gathered: list[Any]) -> dict[str, Any]:
+        """The per-rank envelope from every rank's ``(rank, dp_info, serialized payload)``."""
+        entries = {int(rank): pickle.loads(data) for rank, _, data in gathered}
         coords = {int(rank): dp for rank, dp, _ in gathered}
         layout = coords if all(dp is not None for dp in coords.values()) else None
         return build_per_rank_envelope(entries, world_size=self._world_size, data_parallel=layout)
@@ -891,7 +923,9 @@ class CheckpointManager:
         if drain_error is not None:
             error = drain_error
 
-        per_rank = self._gather_rank_states(dataloader)
+        per_rank, gather_error = self._gather_rank_states(dataloader)
+        if error is None:
+            error = gather_error
 
         if self._rank == 0 and error is None:
             error = _attempt(

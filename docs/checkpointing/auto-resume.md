@@ -95,6 +95,7 @@ if resume_path or config.checkpoint.load_path:
     step, tokens_seen, ckpt_extra_loaded = ckpt_mgr.load(
         path=str(resume_path) if resume_path else None,
         scheduler=scheduler,
+        exact_resume=resume_path is not None,
     )
     if ckpt_extra_loaded.get("wandb_run_id"):
         config.metrics.wandb_run_id = ckpt_extra_loaded["wandb_run_id"]
@@ -161,7 +162,8 @@ each stage saves through its own process group, so every rank first
 waits at a barrier until every stage's save has completed; only then
 does rank 0 move `latest` and prune.
 
-A save that fails on any rank (a DCP write or async flush, or rank 0's
+A save that fails on any rank (a DCP write or async flush, a rank's
+capture of its own dataloader and RNG state, or rank 0's
 `train_state.pt`, `metadata.json` or move of `latest`) fails on every
 rank, and `latest` never points at it. The barriers that end `save()`,
 `wait()` and `flush_pending_save()` carry each rank's outcome: a rank

@@ -42,10 +42,12 @@ Entry points, both in
 ## Who writes it
 
 ```python
-# manager.py, inside save()
-per_rank = self._gather_rank_states(dataloader)
+# manager.py, inside save() (abridged)
+per_rank, gather_error = self._gather_rank_states(dataloader)  # every rank
+if error is None:
+    error = gather_error
 
-if self._rank == 0:
+if self._rank == 0 and error is None:
     train_state = build_train_state(
         step=step, tokens_seen=tokens_seen,
         scheduler=scheduler, dataloader=dataloader, extra=extra,
@@ -58,7 +60,15 @@ Only global rank 0 writes; the file is not sharded. Before the
 write, every rank's own dataloader/RNG payload is gathered
 collectively (on the manager's dedicated gloo group) into the
 versioned `per_rank` envelope, so the single file still carries every
-rank's state. On load, rank 0 reads and broadcasts it to every rank
+rank's state. Each rank captures and pickles its payload before the
+gather. A rank whose capture fails (its loader's `state_dict()`
+raises, or the payload cannot be pickled) still enters the gather,
+without a payload, so the save fails on every rank instead of leaving
+the others waiting: that rank raises its own error, every other rank
+raises a `RuntimeError` naming it, rank 0 writes no `train_state.pt`,
+and `latest` stays on the previous checkpoint.
+
+On load, rank 0 reads the file and broadcasts it to every rank
 via `dist.broadcast_object_list`; all ranks agree on `step` and
 scheduler state. On an exact resume (the training entry's auto-resume
 of the run's own checkpoint, `load(..., exact_resume=True)`) each rank
@@ -71,8 +81,10 @@ global rank. Any other load (a `load_path` warm start,
 
 Dataloader cursors and RNG streams are rank-local: pipeline stages
 seed `seed + pp_rank`, CUDA streams diverge during training, and a
-stateful loader's position is its own rank's. The `per_rank`
-envelope records each rank's payload:
+stateful loader's position is its own rank's. The gather spans every
+rank of every pipeline stage, so each stage resumes its own streams
+rather than stage 0's. The `per_rank` envelope records each rank's
+payload:
 
 - `version`: schema version, currently `1`. A newer version than
   the running code understands refuses to load.
@@ -228,12 +240,14 @@ Custom training workflows can use it for anything
 ## Save failures
 
 `torch.save` uses `pickle` under the hood. If any object in the
-train state isn't picklable, the save raises — the DCP shard is
-already on disk, but the non-distributed state file is missing.
+train state isn't picklable (an `extra` value, or any rank's
+dataloader state), the save raises on every rank: the DCP shard is
+already on disk, but the non-distributed state file is missing and
+`latest` does not move to it.
 
-Practical implication: keep `extra=` values to primitives, lists,
-dicts, and tensors. Don't stuff a live logger, process group, or
-generator in there.
+Practical implication: keep `extra=` values and a custom loader's
+`state_dict()` to primitives, lists, dicts, and tensors. Don't stuff
+a live logger, process group, or generator in there.
 
 ## When `train_state.pt` is missing
 

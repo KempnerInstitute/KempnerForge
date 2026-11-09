@@ -15,6 +15,7 @@ global rank -> ``(dp_rank, dp_size)`` maps for a 4-rank job under
 
 from __future__ import annotations
 
+import pickle
 import random
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -110,10 +111,10 @@ def _install_fake_world(
     """Simulate a WORLD-rank job around rank 0's manager.
 
     ``all_gather_object`` fills the output list with every rank's
-    ``(global_rank, dp_coordinates, payload)``, exactly as the real collective
-    would (coordinates from ``layout``, or None); events record the gather and
-    the closing status agreement with the group they ran on, and the agreement
-    reports no failure on any rank.
+    ``(global_rank, dp_coordinates, serialized payload)``, exactly as the real
+    collective would (coordinates from ``layout``, or None); events record the
+    gather and the closing status agreement with the group they ran on, and the
+    agreement reports no failure on any rank.
     """
     monkeypatch.setattr(mgr_mod.dist, "is_initialized", lambda: True)
     monkeypatch.setattr(mgr_mod.dist, "get_rank", lambda group=None: 0)
@@ -126,7 +127,8 @@ def _install_fake_world(
     def fake_all_gather(obj_list, obj, group=None):
         events.append(("gather", group))
         for r in range(WORLD):
-            obj_list[r] = (r, layout[r] if layout is not None else None, payloads[r])
+            dp = layout[r] if layout is not None else None
+            obj_list[r] = (r, dp, pickle.dumps(payloads[r]))
 
     monkeypatch.setattr(mgr_mod.dist, "all_gather_object", fake_all_gather)
 
@@ -505,6 +507,133 @@ class TestGatherMustCoverTheWorld:
         assert not (tmp_path / "step_1" / "train_state.pt").exists(), "only rank 0 writes the file"
 
 
+class _BrokenLoader:
+    """A stateful loader whose ``state_dict()`` raises, as a corrupt cursor would."""
+
+    def state_dict(self) -> dict:
+        raise OSError("cursor unavailable")
+
+
+class _Unserializable:
+    """A loader-state value that pickle refuses."""
+
+    def __reduce__(self):
+        raise TypeError("cannot serialize this cursor")
+
+
+def _install_capture_world(m, me: int, failing: set[int], events: list) -> list:
+    """Simulate global rank ``me`` of a WORLD-rank save in which the ``failing`` ranks
+    could not capture their own loader/RNG payload.
+
+    The gather hands back what this rank contributed in its own slot, a serialized
+    payload for every other rank, and no payload for each rank in ``failing``, the way
+    a rank whose capture failed enters the real collective. The closing agreement marks
+    the ``failing`` ranks as failed. Returns the list of objects this rank contributed.
+    """
+    contributed: list = []
+    m.setattr(mgr_mod.dist, "is_initialized", lambda: True)
+    m.setattr(mgr_mod.dist, "get_rank", lambda group=None: me)
+    m.setattr(mgr_mod.dist, "get_world_size", lambda group=None: WORLD)
+    m.setattr(mgr_mod.dist, "new_group", lambda backend=None: "GLOO_PG")
+
+    def fake_all_reduce(flags, group=None):
+        events.append(("agree", group))
+        for r in failing:
+            flags[r] = 1
+
+    def fake_all_gather(obj_list, obj, group=None):
+        events.append(("gather", group))
+        contributed.append(obj)
+        peers, _ = _mk_payloads(seed_base=10, cursor_base=100)
+        for r in range(WORLD):
+            if r == me:
+                obj_list[r] = obj
+            else:
+                obj_list[r] = (r, None, None if r in failing else pickle.dumps(peers[r]))
+
+    m.setattr(mgr_mod.dist, "all_reduce", fake_all_reduce)
+    m.setattr(mgr_mod.dist, "all_gather_object", fake_all_gather)
+    return contributed
+
+
+class TestAFailedCaptureFailsEveryRank:
+    """A rank that cannot capture its payload fails the save on every rank, and no rank waits.
+
+    The capture runs on every rank before the gather, so a rank whose loader raises in
+    ``state_dict()``, or whose payload cannot be serialized, still enters the gather, with no
+    payload, and then the closing agreement. Every rank that gets its peers' payloads sees the
+    gap, so rank 0 writes no ``train_state.pt`` and moves no ``latest``, and every rank raises.
+    """
+
+    @pytest.mark.parametrize("me", [0, 2])
+    def test_a_rank_whose_loader_raises_still_joins_the_gather(self, tmp_path, monkeypatch, me):
+        events: list = []
+        with monkeypatch.context() as m:
+            contributed = _install_capture_world(m, me, failing=set(), events=events)
+            mgr = _mock_mgr(tmp_path, m)
+            with pytest.raises(OSError, match="cursor unavailable"):
+                mgr.save(step=1, dataloader=_BrokenLoader())
+
+        assert events == [("gather", "GLOO_PG"), ("agree", "GLOO_PG")]
+        assert contributed == [(me, None, None)]
+        assert not (tmp_path / "step_1" / "train_state.pt").exists()
+        assert not (tmp_path / "latest").exists()
+
+    def test_a_payload_that_cannot_be_serialized_fails_like_a_capture(self, tmp_path, monkeypatch):
+        class Loader:
+            def state_dict(self):
+                return {"cursor": _Unserializable()}
+
+        events: list = []
+        with monkeypatch.context() as m:
+            contributed = _install_capture_world(m, 0, failing=set(), events=events)
+            mgr = _mock_mgr(tmp_path, m)
+            with pytest.raises(TypeError, match="cannot serialize this cursor"):
+                mgr.save(step=1, dataloader=Loader())
+
+        assert events == [("gather", "GLOO_PG"), ("agree", "GLOO_PG")]
+        assert contributed == [(0, None, None)]
+        assert not (tmp_path / "step_1" / "train_state.pt").exists()
+
+    @pytest.mark.parametrize(
+        "mode", [AsyncCheckpointMode.disabled, AsyncCheckpointMode.async_pinned]
+    )
+    def test_a_peer_that_failed_stops_the_write_and_the_commit(self, tmp_path, monkeypatch, mode):
+        """Rank 0 sees rank 3's missing payload, writes nothing, commits nothing, and raises."""
+        events: list = []
+        failing: set[int] = set()
+        with monkeypatch.context() as m:
+            _install_capture_world(m, 0, failing=failing, events=events)
+            mgr = _mock_mgr(tmp_path, m, async_mode=mode)
+            mgr.save(step=1)
+            failing.add(3)
+            with pytest.raises(RuntimeError, match=r"ranks \[3\]"):
+                mgr.save(step=2)
+            failing.clear()
+            mgr.wait()
+
+        assert (tmp_path / "step_1" / "train_state.pt").exists()
+        assert not (tmp_path / "step_2" / "train_state.pt").exists()
+        assert (tmp_path / "latest").resolve() == (tmp_path / "step_1").resolve()
+        assert mgr._pending_finalize is None
+
+    def test_an_envelope_that_cannot_be_built_reaches_the_agreement(self, tmp_path, monkeypatch):
+        """Every rank builds the envelope from the same gathered payloads, so a gather that
+        does not cover the world fails every rank alike, through the closing agreement."""
+        mgr = _mock_mgr(tmp_path, monkeypatch)
+        mgr._rank = 1
+        agreed: list = []
+        agree = mgr._agree
+        monkeypatch.setattr(mgr, "_agree", lambda error: (agreed.append(error), agree(error)))
+
+        with pytest.raises(ValueError, match=r"got ranks \[1\]"):
+            mgr.save(step=1)
+
+        assert len(agreed) == 1 and isinstance(agreed[0], ValueError)
+        assert not (tmp_path / "step_1" / "train_state.pt").exists()
+        assert not (tmp_path / "latest").exists()
+
+
 class TestFourRankSaveLoad:
     def test_each_rank_restores_its_own_loader_and_rng(self, tmp_path, monkeypatch):
         """Each rank gets back its own cursor and RNG streams.
@@ -569,7 +698,8 @@ class TestFourRankSaveLoad:
             assert _draw() == exp_second[r]
 
     def test_save_contributes_own_payload_to_gather(self, tmp_path, monkeypatch):
-        """The object each rank hands the collective is (global_rank, payload)."""
+        """The object each rank hands the collective is (global_rank, dp_info, payload),
+        with the payload serialized before the gather."""
         contributed: list = []
 
         class Loader:
@@ -583,7 +713,7 @@ class TestFourRankSaveLoad:
             def capturing_gather(obj_list, obj, group=None):
                 contributed.append((obj, group))
                 for r in range(WORLD):
-                    obj_list[r] = (r, (r, WORLD), _mk_payloads(1, 1)[0][r])
+                    obj_list[r] = (r, (r, WORLD), pickle.dumps(_mk_payloads(1, 1)[0][r]))
 
             m.setattr(mgr_mod.dist, "all_gather_object", capturing_gather)
             mgr = _mock_mgr(tmp_path, m, dp_info=(0, WORLD))
@@ -591,14 +721,19 @@ class TestFourRankSaveLoad:
 
         (obj, group) = contributed[0]
         assert group == "GLOO_PG", "gather must run on the dedicated gloo group"
-        rank, dp_coords, payload = obj
+        rank, dp_coords, serialized = obj
+        payload = pickle.loads(serialized)
         assert rank == 0
         assert dp_coords == (0, WORLD)
         assert payload["dataloader"] == {"cursor": 41}
         assert "torch_cpu" in payload["rng"]
 
     def test_collective_and_durability_ordering(self, tmp_path, monkeypatch):
-        """gather -> train_state write -> latest commit -> closing agreement."""
+        """gather -> train_state write -> latest commit -> closing agreement.
+
+        Only writes to a file count: pickling a payload's tensors calls ``torch.save``
+        into an in-memory buffer.
+        """
         payloads, _ = _mk_payloads(seed_base=1, cursor_base=1)
         events: list = []
         with monkeypatch.context() as m:
@@ -608,7 +743,8 @@ class TestFourRankSaveLoad:
             orig_torch_save = torch.save
 
             def recording_save(obj, f, *args, **kwargs):
-                events.append(("write", Path(str(f)).name))
+                if isinstance(f, (str, Path)):
+                    events.append(("write", Path(f).name))
                 orig_torch_save(obj, f, *args, **kwargs)
 
             m.setattr(mgr_mod.torch, "save", recording_save)

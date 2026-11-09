@@ -808,6 +808,60 @@ class TestPerRankState:
         assert self._draw() == saved_draws[0], f"rank {rank} did not restore rank 0's RNG"
         dist.barrier()
 
+    @staticmethod
+    def _stepped_model(mesh):
+        """A sharded model whose optimizer has taken one step, so it holds state."""
+        from kempnerforge.config.schema import OptimizerConfig
+
+        torch.manual_seed(42)
+        model = Transformer(SMALL_CONFIG).cuda()
+        apply_fsdp2(model, mesh)
+        opt = build_optimizer(model, OptimizerConfig(lr=1e-3, fused=False))
+        model(torch.randint(0, 512, (2, 32), device="cuda")).sum().backward()
+        opt.step()
+        opt.zero_grad()
+        return model, opt
+
+    @pytest.mark.timeout(120, method="thread")
+    @pytest.mark.parametrize(
+        "mode",
+        [AsyncCheckpointMode.disabled, AsyncCheckpointMode.async_pinned],
+        ids=["sync", "async"],
+    )
+    def test_a_rank_whose_loader_cannot_save_fails_every_rank(
+        self, distributed_env, shared_tmp_dir, mode
+    ):
+        """The last rank's loader raises in ``state_dict()``: that rank raises its error, every
+        other rank raises naming it, none waits for another, and ``latest`` stays on the last
+        good checkpoint, which still resumes."""
+        rank = dist.get_rank()
+        world = dist.get_world_size()
+        last = world - 1
+        model, opt = self._stepped_model(distributed_env)
+        cfg = CheckpointConfig(dir=shared_tmp_dir, async_mode=mode)
+        mgr = CheckpointManager(cfg, model, opt, dp_info=(rank, world))
+        mgr.save(step=1, dataloader=_CursorLoader(cursor=100 + rank))
+
+        class BrokenLoader:
+            def state_dict(self):
+                raise OSError("cursor unavailable")
+
+        loader = BrokenLoader() if rank == last else _CursorLoader(cursor=200 + rank)
+        expected = OSError if rank == last else RuntimeError
+        reason = "cursor unavailable" if rank == last else rf"ranks \[{last}\]"
+        with pytest.raises(expected, match=reason):
+            mgr.save(step=2, dataloader=loader)
+        mgr.wait()
+
+        if rank == 0:
+            assert (Path(shared_tmp_dir) / "latest").resolve().name == "step_1"
+            assert not (Path(shared_tmp_dir) / "step_2" / "train_state.pt").exists()
+        resumed = _CursorLoader(cursor=-1)
+        step, _, _ = mgr.load(dataloader=resumed, exact_resume=True)
+        assert step == 1
+        assert resumed.restored == {"cursor": 100 + rank}
+        dist.barrier()
+
 
 class TestWeightDecayScopeAcrossStages:
     """The scope check runs on every rank or on none, whichever stages hold optimizer state.
