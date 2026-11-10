@@ -485,16 +485,14 @@ class TestPackedForward:
                 tile_global=tile_global,
             )
         batch = pack_vlm_samples(docs, seq_len=128, tokens_per_image=8, pad_id=0)
-        image_slots = lc.views_per_image * 8
         with torch.no_grad():
             packed, _ = self._forward(wrapper, batch)
             start = 0
             for doc in docs:
                 prefix, _ = wrapper(doc["pixel_values"].unsqueeze(0), doc["input_ids"].unsqueeze(0))
-                text_start = start + image_slots
-                text_end = text_start + doc["input_ids"].shape[0]
-                assert torch.allclose(packed[0, text_start:text_end], prefix[0], atol=1e-5)
-                start = text_end
+                end = start + doc["input_ids"].shape[0]
+                assert torch.allclose(packed[0, start:end], prefix[0], atol=1e-5)
+                start = end
 
     def test_documents_do_not_see_each_other(self):
         """Changing the first document leaves the second document's logits unchanged."""
