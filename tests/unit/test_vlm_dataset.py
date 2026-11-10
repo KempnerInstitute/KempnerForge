@@ -1097,7 +1097,23 @@ class TestPackVLMSamples:
         with pytest.raises(ValueError, match="no samples"):
             collator([])
 
-    @pytest.mark.parametrize("text_len", [40, 0])
+    def test_a_document_without_text_packs_its_image_alone(self):
+        doc = _doc(3, 10)
+        doc["text_len"] = torch.tensor(0)
+        batch = pack_vlm_samples([doc, _doc(2, 20)], seq_len=12, tokens_per_image=2, pad_id=0)
+        assert batch["image_starts"].tolist() == [0, 2]
+        assert batch["doc_ids"][0].tolist() == [0, 0, 1, 1, 1, 1] + [2] * 6
+        assert batch["text_rows"].tolist() == [0, 0]
+        assert batch["text_positions"].tolist() == [4, 5]
+
+    def test_a_trimmed_document_leaves_its_last_label_unsupervised(self):
+        doc = _doc(5, 10)
+        doc["text_len"] = torch.tensor(3)
+        batch = pack_vlm_samples([doc], seq_len=12, tokens_per_image=2, pad_id=0)
+        assert batch["input_ids"][0, 2:5].tolist() == [10, 11, 12]
+        assert batch["labels"][0, 2:5].tolist() == [11, 12, -100]
+
+    @pytest.mark.parametrize("text_len", [40, -1])
     def test_text_len_outside_the_ids_raises(self, text_len):
         doc = _doc(3, 10)
         doc["text_len"] = torch.tensor(text_len)

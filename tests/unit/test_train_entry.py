@@ -2855,6 +2855,18 @@ class TestVlmSourceBuilders:
         with pytest.raises(ValueError, match="cannot hold one packed document"):
             dp.build_data_pipeline(config, _runtime(), tokens_per_image=config.train.seq_len)
 
+    def test_packed_fit_check_runs_before_the_dataset_loads(self, monkeypatch):
+        seen: dict = {}
+        dp = _stub_loaders(monkeypatch, seen)
+        self._stub_vlm_modules(monkeypatch, seen)
+        config = self._vlm_data_config()
+        config.data.pack_sequences = True
+        with pytest.raises(ValueError, match="cannot hold one packed document"):
+            dp.build_data_pipeline(config, _runtime(), tokens_per_image=config.train.seq_len)
+        with pytest.raises(ValueError, match="built model's tokens per image"):
+            dp.build_data_pipeline(config, _runtime())
+        assert "dataset" not in seen
+
     def test_packed_tiled_image_budget_counts_every_view(self, monkeypatch):
         import kempnerforge.data.vlm_dataset as vlmd
 
