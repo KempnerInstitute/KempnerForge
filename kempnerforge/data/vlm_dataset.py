@@ -265,9 +265,14 @@ def _warn_sample_masked_for_prompt(min_text_len: int, max_text_len: int) -> None
 def _image_feature(features: Any, image_field: str) -> Any:
     """The column's image feature (inside a list feature if need be), or ``None``."""
     feature = features[image_field]
-    while not hasattr(feature, "decode_example") and hasattr(feature, "feature"):
-        feature = feature.feature
-    return feature if hasattr(feature, "decode_example") else None
+    while not hasattr(feature, "decode_example"):
+        if isinstance(feature, list) and feature:
+            feature = feature[0]
+        elif hasattr(feature, "feature"):
+            feature = feature.feature
+        else:
+            return None
+    return feature
 
 
 def _decode_image(feature: Any, value: Any) -> Any:
