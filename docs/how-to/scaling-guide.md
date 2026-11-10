@@ -230,7 +230,7 @@ for the 32-GPU MoE config per the benchmark.
 
 ### Running MoE + PP
 
-`JobConfig.__post_init__` raises this — MoE is data-dependent and
+`JobConfig.validate` raises this: MoE routing is data-dependent and
 doesn't compose with static pipeline stages. No workaround in
 KempnerForge today. See
 [MoE experiments § Composition caveats](moe-experiments.md#composition-caveats).

@@ -81,7 +81,8 @@ It holds `step` and `tokens_seen`, plus the run's `optimizer.weight_decay_scope`
   — `CheckpointManager.save()`/`load()`/`wait()`, `latest` symlink
   maintenance, retention cleanup.
 - [`kempnerforge/checkpoint/async_save.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/checkpoint/async_save.py)
-  — `AsyncCheckpointer`: sync / async / pinned-memory modes.
+  — `AsyncCheckpointer`: the sync and async save modes
+  (`async_with_pinned_mem` runs the same call as `async`).
 - [`kempnerforge/checkpoint/state.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/checkpoint/state.py)
   — `build_train_state` / `restore_train_state`, RNG capture.
 - [`kempnerforge/resilience/elastic.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/resilience/elastic.py)

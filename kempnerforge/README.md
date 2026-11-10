@@ -217,7 +217,7 @@ tests/         # unit, integration, distributed, and end-to-end tests
 
 ## Contributing
 
-See [`docs/contributing.md`](../docs/contributing.md) for the editor loop, build commands, and style conventions.
+See [`CONTRIBUTING.md`](../CONTRIBUTING.md) for the editor loop, build commands, and style conventions.
 
 ## License
 

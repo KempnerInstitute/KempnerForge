@@ -219,7 +219,7 @@ optimum after the fix.
 ### Why MFU is 1.5%
 
 MFU of 1.5% is correct for this model at this scale, not a bug. ~2.9B
-active parameters on 32 × H200 means ~90M active params per GPU —
+active parameters on 32 × H200 means ~90M active params per GPU;
 each H200 is designed for billions. Communication overhead (EP
 all-to-all, FSDP all-gather/reduce-scatter, TP collectives) dwarfs
 compute. For comparison, a dense 13B model hits 32.7% MFU on the same

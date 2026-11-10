@@ -2,8 +2,9 @@
 
 [`kempnerforge/resilience/elastic.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/resilience/elastic.py)
 is a small pile of SLURM-environment helpers. Despite the file name, it
-does not do elastic training: there is no rendezvous and no change of
-membership while a job runs. Most of the helpers are
+does not do elastic training: there is no elastic (torchelastic)
+rendezvous and no change of membership while a job runs. Most of the
+helpers are
 read-only introspection — they pull variables out of the environment
 and return typed data. The one with teeth is `resolve_resume_path`,
 documented on its own page; this page covers the rest.

@@ -12,7 +12,7 @@
 | Field | Value |
 |-------|-------|
 | Total params | ~9.2B |
-| Active params/token | ~2.9B |
+| Active params/token | ~2.9B (with the embedding and output head) |
 | dim | 2048 |
 | layers | 24 |
 | heads | 16 |

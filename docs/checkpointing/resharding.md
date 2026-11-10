@@ -79,15 +79,18 @@ typically don't need to rebalance mid-training.
   that tensor because the module wasn't in the model yet. Neither a
   resume nor a `checkpoint.load_path` warm start can add it:
   `exclude_from_loading` skips the whole model or the whole optimizer,
-  not single tensors. For a change `ModelConfig` can express (more
-  layers, for example), the weights-only round trip in
-  [HF conversion](hf-conversion.md) carries the old weights over:
+  not single tensors. For a change `ModelConfig` can express that adds
+  tensors without resizing existing ones (more layers, for example),
+  the weights-only round trip in [HF conversion](hf-conversion.md)
+  carries the old weights over:
   `dcp-to-hf` with the old config, then `hf-to-dcp` with the new one,
   which leaves the new parameters at their initial values with a
   warning. The export casts the weights to the export dtype, bfloat16
   unless you choose another (see [Dtypes](hf-conversion.md#dtypes)),
   and the result has no optimizer state or `train_state.pt`, so the
-  run starts at step 0.
+  run starts at step 0. A change that also resizes an existing tensor,
+  such as more experts (the router grows) or a larger vocabulary, fails
+  in `hf-to-dcp` with a size mismatch.
 - **Extra parameter**: the saver wrote a tensor the loader doesn't
   want (you removed a module). DCP ignores the extra shard —
   silently, so watch the checkpoint size rather than relying on

@@ -323,7 +323,7 @@ tests/
 3. Add validation in `__post_init__` if the field has constraints.
 4. If it needs to be in `schema.py` re-exports, add it there.
 5. Add unit tests in `tests/unit/test_config.py`: default value, valid values, rejection of invalid values.
-6. Cross-section validation (e.g., "MoE + PP is not supported") goes in `JobConfig.__post_init__` in `kempnerforge/config/job.py`.
+6. Cross-section validation (e.g., "MoE + PP is not supported") goes in `JobConfig.validate(world_size)` in `kempnerforge/config/job.py`.
 
 ### New model component
 
@@ -396,7 +396,7 @@ uv run python scripts/train.py configs/train/debug.toml \
 Config rules:
 - New fields must default to disabled/off so existing configs keep working.
 - Validate in `__post_init__` — fail fast with a clear `ValueError`.
-- Cross-section validation (e.g., "EP requires MoE") goes in `JobConfig.__post_init__`.
+- Cross-section validation (e.g., "EP requires MoE") goes in `JobConfig.validate(world_size)`.
 
 ## Writing Docs
 

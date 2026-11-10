@@ -58,7 +58,7 @@ Assume preflight has passed. Walk the user through the status of the subsystems 
 ### Resilience (kempnerforge/resilience/)
 - **Implemented**: SIGTERM/SIGUSR1 handlers for SLURM preemption (`signal_handler.py`), GPU compute and memory health probes (`health.py`), NCCL liveness via all-reduce (`health.py`), SLURM job info and auto-resume helpers (`elastic.py`).
 - **Tested**: `test_resilience.py`.
-- **Gaps**: No elastic training: no rendezvous, and a job cannot gain or lose nodes while it runs. No automatic rollback to a specific earlier checkpoint on persistent NaN. Recommendation today is manual: the NaN handler warns and exits with guidance. No integration with external HPC monitoring (Prometheus / DCGM alerts).
+- **Gaps**: No elastic training: no elastic (torchelastic) rendezvous, and a job cannot gain or lose nodes while it runs. No automatic rollback to a specific earlier checkpoint on persistent NaN. Recommendation today is manual: the NaN handler warns and exits with guidance. No integration with external HPC monitoring (Prometheus / DCGM alerts).
 
 ### Metrics (kempnerforge/metrics/)
 - **Implemented**: `MetricsTracker` with EMA smoothing, WandB and TensorBoard backends (`tracker.py`), MFU computation (`mfu.py`), peak memory tracking with optional snapshot export (`memory.py`), rank-aware logger (`logger.py`).

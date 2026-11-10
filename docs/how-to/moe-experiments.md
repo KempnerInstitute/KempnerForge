@@ -125,9 +125,9 @@ to go faster.
 
 Rule of thumb — turn on EP when:
 
-1. **Expert weights > 50% of total model memory.** For a 4B-total
-   MoE with 8 experts and `moe_frequency=1`, experts are typically
-   70-80% of parameters. EP=2 cuts that in half per rank.
+1. **Expert weights > 50% of total model memory.** In the 9.2B-total
+   MoE presets (8 experts, `moe_frequency=1`), the experts hold 8.46B
+   of the 9.23B parameters, about 92%. EP=2 cuts that in half per rank.
 2. **You're OOMing with FSDP alone.** FSDP shards by tensor, but
    experts live as `(E, dim, hidden)` parameters (packed) or as
    `ModuleList`. FSDP wraps them but can't split across the expert
@@ -142,7 +142,7 @@ Rule of thumb — turn on EP when:
 Constraints:
 
 - `num_experts` must be divisible by `ep` (validated in
-  `JobConfig.__post_init__`).
+  `JobConfig.validate`).
 - `ep > 1` with `num_experts == 0` is rejected — EP requires MoE.
 - Typical combinations: `ep=2` for 8 experts, `ep=4` for 8-16 experts,
   `ep=8` for 32+ experts.
@@ -231,7 +231,7 @@ at bf16 regardless.
 FP8 + EP composes fine — they're orthogonal (EP moves experts across
 ranks, FP8 wouldn't touch them anyway).
 
-FP8 + TP does **not** compose — `JobConfig.__post_init__` rejects it
+FP8 + TP does **not** compose: `JobConfig.validate` rejects it
 because `Float8Linear`'s DTensor strategy is incomplete. See
 [FP8 § TP incompatibility](../distributed/fp8.md#tp-incompatibility).
 
@@ -239,10 +239,11 @@ because `Float8Linear`'s DTensor strategy is incomplete. See
 
 ```
 MoE + Pipeline Parallelism is not supported. MoE layers use
-all-to-all communication which conflicts with the pipeline schedule.
+data-dependent routing that is incompatible with pipeline stage
+splitting. Use FSDP, TP, or EP instead.
 ```
 
-Raised in `JobConfig.__post_init__` when `num_experts > 0` and
+Raised in `JobConfig.validate` when `num_experts > 0` and
 `pp > 1`. For very large MoE runs that need PP, you'd need a
 schedule that interleaves all-to-all with pipeline microbatches —
 not in KempnerForge today.

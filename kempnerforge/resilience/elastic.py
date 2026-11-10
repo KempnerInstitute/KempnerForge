@@ -1,9 +1,9 @@
 """SLURM job and auto-resume helpers.
 
 Despite the module name, nothing here is elastic training: there is no
-rendezvous and no change of membership while a job runs. The helpers read
-the SLURM job's environment and find the checkpoint a restarted run
-resumes from:
+elastic (torchelastic) rendezvous and no change of membership while a job
+runs. The helpers read the SLURM job's environment and find the checkpoint
+a restarted run resumes from:
 
 - SLURM job info detection
 - Requeue detection
