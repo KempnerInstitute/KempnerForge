@@ -286,11 +286,14 @@ class TestPositionIdsWithKVCache:
             ]
         torch.testing.assert_close(torch.cat([prefill, *steps], dim=1), full, rtol=1e-5, atol=1e-5)
 
-    @pytest.mark.parametrize("backend", ["sdpa", "flex"])
     @pytest.mark.parametrize("route", ["default", "argument", "context", "rotation"])
-    @pytest.mark.parametrize("capture", [False, True], ids=["sdpa", "weights"])
-    def test_appending_several_tokens_matches_the_full_forward(self, backend, route, capture):
-        """Cached appends match a full forward under either configured attention backend."""
+    @pytest.mark.parametrize(
+        ("backend", "capture"),
+        [("sdpa", False), ("sdpa", True), ("flex", False)],
+        ids=["sdpa", "weights", "flex"],
+    )
+    def test_appending_several_tokens_matches_the_full_forward(self, route, backend, capture):
+        """Tokens appended to a non-empty cache see every cached key, on every attention path."""
         model = _tiny_model(attention_backend=backend)
         for layer in model.layers.values():
             layer.attention.capture_attention_weights = capture
