@@ -147,7 +147,9 @@ def apply_float8(model: Transformer, enable_fsdp_float8_all_gather: bool = True)
     with dynamic tensorwise scaling. Master weights keep their dtype (bf16, or fp32).
 
     Must be called AFTER apply_tensor_parallel / apply_expert_parallel
-    and BEFORE apply_ac / apply_fsdp2.
+    and BEFORE apply_ac / apply_fsdp2. The shape check below reads each Linear's
+    global ``in_features`` and ``out_features``, which are its weight's dimensions
+    only without TP; config validation rejects FP8 with TP.
 
     Routed MoE experts are excluded because they use grouped GEMM
     (torch._grouped_mm), which bypasses Float8Linear.forward(). The shared expert
@@ -164,6 +166,10 @@ def apply_float8(model: Transformer, enable_fsdp_float8_all_gather: bool = True)
             (halves communication volume). Requires FSDP2 to be applied after.
             Must be False when TP is active — the float8 weight wrapper calls
             aten.is_pinned on DTensors, which has no sharding strategy yet.
+
+    Raises:
+        ValueError: If the model has Linear layers but none of them converts, so an
+            FP8 run would train entirely in high precision.
     """
     import dataclasses
 
@@ -208,6 +214,17 @@ def apply_float8(model: Transformer, enable_fsdp_float8_all_gather: bool = True)
 
     convert_to_float8_training(model, config=config, module_filter_fn=_filter_fn)
 
+    kept = ", ".join(f"{name} x{count}" for name, count in unaligned.items())
+    if counts["linear"] and not counts["converted"]:
+        raise ValueError(
+            f"Float8 converted 0 of {counts['linear']} Linear layers, so "
+            "train.mixed_precision='fp8' would train entirely in high precision. Experts, "
+            "shared experts and routers are excluded by name, and torch._scaled_mm needs both "
+            f"dimensions of a weight divisible by {FP8_DIM_MULTIPLE}, which these are not: "
+            f"{kept or 'none'}. Make those dimensions multiples of {FP8_DIM_MULTIPLE}, or "
+            "train in bf16."
+        )
+
     logger.info(
         f"Applied Float8 training: recipe=TENSORWISE, "
         f"fsdp_float8_all_gather={enable_fsdp_float8_all_gather}, "
@@ -216,8 +233,7 @@ def apply_float8(model: Transformer, enable_fsdp_float8_all_gather: bool = True)
     if unaligned:
         logger.warning(
             f"Float8 kept {sum(unaligned.values())} Linear layer(s) in high precision because "
-            f"torch._scaled_mm needs both dimensions divisible by {FP8_DIM_MULTIPLE}: "
-            + ", ".join(f"{name} x{count}" for name, count in unaligned.items())
+            f"torch._scaled_mm needs both dimensions divisible by {FP8_DIM_MULTIPLE}: {kept}"
         )
 
 

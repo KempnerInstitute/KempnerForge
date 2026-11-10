@@ -78,6 +78,23 @@ class TestFP8Config:
             train=TrainConfig(mixed_precision="fp8"),
         ).validate(world_size=1)
 
+    @pytest.mark.parametrize(("batch_size", "ok"), [(1, False), (4, True)])
+    def test_tokens_per_micro_batch_divisible_by_16(self, batch_size, ok):
+        """The FP8 weight gradient multiplies over batch_size * seq_len tokens."""
+        from kempnerforge.config.schema import JobConfig, ModelConfig
+
+        config = JobConfig(
+            model=ModelConfig(dim=64, n_layers=2, n_heads=4, vocab_size=256, max_seq_len=128),
+            train=TrainConfig(mixed_precision="fp8", batch_size=batch_size, seq_len=100),
+        )
+        if ok:
+            config.validate(world_size=1)
+            return
+        with pytest.raises(
+            ValueError, match=r"needs train.batch_size \* train.seq_len divisible by 16 \(got 1 \*"
+        ):
+            config.validate(world_size=1)
+
 
 class TestApplyFloat8:
     """Test apply_float8 converts the right modules and skips experts."""
@@ -149,6 +166,38 @@ class TestApplyFloat8:
 
         float8_count = sum(1 for m in moe_transformer.modules() if isinstance(m, Float8Linear))
         assert float8_count > 0, "No Float8Linear modules found — conversion failed"
+
+    def test_name_rules_skip_an_aligned_router_and_experts(self):
+        """With 16 experts every MoE Linear is a multiple of 16, so only the names keep it out."""
+        from torchao.float8.float8_linear import Float8Linear
+
+        from kempnerforge.config.schema import ModelConfig
+        from kempnerforge.distributed.parallel import apply_float8
+        from kempnerforge.model.transformer import Transformer
+
+        model = Transformer(
+            ModelConfig(
+                dim=64,
+                n_layers=2,
+                n_heads=4,
+                vocab_size=256,
+                num_experts=16,
+                moe_top_k=2,
+                moe_shared_experts=1,
+            )
+        )
+        moe = {
+            fqn: m
+            for fqn, m in model.named_modules()
+            if isinstance(m, torch.nn.Linear) and ".mlp." in fqn
+        }
+        assert all(m.in_features % 16 == 0 and m.out_features % 16 == 0 for m in moe.values())
+        assert any(fqn.endswith(".router.gate") for fqn in moe)
+        assert any(".shared_expert." in fqn for fqn in moe)
+        apply_float8(model, enable_fsdp_float8_all_gather=False)
+        kept = {fqn for fqn, m in model.named_modules() if type(m) is torch.nn.Linear}
+        assert kept == set(moe)
+        assert isinstance(model.output_head.proj, Float8Linear)
 
     def test_apply_float8_forward_backward(self, small_transformer):
         """Float8 model produces finite output and gradients on CPU (emulated)."""
@@ -236,11 +285,34 @@ class TestFloat8Alignment:
         )
         with caplog.at_level(logging.INFO, logger="kempnerforge.distributed.parallel"):
             apply_float8(model, enable_fsdp_float8_all_gather=False)
-        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        records = [r for r in caplog.records if r.name == "kempnerforge.distributed.parallel"]
+        warnings = [r.getMessage() for r in records if r.levelno == logging.WARNING]
         assert len(warnings) == 1
         assert "layers.*.attention.k_proj (8x64) x3" in warnings[0]
         assert "layers.*.attention.v_proj (8x64) x3" in warnings[0]
-        assert any("converted 16 of 22 Linear layers" in r.getMessage() for r in caplog.records)
+        assert any("converted 16 of 22 Linear layers" in r.getMessage() for r in records)
+
+    def test_raises_when_no_linear_converts(self):
+        """head_dim 10, an FFN of 200 and a 50257 vocabulary leave no Linear FP8 can run."""
+        from torchao.float8.float8_linear import Float8Linear
+
+        from kempnerforge.config.schema import ModelConfig
+        from kempnerforge.distributed.parallel import apply_float8
+        from kempnerforge.model.transformer import Transformer
+
+        model = Transformer(
+            ModelConfig(
+                dim=64,
+                n_layers=2,
+                n_heads=4,
+                head_dim_override=10,
+                ffn_hidden_dim=200,
+                vocab_size=50257,
+            )
+        )
+        with pytest.raises(ValueError, match=r"converted 0 of 15 Linear layers.*\(50257x64\)"):
+            apply_float8(model, enable_fsdp_float8_all_gather=False)
+        assert not any(isinstance(m, Float8Linear) for m in model.modules())
 
     def test_mixed_model_runs_forward_backward(self):
         """Float8 and high-precision Linears in one block train together (CPU emulation)."""

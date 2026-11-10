@@ -1645,11 +1645,11 @@
       },
       "tests/unit/test_fp8.py": {
         "classes": [
-          "TestFP8Config(9)",
-          "TestApplyFloat8(4)",
-          "TestFloat8Alignment(3)"
+          "TestFP8Config(10)",
+          "TestApplyFloat8(5)",
+          "TestFloat8Alignment(4)"
         ],
-        "count": 16
+        "count": 19
       },
       "tests/unit/test_packing.py": {
         "classes": [
