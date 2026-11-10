@@ -71,8 +71,9 @@ For `sigmoid_topk`, the coefficient has no effect by default
 
 On a MoT VLM each modality's router gets the same pressure per unit of
 the coefficient as a text model's router, but the logged
-`moe/aux_loss` sums one term per router, so an image + text model
-reads about twice a text model's; see
+`moe/aux_loss` sums one term per router, so with balanced routers an
+image + text MoT model reads about twice what a text model with the
+same MoE layers reads; see
 [Aux loss § Training-loop integration](../moe/aux-loss-and-balancing.md#training-loop-integration).
 
 ## Diagnose hot/cold experts

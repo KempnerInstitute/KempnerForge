@@ -126,11 +126,13 @@ if self.bias_schedule == "linear_warmup":
 The schedule needs the current training step, which is pushed in each
 step via `model.set_moe_step(step, max_steps)` in
 the step body. `Transformer.set_moe_step` walks only sigmoid
-routers, including each MoT modality's:
+routers, each MoT modality's included. `_moe_mlps()` yields every
+`MoEMLP`: the one a flat MoE layer holds, and on a MoT layer the one
+each modality holds.
 
 ```python
 # kempnerforge/model/transformer.py — set_moe_step
-for _, _, mlp in self._moe_mlps():   # every MoEMLP, one per MoT modality
+for _, _, mlp in self._moe_mlps():
     if isinstance(mlp.router, SigmoidTopKRouter):
         mlp.router.set_step(step, max_steps)
 ```
