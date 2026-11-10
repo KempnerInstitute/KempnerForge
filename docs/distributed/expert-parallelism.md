@@ -136,7 +136,7 @@ which places each rank's experts among all `num_experts`:
 Packed weights that FSDP shards need torch 2.10 or newer for this:
 joining the EP mesh to FSDP's uses `DeviceMesh._get_root_mesh`, which
 arrived in 2.10. `pyproject.toml` allows torch 2.6 and newer, and with
-an older torch a save or load of such a layer raises and names the
+torch 2.6 to 2.9 a save or load of such a layer raises and names the
 version it needs. Unpacked experts need no particular torch version.
 
 The presented tensors are views of each rank's own, so a save copies,
