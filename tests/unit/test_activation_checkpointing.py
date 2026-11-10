@@ -3,14 +3,13 @@
 ``full`` wraps each child of ``layers`` and ``cross_attention_layers`` by
 position, so the MoT, MoMa and cross-attention blocks are checkpointed like
 ``TransformerBlock``; ``selective`` wraps the ``Attention``, ``MoTAttention``
-and ``CrossAttention`` modules inside them. Each model is a tiny one built on
-CPU through ``build_parallel_model``, the path training takes.
+and ``CrossAttention`` modules inside them. Most models are tiny ones built
+on CPU through ``build_parallel_model``, the path training takes.
 """
 
 from __future__ import annotations
 
 import logging
-import socket
 from collections import Counter
 
 import pytest
@@ -38,6 +37,7 @@ from kempnerforge.config.vlm import (
 )
 from kempnerforge.distributed.parallel import apply_ac, build_parallel_model, default_mp_policy
 from kempnerforge.distributed.pipeline_parallel import build_stage_module
+from kempnerforge.metrics.logger import get_logger
 from kempnerforge.model.mot import MoTBlock, mot_warm_start_from_text_stack
 from kempnerforge.model.transformer import Transformer
 from kempnerforge.model.vlm import inner_transformer
@@ -131,9 +131,12 @@ def _wrapped(model: nn.Module) -> dict[str, int]:
 def parallel_logs(caplog, monkeypatch):
     """Messages ``kempnerforge.distributed.parallel`` logged at one level, INFO by default.
 
-    Once anything configures KempnerForge logging, the ``kempnerforge`` logger
-    stops propagating to the root logger where caplog listens.
+    Configuring KempnerForge logging, which the first ``get_logger`` call does once,
+    stops the ``kempnerforge`` logger from propagating to the root logger where caplog
+    listens. The fixture configures it first, so a module imported later in the test,
+    such as the freeze helpers a VLM build loads, cannot turn propagation back off.
     """
+    get_logger(__name__)
     monkeypatch.setattr(logging.getLogger("kempnerforge"), "propagate", True)
     caplog.set_level(logging.INFO, logger="kempnerforge.distributed.parallel")
 
@@ -169,6 +172,18 @@ class TestWhatGetsWrapped:
         model = _build(arch, mode)
         assert apply_ac(inner_transformer(model), mode) == 0
         assert _wrapped(model) == WRAPPED[(arch, mode)]
+
+    @pytest.mark.parametrize("mode", MODES)
+    def test_accepts_the_mode_as_its_string_value(self, mode):
+        model = _build("text", NONE)
+        apply_ac(model, mode.value)
+        assert _wrapped(model) == WRAPPED[("text", mode)]
+
+    def test_rejects_an_unknown_mode(self):
+        model = _build("text", NONE)
+        with pytest.raises(ValueError, match="not a valid ActivationCheckpointing"):
+            apply_ac(model, "partial")
+        assert _wrapped(model) == {}
 
     def test_full_wraps_a_pipeline_stage(self):
         """A pipeline stage has ``layers`` and no ``cross_attention_layers``."""
@@ -334,23 +349,14 @@ class TestMoTWarmStart:
         _assert_warm_started(transformer, source)
 
 
-def _free_port() -> int:
-    """An unused local TCP port for the gloo rendezvous."""
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
 def _full(grad: torch.Tensor) -> torch.Tensor:
     """The whole gradient, gathered when FSDP2 holds it as a sharded ``DTensor``."""
     return grad.full_tensor() if isinstance(grad, DTensor) else grad
 
 
-def _check_fsdp_parity(rank: int, world: int, port: int) -> None:
+def _check_fsdp_parity(rank: int, world: int, store: str) -> None:
     """Under FSDP2, checkpointed models match their unchecked twins on each arch and mode."""
-    dist.init_process_group(
-        "gloo", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=world
-    )
+    dist.init_process_group("gloo", init_method=f"file://{store}", rank=rank, world_size=world)
     try:
         mesh = init_device_mesh("cpu", (world,), mesh_dim_names=("dp_shard",))
         rows = slice(rank * 2, rank * 2 + 2)
@@ -381,6 +387,6 @@ def _check_fsdp_parity(rank: int, world: int, port: int) -> None:
 
 
 class TestUnderFsdp2:
-    def test_checkpointed_vlm_blocks_match_under_fsdp2(self):
+    def test_checkpointed_vlm_blocks_match_under_fsdp2(self, tmp_path):
         """Two gloo ranks shard each VLM with FSDP2 after ``apply_ac`` wrapped its blocks."""
-        mp.spawn(_check_fsdp_parity, args=(2, _free_port()), nprocs=2)
+        mp.spawn(_check_fsdp_parity, args=(2, str(tmp_path / "store")), nprocs=2)

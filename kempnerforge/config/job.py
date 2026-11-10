@@ -243,6 +243,21 @@ class JobConfig:
                 "or TP without FP8."
             )
 
+        if (
+            self.model.is_moe
+            and self.model.moe_router == "sigmoid_topk"
+            and self.train.activation_checkpointing == "full"
+        ):
+            raise ValueError(
+                "model.moe_router = 'sigmoid_topk' does not support "
+                "train.activation_checkpointing = 'full': the sigmoid router updates its expert "
+                "bias in place in every training forward, so the backward's replay of a "
+                "checkpointed block routes with a moved bias, can pick other experts than the "
+                "forward did, and then raises CheckpointError. Use activation_checkpointing = "
+                "'selective', which checkpoints attention only and leaves the MoE layers out "
+                "of the replay."
+            )
+
         if self.model.is_moe and self.distributed.pp > 1:
             alternatives = (
                 "Use FSDP instead; MoT runs neither TP nor EP."

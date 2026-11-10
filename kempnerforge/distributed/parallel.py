@@ -130,7 +130,7 @@ def _is_checkpointed(module: torch.nn.Module) -> bool:
     return any(isinstance(m, CheckpointWrapper) for m in module.modules())
 
 
-def apply_ac(model: Transformer | PipelineStageModule, mode: ActivationCheckpointing) -> int:
+def apply_ac(model: Transformer | PipelineStageModule, mode: ActivationCheckpointing | str) -> int:
     """Apply activation checkpointing to the model's blocks.
 
     Must be called BEFORE apply_fsdp2.
@@ -144,7 +144,8 @@ def apply_ac(model: Transformer | PipelineStageModule, mode: ActivationCheckpoin
 
     Args:
         model: Transformer model or pipeline stage.
-        mode: Checkpointing mode, "none", "full", or "selective". ``full``
+        mode: Checkpointing mode, "none", "full", or "selective", as an
+            ``ActivationCheckpointing`` member or its string value. ``full``
             checkpoints every block (maximum memory savings); ``selective``
             checkpoints the ``Attention``, ``MoTAttention`` and
             ``CrossAttention`` modules inside each block (balanced trade-off)
@@ -153,6 +154,7 @@ def apply_ac(model: Transformer | PipelineStageModule, mode: ActivationCheckpoin
     Returns:
         The number of modules this call wrapped.
     """
+    mode = ActivationCheckpointing(mode)
     if mode == ActivationCheckpointing.none:
         return 0
 

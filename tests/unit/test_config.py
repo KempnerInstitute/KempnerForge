@@ -681,6 +681,31 @@ class TestJobConfig:
         )
         config.validate(world_size=2)
 
+    @pytest.mark.parametrize("arch", [None, "joint_decoder", "cross_attention", "mot"])
+    def test_validate_sigmoid_router_with_full_ac_rejected(self, arch) -> None:
+        """The sigmoid router moves its bias in every forward, so a replayed block can route
+        tokens to other experts; every arch with MoE layers is rejected, text included."""
+        config = _vlm_job(arch, num_experts=2)
+        config.model.moe_router = "sigmoid_topk"
+        config.train.activation_checkpointing = ActivationCheckpointing.full
+        match = r"'sigmoid_topk' does not support .*'full'.*= 'selective'"
+        with pytest.raises(ValueError, match=match):
+            config.validate(world_size=1)
+
+    @pytest.mark.parametrize(
+        ("router", "mode"),
+        [
+            ("sigmoid_topk", ActivationCheckpointing.selective),
+            ("sigmoid_topk", ActivationCheckpointing.none),
+            ("softmax_topk", ActivationCheckpointing.full),
+        ],
+    )
+    def test_validate_sigmoid_router_without_full_ac_passes(self, router, mode) -> None:
+        config = _vlm_job("mot", num_experts=2)
+        config.model.moe_router = router
+        config.train.activation_checkpointing = mode
+        config.validate(world_size=1)
+
     def test_validate_dense_with_pp_passes(self):
         config = JobConfig(
             model=ModelConfig(tie_embeddings=False),
