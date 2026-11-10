@@ -1133,14 +1133,24 @@
             "forward(ctx, x, output_split_sizes, input_split_sizes, group)",
             "backward(ctx, grad_output)"
           ]
+        },
+        "_ScaleGrad": {
+          "purpose": "Identity forward that scales the gradient, averaging routed-expert gradients over the EP group",
+          "methods": [
+            "forward(ctx, x, scale)",
+            "backward(ctx, grad_output)"
+          ]
         }
       },
       "functions": [
         "ep_dispatch_and_compute(x, weights, indices, moe, ep_group, local_expert_start, num_local_experts, ep_world_size, gradient_scale) -> Tensor",
-        "apply_expert_parallel(model, device_mesh)"
+        "apply_expert_parallel(model, device_mesh)",
+        "expert_parallel_params(model) -> (list[Parameter], ProcessGroup | None)"
       ],
       "tested_by": [
-        "tests/distributed/test_ep.py"
+        "tests/distributed/test_ep.py",
+        "tests/unit/test_ep_gradients.py",
+        "tests/unit/test_expert_parallel.py"
       ]
     },
     "kempnerforge/distributed/pipeline_parallel.py": {
@@ -1172,10 +1182,11 @@
     "kempnerforge/distributed/utils.py": {
       "functions": [
         "get_dp_info(device_mesh) -> (dp_rank, dp_size)",
-        "clip_grad_norm_(model, max_norm, foreach) -> Tensor"
+        "clip_grad_norm_(model, max_norm, foreach, pp_group) -> Tensor"
       ],
       "tested_by": [
-        "tests/unit/test_distributed.py::TestClipGradNorm"
+        "tests/unit/test_distributed.py::TestClipGradNorm",
+        "tests/unit/test_ep_gradients.py::TestClipUnderExpertParallelism"
       ]
     },
     "kempnerforge/checkpoint/state.py": {
