@@ -838,7 +838,8 @@ class TestHuggingFaceVLMDataset:
         """A prompt value that is not a string is rejected, not dropped as no prompt."""
         ds = _prompted_dataset(tmp_path, monkeypatch, ["ab"])
         row = {"image": _make_image(32), "caption": "xyz", "prompt": ["ab"]}
-        monkeypatch.setattr(ds, "_ds", [row])
+        monkeypatch.setattr(ds, "_text_rows", [row])
+        monkeypatch.setattr(ds, "_image_rows", [row])
         with pytest.raises(TypeError, match="'prompt' must be str or None, got list"):
             _ = ds[0]
 
