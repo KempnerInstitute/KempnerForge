@@ -135,8 +135,9 @@ class Attention(nn.Module):
 
         Args:
             x: Input tensor of shape (batch, seq_len, dim).
-            rope_cos: RoPE cosine frequencies, shape (seq_len, head_dim // 2).
-            rope_sin: RoPE sine frequencies, shape (seq_len, head_dim // 2).
+            rope_cos: RoPE cosine frequencies, shape (seq_len, head_dim // 2) shared
+                across the batch or (batch, seq_len, head_dim // 2) per row.
+            rope_sin: RoPE sine frequencies, same shape as ``rope_cos``.
             kv_cache: Optional KV cache for incremental generation. The tokens
                 of this forward are appended to it, and each attends to every
                 cached key and to the appended keys up to its own position.
@@ -154,9 +155,15 @@ class Attention(nn.Module):
             Output tensor of shape (batch, seq_len, dim).
 
         Raises:
+            ValueError: If ``attn_mask`` is combined with ``kv_cache``.
             NotImplementedError: If ``capture_attention_weights`` is set and
                 ``attn_mask`` is a ``BlockMask``.
         """
+        if kv_cache is not None and attn_mask is not None:
+            raise ValueError(
+                "attn_mask (dense or BlockMask) cannot be combined with kv_cache; "
+                "visibility masks are training-only"
+            )
         if isinstance(attn_mask, BlockMask) and self.capture_attention_weights:
             raise NotImplementedError(
                 "capture_attention_weights requires attention_backend='sdpa'. "
@@ -189,10 +196,6 @@ class Attention(nn.Module):
             v = v.repeat_interleave(self.n_rep, dim=1)
 
         if isinstance(attn_mask, BlockMask):
-            assert kv_cache is None, (
-                "a BlockMask does not compose with kv_cache decode; a decode step "
-                "re-derives its own mask as the key axis grows."
-            )
             out = flex_attention_fn(q.is_cuda)(
                 q,
                 k,
@@ -205,10 +208,6 @@ class Attention(nn.Module):
             out, attn_weights = self._attention_with_weights(q, k, v, seq_len, attn_mask, kv_cache)
             self.last_attention_weights = attn_weights.detach().cpu()
         elif attn_mask is not None:
-            assert kv_cache is None, (
-                "a dense attn_mask does not compose with kv_cache decode; it is square "
-                "over the residual stream, while a cache grows the key axis every step."
-            )
             with self._sdpa_context():
                 out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         elif seq_len > 1 and k.shape[2] > seq_len:
