@@ -121,11 +121,12 @@ uv run torchrun --nproc_per_node=4 scripts/train.py configs/train/debug.toml \
     --checkpoint.dir=checkpoints/debug_4gpu
 
 # SLURM (single node, 4 GPUs): use your cluster's partition and account
+mkdir -p logs
 sbatch --partition=<partition> --account=<account> scripts/slurm/singlenode.sh \
     configs/train/debug.toml --checkpoint.dir=checkpoints/debug_slurm
 ```
 
-`debug.toml` trains a 20M-parameter model on synthetic tokens, so these commands need no dataset, but they do need CUDA GPUs: one for the debug run, four for the other two. A run resumes from the latest checkpoint in its `checkpoint.dir`, so each command writes to its own. Most other configs in `configs/train/` set `dataset_path = "/path/to/tokenized/dataset"`, a placeholder: pass `--data.dataset_path=<your shards>` or edit the config before running them (see [available configs](docs/reference/available-configs.md)). The sbatch scripts in `scripts/slurm/` carry placeholder `--partition` and `--account` values in their `#SBATCH` headers; the `sbatch` flags above override them, or you can edit the headers.
+`debug.toml` trains a 20M-parameter model on synthetic tokens, so these commands need no dataset, but they do need CUDA GPUs: one for the debug run, four for the other two. A run resumes from the latest checkpoint in its `checkpoint.dir`, so each command writes to its own. Most other configs in `configs/train/` set `dataset_path = "/path/to/tokenized/dataset"`, a placeholder: pass `--data.dataset_path=<your shards>` or edit the config before running them (see [available configs](docs/reference/available-configs.md)). The sbatch scripts in `scripts/slurm/` carry placeholder `--partition` and `--account` values in their `#SBATCH` headers; the `sbatch` flags above override them, or you can edit the headers. The scripts write their output to `logs/`; Slurm 23.02 and later create it, and older versions fail the job silently without it.
 
 Further reading:
 - [`docs/getting-started/quickstart.md`](docs/getting-started/quickstart.md): 5-minute walkthrough (install → debug → multi-GPU → custom data → optimizer swap → MoE → hooks)
