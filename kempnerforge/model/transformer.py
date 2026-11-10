@@ -456,7 +456,9 @@ class Transformer(nn.Module):
         Returns:
             Logits tensor of shape ``(batch, out_seq_len, vocab_size)``
             where ``out_seq_len == seq_len`` normally or the sliced
-            length when ``modality.output_slice`` is set. Built with
+            length when ``modality.output_slice`` is set, or ``(1, M,
+            vocab_size)`` over the ``M`` positions ``modality.output_rows``
+            and ``output_positions`` pick. Built with
             ``include_output_head=False``, returns the final hidden
             states ``(batch, out_seq_len, dim)`` instead.
         """

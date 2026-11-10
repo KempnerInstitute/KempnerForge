@@ -33,19 +33,19 @@ from torch.nn.attention.flex_attention import BlockMask, create_block_mask, flex
 
 _FLEX_STATIC = torch.compile(flex_attention, dynamic=False)
 _CREATE_BLOCK_MASK_STATIC = torch.compile(create_block_mask, dynamic=False)
+_FLEX_DYNAMIC = torch.compile(flex_attention)
+_CREATE_BLOCK_MASK_DYNAMIC = torch.compile(create_block_mask)
 _FLEX_COMPILED = _FLEX_STATIC
 _CREATE_BLOCK_MASK_COMPILED = _CREATE_BLOCK_MASK_STATIC
 
 
 def use_dynamic_flex_shapes(enabled: bool) -> None:
-    """Compile the flex helpers for a varying batch size (packed VLM rows), or pin shapes again."""
+    """Select the flex helpers compiled for a varying batch size, or the pinned-shape pair."""
     global _FLEX_COMPILED, _CREATE_BLOCK_MASK_COMPILED
-    if enabled:
-        _FLEX_COMPILED = torch.compile(flex_attention)
-        _CREATE_BLOCK_MASK_COMPILED = torch.compile(create_block_mask)
-    else:
-        _FLEX_COMPILED = _FLEX_STATIC
-        _CREATE_BLOCK_MASK_COMPILED = _CREATE_BLOCK_MASK_STATIC
+    _FLEX_COMPILED = _FLEX_DYNAMIC if enabled else _FLEX_STATIC
+    _CREATE_BLOCK_MASK_COMPILED = (
+        _CREATE_BLOCK_MASK_DYNAMIC if enabled else _CREATE_BLOCK_MASK_STATIC
+    )
 
 
 def flex_attention_fn(compiled: bool) -> Callable[..., Any]:

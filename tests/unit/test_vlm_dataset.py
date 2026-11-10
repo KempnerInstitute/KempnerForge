@@ -1073,11 +1073,11 @@ class TestPackVLMSamples:
         assert batch["image_starts"].tolist() == [0, 2, 4]
         assert batch["input_ids"][0, 6:8].tolist() == [10, 11]
 
-    def test_without_text_len_every_position_is_real(self):
+    def test_without_text_len_raises(self):
         doc = _doc(3, 10)
         del doc["text_len"]
-        batch = pack_vlm_samples([doc], seq_len=12, tokens_per_image=2, pad_id=0)
-        assert batch["doc_ids"][0].tolist() == [0] * 10 + [1] * 2
+        with pytest.raises(ValueError, match="every sample needs text_len"):
+            pack_vlm_samples([doc], seq_len=12, tokens_per_image=2, pad_id=0)
 
     def test_oversize_document_raises(self):
         with pytest.raises(ValueError, match="does not fit a row"):

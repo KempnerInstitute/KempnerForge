@@ -388,6 +388,7 @@ def run_training(
         run_training_loop(session, step=step, tokens_seen=tokens_seen)
         finished = True
     finally:
+        use_dynamic_flex_shapes(False)
         if tracker is not None:
             tracker.close()
         if finished:

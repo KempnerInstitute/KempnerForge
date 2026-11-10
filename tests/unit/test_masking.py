@@ -954,8 +954,10 @@ def test_dynamic_flex_shapes_toggle_swaps_and_restores_the_compiled_helpers():
     static = masking.flex_attention_fn(True)
     try:
         masking.use_dynamic_flex_shapes(True)
-        assert masking.flex_attention_fn(True) is not static
-        assert masking._CREATE_BLOCK_MASK_COMPILED is not masking._CREATE_BLOCK_MASK_STATIC
+        assert masking.flex_attention_fn(True) is masking._FLEX_DYNAMIC
+        assert masking._CREATE_BLOCK_MASK_COMPILED is masking._CREATE_BLOCK_MASK_DYNAMIC
+        masking.use_dynamic_flex_shapes(True)
+        assert masking.flex_attention_fn(True) is masking._FLEX_DYNAMIC
     finally:
         masking.use_dynamic_flex_shapes(False)
     assert masking.flex_attention_fn(True) is static

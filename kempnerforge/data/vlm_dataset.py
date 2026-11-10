@@ -539,9 +539,8 @@ def pack_vlm_samples(
 
     A sample is one document: ``pixel_values`` ``(3, H, W)`` or ``(V, 3, H, W)``
     (``V`` views, each an encoder input), ``input_ids`` and ``labels`` ``(T,)``
-    whose first ``text_len`` positions are real (all of them when the key is
-    absent; ``0`` packs the image alone with nothing to supervise, as the
-    unpacked path's all-masked row does). Its footprint is ``V *
+    whose first ``text_len`` positions are real (``0`` packs the image alone
+    with nothing to supervise, as the unpacked path's all-masked row does). Its footprint is ``V *
     tokens_per_image`` placeholder slots followed by ``text_len`` tokens, whose
     last label is always ``-100`` since its next token is not in the row.
     Documents go first-fit into rows in order: into the first open row with
@@ -561,8 +560,9 @@ def pack_vlm_samples(
         token in document order, where the wrapper runs the LM head.
 
     Raises:
-        ValueError: ``samples`` is empty, a document has no image or a footprint
-            over ``seq_len``, or ``seq_len`` or ``tokens_per_image`` is not positive.
+        ValueError: ``samples`` is empty, a sample lacks ``text_len``, a document
+            has no image or a footprint over ``seq_len``, or ``seq_len`` or
+            ``tokens_per_image`` is not positive.
     """
     if seq_len <= 0 or tokens_per_image <= 0:
         raise ValueError("seq_len and tokens_per_image must be positive")
@@ -581,7 +581,12 @@ def pack_vlm_samples(
         if views.shape[0] == 0:
             raise ValueError("pack_vlm_samples: every document needs at least one image")
         n_ids = sample["input_ids"].shape[0]
-        text_len = int(sample["text_len"]) if "text_len" in sample else n_ids
+        if "text_len" not in sample:
+            raise ValueError(
+                "pack_vlm_samples: every sample needs text_len, its count of real tokens; "
+                "a right-padded sample without it would pack its padding as text"
+            )
+        text_len = int(sample["text_len"])
         if not 0 <= text_len <= n_ids:
             raise ValueError(f"text_len ({text_len}) must lie within the {n_ids} input_ids")
         footprint = views.shape[0] * tokens_per_image + text_len
