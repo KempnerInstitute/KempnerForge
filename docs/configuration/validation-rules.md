@@ -9,8 +9,8 @@ Validation runs in two passes:
    launchers
    ([`training/runtime.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/training/runtime.py),
    [`scripts/eval.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/scripts/eval.py))
-   once `world_size` is known. Checks rules that cross section
-   boundaries.
+   once `world_size` is known, before the process group starts. Checks
+   rules that cross section boundaries.
 
 All invalid cases raise `ValueError` with a message naming the fields
 involved, unless noted otherwise.
@@ -185,6 +185,40 @@ File:
 [`kempnerforge/config/profiling.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/config/profiling.py).
 
 - `end_step > start_step`.
+
+### `AdapterConfig`
+
+File:
+[`kempnerforge/config/adapter.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/config/adapter.py).
+
+- `type` must name a registered adapter; the error lists them.
+- `hidden_dim >= 0`.
+- `activation ∈ {"gelu", "silu", "relu"}`.
+- `pre_norm` is `""` or a registered norm; the error lists them.
+- `pool_window > 0` and `pool_heads > 0`.
+- Every other field must be one the selected adapter uses, or stay at its
+  default. The fields an adapter uses come from its builder's parameters, or
+  from the `accepts` it registers with (see
+  [Registry](registry.md#adapters-declare-the-fields-they-use)), so the check
+  needs no list of types; the error names each unused field, its value, the
+  adapter type, and the fields that type uses:
+
+  | `type` | Uses |
+  |--------|------|
+  | `mlp_2layer` | `hidden_dim`, `activation`, `pre_norm` |
+  | `linear` | none |
+  | `avgpool` | `pool_window`, `hidden_dim`; `activation` and `pre_norm` once `hidden_dim > 0` |
+  | `attentional_pool` | `pool_window`, `pool_heads` |
+
+  A plugin adapter whose builder reads a `**kwargs` and registers no
+  `accepts` accepts every field.
+  The check runs once the TOML is applied and again once the CLI overrides
+  land, so a setting the adapter would drop stops the run before
+  `init_distributed`. The first run sees the TOML alone, so its adapter
+  fields must fit its own `type`, and a type switched on the command line
+  needs the fields it does not use reset there too
+  (for example `--adapter.hidden_dim=0 --adapter.pre_norm=`); see
+  [Config sections](config-sections.md#adapter-adapterconfig).
 
 ## Cross-section rules — `JobConfig.validate(world_size)`
 

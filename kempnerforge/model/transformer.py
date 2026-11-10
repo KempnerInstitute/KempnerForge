@@ -399,14 +399,26 @@ class Transformer(nn.Module):
             modality: Optional ``ModalityContext`` bundling pre-embedded
                 inputs, prefix embeds, output slicing, image features,
                 and modality routing tags for VLM arches. ``None`` is the
-                pure text-only forward.
+                pure text-only forward. It may also carry ``position_ids``
+                and ``attention_group_ids`` (see those arguments) or the
+                rotation itself as ``rope_cos`` and ``rope_sin``,
+                ``(batch, seq_len, head_dim // 2)`` over the residual, or
+                ``(1, seq_len, head_dim // 2)`` shared by every row, for
+                position schemes that are not one integer per token; the
+                rotation excludes ``position_ids``, covers the appended
+                tokens under ``kv_caches`` as ``position_ids`` does, is
+                applied without the model's own tables, and is unsupported
+                for MoT.
             kv_caches: Optional list of KVCache (one per layer) for
-                generation. When provided, RoPE positions are offset by
-                the current cache fill level. Cross-arg invariant:
+                generation. The tokens of this forward are appended after
+                the cached ones; without caller positions or a rotation
+                their RoPE positions continue from the cache fill level.
+                Cross-arg invariant:
                 ``kv_caches`` forbids ``modality.prefix_embeds``,
                 ``modality.output_slice``, ``modality.image_features``,
                 ``modality.modality_ids``, ``modality.key_padding_mask``,
-                ``doc_ids`` and ``attention_group_ids`` (all training-only).
+                ``doc_ids`` and ``attention_group_ids``, by argument or as
+                ``modality.attention_group_ids`` (all training-only).
             doc_ids: Optional per-token document IDs for packed sequences,
                 shape ``(batch, seq_len)`` over the residual stream. Enables
                 block-diagonal causal attention that isolates documents within
@@ -418,10 +430,14 @@ class Transformer(nn.Module):
                 positions can e.g. restart at zero at each document of a
                 packed sequence. ``None`` (default) assigns contiguous
                 positions starting at the KV-cache fill level, exactly as
-                before. Cannot be combined with ``kv_caches`` (cached
-                generation derives positions from the cache fill level);
-                unsupported for MoT, which derives per-modality positions
-                internally.
+                before. With ``kv_caches`` the tensor covers the tokens of
+                this forward alone, the ones being appended, so a caller
+                that positions its own tokens does so at prefill and at
+                every decode step alike. Unsupported for MoT, which derives
+                per-modality positions internally. A ``ModalityContext`` may carry the same tensor
+                as ``modality.position_ids`` instead, which is how a strategy
+                chooses the positions of the residual it lays out; passing
+                both raises.
             attention_group_ids: Optional per-token visibility group ids over
                 the residual stream, shape ``(batch, seq_len)``, int64;
                 negative means no group. Tokens sharing a nonnegative id see
@@ -432,7 +448,8 @@ class Transformer(nn.Module):
                 give the same visibility as ``None`` but still build a mask, so
                 ``None`` is the unmasked fast path. On MoT, ``doc_ids`` and
                 group ids need ``vlm.mot_modalities`` in residual order,
-                ``("image", "text")``.
+                ``("image", "text")``. May likewise come from
+                ``modality.attention_group_ids``, not both.
 
         Returns:
             Logits tensor of shape ``(batch, out_seq_len, vocab_size)``
@@ -449,6 +466,12 @@ class Transformer(nn.Module):
         modality_ids = modality.modality_ids if modality is not None else None
         key_padding_mask = modality.key_padding_mask if modality is not None else None
         inline_embeds = modality.inline_embeds if modality is not None else None
+        position_ids = _argument_or_context("position_ids", position_ids, modality)
+        rope_cos = modality.rope_cos if modality is not None else None
+        rope_sin = modality.rope_sin if modality is not None else None
+        attention_group_ids = _argument_or_context(
+            "attention_group_ids", attention_group_ids, modality
+        )
 
         if (tokens is None) == (inputs_embeds is None):
             raise ValueError(
@@ -488,18 +511,16 @@ class Transformer(nn.Module):
                 raise ValueError("doc_ids is training-only; cannot be combined with kv_caches")
             if attention_group_ids is not None:
                 raise ValueError(
-                    "attention_group_ids is training-only; cannot be combined with kv_caches"
+                    "attention_group_ids (the argument or modality.attention_group_ids) is "
+                    "training-only; cannot be combined with kv_caches"
                 )
         text = tokens if tokens is not None else inputs_embeds
         assert text is not None
         batch = text.shape[0]
         seq_len = text.shape[1] + (prefix_embeds.shape[1] if prefix_embeds is not None else 0)
+        if rope_cos is not None and position_ids is not None:
+            raise ValueError("modality.rope_cos/rope_sin cannot be combined with position_ids")
         if position_ids is not None:
-            if kv_caches is not None:
-                raise ValueError(
-                    "position_ids cannot be combined with kv_caches; cached generation "
-                    "derives positions from the cache fill level"
-                )
             if self._mot_modalities:
                 raise ValueError(
                     "position_ids is not supported for MoT models, which derive "
@@ -522,12 +543,25 @@ class Transformer(nn.Module):
                 raise ValueError(
                     "RoPE tables not initialized; call init_weights_and_freqs() after to_empty()"
                 )
-            n_positions = self._rope_cos.shape[0]
-            if bool((position_ids < 0).any()) or bool((position_ids >= n_positions).any()):
+            n_positions = self.config.max_seq_len
+            if bool(((position_ids < 0) | (position_ids >= n_positions)).any()):
                 raise ValueError(
                     f"position_ids must be in [0, {n_positions}) (the precomputed RoPE "
                     f"table range, model.max_seq_len); got min {int(position_ids.min())}, "
                     f"max {int(position_ids.max())}"
+                )
+        if rope_cos is not None:
+            assert rope_sin is not None
+            if self._mot_modalities:
+                raise ValueError(
+                    "modality.rope_cos/rope_sin is not supported for MoT models, which derive "
+                    "per-modality positions internally"
+                )
+            expected = (batch, seq_len, self.config.head_dim // 2)
+            if tuple(rope_cos.shape[1:]) != expected[1:] or rope_cos.shape[0] not in (1, batch):
+                raise ValueError(
+                    f"modality.rope_cos shape {tuple(rope_cos.shape)} does not match the "
+                    f"residual rotation shape {expected} (batch or 1, seq_len, head_dim // 2)"
                 )
         if modality_ids is not None and modality_ids.dtype != torch.long:
             raise ValueError(
@@ -573,17 +607,24 @@ class Transformer(nn.Module):
             h = torch.cat([prefix_embeds, h], dim=1)
 
         start_pos = kv_caches[0].seq_len if kv_caches is not None else 0
-
-        if self._rope_cos.device != h.device:  # type: ignore[reportOptionalMemberAccess]
-            self._rope_cos = self._rope_cos.to(h.device)  # type: ignore[reportOptionalMemberAccess]
-            self._rope_sin = self._rope_sin.to(h.device)  # type: ignore[reportOptionalMemberAccess]
-        if position_ids is not None:
-            position_ids = position_ids.to(h.device)
-            cos = self._rope_cos[position_ids]  # type: ignore[reportOptionalSubscript]
-            sin = self._rope_sin[position_ids]  # type: ignore[reportOptionalSubscript]
+        if rope_cos is not None:
+            assert rope_sin is not None
+            cos, sin = rope_cos.to(h.device), rope_sin.to(h.device)
         else:
-            cos = self._rope_cos[start_pos : start_pos + seq_len]  # type: ignore[reportOptionalSubscript]
-            sin = self._rope_sin[start_pos : start_pos + seq_len]  # type: ignore[reportOptionalSubscript]
+            if self._rope_cos is None or self._rope_sin is None:
+                raise ValueError(
+                    "RoPE tables not initialized; call init_weights_and_freqs() after to_empty()"
+                )
+            if self._rope_cos.device != h.device:
+                self._rope_cos = self._rope_cos.to(h.device)
+                self._rope_sin = self._rope_sin.to(h.device)
+            if position_ids is not None:
+                position_ids = position_ids.to(h.device)
+                cos = self._rope_cos[position_ids]
+                sin = self._rope_sin[position_ids]
+            else:
+                cos = self._rope_cos[start_pos : start_pos + seq_len]
+                sin = self._rope_sin[start_pos : start_pos + seq_len]
 
         if self._moma_modalities:
             assert modality_ids is not None
@@ -639,6 +680,18 @@ class Transformer(nn.Module):
             h = self.output_head(h)
 
         return h
+
+
+def _argument_or_context(
+    name: str, argument: torch.Tensor | None, modality: ModalityContext | None
+) -> torch.Tensor | None:
+    """The forward argument ``name`` or the ``ModalityContext`` field of that name, never both."""
+    from_context = getattr(modality, name) if modality is not None else None
+    if argument is not None and from_context is not None:
+        raise ValueError(
+            f"{name} was passed to Transformer.forward and set on modality.{name}; give one"
+        )
+    return argument if argument is not None else from_context
 
 
 @registry.register_model("transformer")

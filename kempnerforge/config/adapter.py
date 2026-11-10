@@ -11,10 +11,17 @@ In TOML, ``[adapter]`` is a top-level section parallel to ``[model]``,
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import inspect
+from collections.abc import Callable
+from dataclasses import dataclass, fields
 from typing import Any
 
 from kempnerforge.config.registry import registry
+
+_KEYWORD_PARAMETER_KINDS = (
+    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+    inspect.Parameter.KEYWORD_ONLY,
+)
 
 
 @dataclass
@@ -25,17 +32,31 @@ class AdapterConfig:
         type: Registry key for the adapter builder. Projection adapters
             ``"mlp_2layer"`` (default) / ``"linear"`` keep the token count;
             pooling adapters ``"avgpool"`` / ``"attentional_pool"`` reduce it.
-        hidden_dim: Hidden width for ``mlp_2layer``. ``0`` means "match
-            ``out_dim``"; ignored by the other types.
+        hidden_dim: Hidden width of a 2-layer MLP. For ``mlp_2layer``, ``0``
+            means "match ``out_dim``". For ``avgpool``, a positive value
+            replaces the single ``Linear`` after the pool with a 2-layer MLP
+            head (``[pre_norm ->] Linear(in_dim, hidden_dim) -> activation ->
+            Linear(hidden_dim, out_dim)``), and ``0`` keeps the ``Linear``.
         activation: Activation between the two MLP projections. One of
-            ``"gelu"`` (default), ``"silu"``, ``"relu"``. ``mlp_2layer`` only.
+            ``"gelu"`` (default), ``"silu"``, ``"relu"``. Used by
+            ``mlp_2layer``, and by ``avgpool`` when ``hidden_dim > 0``.
         pre_norm: Norm-registry key (``"rmsnorm"`` / ``"layernorm"``) for a norm
-            over the vision features ahead of ``mlp_2layer``'s first projection
-            (exposed as ``ln_q``); ``""`` (default) builds none. ``mlp_2layer`` only.
+            ahead of the MLP's first projection (exposed as ``ln_q``); ``""``
+            (default) builds none. Used by ``mlp_2layer`` over the vision
+            features, and by ``avgpool`` over the pooled features when
+            ``hidden_dim > 0``.
         pool_window: Pooling kernel side for the pooling adapters (e.g. ``2``
-            for image 2×2, ``3`` for video 3×3); ignored by projection adapters.
+            for image 2×2, ``3`` for video 3×3).
         pool_heads: Number of attention heads for ``attentional_pool``; must
-            divide the vision feature dim. Ignored by the other types.
+            divide the vision feature dim.
+
+    A field the selected adapter does not use must keep its default, or
+    construction raises ``ValueError`` naming the field and the adapter type.
+    The fields an adapter uses are the ones its builder takes as parameters
+    that can be passed by keyword, when the builder's ``**`` parameter is
+    named ``_`` or it has none. ``accepts`` in ``registry.register_adapter``
+    overrides that, and an adapter whose builder reads any other ``**``
+    parameter and declares nothing accepts every field.
     """
 
     type: str = "mlp_2layer"
@@ -72,13 +93,55 @@ class AdapterConfig:
             raise ValueError(f"adapter.pool_window must be positive (got {self.pool_window})")
         if self.pool_heads <= 0:
             raise ValueError(f"adapter.pool_heads must be positive (got {self.pool_heads})")
+        self._reject_unused_fields()
+
+    def _fields_in_use(self) -> frozenset[str] | None:
+        known = frozenset(f.name for f in fields(self))
+        declared = registry.get_adapter_accepts(self.type)
+        if declared is None:
+            return _keyword_fields(registry.get_adapter(self.type), known - {"type"})
+        named = declared(self) if callable(declared) else declared
+        if isinstance(named, str):
+            raise TypeError(
+                f"accepts for adapter {self.type!r} must return a collection of field names, "
+                f"not the string {named!r}"
+            )
+        used = frozenset(named)
+        unknown = sorted(used - known)
+        if unknown:
+            raise ValueError(
+                f"adapter.type = {self.type!r} declares fields AdapterConfig does not have: "
+                f"{unknown}. AdapterConfig fields: {sorted(known)}."
+            )
+        return used
+
+    def _reject_unused_fields(self) -> None:
+        used = self._fields_in_use()
+        if used is None:
+            return
+        unused = [
+            f
+            for f in fields(self)
+            if f.name != "type" and f.name not in used and getattr(self, f.name) != f.default
+        ]
+        if unused:
+            settings = ", ".join(f"adapter.{f.name} = {getattr(self, f.name)!r}" for f in unused)
+            defaults = ", ".join(f"{f.name} = {f.default!r}" for f in unused)
+            uses = ", ".join(sorted(used)) or "no adapter fields"
+            raise ValueError(
+                f"adapter.type = {self.type!r} does not use {settings}; with these settings "
+                f"it uses {uses}. Leave unused fields at their defaults ({defaults})."
+            )
 
     def extra_kwargs(self) -> dict[str, Any]:
         """Builder kwargs beyond ``in_dim`` / ``out_dim``.
 
-        ``hidden_dim=0`` is mapped to ``None`` so the adapter falls back to
-        its own default (e.g., ``out_dim`` for ``MLP2LayerAdapter``). Pooling
-        kwargs are always passed; projection builders swallow them via ``**_``.
+        ``hidden_dim=0`` maps to ``None``, which each adapter reads as its own
+        default (``out_dim`` wide for ``MLP2LayerAdapter``, no MLP head for
+        ``AvgPoolAdapter``). Every field is passed; a builder takes the ones
+        it uses and swallows the rest via ``**_``, which construction has
+        checked are at their defaults unless the adapter accepts every field
+        (see the class docstring).
         """
         return {
             "hidden_dim": self.hidden_dim or None,
@@ -108,3 +171,21 @@ class AdapterConfig:
         from kempnerforge.model.adapter import POOLING_ADAPTER_TYPES  # noqa: PLC0415
 
         return POOLING_ADAPTER_TYPES
+
+
+def _keyword_fields(
+    builder: Callable[..., Any], field_names: frozenset[str]
+) -> frozenset[str] | None:
+    """The ``field_names`` that ``builder`` takes as parameters passable by keyword.
+
+    ``None`` when the builder's ``**`` parameter has a name other than ``_``,
+    since the builder may then read any field from it. The builder's own
+    signature counts, not one ``functools.wraps`` copied onto it from a
+    function it wraps: the wrapper is what receives the fields.
+    """
+    parameters = inspect.signature(builder, follow_wrapped=False).parameters.values()
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD and p.name != "_" for p in parameters):
+        return None
+    return frozenset(
+        p.name for p in parameters if p.kind in _KEYWORD_PARAMETER_KINDS and p.name in field_names
+    )

@@ -9,6 +9,7 @@ from __future__ import annotations
 import pytest
 import torch
 import torch.distributed.checkpoint as dcp
+from PIL import Image
 from torch.distributed.checkpoint.api import CheckpointException
 from torch.distributed.checkpoint.state_dict import get_model_state_dict, set_model_state_dict
 
@@ -24,7 +25,13 @@ from kempnerforge.config.vlm import (
     MoTConfig,
     VLMConfig,
 )
-from kempnerforge.data.vlm_dataset import pack_vlm_samples
+from kempnerforge.data.vlm_dataset import (
+    DEFAULT_IMAGE_MEAN,
+    DEFAULT_IMAGE_STD,
+    VLMCollator,
+    pack_vlm_samples,
+    tile_image,
+)
 from kempnerforge.model.modality import ModalityContext
 from kempnerforge.model.transformer import Transformer
 from kempnerforge.model.vlm import (
@@ -657,6 +664,25 @@ class TestPoolingConnector:
         logits, _ = wrapper(pixels, input_ids, labels)
         assert logits.shape == (2, 16, 256)
 
+    def test_avgpool_norm_mlp_head_keeps_the_pooled_count(self):
+        """The head changes the projection, not the token count, and its norm
+        takes the model's norm_eps."""
+        mc = ModelConfig(
+            dim=64, n_layers=2, n_heads=4, vocab_size=256, max_seq_len=64, norm_eps=1e-6
+        )
+        vc = VisionEncoderConfig(type="random", feature_dim=96, num_tokens=16)
+        ac = AdapterConfig(type="avgpool", pool_window=2, hidden_dim=96, pre_norm="rmsnorm")
+        wrapper = build_vlm_wrapper(mc, vc, ac, JointDecoderConfig(max_text_len=32))
+        assert wrapper.num_image_tokens == 4
+        assert wrapper.adapter.proj.ln_q.eps == 1e-6
+        assert "adapter.proj.ln_q.weight" in wrapper.state_dict()
+        wrapper = wrapper.to(DEVICE).eval()
+        pixels = torch.randn(2, 3, 16, 16, device=DEVICE)
+        input_ids = torch.randint(0, 256, (2, 20), device=DEVICE)
+        with torch.no_grad():
+            logits, _ = wrapper(pixels, input_ids)
+        assert logits.shape == (2, 20, 256)
+
     def test_projection_adapter_keeps_token_count(self):
         """Regression: a non-pooling adapter must leave num_image_tokens ==
         encoder.num_tokens (the image path stays bit-for-bit unchanged)."""
@@ -678,6 +704,27 @@ def _video_wrapper(vlm_cfg, frames: int = 4, *, ffn_hidden_dim: int | None = Non
     vc = VisionEncoderConfig(type="random", feature_dim=96, num_tokens=16)
     ac = AdapterConfig(type="avgpool", pool_window=2)
     return build_vlm_wrapper(mc, vc, ac, vlm_cfg, frames_per_clip=frames)
+
+
+class TestTiledViews:
+    def test_tiled_views_ride_the_frame_axis(self):
+        """A 2 × 2 grid plus the whole image is 5 views of 4 pooled tokens each."""
+        vlm_cfg = JointDecoderConfig(max_text_len=8, tile_grid=2)
+        wrapper = _video_wrapper(vlm_cfg, frames=vlm_cfg.views_per_image)
+        assert wrapper.num_image_tokens == 20
+        img = Image.new("RGB", (40, 24), color=(10, 20, 30))
+        views = tile_image(img, 16, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD, tile_grid=2)
+        ids = torch.randint(0, 256, (8,))
+        samples = [{"pixel_values": views, "input_ids": ids, "labels": ids} for _ in range(2)]
+        batch = VLMCollator(pad_id=0, max_text_len=8)(samples)
+        assert batch["pixel_values"].shape == (2, 5, 3, 16, 16)
+        logits, _ = wrapper(batch["pixel_values"], batch["input_ids"], batch["labels"])
+        assert logits.shape == (2, 8, 256)
+
+    def test_view_count_mismatch_raises(self):
+        wrapper = _video_wrapper(JointDecoderConfig(max_text_len=8, tile_grid=2), frames=5)
+        with pytest.raises(ValueError, match="frames-per-clip mismatch"):
+            wrapper(torch.randn(1, 4, 3, 16, 16), torch.randint(0, 256, (1, 8)))
 
 
 class TestVideoForward:
