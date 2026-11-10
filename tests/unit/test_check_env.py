@@ -420,6 +420,42 @@ class TestCheckMlflow:
         assert r.status == check_env.WARN
         assert "no [from-uri] section" in r.message
 
+    @pytest.mark.parametrize("check_credentials", [False, True], ids=["offline", "probe"])
+    def test_a_config_profile_naming_another_profile_than_the_uri_is_a_warn(
+        self, home, monkeypatch, check_credentials
+    ):
+        """The backend keeps the variable, so the run would use two profiles (#463); a probe,
+        which would test only the URI's, is not run."""
+        (home / ".databrickscfg").write_text(
+            "[prod]\nhost = h\ntoken = t\n[dev]\nhost = h\ntoken = u\n"
+        )
+        monkeypatch.setenv("MLFLOW_TRACKING_URI", "databricks://prod")
+        monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", "dev")
+        seen: list[dict] = []
+        self._fake_sdk(monkeypatch, self._recording_client(seen))
+        r = check_env.check_mlflow(check_credentials=check_credentials)
+        assert r.status == check_env.WARN
+        assert "selects profile prod but $DATABRICKS_CONFIG_PROFILE is dev" in r.message
+        assert "unset DATABRICKS_CONFIG_PROFILE or set it to prod" in r.message
+        assert seen == []
+
+    @pytest.mark.parametrize("value", ["prod", ""], ids=["same-profile", "empty"])
+    def test_a_config_profile_equal_to_the_uris_or_empty_passes(self, home, monkeypatch, value):
+        (home / ".databrickscfg").write_text("[prod]\nhost = h\ntoken = t\n")
+        monkeypatch.setenv("MLFLOW_TRACKING_URI", "databricks://prod")
+        monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", value)
+        r = check_env.check_mlflow()
+        assert r.status == check_env.OK
+        assert "profile prod found" in r.message
+
+    def test_a_profile_mismatch_without_a_profile_file_is_not_a_warn(self, monkeypatch):
+        """With no file the SDK reads no profile at all, so every client takes the environment."""
+        monkeypatch.setenv("MLFLOW_TRACKING_URI", "databricks://prod")
+        monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", "dev")
+        monkeypatch.setenv("DATABRICKS_HOST", "https://x.cloud.databricks.com")
+        monkeypatch.setenv("DATABRICKS_TOKEN", "dapi-xxx")
+        assert check_env.check_mlflow().status == check_env.OK
+
     def test_profile_not_in_file_is_informational(self, home):
         (home / ".databrickscfg").write_text("[other]\nhost = h\n")
         r = check_env.check_mlflow()
@@ -1144,7 +1180,7 @@ class TestCheckMlflow:
     def test_check_credentials_does_not_force_a_profile_when_none_is_selected(
         self, home, monkeypatch
     ):
-        """The backend never passes profile=, so neither does the probe."""
+        """With no profile selected the backend passes no profile=, so neither does the probe."""
         (home / ".databrickscfg").write_text("[DEFAULT]\nhost = h\n")
         seen: list[dict] = []
         self._fake_sdk(monkeypatch, self._recording_client(seen))

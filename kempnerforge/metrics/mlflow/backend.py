@@ -18,7 +18,11 @@ from typing import Any
 
 from kempnerforge.config.schema import JobConfig, MetricsConfig
 from kempnerforge.metrics.logger import get_logger
-from kempnerforge.metrics.mlflow.auth import _auth_hint, _prepare_databricks_auth
+from kempnerforge.metrics.mlflow.auth import (
+    _auth_hint,
+    _databricks_profile,
+    _prepare_databricks_auth,
+)
 from kempnerforge.metrics.mlflow.models import (
     checkpoint_model_name,
     find_or_create_checkpoint_model,
@@ -71,6 +75,10 @@ def _resolve_mlflow_experiment(config: MetricsConfig, uri: str) -> str | None:
     """Experiment name: mlflow_experiment -> $MLFLOW_EXPERIMENT -> auto
     (/Users/<user>/<project> via the SDK on Databricks; bare name locally).
 
+    The auto path's SDK client takes the profile a ``databricks://<profile>`` URI names, as
+    MLflow's tracking client does, so the path names the user the run logs as; for a URI that
+    names none, both resolve their profile from the environment.
+
     On Databricks a non-absolute $MLFLOW_EXPERIMENT raises ValueError; the backend
     catches it and disables MLflow with a clear message (the config-field equivalent
     is rejected at load time by MetricsConfig.__post_init__).
@@ -92,7 +100,9 @@ def _resolve_mlflow_experiment(config: MetricsConfig, uri: str) -> str | None:
     try:
         from databricks.sdk import WorkspaceClient
 
-        user = WorkspaceClient().current_user.me().user_name
+        profile = _databricks_profile(uri)
+        client = WorkspaceClient(profile=profile) if profile else WorkspaceClient()
+        user = client.current_user.me().user_name
         return f"/Users/{user}/{project}"
     except Exception as e:
         logger.warning(

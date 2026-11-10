@@ -165,6 +165,12 @@ def _unset_tracking_env(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_profile_mismatch_warned_yet(monkeypatch):
+    """Start each test before any Databricks profile mismatch was warned in this process."""
+    monkeypatch.setattr(auth_mod, "_profile_mismatches_warned", set())
+
+
+@pytest.fixture(autouse=True)
 def _no_git_and_no_launch_toml(monkeypatch):
     """Start each test outside any repository and with no config file on the command line."""
     monkeypatch.setattr(backend_mod, "_git_state", lambda: None)
@@ -218,7 +224,7 @@ def _park_log_metrics(fm):
 
 def _capture_warnings(monkeypatch) -> list[str]:
     seen: list[str] = []
-    for module in (backend_mod, worker_mod):
+    for module in (backend_mod, worker_mod, auth_mod):
         monkeypatch.setattr(module.logger, "warning", lambda msg, *a, **k: seen.append(str(msg)))
     return seen
 
@@ -484,7 +490,7 @@ def _workspace_of(user):
     return types.SimpleNamespace(current_user=types.SimpleNamespace(me=lambda: me))
 
 
-def _no_credentials():
+def _no_credentials(**kwargs):
     raise ValueError("default auth: cannot configure default credentials")
 
 
@@ -534,8 +540,9 @@ class TestMlflowDatabricksAuth:
         under, the fake mlflow)."""
         built: list = []
 
-        def workspace_client():
-            built.append(os.environ.get("DATABRICKS_CONFIG_PROFILE"))
+        def workspace_client(**kwargs):
+            """The profile a real client resolves: the one passed, else the environment's."""
+            built.append(kwargs.get("profile") or os.environ.get("DATABRICKS_CONFIG_PROFILE"))
             return _workspace_of("me")
 
         _fake_databricks_sdk(monkeypatch, workspace_client)
@@ -551,11 +558,39 @@ class TestMlflowDatabricksAuth:
         assert fm.tracking_uris == ["databricks://profile-a"]
         assert os.environ["DATABRICKS_CONFIG_PROFILE"] == "profile-a"
 
-    def test_an_operator_set_profile_wins(self, monkeypatch):
+    def test_an_operator_set_profile_is_kept_and_the_lookup_follows_the_uri(self, monkeypatch):
+        """MLflow's tracking client takes the URI's profile first, so the experiment lookup does
+        too (#463), and the operator's variable is left as it was."""
         monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", "profile-b")
         built, _ = self._profile_seen_by_sdk(monkeypatch, "databricks://profile-a")
-        assert built == ["profile-b"]
+        assert built == ["profile-a"]
         assert os.environ["DATABRICKS_CONFIG_PROFILE"] == "profile-b"
+
+    def test_a_kept_operator_profile_is_warned_once_per_pair(self, monkeypatch):
+        """The warning names both profiles. The publisher prepares auth for every checkpoint it
+        publishes, so a process warns once for each pair."""
+        warnings_seen = _capture_warnings(monkeypatch)
+        monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", "profile-b")
+        for _ in range(3):
+            auth_mod._prepare_databricks_auth("databricks://profile-a")
+        auth_mod._prepare_databricks_auth("databricks://profile-c")
+        first, second = warnings_seen
+        assert "'profile-a'" in first and "DATABRICKS_CONFIG_PROFILE='profile-b'" in first
+        assert "'profile-c'" in second and "DATABRICKS_CONFIG_PROFILE='profile-b'" in second
+        assert os.environ["DATABRICKS_CONFIG_PROFILE"] == "profile-b"
+
+    def test_an_operator_set_profile_equal_to_the_uris_is_quiet(self, monkeypatch):
+        monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", "profile-a")
+        warnings_seen = _capture_warnings(monkeypatch)
+        built, _ = self._profile_seen_by_sdk(monkeypatch, "databricks://profile-a")
+        assert built == ["profile-a"] and warnings_seen == []
+
+    def test_an_empty_operator_profile_counts_as_unset(self, monkeypatch):
+        """The SDK skips an empty variable, so the URI's profile is exported over it."""
+        monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", "")
+        built, _ = self._profile_seen_by_sdk(monkeypatch, "databricks://profile-a")
+        assert built == ["profile-a"]
+        assert os.environ["DATABRICKS_CONFIG_PROFILE"] == "profile-a"
 
     @pytest.mark.parametrize("uri", ["databricks", "http://localhost:5000"])
     def test_other_uris_select_no_profile(self, monkeypatch, uri):
@@ -707,7 +742,7 @@ class TestMlflowDatabricksAuth:
 
         _fake_databricks_sdk(
             monkeypatch,
-            (lambda: _workspace_of("me")) if credentials == "found" else _no_credentials,
+            (lambda **kwargs: _workspace_of("me")) if credentials == "found" else _no_credentials,
         )
         cfg = MetricsConfig(enable_mlflow=True, mlflow_tracking_uri="databricks://profile-a")
         backend, _ = _init_backend(monkeypatch, cfg)
@@ -1032,6 +1067,29 @@ class TestResolveMlflowExperiment:
         monkeypatch.setitem(sys.modules, "databricks.sdk", fake_sdk)
         cfg = MetricsConfig(enable_mlflow=True, wandb_project="proj")
         assert _resolve_mlflow_experiment(cfg, "databricks") == "/Users/abbas/proj"
+
+    @pytest.mark.parametrize(
+        ("uri", "kwargs"),
+        [
+            ("databricks://profile-a", {"profile": "profile-a"}),
+            ("databricks://profile-a/", {"profile": "profile-a"}),
+            ("databricks", {}),
+            ("databricks://scope:prefix", {}),
+        ],
+    )
+    def test_auto_resolve_builds_its_client_with_the_uris_profile(self, monkeypatch, uri, kwargs):
+        """As MLflow does: the URI's profile when it names one, else no ``profile=`` at all, so
+        auth the SDK resolves from the environment alone (OIDC among it) still applies."""
+        seen: list = []
+
+        def workspace_client(**passed):
+            seen.append(passed)
+            return _workspace_of("abbas")
+
+        _fake_databricks_sdk(monkeypatch, workspace_client)
+        cfg = MetricsConfig(enable_mlflow=True, wandb_project="proj")
+        assert _resolve_mlflow_experiment(cfg, uri) == "/Users/abbas/proj"
+        assert seen == [kwargs]
 
     def test_auto_resolve_failure_returns_none(self, monkeypatch):
         """If the SDK lookup fails, auto-resolution returns None (backend then disables)."""

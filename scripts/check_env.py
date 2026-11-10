@@ -355,18 +355,44 @@ _DATABRICKS_ENV_AUTH: dict[str, tuple[str, tuple[tuple[str, ...], ...]]] = {
 }
 
 
-def _selected_databricks_profile() -> str | None:
-    """The Databricks profile explicitly selected, or None when none is.
-
-    A databricks://<profile> $MLFLOW_TRACKING_URI, then $DATABRICKS_CONFIG_PROFILE.
-    """
+def _tracking_uri_profile() -> str | None:
+    """The profile a databricks://<profile> $MLFLOW_TRACKING_URI names, or None."""
     try:
         uri = urlparse(os.environ.get("MLFLOW_TRACKING_URI", ""))
     except ValueError:
         uri = urlparse("")
     if uri.scheme == "databricks" and uri.netloc and not {":", "@"} & set(uri.netloc):
         return uri.netloc
-    return os.environ.get("DATABRICKS_CONFIG_PROFILE") or None
+    return None
+
+
+def _selected_databricks_profile() -> str | None:
+    """The Databricks profile explicitly selected, or None when none is.
+
+    A databricks://<profile> $MLFLOW_TRACKING_URI, then $DATABRICKS_CONFIG_PROFILE.
+    """
+    return _tracking_uri_profile() or os.environ.get("DATABRICKS_CONFIG_PROFILE") or None
+
+
+def _profile_mismatch() -> str | None:
+    """Why the run would authenticate with two profiles, or None.
+
+    The backend keeps a non-empty $DATABRICKS_CONFIG_PROFILE, so when it names another profile
+    than a databricks://<profile> $MLFLOW_TRACKING_URI, MLflow's tracking calls and the
+    experiment lookup take the URI's profile while SDK clients built from the environment
+    alone take the variable's.
+    """
+    uri_profile = _tracking_uri_profile()
+    env_profile = os.environ.get("DATABRICKS_CONFIG_PROFILE")
+    if not uri_profile or not env_profile or env_profile == uri_profile:
+        return None
+    return (
+        f"$MLFLOW_TRACKING_URI selects profile {uri_profile} but $DATABRICKS_CONFIG_PROFILE is "
+        f"{env_profile}: MLflow's tracking calls and the experiment lookup use {uri_profile}, "
+        f"while SDK clients built from the environment alone, MLflow's run-artifact uploads "
+        f"among them, use {env_profile}; unset DATABRICKS_CONFIG_PROFILE or set it to "
+        f"{uri_profile}"
+    )
 
 
 def _databricks_config_file() -> str:
@@ -489,7 +515,10 @@ def check_mlflow(check_credentials: bool = False) -> CheckResult:
     the environment route applies instead. With none selected, any Databricks credential
     variable makes the SDK skip the file, so the environment route applies; otherwise the file's
     default profile does. A route no offline evidence settles, SDK OAuth among them, is a WARN
-    naming all three routes rather than a pass.
+    naming all three routes rather than a pass. On the profile route, a $DATABRICKS_CONFIG_PROFILE
+    that names another profile than the URI is a WARN naming both: the backend keeps it, so the
+    run's SDK clients built from the environment alone would use another profile than MLflow's
+    tracking calls.
 
     ``check_credentials`` validates the resolved route through the SDK, naming a profile only
     when one is selected. It first exports DATABRICKS_TOKEN from DATABRICKS_API_TOKEN as the
@@ -529,6 +558,8 @@ def check_mlflow(check_credentials: bool = False) -> CheckResult:
                 WARN,
                 f"no Databricks credentials found ({problem}); {_MLFLOW_AUTH_ROUTES}",
             )
+        if mismatch := _profile_mismatch():
+            return CheckResult("mlflow", WARN, mismatch)
         found = (
             f"profile {profile} found in {config_name}"
             if quotable

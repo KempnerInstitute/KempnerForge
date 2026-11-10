@@ -65,9 +65,15 @@ so an exported `DATABRICKS_TOKEN` overrides the profile's token. With none selec
 `databricks` URI and no `$DATABRICKS_CONFIG_PROFILE`), an exported `DATABRICKS_HOST`,
 `DATABRICKS_TOKEN` or other credential variable makes the SDK ignore `~/.databrickscfg`. To
 combine a profile with exported variables, select it. For token auth with none selected, export
-both `DATABRICKS_HOST` and a token, or neither. `databricks://<profile>` also exports the profile
-as `DATABRICKS_CONFIG_PROFILE` for the SDK and artifact calls, unless that variable is already
-set; if you set it yourself, keep it equal to the URI's profile.
+both `DATABRICKS_HOST` and a token, or neither.
+
+`databricks://<profile>` also exports the profile as `DATABRICKS_CONFIG_PROFILE`, when that
+variable is unset or empty, for SDK clients built from the environment alone, which never see
+the tracking URI: MLflow uploads run artifacts, the `config.json` and launch TOML among them,
+through such a client first. A `DATABRICKS_CONFIG_PROFILE` you exported that names another
+profile is kept, and the backend warns, naming both. MLflow's tracking calls and the automatic
+experiment lookup below then use the URI's profile, while those SDK clients use yours, so unset
+the variable or set it to the URI's profile.
 
 ```{warning}
 `DATABRICKS_API_TOKEN` is not a name the SDK reads. The training backend and the
@@ -89,8 +95,10 @@ variable takes the environment route, which passes on `DATABRICKS_HOST` plus a t
 either name, a username and password, or a client id and secret; with no credential variable
 set it reads the file and uses the SDK's default profile. Anything else warns without failing,
 naming the three routes, because it cannot verify OAuth, a CLI login or a metadata service
-offline. It parses the whole file, as the SDK does, but no value from the file reaches a
-message. It looks at the environment, not at `mlflow_tracking_uri` in a config. Add
+offline. When `$MLFLOW_TRACKING_URI` selects one profile and `$DATABRICKS_CONFIG_PROFILE` names
+another, it warns, naming both, as the backend would. It parses the whole file, as the SDK
+does, but no value from the file reaches a message. It looks at the environment, not at
+`mlflow_tracking_uri` in a config. Add
 `--check-credentials` to also call the workspace through the SDK by that same resolution,
 naming a profile only when one is selected; it calls whenever the offline check passes or leaves
 an environment route unsettled. A failure is reported by exception class only,
@@ -122,9 +130,10 @@ On Databricks the experiment name **must be an absolute workspace path**
 experiment is rejected. `MetricsConfig.__post_init__` aborts at config-load time for the config
 field, and the backend disables with a clear message if `$MLFLOW_EXPERIMENT` is not absolute at
 runtime. When none is set, auto derives `/Users/<databricks-username>/<wandb_project>` through
-the Databricks SDK (off Databricks, the bare `wandb_project` name). It needs working
-credentials: when the user cannot be resolved the backend disables itself and asks for an
-explicit path.
+the Databricks SDK (off Databricks, the bare `wandb_project` name), with the profile a
+`databricks://<profile>` URI names, as MLflow's tracking client does, so the path belongs to
+the user the run logs as. It needs working credentials: when the user cannot be resolved the
+backend disables itself and asks for an explicit path.
 
 ## Checking the server from a compute node
 
@@ -308,8 +317,9 @@ environment, as described under credentials below.
 - **Credentials.** It prepares auth from the [routes above](#authentication) the way the
   training backend does: it uses the recorded `tracking_uri` as written, a
   `databricks://<profile>` entry selects that profile (exported as `DATABRICKS_CONFIG_PROFILE`
-  unless already set, so artifact uploads a harness makes later in the same process
-  authenticate too), and `DATABRICKS_API_TOKEN` stands in for an unset or empty
+  when that is unset or empty, so artifact uploads a harness makes later in the same process
+  authenticate too; another profile already there is kept, with the warning above, once per
+  process), and `DATABRICKS_API_TOKEN` stands in for an unset or empty
   `DATABRICKS_TOKEN`. `user:token@` credentials in a tracking URI are stripped before the
   sidecar is written, so that route does not carry over. Give the machine that publishes a profile of the
   same name.
