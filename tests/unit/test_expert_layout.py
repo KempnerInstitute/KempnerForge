@@ -137,6 +137,21 @@ class TestUnpackedNames:
         with pytest.raises(ValueError, match="no entry for 1 expert weights"):
             ExpertLayout([(LAYER, moe)]).to_global(state)
 
+    def test_entries_outside_the_split_layers_pass_through(self):
+        """A value that maps no names, and another layer's experts, keep their names."""
+        moe = _rank_one_of_two()
+        local = _state(moe)
+        other = "layers.1.mlp.experts.0.up_proj.weight"
+        local["model"][other] = torch.zeros(1)
+        local["step"] = 7
+        layout = ExpertLayout([(LAYER, moe)])
+        state = layout.to_global(local)
+        assert state["step"] == 7
+        assert state["model"][other] is local["model"][other]
+        restored = layout.to_local(state)
+        assert restored["step"] == 7
+        assert restored["model"][other] is local["model"][other]
+
     def test_a_local_index_past_the_rank_experts_is_refused(self):
         """Rank 1 has no local expert 2, whose global index 4 is past the layer's four experts."""
         moe = _rank_one_of_two()
