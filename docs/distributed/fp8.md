@@ -15,7 +15,8 @@ from `kempnerforge/distributed/parallel.py`. Gated by
 `torchao.float8.convert_to_float8_training` walks the model and
 replaces `nn.Linear` with `Float8Linear`. A filter function selects
 which modules to convert (simplified here; the real one also counts the
-`Linear` layers and records each one it keeps out for a warning):
+`Linear` layers and records each one the shape check keeps out, for a
+startup warning):
 
 ```python
 def _filter_fn(module, fqn):
@@ -67,10 +68,17 @@ n_kv_heads = 1`), an output head with the GPT-2 vocabulary
 explicit `ffn_hidden_dim` that is not a multiple of 16. The filter
 keeps such a `Linear` in bf16, and `apply_float8` logs one warning that
 names each kept layer with its shape and count, for example
-`layers.*.attention.k_proj (8x64) x32`. Config validation rejects the
-one case the filter cannot fix: `model.dim` not a multiple of 16, where
-no layer could convert (see
-[Validation rules § FP8 geometry](../configuration/validation-rules.md#fp8-geometry)).
+`layers.*.attention.k_proj (8x64) x32`.
+
+Config validation rejects the two cases the filter cannot fix (see
+[Validation rules § FP8 geometry](../configuration/validation-rules.md#fp8-geometry)):
+`model.dim` not a multiple of 16, where no layer could convert, and, in
+a text run, `train.batch_size * train.seq_len` not a multiple of 16,
+because the FP8 weight gradient multiplies over the micro-batch's
+tokens. If a model passes both checks and still converts no `Linear`,
+for example `dim = 64` with `n_heads = 4`, `head_dim_override = 10`,
+`ffn_hidden_dim = 200` and `vocab_size = 50257`, `apply_float8` raises
+a `ValueError` rather than let an FP8 run train entirely in bf16.
 
 **Embeddings & norms**: not `Linear` — `convert_to_float8_training`
 skips them automatically (no filter entry needed).

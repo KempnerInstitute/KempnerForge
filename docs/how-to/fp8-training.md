@@ -24,7 +24,10 @@ the bytes, and the converted matmuls run as FP8 GEMMs, whose peak is
 twice the bf16 peak. How much of that reaches end-to-end throughput
 depends on the model and batch shape, so compare `tok/s` against a bf16
 run of the same config; the logged MFU uses the bf16 peak for both
-([MFU § FP8 caveat](../metrics-and-profiling/mfu.md#fp8-caveat)).
+([MFU § FP8 caveat](../metrics-and-profiling/mfu.md#fp8-caveat)). No FP8
+throughput measurement has been published for this repo yet;
+[Reference § Benchmarks](../reference/benchmarks.md) covers bf16 runs
+only.
 
 ## Turn it on
 
@@ -100,8 +103,9 @@ is the confirmation, and its count says how many `Linear` layers run in
 FP8 (225 of 225 for `7b_16gpu_fp8.toml`). If it's missing,
 `mixed_precision` didn't resolve to `"fp8"`. A layer with a dimension
 that is not a multiple of 16 stays in bf16, and a warning right after
-names it. For `configs/train/hf_wikitext.toml`, whose GPT-2 vocabulary
-has 50257 tokens:
+names it (under pipeline parallelism, the line and the warning cover
+rank 0's stage only). For `configs/train/hf_wikitext.toml`, whose GPT-2
+vocabulary has 50257 tokens:
 
 ```
 Applied Float8 training: recipe=TENSORWISE, fsdp_float8_all_gather=True, converted 56 of 57 Linear layers
@@ -182,6 +186,21 @@ FP8 as well, make the dimension a multiple of 16: pad `vocab_size`
 Every projection and the output head has `model.dim` on one side, so
 with this `dim` no layer could run in FP8. Use a `dim` that is a
 multiple of 16, or train in bf16.
+
+**`ValueError: train.mixed_precision='fp8' needs train.batch_size * train.seq_len divisible by 16`.**
+The FP8 weight gradient multiplies over the micro-batch's tokens, so
+the first backward would fail. Pick a `batch_size` or `seq_len` that
+makes the product a multiple of 16; a `seq_len` that is one works with
+any `batch_size`. VLM runs skip this check because their token counts
+depend on the data; there the symptom is an error in the first backward
+such as `Expected trailing dimension of mat1 to be divisible by 16 but
+got mat1 shape: (<out_features>x<tokens>)`.
+
+**`ValueError: Float8 converted 0 of N Linear layers`.** Every `Linear`
+is either excluded by name or has a dimension that is not a multiple of
+16, so the run would train entirely in bf16. The message names the
+layers the shape check kept; make those dimensions multiples of 16, or
+train in bf16.
 
 **`ValueError: FP8 + Tensor Parallelism is not yet supported`.** The
 config validator ran. Either set `distributed.tp = 1` (and let FSDP

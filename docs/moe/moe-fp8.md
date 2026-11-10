@@ -55,9 +55,9 @@ for the grouped GEMM call site.
 Two reasons:
 
 1. **Tiny output dim.** Router gate is `Linear(dim, num_experts)`.
-   `num_experts` is typically 8-64 — not divisible by 16, which
-   `torch._scaled_mm` requires for its fast path. Fallback paths
-   give no speedup.
+   `num_experts` is often not a multiple of 16, which
+   `torch._scaled_mm` requires (it raises otherwise), and the matmul is
+   too small to gain from FP8.
 2. **Not compute-bound.** Routing is essentially a decision — the
    gate matmul is a tiny fraction of total FLOPs. FP8 quantization
    error on the routing decision could measurably perturb which
