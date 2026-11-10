@@ -89,8 +89,9 @@ encoder and adapter then run on one blank image whose output carries no weight,
 so FSDP2's collectives still see every rank, and under `train.compile_model`
 such a micro-batch is a second compiled graph. When the loaded dataset holds
 text-only rows, every unpacked batch carries a `frame_mask`, so the prefix
-route's attention takes an explicit mask rather than the unmasked causal fast
-path for that run, and never flips between the two. The flag needs an
+route's attention takes an explicit dense mask rather than the unmasked causal
+fast path (or the flex backend's block-sparse mask) for that run, and never
+flips between the two. The flag needs an
 image-prefix arch or packing, not `cross_attention`, whose image K/V cannot
 hide a blank image. On `mot` and `moma` the hidden blank image's tokens still
 pass through the image experts and count in the load-balance loss. Without the
