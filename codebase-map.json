@@ -1099,6 +1099,7 @@
         "tests/distributed/test_fsdp.py::TestActivationCheckpointing",
         "tests/distributed/test_fsdp.py::TestGetDpMesh",
         "tests/unit/test_fp8.py::TestApplyFloat8",
+        "tests/unit/test_fp8.py::TestFloat8Alignment",
         "tests/unit/test_distributed.py::TestDefaultMpPolicy",
         "tests/unit/test_distributed.py::TestApplyFsdpVLMGuards",
         "tests/unit/test_distributed.py::TestBuildParallelModelVLM",
@@ -1644,9 +1645,10 @@
       "tests/unit/test_fp8.py": {
         "classes": [
           "TestFP8Config(7)",
-          "TestApplyFloat8(4)"
+          "TestApplyFloat8(4)",
+          "TestFloat8Alignment(3)"
         ],
-        "count": 11
+        "count": 14
       },
       "tests/unit/test_packing.py": {
         "classes": [

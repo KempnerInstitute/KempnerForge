@@ -1,12 +1,15 @@
 # MoE + FP8
 
 FP8 training (via `torchao.float8`) converts dense `nn.Linear` modules
-to `Float8Linear`. Three classes of Linear in an MoE model get
+to `Float8Linear`. Four classes of Linear in an MoE model get
 **excluded** from that conversion:
 
 1. Routed experts (`experts.*`)
 2. Shared expert (`shared_expert.*`)
 3. Router gate (`router.gate`)
+4. Any other Linear with a dimension not divisible by 16, which
+   `torch._scaled_mm` rejects (see
+   [FP8 § Exclusion rules](../distributed/fp8.md#exclusion-rules))
 
 Everything else — attention projections, output head, dense-layer
 MLPs — converts normally.
@@ -19,14 +22,15 @@ From
 ```python
 # kempnerforge/distributed/parallel.py — apply_float8._filter_fn
 def _filter_fn(module, fqn):
-    if "experts" in fqn or "shared_expert" in fqn:
+    if "experts" in fqn or "shared_expert" in fqn or "router" in fqn:
         return False
-    return "router" not in fqn
+    return module.in_features % 16 == 0 and module.out_features % 16 == 0
 ```
 
 `convert_to_float8_training` walks the model, asks the filter for
 each `Linear`, and only replaces the module when the filter returns
-True.
+True. The real filter also counts the `Linear` layers and records each
+one the shape check keeps out, for a startup warning.
 
 ## Why experts are excluded
 
@@ -75,13 +79,14 @@ the shared expert is later routed through the grouped path.
 
 ## What stays FP8
 
-Everything not caught by the three filter rules:
+Everything not caught by the four filter rules:
 
 | Module | Converted | FQN pattern |
 |--------|:---------:|-------------|
 | Attention Q/K/V/O | yes | `*.attention.{q_proj,k_proj,v_proj,o_proj}` |
 | Dense MLP gate/up/down | yes | `*.mlp.{gate_proj,up_proj,down_proj}` (dense layers only) |
 | Output head | yes | `output_head.proj` |
+| Any of the three above with a dimension not a multiple of 16 | no | named in the startup warning |
 | Router gate | no | `*.router.gate` |
 | Routed experts | no | `*.experts.*.{gate,up,down}_proj` |
 | Shared expert | no | `*.shared_expert.*` |

@@ -80,7 +80,8 @@ The filter function excludes any FQN containing `"experts"`,
 `Linear.forward`); the shared expert is a plain `Linear` call, excluded
 with them by convention; routers have small output dims (often not a
 multiple of 16, which `torch._scaled_mm` requires) and aren't
-compute-bound.
+compute-bound. It also keeps any `Linear` with a dimension not
+divisible by 16 in bf16, since `torch._scaled_mm` rejects it.
 
 **Note:** `enable_fsdp_float8_all_gather=True` is incompatible with TP
 because the float8 weight wrapper calls `aten.is_pinned` on `DTensor`s

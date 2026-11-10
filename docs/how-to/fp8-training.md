@@ -88,15 +88,24 @@ in bf16 and produces sensible loss curves. Check the rank-0 log at
 startup:
 
 ```
-Applied Float8 training: recipe=TENSORWISE, fsdp_float8_all_gather=True
+Applied Float8 training: recipe=TENSORWISE, fsdp_float8_all_gather=True, converted 225 of 225 Linear layers
 Optimizer groups: ...
 Model: ...
 ```
 
 The `Applied Float8 training` line (from
 [`apply_float8`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/distributed/parallel.py))
-is the confirmation. If it's missing, `mixed_precision` didn't resolve
-to `"fp8"`.
+is the confirmation, and its count says how many `Linear` layers run in
+FP8 (225 of 225 for `7b_16gpu_fp8.toml`). If it's missing,
+`mixed_precision` didn't resolve to `"fp8"`. A layer with a dimension
+that is not a multiple of 16 stays in bf16, and a warning right after
+names it. For `configs/train/hf_wikitext.toml`, whose GPT-2 vocabulary
+has 50257 tokens:
+
+```
+Applied Float8 training: recipe=TENSORWISE, fsdp_float8_all_gather=True, converted 56 of 57 Linear layers
+Float8 kept 1 Linear layer(s) in high precision because torch._scaled_mm needs both dimensions divisible by 16: output_head.proj (50257x512) x1
+```
 
 For a deeper check, profile one step:
 
@@ -118,13 +127,17 @@ for how to read the summary.
 Pulled from the filter in
 [`apply_float8`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/distributed/parallel.py):
 
-- **Converted** — attention (`q/k/v/o_proj`), dense MLP
+- **Converted**: attention (`q/k/v/o_proj`), dense MLP
   (`gate/up/down_proj`), final `output_head.proj`.
-- **Excluded** — routed MoE experts (`experts.*`) because they use
+- **Excluded**: routed MoE experts (`experts.*`) because they use
   `torch._grouped_mm` and bypass `Float8Linear.forward`; the shared
   expert (`shared_expert.*`), a plain `Linear` call, by convention to
   match them; the MoE router because its output dim is small and not
   compute-bound; embeddings and norms because they aren't `nn.Linear`.
+- **Kept in bf16**: a layer from the converted list whose
+  `in_features` or `out_features` is not a multiple of 16, which
+  `torch._scaled_mm` rejects. The startup warning names each one with
+  its shape.
 
 For an MoE model this means attention, dense-block MLPs and the output
 head are FP8, but the routed and shared experts run in bf16, so FP8
@@ -155,6 +168,14 @@ checkpoint-and-relaunch patterns.
 `mixed_precision` is wrong. Check
 `config.train.mixed_precision == "fp8"` (not `"FP8"` or `"float8"`).
 The `Literal[...]` type in the dataclass lets only four values through.
+
+**`Float8 kept N Linear layer(s) in high precision` warning.** The
+named layers have a dimension that is not a multiple of 16, so they
+train in bf16 while the rest of the model runs in FP8. To run them in
+FP8 as well, make the dimension a multiple of 16: pad `vocab_size`
+(50272 instead of GPT-2's 50257), raise `n_kv_heads` so that
+`n_kv_heads * head_dim` is a multiple of 16, or pick an
+`ffn_hidden_dim` that is.
 
 **`ValueError: FP8 + Tensor Parallelism is not yet supported`.** The
 config validator ran. Either set `distributed.tp = 1` (and let FSDP

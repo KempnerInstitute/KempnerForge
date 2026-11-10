@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 import torch
 
@@ -154,3 +156,79 @@ class TestApplyFloat8:
 
         float8_count = sum(1 for m in model.modules() if isinstance(m, Float8Linear))
         assert float8_count > 0
+
+
+class TestFloat8Alignment:
+    """``apply_float8`` keeps each Linear with a dimension not divisible by 16 in high precision.
+
+    ``torch._scaled_mm`` rejects such a weight in the first forward on CUDA (issue #240); the
+    CPU kernel does not check, so these tests check the conversion, not the crash.
+    """
+
+    @staticmethod
+    def _kept(model: torch.nn.Module) -> set[str]:
+        """Names, without the layer index, of the Linears left unconverted."""
+        return {
+            fqn.split(".", 2)[-1] if fqn.startswith("layers.") else fqn
+            for fqn, m in model.named_modules()
+            if type(m) is torch.nn.Linear
+        }
+
+    @pytest.mark.parametrize(
+        ("geometry", "kept"),
+        [
+            (dict(dim=64, n_heads=8, n_kv_heads=1), {"attention.k_proj", "attention.v_proj"}),
+            (dict(dim=64, n_heads=4, vocab_size=50257), {"output_head.proj"}),
+            (
+                dict(dim=64, n_heads=4, ffn_hidden_dim=200),
+                {"mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"},
+            ),
+            (dict(dim=64, n_heads=4, n_kv_heads=2), set()),
+        ],
+        ids=["kv-8x64", "vocab-50257", "ffn-200", "aligned"],
+    )
+    def test_converts_only_aligned_linears(self, geometry, kept):
+        from torchao.float8.float8_linear import Float8Linear
+
+        from kempnerforge.config.schema import ModelConfig
+        from kempnerforge.distributed.parallel import apply_float8
+        from kempnerforge.model.transformer import Transformer
+
+        model = Transformer(ModelConfig(**{"n_layers": 2, "vocab_size": 256, **geometry}))
+        apply_float8(model, enable_fsdp_float8_all_gather=False)
+        converted = [m for m in model.modules() if isinstance(m, Float8Linear)]
+        assert converted
+        assert all(m.in_features % 16 == 0 and m.out_features % 16 == 0 for m in converted)
+        assert self._kept(model) == kept
+
+    def test_warns_once_naming_the_kept_layers(self, caplog, monkeypatch):
+        from kempnerforge.config.schema import ModelConfig
+        from kempnerforge.distributed.parallel import apply_float8
+        from kempnerforge.model.transformer import Transformer
+
+        monkeypatch.setattr(logging.getLogger("kempnerforge"), "propagate", True)
+        model = Transformer(
+            ModelConfig(dim=64, n_layers=3, n_heads=8, n_kv_heads=1, vocab_size=256)
+        )
+        with caplog.at_level(logging.INFO, logger="kempnerforge.distributed.parallel"):
+            apply_float8(model, enable_fsdp_float8_all_gather=False)
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert "layers.*.attention.k_proj (8x64) x3" in warnings[0]
+        assert "layers.*.attention.v_proj (8x64) x3" in warnings[0]
+        assert any("converted 16 of 22 Linear layers" in r.getMessage() for r in caplog.records)
+
+    def test_mixed_model_runs_forward_backward(self):
+        """Float8 and high-precision Linears in one block train together (CPU emulation)."""
+        from kempnerforge.config.schema import ModelConfig
+        from kempnerforge.distributed.parallel import apply_float8
+        from kempnerforge.model.transformer import Transformer
+
+        model = Transformer(
+            ModelConfig(dim=64, n_layers=2, n_heads=8, n_kv_heads=1, vocab_size=256)
+        )
+        apply_float8(model, enable_fsdp_float8_all_gather=False)
+        out = model(torch.randint(0, 256, (2, 16)))
+        out.float().sum().backward()
+        assert torch.isfinite(out).all()
+        assert all(p.grad is not None for p in model.parameters())

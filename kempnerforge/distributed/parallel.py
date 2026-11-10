@@ -32,6 +32,7 @@ from torch.distributed.device_mesh import DeviceMesh
 
 from kempnerforge.config.registry import registry
 from kempnerforge.config.schema import ActivationCheckpointing
+from kempnerforge.config.training import FP8_DIM_MULTIPLE
 from kempnerforge.model.transformer import Transformer, TransformerBlock
 
 if TYPE_CHECKING:
@@ -152,6 +153,11 @@ def apply_float8(model: Transformer, enable_fsdp_float8_all_gather: bool = True)
     (torch._grouped_mm), which bypasses Float8Linear.forward(). The shared expert
     is a plain Linear call; the same name filter excludes it, by convention.
 
+    A Linear whose ``in_features`` or ``out_features`` is not a multiple of
+    ``FP8_DIM_MULTIPLE`` (16) stays in high precision, because torch._scaled_mm
+    rejects it on CUDA. One warning names each such layer with its shape, and the
+    info line counts the converted Linears.
+
     Args:
         model: Transformer model.
         enable_fsdp_float8_all_gather: If True, FSDP2 all-gathers use float8
@@ -172,6 +178,9 @@ def apply_float8(model: Transformer, enable_fsdp_float8_all_gather: bool = True)
         enable_fsdp_float8_all_gather=enable_fsdp_float8_all_gather,
     )
 
+    unaligned: dict[str, int] = {}
+    counts = {"converted": 0, "linear": 0}
+
     def _filter_fn(module: torch.nn.Module, fqn: str) -> bool:
         """Skip modules that shouldn't use Float8.
 
@@ -180,17 +189,36 @@ def apply_float8(model: Transformer, enable_fsdp_float8_all_gather: bool = True)
         - Shared expert: a plain Linear call, excluded with the routed experts by convention
         - Router gate: small output dim (num_experts) often not divisible by 16,
           which torch._scaled_mm requires. Also not compute-bound.
+        - Any other Linear with a dimension not divisible by 16, which torch._scaled_mm
+          rejects in its first call. Each is recorded by name, with layer indices
+          collapsed to ``*``, and by shape, for the warning.
         """
-        if "experts" in fqn or "shared_expert" in fqn:
+        if not isinstance(module, torch.nn.Linear):
             return False
-        return "router" not in fqn
+        counts["linear"] += 1
+        if "experts" in fqn or "shared_expert" in fqn or "router" in fqn:
+            return False
+        if module.in_features % FP8_DIM_MULTIPLE or module.out_features % FP8_DIM_MULTIPLE:
+            pattern = ".".join("*" if part.isdigit() else part for part in fqn.split("."))
+            key = f"{pattern} ({module.out_features}x{module.in_features})"
+            unaligned[key] = unaligned.get(key, 0) + 1
+            return False
+        counts["converted"] += 1
+        return True
 
     convert_to_float8_training(model, config=config, module_filter_fn=_filter_fn)
 
     logger.info(
         f"Applied Float8 training: recipe=TENSORWISE, "
-        f"fsdp_float8_all_gather={enable_fsdp_float8_all_gather}"
+        f"fsdp_float8_all_gather={enable_fsdp_float8_all_gather}, "
+        f"converted {counts['converted']} of {counts['linear']} Linear layers"
     )
+    if unaligned:
+        logger.warning(
+            f"Float8 kept {sum(unaligned.values())} Linear layer(s) in high precision because "
+            f"torch._scaled_mm needs both dimensions divisible by {FP8_DIM_MULTIPLE}: "
+            + ", ".join(f"{name} x{count}" for name, count in unaligned.items())
+        )
 
 
 def _has_ep_moe(module: torch.nn.Module) -> bool:

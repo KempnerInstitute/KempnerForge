@@ -14,13 +14,14 @@ from `kempnerforge/distributed/parallel.py`. Gated by
 
 `torchao.float8.convert_to_float8_training` walks the model and
 replaces `nn.Linear` with `Float8Linear`. A filter function selects
-which modules to convert:
+which modules to convert (simplified here; the real one also counts the
+`Linear` layers and records each one it keeps out for a warning):
 
 ```python
 def _filter_fn(module, fqn):
-    if "experts" in fqn or "shared_expert" in fqn:
+    if "experts" in fqn or "shared_expert" in fqn or "router" in fqn:
         return False
-    return "router" not in fqn
+    return module.in_features % 16 == 0 and module.out_features % 16 == 0
 ```
 
 So the converted set is:
@@ -30,6 +31,7 @@ So the converted set is:
 | Attention `q_proj`, `k_proj`, `v_proj`, `o_proj` | yes | Standard `Linear` call path |
 | Dense MLP `gate_proj`, `up_proj`, `down_proj` | yes | Standard `Linear` call path |
 | Final `output_head.proj` | yes | Standard `Linear` call path |
+| A `Linear` from the three rows above with `in_features` or `out_features` not a multiple of 16 | **no** | `torch._scaled_mm` rejects it; kept in bf16 and named in a startup warning |
 | MoE `experts.*.{gate,up,down}_proj` | **no** | Bypass — uses `torch._grouped_mm` |
 | `shared_expert.*` | **no** | By convention, to match the routed experts (a plain `Linear` call path) |
 | `router.gate` | **no** | Small output dim, not compute-bound |
@@ -55,6 +57,17 @@ to match the routed experts (see
 `Float8Linear`) requires output dim divisible by 16 and gives no
 speedup on such small matmuls. The router is also routing-decision
 logic, not a compute bottleneck.
+
+**A dimension not divisible by 16**: `torch._scaled_mm` needs both
+dimensions of an FP8 weight to be multiples of 16 and raises on CUDA
+otherwise. Common cases are `k_proj` and `v_proj` when
+`n_kv_heads * head_dim` is small (8 for `dim = 64, n_heads = 8,
+n_kv_heads = 1`), an output head with the GPT-2 vocabulary
+(`vocab_size = 50257`, as in `configs/train/hf_wikitext.toml`), and an
+explicit `ffn_hidden_dim` that is not a multiple of 16. The filter
+keeps such a `Linear` in bf16, and `apply_float8` logs one warning that
+names each kept layer with its shape and count, for example
+`layers.*.attention.k_proj (8x64) x32`.
 
 **Embeddings & norms**: not `Linear` — `convert_to_float8_training`
 skips them automatically (no filter entry needed).
@@ -148,7 +161,8 @@ fp32_master_weights = false      # true keeps the master weights in fp32
 ```
 
 That's the entire surface. The recipe is always `TENSORWISE`
-(per-tensor scaling), and the filter rules are hard-coded. Custom
+(per-tensor scaling), and the filter rules (the names above and the
+divisible-by-16 rule) are hard-coded. Custom
 recipes / filters require editing `apply_float8` directly.
 
 ## Hardware
