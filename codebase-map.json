@@ -689,7 +689,7 @@
       "functions": [
         "cross_entropy_loss(logits, labels) -> Tensor",
         "chunked_cross_entropy_loss(logits, labels, chunk_size) -> Tensor",
-        "z_loss(logits, weight) -> Tensor",
+        "z_loss(logits, weight, chunk_size=None) -> Tensor",
         "build_loss_fn(config) -> Callable"
       ],
       "registry": [
@@ -1575,10 +1575,10 @@
         "classes": [
           "TestCrossEntropy(2)",
           "TestChunkedCrossEntropy(6)",
-          "TestZLoss(5)",
-          "TestBuildLossFn(5)"
+          "TestZLoss(10)",
+          "TestBuildLossFn(11)"
         ],
-        "count": 18
+        "count": 29
       },
       "tests/unit/test_moe.py": {
         "classes": [
