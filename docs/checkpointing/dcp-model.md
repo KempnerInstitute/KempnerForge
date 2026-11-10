@@ -256,7 +256,9 @@ and an absent state cannot be told apart from one that went missing, so
 a never-stepped parameter in one of those still fails the load. Start
 from it in a new `checkpoint.dir`, with `[checkpoint].load_path`
 pointing at it and `exclude_from_loading = ["optimizer"]`, which
-restores the weights and begins with a fresh optimizer. In the old
+restores the weights and begins with a fresh optimizer
+(`["optimizer", "train_state"]` also starts the step, schedule and data
+order fresh). In the old
 `checkpoint.dir` the resume would take precedence over `load_path`.
 
 A parameter whose optimizer changed since the save holds another

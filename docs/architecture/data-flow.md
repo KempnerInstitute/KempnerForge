@@ -100,7 +100,7 @@ useful for smoke-testing the parallelism stack without any corpus.
 
 `doc_ids` is optional: non-`None` only when the dataset packs multiple
 documents into one sequence. It triggers the block-diagonal attention
-mask path (see [Model § Three attention paths](model.md#three-attention-paths)).
+mask path (see [Model § Attention paths](model.md#attention-paths)).
 
 ### 2 · `maybe_no_sync`
 

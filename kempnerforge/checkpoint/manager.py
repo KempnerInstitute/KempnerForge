@@ -9,6 +9,7 @@ separately as a torch file and broadcast from rank 0 on load.
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import os
@@ -16,8 +17,9 @@ import re
 import shutil
 import stat
 import threading
+import time
 import uuid
-from collections.abc import Callable, Container, Iterable
+from collections.abc import Callable, Container, Iterable, Iterator
 from functools import partial
 from pathlib import Path
 from typing import Any, Protocol, TypeGuard, cast
@@ -36,9 +38,11 @@ from torch.distributed.checkpoint.state_dict import (
 
 from kempnerforge.checkpoint.async_save import AsyncCheckpointer
 from kempnerforge.checkpoint.state import build_train_state, restore_train_state
+from kempnerforge.config.checkpoint import is_weights_only, validate_exclude_keys
 from kempnerforge.config.optimizer import WEIGHT_DECAY_SCOPES
 from kempnerforge.config.schema import AsyncCheckpointMode, CheckpointConfig
 from kempnerforge.data.dataloader import DataPositionError, StreamingDataLoader
+from kempnerforge.distributed.utils import agree_across_ranks
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +55,8 @@ _NEVER_STEPPED_KEY = "optimizer_never_stepped"
 _NEVER_STEPPED_PREFIX = f"{_NEVER_STEPPED_KEY}."
 _OPTIM_PREFIX = "optimizer."
 _UNRECORDED_WEIGHT_DECAY_SCOPE = "exclude_norms_and_biases"
+_TRANSIENT_REMOVE_ERRNOS = frozenset({errno.ENOTEMPTY, errno.EBUSY, errno.ENOENT})
+_REMOVE_RETRY_DELAYS = (0.05, 0.1, 0.2, 0.4)
 TrackingSource = Callable[[], list[dict[str, str]]]
 CheckpointRecord = Callable[[str, dict[str, str]], None]
 
@@ -430,6 +436,35 @@ def _replace_file(path: Path, text: str) -> None:
         raise
 
 
+def _remove_tree(path: Path, lock: threading.Lock, delays: Iterator[float]) -> None:
+    """Remove the directory ``path``, retrying while NFS briefly keeps it non-empty.
+
+    ``ENOTEMPTY``, ``EBUSY`` and ``ENOENT`` are retried while ``path`` exists, each retry
+    after waiting the next of ``delays``.
+
+    Args:
+        path: The directory to remove.
+        lock: Held for each attempt and released during the waits.
+        delays: The waits left, in seconds, which removals can share.
+
+    Raises:
+        OSError: Any other error, or a retried one once ``path`` is gone or
+            ``delays`` is spent.
+    """
+    while True:
+        try:
+            with lock:
+                shutil.rmtree(path)
+            return
+        except OSError as e:
+            if e.errno not in _TRANSIENT_REMOVE_ERRNOS or not path.exists():
+                raise
+            delay = next(delays, None)
+            if delay is None:
+                raise
+            time.sleep(delay)
+
+
 _URI_USERINFO = re.compile(r"(?<=://)[^/?#\s]+@")
 
 
@@ -580,32 +615,18 @@ class CheckpointManager:
         being durable covers its own stage only; without PP the save spans every
         rank. Every rank calls this once its own write has ended, with the error
         it raised, if any; under PP it then raises on every rank when any rank's
-        write failed (see ``_agree``).
+        write failed (see ``agree``).
         """
         if self._pp_rank is not None:
-            self._agree(error)
+            self.agree(error)
 
-    def _agree(self, error: BaseException | None) -> None:
-        """Barrier on the manager's dedicated gloo group that raises on every rank if any failed.
+    def agree(self, error: BaseException | None, what: str = "Checkpoint save") -> None:
+        """Agree on the manager's dedicated gloo group that every rank's ``what`` succeeded.
 
-        Every rank passes the error its own part of the save raised, or ``None``.
-        A rank with an error re-raises it; when any rank has one, every other rank
-        raises a ``RuntimeError`` naming the ranks that failed, so no rank is left
-        waiting in a later collective for a rank that has raised. The group is not
-        the default process group that DCP's async-save background thread issues
-        collectives on. Without an initialized process group, ``error`` is raised
-        if set.
+        See ``agree_across_ranks``. The group is not the default process group
+        that DCP's async-save background thread issues collectives on.
         """
-        failed: list[int] = []
-        if dist.is_initialized():
-            flags = torch.zeros(dist.get_world_size(self._sync_group), dtype=torch.int32)
-            flags[dist.get_rank(self._sync_group)] = int(error is not None)
-            dist.all_reduce(flags, group=self._sync_group)
-            failed = flags.nonzero().flatten().tolist()
-        if error is not None:
-            raise error
-        if failed:
-            raise RuntimeError(f"Checkpoint save failed on ranks {failed}")
+        agree_across_ranks(error, what, group=self._sync_group)
 
     def set_tracking_source(self, source: TrackingSource | None) -> None:
         """Record the logging runs ``source`` reports in every later ``metadata.json``.
@@ -789,7 +810,7 @@ class CheckpointManager:
             if self._rank == 0 and error is None:
                 error = _attempt(self._commit_latest, step, ckpt_dir)
 
-        self._agree(error)
+        self.agree(error)
 
         if not sync_mode:
             self._pending_finalize = (step, ckpt_dir)
@@ -834,7 +855,7 @@ class CheckpointManager:
         committed.
         """
         error = _attempt(self._async_ckpt.wait)
-        self._agree(self._drain_pending_finalize(error=error))
+        self.agree(self._drain_pending_finalize(error=error))
 
     def flush_pending_save(self) -> None:
         """Drain any in-flight async save before mutating model state.
@@ -852,7 +873,7 @@ class CheckpointManager:
         rank raises on every rank, and nothing is committed.
         """
         error = _attempt(self._async_ckpt.wait)
-        self._agree(self._drain_pending_finalize(error=error))
+        self.agree(self._drain_pending_finalize(error=error))
 
     def peek_saved_step(self, path: str | None = None) -> int | None:
         """Read ``step`` from a candidate checkpoint's metadata.json.
@@ -891,7 +912,14 @@ class CheckpointManager:
                 or the ``latest`` symlink.
             scheduler: LR scheduler to restore.
             dataloader: Stateful dataloader to restore.
-            exclude_keys: DCP state keys to skip (e.g., ["optimizer"] for fine-tuning).
+            exclude_keys: State to skip: the DCP keys ``"model"`` and
+                ``"optimizer"`` (e.g. ``["optimizer"]`` for fine-tuning), or
+                ``["optimizer", "train_state"]`` for a weights-only warm start
+                that loads the model alone and ignores ``train_state.pt`` (step,
+                token count, scheduler, dataloader position, RNG) and the saved
+                freeze metadata, so the new run starts at step 0 with its own
+                schedule, data order and freeze. ``"train_state"`` in any other
+                combination raises ``ValueError``.
             vlm_freeze_expected: Canonical freeze metadata (output of
                 ``canonical_freeze_meta``) for the current run's VLMConfig.
                 When both the saved metadata and this argument are set,
@@ -913,7 +941,12 @@ class CheckpointManager:
             FileNotFoundError: No checkpoint resolves although one was named, or the
                 checkpoint holds optimizer state that this load restores but has no
                 ``train_state.pt``. Raised before any state is loaded.
+            ValueError: ``exclude_keys`` is not a list of distinct DCP keys, or names
+                ``"train_state"`` outside ``["optimizer", "train_state"]``. Raised
+                before the path is resolved.
         """
+        if exclude_keys is not None:
+            validate_exclude_keys(exclude_keys, "exclude_keys")
         ckpt_dir = self._resolve_load_path(path)
         if ckpt_dir is None:
             requested = path if path is not None else self.config.load_path
@@ -929,8 +962,14 @@ class CheckpointManager:
             ckpt_dir = self._resolve_dcp_load_dir(ckpt_dir, path)
 
         logger.info(f"Loading checkpoint: {ckpt_dir}")
+        load_train_state = not is_weights_only(exclude_keys)
+        if not load_train_state and vlm_freeze_expected is not None:
+            logger.warning(
+                f"vlm_freeze_expected is not compared with {ckpt_dir}: a weights-only warm start "
+                "applies the new run's freeze"
+            )
 
-        if vlm_freeze_expected is not None:
+        if vlm_freeze_expected is not None and load_train_state:
             metadata_path = ckpt_dir / _METADATA_FILE
             if metadata_path.exists():
                 try:
@@ -984,7 +1023,7 @@ class CheckpointManager:
             load_optim = False
 
         train_state_path = ckpt_dir / _TRAIN_STATE_FILE
-        train_state_exists = self._train_state_exists(train_state_path)
+        train_state_exists = load_train_state and self._train_state_exists(train_state_path)
         if load_optim and not train_state_exists:
             raise FileNotFoundError(
                 f"Cannot resume {ckpt_dir}: it holds optimizer state but no {_TRAIN_STATE_FILE}, "
@@ -1037,7 +1076,13 @@ class CheckpointManager:
             for optimizer in self.checkpointed_optimizers:
                 _reset_to_fresh(optimizer)
 
-        if train_state_exists:
+        if not load_train_state:
+            logger.info(
+                f"Weights-only warm start from {ckpt_dir}: its step, schedule, data position "
+                "and RNG are not restored, and its freeze metadata is not compared"
+            )
+            step, tokens_seen, extra = 0, 0, {}
+        elif train_state_exists:
             train_state = (
                 _load_train_state(train_state_path)
                 if self._rank == 0 or not dist.is_initialized()
@@ -1173,11 +1218,12 @@ class CheckpointManager:
                 f"{ckpt_dir} was saved with optimizer.weight_decay_scope={saved!r}, but this "
                 f"run uses {self._weight_decay_scope!r}. The scope decides the optimizer's "
                 f"param groups, so the saved optimizer state cannot be loaded into this run's "
-                f"groups. Resume with weight_decay_scope={saved!r}, or start a new run from "
-                f"the checkpoint without its optimizer state: checkpoint.load_path="
-                f'{str(ckpt_dir)!r} with checkpoint.exclude_from_loading=["optimizer"] and '
-                f"a checkpoint.dir that holds no checkpoint, since training auto-resumes from "
-                f"a checkpoint there in place of load_path, optimizer state included."
+                f"groups. Resume with weight_decay_scope={saved!r}, or continue from the "
+                f"checkpoint with a fresh optimizer: checkpoint.load_path={str(ckpt_dir)!r} "
+                f'with checkpoint.exclude_from_loading=["optimizer"] (add "train_state" to '
+                f"also restart the step, schedule and data position) and a checkpoint.dir "
+                f"that holds no checkpoint, since training auto-resumes from a checkpoint "
+                f"there in place of load_path, optimizer state included."
             )
 
     def apply_dataloader_state(self, dataloader: Any) -> None:
@@ -1320,6 +1366,11 @@ class CheckpointManager:
         flush is dispatched, so ``_inflight_dir`` is what keeps a checkpoint
         that is not among the newest, as after a rewind, from being deleted
         while it is written.
+
+        A directory that NFS briefly keeps non-empty is retried after 0.05, 0.1,
+        0.2 and 0.4 s, waits that all the removals of one cleanup share, so a
+        cleanup requests at most 0.75 s of retry sleep. One that still cannot be
+        removed is logged and left for the next cleanup.
         """
         keep = self.config.keep_last_n
         if keep <= 0:
@@ -1344,12 +1395,12 @@ class CheckpointManager:
                 protected.add(d.resolve())
 
         to_remove = ckpt_dirs[:-keep] if len(ckpt_dirs) > keep else []
+        delays = iter(_REMOVE_RETRY_DELAYS)
         for d in to_remove:
             if d.resolve() in protected:
                 continue
             try:
-                with self._sidecar_lock:
-                    shutil.rmtree(d)
+                _remove_tree(d, self._sidecar_lock, delays)
             except OSError as e:
                 logger.warning(
                     f"Could not remove old checkpoint {d} ({e}); the next cleanup retries it"
