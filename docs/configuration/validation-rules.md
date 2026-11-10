@@ -321,6 +321,21 @@ train.is_fp8 && distributed.tp > 1  →  ValueError
 Rationale in the error message: `torchao.Float8Linear` does not compose
 with DTensor sharding today.
 
+### Sigmoid MoE router + full activation checkpointing
+
+```
+model.is_moe && model.moe_router == "sigmoid_topk"
+    && train.activation_checkpointing == "full"  →  ValueError
+```
+
+The sigmoid router updates its expert bias in place in every training
+forward. Under `"full"` the backward replays each checkpointed block's
+forward, so the replay routes with a moved bias, can send tokens to other
+experts than the forward did, and then raises `CheckpointError`. Checked
+for every arch with MoE layers, text models included. Use
+`activation_checkpointing = "selective"`, which checkpoints attention only
+and leaves the MoE layers out of the replay.
+
 ### MoE + PP
 
 ```

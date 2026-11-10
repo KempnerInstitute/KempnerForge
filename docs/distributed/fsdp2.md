@@ -222,10 +222,15 @@ Wrapping adds a `_checkpoint_wrapped_module.` segment to the names
 `named_modules()` and `named_parameters()` give whatever is inside, for
 example `transformer.layers.0._checkpoint_wrapped_module.attn.q_proj.image.weight`.
 `state_dict()` and DCP checkpoints drop it, so a checkpoint loads
-under any mode. Freeze patterns match the `named_parameters()` names,
-though: the default module aliases end in `*` and still match, while a
-raw pattern that spells a path inside a wrapped module, such as
-`transformer.layers.0.attn.*`, matches nothing under `"full"`.
+under any mode. Freeze patterns match the `named_parameters()` names:
+the default module aliases end in `*` and still match, but a raw
+pattern that spells a path inside a wrapped module matches nothing:
+under `full` a path inside a block, such as
+`transformer.layers.0.attn.*`, and under `selective` a path inside an
+attention module, such as `transformer.layers.0.attn.q_proj.*`. That
+was already so for `TransformerBlock` and `Attention`; it now applies
+to the MoT, MoMa and cross-attention blocks and to `MoTAttention` and
+`CrossAttention` too.
 
 All three use `CheckpointImpl.NO_REENTRANT` — the modern
 `torch.utils.checkpoint` implementation that composes cleanly with
