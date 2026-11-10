@@ -1540,6 +1540,29 @@ class TestInlineEmbeds:
         assert embeds.grad is not None and torch.isfinite(embeds.grad).all()
         assert all(p.grad is not None for p in model.token_embedding.parameters())
 
+    def test_output_gather_runs_the_head_on_the_chosen_positions(self):
+        model = Transformer(_KWARG_CONFIG).to(DEVICE).eval()
+        tokens = torch.randint(0, 256, (2, 16), device=DEVICE)
+        rows = torch.tensor([0, 1, 1], device=DEVICE)
+        positions = torch.tensor([5, 0, 15], device=DEVICE)
+        with torch.no_grad():
+            full = model(tokens)
+            picked = model(
+                tokens, modality=ModalityContext(output_rows=rows, output_positions=positions)
+            )
+        assert picked.shape == (1, 3, 256)
+        torch.testing.assert_close(picked[0], full[rows, positions])
+
+    def test_output_gather_rejects_a_slice_and_a_cache(self):
+        with pytest.raises(ValueError, match="both trim the head"):
+            ModalityContext(
+                output_rows=torch.zeros(1, dtype=torch.long),
+                output_positions=torch.zeros(1, dtype=torch.long),
+                output_slice=slice(1, None),
+            )
+        with pytest.raises(ValueError, match="must be given together"):
+            ModalityContext(output_rows=torch.zeros(1, dtype=torch.long))
+
     def test_width_mismatch_raises(self):
         model = Transformer(_KWARG_CONFIG).to(DEVICE)
         tokens = torch.randint(0, 256, (1, 8), device=DEVICE)

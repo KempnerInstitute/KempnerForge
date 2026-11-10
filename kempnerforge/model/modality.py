@@ -64,6 +64,10 @@ class ModalityContext:
       ``inline_positions``, both ``(M,)`` int64, and they require it:
       token ``m`` is written at ``[inline_rows[m], inline_positions[m]]``
       of the embedded rows.
+    - ``output_rows`` and ``output_positions`` come together, ``(M,)`` int64,
+      and exclude ``output_slice``: the head runs on ``h[output_rows,
+      output_positions]`` only, giving ``(1, M, vocab)`` logits, which is how
+      a packed row skips its image slots and padding tail.
     - ``image_mask`` requires ``image_features`` to be set (a
       free-standing ``image_mask`` with no features is a programming
       error).
@@ -99,6 +103,8 @@ class ModalityContext:
     inline_embeds: torch.Tensor | None = None
     inline_rows: torch.Tensor | None = None
     inline_positions: torch.Tensor | None = None
+    output_rows: torch.Tensor | None = None
+    output_positions: torch.Tensor | None = None
     position_ids: torch.Tensor | None = None
     attention_group_ids: torch.Tensor | None = None
     rope_cos: torch.Tensor | None = None
@@ -121,6 +127,7 @@ class ModalityContext:
                 "residual-stream routes)"
             )
         self._check_inline()
+        self._check_output_gather()
         if self.image_mask is not None and self.image_features is None:
             raise ValueError("ModalityContext: image_mask requires image_features to be set")
         extends_residual = (
@@ -154,6 +161,31 @@ class ModalityContext:
                     f"ModalityContext: {name} must be (batch, seq_len), got {tuple(ids.shape)}"
                 )
         self._check_rope()
+
+    def _check_output_gather(self) -> None:
+        if (self.output_rows is None) != (self.output_positions is None):
+            raise ValueError(
+                "ModalityContext: output_rows and output_positions must be given together"
+            )
+        if self.output_rows is None or self.output_positions is None:
+            return
+        if self.output_slice is not None:
+            raise ValueError("ModalityContext: output_rows and output_slice both trim the head")
+        for name, index in (
+            ("output_rows", self.output_rows),
+            ("output_positions", self.output_positions),
+        ):
+            if index.dtype != torch.long:
+                raise ValueError(
+                    f"ModalityContext: {name}.dtype must be torch.long, got {index.dtype}"
+                )
+            if index.dim() != 1:
+                raise ValueError(f"ModalityContext: {name} must be (M,), got {tuple(index.shape)}")
+        if self.output_rows.shape != self.output_positions.shape:
+            raise ValueError(
+                f"ModalityContext: output_rows {tuple(self.output_rows.shape)} and "
+                f"output_positions {tuple(self.output_positions.shape)} differ in length"
+            )
 
     def _check_inline(self) -> None:
         indices = (self.inline_rows, self.inline_positions)

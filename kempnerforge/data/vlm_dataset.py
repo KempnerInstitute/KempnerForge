@@ -554,7 +554,9 @@ def pack_vlm_samples(
         document's positions (and the tail's) restarting at ``0``;
         ``image_rows`` and ``image_starts`` ``(N,)``,
         the row and first slot of each image; ``image_tokens``, 0-d, the
-        ``tokens_per_image`` the slots were laid out with.
+        ``tokens_per_image`` the slots were laid out with; ``text_rows`` and
+        ``text_positions`` ``(M,)``, the row and position of every real text
+        token in document order, where the wrapper runs the LM head.
 
     Raises:
         ValueError: ``samples`` is empty, a document has no image or a footprint
@@ -568,6 +570,8 @@ def pack_vlm_samples(
     images: list[torch.Tensor] = []
     image_rows: list[int] = []
     image_starts: list[int] = []
+    text_rows: list[int] = []
+    text_positions: list[int] = []
     for sample in samples:
         views = sample["pixel_values"]
         if views.dim() == 3:
@@ -604,6 +608,8 @@ def pack_vlm_samples(
             image_rows.append(row_index)
             image_starts.append(cursor)
             cursor += tokens_per_image
+        text_rows.extend([row_index] * text_len)
+        text_positions.extend(range(cursor, cursor + text_len))
         row["input_ids"][cursor : cursor + text_len] = sample["input_ids"][:text_len]
         row["labels"][cursor : cursor + text_len] = sample["labels"][:text_len]
         row["doc_ids"][row["fill"] : cursor + text_len] = row["docs"]
@@ -622,6 +628,8 @@ def pack_vlm_samples(
         "image_rows": torch.tensor(image_rows, dtype=torch.long),
         "image_starts": torch.tensor(image_starts, dtype=torch.long),
         "image_tokens": torch.tensor(tokens_per_image, dtype=torch.long),
+        "text_rows": torch.tensor(text_rows, dtype=torch.long),
+        "text_positions": torch.tensor(text_positions, dtype=torch.long),
     }
 
 

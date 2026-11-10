@@ -76,7 +76,9 @@ of each micro-batch first-fit into rows of `train.seq_len` instead. Each
 document is its image's token slots followed by its real text, `doc_ids` keeps
 attention inside a document, and the wrapper writes each image's tokens over
 its slots (`ModalityContext.inline_embeds`). Each document's positions
-restart at 0, so a document sees the positions it would on the unpacked path.
+restart at 0, so a document sees the positions it would on the unpacked path,
+and the LM head runs on the text positions only, so the loss, the z-loss and
+the head's memory match the unpacked path too.
 The number of rows follows the documents' lengths, so it varies between
 micro-batches.
 
@@ -95,6 +97,7 @@ max_text_len = 256         # per-document text cap
 
 [data]
 pack_sequences = true
+hf_image_size = 512        # the checkpoint's resolution: 32 × 32 patches
 
 [model]
 max_seq_len = 2048         # the RoPE table must cover a full row

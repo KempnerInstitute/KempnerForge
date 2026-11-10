@@ -392,7 +392,9 @@ class Transformer(nn.Module):
         for the full intra-context invariant table. ``inline_embeds`` are
         written over the embedded ``tokens`` at ``(inline_rows,
         inline_positions)`` before the first layer, which is how a packed
-        row carries each document's image tokens before its own text.
+        row carries each document's image tokens before its own text, and
+        ``output_rows`` / ``output_positions`` pick the positions the head
+        runs on, giving ``(1, M, vocab)`` logits.
 
         Args:
             tokens: Integer token ids, shape ``(batch, seq_len)``.
@@ -466,6 +468,8 @@ class Transformer(nn.Module):
         modality_ids = modality.modality_ids if modality is not None else None
         key_padding_mask = modality.key_padding_mask if modality is not None else None
         inline_embeds = modality.inline_embeds if modality is not None else None
+        output_rows = modality.output_rows if modality is not None else None
+        output_positions = modality.output_positions if modality is not None else None
         position_ids = _argument_or_context("position_ids", position_ids, modality)
         rope_cos = modality.rope_cos if modality is not None else None
         rope_sin = modality.rope_sin if modality is not None else None
@@ -502,6 +506,10 @@ class Transformer(nn.Module):
             if inline_embeds is not None:
                 raise ValueError(
                     "modality.inline_embeds is training-only; cannot be combined with kv_caches"
+                )
+            if output_rows is not None:
+                raise ValueError(
+                    "modality.output_rows is training-only; cannot be combined with kv_caches"
                 )
             if key_padding_mask is not None:
                 raise ValueError(
@@ -675,6 +683,9 @@ class Transformer(nn.Module):
 
         if output_slice is not None:
             h = h[:, output_slice, :]
+        if output_rows is not None:
+            assert output_positions is not None
+            h = h[output_rows, output_positions].unsqueeze(0)
 
         if self.output_head is not None:
             h = self.output_head(h)

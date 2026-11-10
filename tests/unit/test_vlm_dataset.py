@@ -1050,6 +1050,8 @@ class TestPackVLMSamples:
         assert batch["doc_ids"][1].tolist() == [0] * 7 + [1] * 5
         assert batch["position_ids"][0].tolist() == [0, 1, 2, 3, 4, 0, 1, 2, 3, 4, 5, 0]
         assert batch["position_ids"][1].tolist() == list(range(7)) + list(range(5))
+        assert batch["text_rows"].tolist() == [0] * 7 + [1] * 5
+        assert batch["text_positions"].tolist() == [2, 3, 4, 7, 8, 9, 10, 2, 3, 4, 5, 6]
         assert batch["image_rows"].tolist() == [0, 0, 1]
         assert batch["image_starts"].tolist() == [0, 5, 0]
         assert batch["pixel_values"].shape == (3, 3, 4, 4)

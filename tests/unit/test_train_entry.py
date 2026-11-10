@@ -1250,6 +1250,48 @@ def _stub_entry(monkeypatch, model: nn.Module) -> FakeCheckpointManager:
 
 
 class TestRunTraining:
+    def test_packed_vlm_batches_train_through_run_training(self, monkeypatch):
+        """run_training drives vlm_step over packed rows with a real wrapper."""
+        import kempnerforge.training.entry as entry
+        from kempnerforge.data.vlm_dataset import pack_vlm_samples
+        from kempnerforge.model.vlm import build_vlm_wrapper
+        from kempnerforge.training.entry import run_training
+
+        config = _vlm_config()
+        config.data.pack_sequences = True
+        config.train.max_steps = 2
+        assert config.vision_encoder is not None and config.adapter is not None
+        assert config.vlm is not None
+        model = build_vlm_wrapper(config.model, config.vision_encoder, config.adapter, config.vlm)
+        before = next(model.transformer.parameters()).detach().clone()
+
+        def doc(text_len: int, seed: int) -> dict:
+            gen = torch.Generator().manual_seed(seed)
+            ids = torch.randint(0, 256, (text_len,), generator=gen)
+            labels = torch.full((text_len,), -100, dtype=torch.long)
+            labels[:-1] = ids[1:]
+            return {
+                "pixel_values": torch.randn(3, 16, 16, generator=gen),
+                "input_ids": ids,
+                "labels": labels,
+                "text_len": torch.tensor(text_len),
+            }
+
+        batches = [
+            pack_vlm_samples(
+                [doc(10, 1), doc(20, 2), doc(6, 3)], seq_len=64, tokens_per_image=8, pad_id=0
+            ),
+            pack_vlm_samples([doc(30, 4), doc(24, 5)], seq_len=64, tokens_per_image=8, pad_id=0),
+        ]
+        assert [b["input_ids"].shape[0] for b in batches] == [1, 2]
+        ckpt = _stub_entry(monkeypatch, model)
+        ckpt.apply_dataloader_state = lambda _loader: None
+        monkeypatch.setattr(
+            entry, "build_data_pipeline", lambda *_a, **_k: DataPipeline(dataloader=batches)
+        )
+        run_training(config)
+        assert not torch.equal(before, next(model.transformer.parameters()))
+
     def test_defaults_to_the_registry_selected_step_body(self, monkeypatch):
         from kempnerforge.training.entry import run_training
 
@@ -3113,6 +3155,11 @@ class TestVlmStep:
         assert session.step_fn(session, 0).tokens is None
         batch = self._batch()
         batch["doc_ids"] = torch.zeros(2, 4, dtype=torch.long)
+        session, _ = self._session([batch])
+        assert session.step_fn(session, 0).tokens is None
+        batch["image_rows"] = torch.tensor([0, 1])
+        batch["image_starts"] = torch.tensor([0, 0])
+        batch["image_tokens"] = torch.tensor(2)
         session, _ = self._session([batch])
         assert session.step_fn(session, 0).tokens == 8
 

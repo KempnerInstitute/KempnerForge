@@ -270,13 +270,26 @@ def pipeline_step(session: TrainingSession, step: int) -> StepResult:
     return StepResult(loss=loss_tensor.item(), grad_norm=grad_norm_val)
 
 
+_PACKED_BATCH_KEYS = (
+    "doc_ids",
+    "position_ids",
+    "attention_group_ids",
+    "image_rows",
+    "image_starts",
+    "text_rows",
+    "text_positions",
+)
+
+
 def vlm_step(session: TrainingSession, step: int) -> StepResult:
     """VLM step (no PP): pixel_values + input_ids forward, with a text-token count.
 
-    A packed batch also carries ``doc_ids``, ``position_ids`` and the image
-    placement (``image_rows``, ``image_starts``, ``image_tokens``), passed
-    through to the wrapper. Its row count varies, so the step reports the
-    tokens it ran and marks the leading dims dynamic for ``torch.compile``.
+    A packed batch (one with ``image_rows``) also carries ``doc_ids``,
+    ``position_ids``, the image placement (``image_starts``, ``image_tokens``)
+    and the text positions, all passed through to the wrapper, with
+    ``attention_group_ids`` when a collator emits them. Its row count varies,
+    so the step reports the tokens it ran and marks the leading dims dynamic
+    for ``torch.compile``.
     """
     config = session.config
     tc, mc = config.train, config.model
@@ -299,24 +312,22 @@ def vlm_step(session: TrainingSession, step: int) -> StepResult:
         input_ids = batch["input_ids"].to(device)
         labels = batch["labels"].to(device)
         frame_mask = batch["frame_mask"].to(device) if "frame_mask" in batch else None
-        packed: dict[str, Any] = {
-            key: batch[key].to(device)
-            for key in ("doc_ids", "position_ids", "image_rows", "image_starts")
-            if key in batch
+        extras: dict[str, Any] = {
+            key: batch[key].to(device) for key in _PACKED_BATCH_KEYS if key in batch
         }
         if "image_tokens" in batch:
-            packed["image_tokens"] = int(batch["image_tokens"])
-        if packed:
+            extras["image_tokens"] = int(batch["image_tokens"])
+        if "image_rows" in extras:
             packed_tokens = (packed_tokens or 0) + input_ids.numel()
             if tc.compile_model:
-                _mark_rows_dynamic(pixel_values, input_ids, labels, *packed.values())
+                _mark_rows_dynamic(pixel_values, input_ids, labels, *extras.values())
 
         with maybe_no_sync(model, micro_step, tc.grad_accum_steps):
             if mc.is_moe:
                 inner_transformer(model).set_moe_step(step, tc.max_steps)  # type: ignore[attr-defined]
             with session.autocast():
                 logits, labels_out = model(
-                    pixel_values, input_ids, labels, frame_mask=frame_mask, **packed
+                    pixel_values, input_ids, labels, frame_mask=frame_mask, **extras
                 )
                 loss = session.loss_fn(logits, labels_out)
 

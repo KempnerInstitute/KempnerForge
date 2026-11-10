@@ -93,10 +93,11 @@ def test_packed_flex_compile_tracks_varying_rows_and_images() -> None:
         _mark_rows_dynamic(*batch.values())
         dense.zero_grad(set_to_none=True)
         sparse.zero_grad(set_to_none=True)
-        reference, _ = dense(**batch, image_tokens=image_tokens)
+        reference, reference_labels = dense(**batch, image_tokens=image_tokens)
         actual, _ = compiled(**batch, image_tokens=image_tokens)
         torch.testing.assert_close(actual, reference, rtol=2e-5, atol=2e-5)
-        labels = batch["labels"].reshape(-1)
+        assert reference_labels is not None
+        labels = reference_labels.reshape(-1)
         reference_loss = F.cross_entropy(reference.reshape(-1, 128), labels)
         actual_loss = F.cross_entropy(actual.reshape(-1, 128), labels)
         assert torch.isfinite(actual_loss)
