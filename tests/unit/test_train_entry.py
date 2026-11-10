@@ -1539,6 +1539,8 @@ class TestWeightDecayScopeWarmStart:
         config.checkpoint.exclude_from_loading = ["optimizer"]
         assert restore_checkpoint(config, model, None, manager) == (1, 0)
         assert not optimizer.state
+        config.checkpoint.exclude_from_loading = ["optimizer", "train_state"]
+        assert restore_checkpoint(config, model, None, manager) == (0, 0)
 
 
 class TestBuildDataPipeline:
@@ -1994,6 +1996,10 @@ class FakeResumeManager:
         self.load_kwargs = kw
         return self._ret
 
+    def agree(self, error, what=""):
+        if error is not None:
+            raise error
+
 
 def _entry_warnings(call):
     """Run ``call`` and return its result and the warnings the training entry logged."""
@@ -2127,7 +2133,14 @@ class TestRestoreCheckpoint:
             (False, "/somewhere/converted", ["model"], ["model"]),
             (False, "/somewhere/converted", ["model", "optimizer"], ["model", "optimizer"]),
             (False, "/somewhere/converted", [], None),
+            (
+                False,
+                "/somewhere/converted",
+                ["optimizer", "train_state"],
+                ["optimizer", "train_state"],
+            ),
             (True, None, ["optimizer"], None),
+            (True, "/somewhere/converted", ["optimizer", "train_state"], None),
             (True, None, [], None),
             (True, "/somewhere/converted", ["optimizer"], None),
             (True, "/somewhere/converted", ["model", "optimizer"], None),
@@ -2239,14 +2252,31 @@ class TestRestoreCheckpoint:
         assert mgr.load_kwargs["vlm_freeze_expected"] == freeze_meta_at_step(0, config.vlm)
         assert mgr.load_kwargs["exclude_keys"] == ["model"]
 
-    def test_mot_warm_start_fires_only_at_step_zero(self, monkeypatch, tmp_path):
+    def test_weights_only_warm_start_skips_the_freeze_probe(self, monkeypatch):
+        import kempnerforge.training.entry as entry
+
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: None)
+        config = _vlm_config()
+        config.checkpoint.load_path = "/runs/stage1/step_50000"
+        config.checkpoint.exclude_from_loading = ["optimizer", "train_state"]
+        mgr = FakeResumeManager(step=0, tokens=0, saved_step=50000)
+        entry.restore_checkpoint(config, TinyTextModel(), None, mgr)
+        assert mgr.peeked == []
+        assert mgr.load_kwargs["vlm_freeze_expected"] is None
+        assert mgr.load_kwargs["exclude_keys"] == ["optimizer", "train_state"]
+
+    @pytest.mark.parametrize("wrapped", [False, True], ids=["plain_state_dict", "model_wrapper"])
+    def test_mot_warm_start_runs_only_when_no_checkpoint_supplied_the_model(
+        self, monkeypatch, tmp_path, wrapped
+    ):
         import kempnerforge.training.entry as entry
         from kempnerforge.config.adapter import AdapterConfig
         from kempnerforge.config.vision import VisionEncoderConfig
         from kempnerforge.config.vlm import MoTConfig
 
         monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: tmp_path / "s")
-        monkeypatch.setattr(torch, "load", lambda *a, **k: {"model": {"w": 1}})
+        source = {"w": 1}
+        monkeypatch.setattr(torch, "load", lambda *a, **k: {"model": source} if wrapped else source)
         copied: list = []
         monkeypatch.setattr(
             entry, "mot_warm_start_from_text_stack", lambda m, src: copied.append(src)
@@ -2260,12 +2290,30 @@ class TestRestoreCheckpoint:
                 max_text_len=32, mot_warm_start_from_text=True, mot_warm_start_path="/x.pt"
             ),
         )
+        for step in (0, 4):
+            entry.restore_checkpoint(config, TinyTextModel(), None, FakeResumeManager(step=step))
+            assert copied == [], f"a resume at step {step} supplied the model"
+
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: None)
+        config.checkpoint.load_path = str(tmp_path / "stage1")
+        config.checkpoint.exclude_from_loading = ["optimizer", "train_state"]
+        entry.restore_checkpoint(config, TinyTextModel(), None, FakeResumeManager(step=0))
+        assert copied == []
+
+        config.checkpoint.exclude_from_loading = ["model"]
         entry.restore_checkpoint(config, TinyTextModel(), None, FakeResumeManager(step=0))
         assert copied == [{"w": 1}]
+        entry.restore_checkpoint(config, TinyTextModel(), None, FakeResumeManager(step=4))
+        assert copied == [{"w": 1}] * 2, "a step-4 train state without the model needs the copy"
 
         copied.clear()
-        entry.restore_checkpoint(config, TinyTextModel(), None, FakeResumeManager(step=4))
-        assert copied == []
+        config.checkpoint.load_path = None
+        config.checkpoint.exclude_from_loading = []
+        assert entry.restore_checkpoint(config, TinyTextModel(), None, FakeResumeManager()) == (
+            0,
+            0,
+        )
+        assert copied == [{"w": 1}]
 
     def test_a_resume_that_overrides_load_path_warns_naming_both(self, monkeypatch, tmp_path):
         """A rollback through ``load_path`` into a ``dir`` that has checkpoints resumes instead."""

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+from collections.abc import Callable
 from pathlib import Path
 from typing import cast
 
@@ -17,8 +18,9 @@ import torch
 import torch.distributed as dist
 
 from kempnerforge.checkpoint.manager import CheckpointManager
+from kempnerforge.config.checkpoint import is_weights_only
 from kempnerforge.config.job import JobConfig
-from kempnerforge.config.vlm import MoTConfig
+from kempnerforge.config.vlm import MoTConfig, VLMConfig
 from kempnerforge.distributed.parallel import (
     apply_ac,
     apply_float8,
@@ -195,6 +197,33 @@ def build_checkpoint_manager(
     )
 
 
+def _mot_text_warm_start(
+    vlm_cfg: VLMConfig | None,
+    model: torch.nn.Module,
+    agree: Callable[[BaseException | None, str], None],
+) -> None:
+    """Copy the dense block weights of ``mot_warm_start_path`` into a MoT model.
+
+    ``agree`` is the checkpoint manager's rank agreement: every rank reports
+    whether it read the source before any rank enters the copy's DTensor
+    collectives, so a rank that cannot read the file fails the run on every rank
+    instead of leaving the others waiting until the process-group timeout.
+    """
+    if not isinstance(vlm_cfg, MoTConfig) or not vlm_cfg.mot_warm_start_from_text:
+        return
+    source = {}
+    error = None
+    try:
+        source = torch.load(vlm_cfg.mot_warm_start_path, map_location="cpu", weights_only=True)
+        if isinstance(source, dict) and "model" in source:
+            source = source["model"]
+    except Exception as exc:
+        error = exc
+    agree(error, f"MoT warm-start: reading {vlm_cfg.mot_warm_start_path}")
+    mot_warm_start_from_text_stack(inner_transformer(model), source)
+    logger.info(f"MoT warm-start: copied dense block weights from {vlm_cfg.mot_warm_start_path}")
+
+
 def _unused_load_path_message(config: JobConfig, resume_path: Path) -> str:
     """The warning that a resume from ``checkpoint.dir`` wins over ``checkpoint.load_path``."""
     ckpt = config.checkpoint
@@ -239,8 +268,9 @@ def restore_checkpoint(
     """Auto-resume from ``latest`` (or ``checkpoint.load_path``).
 
     Returns ``(step, tokens_seen)`` — ``(0, 0)`` when there is nothing to
-    resume from. Also restores the metrics run ids, runs the MoT warm-start
-    hook, and re-applies the effective freeze at the resumed step.
+    resume from. Also restores the metrics run ids, runs the MoT text warm
+    start when no checkpoint supplied the model weights and the run starts at
+    step 0, and re-applies the effective freeze at the resumed step.
 
     A checkpoint in ``checkpoint.dir`` takes precedence over ``checkpoint.load_path``, so a
     requeued warm start resumes rather than starting over; rank 0 then warns that
@@ -258,7 +288,9 @@ def restore_checkpoint(
         resume_path = Path(chosen[0]) if chosen[0] else None
     else:
         resume_path = resolve_resume_path(config.checkpoint.dir, num_stages)
+    vlm_cfg = config.vlm
     if not resume_path and not config.checkpoint.load_path:
+        _mot_text_warm_start(vlm_cfg, model, ckpt_mgr.agree)
         return 0, 0
     rank_zero = not dist.is_initialized() or dist.get_rank() == 0
     if (
@@ -269,16 +301,16 @@ def restore_checkpoint(
     ):
         logger.warning(_unused_load_path_message(config, resume_path))
 
-    vlm_cfg = config.vlm
+    warm_start_exclude = (
+        (config.checkpoint.exclude_from_loading or None) if resume_path is None else None
+    )
+    weights_only = is_weights_only(warm_start_exclude)
     vlm_freeze_expected = None
-    if config.is_vlm:
+    if config.is_vlm and not weights_only:
         assert vlm_cfg is not None
         probe_step = ckpt_mgr.peek_saved_step(str(resume_path) if resume_path else None) or 0
         vlm_freeze_expected = freeze_meta_at_step(probe_step, vlm_cfg)
 
-    warm_start_exclude = (
-        (config.checkpoint.exclude_from_loading or None) if resume_path is None else None
-    )
     step, tokens_seen, ckpt_extra_loaded = ckpt_mgr.load(
         path=str(resume_path) if resume_path else None,
         scheduler=scheduler,
@@ -290,14 +322,8 @@ def restore_checkpoint(
     if ckpt_extra_loaded.get("mlflow_run_id"):
         config.metrics.mlflow_run_id = ckpt_extra_loaded["mlflow_run_id"]
 
-    if isinstance(vlm_cfg, MoTConfig) and vlm_cfg.mot_warm_start_from_text and step == 0:
-        source = torch.load(vlm_cfg.mot_warm_start_path, map_location="cpu", weights_only=True)
-        if isinstance(source, dict) and "model" in source:
-            source = source["model"]
-        mot_warm_start_from_text_stack(inner_transformer(model), source)
-        logger.info(
-            f"MoT warm-start: copied dense block weights from {vlm_cfg.mot_warm_start_path}"
-        )
+    if warm_start_exclude is not None and "model" in warm_start_exclude:
+        _mot_text_warm_start(vlm_cfg, model, ckpt_mgr.agree)
 
     if vlm_cfg is not None and vlm_cfg.freeze_schedule:
         valid_modules = set(vlm_cfg.module_patterns.keys())
