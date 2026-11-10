@@ -32,6 +32,7 @@ from kempnerforge.training.eval import run_eval
 from kempnerforge.training.freeze import apply_freeze_specs, freeze_meta_at_step
 from kempnerforge.training.grad import maybe_no_sync
 from kempnerforge.training.hooks import HookRunner, StepContext
+from kempnerforge.training.optimizer import module_learning_rates
 from kempnerforge.training.runtime import PipelineBundle, RuntimeContext, pp_group
 
 logger = get_logger(__name__)
@@ -407,11 +408,15 @@ def checkpoint_extra(config: JobConfig, step: int, phases: PhaseState) -> dict:
 
 
 def _log_periodic_metrics(session: TrainingSession, result: StepResult, step: int) -> None:
-    """MoE / VLM-text-token / per-dataset series, on the main metrics interval."""
+    """Per-module LR / MoE / VLM-text-token / per-dataset series, on the main metrics interval."""
     config = session.config
     mc = config.model
     tracker = session.tracker
     model = session.model
+
+    module_lrs = module_learning_rates(session.optimizer)
+    if module_lrs:
+        tracker.log_eval(module_lrs, step)
 
     if mc.is_moe:
         inner = inner_transformer(model)
