@@ -52,7 +52,7 @@ enable_wandb       = false
 enable_tensorboard = false
 wandb_project      = "kempnerforge"
 wandb_run_name     = ""          # auto-generated if empty
-wandb_run_id       = ""          # restored from checkpoint on resume
+wandb_run_id       = ""          # restored from checkpoint on an auto-resume
 tensorboard_dir    = "tb_logs"
 enable_mlflow      = false
 mlflow_experiment  = "/Experiments/my-project"   # absolute workspace path on Databricks
@@ -87,7 +87,7 @@ profiler
 - [Training § Training loop](../training/training-loop.md) — where
   `tracker.start_step` / `end_step` bookend every step.
 - [Checkpointing § Train state](../checkpointing/train-state.md) —
-  `wandb_run_id` is saved in `ckpt_extra` so resume reattaches to the
-  same run.
+  `wandb_run_id` is saved in `ckpt_extra` so an auto-resume reattaches to
+  the same run.
 - [Configuration § `[metrics]` and `[profiling]`](../configuration/config-sections.md) —
   every knob on this page.

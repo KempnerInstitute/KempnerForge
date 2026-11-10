@@ -57,10 +57,10 @@ def _import_mlflow() -> Any:
     """Import mlflow with bounded HTTP requests and its usage telemetry off.
 
     Values already set in the environment win. The first call MLflow records starts a telemetry
-    thread that fetches a config and then draws from Python's global ``random``. A resumed run
-    makes that call after the checkpoint restored the RNG, which would leave the stream one draw
-    ahead of the uninterrupted run's, and in a fresh run the draw lands at an unpredictable point
-    among the training thread's own draws.
+    thread that fetches a config and, when the fetch succeeds, draws from Python's global
+    ``random``. A resumed run makes that call after the checkpoint restored the RNG, which would
+    leave the stream one draw ahead of the uninterrupted run's, and in a fresh run the draw
+    lands at an unpredictable point among the training thread's own draws.
     """
     os.environ.setdefault("MLFLOW_HTTP_REQUEST_TIMEOUT", "30")
     os.environ.setdefault("MLFLOW_HTTP_REQUEST_MAX_RETRIES", "3")
@@ -76,8 +76,11 @@ def _resolve_mlflow_experiment(config: MetricsConfig, uri: str) -> str | None:
     (/Users/<user>/<project> via the SDK on Databricks; bare name locally).
 
     The auto path's SDK client takes the profile a ``databricks://<profile>`` URI names, as
-    MLflow's tracking client does, so the path names the user the run logs as; for a URI that
-    names none, both resolve their profile from the environment.
+    MLflow's tracking client does, so the path names the user the run logs as; with a plain
+    ``databricks`` URI both resolve their profile from the environment. The secret-scope form
+    ``databricks://<scope>:<prefix>`` is not supported here: MLflow builds that URI's client
+    from the secret scope, which this lookup does not read, so it may resolve another user. Set
+    the experiment explicitly with that form.
 
     On Databricks a non-absolute $MLFLOW_EXPERIMENT raises ValueError; the backend
     catches it and disables MLflow with a clear message (the config-field equivalent

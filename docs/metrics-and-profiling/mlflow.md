@@ -99,11 +99,11 @@ offline. On the profile route it also counts the auth methods behind the profile
 names and the credential variables set, as the SDK does, and warns when there is more than one,
 such as a `token` in the section beside an exported `DATABRICKS_CLIENT_ID` or a stray
 `ARM_CLIENT_ID`, unless `$DATABRICKS_AUTH_TYPE` or a non-empty `auth_type` key in the profile
-picks one: the SDK refuses such a profile, and the backend disables itself. When
-`$MLFLOW_TRACKING_URI` selects one profile and `$DATABRICKS_CONFIG_PROFILE` names another, it
-warns, naming both, as the backend would. It parses the whole file, as the SDK does, but no
-value from the file reaches a message. It looks at the environment, not at
-`mlflow_tracking_uri` in a config. Add
+picks one: the SDK refuses such a profile, and the backend disables itself. On that route,
+when `$MLFLOW_TRACKING_URI` selects one profile and `$DATABRICKS_CONFIG_PROFILE` names another,
+it warns, naming both, as the backend does; one warning says both problems when both apply. It
+parses the whole file, as the SDK does, but no value from the file reaches a message. It looks
+at the environment, not at `mlflow_tracking_uri` in a config. Add
 `--check-credentials` to also call the workspace through the SDK by that same resolution,
 naming a profile only when one is selected; it calls whenever the offline check passes or leaves
 an environment route unsettled. A failure is reported by exception class only,
@@ -138,7 +138,10 @@ runtime. When none is set, auto derives `/Users/<databricks-username>/<wandb_pro
 the Databricks SDK (off Databricks, the bare `wandb_project` name), with the profile a
 `databricks://<profile>` URI names, as MLflow's tracking client does, so the path belongs to
 the user the run logs as. It needs working credentials: when the user cannot be resolved the
-backend disables itself and asks for an explicit path.
+backend disables itself and asks for an explicit path. The secret-scope form
+`databricks://<scope>:<prefix>` is not supported by the automatic path: MLflow builds that
+URI's client from the secret scope, which the lookup does not read, so it may resolve another
+user. Set `mlflow_experiment` or `$MLFLOW_EXPERIMENT` with that form.
 
 ## Checking the server from a compute node
 
@@ -223,10 +226,15 @@ the checkpoint keeps its name and its steps. Rank 0 adds two tags to the new run
 `kempnerforge.warm_start.checkpoint`, the real path of the step directory it loaded, and
 `kempnerforge.warm_start.source_run_id`, the MLflow run that saved it, read from the
 checkpoint's `metadata.json` (else from its `train_state.pt`) and left out when neither records
-one. The warm start's own checkpoints record its new run, so a requeue after its first save
-auto-resumes that run; one preempted before its first save starts another new run, as a fresh
-run does. To log a warm start into an existing run on purpose, set `metrics.mlflow_run_id`: a
-run id the config sets is kept, and the resume rules above apply to it.
+one. The warm start's checkpoints record its new run from its first logged step on, since the
+backend starts the run lazily, so a requeue from one of them auto-resumes that run. A warm
+start preempted before its first save starts over as another warm start, with another new run.
+A checkpoint saved before its first logged step records no run: a warm start from step 5 first
+logs at step 10 with the default `metrics.log_interval`, so an emergency save or a
+`dyn_ckpt_window` milestone before then is such a checkpoint. A requeue from it opens another
+new run, as a fresh run would, and that run carries no warm-start tags. To log a warm start
+into an existing run on purpose, set `metrics.mlflow_run_id`: a run id the config sets is kept,
+and the resume rules above apply to it.
 
 ## Finding a checkpoint's run
 
@@ -425,23 +433,25 @@ check included, run with MLflow's own defaults.
 MLflow collects anonymous usage telemetry unless told not to. The training backend turns it
 off: before it imports `mlflow` it sets `MLFLOW_DISABLE_TELEMETRY=true`, unless the variable is
 already set. MLflow's telemetry draws from Python's global `random`: the first call MLflow
-records starts a background thread that fetches the telemetry config and then calls
-`random.randint`. A resumed run makes that call after the checkpoint restored the RNG, so with
-telemetry on, a hook or a custom step function that draws from `random` would get a stream one
-draw ahead of the uninterrupted run's, and in a fresh run the draw would land at an
-unpredictable point among the training thread's own draws. Export
+records starts a background thread that fetches the telemetry config and, when the fetch
+succeeds, calls `random.randint`. A resumed run makes that call after the checkpoint restored
+the RNG, so with telemetry on, a hook or a custom step function that draws from `random` would
+get a stream one draw ahead of the uninterrupted run's, and in a fresh run the draw would land
+at an unpredictable point among the training thread's own draws. Export
 `MLFLOW_DISABLE_TELEMETRY=false` to keep MLflow's telemetry at that cost.
 
 MLflow reads the variable at each call it records, so the default also holds when your code
 imports `mlflow` before the backend does, except for autologging (`mlflow.autolog()` and the
 flavor integrations), whose events MLflow records without reading it: a job that does both
 should export `MLFLOW_DISABLE_TELEMETRY=true` itself. The [publisher](#publishing-eval-results)
-runs outside training and restores no RNG, so it leaves telemetry as MLflow sets it.
+runs outside training and restores no RNG, so it leaves telemetry as MLflow sets it, unless it
+inherits the training process's environment.
 
 Two other kinds of draw from `random` remain in the tracking stack. MLflow, urllib3 and the
-Databricks SDK draw a random jitter for the wait before they retry a failed request, and a
-SQLite store before it retries a locked write, at times that depend on the network and the
-server. A local file or SQLite store draws a random name for a new run that has no
+Databricks SDK draw a random jitter for the wait before they retry a failed request, and a SQL
+store (SQLite included) before it retries a run-tag write that collided with a concurrent
+writer's, at times that depend on the network and the server. A local file or SQLite store
+draws a random name for a new run that has no
 `mlflow_run_name` (a file store can also draw when it creates an experiment), which a resume
 that reattaches its run never does. KempnerForge's own training path draws nothing from
 `random`, so the model, loss and grad norm are unaffected either way; a hook that needs a

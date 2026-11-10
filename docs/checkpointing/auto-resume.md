@@ -268,8 +268,9 @@ and requeues of the new run resume from its own checkpoints in the new
 `dir`. The new run logs to new MLflow and W&B runs, the MLflow one
 tagged with the checkpoint it started from
 ([MLflow § Run ID and resume](../metrics-and-profiling/mlflow.md#run-id-and-resume)),
-while rewinding `latest` as above continues the original runs. Setting
-`load_path` to `step_5000` while `dir` stays
+while rewinding `latest` as above continues the original runs, where
+MLflow drops the rerun's steps up to the last `train/loss` step the run
+already holds. Setting `load_path` to `step_5000` while `dir` stays
 `checkpoints` does not roll back: the run resumes from the newest
 checkpoint there, and rank 0 warns that `load_path` is not used.
 
