@@ -11,7 +11,8 @@ into a versioned envelope at save time, and on an exact resume
 (``load(exact_resume=True)``) each rank restores its own entry from the
 broadcast (see ``kempnerforge.checkpoint.state``). Any other load (a
 ``load_path`` warm start, evaluation) restores rank 0's single copy on every
-rank.
+rank. A weights-only warm start (``exclude_keys=["optimizer", "train_state"]``)
+reads no ``train_state.pt``, so it restores neither and checks no topology.
 
 Resharding model and optimizer state is therefore free, but an exact resume
 is not: a rank's loader cursor and RNG streams are valid only on the world
@@ -1096,7 +1097,10 @@ class CheckpointManager:
                 rank must pass the same value. False (a ``load_path`` warm
                 start, evaluation, any other load) restores the single-copy
                 ``rng``/``dataloader`` keys (rank 0's) on every rank with no
-                topology check.
+                topology check. The weights-only ``exclude_keys`` pair reads no
+                train state: no rank restores loader/RNG state or enters the
+                train-state broadcasts or the layout gather, and with
+                ``exact_resume`` it raises.
 
         Returns:
             Tuple of (step, tokens_seen, extra) where extra contains any
@@ -1106,12 +1110,19 @@ class CheckpointManager:
             FileNotFoundError: No checkpoint resolves although one was named, or the
                 checkpoint holds optimizer state that this load restores but has no
                 ``train_state.pt``. Raised before any state is loaded.
-            ValueError: ``exclude_keys`` is not a list of distinct DCP keys, or names
-                ``"train_state"`` outside ``["optimizer", "train_state"]``. Raised
-                before the path is resolved.
+            ValueError: ``exclude_keys`` is not a list of distinct DCP keys, names
+                ``"train_state"`` outside ``["optimizer", "train_state"]``, or is that
+                pair with ``exact_resume``. Raised before the path is resolved.
         """
         if exclude_keys is not None:
             validate_exclude_keys(exclude_keys, "exclude_keys")
+        if exact_resume and is_weights_only(exclude_keys):
+            raise ValueError(
+                "exact_resume restores each rank's dataloader/RNG state from train_state.pt, "
+                "which exclude_keys=['optimizer', 'train_state'] skips: a weights-only warm "
+                "start begins a new run at step 0. Load it with exact_resume=False, or drop "
+                "'train_state' from exclude_keys to resume."
+            )
         ckpt_dir = self._resolve_load_path(path)
         if ckpt_dir is None:
             requested = path if path is not None else self.config.load_path

@@ -76,6 +76,10 @@ then restores **its own** entry from `per_rank["ranks"]`, keyed by
 global rank. Any other load (a `load_path` warm start,
 `scripts/eval.py`) restores the single-copy `rng`/`dataloader` keys
 (rank 0's) on every rank with no topology check, exactly as before.
+A weights-only warm start
+(`exclude_from_loading = ["optimizer", "train_state"]`) never reads
+the file, so no rank restores either copy or enters the broadcast or
+the layout gather.
 
 ## Per-rank state (schema v1)
 
@@ -129,7 +133,10 @@ Compatibility:
   restore rank 0's copy on every rank and ignore `per_rank`.
 - **Not a resume**: a `load_path` warm start or an evaluation load
   ignores `per_rank` and restores the single-copy keys (rank 0's) on
-  every rank, exactly as before, on any world size or layout.
+  every rank, exactly as before, on any world size or layout. A
+  weights-only warm start skips the whole file, `per_rank` included:
+  every rank keeps the RNG streams seeded at startup and starts its
+  loader from the first sample, on any world size or layout.
 
 ## RNG capture
 

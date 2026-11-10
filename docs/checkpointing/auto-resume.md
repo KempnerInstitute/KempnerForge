@@ -126,7 +126,8 @@ the same warning states. Use an empty `dir` to guarantee the warm start.
 Per-rank dataloader/RNG state follows it too: only the auto-resume is
 an exact resume, where each rank restores its own state and a changed
 world size or data-parallel layout is refused; a `load_path` warm
-start restores rank 0's single copy on every rank on any topology
+start restores rank 0's single copy on every rank on any topology, and
+a weights-only one (below) restores neither
 (see [Train state](train-state.md#per-rank-state-schema-v1)). To
 auto-resume onto a different topology anyway, set
 `checkpoint.ignore_rank_state_mismatch`: see

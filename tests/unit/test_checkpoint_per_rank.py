@@ -1031,8 +1031,8 @@ class TestLoadsThatAreNotAResume:
         "world", [2, WORLD], ids=["world_size_change", "same_size_layout_change"]
     )
     def test_eval_style_load(self, tmp_path, monkeypatch, world):
-        """Weights-only load by a manager built without dp_info and called
-        without a resume context, as scripts/eval.py does. It cannot see the
+        """A load that skips the optimizer, by a manager built without dp_info and
+        called without a resume context, as scripts/eval.py does. It cannot see the
         new run's layout, so a same-size layout change is just the same size."""
         payloads, expected = _mk_payloads(seed_base=1000, cursor_base=100)
         _save_four_rank_ckpt(tmp_path, monkeypatch, payloads, step=7, layout=DP4)
@@ -1055,8 +1055,8 @@ class TestLoadsThatAreNotAResume:
         ids=["world_size_change", "same_size_layout_change"],
     )
     def test_load_path_warm_start(self, tmp_path, monkeypatch, world, layout):
-        """Weights-only warm start through the training entry, by a manager that
-        records its layout as build_checkpoint_manager does."""
+        """A warm start with a fresh optimizer through the training entry, by a
+        manager that records its layout as build_checkpoint_manager does."""
         from kempnerforge.config.job import JobConfig
         from kempnerforge.training.entry import restore_checkpoint
 
@@ -1083,6 +1083,146 @@ class TestLoadsThatAreNotAResume:
             assert mgr._pending_dataloader_state == {"cursor": 100, "prefetch_depth": 1}
             assert _draw() == expected[0], f"rank {r} did not restore rank 0's copy"
         assert gathers == []
+
+
+WEIGHTS_ONLY = ["optimizer", "train_state"]
+TOPOLOGIES = pytest.mark.parametrize(
+    ("world", "layout"),
+    [(WORLD, DP4), (2, {0: (0, 2), 1: (1, 2)}), (WORLD, DP2_TP2)],
+    ids=["saved_topology", "world_size_change", "same_size_layout_change"],
+)
+
+
+def _install_recording_world(m, rank: int, world: int, calls: list) -> None:
+    """Simulate global rank ``rank`` of a ``world``-rank job whose collectives only record.
+
+    Every broadcast, gather and all-reduce appends ``(rank, collective, the object it
+    carries)`` to ``calls`` and changes nothing.
+    """
+    m.setattr(mgr_mod.dist, "is_initialized", lambda: True)
+    m.setattr(mgr_mod.dist, "get_rank", lambda group=None: rank)
+    m.setattr(mgr_mod.dist, "get_world_size", lambda group=None: world)
+    m.setattr(mgr_mod.dist, "new_group", lambda backend=None: "GLOO_PG")
+    m.setattr(
+        mgr_mod.dist,
+        "broadcast_object_list",
+        lambda obj_list, src=0: calls.append((rank, "broadcast", obj_list[0])),
+    )
+    m.setattr(
+        mgr_mod.dist,
+        "all_gather_object",
+        lambda obj_list, obj, group=None: calls.append((rank, "gather", obj)),
+    )
+    m.setattr(
+        mgr_mod.dist,
+        "all_reduce",
+        lambda tensor, group=None: calls.append((rank, "all_reduce", None)),
+    )
+
+
+def _per_rank_checkpoint(tmp_path, monkeypatch) -> Path:
+    """A 4-rank ``step_7`` whose ``train_state.pt`` holds the per-rank envelope."""
+    payloads, _ = _mk_payloads(seed_base=1000, cursor_base=100)
+    _save_four_rank_ckpt(
+        tmp_path, monkeypatch, payloads, step=7, layout=DP4, scheduler=_FakeScheduler(0.5)
+    )
+    ckpt_dir = tmp_path / "step_7"
+    assert PER_RANK_KEY in torch.load(ckpt_dir / "train_state.pt", weights_only=False)
+    return ckpt_dir
+
+
+def _fresh_draw(rank: int) -> tuple[float, float, float]:
+    """Seed rank ``rank``'s generators as its run would at startup; return their next draw."""
+    _seed_all(555 + rank)
+    draw = _draw()
+    _seed_all(555 + rank)
+    return draw
+
+
+class TestWeightsOnlyWarmStart:
+    """A warm start that skips ``train_state.pt`` skips the per-rank envelope inside it.
+
+    No rank restores loader or RNG state, its own entry or rank 0's copy, and no rank
+    enters a collective of the train-state path (the existence and train-state broadcasts,
+    the data-parallel layout gather), so the ranks cannot disagree on one. Nothing is
+    checked against the saved topology: the warm start begins a new run on any world size
+    or layout without ``checkpoint.ignore_rank_state_mismatch``.
+    """
+
+    @TOPOLOGIES
+    def test_no_rank_restores_state_or_enters_a_collective(
+        self, tmp_path, monkeypatch, world, layout
+    ):
+        ckpt_dir = _per_rank_checkpoint(tmp_path, monkeypatch)
+        calls: list = []
+        for r in range(world):
+            scheduler = _FakeScheduler(0.1)
+            loader = MagicMock(spec=["load_state_dict"])
+            with monkeypatch.context() as m:
+                _install_recording_world(m, r, world, calls)
+                mgr = _mock_mgr(tmp_path, m, dp_info=layout[r])
+                dcp_load = mgr_mod.dcp.load
+                fresh = _fresh_draw(r)
+                result = mgr.load(
+                    path=str(ckpt_dir),
+                    scheduler=scheduler,
+                    dataloader=loader,
+                    exclude_keys=WEIGHTS_ONLY,
+                )
+            assert result == (0, 0, {})
+            assert _draw() == fresh, f"rank {r} restored saved RNG state"
+            assert scheduler.restored is None
+            loader.load_state_dict.assert_not_called()
+            assert mgr._pending_dataloader_state is None
+            dcp_load.assert_called_once()
+            assert set(dcp_load.call_args.args[0]) == {"model"}
+        assert calls == []
+
+    @TOPOLOGIES
+    def test_training_entry_warm_start(self, tmp_path, monkeypatch, world, layout):
+        """Through ``restore_checkpoint``, every rank's only collective is the broadcast
+        of the resume path, which finds nothing to resume in the new run's directory."""
+        from kempnerforge.config.job import JobConfig
+        from kempnerforge.training.entry import restore_checkpoint
+
+        ckpt_dir = _per_rank_checkpoint(tmp_path, monkeypatch)
+        calls: list = []
+        for r in range(world):
+            config = JobConfig(
+                checkpoint=CheckpointConfig(
+                    dir=str(tmp_path / "new_run"),
+                    load_path=str(ckpt_dir),
+                    exclude_from_loading=list(WEIGHTS_ONLY),
+                )
+            )
+            scheduler = _FakeScheduler(0.1)
+            with monkeypatch.context() as m:
+                _install_recording_world(m, r, world, calls)
+                m.setattr("kempnerforge.checkpoint.manager.dcp.load", MagicMock())
+                model = torch.nn.Linear(4, 4)
+                opt = torch.optim.SGD(model.parameters(), lr=0.1)
+                mgr = CheckpointManager(config.checkpoint, model, opt, dp_info=layout[r])
+                fresh = _fresh_draw(r)
+                assert restore_checkpoint(config, model, scheduler, mgr) == (0, 0)
+            assert _draw() == fresh, f"rank {r} restored saved RNG state"
+            assert scheduler.restored is None
+            assert mgr._pending_dataloader_state is None
+        assert calls == [(r, "broadcast", "") for r in range(world)]
+
+    def test_an_exact_resume_that_skips_it_is_refused_before_any_collective(
+        self, tmp_path, monkeypatch
+    ):
+        ckpt_dir = _per_rank_checkpoint(tmp_path, monkeypatch)
+        calls: list = []
+        for r in range(WORLD):
+            with monkeypatch.context() as m:
+                _install_recording_world(m, r, WORLD, calls)
+                mgr = _mock_mgr(tmp_path, m, dp_info=DP4[r])
+                dcp_load = mgr_mod.dcp.load
+                with pytest.raises(ValueError, match="exact_resume restores"):
+                    mgr.load(path=str(ckpt_dir), exclude_keys=WEIGHTS_ONLY, exact_resume=True)
+            dcp_load.assert_not_called()
+        assert calls == []
 
 
 class TestMidSaveInterruption:
