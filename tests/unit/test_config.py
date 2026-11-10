@@ -791,6 +791,20 @@ class TestJobConfig:
                 video=VideoConfig(max_frames=2, min_frames=1, frame_size=16),
             )
 
+    def test_vlm_packing_inherits_the_sequence_parallel_refusal(self):
+        """Packed rows are indexed as plain tensors, which sequence parallelism cannot carry."""
+        config = JobConfig(
+            model=ModelConfig(max_seq_len=1024),
+            distributed=DistributedConfig(tp=2),
+            vision_encoder=VisionEncoderConfig(type="random", num_tokens=16),
+            adapter=AdapterConfig(),
+            vlm=VLMConfig(max_text_len=64),
+            data=DataConfig(pack_sequences=True),
+        )
+        assert config.model.tp_sequence_parallel
+        with pytest.raises(ValueError, match="sequence parallelism on"):
+            config.validate(world_size=2)
+
     def test_tiled_views_count_toward_the_vlm_budget(self):
         """3 × 3 crops plus the whole image are 10 views of 16 tokens: 160 + 64 text."""
         config = JobConfig(

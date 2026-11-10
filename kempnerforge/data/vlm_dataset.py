@@ -559,8 +559,9 @@ def pack_vlm_samples(
         token in document order, where the wrapper runs the LM head.
 
     Raises:
-        ValueError: ``samples`` is empty, a document has no image or a footprint
-            over ``seq_len``, or ``seq_len`` or ``tokens_per_image`` is not positive.
+        ValueError: ``samples`` is empty, a document has no image, no text or a
+            footprint over ``seq_len``, or ``seq_len`` or ``tokens_per_image`` is
+            not positive.
     """
     if seq_len <= 0 or tokens_per_image <= 0:
         raise ValueError("seq_len and tokens_per_image must be positive")
@@ -580,8 +581,11 @@ def pack_vlm_samples(
             raise ValueError("pack_vlm_samples: every document needs at least one image")
         n_ids = sample["input_ids"].shape[0]
         text_len = int(sample["text_len"]) if "text_len" in sample else n_ids
-        if not 0 <= text_len <= n_ids:
-            raise ValueError(f"text_len ({text_len}) must lie within the {n_ids} input_ids")
+        if not 1 <= text_len <= n_ids:
+            raise ValueError(
+                f"text_len ({text_len}) must lie within 1..{n_ids}, the document's input_ids; "
+                "a document without text has nothing to supervise"
+            )
         footprint = views.shape[0] * tokens_per_image + text_len
         if footprint > seq_len:
             raise ValueError(

@@ -141,8 +141,9 @@ class StepResult:
     The per-dataset fields stay empty for step bodies that don't produce
     them; ``text_tokens`` stays None, which a VLM run treats as an error
     rather than logging a zero. ``tokens`` is what this rank ran when the
-    batch decides it (packed VLM rows); None means ``batch_size × seq_len``
-    per micro-step.
+    batch decides it (packed VLM rows), counted as row slots like the unpacked
+    ``batch_size × seq_len``, image slots and padding included; None means
+    the configured batch per micro-step.
     """
 
     loss: float
