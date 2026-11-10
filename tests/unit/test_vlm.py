@@ -467,6 +467,35 @@ class TestPackedForward:
         assert torch.allclose(alone[0, :12], prefix[0], atol=1e-5)
         assert torch.allclose(after_another[0, 6:18], prefix[0], atol=1e-5)
 
+    @pytest.mark.parametrize("tile_global", [False, True])
+    def test_packed_tiled_documents_match_the_prefix_path(self, tile_global):
+        mc, vc, ac, lc = _tiny_configs(num_image_tokens=8)
+        mc.max_seq_len = 128
+        lc.tile_grid = 2
+        lc.tile_global = tile_global
+        wrapper = build_vlm_wrapper(mc, vc, ac, lc, frames_per_clip=lc.views_per_image).eval()
+        docs = [_packed_doc(6, 5), _packed_doc(12, 4)]
+        for index, doc in enumerate(docs):
+            doc["pixel_values"] = tile_image(
+                Image.new("RGB", (32, 32), color=(40 + 80 * index, 100, 180)),
+                16,
+                DEFAULT_IMAGE_MEAN,
+                DEFAULT_IMAGE_STD,
+                tile_grid=2,
+                tile_global=tile_global,
+            )
+        batch = pack_vlm_samples(docs, seq_len=128, tokens_per_image=8, pad_id=0)
+        image_slots = lc.views_per_image * 8
+        with torch.no_grad():
+            packed, _ = self._forward(wrapper, batch)
+            start = 0
+            for doc in docs:
+                prefix, _ = wrapper(doc["pixel_values"].unsqueeze(0), doc["input_ids"].unsqueeze(0))
+                text_start = start + image_slots
+                text_end = text_start + doc["input_ids"].shape[0]
+                assert torch.allclose(packed[0, text_start:text_end], prefix[0], atol=1e-5)
+                start = text_end
+
     def test_documents_do_not_see_each_other(self):
         """Changing the first document leaves the second document's logits unchanged."""
         wrapper = _build_tiny_wrapper(num_image_tokens=8).eval()

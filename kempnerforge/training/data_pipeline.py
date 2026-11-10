@@ -144,11 +144,11 @@ def _build_vlm_pipeline(
                     "data.pack_sequences on a VLM run needs the built model's tokens per image; "
                     "pass the wrapper's packed_tokens_per_image(model) as tokens_per_image"
                 )
-            image_tokens = tokens_per_image * config.views_per_sample
-            if image_tokens + vlm_cfg.max_text_len > tc.seq_len:
+            visual_tokens = config.views_per_sample * tokens_per_image
+            if visual_tokens + vlm_cfg.max_text_len > tc.seq_len:
                 raise ValueError(
                     f"train.seq_len ({tc.seq_len}) cannot hold one packed document: "
-                    f"{image_tokens} image tokens + vlm.max_text_len ({vlm_cfg.max_text_len})"
+                    f"{visual_tokens} image tokens + vlm.max_text_len ({vlm_cfg.max_text_len})"
                 )
             collator = PackedVLMCollator(
                 pad_id=pad_id, seq_len=tc.seq_len, tokens_per_image=tokens_per_image

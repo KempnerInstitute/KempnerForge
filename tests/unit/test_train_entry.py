@@ -2855,6 +2855,24 @@ class TestVlmSourceBuilders:
         with pytest.raises(ValueError, match="cannot hold one packed document"):
             dp.build_data_pipeline(config, _runtime(), tokens_per_image=config.train.seq_len)
 
+    def test_packed_tiled_image_budget_counts_every_view(self, monkeypatch):
+        import kempnerforge.data.vlm_dataset as vlmd
+
+        seen: dict = {}
+        dp = _stub_loaders(monkeypatch, seen)
+        self._stub_vlm_modules(monkeypatch, seen)
+        monkeypatch.setattr(vlmd, "PackedVLMCollator", lambda **k: seen.setdefault("packed", k))
+        config = self._vlm_data_config(tile_grid=2, tile_global=False)
+        config.data.pack_sequences = True
+        config.train.seq_len = 4 * 12 + config.vlm.max_text_len - 1
+        with pytest.raises(ValueError, match="48 image tokens"):
+            dp.build_data_pipeline(config, _runtime(), tokens_per_image=12)
+        config.train.seq_len += 1
+        dp.build_data_pipeline(config, _runtime(), tokens_per_image=12)
+        assert seen["packed"]["tokens_per_image"] == 12
+        assert seen["dataset"]["tile_grid"] == 2
+        assert seen["dataset"]["tile_global"] is False
+
     def test_image_path_hands_the_tiling_to_the_dataset(self, monkeypatch):
         seen: dict = {}
         dp = _stub_loaders(monkeypatch, seen)
