@@ -1933,6 +1933,18 @@ class TestBuildModel:
         entry.build_model(config, _runtime(), lambda a, b: a)
         assert seen["frames_per_clip"] == 6
 
+    def test_non_pp_sizes_the_model_for_the_tiled_views(self, monkeypatch):
+        """A 2 × 2 grid without the whole image is four views per sample."""
+        import kempnerforge.training.entry as entry
+
+        seen: dict = {}
+        monkeypatch.setattr(
+            entry, "build_parallel_model", lambda *a, **k: seen.update(k) or "MODEL"
+        )
+        config = _vlm_config(tile_grid=2, tile_global=False)
+        entry.build_model(config, _runtime(), lambda a, b: a)
+        assert seen["frames_per_clip"] == 4
+
     def test_pp_builds_a_bundle_from_the_mesh(self, monkeypatch):
         stage, calls = FakeStageModule(), {}
         entry = _stub_pp(monkeypatch, stage, calls)
@@ -2742,8 +2754,8 @@ class TestEosResolution:
 
 
 class TestVlmSourceBuilders:
-    def _vlm_data_config(self, video=False) -> JobConfig:
-        config = _vlm_config()
+    def _vlm_data_config(self, video=False, **vlm_kw) -> JobConfig:
+        config = _vlm_config(**vlm_kw)
         config.data = DataConfig(hf_dataset_name="coco", tokenizer_path="tok", num_workers=0)
         if video:
             from kempnerforge.config.video import VideoConfig
@@ -2757,7 +2769,9 @@ class TestVlmSourceBuilders:
 
         monkeypatch.setattr(vlmd, "build_tokenizer", lambda p: "TOK")
         monkeypatch.setattr(vlmd, "resolve_pad_id", lambda tok: 7)
-        monkeypatch.setattr(vlmd, "HuggingFaceVLMDataset", lambda **k: FakeDataset(**k))
+        monkeypatch.setattr(
+            vlmd, "HuggingFaceVLMDataset", lambda **k: FakeDataset(**seen.setdefault("dataset", k))
+        )
         monkeypatch.setattr(vlmd, "VLMCollator", lambda **k: seen.setdefault("image_collator", k))
         monkeypatch.setattr(vid, "build_video_dataset", lambda *a: FakeDataset())
         monkeypatch.setattr(vid, "VideoCollator", lambda **k: seen.setdefault("video_collator", k))
@@ -2770,6 +2784,14 @@ class TestVlmSourceBuilders:
         assert data.dataloader == "stateful_OBJ"
         assert seen["image_collator"]["pad_id"] == 7
         assert "video_collator" not in seen
+
+    def test_image_path_hands_the_tiling_to_the_dataset(self, monkeypatch):
+        seen: dict = {}
+        dp = _stub_loaders(monkeypatch, seen)
+        self._stub_vlm_modules(monkeypatch, seen)
+        dp.build_data_pipeline(self._vlm_data_config(tile_grid=2, tile_global=False), _runtime())
+        assert seen["dataset"]["tile_grid"] == 2
+        assert seen["dataset"]["tile_global"] is False
 
     def test_video_path_uses_the_video_collator(self, monkeypatch):
         seen: dict = {}
@@ -3060,21 +3082,35 @@ def restore_matmul_precision() -> Iterator[None]:
 
 
 class TestSetupDistributed:
-    def test_builds_the_context_and_validates_against_world_size(self, monkeypatch):
+    def test_validates_against_world_size_then_builds_the_context(self, monkeypatch):
         import kempnerforge.training.runtime as rt
 
-        validated: list = []
+        calls: list = []
         monkeypatch.setattr(rt, "get_world_info", lambda: (3, 1, 8))
-        monkeypatch.setattr(rt, "init_distributed", lambda cfg, seed: "MESH")
+        monkeypatch.setattr(
+            rt, "init_distributed", lambda cfg, seed: calls.append("init") or "MESH"
+        )
         monkeypatch.setattr(rt, "log_job_info", lambda: None)
         config = make_config()
-        monkeypatch.setattr(type(config), "validate", lambda self, ws: validated.append(ws))
+        monkeypatch.setattr(type(config), "validate", lambda self, ws: calls.append(ws))
 
         ctx = rt.setup_distributed(config)
 
         assert (ctx.rank, ctx.local_rank, ctx.world_size) == (3, 1, 8)
         assert ctx.device_mesh == "MESH"
-        assert validated == [8]
+        assert calls == [8, "init"]
+
+    def test_a_config_error_stops_before_the_process_group(self, monkeypatch):
+        import kempnerforge.training.runtime as rt
+
+        inits: list = []
+        monkeypatch.setattr(rt, "get_world_info", lambda: (0, 0, 4))
+        monkeypatch.setattr(rt, "init_distributed", lambda cfg, seed: inits.append(seed))
+        monkeypatch.setattr(rt, "log_job_info", lambda: None)
+
+        with pytest.raises(ValueError, match=r"train\.seq_len \(128\) exceeds model\.max_seq_len"):
+            rt.setup_distributed(make_config(seq_len=128))
+        assert inits == []
 
     def test_seed_is_threaded_into_init(self, monkeypatch):
         import kempnerforge.training.runtime as rt
@@ -3111,6 +3147,23 @@ class TestSetupDistributed:
         torch.set_float32_matmul_precision("medium")
         apply_matmul_precision(TrainConfig())
         assert torch.get_float32_matmul_precision() == "medium"
+
+
+class TestEvalScriptSetup:
+    def test_a_config_error_stops_before_the_process_group(self, monkeypatch):
+        root = Path(__file__).resolve().parents[2]
+        monkeypatch.syspath_prepend(str(root / "scripts"))
+        import eval as eval_script
+
+        inits: list = []
+        monkeypatch.setattr(eval_script, "get_world_info", lambda: (0, 0, 4))
+        monkeypatch.setattr(eval_script, "init_distributed", lambda cfg, seed: inits.append(seed))
+        debug = str(root / "configs" / "train" / "debug.toml")
+        monkeypatch.setattr("sys.argv", ["eval.py", debug, "--train.seq_len=1024"])
+
+        with pytest.raises(ValueError, match=r"train\.seq_len \(1024\) exceeds model\.max_seq_len"):
+            eval_script.main()
+        assert inits == []
 
 
 class TestPpGroup:

@@ -9,11 +9,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn.functional as F
+from torch.nn.attention.flex_attention import create_block_mask
 
 from kempnerforge.config.schema import ModelConfig
 from kempnerforge.distributed.pipeline_parallel import PipelineStageModule
 from kempnerforge.distributed.tensor_parallel import apply_tensor_parallel
-from kempnerforge.model.attention import Attention
+from kempnerforge.model.attention import Attention, KVCache
 from kempnerforge.model.embedding import OutputHead, TokenEmbedding
 from kempnerforge.model.init import init_weights
 from kempnerforge.model.mlp import StandardMLP, SwiGLUMLP, build_mlp
@@ -177,6 +178,67 @@ class TestAttention:
     def test_sdpa_backend_stored_on_module(self):
         attn = Attention(dim=128, n_heads=4, n_kv_heads=4, sdpa_backend="math")
         assert attn.sdpa_backend == "math"
+
+    @pytest.mark.parametrize("capture", [False, True])
+    @pytest.mark.parametrize("past", [0, 4])
+    def test_a_visibility_mask_is_refused_before_writing_the_cache(self, capture, past):
+        attn = Attention(dim=64, n_heads=4, n_kv_heads=2)
+        attn.capture_attention_weights = capture
+        cos, sin = precompute_rope_frequencies(16, 16)
+        cache = KVCache(
+            batch_size=1,
+            max_seq_len=16,
+            n_kv_heads=2,
+            head_dim=16,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+        )
+        with torch.no_grad():
+            if past:
+                attn(torch.randn(1, past, 64), cos[:past], sin[:past], kv_cache=cache)
+            x = torch.randn(1, 3, 64)
+            square = torch.ones(1, 1, 3, 3, dtype=torch.bool)
+            whole = torch.ones(7, 7, dtype=torch.bool)
+            for wrong in (square, whole):
+                with pytest.raises(ValueError, match="cannot be combined with kv_cache"):
+                    attn(
+                        x,
+                        cos[past : past + 3],
+                        sin[past : past + 3],
+                        kv_cache=cache,
+                        attn_mask=wrong,
+                    )
+                assert cache.seq_len == past
+            block = create_block_mask(lambda b, h, q, kv: q >= kv, 1, 1, 3, 3, device="cpu")
+            with pytest.raises(ValueError, match="cannot be combined with kv_cache"):
+                attn(x, cos[past : past + 3], sin[past : past + 3], kv_cache=cache, attn_mask=block)
+            assert cache.seq_len == past
+
+    @pytest.mark.parametrize("capture", [False, True])
+    def test_a_layer_on_its_own_appends_tokens_under_a_pinned_kernel(self, capture):
+        """Without a mask from the transformer, a layer derives the lower-right one itself."""
+        torch.manual_seed(0)
+        attn = Attention(dim=64, n_heads=4, n_kv_heads=2, sdpa_backend="math")
+        attn.capture_attention_weights = capture
+        cos, sin = precompute_rope_frequencies(16, 16)
+        x = torch.randn(1, 8, 64)
+        cache = KVCache(
+            batch_size=1,
+            max_seq_len=16,
+            n_kv_heads=2,
+            head_dim=16,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+        )
+        with torch.no_grad():
+            full = attn(x, cos[:8], sin[:8])
+            prefill = attn(x[:, :4], cos[:4], sin[:4], kv_cache=cache)
+            appended = attn(x[:, 4:7], cos[4:7], sin[4:7], kv_cache=cache)
+            last = attn(x[:, 7:], cos[7:8], sin[7:8], kv_cache=cache)
+        torch.testing.assert_close(torch.cat([prefill, appended, last], dim=1), full)
+        if capture:
+            assert attn.last_attention_weights is not None
+            assert attn.last_attention_weights.shape == (1, 4, 1, 8)
 
 
 class TestMLP:
