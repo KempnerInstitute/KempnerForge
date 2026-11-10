@@ -77,7 +77,8 @@ them before DCP sees them: an unpacked expert is saved under its global
 index, and each packed weight as one tensor of `num_experts` rows. The
 checkpoint is the one an `ep=1` run writes, so DCP reshards it to any
 `ep` that divides `num_experts`, including `ep=1`, and an `ep=1`
-checkpoint loads into an EP run. See
+checkpoint loads into an EP run. Packed experts under FSDP need torch
+2.10 or newer for this. See
 [Expert parallelism § Checkpoints](../distributed/expert-parallelism.md#checkpoints).
 
 ## What to check if resharding fails

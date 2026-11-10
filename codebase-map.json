@@ -1689,9 +1689,10 @@
           "TestUnpackedNames(7)",
           "TestPackedWithoutMesh(3)",
           "TestOlderTorch(1)",
-          "TestCheckSavedExperts(6)"
+          "TestCheckSavedExperts(6)",
+          "TestRootLayer(5)"
         ],
-        "count": 19
+        "count": 24
       },
       "tests/unit/test_fp8.py": {
         "classes": [

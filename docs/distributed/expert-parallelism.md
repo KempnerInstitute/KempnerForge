@@ -133,6 +133,12 @@ which places each rank's experts among all `num_experts`:
   tensor parallelism shards on the same dimension, with FSDP's
   `Shard(0)` becoming `_StridedShard(0, split_factor=ep)`.
 
+Packed weights that FSDP shards need torch 2.10 or newer for this:
+joining the EP mesh to FSDP's uses `DeviceMesh._get_root_mesh`, which
+arrived in 2.10. `pyproject.toml` allows torch 2.6 and newer, and with
+an older torch a save or load of such a layer raises and names the
+version it needs. Unpacked experts need no particular torch version.
+
 The presented tensors are views of each rank's own, so a save copies,
 gathers and sends nothing more than DCP writes, and each expert is
 written once, by a rank that holds it. The checkpoint is the one an
