@@ -66,6 +66,7 @@ def _run_torchrun(
             "-m",
             "torch.distributed.run",
             "--standalone",
+            "--local-addr=127.0.0.1",
             f"--nproc_per_node={nproc}",
             script,
             *args,
