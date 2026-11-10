@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import glob
+import io
 import json
 import logging
 import os
 import sys
+import time
 import types
 from contextlib import closing
 from pathlib import Path
@@ -33,6 +35,7 @@ from kempnerforge.metrics.logger import (
 )
 from kempnerforge.metrics.memory import (
     DeviceMemoryMonitor,
+    format_memory_stats,
     get_memory_stats,
     get_memory_utilization,
     reset_peak_memory,
@@ -98,6 +101,51 @@ class TestMetricsTracker:
             )
         assert "loss" in tracker._smoothed
         assert "tokens_per_sec" in tracker._smoothed
+
+    def test_smoothing_takes_the_steps_between_logs(self):
+        """The EMA sees every step, so the logged ``smoothed/loss`` includes unlogged step 3."""
+        tracker = self._make_tracker(log_interval=2)
+        backend = _FakeBackend()
+        tracker._backends.append(backend)
+        for step, loss in enumerate([1.0, 2.0, 3.0, 4.0], start=1):
+            tracker.start_step()
+            tracker.end_step(step=step, loss=loss, grad_norm=1.0, lr=3e-4, tokens_in_step=1024)
+        logged = [(step, m["smoothed/loss"]) for m, step in backend.log_calls]
+        assert logged == [(1, 1.0), (2, pytest.approx(1.1)), (4, pytest.approx(1.561))]
+
+    def test_end_step_reads_memory_once_per_logged_step(self, monkeypatch):
+        """A logged step reads each counter once, from the current device; other steps read none."""
+        tracker = self._make_tracker(log_interval=2)
+        fake = _FakeCudaMemory(monkeypatch)
+        reads = []
+        for step in range(1, 5):
+            fake.reads.clear()
+            tracker.start_step()
+            tracker.end_step(step=step, loss=2.0, grad_norm=1.0, lr=3e-4, tokens_in_step=1024)
+            reads.append(list(fake.reads))
+        assert reads == [[3, 3, 3, 3], [3, 3, 3, 3], [], [3, 3, 3, 3]]
+
+    def test_peak_memory_is_the_high_water_mark_of_the_run(self, monkeypatch):
+        """A step-1 spike stays in ``gpu/peak_gb`` and ``mem=`` after use drops; none resets it."""
+        tracker = self._make_tracker(log_interval=1)
+        backend = _FakeBackend()
+        tracker._backends.append(backend)
+        lines: list[str] = []
+        monkeypatch.setattr(tracker_mod.logger, "info", lines.append)
+        monkeypatch.setattr(log_mod, "_supports_color", lambda: False)
+        fake = _FakeCudaMemory(monkeypatch)
+        for step, spike in [(1, 6 * _GIB), (2, _GIB // 2)]:
+            tracker.start_step()
+            fake.allocate(spike)
+            fake.allocate(_GIB // 2)
+            tracker.end_step(step=step, loss=2.0, grad_norm=1.0, lr=3e-4, tokens_in_step=1024)
+        published = [
+            (m["gpu/allocated_gb"], m["gpu/peak_gb"], m["gpu/mem_utilization"])
+            for m, _ in backend.log_calls
+        ]
+        assert published == [(0.5, 6.0, 0.075), (0.5, 6.0, 0.075)]
+        assert ["mem=6.0/80GB" in line for line in lines] == [True, True]
+        assert fake.resets == []
 
     def test_close_without_backends(self):
         tracker = self._make_tracker()
@@ -214,6 +262,48 @@ class TestStepMetrics:
         assert m.mem_utilization == 0.0
 
 
+_GIB = 1024**3
+
+
+class _FakeCudaMemory:
+    """CUDA memory counters on a CPU host, for a process whose current device is cuda:3.
+
+    Like torch, each counter resolves ``device=None`` to the current device; ``reads`` and
+    ``resets`` record the device every read and every peak reset resolved to.
+    """
+
+    def __init__(self, monkeypatch) -> None:
+        self.allocated = 0
+        self.peak = 0
+        self.reads: list[int] = []
+        self.resets: list[int] = []
+        cuda = torch.cuda
+        monkeypatch.setattr(cuda, "is_available", lambda: True)
+        monkeypatch.setattr(cuda, "current_device", lambda: 3)
+        monkeypatch.setattr(cuda, "memory_allocated", lambda d=None: self._read(d, self.allocated))
+        monkeypatch.setattr(cuda, "max_memory_allocated", lambda d=None: self._read(d, self.peak))
+        monkeypatch.setattr(cuda, "memory_reserved", lambda d=None: self._read(d, self.peak))
+        monkeypatch.setattr(
+            cuda,
+            "get_device_properties",
+            lambda d=None: types.SimpleNamespace(total_memory=self._read(d, 80 * _GIB)),
+        )
+        monkeypatch.setattr(cuda, "reset_peak_memory_stats", self._reset)
+
+    def _read(self, device: int | None, value: int) -> int:
+        self.reads.append(torch.cuda.current_device() if device is None else device)
+        return value
+
+    def _reset(self, device: int | None = None) -> None:
+        self.resets.append(torch.cuda.current_device() if device is None else device)
+        self.peak = self.allocated
+
+    def allocate(self, nbytes: int) -> None:
+        """Hold ``nbytes`` from now on, raising the peak if that is a new high."""
+        self.allocated = nbytes
+        self.peak = max(self.peak, nbytes)
+
+
 class TestDeviceMemoryMonitor:
     def test_report_returns_stats(self):
         monitor = DeviceMemoryMonitor()
@@ -270,6 +360,22 @@ class TestDeviceMemoryMonitor:
         monitor = DeviceMemoryMonitor(snapshot_dir=str(tmp_path))
         assert monitor.capture_snapshot(step=1) is None
 
+    @pytest.mark.parametrize(("device", "resolved"), [(None, 3), (0, 0)])
+    def test_snapshot_syncs_and_names_the_device_it_reads(
+        self, monkeypatch, tmp_path, device, resolved
+    ):
+        """By default the snapshot uses the current device; an explicit index, 0 included, wins."""
+        _FakeCudaMemory(monkeypatch)
+        synced: list[int | None] = []
+        monkeypatch.setattr(torch.cuda, "synchronize", synced.append)
+        monkeypatch.setattr(torch.cuda.memory, "_record_memory_history", lambda *a, **k: None)
+        monkeypatch.setattr(torch.cuda.memory, "_snapshot", lambda: {"segments": []})
+        monitor = DeviceMemoryMonitor(device=device, snapshot_dir=str(tmp_path))
+        expected = tmp_path / f"snapshot_step_7_device_{resolved}.pickle"
+        assert monitor.capture_snapshot(step=7) == str(expected)
+        assert expected.is_file()
+        assert synced == [resolved]
+
 
 class TestMemoryHelpers:
     def test_get_memory_stats_cpu_only(self, monkeypatch):
@@ -294,6 +400,36 @@ class TestMemoryHelpers:
         """Without CUDA, reset_peak_memory is a no-op (must not raise)."""
         monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
         reset_peak_memory(device=0)
+
+    def test_get_memory_stats_reads_the_current_device(self, monkeypatch):
+        """Without a device, every counter is read from the current device, not from device 0."""
+        fake = _FakeCudaMemory(monkeypatch)
+        fake.allocate(2 * _GIB)
+        assert get_memory_stats() == {
+            "allocated_gb": 2.0,
+            "peak_gb": 2.0,
+            "reserved_gb": 2.0,
+            "total_gb": 80.0,
+        }
+        assert fake.reads == [3, 3, 3, 3]
+        fake.reads.clear()
+        get_memory_stats(device=1)
+        assert fake.reads == [1, 1, 1, 1]
+
+    @pytest.mark.parametrize(("device", "resolved"), [(None, 3), (0, 0), (1, 1)])
+    def test_every_memory_helper_reads_the_device_asked_for(self, monkeypatch, device, resolved):
+        """Each helper reads the current device by default and an explicit index, 0 included."""
+        fake = _FakeCudaMemory(monkeypatch)
+        fake.allocate(8 * _GIB)
+        on = {} if device is None else {"device": device}
+        assert get_memory_stats(**on)["peak_gb"] == 8.0
+        assert get_memory_utilization(**on) == 0.1
+        assert format_memory_stats(**on) == (
+            "GPU mem: 8.0GB allocated, 8.0GB peak, 8.0GB reserved / 80.0GB total (10%)"
+        )
+        reset_peak_memory(**on)
+        assert set(fake.reads) == {resolved}
+        assert fake.resets == [resolved]
 
 
 class TestWandBBackend:
@@ -789,6 +925,40 @@ class TestTensorBoardBackend:
         assert backend._writer is False
 
 
+@pytest.fixture
+def utc_minus_8():
+    """Make local time UTC-8, with no daylight saving, for one test."""
+    try:
+        with patch.dict(os.environ, {"TZ": "PST8"}):
+            time.tzset()
+            yield
+    finally:
+        time.tzset()
+
+
+def _plain_rank_logger(monkeypatch, name: str) -> tuple[logging.Logger, io.StringIO]:
+    """A rank-0 logger whose only output is a plain ``_RankFormatter`` writing to the stream."""
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(_RankFormatter(use_color=False))
+    logger = logging.getLogger(name)
+    monkeypatch.setattr(logger, "handlers", [handler])
+    monkeypatch.setattr(logger, "propagate", False)
+    monkeypatch.setenv("RANK", "0")
+    return logger, stream
+
+
+class _RecordingHandler(logging.Handler):
+    """Keeps every record it is handed, unformatted."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+
 class TestRankLogger:
     def test_get_logger_returns_logger(self):
         logger = get_logger("test_module")
@@ -837,6 +1007,14 @@ class TestRankLogger:
         assert "INFO" in output
         assert "hello world" in output
 
+    def test_rank_formatter_starts_with_the_local_time(self, utc_minus_8):
+        """A line starts with the record's local time to the millisecond, then rank and level."""
+        record = logging.LogRecord("test", logging.INFO, "", 0, "hello world", (), None)
+        record.created, record.msecs = 1_700_000_000.007, 7.0
+        with patch.dict(os.environ, {"RANK": "5"}):
+            output = _RankFormatter(use_color=False).format(record)
+        assert output == "2023-11-14 14:13:20.007 [rank 5] INFO     hello world"
+
     def test_supports_color_no_color_env(self, monkeypatch):
         """NO_COLOR=1 disables color output regardless of TTY status."""
         monkeypatch.setenv("NO_COLOR", "1")
@@ -867,6 +1045,61 @@ class TestRankLogger:
         record = logging.LogRecord("test", logging.INFO, "", 0, "hello", (), None)
         output = fmt.format(record)
         assert "\x1b[" in output
+
+    def test_rank_formatter_dims_the_time_with_the_rank(self, monkeypatch, utc_minus_8):
+        """With color on, the time and the rank share one dim span ahead of the colored level."""
+        monkeypatch.setattr(log_mod, "_supports_color", lambda: True)
+        monkeypatch.setenv("RANK", "0")
+        record = logging.LogRecord("test", logging.INFO, "", 0, "hello", (), None)
+        record.created, record.msecs = 1_700_000_000.25, 250.0
+        output = _RankFormatter(use_color=True).format(record)
+        c = log_mod._COLORS
+        dimmed = f"{c['dim']}2023-11-14 14:13:20.250 [rank 0]{c['reset']}"
+        assert output == f"{dimmed} {c['green']}INFO    {c['reset']} hello"
+
+    def test_rank_formatter_prints_the_traceback_of_a_logged_exception(self, monkeypatch):
+        """``logger.exception`` prints the traceback below its line, as logging.Formatter does."""
+        logger, stream = _plain_rank_logger(monkeypatch, "test_rank_formatter_exception")
+        try:
+            raise ValueError("bad batch")
+        except ValueError:
+            logger.exception("step failed")
+            traceback = logging.Formatter().formatException(sys.exc_info())
+        line, rest = stream.getvalue().split("\n", 1)
+        assert line.endswith(" [rank 0] ERROR    step failed")
+        assert rest == f"{traceback}\n"
+        assert traceback.startswith("Traceback (most recent call last):")
+        assert traceback.endswith("ValueError: bad batch")
+
+    def test_rank_formatter_prints_the_stack_of_a_record(self, monkeypatch):
+        """``stack_info=True`` prints the caller's stack below the line, exactly once."""
+        logger, stream = _plain_rank_logger(monkeypatch, "test_rank_formatter_stack")
+        recorder = _RecordingHandler()
+        logger.addHandler(recorder)
+        logger.warning("slow step", stack_info=True)
+        (record,) = recorder.records
+        line, stack = stream.getvalue().split("\n", 1)
+        assert line.endswith(" [rank 0] WARNING  slow step")
+        assert stack == f"{record.stack_info}\n"
+        assert stack.startswith("Stack (most recent call last):\n")
+        assert "in test_rank_formatter_prints_the_stack_of_a_record\n" in stack
+
+    def test_rank_formatter_adds_no_blank_line_after_a_trailing_newline(self):
+        """After a message ending in a newline, traceback then stack follow as logging.Formatter."""
+        try:
+            raise ValueError("bad batch")
+        except ValueError:
+            exc_info = sys.exc_info()
+        stack = "Stack (most recent call last):\n  frame"
+        record = logging.LogRecord(
+            "test", logging.ERROR, "", 0, "step failed\n", (), exc_info, sinfo=stack
+        )
+        with patch.dict(os.environ, {"RANK": "0"}):
+            output = _RankFormatter(use_color=False).format(record)
+        rest = output.split(" [rank 0] ERROR    ", 1)[1]
+        assert rest == logging.Formatter().format(record)
+        assert rest.startswith("step failed\nTraceback (most recent call last):\n")
+        assert rest.endswith(f"ValueError: bad batch\n{stack}")
 
     def test_configure_root_no_rank_filter(self, monkeypatch):
         """When rank_zero_only=False, _configure_root attaches no _RankFilter.

@@ -4,6 +4,9 @@ Provides utilities for monitoring GPU memory usage during training:
   - Current / peak / reserved memory
   - Memory utilization as a percentage of total
   - Human-readable formatting
+
+Each helper, and ``DeviceMemoryMonitor``, reads one CUDA device: ``device=None``, the
+default, is the current device, which ``init_distributed`` sets to the rank's own GPU.
 """
 
 from __future__ import annotations
@@ -15,14 +18,15 @@ import torch
 logger = logging.getLogger(__name__)
 
 
-def get_memory_stats(device: int = 0) -> dict[str, float]:
+def get_memory_stats(device: int | None = None) -> dict[str, float]:
     """Get current GPU memory statistics in GB.
 
     Args:
-        device: CUDA device index.
+        device: CUDA device index, or None for the current device.
 
     Returns:
-        Dict with allocated, peak, reserved, and total memory in GB.
+        Dict with allocated, peak, reserved, and total memory in GB. Peak is the most
+        allocated since the process started or the device's last ``reset_peak_memory``.
     """
     if not torch.cuda.is_available():
         return {"allocated_gb": 0, "peak_gb": 0, "reserved_gb": 0, "total_gb": 0}
@@ -36,8 +40,11 @@ def get_memory_stats(device: int = 0) -> dict[str, float]:
     }
 
 
-def get_memory_utilization(device: int = 0) -> float:
+def get_memory_utilization(device: int | None = None) -> float:
     """Get peak memory utilization as a fraction of total GPU memory.
+
+    Args:
+        device: CUDA device index, or None for the current device.
 
     Returns:
         Utilization between 0.0 and 1.0.
@@ -48,8 +55,8 @@ def get_memory_utilization(device: int = 0) -> float:
     return stats["peak_gb"] / stats["total_gb"]
 
 
-def format_memory_stats(device: int = 0) -> str:
-    """Format memory stats as a human-readable string."""
+def format_memory_stats(device: int | None = None) -> str:
+    """Format memory stats of ``device`` (None: the current device) as a human-readable string."""
     stats = get_memory_stats(device)
     util = get_memory_utilization(device)
     return (
@@ -60,8 +67,8 @@ def format_memory_stats(device: int = 0) -> str:
     )
 
 
-def reset_peak_memory(device: int = 0) -> None:
-    """Reset peak memory tracking counter."""
+def reset_peak_memory(device: int | None = None) -> None:
+    """Reset the peak memory counter of ``device`` (None: the current device)."""
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats(device)
 
@@ -76,14 +83,14 @@ class DeviceMemoryMonitor:
     debugging OOM and memory fragmentation with pytorch.org/memory_viz.
 
     Args:
-        device: CUDA device index.
+        device: CUDA device index, or None for the device that is current at each call.
         snapshot_step: Step at which to capture a memory snapshot. None to disable.
         snapshot_dir: Directory to save snapshots.
     """
 
     def __init__(
         self,
-        device: int = 0,
+        device: int | None = None,
         snapshot_step: int | None = None,
         snapshot_dir: str = "memory_snapshots",
     ) -> None:
@@ -139,13 +146,14 @@ class DeviceMemoryMonitor:
             snapshot_dir.mkdir(parents=True, exist_ok=True)
 
             torch.cuda.memory._record_memory_history()
-            torch.cuda.synchronize(self.device)
+            device = torch.cuda.current_device() if self.device is None else self.device
+            torch.cuda.synchronize(device)
             snapshot = torch.cuda.memory._snapshot()
             torch.cuda.memory._record_memory_history(enabled=None)
 
             import pickle
 
-            path = snapshot_dir / f"snapshot_step_{step}_device_{self.device}.pickle"
+            path = snapshot_dir / f"snapshot_step_{step}_device_{device}.pickle"
             with open(path, "wb") as f:
                 pickle.dump(snapshot, f)
 

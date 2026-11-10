@@ -438,9 +438,38 @@ class TestCheckpointConfig:
         with pytest.raises(ValueError, match="interval must be positive"):
             CheckpointConfig(interval=0)
 
-    @pytest.mark.parametrize("keys", [[], ["model"], ["optimizer"], ["model", "optimizer"]])
-    def test_exclude_from_loading_accepts_the_two_state_keys(self, keys):
+    @pytest.mark.parametrize(
+        "keys",
+        [
+            [],
+            ["model"],
+            ["optimizer"],
+            ["model", "optimizer"],
+            ["optimizer", "train_state"],
+            ["train_state", "optimizer"],
+        ],
+    )
+    def test_exclude_from_loading_accepts_the_state_keys(self, keys):
         assert CheckpointConfig(exclude_from_loading=keys).exclude_from_loading == keys
+
+    @pytest.mark.parametrize(
+        "keys",
+        [["train_state"], ["model", "train_state"], ["model", "optimizer", "train_state"]],
+    )
+    def test_train_state_is_rejected_outside_the_weights_only_pair(self, keys):
+        with pytest.raises(ValueError, match="must be \\['optimizer', 'train_state'\\]"):
+            CheckpointConfig(exclude_from_loading=keys)
+
+    @pytest.mark.parametrize(
+        "keys", [["optimizer", "optimizer"], ["optimizer", "train_state", "train_state"]]
+    )
+    def test_exclude_from_loading_rejects_a_repeated_key(self, keys):
+        with pytest.raises(ValueError, match="repeats a key"):
+            CheckpointConfig(exclude_from_loading=keys)
+
+    def test_exclude_from_loading_rejects_a_bare_string(self):
+        with pytest.raises(ValueError, match="must be a list"):
+            CheckpointConfig(exclude_from_loading="optimizer")  # type: ignore[arg-type]
 
     @pytest.mark.parametrize(
         "keys",
@@ -455,6 +484,19 @@ class TestCheckpointConfig:
         toml = tmp_path / "ckpt.toml"
         toml.write_text('[checkpoint]\nexclude_from_loading = ["lm_head"]\n')
         with pytest.raises(ValueError, match="exclude_from_loading"):
+            load_config(str(toml), cli_args=[])
+
+    @pytest.mark.parametrize("keys", [[["optimizer", "train_state"]], [{"optimizer": True}]])
+    def test_exclude_from_loading_rejects_unhashable_elements(self, keys):
+        with pytest.raises(
+            ValueError, match="accepts only 'model', 'optimizer' and/or 'train_state'"
+        ):
+            CheckpointConfig(exclude_from_loading=keys)
+
+    def test_nested_exclude_from_loading_is_validated_from_toml(self, tmp_path):
+        toml = tmp_path / "ckpt.toml"
+        toml.write_text('[checkpoint]\nexclude_from_loading = [["optimizer", "train_state"]]\n')
+        with pytest.raises(ValueError, match="accepts only"):
             load_config(str(toml), cli_args=[])
 
     def test_dyn_ckpt_window_defaults_to_none(self):
@@ -766,6 +808,65 @@ class TestJobConfig:
         )
         with pytest.raises(ValueError, match="train.seq_len.*insufficient for VLM"):
             config.validate(world_size=1)
+
+    def test_tiled_views_count_toward_the_vlm_budget(self):
+        """3 × 3 crops plus the whole image are 10 views of 16 tokens: 160 + 64 text."""
+        config = JobConfig(
+            model=ModelConfig(max_seq_len=1024),
+            vision_encoder=VisionEncoderConfig(type="random", num_tokens=16),
+            adapter=AdapterConfig(),
+            vlm=VLMConfig(max_text_len=64, tile_grid=3),
+            train=TrainConfig(seq_len=200),
+        )
+        assert config.views_per_sample == 10
+        with pytest.raises(ValueError, match=r"residual_image_tokens \(160\)"):
+            config.validate(world_size=1)
+        config.train.seq_len = 224
+        config.validate(world_size=1)
+
+    def test_the_video_tiling_refusal_precedes_the_budget_check(self):
+        from kempnerforge.config.video import VideoConfig
+
+        with pytest.raises(ValueError, match="leave vlm.tile_grid at 0"):
+            JobConfig(
+                model=ModelConfig(max_seq_len=64),
+                vision_encoder=VisionEncoderConfig(type="random", num_tokens=16),
+                adapter=AdapterConfig(),
+                vlm=VLMConfig(max_text_len=64, tile_grid=3),
+                video=VideoConfig(max_frames=8, min_frames=1, frame_size=16),
+            )
+
+    def test_tiled_views_must_fit_max_seq_len_at_construction(self):
+        with pytest.raises(ValueError, match=r"residual_image_tokens \(160\)"):
+            JobConfig(
+                model=ModelConfig(max_seq_len=200),
+                vision_encoder=VisionEncoderConfig(type="random", num_tokens=16),
+                adapter=AdapterConfig(),
+                vlm=VLMConfig(max_text_len=64, tile_grid=3),
+            )
+
+    def test_tiling_is_refused_alongside_a_video_section(self):
+        from kempnerforge.config.video import VideoConfig
+
+        with pytest.raises(ValueError, match="leave vlm.tile_grid at 0"):
+            JobConfig(
+                model=ModelConfig(max_seq_len=1024),
+                vision_encoder=VisionEncoderConfig(type="random", num_tokens=16),
+                adapter=AdapterConfig(),
+                vlm=VLMConfig(max_text_len=64, tile_grid=2),
+                video=VideoConfig(max_frames=2, min_frames=1, frame_size=16),
+                train=TrainConfig(seq_len=512),
+            ).validate(world_size=1)
+
+    def test_views_per_sample_is_one_for_text_and_untiled_runs(self):
+        assert JobConfig().views_per_sample == 1
+        config = JobConfig(
+            model=ModelConfig(max_seq_len=1024),
+            vision_encoder=VisionEncoderConfig(type="random", num_tokens=16),
+            adapter=AdapterConfig(),
+            vlm=VLMConfig(max_text_len=64),
+        )
+        assert config.views_per_sample == 1
 
     def test_validate_vlm_pp_rejected(self):
         config = JobConfig(

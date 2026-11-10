@@ -60,8 +60,8 @@ def main() -> None:
     rank, local_rank, world_size = get_world_info()
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
 
-    device_mesh = init_distributed(config.distributed, seed=config.train.seed)
     config.validate(world_size)
+    device_mesh = init_distributed(config.distributed, seed=config.train.seed)
     apply_matmul_precision(config.train)
 
     tc = config.train
@@ -83,7 +83,7 @@ def main() -> None:
     dummy_optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
     ckpt_mgr = CheckpointManager(config.checkpoint, model, dummy_optimizer)
 
-    resume_path = resolve_resume_path(config.checkpoint.dir)
+    resume_path = resolve_resume_path(config.checkpoint.dir, require_train_state=False)
     load_path = config.checkpoint.load_path or (str(resume_path) if resume_path else None)
 
     if load_path is None:

@@ -4,7 +4,8 @@
 produces the ``VLMSample`` contract:
 
 - ``pixel_values``: ``(3, H, W)`` float tensor, resized to ``image_size``
-  and normalized with the provided mean/std.
+  and normalized with the provided mean/std; ``(V, 3, H, W)`` when
+  ``tile_grid`` cuts the image into ``V`` views (``tile_image``).
 - ``input_ids``: ``(T,)`` int64 tensor, right-padded to ``max_text_len``.
 - ``labels``: ``(T,)`` int64 next-token targets (``labels[i]`` = input
   token ``i+1``), right-padded to ``max_text_len``; pad, trailing, and
@@ -57,11 +58,7 @@ def pil_to_tensor(
     """
     from PIL import Image
 
-    if not isinstance(img, Image.Image):
-        raise TypeError(
-            f"Expected a PIL.Image, got {type(img).__name__}. "
-            "If the dataset returns raw bytes, decode with PIL first."
-        )
+    _require_pil(img)
     img = img.convert("RGB").resize((image_size, image_size), Image.Resampling.BILINEAR)
     import numpy as np
 
@@ -70,6 +67,66 @@ def pil_to_tensor(
     mean_t = torch.tensor(mean, dtype=t.dtype).view(3, 1, 1)
     std_t = torch.tensor(std, dtype=t.dtype).view(3, 1, 1)
     return (t - mean_t) / std_t
+
+
+def _require_pil(img: Any) -> None:
+    from PIL import Image
+
+    if not isinstance(img, Image.Image):
+        raise TypeError(
+            f"Expected a PIL.Image, got {type(img).__name__}. "
+            "If the dataset returns raw bytes, decode with PIL first."
+        )
+
+
+def tile_image(
+    img: Any,
+    image_size: int,
+    mean: tuple[float, float, float],
+    std: tuple[float, float, float],
+    *,
+    tile_grid: int,
+    tile_global: bool = True,
+) -> torch.Tensor:
+    """Cut an image into views: the whole image, then an ``n × n`` raster of crops.
+
+    The whole image, resized to ``image_size`` square exactly as ``pil_to_tensor``
+    does, comes first when ``tile_global``. The crops are cut from the image
+    resized to ``tile_grid * image_size`` square, so each is ``image_size`` px and
+    together they cover that canvas exactly; they follow in raster order (left
+    to right, then top to bottom). Returns ``(views, 3, image_size,
+    image_size)``, every view normalized like ``pil_to_tensor``.
+
+    Public for the same reason as ``pil_to_tensor``: an evaluation adapter must
+    tile a request's image exactly as training did.
+    """
+    if tile_grid < 2:
+        raise ValueError(f"tile_grid must be >= 2 (an n × n grid of crops), got {tile_grid}")
+    _require_pil(img)
+    views = []
+    if tile_global:
+        views.append(pil_to_tensor(img, image_size, mean, std).unsqueeze(0))
+    canvas = pil_to_tensor(img, tile_grid * image_size, mean, std)
+    crops = canvas.reshape(3, tile_grid, image_size, tile_grid, image_size)
+    views.append(
+        crops.permute(1, 3, 0, 2, 4).reshape(tile_grid * tile_grid, 3, image_size, image_size)
+    )
+    return torch.cat(views, dim=0)
+
+
+def image_to_views(
+    img: Any,
+    image_size: int,
+    mean: tuple[float, float, float],
+    std: tuple[float, float, float],
+    *,
+    tile_grid: int = 0,
+    tile_global: bool = True,
+) -> torch.Tensor:
+    """One ``(3, H, W)`` view, or the ``(V, 3, H, W)`` views of ``tile_image`` when tiling."""
+    if tile_grid:
+        return tile_image(img, image_size, mean, std, tile_grid=tile_grid, tile_global=tile_global)
+    return pil_to_tensor(img, image_size, mean, std)
 
 
 def frames_to_clip_tensor(
@@ -328,6 +385,10 @@ class HuggingFaceVLMDataset(Dataset):
         image_mean / image_std: Normalization stats. Defaults match
             SigLIP's ``(0.5, 0.5, 0.5)``.
         dataset_config: HF dataset config name, if required.
+        tile_grid: ``0`` keeps one view per image; ``n`` cuts each image into
+            an ``n × n`` grid of ``image_size`` crops (``tile_image``), so
+            ``pixel_values`` is ``(views, 3, H, W)``.
+        tile_global: Whether a tiled image's views start with the whole image.
     """
 
     def __init__(
@@ -343,6 +404,8 @@ class HuggingFaceVLMDataset(Dataset):
         image_mean: tuple[float, float, float] = DEFAULT_IMAGE_MEAN,
         image_std: tuple[float, float, float] = DEFAULT_IMAGE_STD,
         dataset_config: str | None = None,
+        tile_grid: int = 0,
+        tile_global: bool = True,
     ) -> None:
         import os
 
@@ -369,6 +432,8 @@ class HuggingFaceVLMDataset(Dataset):
         self._image_size = image_size
         self._image_mean = image_mean
         self._image_std = image_std
+        self._tile_grid = tile_grid
+        self._tile_global = tile_global
         self._max_text_len = max_text_len
         self._tokenizer = build_tokenizer(tokenizer_path)
         if prompt_field is not None:
@@ -376,7 +441,7 @@ class HuggingFaceVLMDataset(Dataset):
             _check_prompt_column_has_room(ds, prompt_field, self._tokenizer, max_text_len)
         logger.info(
             f"HuggingFaceVLMDataset: {dataset_name} [{split}], {len(self._ds):,} samples, "
-            f"image_size={image_size}, max_text_len={max_text_len}"
+            f"image_size={image_size}, tile_grid={tile_grid}, max_text_len={max_text_len}"
         )
 
     def __len__(self) -> int:
@@ -384,8 +449,13 @@ class HuggingFaceVLMDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         row = self._ds[idx]
-        pixels = pil_to_tensor(
-            row[self._image_field], self._image_size, self._image_mean, self._image_std
+        pixels = image_to_views(
+            row[self._image_field],
+            self._image_size,
+            self._image_mean,
+            self._image_std,
+            tile_grid=self._tile_grid,
+            tile_global=self._tile_global,
         )
         text_val = row[self._text_field]
         if not isinstance(text_val, str):
@@ -405,7 +475,8 @@ class VLMCollator:
     """Stack VLM samples into a fixed-length batch.
 
     Output keys:
-      - ``pixel_values``: ``(B, 3, H, W)``.
+      - ``pixel_values``: ``(B, 3, H, W)``, or ``(B, V, 3, H, W)`` when every
+        sample carries ``V`` views of its image.
       - ``input_ids``: ``(B, max_text_len)`` int64.
       - ``labels``: ``(B, max_text_len)`` int64 with ``-100`` on pad.
       - ``image_positions``: ``(B,)`` long tensor. Reserved slot for

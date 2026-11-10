@@ -90,6 +90,12 @@ class VLMConfig:
       not registered, or one other than the class's own default.
     - ``max_text_len`` fixed text padding length used by ``VLMCollator``.
       Enforces rank-consistent batches under FSDP2.
+    - ``tile_grid`` how the image path cuts each image into views: ``0``
+      encodes the image as one view; ``n >= 2`` encodes an ``n × n`` grid
+      of crops in raster order, preceded by the whole image when
+      ``tile_global``. The views travel like a clip's frames.
+    - ``tile_global`` whether a tiled image's views start with the whole
+      image; ignored when ``tile_grid`` is ``0``.
     - ``freeze`` static freeze specs applied once at build time.
     - ``freeze_schedule`` step-boundary freeze transitions.
     - ``module_patterns`` map of module alias (``"transformer"``,
@@ -99,6 +105,8 @@ class VLMConfig:
 
     arch: str = "joint_decoder"
     max_text_len: int = 512
+    tile_grid: int = 0
+    tile_global: bool = True
     freeze: list[FreezeSpec] = field(default_factory=lambda: [FreezeSpec("vision_encoder", True)])
     freeze_schedule: list[FreezeStage] = field(default_factory=list)
     module_patterns: dict[str, list[str]] = field(
@@ -119,6 +127,11 @@ class VLMConfig:
             )
         if self.max_text_len < 2:
             raise ValueError("vlm.max_text_len must be >= 2 (a caption token plus its target)")
+        if self.tile_grid < 0 or self.tile_grid == 1:
+            raise ValueError(
+                "vlm.tile_grid must be 0 (one view per image) or >= 2 (an n × n grid of "
+                f"crops), got {self.tile_grid}"
+            )
         if self.freeze_schedule:
             steps = [s.start_step for s in self.freeze_schedule]
             if steps != sorted(steps) or len(steps) != len(set(steps)):
@@ -144,6 +157,13 @@ class VLMConfig:
                 value will skip and re-run at build time.
         """
         return num_tokens
+
+    @property
+    def views_per_image(self) -> int:
+        """Views the encoder sees per image: one, or the grid's crops plus the whole image."""
+        if self.tile_grid == 0:
+            return 1
+        return self.tile_grid * self.tile_grid + int(self.tile_global)
 
     @property
     def is_generative(self) -> bool:
