@@ -275,22 +275,28 @@ def _images_per_row(rows: Any, image_field: str) -> np.ndarray:
     """
     import pyarrow as pa
 
+    def present(array: Any) -> np.ndarray:
+        """Which entries hold an image: not null, and not a struct whose fields are all null."""
+        valid = array.is_valid().to_numpy(zero_copy_only=False)
+        if pa.types.is_struct(array.type) and len(array.type) > 0:
+            fields = [array.field(i).is_valid() for i in range(len(array.type))]
+            valid &= np.any([f.to_numpy(zero_copy_only=False) for f in fields], axis=0)
+        return valid
+
     column = rows.select_columns([image_field]).with_format("arrow")[:].column(image_field)
     counts = [np.zeros(0, dtype=np.int64)]
     for chunk in column.chunks:
         valid = chunk.is_valid().to_numpy(zero_copy_only=False)
         if pa.types.is_list(chunk.type) or pa.types.is_large_list(chunk.type):
-            present = chunk.values.is_valid().to_numpy(zero_copy_only=False)
             offsets = chunk.offsets.to_numpy()
-            running = np.concatenate([[0], np.cumsum(present, dtype=np.int64)])
+            running = np.concatenate([[0], np.cumsum(present(chunk.values), dtype=np.int64)])
             count = (running[offsets[1:]] - running[offsets[:-1]]) * valid
         elif pa.types.is_fixed_size_list(chunk.type):
             size = chunk.type.list_size
             values = chunk.values.slice(chunk.offset * size, len(chunk) * size)
-            present = values.is_valid().to_numpy(zero_copy_only=False).reshape(len(chunk), size)
-            count = present.sum(axis=1, dtype=np.int64) * valid
+            count = present(values).reshape(len(chunk), size).sum(axis=1, dtype=np.int64) * valid
         else:
-            count = valid.astype(np.int64)
+            count = present(chunk).astype(np.int64)
         counts.append(count)
     return np.concatenate(counts)
 
@@ -576,8 +582,8 @@ class VLMCollator:
             "image_positions": image_positions,
         }
         if self.allow_text_only:
-            mask = torch.tensor(has_image, dtype=torch.bool).unsqueeze(1)
-            batch["frame_mask"] = mask.expand(B, views).clone()
+            mask = torch.tensor(has_image, dtype=torch.bool)
+            batch["frame_mask"] = mask.unsqueeze(1).repeat(1, views)
         return batch
 
 

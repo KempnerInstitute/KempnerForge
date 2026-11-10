@@ -125,7 +125,7 @@ class JobConfig:
                 raise ValueError(
                     "data.hf_allow_text_only is not supported with vlm.arch='cross_attention': "
                     "its image K/V has no way to hide a document's blank image, so the text "
-                    "would attend to it; use an image-prefix arch or packing"
+                    "would attend to it; use an image-prefix arch (joint_decoder, mot or moma)"
                 )
         if self.data.pack_sequences and self.vlm is not None:
             if self.video is not None:

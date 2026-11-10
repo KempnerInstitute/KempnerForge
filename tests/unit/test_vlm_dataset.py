@@ -960,6 +960,13 @@ class TestTextOnlyRows:
         pairs = pa.array([[1, 2], [1, None], None], pa.list_(pa.int64(), 2))
         fixed = Dataset(pa.table({"image": pairs}))
         assert vlm_dataset._images_per_row(fixed, "image").tolist() == [2, 1, 0]
+        blank = {"bytes": None, "path": None}
+        structs = pa.array(
+            [{"bytes": b"x", "path": None}, blank, None, {"bytes": None, "path": "a.png"}],
+            pa.struct([("bytes", pa.binary()), ("path", pa.string())]),
+        )
+        empties = Dataset(pa.table({"image": structs}))
+        assert vlm_dataset._images_per_row(empties, "image").tolist() == [1, 0, 0, 1]
 
 
 class TestFramesToClipTensor:
