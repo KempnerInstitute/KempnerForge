@@ -54,7 +54,10 @@ version.
 
 During generation, `Transformer.forward` slices `cos`/`sin` starting at
 `kv_caches[0].seq_len` so incremental tokens get the correct absolute
-positions.
+positions. A caller may instead give the positions of the tokens being
+appended (`position_ids`, by argument or on the `ModalityContext`) or the
+rotation itself (`modality.rope_cos`/`rope_sin`, built from the same
+tables), at prefill and at every decode step alike.
 
 ## Attention
 
@@ -104,7 +107,8 @@ before RoPE. Stabilizes attention logits at scale (Gemma, DeepSeek-V3).
 3. **Single-token decode** (`seq_len == 1` with a KV cache): no mask, so the
    query attends to all cached positions. `is_causal=True` here would
    incorrectly restrict attention to only the first key. Mask inputs are
-   refused together with a KV cache.
+   refused together with a KV cache, whether passed as arguments or carried
+   on the ``ModalityContext``.
 4. **Several tokens appended to a filled cache** (`seq_len > 1` with cached
    keys): SDPA with `torch.nn.attention.bias.causal_lower_right`, so each new
    token attends to every cached key and to the new keys up to its own
@@ -134,7 +138,9 @@ silent-incorrectness risk. Keep them module-level.
 ### SDPA backend
 
 `sdpa_backend` (default `"auto"`) selects flash / mem-efficient / cudnn /
-math via a context manager. `"auto"` lets PyTorch pick.
+math via a context manager. `"auto"` lets PyTorch pick. Cached multi-token
+appends use `causal_lower_right` without a dense mask or kernel fallback,
+so a pinned flash backend stays enabled.
 
 ## MLP
 
