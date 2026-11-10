@@ -244,3 +244,56 @@ class TestCheckSavedExperts:
         """A checkpoint without the layer's experts, such as a dense one, is not refused here."""
         check_saved_experts(_model(), _index(experts=0), "ckpt")
         check_saved_experts(_model(packed=True), _index(), "ckpt")
+
+
+class TestRootLayer:
+    """A model that is itself the ``MoEMLP`` names its state-dict entries with no prefix."""
+
+    def test_its_name_is_empty(self):
+        moe = build_moe(dim=8, hidden_dim=16, num_experts=4, top_k=2)
+        assert list(moe_layers(moe)) == [("", moe)]
+
+    def test_unpacked_experts_take_their_global_index(self):
+        moe = _rank_one_of_two()
+        names = [
+            "router.gate.weight",
+            *(f"experts.{i}.{p}.weight" for i in (0, 1) for p in PROJECTIONS),
+        ]
+        local = {
+            "model": {name: p for name, p in moe.named_parameters() if "experts" in name},
+            "optimizer": {
+                "state": {name: {"exp_avg": torch.zeros(1)} for name in names},
+                "param_groups": [{"params": names, "lr": 0.1}],
+            },
+        }
+        layout = ExpertLayout([("", moe)])
+        state = layout.to_global(local)
+        assert set(state["model"]) == {
+            f"experts.{i}.{p}.weight" for i in (2, 3) for p in PROJECTIONS
+        }
+        assert state["optimizer"]["param_groups"][0]["params"] == [
+            "router.gate.weight",
+            *(f"experts.{i}.{p}.weight" for i in range(4) for p in PROJECTIONS),
+        ]
+        assert set(layout.to_local(state)["model"]) == set(local["model"])
+
+    def test_packed_weights_are_named_without_a_leading_dot(self):
+        moe = _rank_one_of_two(packed=True)
+        state = {"model": dict(moe.named_parameters())}
+        with pytest.raises(ValueError, match=r"^(up|down|gate)_w is split over ep=2"):
+            ExpertLayout([("", moe)]).to_global(state)
+
+    def test_a_checkpoint_of_one_rank_is_refused(self):
+        moe = build_moe(dim=8, hidden_dim=16, num_experts=4, top_k=2)
+        size = SimpleNamespace(size=torch.Size([16, 8]))
+        held = {f"model.experts.{e}.{p}.weight": size for e in range(2) for p in PROJECTIONS}
+        with pytest.raises(ValueError, match=r"\(the model holds experts 0-1\).*saved with ep=2"):
+            check_saved_experts(moe, held, "ckpt")
+        every = {f"model.experts.{e}.{p}.weight": size for e in range(4) for p in PROJECTIONS}
+        check_saved_experts(moe, every, "ckpt")
+
+    def test_a_packed_checkpoint_of_one_rank_is_refused(self):
+        moe = build_moe(dim=8, hidden_dim=16, num_experts=4, top_k=2, packed_experts=True)
+        held = {"model.up_w": SimpleNamespace(size=torch.Size([1, 16, 8]))}
+        with pytest.raises(ValueError, match=r"\(up_w has 1 row\).*saved with ep=4"):
+            check_saved_experts(moe, held, "ckpt")

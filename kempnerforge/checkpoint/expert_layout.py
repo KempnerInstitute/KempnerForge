@@ -31,14 +31,19 @@ from torch.distributed.tensor.placement_types import _StridedShard
 from kempnerforge.model.moe import MoEMLP
 
 _WRAPPERS = frozenset({"_checkpoint_wrapped_module", "_orig_mod"})
-_EXPERT_NAME = re.compile(r"(?P<layer>.+?)\.experts\.(?P<index>\d+)\.(?P<rest>.+)")
+_EXPERT_NAME = re.compile(r"(?:(?P<layer>.+?)\.)?experts\.(?P<index>\d+)\.(?P<rest>.+)")
+
+
+def _join(*parts: str) -> str:
+    """``parts`` joined with dots, leaving out empty ones, as module names are joined."""
+    return ".".join(part for part in parts if part)
 
 
 def moe_layers(model: torch.nn.Module) -> Iterator[tuple[str, MoEMLP]]:
     """Each ``MoEMLP`` in ``model`` with the name its state-dict entries start with.
 
-    The name leaves out the activation-checkpoint and ``torch.compile`` wrappers, as
-    ``get_model_state_dict`` does.
+    The name is empty when ``model`` is itself the ``MoEMLP``. It leaves out the
+    activation-checkpoint and ``torch.compile`` wrappers, as ``get_model_state_dict`` does.
     """
     for name, module in model.named_modules():
         if isinstance(module, MoEMLP):
@@ -141,7 +146,7 @@ class ExpertLayout:
     def __init__(self, layers: list[tuple[str, MoEMLP]]) -> None:
         self._unpacked = {name: moe for name, moe in layers if not moe.packed_experts}
         self._packed = {
-            f"{name}.{weight}": (moe, weight)
+            _join(name, weight): (moe, weight)
             for name, moe in layers
             if moe.packed_experts
             for weight in _packed_weights(moe)
@@ -251,7 +256,9 @@ class ExpertLayout:
         """Every split expert weight's name in this rank's model state dict."""
         names = set(self._packed)
         for layer, moe in self._unpacked.items():
-            names.update(f"{layer}.experts.{param}" for param, _ in moe.experts.named_parameters())
+            names.update(
+                _join(layer, "experts", param) for param, _ in moe.experts.named_parameters()
+            )
         return names
 
     def _parse(self, name: str) -> tuple[str, MoEMLP, int, str] | None:
@@ -259,10 +266,11 @@ class ExpertLayout:
         match = _EXPERT_NAME.fullmatch(name)
         if match is None:
             return None
-        moe = self._unpacked.get(match["layer"])
+        layer = match["layer"] or ""
+        moe = self._unpacked.get(layer)
         if moe is None:
             return None
-        return match["layer"], moe, int(match["index"]), match["rest"]
+        return layer, moe, int(match["index"]), match["rest"]
 
     def _global_name(self, name: str) -> str:
         """``name`` with a split expert's local index replaced by its global one."""
@@ -272,10 +280,10 @@ class ExpertLayout:
         layer, moe, index, rest = parsed
         if index >= moe.num_local_experts:
             raise ValueError(
-                f"{name} names local expert {index}, but {layer} holds "
+                f"{name} names local expert {index}, but {layer or 'the model'} holds "
                 f"{moe.num_local_experts} experts on this rank"
             )
-        global_name = f"{layer}.experts.{moe.local_expert_start + index}.{rest}"
+        global_name = _join(layer, "experts", str(moe.local_expert_start + index), rest)
         self._local_names[global_name] = name
         return global_name
 
@@ -307,7 +315,7 @@ class ExpertLayout:
                 continue
             count = moe.num_local_experts
             result += [
-                f"{layer}.experts.{rank * count + index}.{rest}"
+                _join(layer, "experts", str(rank * count + index), rest)
                 for rank in range(moe.ep_world_size)
                 for index, rest in entries
             ]
@@ -396,9 +404,9 @@ class ExpertLayout:
 def _held_experts(saved: Mapping[str, Any], layer: str, moe: MoEMLP) -> int | None:
     """How many experts of ``layer`` the DCP index ``saved`` holds; None if it holds none."""
     if moe.packed_experts:
-        size = getattr(saved.get(f"model.{layer}.up_w"), "size", None)
+        size = getattr(saved.get(_join("model", layer, "up_w")), "size", None)
         return int(size[0]) if size else None
-    head = f"model.{layer}.experts."
+    head = _join("model", layer, "experts.")
     indices = {key[len(head) :].partition(".")[0] for key in saved if key.startswith(head)}
     held = {index for index in indices if index.isdigit()}
     return len(held) if held else None
@@ -428,11 +436,11 @@ def check_saved_experts(model: torch.nn.Module, saved: Mapping[str, Any], where:
     layer, moe, held = short[0]
     total = moe.num_experts
     holds = (
-        f"{layer}.up_w has {held} {'row' if held == 1 else 'rows'}"
+        f"{_join(layer, 'up_w')} has {held} {'row' if held == 1 else 'rows'}"
         if moe.packed_experts
-        else f"{layer} holds experts 0-{held - 1}"
+        else f"{layer or 'the model'} holds experts 0-{held - 1}"
         if held > 1
-        else f"{layer} holds expert 0"
+        else f"{layer or 'the model'} holds expert 0"
     )
     layers = "MoE layer" if len(short) == 1 else "MoE layers"
     saved_with = f"ep={total // held}" if total % held == 0 else "expert parallelism"
