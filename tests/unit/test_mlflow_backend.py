@@ -149,6 +149,7 @@ def _unset_mlflow_import_env(monkeypatch):
 _TRACKING_ENV = (
     "MLFLOW_TRACKING_URI",
     "MLFLOW_EXPERIMENT",
+    "MLFLOW_EXPERIMENT_ID",
     "DATABRICKS_HOST",
     "DATABRICKS_TOKEN",
     "DATABRICKS_API_TOKEN",
@@ -168,6 +169,27 @@ def _unset_tracking_env(monkeypatch):
 def _no_profile_mismatch_warned_yet(monkeypatch):
     """Start each test before any Databricks profile mismatch was warned in this process."""
     monkeypatch.setattr(auth_mod, "_profile_mismatches_warned", set())
+
+
+@pytest.fixture
+def real_mlflow(monkeypatch):
+    """The installed mlflow over local file stores, skipped when it is absent.
+
+    ``set_tracking_uri`` and ``set_experiment`` keep the tracking URI and the active experiment
+    in module globals for the rest of the process, and a file store draws from Python's global
+    ``random`` to name a run or an experiment, so all three are put back after the test. The
+    variables MLflow exports are in ``_TRACKING_ENV``.
+    """
+    mlflow = pytest.importorskip("mlflow")
+    import mlflow.tracking._tracking_service.utils as tracking_utils
+    import mlflow.tracking.fluent as fluent
+
+    monkeypatch.setenv("MLFLOW_ALLOW_FILE_STORE", "true")
+    monkeypatch.setattr(tracking_utils, "_tracking_uri", tracking_utils._tracking_uri)
+    monkeypatch.setattr(fluent, "_active_experiment_id", fluent._active_experiment_id)
+    state = random.getstate()
+    yield mlflow
+    random.setstate(state)
 
 
 @pytest.fixture(autouse=True)
@@ -1398,14 +1420,16 @@ class TestMLflowBestEffort:
 class TestMLflowTelemetry:
     """MLflow's usage telemetry stays off, so it never draws from a restored Python RNG (#547)."""
 
-    def test_a_resumed_run_leaves_pythons_rng_where_the_restore_put_it(self, monkeypatch, tmp_path):
+    def test_a_resumed_run_leaves_pythons_rng_where_the_restore_put_it(
+        self, real_mlflow, monkeypatch, tmp_path
+    ):
         """A resume's first call MLflow records is a metric log, made after the RNG restore.
 
         With telemetry on, that call starts MLflow's config fetch, whose thread then draws from
         Python's global ``random``. Here the config is served from memory, nothing is sent, and
-        MLflow keeps its installation id under ``tmp_path``.
+        MLflow keeps its installation id under ``tmp_path``. ``real_mlflow`` puts the global RNG
+        back afterwards, the draws of the file store below included.
         """
-        mlflow = pytest.importorskip("mlflow")
         telemetry_client = pytest.importorskip("mlflow.telemetry.client")
         import mlflow.telemetry.utils as telemetry_utils
 
@@ -1414,12 +1438,11 @@ class TestMLflowTelemetry:
 
             def json(self):
                 return {
-                    "mlflow_version": mlflow.__version__,
+                    "mlflow_version": real_mlflow.__version__,
                     "rollout_percentage": 100,
                     "ingestion_url": "http://127.0.0.1:9",
                 }
 
-        monkeypatch.setenv("MLFLOW_ALLOW_FILE_STORE", "true")
         monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
         monkeypatch.delenv("DO_NOT_TRACK", raising=False)
         monkeypatch.setattr(telemetry_utils, "_IS_IN_CI_ENV_OR_TESTING", False)
@@ -1435,12 +1458,11 @@ class TestMLflowTelemetry:
         )
         monkeypatch.setattr(telemetry_client, "_MLFLOW_TELEMETRY_CLIENT", None)
         uri = (tmp_path / "mlruns").as_uri()
-        store = mlflow.MlflowClient(uri)
+        store = real_mlflow.MlflowClient(uri)
         run_id = store.create_run(store.create_experiment("rng")).info.run_id
         telemetry = telemetry_client.TelemetryClient()
         monkeypatch.setattr(telemetry_client, "_MLFLOW_TELEMETRY_CLIENT", telemetry)
         cfg = _mlflow_cfg(mlflow_tracking_uri=uri, mlflow_experiment="rng", mlflow_run_id=run_id)
-        saved = random.getstate()
         try:
             random.seed(0)
             restored = random.getstate()
@@ -1452,9 +1474,10 @@ class TestMLflowTelemetry:
             if fetch is not None:
                 fetch.join(10)
             assert random.getstate() == restored
+            history = store.get_metric_history(run_id, "train/loss")
+            assert [(m.step, m.value) for m in history] == [(5, 1.0)]
         finally:
             telemetry._clean_up()
-            random.setstate(saved)
 
 
 class TestWarmStartRun:
@@ -1514,12 +1537,10 @@ class TestWarmStartRun:
 
     @pytest.mark.parametrize("experiment", ["ws", "stage2"], ids=["same", "other-experiment"])
     def test_a_warm_start_logs_to_a_new_run_and_leaves_the_source_run_alone(
-        self, monkeypatch, tmp_path, experiment
+        self, real_mlflow, monkeypatch, tmp_path, experiment
     ):
-        mlflow = pytest.importorskip("mlflow")
-        monkeypatch.setenv("MLFLOW_ALLOW_FILE_STORE", "true")
         monkeypatch.setenv("MLFLOW_DISABLE_TELEMETRY", "true")
-        uri, store, source = self._stage1(mlflow, tmp_path)
+        uri, store, source = self._stage1(real_mlflow, tmp_path)
         step, new, active = self._stage2(tmp_path, uri, experiment, last_step=7)
         assert (step, active) == (5, True)
         assert new and new != source
@@ -1536,12 +1557,10 @@ class TestWarmStartRun:
             float(s) for s in range(1, 11)
         ]
 
-    def test_a_requeued_warm_start_continues_its_own_run(self, monkeypatch, tmp_path):
+    def test_a_requeued_warm_start_continues_its_own_run(self, real_mlflow, monkeypatch, tmp_path):
         """Once stage 2 has saved, a requeue resumes stage 2's checkpoint and its new run."""
-        mlflow = pytest.importorskip("mlflow")
-        monkeypatch.setenv("MLFLOW_ALLOW_FILE_STORE", "true")
         monkeypatch.setenv("MLFLOW_DISABLE_TELEMETRY", "true")
-        uri, store, source = self._stage1(mlflow, tmp_path)
+        uri, store, source = self._stage1(real_mlflow, tmp_path)
         _, first, _ = self._stage2(tmp_path, uri, "ws", last_step=7)
         step, second, _ = self._stage2(tmp_path, uri, "ws", last_step=9)
         assert step == 7 and second == first != source

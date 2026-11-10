@@ -589,7 +589,7 @@ def check_mlflow(check_credentials: bool = False) -> CheckResult:
     profile is a WARN naming the keys and variables, never a value. A $DATABRICKS_CONFIG_PROFILE
     that names another profile than the URI is a WARN naming both: the backend keeps it, so the
     run's SDK clients built from the environment alone would use another profile than MLflow's
-    tracking calls.
+    tracking calls. When both apply, the one WARN says both.
 
     ``check_credentials`` validates the resolved route through the SDK, naming a profile only
     when one is selected. It first exports DATABRICKS_TOKEN from DATABRICKS_API_TOKEN as the
@@ -630,10 +630,12 @@ def check_mlflow(check_credentials: bool = False) -> CheckResult:
                 f"no Databricks credentials found ({problem}); {_MLFLOW_AUTH_ROUTES}",
             )
         section = f"[{profile}]" if quotable else "the profile [__settings__] default_profile names"
-        if conflict := _profile_auth_conflict(config.keys_of(profile), section):
-            return CheckResult("mlflow", WARN, f"{conflict}; {_MLFLOW_AUTH_ROUTES}")
-        if mismatch := _profile_mismatch():
-            return CheckResult("mlflow", WARN, mismatch)
+        conflict = _profile_auth_conflict(config.keys_of(profile), section)
+        mismatch = _profile_mismatch()
+        if conflict or mismatch:
+            routes = f"; {_MLFLOW_AUTH_ROUTES}" if conflict else ""
+            warning = "; ".join(part for part in (conflict, mismatch) if part)
+            return CheckResult("mlflow", WARN, warning + routes)
         found = (
             f"profile {profile} found in {config_name}"
             if quotable

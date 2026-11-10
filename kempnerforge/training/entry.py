@@ -265,13 +265,14 @@ def _tag_warm_start_run(config: JobConfig, extra: dict) -> None:
     """
     metrics = config.metrics
     source = Path(os.path.realpath(str(config.checkpoint.load_path)))
+    mlflow_source = _source_mlflow_run_id(source, extra) if metrics.enable_mlflow else None
     unused = [
-        f"{key}={extra[key]}"
-        for key, enabled, named in (
-            ("mlflow_run_id", metrics.enable_mlflow, metrics.mlflow_run_id),
-            ("wandb_run_id", metrics.enable_wandb, metrics.wandb_run_id),
+        f"{key}={run_id}"
+        for key, run_id, enabled, named in (
+            ("mlflow_run_id", mlflow_source, metrics.enable_mlflow, metrics.mlflow_run_id),
+            ("wandb_run_id", extra.get("wandb_run_id"), metrics.enable_wandb, metrics.wandb_run_id),
         )
-        if enabled and not named and extra.get(key)
+        if enabled and not named and run_id
     ]
     if unused:
         logger.info(
@@ -282,9 +283,8 @@ def _tag_warm_start_run(config: JobConfig, extra: dict) -> None:
     if not metrics.enable_mlflow:
         return
     tags = {WARM_START_CHECKPOINT_TAG: str(source)}
-    run_id = _source_mlflow_run_id(source, extra)
-    if run_id is not None:
-        tags[WARM_START_SOURCE_RUN_TAG] = run_id
+    if mlflow_source is not None:
+        tags[WARM_START_SOURCE_RUN_TAG] = mlflow_source
     metrics.mlflow_tags = {**tags, **metrics.mlflow_tags}
 
 

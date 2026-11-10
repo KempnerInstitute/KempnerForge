@@ -2074,14 +2074,17 @@ class TestRestoreCheckpoint:
         assert mgr.load_kwargs["path"] is None
 
     def test_metrics_run_ids_are_restored_onto_the_config(self, monkeypatch, tmp_path):
+        """An auto-resume continues the saved runs, so it adds no warm-start tags."""
         import kempnerforge.training.entry as entry
 
         monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: tmp_path / "s")
         config = make_config()
+        config.metrics.enable_mlflow = True
         mgr = FakeResumeManager(extra={"wandb_run_id": "W1", "mlflow_run_id": "M1"})
         entry.restore_checkpoint(config, TinyTextModel(), None, mgr)
         assert config.metrics.wandb_run_id == "W1"
         assert config.metrics.mlflow_run_id == "M1"
+        assert config.metrics.mlflow_tags == {}
 
     def test_absent_run_ids_do_not_clobber_existing_ones(self, monkeypatch, tmp_path):
         import kempnerforge.training.entry as entry
@@ -2093,11 +2096,12 @@ class TestRestoreCheckpoint:
         assert config.metrics.wandb_run_id == "KEEP"
 
     @staticmethod
-    def _warm_start(monkeypatch, tmp_path, extra, *, metadata=None, rank=0, **metrics):
+    def _warm_start(monkeypatch, tmp_path, extra, *, metadata=None, rank=0, link=None, **metrics):
         """Warm-start a config with MLflow on, and ``metrics`` set, from ``tmp_path/step_5``
         (a ``load_path`` with nothing in ``checkpoint.dir``); return the config and the source.
 
         ``metadata`` is the source's ``metadata.json``: a dict to write as JSON, or raw text.
+        ``link`` names a symlink to the source, made under ``tmp_path`` and used as ``load_path``.
         """
         import kempnerforge.training.entry as entry
 
@@ -2106,13 +2110,17 @@ class TestRestoreCheckpoint:
         if metadata is not None:
             text = metadata if isinstance(metadata, str) else json.dumps(metadata)
             (source / "metadata.json").write_text(text)
+        load_path = source
+        if link is not None:
+            load_path = tmp_path / link
+            load_path.symlink_to(source.name)
         monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: None)
         if rank:
             monkeypatch.setattr(entry.dist, "is_initialized", lambda: True)
             monkeypatch.setattr(entry.dist, "get_rank", lambda: rank)
             monkeypatch.setattr(entry.dist, "broadcast_object_list", lambda lst, src=0: None)
         config = make_config()
-        config.checkpoint.load_path = str(source)
+        config.checkpoint.load_path = str(load_path)
         config.metrics.enable_mlflow = True
         for name, value in metrics.items():
             setattr(config.metrics, name, value)
@@ -2145,6 +2153,34 @@ class TestRestoreCheckpoint:
         config, _ = self._warm_start(monkeypatch, tmp_path, {}, metadata=metadata)
         tag = config.metrics.mlflow_tags["kempnerforge.warm_start.source_run_id"]
         assert tag == "FROM-SIDECAR"
+
+    @pytest.mark.parametrize(
+        "tracking",
+        [
+            [{"backend": "mlflow", "run_id": "FROM-SIDECAR"}],
+            [
+                {"backend": "wandb", "run_id": "W-SIDECAR"},
+                {"backend": "mlflow", "run_id": "FROM-SIDECAR"},
+            ],
+        ],
+        ids=["over-the-train-state", "after-a-wandb-record"],
+    )
+    def test_the_sidecars_mlflow_record_names_the_source_run(self, monkeypatch, tmp_path, tracking):
+        """The sidecar's ``mlflow`` record wins over the train state's id and any other record."""
+        extra = {"mlflow_run_id": "M1"}
+        metadata = {"step": 5, "tracking": tracking}
+        config, _ = self._warm_start(monkeypatch, tmp_path, extra, metadata=metadata)
+        tag = config.metrics.mlflow_tags["kempnerforge.warm_start.source_run_id"]
+        assert tag == "FROM-SIDECAR"
+
+    def test_the_checkpoint_tag_is_the_directory_a_symlinked_load_path_names(
+        self, monkeypatch, tmp_path
+    ):
+        """A load_path through ``latest`` is tagged with the step directory it points at."""
+        config, source = self._warm_start(monkeypatch, tmp_path, {}, link="latest")
+        assert config.checkpoint.load_path == str(tmp_path / "latest")
+        tag = config.metrics.mlflow_tags["kempnerforge.warm_start.checkpoint"]
+        assert tag == str(source.resolve())
 
     @pytest.mark.parametrize(
         "metadata",
@@ -2214,6 +2250,19 @@ class TestRestoreCheckpoint:
         assert len(lines) == (1 if named else 0)
         for item in ("mlflow_run_id=M1", "wandb_run_id=W1"):
             assert any(item in line for line in lines) == (item in named)
+
+    def test_a_weights_only_warm_start_names_the_mlflow_run_its_sidecar_records(
+        self, monkeypatch, tmp_path
+    ):
+        """A load that skips train_state.pt has no ``extra``, so the sidecar names the run."""
+        import kempnerforge.training.entry as entry
+
+        seen: list[str] = []
+        monkeypatch.setattr(entry.logger, "info", lambda msg, *a, **k: seen.append(str(msg)))
+        metadata = {"step": 5, "tracking": [{"backend": "mlflow", "run_id": "FROM-SIDECAR"}]}
+        self._warm_start(monkeypatch, tmp_path, {}, metadata=metadata)
+        (line,) = [m for m in seen if m.startswith("Warm start from")]
+        assert "mlflow_run_id=FROM-SIDECAR" in line
 
     def test_vlm_resume_computes_expected_freeze_at_the_saved_step(self, monkeypatch, tmp_path):
         import kempnerforge.training.entry as entry

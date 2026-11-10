@@ -456,6 +456,22 @@ class TestCheckMlflow:
         monkeypatch.setenv("DATABRICKS_TOKEN", "dapi-xxx")
         assert check_env.check_mlflow().status == check_env.OK
 
+    def test_a_profile_mismatch_beside_two_auth_methods_is_one_warn_naming_both(
+        self, home, monkeypatch
+    ):
+        (home / ".databrickscfg").write_text(
+            "[prod]\nhost = h\ntoken = t\n[dev]\nhost = h\ntoken = u\n"
+        )
+        monkeypatch.setenv("MLFLOW_TRACKING_URI", "databricks://prod")
+        monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", "dev")
+        monkeypatch.setenv("DATABRICKS_CLIENT_ID", "i")
+        monkeypatch.setenv("DATABRICKS_CLIENT_SECRET", "s")
+        r = check_env.check_mlflow()
+        assert r.status == check_env.WARN
+        assert "more than one auth method" in r.message and "token in [prod]" in r.message
+        assert "selects profile prod but $DATABRICKS_CONFIG_PROFILE is dev" in r.message
+        assert r.message.endswith(check_env._MLFLOW_AUTH_ROUTES)
+
     def test_profile_not_in_file_is_informational(self, home):
         (home / ".databrickscfg").write_text("[other]\nhost = h\n")
         r = check_env.check_mlflow()
