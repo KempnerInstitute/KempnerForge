@@ -490,10 +490,10 @@ class TestKVCacheDecode:
     """A cache grows the key axis every step, so the mask is re-derived, not shared."""
 
     @staticmethod
-    def _caches(model: Transformer, max_seq_len: int) -> list[KVCache]:
+    def _caches(model: Transformer, max_seq_len: int, batch: int = 1) -> list[KVCache]:
         return [
             KVCache(
-                batch_size=1,
+                batch_size=batch,
                 max_seq_len=max_seq_len,
                 n_kv_heads=model.config.n_kv_heads,  # type: ignore[reportArgumentType]
                 head_dim=model.config.head_dim,
@@ -531,6 +531,45 @@ class TestKVCacheDecode:
                 model(tokens[:, i : i + 1], kv_caches=caches)
         assert [mask for mask, _ in seen] == [None] * 5
         assert [length for _, length in seen] == [0, 1, 2, 3, 4]
+
+    @pytest.mark.parametrize("capture", [False, True], ids=["fused", "capture_weights"])
+    @pytest.mark.parametrize(
+        "chunks", [(3, 2, 3), (1, 7), (5, 1, 2)], ids=["3-2-3", "1-7", "5-1-2"]
+    )
+    def test_chunks_appended_to_a_filled_cache_match_one_full_forward(self, capture, chunks):
+        """Each appended token sees every cached key and the new keys up to its own position."""
+        torch.manual_seed(0)
+        model = Transformer(
+            ModelConfig(dim=64, n_layers=2, n_heads=4, n_kv_heads=2, vocab_size=64, max_seq_len=16)
+        ).eval()
+        for layer in model.layers.values():
+            layer.attention.capture_attention_weights = capture
+        tokens = torch.randint(0, 64, (2, 8), generator=torch.Generator().manual_seed(2))
+        caches = self._caches(model, max_seq_len=16, batch=2)
+        with torch.no_grad():
+            full = model(tokens)
+            parts, start = [], 0
+            for length in chunks:
+                parts.append(model(tokens[:, start : start + length], kv_caches=caches))
+                start += length
+        torch.testing.assert_close(torch.cat(parts, dim=1), full, rtol=1e-5, atol=1e-5)
+        assert caches[0].seq_len == 8
+
+    def test_captured_weights_of_an_appended_chunk_are_the_full_forwards_rows(self):
+        """Captured weights of an appended chunk equal the full forward's rows for those tokens."""
+        model = _tiny_model("sdpa", n_layers=1)
+        attention = next(iter(model.layers.values())).attention
+        attention.capture_attention_weights = True
+        tokens = torch.randint(0, 64, (1, 8), generator=torch.Generator().manual_seed(3))
+        caches = self._caches(model, max_seq_len=16)
+        with torch.no_grad():
+            model(tokens)
+            full = attention.last_attention_weights
+            model(tokens[:, :5], kv_caches=caches)
+            model(tokens[:, 5:], kv_caches=caches)
+            appended = attention.last_attention_weights
+        assert appended.shape == (1, 4, 3, 8)
+        torch.testing.assert_close(appended, full[:, :, 5:, :], rtol=1e-5, atol=1e-6)
 
     @staticmethod
     def _capturing_model(capture: bool) -> tuple[Transformer, list[None]]:
