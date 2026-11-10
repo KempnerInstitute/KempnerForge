@@ -795,6 +795,7 @@ class TestJobConfig:
         """Packed rows are indexed as plain tensors, which sequence parallelism cannot carry."""
         config = JobConfig(
             model=ModelConfig(max_seq_len=1024),
+            train=TrainConfig(seq_len=512),
             distributed=DistributedConfig(tp=2),
             vision_encoder=VisionEncoderConfig(type="random", num_tokens=16),
             adapter=AdapterConfig(),
