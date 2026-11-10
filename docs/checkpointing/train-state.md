@@ -25,6 +25,7 @@ Entry points, both in
         "torch_cuda": torch.cuda.get_rng_state(),   # if CUDA available
     },
     "scheduler":   scheduler.state_dict(),            # present if scheduler passed
+    "scheduler_group_modules": [None, "adapter", ...],  # if a param group names a module
     "dataloader":  dataloader.state_dict(),           # rank 0's; present if dataloader passed
     "per_rank": {                         # schema v1: every rank's own state
         "version": 1,
@@ -167,6 +168,26 @@ linear, wsd, rex, constant) the dict contains the step count and
 base LR, which together determine the next LR value. Restoring it
 gets you back the same LR schedule from that step.
 
+The base LR is kept per param group, in the order of the optimizer's
+groups. When a group names a module under `"module"`, as
+`build_optimizer` names the groups of
+[`optimizer.lr_multipliers`](../training/optimizers.md#per-module-learning-rates),
+`scheduler_group_modules` records the module of every group, None for
+one outside the listed modules. A load into groups laid out otherwise,
+because other parameters are trainable or the weight-decay scope
+changed, carries the saved schedule on in every group, as a load into
+the same groups does: each group gets the saved entries of its
+module's groups, and a group of a module the state holds no group of
+gets those of the first saved group, its rates scaled from that
+group's multiplier to its own, so it runs at the saved peak times its
+multiplier. Without a recorded module on either side, the state loads
+as saved, unless the number of groups changed: a `LambdaLR` state is
+then laid out the same way, its groups all of no module. Either way
+the saved base LRs win over the ones the optimizer was built with, so
+a changed `optimizer.lr` takes no effect; a load whose groups name a
+module logs the peak of each module's groups, and warns when they
+differ from the ones the optimizer was built with.
+
 Pure `phase.lr_scale` overlays live in the training loop and are
 recomputed from the current phase, so they don't need to be saved.
 
@@ -218,8 +239,8 @@ ckpt_mgr.save(step=step, tokens_seen=tokens_seen, scheduler=scheduler,
 ```
 
 On load, `restore_train_state` strips out the "standard" keys
-(`step`, `tokens_seen`, `rng`, `scheduler`, `dataloader`, `per_rank`)
-and returns the rest as the third tuple element:
+(`step`, `tokens_seen`, `rng`, `scheduler`, `scheduler_group_modules`,
+`dataloader`, `per_rank`) and returns the rest as the third tuple element:
 
 ```python
 step, tokens_seen, extra = ckpt_mgr.load(path=..., scheduler=scheduler)

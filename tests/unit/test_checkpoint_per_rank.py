@@ -170,12 +170,14 @@ def _install_fake_load_world(
     Broadcasts deliver rank 0's values (the file-existence flag, then the
     train state rank 0 reads). The gather delivers every rank's current
     ``(global_rank, dp_coordinates)`` from ``layout`` and records what this
-    rank contributed and on which group.
+    rank contributed and on which group. The load's agreement reports no
+    failure on any other rank.
     """
     m.setattr(mgr_mod.dist, "is_initialized", lambda: True)
-    m.setattr(mgr_mod.dist, "get_rank", lambda: rank)
-    m.setattr(mgr_mod.dist, "get_world_size", lambda: world)
+    m.setattr(mgr_mod.dist, "get_rank", lambda group=None: rank)
+    m.setattr(mgr_mod.dist, "get_world_size", lambda group=None: world)
     m.setattr(mgr_mod.dist, "new_group", lambda backend=None: "GLOO_PG")
+    m.setattr(mgr_mod.dist, "all_reduce", lambda tensor, group=None: None)
     ts_path = ckpt_dir / "train_state.pt"
 
     def fake_broadcast(obj_list, src=0):
