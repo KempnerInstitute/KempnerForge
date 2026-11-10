@@ -262,12 +262,18 @@ def _warn_sample_masked_for_prompt(min_text_len: int, max_text_len: int) -> None
         )
 
 
-def _decode_image(value: Any) -> Any:
-    """A PIL image from an undecoded ``datasets`` image entry, or the image itself."""
-    if isinstance(value, dict):
-        from datasets import Image
+def _image_feature(features: Any, image_field: str) -> Any:
+    """The column's image feature (inside a list feature if need be), or ``None``."""
+    feature = features[image_field]
+    while not hasattr(feature, "decode_example") and hasattr(feature, "feature"):
+        feature = feature.feature
+    return feature if hasattr(feature, "decode_example") else None
 
-        return Image().decode_example(value)
+
+def _decode_image(feature: Any, value: Any) -> Any:
+    """A PIL image from an undecoded entry of ``feature``'s column, or the entry itself."""
+    if feature is not None and isinstance(value, dict):
+        return feature.decode_example(value)
     return value
 
 
@@ -482,6 +488,7 @@ class HuggingFaceVLMDataset(Dataset):
         self._ds: HFDataset = ds
         self._text_rows: Any = ds.remove_columns([image_field])
         self._image_rows: Any = ds.select_columns([image_field]).with_format("arrow")
+        self._image_feature = _image_feature(ds.features, image_field)
         self._image_field = image_field
         self._text_field = text_field
         self._prompt_field = prompt_field
@@ -526,7 +533,10 @@ class HuggingFaceVLMDataset(Dataset):
         else:
             tensors = [
                 pil_to_tensor(
-                    _decode_image(img), self._image_size, self._image_mean, self._image_std
+                    _decode_image(self._image_feature, img),
+                    self._image_size,
+                    self._image_mean,
+                    self._image_std,
                 )
                 for img in images
             ]
