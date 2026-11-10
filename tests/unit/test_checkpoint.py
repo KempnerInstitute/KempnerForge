@@ -2190,9 +2190,9 @@ class TestSyncBarrierGroup:
 
     def test_agree_without_a_process_group_raises_only_its_own_error(self, tmp_path):
         mgr = self._mgr(tmp_path)
-        mgr._agree(None)
+        mgr.agree(None)
         with pytest.raises(OSError, match="No space left"):
-            mgr._agree(OSError(28, "No space left on device"))
+            mgr.agree(OSError(28, "No space left on device"))
 
     def test_init_creates_dedicated_gloo_group(self, tmp_path, monkeypatch):
         import kempnerforge.checkpoint.manager as mgr_mod
@@ -2234,18 +2234,18 @@ class TestSyncBarrierGroup:
 
     def test_agree_uses_dedicated_group_not_default(self, tmp_path, monkeypatch):
         groups = self._four_ranks(monkeypatch, [])
-        self._mgr(tmp_path)._agree(None)
+        self._mgr(tmp_path).agree(None)
         assert groups == ["GLOO_PG"]
 
     def test_agree_raises_on_every_rank_when_others_failed(self, tmp_path, monkeypatch):
         self._four_ranks(monkeypatch, [1, 3])
         with pytest.raises(RuntimeError, match=r"Checkpoint save failed on ranks \[1, 3\]"):
-            self._mgr(tmp_path)._agree(None)
+            self._mgr(tmp_path).agree(None)
 
     def test_agree_reraises_this_ranks_own_error(self, tmp_path, monkeypatch):
         self._four_ranks(monkeypatch, [2])
         with pytest.raises(OSError, match="No space left"):
-            self._mgr(tmp_path)._agree(OSError(28, "No space left on device"))
+            self._mgr(tmp_path).agree(OSError(28, "No space left on device"))
 
 
 class TestCheckpointManagerLoad:

@@ -39,6 +39,7 @@ from kempnerforge.checkpoint.state import build_train_state, restore_train_state
 from kempnerforge.config.checkpoint import is_weights_only, validate_exclude_keys
 from kempnerforge.config.optimizer import WEIGHT_DECAY_SCOPES
 from kempnerforge.config.schema import AsyncCheckpointMode, CheckpointConfig
+from kempnerforge.distributed.utils import agree_across_ranks
 
 logger = logging.getLogger(__name__)
 
@@ -578,32 +579,18 @@ class CheckpointManager:
         being durable covers its own stage only; without PP the save spans every
         rank. Every rank calls this once its own write has ended, with the error
         it raised, if any; under PP it then raises on every rank when any rank's
-        write failed (see ``_agree``).
+        write failed (see ``agree``).
         """
         if self._pp_rank is not None:
-            self._agree(error)
+            self.agree(error)
 
-    def _agree(self, error: BaseException | None) -> None:
-        """Barrier on the manager's dedicated gloo group that raises on every rank if any failed.
+    def agree(self, error: BaseException | None, what: str = "Checkpoint save") -> None:
+        """Agree on the manager's dedicated gloo group that every rank's ``what`` succeeded.
 
-        Every rank passes the error its own part of the save raised, or ``None``.
-        A rank with an error re-raises it; when any rank has one, every other rank
-        raises a ``RuntimeError`` naming the ranks that failed, so no rank is left
-        waiting in a later collective for a rank that has raised. The group is not
-        the default process group that DCP's async-save background thread issues
-        collectives on. Without an initialized process group, ``error`` is raised
-        if set.
+        See ``agree_across_ranks``. The group is not the default process group
+        that DCP's async-save background thread issues collectives on.
         """
-        failed: list[int] = []
-        if dist.is_initialized():
-            flags = torch.zeros(dist.get_world_size(self._sync_group), dtype=torch.int32)
-            flags[dist.get_rank(self._sync_group)] = int(error is not None)
-            dist.all_reduce(flags, group=self._sync_group)
-            failed = flags.nonzero().flatten().tolist()
-        if error is not None:
-            raise error
-        if failed:
-            raise RuntimeError(f"Checkpoint save failed on ranks {failed}")
+        agree_across_ranks(error, what, group=self._sync_group)
 
     def set_tracking_source(self, source: TrackingSource | None) -> None:
         """Record the logging runs ``source`` reports in every later ``metadata.json``.
@@ -787,7 +774,7 @@ class CheckpointManager:
             if self._rank == 0 and error is None:
                 error = _attempt(self._commit_latest, step, ckpt_dir)
 
-        self._agree(error)
+        self.agree(error)
 
         if not sync_mode:
             self._pending_finalize = (step, ckpt_dir)
@@ -832,7 +819,7 @@ class CheckpointManager:
         committed.
         """
         error = _attempt(self._async_ckpt.wait)
-        self._agree(self._drain_pending_finalize(error=error))
+        self.agree(self._drain_pending_finalize(error=error))
 
     def flush_pending_save(self) -> None:
         """Drain any in-flight async save before mutating model state.
@@ -850,7 +837,7 @@ class CheckpointManager:
         rank raises on every rank, and nothing is committed.
         """
         error = _attempt(self._async_ckpt.wait)
-        self._agree(self._drain_pending_finalize(error=error))
+        self.agree(self._drain_pending_finalize(error=error))
 
     def peek_saved_step(self, path: str | None = None) -> int | None:
         """Read ``step`` from a candidate checkpoint's metadata.json.

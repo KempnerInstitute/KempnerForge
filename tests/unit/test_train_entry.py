@@ -1984,6 +1984,10 @@ class FakeResumeManager:
         self.load_kwargs = kw
         return self._ret
 
+    def agree(self, error, what=""):
+        if error is not None:
+            raise error
+
 
 def _entry_warnings(call):
     """Run ``call`` and return its result and the warnings the training entry logged."""
@@ -2288,7 +2292,7 @@ class TestRestoreCheckpoint:
         entry.restore_checkpoint(config, TinyTextModel(), None, FakeResumeManager(step=0))
         assert copied == [{"w": 1}]
         entry.restore_checkpoint(config, TinyTextModel(), None, FakeResumeManager(step=4))
-        assert copied == [{"w": 1}], "a step-4 train state came with the excluded model"
+        assert copied == [{"w": 1}] * 2, "a step-4 train state without the model needs the copy"
 
         copied.clear()
         config.checkpoint.load_path = None

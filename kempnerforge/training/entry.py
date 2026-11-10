@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+from collections.abc import Callable
 from pathlib import Path
 from typing import cast
 
@@ -196,8 +197,18 @@ def build_checkpoint_manager(
     )
 
 
-def _mot_text_warm_start(vlm_cfg: VLMConfig | None, model: torch.nn.Module) -> None:
-    """Copy the dense block weights of ``mot_warm_start_path`` into a MoT model."""
+def _mot_text_warm_start(
+    vlm_cfg: VLMConfig | None,
+    model: torch.nn.Module,
+    agree: Callable[[BaseException | None, str], None],
+) -> None:
+    """Copy the dense block weights of ``mot_warm_start_path`` into a MoT model.
+
+    ``agree`` is the checkpoint manager's rank agreement: every rank reports
+    whether it read the source before any rank enters the copy's DTensor
+    collectives, so a rank that cannot read the file fails the run on every rank
+    instead of leaving the others waiting until the process-group timeout.
+    """
     if not isinstance(vlm_cfg, MoTConfig) or not vlm_cfg.mot_warm_start_from_text:
         return
     source = {}
@@ -208,18 +219,7 @@ def _mot_text_warm_start(vlm_cfg: VLMConfig | None, model: torch.nn.Module) -> N
             source = source["model"]
     except Exception as exc:
         error = exc
-    # Every rank must finish reading before any rank enters the DTensor copy's collectives.
-    errors: list[str | None] = []
-    if dist.is_initialized():
-        errors = [None] * dist.get_world_size()
-        dist.all_gather_object(errors, str(error) if error is not None else None)
-    if error is not None:
-        raise error
-    failed = [rank for rank, message in enumerate(errors) if message is not None]
-    if failed:
-        raise RuntimeError(
-            f"MoT warm-start: could not read {vlm_cfg.mot_warm_start_path} on ranks {failed}"
-        )
+    agree(error, f"MoT warm-start: reading {vlm_cfg.mot_warm_start_path}")
     mot_warm_start_from_text_stack(inner_transformer(model), source)
     logger.info(f"MoT warm-start: copied dense block weights from {vlm_cfg.mot_warm_start_path}")
 
@@ -290,7 +290,7 @@ def restore_checkpoint(
         resume_path = resolve_resume_path(config.checkpoint.dir, num_stages)
     vlm_cfg = config.vlm
     if not resume_path and not config.checkpoint.load_path:
-        _mot_text_warm_start(vlm_cfg, model)
+        _mot_text_warm_start(vlm_cfg, model, ckpt_mgr.agree)
         return 0, 0
     rank_zero = not dist.is_initialized() or dist.get_rank() == 0
     if (
@@ -322,8 +322,8 @@ def restore_checkpoint(
     if ckpt_extra_loaded.get("mlflow_run_id"):
         config.metrics.mlflow_run_id = ckpt_extra_loaded["mlflow_run_id"]
 
-    if step == 0 and warm_start_exclude is not None and "model" in warm_start_exclude:
-        _mot_text_warm_start(vlm_cfg, model)
+    if warm_start_exclude is not None and "model" in warm_start_exclude:
+        _mot_text_warm_start(vlm_cfg, model, ckpt_mgr.agree)
 
     if vlm_cfg is not None and vlm_cfg.freeze_schedule:
         valid_modules = set(vlm_cfg.module_patterns.keys())
