@@ -1421,7 +1421,7 @@ class TestSaveCheckpointRegistration:
         def spy(src, dst):
             replaced.append((Path(src), Path(dst), Path(src).read_text()))
             if nfs_held:
-                os.link(dst, Path(dst).with_name(".nfs000000000000000100000001"))
+                os.link(dst, Path(dst).with_name(".nfs000000000000000200000002"))
             replace(src, dst)
 
         monkeypatch.setattr(os, "replace", spy)

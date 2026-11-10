@@ -386,7 +386,12 @@ class TestLatestWaitsForEveryStage:
         spawn(_check_latest_waits_for_every_stage, 2, str(tmp_path / "ckpt"), async_mode)
 
 
+@pytest.mark.timeout(360)
 class TestAFailedSaveFailsEveryRank:
+    """Each case runs under ``run_to_outcomes``: 240 s to reach the save, 45 s in it and 60 s
+    to exit. The 360 s timeout covers all three and the 5 s grace period for stopping the ranks,
+    so under CI's shorter default a hung case still fails with its phase's message."""
+
     @pytest.mark.parametrize(
         ("shape", "names", "async_mode", "failing", "failed"),
         [
