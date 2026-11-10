@@ -235,12 +235,46 @@ mesh: ("dp_shard", "ep", "tp") → (4, 2, 4)
 
 - Each EP group (size 2) splits the 8 experts as `experts 0-3` on
   rank 0 and `experts 4-7` on rank 1.
-- Within each EP group, TP shards the per-expert Linears along `tp=4`.
+- Within each EP group, TP shards the attention projections along
+  `tp=4`; the TP plan leaves the MoE layers whole, so their experts
+  are replicated over `tp`.
 - FSDP shards the remaining params across the `dp_shard=4` axis with
   per-sub-module wrapping.
 
 Benchmark and reproducer: [Benchmarks § MoE Expert
 Parallelism](../reference/benchmarks.md#moe-expert-parallelism).
+
+## Gradients and clipping
+
+The ranks of an EP group differ only in `ep`, so they share a DP rank
+and read the same batch: `ep` splits the experts, not the data. The
+global batch, and the tokens counted per step, are those of the DP
+dimensions alone, as without EP.
+
+Each local expert therefore receives every token routed to it once
+from each rank of its EP group, and its weight gradient sums the
+gradients of `ep` ranks' losses, while FSDP2 averages over the DP mesh
+only. `ep_dispatch_and_compute` divides the gradient that enters the
+local expert compute by `ep` and multiplies the gradient it hands back
+to the tokens by `ep`. The routed-expert gradients are then the mean
+over the EP group, equal to one process's on the same batch, and every
+other gradient is unchanged. Both factors are exact when `ep` is a
+power of two. For other sizes the gradient handed back to the tokens,
+which reaches every parameter outside the routed experts, takes two
+extra roundings, which shows in bf16.
+
+The routers, the shared experts and every parameter outside the MoE
+layers have a copy on each EP rank. FSDP2 does not reduce their
+gradients over `ep`, so the copies stay equal only as long as the EP
+ranks compute and scale those gradients alike. `clip_grad_norm_`
+therefore sums the routed experts' squared norms over the EP group and
+averages the copies', and every EP rank clips by the whole model's norm
+with the same coefficient; see
+[Gradient utilities § Under expert parallelism](../training/gradient-utilities.md#under-expert-parallelism).
+That removes one cause of drift, not every cause: on GPU the copies
+still drift apart over training, with or without clipping, and nothing
+re-syncs them across the EP group yet
+([#482](https://github.com/KempnerInstitute/KempnerForge/issues/482)).
 
 ## Gradient scaling (optional)
 
@@ -252,6 +286,13 @@ gradient flows back through the dispatch all-to-all to the router
 and expert params correctly. Disabled by default — it changes
 gradient magnitudes and should be validated against a baseline run
 before flipping on.
+
+`avg_tokens` is the average load over all `num_experts` experts, as in
+`MoEMLP._local_forward`, and as there the scale applies in training
+mode only, whether or not gradients are on. A local expert receives a
+copy of its tokens from each EP rank, so in those units the average is
+`num_tokens · top_k / num_local_experts`, and EP leaves the scale, and
+with it the forward pass, unchanged.
 
 ## See also
 
